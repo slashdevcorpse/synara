@@ -869,8 +869,69 @@ layer("AutomationService", (it) => {
       assert.strictEqual(results.length, 0);
       assert.strictEqual(dispatchedCommands.length, 0);
       assert.strictEqual(
-        listed.runs.filter((run) => run.automationId === automationId).length,
-        0,
+        listed.definitions.find((definition) => definition.id === automationId)?.nextRunAt,
+        "2026-06-16T10:05:00.000Z",
+      );
+      assert.strictEqual(
+        listed.runs.find((run) => run.automationId === automationId)?.status,
+        "skipped",
+      );
+    }),
+  );
+
+  it.effect("advances blocked scheduled automations so later eligible definitions can run", () =>
+    Effect.gen(function* () {
+      resetHarness();
+      const service = yield* AutomationService;
+      const repository = yield* AutomationRepository;
+      const blockedIds = Array.from({ length: 5 }, (_, index) =>
+        AutomationId.makeUnsafe(`automation-due-blocked-${index}`),
+      );
+      const eligibleId = AutomationId.makeUnsafe("automation-due-eligible-after-blocked");
+
+      for (const automationId of blockedIds) {
+        yield* repository.createDefinition({
+          id: automationId,
+          input: {
+            ...createInput("worktree"),
+            schedule: { type: "interval", everySeconds: 300 },
+            runtimeMode: "full-access",
+            acknowledgedRisks: [],
+          },
+          now: "2026-06-16T10:00:00.000Z",
+        });
+      }
+      yield* repository.createDefinition({
+        id: eligibleId,
+        input: {
+          ...createInput("local"),
+          schedule: { type: "interval", everySeconds: 300 },
+        },
+        now: "2026-06-16T10:00:00.000Z",
+      });
+
+      const firstPass = yield* service.runDueOnce({
+        now: "2026-06-16T10:00:00.000Z",
+        limit: 5,
+        leaseOwnerId: "test-scheduler",
+      });
+      const secondPass = yield* service.runDueOnce({
+        now: "2026-06-16T10:00:00.000Z",
+        limit: 5,
+        leaseOwnerId: "test-scheduler",
+      });
+      const listed = yield* service.list({ projectId });
+
+      assert.strictEqual(firstPass.length, 0);
+      assert.strictEqual(secondPass.length, 1);
+      assert.strictEqual(secondPass[0]?.run.automationId, eligibleId);
+      assert.strictEqual(
+        listed.runs.filter((run) => blockedIds.includes(run.automationId)).length,
+        5,
+      );
+      assert.strictEqual(
+        listed.definitions.find((definition) => definition.id === eligibleId)?.nextRunAt,
+        "2026-06-16T10:05:00.000Z",
       );
     }),
   );

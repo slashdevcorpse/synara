@@ -2134,12 +2134,6 @@ export const AutomationServiceLive = Layer.effect(
           return Option.none<AutomationRunNowResult>();
         }
 
-        yield* validateRiskAcknowledgements({
-          runtimeMode: definition.runtimeMode,
-          worktreeMode: definition.worktreeMode,
-          acknowledgedRisks: definition.acknowledgedRisks,
-        });
-
         const occurrence = scheduledOccurrenceForDefinition(definition, now);
         const { scheduledFor, nextRunAt } = occurrence;
         if (occurrence.skip) {
@@ -2152,6 +2146,26 @@ export const AutomationServiceLive = Layer.effect(
           );
           if (inserted) {
             yield* markScheduledRunSkipped(run, "Scheduled occurrence was missed.", now);
+          }
+          yield* advanceScheduledDefinition(definition, nextRunAt, now);
+          return Option.none<AutomationRunNowResult>();
+        }
+
+        const riskBlockReason = riskAcknowledgementError({
+          runtimeMode: definition.runtimeMode,
+          worktreeMode: definition.worktreeMode,
+          acknowledgedRisks: definition.acknowledgedRisks,
+        });
+        if (riskBlockReason !== null) {
+          const { run, inserted } = yield* createPendingRun(
+            definition,
+            { type: "scheduled" },
+            scheduledFor,
+            now,
+            { threadIdOverride: null },
+          );
+          if (inserted) {
+            yield* markScheduledRunSkipped(run, riskBlockReason, now);
           }
           yield* advanceScheduledDefinition(definition, nextRunAt, now);
           return Option.none<AutomationRunNowResult>();
