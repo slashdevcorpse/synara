@@ -43,6 +43,7 @@ import { AnalyticsService } from "../../telemetry/Services/AnalyticsService.ts";
 export interface ProviderServiceLiveOptions {
   readonly canonicalEventLogPath?: string;
   readonly canonicalEventLogger?: EventNdjsonLogger;
+  readonly runtimeIdleStopMs?: number;
 }
 
 const DEFAULT_PROVIDER_RUNTIME_IDLE_STOP_MS = 10 * 60 * 1000;
@@ -162,6 +163,10 @@ function runtimePayloadRecord(value: unknown): Record<string, unknown> {
     : {};
 }
 
+function hasResumeCursor(value: unknown): boolean {
+  return value !== null && value !== undefined;
+}
+
 function runtimeStatusForEvent(event: ProviderRuntimeEvent): "running" | "stopped" | "error" {
   switch (event.type) {
     case "session.state.changed":
@@ -225,6 +230,10 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
     const directory = yield* ProviderSessionDirectory;
     const runtimeEventPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent>();
     const runtimeIdleTimers = new Map<ThreadId, ReturnType<typeof setTimeout>>();
+    const runtimeIdleStopMs = Math.max(
+      0,
+      options?.runtimeIdleStopMs ?? PROVIDER_RUNTIME_IDLE_STOP_MS,
+    );
     let stopIdleRuntimeSession: ((threadId: ThreadId) => void) | null = null;
 
     const clearRuntimeIdleTimer = (threadId: ThreadId) => {
@@ -238,14 +247,14 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
 
     const scheduleRuntimeIdleStop = (threadId: ThreadId) => {
       clearRuntimeIdleTimer(threadId);
-      if (PROVIDER_RUNTIME_IDLE_STOP_MS <= 0) {
+      if (runtimeIdleStopMs <= 0) {
         return;
       }
 
       const timer = setTimeout(() => {
         runtimeIdleTimers.delete(threadId);
         stopIdleRuntimeSession?.(threadId);
-      }, PROVIDER_RUNTIME_IDLE_STOP_MS);
+      }, runtimeIdleStopMs);
       timer.unref();
       runtimeIdleTimers.set(threadId, timer);
     };
@@ -446,8 +455,7 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
     }) =>
       Effect.gen(function* () {
         const adapter = yield* registry.getByProvider(input.binding.provider);
-        const hasResumeCursor =
-          input.binding.resumeCursor !== null && input.binding.resumeCursor !== undefined;
+        const hasPersistedResumeCursor = hasResumeCursor(input.binding.resumeCursor);
         const hasActiveSession = yield* adapter.hasSession(input.binding.threadId);
         if (hasActiveSession) {
           const activeSessions = yield* adapter.listSessions();
@@ -459,13 +467,13 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
             yield* analytics.record("provider.session.recovered", {
               provider: existing.provider,
               strategy: "adopt-existing",
-              hasResumeCursor: existing.resumeCursor !== undefined,
+              hasResumeCursor: hasResumeCursor(existing.resumeCursor),
             });
             return { adapter, session: existing } as const;
           }
         }
 
-        if (!hasResumeCursor) {
+        if (!hasPersistedResumeCursor) {
           return yield* toValidationError(
             input.operation,
             `Cannot recover thread '${input.binding.threadId}' because no provider resume state is persisted.`,
@@ -482,7 +490,7 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
           ...(persistedCwd ? { cwd: persistedCwd } : {}),
           ...(persistedModelSelection ? { modelSelection: persistedModelSelection } : {}),
           ...(persistedProviderOptions ? { providerOptions: persistedProviderOptions } : {}),
-          ...(hasResumeCursor ? { resumeCursor: input.binding.resumeCursor } : {}),
+          ...(hasPersistedResumeCursor ? { resumeCursor: input.binding.resumeCursor } : {}),
           runtimeMode: input.binding.runtimeMode ?? "full-access",
         });
         if (resumed.provider !== adapter.provider) {
@@ -496,7 +504,7 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
         yield* analytics.record("provider.session.recovered", {
           provider: resumed.provider,
           strategy: "resume-thread",
-          hasResumeCursor: resumed.resumeCursor !== undefined,
+          hasResumeCursor: hasResumeCursor(resumed.resumeCursor),
         });
         return { adapter, session: resumed } as const;
       });
@@ -598,7 +606,7 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
         yield* analytics.record("provider.session.started", {
           provider: session.provider,
           runtimeMode: input.runtimeMode,
-          hasResumeCursor: session.resumeCursor !== undefined,
+          hasResumeCursor: hasResumeCursor(session.resumeCursor),
           hasCwd: typeof input.cwd === "string" && input.cwd.trim().length > 0,
           hasModel:
             typeof input.modelSelection?.model === "string" &&
@@ -985,7 +993,9 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
           if (!session || session.status !== "ready" || session.activeTurnId !== undefined) {
             return;
           }
-          if (session.resumeCursor === undefined) {
+          // Live adapter snapshots can temporarily omit cursors even though the
+          // directory already persisted one from an earlier runtime event.
+          if (!hasResumeCursor(session.resumeCursor) && !hasResumeCursor(binding.resumeCursor)) {
             return;
           }
 

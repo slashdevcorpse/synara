@@ -198,6 +198,14 @@ function makeFakeCodexAdapter(provider: ProviderKind = "codex") {
     Effect.runSync(PubSub.publish(runtimeEventPubSub, event as unknown as ProviderRuntimeEvent));
   };
 
+  const waitForRuntimeSubscribers = (count = 1): Effect.Effect<void> =>
+    waitUntil(
+      () => runtimeEventPubSub.subscribers.size >= count,
+      500,
+      20,
+      `${provider} runtime event subscriber`,
+    );
+
   const updateSession = (
     threadId: ThreadId,
     update: (session: ProviderSession) => ProviderSession,
@@ -212,6 +220,7 @@ function makeFakeCodexAdapter(provider: ProviderKind = "codex") {
   return {
     adapter,
     emit,
+    waitForRuntimeSubscribers,
     updateSession,
     startSession,
     sendTurn,
@@ -230,7 +239,23 @@ function makeFakeCodexAdapter(provider: ProviderKind = "codex") {
 const sleep = (ms: number) =>
   Effect.promise(() => new Promise<void>((resolve) => setTimeout(resolve, ms)));
 
-function makeProviderServiceLayer() {
+const waitUntil = (
+  predicate: () => boolean,
+  timeoutMs = 500,
+  intervalMs = 20,
+  description = "condition",
+): Effect.Effect<void> =>
+  Effect.gen(function* () {
+    const deadline = Date.now() + timeoutMs;
+    while (!predicate() && Date.now() < deadline) {
+      yield* sleep(intervalMs);
+    }
+    if (!predicate()) {
+      assert.fail(`Timed out waiting for ${description}`);
+    }
+  });
+
+function makeProviderServiceLayer(options?: Parameters<typeof makeProviderServiceLive>[0]) {
   const codex = makeFakeCodexAdapter();
   const claude = makeFakeCodexAdapter("claudeAgent");
   const registry: typeof ProviderAdapterRegistry.Service = {
@@ -251,7 +276,7 @@ function makeProviderServiceLayer() {
 
   const layer = it.layer(
     Layer.mergeAll(
-      makeProviderServiceLive().pipe(
+      makeProviderServiceLive(options).pipe(
         Layer.provide(providerAdapterLayer),
         Layer.provide(directoryLayer),
         Layer.provideMerge(AnalyticsService.layerTest),
@@ -1293,6 +1318,63 @@ routing.layer("ProviderServiceLive routing", (it) => {
 
       fs.rmSync(tempDir, { recursive: true, force: true });
     }).pipe(Effect.provide(NodeServices.layer)),
+  );
+});
+
+const idleCleanup = makeProviderServiceLayer({ runtimeIdleStopMs: 20 });
+idleCleanup.layer("ProviderServiceLive idle cleanup", (it) => {
+  it.effect("stops idle ready runtime using the persisted cursor when the live snapshot omits it", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService;
+      const runtimeRepository = yield* ProviderSessionRuntimeRepository;
+
+      const session = yield* provider.startSession(asThreadId("thread-idle-persisted-cursor"), {
+        provider: "codex",
+        threadId: asThreadId("thread-idle-persisted-cursor"),
+        runtimeMode: "full-access",
+      });
+
+      const persistedBefore = yield* runtimeRepository.getByThreadId({
+        threadId: session.threadId,
+      });
+      assert.equal(Option.isSome(persistedBefore), true);
+      if (Option.isSome(persistedBefore)) {
+        assert.deepEqual(persistedBefore.value.resumeCursor, session.resumeCursor);
+      }
+
+      idleCleanup.codex.updateSession(session.threadId, (existing) => {
+        const { resumeCursor: _omittedResumeCursor, ...withoutResumeCursor } = existing;
+        return withoutResumeCursor;
+      });
+      yield* idleCleanup.codex.waitForRuntimeSubscribers();
+      idleCleanup.codex.emit({
+        type: "turn.completed",
+        eventId: asEventId("runtime-idle-persisted-cursor-complete"),
+        provider: "codex",
+        createdAt: "2026-02-27T00:04:00.000Z",
+        threadId: session.threadId,
+        payload: { state: "completed" },
+      });
+
+      yield* waitUntil(
+        () => idleCleanup.codex.stopSession.mock.calls.length > 0,
+        500,
+        20,
+        "idle runtime stop",
+      );
+
+      assert.equal(idleCleanup.codex.stopSession.mock.calls.length, 1);
+      assert.deepEqual(idleCleanup.codex.stopSession.mock.calls[0]?.[0], session.threadId);
+
+      const persistedAfter = yield* runtimeRepository.getByThreadId({
+        threadId: session.threadId,
+      });
+      assert.equal(Option.isSome(persistedAfter), true);
+      if (Option.isSome(persistedAfter)) {
+        assert.equal(persistedAfter.value.status, "stopped");
+        assert.deepEqual(persistedAfter.value.resumeCursor, session.resumeCursor);
+      }
+    }),
   );
 });
 
