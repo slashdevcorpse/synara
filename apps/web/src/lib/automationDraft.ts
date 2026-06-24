@@ -153,17 +153,6 @@ export function buildAutomationDraftWarnings(input: {
   return warnings;
 }
 
-type RunBlockingRiskWarningId = Extract<
-  AutomationAcknowledgedRiskId,
-  "full-access" | "local-checkout"
->;
-
-function isRunBlockingRiskWarningId(
-  id: AutomationDraftWarningId,
-): id is RunBlockingRiskWarningId {
-  return id === "full-access" || id === "local-checkout";
-}
-
 function warningIdsRequiringAcknowledgement(
   warnings: readonly AutomationDraftWarning[],
 ): ReadonlySet<AutomationDraftWarningId> {
@@ -173,12 +162,10 @@ function warningIdsRequiringAcknowledgement(
 }
 
 // Computes the approval an existing automation still needs before it can run.
-// `warnings` are the run-blocking risks that have not been acknowledged — they drive the
-// approval banner (empty means no approval needed). `acknowledgedRisks` is the full set to
-// persist when approving: every risk the config requires, merged with what is already
-// acknowledged. It includes fast-interval when the schedule is sub-minute, because
-// automation.update revalidates the whole definition and rejects such a schedule unless
-// fast-interval is acknowledged — so a banner approval would otherwise fail to save.
+// `warnings` are the visible risks that the approval will persist, and `acknowledgedRisks`
+// is the full risk set to save: every risk the config requires, merged with existing
+// acknowledgements. Sub-minute schedules may also need a capped maxIterations patch so the
+// acknowledgement-only update passes the server's active-schedule validation.
 export function automationApprovalGaps(input: {
   readonly schedule: AutomationSchedule;
   readonly mode: AutomationMode;
@@ -186,11 +173,13 @@ export function automationApprovalGaps(input: {
   readonly worktreeMode: AutomationWorktreeMode;
   readonly prompt: string;
   readonly acknowledgedRisks: readonly AutomationAcknowledgedRiskId[];
+  readonly enabled?: boolean;
+  readonly maxIterations?: number | null;
 }): {
   readonly warnings: readonly AutomationDraftWarning[];
   readonly acknowledgedRisks: readonly AutomationAcknowledgedRiskId[];
+  readonly maxIterations?: number;
 } {
-  const acknowledged = new Set(input.acknowledgedRisks);
   const allWarnings = buildAutomationDraftWarnings({
     schedule: input.schedule,
     mode: input.mode,
@@ -202,11 +191,12 @@ export function automationApprovalGaps(input: {
     prompt: input.prompt,
   });
   const requiredWarningIds = warningIdsRequiringAcknowledgement(allWarnings);
+  const acknowledgedWarningIds = warningIdsForAcknowledgedRisks(input.acknowledgedRisks);
   const warnings = allWarnings.filter(
     (warning) =>
       warning.requiresAcknowledgement &&
-      isRunBlockingRiskWarningId(warning.id) &&
-      !acknowledged.has(warning.id),
+      requiredWarningIds.has(warning.id) &&
+      !acknowledgedWarningIds.has(warning.id),
   );
   const acknowledgedRisks = Array.from(
     new Set([
@@ -214,7 +204,16 @@ export function automationApprovalGaps(input: {
       ...acknowledgedRiskIdsForDraft(allWarnings, requiredWarningIds),
     ]),
   );
-  return { warnings, acknowledgedRisks };
+  const maxIterations =
+    input.enabled === true &&
+    input.schedule.type === "interval" &&
+    input.schedule.everySeconds < 60 &&
+    (input.maxIterations === null ||
+      (input.maxIterations ?? DEFAULT_AUTOMATION_FAST_INTERVAL_MAX_ITERATIONS) >
+        DEFAULT_AUTOMATION_FAST_INTERVAL_MAX_ITERATIONS)
+      ? DEFAULT_AUTOMATION_FAST_INTERVAL_MAX_ITERATIONS
+      : undefined;
+  return { warnings, acknowledgedRisks, maxIterations };
 }
 
 export function acknowledgedRiskIdsForDraft(

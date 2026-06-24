@@ -2015,6 +2015,11 @@ export const AutomationServiceLive = Layer.effect(
       Effect.gen(function* () {
         const definition = yield* requireDefinition(input.automationId);
         const now = isoNow();
+        yield* validateRiskAcknowledgements({
+          runtimeMode: definition.runtimeMode,
+          worktreeMode: definition.worktreeMode,
+          acknowledgedRisks: definition.acknowledgedRisks,
+        });
         // Heartbeat automations continue a single shared thread, so a manual run must not
         // race a scheduled (or earlier manual) run that is still in flight. Standalone
         // automations spawn independent threads, so concurrent manual runs are fine.
@@ -2128,6 +2133,12 @@ export const AutomationServiceLive = Layer.effect(
           yield* publishDefinition(definition.id);
           return Option.none<AutomationRunNowResult>();
         }
+
+        yield* validateRiskAcknowledgements({
+          runtimeMode: definition.runtimeMode,
+          worktreeMode: definition.worktreeMode,
+          acknowledgedRisks: definition.acknowledgedRisks,
+        });
 
         const occurrence = scheduledOccurrenceForDefinition(definition, now);
         const { scheduledFor, nextRunAt } = occurrence;

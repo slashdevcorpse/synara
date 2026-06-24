@@ -267,6 +267,8 @@ function AutomationDetailView() {
     worktreeMode: definition.worktreeMode,
     prompt: definition.prompt,
     acknowledgedRisks: definition.acknowledgedRisks,
+    enabled: definition.enabled,
+    maxIterations: definition.maxIterations,
   });
   const approveAutomationRisks = () =>
     // Records consent only, persisting the full required risk set so the update validates.
@@ -275,6 +277,9 @@ function AutomationDetailView() {
     updateMutation.mutateAsync({
       id: definition.id,
       acknowledgedRisks: approvalGaps.acknowledgedRisks,
+      ...(approvalGaps.maxIterations !== undefined
+        ? { maxIterations: approvalGaps.maxIterations }
+        : {}),
     });
   const handleApproveAndRunNow = async () => {
     try {

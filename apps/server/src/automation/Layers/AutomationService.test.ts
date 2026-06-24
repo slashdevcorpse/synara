@@ -841,6 +841,40 @@ layer("AutomationService", (it) => {
     }),
   );
 
+  it.effect("blocks due scheduled full-access automations until acknowledged", () =>
+    Effect.gen(function* () {
+      resetHarness();
+      const service = yield* AutomationService;
+      const repository = yield* AutomationRepository;
+      const automationId = AutomationId.makeUnsafe("automation-due-unapproved-full-access");
+
+      yield* repository.createDefinition({
+        id: automationId,
+        input: {
+          ...createInput("worktree"),
+          schedule: { type: "interval", everySeconds: 300 },
+          runtimeMode: "full-access",
+          acknowledgedRisks: [],
+        },
+        now: "2026-06-16T10:00:00.000Z",
+      });
+
+      const results = yield* service.runDueOnce({
+        now: "2026-06-16T10:00:00.000Z",
+        limit: 10,
+        leaseOwnerId: "test-scheduler",
+      });
+      const listed = yield* service.list({ projectId });
+
+      assert.strictEqual(results.length, 0);
+      assert.strictEqual(dispatchedCommands.length, 0);
+      assert.strictEqual(
+        listed.runs.filter((run) => run.automationId === automationId).length,
+        0,
+      );
+    }),
+  );
+
   it.effect("records and advances missed scheduled occurrences when misfire policy is skip", () =>
     Effect.gen(function* () {
       resetHarness();
