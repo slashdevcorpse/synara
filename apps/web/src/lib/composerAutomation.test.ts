@@ -508,6 +508,25 @@ describe("composerAutomation", () => {
     });
   });
 
+  it("keeps 'please' as task content when generation is unavailable", async () => {
+    // Generation fails, so the deterministic invocation is carried forward. "please" must
+    // survive (it is real task content here), unlike "for me" possessive filler.
+    const offline = vi.fn(async () => {
+      throw new Error("generation unavailable");
+    });
+    const decision = await resolveComposerAutomationRequest({
+      message: "create an automation to remind me to say please",
+      cwd: "/tmp/project",
+      nowIso: NOW_ISO,
+      generateIntent: offline,
+    });
+    expect(decision.type).toBe("needs-clarification");
+    if (decision.type !== "needs-clarification") {
+      throw new Error("Expected needs-clarification decision");
+    }
+    expect(decision.automationMessage).toContain("say please");
+  });
+
   describe("automationClarificationPrompt", () => {
     it("asks for both the task and cadence when the task is missing", () => {
       expect(automationClarificationPrompt(["taskPrompt", "schedule"])).toContain(

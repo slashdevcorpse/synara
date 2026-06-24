@@ -81,14 +81,15 @@ export interface ComposerAutomationDraftDecision {
   readonly needsDraftReview: boolean;
 }
 
-// Trailing filler like "for me" / "per favore" carries no task content, but once a
-// follow-up answer is folded onto the accumulated request it would survive into the
-// parsed prompt (e.g. "for me check the build"). Strip it so multi-turn setup keeps a
-// clean task. Conservative on purpose: only first/second-person filler, never nouns.
+// Trailing "for me" filler carries no task content, but once a follow-up answer is
+// folded onto the accumulated request it would survive into the parsed prompt (e.g.
+// "for me check the build"). Strip it so multi-turn setup keeps a clean task.
+// Deliberately narrow: only the "for me/us/myself" possessive tail (and its Italian
+// form). "please" is left alone because it can be real task content ("say please").
 function stripTrailingAutomationFiller(message: string): string {
   return message
     .replace(/[?？]+\s*$/u, "")
-    .replace(/\s+(?:for\s+(?:me|us|myself)|per\s+(?:me|noi)|please|per favore)\s*$/iu, "")
+    .replace(/\s+(?:for\s+(?:me|us|myself)|per\s+(?:me|noi))\s*$/iu, "")
     .trim();
 }
 

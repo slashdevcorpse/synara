@@ -5906,17 +5906,13 @@ export default function ChatView({
       const restored = draft
         ? `${pendingAutomationConversation.accumulatedMessage}\n${draft}`
         : pendingAutomationConversation.accumulatedMessage;
+      // Restore only the prompt text; any attachments/skills/mentions the user added
+      // during setup stay in the draft so Cancel never discards them.
       promptRef.current = restored;
-      clearComposerDraftContent(activeThread.id);
       setComposerDraftPrompt(activeThread.id, restored);
     }
     setPendingAutomationConversation(null);
-  }, [
-    activeThread,
-    clearComposerDraftContent,
-    pendingAutomationConversation,
-    setComposerDraftPrompt,
-  ]);
+  }, [activeThread, pendingAutomationConversation, setComposerDraftPrompt]);
 
   const toggleAutomationWarning = useCallback((id: AutomationDraftWarningId, checked: boolean) => {
     setAcknowledgedAutomationWarnings((current) => {
@@ -6625,7 +6621,14 @@ export default function ChatView({
           // automationMessage accumulates for the next re-resolve and for Cancel's restore.
           const question = automationClarificationPrompt(automationRequest.missingFields);
           const priorBubbles = conversation?.bubbles ?? [];
-          clearComposerInput(activeThread.id);
+          // Clear only the submitted text so a fresh answer can be typed; anything added
+          // while intent generation was resolving (a new attachment, or more typing) is
+          // preserved rather than wiped.
+          if (promptRef.current.trim() === trimmedPromptForSend) {
+            promptRef.current = "";
+            setComposerDraftPrompt(activeThread.id, "");
+            setComposerTrigger(null);
+          }
           setPendingAutomationConversation({
             accumulatedMessage: automationRequest.automationMessage,
             bubbles: [
@@ -6659,8 +6662,8 @@ export default function ChatView({
           if (conversation !== null) {
             // Keep the full multi-turn request in the composer so dismissing the review
             // dialog doesn't lose it (the single-turn path likewise leaves its text).
+            // Restore only the text; any attachments/mentions on the final reply stay.
             promptRef.current = messageForAutomation;
-            clearComposerDraftContent(activeThread.id);
             setComposerDraftPrompt(activeThread.id, messageForAutomation);
           }
           setAutomationEditingDefinition(null);
