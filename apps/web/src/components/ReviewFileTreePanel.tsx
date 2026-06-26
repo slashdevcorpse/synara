@@ -76,8 +76,11 @@ const ReviewFileTreeNodes = memo(function ReviewFileTreeNodes(props: {
       {props.nodes.map((node) => {
         if (node.kind === "file") {
           return (
+            // Namespace keys by kind: a diff that replaces a file with a
+            // same-named directory (delete `foo`, add `foo/bar`) yields sibling
+            // file and directory nodes sharing the same path.
             <ReviewTreeRow
-              key={node.path}
+              key={`file:${node.path}`}
               depth={props.depth}
               selected={node.path === props.selectedFilePath}
               leading={
@@ -96,7 +99,7 @@ const ReviewFileTreeNodes = memo(function ReviewFileTreeNodes(props: {
         const open = !props.isPathCollapsed(node.path);
         return (
           <Collapsible
-            key={node.path}
+            key={`dir:${node.path}`}
             open={open}
             onOpenChange={() => props.onToggleDirectory(node.path)}
           >

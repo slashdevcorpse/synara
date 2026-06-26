@@ -82,6 +82,21 @@ describe("buildFileDiffTree", () => {
     expect(names(root.children)).toEqual(["nested", "one.ts"]);
   });
 
+  it("keeps a same-named file and directory as distinct sibling nodes", () => {
+    // A diff that deletes file `foo` while adding `foo/bar.ts` yields a directory
+    // and a file that share the path "foo"; both must survive as siblings so the
+    // replacement renders faithfully (the panel disambiguates their React keys
+    // by node kind).
+    const tree = buildFileDiffTree([createFileDiff("foo"), createFileDiff("foo/bar.ts")]);
+    expect(tree).toHaveLength(2);
+
+    const directory = tree.find((node) => node.kind === "directory");
+    const file = tree.find((node) => node.kind === "file");
+    expect(directory?.path).toBe("foo");
+    expect(file?.path).toBe("foo");
+    expect(names(asDirectory(directory).children)).toEqual(["bar.ts"]);
+  });
+
   it("sorts entries with natural, case-insensitive ordering", () => {
     const tree = buildFileDiffTree([
       createFileDiff("file10.ts"),

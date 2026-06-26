@@ -43,6 +43,22 @@ describe("ReviewFileTreePanel", () => {
     expect(markup).toContain("ChatView.tsx");
   });
 
+  it("renders a same-named file and directory replacement as distinct rows", () => {
+    // Deleting `foo` while adding `foo/bar.ts` produces sibling nodes that share
+    // the path "foo"; the panel must render both without colliding React keys.
+    const markup = renderToStaticMarkup(
+      <ReviewFileTreePanel
+        files={[createFileDiff("foo"), createFileDiff("foo/bar.ts")]}
+        selectedFilePath="foo"
+        resolvedTheme="dark"
+        onSelectFile={vi.fn()}
+      />,
+    );
+
+    expect(markup).toContain("foo");
+    expect(markup).toContain("bar.ts");
+  });
+
   it("shows a coherent empty state when there are no files", () => {
     const markup = renderToStaticMarkup(
       <ReviewFileTreePanel
