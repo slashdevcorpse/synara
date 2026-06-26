@@ -9498,11 +9498,10 @@ export default function ChatView({
   );
   const onReviewComposerLiveChanges = useCallback(() => {
     if (!activeTurnLiveDiffState.turnId) {
-      onOpenDiff();
       return;
     }
     onOpenTurnDiff(activeTurnLiveDiffState.turnId);
-  }, [activeTurnLiveDiffState.turnId, onOpenDiff, onOpenTurnDiff]);
+  }, [activeTurnLiveDiffState.turnId, onOpenTurnDiff]);
   const onNavigateToThread = useCallback(
     (nextThreadId: ThreadId) => {
       void navigate({
@@ -9869,7 +9868,7 @@ export default function ChatView({
                 fileCount={activeTurnLiveDiffState.fileCount}
                 additions={activeTurnLiveDiffState.additions}
                 deletions={activeTurnLiveDiffState.deletions}
-                onReview={onReviewComposerLiveChanges}
+                onReview={activeTurnLiveDiffState.turnId ? onReviewComposerLiveChanges : undefined}
               />
             ) : null}
             {renderActiveTaskListCard(showComposerLiveChangesHeader)}

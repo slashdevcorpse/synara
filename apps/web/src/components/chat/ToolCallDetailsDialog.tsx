@@ -6,9 +6,11 @@
 
 import type { ReactNode } from "react";
 import { ChangesIcon, TerminalIcon } from "~/lib/icons";
+import { createMarkdownCodeFence, formatShellTranscript } from "~/lib/toolCallDetailsFormatting";
 import { cn } from "~/lib/utils";
-import type { WorkLogToolOutputDetails } from "../../lib/toolCallDetails";
+import type { WorkLogToolDetails, WorkLogToolOutputDetails } from "../../lib/toolCallDetails";
 import type { WorkLogEntry } from "../../session-logic";
+import ChatMarkdown from "../ChatMarkdown";
 import {
   Dialog,
   DialogDescription,
@@ -22,6 +24,8 @@ const DETAIL_HEADER_CLASS_NAME =
   "border-b border-border/45 px-3 py-2 text-[10px] font-medium uppercase tracking-[0.14em]";
 const DETAIL_CODE_BLOCK_CLASS_NAME =
   "max-h-[min(46vh,30rem)] overflow-auto whitespace-pre-wrap break-words font-chat-code text-[11px] leading-relaxed text-foreground/88";
+const TOOL_DETAILS_MARKDOWN_CLASS_NAME =
+  "text-[length:var(--app-font-size-ui,12px)] leading-relaxed";
 
 interface ToolCallDetailsDialogProps {
   entry: WorkLogEntry | null;
@@ -56,83 +60,104 @@ export function ToolCallDetailsDialog({ entry, open, onOpenChange }: ToolCallDet
           className="max-h-[min(72vh,620px)] space-y-4 px-4 py-4"
           data-tool-details-dialog="true"
         >
-          {details ? (
-            <>
-              {details.command ? (
-                <ToolDetailSection title="Command">
-                  <ToolCodeBlock tone="command">{details.command}</ToolCodeBlock>
-                </ToolDetailSection>
-              ) : null}
-
-              {details.files?.length ? (
-                <ToolDetailSection title="Files">
-                  <div className="flex flex-wrap gap-1.5">
-                    {details.files.map((file) => (
-                      <span
-                        key={file}
-                        className="max-w-full rounded-md border border-border/45 bg-background/70 px-2 py-1 font-chat-code text-[11px] text-foreground/82"
-                        title={file}
-                      >
-                        {file}
-                      </span>
-                    ))}
-                  </div>
-                </ToolDetailSection>
-              ) : null}
-
-              {details.diff ? (
-                <ToolDetailSection title="Diff">
-                  <DiffCodeBlock>{details.diff}</DiffCodeBlock>
-                </ToolDetailSection>
-              ) : null}
-
-              {details.edits?.length ? (
-                <ToolDetailSection title="Edits">
-                  <div className="space-y-3">
-                    {details.edits.map((edit, index) => (
-                      <div
-                        key={`${edit.path ?? "edit"}:${index}`}
-                        className="overflow-hidden rounded-lg border border-border/45 bg-background/58"
-                      >
-                        {edit.path ? (
-                          <div className="border-b border-border/45 px-3 py-2 font-chat-code text-[11px] text-muted-foreground/72">
-                            {edit.path}
-                          </div>
-                        ) : null}
-                        <div className="grid gap-0 md:grid-cols-2">
-                          {edit.oldText !== undefined ? (
-                            <TextChangeBlock title="Before" tone="remove">
-                              {edit.oldText}
-                            </TextChangeBlock>
-                          ) : null}
-                          {edit.newText !== undefined ? (
-                            <TextChangeBlock title="After" tone="add">
-                              {edit.newText}
-                            </TextChangeBlock>
-                          ) : null}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                </ToolDetailSection>
-              ) : null}
-
-              {details.content ? (
-                <ToolDetailSection title="Written Content">
-                  <ToolCodeBlock>{details.content}</ToolCodeBlock>
-                </ToolDetailSection>
-              ) : null}
-
-              {details.output ? <ToolOutputSection output={details.output} /> : null}
-            </>
-          ) : (
-            <div className="rounded-lg border border-border/45 bg-background/60 px-3 py-2 text-sm text-muted-foreground">
-              No detailed payload was available for this tool call.
-            </div>
-          )}
+          <ToolCallDetailsContent details={details} />
         </DialogPanel>
       </DialogPopup>
     </Dialog>
+  );
+}
+
+export function ToolCallDetailsContent({ details }: { details: WorkLogToolDetails | undefined }) {
+  if (!details) {
+    return (
+      <div className="rounded-lg border border-border/45 bg-background/60 px-3 py-2 text-sm text-muted-foreground">
+        No detailed payload was available for this tool call.
+      </div>
+    );
+  }
+
+  return (
+    <>
+      {details.command ? (
+        <div className="space-y-2">
+          <MarkdownToolCodeBlock language="bash">
+            {formatShellTranscript(details.command, details.output)}
+          </MarkdownToolCodeBlock>
+          {details.output ? <ToolOutputMetadata output={details.output} /> : null}
+        </div>
+      ) : null}
+
+      {details.files?.length ? (
+        <ToolDetailSection title="Files">
+          <div className="flex flex-wrap gap-1.5">
+            {details.files.map((file) => (
+              <span
+                key={file}
+                className="max-w-full rounded-md border border-border/45 bg-background/70 px-2 py-1 font-chat-code text-[11px] text-foreground/82"
+                title={file}
+              >
+                {file}
+              </span>
+            ))}
+          </div>
+        </ToolDetailSection>
+      ) : null}
+
+      {details.diff ? (
+        <ToolDetailSection title="Diff">
+          <DiffCodeBlock>{details.diff}</DiffCodeBlock>
+        </ToolDetailSection>
+      ) : null}
+
+      {details.edits?.length ? (
+        <ToolDetailSection title="Edits">
+          <div className="space-y-3">
+            {details.edits.map((edit, index) => (
+              <div
+                key={`${edit.path ?? "edit"}:${index}`}
+                className="overflow-hidden rounded-lg border border-border/45 bg-background/58"
+              >
+                {edit.path ? (
+                  <div className="border-b border-border/45 px-3 py-2 font-chat-code text-[11px] text-muted-foreground/72">
+                    {edit.path}
+                  </div>
+                ) : null}
+                <div className="grid gap-0 md:grid-cols-2">
+                  {edit.oldText !== undefined ? (
+                    <TextChangeBlock title="Before" tone="remove">
+                      {edit.oldText}
+                    </TextChangeBlock>
+                  ) : null}
+                  {edit.newText !== undefined ? (
+                    <TextChangeBlock title="After" tone="add">
+                      {edit.newText}
+                    </TextChangeBlock>
+                  ) : null}
+                </div>
+              </div>
+            ))}
+          </div>
+        </ToolDetailSection>
+      ) : null}
+
+      {details.content ? (
+        <ToolDetailSection title="Written Content">
+          <MarkdownToolCodeBlock language="text">{details.content}</MarkdownToolCodeBlock>
+        </ToolDetailSection>
+      ) : null}
+
+      {details.output && !details.command ? <ToolOutputSection output={details.output} /> : null}
+    </>
+  );
+}
+
+function MarkdownToolCodeBlock(props: { language: string; children: string }) {
+  return (
+    <ChatMarkdown
+      text={createMarkdownCodeFence(props.language, props.children)}
+      cwd={undefined}
+      className={TOOL_DETAILS_MARKDOWN_CLASS_NAME}
+    />
   );
 }
 
@@ -147,11 +172,33 @@ function ToolDetailSection(props: { title: string; children: ReactNode }) {
   );
 }
 
+function ToolOutputMetadata({ output }: { output: WorkLogToolOutputDetails }) {
+  if (output.exitCode === undefined && !output.truncated) {
+    return null;
+  }
+  return (
+    <div className="flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground/68">
+      {output.exitCode !== undefined ? (
+        <span className="rounded-full border border-border/45 px-2 py-0.5">
+          Exit code {output.exitCode}
+        </span>
+      ) : null}
+      {output.truncated ? (
+        <span className="rounded-full border border-amber-500/30 bg-amber-500/8 px-2 py-0.5 text-amber-200/90">
+          Truncated
+        </span>
+      ) : null}
+    </div>
+  );
+}
+
 function ToolOutputSection({ output }: { output: WorkLogToolOutputDetails }) {
   return (
     <ToolDetailSection title="Output">
       <div className="space-y-3">
-        {output.output ? <ToolCodeBlock>{output.output}</ToolCodeBlock> : null}
+        {output.output ? (
+          <MarkdownToolCodeBlock language="text">{output.output}</MarkdownToolCodeBlock>
+        ) : null}
         {output.stdout ? (
           <LabeledCodeBlock title="Stdout" tone="output">
             {output.stdout}
@@ -162,20 +209,7 @@ function ToolOutputSection({ output }: { output: WorkLogToolOutputDetails }) {
             {output.stderr}
           </LabeledCodeBlock>
         ) : null}
-        {output.exitCode !== undefined || output.truncated ? (
-          <div className="flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground/68">
-            {output.exitCode !== undefined ? (
-              <span className="rounded-full border border-border/45 px-2 py-0.5">
-                Exit code {output.exitCode}
-              </span>
-            ) : null}
-            {output.truncated ? (
-              <span className="rounded-full border border-amber-500/30 bg-amber-500/8 px-2 py-0.5 text-amber-200/90">
-                Truncated
-              </span>
-            ) : null}
-          </div>
-        ) : null}
+        <ToolOutputMetadata output={output} />
       </div>
     </ToolDetailSection>
   );

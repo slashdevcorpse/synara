@@ -45,7 +45,7 @@ import {
   type ThreadWorkspacePatch,
 } from "./types";
 import { Debouncer } from "@tanstack/react-pacer";
-import { hasLiveTurnTailWork } from "./session-logic";
+import { hasLiveTurnTailWork, isSessionRunningTurn } from "./session-logic";
 import { deriveThreadSummaryMetadata } from "@t3tools/shared/threadSummary";
 import { getThreadFromState, getThreadsFromState } from "./threadDerivation";
 import { toAttachmentPreviewUrl } from "./lib/wsHttpUrl";
@@ -2148,6 +2148,9 @@ function sidebarThreadSummariesEqual(
     left.envMode === right.envMode &&
     left.branch === right.branch &&
     left.worktreePath === right.worktreePath &&
+    (left.associatedWorktreePath ?? null) === (right.associatedWorktreePath ?? null) &&
+    (left.associatedWorktreeBranch ?? null) === (right.associatedWorktreeBranch ?? null) &&
+    (left.associatedWorktreeRef ?? null) === (right.associatedWorktreeRef ?? null) &&
     left.session === right.session &&
     left.createdAt === right.createdAt &&
     (left.archivedAt ?? null) === (right.archivedAt ?? null) &&
@@ -2187,6 +2190,9 @@ function buildSidebarThreadSummary(
     envMode: thread.envMode,
     branch: thread.branch,
     worktreePath: thread.worktreePath,
+    associatedWorktreePath: thread.associatedWorktreePath ?? null,
+    associatedWorktreeBranch: thread.associatedWorktreeBranch ?? null,
+    associatedWorktreeRef: thread.associatedWorktreeRef ?? null,
     session: thread.session,
     createdAt: thread.createdAt,
     archivedAt: thread.archivedAt ?? null,
@@ -2637,7 +2643,7 @@ function reconcileLatestTurnFromSession(
   session: NonNullable<ReadModelThread["session"]>,
   error: string | null,
 ): Thread["latestTurn"] {
-  if (session.status === "running" && session.activeTurnId !== null) {
+  if (isSessionRunningTurn(session)) {
     return buildLatestTurn({
       previous: thread.latestTurn,
       turnId: session.activeTurnId,
