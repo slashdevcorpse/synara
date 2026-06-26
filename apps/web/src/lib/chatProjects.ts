@@ -18,6 +18,19 @@ import { newCommandId, newProjectId } from "./utils";
 const pendingHomeChatCreationByWorkspaceRoot = new Map<string, Promise<ProjectId | null>>();
 const pendingHomeChatFixupByWorkspaceRoot = new Map<string, Promise<void>>();
 
+async function updateHomeChatProjectMetadata(
+  api: NonNullable<ReturnType<typeof readNativeApi>>,
+  projectId: ProjectId,
+): Promise<void> {
+  await api.orchestration.dispatchCommand({
+    type: "project.meta.update",
+    commandId: newCommandId(),
+    projectId,
+    kind: "chat",
+    title: "Home",
+  });
+}
+
 function matchesLegacyHomeChatWorkspaceRoot(
   project: Pick<Project, "cwd">,
   input: ServerWorkspacePaths,
@@ -132,13 +145,7 @@ async function fixupHomeChatProject(input: ServerWorkspacePaths): Promise<void> 
   }
 
   if (needsKindFixup) {
-    await api.orchestration.dispatchCommand({
-      type: "project.meta.update",
-      commandId: newCommandId(),
-      projectId: canonicalProjectId,
-      kind: "chat",
-      title: "Home",
-    });
+    await updateHomeChatProjectMetadata(api, canonicalProjectId);
   }
 
   for (const duplicateProjectId of duplicateProjectIds) {
@@ -207,7 +214,9 @@ export async function ensureHomeChatProject(
       if (isDuplicateProjectCreateError(message)) {
         const duplicateProjectId = extractDuplicateProjectCreateProjectId(message);
         if (duplicateProjectId) {
-          return duplicateProjectId as ProjectId;
+          const homeProjectId = duplicateProjectId as ProjectId;
+          await updateHomeChatProjectMetadata(api, homeProjectId);
+          return homeProjectId;
         }
       }
       throw error;

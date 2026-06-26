@@ -104,10 +104,12 @@ describe("isHomeChatContainerProject", () => {
 
   it("recovers an existing Home project id when creation races a stale duplicate", async () => {
     const existingProjectId = ProjectId.makeUnsafe("project-home-existing");
-    const dispatchCommand = vi.fn(async () => {
-      throw new Error(
-        `Orchestration command invariant failed (project.create): Project '${existingProjectId}' already uses workspace root '/Users/tester'.`,
-      );
+    const dispatchCommand = vi.fn(async (command: { type: string }) => {
+      if (command.type === "project.create") {
+        throw new Error(
+          `Orchestration command invariant failed (project.create): Project '${existingProjectId}' already uses workspace root '/Users/tester'.`,
+        );
+      }
     });
     vi.stubGlobal("window", {
       nativeApi: {
@@ -128,6 +130,14 @@ describe("isHomeChatContainerProject", () => {
         type: "project.create",
         kind: "chat",
         workspaceRoot: "/Users/tester",
+      }),
+    );
+    expect(dispatchCommand).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "project.meta.update",
+        projectId: existingProjectId,
+        kind: "chat",
+        title: "Home",
       }),
     );
   });
