@@ -18,6 +18,16 @@ import { newCommandId, newProjectId } from "./utils";
 const pendingHomeChatCreationByWorkspaceRoot = new Map<string, Promise<ProjectId | null>>();
 const pendingHomeChatFixupByWorkspaceRoot = new Map<string, Promise<void>>();
 
+interface HomeChatContainerCandidate {
+  readonly id?: ProjectId;
+  readonly kind?: Project["kind"];
+  readonly cwd?: string;
+  readonly workspaceRoot?: string;
+  readonly name?: string;
+  readonly remoteName?: string;
+  readonly title?: string;
+}
+
 async function updateHomeChatProjectMetadata(
   api: NonNullable<ReturnType<typeof readNativeApi>>,
   projectId: ProjectId,
@@ -29,6 +39,61 @@ async function updateHomeChatProjectMetadata(
     kind: "chat",
     title: "Home",
   });
+}
+
+function isHomeChatContainerCandidate(
+  project: HomeChatContainerCandidate | null | undefined,
+  paths: ServerWorkspacePaths,
+): boolean {
+  const cwd = project?.cwd ?? project?.workspaceRoot ?? "";
+  if (!cwd) {
+    return false;
+  }
+
+  const title = project?.title ?? "";
+  return isHomeChatContainerProject(
+    {
+      cwd,
+      kind: project?.kind ?? "project",
+      name: project?.name ?? title,
+      remoteName: project?.remoteName ?? title,
+    },
+    paths,
+  );
+}
+
+function findHomeChatContainerCandidateById<T extends HomeChatContainerCandidate>(
+  projects: readonly T[],
+  projectId: ProjectId,
+  paths: ServerWorkspacePaths,
+): T | null {
+  return (
+    projects.find(
+      (project) => project.id === projectId && isHomeChatContainerCandidate(project, paths),
+    ) ?? null
+  );
+}
+
+async function findDuplicateHomeChatContainer(
+  api: NonNullable<ReturnType<typeof readNativeApi>>,
+  projectId: ProjectId,
+  paths: ServerWorkspacePaths,
+): Promise<HomeChatContainerCandidate | null> {
+  const localProject = findHomeChatContainerCandidateById(
+    useStore.getState().projects,
+    projectId,
+    paths,
+  );
+  if (localProject) {
+    return localProject;
+  }
+
+  const snapshot = await api.orchestration.getShellSnapshot().catch(() => null);
+  if (!snapshot) {
+    return null;
+  }
+
+  return findHomeChatContainerCandidateById(snapshot.projects, projectId, paths);
 }
 
 function matchesLegacyHomeChatWorkspaceRoot(
@@ -215,8 +280,13 @@ export async function ensureHomeChatProject(
         const duplicateProjectId = extractDuplicateProjectCreateProjectId(message);
         if (duplicateProjectId) {
           const homeProjectId = duplicateProjectId as ProjectId;
-          await updateHomeChatProjectMetadata(api, homeProjectId);
-          return homeProjectId;
+          const duplicateProject = await findDuplicateHomeChatContainer(api, homeProjectId, paths);
+          if (duplicateProject) {
+            if (duplicateProject.kind !== "chat") {
+              await updateHomeChatProjectMetadata(api, homeProjectId);
+            }
+            return homeProjectId;
+          }
         }
       }
       throw error;
