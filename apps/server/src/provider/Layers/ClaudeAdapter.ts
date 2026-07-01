@@ -274,13 +274,16 @@ interface ClaudeSessionContext {
   // Tasks announced via task_started, keyed by the spawning tool_use id. Lets
   // subagent output that arrives after the Task tool_result already resolved
   // (backgrounded subagents) surface as task progress instead of being dropped.
-  // Entries are removed when the task reaches a terminal state.
+  // turnId is the turn that spawned the task: late background events must carry
+  // a turn id or the web work-log filter hides them. Entries are removed when
+  // the task reaches a terminal state.
   readonly knownTasksByToolUseId: Map<
     string,
     {
       readonly taskId: string;
       readonly description: string;
       readonly subagentType?: string;
+      readonly turnId?: TurnId;
     }
   >;
 }
@@ -1839,7 +1842,10 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
               status: "inProgress",
               title: toolEntry.title,
               ...(toolEntry.detail ? { detail: toolEntry.detail } : {}),
+              // `output` is the field the web's collab work-log extraction
+              // renders; `subagentText` rides along for richer clients.
               data: toolLifecycleEventData(toolEntry, {
+                output: latestText,
                 subagentText: latestText,
                 ...(subagentType ? { subagentType } : {}),
               }),
@@ -1859,6 +1865,10 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
           return;
         }
 
+        // Late background progress usually arrives after the spawning turn
+        // completed; stamp it with that turn's id anyway — the web work-log
+        // filter hides turn-less activities once turn-stamped messages exist.
+        const progressTurnId = context.turnState?.turnId ?? taskInfo.turnId;
         const stamp = yield* makeEventStamp();
         yield* offerRuntimeEvent({
           type: "task.progress",
@@ -1866,7 +1876,7 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
           provider: PROVIDER,
           createdAt: stamp.createdAt,
           threadId: context.session.threadId,
-          ...(context.turnState ? { turnId: asCanonicalTurnId(context.turnState.turnId) } : {}),
+          ...(progressTurnId ? { turnId: asCanonicalTurnId(progressTurnId) } : {}),
           payload: {
             taskId: RuntimeTaskId.makeUnsafe(taskInfo.taskId),
             description: taskInfo.description,
@@ -1952,11 +1962,14 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
         // Incremental task patches stay off the timeline (they're covered by
         // task_started/progress/notification), but terminal patches are the
         // reliable cleanup signal for per-task bookkeeping — a killed or failed
-        // task may never emit a task_notification.
+        // task may never emit a task_notification. hiddenTaskIds is deliberately
+        // NOT cleaned here: a terminal patch can precede the task_notification,
+        // and the notification does not always repeat skip_transcript, so the
+        // tombstone must survive until the notification consumes it (a leaked
+        // string per never-notifying hidden task is negligible).
         if (message.subtype === "task_updated") {
           const patchStatus = (message.patch as { status?: string } | undefined)?.status;
           if (patchStatus === "completed" || patchStatus === "failed" || patchStatus === "killed") {
-            context.hiddenTaskIds.delete(message.task_id);
             for (const [toolUseId, taskInfo] of context.knownTasksByToolUseId) {
               if (taskInfo.taskId === message.task_id) {
                 context.knownTasksByToolUseId.delete(toolUseId);
@@ -1969,15 +1982,16 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
 
         if (message.subtype === "session_state_changed") {
           // Authoritative turn-over signal: `idle` fires only after held-back
-          // results flush and background agents settle. Close any synthetic turn
-          // a background continuation left open — its result may never arrive as
-          // a standalone message — so the thread returns to ready instead of
-          // appearing stuck in a phantom turn.
+          // results flush and background agents settle. Any turn still open at
+          // this point — a synthetic continuation whose result never arrived as
+          // a standalone message, or a user turn whose result was swallowed by
+          // an over-counted stale-result debt — is by definition finished, so
+          // close it rather than leaving the thread stuck in a phantom turn.
           if (message.state === "idle") {
             // All owed results have flushed by the time idle fires; drop any
             // remaining stale-result debt so future results are never swallowed.
             context.staleResultsExpected = 0;
-            if (context.turnState?.origin === "synthetic") {
+            if (context.turnState) {
               yield* completeTurn(context, "completed");
             }
           }
@@ -2106,6 +2120,7 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
                 description:
                   message.description.trim().length > 0 ? message.description : "Subagent task",
                 ...(message.subagent_type ? { subagentType: message.subagent_type } : {}),
+                ...(context.turnState ? { turnId: context.turnState.turnId } : {}),
               });
             }
             yield* offerRuntimeEvent({
@@ -2121,10 +2136,17 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
               },
             });
             return;
-          case "task_progress":
+          case "task_progress": {
             if (context.hiddenTaskIds.has(message.task_id)) {
               return;
             }
+            // Background task events can arrive between turns. The web work-log
+            // filter hides turn-less activities once turn-stamped messages
+            // exist, so fall back to the turn that spawned the task.
+            const progressTurnId =
+              !context.turnState && message.tool_use_id
+                ? context.knownTasksByToolUseId.get(message.tool_use_id)?.turnId
+                : undefined;
             if (message.usage) {
               const normalizedUsage = normalizeClaudeTokenUsage(
                 message.usage,
@@ -2137,6 +2159,7 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
                   ...base,
                   eventId: usageStamp.eventId,
                   createdAt: usageStamp.createdAt,
+                  ...(progressTurnId ? { turnId: asCanonicalTurnId(progressTurnId) } : {}),
                   type: "thread.token-usage.updated",
                   payload: {
                     usage: normalizedUsage,
@@ -2146,6 +2169,7 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
             }
             yield* offerRuntimeEvent({
               ...base,
+              ...(progressTurnId ? { turnId: asCanonicalTurnId(progressTurnId) } : {}),
               type: "task.progress",
               payload: {
                 taskId: RuntimeTaskId.makeUnsafe(message.task_id),
@@ -2160,44 +2184,51 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
             // While the spawning Task tool call is still awaiting its result,
             // mirror the progress onto its tool item so the "Subagent task"
             // row shows live activity instead of a frozen request summary.
-            {
-              const spawningTool = message.tool_use_id
-                ? context.toolsAwaitingResult.get(message.tool_use_id)
-                : undefined;
-              if (spawningTool) {
-                const progressStamp = yield* makeEventStamp();
-                yield* offerRuntimeEvent({
-                  ...base,
-                  eventId: progressStamp.eventId,
-                  createdAt: progressStamp.createdAt,
-                  type: "item.updated",
-                  itemId: asRuntimeItemId(spawningTool.itemId),
-                  payload: {
-                    itemType: spawningTool.itemType,
-                    status: "inProgress",
-                    title: spawningTool.title,
-                    ...(spawningTool.detail ? { detail: spawningTool.detail } : {}),
-                    data: toolLifecycleEventData(spawningTool, {
-                      taskId: message.task_id,
-                      ...(message.summary ? { taskSummary: message.summary } : {}),
-                      ...(message.last_tool_name ? { lastToolName: message.last_tool_name } : {}),
-                      ...(message.subagent_type ? { subagentType: message.subagent_type } : {}),
-                    }),
-                  },
-                  providerRefs: nativeProviderRefs(context, {
-                    providerItemId: spawningTool.itemId,
+            const spawningTool = message.tool_use_id
+              ? context.toolsAwaitingResult.get(message.tool_use_id)
+              : undefined;
+            if (spawningTool) {
+              const progressStamp = yield* makeEventStamp();
+              yield* offerRuntimeEvent({
+                ...base,
+                eventId: progressStamp.eventId,
+                createdAt: progressStamp.createdAt,
+                type: "item.updated",
+                itemId: asRuntimeItemId(spawningTool.itemId),
+                payload: {
+                  itemType: spawningTool.itemType,
+                  status: "inProgress",
+                  title: spawningTool.title,
+                  ...(spawningTool.detail ? { detail: spawningTool.detail } : {}),
+                  data: toolLifecycleEventData(spawningTool, {
+                    taskId: message.task_id,
+                    // `output` is the field the web's collab work-log extraction
+                    // renders; the named fields ride along for richer clients.
+                    ...(message.summary
+                      ? { output: message.summary, taskSummary: message.summary }
+                      : {}),
+                    ...(message.last_tool_name ? { lastToolName: message.last_tool_name } : {}),
+                    ...(message.subagent_type ? { subagentType: message.subagent_type } : {}),
                   }),
-                });
-              }
+                },
+                providerRefs: nativeProviderRefs(context, {
+                  providerItemId: spawningTool.itemId,
+                }),
+              });
             }
             return;
-          case "task_notification":
+          }
+          case "task_notification": {
+            const notifiedTask = message.tool_use_id
+              ? context.knownTasksByToolUseId.get(message.tool_use_id)
+              : undefined;
             if (message.tool_use_id) {
               context.knownTasksByToolUseId.delete(message.tool_use_id);
             }
             if (context.hiddenTaskIds.delete(message.task_id) || message.skip_transcript === true) {
               return;
             }
+            const notificationTurnId = !context.turnState ? notifiedTask?.turnId : undefined;
             if (message.usage) {
               const normalizedUsage = normalizeClaudeTokenUsage(
                 message.usage,
@@ -2210,6 +2241,7 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
                   ...base,
                   eventId: usageStamp.eventId,
                   createdAt: usageStamp.createdAt,
+                  ...(notificationTurnId ? { turnId: asCanonicalTurnId(notificationTurnId) } : {}),
                   type: "thread.token-usage.updated",
                   payload: {
                     usage: normalizedUsage,
@@ -2219,6 +2251,7 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
             }
             yield* offerRuntimeEvent({
               ...base,
+              ...(notificationTurnId ? { turnId: asCanonicalTurnId(notificationTurnId) } : {}),
               type: "task.completed",
               payload: {
                 taskId: RuntimeTaskId.makeUnsafe(message.task_id),
@@ -2229,6 +2262,7 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
               },
             });
             return;
+          }
           case "files_persisted":
             yield* offerRuntimeEvent({
               ...base,

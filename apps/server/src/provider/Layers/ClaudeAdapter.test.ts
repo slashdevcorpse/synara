@@ -4698,6 +4698,8 @@ describe("ClaudeAdapterLive", () => {
           subagentType?: string;
         };
         assert.equal(data.subagentText, "Inner update");
+        // The web's collab work-log extraction renders `output`.
+        assert.equal((data as { output?: string }).output, "Inner update");
         assert.equal(data.subagentType, "explore");
         assert.equal(String(subagentUpdate.turnId), String(turn.turnId));
       }
@@ -4841,6 +4843,16 @@ describe("ClaudeAdapterLive", () => {
         usage: { total_tokens: 10, tool_uses: 1, duration_ms: 5 },
         session_id: "sdk-session-workflow",
         uuid: "task-hidden-progress",
+      } as unknown as SDKMessage);
+      // A terminal patch can precede the notification; it must not erase the
+      // hidden marker the notification (which may omit skip_transcript) needs.
+      harness.query.emit({
+        type: "system",
+        subtype: "task_updated",
+        task_id: "task-hidden-1",
+        patch: { status: "completed" },
+        session_id: "sdk-session-workflow",
+        uuid: "task-hidden-updated",
       } as unknown as SDKMessage);
       harness.query.emit({
         type: "system",
@@ -5251,7 +5263,7 @@ describe("ClaudeAdapterLive", () => {
         provider: "claudeAgent",
         runtimeMode: "full-access",
       });
-      yield* adapter.sendTurn({
+      const turn = yield* adapter.sendTurn({
         threadId: session.threadId,
         input: "hello",
         attachments: [],
@@ -5303,6 +5315,16 @@ describe("ClaudeAdapterLive", () => {
         },
       } as unknown as SDKMessage);
 
+      // The spawning turn ends while the subagent keeps running.
+      harness.query.emit({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        errors: [],
+        session_id: "sdk-session-bg-subagent",
+        uuid: "bg-subagent-result",
+      } as unknown as SDKMessage);
+
       // Later subagent output can no longer attach to the completed tool item.
       harness.query.emit({
         type: "assistant",
@@ -5328,6 +5350,9 @@ describe("ClaudeAdapterLive", () => {
         assert.equal(progressEvent.payload.toolUseId, "task-tool-bg");
         assert.equal(progressEvent.payload.subagentType, "explore");
         assert.equal(progressEvent.payload.description, "Explore the repo");
+        // Late background progress carries the spawning turn's id so the web
+        // work-log filter keeps it visible.
+        assert.equal(String(progressEvent.turnId), String(turn.turnId));
       }
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
@@ -5406,6 +5431,8 @@ describe("ClaudeAdapterLive", () => {
         };
         assert.equal(data.taskId, "task-fg-1");
         assert.equal(data.taskSummary, "Checked 3 files");
+        // The web's collab work-log extraction renders `output`.
+        assert.equal((data as { output?: string }).output, "Checked 3 files");
         assert.equal(data.lastToolName, "Grep");
       }
 
@@ -5416,6 +5443,113 @@ describe("ClaudeAdapterLive", () => {
         ),
         true,
       );
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("closes a user turn on the idle signal when its result was swallowed", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+
+      const runtimeEventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.takeUntil(
+          (event) =>
+            event.type === "session.state.changed" && event.payload.reason === "session_state:idle",
+        ),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      const session = yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: "claudeAgent",
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({
+        threadId: session.threadId,
+        input: "first",
+        attachments: [],
+      });
+      // Complete the user turn so the follow-up activity opens a synthetic turn.
+      harness.query.emit({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        errors: [],
+        session_id: "sdk-session-idle-heal",
+        uuid: "idle-heal-result-1",
+      } as unknown as SDKMessage);
+
+      // Background continuation opens a synthetic turn...
+      harness.query.emit({
+        type: "stream_event",
+        session_id: "sdk-session-idle-heal",
+        uuid: "idle-heal-bg-delta",
+        parent_tool_use_id: null,
+        event: {
+          type: "content_block_delta",
+          index: 0,
+          delta: { type: "text_delta", text: "background follow-up" },
+        },
+      } as unknown as SDKMessage);
+
+      // ...which the user preempts. The synthetic turn's result never arrives
+      // as a standalone message, so the armed stale-result debt swallows the
+      // result that actually belongs to this new user turn.
+      const userTurn = yield* adapter.sendTurn({
+        threadId: session.threadId,
+        input: "second",
+        attachments: [],
+      });
+      harness.query.emit({
+        type: "stream_event",
+        session_id: "sdk-session-idle-heal",
+        uuid: "idle-heal-user-delta",
+        parent_tool_use_id: null,
+        event: {
+          type: "content_block_delta",
+          index: 0,
+          delta: { type: "text_delta", text: "answer to second" },
+        },
+      } as unknown as SDKMessage);
+      harness.query.emit({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        errors: [],
+        session_id: "sdk-session-idle-heal",
+        uuid: "idle-heal-result-2",
+      } as unknown as SDKMessage);
+
+      // The idle signal is authoritative: the still-open user turn must close
+      // instead of leaving the thread stuck running.
+      harness.query.emit({
+        type: "system",
+        subtype: "session_state_changed",
+        state: "idle",
+        session_id: "sdk-session-idle-heal",
+        uuid: "idle-heal-idle",
+      } as unknown as SDKMessage);
+
+      const runtimeEvents = Array.from(yield* Fiber.join(runtimeEventsFiber));
+
+      const userTurnCompleted = runtimeEvents.find(
+        (event) =>
+          event.type === "turn.completed" && String(event.turnId) === String(userTurn.turnId),
+      );
+      assert.equal(userTurnCompleted?.type, "turn.completed");
+      if (userTurnCompleted?.type === "turn.completed") {
+        assert.equal(userTurnCompleted.payload.state, "completed");
+      }
+
+      const idleState = runtimeEvents[runtimeEvents.length - 1];
+      assert.equal(idleState?.type, "session.state.changed");
+      if (idleState?.type === "session.state.changed") {
+        assert.equal(idleState.payload.state, "ready");
+      }
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(harness.layer),
