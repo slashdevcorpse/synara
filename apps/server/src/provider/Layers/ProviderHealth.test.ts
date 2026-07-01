@@ -1,3 +1,5 @@
+import { symlinkSync } from "node:fs";
+
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import type { ServerProviderStatus } from "@t3tools/contracts";
 import {
@@ -780,6 +782,32 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
         ),
       );
     });
+
+    it.effect("reports misconfigured account shadow homes as an error status", () =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const { tmpDir } = yield* withTempCodexHome();
+        const shadowHome = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "t3-codex-shadow-",
+        });
+        yield* fileSystem.writeFileString(path.join(tmpDir, "auth.json"), "{}");
+        yield* Effect.sync(() =>
+          symlinkSync(path.join(tmpDir, "auth.json"), path.join(shadowHome, "auth.json")),
+        );
+
+        const status = yield* makeCheckCodexProviderStatus("codex", tmpDir, shadowHome, "work");
+        assert.strictEqual(status.status, "error");
+        assert.strictEqual(status.available, false);
+        assert.match(status.message ?? "", /symlink/);
+      }).pipe(
+        Effect.provide(
+          mockSpawnerLayer(() => {
+            throw new Error("no probes should run for a misconfigured account home");
+          }),
+        ),
+      ),
+    );
 
     it.effect("returns unavailable when codex is missing", () =>
       Effect.gen(function* () {
