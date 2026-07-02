@@ -42,6 +42,7 @@ import type { ContextMenuItem } from "@t3tools/contracts";
 import {
   SYNARA_WANDY_STABLE_APP_DIR_ENV,
   isWandyExplicitlyDisabledInEnv,
+  isWandyPackageRoot,
   resolveWandyLauncherPath as resolveSharedWandyLauncherPath,
   resolveStableWandyAppDir as resolveSharedStableWandyAppDir,
 } from "@t3tools/shared/wandy";
@@ -802,7 +803,7 @@ function resolveWandyPackageRoots(): string[] {
       appRoot.replace(/\.asar$/, ".asar.unpacked"),
       "node_modules/@t3tools/wandy",
     );
-    return FS.existsSync(Path.join(unpackedRoot, "package.json")) ? [unpackedRoot] : [];
+    return isWandyPackageRoot(unpackedRoot) ? [unpackedRoot] : [];
   }
 
   const roots = [
@@ -816,7 +817,7 @@ function resolveWandyPackageRoots(): string[] {
     );
   }
 
-  return roots.filter((root) => FS.existsSync(Path.join(root, "package.json")));
+  return roots.filter(isWandyPackageRoot);
 }
 
 function resolveDesktopWandyStableAppDir(): string {

@@ -10,6 +10,9 @@ import path from "node:path";
 
 const requireFromHere = createRequire(import.meta.url);
 
+// Standalone copy of wandyRuntimeRelativeParts in packages/shared/src/wandy.ts:
+// this file is staged into dist-electron and runs without workspace imports.
+// Keep the two tables in sync.
 const PLATFORM_RUNTIME_RELATIVE_PATHS = {
   "darwin-arm64": ["dist", "Wandy.app", "Contents", "MacOS", "Wandy"],
   "darwin-x64": ["dist", "Wandy.app", "Contents", "MacOS", "Wandy"],

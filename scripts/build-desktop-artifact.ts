@@ -18,6 +18,7 @@ import {
   createDesktopPlatformBuildConfig,
   validateDesktopNativeBuildHost,
 } from "./lib/desktop-platform-build-config.ts";
+import { WANDY_APP_BUNDLE_NAME, wandyRuntimeRelativeParts } from "@t3tools/shared/wandy";
 import { parseBooleanEnvValue } from "./lib/env-bool.ts";
 import { inspectMacCodeSignature } from "./lib/mac-code-signature.ts";
 import { finalizeMacUpdateZip } from "./lib/mac-update-zip-finalize.ts";
@@ -207,7 +208,38 @@ interface StagePackageJson {
 
 const WANDY_PACKAGE_NAME = "@t3tools/wandy";
 const WANDY_STAGE_RELATIVE_DIR = "packages/wandy";
-const WANDY_RUNTIME_PACKAGE_ENTRIES = ["package.json", "bin", "LICENSE"] as const;
+const WANDY_RUNTIME_PACKAGE_ENTRIES = [["package.json"], ["bin"], ["LICENSE"]] as const;
+
+const BUILD_PLATFORM_TO_NODE_PLATFORM: Record<typeof BuildPlatform.Type, NodeJS.Platform> = {
+  mac: "darwin",
+  linux: "linux",
+  win: "win32",
+};
+
+// Runtime layout comes from the shared table so build staging can never drift
+// from what launcher resolution expects at runtime.
+function wandyRuntimeParts(
+  platform: typeof BuildPlatform.Type,
+  arch: "arm64" | "x64",
+): readonly string[] {
+  const parts = wandyRuntimeRelativeParts(BUILD_PLATFORM_TO_NODE_PLATFORM[platform], arch);
+  if (!parts) {
+    throw new Error(`No bundled Wandy runtime is defined for ${platform}/${arch}.`);
+  }
+  return parts;
+}
+
+function normalizeWandyArch(arch: typeof BuildArch.Type): "arm64" | "x64" {
+  // Universal builds only exist for mac, where the app bundle covers both.
+  return arch === "arm64" ? "arm64" : "x64";
+}
+
+function wandyRuntimeBinaryParts(
+  platform: typeof BuildPlatform.Type,
+  arch: typeof BuildArch.Type,
+): readonly string[] {
+  return wandyRuntimeParts(platform, normalizeWandyArch(arch));
+}
 
 // Each desktop artifact only ships the Wandy runtime for its own platform;
 // bundling the full dist tree would embed the macOS app bundle and both
@@ -215,25 +247,15 @@ const WANDY_RUNTIME_PACKAGE_ENTRIES = ["package.json", "bin", "LICENSE"] as cons
 function wandyDistEntriesForPlatform(
   platform: typeof BuildPlatform.Type,
   arch: typeof BuildArch.Type,
-): readonly string[] {
+): ReadonlyArray<readonly string[]> {
   if (platform === "mac") {
-    return ["dist/Wandy.app"];
+    // ["dist", "Wandy.app"] — the whole app bundle.
+    return [wandyRuntimeParts(platform, "arm64").slice(0, 2)];
   }
-  const distArchDirs =
-    arch === "universal" ? ["arm64", "amd64"] : [arch === "x64" ? "amd64" : arch];
-  const distPlatformDir = platform === "win" ? "windows" : "linux";
-  return distArchDirs.map((distArch) => `dist/${distPlatformDir}/${distArch}`);
-}
-
-function wandyRuntimeBinaryRelativePath(
-  platform: typeof BuildPlatform.Type,
-  arch: typeof BuildArch.Type,
-): string {
-  if (platform === "mac") {
-    return "dist/Wandy.app/Contents/MacOS/Wandy";
-  }
-  const distArch = arch === "x64" || arch === "universal" ? "amd64" : arch;
-  return platform === "win" ? `dist/windows/${distArch}/wandy.exe` : `dist/linux/${distArch}/wandy`;
+  const arches: ReadonlyArray<"arm64" | "x64"> =
+    arch === "universal" ? ["arm64", "x64"] : [normalizeWandyArch(arch)];
+  // Binary's parent dir, e.g. ["dist", "linux", "amd64"].
+  return arches.map((entryArch) => wandyRuntimeParts(platform, entryArch).slice(0, -1));
 }
 
 function withStagedWandyDependency(dependencies: Record<string, unknown>): Record<string, unknown> {
@@ -588,10 +610,7 @@ const stageWandyPackage = Effect.fn("stageWandyPackage")(function* (
   const path = yield* Path.Path;
   const fs = yield* FileSystem.FileSystem;
   const sourceDir = path.join(repoRoot, "packages/wandy");
-  const runtimeBinary = path.join(
-    sourceDir,
-    ...wandyRuntimeBinaryRelativePath(platform, arch).split("/"),
-  );
+  const runtimeBinary = path.join(sourceDir, ...wandyRuntimeBinaryParts(platform, arch));
 
   if (!(yield* fs.exists(runtimeBinary))) {
     const hint = platform === "mac" ? " Run 'cd packages/wandy && bun run build:macos' first." : "";
@@ -601,7 +620,7 @@ const stageWandyPackage = Effect.fn("stageWandyPackage")(function* (
   }
 
   if (requireStableCodeSignature) {
-    const appBundlePath = path.join(sourceDir, "dist", "Wandy.app");
+    const appBundlePath = path.join(sourceDir, "dist", WANDY_APP_BUNDLE_NAME);
     const signature = inspectMacCodeSignature(appBundlePath);
     if (!signature.isStable) {
       return yield* new BuildScriptError({
@@ -624,12 +643,12 @@ const stageWandyPackage = Effect.fn("stageWandyPackage")(function* (
     ...WANDY_RUNTIME_PACKAGE_ENTRIES,
     ...wandyDistEntriesForPlatform(platform, arch),
   ];
-  for (const entry of entries) {
-    const from = path.join(sourceDir, ...entry.split("/"));
+  for (const entryParts of entries) {
+    const from = path.join(sourceDir, ...entryParts);
     if (!(yield* fs.exists(from))) {
       continue;
     }
-    const to = path.join(targetDir, ...entry.split("/"));
+    const to = path.join(targetDir, ...entryParts);
     yield* fs.makeDirectory(path.dirname(to), { recursive: true });
     const stat = yield* fs.stat(from);
     if (stat.type === "Directory") {

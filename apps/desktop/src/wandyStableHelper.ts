@@ -3,8 +3,9 @@ import * as Crypto from "node:crypto";
 import * as FS from "node:fs";
 import * as Path from "node:path";
 
-const WANDY_APP_BUNDLE_NAME = "Wandy.app";
-const WANDY_EXECUTABLE_RELATIVE_PATH = Path.join("Contents", "MacOS", "Wandy");
+import { WANDY_APP_BUNDLE_NAME, WANDY_MACOS_APP_EXECUTABLE_PARTS } from "@t3tools/shared/wandy";
+
+const WANDY_EXECUTABLE_RELATIVE_PATH = Path.join(...WANDY_MACOS_APP_EXECUTABLE_PARTS);
 const WANDY_SOURCE_FINGERPRINT_FILE = ".wandy-source-fingerprint";
 
 export type EnsureStableWandyHelperResult = {

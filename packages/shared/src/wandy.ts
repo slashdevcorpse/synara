@@ -120,12 +120,13 @@ export const WANDY_DISABLE_APP_AGENT_PROXY_ENV = "WANDY_DISABLE_APP_AGENT_PROXY"
 
 const WANDY_ACP_MCP_SERVER_ENV = [] as const;
 
-const STABLE_APP_BUNDLE_NAME = "Wandy.app";
+export const WANDY_APP_BUNDLE_NAME = "Wandy.app";
+// Path of the executable inside Wandy.app; the single source for every
+// consumer that can import this module (stable helper, build scripts).
+export const WANDY_MACOS_APP_EXECUTABLE_PARTS = ["Contents", "MacOS", "Wandy"] as const;
 const STABLE_APP_EXECUTABLE_RELATIVE_PATH = [
-  STABLE_APP_BUNDLE_NAME,
-  "Contents",
-  "MacOS",
-  "Wandy",
+  WANDY_APP_BUNDLE_NAME,
+  ...WANDY_MACOS_APP_EXECUTABLE_PARTS,
 ] as const;
 
 const LEGACY_MCP_SERVER_NAMES = [
@@ -478,14 +479,30 @@ export function resolveWandyEnabledFromSettings(input: {
   return isWandyEnabledInEnv(input.env ?? process.env) && input.enableWandy;
 }
 
+// Mirrored (with a pointer back here) in the standalone launchers that cannot
+// import workspace TS: packages/wandy/bin/wandy{,-mcp} (generated npm shims)
+// and apps/desktop/scripts/wandyMcp.mjs.
 const PLATFORM_RUNTIME_RELATIVE_PATHS: Record<string, readonly string[]> = {
-  "darwin-arm64": ["dist", "Wandy.app", "Contents", "MacOS", "Wandy"],
-  "darwin-x64": ["dist", "Wandy.app", "Contents", "MacOS", "Wandy"],
+  "darwin-arm64": ["dist", WANDY_APP_BUNDLE_NAME, ...WANDY_MACOS_APP_EXECUTABLE_PARTS],
+  "darwin-x64": ["dist", WANDY_APP_BUNDLE_NAME, ...WANDY_MACOS_APP_EXECUTABLE_PARTS],
   "linux-arm64": ["dist", "linux", "arm64", "wandy"],
   "linux-x64": ["dist", "linux", "amd64", "wandy"],
   "win32-arm64": ["dist", "windows", "arm64", "wandy.exe"],
   "win32-x64": ["dist", "windows", "amd64", "wandy.exe"],
 };
+
+// Package-relative path segments of the bundled runtime for a platform/arch,
+// or null when no native runtime ships for that combination.
+export function wandyRuntimeRelativeParts(
+  platform: NodeJS.Platform,
+  arch: string,
+): readonly string[] | null {
+  return PLATFORM_RUNTIME_RELATIVE_PATHS[`${platform}-${arch}`] ?? null;
+}
+
+export function isWandyPackageRoot(root: string): boolean {
+  return existsSync(path.join(root, "package.json"));
+}
 
 function resolveBundledWandyBinLauncherPath(input: {
   readonly packageRoot: string;
@@ -572,7 +589,7 @@ export function resolveWandyPackageRoots(
 
   const appendRoot = (candidate: string) => {
     const resolved = path.resolve(candidate);
-    if (seen.has(resolved) || !existsSync(path.join(resolved, "package.json"))) {
+    if (seen.has(resolved) || !isWandyPackageRoot(resolved)) {
       return;
     }
     seen.add(resolved);
@@ -613,8 +630,7 @@ export function resolveBundledWandyRuntimePath(input: {
 }): string | null {
   const platform = input.platform ?? process.platform;
   const arch = input.arch ?? process.arch;
-  const platformKey = `${platform}-${arch}`;
-  const relativeParts = PLATFORM_RUNTIME_RELATIVE_PATHS[platformKey];
+  const relativeParts = wandyRuntimeRelativeParts(platform, arch);
   if (!relativeParts) {
     return null;
   }

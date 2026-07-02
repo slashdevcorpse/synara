@@ -919,6 +919,9 @@ export function makeGrokAdapter(
           let ctx!: GrokSessionContext;
 
           const parsedResumeSessionId = parseGrokResume(input.resumeCursor)?.sessionId;
+          // Applies the same predicate AcpSessionRuntime uses internally: the
+          // adapter's resume bookkeeping (replay deferred, resume cursor) must
+          // match the session/new-vs-load decision the runtime will make.
           const resumeSessionId = shouldSkipAcpSessionResumeForWandy()
             ? undefined
             : parsedResumeSessionId;
