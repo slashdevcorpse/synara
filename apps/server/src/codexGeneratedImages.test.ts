@@ -2,10 +2,11 @@ import assert from "node:assert/strict";
 import path from "node:path";
 import { afterEach, describe, it } from "vitest";
 
-import type { ProviderRuntimeEvent } from "@t3tools/contracts";
+import { DEFAULT_SERVER_SETTINGS, type ProviderRuntimeEvent } from "@t3tools/contracts";
 
 import {
   CODEX_GENERATED_IMAGE_ARTIFACT_KIND,
+  codexConfiguredHomePathsFromSettings,
   generatedImagePathFromRuntimeEvent,
   isGeneratedImageOnlyMarkdown,
   resolveCodexGeneratedImagesRoot,
@@ -157,6 +158,43 @@ describe("resolveCodexGeneratedImagesRoot(s)", () => {
     const roots = resolveCodexGeneratedImagesRoots(homePath);
     assert.ok(roots.length >= 1 && roots.length <= 2, `expected 1-2 roots, got ${roots.length}`);
     assert.ok(roots.includes(path.join(homePath, "generated_images")));
+  });
+});
+
+describe("codexConfiguredHomePathsFromSettings", () => {
+  const previousDisableFlag = process.env.DPCODE_DISABLE_CODEX_DPCODE_BROWSER_PLUGIN;
+
+  afterEach(() => {
+    if (previousDisableFlag === undefined)
+      delete process.env.DPCODE_DISABLE_CODEX_DPCODE_BROWSER_PLUGIN;
+    else process.env.DPCODE_DISABLE_CODEX_DPCODE_BROWSER_PLUGIN = previousDisableFlag;
+  });
+
+  it("includes the env-scoped write home for instances relocating the overlay root", () => {
+    delete process.env.DPCODE_DISABLE_CODEX_DPCODE_BROWSER_PLUGIN;
+    const settings = {
+      ...DEFAULT_SERVER_SETTINGS,
+      providerInstances: {
+        codex_env: {
+          driver: "codex" as const,
+          enabled: true,
+          environment: [{ name: "SYNARA_HOME", value: "/instance-env/runtime", sensitive: false }],
+        },
+      },
+    };
+
+    const homes = codexConfiguredHomePathsFromSettings(settings);
+
+    const expectedPrefix = path.join(
+      "/instance-env/runtime",
+      "codex-home-overlay",
+      "accounts",
+      "codex_env-",
+    );
+    assert.ok(
+      homes.some((home) => home.startsWith(expectedPrefix)),
+      `expected env-scoped account overlay home, got ${JSON.stringify(homes)}`,
+    );
   });
 });
 

@@ -15,7 +15,10 @@ import {
   type ThreadId,
 } from "@t3tools/contracts";
 import { isSupportedLocalImagePath as isSupportedLocalImagePathShared } from "@t3tools/shared/localPreviewFiles";
-import { deriveProviderInstances } from "@t3tools/shared/providerInstances";
+import {
+  deriveProviderInstances,
+  providerStartOptionsFromInstance,
+} from "@t3tools/shared/providerInstances";
 
 import {
   DPCODE_CODEX_HOME_ACCOUNT_OVERLAYS_DIR,
@@ -147,6 +150,14 @@ export function codexConfiguredHomePathsFromSettings(settings: ServerSettings): 
     const instanceShadowHomePath = instance.config.shadowHomePath;
     if (typeof instanceShadowHomePath === "string" && instanceShadowHomePath.trim()) {
       homePaths.add(instanceShadowHomePath.trim());
+    }
+    // Instances write under the home their launch options and per-instance
+    // environment resolve to (env vars can relocate CODEX_HOME or the overlay
+    // root). Add that write home so predicted image paths stay allowlisted —
+    // this mirrors the resolution generated-image events use.
+    const codexOptions = providerStartOptionsFromInstance(instance)?.codex;
+    if (codexOptions) {
+      homePaths.add(resolveCodexHomePath(codexOptions));
     }
   }
   return [...homePaths];

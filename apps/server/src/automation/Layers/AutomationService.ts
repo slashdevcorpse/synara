@@ -24,6 +24,7 @@ import {
 import { Cause, Effect, Layer, Option, PubSub, Queue, Stream } from "effect";
 import {
   inferLegacyProviderKindFromModelSelection,
+  mergeProviderStartOptions,
   providerStartOptionsFromInstance,
   resolveModelSelectionInstanceId,
   resolveProviderInstance,
@@ -1262,18 +1263,32 @@ export const AutomationServiceLive = Layer.effect(
 
     const resolveAutomationCompletionTextGenerationInput = (definition: AutomationDefinition) =>
       Effect.gen(function* () {
+        const settings = yield* serverSettings.getSettings.pipe(
+          Effect.mapError(toServiceError("Failed to load text-generation settings.")),
+        );
+        // Stored definitions never carry redacted per-instance environment or
+        // secrets, so the completion evaluator must merge in the server-side
+        // instance options the same way turn dispatch does.
+        const selectionInstance = definition.modelSelection
+          ? resolveProviderInstance(settings, {
+              instanceId: resolveModelSelectionInstanceId(definition.modelSelection),
+            })
+          : null;
+        const directProviderOptions = selectionInstance
+          ? mergeProviderStartOptions(
+              definition.providerOptions,
+              providerStartOptionsFromInstance(selectionInstance),
+            )
+          : definition.providerOptions;
         const directInput = resolveTextGenerationInputForSelection(
           definition.modelSelection,
-          definition.providerOptions,
-          inferLegacyProviderKindFromModelSelection(definition.modelSelection),
+          directProviderOptions,
+          selectionInstance?.driver ??
+            inferLegacyProviderKindFromModelSelection(definition.modelSelection),
         );
         if (directInput) {
           return directInput;
         }
-
-        const settings = yield* serverSettings.getSettings.pipe(
-          Effect.mapError(toServiceError("Failed to load text-generation settings.")),
-        );
         const fallbackInstance = resolveProviderInstance(settings, {
           instanceId: resolveModelSelectionInstanceId(settings.textGenerationModelSelection),
         });
