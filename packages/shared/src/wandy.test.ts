@@ -12,6 +12,8 @@ import {
   WANDY_MCP_TOOL_NAMES,
   formatWandyGrokToolName,
   shouldSkipAcpSessionResumeForWandy,
+  buildWandyAcpToolInvocationInstructions,
+  wandyMcpToolNamesForPlatform,
   isWandyEnabledInEnv,
   isWandyExplicitlyDisabledInEnv,
   resolveWandyEnabledFromSettings,
@@ -146,7 +148,7 @@ describe("Wandy MCP builders", () => {
   } as const;
 
   it("builds ACP stdio MCP servers when enabled", () => {
-    const servers = buildWandyAcpMcpServers({ env });
+    const servers = buildWandyAcpMcpServers({ env, platform: "darwin", arch: "arm64" });
     assert.equal(servers.length, 1);
     assert.equal(servers[0]?.name, "wandy");
     assert.equal(servers[0]?.command, bundledLauncherPath);
@@ -155,7 +157,7 @@ describe("Wandy MCP builders", () => {
   });
 
   it("builds Claude MCP servers when enabled", () => {
-    const servers = buildWandyClaudeMcpServers({ env });
+    const servers = buildWandyClaudeMcpServers({ env, platform: "darwin", arch: "arm64" });
     assert.deepEqual(servers, {
       wandy: {
         command: bundledLauncherPath,
@@ -165,7 +167,7 @@ describe("Wandy MCP builders", () => {
   });
 
   it("builds OpenCode MCP config when enabled", () => {
-    const config = buildWandyOpenCodeMcpConfig({ env });
+    const config = buildWandyOpenCodeMcpConfig({ env, platform: "darwin", arch: "arm64" });
     assert.deepEqual(config, {
       name: "wandy",
       config: {
@@ -183,7 +185,10 @@ describe("Wandy MCP builders", () => {
   });
 
   it("skips ACP resume when Wandy MCP is enabled", () => {
-    assert.equal(shouldSkipAcpSessionResumeForWandy({ env }), true);
+    assert.equal(
+      shouldSkipAcpSessionResumeForWandy({ env, platform: "darwin", arch: "arm64" }),
+      true,
+    );
     assert.equal(shouldSkipAcpSessionResumeForWandy({ env: { SYNARA_ENABLE_WANDY: "0" } }), false);
   });
 });
@@ -223,6 +228,8 @@ describe("resolveWandyLauncherPath", () => {
         resolveWandyLauncherPath({
           env: { HOME: "/tmp/synara-wandy-prefer-bundled" },
           fallbackPackageRoots: [packageRoot],
+          platform: "darwin",
+          arch: "arm64",
           preferBundled: true,
         }),
         path.join(packageRoot, "dist", "Wandy.app", "Contents", "MacOS", "Wandy"),
@@ -245,6 +252,8 @@ describe("resolveWandyLauncherPath", () => {
         resolveWandyLauncherPath({
           env: { HOME: "/tmp/synara-wandy-prefer" },
           fallbackPackageRoots: [packageRoot],
+          platform: "darwin",
+          arch: "arm64",
         }),
         stableLauncher,
       );
@@ -271,6 +280,8 @@ describe("resolveWandyLauncherPath", () => {
         resolveWandyLauncherPath({
           env: { HOME: "/tmp/synara-wandy-not-executable" },
           fallbackPackageRoots: [packageRoot],
+          platform: "darwin",
+          arch: "arm64",
         }),
         path.join(packageRoot, "dist", "Wandy.app", "Contents", "MacOS", "Wandy"),
       );
@@ -284,6 +295,8 @@ describe("resolveWandyLauncherPath", () => {
     const launcherPath = resolveWandyLauncherPath({
       env: { HOME: "/tmp/synara-wandy-no-stable-install" },
       fallbackPackageRoots: [packageRoot],
+      platform: "darwin",
+      arch: "arm64",
     });
 
     assert.equal(
@@ -299,6 +312,8 @@ describe("resolveWandyLauncherPath", () => {
         SYNARA_WANDY_LAUNCHER_PATH: path.join(packageRoot, "bin", "wandy"),
       },
       fallbackPackageRoots: [packageRoot],
+      platform: "darwin",
+      arch: "arm64",
     });
 
     assert.equal(
@@ -314,6 +329,8 @@ describe("resolveWandyLauncherPath", () => {
         SYNARA_WANDY_LAUNCHER_PATH: "/tmp/missing-wandy/bin/wandy",
       },
       fallbackPackageRoots: [packageRoot],
+      platform: "darwin",
+      arch: "arm64",
     });
 
     assert.equal(
@@ -325,7 +342,7 @@ describe("resolveWandyLauncherPath", () => {
   it("resolves the bundled launcher from a package root", () => {
     const packageRoot = path.resolve(import.meta.dirname, "../../wandy");
     assert.equal(
-      resolveBundledWandyLauncherPath({ packageRoot }),
+      resolveBundledWandyLauncherPath({ packageRoot, platform: "darwin", arch: "arm64" }),
       path.join(packageRoot, "dist", "Wandy.app", "Contents", "MacOS", "Wandy"),
     );
   });
@@ -354,6 +371,8 @@ describe("resolveWandyLauncherPath", () => {
         SYNARA_ENABLE_WANDY: "1",
       },
       searchRoots: [outsideWorkspace],
+      platform: "darwin",
+      arch: "arm64",
     });
 
     assert.equal(
@@ -379,6 +398,8 @@ describe("resolveWandyLauncherPath", () => {
             SYNARA_ENABLE_WANDY: "1",
           },
           fallbackPackageRoots: [packageRoot],
+          platform: "darwin",
+          arch: "arm64",
         }),
         [],
       );
@@ -420,12 +441,13 @@ describe("standalone launcher runtime tables", () => {
     }
   });
 
-  it("bin/wandy-mcp delegates to bin/wandy", () => {
+  it("bin/wandy-mcp delegates to bin/wandy and defaults to MCP mode", () => {
     const source = readFileSync(
       path.resolve(import.meta.dirname, "../../wandy/bin/wandy-mcp"),
       "utf8",
     );
     assert.match(source, /require\("\.\/wandy"\);/);
+    assert.match(source, /push\("mcp"\)/);
   });
 
   it("apps/desktop/scripts/wandyMcp.mjs matches wandyRuntimeRelativeParts", () => {
@@ -504,6 +526,15 @@ describe("Wandy tool naming", () => {
     assert.equal(formatWandyGrokToolName("run_sequence"), "wandy__run_sequence");
     assert.equal(WANDY_MCP_TOOL_NAMES.length, 10);
   });
+
+  it("only advertises run_sequence on macOS, where the runtime implements it", () => {
+    assert.ok(wandyMcpToolNamesForPlatform("darwin").includes("run_sequence"));
+    assert.ok(!wandyMcpToolNamesForPlatform("linux").includes("run_sequence"));
+    assert.ok(!wandyMcpToolNamesForPlatform("win32").includes("run_sequence"));
+    assert.match(buildWandyAcpToolInvocationInstructions("darwin"), /run_sequence/);
+    assert.doesNotMatch(buildWandyAcpToolInvocationInstructions("linux"), /run_sequence/);
+    assert.doesNotMatch(buildWandyAcpToolInvocationInstructions("win32"), /run_sequence/);
+  });
 });
 
 describe("withSynaraWandyPromptContext", () => {
@@ -550,6 +581,8 @@ describe("withSynaraWandyPromptContext", () => {
             SYNARA_ENABLE_WANDY: "1",
           },
           fallbackPackageRoots: [packageRoot],
+          platform: "darwin",
+          arch: "arm64",
         }),
         prompt,
       );

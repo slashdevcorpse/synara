@@ -237,9 +237,13 @@ function installClaudeMcp(configPath, projectRoot, serverName, commandName) {
   );
 
   const target = mcpServers[serverName];
-  const legacy = mcpServers[legacyServerName];
+  // A legacy alias only exists when it differs from the target name;
+  // otherwise a rerun would delete the entry it just wrote.
+  const hasDistinctLegacy = serverName !== legacyServerName;
+  const legacy = hasDistinctLegacy ? mcpServers[legacyServerName] : undefined;
   const targetMatches = JSON.stringify(target) === JSON.stringify(desiredEntry);
-  const legacyMatches = JSON.stringify(legacy) === JSON.stringify(desiredEntry);
+  const legacyMatches =
+    hasDistinctLegacy && JSON.stringify(legacy) === JSON.stringify(desiredEntry);
 
   if (targetMatches && !legacyMatches) {
     process.stdout.write(
@@ -280,9 +284,13 @@ function installGeminiMcp(configPath, serverName, commandName) {
   );
 
   const target = mcpServers[serverName];
-  const legacy = mcpServers[legacyServerName];
+  // A legacy alias only exists when it differs from the target name;
+  // otherwise a rerun would delete the entry it just wrote.
+  const hasDistinctLegacy = serverName !== legacyServerName;
+  const legacy = hasDistinctLegacy ? mcpServers[legacyServerName] : undefined;
   const targetMatches = JSON.stringify(target) === JSON.stringify(desiredEntry);
-  const legacyMatches = JSON.stringify(legacy) === JSON.stringify(desiredEntry);
+  const legacyMatches =
+    hasDistinctLegacy && JSON.stringify(legacy) === JSON.stringify(desiredEntry);
 
   if (targetMatches && !legacyMatches) {
     process.stdout.write(
@@ -367,7 +375,7 @@ function installOpencodeMcp(primaryConfigPath, secondaryConfigPath, serverName, 
         mcp[serverName] = desiredEntry;
         record.dirty = true;
       }
-      if (legacyServerName in mcp) {
+      if (serverName !== legacyServerName && legacyServerName in mcp) {
         delete mcp[legacyServerName];
         record.dirty = true;
       }
@@ -427,14 +435,15 @@ function installCodexMcp(configPath, serverName, commandName) {
           : []),
       ]) === desiredCanonical
     : false;
-  const legacyMatches = legacySection
-    ? canonicalSectionBody([
-        ...legacySection.bodyLines,
-        ...(legacyEnvSection
-          ? [`[${legacyEnvSection.header}]`, ...legacyEnvSection.bodyLines]
-          : []),
-      ]) === desiredCanonical
-    : false;
+  const legacyMatches =
+    serverName !== legacyServerName && legacySection
+      ? canonicalSectionBody([
+          ...legacySection.bodyLines,
+          ...(legacyEnvSection
+            ? [`[${legacyEnvSection.header}]`, ...legacyEnvSection.bodyLines]
+            : []),
+        ]) === desiredCanonical
+      : false;
 
   if (targetMatches && !legacyMatches) {
     process.stdout.write(
@@ -446,7 +455,10 @@ function installCodexMcp(configPath, serverName, commandName) {
   const nextText = applyTomlSectionUpdates(
     text,
     {
-      removeHeaders: [targetEnvHeader, legacyHeader, legacyEnvHeader],
+      removeHeaders: [
+        targetEnvHeader,
+        ...(serverName !== legacyServerName ? [legacyHeader, legacyEnvHeader] : []),
+      ],
       upserts: [{ header: targetHeader, body: desiredBody }],
     },
     configPath,

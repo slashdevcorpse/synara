@@ -34,6 +34,7 @@ import {
   resolveBaseCodexHomePath,
   resolveDpCodeCodexHomeOverlayPath,
   shouldDisableDpCodeBrowserPlugin,
+  shouldUseCodexHomeOverlay,
 } from "./codexHomePaths.ts";
 
 const CODEX_PROCESS_SHELL_ENV_NAMES = ["PATH", "SSH_AUTH_SOCK"] as const;
@@ -202,15 +203,13 @@ export function buildCodexProcessEnv(
 ): NodeJS.ProcessEnv {
   const baseEnv = { ...(input.env ?? process.env) };
   const disableBrowserPlugin = shouldDisableDpCodeBrowserPlugin(baseEnv);
-  const needsWandyOverlay = isWandyEnabledInEnv(baseEnv);
-  const overlayHomePath =
-    disableBrowserPlugin || needsWandyOverlay
-      ? prepareDpCodeCodexHomeOverlay({
-          env: baseEnv,
-          ...(input.homePath ? { homePath: input.homePath } : {}),
-          disableBrowserPlugin,
-        })
-      : undefined;
+  const overlayHomePath = shouldUseCodexHomeOverlay(baseEnv)
+    ? prepareDpCodeCodexHomeOverlay({
+        env: baseEnv,
+        ...(input.homePath ? { homePath: input.homePath } : {}),
+        disableBrowserPlugin,
+      })
+    : undefined;
   const effectiveEnv =
     overlayHomePath || input.homePath
       ? { ...baseEnv, CODEX_HOME: overlayHomePath ?? input.homePath }

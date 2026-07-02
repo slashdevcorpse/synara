@@ -197,8 +197,11 @@ function platformLaunchTable() {
 
 function renderMcpLauncherDelegate() {
   return `#!/usr/bin/env node
-// Delegates to the wandy launcher. Kept as a separate bin entry so MCP
-// configs can reference \`wandy-mcp\` directly; behavior is identical.
+// Delegates to the wandy launcher, defaulting to the stdio MCP server so MCP
+// clients can configure \`wandy-mcp\` as their command without arguments.
+if (process.argv.length <= 2) {
+  process.argv.push("mcp");
+}
 require("./wandy");
 `;
 }

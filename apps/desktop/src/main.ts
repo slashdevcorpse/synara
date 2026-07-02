@@ -873,10 +873,14 @@ function resolveWandyLauncherPath(): string | null {
       return wandyLauncherPathCache;
     }
 
+    // Fallback still carries a runnable bundled launcher (when one resolved);
+    // losing permission-path stability beats silently disabling Wandy MCP.
     console.warn(
-      `[desktop] Wandy stable helper unavailable; Wandy MCP will not be registered. ${stableResult.reason ?? ""}`,
+      stableResult.launcherPath
+        ? `[desktop] Wandy stable helper unavailable; using the bundled launcher directly. ${stableResult.reason ?? ""}`
+        : `[desktop] Wandy stable helper unavailable; Wandy MCP will not be registered. ${stableResult.reason ?? ""}`,
     );
-    wandyLauncherPathCache = null;
+    wandyLauncherPathCache = stableResult.launcherPath;
     return wandyLauncherPathCache;
   }
 

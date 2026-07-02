@@ -27,6 +27,17 @@ export const WANDY_MCP_TOOL_NAMES = [
 
 export type WandyMcpToolName = (typeof WANDY_MCP_TOOL_NAMES)[number];
 
+// run_sequence is only implemented by the macOS runtime (WandyKit); the
+// Linux/Windows runtimes neither expose nor dispatch it, so it must not be
+// advertised to agents there.
+export function wandyMcpToolNamesForPlatform(
+  platform: NodeJS.Platform = process.platform,
+): readonly WandyMcpToolName[] {
+  return platform === "darwin"
+    ? WANDY_MCP_TOOL_NAMES
+    : WANDY_MCP_TOOL_NAMES.filter((tool) => tool !== "run_sequence");
+}
+
 export function formatWandyGrokToolName(tool: WandyMcpToolName): string {
   return `${WANDY_GROK_MCP_TOOL_PREFIX}${tool}`;
 }
@@ -34,10 +45,6 @@ export function formatWandyGrokToolName(tool: WandyMcpToolName): string {
 export function formatWandyCodexToolName(tool: WandyMcpToolName): string {
   return `${WANDY_MCP_TOOL_PREFIX}${tool}`;
 }
-
-const WANDY_GROK_TOOL_CATALOG = WANDY_MCP_TOOL_NAMES.map((tool) =>
-  formatWandyGrokToolName(tool),
-).join(", ");
 
 export const WANDY_BROWSER_TOOL_ROUTING_INSTRUCTIONS = `
 
@@ -54,7 +61,18 @@ Use \`Wandy\` only when at least one of these is true:
 
 Do not choose \`Wandy\` first for ordinary browser inspection, browser screenshots, or browser navigation when the in-app browser can handle the request.`;
 
-export const WANDY_ACP_TOOL_INVOCATION_INSTRUCTIONS = `
+export function buildWandyAcpToolInvocationInstructions(
+  platform: NodeJS.Platform = process.platform,
+): string {
+  const toolCatalog = wandyMcpToolNamesForPlatform(platform)
+    .map((tool) => formatWandyGrokToolName(tool))
+    .join(", ");
+  const runSequenceRule =
+    platform === "darwin"
+      ? "\n- When the next steps are already known from the current tree, prefer `wandy__run_sequence` to run consecutive clicks, typing, and key presses in one local batch."
+      : "";
+
+  return `
 
 ## Wandy MCP tool invocation
 
@@ -62,19 +80,21 @@ When the user asks for \`Wandy\` or \`@wandy\`, you must drive the desktop throu
 
 The \`wandy\` MCP server is registered when the session starts. These tools are already available — call them directly. Do not call \`search_tool\`, \`tool_search\`, or similar discovery tools to find them. Never spend multiple turns searching for names like "wandy click" or "wandy get_app_state".
 
-Grok qualified tool names (call with \`use_tool\`): ${WANDY_GROK_TOOL_CATALOG}.
+Grok qualified tool names (call with \`use_tool\`): ${toolCatalog}.
 Codex qualified tool names use the \`mcp__wandy__\` prefix (for example \`mcp__wandy__get_app_state\`).
 
 Speed rules for desktop UI work:
 - Start each assistant turn with one \`wandy__get_app_state\` for the target app, then act from that tree.
 - Re-fetch state only after navigation, opening/closing dialogs, or a failed/missed click — not before every click on the same stable screen.
 - Do not immediately call \`wandy__get_app_state\` after a successful action; first use the returned action result unless the next step needs a fresh tree.
-- Prefer \`wandy__set_value\` for text fields and \`wandy__click\` with element indices from the latest tree.
-- When the next steps are already known from the current tree, prefer \`wandy__run_sequence\` to run consecutive clicks, typing, and key presses in one local batch.
+- Prefer \`wandy__set_value\` for text fields and \`wandy__click\` with element indices from the latest tree.${runSequenceRule}
 - Batch obvious next steps instead of alternating search/discovery and single actions.
 - Do not call \`ask_user_question\` for routine confirmation when the user already gave a direct action request.
 
 If a \`wandy__\` tool call fails with "Tool not found", report that failure to the user instead of retrying discovery loops or falling back to shell automation.`;
+}
+
+export const WANDY_ACP_TOOL_INVOCATION_INSTRUCTIONS = buildWandyAcpToolInvocationInstructions();
 
 export const SYNARA_WANDY_PROMPT_APPEND = [
   WANDY_BROWSER_TOOL_ROUTING_INSTRUCTIONS.trim(),
