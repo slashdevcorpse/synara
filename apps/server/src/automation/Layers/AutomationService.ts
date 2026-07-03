@@ -974,6 +974,7 @@ export const AutomationServiceLive = Layer.effect(
                 ? { providerOptions: definition.providerOptions }
                 : {}),
               dispatchMode: "queue",
+              dispatchOrigin: "automation",
               runtimeMode: definition.runtimeMode,
               interactionMode: definition.interactionMode,
               createdAt: now,
@@ -1060,6 +1061,7 @@ export const AutomationServiceLive = Layer.effect(
             modelSelection: definition.modelSelection,
             ...(definition.providerOptions ? { providerOptions: definition.providerOptions } : {}),
             dispatchMode: "queue",
+            dispatchOrigin: "automation",
             runtimeMode: definition.runtimeMode,
             interactionMode: definition.interactionMode,
             createdAt: now,

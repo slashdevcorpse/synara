@@ -7,6 +7,7 @@ import { DEFAULT_SERVER_SETTINGS, type ProviderRuntimeEvent } from "@t3tools/con
 import {
   CODEX_GENERATED_IMAGE_ARTIFACT_KIND,
   codexConfiguredHomePathsFromSettings,
+  extractCodexGeneratedImageReference,
   generatedImagePathFromRuntimeEvent,
   isGeneratedImageOnlyMarkdown,
   resolveCodexGeneratedImagesRoot,
@@ -135,6 +136,36 @@ describe("resolveCodexGeneratedImagesRoot(s)", () => {
       environment: { DPCODE_DISABLE_CODEX_DPCODE_BROWSER_PLUGIN: "0" },
     });
     assert.equal(root, path.join("/codex-test/.codex-work", "generated_images"));
+  });
+
+  it("predicts missing saved_path references from the selected account home", () => {
+    process.env.SYNARA_HOME = "/synara-test/runtime";
+    delete process.env.DPCODE_DISABLE_CODEX_DPCODE_BROWSER_PLUGIN;
+
+    const reference = extractCodexGeneratedImageReference({
+      value: {
+        type: "image_generation_end",
+        call_id: "call-1",
+      },
+      threadId: "provider-thread-1",
+      codexHome: {
+        homePath: "/codex-test/.codex-work",
+        accountId: "codex_work",
+      },
+    });
+
+    assert.ok(reference, "expected generated-image reference");
+    assert.ok(
+      reference.path.startsWith(
+        path.join("/synara-test/runtime", "codex-home-overlay", "accounts", "codex_work-"),
+      ),
+      `expected account overlay path, got ${reference.path}`,
+    );
+    assert.equal(
+      path.basename(reference.path),
+      "call-1.png",
+      "predicted path should use the image call id",
+    );
   });
 
   it("returns both source and overlay generated_images roots for the allowlist", () => {

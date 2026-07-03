@@ -254,10 +254,10 @@ layer("reconcileMigrationLineage", (it) => {
           )
       `;
 
-      const executed = yield* runMigrations({ toMigrationInclusive: 50 });
+      const executed = yield* runMigrations({ toMigrationInclusive: 51 });
       assert.deepStrictEqual(
         executed.map(([id]) => id),
-        [49, 50],
+        [49, 50, 51],
       );
 
       const projectionSessionColumns = yield* tableColumnNames(sql, "projection_thread_sessions");
