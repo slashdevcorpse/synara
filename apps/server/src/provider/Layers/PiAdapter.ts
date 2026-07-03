@@ -33,6 +33,7 @@ import {
 } from "@t3tools/contracts";
 import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
 import { Effect, FileSystem, Layer, Queue, Stream } from "effect";
+import * as Semaphore from "effect/Semaphore";
 
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
@@ -751,6 +752,28 @@ function makeAgentDir(
   return trimToUndefined(agentDir) ?? piSdk.getAgentDir();
 }
 
+function installTemporaryProcessEnvironment(
+  environment: Readonly<Record<string, string>> | undefined,
+): () => void {
+  if (!environment || Object.keys(environment).length === 0) {
+    return () => {};
+  }
+  const previous = new Map<string, string | undefined>();
+  for (const [key, value] of Object.entries(environment)) {
+    previous.set(key, process.env[key]);
+    process.env[key] = value;
+  }
+  return () => {
+    for (const [key, value] of previous) {
+      if (value === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
+  };
+}
+
 // Keep discovery registries isolated so extension provider registrations reflect
 // the current agent dir + project cwd instead of stale state from prior listings.
 function createPiModelRegistry(
@@ -858,6 +881,7 @@ const makePiAdapter = (options?: PiAdapterLiveOptions) =>
     const runtimeEventQueue = yield* Queue.unbounded<ProviderRuntimeEvent>();
     const sessions = new Map<ThreadId, PiSessionContext>();
     const modelRegistries = new Map<string, ModelRegistry>();
+    const piEnvironmentSemaphore = yield* Semaphore.make(1);
     const ownsNativeEventLogger = options?.nativeEventLogger === undefined;
     const nativeEventLogger =
       options?.nativeEventLogger ??
@@ -876,6 +900,18 @@ const makePiAdapter = (options?: PiAdapterLiveOptions) =>
             cause,
           }),
       });
+
+    const withPiSdkEnvironment = <A, E>(
+      environment: Readonly<Record<string, string>> | undefined,
+      effect: Effect.Effect<A, E>,
+    ): Effect.Effect<A, E> =>
+      piEnvironmentSemaphore.withPermits(1)(
+        Effect.acquireUseRelease(
+          Effect.sync(() => installTemporaryProcessEnvironment(environment)),
+          () => effect,
+          (restore) => Effect.sync(restore),
+        ),
+      );
 
     const getModelRegistry = async (
       agentDir: string,
@@ -1614,11 +1650,9 @@ const makePiAdapter = (options?: PiAdapterLiveOptions) =>
       Effect.gen(function* () {
         const cwd = trimToUndefined(input.cwd) ?? serverConfig.cwd;
         const piSdk = yield* loadPiSdk("session/start");
-        const agentDir = makeAgentDir(input.providerOptions?.pi?.agentDir, piSdk);
         const sessionFile = extractResumeSessionFile(input.resumeCursor);
-        const sessionManager = sessionFile
-          ? piSdk.SessionManager.open(sessionFile, undefined, cwd)
-          : piSdk.SessionManager.create(cwd);
+        const piOptions = input.providerOptions?.pi;
+        const piEnvironment = piOptions?.environment;
         const modelId = input.modelSelection?.model;
         const thinkingLevel = normalizePiThinkingLevel(
           getModelSelectionStringOptionValue(input.modelSelection, "thinkingLevel"),
@@ -1637,24 +1671,32 @@ const makePiAdapter = (options?: PiAdapterLiveOptions) =>
               }),
           });
         }
-        const { runtime, modelRegistry } = yield* Effect.tryPromise({
-          try: () =>
-            createSdkRuntime({
-              sdk: piSdk,
-              cwd,
-              agentDir,
-              sessionManager,
-              ...(modelId ? { modelId } : {}),
-              ...(thinkingLevel ? { thinkingLevel } : {}),
-            }),
-          catch: (cause) =>
-            new ProviderAdapterRequestError({
-              provider: PROVIDER,
-              method: "session/start",
-              detail: toMessage(cause, "Failed to start Pi session."),
-              cause,
-            }),
-        });
+        const { runtime, modelRegistry } = yield* withPiSdkEnvironment(
+          piEnvironment,
+          Effect.tryPromise({
+            try: () => {
+              const agentDir = makeAgentDir(piOptions?.agentDir, piSdk);
+              const sessionManager = sessionFile
+                ? piSdk.SessionManager.open(sessionFile, undefined, cwd)
+                : piSdk.SessionManager.create(cwd);
+              return createSdkRuntime({
+                sdk: piSdk,
+                cwd,
+                agentDir,
+                sessionManager,
+                ...(modelId ? { modelId } : {}),
+                ...(thinkingLevel ? { thinkingLevel } : {}),
+              });
+            },
+            catch: (cause) =>
+              new ProviderAdapterRequestError({
+                provider: PROVIDER,
+                method: "session/start",
+                detail: toMessage(cause, "Failed to start Pi session."),
+                cause,
+              }),
+          }),
+        );
         const now = new Date().toISOString();
         const model = runtime.session.model
           ? `${runtime.session.model.provider}/${runtime.session.model.id}`
@@ -1689,17 +1731,20 @@ const makePiAdapter = (options?: PiAdapterLiveOptions) =>
           handleSessionEvent(context, event),
         );
         sessions.set(input.threadId, context);
-        yield* Effect.tryPromise({
-          try: () =>
-            runtime.session.bindExtensions({ uiContext: makePiExtensionUIContext(context) }),
-          catch: (cause) =>
-            new ProviderAdapterRequestError({
-              provider: PROVIDER,
-              method: "extension/bind",
-              detail: toMessage(cause, "Failed to bind Pi extensions."),
-              cause,
-            }),
-        }).pipe(
+        yield* withPiSdkEnvironment(
+          piEnvironment,
+          Effect.tryPromise({
+            try: () =>
+              runtime.session.bindExtensions({ uiContext: makePiExtensionUIContext(context) }),
+            catch: (cause) =>
+              new ProviderAdapterRequestError({
+                provider: PROVIDER,
+                method: "extension/bind",
+                detail: toMessage(cause, "Failed to bind Pi extensions."),
+                cause,
+              }),
+          }),
+        ).pipe(
           Effect.catch((error) =>
             Effect.gen(function* () {
               sessions.delete(input.threadId);
@@ -2107,175 +2152,189 @@ const makePiAdapter = (options?: PiAdapterLiveOptions) =>
       }).pipe(Effect.asVoid);
 
     const listModels: NonNullable<PiAdapterShape["listModels"]> = (input) =>
-      Effect.tryPromise({
-        try: async () => {
-          const piSdk = await loadPiCodingAgentModule();
-          const agentDir = makeAgentDir(input.agentDir, piSdk);
-          const cwd = trimToUndefined(input.cwd) ?? serverConfig.cwd;
-          const { authStorage, registry } = createPiModelRegistry(agentDir, piSdk);
-          const services = await piSdk.createAgentSessionServices({
-            cwd,
-            agentDir,
-            authStorage,
-            modelRegistry: registry,
-          });
-          const extensionCount = services.resourceLoader.getExtensions().extensions.length;
-          const models = services.modelRegistry.getAvailable().map((model) => {
-            const supportedThinkingOptions = getPiSupportedThinkingOptions(model);
+      withPiSdkEnvironment(
+        input.environment,
+        Effect.tryPromise({
+          try: async () => {
+            const piSdk = await loadPiCodingAgentModule();
+            const agentDir = makeAgentDir(input.agentDir, piSdk);
+            const cwd = trimToUndefined(input.cwd) ?? serverConfig.cwd;
+            const { authStorage, registry } = createPiModelRegistry(agentDir, piSdk);
+            const services = await piSdk.createAgentSessionServices({
+              cwd,
+              agentDir,
+              authStorage,
+              modelRegistry: registry,
+            });
+            const extensionCount = services.resourceLoader.getExtensions().extensions.length;
+            const models = services.modelRegistry.getAvailable().map((model) => {
+              const supportedThinkingOptions = getPiSupportedThinkingOptions(model);
+              return {
+                slug: `${model.provider}/${model.id}`,
+                name: model.name,
+                upstreamProviderId: model.provider,
+                upstreamProviderName: services.modelRegistry.getProviderDisplayName(model.provider),
+                ...(supportedThinkingOptions.length > 0
+                  ? {
+                      supportedReasoningEfforts: supportedThinkingOptions.map((option) => ({
+                        value: option.value,
+                        label: option.label,
+                        description: option.description,
+                      })),
+                      ...(supportedThinkingOptions.some(
+                        (option) => option.value === DEFAULT_PI_THINKING_LEVEL,
+                      )
+                        ? { defaultReasoningEffort: DEFAULT_PI_THINKING_LEVEL }
+                        : {}),
+                    }
+                  : {}),
+              };
+            });
             return {
-              slug: `${model.provider}/${model.id}`,
-              name: model.name,
-              upstreamProviderId: model.provider,
-              upstreamProviderName: services.modelRegistry.getProviderDisplayName(model.provider),
-              ...(supportedThinkingOptions.length > 0
-                ? {
-                    supportedReasoningEfforts: supportedThinkingOptions.map((option) => ({
-                      value: option.value,
-                      label: option.label,
-                      description: option.description,
-                    })),
-                    ...(supportedThinkingOptions.some(
-                      (option) => option.value === DEFAULT_PI_THINKING_LEVEL,
-                    )
-                      ? { defaultReasoningEffort: DEFAULT_PI_THINKING_LEVEL }
-                      : {}),
-                  }
-                : {}),
-            };
-          });
-          return {
-            models,
-            source: extensionCount > 0 ? "pi.sdk+extensions" : "pi.sdk",
-            cached: false,
-          } satisfies ProviderListModelsResult;
-        },
-        catch: (cause) =>
-          new ProviderAdapterRequestError({
-            provider: PROVIDER,
-            method: "model/list",
-            detail: toMessage(cause, "Failed to list Pi models."),
-            cause,
-          }),
-      });
+              models,
+              source: extensionCount > 0 ? "pi.sdk+extensions" : "pi.sdk",
+              cached: false,
+            } satisfies ProviderListModelsResult;
+          },
+          catch: (cause) =>
+            new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "model/list",
+              detail: toMessage(cause, "Failed to list Pi models."),
+              cause,
+            }),
+        }),
+      );
 
     const listSkills: NonNullable<PiAdapterShape["listSkills"]> = (input) =>
-      Effect.tryPromise({
-        try: async () => {
-          const active = input.threadId
-            ? sessions.get(ThreadId.makeUnsafe(input.threadId))
-            : undefined;
-          const loader = active?.runtime.session.resourceLoader;
-          if (active && input.forceReload) {
-            await active.runtime.session.reload();
-          }
-          let services:
-            | Awaited<ReturnType<PiCodingAgentModule["createAgentSessionServices"]>>
-            | undefined;
-          if (!loader) {
+      withPiSdkEnvironment(
+        input.environment,
+        Effect.tryPromise({
+          try: async () => {
+            const active = input.threadId
+              ? sessions.get(ThreadId.makeUnsafe(input.threadId))
+              : undefined;
+            const loader = active?.runtime.session.resourceLoader;
+            if (active && input.forceReload) {
+              await active.runtime.session.reload();
+            }
+            let services:
+              | Awaited<ReturnType<PiCodingAgentModule["createAgentSessionServices"]>>
+              | undefined;
+            if (!loader) {
+              const piSdk = await loadPiCodingAgentModule();
+              services = await piSdk.createAgentSessionServices({
+                cwd: input.cwd,
+                agentDir: makeAgentDir(input.agentDir, piSdk),
+              });
+            }
+            if (services && input.forceReload) {
+              await services.resourceLoader.reload();
+            }
+            const resourceLoader = loader ?? services?.resourceLoader;
+            if (!resourceLoader) {
+              throw new Error("Failed to create Pi resource loader.");
+            }
+            const result = resourceLoader.getSkills();
+            return {
+              skills: result.skills.map((skill) => {
+                const description = trimToUndefined(skill.description);
+                const scope = trimToUndefined(skill.sourceInfo.source);
+                return {
+                  name: skill.name,
+                  ...(description ? { description } : {}),
+                  path: skill.filePath,
+                  enabled: !skill.disableModelInvocation,
+                  ...(scope ? { scope } : {}),
+                };
+              }),
+              source: "pi.sdk",
+              cached: false,
+            } satisfies ProviderListSkillsResult;
+          },
+          catch: (cause) =>
+            new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "skill/list",
+              detail: toMessage(cause, "Failed to list Pi skills."),
+              cause,
+            }),
+        }),
+      );
+
+    const listCommands: NonNullable<PiAdapterShape["listCommands"]> = (input) =>
+      withPiSdkEnvironment(
+        input.environment,
+        Effect.tryPromise({
+          try: async () => {
+            const active = input.threadId
+              ? sessions.get(ThreadId.makeUnsafe(input.threadId))
+              : undefined;
+            const session = active?.runtime.session;
+            const reloadCommand = {
+              name: "reload",
+              description: "Reload Pi extensions, skills, prompts, themes, tools, and settings",
+            };
+            if (session) {
+              if (input.forceReload) {
+                await session.reload();
+              }
+              const extensionCommands = session.extensionRunner
+                .getRegisteredCommands()
+                .map((command) => ({
+                  name: command.invocationName,
+                  description: trimToUndefined(command.description) ?? "Extension command",
+                }));
+              const promptCommands = session.promptTemplates.map((template) => ({
+                name: template.name,
+                description: trimToUndefined(template.description) ?? "Prompt template",
+              }));
+              const skillCommands = session.resourceLoader.getSkills().skills.map((skill) => ({
+                name: `skill:${skill.name}`,
+                description: trimToUndefined(skill.description) ?? "Skill",
+              }));
+              return {
+                commands: [
+                  reloadCommand,
+                  ...extensionCommands,
+                  ...promptCommands,
+                  ...skillCommands,
+                ],
+                source: "pi.sdk",
+                cached: false,
+              } satisfies ProviderListCommandsResult;
+            }
             const piSdk = await loadPiCodingAgentModule();
-            services = await piSdk.createAgentSessionServices({
+            const services = await piSdk.createAgentSessionServices({
               cwd: input.cwd,
               agentDir: makeAgentDir(input.agentDir, piSdk),
             });
-          }
-          if (services && input.forceReload) {
-            await services.resourceLoader.reload();
-          }
-          const resourceLoader = loader ?? services?.resourceLoader;
-          if (!resourceLoader) {
-            throw new Error("Failed to create Pi resource loader.");
-          }
-          const result = resourceLoader.getSkills();
-          return {
-            skills: result.skills.map((skill) => {
-              const description = trimToUndefined(skill.description);
-              const scope = trimToUndefined(skill.sourceInfo.source);
-              return {
-                name: skill.name,
-                ...(description ? { description } : {}),
-                path: skill.filePath,
-                enabled: !skill.disableModelInvocation,
-                ...(scope ? { scope } : {}),
-              };
-            }),
-            source: "pi.sdk",
-            cached: false,
-          } satisfies ProviderListSkillsResult;
-        },
-        catch: (cause) =>
-          new ProviderAdapterRequestError({
-            provider: PROVIDER,
-            method: "skill/list",
-            detail: toMessage(cause, "Failed to list Pi skills."),
-            cause,
-          }),
-      });
-
-    const listCommands: NonNullable<PiAdapterShape["listCommands"]> = (input) =>
-      Effect.tryPromise({
-        try: async () => {
-          const active = input.threadId
-            ? sessions.get(ThreadId.makeUnsafe(input.threadId))
-            : undefined;
-          const session = active?.runtime.session;
-          const reloadCommand = {
-            name: "reload",
-            description: "Reload Pi extensions, skills, prompts, themes, tools, and settings",
-          };
-          if (session) {
             if (input.forceReload) {
-              await session.reload();
+              await services.resourceLoader.reload();
             }
-            const extensionCommands = session.extensionRunner
-              .getRegisteredCommands()
-              .map((command) => ({
-                name: command.invocationName,
-                description: trimToUndefined(command.description) ?? "Extension command",
-              }));
-            const promptCommands = session.promptTemplates.map((template) => ({
+            const promptCommands = services.resourceLoader.getPrompts().prompts.map((template) => ({
               name: template.name,
               description: trimToUndefined(template.description) ?? "Prompt template",
             }));
-            const skillCommands = session.resourceLoader.getSkills().skills.map((skill) => ({
+            const skillCommands = services.resourceLoader.getSkills().skills.map((skill) => ({
               name: `skill:${skill.name}`,
               description: trimToUndefined(skill.description) ?? "Skill",
             }));
             return {
-              commands: [reloadCommand, ...extensionCommands, ...promptCommands, ...skillCommands],
+              commands: [reloadCommand, ...promptCommands, ...skillCommands],
               source: "pi.sdk",
               cached: false,
             } satisfies ProviderListCommandsResult;
-          }
-          const piSdk = await loadPiCodingAgentModule();
-          const services = await piSdk.createAgentSessionServices({
-            cwd: input.cwd,
-            agentDir: makeAgentDir(input.agentDir, piSdk),
-          });
-          if (input.forceReload) {
-            await services.resourceLoader.reload();
-          }
-          const promptCommands = services.resourceLoader.getPrompts().prompts.map((template) => ({
-            name: template.name,
-            description: trimToUndefined(template.description) ?? "Prompt template",
-          }));
-          const skillCommands = services.resourceLoader.getSkills().skills.map((skill) => ({
-            name: `skill:${skill.name}`,
-            description: trimToUndefined(skill.description) ?? "Skill",
-          }));
-          return {
-            commands: [reloadCommand, ...promptCommands, ...skillCommands],
-            source: "pi.sdk",
-            cached: false,
-          } satisfies ProviderListCommandsResult;
-        },
-        catch: (cause) =>
-          new ProviderAdapterRequestError({
-            provider: PROVIDER,
-            method: "command/list",
-            detail: toMessage(cause, "Failed to list Pi commands."),
-            cause,
-          }),
-      });
+          },
+          catch: (cause) =>
+            new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "command/list",
+              detail: toMessage(cause, "Failed to list Pi commands."),
+              cause,
+            }),
+        }),
+      );
 
     const getComposerCapabilities: NonNullable<PiAdapterShape["getComposerCapabilities"]> = () =>
       Effect.succeed({

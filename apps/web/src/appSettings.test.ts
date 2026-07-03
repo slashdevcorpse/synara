@@ -10,6 +10,7 @@ import { codexAccountInstanceId } from "@t3tools/shared/providerInstances";
 
 import {
   AppSettingsSchema,
+  buildInitialServerSettingsMigrationPatch,
   DEFAULT_CHAT_FONT_SIZE_PX,
   DEFAULT_SIDEBAR_PROJECT_SORT_ORDER,
   DEFAULT_TERMINAL_FONT_SIZE_PX,
@@ -472,6 +473,48 @@ describe("normalizeStoredAppSettings", () => {
       serverUrl: "http://127.0.0.1:4096",
       serverPassword: "",
       serverPasswordRedacted: true,
+    });
+  });
+
+  it("builds the initial server migration patch from legacy plaintext before storage redaction", () => {
+    const decodedSettings = Schema.decodeSync(Schema.fromJsonString(AppSettingsSchema))(
+      JSON.stringify({
+        providerInstances: {
+          grok_work: {
+            driver: "grok",
+            environment: [{ name: "XAI_API_KEY", value: "super-secret", sensitive: true }],
+          },
+          opencode_work: {
+            driver: "opencode",
+            config: { serverUrl: "http://127.0.0.1:4096", serverPassword: "server-secret" },
+          },
+        },
+      }),
+    );
+
+    expect(buildInitialServerSettingsMigrationPatch(decodedSettings).providerInstances).toEqual({
+      grok_work: {
+        driver: "grok",
+        environment: [{ name: "XAI_API_KEY", value: "super-secret", sensitive: true }],
+      },
+      opencode_work: {
+        driver: "opencode",
+        config: { serverUrl: "http://127.0.0.1:4096", serverPassword: "server-secret" },
+      },
+    });
+    expect(normalizeStoredAppSettings(decodedSettings).providerInstances).toEqual({
+      grok_work: {
+        driver: "grok",
+        environment: [{ name: "XAI_API_KEY", value: "", sensitive: true, valueRedacted: true }],
+      },
+      opencode_work: {
+        driver: "opencode",
+        config: {
+          serverUrl: "http://127.0.0.1:4096",
+          serverPassword: "",
+          serverPasswordRedacted: true,
+        },
+      },
     });
   });
 
@@ -1046,6 +1089,26 @@ describe("getProviderInstanceOptions", () => {
 });
 
 describe("resolveSelectableProviderInstanceId", () => {
+  it("uses the selected Codex account when only the provider is requested", () => {
+    const settings = {
+      codexAccounts: [
+        {
+          id: "work@example.com",
+          label: "Work",
+          homePath: "",
+          shadowHomePath: "",
+        },
+      ],
+      codexHomePath: "",
+      providerInstances: {},
+      selectedCodexAccountId: "work@example.com",
+    } as const;
+
+    expect(resolveSelectableProviderInstanceId(settings, "codex")).toBe(
+      codexAccountInstanceId("work@example.com"),
+    );
+  });
+
   it("keeps a requested enabled provider instance", () => {
     const settings = {
       codexAccounts: [],
@@ -1447,8 +1510,18 @@ describe("provider-indexed custom model settings", () => {
   });
 
   it("reads custom models from the selected provider instance without leaking provider buckets", () => {
+    const derivedCodexInstanceId = codexAccountInstanceId("work@example.com");
     const modelSettings = {
       ...settings,
+      codexAccounts: [
+        {
+          id: "work@example.com",
+          label: "Work Email",
+          homePath: "",
+          shadowHomePath: "",
+        },
+      ],
+      codexHomePath: "",
       providerInstances: {
         claude_work: {
           driver: "claudeAgent",
@@ -1461,6 +1534,11 @@ describe("provider-indexed custom model settings", () => {
           config: {},
         },
         codex_work: {
+          driver: "codex",
+          enabled: true,
+          config: {},
+        },
+        [derivedCodexInstanceId]: {
           driver: "codex",
           enabled: true,
           config: {},
@@ -1496,6 +1574,13 @@ describe("provider-indexed custom model settings", () => {
         isDefault: false,
       }),
     ).toEqual([]);
+    expect(
+      getCustomModelsForProviderInstance(modelSettings, {
+        instanceId: derivedCodexInstanceId,
+        provider: "codex",
+        isDefault: false,
+      }),
+    ).toEqual(["custom/codex-model"]);
   });
 });
 

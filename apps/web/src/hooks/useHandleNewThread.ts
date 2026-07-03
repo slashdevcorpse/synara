@@ -2,7 +2,11 @@ import { type ProjectId, type ProviderInstanceId, ThreadId } from "@t3tools/cont
 import { getDefaultModel } from "@t3tools/shared/model";
 import { useNavigate } from "@tanstack/react-router";
 import { useCallback, useMemo } from "react";
-import { getProviderInstanceOptions, useAppSettings } from "../appSettings";
+import {
+  getProviderInstanceOptions,
+  resolveSelectableProviderInstanceId,
+  useAppSettings,
+} from "../appSettings";
 import {
   type ComposerThreadDraftState,
   type DraftThreadState,
@@ -62,7 +66,7 @@ export function useHandleNewThread() {
           return;
         }
         setModelSelection(threadId, {
-          instanceId: options.provider,
+          instanceId: resolveSelectableProviderInstanceId(settings, options.provider),
           model: defaultModel,
         });
       };
@@ -311,7 +315,7 @@ export function useHandleNewThread() {
       focusedThreadId,
       markTemporaryThread,
       providerInstances,
-      settings.defaultProvider,
+      settings,
     ],
   );
 

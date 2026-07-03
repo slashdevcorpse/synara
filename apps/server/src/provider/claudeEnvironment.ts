@@ -5,6 +5,7 @@
 // Exports: claudeHomeEnvironment, buildClaudeProcessEnv
 
 import * as NodePath from "node:path";
+import { homedir } from "node:os";
 
 import {
   CLAUDE_DIRECT_CREDENTIAL_ENV_KEYS,
@@ -39,6 +40,16 @@ export function claudeHomeEnvironment(
   };
 }
 
+function expandClaudeHomePath(homePath: string, homeDir?: string): string {
+  if (homePath === "~") {
+    return homeDir ?? homedir();
+  }
+  if (homePath.startsWith("~/")) {
+    return NodePath.join(homeDir ?? homedir(), homePath.slice(2));
+  }
+  return homePath;
+}
+
 export function buildClaudeProcessEnv(input?: {
   readonly homePath?: string | null | undefined;
   readonly environment?: Readonly<Record<string, string>> | undefined;
@@ -47,6 +58,9 @@ export function buildClaudeProcessEnv(input?: {
   readonly hasClaudeCliCredentials?: boolean;
 }): NodeJS.ProcessEnv {
   const trimmedHomePath = input?.homePath?.trim();
+  const resolvedHomePath = trimmedHomePath
+    ? expandClaudeHomePath(trimmedHomePath, input?.homeDir)
+    : undefined;
   const env: NodeJS.ProcessEnv = { ...(input?.env ?? process.env) };
   // Align the subprocess HOME with the credential home being checked so Claude
   // reads the same login state the health/session gate validated. Instance
@@ -57,13 +71,13 @@ export function buildClaudeProcessEnv(input?: {
   if (input?.environment) {
     Object.assign(env, input.environment);
   }
-  if (trimmedHomePath) {
-    Object.assign(env, claudeHomeEnvironment(trimmedHomePath));
+  if (resolvedHomePath) {
+    Object.assign(env, claudeHomeEnvironment(resolvedHomePath));
   }
 
   // Credentials live in the selected instance home when one is configured;
   // otherwise fall back to the caller-provided server home / env HOME.
-  const credentialsHomeDir = trimmedHomePath ?? input?.homeDir;
+  const credentialsHomeDir = resolvedHomePath ?? input?.homeDir;
   const hasLocalClaudeAuth =
     input?.hasClaudeCliCredentials ??
     hasUsableClaudeCliCredentials(

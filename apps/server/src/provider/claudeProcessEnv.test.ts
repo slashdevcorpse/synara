@@ -98,6 +98,18 @@ describe("claudeProcessEnv", () => {
     assert.equal(result.ANTHROPIC_API_KEY, undefined);
   });
 
+  it("expands tilde instance homes before setting HOME and checking credentials", () => {
+    const result = buildClaudeProcessEnv({
+      env: { HOME: "/home/default", ANTHROPIC_API_KEY: "stale-key" },
+      homeDir: "/Users/tester",
+      homePath: "~/.claude-work",
+      hasClaudeCliCredentials: true,
+    });
+
+    assert.equal(result.HOME, "/Users/tester/.claude-work");
+    assert.equal(result.ANTHROPIC_API_KEY, undefined);
+  });
+
   it("checks CLAUDE_CONFIG_DIR before the default Claude home", () => {
     assert.deepEqual(
       resolveClaudeCredentialsPaths({

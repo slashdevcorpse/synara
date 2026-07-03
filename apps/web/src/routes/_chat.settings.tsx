@@ -50,6 +50,7 @@ import {
   MAX_CHAT_FONT_SIZE_PX,
   MAX_TERMINAL_FONT_SIZE_PX,
   getCustomModelsForProvider,
+  getCustomModelsForProviderInstance,
   getGitTextGenerationPickerOptions,
   getProviderInstanceOptions,
   getUnsupportedProviderInstanceOptions,
@@ -553,23 +554,11 @@ function readProviderInstanceConfigBoolean(config: unknown, key: string): boolea
 }
 
 function readStoredCustomModelsForTarget(
-  settings: Pick<AppSettings, "providerInstances"> &
+  settings: Pick<AppSettings, "codexAccounts" | "codexHomePath" | "providerInstances"> &
     Parameters<typeof getCustomModelsForProvider>[0],
   target: CustomModelTargetOption,
 ): readonly string[] {
-  if (target.isDefault || target.instanceId === target.provider) {
-    return getCustomModelsForProvider(settings, target.provider);
-  }
-
-  const raw = settings.providerInstances[target.instanceId];
-  const config = raw?.config;
-  const customModels =
-    config && typeof config === "object" && !Array.isArray(config)
-      ? (config as Record<string, unknown>).customModels
-      : null;
-  return Array.isArray(customModels)
-    ? customModels.filter((entry): entry is string => typeof entry === "string")
-    : [];
+  return getCustomModelsForProviderInstance(settings, target);
 }
 
 function removeProviderInstanceCustomModels(
