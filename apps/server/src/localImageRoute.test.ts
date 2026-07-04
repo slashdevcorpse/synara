@@ -16,6 +16,7 @@ import { ServerAuth, type ServerAuthShape } from "./auth/Services/ServerAuth";
 import { resolveDefaultChatWorkspaceRoot, ServerConfig, type ServerConfigShape } from "./config";
 import { attachmentsEffectRouteLayer, localImageEffectRouteLayer } from "./http";
 import { createLocalPreviewGrant } from "./localImageFiles";
+import type { CodexGeneratedImageHomeCandidate } from "./codexGeneratedImages.ts";
 import type { ProviderAdapterError } from "./provider/Errors.ts";
 import type { ProviderAdapterShape } from "./provider/Services/ProviderAdapter.ts";
 import { ProviderAdapterRegistry } from "./provider/Services/ProviderAdapterRegistry.ts";
@@ -111,7 +112,7 @@ function makeFakeServerAuth(): ServerAuthShape {
 }
 
 function makeGeneratedImageHomeRegistry(
-  homePaths: readonly string[],
+  homePaths: readonly CodexGeneratedImageHomeCandidate[],
 ): typeof ProviderAdapterRegistry.Service {
   const adapter: ProviderAdapterShape<ProviderAdapterError> = {
     provider: "codex",

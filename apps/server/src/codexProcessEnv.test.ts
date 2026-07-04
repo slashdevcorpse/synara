@@ -10,6 +10,8 @@ import {
   readlinkSync,
   rmSync,
   symlinkSync,
+  chmodSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import OS from "node:os";
@@ -77,6 +79,36 @@ describe("buildCodexProcessEnv account overlays", () => {
       path.resolve(readlinkSync(overlayAuthPath)),
       path.resolve(path.join(fixture.shadowHomePath, "auth.json")),
     );
+  });
+
+  it("fails when shadow-home auth cannot be linked into the account overlay", () => {
+    const fixture = makeAccountFixture({ shadowAuth: "real" });
+    const firstEnv = buildCodexProcessEnv({
+      env: fixture.env,
+      homePath: fixture.homePath,
+      shadowHomePath: fixture.shadowHomePath,
+      accountId: "work",
+      platform: "win32",
+    });
+    const overlayHomePath = firstEnv.CODEX_HOME;
+    assert.ok(overlayHomePath);
+    unlinkSync(path.join(overlayHomePath, "auth.json"));
+    chmodSync(overlayHomePath, 0o500);
+    try {
+      assert.throws(
+        () =>
+          buildCodexProcessEnv({
+            env: fixture.env,
+            homePath: fixture.homePath,
+            shadowHomePath: fixture.shadowHomePath,
+            accountId: "work",
+            platform: "win32",
+          }),
+        /EACCES|EPERM/,
+      );
+    } finally {
+      chmodSync(overlayHomePath, 0o700);
+    }
   });
 
   it("tolerates shadow homes with no auth state yet", () => {

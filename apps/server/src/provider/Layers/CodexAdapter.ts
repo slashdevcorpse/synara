@@ -51,6 +51,7 @@ import {
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import {
   codexGeneratedImageArtifact,
+  type CodexGeneratedImageHomeCandidate,
   type CodexGeneratedImageHomeContext,
   extractCodexGeneratedImageReference,
   firstStringValue,
@@ -1928,11 +1929,15 @@ const makeCodexAdapter = (options?: CodexAdapterLiveOptions) =>
       CodexAdapterShape["listGeneratedImageHomePaths"]
     > = () =>
       Effect.sync(() => {
-        const homePaths = new Set<string>();
+        const homePaths = new Map<string, CodexGeneratedImageHomeCandidate>();
         for (const session of manager.listSessions()) {
-          homePaths.add(resolveCodexHomePath(manager.getSessionCodexOptions(session.threadId)));
+          const codexOptions = manager.getSessionCodexOptions(session.threadId);
+          const candidate = codexOptions ?? resolveCodexHomePath(undefined);
+          const candidateKey =
+            typeof candidate === "string" ? `path:${candidate}` : JSON.stringify(candidate);
+          homePaths.set(candidateKey, candidate);
         }
-        return [...homePaths];
+        return [...homePaths.values()];
       });
 
     const hasSession: CodexAdapterShape["hasSession"] = (threadId) =>

@@ -42,6 +42,7 @@ import type {
 } from "@t3tools/contracts";
 import type { Effect } from "effect";
 import type { Stream } from "effect";
+import type { CodexGeneratedImageHomeCandidate } from "../../codexGeneratedImages.ts";
 
 export type ProviderSessionModelSwitchMode = "in-session" | "restart-session" | "unsupported";
 
@@ -147,7 +148,10 @@ export interface ProviderAdapterShape<TError> {
   /**
    * List provider home roots that can contain generated image artifacts for live sessions.
    */
-  readonly listGeneratedImageHomePaths?: () => Effect.Effect<ReadonlyArray<string>, TError>;
+  readonly listGeneratedImageHomePaths?: () => Effect.Effect<
+    ReadonlyArray<CodexGeneratedImageHomeCandidate>,
+    TError
+  >;
 
   /**
    * Check whether this adapter owns an active session id.

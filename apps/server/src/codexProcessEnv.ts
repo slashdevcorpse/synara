@@ -277,17 +277,13 @@ function prepareDpCodeCodexHomeOverlay(input: {
         continue;
       }
       const targetPath = path.join(overlayHomePath, entry);
-      try {
-        ensureCodexOverlaySymlink({
-          entryName: entry,
-          sourcePath: path.join(shadowHomePath, entry),
-          targetPath,
-          type: sourceStat.isDirectory() ? "dir" : "file",
-          force: true,
-        });
-      } catch {
-        // Transient overlay filesystem races must not block session start.
-      }
+      ensureCodexOverlaySymlink({
+        entryName: entry,
+        sourcePath: path.join(shadowHomePath, entry),
+        targetPath,
+        type: sourceStat.isDirectory() ? "dir" : "file",
+        force: true,
+      });
     }
   }
 

@@ -1713,7 +1713,7 @@ layer("AutomationService", (it) => {
     }),
   );
 
-  it.effect("drops stale heartbeat turn provider options when the selected instance is gone", () =>
+  it.effect("fails a heartbeat run when the selected provider instance is gone", () =>
     Effect.gen(function* () {
       resetHarness();
       const service = yield* AutomationService;
@@ -1739,14 +1739,16 @@ layer("AutomationService", (it) => {
         },
       });
 
-      yield* service.runNow({ automationId: created.id });
+      const error = yield* service.runNow({ automationId: created.id }).pipe(Effect.flip);
 
-      const command = dispatchedCommands[0];
-      assert.strictEqual(command?.type, "thread.turn.start");
-      if (command?.type !== "thread.turn.start") {
-        assert.fail("Expected a thread.turn.start command.");
-      }
-      assert.isUndefined(command.providerOptions);
+      assert.match(
+        error.message,
+        /provider instance 'codex_removed_dispatch' is no longer configured/,
+      );
+      assert.strictEqual(dispatchedCommands.length, 0);
+      const listed = yield* service.list({ projectId });
+      const failedRun = listed.runs.find((entry) => entry.automationId === created.id);
+      assert.strictEqual(failedRun?.status, "failed");
     }),
   );
 
@@ -2484,7 +2486,7 @@ layer("AutomationService", (it) => {
   );
 
   it.effect(
-    "drops stale heartbeat completion provider options when the selected instance is gone",
+    "drops stale heartbeat completion provider options when the selected instance is removed",
     () =>
       Effect.gen(function* () {
         resetHarness();
@@ -2494,6 +2496,16 @@ layer("AutomationService", (it) => {
         const automationTurnId = TurnId.makeUnsafe("turn-stop-missing-provider-instance");
         threadShell = Option.some(makeThreadShell({ id: targetThreadId }));
         yield* serverSettings.updateSettings({
+          providerInstances: {
+            codex_removed: {
+              driver: "codex",
+              displayName: "Codex Removed",
+              config: {
+                homePath: "/tmp/codex-removed-home",
+                accountId: "removed",
+              },
+            },
+          },
           textGenerationModelSelection: {
             instanceId: "cursor",
             model: "composer-2",
@@ -2519,6 +2531,13 @@ layer("AutomationService", (it) => {
           completionPolicy: heartbeatCompletionPolicy("the PR is ready"),
         });
         const { run } = yield* service.runNow({ automationId: created.id });
+        yield* serverSettings.updateSettings({
+          providerInstances: {},
+          textGenerationModelSelection: {
+            instanceId: "cursor",
+            model: "composer-2",
+          },
+        });
         yield* completeHeartbeatRun({
           run,
           threadId: targetThreadId,
