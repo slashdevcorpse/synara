@@ -39,6 +39,7 @@ import {
 
 import { showConfirmDialogFallback } from "./confirmDialogFallback";
 import { showContextMenuFallback } from "./contextMenuFallback";
+import { reportWsListenerError } from "./wsListenerErrors";
 import { WsTransport } from "./wsTransport";
 import { emitWsTransportState } from "./wsTransportEvents";
 
@@ -215,8 +216,8 @@ export function onServerWelcome(listener: (payload: WsWelcomePayload) => void): 
   if (latestWelcome) {
     try {
       listener(latestWelcome);
-    } catch {
-      // Swallow listener errors
+    } catch (error) {
+      reportWsListenerError("serverWelcome", error);
     }
   }
 
@@ -239,8 +240,8 @@ export function onServerConfigUpdated(
   if (latestConfig) {
     try {
       listener(latestConfig);
-    } catch {
-      // Swallow listener errors
+    } catch (error) {
+      reportWsListenerError("serverConfigUpdated", error);
     }
   }
 
@@ -262,8 +263,8 @@ export function onServerProviderStatusesUpdated(
   if (latestProviderStatuses) {
     try {
       listener(latestProviderStatuses);
-    } catch {
-      // Swallow listener errors
+    } catch (error) {
+      reportWsListenerError("serverProviderStatusesUpdated", error);
     }
   }
 
@@ -282,8 +283,8 @@ export function onServerMaintenanceUpdated(
   if (latestMaintenance) {
     try {
       listener(latestMaintenance);
-    } catch {
-      // Swallow listener errors
+    } catch (error) {
+      reportWsListenerError("serverMaintenanceUpdated", error);
     }
   }
 
@@ -302,8 +303,8 @@ export function onServerSettingsUpdated(
   if (latestSettings) {
     try {
       listener(latestSettings);
-    } catch {
-      // Swallow listener errors
+    } catch (error) {
+      reportWsListenerError("serverSettingsUpdated", error);
     }
   }
 
@@ -328,8 +329,8 @@ export function createWsNativeApi(): NativeApi {
     for (const listener of welcomeListeners) {
       try {
         listener(payload);
-      } catch {
-        // Swallow listener errors
+      } catch (error) {
+        reportWsListenerError("serverWelcome", error);
       }
     }
   });
@@ -338,8 +339,8 @@ export function createWsNativeApi(): NativeApi {
     for (const listener of serverConfigUpdatedListeners) {
       try {
         listener(payload);
-      } catch {
-        // Swallow listener errors
+      } catch (error) {
+        reportWsListenerError("serverConfigUpdated", error);
       }
     }
   });
@@ -348,8 +349,8 @@ export function createWsNativeApi(): NativeApi {
     for (const listener of serverProviderStatusesUpdatedListeners) {
       try {
         listener(payload);
-      } catch {
-        // Swallow listener errors
+      } catch (error) {
+        reportWsListenerError("serverProviderStatusesUpdated", error);
       }
     }
   });
@@ -358,8 +359,8 @@ export function createWsNativeApi(): NativeApi {
     for (const listener of serverMaintenanceUpdatedListeners) {
       try {
         listener(payload);
-      } catch {
-        // Swallow listener errors
+      } catch (error) {
+        reportWsListenerError("serverMaintenanceUpdated", error);
       }
     }
   });
@@ -368,8 +369,8 @@ export function createWsNativeApi(): NativeApi {
     for (const listener of serverSettingsUpdatedListeners) {
       try {
         listener(payload);
-      } catch {
-        // Swallow listener errors
+      } catch (error) {
+        reportWsListenerError("serverSettingsUpdated", error);
       }
     }
   });
@@ -378,8 +379,8 @@ export function createWsNativeApi(): NativeApi {
     for (const listener of gitActionProgressListeners) {
       try {
         listener(payload);
-      } catch {
-        // Swallow listener errors
+      } catch (error) {
+        reportWsListenerError("gitActionProgress", error);
       }
     }
   });
@@ -388,8 +389,8 @@ export function createWsNativeApi(): NativeApi {
     for (const listener of terminalEventListeners) {
       try {
         listener(payload);
-      } catch {
-        // Swallow listener errors
+      } catch (error) {
+        reportWsListenerError("terminalEvent", error);
       }
     }
   });
@@ -398,8 +399,8 @@ export function createWsNativeApi(): NativeApi {
     for (const listener of projectDevServerEventListeners) {
       try {
         listener(payload);
-      } catch {
-        // Swallow listener errors
+      } catch (error) {
+        reportWsListenerError("projectDevServerEvent", error);
       }
     }
   });
@@ -408,8 +409,8 @@ export function createWsNativeApi(): NativeApi {
     for (const listener of automationEventListeners) {
       try {
         listener(payload);
-      } catch {
-        // Swallow listener errors
+      } catch (error) {
+        reportWsListenerError("automationEvent", error);
       }
     }
   });
@@ -418,8 +419,8 @@ export function createWsNativeApi(): NativeApi {
     for (const listener of orchestrationDomainEventListeners) {
       try {
         listener(payload);
-      } catch {
-        // Swallow listener errors
+      } catch (error) {
+        reportWsListenerError("orchestration.domainEvent", error);
       }
     }
   });
@@ -428,8 +429,8 @@ export function createWsNativeApi(): NativeApi {
     for (const listener of orchestrationShellEventListeners) {
       try {
         listener(payload);
-      } catch {
-        // Swallow listener errors
+      } catch (error) {
+        reportWsListenerError("orchestration.shellEvent", error);
       }
     }
   });
@@ -438,8 +439,8 @@ export function createWsNativeApi(): NativeApi {
     for (const listener of orchestrationThreadEventListeners) {
       try {
         listener(payload);
-      } catch {
-        // Swallow listener errors
+      } catch (error) {
+        reportWsListenerError("orchestration.threadEvent", error);
       }
     }
   });

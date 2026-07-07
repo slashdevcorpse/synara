@@ -146,4 +146,51 @@ describe("WsTransport", () => {
 
     expect(listener).not.toHaveBeenCalled();
   });
+
+  it("reports throwing state listeners without blocking later listeners", () => {
+    const transport = new WsTransport();
+    const failure = new Error("state listener failed");
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const laterListener = vi.fn();
+    const unsubscribeThrowing = transport.onStateChange(() => {
+      throw failure;
+    });
+    const unsubscribeLater = transport.onStateChange(laterListener);
+
+    (transport as unknown as { setState: (state: "open") => void }).setState("open");
+
+    expect(laterListener).toHaveBeenCalledWith("open");
+    expect(consoleError).toHaveBeenCalledWith("[ws:transport-state] listener threw", failure);
+
+    unsubscribeThrowing();
+    unsubscribeLater();
+    transport.dispose();
+  });
+
+  it("reports throwing stream listeners without blocking later listeners", () => {
+    const transport = new WsTransport();
+    const failure = new Error("stream listener failed");
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const laterListener = vi.fn();
+    const unsubscribeThrowing = transport.subscribe(WS_CHANNELS.serverWelcome, () => {
+      throw failure;
+    });
+    const unsubscribeLater = transport.subscribe(WS_CHANNELS.serverWelcome, laterListener);
+    const payload = { cwd: "/tmp/workspace", homeDir: "/Users/tester", projectName: "synara" };
+
+    (
+      transport as unknown as {
+        emit: (channel: typeof WS_CHANNELS.serverWelcome, data: typeof payload) => void;
+      }
+    ).emit(WS_CHANNELS.serverWelcome, payload);
+
+    expect(laterListener).toHaveBeenCalledWith(
+      expect.objectContaining({ channel: WS_CHANNELS.serverWelcome, data: payload }),
+    );
+    expect(consoleError).toHaveBeenCalledWith("[ws:transport-stream] listener threw", failure);
+
+    unsubscribeThrowing();
+    unsubscribeLater();
+    transport.dispose();
+  });
 });

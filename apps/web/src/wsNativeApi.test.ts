@@ -130,6 +130,25 @@ afterEach(() => {
 });
 
 describe("wsNativeApi", () => {
+  it("reports a throwing push listener and continues to later listeners", async () => {
+    const { createWsNativeApi, onServerWelcome } = await import("./wsNativeApi");
+    const failure = new Error("welcome listener failed");
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const laterListener = vi.fn();
+
+    createWsNativeApi();
+    onServerWelcome(() => {
+      throw failure;
+    });
+    onServerWelcome(laterListener);
+
+    const payload = { cwd: "/tmp/workspace", homeDir: "/Users/tester", projectName: "synara" };
+    emitPush(WS_CHANNELS.serverWelcome, payload);
+
+    expect(laterListener).toHaveBeenCalledWith(expect.objectContaining(payload));
+    expect(consoleError).toHaveBeenCalledWith("[ws:serverWelcome] listener threw", failure);
+  });
+
   it("delivers and caches valid server.welcome payloads", async () => {
     const { createWsNativeApi, onServerWelcome } = await import("./wsNativeApi");
 

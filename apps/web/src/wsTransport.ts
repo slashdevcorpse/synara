@@ -29,6 +29,7 @@ import { Cause, Data, Effect, Exit, Layer, ManagedRuntime, Scope, Stream } from 
 import { RpcClient, RpcSerialization } from "effect/unstable/rpc";
 import * as Socket from "effect/unstable/socket/Socket";
 
+import { reportWsListenerError } from "./wsListenerErrors";
 import type { WsTransportState } from "./wsTransportEvents";
 
 type PushListener<C extends WsPushChannel> = (message: WsPushMessage<C>) => void;
@@ -320,8 +321,9 @@ export class WsTransport {
     for (const listener of this.stateListeners) {
       try {
         listener(state);
-      } catch {
+      } catch (error) {
         // Listener errors must not break reconnect or RPC state transitions.
+        reportWsListenerError("transport-state", error);
       }
     }
   }
@@ -363,8 +365,9 @@ export class WsTransport {
     for (const listener of listeners) {
       try {
         listener(message);
-      } catch {
+      } catch (error) {
         // Listener errors must not break transport streams.
+        reportWsListenerError("transport-stream", error);
       }
     }
   }
