@@ -45,7 +45,11 @@ import { RotatingFileSink } from "@t3tools/shared/logging";
 import { isBackendReadinessAborted, waitForHttpReady } from "./backendReadiness";
 import { resolveBackendNodeArgs } from "./backendNodeOptions";
 import { BackendRestartBackoff } from "./backendRestartBackoff";
-import { waitForBackendStartupReady } from "./backendStartupReadiness";
+import {
+  isBackendStartupReadyResponse,
+  monitorBackendStartupHealth,
+  waitForBackendStartupReady,
+} from "./backendStartupReadiness";
 import { showDesktopConfirmDialog } from "./confirmDialog";
 import {
   LSREGISTER_PATH,
@@ -454,19 +458,7 @@ async function waitForBackendWindowReady(baseUrl: string): Promise<"listening" |
       waitForBackendHttpReady(baseUrl, {
         path: "/health",
         timeoutMs: 60_000,
-        isReady: async (response) => {
-          if (!response.ok) {
-            return false;
-          }
-          try {
-            const payload = (await response.json()) as {
-              startupReady?: unknown;
-            };
-            return payload.startupReady === true;
-          } catch {
-            return false;
-          }
-        },
+        isReady: isBackendStartupReadyResponse,
       }),
     cancelHttpWait: cancelBackendReadinessWait,
   });
@@ -2021,6 +2013,7 @@ function startBackend(): void {
   const listeningDetector = new ServerListeningDetector();
   backendListeningDetector = listeningDetector;
   backendProcess = child;
+  const backendBaseUrl = backendHttpUrl;
   const backendStartedAtMs = Date.now();
   let backendSessionClosed = false;
   const closeBackendSession = (details: string) => {
@@ -2034,16 +2027,22 @@ function startBackend(): void {
   );
   captureBackendOutput(child);
 
-  void listeningDetector.promise.then(
-    () => {
-      if (backendProcess === child) {
-        backendRestartBackoff.reset();
-      }
+  const startupHealthMonitor = monitorBackendStartupHealth({
+    waitUntilReady: (signal) =>
+      waitForHttpReady(backendBaseUrl, {
+        path: "/health",
+        timeoutMs: 60_000,
+        signal,
+        isReady: isBackendStartupReadyResponse,
+      }),
+    isCurrent: () => backendProcess === child,
+    onReady: () => {
+      backendRestartBackoff.reset();
     },
-    () => undefined,
-  );
+  });
 
   child.on("error", (error) => {
+    startupHealthMonitor.abort();
     if (backendListeningDetector === listeningDetector) {
       listeningDetector.fail(error);
       backendListeningDetector = null;
@@ -2057,6 +2056,7 @@ function startBackend(): void {
   });
 
   child.on("exit", (code, signal) => {
+    startupHealthMonitor.abort();
     if (backendListeningDetector === listeningDetector) {
       listeningDetector.fail(
         new Error(
