@@ -1,3 +1,7 @@
+// FILE: codexAppServerManager.test.ts
+// Purpose: Covers Codex JSON-RPC translation, session lifecycle, and race safety.
+// Depends on: CodexAppServerManager test harnesses and mocked child/session contexts.
+
 import { describe, expect, it, vi } from "vitest";
 import { randomUUID } from "node:crypto";
 import {
@@ -782,15 +786,23 @@ describe("startSession", () => {
 // *different* stale context, mirroring exactly what startSession/forkThread's
 // catch block and race-winner re-check do.
 describe("session start/fork race identity guards", () => {
-  function createFakeSessionContext(threadId: string) {
+  function createFakeSessionContext(
+    threadId: string,
+    status: "ready" | "connecting" = "ready",
+    resumeThreadId: string | undefined = threadId,
+  ) {
+    let settleReadiness!: (result: unknown) => void;
+    const readinessPromise = new Promise<unknown>((resolve) => {
+      settleReadiness = resolve;
+    });
     return {
       session: {
         provider: "codex",
-        status: "ready",
+        status,
         threadId: asThreadId(threadId),
         runtimeMode: "full-access",
         model: "gpt-5.3-codex",
-        resumeCursor: { threadId },
+        resumeCursor: resumeThreadId ? { threadId: resumeThreadId } : undefined,
         createdAt: "2026-02-10T00:00:00.000Z",
         updatedAt: "2026-02-10T00:00:00.000Z",
       },
@@ -809,6 +821,10 @@ describe("session start/fork race identity guards", () => {
       reviewTurnIds: new Set<string>(),
       nextRequestId: 1,
       stopping: false,
+      readiness: {
+        promise: readinessPromise,
+        settle: settleReadiness,
+      },
     };
   }
 
@@ -818,6 +834,15 @@ describe("session start/fork race identity guards", () => {
       disposeIfCurrent: (
         threadId: ThreadId,
         context: ReturnType<typeof createFakeSessionContext>,
+      ) => void;
+      awaitSessionReady: (
+        threadId: ThreadId,
+        context: ReturnType<typeof createFakeSessionContext>,
+      ) => Promise<ReturnType<typeof createFakeSessionContext>["session"]>;
+      settleSessionReady: (context: ReturnType<typeof createFakeSessionContext>) => void;
+      settleSessionReadinessFailure: (
+        context: ReturnType<typeof createFakeSessionContext>,
+        error: Error,
       ) => void;
     };
   }
@@ -885,6 +910,50 @@ describe("session start/fork race identity guards", () => {
 
     updateSession.mockRestore();
     emitLifecycleEvent.mockRestore();
+  });
+
+  it("keeps a stale caller pending until the replacement owner is ready", async () => {
+    const manager = new CodexAppServerManager();
+    const threadId = asThreadId("thread-race-ready");
+    const winnerContext = createFakeSessionContext("thread-race-ready", "connecting", undefined);
+
+    const internals = accessManagerInternals(manager);
+    internals.sessions.set(threadId, winnerContext);
+
+    let resolved = false;
+    const waiting = internals.awaitSessionReady(threadId, winnerContext).then((session) => {
+      resolved = true;
+      return session;
+    });
+    await Promise.resolve();
+    expect(resolved).toBe(false);
+
+    winnerContext.session.status = "ready";
+    winnerContext.session.resumeCursor = { threadId: "provider-thread-ready" };
+    internals.settleSessionReady(winnerContext);
+
+    await expect(waiting).resolves.toMatchObject({
+      status: "ready",
+      resumeCursor: { threadId: "provider-thread-ready" },
+    });
+    expect(resolved).toBe(true);
+  });
+
+  it("propagates replacement startup failure instead of returning a half-open session", async () => {
+    const manager = new CodexAppServerManager();
+    const threadId = asThreadId("thread-race-failed");
+    const winnerContext = createFakeSessionContext("thread-race-failed", "connecting", undefined);
+
+    const internals = accessManagerInternals(manager);
+    internals.sessions.set(threadId, winnerContext);
+    const waiting = internals.awaitSessionReady(threadId, winnerContext);
+
+    internals.settleSessionReadinessFailure(
+      winnerContext,
+      new Error("replacement initialization failed"),
+    );
+
+    await expect(waiting).rejects.toThrow("replacement initialization failed");
   });
 });
 

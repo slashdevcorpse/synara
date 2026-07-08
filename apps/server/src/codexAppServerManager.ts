@@ -1,3 +1,7 @@
+// FILE: codexAppServerManager.ts
+// Purpose: Owns Codex app-server processes, JSON-RPC requests, sessions, and lifecycle events.
+// Depends on: provider contracts, Codex process spawning, and orchestration-facing session APIs.
+
 import { type ChildProcessWithoutNullStreams, spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
@@ -101,6 +105,32 @@ type CodexSessionApprovalOverride = {
   };
 };
 
+type CodexSessionReadinessResult =
+  | { readonly ok: true; readonly session: ProviderSession }
+  | { readonly ok: false; readonly error: Error };
+
+interface CodexSessionReadiness {
+  readonly promise: Promise<CodexSessionReadinessResult>;
+  readonly settle: (result: CodexSessionReadinessResult) => void;
+}
+
+// Creates a single-settlement readiness signal so race losers can await the slot owner.
+function createCodexSessionReadiness(): CodexSessionReadiness {
+  let settled = false;
+  let resolveResult!: (result: CodexSessionReadinessResult) => void;
+  const promise = new Promise<CodexSessionReadinessResult>((resolve) => {
+    resolveResult = resolve;
+  });
+  return {
+    promise,
+    settle: (result) => {
+      if (settled) return;
+      settled = true;
+      resolveResult(result);
+    },
+  };
+}
+
 interface CodexSessionContext {
   session: ProviderSession;
   account: CodexAccountSnapshot;
@@ -116,6 +146,7 @@ interface CodexSessionContext {
   nextRequestId: number;
   stopping: boolean;
   discovery?: boolean;
+  readiness?: CodexSessionReadiness;
 }
 
 interface CodexSkillListInput {
@@ -815,6 +846,7 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
         reviewTurnIds: new Set(),
         nextRequestId: 1,
         stopping: false,
+        readiness: createCodexSessionReadiness(),
       };
 
       this.sessions.set(threadId, context);
@@ -948,19 +980,25 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
         requestedRuntimeMode: input.runtimeMode,
       }).pipe(this.runPromise);
       const currentOwner = this.sessions.get(threadId);
-      if (currentOwner && currentOwner !== context) {
+      if (currentOwner !== context) {
         // A concurrent start won the slot while we were initializing. Tear down
         // only our own context and hand back the winner's session instead of
         // clobbering it.
         this.disposeContextResources(context);
-        return { ...currentOwner.session };
+        if (!currentOwner) {
+          throw new Error("Codex session lost ownership before it became ready.");
+        }
+        return await this.awaitSessionReady(threadId, currentOwner);
       }
 
+      this.settleSessionReady(context);
       this.emitLifecycleEvent(context, "session/ready", `Connected to thread ${providerThreadId}`);
       return { ...context.session };
     } catch (error) {
       const message = error instanceof Error ? error.message : "Failed to start Codex session.";
       if (context) {
+        const failure = new Error(message, { cause: error });
+        this.settleSessionReadinessFailure(context, failure);
         this.updateSession(context, {
           status: "error",
           lastError: message,
@@ -1442,6 +1480,7 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
         reviewTurnIds: new Set(),
         nextRequestId: 1,
         stopping: false,
+        readiness: createCodexSessionReadiness(),
       };
 
       this.sessions.set(threadId, context);
@@ -1490,20 +1529,28 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
       });
       this.emitLifecycleEvent(context, "session/threadOpenResolved", "Codex thread/fork resolved.");
       const currentOwner = this.sessions.get(threadId);
-      if (currentOwner && currentOwner !== context) {
+      if (currentOwner !== context) {
         // A concurrent start/fork won the slot while we were initializing. Tear
         // down only our own context and hand back the winner's fork result
         // instead of clobbering it.
         this.disposeContextResources(context);
-        const winnerResumeThreadId = readResumeCursorThreadId(currentOwner.session.resumeCursor);
+        if (!currentOwner) {
+          throw new Error("Codex fork session lost ownership before it became ready.");
+        }
+        const winnerSession = await this.awaitSessionReady(threadId, currentOwner);
+        const winnerResumeThreadId = readResumeCursorThreadId(winnerSession.resumeCursor);
+        if (!winnerResumeThreadId) {
+          throw new Error("Winning Codex session is ready without a provider resume thread id.");
+        }
         return {
           threadId,
           resumeCursor: {
-            threadId: winnerResumeThreadId ?? forkedProviderThreadId,
+            threadId: winnerResumeThreadId,
           },
         };
       }
 
+      this.settleSessionReady(context);
       this.emitLifecycleEvent(
         context,
         "session/ready",
@@ -1519,6 +1566,8 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
     } catch (error) {
       const message = error instanceof Error ? error.message : "Failed to fork Codex thread.";
       if (context) {
+        const failure = new Error(message, { cause: error });
+        this.settleSessionReadinessFailure(context, failure);
         this.updateSession(context, {
           status: "error",
           lastError: message,
@@ -1732,6 +1781,10 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
    * its threadId slot (e.g. it lost a concurrent start/fork race).
    */
   private disposeContextResources(context: CodexSessionContext): void {
+    this.settleSessionReadinessFailure(
+      context,
+      new Error("Session stopped before it became ready."),
+    );
     context.stopping = true;
 
     for (const pending of context.pending.values()) {
@@ -1761,6 +1814,37 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
     } else {
       this.disposeContextResources(context);
     }
+  }
+
+  // Resolves readiness only after the winning context has a usable provider thread.
+  private settleSessionReady(context: CodexSessionContext): void {
+    context.readiness?.settle({ ok: true, session: { ...context.session } });
+  }
+
+  // Settles every failure/teardown path without creating unhandled promise rejections.
+  private settleSessionReadinessFailure(context: CodexSessionContext, error: Error): void {
+    context.readiness?.settle({ ok: false, error });
+  }
+
+  // Waits for the replacement owner and re-checks ownership before exposing it.
+  private async awaitSessionReady(
+    threadId: ThreadId,
+    context: CodexSessionContext,
+  ): Promise<ProviderSession> {
+    if (!context.readiness) {
+      throw new Error("Winning Codex session has no readiness signal.");
+    }
+    const result = await context.readiness.promise;
+    if (!result.ok) {
+      throw result.error;
+    }
+    if (this.sessions.get(threadId) !== context) {
+      throw new Error("Winning Codex session lost ownership before it became ready.");
+    }
+    if (result.session.status !== "ready" || !readResumeCursorThreadId(result.session.resumeCursor)) {
+      throw new Error("Winning Codex session resolved before its provider thread was ready.");
+    }
+    return { ...result.session };
   }
 
   listSessions(): ProviderSession[] {
