@@ -76,6 +76,7 @@ import {
   Queue,
   Random,
   Ref,
+  Semaphore,
   Stream,
 } from "effect";
 
@@ -117,6 +118,8 @@ interface ClaudeResumeState {
   readonly resume?: string;
   readonly resumeSessionAt?: string;
   readonly turnCount?: number;
+  readonly rerouteOriginalApiModelId?: string;
+  readonly rerouteFallbackApiModelId?: string;
 }
 
 interface ClaudeTurnState {
@@ -437,6 +440,10 @@ interface ClaudeModelRefusalFallback {
   readonly content?: string;
 }
 
+function readNonEmptyString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 ? value : undefined;
+}
+
 function readClaudeModelRefusalFallback(message: unknown): ClaudeModelRefusalFallback | undefined {
   if (!message || typeof message !== "object") {
     return undefined;
@@ -444,6 +451,8 @@ function readClaudeModelRefusalFallback(message: unknown): ClaudeModelRefusalFal
   const record = message as {
     type?: unknown;
     subtype?: unknown;
+    original_model?: unknown;
+    fallback_model?: unknown;
     originalModel?: unknown;
     fallbackModel?: unknown;
     content?: unknown;
@@ -451,14 +460,12 @@ function readClaudeModelRefusalFallback(message: unknown): ClaudeModelRefusalFal
   if (record.type !== "system" || record.subtype !== "model_refusal_fallback") {
     return undefined;
   }
+  // Claude Agent SDK 0.3.x emits snake_case fields. Accept camelCase too so a
+  // future typed SDK projection cannot silently disable reroute protection.
   const originalModel =
-    typeof record.originalModel === "string" && record.originalModel.trim().length > 0
-      ? record.originalModel
-      : undefined;
+    readNonEmptyString(record.original_model) ?? readNonEmptyString(record.originalModel);
   const fallbackModel =
-    typeof record.fallbackModel === "string" && record.fallbackModel.trim().length > 0
-      ? record.fallbackModel
-      : undefined;
+    readNonEmptyString(record.fallback_model) ?? readNonEmptyString(record.fallbackModel);
   if (!originalModel || !fallbackModel) {
     return undefined;
   }
@@ -562,6 +569,29 @@ const CLAUDE_CONTEXT_WINDOW_MAX_TOKENS = {
   "1m": 1_000_000,
 } as const;
 
+function resolveClaudeApiModelIdForContextWindow(
+  apiModelId: string,
+  selectedContextWindow: string | null | undefined,
+): string {
+  const baseApiModelId = stripClaudeContextWindowSuffix(apiModelId);
+  const caps = getModelCapabilities("claudeAgent", baseApiModelId);
+  return selectedContextWindow === "1m" && hasContextWindowOption(caps, "1m")
+    ? `${baseApiModelId}[1m]`
+    : baseApiModelId;
+}
+
+function resolveClaudeApiModelIdContextWindowMaxTokens(
+  apiModelId: string | undefined,
+): number | undefined {
+  if (!apiModelId) {
+    return undefined;
+  }
+  return resolveSelectedClaudeContextWindowMaxTokens(
+    stripClaudeContextWindowSuffix(apiModelId),
+    apiModelId.endsWith("[1m]") ? "1m" : undefined,
+  );
+}
+
 function resolveSelectedClaudeContextWindowMaxTokens(
   model: string | null | undefined,
   selectedContextWindow: string | null | undefined,
@@ -631,6 +661,8 @@ function readClaudeResumeState(resumeCursor: unknown): ClaudeResumeState | undef
     sessionId?: unknown;
     resumeSessionAt?: unknown;
     turnCount?: unknown;
+    rerouteOriginalApiModelId?: unknown;
+    rerouteFallbackApiModelId?: unknown;
   };
 
   const threadIdCandidate = typeof cursor.threadId === "string" ? cursor.threadId : undefined;
@@ -648,6 +680,10 @@ function readClaudeResumeState(resumeCursor: unknown): ClaudeResumeState | undef
   const resumeSessionAt =
     typeof cursor.resumeSessionAt === "string" ? cursor.resumeSessionAt : undefined;
   const turnCountValue = typeof cursor.turnCount === "number" ? cursor.turnCount : undefined;
+  const rerouteOriginalApiModelId = readNonEmptyString(cursor.rerouteOriginalApiModelId);
+  const rerouteFallbackApiModelId = readNonEmptyString(cursor.rerouteFallbackApiModelId);
+  const hasCompleteReroute =
+    rerouteOriginalApiModelId !== undefined && rerouteFallbackApiModelId !== undefined;
 
   return {
     ...(threadId ? { threadId } : {}),
@@ -655,6 +691,9 @@ function readClaudeResumeState(resumeCursor: unknown): ClaudeResumeState | undef
     ...(resumeSessionAt ? { resumeSessionAt } : {}),
     ...(turnCountValue !== undefined && Number.isInteger(turnCountValue) && turnCountValue >= 0
       ? { turnCount: turnCountValue }
+      : {}),
+    ...(hasCompleteReroute
+      ? { rerouteOriginalApiModelId, rerouteFallbackApiModelId }
       : {}),
   };
 }
@@ -1369,6 +1408,7 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
       }) => query({ prompt: input.prompt, options: input.options }) as ClaudeQueryRuntime);
 
     const sessions = new Map<ThreadId, ClaudeSessionContext>();
+    const sessionLifecycleLocks = new Map<ThreadId, Semaphore.Semaphore>();
     let cachedModels: ProviderListModelsResult | null = null;
     let cachedAgents: ProviderListAgentsResult | null = null;
     const runtimeEventQueue = yield* Queue.unbounded<ProviderRuntimeEvent>();
@@ -1376,6 +1416,17 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
     const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
     const nextEventId = Effect.map(Random.nextUUIDv4, (id) => EventId.makeUnsafe(id));
     const makeEventStamp = () => Effect.all({ eventId: nextEventId, createdAt: nowIso });
+    const withSessionLifecycleLock = <A, E, R>(
+      threadId: ThreadId,
+      effect: Effect.Effect<A, E, R>,
+    ): Effect.Effect<A, E, R> => {
+      let lock = sessionLifecycleLocks.get(threadId);
+      if (lock === undefined) {
+        lock = Semaphore.makeUnsafe(1);
+        sessionLifecycleLocks.set(threadId, lock);
+      }
+      return lock.withPermits(1)(effect);
+    };
     const resolveClaudeSdkEnv = Effect.sync(() =>
       buildClaudeProcessEnv({ env: process.env, homeDir: serverConfig.homeDir }),
     );
@@ -1459,6 +1510,12 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
           ...(context.resumeSessionId ? { resume: context.resumeSessionId } : {}),
           ...(context.lastAssistantUuid ? { resumeSessionAt: context.lastAssistantUuid } : {}),
           turnCount: context.turns.length,
+          ...(context.rerouteOriginalApiModelId && context.currentApiModelId
+            ? {
+                rerouteOriginalApiModelId: context.rerouteOriginalApiModelId,
+                rerouteFallbackApiModelId: context.currentApiModelId,
+              }
+            : {}),
         };
 
         context.session = {
@@ -1754,10 +1811,9 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
         });
       });
 
-    // Warns once per session per threshold when the per-request prompt size makes
-    // token burn dangerous: every request re-sends the whole context, and after a
-    // 5-minute prompt-cache expiry it is re-ingested as uncached tokens. Above 200k
-    // (1M window) requests additionally bill at the long-context premium.
+    // Warn once per session per threshold when the per-request prompt size makes
+    // usage burn dangerous. Every request processes the full context again; cache
+    // behavior changes how those tokens are categorized, not how large the request is.
     const maybeEmitContextUsageWarning = (
       context: ClaudeSessionContext,
       rawUsage: Record<string, unknown>,
@@ -1768,18 +1824,20 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
           return;
         }
         const approxThousands = Math.round(promptTokens / 1000);
-        const isLongContextSession = context.currentApiModelId?.endsWith("[1m]") === true;
-        if (isLongContextSession) {
-          if (
-            promptTokens > CLAUDE_DEFAULT_CONTEXT_WINDOW_TOKENS &&
-            !context.emittedContextUsageWarnings.has("long-context-premium")
-          ) {
-            context.emittedContextUsageWarnings.add("long-context-premium");
-            yield* emitRuntimeWarning(
-              context,
-              `Claude context passed 200k tokens in the 1M window (~${approxThousands}k tokens per request). Long-context requests bill at a premium and consume usage limits much faster - consider compacting or starting a fresh thread.`,
-            );
-          }
+        if (
+          promptTokens > CLAUDE_DEFAULT_CONTEXT_WINDOW_TOKENS &&
+          !context.emittedContextUsageWarnings.has("large-prompt")
+        ) {
+          context.emittedContextUsageWarnings.add("large-prompt");
+          const windowLabel =
+            context.lastKnownContextWindow === CLAUDE_CONTEXT_WINDOW_MAX_TOKENS["1m"] ||
+            context.currentApiModelId?.endsWith("[1m]") === true
+              ? " with the 1M window enabled"
+              : "";
+          yield* emitRuntimeWarning(
+            context,
+            `Claude is processing ~${approxThousands}k prompt tokens per request${windowLabel}. Large prompts consume usage limits much faster - consider starting a fresh thread.`,
+          );
           return;
         }
         const contextWindow =
@@ -2634,9 +2692,9 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
         // costs two full-context cache misses per bounce.
         const refusalFallback = readClaudeModelRefusalFallback(message);
         if (refusalFallback) {
-          context.rerouteOriginalApiModelId =
-            context.currentApiModelId ?? refusalFallback.originalModel;
+          context.rerouteOriginalApiModelId ??= refusalFallback.originalModel;
           context.currentApiModelId = refusalFallback.fallbackModel;
+          yield* updateResumeCursor(context);
           yield* offerRuntimeEvent({
             ...base,
             type: "model.rerouted",
@@ -3064,7 +3122,9 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
           });
         }
 
-        sessions.delete(context.session.threadId);
+        if (sessions.get(context.session.threadId) === context) {
+          sessions.delete(context.session.threadId);
+        }
       });
 
     const requireSession = (
@@ -3416,7 +3476,27 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
         const requestedEffort = trimOrNull(modelSelection?.options?.effort ?? null);
         const requestedContextWindow = trimOrNull(modelSelection?.options?.contextWindow ?? null);
         const caps = getModelCapabilities("claudeAgent", modelSelection?.model);
-        const apiModelId = modelSelection ? resolveApiModelId(modelSelection) : undefined;
+        const requestedApiModelId = modelSelection ? resolveApiModelId(modelSelection) : undefined;
+        const resumeRerouteOriginalApiModelId = resumeState?.rerouteOriginalApiModelId;
+        const resumeRerouteFallbackApiModelId = resumeState?.rerouteFallbackApiModelId;
+        const resumedRerouteMatchesSelection =
+          resumeRerouteOriginalApiModelId !== undefined &&
+          resumeRerouteFallbackApiModelId !== undefined &&
+          (requestedApiModelId === undefined ||
+            stripClaudeContextWindowSuffix(requestedApiModelId) ===
+              stripClaudeContextWindowSuffix(resumeRerouteOriginalApiModelId));
+        const resumedRerouteOriginalApiModelId = resumedRerouteMatchesSelection
+          ? resumeRerouteOriginalApiModelId
+          : undefined;
+        const resumedRerouteFallbackApiModelId = resumedRerouteMatchesSelection
+          ? requestedApiModelId === undefined
+            ? resumeRerouteFallbackApiModelId
+            : resolveClaudeApiModelIdForContextWindow(
+                resumeRerouteFallbackApiModelId,
+                requestedContextWindow,
+              )
+          : undefined;
+        const apiModelId = resumedRerouteFallbackApiModelId ?? requestedApiModelId;
         const effort =
           requestedEffort && hasEffortLevel(caps, requestedEffort) ? requestedEffort : null;
         const fastMode = modelSelection?.options?.fastMode === true && caps.supportsFastMode;
@@ -3430,9 +3510,8 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
           toPermissionMode(providerOptions?.permissionMode) ??
           (input.runtimeMode === "full-access" ? "bypassPermissions" : undefined);
         const settings = {
-          // Auto-compaction bounds context growth. Without it a long session replays
-          // its entire history as uncached tokens after every prompt-cache expiry,
-          // which is the dominant driver of runaway usage on long threads.
+          // Keep SDK auto-compaction explicit. Its threshold follows the effective
+          // context window, so 1M remains an intentional per-thread choice.
           autoCompactEnabled: true,
           ...(typeof thinking === "boolean" ? { alwaysThinkingEnabled: thinking } : {}),
           ...(fastMode ? { fastMode: true } : {}),
@@ -3541,6 +3620,12 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
               ? { resumeSessionAt: resumeState.resumeSessionAt }
               : {}),
             turnCount: resumeState?.turnCount ?? 0,
+            ...(resumedRerouteOriginalApiModelId && resumedRerouteFallbackApiModelId
+              ? {
+                  rerouteOriginalApiModelId: resumedRerouteOriginalApiModelId,
+                  rerouteFallbackApiModelId: resumedRerouteFallbackApiModelId,
+                }
+              : {}),
           },
           createdAt: startedAt,
           updatedAt: startedAt,
@@ -3562,78 +3647,100 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
           inFlightTools,
           turnState: undefined,
           interruptRequestedTurnId: undefined,
-          lastKnownContextWindow: undefined,
+          lastKnownContextWindow: resolveClaudeApiModelIdContextWindowMaxTokens(apiModelId),
           lastKnownTokenUsage: undefined,
           lastAssistantUuid: resumeState?.resumeSessionAt,
           lastThreadStartedId: undefined,
-          rerouteOriginalApiModelId: undefined,
+          rerouteOriginalApiModelId: resumedRerouteOriginalApiModelId,
           emittedContextUsageWarnings: new Set(),
           stopped: false,
           warnedUnhandledSdkKinds: new Set(),
         };
-        yield* Ref.set(contextRef, context);
-        sessions.set(threadId, context);
-
-        const sessionStartedStamp = yield* makeEventStamp();
-        yield* offerRuntimeEvent({
-          type: "session.started",
-          eventId: sessionStartedStamp.eventId,
-          provider: PROVIDER,
-          createdAt: sessionStartedStamp.createdAt,
+        yield* withSessionLifecycleLock(
           threadId,
-          payload: input.resumeCursor !== undefined ? { resume: input.resumeCursor } : {},
-          providerRefs: {},
-        });
+          Effect.gen(function* () {
+            // Create the replacement first so a spawn failure leaves the current
+            // session usable, then atomically retire the old runtime before install.
+            const existing = sessions.get(threadId);
+            if (existing && existing !== context) {
+              yield* stopSessionInternal(existing, { emitExitEvent: false });
+            }
 
-        const configuredStamp = yield* makeEventStamp();
-        yield* offerRuntimeEvent({
-          type: "session.configured",
-          eventId: configuredStamp.eventId,
-          provider: PROVIDER,
-          createdAt: configuredStamp.createdAt,
-          threadId,
-          payload: {
-            config: {
-              ...(modelSelection?.model ? { model: modelSelection.model } : {}),
-              ...(apiModelId ? { apiModelId } : {}),
-              ...(requestedContextWindow ? { contextWindow: requestedContextWindow } : {}),
-              ...(input.cwd ? { cwd: input.cwd } : {}),
-              ...(effectiveEffort ? { effort: effectiveEffort } : {}),
-              ...(permissionMode ? { permissionMode } : {}),
-              ...(providerOptions?.maxThinkingTokens !== undefined
-                ? { maxThinkingTokens: providerOptions.maxThinkingTokens }
-                : {}),
-              ...(fastMode ? { fastMode: true } : {}),
-              ...(ultracode ? { ultracode: true } : {}),
-            },
-          },
-          providerRefs: {},
-        });
+            yield* Ref.set(contextRef, context);
+            sessions.set(threadId, context);
 
-        const readyStamp = yield* makeEventStamp();
-        yield* offerRuntimeEvent({
-          type: "session.state.changed",
-          eventId: readyStamp.eventId,
-          provider: PROVIDER,
-          createdAt: readyStamp.createdAt,
-          threadId,
-          payload: {
-            state: "ready",
-          },
-          providerRefs: {},
-        });
+            const sessionStartedStamp = yield* makeEventStamp();
+            yield* offerRuntimeEvent({
+              type: "session.started",
+              eventId: sessionStartedStamp.eventId,
+              provider: PROVIDER,
+              createdAt: sessionStartedStamp.createdAt,
+              threadId,
+              payload: input.resumeCursor !== undefined ? { resume: input.resumeCursor } : {},
+              providerRefs: {},
+            });
 
-        const streamFiber = Effect.runFork(runSdkStream(context));
-        context.streamFiber = streamFiber;
-        streamFiber.addObserver((exit) => {
-          if (context.stopped) {
-            return;
-          }
-          if (context.streamFiber === streamFiber) {
-            context.streamFiber = undefined;
-          }
-          Effect.runFork(handleStreamExit(context, exit));
-        });
+            const configuredStamp = yield* makeEventStamp();
+            yield* offerRuntimeEvent({
+              type: "session.configured",
+              eventId: configuredStamp.eventId,
+              provider: PROVIDER,
+              createdAt: configuredStamp.createdAt,
+              threadId,
+              payload: {
+                config: {
+                  ...(modelSelection?.model ? { model: modelSelection.model } : {}),
+                  ...(apiModelId ? { apiModelId } : {}),
+                  ...(requestedContextWindow ? { contextWindow: requestedContextWindow } : {}),
+                  ...(input.cwd ? { cwd: input.cwd } : {}),
+                  ...(effectiveEffort ? { effort: effectiveEffort } : {}),
+                  ...(permissionMode ? { permissionMode } : {}),
+                  ...(providerOptions?.maxThinkingTokens !== undefined
+                    ? { maxThinkingTokens: providerOptions.maxThinkingTokens }
+                    : {}),
+                  ...(fastMode ? { fastMode: true } : {}),
+                  ...(ultracode ? { ultracode: true } : {}),
+                },
+              },
+              providerRefs: {},
+            });
+
+            const readyStamp = yield* makeEventStamp();
+            yield* offerRuntimeEvent({
+              type: "session.state.changed",
+              eventId: readyStamp.eventId,
+              provider: PROVIDER,
+              createdAt: readyStamp.createdAt,
+              threadId,
+              payload: {
+                state: "ready",
+              },
+              providerRefs: {},
+            });
+
+            if (
+              context.lastKnownContextWindow === CLAUDE_CONTEXT_WINDOW_MAX_TOKENS["1m"]
+            ) {
+              context.emittedContextUsageWarnings.add("one-million-window");
+              yield* emitRuntimeWarning(
+                context,
+                "Claude's 1M context window is enabled for this thread. Auto-compaction follows that larger window, so long conversations can consume usage limits much faster. Switch this thread to 200k if 1M was inherited unintentionally.",
+              );
+            }
+
+            const streamFiber = Effect.runFork(runSdkStream(context));
+            context.streamFiber = streamFiber;
+            streamFiber.addObserver((exit) => {
+              if (context.stopped) {
+                return;
+              }
+              if (context.streamFiber === streamFiber) {
+                context.streamFiber = undefined;
+              }
+              Effect.runFork(handleStreamExit(context, exit));
+            });
+          }),
+        );
 
         return {
           ...session,
@@ -3667,7 +3774,25 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
             // A safeguard reroute pinned this session to the fallback model. The
             // thread selection still names the refused model; switching back would
             // re-ingest the entire context uncached (and likely bounce again), so
-            // stay on the fallback until the user picks a different model.
+            // stay on the fallback until the user picks a different model. Context
+            // window changes still apply to the effective fallback model.
+            const fallbackApiModelId = context.currentApiModelId;
+            if (fallbackApiModelId !== undefined) {
+              const effectiveFallbackApiModelId = resolveClaudeApiModelIdForContextWindow(
+                fallbackApiModelId,
+                modelSelection.options?.contextWindow,
+              );
+              if (effectiveFallbackApiModelId !== fallbackApiModelId) {
+                yield* Effect.tryPromise({
+                  try: () => context.query.setModel(effectiveFallbackApiModelId),
+                  catch: (cause) => toRequestError(input.threadId, "turn/setModel", cause),
+                });
+              }
+              context.currentApiModelId = effectiveFallbackApiModelId;
+              context.lastKnownContextWindow =
+                resolveClaudeApiModelIdContextWindowMaxTokens(effectiveFallbackApiModelId);
+              yield* updateResumeCursor(context);
+            }
           } else {
             if (apiModelId !== context.currentApiModelId) {
               yield* Effect.tryPromise({
@@ -3680,6 +3805,7 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
             if (requestedContextWindowMaxTokens !== undefined) {
               context.lastKnownContextWindow = requestedContextWindowMaxTokens;
             }
+            yield* updateResumeCursor(context);
           }
         }
 
@@ -3731,7 +3857,11 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
           createdAt: turnStartedStamp.createdAt,
           threadId: context.session.threadId,
           turnId,
-          payload: modelSelection?.model ? { model: modelSelection.model } : {},
+          payload: context.currentApiModelId
+            ? { model: stripClaudeContextWindowSuffix(context.currentApiModelId) }
+            : modelSelection?.model
+              ? { model: modelSelection.model }
+              : {},
           providerRefs: {},
         });
 
@@ -3822,12 +3952,15 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
       });
 
     const stopSession: ClaudeAdapterShape["stopSession"] = (threadId) =>
-      Effect.gen(function* () {
-        const context = yield* requireSession(threadId);
-        yield* stopSessionInternal(context, {
-          emitExitEvent: true,
-        });
-      });
+      withSessionLifecycleLock(
+        threadId,
+        Effect.gen(function* () {
+          const context = yield* requireSession(threadId);
+          yield* stopSessionInternal(context, {
+            emitExitEvent: true,
+          });
+        }),
+      );
 
     const listSessions: ClaudeAdapterShape["listSessions"] = () =>
       Effect.sync(() => Array.from(sessions.values(), ({ session }) => ({ ...session })));

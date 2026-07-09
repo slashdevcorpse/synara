@@ -303,8 +303,8 @@ describe("TraitsPicker (Claude)", () => {
     await page.getByRole("button").click();
     await page.getByRole("menuitemradio", { name: "1M" }).click();
 
-    // The 1M window carries a long-context billing premium: the thread keeps the
-    // choice, but it must never leak into the sticky defaults for future threads.
+    // A 1M thread can grow far beyond the normal compaction point: keep the explicit
+    // thread choice, but never leak it into sticky defaults for future threads.
     const sticky = useComposerDraftStore.getState().stickyModelSelectionByProvider.claudeAgent;
     expect(sticky?.provider === "claudeAgent" ? sticky.options?.contextWindow : undefined).toBe(
       undefined,

@@ -1536,9 +1536,9 @@ function normalizeModelSelection(
 
 // ── Sticky selection sanitization ─────────────────────────────────────
 
-// The Claude context window must stay a per-thread choice: the 1M window carries a
-// long-context billing premium and disables effective compaction, so a one-off pick
-// must never silently become the default for every future thread via sticky state.
+// The Claude context window must stay a per-thread choice: a 1M thread can grow far
+// beyond the normal 200k compaction point and consume usage limits much faster, so a
+// one-off pick must never silently become every future thread's sticky default.
 function stripNonStickyModelOptions(selection: ModelSelection): ModelSelection {
   if (selection.provider !== "claudeAgent" || !selection.options?.contextWindow) {
     return selection;

@@ -17,7 +17,7 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import { assert, describe, it } from "@effect/vitest";
-import { Effect, Fiber, Layer, Random, Stream } from "effect";
+import { Effect, Exit, Fiber, Layer, Random, Stream } from "effect";
 
 import { attachmentRelativePath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
@@ -187,6 +187,30 @@ function makeHarness(config?: {
     query,
     getLastCreateQueryInput: () => createInput,
   };
+}
+
+function makeMultiQueryHarness(config?: { readonly failCreateAt?: number }) {
+  const queries: Array<FakeClaudeQuery> = [];
+  const createInputs: Array<{
+    readonly prompt: AsyncIterable<SDKUserMessage>;
+    readonly options: ClaudeQueryOptions;
+  }> = [];
+  const layer = makeClaudeAdapterLive({
+    createQuery: (input) => {
+      if (queries.length === config?.failCreateAt) {
+        throw new Error("simulated Claude spawn failure");
+      }
+      const query = new FakeClaudeQuery();
+      queries.push(query);
+      createInputs.push(input);
+      return query;
+    },
+  }).pipe(
+    Layer.provideMerge(ServerConfig.layerTest("/tmp/claude-adapter-test", "/tmp")),
+    Layer.provideMerge(NodeServices.layer),
+  );
+
+  return { layer, queries, createInputs };
 }
 
 function makeDeterministicRandomService(seed = 0x1234_5678): {
@@ -3597,6 +3621,38 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
+  it.effect("warns immediately when a thread starts with the 1M context window", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const warningFiber = yield* Stream.filter(
+        adapter.streamEvents,
+        (event) =>
+          event.type === "runtime.warning" && event.payload.message.includes("1M context window"),
+      ).pipe(Stream.runHead, Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: "claudeAgent",
+        runtimeMode: "full-access",
+        modelSelection: {
+          provider: "claudeAgent",
+          model: "claude-opus-4-8",
+          options: { contextWindow: "1m" },
+        },
+      });
+
+      const warning = yield* Fiber.join(warningFiber);
+      assert.equal(warning._tag, "Some");
+      if (warning._tag === "Some" && warning.value.type === "runtime.warning") {
+        assert.ok(warning.value.payload.message.includes("Switch this thread to 200k"));
+      }
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
   it.effect("pins the fallback model after a safeguard reroute", () => {
     const harness = makeHarness();
     return Effect.gen(function* () {
@@ -3605,7 +3661,7 @@ describe("ClaudeAdapterLive", () => {
       const reroutedFiber = yield* Stream.filter(
         adapter.streamEvents,
         (event) => event.type === "model.rerouted",
-      ).pipe(Stream.runHead, Effect.forkChild);
+      ).pipe(Stream.take(2), Stream.runCollect, Effect.forkChild);
 
       const session = yield* adapter.startSession({
         threadId: THREAD_ID,
@@ -3621,21 +3677,37 @@ describe("ClaudeAdapterLive", () => {
         type: "system",
         subtype: "model_refusal_fallback",
         content: "Fable 5's safeguards flagged this message. Switched to Opus 4.8.",
-        originalModel: "claude-fable-5",
-        fallbackModel: "claude-opus-4-8",
+        original_model: "claude-fable-5",
+        fallback_model: "claude-opus-4-8",
+        request_id: "fallback-request-1",
         session_id: "sdk-session-fallback",
         uuid: "fallback-1",
       } as unknown as SDKMessage);
+      harness.query.emit({
+        type: "system",
+        subtype: "model_refusal_fallback",
+        content: "The safeguard repeated its Opus 4.8 fallback.",
+        original_model: "claude-fable-5",
+        fallback_model: "claude-opus-4-8",
+        request_id: "fallback-request-2",
+        session_id: "sdk-session-fallback",
+        uuid: "fallback-2",
+      } as unknown as SDKMessage);
 
-      const rerouted = yield* Fiber.join(reroutedFiber);
-      assert.equal(rerouted._tag, "Some");
-      if (rerouted._tag === "Some" && rerouted.value.type === "model.rerouted") {
-        assert.equal(rerouted.value.payload.fromModel, "claude-fable-5");
-        assert.equal(rerouted.value.payload.toModel, "claude-opus-4-8");
+      const rerouted = Array.from(yield* Fiber.join(reroutedFiber));
+      assert.equal(rerouted.length, 2);
+      const firstReroute = rerouted[0];
+      if (firstReroute?.type === "model.rerouted") {
+        assert.equal(firstReroute.payload.fromModel, "claude-fable-5");
+        assert.equal(firstReroute.payload.toModel, "claude-opus-4-8");
       }
 
       // A turn still requesting the refused model must not flip back: each bounce
       // re-ingests the entire context as uncached tokens.
+      const turnStartedFiber = yield* Stream.filter(
+        adapter.streamEvents,
+        (event) => event.type === "turn.started",
+      ).pipe(Stream.runHead, Effect.forkChild);
       yield* adapter.sendTurn({
         threadId: session.threadId,
         input: "continue",
@@ -3646,6 +3718,25 @@ describe("ClaudeAdapterLive", () => {
         attachments: [],
       });
       assert.deepEqual(harness.query.setModelCalls, []);
+      const turnStarted = yield* Fiber.join(turnStartedFiber);
+      assert.equal(turnStarted._tag, "Some");
+      if (turnStarted._tag === "Some" && turnStarted.value.type === "turn.started") {
+        assert.equal(turnStarted.value.payload.model, "claude-opus-4-8");
+      }
+
+      // Context changes apply to the effective fallback without switching back
+      // to the refused model.
+      yield* adapter.sendTurn({
+        threadId: session.threadId,
+        input: "continue with the larger window",
+        modelSelection: {
+          provider: "claudeAgent",
+          model: "claude-fable-5",
+          options: { contextWindow: "1m" },
+        },
+        attachments: [],
+      });
+      assert.deepEqual(harness.query.setModelCalls, ["claude-opus-4-8[1m]"]);
 
       // Picking a genuinely different model clears the pin and applies it.
       yield* adapter.sendTurn({
@@ -3657,7 +3748,10 @@ describe("ClaudeAdapterLive", () => {
         },
         attachments: [],
       });
-      assert.deepEqual(harness.query.setModelCalls, ["claude-opus-4-6"]);
+      assert.deepEqual(harness.query.setModelCalls, [
+        "claude-opus-4-8[1m]",
+        "claude-opus-4-6",
+      ]);
 
       // And the original model can be re-applied after the explicit switch.
       yield* adapter.sendTurn({
@@ -3669,7 +3763,120 @@ describe("ClaudeAdapterLive", () => {
         },
         attachments: [],
       });
-      assert.deepEqual(harness.query.setModelCalls, ["claude-opus-4-6", "claude-fable-5"]);
+      assert.deepEqual(harness.query.setModelCalls, [
+        "claude-opus-4-8[1m]",
+        "claude-opus-4-6",
+        "claude-fable-5",
+      ]);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("preserves fallback routing while replacing and resuming a session", () => {
+    const harness = makeMultiQueryHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const reroutedFiber = yield* Stream.filter(
+        adapter.streamEvents,
+        (event) => event.type === "model.rerouted",
+      ).pipe(Stream.runHead, Effect.forkChild);
+
+      const firstSession = yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: "claudeAgent",
+        runtimeMode: "full-access",
+        modelSelection: {
+          provider: "claudeAgent",
+          model: "claude-fable-5",
+          options: { contextWindow: "1m" },
+        },
+      });
+      const firstQuery = harness.queries[0];
+      assert.ok(firstQuery);
+
+      firstQuery.emit({
+        type: "system",
+        subtype: "model_refusal_fallback",
+        original_model: "claude-fable-5",
+        fallback_model: "claude-opus-4-8",
+        request_id: "fallback-request-resume",
+        session_id: "sdk-session-fallback-resume",
+        uuid: "fallback-resume-1",
+      } as unknown as SDKMessage);
+      yield* Fiber.join(reroutedFiber);
+
+      const activeAfterFallback = (yield* adapter.listSessions()).find(
+        (session) => session.threadId === firstSession.threadId,
+      );
+      assert.ok(activeAfterFallback?.resumeCursor);
+
+      const resumedSession = yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: "claudeAgent",
+        runtimeMode: "full-access",
+        modelSelection: {
+          provider: "claudeAgent",
+          model: "claude-fable-5",
+          options: { contextWindow: "1m" },
+        },
+        resumeCursor: activeAfterFallback?.resumeCursor,
+      });
+      const secondQuery = harness.queries[1];
+      assert.ok(secondQuery);
+      assert.equal(firstQuery.closeCalls, 1);
+      assert.equal(harness.createInputs[1]?.options.model, "claude-opus-4-8[1m]");
+      assert.equal(yield* adapter.hasSession(THREAD_ID), true);
+      assert.equal((yield* adapter.listSessions()).length, 1);
+
+      yield* adapter.sendTurn({
+        threadId: resumedSession.threadId,
+        input: "continue after resume",
+        modelSelection: {
+          provider: "claudeAgent",
+          model: "claude-fable-5",
+          options: { contextWindow: "1m" },
+        },
+        attachments: [],
+      });
+      assert.deepEqual(secondQuery.setModelCalls, []);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("keeps the current Claude session when replacement spawn fails", () => {
+    const harness = makeMultiQueryHarness({ failCreateAt: 1 });
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: "claudeAgent",
+        runtimeMode: "full-access",
+        modelSelection: { provider: "claudeAgent", model: "claude-opus-4-8" },
+      });
+      const firstQuery = harness.queries[0];
+      assert.ok(firstQuery);
+
+      const replacement = yield* Effect.exit(
+        adapter.startSession({
+          threadId: THREAD_ID,
+          provider: "claudeAgent",
+          runtimeMode: "full-access",
+          modelSelection: {
+            provider: "claudeAgent",
+            model: "claude-opus-4-8",
+            options: { effort: "max" },
+          },
+        }),
+      );
+
+      assert.ok(Exit.isFailure(replacement));
+      assert.equal(firstQuery.closeCalls, 0);
+      assert.equal(yield* adapter.hasSession(THREAD_ID), true);
+      assert.equal((yield* adapter.listSessions()).length, 1);
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(harness.layer),
@@ -3743,14 +3950,15 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
-  it.effect("warns about the long-context premium past 200k on a 1M session", () => {
+  it.effect("warns about large prompts past 200k on a 1M session", () => {
     const harness = makeHarness();
     return Effect.gen(function* () {
       const adapter = yield* ClaudeAdapter;
 
       const warningsFiber = yield* Stream.filter(
         adapter.streamEvents,
-        (event) => event.type === "runtime.warning",
+        (event) =>
+          event.type === "runtime.warning" && event.payload.message.includes("processing"),
       ).pipe(Stream.take(1), Stream.runCollect, Effect.forkChild);
 
       const session = yield* adapter.startSession({
@@ -3790,8 +3998,9 @@ describe("ClaudeAdapterLive", () => {
       const warning = warnings[0];
       assert.equal(warning?.type, "runtime.warning");
       if (warning?.type === "runtime.warning") {
-        assert.ok(warning.payload.message.includes("1M window"));
-        assert.ok(warning.payload.message.includes("premium"));
+        assert.ok(warning.payload.message.includes("prompt tokens per request"));
+        assert.ok(warning.payload.message.includes("usage limits"));
+        assert.ok(!warning.payload.message.includes("premium"));
       }
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
@@ -3804,10 +4013,10 @@ describe("ClaudeAdapterLive", () => {
     return Effect.gen(function* () {
       const adapter = yield* ClaudeAdapter;
 
-      const runtimeEventsFiber = yield* Stream.take(adapter.streamEvents, 6).pipe(
-        Stream.runCollect,
-        Effect.forkChild,
-      );
+      const runtimeEventsFiber = yield* Stream.filter(
+        adapter.streamEvents,
+        (event) => event.type === "thread.token-usage.updated",
+      ).pipe(Stream.take(1), Stream.runCollect, Effect.forkChild);
 
       const session = yield* adapter.startSession({
         threadId: THREAD_ID,
@@ -3864,10 +4073,10 @@ describe("ClaudeAdapterLive", () => {
       return Effect.gen(function* () {
         const adapter = yield* ClaudeAdapter;
 
-        const runtimeEventsFiber = yield* Stream.take(adapter.streamEvents, 8).pipe(
-          Stream.runCollect,
-          Effect.forkChild,
-        );
+        const runtimeEventsFiber = yield* Stream.filter(
+          adapter.streamEvents,
+          (event) => event.type === "thread.token-usage.updated",
+        ).pipe(Stream.take(2), Stream.runCollect, Effect.forkChild);
 
         const session = yield* adapter.startSession({
           threadId: THREAD_ID,
