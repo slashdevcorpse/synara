@@ -141,12 +141,16 @@ function resolveClaudeEnvironment(input: {
     TextGenerationShape["generateThreadTitle"]
   >[0]["providerOptions"];
   readonly homeDir?: string;
+  readonly isolationRootDir?: string;
+  readonly providerInstanceId?: string;
 }): NodeJS.ProcessEnv {
   const claudeOptions = input.providerOptions?.claudeAgent;
   return buildClaudeProcessEnv({
     homePath: claudeOptions?.homePath,
     environment: claudeOptions?.environment,
     homeDir: input.homeDir,
+    isolationRootDir: input.isolationRootDir,
+    providerInstanceId: input.providerInstanceId,
   });
 }
 
@@ -203,7 +207,12 @@ const makeClaudeTextGeneration = Effect.gen(function* () {
   }): Effect.Effect<S["Type"], TextGenerationError, S["DecodingServices"]> =>
     Effect.gen(function* () {
       const binaryPath = resolveClaudeBinaryPath({ providerOptions });
-      const env = resolveClaudeEnvironment({ providerOptions, homeDir: serverConfig.homeDir });
+      const env = resolveClaudeEnvironment({
+        providerOptions,
+        homeDir: serverConfig.homeDir,
+        isolationRootDir: serverConfig.stateDir,
+        providerInstanceId: modelSelection.instanceId,
+      });
       // Keep the environment switch as defense in depth alongside the mandatory
       // CLI flag below. Binaries that predate --safe-mode must reject the request
       // rather than silently running auxiliary generation with customizations.

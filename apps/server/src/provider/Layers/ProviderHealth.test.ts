@@ -16,6 +16,7 @@ import { SYNARA_CODEX_HOME_OVERLAY_DIR } from "../../codexHomePaths";
 import { ServerConfig } from "../../config";
 import { ServerSettingsService } from "../../serverSettings";
 import { CODEX_CLI_UNPARSEABLE_VERSION_MESSAGE } from "../codexCliVersion";
+import { claudeIsolatedHomePath } from "../claudeEnvironment";
 import { ProviderHealth } from "../Services/ProviderHealth";
 import {
   readProviderStatusCache,
@@ -1473,6 +1474,42 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
 
       assert.strictEqual(env.HOME, "/tmp/synara-test-home/.claude-work");
       assert.strictEqual(env.SYNARA_TEST_INSTANCE, "claude-work");
+    });
+
+    it.effect("scopes environment-only Claude health probes to the selected instance", () => {
+      const isolationRootDir = "/tmp/synara-provider-health-state";
+      const providerInstanceId = "claude_work" as ProviderInstanceId;
+      return makeCheckClaudeProviderStatus(
+        undefined,
+        "claude",
+        undefined,
+        { ANTHROPIC_AUTH_TOKEN: "work-token" },
+        "/tmp/server-home",
+        { providerInstanceId, isolationRootDir },
+      ).pipe(
+        Effect.tap((status) => Effect.sync(() => assert.strictEqual(status.status, "ready"))),
+        Effect.provide(
+          mockSpawnerLayer((args, _command, env) => {
+            assert.strictEqual(
+              env?.HOME,
+              claudeIsolatedHomePath({ isolationRootDir, providerInstanceId }),
+            );
+            assert.strictEqual(env?.ANTHROPIC_AUTH_TOKEN, "work-token");
+            const joined = args.join(" ");
+            if (joined === "--version") {
+              return { stdout: "1.0.0\n", stderr: "", code: 0 };
+            }
+            if (joined === "auth status") {
+              return {
+                stdout: '{"loggedIn":true,"authMethod":"claude.ai"}\n',
+                stderr: "",
+                code: 0,
+              };
+            }
+            throw new Error(`Unexpected args: ${joined}`);
+          }),
+        ),
+      );
     });
 
     it.effect("isolates explicit Claude home probes from an inherited config directory", () =>

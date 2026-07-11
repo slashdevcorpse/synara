@@ -15,6 +15,7 @@ import {
   CommandId,
   type ModelSelection,
   type OrchestrationImportThreadInput,
+  type ProviderInstanceId,
   type ProviderStartOptions,
   type ServerSettings,
   type ThreadHandoffImportedMessage,
@@ -145,19 +146,24 @@ async function queryClaudeHistoricalSession<T>(input: {
 
 export function claudeHistoricalSessionEnvironment(
   providerOptions: ProviderStartOptions | undefined,
-  input?: { readonly homeDir?: string | undefined },
+  input?: {
+    readonly homeDir?: string | undefined;
+    readonly isolationRootDir?: string | undefined;
+    readonly providerInstanceId?: ProviderInstanceId | undefined;
+  },
 ): NodeJS.ProcessEnv | undefined {
   const claudeOptions = providerOptions?.claudeAgent;
-  if (!claudeOptions && !input?.homeDir) {
+  if (!claudeOptions && !input?.homeDir && !input?.isolationRootDir && !input?.providerInstanceId) {
     return undefined;
   }
   const homePath = claudeOptions?.homePath?.trim();
-  const environment = claudeOptions?.environment ?? {};
-  if (!homePath && Object.keys(environment).length === 0) {
-    // Default Claude imports still belong to the configured Synara home, not the server process HOME.
-    return buildClaudeProcessEnv({ homeDir: input?.homeDir });
-  }
-  return buildClaudeProcessEnv({ homePath, environment, homeDir: input?.homeDir });
+  return buildClaudeProcessEnv({
+    homePath,
+    environment: claudeOptions?.environment,
+    homeDir: input?.homeDir,
+    isolationRootDir: input?.isolationRootDir,
+    providerInstanceId: input?.providerInstanceId,
+  });
 }
 
 function mapProviderSessionStatusToOrchestrationStatus(
@@ -204,7 +210,7 @@ export interface ImportThreadHandlerOptions {
   readonly projectionSnapshotQuery: ProjectionSnapshotQueryShape;
   readonly providerAdapterRegistry: ProviderAdapterRegistryShape;
   readonly providerService: ProviderServiceShape;
-  readonly serverConfig: Pick<ServerConfigShape, "homeDir">;
+  readonly serverConfig: Pick<ServerConfigShape, "homeDir" | "stateDir">;
   readonly serverSettings: ServerSettingsShape;
 }
 
@@ -227,10 +233,13 @@ export function makeImportThreadHandler(options: ImportThreadHandlerOptions) {
   const ensureClaudeThreadImportable = Effect.fn(function* (input: {
     readonly cwd: string | undefined;
     readonly externalId: string;
+    readonly providerInstanceId: ProviderInstanceId;
     readonly providerOptions?: ProviderStartOptions;
   }) {
     const historicalEnv = claudeHistoricalSessionEnvironment(input.providerOptions, {
       homeDir: options.serverConfig.homeDir,
+      isolationRootDir: options.serverConfig.stateDir,
+      providerInstanceId: input.providerInstanceId,
     });
     const claudeSessionInfo = yield* Effect.tryPromise({
       try: () =>
@@ -251,7 +260,13 @@ export function makeImportThreadHandler(options: ImportThreadHandlerOptions) {
     if (claudeSessionInfo) return;
 
     const sessionFoundElsewhere = yield* Effect.tryPromise({
-      try: () => getClaudeSessionInfo(input.externalId),
+      try: () =>
+        queryClaudeHistoricalSession<SDKSessionInfo | null | undefined>({
+          method: "getSessionInfo",
+          sessionId: input.externalId,
+          dir: undefined,
+          environment: historicalEnv,
+        }),
       catch: () => undefined,
     });
 
@@ -384,11 +399,14 @@ export function makeImportThreadHandler(options: ImportThreadHandlerOptions) {
     readonly cwd: string | undefined;
     readonly externalId: string;
     readonly importedAt: string;
+    readonly providerInstanceId: ProviderInstanceId;
     readonly providerOptions?: ProviderStartOptions;
     readonly threadId: ThreadId;
   }) {
     const historicalEnv = claudeHistoricalSessionEnvironment(input.providerOptions, {
       homeDir: options.serverConfig.homeDir,
+      isolationRootDir: options.serverConfig.stateDir,
+      providerInstanceId: input.providerInstanceId,
     });
     const sessionMessages = yield* Effect.tryPromise({
       try: () =>
@@ -527,6 +545,7 @@ export function makeImportThreadHandler(options: ImportThreadHandlerOptions) {
       yield* ensureClaudeThreadImportable({
         cwd,
         externalId,
+        providerInstanceId: resolvedProvider.instance.instanceId,
         ...(providerOptions ? { providerOptions } : {}),
       });
     }
@@ -558,6 +577,7 @@ export function makeImportThreadHandler(options: ImportThreadHandlerOptions) {
         threadId: thread.id,
         externalId,
         cwd,
+        providerInstanceId: resolvedProvider.instance.instanceId,
         ...(providerOptions ? { providerOptions } : {}),
         importedAt: session.updatedAt,
       });

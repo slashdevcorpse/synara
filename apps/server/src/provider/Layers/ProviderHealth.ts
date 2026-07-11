@@ -439,10 +439,12 @@ const CAPABILITIES_PROBE_TIMEOUT_MS = 8_000;
 const CLAUDE_SUBSCRIPTION_CACHE_TTL_MS = 5 * 60 * 1_000;
 
 interface ClaudeSubscriptionProbeInput {
+  readonly instanceId?: ProviderInstanceId | undefined;
   readonly binaryPath?: string | undefined;
   readonly homePath?: string | undefined;
   readonly environment?: Readonly<Record<string, string>> | undefined;
   readonly homeDir?: string | undefined;
+  readonly isolationRootDir?: string | undefined;
 }
 
 function waitForAbortSignal(signal: AbortSignal): Promise<void> {
@@ -476,9 +478,11 @@ function environmentFingerprint(
 
 function claudeSubscriptionProbeKey(input: ClaudeSubscriptionProbeInput): string {
   return JSON.stringify({
+    instanceId: input.instanceId?.trim() || null,
     binaryPath: input.binaryPath?.trim() || null,
     homeDir: input.homeDir?.trim() || null,
     homePath: input.homePath?.trim() || null,
+    isolationRootDir: input.isolationRootDir?.trim() || null,
     environment: environmentFingerprint(input.environment),
   });
 }
@@ -486,7 +490,13 @@ function claudeSubscriptionProbeKey(input: ClaudeSubscriptionProbeInput): string
 const probeClaudeSubscription = (input: ClaudeSubscriptionProbeInput) => {
   const abort = new AbortController();
   const executable = nonEmptyTrimmed(input.binaryPath) ?? "claude";
-  const env = makeClaudeProbeEnv(input.homePath, input.environment, input.homeDir);
+  const env = makeClaudeProbeEnv(
+    input.homePath,
+    input.environment,
+    input.homeDir,
+    input.instanceId,
+    input.isolationRootDir,
+  );
   return Effect.tryPromise(async () => {
     const q = claudeQuery({
       // oxlint-disable-next-line require-yield
@@ -906,8 +916,16 @@ export function makeClaudeProbeEnv(
   homePath?: string,
   environment?: Readonly<Record<string, string>>,
   homeDir?: string,
+  providerInstanceId?: ProviderInstanceId,
+  isolationRootDir?: string,
 ): NodeJS.ProcessEnv {
-  return buildClaudeProcessEnv({ homePath, environment, homeDir });
+  return buildClaudeProcessEnv({
+    homePath,
+    environment,
+    homeDir,
+    providerInstanceId,
+    isolationRootDir,
+  });
 }
 
 const readCodexConfigModelProviderForEnv = (env: NodeJS.ProcessEnv) =>
@@ -1146,12 +1164,22 @@ export const makeCheckClaudeProviderStatus = (
   homePath?: string,
   environment?: Readonly<Record<string, string>>,
   homeDir?: string,
-  options?: { readonly falseNegativeRetryDelayMs?: number },
+  options?: {
+    readonly falseNegativeRetryDelayMs?: number;
+    readonly providerInstanceId?: ProviderInstanceId;
+    readonly isolationRootDir?: string;
+  },
 ): Effect.Effect<ServerProviderStatus, never, ChildProcessSpawner.ChildProcessSpawner> =>
   Effect.gen(function* () {
     const checkedAt = new Date().toISOString();
     const executable = nonEmptyTrimmed(binaryPath) ?? "claude";
-    const probeEnv = buildClaudeProcessEnv({ homePath, environment, homeDir });
+    const probeEnv = buildClaudeProcessEnv({
+      homePath,
+      environment,
+      homeDir,
+      providerInstanceId: options?.providerInstanceId,
+      isolationRootDir: options?.isolationRootDir,
+    });
 
     // Probe 1: `claude --version` — is the CLI reachable?
     const versionProbe = yield* runClaudeCommand(["--version"], executable, probeEnv).pipe(
@@ -1256,7 +1284,7 @@ export const makeCheckClaudeProviderStatus = (
 
     let authOutput = authProbe.success.value;
     let parsed = parseClaudeAuthStatusFromOutput(authOutput);
-    const credentialsHome = nonEmptyTrimmed(homePath) ?? homeDir;
+    const credentialsHome = nonEmptyTrimmed(probeEnv.HOME) ?? homeDir;
     const credentialSummary = readClaudeCliCredentialsSummary(
       credentialsHome ? { env: probeEnv, homeDir: credentialsHome } : { env: probeEnv },
     );
@@ -2746,20 +2774,28 @@ export const ProviderHealthLive = Layer.effect(
           );
         }
         case "claudeAgent": {
-          const claudeHomePath = readInstanceConfigString(instance, "homePath");
+          const claudeOptions = providerStartOptionsFromInstance(instance)?.claudeAgent;
+          const claudeHomePath = claudeOptions?.homePath;
+          const claudeEnvironment = claudeOptions?.environment;
           return checkProviderInstanceWhenEnabled(
             instance,
             makeCheckClaudeProviderStatus(
               resolveClaudeSubscription({
+                instanceId: instance.instanceId,
                 binaryPath,
                 homePath: claudeHomePath,
-                environment: instance.environment,
+                environment: claudeEnvironment,
                 homeDir: serverConfig.homeDir,
+                isolationRootDir: serverConfig.stateDir,
               }),
               binaryPath,
               claudeHomePath,
-              instance.environment,
+              claudeEnvironment,
               serverConfig.homeDir,
+              {
+                providerInstanceId: instance.instanceId,
+                isolationRootDir: serverConfig.stateDir,
+              },
             ),
           );
         }

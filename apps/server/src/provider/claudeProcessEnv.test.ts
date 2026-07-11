@@ -8,7 +8,7 @@ import path from "node:path";
 
 import { describe, it, assert } from "@effect/vitest";
 
-import { buildClaudeProcessEnv } from "./claudeEnvironment.ts";
+import { buildClaudeProcessEnv, claudeIsolatedHomePath } from "./claudeEnvironment.ts";
 import {
   CLAUDE_ACCOUNT_ISOLATION_ENV_KEYS,
   hasUsableClaudeCliCredentials,
@@ -95,10 +95,18 @@ describe("claudeProcessEnv", () => {
         HTTPS_PROXY: "https://shared-network-proxy.example.test",
       },
       environment: { ANTHROPIC_AUTH_TOKEN: "instance-auth-token" },
+      isolationRootDir: "/synara/state",
+      providerInstanceId: "claude_work",
       hasClaudeCliCredentials: false,
     });
 
-    assert.equal(result.HOME, "/home/account-a");
+    assert.equal(
+      result.HOME,
+      claudeIsolatedHomePath({
+        isolationRootDir: "/synara/state",
+        providerInstanceId: "claude_work",
+      }),
+    );
     assert.equal(result.PATH, "/bin");
     assert.equal(result.ANTHROPIC_API_KEY, undefined);
     assert.equal(result.ANTHROPIC_AUTH_TOKEN, "instance-auth-token");
@@ -145,6 +153,160 @@ describe("claudeProcessEnv", () => {
 
     assert.equal(result.ANTHROPIC_API_KEY, undefined);
     assert.equal(result.AWS_PROFILE, undefined);
+  });
+
+  it("isolates environment-only instances from inherited HOME and CLAUDE_CONFIG_DIR OAuth", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "synara-claude-disk-isolation-"));
+    const inheritedHome = path.join(root, "server-home");
+    const inheritedConfig = path.join(root, "server-claude-config");
+    const isolationRootDir = path.join(root, "synara-state");
+    const credentials = JSON.stringify({
+      claudeAiOauth: {
+        accessToken: "server-account-token",
+        expiresAt: Date.now() + 60_000,
+      },
+    });
+    try {
+      mkdirSync(path.join(inheritedHome, ".claude"), { recursive: true });
+      mkdirSync(inheritedConfig, { recursive: true });
+      writeFileSync(path.join(inheritedHome, ".claude", ".credentials.json"), credentials);
+      writeFileSync(path.join(inheritedConfig, ".credentials.json"), credentials);
+
+      const result = buildClaudeProcessEnv({
+        env: {
+          HOME: inheritedHome,
+          CLAUDE_CONFIG_DIR: inheritedConfig,
+        },
+        homeDir: inheritedHome,
+        isolationRootDir,
+        providerInstanceId: "claude_work",
+        environment: { ANTHROPIC_AUTH_TOKEN: "work-account-token" },
+      });
+      const isolatedHome = claudeIsolatedHomePath({
+        isolationRootDir,
+        providerInstanceId: "claude_work",
+      });
+
+      assert.equal(result.HOME, isolatedHome);
+      assert.equal(result.CLAUDE_CONFIG_DIR, undefined);
+      assert.notEqual(result.HOME, inheritedHome);
+      assert.equal(hasUsableClaudeCliCredentials({ env: result, homeDir: isolatedHome }), false);
+      assert.deepEqual(resolveClaudeCredentialsPaths({ env: result, homeDir: isolatedHome }), [
+        path.join(isolatedHome, ".claude", ".credentials.json"),
+      ]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps empty and redacted custom instances on distinct isolated homes", () => {
+    const isolationRootDir = "/synara/state";
+    const redactedA = buildClaudeProcessEnv({
+      env: { HOME: "/home/server" },
+      isolationRootDir,
+      providerInstanceId: "claude_redacted_a",
+      hasClaudeCliCredentials: false,
+    });
+    const redactedB = buildClaudeProcessEnv({
+      env: { HOME: "/home/server" },
+      isolationRootDir,
+      providerInstanceId: "claude_redacted_b",
+      hasClaudeCliCredentials: false,
+    });
+    const explicitlyEmpty = buildClaudeProcessEnv({
+      env: { HOME: "/home/server" },
+      environment: {},
+      isolationRootDir,
+      providerInstanceId: "claude_empty",
+      hasClaudeCliCredentials: false,
+    });
+
+    assert.notEqual(redactedA.HOME, redactedB.HOME);
+    assert.notEqual(redactedA.HOME, explicitlyEmpty.HOME);
+    assert.notEqual(redactedB.HOME, explicitlyEmpty.HOME);
+    for (const isolatedHome of [redactedA.HOME, redactedB.HOME, explicitlyEmpty.HOME]) {
+      assert.ok(isolatedHome);
+      assert.equal(path.isAbsolute(isolatedHome), true);
+      assert.equal(path.relative(isolationRootDir, isolatedHome).startsWith(".."), false);
+    }
+  });
+
+  it("contains encoded provider instance ids within the Synara isolation root", () => {
+    const isolationRootDir = "/synara/state";
+    const isolatedHome = claudeIsolatedHomePath({
+      isolationRootDir,
+      providerInstanceId: "../../outside/account",
+    });
+    const relativeHome = path.relative(isolationRootDir, isolatedHome);
+
+    assert.equal(path.isAbsolute(isolatedHome), true);
+    assert.equal(relativeHome.startsWith(".."), false);
+    assert.equal(relativeHome.includes("outside/account"), false);
+  });
+
+  it("keeps mixed-case instance ids distinct on case-insensitive filesystems", () => {
+    const isolationRootDir = "/synara/state";
+    const upperHome = claudeIsolatedHomePath({
+      isolationRootDir,
+      providerInstanceId: "AAG",
+    });
+    const lowerHome = claudeIsolatedHomePath({
+      isolationRootDir,
+      providerInstanceId: "AAa",
+    });
+
+    assert.notEqual(upperHome.toLowerCase(), lowerHome.toLowerCase());
+  });
+
+  it("preserves the default instance home unless it explicitly configures an environment", () => {
+    const defaultResult = buildClaudeProcessEnv({
+      env: { HOME: "/home/server" },
+      homeDir: "/home/server",
+      isolationRootDir: "/synara/state",
+      providerInstanceId: "claudeAgent",
+      hasClaudeCliCredentials: false,
+    });
+    const configuredResult = buildClaudeProcessEnv({
+      env: { HOME: "/home/server" },
+      homeDir: "/home/server",
+      environment: { ANTHROPIC_AUTH_TOKEN: "default-instance-token" },
+      isolationRootDir: "/synara/state",
+      providerInstanceId: "claudeAgent",
+      hasClaudeCliCredentials: false,
+    });
+
+    assert.equal(defaultResult.HOME, "/home/server");
+    assert.equal(
+      configuredResult.HOME,
+      claudeIsolatedHomePath({
+        isolationRootDir: "/synara/state",
+        providerInstanceId: "claudeAgent",
+      }),
+    );
+  });
+
+  it("uses explicitly configured HOME and Windows profile paths as the account boundary", () => {
+    const result = buildClaudeProcessEnv({
+      env: {
+        HOME: "C:\\Users\\server",
+        USERPROFILE: "C:\\Users\\server",
+        APPDATA: "C:\\Users\\server\\AppData\\Roaming",
+      },
+      environment: {
+        HOME: "C:\\Accounts\\work",
+        USERPROFILE: "D:\\Profiles\\work",
+        APPDATA: "E:\\Claude\\Roaming",
+      },
+      isolationRootDir: "C:\\Synara\\userdata",
+      providerInstanceId: "claude_work",
+      platform: "win32",
+      hasClaudeCliCredentials: false,
+    });
+
+    assert.equal(result.HOME, "C:\\Accounts\\work");
+    assert.equal(result.USERPROFILE, "D:\\Profiles\\work");
+    assert.equal(result.APPDATA, "E:\\Claude\\Roaming");
+    assert.equal(result.LOCALAPPDATA, "C:\\Accounts\\work\\AppData\\Local");
   });
 
   it("overlays the instance home and looks up credentials there", () => {

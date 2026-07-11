@@ -1,9 +1,14 @@
 import { homedir } from "node:os";
 import path from "node:path";
 
-import { DEFAULT_SERVER_SETTINGS, type ProviderStartOptions } from "@synara/contracts";
+import {
+  DEFAULT_SERVER_SETTINGS,
+  type ProviderInstanceId,
+  type ProviderStartOptions,
+} from "@synara/contracts";
 import { describe, expect, it } from "vitest";
 
+import { claudeIsolatedHomePath } from "../provider/claudeEnvironment";
 import {
   claudeHistoricalSessionChildEnvironment,
   claudeHistoricalSessionEnvironment,
@@ -44,6 +49,28 @@ describe("claudeHistoricalSessionEnvironment", () => {
     });
 
     expect(environment?.HOME).toBe("/synara/home");
+  });
+
+  it("scopes environment-only Claude imports to the selected provider instance", () => {
+    const isolationRootDir = "/synara/userdata";
+    const providerInstanceId = "claude_work" as ProviderInstanceId;
+    const environment = claudeHistoricalSessionEnvironment(
+      {
+        claudeAgent: {
+          environment: { ANTHROPIC_AUTH_TOKEN: "work-token" },
+        },
+      } satisfies ProviderStartOptions,
+      {
+        homeDir: "/synara/home",
+        isolationRootDir,
+        providerInstanceId,
+      },
+    );
+
+    expect(environment?.HOME).toBe(
+      claudeIsolatedHomePath({ isolationRootDir, providerInstanceId }),
+    );
+    expect(environment?.ANTHROPIC_AUTH_TOKEN).toBe("work-token");
   });
 
   it("passes the sanitized historical environment to child queries without remerging process env", () => {

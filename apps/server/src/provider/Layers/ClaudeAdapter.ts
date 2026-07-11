@@ -283,6 +283,7 @@ function neverResolvingUserMessageStream(): AsyncIterable<SDKUserMessage> {
 }
 
 function claudeDiscoveryKey(input: {
+  readonly instanceId?: string | null | undefined;
   readonly binaryPath?: string | null | undefined;
   readonly homePath?: string | null | undefined;
   readonly environment?: Readonly<Record<string, string>> | undefined;
@@ -290,6 +291,7 @@ function claudeDiscoveryKey(input: {
   readonly includeCwd?: boolean;
 }): string {
   return JSON.stringify({
+    instanceId: input.instanceId?.trim() || null,
     binaryPath: input.binaryPath?.trim() || "claude",
     homePath: input.homePath?.trim() || null,
     environment: environmentFingerprint(input.environment),
@@ -1473,14 +1475,21 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
     const makeEventStamp = () => Effect.all({ eventId: nextEventId, createdAt: nowIso });
     // Instance-aware Claude env: overlays the selected account home/env and strips
     // stale inherited request credentials when a local CLI login can serve instead.
-    const claudeInstanceEnv = (providerOptions?: {
-      readonly homePath?: string | null | undefined;
-      readonly environment?: Readonly<Record<string, string>> | undefined;
-    }): NodeJS.ProcessEnv =>
+    const claudeInstanceEnv = (
+      providerOptions:
+        | {
+            readonly homePath?: string | null | undefined;
+            readonly environment?: Readonly<Record<string, string>> | undefined;
+          }
+        | undefined,
+      providerInstanceId?: string | undefined,
+    ): NodeJS.ProcessEnv =>
       buildClaudeProcessEnv({
         homePath: providerOptions?.homePath,
         environment: providerOptions?.environment,
         homeDir: serverConfig.homeDir,
+        isolationRootDir: serverConfig.stateDir,
+        providerInstanceId,
       });
     const withSessionLifecycleLock = <A, E, R>(
       threadId: ThreadId,
@@ -3540,14 +3549,17 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
           );
 
         const providerOptions = input.providerOptions?.claudeAgent;
-        const queryEnv = claudeInstanceEnv(providerOptions);
+        const providerInstanceId = input.providerInstanceId ?? input.modelSelection?.instanceId;
+        const queryEnv = claudeInstanceEnv(providerOptions, providerInstanceId);
         const commandDiscoveryKey = claudeDiscoveryKey({
+          instanceId: providerInstanceId,
           binaryPath: providerOptions?.binaryPath,
           homePath: providerOptions?.homePath,
           environment: providerOptions?.environment,
           cwd: input.cwd,
         });
         const accountDiscoveryKey = claudeDiscoveryKey({
+          instanceId: providerInstanceId,
           binaryPath: providerOptions?.binaryPath,
           homePath: providerOptions?.homePath,
           environment: providerOptions?.environment,
@@ -3699,7 +3711,7 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
           const session: ProviderSession = {
             threadId,
             provider: PROVIDER,
-            ...(input.providerInstanceId ? { providerInstanceId: input.providerInstanceId } : {}),
+            ...(providerInstanceId ? { providerInstanceId } : {}),
             status: "ready",
             runtimeMode: input.runtimeMode,
             ...(input.cwd ? { cwd: input.cwd } : {}),
@@ -4106,7 +4118,7 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
           settingSources: [...CLAUDE_SETTING_SOURCES],
           permissionMode: "plan" as PermissionMode,
           persistSession: false,
-          env: claudeInstanceEnv(input),
+          env: claudeInstanceEnv(input, input.instanceId),
         },
       });
 
