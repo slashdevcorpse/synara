@@ -15,7 +15,6 @@ import {
   symlinkSync,
   chmodSync,
   unlinkSync,
-  utimesSync,
   writeFileSync,
 } from "node:fs";
 import OS from "node:os";
@@ -26,6 +25,7 @@ import { afterEach, assert, describe, it } from "@effect/vitest";
 import { expect, vi } from "vitest";
 
 import {
+  buildCodexAppServerArgs,
   buildCodexProcessLaunchContext,
   buildCodexProcessEnv,
   isCodexSharedContinuationStatePrepared,
@@ -126,6 +126,29 @@ describe("buildCodexProcessEnv account overlays", () => {
       }) as typeof symlinkSync,
       copyFile: copyFileSync,
     };
+  }
+
+  function spawnBunEval(script: string) {
+    let child!: ReturnType<typeof spawn>;
+    const completed = new Promise<{ readonly code: number | null; readonly stderr: string }>(
+      (resolve, reject) => {
+        const spawned = spawn("bun", ["-e", script], {
+          cwd: import.meta.dirname,
+          stdio: ["ignore", "ignore", "pipe"],
+        });
+        child = spawned;
+        let stderr = "";
+        spawned.stderr.setEncoding("utf8");
+        spawned.stderr.on("data", (chunk: string) => {
+          stderr += chunk;
+        });
+        spawned.once("error", reject);
+        spawned.once("exit", (code) => {
+          resolve({ code, stderr });
+        });
+      },
+    );
+    return { child, completed };
   }
 
   it("links account-private auth from the shadow home instead of the shared home", () => {
@@ -266,6 +289,148 @@ describe("buildCodexProcessEnv account overlays", () => {
     assert.ok(env.CODEX_HOME);
     assert.match(readFileSync(path.join(env.CODEX_HOME, "config.toml"), "utf8"), /sqlite_home/);
   });
+
+  it("places enforced app-server config after the subcommand at exact CLI precedence", () => {
+    const root = makeTempRoot();
+    const sourceHomePath = path.join(root, 'source codex home "primary"');
+    mkdirSync(sourceHomePath, { recursive: true });
+    writeFileSync(path.join(sourceHomePath, "config.toml"), "", "utf8");
+
+    const launch = buildCodexProcessLaunchContext({
+      env: {
+        HOME: root,
+        SYNARA_HOME: path.join(root, "runtime"),
+        CODEX_SQLITE_HOME: path.join(root, "inherited-wrong-sqlite-home"),
+      },
+      homePath: sourceHomePath,
+      platform: "win32",
+    });
+
+    assert.deepEqual(launch.appServerArgs, [
+      "app-server",
+      "--config",
+      `sqlite_home=${JSON.stringify(path.resolve(sourceHomePath))}`,
+      "--config",
+      'cli_auth_credentials_store="file"',
+    ]);
+    assert.deepEqual(launch.appServerArgs, buildCodexAppServerArgs(sourceHomePath));
+    assert.strictEqual(launch.env.CODEX_SQLITE_HOME, path.resolve(sourceHomePath));
+  });
+
+  it.runIf(Boolean(process.env.CODEX_BINARY_PATH))(
+    "gives enforced CLI config precedence over real Codex user and project layers",
+    async () => {
+      const binaryPath = process.env.CODEX_BINARY_PATH;
+      assert.ok(binaryPath);
+      const root = makeTempRoot();
+      const userHomePath = path.join(root, "user-home");
+      const sourceHomePath = path.join(root, "shared sqlite home");
+      const projectPath = path.join(root, "project");
+      mkdirSync(userHomePath, { recursive: true });
+      mkdirSync(sourceHomePath, { recursive: true });
+      mkdirSync(path.join(projectPath, ".codex"), { recursive: true });
+      writeFileSync(
+        path.join(userHomePath, "config.toml"),
+        [
+          `sqlite_home = ${JSON.stringify(path.join(root, "wrong-user-sqlite"))}`,
+          'cli_auth_credentials_store = "keyring"',
+          `[projects.${JSON.stringify(projectPath)}]`,
+          'trust_level = "trusted"',
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+      writeFileSync(
+        path.join(projectPath, ".codex", "config.toml"),
+        [
+          `sqlite_home = ${JSON.stringify(path.join(root, "wrong-project-sqlite"))}`,
+          'cli_auth_credentials_store = "keyring"',
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+
+      const child = spawn(binaryPath, [...buildCodexAppServerArgs(sourceHomePath)], {
+        cwd: projectPath,
+        env: { ...process.env, CODEX_HOME: userHomePath },
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      let stderr = "";
+      child.stderr.setEncoding("utf8");
+      child.stderr.on("data", (chunk: string) => {
+        stderr += chunk;
+      });
+
+      try {
+        const response = await new Promise<Record<string, unknown>>((resolve, reject) => {
+          let settled = false;
+          let buffer = "";
+          const timeout = setTimeout(() => {
+            settled = true;
+            reject(new Error(`Timed out waiting for config/read. ${stderr}`));
+          }, 10_000);
+          const finish = (operation: () => void) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timeout);
+            operation();
+          };
+          child.once("error", (error) => finish(() => reject(error)));
+          child.once("exit", (code) => {
+            finish(() => reject(new Error(`Codex app-server exited with ${code}. ${stderr}`)));
+          });
+          child.stdout.setEncoding("utf8");
+          child.stdout.on("data", (chunk: string) => {
+            buffer += chunk;
+            for (;;) {
+              const newlineIndex = buffer.indexOf("\n");
+              if (newlineIndex < 0) return;
+              const line = buffer.slice(0, newlineIndex);
+              buffer = buffer.slice(newlineIndex + 1);
+              const message = JSON.parse(line) as { readonly id?: unknown } & Record<
+                string,
+                unknown
+              >;
+              if (message.id === 1) {
+                child.stdin.write(`${JSON.stringify({ method: "initialized" })}\n`);
+                child.stdin.write(
+                  `${JSON.stringify({
+                    id: 2,
+                    method: "config/read",
+                    params: { cwd: projectPath, includeLayers: true },
+                  })}\n`,
+                );
+              } else if (message.id === 2) {
+                finish(() => resolve(message));
+              }
+            }
+          });
+          child.stdin.write(
+            `${JSON.stringify({
+              id: 1,
+              method: "initialize",
+              params: {
+                clientInfo: { name: "synara-test", version: "1" },
+                capabilities: {},
+              },
+            })}\n`,
+          );
+        });
+        const result = response.result as
+          | {
+              readonly config?: {
+                readonly sqlite_home?: unknown;
+                readonly cli_auth_credentials_store?: unknown;
+              };
+            }
+          | undefined;
+        assert.strictEqual(result?.config?.sqlite_home, path.resolve(sourceHomePath));
+        assert.strictEqual(result?.config?.cli_auth_credentials_store, "file");
+      } finally {
+        child.kill();
+      }
+    },
+  );
 
   it("structurally rejects every effective sqlite_home form that overrides source routing", () => {
     const configCases = [
@@ -581,7 +746,7 @@ describe("buildCodexProcessEnv account overlays", () => {
     );
   });
 
-  it("revalidates a stale migration plan and preserves a target that appears during execution", () => {
+  it("preserves a conflicting continuation target that appears during preparation", () => {
     const fixture = makeAccountFixture({ shadowAuth: "missing" });
     const overlayHomePath = resolveActiveCodexHomeWritePath({
       env: fixture.env,
@@ -612,153 +777,133 @@ describe("buildCodexProcessEnv account overlays", () => {
           platform: "win32",
           overlayEntryLinker: mutateAfterPlanningStarts,
         }),
-      /changed during preparation/,
+      /exists as real entries in both|refusing to overwrite raced/,
     );
     assert.strictEqual(readFileSync(sourceStatePath, "utf8"), "same-before-plan");
     assert.strictEqual(readFileSync(overlayStatePath, "utf8"), "appeared-after-plan");
     assert.ok(lstatSync(overlayStatePath).isFile());
   });
 
-  it("does not let a stale owner release remove its reclaimer's successor lock", async () => {
-    const fixture = makeAccountFixture({ shadowAuth: "real" });
-    const personalShadowHomePath = path.join(
-      path.dirname(fixture.shadowHomePath),
-      "codex-shadow-personal-lock",
-    );
-    mkdirSync(personalShadowHomePath, { recursive: true });
-    writeFileSync(path.join(personalShadowHomePath, "auth.json"), "{}", "utf8");
-    const lockPath = path.join(fixture.homePath, ".synara-shared-continuation-v1.lock");
-    const ownerPath = path.join(lockPath, "owner.json");
+  it("converges when separate processes prepare the same continuation overlay", async () => {
+    const root = makeTempRoot();
+    const homePath = path.join(root, "codex-home");
+    const runtimePath = path.join(root, "synara-runtime");
+    mkdirSync(homePath, { recursive: true });
+    writeFileSync(path.join(homePath, "config.toml"), "", "utf8");
+    const env = { HOME: root, SYNARA_HOME: runtimePath };
+    const overlayHomePath = resolveActiveCodexHomeWritePath({ env, homePath });
     const moduleUrl = pathToFileURL(path.join(import.meta.dirname, "codexProcessEnv.ts")).href;
-    const spawnPreparation = (
-      accountId: string,
-      shadowHomePath: string,
-      readyPath: string,
-      releasePath: string,
-    ) => {
-      let child!: ReturnType<typeof spawn>;
-      const completed = new Promise<{ readonly code: number | null; readonly stderr: string }>(
-        (resolve, reject) => {
-          const script = `
-          import { copyFileSync, existsSync, symlinkSync, writeFileSync } from "node:fs";
-          import path from "node:path";
-          import { buildCodexProcessEnv } from ${JSON.stringify(moduleUrl)};
-          let paused = false;
-          buildCodexProcessEnv({
-            ...${JSON.stringify({
-              env: fixture.env,
-              homePath: fixture.homePath,
-              accountId,
-              shadowHomePath,
-              platform: "win32",
-            })},
-            overlayEntryLinker: {
-              symlink(sourcePath, targetPath, type) {
-                if (!paused && path.basename(String(targetPath)) === "sessions") {
-                  paused = true;
-                  writeFileSync(${JSON.stringify(readyPath)}, "ready", "utf8");
-                  while (!existsSync(${JSON.stringify(releasePath)})) {
-                    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
-                  }
-                }
-                return symlinkSync(sourcePath, targetPath, type);
-              },
-              copyFile: copyFileSync,
-            },
-          });
-        `;
-          const spawned = spawn("bun", ["-e", script], {
-            cwd: import.meta.dirname,
-            stdio: ["ignore", "ignore", "pipe"],
-          });
-          child = spawned;
-          let stderr = "";
-          spawned.stderr.setEncoding("utf8");
-          spawned.stderr.on("data", (chunk: string) => {
-            stderr += chunk;
-          });
-          spawned.once("error", reject);
-          spawned.once("exit", (code) => {
-            resolve({ code, stderr });
-          });
-        },
-      );
-      return { child, completed };
-    };
-
-    const ownerReadyPath = path.join(path.dirname(fixture.homePath), "owner-ready");
-    const ownerReleasePath = path.join(path.dirname(fixture.homePath), "owner-release");
-    const reclaimerReadyPath = path.join(path.dirname(fixture.homePath), "reclaimer-ready");
-    const reclaimerReleasePath = path.join(path.dirname(fixture.homePath), "reclaimer-release");
-    const owner = spawnPreparation(
-      "personal",
-      personalShadowHomePath,
-      ownerReadyPath,
-      ownerReleasePath,
-    );
-    let reclaimer: ReturnType<typeof spawnPreparation> | undefined;
+    const releasePath = path.join(root, "release");
+    const preparations = [0, 1].map((index) => {
+      const readyPath = path.join(root, `ready-${index}`);
+      const script = `
+        import { existsSync, writeFileSync } from "node:fs";
+        import { buildCodexProcessEnv } from ${JSON.stringify(moduleUrl)};
+        writeFileSync(${JSON.stringify(readyPath)}, "ready", "utf8");
+        while (!existsSync(${JSON.stringify(releasePath)})) {
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+        }
+        buildCodexProcessEnv(${JSON.stringify({ env, homePath, platform: "win32" })});
+      `;
+      return { readyPath, ...spawnBunEval(script) };
+    });
 
     try {
-      await vi.waitFor(() => expect(existsSync(ownerReadyPath)).toBe(true), { timeout: 5_000 });
-      const originalOwner = JSON.parse(readFileSync(ownerPath, "utf8")) as {
-        readonly token: string;
-      };
-      writeFileSync(
-        ownerPath,
-        `${JSON.stringify({ token: originalOwner.token, createdAtMs: 1 })}\n`,
-        "utf8",
+      await vi.waitFor(
+        () => expect(preparations.every(({ readyPath }) => existsSync(readyPath))).toBe(true),
+        {
+          timeout: 5_000,
+        },
       );
-      utimesSync(ownerPath, new Date(0), new Date(0));
-
-      reclaimer = spawnPreparation(
-        "work",
-        fixture.shadowHomePath,
-        reclaimerReadyPath,
-        reclaimerReleasePath,
-      );
-      await vi.waitFor(() => expect(existsSync(reclaimerReadyPath)).toBe(true), {
-        timeout: 5_000,
-      });
-      const successorBeforeStaleRelease = readFileSync(ownerPath, "utf8");
-
-      writeFileSync(ownerReleasePath, "release", "utf8");
-      const ownerResult = await owner.completed;
-      assert.notStrictEqual(ownerResult.code, 0);
-      assert.match(ownerResult.stderr, /Lost ownership of Codex continuation lock/);
-      assert.strictEqual(readFileSync(ownerPath, "utf8"), successorBeforeStaleRelease);
-
-      writeFileSync(reclaimerReleasePath, "release", "utf8");
-      const reclaimerResult = await reclaimer.completed;
-      assert.strictEqual(reclaimerResult.code, 0, reclaimerResult.stderr);
+      writeFileSync(releasePath, "release", "utf8");
+      const results = await Promise.all(preparations.map(({ completed }) => completed));
+      for (const result of results) {
+        assert.strictEqual(result.code, 0, result.stderr);
+      }
     } finally {
-      writeFileSync(ownerReleasePath, "release", "utf8");
-      writeFileSync(reclaimerReleasePath, "release", "utf8");
-      if (owner.child.exitCode === null) owner.child.kill("SIGKILL");
-      if (reclaimer?.child.exitCode === null) reclaimer.child.kill("SIGKILL");
+      writeFileSync(releasePath, "release", "utf8");
+      for (const { child } of preparations) {
+        if (child.exitCode === null) child.kill("SIGKILL");
+      }
     }
 
-    assert.ok(
-      isCodexSharedContinuationStatePrepared({
-        env: fixture.env,
-        homePath: fixture.homePath,
-        shadowHomePath: personalShadowHomePath,
-        accountId: "personal",
-      }),
-    );
-    assert.ok(
-      isCodexSharedContinuationStatePrepared({
-        env: fixture.env,
-        homePath: fixture.homePath,
-        shadowHomePath: fixture.shadowHomePath,
-        accountId: "work",
-      }),
-    );
-    assert.strictEqual(existsSync(lockPath), false);
+    assert.ok(isCodexSharedContinuationStatePrepared({ env, homePath }));
+    for (const entryName of [
+      "sessions",
+      "archived_sessions",
+      "history.jsonl",
+      "session_index.jsonl",
+    ]) {
+      const targetPath = path.join(overlayHomePath, entryName);
+      assert.ok(lstatSync(targetPath).isSymbolicLink(), entryName);
+      assert.strictEqual(
+        path.resolve(path.dirname(targetPath), readlinkSync(targetPath)),
+        path.resolve(homePath, entryName),
+        entryName,
+      );
+    }
     assert.deepEqual(
-      readdirSync(fixture.homePath).filter((entryName) =>
-        entryName.startsWith(".synara-shared-continuation-v1.lock.quarantine-"),
+      readdirSync(homePath).filter(
+        (entryName) =>
+          entryName.startsWith(".synara-shared-continuation-") ||
+          entryName.startsWith("synara-shared-continuation-v1.json."),
       ),
       [],
+    );
+  });
+
+  it("fails closed without deleting a continuation target raced in by another process", async () => {
+    const root = makeTempRoot();
+    const homePath = path.join(root, "codex-home");
+    const runtimePath = path.join(root, "synara-runtime");
+    const env = { HOME: root, SYNARA_HOME: runtimePath };
+    mkdirSync(homePath, { recursive: true });
+    writeFileSync(path.join(homePath, "config.toml"), "", "utf8");
+    const overlayHomePath = resolveActiveCodexHomeWritePath({ env, homePath });
+    const targetPath = path.join(overlayHomePath, "history.jsonl");
+    const readyPath = path.join(root, "ready");
+    const releasePath = path.join(root, "release");
+    const moduleUrl = pathToFileURL(path.join(import.meta.dirname, "codexProcessEnv.ts")).href;
+    const preparation = spawnBunEval(`
+      import { copyFileSync, existsSync, symlinkSync, writeFileSync } from "node:fs";
+      import path from "node:path";
+      import { buildCodexProcessEnv } from ${JSON.stringify(moduleUrl)};
+      buildCodexProcessEnv({
+        ...${JSON.stringify({ env, homePath, platform: "win32" })},
+        overlayEntryLinker: {
+          symlink(sourcePath, targetPath, type) {
+            if (path.basename(String(targetPath)) === "history.jsonl") {
+              writeFileSync(${JSON.stringify(readyPath)}, "ready", "utf8");
+              while (!existsSync(${JSON.stringify(releasePath)})) {
+                Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+              }
+            }
+            return symlinkSync(sourcePath, targetPath, type);
+          },
+          copyFile: copyFileSync,
+        },
+      });
+    `);
+
+    try {
+      await vi.waitFor(() => expect(existsSync(readyPath)).toBe(true), {
+        timeout: 5_000,
+      });
+      writeFileSync(targetPath, "independent-writer", "utf8");
+      writeFileSync(releasePath, "release", "utf8");
+      const result = await preparation.completed;
+      assert.notStrictEqual(result.code, 0);
+      assert.match(result.stderr, /refusing to overwrite raced or independently owned state/);
+    } finally {
+      writeFileSync(releasePath, "release", "utf8");
+      if (preparation.child.exitCode === null) preparation.child.kill("SIGKILL");
+    }
+
+    assert.strictEqual(readFileSync(targetPath, "utf8"), "independent-writer");
+    assert.ok(lstatSync(targetPath).isFile());
+    assert.strictEqual(
+      existsSync(path.join(homePath, "synara-shared-continuation-v1.json")),
+      false,
     );
   });
 

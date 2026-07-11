@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { randomUUID } from "node:crypto";
 import {
+  chmodSync,
   copyFileSync,
   existsSync,
   lstatSync,
@@ -24,6 +25,7 @@ import {
   readCodexAuthTrackingFingerprint,
   resolveCodexBrowserUsePipePath,
 } from "./codexProcessEnv";
+import { CODEX_CLI_UNPARSEABLE_VERSION_MESSAGE } from "./provider/codexCliVersion";
 import {
   buildCodexInitializeParams,
   CODEX_DEFAULT_MODE_DEVELOPER_INSTRUCTIONS,
@@ -39,6 +41,44 @@ import {
 import { ensureIsolatedScratchWorkspace } from "./scratchWorkspaces";
 
 const asThreadId = (value: string): ThreadId => ThreadId.makeUnsafe(value);
+
+function writeFakeCodexExecutable(root: string): string {
+  const binaryPath = path.join(root, "fake-codex.mjs");
+  writeFileSync(
+    binaryPath,
+    `#!/usr/bin/env node
+import fs from "node:fs";
+import readline from "node:readline";
+
+const args = process.argv.slice(2);
+if (args[0] === "--version") {
+  process.stdout.write((process.env.SYNARA_FAKE_CODEX_VERSION_OUTPUT ?? "codex 0.105.0") + "\\n");
+  process.exit(0);
+}
+if (args[0] !== "app-server") {
+  process.stderr.write("unexpected command: " + JSON.stringify(args) + "\\n");
+  process.exit(2);
+}
+if (process.env.SYNARA_FAKE_CODEX_ARGS_PATH) {
+  fs.writeFileSync(process.env.SYNARA_FAKE_CODEX_ARGS_PATH, JSON.stringify(args), "utf8");
+}
+
+const lines = readline.createInterface({ input: process.stdin });
+lines.on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.id === undefined) return;
+  let result = {};
+  if (message.method === "model/list") result = { data: [] };
+  if (message.method === "thread/start") result = { thread: { id: "fake-provider-thread" } };
+  process.stdout.write(JSON.stringify({ id: message.id, result }) + "\\n");
+});
+`,
+    "utf8",
+  );
+  chmodSync(binaryPath, 0o755);
+  return binaryPath;
+}
+
 const fullAccessTurnOverrides = {
   approvalPolicy: "never",
   sandboxPolicy: { type: "dangerFullAccess" },
@@ -1267,6 +1307,99 @@ describe("startSession", () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
+
+  it.runIf(process.platform !== "win32")(
+    "passes enforced config flags to the app-server after project override attempts",
+    async () => {
+      const root = mkdtempSync(path.join(os.tmpdir(), "synara-codex-app-args-"));
+      const sourceHome = path.join(root, "source codex home");
+      const runtimeHome = path.join(root, "runtime");
+      const projectPath = path.join(root, "project");
+      const argsPath = path.join(root, "app-server-args.json");
+      mkdirSync(sourceHome, { recursive: true });
+      mkdirSync(path.join(projectPath, ".codex"), { recursive: true });
+      writeFileSync(path.join(sourceHome, "config.toml"), "", "utf8");
+      writeFileSync(
+        path.join(projectPath, ".codex", "config.toml"),
+        `sqlite_home = ${JSON.stringify(path.join(root, "project-wrong-sqlite"))}\ncli_auth_credentials_store = "keyring"\n`,
+        "utf8",
+      );
+      const binaryPath = writeFakeCodexExecutable(root);
+      const manager = new CodexAppServerManager();
+
+      try {
+        await manager.startSession({
+          threadId: asThreadId("thread-enforced-app-args"),
+          provider: "codex",
+          cwd: projectPath,
+          runtimeMode: "full-access",
+          providerOptions: {
+            codex: {
+              binaryPath,
+              homePath: sourceHome,
+              environment: {
+                HOME: root,
+                SYNARA_HOME: runtimeHome,
+                SYNARA_FAKE_CODEX_ARGS_PATH: argsPath,
+                CODEX_SQLITE_HOME: path.join(root, "environment-wrong-sqlite"),
+              },
+            },
+          },
+        });
+
+        expect(JSON.parse(readFileSync(argsPath, "utf8"))).toEqual([
+          "app-server",
+          "--config",
+          `sqlite_home=${JSON.stringify(path.resolve(sourceHome))}`,
+          "--config",
+          'cli_auth_credentials_store="file"',
+        ]);
+      } finally {
+        manager.stopAll();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "fails closed when a successful Codex version check cannot be parsed",
+    async () => {
+      const root = mkdtempSync(path.join(os.tmpdir(), "synara-codex-version-unparseable-"));
+      const sourceHome = path.join(root, "source-home");
+      const argsPath = path.join(root, "app-server-args.json");
+      mkdirSync(sourceHome, { recursive: true });
+      writeFileSync(path.join(sourceHome, "config.toml"), "", "utf8");
+      const binaryPath = writeFakeCodexExecutable(root);
+      const manager = new CodexAppServerManager();
+
+      try {
+        await expect(
+          manager.startSession({
+            threadId: asThreadId("thread-unparseable-version"),
+            provider: "codex",
+            cwd: root,
+            runtimeMode: "full-access",
+            providerOptions: {
+              codex: {
+                binaryPath,
+                homePath: sourceHome,
+                environment: {
+                  HOME: root,
+                  SYNARA_HOME: path.join(root, "runtime"),
+                  SYNARA_FAKE_CODEX_ARGS_PATH: argsPath,
+                  SYNARA_FAKE_CODEX_VERSION_OUTPUT: "Codex development build",
+                },
+              },
+            },
+          }),
+        ).rejects.toThrow(CODEX_CLI_UNPARSEABLE_VERSION_MESSAGE);
+        expect(existsSync(argsPath)).toBe(false);
+      } finally {
+        manager.stopAll();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
 
   it("fails fast with an upgrade message when codex is below the minimum supported version", async () => {
     const manager = new CodexAppServerManager();

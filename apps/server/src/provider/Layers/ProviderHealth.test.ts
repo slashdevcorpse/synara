@@ -15,6 +15,7 @@ import { ChildProcessSpawner } from "effect/unstable/process";
 import { SYNARA_CODEX_HOME_OVERLAY_DIR } from "../../codexHomePaths";
 import { ServerConfig } from "../../config";
 import { ServerSettingsService } from "../../serverSettings";
+import { CODEX_CLI_UNPARSEABLE_VERSION_MESSAGE } from "../codexCliVersion";
 import { ProviderHealth } from "../Services/ProviderHealth";
 import {
   readProviderStatusCache,
@@ -1043,6 +1044,31 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
         ),
       ),
     );
+
+    it.effect("returns unavailable when a successful codex version cannot be parsed", () => {
+      let probes = 0;
+      return Effect.gen(function* () {
+        yield* withTempCodexHome();
+        const status = yield* checkCodexProviderStatus;
+        assert.strictEqual(status.provider, "codex");
+        assert.strictEqual(status.status, "error");
+        assert.strictEqual(status.available, false);
+        assert.strictEqual(status.authStatus, "unknown");
+        assert.strictEqual(status.message, CODEX_CLI_UNPARSEABLE_VERSION_MESSAGE);
+        assert.strictEqual(probes, 1);
+      }).pipe(
+        Effect.provide(
+          mockSpawnerLayer((args) => {
+            probes += 1;
+            const joined = args.join(" ");
+            if (joined === "--version") {
+              return { stdout: "Codex development build\n", stderr: "", code: 0 };
+            }
+            throw new Error(`Unexpected args: ${joined}`);
+          }),
+        ),
+      );
+    });
 
     it.effect("returns unauthenticated when auth probe reports login required", () =>
       Effect.gen(function* () {

@@ -46,6 +46,7 @@ import { prepareWindowsSafeProcess } from "@synara/shared/windowsProcess";
 import { Effect, ServiceMap } from "effect";
 
 import {
+  CODEX_CLI_UNPARSEABLE_VERSION_MESSAGE,
   formatCodexCliUpgradeMessage,
   isCodexCliVersionSupported,
   parseCodexCliVersion,
@@ -593,8 +594,9 @@ function spawnCodexAppServer(input: {
   readonly binaryPath: string;
   readonly cwd: string;
   readonly env: NodeJS.ProcessEnv;
+  readonly args: readonly string[];
 }): ChildProcessWithoutNullStreams {
-  const prepared = prepareWindowsSafeProcess(input.binaryPath, ["app-server"], {
+  const prepared = prepareWindowsSafeProcess(input.binaryPath, input.args, {
     cwd: input.cwd,
     env: input.env,
   });
@@ -932,7 +934,11 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
         ...(codexAccountId ? { accountId: codexAccountId } : {}),
         ...(codexEnvironment ? { environment: codexEnvironment } : {}),
       });
-      const { env: codexProcessEnv, authTracking } = buildCodexProcessLaunchContext({
+      const {
+        env: codexProcessEnv,
+        authTracking,
+        appServerArgs,
+      } = buildCodexProcessLaunchContext({
         ...(codexEnvironment ? { env: { ...process.env, ...codexEnvironment } } : {}),
         ...(codexHomePath ? { homePath: codexHomePath } : {}),
         ...(codexShadowHomePath ? { shadowHomePath: codexShadowHomePath } : {}),
@@ -942,6 +948,7 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
         binaryPath: codexBinaryPath,
         cwd: resolvedCwd,
         env: codexProcessEnv,
+        args: appServerArgs,
       });
       const output = readline.createInterface({ input: child.stdout });
 
@@ -1571,7 +1578,11 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
         ...(codexAccountId ? { accountId: codexAccountId } : {}),
         ...(codexEnvironment ? { environment: codexEnvironment } : {}),
       });
-      const { env: codexProcessEnv, authTracking } = buildCodexProcessLaunchContext({
+      const {
+        env: codexProcessEnv,
+        authTracking,
+        appServerArgs,
+      } = buildCodexProcessLaunchContext({
         ...(codexEnvironment ? { env: { ...process.env, ...codexEnvironment } } : {}),
         ...(codexHomePath ? { homePath: codexHomePath } : {}),
         ...(codexShadowHomePath ? { shadowHomePath: codexShadowHomePath } : {}),
@@ -1581,6 +1592,7 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
         binaryPath: codexBinaryPath,
         cwd: resolvedCwd,
         env: codexProcessEnv,
+        args: appServerArgs,
       });
       const output = readline.createInterface({ input: child.stdout });
 
@@ -2277,13 +2289,16 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
         ? { environment: normalizedCodexOptions.environment }
         : {}),
     });
-    const { env: codexProcessEnv, authTracking } = buildCodexProcessLaunchContext(
-      codexProcessEnvInputForOptions(normalizedCodexOptions),
-    );
+    const {
+      env: codexProcessEnv,
+      authTracking,
+      appServerArgs,
+    } = buildCodexProcessLaunchContext(codexProcessEnvInputForOptions(normalizedCodexOptions));
     const child = spawnCodexAppServer({
       binaryPath: codexBinaryPath,
       cwd: normalizedCwd,
       env: codexProcessEnv,
+      args: appServerArgs,
     });
     const output = readline.createInterface({ input: child.stdout });
     const context: CodexSessionContext = {
@@ -3701,7 +3716,10 @@ function assertSupportedCodexCliVersion(input: {
   }
 
   const parsedVersion = parseCodexCliVersion(`${stdout}\n${stderr}`);
-  if (parsedVersion && !isCodexCliVersionSupported(parsedVersion)) {
+  if (!parsedVersion) {
+    throw new Error(CODEX_CLI_UNPARSEABLE_VERSION_MESSAGE);
+  }
+  if (!isCodexCliVersionSupported(parsedVersion)) {
     throw new Error(formatCodexCliUpgradeMessage(parsedVersion));
   }
 }
