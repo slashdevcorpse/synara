@@ -924,8 +924,9 @@ export function projectEvent(
           (entry) => entry.turnId === thread.latestTurn?.turnId,
         )?.checkpointTurnCount;
         const preservesNewerLatestTurn =
-          previousLatestCheckpointTurnCount !== undefined &&
-          previousLatestCheckpointTurnCount > payload.checkpointTurnCount;
+          payload.preserveLatestTurn === true ||
+          (previousLatestCheckpointTurnCount !== undefined &&
+            previousLatestCheckpointTurnCount > payload.checkpointTurnCount);
         const latestTurn = preservesNewerLatestTurn
           ? thread.latestTurn
           : isProviderDiffPlaceholderRef(payload.checkpointRef) &&

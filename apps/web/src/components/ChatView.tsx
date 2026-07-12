@@ -6284,7 +6284,8 @@ export default function ChatView({
       }
       const confirmed = await api.dialogs.confirm(
         [
-          "Undo the file changes shown in this card?",
+          "Undo the latest file changes shown in this card?",
+          "Earlier file changes will remain available to undo.",
           "Messages and provider conversation history will be kept.",
           "This action cannot be undone.",
         ].join("\n"),
@@ -6294,16 +6295,14 @@ export default function ChatView({
       setIsRevertingCheckpoint(true);
       setThreadError(activeThread.id, null);
       try {
-        for (const turnCount of [...new Set(turnCounts)].toSorted((left, right) => right - left)) {
-          await api.orchestration.dispatchCommand({
-            type: "thread.checkpoint.revert",
-            commandId: newCommandId(),
-            threadId: activeThread.id,
-            turnCount,
-            scope: "files",
-            createdAt: new Date().toISOString(),
-          });
-        }
+        await api.orchestration.dispatchCommand({
+          type: "thread.checkpoint.revert",
+          commandId: newCommandId(),
+          threadId: activeThread.id,
+          turnCount: Math.max(...turnCounts),
+          scope: "files",
+          createdAt: new Date().toISOString(),
+        });
       } catch (err) {
         setThreadError(
           activeThread.id,
