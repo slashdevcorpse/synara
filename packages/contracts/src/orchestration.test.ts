@@ -549,6 +549,50 @@ it.effect("decodes pinned-message commands and events", () =>
   }),
 );
 
+it.effect("defaults legacy file-restore failures to no workspace review", () =>
+  Effect.gen(function* () {
+    const event = yield* decodeOrchestrationEvent({
+      sequence: 1,
+      eventId: "event-file-restore-failed",
+      aggregateKind: "thread",
+      aggregateId: "thread-1",
+      type: "thread.checkpoint-files-restore-failed",
+      occurredAt: "2026-01-01T00:00:00.000Z",
+      commandId: "cmd-file-restore-failed",
+      causationEventId: null,
+      correlationId: "cmd-file-restore",
+      metadata: {},
+      payload: {
+        threadId: "thread-1",
+        messageId: "message-1",
+        turnCount: 0,
+        requestCommandId: "cmd-file-restore",
+        detail: "Checkpoint was unavailable.",
+      },
+    });
+
+    assert.strictEqual(event.type, "thread.checkpoint-files-restore-failed");
+    assert.strictEqual(event.payload.requiresWorkspaceReview, false);
+  }),
+);
+
+it.effect("decodes idempotent file-restore reconciliation commands", () =>
+  Effect.gen(function* () {
+    const command = yield* decodeClientOrchestrationCommand({
+      type: "thread.checkpoint.files.restore.reconcile",
+      commandId: "cmd-file-restore-reconcile",
+      requestCommandId: "cmd-file-restore",
+      threadId: "thread-1",
+      messageId: "message-1",
+      turnCount: 0,
+      createdAt: "2026-01-01T00:00:00.000Z",
+    });
+
+    assert.strictEqual(command.type, "thread.checkpoint.files.restore.reconcile");
+    assert.strictEqual(command.requestCommandId, "cmd-file-restore");
+  }),
+);
+
 it.effect("decodes thread marker commands and events", () =>
   Effect.gen(function* () {
     const command = yield* decodeClientOrchestrationCommand({

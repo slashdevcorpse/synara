@@ -178,6 +178,7 @@ const make = Effect.gen(function* () {
     readonly threadId: ThreadId;
     readonly turnCount: number;
     readonly detail: string;
+    readonly requiresWorkspaceReview?: boolean;
     readonly createdAt: string;
     readonly filesRestore?: {
       readonly requestCommandId: CommandId;
@@ -185,7 +186,7 @@ const make = Effect.gen(function* () {
     };
   }) =>
     Effect.gen(function* () {
-      yield* orchestrationEngine.dispatch({
+      const appendActivity = orchestrationEngine.dispatch({
         type: "thread.activity.append",
         commandId: serverCommandId("checkpoint-revert-failure"),
         threadId: input.threadId,
@@ -204,17 +205,42 @@ const make = Effect.gen(function* () {
         createdAt: input.createdAt,
       });
       if (input.filesRestore) {
-        yield* orchestrationEngine.dispatch({
-          type: "thread.checkpoint.files.restore.fail",
-          commandId: serverCommandId("checkpoint-files-restore-failed"),
-          requestCommandId: input.filesRestore.requestCommandId,
+        yield* appendActivity.pipe(Effect.catch(() => Effect.void));
+        yield* appendFilesRestoreFailureTerminal({
           threadId: input.threadId,
-          messageId: input.filesRestore.messageId,
           turnCount: input.turnCount,
           detail: input.detail,
+          requiresWorkspaceReview: input.requiresWorkspaceReview ?? false,
           createdAt: input.createdAt,
+          filesRestore: input.filesRestore,
         });
+        return;
       }
+
+      yield* appendActivity;
+    });
+
+  const appendFilesRestoreFailureTerminal = (input: {
+    readonly threadId: ThreadId;
+    readonly turnCount: number;
+    readonly detail: string;
+    readonly requiresWorkspaceReview: boolean;
+    readonly createdAt: string;
+    readonly filesRestore: {
+      readonly requestCommandId: CommandId;
+      readonly messageId: MessageId;
+    };
+  }) =>
+    orchestrationEngine.dispatch({
+      type: "thread.checkpoint.files.restore.fail",
+      commandId: serverCommandId("checkpoint-files-restore-failed"),
+      requestCommandId: input.filesRestore.requestCommandId,
+      threadId: input.threadId,
+      messageId: input.filesRestore.messageId,
+      turnCount: input.turnCount,
+      detail: input.detail,
+      requiresWorkspaceReview: input.requiresWorkspaceReview,
+      createdAt: input.createdAt,
     });
 
   const appendCaptureFailureActivity = (input: {
@@ -881,6 +907,16 @@ const make = Effect.gen(function* () {
       }).pipe(Effect.catch(() => Effect.void));
       return;
     }
+    if (thread.deletedAt !== null) {
+      yield* appendRevertFailureActivity({
+        threadId: event.payload.threadId,
+        turnCount: event.payload.turnCount,
+        detail: "Thread was deleted before the checkpoint restore could run.",
+        createdAt: now,
+        ...(filesRestore ? { filesRestore } : {}),
+      }).pipe(Effect.catch(() => Effect.void));
+      return;
+    }
 
     const sessionRuntime = yield* resolveSessionRuntimeForThread(event.payload.threadId);
     if (Option.isNone(sessionRuntime)) {
@@ -1033,9 +1069,128 @@ const make = Effect.gen(function* () {
       );
   });
 
+  const failInterruptedFileRestoresOnStart = Effect.fnUntraced(function* () {
+    const events = yield* Stream.runCollect(orchestrationEngine.readEvents(0)).pipe(
+      Effect.map((chunk): OrchestrationEvent[] => Array.from(chunk)),
+    );
+    type RestoreState = {
+      request?: Extract<OrchestrationEvent, { type: "thread.checkpoint-files-restore-requested" }>;
+      reconciliation?: Extract<
+        OrchestrationEvent,
+        { type: "thread.checkpoint-files-restore-reconciliation-requested" }
+      >;
+      terminal: boolean;
+    };
+    const restoreStates = new Map<CommandId, RestoreState>();
+    const stateFor = (requestCommandId: CommandId) => {
+      const existing = restoreStates.get(requestCommandId);
+      if (existing) return existing;
+      const created: RestoreState = { terminal: false };
+      restoreStates.set(requestCommandId, created);
+      return created;
+    };
+
+    for (const event of events) {
+      if (event.type === "thread.checkpoint-files-restore-requested" && event.commandId !== null) {
+        stateFor(event.commandId).request = event;
+        continue;
+      }
+      if (event.type === "thread.checkpoint-files-restore-reconciliation-requested") {
+        stateFor(event.payload.requestCommandId).reconciliation = event;
+        continue;
+      }
+      if (
+        event.type === "thread.checkpoint-files-restored" ||
+        event.type === "thread.checkpoint-files-restore-failed"
+      ) {
+        stateFor(event.payload.requestCommandId).terminal = true;
+      }
+    }
+
+    const now = new Date().toISOString();
+    yield* Effect.forEach(
+      restoreStates.entries(),
+      ([requestCommandId, state]) => {
+        if (state.terminal) return Effect.void;
+        const source = state.request ?? state.reconciliation;
+        if (!source) return Effect.void;
+        return appendFilesRestoreFailureTerminal({
+          threadId: source.payload.threadId,
+          turnCount: source.payload.turnCount,
+          detail: state.request
+            ? "File restore did not finish before Synara restarted. No automatic retry was run; inspect the working tree before continuing."
+            : "Synara restarted before file restore acceptance could be confirmed. No restore was replayed; inspect the working tree before continuing.",
+          requiresWorkspaceReview: true,
+          createdAt: now,
+          filesRestore: {
+            requestCommandId,
+            messageId: source.payload.messageId,
+          },
+        }).pipe(
+          Effect.catch((error) =>
+            Effect.logWarning(
+              "failed to append interrupted checkpoint files restore terminal",
+            ).pipe(
+              Effect.annotateLogs({
+                threadId: source.payload.threadId,
+                requestCommandId,
+                error: error.message,
+              }),
+            ),
+          ),
+        );
+      },
+      { concurrency: 1 },
+    );
+  });
+
+  const readFileRestoreEventState = Effect.fnUntraced(function* (requestCommandId: CommandId) {
+    const events = yield* Stream.runCollect(orchestrationEngine.readEvents(0)).pipe(
+      Effect.map((chunk): OrchestrationEvent[] => Array.from(chunk)),
+    );
+    let requested = false;
+    let terminal = false;
+    for (const event of events) {
+      if (
+        event.type === "thread.checkpoint-files-restore-requested" &&
+        event.commandId === requestCommandId
+      ) {
+        requested = true;
+        continue;
+      }
+      if (
+        (event.type === "thread.checkpoint-files-restored" ||
+          event.type === "thread.checkpoint-files-restore-failed") &&
+        event.payload.requestCommandId === requestCommandId
+      ) {
+        terminal = true;
+      }
+    }
+    return { requested, terminal } as const;
+  });
+
   const processDomainEvent = Effect.fnUntraced(function* (event: OrchestrationEvent) {
     if (event.type === "thread.turn-start-requested" || event.type === "thread.message-sent") {
       yield* ensurePreTurnBaselineFromDomainTurnStart(event);
+      return;
+    }
+
+    if (event.type === "thread.checkpoint-files-restore-reconciliation-requested") {
+      const state = yield* readFileRestoreEventState(event.payload.requestCommandId);
+      if (!state.requested && !state.terminal) {
+        yield* appendFilesRestoreFailureTerminal({
+          threadId: event.payload.threadId,
+          turnCount: event.payload.turnCount,
+          detail:
+            "Synara could not confirm that the file restore was accepted. No restore was replayed; inspect the working tree before continuing.",
+          requiresWorkspaceReview: true,
+          createdAt: new Date().toISOString(),
+          filesRestore: {
+            requestCommandId: event.payload.requestCommandId,
+            messageId: event.payload.messageId,
+          },
+        });
+      }
       return;
     }
 
@@ -1043,12 +1198,21 @@ const make = Effect.gen(function* () {
       event.type === "thread.checkpoint-revert-requested" ||
       event.type === "thread.checkpoint-files-restore-requested"
     ) {
+      if (event.type === "thread.checkpoint-files-restore-requested" && event.commandId !== null) {
+        const state = yield* readFileRestoreEventState(event.commandId);
+        if (state.terminal) {
+          return;
+        }
+      }
       yield* handleRevertRequested(event).pipe(
         Effect.catch((error) =>
           appendRevertFailureActivity({
             threadId: event.payload.threadId,
             turnCount: event.payload.turnCount,
             detail: error.message,
+            ...(event.type === "thread.checkpoint-files-restore-requested"
+              ? { requiresWorkspaceReview: true }
+              : {}),
             createdAt: new Date().toISOString(),
             ...(event.type === "thread.checkpoint-files-restore-requested" &&
             event.commandId !== null
@@ -1127,6 +1291,14 @@ const make = Effect.gen(function* () {
   const worker = yield* makeDrainableWorker(processInputSafely);
 
   const start: CheckpointReactorShape["start"] = Effect.gen(function* () {
+    yield* failInterruptedFileRestoresOnStart().pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("failed to reconcile interrupted file restores on checkpoint startup", {
+          cause: Cause.pretty(cause),
+        }),
+      ),
+    );
+
     yield* Effect.forkScoped(
       Stream.runForEach(orchestrationEngine.streamDomainEvents, (event) => {
         if (
@@ -1134,6 +1306,7 @@ const make = Effect.gen(function* () {
           event.type !== "thread.message-sent" &&
           event.type !== "thread.checkpoint-revert-requested" &&
           event.type !== "thread.checkpoint-files-restore-requested" &&
+          event.type !== "thread.checkpoint-files-restore-reconciliation-requested" &&
           event.type !== "thread.turn-diff-completed"
         ) {
           return Effect.void;

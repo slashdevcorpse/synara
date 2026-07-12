@@ -1371,6 +1371,25 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
       };
     }
 
+    case "thread.checkpoint.files.restore.reconcile": {
+      return {
+        ...withEventBase({
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt: command.createdAt,
+          commandId: command.commandId,
+        }),
+        type: "thread.checkpoint-files-restore-reconciliation-requested",
+        payload: {
+          threadId: command.threadId,
+          messageId: command.messageId,
+          turnCount: command.turnCount,
+          requestCommandId: command.requestCommandId,
+          createdAt: command.createdAt,
+        },
+      };
+    }
+
     case "thread.conversation.rollback": {
       const thread = yield* requireThread({
         readModel,
@@ -1678,7 +1697,9 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
     }
 
     case "thread.checkpoint.files.restore.fail": {
-      yield* requireThread({ readModel, command, threadId: command.threadId });
+      // Correlated failure cleanup must remain appendable even after the owning
+      // thread is deleted. Otherwise restart reconciliation can leave a
+      // destructive files-only restore permanently pending with no safe unlock.
       return {
         ...withEventBase({
           aggregateKind: "thread",
@@ -1693,6 +1714,7 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           turnCount: command.turnCount,
           requestCommandId: command.requestCommandId,
           detail: command.detail,
+          requiresWorkspaceReview: command.requiresWorkspaceReview,
         },
       };
     }

@@ -25,6 +25,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { CheckpointStoreLive } from "../../checkpointing/Layers/CheckpointStore.ts";
 import { CheckpointStore } from "../../checkpointing/Services/CheckpointStore.ts";
+import { CheckpointInvariantError } from "../../checkpointing/Errors.ts";
 import { GitCoreLive } from "../../git/Layers/GitCore.ts";
 import { CheckpointReactorLive } from "./CheckpointReactor.ts";
 import { OrchestrationEngineLive } from "./OrchestrationEngine.ts";
@@ -369,6 +370,7 @@ describe("CheckpointReactor", () => {
       cwd,
       drain,
       startReactor,
+      checkpointStore,
     };
   }
 
@@ -1794,10 +1796,141 @@ describe("CheckpointReactor", () => {
     );
     const failure = events.find((event) => event.type === "thread.checkpoint-files-restore-failed");
     expect(failure?.payload.detail).toContain("No active provider session");
+    expect(failure?.payload.requiresWorkspaceReview).toBe(false);
     expect(harness.provider.rollbackConversation).not.toHaveBeenCalled();
   });
 
-  it("does not replay an ambiguous persisted file restore when the reactor starts", async () => {
+  it("requires workspace review when a restore fails after partially changing files", async () => {
+    const harness = await createHarness();
+    const createdAt = new Date().toISOString();
+    const threadId = ThreadId.makeUnsafe("thread-1");
+    const messageId = MessageId.makeUnsafe("message-partial-file-restore");
+    const requestCommandId = CommandId.makeUnsafe("cmd-partial-file-restore");
+    runGit(harness.cwd, [
+      "update-ref",
+      checkpointRefForThreadMessageStart(threadId, messageId),
+      "HEAD",
+    ]);
+    vi.spyOn(harness.checkpointStore, "restoreCheckpoint").mockImplementation(() =>
+      Effect.sync(() => {
+        fs.writeFileSync(path.join(harness.cwd, "README.md"), "partially restored\n", "utf8");
+      }).pipe(
+        Effect.flatMap(() =>
+          Effect.fail(
+            new CheckpointInvariantError({
+              operation: "CheckpointStore.restoreCheckpoint",
+              detail: "clean failed after restore",
+            }),
+          ),
+        ),
+      ),
+    );
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.checkpoint.files.restore",
+        commandId: requestCommandId,
+        threadId,
+        messageId,
+        turnCount: 0,
+        createdAt,
+      }),
+    );
+    const events = await waitForEvent(
+      harness.engine,
+      (event) =>
+        event.type === "thread.checkpoint-files-restore-failed" &&
+        event.payload.requestCommandId === requestCommandId,
+    );
+    const failure = events.find(
+      (
+        event,
+      ): event is Extract<
+        (typeof events)[number],
+        { type: "thread.checkpoint-files-restore-failed" }
+      > =>
+        event.type === "thread.checkpoint-files-restore-failed" &&
+        event.payload.requestCommandId === requestCommandId,
+    );
+
+    expect(fs.readFileSync(path.join(harness.cwd, "README.md"), "utf8")).toBe(
+      "partially restored\n",
+    );
+    expect(failure?.payload.requiresWorkspaceReview).toBe(true);
+  });
+
+  it("reconciles an unobserved dispatch without allowing a late destructive restore", async () => {
+    const harness = await createHarness();
+    const createdAt = new Date().toISOString();
+    const threadId = ThreadId.makeUnsafe("thread-1");
+    const messageId = MessageId.makeUnsafe("message-ambiguous-dispatch");
+    const requestCommandId = CommandId.makeUnsafe("cmd-ambiguous-dispatch");
+    runGit(harness.cwd, [
+      "update-ref",
+      checkpointRefForThreadMessageStart(threadId, messageId),
+      "HEAD",
+    ]);
+    fs.writeFileSync(path.join(harness.cwd, "README.md"), "newer guarded work\n", "utf8");
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.checkpoint.files.restore.reconcile",
+        commandId: CommandId.makeUnsafe("cmd-reconcile-ambiguous-dispatch"),
+        requestCommandId,
+        threadId,
+        messageId,
+        turnCount: 0,
+        createdAt,
+      }),
+    );
+    const reconciledEvents = await waitForEvent(
+      harness.engine,
+      (event) =>
+        event.type === "thread.checkpoint-files-restore-failed" &&
+        event.payload.requestCommandId === requestCommandId,
+    );
+    const reconciliationFailure = reconciledEvents.find(
+      (
+        event,
+      ): event is Extract<
+        (typeof reconciledEvents)[number],
+        { type: "thread.checkpoint-files-restore-failed" }
+      > =>
+        event.type === "thread.checkpoint-files-restore-failed" &&
+        event.payload.requestCommandId === requestCommandId,
+    );
+    expect(reconciliationFailure?.payload.requiresWorkspaceReview).toBe(true);
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.checkpoint.files.restore",
+        commandId: requestCommandId,
+        threadId,
+        messageId,
+        turnCount: 0,
+        createdAt,
+      }),
+    );
+    await harness.drain();
+
+    expect(fs.readFileSync(path.join(harness.cwd, "README.md"), "utf8")).toBe(
+      "newer guarded work\n",
+    );
+    const allEvents = await Effect.runPromise(
+      Stream.runCollect(harness.engine.readEvents(0)).pipe(
+        Effect.map((chunk) => Array.from(chunk)),
+      ),
+    );
+    expect(
+      allEvents.some(
+        (event) =>
+          event.type === "thread.checkpoint-files-restored" &&
+          event.payload.requestCommandId === requestCommandId,
+      ),
+    ).toBe(false);
+  });
+
+  it("fails an ambiguous persisted file restore without replaying it when the reactor starts", async () => {
     const harness = await createHarness({ startReactor: false });
     const createdAt = new Date().toISOString();
     const threadId = ThreadId.makeUnsafe("thread-1");
@@ -1830,12 +1963,64 @@ describe("CheckpointReactor", () => {
         Effect.map((chunk) => Array.from(chunk)),
       ),
     );
-    expect(
-      events.some(
-        (event) =>
-          event.type === "thread.checkpoint-files-restored" ||
-          event.type === "thread.checkpoint-files-restore-failed",
+    const failure = events.find(
+      (
+        event,
+      ): event is Extract<
+        (typeof events)[number],
+        { type: "thread.checkpoint-files-restore-failed" }
+      > =>
+        event.type === "thread.checkpoint-files-restore-failed" &&
+        event.payload.requestCommandId === CommandId.makeUnsafe("cmd-persisted-files-restore"),
+    );
+    expect(failure?.payload.detail).toContain("No automatic retry was run");
+    expect(failure?.payload.requiresWorkspaceReview).toBe(true);
+    expect(events.some((event) => event.type === "thread.checkpoint-files-restored")).toBe(false);
+  });
+
+  it("persists a correlated terminal failure when the restore thread was deleted", async () => {
+    const harness = await createHarness({ startReactor: false });
+    const createdAt = new Date().toISOString();
+    const threadId = ThreadId.makeUnsafe("thread-1");
+    const requestCommandId = CommandId.makeUnsafe("cmd-deleted-thread-files-restore");
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.checkpoint.files.restore",
+        commandId: requestCommandId,
+        threadId,
+        messageId: MessageId.makeUnsafe("message-deleted-thread-files-restore"),
+        turnCount: 0,
+        createdAt,
+      }),
+    );
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.delete",
+        commandId: CommandId.makeUnsafe("cmd-delete-restore-thread"),
+        threadId,
+      }),
+    );
+
+    await harness.startReactor();
+    await harness.drain();
+
+    const events = await Effect.runPromise(
+      Stream.runCollect(harness.engine.readEvents(0)).pipe(
+        Effect.map((chunk) => Array.from(chunk)),
       ),
-    ).toBe(false);
+    );
+    const failure = events.find(
+      (
+        event,
+      ): event is Extract<
+        (typeof events)[number],
+        { type: "thread.checkpoint-files-restore-failed" }
+      > =>
+        event.type === "thread.checkpoint-files-restore-failed" &&
+        event.payload.requestCommandId === requestCommandId,
+    );
+    expect(failure?.payload.requiresWorkspaceReview).toBe(true);
+    expect(harness.provider.rollbackConversation).not.toHaveBeenCalled();
   });
 });

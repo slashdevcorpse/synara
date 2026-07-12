@@ -4,6 +4,10 @@ import {
   normalizePlanMarkdownForExport,
 } from "../../proposedPlan";
 import { useCopyToClipboard } from "~/hooks/useCopyToClipboard";
+import {
+  CHECKPOINT_FILE_RESTORE_BLOCKED_MESSAGE,
+  hasPendingCheckpointFileRestore,
+} from "~/lib/checkpointFileRestore";
 import { ArrowDownIcon, ArrowUpIcon, CopyIcon } from "~/lib/icons";
 import { cn } from "~/lib/utils";
 import { readNativeApi } from "~/nativeApi";
@@ -57,6 +61,14 @@ export const ProposedPlanActions = memo(function ProposedPlanActions({
         type: "error",
         title: "Workspace path is unavailable",
         description: "This thread does not have a workspace path to download into.",
+      });
+      return;
+    }
+    if (hasPendingCheckpointFileRestore()) {
+      toastManager.add({
+        type: "error",
+        title: "File restore in progress",
+        description: CHECKPOINT_FILE_RESTORE_BLOCKED_MESSAGE,
       });
       return;
     }

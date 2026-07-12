@@ -34,6 +34,10 @@ import {
 import { basenameOfPath } from "~/file-icons";
 import { useTheme } from "~/hooks/useTheme";
 import { getSelectionWithin, type ChatFileReference } from "~/lib/chatReferences";
+import {
+  CHECKPOINT_FILE_RESTORE_BLOCKED_MESSAGE,
+  hasPendingCheckpointFileRestore,
+} from "~/lib/checkpointFileRestore";
 import { resolveDiffThemeName, type DiffThemeName } from "~/lib/diffRendering";
 import { formatFileCommentRange, type FileCommentSelection } from "~/lib/fileComments";
 import { showFileReferenceContextMenu } from "~/lib/fileReferenceContextMenu";
@@ -65,6 +69,7 @@ import { useCodeSelectionAction } from "./chat/useCodeSelectionAction";
 import { LocalImagePreview } from "./LocalImagePreview";
 import { PdfFilePreview } from "./PdfFilePreview";
 import { Skeleton } from "./ui/skeleton";
+import { toastManager } from "./ui/toast";
 
 const MARKDOWN_PREVIEW_EXTENSIONS = new Set([".markdown", ".md", ".mdx"]);
 
@@ -461,6 +466,14 @@ export function WorkspaceFilePreview(props: WorkspaceFilePreviewProps) {
       if (!api) {
         return;
       }
+      if (hasPendingCheckpointFileRestore()) {
+        toastManager.add({
+          type: "error",
+          title: "File restore in progress",
+          description: CHECKPOINT_FILE_RESTORE_BLOCKED_MESSAGE,
+        });
+        return;
+      }
       queryClient.setQueryData(options.queryKey, { ...current, contents: nextContents });
       // The read RPC may have resolved a bare/partial reference (e.g. a clicked
       // `notes.md`) to its real nested path. Write back to that resolved path,
@@ -475,13 +488,16 @@ export function WorkspaceFilePreview(props: WorkspaceFilePreviewProps) {
       latestTaskWriteVersionRef.current.byFile.set(fileKey, writeVersion);
       taskWriteQueueRef.current = taskWriteQueueRef.current
         .catch(() => undefined)
-        .then(() =>
-          api.projects.writeFile({
+        .then(() => {
+          if (hasPendingCheckpointFileRestore()) {
+            throw new Error(CHECKPOINT_FILE_RESTORE_BLOCKED_MESSAGE);
+          }
+          return api.projects.writeFile({
             cwd: workspaceRoot,
             relativePath: writeRelativePath,
             contents: nextContents,
-          }),
-        )
+          });
+        })
         .then(() => undefined)
         .catch(() => {
           if (latestTaskWriteVersionRef.current.byFile.get(fileKey) !== writeVersion) {

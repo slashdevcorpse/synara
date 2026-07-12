@@ -62,6 +62,7 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
   type MouseEvent,
 } from "react";
 import { GoTasklist } from "react-icons/go";
@@ -90,7 +91,22 @@ import {
 } from "~/lib/providerDiscoveryReactQuery";
 import { projectSearchEntriesQueryOptions } from "~/lib/projectReactQuery";
 import { serverConfigQueryOptions, serverQueryKeys } from "~/lib/serverReactQuery";
-import { waitForCheckpointFileRestore } from "~/lib/checkpointFileRestore";
+import {
+  CHECKPOINT_FILE_RESTORE_BLOCKED_MESSAGE,
+  clearPendingCheckpointFileRestore,
+  getCheckpointFileRestoreClientId,
+  getCheckpointFileRestoreStatus,
+  getPendingCheckpointFileRestoreSnapshot,
+  hasPendingCheckpointFileRestore,
+  isCheckpointFileRestoreReviewRequiredError,
+  isStaleCheckpointFileRestoreConfirmation,
+  isDefinitiveDispatchRejection,
+  readPendingCheckpointFileRestore,
+  savePendingCheckpointFileRestore,
+  shouldReconcileCheckpointFileRestoreAcceptance,
+  subscribePendingCheckpointFileRestore,
+  waitForCheckpointFileRestore,
+} from "~/lib/checkpointFileRestore";
 import { useRefreshProviderStatusesNow } from "~/hooks/useProviderStatusRefresh";
 import { SINGLE_CHAT_PANE_SCOPE_ID } from "~/lib/chatPaneScope";
 import {
@@ -1191,7 +1207,20 @@ export default function ChatView({
   const [localDispatch, setLocalDispatch] = useState<LocalDispatchSnapshot | null>(null);
   const failedWorktreeSetupDispatchStartedAtRef = useRef<string | null>(null);
   const [isLocalConnecting, _setIsLocalConnecting] = useState(false);
-  const [isRevertingCheckpoint, setIsRevertingCheckpoint] = useState(false);
+  const pendingCheckpointFileRestoreSnapshot = useSyncExternalStore(
+    subscribePendingCheckpointFileRestore,
+    getPendingCheckpointFileRestoreSnapshot,
+    () => null,
+  );
+  const [isRevertingCheckpointLocal, setIsRevertingCheckpoint] = useState(
+    () => pendingCheckpointFileRestoreSnapshot !== null,
+  );
+  const [checkpointFileRestoreReviewMessage, setCheckpointFileRestoreReviewMessage] = useState<
+    string | null
+  >(null);
+  const checkpointFileRestoreRequiresReview = checkpointFileRestoreReviewMessage !== null;
+  const isRevertingCheckpoint =
+    isRevertingCheckpointLocal || pendingCheckpointFileRestoreSnapshot !== null;
   const [showScrollToBottom, setShowScrollToBottom] = useState(false);
   const [respondingRequestIds, setRespondingRequestIds] = useState<ApprovalRequestId[]>([]);
   const [respondingUserInputRequestIds, setRespondingUserInputRequestIds] = useState<
@@ -2643,7 +2672,7 @@ export default function ChatView({
     activeThreadId === null ? null : `${activeThreadId}:${activeLatestTurn?.turnId ?? "idle"}`;
   const activeTurnInProgress = activeTurnLayoutLive || keepSettledActiveTurnLayout;
   const isComposerApprovalState = activePendingApproval !== null;
-  const isComposerEditorDisabled = isConnecting || isComposerApprovalState;
+  const isComposerEditorDisabled = isConnecting || isComposerApprovalState || isRevertingCheckpoint;
   const canCollapsePastedTextToDraft = shouldEnableComposerPastedTextCollapse({
     isComposerApprovalState,
     hasPendingUserInput: pendingUserInputs.length > 0,
@@ -3775,6 +3804,125 @@ export default function ChatView({
     },
     [setStoreThreadError],
   );
+  const checkpointFileRestoreClientIdRef = useRef(getCheckpointFileRestoreClientId());
+  const isCheckpointFileRestoreGateActiveNow = useCallback(
+    () => isRevertingCheckpointLocal || hasPendingCheckpointFileRestore(),
+    [isRevertingCheckpointLocal],
+  );
+  const assertCheckpointFileRestoreMutationAllowed = useCallback(() => {
+    if (hasPendingCheckpointFileRestore()) {
+      throw new Error(CHECKPOINT_FILE_RESTORE_BLOCKED_MESSAGE);
+    }
+  }, []);
+
+  useEffect(() => {
+    const pending = readPendingCheckpointFileRestore();
+    if (!pending) {
+      setIsRevertingCheckpoint(false);
+      setCheckpointFileRestoreReviewMessage(null);
+      return;
+    }
+    if (isStaleCheckpointFileRestoreConfirmation(pending)) {
+      clearPendingCheckpointFileRestore(pending.requestCommandId);
+      setIsRevertingCheckpoint(false);
+      setThreadError(
+        activeThreadId,
+        "The previous file-restore confirmation was interrupted before dispatch; no files were changed.",
+      );
+      return;
+    }
+
+    let cancelled = false;
+    if (pending.phase === "confirming") {
+      setIsRevertingCheckpoint(pending.clientId === checkpointFileRestoreClientIdRef.current);
+      if (pending.clientId !== checkpointFileRestoreClientIdRef.current) {
+        const reviewMessage =
+          "A file restore confirmation was interrupted before Synara sent it. If no confirmation dialog is still open, inspect the working tree, then use “Review and unlock” before starting new work.";
+        setCheckpointFileRestoreReviewMessage(reviewMessage);
+        setThreadError(activeThreadId ?? pending.threadId, reviewMessage);
+      }
+      return;
+    }
+
+    setIsRevertingCheckpoint(true);
+    setThreadError(
+      activeThreadId ?? pending.threadId,
+      pending.threadId === activeThreadId
+        ? "Reconciling file restore status. Wait for Synara to confirm it is safe to continue."
+        : "A file restore in another thread is still being reconciled. Wait for Synara to confirm it is safe to continue.",
+    );
+    const api = readNativeApi();
+    if (!api) return;
+
+    const completion = waitForCheckpointFileRestore({
+      requestCommandId: pending.requestCommandId,
+      subscribe: api.orchestration.onDomainEvent,
+      getStatus: () =>
+        getCheckpointFileRestoreStatus({
+          api: api.orchestration,
+          threadId: pending.threadId,
+          requestCommandId: pending.requestCommandId,
+        }).then(async (status) => {
+          const reconciliationCommandId = pending.reconciliationCommandId;
+          if (
+            status.status === "not-found" &&
+            reconciliationCommandId !== undefined &&
+            shouldReconcileCheckpointFileRestoreAcceptance(pending)
+          ) {
+            await api.orchestration
+              .dispatchCommand({
+                type: "thread.checkpoint.files.restore.reconcile",
+                commandId: reconciliationCommandId,
+                requestCommandId: pending.requestCommandId,
+                threadId: pending.threadId,
+                messageId: pending.messageId,
+                turnCount: pending.turnCount,
+                createdAt: pending.createdAt,
+              })
+              .catch(() => {
+                // Reconciliation is non-destructive and idempotent. A later
+                // poll retries it after transport recovery.
+              });
+          }
+          return status;
+        }),
+    });
+
+    void completion.promise
+      .then(() => {
+        if (cancelled) return;
+        clearPendingCheckpointFileRestore(pending.requestCommandId);
+        setCheckpointFileRestoreReviewMessage(null);
+        setThreadError(pending.threadId, null);
+        if (activeThreadId && pending.threadId !== activeThreadId) {
+          setThreadError(activeThreadId, null);
+        }
+      })
+      .catch((error: unknown) => {
+        if (cancelled) return;
+        const message = error instanceof Error ? error.message : "Failed to restore file changes.";
+        if (isCheckpointFileRestoreReviewRequiredError(error)) {
+          const reviewMessage = `${message} Inspect the working tree, then use “Review and unlock” before starting new work.`;
+          setCheckpointFileRestoreReviewMessage(reviewMessage);
+          setThreadError(activeThreadId ?? pending.threadId, reviewMessage);
+          return;
+        }
+        clearPendingCheckpointFileRestore(pending.requestCommandId);
+        setCheckpointFileRestoreReviewMessage(null);
+        const failedOnActiveThread = pending.threadId === activeThreadId || !activeThreadId;
+        setThreadError(
+          failedOnActiveThread ? pending.threadId : activeThreadId,
+          failedOnActiveThread
+            ? message
+            : `A pending file restore in another thread failed: ${message}`,
+        );
+      });
+
+    return () => {
+      cancelled = true;
+      completion.cancel();
+    };
+  }, [activeThreadId, pendingCheckpointFileRestoreSnapshot, setThreadError]);
 
   const focusComposer = useCallback(() => {
     // Secondary chrome is deferred during thread switches; replay focus once it
@@ -4357,6 +4505,10 @@ export default function ChatView({
     ): Promise<ProjectScriptRunResult | null> => {
       const api = readNativeApi();
       if (!api || !activeThreadId || !activeProject || !activeThread) return null;
+      if (isCheckpointFileRestoreGateActiveNow()) {
+        setThreadError(activeThreadId, CHECKPOINT_FILE_RESTORE_BLOCKED_MESSAGE);
+        return null;
+      }
       if (options?.rememberAsLastInvoked !== false) {
         setLastInvokedScriptByProjectId((current) => {
           if (current[activeProject.id] === script.id) return current;
@@ -4386,6 +4538,7 @@ export default function ChatView({
       setTerminalFocusRequestId((value) => value + 1);
 
       try {
+        assertCheckpointFileRestoreMutationAllowed();
         const { metadata } = await runProjectCommandInTerminal({
           api,
           threadId: activeThreadId,
@@ -4422,7 +4575,9 @@ export default function ChatView({
       activeProject,
       activeThread,
       activeThreadId,
+      assertCheckpointFileRestoreMutationAllowed,
       gitCwd,
+      isCheckpointFileRestoreGateActiveNow,
       setTerminalOpen,
       setThreadError,
       storeNewTerminal,
@@ -4441,6 +4596,7 @@ export default function ChatView({
       !api ||
       !isServerThread ||
       !activeThread ||
+      isCheckpointFileRestoreGateActiveNow() ||
       activeThread.session === null ||
       activeThread.session.status === "closed"
     ) {
@@ -4453,7 +4609,7 @@ export default function ChatView({
       threadId: activeThread.id,
       createdAt: new Date().toISOString(),
     });
-  }, [activeThread, isServerThread]);
+  }, [activeThread, isCheckpointFileRestoreGateActiveNow, isServerThread]);
   const {
     handoffBusy,
     worktreeHandoffDialogOpen,
@@ -5154,10 +5310,6 @@ export default function ChatView({
   }, [composerMenuItems, composerMenuOpen]);
 
   useEffect(() => {
-    setIsRevertingCheckpoint(false);
-  }, [activeThread?.id]);
-
-  useEffect(() => {
     if (!activeThread?.id || terminalState.terminalOpen || isInactiveSplitPane) return;
     const frame = window.requestAnimationFrame(() => {
       focusComposer();
@@ -5695,14 +5847,14 @@ export default function ChatView({
 
   const onInterrupt = useCallback(async () => {
     const api = readNativeApi();
-    if (!api || !activeThread) return;
+    if (!api || !activeThread || isCheckpointFileRestoreGateActiveNow()) return;
     await api.orchestration.dispatchCommand({
       type: "thread.turn.interrupt",
       commandId: newCommandId(),
       threadId: activeThread.id,
       createdAt: new Date().toISOString(),
     });
-  }, [activeThread]);
+  }, [activeThread, isCheckpointFileRestoreGateActiveNow]);
 
   useEffect(() => {
     if (surfaceMode === "split" && !isFocusedPane) {
@@ -6231,38 +6383,97 @@ export default function ChatView({
   const onRevertToTurnCount = useCallback(
     async (turnCount: number, scope?: "files", messageId?: MessageId) => {
       const api = readNativeApi();
-      if (!api || !activeThread || isRevertingCheckpoint) return;
+      if (
+        !api ||
+        !activeThread ||
+        isRevertingCheckpoint ||
+        isCheckpointFileRestoreGateActiveNow()
+      ) {
+        return;
+      }
       if (scope === "files" && messageId === undefined) return;
 
       if (hasLiveTurn || isSendBusy || isConnecting) {
         setThreadError(activeThread.id, "Interrupt the current turn before reverting checkpoints.");
         return;
       }
-      const confirmed = await api.dialogs.confirm(
+      const commandId = newCommandId();
+      const pendingConfirmation =
         scope === "files"
-          ? [
-              "Undo these file changes?",
-              "Files will be restored to their state before this turn. Your chat history will stay.",
-              "This action cannot be undone.",
-            ].join("\n")
-          : [
-              `Revert this thread to checkpoint ${turnCount}?`,
-              "This will discard newer messages and turn diffs in this thread.",
-              "This action cannot be undone.",
-            ].join("\n"),
-      );
+          ? {
+              threadId: activeThread.id,
+              messageId: messageId!,
+              turnCount,
+              requestCommandId: commandId,
+              reconciliationCommandId: newCommandId(),
+              createdAt: new Date().toISOString(),
+              phase: "confirming" as const,
+              clientId: checkpointFileRestoreClientIdRef.current,
+            }
+          : null;
+      if (pendingConfirmation && !savePendingCheckpointFileRestore(pendingConfirmation)) {
+        setThreadError(
+          activeThread.id,
+          "Another file restore is already pending, or its safety lock could not be persisted.",
+        );
+        return;
+      }
+      if (pendingConfirmation) {
+        setIsRevertingCheckpoint(true);
+      }
+      let confirmed = false;
+      try {
+        confirmed = await api.dialogs.confirm(
+          scope === "files"
+            ? [
+                "Undo these file changes?",
+                "Files will be restored to their state before this turn. Your chat history will stay.",
+                "This action cannot be undone.",
+              ].join("\n")
+            : [
+                `Revert this thread to checkpoint ${turnCount}?`,
+                "This will discard newer messages and turn diffs in this thread.",
+                "This action cannot be undone.",
+              ].join("\n"),
+        );
+      } catch (error) {
+        if (pendingConfirmation) {
+          clearPendingCheckpointFileRestore(commandId);
+          setIsRevertingCheckpoint(false);
+        }
+        setThreadError(
+          activeThread.id,
+          error instanceof Error ? error.message : "Could not confirm the file restore.",
+        );
+        return;
+      }
       if (!confirmed) {
+        if (pendingConfirmation) {
+          clearPendingCheckpointFileRestore(commandId);
+          setIsRevertingCheckpoint(false);
+        }
         return;
       }
 
       setIsRevertingCheckpoint(true);
       setThreadError(activeThread.id, null);
-      const commandId = newCommandId();
       if (scope === "files") {
-        const completion = waitForCheckpointFileRestore({
-          requestCommandId: commandId,
-          subscribe: api.orchestration.onDomainEvent,
-        });
+        const storedPending = readPendingCheckpointFileRestore();
+        if (storedPending?.requestCommandId !== commandId || storedPending.phase !== "confirming") {
+          setIsRevertingCheckpoint(false);
+          setThreadError(activeThread.id, CHECKPOINT_FILE_RESTORE_BLOCKED_MESSAGE);
+          return;
+        }
+        const pendingRestore = {
+          ...pendingConfirmation!,
+          phase: "dispatched" as const,
+        };
+        if (!savePendingCheckpointFileRestore(pendingRestore)) {
+          clearPendingCheckpointFileRestore(commandId);
+          setThreadError(activeThread.id, "The file restore safety lock could not be updated.");
+          setIsRevertingCheckpoint(false);
+          return;
+        }
         try {
           await api.orchestration.dispatchCommand({
             type: "thread.checkpoint.files.restore",
@@ -6270,28 +6481,33 @@ export default function ChatView({
             threadId: activeThread.id,
             messageId: messageId!,
             turnCount,
-            createdAt: new Date().toISOString(),
+            createdAt: pendingRestore.createdAt,
           });
-        } catch {
+        } catch (error) {
+          if (isDefinitiveDispatchRejection(error)) {
+            clearPendingCheckpointFileRestore(commandId);
+            setThreadError(
+              activeThread.id,
+              error instanceof Error ? error.message : "File restore was rejected.",
+            );
+            setIsRevertingCheckpoint(false);
+            return;
+          }
           // The request may have been accepted before the transport failed.
-          // Keep the destructive-operation gate closed until a durable terminal
-          // event arrives; reconnecting is the explicit escape hatch.
+          // Keep the destructive-operation gate closed until durable state
+          // proves success or failure.
+          void savePendingCheckpointFileRestore({
+            ...pendingRestore,
+            acceptanceAmbiguous: true,
+          });
           setThreadError(
             activeThread.id,
-            "File restore status is indeterminate. Wait for completion or reconnect before continuing.",
+            "File restore status is indeterminate. Wait for Synara to confirm it is safe to continue.",
           );
         }
-        try {
-          await completion.promise;
-          setThreadError(activeThread.id, null);
-        } catch (err) {
-          setThreadError(
-            activeThread.id,
-            err instanceof Error ? err.message : "Failed to restore file changes.",
-          );
-        }
-        completion.cancel();
-        setIsRevertingCheckpoint(false);
+
+        // The single lifecycle reconciler above owns correlated completion,
+        // reconnect polling, cleanup, and the mutation gate for every pane.
         return;
       }
 
@@ -6311,7 +6527,15 @@ export default function ChatView({
       }
       setIsRevertingCheckpoint(false);
     },
-    [activeThread, hasLiveTurn, isConnecting, isRevertingCheckpoint, isSendBusy, setThreadError],
+    [
+      activeThread,
+      hasLiveTurn,
+      isCheckpointFileRestoreGateActiveNow,
+      isConnecting,
+      isRevertingCheckpoint,
+      isSendBusy,
+      setThreadError,
+    ],
   );
 
   const onCreateHandoffThread = useCallback(
@@ -6866,6 +7090,8 @@ export default function ChatView({
       !activeThread ||
       isSendBusy ||
       isConnecting ||
+      isRevertingCheckpoint ||
+      isCheckpointFileRestoreGateActiveNow() ||
       isVoiceTranscribing ||
       sendPreflightInFlightRef.current ||
       sendInFlightRef.current
@@ -7067,6 +7293,13 @@ export default function ChatView({
         cwd: activeProject.cwd,
         generateIntent: (request) => api.server.generateAutomationIntent(request),
       });
+      if (isCheckpointFileRestoreGateActiveNow()) {
+        setThreadError(
+          activeThread.id,
+          "A file restore started during send preparation. Wait for reconciliation before retrying.",
+        );
+        return false;
+      }
       // Drop a stale resolve: bail if the user switched threads, or cancelled/changed the
       // setup, while generateAutomationIntent was awaiting.
       if (
@@ -7166,6 +7399,13 @@ export default function ChatView({
         if (!preparedAutomation) {
           return true;
         }
+        if (isCheckpointFileRestoreGateActiveNow()) {
+          setThreadError(
+            activeThread.id,
+            "A file restore started during automation preparation. Wait before creating it.",
+          );
+          return false;
+        }
         await createAutomationFromForm({
           form: preparedAutomation.form,
           warnings: automationDraft.warnings,
@@ -7196,6 +7436,13 @@ export default function ChatView({
         sendPreflightInFlightRef.current = false;
       }
     })();
+    if (isCheckpointFileRestoreGateActiveNow()) {
+      setThreadError(
+        activeThread.id,
+        "A file restore started during send preparation. Wait for reconciliation before retrying.",
+      );
+      return false;
+    }
     if (!sendProviderAvailability.usable) {
       toastManager.add({
         type: "error",
@@ -7215,6 +7462,13 @@ export default function ChatView({
           image: null,
         }),
       );
+    if (isCheckpointFileRestoreGateActiveNow()) {
+      setThreadError(
+        activeThread.id,
+        "A file restore started during send preparation. Wait for reconciliation before retrying.",
+      );
+      return false;
+    }
     if (browserPromptAttachment.image) {
       const nextAttachmentCount =
         composerImagesForSend.length +
@@ -7248,8 +7502,6 @@ export default function ChatView({
     }
 
     if (hasLiveTurn && dispatchMode === "queue" && queuedChatTurn === null) {
-      clearComposerInput(activeThread.id);
-      scheduleComposerFocus();
       const queuedImagesForPersistence = await Promise.all(
         composerImagesForSend.map(async (image) => {
           try {
@@ -7262,6 +7514,15 @@ export default function ChatView({
           }
         }),
       );
+      if (isCheckpointFileRestoreGateActiveNow()) {
+        setThreadError(
+          activeThread.id,
+          "A file restore started while the queued turn was being prepared. Retry after reconciliation.",
+        );
+        return false;
+      }
+      clearComposerInput(activeThread.id);
+      scheduleComposerFocus();
       enqueueQueuedComposerTurn(activeThread.id, {
         id: randomUUID(),
         kind: "chat",
@@ -7459,6 +7720,14 @@ export default function ChatView({
       : null;
     const worktreeSetupScriptName = setupScriptForWorktree?.name ?? null;
 
+    if (isCheckpointFileRestoreGateActiveNow()) {
+      setThreadError(
+        threadIdForSend,
+        "A file restore started during send preparation. Wait for reconciliation before retrying.",
+      );
+      return false;
+    }
+
     sendInFlightRef.current = true;
     beginLocalDispatch(
       baseBranchForWorktree
@@ -7591,8 +7860,12 @@ export default function ChatView({
     let createdServerThreadForLocalDraft = false;
     let turnStartSucceeded = false;
     await (async () => {
+      const throwIfFileRestoreStarted = () => {
+        assertCheckpointFileRestoreMutationAllowed();
+      };
       // On first message: lock in branch + create worktree if needed.
       if (baseBranchForWorktree) {
+        throwIfFileRestoreStarted();
         const result = await createWorktreeMutation.mutateAsync({
           cwd: targetProjectCwdForSend,
           branch: baseBranchForWorktree,
@@ -7609,6 +7882,7 @@ export default function ChatView({
           worktreePath: result.worktree.path,
         });
         if (isServerThread) {
+          throwIfFileRestoreStarted();
           await api.orchestration.dispatchCommand({
             type: "thread.meta.update",
             commandId: newCommandId(),
@@ -7641,6 +7915,7 @@ export default function ChatView({
       );
 
       if (isLocalDraftThread) {
+        throwIfFileRestoreStarted();
         const inheritedProjectInstructions =
           useProjectInstructionsStore.getState().instructionsByProjectId[targetProjectIdForSend] ??
           "";
@@ -7678,6 +7953,7 @@ export default function ChatView({
           }
         }
         if (targetProjectKindForSend === "chat") {
+          throwIfFileRestoreStarted();
           await api.orchestration.dispatchCommand({
             type: "project.meta.update",
             commandId: newCommandId(),
@@ -7699,6 +7975,7 @@ export default function ChatView({
           }
         }
         if (shouldRunSetupScript) {
+          throwIfFileRestoreStarted();
           beginLocalDispatch({
             worktreeSetupStepId: "run-setup-action",
             setupScriptName: setupScript.name,
@@ -7722,6 +7999,7 @@ export default function ChatView({
       }
 
       if (isServerThread) {
+        throwIfFileRestoreStarted();
         await persistThreadSettingsForNextTurn({
           threadId: threadIdForSend,
           createdAt: messageCreatedAt,
@@ -7737,6 +8015,7 @@ export default function ChatView({
           : undefined,
       );
       const turnAttachments = await turnAttachmentsPromise;
+      throwIfFileRestoreStarted();
       rememberCustomBinaryPathForDispatch({
         threadId: threadIdForSend,
         provider: selectedModelSelectionForSend.provider,
@@ -7856,7 +8135,7 @@ export default function ChatView({
   const onRespondToApproval = useCallback(
     async (requestId: ApprovalRequestId, decision: ProviderApprovalDecision) => {
       const api = readNativeApi();
-      if (!api || !activeThreadId) return;
+      if (!api || !activeThreadId || isCheckpointFileRestoreGateActiveNow()) return;
 
       setRespondingRequestIds((existing) =>
         existing.includes(requestId) ? existing : [...existing, requestId],
@@ -7885,13 +8164,19 @@ export default function ChatView({
         });
       setRespondingRequestIds((existing) => existing.filter((id) => id !== requestId));
     },
-    [activeThreadId, runtimeMode, setComposerDraftRuntimeMode, setStoreThreadError],
+    [
+      activeThreadId,
+      isCheckpointFileRestoreGateActiveNow,
+      runtimeMode,
+      setComposerDraftRuntimeMode,
+      setStoreThreadError,
+    ],
   );
 
   const onRespondToUserInput = useCallback(
     async (requestId: ApprovalRequestId, answers: ProviderUserInputAnswers) => {
       const api = readNativeApi();
-      if (!api || !activeThreadId) return;
+      if (!api || !activeThreadId || isCheckpointFileRestoreGateActiveNow()) return;
       const dispatchAnswers = hasCompletePendingUserInputAnswers(answers)
         ? answers
         : omitNullPendingUserInputAnswers(answers);
@@ -7916,11 +8201,15 @@ export default function ChatView({
         });
       setRespondingUserInputRequestIds((existing) => existing.filter((id) => id !== requestId));
     },
-    [activeThreadId, setStoreThreadError],
+    [activeThreadId, isCheckpointFileRestoreGateActiveNow, setStoreThreadError],
   );
 
   const onCancelActivePendingUserInput = useCallback(() => {
-    if (!activePendingUserInput || activePendingIsResponding) {
+    if (
+      !activePendingUserInput ||
+      activePendingIsResponding ||
+      isCheckpointFileRestoreGateActiveNow()
+    ) {
       return;
     }
     promptRef.current = "";
@@ -7928,7 +8217,13 @@ export default function ChatView({
     setComposerCursor(0);
     setComposerTrigger(null);
     void onRespondToUserInput(activePendingUserInput.requestId, {});
-  }, [activePendingIsResponding, activePendingUserInput, onRespondToUserInput, setPrompt]);
+  }, [
+    activePendingIsResponding,
+    activePendingUserInput,
+    isCheckpointFileRestoreGateActiveNow,
+    onRespondToUserInput,
+    setPrompt,
+  ]);
 
   const setActivePendingUserInputQuestionIndex = useCallback(
     (nextQuestionIndex: number) => {
@@ -7945,7 +8240,7 @@ export default function ChatView({
 
   const onToggleActivePendingUserInputOption = useCallback(
     (questionId: string, optionLabel: string) => {
-      if (!activePendingUserInput) {
+      if (!activePendingUserInput || isCheckpointFileRestoreGateActiveNow()) {
         return null;
       }
       const question = activePendingUserInput.questions.find((entry) => entry.id === questionId);
@@ -7976,7 +8271,7 @@ export default function ChatView({
       setComposerTrigger(null);
       return nextDraftAnswer;
     },
-    [activePendingUserInput],
+    [activePendingUserInput, isCheckpointFileRestoreGateActiveNow],
   );
 
   const onChangeActivePendingUserInputCustomAnswer = useCallback(
@@ -7987,7 +8282,7 @@ export default function ChatView({
       expandedCursor: number,
       cursorAdjacentToMention: boolean,
     ) => {
-      if (!activePendingUserInput) {
+      if (!activePendingUserInput || isCheckpointFileRestoreGateActiveNow()) {
         return;
       }
       promptRef.current = value;
@@ -8014,12 +8309,16 @@ export default function ChatView({
         cursorAdjacentToMention ? null : detectComposerTrigger(value, expandedCursor),
       );
     },
-    [activePendingUserInput],
+    [activePendingUserInput, isCheckpointFileRestoreGateActiveNow],
   );
 
   const onAdvanceActivePendingUserInput = useCallback(
     (answerOverrides?: Record<string, PendingUserInputDraftAnswer>): boolean => {
-      if (!activePendingUserInput || !activePendingProgress) {
+      if (
+        !activePendingUserInput ||
+        !activePendingProgress ||
+        isCheckpointFileRestoreGateActiveNow()
+      ) {
         return false;
       }
       const pendingDraftAnswers =
@@ -8065,17 +8364,22 @@ export default function ChatView({
       activePendingDraftAnswers,
       activePendingProgress,
       activePendingUserInput,
+      isCheckpointFileRestoreGateActiveNow,
       onRespondToUserInput,
       setActivePendingUserInputQuestionIndex,
     ],
   );
 
   const onPreviousActivePendingUserInputQuestion = useCallback(() => {
-    if (!activePendingProgress) {
+    if (!activePendingProgress || isCheckpointFileRestoreGateActiveNow()) {
       return;
     }
     setActivePendingUserInputQuestionIndex(Math.max(activePendingProgress.questionIndex - 1, 0));
-  }, [activePendingProgress, setActivePendingUserInputQuestionIndex]);
+  }, [
+    activePendingProgress,
+    isCheckpointFileRestoreGateActiveNow,
+    setActivePendingUserInputQuestionIndex,
+  ]);
 
   async function onSubmitPlanFollowUp({
     text,
@@ -8095,6 +8399,8 @@ export default function ChatView({
       !isServerThread ||
       isSendBusy ||
       isConnecting ||
+      isRevertingCheckpoint ||
+      isCheckpointFileRestoreGateActiveNow() ||
       sendInFlightRef.current
     ) {
       return false;
@@ -8140,6 +8446,11 @@ export default function ChatView({
         runtimeMode: queuedTurn?.runtimeMode ?? runtimeMode,
         interactionMode: nextInteractionMode,
       });
+      if (isCheckpointFileRestoreGateActiveNow()) {
+        throw new Error(
+          "A file restore started while this plan follow-up was being prepared. Retry after reconciliation.",
+        );
+      }
 
       // Keep the mode toggle and plan-follow-up banner in sync immediately
       // while the same-thread implementation turn is starting.
@@ -8214,7 +8525,13 @@ export default function ChatView({
   const onEditUserMessage = useCallback(
     async (messageId: MessageId, text: string): Promise<boolean> => {
       const api = readNativeApi();
-      if (!api || !activeThread || !isServerThread || isRevertingCheckpoint) {
+      if (
+        !api ||
+        !activeThread ||
+        !isServerThread ||
+        isRevertingCheckpoint ||
+        isCheckpointFileRestoreGateActiveNow()
+      ) {
         return false;
       }
       const editTarget = resolveTailUserMessageEditTarget({
@@ -8287,6 +8604,7 @@ export default function ChatView({
     [
       activeThread,
       isConnecting,
+      isCheckpointFileRestoreGateActiveNow,
       isRevertingCheckpoint,
       isSendBusy,
       isServerThread,
@@ -8390,6 +8708,8 @@ export default function ChatView({
       phase === "disconnected" ||
       isSendBusy ||
       isConnecting ||
+      isRevertingCheckpoint ||
+      isCheckpointFileRestoreGateActiveNow() ||
       queuedSteerGate !== null ||
       activePendingApproval !== null ||
       activePendingProgress !== null ||
@@ -8427,6 +8747,8 @@ export default function ChatView({
     dispatchQueuedComposerTurn,
     phase,
     isConnecting,
+    isCheckpointFileRestoreGateActiveNow,
+    isRevertingCheckpoint,
     isSendBusy,
     pendingUserInputs.length,
     hasLiveTurn,
@@ -8447,6 +8769,8 @@ export default function ChatView({
       !isServerThread ||
       isSendBusy ||
       isConnecting ||
+      isRevertingCheckpoint ||
+      isCheckpointFileRestoreGateActiveNow() ||
       sendInFlightRef.current
     ) {
       return;
@@ -8562,6 +8886,8 @@ export default function ChatView({
     activeThreadAssociatedWorktree,
     beginLocalDispatch,
     isConnecting,
+    isCheckpointFileRestoreGateActiveNow,
+    isRevertingCheckpoint,
     isSendBusy,
     isServerThread,
     navigate,
@@ -9872,6 +10198,25 @@ export default function ChatView({
     if (!activeThread) return;
     setThreadError(activeThread.id, null);
   }, [activeThread, setThreadError]);
+  const acknowledgeCheckpointFileRestoreReview = useCallback(async () => {
+    const pending = readPendingCheckpointFileRestore();
+    const api = readNativeApi();
+    if (!pending || !api) return;
+    const confirmed = await api.dialogs.confirm(
+      [
+        "Review the working tree before unlocking",
+        "Synara restarted while Undo may have been modifying files. Inspect git status and the working tree for partial changes first.",
+        "Confirm only when you are ready to allow new file-changing actions.",
+      ].join("\n"),
+    );
+    if (!confirmed) return;
+    clearPendingCheckpointFileRestore(pending.requestCommandId);
+    setCheckpointFileRestoreReviewMessage(null);
+    setThreadError(pending.threadId, null);
+    if (activeThreadId !== pending.threadId) {
+      setThreadError(activeThreadId, null);
+    }
+  }, [activeThreadId, setThreadError]);
   const dismissActiveProviderHealthBanner = useCallback(() => {
     if (!activeProviderHealthBannerDismissalKey) return;
     setDismissedProviderHealthBannerKeys((current) => {
@@ -10268,6 +10613,7 @@ export default function ChatView({
                     approval={activePendingApproval}
                     pendingCount={pendingApprovals.length}
                     isResponding={respondingRequestIds.includes(activePendingApproval.requestId)}
+                    disabled={isRevertingCheckpoint}
                     onRespond={onRespondToApproval}
                   />
                 </div>
@@ -10278,6 +10624,7 @@ export default function ChatView({
                     respondingRequestIds={respondingUserInputRequestIds}
                     answers={activePendingDraftAnswers}
                     questionIndex={activePendingQuestionIndex}
+                    disabled={isRevertingCheckpoint}
                     onToggleOption={onToggleActivePendingUserInputOption}
                     onAdvance={onAdvanceActivePendingUserInput}
                     onPrevious={onPreviousActivePendingUserInputQuestion}
@@ -10519,7 +10866,12 @@ export default function ChatView({
                       {!isVoiceRecording && !isVoiceTranscribing ? composerPickerControls : null}
                       {showVoiceNotesControl && (isVoiceRecording || isVoiceTranscribing) ? (
                         <ComposerVoiceRecorderBar
-                          disabled={isComposerApprovalState || isConnecting || isSendBusy}
+                          disabled={
+                            isComposerApprovalState ||
+                            isConnecting ||
+                            isSendBusy ||
+                            isRevertingCheckpoint
+                          }
                           isRecording={isVoiceRecording}
                           isTranscribing={isVoiceTranscribing}
                           durationLabel={voiceRecordingDurationLabel}
@@ -10542,6 +10894,7 @@ export default function ChatView({
                           size="sm"
                           className="rounded-full px-4"
                           disabled={
+                            isRevertingCheckpoint ||
                             activePendingIsResponding ||
                             (activePendingProgress.isLastQuestion
                               ? !activePendingResolvedAnswers
@@ -10560,6 +10913,7 @@ export default function ChatView({
                           variant="prominent"
                           size="icon-xs"
                           className="sm:size-[26px]"
+                          disabled={isRevertingCheckpoint}
                           onClick={() => void onInterrupt()}
                           aria-label="Stop generation"
                           title="Stop the current response. On Mac, press Ctrl+C to interrupt."
@@ -10578,7 +10932,7 @@ export default function ChatView({
                               type="submit"
                               size="sm"
                               className="h-9 rounded-full px-4 sm:h-8"
-                              disabled={isSendBusy || isConnecting}
+                              disabled={isSendBusy || isConnecting || isRevertingCheckpoint}
                             >
                               {isConnecting || isSendBusy ? "Sending..." : "Refine"}
                             </Button>
@@ -10588,7 +10942,7 @@ export default function ChatView({
                                 type="submit"
                                 size="sm"
                                 className="h-9 rounded-l-full rounded-r-none px-4 sm:h-8"
-                                disabled={isSendBusy || isConnecting}
+                                disabled={isSendBusy || isConnecting || isRevertingCheckpoint}
                               >
                                 {isConnecting || isSendBusy ? "Sending..." : "Implement"}
                               </Button>
@@ -10600,7 +10954,7 @@ export default function ChatView({
                                       variant="default"
                                       className="h-9 rounded-l-none rounded-r-full border-l-white/12 px-2 sm:h-8"
                                       aria-label="Implementation actions"
-                                      disabled={isSendBusy || isConnecting}
+                                      disabled={isSendBusy || isConnecting || isRevertingCheckpoint}
                                     />
                                   }
                                 >
@@ -10608,7 +10962,7 @@ export default function ChatView({
                                 </MenuTrigger>
                                 <MenuPopup align="end" side="top">
                                   <MenuItem
-                                    disabled={isSendBusy || isConnecting}
+                                    disabled={isSendBusy || isConnecting || isRevertingCheckpoint}
                                     onClick={() => void onImplementPlanInNewThread()}
                                   >
                                     Implement in a new thread
@@ -10621,7 +10975,12 @@ export default function ChatView({
                           <>
                             {showVoiceNotesControl ? (
                               <ComposerVoiceButton
-                                disabled={isComposerApprovalState || isConnecting || isSendBusy}
+                                disabled={
+                                  isComposerApprovalState ||
+                                  isConnecting ||
+                                  isSendBusy ||
+                                  isRevertingCheckpoint
+                                }
                                 isRecording={isVoiceRecording}
                                 isTranscribing={isVoiceTranscribing}
                                 durationLabel={voiceRecordingDurationLabel}
@@ -10636,19 +10995,22 @@ export default function ChatView({
                               disabled={
                                 isSendBusy ||
                                 isConnecting ||
+                                isRevertingCheckpoint ||
                                 isVoiceTranscribing ||
                                 !composerSendState.hasSendableContent
                               }
                               aria-label={
-                                isConnecting
-                                  ? "Connecting"
-                                  : isVoiceTranscribing
-                                    ? "Transcribing voice note"
-                                    : isPreparingWorktree
-                                      ? "Preparing worktree"
-                                      : isSendBusy
-                                        ? "Sending"
-                                        : "Send message"
+                                isRevertingCheckpoint
+                                  ? "Restoring files"
+                                  : isConnecting
+                                    ? "Connecting"
+                                    : isVoiceTranscribing
+                                      ? "Transcribing voice note"
+                                      : isPreparingWorktree
+                                        ? "Preparing worktree"
+                                        : isSendBusy
+                                          ? "Sending"
+                                          : "Send message"
                               }
                             >
                               {isConnecting || isSendBusy ? (
@@ -10860,7 +11222,15 @@ export default function ChatView({
         status={shouldShowProviderHealthBanner ? visibleActiveProviderStatus : null}
         onDismiss={dismissActiveProviderHealthBanner}
       />
-      <ThreadErrorBanner error={activeThread.error} onDismiss={dismissActiveThreadError} />
+      <ThreadErrorBanner
+        error={checkpointFileRestoreReviewMessage ?? activeThread.error}
+        {...(checkpointFileRestoreRequiresReview
+          ? {
+              actionLabel: "Review and unlock",
+              onAction: () => void acknowledgeCheckpointFileRestoreReview(),
+            }
+          : { onDismiss: dismissActiveThreadError })}
+      />
       <RateLimitBanner
         rateLimitStatus={visibleActiveRateLimitStatus}
         onDismiss={dismissActiveRateLimitBanner}

@@ -18,6 +18,7 @@ interface ComposerPendingApprovalPanelProps {
   approval: PendingApproval;
   pendingCount: number;
   isResponding: boolean;
+  disabled?: boolean;
   onRespond: (requestId: ApprovalRequestId, decision: ProviderApprovalDecision) => Promise<void>;
 }
 
@@ -74,6 +75,7 @@ export const ComposerPendingApprovalPanel = memo(function ComposerPendingApprova
   approval,
   pendingCount,
   isResponding,
+  disabled = false,
   onRespond,
 }: ComposerPendingApprovalPanelProps) {
   const parsed = useMemo(() => parseApprovalDetail(approval.detail), [approval.detail]);
@@ -82,7 +84,7 @@ export const ComposerPendingApprovalPanel = memo(function ComposerPendingApprova
   // Digit shortcuts bubble from focused controls inside this card only; a bare
   // number key elsewhere in the app must never approve a tool request.
   const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
-    if (isResponding || event.metaKey || event.ctrlKey || event.altKey) return;
+    if (disabled || isResponding || event.metaKey || event.ctrlKey || event.altKey) return;
     const target = event.target;
     if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) return;
     if (
@@ -128,8 +130,12 @@ export const ComposerPendingApprovalPanel = memo(function ComposerPendingApprova
             label={action.label}
             description={action.description}
             tone={action.tone}
-            disabled={isResponding}
-            onSelect={() => void onRespond(requestId, action.decision)}
+            disabled={disabled || isResponding}
+            onSelect={() => {
+              if (!disabled && !isResponding) {
+                void onRespond(requestId, action.decision);
+              }
+            }}
           />
         ))}
       </div>

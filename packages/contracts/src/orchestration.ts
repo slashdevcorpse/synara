@@ -1157,6 +1157,16 @@ const ThreadCheckpointFilesRestoreCommand = Schema.Struct({
   createdAt: IsoDateTime,
 });
 
+const ThreadCheckpointFilesRestoreReconcileCommand = Schema.Struct({
+  type: Schema.Literal("thread.checkpoint.files.restore.reconcile"),
+  commandId: CommandId,
+  requestCommandId: CommandId,
+  threadId: ThreadId,
+  messageId: MessageId,
+  turnCount: NonNegativeInt,
+  createdAt: IsoDateTime,
+});
+
 const ThreadConversationRollbackCommand = Schema.Struct({
   type: Schema.Literal("thread.conversation.rollback"),
   commandId: CommandId,
@@ -1222,6 +1232,7 @@ const DispatchableClientOrchestrationCommand = Schema.Union([
   ThreadUserInputRespondCommand,
   ThreadCheckpointRevertCommand,
   ThreadCheckpointFilesRestoreCommand,
+  ThreadCheckpointFilesRestoreReconcileCommand,
   ThreadMessageEditAndResendCommand,
   ThreadActivityAppendCommand,
   ThreadSessionStopCommand,
@@ -1256,6 +1267,7 @@ export const ClientOrchestrationCommand = Schema.Union([
   ThreadUserInputRespondCommand,
   ThreadCheckpointRevertCommand,
   ThreadCheckpointFilesRestoreCommand,
+  ThreadCheckpointFilesRestoreReconcileCommand,
   ThreadMessageEditAndResendCommand,
   ThreadActivityAppendCommand,
   ThreadSessionStopCommand,
@@ -1345,6 +1357,7 @@ const ThreadCheckpointFilesRestoreFailCommand = Schema.Struct({
   messageId: MessageId,
   turnCount: NonNegativeInt,
   detail: TrimmedNonEmptyString,
+  requiresWorkspaceReview: Schema.Boolean,
   createdAt: IsoDateTime,
 });
 
@@ -1410,6 +1423,7 @@ export const OrchestrationEventType = Schema.Literals([
   "thread.user-input-response-requested",
   "thread.checkpoint-revert-requested",
   "thread.checkpoint-files-restore-requested",
+  "thread.checkpoint-files-restore-reconciliation-requested",
   "thread.checkpoint-files-restored",
   "thread.checkpoint-files-restore-failed",
   "thread.reverted",
@@ -1683,6 +1697,14 @@ export const ThreadCheckpointFilesRestoreRequestedPayload = Schema.Struct({
   createdAt: IsoDateTime,
 });
 
+export const ThreadCheckpointFilesRestoreReconciliationRequestedPayload = Schema.Struct({
+  threadId: ThreadId,
+  messageId: MessageId,
+  turnCount: NonNegativeInt,
+  requestCommandId: CommandId,
+  createdAt: IsoDateTime,
+});
+
 export const ThreadCheckpointFilesRestoredPayload = Schema.Struct({
   threadId: ThreadId,
   messageId: MessageId,
@@ -1696,6 +1718,7 @@ export const ThreadCheckpointFilesRestoreFailedPayload = Schema.Struct({
   turnCount: NonNegativeInt,
   requestCommandId: CommandId,
   detail: TrimmedNonEmptyString,
+  requiresWorkspaceReview: Schema.Boolean.pipe(Schema.withDecodingDefault(() => false)),
 });
 
 export const ThreadRevertedPayload = Schema.Struct({
@@ -1914,6 +1937,11 @@ export const OrchestrationEvent = Schema.Union([
     ...EventBaseFields,
     type: Schema.Literal("thread.checkpoint-files-restore-requested"),
     payload: ThreadCheckpointFilesRestoreRequestedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("thread.checkpoint-files-restore-reconciliation-requested"),
+    payload: ThreadCheckpointFilesRestoreReconciliationRequestedPayload,
   }),
   Schema.Struct({
     ...EventBaseFields,

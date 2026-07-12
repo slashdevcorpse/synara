@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 
-import { WsAutomationCreateRpc, WsProjectsDiscoverScriptsRpc, WsRpcError, WsRpcGroup } from "./rpc";
+import {
+  WS_RPC_ERROR_CODES,
+  WsAutomationCreateRpc,
+  WsProjectsDiscoverScriptsRpc,
+  WsRpcError,
+  WsRpcGroup,
+} from "./rpc";
 
 describe("WS RPC contracts", () => {
   it("exports the additive Effect RPC group", () => {
@@ -9,6 +15,12 @@ describe("WS RPC contracts", () => {
 
   it("uses a schema-backed transport error", () => {
     expect(new WsRpcError({ message: "failed" }).message).toBe("failed");
+    expect(
+      new WsRpcError({
+        message: "rejected",
+        code: WS_RPC_ERROR_CODES.orchestrationDispatchRejected,
+      }).code,
+    ).toBe(WS_RPC_ERROR_CODES.orchestrationDispatchRejected);
   });
 
   it("exports the project script discovery RPC", () => {

@@ -28,6 +28,10 @@ import {
 } from "../composerSlashCommands";
 import { buildThreadHandoffImportedMessages } from "../lib/threadHandoff";
 import { toastManager } from "../components/ui/toast";
+import {
+  CHECKPOINT_FILE_RESTORE_BLOCKED_MESSAGE,
+  hasPendingCheckpointFileRestore,
+} from "../lib/checkpointFileRestore";
 import type { ComposerCommandItem } from "../components/chat/ComposerCommandMenu";
 import { buildNextProviderOptions } from "../providerModelOptions";
 import { resolveForkThreadEnvironment } from "../lib/threadEnvironment";
@@ -47,6 +51,16 @@ type SlashCommandItem = Extract<ComposerCommandItem, { type: "slash-command" }>;
 
 function wasPromptReplacementApplied(result: number | false): boolean {
   return result !== false;
+}
+
+function blockIfCheckpointFileRestorePending(): boolean {
+  if (!hasPendingCheckpointFileRestore()) return false;
+  toastManager.add({
+    type: "error",
+    title: "File restore in progress",
+    description: CHECKPOINT_FILE_RESTORE_BLOCKED_MESSAGE,
+  });
+  return true;
 }
 
 export function useComposerSlashCommands(input: {
@@ -152,6 +166,9 @@ export function useComposerSlashCommands(input: {
         title: "Compact is unavailable",
         description: "Open an active supported server thread before compacting context.",
       });
+      return false;
+    }
+    if (blockIfCheckpointFileRestorePending()) {
       return false;
     }
 
@@ -309,6 +326,9 @@ export function useComposerSlashCommands(input: {
         });
         return true;
       }
+      if (blockIfCheckpointFileRestorePending()) {
+        return true;
+      }
 
       const importedMessages = buildThreadHandoffImportedMessages(activeThread);
       const nextThreadId = newThreadId();
@@ -341,6 +361,9 @@ export function useComposerSlashCommands(input: {
       });
 
       if (initialPrompt.length > 0) {
+        if (blockIfCheckpointFileRestorePending()) {
+          return true;
+        }
         await api.orchestration.dispatchCommand({
           type: "thread.turn.start",
           commandId: newCommandId(),
@@ -407,6 +430,9 @@ export function useComposerSlashCommands(input: {
         });
         return false;
       }
+      if (blockIfCheckpointFileRestorePending()) {
+        return false;
+      }
 
       const messageText =
         target === "base-branch" && activeRootBranch
@@ -442,6 +468,9 @@ export function useComposerSlashCommands(input: {
           ...associatedWorktree,
           createdAt,
         });
+        if (blockIfCheckpointFileRestorePending()) {
+          return false;
+        }
         await api.orchestration.dispatchCommand({
           type: "thread.turn.start",
           commandId: newCommandId(),

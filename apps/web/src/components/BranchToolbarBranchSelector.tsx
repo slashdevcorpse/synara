@@ -27,6 +27,10 @@ import {
   gitStatusQueryOptions,
   invalidateGitQueries,
 } from "../lib/gitReactQuery";
+import {
+  CHECKPOINT_FILE_RESTORE_BLOCKED_MESSAGE,
+  hasPendingCheckpointFileRestore,
+} from "../lib/checkpointFileRestore";
 import { readNativeApi } from "../nativeApi";
 import { parsePullRequestReference } from "../pullRequestReference";
 import {
@@ -120,6 +124,16 @@ function addBranchRecoveryToast(input: Parameters<typeof toastManager.add>[0]) {
   return activeBranchRecoveryToastId;
 }
 
+function blockIfCheckpointFileRestorePending(): boolean {
+  if (!hasPendingCheckpointFileRestore()) return false;
+  toastManager.add({
+    type: "error",
+    title: "File restore in progress",
+    description: CHECKPOINT_FILE_RESTORE_BLOCKED_MESSAGE,
+  });
+  return true;
+}
+
 function parseDirtyWorktreeError(error: unknown): { branch: string; files: string[] } | null {
   const detail = error instanceof Error ? error.message : String(error);
   const match = DIRTY_WORKTREE_ERROR_PATTERN.exec(detail);
@@ -182,6 +196,7 @@ function handleCheckoutError(
   },
 ): void {
   const retryStashAndCheckout = async (): Promise<void> => {
+    if (blockIfCheckpointFileRestorePending()) return;
     await input.api.git.stashAndCheckout({ cwd: input.cwd, branch: input.branch });
     await invalidateGitQueries(input.queryClient);
     input.onSuccess();
@@ -203,6 +218,7 @@ function handleCheckoutError(
         onClick: () => {
           input.runBranchAction(async () => {
             try {
+              if (blockIfCheckpointFileRestorePending()) return;
               await input.api.git.removeIndexLock({ cwd: input.cwd });
               await retryStashAndCheckout();
             } catch (retryError) {
@@ -513,10 +529,11 @@ export function BranchToolbarBranchSelector({
   const discardStashFromDialog = useCallback(() => {
     const dialog = stashDiscardDialog;
     const api = readNativeApi();
-    if (!dialog || !api || isDroppingStash) return;
+    if (!dialog || !api || isDroppingStash || blockIfCheckpointFileRestorePending()) return;
     setIsDroppingStash(true);
     runBranchAction(async () => {
       try {
+        if (blockIfCheckpointFileRestorePending()) return;
         await api.git.stashDrop({ cwd: dialog.cwd });
         setStashDiscardDialog(null);
       } finally {
@@ -527,7 +544,9 @@ export function BranchToolbarBranchSelector({
 
   const selectBranch = (branch: GitBranch) => {
     const api = readNativeApi();
-    if (!api || !branchCwd || isBranchActionPending) return;
+    if (!api || !branchCwd || isBranchActionPending || blockIfCheckpointFileRestorePending()) {
+      return;
+    }
 
     // In new-worktree mode, selecting a branch sets the base branch.
     if (isSelectingWorktreeBase) {
@@ -562,6 +581,7 @@ export function BranchToolbarBranchSelector({
     onComposerFocusRequest?.();
 
     runBranchAction(async () => {
+      if (blockIfCheckpointFileRestorePending()) return;
       setOptimisticBranch(selectedBranchName);
       try {
         await api.git.checkout({ cwd: selectionTarget.checkoutCwd, branch: branch.name });
@@ -605,16 +625,26 @@ export function BranchToolbarBranchSelector({
   const createBranch = (rawName: string) => {
     const name = rawName.trim();
     const api = readNativeApi();
-    if (!api || !branchCwd || !name || isBranchActionPending) return;
+    if (
+      !api ||
+      !branchCwd ||
+      !name ||
+      isBranchActionPending ||
+      blockIfCheckpointFileRestorePending()
+    ) {
+      return;
+    }
 
     setIsBranchMenuOpen(false);
     onComposerFocusRequest?.();
 
     runBranchAction(async () => {
+      if (blockIfCheckpointFileRestorePending()) return;
       setOptimisticBranch(name);
 
       try {
         await api.git.createBranch({ cwd: branchCwd, branch: name, publish: hasOriginRemote });
+        if (blockIfCheckpointFileRestorePending()) return;
         try {
           await api.git.checkout({ cwd: branchCwd, branch: name });
         } catch (error) {

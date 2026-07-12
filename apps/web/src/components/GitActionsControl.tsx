@@ -22,6 +22,10 @@ import {
   type LucideIcon,
   PushIcon,
 } from "~/lib/icons";
+import {
+  CHECKPOINT_FILE_RESTORE_BLOCKED_MESSAGE,
+  hasPendingCheckpointFileRestore,
+} from "~/lib/checkpointFileRestore";
 import { Input } from "~/components/ui/input";
 import { GitHubIcon } from "./Icons";
 import {
@@ -143,6 +147,16 @@ interface RunGitActionWithToastInput {
   isDefaultBranchOverride?: boolean;
   progressToastId?: GitActionToastId;
   filePaths?: string[];
+}
+
+function blockIfCheckpointFileRestorePending(): boolean {
+  if (!hasPendingCheckpointFileRestore()) return false;
+  toastManager.add({
+    type: "error",
+    title: "File restore in progress",
+    description: CHECKPOINT_FILE_RESTORE_BLOCKED_MESSAGE,
+  });
+  return true;
 }
 
 interface GitPickerMenuItem {
@@ -626,6 +640,7 @@ export default function GitActionsControl({
   }, [gitStatusForActions, threadToastData]);
 
   const runSyncWithRemote = useCallback(() => {
+    if (blockIfCheckpointFileRestorePending()) return;
     const promise = pullMutation.mutateAsync();
     toastManager.promise(promise, {
       loading: { title: "Syncing with remote...", data: threadToastData },
@@ -659,6 +674,7 @@ export default function GitActionsControl({
       progressToastId,
       filePaths,
     }: RunGitActionWithToastInput) => {
+      if (blockIfCheckpointFileRestorePending()) return;
       const actionStatus = statusOverride ?? gitStatusForActions;
       const actionBranch = actionStatus?.branch ?? null;
       const actionIsDefaultBranch =
@@ -746,6 +762,16 @@ export default function GitActionsControl({
         });
       }
 
+      if (hasPendingCheckpointFileRestore()) {
+        activeGitActionProgressRef.current = null;
+        toastManager.update(resolvedProgressToastId, {
+          type: "error",
+          title: "File restore in progress",
+          description: CHECKPOINT_FILE_RESTORE_BLOCKED_MESSAGE,
+          data: threadToastData,
+        });
+        return;
+      }
       const promise = runImmediateGitActionMutation.mutateAsync({
         actionId,
         action,
@@ -980,7 +1006,7 @@ export default function GitActionsControl({
   const createAndCheckoutBranch = useCallback(
     async (branchName: string) => {
       const api = readNativeApi();
-      if (!api || !gitCwd) return;
+      if (!api || !gitCwd || blockIfCheckpointFileRestorePending()) return;
 
       const trimmedName = branchName.trim();
       if (!trimmedName) return;
@@ -1023,7 +1049,25 @@ export default function GitActionsControl({
       });
 
       try {
+        if (hasPendingCheckpointFileRestore()) {
+          toastManager.update(toastId, {
+            type: "error",
+            title: "File restore in progress",
+            description: CHECKPOINT_FILE_RESTORE_BLOCKED_MESSAGE,
+            data: threadToastData,
+          });
+          return;
+        }
         await api.git.createBranch({ cwd: gitCwd, branch: trimmedName, publish: hasOriginRemote });
+        if (hasPendingCheckpointFileRestore()) {
+          toastManager.update(toastId, {
+            type: "error",
+            title: `Created ${trimmedName}, but did not switch`,
+            description: CHECKPOINT_FILE_RESTORE_BLOCKED_MESSAGE,
+            data: threadToastData,
+          });
+          return;
+        }
         await api.git.checkout({ cwd: gitCwd, branch: trimmedName });
         if (activeThreadId) {
           void api.orchestration

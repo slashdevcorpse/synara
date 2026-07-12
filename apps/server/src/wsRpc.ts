@@ -6,7 +6,9 @@ import {
   ORCHESTRATION_WS_METHODS,
   ThreadId,
   WS_METHODS,
+  WS_RPC_ERROR_CODES,
   WsRpcError,
+  type WsRpcErrorCode,
   WsRpcGroup,
   type GitActionProgressEvent,
   type OrchestrationEvent,
@@ -257,14 +259,26 @@ function readDescendantProcesses(rootPid: number): Promise<ProcessTableRow[]> {
   });
 }
 
-function toWsRpcError(cause: unknown, fallbackMessage: string) {
-  return Schema.is(WsRpcError)(cause)
-    ? cause
-    : new WsRpcError({
-        message:
-          cause instanceof Error && cause.message.length > 0 ? cause.message : fallbackMessage,
-        cause,
-      });
+function toWsRpcError(
+  cause: unknown,
+  fallbackMessage: string,
+  options?: { readonly code?: WsRpcErrorCode },
+) {
+  if (Schema.is(WsRpcError)(cause)) {
+    if (options?.code === undefined || cause.code === options.code) {
+      return cause;
+    }
+    return new WsRpcError({
+      message: cause.message,
+      code: options.code,
+      cause: cause.cause,
+    });
+  }
+  return new WsRpcError({
+    message: cause instanceof Error && cause.message.length > 0 ? cause.message : fallbackMessage,
+    code: options?.code,
+    cause,
+  });
 }
 
 const failLiveUiStreamForSnapshotResync = (report: LiveUiStreamDropReport) =>
@@ -609,8 +623,11 @@ export const makeWsRpcLayer = () =>
         event.aggregateId === threadId &&
         isThreadDetailEvent(event);
 
-      const rpcEffect = <A, E, R>(effect: Effect.Effect<A, E, R>, fallbackMessage: string) =>
-        effect.pipe(Effect.mapError((cause) => toWsRpcError(cause, fallbackMessage)));
+      const rpcEffect = <A, E, R>(
+        effect: Effect.Effect<A, E, R>,
+        fallbackMessage: string,
+        options?: { readonly code?: WsRpcErrorCode },
+      ) => effect.pipe(Effect.mapError((cause) => toWsRpcError(cause, fallbackMessage, options)));
 
       return WsRpcGroup.of({
         [ORCHESTRATION_WS_METHODS.dispatchCommand]: (command) =>
@@ -630,6 +647,7 @@ export const makeWsRpcLayer = () =>
               return result;
             }),
             "Failed to dispatch orchestration command",
+            { code: WS_RPC_ERROR_CODES.orchestrationDispatchRejected },
           ),
         [ORCHESTRATION_WS_METHODS.importThread]: (input) =>
           rpcEffect(importThread(input), "Failed to import thread"),

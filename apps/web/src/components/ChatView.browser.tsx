@@ -5,9 +5,11 @@ import {
   AutomationId,
   type AutomationCreateInput,
   type AutomationDefinition,
+  CommandId,
   EventId,
   MessageId,
   ORCHESTRATION_WS_METHODS,
+  type OrchestrationEvent,
   type OrchestrationReadModel,
   type ProjectId,
   type ServerConfig,
@@ -34,6 +36,10 @@ import {
   type TerminalContextDraft,
   removeInlineTerminalContextPlaceholder,
 } from "../lib/terminalContext";
+import {
+  readPendingCheckpointFileRestore,
+  savePendingCheckpointFileRestore,
+} from "../lib/checkpointFileRestore";
 import { isMacPlatform } from "../lib/utils";
 import { readNativeApi } from "../nativeApi";
 import { resetHomeChatProjectPrewarmStateForTests } from "../lib/chatProjects";
@@ -85,6 +91,7 @@ interface TestFixture {
 
 let fixture: TestFixture;
 const wsRequests: WsRequestEnvelope["body"][] = [];
+let orchestrationReplayEvents: OrchestrationEvent[] = [];
 const wsLink = ws.link(/ws(s)?:\/\/.*/);
 
 interface ViewportSpec {
@@ -979,6 +986,9 @@ function resolveWsRpc(body: WsRequestEnvelope["body"]): unknown {
   if (tag === ORCHESTRATION_WS_METHODS.getSnapshot) {
     return fixture.snapshot;
   }
+  if (tag === ORCHESTRATION_WS_METHODS.replayEvents) {
+    return orchestrationReplayEvents;
+  }
   if (tag === ORCHESTRATION_WS_METHODS.dispatchCommand) {
     if (recordProjectCreateCommand(body.command)) {
       return { sequence: fixture.snapshot.snapshotSequence };
@@ -1658,6 +1668,7 @@ describe("ChatView timeline estimator parity (full app)", () => {
     localStorage.clear();
     document.body.innerHTML = "";
     wsRequests.length = 0;
+    orchestrationReplayEvents = [];
     useComposerDraftStore.setState({
       draftsByThreadId: {},
       draftThreadsByThreadId: {},
@@ -1689,6 +1700,272 @@ describe("ChatView timeline estimator parity (full app)", () => {
     resetRetainedThreadDetailSubscriptionsForTests();
     resetWsNativeApiForTest();
     document.body.innerHTML = "";
+  });
+
+  it("keeps every composer gated until a reloaded file restore reaches terminal success", async () => {
+    const messageId = MessageId.makeUnsafe("msg-user-pending-file-restore");
+    const requestCommandId = CommandId.makeUnsafe("cmd-pending-file-restore");
+    savePendingCheckpointFileRestore({
+      threadId: THREAD_ID,
+      messageId,
+      turnCount: 0,
+      requestCommandId,
+      createdAt: NOW_ISO,
+      phase: "dispatched",
+    });
+
+    const mounted = await mountChatView({
+      viewport: DEFAULT_VIEWPORT,
+      snapshot: addThreadToSnapshot(
+        createSnapshotForTargetUser({
+          targetMessageId: messageId,
+          targetText: "restore this turn",
+        }),
+        OTHER_THREAD_ID,
+      ),
+      initialEntry: `/${OTHER_THREAD_ID}`,
+    });
+
+    try {
+      let editor = await waitForElement(
+        () => document.querySelector<HTMLElement>("[data-testid='composer-editor']"),
+        "Unable to find composer editor.",
+      );
+      await vi.waitFor(() => {
+        expect(editor.getAttribute("contenteditable")).toBe("false");
+      });
+
+      await mounted.router.navigate({
+        to: "/$threadId",
+        params: { threadId: THREAD_ID },
+      });
+      await waitForLayout();
+      editor = await waitForElement(
+        () => document.querySelector<HTMLElement>("[data-testid='composer-editor']"),
+        "Unable to find composer editor after switching threads.",
+      );
+
+      await vi.waitFor(() => {
+        expect(mounted.router.state.location.pathname).toBe(`/${THREAD_ID}`);
+        expect(editor.getAttribute("contenteditable")).toBe("false");
+        expect(
+          wsRequests.some((request) => request._tag === ORCHESTRATION_WS_METHODS.replayEvents),
+        ).toBe(true);
+      });
+      await waitForLayout();
+      expect(editor.getAttribute("contenteditable")).toBe("false");
+
+      orchestrationReplayEvents = [
+        {
+          sequence: 1,
+          eventId: EventId.makeUnsafe("event-pending-file-restore-requested"),
+          aggregateKind: "thread",
+          aggregateId: THREAD_ID,
+          occurredAt: NOW_ISO,
+          commandId: requestCommandId,
+          causationEventId: null,
+          correlationId: requestCommandId,
+          metadata: {},
+          type: "thread.checkpoint-files-restore-requested",
+          payload: {
+            threadId: THREAD_ID,
+            messageId,
+            turnCount: 0,
+            createdAt: NOW_ISO,
+          },
+        },
+        {
+          sequence: 2,
+          eventId: EventId.makeUnsafe("event-pending-file-restore-succeeded"),
+          aggregateKind: "thread",
+          aggregateId: THREAD_ID,
+          occurredAt: NOW_ISO,
+          commandId: CommandId.makeUnsafe("cmd-pending-file-restore-complete"),
+          causationEventId: null,
+          correlationId: requestCommandId,
+          metadata: {},
+          type: "thread.checkpoint-files-restored",
+          payload: {
+            threadId: THREAD_ID,
+            messageId,
+            turnCount: 0,
+            requestCommandId,
+          },
+        },
+      ];
+
+      await vi.waitFor(
+        () => {
+          expect(editor.getAttribute("contenteditable")).toBe("true");
+          expect(readPendingCheckpointFileRestore()).toBeNull();
+        },
+        { timeout: 5_000, interval: 50 },
+      );
+    } finally {
+      await mounted.cleanup();
+    }
+  });
+
+  it("does not auto-dispatch a queued turn during initial restore-gate rehydration", async () => {
+    const queuedPrompt = "queued prompt that must wait for file restore";
+    const messageId = MessageId.makeUnsafe("msg-user-pending-file-restore-queued");
+    savePendingCheckpointFileRestore({
+      threadId: THREAD_ID,
+      messageId,
+      turnCount: 0,
+      requestCommandId: CommandId.makeUnsafe("cmd-pending-file-restore-queued"),
+      createdAt: NOW_ISO,
+      phase: "dispatched",
+    });
+    useComposerDraftStore.getState().enqueueQueuedTurn(THREAD_ID, {
+      id: "queued-turn-file-restore-gated",
+      kind: "chat",
+      createdAt: NOW_ISO,
+      previewText: queuedPrompt,
+      prompt: queuedPrompt,
+      images: [],
+      files: [],
+      assistantSelections: [],
+      terminalContexts: [],
+      fileComments: [],
+      pastedTexts: [],
+      skills: [],
+      mentions: [],
+      selectedProvider: "codex",
+      selectedModel: "gpt-5",
+      selectedPromptEffort: null,
+      modelSelection: {
+        provider: "codex",
+        model: "gpt-5",
+      },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      envMode: "local",
+    });
+
+    const mounted = await mountChatView({
+      viewport: DEFAULT_VIEWPORT,
+      snapshot: createSnapshotForTargetUser({
+        targetMessageId: messageId,
+        targetText: "restore this turn before draining queue",
+        sessionStatus: "ready",
+      }),
+    });
+
+    try {
+      const editor = await waitForElement(
+        () => document.querySelector<HTMLElement>("[data-testid='composer-editor']"),
+        "Unable to find composer editor.",
+      );
+
+      await vi.waitFor(() => {
+        expect(editor.getAttribute("contenteditable")).toBe("false");
+        expect(document.querySelectorAll('[data-testid="queued-follow-up-row"]')).toHaveLength(1);
+      });
+      await waitForLayout();
+      expect(
+        wsRequests.some((request) => {
+          const command = readDispatchedCommand(request);
+          return command?.type === "thread.turn.start";
+        }),
+      ).toBe(false);
+    } finally {
+      await mounted.cleanup();
+    }
+  });
+
+  it("requires explicit working-tree review before unlocking an interrupted restore", async () => {
+    const messageId = MessageId.makeUnsafe("msg-user-interrupted-file-restore");
+    const requestCommandId = CommandId.makeUnsafe("cmd-interrupted-file-restore");
+    savePendingCheckpointFileRestore({
+      threadId: THREAD_ID,
+      messageId,
+      turnCount: 0,
+      requestCommandId,
+      createdAt: NOW_ISO,
+      phase: "dispatched",
+    });
+    orchestrationReplayEvents = [
+      {
+        sequence: 1,
+        eventId: EventId.makeUnsafe("event-interrupted-file-restore-requested"),
+        aggregateKind: "thread",
+        aggregateId: THREAD_ID,
+        occurredAt: NOW_ISO,
+        commandId: requestCommandId,
+        causationEventId: null,
+        correlationId: requestCommandId,
+        metadata: {},
+        type: "thread.checkpoint-files-restore-requested",
+        payload: {
+          threadId: THREAD_ID,
+          messageId,
+          turnCount: 0,
+          createdAt: NOW_ISO,
+        },
+      },
+      {
+        sequence: 2,
+        eventId: EventId.makeUnsafe("event-interrupted-file-restore-failed"),
+        aggregateKind: "thread",
+        aggregateId: THREAD_ID,
+        occurredAt: NOW_ISO,
+        commandId: CommandId.makeUnsafe("cmd-interrupted-file-restore-failed"),
+        causationEventId: null,
+        correlationId: requestCommandId,
+        metadata: {},
+        type: "thread.checkpoint-files-restore-failed",
+        payload: {
+          threadId: THREAD_ID,
+          messageId,
+          turnCount: 0,
+          requestCommandId,
+          detail: "File restore was interrupted by a restart.",
+          requiresWorkspaceReview: true,
+        },
+      },
+    ];
+
+    const mounted = await mountChatView({
+      viewport: DEFAULT_VIEWPORT,
+      snapshot: createSnapshotForTargetUser({
+        targetMessageId: messageId,
+        targetText: "restore this turn",
+      }),
+    });
+
+    try {
+      const editor = await waitForElement(
+        () => document.querySelector<HTMLElement>("[data-testid='composer-editor']"),
+        "Unable to find composer editor.",
+      );
+      const reviewButton = await waitForElement(
+        () =>
+          Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find(
+            (button) => button.textContent?.trim() === "Review and unlock",
+          ) ?? null,
+        "Unable to find working-tree review action.",
+      );
+      expect(editor.getAttribute("contenteditable")).toBe("false");
+      expect(readPendingCheckpointFileRestore()?.requestCommandId).toBe(requestCommandId);
+
+      reviewButton.click();
+      const confirmButton = await waitForElement(
+        () =>
+          Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find(
+            (button) => button.textContent?.trim() === "Confirm",
+          ) ?? null,
+        "Unable to find review confirmation action.",
+      );
+      confirmButton.click();
+
+      await vi.waitFor(() => {
+        expect(editor.getAttribute("contenteditable")).toBe("true");
+        expect(readPendingCheckpointFileRestore()).toBeNull();
+      });
+    } finally {
+      await mounted.cleanup();
+    }
   });
 
   it.each(TEXT_VIEWPORT_MATRIX)(

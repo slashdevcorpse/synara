@@ -20,6 +20,7 @@ interface PendingUserInputPanelProps {
   respondingRequestIds: ApprovalRequestId[];
   answers: Record<string, PendingUserInputDraftAnswer>;
   questionIndex: number;
+  disabled?: boolean;
   onToggleOption: (questionId: string, optionLabel: string) => PendingUserInputDraftAnswer | null;
   onAdvance: (answerOverrides?: Record<string, PendingUserInputDraftAnswer>) => void;
   onPrevious: () => void;
@@ -35,6 +36,7 @@ export const ComposerPendingUserInputPanel = memo(function ComposerPendingUserIn
   respondingRequestIds,
   answers,
   questionIndex,
+  disabled = false,
   onToggleOption,
   onAdvance,
   onPrevious,
@@ -51,6 +53,7 @@ export const ComposerPendingUserInputPanel = memo(function ComposerPendingUserIn
       isResponding={respondingRequestIds.includes(activePrompt.requestId)}
       answers={answers}
       questionIndex={questionIndex}
+      disabled={disabled}
       onToggleOption={onToggleOption}
       onAdvance={onAdvance}
       onPrevious={onPrevious}
@@ -64,6 +67,7 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
   isResponding,
   answers,
   questionIndex,
+  disabled,
   onToggleOption,
   onAdvance,
   onPrevious,
@@ -73,6 +77,7 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
   isResponding: boolean;
   answers: Record<string, PendingUserInputDraftAnswer>;
   questionIndex: number;
+  disabled: boolean;
   onToggleOption: (questionId: string, optionLabel: string) => PendingUserInputDraftAnswer | null;
   onAdvance: (answerOverrides?: Record<string, PendingUserInputDraftAnswer>) => void;
   onPrevious: () => void;
@@ -96,9 +101,12 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
         autoAdvanceTimerRef.current = null;
       }
     };
-  }, [activeQuestion?.id, isResponding]);
+  }, [activeQuestion?.id, disabled, isResponding]);
 
   const handleOptionSelection = useEffectEvent((questionId: string, optionLabel: string) => {
+    if (disabled || isResponding) {
+      return;
+    }
     const nextDraftAnswer = onToggleOption(questionId, optionLabel);
     if (activeQuestion?.multiSelect) {
       return;
@@ -115,7 +123,7 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
   // Keyboard shortcut: digits toggle options for multi-select prompts and preserve
   // the current auto-advance behavior for single-select questions.
   useEffect(() => {
-    if (!activeQuestion || isResponding) return;
+    if (!activeQuestion || disabled || isResponding) return;
     const handler = (event: globalThis.KeyboardEvent) => {
       if (event.metaKey || event.ctrlKey || event.altKey) return;
       const target = event.target;
@@ -141,7 +149,7 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
     };
     document.addEventListener("keydown", handler);
     return () => document.removeEventListener("keydown", handler);
-  }, [activeQuestion, isResponding]);
+  }, [activeQuestion, disabled, isResponding]);
 
   if (!activeQuestion) {
     return null;
@@ -162,7 +170,7 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
           <div className="flex shrink-0 items-center gap-0.5 pt-px text-muted-foreground/70">
             <button
               type="button"
-              disabled={!canGoBack || isResponding}
+              disabled={!canGoBack || disabled || isResponding}
               onClick={onPrevious}
               className={NAV_BUTTON_CLASS_NAME}
               aria-label="Previous question"
@@ -174,7 +182,7 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
             </span>
             <button
               type="button"
-              disabled={!canGoForward || isResponding}
+              disabled={!canGoForward || disabled || isResponding}
               onClick={() => onAdvance()}
               className={NAV_BUTTON_CLASS_NAME}
               aria-label="Next question"
@@ -199,7 +207,7 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
                 label={option.label}
                 description={option.description}
                 selected={isSelected}
-                disabled={isResponding}
+                disabled={disabled || isResponding}
                 onSelect={() => handleOptionSelection(activeQuestion.id, option.label)}
                 trailing={
                   isSelected ? (
@@ -214,11 +222,15 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
         <div className="mt-2.5 flex justify-end">
           <button
             type="button"
-            disabled={isResponding}
-            onClick={onCancel}
+            disabled={disabled || isResponding}
+            onClick={() => {
+              if (!disabled && !isResponding) {
+                onCancel();
+              }
+            }}
             className={cn(
               "rounded-md px-2 py-1 text-[12px] text-[var(--color-text-foreground-secondary)] transition-colors duration-150 hover:bg-[var(--color-background-button-secondary-hover)] hover:text-[var(--color-text-foreground)]",
-              isResponding && "cursor-not-allowed opacity-50",
+              (disabled || isResponding) && "cursor-not-allowed opacity-50",
             )}
           >
             Cancel

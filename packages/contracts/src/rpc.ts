@@ -162,8 +162,16 @@ import {
 } from "./stats";
 import { WS_METHODS } from "./ws";
 
+export const WS_RPC_ERROR_CODES = {
+  orchestrationDispatchRejected: "orchestration.dispatch.rejected",
+} as const;
+
+export const WsRpcErrorCode = Schema.Literals([WS_RPC_ERROR_CODES.orchestrationDispatchRejected]);
+export type WsRpcErrorCode = typeof WsRpcErrorCode.Type;
+
 export class WsRpcError extends Schema.TaggedErrorClass<WsRpcError>()("WsRpcError", {
   message: Schema.String,
+  code: Schema.optional(WsRpcErrorCode),
   cause: Schema.optional(Schema.Defect),
 }) {}
 

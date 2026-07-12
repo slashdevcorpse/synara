@@ -7,6 +7,10 @@ import type {
 } from "@synara/contracts";
 import { mutationOptions, queryOptions, type QueryClient } from "@tanstack/react-query";
 import { ensureNativeApi } from "../nativeApi";
+import {
+  CHECKPOINT_FILE_RESTORE_BLOCKED_MESSAGE,
+  hasPendingCheckpointFileRestore,
+} from "./checkpointFileRestore";
 import { buildPatchCacheKey } from "./diffRendering";
 
 const GIT_STATUS_STALE_TIME_MS = 30_000;
@@ -70,6 +74,12 @@ export function invalidateGitQueries(queryClient: QueryClient) {
     queryClient.invalidateQueries({ queryKey: ["git", "working-tree-diff"] as const }),
     queryClient.invalidateQueries({ queryKey: ["git", "pull-request"] as const }),
   ]);
+}
+
+function assertCheckpointFileRestoreMutationAllowed(): void {
+  if (hasPendingCheckpointFileRestore()) {
+    throw new Error(CHECKPOINT_FILE_RESTORE_BLOCKED_MESSAGE);
+  }
 }
 
 // Scope live file-change invalidations so unrelated project/worktree git caches stay warm.
@@ -301,6 +311,7 @@ function makeGitMutationOptions<TArgs, TResult>(config: {
     mutationFn: async (args: TArgs) => {
       const api = ensureNativeApi();
       if (!config.cwd) throw new Error(config.unavailableMessage);
+      assertCheckpointFileRestoreMutationAllowed();
       return config.run(api, config.cwd, args);
     },
     ...(invalidateOn === "success"
@@ -431,6 +442,7 @@ export function gitCreateWorktreeMutationOptions(input: { queryClient: QueryClie
     }) => {
       const api = ensureNativeApi();
       if (!cwd) throw new Error("Git worktree creation is unavailable.");
+      assertCheckpointFileRestoreMutationAllowed();
       return api.git.createWorktree({ cwd, branch, newBranch, path: path ?? null });
     },
     mutationKey: ["git", "mutation", "create-worktree"] as const,
@@ -445,6 +457,7 @@ export function gitCreateDetachedWorktreeMutationOptions(input: { queryClient: Q
     mutationFn: async ({ cwd, ref, path }: { cwd: string; ref: string; path?: string | null }) => {
       const api = ensureNativeApi();
       if (!cwd) throw new Error("Git worktree creation is unavailable.");
+      assertCheckpointFileRestoreMutationAllowed();
       return api.git.createDetachedWorktree({ cwd, ref, path: path ?? null });
     },
     mutationKey: ["git", "mutation", "create-detached-worktree"] as const,
@@ -459,6 +472,7 @@ export function gitRemoveWorktreeMutationOptions(input: { queryClient: QueryClie
     mutationFn: async ({ cwd, path, force }: { cwd: string; path: string; force?: boolean }) => {
       const api = ensureNativeApi();
       if (!cwd) throw new Error("Git worktree removal is unavailable.");
+      assertCheckpointFileRestoreMutationAllowed();
       return api.git.removeWorktree({ cwd, path, force });
     },
     mutationKey: ["git", "mutation", "remove-worktree"] as const,

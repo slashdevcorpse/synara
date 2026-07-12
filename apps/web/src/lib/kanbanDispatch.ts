@@ -33,6 +33,10 @@ import type { SidebarThreadSummary } from "../types";
 import { DEFAULT_INTERACTION_MODE, DEFAULT_RUNTIME_MODE } from "../types";
 import { appendAssistantSelectionsToPrompt } from "./assistantSelections";
 import {
+  CHECKPOINT_FILE_RESTORE_BLOCKED_MESSAGE,
+  hasPendingCheckpointFileRestore,
+} from "./checkpointFileRestore";
+import {
   buildUploadComposerAttachments,
   formatOutgoingComposerPrompt,
   resolvePromptEffortFromModelSelection,
@@ -126,6 +130,9 @@ async function dispatchKanbanDraftThreadOnce(
   const api = readNativeApi();
   if (!api) {
     return { kind: "unavailable" };
+  }
+  if (hasPendingCheckpointFileRestore()) {
+    return { kind: "error", message: CHECKPOINT_FILE_RESTORE_BLOCKED_MESSAGE };
   }
 
   // Re-read the composer at drop time: the card snapshot may lag behind edits made
@@ -223,6 +230,10 @@ async function dispatchKanbanDraftThreadOnce(
   const droppedAtMs = Date.now();
   const createdAt = new Date(droppedAtMs).toISOString();
 
+  if (hasPendingCheckpointFileRestore()) {
+    return { kind: "error", message: CHECKPOINT_FILE_RESTORE_BLOCKED_MESSAGE };
+  }
+
   // Optimistic move: show the card In Progress before any round-trip. Provider
   // session init can take seconds; runtime events confirm the move (reconciliation
   // clears the entry) or the failure paths below revert it.
@@ -267,6 +278,10 @@ async function dispatchKanbanDraftThreadOnce(
         },
         api,
       );
+      if (hasPendingCheckpointFileRestore()) {
+        kanbanUi.clearOptimisticDispatch(threadId);
+        return { kind: "error", message: CHECKPOINT_FILE_RESTORE_BLOCKED_MESSAGE };
+      }
       if (promotion === "unavailable") {
         kanbanUi.clearOptimisticDispatch(threadId);
         return { kind: "unavailable" };
@@ -282,6 +297,10 @@ async function dispatchKanbanDraftThreadOnce(
     }
 
     const turnAttachments = await turnAttachmentsPromise;
+    if (hasPendingCheckpointFileRestore()) {
+      kanbanUi.clearOptimisticDispatch(threadId);
+      return { kind: "error", message: CHECKPOINT_FILE_RESTORE_BLOCKED_MESSAGE };
+    }
     await api.orchestration.dispatchCommand({
       type: "thread.turn.start",
       commandId: newCommandId(),
