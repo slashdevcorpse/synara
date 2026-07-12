@@ -228,6 +228,8 @@ function mergeTurnDiffSummaries(
   const checkpointTurnCountsFor = (summary: TurnDiffSummary): number[] => {
     if (
       summary.files.length === 0 ||
+      summary.status === "missing" ||
+      summary.status === "error" ||
       summary.checkpointRef === undefined ||
       summary.checkpointRef.startsWith("provider-diff:")
     ) {

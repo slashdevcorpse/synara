@@ -510,6 +510,12 @@ describe("buildTurnDiffSummaryByAssistantMessageId", () => {
           checkpointTurnCount: 3,
           checkpointRef: CheckpointRef.makeUnsafe("provider-diff:event-3"),
         }),
+        makeSummary({
+          turnId: "turn-missing",
+          checkpointTurnCount: 4,
+          status: "missing",
+          checkpointRef: CheckpointRef.makeUnsafe("checkpoint-turn-missing"),
+        }),
       ],
       messages: [
         { id: MessageId.makeUnsafe("u-1"), role: "user", turnId: null },
@@ -528,10 +534,16 @@ describe("buildTurnDiffSummaryByAssistantMessageId", () => {
           role: "assistant",
           turnId: TurnId.makeUnsafe("turn-placeholder"),
         },
+        {
+          id: MessageId.makeUnsafe("a-missing"),
+          role: "assistant",
+          turnId: TurnId.makeUnsafe("turn-missing"),
+        },
       ],
     });
 
-    expect(result.get(MessageId.makeUnsafe("a-placeholder"))?.checkpointTurnCounts).toEqual([]);
+    expect(result.has(MessageId.makeUnsafe("a-placeholder"))).toBe(false);
+    expect(result.get(MessageId.makeUnsafe("a-missing"))?.checkpointTurnCounts).toEqual([]);
   });
 
   it("keeps separate cards for response segments split by user messages", () => {

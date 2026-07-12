@@ -396,6 +396,14 @@ const makeCheckpointStore = Effect.gen(function* () {
         return true;
       }
 
+      const changedPaths = yield* git.execute({
+        operation,
+        cwd: input.cwd,
+        args: ["diff", "--name-only", "--no-renames", "-z", fromCommitOid, toCommitOid],
+        maxOutputBytes: input.maxOutputBytes ?? CHECKPOINT_DIFF_MAX_OUTPUT_BYTES,
+      });
+      const affectedPaths = changedPaths.stdout.split("\0").filter((entry) => entry.length > 0);
+
       return yield* Effect.acquireUseRelease(
         fs.makeTempDirectory({ prefix: "synara-checkpoint-undo-" }),
         (tempDir) =>
@@ -407,11 +415,11 @@ const makeCheckpointStore = Effect.gen(function* () {
               cwd: input.cwd,
               args: ["apply", "--reverse", "--whitespace=nowarn", "--", patchPath],
             });
-            if (input.affectedPaths.length > 0 && (yield* hasHeadCommit(input.cwd))) {
+            if (affectedPaths.length > 0) {
               yield* git.execute({
                 operation,
                 cwd: input.cwd,
-                args: ["reset", "--quiet", "--", ...input.affectedPaths],
+                args: ["reset", "--quiet", fromCommitOid, "--", ...affectedPaths],
               });
             }
             return true;

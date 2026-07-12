@@ -22,6 +22,7 @@ import {
   checkpointRefForThreadTurnLive,
   checkpointRefForThreadTurnStart,
   checkpointRefForThreadTurnStartInManagedFamily,
+  isManagedCheckpointRefForThread,
   resolveThreadWorkspaceCwd,
 } from "../../checkpointing/Utils.ts";
 import { clearWorkspaceIndexCache } from "../../workspaceEntries.ts";
@@ -854,26 +855,6 @@ const make = Effect.gen(function* () {
       return;
     }
 
-    const sessionRuntime = yield* resolveSessionRuntimeForThread(event.payload.threadId);
-    if (Option.isNone(sessionRuntime)) {
-      yield* appendRevertFailureActivity({
-        threadId: event.payload.threadId,
-        turnCount: event.payload.turnCount,
-        detail: "No active provider session with workspace cwd is bound to this thread.",
-        createdAt: now,
-      }).pipe(Effect.catch(() => Effect.void));
-      return;
-    }
-    if (!isGitWorkspace(sessionRuntime.value.cwd)) {
-      yield* appendRevertFailureActivity({
-        threadId: event.payload.threadId,
-        turnCount: event.payload.turnCount,
-        detail: "Checkpoints are unavailable because this project is not a git repository.",
-        createdAt: now,
-      }).pipe(Effect.catch(() => Effect.void));
-      return;
-    }
-
     const currentTurnCount = thread.checkpoints.reduce(
       (maxTurnCount, checkpoint) => Math.max(maxTurnCount, checkpoint.checkpointTurnCount),
       0,
@@ -890,10 +871,33 @@ const make = Effect.gen(function* () {
     }
 
     if (event.payload.scope === "files") {
+      const project = yield* getProjectShell(thread.projectId);
+      const checkpointCwd = project
+        ? yield* resolveCheckpointCwd({
+            threadId: event.payload.threadId,
+            thread,
+            project,
+            preferSessionRuntime: false,
+          })
+        : undefined;
+      if (!checkpointCwd) {
+        yield* appendRevertFailureActivity({
+          threadId: event.payload.threadId,
+          turnCount: event.payload.turnCount,
+          detail: "No git workspace is available for file Undo.",
+          createdAt: now,
+        }).pipe(Effect.catch(() => Effect.void));
+        return;
+      }
+
+      const isUndoableCheckpoint = (checkpoint: (typeof thread.checkpoints)[number]) =>
+        checkpoint.status === "ready" &&
+        checkpoint.files.length > 0 &&
+        isManagedCheckpointRefForThread(checkpoint.checkpointRef, event.payload.threadId);
       const targetCheckpoint = thread.checkpoints.find(
         (checkpoint) => checkpoint.checkpointTurnCount === event.payload.turnCount,
       );
-      if (!targetCheckpoint || targetCheckpoint.files.length === 0) {
+      if (!targetCheckpoint || !isUndoableCheckpoint(targetCheckpoint)) {
         yield* appendRevertFailureActivity({
           threadId: event.payload.threadId,
           turnCount: event.payload.turnCount,
@@ -904,7 +908,9 @@ const make = Effect.gen(function* () {
       }
       const latestUndoableTurnCount = thread.checkpoints.reduce(
         (latest, checkpoint) =>
-          checkpoint.files.length > 0 ? Math.max(latest, checkpoint.checkpointTurnCount) : latest,
+          isUndoableCheckpoint(checkpoint)
+            ? Math.max(latest, checkpoint.checkpointTurnCount)
+            : latest,
         0,
       );
       if (targetCheckpoint.checkpointTurnCount !== latestUndoableTurnCount) {
@@ -924,7 +930,7 @@ const make = Effect.gen(function* () {
           targetCheckpoint.turnId,
         ) ?? checkpointRefForThreadTurnStart(event.payload.threadId, targetCheckpoint.turnId);
       const hasTurnStartCheckpoint = yield* checkpointStore.hasCheckpointRef({
-        cwd: sessionRuntime.value.cwd,
+        cwd: checkpointCwd,
         checkpointRef: turnStartCheckpointRef,
       });
       const previousCheckpointRef =
@@ -952,10 +958,9 @@ const make = Effect.gen(function* () {
       }
 
       const reversed = yield* checkpointStore.reverseCheckpointDiff({
-        cwd: sessionRuntime.value.cwd,
+        cwd: checkpointCwd,
         fromCheckpointRef,
         toCheckpointRef: targetCheckpoint.checkpointRef,
-        affectedPaths: targetCheckpoint.files.map((file) => file.path),
         fallbackFromToHead: event.payload.turnCount === 1 && !hasTurnStartCheckpoint,
       });
       if (!reversed) {
@@ -969,23 +974,11 @@ const make = Effect.gen(function* () {
       }
 
       yield* checkpointStore.captureCheckpoint({
-        cwd: sessionRuntime.value.cwd,
+        cwd: checkpointCwd,
         checkpointRef: targetCheckpoint.checkpointRef,
       });
-      yield* Effect.forEach(
-        thread.checkpoints.filter(
-          (checkpoint) => checkpoint.checkpointTurnCount > targetCheckpoint.checkpointTurnCount,
-        ),
-        (checkpoint) =>
-          checkpointStore.copyCheckpointRef({
-            cwd: sessionRuntime.value.cwd,
-            fromCheckpointRef: targetCheckpoint.checkpointRef,
-            toCheckpointRef: checkpoint.checkpointRef,
-          }),
-        { discard: true },
-      );
 
-      clearWorkspaceIndexCache(sessionRuntime.value.cwd);
+      clearWorkspaceIndexCache(checkpointCwd);
       yield* orchestrationEngine.dispatch({
         type: "thread.turn.diff.complete",
         commandId: serverCommandId("checkpoint-files-undone"),
@@ -1001,6 +994,26 @@ const make = Effect.gen(function* () {
         checkpointTurnCount: targetCheckpoint.checkpointTurnCount,
         createdAt: now,
       });
+      return;
+    }
+
+    const sessionRuntime = yield* resolveSessionRuntimeForThread(event.payload.threadId);
+    if (Option.isNone(sessionRuntime)) {
+      yield* appendRevertFailureActivity({
+        threadId: event.payload.threadId,
+        turnCount: event.payload.turnCount,
+        detail: "No active provider session with workspace cwd is bound to this thread.",
+        createdAt: now,
+      }).pipe(Effect.catch(() => Effect.void));
+      return;
+    }
+    if (!isGitWorkspace(sessionRuntime.value.cwd)) {
+      yield* appendRevertFailureActivity({
+        threadId: event.payload.threadId,
+        turnCount: event.payload.turnCount,
+        detail: "Checkpoints are unavailable because this project is not a git repository.",
+        createdAt: now,
+      }).pipe(Effect.catch(() => Effect.void));
       return;
     }
 

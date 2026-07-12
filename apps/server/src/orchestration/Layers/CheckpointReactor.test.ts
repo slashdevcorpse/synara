@@ -187,14 +187,16 @@ function runGit(cwd: string, args: ReadonlyArray<string>) {
   });
 }
 
-function createGitRepository() {
+function createGitRepository(hasInitialCommit = true) {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "synara-checkpoint-handler-"));
   runGit(cwd, ["init", "--initial-branch=main"]);
   runGit(cwd, ["config", "user.email", "test@example.com"]);
   runGit(cwd, ["config", "user.name", "Test User"]);
-  fs.writeFileSync(path.join(cwd, "README.md"), "v1\n", "utf8");
-  runGit(cwd, ["add", "."]);
-  runGit(cwd, ["commit", "-m", "Initial"]);
+  if (hasInitialCommit) {
+    fs.writeFileSync(path.join(cwd, "README.md"), "v1\n", "utf8");
+    runGit(cwd, ["add", "."]);
+    runGit(cwd, ["commit", "-m", "Initial"]);
+  }
   return cwd;
 }
 
@@ -258,8 +260,9 @@ describe("CheckpointReactor", () => {
     readonly threadWorktreePath?: string | null;
     readonly providerSessionCwd?: string;
     readonly providerName?: ProviderKind;
+    readonly hasInitialCommit?: boolean;
   }) {
-    const cwd = createGitRepository();
+    const cwd = createGitRepository(options?.hasInitialCommit ?? true);
     tempDirs.push(cwd);
     const provider = createProviderServiceHarness(
       cwd,
@@ -1340,6 +1343,7 @@ describe("CheckpointReactor", () => {
     const threadId = ThreadId.makeUnsafe("thread-1");
     const turnOneId = asTurnId("turn-files-1");
     const turnTwoId = asTurnId("turn-files-2");
+    const placeholderTurnId = asTurnId("turn-files-placeholder");
 
     await runtime!.runPromise(
       harness.checkpointStore.captureCheckpoint({
@@ -1353,6 +1357,13 @@ describe("CheckpointReactor", () => {
       harness.checkpointStore.captureCheckpoint({
         cwd: harness.cwd,
         checkpointRef: checkpointRefForThreadTurn(threadId, 1),
+      }),
+    );
+    await runtime!.runPromise(
+      harness.checkpointStore.copyCheckpointRef({
+        cwd: harness.cwd,
+        fromCheckpointRef: checkpointRefForThreadTurn(threadId, 1),
+        toCheckpointRef: checkpointRefForThreadTurnStart(threadId, turnTwoId),
       }),
     );
     fs.writeFileSync(path.join(harness.cwd, "two.txt"), "two\n", "utf8");
@@ -1424,6 +1435,20 @@ describe("CheckpointReactor", () => {
         }),
       );
     }
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.diff.complete",
+        commandId: CommandId.makeUnsafe("cmd-files-undo-live-placeholder"),
+        threadId,
+        turnId: placeholderTurnId,
+        completedAt: createdAt,
+        checkpointRef: CheckpointRef.makeUnsafe("provider-diff:files-undo-placeholder"),
+        status: "missing",
+        files: [{ path: "placeholder.txt", kind: "modified", additions: 1, deletions: 0 }],
+        checkpointTurnCount: 3,
+        createdAt,
+      }),
+    );
 
     await Effect.runPromise(
       harness.engine.dispatch({
@@ -1435,12 +1460,18 @@ describe("CheckpointReactor", () => {
         createdAt,
       }),
     );
-    await harness.drain();
+    await waitForThread(harness.engine, (entry) =>
+      entry.checkpoints.some(
+        (checkpoint) => checkpoint.checkpointTurnCount === 2 && checkpoint.files?.length === 0,
+      ),
+    );
     const afterFirstUndo = (await Effect.runPromise(harness.engine.getReadModel())).threads.find(
       (entry) => entry.id === threadId,
     );
     expect(afterFirstUndo?.activities).toEqual([]);
-    expect(afterFirstUndo?.checkpoints[1]?.files).toEqual([]);
+    expect(
+      afterFirstUndo?.checkpoints.find((checkpoint) => checkpoint.checkpointTurnCount === 2)?.files,
+    ).toEqual([]);
     expect(fs.readFileSync(path.join(harness.cwd, "one.txt"), "utf8")).toBe("one\n");
     expect(fs.existsSync(path.join(harness.cwd, "two.txt"))).toBe(false);
 
@@ -1454,12 +1485,20 @@ describe("CheckpointReactor", () => {
         createdAt,
       }),
     );
-    await harness.drain();
+    await waitForThread(harness.engine, (entry) =>
+      entry.checkpoints.some(
+        (checkpoint) => checkpoint.checkpointTurnCount === 1 && checkpoint.files?.length === 0,
+      ),
+    );
 
     const readModel = await Effect.runPromise(harness.engine.getReadModel());
     const thread = readModel.threads.find((entry) => entry.id === threadId);
-    expect(thread?.checkpoints.every((checkpoint) => checkpoint.files.length === 0)).toBe(true);
-    expect(thread?.latestTurn?.turnId).toBe(turnTwoId);
+    expect(
+      thread?.checkpoints
+        .filter((checkpoint) => !checkpoint.checkpointRef.startsWith("provider-diff:"))
+        .every((checkpoint) => checkpoint.files.length === 0),
+    ).toBe(true);
+    expect(thread?.latestTurn?.turnId).toBe(placeholderTurnId);
     expect(thread?.messages.map((message) => message.text)).toEqual([
       "Change two files",
       "Changed them",
@@ -1469,9 +1508,25 @@ describe("CheckpointReactor", () => {
     expect(fs.existsSync(path.join(harness.cwd, "two.txt"))).toBe(false);
     expect(gitRefExists(harness.cwd, checkpointRefForThreadTurn(threadId, 1))).toBe(true);
     expect(gitRefExists(harness.cwd, checkpointRefForThreadTurn(threadId, 2))).toBe(true);
-    expect(runGit(harness.cwd, ["rev-parse", checkpointRefForThreadTurn(threadId, 1)]).trim()).toBe(
-      runGit(harness.cwd, ["rev-parse", checkpointRefForThreadTurn(threadId, 2)]).trim(),
-    );
+    expect(
+      runGit(harness.cwd, ["rev-parse", checkpointRefForThreadTurn(threadId, 1)]).trim(),
+    ).not.toBe(runGit(harness.cwd, ["rev-parse", checkpointRefForThreadTurn(threadId, 2)]).trim());
+    expect(
+      runGit(harness.cwd, [
+        "diff",
+        "--name-only",
+        checkpointRefForThreadTurnStart(threadId, turnTwoId),
+        checkpointRefForThreadTurn(threadId, 2),
+      ]),
+    ).toBe("");
+    expect(
+      runGit(harness.cwd, [
+        "ls-tree",
+        "-r",
+        "--name-only",
+        checkpointRefForThreadTurnStart(threadId, turnTwoId),
+      ]),
+    ).toContain("one.txt");
     expect(runGit(harness.cwd, ["diff", "--cached", "--name-only"]).trim()).toBe("");
     const events = await Effect.runPromise(
       Stream.runCollect(harness.engine.readEvents(0)).pipe(
@@ -1491,11 +1546,88 @@ describe("CheckpointReactor", () => {
         createdAt,
       }),
     );
-    await harness.drain();
+    await waitForEvent(harness.engine, (event) => event.type === "thread.reverted");
     expect(fs.existsSync(path.join(harness.cwd, "one.txt"))).toBe(false);
     expect(fs.existsSync(path.join(harness.cwd, "two.txt"))).toBe(false);
     expect(fs.existsSync(path.join(harness.cwd, "later.txt"))).toBe(false);
     expect(harness.provider.rollbackConversation).toHaveBeenCalledTimes(1);
+  });
+
+  it("undoes staged renames without an active session or HEAD", async () => {
+    const harness = await createHarness({
+      hasSession: false,
+      hasInitialCommit: false,
+      seedFilesystemCheckpoints: false,
+    });
+    const createdAt = new Date().toISOString();
+    const threadId = ThreadId.makeUnsafe("thread-1");
+
+    await runtime!.runPromise(
+      harness.checkpointStore.captureCheckpoint({
+        cwd: harness.cwd,
+        checkpointRef: checkpointRefForThreadTurn(threadId, 0),
+      }),
+    );
+    fs.writeFileSync(path.join(harness.cwd, "before.txt"), "before\n", "utf8");
+    runGit(harness.cwd, ["add", "before.txt"]);
+    await runtime!.runPromise(
+      harness.checkpointStore.captureCheckpoint({
+        cwd: harness.cwd,
+        checkpointRef: checkpointRefForThreadTurn(threadId, 1),
+      }),
+    );
+    runGit(harness.cwd, ["mv", "before.txt", "after.txt"]);
+    await runtime!.runPromise(
+      harness.checkpointStore.captureCheckpoint({
+        cwd: harness.cwd,
+        checkpointRef: checkpointRefForThreadTurn(threadId, 2),
+      }),
+    );
+
+    for (const [turnCount, turnId, filePath] of [
+      [1, asTurnId("turn-unborn-add"), "before.txt"],
+      [2, asTurnId("turn-unborn-rename"), "after.txt"],
+    ] as const) {
+      await Effect.runPromise(
+        harness.engine.dispatch({
+          type: "thread.turn.diff.complete",
+          commandId: CommandId.makeUnsafe(`cmd-unborn-diff-${turnCount}`),
+          threadId,
+          turnId,
+          completedAt: createdAt,
+          checkpointRef: checkpointRefForThreadTurn(threadId, turnCount),
+          status: "ready",
+          files: [{ path: filePath, kind: "modified", additions: 1, deletions: 0 }],
+          checkpointTurnCount: turnCount,
+          createdAt,
+        }),
+      );
+    }
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.checkpoint.revert",
+        commandId: CommandId.makeUnsafe("cmd-unborn-undo-rename"),
+        threadId,
+        turnCount: 2,
+        scope: "files",
+        createdAt,
+      }),
+    );
+    await waitForThread(harness.engine, (entry) =>
+      entry.checkpoints.some(
+        (checkpoint) => checkpoint.checkpointTurnCount === 2 && checkpoint.files?.length === 0,
+      ),
+    );
+
+    expect(fs.existsSync(path.join(harness.cwd, "before.txt"))).toBe(true);
+    expect(fs.existsSync(path.join(harness.cwd, "after.txt"))).toBe(false);
+    expect(runGit(harness.cwd, ["diff", "--cached", "--name-only"])).toBe("before.txt\n");
+    const thread = (await Effect.runPromise(harness.engine.getReadModel())).threads.find(
+      (entry) => entry.id === threadId,
+    );
+    expect(thread?.activities).toEqual([]);
+    expect(harness.provider.rollbackConversation).not.toHaveBeenCalled();
   });
 
   it("keeps full thread revert behavior for explicit thread scope", async () => {

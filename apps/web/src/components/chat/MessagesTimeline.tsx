@@ -1584,7 +1584,13 @@ export const MessagesTimeline = memo(function MessagesTimeline({
                   const checkpointTurnCounts =
                     turnSummary.checkpointTurnCounts ??
                     (checkpointTurnCount === undefined ? [] : [checkpointTurnCount]);
-                  const canUndo = checkpointTurnCounts.length > 0 && onUndoTurnFiles !== undefined;
+                  const canUndo =
+                    turnSummary.status !== "missing" &&
+                    turnSummary.status !== "error" &&
+                    turnSummary.checkpointRef !== undefined &&
+                    !turnSummary.checkpointRef.startsWith("provider-diff:") &&
+                    checkpointTurnCounts.length > 0 &&
+                    onUndoTurnFiles !== undefined;
                   const totalAdditions = checkpointFiles.reduce(
                     (sum, file) => sum + (file.additions ?? 0),
                     0,
