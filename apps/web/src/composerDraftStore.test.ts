@@ -2194,7 +2194,7 @@ describe("composerDraftStore setModelSelection", () => {
 
   it("drops a runtime Codex effort when switching models before terminal promotion", () => {
     const store = useComposerDraftStore.getState();
-    store.setModelSelection(
+    store.setModelSelectionAndSticky(
       threadId,
       modelSelection("codex", "gpt-5.6-sol", {
         reasoningEffort: "ultra",
@@ -2202,11 +2202,13 @@ describe("composerDraftStore setModelSelection", () => {
       }),
     );
 
-    store.setModelSelection(threadId, modelSelection("codex", "gpt-5.4"));
+    store.setModelSelectionAndSticky(threadId, modelSelection("codex", "gpt-5.4"));
 
-    const draft = useComposerDraftStore.getState().draftsByThreadId[threadId];
+    const state = useComposerDraftStore.getState();
+    const draft = state.draftsByThreadId[threadId];
     const expectedSelection = modelSelection("codex", "gpt-5.4", { fastMode: true });
     expect(draft?.modelSelectionByProvider.codex).toEqual(expectedSelection);
+    expect(state.stickyModelSelectionByProvider.codex).toEqual(expectedSelection);
     expect(
       resolvePreferredComposerModelSelection({
         draft,
@@ -2218,14 +2220,17 @@ describe("composerDraftStore setModelSelection", () => {
 
   it("retains a runtime Codex effort when reselecting the same model", () => {
     const store = useComposerDraftStore.getState();
-    const selection = modelSelection("codex", "gpt-5.6-sol", { reasoningEffort: "max" });
-    store.setModelSelection(threadId, selection);
+    const selection = modelSelection("codex", "gpt-5.6-sol", {
+      reasoningEffort: "max",
+      fastMode: true,
+    });
+    store.setModelSelectionAndSticky(threadId, selection);
 
-    store.setModelSelection(threadId, modelSelection("codex", "gpt-5.6-sol"));
+    store.setModelSelectionAndSticky(threadId, modelSelection("codex", "gpt-5.6-sol"));
 
-    expect(
-      useComposerDraftStore.getState().draftsByThreadId[threadId]?.modelSelectionByProvider.codex,
-    ).toEqual(selection);
+    const state = useComposerDraftStore.getState();
+    expect(state.draftsByThreadId[threadId]?.modelSelectionByProvider.codex).toEqual(selection);
+    expect(state.stickyModelSelectionByProvider.codex).toEqual(selection);
   });
 });
 

@@ -543,6 +543,7 @@ export interface ComposerDraftStoreState {
     threadId: ThreadId,
     modelSelection: ModelSelection | null | undefined,
   ) => void;
+  setModelSelectionAndSticky: (threadId: ThreadId, modelSelection: ModelSelection) => void;
   setModelOptions: (
     threadId: ThreadId,
     modelOptions: ProviderModelOptions | null | undefined,
@@ -3815,6 +3816,12 @@ export const useComposerDraftStore = create<ComposerDraftStoreState>()(
           }
           return { draftsByThreadId: nextDraftsByThreadId };
         });
+      },
+      setModelSelectionAndSticky: (threadId, modelSelection) => {
+        get().setModelSelection(threadId, modelSelection);
+        const correctedSelection =
+          get().draftsByThreadId[threadId]?.modelSelectionByProvider[modelSelection.provider];
+        get().setStickyModelSelection(correctedSelection ?? modelSelection);
       },
       setModelOptions: (threadId, modelOptions) => {
         if (threadId.length === 0) {

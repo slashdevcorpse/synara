@@ -1026,8 +1026,8 @@ export default function ChatView({
   const desktopTopBarTrafficLightGutterClassName = useDesktopTopBarTrafficLightGutterClassName();
   const desktopTopBarWindowControlsGutterClassName =
     useDesktopTopBarWindowControlsGutterClassName();
-  const setStickyComposerModelSelection = useComposerDraftStore(
-    (store) => store.setStickyModelSelection,
+  const setComposerDraftModelSelectionAndSticky = useComposerDraftStore(
+    (store) => store.setModelSelectionAndSticky,
   );
   const timestampFormat = settings.timestampFormat;
   const navigate = useNavigate();
@@ -8547,23 +8547,21 @@ export default function ChatView({
         provider,
         model: resolvedModel,
       };
-      setComposerDraftModelSelection(activeThread.id, nextModelSelection);
+      setComposerDraftModelSelectionAndSticky(activeThread.id, nextModelSelection);
       if (provider === "cursor" && !showExpandedCursorModelVariants) {
         setComposerDraftProviderModelOptions(activeThread.id, provider, undefined, {
           persistSticky: true,
           model: resolvedModel,
         });
       }
-      setStickyComposerModelSelection(nextModelSelection);
       scheduleComposerFocus();
     },
     [
       activeThread,
       lockedProvider,
       scheduleComposerFocus,
-      setComposerDraftModelSelection,
+      setComposerDraftModelSelectionAndSticky,
       setComposerDraftProviderModelOptions,
-      setStickyComposerModelSelection,
       showExpandedCursorModelVariants,
       customModelsByProvider,
       modelOptionsByProvider,
