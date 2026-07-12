@@ -877,7 +877,7 @@ const make = Effect.gen(function* () {
             threadId: event.payload.threadId,
             thread,
             project,
-            preferSessionRuntime: false,
+            preferSessionRuntime: true,
           })
         : undefined;
       if (!checkpointCwd) {
