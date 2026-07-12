@@ -43,6 +43,25 @@ describe("root event invalidation", () => {
     expect(shouldInvalidateGitQueriesForEvent(event("thread.conversation-rolled-back"))).toBe(true);
   });
 
+  it("invalidates workspace caches for review-required file restore failures", () => {
+    const threadId = ThreadId.makeUnsafe("thread-restore-review");
+    const reviewRequiredFailure = event("thread.checkpoint-files-restore-failed", {
+      threadId,
+      requiresWorkspaceReview: true,
+    });
+    const safeFailure = event("thread.checkpoint-files-restore-failed", {
+      threadId,
+      requiresWorkspaceReview: false,
+    });
+
+    expect(shouldInvalidateGitQueriesForEvent(reviewRequiredFailure)).toBe(true);
+    expect(shouldInvalidateProviderQueriesForEvent(reviewRequiredFailure)).toBe(true);
+    expect(getGitInvalidationThreadIdForEvent(reviewRequiredFailure)).toBe(threadId);
+    expect(getStudioOutputInvalidationThreadIdForEvent(reviewRequiredFailure)).toBe(threadId);
+    expect(shouldInvalidateGitQueriesForEvent(safeFailure)).toBe(false);
+    expect(shouldInvalidateProviderQueriesForEvent(safeFailure)).toBe(false);
+  });
+
   it("invalidates git queries when thread workspace metadata changes", () => {
     expect(
       shouldInvalidateGitQueriesForEvent(event("thread.meta-updated", { branch: "feature/diff" })),

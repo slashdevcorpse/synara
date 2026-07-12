@@ -20,12 +20,22 @@ const FILE_CHANGE_EVENT_TYPES = new Set<OrchestrationEvent["type"]>([
   "thread.conversation-rolled-back",
 ]);
 
+function isReviewRequiredFileRestoreFailure(event: OrchestrationEvent): boolean {
+  return (
+    event.type === "thread.checkpoint-files-restore-failed" && event.payload.requiresWorkspaceReview
+  );
+}
+
+function shouldInvalidateWorkspaceFileQueriesForEvent(event: OrchestrationEvent): boolean {
+  return FILE_CHANGE_EVENT_TYPES.has(event.type) || isReviewRequiredFileRestoreFailure(event);
+}
+
 export function shouldInvalidateProviderQueriesForEvent(event: OrchestrationEvent): boolean {
-  return FILE_CHANGE_EVENT_TYPES.has(event.type);
+  return shouldInvalidateWorkspaceFileQueriesForEvent(event);
 }
 
 export function shouldInvalidateGitQueriesForEvent(event: OrchestrationEvent): boolean {
-  if (FILE_CHANGE_EVENT_TYPES.has(event.type)) {
+  if (shouldInvalidateWorkspaceFileQueriesForEvent(event)) {
     return true;
   }
 
@@ -83,7 +93,7 @@ export function getStudioOutputInvalidationThreadIdForEvent(
       ? getProjectFileInvalidationThreadIdForEvent(event)
       : null;
   }
-  if (!FILE_CHANGE_EVENT_TYPES.has(event.type)) {
+  if (!shouldInvalidateWorkspaceFileQueriesForEvent(event)) {
     return null;
   }
   return "threadId" in event.payload ? (event.payload.threadId as ThreadId) : null;

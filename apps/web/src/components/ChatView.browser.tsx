@@ -1754,6 +1754,10 @@ describe("ChatView timeline estimator parity (full app)", () => {
       });
       await waitForLayout();
       expect(editor.getAttribute("contenteditable")).toBe("false");
+      const workspaceQueryRequestsBeforeReplay = wsRequests.filter(
+        (request) =>
+          request._tag === WS_METHODS.gitListBranches || request._tag === WS_METHODS.gitStatus,
+      ).length;
 
       orchestrationReplayEvents = [
         {
@@ -1798,6 +1802,13 @@ describe("ChatView timeline estimator parity (full app)", () => {
         () => {
           expect(editor.getAttribute("contenteditable")).toBe("true");
           expect(readPendingCheckpointFileRestore()).toBeNull();
+          expect(
+            wsRequests.filter(
+              (request) =>
+                request._tag === WS_METHODS.gitListBranches ||
+                request._tag === WS_METHODS.gitStatus,
+            ).length,
+          ).toBeGreaterThan(workspaceQueryRequestsBeforeReplay);
         },
         { timeout: 5_000, interval: 50 },
       );

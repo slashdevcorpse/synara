@@ -124,9 +124,8 @@ export function shouldReconcileCheckpointFileRestoreAcceptance(
 
 export function isStaleCheckpointFileRestoreConfirmation(
   pending: PendingCheckpointFileRestore,
-  clientId: string = getCheckpointFileRestoreClientId(),
 ): boolean {
-  return pending.phase === "confirming" && pending.clientId !== clientId;
+  return pending.phase === "confirming" && pending.clientId === undefined;
 }
 
 export function getCheckpointFileRestoreStorage(): Storage | null {

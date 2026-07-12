@@ -1527,6 +1527,100 @@ describe("CheckpointReactor", () => {
     expect(gitRefExists(harness.cwd, checkpointRefForThreadTurn(threadId, 2))).toBe(true);
   });
 
+  it("uses numbered checkpoints for legacy file restores only before prior file-restore side effects", async () => {
+    const harness = await createHarness();
+    const createdAt = new Date().toISOString();
+    const threadId = ThreadId.makeUnsafe("thread-1");
+    const firstMessageId = MessageId.makeUnsafe("message-legacy-files-only-1");
+    const secondMessageId = MessageId.makeUnsafe("message-legacy-files-only-2");
+    const firstRequestCommandId = CommandId.makeUnsafe("cmd-legacy-files-only-1");
+    const secondRequestCommandId = CommandId.makeUnsafe("cmd-legacy-files-only-2");
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.makeUnsafe("cmd-legacy-files-only-session-set"),
+        threadId,
+        session: {
+          threadId,
+          status: "ready",
+          providerName: "claudeAgent",
+          runtimeMode: "approval-required",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: createdAt,
+        },
+        createdAt,
+      }),
+    );
+    for (const checkpointTurnCount of [1, 2]) {
+      await Effect.runPromise(
+        harness.engine.dispatch({
+          type: "thread.turn.diff.complete",
+          commandId: CommandId.makeUnsafe(`cmd-legacy-files-only-diff-${checkpointTurnCount}`),
+          threadId,
+          turnId: asTurnId(`turn-legacy-files-only-${checkpointTurnCount}`),
+          completedAt: createdAt,
+          checkpointRef: checkpointRefForThreadTurn(threadId, checkpointTurnCount),
+          status: "ready",
+          files: [],
+          checkpointTurnCount,
+          createdAt,
+        }),
+      );
+    }
+
+    expect(
+      gitRefExists(harness.cwd, checkpointRefForThreadMessageStart(threadId, firstMessageId)),
+    ).toBe(false);
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.checkpoint.files.restore",
+        commandId: firstRequestCommandId,
+        threadId,
+        messageId: firstMessageId,
+        turnCount: 1,
+        createdAt,
+      }),
+    );
+
+    await waitForEvent(
+      harness.engine,
+      (event) =>
+        event.type === "thread.checkpoint-files-restored" &&
+        event.payload.requestCommandId === firstRequestCommandId,
+    );
+    expect(fs.readFileSync(path.join(harness.cwd, "README.md"), "utf8")).toBe("v2\n");
+
+    fs.writeFileSync(path.join(harness.cwd, "README.md"), "newer after legacy restore\n", "utf8");
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.checkpoint.files.restore",
+        commandId: secondRequestCommandId,
+        threadId,
+        messageId: secondMessageId,
+        turnCount: 2,
+        createdAt,
+      }),
+    );
+
+    const events = await waitForEvent(
+      harness.engine,
+      (event) =>
+        event.type === "thread.checkpoint-files-restore-failed" &&
+        event.payload.requestCommandId === secondRequestCommandId,
+    );
+    const secondTerminalSuccess = events.find(
+      (event) =>
+        event.type === "thread.checkpoint-files-restored" &&
+        event.payload.requestCommandId === secondRequestCommandId,
+    );
+    expect(secondTerminalSuccess).toBeUndefined();
+    expect(fs.readFileSync(path.join(harness.cwd, "README.md"), "utf8")).toBe(
+      "newer after legacy restore\n",
+    );
+  });
+
   it("restores turn zero from the persisted checkpoint family", async () => {
     const harness = await createHarness({ seedFilesystemCheckpoints: false });
     const createdAt = new Date().toISOString();

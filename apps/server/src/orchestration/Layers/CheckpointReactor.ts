@@ -913,6 +913,24 @@ const make = Effect.gen(function* () {
     });
   });
 
+  const hasPriorFilesRestoreSideEffect = Effect.fnUntraced(function* (
+    threadId: ThreadId,
+    beforeSequence: number,
+  ) {
+    const events = yield* Stream.runCollect(orchestrationEngine.readEvents(0)).pipe(
+      Effect.map((chunk): OrchestrationEvent[] => Array.from(chunk)),
+    );
+    return events.some(
+      (candidate) =>
+        candidate.aggregateKind === "thread" &&
+        candidate.aggregateId === threadId &&
+        candidate.sequence < beforeSequence &&
+        (candidate.type === "thread.checkpoint-files-restored" ||
+          (candidate.type === "thread.checkpoint-files-restore-failed" &&
+            candidate.payload.requiresWorkspaceReview)),
+    );
+  });
+
   const handleRevertRequested = Effect.fnUntraced(function* (
     event: Extract<
       OrchestrationEvent,
@@ -1016,13 +1034,21 @@ const make = Effect.gen(function* () {
         ),
       )
       .find((checkpointRef) => checkpointRef !== null);
-    const targetCheckpointRef = filesRestore
-      ? checkpointRefForThreadMessageStart(event.payload.threadId, filesRestore.messageId)
-      : event.payload.turnCount === 0
+    const numberedTurnCheckpointRef =
+      event.payload.turnCount === 0
         ? (earliestManagedBaselineRef ?? checkpointRefForThreadTurn(event.payload.threadId, 0))
         : thread.checkpoints.find(
             (checkpoint) => checkpoint.checkpointTurnCount === event.payload.turnCount,
           )?.checkpointRef;
+    const targetCheckpointRef = filesRestore
+      ? checkpointRefForThreadMessageStart(event.payload.threadId, filesRestore.messageId)
+      : numberedTurnCheckpointRef;
+    const legacyFilesRestoreFallbackRef =
+      filesRestore &&
+      numberedTurnCheckpointRef &&
+      !(yield* hasPriorFilesRestoreSideEffect(event.payload.threadId, event.sequence))
+        ? numberedTurnCheckpointRef
+        : null;
 
     if (!targetCheckpointRef) {
       yield* appendRevertFailureActivity({
@@ -1035,13 +1061,31 @@ const make = Effect.gen(function* () {
       return;
     }
 
-    const restored = yield* withCheckpointFileRestoreInterlock(
-      checkpointStore.restoreCheckpoint({
-        cwd: sessionRuntime.value.cwd,
-        checkpointRef: targetCheckpointRef,
-        fallbackToHead: !filesOnly && event.payload.turnCount === 0,
-      }),
+    const restoreTargetCheckpointRef = (checkpointRef: CheckpointRef, fallbackToHead: boolean) =>
+      withCheckpointFileRestoreInterlock(
+        checkpointStore.restoreCheckpoint({
+          cwd: sessionRuntime.value.cwd,
+          checkpointRef,
+          fallbackToHead,
+        }),
+      );
+
+    let restored = yield* restoreTargetCheckpointRef(
+      targetCheckpointRef,
+      !filesOnly && event.payload.turnCount === 0,
     );
+    if (
+      !restored &&
+      filesRestore &&
+      legacyFilesRestoreFallbackRef !== null &&
+      legacyFilesRestoreFallbackRef !== targetCheckpointRef
+    ) {
+      // Older histories predate message-start checkpoint refs. Before any
+      // successful file-only undo, the persisted numbered turn checkpoint is
+      // still the best known message-start baseline; after one undo it is no
+      // longer safe because sequential undo must preserve the post-undo state.
+      restored = yield* restoreTargetCheckpointRef(legacyFilesRestoreFallbackRef, false);
+    }
     if (!restored) {
       yield* appendRevertFailureActivity({
         threadId: event.payload.threadId,

@@ -509,7 +509,7 @@ describe("checkpoint file restore pending storage", () => {
     ).toBe(true);
   });
 
-  it("recognizes a confirmation abandoned by a previous client instance", () => {
+  it("does not treat another tab's confirmation lock as stale", () => {
     const pending = {
       threadId,
       messageId,
@@ -520,8 +520,9 @@ describe("checkpoint file restore pending storage", () => {
       clientId: "client-before-reload",
     };
 
-    expect(isStaleCheckpointFileRestoreConfirmation(pending, "client-before-reload")).toBe(false);
-    expect(isStaleCheckpointFileRestoreConfirmation(pending, "client-after-reload")).toBe(true);
+    expect(isStaleCheckpointFileRestoreConfirmation(pending)).toBe(false);
+    const { clientId: _clientId, ...ownerlessPending } = pending;
+    expect(isStaleCheckpointFileRestoreConfirmation(ownerlessPending)).toBe(true);
   });
 
   it("rejects storage writes that cannot be read back", () => {

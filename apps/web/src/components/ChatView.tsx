@@ -75,6 +75,8 @@ import {
   gitCreateWorktreeMutationOptions,
   gitGithubRepositoryQueryOptions,
   gitBranchesQueryOptions,
+  invalidateGitQueries,
+  invalidateGitQueriesForCwds,
 } from "~/lib/gitReactQuery";
 import { resolveProviderDiscoveryCwd } from "~/lib/providerDiscovery";
 import {
@@ -89,7 +91,12 @@ import {
   supportsSkillDiscovery,
   supportsThreadCompaction,
 } from "~/lib/providerDiscoveryReactQuery";
-import { projectSearchEntriesQueryOptions } from "~/lib/projectReactQuery";
+import { providerQueryKeys } from "~/lib/providerReactQuery";
+import {
+  invalidateProjectFileQueriesForCwds,
+  projectQueryKeys,
+  projectSearchEntriesQueryOptions,
+} from "~/lib/projectReactQuery";
 import { serverConfigQueryOptions, serverQueryKeys } from "~/lib/serverReactQuery";
 import {
   CHECKPOINT_FILE_RESTORE_BLOCKED_MESSAGE,
@@ -3814,6 +3821,39 @@ export default function ChatView({
       throw new Error(CHECKPOINT_FILE_RESTORE_BLOCKED_MESSAGE);
     }
   }, []);
+  const invalidateCheckpointFileRestoreWorkspace = useCallback(
+    (targetThreadId: ThreadId) => {
+      void queryClient.invalidateQueries({ queryKey: providerQueryKeys.all });
+      void queryClient.invalidateQueries({
+        queryKey: serverQueryKeys.studioThreadOutputs(targetThreadId),
+      });
+
+      const state = useStore.getState();
+      const thread =
+        getThreadFromState(state, targetThreadId) ??
+        state.threads.find((candidate) => candidate.id === targetThreadId);
+      const projectCwd =
+        state.projects.find((project) => project.id === thread?.projectId)?.cwd ?? null;
+      const workspaceCwd =
+        thread && projectCwd
+          ? resolveSharedThreadWorkspaceCwd({
+              projectCwd,
+              envMode: thread.envMode,
+              worktreePath: thread.worktreePath,
+            })
+          : null;
+
+      if (workspaceCwd) {
+        void invalidateProjectFileQueriesForCwds(queryClient, [workspaceCwd]);
+        void invalidateGitQueriesForCwds(queryClient, [workspaceCwd]);
+        return;
+      }
+
+      void queryClient.invalidateQueries({ queryKey: projectQueryKeys.all });
+      void invalidateGitQueries(queryClient);
+    },
+    [queryClient],
+  );
 
   useEffect(() => {
     const pending = readPendingCheckpointFileRestore();
@@ -3891,6 +3931,7 @@ export default function ChatView({
     void completion.promise
       .then(() => {
         if (cancelled) return;
+        invalidateCheckpointFileRestoreWorkspace(pending.threadId);
         clearPendingCheckpointFileRestore(pending.requestCommandId);
         setCheckpointFileRestoreReviewMessage(null);
         setThreadError(pending.threadId, null);
@@ -3902,6 +3943,7 @@ export default function ChatView({
         if (cancelled) return;
         const message = error instanceof Error ? error.message : "Failed to restore file changes.";
         if (isCheckpointFileRestoreReviewRequiredError(error)) {
+          invalidateCheckpointFileRestoreWorkspace(pending.threadId);
           const reviewMessage = `${message} Inspect the working tree, then use “Review and unlock” before starting new work.`;
           setCheckpointFileRestoreReviewMessage(reviewMessage);
           setThreadError(activeThreadId ?? pending.threadId, reviewMessage);
@@ -3922,7 +3964,12 @@ export default function ChatView({
       cancelled = true;
       completion.cancel();
     };
-  }, [activeThreadId, pendingCheckpointFileRestoreSnapshot, setThreadError]);
+  }, [
+    activeThreadId,
+    invalidateCheckpointFileRestoreWorkspace,
+    pendingCheckpointFileRestoreSnapshot,
+    setThreadError,
+  ]);
 
   const focusComposer = useCallback(() => {
     // Secondary chrome is deferred during thread switches; replay focus once it

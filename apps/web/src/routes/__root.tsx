@@ -749,6 +749,7 @@ function isThreadDetailEventForThread(event: OrchestrationEvent, threadId: Threa
     event.type === "thread.activity-appended" ||
     event.type === "thread.turn-diff-completed" ||
     event.type === "thread.checkpoint-files-restored" ||
+    event.type === "thread.checkpoint-files-restore-failed" ||
     event.type === "thread.reverted" ||
     event.type === "thread.conversation-rolled-back" ||
     event.type === "thread.session-set" ||
