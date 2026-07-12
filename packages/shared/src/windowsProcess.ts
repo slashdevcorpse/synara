@@ -32,6 +32,7 @@ export interface WindowsSafeProcessCommand {
   readonly args: string[];
   readonly shell: false;
   readonly windowsHide?: true;
+  readonly windowsVerbatimArguments?: true;
 }
 
 const WINDOWS_BATCH_EXTENSION_PATTERN = /\.(?:cmd|bat)$/i;
@@ -183,5 +184,6 @@ export function prepareWindowsSafeProcess(
     args: buildWindowsBatchCommandArgs(resolvedCommand, args),
     shell: false,
     windowsHide: true,
+    windowsVerbatimArguments: true,
   };
 }

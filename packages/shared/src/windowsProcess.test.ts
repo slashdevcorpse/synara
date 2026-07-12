@@ -203,6 +203,7 @@ describe("windowsProcess", () => {
       ],
       shell: false,
       windowsHide: true,
+      windowsVerbatimArguments: true,
     });
   });
 
@@ -233,6 +234,7 @@ describe("windowsProcess", () => {
       ],
       shell: false,
       windowsHide: true,
+      windowsVerbatimArguments: true,
     });
   });
 
@@ -258,6 +260,7 @@ describe("windowsProcess", () => {
       ],
       shell: false,
       windowsHide: true,
+      windowsVerbatimArguments: true,
     });
     expect(spawnSync).not.toHaveBeenCalled();
   });
@@ -354,6 +357,7 @@ describe("windowsProcess", () => {
           encoding: "utf8",
           shell: false,
           windowsHide: true,
+          windowsVerbatimArguments: prepared.windowsVerbatimArguments,
         });
 
         expect(result.error).toBeUndefined();
