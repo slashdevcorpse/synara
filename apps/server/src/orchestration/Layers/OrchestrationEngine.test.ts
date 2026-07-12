@@ -180,6 +180,184 @@ describe("OrchestrationEngine", () => {
     await system.dispose();
   });
 
+  it("blocks new destructive work while a checkpoint files restore is pending", async () => {
+    const system = await createOrchestrationSystem();
+    const { engine } = system;
+    const createdAt = now();
+    const threadId = ThreadId.makeUnsafe("thread-restore-gate");
+    const requestCommandId = CommandId.makeUnsafe("cmd-restore-gate-request");
+
+    await system.run(
+      engine.dispatch({
+        type: "project.create",
+        commandId: CommandId.makeUnsafe("cmd-restore-gate-project"),
+        projectId: asProjectId("project-restore-gate"),
+        title: "Restore Gate Project",
+        workspaceRoot: "/tmp/project-restore-gate",
+        defaultModelSelection: {
+          provider: "codex",
+          model: "gpt-5-codex",
+        },
+        createdAt,
+      }),
+    );
+    await system.run(
+      engine.dispatch({
+        type: "thread.create",
+        commandId: CommandId.makeUnsafe("cmd-restore-gate-thread"),
+        threadId,
+        projectId: asProjectId("project-restore-gate"),
+        title: "restore-gate",
+        modelSelection: {
+          provider: "codex",
+          model: "gpt-5-codex",
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        branch: null,
+        worktreePath: null,
+        createdAt,
+      }),
+    );
+    await system.run(
+      engine.dispatch({
+        type: "thread.checkpoint.files.restore",
+        commandId: requestCommandId,
+        threadId,
+        messageId: asMessageId("msg-restore-gate"),
+        turnCount: 1,
+        createdAt,
+      }),
+    );
+
+    await expect(
+      system.run(
+        engine.dispatch({
+          type: "thread.turn.start",
+          commandId: CommandId.makeUnsafe("cmd-restore-gate-turn-blocked"),
+          threadId,
+          message: {
+            messageId: asMessageId("msg-restore-gate-blocked"),
+            role: "user",
+            text: "new work should wait",
+            attachments: [],
+          },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "approval-required",
+          createdAt,
+        }),
+      ),
+    ).rejects.toThrow("A checkpoint file restore is still pending");
+
+    await expect(
+      system.run(
+        engine.dispatch({
+          type: "thread.checkpoint.files.restore",
+          commandId: CommandId.makeUnsafe("cmd-restore-gate-second-restore"),
+          threadId,
+          messageId: asMessageId("msg-restore-gate-second"),
+          turnCount: 1,
+          createdAt,
+        }),
+      ),
+    ).rejects.toThrow("A checkpoint file restore is still pending");
+
+    await expect(
+      system.run(
+        engine.dispatch({
+          type: "project.create",
+          commandId: CommandId.makeUnsafe("cmd-restore-gate-project-blocked"),
+          projectId: asProjectId("project-restore-gate-blocked"),
+          title: "Blocked Restore Gate Project",
+          workspaceRoot: "/tmp/project-restore-gate-blocked",
+          defaultModelSelection: {
+            provider: "codex",
+            model: "gpt-5-codex",
+          },
+          createdAt,
+        }),
+      ),
+    ).rejects.toThrow("A checkpoint file restore is still pending");
+
+    await expect(
+      system.run(
+        engine.dispatch({
+          type: "project.meta.update",
+          commandId: CommandId.makeUnsafe("cmd-restore-gate-project-update-blocked"),
+          projectId: asProjectId("project-restore-gate"),
+          workspaceRoot: "/tmp/project-restore-gate-updated",
+        }),
+      ),
+    ).rejects.toThrow("A checkpoint file restore is still pending");
+
+    await expect(
+      system.run(
+        engine.dispatch({
+          type: "thread.delete",
+          commandId: CommandId.makeUnsafe("cmd-restore-gate-thread-delete-blocked"),
+          threadId,
+        }),
+      ),
+    ).rejects.toThrow("A checkpoint file restore is still pending");
+
+    await expect(
+      system.run(
+        engine.dispatch({
+          type: "thread.checkpoint.files.restore.reconcile",
+          commandId: CommandId.makeUnsafe("cmd-restore-gate-reconcile"),
+          requestCommandId,
+          threadId,
+          messageId: asMessageId("msg-restore-gate"),
+          turnCount: 1,
+          createdAt,
+        }),
+      ),
+    ).resolves.toEqual(
+      expect.objectContaining({
+        sequence: expect.any(Number),
+      }),
+    );
+
+    await system.run(
+      engine.dispatch({
+        type: "thread.checkpoint.files.restore.fail",
+        commandId: CommandId.makeUnsafe("cmd-restore-gate-fail"),
+        requestCommandId,
+        threadId,
+        messageId: asMessageId("msg-restore-gate"),
+        turnCount: 1,
+        detail: "Restore outcome requires review.",
+        requiresWorkspaceReview: true,
+        createdAt,
+      }),
+    );
+
+    await expect(
+      system.run(
+        engine.dispatch({
+          type: "thread.turn.start",
+          commandId: CommandId.makeUnsafe("cmd-restore-gate-turn-after-terminal"),
+          threadId,
+          message: {
+            messageId: asMessageId("msg-restore-gate-after-terminal"),
+            role: "user",
+            text: "new work can resume",
+            attachments: [],
+          },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "approval-required",
+          createdAt,
+        }),
+      ),
+    ).resolves.toEqual(
+      expect.objectContaining({
+        sequence: expect.any(Number),
+      }),
+    );
+
+    await system.dispose();
+  });
+
   it("streams persisted domain events in order", async () => {
     const system = await createOrchestrationSystem();
     const { engine } = system;

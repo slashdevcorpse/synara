@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 
 import {
   CommandId,
+  type ClientOrchestrationCommand,
   DEFAULT_TERMINAL_ID,
   ORCHESTRATION_WS_METHODS,
   ThreadId,
@@ -47,9 +48,17 @@ import { createLocalPreviewGrant } from "./localImageFiles";
 import { listLocalServers, stopLocalServer } from "./localServerMonitor";
 import { Open, resolveAvailableEditors } from "./open";
 import { makeDispatchCommandNormalizer } from "./orchestration/dispatchCommandNormalization";
+import { isDefinitiveDispatchRejection } from "./orchestration/dispatchRejectionClassification";
 import { makeImportThreadHandler } from "./orchestration/importThreadRoute";
 import { OrchestrationEngineService } from "./orchestration/Services/OrchestrationEngine";
 import { ProjectionSnapshotQuery } from "./orchestration/Services/ProjectionSnapshotQuery";
+import {
+  hasPendingCheckpointFileRestore,
+  isOrchestrationCommandTypeBlockedByPendingCheckpointFileRestore,
+  makePendingCheckpointFileRestoreCommandError,
+  shouldBlockCommandForPendingCheckpointFileRestore,
+} from "./orchestration/checkpointFileRestoreGate";
+import { withCheckpointFileRestoreInterlock } from "./orchestration/checkpointFileRestoreInterlock";
 import { shouldPublishThreadShellForEvent } from "./orchestration/threadShellEvents";
 import { ProviderDiscoveryService } from "./provider/Services/ProviderDiscoveryService";
 import { discoverSkillsCatalog, synaraSkillsDir } from "./provider/skillsCatalog";
@@ -629,9 +638,52 @@ export const makeWsRpcLayer = () =>
         options?: { readonly code?: WsRpcErrorCode },
       ) => effect.pipe(Effect.mapError((cause) => toWsRpcError(cause, fallbackMessage, options)));
 
+      const requireNoPendingCheckpointFileRestore = (
+        operation: string,
+        options?: { readonly allowRecordedCommandId?: CommandId },
+      ) =>
+        Stream.runCollect(orchestrationEngine.readEvents(0)).pipe(
+          Effect.map((events): OrchestrationEvent[] => Array.from(events)),
+          Effect.flatMap((events) => {
+            const blocked = options
+              ? shouldBlockCommandForPendingCheckpointFileRestore(events, operation, options)
+              : hasPendingCheckpointFileRestore(events);
+            return blocked
+              ? Effect.fail(makePendingCheckpointFileRestoreCommandError(operation))
+              : Effect.void;
+          }),
+        );
+
+      const gatedRpcEffect = <A, E, R>(
+        operation: string,
+        effect: Effect.Effect<A, E, R>,
+        fallbackMessage: string,
+        options?: { readonly code?: WsRpcErrorCode },
+      ): Effect.Effect<A, WsRpcError, R> =>
+        rpcEffect(
+          withCheckpointFileRestoreInterlock(
+            requireNoPendingCheckpointFileRestore(operation).pipe(Effect.flatMap(() => effect)),
+          ),
+          fallbackMessage,
+          options,
+        );
+
+      const gateDispatchCommandIfPotentiallyMutating = <A, E, R>(
+        command: ClientOrchestrationCommand,
+        effect: Effect.Effect<A, E, R>,
+      ) =>
+        isOrchestrationCommandTypeBlockedByPendingCheckpointFileRestore(command.type)
+          ? withCheckpointFileRestoreInterlock(
+              requireNoPendingCheckpointFileRestore(command.type, {
+                allowRecordedCommandId: command.commandId,
+              }).pipe(Effect.flatMap(() => effect)),
+            )
+          : effect;
+
       return WsRpcGroup.of({
         [ORCHESTRATION_WS_METHODS.dispatchCommand]: (command) =>
-          rpcEffect(
+          gateDispatchCommandIfPotentiallyMutating(
+            command,
             Effect.gen(function* () {
               const { command: normalizedCommand, prepareWorkspaceRoot } =
                 yield* normalizeDispatchCommand({ command });
@@ -646,8 +698,16 @@ export const makeWsRpcLayer = () =>
               }
               return result;
             }),
-            "Failed to dispatch orchestration command",
-            { code: WS_RPC_ERROR_CODES.orchestrationDispatchRejected },
+          ).pipe(
+            Effect.mapError((cause) =>
+              toWsRpcError(
+                cause,
+                "Failed to dispatch orchestration command",
+                isDefinitiveDispatchRejection(cause)
+                  ? { code: WS_RPC_ERROR_CODES.orchestrationDispatchRejected }
+                  : undefined,
+              ),
+            ),
           ),
         [ORCHESTRATION_WS_METHODS.importThread]: (input) =>
           rpcEffect(importThread(input), "Failed to import thread"),
@@ -768,9 +828,17 @@ export const makeWsRpcLayer = () =>
             "Failed to create local file preview grant",
           ),
         [WS_METHODS.projectsWriteFile]: (input) =>
-          rpcEffect(workspaceFileSystem.writeFile(input), "Failed to write workspace file"),
+          gatedRpcEffect(
+            WS_METHODS.projectsWriteFile,
+            workspaceFileSystem.writeFile(input),
+            "Failed to write workspace file",
+          ),
         [WS_METHODS.projectsRunDevServer]: (input) =>
-          rpcEffect(devServerManager.run(input), "Failed to start dev server"),
+          gatedRpcEffect(
+            WS_METHODS.projectsRunDevServer,
+            devServerManager.run(input),
+            "Failed to start dev server",
+          ),
         [WS_METHODS.projectsStopDevServer]: (input) =>
           rpcEffect(devServerManager.stop(input), "Failed to stop dev server"),
         [WS_METHODS.projectsListDevServers]: () =>
@@ -793,7 +861,8 @@ export const makeWsRpcLayer = () =>
             }),
           ),
         [WS_METHODS.studioListThreadOutputs]: (input) =>
-          rpcEffect(
+          gatedRpcEffect(
+            WS_METHODS.studioListThreadOutputs,
             Effect.gen(function* () {
               // Self-heal the Studio folder tree: an accepted create whose deferred scaffold
               // failed (crash, transient FS error) must not leave Studio without its Outbox
@@ -853,28 +922,32 @@ export const makeWsRpcLayer = () =>
         [WS_METHODS.gitSummarizeDiff]: (input) =>
           rpcEffect(gitManager.summarizeDiff(input), "Failed to summarize diff"),
         [WS_METHODS.gitPull]: (input) =>
-          rpcEffect(
+          gatedRpcEffect(
+            WS_METHODS.gitPull,
             git.pullCurrentBranch(input.cwd).pipe(Effect.tap(() => refreshGitStatus(input.cwd))),
             "Failed to pull branch",
           ),
         [WS_METHODS.gitRunStackedAction]: (input) =>
           bufferLiveUiStream(
             Stream.callback<GitActionProgressEvent, WsRpcError>((queue) =>
-              gitManager
-                .runStackedAction(input, {
-                  actionId: input.actionId,
-                  progressReporter: {
-                    publish: (event) => Queue.offer(queue, event).pipe(Effect.asVoid),
-                  },
-                })
-                .pipe(
-                  Effect.tap(() => refreshGitStatus(input.cwd)),
-                  Effect.matchCauseEffect({
-                    onFailure: (cause) =>
-                      Queue.fail(queue, toWsRpcError(cause, "Git action failed")),
-                    onSuccess: () => Queue.end(queue).pipe(Effect.asVoid),
-                  }),
+              withCheckpointFileRestoreInterlock(
+                requireNoPendingCheckpointFileRestore(WS_METHODS.gitRunStackedAction).pipe(
+                  Effect.flatMap(() =>
+                    gitManager.runStackedAction(input, {
+                      actionId: input.actionId,
+                      progressReporter: {
+                        publish: (event) => Queue.offer(queue, event).pipe(Effect.asVoid),
+                      },
+                    }),
+                  ),
                 ),
+              ).pipe(
+                Effect.tap(() => refreshGitStatus(input.cwd)),
+                Effect.matchCauseEffect({
+                  onFailure: (cause) => Queue.fail(queue, toWsRpcError(cause, "Git action failed")),
+                  onSuccess: () => Queue.end(queue).pipe(Effect.asVoid),
+                }),
+              ),
             ),
             { label: "git.stacked-action" },
           ),
@@ -886,7 +959,8 @@ export const makeWsRpcLayer = () =>
             "Failed to load pull request checks and comments",
           ),
         [WS_METHODS.gitPreparePullRequestThread]: (input) =>
-          rpcEffect(
+          gatedRpcEffect(
+            WS_METHODS.gitPreparePullRequestThread,
             gitManager
               .preparePullRequestThread(input)
               .pipe(Effect.tap(() => refreshGitStatus(input.cwd))),
@@ -895,55 +969,68 @@ export const makeWsRpcLayer = () =>
         [WS_METHODS.gitListBranches]: (input) =>
           rpcEffect(git.listBranches(input), "Failed to list branches"),
         [WS_METHODS.gitCreateWorktree]: (input) =>
-          rpcEffect(
+          gatedRpcEffect(
+            WS_METHODS.gitCreateWorktree,
             git.createWorktree(input).pipe(Effect.tap(() => refreshGitStatus(input.cwd))),
             "Failed to create worktree",
           ),
         [WS_METHODS.gitCreateDetachedWorktree]: (input) =>
-          rpcEffect(
+          gatedRpcEffect(
+            WS_METHODS.gitCreateDetachedWorktree,
             git.createDetachedWorktree(input).pipe(Effect.tap(() => refreshGitStatus(input.cwd))),
             "Failed to create detached worktree",
           ),
         [WS_METHODS.gitRemoveWorktree]: (input) =>
-          rpcEffect(
+          gatedRpcEffect(
+            WS_METHODS.gitRemoveWorktree,
             git.removeWorktree(input).pipe(Effect.tap(() => refreshGitStatus(input.cwd))),
             "Failed to remove worktree",
           ),
         [WS_METHODS.gitCreateBranch]: (input) =>
-          rpcEffect(
+          gatedRpcEffect(
+            WS_METHODS.gitCreateBranch,
             git.createBranch(input).pipe(Effect.tap(() => refreshGitStatus(input.cwd))),
             "Failed to create branch",
           ),
         [WS_METHODS.gitCheckout]: (input) =>
-          rpcEffect(
+          gatedRpcEffect(
+            WS_METHODS.gitCheckout,
             Effect.scoped(git.checkoutBranch(input)).pipe(
               Effect.tap(() => refreshGitStatus(input.cwd)),
             ),
             "Failed to checkout branch",
           ),
         [WS_METHODS.gitStashAndCheckout]: (input) =>
-          rpcEffect(
+          gatedRpcEffect(
+            WS_METHODS.gitStashAndCheckout,
             Effect.scoped(git.stashAndCheckout(input)).pipe(
               Effect.tap(() => refreshGitStatus(input.cwd)),
             ),
             "Failed to stash and checkout",
           ),
         [WS_METHODS.gitStashDrop]: (input) =>
-          rpcEffect(
+          gatedRpcEffect(
+            WS_METHODS.gitStashDrop,
             git.stashDrop(input).pipe(Effect.tap(() => refreshGitStatus(input.cwd))),
             "Failed to drop stash",
           ),
         [WS_METHODS.gitStashInfo]: (input) =>
           rpcEffect(git.stashInfo(input), "Failed to read stash"),
         [WS_METHODS.gitRemoveIndexLock]: (input) =>
-          rpcEffect(git.removeIndexLock(input), "Failed to remove Git index lock"),
+          gatedRpcEffect(
+            WS_METHODS.gitRemoveIndexLock,
+            git.removeIndexLock(input),
+            "Failed to remove Git index lock",
+          ),
         [WS_METHODS.gitInit]: (input) =>
-          rpcEffect(
+          gatedRpcEffect(
+            WS_METHODS.gitInit,
             git.initRepo(input).pipe(Effect.tap(() => refreshGitStatus(input.cwd))),
             "Failed to initialize repository",
           ),
         [WS_METHODS.gitStageFiles]: (input) =>
-          rpcEffect(
+          gatedRpcEffect(
+            WS_METHODS.gitStageFiles,
             git.stageFiles(input.cwd, input.paths).pipe(
               Effect.tap(() => refreshGitStatus(input.cwd)),
               Effect.as({ ok: true }),
@@ -951,7 +1038,8 @@ export const makeWsRpcLayer = () =>
             "Failed to stage files",
           ),
         [WS_METHODS.gitUnstageFiles]: (input) =>
-          rpcEffect(
+          gatedRpcEffect(
+            WS_METHODS.gitUnstageFiles,
             git.unstageFiles(input.cwd, input.paths).pipe(
               Effect.tap(() => refreshGitStatus(input.cwd)),
               Effect.as({ ok: true }),
@@ -959,20 +1047,23 @@ export const makeWsRpcLayer = () =>
             "Failed to unstage files",
           ),
         [WS_METHODS.gitHandoffThread]: (input) =>
-          rpcEffect(
+          gatedRpcEffect(
+            WS_METHODS.gitHandoffThread,
             gitManager.handoffThread(input).pipe(Effect.tap(() => refreshGitStatus(input.cwd))),
             "Failed to hand off thread",
           ),
 
         [WS_METHODS.terminalOpen]: (input) =>
-          rpcEffect(
+          gatedRpcEffect(
+            WS_METHODS.terminalOpen,
             resetTerminalTitleBuffer(input.threadId, input.terminalId ?? DEFAULT_TERMINAL_ID).pipe(
               Effect.andThen(terminalManager.open(input)),
             ),
             "Failed to open terminal",
           ),
         [WS_METHODS.terminalWrite]: (input) =>
-          rpcEffect(
+          gatedRpcEffect(
+            WS_METHODS.terminalWrite,
             terminalManager.write(input).pipe(
               Effect.tap(() =>
                 maybeAutoRenameTerminalThread({
@@ -991,7 +1082,8 @@ export const makeWsRpcLayer = () =>
         [WS_METHODS.terminalClear]: (input) =>
           rpcEffect(terminalManager.clear(input), "Failed to clear terminal"),
         [WS_METHODS.terminalRestart]: (input) =>
-          rpcEffect(
+          gatedRpcEffect(
+            WS_METHODS.terminalRestart,
             resetTerminalTitleBuffer(input.threadId, input.terminalId ?? DEFAULT_TERMINAL_ID).pipe(
               Effect.andThen(terminalManager.restart(input)),
             ),
@@ -1240,7 +1332,11 @@ export const makeWsRpcLayer = () =>
             "Failed to get composer capabilities",
           ),
         [WS_METHODS.providerCompactThread]: (input) =>
-          rpcEffect(providerService.compactThread(input), "Failed to compact thread"),
+          gatedRpcEffect(
+            WS_METHODS.providerCompactThread,
+            providerService.compactThread(input),
+            "Failed to compact thread",
+          ),
         [WS_METHODS.providerListCommands]: (input) =>
           rpcEffect(providerDiscoveryService.listCommands(input), "Failed to list commands"),
         [WS_METHODS.providerListSkills]: (input) =>
@@ -1279,7 +1375,11 @@ export const makeWsRpcLayer = () =>
         [WS_METHODS.automationDelete]: (input) =>
           rpcEffect(automationService.delete(input), "Failed to delete automation"),
         [WS_METHODS.automationRunNow]: (input) =>
-          rpcEffect(automationService.runNow(input), "Failed to run automation"),
+          gatedRpcEffect(
+            WS_METHODS.automationRunNow,
+            automationService.runNow(input),
+            "Failed to run automation",
+          ),
         [WS_METHODS.automationCancelRun]: (input) =>
           rpcEffect(automationService.cancelRun(input), "Failed to cancel automation run"),
         [WS_METHODS.automationMarkRunRead]: (input) =>

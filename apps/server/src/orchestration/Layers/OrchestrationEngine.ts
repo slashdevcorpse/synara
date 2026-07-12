@@ -31,6 +31,11 @@ import {
   OrchestrationCommandTimeoutError,
   type OrchestrationDispatchError,
 } from "../Errors.ts";
+import {
+  isOrchestrationCommandBlockedByPendingCheckpointFileRestore,
+  makePendingCheckpointFileRestoreCommandError,
+  shouldBlockCommandForPendingCheckpointFileRestore,
+} from "../checkpointFileRestoreGate.ts";
 import { decideOrchestrationCommand } from "../decider.ts";
 import type { ProjectMetadataOrchestrationEvent } from "../projectMetadataProjection.ts";
 import { PROJECT_METADATA_SNAPSHOT_PROJECTORS } from "../projectMetadataProjection.ts";
@@ -378,6 +383,15 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           }),
         );
         return;
+      }
+
+      if (isOrchestrationCommandBlockedByPendingCheckpointFileRestore(envelope.command)) {
+        const events = yield* Stream.runCollect(eventStore.readFromSequence(0)).pipe(
+          Effect.map((chunk): OrchestrationEvent[] => Array.from(chunk)),
+        );
+        if (shouldBlockCommandForPendingCheckpointFileRestore(events, envelope.command.type)) {
+          return yield* makePendingCheckpointFileRestoreCommandError(envelope.command.type);
+        }
       }
 
       const deciderReadModel = yield* buildDeciderReadModel(envelope.command);

@@ -33,6 +33,7 @@ import { OrchestrationProjectionPipelineLive } from "./ProjectionPipeline.ts";
 import { OrchestrationProjectionSnapshotQueryLive } from "./ProjectionSnapshotQuery.ts";
 import { RuntimeReceiptBusLive } from "./RuntimeReceiptBus.ts";
 import { OrchestrationEventStoreLive } from "../../persistence/Layers/OrchestrationEventStore.ts";
+import { OrchestrationEventStore } from "../../persistence/Services/OrchestrationEventStore.ts";
 import { OrchestrationCommandReceiptRepositoryLive } from "../../persistence/Layers/OrchestrationCommandReceipts.ts";
 import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite.ts";
 import {
@@ -40,6 +41,8 @@ import {
   type OrchestrationEngineShape,
 } from "../Services/OrchestrationEngine.ts";
 import { CheckpointReactor } from "../Services/CheckpointReactor.ts";
+import { OrchestrationCommandInternalError } from "../Errors.ts";
+import { hasPendingCheckpointFileRestore } from "../checkpointFileRestoreGate.ts";
 import {
   ProviderService,
   type ProviderServiceShape,
@@ -234,7 +237,7 @@ async function waitForGitRefExists(cwd: string, ref: string, timeoutMs = 30_000)
 
 describe("CheckpointReactor", () => {
   let runtime: ManagedRuntime.ManagedRuntime<
-    OrchestrationEngineService | CheckpointReactor | CheckpointStore,
+    OrchestrationEngineService | CheckpointReactor | CheckpointStore | OrchestrationEventStore,
     unknown
   > | null = null;
   let scope: Scope.Closeable | null = null;
@@ -291,6 +294,7 @@ describe("CheckpointReactor", () => {
       Layer.provideMerge(RuntimeReceiptBusLive),
       Layer.provideMerge(Layer.succeed(ProviderService, provider.service)),
       Layer.provideMerge(CheckpointStoreLive.pipe(Layer.provide(GitCoreLive))),
+      Layer.provideMerge(OrchestrationEventStoreLive),
       Layer.provideMerge(ServerConfigLayer),
       Layer.provideMerge(NodeServices.layer),
       Layer.provideMerge(SqlitePersistenceMemory),
@@ -300,6 +304,7 @@ describe("CheckpointReactor", () => {
     const engine = await runtime.runPromise(Effect.service(OrchestrationEngineService));
     const reactor = await runtime.runPromise(Effect.service(CheckpointReactor));
     const checkpointStore = await runtime.runPromise(Effect.service(CheckpointStore));
+    const eventStore = await runtime.runPromise(Effect.service(OrchestrationEventStore));
     scope = await Effect.runPromise(Scope.make("sequential"));
     const startReactor = () => Effect.runPromise(reactor.start.pipe(Scope.provide(scope!)));
     if (options?.startReactor ?? true) {
@@ -371,6 +376,7 @@ describe("CheckpointReactor", () => {
       drain,
       startReactor,
       checkpointStore,
+      eventStore,
     };
   }
 
@@ -1859,6 +1865,80 @@ describe("CheckpointReactor", () => {
     expect(failure?.payload.requiresWorkspaceReview).toBe(true);
   });
 
+  it("persists a review-required terminal when success completion cannot be saved", async () => {
+    const harness = await createHarness();
+    const createdAt = new Date().toISOString();
+    const threadId = ThreadId.makeUnsafe("thread-1");
+    const messageId = MessageId.makeUnsafe("message-complete-terminal-fails");
+    const requestCommandId = CommandId.makeUnsafe("cmd-complete-terminal-fails");
+    runGit(harness.cwd, [
+      "update-ref",
+      checkpointRefForThreadMessageStart(threadId, messageId),
+      "HEAD",
+    ]);
+
+    const originalDispatch = harness.engine.dispatch;
+    let fallbackFailureAttempts = 0;
+    vi.spyOn(harness.engine, "dispatch").mockImplementation((command) => {
+      if (command.type === "thread.checkpoint.files.restore.complete") {
+        return Effect.fail(
+          new OrchestrationCommandInternalError({
+            commandId: command.commandId,
+            commandType: command.type,
+            detail: "simulated terminal persistence failure",
+          }),
+        );
+      }
+      if (
+        command.type === "thread.checkpoint.files.restore.fail" &&
+        command.requestCommandId === requestCommandId &&
+        fallbackFailureAttempts < 4
+      ) {
+        fallbackFailureAttempts += 1;
+        return Effect.fail(
+          new OrchestrationCommandInternalError({
+            commandId: command.commandId,
+            commandType: command.type,
+            detail: "simulated fallback terminal persistence failure",
+          }),
+        );
+      }
+      return originalDispatch(command);
+    });
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.checkpoint.files.restore",
+        commandId: requestCommandId,
+        threadId,
+        messageId,
+        turnCount: 0,
+        createdAt,
+      }),
+    );
+
+    const events = await waitForEvent(
+      harness.engine,
+      (event) =>
+        event.type === "thread.checkpoint-files-restore-failed" &&
+        event.payload.requestCommandId === requestCommandId,
+    );
+    const failure = events.find(
+      (
+        event,
+      ): event is Extract<
+        (typeof events)[number],
+        { type: "thread.checkpoint-files-restore-failed" }
+      > =>
+        event.type === "thread.checkpoint-files-restore-failed" &&
+        event.payload.requestCommandId === requestCommandId,
+    );
+
+    expect(failure?.payload.detail).toContain("could not persist the success terminal");
+    expect(failure?.payload.requiresWorkspaceReview).toBe(true);
+    expect(fallbackFailureAttempts).toBe(4);
+  });
+
   it("reconciles an unobserved dispatch without allowing a late destructive restore", async () => {
     const harness = await createHarness();
     const createdAt = new Date().toISOString();
@@ -1978,7 +2058,56 @@ describe("CheckpointReactor", () => {
     expect(events.some((event) => event.type === "thread.checkpoint-files-restored")).toBe(false);
   });
 
-  it("persists a correlated terminal failure when the restore thread was deleted", async () => {
+  it("does not restore files or leave a pending gate for legacy requests without command ids", async () => {
+    const harness = await createHarness({ startReactor: false });
+    const createdAt = new Date().toISOString();
+    const threadId = ThreadId.makeUnsafe("thread-1");
+    const messageId = MessageId.makeUnsafe("message-null-command-files-restore");
+    runGit(harness.cwd, [
+      "update-ref",
+      checkpointRefForThreadMessageStart(threadId, messageId),
+      "HEAD",
+    ]);
+    fs.writeFileSync(path.join(harness.cwd, "README.md"), "newer work must survive\n", "utf8");
+    const restoreSpy = vi.spyOn(harness.checkpointStore, "restoreCheckpoint");
+
+    await Effect.runPromise(
+      harness.eventStore.append({
+        eventId: EventId.makeUnsafe("evt-null-command-files-restore"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: createdAt,
+        commandId: null,
+        causationEventId: null,
+        correlationId: null,
+        metadata: {},
+        type: "thread.checkpoint-files-restore-requested",
+        payload: {
+          threadId,
+          messageId,
+          turnCount: 0,
+          createdAt,
+        },
+      }),
+    );
+
+    await harness.startReactor();
+    await harness.drain();
+
+    expect(restoreSpy).not.toHaveBeenCalled();
+    expect(fs.readFileSync(path.join(harness.cwd, "README.md"), "utf8")).toBe(
+      "newer work must survive\n",
+    );
+    const events = await Effect.runPromise(
+      Stream.runCollect(harness.engine.readEvents(0)).pipe(
+        Effect.map((chunk) => Array.from(chunk)),
+      ),
+    );
+    expect(hasPendingCheckpointFileRestore(events)).toBe(false);
+    expect(events.some((event) => event.type === "thread.checkpoint-files-restored")).toBe(false);
+  });
+
+  it("persists a correlated terminal failure for legacy restore requests whose thread was deleted", async () => {
     const harness = await createHarness({ startReactor: false });
     const createdAt = new Date().toISOString();
     const threadId = ThreadId.makeUnsafe("thread-1");
@@ -1995,12 +2124,23 @@ describe("CheckpointReactor", () => {
       }),
     );
     await Effect.runPromise(
-      harness.engine.dispatch({
-        type: "thread.delete",
+      harness.eventStore.append({
+        eventId: EventId.makeUnsafe("evt-legacy-delete-restore-thread"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: createdAt,
         commandId: CommandId.makeUnsafe("cmd-delete-restore-thread"),
-        threadId,
+        causationEventId: null,
+        correlationId: CommandId.makeUnsafe("cmd-delete-restore-thread"),
+        metadata: {},
+        type: "thread.deleted",
+        payload: {
+          threadId,
+          deletedAt: createdAt,
+        },
       }),
     );
+    await Effect.runPromise(harness.engine.repairState());
 
     await harness.startReactor();
     await harness.drain();
