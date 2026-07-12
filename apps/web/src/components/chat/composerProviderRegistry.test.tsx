@@ -101,6 +101,37 @@ describe("getComposerProviderState", () => {
     });
   });
 
+  it("reads only Codex options when other provider effort state is present", () => {
+    const state = getComposerProviderState({
+      provider: "codex",
+      model: "gpt-5.4",
+      prompt: "",
+      modelOptions: {
+        codex: { reasoningEffort: "xhigh" },
+        cursor: { reasoningEffort: "low" },
+      },
+    });
+
+    expect(state.modelOptionsForDispatch).toEqual({ reasoningEffort: "xhigh" });
+    expect(state.promptEffort).toBe("xhigh");
+  });
+
+  it("reads only Cursor options when Codex runtime effort state is present", () => {
+    const state = getComposerProviderState({
+      provider: "cursor",
+      model: "claude-opus-4-7",
+      runtimeModel: CURSOR_RUNTIME_MODEL_300K,
+      prompt: "",
+      modelOptions: {
+        codex: { reasoningEffort: "ultra" },
+        cursor: { reasoningEffort: "xhigh" },
+      },
+    });
+
+    expect(state.modelOptionsForDispatch).toEqual({ reasoningEffort: "xhigh" });
+    expect(state.promptEffort).toBe("xhigh");
+  });
+
   it("preserves a stored runtime Codex effort for dispatch before discovery resolves", () => {
     const state = getComposerProviderState({
       provider: "codex",

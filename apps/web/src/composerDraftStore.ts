@@ -65,7 +65,7 @@ import {
 } from "./lib/composerPastedText";
 import { normalizeAssistantSelectionAttachment } from "./lib/assistantSelections";
 import { cloneComposerImageAttachment } from "./lib/composerSend";
-import { classifyCodexReasoningEffortSupport } from "./lib/codexReasoningEffort";
+import { classifyProviderReasoningEffortSupport } from "./lib/codexReasoningEffort";
 import { buildModelSelection } from "./providerModelOptions";
 import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
@@ -1527,6 +1527,49 @@ function normalizeModelSelection(
                     ? modelOptions?.pi
                     : undefined;
   return makeModelSelection(provider, model, options);
+}
+
+function reconcileProviderScopedModelSelection(
+  requested: ModelSelection,
+  current: ModelSelection | null | undefined,
+): ModelSelection {
+  if (requested.options !== undefined || current?.provider !== requested.provider) {
+    return requested;
+  }
+  if (current.model === requested.model) {
+    return makeModelSelection(requested.provider, requested.model, current.options);
+  }
+  if (
+    current.provider !== "codex" &&
+    current.provider !== "cursor" &&
+    current.provider !== "claudeAgent"
+  ) {
+    return requested;
+  }
+  let preservedOptions = current.options;
+  const effort =
+    current.provider === "claudeAgent"
+      ? current.options?.effort
+      : current.provider === "codex" || current.provider === "cursor"
+        ? current.options?.reasoningEffort
+        : undefined;
+  if (
+    effort !== undefined &&
+    classifyProviderReasoningEffortSupport({
+      provider: requested.provider,
+      model: requested.model,
+      effort,
+    }) !== "supported"
+  ) {
+    if (current.provider === "claudeAgent") {
+      const { effort: _effort, ...remainingOptions } = current.options ?? {};
+      preservedOptions = Object.keys(remainingOptions).length > 0 ? remainingOptions : undefined;
+    } else if (current.provider === "codex" || current.provider === "cursor") {
+      const { reasoningEffort: _reasoningEffort, ...remainingOptions } = current.options ?? {};
+      preservedOptions = Object.keys(remainingOptions).length > 0 ? remainingOptions : undefined;
+    }
+  }
+  return makeModelSelection(requested.provider, requested.model, preservedOptions);
 }
 
 // ── Sticky selection sanitization ─────────────────────────────────────
@@ -3527,10 +3570,8 @@ export const useComposerDraftStore = create<ComposerDraftStoreState>()(
           for (const [provider, selection] of Object.entries(stickyMap)) {
             if (selection) {
               const current = nextMap[provider as ProviderKind];
-              nextMap[provider as ProviderKind] = {
-                ...selection,
-                model: current?.model ?? selection.model,
-              };
+              nextMap[provider as ProviderKind] =
+                current && current.model !== selection.model ? current : selection;
             }
           }
           if (
@@ -3772,34 +3813,10 @@ export const useComposerDraftStore = create<ComposerDraftStoreState>()(
           const nextMap = { ...base.modelSelectionByProvider };
           if (normalized) {
             const current = nextMap[normalized.provider];
-            if (normalized.options !== undefined) {
-              // Explicit options provided → use them
-              nextMap[normalized.provider] = normalized;
-            } else {
-              // Codex efforts are model-scoped. Preserve them across model changes only
-              // when the target's known static capabilities affirm support; runtime-only
-              // target values remain unsafe until that target is discovered explicitly.
-              let preservedOptions = current?.options;
-              if (
-                normalized.provider === "codex" &&
-                current?.provider === "codex" &&
-                current.model !== normalized.model &&
-                current.options?.reasoningEffort !== undefined &&
-                classifyCodexReasoningEffortSupport({
-                  model: normalized.model,
-                  effort: current.options.reasoningEffort,
-                }) !== "supported"
-              ) {
-                const { reasoningEffort: _reasoningEffort, ...remainingOptions } = current.options;
-                preservedOptions =
-                  Object.keys(remainingOptions).length > 0 ? remainingOptions : undefined;
-              }
-              nextMap[normalized.provider] = makeModelSelection(
-                normalized.provider,
-                normalized.model,
-                preservedOptions,
-              );
-            }
+            nextMap[normalized.provider] = reconcileProviderScopedModelSelection(
+              normalized,
+              current,
+            );
           }
           const nextActiveProvider = normalized?.provider ?? base.activeProvider;
           if (

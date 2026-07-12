@@ -1,4 +1,4 @@
-import type { ProviderModelDescriptor } from "@synara/contracts";
+import type { ProviderKind, ProviderModelDescriptor } from "@synara/contracts";
 import { getModelCapabilities, hasEffortLevel, trimOrNull } from "@synara/shared/model";
 
 export type CodexReasoningEffortSupport = "supported" | "unsupported" | "unknown";
@@ -6,7 +6,8 @@ export type CodexReasoningEffortSupport = "supported" | "unsupported" | "unknown
 // Runtime discovery is authoritative when present. Before it arrives, known static
 // models can still validate built-in efforts; genuinely unknown models remain open
 // to forward-compatible runtime-only values.
-export function classifyCodexReasoningEffortSupport(input: {
+export function classifyProviderReasoningEffortSupport(input: {
+  provider: ProviderKind;
   model: string | null | undefined;
   effort: string | null | undefined;
   runtimeModel?: ProviderModelDescriptor | undefined;
@@ -23,9 +24,15 @@ export function classifyCodexReasoningEffortSupport(input: {
       : "unsupported";
   }
 
-  const staticCapabilities = getModelCapabilities("codex", input.model);
+  const staticCapabilities = getModelCapabilities(input.provider, input.model);
   if (staticCapabilities.reasoningEffortLevels.length === 0) {
     return "unknown";
   }
   return hasEffortLevel(staticCapabilities, effort) ? "supported" : "unsupported";
+}
+
+export function classifyCodexReasoningEffortSupport(
+  input: Omit<Parameters<typeof classifyProviderReasoningEffortSupport>[0], "provider">,
+): CodexReasoningEffortSupport {
+  return classifyProviderReasoningEffortSupport({ ...input, provider: "codex" });
 }
