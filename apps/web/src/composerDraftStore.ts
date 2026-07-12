@@ -65,6 +65,7 @@ import {
 } from "./lib/composerPastedText";
 import { normalizeAssistantSelectionAttachment } from "./lib/assistantSelections";
 import { cloneComposerImageAttachment } from "./lib/composerSend";
+import { classifyCodexReasoningEffortSupport } from "./lib/codexReasoningEffort";
 import { buildModelSelection } from "./providerModelOptions";
 import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
@@ -3775,15 +3776,19 @@ export const useComposerDraftStore = create<ComposerDraftStoreState>()(
               // Explicit options provided → use them
               nextMap[normalized.provider] = normalized;
             } else {
-              // Runtime-discovered Codex efforts are model-scoped. When the model changes
-              // without an explicit option selection, keep provider-wide options but drop
-              // the effort instead of carrying a value the target model may not support.
+              // Codex efforts are model-scoped. Preserve them across model changes only
+              // when the target's known static capabilities affirm support; runtime-only
+              // target values remain unsafe until that target is discovered explicitly.
               let preservedOptions = current?.options;
               if (
                 normalized.provider === "codex" &&
                 current?.provider === "codex" &&
                 current.model !== normalized.model &&
-                current.options?.reasoningEffort !== undefined
+                current.options?.reasoningEffort !== undefined &&
+                classifyCodexReasoningEffortSupport({
+                  model: normalized.model,
+                  effort: current.options.reasoningEffort,
+                }) !== "supported"
               ) {
                 const { reasoningEffort: _reasoningEffort, ...remainingOptions } = current.options;
                 preservedOptions =

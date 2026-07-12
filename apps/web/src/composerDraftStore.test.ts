@@ -2232,6 +2232,26 @@ describe("composerDraftStore setModelSelection", () => {
     expect(state.draftsByThreadId[threadId]?.modelSelectionByProvider.codex).toEqual(selection);
     expect(state.stickyModelSelectionByProvider.codex).toEqual(selection);
   });
+
+  it("preserves a built-in Codex effort supported by both models", () => {
+    const store = useComposerDraftStore.getState();
+    store.setModelSelectionAndSticky(
+      threadId,
+      modelSelection("codex", "gpt-5.5", { reasoningEffort: "xhigh", fastMode: true }),
+    );
+
+    store.setModelSelectionAndSticky(threadId, modelSelection("codex", "gpt-5.4"));
+
+    const expectedSelection = modelSelection("codex", "gpt-5.4", {
+      reasoningEffort: "xhigh",
+      fastMode: true,
+    });
+    const state = useComposerDraftStore.getState();
+    expect(state.draftsByThreadId[threadId]?.modelSelectionByProvider.codex).toEqual(
+      expectedSelection,
+    );
+    expect(state.stickyModelSelectionByProvider.codex).toEqual(expectedSelection);
+  });
 });
 
 describe("composerDraftStore sticky composer settings", () => {

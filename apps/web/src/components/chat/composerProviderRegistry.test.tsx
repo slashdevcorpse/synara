@@ -122,6 +122,25 @@ describe("getComposerProviderState", () => {
     });
   });
 
+  it("rejects an unsupported effort for a known static Codex model before discovery", () => {
+    const state = getComposerProviderState({
+      provider: "codex",
+      model: "gpt-5.4",
+      prompt: "",
+      modelOptions: {
+        codex: {
+          reasoningEffort: "ultra",
+        },
+      },
+    });
+
+    expect(state).toEqual({
+      provider: "codex",
+      promptEffort: "high",
+      modelOptionsForDispatch: undefined,
+    });
+  });
+
   it("drops a stored runtime Codex effort after discovery proves it unsupported", () => {
     const state = getComposerProviderState({
       provider: "codex",
