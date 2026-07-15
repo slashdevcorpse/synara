@@ -1217,6 +1217,20 @@ const worker = setupWorker(
       sendEffectRpcExit(client, parsed.request.id, resolveWsRpc(requestBody));
     });
   }),
+  http.post("*/api/attachments/upload", ({ request }) => {
+    const url = new URL(request.url);
+    const threadId = url.searchParams.get("threadId") ?? THREAD_ID;
+    return HttpResponse.json(
+      {
+        type: url.searchParams.get("type") ?? "image",
+        id: `${threadId}-11111111-1111-4111-8111-111111111111`,
+        name: url.searchParams.get("name") ?? "attachment.png",
+        mimeType: url.searchParams.get("mimeType") ?? "image/png",
+        sizeBytes: 8,
+      },
+      { status: 201 },
+    );
+  }),
   http.get("*/attachments/:attachmentId", async () => {
     if (attachmentResponseDelayMs > 0) {
       await new Promise<void>((resolve) => {
@@ -1998,6 +2012,7 @@ describe("ChatView timeline estimator parity (full app)", () => {
   });
 
   it("smoothly re-sticks to the bottom after sending an optimistic user message", async () => {
+    const restoreNativeApi = installDeterministicSendNativeApi();
     const mounted = await mountChatView({
       viewport: DEFAULT_VIEWPORT,
       snapshot: createSnapshotForTargetUser({
@@ -2065,6 +2080,7 @@ describe("ChatView timeline estimator parity (full app)", () => {
         patchedScrollContainer.scrollTo = originalScrollTo;
       }
       await mounted.cleanup();
+      restoreNativeApi();
     }
   });
 
@@ -3263,6 +3279,7 @@ describe("ChatView timeline estimator parity (full app)", () => {
   });
 
   it("auto-dispatches a queued turn without wiping the live composer draft", async () => {
+    const restoreNativeApi = installDeterministicSendNativeApi();
     const queuedPrompt = "queued prompt that should auto-send";
     const draftBeingTyped = "draft the user is still typing";
 
@@ -3336,10 +3353,12 @@ describe("ChatView timeline estimator parity (full app)", () => {
       );
     } finally {
       await mounted.cleanup();
+      restoreNativeApi();
     }
   });
 
   it("auto-dispatches a queued chat turn as a chat message even while a plan follow-up is pending", async () => {
+    const restoreNativeApi = installDeterministicSendNativeApi();
     const queuedPrompt = "queued chat turn that must stay a chat message";
     const queuedImage = createComposerImage({
       id: "queued-plan-image-1",
@@ -3355,6 +3374,7 @@ describe("ChatView timeline estimator parity (full app)", () => {
     });
 
     try {
+      await waitForComposerEditor();
       // Make the live composer's interaction mode explicitly "plan" so the
       // plan-follow-up branch in onSend is live. The queued chat turn below
       // carries its own "default" mode and an image attachment, both of which the
@@ -3425,6 +3445,7 @@ describe("ChatView timeline estimator parity (full app)", () => {
       );
     } finally {
       await mounted.cleanup();
+      restoreNativeApi();
     }
   });
 
@@ -4524,6 +4545,7 @@ describe("ChatView timeline estimator parity (full app)", () => {
   });
 
   it("promotes terminal-first shortcut threads so they render as terminal rows", async () => {
+    const restoreNativeApi = installDeterministicSendNativeApi();
     const mounted = await mountChatView({
       viewport: DEFAULT_VIEWPORT,
       snapshot: createSnapshotForTargetUser({
@@ -4599,6 +4621,7 @@ describe("ChatView timeline estimator parity (full app)", () => {
       );
     } finally {
       await mounted.cleanup();
+      restoreNativeApi();
     }
   });
 
