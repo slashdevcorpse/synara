@@ -1,7 +1,5 @@
 import type { ServerConfig } from "@synara/contracts";
 
-export const BROWSER_INTEGRATION_WAIT_MS = 15_000;
-
 export function createBrowserTestServerConfig(checkedAt: string): ServerConfig {
   return {
     cwd: "/repo/project",

@@ -27,11 +27,7 @@ import {
   sendEffectRpcExit,
   type EffectRpcWebSocketClient,
 } from "../test/effectRpcWebSocketMock";
-import {
-  BROWSER_INTEGRATION_WAIT_MS,
-  createBrowserTestServerConfig,
-  createFullscreenTestHost,
-} from "../test/browserHarness";
+import { createBrowserTestServerConfig, createFullscreenTestHost } from "../test/browserHarness";
 import { resetWsNativeApiForTest } from "../wsNativeApi";
 
 const THREAD_ID = "thread-kb-toast-test" as ThreadId;
@@ -294,7 +290,7 @@ async function mountApp(): Promise<{ cleanup: () => Promise<void> }> {
 
   const screen = await render(<RouterProvider router={router} />, { container: host });
   await vi.waitFor(() => expect(serverConfigStreamRequestId).toBeTruthy(), {
-    timeout: BROWSER_INTEGRATION_WAIT_MS,
+    timeout: 8_000,
     interval: 16,
   });
   let cleanedUp = false;

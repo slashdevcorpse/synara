@@ -276,6 +276,10 @@ export class WsTransport {
   private sessionVersion = 0;
   private state: WsTransportState = "connecting";
   private disposed = false;
+  private readonly runtimeByClient = new WeakMap<
+    RpcClientInstance,
+    ManagedRuntime.ManagedRuntime<RpcClient.Protocol, never>
+  >();
   private runtime: ManagedRuntime.ManagedRuntime<RpcClient.Protocol, never>;
   private clientScope: Scope.Closeable;
   private clientPromise: Promise<RpcClientInstance>;
@@ -305,6 +309,7 @@ export class WsTransport {
     const abortScope = makeRequestAbortScope(options);
     try {
       const client = await awaitWithAbort(this.getClient(), abortScope.signal);
+      const clientRuntime = this.getClientRuntime(client);
 
       if (method === WS_METHODS.gitRunStackedAction) {
         return (await this.runGitActionStream(client, params, abortScope.signal)) as T;
@@ -345,7 +350,7 @@ export class WsTransport {
         >
       )[method];
       if (!call) throw new WsTransportRpcError({ message: `Unknown RPC method: ${method}` });
-      return (await this.runtime.runPromise(
+      return (await clientRuntime.runPromise(
         call(normalizedRpcInput),
         abortScope.signal ? { signal: abortScope.signal } : undefined,
       )) as T;
@@ -498,6 +503,7 @@ export class WsTransport {
       this.runtime = featureRuntime;
       this.clientScope = featureScope;
       const client = await featureRuntime.runPromise(Scope.provide(featureScope)(makeRpcClient));
+      this.runtimeByClient.set(client, featureRuntime);
       if (!this.disposed && this.sessionVersion === sessionVersion) {
         if (
           this.compatibility &&
@@ -535,6 +541,16 @@ export class WsTransport {
       if (isTerminalCompatibilityFailure(error)) throw error;
       return this.reconnect();
     }
+  }
+
+  private getClientRuntime(
+    client: RpcClientInstance,
+  ): ManagedRuntime.ManagedRuntime<RpcClient.Protocol, never> {
+    const runtime = this.runtimeByClient.get(client);
+    if (!runtime) {
+      throw new Error("Missing runtime for WebSocket RPC client");
+    }
+    return runtime;
   }
 
   private reconnect(): Promise<RpcClientInstance> {
@@ -643,6 +659,7 @@ export class WsTransport {
           this.startLifecycleStream(client);
         } else if (channel === WS_CHANNELS.serverConfigUpdated) {
           this.startStream(
+            client,
             "server.config",
             client[WS_METHODS.subscribeServerConfig]({}),
             (event: ServerConfigStreamEvent) => {
@@ -659,6 +676,7 @@ export class WsTransport {
           );
         } else if (channel === WS_CHANNELS.serverProviderStatusesUpdated) {
           this.startStream(
+            client,
             "server.providers",
             client[WS_METHODS.subscribeServerProviderStatuses]({}),
             (payload: ServerProviderStatusesUpdatedPayload) =>
@@ -667,6 +685,7 @@ export class WsTransport {
           );
         } else if (channel === WS_CHANNELS.serverSettingsUpdated) {
           this.startStream(
+            client,
             "server.settings",
             client[WS_METHODS.subscribeServerSettings]({}),
             (payload: ServerSettingsUpdatedPayload) =>
@@ -675,6 +694,7 @@ export class WsTransport {
           );
         } else if (channel === WS_CHANNELS.terminalEvent) {
           this.startStream(
+            client,
             "terminal.events",
             client[WS_METHODS.subscribeTerminalEvents]({}),
             (event: TerminalEvent) => this.emit(WS_CHANNELS.terminalEvent, event),
@@ -682,6 +702,7 @@ export class WsTransport {
           );
         } else if (channel === WS_CHANNELS.projectDevServerEvent) {
           this.startStream(
+            client,
             "project.devServers",
             client[WS_METHODS.subscribeProjectDevServerEvents]({}),
             (event: ProjectDevServerEvent) => this.emit(WS_CHANNELS.projectDevServerEvent, event),
@@ -689,6 +710,7 @@ export class WsTransport {
           );
         } else if (channel === WS_CHANNELS.automationEvent) {
           this.startStream(
+            client,
             "automation.events",
             client[WS_METHODS.subscribeAutomationEvents]({}),
             (event: AutomationStreamEvent) => this.emit(WS_CHANNELS.automationEvent, event),
@@ -696,6 +718,7 @@ export class WsTransport {
           );
         } else if (channel === ORCHESTRATION_WS_CHANNELS.domainEvent) {
           this.startStream(
+            client,
             "orchestration.domain",
             client[WS_METHODS.subscribeOrchestrationDomainEvents]({}),
             (event: OrchestrationEvent) => this.emit(ORCHESTRATION_WS_CHANNELS.domainEvent, event),
@@ -741,6 +764,7 @@ export class WsTransport {
         .catch((error) => console.warn("WebSocket RPC lifecycle stream failed to restart", error));
     };
     this.startStream(
+      client,
       "server.lifecycle",
       client[WS_METHODS.subscribeServerLifecycle]({}),
       (event: ServerLifecycleStreamEvent) => {
@@ -762,6 +786,7 @@ export class WsTransport {
         .catch((error) => console.warn("WebSocket RPC shell stream failed to restart", error));
     };
     this.startStream(
+      client,
       "orchestration.shell",
       client[ORCHESTRATION_WS_METHODS.subscribeShell]({}),
       (event: OrchestrationShellStreamItem) =>
@@ -793,6 +818,7 @@ export class WsTransport {
         .catch((error) => console.warn("WebSocket RPC thread stream failed to restart", error));
     };
     this.startStream(
+      client,
       key,
       client[ORCHESTRATION_WS_METHODS.subscribeThread](input as never),
       (event: OrchestrationThreadStreamItem) =>
@@ -802,6 +828,7 @@ export class WsTransport {
   }
 
   private startStream<T>(
+    client: RpcClientInstance,
     key: string,
     stream: unknown,
     listener: (event: T) => void,
@@ -813,7 +840,7 @@ export class WsTransport {
     const settled = new Promise<void>((resolve) => {
       resolveSettled = resolve;
     });
-    const cancel = this.runtime.runCallback(
+    const cancel = this.getClientRuntime(client).runCallback(
       Stream.runForEach(runnableStream, (event) => Effect.sync(() => listener(event))),
       {
         onExit: (exit) => {
@@ -870,7 +897,7 @@ export class WsTransport {
     signal?: AbortSignal,
   ): Promise<GitRunStackedActionResult> {
     let result: GitRunStackedActionResult | null = null;
-    await this.runtime.runPromise(
+    await this.getClientRuntime(client).runPromise(
       Stream.runForEach(client[WS_METHODS.gitRunStackedAction](params as never), (event) =>
         Effect.sync(() => {
           this.emit(WS_CHANNELS.gitActionProgress, event as GitActionProgressEvent);
