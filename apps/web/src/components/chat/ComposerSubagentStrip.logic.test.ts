@@ -12,6 +12,7 @@ import type { Thread } from "../../types";
 import { enrichSubagentWorkEntries } from "../ChatView.logic";
 import { localSubagentThreadId } from "../ChatView.selectors";
 import {
+  collectForegroundRunningSubagentStripItems,
   collectRunningSubagentStripItems,
   deriveComposerSubagentStripItems,
   type ComposerSubagentStripItem,
@@ -239,6 +240,32 @@ describe("deriveComposerSubagentStripItems", () => {
       ["sub-bg-spawn", true],
       ["sub-bg-patch", true],
     ]);
+  });
+
+  it("matches confirmed backgrounded patches by tool_use_id when it differs from the row key", () => {
+    const items = subagentRows(
+      deriveComposerSubagentStripItems({
+        workEntries: [
+          workEntry({
+            id: "entry-1",
+            turnId: "turn-1",
+            subagents: [
+              subagent({
+                threadId: "agent-1",
+                providerThreadId: "toolu_1",
+                nickname: "Ada",
+                rawStatus: "running",
+                isActive: true,
+              }),
+            ],
+          }),
+        ],
+        liveTurnId: TurnId.makeUnsafe("turn-1"),
+        backgroundedProviderThreadIds: new Set(["toolu_1"]),
+      }),
+    );
+
+    expect(items[0]).toMatchObject({ providerThreadId: "toolu_1", isBackground: true });
   });
 
   it("falls back to prior subagents when the live turn spawned none", () => {
@@ -669,5 +696,42 @@ describe("collectRunningSubagentStripItems", () => {
     });
 
     expect(collectRunningSubagentStripItems(rows)).toEqual([]);
+  });
+});
+
+describe("collectForegroundRunningSubagentStripItems", () => {
+  it("keeps only running rows not backgrounded by spawn hint or confirmed patch", () => {
+    const rows = deriveComposerSubagentStripItems({
+      workEntries: [
+        workEntry({
+          id: "entry-1",
+          turnId: "turn-1",
+          subagents: [
+            subagent({ threadId: "sub-fg", nickname: "Ada", rawStatus: "running", isActive: true }),
+            subagent({
+              threadId: "sub-bg-spawn",
+              nickname: "Blue",
+              background: true,
+              rawStatus: "running",
+              isActive: true,
+            }),
+            subagent({
+              threadId: "sub-bg-patch",
+              providerThreadId: "toolu_patch",
+              nickname: "Cleo",
+              rawStatus: "running",
+              isActive: true,
+            }),
+            subagent({ threadId: "sub-done", nickname: "Dot", rawStatus: "completed" }),
+          ],
+        }),
+      ],
+      liveTurnId: TurnId.makeUnsafe("turn-1"),
+      backgroundedProviderThreadIds: new Set(["toolu_patch"]),
+      parentRow: { threadId: ThreadId.makeUnsafe("thread-1"), label: "Main thread" },
+    });
+
+    const foreground = collectForegroundRunningSubagentStripItems(rows);
+    expect(foreground.map((item) => item.primaryLabel)).toEqual(["Ada"]);
   });
 });

@@ -465,6 +465,7 @@ import { TranscriptSelectionActionLayer } from "./chat/TranscriptSelectionAction
 import { ComposerActiveTaskListCard } from "./chat/ComposerActiveTaskListCard";
 import { ComposerSubagentStrip } from "./chat/ComposerSubagentStrip";
 import {
+  collectForegroundRunningSubagentStripItems,
   collectRunningSubagentStripItems,
   deriveComposerSubagentStripItems,
   type ComposerSubagentStripItem,
@@ -6071,6 +6072,13 @@ export default function ChatView({
     await Promise.all(running.map((item) => onStopSubagentStripItem(item)));
   }, [composerSubagentStripItems, onStopSubagentStripItem]);
 
+  // Ctrl+B parity with the native CLI: send every foreground running subagent to
+  // the background at once, fanning through the same per-row background dispatch.
+  const onBackgroundAllForegroundSubagentStripItems = useCallback(async () => {
+    const foreground = collectForegroundRunningSubagentStripItems(composerSubagentStripItems);
+    await Promise.all(foreground.map((item) => onBackgroundSubagentStripItem(item)));
+  }, [composerSubagentStripItems, onBackgroundSubagentStripItem]);
+
   // Pause is the same stop command; the local flag makes the settled card read
   // as paused (with a resume affordance) instead of plain stopped.
   const onPauseWorkflowRun = useCallback(async () => {
@@ -6144,6 +6152,24 @@ export default function ChatView({
         event.preventDefault();
         event.stopPropagation();
         void onInterrupt();
+        return;
+      }
+      // Ctrl+B mirrors the native CLI: background all foreground running
+      // subagents. Literal Ctrl on every platform, but stays out of the
+      // terminal, where Ctrl+B is real shell input (readline cursor-back,
+      // tmux prefix). Silent no-op (event untouched) when nothing qualifies.
+      if (
+        event.ctrlKey &&
+        !event.metaKey &&
+        !event.altKey &&
+        !event.shiftKey &&
+        event.key.toLowerCase() === "b" &&
+        !isTerminalFocused() &&
+        collectForegroundRunningSubagentStripItems(composerSubagentStripItems).length > 0
+      ) {
+        event.preventDefault();
+        event.stopPropagation();
+        void onBackgroundAllForegroundSubagentStripItems();
         return;
       }
       const composerPickerShortcutActive =
@@ -6359,6 +6385,8 @@ export default function ChatView({
     onToggleDiff,
     onInterrupt,
     onSplitSurface,
+    composerSubagentStripItems,
+    onBackgroundAllForegroundSubagentStripItems,
     isFocusedPane,
     hasLiveTurn,
     handleModelPickerOpenChange,

@@ -111,7 +111,11 @@ function toStripItem(
     statusKind,
     isActive: statusKind === "running",
     isViewed: viewedThreadId !== null && threadId === viewedThreadId,
-    isBackground: subagent.background === true || backgroundedThreadIds.has(key),
+    // Confirmed patches key by the Task tool_use_id — the same handle the
+    // background command dispatches with — which can differ from the row key.
+    isBackground:
+      subagent.background === true ||
+      backgroundedThreadIds.has(subagent.providerThreadId ?? subagent.threadId),
     accentColor: presentation.accentColor,
   };
 }
@@ -141,6 +145,14 @@ export function collectRunningSubagentStripItems(
   return rows.filter(
     (row): row is ComposerSubagentStripItem => row.kind === "subagent" && row.isActive,
   );
+}
+
+// Rows the per-row background action and Ctrl+B target: running rows not yet
+// backgrounded by either the spawn hint or a confirmed task_updated patch.
+export function collectForegroundRunningSubagentStripItems(
+  rows: ReadonlyArray<ComposerSubagentStripRow>,
+): ComposerSubagentStripItem[] {
+  return collectRunningSubagentStripItems(rows).filter((row) => !row.isBackground);
 }
 
 const NO_BACKGROUNDED_THREAD_IDS: ReadonlySet<string> = new Set();

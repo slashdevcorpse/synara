@@ -10,9 +10,9 @@ import { pluralize } from "@synara/shared/text";
 import { memo } from "react";
 import {
   PiArrowBendUpLeft,
-  PiArrowLineDown,
   PiArrowsInSimple,
   PiArrowsOutSimple,
+  PiTrayArrowDown,
 } from "react-icons/pi";
 
 import { BotIcon, LoaderIcon, StopIcon } from "~/lib/icons";
@@ -206,10 +206,10 @@ export const ComposerSubagentStrip = memo(function ComposerSubagentStrip({
                     size="icon-xs"
                     className={cn("shrink-0", COMPOSER_STACKED_PANEL_ICON_BUTTON_CLASS_NAME)}
                     onClick={() => onBackgroundItem(item)}
-                    aria-label="Move subagent to background"
-                    title="Move subagent to background (the main agent keeps working)"
+                    aria-label="Run in background (ctrl+b)"
+                    title="Run in background (ctrl+b)"
                   >
-                    <PiArrowLineDown className="size-3" />
+                    <PiTrayArrowDown className="size-3" />
                   </Button>
                 ) : null}
                 {item.isActive && onStopItem ? (
