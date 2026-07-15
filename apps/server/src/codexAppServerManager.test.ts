@@ -2999,7 +2999,12 @@ describe("CodexAppServerManager process teardown", () => {
     });
     const manager = new CodexAppServerManager(undefined, { teardownProcessTree });
     const threadId = asThreadId("thread-stop-proof");
-    const outputClose = vi.fn();
+    const closedEvents: string[] = [];
+    manager.on("event", (event) => {
+      if (event.method === "session/closed") {
+        closedEvents.push(event.method);
+      }
+    });
     const context = {
       session: {
         provider: "codex",
@@ -3019,7 +3024,6 @@ describe("CodexAppServerManager process teardown", () => {
         once: vi.fn(),
         removeListener: vi.fn(),
       },
-      output: { close: outputClose },
       pending: new Map(),
       pendingApprovals: new Map(),
       pendingUserInputs: new Map(),
@@ -3039,13 +3043,14 @@ describe("CodexAppServerManager process teardown", () => {
     const concurrentStop = manager.stopSession(threadId);
 
     expect(teardownProcessTree).toHaveBeenCalledTimes(1);
-    expect(outputClose).toHaveBeenCalledTimes(1);
+    expect(closedEvents).toHaveLength(0);
     expect(manager.hasSession(threadId)).toBe(true);
     expect(manager.listSessions()[0]).toMatchObject({ status: "ready" });
 
     proveExit?.();
     await Promise.all([firstStop, concurrentStop]);
 
+    expect(closedEvents).toEqual(["session/closed"]);
     expect(manager.hasSession(threadId)).toBe(false);
   });
 });

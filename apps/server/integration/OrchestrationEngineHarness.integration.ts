@@ -186,6 +186,7 @@ export interface OrchestrationIntegrationHarness {
     predicate: (row: {
       readonly status: "pending" | "responding" | "confirmed" | "retryable" | "uncertain";
       readonly decision: "accept" | "acceptForSession" | "decline" | "cancel" | null;
+      readonly lifecycleGeneration: string | null;
       readonly resolvedAt: string | null;
     }) => boolean,
     timeoutMs?: number,
@@ -193,6 +194,7 @@ export interface OrchestrationIntegrationHarness {
     {
       readonly status: "pending" | "responding" | "confirmed" | "retryable" | "uncertain";
       readonly decision: "accept" | "acceptForSession" | "decline" | "cancel" | null;
+      readonly lifecycleGeneration: string | null;
       readonly resolvedAt: string | null;
     },
     never
@@ -424,6 +426,7 @@ export const makeOrchestrationIntegrationHarness = (
                 onSome: (value) => ({
                   status: value.status,
                   decision: value.decision,
+                  lifecycleGeneration: value.lifecycleGeneration,
                   resolvedAt: value.resolvedAt,
                 }),
               }),
@@ -434,6 +437,7 @@ export const makeOrchestrationIntegrationHarness = (
         ): row is {
           readonly status: "pending" | "responding" | "confirmed" | "retryable" | "uncertain";
           readonly decision: "accept" | "acceptForSession" | "decline" | "cancel" | null;
+          readonly lifecycleGeneration: string | null;
           readonly resolvedAt: string | null;
         } => row !== null && predicate(row),
         `pending approval '${requestId}'`,
@@ -442,6 +446,7 @@ export const makeOrchestrationIntegrationHarness = (
         {
           readonly status: "pending" | "responding" | "confirmed" | "retryable" | "uncertain";
           readonly decision: "accept" | "acceptForSession" | "decline" | "cancel" | null;
+          readonly lifecycleGeneration: string | null;
           readonly resolvedAt: string | null;
         },
         never

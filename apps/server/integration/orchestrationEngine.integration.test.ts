@@ -540,6 +540,7 @@ it.live("tracks approval requests and resolves pending approvals on user respons
       yield* seedProjectAndThread(harness);
 
       yield* harness.adapterHarness!.queueTurnResponseForNextSession({
+        deferCompletion: true,
         events: [
           {
             type: "turn.started",
@@ -587,12 +588,14 @@ it.live("tracks approval requests and resolves pending approvals on user respons
         (row) => row.status === "pending" && row.decision === null,
       );
       assert.equal(pendingRow.status, "pending");
+      assert.notEqual(pendingRow.lifecycleGeneration, null);
 
       yield* harness.engine.dispatch({
         type: "thread.approval.respond",
         commandId: CommandId.makeUnsafe("cmd-approval-respond"),
         threadId: THREAD_ID,
         requestId: APPROVAL_REQUEST_ID,
+        lifecycleGeneration: pendingRow.lifecycleGeneration!,
         decision: "accept",
         createdAt: nowIso(),
       });
@@ -1091,6 +1094,7 @@ it.live("forwards claudeAgent approval responses to the provider session", () =>
         yield* seedProjectAndThread(harness);
 
         yield* harness.adapterHarness!.queueTurnResponseForNextSession({
+          deferCompletion: true,
           events: [
             {
               type: "turn.started",
@@ -1133,11 +1137,18 @@ it.live("forwards claudeAgent approval responses to the provider session", () =>
         );
         assert.equal(thread.session?.threadId, "thread-1");
 
+        const pendingRow = yield* harness.waitForPendingApproval(
+          THREAD_ID,
+          "req-approval-1",
+          (row) => row.status === "pending" && row.lifecycleGeneration !== null,
+        );
+
         yield* harness.engine.dispatch({
           type: "thread.approval.respond",
           commandId: CommandId.makeUnsafe("cmd-claude-approval-respond"),
           threadId: THREAD_ID,
           requestId: APPROVAL_REQUEST_ID,
+          lifecycleGeneration: pendingRow.lifecycleGeneration!,
           decision: "accept",
           createdAt: nowIso(),
         });
@@ -1166,6 +1177,7 @@ it.live("forwards thread.turn.interrupt to claudeAgent provider sessions", () =>
         yield* seedProjectAndThread(harness);
 
         yield* harness.adapterHarness!.queueTurnResponseForNextSession({
+          deferCompletion: true,
           events: [
             {
               type: "turn.started",
