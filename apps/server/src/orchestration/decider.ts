@@ -401,7 +401,6 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         }
         yield* requireSpaceAssignableProject({
           command,
-          projectTitle: project.title,
           projectWorkspaceRoot: project.workspaceRoot,
           workspacePaths,
         });
@@ -522,7 +521,6 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         requestedSpace !== undefined &&
         requestedSpace.deletedAt === null &&
         !isLegacyHomeChatContainerRow({
-          projectTitle: command.title,
           projectWorkspaceRoot: command.workspaceRoot,
           workspacePaths,
         })
@@ -561,6 +559,12 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
       });
       const nextProjectKind = command.kind ?? existingProject.kind ?? "project";
       if (command.spaceId !== undefined && command.spaceId !== null) {
+        if (existingProject.deletedAt !== null) {
+          return yield* new OrchestrationCommandInvariantError({
+            commandType: command.type,
+            detail: "Deleted projects cannot be assigned to a space.",
+          });
+        }
         if (nextProjectKind !== "project") {
           return yield* new OrchestrationCommandInvariantError({
             commandType: command.type,
@@ -571,7 +575,6 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         // command may retitle or move the project.
         yield* requireSpaceAssignableProject({
           command,
-          projectTitle: command.title ?? existingProject.title,
           projectWorkspaceRoot: command.workspaceRoot ?? existingProject.workspaceRoot,
           workspacePaths,
         });

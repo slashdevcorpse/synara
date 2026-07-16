@@ -27,6 +27,7 @@ import type { Project, SidebarThreadSummary, Space } from "../types";
 import { useWorkspaceStore } from "../workspaceStore";
 import { sortThreadsForSidebar } from "./Sidebar.logic";
 import type { SpaceEditorValue } from "./SpaceEditorDialog";
+import { useRouteSpaceSync } from "./useRouteSpaceSync";
 import { toastManager } from "./ui/toast";
 
 type SpaceEditorState =
@@ -80,21 +81,21 @@ export function useSpacesController(input: {
     [chatWorkspaceRoot, homeDir, studioWorkspaceRoot],
   );
 
+  const routeSpaceProject =
+    isOnKanban && routeProjectId ? (projectById.get(routeProjectId) ?? null) : activeRouteProject;
+  const routeSpaceContext = isOrdinarySpaceProject(routeSpaceProject, workspacePaths)
+    ? { projectId: routeSpaceProject.id, spaceId: routeSpaceProject.spaceId ?? null }
+    : null;
+  const routeSpaceProjectId = routeSpaceContext?.projectId ?? null;
+  const routeSpaceId = routeSpaceContext ? routeSpaceContext.spaceId : undefined;
+
   const [spaceEditorState, setSpaceEditorState] = useState<SpaceEditorState | null>(null);
   const [spaceProjectPickerTargetId, setSpaceProjectPickerTargetId] = useState<SpaceId | null>(
     null,
   );
-  /**
-   * State, not a ref: the reconcile and route-sync effects below must re-run when the
-   * pending window closes (route landed, or the timeout gave up), or a skipped cleanup
-   * would sit stale until the next unrelated render.
-   */
-  const [pendingManualSpaceSelection, setPendingManualSpaceSelection] = useState<{
-    spaceId: SpaceId | null;
-  } | null>(null);
 
   useEffect(() => {
-    if (!threadsHydrated || pendingManualSpaceSelection) return;
+    if (!threadsHydrated) return;
     reconcileSpacesUi({
       activeSpaceIds: new Set(spaces.map((space) => space.id)),
       projectSpaceById: new Map(
@@ -108,59 +109,22 @@ export function useSpacesController(input: {
     });
   }, [
     ordinarySpaceProjects,
-    pendingManualSpaceSelection,
     reconcileSpacesUi,
     sidebarThreads,
     spaces,
     threadsHydrated,
   ]);
 
-  useEffect(() => {
-    const routeProject =
-      isOnKanban && routeProjectId ? (projectById.get(routeProjectId) ?? null) : activeRouteProject;
-    if (!isOrdinarySpaceProject(routeProject, workspacePaths)) {
-      return;
-    }
-
-    const routeSpaceId = routeProject.spaceId ?? null;
-    if (pendingManualSpaceSelection && pendingManualSpaceSelection.spaceId !== routeSpaceId) {
-      return;
-    }
-    if (pendingManualSpaceSelection?.spaceId === routeSpaceId) {
-      setPendingManualSpaceSelection(null);
-    }
-    if (activeSpaceId !== routeSpaceId) {
-      setActiveSpaceId(routeSpaceId);
-    }
-    if (routeThreadId) {
-      rememberSpaceThread(routeSpaceId, routeThreadId);
-    } else if (isOnKanban) {
-      rememberSpaceProject(routeSpaceId, routeProject.id);
-    }
-  }, [
-    activeRouteProject,
-    activeSpaceId,
+  useRouteSpaceSync({
     isOnKanban,
-    pendingManualSpaceSelection,
-    projectById,
-    rememberSpaceProject,
-    rememberSpaceThread,
-    routeProjectId,
+    routeProjectId: routeSpaceProjectId,
+    routeSpaceId,
     routeThreadId,
-    setActiveSpaceId,
-    workspacePaths,
-  ]);
+  });
 
-  const selectSpaceOptimistically = useCallback(
+  const selectSpaceForNavigation = useCallback(
     (spaceId: SpaceId | null) => {
-      const pendingSelection = { spaceId };
-      setPendingManualSpaceSelection(pendingSelection);
       setActiveSpaceId(spaceId);
-      window.setTimeout(() => {
-        setPendingManualSpaceSelection((current) =>
-          current === pendingSelection ? null : current,
-        );
-      }, 1_500);
     },
     [setActiveSpaceId],
   );
@@ -179,7 +143,7 @@ export function useSpacesController(input: {
         rememberSpaceProject(currentRouteSpaceProject.spaceId ?? null, currentRouteSpaceProject.id);
       }
 
-      selectSpaceOptimistically(spaceId);
+      selectSpaceForNavigation(spaceId);
 
       const availableThreads = sidebarThreads.filter((thread) => {
         if (thread.archivedAt != null) return false;
@@ -239,7 +203,7 @@ export function useSpacesController(input: {
       rememberSpaceThread,
       routeProjectId,
       routeThreadId,
-      selectSpaceOptimistically,
+      selectSpaceForNavigation,
       sidebarThreadSortOrder,
       sidebarThreads,
       workspacePaths,
@@ -287,7 +251,7 @@ export function useSpacesController(input: {
         }
 
         if (activeRouteProjectId === projectId || (isOnKanban && routeProjectId === projectId)) {
-          selectSpaceOptimistically(spaceId);
+          selectSpaceForNavigation(spaceId);
         }
         return;
       }
@@ -300,7 +264,7 @@ export function useSpacesController(input: {
       handleSelectSpace,
       isOnKanban,
       routeProjectId,
-      selectSpaceOptimistically,
+      selectSpaceForNavigation,
       spaceEditorState,
       spaces,
     ],
@@ -324,7 +288,7 @@ export function useSpacesController(input: {
       try {
         await deleteSpace({ api, spaceId });
         if (activeSpaceId === spaceId) {
-          selectSpaceOptimistically(null);
+          selectSpaceForNavigation(null);
           const activeContextProject =
             activeRouteProject ??
             (isOnKanban && routeProjectId ? (projectById.get(routeProjectId) ?? null) : null);
@@ -348,7 +312,7 @@ export function useSpacesController(input: {
       ordinarySpaceProjects,
       projectById,
       routeProjectId,
-      selectSpaceOptimistically,
+      selectSpaceForNavigation,
       spaces,
       workspacePaths,
     ],
@@ -402,7 +366,7 @@ export function useSpacesController(input: {
       try {
         await moveProjectToSpace({ api, projectId, spaceId });
         if (activeRouteProjectId === projectId || (isOnKanban && routeProjectId === projectId)) {
-          selectSpaceOptimistically(spaceId);
+          selectSpaceForNavigation(spaceId);
         }
       } catch (error) {
         toastManager.add({
@@ -418,7 +382,7 @@ export function useSpacesController(input: {
       onCloseProjectContextMenu,
       projectById,
       routeProjectId,
-      selectSpaceOptimistically,
+      selectSpaceForNavigation,
     ],
   );
 

@@ -123,17 +123,16 @@ export interface SpaceAssignmentWorkspacePaths {
 /**
  * Server half of the web's `isOrdinarySpaceProject` membership rule. Managed chat and
  * Studio containers are excluded by kind alone, but legacy Home chat containers kept
- * `kind: "project"` — they are only recognizable by living at the home directory or chat
- * workspace root under the name "Home". Those containers are reachable from every Space,
- * so they must never belong to one.
+ * `kind: "project"`. Their reserved home/chat workspace root remains stable even if their
+ * display title was renamed, so root identity is the authoritative signal. Those containers
+ * are reachable from every Space and must never belong to one.
  */
 export function isLegacyHomeChatContainerRow(input: {
-  readonly projectTitle: string;
   readonly projectWorkspaceRoot: string;
   readonly workspacePaths: SpaceAssignmentWorkspacePaths | undefined;
 }): boolean {
   const homeDir = input.workspacePaths?.homeDir.trim() ?? "";
-  if (homeDir.length === 0 || input.projectTitle !== "Home") {
+  if (homeDir.length === 0) {
     return false;
   }
   const chatWorkspaceRoot = input.workspacePaths?.chatWorkspaceRoot.trim() || homeDir;
@@ -147,7 +146,6 @@ export function isLegacyHomeChatContainerRow(input: {
 /** The rejecting form for explicit assignment commands, where a bad target is an error. */
 export function requireSpaceAssignableProject(input: {
   readonly command: OrchestrationCommand;
-  readonly projectTitle: string;
   readonly projectWorkspaceRoot: string;
   readonly workspacePaths: SpaceAssignmentWorkspacePaths | undefined;
 }): Effect.Effect<void, OrchestrationCommandInvariantError> {

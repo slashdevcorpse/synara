@@ -312,6 +312,28 @@ describe("Spaces", () => {
       ),
     ).rejects.toThrow(/chats container/i);
 
+    // The reserved root, not mutable display metadata, identifies the legacy container.
+    ({ readModel } = await dispatch(readModel, {
+      type: "project.meta.update",
+      commandId: CommandId.makeUnsafe("cmd-rename-legacy-home"),
+      projectId: legacyHomeProjectId,
+      title: "Personal chats",
+    }));
+    await expect(
+      Effect.runPromise(
+        decideOrchestrationCommand({
+          command: {
+            type: "project.meta.update",
+            commandId: CommandId.makeUnsafe("cmd-assign-renamed-legacy-home"),
+            projectId: legacyHomeProjectId,
+            spaceId,
+          },
+          readModel,
+          workspacePaths,
+        }),
+      ),
+    ).rejects.toThrow(/chats container/i);
+
     // An ordinary project named anything else files normally under the same paths.
     const assigned = await Effect.runPromise(
       decideOrchestrationCommand({
@@ -480,6 +502,20 @@ describe("Spaces", () => {
     }));
     expect(readModel.projects[0]?.deletedAt).not.toBeNull();
     expect(readModel.projects[0]?.spaceId).toBe(spaceId);
+
+    await expect(
+      Effect.runPromise(
+        decideOrchestrationCommand({
+          command: {
+            type: "project.meta.update",
+            commandId: CommandId.makeUnsafe("cmd-reassign-deleted-project"),
+            projectId,
+            spaceId,
+          },
+          readModel,
+        }),
+      ),
+    ).rejects.toThrow(/deleted projects cannot be assigned/i);
 
     const deletion = await dispatch(readModel, {
       type: "space.delete",
