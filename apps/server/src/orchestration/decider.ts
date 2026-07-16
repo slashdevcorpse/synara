@@ -15,6 +15,7 @@ import {
 import {
   deriveAssociatedWorktreeMetadata,
   deriveAssociatedWorktreeMetadataPatch,
+  workspaceRootsEqual,
 } from "@synara/shared/threadWorkspace";
 import { doThreadMarkerRangesOverlap } from "@synara/shared/threadMarkers";
 import {
@@ -577,18 +578,31 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         command.defaultModelSelection !== undefined ||
         command.scripts !== undefined ||
         command.isPinned !== undefined;
+      const isLegacyHomeChatContainer = isLegacyHomeChatContainerRow({
+        projectTitle: existingProject.title,
+        projectWorkspaceRoot: existingProject.workspaceRoot,
+        workspacePaths,
+      });
       if (
         command.title !== undefined &&
         command.title !== existingProject.title &&
-        isLegacyHomeChatContainerRow({
-          projectTitle: existingProject.title,
-          projectWorkspaceRoot: existingProject.workspaceRoot,
-          workspacePaths,
-        })
+        isLegacyHomeChatContainer
       ) {
         return yield* new OrchestrationCommandInvariantError({
           commandType: command.type,
           detail: "The legacy Chats container cannot be renamed.",
+        });
+      }
+      if (
+        command.workspaceRoot !== undefined &&
+        !workspaceRootsEqual(command.workspaceRoot, existingProject.workspaceRoot, {
+          platform: process.platform,
+        }) &&
+        isLegacyHomeChatContainer
+      ) {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: "The legacy Chats container workspace root cannot be changed.",
         });
       }
       if (command.spaceId !== undefined && command.spaceId !== null) {

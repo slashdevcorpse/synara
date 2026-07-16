@@ -373,6 +373,22 @@ describe("Spaces", () => {
       ),
     ).rejects.toThrow(/cannot be renamed/i);
 
+    await expect(
+      Effect.runPromise(
+        decideOrchestrationCommand({
+          command: {
+            type: "project.meta.update",
+            commandId: CommandId.makeUnsafe("cmd-move-legacy-home-root"),
+            projectId: legacyHomeProjectId,
+            workspaceRoot: "/Users/dev/code/legacy-home",
+            spaceId,
+          },
+          readModel,
+          workspacePaths,
+        }),
+      ),
+    ).rejects.toThrow(/workspace root cannot be changed/i);
+
     // An ordinary project named anything else files normally under the same paths.
     const assigned = await Effect.runPromise(
       decideOrchestrationCommand({
