@@ -12,16 +12,16 @@ const tableColumns = (sql: SqlClient.SqlClient, tableName: string) =>
     SELECT name FROM pragma_table_info(${tableName})
   `.pipe(Effect.map((rows) => rows.map((row) => row.name)));
 
-layer("054_Spaces", (it) => {
+layer("055_Spaces", (it) => {
   it.effect("adds custom-space storage and nullable project assignments", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
-      yield* runMigrations({ toMigrationInclusive: 53 });
+      yield* runMigrations({ toMigrationInclusive: 54 });
 
       assert.notInclude(yield* tableColumns(sql, "projection_projects"), "space_id");
 
-      const executed = yield* runMigrations({ toMigrationInclusive: 54 });
-      assert.deepStrictEqual(executed, [[54, "Spaces"]]);
+      const executed = yield* runMigrations({ toMigrationInclusive: 55 });
+      assert.deepStrictEqual(executed, [[55, "Spaces"]]);
       assert.include(yield* tableColumns(sql, "projection_projects"), "space_id");
       assert.deepStrictEqual(yield* tableColumns(sql, "projection_spaces"), [
         "space_id",
