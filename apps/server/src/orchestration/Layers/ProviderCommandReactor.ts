@@ -1039,10 +1039,51 @@ const make = Effect.gen(function* () {
         ? resolveSubagentProviderThreadId(thread.id, providerThread.id)
         : undefined;
       if (providerThread && subagentProviderThreadId) {
+        // Parity with the steerTurn path below: inline portable skill
+        // instructions, normalize skill/agent mentions, and forward the
+        // structured context so the adapter can project attachments into the
+        // text-only subagent steering channel.
+        const steerProvider = (providerThread.session?.providerName ??
+          providerThread.modelSelection.provider) as ProviderKind;
+        const steerSkillInlineText =
+          input.skills !== undefined && input.skills.length > 0
+            ? yield* Effect.tryPromise(() =>
+                buildInlineSkillInstructions({
+                  provider: steerProvider,
+                  skills: input.skills ?? [],
+                  maxChars: Math.max(
+                    0,
+                    PROVIDER_SEND_TURN_MAX_INPUT_CHARS - input.messageText.length - 1_000,
+                  ),
+                }),
+              ).pipe(
+                Effect.catch((error) =>
+                  Effect.logWarning("failed to inline portable skill instructions", {
+                    threadId: input.threadId,
+                    error,
+                  }).pipe(Effect.as("")),
+                ),
+              )
+            : "";
+        const steerMessageWithSkills = steerSkillInlineText
+          ? `${input.messageText}\n\n${steerSkillInlineText}`
+          : input.messageText;
+        const normalizedSteerInput = toNonEmptyProviderInput(
+          normalizeSkillMentionTextForProvider({
+            provider: steerProvider,
+            messageText: steerMessageWithSkills,
+            ...(input.skills !== undefined ? { skills: input.skills } : {}),
+          }),
+        );
         yield* providerService.steerSubagent({
           threadId: providerThread.id,
           providerThreadId: subagentProviderThreadId,
-          input: input.messageText,
+          input: normalizedSteerInput ?? input.messageText,
+          ...(input.attachments !== undefined && input.attachments.length > 0
+            ? { attachments: input.attachments }
+            : {}),
+          ...(input.skills !== undefined ? { skills: input.skills } : {}),
+          ...(input.mentions !== undefined ? { mentions: input.mentions } : {}),
         });
         return;
       }
@@ -1382,6 +1423,22 @@ const make = Effect.gen(function* () {
             // bootstrap. This must preserve the provider binding: startSession
             // recovers the cursor from it when the fresh runtime is spawned.
             if (!providerService.stopRuntimeSession) {
+              return yield* replayWithTranscriptBootstrap(error);
+            }
+            // Background tasks share the runtime subprocess with the parent
+            // turn; stopping it for a native-resume retry would silently kill
+            // them. Recover on the live runtime via transcript bootstrap.
+            const liveBackgroundTasks = providerService.hasLiveRuntimeTasks
+              ? yield* providerService.hasLiveRuntimeTasks({ threadId: input.threadId })
+              : false;
+            if (liveBackgroundTasks) {
+              yield* Effect.logWarning(
+                "provider command reactor skipping native resume retry: live background tasks",
+                {
+                  threadId: input.threadId,
+                  messageId: input.messageId,
+                },
+              );
               return yield* replayWithTranscriptBootstrap(error);
             }
             yield* providerService
@@ -1988,10 +2045,23 @@ const make = Effect.gen(function* () {
       });
     }
 
-    yield* providerService.stopTask({
-      threadId: providerThread.id,
-      taskId: event.payload.taskId,
-    });
+    yield* providerService
+      .stopTask({
+        threadId: providerThread.id,
+        taskId: event.payload.taskId,
+      })
+      .pipe(
+        Effect.catchCause((cause) =>
+          appendProviderFailureActivity({
+            threadId: event.payload.threadId,
+            kind: "provider.task.stop.failed",
+            summary: "Provider task stop failed",
+            detail: Cause.pretty(cause),
+            turnId: null,
+            createdAt: event.payload.createdAt,
+          }),
+        ),
+      );
   });
 
   const processTaskBackgroundRequested = Effect.fnUntraced(function* (
@@ -2010,10 +2080,23 @@ const make = Effect.gen(function* () {
       });
     }
 
-    yield* providerService.backgroundTask({
-      threadId: providerThread.id,
-      toolUseId: event.payload.toolUseId,
-    });
+    yield* providerService
+      .backgroundTask({
+        threadId: providerThread.id,
+        toolUseId: event.payload.toolUseId,
+      })
+      .pipe(
+        Effect.catchCause((cause) =>
+          appendProviderFailureActivity({
+            threadId: event.payload.threadId,
+            kind: "provider.task.background.failed",
+            summary: "Provider task background failed",
+            detail: Cause.pretty(cause),
+            turnId: null,
+            createdAt: event.payload.createdAt,
+          }),
+        ),
+      );
   });
 
   const processApprovalResponseRequested = Effect.fnUntraced(function* (

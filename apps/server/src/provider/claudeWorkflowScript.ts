@@ -24,10 +24,32 @@ const QUOTES = new Set(['"', "'", "`"]);
 // `index`. Returns undefined on anything computed - identifiers, calls, template
 // interpolation - which is exactly the "pure literal" contract for meta.
 function parseLiteral(source: string, index: number): { value: unknown; end: number } | undefined {
-  const skipWhitespace = (from: number): number => {
+  // Consumes whitespace plus `//` line comments and `/* ... */` block
+  // comments so inline comments inside the meta literal don't derail the
+  // parse. An unterminated block comment has no valid resumption point, so
+  // it jumps to end-of-source, which the caller then treats as a mismatch.
+  const skipTrivia = (from: number): number => {
     let at = from;
-    while (at < source.length && /\s/.test(source[at]!)) {
-      at += 1;
+    while (at < source.length) {
+      const char = source[at]!;
+      if (/\s/.test(char)) {
+        at += 1;
+        continue;
+      }
+      if (char === "/" && source[at + 1] === "/") {
+        const newline = source.indexOf("\n", at + 2);
+        at = newline === -1 ? source.length : newline;
+        continue;
+      }
+      if (char === "/" && source[at + 1] === "*") {
+        const close = source.indexOf("*/", at + 2);
+        if (close === -1) {
+          return source.length;
+        }
+        at = close + 2;
+        continue;
+      }
+      break;
     }
     return at;
   };
@@ -55,7 +77,7 @@ function parseLiteral(source: string, index: number): { value: unknown; end: num
     return undefined;
   };
 
-  const at = skipWhitespace(index);
+  const at = skipTrivia(index);
   const char = source[at];
   if (char === undefined) {
     return undefined;
@@ -68,16 +90,16 @@ function parseLiteral(source: string, index: number): { value: unknown; end: num
 
   if (char === "[") {
     const items: Array<unknown> = [];
-    let cursor = skipWhitespace(at + 1);
+    let cursor = skipTrivia(at + 1);
     while (cursor < source.length && source[cursor] !== "]") {
       const item = parseLiteral(source, cursor);
       if (!item) {
         return undefined;
       }
       items.push(item.value);
-      cursor = skipWhitespace(item.end);
+      cursor = skipTrivia(item.end);
       if (source[cursor] === ",") {
-        cursor = skipWhitespace(cursor + 1);
+        cursor = skipTrivia(cursor + 1);
       }
     }
     return source[cursor] === "]" ? { value: items, end: cursor + 1 } : undefined;
@@ -85,7 +107,7 @@ function parseLiteral(source: string, index: number): { value: unknown; end: num
 
   if (char === "{") {
     const record: Record<string, unknown> = {};
-    let cursor = skipWhitespace(at + 1);
+    let cursor = skipTrivia(at + 1);
     while (cursor < source.length && source[cursor] !== "}") {
       let key: string;
       if (QUOTES.has(source[cursor]!)) {
@@ -103,7 +125,7 @@ function parseLiteral(source: string, index: number): { value: unknown; end: num
         key = identifier[0];
         cursor += identifier[0].length;
       }
-      cursor = skipWhitespace(cursor);
+      cursor = skipTrivia(cursor);
       if (source[cursor] !== ":") {
         return undefined;
       }
@@ -112,9 +134,9 @@ function parseLiteral(source: string, index: number): { value: unknown; end: num
         return undefined;
       }
       record[key] = entry.value;
-      cursor = skipWhitespace(entry.end);
+      cursor = skipTrivia(entry.end);
       if (source[cursor] === ",") {
-        cursor = skipWhitespace(cursor + 1);
+        cursor = skipTrivia(cursor + 1);
       }
     }
     return source[cursor] === "}" ? { value: record, end: cursor + 1 } : undefined;
@@ -230,11 +252,20 @@ export function extractClaudeWorkflowAgentPhases(
 }
 
 // Returns the text of one call's argument list, from the opening paren to its
-// balanced close, skipping over string literals so parens inside prompts don't
-// unbalance the scan.
+// balanced close, skipping over string literals (so parens inside prompts
+// don't unbalance the scan) and comments (so parens or option-shaped text
+// inside `//`/`/* */` comments don't unbalance the scan or leak into the
+// result). Comment regions are elided down to a single space in the
+// returned text so downstream regex extraction never sees commented-out
+// content; string literal contents - including ones containing `//` or
+// `/*` - are preserved exactly, since comment-skipping only applies outside
+// of string literals.
 function readBalancedCall(source: string, openParen: number): string | undefined {
   let depth = 0;
   let at = openParen;
+  let segmentStart = openParen;
+  const parts: Array<string> = [];
+
   while (at < source.length) {
     const char = source[at]!;
     if (QUOTES.has(char)) {
@@ -243,12 +274,33 @@ function readBalancedCall(source: string, openParen: number): string | undefined
       while (at < source.length && source[at] !== quote) {
         at += source[at] === "\\" ? 2 : 1;
       }
-    } else if (char === "(") {
+      at += 1;
+      continue;
+    }
+    if (char === "/" && source[at + 1] === "/") {
+      parts.push(source.slice(segmentStart, at), " ");
+      const newline = source.indexOf("\n", at + 2);
+      at = newline === -1 ? source.length : newline;
+      segmentStart = at;
+      continue;
+    }
+    if (char === "/" && source[at + 1] === "*") {
+      const close = source.indexOf("*/", at + 2);
+      if (close === -1) {
+        return undefined;
+      }
+      parts.push(source.slice(segmentStart, at), " ");
+      at = close + 2;
+      segmentStart = at;
+      continue;
+    }
+    if (char === "(") {
       depth += 1;
     } else if (char === ")") {
       depth -= 1;
       if (depth === 0) {
-        return source.slice(openParen + 1, at);
+        parts.push(source.slice(segmentStart, at));
+        return parts.join("").slice(1);
       }
     }
     at += 1;

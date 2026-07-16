@@ -4936,8 +4936,18 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
             detail: `Subagent '${providerThreadId}' already finished; the message was not delivered.`,
           });
         }
+        // The PreToolUse hook channel is text-only: project every attachment
+        // (images included) as a disk-path reference the subagent can read
+        // with its own tools.
+        const attachmentsBlock = buildFileAttachmentsPromptBlock({
+          attachments: input.attachments,
+          attachmentsDir: serverConfig.attachmentsDir,
+          include: "all-files",
+          includeImage: () => true,
+        });
+        const message = attachmentsBlock ? `${input.input}\n\n${attachmentsBlock}` : input.input;
         const pending = context.pendingSubagentSteers.get(providerThreadId) ?? [];
-        pending.push(input);
+        pending.push(message);
         context.pendingSubagentSteers.set(providerThreadId, pending);
       });
 

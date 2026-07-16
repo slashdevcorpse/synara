@@ -133,6 +133,11 @@ export const ProviderSteerSubagentInput = Schema.Struct({
   threadId: ThreadId,
   providerThreadId: TrimmedNonEmptyString,
   input: TrimmedNonEmptyString.check(Schema.isMaxLength(PROVIDER_SEND_TURN_MAX_INPUT_CHARS)),
+  attachments: Schema.optional(
+    Schema.Array(ChatAttachment).check(Schema.isMaxLength(PROVIDER_SEND_TURN_MAX_ATTACHMENTS)),
+  ),
+  skills: Schema.optional(Schema.Array(ProviderSkillReference)),
+  mentions: Schema.optional(Schema.Array(ProviderMentionReference)),
 });
 export type ProviderSteerSubagentInput = typeof ProviderSteerSubagentInput.Type;
 

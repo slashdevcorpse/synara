@@ -43,6 +43,18 @@ import type { Effect } from "effect";
 import type { Stream } from "effect";
 
 export type ProviderSessionModelSwitchMode = "in-session" | "restart-session" | "unsupported";
+
+/**
+ * Structured payload for steering a running subagent. Mirrors the turn-input
+ * context fields so adapters can project attachments/skills/mentions into the
+ * provider-native steering channel (which is typically text-only).
+ */
+export interface ProviderSteerSubagentPayload {
+  readonly input: string;
+  readonly attachments?: ProviderSendTurnInput["attachments"];
+  readonly skills?: ProviderSendTurnInput["skills"];
+  readonly mentions?: ProviderSendTurnInput["mentions"];
+}
 export type ProviderConversationRollbackMode = "native" | "restart-session";
 
 export interface ProviderAdapterCapabilities {
@@ -134,7 +146,7 @@ export interface ProviderAdapterShape<TError> {
   readonly steerSubagent?: (
     threadId: ThreadId,
     providerThreadId: string,
-    input: string,
+    input: ProviderSteerSubagentPayload,
   ) => Effect.Effect<void, TError>;
 
   /**

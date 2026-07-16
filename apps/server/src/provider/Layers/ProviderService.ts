@@ -1176,7 +1176,10 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
           allowRecovery: true,
         });
         if (!routed.adapter.stopTask) {
-          return;
+          return yield* toValidationError(
+            "ProviderService.stopTask",
+            `Provider '${routed.adapter.provider}' does not support stopping a provider task.`,
+          );
         }
         yield* routed.adapter.stopTask(routed.threadId, input.taskId);
         yield* analytics.record("provider.task.stopped", {
@@ -1197,7 +1200,10 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
           allowRecovery: true,
         });
         if (!routed.adapter.backgroundTask) {
-          return;
+          return yield* toValidationError(
+            "ProviderService.backgroundTask",
+            `Provider '${routed.adapter.provider}' does not support backgrounding a provider task.`,
+          );
         }
         yield* routed.adapter.backgroundTask(routed.threadId, input.toolUseId);
         yield* analytics.record("provider.task.backgrounded", {
@@ -1223,7 +1229,12 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
             `Provider '${routed.adapter.provider}' does not support messaging a running subagent.`,
           );
         }
-        yield* routed.adapter.steerSubagent(routed.threadId, input.providerThreadId, input.input);
+        yield* routed.adapter.steerSubagent(routed.threadId, input.providerThreadId, {
+          input: input.input,
+          ...(input.attachments !== undefined ? { attachments: input.attachments } : {}),
+          ...(input.skills !== undefined ? { skills: input.skills } : {}),
+          ...(input.mentions !== undefined ? { mentions: input.mentions } : {}),
+        });
         yield* analytics.record("provider.subagent.steered", {
           provider: routed.adapter.provider,
         });
@@ -1351,6 +1362,9 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
 
     const stopRuntimeSession: StopRuntimeSession = (rawInput) =>
       stopRuntimeSessionInternal(rawInput);
+
+    const hasLiveRuntimeTasks: NonNullable<ProviderServiceShape["hasLiveRuntimeTasks"]> = (input) =>
+      Effect.sync(() => (liveRuntimeTaskIds.get(input.threadId)?.size ?? 0) > 0);
 
     stopIdleRuntimeSession = (threadId, generation) => {
       const stopEffect = Effect.gen(function* () {
@@ -1647,6 +1661,7 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
       respondToUserInput,
       stopSession,
       stopRuntimeSession,
+      hasLiveRuntimeTasks,
       clearSessionResumeCursor,
       listSessions,
       getCapabilities,

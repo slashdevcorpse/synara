@@ -322,6 +322,7 @@ import {
 } from "../appSettings";
 import { resolveTerminalNewAction } from "../lib/terminalNewAction";
 import { isTerminalFocused } from "../lib/terminalFocus";
+import { isEditableEventTarget } from "../lib/editableEventTarget";
 import { compareProvidersByOrder } from "../providerOrdering";
 import {
   type ComposerFileAttachment,
@@ -340,6 +341,7 @@ import {
 } from "../composerDraftStore";
 import { useTemporaryThreadStore } from "../temporaryThreadStore";
 import { useComposerFocusRequestStore } from "../composerFocusRequestStore";
+import { useWorkflowRunUiStore, useWorkflowRunUiThreadState } from "../workflowRunUiStore";
 import { appendComposerPromptText } from "../lib/chatReferences";
 import {
   appendOriginalComposerPromptBlocks,
@@ -1264,6 +1266,8 @@ export default function ChatView({
   );
   const markTemporaryThread = useTemporaryThreadStore((store) => store.markTemporaryThread);
   const clearTemporaryThread = useTemporaryThreadStore((store) => store.clearTemporaryThread);
+  const markWorkflowRunPaused = useWorkflowRunUiStore((store) => store.markPaused);
+  const markWorkflowRunDismissed = useWorkflowRunUiStore((store) => store.markDismissed);
   const serverThread = useStore(useMemo(() => createThreadSelector(threadId), [threadId]));
   const fallbackDraftProjectId = draftThread?.projectId ?? null;
   const fallbackDraftProject = useStore(
@@ -1304,15 +1308,6 @@ export default function ChatView({
   const [activeTaskListCompact, setActiveTaskListCompact] = useState(false);
   const [subagentStripCompact, setSubagentStripCompact] = useState(false);
   const [workflowRunCardCompact, setWorkflowRunCardCompact] = useState(false);
-  // Transient, client-only workflow run flags keyed by workflow task id:
-  // pausedByUser tells the settled card apart from a plain stop; dismissed
-  // retires a settled card the run's activities would otherwise keep visible.
-  const [pausedWorkflowTaskIds, setPausedWorkflowTaskIds] = useState<ReadonlySet<string>>(
-    () => new Set(),
-  );
-  const [dismissedWorkflowTaskIds, setDismissedWorkflowTaskIds] = useState<ReadonlySet<string>>(
-    () => new Set(),
-  );
   const [isComposerFooterCompact, setIsComposerFooterCompact] = useState(false);
   // Width-aware visibility for the footer picker cluster (context meter,
   // model name, traits label). Inputs live in a ref so the resize observer
@@ -2910,6 +2905,19 @@ export default function ChatView({
     }
     return refs;
   }, [workLogEntries]);
+  // Persisted (per-thread) workflow run flags: pausedByUser tells the settled
+  // card apart from a plain stop; dismissed retires a settled card the run's
+  // activities would otherwise keep visible. Survive reloads via
+  // workflowRunUiStore instead of living in component state.
+  const workflowRunUiThreadState = useWorkflowRunUiThreadState(activeThreadId);
+  const pausedWorkflowTaskIds = useMemo(
+    () => new Set(workflowRunUiThreadState.pausedByUser),
+    [workflowRunUiThreadState.pausedByUser],
+  );
+  const dismissedWorkflowTaskIds = useMemo(
+    () => new Set(workflowRunUiThreadState.dismissed),
+    [workflowRunUiThreadState.dismissed],
+  );
   const workflowRunState = useMemo(
     () =>
       deriveWorkflowRunState({
@@ -6088,20 +6096,21 @@ export default function ChatView({
     await Promise.all(foreground.map((item) => onBackgroundSubagentStripItem(item)));
   }, [composerSubagentStripItems, onBackgroundSubagentStripItem]);
 
-  // Pause is the same stop command; the local flag makes the settled card read
-  // as paused (with a resume affordance) instead of plain stopped.
+  // Pause is the same stop command; the persisted flag makes the settled card
+  // read as paused (with a resume affordance) instead of plain stopped, across
+  // reloads too.
   const onPauseWorkflowRun = useCallback(async () => {
-    if (!workflowRunState) return;
+    if (!workflowRunState || !activeThreadId) return;
     const { workflowTaskId } = workflowRunState;
-    setPausedWorkflowTaskIds((existing) => new Set(existing).add(workflowTaskId));
+    markWorkflowRunPaused(activeThreadId, workflowTaskId);
     await onStopWorkflowRun();
-  }, [onStopWorkflowRun, workflowRunState]);
+  }, [activeThreadId, markWorkflowRunPaused, onStopWorkflowRun, workflowRunState]);
 
   const onDismissWorkflowRun = useCallback(() => {
-    if (!workflowRunState) return;
+    if (!workflowRunState || !activeThreadId) return;
     const { workflowTaskId } = workflowRunState;
-    setDismissedWorkflowTaskIds((existing) => new Set(existing).add(workflowTaskId));
-  }, [workflowRunState]);
+    markWorkflowRunDismissed(activeThreadId, workflowTaskId);
+  }, [activeThreadId, markWorkflowRunDismissed, workflowRunState]);
 
   const onProviderModelSelect = useCallback(
     (provider: ProviderKind, model: ModelSlug) => {
@@ -6165,7 +6174,9 @@ export default function ChatView({
       // Ctrl+B mirrors the native CLI: background all foreground running
       // subagents. Literal Ctrl on every platform, but stays out of the
       // terminal, where Ctrl+B is real shell input (readline cursor-back,
-      // tmux prefix). Silent no-op (event untouched) when nothing qualifies.
+      // tmux prefix), and out of text-editing surfaces, where Ctrl+B is the
+      // native macOS "move cursor back" binding. Silent no-op (event
+      // untouched) when nothing qualifies.
       if (
         event.ctrlKey &&
         !event.metaKey &&
@@ -6173,6 +6184,7 @@ export default function ChatView({
         !event.shiftKey &&
         event.key.toLowerCase() === "b" &&
         !isTerminalFocused() &&
+        !isEditableEventTarget(event) &&
         collectForegroundRunningSubagentStripItems(composerSubagentStripItems).length > 0
       ) {
         event.preventDefault();
@@ -8853,12 +8865,14 @@ export default function ChatView({
       interactionMode,
       envMode,
     });
-    if (sent) {
-      setDismissedWorkflowTaskIds((existing) => new Set(existing).add(workflowTaskId));
+    if (sent && activeThreadId) {
+      markWorkflowRunDismissed(activeThreadId, workflowTaskId);
     }
   }, [
+    activeThreadId,
     envMode,
     interactionMode,
+    markWorkflowRunDismissed,
     providerOptionsForDispatch,
     runtimeMode,
     selectedModel,

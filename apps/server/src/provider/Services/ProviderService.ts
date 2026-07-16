@@ -138,6 +138,14 @@ export interface ProviderServiceShape {
   }) => Effect.Effect<void, ProviderServiceError>;
 
   /**
+   * Whether provider-native background tasks are currently keeping the
+   * thread's runtime alive. Restart-oriented recovery paths must check this
+   * before stopRuntimeSession: killing the shared subprocess silently
+   * terminates those tasks.
+   */
+  readonly hasLiveRuntimeTasks?: (input: { readonly threadId: ThreadId }) => Effect.Effect<boolean>;
+
+  /**
    * Forget a stale provider-native resume cursor while preserving local routing
    * metadata such as provider options and runtime mode.
    */

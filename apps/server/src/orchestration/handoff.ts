@@ -30,6 +30,14 @@ function roleLabel(message: Pick<OrchestrationMessage, "role">): "User" | "Assis
   return message.role === "assistant" ? "Assistant" : "User";
 }
 
+function earlierSummaryHeader(omittedCount: number): string {
+  return omittedCount > 0
+    ? `Earlier conversation summary (${omittedCount} older ${
+        omittedCount === 1 ? "message" : "messages"
+      } omitted to fit the context budget):`
+    : "Earlier conversation summary:";
+}
+
 export function listImportedHandoffMessages(
   thread: Pick<OrchestrationThread, "messages">,
 ): ReadonlyArray<OrchestrationMessage> {
@@ -135,6 +143,15 @@ function buildImportedMessagesBootstrapText(input: {
       maxChars -
       sections.reduce((total, section) => total + section.length + 2, 0) -
       (recentSection.length + 2);
+    // Reserve space for the omission header up front so accepted summary
+    // lines can never push the assembled section past `remaining`. The
+    // header only shrinks as more lines are accepted (omittedCount falls
+    // monotonically from earlierMessages.length toward 0, and shorter/no
+    // counts never produce a longer header), so sizing the reservation off
+    // the largest possible omitted count is a true worst-case bound, not
+    // just a conservative guess. The extra `+ 1` covers the "\n" that joins
+    // the header to the summary lines when at least one line is kept.
+    remaining -= earlierSummaryHeader(earlierMessages.length).length + 1;
     const summaryLines: string[] = [];
     for (let index = earlierMessages.length - 1; index >= 0; index -= 1) {
       const message = earlierMessages[index]!;
@@ -151,12 +168,7 @@ function buildImportedMessagesBootstrapText(input: {
     }
     summaryLines.reverse();
     const omittedCount = earlierMessages.length - summaryLines.length;
-    const header =
-      omittedCount > 0
-        ? `Earlier conversation summary (${omittedCount} older ${
-            omittedCount === 1 ? "message" : "messages"
-          } omitted to fit the context budget):`
-        : "Earlier conversation summary:";
+    const header = earlierSummaryHeader(omittedCount);
     sections.push(summaryLines.length > 0 ? `${header}\n${summaryLines.join("\n")}` : header);
   }
 

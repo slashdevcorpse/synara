@@ -53,6 +53,40 @@ describe("parseClaudeWorkflowScriptMeta", () => {
       undefined,
     );
   });
+
+  it("parses meta with inline `//` comments after fields and inside the phases array", () => {
+    const script = `export const meta = {
+  name: 'spec',
+  description: 'Draft the feature spec',   // one-line, shown in permission dialog
+  phases: [  // one entry per phase() call
+    { title: "One", detail: "Research" }, // first phase
+    { title: "Two" }, // second phase
+  ],
+};
+`;
+    expect(parseClaudeWorkflowScriptMeta(script)).toEqual({
+      name: "spec",
+      description: "Draft the feature spec",
+      phases: [{ title: "One", detail: "Research" }, { title: "Two" }],
+    });
+  });
+
+  it("parses meta with a /* block */ comment between a key and its value, and inside an array", () => {
+    const script = `export const meta = {
+  name: /* the workflow's name */ "spec",
+  phases: [ /* leading note */ { title: "One" } /* trailing note */ ],
+};`;
+    expect(parseClaudeWorkflowScriptMeta(script)).toEqual({
+      name: "spec",
+      phases: [{ title: "One" }],
+    });
+  });
+
+  it("returns undefined for an unterminated block comment inside meta without hanging", () => {
+    expect(
+      parseClaudeWorkflowScriptMeta('export const meta = { name: /* unterminated "spec" };'),
+    ).toBeUndefined();
+  });
 });
 
 describe("extractClaudeWorkflowAgentPhases", () => {
@@ -92,6 +126,44 @@ describe("extractClaudeWorkflowAgentPlans", () => {
       fast: { model: "haiku", effort: "low" },
     });
     expect(extractClaudeWorkflowAgentPhases(script)).toBeUndefined();
+  });
+
+  it("extracts options when the prompt string contains a URL and a comment-like substring", () => {
+    const script = `
+      await agent("See https://example.com/docs and note /* not a comment */ this.", {
+        label: "url-agent",
+        phase: "One",
+      });
+    `;
+    expect(extractClaudeWorkflowAgentPlans(script)).toEqual({
+      "url-agent": { phase: "One" },
+    });
+  });
+
+  it("parses a balanced call across a `// why ) here` comment", () => {
+    const script = `
+      await agent("Research prior art", {
+        // why ) here - this paren doesn't close the call
+        label: "commented-agent",
+        phase: "One",
+      });
+    `;
+    expect(extractClaudeWorkflowAgentPlans(script)).toEqual({
+      "commented-agent": { phase: "One" },
+    });
+  });
+
+  it("ignores commented-out options and extracts the real ones", () => {
+    const script = `
+      await agent("Scan the repo", {
+        // label: "fake", phase: "Wrong",
+        label: 'real',
+        phase: 'Scan',
+      });
+    `;
+    expect(extractClaudeWorkflowAgentPlans(script)).toEqual({
+      real: { phase: "Scan" },
+    });
   });
 });
 

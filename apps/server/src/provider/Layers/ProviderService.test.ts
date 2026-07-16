@@ -2594,6 +2594,68 @@ validation.layer("ProviderServiceLive validation", (it) => {
     }),
   );
 
+  it.effect("fails loudly when the adapter does not support stopping a task", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService;
+
+      yield* provider.startSession(asThreadId("thread-task-stop-unsupported"), {
+        provider: "codex",
+        threadId: asThreadId("thread-task-stop-unsupported"),
+        cwd: "/tmp/project",
+        runtimeMode: "full-access",
+      });
+
+      const failure = yield* Effect.result(
+        provider.stopTask({
+          threadId: asThreadId("thread-task-stop-unsupported"),
+          taskId: "task-1",
+        }),
+      );
+
+      assert.equal(failure._tag, "Failure");
+      if (failure._tag !== "Failure") {
+        return;
+      }
+      assert.equal(failure.failure._tag, "ProviderValidationError");
+      if (failure.failure._tag !== "ProviderValidationError") {
+        return;
+      }
+      assert.equal(failure.failure.operation, "ProviderService.stopTask");
+      assert.equal(failure.failure.issue.includes("does not support stopping"), true);
+    }),
+  );
+
+  it.effect("fails loudly when the adapter does not support backgrounding a task", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService;
+
+      yield* provider.startSession(asThreadId("thread-task-bg-unsupported"), {
+        provider: "codex",
+        threadId: asThreadId("thread-task-bg-unsupported"),
+        cwd: "/tmp/project",
+        runtimeMode: "full-access",
+      });
+
+      const failure = yield* Effect.result(
+        provider.backgroundTask({
+          threadId: asThreadId("thread-task-bg-unsupported"),
+          toolUseId: "tool-1",
+        }),
+      );
+
+      assert.equal(failure._tag, "Failure");
+      if (failure._tag !== "Failure") {
+        return;
+      }
+      assert.equal(failure.failure._tag, "ProviderValidationError");
+      if (failure.failure._tag !== "ProviderValidationError") {
+        return;
+      }
+      assert.equal(failure.failure.operation, "ProviderService.backgroundTask");
+      assert.equal(failure.failure.issue.includes("does not support backgrounding"), true);
+    }),
+  );
+
   it.effect("accepts startSession when adapter has not emitted provider thread id yet", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService;

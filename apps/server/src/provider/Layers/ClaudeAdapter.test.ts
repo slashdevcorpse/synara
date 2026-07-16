@@ -1796,7 +1796,9 @@ describe("ClaudeAdapterLive", () => {
       // No pending steer: the hook stays a clean passthrough.
       assert.deepEqual(yield* invokeHook("task-steer-1"), {});
 
-      yield* adapter.steerSubagent(session.threadId, "tool-task-steer-1", "Focus on the tests");
+      yield* adapter.steerSubagent(session.threadId, "tool-task-steer-1", {
+        input: "Focus on the tests",
+      });
 
       // Main-thread hook calls carry no agent_id and must never drain the queue.
       assert.deepEqual(yield* invokeHook(undefined), {});
@@ -1827,6 +1829,95 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
+  it.effect("projects steer attachments as disk-path references in the delivered text", () => {
+    const baseDir = mkdtempSync(path.join(os.tmpdir(), "claude-steer-attachments-"));
+    const harness = makeHarness({ baseDir });
+    return Effect.gen(function* () {
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() =>
+          rmSync(baseDir, {
+            recursive: true,
+            force: true,
+          }),
+        ),
+      );
+
+      const adapter = yield* ClaudeAdapter;
+      const { attachmentsDir } = yield* ServerConfig;
+
+      const attachment = {
+        type: "file" as const,
+        id: "thread-claude-steer-attachment-12345678-1234-1234-1234-123456789abc",
+        name: "notes.txt",
+        mimeType: "text/plain",
+        sizeBytes: 4,
+      };
+      const attachmentPath = path.join(attachmentsDir, attachmentRelativePath(attachment));
+      mkdirSync(path.dirname(attachmentPath), { recursive: true });
+      writeFileSync(attachmentPath, Uint8Array.from([1, 2, 3, 4]));
+
+      const session = yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: "claudeAgent",
+        runtimeMode: "full-access",
+      });
+
+      harness.query.emit({
+        type: "system",
+        subtype: "task_started",
+        task_id: "task-steer-attach-1",
+        tool_use_id: "tool-task-steer-attach-1",
+        subagent_type: "worker-high",
+        description: "Long-running task",
+        session_id: "sdk-session-steer-attach",
+        uuid: "task-started-steer-attach-1",
+      } as unknown as SDKMessage);
+
+      const hook = harness.getLastCreateQueryInput()?.options.hooks?.PreToolUse?.[0]?.hooks[0];
+      assert.isDefined(hook);
+      const invokeHook = () =>
+        Effect.promise(() =>
+          hook!(
+            {
+              hook_event_name: "PreToolUse",
+              tool_name: "Read",
+              tool_input: {},
+              tool_use_id: "tool-read-steer-attach-1",
+              session_id: "sdk-session-steer-attach",
+              transcript_path: "/tmp/transcript",
+              cwd: "/tmp",
+              agent_id: "task-steer-attach-1",
+            } as HookInput,
+            "tool-read-steer-attach-1",
+            { signal: new AbortController().signal },
+          ),
+        );
+
+      // Drains the microtask queue so the stream fiber ingests task_started
+      // (and registers the subagent run) before the steer is queued.
+      assert.deepEqual(yield* invokeHook(), {});
+
+      yield* adapter.steerSubagent(session.threadId, "tool-task-steer-attach-1", {
+        input: "Use the attached notes",
+        attachments: [attachment],
+      });
+
+      const hookOutput = yield* invokeHook();
+      const additionalContext =
+        "hookSpecificOutput" in hookOutput &&
+        hookOutput.hookSpecificOutput?.hookEventName === "PreToolUse"
+          ? hookOutput.hookSpecificOutput.additionalContext
+          : undefined;
+      assert.isDefined(additionalContext);
+      assert.include(additionalContext, "Use the attached notes");
+      assert.include(additionalContext, "<attached_files>");
+      assert.include(additionalContext, attachmentPath);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
   it.effect("rejects steering a subagent that already settled", () => {
     const harness = makeHarness();
     return Effect.gen(function* () {
@@ -1839,7 +1930,7 @@ describe("ClaudeAdapterLive", () => {
       });
 
       const result = yield* adapter
-        .steerSubagent(session.threadId, "tool-task-finished", "too late")
+        .steerSubagent(session.threadId, "tool-task-finished", { input: "too late" })
         .pipe(Effect.result);
       assert.equal(result._tag, "Failure");
       if (result._tag === "Failure") {
