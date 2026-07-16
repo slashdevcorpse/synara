@@ -1750,6 +1750,57 @@ idleCleanup.layer("ProviderServiceLive idle cleanup", (it) => {
     }),
   );
 
+  it.effect("keeps the runtime alive until background tasks settle", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService;
+      const threadId = asThreadId("thread-idle-background-task");
+
+      idleCleanup.claude.stopSession.mockClear();
+      const session = yield* provider.startSession(threadId, {
+        provider: "claudeAgent",
+        threadId,
+        runtimeMode: "full-access",
+      });
+      yield* idleCleanup.claude.waitForRuntimeSubscribers();
+      idleCleanup.claude.emit({
+        type: "task.started",
+        eventId: asEventId("runtime-background-task-started"),
+        provider: "claudeAgent",
+        createdAt: "2026-07-16T20:00:00.000Z",
+        threadId,
+        payload: { taskId: "background-task-1" },
+      });
+      idleCleanup.claude.emit({
+        type: "turn.completed",
+        eventId: asEventId("runtime-background-parent-completed"),
+        provider: "claudeAgent",
+        createdAt: "2026-07-16T20:00:01.000Z",
+        threadId,
+        payload: { state: "completed" },
+      });
+
+      yield* sleep(150);
+      assert.equal(idleCleanup.claude.stopSession.mock.calls.length, 0);
+
+      idleCleanup.claude.emit({
+        type: "task.updated",
+        eventId: asEventId("runtime-background-task-completed"),
+        provider: "claudeAgent",
+        createdAt: "2026-07-16T20:00:02.000Z",
+        threadId,
+        payload: { taskId: "background-task-1", status: "completed" },
+      });
+
+      yield* waitUntil(
+        () => idleCleanup.claude.stopSession.mock.calls.length > 0,
+        500,
+        20,
+        "idle runtime stop after background task settlement",
+      );
+      assert.deepEqual(idleCleanup.claude.stopSession.mock.calls[0]?.[0], session.threadId);
+    }),
+  );
+
   it.effect("serializes a fired idle stop before starting new turn work", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService;

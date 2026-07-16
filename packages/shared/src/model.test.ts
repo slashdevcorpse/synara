@@ -673,6 +673,24 @@ describe("claudeSelectionRequiresRestart", () => {
     ).toBe(false);
   });
 
+  it("restarts when a model switch makes a persisted max effort effective", () => {
+    expect(
+      claudeSelectionRequiresRestart(
+        selection("claude-haiku-4-5", { effort: "max" }),
+        selection("claude-sonnet-5", { effort: "max" }),
+      ),
+    ).toBe(true);
+  });
+
+  it("restarts when a model switch makes a persisted max effort unsupported", () => {
+    expect(
+      claudeSelectionRequiresRestart(
+        selection("claude-sonnet-5", { effort: "max" }),
+        selection("claude-haiku-4-5", { effort: "max" }),
+      ),
+    ).toBe(true);
+  });
+
   it("does not restart when a model switch carries an unsupported thinking override", () => {
     expect(
       claudeSelectionRequiresRestart(

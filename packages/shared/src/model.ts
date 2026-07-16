@@ -587,13 +587,6 @@ interface ClaudeSpawnProfile {
   readonly maxEffort: boolean;
 }
 
-function sameClaudeRequestedSpawnOptions(
-  previous: Extract<ModelSelection, { provider: "claudeAgent" }>,
-  next: Extract<ModelSelection, { provider: "claudeAgent" }>,
-): boolean {
-  return trimOrNull(previous.options?.effort ?? null) === trimOrNull(next.options?.effort ?? null);
-}
-
 // Mirrors the spawn-time option derivation in the Claude adapter's startSession:
 // only `max` effort is fixed at subprocess spawn (the query `effort` option;
 // the flag-settings `effortLevel` key caps at xhigh). Every other effort level
@@ -632,13 +625,9 @@ export function claudeSelectionRequiresRestart(
   if (previous.provider !== "claudeAgent") {
     return true;
   }
-  if (previous.model !== next.model && sameClaudeRequestedSpawnOptions(previous, next)) {
-    // A model switch is handled by setModel. Do not interpret the new model's
-    // different capabilities as a spawn-setting change when the requested
-    // effort itself is unchanged (for example, a `max` effort carried into a
-    // model that does not support it — the CLI downgrades it silently).
-    return false;
-  }
+  // Normalize against each model before deciding a model-only switch is live:
+  // a persisted `max` request may become spawn-fixed (or stop being so) as the
+  // selected model's capabilities change.
   const prev = claudeSpawnProfile(previous);
   const desired = claudeSpawnProfile(next);
   return prev.maxEffort !== desired.maxEffort;
