@@ -53,6 +53,7 @@ import {
   ThreadTurnStartRequestedPayload,
 } from "./Schemas.ts";
 import { resolveStableMessageTurnId } from "./messageTurnId.ts";
+import { settleTurnStateFromSession } from "./turnLifecycle.ts";
 
 type ThreadPatch = Partial<Omit<OrchestrationThread, "id" | "projectId">>;
 const MAX_THREAD_MESSAGES = 2_000;
@@ -93,18 +94,8 @@ function settleLatestTurnForSessionStatus(
   if (latestTurn?.state !== "running") {
     return latestTurn;
   }
-  const settledState =
-    session.status === "error"
-      ? ("error" as const)
-      : session.status === "interrupted" || session.status === "stopped"
-        ? ("interrupted" as const)
-        : session.status === "ready"
-          ? ("completed" as const)
-          : null;
+  const settledState = settleTurnStateFromSession(session, latestTurn.state);
   if (settledState === null) {
-    return latestTurn;
-  }
-  if (session.activeTurnId !== null && settledState !== "error") {
     return latestTurn;
   }
   return {

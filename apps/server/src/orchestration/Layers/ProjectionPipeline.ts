@@ -77,6 +77,7 @@ import {
 } from "../projectMetadataProjection.ts";
 import { applySpaceMetadataProjection } from "../spaceMetadataProjection.ts";
 import { resolveStableMessageTurnId } from "../messageTurnId.ts";
+import { settleTurnStateFromSession } from "../turnLifecycle.ts";
 import {
   attachmentRelativePath,
   parseAttachmentIdFromRelativePath,
@@ -126,28 +127,6 @@ const materializeAttachmentsForProjection = Effect.fn(
   (input: { readonly attachments: ReadonlyArray<ChatAttachment> }) =>
     Effect.succeed(input.attachments.length === 0 ? [] : input.attachments),
 );
-
-function finalizeTurnStateFromSessionStatus(
-  status: "starting" | "running" | "ready" | "interrupted" | "stopped" | "error",
-  existingState: ProjectionTurn["state"],
-): ProjectionTurn["state"] {
-  switch (status) {
-    case "error":
-      return "error";
-    case "interrupted":
-      return "interrupted";
-    case "ready":
-    case "stopped":
-      return existingState === "error"
-        ? "error"
-        : existingState === "interrupted"
-          ? "interrupted"
-          : "completed";
-    case "starting":
-    case "running":
-      return "running";
-  }
-}
 
 function extractActivityRequestId(payload: unknown): ApprovalRequestId | null {
   if (typeof payload !== "object" || payload === null) {
@@ -1436,13 +1415,8 @@ const makeOrchestrationProjectionPipeline = Effect.gen(function* () {
         case "thread.session-set": {
           const turnId = event.payload.session.activeTurnId;
           if (event.payload.session.status !== "running" || turnId === null) {
-            if (
-              event.payload.session.activeTurnId === null &&
-              (event.payload.session.status === "ready" ||
-                event.payload.session.status === "error" ||
-                event.payload.session.status === "interrupted" ||
-                event.payload.session.status === "stopped")
-            ) {
+            const settledState = settleTurnStateFromSession(event.payload.session, "running");
+            if (settledState !== null) {
               // Close the newest still-open turn when the runtime reports that
               // the thread is no longer running. Assistant message completion
               // can happen multiple times inside one turn, so session status is
@@ -1467,10 +1441,9 @@ const makeOrchestrationProjectionPipeline = Effect.gen(function* () {
               if (turnToFinalize) {
                 yield* projectionTurnRepository.upsertByTurnId({
                   ...turnToFinalize,
-                  state: finalizeTurnStateFromSessionStatus(
-                    event.payload.session.status,
+                  state:
+                    settleTurnStateFromSession(event.payload.session, turnToFinalize.state) ??
                     turnToFinalize.state,
-                  ),
                   startedAt: turnToFinalize.startedAt ?? event.payload.session.updatedAt,
                   requestedAt: turnToFinalize.requestedAt ?? event.payload.session.updatedAt,
                   completedAt: event.payload.session.updatedAt,

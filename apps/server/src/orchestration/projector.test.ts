@@ -703,6 +703,34 @@ describe("orchestration projector", () => {
     });
   });
 
+  it("settles an errored turn even when the session still retains the active turn", async () => {
+    const createdAt = "2026-02-23T08:00:00.000Z";
+    const startedAt = "2026-02-23T08:00:05.000Z";
+    const erroredAt = "2026-02-23T08:00:10.000Z";
+
+    const afterRunning = await projectThreadWithRunningTurn({ createdAt, startedAt });
+    const afterError = await Effect.runPromise(
+      projectEvent(
+        afterRunning,
+        makeSessionSetEvent({
+          sequence: 3,
+          commandId: "cmd-error",
+          occurredAt: erroredAt,
+          status: "error",
+          activeTurnId: "turn-1",
+          lastError: "provider crashed",
+          updatedAt: erroredAt,
+        }),
+      ),
+    );
+
+    expect(afterError.threads[0]?.latestTurn).toMatchObject({
+      turnId: "turn-1",
+      state: "error",
+      completedAt: erroredAt,
+    });
+  });
+
   it("does not let a late provider-diff placeholder unsettle a session-settled turn", async () => {
     const createdAt = "2026-02-23T08:00:00.000Z";
     const startedAt = "2026-02-23T08:00:05.000Z";
