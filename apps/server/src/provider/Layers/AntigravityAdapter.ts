@@ -884,10 +884,7 @@ const makeAntigravityAdapter = Effect.gen(function* () {
         cwd: context.session.cwd ?? serverConfig.cwd,
         env: buildProviderChildEnvironment({
           provider: PROVIDER,
-          inheritedSynaraKeys: [
-            "SYNARA_ANTIGRAVITY_EVENTS",
-            "SYNARA_ANTIGRAVITY_HOOK_DECISION",
-          ],
+          inheritedSynaraKeys: ["SYNARA_ANTIGRAVITY_EVENTS", "SYNARA_ANTIGRAVITY_HOOK_DECISION"],
           overrides: {
             SYNARA_ANTIGRAVITY_EVENTS: eventFile,
             SYNARA_ANTIGRAVITY_HOOK_DECISION: "allow",

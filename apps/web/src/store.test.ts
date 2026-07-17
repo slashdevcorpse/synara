@@ -601,7 +601,7 @@ describe("store pure functions", () => {
         }),
       ]);
 
-      expect(next.threads[0]?.latestTurn).toMatchObject({
+      expect(threadsOf(next)[0]?.latestTurn).toMatchObject({
         turnId: TurnId.makeUnsafe("turn-running"),
         state: expectedState,
         completedAt: "2026-02-27T00:02:00.000Z",
@@ -638,7 +638,7 @@ describe("store pure functions", () => {
       }),
     ]);
 
-    expect(next.threads[0]?.latestTurn).toMatchObject({
+    expect(threadsOf(next)[0]?.latestTurn).toMatchObject({
       turnId: TurnId.makeUnsafe("turn-running"),
       state: "running",
       completedAt: null,
@@ -1661,7 +1661,7 @@ describe("store pure functions", () => {
       }),
     ]);
 
-    expect(next.threads[0]?.latestTurn).toMatchObject({
+    expect(threadsOf(next)[0]?.latestTurn).toMatchObject({
       turnId: TurnId.makeUnsafe("turn-1"),
       state: "completed",
       completedAt: "2026-02-27T00:01:30.000Z",
