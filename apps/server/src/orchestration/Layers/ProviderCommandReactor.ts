@@ -70,6 +70,7 @@ import {
 } from "../../git/Services/TextGeneration.ts";
 import { resolveTextGenerationInputForSelection } from "../../git/textGenerationSelection.ts";
 import { ProviderService } from "../../provider/Services/ProviderService.ts";
+import { resolveProviderDispatchAttachments } from "../../provider/providerAttachmentPaths.ts";
 import { OrchestrationEventDeliveryRepositoryLive } from "../../persistence/Layers/OrchestrationEventDeliveries.ts";
 import { ProjectionPendingInteractionRepositoryLive } from "../../persistence/Layers/ProjectionPendingInteractions.ts";
 import { QueuedTurnPromotionRepositoryLive } from "../../persistence/Layers/QueuedTurnPromotions.ts";
@@ -79,6 +80,8 @@ import {
   PROVIDER_COMMAND_REACTOR_CONSUMER,
 } from "../../persistence/Services/OrchestrationEventDeliveries.ts";
 import { QueuedTurnPromotionRepository } from "../../persistence/Services/QueuedTurnPromotions.ts";
+import { ManagedAttachmentRepository } from "../../persistence/Services/ManagedAttachments.ts";
+import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { providerStartOptionsFromServerSettings } from "@synara/shared/serverSettings";
 import { clearWorkspaceIndexCache } from "../../workspaceEntries.ts";
@@ -330,6 +333,8 @@ const make = Effect.gen(function* () {
   const git = yield* GitCore;
   const textGeneration = yield* TextGeneration;
   const serverSettings = yield* ServerSettingsService;
+  const managedAttachments = yield* ManagedAttachmentRepository;
+  const serverConfig = yield* ServerConfig;
   const handledTurnStartKeys = yield* Cache.make<string, true>({
     capacity: HANDLED_TURN_START_KEY_MAX,
     timeToLive: HANDLED_TURN_START_KEY_TTL,
@@ -1183,7 +1188,15 @@ const make = Effect.gen(function* () {
         ...(input.skills !== undefined ? { skills: input.skills } : {}),
       }),
     );
-    const normalizedAttachments = input.attachments ?? [];
+    const normalizedAttachments = yield* resolveProviderDispatchAttachments({
+      attachments: input.attachments,
+      attachmentsDir: serverConfig.attachmentsDir,
+      repository: managedAttachments,
+      threadId: input.threadId,
+      messageId: input.messageId,
+      provider: selectedProvider as ProviderKind,
+      operation: "thread.turn.start",
+    });
     const activeSession = yield* providerService
       .listSessions()
       .pipe(
@@ -1709,11 +1722,20 @@ const make = Effect.gen(function* () {
       });
     }
 
+    const resolvedAttachments = yield* resolveProviderDispatchAttachments({
+      attachments: message.attachments,
+      attachmentsDir: serverConfig.attachmentsDir,
+      repository: managedAttachments,
+      threadId: event.payload.threadId,
+      messageId: message.id,
+      provider: providerName as ProviderKind,
+      operation: "thread.turn.start",
+    });
     const firstTurnRenameInput = {
       threadId: event.payload.threadId,
       messageId: message.id,
       messageText: message.text,
-      ...(message.attachments !== undefined ? { attachments: message.attachments } : {}),
+      ...(message.attachments !== undefined ? { attachments: resolvedAttachments } : {}),
       ...(event.payload.modelSelection !== undefined
         ? { modelSelection: event.payload.modelSelection }
         : {}),

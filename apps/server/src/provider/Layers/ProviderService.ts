@@ -59,6 +59,7 @@ import {
   isStartedTurnApplicable,
 } from "../terminalTurnApplicability.ts";
 import { makeProviderLifecycleCoordinator } from "../providerLifecycleCoordinator.ts";
+import { carryProviderAttachmentPaths } from "../providerAttachmentPaths.ts";
 
 export interface ProviderServiceLiveOptions {
   readonly canonicalEventLogPath?: string;
@@ -1308,7 +1309,7 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
 
         const input = {
           ...parsed,
-          attachments: parsed.attachments ?? [],
+          attachments: carryProviderAttachmentPaths(rawInput, parsed.attachments ?? []),
         };
         if (!input.input && input.attachments.length === 0) {
           return yield* toValidationError(
@@ -1368,7 +1369,7 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
 
         const input = {
           ...parsed,
-          attachments: parsed.attachments ?? [],
+          attachments: carryProviderAttachmentPaths(rawInput, parsed.attachments ?? []),
         };
         if (!input.input && input.attachments.length === 0) {
           return yield* toValidationError(

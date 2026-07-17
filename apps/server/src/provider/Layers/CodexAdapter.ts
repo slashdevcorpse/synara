@@ -43,7 +43,7 @@ import {
   CodexAppServerManager,
   type CodexAppServerStartSessionInput,
 } from "../../codexAppServerManager.ts";
-import { resolveAttachmentPath } from "../../attachmentStore.ts";
+import { resolveProviderAttachmentPath } from "../providerAttachmentPaths.ts";
 import {
   codexGeneratedImageArtifact,
   extractCodexGeneratedImageReference,
@@ -1672,7 +1672,7 @@ const makeCodexAdapter = (options?: CodexAdapterLiveOptions) =>
               if (attachment.type !== "image") {
                 return null;
               }
-              const attachmentPath = resolveAttachmentPath({
+              const attachmentPath = resolveProviderAttachmentPath({
                 attachmentsDir: serverConfig.attachmentsDir,
                 attachment,
               });
@@ -1750,7 +1750,7 @@ const makeCodexAdapter = (options?: CodexAdapterLiveOptions) =>
               if (attachment.type !== "image") {
                 return null;
               }
-              const attachmentPath = resolveAttachmentPath({
+              const attachmentPath = resolveProviderAttachmentPath({
                 attachmentsDir: serverConfig.attachmentsDir,
                 attachment,
               });

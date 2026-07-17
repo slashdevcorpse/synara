@@ -63,6 +63,7 @@ import {
   type StudioOutputReactorShape,
 } from "../Services/StudioOutputReactor.ts";
 import { attachmentRelativePath } from "../../attachmentStore.ts";
+import { resolveProviderAttachmentPath } from "../../provider/providerAttachmentPaths.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { checkpointRefForThreadTurn } from "../../checkpointing/Utils.ts";
 import {
@@ -521,7 +522,10 @@ describe("ProviderCommandReactor", () => {
         readonly mimeType: string;
         readonly sizeBytes: number;
       }) => {
-        const relativePath = attachmentRelativePath(attachment);
+        const flatRelativePath = attachmentRelativePath(attachment);
+        const relativePath = attachment.id.startsWith("att_v2_")
+          ? `objects/${attachment.id.slice(7, 9)}/${flatRelativePath}`
+          : flatRelativePath;
         const attachmentPath = path.join(stateDir, "attachments", relativePath);
         fs.mkdirSync(path.dirname(attachmentPath), { recursive: true });
         if (!fs.existsSync(attachmentPath)) {
@@ -557,6 +561,7 @@ describe("ProviderCommandReactor", () => {
               ),
             ),
         );
+        return attachmentPath;
       },
       drain,
       emitRuntimeEvent,
@@ -2257,6 +2262,65 @@ describe("ProviderCommandReactor", () => {
       skills: [skill],
       mentions: [mention],
     });
+  });
+
+  it("dispatches managed attachments from their repository object paths", async () => {
+    const harness = await createHarness();
+    const now = new Date().toISOString();
+    const imageAttachment = {
+      type: "image" as const,
+      id: "att_v2_aa000000000000000000000000000000",
+      name: "diagram.png",
+      mimeType: "image/png",
+      sizeBytes: 4,
+    };
+    const storagePath = await harness.stageAttachment(imageAttachment);
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.meta.update",
+        commandId: CommandId.makeUnsafe("cmd-managed-object-path-generic-title"),
+        threadId: ThreadId.makeUnsafe("thread-1"),
+        title: "New thread",
+      }),
+    );
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.makeUnsafe("cmd-managed-object-path"),
+        threadId: ThreadId.makeUnsafe("thread-1"),
+        message: {
+          messageId: asMessageId("message-managed-object-path"),
+          role: "user",
+          text: "Inspect this image",
+          attachments: [imageAttachment],
+        },
+        runtimeMode: "approval-required",
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+    const sentAttachment = harness.sendTurn.mock.calls[0]?.[0].attachments?.[0];
+    expect(sentAttachment).toMatchObject(imageAttachment);
+    expect(
+      sentAttachment &&
+        resolveProviderAttachmentPath({
+          attachmentsDir: path.join(harness.stateDir, "attachments"),
+          attachment: sentAttachment,
+        }),
+    ).toBe(storagePath);
+
+    await waitFor(() => harness.generateThreadTitle.mock.calls.length === 1);
+    const titleAttachment = harness.generateThreadTitle.mock.calls[0]?.[0].attachments?.[0];
+    expect(
+      titleAttachment &&
+        resolveProviderAttachmentPath({
+          attachmentsDir: path.join(harness.stateDir, "attachments"),
+          attachment: titleAttachment,
+        }),
+    ).toBe(storagePath);
   });
 
   it("restarts Droid edits and bootstraps only the retained transcript", async () => {

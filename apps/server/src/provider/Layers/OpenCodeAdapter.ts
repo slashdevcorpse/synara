@@ -29,7 +29,7 @@ import type {
   Todo,
 } from "@opencode-ai/sdk/v2";
 
-import { resolveAttachmentPath } from "../../attachmentStore.ts";
+import { resolveProviderAttachmentPath } from "../providerAttachmentPaths.ts";
 import { ServerConfig } from "../../config.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
 import {
@@ -3852,7 +3852,7 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
         const fileParts = toOpenCodeFileParts({
           attachments: input.attachments,
           resolveAttachmentPath: (attachment) =>
-            resolveAttachmentPath({
+            resolveProviderAttachmentPath({
               attachmentsDir: serverConfig.attachmentsDir,
               attachment,
             }),

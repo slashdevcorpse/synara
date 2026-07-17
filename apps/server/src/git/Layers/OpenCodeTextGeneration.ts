@@ -17,7 +17,7 @@ import { sanitizeGeneratedThreadTitle } from "@synara/shared/chatThreads";
 import { sanitizeBranchFragment, sanitizeFeatureBranchName } from "@synara/shared/git";
 import { getModelSelectionStringOptionValue } from "@synara/shared/model";
 
-import { resolveAttachmentPath } from "../../attachmentStore.ts";
+import { resolveProviderAttachmentPath } from "../../provider/providerAttachmentPaths.ts";
 import { ServerConfig } from "../../config.ts";
 import { appendFileAttachmentsPromptBlock } from "../../provider/attachmentProjection.ts";
 import {
@@ -372,7 +372,10 @@ const makeOpenCodeCompatibleTextGeneration = (config: OpenCodeCompatibleTextGene
       const fileParts = toOpenCodeFileParts({
         attachments: input.attachments,
         resolveAttachmentPath: (attachment) =>
-          resolveAttachmentPath({ attachmentsDir: serverConfig.attachmentsDir, attachment }),
+          resolveProviderAttachmentPath({
+            attachmentsDir: serverConfig.attachmentsDir,
+            attachment,
+          }),
       });
 
       const runAgainstServer = (server: Pick<OpenCodeServerConnection, "url">) =>

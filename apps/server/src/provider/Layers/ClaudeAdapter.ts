@@ -88,7 +88,7 @@ import {
   Stream,
 } from "effect";
 
-import { resolveAttachmentPath } from "../../attachmentStore.ts";
+import { resolveProviderAttachmentPath } from "../providerAttachmentPaths.ts";
 import { ServerConfig } from "../../config.ts";
 import { buildFileAttachmentsPromptBlock } from "../attachmentProjection.ts";
 import { buildClaudeProcessEnv } from "../claudeProcessEnv.ts";
@@ -1010,7 +1010,7 @@ function buildUserMessageEffect(
         continue;
       }
 
-      const attachmentPath = resolveAttachmentPath({
+      const attachmentPath = resolveProviderAttachmentPath({
         attachmentsDir: dependencies.attachmentsDir,
         attachment,
       });

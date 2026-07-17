@@ -6,7 +6,7 @@
 import type { ChatAttachment, ChatImageAttachment, ProviderKind } from "@synara/contracts";
 import { Effect } from "effect";
 
-import { resolveAttachmentPath } from "../attachmentStore.ts";
+import { resolveProviderAttachmentPath } from "./providerAttachmentPaths.ts";
 import { ProviderAdapterRequestError } from "./Errors.ts";
 
 // Assistant selections stay in history as attachments, but the composer serializes them into text.
@@ -33,7 +33,7 @@ export function loadProviderPromptImageBlocks(input: {
   readonly readErrorDetail?: (cause: unknown) => string;
 }): Effect.Effect<ProviderPromptImageBlock[], ProviderAdapterRequestError> {
   return Effect.forEach(filterProviderPromptImageAttachments(input.attachments), (attachment) => {
-    const attachmentPath = resolveAttachmentPath({
+    const attachmentPath = resolveProviderAttachmentPath({
       attachmentsDir: input.attachmentsDir,
       attachment,
     });

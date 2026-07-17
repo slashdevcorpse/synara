@@ -39,7 +39,7 @@ import {
 } from "@synara/contracts";
 import { Effect, FileSystem, Layer, Queue, Stream } from "effect";
 
-import { resolveAttachmentPath } from "../../attachmentStore.ts";
+import { resolveProviderAttachmentPath } from "../providerAttachmentPaths.ts";
 import { ServerConfig } from "../../config.ts";
 import { buildProviderChildEnvironment } from "../../providerChildEnvironment.ts";
 import {
@@ -2017,7 +2017,7 @@ const makePiAdapter = (options?: PiAdapterLiveOptions) =>
           (attachment) =>
             Effect.gen(function* () {
               if (attachment.type !== "image" || !attachment.mimeType) return undefined;
-              const attachmentPath = resolveAttachmentPath({
+              const attachmentPath = resolveProviderAttachmentPath({
                 attachmentsDir: serverConfig.attachmentsDir,
                 attachment,
               });
