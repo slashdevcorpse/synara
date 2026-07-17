@@ -97,12 +97,11 @@ export function SpaceProjectPickerDialog(props: {
     setSubmitting(true);
     setError(null);
     try {
-      const submittedCount = selectedIds.size;
       const failedProjectIds = (await props.onSubmit([...selectedIds])) ?? [];
       if (failedProjectIds.length > 0) {
         setSelectedIds(new Set(failedProjectIds));
         setError(
-          `${submittedCount - failedProjectIds.length} moved; ${failedProjectIds.length} could not be moved. Try again.`,
+          `${failedProjectIds.length} could not be moved. Projects processed before the failure remain in ${props.targetSpace?.name ?? "the target space"}. Try again.`,
         );
         setSubmitting(false);
         return;

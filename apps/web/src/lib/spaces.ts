@@ -109,14 +109,15 @@ export async function moveProjectToSpace(input: {
  * Files projects into a space as one atomic command per chunk (the command payload is
  * capped, so oversized selections split). A chunk either fully applies or fully fails;
  * on the first failure the remaining chunks are not attempted and everything not yet
- * moved is reported back for retry.
+ * processed is reported back for retry. The server may skip projects that are already
+ * settled (assigned to the target or deleted), so a successful chunk must not be used
+ * to infer an exact count of projects whose assignment changed.
  */
 export async function moveProjectsToSpace(input: {
   api: NativeApi;
   projectIds: ReadonlyArray<ProjectId>;
   spaceId: SpaceId;
-}): Promise<{ movedProjectIds: ProjectId[]; failedProjectIds: ProjectId[] }> {
-  const movedProjectIds: ProjectId[] = [];
+}): Promise<{ failedProjectIds: ProjectId[] }> {
   for (
     let offset = 0;
     offset < input.projectIds.length;
@@ -130,10 +131,9 @@ export async function moveProjectsToSpace(input: {
         spaceId: input.spaceId,
         projectIds: chunk,
       });
-      movedProjectIds.push(...chunk);
     } catch {
-      return { movedProjectIds, failedProjectIds: input.projectIds.slice(offset) };
+      return { failedProjectIds: input.projectIds.slice(offset) };
     }
   }
-  return { movedProjectIds, failedProjectIds: [] };
+  return { failedProjectIds: [] };
 }
