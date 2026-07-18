@@ -2362,10 +2362,7 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
   ): void {
     const rawRoute = this.readRouteFields(notification.params);
     this.rememberCollabReceiverTurns(context, notification.params, rawRoute.turnId);
-    const resolvedCollaborationRoute = this.resolveCollaborationRoute(
-      context,
-      notification.params,
-    );
+    const resolvedCollaborationRoute = this.resolveCollaborationRoute(context, notification.params);
     const {
       parentTurnId: childParentTurnId,
       providerThreadId,

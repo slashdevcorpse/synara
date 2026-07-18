@@ -329,10 +329,7 @@ function handleServerNotificationForTest(
 ): void {
   (
     manager as unknown as {
-      handleServerNotification: (
-        context: unknown,
-        notification: Record<string, unknown>,
-      ) => void;
+      handleServerNotification: (context: unknown, notification: Record<string, unknown>) => void;
     }
   ).handleServerNotification(context, notification);
 }
@@ -344,10 +341,7 @@ async function handleServerRequestForTest(
 ): Promise<void> {
   await (
     manager as unknown as {
-      handleServerRequest: (
-        context: unknown,
-        request: Record<string, unknown>,
-      ) => Promise<void>;
+      handleServerRequest: (context: unknown, request: Record<string, unknown>) => Promise<void>;
     }
   ).handleServerRequest(context, request);
 }
