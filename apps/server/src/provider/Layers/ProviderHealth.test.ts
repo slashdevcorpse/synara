@@ -155,6 +155,7 @@ const allProvidersDisabledSettings = {
     antigravity: { enabled: false },
     grok: { enabled: false },
     droid: { enabled: false },
+    kimi: { enabled: false },
     kilo: { enabled: false },
     opencode: { enabled: false },
     pi: { enabled: false },
@@ -170,6 +171,7 @@ const allProvidersDisabledServerSettings = {
     antigravity: { ...DEFAULT_SERVER_SETTINGS.providers.antigravity, enabled: false },
     grok: { ...DEFAULT_SERVER_SETTINGS.providers.grok, enabled: false },
     droid: { ...DEFAULT_SERVER_SETTINGS.providers.droid, enabled: false },
+    kimi: { ...DEFAULT_SERVER_SETTINGS.providers.kimi, enabled: false },
     kilo: { ...DEFAULT_SERVER_SETTINGS.providers.kilo, enabled: false },
     opencode: { ...DEFAULT_SERVER_SETTINGS.providers.opencode, enabled: false },
     pi: { ...DEFAULT_SERVER_SETTINGS.providers.pi, enabled: false },
@@ -288,6 +290,26 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
       });
     });
 
+    it("updates npm-managed Kimi through its matching package manager and PATH", () => {
+      const definition = PACKAGE_MANAGED_PROVIDER_UPDATES.kimi;
+      assert.ok(definition);
+
+      const capabilities = resolvePackageManagedProviderMaintenance(definition, {
+        binaryPath: "kimi",
+        realCommandPath:
+          "/Users/test/.nvm/versions/node/v24.13.0/lib/node_modules/@moonshot-ai/kimi-code/dist/main.mjs",
+        commandDirectory: "/Users/test/.nvm/versions/node/v24.13.0/bin",
+      });
+
+      assert.deepStrictEqual(capabilities.update, {
+        command: "npm install -g @moonshot-ai/kimi-code@latest",
+        executable: "npm",
+        args: ["install", "-g", "@moonshot-ai/kimi-code@latest"],
+        lockKey: "npm-global",
+        pathPrepend: "/Users/test/.nvm/versions/node/v24.13.0/bin",
+      });
+    });
+
     it.effect("stops a hung provider process and persists a failed update state", () =>
       Effect.gen(function* () {
         let killed = false;
@@ -371,7 +393,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
       );
       const codex = statuses.find((status) => status.provider === "codex");
 
-      assert.strictEqual(statuses.length, 9);
+      assert.strictEqual(statuses.length, 10);
       assert.strictEqual(codex?.available, false);
       assert.strictEqual(codex?.message, "Provider is disabled in Synara settings.");
     });
@@ -506,7 +528,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
         const providerHealth = yield* ProviderHealth;
         const statuses = yield* providerHealth.refresh;
 
-        assert.strictEqual(statuses.length, 9);
+        assert.strictEqual(statuses.length, 10);
         for (const status of statuses) {
           assert.strictEqual(status.available, false);
           assert.strictEqual(status.message, "Provider is disabled in Synara settings.");

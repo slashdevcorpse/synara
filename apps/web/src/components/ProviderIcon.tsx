@@ -71,6 +71,7 @@ export const PROVIDER_ICON_COMPONENT_BY_PROVIDER: Record<ProviderKind, Icon> = {
   antigravity: AntigravityIcon,
   grok: GrokIcon,
   droid: DroidIcon,
+  kimi: KimiIcon,
   kilo: KiloIcon,
   opencode: OpenCodeProviderIcon,
   pi: PiIcon,

@@ -200,6 +200,7 @@ const layer = it.layer(
         Layer.succeed(AntigravityAdapter, fakeAntigravityAdapter),
         Layer.succeed(GrokAdapter, fakeGrokAdapter),
         Layer.succeed(DroidAdapter, fakeDroidAdapter),
+        Layer.succeed(KimiAdapter, fakeKimiAdapter),
         Layer.succeed(KiloAdapter, fakeKiloAdapter),
         Layer.succeed(OpenCodeAdapter, fakeOpenCodeAdapter),
         Layer.succeed(PiAdapter, fakePiAdapter),
@@ -219,6 +220,7 @@ layer("ProviderAdapterRegistryLive", (it) => {
       const antigravity = yield* registry.getByProvider("antigravity");
       const grok = yield* registry.getByProvider("grok");
       const droid = yield* registry.getByProvider("droid");
+      const kimi = yield* registry.getByProvider("kimi");
       const kilo = yield* registry.getByProvider("kilo");
       const opencode = yield* registry.getByProvider("opencode");
       const pi = yield* registry.getByProvider("pi");
@@ -228,6 +230,7 @@ layer("ProviderAdapterRegistryLive", (it) => {
       assert.equal(antigravity, fakeAntigravityAdapter);
       assert.equal(grok, fakeGrokAdapter);
       assert.equal(droid, fakeDroidAdapter);
+      assert.equal(kimi, fakeKimiAdapter);
       assert.equal(kilo, fakeKiloAdapter);
       assert.equal(opencode, fakeOpenCodeAdapter);
       assert.equal(pi, fakePiAdapter);
@@ -240,6 +243,7 @@ layer("ProviderAdapterRegistryLive", (it) => {
         "antigravity",
         "grok",
         "droid",
+        "kimi",
         "kilo",
         "opencode",
         "pi",

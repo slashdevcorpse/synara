@@ -868,6 +868,8 @@ function getProviderStartOptionsCustomBinaryPath(
       return normalizeCustomBinaryPath(providerOptions?.grok?.binaryPath);
     case "droid":
       return normalizeCustomBinaryPath(providerOptions?.droid?.binaryPath);
+    case "kimi":
+      return normalizeCustomBinaryPath(providerOptions?.kimi?.binaryPath);
     case "kilo":
       return normalizeCustomBinaryPath(providerOptions?.kilo?.binaryPath);
     case "opencode":
@@ -2057,6 +2059,7 @@ export default function ChatView({
       antigravity: resolveHint("antigravity"),
       grok: resolveHint("grok"),
       droid: resolveHint("droid"),
+      kimi: resolveHint("kimi"),
       kilo: resolveHint("kilo"),
       opencode: resolveHint("opencode"),
       pi: resolveHint("pi"),
@@ -2112,6 +2115,15 @@ export default function ChatView({
       binaryPath: settings.droidBinaryPath || null,
       cwd: providerModelDiscoveryCwd,
       enabled: droidModelDiscoveryEnabled,
+    }),
+  );
+  const kimiModelDiscoveryEnabled =
+    selectedProvider === "kimi" || lockedProvider === "kimi" || isModelPickerOpen;
+  const kimiDynamicModelsQuery = useQuery(
+    providerModelsQueryOptions({
+      provider: "kimi",
+      binaryPath: settings.kimiBinaryPath || null,
+      enabled: kimiModelDiscoveryEnabled,
     }),
   );
   const openCodeDynamicModelsQuery = useQuery(
@@ -2180,6 +2192,14 @@ export default function ChatView({
     droidModelDiscoveryEnabled &&
     !hasResolvedDroidModelDiscovery &&
     isInitialModelDiscoveryPending(droidDynamicModelsQuery);
+  const hasResolvedKimiModelDiscovery =
+    (kimiDynamicModelsQuery.data?.source === "kimi.acp" ||
+      kimiDynamicModelsQuery.data?.source === "kimi-builtin") &&
+    (kimiDynamicModelsQuery.data.models.length ?? 0) > 0;
+  const kimiModelDiscoveryPending =
+    kimiModelDiscoveryEnabled &&
+    !hasResolvedKimiModelDiscovery &&
+    isInitialModelDiscoveryPending(kimiDynamicModelsQuery);
   const hasResolvedKiloModelDiscovery =
     (kiloDynamicModelsQuery.data?.source === "kilo-cli" ||
       kiloDynamicModelsQuery.data?.source === "kilo") &&
@@ -2240,6 +2260,11 @@ export default function ChatView({
         customModelsByProvider.droid,
         composerModelHintByProvider.droid,
       ),
+      kimi: getAppModelOptions(
+        "kimi",
+        customModelsByProvider.kimi,
+        composerModelHintByProvider.kimi,
+      ),
       kilo: getAppModelOptions(
         "kilo",
         customModelsByProvider.kilo,
@@ -2267,6 +2292,7 @@ export default function ChatView({
       antigravity: antigravityModelsQuery.data,
       grok: grokDynamicModelsQuery.data,
       droid: droidDynamicModelsQuery.data,
+      kimi: kimiDynamicModelsQuery.data,
       kilo: kiloDynamicModelsQuery.data,
       opencode: openCodeDynamicModelsQuery.data,
       pi: piDynamicModelsQuery.data,
@@ -2279,6 +2305,7 @@ export default function ChatView({
       "antigravity",
       "grok",
       "droid",
+      "kimi",
       "kilo",
       "opencode",
       "pi",
@@ -2325,6 +2352,7 @@ export default function ChatView({
       antigravity: antigravityModelsQuery.data?.models ?? [],
       grok: grokDynamicModelsQuery.data?.models ?? [],
       droid: droidDynamicModelsQuery.data?.models ?? [],
+      kimi: kimiDynamicModelsQuery.data?.models ?? [],
       kilo: kiloDynamicModelsQuery.data?.models ?? [],
       opencode: openCodeDynamicModelsQuery.data?.models ?? [],
       pi: piDynamicModelsQuery.data?.models ?? [],
@@ -2349,6 +2377,7 @@ export default function ChatView({
     antigravity: antigravityModelsQuery,
     grok: grokDynamicModelsQuery,
     droid: droidDynamicModelsQuery,
+    kimi: kimiDynamicModelsQuery,
     kilo: kiloDynamicModelsQuery,
     opencode: openCodeDynamicModelsQuery,
     pi: piDynamicModelsQuery,
@@ -2417,16 +2446,18 @@ export default function ChatView({
         ? cursorModelDiscoveryPending
         : selectedProvider === "droid"
           ? droidModelDiscoveryPending
-          : selectedProvider === "kilo"
-            ? kiloModelDiscoveryPending
-            : selectedProvider === "opencode"
-              ? openCodeModelDiscoveryPending
-              : selectedProvider === "pi"
-                ? piModelDiscoveryPending
-                : selectedProviderModelsQuery !== undefined &&
-                  (selectedProviderModelsQuery.isLoading ||
-                    (selectedProviderModelsQuery.isFetching &&
-                      selectedProviderModelsQuery.data === undefined));
+          : selectedProvider === "kimi"
+            ? kimiModelDiscoveryPending
+            : selectedProvider === "kilo"
+              ? kiloModelDiscoveryPending
+              : selectedProvider === "opencode"
+                ? openCodeModelDiscoveryPending
+                : selectedProvider === "pi"
+                  ? piModelDiscoveryPending
+                  : selectedProviderModelsQuery !== undefined &&
+                    (selectedProviderModelsQuery.isLoading ||
+                      (selectedProviderModelsQuery.isFetching &&
+                        selectedProviderModelsQuery.data === undefined));
   const selectedProviderRequiresRuntimeModels =
     selectedProvider === "cursor" ||
     selectedProvider === "antigravity" ||
@@ -2441,13 +2472,15 @@ export default function ChatView({
         ? cursorModelDiscoveryPending
         : selectedProvider === "droid"
           ? droidModelDiscoveryPending
-          : selectedProvider === "kilo"
-            ? kiloModelDiscoveryPending
-            : selectedProvider === "opencode"
-              ? openCodeModelDiscoveryPending
-              : selectedProvider === "pi"
-                ? piModelDiscoveryPending
-                : false;
+          : selectedProvider === "kimi"
+            ? kimiModelDiscoveryPending
+            : selectedProvider === "kilo"
+              ? kiloModelDiscoveryPending
+              : selectedProvider === "opencode"
+                ? openCodeModelDiscoveryPending
+                : selectedProvider === "pi"
+                  ? piModelDiscoveryPending
+                  : false;
   const showComposerModelBootstrapSkeleton = shouldShowComposerModelBootstrapSkeleton({
     selectedProvider,
     selectedModel,
@@ -8932,6 +8965,7 @@ export default function ChatView({
           antigravity: antigravityModelDiscoveryPending,
           cursor: cursorModelDiscoveryPending,
           droid: droidModelDiscoveryPending,
+          kimi: kimiModelDiscoveryPending,
           kilo: kiloModelDiscoveryPending,
           opencode: openCodeModelDiscoveryPending,
           pi: piModelDiscoveryPending,
@@ -8975,6 +9009,7 @@ export default function ChatView({
         antigravity: antigravityModelDiscoveryPending,
         cursor: cursorModelDiscoveryPending,
         droid: droidModelDiscoveryPending,
+        kimi: kimiModelDiscoveryPending,
         kilo: kiloModelDiscoveryPending,
         opencode: openCodeModelDiscoveryPending,
         pi: piModelDiscoveryPending,

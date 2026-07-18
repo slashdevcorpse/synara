@@ -38,6 +38,3 @@ __screenshots__/
 /browser-sidebar-comment-preload.js.map
 /preload.js.map
 /bootstrap.js.map
-
-# codegraph: local code-structure index (rebuilt per machine; do not commit)
-.codegraph/

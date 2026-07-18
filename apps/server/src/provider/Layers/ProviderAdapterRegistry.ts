@@ -42,6 +42,7 @@ const makeProviderAdapterRegistry = (options?: ProviderAdapterRegistryLiveOption
             yield* AntigravityAdapter,
             yield* GrokAdapter,
             yield* DroidAdapter,
+            yield* KimiAdapter,
             yield* KiloAdapter,
             yield* OpenCodeAdapter,
             yield* PiAdapter,

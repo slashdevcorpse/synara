@@ -12,6 +12,7 @@ type ModelProviderKind =
   | "antigravity"
   | "grok"
   | "droid"
+  | "kimi"
   | "kilo"
   | "opencode"
   | "pi";
@@ -92,6 +93,7 @@ function inferLegacyModelProvider(provider: unknown, model: string): ModelProvid
     provider === "antigravity" ||
     provider === "grok" ||
     provider === "droid" ||
+    provider === "kimi" ||
     provider === "kilo" ||
     provider === "opencode" ||
     provider === "pi"

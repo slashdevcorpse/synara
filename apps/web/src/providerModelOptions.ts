@@ -157,12 +157,9 @@ export function mergeDynamicModelOptions(input: {
       // its single model is a managed alias whose backend display name updates
       // server-side, so Kimi's live ACP-reported name wins over the static label.
       name:
-        staticNameBySlug.get(normalizedSlug) ??
-        (rawName.length > 0 &&
-        rawName.toLowerCase() !== rawSlug &&
-        rawName.toLowerCase() !== normalizedSlug.toLowerCase()
-          ? rawName
-          : displayNameFallback),
+        input.provider === "kimi"
+          ? (meaningfulDynamicName ?? staticName ?? displayNameFallback)
+          : (staticName ?? meaningfulDynamicName ?? displayNameFallback),
       ...(dynamicModel.description?.trim() ? { description: dynamicModel.description.trim() } : {}),
       ...(dynamicModel.upstreamProviderId?.trim()
         ? { upstreamProviderId: dynamicModel.upstreamProviderId.trim() }
@@ -328,6 +325,12 @@ export function buildNextProviderOptions(
       ...patch,
     } as DroidModelOptions;
   }
+  if (provider === "kimi") {
+    return {
+      ...(modelOptions as KimiModelOptions | undefined),
+      ...patch,
+    } as KimiModelOptions;
+  }
   if (provider === "opencode") {
     return {
       ...(modelOptions as OpenCodeModelOptions | undefined),
@@ -378,6 +381,11 @@ export function buildModelSelection(
   model: string,
   options?: DroidModelOptions | null | undefined,
 ): DroidModelSelection;
+export function buildModelSelection(
+  provider: "kimi",
+  model: string,
+  options?: KimiModelOptions | null | undefined,
+): KimiModelSelection;
 export function buildModelSelection(
   provider: "opencode",
   model: string,
@@ -450,6 +458,14 @@ export function buildModelSelection(
             provider,
             model,
             options: options as DroidModelOptions,
+          }
+        : { provider, model };
+    case "kimi":
+      return options
+        ? {
+            provider,
+            model,
+            options: options as KimiModelOptions,
           }
         : { provider, model };
     case "kilo":

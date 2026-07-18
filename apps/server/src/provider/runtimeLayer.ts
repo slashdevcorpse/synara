@@ -65,6 +65,10 @@ export function makeServerProviderLayer() {
       {},
       nativeEventLogger ? { nativeEventLogger } : undefined,
     );
+    const kimiAdapterLayer = makeKimiAdapterLive(
+      {},
+      nativeEventLogger ? { nativeEventLogger } : undefined,
+    );
     const cursorAdapterLayer = makeCursorAdapterLive(
       {},
       nativeEventLogger ? { nativeEventLogger } : undefined,
@@ -77,6 +81,7 @@ export function makeServerProviderLayer() {
       Layer.provide(antigravityAdapterLayer),
       Layer.provide(grokAdapterLayer),
       Layer.provide(droidAdapterLayer),
+      Layer.provide(kimiAdapterLayer),
       Layer.provide(kiloAdapterLayer),
       Layer.provide(openCodeAdapterLayer),
       Layer.provide(piAdapterLayer),

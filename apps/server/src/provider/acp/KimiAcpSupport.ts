@@ -13,7 +13,7 @@
  *
  * @module KimiAcpSupport
  */
-import { type ProviderModelDescriptor } from "@t3tools/contracts";
+import { type ProviderListModelsResult, type ProviderModelDescriptor } from "@t3tools/contracts";
 import { Effect, Layer, Scope, ServiceMap } from "effect";
 import type * as EffectAcpErrors from "effect-acp/errors";
 import type * as EffectAcpSchema from "effect-acp/schema";
@@ -45,6 +45,7 @@ export interface KimiAcpModelSelectionErrorContext {
 
 export const DEFAULT_KIMI_BINARY = "kimi";
 const KIMI_LOGIN_AUTH_METHOD_ID = "login";
+const KIMI_THINKING_CONFIG_ID = "thinking";
 
 export function buildKimiAcpSpawnInput(
   kimiSettings: KimiAcpRuntimeSettings | null | undefined,
@@ -130,11 +131,45 @@ function flattenKimiModelConfigEntries(
   return entries;
 }
 
+function findKimiSelectConfig(
+  configOptions: ReadonlyArray<EffectAcpSchema.SessionConfigOption>,
+  input: { readonly id: string; readonly category: string },
+): Extract<EffectAcpSchema.SessionConfigOption, { readonly type: "select" }> | undefined {
+  return configOptions.find(
+    (option): option is Extract<EffectAcpSchema.SessionConfigOption, { readonly type: "select" }> =>
+      option.type === "select" &&
+      (option.id.trim().toLowerCase() === input.id || option.category === input.category),
+  );
+}
+
+function flattenKimiSelectOptions(
+  options: EffectAcpSchema.SessionConfigSelectOptions,
+): ReadonlyArray<EffectAcpSchema.SessionConfigSelectOption> {
+  return options.flatMap((entry) => ("options" in entry ? entry.options : [entry]));
+}
+
+function kimiSupportsThinkingToggle(
+  configOptions: ReadonlyArray<EffectAcpSchema.SessionConfigOption>,
+): boolean {
+  const thinking = findKimiSelectConfig(configOptions, {
+    id: KIMI_THINKING_CONFIG_ID,
+    category: "thought_level",
+  });
+  if (!thinking) return false;
+  const values = new Set(
+    flattenKimiSelectOptions(thinking.options).map((option) => option.value.toLowerCase()),
+  );
+  return values.has("on") && values.has("off");
+}
+
 // The backend behind Kimi's managed alias auto-updates, so the live `model`
 // config option is the authoritative source for the picker's model name.
 export function buildKimiModelDescriptorsFromConfigOptions(
   configOptions: ReadonlyArray<EffectAcpSchema.SessionConfigOption>,
 ): ReadonlyArray<ProviderModelDescriptor> {
+  const modelConfig = findKimiSelectConfig(configOptions, { id: "model", category: "model" });
+  const currentModel = modelConfig?.currentValue?.trim().toLowerCase();
+  const supportsThinkingToggle = kimiSupportsThinkingToggle(configOptions);
   const seen = new Set<string>();
   const descriptors: Array<ProviderModelDescriptor> = [];
   for (const entry of flattenKimiModelConfigEntries(configOptions)) {
@@ -145,9 +180,82 @@ export function buildKimiModelDescriptorsFromConfigOptions(
       continue;
     }
     seen.add(slug);
-    descriptors.push({ slug, name: entry.name.length > 0 ? entry.name : slug });
+    descriptors.push({
+      slug,
+      name: entry.name.length > 0 ? entry.name : slug,
+      ...(supportsThinkingToggle && entry.value.toLowerCase() === currentModel
+        ? { supportsThinkingToggle: true }
+        : {}),
+    });
   }
   return descriptors;
+}
+
+/**
+ * Probes each advertised Kimi model because ACP only exposes the thinking option
+ * for the currently selected model. The disposable discovery session is restored
+ * before it is closed so probing never mutates the user's persisted selection.
+ */
+export function discoverKimiAcpModels(
+  runtime: Pick<AcpSessionRuntimeShape, "getConfigOptions" | "setConfigOption" | "setModel">,
+): Effect.Effect<ProviderListModelsResult, EffectAcpErrors.AcpError> {
+  return Effect.gen(function* () {
+    const initialOptions = yield* runtime.getConfigOptions;
+    const modelConfig = findKimiSelectConfig(initialOptions, { id: "model", category: "model" });
+    const modelEntries = flattenKimiModelConfigEntries(initialOptions);
+    if (!modelConfig || modelEntries.length === 0) {
+      return {
+        models: [],
+        source: "kimi.acp",
+        cached: false,
+      } satisfies ProviderListModelsResult;
+    }
+
+    const originalModel = modelConfig.currentValue;
+    const originalThinking = findKimiSelectConfig(initialOptions, {
+      id: KIMI_THINKING_CONFIG_ID,
+      category: "thought_level",
+    })?.currentValue;
+    const models = yield* Effect.forEach(
+      modelEntries,
+      (entry) =>
+        runtime.setModel(entry.value).pipe(
+          Effect.andThen(runtime.getConfigOptions),
+          Effect.map((updatedOptions) => {
+            const slug = kimiBareModelSlug(entry.value);
+            return {
+              slug,
+              name: entry.name.length > 0 ? entry.name : slug,
+              ...(kimiSupportsThinkingToggle(updatedOptions)
+                ? { supportsThinkingToggle: true }
+                : {}),
+            } satisfies ProviderModelDescriptor;
+          }),
+          Effect.catch(() =>
+            Effect.succeed({
+              slug: kimiBareModelSlug(entry.value),
+              name: entry.name.length > 0 ? entry.name : kimiBareModelSlug(entry.value),
+            } satisfies ProviderModelDescriptor),
+          ),
+        ),
+      { concurrency: 1 },
+    );
+
+    if (originalModel) {
+      yield* runtime.setModel(originalModel).pipe(Effect.ignore);
+      if (originalThinking) {
+        yield* runtime
+          .setConfigOption(KIMI_THINKING_CONFIG_ID, originalThinking)
+          .pipe(Effect.ignore);
+      }
+    }
+
+    return {
+      models,
+      source: "kimi.acp",
+      cached: false,
+    } satisfies ProviderListModelsResult;
+  });
 }
 
 // Resolves a Synara model slug (bare `kimi-for-coding`, the full ACP value, or a
@@ -200,6 +308,36 @@ export function applyKimiAcpModelSelection<E>(input: {
     }
     yield* input.runtime
       .setModel(value)
+      .pipe(
+        Effect.mapError((cause) => input.mapError({ cause, method: "session/set_config_option" })),
+      );
+  });
+}
+
+/** Applies Kimi's ACP-native binary thinking selector when the model exposes it. */
+export function applyKimiAcpThinkingSelection<E>(input: {
+  readonly runtime: Pick<AcpSessionRuntimeShape, "getConfigOptions" | "setConfigOption">;
+  readonly thinking: boolean | undefined;
+  readonly mapError: (context: KimiAcpModelSelectionErrorContext) => E;
+}): Effect.Effect<void, E> {
+  if (input.thinking === undefined) return Effect.void;
+  return Effect.gen(function* () {
+    const configOptions = yield* input.runtime.getConfigOptions;
+    const thinkingConfig = findKimiSelectConfig(configOptions, {
+      id: KIMI_THINKING_CONFIG_ID,
+      category: "thought_level",
+    });
+    if (!thinkingConfig) return;
+
+    const requestedValue = input.thinking ? "on" : "off";
+    const resolvedValue = flattenKimiSelectOptions(thinkingConfig.options).find(
+      (option) => option.value.toLowerCase() === requestedValue,
+    )?.value;
+    // Always-thinking models intentionally expose only `on`; ignore a stale
+    // persisted `off` choice rather than making an otherwise valid model unusable.
+    if (!resolvedValue) return;
+    yield* input.runtime
+      .setConfigOption(thinkingConfig.id, resolvedValue)
       .pipe(
         Effect.mapError((cause) => input.mapError({ cause, method: "session/set_config_option" })),
       );

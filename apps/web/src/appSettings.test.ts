@@ -516,6 +516,7 @@ describe("provider-indexed custom model settings", () => {
     customAntigravityModels: ["Gemini 3.5 Flash (Experimental)"],
     customGrokModels: ["grok/custom-fast"],
     customDroidModels: ["claude-opus-4-8-custom"],
+    customKimiModels: ["kimi-for-coding"],
     customKiloModels: ["kilo/kilo-auto/free"],
     customOpenCodeModels: ["openrouter/gpt-oss-120b"],
     customPiModels: ["anthropic/custom-pi"],
@@ -529,16 +530,17 @@ describe("provider-indexed custom model settings", () => {
       "antigravity",
       "grok",
       "droid",
+      "kimi",
       "kilo",
       "opencode",
       "pi",
     ]);
   });
 
-  it("keeps Droid persistence compatible without advertising unsupported custom slugs", () => {
-    expect(CUSTOM_MODEL_EDITOR_PROVIDER_SETTINGS.map((config) => config.provider)).not.toContain(
-      "droid",
-    );
+  it("keeps ACP-validated providers out of the unsupported custom model editor", () => {
+    const providers = CUSTOM_MODEL_EDITOR_PROVIDER_SETTINGS.map((config) => config.provider);
+    expect(providers).not.toContain("droid");
+    expect(providers).not.toContain("kimi");
   });
 
   it("reads custom models for each provider", () => {
@@ -547,6 +549,7 @@ describe("provider-indexed custom model settings", () => {
     expect(getCustomModelsForProvider(settings, "cursor")).toEqual(["cursor/custom-model"]);
     expect(getCustomModelsForProvider(settings, "grok")).toEqual(["grok/custom-fast"]);
     expect(getCustomModelsForProvider(settings, "droid")).toEqual(["claude-opus-4-8-custom"]);
+    expect(getCustomModelsForProvider(settings, "kimi")).toEqual(["kimi-for-coding"]);
     expect(getCustomModelsForProvider(settings, "kilo")).toEqual(["kilo/kilo-auto/free"]);
     expect(getCustomModelsForProvider(settings, "opencode")).toEqual(["openrouter/gpt-oss-120b"]);
     expect(getCustomModelsForProvider(settings, "pi")).toEqual(["anthropic/custom-pi"]);
@@ -560,6 +563,7 @@ describe("provider-indexed custom model settings", () => {
       customAntigravityModels: ["Gemini 3.5 Flash (Experimental)"],
       customGrokModels: ["grok/default-fast"],
       customDroidModels: ["droid/default-model"],
+      customKimiModels: ["kimi-for-coding"],
       customKiloModels: ["kilo/default-auto"],
       customOpenCodeModels: ["openai/gpt-5"],
       customPiModels: ["anthropic/default-pi"],
@@ -575,6 +579,7 @@ describe("provider-indexed custom model settings", () => {
     ]);
     expect(getDefaultCustomModelsForProvider(defaults, "grok")).toEqual(["grok/default-fast"]);
     expect(getDefaultCustomModelsForProvider(defaults, "droid")).toEqual(["droid/default-model"]);
+    expect(getDefaultCustomModelsForProvider(defaults, "kimi")).toEqual(["kimi-for-coding"]);
     expect(getDefaultCustomModelsForProvider(defaults, "kilo")).toEqual(["kilo/default-auto"]);
     expect(getDefaultCustomModelsForProvider(defaults, "opencode")).toEqual(["openai/gpt-5"]);
     expect(getDefaultCustomModelsForProvider(defaults, "pi")).toEqual(["anthropic/default-pi"]);
@@ -616,6 +621,12 @@ describe("provider-indexed custom model settings", () => {
     });
   });
 
+  it("patches custom models for Kimi", () => {
+    expect(patchCustomModels("kimi", ["kimi-for-coding"])).toEqual({
+      customKimiModels: ["kimi-for-coding"],
+    });
+  });
+
   it("patches custom models for opencode", () => {
     expect(patchCustomModels("opencode", ["openrouter/gpt-oss-120b"])).toEqual({
       customOpenCodeModels: ["openrouter/gpt-oss-120b"],
@@ -642,6 +653,7 @@ describe("provider-indexed custom model settings", () => {
       antigravity: ["Gemini 3.5 Flash (Experimental)"],
       grok: ["grok/custom-fast"],
       droid: ["claude-opus-4-8-custom"],
+      kimi: ["kimi-for-coding"],
       kilo: ["kilo/kilo-auto/free"],
       opencode: ["openrouter/gpt-oss-120b"],
       pi: ["anthropic/custom-pi"],

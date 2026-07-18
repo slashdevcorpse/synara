@@ -79,7 +79,8 @@ import {
 } from "../acp/AcpTurnIdleWatchdog.ts";
 import {
   applyKimiAcpModelSelection,
-  buildKimiModelDescriptorsFromConfigOptions,
+  applyKimiAcpThinkingSelection,
+  discoverKimiAcpModels,
   makeKimiAcpRuntime,
   type KimiAcpRuntimeSettings,
 } from "../acp/KimiAcpSupport.ts";
@@ -428,6 +429,9 @@ function applyRequestedSessionConfiguration<E>(input: {
   readonly modelSelection:
     | {
         readonly model: string;
+        readonly options?: {
+          readonly thinking?: boolean;
+        };
       }
     | undefined;
   readonly mapError: (context: {
@@ -440,6 +444,11 @@ function applyRequestedSessionConfiguration<E>(input: {
       yield* applyKimiAcpModelSelection({
         runtime: input.runtime,
         model: input.modelSelection.model,
+        mapError: ({ cause, method }) => input.mapError({ cause, method }),
+      });
+      yield* applyKimiAcpThinkingSelection({
+        runtime: input.runtime,
+        thinking: input.modelSelection.options?.thinking,
         mapError: ({ cause, method }) => input.mapError({ cause, method }),
       });
     }
@@ -1143,7 +1152,13 @@ export function makeKimiAdapter(
           runtime: ctx.acp,
           runtimeMode: ctx.session.runtimeMode,
           interactionMode: input.interactionMode,
-          modelSelection: model === undefined ? undefined : { model },
+          modelSelection:
+            model === undefined
+              ? undefined
+              : {
+                  model,
+                  ...(turnModelSelection?.options ? { options: turnModelSelection.options } : {}),
+                },
           mapError: ({ cause, method }) =>
             mapAcpToAdapterError(PROVIDER, input.threadId, method, cause),
         });
@@ -1454,7 +1469,7 @@ export function makeKimiAdapter(
         supportsPluginDiscovery: false,
         supportsRuntimeModelList: true,
         supportsThreadCompaction: false,
-        supportsThreadImport: false,
+        supportsThreadImport: true,
       } satisfies ProviderComposerCapabilities);
 
     // Kimi's managed `kimi-for-coding` alias auto-updates its backend (and the
@@ -1473,16 +1488,15 @@ export function makeKimiAdapter(
           clientInfo: { name: "Synara", version: "0.0.0" },
         });
         yield* runtime.start();
-        const configOptions = yield* runtime.getConfigOptions;
-        const models = buildKimiModelDescriptorsFromConfigOptions(configOptions);
-        if (models.length === 0) {
+        const result = yield* discoverKimiAcpModels(runtime);
+        if (result.models.length === 0) {
           return yield* new ProviderAdapterRequestError({
             provider: PROVIDER,
             method: "model/list",
             detail: "Kimi ACP model discovery returned no models.",
           });
         }
-        return models;
+        return result;
       }).pipe(
         Effect.scoped,
         Effect.timeoutOption(KIMI_MODEL_DISCOVERY_TIMEOUT_MS),
@@ -1496,19 +1510,15 @@ export function makeKimiAdapter(
                   detail: "Timed out while discovering Kimi models over ACP.",
                 }),
               ),
-            onSome: (models) => Effect.succeed(models),
+            onSome: (result) => Effect.succeed(result),
           }),
         ),
       );
 
       return discover.pipe(
-        Effect.map(
-          (models) =>
-            ({ models, source: "kimi.acp", cached: false }) satisfies ProviderListModelsResult,
-        ),
         Effect.catch(() =>
           Effect.succeed({
-            models: [{ slug: "kimi-for-coding", name: "K2.7 Code" }],
+            models: [{ slug: "kimi-for-coding", name: "Kimi for Coding" }],
             source: "kimi-builtin",
             cached: false,
           } satisfies ProviderListModelsResult),

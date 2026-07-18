@@ -144,6 +144,11 @@ export const DroidModelOptions = Schema.Struct({
 });
 export type DroidModelOptions = typeof DroidModelOptions.Type;
 
+export const KimiModelOptions = Schema.Struct({
+  thinking: Schema.optional(Schema.Boolean),
+});
+export type KimiModelOptions = typeof KimiModelOptions.Type;
+
 export const ProviderModelOptions = Schema.Struct({
   codex: Schema.optional(CodexModelOptions),
   claudeAgent: Schema.optional(ClaudeModelOptions),
@@ -151,6 +156,7 @@ export const ProviderModelOptions = Schema.Struct({
   antigravity: Schema.optional(AntigravityModelOptions),
   grok: Schema.optional(GrokModelOptions),
   droid: Schema.optional(DroidModelOptions),
+  kimi: Schema.optional(KimiModelOptions),
   kilo: Schema.optional(OpenCodeModelOptions),
   opencode: Schema.optional(OpenCodeModelOptions),
   pi: Schema.optional(PiModelOptions),
@@ -229,6 +235,14 @@ const GROK_BUILD_CAPABILITIES: ModelCapabilities = {
     { value: "medium", label: "Medium" },
     { value: "high", label: "High" },
   ],
+  supportsFastMode: false,
+  supportsThinkingToggle: false,
+  promptInjectedEffortLevels: [],
+  contextWindowOptions: [],
+};
+
+const KIMI_FOR_CODING_CAPABILITIES: ModelCapabilities = {
+  reasoningEffortLevels: [],
   supportsFastMode: false,
   supportsThinkingToggle: false,
   promptInjectedEffortLevels: [],
@@ -731,6 +745,13 @@ export const MODEL_OPTIONS_BY_PROVIDER = {
       capabilities: DROID_CORE_HIGH_ONLY_CAPABILITIES,
     },
   ],
+  kimi: [
+    {
+      slug: "kimi-for-coding",
+      name: "Kimi for Coding",
+      capabilities: KIMI_FOR_CODING_CAPABILITIES,
+    },
+  ],
   opencode: [
     {
       slug: "openai/gpt-5",
@@ -829,6 +850,7 @@ export const DEFAULT_MODEL_BY_PROVIDER: Record<ProviderWithDefaultModel, ModelSl
   antigravity: "Gemini 3.5 Flash",
   grok: "grok-build",
   droid: "claude-opus-4-8",
+  kimi: "kimi-for-coding",
   kilo: "kilo/kilo-auto/free",
   opencode: "openai/gpt-5",
 };
@@ -981,6 +1003,7 @@ export const PROVIDER_DISPLAY_NAMES: Record<ProviderKind, string> = {
   antigravity: "Antigravity",
   grok: "Grok",
   droid: "Droid",
+  kimi: "Kimi Code",
   kilo: "Kilo",
   opencode: "OpenCode",
   pi: "Pi",

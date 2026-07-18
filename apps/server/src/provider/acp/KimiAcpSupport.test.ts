@@ -4,8 +4,10 @@ import { describe, expect, it } from "vitest";
 
 import {
   applyKimiAcpModelSelection,
+  applyKimiAcpThinkingSelection,
   buildKimiAcpSpawnInput,
   buildKimiModelDescriptorsFromConfigOptions,
+  discoverKimiAcpModels,
   resolveKimiAcpAuthMethodId,
   resolveKimiAcpModelValue,
 } from "./KimiAcpSupport.ts";
@@ -115,6 +117,26 @@ describe("buildKimiModelDescriptorsFromConfigOptions", () => {
     ] as unknown as Parameters<typeof buildKimiModelDescriptorsFromConfigOptions>[0];
     expect(buildKimiModelDescriptorsFromConfigOptions(noModel)).toEqual([]);
   });
+
+  it("marks a model as toggleable only when Kimi advertises both thinking values", () => {
+    const toggleable = [
+      liveConfigOptions[0],
+      {
+        type: "select",
+        id: "thinking",
+        name: "Thinking",
+        category: "thought_level",
+        currentValue: "off",
+        options: [
+          { value: "off", name: "Thinking Off" },
+          { value: "on", name: "Thinking On" },
+        ],
+      },
+    ] as Parameters<typeof buildKimiModelDescriptorsFromConfigOptions>[0];
+    expect(buildKimiModelDescriptorsFromConfigOptions(toggleable)).toEqual([
+      { slug: "kimi-for-coding", name: "K2.7 Code", supportsThinkingToggle: true },
+    ]);
+  });
 });
 
 describe("resolveKimiAcpModelValue", () => {
@@ -181,5 +203,121 @@ describe("applyKimiAcpModelSelection", () => {
       }),
     );
     expect(calls).toEqual([]);
+  });
+});
+
+describe("applyKimiAcpThinkingSelection", () => {
+  const toggleConfig = [
+    ...KIMI_MODEL_CONFIG,
+    {
+      type: "select",
+      id: "thinking",
+      name: "Thinking",
+      category: "thought_level",
+      currentValue: "off",
+      options: [
+        { value: "off", name: "Thinking Off" },
+        { value: "on", name: "Thinking On" },
+      ],
+    },
+  ] as unknown as ReadonlyArray<EffectAcpSchema.SessionConfigOption>;
+
+  it("maps Synara's boolean choice to Kimi's on/off select value", async () => {
+    const calls: Array<string> = [];
+    await Effect.runPromise(
+      applyKimiAcpThinkingSelection({
+        runtime: {
+          getConfigOptions: Effect.succeed(toggleConfig),
+          setConfigOption: (id, value) =>
+            Effect.sync(() => {
+              calls.push(`${id}=${String(value)}`);
+              return { configOptions: [] };
+            }),
+        },
+        thinking: true,
+        mapError: (context) => context,
+      }),
+    );
+    expect(calls).toEqual(["thinking=on"]);
+  });
+
+  it("ignores stale off selections for an always-thinking model", async () => {
+    const calls: Array<string> = [];
+    await Effect.runPromise(
+      applyKimiAcpThinkingSelection({
+        runtime: {
+          getConfigOptions: Effect.succeed([
+            ...KIMI_MODEL_CONFIG,
+            {
+              type: "select",
+              id: "thinking",
+              name: "Thinking",
+              category: "thought_level",
+              currentValue: "on",
+              options: [{ value: "on", name: "Thinking On" }],
+            },
+          ] as unknown as ReadonlyArray<EffectAcpSchema.SessionConfigOption>),
+          setConfigOption: (id, value) =>
+            Effect.sync(() => {
+              calls.push(`${id}=${String(value)}`);
+              return { configOptions: [] };
+            }),
+        },
+        thinking: false,
+        mapError: (context) => context,
+      }),
+    );
+    expect(calls).toEqual([]);
+  });
+});
+
+describe("discoverKimiAcpModels", () => {
+  it("probes each model for its dynamic thinking capability", async () => {
+    let selected = "moonshot/plain";
+    const config = () =>
+      [
+        {
+          type: "select",
+          id: "model",
+          name: "Model",
+          category: "model",
+          currentValue: selected,
+          options: [
+            { value: "moonshot/plain", name: "Plain" },
+            { value: "moonshot/reasoning", name: "Reasoning" },
+          ],
+        },
+        ...(selected === "moonshot/reasoning"
+          ? [
+              {
+                type: "select",
+                id: "thinking",
+                name: "Thinking",
+                category: "thought_level",
+                currentValue: "off",
+                options: [
+                  { value: "off", name: "Thinking Off" },
+                  { value: "on", name: "Thinking On" },
+                ],
+              },
+            ]
+          : []),
+      ] as unknown as ReadonlyArray<EffectAcpSchema.SessionConfigOption>;
+    const result = await Effect.runPromise(
+      discoverKimiAcpModels({
+        getConfigOptions: Effect.sync(config),
+        setModel: (value) =>
+          Effect.sync(() => {
+            selected = value;
+          }),
+        setConfigOption: () => Effect.succeed({ configOptions: [] }),
+      }),
+    );
+
+    expect(result.models).toEqual([
+      { slug: "plain", name: "Plain" },
+      { slug: "reasoning", name: "Reasoning", supportsThinkingToggle: true },
+    ]);
+    expect(selected).toBe("moonshot/plain");
   });
 });
