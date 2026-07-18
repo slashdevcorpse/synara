@@ -5307,6 +5307,7 @@ describe("ChatView timeline estimator parity (full app)", () => {
           AUTO_SCROLL_BOTTOM_THRESHOLD_PX,
         );
       });
+      const scrollTopBeforeExpansion = scrollContainer.scrollTop;
 
       finalExpandButton.click();
       await vi.waitFor(
@@ -5324,6 +5325,7 @@ describe("ChatView timeline estimator parity (full app)", () => {
       expect(readStackLayout().distanceFromBottomPx).toBeGreaterThan(
         AUTO_SCROLL_BOTTOM_THRESHOLD_PX,
       );
+      expect(Math.abs(scrollContainer.scrollTop - scrollTopBeforeExpansion)).toBeLessThanOrEqual(1);
     } finally {
       await mounted.cleanup();
     }
