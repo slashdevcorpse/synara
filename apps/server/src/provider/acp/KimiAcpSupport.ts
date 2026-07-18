@@ -13,7 +13,7 @@
  *
  * @module KimiAcpSupport
  */
-import { type ProviderListModelsResult, type ProviderModelDescriptor } from "@t3tools/contracts";
+import { type ProviderListModelsResult, type ProviderModelDescriptor } from "@synara/contracts";
 import { Effect, Layer, Scope, ServiceMap } from "effect";
 import type * as EffectAcpErrors from "effect-acp/errors";
 import type * as EffectAcpSchema from "effect-acp/schema";

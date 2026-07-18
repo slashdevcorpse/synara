@@ -19,7 +19,7 @@ import {
   type RuntimeMode,
   type ThreadId,
   TurnId,
-} from "@t3tools/contracts";
+} from "@synara/contracts";
 import {
   Cause,
   DateTime,
@@ -93,8 +93,6 @@ const KIMI_RESUME_VERSION = 1 as const;
 const KIMI_ACP_TRANSPORT_DEBUG_MARKER = "kimi-acp-transport-v1";
 const KIMI_ACP_LOG_PAYLOAD_LIMIT = 4_000;
 const KIMI_ACP_DEBUG_ENV = "SYNARA_KIMI_ACP_DEBUG";
-const DPCODE_KIMI_ACP_DEBUG_ENV = "DPCODE_KIMI_ACP_DEBUG";
-const LEGACY_KIMI_ACP_DEBUG_ENV = "DP_KIMI_ACP_DEBUG";
 const KIMI_RESUME_REPLAY_QUIET_MS = 350;
 const KIMI_RESUME_REPLAY_MAX_WAIT_MS = 3_000;
 // Backstop for an alive-but-silent kimi child: if a turn produces no ACP
@@ -141,11 +139,7 @@ function summarizeKimiAcpRequestPayload(method: string, payload: unknown): unkno
 }
 
 function isKimiAcpDebugEnabled(): boolean {
-  return (
-    process.env[KIMI_ACP_DEBUG_ENV] === "1" ||
-    process.env[DPCODE_KIMI_ACP_DEBUG_ENV] === "1" ||
-    process.env[LEGACY_KIMI_ACP_DEBUG_ENV] === "1"
-  );
+  return process.env[KIMI_ACP_DEBUG_ENV] === "1";
 }
 
 function shouldMirrorKimiAcpProtocolLog(event: {
