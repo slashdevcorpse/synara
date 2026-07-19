@@ -111,6 +111,21 @@ export function resolveRenderedPullRequestInput(
   return selectedInput ?? retainedInput;
 }
 
+export function retainActivePullRequestInput(
+  selectedInput: PullRequestRouteSelection | null,
+  retainedInput: PullRequestRouteSelection | null,
+): PullRequestRouteSelection | null {
+  if (!selectedInput) return retainedInput;
+  if (
+    retainedInput?.projectId === selectedInput.projectId &&
+    retainedInput.repository === selectedInput.repository &&
+    retainedInput.number === selectedInput.number
+  ) {
+    return retainedInput;
+  }
+  return selectedInput;
+}
+
 // Every filter change and the panel close drop the current selection the same way; keep the
 // patch in one place so a new selection field can't be forgotten by one of the call sites.
 const CLEARED_SELECTION = {
@@ -294,16 +309,12 @@ function PullRequestsRouteView() {
       : null;
   const detailOpen = selectedInput !== null;
   const [retainedInput, setRetainedInput] = useState(selectedInput);
-  useEffect(() => {
-    if (!selectedInput) return;
-    // Timeout-0 keeps the state write asynchronous (compiler-eligible); the
-    // detail panel animates in over 300ms, so one macrotask is invisible.
-    const timeout = window.setTimeout(() => setRetainedInput(selectedInput), 0);
-    return () => window.clearTimeout(timeout);
-    // selectedInput is a fresh object literal every render; depend on its primitive
-    // fields instead so this only re-fires when the actual selection changes.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [search.selectedProjectId, search.selectedRepo, search.number]);
+  const nextRetainedInput = retainActivePullRequestInput(selectedInput, retainedInput);
+  if (nextRetainedInput !== retainedInput) {
+    // Reconcile during render so an active A -> B selection is retained before
+    // any close can cancel or outrun it. React retries this render immediately.
+    setRetainedInput(nextRetainedInput);
+  }
   useEffect(() => {
     if (detailOpen) return;
     const timeout = window.setTimeout(() => setRetainedInput(null), 300);

@@ -23,16 +23,19 @@ Run `npx --yes react-doctor@0.8.1 --verbose` (the default `--scope full`) to sca
 When the user types `/doctor`, says "run react doctor", or asks for a full triage / cleanup pass (not just a regression check), fetch the reviewed local-triage playbook, verify its SHA-256 digest, and only then follow it. A digest mismatch is a hard stop: do not display, interpret, or follow the downloaded content.
 
 ```bash
-playbook="$(mktemp)"
-trap 'rm -f "$playbook"' EXIT
-curl --fail --silent --show-error \
-  --header 'Cache-Control: no-cache' \
-  --output "$playbook" \
-  https://www.react.doctor/prompts/react-doctor-agent.md
-printf '%s  %s\n' \
-  '0e2d3c6d8dddfc04606c4ff379d3d4f63cc2ee07dd028902ec9e9b24d413f39f' \
-  "$playbook" | sha256sum --check --strict -
-cat "$playbook"
+(
+  set -eu
+  playbook="$(mktemp)"
+  trap 'rm -f "$playbook"' EXIT
+  curl --fail --silent --show-error \
+    --header 'Cache-Control: no-cache' \
+    --output "$playbook" \
+    https://www.react.doctor/prompts/react-doctor-agent.md
+  printf '%s  %s\n' \
+    '0e2d3c6d8dddfc04606c4ff379d3d4f63cc2ee07dd028902ec9e9b24d413f39f' \
+    "$playbook" | sha256sum --check --strict -
+  cat "$playbook"
+)
 ```
 
 On PowerShell, use the equivalent integrity-gated workflow:

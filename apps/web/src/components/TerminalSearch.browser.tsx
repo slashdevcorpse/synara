@@ -25,7 +25,9 @@ describe("TerminalSearch", () => {
     } as unknown as SearchAddon;
 
     await render(<TerminalSearch searchAddon={searchAddon} isOpen onClose={() => undefined} />);
-    await page.getByRole("textbox", { name: "Find" }).fill("needle");
+    const searchInput = page.getByRole("textbox", { name: "Find" });
+    await expect.element(searchInput).toHaveAttribute("aria-label", "Find");
+    await searchInput.fill("needle");
 
     await new Promise((resolve) => window.setTimeout(resolve, 180));
 

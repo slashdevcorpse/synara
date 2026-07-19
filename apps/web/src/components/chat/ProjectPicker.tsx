@@ -102,6 +102,7 @@ export const ProjectPicker = memo(function ProjectPicker({
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [directoryEntries, setDirectoryEntries] = useState<readonly ProjectDirectoryEntry[]>([]);
   const mountedRef = useRef(false);
+  const directoryRequestGenerationRef = useRef(0);
   const isProjectSelectionMode = selectionMode === "project";
 
   useEffect(() => {
@@ -267,16 +268,36 @@ export const ProjectPicker = memo(function ProjectPicker({
   }, []);
 
   useEffect(() => {
+    const requestGeneration = ++directoryRequestGenerationRef.current;
+    const isCurrentRequest = () =>
+      mountedRef.current && directoryRequestGenerationRef.current === requestGeneration;
+    let timeoutId: number | null = null;
+
+    const cancelRequest = () => {
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId);
+      }
+      if (directoryRequestGenerationRef.current === requestGeneration) {
+        directoryRequestGenerationRef.current += 1;
+      }
+    };
+
     if (isProjectSelectionMode || !open || !homeDir || directoryEntries.length > 0) {
-      return;
+      // A prior request may already have entered its loading state. Defer the
+      // reset so a replacement effect can claim a newer generation first.
+      timeoutId = window.setTimeout(() => {
+        if (!isCurrentRequest()) return;
+        setIsLoadingDirectories(false);
+      }, 0);
+      return cancelRequest;
     }
     // Timeout-0 keeps every state write asynchronous (no wasted pre-paint
     // render), which also keeps this component eligible for React Compiler.
-    let cancelled = false;
-    const timeoutId = window.setTimeout(() => {
-      if (cancelled) return;
+    timeoutId = window.setTimeout(() => {
+      if (!isCurrentRequest()) return;
       const api = readNativeApi();
       if (!api) {
+        setIsLoadingDirectories(false);
         setErrorMessage("App is still connecting. Try again in a moment.");
         return;
       }
@@ -286,7 +307,7 @@ export const ProjectPicker = memo(function ProjectPicker({
       void api.projects
         .listDirectories({ cwd: homeDir })
         .then((result) => {
-          if (cancelled || !mountedRef.current) return;
+          if (!isCurrentRequest()) return;
           setIsLoadingDirectories(false);
           setDirectoryEntries(
             result.entries.flatMap((entry) =>
@@ -304,15 +325,12 @@ export const ProjectPicker = memo(function ProjectPicker({
           );
         })
         .catch((error) => {
-          if (cancelled || !mountedRef.current) return;
+          if (!isCurrentRequest()) return;
           setIsLoadingDirectories(false);
           setErrorMessage(error instanceof Error ? error.message : "Unable to load folders.");
         });
     }, 0);
-    return () => {
-      cancelled = true;
-      window.clearTimeout(timeoutId);
-    };
+    return cancelRequest;
   }, [directoryEntries.length, homeDir, isProjectSelectionMode, open]);
 
   const handleSelectActiveFolder = useCallback(

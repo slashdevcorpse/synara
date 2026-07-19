@@ -4,7 +4,10 @@
 import type { ProjectId } from "@synara/contracts";
 import { describe, expect, it } from "vitest";
 
-import { resolveRenderedPullRequestInput } from "./_chat.pull-requests.index";
+import {
+  resolveRenderedPullRequestInput,
+  retainActivePullRequestInput,
+} from "./_chat.pull-requests.index";
 
 describe("resolveRenderedPullRequestInput", () => {
   const previous = {
@@ -24,5 +27,16 @@ describe("resolveRenderedPullRequestInput", () => {
 
   it("retains the previous pull request only after the live selection closes", () => {
     expect(resolveRenderedPullRequestInput(null, previous)).toBe(previous);
+  });
+
+  it("captures an active switch before a subsequent close", () => {
+    const retainedAfterSwitch = retainActivePullRequestInput(selected, previous);
+
+    expect(retainedAfterSwitch).toBe(selected);
+    expect(retainActivePullRequestInput(null, retainedAfterSwitch)).toBe(selected);
+  });
+
+  it("keeps retained identity when the active selection is unchanged", () => {
+    expect(retainActivePullRequestInput({ ...previous }, previous)).toBe(previous);
   });
 });

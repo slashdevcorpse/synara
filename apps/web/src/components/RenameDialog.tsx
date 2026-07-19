@@ -55,8 +55,9 @@ export function RenameDialog({
         {/* Field state lives below DialogPopup, which unmounts its children
             after the close transition. Keying by the seed also resets draft,
             save lock, focus, and event callbacks if the backing title changes
-            while the same popup is still open. Current callers cannot retarget
-            an open modal through the UI; ChatView closes it on thread changes. */}
+            while the same popup is still open. Async completion is scoped to
+            that keyed form generation so a replaced form cannot be closed or
+            unlocked by the previous save. */}
         <RenameDialogForm
           key={initialValue}
           initialValue={initialValue}
@@ -111,8 +112,7 @@ function RenameDialogForm({
     setIsSaving(true);
     try {
       await onSave(trimmed);
-      // Preserve successful-save close semantics when the title update itself
-      // changes initialValue and remounts this form before onSave settles.
+      if (!mountedRef.current) return;
       onOpenChange(false);
     } catch {
       if (!mountedRef.current) return;
