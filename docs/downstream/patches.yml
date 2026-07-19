@@ -26,7 +26,7 @@
             "https://github.com/Emanuele-web04/synara/pull/419",
           ],
         "overlapResolutionPolicy": "Do not carry the PR 396 backup slice independently. PR 419 substantially supersedes it with isolated historical fixtures and complete recovery coverage; assess and absorb PR 419 as the authoritative migration-backup candidate.",
-        "lastAssessedUpstreamSha": "f4a020d064317f285984ad31a09f4f7d9b2bfd65",
+        "lastAssessedUpstreamSha": "710e3e4ddd0d5b69bde7267cc2c4b4acbe834dd6",
         "verificationDate": "2026-07-19",
         "retirementCondition": "Retire after PR 419 or an equivalent upstream change is merged, absorbed through a classified sync, and its historical-fixture recovery tests pass on Windows.",
         "statusHistory":
@@ -63,7 +63,7 @@
         "regressionTests": ["apps/server/src/persistence/MigrationBackup.test.ts"],
         "upstreamLinks": ["https://github.com/Emanuele-web04/synara/pull/419"],
         "overlapResolutionPolicy": "Prefer PR 419 over PR 396's migration-backup portion. Rebase or rewrite only after checking upstream migration-lineage changes and preserving fixture isolation and recovery assertions.",
-        "lastAssessedUpstreamSha": "f4a020d064317f285984ad31a09f4f7d9b2bfd65",
+        "lastAssessedUpstreamSha": "710e3e4ddd0d5b69bde7267cc2c4b4acbe834dd6",
         "verificationDate": "2026-07-19",
         "retirementCondition": "Retire after the recovery implementation and historical fixture are merged upstream, absorbed downstream, and equivalent Windows recovery gates remain permanent.",
         "statusHistory":
@@ -88,7 +88,7 @@
         "regressionTests": ["apps/server/src/codexAppServerManager.test.ts"],
         "upstreamLinks": ["https://github.com/Emanuele-web04/synara/pull/396"],
         "overlapResolutionPolicy": "Keep this logical patch separate from migration backup and initialization timeout work. Reassess provider ownership semantics whenever upstream changes Codex process startup or teardown.",
-        "lastAssessedUpstreamSha": "f4a020d064317f285984ad31a09f4f7d9b2bfd65",
+        "lastAssessedUpstreamSha": "710e3e4ddd0d5b69bde7267cc2c4b4acbe834dd6",
         "verificationDate": "2026-07-19",
         "retirementCondition": "Retire after upstream owns the overlay connection for the full provider lifecycle and equivalent restart/cleanup regression coverage is merged and absorbed.",
         "statusHistory":
@@ -117,7 +117,7 @@
         "regressionTests": ["apps/server/src/codexAppServerManager.test.ts"],
         "upstreamLinks": ["https://github.com/Emanuele-web04/synara/pull/396"],
         "overlapResolutionPolicy": "Preserve the distinction between the normal initialize timeout and the bounded recovery timeout. Re-evaluate constants and retry sequencing after upstream startup changes.",
-        "lastAssessedUpstreamSha": "f4a020d064317f285984ad31a09f4f7d9b2bfd65",
+        "lastAssessedUpstreamSha": "710e3e4ddd0d5b69bde7267cc2c4b4acbe834dd6",
         "verificationDate": "2026-07-19",
         "retirementCondition": "Retire after upstream merges equivalent bounded recovery timeout behavior and the focused Codex initialization regressions are absorbed.",
         "statusHistory":
@@ -161,7 +161,7 @@
           ],
         "upstreamLinks": ["https://github.com/Emanuele-web04/synara/pull/397"],
         "overlapResolutionPolicy": "Treat changes to ProviderHealth, Codex startup, executable lookup, or Windows process planning as semantic overlaps. Rebase against the absorbed provider-maintenance and child-routing fixes before landing.",
-        "lastAssessedUpstreamSha": "f4a020d064317f285984ad31a09f4f7d9b2bfd65",
+        "lastAssessedUpstreamSha": "710e3e4ddd0d5b69bde7267cc2c4b4acbe834dd6",
         "verificationDate": "2026-07-19",
         "retirementCondition": "Retire after native executable selection and the shared Windows spawn contract merge upstream with equivalent tests and are absorbed downstream.",
         "statusHistory":
@@ -225,7 +225,7 @@
           ],
         "upstreamLinks": ["https://github.com/Emanuele-web04/synara/pull/420"],
         "overlapResolutionPolicy": "Rebase and semantically review every composer, ChatView, provider-usage, and contract overlap. Preserve the newest upstream layout behavior and reapply quota placement only where it remains compatible.",
-        "lastAssessedUpstreamSha": "f4a020d064317f285984ad31a09f4f7d9b2bfd65",
+        "lastAssessedUpstreamSha": "710e3e4ddd0d5b69bde7267cc2c4b4acbe834dd6",
         "verificationDate": "2026-07-19",
         "retirementCondition": "Retire after upstream exposes equivalent multi-provider composer quota behavior with permanent server, contract, and web regression coverage.",
         "statusHistory":
@@ -254,7 +254,7 @@
         "regressionTests": ["apps/server/src/provider/Layers/AntigravityAdapter.test.ts"],
         "upstreamLinks": ["https://github.com/Emanuele-web04/synara/pull/421"],
         "overlapResolutionPolicy": "Keep provider command construction aligned with the shared process contract. Any upstream adapter or spawn change requires a semantic review and the Windows regression must remain blocking.",
-        "lastAssessedUpstreamSha": "f4a020d064317f285984ad31a09f4f7d9b2bfd65",
+        "lastAssessedUpstreamSha": "710e3e4ddd0d5b69bde7267cc2c4b4acbe834dd6",
         "verificationDate": "2026-07-19",
         "retirementCondition": "Retire after the Windows-safe Antigravity spawn path and its focused adapter regression merge upstream and are absorbed downstream.",
         "statusHistory":
@@ -300,7 +300,7 @@
           ],
         "upstreamLinks": ["https://github.com/Emanuele-web04/synara/pull/429"],
         "overlapResolutionPolicy": "Treat changes to terminal history persistence, snapshot contracts, xterm writes, output acknowledgements, clear/restart handling, or viewport resize sequencing as semantic overlaps. Preserve integrity-bound source dimensions and the rule that retained live bytes are released only after replay reaches a verified destination grid.",
-        "lastAssessedUpstreamSha": "f4a020d064317f285984ad31a09f4f7d9b2bfd65",
+        "lastAssessedUpstreamSha": "710e3e4ddd0d5b69bde7267cc2c4b4acbe834dd6",
         "verificationDate": "2026-07-19",
         "retirementCondition": "Retire after recovered-grid persistence and replay merge upstream with equivalent server, contract, unit, and real-browser coverage and that upstream state is absorbed downstream.",
         "statusHistory":
@@ -349,7 +349,7 @@
           ],
         "upstreamLinks": ["https://github.com/Emanuele-web04/synara/pull/430"],
         "overlapResolutionPolicy": "Preserve the per-launch secret boundary, desktop-only loopback authorization, secret redaction, actual-child-exit proof, single bounded force fallback, and scoped finalizer ordering. The canonical PR's CI-only hunk is intentionally excluded because downstream windows_x64 already runs the full workspace and desktop integration suites.",
-        "lastAssessedUpstreamSha": "f4a020d064317f285984ad31a09f4f7d9b2bfd65",
+        "lastAssessedUpstreamSha": "710e3e4ddd0d5b69bde7267cc2c4b4acbe834dd6",
         "verificationDate": "2026-07-19",
         "retirementCondition": "Retire after authenticated graceful desktop shutdown, scoped server draining, and equivalent Windows process integration coverage merge upstream and are absorbed downstream.",
         "statusHistory":
