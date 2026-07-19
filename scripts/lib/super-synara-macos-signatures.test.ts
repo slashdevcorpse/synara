@@ -1,8 +1,11 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  type MacSignatureAuditInventory,
   type MacSignatureAllowlist,
   type MacUnsignedSignatureReport,
+  validateMacSignatureAllowlist,
+  validateMacSignatureAuditInventory,
   validateMacUnsignedSignatureReport,
 } from "./super-synara-macos-signatures.ts";
 
@@ -56,6 +59,36 @@ function validReport(): MacUnsignedSignatureReport {
 }
 
 describe("Super Synara macOS signature evidence", () => {
+  it("keeps audit inventories unclassified and separate from admission reports", () => {
+    const report = validReport();
+    const inventory: MacSignatureAuditInventory = {
+      schemaVersion: 1,
+      kind: "macos-signature-audit-inventory",
+      appBundle: report.appBundle,
+      electronVersion: report.electronVersion,
+      deepVerification: {
+        command: "codesign --verify --deep --strict --verbose=4",
+        exitCode: 1,
+        output: "review needed",
+      },
+      notarizationTicket: report.notarizationTicket,
+      notarizationEvidence: report.notarizationEvidence,
+      codeObjects: [...report.productOwned, ...report.thirdParty],
+    };
+    expect(validateMacSignatureAuditInventory(inventory)).toEqual(inventory);
+  });
+
+  it("rejects an empty placeholder allowlist", () => {
+    expect(() =>
+      validateMacSignatureAllowlist({
+        schemaVersion: 1,
+        electronVersion: "40.10.6",
+        productOwnedPaths: [],
+        thirdParty: [],
+      }),
+    ).toThrow("reviewed product-owned and third-party paths");
+  });
+
   it("accepts an exact ad-hoc and reviewed-vendor match", () => {
     expect(validateMacUnsignedSignatureReport(validReport(), allowlist)).toEqual(validReport());
   });
@@ -107,10 +140,7 @@ describe("Super Synara macOS signature evidence", () => {
       ),
     ).toThrow("identity changed");
     expect(() =>
-      validateMacUnsignedSignatureReport(
-        { ...report, notarizationTicket: "present" },
-        allowlist,
-      ),
+      validateMacUnsignedSignatureReport({ ...report, notarizationTicket: "present" }, allowlist),
     ).toThrow("notarization ticket");
   });
 });

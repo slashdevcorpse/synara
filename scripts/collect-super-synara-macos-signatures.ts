@@ -4,21 +4,17 @@
 // Layer: Native release verification
 
 import { spawnSync } from "node:child_process";
-import {
-  lstatSync,
-  mkdtempSync,
-  readFileSync,
-  readdirSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
+import { lstatSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 
 import {
+  type MacSignatureAuditInventory,
   type MacSignatureAllowlist,
   type MacSignatureIdentity,
   type MacUnsignedSignatureReport,
+  validateMacSignatureAllowlist,
+  validateMacSignatureAuditInventory,
   validateMacUnsignedSignatureReport,
 } from "./lib/super-synara-macos-signatures.ts";
 
@@ -44,8 +40,10 @@ function run(
 }
 
 function parseArgs(argv: ReadonlyArray<string>): {
+  readonly mode: "audit" | "admit";
   readonly zip: string;
-  readonly allowlist: string;
+  readonly electronVersion: string;
+  readonly allowlist: string | null;
   readonly output: string;
 } {
   const values = new Map<string, string>();
@@ -57,7 +55,7 @@ function parseArgs(argv: ReadonlyArray<string>): {
     }
     values.set(name, value);
   }
-  const known = new Set(["--zip", "--allowlist", "--output"]);
+  const known = new Set(["--mode", "--zip", "--electron-version", "--allowlist", "--output"]);
   for (const name of values.keys()) {
     if (!known.has(name)) throw new Error(`Unknown macOS signature argument: ${name}.`);
   }
@@ -66,9 +64,22 @@ function parseArgs(argv: ReadonlyArray<string>): {
     if (!value) throw new Error(`Missing macOS signature argument: ${name}.`);
     return value;
   };
+  const mode = required("--mode");
+  if (mode !== "audit" && mode !== "admit") {
+    throw new Error(`macOS signature mode must be audit or admit, got ${mode}.`);
+  }
+  const allowlist = values.get("--allowlist") || null;
+  if (mode === "admit" && allowlist === null) {
+    throw new Error("Admission mode requires --allowlist with a committed reviewed policy.");
+  }
+  if (mode === "audit" && allowlist !== null) {
+    throw new Error("Audit mode does not accept an allowlist; it produces unclassified evidence.");
+  }
   return {
+    mode,
     zip: required("--zip"),
-    allowlist: required("--allowlist"),
+    electronVersion: required("--electron-version"),
+    allowlist,
     output: required("--output"),
   };
 }
@@ -120,7 +131,6 @@ if (process.platform !== "darwin") {
   throw new Error("macOS signature collection must run on a macOS host.");
 }
 const options = parseArgs(process.argv.slice(2));
-const allowlist = JSON.parse(readFileSync(options.allowlist, "utf8")) as MacSignatureAllowlist;
 const extractionRoot = mkdtempSync(join(tmpdir(), "super-synara-signatures-"));
 try {
   run("ditto", ["-x", "-k", options.zip, extractionRoot]);
@@ -133,32 +143,76 @@ try {
   }
   const appBundle = appBundles[0]!;
   const appBundlePath = join(extractionRoot, appBundle);
-  run("codesign", ["--verify", "--deep", "--strict", "--verbose=4", appBundlePath]);
+  const deepVerification = run(
+    "codesign",
+    ["--verify", "--deep", "--strict", "--verbose=4", appBundlePath],
+    true,
+  );
 
   const signatures = [appBundlePath, ...candidateFiles(appBundlePath)]
     .map((path) => parseSignature(path, appBundlePath))
     .filter((identity): identity is MacSignatureIdentity => identity !== null);
-  const productPaths = new Set(allowlist.productOwnedPaths);
   const notarization = run("xcrun", ["stapler", "validate", appBundlePath], true);
-  const report: MacUnsignedSignatureReport = {
-    schemaVersion: 1,
-    appBundle,
-    electronVersion: allowlist.electronVersion,
-    notarizationTicket: notarization.status === 0 ? "present" : "absent",
-    notarizationEvidence: {
-      command: "xcrun stapler validate",
-      exitCode: notarization.status,
-      output: notarization.output,
-    },
-    productOwned: signatures.filter((identity) => productPaths.has(identity.path)),
-    thirdParty: signatures.filter((identity) => !productPaths.has(identity.path)),
-  };
-  validateMacUnsignedSignatureReport(report, allowlist);
-  writeFileSync(options.output, `${JSON.stringify(report, null, 2)}\n`, {
-    encoding: "utf8",
-    flag: "wx",
-  });
-  console.log(`Wrote reviewed macOS signature evidence to ${options.output}.`);
+  if (options.mode === "audit") {
+    const inventory: MacSignatureAuditInventory = {
+      schemaVersion: 1,
+      kind: "macos-signature-audit-inventory",
+      appBundle,
+      electronVersion: options.electronVersion,
+      deepVerification: {
+        command: "codesign --verify --deep --strict --verbose=4",
+        exitCode: deepVerification.status,
+        output: deepVerification.output,
+      },
+      notarizationTicket: notarization.status === 0 ? "present" : "absent",
+      notarizationEvidence: {
+        command: "xcrun stapler validate",
+        exitCode: notarization.status,
+        output: notarization.output,
+      },
+      codeObjects: signatures,
+    };
+    validateMacSignatureAuditInventory(inventory);
+    writeFileSync(options.output, `${JSON.stringify(inventory, null, 2)}\n`, {
+      encoding: "utf8",
+      flag: "wx",
+    });
+    console.log(`Wrote unclassified macOS signature audit inventory to ${options.output}.`);
+  } else {
+    if (deepVerification.status !== 0) {
+      throw new Error(
+        `Strict macOS code-signature verification failed: ${deepVerification.output}`,
+      );
+    }
+    const allowlist = validateMacSignatureAllowlist(
+      JSON.parse(readFileSync(options.allowlist!, "utf8")) as MacSignatureAllowlist,
+    );
+    if (allowlist.electronVersion !== options.electronVersion) {
+      throw new Error(
+        `Requested Electron ${options.electronVersion} does not match reviewed ${allowlist.electronVersion}.`,
+      );
+    }
+    const productPaths = new Set(allowlist.productOwnedPaths);
+    const report: MacUnsignedSignatureReport = {
+      schemaVersion: 1,
+      appBundle,
+      electronVersion: options.electronVersion,
+      notarizationTicket: notarization.status === 0 ? "present" : "absent",
+      notarizationEvidence: {
+        command: "xcrun stapler validate",
+        exitCode: notarization.status,
+        output: notarization.output,
+      },
+      productOwned: signatures.filter((identity) => productPaths.has(identity.path)),
+      thirdParty: signatures.filter((identity) => !productPaths.has(identity.path)),
+    };
+    validateMacUnsignedSignatureReport(report, allowlist);
+    writeFileSync(options.output, `${JSON.stringify(report, null, 2)}\n`, {
+      encoding: "utf8",
+      flag: "wx",
+    });
+    console.log(`Wrote reviewed macOS signature evidence to ${options.output}.`);
+  }
 } finally {
   rmSync(extractionRoot, { recursive: true, force: true });
 }

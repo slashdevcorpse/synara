@@ -1,0 +1,129 @@
+name: Super Synara macOS Signature Audit
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Downstream version to inventory (for example 0.5.5-super.1)"
+        required: true
+        type: string
+      source_sha:
+        description: "Exact 40-character downstream source commit"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: super-synara-macos-signature-audit
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    name: Build and inventory unsigned macOS arm64 app
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - name: Require owner-dispatched main revision
+        shell: bash
+        env:
+          ACTOR: ${{ github.actor }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          OWNER: ${{ github.repository_owner }}
+          REF_NAME: ${{ github.ref_name }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$ACTOR" == "$OWNER" ]]
+          [[ "$TRIGGERING_ACTOR" == "$OWNER" ]]
+          [[ "$REF_NAME" == "main" ]]
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+
+      - name: Checkout exact source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version-file: package.json
+
+      - name: Setup Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: package.json
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - id: downstream
+        name: Validate downstream state
+        shell: bash
+        run: node scripts/validate-downstream-state.ts --github-output "$GITHUB_OUTPUT"
+
+      - name: Validate audit source
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "$SOURCE_SHA" ]]
+          node scripts/verify-release-source-provenance.ts \
+            "$VERSION" \
+            "super-v$VERSION" \
+            false \
+            "$SOURCE_SHA" \
+            branch \
+            main \
+            github-unsigned-prerelease \
+            false
+
+      - name: Build unsigned macOS arm64 audit artifact
+        shell: bash
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+          SYNARA_DESKTOP_FLAVOR: super
+          SYNARA_DESKTOP_DISABLE_UPDATES: "1"
+          VERSION: ${{ inputs.version }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          lockfile_sha256="$(shasum -a 256 bun.lock | awk '{print $1}')"
+          node scripts/build-desktop-artifact.ts \
+            --platform mac \
+            --target dmg \
+            --arch arm64 \
+            --build-version "$VERSION" \
+            --source-commit "$SOURCE_SHA" \
+            --source-tag "super-v$VERSION" \
+            --lockfile-sha256 "$lockfile_sha256" \
+            --output-dir release-audit \
+            --desktop-flavor super \
+            --disable-updates
+
+      - name: Collect unclassified signature inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          zips=(release-audit/*.zip)
+          [[ "${#zips[@]}" -eq 1 ]]
+          node scripts/collect-super-synara-macos-signatures.ts \
+            --mode audit \
+            --zip "${zips[0]}" \
+            --electron-version 40.10.6 \
+            --output macos-arm64-signature-audit.json
+
+      - name: Upload inventory only
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: super-synara-macos-arm64-signature-audit
+          path: macos-arm64-signature-audit.json
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 9
