@@ -5,9 +5,7 @@ import {
   validateSuperSynaraGitHubState,
 } from "./super-synara-release-state.ts";
 
-function state(
-  overrides: Partial<SuperSynaraGitHubStateInput> = {},
-): SuperSynaraGitHubStateInput {
+function state(overrides: Partial<SuperSynaraGitHubStateInput> = {}): SuperSynaraGitHubStateInput {
   return {
     phase: "preflight",
     repository: "slashdevcorpse/synara",
@@ -39,14 +37,10 @@ describe("Super Synara GitHub release state", () => {
       validateSuperSynaraGitHubState(state({ triggeringActor: "someone-else" })),
     ).toThrow("triggering_actor");
     expect(() =>
-      validateSuperSynaraGitHubState(
-        state({ tagCommit: "b".repeat(40), tagObjectType: "commit" }),
-      ),
+      validateSuperSynaraGitHubState(state({ tagCommit: "b".repeat(40), tagObjectType: "commit" })),
     ).toThrow("points to");
     expect(() =>
-      validateSuperSynaraGitHubState(
-        state({ tagCommit: "a".repeat(40), tagObjectType: "tag" }),
-      ),
+      validateSuperSynaraGitHubState(state({ tagCommit: "a".repeat(40), tagObjectType: "tag" })),
     ).toThrow("directly to a commit object");
     expect(() =>
       validateSuperSynaraGitHubState(

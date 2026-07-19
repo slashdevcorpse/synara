@@ -87,10 +87,7 @@ export function validateReleaseSourcePolicy(
     throw new Error(`Signed release tag must be ${expectedTag}, got ${input.tag}.`);
   }
   validatePackageVersions(input.packageVersions, input.version);
-  if (
-    input.publishRelease &&
-    (input.refType !== "tag" || input.refName !== expectedTag)
-  ) {
+  if (input.publishRelease && (input.refType !== "tag" || input.refName !== expectedTag)) {
     throw new Error(
       `Publishing requires the workflow ref to be the exact release tag ${expectedTag}; got ${input.refType ?? "<none>"}/${input.refName ?? "<none>"}.`,
     );

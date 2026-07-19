@@ -40,7 +40,9 @@ function assertFullSha(label: string, value: string): void {
 
 export function validateSuperSynaraGitHubState(input: SuperSynaraGitHubStateInput): void {
   if (input.repository !== "slashdevcorpse/synara" || input.refName !== "main") {
-    throw new Error("Super Synara publication is restricted to slashdevcorpse/synara protected main.");
+    throw new Error(
+      "Super Synara publication is restricted to slashdevcorpse/synara protected main.",
+    );
   }
   if (input.actor !== input.owner || input.triggeringActor !== input.owner) {
     throw new Error("Both github.actor and github.triggering_actor must be the repository owner.");
@@ -66,9 +68,7 @@ export function validateSuperSynaraGitHubState(input: SuperSynaraGitHubStateInpu
 
   const tagReleases = input.releases.filter((release) => release.tagName === input.tag);
   const beforeDraft =
-    input.phase === "preflight" ||
-    input.phase === "reserve-tag" ||
-    input.phase === "before-draft";
+    input.phase === "preflight" || input.phase === "reserve-tag" || input.phase === "before-draft";
   if (beforeDraft) {
     if (tagReleases.length > 0) {
       const kinds = tagReleases.map((release) => (release.draft ? "draft" : "public")).join(", ");
@@ -87,7 +87,9 @@ export function validateSuperSynaraGitHubState(input: SuperSynaraGitHubStateInpu
     throw new Error("Publication requires the exact current-run GitHub draft release ID.");
   }
   if (tagReleases.length !== 1) {
-    throw new Error(`Expected exactly one current-run draft for ${input.tag}, found ${tagReleases.length}.`);
+    throw new Error(
+      `Expected exactly one current-run draft for ${input.tag}, found ${tagReleases.length}.`,
+    );
   }
   const release = tagReleases[0]!;
   if (
@@ -96,6 +98,8 @@ export function validateSuperSynaraGitHubState(input: SuperSynaraGitHubStateInpu
     !release.prerelease ||
     release.targetCommitish.toLowerCase() !== input.sourceCommit.toLowerCase()
   ) {
-    throw new Error("Existing draft is not the exact current-run prerelease for the source commit.");
+    throw new Error(
+      "Existing draft is not the exact current-run prerelease for the source commit.",
+    );
   }
 }

@@ -28,22 +28,22 @@ prereleases, not as unpublished or verified-signed artifacts.
 
 ## 2. Locked decisions
 
-| Area | Decision |
-| --- | --- |
-| Product name | `Super Synara` |
-| Repository | Public fork at `slashdevcorpse/synara` |
-| Primary platform | Windows x64 |
-| Secondary platform | macOS Apple Silicon / arm64 |
-| Excluded downloads | Linux, macOS Intel/x64, universal macOS |
-| CI hosts | Standard `ubuntu-24.04`, `windows-2022`, and ARM64 `macos-15` runners only |
-| Linux meaning | Ubuntu may run portable CI; no Linux application is packaged or published |
-| Publication | Persistent GitHub prerelease assets |
-| Trigger | `workflow_dispatch` only; never automatic on tag or push |
-| Signing | No Azure/Authenticode, Apple Developer ID, or notarization; macOS ad-hoc signatures are recorded, not treated as trusted signing |
-| Updates | Manual download only; automatic updater disabled and no updater feed published |
-| Upstream intake | Reviewed merge commits from upstream through sync PRs |
-| Downstream history | Protected, never rebased or force-pushed after publication |
-| License | Retain upstream MIT license and attribution |
+| Area               | Decision                                                                                                                         |
+| ------------------ | -------------------------------------------------------------------------------------------------------------------------------- |
+| Product name       | `Super Synara`                                                                                                                   |
+| Repository         | Public fork at `slashdevcorpse/synara`                                                                                           |
+| Primary platform   | Windows x64                                                                                                                      |
+| Secondary platform | macOS Apple Silicon / arm64                                                                                                      |
+| Excluded downloads | Linux, macOS Intel/x64, universal macOS                                                                                          |
+| CI hosts           | Standard `ubuntu-24.04`, `windows-2022`, and ARM64 `macos-15` runners only                                                       |
+| Linux meaning      | Ubuntu may run portable CI; no Linux application is packaged or published                                                        |
+| Publication        | Persistent GitHub prerelease assets                                                                                              |
+| Trigger            | `workflow_dispatch` only; never automatic on tag or push                                                                         |
+| Signing            | No Azure/Authenticode, Apple Developer ID, or notarization; macOS ad-hoc signatures are recorded, not treated as trusted signing |
+| Updates            | Manual download only; automatic updater disabled and no updater feed published                                                   |
+| Upstream intake    | Reviewed merge commits from upstream through sync PRs                                                                            |
+| Downstream history | Protected, never rebased or force-pushed after publication                                                                       |
+| License            | Retain upstream MIT license and attribution                                                                                      |
 
 ## 3. Current-state evidence (2026-07-18)
 
@@ -111,19 +111,19 @@ prereleases, not as unpublished or verified-signed artifacts.
 Add `super` as a fourth desktop flavor beside production, development, and canary. Freeze these
 values for implementation:
 
-| Identity surface | Super Synara value |
-| --- | --- |
-| Flavor key | `super` |
-| Display/product name | `Super Synara` |
-| Artifact prefix | `Super-Synara` |
+| Identity surface              | Super Synara value                     |
+| ----------------------------- | -------------------------------------- |
+| Flavor key                    | `super`                                |
+| Display/product name          | `Super Synara`                         |
+| Artifact prefix               | `Super-Synara`                         |
 | Bundle ID / App User Model ID | `io.github.slashdevcorpse.supersynara` |
-| Renderer scheme | `super-synara` |
-| Renderer origin | `super-synara://app` |
-| Renderer entry URL | `super-synara://app/index.html` |
-| Electron user-data directory | `super-synara` |
-| Default backend home | `.super-synara` |
-| Windows NSIS GUID | `ab3ea852-4edf-4caa-977e-9d00ccab2b1e` |
-| Update strategy | `manual` / disabled |
+| Renderer scheme               | `super-synara`                         |
+| Renderer origin               | `super-synara://app`                   |
+| Renderer entry URL            | `super-synara://app/index.html`        |
+| Electron user-data directory  | `super-synara`                         |
+| Default backend home          | `.super-synara`                        |
+| Windows NSIS GUID             | `ab3ea852-4edf-4caa-977e-9d00ccab2b1e` |
+| Update strategy               | `manual` / disabled                    |
 
 Implementation requirements:
 
@@ -881,4 +881,3 @@ This planning task does not authorize workflow activation, remote changes, pushe
 the project's heavyweight checks. During implementation, completion requires one final bundled
 verification pass using `bun run fmt:check`, `bun run lint`, `bun run typecheck`, and
 `bun run test`—never `bun test`—plus the native packaging and installed-app gates above.
-
