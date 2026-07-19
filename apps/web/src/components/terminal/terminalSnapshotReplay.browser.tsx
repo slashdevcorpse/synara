@@ -794,8 +794,9 @@ describe("recovered terminal snapshot replay in real xterm", () => {
           });
           await waitForCondition(
             () =>
-              bufferText(entry.terminal).includes("LIVE-NORMAL-AFTER-CLEAR") &&
-              acknowledgedBytes.includes(23),
+              acknowledgedBytes.includes(23) &&
+              entry.pendingWriteBytes === 0 &&
+              bufferText(entry.terminal).includes("LIVE-NORMAL-AFTER-CLEAR"),
             "normal post-clear output parsing",
           );
 
