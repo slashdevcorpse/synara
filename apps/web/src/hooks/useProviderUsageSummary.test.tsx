@@ -98,7 +98,9 @@ function readProviderUsageSummary(input: {
       threads: [],
       threadRateLimits: input.threadRateLimits,
       providerSnapshot: input.providerSnapshot,
-      fetchProviderData: input.fetchProviderData,
+      ...(input.fetchProviderData === undefined
+        ? {}
+        : { fetchProviderData: input.fetchProviderData }),
       includeSupplementalData: input.includeSupplementalData,
     });
     return <span />;
