@@ -159,7 +159,7 @@ describe("downstream state validator", () => {
   });
 
   it("validates active revert and exclusion range ancestry", () => {
-    const state = validState();
+    const state = { ...validState(), activeRevertedRanges: [] as unknown[] };
     state.activeRevertedRanges = [
       {
         id: "bad-order",

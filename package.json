@@ -41,6 +41,7 @@
     "test": "turbo run test",
     "brand:check": "node scripts/check-brand-identity.ts",
     "downstream:validate": "node scripts/validate-downstream-state.ts",
+    "workflows:validate": "node scripts/verify-workflow-contracts.ts",
     "test:desktop-smoke": "turbo run smoke-test --filter=@synara/desktop",
     "fmt": "oxfmt",
     "fmt:check": "oxfmt --check",
