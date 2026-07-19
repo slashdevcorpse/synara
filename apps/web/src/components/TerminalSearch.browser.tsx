@@ -17,7 +17,7 @@ describe("TerminalSearch", () => {
   });
 
   it("runs a debounced search after the query rerender", async () => {
-    const findNext = vi.fn(() => false);
+    const findNext = vi.fn((_term: string) => false);
     const searchAddon = {
       clearDecorations: vi.fn(),
       findNext,
