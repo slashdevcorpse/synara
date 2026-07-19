@@ -4,15 +4,7 @@
 // Exports: scoped single-flight editor discovery with stale-while-refresh semantics.
 
 import type { EditorId } from "@synara/contracts";
-import {
-  Deferred,
-  Effect,
-  Exit,
-  PubSub,
-  Scope,
-  Semaphore,
-  Stream,
-} from "effect";
+import { Deferred, Effect, Exit, PubSub, Scope, Semaphore, Stream } from "effect";
 
 import {
   discoverAvailableEditors,
@@ -47,10 +39,7 @@ export interface EditorAvailability {
 }
 
 export interface EditorAvailabilityOptions {
-  readonly discover?: (
-    signal: AbortSignal,
-    identity: string,
-  ) => Promise<EditorDiscoveryResult>;
+  readonly discover?: (signal: AbortSignal, identity: string) => Promise<EditorDiscoveryResult>;
   readonly identity?: () => string;
   readonly now?: () => number;
   readonly refreshAfterMs?: number;
@@ -110,8 +99,7 @@ export const makeEditorAvailability = (
       if (options.discover || options.identity) {
         const requestIdentity = options.identity?.() ?? resolveEditorDiscoveryIdentity();
         const discover =
-          options.discover ??
-          ((signal: AbortSignal) => discoverAvailableEditors({ signal }));
+          options.discover ?? ((signal: AbortSignal) => discoverAvailableEditors({ signal }));
         return {
           identity: requestIdentity,
           discover: (signal) => discover(signal, requestIdentity),
@@ -174,10 +162,7 @@ export const makeEditorAvailability = (
 
     const getCurrent = lock.withPermits(1)(Effect.sync(() => toSnapshot(state)));
 
-    let settle: (
-      entry: InFlightRefresh,
-      result: EditorDiscoveryResult,
-    ) => Effect.Effect<void>;
+    let settle: (entry: InFlightRefresh, result: EditorDiscoveryResult) => Effect.Effect<void>;
     const startRefreshLocked = (
       request: EditorDiscoveryRequest,
       completed: Deferred.Deferred<EditorAvailabilitySnapshot>,
@@ -265,8 +250,7 @@ export const makeEditorAvailability = (
               }
 
               const continuation =
-                pendingRefresh?.completed ??
-                (yield* Deferred.make<EditorAvailabilitySnapshot>());
+                pendingRefresh?.completed ?? (yield* Deferred.make<EditorAvailabilitySnapshot>());
               yield* startRefreshLocked(continuationRequest, continuation, [
                 entry.completed,
                 ...entry.waiters,

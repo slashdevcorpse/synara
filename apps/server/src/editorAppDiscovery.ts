@@ -389,8 +389,7 @@ export async function discoverWindowsStorePackageInstallLocations(
   ] as const;
   const launch: SpawnWindowsStorePowerShell =
     options.spawnProcess ??
-    ((command, commandArgs, spawnOptions) =>
-      spawn(command, [...commandArgs], spawnOptions));
+    ((command, commandArgs, spawnOptions) => spawn(command, [...commandArgs], spawnOptions));
 
   let child: ChildProcessByStdio<null, Readable, Readable>;
   try {
@@ -485,9 +484,7 @@ export async function discoverWindowsStorePackageInstallLocations(
       }
 
       const expectedFamilies = new Set(
-        packageDefs.map((packageDef) =>
-          windowsStorePackageFamilyName(packageDef).toLowerCase(),
-        ),
+        packageDefs.map((packageDef) => windowsStorePackageFamilyName(packageDef).toLowerCase()),
       );
       const parsed = parseBulkPowerShellPackageOutput(
         Buffer.concat(stdoutChunks).toString("utf8"),

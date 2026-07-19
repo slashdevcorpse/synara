@@ -6,13 +6,12 @@ import { resolveEditorDiscoveryIdentity, type EditorDiscoveryResult } from "./op
 
 const success = (
   availableEditors: Extract<EditorDiscoveryResult, { status: "success" }>["availableEditors"],
-) =>
-  ({
-    status: "success" as const,
-    availableEditors,
-    fileSystemOperations: 0,
-    subprocessCount: 0,
-  });
+) => ({
+  status: "success" as const,
+  availableEditors,
+  fileSystemOperations: 0,
+  subprocessCount: 0,
+});
 
 describe("EditorAvailability", () => {
   it("returns immediately and shares one background discovery across concurrent callers", async () => {
@@ -376,10 +375,7 @@ describe("EditorAvailability", () => {
 
           throwIdentity = true;
           completeA(success(["cursor"]));
-          const results = yield* Effect.forEach(
-            [firstA, secondA, firstB, secondB],
-            Fiber.join,
-          );
+          const results = yield* Effect.forEach([firstA, secondA, firstB, secondB], Fiber.join);
           expect(
             results.map((result) => ({
               status: result.status,

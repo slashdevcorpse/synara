@@ -50,10 +50,7 @@ import {
   STUDIO_WORKSPACE_SUBDIRECTORIES,
 } from "./studioWorkspaceScaffold";
 import { DevServerManager, findProjectDevServerForLocalServer } from "./devServerManager";
-import {
-  makeEditorAvailability,
-  type EditorAvailabilitySnapshot,
-} from "./editorAvailability";
+import { makeEditorAvailability, type EditorAvailabilitySnapshot } from "./editorAvailability";
 import { GitCore } from "./git/Services/GitCore";
 import { GitManager } from "./git/Services/GitManager";
 import { GitHubCliError } from "./git/Errors";

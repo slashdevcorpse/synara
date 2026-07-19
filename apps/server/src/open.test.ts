@@ -764,10 +764,7 @@ it.layer(NodeServices.layer)("discoverAvailableEditors", (it) => {
 
     assert.notEqual(modulesA, modulesB);
     assert.notEqual(modulesB, modulesA);
-    assert.equal(
-      modulesA,
-      windowsIdentity("C:\\modules-a", "C:\\different-shadow", true),
-    );
+    assert.equal(modulesA, windowsIdentity("C:\\modules-a", "C:\\different-shadow", true));
     assert.equal(
       resolveEditorDiscoveryIdentity({
         platform: "linux",
@@ -782,32 +779,34 @@ it.layer(NodeServices.layer)("discoverAvailableEditors", (it) => {
     );
   });
 
-  it.effect("discovers command editors asynchronously with mixed-case Windows environment keys", () =>
-    Effect.gen(function* () {
-      const fs = yield* FileSystem.FileSystem;
-      const path = yield* Path.Path;
-      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "synara-editor-async-é-" });
-      yield* fs.writeFileString(path.join(dir, "code.CMD"), "@echo off\r\n");
+  it.effect(
+    "discovers command editors asynchronously with mixed-case Windows environment keys",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const dir = yield* fs.makeTempDirectoryScoped({ prefix: "synara-editor-async-é-" });
+        yield* fs.writeFileString(path.join(dir, "code.CMD"), "@echo off\r\n");
 
-      const result = yield* Effect.promise(() =>
-        discoverAvailableEditors({
-          platform: "win32",
-          cwd: dir,
-          env: { pAtH: dir, PaThExT: ".CMD" },
-          lookupWindowsStorePackages: async () => ({
-            status: "success",
-            installLocationsByFamily: {},
-            subprocessCount: 1,
+        const result = yield* Effect.promise(() =>
+          discoverAvailableEditors({
+            platform: "win32",
+            cwd: dir,
+            env: { pAtH: dir, PaThExT: ".CMD" },
+            lookupWindowsStorePackages: async () => ({
+              status: "success",
+              installLocationsByFamily: {},
+              subprocessCount: 1,
+            }),
           }),
-        }),
-      );
+        );
 
-      assert.equal(result.status, "success");
-      if (result.status === "success") {
-        assert.equal(result.availableEditors.includes("vscode"), true);
-        assert.equal(result.subprocessCount, 1);
-      }
-    }),
+        assert.equal(result.status, "success");
+        if (result.status === "success") {
+          assert.equal(result.availableEditors.includes("vscode"), true);
+          assert.equal(result.subprocessCount, 1);
+        }
+      }),
   );
 
   it("caps outstanding asynchronous filesystem probes at eight", async () => {
@@ -944,7 +943,12 @@ it("kills AppX discovery when combined output crosses the 256 KiB cap", async ()
 });
 
 it("settles and removes listeners when AppX termination cannot signal the child", async () => {
-  for (const kill of [() => false, () => { throw new Error("kill failed"); }]) {
+  for (const kill of [
+    () => false,
+    () => {
+      throw new Error("kill failed");
+    },
+  ]) {
     const child = makeFakeAppxChild(kill);
     const lookup = discoverWindowsStorePackageInstallLocations(vscodeStorePackages(), {
       platform: "win32",

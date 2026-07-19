@@ -21,10 +21,7 @@ type SpawnSyncLike = (
   },
 ) => { stdout?: string | null; status?: number | null; error?: Error | undefined };
 
-export type WindowsCommandDiscoveryOutcome =
-  | "resolved"
-  | "not_found"
-  | "transient_failure";
+export type WindowsCommandDiscoveryOutcome = "resolved" | "not_found" | "transient_failure";
 
 export interface WindowsCommandDiscoveryObservation {
   readonly outcome: WindowsCommandDiscoveryOutcome;
@@ -443,8 +440,7 @@ function discoverWindowsCommandCandidates(
   // can enter discovery. The public API remains synchronous.
   const launchWhere: SpawnSyncLike =
     input.spawnSync ??
-    ((whereCommand, whereArgs, options) =>
-      spawnSync(whereCommand, [...whereArgs], options));
+    ((whereCommand, whereArgs, options) => spawnSync(whereCommand, [...whereArgs], options));
   const result = launchWhere(resolveWindowsWhereExe(env, cwd), [command], {
     cwd,
     env,
@@ -473,11 +469,7 @@ export function resolveWindowsCommandCandidates(
 ): string[] {
   const pathLikeCommand = isPathLikeCommand(command);
   if (pathLikeCommand && hasWindowsExecutableExtension(command)) {
-    observeWindowsCommandDiscovery(
-      input,
-      { outcome: "resolved", candidates: [command] },
-      "bypass",
-    );
+    observeWindowsCommandDiscovery(input, { outcome: "resolved", candidates: [command] }, "bypass");
     return [command];
   }
 

@@ -341,10 +341,7 @@ export function resolveEffectiveEnvironmentValue(
   return effectiveName === undefined ? undefined : env[effectiveName];
 }
 
-function resolvePathEnvironmentVariable(
-  env: NodeJS.ProcessEnv,
-  platform: NodeJS.Platform,
-): string {
+function resolvePathEnvironmentVariable(env: NodeJS.ProcessEnv, platform: NodeJS.Platform): string {
   return resolveEffectiveEnvironmentValue(env, "PATH", platform) ?? "";
 }
 
@@ -467,13 +464,7 @@ export function resolveAvailableEditors(
       continue;
     }
 
-    if (
-      lookupWindowsStorePackage(
-        getEditorWindowsStorePackages(editor),
-        platform,
-        env,
-      ) !== null
-    ) {
+    if (lookupWindowsStorePackage(getEditorWindowsStorePackages(editor), platform, env) !== null) {
       available.push(editor.id);
       continue;
     }
@@ -630,13 +621,8 @@ export async function discoverAvailableEditors(
   };
 
   const isCommandAvailableAsync = async (command: string): Promise<boolean> => {
-    const windowsPathExtensions =
-      platform === "win32" ? resolveWindowsPathExtensions(env) : [];
-    const commandCandidates = resolveCommandCandidates(
-      command,
-      platform,
-      windowsPathExtensions,
-    );
+    const windowsPathExtensions = platform === "win32" ? resolveWindowsPathExtensions(env) : [];
+    const commandCandidates = resolveCommandCandidates(command, platform, windowsPathExtensions);
     if (command.includes("/") || command.includes("\\")) {
       for (const candidate of commandCandidates) {
         const candidatePath = resolve(cwd, candidate);

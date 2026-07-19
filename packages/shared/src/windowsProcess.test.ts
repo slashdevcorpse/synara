@@ -521,9 +521,7 @@ describe("windowsProcess", () => {
       now = 29_999;
       expect(resolveWindowsCommandCandidates("tool", input)).toEqual(["C:\\tools\\first.cmd"]);
       now = 30_000;
-      expect(resolveWindowsCommandCandidates("tool", input)).toEqual([
-        "C:\\tools\\second.cmd",
-      ]);
+      expect(resolveWindowsCommandCandidates("tool", input)).toEqual(["C:\\tools\\second.cmd"]);
       expect(spawnSync).toHaveBeenCalledTimes(2);
       expect(getWindowsCommandDiscoveryCacheStats(commandDiscoveryCache)).toEqual({ size: 1 });
     });
@@ -584,7 +582,10 @@ describe("windowsProcess", () => {
       { name: "status greater than one", result: { stdout: "", status: 2 } },
       { name: "status one with output", result: { stdout: `${resolvedCommand}\r\n`, status: 1 } },
       { name: "empty successful output", result: { stdout: "", status: 0 } },
-      { name: "malformed relative output", result: { stdout: "relative\\codex.cmd\r\n", status: 0 } },
+      {
+        name: "malformed relative output",
+        result: { stdout: "relative\\codex.cmd\r\n", status: 0 },
+      },
       {
         name: "truncated oversized output",
         result: { stdout: `C:\\${"a".repeat(256 * 1024)}\r\n`, status: 0 },
@@ -650,7 +651,10 @@ describe("windowsProcess", () => {
 
     it("normalizes mixed-case env names and ASCII value case without folding non-ASCII", () => {
       const commandDiscoveryCache = createWindowsCommandDiscoveryCache();
-      const spawnSync = vi.fn(() => ({ stdout: "D:\\Program Files\\工具\\codex.cmd\r\n", status: 0 }));
+      const spawnSync = vi.fn(() => ({
+        stdout: "D:\\Program Files\\工具\\codex.cmd\r\n",
+        status: 0,
+      }));
 
       expect(
         resolveWindowsCommandCandidates("CODEX", {
@@ -1353,10 +1357,7 @@ describe("windowsProcess", () => {
         const commonBin = Path.join(root, "bin");
         const unicodePathCapital = Path.join(root, `path-${unicodeCapitalIWithDot}`);
         const unicodePathExpanded = Path.join(root, `path-${unicodeLowerIWithCombiningDot}`);
-        const unicodeSystemRootCapital = Path.join(
-          root,
-          `Windows-${unicodeCapitalIWithDot}`,
-        );
+        const unicodeSystemRootCapital = Path.join(root, `Windows-${unicodeCapitalIWithDot}`);
         const unicodeSystemRootExpanded = Path.join(
           root,
           `Windows-${unicodeLowerIWithCombiningDot}`,
@@ -1365,8 +1366,7 @@ describe("windowsProcess", () => {
         const realWhereExe = Path.join(realSystemRoot, "System32", "where.exe");
         const pathCommand = "synara-native-path-identity-probe";
         const unicodeCommandCapital = `synara-native-command-${unicodeCapitalIWithDot}`;
-        const unicodeCommandExpanded =
-          `synara-native-command-${unicodeLowerIWithCombiningDot}`;
+        const unicodeCommandExpanded = `synara-native-command-${unicodeLowerIWithCombiningDot}`;
         const pathExtCommand = "synara-native-pathext-identity-probe";
         const shapeCommand = "synara-native-shape-identity-probe";
         const shapeCandidate = Path.join(commonBin, `${shapeCommand}.cmd`);
@@ -1375,9 +1375,7 @@ describe("windowsProcess", () => {
         const foldNativeCandidateForComparison = (candidate: string): string =>
           Path.win32
             .normalize(candidate)
-            .replace(/[A-Z]/g, (character) =>
-              String.fromCharCode(character.charCodeAt(0) + 0x20),
-            );
+            .replace(/[A-Z]/g, (character) => String.fromCharCode(character.charCodeAt(0) + 0x20));
         const makeVariant = (
           input: Pick<NativeVariant, "command" | "cwd" | "env">,
           outcome: NativeVariant["outcome"],
@@ -1388,11 +1386,7 @@ describe("windowsProcess", () => {
           candidates,
           cacheable: outcome !== transientOutcome,
         });
-        const runCollision = (
-          name: string,
-          left: NativeVariant,
-          right: NativeVariant,
-        ): void => {
+        const runCollision = (name: string, left: NativeVariant, right: NativeVariant): void => {
           const nativeOracle = new Map<NativeVariant, string[]>();
           for (const variant of [left, right]) {
             const oracleObservations: WindowsCommandDiscoveryObservation[] = [];
@@ -1400,8 +1394,7 @@ describe("windowsProcess", () => {
               platform: "win32",
               cwd: variant.cwd,
               env: variant.env,
-              spawnSync: (command, args, options) =>
-                spawnChildSync(command, [...args], options),
+              spawnSync: (command, args, options) => spawnChildSync(command, [...args], options),
               onCommandDiscovery: (observation) => oracleObservations.push(observation),
             }).map(foldNativeCandidateForComparison);
             expect(oracleCandidates, `${name} native oracle multiplicity`).toHaveLength(
@@ -1458,14 +1451,8 @@ describe("windowsProcess", () => {
           mkdirSync(Path.join(unicodeSystemRootCapital, "System32"), { recursive: true });
           mkdirSync(Path.join(unicodeSystemRootExpanded, "System32"), { recursive: true });
 
-          const unicodePathCapitalCandidate = Path.join(
-            unicodePathCapital,
-            `${pathCommand}.cmd`,
-          );
-          const unicodePathExpandedCandidate = Path.join(
-            unicodePathExpanded,
-            `${pathCommand}.cmd`,
-          );
+          const unicodePathCapitalCandidate = Path.join(unicodePathCapital, `${pathCommand}.cmd`);
+          const unicodePathExpandedCandidate = Path.join(unicodePathExpanded, `${pathCommand}.cmd`);
           const unicodeCommandCapitalCandidate = Path.join(
             commonBin,
             `${unicodeCommandCapital}.cmd`,
@@ -1494,14 +1481,8 @@ describe("windowsProcess", () => {
           ]) {
             writeFileSync(candidate, "");
           }
-          copyFileSync(
-            realWhereExe,
-            Path.join(unicodeSystemRootCapital, "System32", "where.exe"),
-          );
-          writeFileSync(
-            Path.join(unicodeSystemRootExpanded, "System32", "where.exe"),
-            "",
-          );
+          copyFileSync(realWhereExe, Path.join(unicodeSystemRootCapital, "System32", "where.exe"));
+          writeFileSync(Path.join(unicodeSystemRootExpanded, "System32", "where.exe"), "");
 
           const baseEnv = (overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv => ({
             PATH: commonBin,

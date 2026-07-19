@@ -22,11 +22,7 @@ describe("editor availability config updates", () => {
   it("filters the revision already represented by the initial config snapshot", async () => {
     const events = await Effect.runPromise(
       makeEditorAvailabilityConfigUpdateStream(
-        Stream.fromIterable([
-          snapshot(1, ["cursor"]),
-          snapshot(2, ["vscode"]),
-          snapshot(3, []),
-        ]),
+        Stream.fromIterable([snapshot(1, ["cursor"]), snapshot(2, ["vscode"]), snapshot(3, [])]),
         1,
       ).pipe(Stream.runCollect),
     );
