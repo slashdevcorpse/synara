@@ -25,8 +25,9 @@ export function ProjectSidebarIcon({
   glyphClassName?: string;
 }) {
   const faviconSrc = resolveProjectFaviconUrl(cwd);
-  // Keyed by src: a cwd change derives back to the cache-seeded default in the
-  // same render, so the probe effect never needs a synchronous setState.
+  // Initial mount seeds from the cache; later cwd changes read the current
+  // source's cached result below in the same render, so the probe effect never
+  // needs a synchronous setState.
   const [probe, setProbe] = useState<{ src: string; present: boolean } | null>(() => {
     const cached = projectFaviconPresence.get(faviconSrc);
     return cached === undefined ? null : { src: faviconSrc, present: cached };
