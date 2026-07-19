@@ -69,6 +69,9 @@ describe("desktop smoke process lifecycle", () => {
     const child = new FakeSmokeProcess();
     const signalProcess = vi.fn((_pid, signal) => {
       if (signal === "SIGTERM") child.exitAndClose(null, "SIGTERM");
+      if (signal === "SIGKILL") {
+        throw Object.assign(new Error("process group no longer exists"), { code: "ESRCH" });
+      }
     });
     const resultPromise = superviseDesktopSmokeProcess({
       child,
@@ -76,12 +79,47 @@ describe("desktop smoke process lifecycle", () => {
       signalProcess,
     });
 
-    await vi.advanceTimersByTimeAsync(8_000);
+    await vi.advanceTimersByTimeAsync(13_000);
 
     await expectSettled(resultPromise, { ok: true, failures: [], teardownDiagnostics: [] });
-    expect(signalProcess).toHaveBeenCalledOnce();
-    expect(signalProcess).toHaveBeenCalledWith(-child.pid, "SIGTERM");
+    expect(signalProcess.mock.calls).toEqual([
+      [-child.pid, "SIGTERM"],
+      [-child.pid, "SIGKILL"],
+    ]);
     expect(child.kill).not.toHaveBeenCalled();
+  });
+
+  it("keeps POSIX teardown active through the force stage after the root closes", async () => {
+    const child = new FakeSmokeProcess();
+    let helperAlive = true;
+    const signalProcess = vi.fn((_pid, signal) => {
+      if (signal === "SIGTERM") child.exitAndClose(null, "SIGTERM");
+      if (signal === "SIGKILL") helperAlive = false;
+    });
+    const resultPromise = superviseDesktopSmokeProcess({
+      child,
+      platform: "darwin",
+      signalProcess,
+    });
+    let resolved = false;
+    void resultPromise.then(() => {
+      resolved = true;
+    });
+
+    await vi.advanceTimersByTimeAsync(8_000);
+
+    expect(resolved).toBe(false);
+    expect(helperAlive).toBe(true);
+    expect(signalProcess).toHaveBeenCalledExactlyOnceWith(-child.pid, "SIGTERM");
+
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    await expectSettled(resultPromise, { ok: true, failures: [], teardownDiagnostics: [] });
+    expect(helperAlive).toBe(false);
+    expect(signalProcess.mock.calls).toEqual([
+      [-child.pid, "SIGTERM"],
+      [-child.pid, "SIGKILL"],
+    ]);
   });
 
   it("fails when the desktop exits before proving the observation window", async () => {
@@ -94,6 +132,7 @@ describe("desktop smoke process lifecycle", () => {
     });
 
     child.exitAndClose(0);
+    await vi.advanceTimersByTimeAsync(5_000);
 
     await expectSettled(resultPromise, {
       ok: false,
@@ -115,7 +154,7 @@ describe("desktop smoke process lifecycle", () => {
       signalProcess,
     });
 
-    await vi.advanceTimersByTimeAsync(8_000);
+    await vi.advanceTimersByTimeAsync(13_000);
 
     await expectSettled(resultPromise, {
       ok: false,
@@ -147,6 +186,7 @@ describe("desktop smoke process lifecycle", () => {
     });
 
     child.emit("error", new Error("stream aborted"));
+    await vi.advanceTimersByTimeAsync(5_000);
 
     await expectSettled(resultPromise, {
       ok: false,
@@ -235,8 +275,9 @@ describe("desktop smoke process lifecycle", () => {
       child.exitAndClose(null, "SIGTERM");
       return true;
     });
-    const signalProcess = vi.fn(() => {
-      throw new Error("group missing");
+    const signalProcess = vi.fn((_pid, signal) => {
+      if (signal === "SIGTERM") throw new Error("group missing");
+      throw Object.assign(new Error("process group no longer exists"), { code: "ESRCH" });
     });
     const resultPromise = superviseDesktopSmokeProcess({
       child,
@@ -244,7 +285,7 @@ describe("desktop smoke process lifecycle", () => {
       signalProcess,
     });
 
-    await vi.advanceTimersByTimeAsync(8_000);
+    await vi.advanceTimersByTimeAsync(13_000);
 
     await expectSettled(resultPromise, {
       ok: false,
@@ -290,7 +331,7 @@ describe("desktop smoke process lifecycle", () => {
       signalProcess,
     });
 
-    await vi.advanceTimersByTimeAsync(8_000);
+    await vi.advanceTimersByTimeAsync(13_000);
 
     await expectSettled(resultPromise, {
       ok: false,
@@ -446,9 +487,9 @@ describe("desktop smoke process lifecycle", () => {
       signalProcess,
     });
 
-    await vi.advanceTimersByTimeAsync(8_000);
+    await vi.advanceTimersByTimeAsync(13_000);
 
     await expectSettled(resultPromise, { ok: true });
-    expect(signalProcess).toHaveBeenCalledOnce();
+    expect(signalProcess).toHaveBeenCalledTimes(2);
   });
 });

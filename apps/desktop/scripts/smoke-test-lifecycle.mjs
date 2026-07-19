@@ -129,6 +129,7 @@ export function superviseDesktopSmokeProcess({
     let observationComplete = false;
     let teardownStarted = false;
     let forceStarted = false;
+    let posixForceAttemptComplete = false;
     let windowsTreeAttemptStarted = false;
     let windowsTreeAttemptComplete = false;
     let windowsTreeConfirmed = false;
@@ -217,6 +218,9 @@ export function superviseDesktopSmokeProcess({
         signalProcess(-child.pid, signal);
         return true;
       } catch (error) {
+        if (signal === "SIGKILL" && error?.code === "ESRCH") {
+          return true;
+        }
         addTeardownDiagnostic(`Process-group ${signal} failed: ${formatError(error)}`);
         directKill(signal);
         return false;
@@ -225,7 +229,11 @@ export function superviseDesktopSmokeProcess({
 
     const maybeFinishAfterClose = () => {
       if (!closeObserved || settled) return;
-      if (platform !== "win32" || windowsTreeConfirmed || windowsTreeAttemptComplete) finish();
+      if (platform === "win32") {
+        if (windowsTreeConfirmed || windowsTreeAttemptComplete) finish();
+        return;
+      }
+      if (posixForceAttemptComplete) finish();
     };
 
     const startWindowsTreeKill = () => {
@@ -300,6 +308,8 @@ export function superviseDesktopSmokeProcess({
 
       if (platform !== "win32") {
         signalPosixTree("SIGKILL");
+        posixForceAttemptComplete = true;
+        maybeFinishAfterClose();
         return;
       }
       startWindowsTreeKill();
