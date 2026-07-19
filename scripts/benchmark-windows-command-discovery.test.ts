@@ -1,11 +1,24 @@
+import { randomUUID } from "node:crypto";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { describe, expect, it } from "vitest";
 
 import {
   alternatingVersionOrder,
   assertComparableEditorBenchmarkRuntime,
+  assertCandidateCheckoutIdentity,
+  assertMatchingLockfileProvenance,
+  assertMatchingPackageManagerProvenance,
+  assertRevisionLocalResolutions,
+  assertSafeBenchmarkOutputPath,
+  benchmarkDependencyLinks,
   evaluateBenchmarkGates,
+  formatBenchmarkFailure,
   hashFixtureLabel,
   parseBenchmarkArgs,
+  runCleanupSteps,
   summarizeSamples,
   type BenchmarkSummary,
   type ScenarioComparison,
@@ -74,7 +87,7 @@ function passingScenarios(): ScenarioComparison[] {
 }
 
 describe("benchmark-windows-command-discovery", () => {
-  it("requires immutable SHAs, 30 iterations, five warmups, and a bounded output path", () => {
+  it("requires immutable SHAs, 30 iterations, and five warmups", () => {
     const parsed = parseBenchmarkArgs(
       [
         "--repo",
@@ -148,6 +161,151 @@ describe("benchmark-windows-command-discovery", () => {
         "C:\\repo",
       ),
     ).toThrow("must be different");
+  });
+
+  it("requires the invoking tracked checkout to match the candidate revision", () => {
+    expect(() =>
+      assertCandidateCheckoutIdentity({
+        headSha: SHA_B,
+        candidateSha: SHA_B,
+        trackedStatus: "",
+      }),
+    ).not.toThrow();
+    expect(() =>
+      assertCandidateCheckoutIdentity({
+        headSha: SHA_A,
+        candidateSha: SHA_B,
+        trackedStatus: "",
+      }),
+    ).toThrow("does not match candidate");
+    expect(() =>
+      assertCandidateCheckoutIdentity({
+        headSha: SHA_B,
+        candidateSha: SHA_B,
+        trackedStatus: " M scripts/benchmark-windows-command-discovery.ts",
+      }),
+    ).toThrow("tracked changes");
+  });
+
+  it("provisions shallow no-network links and rejects dependency leakage", () => {
+    const worktree = "C:\\benchmark\\candidate";
+    const externalEffect = "C:\\locked-dependencies\\effect";
+    expect(benchmarkDependencyLinks(worktree, externalEffect)).toEqual(
+      expect.arrayContaining([
+        {
+          link: join(worktree, "apps", "server", "node_modules", "@synara", "contracts"),
+          target: join(worktree, "packages", "contracts"),
+        },
+        {
+          link: join(worktree, "apps", "server", "node_modules", "effect"),
+          target: externalEffect,
+        },
+      ]),
+    );
+    expect(() =>
+      assertRevisionLocalResolutions(worktree, {
+        contracts: join(worktree, "packages", "contracts", "src", "index.ts"),
+        sharedWindowsProcess: join(
+          worktree,
+          "packages",
+          "shared",
+          "src",
+          "windowsProcess.ts",
+        ),
+        effectFromServer: join(externalEffect, "dist", "effect.js"),
+        effectFromContracts: join(externalEffect, "dist", "effect.js"),
+      }, externalEffect),
+    ).not.toThrow();
+    expect(() =>
+      assertRevisionLocalResolutions(worktree, {
+        contracts: "C:\\mutable-source\\packages\\contracts\\src\\index.ts",
+        sharedWindowsProcess: join(
+          worktree,
+          "packages",
+          "shared",
+          "src",
+          "windowsProcess.ts",
+        ),
+        effectFromServer: join(externalEffect, "dist", "effect.js"),
+        effectFromContracts: join(externalEffect, "dist", "effect.js"),
+      }, externalEffect),
+    ).toThrow("resolved outside detached revision");
+    expect(() =>
+      assertRevisionLocalResolutions(worktree, {
+        contracts: join(worktree, "packages", "contracts", "src", "index.ts"),
+        sharedWindowsProcess: join(
+          worktree,
+          "packages",
+          "shared",
+          "src",
+          "windowsProcess.ts",
+        ),
+        effectFromServer: "C:\\ancestor-node-modules\\effect\\dist\\effect.js",
+        effectFromContracts: join(externalEffect, "dist", "effect.js"),
+      }, externalEffect),
+    ).toThrow("locked external Effect package");
+  });
+
+  it("rejects immutable revisions with different committed lockfiles", () => {
+    expect(() => assertMatchingLockfileProvenance("same", "same")).not.toThrow();
+    expect(() => assertMatchingLockfileProvenance("base", "candidate")).toThrow(
+      "different committed bun.lock digests",
+    );
+    expect(() => assertMatchingPackageManagerProvenance("bun@1.3.12", "bun@1.3.12")).not.toThrow();
+    expect(() => assertMatchingPackageManagerProvenance("bun@1.3.12", "bun@1.3.14")).toThrow(
+      "different packageManager declarations",
+    );
+  });
+
+  it("accepts only an empty controlled receipt directory directly under OS temp", () => {
+    const suffix = randomUUID().replaceAll("-", "");
+    const controlled = join(tmpdir(), `synara-goal09-benchmark-${suffix}`);
+    const uncontrolled = join(tmpdir(), `goal09-benchmark-${suffix}`);
+    mkdirSync(controlled);
+    mkdirSync(uncontrolled);
+    try {
+      const output = join(controlled, "receipt.json");
+      expect(() => assertSafeBenchmarkOutputPath(output)).not.toThrow();
+      expect(() =>
+        assertSafeBenchmarkOutputPath(join(controlled, "other.json")),
+      ).toThrow("filename must be receipt.json");
+      expect(() =>
+        assertSafeBenchmarkOutputPath(join(uncontrolled, "receipt.json")),
+      ).toThrow("outside the controlled temp boundary");
+      writeFileSync(join(controlled, "unexpected.txt"), "unexpected\n");
+      expect(() => assertSafeBenchmarkOutputPath(output)).toThrow("must be empty");
+    } finally {
+      rmSync(controlled, { recursive: true, force: true });
+      rmSync(uncontrolled, { recursive: true, force: true });
+    }
+  });
+
+  it("attempts every cleanup step and reports each failure", () => {
+    const calls: string[] = [];
+    const errors = runCleanupSteps([
+      () => {
+        calls.push("candidate");
+        throw new Error("candidate cleanup failed");
+      },
+      () => {
+        calls.push("base");
+      },
+      () => {
+        calls.push("root");
+        throw new Error("root cleanup failed");
+      },
+    ]);
+    expect(calls).toEqual(["candidate", "base", "root"]);
+    expect(errors.map((error) => error.message)).toEqual([
+      "candidate cleanup failed",
+      "root cleanup failed",
+    ]);
+    const formatted = formatBenchmarkFailure(
+      new AggregateError([new Error("primary failure"), ...errors], "benchmark and cleanup failed"),
+    );
+    expect(formatted).toContain("primary failure");
+    expect(formatted).toContain("candidate cleanup failed");
+    expect(formatted).toContain("root cleanup failed");
   });
 
   it("rejects editor measurements that cannot invoke both immutable implementations", () => {

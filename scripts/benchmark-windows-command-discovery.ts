@@ -8,11 +8,16 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
+  statSync,
+  symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { arch, cpus, platform, release, version } from "node:os";
+import { arch, cpus, platform, release, tmpdir, version } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import pathWin32 from "node:path/win32";
 import { pathToFileURL } from "node:url";
@@ -24,6 +29,8 @@ const DEFAULT_WARMUPS = 5;
 const MIN_ITERATIONS = 30;
 const FIXTURE_ID = "windows-command-discovery-v1";
 const SHA_PATTERN = /^[0-9a-f]{40}$/i;
+const RECEIPT_DIRECTORY_PATTERN = /^synara-goal09-benchmark-[0-9a-f]{32}$/i;
+const RECEIPT_FILENAME = "receipt.json";
 const SIMULATED_WHERE_DELAY_MS = 2;
 
 export interface BenchmarkCliOptions {
@@ -162,6 +169,21 @@ interface NodeDuplicateEnvironmentOracle {
   readonly expectedKey: "PATH";
   readonly expectedValueSha256: string;
   readonly passed: boolean;
+}
+
+interface DependencyProvenance {
+  readonly bunLockSha256: string;
+  readonly provisioning: {
+    readonly mode: "revision-local-workspace-junctions";
+    readonly network: "disabled";
+    readonly lifecycleScripts: "not-run";
+    readonly externalEffectPackageJsonSha256: string;
+    readonly externalEffectVersion: string;
+  };
+  readonly revisionLocalResolutions: {
+    readonly contracts: string;
+    readonly sharedWindowsProcess: string;
+  };
 }
 
 function requiredValue(args: readonly string[], index: number, flag: string): string {
@@ -416,12 +438,253 @@ function git(repo: string, args: readonly string[]): string {
   }).trim();
 }
 
+function isPathInside(root: string, candidate: string): boolean {
+  const relativePath = relative(resolve(root), resolve(candidate));
+  return (
+    relativePath.length > 0 &&
+    !relativePath.startsWith("..") &&
+    !isAbsolute(relativePath)
+  );
+}
+
+export function assertCandidateCheckoutIdentity(input: {
+  readonly headSha: string;
+  readonly candidateSha: string;
+  readonly trackedStatus: string;
+}): void {
+  if (input.headSha.toLowerCase() !== input.candidateSha.toLowerCase()) {
+    throw new Error(
+      `Benchmark checkout HEAD ${input.headSha} does not match candidate ${input.candidateSha}.`,
+    );
+  }
+  if (input.trackedStatus.trim().length > 0) {
+    throw new Error(`Benchmark checkout has tracked changes:\n${input.trackedStatus}`);
+  }
+}
+
+function assertInvokingCheckout(repo: string, candidateSha: string): void {
+  assertCandidateCheckoutIdentity({
+    headSha: git(repo, ["rev-parse", "HEAD"]),
+    candidateSha,
+    trackedStatus: git(repo, ["status", "--porcelain=v1", "--untracked-files=no"]),
+  });
+}
+
+export function assertSafeBenchmarkOutputPath(
+  output: string,
+  operatingSystemTemp: string = tmpdir(),
+): void {
+  const resolvedOutput = resolve(output);
+  const parent = dirname(resolvedOutput);
+  const tempRoot = realpathSync(resolve(operatingSystemTemp));
+  if (basename(resolvedOutput) !== RECEIPT_FILENAME) {
+    throw new Error(`Benchmark output filename must be ${RECEIPT_FILENAME}.`);
+  }
+  if (!existsSync(parent) || !statSync(parent).isDirectory()) {
+    throw new Error(`Benchmark output directory must already exist: ${parent}`);
+  }
+  const realParent = realpathSync(parent);
+  if (
+    resolve(dirname(realParent)).toLowerCase() !== tempRoot.toLowerCase() ||
+    !RECEIPT_DIRECTORY_PATTERN.test(basename(realParent))
+  ) {
+    throw new Error(`Benchmark output directory is outside the controlled temp boundary: ${parent}`);
+  }
+  if (readdirSync(realParent).length > 0 || existsSync(resolvedOutput)) {
+    throw new Error(`Benchmark output directory must be empty: ${parent}`);
+  }
+}
+
+export function benchmarkDependencyLinks(
+  worktree: string,
+  externalEffectPackage: string,
+): ReadonlyArray<{ readonly link: string; readonly target: string }> {
+  return [
+    {
+      link: join(worktree, "apps", "server", "node_modules", "@synara", "contracts"),
+      target: join(worktree, "packages", "contracts"),
+    },
+    {
+      link: join(worktree, "apps", "server", "node_modules", "@synara", "shared"),
+      target: join(worktree, "packages", "shared"),
+    },
+    {
+      link: join(worktree, "apps", "server", "node_modules", "effect"),
+      target: externalEffectPackage,
+    },
+    {
+      link: join(worktree, "packages", "contracts", "node_modules", "effect"),
+      target: externalEffectPackage,
+    },
+  ];
+}
+
+export function assertRevisionLocalResolutions(
+  worktree: string,
+  resolutions: {
+    readonly contracts: string;
+    readonly sharedWindowsProcess: string;
+    readonly effectFromServer: string;
+    readonly effectFromContracts: string;
+  },
+  externalEffectPackage: string,
+): void {
+  for (const [name, resolvedPath] of Object.entries({
+    contracts: resolutions.contracts,
+    sharedWindowsProcess: resolutions.sharedWindowsProcess,
+  })) {
+    if (!isPathInside(worktree, resolvedPath)) {
+      throw new Error(
+        `Benchmark dependency ${name} resolved outside detached revision ${worktree}: ${resolvedPath}`,
+      );
+    }
+  }
+  for (const [name, resolvedPath] of Object.entries({
+    effectFromServer: resolutions.effectFromServer,
+    effectFromContracts: resolutions.effectFromContracts,
+  })) {
+    if (!isPathInside(externalEffectPackage, resolvedPath)) {
+      throw new Error(
+        `Benchmark dependency ${name} did not resolve from the locked external Effect package: ${resolvedPath}`,
+      );
+    }
+  }
+}
+
+function provisionRevisionDependencies(
+  worktree: string,
+  externalEffectPackage: string,
+  committedBunLockSha256: string,
+): DependencyProvenance {
+  const effectPackageJsonPath = join(externalEffectPackage, "package.json");
+  const effectPackageJsonContents = readFileSync(effectPackageJsonPath);
+  const effectPackageJson = JSON.parse(effectPackageJsonContents.toString("utf8")) as {
+    readonly version?: unknown;
+  };
+  if (typeof effectPackageJson.version !== "string" || effectPackageJson.version.length === 0) {
+    throw new Error(`Invalid Effect package metadata: ${effectPackageJsonPath}`);
+  }
+  for (const dependency of benchmarkDependencyLinks(worktree, externalEffectPackage)) {
+    mkdirSync(dirname(dependency.link), { recursive: true });
+    symlinkSync(dependency.target, dependency.link, "junction");
+  }
+  const resolutionScript = [
+    'const root = process.env.SYNARA_BENCHMARK_WORKTREE;',
+    'if (!root) throw new Error("Missing benchmark worktree.");',
+    'const parent = `${root}/apps/server/src/open.ts`;',
+    'const contractsParent = `${root}/packages/contracts/src/index.ts`;',
+    'process.stdout.write(JSON.stringify({',
+    '  contracts: Bun.resolveSync("@synara/contracts", parent),',
+    '  sharedWindowsProcess: Bun.resolveSync("@synara/shared/windowsProcess", parent),',
+    '  effectFromServer: Bun.resolveSync("effect", parent),',
+    '  effectFromContracts: Bun.resolveSync("effect", contractsParent),',
+    '}));',
+  ].join("\n");
+  const resolutionEnvironment = Object.fromEntries(
+    Object.entries(process.env).filter(([name]) => name.toUpperCase() !== "NODE_PATH"),
+  );
+  const resolutions = JSON.parse(
+    execFileSync(process.execPath, ["-e", resolutionScript], {
+      cwd: worktree,
+      encoding: "utf8",
+      env: { ...resolutionEnvironment, SYNARA_BENCHMARK_WORKTREE: worktree },
+      timeout: 30_000,
+      windowsHide: true,
+    }),
+  ) as {
+    readonly contracts: string;
+    readonly sharedWindowsProcess: string;
+    readonly effectFromServer: string;
+    readonly effectFromContracts: string;
+  };
+  assertRevisionLocalResolutions(worktree, resolutions, externalEffectPackage);
+  assertCleanWorktree(worktree);
+  return {
+    bunLockSha256: committedBunLockSha256,
+    provisioning: {
+      mode: "revision-local-workspace-junctions",
+      network: "disabled",
+      lifecycleScripts: "not-run",
+      externalEffectPackageJsonSha256: createHash("sha256")
+        .update(effectPackageJsonContents)
+        .digest("hex"),
+      externalEffectVersion: effectPackageJson.version,
+    },
+    revisionLocalResolutions: {
+      contracts: relative(worktree, resolutions.contracts).replaceAll("\\", "/"),
+      sharedWindowsProcess: relative(worktree, resolutions.sharedWindowsProcess).replaceAll(
+        "\\",
+        "/",
+      ),
+    },
+  };
+}
+
+function removeRevisionDependencyLinks(worktree: string, externalEffectPackage: string): void {
+  for (const dependency of [...benchmarkDependencyLinks(worktree, externalEffectPackage)].reverse()) {
+    if (existsSync(dependency.link)) unlinkSync(dependency.link);
+  }
+}
+
+export function runCleanupSteps(steps: ReadonlyArray<() => void>): Error[] {
+  const errors: Error[] = [];
+  for (const step of steps) {
+    try {
+      step();
+    } catch (cause) {
+      errors.push(cause instanceof Error ? cause : new Error(String(cause)));
+    }
+  }
+  return errors;
+}
+
 function resolveCommit(repo: string, sha: string): string {
   const resolvedSha = git(repo, ["rev-parse", `${sha}^{commit}`]).toLowerCase();
   if (resolvedSha !== sha.toLowerCase()) {
     throw new Error(`SHA did not resolve immutably: requested ${sha}, resolved ${resolvedSha}`);
   }
   return resolvedSha;
+}
+
+function hashCommittedFile(repo: string, sha: string, path: string): string {
+  const contents = execFileSync("git", ["-C", repo, "show", `${sha}:${path}`], {
+    maxBuffer: 4 * 1024 * 1024,
+    windowsHide: true,
+  });
+  return createHash("sha256").update(contents).digest("hex");
+}
+
+function readCommittedPackageManager(repo: string, sha: string): string {
+  const packageJson = JSON.parse(
+    execFileSync("git", ["-C", repo, "show", `${sha}:package.json`], {
+      encoding: "utf8",
+      maxBuffer: 1024 * 1024,
+      windowsHide: true,
+    }),
+  ) as { readonly packageManager?: unknown };
+  if (typeof packageJson.packageManager !== "string" || packageJson.packageManager.length === 0) {
+    throw new Error(`Revision ${sha} has no packageManager declaration.`);
+  }
+  return packageJson.packageManager;
+}
+
+export function assertMatchingLockfileProvenance(baseDigest: string, candidateDigest: string): void {
+  if (baseDigest !== candidateDigest) {
+    throw new Error(
+      `Benchmark revisions have different committed bun.lock digests: base=${baseDigest}, candidate=${candidateDigest}.`,
+    );
+  }
+}
+
+export function assertMatchingPackageManagerProvenance(
+  baseDeclaration: string,
+  candidateDeclaration: string,
+): void {
+  if (baseDeclaration !== candidateDeclaration) {
+    throw new Error(
+      `Benchmark revisions have different packageManager declarations: base=${baseDeclaration}, candidate=${candidateDeclaration}.`,
+    );
+  }
 }
 
 function assertAncestor(repo: string, ancestor: string, descendant: string, label: string): void {
@@ -440,8 +703,18 @@ function assertCleanWorktree(worktree: string): void {
   if (dirty.length > 0) throw new Error(`Benchmark worktree is dirty: ${worktree}`);
 }
 
-function assertSafeTempRoot(tempRoot: string, gitCommonDir: string): void {
-  const relativePath = relative(gitCommonDir, tempRoot);
+function assertDetachedRevision(worktree: string, expectedSha: string): void {
+  const headSha = git(worktree, ["rev-parse", "HEAD"]).toLowerCase();
+  if (headSha !== expectedSha.toLowerCase()) {
+    throw new Error(
+      `Detached benchmark worktree HEAD ${headSha} does not match expected ${expectedSha}.`,
+    );
+  }
+  assertCleanWorktree(worktree);
+}
+
+function assertSafeTempRoot(tempRoot: string, allowedParent: string): void {
+  const relativePath = relative(allowedParent, tempRoot);
   if (
     relativePath.length === 0 ||
     relativePath.startsWith("..") ||
@@ -1001,7 +1274,10 @@ async function measureNativeWhere(runtime: VersionRuntime, fixture: BenchmarkFix
 async function runBenchmark(options: BenchmarkCliOptions): Promise<Record<string, unknown>> {
   if (platform() !== "win32") throw new Error("The final discovery benchmark must run on Windows.");
   if (!existsSync(join(options.repo, ".git"))) throw new Error(`Not a Git repository: ${options.repo}`);
-  if (existsSync(options.output)) throw new Error(`Refusing to overwrite benchmark output: ${options.output}`);
+  if (process.env.NODE_PATH?.trim()) {
+    throw new Error("NODE_PATH must be unset for the isolated discovery benchmark.");
+  }
+  assertSafeBenchmarkOutputPath(options.output);
 
   const baseSha = resolveCommit(options.repo, options.baseSha);
   const candidateSha = resolveCommit(options.repo, options.candidateSha);
@@ -1011,26 +1287,67 @@ async function runBenchmark(options: BenchmarkCliOptions): Promise<Record<string
   }
   assertAncestor(options.repo, parentSha, baseSha, "Required #397 parent check");
   assertAncestor(options.repo, baseSha, candidateSha, "Candidate ancestry check");
+  assertInvokingCheckout(options.repo, candidateSha);
+  const baseBunLockSha256 = hashCommittedFile(options.repo, baseSha, "bun.lock");
+  const candidateBunLockSha256 = hashCommittedFile(options.repo, candidateSha, "bun.lock");
+  assertMatchingLockfileProvenance(baseBunLockSha256, candidateBunLockSha256);
+  const basePackageManager = readCommittedPackageManager(options.repo, baseSha);
+  const candidatePackageManager = readCommittedPackageManager(options.repo, candidateSha);
+  assertMatchingPackageManagerProvenance(basePackageManager, candidatePackageManager);
+  const externalEffectPackage = realpathSync(
+    join(options.repo, "apps", "server", "node_modules", "effect"),
+  );
 
-  const gitCommonDirRaw = git(options.repo, ["rev-parse", "--git-common-dir"]);
-  const gitCommonDir = resolve(options.repo, gitCommonDirRaw);
-  const tempRoot = mkdtempSync(join(gitCommonDir, "synara-discovery-benchmark-"));
-  assertSafeTempRoot(tempRoot, gitCommonDir);
+  const windowsRoot = process.env.SystemRoot ?? process.env.WINDIR;
+  if (!windowsRoot) throw new Error("SystemRoot or WINDIR is required for benchmark isolation.");
+  const isolatedWorktreeTemp = realpathSync(join(windowsRoot, "Temp"));
+  for (
+    let ancestor = isolatedWorktreeTemp;
+    ;
+    ancestor = dirname(ancestor)
+  ) {
+    if (existsSync(join(ancestor, "node_modules"))) {
+      throw new Error(`Benchmark worktree ancestor contains node_modules: ${ancestor}`);
+    }
+    const parent = dirname(ancestor);
+    if (parent === ancestor) break;
+  }
+  const tempRoot = mkdtempSync(join(isolatedWorktreeTemp, "synara-discovery-benchmark-"));
+  assertSafeTempRoot(tempRoot, isolatedWorktreeTemp);
   const baseWorktree = join(tempRoot, "base");
   const candidateWorktree = join(tempRoot, "candidate");
+  let benchmarkReport: Record<string, unknown> | undefined;
+  let benchmarkFailure: unknown;
+  let benchmarkFailed = false;
+  let baseWorktreeRegistered = false;
+  let candidateWorktreeRegistered = false;
 
   try {
     execFileSync("git", ["-C", options.repo, "worktree", "add", "--detach", baseWorktree, baseSha], {
       stdio: "ignore",
       windowsHide: true,
     });
+    baseWorktreeRegistered = true;
     execFileSync(
       "git",
       ["-C", options.repo, "worktree", "add", "--detach", candidateWorktree, candidateSha],
       { stdio: "ignore", windowsHide: true },
     );
-    assertCleanWorktree(baseWorktree);
-    assertCleanWorktree(candidateWorktree);
+    candidateWorktreeRegistered = true;
+    assertDetachedRevision(baseWorktree, baseSha);
+    assertDetachedRevision(candidateWorktree, candidateSha);
+    const baseDependencies = provisionRevisionDependencies(
+      baseWorktree,
+      externalEffectPackage,
+      baseBunLockSha256,
+    );
+    const candidateDependencies = provisionRevisionDependencies(
+      candidateWorktree,
+      externalEffectPackage,
+      candidateBunLockSha256,
+    );
+    assertDetachedRevision(baseWorktree, baseSha);
+    assertDetachedRevision(candidateWorktree, candidateSha);
 
     const fixture = createFixture(tempRoot);
     const [baseRuntime, candidateRuntime] = await Promise.all([
@@ -1105,7 +1422,12 @@ async function runBenchmark(options: BenchmarkCliOptions): Promise<Record<string
       immutableRevisions: { baseSha, candidateSha, pr397ParentOrIntegrationSha: parentSha },
       dirtyStateRejection: {
         enforced: true,
-        scope: "clean detached base and candidate worktrees",
+        scope: "candidate-matched tracked-clean invoking checkout plus clean detached worktrees",
+      },
+      dependencyProvenance: {
+        identicalCommittedLockfile: true,
+        base: baseDependencies,
+        candidate: candidateDependencies,
       },
       machine: {
         platform: platform(),
@@ -1119,6 +1441,14 @@ async function runBenchmark(options: BenchmarkCliOptions): Promise<Record<string
       runtimes: {
         benchmark: { name: "bun", version: Bun.version },
         node: { name: "node", version: nodeEnvironmentOracle.oracleRuntime.version },
+        packageManagerPolicy: {
+          baseDeclaration: basePackageManager,
+          candidateDeclaration: candidatePackageManager,
+          actualRuntime: `bun@${Bun.version}`,
+          exactDeclarationMatch: basePackageManager === `bun@${Bun.version}`,
+          policy:
+            "relative benchmark uses one recorded Bun runtime for both revisions; declaration drift is rejected and exact-pin mismatch is disclosed",
+        },
       },
       fixture: {
         id: FIXTURE_ID,
@@ -1188,20 +1518,88 @@ async function runBenchmark(options: BenchmarkCliOptions): Promise<Record<string
       passed: gates.every((gate) => gate.passed),
     };
 
-    mkdirSync(dirname(options.output), { recursive: true });
-    writeFileSync(options.output, `${JSON.stringify(report, null, 2)}\n`, { flag: "wx" });
-    return report;
-  } finally {
-    for (const worktree of [candidateWorktree, baseWorktree]) {
-      if (!existsSync(worktree)) continue;
-      execFileSync("git", ["-C", options.repo, "worktree", "remove", "--force", worktree], {
+    benchmarkReport = report;
+  } catch (cause) {
+    benchmarkFailed = true;
+    benchmarkFailure = cause;
+  }
+
+  const cleanupErrors = runCleanupSteps([
+    () => {
+      if (existsSync(candidateWorktree)) {
+        removeRevisionDependencyLinks(candidateWorktree, externalEffectPackage);
+      }
+    },
+    () => {
+      if (!candidateWorktreeRegistered) return;
+      execFileSync(
+        "git",
+        ["-C", options.repo, "worktree", "remove", "--force", candidateWorktree],
+        { stdio: "ignore", windowsHide: true },
+      );
+      candidateWorktreeRegistered = false;
+    },
+    () => {
+      if (existsSync(baseWorktree)) {
+        removeRevisionDependencyLinks(baseWorktree, externalEffectPackage);
+      }
+    },
+    () => {
+      if (!baseWorktreeRegistered) return;
+      execFileSync("git", ["-C", options.repo, "worktree", "remove", "--force", baseWorktree], {
         stdio: "ignore",
         windowsHide: true,
       });
+      baseWorktreeRegistered = false;
+    },
+    () => {
+      assertSafeTempRoot(tempRoot, isolatedWorktreeTemp);
+      const registeredWorktrees = [candidateWorktree, baseWorktree].filter((worktree) =>
+        existsSync(worktree),
+      );
+      if (
+        registeredWorktrees.length > 0 ||
+        candidateWorktreeRegistered ||
+        baseWorktreeRegistered
+      ) {
+        throw new Error(
+          `Refusing to remove benchmark root while worktrees remain: ${registeredWorktrees.join(", ") || "registered metadata"}`,
+        );
+      }
+      if (existsSync(tempRoot)) {
+        rmSync(tempRoot, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+      }
+    },
+  ]);
+  if (benchmarkFailed) {
+    if (cleanupErrors.length > 0) {
+      throw new AggregateError(
+        [benchmarkFailure, ...cleanupErrors],
+        "Benchmark failed and cleanup also reported errors.",
+      );
     }
-    assertSafeTempRoot(tempRoot, gitCommonDir);
-    rmSync(tempRoot, { recursive: true, force: true });
+    throw benchmarkFailure;
   }
+  if (cleanupErrors.length > 0) {
+    throw new AggregateError(cleanupErrors, "Benchmark cleanup reported errors.");
+  }
+  if (benchmarkReport === undefined) throw new Error("Benchmark did not produce a report.");
+  writeFileSync(options.output, `${JSON.stringify(benchmarkReport, null, 2)}\n`, { flag: "wx" });
+  return benchmarkReport;
+}
+
+export function formatBenchmarkFailure(cause: unknown): string {
+  if (cause instanceof AggregateError) {
+    const nested = Array.from(cause.errors, (error, index) => {
+      const formatted = formatBenchmarkFailure(error)
+        .split("\n")
+        .map((line) => `  ${line}`)
+        .join("\n");
+      return `[${index + 1}]\n${formatted}`;
+    });
+    return [cause.stack ?? cause.message, ...nested].join("\n");
+  }
+  return cause instanceof Error ? (cause.stack ?? cause.message) : String(cause);
 }
 
 async function main(): Promise<void> {
@@ -1214,7 +1612,7 @@ async function main(): Promise<void> {
 
 if (import.meta.main) {
   main().catch((cause: unknown) => {
-    process.stderr.write(`${cause instanceof Error ? cause.stack ?? cause.message : String(cause)}\n`);
+    process.stderr.write(`${formatBenchmarkFailure(cause)}\n`);
     process.exitCode = 1;
   });
 }
