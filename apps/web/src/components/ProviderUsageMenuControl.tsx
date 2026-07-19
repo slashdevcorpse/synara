@@ -8,7 +8,7 @@ import {
   type ServerProviderUsageSnapshot,
 } from "@synara/contracts";
 import { providerUsageNeedsAuthDetail } from "@synara/shared/providerUsage";
-import { useMemo, type ReactNode } from "react";
+import { type ReactNode } from "react";
 
 import { useAppSettings } from "~/appSettings";
 import { useProviderUsageSummary } from "~/hooks/useProviderUsageSummary";
@@ -30,6 +30,7 @@ import { Menu, MenuTrigger } from "./ui/menu";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "./ui/tooltip";
 
 const NO_USAGE_THREADS = [] as const;
+const selectNoUsageThreads = () => NO_USAGE_THREADS;
 
 export interface ProviderUsageMenuModel {
   menuTitle: string;
@@ -141,13 +142,8 @@ export function useProviderUsageMenuModel(
   options: ProviderUsageMenuModelOptions = {},
 ): ProviderUsageMenuModel | null {
   const { settings } = useAppSettings();
-  const selectAllThreads = useMemo(
-    () =>
-      options.includeSupplementalData === false
-        ? () => NO_USAGE_THREADS
-        : createAllThreadsSelector(),
-    [options.includeSupplementalData],
-  );
+  const selectAllThreads =
+    options.includeSupplementalData === false ? selectNoUsageThreads : createAllThreadsSelector();
   const threads = useStore(selectAllThreads);
   const usageSummary = useProviderUsageSummary({
     provider,
@@ -157,20 +153,16 @@ export function useProviderUsageMenuModel(
     includeSupplementalData: options.includeSupplementalData,
     providerSnapshot: options.providerSnapshot,
   });
-  const model = useMemo(
-    () =>
-      deriveProviderUsageMenuModel({
-        provider,
-        rateLimits: usageSummary.rateLimits,
-        usageLines: usageSummary.usageLines,
-        planName: usageSummary.planName,
-        notice: usageSummary.usageNotice,
-        isLoading: options.isLoading ?? usageSummary.isLoading,
-        snapshotStatus: usageSummary.snapshotStatus,
-        snapshotDetail: usageSummary.snapshotDetail,
-      }),
-    [options.isLoading, provider, usageSummary],
-  );
+  const model = deriveProviderUsageMenuModel({
+    provider,
+    rateLimits: usageSummary.rateLimits,
+    usageLines: usageSummary.usageLines,
+    planName: usageSummary.planName,
+    notice: usageSummary.usageNotice,
+    isLoading: options.isLoading ?? usageSummary.isLoading,
+    snapshotStatus: usageSummary.snapshotStatus,
+    snapshotDetail: usageSummary.snapshotDetail,
+  });
 
   if (!model.primaryRow && options.includeEmptyState !== true) {
     return null;

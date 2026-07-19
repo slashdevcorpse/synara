@@ -8,6 +8,7 @@ import type { ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 
+import { openUsageQueryKeys } from "~/lib/openUsageReactQuery";
 import type { ProviderRateLimit } from "~/lib/rateLimits";
 import { serverQueryKeys } from "~/lib/serverReactQuery";
 import { useProviderUsageSummary } from "./useProviderUsageSummary";
@@ -37,6 +38,40 @@ function fallbackSnapshot(): ServerProviderUsageSnapshot {
   });
 }
 
+function threadFallbackRateLimits(): ReadonlyArray<ProviderRateLimit> {
+  return [
+    {
+      provider: "claudeAgent",
+      updatedAt: "2026-06-09T12:00:00.000Z",
+      limits: [{ window: "Thread cache", usedPercent: 12 }],
+    },
+  ];
+}
+
+function seedCachedProviderUsage(queryClient: QueryClient, input: { includeLocalUsage: boolean }) {
+  queryClient.setQueryData(
+    serverQueryKeys.allProviderUsage("claudeAgent", input.includeLocalUsage),
+    [
+      snapshot({
+        status: "ok",
+        planName: "Cached live plan",
+        detail: "Cached live detail",
+        limits: [{ window: "Cached live", usedPercent: 70 }],
+        usageLines: [{ label: "Cached live", value: "70%" }],
+      }),
+    ],
+  );
+  queryClient.setQueryData(serverQueryKeys.providerUsage("claudeAgent", null), fallbackSnapshot());
+  queryClient.setQueryData(openUsageQueryKeys.provider("claudeAgent"), {
+    providerId: "claude",
+    fetchedAt: "2026-06-09T12:00:00.000Z",
+    lines: [
+      { type: "progress", label: "OpenUsage cache", used: 80, limit: 100 },
+      { type: "text", label: "OpenUsage cache", value: "80%" },
+    ],
+  });
+}
+
 function renderWithQueryClient(queryClient: QueryClient, node: ReactNode) {
   return renderToStaticMarkup(
     <QueryClientProvider client={queryClient}>{node}</QueryClientProvider>,
@@ -48,6 +83,7 @@ function readProviderUsageSummary(input: {
   provider?: ProviderKind | undefined;
   threadRateLimits?: ReadonlyArray<ProviderRateLimit> | undefined;
   providerSnapshot?: ServerProviderUsageSnapshot | undefined;
+  fetchProviderData?: boolean | undefined;
   includeSupplementalData?: boolean | undefined;
 }) {
   // Capture into a ref-style holder: the hook only runs inside the closure, so a
@@ -62,6 +98,7 @@ function readProviderUsageSummary(input: {
       threads: [],
       threadRateLimits: input.threadRateLimits,
       providerSnapshot: input.providerSnapshot,
+      fetchProviderData: input.fetchProviderData,
       includeSupplementalData: input.includeSupplementalData,
     });
     return <span />;
@@ -210,51 +247,92 @@ describe("useProviderUsageSummary", () => {
     expect(summary.usageNotice).toBeUndefined();
   });
 
-  it("does not show fallback rows when an explicit provider card snapshot is non-ok", () => {
+  it("keeps an explicit non-ok snapshot authoritative over every cached fallback", () => {
     const queryClient = createQueryClient();
-    queryClient.setQueryData(serverQueryKeys.allProviderUsage("claudeAgent"), []);
-    queryClient.setQueryData(
-      serverQueryKeys.providerUsage("claudeAgent", null),
-      fallbackSnapshot(),
-    );
-
-    const summary = readProviderUsageSummary({
-      queryClient,
-      providerSnapshot: snapshot({ status: "error", detail: "Usage is currently unavailable." }),
-    });
-
-    expect(summary.rateLimits).toEqual([]);
-    expect(summary.usageLines).toEqual([]);
-  });
-
-  it("keeps an explicit composer snapshot authoritative over cached supplemental data", () => {
-    const queryClient = createQueryClient();
-    queryClient.setQueryData(serverQueryKeys.allProviderUsage("claudeAgent"), [
-      snapshot({
-        status: "ok",
-        planName: "Cached plan",
-        limits: [{ window: "Weekly", usedPercent: 70 }],
-      }),
-    ]);
-    queryClient.setQueryData(
-      serverQueryKeys.providerUsage("claudeAgent", null),
-      fallbackSnapshot(),
-    );
+    seedCachedProviderUsage(queryClient, { includeLocalUsage: false });
 
     const summary = readProviderUsageSummary({
       queryClient,
       includeSupplementalData: false,
+      threadRateLimits: threadFallbackRateLimits(),
+      providerSnapshot: snapshot({
+        status: "error",
+        planName: "Authoritative failed plan",
+        detail: "Usage is currently unavailable.",
+      }),
+    });
+
+    expect(summary.rateLimits).toEqual([]);
+    expect(summary.usageLines).toEqual([]);
+    expect(summary.planName).toBe("Authoritative failed plan");
+    expect(summary.snapshotStatus).toBe("error");
+    expect(summary.snapshotDetail).toBe("Usage is currently unavailable.");
+    expect(summary.usageNotice).toBeUndefined();
+  });
+
+  it("exposes only an explicit snapshot when every disabled source has cached data", () => {
+    const queryClient = createQueryClient();
+    seedCachedProviderUsage(queryClient, { includeLocalUsage: false });
+
+    const summary = readProviderUsageSummary({
+      queryClient,
+      includeSupplementalData: false,
+      threadRateLimits: threadFallbackRateLimits(),
       providerSnapshot: snapshot({
         status: "ok",
         planName: "Authoritative plan",
+        detail: "Authoritative detail",
         limits: [{ window: "Weekly", usedPercent: 20 }],
+        usageLines: [{ label: "Authoritative", value: "20%" }],
       }),
     });
 
     expect(summary.rateLimits).toMatchObject([
       { provider: "claudeAgent", limits: [{ window: "Weekly", usedPercent: 20 }] },
     ]);
-    expect(summary.usageLines).toEqual([]);
+    expect(summary.usageLines).toEqual([{ label: "Authoritative", value: "20%" }]);
     expect(summary.planName).toBe("Authoritative plan");
+    expect(summary.snapshotStatus).toBe("ok");
+    expect(summary.snapshotDetail).toBe("Authoritative detail");
+  });
+
+  it("does not leak cached supplemental data while an account-only live snapshot is pending", () => {
+    const queryClient = createQueryClient();
+    seedCachedProviderUsage(queryClient, { includeLocalUsage: true });
+
+    const summary = readProviderUsageSummary({
+      queryClient,
+      includeSupplementalData: false,
+      threadRateLimits: threadFallbackRateLimits(),
+    });
+
+    expect(
+      queryClient.getQueryData(serverQueryKeys.allProviderUsage("claudeAgent", false)),
+    ).toBeUndefined();
+    expect(summary.rateLimits).toEqual([]);
+    expect(summary.usageLines).toEqual([]);
+    expect(summary.planName).toBeNull();
+    expect(summary.snapshotStatus).toBeNull();
+    expect(summary.snapshotDetail).toBeNull();
+    expect(summary.isLoading).toBe(true);
+  });
+
+  it("does not read any cached query when live fetching is disabled without an explicit snapshot", () => {
+    const queryClient = createQueryClient();
+    seedCachedProviderUsage(queryClient, { includeLocalUsage: false });
+
+    const summary = readProviderUsageSummary({
+      queryClient,
+      fetchProviderData: false,
+      includeSupplementalData: false,
+      threadRateLimits: threadFallbackRateLimits(),
+    });
+
+    expect(summary.rateLimits).toEqual([]);
+    expect(summary.usageLines).toEqual([]);
+    expect(summary.planName).toBeNull();
+    expect(summary.snapshotStatus).toBeNull();
+    expect(summary.snapshotDetail).toBeNull();
+    expect(summary.isLoading).toBe(false);
   });
 });
