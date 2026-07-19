@@ -1,17 +1,34 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
 
 import {
+  formatDownstreamGitHubOutput,
   parseJsonCompatibleYaml,
   validateDownstreamState,
   type CommitGraph,
 } from "./lib/downstream-state.ts";
 
-function resolveRepositoryRoot(args: readonly string[]): string {
-  if (args.length === 0) return process.cwd();
-  if (args.length === 2 && args[0] === "--repository-root") return resolve(args[1]!);
-  throw new Error("Usage: node scripts/validate-downstream-state.ts [--repository-root <path>]");
+interface CliOptions {
+  readonly repositoryRoot: string;
+  readonly githubOutputPath: string | null;
+}
+
+function parseCliOptions(args: readonly string[]): CliOptions {
+  let repositoryRoot = process.cwd();
+  let githubOutputPath: string | null = null;
+  for (let index = 0; index < args.length; index += 2) {
+    const option = args[index];
+    const value = args[index + 1];
+    if (!value || (option !== "--repository-root" && option !== "--github-output")) {
+      throw new Error(
+        "Usage: node scripts/validate-downstream-state.ts [--repository-root <path>] [--github-output <path>]",
+      );
+    }
+    if (option === "--repository-root") repositoryRoot = resolve(value);
+    if (option === "--github-output") githubOutputPath = resolve(value);
+  }
+  return { repositoryRoot, githubOutputPath };
 }
 
 function createCommitGraph(repositoryRoot: string): CommitGraph {
@@ -53,7 +70,7 @@ function resolveAssessment(repositoryRoot: string, repositoryPath: string): stri
 }
 
 function main(): void {
-  const repositoryRoot = resolveRepositoryRoot(process.argv.slice(2));
+  const { repositoryRoot, githubOutputPath } = parseCliOptions(process.argv.slice(2));
   const inventoryPath = resolve(repositoryRoot, "docs/downstream/patches.yml");
   const statePath = resolve(repositoryRoot, "docs/downstream/upstream-state.json");
   const inventory = parseJsonCompatibleYaml(
@@ -83,6 +100,13 @@ function main(): void {
   console.log(
     `Downstream state validation passed: ${result.patchCount} patches, ${result.syncCount} accepted sync, authority ${result.lastEffectiveUpstreamSha}.`,
   );
+  if (githubOutputPath !== null && result.lastEffectiveUpstreamSha !== null) {
+    appendFileSync(
+      githubOutputPath,
+      formatDownstreamGitHubOutput(result.lastEffectiveUpstreamSha),
+      "utf8",
+    );
+  }
 }
 
 if (import.meta.main) main();

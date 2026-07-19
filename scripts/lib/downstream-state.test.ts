@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  formatDownstreamGitHubOutput,
   parseJsonCompatibleYaml,
   validateDownstreamState,
   type DownstreamValidationContext,
@@ -180,5 +181,12 @@ describe("downstream state validator", () => {
     expect(() => parseJsonCompatibleYaml("schemaVersion: [", "patches.yml")).toThrow(
       "must contain valid YAML",
     );
+  });
+
+  it("emits the validated release preflight output contract", () => {
+    expect(formatDownstreamGitHubOutput(effectiveSha)).toBe(
+      `absorbed_upstream_sha=${effectiveSha}\n`,
+    );
+    expect(() => formatDownstreamGitHubOutput("short-sha")).toThrow("validated full upstream SHA");
   });
 });

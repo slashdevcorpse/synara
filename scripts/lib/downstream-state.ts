@@ -495,6 +495,13 @@ export function parseJsonCompatibleYaml(contents: string, path: string): unknown
   }
 }
 
+export function formatDownstreamGitHubOutput(lastEffectiveUpstreamSha: string): string {
+  if (!SHA_PATTERN.test(lastEffectiveUpstreamSha)) {
+    throw new Error("Cannot emit GitHub output without a validated full upstream SHA.");
+  }
+  return `absorbed_upstream_sha=${lastEffectiveUpstreamSha}\n`;
+}
+
 export function validateDownstreamState(
   rawInventory: unknown,
   rawState: unknown,
