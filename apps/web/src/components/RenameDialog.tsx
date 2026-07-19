@@ -45,24 +45,64 @@ export function RenameDialog({
   onOpenChange,
   onSave,
 }: RenameDialogProps) {
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogPopup surface="solid" className="max-w-md">
+        <DialogHeader>
+          <DialogTitle>{title}</DialogTitle>
+          {description ? <DialogDescription>{description}</DialogDescription> : null}
+        </DialogHeader>
+        {/* Field state lives below DialogPopup, which unmounts its children
+            after the close transition. Keying by the seed also resets draft,
+            save lock, focus, and event callbacks if the backing title changes
+            while the same popup is still open. Async completion is scoped to
+            that keyed form generation so a replaced form cannot be closed or
+            unlocked by the previous save. */}
+        <RenameDialogForm
+          key={initialValue}
+          initialValue={initialValue}
+          allowEmpty={allowEmpty}
+          placeholder={placeholder}
+          saveLabel={saveLabel}
+          onOpenChange={onOpenChange}
+          onSave={onSave}
+        />
+      </DialogPopup>
+    </Dialog>
+  );
+}
+
+function RenameDialogForm({
+  initialValue,
+  allowEmpty,
+  placeholder,
+  saveLabel,
+  onOpenChange,
+  onSave,
+}: {
+  initialValue: string;
+  allowEmpty: boolean;
+  placeholder: string | undefined;
+  saveLabel: string;
+  onOpenChange: (open: boolean) => void;
+  onSave: (value: string) => Promise<void> | void;
+}) {
   const [value, setValue] = useState(initialValue);
   const [isSaving, setIsSaving] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+  const mountedRef = useRef(true);
 
   useEffect(() => {
-    if (!open) {
-      setIsSaving(false);
-      return;
-    }
-    setValue(initialValue);
+    mountedRef.current = true;
     const frame = window.requestAnimationFrame(() => {
       inputRef.current?.focus();
       inputRef.current?.select();
     });
     return () => {
+      mountedRef.current = false;
       window.cancelAnimationFrame(frame);
     };
-  }, [open, initialValue]);
+  }, []);
 
   const trimmed = value.trim();
   const canSave = (allowEmpty || trimmed.length > 0) && !isSaving;
@@ -72,56 +112,47 @@ export function RenameDialog({
     setIsSaving(true);
     try {
       await onSave(trimmed);
+      if (!mountedRef.current) return;
       onOpenChange(false);
     } catch {
+      if (!mountedRef.current) return;
       setIsSaving(false);
     }
   };
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogPopup surface="solid" className="max-w-md">
-        <DialogHeader>
-          <DialogTitle>{title}</DialogTitle>
-          {description ? <DialogDescription>{description}</DialogDescription> : null}
-        </DialogHeader>
-        <DialogPanel>
-          <form
-            onSubmit={(event) => {
-              event.preventDefault();
-              void handleSubmit();
-            }}
-          >
-            <Input
-              ref={inputRef}
-              size="lg"
-              value={value}
-              placeholder={placeholder}
-              disabled={isSaving}
-              onChange={(event) => setValue(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Escape") {
-                  event.preventDefault();
-                  onOpenChange(false);
-                }
-              }}
-            />
-          </form>
-        </DialogPanel>
-        <DialogFooter>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => onOpenChange(false)}
+    <>
+      <DialogPanel>
+        <form
+          onSubmit={(event) => {
+            event.preventDefault();
+            void handleSubmit();
+          }}
+        >
+          <Input
+            ref={inputRef}
+            size="lg"
+            value={value}
+            placeholder={placeholder}
             disabled={isSaving}
-          >
-            Cancel
-          </Button>
-          <Button size="sm" onClick={() => void handleSubmit()} disabled={!canSave}>
-            {isSaving ? "Saving..." : saveLabel}
-          </Button>
-        </DialogFooter>
-      </DialogPopup>
-    </Dialog>
+            onChange={(event) => setValue(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Escape") {
+                event.preventDefault();
+                onOpenChange(false);
+              }
+            }}
+          />
+        </form>
+      </DialogPanel>
+      <DialogFooter>
+        <Button variant="outline" size="sm" onClick={() => onOpenChange(false)} disabled={isSaving}>
+          Cancel
+        </Button>
+        <Button size="sm" onClick={() => void handleSubmit()} disabled={!canSave}>
+          {isSaving ? "Saving..." : saveLabel}
+        </Button>
+      </DialogFooter>
+    </>
   );
 }

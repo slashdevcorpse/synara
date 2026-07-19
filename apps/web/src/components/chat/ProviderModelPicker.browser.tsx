@@ -190,6 +190,9 @@ describe("ProviderModelPicker", () => {
         expect(text).toContain("Codex");
         expect(text).toContain("Claude");
         expect(text).not.toContain("Claude Sonnet 4.6");
+        expect(
+          document.querySelector('[role="menu"]')?.classList.contains("composer-picker-menu-fixed"),
+        ).toBe(true);
       });
     } finally {
       await mounted.cleanup();

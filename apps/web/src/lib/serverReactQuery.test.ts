@@ -2,7 +2,18 @@
 // Purpose: Locks down server React Query polling profiles and cache options.
 // Layer: Web data-fetching unit tests
 
-import { describe, expect, it } from "vitest";
+import { QueryClient } from "@tanstack/react-query";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+const mocks = vi.hoisted(() => ({
+  listProviderUsage: vi.fn(),
+}));
+
+vi.mock("~/nativeApi", () => ({
+  ensureNativeApi: () => ({
+    server: { listProviderUsage: mocks.listProviderUsage },
+  }),
+}));
 
 import {
   LOCAL_SERVERS_VISIBLE_REFETCH_INTERVAL_MS,
@@ -12,6 +23,10 @@ import {
   serverQueryKeys,
   sidebarLocalServersQueryOptions,
 } from "./serverReactQuery";
+
+afterEach(() => {
+  vi.clearAllMocks();
+});
 
 describe("serverLocalServersQueryOptions", () => {
   it("uses the visible polling interval by default", () => {
@@ -78,6 +93,30 @@ describe("serverAllProviderUsageQueryOptions", () => {
     expect(scoped.queryKey).toEqual(serverQueryKeys.allProviderUsage("claudeAgent"));
     expect(accountOnly.queryKey).toEqual(serverQueryKeys.allProviderUsage("claudeAgent", false));
     expect(all.queryKey).toEqual(serverQueryKeys.allProviderUsage(null));
+  });
+
+  it("forwards the account-only flag through the query function", async () => {
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    mocks.listProviderUsage.mockResolvedValue([]);
+
+    try {
+      await queryClient.fetchQuery(
+        serverAllProviderUsageQueryOptions({
+          provider: "claudeAgent",
+          includeLocalUsage: false,
+        }),
+      );
+    } finally {
+      queryClient.clear();
+    }
+
+    expect(mocks.listProviderUsage).toHaveBeenCalledOnce();
+    expect(mocks.listProviderUsage).toHaveBeenCalledWith({
+      provider: "claudeAgent",
+      includeLocalUsage: false,
+    });
   });
 });
 

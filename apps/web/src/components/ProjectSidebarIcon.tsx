@@ -25,31 +25,34 @@ export function ProjectSidebarIcon({
   glyphClassName?: string;
 }) {
   const faviconSrc = resolveProjectFaviconUrl(cwd);
-  const [hasFavicon, setHasFavicon] = useState<boolean>(
-    () => projectFaviconPresence.get(faviconSrc) === true,
-  );
+  // Initial mount seeds from the cache; later cwd changes read the current
+  // source's cached result below in the same render, so the probe effect never
+  // needs a synchronous setState.
+  const [probe, setProbe] = useState<{ src: string; present: boolean } | null>(() => {
+    const cached = projectFaviconPresence.get(faviconSrc);
+    return cached === undefined ? null : { src: faviconSrc, present: cached };
+  });
+  const cachedPresence = projectFaviconPresence.get(faviconSrc);
+  const hasFavicon =
+    probe !== null && probe.src === faviconSrc ? probe.present : cachedPresence === true;
   const FolderGlyph = expanded ? FolderOpen : FolderClosed;
 
-  // Probe with Image() so Electron/file-origin behaves like the actual visible <img>.
+  // Probe with Image() so Electron/file-origin behaves like the actual visible
+  // <img>. Runs even on a module-cache hit (the browser cache makes the reload
+  // instant) so the load/error handlers stay the only state writers.
   useEffect(() => {
-    const cached = projectFaviconPresence.get(faviconSrc);
-    if (cached !== undefined) {
-      setHasFavicon(cached);
-      return;
-    }
-
     let cancelled = false;
     const image = new Image();
     const handleLoad = () => {
       projectFaviconPresence.set(faviconSrc, true);
       if (!cancelled) {
-        setHasFavicon(true);
+        setProbe({ src: faviconSrc, present: true });
       }
     };
     const handleError = () => {
       projectFaviconPresence.set(faviconSrc, false);
       if (!cancelled) {
-        setHasFavicon(false);
+        setProbe({ src: faviconSrc, present: false });
       }
     };
 
@@ -76,7 +79,7 @@ export function ProjectSidebarIcon({
           className="absolute -right-1 -bottom-1 size-3 rounded-[4px] object-contain shadow-sm"
           onError={() => {
             projectFaviconPresence.set(faviconSrc, false);
-            setHasFavicon(false);
+            setProbe({ src: faviconSrc, present: false });
           }}
         />
       ) : null}

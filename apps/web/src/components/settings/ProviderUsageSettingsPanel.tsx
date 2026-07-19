@@ -10,7 +10,6 @@ import {
   providerUsageNeedsAuthDetail,
 } from "@synara/shared/providerUsage";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useMemo } from "react";
 
 import { useAppSettings } from "~/appSettings";
 import { ProviderIcon } from "~/components/ProviderIcon";
@@ -75,10 +74,7 @@ function ProviderUsageCard({ snapshot }: { snapshot: ServerProviderUsageSnapshot
     fetchProviderData: false,
     includeSupplementalData: false,
   });
-  const meterRows = useMemo(
-    () => deriveProviderUsageDisplayRows(usageSummary.rateLimits),
-    [usageSummary.rateLimits],
-  );
+  const meterRows = deriveProviderUsageDisplayRows(usageSummary.rateLimits);
   const usageLines = usageSummary.usageLines;
 
   const hasUsage = meterRows.length > 0 || usageLines.length > 0;
@@ -152,12 +148,12 @@ export function completeProviderUsageRefresh(
 export function ProviderUsageSettingsPanel() {
   const queryClient = useQueryClient();
   const { settings, updateSettings } = useAppSettings();
-  const usageQuery = useQuery(serverAllProviderUsageQueryOptions());
+  const usageQuery = useQuery(serverAllProviderUsageQueryOptions({ includeLocalUsage: false }));
   const refreshMutation = useMutation({
-    mutationFn: () => fetchAllProviderUsage({ forceRefresh: true }),
+    mutationFn: () => fetchAllProviderUsage({ forceRefresh: true, includeLocalUsage: false }),
     onSuccess: (data) => {
       queryClient.setQueryData<readonly ServerProviderUsageSnapshot[]>(
-        serverQueryKeys.allProviderUsage(),
+        serverQueryKeys.allProviderUsage(null, false),
         completeProviderUsageRefresh(data),
       );
     },
@@ -165,9 +161,7 @@ export function ProviderUsageSettingsPanel() {
 
   // Always render a card per supported provider, ordered consistently, even if the batch
   // omitted one (e.g. a transient server error) — fall back to an "unavailable" placeholder.
-  const cards = useMemo(() => {
-    return completeProviderUsageRefresh(usageQuery.data ?? []);
-  }, [usageQuery.data]);
+  const cards = completeProviderUsageRefresh(usageQuery.data ?? []);
 
   const showInitialLoading = usageQuery.isPending && !usageQuery.data;
 
