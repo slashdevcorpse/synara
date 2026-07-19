@@ -54,11 +54,13 @@ import {
   resolveSynaraDesktopFlavor,
   synaraDesktopIdentity,
 } from "@synara/shared/desktopIdentity";
+import { renderPackagedDesktopIdentityProof } from "@synara/shared/desktopIdentityProof";
 import { NetService } from "@synara/shared/Net";
 import { RotatingFileSink } from "@synara/shared/logging";
 import { ensureStaticSnapshot, findAsarArchivePath } from "@synara/shared/staticSnapshot";
 import { isBackendReadinessAborted, waitForHttpReady } from "./backendReadiness";
 import { resolveBackendNodeArgs } from "./backendNodeOptions";
+import { stopWindowsBackendAndWait } from "./backendShutdown";
 import {
   bundleSignatureFromStats,
   isBundleStable,
@@ -155,6 +157,7 @@ import {
 import { normalizeDesktopWsUrl, resolveDesktopWsUrlFromEnv } from "./desktopWsBridge";
 import {
   repairBrowserProfileFromBridgeManifest,
+  resolveDesktopBackendHomePath,
   resolveDesktopAppDataBase,
   resolveDesktopUserDataPath,
 } from "./desktopUserDataProfile";
@@ -188,14 +191,22 @@ syncShellEnvironment();
 const IPC = DESKTOP_IPC_CHANNELS;
 const MAX_CLIPBOARD_IMAGE_DATA_URL_LENGTH = 16 * 1024 * 1024;
 const isDevelopment = Boolean(process.env.VITE_DEV_SERVER_URL);
+declare const __SYNARA_PACKAGED_DESKTOP_FLAVOR__: string;
+declare const __SYNARA_PACKAGED_UPDATES_DISABLED__: boolean;
 const desktopFlavor = resolveSynaraDesktopFlavor({
   isDevelopment,
-  requestedFlavor: process.env.SYNARA_DESKTOP_FLAVOR,
+  requestedFlavor: app.isPackaged ? undefined : process.env.SYNARA_DESKTOP_FLAVOR,
+  packagedFlavor: app.isPackaged ? __SYNARA_PACKAGED_DESKTOP_FLAVOR__ : undefined,
 });
 const desktopIdentity = synaraDesktopIdentity(desktopFlavor);
-const BASE_DIR =
-  process.env.SYNARA_HOME?.trim() ||
-  Path.join(OS.homedir(), desktopIdentity.defaultHomeDirectoryName);
+const packagedUpdatesDisabled = app.isPackaged && __SYNARA_PACKAGED_UPDATES_DISABLED__;
+const BASE_DIR = resolveDesktopBackendHomePath({
+  homeDirectory: OS.homedir(),
+  defaultHomeDirectoryName: desktopIdentity.defaultHomeDirectoryName,
+  configuredHomeDirectory: process.env.SYNARA_HOME,
+  forbiddenHomeDirectories:
+    desktopIdentity.flavor === "super" ? [Path.join(OS.homedir(), ".synara")] : [],
+});
 const STATE_DIR = Path.join(BASE_DIR, "userdata");
 const DESKTOP_WINDOW_STATE_PATH = Path.join(STATE_DIR, "desktop-window-state.json");
 const DESKTOP_SCHEME = desktopIdentity.scheme;
@@ -208,6 +219,7 @@ const LOG_DIR = Path.join(STATE_DIR, "logs");
 const LOG_FILE_MAX_BYTES = 10 * 1024 * 1024;
 const LOG_FILE_MAX_FILES = 10;
 const APP_RUN_ID = Crypto.randomBytes(6).toString("hex");
+const DESKTOP_BACKEND_SHUTDOWN_TOKEN = Crypto.randomBytes(32).toString("hex");
 // Electron's single-instance lock is scoped through userData on Windows/Linux.
 // Set the flavor-specific profile first so Stable, Dev, and Canary never contend
 // for the same lock even when they use the same Electron executable.
@@ -261,6 +273,7 @@ let desktopShutdownPromise: Promise<void> | null = null;
 let desktopStartupBlockedForMigrationRecovery = false;
 let desktopShutdownComplete = false;
 let desktopProtocolRegistered = false;
+let appIdentityConfigured = false;
 let aboutCommitHashCache: string | null | undefined;
 let appUpdateYmlCache: Record<string, string> | null | undefined;
 let desktopLogSink: RotatingFileSink | null = null;
@@ -523,6 +536,12 @@ function ensureInitialBackendWindowOpen(baseUrl: string): void {
       backendInitialWindowOpenInFlight = promise;
     },
     waitForBackendWindowReady,
+    onReady: () => {
+      if (app.isPackaged && process.env.SYNARA_DESKTOP_QUALIFICATION_EXIT_AFTER_STARTUP === "1") {
+        writeDesktopLogHeader("packaged startup qualification exit requested");
+        requestGracefulAppQuit("packaged startup qualification");
+      }
+    },
     writeLog: writeDesktopLogHeader,
     isReadinessAborted: isBackendReadinessAborted,
     formatErrorMessage,
@@ -1148,6 +1167,10 @@ function handleFatalStartupError(stage: string, error: unknown): void {
     isQuitting = true;
     dialog.showErrorBox("Synara failed to start", `Stage: ${stage}\n${message}${detail}`);
   }
+  if (process.platform === "win32") {
+    requestGracefulAppQuit(`fatal startup (${stage})`);
+    return;
+  }
   stopBackend();
   restoreStdIoCapture?.();
   app.quit();
@@ -1264,13 +1287,18 @@ function hasConfiguredUpdateFeed(): boolean {
 }
 
 function resolveAutoUpdateDisabledReason(): string | null {
+  if (desktopIdentity.updateStrategy === "manual") {
+    return "Super Synara uses manual updates only. Download and verify a newer unsigned prerelease from the Super Synara GitHub releases page.";
+  }
   return getAutoUpdateDisabledReason({
     isDevelopment,
     isPackaged: app.isPackaged,
     platform: process.platform,
     appImage: process.env.APPIMAGE,
     disabledByEnv:
-      desktopIdentity.usesScriptedUpdates || process.env.SYNARA_DISABLE_AUTO_UPDATE === "1",
+      desktopIdentity.usesScriptedUpdates ||
+      packagedUpdatesDisabled ||
+      process.env.SYNARA_DISABLE_AUTO_UPDATE === "1",
     hasUpdateFeedConfig: hasConfiguredUpdateFeed(),
   });
 }
@@ -1661,6 +1689,9 @@ function resolveUserDataPath(): string {
 }
 
 function repairBrowserProfileBeforeElectronReady(userDataPath: string): void {
+  if (!desktopIdentity.allowsProfileBridgeRepair) {
+    return;
+  }
   const browserProfileRepair = repairBrowserProfileFromBridgeManifest(userDataPath);
   if (browserProfileRepair.status === "repaired") {
     console.info("[desktop] Completed Synara browser profile bridge repair", {
@@ -1685,11 +1716,38 @@ function configureAppIdentity(): void {
     applicationVersion: app.getVersion(),
     version: commitHash ?? "unknown",
     copyright: `© ${new Date().getFullYear()} Emanuele Di Pietro`,
+    ...(desktopIdentity.downstreamRepositoryUrl
+      ? {
+          website: desktopIdentity.downstreamRepositoryUrl,
+          credits:
+            "Unofficial downstream of Synara, distributed under the MIT License. Super Synara prereleases are unsigned and use manual updates only.",
+        }
+      : {}),
   });
 
   if (process.platform === "win32") {
     app.setAppUserModelId(APP_USER_MODEL_ID);
   }
+  appIdentityConfigured = true;
+}
+
+function writePackagedDesktopIdentityProof(): void {
+  if (!app.isPackaged) return;
+  if (!appIdentityConfigured || !desktopProtocolRegistered) {
+    throw new Error("Packaged desktop identity proof requested before identity setup completed.");
+  }
+  writeDesktopLogHeader(
+    renderPackagedDesktopIdentityProof({
+      flavor: desktopIdentity.flavor,
+      appUserModelId: process.platform === "win32" ? APP_USER_MODEL_ID : null,
+      bundleId: desktopIdentity.bundleId,
+      internalProtocolScheme: DESKTOP_SCHEME,
+      internalProtocolRegistered: true,
+      userDataDirectoryName: desktopIdentity.userDataDirectoryName,
+      userDataPath: app.getPath("userData"),
+      backendHomePath: BASE_DIR,
+    }),
+  );
 }
 
 // The packaged bundle icon is a solid, pre-rounded ICNS so Tahoe does not reinterpret
@@ -2724,6 +2782,7 @@ function backendEnv(): NodeJS.ProcessEnv {
     SYNARA_PORT: String(backendPort),
     SYNARA_HOME: BASE_DIR,
     SYNARA_AUTH_TOKEN: backendAuthToken,
+    SYNARA_DESKTOP_SHUTDOWN_TOKEN: DESKTOP_BACKEND_SHUTDOWN_TOKEN,
   };
 }
 
@@ -2866,6 +2925,18 @@ async function stopBackendAndWaitForExit(timeoutMs = BACKEND_SHUTDOWN_TIMEOUT_MS
   if (!child) return;
   const backendChild = child;
   if (backendChild.exitCode !== null || backendChild.signalCode !== null) return;
+
+  if (process.platform === "win32") {
+    const forceKillDelayMs = Math.min(BACKEND_FORCE_KILL_DELAY_MS, Math.max(0, timeoutMs - 500));
+    await stopWindowsBackendAndWait({
+      child: backendChild,
+      backendHttpUrl,
+      shutdownToken: DESKTOP_BACKEND_SHUTDOWN_TOKEN,
+      forceKillDelayMs,
+      timeoutMs,
+    });
+    return;
+  }
 
   await new Promise<void>((resolve) => {
     let settled = false;
@@ -3644,6 +3715,7 @@ if (hasSingleInstanceLock) {
         }
         throw error;
       }
+      writePackagedDesktopIdentityProof();
       startBundleSwapWatcher();
       void bootstrap().catch((error) => {
         handleFatalStartupError("bootstrap", error);

@@ -1,0 +1,607 @@
+// FILE: super-synara-workflow-contract.ts
+// Purpose: Guards the manual unsigned prerelease and read-only macOS inventory workflows.
+// Layer: Release workflow contract
+
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+
+import { parse as parseYaml } from "yaml";
+
+type UnknownRecord = Record<string, unknown>;
+
+const PRERELEASE_WINDOWS_REQUIRED_COMMANDS = [
+  "bun run brand:check",
+  "bun run --cwd packages/shared test src/desktopIdentity.test.ts src/desktopIdentityProof.test.ts src/windowsCertificate.test.ts",
+  "bun run --cwd apps/desktop test src/backendShutdown.test.ts src/backendShutdown.windows.integration.test.ts",
+  "bun run --cwd scripts test check-brand-identity.test.ts verify-packaged-desktop-startup.test.ts lib/desktop-artifact-policy.test.ts lib/windows-authenticode.test.ts lib/windows-installer-qualification.test.ts lib/release-artifact-provenance.test.ts lib/super-synara-release-admission.test.ts lib/super-synara-workflow-contract.test.ts",
+  "node scripts/verify-workflow-contracts.ts",
+] as const;
+const PRERELEASE_MACOS_REQUIRED_COMMANDS = [
+  "bun run brand:check",
+  "bun run --cwd apps/desktop test",
+  "bun run --cwd packages/shared test src/desktopIdentity.test.ts src/desktopIdentityProof.test.ts",
+  "bun run --cwd scripts test lib/desktop-artifact-policy.test.ts verify-packaged-desktop-startup.test.ts lib/super-synara-macos-signatures.test.ts lib/release-artifact-provenance.test.ts lib/super-synara-release-admission.test.ts lib/super-synara-workflow-contract.test.ts",
+] as const;
+
+function isRecord(value: unknown): value is UnknownRecord {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function normalizeShellCommand(command: string): string {
+  return command.replace(/\s+/g, " ").trim();
+}
+
+function executableShellLines(command: string): readonly string[] {
+  return command
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !line.startsWith("#"));
+}
+
+function invokesRootTest(command: string): boolean {
+  return executableShellLines(command).some((line) =>
+    /(?:^|(?:&&|\|\||;)\s*)bun run test(?=$|\s|&&|\|\||;)/.test(line),
+  );
+}
+
+function masksShellFailure(command: string): boolean {
+  return executableShellLines(command).some(
+    (line) =>
+      /(?:\|\||;)\s*(?:true|:|exit\s+0)(?=\s*(?:[;#]|$))/.test(line) ||
+      /(?:^|(?:&&|\|\||;)\s*)exit\s+0(?=\s*(?:[;#]|$))/.test(line),
+  );
+}
+
+interface WorkflowRunStep {
+  readonly command: string;
+  readonly continueOnError: unknown;
+  readonly condition: unknown;
+  readonly index: number;
+  readonly rawCommand: string;
+}
+
+function publicationJobs(workflowText: string): UnknownRecord {
+  const workflow = parseYaml(workflowText, {
+    strict: true,
+    uniqueKeys: true,
+  }) as unknown;
+  if (!isRecord(workflow) || !isRecord(workflow.jobs)) {
+    throw new Error("Publication workflow must define jobs.");
+  }
+  return workflow.jobs;
+}
+
+function publicationJob(jobs: UnknownRecord, jobName: string): UnknownRecord {
+  const job = jobs[jobName];
+  if (!isRecord(job) || !Array.isArray(job.steps)) {
+    throw new Error(`Publication workflow must define the ${jobName} job with steps.`);
+  }
+  return job;
+}
+
+function nativeJobRunSteps(jobs: UnknownRecord, jobName: string): readonly WorkflowRunStep[] {
+  const job = publicationJob(jobs, jobName);
+  const steps = job.steps;
+  if (!Array.isArray(steps)) {
+    throw new Error(`Publication workflow must define the ${jobName} job with steps.`);
+  }
+  return steps
+    .map((step, index): WorkflowRunStep | null => {
+      if (!isRecord(step) || typeof step.run !== "string") return null;
+      return {
+        command: normalizeShellCommand(step.run),
+        continueOnError: step["continue-on-error"],
+        condition: step.if,
+        index,
+        rawCommand: step.run,
+      };
+    })
+    .filter((step): step is WorkflowRunStep => step !== null);
+}
+
+function hasExecutableLine(command: string, expectedStart: string): boolean {
+  return executableShellLines(command).some(
+    (line) => line === expectedStart || line.startsWith(`${expectedStart} `),
+  );
+}
+
+function verifyRootTestOwnership(jobs: UnknownRecord): void {
+  const occurrences: Array<{
+    readonly jobName: string;
+    readonly step: WorkflowRunStep;
+  }> = [];
+  for (const jobName of Object.keys(jobs)) {
+    const job = jobs[jobName];
+    if (!isRecord(job) || !Array.isArray(job.steps)) continue;
+    for (const step of nativeJobRunSteps(jobs, jobName)) {
+      if (invokesRootTest(step.rawCommand)) occurrences.push({ jobName, step });
+    }
+  }
+  const preflight = occurrences.filter(({ jobName }) => jobName === "preflight");
+  const barePreflight = preflight.filter(({ step }) => step.command === "bun run test");
+  if (barePreflight.length !== 1) {
+    throw new Error("Publication workflow preflight must run exactly one bare bun run test suite.");
+  }
+  const [preflightSuite] = barePreflight;
+  if (
+    preflightSuite!.step.condition !== undefined ||
+    (preflightSuite!.step.continueOnError !== undefined &&
+      preflightSuite!.step.continueOnError !== false)
+  ) {
+    throw new Error(
+      "Publication workflow preflight bare bun run test must be unconditional and fail closed.",
+    );
+  }
+  const additionalInvocation = occurrences.find(
+    ({ jobName, step }) => jobName !== "preflight" || step.command !== "bun run test",
+  );
+  if (additionalInvocation) {
+    throw new Error(
+      `Publication workflow ${additionalInvocation.jobName} must not own an additional or chained monorepo-wide bun run test suite.`,
+    );
+  }
+}
+
+function verifyNativeJobCommands(
+  job: UnknownRecord,
+  jobName: string,
+  expectedRunner: string,
+  steps: readonly WorkflowRunStep[],
+  requiredCommands: readonly string[],
+  buildCommandStart: string,
+): void {
+  if (job["runs-on"] !== expectedRunner) {
+    throw new Error(`Publication workflow ${jobName} must run on ${expectedRunner}.`);
+  }
+  if (
+    job.if !== undefined ||
+    (job["continue-on-error"] !== undefined && job["continue-on-error"] !== false)
+  ) {
+    throw new Error(`Publication workflow ${jobName} job must be unconditional and fail closed.`);
+  }
+  const buildSteps = steps.filter((step) => hasExecutableLine(step.rawCommand, buildCommandStart));
+  if (buildSteps.length !== 1) {
+    throw new Error(
+      `Publication workflow ${jobName} must execute exactly one native build command starting with ${buildCommandStart}.`,
+    );
+  }
+  const [buildStep] = buildSteps;
+  if (
+    buildStep!.condition !== undefined ||
+    (buildStep!.continueOnError !== undefined && buildStep!.continueOnError !== false)
+  ) {
+    throw new Error(
+      `Publication workflow ${jobName} native build must be unconditional and fail closed.`,
+    );
+  }
+  if (masksShellFailure(buildStep!.rawCommand)) {
+    throw new Error(`Publication workflow ${jobName} native build must not mask shell failures.`);
+  }
+  for (const command of requiredCommands) {
+    const matches = steps.filter((step) => step.command === command);
+    if (matches.length !== 1) {
+      throw new Error(
+        `Publication workflow ${jobName} must run exact native gate command: ${command}.`,
+      );
+    }
+    const [step] = matches;
+    if (
+      step!.condition !== undefined ||
+      (step!.continueOnError !== undefined && step!.continueOnError !== false)
+    ) {
+      throw new Error(
+        `Publication workflow ${jobName} native gate must be unconditional and fail closed: ${command}.`,
+      );
+    }
+    if (step!.index >= buildStep!.index) {
+      throw new Error(
+        `Publication workflow ${jobName} native gate must run before the native build: ${command}.`,
+      );
+    }
+  }
+  if (steps.some((step) => invokesRootTest(step.rawCommand))) {
+    throw new Error(
+      `Publication workflow ${jobName} must not run the monorepo-wide bun run test suite.`,
+    );
+  }
+}
+
+function requireText(haystack: string, needle: string, message: string): void {
+  if (!haystack.includes(needle)) throw new Error(message);
+}
+
+function prohibitText(haystack: string, needle: string, message: string): void {
+  if (haystack.includes(needle)) throw new Error(message);
+}
+
+function continuedShellCommands(workflow: string, commandNeedle: string): ReadonlyArray<string> {
+  const lines = workflow.split("\n");
+  const commands: string[] = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    if (!lines[index]?.includes(commandNeedle)) continue;
+    const commandLines = [lines[index]!.trim()];
+    while (commandLines.at(-1)?.endsWith("\\")) {
+      index += 1;
+      if (index >= lines.length) break;
+      commandLines.push(lines[index]!.trim());
+    }
+    commands.push(commandLines.join("\n"));
+  }
+  return commands;
+}
+
+function requirePinnedActions(workflow: string, label: string): void {
+  const uses = [...workflow.matchAll(/^\s*uses:\s*(\S+)/gm)].map((match) => match[1]!);
+  if (uses.length === 0) throw new Error(`${label} must use explicitly pinned actions.`);
+  for (const action of uses) {
+    if (!/^[^@\s]+@[0-9a-f]{40}$/.test(action)) {
+      throw new Error(`${label} action is not pinned to a full commit: ${action}.`);
+    }
+  }
+}
+
+export function verifySuperSynaraWorkflowText(main: string, audit: string): void {
+  main = main.replaceAll("\r\n", "\n");
+  audit = audit.replaceAll("\r\n", "\n");
+  for (const [label, workflow] of [
+    ["Publication workflow", main],
+    ["Audit workflow", audit],
+  ] as const) {
+    requireText(workflow, "workflow_dispatch:", `${label} must be manual-only.`);
+    prohibitText(workflow, "\n  push:", `${label} must not have a push trigger.`);
+    prohibitText(workflow, "pull_request:", `${label} must not have a pull-request trigger.`);
+    requireText(workflow, "cancel-in-progress: false", `${label} must serialize reruns.`);
+    requirePinnedActions(workflow, label);
+    prohibitText(workflow, "secrets.", `${label} must not consume signing or publication secrets.`);
+    prohibitText(workflow, "id-token:", `${label} must not request identity-token permission.`);
+  }
+
+  for (const job of ["preflight", "reserve_tag", "windows_x64", "macos_arm64", "publish"]) {
+    requireText(main, `\n  ${job}:`, `Publication workflow is missing the ${job} job.`);
+  }
+  const jobs = publicationJobs(main);
+  verifyRootTestOwnership(jobs);
+  const preflightJob = publicationJob(jobs, "preflight");
+  if (preflightJob["runs-on"] !== "ubuntu-24.04") {
+    throw new Error("Publication workflow preflight must run on ubuntu-24.04.");
+  }
+  if (
+    preflightJob.if !== undefined ||
+    (preflightJob["continue-on-error"] !== undefined && preflightJob["continue-on-error"] !== false)
+  ) {
+    throw new Error("Publication workflow preflight job must be unconditional and fail closed.");
+  }
+  const windowsJob = publicationJob(jobs, "windows_x64");
+  const macosJob = publicationJob(jobs, "macos_arm64");
+  verifyNativeJobCommands(
+    windowsJob,
+    "windows_x64",
+    "windows-2022",
+    nativeJobRunSteps(jobs, "windows_x64"),
+    PRERELEASE_WINDOWS_REQUIRED_COMMANDS,
+    "bun run dist:desktop:super:win --",
+  );
+  verifyNativeJobCommands(
+    macosJob,
+    "macos_arm64",
+    "macos-15",
+    nativeJobRunSteps(jobs, "macos_arm64"),
+    PRERELEASE_MACOS_REQUIRED_COMMANDS,
+    "bun run dist:desktop:super:mac --",
+  );
+  const macosBuildStep = nativeJobRunSteps(jobs, "macos_arm64").find((step) =>
+    hasExecutableLine(step.rawCommand, "bun run dist:desktop:super:mac --"),
+  );
+  if (
+    !macosBuildStep ||
+    !hasExecutableLine(macosBuildStep.rawCommand, 'test "$(uname -m)" = arm64')
+  ) {
+    throw new Error(
+      "macOS publication must prove arm64 host architecture in the native build step.",
+    );
+  }
+  requireText(
+    main,
+    "environment: super-synara-prerelease",
+    "Publication must use the protected Super Synara environment.",
+  );
+  requireText(
+    main,
+    "confirm_unsigned:",
+    "Unsigned public publication must require an explicit confirmation input.",
+  );
+  prohibitText(
+    main,
+    "confirm_unsigned_publication:",
+    "Publication must use the plan-locked confirmation input name.",
+  );
+  requireText(main, "\n      tag:\n", "Publication dispatch must require an explicit tag input.");
+  requireText(
+    main,
+    '[[ "$TAG" == "super-v$VERSION" ]]',
+    "Publication must fail unless the explicit tag matches the version.",
+  );
+  requireText(
+    main,
+    "group: super-synara-prerelease",
+    "Publication must use the plan-locked concurrency group.",
+  );
+  requireText(
+    main,
+    "REF_PROTECTED: ${{ github.ref_protected }}",
+    "Publication must bind GitHub protected-ref state.",
+  );
+  requireText(
+    main,
+    '[[ "$REF_PROTECTED" == "true" ]]',
+    "Publication must fail closed unless the dispatch ref is protected.",
+  );
+  requireText(
+    main,
+    "cd apps/web && ./node_modules/.bin/playwright install --with-deps chromium",
+    "Browser preflight must use the workspace-local Playwright binary.",
+  );
+  requireText(
+    main,
+    'node scripts/validate-downstream-state.ts --github-output "$GITHUB_OUTPUT"',
+    "Publication must consume the exact Phase 0 GitHub output interface.",
+  );
+  requireText(
+    main,
+    "absorbed_upstream_sha: ${{ steps.downstream.outputs.absorbed_upstream_sha }}",
+    "Publication must bind the absorbed upstream SHA from Phase 0.",
+  );
+  requireText(
+    main,
+    "verify-super-synara-macos-allowlist.ts",
+    "Preflight must reject a missing or placeholder macOS signature policy.",
+  );
+  for (const variable of [
+    "SUPER_SYNARA_MAX_WINDOWS_BYTES",
+    "SUPER_SYNARA_MAX_MACOS_BYTES",
+    "SUPER_SYNARA_MAX_TOTAL_BYTES",
+  ]) {
+    requireText(main, variable, `Publication must bind repository byte cap ${variable}.`);
+  }
+  for (const phase of [
+    "preflight",
+    "reserve-tag",
+    "before-draft",
+    "after-draft",
+    "before-publish",
+  ]) {
+    requireText(main, `--phase ${phase}`, `Publication must validate GitHub state at ${phase}.`);
+  }
+  requireText(main, "SYNARA_DESKTOP_FLAVOR: super", "Native builds must select Super flavor.");
+  requireText(
+    main,
+    'SYNARA_DESKTOP_DISABLE_UPDATES: "1"',
+    "Native builds must disable the updater.",
+  );
+  requireText(
+    main,
+    "bun run dist:desktop:super:win --",
+    "Windows publication must use the isolated Super packaging entry point.",
+  );
+  for (const qualificationNeedle of [
+    "select-upstream-synara-release.ts",
+    "--repo Emanuele-web04/synara",
+    "select-previous-super-synara-release.ts",
+    "steps.previous_release.outputs.found == 'true'",
+    "qualify-super-synara-windows-installer.ts",
+    '"--upstream-installer", $env:UPSTREAM_INSTALLER',
+    '"--previous-installer", $env:PREVIOUS_INSTALLER',
+    '"--report", (Join-Path $env:RUNNER_TEMP "windows-installer-qualification.json")',
+    '--windows-qualification-report "$qualification_report"',
+  ]) {
+    requireText(
+      main,
+      qualificationNeedle,
+      `Windows installer qualification contract is missing ${qualificationNeedle}.`,
+    );
+  }
+  if ((main.match(/--current-version \$env:VERSION/g)?.length ?? 0) < 2) {
+    throw new Error(
+      "Windows qualification must bind both upstream-core and previous-release selection to the requested Super version.",
+    );
+  }
+  const packagedStartupCommands = continuedShellCommands(
+    main,
+    "node scripts/verify-packaged-desktop-startup.ts",
+  );
+  if (packagedStartupCommands.length !== 2) {
+    throw new Error("Publication must run exactly two packaged startup verifications.");
+  }
+  for (const command of packagedStartupCommands) {
+    requireText(
+      command,
+      "--flavor super",
+      "Packaged startup verification must select Super flavor.",
+    );
+  }
+  const packagedStartupIndex = main.indexOf("verify-packaged-desktop-startup.ts");
+  const installerQualificationIndex = main.indexOf("qualify-super-synara-windows-installer.ts");
+  if (packagedStartupIndex < 0 || installerQualificationIndex <= packagedStartupIndex) {
+    throw new Error(
+      "Windows installer qualification must run after packaged startup verification.",
+    );
+  }
+  const windowsProvenanceIndex = main.indexOf(
+    "Write final Windows provenance from native qualification",
+  );
+  const windowsUploadIndex = main.indexOf("Upload exact Windows lane");
+  if (
+    windowsProvenanceIndex <= installerQualificationIndex ||
+    windowsUploadIndex <= windowsProvenanceIndex
+  ) {
+    throw new Error(
+      "Windows provenance must consume native qualification before the exact lane is uploaded.",
+    );
+  }
+  const windowsUploadBlock = main.slice(
+    windowsUploadIndex,
+    main.indexOf("\n  macos_arm64:", windowsUploadIndex),
+  );
+  prohibitText(
+    windowsUploadBlock,
+    "windows-installer-qualification.json",
+    "The transient Windows qualification report must not be uploaded.",
+  );
+  requireText(
+    main,
+    "bun run dist:desktop:super:mac --",
+    "macOS publication must use the isolated Super packaging entry point.",
+  );
+  prohibitText(main, "--desktop-flavor", "Publication must not use the superseded flavor flag.");
+  const mainCleanlinessChecks =
+    main.match(/node scripts\/verify-release-worktree-clean\.ts/g)?.length ?? 0;
+  if (mainCleanlinessChecks < 7) {
+    throw new Error(
+      "Publication must prove source cleanliness after installs, builds, and staging.",
+    );
+  }
+  requireText(
+    main,
+    "verify-release-worktree-clean.ts release-build release-publish",
+    "Native lanes must admit only their declared build and publication outputs.",
+  );
+  requireText(
+    main,
+    "verify-release-worktree-clean.ts release-stage release-redownload",
+    "Publication must recheck source cleanliness after release staging.",
+  );
+  requireText(
+    main,
+    "collect-super-synara-macos-signatures.ts",
+    "macOS publication must collect signature evidence.",
+  );
+  const admissionCommands = continuedShellCommands(
+    main,
+    "node scripts/collect-super-synara-macos-signatures.ts",
+  );
+  if (admissionCommands.length !== 1 || !admissionCommands[0]!.includes('--dmg "$disk_image"')) {
+    throw new Error("macOS publication signature admission must inspect the exact final DMG.");
+  }
+  prohibitText(
+    admissionCommands[0]!,
+    "--zip",
+    "macOS publication signature admission must not rely on ZIP-only evidence.",
+  );
+  requireText(main, "--mode admit", "macOS publication must use fail-closed admission mode.");
+  requireText(
+    main,
+    "prepare-super-synara-release.ts prepare",
+    "Publication must build the exact admitted release set.",
+  );
+  requireText(
+    main,
+    "prepare-super-synara-release.ts verify",
+    "Publication must revalidate admitted bytes before making the draft public.",
+  );
+  const releaseAdmissionCommands = continuedShellCommands(
+    main,
+    "node scripts/prepare-super-synara-release.ts",
+  );
+  if (
+    releaseAdmissionCommands.length !== 2 ||
+    releaseAdmissionCommands.some(
+      (command) =>
+        !command.includes(
+          "--mac-signature-allowlist scripts/super-synara-macos-signature-allowlist.json",
+        ),
+    )
+  ) {
+    throw new Error(
+      "Final release preparation and revalidation must use the reviewed macOS signature allowlist.",
+    );
+  }
+  requireText(main, '[[ "${#assets[@]}" -eq 8 ]]', "Publication must upload exactly eight files.");
+  for (const asset of [
+    "windows-x64-unsigned.exe",
+    "macos-arm64-unsigned.dmg",
+    "artifact-windows-x64.provenance.json",
+    "artifact-macos-arm64.provenance.json",
+    "release-index.json",
+    "SHA256SUMS.txt",
+    "UNSIGNED-BUILD.md",
+    "LICENSE",
+  ]) {
+    requireText(main, asset, `Publication contract is missing ${asset}.`);
+  }
+  requireText(main, "gh release create", "Publication must start from an owned GitHub draft.");
+  requireText(
+    main,
+    '--title "Unofficial downstream Super Synara $VERSION (unsigned prerelease)"',
+    "Release title must prominently identify the unofficial downstream and unsigned prerelease.",
+  );
+  requireText(main, "gh release upload", "Publication must upload to the owned draft.");
+  requireText(main, "cmp ", "Publication must compare redownloaded bytes exactly.");
+  requireText(main, "make_latest=false", "Unsigned prerelease must not become GitHub Latest.");
+  prohibitText(
+    main,
+    "gh release delete",
+    "Failure handling must never delete a draft automatically.",
+  );
+  prohibitText(main, "--clobber", "Draft assets must never be silently overwritten on rerun.");
+  for (const prohibitedAsset of [".blockmap", "latest.yml", "latest-mac.yml", ".AppImage"]) {
+    prohibitText(main, prohibitedAsset, `Publication must not expose ${prohibitedAsset}.`);
+  }
+
+  requireText(audit, "permissions:\n  contents: read", "Audit must be read-only.");
+  requireText(
+    audit,
+    "REF_PROTECTED: ${{ github.ref_protected }}",
+    "Audit must bind GitHub protected-ref state.",
+  );
+  requireText(
+    audit,
+    '[[ "$REF_PROTECTED" == "true" ]]',
+    "Audit must fail closed unless the dispatch ref is protected.",
+  );
+  requireText(audit, 'test "$(uname -m)" = arm64', "Audit must prove arm64 host architecture.");
+  prohibitText(audit, "contents: write", "Audit must not receive write permission.");
+  for (const auditSourceNeedle of [
+    "REF_SHA: ${{ github.sha }}",
+    '[[ "$SOURCE_SHA" == "$REF_SHA" ]]',
+    'CORE_VERSION="${BASH_REMATCH[1]}"',
+    '"v$CORE_VERSION"',
+    "build-only",
+  ]) {
+    requireText(audit, auditSourceNeedle, `Audit source contract is missing ${auditSourceNeedle}.`);
+  }
+  requireText(audit, "--mode audit", "Audit must emit unclassified inventory evidence.");
+  const auditCleanlinessChecks =
+    audit.match(/node scripts\/verify-release-worktree-clean\.ts/g)?.length ?? 0;
+  if (auditCleanlinessChecks < 2) {
+    throw new Error("Audit must prove source cleanliness after install and inventory generation.");
+  }
+  requireText(
+    audit,
+    "bun run dist:desktop:super:mac --",
+    "Audit must use the isolated Super packaging entry point.",
+  );
+  const auditCommands = continuedShellCommands(
+    audit,
+    "node scripts/collect-super-synara-macos-signatures.ts",
+  );
+  if (auditCommands.length !== 1 || !auditCommands[0]!.includes("--dmg")) {
+    throw new Error("macOS signature audit must inspect the built DMG directly.");
+  }
+  prohibitText(auditCommands[0]!, "--zip", "macOS signature audit must not rely on ZIP evidence.");
+  prohibitText(audit, "--desktop-flavor", "Audit must not use the superseded flavor flag.");
+  prohibitText(audit, "--allowlist", "Audit must not classify objects with an allowlist.");
+  requireText(audit, "retention-days: 1", "Audit inventory retention must be one day.");
+  prohibitText(audit, "gh release", "Audit must not create or mutate releases.");
+  prohibitText(audit, "git tag", "Audit must not reserve tags.");
+  prohibitText(audit, "git push", "Audit must not mutate repository refs.");
+}
+
+export function verifySuperSynaraWorkflowContracts(repoRoot: string): void {
+  verifySuperSynaraWorkflowText(
+    readFileSync(resolve(repoRoot, ".github/workflows/super-synara-prerelease.yml"), "utf8"),
+    readFileSync(
+      resolve(repoRoot, ".github/workflows/super-synara-macos-signature-audit.yml"),
+      "utf8",
+    ),
+  );
+}

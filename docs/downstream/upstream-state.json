@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "repository": "slashdevcorpse/synara",
+  "canonicalUpstream": "Emanuele-web04/synara",
+  "lastEffectiveUpstreamSha": "f4a020d064317f285984ad31a09f4f7d9b2bfd65",
+  "lastVerifiedOn": "2026-07-19",
+  "acceptedSyncs": [
+    {
+      "id": "baseline-2026-07-19-f4a020d0",
+      "previousUpstreamSha": "ef16dee917722d27782e95bba9c286967d61d5ed",
+      "effectiveUpstreamSha": "f4a020d064317f285984ad31a09f4f7d9b2bfd65",
+      "downstreamCommit": "f4a020d064317f285984ad31a09f4f7d9b2bfd65",
+      "integrationMethod": "fast-forward",
+      "pullRequest": null,
+      "assessmentPath": "docs/downstream/syncs/2026-07-19-baseline-ef16dee9-f4a020d0.md",
+      "acceptedOn": "2026-07-19",
+      "rollbackSha": "ef16dee917722d27782e95bba9c286967d61d5ed",
+      "classificationComplete": true
+    }
+  ],
+  "activeRevertedRanges": [],
+  "activeExcludedRanges": []
+}

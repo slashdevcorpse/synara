@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import {
   repairBrowserProfileFromBridgeManifest,
+  resolveDesktopBackendHomePath,
   resolveDesktopAppDataBase,
   resolveDesktopUserDataPath,
 } from "./desktopUserDataProfile";
@@ -28,14 +29,42 @@ describe("desktopUserDataProfile", () => {
   it("resolves the canonical Synara profile names", () => {
     const appDataBase = "/Users/tester/Library/Application Support";
     expect(resolveDesktopUserDataPath({ appDataBase, userDataDirectoryName: "synara-dev" })).toBe(
-      "/Users/tester/Library/Application Support/synara-dev",
+      Path.join(appDataBase, "synara-dev"),
     );
     expect(resolveDesktopUserDataPath({ appDataBase, userDataDirectoryName: "synara" })).toBe(
-      "/Users/tester/Library/Application Support/synara",
+      Path.join(appDataBase, "synara"),
     );
     expect(
       resolveDesktopUserDataPath({ appDataBase, userDataDirectoryName: "synara-canary" }),
-    ).toBe("/Users/tester/Library/Application Support/synara-canary");
+    ).toBe(Path.join(appDataBase, "synara-canary"));
+    expect(resolveDesktopUserDataPath({ appDataBase, userDataDirectoryName: "super-synara" })).toBe(
+      Path.join(appDataBase, "super-synara"),
+    );
+  });
+
+  it("defaults Super Synara to its isolated backend home", () => {
+    expect(
+      resolveDesktopBackendHomePath({
+        homeDirectory: "/Users/tester",
+        defaultHomeDirectoryName: ".super-synara",
+      }),
+    ).toBe(Path.resolve("/Users/tester/.super-synara"));
+  });
+
+  it("refuses configured homes inside live upstream Synara state", () => {
+    for (const configuredHomeDirectory of [
+      "/Users/tester/.synara",
+      "/Users/tester/.synara/copied-by-mistake",
+    ]) {
+      expect(() =>
+        resolveDesktopBackendHomePath({
+          homeDirectory: "/Users/tester",
+          defaultHomeDirectoryName: ".super-synara",
+          configuredHomeDirectory,
+          forbiddenHomeDirectories: ["/Users/tester/.synara"],
+        }),
+      ).toThrow("refuses to use upstream Synara state");
+    }
   });
 
   it("uses XDG_CONFIG_HOME on Linux when available", () => {

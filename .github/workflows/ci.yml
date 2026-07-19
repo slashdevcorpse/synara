@@ -6,27 +6,37 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   quality:
-    name: Format, Lint, Typecheck, Test, Browser Test, Build
+    name: quality
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version-file: package.json
 
       - name: Setup Node
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version-file: package.json
 
       - name: Cache Bun and Turbo
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: |
             ~/.bun/install/cache
@@ -36,7 +46,7 @@ jobs:
             ${{ runner.os }}-bun-${{ hashFiles('bun.lock') }}-
 
       - name: Cache Playwright browsers
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: ~/.cache/ms-playwright
           key: ${{ runner.os }}-playwright-${{ hashFiles('bun.lock') }}
@@ -46,8 +56,13 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      - name: Validate downstream state
+        run: node scripts/validate-downstream-state.ts
+
+      - name: Validate workflow contracts
+        run: node scripts/verify-workflow-contracts.ts
+
       - name: Verify Linux terminal PTY native dependency
-        if: runner.os == 'Linux'
         run: node scripts/node-pty-smoke.mjs
 
       - name: Verify Synara identity
@@ -65,9 +80,6 @@ jobs:
       - name: Test
         run: bun run test
 
-      # Run the workspace-local playwright binary directly: bunx stalled after
-      # the chromium download on hosted runners. The step timeout stops any
-      # remaining apt/download stalls from eating the whole job budget.
       - name: Install browser test runtime
         timeout-minutes: 15
         env:
@@ -80,9 +92,6 @@ jobs:
         timeout-minutes: 20
         run: bun run --cwd apps/web test:browser:stable
 
-      # Pixel/font/layout comparisons are tracked explicitly in
-      # apps/web/BROWSER_TEST_QUARANTINE.md while their Linux rendering is fixed.
-      # All untagged browser tests run in the blocking stable step above.
       - name: Browser test (Linux geometry quarantine)
         continue-on-error: true
         timeout-minutes: 10
@@ -96,52 +105,185 @@ jobs:
           test -f apps/desktop/dist-electron/preload.js
           grep -nE "desktopBridge|getWsUrl|PICK_FOLDER_CHANNEL|wsUrl" apps/desktop/dist-electron/preload.js
 
-  windows_process:
-    name: Windows Process Regression
+  windows_x64:
+    name: windows_x64
     runs-on: windows-2022
-    timeout-minutes: 15
+    timeout-minutes: 90
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version-file: package.json
 
       - name: Setup Node
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version-file: package.json
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
-      - name: Test Windows process planning
-        run: bun run --cwd packages/shared test src/windowsProcess.test.ts
+      - name: Verify Super Synara identity
+        run: bun run brand:check
 
-      - name: Test Effect Windows process spawn
-        run: bun run --cwd apps/server test src/windowsProcessEffect.test.ts
+      - name: Run shared desktop identity and certificate regressions
+        run: >-
+          bun run --cwd packages/shared test
+          src/desktopIdentity.test.ts
+          src/desktopIdentityProof.test.ts
+          src/windowsCertificate.test.ts
 
-  release_smoke:
-    name: Release Smoke
-    runs-on: ubuntu-24.04
+      - name: Run Windows desktop shutdown regressions
+        run: >-
+          bun run --cwd apps/desktop test
+          src/backendShutdown.test.ts
+          src/backendShutdown.windows.integration.test.ts
+
+      - name: Run Windows process regressions
+        run: >-
+          bun run --cwd packages/shared test
+          src/windowsProcess.test.ts
+
+      - name: Run Windows provider startup and migration regressions
+        run: >-
+          bun run --cwd apps/server test
+          src/windowsProcessEffect.test.ts
+          src/codexAppServerManager.test.ts
+          src/provider/Layers/ProviderHealth.test.ts
+          src/persistence/MigrationBackup.test.ts
+          src/restoreMigrationBackup.test.ts
+
+      - name: Run Windows desktop lifecycle regressions
+        run: >-
+          bun run --cwd apps/desktop test
+          src/desktopMigrationRecovery.test.ts
+          src/desktopStorageMigration.test.ts
+          src/windowState.test.ts
+          src/updateState.test.ts
+
+      - name: Run Super Synara Windows release contract regressions
+        run: >-
+          bun run --cwd scripts test
+          check-brand-identity.test.ts
+          verify-packaged-desktop-startup.test.ts
+          lib/desktop-artifact-policy.test.ts
+          lib/windows-authenticode.test.ts
+          lib/windows-installer-qualification.test.ts
+          lib/release-artifact-provenance.test.ts
+          lib/super-synara-release-admission.test.ts
+          lib/super-synara-workflow-contract.test.ts
+
+      - name: Validate workflow contracts
+        run: node scripts/verify-workflow-contracts.ts
+
+      - name: Build desktop pipeline
+        env:
+          SYNARA_DESKTOP_DISABLE_UPDATES: "1"
+          SYNARA_DESKTOP_FLAVOR: super
+        run: bun run build:desktop
+
+      - name: Smoke unpacked desktop in isolated state
+        env:
+          SYNARA_DESKTOP_DISABLE_UPDATES: "1"
+          SYNARA_DESKTOP_FLAVOR: super
+          SYNARA_HOME: ${{ runner.temp }}\super-synara-ci-home
+          SYNARA_PORT_OFFSET: "2710"
+        run: bun run test:desktop-smoke
+
+  macos_arm64:
+    name: macos_arm64
+    runs-on: macos-15
+    timeout-minutes: 60
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version-file: package.json
 
       - name: Setup Node
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: package.json
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Verify arm64 runner architecture
+        run: test "$(uname -m)" = arm64
+
+      - name: Verify Super Synara identity
+        run: bun run brand:check
+
+      - name: Verify native terminal helper
+        run: node scripts/node-pty-smoke.mjs
+
+      - name: Run desktop-native regressions
+        run: bun run --cwd apps/desktop test
+
+      - name: Build desktop pipeline
+        env:
+          SYNARA_DESKTOP_DISABLE_UPDATES: "1"
+          SYNARA_DESKTOP_FLAVOR: super
+        run: bun run build:desktop
+
+      - name: Smoke unpacked desktop in isolated state
+        env:
+          SYNARA_DESKTOP_DISABLE_UPDATES: "1"
+          SYNARA_DESKTOP_FLAVOR: super
+          SYNARA_HOME: ${{ runner.temp }}/super-synara-ci-home
+          SYNARA_PORT_OFFSET: "2810"
+        run: bun run test:desktop-smoke
+
+  release_smoke:
+    name: release_smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version-file: package.json
+
+      - name: Setup Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version-file: package.json
 
       - name: Install dependencies
         run: bun install --frozen-lockfile --ignore-scripts
+
+      - name: Validate downstream state
+        run: node scripts/validate-downstream-state.ts
+
+      - name: Validate source workflow contracts
+        run: node scripts/verify-workflow-contracts.ts
+
+      - name: Verify disabled workflow state on downstream main
+        if: github.repository == 'slashdevcorpse/synara' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/verify-workflow-contracts.ts --check-github-state
 
       - name: Verify Synara identity
         run: bun run brand:check

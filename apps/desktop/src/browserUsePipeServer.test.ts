@@ -3,9 +3,10 @@
 // Layer: Desktop test
 // Depends on: Vitest and browserUsePipeServer path resolution exports
 
+import { randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { createConnection, type Socket } from "node:net";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, posix } from "node:path";
 import { endianness, tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
 
@@ -70,8 +71,11 @@ async function withPipeServer(
   },
   run: (socket: Socket) => Promise<void>,
 ): Promise<void> {
-  const directory = await mkdtemp(join(tmpdir(), "synara-browser-pipe-test-"));
-  const pipePath = join(directory, "browser.sock");
+  const directory =
+    process.platform === "win32"
+      ? null
+      : await mkdtemp(join(tmpdir(), "synara-browser-pipe-test-"));
+  const pipePath = resolveTestPipePath(process.platform, randomUUID(), directory ?? undefined);
   const browserManager = options.browserManager ?? { getBrowserUseSnapshot: () => null };
   const server = new BrowserUsePipeServer(browserManager as never, {
     pipePath,
@@ -89,15 +93,27 @@ async function withPipeServer(
   } finally {
     socket.destroy();
     await server.dispose();
-    await rm(directory, { recursive: true, force: true });
+    if (directory !== null) {
+      await rm(directory, { recursive: true, force: true });
+    }
   }
+}
+
+function resolveTestPipePath(
+  platform: NodeJS.Platform,
+  uniqueId: string,
+  unixDirectory = "/tmp/synara-browser-pipe-test",
+): string {
+  return platform === "win32"
+    ? String.raw`\\.\pipe\synara-browser-pipe-test-${uniqueId}`
+    : posix.join(unixDirectory, "browser.sock");
 }
 
 describe("browser-use pipe path resolution", () => {
   it("creates a discoverable unix socket path under the Codex browser-use directory", () => {
     const pipePath = resolveDefaultBrowserUsePipePath("darwin");
 
-    expect(dirname(pipePath)).toBe(`${tmpdir()}/codex-browser-use`);
+    expect(dirname(pipePath)).toBe(join(tmpdir(), "codex-browser-use"));
     expect(basename(pipePath)).toMatch(/^synara-iab-\d+-[0-9a-f-]{36}\.sock$/);
   });
 
@@ -113,8 +129,18 @@ describe("browser-use pipe path resolution", () => {
   });
 
   it("falls back to the generated path when the environment is empty", () => {
-    expect(resolveConfiguredBrowserUsePipePath({}, "darwin")).toMatch(
-      /codex-browser-use\/synara-iab-\d+-[0-9a-f-]{36}\.sock$/,
+    const pipePath = resolveConfiguredBrowserUsePipePath({}, "darwin");
+
+    expect(dirname(pipePath)).toBe(join(tmpdir(), "codex-browser-use"));
+    expect(basename(pipePath)).toMatch(/^synara-iab-\d+-[0-9a-f-]{36}\.sock$/);
+  });
+
+  it("uses named pipes on Windows and filesystem sockets on POSIX test hosts", () => {
+    expect(resolveTestPipePath("win32", "fixed-id")).toBe(
+      String.raw`\\.\pipe\synara-browser-pipe-test-fixed-id`,
+    );
+    expect(resolveTestPipePath("darwin", "fixed-id", "/tmp/private-browser-use")).toBe(
+      "/tmp/private-browser-use/browser.sock",
     );
   });
 

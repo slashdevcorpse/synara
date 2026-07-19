@@ -1,0 +1,48 @@
+{
+  "schemaVersion": 1,
+  "repository": "slashdevcorpse/synara",
+  "disabledWorkflows": [
+    {
+      "path": ".github/workflows/issue-labels.yml",
+      "requiredState": "disabled_manually",
+      "reason": "The inherited label synchronizer has repository write authority and is not part of the downstream release channel."
+    },
+    {
+      "path": ".github/workflows/pr-size.yml",
+      "requiredState": "disabled_manually",
+      "reason": "The inherited pull_request_target label path remains disabled until it is replaced by a read-only design."
+    },
+    {
+      "path": ".github/workflows/pr-vouch.yml",
+      "requiredState": "disabled_manually",
+      "reason": "The inherited trust-label workflow uses pull_request_target with write authority and is not required downstream."
+    },
+    {
+      "path": ".github/workflows/release.yml",
+      "requiredState": "disabled_manually",
+      "reason": "The upstream signed release workflow publishes updater assets and must never service unsigned Super Synara prereleases."
+    }
+  ],
+  "allowedWorkflows": [
+    {
+      "path": ".github/workflows/ci.yml",
+      "requiredOnDefaultBranch": true,
+      "triggers": ["pull_request", "push"]
+    },
+    {
+      "path": ".github/workflows/upstream-watch.yml",
+      "requiredOnDefaultBranch": true,
+      "triggers": ["schedule", "workflow_dispatch"]
+    },
+    {
+      "path": ".github/workflows/super-synara-prerelease.yml",
+      "requiredOnDefaultBranch": false,
+      "triggers": ["workflow_dispatch"]
+    },
+    {
+      "path": ".github/workflows/super-synara-macos-signature-audit.yml",
+      "requiredOnDefaultBranch": false,
+      "triggers": ["workflow_dispatch"]
+    }
+  ]
+}

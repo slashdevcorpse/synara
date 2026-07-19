@@ -56,6 +56,8 @@ export function resolveMacAppBundlePath(
   if (platform !== "darwin") {
     return null;
   }
-  const bundlePath = Path.resolve(execPath, "..", "..", "..");
+  // The explicit platform argument describes the path, so parsing must not
+  // inherit the host running the test or cross-platform build.
+  const bundlePath = Path.posix.resolve(execPath, "..", "..", "..");
   return bundlePath.endsWith(".app") ? bundlePath : null;
 }

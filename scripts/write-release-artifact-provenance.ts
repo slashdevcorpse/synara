@@ -3,10 +3,17 @@
 // Purpose: CLI entrypoint for post-build release asset trust proof.
 // Layer: Release verification script
 
+import { readFileSync } from "node:fs";
+
 import {
   type ReleaseArtifactPlatform,
+  type ReleaseDistributionKind,
   writeReleaseArtifactProvenance,
 } from "./lib/release-artifact-provenance.ts";
+import type {
+  MacSignatureAllowlist,
+  MacUnsignedSignatureReport,
+} from "./lib/super-synara-macos-signatures.ts";
 
 interface CliOptions {
   readonly assetsDirectory: string;
@@ -19,15 +26,30 @@ interface CliOptions {
   readonly lockfileSha256: string;
   readonly publication: boolean;
   readonly signed: boolean;
+  readonly distributionKind?: ReleaseDistributionKind;
+  readonly distributionRepository?: string;
+  readonly distributionPrerelease?: boolean;
+  readonly distributionLatest?: boolean;
+  readonly updaterFeed?: boolean;
+  readonly absorbedUpstreamSha?: string;
+  readonly macSignatureReport?: MacUnsignedSignatureReport;
+  readonly macSignatureAllowlist?: MacSignatureAllowlist;
+  readonly artifactFileNames?: ReadonlyArray<string>;
+  readonly outputFileName?: string;
   readonly expectedMacTeamId?: string;
   readonly expectedWindowsPublisher?: string;
   readonly expectedWindowsSubjectDn?: string;
+  readonly windowsQualificationReportPath?: string;
 }
 
 function parseBoolean(name: string, value: string | undefined): boolean {
   if (value === "true") return true;
   if (value === "false") return false;
   throw new Error(`${name} must be true or false.`);
+}
+
+function parseOptionalBoolean(name: string, value: string | undefined): boolean | undefined {
+  return value === undefined ? undefined : parseBoolean(name, value);
 }
 
 function parseArgs(argv: ReadonlyArray<string>): CliOptions {
@@ -65,9 +87,20 @@ function parseArgs(argv: ReadonlyArray<string>): CliOptions {
     "--lockfile-sha256",
     "--publication",
     "--signed",
+    "--distribution-kind",
+    "--distribution-repository",
+    "--distribution-prerelease",
+    "--distribution-latest",
+    "--updater-feed",
+    "--absorbed-upstream-sha",
+    "--mac-signature-report",
+    "--mac-signature-allowlist",
+    "--artifact-files",
+    "--output-file-name",
     "--expected-mac-team-id",
     "--expected-windows-publisher",
     "--expected-windows-subject-dn",
+    "--windows-qualification-report",
   ]);
   for (const name of values.keys()) {
     if (!knownArguments.has(name))
@@ -77,6 +110,25 @@ function parseArgs(argv: ReadonlyArray<string>): CliOptions {
   const expectedMacTeamId = values.get("--expected-mac-team-id") || undefined;
   const expectedWindowsPublisher = values.get("--expected-windows-publisher") || undefined;
   const expectedWindowsSubjectDn = values.get("--expected-windows-subject-dn") || undefined;
+  const distributionKind = values.get("--distribution-kind") || undefined;
+  if (
+    distributionKind !== undefined &&
+    distributionKind !== "build-only" &&
+    distributionKind !== "github-unsigned-prerelease" &&
+    distributionKind !== "signed-release"
+  ) {
+    throw new Error(`Unsupported distribution kind: ${distributionKind}.`);
+  }
+  const macSignatureReportPath = values.get("--mac-signature-report");
+  const macSignatureAllowlistPath = values.get("--mac-signature-allowlist");
+  if (Boolean(macSignatureReportPath) !== Boolean(macSignatureAllowlistPath)) {
+    throw new Error("macOS signature report and allowlist must be provided together.");
+  }
+  const artifactFileNames = values
+    .get("--artifact-files")
+    ?.split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
   return {
     assetsDirectory: required("--assets-dir"),
     platform,
@@ -88,9 +140,56 @@ function parseArgs(argv: ReadonlyArray<string>): CliOptions {
     lockfileSha256: required("--lockfile-sha256"),
     publication: parseBoolean("--publication", values.get("--publication")),
     signed: parseBoolean("--signed", values.get("--signed")),
+    ...(distributionKind ? { distributionKind } : {}),
+    ...(values.get("--distribution-repository")
+      ? { distributionRepository: values.get("--distribution-repository")! }
+      : {}),
+    ...(parseOptionalBoolean(
+      "--distribution-prerelease",
+      values.get("--distribution-prerelease"),
+    ) === undefined
+      ? {}
+      : {
+          distributionPrerelease: parseBoolean(
+            "--distribution-prerelease",
+            values.get("--distribution-prerelease"),
+          ),
+        }),
+    ...(parseOptionalBoolean("--distribution-latest", values.get("--distribution-latest")) ===
+    undefined
+      ? {}
+      : {
+          distributionLatest: parseBoolean(
+            "--distribution-latest",
+            values.get("--distribution-latest"),
+          ),
+        }),
+    ...(parseOptionalBoolean("--updater-feed", values.get("--updater-feed")) === undefined
+      ? {}
+      : { updaterFeed: parseBoolean("--updater-feed", values.get("--updater-feed")) }),
+    ...(values.get("--absorbed-upstream-sha")
+      ? { absorbedUpstreamSha: values.get("--absorbed-upstream-sha")! }
+      : {}),
+    ...(macSignatureReportPath && macSignatureAllowlistPath
+      ? {
+          macSignatureReport: JSON.parse(
+            readFileSync(macSignatureReportPath, "utf8"),
+          ) as MacUnsignedSignatureReport,
+          macSignatureAllowlist: JSON.parse(
+            readFileSync(macSignatureAllowlistPath, "utf8"),
+          ) as MacSignatureAllowlist,
+        }
+      : {}),
+    ...(artifactFileNames && artifactFileNames.length > 0 ? { artifactFileNames } : {}),
+    ...(values.get("--output-file-name")
+      ? { outputFileName: values.get("--output-file-name")! }
+      : {}),
     ...(expectedMacTeamId ? { expectedMacTeamId } : {}),
     ...(expectedWindowsPublisher ? { expectedWindowsPublisher } : {}),
     ...(expectedWindowsSubjectDn ? { expectedWindowsSubjectDn } : {}),
+    ...(values.get("--windows-qualification-report")
+      ? { windowsQualificationReportPath: values.get("--windows-qualification-report")! }
+      : {}),
   };
 }
 

@@ -6,19 +6,40 @@ import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   createReadStream,
+  existsSync,
   lstatSync,
   mkdtempSync,
   readdirSync,
+  readFileSync,
   rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 
 import { matchesDistinguishedName } from "@synara/shared/windowsCertificate";
 
+import {
+  type MacSignatureAllowlist,
+  type MacUnsignedSignatureReport,
+  validateMacUnsignedSignatureReport,
+} from "./super-synara-macos-signatures.ts";
+import type {
+  WindowsInstallerQualificationReport,
+  WindowsQualifiedExecutableEvidence,
+  WindowsVendorExecutableEvidence,
+} from "./windows-installer-qualification.ts";
+import {
+  inspectUnsignedWindowsExecutable,
+  type WindowsUnsignedAuthenticodeEvidence,
+} from "./windows-authenticode.ts";
+
 export type ReleaseArtifactPlatform = "linux" | "mac" | "win";
+export type ReleaseDistributionKind =
+  | "build-only"
+  | "github-unsigned-prerelease"
+  | "signed-release";
 
 export interface ReleaseArtifactProvenanceInput {
   readonly assetsDirectory: string;
@@ -31,10 +52,20 @@ export interface ReleaseArtifactProvenanceInput {
   readonly lockfileSha256: string;
   readonly publication: boolean;
   readonly signed: boolean;
+  readonly distributionKind?: ReleaseDistributionKind;
+  readonly distributionRepository?: string;
+  readonly distributionPrerelease?: boolean;
+  readonly distributionLatest?: boolean;
+  readonly updaterFeed?: boolean;
+  readonly absorbedUpstreamSha?: string;
+  readonly macSignatureReport?: MacUnsignedSignatureReport;
+  readonly macSignatureAllowlist?: MacSignatureAllowlist;
   readonly expectedMacTeamId?: string;
   readonly expectedWindowsPublisher?: string;
   readonly expectedWindowsSubjectDn?: string;
+  readonly windowsQualificationReportPath?: string;
   readonly artifactFileNames?: ReadonlyArray<string>;
+  readonly outputFileName?: string;
 }
 
 export interface ReleaseArtifactDigest {
@@ -64,7 +95,27 @@ interface MacSignatureEvidence {
   readonly diskImage: string;
 }
 
-type SigningEvidence =
+interface WindowsUnsignedQualificationEvidence {
+  readonly qualificationReportSchemaVersion: 3;
+  readonly currentVersion: string;
+  readonly upgrade: "qualified" | "not-run-no-previous-release";
+  readonly previousVersion: string | null;
+  readonly installer: WindowsQualifiedExecutableEvidence & { readonly role: "installer" };
+  readonly productOwnedExecutables: readonly [
+    WindowsQualifiedExecutableEvidence & { readonly role: "main-executable" },
+    WindowsQualifiedExecutableEvidence & { readonly role: "uninstaller" },
+  ];
+  readonly vendorExecutables: ReadonlyArray<WindowsVendorExecutableEvidence>;
+}
+
+export interface ReleaseArtifactProvenanceRuntime {
+  readonly inspectUnsignedWindowsExecutable: (
+    executablePath: string,
+  ) => WindowsUnsignedAuthenticodeEvidence;
+  readonly windowsQualificationReportDirectory?: string;
+}
+
+export type SigningEvidence =
   | {
       readonly status: "verified";
       readonly scheme: "apple-developer-id";
@@ -88,11 +139,33 @@ type SigningEvidence =
       readonly scheme: "none";
       readonly identity: null;
       readonly checks: ReadonlyArray<string>;
+    }
+  | {
+      readonly status: "unsigned-prerelease";
+      readonly scheme: "none";
+      readonly thirdPartyComponents: "not-applicable";
+      readonly identity: WindowsUnsignedQualificationEvidence;
+      readonly checks: ReadonlyArray<string>;
+    }
+  | {
+      readonly status: "unsigned-prerelease";
+      readonly scheme: "ad-hoc-only";
+      readonly thirdPartyComponents: "reviewed-allowlist";
+      readonly identity: MacUnsignedSignatureReport;
+      readonly checks: ReadonlyArray<string>;
     };
 
 export interface ReleaseArtifactProvenanceManifest {
-  readonly schemaVersion: 1;
+  readonly schemaVersion: 2;
   readonly publication: boolean;
+  readonly distribution: {
+    readonly kind: ReleaseDistributionKind;
+    readonly repository: string | null;
+    readonly tag: string | null;
+    readonly prerelease: boolean;
+    readonly latest: boolean | null;
+    readonly updaterFeed: boolean;
+  };
   readonly platform: ReleaseArtifactPlatform;
   readonly arch: string;
   readonly target: string;
@@ -101,12 +174,22 @@ export interface ReleaseArtifactProvenanceManifest {
     readonly commit: string;
     readonly tag: string | null;
     readonly lockfileSha256: string;
+    readonly absorbedUpstreamSha: string | null;
   };
   readonly signing: SigningEvidence;
   readonly artifacts: ReadonlyArray<ReleaseArtifactDigest>;
 }
 
 const MAX_COMMAND_OUTPUT_BYTES = 4 * 1024 * 1024;
+export const WINDOWS_INSTALLER_QUALIFICATION_REPORT_FILE_NAME =
+  "windows-installer-qualification.json";
+
+const nativeProvenanceRuntime: ReleaseArtifactProvenanceRuntime = {
+  inspectUnsignedWindowsExecutable,
+  ...(process.env.RUNNER_TEMP
+    ? { windowsQualificationReportDirectory: process.env.RUNNER_TEMP }
+    : {}),
+};
 
 function runCommand(command: string, args: ReadonlyArray<string>): CommandResult {
   const result = spawnSync(command, [...args], {
@@ -137,6 +220,235 @@ function requireSingleArtifact(
   return matches[0]!;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function sameWindowsPath(left: string, right: string): boolean {
+  return resolve(left).toLowerCase() === resolve(right).toLowerCase();
+}
+
+function validateUnsignedAuthenticodeEvidence(
+  value: unknown,
+  expectedPath: string,
+  label: string,
+): asserts value is WindowsUnsignedAuthenticodeEvidence {
+  if (
+    !isRecord(value) ||
+    typeof value.path !== "string" ||
+    !sameWindowsPath(value.path, expectedPath) ||
+    value.status !== "NotSigned" ||
+    value.signerCertificate !== null ||
+    value.timeStamperCertificate !== null
+  ) {
+    throw new Error(`${label} does not contain exact NotSigned Authenticode evidence.`);
+  }
+}
+
+function validateQualifiedExecutable(
+  value: unknown,
+  expected: {
+    readonly role: WindowsQualifiedExecutableEvidence["role"];
+    readonly fileName?: string;
+    readonly path?: string;
+    readonly productName?: string;
+  },
+  label: string,
+): asserts value is WindowsQualifiedExecutableEvidence {
+  if (
+    !isRecord(value) ||
+    value.role !== expected.role ||
+    typeof value.fileName !== "string" ||
+    typeof value.path !== "string" ||
+    (value.productName !== null && typeof value.productName !== "string") ||
+    typeof value.sha256 !== "string" ||
+    !/^[0-9a-f]{64}$/.test(value.sha256)
+  ) {
+    throw new Error(`${label} is malformed.`);
+  }
+  if (
+    (expected.fileName !== undefined && value.fileName !== expected.fileName) ||
+    (expected.path !== undefined && !sameWindowsPath(value.path, expected.path)) ||
+    (expected.productName !== undefined && value.productName !== expected.productName)
+  ) {
+    throw new Error(`${label} does not match the expected executable identity.`);
+  }
+  validateUnsignedAuthenticodeEvidence(value.authenticode, value.path, label);
+}
+
+function validateVendorExecutable(
+  value: unknown,
+  label: string,
+): asserts value is WindowsVendorExecutableEvidence {
+  if (
+    !isRecord(value) ||
+    value.role !== "vendor-executable" ||
+    typeof value.fileName !== "string" ||
+    typeof value.path !== "string" ||
+    basename(value.path) !== value.fileName ||
+    (value.productName !== null && typeof value.productName !== "string") ||
+    typeof value.sha256 !== "string" ||
+    !/^[0-9a-f]{64}$/.test(value.sha256)
+  ) {
+    throw new Error(`${label} is malformed.`);
+  }
+}
+
+function readWindowsQualificationReport(
+  input: ReleaseArtifactProvenanceInput,
+  artifact: ReleaseArtifactDigest,
+  runtime: ReleaseArtifactProvenanceRuntime,
+): WindowsUnsignedQualificationEvidence {
+  const reportPath = input.windowsQualificationReportPath
+    ? resolve(input.windowsQualificationReportPath)
+    : "";
+  const trustedReportDirectory = runtime.windowsQualificationReportDirectory?.trim();
+  if (
+    !trustedReportDirectory ||
+    basename(reportPath) !== WINDOWS_INSTALLER_QUALIFICATION_REPORT_FILE_NAME ||
+    dirname(reportPath).toLowerCase() !== resolve(trustedReportDirectory).toLowerCase()
+  ) {
+    throw new Error(
+      "Windows qualification report must be the exact native report under RUNNER_TEMP.",
+    );
+  }
+  if (!existsSync(reportPath) || !lstatSync(reportPath).isFile()) {
+    throw new Error(
+      `Windows unsigned provenance requires ${WINDOWS_INSTALLER_QUALIFICATION_REPORT_FILE_NAME}.`,
+    );
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(reportPath, "utf8"));
+  } catch (error) {
+    throw new Error("Windows installer qualification report is malformed JSON.", {
+      cause: error,
+    });
+  }
+  if (!isRecord(parsed)) {
+    throw new Error("Windows installer qualification report must be an object.");
+  }
+  const report = parsed as unknown as WindowsInstallerQualificationReport;
+  if (
+    report.schemaVersion !== 3 ||
+    report.platform !== "windows-x64" ||
+    report.currentVersion !== input.version ||
+    (report.upgrade !== "qualified" && report.upgrade !== "not-run-no-previous-release") ||
+    (report.upgrade === "qualified"
+      ? typeof report.previousVersion !== "string"
+      : report.previousVersion !== null)
+  ) {
+    throw new Error("Windows installer qualification report does not match this release.");
+  }
+  if (
+    report.sideBySide?.upstreamStartupProven !== true ||
+    report.sideBySide.upstreamControlledCleanupProven !== true ||
+    report.sideBySide.concurrentOverlapProven !== true ||
+    report.sideBySide.distinctProcessLocksProven !== true ||
+    report.sideBySide.distinctProfileRootsProven !== true ||
+    report.sideBySide.upstreamExecutablePreserved !== true ||
+    report.sideBySide.upstreamRegistrationPreserved !== true ||
+    report.sideBySide.upstreamProfileSentinelsPreserved !== true ||
+    report.sideBySide.upstreamUninstallCleanupProven !== true ||
+    report.isolation?.liveProfilesRead !== false ||
+    report.isolation.liveProfilesMutated !== false ||
+    report.isolation.upstreamRegistrationPreserved !== true ||
+    report.isolation.upstreamSentinelsPreserved !== true ||
+    report.isolation.superStateWasTemporary !== true ||
+    report.installation?.productName !== "Super Synara" ||
+    report.installation.executableName !== "Super Synara.exe" ||
+    report.installation.registrationScope !== "current-user-64" ||
+    report.installation.startupProven !== true ||
+    report.installation.cleanExitProven !== true ||
+    report.installation.uninstallCleanupProven !== true
+  ) {
+    throw new Error("Windows installer qualification report omitted a required lifecycle proof.");
+  }
+
+  const installerPath = resolve(input.assetsDirectory, artifact.fileName);
+  validateQualifiedExecutable(
+    report.installer,
+    {
+      role: "installer",
+      fileName: artifact.fileName,
+      path: installerPath,
+      productName: "Super Synara",
+    },
+    "Windows installer evidence",
+  );
+  if (report.installer.sha256 !== artifact.sha256) {
+    throw new Error("Windows qualification installer SHA-256 differs from the staged artifact.");
+  }
+
+  const installDirectory = report.installation.installDirectory;
+  if (
+    typeof installDirectory !== "string" ||
+    !Array.isArray(report.installation.productOwnedExecutables)
+  ) {
+    throw new Error(
+      "Windows installer qualification report omitted installed executable evidence.",
+    );
+  }
+  if (report.installation.productOwnedExecutables.length !== 2) {
+    throw new Error("Windows qualification must report exactly two product-owned executables.");
+  }
+  const [mainExecutable, uninstaller] = report.installation.productOwnedExecutables;
+  validateQualifiedExecutable(
+    mainExecutable,
+    {
+      role: "main-executable",
+      fileName: "Super Synara.exe",
+      path: join(installDirectory, "Super Synara.exe"),
+      productName: "Super Synara",
+    },
+    "Installed Super Synara executable evidence",
+  );
+  validateQualifiedExecutable(
+    uninstaller,
+    {
+      role: "uninstaller",
+      fileName: "Uninstall Super Synara.exe",
+      path: join(installDirectory, "Uninstall Super Synara.exe"),
+      productName: "Super Synara",
+    },
+    "Installed Super Synara uninstaller evidence",
+  );
+  if (!Array.isArray(report.installation.vendorExecutables)) {
+    throw new Error("Windows qualification must report vendor executables separately.");
+  }
+  for (const [index, executable] of report.installation.vendorExecutables.entries()) {
+    validateVendorExecutable(executable, `Installed vendor executable evidence ${index}`);
+    const relativePath = executable.path.slice(resolve(installDirectory).length + 1);
+    if (
+      relativePath.length === 0 ||
+      relativePath.startsWith("..") ||
+      resolve(installDirectory, relativePath).toLowerCase() !== executable.path.toLowerCase()
+    ) {
+      throw new Error("Reported vendor executable is outside the controlled install directory.");
+    }
+  }
+
+  const nativeInstallerEvidence = runtime.inspectUnsignedWindowsExecutable(installerPath);
+  validateUnsignedAuthenticodeEvidence(
+    nativeInstallerEvidence,
+    installerPath,
+    "Native Windows installer inspection",
+  );
+  if (JSON.stringify(nativeInstallerEvidence) !== JSON.stringify(report.installer.authenticode)) {
+    throw new Error("Native installer inspection differs from qualification evidence.");
+  }
+
+  return {
+    qualificationReportSchemaVersion: 3,
+    currentVersion: report.currentVersion,
+    upgrade: report.upgrade,
+    previousVersion: report.previousVersion,
+    installer: report.installer,
+    productOwnedExecutables: report.installation.productOwnedExecutables,
+    vendorExecutables: report.installation.vendorExecutables,
+  };
+}
+
 function hashFile(filePath: string): Promise<string> {
   return new Promise((resolveHash, reject) => {
     const hash = createHash("sha256");
@@ -153,7 +465,7 @@ export async function collectReleaseArtifactDigests(
 ): Promise<ReadonlyArray<ReleaseArtifactDigest>> {
   const fileNames = (artifactFileNames ?? readdirSync(assetsDirectory))
     .filter((fileName) => !fileName.endsWith(".provenance.json"))
-    .sort((left, right) => left.localeCompare(right));
+    .toSorted((left, right) => left.localeCompare(right));
   if (new Set(fileNames).size !== fileNames.length) {
     throw new Error("Release artifact file names must be unique.");
   }
@@ -382,7 +694,75 @@ function verifyWindowsSignatures(
 function resolveSigningEvidence(
   input: ReleaseArtifactProvenanceInput,
   artifacts: ReadonlyArray<ReleaseArtifactDigest>,
+  runtime: ReleaseArtifactProvenanceRuntime,
 ): SigningEvidence {
+  const distributionKind = resolveDistributionKind(input);
+  if (distributionKind === "github-unsigned-prerelease") {
+    if (input.platform === "linux") {
+      throw new Error("Unsigned GitHub prereleases support only Windows and macOS.");
+    }
+    const publishableArtifact = requireSingleArtifact(
+      artifacts,
+      input.platform === "mac" ? ".dmg" : ".exe",
+    );
+    if (input.platform === "win") {
+      const installer = publishableArtifact;
+      if (artifacts.length !== 1) {
+        throw new Error("Windows unsigned provenance must describe exactly one staged artifact.");
+      }
+      const stagedExecutables = readdirSync(input.assetsDirectory).filter((fileName) =>
+        fileName.endsWith(".exe"),
+      );
+      if (stagedExecutables.length !== 1 || stagedExecutables[0] !== installer.fileName) {
+        throw new Error("Windows unsigned provenance requires the exact sole staged installer.");
+      }
+      return {
+        status: "unsigned-prerelease",
+        scheme: "none",
+        thirdPartyComponents: "not-applicable",
+        identity: readWindowsQualificationReport(input, installer, runtime),
+        checks: [
+          "outer installer Get-AuthenticodeSignature Status=NotSigned",
+          "installed product-owned executables Status=NotSigned",
+          "signer and timestamp certificates absent",
+          "qualification installer SHA-256 exact match",
+          "vendor executables inventoried separately without an unsigned-signature claim",
+        ],
+      };
+    }
+    if (!input.macSignatureReport || !input.macSignatureAllowlist) {
+      throw new Error(
+        "Unsigned macOS prerelease provenance requires a signature report and reviewed allowlist.",
+      );
+    }
+    const identity = validateMacUnsignedSignatureReport(
+      input.macSignatureReport,
+      input.macSignatureAllowlist,
+    );
+    if (
+      identity.diskImage.fileName !== publishableArtifact.fileName ||
+      identity.diskImage.size !== publishableArtifact.size ||
+      identity.diskImage.sha256 !== publishableArtifact.sha256
+    ) {
+      throw new Error(
+        `macOS signature report disk-image evidence does not match staged ${publishableArtifact.fileName}.`,
+      );
+    }
+    return {
+      status: "unsigned-prerelease",
+      scheme: "ad-hoc-only",
+      thirdPartyComponents: "reviewed-allowlist",
+      identity,
+      checks: [
+        "all product-owned binaries ad-hoc-only",
+        "reviewed third-party signature allowlist exact match",
+        "published DMG filename, size, and SHA-256 match signature report",
+        "published DMG has no Developer ID signature",
+        "DMG and app notarization tickets explicitly absent",
+      ],
+    };
+  }
+
   if (input.platform === "linux") {
     if (input.signed) {
       throw new Error("Linux release provenance cannot claim an unsupported signing scheme.");
@@ -414,6 +794,44 @@ function resolveSigningEvidence(
     : verifyWindowsSignatures(input, artifacts);
 }
 
+function resolveDistributionKind(input: ReleaseArtifactProvenanceInput): ReleaseDistributionKind {
+  return input.distributionKind ?? (input.signed ? "signed-release" : "build-only");
+}
+
+function resolveDistribution(
+  input: ReleaseArtifactProvenanceInput,
+): ReleaseArtifactProvenanceManifest["distribution"] {
+  const kind = resolveDistributionKind(input);
+  if (kind === "github-unsigned-prerelease") {
+    return {
+      kind,
+      repository: input.distributionRepository!,
+      tag: input.sourceTag,
+      prerelease: true,
+      latest: false,
+      updaterFeed: false,
+    };
+  }
+  if (kind === "signed-release") {
+    return {
+      kind,
+      repository: input.distributionRepository?.trim() || null,
+      tag: input.sourceTag,
+      prerelease: input.distributionPrerelease ?? input.version.includes("-"),
+      latest: input.distributionLatest ?? null,
+      updaterFeed: input.updaterFeed ?? true,
+    };
+  }
+  return {
+    kind,
+    repository: null,
+    tag: input.sourceTag,
+    prerelease: false,
+    latest: false,
+    updaterFeed: false,
+  };
+}
+
 function validateInput(input: ReleaseArtifactProvenanceInput): void {
   if (!/^[0-9a-f]{40}$/i.test(input.sourceCommit)) {
     throw new Error("Artifact provenance requires a full source commit.");
@@ -421,16 +839,92 @@ function validateInput(input: ReleaseArtifactProvenanceInput): void {
   if (!/^[0-9a-f]{64}$/i.test(input.lockfileSha256)) {
     throw new Error("Artifact provenance requires a bun.lock SHA-256.");
   }
+  if (
+    input.outputFileName !== undefined &&
+    !/^artifact-(?:windows-x64|macos-arm64|linux-[a-z0-9_-]+|mac-[a-z0-9_-]+|win-[a-z0-9_-]+)\.provenance\.json$/.test(
+      input.outputFileName,
+    )
+  ) {
+    throw new Error(`Invalid artifact provenance output name: ${input.outputFileName}.`);
+  }
+  if (
+    input.absorbedUpstreamSha !== undefined &&
+    !/^[0-9a-f]{40}$/i.test(input.absorbedUpstreamSha)
+  ) {
+    throw new Error("Artifact provenance requires a full absorbed upstream SHA.");
+  }
+
+  const distributionKind = resolveDistributionKind(input);
+  if (distributionKind === "github-unsigned-prerelease") {
+    if (!input.publication || input.signed) {
+      throw new Error("Unsigned GitHub prerelease policy must be public and unsigned.");
+    }
+    if (input.platform !== "win" && input.platform !== "mac") {
+      throw new Error("Unsigned GitHub prerelease policy supports only Windows and macOS.");
+    }
+    if (!/^\d+\.\d+\.\d+-super\.[1-9]\d*$/.test(input.version)) {
+      throw new Error(`Invalid Super Synara prerelease version: ${input.version}.`);
+    }
+    if (input.sourceTag !== `super-v${input.version}`) {
+      throw new Error(
+        `Source tag ${input.sourceTag ?? "<missing>"} does not match Super Synara version ${input.version}.`,
+      );
+    }
+    if (input.distributionRepository !== "slashdevcorpse/synara") {
+      throw new Error("Unsigned prerelease repository must be slashdevcorpse/synara.");
+    }
+    if (
+      input.distributionPrerelease === false ||
+      input.distributionLatest === true ||
+      input.updaterFeed === true
+    ) {
+      throw new Error(
+        "Unsigned prerelease distribution flags must remain prerelease, non-Latest, and updater-free.",
+      );
+    }
+    if (!input.absorbedUpstreamSha) {
+      throw new Error("Unsigned prerelease provenance requires the absorbed upstream SHA.");
+    }
+    if (input.platform === "win" && !input.windowsQualificationReportPath?.trim()) {
+      throw new Error("Windows unsigned provenance requires a qualification report path.");
+    }
+    if (input.platform === "mac" && input.windowsQualificationReportPath !== undefined) {
+      throw new Error("macOS provenance cannot consume Windows qualification evidence.");
+    }
+    return;
+  }
+
   if (input.sourceTag !== null && input.sourceTag !== `v${input.version}`) {
     throw new Error(`Source tag ${input.sourceTag} does not match version ${input.version}.`);
   }
   if (input.publication && input.sourceTag === null) {
     throw new Error("Published artifact provenance requires an exact source tag.");
   }
+  if (distributionKind === "build-only" && input.publication) {
+    throw new Error("Build-only provenance cannot authorize public distribution.");
+  }
+  if (distributionKind === "signed-release" && input.publication && !input.signed) {
+    throw new Error("Signed-release publication requires verified signing.");
+  }
 }
 
 export async function writeReleaseArtifactProvenance(
   input: ReleaseArtifactProvenanceInput,
+): Promise<{ readonly manifest: ReleaseArtifactProvenanceManifest; readonly path: string }> {
+  return writeReleaseArtifactProvenanceWithRuntime(input, nativeProvenanceRuntime);
+}
+
+/** Cross-platform test seam. Production callers must use writeReleaseArtifactProvenance. */
+export async function writeReleaseArtifactProvenanceWithRuntimeForTest(
+  input: ReleaseArtifactProvenanceInput,
+  runtime: ReleaseArtifactProvenanceRuntime,
+): Promise<{ readonly manifest: ReleaseArtifactProvenanceManifest; readonly path: string }> {
+  return writeReleaseArtifactProvenanceWithRuntime(input, runtime);
+}
+
+async function writeReleaseArtifactProvenanceWithRuntime(
+  input: ReleaseArtifactProvenanceInput,
+  runtime: ReleaseArtifactProvenanceRuntime,
 ): Promise<{ readonly manifest: ReleaseArtifactProvenanceManifest; readonly path: string }> {
   validateInput(input);
   const artifacts = await collectReleaseArtifactDigests(
@@ -438,8 +932,9 @@ export async function writeReleaseArtifactProvenance(
     input.artifactFileNames,
   );
   const manifest: ReleaseArtifactProvenanceManifest = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     publication: input.publication,
+    distribution: resolveDistribution(input),
     platform: input.platform,
     arch: input.arch,
     target: input.target,
@@ -448,13 +943,14 @@ export async function writeReleaseArtifactProvenance(
       commit: input.sourceCommit.toLowerCase(),
       tag: input.sourceTag,
       lockfileSha256: input.lockfileSha256.toLowerCase(),
+      absorbedUpstreamSha: input.absorbedUpstreamSha?.toLowerCase() ?? null,
     },
-    signing: resolveSigningEvidence(input, artifacts),
+    signing: resolveSigningEvidence(input, artifacts, runtime),
     artifacts,
   };
   const outputPath = join(
     input.assetsDirectory,
-    `artifact-${input.platform}-${input.arch}.provenance.json`,
+    input.outputFileName ?? `artifact-${input.platform}-${input.arch}.provenance.json`,
   );
   writeFileSync(outputPath, `${JSON.stringify(manifest, null, 2)}\n`, { flag: "wx" });
   return { manifest, path: outputPath };

@@ -176,6 +176,10 @@ function ensurePipeParentDirectory(pipePath: string): void {
   FS.chmodSync(parent, 0o700);
 }
 
+function isWindowsNamedPipePath(pipePath: string): boolean {
+  return /^\\\\\.\\pipe\\[^\\]+$/iu.test(pipePath);
+}
+
 function cleanupPipePath(pipePath: string): void {
   try {
     const stat = FS.lstatSync(pipePath);
@@ -228,8 +232,15 @@ export class BrowserUsePipeServer {
     if (!this.pipePath) {
       throw new Error("Browser-use native pipe is disabled without a proven private Windows ACL");
     }
-    ensurePipeParentDirectory(this.pipePath);
-    cleanupPipePath(this.pipePath);
+    const usesWindowsNamedPipe = process.platform === "win32";
+    if (usesWindowsNamedPipe) {
+      if (!isWindowsNamedPipePath(this.pipePath)) {
+        throw new Error("Browser-use native pipe must use the Windows named-pipe namespace");
+      }
+    } else {
+      ensurePipeParentDirectory(this.pipePath);
+      cleanupPipePath(this.pipePath);
+    }
     await new Promise<void>((resolve, reject) => {
       this.server.once("error", reject);
       this.server.listen({ path: this.pipePath, readableAll: false, writableAll: false }, () => {
@@ -237,7 +248,9 @@ export class BrowserUsePipeServer {
         resolve();
       });
     });
-    FS.chmodSync(this.pipePath, 0o600);
+    if (!usesWindowsNamedPipe) {
+      FS.chmodSync(this.pipePath, 0o600);
+    }
     this.started = true;
   }
 
@@ -256,7 +269,9 @@ export class BrowserUsePipeServer {
       });
       this.started = false;
     }
-    cleanupPipePath(this.pipePath);
+    if (process.platform !== "win32") {
+      cleanupPipePath(this.pipePath);
+    }
   }
 
   private handleSocketConnection(socket: Net.Socket): void {

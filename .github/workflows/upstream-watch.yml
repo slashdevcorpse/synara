@@ -1,0 +1,126 @@
+name: Upstream Watch
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: super-synara-upstream-watch
+  cancel-in-progress: true
+
+jobs:
+  inspect:
+    name: Inspect upstream drift
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      report_body: ${{ steps.report.outputs.report_body }}
+      fail_closed: ${{ steps.report.outputs.fail_closed }}
+    steps:
+      - name: Checkout downstream authority
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: package.json
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version-file: package.json
+
+      - name: Install validation dependencies
+        run: bun install --frozen-lockfile --ignore-scripts
+
+      - name: Validate downstream authority
+        run: node scripts/validate-downstream-state.ts
+
+      - id: report
+        name: Generate non-merging drift report
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          node scripts/upstream-drift-report.ts \
+            --json-output upstream-drift.json \
+            --markdown-output upstream-drift.md
+          {
+            echo "report_body<<SUPER_SYNARA_REPORT"
+            cat upstream-drift.md
+            echo "SUPER_SYNARA_REPORT"
+            echo "fail_closed=$(jq -r .failClosed upstream-drift.json)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Fail closed on rewritten history or overlapping sync PRs
+        if: steps.report.outputs.fail_closed == 'true'
+        run: |
+          echo "Upstream drift violated a fail-closed invariant. See the tracking issue." >&2
+          exit 1
+
+  report:
+    name: Report upstream drift
+    if: always()
+    needs: inspect
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Create or update the single tracking issue
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          REPORT_BODY: ${{ needs.inspect.outputs.report_body }}
+          INSPECT_RESULT: ${{ needs.inspect.result }}
+        with:
+          script: |
+            const marker = "<!-- super-synara-upstream-drift -->";
+            const title = "[Super Synara] Upstream drift";
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const generatedBody = process.env.REPORT_BODY?.trim();
+            const body = generatedBody
+              ? generatedBody
+              : `${marker}\n# Super Synara upstream drift\n\n**Status:** FAIL CLOSED\n\nThe inspection job ended with \`${process.env.INSPECT_RESULT ?? "unknown"}\` before it produced a validated report. Inspect [workflow run ${context.runId}](${runUrl}).\n\nNo refs, branches, merges, or releases were modified.`;
+            const issues = await github.paginate(github.rest.issues.listForRepo, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: "open",
+              per_page: 100,
+            });
+            const trackingIssues = issues.filter(
+              (issue) => !issue.pull_request && issue.body?.includes(marker),
+            );
+            if (trackingIssues.length > 1) {
+              core.setFailed(
+                `Expected at most one upstream drift issue, found ${trackingIssues.length}.`,
+              );
+              return;
+            }
+            const existing = trackingIssues[0];
+            if (!existing) {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body,
+              });
+              return;
+            }
+            if (existing.title !== title || existing.body !== body) {
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.number,
+                title,
+                body,
+              });
+            }

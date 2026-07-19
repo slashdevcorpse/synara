@@ -37,9 +37,10 @@ import {
   type ServerVoiceTranscriptionInput,
   type ServerVoiceTranscriptionResult,
 } from "@synara/contracts";
+import { resolveCodexCliExecutable } from "@synara/shared/codexCliExecutable";
 import { getModelSelectionBooleanOptionValue, normalizeModelSlug } from "@synara/shared/model";
 import { decodeSubagentReceiverThreadIds } from "@synara/shared/subagents";
-import { prepareWindowsSafeProcess } from "@synara/shared/windowsProcess";
+import { prepareResolvedWindowsSafeProcess } from "@synara/shared/windowsProcess";
 import { Effect, ServiceMap } from "effect";
 
 import {
@@ -63,6 +64,8 @@ import {
 } from "./codexAppServerTransport.ts";
 
 const log = createLogger("codex");
+const CODEX_DEFAULT_REQUEST_TIMEOUT_MS = 20_000;
+const CODEX_INITIALIZE_TIMEOUT_MS = 45_000;
 
 type PendingRequestKey = string;
 
@@ -564,6 +567,25 @@ function resolveCodexTurnOverrides(context: CodexSessionContext): {
   );
 }
 
+function encodeCodexTomlBasicStringForCommand(value: string): string {
+  return JSON.stringify(value).replace(
+    /[&|<>^%]/g,
+    (character) => `\\u${character.codePointAt(0)!.toString(16).padStart(4, "0")}`,
+  );
+}
+
+export function buildCodexAppServerArgs(env: NodeJS.ProcessEnv): string[] {
+  const sqliteHome = env.CODEX_SQLITE_HOME?.trim();
+  if (!sqliteHome) {
+    return ["app-server"];
+  }
+
+  // Keep this as a root CLI override. Codex session flags outrank project,
+  // user, and system config, any of which can otherwise redirect sqlite_home
+  // away from Synara's process-owned overlay.
+  return ["-c", `sqlite_home=${encodeCodexTomlBasicStringForCommand(sqliteHome)}`, "app-server"];
+}
+
 export function resolveCodexModelForAccount(
   model: string | undefined,
   account: CodexAccountSnapshot,
@@ -580,10 +602,14 @@ function spawnCodexAppServer(input: {
   readonly cwd: string;
   readonly env: NodeJS.ProcessEnv;
 }): ChildProcessWithoutNullStreams {
-  const prepared = prepareWindowsSafeProcess(input.binaryPath, ["app-server"], {
-    cwd: input.cwd,
-    env: input.env,
-  });
+  const prepared = prepareResolvedWindowsSafeProcess(
+    input.binaryPath,
+    buildCodexAppServerArgs(input.env),
+    {
+      cwd: input.cwd,
+      env: input.env,
+    },
+  );
   return spawn(prepared.command, prepared.args, {
     cwd: input.cwd,
     env: input.env,
@@ -592,6 +618,18 @@ function spawnCodexAppServer(input: {
     windowsHide: prepared.windowsHide,
     windowsVerbatimArguments: prepared.windowsVerbatimArguments,
   });
+}
+
+async function resolveCodexLaunch(input: {
+  readonly binaryPath: string;
+  readonly cwd: string;
+  readonly homePath?: string;
+}): Promise<{ readonly binaryPath: string; readonly env: NodeJS.ProcessEnv }> {
+  const env = await buildCodexProcessEnv(input.homePath ? { homePath: input.homePath } : {});
+  return {
+    binaryPath: resolveCodexCliExecutable(input.binaryPath, { cwd: input.cwd, env }),
+    env,
+  };
 }
 
 export function normalizeCodexModelSlug(
@@ -819,19 +857,21 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
       };
 
       const codexOptions = readCodexProviderOptions(input);
-      const codexBinaryPath = codexOptions.binaryPath ?? "codex";
       const codexHomePath = codexOptions.homePath;
-      await this.assertSupportedCodexCliVersion({
-        binaryPath: codexBinaryPath,
+      const codexLaunch = await resolveCodexLaunch({
+        binaryPath: codexOptions.binaryPath ?? "codex",
         cwd: resolvedCwd,
         ...(codexHomePath ? { homePath: codexHomePath } : {}),
       });
-      const child = spawnCodexAppServer({
-        binaryPath: codexBinaryPath,
+      await this.assertSupportedCodexCliVersion({
+        binaryPath: codexLaunch.binaryPath,
         cwd: resolvedCwd,
-        env: await buildCodexProcessEnv({
-          ...(codexHomePath ? { homePath: codexHomePath } : {}),
-        }),
+        env: codexLaunch.env,
+      });
+      const child = spawnCodexAppServer({
+        binaryPath: codexLaunch.binaryPath,
+        cwd: resolvedCwd,
+        env: codexLaunch.env,
       });
 
       context = {
@@ -1447,19 +1487,21 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
         runtimeMode: input.runtimeMode,
         ...(input.cwd !== undefined ? { cwd: input.cwd } : {}),
       });
-      const codexBinaryPath = codexOptions.binaryPath ?? "codex";
       const codexHomePath = codexOptions.homePath;
-      await this.assertSupportedCodexCliVersion({
-        binaryPath: codexBinaryPath,
+      const codexLaunch = await resolveCodexLaunch({
+        binaryPath: codexOptions.binaryPath ?? "codex",
         cwd: resolvedCwd,
         ...(codexHomePath ? { homePath: codexHomePath } : {}),
       });
-      const child = spawnCodexAppServer({
-        binaryPath: codexBinaryPath,
+      await this.assertSupportedCodexCliVersion({
+        binaryPath: codexLaunch.binaryPath,
         cwd: resolvedCwd,
-        env: await buildCodexProcessEnv({
-          ...(codexHomePath ? { homePath: codexHomePath } : {}),
-        }),
+        env: codexLaunch.env,
+      });
+      const child = spawnCodexAppServer({
+        binaryPath: codexLaunch.binaryPath,
+        cwd: resolvedCwd,
+        env: codexLaunch.env,
       });
 
       context = {
@@ -2082,14 +2124,19 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
     }
 
     const now = new Date().toISOString();
-    await this.assertSupportedCodexCliVersion({
+    const codexLaunch = await resolveCodexLaunch({
       binaryPath: "codex",
       cwd: normalizedCwd,
     });
-    const child = spawnCodexAppServer({
-      binaryPath: "codex",
+    await this.assertSupportedCodexCliVersion({
+      binaryPath: codexLaunch.binaryPath,
       cwd: normalizedCwd,
-      env: await buildCodexProcessEnv(),
+      env: codexLaunch.env,
+    });
+    const child = spawnCodexAppServer({
+      binaryPath: codexLaunch.binaryPath,
+      cwd: normalizedCwd,
+      env: codexLaunch.env,
     });
     const context: CodexSessionContext = {
       session: {
@@ -2669,7 +2716,9 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
     context: CodexSessionContext,
     method: string,
     params: unknown,
-    timeoutMs = 20_000,
+    timeoutMs = method === "initialize"
+      ? CODEX_INITIALIZE_TIMEOUT_MS
+      : CODEX_DEFAULT_REQUEST_TIMEOUT_MS,
   ): Promise<TResponse> {
     const id = context.nextRequestId;
     context.nextRequestId += 1;
@@ -2794,7 +2843,7 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
   private async assertSupportedCodexCliVersion(input: {
     readonly binaryPath: string;
     readonly cwd: string;
-    readonly homePath?: string;
+    readonly env: NodeJS.ProcessEnv;
   }): Promise<void> {
     await assertSupportedCodexCliVersion(input);
   }
@@ -3562,18 +3611,15 @@ function readCodexProviderOptions(input: CodexAppServerStartSessionInput): {
 async function assertSupportedCodexCliVersion(input: {
   readonly binaryPath: string;
   readonly cwd: string;
-  readonly homePath?: string;
+  readonly env: NodeJS.ProcessEnv;
 }): Promise<void> {
-  const env = await buildCodexProcessEnv({
-    ...(input.homePath ? { homePath: input.homePath } : {}),
-  });
-  const prepared = prepareWindowsSafeProcess(input.binaryPath, ["--version"], {
+  const prepared = prepareResolvedWindowsSafeProcess(input.binaryPath, ["--version"], {
     cwd: input.cwd,
-    env,
+    env: input.env,
   });
   const result = spawnSync(prepared.command, prepared.args, {
     cwd: input.cwd,
-    env,
+    env: input.env,
     encoding: "utf8",
     shell: prepared.shell,
     stdio: ["ignore", "pipe", "pipe"],
