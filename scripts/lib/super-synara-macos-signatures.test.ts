@@ -27,6 +27,11 @@ function validReport(): MacUnsignedSignatureReport {
     appBundle: "Super Synara.app",
     electronVersion: "40.10.6",
     notarizationTicket: "absent",
+    notarizationEvidence: {
+      command: "xcrun stapler validate",
+      exitCode: 65,
+      output: "The validate action failed because no ticket was found.",
+    },
     productOwned: [
       {
         path: "Contents/MacOS/Super Synara",

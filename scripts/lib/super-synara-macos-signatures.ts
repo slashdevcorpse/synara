@@ -31,6 +31,11 @@ export interface MacUnsignedSignatureReport {
   readonly appBundle: string;
   readonly electronVersion: string;
   readonly notarizationTicket: "absent" | "present";
+  readonly notarizationEvidence: {
+    readonly command: "xcrun stapler validate";
+    readonly exitCode: number;
+    readonly output: string;
+  };
   readonly productOwned: ReadonlyArray<MacSignatureIdentity>;
   readonly thirdParty: ReadonlyArray<MacSignatureIdentity>;
 }
@@ -100,6 +105,14 @@ export function validateMacUnsignedSignatureReport(
   }
   if (report.notarizationTicket !== "absent") {
     throw new Error("Unsigned prerelease app unexpectedly has a notarization ticket.");
+  }
+  if (
+    report.notarizationEvidence.command !== "xcrun stapler validate" ||
+    !Number.isInteger(report.notarizationEvidence.exitCode) ||
+    report.notarizationEvidence.exitCode === 0 ||
+    report.notarizationEvidence.output.trim().length === 0
+  ) {
+    throw new Error("Unsigned prerelease lacks fail-closed notarization-ticket absence evidence.");
   }
 
   assertUniquePaths("Product-owned signature", report.productOwned);
