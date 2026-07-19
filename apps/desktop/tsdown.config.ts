@@ -8,7 +8,8 @@ import { defineConfig } from "tsdown";
 const sourcemapEnv = process.env.SYNARA_DESKTOP_SOURCEMAP?.trim().toLowerCase();
 const buildSourcemap = sourcemapEnv === "1" || sourcemapEnv === "true";
 const windowsUpdaterPublisher = process.env.AZURE_TRUSTED_SIGNING_SUBJECT_DN?.trim() ?? "";
-const packagedDesktopFlavor = process.env.SYNARA_DESKTOP_FLAVOR?.trim().toLowerCase() || "production";
+const packagedDesktopFlavor =
+  process.env.SYNARA_DESKTOP_FLAVOR?.trim().toLowerCase() || "production";
 if (!new Set(["production", "canary", "super"]).has(packagedDesktopFlavor)) {
   throw new Error(`Invalid packaged desktop flavor '${packagedDesktopFlavor}'.`);
 }

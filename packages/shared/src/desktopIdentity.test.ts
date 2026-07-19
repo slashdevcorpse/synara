@@ -72,9 +72,7 @@ describe("desktopIdentity", () => {
     expect(SYNARA_SUPER_BUNDLE_ID).toBe("io.github.slashdevcorpse.supersynara");
     expect(SYNARA_SUPER_DESKTOP_ORIGIN).toBe("super-synara://app");
     expect(SYNARA_SUPER_DESKTOP_ENTRY_URL).toBe("super-synara://app/index.html");
-    expect(SYNARA_SUPER_WINDOWS_INSTALLER_GUID).toBe(
-      "ab3ea852-4edf-4caa-977e-9d00ccab2b1e",
-    );
+    expect(SYNARA_SUPER_WINDOWS_INSTALLER_GUID).toBe("ab3ea852-4edf-4caa-977e-9d00ccab2b1e");
     expect(synaraDesktopIdentity("super")).toEqual({
       flavor: "super",
       displayName: "Super Synara",

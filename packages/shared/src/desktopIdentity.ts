@@ -46,7 +46,11 @@ export function resolveSynaraDesktopFlavor(input: {
 }): SynaraDesktopFlavor {
   if (input.packagedFlavor !== undefined) {
     const packagedFlavor = input.packagedFlavor.trim().toLowerCase();
-    if (packagedFlavor === "production" || packagedFlavor === "canary" || packagedFlavor === "super") {
+    if (
+      packagedFlavor === "production" ||
+      packagedFlavor === "canary" ||
+      packagedFlavor === "super"
+    ) {
       return packagedFlavor;
     }
     throw new Error(`Invalid packaged desktop flavor '${input.packagedFlavor}'.`);

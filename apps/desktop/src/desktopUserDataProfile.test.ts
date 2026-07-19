@@ -37,9 +37,9 @@ describe("desktopUserDataProfile", () => {
     expect(
       resolveDesktopUserDataPath({ appDataBase, userDataDirectoryName: "synara-canary" }),
     ).toBe(Path.join(appDataBase, "synara-canary"));
-    expect(
-      resolveDesktopUserDataPath({ appDataBase, userDataDirectoryName: "super-synara" }),
-    ).toBe(Path.join(appDataBase, "super-synara"));
+    expect(resolveDesktopUserDataPath({ appDataBase, userDataDirectoryName: "super-synara" })).toBe(
+      Path.join(appDataBase, "super-synara"),
+    );
   });
 
   it("defaults Super Synara to its isolated backend home", () => {
