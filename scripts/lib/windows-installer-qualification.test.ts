@@ -52,6 +52,9 @@ interface FakeRuntime extends WindowsInstallerQualificationRuntime {
   readonly commands: WindowsCommandSpec[];
   readonly registry: Map<string, string>;
   readonly startupEnvironments: NodeJS.ProcessEnv[];
+  readonly lifecycleEvents: string[];
+  upstreamRunning: boolean;
+  exitUpstreamBeforeSuperStartup: boolean;
   failAfterCurrentInstall: boolean;
   mutateUpstreamOnSuperInstall: boolean;
 }
@@ -60,6 +63,7 @@ function fakeRuntime(): FakeRuntime {
   const commands: WindowsCommandSpec[] = [];
   const registry = new Map<string, string>();
   const startupEnvironments: NodeJS.ProcessEnv[] = [];
+  const lifecycleEvents: string[] = [];
   let upstreamInstallDirectory: string | null = null;
   const runtime: FakeRuntime = {
     platform: "win32",
@@ -68,11 +72,15 @@ function fakeRuntime(): FakeRuntime {
     commands,
     registry,
     startupEnvironments,
+    lifecycleEvents,
+    upstreamRunning: false,
+    exitUpstreamBeforeSuperStartup: false,
     failAfterCurrentInstall: false,
     mutateUpstreamOnSuperInstall: false,
     readRegistry: (target) => registry.get(`${target.id}:${target.key}`) ?? null,
     runCommand: (spec) => {
       commands.push(spec);
+      lifecycleEvents.push(spec.label);
       const commandName = spec.command.split(/[\\/]/).at(-1) ?? "";
       const superInstallerMatch = /^Super-Synara-(.+)-windows-x64-unsigned\.exe$/.exec(commandName);
       const upstreamInstallerMatch = /^Synara-(.+)-x64\.exe$/.exec(commandName);
@@ -143,12 +151,60 @@ function fakeRuntime(): FakeRuntime {
       path.endsWith("Super Synara.exe")
         ? { productName: "Super Synara" }
         : { productName: "Synara" },
+    launchStartupAndKeepRunning: vi.fn(async (options) => {
+      startupEnvironments.push(options.env);
+      expect(options.command.endsWith("Synara.exe")).toBe(true);
+      expect(options.command.endsWith("Super Synara.exe")).toBe(false);
+      expect(options.env.SYNARA_HOME).toContain("super-synara-installer-qualification-");
+      expect(options.env.APPDATA).toContain("super-synara-installer-qualification-");
+      expect(options.env.SYNARA_DESKTOP_QUALIFICATION_EXIT_AFTER_STARTUP).toBeUndefined();
+      runtime.upstreamRunning = true;
+      lifecycleEvents.push("upstream-startup-proven");
+      return {
+        pid: 1001,
+        assertRunning: () => {
+          if (!runtime.upstreamRunning) throw new Error("fake upstream Synara is not running");
+        },
+        waitForExit: async () => (runtime.upstreamRunning ? null : { code: 0, signal: null }),
+        stopControlled: async () => {
+          if (!runtime.upstreamRunning) {
+            lifecycleEvents.push("upstream-already-exited");
+            return { mode: "already-exited" as const, code: 0, signal: null };
+          }
+          runtime.upstreamRunning = false;
+          lifecycleEvents.push("upstream-controlled-process-tree-cleanup");
+          return {
+            mode: "controlled-process-tree-cleanup" as const,
+            code: 1,
+            signal: null,
+          };
+        },
+      };
+    }),
     verifyStartup: vi.fn(async (options) => {
       startupEnvironments.push(options.env);
       expect(options.command.endsWith("Super Synara.exe")).toBe(true);
       expect(options.env.SYNARA_HOME).toContain("super-synara-installer-qualification-");
       expect(options.env.APPDATA).toContain("super-synara-installer-qualification-");
       expect(options.env.SYNARA_DESKTOP_QUALIFICATION_EXIT_AFTER_STARTUP).toBe("1");
+      expect(options.expectedIdentityProof).toEqual({
+        flavor: "super",
+        appUserModelId: "io.github.slashdevcorpse.supersynara",
+        bundleId: "io.github.slashdevcorpse.supersynara",
+        internalProtocolScheme: "super-synara",
+        internalProtocolRegistered: true,
+        userDataDirectoryName: "super-synara",
+        userDataPath: join(options.env.APPDATA!, "super-synara"),
+        backendHomePath: options.env.SYNARA_HOME,
+      });
+      if (runtime.exitUpstreamBeforeSuperStartup) {
+        runtime.upstreamRunning = false;
+        lifecycleEvents.push("upstream-exited-before-super-startup");
+      }
+      if (!runtime.upstreamRunning) {
+        throw new Error("Super Synara startup was not concurrent with upstream Synara");
+      }
+      lifecycleEvents.push("super-startup-and-clean-exit-proven");
     }),
     sleep: async () => undefined,
   };
@@ -205,17 +261,41 @@ describe("Super Synara Windows installer qualification", () => {
       runtime,
     );
 
+    expect(report.schemaVersion).toBe(2);
     expect(report.upgrade).toBe("not-run-no-previous-release");
     expect(report.previousVersion).toBeNull();
     expect(report.sideBySide).toMatchObject({
       upstreamVersion: "0.5.5",
       upstreamTag: "v0.5.5",
       upstreamInstallerSha256: expect.stringMatching(/^[0-9a-f]{64}$/),
+      upstreamStartupProven: true,
+      upstreamGracefulExitProven: false,
+      upstreamExitMode: "controlled-process-tree-cleanup",
+      upstreamControlledCleanupProven: true,
+      concurrentOverlapProven: true,
+      distinctProcessLocksProven: true,
+      distinctProfileRootsProven: true,
       upstreamExecutablePreserved: true,
       upstreamRegistrationPreserved: true,
     });
     expect(report.installation.uninstallCleanupProven).toBe(true);
-    expect(runtime.startupEnvironments).toHaveLength(1);
+    expect(report.installation).toMatchObject({
+      appUserModelId: "io.github.slashdevcorpse.supersynara",
+      bundleId: "io.github.slashdevcorpse.supersynara",
+      internalProtocolScheme: "super-synara",
+      userDataDirectoryName: "super-synara",
+      isolatedIdentityPathsProven: true,
+    });
+    expect(runtime.startupEnvironments).toHaveLength(2);
+    expect(runtime.lifecycleEvents).toEqual([
+      "silent installer Synara-0.5.5-x64.exe",
+      "silent installer Super-Synara-0.5.5-super.1-windows-x64-unsigned.exe",
+      "upstream-startup-proven",
+      "super-startup-and-clean-exit-proven",
+      "upstream-controlled-process-tree-cleanup",
+      "silent Super Synara uninstaller",
+      "silent Synara uninstaller",
+    ]);
     expect(runtime.registry).toEqual(before);
   });
 
@@ -244,6 +324,31 @@ describe("Super Synara Windows installer qualification", () => {
       "silent Super Synara uninstaller",
       "silent Synara uninstaller",
     ]);
+  });
+
+  it("rejects a sequential-only startup when upstream exits before Super is proven", async () => {
+    const artifactRoot = join(process.cwd(), `.qualification-fixture-${process.pid}-sequential`);
+    roots.push(artifactRoot);
+    const runtime = fakeRuntime();
+    runtime.exitUpstreamBeforeSuperStartup = true;
+
+    await expect(
+      qualifySuperSynaraWindowsInstaller(
+        {
+          installerPath: installer(artifactRoot, "0.5.5-super.2"),
+          upstreamInstallerPath: upstreamInstaller(artifactRoot),
+          version: "0.5.5-super.2",
+          startupTimeoutMs: 10_000,
+        },
+        runtime,
+      ),
+    ).rejects.toThrow("qualification failed");
+
+    expect(runtime.lifecycleEvents).toContain("upstream-startup-proven");
+    expect(runtime.lifecycleEvents).toContain("upstream-exited-before-super-startup");
+    expect(runtime.lifecycleEvents).toContain("upstream-already-exited");
+    expect(runtime.lifecycleEvents).not.toContain("super-startup-and-clean-exit-proven");
+    expect(runtime.registry.size).toBe(0);
   });
 
   it("runs owned cleanup and preserves upstream registration after installer failure", async () => {

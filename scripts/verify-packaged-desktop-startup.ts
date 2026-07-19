@@ -17,10 +17,15 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, join, normalize, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { synaraDesktopIdentity, type SynaraDesktopFlavor } from "@synara/shared/desktopIdentity";
+import {
+  PACKAGED_DESKTOP_IDENTITY_PROOF_PREFIX,
+  parsePackagedDesktopIdentityProof,
+  type PackagedDesktopIdentityProof,
+} from "@synara/shared/desktopIdentityProof";
 
 export type PackagedDesktopPlatform = "linux" | "mac" | "win";
 
@@ -141,6 +146,23 @@ export interface PackagedDesktopExecutableStartupOptions {
   readonly logPath: string;
   readonly timeoutMs: number;
   readonly description: string;
+  readonly expectedIdentityProof?: PackagedDesktopIdentityProof;
+}
+
+export interface PackagedDesktopExitOutcome {
+  readonly code: number | null;
+  readonly signal: NodeJS.Signals | null;
+}
+
+export interface PackagedDesktopControlledStopResult extends PackagedDesktopExitOutcome {
+  readonly mode: "already-exited" | "controlled-process-tree-cleanup";
+}
+
+export interface RunningPackagedDesktop {
+  readonly pid: number;
+  assertRunning(): void;
+  waitForExit(timeoutMs: number): Promise<PackagedDesktopExitOutcome | null>;
+  stopControlled(): Promise<PackagedDesktopControlledStopResult>;
 }
 
 function prepareMacLaunch(
@@ -239,6 +261,34 @@ export function packagedDesktopExecutableFileName(
   return platform === "win" ? `${executableName}.exe` : executableName;
 }
 
+export function createExpectedPackagedDesktopIdentityProof(
+  options: Pick<PackagedDesktopStartupOptions, "platform" | "flavor">,
+  env: NodeJS.ProcessEnv,
+): PackagedDesktopIdentityProof {
+  const identity = synaraDesktopIdentity(options.flavor);
+  const userDataBase =
+    options.platform === "mac"
+      ? env.HOME && join(env.HOME, "Library", "Application Support")
+      : options.platform === "win"
+        ? env.APPDATA
+        : env.XDG_CONFIG_HOME;
+  if (!userDataBase || !env.SYNARA_HOME) {
+    throw new Error(
+      `Packaged ${options.platform} identity proof requires isolated user-data and backend-home paths.`,
+    );
+  }
+  return {
+    flavor: identity.flavor,
+    appUserModelId: options.platform === "win" ? identity.bundleId : null,
+    bundleId: identity.bundleId,
+    internalProtocolScheme: identity.scheme,
+    internalProtocolRegistered: true,
+    userDataDirectoryName: identity.userDataDirectoryName,
+    userDataPath: join(userDataBase, identity.userDataDirectoryName),
+    backendHomePath: env.SYNARA_HOME,
+  };
+}
+
 export function createPackagedDesktopSmokeEnvironment(
   root: string,
   options: Pick<PackagedDesktopStartupOptions, "platform" | "version"> &
@@ -274,12 +324,10 @@ export function createPackagedDesktopSmokeEnvironment(
   ]) {
     if (path) mkdirSync(path, { recursive: true });
   }
-  const userDataPath =
-    options.platform === "mac"
-      ? join(env.HOME!, "Library", "Application Support", identity.userDataDirectoryName)
-      : options.platform === "win"
-        ? join(env.APPDATA!, identity.userDataDirectoryName)
-        : join(env.XDG_CONFIG_HOME!, identity.userDataDirectoryName);
+  const userDataPath = createExpectedPackagedDesktopIdentityProof(
+    { platform: options.platform, flavor: options.flavor ?? "production" },
+    env,
+  ).userDataPath;
   mkdirSync(userDataPath, { recursive: true });
   if (options.platform === "mac") {
     // Prevent the packaged app's update-only icon repair from registering this
@@ -304,37 +352,161 @@ function waitForExit(child: ChildProcess, timeoutMs: number): Promise<boolean> {
   });
 }
 
-async function terminateProcessTree(child: ChildProcess): Promise<void> {
-  if (!child.pid || child.exitCode !== null || child.signalCode !== null) return;
+async function terminateProcessTree(child: ChildProcess): Promise<boolean> {
+  if (child.exitCode !== null || child.signalCode !== null) return false;
+  if (!child.pid) throw new Error("Cannot terminate a packaged desktop process without a PID.");
   if (process.platform === "win32") {
-    spawnSync("taskkill", ["/pid", String(child.pid), "/t", "/f"], {
+    const result = spawnSync("taskkill", ["/pid", String(child.pid), "/t", "/f"], {
       stdio: "ignore",
       windowsHide: true,
     });
-    await waitForExit(child, 5_000);
-    return;
+    if (await waitForExit(child, 5_000)) return !result.error && result.status === 0;
+    throw new Error(
+      `Packaged desktop process tree ${child.pid} remained alive after taskkill (status=${result.status ?? "unknown"}).`,
+    );
   }
+  let terminationRequested = false;
   try {
     process.kill(-child.pid, "SIGTERM");
+    terminationRequested = true;
   } catch {
-    child.kill("SIGTERM");
+    terminationRequested = child.kill("SIGTERM");
   }
-  if (await waitForExit(child, 5_000)) return;
+  if (await waitForExit(child, 5_000)) return terminationRequested;
   try {
     process.kill(-child.pid, "SIGKILL");
+    terminationRequested = true;
   } catch {
-    child.kill("SIGKILL");
+    terminationRequested = child.kill("SIGKILL") || terminationRequested;
   }
-  await waitForExit(child, 2_000);
+  if (!(await waitForExit(child, 2_000))) {
+    throw new Error(`Packaged desktop process tree ${child.pid} remained alive after SIGKILL.`);
+  }
+  return terminationRequested;
 }
 
-export function hasPackagedDesktopStartupProof(logPath: string): boolean {
+function childExitOutcome(child: ChildProcess): PackagedDesktopExitOutcome | null {
+  if (child.exitCode === null && child.signalCode === null) return null;
+  return { code: child.exitCode, signal: child.signalCode };
+}
+
+export async function launchPackagedDesktopAndWaitForStartup(
+  options: PackagedDesktopExecutableStartupOptions,
+): Promise<RunningPackagedDesktop> {
+  const child = spawn(options.command, [...(options.args ?? [])], {
+    cwd: options.cwd,
+    env: options.env,
+    detached: process.platform !== "win32",
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  const childOutcome: { launchError: Error | null } = { launchError: null };
+  child.once("error", (error) => {
+    childOutcome.launchError = error;
+  });
+  child.stdout?.resume();
+  child.stderr?.resume();
+
+  let startupProven = false;
+  try {
+    const startupDeadline = Date.now() + options.timeoutMs;
+    while (Date.now() < startupDeadline) {
+      if (childOutcome.launchError) {
+        throw new Error(
+          `${options.description} could not start: ${childOutcome.launchError.message}`,
+        );
+      }
+      if (hasPackagedDesktopStartupProof(options.logPath, options.expectedIdentityProof)) {
+        startupProven = true;
+        break;
+      }
+      const exited = childExitOutcome(child);
+      if (exited) {
+        throw new Error(
+          `${options.description} exited before startup proof (code=${exited.code ?? "null"}, signal=${exited.signal ?? "null"}).`,
+        );
+      }
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 200));
+    }
+    if (!startupProven) {
+      throw new Error(
+        `${options.description} startup proof timed out after ${options.timeoutMs}ms.`,
+      );
+    }
+
+    const pid = child.pid;
+    if (!pid) throw new Error(`${options.description} started without a process ID.`);
+    const assertRunning = (): void => {
+      if (childOutcome.launchError) {
+        throw new Error(
+          `${options.description} process failed: ${childOutcome.launchError.message}`,
+        );
+      }
+      const exited = childExitOutcome(child);
+      if (exited) {
+        throw new Error(
+          `${options.description} is not running (code=${exited.code ?? "null"}, signal=${exited.signal ?? "null"}).`,
+        );
+      }
+    };
+    return {
+      pid,
+      assertRunning,
+      waitForExit: async (timeoutMs) => {
+        if (!(await waitForExit(child, timeoutMs))) return null;
+        return childExitOutcome(child) ?? { code: null, signal: null };
+      },
+      stopControlled: async () => {
+        const existingOutcome = childExitOutcome(child);
+        if (existingOutcome) return { mode: "already-exited", ...existingOutcome };
+        const cleanupRequested = await terminateProcessTree(child);
+        const stoppedOutcome = childExitOutcome(child);
+        if (!stoppedOutcome) {
+          throw new Error(`${options.description} controlled process-tree cleanup was unproven.`);
+        }
+        if (!cleanupRequested) return { mode: "already-exited", ...stoppedOutcome };
+        return { mode: "controlled-process-tree-cleanup", ...stoppedOutcome };
+      },
+    };
+  } finally {
+    if (!startupProven && child.pid) await terminateProcessTree(child);
+  }
+}
+
+function hasExpectedPackagedDesktopIdentityProof(
+  log: string,
+  expected: PackagedDesktopIdentityProof,
+): boolean {
+  return log.split(/\r?\n/).some((line) => {
+    const proofStart = line.indexOf(PACKAGED_DESKTOP_IDENTITY_PROOF_PREFIX);
+    if (proofStart < 0) return false;
+    const actual = parsePackagedDesktopIdentityProof(line.slice(proofStart));
+    return (
+      actual !== null &&
+      actual.flavor === expected.flavor &&
+      actual.appUserModelId === expected.appUserModelId &&
+      actual.bundleId === expected.bundleId &&
+      actual.internalProtocolScheme === expected.internalProtocolScheme &&
+      actual.internalProtocolRegistered === expected.internalProtocolRegistered &&
+      actual.userDataDirectoryName === expected.userDataDirectoryName &&
+      normalize(actual.userDataPath) === normalize(expected.userDataPath) &&
+      normalize(actual.backendHomePath) === normalize(expected.backendHomePath)
+    );
+  });
+}
+
+export function hasPackagedDesktopStartupProof(
+  logPath: string,
+  expectedIdentityProof?: PackagedDesktopIdentityProof,
+): boolean {
   try {
     const log = readFileSync(logPath, "utf8");
     return (
       log.includes("app ready") &&
       log.includes("bootstrap main window created") &&
-      log.includes("bootstrap backend ready source=")
+      log.includes("bootstrap backend ready source=") &&
+      (!expectedIdentityProof ||
+        hasExpectedPackagedDesktopIdentityProof(log, expectedIdentityProof))
     );
   } catch {
     return false;
@@ -356,68 +528,22 @@ export function hasPackagedDesktopCleanExitProof(logPath: string): boolean {
 export async function verifyPackagedDesktopExecutableStartup(
   options: PackagedDesktopExecutableStartupOptions,
 ): Promise<void> {
-  const child = spawn(options.command, [...(options.args ?? [])], {
-    cwd: options.cwd,
-    env: options.env,
-    detached: process.platform !== "win32",
-    stdio: ["ignore", "pipe", "pipe"],
-    windowsHide: true,
-  });
-  const childOutcome: {
-    exited: { code: number | null; signal: NodeJS.Signals | null } | null;
-    launchError: Error | null;
-  } = { exited: null, launchError: null };
-  child.once("exit", (code, signal) => {
-    childOutcome.exited = { code, signal };
-  });
-  child.once("error", (error) => {
-    childOutcome.launchError = error;
-  });
-  child.stdout?.resume();
-  child.stderr?.resume();
-
+  const running = await launchPackagedDesktopAndWaitForStartup(options);
   try {
-    let startupProven = false;
-    const startupDeadline = Date.now() + options.timeoutMs;
-    let cleanExitDeadline: number | null = null;
-    while (Date.now() < (cleanExitDeadline ?? startupDeadline)) {
-      if (!startupProven && hasPackagedDesktopStartupProof(options.logPath)) {
-        startupProven = true;
-        cleanExitDeadline = Date.now() + 30_000;
-      }
-      if (childOutcome.launchError) {
-        throw new Error(
-          `${options.description} could not start: ${childOutcome.launchError.message}`,
-        );
-      }
-      if (childOutcome.exited) {
-        if (!startupProven) {
-          throw new Error(
-            `${options.description} exited before startup proof (code=${childOutcome.exited.code ?? "null"}, signal=${childOutcome.exited.signal ?? "null"}).`,
-          );
-        }
-        if (childOutcome.exited.code !== 0 || childOutcome.exited.signal !== null) {
-          throw new Error(
-            `${options.description} did not exit cleanly (code=${childOutcome.exited.code ?? "null"}, signal=${childOutcome.exited.signal ?? "null"}).`,
-          );
-        }
-        if (!hasPackagedDesktopCleanExitProof(options.logPath)) {
-          throw new Error(`${options.description} exited without graceful shutdown proof.`);
-        }
-        console.log(
-          `${options.description} startup and clean-exit smoke passed from isolated state.`,
-        );
-        return;
-      }
-      await new Promise((resolveDelay) => setTimeout(resolveDelay, 200));
+    const exited = await running.waitForExit(30_000);
+    if (!exited)
+      throw new Error(`${options.description} clean-exit proof timed out after startup.`);
+    if (exited.code !== 0 || exited.signal !== null) {
+      throw new Error(
+        `${options.description} did not exit cleanly (code=${exited.code ?? "null"}, signal=${exited.signal ?? "null"}).`,
+      );
     }
-    throw new Error(
-      startupProven
-        ? `${options.description} clean-exit proof timed out after startup.`
-        : `${options.description} startup proof timed out after ${options.timeoutMs}ms.`,
-    );
+    if (!hasPackagedDesktopCleanExitProof(options.logPath)) {
+      throw new Error(`${options.description} exited without graceful shutdown proof.`);
+    }
+    console.log(`${options.description} startup and clean-exit smoke passed from isolated state.`);
   } finally {
-    await terminateProcessTree(child);
+    await running.stopControlled();
   }
 }
 
@@ -459,6 +585,7 @@ export async function verifyPackagedDesktopStartup(
       logPath,
       timeoutMs: options.timeoutMs,
       description: `Packaged ${options.platform}/${options.arch}`,
+      expectedIdentityProof: createExpectedPackagedDesktopIdentityProof(options, env),
     });
   } finally {
     rmSync(temporaryRoot, { recursive: true, force: true });

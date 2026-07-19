@@ -13,7 +13,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join, normalize, resolve } from "node:path";
+import { basename, join, normalize, resolve, sep } from "node:path";
 
 import {
   SYNARA_WINDOWS_INSTALLER_GUID,
@@ -23,8 +23,11 @@ import {
 } from "@synara/shared/desktopIdentity";
 
 import {
+  createExpectedPackagedDesktopIdentityProof,
   createPackagedDesktopSmokeEnvironment,
+  launchPackagedDesktopAndWaitForStartup,
   verifyPackagedDesktopExecutableStartup,
+  type PackagedDesktopControlledStopResult,
 } from "../verify-packaged-desktop-startup.ts";
 import {
   compareSuperSynaraVersions,
@@ -74,6 +77,7 @@ export interface WindowsInstallerQualificationRuntime {
   readonly readRegistry: (target: WindowsRegistryTarget) => string | null;
   readonly runCommand: (spec: WindowsCommandSpec) => void;
   readonly readExecutableIdentity: (executablePath: string) => WindowsExecutableIdentity;
+  readonly launchStartupAndKeepRunning: typeof launchPackagedDesktopAndWaitForStartup;
   readonly verifyStartup: typeof verifyPackagedDesktopExecutableStartup;
   readonly sleep: (milliseconds: number) => Promise<void>;
 }
@@ -87,7 +91,7 @@ export interface WindowsInstallerQualificationOptions {
 }
 
 export interface WindowsInstallerQualificationReport {
-  readonly schemaVersion: 1;
+  readonly schemaVersion: 2;
   readonly platform: "windows-x64";
   readonly currentVersion: string;
   readonly upgrade: "qualified" | "not-run-no-previous-release";
@@ -97,6 +101,13 @@ export interface WindowsInstallerQualificationReport {
     readonly upstreamTag: string;
     readonly upstreamInstallerSha256: string;
     readonly upstreamProductName: "Synara";
+    readonly upstreamStartupProven: true;
+    readonly upstreamGracefulExitProven: false;
+    readonly upstreamExitMode: "controlled-process-tree-cleanup";
+    readonly upstreamControlledCleanupProven: true;
+    readonly concurrentOverlapProven: true;
+    readonly distinctProcessLocksProven: true;
+    readonly distinctProfileRootsProven: true;
     readonly upstreamExecutablePreserved: true;
     readonly upstreamRegistrationPreserved: true;
     readonly upstreamProfileSentinelsPreserved: true;
@@ -112,6 +123,11 @@ export interface WindowsInstallerQualificationReport {
   readonly installation: {
     readonly productName: "Super Synara";
     readonly executableName: "Super Synara.exe";
+    readonly appUserModelId: "io.github.slashdevcorpse.supersynara";
+    readonly bundleId: "io.github.slashdevcorpse.supersynara";
+    readonly internalProtocolScheme: "super-synara";
+    readonly userDataDirectoryName: "super-synara";
+    readonly isolatedIdentityPathsProven: true;
     readonly registrationScope: "current-user-64";
     readonly startupProven: true;
     readonly cleanExitProven: true;
@@ -375,6 +391,9 @@ function createQualificationPaths(
     { platform: "win", version: "qualification", flavor },
     process.env,
   );
+  if (flavor !== "super") {
+    delete environment.SYNARA_DESKTOP_QUALIFICATION_EXIT_AFTER_STARTUP;
+  }
   environment.TEMP = join(stateRoot, "temp");
   environment.TMP = environment.TEMP;
   mkdirSync(environment.TEMP, { recursive: true });
@@ -413,6 +432,43 @@ function createQualificationPaths(
       join(environment.APPDATA!, identity.userDataDirectoryName, "qualification-sentinel.bin"),
     ],
   };
+}
+
+function normalizedPathKey(path: string): string {
+  return normalize(resolve(path)).toLowerCase();
+}
+
+function pathsOverlap(left: string, right: string): boolean {
+  const normalizedLeft = normalizedPathKey(left);
+  const normalizedRight = normalizedPathKey(right);
+  return (
+    normalizedLeft === normalizedRight ||
+    normalizedLeft.startsWith(`${normalizedRight}${sep}`) ||
+    normalizedRight.startsWith(`${normalizedLeft}${sep}`)
+  );
+}
+
+function assertDistinctProfileRoots(
+  superPaths: QualificationPaths,
+  upstreamPaths: QualificationPaths,
+): void {
+  const superProfileRoots = [
+    superPaths.environment.SYNARA_HOME,
+    join(superPaths.environment.APPDATA!, SUPER_IDENTITY.userDataDirectoryName),
+  ];
+  const upstreamProfileRoots = [
+    upstreamPaths.environment.SYNARA_HOME,
+    join(upstreamPaths.environment.APPDATA!, UPSTREAM_IDENTITY.userDataDirectoryName),
+  ];
+  if (
+    superProfileRoots.some((superRoot) =>
+      upstreamProfileRoots.some(
+        (upstreamRoot) => !superRoot || !upstreamRoot || pathsOverlap(superRoot, upstreamRoot),
+      ),
+    )
+  ) {
+    throw new Error("Super Synara and upstream Synara qualification profile roots overlap.");
+  }
 }
 
 function snapshotSentinels(paths: ReadonlyArray<string>): ReadonlyMap<string, Buffer> {
@@ -601,6 +657,65 @@ function assertInstalledApplicationUnchanged(
   }
 }
 
+async function qualifyConcurrentSideBySideStartup(
+  runtime: WindowsInstallerQualificationRuntime,
+  upstreamPaths: QualificationPaths,
+  superPaths: QualificationPaths,
+  startupTimeoutMs: number,
+): Promise<
+  PackagedDesktopControlledStopResult & { readonly mode: "controlled-process-tree-cleanup" }
+> {
+  const upstreamProcess = await runtime.launchStartupAndKeepRunning({
+    command: upstreamPaths.executablePath,
+    cwd: upstreamPaths.installDirectory,
+    env: upstreamPaths.environment,
+    logPath: upstreamPaths.logPath,
+    timeoutMs: startupTimeoutMs,
+    description: "Installed upstream Synara windows/x64",
+  });
+  let startupFailure: unknown = null;
+  try {
+    upstreamProcess.assertRunning();
+    await runtime.verifyStartup({
+      command: superPaths.executablePath,
+      cwd: superPaths.installDirectory,
+      env: superPaths.environment,
+      logPath: superPaths.logPath,
+      timeoutMs: startupTimeoutMs,
+      description: "Installed Super Synara windows/x64",
+      expectedIdentityProof: createExpectedPackagedDesktopIdentityProof(
+        { platform: "win", flavor: "super" },
+        superPaths.environment,
+      ),
+    });
+    upstreamProcess.assertRunning();
+  } catch (error) {
+    startupFailure = error;
+  }
+
+  let stopResult: PackagedDesktopControlledStopResult;
+  try {
+    stopResult = await upstreamProcess.stopControlled();
+  } catch (cleanupError) {
+    if (startupFailure) {
+      const combinedFailure = new AggregateError(
+        [startupFailure, cleanupError],
+        "Concurrent side-by-side startup and upstream process cleanup both failed.",
+        { cause: cleanupError },
+      );
+      throw combinedFailure;
+    }
+    throw cleanupError;
+  }
+  if (startupFailure) throw startupFailure;
+  if (stopResult.mode !== "controlled-process-tree-cleanup") {
+    throw new Error(
+      `Installed upstream Synara exited before controlled cleanup (code=${stopResult.code ?? "null"}, signal=${stopResult.signal ?? "null"}).`,
+    );
+  }
+  return { ...stopResult, mode: "controlled-process-tree-cleanup" };
+}
+
 export async function qualifySuperSynaraWindowsInstaller(
   options: WindowsInstallerQualificationOptions,
   runtime: WindowsInstallerQualificationRuntime,
@@ -637,6 +752,7 @@ export async function qualifySuperSynaraWindowsInstaller(
       UPSTREAM_IDENTITY,
       "production",
     );
+    assertDistinctProfileRoots(superPaths, upstreamPaths);
   } catch (error) {
     rmSync(root, { recursive: true, force: true });
     throw error;
@@ -706,14 +822,12 @@ export async function qualifySuperSynaraWindowsInstaller(
       installedUpstream,
       "Installed upstream Synara",
     );
-    await runtime.verifyStartup({
-      command: superPaths.executablePath,
-      cwd: superPaths.installDirectory,
-      env: superPaths.environment,
-      logPath: superPaths.logPath,
-      timeoutMs: options.startupTimeoutMs,
-      description: "Installed Super Synara windows/x64",
-    });
+    await qualifyConcurrentSideBySideStartup(
+      runtime,
+      upstreamPaths,
+      superPaths,
+      options.startupTimeoutMs,
+    );
     assertSentinelsUnchanged(superSentinelSnapshot);
     assertInstalledApplicationUnchanged(
       runtime,
@@ -745,7 +859,7 @@ export async function qualifySuperSynaraWindowsInstaller(
     );
 
     report = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       platform: "windows-x64",
       currentVersion,
       upgrade: previousVersion ? "qualified" : "not-run-no-previous-release",
@@ -755,6 +869,13 @@ export async function qualifySuperSynaraWindowsInstaller(
         upstreamTag: `v${upstreamVersion}`,
         upstreamInstallerSha256,
         upstreamProductName: "Synara",
+        upstreamStartupProven: true,
+        upstreamGracefulExitProven: false,
+        upstreamExitMode: "controlled-process-tree-cleanup",
+        upstreamControlledCleanupProven: true,
+        concurrentOverlapProven: true,
+        distinctProcessLocksProven: true,
+        distinctProfileRootsProven: true,
         upstreamExecutablePreserved: true,
         upstreamRegistrationPreserved: true,
         upstreamProfileSentinelsPreserved: true,
@@ -770,6 +891,11 @@ export async function qualifySuperSynaraWindowsInstaller(
       installation: {
         productName: "Super Synara",
         executableName: "Super Synara.exe",
+        appUserModelId: "io.github.slashdevcorpse.supersynara",
+        bundleId: "io.github.slashdevcorpse.supersynara",
+        internalProtocolScheme: "super-synara",
+        userDataDirectoryName: "super-synara",
+        isolatedIdentityPathsProven: true,
         registrationScope: "current-user-64",
         startupProven: true,
         cleanExitProven: true,

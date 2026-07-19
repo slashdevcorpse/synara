@@ -60,6 +60,10 @@
       "types": "./src/desktopIdentity.ts",
       "import": "./src/desktopIdentity.ts"
     },
+    "./desktopIdentityProof": {
+      "types": "./src/desktopIdentityProof.ts",
+      "import": "./src/desktopIdentityProof.ts"
+    },
     "./Net": {
       "types": "./src/Net.ts",
       "import": "./src/Net.ts"

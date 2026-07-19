@@ -7,7 +7,10 @@ import { writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { verifyPackagedDesktopExecutableStartup } from "./verify-packaged-desktop-startup.ts";
+import {
+  launchPackagedDesktopAndWaitForStartup,
+  verifyPackagedDesktopExecutableStartup,
+} from "./verify-packaged-desktop-startup.ts";
 import {
   qualifySuperSynaraWindowsInstaller,
   type WindowsExecutableIdentity,
@@ -142,6 +145,7 @@ export function createNativeWindowsInstallerQualificationRuntime(): WindowsInsta
     readRegistry,
     runCommand,
     readExecutableIdentity,
+    launchStartupAndKeepRunning: launchPackagedDesktopAndWaitForStartup,
     verifyStartup: verifyPackagedDesktopExecutableStartup,
     sleep: (milliseconds) => new Promise((resolveDelay) => setTimeout(resolveDelay, milliseconds)),
   };

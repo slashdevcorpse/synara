@@ -410,7 +410,7 @@ jobs:
           }
           "path=$installer" >> $env:GITHUB_OUTPUT
 
-      - name: Qualify Windows install, side-by-side isolation, upgrade, and uninstall
+      - name: Qualify concurrent Windows side-by-side runtime, upgrade, and uninstall
         shell: pwsh
         env:
           VERSION: ${{ needs.preflight.outputs.version }}

@@ -54,6 +54,7 @@ import {
   resolveSynaraDesktopFlavor,
   synaraDesktopIdentity,
 } from "@synara/shared/desktopIdentity";
+import { renderPackagedDesktopIdentityProof } from "@synara/shared/desktopIdentityProof";
 import { NetService } from "@synara/shared/Net";
 import { RotatingFileSink } from "@synara/shared/logging";
 import { ensureStaticSnapshot, findAsarArchivePath } from "@synara/shared/staticSnapshot";
@@ -272,6 +273,7 @@ let desktopShutdownPromise: Promise<void> | null = null;
 let desktopStartupBlockedForMigrationRecovery = false;
 let desktopShutdownComplete = false;
 let desktopProtocolRegistered = false;
+let appIdentityConfigured = false;
 let aboutCommitHashCache: string | null | undefined;
 let appUpdateYmlCache: Record<string, string> | null | undefined;
 let desktopLogSink: RotatingFileSink | null = null;
@@ -1726,6 +1728,26 @@ function configureAppIdentity(): void {
   if (process.platform === "win32") {
     app.setAppUserModelId(APP_USER_MODEL_ID);
   }
+  appIdentityConfigured = true;
+}
+
+function writePackagedDesktopIdentityProof(): void {
+  if (!app.isPackaged) return;
+  if (!appIdentityConfigured || !desktopProtocolRegistered) {
+    throw new Error("Packaged desktop identity proof requested before identity setup completed.");
+  }
+  writeDesktopLogHeader(
+    renderPackagedDesktopIdentityProof({
+      flavor: desktopIdentity.flavor,
+      appUserModelId: process.platform === "win32" ? APP_USER_MODEL_ID : null,
+      bundleId: desktopIdentity.bundleId,
+      internalProtocolScheme: DESKTOP_SCHEME,
+      internalProtocolRegistered: true,
+      userDataDirectoryName: desktopIdentity.userDataDirectoryName,
+      userDataPath: app.getPath("userData"),
+      backendHomePath: BASE_DIR,
+    }),
+  );
 }
 
 // The packaged bundle icon is a solid, pre-rounded ICNS so Tahoe does not reinterpret
@@ -3693,6 +3715,7 @@ if (hasSingleInstanceLock) {
         }
         throw error;
       }
+      writePackagedDesktopIdentityProof();
       startBundleSwapWatcher();
       void bootstrap().catch((error) => {
         handleFatalStartupError("bootstrap", error);

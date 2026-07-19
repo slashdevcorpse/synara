@@ -5,7 +5,15 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
+  renderPackagedDesktopIdentityProof,
+  type PackagedDesktopIdentityProof,
+} from "@synara/shared/desktopIdentityProof";
+
+import {
   createPackagedDesktopSmokeEnvironment,
+  createExpectedPackagedDesktopIdentityProof,
+  hasPackagedDesktopStartupProof,
+  launchPackagedDesktopAndWaitForStartup,
   packagedDesktopExecutableFileName,
   parsePackagedDesktopStartupArgs,
   resolveNativePackagedDesktopPlatform,
@@ -123,6 +131,85 @@ describe("packaged desktop startup verification", () => {
     expect(packagedDesktopExecutableFileName("production", "win")).toBe("Synara.exe");
     expect(packagedDesktopExecutableFileName("super", "win")).toBe("Super Synara.exe");
     expect(packagedDesktopExecutableFileName("super", "mac")).toBe("Super Synara");
+  });
+
+  it.each([
+    { platform: "win" as const, appUserModelId: "io.github.slashdevcorpse.supersynara" },
+    { platform: "mac" as const, appUserModelId: null },
+  ])(
+    "requires exact baked Super identity and isolated $platform profile paths",
+    ({ platform, appUserModelId }) => {
+      const root = mkdtempSync(join(tmpdir(), `packaged-${platform}-identity-proof-test-`));
+      temporaryRoots.push(root);
+      const logPath = join(root, "desktop-main.log");
+      const env = createPackagedDesktopSmokeEnvironment(
+        join(root, "state"),
+        { platform, version: "1.2.3", flavor: "super" },
+        {},
+      );
+      const expectedIdentity = createExpectedPackagedDesktopIdentityProof(
+        { platform, flavor: "super" },
+        env,
+      );
+      expect(expectedIdentity.appUserModelId).toBe(appUserModelId);
+      const writeStartupProof = (proof: PackagedDesktopIdentityProof): void => {
+        writeFileSync(
+          logPath,
+          [
+            "app ready",
+            `[desktop] ${renderPackagedDesktopIdentityProof(proof)}`,
+            "bootstrap main window created",
+            "bootstrap backend ready source=listening",
+          ].join("\n"),
+        );
+      };
+
+      writeStartupProof(expectedIdentity);
+      expect(hasPackagedDesktopStartupProof(logPath, expectedIdentity)).toBe(true);
+      const invalidProofs: PackagedDesktopIdentityProof[] = [
+        { ...expectedIdentity, appUserModelId: "wrong.app-user-model-id" },
+        { ...expectedIdentity, bundleId: "wrong.bundle" },
+        { ...expectedIdentity, internalProtocolScheme: "wrong-scheme" },
+        { ...expectedIdentity, userDataDirectoryName: "wrong-profile" },
+        { ...expectedIdentity, userDataPath: join(root, "wrong-user-data") },
+        { ...expectedIdentity, backendHomePath: join(root, "wrong-home") },
+      ];
+      for (const invalidProof of invalidProofs) {
+        writeStartupProof(invalidProof);
+        expect(hasPackagedDesktopStartupProof(logPath, expectedIdentity)).toBe(false);
+      }
+    },
+  );
+
+  it("keeps a startup-proven process alive until controlled tree cleanup", async () => {
+    const root = mkdtempSync(join(tmpdir(), "packaged-running-handle-test-"));
+    temporaryRoots.push(root);
+    const logPath = join(root, "desktop-main.log");
+    writeFileSync(
+      logPath,
+      [
+        "app ready",
+        "bootstrap main window created",
+        "bootstrap backend ready source=listening",
+      ].join("\n"),
+    );
+    const running = await launchPackagedDesktopAndWaitForStartup({
+      command: process.execPath,
+      args: ["-e", "setInterval(() => {}, 1000)"],
+      cwd: root,
+      env: process.env,
+      logPath,
+      timeoutMs: 5_000,
+      description: "Fake long-running packaged app",
+    });
+    try {
+      expect(() => running.assertRunning()).not.toThrow();
+      const result = await running.stopControlled();
+      expect(result.mode).toBe("controlled-process-tree-cleanup");
+      expect(() => running.assertRunning()).toThrow("is not running");
+    } finally {
+      await running.stopControlled();
+    }
   });
 
   it("requires both startup and graceful clean-exit log proof", async () => {
