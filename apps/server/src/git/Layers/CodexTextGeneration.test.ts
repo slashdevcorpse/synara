@@ -1,7 +1,12 @@
+import { existsSync, realpathSync } from "node:fs";
+import * as NodePath from "node:path";
+
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
 import { Effect, FileSystem, Layer, Path } from "effect";
 import { expect } from "vitest";
+
+import { resolveCodexCliExecutable } from "@synara/shared/codexCliExecutable";
 
 import { ServerConfig } from "../../config.ts";
 import { CodexTextGenerationLive } from "./CodexTextGeneration.ts";
@@ -31,99 +36,121 @@ function acquireCodexEnvLock() {
   });
 }
 
+function fakeCodexNodeScript(): string {
+  return [
+    'import fs from "node:fs";',
+    "",
+    "const args = process.argv.slice(2);",
+    'let outputPath = "";',
+    "let seenImage = false;",
+    "let seenSkipGitRepoCheck = false;",
+    "let seenApprovalNever = false;",
+    "for (let index = 0; index < args.length; index += 1) {",
+    "  const argument = args[index];",
+    '  if (argument === "--image") {',
+    "    index += 1;",
+    "    seenImage = Boolean(args[index]);",
+    "    continue;",
+    "  }",
+    '  if (argument === "--skip-git-repo-check") {',
+    "    seenSkipGitRepoCheck = true;",
+    "    continue;",
+    "  }",
+    '  if (argument === "--config") {',
+    "    index += 1;",
+    "    seenApprovalNever ||= args[index] === 'approval_policy=\"never\"';",
+    "    continue;",
+    "  }",
+    '  if (argument === "--output-last-message") {',
+    "    index += 1;",
+    '    outputPath = args[index] ?? "";',
+    "  }",
+    "}",
+    "",
+    'const stdinContent = fs.readFileSync(0, "utf8");',
+    "const fail = (message, code) => {",
+    "  process.stderr.write(`${message}\\n`);",
+    "  process.exit(code);",
+    "};",
+    'if (process.env.SYNARA_FAKE_CODEX_REQUIRE_IMAGE === "1" && !seenImage) {',
+    '  fail("missing --image input", 2);',
+    "}",
+    'if (process.env.SYNARA_FAKE_CODEX_REQUIRE_SKIP_GIT_REPO_CHECK === "1" && !seenSkipGitRepoCheck) {',
+    '  fail("missing --skip-git-repo-check", 9);',
+    "}",
+    'if (process.env.SYNARA_FAKE_CODEX_REQUIRE_APPROVAL_NEVER === "1" && !seenApprovalNever) {',
+    '  fail("missing approval_policy=never", 10);',
+    "}",
+    "if (process.env.SYNARA_FAKE_CODEX_STDIN_MUST_CONTAIN && !stdinContent.includes(process.env.SYNARA_FAKE_CODEX_STDIN_MUST_CONTAIN)) {",
+    '  fail("stdin missing expected content", 3);',
+    "}",
+    "if (process.env.SYNARA_FAKE_CODEX_STDIN_MUST_NOT_CONTAIN && stdinContent.includes(process.env.SYNARA_FAKE_CODEX_STDIN_MUST_NOT_CONTAIN)) {",
+    '  fail("stdin contained forbidden content", 4);',
+    "}",
+    'if (process.env.SYNARA_FAKE_CODEX_REQUIRE_CODEX_HOME === "1" && !process.env.CODEX_HOME) {',
+    '  fail("missing CODEX_HOME", 5);',
+    "}",
+    'if (process.env.SYNARA_FAKE_CODEX_REQUIRE_AUTH_JSON === "1" && !fs.existsSync(`${process.env.CODEX_HOME}/auth.json`)) {',
+    '  fail("missing auth.json in CODEX_HOME", 6);',
+    "}",
+    "if (process.env.SYNARA_FAKE_CODEX_CODEX_HOME_CONFIG_MUST_CONTAIN) {",
+    '  const config = fs.readFileSync(`${process.env.CODEX_HOME}/config.toml`, "utf8");',
+    "  if (!config.includes(process.env.SYNARA_FAKE_CODEX_CODEX_HOME_CONFIG_MUST_CONTAIN)) {",
+    '    fail("CODEX_HOME config missing expected content", 7);',
+    "  }",
+    "}",
+    "if (process.env.SYNARA_FAKE_CODEX_CODEX_HOME_CONFIG_MUST_NOT_CONTAIN) {",
+    '  const config = fs.readFileSync(`${process.env.CODEX_HOME}/config.toml`, "utf8");',
+    "  if (config.includes(process.env.SYNARA_FAKE_CODEX_CODEX_HOME_CONFIG_MUST_NOT_CONTAIN)) {",
+    '    fail("CODEX_HOME config contained forbidden content", 8);',
+    "  }",
+    "}",
+    "if (process.env.SYNARA_FAKE_CODEX_STDERR) {",
+    "  process.stderr.write(`${process.env.SYNARA_FAKE_CODEX_STDERR}\\n`);",
+    "}",
+    "if (outputPath) {",
+    '  fs.writeFileSync(outputPath, Buffer.from(process.env.SYNARA_FAKE_CODEX_OUTPUT_B64 ?? "e30=", "base64"));',
+    "}",
+    'process.exit(Number.parseInt(process.env.SYNARA_FAKE_CODEX_EXIT_CODE ?? "0", 10));',
+    "",
+  ].join("\n");
+}
+
+function inheritedPathWithoutNativeCodex(pathValue: string | undefined): string[] {
+  const entries = (pathValue ?? "").split(NodePath.delimiter).filter(Boolean);
+  if (process.platform !== "win32") return entries;
+
+  return entries.filter((entry) => {
+    const directory = entry.startsWith('"') && entry.endsWith('"') ? entry.slice(1, -1) : entry;
+    return !["codex.exe", "codex.com"].some((name) => existsSync(NodePath.join(directory, name)));
+  });
+}
+
 function makeFakeCodexBinary(dir: string) {
   return Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const binDir = path.join(dir, "bin");
-    const codexPath = path.join(binDir, "codex");
+    const codexPath = path.join(binDir, process.platform === "win32" ? "codex.cmd" : "codex");
+    const scriptPath = path.join(binDir, "fake-codex.mjs");
     yield* fs.makeDirectory(binDir, { recursive: true });
+    yield* fs.writeFileString(scriptPath, fakeCodexNodeScript());
 
-    yield* fs.writeFileString(
-      codexPath,
-      [
-        "#!/bin/sh",
-        'output_path=""',
-        "while [ $# -gt 0 ]; do",
-        '  if [ "$1" = "--image" ]; then',
-        "    shift",
-        '    if [ -n "$1" ]; then',
-        '      seen_image="1"',
-        "    fi",
-        "    continue",
-        "  fi",
-        '  if [ "$1" = "--skip-git-repo-check" ]; then',
-        '    seen_skip_git_repo_check="1"',
-        "  fi",
-        '  if [ "$1" = "--config" ]; then',
-        "    shift",
-        '    if [ "$1" = "approval_policy=\\"never\\"" ]; then',
-        '      seen_approval_never="1"',
-        "    fi",
-        "    continue",
-        "  fi",
-        '  if [ "$1" = "--output-last-message" ]; then',
-        "    shift",
-        '    output_path="$1"',
-        "  fi",
-        "  shift",
-        "done",
-        'stdin_content="$(cat)"',
-        'if [ "$SYNARA_FAKE_CODEX_REQUIRE_IMAGE" = "1" ] && [ "$seen_image" != "1" ]; then',
-        '  printf "%s\\n" "missing --image input" >&2',
-        "  exit 2",
-        "fi",
-        'if [ "$SYNARA_FAKE_CODEX_REQUIRE_SKIP_GIT_REPO_CHECK" = "1" ] && [ "$seen_skip_git_repo_check" != "1" ]; then',
-        '  printf "%s\\n" "missing --skip-git-repo-check" >&2',
-        "  exit 9",
-        "fi",
-        'if [ "$SYNARA_FAKE_CODEX_REQUIRE_APPROVAL_NEVER" = "1" ] && [ "$seen_approval_never" != "1" ]; then',
-        '  printf "%s\\n" "missing approval_policy=never" >&2',
-        "  exit 10",
-        "fi",
-        'if [ -n "$SYNARA_FAKE_CODEX_STDIN_MUST_CONTAIN" ]; then',
-        '  printf "%s" "$stdin_content" | grep -F -- "$SYNARA_FAKE_CODEX_STDIN_MUST_CONTAIN" >/dev/null || {',
-        '    printf "%s\\n" "stdin missing expected content" >&2',
-        "    exit 3",
-        "  }",
-        "fi",
-        'if [ -n "$SYNARA_FAKE_CODEX_STDIN_MUST_NOT_CONTAIN" ]; then',
-        '  if printf "%s" "$stdin_content" | grep -F -- "$SYNARA_FAKE_CODEX_STDIN_MUST_NOT_CONTAIN" >/dev/null; then',
-        '    printf "%s\\n" "stdin contained forbidden content" >&2',
-        "    exit 4",
-        "  fi",
-        "fi",
-        'if [ "$SYNARA_FAKE_CODEX_REQUIRE_CODEX_HOME" = "1" ] && [ -z "$CODEX_HOME" ]; then',
-        '  printf "%s\\n" "missing CODEX_HOME" >&2',
-        "  exit 5",
-        "fi",
-        'if [ "$SYNARA_FAKE_CODEX_REQUIRE_AUTH_JSON" = "1" ] && [ ! -f "$CODEX_HOME/auth.json" ]; then',
-        '  printf "%s\\n" "missing auth.json in CODEX_HOME" >&2',
-        "  exit 6",
-        "fi",
-        'if [ -n "$SYNARA_FAKE_CODEX_CODEX_HOME_CONFIG_MUST_CONTAIN" ]; then',
-        '  grep -F -- "$SYNARA_FAKE_CODEX_CODEX_HOME_CONFIG_MUST_CONTAIN" "$CODEX_HOME/config.toml" >/dev/null || {',
-        '    printf "%s\\n" "CODEX_HOME config missing expected content" >&2',
-        "    exit 7",
-        "  }",
-        "fi",
-        'if [ -n "$SYNARA_FAKE_CODEX_CODEX_HOME_CONFIG_MUST_NOT_CONTAIN" ]; then',
-        '  if grep -F -- "$SYNARA_FAKE_CODEX_CODEX_HOME_CONFIG_MUST_NOT_CONTAIN" "$CODEX_HOME/config.toml" >/dev/null; then',
-        '    printf "%s\\n" "CODEX_HOME config contained forbidden content" >&2',
-        "    exit 8",
-        "  fi",
-        "fi",
-        'if [ -n "$SYNARA_FAKE_CODEX_STDERR" ]; then',
-        '  printf "%s\\n" "$SYNARA_FAKE_CODEX_STDERR" >&2',
-        "fi",
-        'if [ -n "$output_path" ]; then',
-        '  node -e \'const fs=require("node:fs"); const value=process.argv[2] ?? ""; fs.writeFileSync(process.argv[1], Buffer.from(value, "base64"));\' "$output_path" "${SYNARA_FAKE_CODEX_OUTPUT_B64:-e30=}"',
-        "fi",
-        'exit "${SYNARA_FAKE_CODEX_EXIT_CODE:-0}"',
-        "",
-      ].join("\n"),
-    );
-    yield* fs.chmod(codexPath, 0o755);
+    if (process.platform === "win32") {
+      const escapedNodePath = process.execPath.replaceAll("%", "%%");
+      yield* fs.writeFileString(
+        codexPath,
+        ["@echo off", `@"${escapedNodePath}" "%~dp0fake-codex.mjs" %*`, ""].join("\r\n"),
+      );
+    } else {
+      const escapedNodePath = process.execPath.replaceAll("'", "'\\''");
+      const escapedScriptPath = scriptPath.replaceAll("'", "'\\''");
+      yield* fs.writeFileString(
+        codexPath,
+        ["#!/bin/sh", `exec '${escapedNodePath}' '${escapedScriptPath}' "$@"`, ""].join("\n"),
+      );
+      yield* fs.chmod(codexPath, 0o755);
+    }
     return binDir;
   });
 }
@@ -152,6 +179,8 @@ function withFakeCodexEnv<A, E, R>(
       const tempDir = yield* fs.makeTempDirectoryScoped({ prefix: "synara-codex-text-" });
       const binDir = yield* makeFakeCodexBinary(tempDir);
       const previousPath = process.env.PATH;
+      const previousCodexInstallDir = process.env.CODEX_INSTALL_DIR;
+      const previousLocalAppData = process.env.LOCALAPPDATA;
       const previousSynaraHome = process.env.SYNARA_HOME;
       const previousOutput = process.env.SYNARA_FAKE_CODEX_OUTPUT_B64;
       const previousExitCode = process.env.SYNARA_FAKE_CODEX_EXIT_CODE;
@@ -170,8 +199,17 @@ function withFakeCodexEnv<A, E, R>(
         process.env.SYNARA_FAKE_CODEX_CODEX_HOME_CONFIG_MUST_NOT_CONTAIN;
 
       yield* Effect.sync(() => {
-        process.env.PATH = `${binDir}:${previousPath ?? ""}`;
+        process.env.PATH = [binDir, ...inheritedPathWithoutNativeCodex(previousPath)].join(
+          NodePath.delimiter,
+        );
+        process.env.CODEX_INSTALL_DIR = tempDir;
+        process.env.LOCALAPPDATA = tempDir;
         process.env.SYNARA_HOME = tempDir;
+        if (process.platform === "win32") {
+          expect(
+            realpathSync.native(resolveCodexCliExecutable("codex", { env: process.env })),
+          ).toBe(realpathSync.native(NodePath.join(binDir, "codex.cmd")));
+        }
         process.env.SYNARA_FAKE_CODEX_OUTPUT_B64 = Buffer.from(input.output, "utf8").toString(
           "base64",
         );
@@ -247,6 +285,8 @@ function withFakeCodexEnv<A, E, R>(
 
       return {
         previousPath,
+        previousCodexInstallDir,
+        previousLocalAppData,
         previousSynaraHome,
         previousOutput,
         previousExitCode,
@@ -267,6 +307,16 @@ function withFakeCodexEnv<A, E, R>(
     (previous) =>
       Effect.sync(() => {
         process.env.PATH = previous.previousPath;
+        if (previous.previousCodexInstallDir === undefined) {
+          delete process.env.CODEX_INSTALL_DIR;
+        } else {
+          process.env.CODEX_INSTALL_DIR = previous.previousCodexInstallDir;
+        }
+        if (previous.previousLocalAppData === undefined) {
+          delete process.env.LOCALAPPDATA;
+        } else {
+          process.env.LOCALAPPDATA = previous.previousLocalAppData;
+        }
         if (previous.previousSynaraHome === undefined) {
           delete process.env.SYNARA_HOME;
         } else {
