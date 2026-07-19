@@ -60,6 +60,9 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      - name: Verify dependency install preserved source
+        run: node scripts/verify-release-worktree-clean.ts
+
       - id: downstream
         name: Validate downstream state
         shell: bash
@@ -114,6 +117,12 @@ jobs:
             --zip "${zips[0]}" \
             --electron-version 40.10.6 \
             --output macos-arm64-signature-audit.json
+
+      - name: Verify build changed only declared outputs
+        run: |
+          node scripts/verify-release-worktree-clean.ts \
+            release-audit \
+            macos-arm64-signature-audit.json
 
       - name: Upload inventory only
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

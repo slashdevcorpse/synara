@@ -47,4 +47,43 @@ describe("Super Synara workflow contracts", () => {
       ),
     ).toThrow("missing or placeholder macOS signature policy");
   });
+
+  it("rejects root Playwright lookup and missing source-cleanliness checks", () => {
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          "cd apps/web && ./node_modules/.bin/playwright install --with-deps chromium",
+          "./node_modules/.bin/playwright install --with-deps chromium",
+        ),
+        audit,
+      ),
+    ).toThrow("workspace-local Playwright binary");
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replaceAll(
+          "node scripts/verify-release-worktree-clean.ts",
+          "node scripts/source-check-removed.ts",
+        ),
+        audit,
+      ),
+    ).toThrow("source cleanliness");
+  });
+
+  it("rejects drift from the plan-locked dispatch interface", () => {
+    expect(() =>
+      verifySuperSynaraWorkflowText(main.replace("confirm_unsigned:", "confirm_release:"), audit),
+    ).toThrow("confirmation input");
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace('[[ "$TAG" == "super-v$VERSION" ]]', "true"),
+        audit,
+      ),
+    ).toThrow("explicit tag matches the version");
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace("group: super-synara-prerelease", "group: alternate-release"),
+        audit,
+      ),
+    ).toThrow("plan-locked concurrency group");
+  });
 });

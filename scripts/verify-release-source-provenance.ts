@@ -9,10 +9,9 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { releasePackageFiles } from "./update-release-package-versions.ts";
-import {
-  validateReleaseSourcePolicy,
-} from "./lib/release-source-provenance-policy.ts";
+import { validateReleaseSourcePolicy } from "./lib/release-source-provenance-policy.ts";
 import type { ReleaseDistributionKind } from "./lib/release-artifact-provenance.ts";
+import { verifyReleaseWorktreeCleanliness } from "./lib/release-worktree-cleanliness.ts";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const [
@@ -62,18 +61,7 @@ if (sourceCommit !== expectedCommit.toLowerCase()) {
   throw new Error(`Release HEAD ${sourceCommit} does not match workflow commit ${expectedCommit}.`);
 }
 
-const gitStatus = spawnSync("git", ["status", "--porcelain=v1", "--untracked-files=all"], {
-  cwd: repoRoot,
-  encoding: "utf8",
-});
-if (gitStatus.status !== 0) {
-  throw new Error(`Unable to inspect release worktree: ${gitStatus.stderr.trim() || "git failed"}`);
-}
-if (gitStatus.stdout.trim().length > 0) {
-  throw new Error(
-    "Release source worktree is not clean; provenance must name committed bytes only.",
-  );
-}
+verifyReleaseWorktreeCleanliness(repoRoot);
 
 const packageVersions = releasePackageFiles.map((relativePath) => {
   const packageJson = JSON.parse(readFileSync(resolve(repoRoot, relativePath), "utf8")) as {
@@ -102,10 +90,16 @@ if (distributionKind === "github-unsigned-prerelease" && requireReservedTag) {
   }
   const tagCommit = tagCommitResult.stdout.trim().toLowerCase();
   if (tagCommit !== sourceCommit) {
-    throw new Error(`Reserved Super Synara tag ${tag} points to ${tagCommit}, not ${sourceCommit}.`);
+    throw new Error(
+      `Reserved Super Synara tag ${tag} points to ${tagCommit}, not ${sourceCommit}.`,
+    );
   }
   sourceTag = tag;
-} else if (distributionKind !== "github-unsigned-prerelease" && refType === "tag" && refName === tag) {
+} else if (
+  distributionKind !== "github-unsigned-prerelease" &&
+  refType === "tag" &&
+  refName === tag
+) {
   const tagCommitResult = spawnSync("git", ["rev-parse", `${tag}^{commit}`], {
     cwd: repoRoot,
     encoding: "utf8",

@@ -7,7 +7,11 @@ on:
         description: "Downstream version (for example 0.5.5-super.1)"
         required: true
         type: string
-      confirm_unsigned_publication:
+      tag:
+        description: "Exact immutable tag (for example super-v0.5.5-super.1)"
+        required: true
+        type: string
+      confirm_unsigned:
         description: "I understand this publishes unsigned installers with operating-system warnings"
         required: true
         default: false
@@ -17,7 +21,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: super-synara-unsigned-prerelease
+  group: super-synara-prerelease
   cancel-in-progress: false
 
 jobs:
@@ -56,18 +60,23 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      - name: Verify dependency install preserved source
+        run: node scripts/verify-release-worktree-clean.ts
+
       - id: meta
         name: Require explicit unsigned publication confirmation
         shell: bash
         env:
           VERSION: ${{ inputs.version }}
-          CONFIRMED: ${{ inputs.confirm_unsigned_publication }}
+          TAG: ${{ inputs.tag }}
+          CONFIRMED: ${{ inputs.confirm_unsigned }}
         run: |
           set -euo pipefail
           [[ "$CONFIRMED" == "true" ]]
           [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+-super\.[1-9][0-9]*$ ]]
+          [[ "$TAG" == "super-v$VERSION" ]]
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "tag=super-v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
       - id: budget
         name: Bind repository artifact byte budgets
@@ -150,7 +159,7 @@ jobs:
         run: bun run test
 
       - name: Install Chromium test runtime
-        run: ./node_modules/.bin/playwright install --with-deps chromium
+        run: cd apps/web && ./node_modules/.bin/playwright install --with-deps chromium
 
       - name: Run stable browser tests
         run: bun run --cwd apps/web test:browser:stable
@@ -247,6 +256,9 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      - name: Verify dependency install preserved source
+        run: node scripts/verify-release-worktree-clean.ts
+
       - name: Revalidate tagged source
         shell: bash
         env:
@@ -330,6 +342,9 @@ jobs:
             release-publish \
             "${{ needs.preflight.outputs.max_windows_bytes }}"
 
+      - name: Verify Windows build changed only declared outputs
+        run: node scripts/verify-release-worktree-clean.ts release-build release-publish
+
       - name: Upload exact Windows lane
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -366,6 +381,9 @@ jobs:
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
+
+      - name: Verify dependency install preserved source
+        run: node scripts/verify-release-worktree-clean.ts
 
       - name: Revalidate tagged source
         shell: bash
@@ -469,6 +487,9 @@ jobs:
             release-publish \
             "${{ needs.preflight.outputs.max_macos_bytes }}"
 
+      - name: Verify macOS build changed only declared outputs
+        run: node scripts/verify-release-worktree-clean.ts release-build release-publish
+
       - name: Upload exact macOS lane
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -508,6 +529,9 @@ jobs:
 
       - name: Install dependencies
         run: bun install --frozen-lockfile --ignore-scripts
+
+      - name: Verify dependency install preserved source
+        run: node scripts/verify-release-worktree-clean.ts
 
       - name: Download Windows lane
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -673,6 +697,9 @@ jobs:
           EXPECTED: ${{ needs.preflight.outputs.absorbed_upstream_sha }}
           ACTUAL: ${{ steps.downstream.outputs.absorbed_upstream_sha }}
         run: test "$ACTUAL" = "$EXPECTED"
+
+      - name: Verify publication preparation changed only declared outputs
+        run: node scripts/verify-release-worktree-clean.ts release-stage release-redownload
 
       - name: Validate state immediately before publication
         shell: bash

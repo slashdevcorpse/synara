@@ -56,8 +56,29 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
   );
   requireText(
     main,
-    "confirm_unsigned_publication:",
+    "confirm_unsigned:",
     "Unsigned public publication must require an explicit confirmation input.",
+  );
+  prohibitText(
+    main,
+    "confirm_unsigned_publication:",
+    "Publication must use the plan-locked confirmation input name.",
+  );
+  requireText(main, "\n      tag:\n", "Publication dispatch must require an explicit tag input.");
+  requireText(
+    main,
+    '[[ "$TAG" == "super-v$VERSION" ]]',
+    "Publication must fail unless the explicit tag matches the version.",
+  );
+  requireText(
+    main,
+    "group: super-synara-prerelease",
+    "Publication must use the plan-locked concurrency group.",
+  );
+  requireText(
+    main,
+    "cd apps/web && ./node_modules/.bin/playwright install --with-deps chromium",
+    "Browser preflight must use the workspace-local Playwright binary.",
   );
   requireText(
     main,
@@ -107,6 +128,23 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
     "macOS publication must use the isolated Super packaging entry point.",
   );
   prohibitText(main, "--desktop-flavor", "Publication must not use the superseded flavor flag.");
+  const mainCleanlinessChecks =
+    main.match(/node scripts\/verify-release-worktree-clean\.ts/g)?.length ?? 0;
+  if (mainCleanlinessChecks < 7) {
+    throw new Error(
+      "Publication must prove source cleanliness after installs, builds, and staging.",
+    );
+  }
+  requireText(
+    main,
+    "verify-release-worktree-clean.ts release-build release-publish",
+    "Native lanes must admit only their declared build and publication outputs.",
+  );
+  requireText(
+    main,
+    "verify-release-worktree-clean.ts release-stage release-redownload",
+    "Publication must recheck source cleanliness after release staging.",
+  );
   requireText(
     main,
     "collect-super-synara-macos-signatures.ts",
@@ -154,6 +192,11 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
   requireText(audit, 'test "$(uname -m)" = arm64', "Audit must prove arm64 host architecture.");
   prohibitText(audit, "contents: write", "Audit must not receive write permission.");
   requireText(audit, "--mode audit", "Audit must emit unclassified inventory evidence.");
+  const auditCleanlinessChecks =
+    audit.match(/node scripts\/verify-release-worktree-clean\.ts/g)?.length ?? 0;
+  if (auditCleanlinessChecks < 2) {
+    throw new Error("Audit must prove source cleanliness after install and inventory generation.");
+  }
   requireText(
     audit,
     "bun run dist:desktop:super:mac --",
