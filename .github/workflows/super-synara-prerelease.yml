@@ -70,9 +70,11 @@ jobs:
           VERSION: ${{ inputs.version }}
           TAG: ${{ inputs.tag }}
           CONFIRMED: ${{ inputs.confirm_unsigned }}
+          REF_PROTECTED: ${{ github.ref_protected }}
         run: |
           set -euo pipefail
           [[ "$CONFIRMED" == "true" ]]
+          [[ "$REF_PROTECTED" == "true" ]]
           [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+-super\.[1-9][0-9]*$ ]]
           [[ "$TAG" == "super-v$VERSION" ]]
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
@@ -310,6 +312,7 @@ jobs:
             --assets-dir release-publish \
             --platform win \
             --arch x64 \
+            --flavor super \
             --version "$VERSION"
 
       - id: upstream_release
@@ -532,14 +535,15 @@ jobs:
 
       - name: Admit exact macOS signatures
         shell: bash
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
         run: |
           set -euo pipefail
-          shopt -s nullglob
-          zips=(release-build/*.zip)
-          [[ "${#zips[@]}" -eq 1 ]]
+          disk_image="release-build/Super-Synara-$VERSION-macos-arm64-unsigned.dmg"
+          [[ -f "$disk_image" ]]
           node scripts/collect-super-synara-macos-signatures.ts \
             --mode admit \
-            --zip "${zips[0]}" \
+            --dmg "$disk_image" \
             --electron-version 40.10.6 \
             --allowlist scripts/super-synara-macos-signature-allowlist.json \
             --output "$RUNNER_TEMP/macos-signatures.json"
@@ -553,6 +557,7 @@ jobs:
             --assets-dir release-build \
             --platform mac \
             --arch arm64 \
+            --flavor super \
             --version "$VERSION"
 
       - name: Stage exact macOS payload and provenance
@@ -704,7 +709,7 @@ jobs:
           gh release create "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --target "$SOURCE_COMMIT" \
-            --title "Super Synara $VERSION (unsigned prerelease)" \
+            --title "Unofficial downstream Super Synara $VERSION (unsigned prerelease)" \
             --notes-file release-stage/UNSIGNED-BUILD.md \
             --draft \
             --prerelease \

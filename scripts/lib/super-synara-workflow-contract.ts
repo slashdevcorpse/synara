@@ -13,6 +13,22 @@ function prohibitText(haystack: string, needle: string, message: string): void {
   if (haystack.includes(needle)) throw new Error(message);
 }
 
+function continuedShellCommands(workflow: string, commandNeedle: string): ReadonlyArray<string> {
+  const lines = workflow.split("\n");
+  const commands: string[] = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    if (!lines[index]?.includes(commandNeedle)) continue;
+    const commandLines = [lines[index]!.trim()];
+    while (commandLines.at(-1)?.endsWith("\\")) {
+      index += 1;
+      if (index >= lines.length) break;
+      commandLines.push(lines[index]!.trim());
+    }
+    commands.push(commandLines.join("\n"));
+  }
+  return commands;
+}
+
 function requirePinnedActions(workflow: string, label: string): void {
   const uses = [...workflow.matchAll(/^\s*uses:\s*(\S+)/gm)].map((match) => match[1]!);
   if (uses.length === 0) throw new Error(`${label} must use explicitly pinned actions.`);
@@ -74,6 +90,16 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
     main,
     "group: super-synara-prerelease",
     "Publication must use the plan-locked concurrency group.",
+  );
+  requireText(
+    main,
+    "REF_PROTECTED: ${{ github.ref_protected }}",
+    "Publication must bind GitHub protected-ref state.",
+  );
+  requireText(
+    main,
+    '[[ "$REF_PROTECTED" == "true" ]]',
+    "Publication must fail closed unless the dispatch ref is protected.",
   );
   requireText(
     main,
@@ -144,6 +170,20 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
       "Windows qualification must bind both upstream-core and previous-release selection to the requested Super version.",
     );
   }
+  const packagedStartupCommands = continuedShellCommands(
+    main,
+    "node scripts/verify-packaged-desktop-startup.ts",
+  );
+  if (packagedStartupCommands.length !== 2) {
+    throw new Error("Publication must run exactly two packaged startup verifications.");
+  }
+  for (const command of packagedStartupCommands) {
+    requireText(
+      command,
+      "--flavor super",
+      "Packaged startup verification must select Super flavor.",
+    );
+  }
   const packagedStartupIndex = main.indexOf("verify-packaged-desktop-startup.ts");
   const installerQualificationIndex = main.indexOf("qualify-super-synara-windows-installer.ts");
   if (packagedStartupIndex < 0 || installerQualificationIndex <= packagedStartupIndex) {
@@ -200,6 +240,18 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
     "collect-super-synara-macos-signatures.ts",
     "macOS publication must collect signature evidence.",
   );
+  const admissionCommands = continuedShellCommands(
+    main,
+    "node scripts/collect-super-synara-macos-signatures.ts",
+  );
+  if (admissionCommands.length !== 1 || !admissionCommands[0]!.includes('--dmg "$disk_image"')) {
+    throw new Error("macOS publication signature admission must inspect the exact final DMG.");
+  }
+  prohibitText(
+    admissionCommands[0]!,
+    "--zip",
+    "macOS publication signature admission must not rely on ZIP-only evidence.",
+  );
   requireText(main, "--mode admit", "macOS publication must use fail-closed admission mode.");
   requireText(
     main,
@@ -225,6 +277,11 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
     requireText(main, asset, `Publication contract is missing ${asset}.`);
   }
   requireText(main, "gh release create", "Publication must start from an owned GitHub draft.");
+  requireText(
+    main,
+    '--title "Unofficial downstream Super Synara $VERSION (unsigned prerelease)"',
+    "Release title must prominently identify the unofficial downstream and unsigned prerelease.",
+  );
   requireText(main, "gh release upload", "Publication must upload to the owned draft.");
   requireText(main, "cmp ", "Publication must compare redownloaded bytes exactly.");
   requireText(main, "make_latest=false", "Unsigned prerelease must not become GitHub Latest.");
@@ -239,6 +296,16 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
   }
 
   requireText(audit, "permissions:\n  contents: read", "Audit must be read-only.");
+  requireText(
+    audit,
+    "REF_PROTECTED: ${{ github.ref_protected }}",
+    "Audit must bind GitHub protected-ref state.",
+  );
+  requireText(
+    audit,
+    '[[ "$REF_PROTECTED" == "true" ]]',
+    "Audit must fail closed unless the dispatch ref is protected.",
+  );
   requireText(audit, 'test "$(uname -m)" = arm64', "Audit must prove arm64 host architecture.");
   prohibitText(audit, "contents: write", "Audit must not receive write permission.");
   for (const auditSourceNeedle of [
@@ -261,6 +328,14 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
     "bun run dist:desktop:super:mac --",
     "Audit must use the isolated Super packaging entry point.",
   );
+  const auditCommands = continuedShellCommands(
+    audit,
+    "node scripts/collect-super-synara-macos-signatures.ts",
+  );
+  if (auditCommands.length !== 1 || !auditCommands[0]!.includes("--dmg")) {
+    throw new Error("macOS signature audit must inspect the built DMG directly.");
+  }
+  prohibitText(auditCommands[0]!, "--zip", "macOS signature audit must not rely on ZIP evidence.");
   prohibitText(audit, "--desktop-flavor", "Audit must not use the superseded flavor flag.");
   prohibitText(audit, "--allowlist", "Audit must not classify objects with an allowlist.");
   requireText(audit, "retention-days: 1", "Audit inventory retention must be one day.");

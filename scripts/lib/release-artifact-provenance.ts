@@ -701,8 +701,12 @@ function resolveSigningEvidence(
     if (input.platform === "linux") {
       throw new Error("Unsigned GitHub prereleases support only Windows and macOS.");
     }
-    const installer = requireSingleArtifact(artifacts, input.platform === "mac" ? ".dmg" : ".exe");
+    const publishableArtifact = requireSingleArtifact(
+      artifacts,
+      input.platform === "mac" ? ".dmg" : ".exe",
+    );
     if (input.platform === "win") {
+      const installer = publishableArtifact;
       if (artifacts.length !== 1) {
         throw new Error("Windows unsigned provenance must describe exactly one staged artifact.");
       }
@@ -731,18 +735,30 @@ function resolveSigningEvidence(
         "Unsigned macOS prerelease provenance requires a signature report and reviewed allowlist.",
       );
     }
+    const identity = validateMacUnsignedSignatureReport(
+      input.macSignatureReport,
+      input.macSignatureAllowlist,
+    );
+    if (
+      identity.diskImage.fileName !== publishableArtifact.fileName ||
+      identity.diskImage.size !== publishableArtifact.size ||
+      identity.diskImage.sha256 !== publishableArtifact.sha256
+    ) {
+      throw new Error(
+        `macOS signature report disk-image evidence does not match staged ${publishableArtifact.fileName}.`,
+      );
+    }
     return {
       status: "unsigned-prerelease",
       scheme: "ad-hoc-only",
       thirdPartyComponents: "reviewed-allowlist",
-      identity: validateMacUnsignedSignatureReport(
-        input.macSignatureReport,
-        input.macSignatureAllowlist,
-      ),
+      identity,
       checks: [
         "all product-owned binaries ad-hoc-only",
         "reviewed third-party signature allowlist exact match",
-        "app notarization ticket absent",
+        "published DMG filename, size, and SHA-256 match signature report",
+        "published DMG has no Developer ID signature",
+        "DMG and app notarization tickets explicitly absent",
       ],
     };
   }

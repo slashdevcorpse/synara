@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -10,6 +10,7 @@ import {
 } from "@synara/shared/desktopIdentityProof";
 
 import {
+  assertPackagedMacBundleIdentity,
   createPackagedDesktopSmokeEnvironment,
   createExpectedPackagedDesktopIdentityProof,
   hasPackagedDesktopStartupProof,
@@ -17,10 +18,28 @@ import {
   packagedDesktopExecutableFileName,
   parsePackagedDesktopStartupArgs,
   resolveNativePackagedDesktopPlatform,
+  type SyncTextCommandRunner,
   verifyPackagedDesktopExecutableStartup,
 } from "./verify-packaged-desktop-startup.ts";
 
 const temporaryRoots: string[] = [];
+
+function plistRunnerFor(
+  executable: string,
+  identifier: string,
+  displayName = executable,
+): SyncTextCommandRunner {
+  return () => ({
+    status: 0,
+    stdout: JSON.stringify({
+      CFBundleExecutable: executable,
+      CFBundleIdentifier: identifier,
+      CFBundleName: displayName,
+      CFBundleDisplayName: displayName,
+    }),
+    stderr: "",
+  });
+}
 
 afterEach(() => {
   for (const root of temporaryRoots.splice(0)) {
@@ -210,6 +229,84 @@ describe("packaged desktop startup verification", () => {
     } finally {
       await running.stopControlled();
     }
+  });
+
+  it("reads and locks Super macOS bundle identity before launch", () => {
+    const root = mkdtempSync(join(tmpdir(), "super-synara-packaged-plist-test-"));
+    temporaryRoots.push(root);
+    const appBundle = join(root, "Super Synara.app");
+    const plistPath = join(appBundle, "Contents", "Info.plist");
+    const executablePath = join(appBundle, "Contents", "MacOS", "Super Synara");
+    mkdirSync(join(appBundle, "Contents", "MacOS"), { recursive: true });
+    writeFileSync(plistPath, "binary plist fixture");
+    writeFileSync(executablePath, "executable fixture");
+
+    const invocations: ReadonlyArray<string>[] = [];
+    const runner = (command: string, args: ReadonlyArray<string>) => {
+      invocations.push([command, ...args]);
+      return {
+        status: 0,
+        stdout: JSON.stringify({
+          CFBundleExecutable: "Super Synara",
+          CFBundleIdentifier: "io.github.slashdevcorpse.supersynara",
+          CFBundleName: "Super Synara",
+          CFBundleDisplayName: "Super Synara",
+        }),
+        stderr: "",
+      };
+    };
+
+    expect(assertPackagedMacBundleIdentity(appBundle, "super", runner)).toBe(executablePath);
+    expect(invocations).toEqual([["/usr/bin/plutil", "-convert", "json", "-o", "-", plistPath]]);
+  });
+
+  it("fails closed on macOS plist identity drift while preserving production identity", () => {
+    const root = mkdtempSync(join(tmpdir(), "synara-packaged-plist-drift-test-"));
+    temporaryRoots.push(root);
+    const createApp = (name: string, executableName: string): string => {
+      const appBundle = join(root, name);
+      mkdirSync(join(appBundle, "Contents", "MacOS"), { recursive: true });
+      writeFileSync(join(appBundle, "Contents", "Info.plist"), "binary plist fixture");
+      writeFileSync(join(appBundle, "Contents", "MacOS", executableName), "executable fixture");
+      return appBundle;
+    };
+    const superApp = createApp("Super Synara.app", "Super Synara");
+    const productionApp = createApp("Synara.app", "Synara");
+    expect(() =>
+      assertPackagedMacBundleIdentity(
+        superApp,
+        "super",
+        plistRunnerFor("Super Synara", "com.emanueledipietro.synara"),
+      ),
+    ).toThrow("CFBundleIdentifier mismatch");
+    expect(() =>
+      assertPackagedMacBundleIdentity(
+        superApp,
+        "super",
+        plistRunnerFor("Synara", "io.github.slashdevcorpse.supersynara"),
+      ),
+    ).toThrow("CFBundleExecutable mismatch");
+    expect(() =>
+      assertPackagedMacBundleIdentity(
+        superApp,
+        "super",
+        plistRunnerFor("Super Synara", "io.github.slashdevcorpse.supersynara", "Synara"),
+      ),
+    ).toThrow("CFBundleName mismatch");
+    expect(
+      assertPackagedMacBundleIdentity(
+        productionApp,
+        "production",
+        plistRunnerFor("Synara", "com.emanueledipietro.synara"),
+      ),
+    ).toBe(join(productionApp, "Contents", "MacOS", "Synara"));
+    expect(() =>
+      assertPackagedMacBundleIdentity(superApp, "super", () => ({
+        status: 1,
+        stdout: "",
+        stderr: "missing plist key",
+      })),
+    ).toThrow("Could not read packaged macOS Info.plist");
   });
 
   it("requires both startup and graceful clean-exit log proof", async () => {

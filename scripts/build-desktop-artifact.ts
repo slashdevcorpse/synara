@@ -24,6 +24,7 @@ import {
   createDesktopIdentityBuildConfig,
   findProhibitedUpdaterMetadataFiles,
   isProhibitedUpdaterMetadataFile,
+  resolveDesktopFinalArtifactCopies,
   resolveDesktopPlatformBuildVersion,
   resolveDesktopSourceTag,
 } from "./lib/desktop-artifact-policy.ts";
@@ -1174,22 +1175,45 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
   const stageEntries = yield* fs.readDirectory(stageDistDir);
   yield* fs.makeDirectory(options.outputDir, { recursive: true });
 
-  const copiedArtifacts: string[] = [];
+  const stageFileNames: string[] = [];
   for (const entry of stageEntries) {
-    const from = path.join(stageDistDir, entry);
-    const stat = yield* fs.stat(from).pipe(Effect.catch(() => Effect.succeed(null)));
-    if (!stat || stat.type !== "File") continue;
-    if (options.disableUpdates && isProhibitedUpdaterMetadataFile(entry)) {
+    const candidate = path.join(stageDistDir, entry);
+    const stat = yield* fs.stat(candidate).pipe(Effect.catch(() => Effect.succeed(null)));
+    if (stat?.type === "File") stageFileNames.push(entry);
+  }
+  const artifactCopies = yield* Effect.try({
+    try: () =>
+      resolveDesktopFinalArtifactCopies({
+        flavor: options.flavor,
+        platform: options.platform,
+        target: options.target,
+        arch: options.arch,
+        version: appVersion,
+        stageFileNames,
+      }),
+    catch: (cause) =>
+      new BuildScriptError({
+        message: cause instanceof Error ? cause.message : String(cause),
+        cause,
+      }),
+  });
+
+  const copiedArtifacts: string[] = [];
+  for (const artifactCopy of artifactCopies) {
+    const from = path.join(stageDistDir, artifactCopy.sourceFileName);
+    if (options.disableUpdates && isProhibitedUpdaterMetadataFile(artifactCopy.sourceFileName)) {
       yield* Effect.log(
-        `[desktop-artifact] Omitting updater metadata from disabled build: ${entry}`,
+        `[desktop-artifact] Omitting updater metadata from disabled build: ${artifactCopy.sourceFileName}`,
       );
       continue;
     }
 
     const outputEntry =
-      options.platform === "mac" && options.arch !== "arm64" && entry === "latest-mac.yml"
+      options.platform === "mac" &&
+      options.arch !== "arm64" &&
+      artifactCopy.outputFileName === "latest-mac.yml"
         ? `latest-mac-${options.arch}.yml`
-        : entry;
+        : artifactCopy.outputFileName;
     const to = path.join(options.outputDir, outputEntry);
     yield* fs.copyFile(from, to);
     copiedArtifacts.push(to);

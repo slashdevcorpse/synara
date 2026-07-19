@@ -4,13 +4,31 @@
 import { existsSync, readdirSync } from "node:fs";
 import { basename, join, relative } from "node:path";
 
-import type { SynaraDesktopFlavor, SynaraDesktopIdentity } from "@synara/shared/desktopIdentity";
+import {
+  synaraDesktopIdentity,
+  type SynaraDesktopFlavor,
+  type SynaraDesktopIdentity,
+} from "@synara/shared/desktopIdentity";
 
 export interface DesktopGitHubPublishConfig {
   readonly provider: "github";
   readonly owner: string;
   readonly repo: string;
   readonly releaseType: "release";
+}
+
+export interface DesktopFinalArtifactCopy {
+  readonly sourceFileName: string;
+  readonly outputFileName: string;
+}
+
+export interface ResolveDesktopFinalArtifactCopiesInput {
+  readonly flavor: Exclude<SynaraDesktopFlavor, "development">;
+  readonly platform: "linux" | "mac" | "win";
+  readonly target: string;
+  readonly arch: string;
+  readonly version: string;
+  readonly stageFileNames: ReadonlyArray<string>;
 }
 
 const FROZEN_STAGE_INSTALL_ARGS = [
@@ -102,6 +120,57 @@ export function createDesktopIdentityBuildConfig(input: {
     extraResources: [{ from: "LICENSE", to: "LICENSE" }],
     ...(publish ? { publish: [publish] } : {}),
   };
+}
+
+export function resolveDesktopFinalArtifactCopies(
+  input: ResolveDesktopFinalArtifactCopiesInput,
+): ReadonlyArray<DesktopFinalArtifactCopy> {
+  if (new Set(input.stageFileNames).size !== input.stageFileNames.length) {
+    throw new Error("Staged desktop artifact file names must be unique.");
+  }
+
+  const unchanged = (): ReadonlyArray<DesktopFinalArtifactCopy> =>
+    input.stageFileNames.map((fileName) => ({
+      sourceFileName: fileName,
+      outputFileName: fileName,
+    }));
+
+  if (input.flavor !== "super") return unchanged();
+
+  const contract =
+    input.platform === "win" && input.target === "nsis"
+      ? { extension: "exe", platformName: "windows" }
+      : input.platform === "mac" && input.target === "dmg"
+        ? { extension: "dmg", platformName: "macos" }
+        : null;
+  if (!contract) return unchanged();
+
+  const identity = synaraDesktopIdentity(input.flavor);
+  const expectedSourceFileName = `${identity.artifactPrefix}-${input.version}-${input.arch}.${contract.extension}`;
+  const payloadCandidates = input.stageFileNames.filter((fileName) =>
+    fileName.toLowerCase().endsWith(`.${contract.extension}`),
+  );
+  if (payloadCandidates.length !== 1) {
+    throw new Error(
+      `Expected exactly one Super Synara ${input.platform}/${input.target} .${contract.extension} payload, found ${payloadCandidates.length}: ${payloadCandidates.join(", ") || "<none>"}.`,
+    );
+  }
+  if (payloadCandidates[0] !== expectedSourceFileName) {
+    throw new Error(
+      `Unexpected Super Synara ${input.platform}/${input.target} payload ${payloadCandidates[0]}; expected ${expectedSourceFileName}.`,
+    );
+  }
+
+  const finalPayloadFileName = `${identity.artifactPrefix}-${input.version}-${contract.platformName}-${input.arch}-unsigned.${contract.extension}`;
+  const copies = input.stageFileNames.map((fileName) => ({
+    sourceFileName: fileName,
+    outputFileName: fileName === expectedSourceFileName ? finalPayloadFileName : fileName,
+  }));
+  const outputFileNames = copies.map((copy) => copy.outputFileName);
+  if (new Set(outputFileNames).size !== outputFileNames.length) {
+    throw new Error("Resolved desktop artifact output file names must be unique.");
+  }
+  return copies;
 }
 
 export function isProhibitedUpdaterMetadataFile(fileName: string): boolean {

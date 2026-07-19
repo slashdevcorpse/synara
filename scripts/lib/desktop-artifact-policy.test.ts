@@ -12,6 +12,7 @@ import {
   findProhibitedUpdaterMetadataFiles,
   isProhibitedUpdaterMetadataFile,
   resolveDesktopGitHubPublishConfig,
+  resolveDesktopFinalArtifactCopies,
   resolveDesktopPlatformBuildVersion,
   resolveDesktopSourceTag,
   resolveDesktopStageInstallArgs,
@@ -127,6 +128,100 @@ describe("desktop artifact policy", () => {
       forceCodeSigning: false,
       extraResources: [{ from: "LICENSE", to: "LICENSE" }],
     });
+  });
+
+  it("resolves exact public Super installer and disk-image names", () => {
+    expect(
+      resolveDesktopFinalArtifactCopies({
+        flavor: "super",
+        platform: "win",
+        target: "nsis",
+        arch: "x64",
+        version: "0.5.5-super.3",
+        stageFileNames: ["Super-Synara-0.5.5-super.3-x64.exe"],
+      }),
+    ).toEqual([
+      {
+        sourceFileName: "Super-Synara-0.5.5-super.3-x64.exe",
+        outputFileName: "Super-Synara-0.5.5-super.3-windows-x64-unsigned.exe",
+      },
+    ]);
+
+    expect(
+      resolveDesktopFinalArtifactCopies({
+        flavor: "super",
+        platform: "mac",
+        target: "dmg",
+        arch: "arm64",
+        version: "0.5.5-super.3",
+        stageFileNames: [
+          "Super-Synara-0.5.5-super.3-arm64.dmg",
+          "Super-Synara-0.5.5-super.3-arm64.zip",
+        ],
+      }),
+    ).toEqual([
+      {
+        sourceFileName: "Super-Synara-0.5.5-super.3-arm64.dmg",
+        outputFileName: "Super-Synara-0.5.5-super.3-macos-arm64-unsigned.dmg",
+      },
+      {
+        sourceFileName: "Super-Synara-0.5.5-super.3-arm64.zip",
+        outputFileName: "Super-Synara-0.5.5-super.3-arm64.zip",
+      },
+    ]);
+  });
+
+  it("leaves production, canary, and verification-only macOS zip names unchanged", () => {
+    for (const input of [
+      {
+        flavor: "production",
+        platform: "win",
+        target: "nsis",
+        arch: "x64",
+        version: "1.2.3",
+        stageFileNames: ["Synara-1.2.3-x64.exe"],
+      },
+      {
+        flavor: "canary",
+        platform: "mac",
+        target: "dmg",
+        arch: "arm64",
+        version: "1.2.3-canary.1",
+        stageFileNames: ["Synara-Canary-1.2.3-canary.1-arm64.dmg"],
+      },
+    ] as const) {
+      expect(resolveDesktopFinalArtifactCopies(input)).toEqual(
+        input.stageFileNames.map((fileName) => ({
+          sourceFileName: fileName,
+          outputFileName: fileName,
+        })),
+      );
+    }
+  });
+
+  it("rejects duplicate and unexpected Super publishable payloads", () => {
+    const input = {
+      flavor: "super" as const,
+      platform: "win" as const,
+      target: "nsis",
+      arch: "x64",
+      version: "0.5.5-super.3",
+    };
+    expect(() =>
+      resolveDesktopFinalArtifactCopies({
+        ...input,
+        stageFileNames: [
+          "Super-Synara-0.5.5-super.3-x64.exe",
+          "Super-Synara-0.5.5-super.3-windows-x64-unsigned.exe",
+        ],
+      }),
+    ).toThrow("Expected exactly one");
+    expect(() =>
+      resolveDesktopFinalArtifactCopies({
+        ...input,
+        stageFileNames: ["Other-0.5.5-super.3-x64.exe"],
+      }),
+    ).toThrow("Unexpected Super Synara");
   });
 
   it("ignores every update repository fallback when updates are disabled", () => {

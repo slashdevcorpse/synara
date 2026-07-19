@@ -4,15 +4,29 @@
 // Layer: Native release verification
 
 import { spawnSync } from "node:child_process";
-import { lstatSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import {
+  createReadStream,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join, relative } from "node:path";
+import { basename, join, relative } from "node:path";
 
 import {
+  type MacDiskImageEvidence,
   type MacSignatureAuditInventory,
   type MacSignatureAllowlist,
   type MacSignatureIdentity,
   type MacUnsignedSignatureReport,
+  classifyMacSignatureCandidateFileDescription,
+  classifyMacNotarizationTicket,
+  collectMacSignatureCandidatePaths,
   validateMacSignatureAllowlist,
   validateMacSignatureAuditInventory,
   validateMacUnsignedSignatureReport,
@@ -41,7 +55,7 @@ function run(
 
 function parseArgs(argv: ReadonlyArray<string>): {
   readonly mode: "audit" | "admit";
-  readonly zip: string;
+  readonly dmg: string;
   readonly electronVersion: string;
   readonly allowlist: string | null;
   readonly output: string;
@@ -55,7 +69,7 @@ function parseArgs(argv: ReadonlyArray<string>): {
     }
     values.set(name, value);
   }
-  const known = new Set(["--mode", "--zip", "--electron-version", "--allowlist", "--output"]);
+  const known = new Set(["--mode", "--dmg", "--electron-version", "--allowlist", "--output"]);
   for (const name of values.keys()) {
     if (!known.has(name)) throw new Error(`Unknown macOS signature argument: ${name}.`);
   }
@@ -77,37 +91,28 @@ function parseArgs(argv: ReadonlyArray<string>): {
   }
   return {
     mode,
-    zip: required("--zip"),
+    dmg: required("--dmg"),
     electronVersion: required("--electron-version"),
     allowlist,
     output: required("--output"),
   };
 }
 
-function candidateFiles(root: string): string[] {
-  const candidates: string[] = [];
-  const visit = (directory: string): void => {
-    for (const entryName of readdirSync(directory)) {
-      const path = join(directory, entryName);
-      const entry = lstatSync(path);
-      if (entry.isSymbolicLink()) continue;
-      if (entry.isDirectory()) {
-        visit(path);
-      } else if (
-        entry.isFile() &&
-        ((entry.mode & 0o111) !== 0 || /\.(?:dylib|node|so)$/i.test(entryName))
-      ) {
-        candidates.push(path);
-      }
-    }
-  };
-  visit(root);
-  return candidates;
+function hashFileSha256(path: string): Promise<string> {
+  return new Promise((resolveHash, reject) => {
+    const hash = createHash("sha256");
+    const stream = createReadStream(path);
+    stream.on("error", reject);
+    stream.on("data", (chunk) => hash.update(chunk));
+    stream.on("end", () => resolveHash(hash.digest("hex")));
+  });
 }
 
-function parseSignature(path: string, appBundlePath: string): MacSignatureIdentity | null {
+function parseSignature(path: string, appBundlePath: string): MacSignatureIdentity {
   const result = run("codesign", ["-d", "--verbose=4", path], true);
-  if (result.status !== 0) return null;
+  if (result.status !== 0) {
+    throw new Error(`Signed code candidate lacks readable codesign identity: ${path}.`);
+  }
   const value = (name: string): string | null =>
     new RegExp(`^${name}=(.*)$`, "m").exec(result.output)?.[1]?.trim() || null;
   const teamIdValue = value("TeamIdentifier");
@@ -117,13 +122,73 @@ function parseSignature(path: string, appBundlePath: string): MacSignatureIdenti
     .filter((entry): entry is string => Boolean(entry));
   const cdHash = value("CDHash");
   if (!cdHash) throw new Error(`codesign returned no CDHash for ${path}.`);
+  const signature = value("Signature");
+  const scheme = teamId || authorities.length > 0 ? "developer-id" : "ad-hoc-only";
+  if (scheme === "ad-hoc-only" && signature !== "adhoc") {
+    throw new Error(`Signed code candidate lacks explicit Signature=adhoc evidence: ${path}.`);
+  }
   return {
     path: path === appBundlePath ? "." : relative(appBundlePath, path).replaceAll("\\", "/"),
     identifier: value("Identifier"),
     teamId,
     authorities,
     cdHash,
-    scheme: teamId || authorities.length > 0 ? "developer-id" : "ad-hoc-only",
+    signature,
+    scheme,
+  };
+}
+
+function signedCodeCandidatePaths(appBundlePath: string): ReadonlyArray<string> {
+  return collectMacSignatureCandidatePaths(appBundlePath).filter((path) => {
+    if (lstatSync(path).isDirectory()) return true;
+    const fileType = run("/usr/bin/file", ["-b", path], true);
+    if (fileType.status !== 0) {
+      throw new Error(`Could not classify executable candidate ${path}: ${fileType.output}.`);
+    }
+    return classifyMacSignatureCandidateFileDescription(fileType.output) === "mach-o";
+  });
+}
+
+function inspectDiskImageCodeSignature(
+  diskImagePath: string,
+): MacDiskImageEvidence["codeSignature"] {
+  const result = run("codesign", ["-d", "--verbose=4", diskImagePath], true);
+  const value = (name: string): string | null =>
+    new RegExp(`^${name}=(.*)$`, "m").exec(result.output)?.[1]?.trim() || null;
+  const teamIdValue = value("TeamIdentifier");
+  const teamId = !teamIdValue || teamIdValue === "not set" ? null : teamIdValue;
+  const authorities = [...result.output.matchAll(/^Authority=(.*)$/gm)]
+    .map((match) => match[1]?.trim())
+    .filter((entry): entry is string => Boolean(entry));
+  if (result.status !== 0) {
+    return {
+      command: "codesign -d --verbose=4",
+      exitCode: result.status,
+      output: result.output,
+      status: /code object is not signed at all/i.test(result.output)
+        ? "unsigned"
+        : "indeterminate",
+      teamId,
+      authorities,
+      cdHash: value("CDHash"),
+      signature: value("Signature"),
+    };
+  }
+  const signature = value("Signature");
+  return {
+    command: "codesign -d --verbose=4",
+    exitCode: result.status,
+    output: result.output,
+    status:
+      teamId || authorities.length > 0
+        ? "developer-id"
+        : signature === "adhoc"
+          ? "ad-hoc-only"
+          : "indeterminate",
+    teamId,
+    authorities,
+    cdHash: value("CDHash"),
+    signature,
   };
 }
 
@@ -132,31 +197,63 @@ if (process.platform !== "darwin") {
 }
 const options = parseArgs(process.argv.slice(2));
 const extractionRoot = mkdtempSync(join(tmpdir(), "super-synara-signatures-"));
+const mountPoint = join(extractionRoot, "mounted-dmg");
+let mounted = false;
+let inspectionFailure: Error | null = null;
+let detachFailure: Error | null = null;
+let removalFailure: Error | null = null;
 try {
-  run("ditto", ["-x", "-k", options.zip, extractionRoot]);
-  const appBundles = readdirSync(extractionRoot).filter((entry) => {
-    const candidate = join(extractionRoot, entry);
+  const diskImageStat = lstatSync(options.dmg);
+  if (!diskImageStat.isFile() || diskImageStat.isSymbolicLink()) {
+    throw new Error(`macOS signature input must be a regular DMG file: ${options.dmg}.`);
+  }
+  mkdirSync(mountPoint);
+  run("hdiutil", ["attach", "-readonly", "-nobrowse", "-mountpoint", mountPoint, options.dmg]);
+  mounted = true;
+  const appBundles = readdirSync(mountPoint).filter((entry) => {
+    const candidate = join(mountPoint, entry);
     return entry.endsWith(".app") && lstatSync(candidate).isDirectory();
   });
   if (appBundles.length !== 1) {
     throw new Error(`Expected exactly one top-level app bundle, found ${appBundles.length}.`);
   }
   const appBundle = appBundles[0]!;
-  const appBundlePath = join(extractionRoot, appBundle);
+  if (appBundle !== "Super Synara.app") {
+    throw new Error(`Expected locked Super Synara.app in DMG, found ${appBundle}.`);
+  }
+  const appBundlePath = join(mountPoint, appBundle);
   const deepVerification = run(
     "codesign",
     ["--verify", "--deep", "--strict", "--verbose=4", appBundlePath],
     true,
   );
 
-  const signatures = [appBundlePath, ...candidateFiles(appBundlePath)]
-    .map((path) => parseSignature(path, appBundlePath))
-    .filter((identity): identity is MacSignatureIdentity => identity !== null);
-  const notarization = run("xcrun", ["stapler", "validate", appBundlePath], true);
+  const signatures = [appBundlePath, ...signedCodeCandidatePaths(appBundlePath)].map((path) =>
+    parseSignature(path, appBundlePath),
+  );
+  const appNotarization = run("xcrun", ["stapler", "validate", appBundlePath], true);
+  const diskImageNotarization = run("xcrun", ["stapler", "validate", options.dmg], true);
+  const appNotarizationEvidence = {
+    command: "xcrun stapler validate" as const,
+    exitCode: appNotarization.status,
+    output: appNotarization.output,
+  };
+  const diskImageNotarizationEvidence = {
+    command: "xcrun stapler validate" as const,
+    exitCode: diskImageNotarization.status,
+    output: diskImageNotarization.output,
+  };
+  const diskImage = {
+    fileName: basename(options.dmg),
+    size: diskImageStat.size,
+    sha256: await hashFileSha256(options.dmg),
+    codeSignature: inspectDiskImageCodeSignature(options.dmg),
+  };
   if (options.mode === "audit") {
     const inventory: MacSignatureAuditInventory = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       kind: "macos-signature-audit-inventory",
+      diskImage,
       appBundle,
       electronVersion: options.electronVersion,
       deepVerification: {
@@ -164,11 +261,15 @@ try {
         exitCode: deepVerification.status,
         output: deepVerification.output,
       },
-      notarizationTicket: notarization.status === 0 ? "present" : "absent",
-      notarizationEvidence: {
-        command: "xcrun stapler validate",
-        exitCode: notarization.status,
-        output: notarization.output,
+      notarization: {
+        diskImage: {
+          ticket: classifyMacNotarizationTicket(diskImageNotarizationEvidence),
+          evidence: diskImageNotarizationEvidence,
+        },
+        appBundle: {
+          ticket: classifyMacNotarizationTicket(appNotarizationEvidence),
+          evidence: appNotarizationEvidence,
+        },
       },
       codeObjects: signatures,
     };
@@ -194,14 +295,24 @@ try {
     }
     const productPaths = new Set(allowlist.productOwnedPaths);
     const report: MacUnsignedSignatureReport = {
-      schemaVersion: 1,
+      schemaVersion: 2,
+      diskImage,
       appBundle,
       electronVersion: options.electronVersion,
-      notarizationTicket: notarization.status === 0 ? "present" : "absent",
-      notarizationEvidence: {
-        command: "xcrun stapler validate",
-        exitCode: notarization.status,
-        output: notarization.output,
+      deepVerification: {
+        command: "codesign --verify --deep --strict --verbose=4",
+        exitCode: deepVerification.status,
+        output: deepVerification.output,
+      },
+      notarization: {
+        diskImage: {
+          ticket: classifyMacNotarizationTicket(diskImageNotarizationEvidence),
+          evidence: diskImageNotarizationEvidence,
+        },
+        appBundle: {
+          ticket: classifyMacNotarizationTicket(appNotarizationEvidence),
+          evidence: appNotarizationEvidence,
+        },
       },
       productOwned: signatures.filter((identity) => productPaths.has(identity.path)),
       thirdParty: signatures.filter((identity) => !productPaths.has(identity.path)),
@@ -213,6 +324,31 @@ try {
     });
     console.log(`Wrote reviewed macOS signature evidence to ${options.output}.`);
   }
+} catch (cause) {
+  inspectionFailure = cause instanceof Error ? cause : new Error(String(cause));
 } finally {
-  rmSync(extractionRoot, { recursive: true, force: true });
+  if (mounted) {
+    try {
+      const detached = run("hdiutil", ["detach", mountPoint], true);
+      if (detached.status !== 0) {
+        detachFailure = new Error(`Could not detach inspected DMG: ${detached.output}.`);
+      }
+    } catch (cause) {
+      detachFailure = cause instanceof Error ? cause : new Error(String(cause));
+    }
+  }
+  try {
+    rmSync(extractionRoot, { recursive: true, force: true });
+  } catch (cause) {
+    removalFailure = cause instanceof Error ? cause : new Error(String(cause));
+  }
 }
+if (detachFailure || removalFailure) {
+  throw new AggregateError(
+    [inspectionFailure, detachFailure, removalFailure].filter(
+      (error): error is Error => error !== null,
+    ),
+    "macOS signature inspection cleanup failed.",
+  );
+}
+if (inspectionFailure) throw inspectionFailure;

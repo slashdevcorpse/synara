@@ -158,6 +158,63 @@ describe("Super Synara workflow contracts", () => {
     );
   });
 
+  it("rejects unprotected dispatches and weakened release labeling", () => {
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace('[[ "$REF_PROTECTED" == "true" ]]', "true"),
+        audit,
+      ),
+    ).toThrow("dispatch ref is protected");
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main,
+        audit.replace('[[ "$REF_PROTECTED" == "true" ]]', "true"),
+      ),
+    ).toThrow("dispatch ref is protected");
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          "Unofficial downstream Super Synara $VERSION (unsigned prerelease)",
+          "Super Synara $VERSION (unsigned prerelease)",
+        ),
+        audit,
+      ),
+    ).toThrow("unofficial downstream and unsigned prerelease");
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          "Unofficial downstream Super Synara $VERSION (unsigned prerelease)",
+          "Unofficial downstream Super Synara $VERSION (prerelease)",
+        ),
+        audit,
+      ),
+    ).toThrow("unofficial downstream and unsigned prerelease");
+  });
+
+  it("rejects production-default startup smoke and ZIP-only macOS evidence", () => {
+    expect(() =>
+      verifySuperSynaraWorkflowText(main.replace("--flavor super", "--flavor production"), audit),
+    ).toThrow("startup verification must select Super flavor");
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace("--flavor super \\", "--flavor-removed \\"),
+        audit,
+      ),
+    ).toThrow("startup verification must select Super flavor");
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace('--dmg "$disk_image"', '--zip "${zips[0]}"'),
+        audit,
+      ),
+    ).toThrow("inspect the exact final DMG");
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main,
+        audit.replace('--dmg "${dmgs[0]}"', '--zip "${zips[0]}"'),
+      ),
+    ).toThrow("inspect the built DMG directly");
+  });
+
   it("rejects an audit detached from protected main or mislabeled as publication", () => {
     expect(() =>
       verifySuperSynaraWorkflowText(

@@ -11,6 +11,7 @@ import {
   writeReleaseArtifactProvenanceWithRuntimeForTest,
   type ReleaseArtifactProvenanceInput,
 } from "./release-artifact-provenance.ts";
+import type { MacUnsignedSignatureReport } from "./super-synara-macos-signatures.ts";
 
 const temporaryRoots: string[] = [];
 
@@ -344,7 +345,11 @@ describe("release artifact provenance", () => {
       macSignatureAllowlist: {
         schemaVersion: 1,
         electronVersion: "40.10.6",
-        productOwnedPaths: ["Contents/MacOS/Super Synara"],
+        productOwnedPaths: [
+          ".",
+          "Contents/MacOS/Super Synara",
+          "Contents/Helpers/synara-appsnap-helper",
+        ],
         thirdParty: [
           {
             path: "Contents/Frameworks/Electron Framework.framework/Versions/A/Electron Framework",
@@ -356,22 +361,75 @@ describe("release artifact provenance", () => {
         ],
       },
       macSignatureReport: {
-        schemaVersion: 1,
+        schemaVersion: 2,
+        diskImage: {
+          fileName: diskImage,
+          size: Buffer.byteLength("unsigned-dmg"),
+          sha256: createHash("sha256").update("unsigned-dmg").digest("hex"),
+          codeSignature: {
+            command: "codesign -d --verbose=4",
+            exitCode: 1,
+            output: "code object is not signed at all",
+            status: "unsigned",
+            teamId: null,
+            authorities: [],
+            cdHash: null,
+            signature: null,
+          },
+        },
         appBundle: "Super Synara.app",
         electronVersion: "40.10.6",
-        notarizationTicket: "absent",
-        notarizationEvidence: {
-          command: "xcrun stapler validate",
-          exitCode: 65,
-          output: "The validate action failed because no ticket was found.",
+        deepVerification: {
+          command: "codesign --verify --deep --strict --verbose=4",
+          exitCode: 0,
+          output: "valid on disk",
+        },
+        notarization: {
+          diskImage: {
+            ticket: "absent",
+            evidence: {
+              command: "xcrun stapler validate",
+              exitCode: 65,
+              output:
+                'CloudKit query for Super Synara.dmg (2/abc) failed due to "Record not found".\nCould not find base64 encoded ticket in response for 2/abc',
+            },
+          },
+          appBundle: {
+            ticket: "absent",
+            evidence: {
+              command: "xcrun stapler validate",
+              exitCode: 65,
+              output:
+                'CloudKit query for Super Synara.app (2/def) failed due to "Record not found".\nCould not find base64 encoded ticket in response for 2/def',
+            },
+          },
         },
         productOwned: [
+          {
+            path: ".",
+            identifier: "io.github.slashdevcorpse.supersynara",
+            teamId: null,
+            authorities: [],
+            cdHash: "3".repeat(40),
+            signature: "adhoc",
+            scheme: "ad-hoc-only",
+          },
           {
             path: "Contents/MacOS/Super Synara",
             identifier: "io.github.slashdevcorpse.supersynara",
             teamId: null,
             authorities: [],
             cdHash: "1".repeat(40),
+            signature: "adhoc",
+            scheme: "ad-hoc-only",
+          },
+          {
+            path: "Contents/Helpers/synara-appsnap-helper",
+            identifier: "synara-appsnap-helper",
+            teamId: null,
+            authorities: [],
+            cdHash: "4".repeat(40),
+            signature: "adhoc",
             scheme: "ad-hoc-only",
           },
         ],
@@ -382,6 +440,7 @@ describe("release artifact provenance", () => {
             teamId: null,
             authorities: [],
             cdHash: "2".repeat(40),
+            signature: "adhoc",
             scheme: "ad-hoc-only",
           },
         ],
@@ -393,6 +452,46 @@ describe("release artifact provenance", () => {
       scheme: "ad-hoc-only",
       thirdPartyComponents: "reviewed-allowlist",
     });
+
+    await expect(
+      writeReleaseArtifactProvenance({
+        assetsDirectory: createNativeAsset(diskImage, "mutated-dmg"),
+        artifactFileNames: [diskImage],
+        outputFileName: "artifact-macos-arm64.provenance.json",
+        platform: "mac",
+        arch: "arm64",
+        target: "dmg",
+        version,
+        sourceCommit: "d".repeat(40),
+        sourceTag: `super-v${version}`,
+        lockfileSha256: "e".repeat(64),
+        publication: true,
+        signed: false,
+        distributionKind: "github-unsigned-prerelease",
+        distributionRepository: "slashdevcorpse/synara",
+        updaterFeed: false,
+        absorbedUpstreamSha: "f".repeat(40),
+        macSignatureAllowlist: {
+          schemaVersion: 1,
+          electronVersion: "40.10.6",
+          productOwnedPaths: [
+            ".",
+            "Contents/MacOS/Super Synara",
+            "Contents/Helpers/synara-appsnap-helper",
+          ],
+          thirdParty: [
+            {
+              path: "Contents/Frameworks/Electron Framework.framework/Versions/A/Electron Framework",
+              identifier: "com.github.Electron.framework",
+              teamId: null,
+              authorities: [],
+              scheme: "ad-hoc-only",
+            },
+          ],
+        },
+        macSignatureReport: result.manifest.signing.identity as MacUnsignedSignatureReport,
+      }),
+    ).rejects.toThrow("disk-image evidence does not match staged");
   });
 
   it("continues rejecting unsigned calls through signed-release policy", async () => {

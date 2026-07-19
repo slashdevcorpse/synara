@@ -8,6 +8,7 @@ import {
   chmodSync,
   copyFileSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -138,6 +139,18 @@ interface LaunchCommand {
   readonly cwd: string;
 }
 
+interface SyncTextCommandResult {
+  readonly error?: Error;
+  readonly status: number | null;
+  readonly stdout: string;
+  readonly stderr: string;
+}
+
+export type SyncTextCommandRunner = (
+  command: string,
+  args: ReadonlyArray<string>,
+) => SyncTextCommandResult;
+
 export interface PackagedDesktopExecutableStartupOptions {
   readonly command: string;
   readonly args?: ReadonlyArray<string>;
@@ -165,30 +178,161 @@ export interface RunningPackagedDesktop {
   stopControlled(): Promise<PackagedDesktopControlledStopResult>;
 }
 
+const runSyncTextCommand: SyncTextCommandRunner = (command, args) => {
+  const result = spawnSync(command, [...args], {
+    encoding: "utf8",
+    maxBuffer: 8 * 1024 * 1024,
+    shell: false,
+    windowsHide: true,
+  });
+  return {
+    ...(result.error ? { error: result.error } : {}),
+    status: result.status,
+    stdout: result.stdout || "",
+    stderr: result.stderr || "",
+  };
+};
+
+function readMacPlist(plistPath: string, runner: SyncTextCommandRunner): Record<string, unknown> {
+  const result = runner("/usr/bin/plutil", ["-convert", "json", "-o", "-", plistPath]);
+  if (result.error) {
+    throw new Error(`Could not read packaged macOS Info.plist: ${result.error.message}`);
+  }
+  if (result.status !== 0) {
+    throw new Error(
+      `Could not read packaged macOS Info.plist: ${(result.stderr || result.stdout).trim() || `plutil exited with ${result.status ?? "unknown"}`}.`,
+    );
+  }
+  try {
+    const value: unknown = JSON.parse(result.stdout);
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new Error("plist JSON root is not an object");
+    }
+    return value as Record<string, unknown>;
+  } catch (cause) {
+    throw new Error(
+      `Could not parse packaged macOS Info.plist: ${cause instanceof Error ? cause.message : String(cause)}.`,
+      { cause },
+    );
+  }
+}
+
+export function assertPackagedMacBundleIdentity(
+  appBundle: string,
+  flavor: Exclude<SynaraDesktopFlavor, "development">,
+  runner: SyncTextCommandRunner = runSyncTextCommand,
+): string {
+  const identity = synaraDesktopIdentity(flavor);
+  const expectedAppBundleName = `${identity.displayName}.app`;
+  if (basename(appBundle) !== expectedAppBundleName) {
+    throw new Error(
+      `Packaged macOS app name mismatch: expected ${expectedAppBundleName}, got ${basename(appBundle)}.`,
+    );
+  }
+
+  const plistPath = join(appBundle, "Contents", "Info.plist");
+  if (!existsSync(plistPath)) {
+    throw new Error(`Packaged macOS app is missing ${join("Contents", "Info.plist")}.`);
+  }
+  const plistStat = lstatSync(plistPath);
+  if (!plistStat.isFile() || plistStat.isSymbolicLink()) {
+    throw new Error("Packaged macOS Info.plist must be a non-symlink regular file.");
+  }
+  const plist = readMacPlist(plistPath, runner);
+  const executableName = plist.CFBundleExecutable;
+  if (executableName !== identity.executableName) {
+    throw new Error(
+      `Packaged macOS CFBundleExecutable mismatch: expected ${identity.executableName}, got ${executableName}.`,
+    );
+  }
+  const bundleIdentifier = plist.CFBundleIdentifier;
+  if (bundleIdentifier !== identity.bundleId) {
+    throw new Error(
+      `Packaged macOS CFBundleIdentifier mismatch: expected ${identity.bundleId}, got ${bundleIdentifier}.`,
+    );
+  }
+  if (plist.CFBundleName !== identity.displayName) {
+    throw new Error(
+      `Packaged macOS CFBundleName mismatch: expected ${identity.displayName}, got ${String(plist.CFBundleName)}.`,
+    );
+  }
+  if (
+    plist.CFBundleDisplayName !== undefined &&
+    plist.CFBundleDisplayName !== identity.displayName
+  ) {
+    throw new Error(
+      `Packaged macOS CFBundleDisplayName mismatch: expected ${identity.displayName}, got ${String(plist.CFBundleDisplayName)}.`,
+    );
+  }
+
+  const executable = join(appBundle, "Contents", "MacOS", identity.executableName);
+  if (!existsSync(executable)) {
+    throw new Error(`Packaged macOS app is missing its locked executable: ${executable}.`);
+  }
+  const executableStat = lstatSync(executable);
+  if (!executableStat.isFile() || executableStat.isSymbolicLink()) {
+    throw new Error("Packaged macOS main executable must be a non-symlink regular file.");
+  }
+  return executable;
+}
+
 function prepareMacLaunch(
   assetsDirectory: string,
   extractionRoot: string,
   flavor: Exclude<SynaraDesktopFlavor, "development">,
 ): LaunchCommand {
-  const archive = requireSingleAsset(assetsDirectory, ".zip");
-  runCommand("ditto", ["-x", "-k", archive, extractionRoot]);
+  const diskImage = requireSingleAsset(assetsDirectory, ".dmg");
   const identity = synaraDesktopIdentity(flavor);
   const expectedAppBundleName = `${identity.displayName}.app`;
-  const appBundles = readdirSync(extractionRoot).filter((entry) => entry === expectedAppBundleName);
-  if (appBundles.length !== 1) {
-    throw new Error(
-      `Expected packaged macOS app ${expectedAppBundleName} in ${basename(archive)}, found ${appBundles.length}.`,
+  const mountPoint = join(extractionRoot, "mounted-dmg");
+  mkdirSync(mountPoint);
+  let mounted = false;
+  let inspectionFailure: Error | null = null;
+  try {
+    runCommand("hdiutil", [
+      "attach",
+      "-readonly",
+      "-nobrowse",
+      "-mountpoint",
+      mountPoint,
+      diskImage,
+    ]);
+    mounted = true;
+    const appBundles = readdirSync(mountPoint).filter((entry) => {
+      const candidate = join(mountPoint, entry);
+      if (!entry.endsWith(".app")) return false;
+      const candidateStat = lstatSync(candidate);
+      return candidateStat.isDirectory() && !candidateStat.isSymbolicLink();
+    });
+    if (appBundles.length !== 1 || appBundles[0] !== expectedAppBundleName) {
+      throw new Error(
+        `Expected only packaged macOS app ${expectedAppBundleName} in ${basename(diskImage)}, found ${appBundles.join(", ") || "<none>"}.`,
+      );
+    }
+    runCommand("ditto", [
+      join(mountPoint, expectedAppBundleName),
+      join(extractionRoot, expectedAppBundleName),
+    ]);
+  } catch (cause) {
+    inspectionFailure = cause instanceof Error ? cause : new Error(String(cause));
+  }
+  let detachFailure: Error | null = null;
+  if (mounted) {
+    try {
+      runCommand("hdiutil", ["detach", mountPoint]);
+    } catch (cause) {
+      detachFailure = cause instanceof Error ? cause : new Error(String(cause));
+    }
+  }
+  if (inspectionFailure || detachFailure) {
+    throw new AggregateError(
+      [inspectionFailure, detachFailure].filter((error): error is Error => error !== null),
+      "Packaged macOS DMG inspection failed.",
     );
   }
-  const appBundle = join(extractionRoot, appBundles[0]!);
-  const executables = findFiles(
-    join(appBundle, "Contents", "MacOS"),
-    (candidate) => statSync(candidate).isFile() && basename(candidate) === identity.executableName,
-  );
-  if (executables.length !== 1) {
-    throw new Error(`Expected one macOS main executable, found ${executables.length}.`);
-  }
-  return { command: executables[0]!, args: [], cwd: appBundle };
+  const appBundle = join(extractionRoot, expectedAppBundleName);
+  const executable = assertPackagedMacBundleIdentity(appBundle, flavor);
+  return { command: executable, args: [], cwd: appBundle };
 }
 
 function prepareLinuxLaunch(assetsDirectory: string, extractionRoot: string): LaunchCommand {
@@ -573,6 +717,7 @@ export async function verifyPackagedDesktopStartup(
   const extractionRoot = join(temporaryRoot, "payload");
   mkdirSync(extractionRoot, { recursive: true });
 
+  let verificationFailure: Error | null = null;
   try {
     const launch = prepareLaunch(options, extractionRoot);
     const env = createPackagedDesktopSmokeEnvironment(join(temporaryRoot, "state"), options);
@@ -587,8 +732,20 @@ export async function verifyPackagedDesktopStartup(
       description: `Packaged ${options.platform}/${options.arch}`,
       expectedIdentityProof: createExpectedPackagedDesktopIdentityProof(options, env),
     });
-  } finally {
+  } catch (cause) {
+    verificationFailure = cause instanceof Error ? cause : new Error(String(cause));
+  }
+  let cleanupFailure: Error | null = null;
+  try {
     rmSync(temporaryRoot, { recursive: true, force: true });
+  } catch (cause) {
+    cleanupFailure = cause instanceof Error ? cause : new Error(String(cause));
+  }
+  if (verificationFailure || cleanupFailure) {
+    throw new AggregateError(
+      [verificationFailure, cleanupFailure].filter((error): error is Error => error !== null),
+      "Packaged desktop startup verification or cleanup failed.",
+    );
   }
 }
 

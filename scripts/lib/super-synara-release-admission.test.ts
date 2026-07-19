@@ -35,7 +35,8 @@ async function createPlatformStaging(): Promise<{ directory: string; licensePath
   roots.push(directory, licenseRoot);
   const names = superSynaraReleaseFileNames(coordinates.version);
   writeFileSync(join(directory, names.windowsInstaller), "windows-installer");
-  writeFileSync(join(directory, names.macosDiskImage), "macos-dmg");
+  const diskImageBytes = "macos-dmg";
+  writeFileSync(join(directory, names.macosDiskImage), diskImageBytes);
   const common = {
     version: coordinates.version,
     sourceCommit: coordinates.sourceCommit,
@@ -153,7 +154,11 @@ async function createPlatformStaging(): Promise<{ directory: string; licensePath
     macSignatureAllowlist: {
       schemaVersion: 1,
       electronVersion: "40.10.6",
-      productOwnedPaths: ["Contents/MacOS/Super Synara"],
+      productOwnedPaths: [
+        ".",
+        "Contents/MacOS/Super Synara",
+        "Contents/Helpers/synara-appsnap-helper",
+      ],
       thirdParty: [
         {
           path: "Contents/Frameworks/Electron Framework.framework/Versions/A/Electron Framework",
@@ -165,22 +170,75 @@ async function createPlatformStaging(): Promise<{ directory: string; licensePath
       ],
     },
     macSignatureReport: {
-      schemaVersion: 1,
+      schemaVersion: 2,
+      diskImage: {
+        fileName: names.macosDiskImage,
+        size: Buffer.byteLength(diskImageBytes),
+        sha256: createHash("sha256").update(diskImageBytes).digest("hex"),
+        codeSignature: {
+          command: "codesign -d --verbose=4",
+          exitCode: 1,
+          output: "code object is not signed at all",
+          status: "unsigned",
+          teamId: null,
+          authorities: [],
+          cdHash: null,
+          signature: null,
+        },
+      },
       appBundle: "Super Synara.app",
       electronVersion: "40.10.6",
-      notarizationTicket: "absent",
-      notarizationEvidence: {
-        command: "xcrun stapler validate",
-        exitCode: 65,
-        output: "The validate action failed because no ticket was found.",
+      deepVerification: {
+        command: "codesign --verify --deep --strict --verbose=4",
+        exitCode: 0,
+        output: "valid on disk",
+      },
+      notarization: {
+        diskImage: {
+          ticket: "absent",
+          evidence: {
+            command: "xcrun stapler validate",
+            exitCode: 65,
+            output:
+              'CloudKit query for Super Synara.dmg (2/abc) failed due to "Record not found".\nCould not find base64 encoded ticket in response for 2/abc',
+          },
+        },
+        appBundle: {
+          ticket: "absent",
+          evidence: {
+            command: "xcrun stapler validate",
+            exitCode: 65,
+            output:
+              'CloudKit query for Super Synara.app (2/def) failed due to "Record not found".\nCould not find base64 encoded ticket in response for 2/def',
+          },
+        },
       },
       productOwned: [
+        {
+          path: ".",
+          identifier: "io.github.slashdevcorpse.supersynara",
+          teamId: null,
+          authorities: [],
+          cdHash: "f".repeat(40),
+          signature: "adhoc",
+          scheme: "ad-hoc-only",
+        },
         {
           path: "Contents/MacOS/Super Synara",
           identifier: "io.github.slashdevcorpse.supersynara",
           teamId: null,
           authorities: [],
           cdHash: "d".repeat(40),
+          signature: "adhoc",
+          scheme: "ad-hoc-only",
+        },
+        {
+          path: "Contents/Helpers/synara-appsnap-helper",
+          identifier: "synara-appsnap-helper",
+          teamId: null,
+          authorities: [],
+          cdHash: "a".repeat(40),
+          signature: "adhoc",
           scheme: "ad-hoc-only",
         },
       ],
@@ -191,6 +249,7 @@ async function createPlatformStaging(): Promise<{ directory: string; licensePath
           teamId: null,
           authorities: [],
           cdHash: "e".repeat(40),
+          signature: "adhoc",
           scheme: "ad-hoc-only",
         },
       ],
