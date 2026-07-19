@@ -336,7 +336,8 @@
             "apps/server/src/serverShutdown.test.ts",
             "apps/server/src/serverShutdown.ts",
           ],
-        "subsystems": ["desktop", "server-lifecycle", "http", "process-shutdown", "security", "windows"],
+        "subsystems":
+          ["desktop", "server-lifecycle", "http", "process-shutdown", "security", "windows"],
         "regressionTests":
           [
             "apps/desktop/src/backendShutdown.test.ts",
