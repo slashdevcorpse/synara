@@ -18,7 +18,17 @@ import { join, resolve } from "node:path";
 
 import { matchesDistinguishedName } from "@synara/shared/windowsCertificate";
 
+import {
+  type MacSignatureAllowlist,
+  type MacUnsignedSignatureReport,
+  validateMacUnsignedSignatureReport,
+} from "./super-synara-macos-signatures.ts";
+
 export type ReleaseArtifactPlatform = "linux" | "mac" | "win";
+export type ReleaseDistributionKind =
+  | "build-only"
+  | "github-unsigned-prerelease"
+  | "signed-release";
 
 export interface ReleaseArtifactProvenanceInput {
   readonly assetsDirectory: string;
@@ -31,10 +41,19 @@ export interface ReleaseArtifactProvenanceInput {
   readonly lockfileSha256: string;
   readonly publication: boolean;
   readonly signed: boolean;
+  readonly distributionKind?: ReleaseDistributionKind;
+  readonly distributionRepository?: string;
+  readonly distributionPrerelease?: boolean;
+  readonly distributionLatest?: boolean;
+  readonly updaterFeed?: boolean;
+  readonly absorbedUpstreamSha?: string;
+  readonly macSignatureReport?: MacUnsignedSignatureReport;
+  readonly macSignatureAllowlist?: MacSignatureAllowlist;
   readonly expectedMacTeamId?: string;
   readonly expectedWindowsPublisher?: string;
   readonly expectedWindowsSubjectDn?: string;
   readonly artifactFileNames?: ReadonlyArray<string>;
+  readonly outputFileName?: string;
 }
 
 export interface ReleaseArtifactDigest {
@@ -64,7 +83,7 @@ interface MacSignatureEvidence {
   readonly diskImage: string;
 }
 
-type SigningEvidence =
+export type SigningEvidence =
   | {
       readonly status: "verified";
       readonly scheme: "apple-developer-id";
@@ -88,11 +107,33 @@ type SigningEvidence =
       readonly scheme: "none";
       readonly identity: null;
       readonly checks: ReadonlyArray<string>;
+    }
+  | {
+      readonly status: "unsigned-prerelease";
+      readonly scheme: "none";
+      readonly thirdPartyComponents: "not-applicable";
+      readonly identity: null;
+      readonly checks: ReadonlyArray<string>;
+    }
+  | {
+      readonly status: "unsigned-prerelease";
+      readonly scheme: "ad-hoc-only";
+      readonly thirdPartyComponents: "reviewed-allowlist";
+      readonly identity: MacUnsignedSignatureReport;
+      readonly checks: ReadonlyArray<string>;
     };
 
 export interface ReleaseArtifactProvenanceManifest {
-  readonly schemaVersion: 1;
+  readonly schemaVersion: 2;
   readonly publication: boolean;
+  readonly distribution: {
+    readonly kind: ReleaseDistributionKind;
+    readonly repository: string | null;
+    readonly tag: string | null;
+    readonly prerelease: boolean;
+    readonly latest: boolean | null;
+    readonly updaterFeed: boolean;
+  };
   readonly platform: ReleaseArtifactPlatform;
   readonly arch: string;
   readonly target: string;
@@ -101,6 +142,7 @@ export interface ReleaseArtifactProvenanceManifest {
     readonly commit: string;
     readonly tag: string | null;
     readonly lockfileSha256: string;
+    readonly absorbedUpstreamSha: string | null;
   };
   readonly signing: SigningEvidence;
   readonly artifacts: ReadonlyArray<ReleaseArtifactDigest>;
@@ -383,6 +425,42 @@ function resolveSigningEvidence(
   input: ReleaseArtifactProvenanceInput,
   artifacts: ReadonlyArray<ReleaseArtifactDigest>,
 ): SigningEvidence {
+  const distributionKind = resolveDistributionKind(input);
+  if (distributionKind === "github-unsigned-prerelease") {
+    if (input.platform === "linux") {
+      throw new Error("Unsigned GitHub prereleases support only Windows and macOS.");
+    }
+    requireSingleArtifact(artifacts, input.platform === "mac" ? ".dmg" : ".exe");
+    if (input.platform === "win") {
+      return {
+        status: "unsigned-prerelease",
+        scheme: "none",
+        thirdPartyComponents: "not-applicable",
+        identity: null,
+        checks: ["no trusted Windows publisher requested", "exact installer payload present"],
+      };
+    }
+    if (!input.macSignatureReport || !input.macSignatureAllowlist) {
+      throw new Error(
+        "Unsigned macOS prerelease provenance requires a signature report and reviewed allowlist.",
+      );
+    }
+    return {
+      status: "unsigned-prerelease",
+      scheme: "ad-hoc-only",
+      thirdPartyComponents: "reviewed-allowlist",
+      identity: validateMacUnsignedSignatureReport(
+        input.macSignatureReport,
+        input.macSignatureAllowlist,
+      ),
+      checks: [
+        "all product-owned binaries ad-hoc-only",
+        "reviewed third-party signature allowlist exact match",
+        "app notarization ticket absent",
+      ],
+    };
+  }
+
   if (input.platform === "linux") {
     if (input.signed) {
       throw new Error("Linux release provenance cannot claim an unsupported signing scheme.");
@@ -414,6 +492,42 @@ function resolveSigningEvidence(
     : verifyWindowsSignatures(input, artifacts);
 }
 
+function resolveDistributionKind(input: ReleaseArtifactProvenanceInput): ReleaseDistributionKind {
+  return input.distributionKind ?? (input.signed ? "signed-release" : "build-only");
+}
+
+function resolveDistribution(input: ReleaseArtifactProvenanceInput): ReleaseArtifactProvenanceManifest["distribution"] {
+  const kind = resolveDistributionKind(input);
+  if (kind === "github-unsigned-prerelease") {
+    return {
+      kind,
+      repository: input.distributionRepository!,
+      tag: input.sourceTag,
+      prerelease: true,
+      latest: false,
+      updaterFeed: false,
+    };
+  }
+  if (kind === "signed-release") {
+    return {
+      kind,
+      repository: input.distributionRepository?.trim() || null,
+      tag: input.sourceTag,
+      prerelease: input.distributionPrerelease ?? input.version.includes("-"),
+      latest: input.distributionLatest ?? null,
+      updaterFeed: input.updaterFeed ?? true,
+    };
+  }
+  return {
+    kind,
+    repository: null,
+    tag: input.sourceTag,
+    prerelease: false,
+    latest: false,
+    updaterFeed: false,
+  };
+}
+
 function validateInput(input: ReleaseArtifactProvenanceInput): void {
   if (!/^[0-9a-f]{40}$/i.test(input.sourceCommit)) {
     throw new Error("Artifact provenance requires a full source commit.");
@@ -421,11 +535,62 @@ function validateInput(input: ReleaseArtifactProvenanceInput): void {
   if (!/^[0-9a-f]{64}$/i.test(input.lockfileSha256)) {
     throw new Error("Artifact provenance requires a bun.lock SHA-256.");
   }
+  if (
+    input.outputFileName !== undefined &&
+    !/^artifact-(?:windows-x64|macos-arm64|linux-[a-z0-9_-]+|mac-[a-z0-9_-]+|win-[a-z0-9_-]+)\.provenance\.json$/.test(
+      input.outputFileName,
+    )
+  ) {
+    throw new Error(`Invalid artifact provenance output name: ${input.outputFileName}.`);
+  }
+  if (
+    input.absorbedUpstreamSha !== undefined &&
+    !/^[0-9a-f]{40}$/i.test(input.absorbedUpstreamSha)
+  ) {
+    throw new Error("Artifact provenance requires a full absorbed upstream SHA.");
+  }
+
+  const distributionKind = resolveDistributionKind(input);
+  if (distributionKind === "github-unsigned-prerelease") {
+    if (!input.publication || input.signed) {
+      throw new Error("Unsigned GitHub prerelease policy must be public and unsigned.");
+    }
+    if (input.platform !== "win" && input.platform !== "mac") {
+      throw new Error("Unsigned GitHub prerelease policy supports only Windows and macOS.");
+    }
+    if (!/^\d+\.\d+\.\d+-super\.[1-9]\d*$/.test(input.version)) {
+      throw new Error(`Invalid Super Synara prerelease version: ${input.version}.`);
+    }
+    if (input.sourceTag !== `super-v${input.version}`) {
+      throw new Error(`Source tag ${input.sourceTag ?? "<missing>"} does not match Super Synara version ${input.version}.`);
+    }
+    if (input.distributionRepository !== "slashdevcorpse/synara") {
+      throw new Error("Unsigned prerelease repository must be slashdevcorpse/synara.");
+    }
+    if (
+      input.distributionPrerelease === false ||
+      input.distributionLatest === true ||
+      input.updaterFeed === true
+    ) {
+      throw new Error("Unsigned prerelease distribution flags must remain prerelease, non-Latest, and updater-free.");
+    }
+    if (!input.absorbedUpstreamSha) {
+      throw new Error("Unsigned prerelease provenance requires the absorbed upstream SHA.");
+    }
+    return;
+  }
+
   if (input.sourceTag !== null && input.sourceTag !== `v${input.version}`) {
     throw new Error(`Source tag ${input.sourceTag} does not match version ${input.version}.`);
   }
   if (input.publication && input.sourceTag === null) {
     throw new Error("Published artifact provenance requires an exact source tag.");
+  }
+  if (distributionKind === "build-only" && input.publication) {
+    throw new Error("Build-only provenance cannot authorize public distribution.");
+  }
+  if (distributionKind === "signed-release" && input.publication && !input.signed) {
+    throw new Error("Signed-release publication requires verified signing.");
   }
 }
 
@@ -438,8 +603,9 @@ export async function writeReleaseArtifactProvenance(
     input.artifactFileNames,
   );
   const manifest: ReleaseArtifactProvenanceManifest = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     publication: input.publication,
+    distribution: resolveDistribution(input),
     platform: input.platform,
     arch: input.arch,
     target: input.target,
@@ -448,13 +614,14 @@ export async function writeReleaseArtifactProvenance(
       commit: input.sourceCommit.toLowerCase(),
       tag: input.sourceTag,
       lockfileSha256: input.lockfileSha256.toLowerCase(),
+      absorbedUpstreamSha: input.absorbedUpstreamSha?.toLowerCase() ?? null,
     },
     signing: resolveSigningEvidence(input, artifacts),
     artifacts,
   };
   const outputPath = join(
     input.assetsDirectory,
-    `artifact-${input.platform}-${input.arch}.provenance.json`,
+    input.outputFileName ?? `artifact-${input.platform}-${input.arch}.provenance.json`,
   );
   writeFileSync(outputPath, `${JSON.stringify(manifest, null, 2)}\n`, { flag: "wx" });
   return { manifest, path: outputPath };
