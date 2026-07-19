@@ -1317,7 +1317,10 @@ function makeEditorScenario(
       }
       const elapsedMs = performance.now() - startedAt;
       const subprocessCount = readAppxSubprocessCount(fixture);
-      assertSingleEditorFixtureSubprocessCount(subprocessCount, runtime.label + " editor sample");
+      assertSingleEditorFixtureSubprocessCount(
+        subprocessCount,
+        `${runtime.label} editor sample after ${elapsedMs.toFixed(2)} ms`,
+      );
       for (const editors of editorResults) {
         assertExpectedEditorResult(editors, runtime, elapsedMs, subprocessCount);
       }
@@ -1599,7 +1602,6 @@ async function runBenchmark(options: BenchmarkCliOptions): Promise<Record<string
     assertDetachedRevision(candidateWorktree, candidateSha);
 
     const fixture = createFixture(tempRoot);
-    const editorFixturePreflight = preflightEditorFixture(fixture);
     const [baseRuntime, candidateRuntime] = await Promise.all([
       importVersionRuntime("base", baseSha, baseWorktree),
       importVersionRuntime("candidate", candidateSha, candidateWorktree),
@@ -1610,6 +1612,19 @@ async function runBenchmark(options: BenchmarkCliOptions): Promise<Record<string
         typeof candidateRuntime.open.discoverAvailableEditors === "function",
       candidateEditorAvailability: candidateRuntime.editorAvailability !== null,
     });
+    const editorFixturePreflight = preflightEditorFixture(fixture);
+    const scenarios: ScenarioComparison[] = [];
+    for (const callers of [1, 8, 32] as const) {
+      scenarios.push(
+        await measureScenario({
+          name: `editor_${callers}_callers`,
+          base: makeEditorScenario(baseRuntime, fixture, callers),
+          candidate: makeEditorScenario(candidateRuntime, fixture, callers),
+          warmups: options.warmups,
+          iterations: options.iterations,
+        }),
+      );
+    }
     const commandScenarioNames = [
       "cold_exe",
       "cold_cmd_spaces_non_ascii",
@@ -1623,24 +1638,12 @@ async function runBenchmark(options: BenchmarkCliOptions): Promise<Record<string
       "missing_pathext",
       "empty_pathext",
     ] as const;
-    const scenarios: ScenarioComparison[] = [];
     for (const name of commandScenarioNames) {
       scenarios.push(
         await measureScenario({
           name,
           base: makeCommandScenario(baseRuntime, fixture, name),
           candidate: makeCommandScenario(candidateRuntime, fixture, name),
-          warmups: options.warmups,
-          iterations: options.iterations,
-        }),
-      );
-    }
-    for (const callers of [1, 8, 32] as const) {
-      scenarios.push(
-        await measureScenario({
-          name: `editor_${callers}_callers`,
-          base: makeEditorScenario(baseRuntime, fixture, callers),
-          candidate: makeEditorScenario(candidateRuntime, fixture, callers),
           warmups: options.warmups,
           iterations: options.iterations,
         }),
@@ -1749,6 +1752,8 @@ async function runBenchmark(options: BenchmarkCliOptions): Promise<Record<string
           appxBoundary:
             "same real Windows PowerShell binary, isolated Appx module, filesystem fixture, PATH, PATHEXT, cwd, and expected editor array",
           cacheReset: "each immutable editorAppDiscovery cache cleared once per sample",
+          preflight:
+            "one fail-closed fixture-origin preflight runs immediately before all editor scenarios; samples are never retried",
           subprocessExpectation:
             "exactly one Appx process per base and candidate sample; the cached base is not presented as an uncached subprocess baseline",
         },
