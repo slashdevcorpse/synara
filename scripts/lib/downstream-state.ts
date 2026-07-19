@@ -17,6 +17,11 @@ const SHA_PATTERN = /^[0-9a-f]{40}$/;
 const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const PATCH_ID_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const PATCH_STATUS_SET = new Set<string>(PATCH_STATUSES);
+const STATUSES_REQUIRING_UPSTREAM_SOURCE = new Set<PatchStatus>([
+  "upstream-pending",
+  "upstreamed",
+  "superseded",
+]);
 const ALLOWED_TRANSITIONS = new Set<string>([
   "downstream-only>upstream-pending",
   "downstream-only>deferred",
@@ -127,6 +132,16 @@ function validateSha(
   return sha;
 }
 
+function validateExternalSha(value: unknown, path: string, errors: string[]): string | null {
+  const sha = requireNonEmptyString(value, path, errors);
+  if (sha === null) return null;
+  if (!SHA_PATTERN.test(sha)) {
+    errors.push(`${path} must be a lowercase full 40-character commit SHA.`);
+    return null;
+  }
+  return sha;
+}
+
 function validateRepositoryPath(value: string, path: string, errors: string[]): void {
   const normalized = normalize(value);
   if (
@@ -230,7 +245,22 @@ function validatePatchInventory(
     if (status !== null && !PATCH_STATUS_SET.has(status)) {
       errors.push(`${path}.status has unsupported value ${status}.`);
     }
-    validateSha(patch.introducingCommit, `${path}.introducingCommit`, errors, context.commits);
+    if (
+      status !== null &&
+      PATCH_STATUS_SET.has(status) &&
+      STATUSES_REQUIRING_UPSTREAM_SOURCE.has(status as PatchStatus)
+    ) {
+      validateExternalSha(patch.upstreamSourceCommit, `${path}.upstreamSourceCommit`, errors);
+    } else if (patch.upstreamSourceCommit !== undefined && patch.upstreamSourceCommit !== null) {
+      validateExternalSha(patch.upstreamSourceCommit, `${path}.upstreamSourceCommit`, errors);
+    }
+
+    if (status === "superseded" && patch.introducingCommit === null) {
+      // A candidate that was superseded before it ever landed downstream has no introducing
+      // downstream commit. Its canonical source object remains recorded separately above.
+    } else {
+      validateSha(patch.introducingCommit, `${path}.introducingCommit`, errors, context.commits);
+    }
 
     for (const field of ["touchedFiles", "regressionTests"] as const) {
       const paths = requireStringArray(patch[field], `${path}.${field}`, errors);

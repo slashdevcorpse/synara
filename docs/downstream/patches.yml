@@ -11,7 +11,8 @@
         "userVisibleConsequence": "A failed Windows migration can be diagnosed and restored from an identified backup instead of leaving the application unable to start.",
         "owner": "slashdevcorpse",
         "status": "superseded",
-        "introducingCommit": "29294143b63a8a6dbff263bd24baf4ddcb97c662",
+        "upstreamSourceCommit": "29294143b63a8a6dbff263bd24baf4ddcb97c662",
+        "introducingCommit": null,
         "touchedFiles":
           [
             "apps/server/src/persistence/MigrationBackup.ts",
@@ -48,10 +49,10 @@
         "userVisibleConsequence": "Windows upgrades receive repeatable evidence that recovery works against a representative pre-upgrade database without touching live user state.",
         "owner": "slashdevcorpse",
         "status": "upstream-pending",
-        "introducingCommit": "cd4b0c14a075260d0a1abe5e1897e4a514405e3d",
+        "upstreamSourceCommit": "cd4b0c14a075260d0a1abe5e1897e4a514405e3d",
+        "introducingCommit": "a8ff884d4df597a1ceca1e0cd83e02f0fe264e03",
         "touchedFiles":
           [
-            ".github/workflows/ci.yml",
             "apps/server/src/persistence/MigrationBackup.ts",
             "apps/server/src/persistence/MigrationBackup.test.ts",
             "apps/server/src/persistence/__fixtures__/v0.5.5/README.md",
@@ -70,7 +71,7 @@
             {
               "status": "upstream-pending",
               "date": "2026-07-19",
-              "evidence": "Open upstream PR 419 at cd4b0c14a075260d0a1abe5e1897e4a514405e3d",
+              "evidence": "Open upstream PR 419 at cd4b0c14a075260d0a1abe5e1897e4a514405e3d; rebased downstream at a8ff884d4df597a1ceca1e0cd83e02f0fe264e03",
             },
           ],
       },
@@ -80,7 +81,8 @@
         "userVisibleConsequence": "Restarting or stopping Codex sessions on Windows does not leave overlay database ownership in an indeterminate state.",
         "owner": "slashdevcorpse",
         "status": "upstream-pending",
-        "introducingCommit": "5db8a6020343544c6fca05298efbc01a5c5c251c",
+        "upstreamSourceCommit": "5db8a6020343544c6fca05298efbc01a5c5c251c",
+        "introducingCommit": "1ce77baee4bf927195579ad01bac5ee423473e90",
         "touchedFiles": ["apps/server/src/codexProcessEnv.ts"],
         "subsystems": ["codex", "sqlite", "provider-lifecycle", "windows"],
         "regressionTests": ["apps/server/src/codexAppServerManager.test.ts"],
@@ -94,7 +96,7 @@
             {
               "status": "upstream-pending",
               "date": "2026-07-18",
-              "evidence": "PR 396 commit 5db8a6020343544c6fca05298efbc01a5c5c251c",
+              "evidence": "PR 396 commit 5db8a6020343544c6fca05298efbc01a5c5c251c; rebased downstream at 1ce77baee4bf927195579ad01bac5ee423473e90",
             },
           ],
       },
@@ -104,10 +106,10 @@
         "userVisibleConsequence": "Codex recovery has enough time to complete without making ordinary initialization waits unbounded.",
         "owner": "slashdevcorpse",
         "status": "upstream-pending",
-        "introducingCommit": "d3055257783da39e0da850b4f7d6c14f476b0de8",
+        "upstreamSourceCommit": "d3055257783da39e0da850b4f7d6c14f476b0de8",
+        "introducingCommit": "4bd69819147046d3cebaca3633a5c016bc4cfe9a",
         "touchedFiles":
           [
-            ".github/workflows/ci.yml",
             "apps/server/src/codexAppServerManager.ts",
             "apps/server/src/codexAppServerManager.test.ts",
           ],
@@ -123,7 +125,7 @@
             {
               "status": "upstream-pending",
               "date": "2026-07-18",
-              "evidence": "PR 396 commit d3055257783da39e0da850b4f7d6c14f476b0de8",
+              "evidence": "PR 396 commit d3055257783da39e0da850b4f7d6c14f476b0de8; rebased downstream at 4bd69819147046d3cebaca3633a5c016bc4cfe9a",
             },
           ],
       },
@@ -133,7 +135,8 @@
         "userVisibleConsequence": "Windows provider startup finds and launches the installed Codex CLI even when wrapper or PATH resolution would select an incompatible executable.",
         "owner": "slashdevcorpse",
         "status": "upstream-pending",
-        "introducingCommit": "d28ed6655d152db91e9492e24048fcd931074eda",
+        "upstreamSourceCommit": "7c39415c16415224253c376c8e85df74489596b8",
+        "introducingCommit": "1d4d6091c41551805a6ed288807faf03608aa97e",
         "touchedFiles":
           [
             "apps/desktop/src/voiceTranscription.ts",
@@ -166,7 +169,7 @@
             {
               "status": "upstream-pending",
               "date": "2026-07-18",
-              "evidence": "Open upstream PR 397, introduced by d28ed6655d152db91e9492e24048fcd931074eda",
+              "evidence": "Open upstream PR 397 at 7c39415c16415224253c376c8e85df74489596b8; rebased downstream from 1d4d6091c41551805a6ed288807faf03608aa97e",
             },
           ],
       },
@@ -176,7 +179,8 @@
         "userVisibleConsequence": "Users can see the active provider's remaining quota without leaving the conversation composer.",
         "owner": "slashdevcorpse",
         "status": "upstream-pending",
-        "introducingCommit": "e564af6bc92a703d5a82a1a85c2d79b163ca6c80",
+        "upstreamSourceCommit": "e564af6bc92a703d5a82a1a85c2d79b163ca6c80",
+        "introducingCommit": "74e5ba44bfd40edb68227d24390b63fd8488b542",
         "touchedFiles":
           [
             "apps/server/src/providerUsage/index.ts",
@@ -229,7 +233,7 @@
             {
               "status": "upstream-pending",
               "date": "2026-07-19",
-              "evidence": "Open upstream PR 420 at e564af6bc92a703d5a82a1a85c2d79b163ca6c80",
+              "evidence": "Open upstream PR 420 at e564af6bc92a703d5a82a1a85c2d79b163ca6c80; rebased downstream at 74e5ba44bfd40edb68227d24390b63fd8488b542",
             },
           ],
       },
@@ -239,7 +243,8 @@
         "userVisibleConsequence": "The Antigravity provider starts reliably on Windows without unsafe shell interpretation or divergent process behavior.",
         "owner": "slashdevcorpse",
         "status": "upstream-pending",
-        "introducingCommit": "27ece8862adb5a1d907cbd82b21bb9e660d4e597",
+        "upstreamSourceCommit": "27ece8862adb5a1d907cbd82b21bb9e660d4e597",
+        "introducingCommit": "7d10365410c728d9c88ecb5faa98a850563955ba",
         "touchedFiles":
           [
             "apps/server/src/provider/Layers/AntigravityAdapter.ts",
@@ -257,7 +262,7 @@
             {
               "status": "upstream-pending",
               "date": "2026-07-19",
-              "evidence": "Open upstream PR 421 at 27ece8862adb5a1d907cbd82b21bb9e660d4e597",
+              "evidence": "Open upstream PR 421 at 27ece8862adb5a1d907cbd82b21bb9e660d4e597; rebased downstream at 7d10365410c728d9c88ecb5faa98a850563955ba",
             },
           ],
       },

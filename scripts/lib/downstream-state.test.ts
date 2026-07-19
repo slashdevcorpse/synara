@@ -31,6 +31,7 @@ const validInventory = () => ({
       userVisibleConsequence: "The provider starts consistently.",
       owner: "slashdevcorpse",
       status: "upstream-pending",
+      upstreamSourceCommit: "e".repeat(40),
       introducingCommit: patchSha,
       touchedFiles: ["apps/server/src/example.ts"],
       subsystems: ["provider-startup"],
@@ -143,6 +144,37 @@ describe("downstream state validator", () => {
     const errors = validateDownstreamState(inventory, validState(), context()).errors.join("\n");
     expect(errors).toContain(`references missing commit ${"e".repeat(40)}`);
     expect(errors).toContain(`must equal state authority ${effectiveSha}`);
+  });
+
+  it("allows a superseded upstream candidate that never landed downstream", () => {
+    const inventory = validInventory();
+    const patch = inventory.patches[0]! as unknown as {
+      status: string;
+      introducingCommit: string | null;
+      upstreamSourceCommit: string;
+      statusHistory: Array<{ status: string; date: string; evidence: string }>;
+    };
+    patch.status = "superseded";
+    patch.introducingCommit = null;
+    patch.upstreamSourceCommit = "f".repeat(40);
+    patch.statusHistory = [
+      {
+        status: "superseded",
+        date: "2026-07-19",
+        evidence: "Superseded before downstream integration",
+      },
+    ];
+
+    expect(validateDownstreamState(inventory, validState(), context()).errors).toEqual([]);
+  });
+
+  it("requires upstream source evidence for upstream-tracked patches", () => {
+    const inventory = validInventory();
+    delete (inventory.patches[0] as Partial<(typeof inventory.patches)[number]>)
+      .upstreamSourceCommit;
+
+    const errors = validateDownstreamState(inventory, validState(), context()).errors.join("\n");
+    expect(errors).toContain("upstreamSourceCommit must be a non-empty string");
   });
 
   it("rejects a broken sync chain and an incomplete assessment", () => {
