@@ -27,6 +27,7 @@ export interface SuperSynaraGitHubStateInput {
   readonly tag: string;
   readonly sourceCommit: string;
   readonly tagCommit: string | null;
+  readonly tagObjectType: string | null;
   readonly releases: ReadonlyArray<GitHubReleaseState>;
   readonly currentRunDraftId?: number;
 }
@@ -49,12 +50,18 @@ export function validateSuperSynaraGitHubState(input: SuperSynaraGitHubStateInpu
   }
   assertFullSha("Source commit", input.sourceCommit);
   if (input.tagCommit !== null) {
+    if (input.tagObjectType !== "commit") {
+      throw new Error(`Reserved tag ${input.tag} must resolve directly to a commit object.`);
+    }
     assertFullSha("Tag commit", input.tagCommit);
     if (input.tagCommit.toLowerCase() !== input.sourceCommit.toLowerCase()) {
       throw new Error(
         `Reserved tag ${input.tag} points to ${input.tagCommit}, not ${input.sourceCommit}.`,
       );
     }
+  }
+  if (input.tagCommit === null && input.tagObjectType !== null) {
+    throw new Error("Missing tag commit cannot have a Git object type.");
   }
 
   const tagReleases = input.releases.filter((release) => release.tagName === input.tag);

@@ -65,19 +65,21 @@ const refJson = runGh(
   ["api", `repos/${repository}/git/ref/tags/${encodedTag}`],
   true,
 );
-const tagCommit = refJson
-  ? ((JSON.parse(refJson) as { object?: { sha?: string } }).object?.sha ?? null)
-  : null;
-const releasePayload = JSON.parse(
-  runGh(["api", `repos/${repository}/releases?per_page=100`]),
-) as ReadonlyArray<{
+const refObject = refJson
+  ? (JSON.parse(refJson) as { object?: { sha?: string; type?: string } }).object
+  : undefined;
+const tagCommit = refObject?.sha ?? null;
+const tagObjectType = refObject?.type ?? null;
+const releasePages = JSON.parse(
+  runGh(["api", "--paginate", "--slurp", `repos/${repository}/releases?per_page=100`]),
+) as ReadonlyArray<ReadonlyArray<{
   id: number;
   tag_name: string;
   target_commitish: string;
   draft: boolean;
   prerelease: boolean;
-}>;
-const releases: ReadonlyArray<GitHubReleaseState> = releasePayload.map((release) => ({
+}>>;
+const releases: ReadonlyArray<GitHubReleaseState> = releasePages.flat().map((release) => ({
   id: release.id,
   tagName: release.tag_name,
   targetCommitish: release.target_commitish,
@@ -95,6 +97,7 @@ validateSuperSynaraGitHubState({
   tag,
   sourceCommit: required("--source-commit"),
   tagCommit,
+  tagObjectType,
   releases,
   ...(draftIdInput ? { currentRunDraftId: Number(draftIdInput) } : {}),
 });

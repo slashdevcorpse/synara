@@ -18,6 +18,7 @@ function state(
     tag: "super-v0.5.5-super.1",
     sourceCommit: "a".repeat(40),
     tagCommit: null,
+    tagObjectType: null,
     releases: [],
     ...overrides,
   };
@@ -28,7 +29,7 @@ describe("Super Synara GitHub release state", () => {
     expect(() => validateSuperSynaraGitHubState(state())).not.toThrow();
     expect(() =>
       validateSuperSynaraGitHubState(
-        state({ phase: "reserve-tag", tagCommit: "a".repeat(40) }),
+        state({ phase: "reserve-tag", tagCommit: "a".repeat(40), tagObjectType: "commit" }),
       ),
     ).not.toThrow();
   });
@@ -38,8 +39,15 @@ describe("Super Synara GitHub release state", () => {
       validateSuperSynaraGitHubState(state({ triggeringActor: "someone-else" })),
     ).toThrow("triggering_actor");
     expect(() =>
-      validateSuperSynaraGitHubState(state({ tagCommit: "b".repeat(40) })),
+      validateSuperSynaraGitHubState(
+        state({ tagCommit: "b".repeat(40), tagObjectType: "commit" }),
+      ),
     ).toThrow("points to");
+    expect(() =>
+      validateSuperSynaraGitHubState(
+        state({ tagCommit: "a".repeat(40), tagObjectType: "tag" }),
+      ),
+    ).toThrow("directly to a commit object");
     expect(() =>
       validateSuperSynaraGitHubState(
         state({
@@ -70,6 +78,7 @@ describe("Super Synara GitHub release state", () => {
         state({
           phase: "before-publish",
           tagCommit: "a".repeat(40),
+          tagObjectType: "commit",
           releases: [exactDraft],
           currentRunDraftId: 42,
         }),
@@ -80,6 +89,7 @@ describe("Super Synara GitHub release state", () => {
         state({
           phase: "before-publish",
           tagCommit: "a".repeat(40),
+          tagObjectType: "commit",
           releases: [exactDraft],
           currentRunDraftId: 43,
         }),
