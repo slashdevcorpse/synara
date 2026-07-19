@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -266,6 +266,23 @@ describe("benchmark-windows-command-discovery", () => {
     try {
       const output = join(controlled, "receipt.json");
       expect(() => assertSafeBenchmarkOutputPath(output)).not.toThrow();
+      const longTempAlias = process.env.USERPROFILE
+        ? join(process.env.USERPROFILE, "AppData", "Local", "Temp")
+        : null;
+      if (process.platform === "win32" && longTempAlias && existsSync(longTempAlias)) {
+        const shortIdentity = statSync(tmpdir(), { bigint: true });
+        const longIdentity = statSync(longTempAlias, { bigint: true });
+        if (
+          shortIdentity.dev === longIdentity.dev &&
+          shortIdentity.ino === longIdentity.ino
+        ) {
+          expect(() =>
+            assertSafeBenchmarkOutputPath(
+              join(longTempAlias, `synara-goal09-benchmark-${suffix}`, "receipt.json"),
+            ),
+          ).not.toThrow();
+        }
+      }
       expect(() =>
         assertSafeBenchmarkOutputPath(join(controlled, "other.json")),
       ).toThrow("filename must be receipt.json");

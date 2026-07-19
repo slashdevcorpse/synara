@@ -484,8 +484,11 @@ export function assertSafeBenchmarkOutputPath(
     throw new Error(`Benchmark output directory must already exist: ${parent}`);
   }
   const realParent = realpathSync(parent);
+  const expectedTemp = statSync(tempRoot, { bigint: true });
+  const actualTemp = statSync(dirname(realParent), { bigint: true });
   if (
-    resolve(dirname(realParent)).toLowerCase() !== tempRoot.toLowerCase() ||
+    expectedTemp.dev !== actualTemp.dev ||
+    expectedTemp.ino !== actualTemp.ino ||
     !RECEIPT_DIRECTORY_PATTERN.test(basename(realParent))
   ) {
     throw new Error(`Benchmark output directory is outside the controlled temp boundary: ${parent}`);
