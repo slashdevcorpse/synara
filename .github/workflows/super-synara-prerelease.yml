@@ -272,8 +272,36 @@ jobs:
             "$VERSION" "$TAG" true "$SOURCE_COMMIT" branch main \
             github-unsigned-prerelease true
 
-      - name: Run Windows regression suite
-        run: bun run test
+      - name: Verify Super Synara identity
+        run: bun run brand:check
+
+      - name: Run shared desktop identity and certificate regressions
+        run: >-
+          bun run --cwd packages/shared test
+          src/desktopIdentity.test.ts
+          src/desktopIdentityProof.test.ts
+          src/windowsCertificate.test.ts
+
+      - name: Run Windows desktop shutdown regressions
+        run: >-
+          bun run --cwd apps/desktop test
+          src/backendShutdown.test.ts
+          src/backendShutdown.windows.integration.test.ts
+
+      - name: Run Super Synara Windows release contract regressions
+        run: >-
+          bun run --cwd scripts test
+          check-brand-identity.test.ts
+          verify-packaged-desktop-startup.test.ts
+          lib/desktop-artifact-policy.test.ts
+          lib/windows-authenticode.test.ts
+          lib/windows-installer-qualification.test.ts
+          lib/release-artifact-provenance.test.ts
+          lib/super-synara-release-admission.test.ts
+          lib/super-synara-workflow-contract.test.ts
+
+      - name: Validate workflow contracts
+        run: node scripts/verify-workflow-contracts.ts
 
       - name: Build unsigned Windows installer
         shell: bash
@@ -510,8 +538,27 @@ jobs:
             "$VERSION" "$TAG" true "$SOURCE_COMMIT" branch main \
             github-unsigned-prerelease true
 
-      - name: Run macOS regression suite
-        run: bun run test
+      - name: Verify Super Synara identity
+        run: bun run brand:check
+
+      - name: Run desktop-native regressions
+        run: bun run --cwd apps/desktop test
+
+      - name: Run shared desktop identity regressions
+        run: >-
+          bun run --cwd packages/shared test
+          src/desktopIdentity.test.ts
+          src/desktopIdentityProof.test.ts
+
+      - name: Run Super Synara macOS release contract regressions
+        run: >-
+          bun run --cwd scripts test
+          lib/desktop-artifact-policy.test.ts
+          verify-packaged-desktop-startup.test.ts
+          lib/super-synara-macos-signatures.test.ts
+          lib/release-artifact-provenance.test.ts
+          lib/super-synara-release-admission.test.ts
+          lib/super-synara-workflow-contract.test.ts
 
       - name: Build unsigned macOS disk image
         shell: bash

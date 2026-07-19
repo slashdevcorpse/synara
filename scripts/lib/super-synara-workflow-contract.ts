@@ -5,6 +5,207 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
+import { parse as parseYaml } from "yaml";
+
+type UnknownRecord = Record<string, unknown>;
+
+const PRERELEASE_WINDOWS_REQUIRED_COMMANDS = [
+  "bun run brand:check",
+  "bun run --cwd packages/shared test src/desktopIdentity.test.ts src/desktopIdentityProof.test.ts src/windowsCertificate.test.ts",
+  "bun run --cwd apps/desktop test src/backendShutdown.test.ts src/backendShutdown.windows.integration.test.ts",
+  "bun run --cwd scripts test check-brand-identity.test.ts verify-packaged-desktop-startup.test.ts lib/desktop-artifact-policy.test.ts lib/windows-authenticode.test.ts lib/windows-installer-qualification.test.ts lib/release-artifact-provenance.test.ts lib/super-synara-release-admission.test.ts lib/super-synara-workflow-contract.test.ts",
+  "node scripts/verify-workflow-contracts.ts",
+] as const;
+const PRERELEASE_MACOS_REQUIRED_COMMANDS = [
+  "bun run brand:check",
+  "bun run --cwd apps/desktop test",
+  "bun run --cwd packages/shared test src/desktopIdentity.test.ts src/desktopIdentityProof.test.ts",
+  "bun run --cwd scripts test lib/desktop-artifact-policy.test.ts verify-packaged-desktop-startup.test.ts lib/super-synara-macos-signatures.test.ts lib/release-artifact-provenance.test.ts lib/super-synara-release-admission.test.ts lib/super-synara-workflow-contract.test.ts",
+] as const;
+
+function isRecord(value: unknown): value is UnknownRecord {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function normalizeShellCommand(command: string): string {
+  return command.replace(/\s+/g, " ").trim();
+}
+
+function executableShellLines(command: string): readonly string[] {
+  return command
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !line.startsWith("#"));
+}
+
+function invokesRootTest(command: string): boolean {
+  return executableShellLines(command).some((line) =>
+    /(?:^|(?:&&|\|\||;)\s*)bun run test(?=$|\s|&&|\|\||;)/.test(line),
+  );
+}
+
+function masksShellFailure(command: string): boolean {
+  return executableShellLines(command).some(
+    (line) =>
+      /(?:\|\||;)\s*(?:true|:|exit\s+0)(?=\s*(?:[;#]|$))/.test(line) ||
+      /(?:^|(?:&&|\|\||;)\s*)exit\s+0(?=\s*(?:[;#]|$))/.test(line),
+  );
+}
+
+interface WorkflowRunStep {
+  readonly command: string;
+  readonly continueOnError: unknown;
+  readonly condition: unknown;
+  readonly index: number;
+  readonly rawCommand: string;
+}
+
+function publicationJobs(workflowText: string): UnknownRecord {
+  const workflow = parseYaml(workflowText, {
+    strict: true,
+    uniqueKeys: true,
+  }) as unknown;
+  if (!isRecord(workflow) || !isRecord(workflow.jobs)) {
+    throw new Error("Publication workflow must define jobs.");
+  }
+  return workflow.jobs;
+}
+
+function publicationJob(jobs: UnknownRecord, jobName: string): UnknownRecord {
+  const job = jobs[jobName];
+  if (!isRecord(job) || !Array.isArray(job.steps)) {
+    throw new Error(`Publication workflow must define the ${jobName} job with steps.`);
+  }
+  return job;
+}
+
+function nativeJobRunSteps(jobs: UnknownRecord, jobName: string): readonly WorkflowRunStep[] {
+  const job = publicationJob(jobs, jobName);
+  const steps = job.steps;
+  if (!Array.isArray(steps)) {
+    throw new Error(`Publication workflow must define the ${jobName} job with steps.`);
+  }
+  return steps
+    .map((step, index): WorkflowRunStep | null => {
+      if (!isRecord(step) || typeof step.run !== "string") return null;
+      return {
+        command: normalizeShellCommand(step.run),
+        continueOnError: step["continue-on-error"],
+        condition: step.if,
+        index,
+        rawCommand: step.run,
+      };
+    })
+    .filter((step): step is WorkflowRunStep => step !== null);
+}
+
+function hasExecutableLine(command: string, expectedStart: string): boolean {
+  return executableShellLines(command).some(
+    (line) => line === expectedStart || line.startsWith(`${expectedStart} `),
+  );
+}
+
+function verifyRootTestOwnership(jobs: UnknownRecord): void {
+  const occurrences: Array<{
+    readonly jobName: string;
+    readonly step: WorkflowRunStep;
+  }> = [];
+  for (const jobName of Object.keys(jobs)) {
+    const job = jobs[jobName];
+    if (!isRecord(job) || !Array.isArray(job.steps)) continue;
+    for (const step of nativeJobRunSteps(jobs, jobName)) {
+      if (invokesRootTest(step.rawCommand)) occurrences.push({ jobName, step });
+    }
+  }
+  const preflight = occurrences.filter(({ jobName }) => jobName === "preflight");
+  const barePreflight = preflight.filter(({ step }) => step.command === "bun run test");
+  if (barePreflight.length !== 1) {
+    throw new Error("Publication workflow preflight must run exactly one bare bun run test suite.");
+  }
+  const [preflightSuite] = barePreflight;
+  if (
+    preflightSuite!.step.condition !== undefined ||
+    (preflightSuite!.step.continueOnError !== undefined &&
+      preflightSuite!.step.continueOnError !== false)
+  ) {
+    throw new Error(
+      "Publication workflow preflight bare bun run test must be unconditional and fail closed.",
+    );
+  }
+  const additionalInvocation = occurrences.find(
+    ({ jobName, step }) => jobName !== "preflight" || step.command !== "bun run test",
+  );
+  if (additionalInvocation) {
+    throw new Error(
+      `Publication workflow ${additionalInvocation.jobName} must not own an additional or chained monorepo-wide bun run test suite.`,
+    );
+  }
+}
+
+function verifyNativeJobCommands(
+  job: UnknownRecord,
+  jobName: string,
+  expectedRunner: string,
+  steps: readonly WorkflowRunStep[],
+  requiredCommands: readonly string[],
+  buildCommandStart: string,
+): void {
+  if (job["runs-on"] !== expectedRunner) {
+    throw new Error(`Publication workflow ${jobName} must run on ${expectedRunner}.`);
+  }
+  if (
+    job.if !== undefined ||
+    (job["continue-on-error"] !== undefined && job["continue-on-error"] !== false)
+  ) {
+    throw new Error(`Publication workflow ${jobName} job must be unconditional and fail closed.`);
+  }
+  const buildSteps = steps.filter((step) => hasExecutableLine(step.rawCommand, buildCommandStart));
+  if (buildSteps.length !== 1) {
+    throw new Error(
+      `Publication workflow ${jobName} must execute exactly one native build command starting with ${buildCommandStart}.`,
+    );
+  }
+  const [buildStep] = buildSteps;
+  if (
+    buildStep!.condition !== undefined ||
+    (buildStep!.continueOnError !== undefined && buildStep!.continueOnError !== false)
+  ) {
+    throw new Error(
+      `Publication workflow ${jobName} native build must be unconditional and fail closed.`,
+    );
+  }
+  if (masksShellFailure(buildStep!.rawCommand)) {
+    throw new Error(`Publication workflow ${jobName} native build must not mask shell failures.`);
+  }
+  for (const command of requiredCommands) {
+    const matches = steps.filter((step) => step.command === command);
+    if (matches.length !== 1) {
+      throw new Error(
+        `Publication workflow ${jobName} must run exact native gate command: ${command}.`,
+      );
+    }
+    const [step] = matches;
+    if (
+      step!.condition !== undefined ||
+      (step!.continueOnError !== undefined && step!.continueOnError !== false)
+    ) {
+      throw new Error(
+        `Publication workflow ${jobName} native gate must be unconditional and fail closed: ${command}.`,
+      );
+    }
+    if (step!.index >= buildStep!.index) {
+      throw new Error(
+        `Publication workflow ${jobName} native gate must run before the native build: ${command}.`,
+      );
+    }
+  }
+  if (steps.some((step) => invokesRootTest(step.rawCommand))) {
+    throw new Error(
+      `Publication workflow ${jobName} must not run the monorepo-wide bun run test suite.`,
+    );
+  }
+}
+
 function requireText(haystack: string, needle: string, message: string): void {
   if (!haystack.includes(needle)) throw new Error(message);
 }
@@ -58,13 +259,47 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
   for (const job of ["preflight", "reserve_tag", "windows_x64", "macos_arm64", "publish"]) {
     requireText(main, `\n  ${job}:`, `Publication workflow is missing the ${job} job.`);
   }
-  requireText(main, "runs-on: windows-2022", "Windows publication must use windows-2022.");
-  requireText(main, "runs-on: macos-15", "macOS publication must use macos-15.");
-  requireText(
-    main,
-    'test "$(uname -m)" = arm64',
-    "macOS publication must prove arm64 host architecture.",
+  const jobs = publicationJobs(main);
+  verifyRootTestOwnership(jobs);
+  const preflightJob = publicationJob(jobs, "preflight");
+  if (preflightJob["runs-on"] !== "ubuntu-24.04") {
+    throw new Error("Publication workflow preflight must run on ubuntu-24.04.");
+  }
+  if (
+    preflightJob.if !== undefined ||
+    (preflightJob["continue-on-error"] !== undefined && preflightJob["continue-on-error"] !== false)
+  ) {
+    throw new Error("Publication workflow preflight job must be unconditional and fail closed.");
+  }
+  const windowsJob = publicationJob(jobs, "windows_x64");
+  const macosJob = publicationJob(jobs, "macos_arm64");
+  verifyNativeJobCommands(
+    windowsJob,
+    "windows_x64",
+    "windows-2022",
+    nativeJobRunSteps(jobs, "windows_x64"),
+    PRERELEASE_WINDOWS_REQUIRED_COMMANDS,
+    "bun run dist:desktop:super:win --",
   );
+  verifyNativeJobCommands(
+    macosJob,
+    "macos_arm64",
+    "macos-15",
+    nativeJobRunSteps(jobs, "macos_arm64"),
+    PRERELEASE_MACOS_REQUIRED_COMMANDS,
+    "bun run dist:desktop:super:mac --",
+  );
+  const macosBuildStep = nativeJobRunSteps(jobs, "macos_arm64").find((step) =>
+    hasExecutableLine(step.rawCommand, "bun run dist:desktop:super:mac --"),
+  );
+  if (
+    !macosBuildStep ||
+    !hasExecutableLine(macosBuildStep.rawCommand, 'test "$(uname -m)" = arm64')
+  ) {
+    throw new Error(
+      "macOS publication must prove arm64 host architecture in the native build step.",
+    );
+  }
   requireText(
     main,
     "environment: super-synara-prerelease",

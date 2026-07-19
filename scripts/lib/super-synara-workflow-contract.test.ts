@@ -13,11 +13,11 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const main = readFileSync(
   resolve(repoRoot, ".github/workflows/super-synara-prerelease.yml"),
   "utf8",
-);
+).replaceAll("\r\n", "\n");
 const audit = readFileSync(
   resolve(repoRoot, ".github/workflows/super-synara-macos-signature-audit.yml"),
   "utf8",
-);
+).replaceAll("\r\n", "\n");
 
 describe("Super Synara workflow contracts", () => {
   it("admits the manual fail-closed workflow pair", () => {
@@ -81,6 +81,181 @@ describe("Super Synara workflow contracts", () => {
         audit,
       ),
     ).toThrow("source cleanliness");
+  });
+
+  it("requires exact native prerelease gates and rejects broad native suites", () => {
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          "src/desktopIdentityProof.test.ts\n          src/windowsCertificate.test.ts",
+          "src/forgedIdentityProof.test.ts\n          src/windowsCertificate.test.ts",
+        ),
+        audit,
+      ),
+    ).toThrow("windows_x64 must run exact native gate command");
+
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          "      - name: Validate workflow contracts\n        run: node scripts/verify-workflow-contracts.ts",
+          "      - name: Validate workflow contracts\n        run: node scripts/verify-workflow-contracts.ts\n\n      - name: Unsafe broad Windows suite\n        run: bun run test",
+        ),
+        audit,
+      ),
+    ).toThrow("windows_x64 must not own an additional or chained monorepo-wide bun run test suite");
+
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          "      - name: Build unsigned macOS disk image",
+          "      - name: Unsafe broad macOS suite\n        run: bun run test\n\n      - name: Build unsigned macOS disk image",
+        ),
+        audit,
+      ),
+    ).toThrow("macos_arm64 must not own an additional or chained monorepo-wide bun run test suite");
+
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          "lib/super-synara-macos-signatures.test.ts",
+          "lib/forged-macos-signatures.test.ts",
+        ),
+        audit,
+      ),
+    ).toThrow("macos_arm64 must run exact native gate command");
+  });
+
+  it("binds prerelease suite ownership and native runners", () => {
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace("      - name: Test\n        run: bun run test\n", ""),
+        audit,
+      ),
+    ).toThrow("preflight must run exactly one bare bun run test suite");
+
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          "      - name: Test\n        run: bun run test",
+          "      - name: Test\n        run: bun run test\n\n      - name: Duplicate full suite\n        run: bun run test",
+        ),
+        audit,
+      ),
+    ).toThrow("preflight must run exactly one bare bun run test suite");
+
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace("    runs-on: windows-2022", "    runs-on: ubuntu-24.04"),
+        audit,
+      ),
+    ).toThrow("windows_x64 must run on windows-2022");
+
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace("    runs-on: macos-15", "    runs-on: ubuntu-24.04"),
+        audit,
+      ),
+    ).toThrow("macos_arm64 must run on macos-15");
+
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace("  preflight:\n", "  preflight:\n    if: false\n"),
+        audit,
+      ),
+    ).toThrow("preflight job must be unconditional and fail closed");
+
+    const publishIndex = main.indexOf("\n  publish:");
+    const chainedPublishSuite =
+      main.slice(0, publishIndex) +
+      main
+        .slice(publishIndex)
+        .replace(
+          "    steps:\n",
+          "    steps:\n      - name: Unsafe chained full suite\n        run: bun run test && echo done\n\n",
+        );
+    expect(() => verifySuperSynaraWorkflowText(chainedPublishSuite, audit)).toThrow(
+      "publish must not own an additional or chained monorepo-wide bun run test suite",
+    );
+  });
+
+  it("requires prerelease native gates and builds to fail closed in order", () => {
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          "      - name: Validate workflow contracts\n        run: node scripts/verify-workflow-contracts.ts",
+          "      - name: Validate workflow contracts\n        continue-on-error: true\n        run: node scripts/verify-workflow-contracts.ts",
+        ),
+        audit,
+      ),
+    ).toThrow("windows_x64 native gate must be unconditional and fail closed");
+
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace("  windows_x64:\n", "  windows_x64:\n    if: false\n"),
+        audit,
+      ),
+    ).toThrow("windows_x64 job must be unconditional and fail closed");
+
+    const validatorStep =
+      "      - name: Validate workflow contracts\n        run: node scripts/verify-workflow-contracts.ts\n\n";
+    const reorderedValidator = main
+      .replace(validatorStep, "")
+      .replace("\n  macos_arm64:", `\n${validatorStep}  macos_arm64:`);
+    expect(() => verifySuperSynaraWorkflowText(reorderedValidator, audit)).toThrow(
+      "windows_x64 native gate must run before the native build",
+    );
+
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          "        shell: bash\n        env:\n          CSC_IDENTITY_AUTO_DISCOVERY",
+          "        shell: bash\n        continue-on-error: true\n        env:\n          CSC_IDENTITY_AUTO_DISCOVERY",
+        ),
+        audit,
+      ),
+    ).toThrow("macos_arm64 native build must be unconditional and fail closed");
+  });
+
+  it("requires executable macOS architecture and package commands", () => {
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          '          test "$(uname -m)" = arm64',
+          '          # test "$(uname -m)" = arm64',
+        ),
+        audit,
+      ),
+    ).toThrow("prove arm64 host architecture in the native build step");
+
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          "          bun run dist:desktop:super:mac -- \\",
+          "          echo bun run dist:desktop:super:mac -- \\",
+        ),
+        audit,
+      ),
+    ).toThrow("execute exactly one native build command");
+
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          '          test "$(uname -m)" = arm64',
+          '          test "$(uname -m)" = arm64 || true',
+        ),
+        audit,
+      ),
+    ).toThrow("macos_arm64 native build must not mask shell failures");
+
+    const outputDirectoryLine = "            --output-dir release-build";
+    const macOutputDirectoryIndex = main.lastIndexOf(outputDirectoryLine);
+    const maskedMacBuild =
+      main.slice(0, macOutputDirectoryIndex) +
+      `${outputDirectoryLine} || true` +
+      main.slice(macOutputDirectoryIndex + outputDirectoryLine.length);
+    expect(() => verifySuperSynaraWorkflowText(maskedMacBuild, audit)).toThrow(
+      "macos_arm64 native build must not mask shell failures",
+    );
   });
 
   it("rejects drift from the plan-locked dispatch interface", () => {

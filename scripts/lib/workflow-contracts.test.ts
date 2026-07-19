@@ -49,7 +49,48 @@ const policy = (): WorkflowPolicy => ({
 });
 
 const disabledWorkflow = `name: Disabled\non: workflow_dispatch\njobs:\n  noop:\n    runs-on: ubuntu-24.04\n    steps:\n      - uses: ${pinnedCheckout}\n`;
-const ciWorkflow = `name: CI\non:\n  pull_request:\n  push:\npermissions:\n  contents: read\njobs:\n  quality:\n    runs-on: ubuntu-24.04\n    steps:\n      - uses: ${pinnedCheckout}\n  macos_arm64:\n    runs-on: macos-15\n    steps:\n      - run: test "$(uname -m)" = arm64\n`;
+const ciWorkflow = `name: CI
+on:
+  pull_request:
+  push:
+permissions:
+  contents: read
+jobs:
+  quality:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: ${pinnedCheckout}
+      - run: bun run test
+  windows_x64:
+    runs-on: windows-2022
+    steps:
+      - run: bun run brand:check
+      - run: bun run --cwd packages/shared test src/desktopIdentity.test.ts src/desktopIdentityProof.test.ts src/windowsCertificate.test.ts
+      - run: bun run --cwd apps/desktop test src/backendShutdown.test.ts src/backendShutdown.windows.integration.test.ts
+      - run: bun run --cwd packages/shared test src/windowsProcess.test.ts
+      - run: bun run --cwd apps/server test src/windowsProcessEffect.test.ts src/codexAppServerManager.test.ts src/provider/Layers/ProviderHealth.test.ts src/persistence/MigrationBackup.test.ts src/restoreMigrationBackup.test.ts
+      - run: bun run --cwd apps/desktop test src/desktopMigrationRecovery.test.ts src/desktopStorageMigration.test.ts src/windowState.test.ts src/updateState.test.ts
+      - run: bun run --cwd scripts test check-brand-identity.test.ts verify-packaged-desktop-startup.test.ts lib/desktop-artifact-policy.test.ts lib/windows-authenticode.test.ts lib/windows-installer-qualification.test.ts lib/release-artifact-provenance.test.ts lib/super-synara-release-admission.test.ts lib/super-synara-workflow-contract.test.ts
+      - run: node scripts/verify-workflow-contracts.ts
+      - run: bun run build:desktop
+  macos_arm64:
+    runs-on: macos-15
+    steps:
+      - run: test "$(uname -m)" = arm64
+      - run: bun run brand:check
+      - run: node scripts/node-pty-smoke.mjs
+      - run: bun run --cwd apps/desktop test
+      - run: bun run build:desktop
+  release_smoke:
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo bun run test
+      - run: bun run test:desktop-smoke
+      - run: bun run --cwd scripts test
+      - run: |
+          # bun run test
+          echo safe
+`;
 const watchWorkflow = `name: Watch\non:\n  schedule:\n    - cron: "17 */6 * * *"\n  workflow_dispatch:\npermissions:\n  contents: read\njobs:\n  inspect:\n    runs-on: ubuntu-24.04\n  report:\n    runs-on: ubuntu-24.04\n    permissions:\n      contents: read\n      issues: write\n`;
 
 function validFiles(): Map<string, string> {
@@ -105,6 +146,153 @@ describe("workflow contracts", () => {
     );
     expect(validateWorkflowContracts(files, policy()).join("\n")).toContain(
       "macos_arm64 must fail closed",
+    );
+  });
+
+  it("requires exact native CI gates and rejects broad suites only in native jobs", () => {
+    const missingWindowsGate = validFiles();
+    missingWindowsGate.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace("src/desktopIdentityProof.test.ts", "src/forgedIdentityProof.test.ts"),
+    );
+    expect(validateWorkflowContracts(missingWindowsGate, policy()).join("\n")).toContain(
+      "windows_x64 must run exact native gate command",
+    );
+
+    const broadWindowsSuite = validFiles();
+    broadWindowsSuite.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace(
+        "      - run: bun run brand:check\n",
+        "      - run: bun run brand:check\n      - run: bun run test\n",
+      ),
+    );
+    expect(validateWorkflowContracts(broadWindowsSuite, policy()).join("\n")).toContain(
+      "windows_x64 must not run the monorepo-wide bun run test suite",
+    );
+
+    const broadMacosSuite = validFiles();
+    broadMacosSuite.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace(
+        "      - run: bun run --cwd apps/desktop test\n",
+        "      - run: bun run --cwd apps/desktop test\n      - run: bun run test\n",
+      ),
+    );
+    expect(validateWorkflowContracts(broadMacosSuite, policy()).join("\n")).toContain(
+      "macos_arm64 must not run the monorepo-wide bun run test suite",
+    );
+  });
+
+  it("binds CI suite ownership and native runners", () => {
+    const missingQualitySuite = validFiles();
+    missingQualitySuite.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace("      - run: bun run test\n", ""),
+    );
+    expect(validateWorkflowContracts(missingQualitySuite, policy()).join("\n")).toContain(
+      "quality must run exactly one bare bun run test suite",
+    );
+
+    const duplicateQualitySuite = validFiles();
+    duplicateQualitySuite.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace(
+        "      - run: bun run test\n",
+        "      - run: bun run test\n      - run: bun run test\n",
+      ),
+    );
+    expect(validateWorkflowContracts(duplicateQualitySuite, policy()).join("\n")).toContain(
+      "quality must run exactly one bare bun run test suite",
+    );
+
+    const swappedWindowsRunner = validFiles();
+    swappedWindowsRunner.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace("    runs-on: windows-2022", "    runs-on: ubuntu-24.04"),
+    );
+    expect(validateWorkflowContracts(swappedWindowsRunner, policy()).join("\n")).toContain(
+      "windows_x64 must run on windows-2022",
+    );
+
+    const conditionalQuality = validFiles();
+    conditionalQuality.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace("  quality:\n", "  quality:\n    if: false\n"),
+    );
+    expect(validateWorkflowContracts(conditionalQuality, policy()).join("\n")).toContain(
+      "quality job must be unconditional and fail closed",
+    );
+
+    const chainedReleaseSuite = validFiles();
+    chainedReleaseSuite.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace("          echo safe", "          bun run test && echo done"),
+    );
+    expect(validateWorkflowContracts(chainedReleaseSuite, policy()).join("\n")).toContain(
+      "release_smoke must not own an additional or chained monorepo-wide bun run test suite",
+    );
+  });
+
+  it("requires native CI gates to fail closed before the build", () => {
+    const skippedGate = validFiles();
+    skippedGate.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace(
+        "      - run: node scripts/verify-workflow-contracts.ts",
+        "      - run: node scripts/verify-workflow-contracts.ts\n        continue-on-error: true",
+      ),
+    );
+    expect(validateWorkflowContracts(skippedGate, policy()).join("\n")).toContain(
+      "native gate must be unconditional and fail closed",
+    );
+
+    const gate = "      - run: node scripts/verify-workflow-contracts.ts\n";
+    const reorderedGate = validFiles();
+    reorderedGate.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow
+        .replace(gate, "")
+        .replace(
+          "      - run: bun run build:desktop\n",
+          `      - run: bun run build:desktop\n${gate}`,
+        ),
+    );
+    expect(validateWorkflowContracts(reorderedGate, policy()).join("\n")).toContain(
+      "native gate must run before the desktop build",
+    );
+
+    const conditionalArchitecture = validFiles();
+    conditionalArchitecture.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace(
+        '      - run: test "$(uname -m)" = arm64',
+        '      - if: false\n        run: test "$(uname -m)" = arm64',
+      ),
+    );
+    expect(validateWorkflowContracts(conditionalArchitecture, policy()).join("\n")).toContain(
+      "native gate must be unconditional and fail closed",
+    );
+
+    const conditionalJob = validFiles();
+    conditionalJob.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace("  windows_x64:\n", "  windows_x64:\n    if: false\n"),
+    );
+    expect(validateWorkflowContracts(conditionalJob, policy()).join("\n")).toContain(
+      "windows_x64 job must be unconditional and fail closed",
+    );
+
+    const nonFailingBuild = validFiles();
+    nonFailingBuild.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace(
+        "      - run: bun run build:desktop\n",
+        "      - run: bun run build:desktop\n        continue-on-error: true\n",
+      ),
+    );
+    expect(validateWorkflowContracts(nonFailingBuild, policy()).join("\n")).toContain(
+      "native desktop build must be unconditional and fail closed",
     );
   });
 

@@ -132,14 +132,23 @@ jobs:
       - name: Verify Super Synara identity
         run: bun run brand:check
 
-      - name: Run full Windows test suite
-        run: bun run test
+      - name: Run shared desktop identity and certificate regressions
+        run: >-
+          bun run --cwd packages/shared test
+          src/desktopIdentity.test.ts
+          src/desktopIdentityProof.test.ts
+          src/windowsCertificate.test.ts
 
-      - name: Run Windows process and provider regressions
+      - name: Run Windows desktop shutdown regressions
+        run: >-
+          bun run --cwd apps/desktop test
+          src/backendShutdown.test.ts
+          src/backendShutdown.windows.integration.test.ts
+
+      - name: Run Windows process regressions
         run: >-
           bun run --cwd packages/shared test
           src/windowsProcess.test.ts
-          src/windowsCertificate.test.ts
 
       - name: Run Windows provider startup and migration regressions
         run: >-
@@ -157,6 +166,21 @@ jobs:
           src/desktopStorageMigration.test.ts
           src/windowState.test.ts
           src/updateState.test.ts
+
+      - name: Run Super Synara Windows release contract regressions
+        run: >-
+          bun run --cwd scripts test
+          check-brand-identity.test.ts
+          verify-packaged-desktop-startup.test.ts
+          lib/desktop-artifact-policy.test.ts
+          lib/windows-authenticode.test.ts
+          lib/windows-installer-qualification.test.ts
+          lib/release-artifact-provenance.test.ts
+          lib/super-synara-release-admission.test.ts
+          lib/super-synara-workflow-contract.test.ts
+
+      - name: Validate workflow contracts
+        run: node scripts/verify-workflow-contracts.ts
 
       - name: Build desktop pipeline
         env:

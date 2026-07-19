@@ -34,6 +34,22 @@ const EXPECTED_DISABLED_PATHS = new Set([
   ".github/workflows/pr-vouch.yml",
   ".github/workflows/release.yml",
 ]);
+const CI_WINDOWS_REQUIRED_COMMANDS = [
+  "bun run brand:check",
+  "bun run --cwd packages/shared test src/desktopIdentity.test.ts src/desktopIdentityProof.test.ts src/windowsCertificate.test.ts",
+  "bun run --cwd apps/desktop test src/backendShutdown.test.ts src/backendShutdown.windows.integration.test.ts",
+  "bun run --cwd packages/shared test src/windowsProcess.test.ts",
+  "bun run --cwd apps/server test src/windowsProcessEffect.test.ts src/codexAppServerManager.test.ts src/provider/Layers/ProviderHealth.test.ts src/persistence/MigrationBackup.test.ts src/restoreMigrationBackup.test.ts",
+  "bun run --cwd apps/desktop test src/desktopMigrationRecovery.test.ts src/desktopStorageMigration.test.ts src/windowState.test.ts src/updateState.test.ts",
+  "bun run --cwd scripts test check-brand-identity.test.ts verify-packaged-desktop-startup.test.ts lib/desktop-artifact-policy.test.ts lib/windows-authenticode.test.ts lib/windows-installer-qualification.test.ts lib/release-artifact-provenance.test.ts lib/super-synara-release-admission.test.ts lib/super-synara-workflow-contract.test.ts",
+  "node scripts/verify-workflow-contracts.ts",
+] as const;
+const CI_MACOS_REQUIRED_COMMANDS = [
+  'test "$(uname -m)" = arm64',
+  "bun run brand:check",
+  "node scripts/node-pty-smoke.mjs",
+  "bun run --cwd apps/desktop test",
+] as const;
 
 function isRecord(value: unknown): value is UnknownRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -42,6 +58,152 @@ function isRecord(value: unknown): value is UnknownRecord {
 function stringArray(value: unknown): string[] | null {
   if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string")) return null;
   return value as string[];
+}
+
+function normalizeShellCommand(command: string): string {
+  return command.replace(/\s+/g, " ").trim();
+}
+
+interface WorkflowRunStep {
+  readonly command: string;
+  readonly continueOnError: unknown;
+  readonly condition: unknown;
+  readonly index: number;
+  readonly rawCommand: string;
+}
+
+function executableShellLines(command: string): readonly string[] {
+  return command
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !line.startsWith("#"));
+}
+
+function invokesRootTest(command: string): boolean {
+  return executableShellLines(command).some((line) =>
+    /(?:^|(?:&&|\|\||;)\s*)bun run test(?=$|\s|&&|\|\||;)/.test(line),
+  );
+}
+
+function jobRunSteps(
+  jobs: UnknownRecord,
+  jobName: string,
+  workflowPath: string,
+  errors: string[],
+): readonly WorkflowRunStep[] | null {
+  const job = jobs[jobName];
+  if (!isRecord(job) || !Array.isArray(job.steps)) {
+    errors.push(`${workflowPath} must define the ${jobName} job with steps.`);
+    return null;
+  }
+  return job.steps
+    .map((step, index): WorkflowRunStep | null => {
+      if (!isRecord(step) || typeof step.run !== "string") return null;
+      return {
+        command: normalizeShellCommand(step.run),
+        continueOnError: step["continue-on-error"],
+        condition: step.if,
+        index,
+        rawCommand: step.run,
+      };
+    })
+    .filter((step): step is WorkflowRunStep => step !== null);
+}
+
+function validateNativeJobCommands(
+  workflowPath: string,
+  jobName: string,
+  steps: readonly WorkflowRunStep[],
+  requiredCommands: readonly string[],
+  errors: string[],
+): void {
+  const buildSteps = steps.filter((step) => step.command === "bun run build:desktop");
+  if (buildSteps.length !== 1) {
+    errors.push(`${workflowPath} ${jobName} must retain the native desktop build step.`);
+  }
+  const [buildStep] = buildSteps;
+  if (
+    buildStep &&
+    (buildStep.condition !== undefined ||
+      (buildStep.continueOnError !== undefined && buildStep.continueOnError !== false))
+  ) {
+    errors.push(
+      `${workflowPath} ${jobName} native desktop build must be unconditional and fail closed.`,
+    );
+  }
+  for (const command of requiredCommands) {
+    const matches = steps.filter((step) => step.command === command);
+    if (matches.length !== 1) {
+      errors.push(`${workflowPath} ${jobName} must run exact native gate command: ${command}.`);
+      continue;
+    }
+    const [step] = matches;
+    if (
+      step!.condition !== undefined ||
+      (step!.continueOnError !== undefined && step!.continueOnError !== false)
+    ) {
+      errors.push(
+        `${workflowPath} ${jobName} native gate must be unconditional and fail closed: ${command}.`,
+      );
+    }
+    if (buildStep && step!.index >= buildStep.index) {
+      errors.push(
+        `${workflowPath} ${jobName} native gate must run before the desktop build: ${command}.`,
+      );
+    }
+  }
+  if (steps.some((step) => invokesRootTest(step.rawCommand))) {
+    errors.push(`${workflowPath} ${jobName} must not run the monorepo-wide bun run test suite.`);
+  }
+}
+
+function validateRootTestOwnership(
+  jobs: UnknownRecord,
+  ownerJobName: string,
+  workflowPath: string,
+  errors: string[],
+): void {
+  const occurrences: Array<{
+    readonly jobName: string;
+    readonly step: WorkflowRunStep;
+  }> = [];
+  for (const [jobName, job] of Object.entries(jobs)) {
+    if (!isRecord(job) || !Array.isArray(job.steps)) continue;
+    for (const [index, step] of job.steps.entries()) {
+      if (!isRecord(step) || typeof step.run !== "string") continue;
+      if (!invokesRootTest(step.run)) continue;
+      occurrences.push({
+        jobName,
+        step: {
+          command: normalizeShellCommand(step.run),
+          continueOnError: step["continue-on-error"],
+          condition: step.if,
+          index,
+          rawCommand: step.run,
+        },
+      });
+    }
+  }
+  const owned = occurrences.filter(({ jobName }) => jobName === ownerJobName);
+  const bareOwned = owned.filter(({ step }) => step.command === "bun run test");
+  if (bareOwned.length !== 1) {
+    errors.push(`${workflowPath} ${ownerJobName} must run exactly one bare bun run test suite.`);
+  } else if (
+    bareOwned[0]!.step.condition !== undefined ||
+    (bareOwned[0]!.step.continueOnError !== undefined &&
+      bareOwned[0]!.step.continueOnError !== false)
+  ) {
+    errors.push(
+      `${workflowPath} ${ownerJobName} bare bun run test must be unconditional and fail closed.`,
+    );
+  }
+  for (const occurrence of occurrences) {
+    if (occurrence.jobName !== ownerJobName || occurrence.step.command !== "bun run test") {
+      errors.push(
+        `${workflowPath} ${occurrence.jobName} must not own an additional or chained monorepo-wide bun run test suite.`,
+      );
+    }
+  }
 }
 
 export function parseWorkflowPolicy(contents: string): WorkflowPolicy {
@@ -123,9 +285,11 @@ function collectValuesForKey(value: unknown, key: string, results: unknown[]): v
   }
 }
 
-function permissionEntries(
-  workflow: UnknownRecord,
-): Array<{ readonly location: string; readonly scope: string; readonly access: string }> {
+function permissionEntries(workflow: UnknownRecord): Array<{
+  readonly location: string;
+  readonly scope: string;
+  readonly access: string;
+}> {
   const entries: Array<{ location: string; scope: string; access: string }> = [];
   const addPermissions = (value: unknown, location: string): void => {
     if (typeof value === "string") {
@@ -178,19 +342,65 @@ function allowedWritePermission(path: string, location: string, scope: string): 
 }
 
 function validateCiArchitecture(workflow: UnknownRecord, errors: string[]): void {
-  if (!isRecord(workflow.jobs) || !isRecord(workflow.jobs.macos_arm64)) {
-    errors.push(".github/workflows/ci.yml must define the macos_arm64 job.");
+  const workflowPath = ".github/workflows/ci.yml";
+  if (!isRecord(workflow.jobs)) {
+    errors.push(`${workflowPath} must define jobs.`);
     return;
   }
+  validateRootTestOwnership(workflow.jobs, "quality", workflowPath, errors);
+  const windowsSteps = jobRunSteps(workflow.jobs, "windows_x64", workflowPath, errors);
+  const macosSteps = jobRunSteps(workflow.jobs, "macos_arm64", workflowPath, errors);
+  const windowsJob = workflow.jobs.windows_x64;
   const macosJob = workflow.jobs.macos_arm64;
-  if (macosJob["runs-on"] !== "macos-15") {
-    errors.push(".github/workflows/ci.yml macos_arm64 must run on macos-15.");
+  const qualityJob = workflow.jobs.quality;
+  if (isRecord(qualityJob) && qualityJob["runs-on"] !== "ubuntu-24.04") {
+    errors.push(`${workflowPath} quality must run on ubuntu-24.04.`);
   }
-  const commands: unknown[] = [];
-  collectValuesForKey(macosJob.steps, "run", commands);
-  if (!commands.includes('test "$(uname -m)" = arm64')) {
-    errors.push(
-      '.github/workflows/ci.yml macos_arm64 must fail closed with test "$(uname -m)" = arm64.',
+  if (
+    isRecord(qualityJob) &&
+    (qualityJob.if !== undefined ||
+      (qualityJob["continue-on-error"] !== undefined && qualityJob["continue-on-error"] !== false))
+  ) {
+    errors.push(`${workflowPath} quality job must be unconditional and fail closed.`);
+  }
+  if (isRecord(windowsJob) && windowsJob["runs-on"] !== "windows-2022") {
+    errors.push(`${workflowPath} windows_x64 must run on windows-2022.`);
+  }
+  for (const [jobName, job] of [
+    ["windows_x64", windowsJob],
+    ["macos_arm64", macosJob],
+  ] as const) {
+    if (
+      isRecord(job) &&
+      (job.if !== undefined ||
+        (job["continue-on-error"] !== undefined && job["continue-on-error"] !== false))
+    ) {
+      errors.push(`${workflowPath} ${jobName} job must be unconditional and fail closed.`);
+    }
+  }
+  if (!isRecord(macosJob)) return;
+  if (macosJob["runs-on"] !== "macos-15") {
+    errors.push(`${workflowPath} macos_arm64 must run on macos-15.`);
+  }
+  if (!macosSteps?.some((step) => step.command === 'test "$(uname -m)" = arm64')) {
+    errors.push(`${workflowPath} macos_arm64 must fail closed with test "$(uname -m)" = arm64.`);
+  }
+  if (windowsSteps) {
+    validateNativeJobCommands(
+      workflowPath,
+      "windows_x64",
+      windowsSteps,
+      CI_WINDOWS_REQUIRED_COMMANDS,
+      errors,
+    );
+  }
+  if (macosSteps) {
+    validateNativeJobCommands(
+      workflowPath,
+      "macos_arm64",
+      macosSteps,
+      CI_MACOS_REQUIRED_COMMANDS,
+      errors,
     );
   }
 }
