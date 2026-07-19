@@ -272,7 +272,7 @@
         "userVisibleConsequence": "Restored terminal transcripts preserve wrapping, scrollback, cursor placement, and live-output ordering across sessions instead of being reparsed at an unrelated grid.",
         "owner": "slashdevcorpse",
         "status": "upstream-pending",
-        "upstreamSourceCommit": "13c30b3739d380f2da8c1dfbfc1dccf41021d26c",
+        "upstreamSourceCommit": "2b54ff414d3aa505a6ec5f8c749cb2b8a1c4128a",
         "introducingCommit": "1beb7b3b240ea71f14cd9718ee9415a94c83335e",
         "touchedFiles":
           [
@@ -308,7 +308,7 @@
             {
               "status": "upstream-pending",
               "date": "2026-07-19",
-              "evidence": "Open upstream PR 429 at 13c30b3739d380f2da8c1dfbfc1dccf41021d26c; rebased downstream at 1beb7b3b240ea71f14cd9718ee9415a94c83335e",
+              "evidence": "Open upstream PR 429 at 2b54ff414d3aa505a6ec5f8c749cb2b8a1c4128a; implementation rebased at 1beb7b3b240ea71f14cd9718ee9415a94c83335e and latest rendering wait integrated at 45e70075352db09d70151ef5305852a0ce30769d",
             },
           ],
       },
