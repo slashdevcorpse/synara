@@ -154,6 +154,23 @@ export const makeEditorAvailability = (
     };
     let inFlight: InFlightRefresh | null = null;
     let pending: PendingRefresh | null = null;
+    let requestCaptureRetryAt: number | null = null;
+
+    const captureFailureSnapshot = (retryAt: number): EditorAvailabilitySnapshot => ({
+      ...toSnapshot(state),
+      status: "failed",
+      failureCategory: "filesystem_transient",
+      retryAt,
+    });
+    const setCaptureFailureState = (retryAt: number): EditorAvailabilitySnapshot => {
+      requestCaptureRetryAt = retryAt;
+      state.status = "failed";
+      state.failureCategory = "filesystem_transient";
+      state.retryAt = retryAt;
+      return toSnapshot(state);
+    };
+    const recordCaptureFailure = (attemptedAt: number): EditorAvailabilitySnapshot =>
+      setCaptureFailureState(attemptedAt + retryAfterMs);
 
     const getCurrent = lock.withPermits(1)(Effect.sync(() => toSnapshot(state)));
 
@@ -202,9 +219,27 @@ export const makeEditorAvailability = (
         const settled: SettledRefresh | null = yield* lock.withPermits(1)(
           Effect.gen(function* () {
             if (inFlight !== entry) return null;
-            inFlight = null;
-            const currentRequest = captureRequest();
             const pendingRefresh = pending;
+            const captureAttemptedAt = now();
+            let currentRequest: EditorDiscoveryRequest;
+            try {
+              currentRequest = captureRequest();
+              requestCaptureRetryAt = null;
+            } catch {
+              inFlight = null;
+              pending = null;
+              const snapshot = recordCaptureFailure(captureAttemptedAt);
+              return {
+                snapshot,
+                publish: false,
+                complete: [
+                  entry.completed,
+                  ...entry.waiters,
+                  ...(pendingRefresh ? [pendingRefresh.completed] : []),
+                ],
+              } satisfies SettledRefresh;
+            }
+            inFlight = null;
             pending = null;
             if (pendingRefresh !== null || currentRequest.identity !== entry.identity) {
               const continuationRequest =
@@ -280,9 +315,32 @@ export const makeEditorAvailability = (
     const selectRefresh = (force: boolean) =>
       lock.withPermits(1)(
         Effect.gen(function* () {
-          const request = captureRequest();
-          const requestedIdentity = request.identity;
           const requestedAt = now();
+          if (requestCaptureRetryAt !== null && requestCaptureRetryAt > requestedAt) {
+            return {
+              snapshot:
+                inFlight === null
+                  ? setCaptureFailureState(requestCaptureRetryAt)
+                  : captureFailureSnapshot(requestCaptureRetryAt),
+              completed: null,
+            };
+          }
+          let request: EditorDiscoveryRequest;
+          try {
+            request = captureRequest();
+            requestCaptureRetryAt = null;
+          } catch {
+            const retryAt = requestedAt + retryAfterMs;
+            requestCaptureRetryAt = retryAt;
+            return {
+              snapshot:
+                inFlight === null
+                  ? setCaptureFailureState(retryAt)
+                  : captureFailureSnapshot(retryAt),
+              completed: null,
+            };
+          }
+          const requestedIdentity = request.identity;
           if (inFlight !== null) {
             if (pending !== null) {
               pending.request = request;
@@ -339,6 +397,7 @@ export const makeEditorAvailability = (
         state.lastAttemptIdentity = null;
         state.failureCategory = null;
         state.retryAt = null;
+        requestCaptureRetryAt = null;
         state.status = inFlight !== null ? "refreshing" : state.revision > 0 ? "ready" : "idle";
       }),
     );

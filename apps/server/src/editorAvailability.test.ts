@@ -53,6 +53,282 @@ describe("EditorAvailability", () => {
     );
   });
 
+  it("bounds initial identity capture failures, enforces retry, and recovers after clear", async () => {
+    let clock = 10_000;
+    let throwIdentity = true;
+    let identityCalls = 0;
+    let discoveryCalls = 0;
+
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const availability = yield* makeEditorAvailability({
+            discover: async () => {
+              discoveryCalls += 1;
+              return success(discoveryCalls === 1 ? ["vscode"] : ["cursor"]);
+            },
+            identity: () => {
+              identityCalls += 1;
+              if (throwIdentity) throw new Error("identity unavailable");
+              return "identity-a";
+            },
+            now: () => clock,
+          });
+
+          const firstFailure = yield* availability.refresh;
+          expect(firstFailure).toMatchObject({
+            status: "failed",
+            failureCategory: "filesystem_transient",
+            retryAt: 12_000,
+            availableEditors: [],
+            revision: 0,
+          });
+          expect(identityCalls).toBe(1);
+          expect(discoveryCalls).toBe(0);
+
+          const retryBlocked = yield* availability.refresh;
+          expect(retryBlocked.retryAt).toBe(12_000);
+          expect(identityCalls).toBe(1);
+
+          throwIdentity = false;
+          const stillBlocked = yield* availability.refresh;
+          expect(stillBlocked.status).toBe("failed");
+          expect(identityCalls).toBe(1);
+
+          clock = 12_000;
+          const recovered = yield* availability.refresh;
+          expect(recovered).toMatchObject({
+            status: "ready",
+            availableEditors: ["vscode"],
+            revision: 1,
+            confirmedAt: 12_000,
+          });
+          expect(identityCalls).toBe(3);
+          expect(discoveryCalls).toBe(1);
+
+          throwIdentity = true;
+          clock = 13_000;
+          const retainedFailure = yield* availability.refresh;
+          expect(retainedFailure).toMatchObject({
+            status: "failed",
+            failureCategory: "filesystem_transient",
+            retryAt: 15_000,
+            availableEditors: ["vscode"],
+            revision: 1,
+            confirmedAt: 12_000,
+          });
+
+          throwIdentity = false;
+          yield* availability.clearRefreshState;
+          const recoveredAfterClear = yield* availability.refresh;
+          expect(recoveredAfterClear).toMatchObject({
+            status: "ready",
+            availableEditors: ["cursor"],
+            revision: 2,
+            confirmedAt: 13_000,
+          });
+          expect(identityCalls).toBe(6);
+          expect(discoveryCalls).toBe(2);
+        }),
+      ),
+    );
+  });
+
+  it("reports a caller capture failure without corrupting valid in-flight discovery", async () => {
+    let clock = 20_000;
+    let throwIdentity = false;
+    let identityCalls = 0;
+    let completeDiscovery!: (result: EditorDiscoveryResult) => void;
+
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const availability = yield* makeEditorAvailability({
+            discover: () =>
+              new Promise<EditorDiscoveryResult>((resolve) => {
+                completeDiscovery = resolve;
+              }),
+            identity: () => {
+              identityCalls += 1;
+              if (throwIdentity) throw new Error("identity unavailable");
+              return "identity-a";
+            },
+            now: () => clock,
+          });
+
+          const original = yield* availability.refresh.pipe(Effect.forkScoped);
+          yield* Effect.yieldNow;
+          yield* Effect.yieldNow;
+          throwIdentity = true;
+          const failedCaller = yield* availability.refresh;
+          expect(failedCaller).toMatchObject({
+            status: "failed",
+            failureCategory: "filesystem_transient",
+            retryAt: 22_000,
+          });
+          expect((yield* availability.getCurrent).status).toBe("refreshing");
+
+          throwIdentity = false;
+          completeDiscovery(success(["vscode"]));
+          const confirmed = yield* Fiber.join(original);
+          expect(confirmed).toMatchObject({
+            status: "ready",
+            availableEditors: ["vscode"],
+            revision: 1,
+          });
+          expect(identityCalls).toBe(3);
+          expect((yield* availability.getCurrent).status).toBe("ready");
+          clock += 2_000;
+        }),
+      ),
+    );
+  });
+
+  it("settles an identity-capture failure while retaining confirmed state", async () => {
+    let clock = 30_000;
+    let throwIdentity = false;
+    let identityCalls = 0;
+    let discoveryCalls = 0;
+    let completeDiscovery!: (result: EditorDiscoveryResult) => void;
+
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const availability = yield* makeEditorAvailability({
+            discover: () => {
+              discoveryCalls += 1;
+              if (discoveryCalls === 1) return Promise.resolve(success(["vscode"]));
+              if (discoveryCalls === 2) {
+                return new Promise<EditorDiscoveryResult>((resolve) => {
+                  completeDiscovery = resolve;
+                });
+              }
+              return Promise.resolve(success(["cursor"]));
+            },
+            identity: () => {
+              identityCalls += 1;
+              if (throwIdentity) throw new Error("identity unavailable");
+              return "identity-a";
+            },
+            now: () => clock,
+          });
+
+          const first = yield* availability.refresh;
+          expect(first).toMatchObject({
+            status: "ready",
+            availableEditors: ["vscode"],
+            revision: 1,
+            confirmedAt: 30_000,
+          });
+
+          const second = yield* availability.refresh.pipe(Effect.forkScoped);
+          yield* Effect.yieldNow;
+          yield* Effect.yieldNow;
+          throwIdentity = true;
+          completeDiscovery(success([]));
+          const failed = yield* Fiber.join(second);
+          expect(failed).toMatchObject({
+            status: "failed",
+            failureCategory: "filesystem_transient",
+            retryAt: 32_000,
+            availableEditors: ["vscode"],
+            revision: 1,
+            confirmedAt: 30_000,
+          });
+          expect(yield* availability.getCurrent).toEqual(failed);
+          expect(discoveryCalls).toBe(2);
+
+          throwIdentity = false;
+          const retryBlocked = yield* availability.refresh;
+          expect(retryBlocked).toEqual(failed);
+          expect(identityCalls).toBe(4);
+
+          clock = 32_000;
+          const recovered = yield* availability.refresh;
+          expect(recovered).toMatchObject({
+            status: "ready",
+            availableEditors: ["cursor"],
+            revision: 2,
+            confirmedAt: 32_000,
+          });
+          expect(identityCalls).toBe(6);
+          expect(discoveryCalls).toBe(3);
+        }),
+      ),
+    );
+  });
+
+  it("completes active and pending waiters when settlement identity capture fails", async () => {
+    let clock = 40_000;
+    let currentIdentity = "identity-a";
+    let throwIdentity = false;
+    let identityCalls = 0;
+    const discoveryCalls: string[] = [];
+    let completeA!: (result: EditorDiscoveryResult) => void;
+
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const availability = yield* makeEditorAvailability({
+            discover: (_signal, identity) =>
+              new Promise<EditorDiscoveryResult>((resolve) => {
+                discoveryCalls.push(identity);
+                completeA = resolve;
+              }),
+            identity: () => {
+              identityCalls += 1;
+              if (throwIdentity) throw new Error("identity unavailable");
+              return currentIdentity;
+            },
+            now: () => clock,
+          });
+
+          const firstA = yield* availability.refresh.pipe(Effect.forkScoped);
+          yield* Effect.yieldNow;
+          const secondA = yield* availability.refresh.pipe(Effect.forkScoped);
+          yield* Effect.yieldNow;
+          currentIdentity = "identity-b";
+          const firstB = yield* availability.refresh.pipe(Effect.forkScoped);
+          yield* Effect.yieldNow;
+          const secondB = yield* availability.refresh.pipe(Effect.forkScoped);
+          yield* Effect.yieldNow;
+          expect(discoveryCalls).toEqual(["identity-a"]);
+
+          throwIdentity = true;
+          completeA(success(["cursor"]));
+          const results = yield* Effect.forEach(
+            [firstA, secondA, firstB, secondB],
+            Fiber.join,
+          );
+          expect(
+            results.map((result) => ({
+              status: result.status,
+              failureCategory: result.failureCategory,
+              retryAt: result.retryAt,
+              revision: result.revision,
+            })),
+          ).toEqual(
+            Array.from({ length: 4 }, () => ({
+              status: "failed",
+              failureCategory: "filesystem_transient",
+              retryAt: 42_000,
+              revision: 0,
+            })),
+          );
+          expect(identityCalls).toBe(5);
+          expect(discoveryCalls).toEqual(["identity-a"]);
+          expect(yield* availability.getCurrent).toMatchObject({
+            status: "failed",
+            failureCategory: "filesystem_transient",
+            retryAt: 42_000,
+            revision: 0,
+          });
+          clock += 2_000;
+        }),
+      ),
+    );
+  });
+
   it("queues a changed identity behind a held refresh and never returns the stale result", async () => {
     let currentIdentity = "identity-a";
     const calls: string[] = [];
