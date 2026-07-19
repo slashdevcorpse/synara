@@ -93,6 +93,7 @@ jobs:
           SOURCE_SHA: ${{ inputs.source_sha }}
         run: |
           set -euo pipefail
+          test "$(uname -m)" = arm64
           lockfile_sha256="$(shasum -a 256 bun.lock | awk '{print $1}')"
           node scripts/build-desktop-artifact.ts \
             --platform mac \

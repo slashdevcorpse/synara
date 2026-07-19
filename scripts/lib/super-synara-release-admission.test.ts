@@ -66,7 +66,15 @@ async function createPlatformStaging(): Promise<{ directory: string; licensePath
       schemaVersion: 1,
       electronVersion: "40.10.6",
       productOwnedPaths: ["Contents/MacOS/Super Synara"],
-      thirdParty: [],
+      thirdParty: [
+        {
+          path: "Contents/Frameworks/Electron Framework.framework/Versions/A/Electron Framework",
+          identifier: "com.github.Electron.framework",
+          teamId: null,
+          authorities: [],
+          scheme: "ad-hoc-only",
+        },
+      ],
     },
     macSignatureReport: {
       schemaVersion: 1,
@@ -88,7 +96,16 @@ async function createPlatformStaging(): Promise<{ directory: string; licensePath
           scheme: "ad-hoc-only",
         },
       ],
-      thirdParty: [],
+      thirdParty: [
+        {
+          path: "Contents/Frameworks/Electron Framework.framework/Versions/A/Electron Framework",
+          identifier: "com.github.Electron.framework",
+          teamId: null,
+          authorities: [],
+          cdHash: "e".repeat(40),
+          scheme: "ad-hoc-only",
+        },
+      ],
     },
   });
   const licensePath = join(licenseRoot, "LICENSE");

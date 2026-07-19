@@ -23,6 +23,7 @@ import {
   RELEASE_PATCHES_PATH,
   RELEASE_WORKSPACE_MANIFEST_PATHS,
 } from "./lib/release-workspace-manifests.ts";
+import { verifySuperSynaraWorkflowContracts } from "./lib/super-synara-workflow-contract.ts";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -128,7 +129,10 @@ function verifyCanonicalIdentity(): void {
 }
 
 function verifyReleaseWorkflowSafety(): void {
-  const workflow = readFileSync(resolve(repoRoot, ".github/workflows/release.yml"), "utf8");
+  const workflow = readFileSync(
+    resolve(repoRoot, ".github/workflows/release.yml"),
+    "utf8",
+  ).replaceAll("\r\n", "\n");
   assertContains(
     workflow,
     "publish_release:\n        description:",
@@ -335,6 +339,7 @@ const tempRoot = mkdtempSync(join(tmpdir(), "synara-release-smoke-"));
 try {
   verifyCanonicalIdentity();
   verifyReleaseWorkflowSafety();
+  verifySuperSynaraWorkflowContracts(repoRoot);
   verifyDesktopStageLockAuthority();
   copyWorkspaceManifestFixture(tempRoot);
 

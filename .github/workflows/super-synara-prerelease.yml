@@ -1,0 +1,733 @@
+name: Publish Super Synara Unsigned Prerelease
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Downstream version (for example 0.5.5-super.1)"
+        required: true
+        type: string
+      confirm_unsigned_publication:
+        description: "I understand this publishes unsigned installers with operating-system warnings"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: super-synara-unsigned-prerelease
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    name: Validate immutable source and release policy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      source_commit: ${{ steps.source.outputs.source_commit }}
+      source_tag: ${{ steps.source.outputs.source_tag }}
+      lockfile_sha256: ${{ steps.source.outputs.lockfile_sha256 }}
+      absorbed_upstream_sha: ${{ steps.downstream.outputs.absorbed_upstream_sha }}
+      max_windows_bytes: ${{ steps.budget.outputs.max_windows_bytes }}
+      max_macos_bytes: ${{ steps.budget.outputs.max_macos_bytes }}
+      max_total_bytes: ${{ steps.budget.outputs.max_total_bytes }}
+    steps:
+      - name: Checkout exact workflow commit
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version-file: package.json
+
+      - name: Setup Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: package.json
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - id: meta
+        name: Require explicit unsigned publication confirmation
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+          CONFIRMED: ${{ inputs.confirm_unsigned_publication }}
+        run: |
+          set -euo pipefail
+          [[ "$CONFIRMED" == "true" ]]
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+-super\.[1-9][0-9]*$ ]]
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=super-v$VERSION" >> "$GITHUB_OUTPUT"
+
+      - id: budget
+        name: Bind repository artifact byte budgets
+        shell: bash
+        env:
+          WINDOWS_BYTES: ${{ vars.SUPER_SYNARA_MAX_WINDOWS_BYTES }}
+          MACOS_BYTES: ${{ vars.SUPER_SYNARA_MAX_MACOS_BYTES }}
+          TOTAL_BYTES: ${{ vars.SUPER_SYNARA_MAX_TOTAL_BYTES }}
+        run: |
+          set -euo pipefail
+          [[ "$WINDOWS_BYTES" =~ ^[1-9][0-9]*$ ]]
+          [[ "$MACOS_BYTES" =~ ^[1-9][0-9]*$ ]]
+          [[ "$TOTAL_BYTES" =~ ^[1-9][0-9]*$ ]]
+          (( WINDOWS_BYTES <= TOTAL_BYTES ))
+          (( MACOS_BYTES <= TOTAL_BYTES ))
+          (( WINDOWS_BYTES + MACOS_BYTES <= TOTAL_BYTES ))
+          (( TOTAL_BYTES <= 858986863 ))
+          echo "max_windows_bytes=$WINDOWS_BYTES" >> "$GITHUB_OUTPUT"
+          echo "max_macos_bytes=$MACOS_BYTES" >> "$GITHUB_OUTPUT"
+          echo "max_total_bytes=$TOTAL_BYTES" >> "$GITHUB_OUTPUT"
+
+      - name: Require reviewed macOS signature policy
+        run: |
+          node scripts/verify-super-synara-macos-allowlist.ts \
+            scripts/super-synara-macos-signature-allowlist.json \
+            40.10.6
+
+      - id: downstream
+        name: Validate absorbed upstream state
+        shell: bash
+        run: node scripts/validate-downstream-state.ts --github-output "$GITHUB_OUTPUT"
+
+      - id: source
+        name: Validate source provenance
+        shell: bash
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          SOURCE_COMMIT: ${{ github.sha }}
+        run: |
+          node scripts/verify-release-source-provenance.ts \
+            "$VERSION" \
+            "$TAG" \
+            true \
+            "$SOURCE_COMMIT" \
+            branch \
+            main \
+            github-unsigned-prerelease \
+            false
+
+      - name: Validate GitHub tag and release state
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          node scripts/verify-super-synara-github-state.ts \
+            --phase preflight \
+            --repository "$GITHUB_REPOSITORY" \
+            --ref-name "$GITHUB_REF_NAME" \
+            --actor "$GITHUB_ACTOR" \
+            --triggering-actor "$GITHUB_TRIGGERING_ACTOR" \
+            --owner "$GITHUB_REPOSITORY_OWNER" \
+            --tag "$TAG" \
+            --source-commit "$GITHUB_SHA"
+
+      - name: Verify Super Synara identity
+        run: bun run brand:check
+
+      - name: Check formatting
+        run: bun run fmt:check
+
+      - name: Lint
+        run: bun run lint
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Test
+        run: bun run test
+
+      - name: Install Chromium test runtime
+        run: ./node_modules/.bin/playwright install --with-deps chromium
+
+      - name: Run stable browser tests
+        run: bun run --cwd apps/web test:browser:stable
+
+      - name: Run release contract smoke tests
+        run: bun run release:smoke
+
+  reserve_tag:
+    name: Reserve immutable downstream tag
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ needs.preflight.outputs.source_commit }}
+          fetch-depth: 0
+
+      - name: Validate reservation state
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
+        run: |
+          node scripts/verify-super-synara-github-state.ts \
+            --phase reserve-tag \
+            --repository "$GITHUB_REPOSITORY" \
+            --ref-name "$GITHUB_REF_NAME" \
+            --actor "$GITHUB_ACTOR" \
+            --triggering-actor "$GITHUB_TRIGGERING_ACTOR" \
+            --owner "$GITHUB_REPOSITORY_OWNER" \
+            --tag "$TAG" \
+            --source-commit "$SOURCE_COMMIT"
+
+      - name: Create lightweight tag only when absent
+        shell: bash
+        env:
+          TAG: ${{ needs.preflight.outputs.tag }}
+          SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
+        run: |
+          set -euo pipefail
+          if git show-ref --verify --quiet "refs/tags/$TAG"; then
+            [[ "$(git cat-file -t "$TAG")" == "commit" ]]
+            [[ "$(git rev-parse "$TAG")" == "$SOURCE_COMMIT" ]]
+          else
+            git tag "$TAG" "$SOURCE_COMMIT"
+            git push origin "refs/tags/$TAG"
+          fi
+
+      - name: Revalidate reserved tag
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
+        run: |
+          node scripts/verify-super-synara-github-state.ts \
+            --phase reserve-tag \
+            --repository "$GITHUB_REPOSITORY" \
+            --ref-name "$GITHUB_REF_NAME" \
+            --actor "$GITHUB_ACTOR" \
+            --triggering-actor "$GITHUB_TRIGGERING_ACTOR" \
+            --owner "$GITHUB_REPOSITORY_OWNER" \
+            --tag "$TAG" \
+            --source-commit "$SOURCE_COMMIT"
+
+  windows_x64:
+    name: Build unsigned Windows x64 installer
+    needs: [preflight, reserve_tag]
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - name: Checkout exact tagged source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ needs.preflight.outputs.source_commit }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version-file: package.json
+
+      - name: Setup Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: package.json
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Revalidate tagged source
+        shell: bash
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
+        run: |
+          node scripts/verify-release-source-provenance.ts \
+            "$VERSION" "$TAG" true "$SOURCE_COMMIT" branch main \
+            github-unsigned-prerelease true
+
+      - name: Run Windows regression suite
+        run: bun run test
+
+      - name: Build unsigned Windows installer
+        shell: bash
+        env:
+          SYNARA_DESKTOP_FLAVOR: super
+          SYNARA_DESKTOP_DISABLE_UPDATES: "1"
+          VERSION: ${{ needs.preflight.outputs.version }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
+          LOCKFILE_SHA256: ${{ needs.preflight.outputs.lockfile_sha256 }}
+        run: |
+          node scripts/build-desktop-artifact.ts \
+            --platform win \
+            --target nsis \
+            --arch x64 \
+            --build-version "$VERSION" \
+            --source-commit "$SOURCE_COMMIT" \
+            --source-tag "$TAG" \
+            --lockfile-sha256 "$LOCKFILE_SHA256" \
+            --output-dir release-build \
+            --desktop-flavor super \
+            --disable-updates
+
+      - name: Stage exact Windows payload and provenance
+        shell: bash
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
+          LOCKFILE_SHA256: ${{ needs.preflight.outputs.lockfile_sha256 }}
+          ABSORBED_UPSTREAM_SHA: ${{ needs.preflight.outputs.absorbed_upstream_sha }}
+        run: |
+          set -euo pipefail
+          installer="Super-Synara-$VERSION-windows-x64-unsigned.exe"
+          [[ -f "release-build/$installer" ]]
+          mkdir release-publish
+          cp "release-build/$installer" release-publish/
+          node scripts/write-release-artifact-provenance.ts \
+            --assets-dir release-publish \
+            --platform win \
+            --arch x64 \
+            --target nsis \
+            --version "$VERSION" \
+            --source-commit "$SOURCE_COMMIT" \
+            --source-tag "$TAG" \
+            --lockfile-sha256 "$LOCKFILE_SHA256" \
+            --publication true \
+            --signed false \
+            --distribution-kind github-unsigned-prerelease \
+            --distribution-repository "$GITHUB_REPOSITORY" \
+            --distribution-prerelease true \
+            --distribution-latest false \
+            --updater-feed false \
+            --absorbed-upstream-sha "$ABSORBED_UPSTREAM_SHA" \
+            --artifact-files "$installer" \
+            --output-file-name artifact-windows-x64.provenance.json
+
+      - name: Smoke packaged Windows app
+        shell: bash
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          node scripts/verify-packaged-desktop-startup.ts \
+            --assets-dir release-publish \
+            --platform win \
+            --arch x64 \
+            --version "$VERSION"
+
+      - name: Enforce Windows artifact budget
+        shell: bash
+        run: |
+          node scripts/enforce-super-synara-artifact-budget.ts \
+            release-publish \
+            "${{ needs.preflight.outputs.max_windows_bytes }}"
+
+      - name: Upload exact Windows lane
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: super-synara-windows-x64
+          path: |
+            release-publish/Super-Synara-${{ needs.preflight.outputs.version }}-windows-x64-unsigned.exe
+            release-publish/artifact-windows-x64.provenance.json
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  macos_arm64:
+    name: Build unsigned macOS arm64 disk image
+    needs: [preflight, reserve_tag]
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - name: Checkout exact tagged source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ needs.preflight.outputs.source_commit }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version-file: package.json
+
+      - name: Setup Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: package.json
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Revalidate tagged source
+        shell: bash
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
+        run: |
+          node scripts/verify-release-source-provenance.ts \
+            "$VERSION" "$TAG" true "$SOURCE_COMMIT" branch main \
+            github-unsigned-prerelease true
+
+      - name: Run macOS regression suite
+        run: bun run test
+
+      - name: Build unsigned macOS disk image
+        shell: bash
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+          SYNARA_DESKTOP_FLAVOR: super
+          SYNARA_DESKTOP_DISABLE_UPDATES: "1"
+          VERSION: ${{ needs.preflight.outputs.version }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
+          LOCKFILE_SHA256: ${{ needs.preflight.outputs.lockfile_sha256 }}
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          node scripts/build-desktop-artifact.ts \
+            --platform mac \
+            --target dmg \
+            --arch arm64 \
+            --build-version "$VERSION" \
+            --source-commit "$SOURCE_COMMIT" \
+            --source-tag "$TAG" \
+            --lockfile-sha256 "$LOCKFILE_SHA256" \
+            --output-dir release-build \
+            --desktop-flavor super \
+            --disable-updates
+
+      - name: Admit exact macOS signatures
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          zips=(release-build/*.zip)
+          [[ "${#zips[@]}" -eq 1 ]]
+          node scripts/collect-super-synara-macos-signatures.ts \
+            --mode admit \
+            --zip "${zips[0]}" \
+            --electron-version 40.10.6 \
+            --allowlist scripts/super-synara-macos-signature-allowlist.json \
+            --output "$RUNNER_TEMP/macos-signatures.json"
+
+      - name: Smoke packaged macOS app
+        shell: bash
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          node scripts/verify-packaged-desktop-startup.ts \
+            --assets-dir release-build \
+            --platform mac \
+            --arch arm64 \
+            --version "$VERSION"
+
+      - name: Stage exact macOS payload and provenance
+        shell: bash
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
+          LOCKFILE_SHA256: ${{ needs.preflight.outputs.lockfile_sha256 }}
+          ABSORBED_UPSTREAM_SHA: ${{ needs.preflight.outputs.absorbed_upstream_sha }}
+        run: |
+          set -euo pipefail
+          disk_image="Super-Synara-$VERSION-macos-arm64-unsigned.dmg"
+          [[ -f "release-build/$disk_image" ]]
+          mkdir release-publish
+          cp "release-build/$disk_image" release-publish/
+          node scripts/write-release-artifact-provenance.ts \
+            --assets-dir release-publish \
+            --platform mac \
+            --arch arm64 \
+            --target dmg \
+            --version "$VERSION" \
+            --source-commit "$SOURCE_COMMIT" \
+            --source-tag "$TAG" \
+            --lockfile-sha256 "$LOCKFILE_SHA256" \
+            --publication true \
+            --signed false \
+            --distribution-kind github-unsigned-prerelease \
+            --distribution-repository "$GITHUB_REPOSITORY" \
+            --distribution-prerelease true \
+            --distribution-latest false \
+            --updater-feed false \
+            --absorbed-upstream-sha "$ABSORBED_UPSTREAM_SHA" \
+            --mac-signature-report "$RUNNER_TEMP/macos-signatures.json" \
+            --mac-signature-allowlist scripts/super-synara-macos-signature-allowlist.json \
+            --artifact-files "$disk_image" \
+            --output-file-name artifact-macos-arm64.provenance.json
+
+      - name: Enforce macOS artifact budget
+        shell: bash
+        run: |
+          node scripts/enforce-super-synara-artifact-budget.ts \
+            release-publish \
+            "${{ needs.preflight.outputs.max_macos_bytes }}"
+
+      - name: Upload exact macOS lane
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: super-synara-macos-arm64
+          path: |
+            release-publish/Super-Synara-${{ needs.preflight.outputs.version }}-macos-arm64-unsigned.dmg
+            release-publish/artifact-macos-arm64.provenance.json
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  publish:
+    name: Admit and publish exact unsigned prerelease
+    needs: [preflight, reserve_tag, windows_x64, macos_arm64]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: super-synara-prerelease
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ needs.preflight.outputs.source_commit }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version-file: package.json
+
+      - name: Setup Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: package.json
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile --ignore-scripts
+
+      - name: Download Windows lane
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: super-synara-windows-x64
+          path: release-stage
+
+      - name: Download macOS lane
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: super-synara-macos-arm64
+          path: release-stage
+
+      - name: Validate state before draft creation
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
+        run: |
+          node scripts/verify-super-synara-github-state.ts \
+            --phase before-draft \
+            --repository "$GITHUB_REPOSITORY" \
+            --ref-name "$GITHUB_REF_NAME" \
+            --actor "$GITHUB_ACTOR" \
+            --triggering-actor "$GITHUB_TRIGGERING_ACTOR" \
+            --owner "$GITHUB_REPOSITORY_OWNER" \
+            --tag "$TAG" \
+            --source-commit "$SOURCE_COMMIT"
+
+      - name: Prepare exact eight-file release set
+        shell: bash
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
+          ABSORBED_UPSTREAM_SHA: ${{ needs.preflight.outputs.absorbed_upstream_sha }}
+          MAX_TOTAL_BYTES: ${{ needs.preflight.outputs.max_total_bytes }}
+        run: |
+          node scripts/prepare-super-synara-release.ts prepare \
+            --directory release-stage \
+            --license LICENSE \
+            --version "$VERSION" \
+            --tag "$TAG" \
+            --source-commit "$SOURCE_COMMIT" \
+            --absorbed-upstream-sha "$ABSORBED_UPSTREAM_SHA" \
+            --max-total-bytes "$MAX_TOTAL_BYTES"
+
+      - id: draft
+        name: Create owned draft prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$SOURCE_COMMIT" \
+            --title "Super Synara $VERSION (unsigned prerelease)" \
+            --notes-file release-stage/UNSIGNED-BUILD.md \
+            --draft \
+            --prerelease \
+            --verify-tag \
+            --latest=false
+          draft_id="$(
+            gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+              --jq "[.[][] | select(.tag_name == \"$TAG\" and .draft == true and .prerelease == true and .target_commitish == \"$SOURCE_COMMIT\")] | if length == 1 then .[0].id else error(\"expected one owned draft\") end"
+          )"
+          [[ "$draft_id" =~ ^[1-9][0-9]*$ ]]
+          echo "id=$draft_id" >> "$GITHUB_OUTPUT"
+
+      - name: Validate exact current-run draft
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
+          DRAFT_ID: ${{ steps.draft.outputs.id }}
+        run: |
+          node scripts/verify-super-synara-github-state.ts \
+            --phase after-draft \
+            --repository "$GITHUB_REPOSITORY" \
+            --ref-name "$GITHUB_REF_NAME" \
+            --actor "$GITHUB_ACTOR" \
+            --triggering-actor "$GITHUB_TRIGGERING_ACTOR" \
+            --owner "$GITHUB_REPOSITORY_OWNER" \
+            --tag "$TAG" \
+            --source-commit "$SOURCE_COMMIT" \
+            --current-run-draft-id "$DRAFT_ID"
+
+      - name: Upload exact release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          assets=(
+            "release-stage/Super-Synara-$VERSION-windows-x64-unsigned.exe"
+            "release-stage/Super-Synara-$VERSION-macos-arm64-unsigned.dmg"
+            release-stage/artifact-windows-x64.provenance.json
+            release-stage/artifact-macos-arm64.provenance.json
+            release-stage/release-index.json
+            release-stage/SHA256SUMS.txt
+            release-stage/UNSIGNED-BUILD.md
+            release-stage/LICENSE
+          )
+          [[ "${#assets[@]}" -eq 8 ]]
+          for asset in "${assets[@]}"; do [[ -f "$asset" ]]; done
+          gh release upload "$TAG" "${assets[@]}" --repo "$GITHUB_REPOSITORY"
+
+      - name: Redownload and compare uploaded bytes
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DRAFT_ID: ${{ steps.draft.outputs.id }}
+        run: |
+          set -euo pipefail
+          mkdir release-redownload
+          assets_json="$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases/$DRAFT_ID/assets?per_page=100")"
+          [[ "$(jq '[.[][]] | length' <<< "$assets_json")" -eq 8 ]]
+          while IFS=$'\t' read -r asset_id asset_name; do
+            [[ -f "release-stage/$asset_name" ]]
+            gh api \
+              -H "Accept: application/octet-stream" \
+              "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" \
+              > "release-redownload/$asset_name"
+            cmp "release-stage/$asset_name" "release-redownload/$asset_name"
+          done < <(jq -r '.[][] | [.id, .name] | @tsv' <<< "$assets_json")
+          diff \
+            <(find release-stage -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort) \
+            <(find release-redownload -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)
+
+      - name: Revalidate prepared local bytes
+        shell: bash
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
+          ABSORBED_UPSTREAM_SHA: ${{ needs.preflight.outputs.absorbed_upstream_sha }}
+          MAX_TOTAL_BYTES: ${{ needs.preflight.outputs.max_total_bytes }}
+        run: |
+          node scripts/prepare-super-synara-release.ts verify \
+            --directory release-stage \
+            --version "$VERSION" \
+            --tag "$TAG" \
+            --source-commit "$SOURCE_COMMIT" \
+            --absorbed-upstream-sha "$ABSORBED_UPSTREAM_SHA" \
+            --max-total-bytes "$MAX_TOTAL_BYTES"
+
+      - id: downstream
+        name: Revalidate absorbed upstream state
+        shell: bash
+        run: node scripts/validate-downstream-state.ts --github-output "$GITHUB_OUTPUT"
+
+      - name: Bind revalidated absorbed upstream SHA
+        shell: bash
+        env:
+          EXPECTED: ${{ needs.preflight.outputs.absorbed_upstream_sha }}
+          ACTUAL: ${{ steps.downstream.outputs.absorbed_upstream_sha }}
+        run: test "$ACTUAL" = "$EXPECTED"
+
+      - name: Validate state immediately before publication
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
+          DRAFT_ID: ${{ steps.draft.outputs.id }}
+        run: |
+          node scripts/verify-super-synara-github-state.ts \
+            --phase before-publish \
+            --repository "$GITHUB_REPOSITORY" \
+            --ref-name "$GITHUB_REF_NAME" \
+            --actor "$GITHUB_ACTOR" \
+            --triggering-actor "$GITHUB_TRIGGERING_ACTOR" \
+            --owner "$GITHUB_REPOSITORY_OWNER" \
+            --tag "$TAG" \
+            --source-commit "$SOURCE_COMMIT" \
+            --current-run-draft-id "$DRAFT_ID"
+
+      - name: Publish exact draft as non-latest prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DRAFT_ID: ${{ steps.draft.outputs.id }}
+        run: |
+          gh api --method PATCH \
+            "repos/$GITHUB_REPOSITORY/releases/$DRAFT_ID" \
+            -F draft=false \
+            -F prerelease=true \
+            -f make_latest=false
+
+      - name: Verify public prerelease state
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
+          RELEASE_ID: ${{ steps.draft.outputs.id }}
+        run: |
+          set -euo pipefail
+          release="$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID")"
+          [[ "$(jq -r .tag_name <<< "$release")" == "$TAG" ]]
+          [[ "$(jq -r .target_commitish <<< "$release")" == "$SOURCE_COMMIT" ]]
+          [[ "$(jq -r .draft <<< "$release")" == "false" ]]
+          [[ "$(jq -r .prerelease <<< "$release")" == "true" ]]
+          latest_id="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .id 2>/dev/null || true)"
+          [[ "$latest_id" != "$RELEASE_ID" ]]
