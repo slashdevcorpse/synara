@@ -1,10 +1,9 @@
 // FILE: benchmark-windows-command-discovery.ts
 // Purpose: Compare immutable Windows discovery implementations under one reproducible fixture.
 
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
-  copyFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -27,7 +26,7 @@ import { Effect } from "effect";
 const PR397_HEAD_SHA = "7c39415c16415224253c376c8e85df74489596b8";
 const DEFAULT_WARMUPS = 5;
 const MIN_ITERATIONS = 30;
-const FIXTURE_ID = "windows-command-discovery-v1";
+const FIXTURE_ID = "windows-command-discovery-v2";
 const SHA_PATTERN = /^[0-9a-f]{40}$/i;
 const RECEIPT_DIRECTORY_PATTERN = /^synara-goal09-benchmark-[0-9a-f]{32}$/i;
 const RECEIPT_FILENAME = "receipt.json";
@@ -146,7 +145,7 @@ interface VersionRuntime {
   readonly editorAvailability: EditorAvailabilityRuntimeModule | null;
 }
 
-interface BenchmarkFixture {
+export interface BenchmarkFixture {
   readonly root: string;
   readonly cwdA: string;
   readonly cwdB: string;
@@ -154,11 +153,27 @@ interface BenchmarkFixture {
   readonly binB: string;
   readonly exeCandidate: string;
   readonly cmdCandidate: string;
-  readonly fakeSystemRoot: string;
-  readonly fakePowerShellBin: string;
-  readonly appxCounterFile: string;
+  readonly systemRoot: string;
+  readonly powerShellBin: string;
+  readonly powerShellExecutable: string;
+  readonly powerShellExecutableSha256: string;
+  readonly appxModuleRoot: string;
+  readonly appxModulePath: string;
+  readonly appxMarkerDirectory: string;
   readonly appxInstallLocation: string;
   readonly treeSha256: string;
+}
+
+export interface EditorFixturePreflight {
+  readonly commandType: "Function";
+  readonly moduleName: "Appx";
+  readonly modulePathSha256: string;
+  readonly powerShellVersion: string;
+  readonly powerShellExecutableSha256: string;
+  readonly packageFamilyName: "Microsoft.VisualStudioCode_8wekyb3d8bbwe";
+  readonly installLocationSha256: string;
+  readonly markerCount: 1;
+  readonly transportCommandHidden: true;
 }
 
 interface NodeDuplicateEnvironmentOracle {
@@ -310,7 +325,9 @@ export function summarizeSamples(samples: readonly BenchmarkSample[]): Benchmark
   };
 }
 
-export function alternatingVersionOrder(index: number): readonly ["base", "candidate"] | readonly ["candidate", "base"] {
+export function alternatingVersionOrder(
+  index: number,
+): readonly ["base", "candidate"] | readonly ["candidate", "base"] {
   return index % 2 === 0 ? ["base", "candidate"] : ["candidate", "base"];
 }
 
@@ -372,14 +389,12 @@ export function evaluateBenchmarkGates(
     },
     {
       name: "cold_p95_regression",
-      passed:
-        cold.candidate.p95Ms <= cold.base.p95Ms + Math.max(cold.base.p95Ms * 0.2, 10),
+      passed: cold.candidate.p95Ms <= cold.base.p95Ms + Math.max(cold.base.p95Ms * 0.2, 10),
       detail: `candidate ${cold.candidate.p95Ms} ms; base ${cold.base.p95Ms} ms`,
     },
     {
       name: "warm_zero_additional_where",
-      passed:
-        warm8.candidate.subprocessCount === 0 && warm32.candidate.subprocessCount === 0,
+      passed: warm8.candidate.subprocessCount === 0 && warm32.candidate.subprocessCount === 0,
       detail: `candidate subprocess totals: warm8=${warm8.candidate.subprocessCount}, warm32=${warm32.candidate.subprocessCount}`,
     },
     {
@@ -388,10 +403,7 @@ export function evaluateBenchmarkGates(
         (scenario) => scenario.candidate.maxSubprocessesPerIteration === 1,
       ),
       detail: changedScenarios
-        .map(
-          (scenario) =>
-            `${scenario.name}=${scenario.candidate.maxSubprocessesPerIteration}`,
-        )
+        .map((scenario) => `${scenario.name}=${scenario.candidate.maxSubprocessesPerIteration}`)
         .join(", "),
     },
     {
@@ -404,12 +416,16 @@ export function evaluateBenchmarkGates(
     {
       name: "editor_single_flight",
       passed: editorScenarios.every(
-        (scenario) => scenario.candidate.maxSubprocessesPerIteration === 1,
+        (scenario) =>
+          scenario.base.maxSubprocessesPerIteration === 1 &&
+          scenario.base.subprocessCount === scenario.base.samples &&
+          scenario.candidate.maxSubprocessesPerIteration === 1 &&
+          scenario.candidate.subprocessCount === scenario.candidate.samples,
       ),
       detail: editorScenarios
         .map(
           (scenario) =>
-            `${scenario.name}=${scenario.candidate.maxSubprocessesPerIteration}`,
+            `${scenario.name}=base:${scenario.base.subprocessCount}/${scenario.base.samples},candidate:${scenario.candidate.subprocessCount}/${scenario.candidate.samples}`,
         )
         .join(", "),
     },
@@ -440,11 +456,7 @@ function git(repo: string, args: readonly string[]): string {
 
 function isPathInside(root: string, candidate: string): boolean {
   const relativePath = relative(resolve(root), resolve(candidate));
-  return (
-    relativePath.length > 0 &&
-    !relativePath.startsWith("..") &&
-    !isAbsolute(relativePath)
-  );
+  return relativePath.length > 0 && !relativePath.startsWith("..") && !isAbsolute(relativePath);
 }
 
 export function assertCandidateCheckoutIdentity(input: {
@@ -491,7 +503,9 @@ export function assertSafeBenchmarkOutputPath(
     expectedTemp.ino !== actualTemp.ino ||
     !RECEIPT_DIRECTORY_PATTERN.test(basename(realParent))
   ) {
-    throw new Error(`Benchmark output directory is outside the controlled temp boundary: ${parent}`);
+    throw new Error(
+      `Benchmark output directory is outside the controlled temp boundary: ${parent}`,
+    );
   }
   if (readdirSync(realParent).length > 0 || existsSync(resolvedOutput)) {
     throw new Error(`Benchmark output directory must be empty: ${parent}`);
@@ -572,16 +586,16 @@ function provisionRevisionDependencies(
     symlinkSync(dependency.target, dependency.link, "junction");
   }
   const resolutionScript = [
-    'const root = process.env.SYNARA_BENCHMARK_WORKTREE;',
+    "const root = process.env.SYNARA_BENCHMARK_WORKTREE;",
     'if (!root) throw new Error("Missing benchmark worktree.");',
-    'const parent = `${root}/apps/server/src/open.ts`;',
-    'const contractsParent = `${root}/packages/contracts/src/index.ts`;',
-    'process.stdout.write(JSON.stringify({',
+    "const parent = `${root}/apps/server/src/open.ts`;",
+    "const contractsParent = `${root}/packages/contracts/src/index.ts`;",
+    "process.stdout.write(JSON.stringify({",
     '  contracts: Bun.resolveSync("@synara/contracts", parent),',
     '  sharedWindowsProcess: Bun.resolveSync("@synara/shared/windowsProcess", parent),',
     '  effectFromServer: Bun.resolveSync("effect", parent),',
     '  effectFromContracts: Bun.resolveSync("effect", contractsParent),',
-    '}));',
+    "}));",
   ].join("\n");
   const resolutionEnvironment = Object.fromEntries(
     Object.entries(process.env).filter(([name]) => name.toUpperCase() !== "NODE_PATH"),
@@ -624,7 +638,9 @@ function provisionRevisionDependencies(
 }
 
 function removeRevisionDependencyLinks(worktree: string, externalEffectPackage: string): void {
-  for (const dependency of [...benchmarkDependencyLinks(worktree, externalEffectPackage)].reverse()) {
+  for (const dependency of [
+    ...benchmarkDependencyLinks(worktree, externalEffectPackage),
+  ].reverse()) {
     if (existsSync(dependency.link)) unlinkSync(dependency.link);
   }
 }
@@ -671,7 +687,10 @@ function readCommittedPackageManager(repo: string, sha: string): string {
   return packageJson.packageManager;
 }
 
-export function assertMatchingLockfileProvenance(baseDigest: string, candidateDigest: string): void {
+export function assertMatchingLockfileProvenance(
+  baseDigest: string,
+  candidateDigest: string,
+): void {
   if (baseDigest !== candidateDigest) {
     throw new Error(
       `Benchmark revisions have different committed bun.lock digests: base=${baseDigest}, candidate=${candidateDigest}.`,
@@ -728,72 +747,158 @@ function assertSafeTempRoot(tempRoot: string, allowedParent: string): void {
   }
 }
 
-function createFixture(tempRoot: string): BenchmarkFixture {
+const APPX_MARKER_PATTERN = /^powershell-process-[0-9a-f]{32}\.json$/i;
+const EXPECTED_APPX_FAMILY = "Microsoft.VisualStudioCode_8wekyb3d8bbwe";
+
+const APPX_MODULE_CONTENTS = [
+  "Set-StrictMode -Version Latest",
+  "",
+  "$script:MarkerDirectory = $env:SYNARA_BENCHMARK_APPX_MARKER_DIR",
+  "if ([string]::IsNullOrWhiteSpace($script:MarkerDirectory)) {",
+  "    throw 'SYNARA_BENCHMARK_APPX_MARKER_DIR is required.'",
+  "}",
+  "$script:MarkerPath = Join-Path -Path $script:MarkerDirectory -ChildPath (",
+  "    'powershell-process-{0}.json' -f [Guid]::NewGuid().ToString('N')",
+  ")",
+  "$script:RequestedNames = [Collections.Generic.List[string]]::new()",
+  "",
+  "function Write-SynaraAppxMarker {",
+  "    $marker = [ordered]@{",
+  "        ProcessId = $PID",
+  "        ModulePath = $PSCommandPath",
+  "        RequestedNames = @($script:RequestedNames)",
+  "    } | ConvertTo-Json -Compress",
+  "    [IO.File]::WriteAllText(",
+  "        $script:MarkerPath,",
+  "        $marker,",
+  "        [Text.UTF8Encoding]::new($false)",
+  "    )",
+  "}",
+  "",
+  "Write-SynaraAppxMarker",
+  "",
+  "function Get-AppxPackage {",
+  "    [CmdletBinding()]",
+  "    param(",
+  "        [Parameter(Position = 0)]",
+  "        [string] $Name",
+  "    )",
+  "",
+  "    $installLocation = $env:SYNARA_BENCHMARK_APPX_LOCATION",
+  "    if ([string]::IsNullOrWhiteSpace($installLocation)) {",
+  "        throw 'SYNARA_BENCHMARK_APPX_LOCATION is required.'",
+  "    }",
+  "",
+  "    $script:RequestedNames.Add($Name)",
+  "    Write-SynaraAppxMarker",
+  "",
+  "    if ($Name -ieq 'Microsoft.VisualStudioCode') {",
+  "        [PSCustomObject]@{",
+  "            Name = 'Microsoft.VisualStudioCode'",
+  "            PackageFullName = 'Microsoft.VisualStudioCode_1.0.0.0_x64__8wekyb3d8bbwe'",
+  "            PackageFamilyName = 'Microsoft.VisualStudioCode_8wekyb3d8bbwe'",
+  "            PublisherId = '8wekyb3d8bbwe'",
+  "            InstallLocation = $installLocation",
+  "            IsFramework = $false",
+  "        }",
+  "    }",
+  "}",
+  "",
+  "Export-ModuleMember -Function Get-AppxPackage",
+].join("\r\n");
+
+const APPX_MANIFEST_CONTENTS = [
+  "@{",
+  "    RootModule = 'Appx.psm1'",
+  "    ModuleVersion = '1.0.0'",
+  "    GUID = '4f48295e-594b-4f03-a9f4-b916b5287e67'",
+  "    Author = 'Synara benchmark fixture'",
+  "    Description = 'Deterministic Get-AppxPackage fixture for Windows discovery benchmarks.'",
+  "    PowerShellVersion = '5.1'",
+  "    FunctionsToExport = @('Get-AppxPackage')",
+  "    CmdletsToExport = @()",
+  "    VariablesToExport = @()",
+  "    AliasesToExport = @()",
+  "}",
+].join("\r\n");
+
+function sha256File(path: string): string {
+  return createHash("sha256").update(readFileSync(path)).digest("hex");
+}
+
+function assertSameFile(left: string, right: string, description: string): void {
+  const leftIdentity = statSync(left, { bigint: true });
+  const rightIdentity = statSync(right, { bigint: true });
+  if (leftIdentity.dev !== rightIdentity.dev || leftIdentity.ino !== rightIdentity.ino) {
+    throw new Error(description + " resolved different files.");
+  }
+}
+
+function assertPathInside(parent: string, child: string, description: string): void {
+  const parentIdentity = statSync(realpathSync(parent), { bigint: true });
+  for (let ancestor = dirname(realpathSync(child)); ; ancestor = dirname(ancestor)) {
+    const ancestorIdentity = statSync(ancestor, { bigint: true });
+    if (
+      ancestorIdentity.dev === parentIdentity.dev &&
+      ancestorIdentity.ino === parentIdentity.ino
+    ) {
+      return;
+    }
+    const next = dirname(ancestor);
+    if (next === ancestor) break;
+  }
+  throw new Error(description + " resolved outside the controlled fixture.");
+}
+
+export function createFixture(tempRoot: string): BenchmarkFixture {
   const root = join(tempRoot, "fixture space é");
   const cwdA = join(root, "cwd-a");
   const cwdB = join(root, "cwd-b");
   const binA = join(root, "bin-a");
   const binB = join(root, "bin-b");
-  const fakePowerShellBin = join(root, "powershell-bin");
-  const fakeSystemRoot = join(root, "fake-windows");
-  const fakeSystemPowerShellDir = join(
-    fakeSystemRoot,
-    "System32",
-    "WindowsPowerShell",
-    "v1.0",
-  );
-  const appxInstallLocation = join(root, "appx-install", "VS Code");
+  const configuredSystemRoot = process.env.SystemRoot ?? process.env.WINDIR;
+  if (!configuredSystemRoot) {
+    throw new Error("SystemRoot or WINDIR is required for the editor benchmark fixture.");
+  }
+  const systemRoot = realpathSync(configuredSystemRoot);
+  const powerShellBin = realpathSync(join(systemRoot, "System32", "WindowsPowerShell", "v1.0"));
+  const powerShellExecutable = realpathSync(join(powerShellBin, "powershell.exe"));
+  const powerShellExecutableSha256 = sha256File(powerShellExecutable);
+  const editorRoot = join(tempRoot, "editor-fixture");
+  const appxModuleRoot = join(editorRoot, "modules");
+  const appxModuleDirectory = join(appxModuleRoot, "Appx");
+  const appxModulePath = join(appxModuleDirectory, "Appx.psm1");
+  const appxManifestPath = join(appxModuleDirectory, "Appx.psd1");
+  const appxMarkerDirectory = join(editorRoot, "markers");
+  const appxInstallLocation = join(editorRoot, "appx-install", "VS Code");
   for (const directory of [
     cwdA,
     cwdB,
     binA,
     binB,
-    fakePowerShellBin,
-    fakeSystemPowerShellDir,
+    appxModuleDirectory,
+    appxMarkerDirectory,
     appxInstallLocation,
   ]) {
     mkdirSync(directory, { recursive: true });
   }
   const exeCandidate = join(binA, "native tool.exe");
   const cmdCandidate = join(binB, "shim tool.cmd");
-  const appxCounterFile = join(root, "appx-counter.txt");
-  const fakePowerShellSource = join(root, "fake-powershell.ts");
-  const fakePowerShellPath = join(fakePowerShellBin, "powershell.exe");
-  const fakeSystemPowerShellPath = join(fakeSystemPowerShellDir, "powershell.exe");
-  const fakePowerShellContents = [
-    'import { appendFileSync } from "node:fs";',
-    'const counter = process.env.SYNARA_BENCHMARK_APPX_COUNTER;',
-    'const installLocation = process.env.SYNARA_BENCHMARK_APPX_LOCATION;',
-    'if (!counter || !installLocation) process.exit(23);',
-    'appendFileSync(counter, "1\\n");',
-    'const argumentsText = process.argv.join("\\0");',
-    'const bulk = argumentsText.includes("ConvertTo-Json");',
-    'const family = "Microsoft.VisualStudioCode_8wekyb3d8bbwe";',
-    'if (bulk) process.stdout.write(JSON.stringify([{ Family: family, InstallLocation: installLocation }]));',
-    'else if (argumentsText.includes(`Family = \'${family}\'`)) process.stdout.write(`${installLocation}\\r\\n`);',
-    'else process.exit(1);',
-  ].join("\n");
   writeFileSync(exeCandidate, "MZ-synara-benchmark\n", { flag: "wx" });
   writeFileSync(cmdCandidate, "@echo off\r\nexit /b 0\r\n", { flag: "wx" });
-  writeFileSync(appxCounterFile, "", { flag: "wx" });
-  writeFileSync(fakePowerShellSource, `${fakePowerShellContents}\n`, { flag: "wx" });
-  execFileSync(
-    process.execPath,
-    ["build", fakePowerShellSource, "--compile", "--outfile", fakePowerShellPath],
-    { stdio: "ignore", windowsHide: true },
-  );
-  copyFileSync(fakePowerShellPath, fakeSystemPowerShellPath);
+  writeFileSync(appxModulePath, APPX_MODULE_CONTENTS + "\r\n", { flag: "wx" });
+  writeFileSync(appxManifestPath, APPX_MANIFEST_CONTENTS + "\r\n", { flag: "wx" });
   const treeSha256 = createHash("sha256")
     .update("bin-a/native tool.exe\0")
     .update(readFileSync(exeCandidate))
     .update("\0bin-b/shim tool.cmd\0")
     .update(readFileSync(cmdCandidate))
-    .update("\0fake-powershell.ts\0")
-    .update(fakePowerShellContents)
-    .update("\0powershell-bin/powershell.exe\0")
-    .update(readFileSync(fakePowerShellPath))
-    .update("\0fake-windows/System32/WindowsPowerShell/v1.0/powershell.exe\0")
-    .update(readFileSync(fakeSystemPowerShellPath))
+    .update("\0editor-fixture/modules/Appx/Appx.psm1\0")
+    .update(readFileSync(appxModulePath))
+    .update("\0editor-fixture/modules/Appx/Appx.psd1\0")
+    .update(readFileSync(appxManifestPath))
+    .update("\0host-powershell.exe.sha256\0")
+    .update(powerShellExecutableSha256)
     .digest("hex");
   return {
     root,
@@ -803,12 +908,154 @@ function createFixture(tempRoot: string): BenchmarkFixture {
     binB,
     exeCandidate,
     cmdCandidate,
-    fakeSystemRoot,
-    fakePowerShellBin,
-    appxCounterFile,
+    systemRoot,
+    powerShellBin,
+    powerShellExecutable,
+    powerShellExecutableSha256,
+    appxModuleRoot,
+    appxModulePath,
+    appxMarkerDirectory,
     appxInstallLocation,
     treeSha256,
   };
+}
+
+export function editorFixtureEnvironment(fixture: BenchmarkFixture): NodeJS.ProcessEnv {
+  return {
+    PATH: fixture.powerShellBin,
+    PATHEXT: ".CMD",
+    SystemRoot: fixture.systemRoot,
+    WINDIR: fixture.systemRoot,
+    PSModulePath: fixture.appxModuleRoot,
+    SYNARA_BENCHMARK_APPX_MARKER_DIR: fixture.appxMarkerDirectory,
+    SYNARA_BENCHMARK_APPX_LOCATION: fixture.appxInstallLocation,
+  };
+}
+
+function readAppxMarkerFiles(fixture: BenchmarkFixture): readonly string[] {
+  const entries = readdirSync(fixture.appxMarkerDirectory, { withFileTypes: true });
+  for (const entry of entries) {
+    if (!entry.isFile() || !APPX_MARKER_PATTERN.test(entry.name)) {
+      throw new Error("Unexpected AppX benchmark marker entry: " + entry.name);
+    }
+  }
+  return entries.map((entry) => join(fixture.appxMarkerDirectory, entry.name));
+}
+
+export function resetAppxSubprocessMarkers(fixture: BenchmarkFixture): void {
+  for (const markerPath of readAppxMarkerFiles(fixture)) unlinkSync(markerPath);
+}
+
+export function readAppxSubprocessCount(fixture: BenchmarkFixture): number {
+  return readAppxMarkerFiles(fixture).length;
+}
+
+export function assertSingleEditorFixtureSubprocessCount(
+  count: number,
+  label: string,
+): asserts count is 1 {
+  if (count !== 1) {
+    throw new Error(label + " used " + count + " AppX subprocesses; expected exactly one.");
+  }
+}
+
+export function preflightEditorFixture(fixture: BenchmarkFixture): EditorFixturePreflight {
+  resetAppxSubprocessMarkers(fixture);
+  const environment = editorFixtureEnvironment(fixture);
+  const whereProbe = spawnSync(join(fixture.systemRoot, "System32", "where.exe"), ["powershell"], {
+    encoding: "utf8",
+    env: environment,
+    shell: false,
+    windowsHide: true,
+  });
+  if (whereProbe.error) throw whereProbe.error;
+  if (whereProbe.status !== 1 || whereProbe.stdout.trim().length > 0) {
+    throw new Error(
+      "Editor transport leaked into command discovery: status=" +
+        whereProbe.status +
+        ", stdout=" +
+        JSON.stringify(whereProbe.stdout.trim()) +
+        ".",
+    );
+  }
+
+  const script = [
+    "$ErrorActionPreference = 'Stop'",
+    "$command = Get-Command Get-AppxPackage -ErrorAction Stop",
+    "$package = @(Get-AppxPackage -Name 'Microsoft.VisualStudioCode' -ErrorAction Stop | Select-Object -First 1)[0]",
+    "$result = [ordered]@{ CommandType = [string]$command.CommandType; ModuleName = [string]$command.ModuleName; ModulePath = [string]$command.Module.Path; PowerShellVersion = [string]$PSVersionTable.PSVersion; ExecutablePath = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName; PackageFamilyName = [string]$package.PackageFamilyName; InstallLocation = [string]$package.InstallLocation }",
+    "$result | ConvertTo-Json -Compress",
+  ].join("; ");
+  const output = execFileSync(
+    "powershell.exe",
+    ["-NoProfile", "-NonInteractive", "-Command", script],
+    {
+      encoding: "utf8",
+      env: environment,
+      maxBuffer: 64 * 1024,
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 10_000,
+      windowsHide: true,
+    },
+  );
+  const parsed = JSON.parse(output.trim()) as {
+    readonly CommandType?: unknown;
+    readonly ModuleName?: unknown;
+    readonly ModulePath?: unknown;
+    readonly PowerShellVersion?: unknown;
+    readonly ExecutablePath?: unknown;
+    readonly PackageFamilyName?: unknown;
+    readonly InstallLocation?: unknown;
+  };
+  if (
+    parsed.CommandType !== "Function" ||
+    parsed.ModuleName !== "Appx" ||
+    typeof parsed.ModulePath !== "string" ||
+    typeof parsed.PowerShellVersion !== "string" ||
+    typeof parsed.ExecutablePath !== "string" ||
+    parsed.PackageFamilyName !== EXPECTED_APPX_FAMILY ||
+    parsed.InstallLocation !== fixture.appxInstallLocation
+  ) {
+    throw new Error("Editor fixture preflight returned unexpected data: " + output.trim());
+  }
+  assertPathInside(fixture.appxModuleRoot, parsed.ModulePath, "Get-AppxPackage module");
+  assertSameFile(
+    fixture.powerShellExecutable,
+    parsed.ExecutablePath,
+    "PATH and absolute PowerShell launch",
+  );
+  const markerFiles = readAppxMarkerFiles(fixture);
+  assertSingleEditorFixtureSubprocessCount(markerFiles.length, "Editor fixture preflight");
+  const markerPath = markerFiles[0];
+  if (!markerPath) throw new Error("Editor fixture preflight marker was missing.");
+  const marker = JSON.parse(readFileSync(markerPath, "utf8")) as {
+    readonly ProcessId?: unknown;
+    readonly ModulePath?: unknown;
+    readonly RequestedNames?: unknown;
+  };
+  if (
+    typeof marker.ProcessId !== "number" ||
+    typeof marker.ModulePath !== "string" ||
+    !Array.isArray(marker.RequestedNames) ||
+    marker.RequestedNames.length !== 1 ||
+    marker.RequestedNames[0] !== "Microsoft.VisualStudioCode"
+  ) {
+    throw new Error("Editor fixture marker was malformed: " + JSON.stringify(marker));
+  }
+  assertPathInside(fixture.appxModuleRoot, marker.ModulePath, "AppX marker module");
+  const result: EditorFixturePreflight = {
+    commandType: "Function",
+    moduleName: "Appx",
+    modulePathSha256: hashFixtureLabel(realpathSync(parsed.ModulePath)),
+    powerShellVersion: parsed.PowerShellVersion,
+    powerShellExecutableSha256: fixture.powerShellExecutableSha256,
+    packageFamilyName: EXPECTED_APPX_FAMILY,
+    installLocationSha256: hashFixtureLabel(fixture.appxInstallLocation),
+    markerCount: 1,
+    transportCommandHidden: true,
+  };
+  resetAppxSubprocessMarkers(fixture);
+  return result;
 }
 
 function blockForFixtureDelay(): void {
@@ -889,7 +1136,15 @@ function makeCommandScenario(
         counter: input.counter,
       }),
     );
-    return { result, status: outcome === "transient" ? "transient_failure" : outcome === "not_found" ? "not_found" : "resolved" };
+    return {
+      result,
+      status:
+        outcome === "transient"
+          ? "transient_failure"
+          : outcome === "not_found"
+            ? "not_found"
+            : "resolved",
+    };
   };
 
   if (name.startsWith("warm_")) {
@@ -903,9 +1158,10 @@ function makeCommandScenario(
 
   return {
     run: async () => {
-      const counter = name.startsWith("warm_") || name === "authoritative_negative"
-        ? persistentCounter
-        : { value: 0 };
+      const counter =
+        name.startsWith("warm_") || name === "authoritative_negative"
+          ? persistentCounter
+          : { value: 0 };
       const startCount = counter.value;
       const startedAt = performance.now();
       let statusCategory = "resolved";
@@ -999,26 +1255,7 @@ const EDITOR_DISCOVERY_SUCCESS: EditorDiscoveryRuntimeResult = {
   subprocessCount: 1,
 };
 
-function editorFixtureEnvironment(fixture: BenchmarkFixture): NodeJS.ProcessEnv {
-  return {
-    PATH: fixture.fakePowerShellBin,
-    PATHEXT: ".EXE",
-    SystemRoot: fixture.fakeSystemRoot,
-    SYNARA_BENCHMARK_APPX_COUNTER: fixture.appxCounterFile,
-    SYNARA_BENCHMARK_APPX_LOCATION: fixture.appxInstallLocation,
-  };
-}
-
-function readAppxSubprocessCount(fixture: BenchmarkFixture): number {
-  return readFileSync(fixture.appxCounterFile, "utf8")
-    .split(/\r?\n/)
-    .filter((line) => line.length > 0).length;
-}
-
-function assertExpectedEditorResult(
-  editors: ReadonlyArray<string>,
-  runtime: VersionRuntime,
-): void {
+function assertExpectedEditorResult(editors: ReadonlyArray<string>, runtime: VersionRuntime): void {
   if (editors.length !== 1 || editors[0] !== "vscode") {
     throw new Error(
       `${runtime.label} editor workload returned ${JSON.stringify(editors)}; expected [\"vscode\"].`,
@@ -1033,7 +1270,7 @@ function makeEditorScenario(
 ): ScenarioContext {
   return {
     run: async () => {
-      writeFileSync(fixture.appxCounterFile, "", { flag: "w" });
+      resetAppxSubprocessMarkers(fixture);
       runtime.editorAppDiscovery.clearWindowsStorePackageDiscoveryCache();
       const env = editorFixtureEnvironment(fixture);
       const startedAt = performance.now();
@@ -1073,9 +1310,11 @@ function makeEditorScenario(
         );
         assertExpectedEditorResult(snapshot.availableEditors, runtime);
       }
+      const subprocessCount = readAppxSubprocessCount(fixture);
+      assertSingleEditorFixtureSubprocessCount(subprocessCount, runtime.label + " editor sample");
       return {
         elapsedMs: performance.now() - startedAt,
-        subprocessCount: readAppxSubprocessCount(fixture),
+        subprocessCount,
         statusCategory: "resolved",
       };
     },
@@ -1113,13 +1352,7 @@ async function importVersionRuntime(
   const command = (await import(pathToFileURL(commandPath).href)) as RuntimeModule;
   const openPath = join(worktree, "apps", "server", "src", "open.ts");
   const open = (await import(pathToFileURL(openPath).href)) as OpenRuntimeModule;
-  const editorAppDiscoveryPath = join(
-    worktree,
-    "apps",
-    "server",
-    "src",
-    "editorAppDiscovery.ts",
-  );
+  const editorAppDiscoveryPath = join(worktree, "apps", "server", "src", "editorAppDiscovery.ts");
   const editorAppDiscovery = (await import(
     pathToFileURL(editorAppDiscoveryPath).href
   )) as EditorAppDiscoveryRuntimeModule;
@@ -1138,9 +1371,7 @@ async function importVersionRuntime(
   };
 }
 
-async function checkInitialEditorSnapshotNonBlocking(
-  runtime: VersionRuntime,
-): Promise<boolean> {
+async function checkInitialEditorSnapshotNonBlocking(runtime: VersionRuntime): Promise<boolean> {
   if (runtime.editorAvailability === null) return false;
   let discoveryStarted = false;
   let released = false;
@@ -1210,10 +1441,14 @@ function checkCandidateLru(runtime: VersionRuntime, fixture: BenchmarkFixture): 
 
 function runNodeDuplicateEnvironmentOracle(): NodeDuplicateEnvironmentOracle {
   const nodeDescriptor = JSON.parse(
-    execFileSync("node", ["-p", "JSON.stringify({execPath:process.execPath,version:process.version})"], {
-      encoding: "utf8",
-      windowsHide: true,
-    }),
+    execFileSync(
+      "node",
+      ["-p", "JSON.stringify({execPath:process.execPath,version:process.version})"],
+      {
+        encoding: "utf8",
+        windowsHide: true,
+      },
+    ),
   ) as { readonly execPath: string; readonly version: string };
   const cleanEnvironment = Object.fromEntries(
     Object.entries(process.env).filter(([name]) => name.toUpperCase() !== "PATH"),
@@ -1247,7 +1482,10 @@ function runNodeDuplicateEnvironmentOracle(): NodeDuplicateEnvironmentOracle {
   };
 }
 
-async function measureNativeWhere(runtime: VersionRuntime, fixture: BenchmarkFixture): Promise<BenchmarkSample> {
+async function measureNativeWhere(
+  runtime: VersionRuntime,
+  fixture: BenchmarkFixture,
+): Promise<BenchmarkSample> {
   const systemRoot = process.env.SystemRoot ?? process.env.WINDIR ?? "C:\\Windows";
   const cache = makeCache(runtime.command);
   let observedSubprocesses = 0;
@@ -1267,16 +1505,15 @@ async function measureNativeWhere(runtime: VersionRuntime, fixture: BenchmarkFix
   });
   return {
     elapsedMs: performance.now() - startedAt,
-    subprocessCount: runtime.command.createWindowsCommandDiscoveryCache
-      ? observedSubprocesses
-      : 1,
+    subprocessCount: runtime.command.createWindowsCommandDiscoveryCache ? observedSubprocesses : 1,
     statusCategory: candidates.length > 0 ? "resolved" : "not_found",
   };
 }
 
 async function runBenchmark(options: BenchmarkCliOptions): Promise<Record<string, unknown>> {
   if (platform() !== "win32") throw new Error("The final discovery benchmark must run on Windows.");
-  if (!existsSync(join(options.repo, ".git"))) throw new Error(`Not a Git repository: ${options.repo}`);
+  if (!existsSync(join(options.repo, ".git")))
+    throw new Error(`Not a Git repository: ${options.repo}`);
   if (process.env.NODE_PATH?.trim()) {
     throw new Error("NODE_PATH must be unset for the isolated discovery benchmark.");
   }
@@ -1304,11 +1541,7 @@ async function runBenchmark(options: BenchmarkCliOptions): Promise<Record<string
   const windowsRoot = process.env.SystemRoot ?? process.env.WINDIR;
   if (!windowsRoot) throw new Error("SystemRoot or WINDIR is required for benchmark isolation.");
   const isolatedWorktreeTemp = realpathSync(join(windowsRoot, "Temp"));
-  for (
-    let ancestor = isolatedWorktreeTemp;
-    ;
-    ancestor = dirname(ancestor)
-  ) {
+  for (let ancestor = isolatedWorktreeTemp; ; ancestor = dirname(ancestor)) {
     if (existsSync(join(ancestor, "node_modules"))) {
       throw new Error(`Benchmark worktree ancestor contains node_modules: ${ancestor}`);
     }
@@ -1326,10 +1559,14 @@ async function runBenchmark(options: BenchmarkCliOptions): Promise<Record<string
   let candidateWorktreeRegistered = false;
 
   try {
-    execFileSync("git", ["-C", options.repo, "worktree", "add", "--detach", baseWorktree, baseSha], {
-      stdio: "ignore",
-      windowsHide: true,
-    });
+    execFileSync(
+      "git",
+      ["-C", options.repo, "worktree", "add", "--detach", baseWorktree, baseSha],
+      {
+        stdio: "ignore",
+        windowsHide: true,
+      },
+    );
     baseWorktreeRegistered = true;
     execFileSync(
       "git",
@@ -1353,13 +1590,13 @@ async function runBenchmark(options: BenchmarkCliOptions): Promise<Record<string
     assertDetachedRevision(candidateWorktree, candidateSha);
 
     const fixture = createFixture(tempRoot);
+    const editorFixturePreflight = preflightEditorFixture(fixture);
     const [baseRuntime, candidateRuntime] = await Promise.all([
       importVersionRuntime("base", baseSha, baseWorktree),
       importVersionRuntime("candidate", candidateSha, candidateWorktree),
     ]);
     assertComparableEditorBenchmarkRuntime({
-      baseResolveAvailableEditors:
-        typeof baseRuntime.open.resolveAvailableEditors === "function",
+      baseResolveAvailableEditors: typeof baseRuntime.open.resolveAvailableEditors === "function",
       candidateDiscoverAvailableEditors:
         typeof candidateRuntime.open.discoverAvailableEditors === "function",
       candidateEditorAvailability: candidateRuntime.editorAvailability !== null,
@@ -1419,7 +1656,7 @@ async function runBenchmark(options: BenchmarkCliOptions): Promise<Record<string
         ? "WINDIR"
         : "fallback";
     const report = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       generatedAt: new Date().toISOString(),
       repository: git(options.repo, ["remote", "get-url", "origin"]),
       immutableRevisions: { baseSha, candidateSha, pr397ParentOrIntegrationSha: parentSha },
@@ -1456,6 +1693,7 @@ async function runBenchmark(options: BenchmarkCliOptions): Promise<Record<string
       fixture: {
         id: FIXTURE_ID,
         treeSha256: fixture.treeSha256,
+        editorPowerShell: editorFixturePreflight,
         labels: {
           command: {
             path: hashFixtureLabel(`${fixture.binA};${fixture.binB}`),
@@ -1464,14 +1702,15 @@ async function runBenchmark(options: BenchmarkCliOptions): Promise<Record<string
             cwdB: hashFixtureLabel(fixture.cwdB),
           },
           editor: {
-            path: hashFixtureLabel(fixture.fakePowerShellBin),
-            pathExt: hashFixtureLabel(".EXE"),
+            path: hashFixtureLabel(fixture.powerShellBin),
+            pathExt: hashFixtureLabel(".CMD"),
             cwd: hashFixtureLabel(fixture.cwdA),
-            systemRoot: hashFixtureLabel(fixture.fakeSystemRoot),
+            systemRoot: hashFixtureLabel(fixture.systemRoot),
+            psModulePath: hashFixtureLabel(fixture.appxModuleRoot),
           },
         },
         systemRootSources: {
-          editor: "deterministic fixture",
+          editor: nativeWhereSystemRootSource,
           nativeWhere: nativeWhereSystemRootSource,
         },
         includes: [
@@ -1482,7 +1721,7 @@ async function runBenchmark(options: BenchmarkCliOptions): Promise<Record<string
           "mixed-case duplicate environment keys",
           "missing PATHEXT",
           "empty PATHEXT",
-          "deterministic AppX process double",
+          "real Windows PowerShell with an isolated deterministic Appx module",
         ],
       },
       procedure: {
@@ -1496,10 +1735,13 @@ async function runBenchmark(options: BenchmarkCliOptions): Promise<Record<string
           candidatePath:
             "immutable candidate apps/server/src/open.ts#discoverAvailableEditors through editorAvailability.ts",
           callerCounts: [1, 8, 32],
-          callerSchedule: "all callers submitted together, then candidate refresh joined",
+          callerSchedule:
+            "base callers execute immutable synchronous discovery serially; candidate callers submit concurrently and join one refresh",
           appxBoundary:
-            "same compiled executable double, filesystem fixture, PATH, PATHEXT, cwd, and expected editor array",
+            "same real Windows PowerShell binary, isolated Appx module, filesystem fixture, PATH, PATHEXT, cwd, and expected editor array",
           cacheReset: "each immutable editorAppDiscovery cache cleared once per sample",
+          subprocessExpectation:
+            "exactly one Appx process per base and candidate sample; the cached base is not presented as an uncached subprocess baseline",
         },
       },
       policy: {
@@ -1560,11 +1802,7 @@ async function runBenchmark(options: BenchmarkCliOptions): Promise<Record<string
       const registeredWorktrees = [candidateWorktree, baseWorktree].filter((worktree) =>
         existsSync(worktree),
       );
-      if (
-        registeredWorktrees.length > 0 ||
-        candidateWorktreeRegistered ||
-        baseWorktreeRegistered
-      ) {
+      if (registeredWorktrees.length > 0 || candidateWorktreeRegistered || baseWorktreeRegistered) {
         throw new Error(
           `Refusing to remove benchmark root while worktrees remain: ${registeredWorktrees.join(", ") || "registered metadata"}`,
         );

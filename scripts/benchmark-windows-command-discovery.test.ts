@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -13,11 +13,17 @@ import {
   assertMatchingPackageManagerProvenance,
   assertRevisionLocalResolutions,
   assertSafeBenchmarkOutputPath,
+  assertSingleEditorFixtureSubprocessCount,
   benchmarkDependencyLinks,
+  createFixture,
+  editorFixtureEnvironment,
   evaluateBenchmarkGates,
   formatBenchmarkFailure,
   hashFixtureLabel,
   parseBenchmarkArgs,
+  preflightEditorFixture,
+  readAppxSubprocessCount,
+  resetAppxSubprocessMarkers,
   runCleanupSteps,
   summarizeSamples,
   type BenchmarkSummary,
@@ -75,10 +81,7 @@ function passingScenarios(): ScenarioComparison[] {
     ...[1, 8, 32].map(
       (callers): ScenarioComparison => ({
         name: `editor_${callers}_callers`,
-        base: summary({
-          subprocessCount: callers * 30,
-          maxSubprocessesPerIteration: callers,
-        }),
+        base: summary({ subprocessCount: 30, maxSubprocessesPerIteration: 1 }),
         candidate: summary({ subprocessCount: 30, maxSubprocessesPerIteration: 1 }),
       }),
     ),
@@ -203,46 +206,40 @@ describe("benchmark-windows-command-discovery", () => {
       ]),
     );
     expect(() =>
-      assertRevisionLocalResolutions(worktree, {
-        contracts: join(worktree, "packages", "contracts", "src", "index.ts"),
-        sharedWindowsProcess: join(
-          worktree,
-          "packages",
-          "shared",
-          "src",
-          "windowsProcess.ts",
-        ),
-        effectFromServer: join(externalEffect, "dist", "effect.js"),
-        effectFromContracts: join(externalEffect, "dist", "effect.js"),
-      }, externalEffect),
+      assertRevisionLocalResolutions(
+        worktree,
+        {
+          contracts: join(worktree, "packages", "contracts", "src", "index.ts"),
+          sharedWindowsProcess: join(worktree, "packages", "shared", "src", "windowsProcess.ts"),
+          effectFromServer: join(externalEffect, "dist", "effect.js"),
+          effectFromContracts: join(externalEffect, "dist", "effect.js"),
+        },
+        externalEffect,
+      ),
     ).not.toThrow();
     expect(() =>
-      assertRevisionLocalResolutions(worktree, {
-        contracts: "C:\\mutable-source\\packages\\contracts\\src\\index.ts",
-        sharedWindowsProcess: join(
-          worktree,
-          "packages",
-          "shared",
-          "src",
-          "windowsProcess.ts",
-        ),
-        effectFromServer: join(externalEffect, "dist", "effect.js"),
-        effectFromContracts: join(externalEffect, "dist", "effect.js"),
-      }, externalEffect),
+      assertRevisionLocalResolutions(
+        worktree,
+        {
+          contracts: "C:\\mutable-source\\packages\\contracts\\src\\index.ts",
+          sharedWindowsProcess: join(worktree, "packages", "shared", "src", "windowsProcess.ts"),
+          effectFromServer: join(externalEffect, "dist", "effect.js"),
+          effectFromContracts: join(externalEffect, "dist", "effect.js"),
+        },
+        externalEffect,
+      ),
     ).toThrow("resolved outside detached revision");
     expect(() =>
-      assertRevisionLocalResolutions(worktree, {
-        contracts: join(worktree, "packages", "contracts", "src", "index.ts"),
-        sharedWindowsProcess: join(
-          worktree,
-          "packages",
-          "shared",
-          "src",
-          "windowsProcess.ts",
-        ),
-        effectFromServer: "C:\\ancestor-node-modules\\effect\\dist\\effect.js",
-        effectFromContracts: join(externalEffect, "dist", "effect.js"),
-      }, externalEffect),
+      assertRevisionLocalResolutions(
+        worktree,
+        {
+          contracts: join(worktree, "packages", "contracts", "src", "index.ts"),
+          sharedWindowsProcess: join(worktree, "packages", "shared", "src", "windowsProcess.ts"),
+          effectFromServer: "C:\\ancestor-node-modules\\effect\\dist\\effect.js",
+          effectFromContracts: join(externalEffect, "dist", "effect.js"),
+        },
+        externalEffect,
+      ),
     ).toThrow("locked external Effect package");
   });
 
@@ -272,10 +269,7 @@ describe("benchmark-windows-command-discovery", () => {
       if (process.platform === "win32" && longTempAlias && existsSync(longTempAlias)) {
         const shortIdentity = statSync(tmpdir(), { bigint: true });
         const longIdentity = statSync(longTempAlias, { bigint: true });
-        if (
-          shortIdentity.dev === longIdentity.dev &&
-          shortIdentity.ino === longIdentity.ino
-        ) {
+        if (shortIdentity.dev === longIdentity.dev && shortIdentity.ino === longIdentity.ino) {
           expect(() =>
             assertSafeBenchmarkOutputPath(
               join(longTempAlias, `synara-goal09-benchmark-${suffix}`, "receipt.json"),
@@ -283,12 +277,12 @@ describe("benchmark-windows-command-discovery", () => {
           ).not.toThrow();
         }
       }
-      expect(() =>
-        assertSafeBenchmarkOutputPath(join(controlled, "other.json")),
-      ).toThrow("filename must be receipt.json");
-      expect(() =>
-        assertSafeBenchmarkOutputPath(join(uncontrolled, "receipt.json")),
-      ).toThrow("outside the controlled temp boundary");
+      expect(() => assertSafeBenchmarkOutputPath(join(controlled, "other.json"))).toThrow(
+        "filename must be receipt.json",
+      );
+      expect(() => assertSafeBenchmarkOutputPath(join(uncontrolled, "receipt.json"))).toThrow(
+        "outside the controlled temp boundary",
+      );
       writeFileSync(join(controlled, "unexpected.txt"), "unexpected\n");
       expect(() => assertSafeBenchmarkOutputPath(output)).toThrow("must be empty");
     } finally {
@@ -349,6 +343,75 @@ describe("benchmark-windows-command-discovery", () => {
     ).not.toThrow();
   });
 
+  it("requires exactly one AppX subprocess for every editor sample", () => {
+    expect(() => assertSingleEditorFixtureSubprocessCount(0, "base editor sample")).toThrow(
+      "used 0 AppX subprocesses",
+    );
+    expect(() =>
+      assertSingleEditorFixtureSubprocessCount(1, "candidate editor sample"),
+    ).not.toThrow();
+    expect(() => assertSingleEditorFixtureSubprocessCount(2, "candidate editor sample")).toThrow(
+      "used 2 AppX subprocesses",
+    );
+  });
+
+  it.runIf(process.platform === "win32")(
+    "preflights the isolated Appx module without exposing PowerShell as a terminal",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "synara-editor-fixture-test-"));
+      try {
+        const fixture = createFixture(root);
+        expect(preflightEditorFixture(fixture)).toMatchObject({
+          commandType: "Function",
+          moduleName: "Appx",
+          packageFamilyName: "Microsoft.VisualStudioCode_8wekyb3d8bbwe",
+          markerCount: 1,
+          transportCommandHidden: true,
+        });
+        const open = (await import(
+          new URL("../apps/server/src/open.ts", import.meta.url).href
+        )) as {
+          readonly resolveAvailableEditors: (
+            platform: NodeJS.Platform,
+            env: NodeJS.ProcessEnv,
+          ) => ReadonlyArray<string>;
+          readonly discoverAvailableEditors: (options: {
+            readonly platform: NodeJS.Platform;
+            readonly env: NodeJS.ProcessEnv;
+            readonly cwd: string;
+            readonly signal: AbortSignal;
+          }) => Promise<{
+            readonly status: string;
+            readonly availableEditors?: ReadonlyArray<string>;
+          }>;
+        };
+        const discovery = (await import(
+          new URL("../apps/server/src/editorAppDiscovery.ts", import.meta.url).href
+        )) as {
+          readonly clearWindowsStorePackageDiscoveryCache: () => void;
+        };
+        const env = editorFixtureEnvironment(fixture);
+
+        discovery.clearWindowsStorePackageDiscoveryCache();
+        expect(open.resolveAvailableEditors("win32", env)).toEqual(["vscode"]);
+        expect(readAppxSubprocessCount(fixture)).toBe(1);
+
+        resetAppxSubprocessMarkers(fixture);
+        discovery.clearWindowsStorePackageDiscoveryCache();
+        const candidate = await open.discoverAvailableEditors({
+          platform: "win32",
+          env,
+          cwd: fixture.cwdA,
+          signal: new AbortController().signal,
+        });
+        expect(candidate).toMatchObject({ status: "success", availableEditors: ["vscode"] });
+        expect(readAppxSubprocessCount(fixture)).toBe(1);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
+
   it("summarizes recorded samples without including warmups", () => {
     expect(
       summarizeSamples([
@@ -407,5 +470,27 @@ describe("benchmark-windows-command-discovery", () => {
         "node_duplicate_environment_oracle",
       ]),
     );
+
+    for (const invalidSide of ["base", "candidate"] as const) {
+      const invalidSummary = summary({
+        subprocessCount: invalidSide === "base" ? 0 : 60,
+        maxSubprocessesPerIteration: invalidSide === "base" ? 0 : 2,
+      });
+      const invalidEditorScenarios = passingScenarios().map((scenario) =>
+        scenario.name === "editor_8_callers"
+          ? {
+              name: scenario.name,
+              base: invalidSide === "base" ? invalidSummary : scenario.base,
+              candidate: invalidSide === "candidate" ? invalidSummary : scenario.candidate,
+            }
+          : scenario,
+      );
+      const editorGate = evaluateBenchmarkGates(invalidEditorScenarios, {
+        lruPassed: true,
+        initialEditorSnapshotNonBlocking: true,
+        nodeEnvironmentOraclePassed: true,
+      }).find((gate) => gate.name === "editor_single_flight");
+      expect(editorGate?.passed).toBe(false);
+    }
   });
 });
