@@ -238,6 +238,7 @@ describe("Windows installer qualification primitives", () => {
       "C:\\isolated root\\Super Synara",
       { PATH: "C:\\Windows" },
     );
+    expect(command.command).toBe("C:\\artifacts\\Super Synara.exe");
     expect(command.args).toEqual(["/S", "/D=C:\\isolated root\\Super Synara"]);
     expect(command.env?.PATH).toBe("C:\\Windows");
   });

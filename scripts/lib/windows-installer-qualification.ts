@@ -15,7 +15,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join, normalize, resolve, sep } from "node:path";
+import { basename, join, normalize, resolve, sep, win32 } from "node:path";
 
 import {
   SYNARA_WINDOWS_INSTALLER_GUID,
@@ -306,14 +306,21 @@ function targetValue(snapshot: RegistrySnapshot, id: string): string | null {
   return snapshot.values.get(id) ?? null;
 }
 
+function resolveQualificationPath(path: string): string {
+  if (/^(?:[A-Za-z]:[\\/]|\\\\[^\\/]+[\\/][^\\/]+)/.test(path)) {
+    return win32.normalize(path);
+  }
+  return resolve(path);
+}
+
 export function createSilentInstallerCommand(
   installerPath: string,
   installDirectory: string,
   env: NodeJS.ProcessEnv,
 ): WindowsCommandSpec {
   return {
-    command: resolve(installerPath),
-    args: ["/S", `/D=${resolve(installDirectory)}`],
+    command: resolveQualificationPath(installerPath),
+    args: ["/S", `/D=${resolveQualificationPath(installDirectory)}`],
     env,
     timeoutMs: 180_000,
     label: `silent installer ${basename(installerPath)}`,
@@ -334,7 +341,10 @@ export function parseWindowsExecutableCommandLine(input: string): {
 }
 
 function sameWindowsPath(left: string, right: string): boolean {
-  return normalize(resolve(left)).toLowerCase() === normalize(resolve(right)).toLowerCase();
+  return (
+    normalize(resolveQualificationPath(left)).toLowerCase() ===
+    normalize(resolveQualificationPath(right)).toLowerCase()
+  );
 }
 
 function validateRegistration(
