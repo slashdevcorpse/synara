@@ -155,19 +155,12 @@ describe("desktop artifact policy", () => {
         target: "dmg",
         arch: "arm64",
         version: "0.5.5-super.3",
-        stageFileNames: [
-          "Super-Synara-0.5.5-super.3-arm64.dmg",
-          "Super-Synara-0.5.5-super.3-arm64.zip",
-        ],
+        stageFileNames: ["Super-Synara-0.5.5-super.3-arm64.dmg"],
       }),
     ).toEqual([
       {
         sourceFileName: "Super-Synara-0.5.5-super.3-arm64.dmg",
         outputFileName: "Super-Synara-0.5.5-super.3-macos-arm64-unsigned.dmg",
-      },
-      {
-        sourceFileName: "Super-Synara-0.5.5-super.3-arm64.zip",
-        outputFileName: "Super-Synara-0.5.5-super.3-arm64.zip",
       },
     ]);
   });

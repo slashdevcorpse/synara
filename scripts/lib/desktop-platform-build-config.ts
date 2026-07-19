@@ -24,6 +24,7 @@ export const NODE_PTY_ASAR_UNPACK_GLOBS = ["node_modules/node-pty/**"] as const;
 
 export interface DesktopPlatformBuildConfig {
   readonly asarUnpack?: ReadonlyArray<string>;
+  readonly dmg?: Record<string, unknown>;
   readonly extraFiles?: ReadonlyArray<Record<string, string>>;
   readonly extraResources?: ReadonlyArray<Record<string, string>>;
   readonly files?: ReadonlyArray<string>;
@@ -82,7 +83,12 @@ export function createDesktopPlatformBuildConfig(
 
   if (input.platform === "mac") {
     const mac = {
-      target: input.target === "dmg" ? [input.target, "zip"] : [input.target],
+      target:
+        input.target === "dmg"
+          ? input.disableUpdates
+            ? [input.target]
+            : [input.target, "zip"]
+          : [input.target],
       icon: MAC_DMG_ICON_PATH,
       category: "public.app-category.developer-tools",
       hardenedRuntime: input.signed === true,
@@ -108,6 +114,9 @@ export function createDesktopPlatformBuildConfig(
           to: "Helpers/synara-appsnap-helper",
         },
       ],
+      ...(input.disableUpdates && input.target === "dmg"
+        ? { dmg: { writeUpdateInfo: false } }
+        : {}),
       mac,
     };
   }

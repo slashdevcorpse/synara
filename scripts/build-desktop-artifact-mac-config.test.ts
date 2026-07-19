@@ -194,6 +194,8 @@ describe("createDesktopPlatformBuildConfig", () => {
     });
 
     assert.equal((mac.mac as Record<string, unknown>).identity, null);
+    assert.deepStrictEqual((mac.mac as Record<string, unknown>).target, ["dmg"]);
+    assert.deepStrictEqual(mac.dmg, { writeUpdateInfo: false });
     assert.deepStrictEqual(mac.extraResources, [{ from: "LICENSE", to: "LICENSE" }]);
     assert.deepStrictEqual(win.nsis, {
       guid: "ab3ea852-4edf-4caa-977e-9d00ccab2b1e",
