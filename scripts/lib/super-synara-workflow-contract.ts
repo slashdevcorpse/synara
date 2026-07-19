@@ -218,6 +218,15 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
   requireText(audit, "permissions:\n  contents: read", "Audit must be read-only.");
   requireText(audit, 'test "$(uname -m)" = arm64', "Audit must prove arm64 host architecture.");
   prohibitText(audit, "contents: write", "Audit must not receive write permission.");
+  for (const auditSourceNeedle of [
+    "REF_SHA: ${{ github.sha }}",
+    '[[ "$SOURCE_SHA" == "$REF_SHA" ]]',
+    'CORE_VERSION="${BASH_REMATCH[1]}"',
+    '"v$CORE_VERSION"',
+    "build-only",
+  ]) {
+    requireText(audit, auditSourceNeedle, `Audit source contract is missing ${auditSourceNeedle}.`);
+  }
   requireText(audit, "--mode audit", "Audit must emit unclassified inventory evidence.");
   const auditCleanlinessChecks =
     audit.match(/node scripts\/verify-release-worktree-clean\.ts/g)?.length ?? 0;

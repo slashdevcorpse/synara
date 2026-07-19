@@ -110,4 +110,19 @@ describe("Super Synara workflow contracts", () => {
       ),
     ).toThrow("bind both upstream-core and previous-release selection");
   });
+
+  it("rejects an audit detached from protected main or mislabeled as publication", () => {
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main,
+        audit.replace('[[ "$SOURCE_SHA" == "$REF_SHA" ]]', "true"),
+      ),
+    ).toThrow("Audit source contract");
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main,
+        audit.replace("build-only", "github-unsigned-prerelease"),
+      ),
+    ).toThrow("Audit source contract");
+  });
 });

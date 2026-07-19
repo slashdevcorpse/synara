@@ -32,6 +32,7 @@ jobs:
           TRIGGERING_ACTOR: ${{ github.triggering_actor }}
           OWNER: ${{ github.repository_owner }}
           REF_NAME: ${{ github.ref_name }}
+          REF_SHA: ${{ github.sha }}
           SOURCE_SHA: ${{ inputs.source_sha }}
         run: |
           set -euo pipefail
@@ -39,6 +40,7 @@ jobs:
           [[ "$TRIGGERING_ACTOR" == "$OWNER" ]]
           [[ "$REF_NAME" == "main" ]]
           [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$SOURCE_SHA" == "$REF_SHA" ]]
 
       - name: Checkout exact source
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -76,14 +78,16 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$(git rev-parse HEAD)" == "$SOURCE_SHA" ]]
+          [[ "$VERSION" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-super\.([1-9][0-9]*)$ ]]
+          CORE_VERSION="${BASH_REMATCH[1]}"
           node scripts/verify-release-source-provenance.ts \
-            "$VERSION" \
-            "super-v$VERSION" \
+            "$CORE_VERSION" \
+            "v$CORE_VERSION" \
             false \
             "$SOURCE_SHA" \
             branch \
             main \
-            github-unsigned-prerelease \
+            build-only \
             false
 
       - name: Build unsigned macOS arm64 audit artifact
