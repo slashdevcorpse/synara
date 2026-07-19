@@ -567,8 +567,9 @@ function resolveCodexTurnOverrides(context: CodexSessionContext): {
 }
 
 function encodeCodexTomlBasicStringForCommand(value: string): string {
-  return JSON.stringify(value).replace(/[&|<>^%]/g, (character) =>
-    `\\u${character.codePointAt(0)!.toString(16).padStart(4, "0")}`,
+  return JSON.stringify(value).replace(
+    /[&|<>^%]/g,
+    (character) => `\\u${character.codePointAt(0)!.toString(16).padStart(4, "0")}`,
   );
 }
 
@@ -2689,8 +2690,9 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
     context: CodexSessionContext,
     method: string,
     params: unknown,
-    timeoutMs =
-      method === "initialize" ? CODEX_INITIALIZE_TIMEOUT_MS : CODEX_DEFAULT_REQUEST_TIMEOUT_MS,
+    timeoutMs = method === "initialize"
+      ? CODEX_INITIALIZE_TIMEOUT_MS
+      : CODEX_DEFAULT_REQUEST_TIMEOUT_MS,
   ): Promise<TResponse> {
     const id = context.nextRequestId;
     context.nextRequestId += 1;
