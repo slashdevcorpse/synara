@@ -56,6 +56,32 @@ export function resolveDesktopUserDataPath(input: {
   return Path.join(input.appDataBase, input.userDataDirectoryName);
 }
 
+export function resolveDesktopBackendHomePath(input: {
+  readonly homeDirectory: string;
+  readonly defaultHomeDirectoryName: string;
+  readonly configuredHomeDirectory?: string | undefined;
+  readonly forbiddenHomeDirectories?: ReadonlyArray<string>;
+}): string {
+  const configuredHomeDirectory = input.configuredHomeDirectory?.trim();
+  const candidate = Path.resolve(
+    configuredHomeDirectory || Path.join(input.homeDirectory, input.defaultHomeDirectoryName),
+  );
+  const comparableCandidate = process.platform === "win32" ? candidate.toLowerCase() : candidate;
+
+  for (const forbiddenHomeDirectory of input.forbiddenHomeDirectories ?? []) {
+    const forbidden = Path.resolve(forbiddenHomeDirectory);
+    const comparableForbidden = process.platform === "win32" ? forbidden.toLowerCase() : forbidden;
+    const relative = Path.relative(comparableForbidden, comparableCandidate);
+    if (relative === "" || (!relative.startsWith("..") && !Path.isAbsolute(relative))) {
+      throw new Error(
+        `Super Synara refuses to use upstream Synara state at ${configuredHomeDirectory || candidate}.`,
+      );
+    }
+  }
+
+  return candidate;
+}
+
 function readBridgeProfileSourcePath(targetPath: string): string | null {
   const manifestPath = Path.join(targetPath, BRIDGE_PROFILE_MANIFEST_FILE_NAME);
   if (!FS.existsSync(manifestPath)) return null;

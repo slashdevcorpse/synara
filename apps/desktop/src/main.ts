@@ -155,6 +155,7 @@ import {
 import { normalizeDesktopWsUrl, resolveDesktopWsUrlFromEnv } from "./desktopWsBridge";
 import {
   repairBrowserProfileFromBridgeManifest,
+  resolveDesktopBackendHomePath,
   resolveDesktopAppDataBase,
   resolveDesktopUserDataPath,
 } from "./desktopUserDataProfile";
@@ -188,14 +189,22 @@ syncShellEnvironment();
 const IPC = DESKTOP_IPC_CHANNELS;
 const MAX_CLIPBOARD_IMAGE_DATA_URL_LENGTH = 16 * 1024 * 1024;
 const isDevelopment = Boolean(process.env.VITE_DEV_SERVER_URL);
+declare const __SYNARA_PACKAGED_DESKTOP_FLAVOR__: string;
+declare const __SYNARA_PACKAGED_UPDATES_DISABLED__: boolean;
 const desktopFlavor = resolveSynaraDesktopFlavor({
   isDevelopment,
-  requestedFlavor: process.env.SYNARA_DESKTOP_FLAVOR,
+  requestedFlavor: app.isPackaged ? undefined : process.env.SYNARA_DESKTOP_FLAVOR,
+  packagedFlavor: app.isPackaged ? __SYNARA_PACKAGED_DESKTOP_FLAVOR__ : undefined,
 });
 const desktopIdentity = synaraDesktopIdentity(desktopFlavor);
-const BASE_DIR =
-  process.env.SYNARA_HOME?.trim() ||
-  Path.join(OS.homedir(), desktopIdentity.defaultHomeDirectoryName);
+const packagedUpdatesDisabled = app.isPackaged && __SYNARA_PACKAGED_UPDATES_DISABLED__;
+const BASE_DIR = resolveDesktopBackendHomePath({
+  homeDirectory: OS.homedir(),
+  defaultHomeDirectoryName: desktopIdentity.defaultHomeDirectoryName,
+  configuredHomeDirectory: process.env.SYNARA_HOME,
+  forbiddenHomeDirectories:
+    desktopIdentity.flavor === "super" ? [Path.join(OS.homedir(), ".synara")] : [],
+});
 const STATE_DIR = Path.join(BASE_DIR, "userdata");
 const DESKTOP_WINDOW_STATE_PATH = Path.join(STATE_DIR, "desktop-window-state.json");
 const DESKTOP_SCHEME = desktopIdentity.scheme;
@@ -1264,13 +1273,18 @@ function hasConfiguredUpdateFeed(): boolean {
 }
 
 function resolveAutoUpdateDisabledReason(): string | null {
+  if (desktopIdentity.updateStrategy === "manual") {
+    return "Super Synara uses manual updates only. Download and verify a newer unsigned prerelease from the Super Synara GitHub releases page.";
+  }
   return getAutoUpdateDisabledReason({
     isDevelopment,
     isPackaged: app.isPackaged,
     platform: process.platform,
     appImage: process.env.APPIMAGE,
     disabledByEnv:
-      desktopIdentity.usesScriptedUpdates || process.env.SYNARA_DISABLE_AUTO_UPDATE === "1",
+      desktopIdentity.usesScriptedUpdates ||
+      packagedUpdatesDisabled ||
+      process.env.SYNARA_DISABLE_AUTO_UPDATE === "1",
     hasUpdateFeedConfig: hasConfiguredUpdateFeed(),
   });
 }
@@ -1661,6 +1675,9 @@ function resolveUserDataPath(): string {
 }
 
 function repairBrowserProfileBeforeElectronReady(userDataPath: string): void {
+  if (!desktopIdentity.allowsProfileBridgeRepair) {
+    return;
+  }
   const browserProfileRepair = repairBrowserProfileFromBridgeManifest(userDataPath);
   if (browserProfileRepair.status === "repaired") {
     console.info("[desktop] Completed Synara browser profile bridge repair", {
@@ -1685,6 +1702,13 @@ function configureAppIdentity(): void {
     applicationVersion: app.getVersion(),
     version: commitHash ?? "unknown",
     copyright: `© ${new Date().getFullYear()} Emanuele Di Pietro`,
+    ...(desktopIdentity.downstreamRepositoryUrl
+      ? {
+          website: desktopIdentity.downstreamRepositoryUrl,
+          credits:
+            "Unofficial downstream of Synara, distributed under the MIT License. Super Synara prereleases are unsigned and use manual updates only.",
+        }
+      : {}),
   });
 
   if (process.platform === "win32") {
