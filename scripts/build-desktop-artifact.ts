@@ -14,6 +14,7 @@ import desktopPackageJson from "../apps/desktop/package.json" with { type: "json
 import serverPackageJson from "../apps/server/package.json" with { type: "json" };
 
 import { BRAND_ASSET_PATHS } from "./lib/brand-assets.ts";
+import { createDesktopBuilderCommandPlan } from "./lib/desktop-builder-command.ts";
 import {
   createDesktopPlatformBuildConfig,
   MAC_APPSNAP_HELPER_STAGE_PATH,
@@ -23,6 +24,8 @@ import {
   createDesktopIdentityBuildConfig,
   findProhibitedUpdaterMetadataFiles,
   isProhibitedUpdaterMetadataFile,
+  resolveDesktopPlatformBuildVersion,
+  resolveDesktopSourceTag,
 } from "./lib/desktop-artifact-policy.ts";
 import { synaraDesktopIdentity, type SynaraDesktopFlavor } from "@synara/shared/desktopIdentity";
 import { parseBooleanEnvValue } from "./lib/env-bool.ts";
@@ -33,6 +36,10 @@ import {
   RELEASE_WORKSPACE_MANIFEST_PATHS,
 } from "./lib/release-workspace-manifests.ts";
 import { resolveCatalogDependencies } from "./lib/resolve-catalog.ts";
+import {
+  assertDesktopStageFilesUnchanged,
+  verifyDesktopStagePatchedDependencies,
+} from "./lib/desktop-stage-install.ts";
 
 import * as NodeRuntime from "@effect/platform-node/NodeRuntime";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -111,6 +118,7 @@ interface BuildCliInput {
   readonly sourceTag: Option.Option<string>;
   readonly lockfileSha256: Option.Option<string>;
   readonly outputDir: Option.Option<string>;
+  readonly preparedDependenciesPath: Option.Option<string>;
   readonly skipBuild: Option.Option<boolean>;
   readonly keepStage: Option.Option<boolean>;
   readonly signed: Option.Option<boolean>;
@@ -212,6 +220,7 @@ interface ResolvedBuildOptions {
   readonly sourceTag: string | undefined;
   readonly lockfileSha256: string | undefined;
   readonly outputDir: string;
+  readonly preparedDependenciesPath: string | undefined;
   readonly skipBuild: boolean;
   readonly keepStage: boolean;
   readonly signed: boolean;
@@ -266,6 +275,9 @@ const BuildEnvConfig = Config.all({
   sourceTag: Config.string("SYNARA_SOURCE_TAG").pipe(Config.option),
   lockfileSha256: Config.string("SYNARA_LOCKFILE_SHA256").pipe(Config.option),
   outputDir: Config.string("SYNARA_DESKTOP_OUTPUT_DIR").pipe(Config.option),
+  preparedDependenciesPath: Config.string("SYNARA_DESKTOP_PREPARED_DEPENDENCIES_PATH").pipe(
+    Config.option,
+  ),
   skipBuild: Config.string("SYNARA_DESKTOP_SKIP_BUILD").pipe(Config.option),
   keepStage: Config.string("SYNARA_DESKTOP_KEEP_STAGE").pipe(Config.option),
   signed: Config.string("SYNARA_DESKTOP_SIGNED").pipe(Config.option),
@@ -335,6 +347,26 @@ export const resolveBuildOptions = Effect.fn("resolveBuildOptions")(function* (
     repoRoot,
     mergeOptions(input.outputDir, env.outputDir, releaseDir),
   );
+  const preparedDependenciesPathValue = mergeOptions(
+    input.preparedDependenciesPath,
+    env.preparedDependenciesPath,
+    undefined,
+  );
+  const preparedDependenciesPath = preparedDependenciesPathValue
+    ? path.resolve(repoRoot, preparedDependenciesPathValue)
+    : undefined;
+
+  if (flavor === "super" && !preparedDependenciesPath) {
+    return yield* new BuildScriptError({
+      message:
+        "Super Synara builds require a validated prepared dependency path. Use dist:desktop:super:win or dist:desktop:super:mac.",
+    });
+  }
+  if (flavor !== "super" && preparedDependenciesPath) {
+    return yield* new BuildScriptError({
+      message: "Prepared Super Synara dependencies cannot be used for production or canary builds.",
+    });
+  }
 
   const skipBuild = resolveBooleanFlag(input.skipBuild, envSkipBuild);
   const keepStage = resolveBooleanFlag(input.keepStage, envKeepStage);
@@ -364,6 +396,7 @@ export const resolveBuildOptions = Effect.fn("resolveBuildOptions")(function* (
     sourceTag,
     lockfileSha256,
     outputDir,
+    preparedDependenciesPath,
     skipBuild,
     keepStage,
     signed,
@@ -573,35 +606,6 @@ const verifyStagedNodePty = Effect.fn("verifyStagedNodePty")(function* (
   );
 });
 
-interface PatchFileExpectation {
-  readonly file: string;
-  readonly addedLines: ReadonlyArray<string>;
-}
-
-function parsePatchAddedLines(patchContents: string): PatchFileExpectation[] {
-  const expectations: Array<{ file: string; addedLines: string[] }> = [];
-  let current: { file: string; addedLines: string[] } | null = null;
-  for (const line of patchContents.split("\n")) {
-    if (line.startsWith("+++ ")) {
-      const target = line.slice(4).trim();
-      if (target === "/dev/null") {
-        current = null;
-        continue;
-      }
-      current = { file: target.startsWith("b/") ? target.slice(2) : target, addedLines: [] };
-      expectations.push(current);
-      continue;
-    }
-    if (current && line.startsWith("+")) {
-      const added = line.slice(1).trim();
-      if (added.length > 0) {
-        current.addedLines.push(added);
-      }
-    }
-  }
-  return expectations.filter((expectation) => expectation.addedLines.length > 0);
-}
-
 // Package managers can silently skip tracked patches when the staged install
 // diverges from the repo setup (that shipped broken Windows provider updates
 // in v0.5.2–v0.5.5), so fail the build unless every patched line is present.
@@ -609,34 +613,20 @@ const verifyStagedPatchedDependencies = Effect.fn("verifyStagedPatchedDependenci
   repoRoot: string,
   stageAppDir: string,
 ) {
-  const path = yield* Path.Path;
-  const fs = yield* FileSystem.FileSystem;
   yield* Effect.log("[desktop-artifact] Verifying staged patched dependencies...");
-  for (const [dependency, patchRelativePath] of Object.entries(
-    rootPackageJson.patchedDependencies ?? {},
-  )) {
-    const packageName = dependency.slice(0, dependency.indexOf("@", 1));
-    const patchContents = yield* fs.readFileString(path.join(repoRoot, patchRelativePath));
-    for (const expectation of parsePatchAddedLines(patchContents)) {
-      const stagedFilePath = path.join(stageAppDir, "node_modules", packageName, expectation.file);
-      const stagedContents = yield* fs.readFileString(stagedFilePath).pipe(
-        Effect.mapError(
-          (cause) =>
-            new BuildScriptError({
-              message: `Patched dependency file is missing from the stage: ${stagedFilePath} (expected by ${patchRelativePath}).`,
-              cause,
-            }),
-        ),
-      );
-      for (const addedLine of expectation.addedLines) {
-        if (!stagedContents.includes(addedLine)) {
-          return yield* new BuildScriptError({
-            message: `Staged dependency ${packageName} is missing patched content: ${expectation.file} does not contain "${addedLine}" from ${patchRelativePath}. The tracked patch was not applied by the staged install.`,
-          });
-        }
-      }
-    }
-  }
+  yield* Effect.try({
+    try: () =>
+      verifyDesktopStagePatchedDependencies(
+        repoRoot,
+        stageAppDir,
+        rootPackageJson.patchedDependencies ?? {},
+      ),
+    catch: (cause) =>
+      new BuildScriptError({
+        message: cause instanceof Error ? cause.message : String(cause),
+        cause,
+      }),
+  });
 });
 
 const installFrozenStageDependencies = Effect.fn("installFrozenStageDependencies")(function* (
@@ -683,6 +673,43 @@ const installFrozenStageDependencies = Effect.fn("installFrozenStageDependencies
   yield* fs.remove(path.join(stageAppDir, RELEASE_LOCKFILE_PATH));
   yield* fs.remove(path.join(stageAppDir, RELEASE_PATCHES_PATH), { recursive: true });
 });
+
+const copyPreparedSuperStageDependencies = Effect.fn("copyPreparedSuperStageDependencies")(
+  function* (repoRoot: string, stageAppDir: string, preparedDependenciesPath: string) {
+    const path = yield* Path.Path;
+    const fs = yield* FileSystem.FileSystem;
+    const preparedNodeModules = path.join(preparedDependenciesPath, "node_modules");
+    if (!(yield* fs.exists(preparedNodeModules))) {
+      return yield* new BuildScriptError({
+        message: `Prepared Super Synara node_modules is missing: ${preparedNodeModules}`,
+      });
+    }
+
+    yield* Effect.log(
+      "[desktop-artifact] Revalidating and copying prepared Super Synara dependencies...",
+    );
+    yield* Effect.try({
+      try: () => {
+        assertDesktopStageFilesUnchanged(repoRoot, preparedDependenciesPath, [
+          RELEASE_LOCKFILE_PATH,
+          ...RELEASE_WORKSPACE_MANIFEST_PATHS,
+        ]);
+        verifyDesktopStagePatchedDependencies(
+          repoRoot,
+          preparedDependenciesPath,
+          rootPackageJson.patchedDependencies ?? {},
+        );
+      },
+      catch: (cause) =>
+        new BuildScriptError({
+          message: `Prepared Super Synara dependency validation failed: ${cause instanceof Error ? cause.message : String(cause)}`,
+          cause,
+        }),
+    });
+    yield* fs.copy(preparedNodeModules, path.join(stageAppDir, "node_modules"));
+    yield* verifyStagedPatchedDependencies(repoRoot, stageAppDir);
+  },
+);
 
 const createBuildConfig = Effect.fn("createBuildConfig")(function* (
   platform: typeof BuildPlatform.Type,
@@ -891,9 +918,10 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
       message: `Release lockfile digest mismatch: expected ${options.lockfileSha256}, got ${resolvedLockfileSha256}.`,
     });
   }
-  if (options.sourceTag && options.sourceTag !== `v${appVersion}`) {
+  const expectedSourceTag = resolveDesktopSourceTag(options.flavor, appVersion);
+  if (options.sourceTag && options.sourceTag !== expectedSourceTag) {
     return yield* new BuildScriptError({
-      message: `Release source tag ${options.sourceTag} does not match artifact version ${appVersion}.`,
+      message: `Release source tag ${options.sourceTag} does not match expected tag ${expectedSourceTag}.`,
     });
   }
   if (exactProvenanceRequested) {
@@ -963,6 +991,18 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
   yield* fs.makeDirectory(path.join(stageAppDir, "apps/server"), { recursive: true });
 
   yield* Effect.log("[desktop-artifact] Staging release app...");
+  if (options.flavor === "super") {
+    if (!options.preparedDependenciesPath) {
+      return yield* new BuildScriptError({
+        message: "Super Synara prepared dependency path was not resolved.",
+      });
+    }
+    yield* copyPreparedSuperStageDependencies(
+      repoRoot,
+      stageAppDir,
+      options.preparedDependenciesPath,
+    );
+  }
   yield* fs.copy(distDirs.desktopDist, path.join(stageAppDir, "apps/desktop/dist-electron"));
   yield* fs.copy(distDirs.desktopResources, stageResourcesDir);
   yield* fs.copy(distDirs.serverDist, path.join(stageAppDir, "apps/server/dist"));
@@ -990,7 +1030,7 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
   const stagePackageJson: StagePackageJson = {
     name: "synara-desktop",
     version: appVersion,
-    buildVersion: appVersion,
+    buildVersion: resolveDesktopPlatformBuildVersion(options.flavor, appVersion),
     synaraCommitHash: commitHash,
     synaraLockfileSha256: resolvedLockfileSha256,
     synaraSourceTag: options.sourceTag ?? null,
@@ -1015,7 +1055,9 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
     },
   };
 
-  yield* installFrozenStageDependencies(repoRoot, stageAppDir, options.verbose);
+  if (options.flavor !== "super") {
+    yield* installFrozenStageDependencies(repoRoot, stageAppDir, options.verbose);
+  }
 
   const stagePackageJsonString = yield* encodeJsonString(stagePackageJson);
   yield* fs.writeFileString(path.join(stageAppDir, "package.json"), `${stagePackageJsonString}\n`);
@@ -1056,21 +1098,40 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
   yield* Effect.log(
     `[desktop-artifact] Building ${options.platform}/${options.target} (arch=${options.arch}, version=${appVersion})...`,
   );
-  const electronBuilderExecutable = path.join(
-    repoRoot,
-    "node_modules",
-    ".bin",
-    process.platform === "win32" ? "electron-builder.cmd" : "electron-builder",
-  );
-  yield* runCommand(
-    ChildProcess.make({
-      cwd: stageAppDir,
-      env: buildEnv,
-      ...commandOutputOptions(options.verbose),
-      // Windows needs shell mode to resolve .cmd shims.
-      shell: process.platform === "win32",
-    })`${electronBuilderExecutable} ${platformConfig.cliFlag} --${options.arch} --publish never`,
-  );
+  const electronBuilderPlan = yield* Effect.try({
+    try: () =>
+      createDesktopBuilderCommandPlan({
+        repoRoot,
+        nodeExecutable: process.execPath,
+        platformCliFlag: platformConfig.cliFlag,
+        arch: options.arch,
+      }),
+    catch: (cause) =>
+      new BuildScriptError({
+        message: cause instanceof Error ? cause.message : String(cause),
+        cause,
+      }),
+  });
+  yield* Effect.try({
+    try: () => {
+      const result = spawnSync(electronBuilderPlan.command, [...electronBuilderPlan.args], {
+        cwd: stageAppDir,
+        env: buildEnv,
+        shell: electronBuilderPlan.shell,
+        stdio: options.verbose ? "inherit" : ["ignore", "ignore", "inherit"],
+        windowsHide: true,
+      });
+      if (result.error) throw result.error;
+      if (result.status !== 0) {
+        throw new Error(`electron-builder exited with ${result.status ?? "unknown"}.`);
+      }
+    },
+    catch: (cause) =>
+      new BuildScriptError({
+        message: cause instanceof Error ? cause.message : String(cause),
+        cause,
+      }),
+  });
 
   const stageDistDir = path.join(stageAppDir, "dist");
   if (!(yield* fs.exists(stageDistDir))) {
@@ -1182,6 +1243,12 @@ const buildDesktopArtifactCli = Command.make("build-desktop-artifact", {
   ),
   outputDir: Flag.string("output-dir").pipe(
     Flag.withDescription("Output directory for artifacts (env: SYNARA_DESKTOP_OUTPUT_DIR)."),
+    Flag.optional,
+  ),
+  preparedDependenciesPath: Flag.string("prepared-dependencies-path").pipe(
+    Flag.withDescription(
+      "Validated Super Synara dependency root prepared before this process starts (env: SYNARA_DESKTOP_PREPARED_DEPENDENCIES_PATH).",
+    ),
     Flag.optional,
   ),
   skipBuild: Flag.boolean("skip-build").pipe(

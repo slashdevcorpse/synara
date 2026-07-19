@@ -8,9 +8,14 @@ import { synaraDesktopIdentity } from "@synara/shared/desktopIdentity";
 
 import {
   createDesktopIdentityBuildConfig,
+  desktopStageFileBytesMatch,
   findProhibitedUpdaterMetadataFiles,
   isProhibitedUpdaterMetadataFile,
   resolveDesktopGitHubPublishConfig,
+  resolveDesktopPlatformBuildVersion,
+  resolveDesktopSourceTag,
+  resolveDesktopStageInstallArgs,
+  resolveSuperDesktopStageInstallEnvironment,
 } from "./desktop-artifact-policy.ts";
 
 const temporaryRoots: string[] = [];
@@ -22,6 +27,91 @@ afterEach(() => {
 });
 
 describe("desktop artifact policy", () => {
+  it("uses a normal-saving, unfiltered production stage install only for Super Synara", () => {
+    const baseArgs = [
+      "install",
+      "--production",
+      "--frozen-lockfile",
+      "--ignore-scripts",
+      "--linker",
+      "hoisted",
+    ];
+    expect(resolveDesktopStageInstallArgs("super")).toEqual([
+      "install",
+      "--production",
+      "--ignore-scripts",
+      "--linker",
+      "hoisted",
+    ]);
+    expect(resolveDesktopStageInstallArgs("super")).not.toContain("--frozen-lockfile");
+    expect(resolveDesktopStageInstallArgs("super")).not.toContain("--no-save");
+    expect(resolveDesktopStageInstallArgs("super")).not.toContain("--save");
+    for (const flavor of ["production", "canary"] as const) {
+      expect(resolveDesktopStageInstallArgs(flavor)).toEqual([
+        ...baseArgs,
+        "--filter",
+        "@synara/cli",
+        "--filter",
+        "@synara/desktop",
+      ]);
+    }
+  });
+
+  it("rejects any staged lockfile byte change", () => {
+    const repositoryLockfile = Buffer.from('lock = "same"\n');
+    expect(desktopStageFileBytesMatch(repositoryLockfile, Buffer.from(repositoryLockfile))).toBe(
+      true,
+    );
+    expect(desktopStageFileBytesMatch(repositoryLockfile, Buffer.from('lock = "changed"\n'))).toBe(
+      false,
+    );
+    expect(desktopStageFileBytesMatch(repositoryLockfile, Buffer.from('lock = "same"\r\n'))).toBe(
+      false,
+    );
+  });
+
+  it("removes only the proven nested Bun user-agent trigger", () => {
+    const inheritedEnvironment = {
+      PATH: "C:\\repo\\node_modules\\.bin;C:\\tools",
+      NODE: "C:\\tools\\node.exe",
+      CI: "true",
+      INIT_CWD: "C:\\workflow",
+      npm_config_user_agent: "bun/1.3.12 npm/? node/v24.3.0 win32 x64",
+      npm_config_local_prefix: "C:\\repo",
+      npm_package_json: "C:\\repo\\package.json",
+      npm_package_name: "@synara/monorepo",
+      npm_command: "run-script",
+      npm_execpath: "C:\\tools\\bun.exe",
+      npm_node_execpath: "C:\\tools\\node.exe",
+    };
+    expect(resolveSuperDesktopStageInstallEnvironment(inheritedEnvironment)).toEqual({
+      PATH: "C:\\repo\\node_modules\\.bin;C:\\tools",
+      NODE: "C:\\tools\\node.exe",
+      CI: "true",
+      INIT_CWD: "C:\\workflow",
+      npm_config_local_prefix: "C:\\repo",
+      npm_package_json: "C:\\repo\\package.json",
+      npm_package_name: "@synara/monorepo",
+      npm_command: "run-script",
+      npm_execpath: "C:\\tools\\bun.exe",
+      npm_node_execpath: "C:\\tools\\node.exe",
+    });
+  });
+
+  it("uses flavor-aware source tags without changing upstream flavors", () => {
+    expect(resolveDesktopSourceTag("production", "0.5.5")).toBe("v0.5.5");
+    expect(resolveDesktopSourceTag("canary", "0.5.5")).toBe("v0.5.5");
+    expect(resolveDesktopSourceTag("super", "0.5.5-super.1")).toBe("super-v0.5.5-super.1");
+  });
+
+  it("maps Super prerelease semver to numeric platform build metadata", () => {
+    expect(resolveDesktopPlatformBuildVersion("super", "0.5.5-super.1")).toBe("0.5.5.1");
+    expect(resolveDesktopPlatformBuildVersion("super", "0.5.5")).toBe("0.5.5.0");
+    expect(resolveDesktopPlatformBuildVersion("production", "0.5.5-beta.1")).toBe("0.5.5-beta.1");
+    expect(resolveDesktopPlatformBuildVersion("canary", "0.5.5-canary.1")).toBe("0.5.5-canary.1");
+    expect(() => resolveDesktopPlatformBuildVersion("super", "0.5.5-beta.1")).toThrow("must use");
+  });
+
   it("builds Super Synara with the locked package identity and bundled license", () => {
     expect(
       createDesktopIdentityBuildConfig({
