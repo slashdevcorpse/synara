@@ -326,6 +326,7 @@ export const makeEditorAvailability = (
             };
           }
           let request: EditorDiscoveryRequest;
+          const recoveringCaptureFailure = requestCaptureRetryAt !== null;
           try {
             request = captureRequest();
             requestCaptureRetryAt = null;
@@ -371,7 +372,7 @@ export const makeEditorAvailability = (
             state.confirmedIdentity === requestedIdentity &&
             state.confirmedAt !== null &&
             state.confirmedAt + refreshAfterMs > requestedAt;
-          if (retryBlocked || (!force && fresh)) {
+          if (retryBlocked || (!force && fresh && !recoveringCaptureFailure)) {
             return { snapshot: toSnapshot(state), completed: null };
           }
 

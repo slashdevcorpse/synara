@@ -134,6 +134,86 @@ describe("EditorAvailability", () => {
     );
   });
 
+  it("runs one non-forced recovery discovery after a fresh confirmed capture failure", async () => {
+    let clock = 10_000;
+    let throwIdentity = false;
+    let identityCalls = 0;
+    let discoveryCalls = 0;
+    let completeRecovery!: (result: EditorDiscoveryResult) => void;
+
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const availability = yield* makeEditorAvailability({
+            discover: () => {
+              discoveryCalls += 1;
+              return discoveryCalls === 1
+                ? Promise.resolve(success(["vscode"]))
+                : new Promise<EditorDiscoveryResult>((resolve) => {
+                    completeRecovery = resolve;
+                  });
+            },
+            identity: () => {
+              identityCalls += 1;
+              if (throwIdentity) throw new Error("identity unavailable");
+              return "identity-a";
+            },
+            now: () => clock,
+          });
+
+          const confirmed = yield* availability.refresh;
+          expect(confirmed).toMatchObject({
+            status: "ready",
+            availableEditors: ["vscode"],
+            revision: 1,
+            confirmedAt: 10_000,
+          });
+
+          clock = 11_000;
+          throwIdentity = true;
+          const failed = yield* availability.getSnapshotAndSchedule;
+          expect(failed).toMatchObject({
+            status: "failed",
+            failureCategory: "filesystem_transient",
+            retryAt: 13_000,
+            availableEditors: ["vscode"],
+            revision: 1,
+          });
+          expect(discoveryCalls).toBe(1);
+
+          throwIdentity = false;
+          const retryBlocked = yield* availability.getSnapshotAndSchedule;
+          expect(retryBlocked).toEqual(failed);
+          expect(identityCalls).toBe(3);
+
+          clock = 13_000;
+          const recovering = yield* availability.getSnapshotAndSchedule;
+          expect(recovering).toMatchObject({
+            status: "refreshing",
+            availableEditors: ["vscode"],
+            revision: 1,
+          });
+          yield* Effect.yieldNow;
+          yield* Effect.yieldNow;
+          expect(discoveryCalls).toBe(2);
+          expect((yield* availability.getCurrent).status).toBe("refreshing");
+
+          completeRecovery(success(["cursor"]));
+          yield* Effect.yieldNow;
+          yield* Effect.yieldNow;
+          expect(yield* availability.getCurrent).toMatchObject({
+            status: "ready",
+            availableEditors: ["cursor"],
+            revision: 2,
+            confirmedAt: 13_000,
+          });
+          expect(identityCalls).toBe(5);
+          expect(discoveryCalls).toBe(2);
+        }),
+      ),
+    );
+  });
+
   it("reports a caller capture failure without corrupting valid in-flight discovery", async () => {
     let clock = 20_000;
     let throwIdentity = false;
