@@ -103,6 +103,13 @@ export function resolveDesktopGitHubPublishConfig(input: {
   return { provider: "github", owner, repo, releaseType: "release" };
 }
 
+export function shouldFinalizeMacUpdateZip(input: {
+  readonly platform: "linux" | "mac" | "win";
+  readonly disableUpdates: boolean;
+}): boolean {
+  return input.platform === "mac" && !input.disableUpdates;
+}
+
 export function createDesktopIdentityBuildConfig(input: {
   readonly identity: SynaraDesktopIdentity;
   readonly signed: boolean;
