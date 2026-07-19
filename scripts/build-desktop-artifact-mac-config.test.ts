@@ -7,6 +7,7 @@ import {
   MAC_APPSNAP_HELPER_STAGE_PATH,
   MAC_ENTITLEMENTS_PATH,
   MAC_INHERITED_ENTITLEMENTS_PATH,
+  MAC_NODE_PTY_WINDOWS_EXCLUSIONS,
   MICROPHONE_USAGE_DESCRIPTION,
   NODE_PTY_ASAR_UNPACK_GLOBS,
   validateDesktopNativeBuildHost,
@@ -40,7 +41,19 @@ describe("createDesktopPlatformBuildConfig", () => {
       "apps/desktop/native/appsnap/build/synara-appsnap-helper",
     );
     assert.equal(MAC_APPSNAP_HELPER_ASAR_EXCLUSION, "!apps/desktop/native/appsnap/build/**");
-    assert.deepStrictEqual(config.files, ["**/*", MAC_APPSNAP_HELPER_ASAR_EXCLUSION]);
+    assert.deepStrictEqual(config.files, [
+      "**/*",
+      ...MAC_NODE_PTY_WINDOWS_EXCLUSIONS,
+      MAC_APPSNAP_HELPER_ASAR_EXCLUSION,
+    ]);
+    assert.deepStrictEqual(
+      [...MAC_NODE_PTY_WINDOWS_EXCLUSIONS],
+      [
+        "!node_modules/node-pty/prebuilds/win32-*/**",
+        "!node_modules/node-pty/third_party/conpty/**",
+        "!node_modules/node-pty/deps/winpty/**",
+      ],
+    );
     assert.deepStrictEqual(config.extraFiles, [
       {
         from: "apps/desktop/native/appsnap/build/synara-appsnap-helper",
@@ -64,6 +77,7 @@ describe("createDesktopPlatformBuildConfig", () => {
     });
 
     assert.equal(linux.mac, undefined);
+    assert.equal(linux.files, undefined);
     assert.equal(linux.extraFiles, undefined);
     assert.deepStrictEqual(linux.extraResources, [{ from: "LICENSE", to: "LICENSE" }]);
     assert.deepStrictEqual(linux.asarUnpack, ["node_modules/node-pty/**"]);
@@ -80,6 +94,7 @@ describe("createDesktopPlatformBuildConfig", () => {
     });
 
     assert.equal(win.mac, undefined);
+    assert.equal(win.files, undefined);
     assert.equal(win.extraFiles, undefined);
     assert.deepStrictEqual(win.asarUnpack, ["node_modules/node-pty/**"]);
     assert.equal(WINDOWS_INSTALLER_GUID, "368107a8-afe6-5db5-ab3b-d4f331684868");

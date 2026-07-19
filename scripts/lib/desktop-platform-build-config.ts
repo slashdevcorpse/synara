@@ -21,6 +21,11 @@ export const MAC_APPSNAP_HELPER_BUNDLE_PATH = "Contents/Helpers/synara-appsnap-h
 export const WINDOWS_INSTALLER_GUID = SYNARA_WINDOWS_INSTALLER_GUID;
 const MAC_DMG_ICON_PATH = "icon.icns";
 export const NODE_PTY_ASAR_UNPACK_GLOBS = ["node_modules/node-pty/**"] as const;
+export const MAC_NODE_PTY_WINDOWS_EXCLUSIONS = [
+  "!node_modules/node-pty/prebuilds/win32-*/**",
+  "!node_modules/node-pty/third_party/conpty/**",
+  "!node_modules/node-pty/deps/winpty/**",
+] as const;
 
 export interface DesktopPlatformBuildConfig {
   readonly asarUnpack?: ReadonlyArray<string>;
@@ -107,7 +112,7 @@ export function createDesktopPlatformBuildConfig(
 
     return {
       ...licensedPackaging,
-      files: ["**/*", MAC_APPSNAP_HELPER_ASAR_EXCLUSION],
+      files: ["**/*", ...MAC_NODE_PTY_WINDOWS_EXCLUSIONS, MAC_APPSNAP_HELPER_ASAR_EXCLUSION],
       extraFiles: [
         {
           from: MAC_APPSNAP_HELPER_STAGE_PATH,

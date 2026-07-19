@@ -29,7 +29,7 @@ afterEach(() => {
 });
 
 describe("desktop artifact policy", () => {
-  it("uses a normal-saving, unfiltered production stage install only for Super Synara", () => {
+  it("uses a normal-saving, filtered production stage install only for Super Synara", () => {
     const baseArgs = [
       "install",
       "--production",
@@ -44,6 +44,10 @@ describe("desktop artifact policy", () => {
       "--ignore-scripts",
       "--linker",
       "hoisted",
+      "--filter",
+      "@synara/cli",
+      "--filter",
+      "@synara/desktop",
     ]);
     expect(resolveDesktopStageInstallArgs("super")).not.toContain("--frozen-lockfile");
     expect(resolveDesktopStageInstallArgs("super")).not.toContain("--no-save");

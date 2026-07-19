@@ -44,7 +44,17 @@ export function resolveDesktopStageInstallArgs(
   flavor: Exclude<SynaraDesktopFlavor, "development">,
 ): ReadonlyArray<string> {
   if (flavor === "super") {
-    return ["install", "--production", "--ignore-scripts", "--linker", "hoisted"];
+    return [
+      "install",
+      "--production",
+      "--ignore-scripts",
+      "--linker",
+      "hoisted",
+      "--filter",
+      "@synara/cli",
+      "--filter",
+      "@synara/desktop",
+    ];
   }
   return [...FROZEN_STAGE_INSTALL_ARGS, "--filter", "@synara/cli", "--filter", "@synara/desktop"];
 }

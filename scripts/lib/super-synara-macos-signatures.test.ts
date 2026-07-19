@@ -402,6 +402,20 @@ describe("Super Synara macOS signature evidence", () => {
       expect(
         classifyMacSignatureCandidateFileDescription("POSIX shell script text executable"),
       ).toBe("script");
+      expect(() =>
+        classifyMacSignatureCandidateFileDescription(
+          "PE32+ executable (DLL) (GUI) Aarch64, for MS Windows, 7 sections",
+          "Contents/Resources/app.asar.unpacked/node_modules/@img/sharp-win32-arm64/lib/sharp-win32-arm64.node",
+        ),
+      ).toThrow(
+        "Executable candidate Contents/Resources/app.asar.unpacked/node_modules/@img/sharp-win32-arm64/lib/sharp-win32-arm64.node has unsupported native file type: PE32+ executable (DLL) (GUI) Aarch64, for MS Windows, 7 sections.",
+      );
+      expect(() =>
+        classifyMacSignatureCandidateFileDescription(
+          "ELF 64-bit LSB shared object, x86-64",
+          "Contents/Resources/app.asar.unpacked/node_modules/example/native.node",
+        ),
+      ).toThrow("Contents/Resources/app.asar.unpacked/node_modules/example/native.node");
       expect(() => classifyMacSignatureCandidateFileDescription("data")).toThrow(
         "unsupported native file type",
       );

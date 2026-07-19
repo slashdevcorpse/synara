@@ -145,7 +145,10 @@ function signedCodeCandidatePaths(appBundlePath: string): ReadonlyArray<string> 
     if (fileType.status !== 0) {
       throw new Error(`Could not classify executable candidate ${path}: ${fileType.output}.`);
     }
-    return classifyMacSignatureCandidateFileDescription(fileType.output) === "mach-o";
+    const candidatePath = relative(appBundlePath, path).replaceAll("\\", "/");
+    return (
+      classifyMacSignatureCandidateFileDescription(fileType.output, candidatePath) === "mach-o"
+    );
   });
 }
 
