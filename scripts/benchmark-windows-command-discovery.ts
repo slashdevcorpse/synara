@@ -31,6 +31,8 @@ const SHA_PATTERN = /^[0-9a-f]{40}$/i;
 const RECEIPT_DIRECTORY_PATTERN = /^synara-goal09-benchmark-[0-9a-f]{32}$/i;
 const RECEIPT_FILENAME = "receipt.json";
 const SIMULATED_WHERE_DELAY_MS = 2;
+const NODE_ORACLE_TIMEOUT_MS = 5_000;
+const NODE_ORACLE_MAX_BUFFER_BYTES = 64 * 1024;
 
 export interface BenchmarkCliOptions {
   readonly repo: string;
@@ -176,9 +178,26 @@ export interface EditorFixturePreflight {
   readonly transportCommandHidden: true;
 }
 
-interface NodeDuplicateEnvironmentOracle {
+interface NodeRuntimeEvidence {
+  readonly name: string;
+  readonly version: string;
+  readonly execPathSha256: string;
+}
+
+export interface NodeDuplicateEnvironmentOracle {
   readonly launcherRuntime: { readonly name: "bun"; readonly version: string };
-  readonly oracleRuntime: { readonly name: "node"; readonly version: string };
+  readonly expectedRuntime: NodeRuntimeEvidence;
+  readonly parentLaunchEnvironment: {
+    readonly bunConstructedDuplicateKeyCount: number;
+    readonly serializerObservedDuplicateKeyCount: number;
+  };
+  readonly serializerRuntime: NodeRuntimeEvidence;
+  readonly serializerInputEnvironment: {
+    readonly pathKeyCount: number;
+    readonly duplicateKeyCount: number;
+  };
+  readonly observerRuntime: NodeRuntimeEvidence;
+  readonly observedKeys: readonly string[];
   readonly effectiveKey: string | null;
   readonly effectiveValueSha256: string | null;
   readonly expectedKey: "PATH";
@@ -442,7 +461,7 @@ export function evaluateBenchmarkGates(
     {
       name: "node_duplicate_environment_oracle",
       passed: structural.nodeEnvironmentOraclePassed,
-      detail: "duplicate environment selection was executed by Node, not Bun",
+      detail: "Node parent serialized duplicate keys and Node child observed PATH/upper",
     },
   ];
 }
@@ -1451,47 +1470,196 @@ function checkCandidateLru(runtime: VersionRuntime, fixture: BenchmarkFixture): 
   );
 }
 
-function runNodeDuplicateEnvironmentOracle(): NodeDuplicateEnvironmentOracle {
+function countCaseInsensitiveDuplicateKeys(keys: readonly string[]): number {
+  return keys.length - new Set(keys.map((key) => key.toUpperCase())).size;
+}
+
+function nodeRuntimeEvidence(runtime: {
+  readonly name: string;
+  readonly version: string;
+  readonly execPath: string;
+}): NodeRuntimeEvidence {
+  return {
+    name: runtime.name,
+    version: runtime.version,
+    execPathSha256: hashFixtureLabel(runtime.execPath),
+  };
+}
+
+function runtimeMatchesExpected(
+  actual: NodeRuntimeEvidence,
+  expected: NodeRuntimeEvidence,
+): boolean {
+  return (
+    actual.name === expected.name &&
+    actual.version === expected.version &&
+    actual.execPathSha256 === expected.execPathSha256
+  );
+}
+
+export function evaluateNodeDuplicateEnvironmentOracle(
+  input: Omit<NodeDuplicateEnvironmentOracle, "passed">,
+): boolean {
+  return (
+    input.launcherRuntime.name === "bun" &&
+    input.launcherRuntime.version.length > 0 &&
+    input.expectedRuntime.name === "node" &&
+    input.expectedRuntime.version.length > 0 &&
+    /^[0-9a-f]{64}$/.test(input.expectedRuntime.execPathSha256) &&
+    runtimeMatchesExpected(input.serializerRuntime, input.expectedRuntime) &&
+    runtimeMatchesExpected(input.observerRuntime, input.expectedRuntime) &&
+    input.parentLaunchEnvironment.bunConstructedDuplicateKeyCount === 0 &&
+    input.parentLaunchEnvironment.serializerObservedDuplicateKeyCount === 0 &&
+    input.serializerInputEnvironment.pathKeyCount === 2 &&
+    input.serializerInputEnvironment.duplicateKeyCount === 1 &&
+    input.observedKeys.length === 1 &&
+    input.observedKeys[0] === input.expectedKey &&
+    input.effectiveKey === input.expectedKey &&
+    input.effectiveValueSha256 === input.expectedValueSha256
+  );
+}
+
+export function runNodeDuplicateEnvironmentOracle(): NodeDuplicateEnvironmentOracle {
   const nodeDescriptor = JSON.parse(
     execFileSync(
       "node",
-      ["-p", "JSON.stringify({execPath:process.execPath,version:process.version})"],
-      {
-        encoding: "utf8",
-        windowsHide: true,
-      },
-    ),
-  ) as { readonly execPath: string; readonly version: string };
-  const cleanEnvironment = Object.fromEntries(
-    Object.entries(process.env).filter(([name]) => name.toUpperCase() !== "PATH"),
-  );
-  const upperValue = "C:\\synara-oracle-upper";
-  const mixedValue = "C:\\synara-oracle-mixed";
-  const oracleOutput = JSON.parse(
-    execFileSync(
-      nodeDescriptor.execPath,
       [
-        "-e",
-        "const keys=Object.keys(process.env).filter((key)=>key.toUpperCase()==='PATH').sort();process.stdout.write(JSON.stringify({keys,values:keys.map((key)=>process.env[key])}));",
+        "-p",
+        "JSON.stringify({name:process.release.name,execPath:process.execPath,version:process.version})",
       ],
       {
         encoding: "utf8",
-        env: { ...cleanEnvironment, Path: mixedValue, PATH: upperValue },
+        maxBuffer: NODE_ORACLE_MAX_BUFFER_BYTES,
+        timeout: NODE_ORACLE_TIMEOUT_MS,
         windowsHide: true,
       },
     ),
-  ) as { readonly keys: readonly string[]; readonly values: readonly string[] };
-  const effectiveKey = oracleOutput.keys[0] ?? null;
-  const effectiveValue = oracleOutput.values[0] ?? null;
-  return {
+  ) as { readonly name: string; readonly execPath: string; readonly version: string };
+  const parentEnvironmentKeys = new Set<string>();
+  const parentEnvironment = Object.fromEntries(
+    Object.entries(process.env).filter(([name, value]) => {
+      if (value === undefined) return false;
+      const normalizedName = name.toUpperCase();
+      if (parentEnvironmentKeys.has(normalizedName)) return false;
+      parentEnvironmentKeys.add(normalizedName);
+      return true;
+    }),
+  );
+  const bunConstructedDuplicateKeyCount = countCaseInsensitiveDuplicateKeys(
+    Object.keys(parentEnvironment),
+  );
+  const upperValue = "C:\\synara-oracle-upper";
+  const mixedValue = "C:\\synara-oracle-mixed";
+  const observerSource = `
+const keys = Object.keys(process.env)
+  .filter((key) => key.toUpperCase() === "PATH")
+  .sort();
+process.stdout.write(JSON.stringify({
+  runtime: {
+    name: process.release.name,
+    version: process.version,
+    execPath: process.execPath,
+  },
+  keys,
+  values: keys.map((key) => process.env[key]),
+}));
+`;
+  const serializerSource = `
+const { execFileSync } = require("node:child_process");
+const [upperValue, mixedValue, observerSource] = process.argv.slice(1);
+const duplicateCount = (keys) =>
+  keys.length - new Set(keys.map((key) => key.toUpperCase())).size;
+const parentKeys = Object.keys(process.env);
+const cleanEnvironment = Object.fromEntries(
+  Object.entries(process.env).filter(([name]) => name.toUpperCase() !== "PATH"),
+);
+const childEnvironment = {
+  ...cleanEnvironment,
+  Path: mixedValue,
+  PATH: upperValue,
+};
+const serializerInputPathKeys = Object.keys(childEnvironment).filter(
+  (key) => key.toUpperCase() === "PATH",
+);
+const observer = JSON.parse(
+  execFileSync(process.execPath, ["-e", observerSource], {
+    encoding: "utf8",
+    env: childEnvironment,
+    maxBuffer: ${NODE_ORACLE_MAX_BUFFER_BYTES},
+    timeout: ${NODE_ORACLE_TIMEOUT_MS},
+    windowsHide: true,
+  }),
+);
+process.stdout.write(JSON.stringify({
+  serializerRuntime: {
+    name: process.release.name,
+    version: process.version,
+    execPath: process.execPath,
+  },
+  serializerObservedDuplicateKeyCount: duplicateCount(parentKeys),
+  serializerInputEnvironment: {
+    pathKeyCount: serializerInputPathKeys.length,
+    duplicateKeyCount: duplicateCount(Object.keys(childEnvironment)),
+  },
+  observer,
+}));
+`;
+  const oracleOutput = JSON.parse(
+    execFileSync(
+      nodeDescriptor.execPath,
+      ["-e", serializerSource, upperValue, mixedValue, observerSource],
+      {
+        encoding: "utf8",
+        env: parentEnvironment,
+        maxBuffer: NODE_ORACLE_MAX_BUFFER_BYTES,
+        timeout: NODE_ORACLE_TIMEOUT_MS,
+        windowsHide: true,
+      },
+    ),
+  ) as {
+    readonly serializerRuntime: {
+      readonly name: string;
+      readonly version: string;
+      readonly execPath: string;
+    };
+    readonly serializerObservedDuplicateKeyCount: number;
+    readonly serializerInputEnvironment: {
+      readonly pathKeyCount: number;
+      readonly duplicateKeyCount: number;
+    };
+    readonly observer: {
+      readonly runtime: {
+        readonly name: string;
+        readonly version: string;
+        readonly execPath: string;
+      };
+      readonly keys: readonly string[];
+      readonly values: readonly string[];
+    };
+  };
+  const effectiveKey = oracleOutput.observer.keys[0] ?? null;
+  const effectiveValue = oracleOutput.observer.values[0] ?? null;
+  const evidence: Omit<NodeDuplicateEnvironmentOracle, "passed"> = {
     launcherRuntime: { name: "bun", version: Bun.version },
-    oracleRuntime: { name: "node", version: nodeDescriptor.version },
+    expectedRuntime: {
+      name: "node",
+      version: nodeDescriptor.version,
+      execPathSha256: hashFixtureLabel(nodeDescriptor.execPath),
+    },
+    parentLaunchEnvironment: {
+      bunConstructedDuplicateKeyCount,
+      serializerObservedDuplicateKeyCount: oracleOutput.serializerObservedDuplicateKeyCount,
+    },
+    serializerRuntime: nodeRuntimeEvidence(oracleOutput.serializerRuntime),
+    serializerInputEnvironment: oracleOutput.serializerInputEnvironment,
+    observerRuntime: nodeRuntimeEvidence(oracleOutput.observer.runtime),
+    observedKeys: oracleOutput.observer.keys,
     effectiveKey,
     effectiveValueSha256: effectiveValue === null ? null : hashFixtureLabel(effectiveValue),
     expectedKey: "PATH",
     expectedValueSha256: hashFixtureLabel(upperValue),
-    passed: effectiveKey === "PATH" && effectiveValue === upperValue,
   };
+  return { ...evidence, passed: evaluateNodeDuplicateEnvironmentOracle(evidence) };
 }
 
 async function measureNativeWhere(
@@ -1692,7 +1860,7 @@ async function runBenchmark(options: BenchmarkCliOptions): Promise<Record<string
       },
       runtimes: {
         benchmark: { name: "bun", version: Bun.version },
-        node: { name: "node", version: nodeEnvironmentOracle.oracleRuntime.version },
+        node: { name: "node", version: nodeEnvironmentOracle.expectedRuntime.version },
         packageManagerPolicy: {
           baseDeclaration: basePackageManager,
           candidateDeclaration: candidatePackageManager,

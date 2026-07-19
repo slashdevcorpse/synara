@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -18,6 +19,7 @@ import {
   createFixture,
   editorFixtureEnvironment,
   evaluateBenchmarkGates,
+  evaluateNodeDuplicateEnvironmentOracle,
   formatBenchmarkFailure,
   hashFixtureLabel,
   parseBenchmarkArgs,
@@ -27,6 +29,7 @@ import {
   runCleanupSteps,
   summarizeSamples,
   type BenchmarkSummary,
+  type NodeDuplicateEnvironmentOracle,
   type ScenarioComparison,
 } from "./benchmark-windows-command-discovery.ts";
 
@@ -439,6 +442,98 @@ describe("benchmark-windows-command-discovery", () => {
     expect(label).toMatch(/^[0-9a-f]{64}$/);
     expect(label).not.toContain("Users");
   });
+
+  it("fails the duplicate-environment oracle when either runtime boundary is not Node", () => {
+    const runtime = {
+      name: "node",
+      version: "v24.15.0",
+      execPathSha256: "a".repeat(64),
+    };
+    const evidence = {
+      launcherRuntime: { name: "bun" as const, version: "1.3.14" },
+      expectedRuntime: runtime,
+      parentLaunchEnvironment: {
+        bunConstructedDuplicateKeyCount: 0,
+        serializerObservedDuplicateKeyCount: 0,
+      },
+      serializerRuntime: runtime,
+      serializerInputEnvironment: { pathKeyCount: 2, duplicateKeyCount: 1 },
+      observerRuntime: runtime,
+      observedKeys: ["PATH"],
+      effectiveKey: "PATH",
+      effectiveValueSha256: "b".repeat(64),
+      expectedKey: "PATH" as const,
+      expectedValueSha256: "b".repeat(64),
+    };
+
+    expect(evaluateNodeDuplicateEnvironmentOracle(evidence)).toBe(true);
+    expect(
+      evaluateNodeDuplicateEnvironmentOracle({
+        ...evidence,
+        serializerRuntime: { ...runtime, name: "bun" },
+      }),
+    ).toBe(false);
+    expect(
+      evaluateNodeDuplicateEnvironmentOracle({
+        ...evidence,
+        observerRuntime: { ...runtime, version: "v24.14.0" },
+      }),
+    ).toBe(false);
+    expect(
+      evaluateNodeDuplicateEnvironmentOracle({
+        ...evidence,
+        parentLaunchEnvironment: {
+          ...evidence.parentLaunchEnvironment,
+          bunConstructedDuplicateKeyCount: 1,
+        },
+      }),
+    ).toBe(false);
+    expect(
+      evaluateNodeDuplicateEnvironmentOracle({
+        ...evidence,
+        observedKeys: ["Path"],
+        effectiveKey: "Path",
+      }),
+    ).toBe(false);
+  });
+
+  it.runIf(process.platform === "win32")(
+    "uses a Node serializer and Node observer for duplicate environment selection",
+    () => {
+      const benchmarkModuleUrl = new URL(
+        "./benchmark-windows-command-discovery.ts",
+        import.meta.url,
+      ).href;
+      const oracle = JSON.parse(
+        execFileSync(
+          "bun",
+          [
+            "-e",
+            `import(${JSON.stringify(benchmarkModuleUrl)}).then((module) => process.stdout.write(JSON.stringify(module.runNodeDuplicateEnvironmentOracle())));`,
+          ],
+          { encoding: "utf8", maxBuffer: 64 * 1024, timeout: 10_000, windowsHide: true },
+        ),
+      ) as NodeDuplicateEnvironmentOracle;
+
+      expect(oracle).toMatchObject({
+        launcherRuntime: { name: "bun" },
+        expectedRuntime: { name: "node" },
+        parentLaunchEnvironment: {
+          bunConstructedDuplicateKeyCount: 0,
+          serializerObservedDuplicateKeyCount: 0,
+        },
+        serializerRuntime: { name: "node" },
+        serializerInputEnvironment: { pathKeyCount: 2, duplicateKeyCount: 1 },
+        observerRuntime: { name: "node" },
+        observedKeys: ["PATH"],
+        effectiveKey: "PATH",
+        effectiveValueSha256: oracle.expectedValueSha256,
+        passed: true,
+      });
+      expect(oracle.serializerRuntime).toEqual(oracle.expectedRuntime);
+      expect(oracle.observerRuntime).toEqual(oracle.expectedRuntime);
+    },
+  );
 
   it("enforces latency, subprocess, invalidation, LRU, readiness, and Node-oracle gates", () => {
     const passing = evaluateBenchmarkGates(passingScenarios(), {
