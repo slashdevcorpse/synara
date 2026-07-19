@@ -98,6 +98,17 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
   );
   requireText(
     main,
+    "bun run dist:desktop:super:win --",
+    "Windows publication must use the isolated Super packaging entry point.",
+  );
+  requireText(
+    main,
+    "bun run dist:desktop:super:mac --",
+    "macOS publication must use the isolated Super packaging entry point.",
+  );
+  prohibitText(main, "--desktop-flavor", "Publication must not use the superseded flavor flag.");
+  requireText(
+    main,
     "collect-super-synara-macos-signatures.ts",
     "macOS publication must collect signature evidence.",
   );
@@ -143,6 +154,12 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
   requireText(audit, 'test "$(uname -m)" = arm64', "Audit must prove arm64 host architecture.");
   prohibitText(audit, "contents: write", "Audit must not receive write permission.");
   requireText(audit, "--mode audit", "Audit must emit unclassified inventory evidence.");
+  requireText(
+    audit,
+    "bun run dist:desktop:super:mac --",
+    "Audit must use the isolated Super packaging entry point.",
+  );
+  prohibitText(audit, "--desktop-flavor", "Audit must not use the superseded flavor flag.");
   prohibitText(audit, "--allowlist", "Audit must not classify objects with an allowlist.");
   requireText(audit, "retention-days: 1", "Audit inventory retention must be one day.");
   prohibitText(audit, "gh release", "Audit must not create or mutate releases.");

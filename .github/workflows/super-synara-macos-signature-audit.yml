@@ -95,17 +95,12 @@ jobs:
           set -euo pipefail
           test "$(uname -m)" = arm64
           lockfile_sha256="$(shasum -a 256 bun.lock | awk '{print $1}')"
-          node scripts/build-desktop-artifact.ts \
-            --platform mac \
-            --target dmg \
-            --arch arm64 \
+          bun run dist:desktop:super:mac -- \
             --build-version "$VERSION" \
             --source-commit "$SOURCE_SHA" \
             --source-tag "super-v$VERSION" \
             --lockfile-sha256 "$lockfile_sha256" \
-            --output-dir release-audit \
-            --desktop-flavor super \
-            --disable-updates
+            --output-dir release-audit
 
       - name: Collect unclassified signature inventory
         shell: bash

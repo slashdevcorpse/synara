@@ -271,17 +271,12 @@ jobs:
           SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
           LOCKFILE_SHA256: ${{ needs.preflight.outputs.lockfile_sha256 }}
         run: |
-          node scripts/build-desktop-artifact.ts \
-            --platform win \
-            --target nsis \
-            --arch x64 \
+          bun run dist:desktop:super:win -- \
             --build-version "$VERSION" \
             --source-commit "$SOURCE_COMMIT" \
             --source-tag "$TAG" \
             --lockfile-sha256 "$LOCKFILE_SHA256" \
-            --output-dir release-build \
-            --desktop-flavor super \
-            --disable-updates
+            --output-dir release-build
 
       - name: Stage exact Windows payload and provenance
         shell: bash
@@ -399,17 +394,12 @@ jobs:
         run: |
           set -euo pipefail
           test "$(uname -m)" = arm64
-          node scripts/build-desktop-artifact.ts \
-            --platform mac \
-            --target dmg \
-            --arch arm64 \
+          bun run dist:desktop:super:mac -- \
             --build-version "$VERSION" \
             --source-commit "$SOURCE_COMMIT" \
             --source-tag "$TAG" \
             --lockfile-sha256 "$LOCKFILE_SHA256" \
-            --output-dir release-build \
-            --desktop-flavor super \
-            --disable-updates
+            --output-dir release-build
 
       - name: Admit exact macOS signatures
         shell: bash
