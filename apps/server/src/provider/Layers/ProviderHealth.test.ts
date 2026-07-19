@@ -1,6 +1,10 @@
+import { realpathSync } from "node:fs";
+import * as NodePath from "node:path";
+
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import type { ServerProviderStatus } from "@synara/contracts";
 import { DEFAULT_SERVER_SETTINGS, ServerProviderUpdateError } from "@synara/contracts";
+import { buildWindowsBatchCommandArgs, resolveWindowsComSpec } from "@synara/shared/windowsProcess";
 import { describe, it, assert } from "@effect/vitest";
 import { Effect, FileSystem, Layer, Path, Sink, Stream } from "effect";
 import { TestClock } from "effect/testing";
@@ -48,6 +52,116 @@ import { resolvePackageManagedProviderMaintenance } from "../providerMaintenance
 // ── Test helpers ────────────────────────────────────────────────────
 
 const encoder = new TextEncoder();
+
+interface ProviderCommandFixture {
+  readonly commandDirectory: string;
+}
+
+function fixtureExecutablePath(fixture: ProviderCommandFixture, command: string): string {
+  return NodePath.join(
+    fixture.commandDirectory,
+    process.platform === "win32" ? `${command}.cmd` : command,
+  );
+}
+
+function preparedProviderCommandMatches(input: {
+  readonly fixture: ProviderCommandFixture;
+  readonly executable: string;
+  readonly expectedArgs: ReadonlyArray<string>;
+  readonly command: string;
+  readonly actualArgs: ReadonlyArray<string>;
+  readonly env?: NodeJS.ProcessEnv | undefined;
+  readonly options?: { readonly windowsVerbatimArguments?: boolean } | undefined;
+}): boolean {
+  if (process.platform !== "win32") {
+    return (
+      input.command === input.executable &&
+      JSON.stringify(input.actualArgs) === JSON.stringify(input.expectedArgs)
+    );
+  }
+
+  const env = input.env ?? process.env;
+  return (
+    input.command.toLowerCase() === resolveWindowsComSpec(env).toLowerCase() &&
+    input.options?.windowsVerbatimArguments === true &&
+    JSON.stringify(input.actualArgs) ===
+      JSON.stringify(
+        buildWindowsBatchCommandArgs(
+          fixtureExecutablePath(input.fixture, input.executable),
+          input.expectedArgs,
+        ),
+      )
+  );
+}
+
+function assertPreparedProviderCommand(
+  input: Parameters<typeof preparedProviderCommandMatches>[0],
+): void {
+  assert.ok(
+    preparedProviderCommandMatches(input),
+    `Unexpected prepared ${input.executable} command: ${input.command} ${input.actualArgs.join(" ")}`,
+  );
+}
+
+function withIsolatedProviderCommands<A, E, R>(
+  commands: ReadonlyArray<string>,
+  use: (fixture: ProviderCommandFixture) => Effect.Effect<A, E, R>,
+) {
+  return Effect.acquireUseRelease(
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const tempDirectory = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "provider-health-commands-",
+      });
+      const commandDirectory = path.join(tempDirectory, "bin");
+      yield* fileSystem.makeDirectory(commandDirectory, { recursive: true });
+      const canonicalCommandDirectory = realpathSync.native(commandDirectory);
+
+      for (const command of commands) {
+        const executablePath = fixtureExecutablePath(
+          { commandDirectory: canonicalCommandDirectory },
+          command,
+        );
+        yield* fileSystem.writeFileString(
+          executablePath,
+          process.platform === "win32" ? "@echo off\r\n@exit /b 0\r\n" : "#!/bin/sh\nexit 0\n",
+        );
+        if (process.platform !== "win32") {
+          yield* fileSystem.chmod(executablePath, 0o755);
+        }
+      }
+
+      const previousPath = process.env.PATH;
+      const previousPathExt = process.env.PATHEXT;
+      yield* Effect.sync(() => {
+        process.env.PATH = canonicalCommandDirectory;
+        if (process.platform === "win32") {
+          process.env.PATHEXT = ".COM;.EXE;.BAT;.CMD";
+        }
+      });
+      return {
+        fixture: { commandDirectory: canonicalCommandDirectory },
+        previousPath,
+        previousPathExt,
+      };
+    }),
+    ({ fixture }) => use(fixture),
+    ({ previousPath, previousPathExt }) =>
+      Effect.sync(() => {
+        if (previousPath === undefined) {
+          delete process.env.PATH;
+        } else {
+          process.env.PATH = previousPath;
+        }
+        if (previousPathExt === undefined) {
+          delete process.env.PATHEXT;
+        } else {
+          process.env.PATHEXT = previousPathExt;
+        }
+      }),
+  );
+}
 
 function mockHandle(result: { stdout: string; stderr: string; code: number }) {
   return ChildProcessSpawner.makeHandle({
@@ -117,7 +231,12 @@ function failingSpawnerLayer(description: string) {
 
 function hangingSpawnerLayer(input: {
   readonly onKill: () => void;
-  readonly shouldHang: (args: ReadonlyArray<string>, command: string) => boolean;
+  readonly shouldHang: (
+    args: ReadonlyArray<string>,
+    command: string,
+    env: NodeJS.ProcessEnv | undefined,
+    options: { readonly windowsVerbatimArguments?: boolean } | undefined,
+  ) => boolean;
 }) {
   const handle = ChildProcessSpawner.makeHandle({
     pid: ChildProcessSpawner.ProcessId(2),
@@ -137,8 +256,12 @@ function hangingSpawnerLayer(input: {
       const cmd = command as unknown as {
         command: string;
         args: ReadonlyArray<string>;
+        options?: {
+          env?: NodeJS.ProcessEnv;
+          windowsVerbatimArguments?: boolean;
+        };
       };
-      return input.shouldHang(cmd.args, cmd.command)
+      return input.shouldHang(cmd.args, cmd.command, cmd.options?.env, cmd.options)
         ? Effect.succeed(handle)
         : Effect.succeed(mockHandle({ stdout: "", stderr: "", code: 0 }));
     }),
@@ -294,67 +417,81 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
     });
 
     it.effect("stops a hung provider process and persists a failed update state", () =>
-      Effect.gen(function* () {
-        let killed = false;
-        const fileSystem = yield* FileSystem.FileSystem;
-        const path = yield* Path.Path;
-        const baseDir = yield* fileSystem.makeTempDirectoryScoped({
-          prefix: "provider-update-timeout-",
-        });
-        yield* writeProviderStatusCache({
-          filePath: resolveProviderStatusCachePath({
-            stateDir: path.join(baseDir, "userdata"),
-            provider: "kilo",
-          }),
-          provider: {
-            provider: "kilo",
-            status: "ready",
-            available: true,
-            authStatus: "authenticated",
-            checkedAt: "2026-07-15T12:00:00.000Z",
-            message: "Kilo CLI is installed and authenticated.",
-            version: "7.3.46",
-          },
-        });
-        const settings = {
-          ...allProvidersDisabledServerSettings,
-          providers: {
-            ...allProvidersDisabledServerSettings.providers,
-            kilo: {
-              ...DEFAULT_SERVER_SETTINGS.providers.kilo,
-              enabled: true,
-              binaryPath:
-                "/Users/test/.nvm/versions/node/v24.13.0/lib/node_modules/@kilocode/cli/bin/kilo",
-            },
-          },
-        } satisfies typeof DEFAULT_SERVER_SETTINGS;
-        const layer = makeProviderHealthLive({ providerUpdateTimeoutMs: 20 }).pipe(
-          Layer.provideMerge(ServerSettingsService.layerTest(settings)),
-          Layer.provideMerge(ServerConfig.layerTest(process.cwd(), baseDir)),
-          Layer.provideMerge(
-            hangingSpawnerLayer({
-              onKill: () => (killed = true),
-              shouldHang: (args, command) =>
-                command === "npm" &&
-                args.join(" ") ===
-                  "install -g --prefix /Users/test/.nvm/versions/node/v24.13.0 @kilocode/cli@latest",
+      withIsolatedProviderCommands(["npm"], (fixture) =>
+        Effect.gen(function* () {
+          let killed = false;
+          const fileSystem = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+            prefix: "provider-update-timeout-",
+          });
+          yield* writeProviderStatusCache({
+            filePath: resolveProviderStatusCachePath({
+              stateDir: path.join(baseDir, "userdata"),
+              provider: "kilo",
             }),
-          ),
-        );
+            provider: {
+              provider: "kilo",
+              status: "ready",
+              available: true,
+              authStatus: "authenticated",
+              checkedAt: "2026-07-15T12:00:00.000Z",
+              message: "Kilo CLI is installed and authenticated.",
+              version: "7.3.46",
+            },
+          });
+          const settings = {
+            ...allProvidersDisabledServerSettings,
+            providers: {
+              ...allProvidersDisabledServerSettings.providers,
+              kilo: {
+                ...DEFAULT_SERVER_SETTINGS.providers.kilo,
+                enabled: true,
+                binaryPath:
+                  "/Users/test/.nvm/versions/node/v24.13.0/lib/node_modules/@kilocode/cli/bin/kilo",
+              },
+            },
+          } satisfies typeof DEFAULT_SERVER_SETTINGS;
+          const layer = makeProviderHealthLive({ providerUpdateTimeoutMs: 20 }).pipe(
+            Layer.provideMerge(ServerSettingsService.layerTest(settings)),
+            Layer.provideMerge(ServerConfig.layerTest(process.cwd(), baseDir)),
+            Layer.provideMerge(
+              hangingSpawnerLayer({
+                onKill: () => (killed = true),
+                shouldHang: (args, command, env, options) =>
+                  preparedProviderCommandMatches({
+                    fixture,
+                    executable: "npm",
+                    expectedArgs: [
+                      "install",
+                      "-g",
+                      "--prefix",
+                      "/Users/test/.nvm/versions/node/v24.13.0",
+                      "@kilocode/cli@latest",
+                    ],
+                    command,
+                    actualArgs: args,
+                    env,
+                    options,
+                  }),
+              }),
+            ),
+          );
 
-        const result = yield* Effect.gen(function* () {
-          const providerHealth = yield* ProviderHealth;
-          return yield* TestClock.withLive(providerHealth.updateProvider({ provider: "kilo" }));
-        }).pipe(Effect.provide(layer));
-        const kilo = result.providers.find((provider) => provider.provider === "kilo");
+          const result = yield* Effect.gen(function* () {
+            const providerHealth = yield* ProviderHealth;
+            return yield* TestClock.withLive(providerHealth.updateProvider({ provider: "kilo" }));
+          }).pipe(Effect.provide(layer));
+          const kilo = result.providers.find((provider) => provider.provider === "kilo");
 
-        assert.strictEqual(killed, true);
-        assert.strictEqual(kilo?.updateState?.status, "failed");
-        assert.strictEqual(
-          kilo?.updateState?.message,
-          "Update timed out after 20 milliseconds. The provider process was stopped.",
-        );
-      }),
+          assert.strictEqual(killed, true);
+          assert.strictEqual(kilo?.updateState?.status, "failed");
+          assert.strictEqual(
+            kilo?.updateState?.message,
+            "Update timed out after 20 milliseconds. The provider process was stopped.",
+          );
+        }),
+      ),
     );
   });
 
@@ -1680,19 +1817,28 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
 
   describe("checkOpenCodeProviderStatus", () => {
     it.effect("returns ready when opencode is installed", () =>
-      Effect.gen(function* () {
-        const status = yield* checkOpenCodeProviderStatus;
-        assert.strictEqual(status.provider, "opencode");
-        assert.strictEqual(status.status, "ready");
-        assert.strictEqual(status.available, true);
-        assert.strictEqual(status.authStatus, "unknown");
-      }).pipe(
-        Effect.provide(
-          mockSpawnerLayer((args) => {
-            const joined = args.join(" ");
-            if (joined === "--version") return { stdout: "opencode 1.3.17\n", stderr: "", code: 0 };
-            throw new Error(`Unexpected args: ${joined}`);
-          }),
+      withIsolatedProviderCommands(["opencode"], (fixture) =>
+        Effect.gen(function* () {
+          const status = yield* checkOpenCodeProviderStatus;
+          assert.strictEqual(status.provider, "opencode");
+          assert.strictEqual(status.status, "ready");
+          assert.strictEqual(status.available, true);
+          assert.strictEqual(status.authStatus, "unknown");
+        }).pipe(
+          Effect.provide(
+            mockSpawnerLayer((args, command, env, options) => {
+              assertPreparedProviderCommand({
+                fixture,
+                executable: "opencode",
+                expectedArgs: ["--version"],
+                command,
+                actualArgs: args,
+                env,
+                options,
+              });
+              return { stdout: "opencode 1.3.17\n", stderr: "", code: 0 };
+            }),
+          ),
         ),
       ),
     );
@@ -1748,24 +1894,32 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
 
   describe("checkPiProviderStatus", () => {
     it.effect("returns ready using only the Pi CLI version probe", () =>
-      Effect.gen(function* () {
-        const status = yield* checkPiProviderStatus();
-        assert.strictEqual(status.provider, "pi");
-        assert.strictEqual(status.status, "ready");
-        assert.strictEqual(status.available, true);
-        assert.strictEqual(status.authStatus, "unknown");
-        assert.strictEqual(
-          status.message,
-          "Pi CLI is installed. Configure provider credentials inside Pi as needed.",
-        );
-      }).pipe(
-        Effect.provide(
-          mockSpawnerLayer((args, command) => {
-            assert.strictEqual(command, "pi");
-            const joined = args.join(" ");
-            if (joined === "--version") return { stdout: "pi 0.74.0\n", stderr: "", code: 0 };
-            throw new Error(`Unexpected args: ${joined}`);
-          }),
+      withIsolatedProviderCommands(["pi"], (fixture) =>
+        Effect.gen(function* () {
+          const status = yield* checkPiProviderStatus();
+          assert.strictEqual(status.provider, "pi");
+          assert.strictEqual(status.status, "ready");
+          assert.strictEqual(status.available, true);
+          assert.strictEqual(status.authStatus, "unknown");
+          assert.strictEqual(
+            status.message,
+            "Pi CLI is installed. Configure provider credentials inside Pi as needed.",
+          );
+        }).pipe(
+          Effect.provide(
+            mockSpawnerLayer((args, command, env, options) => {
+              assertPreparedProviderCommand({
+                fixture,
+                executable: "pi",
+                expectedArgs: ["--version"],
+                command,
+                actualArgs: args,
+                env,
+                options,
+              });
+              return { stdout: "pi 0.74.0\n", stderr: "", code: 0 };
+            }),
+          ),
         ),
       ),
     );
@@ -1830,30 +1984,46 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
     );
 
     it.effect("returns ready when Antigravity lists authenticated models", () =>
-      Effect.gen(function* () {
-        const status = yield* checkAntigravityProviderStatus();
-        assert.strictEqual(status.provider, "antigravity");
-        assert.strictEqual(status.status, "ready");
-        assert.strictEqual(status.available, true);
-        assert.strictEqual(status.authStatus, "authenticated");
-        assert.strictEqual(status.version, "1.1.2");
-      }).pipe(
-        Effect.provide(
-          mockSpawnerLayer((args, command) => {
-            assert.strictEqual(command, "agy");
-            const joined = args.join(" ");
-            if (joined === "--version") {
-              return { stdout: "Antigravity CLI 1.1.2\n", stderr: "", code: 0 };
-            }
-            if (joined === "models") {
+      withIsolatedProviderCommands(["agy"], (fixture) =>
+        Effect.gen(function* () {
+          const status = yield* checkAntigravityProviderStatus();
+          assert.strictEqual(status.provider, "antigravity");
+          assert.strictEqual(status.status, "ready");
+          assert.strictEqual(status.available, true);
+          assert.strictEqual(status.authStatus, "authenticated");
+          assert.strictEqual(status.version, "1.1.2");
+        }).pipe(
+          Effect.provide(
+            mockSpawnerLayer((args, command, env, options) => {
+              if (
+                preparedProviderCommandMatches({
+                  fixture,
+                  executable: "agy",
+                  expectedArgs: ["--version"],
+                  command,
+                  actualArgs: args,
+                  env,
+                  options,
+                })
+              ) {
+                return { stdout: "Antigravity CLI 1.1.2\n", stderr: "", code: 0 };
+              }
+              assertPreparedProviderCommand({
+                fixture,
+                executable: "agy",
+                expectedArgs: ["models"],
+                command,
+                actualArgs: args,
+                env,
+                options,
+              });
               return {
                 stdout: "Gemini 3.5 Flash (Medium)\nClaude Sonnet 4.6 (Thinking)\n",
                 stderr: "",
                 code: 0,
               };
-            }
-            throw new Error(`Unexpected args: ${joined}`);
-          }),
+            }),
+          ),
         ),
       ),
     );
