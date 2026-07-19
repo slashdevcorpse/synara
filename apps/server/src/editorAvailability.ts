@@ -206,9 +206,13 @@ export const makeEditorAvailability = (
             const currentRequest = captureRequest();
             const pendingRefresh = pending;
             pending = null;
-            if (currentRequest.identity !== entry.identity) {
+            if (pendingRefresh !== null || currentRequest.identity !== entry.identity) {
+              const continuationRequest =
+                pendingRefresh?.request.identity === currentRequest.identity
+                  ? pendingRefresh.request
+                  : currentRequest;
               const retryBlocked =
-                state.lastAttemptIdentity === currentRequest.identity &&
+                state.lastAttemptIdentity === continuationRequest.identity &&
                 state.retryAt !== null &&
                 state.retryAt > now();
               if (retryBlocked) {
@@ -228,7 +232,7 @@ export const makeEditorAvailability = (
               const continuation =
                 pendingRefresh?.completed ??
                 (yield* Deferred.make<EditorAvailabilitySnapshot>());
-              yield* startRefreshLocked(currentRequest, continuation, [
+              yield* startRefreshLocked(continuationRequest, continuation, [
                 entry.completed,
                 ...entry.waiters,
               ]);
@@ -248,11 +252,7 @@ export const makeEditorAvailability = (
               return {
                 snapshot: toSnapshot(state),
                 publish: true,
-                complete: [
-                  entry.completed,
-                  ...entry.waiters,
-                  ...(pendingRefresh ? [pendingRefresh.completed] : []),
-                ],
+                complete: [entry.completed, ...entry.waiters],
               } satisfies SettledRefresh;
             }
 
@@ -262,11 +262,7 @@ export const makeEditorAvailability = (
             return {
               snapshot: toSnapshot(state),
               publish: false,
-              complete: [
-                entry.completed,
-                ...entry.waiters,
-                ...(pendingRefresh ? [pendingRefresh.completed] : []),
-              ],
+              complete: [entry.completed, ...entry.waiters],
             } satisfies SettledRefresh;
           }),
         );
@@ -288,27 +284,24 @@ export const makeEditorAvailability = (
           const requestedIdentity = request.identity;
           const requestedAt = now();
           if (inFlight !== null) {
+            if (pending !== null) {
+              pending.request = request;
+              return {
+                snapshot: toSnapshot(state),
+                completed: pending.completed,
+              };
+            }
             if (inFlight.identity === requestedIdentity) {
-              if (pending !== null) {
-                inFlight.waiters.push(pending.completed);
-                pending = null;
-              }
               return {
                 snapshot: toSnapshot(state),
                 completed: inFlight.completed,
               };
             }
-            if (pending === null) {
-              pending = {
-                request,
-                completed: yield* Deferred.make<EditorAvailabilitySnapshot>(),
-              };
-            } else {
-              pending.request = request;
-            }
+            const completed = yield* Deferred.make<EditorAvailabilitySnapshot>();
+            pending = { request, completed };
             return {
               snapshot: toSnapshot(state),
-              completed: pending.completed,
+              completed,
             };
           }
 

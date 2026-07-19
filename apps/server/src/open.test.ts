@@ -1,4 +1,4 @@
-import { EventEmitter } from "node:events";
+import { EventEmitter, getEventListeners } from "node:events";
 import { PassThrough } from "node:stream";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -25,6 +25,8 @@ import {
   resolveWindowsStorePackageDirectoryFromPowerShell,
   resolveWindowsStorePackageInstallLocation,
   WINDOWS_STORE_BULK_LOOKUP_OUTPUT_LIMIT_BYTES,
+  WINDOWS_STORE_BULK_LOOKUP_TERMINATION_GRACE_MS,
+  WINDOWS_STORE_BULK_LOOKUP_TIMEOUT_MS,
 } from "./editorAppDiscovery";
 
 function encodeExpectedWindowsEditorUriPath(targetPath: string): string {
@@ -734,6 +736,52 @@ it.layer(NodeServices.layer)("discoverAvailableEditors", (it) => {
     );
   });
 
+  it("versions Windows editor identity by the Node-effective PSModulePath", () => {
+    const windowsIdentity = (
+      psModulePath: string,
+      shadowPsModulePath: string,
+      reverseInsertion: boolean,
+    ) =>
+      resolveEditorDiscoveryIdentity({
+        platform: "win32",
+        cwd: "C:\\workspace",
+        env: reverseInsertion
+          ? {
+              PATH: "C:\\bin",
+              PATHEXT: ".EXE",
+              PSModulePath: psModulePath,
+              psmodulepath: shadowPsModulePath,
+            }
+          : {
+              PATH: "C:\\bin",
+              PATHEXT: ".EXE",
+              psmodulepath: shadowPsModulePath,
+              PSModulePath: psModulePath,
+            },
+      });
+    const modulesA = windowsIdentity("C:\\modules-a", "C:\\shadow-a", false);
+    const modulesB = windowsIdentity("C:\\modules-b", "C:\\shadow-b", true);
+
+    assert.notEqual(modulesA, modulesB);
+    assert.notEqual(modulesB, modulesA);
+    assert.equal(
+      modulesA,
+      windowsIdentity("C:\\modules-a", "C:\\different-shadow", true),
+    );
+    assert.equal(
+      resolveEditorDiscoveryIdentity({
+        platform: "linux",
+        cwd: "/workspace",
+        env: { PATH: "/bin", PSModulePath: "/modules-a" },
+      }),
+      resolveEditorDiscoveryIdentity({
+        platform: "linux",
+        cwd: "/workspace",
+        env: { PATH: "/bin", PSModulePath: "/modules-b" },
+      }),
+    );
+  });
+
   it.effect("discovers command editors asynchronously with mixed-case Windows environment keys", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
@@ -1004,6 +1052,140 @@ it("reports timeout after a successful kill/close race and clears the deadline",
     assert.equal(vi.getTimerCount(), 0);
     assert.equal(child.listenerCount("close"), 0);
     assert.equal(child.stdout.listenerCount("data"), 0);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("bounds true/no-close AppX termination and removes every owned listener", async () => {
+  vi.useFakeTimers();
+  try {
+    const scenarios = [
+      {
+        category: "cancelled" as const,
+        begin: async (child: FakeAppxChild, abortController: AbortController) => {
+          abortController.abort();
+        },
+      },
+      {
+        category: "output_limit" as const,
+        begin: async (child: FakeAppxChild) => {
+          child.stderr.write(Buffer.alloc(WINDOWS_STORE_BULK_LOOKUP_OUTPUT_LIMIT_BYTES + 1));
+        },
+      },
+      {
+        category: "timeout" as const,
+        begin: async () => {
+          await vi.advanceTimersByTimeAsync(WINDOWS_STORE_BULK_LOOKUP_TIMEOUT_MS);
+        },
+      },
+    ];
+
+    for (const scenario of scenarios) {
+      const abortController = new AbortController();
+      const child = makeFakeAppxChild();
+      const externalErrorListener = () => undefined;
+      let kills = 0;
+      child.on("error", externalErrorListener);
+      child.kill = () => {
+        kills += 1;
+        return true;
+      };
+      let resolved = false;
+      const lookup = discoverWindowsStorePackageInstallLocations(vscodeStorePackages(), {
+        platform: "win32",
+        env: { SystemRoot: "C:\\Windows" },
+        signal: abortController.signal,
+        spawnProcess: () => child as never,
+      }).then((result) => {
+        resolved = true;
+        return result;
+      });
+
+      await scenario.begin(child, abortController);
+      await vi.advanceTimersByTimeAsync(WINDOWS_STORE_BULK_LOOKUP_TERMINATION_GRACE_MS - 1);
+      assert.equal(resolved, false);
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(lookup).resolves.toEqual({
+        status: "failure",
+        category: scenario.category,
+        subprocessCount: 1,
+      });
+
+      assert.equal(kills, 1);
+      assert.equal(vi.getTimerCount(), 0);
+      assert.deepEqual(child.listeners("error"), [externalErrorListener]);
+      assert.equal(child.listenerCount("close"), 0);
+      assert.equal(child.stdout.listenerCount("data"), 0);
+      assert.equal(child.stderr.listenerCount("data"), 0);
+      assert.equal(getEventListeners(abortController.signal, "abort").length, 0);
+
+      child.emit("close", 0);
+      child.emit("error", new Error("late child error"));
+      child.stdout.write("late output");
+      abortController.abort();
+      assert.equal(kills, 1);
+      child.removeListener("error", externalErrorListener);
+    }
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("preserves the latched AppX termination category through synchronous child errors", async () => {
+  vi.useFakeTimers();
+  try {
+    const scenarios = [
+      {
+        category: "cancelled" as const,
+        begin: async (child: FakeAppxChild, abortController: AbortController) => {
+          abortController.abort();
+        },
+      },
+      {
+        category: "output_limit" as const,
+        begin: async (child: FakeAppxChild) => {
+          child.stdout.write(Buffer.alloc(WINDOWS_STORE_BULK_LOOKUP_OUTPUT_LIMIT_BYTES + 1));
+        },
+      },
+      {
+        category: "timeout" as const,
+        begin: async () => {
+          await vi.advanceTimersByTimeAsync(WINDOWS_STORE_BULK_LOOKUP_TIMEOUT_MS);
+        },
+      },
+    ];
+
+    for (const scenario of scenarios) {
+      const abortController = new AbortController();
+      const child = makeFakeAppxChild();
+      let kills = 0;
+      child.kill = () => {
+        kills += 1;
+        child.emit("error", new Error("kill race"));
+        return true;
+      };
+      const lookup = discoverWindowsStorePackageInstallLocations(vscodeStorePackages(), {
+        platform: "win32",
+        env: { SystemRoot: "C:\\Windows" },
+        signal: abortController.signal,
+        spawnProcess: () => child as never,
+      });
+
+      await scenario.begin(child, abortController);
+      await expect(lookup).resolves.toEqual({
+        status: "failure",
+        category: scenario.category,
+        subprocessCount: 1,
+      });
+      assert.equal(kills, 1);
+      assert.equal(vi.getTimerCount(), 0);
+      assert.equal(child.listenerCount("error"), 0);
+      assert.equal(child.listenerCount("close"), 0);
+      assert.equal(child.stdout.listenerCount("data"), 0);
+      assert.equal(child.stderr.listenerCount("data"), 0);
+      assert.equal(getEventListeners(abortController.signal, "abort").length, 0);
+    }
   } finally {
     vi.useRealTimers();
   }

@@ -531,11 +531,12 @@ export function resolveEditorDiscoveryIdentity(
   const cwd = options.cwd ?? process.cwd();
   const read = (name: string) => resolveEffectiveEnvironmentValue(env, name, platform) ?? null;
   const source = JSON.stringify({
-    version: 1,
+    version: 2,
     platform,
     cwd: normalizeEditorDiscoveryCwd(cwd, platform),
     path: read("PATH"),
     pathExt: platform === "win32" ? read("PATHEXT") : null,
+    psModulePath: platform === "win32" ? read("PSModulePath") : null,
     home: read("HOME"),
     programFiles: platform === "win32" ? read("ProgramFiles") : null,
     programW6432: platform === "win32" ? read("ProgramW6432") : null,

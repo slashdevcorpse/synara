@@ -49,6 +49,7 @@ const powershellAppxLookupCache = new Map<string, CachedPowerShellAppxLookup>();
 
 export const WINDOWS_STORE_BULK_LOOKUP_TIMEOUT_MS = 2_000;
 export const WINDOWS_STORE_BULK_LOOKUP_OUTPUT_LIMIT_BYTES = 256 * 1024;
+export const WINDOWS_STORE_BULK_LOOKUP_TERMINATION_GRACE_MS = 100;
 
 export type WindowsStoreBulkLookupFailureCategory =
   | "cancelled"
@@ -407,10 +408,19 @@ export async function discoverWindowsStorePackageInstallLocations(
     const stdoutChunks: Buffer[] = [];
     let combinedOutputBytes = 0;
     let terminationCategory: WindowsStoreBulkLookupFailureCategory | null = null;
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    let postKillFallback: ReturnType<typeof setTimeout> | undefined;
     let settled = false;
 
     const cleanup = () => {
-      clearTimeout(timeout);
+      if (deadline !== undefined) {
+        clearTimeout(deadline);
+        deadline = undefined;
+      }
+      if (postKillFallback !== undefined) {
+        clearTimeout(postKillFallback);
+        postKillFallback = undefined;
+      }
       options.signal?.removeEventListener("abort", handleAbort);
       child.stdout.removeListener("data", handleStdout);
       child.stderr.removeListener("data", handleStderr);
@@ -426,13 +436,25 @@ export async function discoverWindowsStorePackageInstallLocations(
     const requestTermination = (category: WindowsStoreBulkLookupFailureCategory) => {
       if (terminationCategory !== null || settled) return;
       terminationCategory = category;
+      if (deadline !== undefined) {
+        clearTimeout(deadline);
+        deadline = undefined;
+      }
       try {
         if (!child.kill()) {
           finish({ status: "failure", category, subprocessCount: 1 });
+          return;
         }
       } catch {
         finish({ status: "failure", category, subprocessCount: 1 });
+        return;
       }
+      if (settled) return;
+      postKillFallback = setTimeout(
+        () => finish({ status: "failure", category, subprocessCount: 1 }),
+        WINDOWS_STORE_BULK_LOOKUP_TERMINATION_GRACE_MS,
+      );
+      postKillFallback.unref();
     };
     const recordOutput = (chunk: Buffer | string, retain: boolean) => {
       const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
@@ -447,7 +469,11 @@ export async function discoverWindowsStorePackageInstallLocations(
     const handleStderr = (chunk: Buffer | string) => recordOutput(chunk, false);
     const handleAbort = () => requestTermination("cancelled");
     const handleError = () =>
-      finish({ status: "failure", category: "process_error", subprocessCount: 1 });
+      finish({
+        status: "failure",
+        category: terminationCategory ?? "process_error",
+        subprocessCount: 1,
+      });
     const handleClose = (code: number | null) => {
       if (terminationCategory !== null) {
         finish({ status: "failure", category: terminationCategory, subprocessCount: 1 });
@@ -477,11 +503,11 @@ export async function discoverWindowsStorePackageInstallLocations(
             },
       );
     };
-    const timeout = setTimeout(
+    deadline = setTimeout(
       () => requestTermination("timeout"),
       WINDOWS_STORE_BULK_LOOKUP_TIMEOUT_MS,
     );
-    timeout.unref();
+    deadline.unref();
 
     child.stdout.on("data", handleStdout);
     child.stderr.on("data", handleStderr);

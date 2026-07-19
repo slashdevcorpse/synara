@@ -93,6 +93,114 @@ describe("EditorAvailability", () => {
     );
   });
 
+  it("keeps the A-to-B-to-A handoff behind a new sequential A refresh", async () => {
+    let currentIdentity = "identity-a";
+    const calls: string[] = [];
+    const completions: Array<(result: EditorDiscoveryResult) => void> = [];
+
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const availability = yield* makeEditorAvailability({
+            discover: (_signal, identity) =>
+              new Promise<EditorDiscoveryResult>((resolve) => {
+                calls.push(identity);
+                completions.push(resolve);
+              }),
+            identity: () => currentIdentity,
+          });
+          yield* availability.getSnapshotAndSchedule;
+          yield* Effect.yieldNow;
+
+          currentIdentity = "identity-b";
+          const bWaiter = yield* availability.refresh.pipe(Effect.forkScoped);
+          yield* Effect.yieldNow;
+          currentIdentity = "identity-a";
+          const secondAWaiter = yield* availability.refresh.pipe(Effect.forkScoped);
+          yield* Effect.yieldNow;
+          expect(calls).toEqual(["identity-a"]);
+
+          completions[0]?.(success(["cursor"]));
+          yield* Effect.yieldNow;
+          yield* Effect.yieldNow;
+          expect(calls).toEqual(["identity-a", "identity-a"]);
+          expect(bWaiter.pollUnsafe()).toBeUndefined();
+          expect(secondAWaiter.pollUnsafe()).toBeUndefined();
+
+          completions[1]?.(success(["vscode"]));
+          const bResult = yield* Fiber.join(bWaiter);
+          const secondAResult = yield* Fiber.join(secondAWaiter);
+          expect(bResult.availableEditors).toEqual(["vscode"]);
+          expect(secondAResult.availableEditors).toEqual(["vscode"]);
+          expect(bResult.revision).toBe(1);
+          expect(secondAResult.revision).toBe(1);
+        }),
+      ),
+    );
+  });
+
+  it("keeps repeated identity flips behind successive sequential handoff barriers", async () => {
+    let currentIdentity = "identity-a";
+    const calls: string[] = [];
+    const completions: Array<(result: EditorDiscoveryResult) => void> = [];
+
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const availability = yield* makeEditorAvailability({
+            discover: (_signal, identity) =>
+              new Promise<EditorDiscoveryResult>((resolve) => {
+                calls.push(identity);
+                completions.push(resolve);
+              }),
+            identity: () => currentIdentity,
+          });
+          yield* availability.getSnapshotAndSchedule;
+          yield* Effect.yieldNow;
+
+          currentIdentity = "identity-b";
+          const bWaiter = yield* availability.refresh.pipe(Effect.forkScoped);
+          yield* Effect.yieldNow;
+          currentIdentity = "identity-a";
+          const secondAWaiter = yield* availability.refresh.pipe(Effect.forkScoped);
+
+          completions[0]?.(success(["cursor"]));
+          yield* Effect.yieldNow;
+          yield* Effect.yieldNow;
+          expect(calls).toEqual(["identity-a", "identity-a"]);
+
+          currentIdentity = "identity-c";
+          const cWaiter = yield* availability.refresh.pipe(Effect.forkScoped);
+          yield* Effect.yieldNow;
+          currentIdentity = "identity-a";
+          const thirdAWaiter = yield* availability.refresh.pipe(Effect.forkScoped);
+
+          completions[1]?.(success(["zed"]));
+          yield* Effect.yieldNow;
+          yield* Effect.yieldNow;
+          expect(calls).toEqual(["identity-a", "identity-a", "identity-a"]);
+          expect(bWaiter.pollUnsafe()).toBeUndefined();
+          expect(secondAWaiter.pollUnsafe()).toBeUndefined();
+          expect(cWaiter.pollUnsafe()).toBeUndefined();
+          expect(thirdAWaiter.pollUnsafe()).toBeUndefined();
+
+          completions[2]?.(success(["vscode"]));
+          const results = yield* Effect.forEach(
+            [bWaiter, secondAWaiter, cWaiter, thirdAWaiter],
+            Fiber.join,
+          );
+          expect(results.map((result) => result.availableEditors)).toEqual([
+            ["vscode"],
+            ["vscode"],
+            ["vscode"],
+            ["vscode"],
+          ]);
+          expect(results.map((result) => result.revision)).toEqual([1, 1, 1, 1]);
+        }),
+      ),
+    );
+  });
+
   it("coalesces repeated mid-flight identity changes to one latest sequential refresh", async () => {
     let currentIdentity = "identity-a";
     const calls: string[] = [];
@@ -171,6 +279,56 @@ describe("EditorAvailability", () => {
     }
   });
 
+  it("refreshes an in-flight PSModulePath change in either order", async () => {
+    const identities = [
+      resolveEditorDiscoveryIdentity({
+        platform: "win32",
+        cwd: "C:\\workspace",
+        env: { PATH: "C:\\bin", PATHEXT: ".EXE", PSModulePath: "C:\\modules-a" },
+      }),
+      resolveEditorDiscoveryIdentity({
+        platform: "win32",
+        cwd: "C:\\workspace",
+        env: { PATH: "C:\\bin", PATHEXT: ".EXE", PSModulePath: "C:\\modules-b" },
+      }),
+    ] as const;
+
+    for (const order of [identities, [identities[1], identities[0]] as const]) {
+      let currentIdentity = order[0];
+      const calls: string[] = [];
+      const completions: Array<(result: EditorDiscoveryResult) => void> = [];
+      await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const availability = yield* makeEditorAvailability({
+              discover: (_signal, identity) =>
+                new Promise<EditorDiscoveryResult>((resolve) => {
+                  calls.push(identity);
+                  completions.push(resolve);
+                }),
+              identity: () => currentIdentity,
+            });
+            yield* availability.getSnapshotAndSchedule;
+            yield* Effect.yieldNow;
+            currentIdentity = order[1];
+            const changedRefresh = yield* availability.refresh.pipe(Effect.forkScoped);
+
+            completions[0]?.(success(["cursor"]));
+            yield* Effect.yieldNow;
+            yield* Effect.yieldNow;
+            expect(calls).toEqual(order);
+            expect(changedRefresh.pollUnsafe()).toBeUndefined();
+
+            completions[1]?.(success(["vscode"]));
+            const confirmed = yield* Fiber.join(changedRefresh);
+            expect(confirmed.availableEditors).toEqual(["vscode"]);
+            expect(confirmed.revision).toBe(1);
+          }),
+        ),
+      );
+    }
+  });
+
   it("retains the last confirmed snapshot on failure and enforces the retry floor", async () => {
     let clock = 10_000;
     let calls = 0;
@@ -214,6 +372,54 @@ describe("EditorAvailability", () => {
           expect(confirmedEmpty.availableEditors).toEqual([]);
           expect(confirmedEmpty.revision).toBe(2);
           expect(calls).toBe(3);
+        }),
+      ),
+    );
+  });
+
+  it("preserves a retry-blocked identity across a cross-identity handoff", async () => {
+    let currentIdentity = "identity-a";
+    let clock = 10_000;
+    const calls: string[] = [];
+    let completeB!: (result: EditorDiscoveryResult) => void;
+
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const availability = yield* makeEditorAvailability({
+            discover: (_signal, identity) => {
+              calls.push(identity);
+              if (calls.length === 1) {
+                return Promise.resolve<EditorDiscoveryResult>({
+                  status: "failure",
+                  category: "filesystem_transient",
+                  fileSystemOperations: 1,
+                  subprocessCount: 0,
+                });
+              }
+              return new Promise<EditorDiscoveryResult>((resolve) => {
+                completeB = resolve;
+              });
+            },
+            identity: () => currentIdentity,
+            now: () => clock,
+          });
+          const failedA = yield* availability.refresh;
+          expect(failedA.status).toBe("failed");
+
+          currentIdentity = "identity-b";
+          yield* availability.getSnapshotAndSchedule;
+          yield* Effect.yieldNow;
+          currentIdentity = "identity-a";
+          const retryBlockedA = yield* availability.refresh.pipe(Effect.forkScoped);
+          completeB(success(["cursor"]));
+
+          const result = yield* Fiber.join(retryBlockedA);
+          expect(result.status).toBe("failed");
+          expect(result.failureCategory).toBe("filesystem_transient");
+          expect(result.revision).toBe(0);
+          expect(calls).toEqual(["identity-a", "identity-b"]);
+          clock += 2_000;
         }),
       ),
     );
@@ -265,13 +471,16 @@ describe("EditorAvailability", () => {
   it("aborts and awaits an in-flight discovery when its scope closes", async () => {
     let started = false;
     let aborted = false;
+    let currentIdentity = "identity-a";
+    const calls: string[] = [];
 
     await Effect.runPromise(
       Effect.scoped(
         Effect.gen(function* () {
           const availability = yield* makeEditorAvailability({
-            discover: (signal) =>
+            discover: (signal, identity) =>
               new Promise<EditorDiscoveryResult>((_resolve, reject) => {
+                calls.push(identity);
                 started = true;
                 signal.addEventListener(
                   "abort",
@@ -282,15 +491,20 @@ describe("EditorAvailability", () => {
                   { once: true },
                 );
               }),
-            identity: () => "identity-1",
+            identity: () => currentIdentity,
           });
           yield* availability.getSnapshotAndSchedule;
           yield* Effect.yieldNow;
           expect(started).toBe(true);
+          currentIdentity = "identity-b";
+          yield* availability.refresh.pipe(Effect.forkScoped);
+          yield* Effect.yieldNow;
+          expect(calls).toEqual(["identity-a"]);
         }),
       ),
     );
 
     expect(aborted).toBe(true);
+    expect(calls).toEqual(["identity-a"]);
   });
 });
