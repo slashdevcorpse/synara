@@ -27,6 +27,7 @@ import {
   resolveDesktopFinalArtifactCopies,
   resolveDesktopPlatformBuildVersion,
   resolveDesktopSourceTag,
+  shouldFinalizeMacUpdateZip,
 } from "./lib/desktop-artifact-policy.ts";
 import { synaraDesktopIdentity, type SynaraDesktopFlavor } from "@synara/shared/desktopIdentity";
 import { parseBooleanEnvValue } from "./lib/env-bool.ts";
@@ -1141,7 +1142,7 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
     });
   }
 
-  if (options.platform === "mac") {
+  if (shouldFinalizeMacUpdateZip(options)) {
     yield* Effect.log("[desktop-artifact] Repacking and validating macOS update zip...");
     const finalizedZip = yield* Effect.tryPromise({
       try: () =>

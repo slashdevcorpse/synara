@@ -17,6 +17,7 @@ import {
   resolveDesktopSourceTag,
   resolveDesktopStageInstallArgs,
   resolveSuperDesktopStageInstallEnvironment,
+  shouldFinalizeMacUpdateZip,
 } from "./desktop-artifact-policy.ts";
 
 const temporaryRoots: string[] = [];
@@ -236,6 +237,13 @@ describe("desktop artifact policy", () => {
       repo: "explicit",
       releaseType: "release",
     });
+  });
+
+  it("finalizes only update-enabled macOS update zips", () => {
+    expect(shouldFinalizeMacUpdateZip({ platform: "mac", disableUpdates: false })).toBe(true);
+    expect(shouldFinalizeMacUpdateZip({ platform: "mac", disableUpdates: true })).toBe(false);
+    expect(shouldFinalizeMacUpdateZip({ platform: "linux", disableUpdates: false })).toBe(false);
+    expect(shouldFinalizeMacUpdateZip({ platform: "win", disableUpdates: false })).toBe(false);
   });
 
   it("identifies updater metadata that may never leave a disabled build", () => {
