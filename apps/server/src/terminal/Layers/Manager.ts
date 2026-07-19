@@ -74,6 +74,12 @@ import {
   type ProcessTreeKiller,
   type TerminalKillSignal,
 } from "../processTreeKiller";
+import {
+  captureWindowsProcessSnapshot,
+  type WindowsProcessChildrenMap,
+  type WindowsProcessSnapshotCollector,
+  type WindowsProcessSnapshotResult,
+} from "../windowsProcessSnapshot";
 
 const DEFAULT_HISTORY_LINE_LIMIT = 5_000;
 const DEFAULT_PERSIST_DEBOUNCE_MS = 250;
@@ -429,7 +435,25 @@ function isShellLikeProcessName(command: string): boolean {
  */
 export function inspectSubprocessActivity(
   parentPid: number,
-  childrenByParentPid: ProcessChildrenMap,
+  childrenByParentPid: ReadonlyMap<
+    number,
+    readonly { readonly pid: number; readonly command: string }[]
+  >,
+): TerminalSubprocessActivity {
+  return inspectSubprocessActivityFromSnapshot(
+    parentPid,
+    childrenByParentPid,
+    new Set([parentPid]),
+  );
+}
+
+function inspectSubprocessActivityFromSnapshot(
+  parentPid: number,
+  childrenByParentPid: ReadonlyMap<
+    number,
+    readonly { readonly pid: number; readonly command: string }[]
+  >,
+  visitedPids: Set<number>,
 ): TerminalSubprocessActivity {
   const children = childrenByParentPid.get(parentPid) ?? [];
   let cliKind: TerminalCliKind | null = null;
@@ -437,7 +461,26 @@ export function inspectSubprocessActivity(
   let hasProviderDescendant = false;
   let hasRunningSubprocess = false;
   for (const child of children) {
-    const nestedActivity = inspectSubprocessActivity(child.pid, childrenByParentPid);
+    let nestedActivity: TerminalSubprocessActivity;
+    if (visitedPids.has(child.pid)) {
+      nestedActivity = emptySubprocessActivity();
+    } else if (visitedPids.size >= POSIX_SUBPROCESS_TREE_WALK_MAX_VISITED) {
+      // A malformed or unexpectedly deep snapshot must not recurse forever or
+      // turn an uninspected process tree into a false idle result.
+      nestedActivity = {
+        cliKind: null,
+        hasNonProviderSubprocess: true,
+        hasProviderDescendant: false,
+        hasRunningSubprocess: true,
+      };
+    } else {
+      visitedPids.add(child.pid);
+      nestedActivity = inspectSubprocessActivityFromSnapshot(
+        child.pid,
+        childrenByParentPid,
+        visitedPids,
+      );
+    }
     const childCliKind = deriveTerminalProcessIdentity(child.command)?.cliKind ?? null;
     if (childCliKind || nestedActivity.hasProviderDescendant) {
       hasProviderDescendant = true;
@@ -1007,6 +1050,8 @@ interface TerminalManagerOptions {
   ptyAdapter: PtyAdapterShape;
   shellResolver?: () => string;
   subprocessChecker?: TerminalSubprocessChecker;
+  subprocessPlatform?: NodeJS.Platform;
+  windowsProcessSnapshotCollector?: WindowsProcessSnapshotCollector;
   processTreeKiller?: ProcessTreeKiller;
   subprocessPollIntervalMs?: number;
   processKillGraceMs?: number;
@@ -1047,11 +1092,14 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
   private readonly subprocessChecker: TerminalSubprocessChecker;
   private readonly processTreeKiller: ProcessTreeKiller;
   private readonly useDefaultSubprocessChecker: boolean;
+  private readonly subprocessPlatform: NodeJS.Platform;
+  private readonly windowsProcessSnapshotCollector: WindowsProcessSnapshotCollector;
   private readonly subprocessPollIntervalMs: number;
   private readonly processKillGraceMs: number;
   private readonly maxRetainedInactiveSessions: number;
   private subprocessPollTimer: ReturnType<typeof setTimeout> | null = null;
   private subprocessPollInFlight = false;
+  private subprocessPollAbortController: AbortController | null = null;
   /** Delay of the currently scheduled poll, so activity can pull it forward. */
   private currentSubprocessPollDelayMs = 0;
   private readonly killEscalationTimers = new Map<PtyProcess, KillEscalationHandle>();
@@ -1076,6 +1124,9 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
     // Only the built-in checker can share a single process snapshot across the
     // poll cycle; injected checkers (tests) keep the per-pid path.
     this.useDefaultSubprocessChecker = options.subprocessChecker === undefined;
+    this.subprocessPlatform = options.subprocessPlatform ?? process.platform;
+    this.windowsProcessSnapshotCollector =
+      options.windowsProcessSnapshotCollector ?? captureWindowsProcessSnapshot;
     this.subprocessPollIntervalMs =
       options.subprocessPollIntervalMs ?? DEFAULT_SUBPROCESS_POLL_INTERVAL_MS;
     this.processKillGraceMs = options.processKillGraceMs ?? DEFAULT_PROCESS_KILL_GRACE_MS;
@@ -2382,9 +2433,11 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
 
   private stopSubprocessPolling(): void {
     this.currentSubprocessPollDelayMs = 0;
-    if (!this.subprocessPollTimer) return;
-    clearTimeout(this.subprocessPollTimer);
-    this.subprocessPollTimer = null;
+    if (this.subprocessPollTimer) {
+      clearTimeout(this.subprocessPollTimer);
+      this.subprocessPollTimer = null;
+    }
+    this.subprocessPollAbortController?.abort();
   }
 
   private async pollSubprocessActivity(): Promise<void> {
@@ -2400,14 +2453,34 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
     }
 
     this.subprocessPollInFlight = true;
-    // Capture the whole process tree once per cycle (built-in POSIX checker
-    // only); every running terminal is then inspected against this shared
-    // snapshot instead of each spawning its own full-system `ps`.
-    const sharedChildrenMap =
-      this.useDefaultSubprocessChecker && process.platform !== "win32"
-        ? await captureProcessChildrenMap()
-        : null;
+    let cycleAbortController: AbortController | null = null;
     try {
+      let sharedChildrenMap: ProcessChildrenMap | WindowsProcessChildrenMap | null = null;
+      let windowsSnapshotResult: WindowsProcessSnapshotResult | null = null;
+      if (this.useDefaultSubprocessChecker && this.subprocessPlatform === "win32") {
+        cycleAbortController = new AbortController();
+        this.subprocessPollAbortController = cycleAbortController;
+        try {
+          windowsSnapshotResult = await this.windowsProcessSnapshotCollector(
+            cycleAbortController.signal,
+          );
+        } catch {
+          windowsSnapshotResult = { kind: "unknown", reason: "capture_failed" };
+        }
+
+        if (windowsSnapshotResult.kind === "unknown") {
+          this.logger.warn("failed to capture Windows terminal process snapshot", {
+            reason: windowsSnapshotResult.reason,
+          });
+          return;
+        }
+        sharedChildrenMap = windowsSnapshotResult.childrenByParentPid;
+      } else if (this.useDefaultSubprocessChecker) {
+        // Preserve the existing POSIX behavior: one full-system `ps` snapshot
+        // per cycle, with its established checker fallback when capture fails.
+        sharedChildrenMap = await captureProcessChildrenMap();
+      }
+
       await Promise.all(
         runningSessions.map(async (session) => {
           const terminalPid = session.pid;
@@ -2476,6 +2549,9 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
         }),
       );
     } finally {
+      if (this.subprocessPollAbortController === cycleAbortController) {
+        this.subprocessPollAbortController = null;
+      }
       this.subprocessPollInFlight = false;
     }
   }
