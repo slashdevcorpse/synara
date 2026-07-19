@@ -19,7 +19,11 @@ import {
   MAC_APPSNAP_HELPER_STAGE_PATH,
   validateDesktopNativeBuildHost,
 } from "./lib/desktop-platform-build-config.ts";
-import { SYNARA_PRODUCTION_BUNDLE_ID } from "@synara/shared/desktopIdentity";
+import {
+  isProhibitedUpdaterMetadataFile,
+  createDesktopIdentityBuildConfig,
+} from "./lib/desktop-artifact-policy.ts";
+import { synaraDesktopIdentity, type SynaraDesktopFlavor } from "@synara/shared/desktopIdentity";
 import { parseBooleanEnvValue } from "./lib/env-bool.ts";
 import { finalizeMacUpdateZip } from "./lib/mac-update-zip-finalize.ts";
 import {
@@ -37,6 +41,7 @@ import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 
 const BuildPlatform = Schema.Literals(["mac", "linux", "win"]);
 const BuildArch = Schema.Literals(["arm64", "x64", "universal"]);
+const PackagedDesktopFlavor = Schema.Literals(["production", "canary", "super"]);
 
 const RepoRoot = Effect.service(Path.Path).pipe(
   Effect.flatMap((path) => path.fromFileUrl(new URL("..", import.meta.url))),
@@ -99,6 +104,7 @@ interface BuildCliInput {
   readonly platform: Option.Option<typeof BuildPlatform.Type>;
   readonly target: Option.Option<string>;
   readonly arch: Option.Option<typeof BuildArch.Type>;
+  readonly flavor: Option.Option<typeof PackagedDesktopFlavor.Type>;
   readonly buildVersion: Option.Option<string>;
   readonly sourceCommit: Option.Option<string>;
   readonly sourceTag: Option.Option<string>;
@@ -107,6 +113,7 @@ interface BuildCliInput {
   readonly skipBuild: Option.Option<boolean>;
   readonly keepStage: Option.Option<boolean>;
   readonly signed: Option.Option<boolean>;
+  readonly disableUpdates: Option.Option<boolean>;
   readonly verbose: Option.Option<boolean>;
   readonly mockUpdates: Option.Option<boolean>;
   readonly mockUpdateServerPort: Option.Option<string>;
@@ -198,6 +205,7 @@ interface ResolvedBuildOptions {
   readonly platform: typeof BuildPlatform.Type;
   readonly target: string;
   readonly arch: typeof BuildArch.Type;
+  readonly flavor: Exclude<SynaraDesktopFlavor, "development">;
   readonly version: string | undefined;
   readonly sourceCommit: string | undefined;
   readonly sourceTag: string | undefined;
@@ -206,6 +214,7 @@ interface ResolvedBuildOptions {
   readonly skipBuild: boolean;
   readonly keepStage: boolean;
   readonly signed: boolean;
+  readonly disableUpdates: boolean;
   readonly verbose: boolean;
   readonly mockUpdates: boolean;
   readonly mockUpdateServerPort: string | undefined;
@@ -250,6 +259,7 @@ const BuildEnvConfig = Config.all({
   platform: Config.schema(BuildPlatform, "SYNARA_DESKTOP_PLATFORM").pipe(Config.option),
   target: Config.string("SYNARA_DESKTOP_TARGET").pipe(Config.option),
   arch: Config.schema(BuildArch, "SYNARA_DESKTOP_ARCH").pipe(Config.option),
+  flavor: Config.schema(PackagedDesktopFlavor, "SYNARA_DESKTOP_FLAVOR").pipe(Config.option),
   version: Config.string("SYNARA_DESKTOP_VERSION").pipe(Config.option),
   sourceCommit: Config.string("SYNARA_SOURCE_COMMIT").pipe(Config.option),
   sourceTag: Config.string("SYNARA_SOURCE_TAG").pipe(Config.option),
@@ -258,6 +268,7 @@ const BuildEnvConfig = Config.all({
   skipBuild: Config.string("SYNARA_DESKTOP_SKIP_BUILD").pipe(Config.option),
   keepStage: Config.string("SYNARA_DESKTOP_KEEP_STAGE").pipe(Config.option),
   signed: Config.string("SYNARA_DESKTOP_SIGNED").pipe(Config.option),
+  disableUpdates: Config.string("SYNARA_DESKTOP_DISABLE_UPDATES").pipe(Config.option),
   verbose: Config.string("SYNARA_DESKTOP_VERBOSE").pipe(Config.option),
   mockUpdates: Config.string("SYNARA_DESKTOP_MOCK_UPDATES").pipe(Config.option),
   mockUpdateServerPort: Config.string("SYNARA_DESKTOP_MOCK_UPDATE_SERVER_PORT").pipe(Config.option),
@@ -302,6 +313,7 @@ export const resolveBuildOptions = Effect.fn("resolveBuildOptions")(function* (
 
   const target = mergeOptions(input.target, env.target, PLATFORM_CONFIG[platform].defaultTarget);
   const arch = mergeOptions(input.arch, env.arch, getDefaultArch(platform));
+  const flavor = mergeOptions(input.flavor, env.flavor, "production");
   const version = mergeOptions(input.buildVersion, env.version, undefined);
   const sourceCommit = mergeOptions(input.sourceCommit, env.sourceCommit, undefined);
   const sourceTag = mergeOptions(input.sourceTag, env.sourceTag, undefined);
@@ -309,6 +321,10 @@ export const resolveBuildOptions = Effect.fn("resolveBuildOptions")(function* (
   const envSkipBuild = yield* resolveBooleanEnv("SYNARA_DESKTOP_SKIP_BUILD", env.skipBuild);
   const envKeepStage = yield* resolveBooleanEnv("SYNARA_DESKTOP_KEEP_STAGE", env.keepStage);
   const envSigned = yield* resolveBooleanEnv("SYNARA_DESKTOP_SIGNED", env.signed);
+  const envDisableUpdates = yield* resolveBooleanEnv(
+    "SYNARA_DESKTOP_DISABLE_UPDATES",
+    env.disableUpdates,
+  );
   const envVerbose = yield* resolveBooleanEnv("SYNARA_DESKTOP_VERBOSE", env.verbose);
   const envMockUpdates = yield* resolveBooleanEnv("SYNARA_DESKTOP_MOCK_UPDATES", env.mockUpdates);
   const releaseDir = resolveBooleanFlag(input.mockUpdates, envMockUpdates)
@@ -322,8 +338,15 @@ export const resolveBuildOptions = Effect.fn("resolveBuildOptions")(function* (
   const skipBuild = resolveBooleanFlag(input.skipBuild, envSkipBuild);
   const keepStage = resolveBooleanFlag(input.keepStage, envKeepStage);
   const signed = resolveBooleanFlag(input.signed, envSigned);
+  const disableUpdates =
+    flavor === "super" || resolveBooleanFlag(input.disableUpdates, envDisableUpdates);
   const verbose = resolveBooleanFlag(input.verbose, envVerbose);
   const mockUpdates = resolveBooleanFlag(input.mockUpdates, envMockUpdates);
+  if (disableUpdates && mockUpdates) {
+    return yield* new BuildScriptError({
+      message: "Disabled desktop updates cannot be combined with mock updater metadata.",
+    });
+  }
   const mockUpdateServerPort = mergeOptions(
     input.mockUpdateServerPort,
     env.mockUpdateServerPort,
@@ -334,6 +357,7 @@ export const resolveBuildOptions = Effect.fn("resolveBuildOptions")(function* (
     platform,
     target,
     arch,
+    flavor,
     version,
     sourceCommit,
     sourceTag,
@@ -342,6 +366,7 @@ export const resolveBuildOptions = Effect.fn("resolveBuildOptions")(function* (
     skipBuild,
     keepStage,
     signed,
+    disableUpdates,
     verbose,
     mockUpdates,
     mockUpdateServerPort,
@@ -528,31 +553,6 @@ function resolveDesktopRuntimeDependencies(
   return resolveCatalogDependencies(runtimeDependencies, catalog, "apps/desktop");
 }
 
-function resolveGitHubPublishConfig():
-  | {
-      readonly provider: "github";
-      readonly owner: string;
-      readonly repo: string;
-      readonly releaseType: "release";
-    }
-  | undefined {
-  const rawRepo =
-    process.env.SYNARA_DESKTOP_UPDATE_REPOSITORY?.trim() ||
-    process.env.GITHUB_REPOSITORY?.trim() ||
-    "";
-  if (!rawRepo) return undefined;
-
-  const [owner, repo, ...rest] = rawRepo.split("/");
-  if (!owner || !repo || rest.length > 0) return undefined;
-
-  return {
-    provider: "github",
-    owner,
-    repo,
-    releaseType: "release",
-  };
-}
-
 const verifyStagedNodePty = Effect.fn("verifyStagedNodePty")(function* (
   stageAppDir: string,
   verbose: boolean,
@@ -686,24 +686,15 @@ const installFrozenStageDependencies = Effect.fn("installFrozenStageDependencies
 const createBuildConfig = Effect.fn("createBuildConfig")(function* (
   platform: typeof BuildPlatform.Type,
   target: string,
-  productName: string,
+  flavor: Exclude<SynaraDesktopFlavor, "development">,
   signed: boolean,
+  disableUpdates: boolean,
   mockUpdates: boolean,
   mockUpdateServerPort: string | undefined,
 ) {
-  const buildConfig: Record<string, unknown> = {
-    appId: SYNARA_PRODUCTION_BUNDLE_ID,
-    productName,
-    artifactName: "Synara-${version}-${arch}.${ext}",
-    directories: {
-      buildResources: "apps/desktop/resources",
-    },
-    forceCodeSigning: signed,
-  };
-  const publishConfig = resolveGitHubPublishConfig();
-  if (publishConfig) {
-    buildConfig.publish = [publishConfig];
-  } else if (mockUpdates) {
+  const identity = synaraDesktopIdentity(flavor);
+  const buildConfig = createDesktopIdentityBuildConfig({ identity, signed, disableUpdates });
+  if (!disableUpdates && mockUpdates && !("publish" in buildConfig)) {
     buildConfig.publish = [
       {
         provider: "generic",
@@ -730,6 +721,8 @@ const createBuildConfig = Effect.fn("createBuildConfig")(function* (
     platform,
     target,
     signed,
+    identity,
+    disableUpdates,
     ...(windowsAzureSignOptions ? { windowsAzureSignOptions } : {}),
   } as const;
 
@@ -937,6 +930,11 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
     yield* runCommand(
       ChildProcess.make({
         cwd: repoRoot,
+        env: {
+          ...process.env,
+          SYNARA_DESKTOP_FLAVOR: options.flavor,
+          SYNARA_DESKTOP_DISABLE_UPDATES: options.disableUpdates ? "1" : "0",
+        },
         ...commandOutputOptions(options.verbose),
         // Windows needs shell mode to resolve .cmd shims (e.g. bun.cmd).
         shell: process.platform === "win32",
@@ -967,6 +965,7 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
   yield* fs.copy(distDirs.desktopDist, path.join(stageAppDir, "apps/desktop/dist-electron"));
   yield* fs.copy(distDirs.desktopResources, stageResourcesDir);
   yield* fs.copy(distDirs.serverDist, path.join(stageAppDir, "apps/server/dist"));
+  yield* fs.copyFile(path.join(repoRoot, "LICENSE"), path.join(stageAppDir, "LICENSE"));
 
   yield* assertPlatformBuildResources(options.platform, stageResourcesDir, options.verbose);
 
@@ -980,8 +979,9 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
   const resolvedBuildConfig = yield* createBuildConfig(
     options.platform,
     options.target,
-    desktopPackageJson.productName ?? "Synara",
+    options.flavor,
     options.signed,
+    options.disableUpdates,
     options.mockUpdates,
     options.mockUpdateServerPort,
   );
@@ -995,7 +995,10 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
     synaraSourceTag: options.sourceTag ?? null,
     synaraWindowsPublisherSubject: resolvedBuildConfig.windowsPublisherSubject,
     private: true,
-    description: "Synara desktop build",
+    description:
+      options.flavor === "super"
+        ? "Unofficial Super Synara downstream desktop build"
+        : "Synara desktop build",
     author: "Emanuele Di Pietro",
     main: "apps/desktop/dist-electron/main.js",
     build: resolvedBuildConfig.buildConfig,
@@ -1022,6 +1025,8 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
 
   const buildEnv: NodeJS.ProcessEnv = {
     ...process.env,
+    SYNARA_DESKTOP_FLAVOR: options.flavor,
+    SYNARA_DESKTOP_DISABLE_UPDATES: options.disableUpdates ? "1" : "0",
   };
   for (const [key, value] of Object.entries(buildEnv)) {
     if (value === "") {
@@ -1103,6 +1108,12 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
     const from = path.join(stageDistDir, entry);
     const stat = yield* fs.stat(from).pipe(Effect.catch(() => Effect.succeed(null)));
     if (!stat || stat.type !== "File") continue;
+    if (options.disableUpdates && isProhibitedUpdaterMetadataFile(entry)) {
+      yield* Effect.log(
+        `[desktop-artifact] Omitting updater metadata from disabled build: ${entry}`,
+      );
+      continue;
+    }
 
     const outputEntry =
       options.platform === "mac" && options.arch !== "arm64" && entry === "latest-mac.yml"
@@ -1139,6 +1150,10 @@ const buildDesktopArtifactCli = Command.make("build-desktop-artifact", {
     Flag.withDescription("Build arch, for example arm64/x64/universal (env: SYNARA_DESKTOP_ARCH)."),
     Flag.optional,
   ),
+  flavor: Flag.choice("flavor", PackagedDesktopFlavor.literals).pipe(
+    Flag.withDescription("Packaged desktop flavor (env: SYNARA_DESKTOP_FLAVOR)."),
+    Flag.optional,
+  ),
   buildVersion: Flag.string("build-version").pipe(
     Flag.withDescription("Artifact version metadata (env: SYNARA_DESKTOP_VERSION)."),
     Flag.optional,
@@ -1172,6 +1187,12 @@ const buildDesktopArtifactCli = Command.make("build-desktop-artifact", {
   signed: Flag.boolean("signed").pipe(
     Flag.withDescription(
       "Enable signing/notarization discovery; Windows uses Azure Trusted Signing (env: SYNARA_DESKTOP_SIGNED).",
+    ),
+    Flag.optional,
+  ),
+  disableUpdates: Flag.boolean("disable-updates").pipe(
+    Flag.withDescription(
+      "Omit updater feed/configuration and updater metadata (env: SYNARA_DESKTOP_DISABLE_UPDATES).",
     ),
     Flag.optional,
   ),

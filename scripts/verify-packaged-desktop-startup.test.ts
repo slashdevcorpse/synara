@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import {
   createPackagedDesktopSmokeEnvironment,
+  packagedDesktopExecutableFileName,
   parsePackagedDesktopStartupArgs,
   resolveNativePackagedDesktopPlatform,
 } from "./verify-packaged-desktop-startup.ts";
@@ -30,12 +31,15 @@ describe("packaged desktop startup verification", () => {
         "x64",
         "--version",
         "1.2.3",
+        "--flavor",
+        "super",
       ]),
     ).toEqual({
       assetsDirectory: expect.stringMatching(/release-publish$/),
       platform: "linux",
       arch: "x64",
       version: "1.2.3",
+      flavor: "super",
       timeoutMs: 60_000,
     });
 
@@ -86,9 +90,36 @@ describe("packaged desktop startup verification", () => {
     }
   });
 
+  it("uses Super Synara executable, profile, and backend-home names without inherited overrides", () => {
+    const root = mkdtempSync(join(tmpdir(), "super-synara-packaged-smoke-env-test-"));
+    temporaryRoots.push(root);
+
+    const env = createPackagedDesktopSmokeEnvironment(
+      root,
+      { platform: "win", version: "1.2.3", flavor: "super" },
+      {
+        PATH: process.env.PATH,
+        SYNARA_HOME: "C:\\Users\\tester\\.synara",
+        SYNARA_DESKTOP_FLAVOR: "production",
+      },
+    );
+
+    expect(env.SYNARA_HOME).toBe(join(root, "super-synara-home"));
+    expect(env.SYNARA_DESKTOP_FLAVOR).toBe("super");
+    expect(env.SYNARA_DISABLE_AUTO_UPDATE).toBe("1");
+    expect(existsSync(join(root, "appdata", "super-synara"))).toBe(true);
+    expect(existsSync(join(root, "appdata", "synara"))).toBe(false);
+  });
+
   it("maps Node host platforms to release platform names", () => {
     expect(resolveNativePackagedDesktopPlatform("darwin")).toBe("mac");
     expect(resolveNativePackagedDesktopPlatform("win32")).toBe("win");
     expect(resolveNativePackagedDesktopPlatform("linux")).toBe("linux");
+  });
+
+  it("derives packaged executable names from desktop identity", () => {
+    expect(packagedDesktopExecutableFileName("production", "win")).toBe("Synara.exe");
+    expect(packagedDesktopExecutableFileName("super", "win")).toBe("Super Synara.exe");
+    expect(packagedDesktopExecutableFileName("super", "mac")).toBe("Super Synara");
   });
 });

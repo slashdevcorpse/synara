@@ -13,6 +13,7 @@ import {
   WINDOWS_INSTALLER_GUID,
 } from "./lib/desktop-platform-build-config.ts";
 import { BRAND_ASSET_PATHS } from "./lib/brand-assets.ts";
+import { synaraDesktopIdentity } from "@synara/shared/desktopIdentity";
 
 describe("createDesktopPlatformBuildConfig", () => {
   it("adds explicit microphone entitlements to macOS builds", () => {
@@ -46,6 +47,7 @@ describe("createDesktopPlatformBuildConfig", () => {
         to: "Helpers/synara-appsnap-helper",
       },
     ]);
+    assert.deepStrictEqual(config.extraResources, [{ from: "LICENSE", to: "LICENSE" }]);
     assert.equal(extendInfo.NSMicrophoneUsageDescription, MICROPHONE_USAGE_DESCRIPTION);
     assert.equal(extendInfo.NSScreenCaptureUsageDescription, undefined);
   });
@@ -63,6 +65,7 @@ describe("createDesktopPlatformBuildConfig", () => {
 
     assert.equal(linux.mac, undefined);
     assert.equal(linux.extraFiles, undefined);
+    assert.deepStrictEqual(linux.extraResources, [{ from: "LICENSE", to: "LICENSE" }]);
     assert.deepStrictEqual(linux.asarUnpack, ["node_modules/node-pty/**"]);
     assert.deepStrictEqual(linux.linux, {
       target: ["AppImage"],
@@ -86,6 +89,7 @@ describe("createDesktopPlatformBuildConfig", () => {
     assert.deepStrictEqual(win.win, {
       target: ["nsis"],
       icon: "icon.ico",
+      executableName: "Synara",
       publisherName: "Synara",
       azureSignOptions: { publisherName: "Synara" },
     });
@@ -100,6 +104,7 @@ describe("createDesktopPlatformBuildConfig", () => {
     assert.deepStrictEqual(config.win, {
       target: ["nsis"],
       icon: "icon.ico",
+      executableName: "Synara",
     });
   });
 
@@ -170,5 +175,34 @@ describe("createDesktopPlatformBuildConfig", () => {
       BRAND_ASSET_PATHS.productionMacLegacyIconPng,
       "assets/prod/black-macos-legacy-1024.png",
     );
+  });
+
+  it("uses an explicit unsigned mac identity and isolated Super Synara Windows registration", () => {
+    const identity = synaraDesktopIdentity("super");
+    const mac = createDesktopPlatformBuildConfig({
+      platform: "mac",
+      target: "dmg",
+      signed: false,
+      identity,
+      disableUpdates: true,
+    });
+    const win = createDesktopPlatformBuildConfig({
+      platform: "win",
+      target: "nsis",
+      identity,
+      disableUpdates: true,
+    });
+
+    assert.equal((mac.mac as Record<string, unknown>).identity, null);
+    assert.deepStrictEqual(mac.extraResources, [{ from: "LICENSE", to: "LICENSE" }]);
+    assert.deepStrictEqual(win.nsis, {
+      guid: "ab3ea852-4edf-4caa-977e-9d00ccab2b1e",
+      differentialPackage: false,
+    });
+    assert.deepStrictEqual(win.win, {
+      target: ["nsis"],
+      icon: "icon.ico",
+      executableName: "Super Synara",
+    });
   });
 });
