@@ -273,7 +273,7 @@
         "owner": "slashdevcorpse",
         "status": "upstream-pending",
         "upstreamSourceCommit": "13c30b3739d380f2da8c1dfbfc1dccf41021d26c",
-        "introducingCommit": "9205ee5e9b5932fb59adb7aad5031bd975a000a9",
+        "introducingCommit": "1beb7b3b240ea71f14cd9718ee9415a94c83335e",
         "touchedFiles":
           [
             "apps/server/src/terminal/Layers/Manager.test.ts",
@@ -308,7 +308,7 @@
             {
               "status": "upstream-pending",
               "date": "2026-07-19",
-              "evidence": "Open upstream PR 429 at 13c30b3739d380f2da8c1dfbfc1dccf41021d26c; rebased downstream at 9205ee5e9b5932fb59adb7aad5031bd975a000a9",
+              "evidence": "Open upstream PR 429 at 13c30b3739d380f2da8c1dfbfc1dccf41021d26c; rebased downstream at 1beb7b3b240ea71f14cd9718ee9415a94c83335e",
             },
           ],
       },
@@ -319,7 +319,7 @@
         "owner": "slashdevcorpse",
         "status": "upstream-pending",
         "upstreamSourceCommit": "a1ba31bb487522d62e7e7be9a46fffa473cec2d4",
-        "introducingCommit": "4a6e7ef4bfe5ca5df3e12acb04a60268d66bbd46",
+        "introducingCommit": "443d2c22df9b07498dd5aa717cc01494ee202501",
         "touchedFiles":
           [
             "apps/desktop/src/backendShutdown.test.ts",
@@ -356,7 +356,7 @@
             {
               "status": "upstream-pending",
               "date": "2026-07-19",
-              "evidence": "Open upstream PR 430 at a1ba31bb487522d62e7e7be9a46fffa473cec2d4; rebased downstream at 4a6e7ef4bfe5ca5df3e12acb04a60268d66bbd46 with the redundant canonical CI hunk excluded",
+              "evidence": "Open upstream PR 430 at a1ba31bb487522d62e7e7be9a46fffa473cec2d4; rebased downstream at 443d2c22df9b07498dd5aa717cc01494ee202501 with the redundant canonical CI hunk excluded",
             },
           ],
       },
