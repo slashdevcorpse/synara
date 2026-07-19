@@ -263,6 +263,23 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
     "prepare-super-synara-release.ts verify",
     "Publication must revalidate admitted bytes before making the draft public.",
   );
+  const releaseAdmissionCommands = continuedShellCommands(
+    main,
+    "node scripts/prepare-super-synara-release.ts",
+  );
+  if (
+    releaseAdmissionCommands.length !== 2 ||
+    releaseAdmissionCommands.some(
+      (command) =>
+        !command.includes(
+          "--mac-signature-allowlist scripts/super-synara-macos-signature-allowlist.json",
+        ),
+    )
+  ) {
+    throw new Error(
+      "Final release preparation and revalidation must use the reviewed macOS signature allowlist.",
+    );
+  }
   requireText(main, '[[ "${#assets[@]}" -eq 8 ]]', "Publication must upload exactly eight files.");
   for (const asset of [
     "windows-x64-unsigned.exe",

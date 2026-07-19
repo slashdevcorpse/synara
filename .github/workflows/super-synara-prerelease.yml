@@ -690,6 +690,7 @@ jobs:
           node scripts/prepare-super-synara-release.ts prepare \
             --directory release-stage \
             --license LICENSE \
+            --mac-signature-allowlist scripts/super-synara-macos-signature-allowlist.json \
             --version "$VERSION" \
             --tag "$TAG" \
             --source-commit "$SOURCE_COMMIT" \
@@ -796,6 +797,7 @@ jobs:
         run: |
           node scripts/prepare-super-synara-release.ts verify \
             --directory release-stage \
+            --mac-signature-allowlist scripts/super-synara-macos-signature-allowlist.json \
             --version "$VERSION" \
             --tag "$TAG" \
             --source-commit "$SOURCE_COMMIT" \

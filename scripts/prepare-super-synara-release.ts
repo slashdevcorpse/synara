@@ -3,15 +3,22 @@
 // Purpose: Creates or revalidates the exact unsigned prerelease staging set.
 // Layer: Release publication admission
 
+import { readFileSync } from "node:fs";
+
 import {
   prepareSuperSynaraRelease,
   verifyPreparedSuperSynaraRelease,
 } from "./lib/super-synara-release-admission.ts";
+import {
+  type MacSignatureAllowlist,
+  validateMacSignatureAllowlist,
+} from "./lib/super-synara-macos-signatures.ts";
 
 function parseArgs(argv: ReadonlyArray<string>): {
   readonly mode: "prepare" | "verify";
   readonly directory: string;
   readonly licensePath?: string;
+  readonly macSignatureAllowlistPath: string;
   readonly version: string;
   readonly tag: string;
   readonly sourceCommit: string;
@@ -34,6 +41,7 @@ function parseArgs(argv: ReadonlyArray<string>): {
   const known = new Set([
     "--directory",
     "--license",
+    "--mac-signature-allowlist",
     "--version",
     "--tag",
     "--source-commit",
@@ -57,6 +65,7 @@ function parseArgs(argv: ReadonlyArray<string>): {
     mode,
     directory: required("--directory"),
     ...(licensePath ? { licensePath } : {}),
+    macSignatureAllowlistPath: required("--mac-signature-allowlist"),
     version: required("--version"),
     tag: required("--tag"),
     sourceCommit: required("--source-commit"),
@@ -66,6 +75,9 @@ function parseArgs(argv: ReadonlyArray<string>): {
 }
 
 const options = parseArgs(process.argv.slice(2));
+const macSignatureAllowlist = validateMacSignatureAllowlist(
+  JSON.parse(readFileSync(options.macSignatureAllowlistPath, "utf8")) as MacSignatureAllowlist,
+);
 const coordinates = {
   version: options.version,
   tag: options.tag,
@@ -77,11 +89,13 @@ const index =
     ? prepareSuperSynaraRelease({
         directory: options.directory,
         licensePath: options.licensePath!,
+        macSignatureAllowlist,
         coordinates,
         maxTotalBytes: options.maxTotalBytes,
       })
     : verifyPreparedSuperSynaraRelease({
         directory: options.directory,
+        macSignatureAllowlist,
         coordinates,
         maxTotalBytes: options.maxTotalBytes,
       });

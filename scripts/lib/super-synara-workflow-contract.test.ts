@@ -46,6 +46,20 @@ describe("Super Synara workflow contracts", () => {
         audit,
       ),
     ).toThrow("missing or placeholder macOS signature policy");
+    for (const mode of ["prepare", "verify"] as const) {
+      const commandIndex = main.indexOf(`node scripts/prepare-super-synara-release.ts ${mode}`);
+      const forged =
+        main.slice(0, commandIndex) +
+        main
+          .slice(commandIndex)
+          .replace(
+            "--mac-signature-allowlist scripts/super-synara-macos-signature-allowlist.json",
+            "--mac-signature-allowlist forged.json",
+          );
+      expect(() => verifySuperSynaraWorkflowText(forged, audit)).toThrow(
+        "preparation and revalidation must use the reviewed macOS signature allowlist",
+      );
+    }
   });
 
   it("rejects root Playwright lookup and missing source-cleanliness checks", () => {

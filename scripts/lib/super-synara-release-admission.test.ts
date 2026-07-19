@@ -16,6 +16,7 @@ import {
   superSynaraReleaseFileNames,
   verifyPreparedSuperSynaraRelease,
 } from "./super-synara-release-admission.ts";
+import type { MacSignatureAllowlist } from "./super-synara-macos-signatures.ts";
 
 const roots: string[] = [];
 const coordinates = {
@@ -24,12 +25,41 @@ const coordinates = {
   sourceCommit: "a".repeat(40),
   absorbedUpstreamSha: "b".repeat(40),
 };
+const macSignatureAllowlist: MacSignatureAllowlist = {
+  schemaVersion: 1,
+  electronVersion: "40.10.6",
+  productOwnedPaths: [".", "Contents/MacOS/Super Synara", "Contents/Helpers/synara-appsnap-helper"],
+  thirdParty: [
+    {
+      path: "Contents/Frameworks/Electron Framework.framework/Versions/A/Electron Framework",
+      identifier: "com.github.Electron.framework",
+      teamId: null,
+      authorities: [],
+      scheme: "ad-hoc-only",
+    },
+  ],
+};
+
+function objectField(value: unknown, field: string): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`Test fixture field ${field} is not an object.`);
+  }
+  const fieldValue = (value as Record<string, unknown>)[field];
+  if (!fieldValue || typeof fieldValue !== "object" || Array.isArray(fieldValue)) {
+    throw new Error(`Test fixture field ${field} is not an object.`);
+  }
+  return fieldValue as Record<string, unknown>;
+}
 
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
-async function createPlatformStaging(): Promise<{ directory: string; licensePath: string }> {
+async function createPlatformStaging(): Promise<{
+  directory: string;
+  licensePath: string;
+  macSignatureAllowlist: MacSignatureAllowlist;
+}> {
   const directory = mkdtempSync(join(tmpdir(), "super-synara-release-admission-test-"));
   const licenseRoot = mkdtempSync(join(tmpdir(), "super-synara-release-license-test-"));
   roots.push(directory, licenseRoot);
@@ -151,24 +181,7 @@ async function createPlatformStaging(): Promise<{ directory: string; licensePath
     platform: "mac",
     arch: "arm64",
     target: "dmg",
-    macSignatureAllowlist: {
-      schemaVersion: 1,
-      electronVersion: "40.10.6",
-      productOwnedPaths: [
-        ".",
-        "Contents/MacOS/Super Synara",
-        "Contents/Helpers/synara-appsnap-helper",
-      ],
-      thirdParty: [
-        {
-          path: "Contents/Frameworks/Electron Framework.framework/Versions/A/Electron Framework",
-          identifier: "com.github.Electron.framework",
-          teamId: null,
-          authorities: [],
-          scheme: "ad-hoc-only",
-        },
-      ],
-    },
+    macSignatureAllowlist,
     macSignatureReport: {
       schemaVersion: 2,
       diskImage: {
@@ -257,15 +270,16 @@ async function createPlatformStaging(): Promise<{ directory: string; licensePath
   });
   const licensePath = join(licenseRoot, "LICENSE");
   writeFileSync(licensePath, "MIT fixture\n");
-  return { directory, licensePath };
+  return { directory, licensePath, macSignatureAllowlist };
 }
 
 describe("Super Synara release admission", () => {
   it("creates the exact eight-file set with canonical checksums and a complete index", async () => {
-    const { directory, licensePath } = await createPlatformStaging();
+    const { directory, licensePath, macSignatureAllowlist } = await createPlatformStaging();
     const index = prepareSuperSynaraRelease({
       directory,
       licensePath,
+      macSignatureAllowlist,
       coordinates,
       maxTotalBytes: 10_000_000,
     });
@@ -289,6 +303,7 @@ describe("Super Synara release admission", () => {
     expect(
       verifyPreparedSuperSynaraRelease({
         directory,
+        macSignatureAllowlist,
         coordinates,
         maxTotalBytes: 10_000_000,
       }),
@@ -328,6 +343,7 @@ describe("Super Synara release admission", () => {
     expect(() =>
       verifyPreparedSuperSynaraRelease({
         directory: mutated.directory,
+        macSignatureAllowlist: mutated.macSignatureAllowlist,
         coordinates,
         maxTotalBytes: 10_000_000,
       }),
@@ -354,5 +370,77 @@ describe("Super Synara release admission", () => {
         maxTotalBytes: 10_000_000,
       }),
     ).toThrow("does not bind exact unsigned Windows product-owned binaries");
+  });
+
+  it("rejects malformed macOS signing identity at final release preparation", async () => {
+    for (const scenario of [
+      "product-owned",
+      "reviewed-third-party",
+      "disk-image",
+      "deep-verification",
+      "notarization",
+    ] as const) {
+      const staged = await createPlatformStaging();
+      const provenancePath = join(
+        staged.directory,
+        superSynaraReleaseFileNames(coordinates.version).macosProvenance,
+      );
+      const provenance: unknown = JSON.parse(readFileSync(provenancePath, "utf8"));
+      const identity = objectField(objectField(provenance, "signing"), "identity");
+      switch (scenario) {
+        case "product-owned":
+          identity.productOwned = [];
+          break;
+        case "reviewed-third-party":
+          identity.thirdParty = [];
+          break;
+        case "disk-image":
+          objectField(identity, "diskImage").sha256 = "0".repeat(64);
+          break;
+        case "deep-verification":
+          objectField(identity, "deepVerification").exitCode = 1;
+          break;
+        case "notarization":
+          objectField(
+            objectField(objectField(identity, "notarization"), "appBundle"),
+            "evidence",
+          ).output = "Could not establish secure connection NSURLErrorDomain";
+          break;
+      }
+      writeFileSync(provenancePath, JSON.stringify(provenance));
+
+      expect(() =>
+        prepareSuperSynaraRelease({
+          ...staged,
+          coordinates,
+          maxTotalBytes: 10_000_000,
+        }),
+      ).toThrow();
+    }
+  });
+
+  it("revalidates macOS signing identity against the reviewed allowlist", async () => {
+    const staged = await createPlatformStaging();
+    prepareSuperSynaraRelease({
+      ...staged,
+      coordinates,
+      maxTotalBytes: 10_000_000,
+    });
+    const provenancePath = join(
+      staged.directory,
+      superSynaraReleaseFileNames(coordinates.version).macosProvenance,
+    );
+    const provenance: unknown = JSON.parse(readFileSync(provenancePath, "utf8"));
+    objectField(objectField(provenance, "signing"), "identity").thirdParty = [];
+    writeFileSync(provenancePath, JSON.stringify(provenance));
+
+    expect(() =>
+      verifyPreparedSuperSynaraRelease({
+        directory: staged.directory,
+        macSignatureAllowlist: staged.macSignatureAllowlist,
+        coordinates,
+        maxTotalBytes: 10_000_000,
+      }),
+    ).toThrow("Third-party signature paths differ from the reviewed allowlist");
   });
 });

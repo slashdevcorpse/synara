@@ -17,6 +17,10 @@ import type {
   ReleaseArtifactDigest,
   ReleaseArtifactProvenanceManifest,
 } from "./release-artifact-provenance.ts";
+import {
+  type MacSignatureAllowlist,
+  validateMacUnsignedSignatureReport,
+} from "./super-synara-macos-signatures.ts";
 
 const REPOSITORY = "slashdevcorpse/synara";
 const PROHIBITED_ASSET_PATTERN = /(?:\.blockmap|\.ya?ml|\.zip|\.AppImage)$/i;
@@ -175,6 +179,7 @@ function validatePlatformManifest(input: {
   readonly payloadFileName: string;
   readonly platform: "win" | "mac";
   readonly coordinates: SuperSynaraReleaseCoordinates;
+  readonly macSignatureAllowlist?: MacSignatureAllowlist;
 }): ReleaseArtifactProvenanceManifest {
   const manifest = readManifest(input.directory, input.manifestFileName);
   const expectedArch = input.platform === "win" ? "x64" : "arm64";
@@ -251,12 +256,34 @@ function validatePlatformManifest(input: {
       );
     }
   }
+  if (input.platform === "mac") {
+    if (!input.macSignatureAllowlist) {
+      throw new Error("Final macOS release admission requires the reviewed signature allowlist.");
+    }
+    const signing = manifest.signing;
+    if (signing.status !== "unsigned-prerelease" || signing.scheme !== "ad-hoc-only") {
+      throw new Error(`${input.manifestFileName} omitted macOS signature evidence.`);
+    }
+    const identity = validateMacUnsignedSignatureReport(
+      signing.identity,
+      input.macSignatureAllowlist,
+    );
+    const artifact = manifest.artifacts[0]!;
+    if (
+      identity.diskImage.fileName !== artifact.fileName ||
+      identity.diskImage.size !== artifact.size ||
+      identity.diskImage.sha256 !== artifact.sha256
+    ) {
+      throw new Error(`${input.manifestFileName} does not bind exact admitted macOS DMG evidence.`);
+    }
+  }
   return manifest;
 }
 
 export function prepareSuperSynaraRelease(input: {
   readonly directory: string;
   readonly licensePath: string;
+  readonly macSignatureAllowlist: MacSignatureAllowlist;
   readonly coordinates: SuperSynaraReleaseCoordinates;
   readonly maxTotalBytes: number;
 }): SuperSynaraReleaseIndex {
@@ -282,6 +309,7 @@ export function prepareSuperSynaraRelease(input: {
     payloadFileName: names.macosDiskImage,
     platform: "mac",
     coordinates,
+    macSignatureAllowlist: input.macSignatureAllowlist,
   });
   if (windowsManifest.source.lockfileSha256 !== macosManifest.source.lockfileSha256) {
     throw new Error("Platform provenance manifests disagree on bun.lock SHA-256.");
@@ -346,6 +374,7 @@ export function prepareSuperSynaraRelease(input: {
 
 export function verifyPreparedSuperSynaraRelease(input: {
   readonly directory: string;
+  readonly macSignatureAllowlist: MacSignatureAllowlist;
   readonly coordinates: SuperSynaraReleaseCoordinates;
   readonly maxTotalBytes: number;
 }): SuperSynaraReleaseIndex {
@@ -369,6 +398,7 @@ export function verifyPreparedSuperSynaraRelease(input: {
     payloadFileName: names.macosDiskImage,
     platform: "mac",
     coordinates: input.coordinates,
+    macSignatureAllowlist: input.macSignatureAllowlist,
   });
   if (windowsManifest.source.lockfileSha256 !== macosManifest.source.lockfileSha256) {
     throw new Error("Platform provenance manifests disagree on bun.lock SHA-256.");
