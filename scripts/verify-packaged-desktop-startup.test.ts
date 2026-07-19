@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -9,6 +9,7 @@ import {
   packagedDesktopExecutableFileName,
   parsePackagedDesktopStartupArgs,
   resolveNativePackagedDesktopPlatform,
+  verifyPackagedDesktopExecutableStartup,
 } from "./verify-packaged-desktop-startup.ts";
 
 const temporaryRoots: string[] = [];
@@ -107,6 +108,7 @@ describe("packaged desktop startup verification", () => {
     expect(env.SYNARA_HOME).toBe(join(root, "super-synara-home"));
     expect(env.SYNARA_DESKTOP_FLAVOR).toBe("super");
     expect(env.SYNARA_DISABLE_AUTO_UPDATE).toBe("1");
+    expect(env.SYNARA_DESKTOP_QUALIFICATION_EXIT_AFTER_STARTUP).toBe("1");
     expect(existsSync(join(root, "appdata", "super-synara"))).toBe(true);
     expect(existsSync(join(root, "appdata", "synara"))).toBe(false);
   });
@@ -121,5 +123,46 @@ describe("packaged desktop startup verification", () => {
     expect(packagedDesktopExecutableFileName("production", "win")).toBe("Synara.exe");
     expect(packagedDesktopExecutableFileName("super", "win")).toBe("Super Synara.exe");
     expect(packagedDesktopExecutableFileName("super", "mac")).toBe("Super Synara");
+  });
+
+  it("requires both startup and graceful clean-exit log proof", async () => {
+    const root = mkdtempSync(join(tmpdir(), "packaged-clean-exit-proof-test-"));
+    temporaryRoots.push(root);
+    const logPath = join(root, "desktop-main.log");
+    writeFileSync(
+      logPath,
+      [
+        "app ready",
+        "bootstrap main window created",
+        "bootstrap backend ready source=listening",
+        "packaged startup qualification exit requested",
+        "packaged startup qualification shutdown complete",
+      ].join("\n"),
+    );
+
+    await expect(
+      verifyPackagedDesktopExecutableStartup({
+        command: process.execPath,
+        args: ["-e", "process.exit(0)"],
+        cwd: root,
+        env: process.env,
+        logPath,
+        timeoutMs: 5_000,
+        description: "Fake packaged app",
+      }),
+    ).resolves.toBeUndefined();
+
+    writeFileSync(logPath, "app ready\nbootstrap main window created\n");
+    await expect(
+      verifyPackagedDesktopExecutableStartup({
+        command: process.execPath,
+        args: ["-e", "process.exit(0)"],
+        cwd: root,
+        env: process.env,
+        logPath,
+        timeoutMs: 5_000,
+        description: "Incomplete fake packaged app",
+      }),
+    ).rejects.toThrow("exited before startup proof");
   });
 });

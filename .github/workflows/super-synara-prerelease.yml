@@ -335,6 +335,105 @@ jobs:
             --arch x64 \
             --version "$VERSION"
 
+      - id: upstream_release
+        name: Select exact stable upstream installer
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $releasesJson = Join-Path $env:RUNNER_TEMP "upstream-synara-releases.json"
+          gh api --paginate --slurp "repos/Emanuele-web04/synara/releases?per_page=100" |
+            Set-Content -LiteralPath $releasesJson -Encoding utf8NoBOM
+          node scripts/select-upstream-synara-release.ts `
+            --releases-json $releasesJson `
+            --current-version $env:VERSION `
+            --github-output $env:GITHUB_OUTPUT
+
+      - id: upstream_installer
+        name: Download exact stable upstream installer
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_TAG: ${{ steps.upstream_release.outputs.upstream_tag }}
+          UPSTREAM_ASSET_NAME: ${{ steps.upstream_release.outputs.upstream_asset_name }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $directory = Join-Path $env:RUNNER_TEMP "upstream-synara-installer"
+          New-Item -ItemType Directory -Path $directory | Out-Null
+          gh release download $env:UPSTREAM_TAG `
+            --repo Emanuele-web04/synara `
+            --pattern $env:UPSTREAM_ASSET_NAME `
+            --dir $directory
+          $installer = Join-Path $directory $env:UPSTREAM_ASSET_NAME
+          if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
+            throw "Exact upstream Synara installer was not downloaded."
+          }
+          "path=$installer" >> $env:GITHUB_OUTPUT
+
+      - id: previous_release
+        name: Select previous Super Synara prerelease when available
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $releasesJson = Join-Path $env:RUNNER_TEMP "super-synara-releases.json"
+          gh api --paginate --slurp "repos/$env:GITHUB_REPOSITORY/releases?per_page=100" |
+            Set-Content -LiteralPath $releasesJson -Encoding utf8NoBOM
+          node scripts/select-previous-super-synara-release.ts `
+            --releases-json $releasesJson `
+            --current-version $env:VERSION `
+            --github-output $env:GITHUB_OUTPUT
+
+      - id: previous_installer
+        if: steps.previous_release.outputs.found == 'true'
+        name: Download previous Super Synara installer
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREVIOUS_TAG: ${{ steps.previous_release.outputs.previous_tag }}
+          PREVIOUS_ASSET_NAME: ${{ steps.previous_release.outputs.previous_asset_name }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $directory = Join-Path $env:RUNNER_TEMP "previous-super-synara-installer"
+          New-Item -ItemType Directory -Path $directory | Out-Null
+          gh release download $env:PREVIOUS_TAG `
+            --repo $env:GITHUB_REPOSITORY `
+            --pattern $env:PREVIOUS_ASSET_NAME `
+            --dir $directory
+          $installer = Join-Path $directory $env:PREVIOUS_ASSET_NAME
+          if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
+            throw "Exact previous Super Synara installer was not downloaded."
+          }
+          "path=$installer" >> $env:GITHUB_OUTPUT
+
+      - name: Qualify Windows install, side-by-side isolation, upgrade, and uninstall
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+          PREVIOUS_FOUND: ${{ steps.previous_release.outputs.found }}
+          PREVIOUS_INSTALLER: ${{ steps.previous_installer.outputs.path }}
+          UPSTREAM_INSTALLER: ${{ steps.upstream_installer.outputs.path }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $currentInstaller = Join-Path "release-publish" "Super-Synara-$env:VERSION-windows-x64-unsigned.exe"
+          $qualificationArgs = @(
+            "scripts/qualify-super-synara-windows-installer.ts",
+            "--installer", $currentInstaller,
+            "--upstream-installer", $env:UPSTREAM_INSTALLER,
+            "--version", $env:VERSION
+          )
+          if ($env:PREVIOUS_FOUND -eq "true") {
+            if ([string]::IsNullOrWhiteSpace($env:PREVIOUS_INSTALLER)) {
+              throw "Previous release selection succeeded without a downloaded installer."
+            }
+            $qualificationArgs += @("--previous-installer", $env:PREVIOUS_INSTALLER)
+          }
+          node @qualificationArgs
+
       - name: Enforce Windows artifact budget
         shell: bash
         run: |

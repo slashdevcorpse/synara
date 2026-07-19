@@ -114,7 +114,7 @@ function findFiles(root: string, predicate: (path: string) => boolean): string[]
       }
     }
   }
-  return matches.sort((left, right) => left.localeCompare(right));
+  return matches.toSorted((left, right) => left.localeCompare(right));
 }
 
 function requireSingleAsset(directory: string, suffix: string): string {
@@ -131,6 +131,16 @@ interface LaunchCommand {
   readonly command: string;
   readonly args: ReadonlyArray<string>;
   readonly cwd: string;
+}
+
+export interface PackagedDesktopExecutableStartupOptions {
+  readonly command: string;
+  readonly args?: ReadonlyArray<string>;
+  readonly cwd: string;
+  readonly env: NodeJS.ProcessEnv;
+  readonly logPath: string;
+  readonly timeoutMs: number;
+  readonly description: string;
 }
 
 function prepareMacLaunch(
@@ -248,6 +258,7 @@ export function createPackagedDesktopSmokeEnvironment(
     SYNARA_HOME: join(root, `${identity.userDataDirectoryName}-home`),
     SYNARA_DESKTOP_FLAVOR: identity.flavor,
     SYNARA_DISABLE_AUTO_UPDATE: "1",
+    SYNARA_DESKTOP_QUALIFICATION_EXIT_AFTER_STARTUP: "1",
     ELECTRON_ENABLE_LOGGING: "1",
   };
   delete env.SYNARA_AUTH_TOKEN;
@@ -317,7 +328,7 @@ async function terminateProcessTree(child: ChildProcess): Promise<void> {
   await waitForExit(child, 2_000);
 }
 
-function hasStartupProof(logPath: string): boolean {
+export function hasPackagedDesktopStartupProof(logPath: string): boolean {
   try {
     const log = readFileSync(logPath, "utf8");
     return (
@@ -327,6 +338,86 @@ function hasStartupProof(logPath: string): boolean {
     );
   } catch {
     return false;
+  }
+}
+
+export function hasPackagedDesktopCleanExitProof(logPath: string): boolean {
+  try {
+    const log = readFileSync(logPath, "utf8");
+    return (
+      log.includes("packaged startup qualification exit requested") &&
+      log.includes("packaged startup qualification shutdown complete")
+    );
+  } catch {
+    return false;
+  }
+}
+
+export async function verifyPackagedDesktopExecutableStartup(
+  options: PackagedDesktopExecutableStartupOptions,
+): Promise<void> {
+  const child = spawn(options.command, [...(options.args ?? [])], {
+    cwd: options.cwd,
+    env: options.env,
+    detached: process.platform !== "win32",
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  const childOutcome: {
+    exited: { code: number | null; signal: NodeJS.Signals | null } | null;
+    launchError: Error | null;
+  } = { exited: null, launchError: null };
+  child.once("exit", (code, signal) => {
+    childOutcome.exited = { code, signal };
+  });
+  child.once("error", (error) => {
+    childOutcome.launchError = error;
+  });
+  child.stdout?.resume();
+  child.stderr?.resume();
+
+  try {
+    let startupProven = false;
+    const startupDeadline = Date.now() + options.timeoutMs;
+    let cleanExitDeadline: number | null = null;
+    while (Date.now() < (cleanExitDeadline ?? startupDeadline)) {
+      if (!startupProven && hasPackagedDesktopStartupProof(options.logPath)) {
+        startupProven = true;
+        cleanExitDeadline = Date.now() + 30_000;
+      }
+      if (childOutcome.launchError) {
+        throw new Error(
+          `${options.description} could not start: ${childOutcome.launchError.message}`,
+        );
+      }
+      if (childOutcome.exited) {
+        if (!startupProven) {
+          throw new Error(
+            `${options.description} exited before startup proof (code=${childOutcome.exited.code ?? "null"}, signal=${childOutcome.exited.signal ?? "null"}).`,
+          );
+        }
+        if (childOutcome.exited.code !== 0 || childOutcome.exited.signal !== null) {
+          throw new Error(
+            `${options.description} did not exit cleanly (code=${childOutcome.exited.code ?? "null"}, signal=${childOutcome.exited.signal ?? "null"}).`,
+          );
+        }
+        if (!hasPackagedDesktopCleanExitProof(options.logPath)) {
+          throw new Error(`${options.description} exited without graceful shutdown proof.`);
+        }
+        console.log(
+          `${options.description} startup and clean-exit smoke passed from isolated state.`,
+        );
+        return;
+      }
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 200));
+    }
+    throw new Error(
+      startupProven
+        ? `${options.description} clean-exit proof timed out after startup.`
+        : `${options.description} startup proof timed out after ${options.timeoutMs}ms.`,
+    );
+  } finally {
+    await terminateProcessTree(child);
   }
 }
 
@@ -356,55 +447,20 @@ export async function verifyPackagedDesktopStartup(
   const extractionRoot = join(temporaryRoot, "payload");
   mkdirSync(extractionRoot, { recursive: true });
 
-  let child: ChildProcess | null = null;
   try {
     const launch = prepareLaunch(options, extractionRoot);
     const env = createPackagedDesktopSmokeEnvironment(join(temporaryRoot, "state"), options);
     const logPath = join(env.SYNARA_HOME!, "userdata", "logs", "desktop-main.log");
-    child = spawn(launch.command, [...launch.args], {
+    await verifyPackagedDesktopExecutableStartup({
+      command: launch.command,
+      args: launch.args,
       cwd: launch.cwd,
       env,
-      detached: process.platform !== "win32",
-      stdio: ["ignore", "pipe", "pipe"],
-      windowsHide: true,
+      logPath,
+      timeoutMs: options.timeoutMs,
+      description: `Packaged ${options.platform}/${options.arch}`,
     });
-
-    const childOutcome: {
-      exited: { code: number | null; signal: NodeJS.Signals | null } | null;
-      launchError: Error | null;
-    } = { exited: null, launchError: null };
-    child.once("exit", (code, signal) => {
-      childOutcome.exited = { code, signal };
-    });
-    child.once("error", (error) => {
-      childOutcome.launchError = error;
-    });
-    child.stdout?.resume();
-    child.stderr?.resume();
-
-    const deadline = Date.now() + options.timeoutMs;
-    while (Date.now() < deadline) {
-      if (hasStartupProof(logPath)) {
-        console.log(
-          `Packaged ${options.platform}/${options.arch} startup smoke passed from isolated state.`,
-        );
-        return;
-      }
-      if (childOutcome.launchError) {
-        throw new Error(`Packaged app could not start: ${childOutcome.launchError.message}`);
-      }
-      if (childOutcome.exited) {
-        throw new Error(
-          `Packaged app exited before startup proof (code=${childOutcome.exited.code ?? "null"}, signal=${childOutcome.exited.signal ?? "null"}).`,
-        );
-      }
-      await new Promise((resolveDelay) => setTimeout(resolveDelay, 200));
-    }
-    throw new Error(`Packaged startup proof timed out after ${options.timeoutMs}ms.`);
   } finally {
-    if (child) {
-      await terminateProcessTree(child);
-    }
     rmSync(temporaryRoot, { recursive: true, force: true });
   }
 }

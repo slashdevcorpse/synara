@@ -13,6 +13,7 @@ export interface InitialBackendWindowOpenOptions {
   readonly getReadinessInFlight: () => Promise<void> | null;
   readonly setReadinessInFlight: (promise: Promise<void> | null) => void;
   readonly waitForBackendWindowReady: (baseUrl: string) => Promise<BackendWindowReadySource>;
+  readonly onReady?: (source: BackendWindowReadySource) => void;
   readonly writeLog: (message: string) => void;
   readonly isReadinessAborted: (error: unknown) => boolean;
   readonly formatErrorMessage: (error: unknown) => string;
@@ -37,6 +38,7 @@ export function openInitialBackendWindow(options: InitialBackendWindowOpenOption
     .waitForBackendWindowReady(options.baseUrl)
     .then((source) => {
       options.writeLog(`bootstrap backend ready source=${source}`);
+      options.onReady?.(source);
     })
     .catch((error) => {
       if (options.isReadinessAborted(error)) {

@@ -68,6 +68,19 @@ describe("openInitialBackendWindow", () => {
     await expect(watchedPromise).resolves.toBeUndefined();
   });
 
+  it("notifies packaged qualification only after backend readiness is proven", async () => {
+    const onReady = vi.fn();
+    const options = createOptions({ onReady });
+
+    openInitialBackendWindow(options);
+    const watchedPromise = vi.mocked(options.setReadinessInFlight).mock.calls[0]?.[0];
+    if (!watchedPromise) throw new Error("Expected startup readiness watcher to be registered.");
+    await watchedPromise;
+
+    expect(onReady).toHaveBeenCalledWith("listening");
+    expect(options.writeLog).toHaveBeenCalledWith("bootstrap backend ready source=listening");
+  });
+
   it("still opens a missing window without duplicating an active readiness watch", () => {
     const activeWatch = Promise.resolve();
     const options = createOptions({

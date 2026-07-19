@@ -86,4 +86,28 @@ describe("Super Synara workflow contracts", () => {
       ),
     ).toThrow("plan-locked concurrency group");
   });
+
+  it("rejects removal of native Windows installer lifecycle qualification", () => {
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          "qualify-super-synara-windows-installer.ts",
+          "qualification-script-removed.ts",
+        ),
+        audit,
+      ),
+    ).toThrow("Windows installer qualification contract");
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace("--repo Emanuele-web04/synara", "--repo untrusted/fork"),
+        audit,
+      ),
+    ).toThrow("Windows installer qualification contract");
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace("--current-version $env:VERSION", "--current-version 0.0.0-super.1"),
+        audit,
+      ),
+    ).toThrow("bind both upstream-core and previous-release selection");
+  });
 });

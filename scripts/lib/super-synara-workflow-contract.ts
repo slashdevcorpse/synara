@@ -122,6 +122,33 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
     "bun run dist:desktop:super:win --",
     "Windows publication must use the isolated Super packaging entry point.",
   );
+  for (const qualificationNeedle of [
+    "select-upstream-synara-release.ts",
+    "--repo Emanuele-web04/synara",
+    "select-previous-super-synara-release.ts",
+    "steps.previous_release.outputs.found == 'true'",
+    "qualify-super-synara-windows-installer.ts",
+    '"--upstream-installer", $env:UPSTREAM_INSTALLER',
+    '"--previous-installer", $env:PREVIOUS_INSTALLER',
+  ]) {
+    requireText(
+      main,
+      qualificationNeedle,
+      `Windows installer qualification contract is missing ${qualificationNeedle}.`,
+    );
+  }
+  if ((main.match(/--current-version \$env:VERSION/g)?.length ?? 0) < 2) {
+    throw new Error(
+      "Windows qualification must bind both upstream-core and previous-release selection to the requested Super version.",
+    );
+  }
+  const packagedStartupIndex = main.indexOf("verify-packaged-desktop-startup.ts");
+  const installerQualificationIndex = main.indexOf("qualify-super-synara-windows-installer.ts");
+  if (packagedStartupIndex < 0 || installerQualificationIndex <= packagedStartupIndex) {
+    throw new Error(
+      "Windows installer qualification must run after packaged startup verification.",
+    );
+  }
   requireText(
     main,
     "bun run dist:desktop:super:mac --",

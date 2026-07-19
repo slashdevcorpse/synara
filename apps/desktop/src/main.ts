@@ -534,6 +534,12 @@ function ensureInitialBackendWindowOpen(baseUrl: string): void {
       backendInitialWindowOpenInFlight = promise;
     },
     waitForBackendWindowReady,
+    onReady: () => {
+      if (app.isPackaged && process.env.SYNARA_DESKTOP_QUALIFICATION_EXIT_AFTER_STARTUP === "1") {
+        writeDesktopLogHeader("packaged startup qualification exit requested");
+        requestGracefulAppQuit("packaged startup qualification");
+      }
+    },
     writeLog: writeDesktopLogHeader,
     isReadinessAborted: isBackendReadinessAborted,
     formatErrorMessage,
