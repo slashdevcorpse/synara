@@ -1255,10 +1255,15 @@ const EDITOR_DISCOVERY_SUCCESS: EditorDiscoveryRuntimeResult = {
   subprocessCount: 1,
 };
 
-function assertExpectedEditorResult(editors: ReadonlyArray<string>, runtime: VersionRuntime): void {
+function assertExpectedEditorResult(
+  editors: ReadonlyArray<string>,
+  runtime: VersionRuntime,
+  elapsedMs: number,
+  subprocessCount: number,
+): void {
   if (editors.length !== 1 || editors[0] !== "vscode") {
     throw new Error(
-      `${runtime.label} editor workload returned ${JSON.stringify(editors)}; expected [\"vscode\"].`,
+      `${runtime.label} editor workload returned ${JSON.stringify(editors)} after ${elapsedMs.toFixed(2)} ms with ${subprocessCount} AppX subprocess; expected ["vscode"].`,
     );
   }
 }
@@ -1274,13 +1279,13 @@ function makeEditorScenario(
       runtime.editorAppDiscovery.clearWindowsStorePackageDiscoveryCache();
       const env = editorFixtureEnvironment(fixture);
       const startedAt = performance.now();
+      let editorResults: ReadonlyArray<ReadonlyArray<string>>;
       if (runtime.label === "base") {
-        const results = await Promise.all(
+        editorResults = await Promise.all(
           Array.from({ length: callers }, async () =>
             runtime.open.resolveAvailableEditors("win32", env),
           ),
         );
-        for (const editors of results) assertExpectedEditorResult(editors, runtime);
       } else {
         if (runtime.editorAvailability === null || !runtime.open.discoverAvailableEditors) {
           throw new Error("Candidate editor discovery/service path is unavailable.");
@@ -1308,12 +1313,16 @@ function makeEditorScenario(
             ),
           ),
         );
-        assertExpectedEditorResult(snapshot.availableEditors, runtime);
+        editorResults = [snapshot.availableEditors];
       }
+      const elapsedMs = performance.now() - startedAt;
       const subprocessCount = readAppxSubprocessCount(fixture);
       assertSingleEditorFixtureSubprocessCount(subprocessCount, runtime.label + " editor sample");
+      for (const editors of editorResults) {
+        assertExpectedEditorResult(editors, runtime, elapsedMs, subprocessCount);
+      }
       return {
-        elapsedMs: performance.now() - startedAt,
+        elapsedMs,
         subprocessCount,
         statusCategory: "resolved",
       };
