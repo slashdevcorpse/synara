@@ -136,6 +136,9 @@ describe("Super Synara release admission", () => {
     expect(readFileSync(join(directory, "UNSIGNED-BUILD.md"), "utf8")).toContain(
       "Do not disable Gatekeeper",
     );
+    expect(readFileSync(join(directory, "UNSIGNED-BUILD.md"), "utf8")).toContain(
+      "License and attribution: MIT; the complete license and copyright notice are included in the attached `LICENSE` file.",
+    );
     expect(
       verifyPreparedSuperSynaraRelease({
         directory,

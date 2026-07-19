@@ -129,27 +129,32 @@ export function enforceReleaseByteCap(
   return totalBytes;
 }
 
-export function renderUnsignedBuildWarning(
-  coordinates: SuperSynaraReleaseCoordinates,
-): string {
-  return `# Super Synara unsigned prerelease\n\n` +
+export function renderUnsignedBuildWarning(coordinates: SuperSynaraReleaseCoordinates): string {
+  return (
+    `# Super Synara unsigned prerelease\n\n` +
     `This is an unofficial downstream Super Synara build. It is publicly distributed without a trusted Windows publisher certificate, Apple Developer ID signature, or Apple notarization.\n\n` +
     `- Version: \`${coordinates.version}\`\n` +
     `- Tag: \`${coordinates.tag}\`\n` +
     `- Downstream commit: \`${coordinates.sourceCommit.toLowerCase()}\`\n` +
     `- Absorbed upstream SHA: \`${coordinates.absorbedUpstreamSha.toLowerCase()}\`\n` +
-    `- Updates: manual download only; no automatic updater feed is included.\n\n` +
+    `- Updates: manual download only; no automatic updater feed is included.\n` +
+    `- License and attribution: MIT; the complete license and copyright notice are included in the attached \`LICENSE\` file.\n\n` +
     `## Operating-system warnings\n\n` +
     `Windows may show **Unknown publisher** or Microsoft Defender SmartScreen, and organization policy or Smart App Control may block the installer.\n\n` +
     `macOS Gatekeeper may block the app. Use Apple's documented per-app Finder or Privacy & Security override: https://support.apple.com/en-ca/102445. Do not disable Gatekeeper or another system-wide security protection.\n\n` +
     `## Verify downloaded bytes\n\n` +
-    `Compute SHA-256 for the installer or DMG and compare it with \`SHA256SUMS.txt\`. The release index binds every published file to this exact tag, downstream commit, and absorbed upstream SHA.\n`;
+    `Compute SHA-256 for the installer or DMG and compare it with \`SHA256SUMS.txt\`. The release index binds every published file to this exact tag, downstream commit, and absorbed upstream SHA.\n`
+  );
 }
 
 function readManifest(directory: string, fileName: string): ReleaseArtifactProvenanceManifest {
-  const parsed = JSON.parse(readFileSync(join(directory, fileName), "utf8")) as ReleaseArtifactProvenanceManifest;
+  const parsed = JSON.parse(
+    readFileSync(join(directory, fileName), "utf8"),
+  ) as ReleaseArtifactProvenanceManifest;
   if (parsed.schemaVersion !== 2) {
-    throw new Error(`${fileName} has unsupported provenance schema ${String(parsed.schemaVersion)}.`);
+    throw new Error(
+      `${fileName} has unsupported provenance schema ${String(parsed.schemaVersion)}.`,
+    );
   }
   return parsed;
 }
@@ -192,7 +197,10 @@ function validatePlatformManifest(input: {
   ) {
     throw new Error(`${input.manifestFileName} does not contain the required unsigned evidence.`);
   }
-  if (manifest.artifacts.length !== 1 || manifest.artifacts[0]?.fileName !== input.payloadFileName) {
+  if (
+    manifest.artifacts.length !== 1 ||
+    manifest.artifacts[0]?.fileName !== input.payloadFileName
+  ) {
     throw new Error(`${input.manifestFileName} must describe exactly ${input.payloadFileName}.`);
   }
   const actual = digestFile(input.directory, input.payloadFileName);
@@ -239,19 +247,18 @@ export function prepareSuperSynaraRelease(input: {
   }
 
   const licenseEntry = lstatSync(input.licensePath);
-  if (!licenseEntry.isFile() || licenseEntry.isSymbolicLink() || basename(input.licensePath) !== "LICENSE") {
+  if (
+    !licenseEntry.isFile() ||
+    licenseEntry.isSymbolicLink() ||
+    basename(input.licensePath) !== "LICENSE"
+  ) {
     throw new Error("Release license source must be a regular root LICENSE file.");
   }
-  copyFileSync(
-    input.licensePath,
-    join(input.directory, names.license),
-    constants.COPYFILE_EXCL,
-  );
-  writeFileSync(
-    join(input.directory, names.warning),
-    renderUnsignedBuildWarning(coordinates),
-    { encoding: "utf8", flag: "wx" },
-  );
+  copyFileSync(input.licensePath, join(input.directory, names.license), constants.COPYFILE_EXCL);
+  writeFileSync(join(input.directory, names.warning), renderUnsignedBuildWarning(coordinates), {
+    encoding: "utf8",
+    flag: "wx",
+  });
 
   const checksumFiles = bytewiseSort([
     names.windowsInstaller,
