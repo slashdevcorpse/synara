@@ -31,6 +31,7 @@ import { Tooltip, TooltipPopup, TooltipTrigger } from "./ui/tooltip";
 
 const NO_USAGE_THREADS = [] as const;
 const selectNoUsageThreads = () => NO_USAGE_THREADS;
+const selectAllUsageThreads = createAllThreadsSelector();
 
 export interface ProviderUsageMenuModel {
   menuTitle: string;
@@ -143,7 +144,7 @@ export function useProviderUsageMenuModel(
 ): ProviderUsageMenuModel | null {
   const { settings } = useAppSettings();
   const selectAllThreads =
-    options.includeSupplementalData === false ? selectNoUsageThreads : createAllThreadsSelector();
+    options.includeSupplementalData === false ? selectNoUsageThreads : selectAllUsageThreads;
   const threads = useStore(selectAllThreads);
   const usageSummary = useProviderUsageSummary({
     provider,

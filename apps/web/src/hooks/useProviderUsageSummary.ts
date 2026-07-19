@@ -130,10 +130,14 @@ export function useProviderUsageSummary(input: {
   const learnMoreHref =
     deriveRateLimitLearnMoreHref(rateLimits) ?? deriveProviderUsageLearnMoreHref(provider);
 
+  const hasPendingProviderUsageSource =
+    allProviderUsageQuery.isPending ||
+    (shouldReadLocalUsageSnapshot && localUsageSnapshotQuery.isPending) ||
+    (shouldReadOpenUsageSnapshot && openUsageSnapshotQuery.isPending);
   const isLoading =
     shouldFetchLiveProviderUsage &&
-    allProviderUsageQuery.isPending &&
-    (!shouldReadLocalUsageSnapshot || localUsageSnapshotQuery.isPending) &&
+    !blocksProviderUsageFallback &&
+    hasPendingProviderUsageSource &&
     rateLimits.length === 0 &&
     usageLines.length === 0;
 

@@ -53,9 +53,12 @@ export function RenameDialog({
           {description ? <DialogDescription>{description}</DialogDescription> : null}
         </DialogHeader>
         {/* Field state lives below DialogPopup, which unmounts its children
-            after the close transition — each open seeds a fresh value from
-            initialValue without a reset effect. */}
+            after the close transition. Keying by the seed also resets draft,
+            save lock, focus, and event callbacks if the backing title changes
+            while the same popup is still open. Current callers cannot retarget
+            an open modal through the UI; ChatView closes it on thread changes. */}
         <RenameDialogForm
+          key={initialValue}
           initialValue={initialValue}
           allowEmpty={allowEmpty}
           placeholder={placeholder}
@@ -86,13 +89,16 @@ function RenameDialogForm({
   const [value, setValue] = useState(initialValue);
   const [isSaving, setIsSaving] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+  const mountedRef = useRef(true);
 
   useEffect(() => {
+    mountedRef.current = true;
     const frame = window.requestAnimationFrame(() => {
       inputRef.current?.focus();
       inputRef.current?.select();
     });
     return () => {
+      mountedRef.current = false;
       window.cancelAnimationFrame(frame);
     };
   }, []);
@@ -105,8 +111,11 @@ function RenameDialogForm({
     setIsSaving(true);
     try {
       await onSave(trimmed);
+      // Preserve successful-save close semantics when the title update itself
+      // changes initialValue and remounts this form before onSave settles.
       onOpenChange(false);
     } catch {
+      if (!mountedRef.current) return;
       setIsSaving(false);
     }
   };

@@ -13,10 +13,9 @@ import { SidebarSegmentedPicker } from "./Sidebar";
 import type { SidebarView } from "./Sidebar.logic";
 
 function selectedSegment(): string | null {
-  const buttons = document.querySelectorAll<HTMLButtonElement>(".sidebar-segmented-picker button");
   return (
-    Array.from(buttons).find((button) =>
-      button.classList.contains("text-[var(--color-text-foreground)]"),
+    document.querySelector<HTMLButtonElement>(
+      '.sidebar-segmented-picker button[aria-pressed="true"]',
     )?.textContent ?? null
   );
 }

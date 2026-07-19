@@ -2289,6 +2289,7 @@ function ChatThreadRouteView() {
   const recoveryStartedRef = useRef(false);
 
   useEffect(() => {
+    mountedRef.current = true;
     return () => {
       mountedRef.current = false;
     };

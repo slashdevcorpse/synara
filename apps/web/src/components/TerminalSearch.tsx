@@ -4,7 +4,7 @@
 // Exports: TerminalSearch
 
 import type { SearchAddon, ISearchOptions } from "@xterm/addon-search";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { IconButton } from "~/components/ui/icon-button";
 import { ChevronDownIcon, ChevronUpIcon, XIcon } from "~/lib/icons";
 import { cn } from "~/lib/utils";
@@ -64,11 +64,11 @@ export function TerminalSearch({ searchAddon, isOpen, onClose }: TerminalSearchP
     setHasResults(found);
   };
 
-  const clearSearchTimer = () => {
+  const clearSearchTimer = useCallback(() => {
     if (searchTimerRef.current === null) return;
     window.clearTimeout(searchTimerRef.current);
     searchTimerRef.current = null;
-  };
+  }, []);
 
   const scheduleSearch = (nextQuery: string) => {
     clearSearchTimer();

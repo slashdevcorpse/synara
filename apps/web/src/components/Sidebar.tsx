@@ -1329,6 +1329,7 @@ export function SidebarSegmentedPicker({
             <button
               key={view}
               type="button"
+              aria-pressed={active}
               className={cn(
                 "relative z-10 flex-1 rounded-md px-2.5 py-0.5 text-[11.5px] font-medium transition-colors duration-200",
                 active

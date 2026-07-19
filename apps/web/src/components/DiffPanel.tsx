@@ -360,6 +360,39 @@ interface DiffPanelProps {
   onEditorDiffOptionsChange?: (control: ReactNode | null) => void;
 }
 
+interface DiffOpenInitializationInput {
+  diffOpen: boolean;
+  selectedTurnId: TurnId | null;
+  diffWordWrap: boolean;
+  previousDiffOpenRef: { current: boolean };
+  setDiffWordWrap: (enabled: boolean) => void;
+  setDiffViewKind: (kind: DiffViewKind) => void;
+}
+
+export function scheduleDiffOpenInitialization({
+  diffOpen,
+  selectedTurnId,
+  diffWordWrap,
+  previousDiffOpenRef,
+  setDiffWordWrap,
+  setDiffViewKind,
+}: DiffOpenInitializationInput): (() => void) | undefined {
+  if (!diffOpen) {
+    previousDiffOpenRef.current = false;
+    return undefined;
+  }
+  if (previousDiffOpenRef.current) {
+    return undefined;
+  }
+
+  const timeoutId = window.setTimeout(() => {
+    previousDiffOpenRef.current = true;
+    setDiffWordWrap(diffWordWrap);
+    setDiffViewKind(resolveInitialDiffViewKind(selectedTurnId));
+  }, 0);
+  return () => window.clearTimeout(timeoutId);
+}
+
 export { DiffWorkerPoolProvider } from "./DiffWorkerPoolProvider";
 
 export default function DiffPanel({
@@ -758,18 +791,18 @@ export default function DiffPanel({
   // Timeout-0 keeps these two sync writes asynchronous (no wasted pre-paint
   // render), which also keeps this component eligible for React Compiler; the
   // panel opens behind a 300ms slide, so one tick is invisible.
-  useEffect(() => {
-    const wasOpen = previousDiffOpenRef.current;
-    previousDiffOpenRef.current = diffOpen;
-    if (!diffOpen || wasOpen) {
-      return;
-    }
-    const timeoutId = window.setTimeout(() => {
-      setDiffWordWrap(settings.diffWordWrap);
-      setDiffViewKind(resolveInitialDiffViewKind(selectedTurnId));
-    }, 0);
-    return () => window.clearTimeout(timeoutId);
-  }, [diffOpen, selectedTurnId, settings.diffWordWrap]);
+  useEffect(
+    () =>
+      scheduleDiffOpenInitialization({
+        diffOpen,
+        selectedTurnId,
+        diffWordWrap: settings.diffWordWrap,
+        previousDiffOpenRef,
+        setDiffWordWrap,
+        setDiffViewKind,
+      }),
+    [diffOpen, selectedTurnId, settings.diffWordWrap],
+  );
 
   useEffect(() => {
     if (selectedTurnId === null) {

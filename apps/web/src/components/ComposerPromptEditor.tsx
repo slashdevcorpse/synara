@@ -40,6 +40,7 @@ import {
   useEffect,
   useImperativeHandle,
   useLayoutEffect,
+  useMemo,
   useRef,
   type ClipboardEventHandler,
   type Ref,
@@ -1219,21 +1220,26 @@ export const ComposerPromptEditor = forwardRef<
   // Normalize once at the wrapper boundary so the inner editor can treat mention refs as concrete.
   const normalizedMentionReferences = mentionReferences ?? [];
   const initialMentionReferencesRef = useRef(normalizedMentionReferences);
-  const initialConfig: InitialConfigType = {
-    namespace: "synara-composer-editor",
-    editable: true,
-    nodes: [...COMPOSER_NODE_CLASSES],
-    editorState: () => {
-      $setComposerEditorPrompt(
-        initialValueRef.current,
-        initialTerminalContextsRef.current,
-        initialMentionReferencesRef.current,
-      );
-    },
-    onError: (error) => {
-      throw error;
-    },
-  };
+  // Lexical consumes this as one-time editor configuration. Keep its identity
+  // stable because React Compiler cannot optimize this component today.
+  const initialConfig = useMemo<InitialConfigType>(
+    () => ({
+      namespace: "synara-composer-editor",
+      editable: true,
+      nodes: [...COMPOSER_NODE_CLASSES],
+      editorState: () => {
+        $setComposerEditorPrompt(
+          initialValueRef.current,
+          initialTerminalContextsRef.current,
+          initialMentionReferencesRef.current,
+        );
+      },
+      onError: (error) => {
+        throw error;
+      },
+    }),
+    [],
+  );
 
   return (
     <LexicalComposer key={COMPOSER_EDITOR_HMR_KEY} initialConfig={initialConfig}>

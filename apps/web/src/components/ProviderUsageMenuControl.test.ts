@@ -55,4 +55,23 @@ describe("ProviderUsageMenuControl", () => {
     expect(firstThreads).toEqual([]);
     expect(secondThreads).toBe(firstThreads);
   });
+
+  it("reuses the all-threads selector when supplemental data is enabled", () => {
+    const options = {
+      includeEmptyState: true as const,
+      includeSupplementalData: true,
+    };
+
+    useProviderUsageMenuModel("codex", options);
+    useProviderUsageMenuModel("codex", options);
+
+    expect(mocks.createAllThreadsSelector).not.toHaveBeenCalled();
+    expect(mocks.useStore).toHaveBeenCalledTimes(2);
+    expect(mocks.useStore.mock.calls[1]![0]).toBe(mocks.useStore.mock.calls[0]![0]);
+    expect(mocks.useProviderUsageSummary).toHaveBeenCalledTimes(2);
+    const firstThreads = mocks.useProviderUsageSummary.mock.calls[0]![0].threads;
+    const secondThreads = mocks.useProviderUsageSummary.mock.calls[1]![0].threads;
+    expect(firstThreads).toEqual(["supplemental-thread"]);
+    expect(secondThreads).toEqual(firstThreads);
+  });
 });

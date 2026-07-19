@@ -104,8 +104,8 @@ function RightDockTab(props: {
 
 // Persist which keep-mounted panes (e.g. terminals) have been activated so they
 // stay in the DOM while another tab is selected, pruned to live panes so closed
-// panes drop out and the set never leaks across thread switches. The set is
-// The rendered set is derived synchronously so a kept pane never unmounts for a
+// panes drop out and the set never leaks across thread switches. The rendered
+// set is derived synchronously so a kept pane never unmounts for a
 // frame. A layout effect commits that set for the next render without mutating a
 // ref during render (which is unsafe when React replays or abandons work).
 function useKeepMountedPaneIds(

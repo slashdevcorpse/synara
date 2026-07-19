@@ -3,7 +3,7 @@
 // Layer: Web settings UI
 // Exports: ThemePackEditor
 
-import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { HexColorPicker } from "react-colorful";
 import { Button } from "./ui/button";
 import {
@@ -314,13 +314,13 @@ function ColorPill({
     colorRef.current = color;
   }, [color]);
 
-  const clearCommitTimer = () => {
+  const clearCommitTimer = useCallback(() => {
     if (commitTimerRef.current === null) {
       return;
     }
     window.clearTimeout(commitTimerRef.current);
     commitTimerRef.current = null;
-  };
+  }, []);
 
   // Explicit undefined check instead of a ref-reading default parameter,
   // which React Compiler does not support yet (it would skip this component).

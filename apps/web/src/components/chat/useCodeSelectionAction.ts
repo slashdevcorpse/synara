@@ -31,12 +31,21 @@ export function useCodeSelectionAction<T>(options: {
   commit: () => void;
 } {
   const { enabled, onCommit, readSelection } = options;
-  const [pendingActionState, setPendingAction] = useState<PendingCodeSelectionAction<T> | null>(
-    null,
-  );
-  // Derived: disabling clears the visible action in the same render, with no
-  // state-resetting effect (the stale state simply stops being surfaced).
-  const pendingAction = enabled ? pendingActionState : null;
+  const [selectionState, setSelectionState] = useState<{
+    enabled: boolean;
+    pendingAction: PendingCodeSelectionAction<T> | null;
+  }>(() => ({ enabled, pendingAction: null }));
+  // Reset while reconciling an enabled transition. Merely hiding the action
+  // while disabled lets the old payload reappear if the surface is enabled
+  // again before another selection is made.
+  if (selectionState.enabled !== enabled) {
+    setSelectionState({ enabled, pendingAction: null });
+  }
+  const pendingAction =
+    enabled && selectionState.enabled === enabled ? selectionState.pendingAction : null;
+  const setPendingAction = (next: PendingCodeSelectionAction<T> | null) => {
+    setSelectionState({ enabled, pendingAction: next });
+  };
 
   const onContainerMouseUp: MouseEventHandler<HTMLElement> = (event) => {
     const container = event.currentTarget;

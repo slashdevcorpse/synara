@@ -6,7 +6,7 @@ import type { ProviderKind, ServerProviderUsageSnapshot } from "@synara/contract
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { openUsageQueryKeys } from "~/lib/openUsageReactQuery";
 import type { ProviderRateLimit } from "~/lib/rateLimits";
@@ -317,6 +317,40 @@ describe("useProviderUsageSummary", () => {
     expect(summary.snapshotStatus).toBeNull();
     expect(summary.snapshotDetail).toBeNull();
     expect(summary.isLoading).toBe(true);
+  });
+
+  it("stays loading while OpenUsage is the only pending provider-usage source", () => {
+    vi.stubGlobal("window", {
+      localStorage: {
+        getItem: () => "true",
+      },
+    });
+
+    try {
+      const queryClient = createQueryClient();
+      queryClient.setQueryData(serverQueryKeys.allProviderUsage("claudeAgent"), []);
+      queryClient.setQueryData(
+        serverQueryKeys.providerUsage("claudeAgent", null),
+        snapshot({ status: "ok" }),
+      );
+
+      const summary = readProviderUsageSummary({ queryClient });
+
+      expect(queryClient.getQueryData(openUsageQueryKeys.provider("claudeAgent"))).toBeUndefined();
+      expect(summary.rateLimits).toEqual([]);
+      expect(summary.usageLines).toEqual([]);
+      expect(summary.isLoading).toBe(true);
+
+      queryClient.setQueryData(openUsageQueryKeys.provider("claudeAgent"), {
+        providerId: "claude",
+        fetchedAt: "2026-06-09T12:00:00.000Z",
+        lines: [],
+      });
+
+      expect(readProviderUsageSummary({ queryClient }).isLoading).toBe(false);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it("does not read any cached query when live fetching is disabled without an explicit snapshot", () => {

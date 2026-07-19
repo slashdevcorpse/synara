@@ -31,7 +31,9 @@ export function ProjectSidebarIcon({
     const cached = projectFaviconPresence.get(faviconSrc);
     return cached === undefined ? null : { src: faviconSrc, present: cached };
   });
-  const hasFavicon = probe !== null && probe.src === faviconSrc && probe.present;
+  const cachedPresence = projectFaviconPresence.get(faviconSrc);
+  const hasFavicon =
+    probe !== null && probe.src === faviconSrc ? probe.present : cachedPresence === true;
   const FolderGlyph = expanded ? FolderOpen : FolderClosed;
 
   // Probe with Image() so Electron/file-origin behaves like the actual visible

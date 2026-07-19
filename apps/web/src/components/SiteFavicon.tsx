@@ -37,11 +37,12 @@ export const SiteFavicon = function SiteFavicon({ url, size, className }: SiteFa
     const cached = siteFaviconStatusCache.get(faviconSrc);
     return cached === undefined ? null : { src: faviconSrc, status: cached };
   });
+  const cachedStatus = faviconSrc ? siteFaviconStatusCache.get(faviconSrc) : undefined;
   const status: "ok" | "fail" | null = !faviconSrc
     ? "fail"
     : probe !== null && probe.src === faviconSrc
       ? probe.status
-      : null;
+      : (cachedStatus ?? null);
 
   // Probe with Image() (via the shared, de-duped helper) so Electron/file-origin
   // behaves like the visible <img> and every consumer reuses one load per host.

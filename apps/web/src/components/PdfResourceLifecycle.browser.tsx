@@ -175,6 +175,46 @@ describe("local preview resource generations", () => {
 });
 
 describe("PDF page draft", () => {
+  it("preserves an active page draft while scrolling changes the visible page", async () => {
+    function ToolbarHarness() {
+      const [currentPage, setCurrentPage] = useState(1);
+      return (
+        <>
+          <button
+            type="button"
+            onMouseDown={(event) => event.preventDefault()}
+            onClick={() => setCurrentPage(2)}
+          >
+            Scroll to 2
+          </button>
+          <PdfViewerToolbar
+            fileName="document.pdf"
+            currentPage={currentPage}
+            numPages={9}
+            onJumpToPage={setCurrentPage}
+            zoomMode={{ type: "custom", scale: 1 }}
+            scale={1}
+            onZoomIn={vi.fn()}
+            onZoomOut={vi.fn()}
+            onSetScale={vi.fn()}
+            onFitWidth={vi.fn()}
+            onFitPage={vi.fn()}
+            openInTarget={null}
+          />
+        </>
+      );
+    }
+
+    await render(<ToolbarHarness />);
+    await browserPage.getByRole("textbox", { name: "Current page" }).fill("9");
+    await browserPage.getByRole("button", { name: "Scroll to 2" }).click();
+
+    expect(document.activeElement?.getAttribute("aria-label")).toBe("Current page");
+    expect(
+      document.querySelector<HTMLInputElement>('input[aria-label="Current page"]')?.value,
+    ).toBe("9");
+  });
+
   it("does not revive an old draft when currentPage returns to its base", async () => {
     function ToolbarHarness() {
       const [currentPage, setCurrentPage] = useState(1);

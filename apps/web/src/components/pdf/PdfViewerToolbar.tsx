@@ -82,7 +82,6 @@ export const PdfViewerToolbar = function PdfViewerToolbar(props: PdfViewerToolba
           <ChevronLeftIcon aria-hidden="true" className="size-4" />
         </ChatHeaderIconButton>
         <PdfPageIndicator
-          key={props.currentPage}
           currentPage={props.currentPage}
           numPages={props.numPages}
           onJumpToPage={props.onJumpToPage}
@@ -165,9 +164,9 @@ function PdfPageIndicator({
   numPages: number;
   onJumpToPage: (pageNumber: number) => void;
 }) {
-  // The caller keys this editor by currentPage, so every navigation gets a new
-  // draft even when the page sequence returns A -> B -> A.
   const [draft, setDraft] = useState(String(currentPage));
+  const [editing, setEditing] = useState(false);
+  const value = editing ? draft : String(currentPage);
 
   const commit = () => {
     const parsed = Number.parseInt(draft, 10);
@@ -175,7 +174,7 @@ function PdfPageIndicator({
       const clamped = Math.min(Math.max(parsed, 1), Math.max(numPages, 1));
       onJumpToPage(clamped);
       // Canonicalize in place for jumps that clamp to the current page: the
-      // keyed remount only resets the draft when the page actually changes.
+      // controlled page value takes over again after editing finishes.
       setDraft(String(clamped));
     } else {
       setDraft(String(currentPage));
@@ -185,12 +184,19 @@ function PdfPageIndicator({
   return (
     <span className="flex items-center gap-1 text-[11px] tabular-nums text-muted-foreground">
       <input
-        value={draft}
+        value={value}
         inputMode="numeric"
         aria-label="Current page"
         className="h-6 w-8 rounded-sm border border-border/60 bg-transparent text-center text-[11px] text-foreground tabular-nums outline-none focus-visible:border-[color:var(--color-border-focus)]"
+        onFocus={() => {
+          setDraft(String(currentPage));
+          setEditing(true);
+        }}
         onChange={(event) => setDraft(event.target.value.replace(/[^0-9]/g, ""))}
-        onBlur={commit}
+        onBlur={() => {
+          commit();
+          setEditing(false);
+        }}
         onKeyDown={(event) => {
           if (event.key === "Enter") {
             event.currentTarget.blur();
