@@ -8,7 +8,7 @@ import {
   type TerminalOpenInput,
   type TerminalRestartInput,
 } from "@synara/contracts";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   PtySpawnError,
@@ -18,7 +18,6 @@ import {
   type PtySpawnInput,
 } from "../Services/PTY";
 import {
-  __terminalManagerShellTesting,
   TerminalManagerRuntime,
   type TerminalSubprocessActivity,
 } from "./Manager";
@@ -28,6 +27,11 @@ import {
   createTerminalHistoryMetadata,
   terminalHistoryMetadataPath,
 } from "../terminalHistoryRecord";
+import type {
+  TerminalShellResolver,
+  WindowsExplicitShellChoice,
+  WindowsShellSelectionDependencies,
+} from "../windowsShellSelection";
 
 class FakePtyProcess implements PtyProcess {
   readonly writes: string[] = [];
@@ -196,40 +200,13 @@ describe("TerminalManager", () => {
     }
   });
 
-  it("prefers PowerShell for new Windows terminals before cmd.exe fallbacks", () => {
-    const candidates = __terminalManagerShellTesting.resolveShellCandidates(
-      () => __terminalManagerShellTesting.windowsDefaultTerminalShell,
-      {
-        envComSpec: "C:\\Windows\\System32\\cmd.exe",
-        platform: "win32",
-      },
-    );
-
-    expect(candidates.map((candidate) => candidate.shell)).toEqual([
-      "powershell.exe",
-      "C:\\Windows\\System32\\cmd.exe",
-      "cmd.exe",
-    ]);
-  });
-
-  it("keeps explicit Windows shell requests ahead of PowerShell defaults", () => {
-    const candidates = __terminalManagerShellTesting.resolveShellCandidates(() => "pwsh.exe", {
-      envComSpec: "C:\\Windows\\System32\\cmd.exe",
-      platform: "win32",
-    });
-
-    expect(candidates.map((candidate) => candidate.shell)).toEqual([
-      "pwsh.exe",
-      "C:\\Windows\\System32\\cmd.exe",
-      "powershell.exe",
-      "cmd.exe",
-    ]);
-  });
-
   function makeManager(
     historyLineLimit = 5,
     options: {
-      shellResolver?: () => string;
+      shellResolver?: TerminalShellResolver;
+      shellPlatform?: NodeJS.Platform;
+      shellEnvironment?: NodeJS.ProcessEnv;
+      windowsShellSelectionDependencies?: WindowsShellSelectionDependencies;
       subprocessChecker?: (terminalPid: number) => Promise<boolean | TerminalSubprocessActivity>;
       processTreeKiller?: ProcessTreeKiller;
       subprocessPollIntervalMs?: number;
@@ -243,11 +220,23 @@ describe("TerminalManager", () => {
     tempDirs.push(logsDir);
     options.prepareLogs?.(logsDir);
     const ptyAdapter = options.ptyAdapter ?? new FakePtyAdapter();
+    const shellPlatform = options.shellPlatform ?? process.platform;
+    const defaultShellChoice: WindowsExplicitShellChoice = {
+      executable: "C:\\Synara Test\\fake-shell.exe",
+      args: [],
+    };
     const manager = new TerminalManagerRuntime({
       logsDir,
       ptyAdapter,
       historyLineLimit,
-      shellResolver: options.shellResolver ?? (() => "/bin/bash"),
+      shellResolver:
+        options.shellResolver ??
+        (() => (shellPlatform === "win32" ? defaultShellChoice : "/bin/bash")),
+      shellPlatform,
+      ...(options.shellEnvironment ? { shellEnvironment: options.shellEnvironment } : {}),
+      ...(options.windowsShellSelectionDependencies
+        ? { windowsShellSelectionDependencies: options.windowsShellSelectionDependencies }
+        : {}),
       ...(options.subprocessChecker ? { subprocessChecker: options.subprocessChecker } : {}),
       ...(options.processTreeKiller ? { processTreeKiller: options.processTreeKiller } : {}),
       ...(options.subprocessPollIntervalMs
@@ -260,6 +249,164 @@ describe("TerminalManager", () => {
     });
     return { logsDir, ptyAdapter, manager };
   }
+
+  it("evaluates a structured explicit Windows choice once and forwards its exact arguments", async () => {
+    const explicitArgs = ["", "two words", '"quoted"', "&|<>^%", "日本語"];
+    const resolveExplicit = vi.fn(() => ({
+      executable: "C:\\Program Files\\Éditeur & Tools\\shell.exe",
+      args: explicitArgs,
+    }));
+    const { manager, ptyAdapter } = makeManager(5, {
+      shellPlatform: "win32",
+      shellResolver: resolveExplicit,
+    });
+
+    const snapshot = await manager.open(openInput());
+
+    expect(snapshot.status).toBe("running");
+    expect(resolveExplicit).toHaveBeenCalledTimes(1);
+    expect(ptyAdapter.spawnInputs).toHaveLength(1);
+    expect(ptyAdapter.spawnInputs[0]?.shell).toBe(
+      "C:\\Program Files\\Éditeur & Tools\\shell.exe",
+    );
+    expect(ptyAdapter.spawnInputs[0]?.args).toEqual(explicitArgs);
+    expect(ptyAdapter.spawnInputs[0]?.args).not.toBe(explicitArgs);
+
+    await manager.restart(restartInput());
+    expect(resolveExplicit).toHaveBeenCalledTimes(2);
+    manager.dispose();
+  });
+
+  it.each([
+    [
+      "resolver failure",
+      () => {
+        throw new Error("C:\\Users\\secret\\profile-output");
+      },
+      "Explicit Windows terminal shell could not be resolved.",
+    ],
+    [
+      "invalid value",
+      () => ({ executable: "C:\\secret\0shell.exe", args: ["secret"] }),
+      "Explicit Windows terminal shell is invalid.",
+    ],
+  ])("fails closed on explicit Windows %s", async (_label, shellResolver, expectedMessage) => {
+    const { manager, ptyAdapter } = makeManager(5, {
+      shellPlatform: "win32",
+      shellResolver: shellResolver as TerminalShellResolver,
+    });
+    const events: TerminalEvent[] = [];
+    manager.on("event", (event) => events.push(event));
+
+    const snapshot = await manager.open(openInput());
+
+    expect(snapshot.status).toBe("error");
+    expect(ptyAdapter.spawnInputs).toEqual([]);
+    expect(events.find((event) => event.type === "error")).toMatchObject({
+      message: expectedMessage,
+    });
+    expect(JSON.stringify(events)).not.toMatch(/secret|profile-output/i);
+    manager.dispose();
+  });
+
+  it("does not fall through after an explicit Windows PTY launch failure", async () => {
+    const { manager, ptyAdapter } = makeManager(5, {
+      shellPlatform: "win32",
+      shellResolver: () => ({ executable: "C:\\private\\missing.exe", args: ["secret"] }),
+    });
+    const events: TerminalEvent[] = [];
+    manager.on("event", (event) => events.push(event));
+    ptyAdapter.spawnFailures.push(Object.assign(new Error("secret ENOENT"), { code: "ENOENT" }));
+
+    const snapshot = await manager.open(openInput());
+
+    expect(snapshot.status).toBe("error");
+    expect(ptyAdapter.spawnInputs).toHaveLength(1);
+    expect(events.find((event) => event.type === "error")).toMatchObject({
+      message: "Explicit Windows terminal shell failed to start.",
+    });
+    expect(JSON.stringify(events)).not.toMatch(/private|secret|missing\.exe/i);
+    manager.dispose();
+  });
+
+  it("advances through the exact Windows automatic order only for not-found PTY races", async () => {
+    const resolveExplicit = vi.fn(() => null);
+    const probes: string[] = [];
+    const validations: string[] = [];
+    const { manager, ptyAdapter } = makeManager(5, {
+      shellPlatform: "win32",
+      shellResolver: resolveExplicit,
+      shellEnvironment: {
+        SystemRoot: "C:\\Windows",
+        ComSpec: "D:\\Command Tools\\cmd.exe",
+      },
+      windowsShellSelectionDependencies: {
+        probePowerShell: async (executable) => {
+          probes.push(executable);
+          return null;
+        },
+        validateExecutable: async (executable) => {
+          validations.push(executable);
+          return null;
+        },
+      },
+    });
+    ptyAdapter.spawnFailures.push(
+      Object.assign(new Error("race one"), { code: "ENOENT" }),
+      Object.assign(new Error("race two"), { code: "ENOENT" }),
+      Object.assign(new Error("file not found"), { code: "ENOENT" }),
+    );
+
+    const snapshot = await manager.open(openInput());
+
+    expect(snapshot.status).toBe("running");
+    expect(resolveExplicit).toHaveBeenCalledTimes(1);
+    expect(ptyAdapter.spawnInputs.map(({ shell, args }) => ({ shell, args }))).toEqual([
+      { shell: "pwsh", args: ["-NoLogo"] },
+      {
+        shell: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+        args: ["-NoLogo"],
+      },
+      { shell: "D:\\Command Tools\\cmd.exe", args: [] },
+      { shell: "C:\\Windows\\System32\\cmd.exe", args: [] },
+    ]);
+    expect(probes).toEqual([
+      "pwsh",
+      "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+    ]);
+    expect(validations).toEqual([
+      "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+      "D:\\Command Tools\\cmd.exe",
+      "C:\\Windows\\System32\\cmd.exe",
+    ]);
+    ptyAdapter.processes.at(-1)?.emitExit({ exitCode: 0, signal: null });
+    manager.dispose();
+  });
+
+  it("stops on a non-not-found automatic PTY failure and sanitizes the event", async () => {
+    const { manager, ptyAdapter } = makeManager(5, {
+      shellPlatform: "win32",
+      shellResolver: () => null,
+      shellEnvironment: { SystemRoot: "C:\\private", ComSpec: "D:\\private\\cmd.exe" },
+      windowsShellSelectionDependencies: {
+        probePowerShell: async () => null,
+        validateExecutable: async () => null,
+      },
+    });
+    const events: TerminalEvent[] = [];
+    manager.on("event", (event) => events.push(event));
+    ptyAdapter.spawnFailures.push(new Error("native binding SECRET failure"));
+
+    const snapshot = await manager.open(openInput());
+
+    expect(snapshot.status).toBe("error");
+    expect(ptyAdapter.spawnInputs).toHaveLength(1);
+    expect(events.find((event) => event.type === "error")).toMatchObject({
+      message: "Windows terminal shell failed to start (PowerShell 7: launch failed).",
+    });
+    expect(JSON.stringify(events)).not.toMatch(/private|SECRET|native binding/i);
+    manager.dispose();
+  });
 
   it("spawns lazily and reuses running terminal per thread", async () => {
     const { manager, ptyAdapter } = makeManager();
@@ -1285,13 +1432,10 @@ describe("TerminalManager", () => {
     manager.dispose();
   });
 
-  it("retries with fallback shells when preferred shell spawn fails", async () => {
-    const missingShellCommand =
-      process.platform === "win32"
-        ? "C:\\definitely\\missing-shell.exe"
-        : "/definitely/missing-shell -l";
+  it("preserves POSIX parsing and fallback when the preferred shell spawn fails", async () => {
     const { manager, ptyAdapter } = makeManager(5, {
-      shellResolver: () => missingShellCommand,
+      shellPlatform: "linux",
+      shellResolver: () => "/definitely/missing-shell -l",
     });
     ptyAdapter.spawnFailures.push(new Error("posix_spawnp failed."));
 
@@ -1299,31 +1443,18 @@ describe("TerminalManager", () => {
 
     expect(snapshot.status).toBe("running");
     expect(ptyAdapter.spawnInputs.length).toBeGreaterThanOrEqual(2);
-    expect(ptyAdapter.spawnInputs[0]?.shell).toBe(
-      process.platform === "win32" ? missingShellCommand : "/definitely/missing-shell",
-    );
-
-    if (process.platform === "win32") {
-      expect(
-        ptyAdapter.spawnInputs.some(
-          (input) =>
-            path.win32.basename(input.shell).toLowerCase() === "cmd.exe" ||
-            path.win32.basename(input.shell).toLowerCase() === "powershell.exe",
-        ),
-      ).toBe(true);
-    } else {
-      expect(
-        ptyAdapter.spawnInputs.some((input) =>
-          ["/bin/zsh", "/bin/bash", "/bin/sh", "zsh", "bash", "sh"].includes(input.shell),
-        ),
-      ).toBe(true);
-    }
+    expect(ptyAdapter.spawnInputs[0]?.shell).toBe("/definitely/missing-shell");
+    expect(
+      ptyAdapter.spawnInputs.some((input) =>
+        ["/bin/zsh", "/bin/bash", "/bin/sh", "zsh", "bash", "sh"].includes(input.shell),
+      ),
+    ).toBe(true);
 
     manager.dispose();
   });
 
   it("emits nested PTY spawn failure details", async () => {
-    const { manager, ptyAdapter } = makeManager();
+    const { manager, ptyAdapter } = makeManager(5, { shellPlatform: "linux" });
     const events: TerminalEvent[] = [];
     manager.on("event", (event) => {
       events.push(event);
@@ -1455,8 +1586,8 @@ describe("TerminalManager", () => {
   });
 
   it("starts zsh as a login shell with prompt spacer disabled", async () => {
-    if (process.platform === "win32") return;
     const { manager, ptyAdapter } = makeManager(5, {
+      shellPlatform: "linux",
       shellResolver: () => "/bin/zsh",
     });
     await manager.open(openInput());
