@@ -4,7 +4,8 @@
 // Layer: Release/CI smoke check
 
 import { createRequire } from "node:module";
-import { dirname, resolve } from "node:path";
+import { chmodSync, lstatSync } from "node:fs";
+import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
@@ -28,6 +29,46 @@ try {
 }
 
 const isWindows = process.platform === "win32";
+
+if (process.platform === "darwin") {
+  try {
+    const nodePtyPackageRoot = dirname(requireFromTarget.resolve("node-pty/package.json"));
+    const selectedNativeModules = Object.keys(requireFromTarget.cache).filter((modulePath) => {
+      const relativeModulePath = relative(nodePtyPackageRoot, modulePath);
+      const isInsidePackage =
+        relativeModulePath !== ".." &&
+        !relativeModulePath.startsWith(`..${sep}`) &&
+        !isAbsolute(relativeModulePath);
+      return isInsidePackage && modulePath.endsWith(`${sep}pty.node`);
+    });
+
+    if (selectedNativeModules.length !== 1) {
+      fail(
+        `Expected exactly one loaded node-pty native module, found ${selectedNativeModules.length}.`,
+        selectedNativeModules.join("\n"),
+      );
+    }
+
+    const spawnHelperPath = resolve(dirname(selectedNativeModules[0]), "spawn-helper");
+    const spawnHelperStat = lstatSync(spawnHelperPath);
+
+    if (spawnHelperStat.isSymbolicLink() || !spawnHelperStat.isFile()) {
+      fail(`Refusing to execute unsafe node-pty spawn helper: ${spawnHelperPath}`);
+    }
+
+    const executableBits = 0o111;
+    if ((spawnHelperStat.mode & executableBits) !== executableBits) {
+      chmodSync(spawnHelperPath, spawnHelperStat.mode | executableBits);
+      console.log(`[node-pty-smoke] Restored execute permissions on ${spawnHelperPath}.`);
+    }
+  } catch (error) {
+    fail(
+      "Failed to qualify the node-pty spawn helper.",
+      error instanceof Error ? error.stack : String(error),
+    );
+  }
+}
+
 const shell = isWindows ? process.env.ComSpec || "cmd.exe" : "/bin/sh";
 const args = isWindows
   ? ["/d", "/s", "/c", `echo ${expectedOutput}`]
