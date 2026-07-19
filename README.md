@@ -1,6 +1,9 @@
-# Synara
+# Super Synara
 
-Synara is a local-first desktop app for coding with the AI agents and subscriptions you already use.
+Super Synara is an unofficial downstream build of [Synara](https://github.com/Emanuele-web04/Synara), a local-first desktop app for coding with the AI agents and subscriptions you already use.
+
+> [!IMPORTANT]
+> Super Synara is independently maintained, unsigned, and distributed as a prerelease. It is not endorsed or supported by the upstream Synara project. Updates are manual: download each new release from the [Super Synara releases page](https://github.com/slashdevcorpse/synara/releases), verify its published SHA-256 checksum, and install it yourself.
 
 It brings chats, terminals, browser previews, diffs, branches, provider sessions, and handoffs into one focused workspace so you can run agent work without juggling a dozen windows.
 
@@ -20,7 +23,7 @@ It brings chats, terminals, browser previews, diffs, branches, provider sessions
 > [!WARNING]
 > You need to have [Codex CLI](https://github.com/openai/codex) installed and authorized for Codex sessions to work.
 
-Install the [desktop app from the Releases page](https://github.com/Emanuele-web04/Synara/releases), or download it from [trysynara.com](https://www.trysynara.com/).
+Install an unsigned prerelease from the [Super Synara releases page](https://github.com/slashdevcorpse/synara/releases). Read the [Super Synara installation guide](./docs/super-synara-install.md) before running a download; it covers checksum verification and the per-app Windows SmartScreen and macOS Gatekeeper prompts. Do not disable either operating-system protection globally.
 
 You can also run Synara locally while the project is still early:
 
@@ -45,4 +48,10 @@ Focused issues and PRs are welcome, especially bug fixes, reliability fixes, and
 
 Read [CONTRIBUTING.md](./CONTRIBUTING.md) before opening an issue or PR.
 
-Need support? [Open a GitHub issue](https://github.com/Emanuele-web04/synara/issues).
+Need Super Synara support? [Open an issue in the downstream repository](https://github.com/slashdevcorpse/synara/issues). Do not send Super Synara support requests to the upstream Synara maintainers.
+
+## Identity and attribution
+
+Super Synara installs beside upstream Synara with a separate application identity, URL scheme, desktop profile, backend home, and Windows installer registration. It does not intentionally reuse or migrate the upstream Synara profile.
+
+Super Synara is derived from [Synara](https://github.com/Emanuele-web04/Synara), copyright © 2026 Emanuele Di Pietro, and is distributed under the [MIT License](./LICENSE). The upstream project and its maintainers do not provide support for this downstream build.
