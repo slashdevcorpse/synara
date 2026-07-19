@@ -1,22 +1,30 @@
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
+
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import { assertSuccess } from "@effect/vitest/utils";
 import { EDITORS } from "@synara/contracts";
 import { FileSystem, Path, Effect } from "effect";
+import { expect, vi } from "vitest";
 
 import {
+  discoverAvailableEditors,
   isCommandAvailable,
   launchDetached,
   resolveAvailableEditors,
+  resolveEditorDiscoveryIdentity,
   resolveEditorLaunch,
   resolveWindowsEditorUriLaunch,
 } from "./open";
 import {
   clearWindowsStorePackageDiscoveryCache,
+  discoverWindowsStorePackageInstallLocations,
   getEditorWindowsStorePackages,
   resolveWindowsStorePackageDirectory,
   resolveWindowsStorePackageDirectoryFromPowerShell,
   resolveWindowsStorePackageInstallLocation,
+  WINDOWS_STORE_BULK_LOOKUP_OUTPUT_LIMIT_BYTES,
 } from "./editorAppDiscovery";
 
 function encodeExpectedWindowsEditorUriPath(targetPath: string): string {
@@ -27,12 +35,24 @@ function encodeExpectedWindowsEditorUriPath(targetPath: string): string {
     .join("/");
 }
 
-function shellSingleQuote(value: string): string {
-  return `'${value.replaceAll("'", "'\\''")}'`;
+type FakeAppxChild = EventEmitter & {
+  stdout: PassThrough;
+  stderr: PassThrough;
+  kill: () => boolean;
+};
+
+function makeFakeAppxChild(kill: () => boolean = () => true): FakeAppxChild {
+  const child = new EventEmitter() as FakeAppxChild;
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.kill = kill;
+  return child;
 }
 
-function fakePowerShellAppxScript(installLocation: string): string {
-  return `#!/bin/sh\nprintf '%s\\n' ${shellSingleQuote(installLocation)}\n`;
+function vscodeStorePackages() {
+  const editor = EDITORS.find((candidate) => candidate.id === "vscode");
+  assert.ok(editor);
+  return getEditorWindowsStorePackages(editor) ?? [];
 }
 
 it.layer(NodeServices.layer)("resolveEditorLaunch", (it) => {
@@ -553,19 +573,17 @@ it.layer(NodeServices.layer)("resolveAvailableEditors", (it) => {
       );
       yield* fs.makeDirectory(installLocation, { recursive: true });
       yield* fs.makeDirectory(binDir, { recursive: true });
-      yield* fs.writeFileString(
-        path.join(binDir, "powershell.exe"),
-        fakePowerShellAppxScript(installLocation),
-      );
-      yield* fs.chmod(path.join(binDir, "powershell.exe"), 0o755);
-
       clearWindowsStorePackageDiscoveryCache();
 
-      const editors = resolveAvailableEditors("win32", {
-        PATH: binDir,
-        PATHEXT: ".COM;.EXE;.BAT;.CMD",
-        ProgramFiles: programFiles,
-      });
+      const editors = resolveAvailableEditors(
+        "win32",
+        {
+          PATH: binDir,
+          PATHEXT: ".COM;.EXE;.BAT;.CMD",
+          ProgramFiles: programFiles,
+        },
+        { lookupWindowsStorePackage: () => installLocation },
+      );
 
       assert.equal(editors.includes("vscode"), true);
     }),
@@ -685,4 +703,308 @@ it.layer(NodeServices.layer)("resolveAvailableEditors", (it) => {
       assert.equal(installLocation, null);
     }),
   );
+});
+
+it.layer(NodeServices.layer)("discoverAvailableEditors", (it) => {
+  it("keeps Unicode-distinct Windows cwd identities distinct in both comparison orders", () => {
+    const dottedCapitalI = resolveEditorDiscoveryIdentity({
+      platform: "win32",
+      cwd: "C:\\workspace\\İ",
+      env: { PATH: "C:\\bin", PATHEXT: ".EXE" },
+    });
+    const lowercaseIWithCombiningDot = resolveEditorDiscoveryIdentity({
+      platform: "win32",
+      cwd: "C:\\workspace\\i\u0307",
+      env: { PATH: "C:\\bin", PATHEXT: ".EXE" },
+    });
+
+    assert.notEqual(dottedCapitalI, lowercaseIWithCombiningDot);
+    assert.notEqual(lowercaseIWithCombiningDot, dottedCapitalI);
+    assert.equal(
+      resolveEditorDiscoveryIdentity({
+        platform: "win32",
+        cwd: "C:\\WORKSPACE\\ASCII",
+        env: { PATH: "C:\\bin", PATHEXT: ".EXE" },
+      }),
+      resolveEditorDiscoveryIdentity({
+        platform: "win32",
+        cwd: "c:\\workspace\\ascii",
+        env: { PATH: "C:\\bin", PATHEXT: ".EXE" },
+      }),
+    );
+  });
+
+  it.effect("discovers command editors asynchronously with mixed-case Windows environment keys", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "synara-editor-async-é-" });
+      yield* fs.writeFileString(path.join(dir, "code.CMD"), "@echo off\r\n");
+
+      const result = yield* Effect.promise(() =>
+        discoverAvailableEditors({
+          platform: "win32",
+          cwd: dir,
+          env: { pAtH: dir, PaThExT: ".CMD" },
+          lookupWindowsStorePackages: async () => ({
+            status: "success",
+            installLocationsByFamily: {},
+            subprocessCount: 1,
+          }),
+        }),
+      );
+
+      assert.equal(result.status, "success");
+      if (result.status === "success") {
+        assert.equal(result.availableEditors.includes("vscode"), true);
+        assert.equal(result.subprocessCount, 1);
+      }
+    }),
+  );
+
+  it("caps outstanding asynchronous filesystem probes at eight", async () => {
+    let active = 0;
+    let maximumActive = 0;
+    const result = await discoverAvailableEditors({
+      platform: "win32",
+      cwd: "C:\\workspace",
+      env: { PATH: "C:\\bin", PATHEXT: ".CMD" },
+      statPath: async () => {
+        active += 1;
+        maximumActive = Math.max(maximumActive, active);
+        await new Promise<void>((resolvePromise) => setImmediate(resolvePromise));
+        active -= 1;
+        throw Object.assign(new Error("missing"), { code: "ENOENT" });
+      },
+      lookupWindowsStorePackages: async () => ({
+        status: "success",
+        installLocationsByFamily: {},
+        subprocessCount: 1,
+      }),
+    });
+
+    assert.equal(result.status, "success");
+    assert.equal(maximumActive <= 8, true);
+    assert.equal(maximumActive > 1, true);
+  });
+
+  it("classifies transient filesystem failures instead of confirming an empty snapshot", async () => {
+    const result = await discoverAvailableEditors({
+      platform: "win32",
+      cwd: "C:\\workspace",
+      env: { PATH: "C:\\bin", PATHEXT: ".CMD" },
+      statPath: async () => {
+        throw Object.assign(new Error("access denied"), { code: "EACCES" });
+      },
+      lookupWindowsStorePackages: async () => ({
+        status: "success",
+        installLocationsByFamily: {},
+        subprocessCount: 1,
+      }),
+    });
+
+    assert.equal(result.status, "failure");
+    if (result.status === "failure") {
+      assert.equal(result.category, "filesystem_transient");
+      assert.equal(result.fileSystemOperations > 0, true);
+      assert.equal(result.subprocessCount, 1);
+    }
+  });
+});
+
+it("runs one bounded, shell-free PowerShell process for bulk AppX discovery", async () => {
+  const editor = EDITORS.find((candidate) => candidate.id === "vscode");
+  assert.ok(editor);
+  const packages = getEditorWindowsStorePackages(editor) ?? [];
+  let captured:
+    | {
+        readonly command: string;
+        readonly args: ReadonlyArray<string>;
+        readonly options: { readonly shell: false; readonly windowsHide: true };
+      }
+    | undefined;
+
+  const result = await discoverWindowsStorePackageInstallLocations(packages, {
+    platform: "win32",
+    env: { SystemRoot: "C:\\Windows" },
+    spawnProcess: (command, args, options) => {
+      captured = { command, args, options };
+      const child = new EventEmitter() as EventEmitter & {
+        stdout: PassThrough;
+        stderr: PassThrough;
+        kill: () => boolean;
+      };
+      child.stdout = new PassThrough();
+      child.stderr = new PassThrough();
+      child.kill = () => true;
+      setImmediate(() => {
+        child.stdout.end(
+          JSON.stringify([
+            {
+              Family: "Microsoft.VisualStudioCode_8wekyb3d8bbwe",
+              InstallLocation: "C:\\Program Files\\WindowsApps\\VSCode",
+            },
+          ]),
+        );
+        child.emit("close", 0);
+      });
+      return child as never;
+    },
+  });
+
+  assert.equal(result.status, "success");
+  assert.equal(captured?.command.endsWith("powershell.exe"), true);
+  assert.equal(captured?.args.includes("-NoProfile"), true);
+  assert.equal(captured?.args.includes("-NonInteractive"), true);
+  assert.equal(captured?.options.shell, false);
+  assert.equal(captured?.options.windowsHide, true);
+  assert.equal(captured?.args.at(-1)?.includes("Microsoft.VisualStudioCode"), true);
+});
+
+it("kills AppX discovery when combined output crosses the 256 KiB cap", async () => {
+  const editor = EDITORS.find((candidate) => candidate.id === "vscode");
+  assert.ok(editor);
+  let kills = 0;
+  const result = await discoverWindowsStorePackageInstallLocations(
+    getEditorWindowsStorePackages(editor) ?? [],
+    {
+      platform: "win32",
+      env: { SystemRoot: "C:\\Windows" },
+      spawnProcess: () => {
+        const child = new EventEmitter() as EventEmitter & {
+          stdout: PassThrough;
+          stderr: PassThrough;
+          kill: () => boolean;
+        };
+        child.stdout = new PassThrough();
+        child.stderr = new PassThrough();
+        child.kill = () => {
+          kills += 1;
+          setImmediate(() => child.emit("close", null));
+          return true;
+        };
+        setImmediate(() =>
+          child.stderr.write(Buffer.alloc(WINDOWS_STORE_BULK_LOOKUP_OUTPUT_LIMIT_BYTES + 1)),
+        );
+        return child as never;
+      },
+    },
+  );
+
+  assert.deepEqual(result, { status: "failure", category: "output_limit", subprocessCount: 1 });
+  assert.equal(kills, 1);
+});
+
+it("settles and removes listeners when AppX termination cannot signal the child", async () => {
+  for (const kill of [() => false, () => { throw new Error("kill failed"); }]) {
+    const child = makeFakeAppxChild(kill);
+    const lookup = discoverWindowsStorePackageInstallLocations(vscodeStorePackages(), {
+      platform: "win32",
+      env: { SystemRoot: "C:\\Windows" },
+      spawnProcess: () => child as never,
+    });
+    child.stderr.write(Buffer.alloc(WINDOWS_STORE_BULK_LOOKUP_OUTPUT_LIMIT_BYTES + 1));
+
+    await expect(lookup).resolves.toEqual({
+      status: "failure",
+      category: "output_limit",
+      subprocessCount: 1,
+    });
+    assert.equal(child.listenerCount("error"), 0);
+    assert.equal(child.listenerCount("close"), 0);
+    assert.equal(child.stdout.listenerCount("data"), 0);
+    assert.equal(child.stderr.listenerCount("data"), 0);
+  }
+});
+
+it("settles AppX abort and error races exactly once", async () => {
+  const abortController = new AbortController();
+  let abortChild!: FakeAppxChild;
+  abortChild = makeFakeAppxChild(() => {
+    setImmediate(() => abortChild.emit("close", 0));
+    return true;
+  });
+  const aborted = discoverWindowsStorePackageInstallLocations(vscodeStorePackages(), {
+    platform: "win32",
+    env: { SystemRoot: "C:\\Windows" },
+    signal: abortController.signal,
+    spawnProcess: () => abortChild as never,
+  });
+  abortController.abort();
+  abortChild.stdout.end("[]");
+  await expect(aborted).resolves.toEqual({
+    status: "failure",
+    category: "cancelled",
+    subprocessCount: 1,
+  });
+
+  const errorChild = makeFakeAppxChild();
+  const errored = discoverWindowsStorePackageInstallLocations(vscodeStorePackages(), {
+    platform: "win32",
+    env: { SystemRoot: "C:\\Windows" },
+    spawnProcess: () => errorChild as never,
+  });
+  errorChild.emit("error", new Error("spawn error"));
+  errorChild.emit("close", 0);
+  await expect(errored).resolves.toEqual({
+    status: "failure",
+    category: "process_error",
+    subprocessCount: 1,
+  });
+  assert.equal(errorChild.listenerCount("close"), 0);
+});
+
+it("prefers a completed AppX close over a later abort and clears the deadline", async () => {
+  vi.useFakeTimers();
+  try {
+    const abortController = new AbortController();
+    const child = makeFakeAppxChild();
+    const lookup = discoverWindowsStorePackageInstallLocations(vscodeStorePackages(), {
+      platform: "win32",
+      env: { SystemRoot: "C:\\Windows" },
+      signal: abortController.signal,
+      spawnProcess: () => child as never,
+    });
+    child.stdout.write("[]");
+    child.emit("close", 0);
+    abortController.abort();
+
+    await expect(lookup).resolves.toEqual({
+      status: "success",
+      installLocationsByFamily: {},
+      subprocessCount: 1,
+    });
+    assert.equal(vi.getTimerCount(), 0);
+    assert.equal(child.listenerCount("close"), 0);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("reports timeout after a successful kill/close race and clears the deadline", async () => {
+  vi.useFakeTimers();
+  try {
+    let child!: FakeAppxChild;
+    child = makeFakeAppxChild(() => {
+      queueMicrotask(() => child.emit("close", 0));
+      return true;
+    });
+    const lookup = discoverWindowsStorePackageInstallLocations(vscodeStorePackages(), {
+      platform: "win32",
+      env: { SystemRoot: "C:\\Windows" },
+      spawnProcess: () => child as never,
+    });
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    await expect(lookup).resolves.toEqual({
+      status: "failure",
+      category: "timeout",
+      subprocessCount: 1,
+    });
+    assert.equal(vi.getTimerCount(), 0);
+    assert.equal(child.listenerCount("close"), 0);
+    assert.equal(child.stdout.listenerCount("data"), 0);
+  } finally {
+    vi.useRealTimers();
+  }
 });
