@@ -4,7 +4,7 @@
 
 import { spawnSync } from "node:child_process";
 import { writeFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { basename, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -18,9 +18,10 @@ import {
   type WindowsInstallerQualificationRuntime,
   type WindowsRegistryTarget,
 } from "./lib/windows-installer-qualification.ts";
+import { inspectUnsignedWindowsExecutable } from "./lib/windows-authenticode.ts";
 
 interface CliOptions extends WindowsInstallerQualificationOptions {
-  readonly reportPath?: string;
+  readonly reportPath: string;
 }
 
 export function parseWindowsInstallerQualificationArgs(argv: ReadonlyArray<string>): CliOptions {
@@ -57,15 +58,29 @@ export function parseWindowsInstallerQualificationArgs(argv: ReadonlyArray<strin
   ) {
     throw new Error("--startup-timeout-ms must be an integer between 5000 and 180000.");
   }
+  const installerPath = resolve(required("--installer"));
+  const reportPath = resolve(required("--report"));
+  const runnerTemp = process.env.RUNNER_TEMP?.trim();
+  if (!runnerTemp) {
+    throw new Error("RUNNER_TEMP is required for the native Windows qualification report.");
+  }
+  if (
+    basename(reportPath) !== "windows-installer-qualification.json" ||
+    dirname(reportPath).toLowerCase() !== resolve(runnerTemp).toLowerCase()
+  ) {
+    throw new Error(
+      "--report must be windows-installer-qualification.json directly under RUNNER_TEMP.",
+    );
+  }
   return {
-    installerPath: resolve(required("--installer")),
+    installerPath,
     upstreamInstallerPath: resolve(required("--upstream-installer")),
     version: required("--version"),
     ...(values.get("--previous-installer")
       ? { previousInstallerPath: resolve(values.get("--previous-installer")!) }
       : {}),
     startupTimeoutMs,
-    ...(values.get("--report") ? { reportPath: resolve(values.get("--report")!) } : {}),
+    reportPath,
   };
 }
 
@@ -125,10 +140,10 @@ function readExecutableIdentity(executablePath: string): WindowsExecutableIdenti
     );
   }
   const parsed = JSON.parse(result.stdout) as Partial<WindowsExecutableIdentity>;
-  if (typeof parsed.productName !== "string") {
+  if (parsed.productName !== null && typeof parsed.productName !== "string") {
     throw new Error("Installed executable version resource omitted product identity.");
   }
-  return { productName: parsed.productName };
+  return { productName: parsed.productName ?? null };
 }
 
 export function createNativeWindowsInstallerQualificationRuntime(): WindowsInstallerQualificationRuntime {
@@ -145,6 +160,7 @@ export function createNativeWindowsInstallerQualificationRuntime(): WindowsInsta
     readRegistry,
     runCommand,
     readExecutableIdentity,
+    inspectUnsignedAuthenticode: inspectUnsignedWindowsExecutable,
     launchStartupAndKeepRunning: launchPackagedDesktopAndWaitForStartup,
     verifyStartup: verifyPackagedDesktopExecutableStartup,
     sleep: (milliseconds) => new Promise((resolveDelay) => setTimeout(resolveDelay, milliseconds)),
@@ -159,6 +175,6 @@ if (invokedPath === fileURLToPath(import.meta.url)) {
     createNativeWindowsInstallerQualificationRuntime(),
   );
   const rendered = `${JSON.stringify(report, null, 2)}\n`;
-  if (options.reportPath) writeFileSync(options.reportPath, rendered, "utf8");
+  writeFileSync(options.reportPath, rendered, { encoding: "utf8", flag: "wx" });
   process.stdout.write(rendered);
 }

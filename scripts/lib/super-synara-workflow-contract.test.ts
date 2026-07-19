@@ -109,6 +109,53 @@ describe("Super Synara workflow contracts", () => {
         audit,
       ),
     ).toThrow("bind both upstream-core and previous-release selection");
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          '"--report", (Join-Path $env:RUNNER_TEMP "windows-installer-qualification.json")',
+          '"--report", "release-publish/forged.json"',
+        ),
+        audit,
+      ),
+    ).toThrow("Windows installer qualification contract");
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          '--windows-qualification-report "$qualification_report"',
+          '--windows-qualification-report "forged.json"',
+        ),
+        audit,
+      ),
+    ).toThrow("Windows installer qualification contract");
+  });
+
+  it("rejects Windows provenance before qualification or transient report upload", () => {
+    const provenanceStep = main.indexOf(
+      "      - name: Write final Windows provenance from native qualification",
+    );
+    const qualificationStep = main.indexOf(
+      "      - name: Qualify concurrent Windows side-by-side runtime, upgrade, and uninstall",
+    );
+    const provenanceEnd = main.indexOf("\n      - name:", provenanceStep + 1);
+    const provenanceBlock = main.slice(provenanceStep, provenanceEnd);
+    const reordered =
+      main.slice(0, qualificationStep) +
+      provenanceBlock +
+      "\n" +
+      main.slice(qualificationStep, provenanceStep) +
+      main.slice(provenanceEnd);
+    expect(() => verifySuperSynaraWorkflowText(reordered, audit)).toThrow(
+      "must consume native qualification",
+    );
+    const uploadedProvenance = "release-publish/artifact-windows-x64.provenance.json";
+    const uploadedProvenanceIndex = main.lastIndexOf(uploadedProvenance);
+    const transientReportUpload =
+      main.slice(0, uploadedProvenanceIndex + uploadedProvenance.length) +
+      "\n            ${{ runner.temp }}/windows-installer-qualification.json" +
+      main.slice(uploadedProvenanceIndex + uploadedProvenance.length);
+    expect(() => verifySuperSynaraWorkflowText(transientReportUpload, audit)).toThrow(
+      "must not be uploaded",
+    );
   });
 
   it("rejects an audit detached from protected main or mislabeled as publication", () => {

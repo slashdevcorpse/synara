@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join, resolve } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -57,6 +57,7 @@ interface FakeRuntime extends WindowsInstallerQualificationRuntime {
   exitUpstreamBeforeSuperStartup: boolean;
   failAfterCurrentInstall: boolean;
   mutateUpstreamOnSuperInstall: boolean;
+  includeVendorExecutable: boolean;
 }
 
 function fakeRuntime(): FakeRuntime {
@@ -77,6 +78,7 @@ function fakeRuntime(): FakeRuntime {
     exitUpstreamBeforeSuperStartup: false,
     failAfterCurrentInstall: false,
     mutateUpstreamOnSuperInstall: false,
+    includeVendorExecutable: false,
     readRegistry: (target) => registry.get(`${target.id}:${target.key}`) ?? null,
     runCommand: (spec) => {
       commands.push(spec);
@@ -101,6 +103,13 @@ function fakeRuntime(): FakeRuntime {
           join(installDirectory, `Uninstall ${installedIdentity.displayName}.exe`),
           `fake-${installedIdentity.flavor}-uninstaller`,
         );
+        if (runtime.includeVendorExecutable && superInstallerMatch) {
+          mkdirSync(join(installDirectory, "resources", "vendor"), { recursive: true });
+          writeFileSync(
+            join(installDirectory, "resources", "vendor", "vendor-helper.exe"),
+            "vendor-signed-fixture",
+          );
+        }
         const version = installerMatch[1]!;
         if (upstreamInstallerMatch) upstreamInstallDirectory = installDirectory;
         const targets = createWindowsRegistrationTargets(installedIdentity.windowsInstallerGuid);
@@ -148,9 +157,20 @@ function fakeRuntime(): FakeRuntime {
       throw new Error(`Unexpected fake command: ${spec.command}.`);
     },
     readExecutableIdentity: (path) =>
-      path.endsWith("Super Synara.exe")
+      basename(path).includes("Super Synara") || basename(path).startsWith("Super-Synara-")
         ? { productName: "Super Synara" }
         : { productName: "Synara" },
+    inspectUnsignedAuthenticode: (path) => {
+      if (basename(path) === "vendor-helper.exe") {
+        throw new Error("Vendor executable must not be classified as product-owned unsigned code.");
+      }
+      return {
+        path: resolve(path),
+        status: "NotSigned",
+        signerCertificate: null,
+        timeStamperCertificate: null,
+      };
+    },
     launchStartupAndKeepRunning: vi.fn(async (options) => {
       startupEnvironments.push(options.env);
       expect(options.command.endsWith("Synara.exe")).toBe(true);
@@ -261,7 +281,7 @@ describe("Super Synara Windows installer qualification", () => {
       runtime,
     );
 
-    expect(report.schemaVersion).toBe(2);
+    expect(report.schemaVersion).toBe(3);
     expect(report.upgrade).toBe("not-run-no-previous-release");
     expect(report.previousVersion).toBeNull();
     expect(report.sideBySide).toMatchObject({
@@ -286,6 +306,32 @@ describe("Super Synara Windows installer qualification", () => {
       userDataDirectoryName: "super-synara",
       isolatedIdentityPathsProven: true,
     });
+    expect(report.installer).toMatchObject({
+      role: "installer",
+      fileName: "Super-Synara-0.5.5-super.1-windows-x64-unsigned.exe",
+      productName: "Super Synara",
+      sha256: expect.stringMatching(/^[0-9a-f]{64}$/),
+      authenticode: {
+        status: "NotSigned",
+        signerCertificate: null,
+        timeStamperCertificate: null,
+      },
+    });
+    expect(report.installation.productOwnedExecutables).toEqual([
+      expect.objectContaining({
+        role: "main-executable",
+        fileName: "Super Synara.exe",
+        productName: "Super Synara",
+        sha256: expect.stringMatching(/^[0-9a-f]{64}$/),
+      }),
+      expect.objectContaining({
+        role: "uninstaller",
+        fileName: "Uninstall Super Synara.exe",
+        productName: "Super Synara",
+        sha256: expect.stringMatching(/^[0-9a-f]{64}$/),
+      }),
+    ]);
+    expect(report.installation.vendorExecutables).toEqual([]);
     expect(runtime.startupEnvironments).toHaveLength(2);
     expect(runtime.lifecycleEvents).toEqual([
       "silent installer Synara-0.5.5-x64.exe",
@@ -324,6 +370,32 @@ describe("Super Synara Windows installer qualification", () => {
       "silent Super Synara uninstaller",
       "silent Synara uninstaller",
     ]);
+  });
+
+  it("inventories vendor executables without claiming they are product-owned or unsigned", async () => {
+    const artifactRoot = join(process.cwd(), `.qualification-fixture-${process.pid}-vendor`);
+    roots.push(artifactRoot);
+    const runtime = fakeRuntime();
+    runtime.includeVendorExecutable = true;
+
+    const report = await qualifySuperSynaraWindowsInstaller(
+      {
+        installerPath: installer(artifactRoot, "0.5.5-super.2"),
+        upstreamInstallerPath: upstreamInstaller(artifactRoot),
+        version: "0.5.5-super.2",
+        startupTimeoutMs: 10_000,
+      },
+      runtime,
+    );
+
+    expect(report.installation.vendorExecutables).toEqual([
+      expect.objectContaining({
+        role: "vendor-executable",
+        fileName: "vendor-helper.exe",
+        sha256: expect.stringMatching(/^[0-9a-f]{64}$/),
+      }),
+    ]);
+    expect(report.installation.vendorExecutables[0]).not.toHaveProperty("authenticode");
   });
 
   it("rejects a sequential-only startup when upstream exits before Super is proven", async () => {

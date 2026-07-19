@@ -52,7 +52,17 @@ export interface SuperSynaraReleaseFileNames {
 }
 
 function bytewiseSort(values: ReadonlyArray<string>): string[] {
-  return [...values].sort((left, right) => Buffer.compare(Buffer.from(left), Buffer.from(right)));
+  return values.toSorted((left, right) => Buffer.compare(Buffer.from(left), Buffer.from(right)));
+}
+
+function hasExactUnsignedEvidence(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const evidence = value as Record<string, unknown>;
+  return (
+    evidence.status === "NotSigned" &&
+    evidence.signerCertificate === null &&
+    evidence.timeStamperCertificate === null
+  );
 }
 
 function sha256File(path: string): string {
@@ -209,6 +219,37 @@ function validatePlatformManifest(input: {
     manifest.artifacts[0].sha256 !== actual.sha256
   ) {
     throw new Error(`${input.payloadFileName} bytes differ from platform provenance.`);
+  }
+  if (input.platform === "win") {
+    const signing = manifest.signing;
+    if (signing.status !== "unsigned-prerelease" || signing.scheme !== "none") {
+      throw new Error(`${input.manifestFileName} omitted Windows Authenticode evidence.`);
+    }
+    const identity = signing.identity;
+    const installer = identity.installer;
+    const productOwned = identity.productOwnedExecutables;
+    if (
+      identity.qualificationReportSchemaVersion !== 3 ||
+      identity.currentVersion !== input.coordinates.version ||
+      installer.fileName !== input.payloadFileName ||
+      installer.productName !== "Super Synara" ||
+      installer.sha256 !== manifest.artifacts[0].sha256 ||
+      !hasExactUnsignedEvidence(installer.authenticode) ||
+      productOwned.length !== 2 ||
+      productOwned[0]?.role !== "main-executable" ||
+      productOwned[0].fileName !== "Super Synara.exe" ||
+      productOwned[0].productName !== "Super Synara" ||
+      !hasExactUnsignedEvidence(productOwned[0].authenticode) ||
+      productOwned[1]?.role !== "uninstaller" ||
+      productOwned[1].fileName !== "Uninstall Super Synara.exe" ||
+      productOwned[1].productName !== "Super Synara" ||
+      !hasExactUnsignedEvidence(productOwned[1].authenticode) ||
+      !Array.isArray(identity.vendorExecutables)
+    ) {
+      throw new Error(
+        `${input.manifestFileName} does not bind exact unsigned Windows product-owned binaries.`,
+      );
+    }
   }
   return manifest;
 }

@@ -130,6 +130,8 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
     "qualify-super-synara-windows-installer.ts",
     '"--upstream-installer", $env:UPSTREAM_INSTALLER',
     '"--previous-installer", $env:PREVIOUS_INSTALLER',
+    '"--report", (Join-Path $env:RUNNER_TEMP "windows-installer-qualification.json")',
+    '--windows-qualification-report "$qualification_report"',
   ]) {
     requireText(
       main,
@@ -149,6 +151,27 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
       "Windows installer qualification must run after packaged startup verification.",
     );
   }
+  const windowsProvenanceIndex = main.indexOf(
+    "Write final Windows provenance from native qualification",
+  );
+  const windowsUploadIndex = main.indexOf("Upload exact Windows lane");
+  if (
+    windowsProvenanceIndex <= installerQualificationIndex ||
+    windowsUploadIndex <= windowsProvenanceIndex
+  ) {
+    throw new Error(
+      "Windows provenance must consume native qualification before the exact lane is uploaded.",
+    );
+  }
+  const windowsUploadBlock = main.slice(
+    windowsUploadIndex,
+    main.indexOf("\n  macos_arm64:", windowsUploadIndex),
+  );
+  prohibitText(
+    windowsUploadBlock,
+    "windows-installer-qualification.json",
+    "The transient Windows qualification report must not be uploaded.",
+  );
   requireText(
     main,
     "bun run dist:desktop:super:mac --",

@@ -290,39 +290,16 @@ jobs:
             --lockfile-sha256 "$LOCKFILE_SHA256" \
             --output-dir release-build
 
-      - name: Stage exact Windows payload and provenance
+      - name: Stage exact Windows payload
         shell: bash
         env:
           VERSION: ${{ needs.preflight.outputs.version }}
-          TAG: ${{ needs.preflight.outputs.tag }}
-          SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
-          LOCKFILE_SHA256: ${{ needs.preflight.outputs.lockfile_sha256 }}
-          ABSORBED_UPSTREAM_SHA: ${{ needs.preflight.outputs.absorbed_upstream_sha }}
         run: |
           set -euo pipefail
           installer="Super-Synara-$VERSION-windows-x64-unsigned.exe"
           [[ -f "release-build/$installer" ]]
           mkdir release-publish
           cp "release-build/$installer" release-publish/
-          node scripts/write-release-artifact-provenance.ts \
-            --assets-dir release-publish \
-            --platform win \
-            --arch x64 \
-            --target nsis \
-            --version "$VERSION" \
-            --source-commit "$SOURCE_COMMIT" \
-            --source-tag "$TAG" \
-            --lockfile-sha256 "$LOCKFILE_SHA256" \
-            --publication true \
-            --signed false \
-            --distribution-kind github-unsigned-prerelease \
-            --distribution-repository "$GITHUB_REPOSITORY" \
-            --distribution-prerelease true \
-            --distribution-latest false \
-            --updater-feed false \
-            --absorbed-upstream-sha "$ABSORBED_UPSTREAM_SHA" \
-            --artifact-files "$installer" \
-            --output-file-name artifact-windows-x64.provenance.json
 
       - name: Smoke packaged Windows app
         shell: bash
@@ -424,7 +401,8 @@ jobs:
             "scripts/qualify-super-synara-windows-installer.ts",
             "--installer", $currentInstaller,
             "--upstream-installer", $env:UPSTREAM_INSTALLER,
-            "--version", $env:VERSION
+            "--version", $env:VERSION,
+            "--report", (Join-Path $env:RUNNER_TEMP "windows-installer-qualification.json")
           )
           if ($env:PREVIOUS_FOUND -eq "true") {
             if ([string]::IsNullOrWhiteSpace($env:PREVIOUS_INSTALLER)) {
@@ -433,6 +411,40 @@ jobs:
             $qualificationArgs += @("--previous-installer", $env:PREVIOUS_INSTALLER)
           }
           node @qualificationArgs
+
+      - name: Write final Windows provenance from native qualification
+        shell: bash
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
+          LOCKFILE_SHA256: ${{ needs.preflight.outputs.lockfile_sha256 }}
+          ABSORBED_UPSTREAM_SHA: ${{ needs.preflight.outputs.absorbed_upstream_sha }}
+        run: |
+          set -euo pipefail
+          installer="Super-Synara-$VERSION-windows-x64-unsigned.exe"
+          qualification_report="$RUNNER_TEMP/windows-installer-qualification.json"
+          [[ -f "$qualification_report" ]]
+          node scripts/write-release-artifact-provenance.ts \
+            --assets-dir release-publish \
+            --platform win \
+            --arch x64 \
+            --target nsis \
+            --version "$VERSION" \
+            --source-commit "$SOURCE_COMMIT" \
+            --source-tag "$TAG" \
+            --lockfile-sha256 "$LOCKFILE_SHA256" \
+            --publication true \
+            --signed false \
+            --distribution-kind github-unsigned-prerelease \
+            --distribution-repository "$GITHUB_REPOSITORY" \
+            --distribution-prerelease true \
+            --distribution-latest false \
+            --updater-feed false \
+            --absorbed-upstream-sha "$ABSORBED_UPSTREAM_SHA" \
+            --windows-qualification-report "$qualification_report" \
+            --artifact-files "$installer" \
+            --output-file-name artifact-windows-x64.provenance.json
 
       - name: Enforce Windows artifact budget
         shell: bash

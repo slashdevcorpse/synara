@@ -1,10 +1,15 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { writeReleaseArtifactProvenance } from "./release-artifact-provenance.ts";
+import {
+  WINDOWS_INSTALLER_QUALIFICATION_REPORT_FILE_NAME,
+  writeReleaseArtifactProvenance,
+  writeReleaseArtifactProvenanceWithRuntimeForTest,
+} from "./release-artifact-provenance.ts";
 import {
   exactSuperSynaraReleaseAllowlist,
   prepareSuperSynaraRelease,
@@ -45,15 +50,98 @@ async function createPlatformStaging(): Promise<{ directory: string; licensePath
     updaterFeed: false,
     absorbedUpstreamSha: coordinates.absorbedUpstreamSha,
   };
-  await writeReleaseArtifactProvenance({
-    ...common,
-    assetsDirectory: directory,
-    artifactFileNames: [names.windowsInstaller],
-    outputFileName: names.windowsProvenance,
-    platform: "win",
-    arch: "x64",
-    target: "nsis",
+  const installerPath = join(directory, names.windowsInstaller);
+  const installDirectory = join(directory, "controlled-install", "Super Synara");
+  const unsignedEvidence = (path: string) => ({
+    path: resolve(path),
+    status: "NotSigned" as const,
+    signerCertificate: null,
+    timeStamperCertificate: null,
   });
+  writeFileSync(
+    join(directory, WINDOWS_INSTALLER_QUALIFICATION_REPORT_FILE_NAME),
+    JSON.stringify({
+      schemaVersion: 3,
+      platform: "windows-x64",
+      currentVersion: coordinates.version,
+      upgrade: "not-run-no-previous-release",
+      previousVersion: null,
+      installer: {
+        role: "installer",
+        fileName: names.windowsInstaller,
+        path: resolve(installerPath),
+        productName: "Super Synara",
+        sha256: createHash("sha256").update("windows-installer").digest("hex"),
+        authenticode: unsignedEvidence(installerPath),
+      },
+      sideBySide: {
+        upstreamStartupProven: true,
+        upstreamControlledCleanupProven: true,
+        concurrentOverlapProven: true,
+        distinctProcessLocksProven: true,
+        distinctProfileRootsProven: true,
+        upstreamExecutablePreserved: true,
+        upstreamRegistrationPreserved: true,
+        upstreamProfileSentinelsPreserved: true,
+        upstreamUninstallCleanupProven: true,
+      },
+      isolation: {
+        liveProfilesRead: false,
+        liveProfilesMutated: false,
+        upstreamRegistrationPreserved: true,
+        upstreamSentinelsPreserved: true,
+        superStateWasTemporary: true,
+      },
+      installation: {
+        productName: "Super Synara",
+        executableName: "Super Synara.exe",
+        registrationScope: "current-user-64",
+        startupProven: true,
+        cleanExitProven: true,
+        uninstallCleanupProven: true,
+        installDirectory,
+        productOwnedExecutables: [
+          {
+            role: "main-executable",
+            fileName: "Super Synara.exe",
+            path: join(installDirectory, "Super Synara.exe"),
+            productName: "Super Synara",
+            sha256: "d".repeat(64),
+            authenticode: unsignedEvidence(join(installDirectory, "Super Synara.exe")),
+          },
+          {
+            role: "uninstaller",
+            fileName: "Uninstall Super Synara.exe",
+            path: join(installDirectory, "Uninstall Super Synara.exe"),
+            productName: "Super Synara",
+            sha256: "e".repeat(64),
+            authenticode: unsignedEvidence(join(installDirectory, "Uninstall Super Synara.exe")),
+          },
+        ],
+        vendorExecutables: [],
+      },
+    }),
+  );
+  await writeReleaseArtifactProvenanceWithRuntimeForTest(
+    {
+      ...common,
+      assetsDirectory: directory,
+      artifactFileNames: [names.windowsInstaller],
+      outputFileName: names.windowsProvenance,
+      platform: "win",
+      arch: "x64",
+      target: "nsis",
+      windowsQualificationReportPath: join(
+        directory,
+        WINDOWS_INSTALLER_QUALIFICATION_REPORT_FILE_NAME,
+      ),
+    },
+    {
+      inspectUnsignedWindowsExecutable: unsignedEvidence,
+      windowsQualificationReportDirectory: directory,
+    },
+  );
+  unlinkSync(join(directory, WINDOWS_INSTALLER_QUALIFICATION_REPORT_FILE_NAME));
   await writeReleaseArtifactProvenance({
     ...common,
     assetsDirectory: directory,
@@ -185,5 +273,27 @@ describe("Super Synara release admission", () => {
         maxTotalBytes: 10_000_000,
       }),
     ).toThrow("bytes differ from platform provenance");
+  });
+
+  it("rejects forged signed product-owned evidence at final release admission", async () => {
+    const staged = await createPlatformStaging();
+    const provenancePath = join(
+      staged.directory,
+      superSynaraReleaseFileNames(coordinates.version).windowsProvenance,
+    );
+    const provenance = JSON.parse(readFileSync(provenancePath, "utf8"));
+    provenance.signing.identity.productOwnedExecutables[1].authenticode.status = "Valid";
+    provenance.signing.identity.productOwnedExecutables[1].authenticode.signerCertificate = {
+      Subject: "CN=Unexpected",
+    };
+    writeFileSync(provenancePath, JSON.stringify(provenance));
+
+    expect(() =>
+      prepareSuperSynaraRelease({
+        ...staged,
+        coordinates,
+        maxTotalBytes: 10_000_000,
+      }),
+    ).toThrow("does not bind exact unsigned Windows product-owned binaries");
   });
 });

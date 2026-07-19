@@ -5,9 +5,11 @@ import { createHash } from "node:crypto";
 import {
   cpSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -34,6 +36,7 @@ import {
   parseSuperSynaraVersion,
   superSynaraWindowsInstallerName,
 } from "./super-synara-previous-release.ts";
+import type { WindowsUnsignedAuthenticodeEvidence } from "./windows-authenticode.ts";
 
 export type WindowsRegistryHive = "HKCU" | "HKLM";
 export type WindowsRegistryView = "32" | "64";
@@ -67,7 +70,7 @@ export interface WindowsCommandSpec {
 }
 
 export interface WindowsExecutableIdentity {
-  readonly productName: string;
+  readonly productName: string | null;
 }
 
 export interface WindowsInstallerQualificationRuntime {
@@ -77,6 +80,9 @@ export interface WindowsInstallerQualificationRuntime {
   readonly readRegistry: (target: WindowsRegistryTarget) => string | null;
   readonly runCommand: (spec: WindowsCommandSpec) => void;
   readonly readExecutableIdentity: (executablePath: string) => WindowsExecutableIdentity;
+  readonly inspectUnsignedAuthenticode: (
+    executablePath: string,
+  ) => WindowsUnsignedAuthenticodeEvidence;
   readonly launchStartupAndKeepRunning: typeof launchPackagedDesktopAndWaitForStartup;
   readonly verifyStartup: typeof verifyPackagedDesktopExecutableStartup;
   readonly sleep: (milliseconds: number) => Promise<void>;
@@ -91,11 +97,15 @@ export interface WindowsInstallerQualificationOptions {
 }
 
 export interface WindowsInstallerQualificationReport {
-  readonly schemaVersion: 2;
+  readonly schemaVersion: 3;
   readonly platform: "windows-x64";
   readonly currentVersion: string;
   readonly upgrade: "qualified" | "not-run-no-previous-release";
   readonly previousVersion: string | null;
+  readonly installer: WindowsQualifiedExecutableEvidence & {
+    readonly role: "installer";
+    readonly fileName: string;
+  };
   readonly sideBySide: {
     readonly upstreamVersion: string;
     readonly upstreamTag: string;
@@ -132,7 +142,30 @@ export interface WindowsInstallerQualificationReport {
     readonly startupProven: true;
     readonly cleanExitProven: true;
     readonly uninstallCleanupProven: true;
+    readonly installDirectory: string;
+    readonly productOwnedExecutables: readonly [
+      WindowsQualifiedExecutableEvidence & { readonly role: "main-executable" },
+      WindowsQualifiedExecutableEvidence & { readonly role: "uninstaller" },
+    ];
+    readonly vendorExecutables: ReadonlyArray<WindowsVendorExecutableEvidence>;
   };
+}
+
+export interface WindowsQualifiedExecutableEvidence {
+  readonly role: "installer" | "main-executable" | "uninstaller";
+  readonly fileName: string;
+  readonly path: string;
+  readonly productName: string | null;
+  readonly sha256: string;
+  readonly authenticode: WindowsUnsignedAuthenticodeEvidence;
+}
+
+export interface WindowsVendorExecutableEvidence {
+  readonly role: "vendor-executable";
+  readonly fileName: string;
+  readonly path: string;
+  readonly productName: string | null;
+  readonly sha256: string;
 }
 
 interface RegistrySnapshot {
@@ -542,10 +575,21 @@ function runAndValidateInstaller(
       `Installed ${identity.displayName} executable is missing: ${paths.executablePath}.`,
     );
   }
+  if (!existsSync(paths.uninstallerPath) || !statSync(paths.uninstallerPath).isFile()) {
+    throw new Error(
+      `Installed ${identity.displayName} uninstaller is missing: ${paths.uninstallerPath}.`,
+    );
+  }
   const executableIdentity = runtime.readExecutableIdentity(paths.executablePath);
   if (executableIdentity.productName !== identity.displayName) {
     throw new Error(
       `Installed executable product identity mismatch: ${executableIdentity.productName}.`,
+    );
+  }
+  const uninstallerIdentity = runtime.readExecutableIdentity(paths.uninstallerPath);
+  if (uninstallerIdentity.productName !== identity.displayName) {
+    throw new Error(
+      `Installed uninstaller product identity mismatch: ${String(uninstallerIdentity.productName)}.`,
     );
   }
   return validateRegistration(snapshotRawRegistry(runtime, targets), version, paths, identity);
@@ -619,6 +663,96 @@ interface InstalledApplicationSnapshot {
 
 function sha256File(path: string): string {
   return createHash("sha256").update(readFileSync(path)).digest("hex");
+}
+
+function listInstalledExecutables(directory: string): ReadonlyArray<string> {
+  const executables: string[] = [];
+  const visit = (currentDirectory: string): void => {
+    for (const entry of readdirSync(currentDirectory, { withFileTypes: true })) {
+      const path = join(currentDirectory, entry.name);
+      if (entry.isDirectory() && !entry.isSymbolicLink()) {
+        visit(path);
+      } else if (entry.isFile() && !entry.isSymbolicLink() && entry.name.endsWith(".exe")) {
+        executables.push(resolve(path));
+      }
+    }
+  };
+  visit(directory);
+  return executables.toSorted((left, right) => left.localeCompare(right));
+}
+
+function inspectQualifiedExecutable<const TRole extends WindowsQualifiedExecutableEvidence["role"]>(
+  runtime: WindowsInstallerQualificationRuntime,
+  path: string,
+  role: TRole,
+): WindowsQualifiedExecutableEvidence & { readonly role: TRole } {
+  const resolvedPath = resolve(path);
+  const entry = lstatSync(resolvedPath);
+  if (!entry.isFile() || entry.isSymbolicLink()) {
+    throw new Error(`Qualified executable must be a regular file: ${resolvedPath}.`);
+  }
+  return {
+    role,
+    fileName: basename(resolvedPath),
+    path: resolvedPath,
+    productName: runtime.readExecutableIdentity(resolvedPath).productName,
+    sha256: sha256File(resolvedPath),
+    authenticode: runtime.inspectUnsignedAuthenticode(resolvedPath),
+  };
+}
+
+function inventoryVendorExecutable(
+  runtime: WindowsInstallerQualificationRuntime,
+  path: string,
+): WindowsVendorExecutableEvidence {
+  const resolvedPath = resolve(path);
+  const entry = lstatSync(resolvedPath);
+  if (!entry.isFile() || entry.isSymbolicLink()) {
+    throw new Error(`Vendor executable must be a regular file: ${resolvedPath}.`);
+  }
+  return {
+    role: "vendor-executable",
+    fileName: basename(resolvedPath),
+    path: resolvedPath,
+    productName: runtime.readExecutableIdentity(resolvedPath).productName,
+    sha256: sha256File(resolvedPath),
+  };
+}
+
+function inspectInstalledExecutables(
+  runtime: WindowsInstallerQualificationRuntime,
+  paths: QualificationPaths,
+): Pick<
+  WindowsInstallerQualificationReport["installation"],
+  "productOwnedExecutables" | "vendorExecutables"
+> {
+  const mainPathKey = normalizedPathKey(paths.executablePath);
+  const uninstallerPathKey = normalizedPathKey(paths.uninstallerPath);
+  const allExecutables = listInstalledExecutables(paths.installDirectory);
+  const discoveredKeys = new Set(allExecutables.map(normalizedPathKey));
+  if (!discoveredKeys.has(mainPathKey) || !discoveredKeys.has(uninstallerPathKey)) {
+    throw new Error("Installed executable inventory omitted a required product-owned executable.");
+  }
+  const main = inspectQualifiedExecutable(runtime, paths.executablePath, "main-executable");
+  const uninstaller = inspectQualifiedExecutable(runtime, paths.uninstallerPath, "uninstaller");
+  if (main.productName !== SUPER_IDENTITY.displayName) {
+    throw new Error(`Installed executable product identity mismatch: ${String(main.productName)}.`);
+  }
+  if (uninstaller.productName !== SUPER_IDENTITY.displayName) {
+    throw new Error(
+      `Installed uninstaller product identity mismatch: ${String(uninstaller.productName)}.`,
+    );
+  }
+  const vendorExecutables = allExecutables
+    .filter((path) => {
+      const key = normalizedPathKey(path);
+      return key !== mainPathKey && key !== uninstallerPathKey;
+    })
+    .map((path) => inventoryVendorExecutable(runtime, path));
+  return {
+    productOwnedExecutables: [main, uninstaller],
+    vendorExecutables,
+  };
 }
 
 function snapshotInstalledApplication(
@@ -732,6 +866,12 @@ export async function qualifySuperSynaraWindowsInstaller(
   }
   const currentVersion = parseSuperSynaraVersion(options.version).text;
   const currentInstaller = requireInstallerFile(options.installerPath, currentVersion);
+  const installerEvidence = inspectQualifiedExecutable(runtime, currentInstaller, "installer");
+  if (installerEvidence.productName !== SUPER_IDENTITY.displayName) {
+    throw new Error(
+      `Installer product identity mismatch: ${String(installerEvidence.productName)}.`,
+    );
+  }
   const upstreamInstaller = resolve(options.upstreamInstallerPath);
   const upstreamVersion = upstreamVersionFromInstaller(upstreamInstaller);
   const upstreamInstallerSha256 = sha256File(upstreamInstaller);
@@ -767,6 +907,10 @@ export async function qualifySuperSynaraWindowsInstaller(
   let attemptedSuperVersion: string | null = null;
   let attemptedUpstreamVersion: string | null = null;
   let report: WindowsInstallerQualificationReport | null = null;
+  let installedExecutableEvidence: Pick<
+    WindowsInstallerQualificationReport["installation"],
+    "productOwnedExecutables" | "vendorExecutables"
+  > | null = null;
   const failures: unknown[] = [];
 
   try {
@@ -814,6 +958,7 @@ export async function qualifySuperSynaraWindowsInstaller(
       superTargets,
       SUPER_IDENTITY,
     );
+    installedExecutableEvidence = inspectInstalledExecutables(runtime, superPaths);
     assertSentinelsUnchanged(superSentinelSnapshot);
     assertInstalledApplicationUnchanged(
       runtime,
@@ -859,11 +1004,12 @@ export async function qualifySuperSynaraWindowsInstaller(
     );
 
     report = {
-      schemaVersion: 2,
+      schemaVersion: 3,
       platform: "windows-x64",
       currentVersion,
       upgrade: previousVersion ? "qualified" : "not-run-no-previous-release",
       previousVersion,
+      installer: installerEvidence,
       sideBySide: {
         upstreamVersion,
         upstreamTag: `v${upstreamVersion}`,
@@ -900,6 +1046,9 @@ export async function qualifySuperSynaraWindowsInstaller(
         startupProven: true,
         cleanExitProven: true,
         uninstallCleanupProven: true,
+        installDirectory: superPaths.installDirectory,
+        productOwnedExecutables: installedExecutableEvidence!.productOwnedExecutables,
+        vendorExecutables: installedExecutableEvidence!.vendorExecutables,
       },
     };
   } catch (error) {

@@ -39,6 +39,7 @@ interface CliOptions {
   readonly expectedMacTeamId?: string;
   readonly expectedWindowsPublisher?: string;
   readonly expectedWindowsSubjectDn?: string;
+  readonly windowsQualificationReportPath?: string;
 }
 
 function parseBoolean(name: string, value: string | undefined): boolean {
@@ -99,6 +100,7 @@ function parseArgs(argv: ReadonlyArray<string>): CliOptions {
     "--expected-mac-team-id",
     "--expected-windows-publisher",
     "--expected-windows-subject-dn",
+    "--windows-qualification-report",
   ]);
   for (const name of values.keys()) {
     if (!knownArguments.has(name))
@@ -142,8 +144,10 @@ function parseArgs(argv: ReadonlyArray<string>): CliOptions {
     ...(values.get("--distribution-repository")
       ? { distributionRepository: values.get("--distribution-repository")! }
       : {}),
-    ...(parseOptionalBoolean("--distribution-prerelease", values.get("--distribution-prerelease")) ===
-    undefined
+    ...(parseOptionalBoolean(
+      "--distribution-prerelease",
+      values.get("--distribution-prerelease"),
+    ) === undefined
       ? {}
       : {
           distributionPrerelease: parseBoolean(
@@ -183,6 +187,9 @@ function parseArgs(argv: ReadonlyArray<string>): CliOptions {
     ...(expectedMacTeamId ? { expectedMacTeamId } : {}),
     ...(expectedWindowsPublisher ? { expectedWindowsPublisher } : {}),
     ...(expectedWindowsSubjectDn ? { expectedWindowsSubjectDn } : {}),
+    ...(values.get("--windows-qualification-report")
+      ? { windowsQualificationReportPath: values.get("--windows-qualification-report")! }
+      : {}),
   };
 }
 
