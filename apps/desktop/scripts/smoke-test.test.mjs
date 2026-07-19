@@ -60,7 +60,9 @@ describe("desktop smoke process lifecycle", () => {
       Path: "C:\\tools",
       ELECTRON_ENABLE_LOGGING: "1",
     });
-    expect(Object.keys(smokeEnvironment).some((key) => key.toLowerCase() === "vite_dev_server_url")).toBe(false);
+    expect(
+      Object.keys(smokeEnvironment).some((key) => key.toLowerCase() === "vite_dev_server_url"),
+    ).toBe(false);
   });
 
   it("passes after the full observation window and a graceful POSIX tree close", async () => {
@@ -68,7 +70,11 @@ describe("desktop smoke process lifecycle", () => {
     const signalProcess = vi.fn((_pid, signal) => {
       if (signal === "SIGTERM") child.exitAndClose(null, "SIGTERM");
     });
-    const resultPromise = superviseDesktopSmokeProcess({ child, platform: "darwin", signalProcess });
+    const resultPromise = superviseDesktopSmokeProcess({
+      child,
+      platform: "darwin",
+      signalProcess,
+    });
 
     await vi.advanceTimersByTimeAsync(8_000);
 
@@ -81,7 +87,11 @@ describe("desktop smoke process lifecycle", () => {
   it("fails when the desktop exits before proving the observation window", async () => {
     const child = new FakeSmokeProcess();
     const signalProcess = vi.fn();
-    const resultPromise = superviseDesktopSmokeProcess({ child, platform: "darwin", signalProcess });
+    const resultPromise = superviseDesktopSmokeProcess({
+      child,
+      platform: "darwin",
+      signalProcess,
+    });
 
     child.exitAndClose(0);
 
@@ -99,7 +109,11 @@ describe("desktop smoke process lifecycle", () => {
       child.stderr.emit("data", Buffer.from("Uncaught TypeError: broken startup\n"));
       child.close(null, "SIGTERM");
     });
-    const resultPromise = superviseDesktopSmokeProcess({ child, platform: "darwin", signalProcess });
+    const resultPromise = superviseDesktopSmokeProcess({
+      child,
+      platform: "darwin",
+      signalProcess,
+    });
 
     await vi.advanceTimersByTimeAsync(8_000);
 
@@ -126,7 +140,11 @@ describe("desktop smoke process lifecycle", () => {
   it("tears down a valid process tree after a child-process error", async () => {
     const child = new FakeSmokeProcess();
     const signalProcess = vi.fn(() => child.exitAndClose(null, "SIGTERM"));
-    const resultPromise = superviseDesktopSmokeProcess({ child, platform: "darwin", signalProcess });
+    const resultPromise = superviseDesktopSmokeProcess({
+      child,
+      platform: "darwin",
+      signalProcess,
+    });
 
     child.emit("error", new Error("stream aborted"));
 
@@ -142,7 +160,11 @@ describe("desktop smoke process lifecycle", () => {
     const signalProcess = vi.fn((_pid, signal) => {
       if (signal === "SIGKILL") child.exitAndClose(null, "SIGKILL");
     });
-    const resultPromise = superviseDesktopSmokeProcess({ child, platform: "darwin", signalProcess });
+    const resultPromise = superviseDesktopSmokeProcess({
+      child,
+      platform: "darwin",
+      signalProcess,
+    });
 
     await vi.advanceTimersByTimeAsync(13_000);
 
@@ -160,7 +182,11 @@ describe("desktop smoke process lifecycle", () => {
       child.exitAndClose(null, "SIGTERM");
       return true;
     });
-    const resultPromise = superviseDesktopSmokeProcess({ child, platform: "win32", killWindowsTree });
+    const resultPromise = superviseDesktopSmokeProcess({
+      child,
+      platform: "win32",
+      killWindowsTree,
+    });
 
     await vi.advanceTimersByTimeAsync(8_000);
 
@@ -173,10 +199,17 @@ describe("desktop smoke process lifecycle", () => {
   it("waits for asynchronous Windows tree confirmation after the root closes", async () => {
     const child = new FakeSmokeProcess();
     let confirmTree;
-    const killWindowsTree = vi.fn(() => new Promise((resolve) => {
-      confirmTree = resolve;
-    }));
-    const resultPromise = superviseDesktopSmokeProcess({ child, platform: "win32", killWindowsTree });
+    const killWindowsTree = vi.fn(
+      () =>
+        new Promise((resolve) => {
+          confirmTree = resolve;
+        }),
+    );
+    const resultPromise = superviseDesktopSmokeProcess({
+      child,
+      platform: "win32",
+      killWindowsTree,
+    });
     let resolved = false;
     void resultPromise.then(() => {
       resolved = true;
@@ -205,7 +238,11 @@ describe("desktop smoke process lifecycle", () => {
     const signalProcess = vi.fn(() => {
       throw new Error("group missing");
     });
-    const resultPromise = superviseDesktopSmokeProcess({ child, platform: "darwin", signalProcess });
+    const resultPromise = superviseDesktopSmokeProcess({
+      child,
+      platform: "darwin",
+      signalProcess,
+    });
 
     await vi.advanceTimersByTimeAsync(8_000);
 
@@ -225,7 +262,11 @@ describe("desktop smoke process lifecycle", () => {
     const signalProcess = vi.fn((_pid, signal) => {
       if (signal === "SIGKILL") throw new Error("kill denied");
     });
-    const resultPromise = superviseDesktopSmokeProcess({ child, platform: "darwin", signalProcess });
+    const resultPromise = superviseDesktopSmokeProcess({
+      child,
+      platform: "darwin",
+      signalProcess,
+    });
 
     await vi.advanceTimersByTimeAsync(13_000);
 
@@ -243,7 +284,11 @@ describe("desktop smoke process lifecycle", () => {
       return true;
     });
     const signalProcess = vi.fn();
-    const resultPromise = superviseDesktopSmokeProcess({ child, platform: "darwin", signalProcess });
+    const resultPromise = superviseDesktopSmokeProcess({
+      child,
+      platform: "darwin",
+      signalProcess,
+    });
 
     await vi.advanceTimersByTimeAsync(8_000);
 
@@ -256,7 +301,13 @@ describe("desktop smoke process lifecycle", () => {
 
   it.each([
     ["returns false", () => false, "Windows taskkill did not confirm process-tree teardown."],
-    ["throws", () => { throw new Error("access denied"); }, "Windows taskkill failed: access denied"],
+    [
+      "throws",
+      () => {
+        throw new Error("access denied");
+      },
+      "Windows taskkill failed: access denied",
+    ],
   ])("cannot pass when Windows taskkill %s", async (_label, taskkillBehavior, diagnostic) => {
     const child = new FakeSmokeProcess();
     child.kill.mockImplementation((signal) => {
@@ -264,7 +315,11 @@ describe("desktop smoke process lifecycle", () => {
       return true;
     });
     const killWindowsTree = vi.fn(taskkillBehavior);
-    const resultPromise = superviseDesktopSmokeProcess({ child, platform: "win32", killWindowsTree });
+    const resultPromise = superviseDesktopSmokeProcess({
+      child,
+      platform: "win32",
+      killWindowsTree,
+    });
 
     await vi.advanceTimersByTimeAsync(8_000);
 
@@ -278,10 +333,17 @@ describe("desktop smoke process lifecycle", () => {
   it("does not pass when the Windows root closes before tree teardown is confirmed", async () => {
     const child = new FakeSmokeProcess();
     let rejectTreeProof;
-    const killWindowsTree = vi.fn(() => new Promise((resolve) => {
-      rejectTreeProof = () => resolve(false);
-    }));
-    const resultPromise = superviseDesktopSmokeProcess({ child, platform: "win32", killWindowsTree });
+    const killWindowsTree = vi.fn(
+      () =>
+        new Promise((resolve) => {
+          rejectTreeProof = () => resolve(false);
+        }),
+    );
+    const resultPromise = superviseDesktopSmokeProcess({
+      child,
+      platform: "win32",
+      killWindowsTree,
+    });
     let resolved = false;
     void resultPromise.then(() => {
       resolved = true;
@@ -307,7 +369,11 @@ describe("desktop smoke process lifecycle", () => {
   it("settles at the hard deadline when asynchronous taskkill never returns", async () => {
     const child = new FakeSmokeProcess();
     const killWindowsTree = vi.fn(() => new Promise(() => {}));
-    const resultPromise = superviseDesktopSmokeProcess({ child, platform: "win32", killWindowsTree });
+    const resultPromise = superviseDesktopSmokeProcess({
+      child,
+      platform: "win32",
+      killWindowsTree,
+    });
 
     await vi.advanceTimersByTimeAsync(15_000);
 
@@ -349,7 +415,11 @@ describe("desktop smoke process lifecycle", () => {
   it("fails at the hard deadline when forced teardown produces no close proof", async () => {
     const child = new FakeSmokeProcess();
     const signalProcess = vi.fn();
-    const resultPromise = superviseDesktopSmokeProcess({ child, platform: "darwin", signalProcess });
+    const resultPromise = superviseDesktopSmokeProcess({
+      child,
+      platform: "darwin",
+      signalProcess,
+    });
 
     await vi.advanceTimersByTimeAsync(15_000);
 
@@ -370,7 +440,11 @@ describe("desktop smoke process lifecycle", () => {
       child.exit(null, "SIGTERM");
       child.close(null, "SIGTERM");
     });
-    const resultPromise = superviseDesktopSmokeProcess({ child, platform: "darwin", signalProcess });
+    const resultPromise = superviseDesktopSmokeProcess({
+      child,
+      platform: "darwin",
+      signalProcess,
+    });
 
     await vi.advanceTimersByTimeAsync(8_000);
 

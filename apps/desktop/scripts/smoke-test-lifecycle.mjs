@@ -272,8 +272,7 @@ export function superviseDesktopSmokeProcess({
           }
 
           addTeardownDiagnostic(
-            normalizedResult?.diagnostic ??
-              "Windows taskkill returned no teardown confirmation.",
+            normalizedResult?.diagnostic ?? "Windows taskkill returned no teardown confirmation.",
           );
           directKill("SIGKILL");
           maybeFinishAfterClose();
@@ -367,7 +366,9 @@ export function superviseDesktopSmokeProcess({
     child.on("close", onClose);
 
     hardDeadlineTimer = setTimer(() => {
-      addFailure(`Desktop process did not close within the ${hardDeadlineMs}ms supervision deadline.`);
+      addFailure(
+        `Desktop process did not close within the ${hardDeadlineMs}ms supervision deadline.`,
+      );
       forceShutdown();
       finish();
     }, hardDeadlineMs);
