@@ -20,8 +20,9 @@ import {
   validateDesktopNativeBuildHost,
 } from "./lib/desktop-platform-build-config.ts";
 import {
-  isProhibitedUpdaterMetadataFile,
   createDesktopIdentityBuildConfig,
+  findProhibitedUpdaterMetadataFiles,
+  isProhibitedUpdaterMetadataFile,
 } from "./lib/desktop-artifact-policy.ts";
 import { synaraDesktopIdentity, type SynaraDesktopFlavor } from "@synara/shared/desktopIdentity";
 import { parseBooleanEnvValue } from "./lib/env-bool.ts";
@@ -1097,6 +1098,15 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
       yield* Effect.log(
         `[desktop-artifact] Removed stale macOS zip blockmap (${path.basename(finalizedZip.removedZipBlockmapPath)}).`,
       );
+    }
+  }
+
+  if (options.disableUpdates) {
+    const prohibitedUpdaterMetadata = findProhibitedUpdaterMetadataFiles(stageDistDir);
+    if (prohibitedUpdaterMetadata.length > 0) {
+      return yield* new BuildScriptError({
+        message: `Disabled desktop build emitted prohibited updater metadata: ${prohibitedUpdaterMetadata.join(", ")}.`,
+      });
     }
   }
 

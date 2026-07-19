@@ -1,12 +1,25 @@
-import { describe, expect, it } from "vitest";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { afterEach, describe, expect, it } from "vitest";
 
 import { synaraDesktopIdentity } from "@synara/shared/desktopIdentity";
 
 import {
   createDesktopIdentityBuildConfig,
+  findProhibitedUpdaterMetadataFiles,
   isProhibitedUpdaterMetadataFile,
   resolveDesktopGitHubPublishConfig,
 } from "./desktop-artifact-policy.ts";
+
+const temporaryRoots: string[] = [];
+
+afterEach(() => {
+  for (const root of temporaryRoots.splice(0)) {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 describe("desktop artifact policy", () => {
   it("builds Super Synara with the locked package identity and bundled license", () => {
@@ -52,5 +65,20 @@ describe("desktop artifact policy", () => {
     }
     expect(isProhibitedUpdaterMetadataFile("Super-Synara.exe")).toBe(false);
     expect(isProhibitedUpdaterMetadataFile("UNSIGNED-BUILD.md")).toBe(false);
+  });
+
+  it("finds updater metadata nested inside a packaged Super output tree", () => {
+    const root = mkdtempSync(join(tmpdir(), "super-synara-artifact-policy-"));
+    temporaryRoots.push(root);
+    const resources = join(root, "win-unpacked", "resources");
+    mkdirSync(resources, { recursive: true });
+    writeFileSync(join(resources, "app-update.yml"), "provider: github\n");
+    writeFileSync(join(root, "latest.yml"), "version: 1.2.3\n");
+    writeFileSync(join(root, "Super-Synara-1.2.3-x64.exe"), "installer");
+
+    expect(findProhibitedUpdaterMetadataFiles(root)).toEqual([
+      "latest.yml",
+      join("win-unpacked", "resources", "app-update.yml"),
+    ]);
   });
 });

@@ -1,6 +1,9 @@
 // FILE: desktop-artifact-policy.ts
 // Purpose: Defines identity and updater policy for staged desktop packages.
 
+import { existsSync, readdirSync } from "node:fs";
+import { basename, join, relative } from "node:path";
+
 import type { SynaraDesktopIdentity } from "@synara/shared/desktopIdentity";
 
 export interface DesktopGitHubPublishConfig {
@@ -54,4 +57,24 @@ export function isProhibitedUpdaterMetadataFile(fileName: string): boolean {
     normalized.endsWith(".blockmap") ||
     /^latest(?:-[a-z0-9-]+)?\.ya?ml$/.test(normalized)
   );
+}
+
+export function findProhibitedUpdaterMetadataFiles(root: string): string[] {
+  if (!existsSync(root)) return [];
+
+  const matches: string[] = [];
+  const pending = [root];
+  while (pending.length > 0) {
+    const directory = pending.pop();
+    if (!directory) continue;
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const candidate = join(directory, entry.name);
+      if (entry.isDirectory()) {
+        pending.push(candidate);
+      } else if (entry.isFile() && isProhibitedUpdaterMetadataFile(basename(candidate))) {
+        matches.push(relative(root, candidate));
+      }
+    }
+  }
+  return matches.toSorted((left, right) => left.localeCompare(right));
 }
