@@ -51,6 +51,14 @@ export function TerminalSearch({ searchAddon, isOpen, onClose }: TerminalSearchP
     }
   }, [isOpen, searchAddon]);
 
+  useEffect(() => {
+    if (!searchAddon) return;
+    const resultsSubscription = searchAddon.onDidChangeResults(({ resultCount }) => {
+      setHasResults(resultCount > 0);
+    });
+    return () => resultsSubscription.dispose();
+  }, [searchAddon]);
+
   const handleSearch = (direction: "next" | "previous") => {
     if (!searchAddon || !query) return;
     if (searchTimerRef.current !== null) {

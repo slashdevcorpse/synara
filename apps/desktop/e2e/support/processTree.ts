@@ -1,12 +1,48 @@
 // FILE: processTree.ts
 // Purpose: Closes Playwright Electron applications and force-terminates their descendants.
 
-import { spawnSync } from "node:child_process";
+import { spawnSync, type ChildProcess } from "node:child_process";
 import type { ElectronApplication } from "@playwright/test";
 import { killWindowsProcessTree } from "../../scripts/smoke-test-lifecycle.mjs";
 
-const GRACEFUL_CLOSE_TIMEOUT_MS = 15_000;
+const GRACEFUL_CLOSE_TIMEOUT_MS = 30_000;
 const FORCE_KILL_TIMEOUT_MS = 5_000;
+
+function observeCleanProcessExit(child: ChildProcess): {
+  promise: Promise<void>;
+  dispose: () => void;
+} {
+  let exitListener: ((code: number | null, signal: NodeJS.Signals | null) => void) | undefined;
+  const promise = new Promise<void>((resolve, reject) => {
+    const settle = (code: number | null, signal: NodeJS.Signals | null): void => {
+      if (code === 0 && signal === null) {
+        resolve();
+        return;
+      }
+      reject(
+        new Error(
+          `Electron application exited while closing with code=${String(code)} signal=${String(signal)}.`,
+        ),
+      );
+    };
+    if (child.exitCode !== null || child.signalCode !== null) {
+      reject(
+        new Error(
+          `Electron application exited before teardown began with code=${String(child.exitCode)} signal=${String(child.signalCode)}.`,
+        ),
+      );
+      return;
+    }
+    exitListener = settle;
+    child.once("exit", exitListener);
+  });
+  return {
+    promise,
+    dispose: () => {
+      if (exitListener) child.off("exit", exitListener);
+    },
+  };
+}
 
 function processIsAlive(pid: number): boolean {
   try {
@@ -141,17 +177,21 @@ async function terminateTrackedProcesses(
 }
 
 export async function closeElectronApplication(electronApp: ElectronApplication): Promise<void> {
-  const pid = electronApp.process().pid;
+  const electronProcess = electronApp.process();
+  const pid = electronProcess.pid;
   const trackedDescendants =
     pid === undefined
       ? []
       : process.platform === "win32"
         ? readWindowsDescendants(pid)
         : readPosixDescendants(pid);
+  const cleanProcessExit = observeCleanProcessExit(electronProcess);
   let timeout: NodeJS.Timeout | undefined;
+  const errors: unknown[] = [];
   try {
     await Promise.race([
       electronApp.close(),
+      cleanProcessExit.promise,
       new Promise<never>((_resolve, reject) => {
         timeout = setTimeout(
           () => reject(new Error("Timed out while closing the Electron application.")),
@@ -160,8 +200,21 @@ export async function closeElectronApplication(electronApp: ElectronApplication)
         timeout.unref();
       }),
     ]);
+  } catch (error) {
+    errors.push(error);
   } finally {
     if (timeout) clearTimeout(timeout);
-    if (pid !== undefined) await terminateTrackedProcesses(pid, trackedDescendants);
+    cleanProcessExit.dispose();
+  }
+  if (pid !== undefined) {
+    try {
+      await terminateTrackedProcesses(pid, trackedDescendants);
+    } catch (error) {
+      errors.push(error);
+    }
+  }
+  if (errors.length === 1) throw errors[0];
+  if (errors.length > 1) {
+    throw new AggregateError(errors, "Electron close and process-tree cleanup both failed.");
   }
 }

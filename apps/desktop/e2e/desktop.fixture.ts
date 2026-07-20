@@ -17,6 +17,15 @@ const LAUNCHER_LOG_SCRIPT_PATH = Path.join(__dirname, "fixtures/launcher-log.cjs
 const NETWORK_GUARD_PATH = Path.join(__dirname, "fixtures/network-guard.cjs");
 type JsonRecord = Record<string, unknown>;
 
+function formatAggregateError(error: unknown): string {
+  if (error instanceof AggregateError) {
+    const nestedErrors = [...error.errors].map(formatAggregateError).join(" | ");
+    return nestedErrors ? `${error.name}: ${error.message} (${nestedErrors})` : error.message;
+  }
+  if (error instanceof Error) return error.stack ?? `${error.name}: ${error.message}`;
+  return String(error);
+}
+
 const PROVIDER_ENV_PREFIXES = [
   "ANTHROPIC_",
   "CLAUDE_",
@@ -850,7 +859,13 @@ export class DesktopHarness {
       errors.push(error);
     }
     if (errors.length > 0) {
-      throw new AggregateError(errors, "Desktop E2E teardown or isolation validation failed.");
+      const errorSummary = errors
+        .map((error, index) => `[${index + 1}] ${formatAggregateError(error)}`)
+        .join("\n");
+      throw new AggregateError(
+        errors,
+        `Desktop E2E teardown or isolation validation failed:\n${errorSummary}`,
+      );
     }
   }
 
@@ -863,7 +878,15 @@ export class DesktopHarness {
     ) {
       throw new Error(`Refusing to remove unverified desktop E2E root: ${resolvedOperationalDir}`);
     }
-    await FS.promises.rm(resolvedOperationalDir, { recursive: true, force: true, maxRetries: 3 });
+    await FS.promises.rm(resolvedOperationalDir, {
+      recursive: true,
+      force: true,
+      maxRetries: 10,
+      retryDelay: 100,
+    });
+    if (FS.existsSync(resolvedOperationalDir)) {
+      throw new Error(`Desktop E2E root still exists after removal: ${resolvedOperationalDir}`);
+    }
   }
 
   private async readJsonLines(filePath: string): Promise<readonly JsonRecord[]> {
