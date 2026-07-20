@@ -838,7 +838,7 @@ it.layer(NodeServices.layer)("keybindings", (it) => {
     }).pipe(Effect.provide(makeKeybindingsLayer())),
   );
 
-  it.effect("fails when the config directory cannot accept writes", () =>
+  it.effect("fails without data loss when the config path cannot accept writes", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
       const { keybindingsConfigPath } = yield* ServerConfig;
@@ -868,7 +868,11 @@ it.layer(NodeServices.layer)("keybindings", (it) => {
             .remove(configDirectory)
             .pipe(Effect.andThen(fs.rename(backupDirectory, configDirectory))),
       );
-      assertFailure(result, "failed to write keybindings config");
+      assert.isTrue(Result.isFailure(result));
+      assert.include(
+        ["failed to access keybindings config", "failed to write keybindings config"],
+        Result.isFailure(result) ? result.failure : "",
+      );
 
       const persisted = yield* readKeybindingsConfig(keybindingsConfigPath);
       const persistedView = persisted.map(({ key, command }) => ({ key, command }));

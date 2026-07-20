@@ -181,7 +181,11 @@ describe("official ACP SDK conformance at the current Synara boundary", () => {
       const result = yield* runtime.prompt({
         prompt: [{ type: "text", text: "continue" }],
       });
-      const events = Array.from(yield* Stream.runCollect(Stream.take(runtime.getEvents(), 7)));
+      const events = Array.from(
+        yield* Stream.runCollect(Stream.take(runtime.getEvents(), 7)).pipe(
+          Effect.timeout("10 seconds"),
+        ),
+      );
 
       expect(result).toEqual({ stopReason: "end_turn" });
       expect(events.map((event) => event._tag)).toEqual([

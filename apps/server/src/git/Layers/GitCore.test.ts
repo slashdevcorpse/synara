@@ -11,7 +11,12 @@ import { splitLines } from "@synara/shared/text";
 import { Effect, Exit, FileSystem, Layer, PlatformError, Schema, Scope } from "effect";
 import { describe, expect, vi } from "vitest";
 
-import { GitCoreLive, makeGitCore, splitCompleteProcessOutputFrames } from "./GitCore.ts";
+import {
+  GitCoreLive,
+  makeGitCore,
+  parseDirtyWorktreeFiles,
+  splitCompleteProcessOutputFrames,
+} from "./GitCore.ts";
 import { GitCore, type GitCoreShape } from "../Services/GitCore.ts";
 import { GitCheckoutDirtyWorktreeError, GitCommandError } from "../Errors.ts";
 import { type ProcessRunResult, runProcess } from "../../processRunner.ts";
@@ -156,6 +161,23 @@ function commitWithDate(
 // ── Tests ──
 
 it.layer(TestLayer)("git integration", (it) => {
+  describe("dirty worktree stderr parsing", () => {
+    it.effect("accepts Git output with or without optional advice", () =>
+      Effect.sync(() => {
+        expect(
+          parseDirtyWorktreeFiles(
+            "error: Your local changes to the following files would be overwritten by merge:\n\tREADME.md\n\tsrc/example.ts\n\nAborting\n",
+          ),
+        ).toEqual(["README.md", "src/example.ts"]);
+        expect(
+          parseDirtyWorktreeFiles(
+            "The following untracked working tree files would be overwritten by checkout:\r\n\tlocal.txt\r\nPlease move or remove them before you switch branches.\r\nAborting\r\n",
+          ),
+        ).toEqual(["local.txt"]);
+      }),
+    );
+  });
+
   describe("shell process execution", () => {
     it.effect("caps captured output when maxOutputBytes is exceeded", () =>
       Effect.gen(function* () {

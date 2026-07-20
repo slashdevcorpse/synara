@@ -58,6 +58,14 @@ function currentPhase(container: HTMLElement): string | null {
   );
 }
 
+function currentOpenState(container: HTMLElement): string | null {
+  return (
+    container
+      .querySelector<HTMLElement>("[data-agent-activity-open]")
+      ?.getAttribute("data-agent-activity-open") ?? null
+  );
+}
+
 describe("AgentActivityPulse lifecycle", () => {
   afterEach(() => {
     document.body.innerHTML = "";
@@ -151,6 +159,7 @@ describe("AgentActivityPulse lifecycle", () => {
     const screen = await render(<ActivityHarness value={input()} />);
     try {
       expect(currentPhase(screen.container)).toBe("thinking");
+      await vi.waitFor(() => expect(currentOpenState(screen.container)).toBe("true"));
       await screen.rerender(
         <ActivityHarness
           value={input({

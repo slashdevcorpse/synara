@@ -295,17 +295,23 @@ function createGitCommandError(
   });
 }
 
-const DIRTY_WORKTREE_PATTERN =
-  /Your local changes to the following files would be overwritten by (?:checkout|merge):\s*([\s\S]*?)Please commit your changes or stash them/;
-const UNTRACKED_OVERWRITE_PATTERN =
-  /The following untracked working tree files would be overwritten by (?:checkout|merge):\s*([\s\S]*?)Please move or remove them/;
+const DIRTY_WORKTREE_HEADER_PATTERN =
+  /^(?:error:\s*)?(?:Your local changes to the following files|The following untracked working tree files) would be overwritten by (?:checkout|merge):$/;
 
-function parseDirtyWorktreeFiles(stderr: string): string[] | null {
-  const match = DIRTY_WORKTREE_PATTERN.exec(stderr) ?? UNTRACKED_OVERWRITE_PATTERN.exec(stderr);
-  if (!match?.[1]) return null;
-  const files = splitLines(match[1])
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0);
+export function parseDirtyWorktreeFiles(stderr: string): string[] | null {
+  const lines = splitLines(stderr);
+  const headerIndex = lines.findIndex((line) => DIRTY_WORKTREE_HEADER_PATTERN.test(line.trim()));
+  if (headerIndex < 0) return null;
+
+  const files: string[] = [];
+  for (const line of lines.slice(headerIndex + 1)) {
+    if (/^[\t ]+\S/.test(line)) {
+      files.push(line.trim());
+      continue;
+    }
+    if (files.length === 0 && line.trim().length === 0) continue;
+    break;
+  }
   return files.length > 0 ? files : null;
 }
 

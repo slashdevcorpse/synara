@@ -583,7 +583,7 @@ const makeOfficialSdkClient = Effect.fnUntraced(function* (
         request(OfficialAcp.methods.agent.session.new, {
           ...payload,
           mcpServers: toOfficialMcpServers(payload.mcpServers),
-        }),
+        }).pipe(Effect.tap(() => fromPromise(awaitSessionUpdateDrain))),
       loadSession: (payload: EffectAcpSchema.LoadSessionRequest) =>
         request(OfficialAcp.methods.agent.session.load, {
           ...payload,

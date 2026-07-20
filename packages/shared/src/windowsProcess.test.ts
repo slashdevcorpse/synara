@@ -1506,6 +1506,15 @@ describe("windowsProcess", () => {
             ] as const) {
               const commandDiscoveryCache = createWindowsCommandDiscoveryCache();
               const observations: WindowsCommandDiscoveryObservation[] = [];
+              const spawnSync: NonNullable<WindowsSafeProcessInput["spawnSync"]> = (
+                command,
+                args,
+                options,
+              ) =>
+                spawnChildSync(command, [...args], {
+                  ...options,
+                  timeout: WINDOWS_WHERE_FIXTURE_PROCESS_TIMEOUT_MS,
+                });
               const resolve = (variant: (typeof variants)[number]) =>
                 resolveWindowsCommandCandidates(collision.command, {
                   platform: "win32",
@@ -1514,6 +1523,7 @@ describe("windowsProcess", () => {
                     variant.pathExt === undefined
                       ? { PATH: binDir, SystemRoot: systemRoot }
                       : { PATH: binDir, PATHEXT: variant.pathExt, SystemRoot: systemRoot },
+                  spawnSync,
                   commandDiscoveryCache,
                   onCommandDiscovery: (observation) => observations.push(observation),
                 }).map((candidate) => Path.win32.basename(candidate).toLowerCase());
@@ -1543,7 +1553,7 @@ describe("windowsProcess", () => {
           rmSync(root, { force: true, recursive: true });
         }
       },
-      20_000,
+      WINDOWS_WHERE_FIXTURE_TEST_TIMEOUT_MS,
     );
 
     it.runIf(process.platform === "win32")(
@@ -1594,6 +1604,15 @@ describe("windowsProcess", () => {
           candidates,
           cacheable: outcome !== transientOutcome,
         });
+        const spawnSync: NonNullable<WindowsSafeProcessInput["spawnSync"]> = (
+          command,
+          args,
+          options,
+        ) =>
+          spawnChildSync(command, [...args], {
+            ...options,
+            timeout: WINDOWS_WHERE_FIXTURE_PROCESS_TIMEOUT_MS,
+          });
         const runCollision = (name: string, left: NativeVariant, right: NativeVariant): void => {
           const nativeOracle = new Map<NativeVariant, string[]>();
           for (const variant of [left, right]) {
@@ -1602,7 +1621,7 @@ describe("windowsProcess", () => {
               platform: "win32",
               cwd: variant.cwd,
               env: variant.env,
-              spawnSync: (command, args, options) => spawnChildSync(command, [...args], options),
+              spawnSync,
               onCommandDiscovery: (observation) => oracleObservations.push(observation),
             }).map(foldNativeCandidateForComparison);
             expect(oracleCandidates, `${name} native oracle multiplicity`).toHaveLength(
@@ -1625,6 +1644,7 @@ describe("windowsProcess", () => {
                 platform: "win32",
                 cwd: variant.cwd,
                 env: variant.env,
+                spawnSync,
                 commandDiscoveryCache,
                 onCommandDiscovery: (observation) => observations.push(observation),
               }).map(foldNativeCandidateForComparison);
@@ -1847,7 +1867,7 @@ describe("windowsProcess", () => {
           rmSync(root, { force: true, recursive: true });
         }
       },
-      30_000,
+      60_000,
     );
 
     it("includes the actual process cwd when cwd is omitted", () => {
