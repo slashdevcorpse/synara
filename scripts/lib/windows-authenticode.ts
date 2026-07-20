@@ -33,6 +33,8 @@ const MAX_POWERSHELL_OUTPUT_BYTES = 1024 * 1024;
 
 const AUTHENTICODE_INSPECTION_COMMAND = [
   "$ErrorActionPreference = 'Stop'",
+  "$securityModule = Join-Path $PSHOME 'Modules\\Microsoft.PowerShell.Security\\Microsoft.PowerShell.Security.psd1'",
+  "Import-Module -Name $securityModule -Force -ErrorAction Stop",
   "$signature = Get-AuthenticodeSignature -LiteralPath $env:SUPER_SYNARA_AUTHENTICODE_PATH",
   "$signer = if ($null -eq $signature.SignerCertificate) { $null } else { [pscustomobject]@{ Subject = $signature.SignerCertificate.Subject; Thumbprint = $signature.SignerCertificate.Thumbprint } }",
   "$timestamp = if ($null -eq $signature.TimeStamperCertificate) { $null } else { [pscustomobject]@{ Subject = $signature.TimeStamperCertificate.Subject; Thumbprint = $signature.TimeStamperCertificate.Thumbprint } }",

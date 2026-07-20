@@ -1,6 +1,6 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, resolve, win32 } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -34,6 +34,12 @@ function runtime(
     runPowerShell: (command, args, env) => {
       expect(command).toBe("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
       expect(args).toContain("-Command");
+      expect(args.join(" ")).toContain(
+        "Join-Path $PSHOME 'Modules\\Microsoft.PowerShell.Security\\Microsoft.PowerShell.Security.psd1'",
+      );
+      expect(args.join(" ")).toContain(
+        "Import-Module -Name $securityModule -Force -ErrorAction Stop",
+      );
       expect(args.join(" ")).toContain("Get-AuthenticodeSignature -LiteralPath");
       expect(args.join(" ")).not.toContain(path);
       expect(env.SUPER_SYNARA_AUTHENTICODE_PATH).toBe(resolve(path));
@@ -62,6 +68,23 @@ describe("Windows unsigned Authenticode inspection", () => {
       timeStamperCertificate: null,
     });
   });
+
+  it.runIf(process.platform === "win32")(
+    "loads the native Windows PowerShell security module explicitly",
+    () => {
+      expect(process.env.SystemRoot).toBeTruthy();
+      const powershell = win32.join(
+        process.env.SystemRoot!,
+        "System32",
+        "WindowsPowerShell",
+        "v1.0",
+        "powershell.exe",
+      );
+      expect(() => inspectUnsignedWindowsExecutable(powershell)).toThrow(
+        "Authenticode status is Valid, not NotSigned.",
+      );
+    },
+  );
 
   for (const status of ["Valid", "UnknownError", "HashMismatch", "NotTrusted"]) {
     it(`rejects Authenticode status ${status}`, () => {
