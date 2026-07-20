@@ -16,6 +16,7 @@ const ACTIVATION_BASE_SHA = "760f4f0679660e122477046f89d3a8b315e42f79";
 const LEGACY_QUERY_TIMEOUT_MS = 1_500;
 const LEGACY_QUERY_MAX_BUFFER_BYTES = 32_768;
 const INTER_MEASUREMENT_SETTLE_MS = 500;
+const REQUIRED_TERMINAL_COUNTS = [1, 8, 32] as const;
 
 interface BenchmarkConfig {
   readonly terminalCounts: readonly number[];
@@ -68,7 +69,7 @@ function positiveInteger(value: string | undefined, option: string): number {
 }
 
 function parseArguments(args: readonly string[]): BenchmarkConfig {
-  let terminalCounts: readonly number[] = [1, 8, 32];
+  let terminalCounts: readonly number[] = REQUIRED_TERMINAL_COUNTS;
   let warmupCycles = 5;
   let measuredCycles = 50;
   let format: "json" = "json";
@@ -338,6 +339,9 @@ async function main(): Promise<void> {
   for (const terminals of config.terminalCounts) {
     results.push(await benchmarkTerminalCount(terminals, config));
   }
+  const missingTerminalCounts = REQUIRED_TERMINAL_COUNTS.filter(
+    (terminalCount) => !results.some((result) => result.terminals === terminalCount),
+  );
 
   const oneTerminal = results.find((result) => result.terminals === 1);
   const eightTerminals = results.find((result) => result.terminals === 8);
@@ -347,6 +351,7 @@ async function main(): Promise<void> {
   const eightTerminalP95Improved = eightTerminals?.acceptance.p95WithinBudget === true;
   const thirtyTwoTerminalP95Improved = thirtyTwoTerminals?.acceptance.p95WithinBudget === true;
   const passed =
+    missingTerminalCounts.length === 0 &&
     queryCountsPass &&
     oneTerminalP95Pass &&
     eightTerminalP95Improved &&
@@ -382,6 +387,7 @@ async function main(): Promise<void> {
     },
     results,
     acceptance: {
+      missingTerminalCounts,
       queryCountsPass,
       oneTerminalP95Pass,
       eightTerminalP95Improved,
