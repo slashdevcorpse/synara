@@ -68,6 +68,7 @@ beforeAll(() => {
     NodePath.join(NodeOs.tmpdir(), "synara-provider-health-commands-"),
   );
   for (const command of [
+    "codex",
     "claude",
     "grok",
     "opencode",
