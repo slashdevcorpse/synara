@@ -1555,15 +1555,25 @@ function countCaseInsensitiveDuplicateKeys(keys: readonly string[]): number {
   return keys.length - new Set(keys.map((key) => key.toUpperCase())).size;
 }
 
-function nodeRuntimeEvidence(runtime: {
+export function createNodeRuntimeEvidenceCollector(
+  hashExecutable: (path: string) => string = hashFileSha256,
+): (runtime: {
   readonly name: string;
   readonly version: string;
   readonly execPath: string;
-}): NodeRuntimeEvidence {
-  return {
-    name: runtime.name,
-    version: runtime.version,
-    execPathSha256: hashFileSha256(runtime.execPath),
+}) => NodeRuntimeEvidence {
+  const execPathSha256ByPath = new Map<string, string>();
+  return (runtime) => {
+    let execPathSha256 = execPathSha256ByPath.get(runtime.execPath);
+    if (execPathSha256 === undefined) {
+      execPathSha256 = hashExecutable(runtime.execPath);
+      execPathSha256ByPath.set(runtime.execPath, execPathSha256);
+    }
+    return {
+      name: runtime.name,
+      version: runtime.version,
+      execPathSha256,
+    };
   };
 }
 
@@ -1665,6 +1675,7 @@ export function runNodeDuplicateEnvironmentOracle(): NodeDuplicateEnvironmentOra
       },
     ),
   ) as { readonly name: string; readonly execPath: string; readonly version: string };
+  const collectNodeRuntimeEvidence = createNodeRuntimeEvidenceCollector();
   const root = mkdtempSync(join(tmpdir(), "synara-node-environment-oracle-"));
   const winnerBin = join(root, "winner-bin");
   const mixedBin = join(root, "mixed-bin");
@@ -1753,7 +1764,7 @@ process.stdout.write(JSON.stringify({
       output: NodeEnvironmentObservation,
       inputEnvironment: NodeJS.ProcessEnv,
     ) => ({
-      runtime: nodeRuntimeEvidence(output.runtime),
+      runtime: collectNodeRuntimeEvidence(output.runtime),
       inputPathKeys: inputPathKeys(inputEnvironment),
       pathKeys: output.keys,
       duplicateKeyCount: countCaseInsensitiveDuplicateKeys(output.keys),
@@ -1804,7 +1815,7 @@ process.stdout.write(JSON.stringify({
     const expectedValueSha256 = hashFixtureLabel(winnerBin);
     const evidence: Omit<NodeDuplicateEnvironmentOracle, "passed"> = {
       launcherRuntime: { name: "bun", version: Bun.version },
-      expectedRuntime: nodeRuntimeEvidence(nodeDescriptor),
+      expectedRuntime: collectNodeRuntimeEvidence(nodeDescriptor),
       rawCallerEnvironment: {
         pathKeys: rawPathKeys,
         duplicateKeyCount: countCaseInsensitiveDuplicateKeys(rawPathKeys),
@@ -1826,7 +1837,7 @@ process.stdout.write(JSON.stringify({
           JSON.stringify(normalizedChildEnvironment) ===
           JSON.stringify(reverseNormalizedChildEnvironment),
       },
-      serializerRuntime: nodeRuntimeEvidence(serializerOutput.runtime),
+      serializerRuntime: collectNodeRuntimeEvidence(serializerOutput.runtime),
       serializerObservedEnvironment: {
         pathKeys: serializerOutput.keys,
         duplicateKeyCount: countCaseInsensitiveDuplicateKeys(serializerOutput.keys),

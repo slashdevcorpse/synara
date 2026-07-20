@@ -17,6 +17,7 @@ import {
   assertSafeBenchmarkOutputPath,
   assertSingleEditorFixtureSubprocessCount,
   benchmarkDependencyLinks,
+  createNodeRuntimeEvidenceCollector,
   createFixture,
   editorFixtureEnvironment,
   evaluateBenchmarkGates,
@@ -496,6 +497,39 @@ describe("benchmark-windows-command-discovery", () => {
     } finally {
       rmSync(root, { force: true, recursive: true });
     }
+  });
+
+  it("reuses executable hashes only within one runtime-evidence collection", () => {
+    const hashedPaths: string[] = [];
+    const hashExecutable = (path: string) => {
+      hashedPaths.push(path);
+      return hashFixtureLabel(`executable-bytes:${path}`);
+    };
+    const collectRuntimeEvidence = createNodeRuntimeEvidenceCollector(hashExecutable);
+    const runtime = { name: "node", version: "v24.15.0", execPath: "C:\\Node\\node.exe" };
+    const expectedHash = hashFixtureLabel(`executable-bytes:${runtime.execPath}`);
+
+    expect(collectRuntimeEvidence(runtime)).toEqual({
+      name: runtime.name,
+      version: runtime.version,
+      execPathSha256: expectedHash,
+    });
+    expect(collectRuntimeEvidence({ ...runtime, version: "v24.15.1" })).toEqual({
+      name: runtime.name,
+      version: "v24.15.1",
+      execPathSha256: expectedHash,
+    });
+    expect(hashedPaths).toEqual([runtime.execPath]);
+
+    const otherExecPath = "D:\\Node\\node.exe";
+    expect(collectRuntimeEvidence({ ...runtime, execPath: otherExecPath }).execPathSha256).toBe(
+      hashFixtureLabel(`executable-bytes:${otherExecPath}`),
+    );
+    expect(hashedPaths).toEqual([runtime.execPath, otherExecPath]);
+
+    const nextCollection = createNodeRuntimeEvidenceCollector(hashExecutable);
+    expect(nextCollection(runtime).execPathSha256).toBe(expectedHash);
+    expect(hashedPaths).toEqual([runtime.execPath, otherExecPath, runtime.execPath]);
   });
 
   it("requires raw collisions, normalized child evidence, and exact cache behavior", () => {
