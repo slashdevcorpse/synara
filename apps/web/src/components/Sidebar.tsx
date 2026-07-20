@@ -3367,7 +3367,7 @@ export default function Sidebar() {
         await runThreadArchiveWithCurrentRoute({
           threadId,
           archiveMutation: () => archiveThreadFromClient(api.orchestration, threadId),
-          onArchived: options?.onArchived,
+          ...(options?.onArchived === undefined ? {} : { onArchived: options.onArchived }),
           getCurrentRouteThreadId: () => routeThreadIdRef.current,
           navigateFromArchivedThread: async () => {
             const fallbackThreadId = getFallbackThreadIdAfterDelete({
