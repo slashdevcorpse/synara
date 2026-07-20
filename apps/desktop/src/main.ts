@@ -67,6 +67,10 @@ import {
 } from "./backendRestartController";
 import { stopWindowsBackendAndWait, type WindowsBackendShutdownResult } from "./backendShutdown";
 import {
+  stopPosixBackendAndWait,
+  type PosixBackendShutdownDisposition,
+} from "./posixBackendShutdown";
+import {
   bundleSignatureFromStats,
   isBundleStable,
   isBundleSwapped,
@@ -3162,16 +3166,13 @@ interface StopBackendAndWaitOptions {
 }
 
 type BackendStopDisposition =
+  | PosixBackendShutdownDisposition
   | { readonly type: "no-process"; readonly exitConfirmed: true; readonly forced: false }
   | {
       readonly type: "expected-child-mismatch";
       readonly exitConfirmed: false;
       readonly forced: false;
-    }
-  | { readonly type: "already-exited"; readonly exitConfirmed: true; readonly forced: false }
-  | { readonly type: "exited"; readonly exitConfirmed: true; readonly forced: boolean }
-  | { readonly type: "timed-out"; readonly exitConfirmed: false; readonly forced: boolean }
-  | { readonly type: "failed"; readonly exitConfirmed: false; readonly forced: boolean };
+    };
 
 function hasBackendProcessExited(child: ChildProcess.ChildProcess): boolean {
   return child.exitCode !== null || child.signalCode !== null;
@@ -3213,93 +3214,6 @@ function logBackendStopDisposition(
   writeDesktopLogHeader(
     `backend stop disposition generation=${generation?.id ?? "none"} pid=${child?.pid ?? "unknown"} disposition=${disposition.type} forced=${disposition.forced} exit-confirmed=${disposition.exitConfirmed}${disposition.exitConfirmed ? "" : " replacement-blocked=true"}`,
   );
-}
-
-async function stopPosixBackendAndWait(input: {
-  readonly child: ChildProcess.ChildProcess;
-  readonly forceKillDelayMs: number;
-  readonly timeoutMs: number;
-}): Promise<BackendStopDisposition> {
-  if (hasBackendProcessExited(input.child)) {
-    return { type: "already-exited", exitConfirmed: true, forced: false };
-  }
-
-  return await new Promise<BackendStopDisposition>((resolve) => {
-    let settled = false;
-    let forced = false;
-    let forceKillTimer: ReturnType<typeof setTimeout> | null = null;
-    let exitTimeoutTimer: ReturnType<typeof setTimeout> | null = null;
-
-    const settle = (disposition: BackendStopDisposition): void => {
-      if (settled) return;
-      settled = true;
-      input.child.off("exit", onExit);
-      if (forceKillTimer) {
-        clearTimeout(forceKillTimer);
-      }
-      if (exitTimeoutTimer) {
-        clearTimeout(exitTimeoutTimer);
-      }
-      resolve(disposition);
-    };
-
-    const onExit = (): void => {
-      settle({ type: "exited", exitConfirmed: true, forced });
-    };
-
-    input.child.once("exit", onExit);
-    try {
-      input.child.kill("SIGTERM");
-    } catch {
-      if (hasBackendProcessExited(input.child)) {
-        onExit();
-      } else {
-        settle({ type: "failed", exitConfirmed: false, forced });
-      }
-      return;
-    }
-
-    if (hasBackendProcessExited(input.child)) {
-      onExit();
-      return;
-    }
-
-    const forceIfRunning = (): void => {
-      if (settled || hasBackendProcessExited(input.child)) {
-        if (hasBackendProcessExited(input.child)) {
-          onExit();
-        }
-        return;
-      }
-      forced = true;
-      try {
-        input.child.kill("SIGKILL");
-      } catch {
-        // The absolute deadline remains authoritative when force delivery fails.
-      }
-      if (hasBackendProcessExited(input.child)) {
-        onExit();
-      }
-    };
-
-    if (input.forceKillDelayMs === 0) {
-      forceIfRunning();
-    } else {
-      forceKillTimer = setTimeout(forceIfRunning, input.forceKillDelayMs);
-      forceKillTimer.unref();
-    }
-
-    if (settled) return;
-
-    exitTimeoutTimer = setTimeout(() => {
-      if (hasBackendProcessExited(input.child)) {
-        onExit();
-        return;
-      }
-      settle({ type: "timed-out", exitConfirmed: false, forced });
-    }, input.timeoutMs);
-    exitTimeoutTimer.unref();
-  });
 }
 
 async function stopBackendAndWaitForExit(

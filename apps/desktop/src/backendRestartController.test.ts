@@ -524,8 +524,8 @@ describe("desktop backend restart integration", () => {
     expect(mismatch).toBeGreaterThanOrEqual(0);
     expect(mismatch).toBeLessThan(readinessCancellation);
     expect(stopBackendAndWait).toContain("Promise<BackendStopDisposition>");
-    expect(stopBackendAndWait).toContain(
-      "fromWindowsBackendShutdownResult(\n          await stopWindowsBackendAndWait({",
+    expect(stopBackendAndWait).toMatch(
+      /fromWindowsBackendShutdownResult\(\s*await stopWindowsBackendAndWait\(\{/,
     );
     expect(stopBackendAndWait).toContain("if (!disposition.exitConfirmed");
     expect(stopBackendAndWait).toContain("if (disposition.exitConfirmed)");
@@ -533,12 +533,12 @@ describe("desktop backend restart integration", () => {
     expect(stopBackendAndWait).not.toContain("backendProcess = null");
     expect(stopBackendAndWait).not.toContain("backendGeneration = null");
 
-    const posixStop = sourceBetween(
-      desktopMainSource,
-      "async function stopPosixBackendAndWait(",
-      "async function stopBackendAndWaitForExit(",
+    expect(desktopMainSource).toMatch(
+      /import\s*\{\s*stopPosixBackendAndWait,\s*type PosixBackendShutdownDisposition,\s*\}\s*from "\.\/posixBackendShutdown";/,
     );
-    expect(posixStop).toContain('settle({ type: "timed-out", exitConfirmed: false, forced })');
+    expect(stopBackendAndWait).toMatch(
+      /disposition = await stopPosixBackendAndWait\(\{\s*child,\s*forceKillDelayMs,\s*timeoutMs,\s*\}\);/,
+    );
 
     const admittedLaunch = sourceBetween(
       desktopMainSource,
