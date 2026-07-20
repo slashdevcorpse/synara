@@ -4,11 +4,7 @@
 
 import path from "node:path";
 
-import {
-  runProcess,
-  type ProcessRunOptions,
-  type ProcessRunResult,
-} from "../processRunner";
+import { runProcess, type ProcessRunOptions, type ProcessRunResult } from "../processRunner";
 
 export const WINDOWS_PROCESS_SNAPSHOT_TIMEOUT_MS = 1_500;
 export const WINDOWS_PROCESS_SNAPSHOT_MAX_BUFFER_BYTES = 8 * 1024 * 1024;
@@ -40,10 +36,7 @@ export interface WindowsProcessChild {
   readonly command: string;
 }
 
-export type WindowsProcessChildrenMap = ReadonlyMap<
-  number,
-  readonly WindowsProcessChild[]
->;
+export type WindowsProcessChildrenMap = ReadonlyMap<number, readonly WindowsProcessChild[]>;
 
 export type WindowsProcessSnapshotUnknownReason =
   | "unsupported_platform"
@@ -159,9 +152,7 @@ function validateTopology(processes: readonly ParsedWindowsProcess[]): boolean {
   return true;
 }
 
-function buildChildrenMap(
-  processes: readonly ParsedWindowsProcess[],
-): WindowsProcessChildrenMap {
+function buildChildrenMap(processes: readonly ParsedWindowsProcess[]): WindowsProcessChildrenMap {
   const mutableChildren = new Map<number, WindowsProcessChild[]>();
   for (const process of processes) {
     const children = mutableChildren.get(process.parentPid) ?? [];

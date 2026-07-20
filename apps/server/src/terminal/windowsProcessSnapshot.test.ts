@@ -134,9 +134,7 @@ describe("createWindowsProcessSnapshotCollector", () => {
     expect(result).toEqual({
       kind: "ok",
       processCount: 1,
-      childrenByParentPid: new Map([
-        [0, [{ pid: 41, command: "process-41.exe --serve" }]],
-      ]),
+      childrenByParentPid: new Map([[0, [{ pid: 41, command: "process-41.exe --serve" }]]]),
     });
   });
 
@@ -163,9 +161,7 @@ describe("createWindowsProcessSnapshotCollector", () => {
       { pid: 20, command: "child.exe" },
       { pid: 30, command },
     ]);
-    expect(result.childrenByParentPid.get(20)).toEqual([
-      { pid: 40, command: "grandchild.exe" },
-    ]);
+    expect(result.childrenByParentPid.get(20)).toEqual([{ pid: 40, command: "grandchild.exe" }]);
   });
 
   it("prefers command line, then executable path, then name", async () => {
@@ -347,7 +343,10 @@ describe("createWindowsProcessSnapshotCollector", () => {
     ["array root", JSON.stringify([])],
     ["wrong version", envelope([record(1, 0)], { version: 2 })],
     ["incomplete", envelope([record(1, 0)], { complete: false })],
-    ["missing record count", JSON.stringify({ version: 1, complete: true, records: [record(1, 0)] })],
+    [
+      "missing record count",
+      JSON.stringify({ version: 1, complete: true, records: [record(1, 0)] }),
+    ],
     ["noninteger record count", envelope([record(1, 0)], { recordCount: 1.5 })],
     ["negative record count", envelope([record(1, 0)], { recordCount: -1 })],
     ["non-array records", envelope([], { records: {} })],

@@ -140,16 +140,12 @@ async function runLegacyTerminalQuery(terminalPid: number): Promise<void> {
     "if ($children) { exit 0 }",
     "exit 1",
   ].join("; ");
-  await runProcess(
-    "powershell.exe",
-    ["-NoProfile", "-NonInteractive", "-Command", command],
-    {
-      timeoutMs: LEGACY_QUERY_TIMEOUT_MS,
-      allowNonZeroExit: true,
-      maxBufferBytes: LEGACY_QUERY_MAX_BUFFER_BYTES,
-      outputMode: "truncate",
-    },
-  );
+  await runProcess("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", command], {
+    timeoutMs: LEGACY_QUERY_TIMEOUT_MS,
+    allowNonZeroExit: true,
+    maxBufferBytes: LEGACY_QUERY_MAX_BUFFER_BYTES,
+    outputMode: "truncate",
+  });
 }
 
 async function runBaselineCycle(

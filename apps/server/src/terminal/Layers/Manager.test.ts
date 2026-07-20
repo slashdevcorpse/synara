@@ -1085,9 +1085,7 @@ describe("TerminalManager", () => {
       expect(collectorCalls).toBe(1);
       expect(
         events
-          .filter(
-            (event) => event.type === "activity" && event.hasRunningSubprocess === true,
-          )
+          .filter((event) => event.type === "activity" && event.hasRunningSubprocess === true)
           .map((event) => event.terminalId)
           .sort(),
       ).toEqual([...terminalIds].sort());
