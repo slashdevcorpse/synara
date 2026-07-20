@@ -28,7 +28,7 @@ import {
   normalizeWindowsChildEnvironment,
   resolveWindowsCommandCandidates,
   type WindowsCommandDiscoveryObservation,
-} from "../packages/shared/src/windowsProcess.ts";
+} from "@synara/shared/windowsProcess";
 
 const PR397_HEAD_SHA = "7c39415c16415224253c376c8e85df74489596b8";
 const DEFAULT_WARMUPS = 5;
@@ -1640,13 +1640,13 @@ export function runNodeDuplicateEnvironmentOracle(): NodeDuplicateEnvironmentOra
         ([name, value]) => value !== undefined && name.toUpperCase() !== "PATH",
       ),
     );
-    const rawCallerEnvironment = {
+    const rawCallerEnvironment: NodeJS.ProcessEnv = {
       ...cleanEnvironment,
       Path: mixedBin,
       PATH: winnerBin,
       PATHEXT: ".CMD",
       SystemRoot: process.env.SystemRoot ?? process.env.WINDIR ?? "C:\\Windows",
-    } satisfies NodeJS.ProcessEnv;
+    };
     const reverseCallerEnvironment = Object.fromEntries(
       Object.entries(rawCallerEnvironment).reverse(),
     );
