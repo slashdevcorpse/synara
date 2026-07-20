@@ -5,11 +5,18 @@
 // Exports: app/package search helpers used by open.ts and editorAppIcons.ts
 // Depends on: EDITORS metadata plus filesystem stat checks.
 
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn, type ChildProcessByStdio } from "node:child_process";
 import { readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
+import pathWin32 from "node:path/win32";
+import type { Readable } from "node:stream";
 
 import { EDITORS } from "@synara/contracts";
+import {
+  normalizeWindowsChildEnvironment,
+  readEffectiveWindowsEnvironmentValue,
+  resolveWindowsSystemRoot,
+} from "@synara/shared/windowsProcess";
 
 export type EditorDefinition = (typeof EDITORS)[number];
 
@@ -43,6 +50,48 @@ interface CachedPowerShellAppxLookup {
 const POWERSHELL_APPX_LOOKUP_TIMEOUT_MS = 1_500;
 const POWERSHELL_APPX_LOOKUP_CACHE_TTL_MS = 300_000;
 const powershellAppxLookupCache = new Map<string, CachedPowerShellAppxLookup>();
+
+export const WINDOWS_STORE_BULK_LOOKUP_TIMEOUT_MS = 2_000;
+export const WINDOWS_STORE_BULK_LOOKUP_OUTPUT_LIMIT_BYTES = 256 * 1024;
+export const WINDOWS_STORE_BULK_LOOKUP_TERMINATION_GRACE_MS = 100;
+
+export type WindowsStoreBulkLookupFailureCategory =
+  | "cancelled"
+  | "malformed_output"
+  | "output_limit"
+  | "process_error"
+  | "process_exit"
+  | "timeout";
+
+export type WindowsStoreBulkLookupResult =
+  | {
+      readonly status: "success";
+      readonly installLocationsByFamily: Readonly<Record<string, string>>;
+      readonly subprocessCount: 0 | 1;
+    }
+  | {
+      readonly status: "failure";
+      readonly category: WindowsStoreBulkLookupFailureCategory;
+      readonly subprocessCount: 0 | 1;
+    };
+
+type SpawnWindowsStorePowerShell = (
+  command: string,
+  args: ReadonlyArray<string>,
+  options: {
+    env: NodeJS.ProcessEnv;
+    shell: false;
+    stdio: ["ignore", "pipe", "pipe"];
+    windowsHide: true;
+  },
+) => ChildProcessByStdio<null, Readable, Readable>;
+
+export interface WindowsStoreBulkLookupOptions {
+  readonly platform?: NodeJS.Platform;
+  readonly env?: NodeJS.ProcessEnv;
+  readonly signal?: AbortSignal;
+  readonly spawnProcess?: SpawnWindowsStorePowerShell;
+}
 
 export function getEditorMacApplications(editor: EditorDefinition): readonly string[] | undefined {
   return "macApplications" in editor ? editor.macApplications : undefined;
@@ -226,8 +275,11 @@ function resolvePowerShellCacheKey(
   return JSON.stringify({
     platform,
     families,
-    path: env.PATH ?? env.Path ?? env.path ?? "",
-    systemRoot: env.SystemRoot ?? env.WINDIR ?? "",
+    path: readEffectiveWindowsEnvironmentValue(env, "PATH") ?? "",
+    systemRoot:
+      readEffectiveWindowsEnvironmentValue(env, "SystemRoot") ??
+      readEffectiveWindowsEnvironmentValue(env, "WINDIR") ??
+      "",
   });
 }
 
@@ -250,6 +302,226 @@ export function clearWindowsStorePackageDiscoveryCache(): void {
   powershellAppxLookupCache.clear();
 }
 
+function buildBulkPowerShellPackageScript(
+  packages: readonly WindowsStorePackageDefinition[],
+): string {
+  const packageArray = `@(${packages
+    .map(
+      (packageDef) =>
+        `@{ Name = ${quotePowerShellLiteral(packageDef.packageName)}; Family = ${quotePowerShellLiteral(
+          windowsStorePackageFamilyName(packageDef),
+        )} }`,
+    )
+    .join(",")})`;
+
+  return [
+    `$packageDefs = ${packageArray}`,
+    "$results = @()",
+    "foreach ($packageDef in $packageDefs) {",
+    "  $package = Get-AppxPackage -Name $packageDef.Name -ErrorAction Stop | " +
+      "Where-Object { $_.PackageFamilyName -ieq $packageDef.Family } | Select-Object -First 1",
+    "  if ($null -ne $package -and $package.InstallLocation) {",
+    "    $results += [PSCustomObject]@{ Family = $package.PackageFamilyName; InstallLocation = $package.InstallLocation }",
+    "  }",
+    "}",
+    "ConvertTo-Json -InputObject @($results) -Compress",
+  ].join("; ");
+}
+
+function parseBulkPowerShellPackageOutput(
+  stdout: string,
+  expectedFamilies: ReadonlySet<string>,
+): Readonly<Record<string, string>> | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout.trim());
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(parsed)) return null;
+
+  const installLocationsByFamily: Record<string, string> = {};
+  for (const entry of parsed) {
+    if (
+      typeof entry !== "object" ||
+      entry === null ||
+      !("Family" in entry) ||
+      !("InstallLocation" in entry) ||
+      typeof entry.Family !== "string" ||
+      typeof entry.InstallLocation !== "string"
+    ) {
+      return null;
+    }
+    const family = entry.Family.trim().toLowerCase();
+    const installLocation = entry.InstallLocation.trim();
+    if (!expectedFamilies.has(family) || installLocation.length === 0) {
+      return null;
+    }
+    installLocationsByFamily[family] = installLocation;
+  }
+  return installLocationsByFamily;
+}
+
+/**
+ * Resolves every relevant AppX package in one bounded, interruptible PowerShell process.
+ * Empty output is represented by a successful empty JSON array; subprocess failures are
+ * deliberately distinct so callers never turn a transient lookup failure into false absence.
+ */
+export async function discoverWindowsStorePackageInstallLocations(
+  packages: readonly WindowsStorePackageDefinition[],
+  options: WindowsStoreBulkLookupOptions = {},
+): Promise<WindowsStoreBulkLookupResult> {
+  const platform = options.platform ?? process.platform;
+  const packageDefs = uniqueWindowsStorePackageDefinitions(packages);
+  if (platform !== "win32" || packageDefs.length === 0) {
+    return { status: "success", installLocationsByFamily: {}, subprocessCount: 0 };
+  }
+  if (options.signal?.aborted) {
+    return { status: "failure", category: "cancelled", subprocessCount: 0 };
+  }
+
+  const env = normalizeWindowsChildEnvironment(options.env ?? process.env);
+  const powershellPath = pathWin32.join(
+    resolveWindowsSystemRoot(env),
+    "System32",
+    "WindowsPowerShell",
+    "v1.0",
+    "powershell.exe",
+  );
+  const args = [
+    "-NoProfile",
+    "-NonInteractive",
+    "-Command",
+    buildBulkPowerShellPackageScript(packageDefs),
+  ] as const;
+  const launch: SpawnWindowsStorePowerShell =
+    options.spawnProcess ??
+    ((command, commandArgs, spawnOptions) => spawn(command, [...commandArgs], spawnOptions));
+
+  let child: ChildProcessByStdio<null, Readable, Readable>;
+  try {
+    child = launch(powershellPath, args, {
+      env,
+      shell: false,
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    });
+  } catch {
+    return { status: "failure", category: "process_error", subprocessCount: 1 };
+  }
+
+  return await new Promise<WindowsStoreBulkLookupResult>((resolve) => {
+    const stdoutChunks: Buffer[] = [];
+    let combinedOutputBytes = 0;
+    let terminationCategory: WindowsStoreBulkLookupFailureCategory | null = null;
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    let postKillFallback: ReturnType<typeof setTimeout> | undefined;
+    let settled = false;
+
+    const cleanup = () => {
+      if (deadline !== undefined) {
+        clearTimeout(deadline);
+        deadline = undefined;
+      }
+      if (postKillFallback !== undefined) {
+        clearTimeout(postKillFallback);
+        postKillFallback = undefined;
+      }
+      options.signal?.removeEventListener("abort", handleAbort);
+      child.stdout.removeListener("data", handleStdout);
+      child.stderr.removeListener("data", handleStderr);
+      child.removeListener("error", handleError);
+      child.removeListener("close", handleClose);
+    };
+    const finish = (result: WindowsStoreBulkLookupResult) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(result);
+    };
+    const requestTermination = (category: WindowsStoreBulkLookupFailureCategory) => {
+      if (terminationCategory !== null || settled) return;
+      terminationCategory = category;
+      if (deadline !== undefined) {
+        clearTimeout(deadline);
+        deadline = undefined;
+      }
+      try {
+        if (!child.kill()) {
+          finish({ status: "failure", category, subprocessCount: 1 });
+          return;
+        }
+      } catch {
+        finish({ status: "failure", category, subprocessCount: 1 });
+        return;
+      }
+      if (settled) return;
+      postKillFallback = setTimeout(
+        () => finish({ status: "failure", category, subprocessCount: 1 }),
+        WINDOWS_STORE_BULK_LOOKUP_TERMINATION_GRACE_MS,
+      );
+      postKillFallback.unref();
+    };
+    const recordOutput = (chunk: Buffer | string, retain: boolean) => {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      combinedOutputBytes += buffer.byteLength;
+      if (combinedOutputBytes > WINDOWS_STORE_BULK_LOOKUP_OUTPUT_LIMIT_BYTES) {
+        requestTermination("output_limit");
+        return;
+      }
+      if (retain) stdoutChunks.push(buffer);
+    };
+    const handleStdout = (chunk: Buffer | string) => recordOutput(chunk, true);
+    const handleStderr = (chunk: Buffer | string) => recordOutput(chunk, false);
+    const handleAbort = () => requestTermination("cancelled");
+    const handleError = () =>
+      finish({
+        status: "failure",
+        category: terminationCategory ?? "process_error",
+        subprocessCount: 1,
+      });
+    const handleClose = (code: number | null) => {
+      if (terminationCategory !== null) {
+        finish({ status: "failure", category: terminationCategory, subprocessCount: 1 });
+        return;
+      }
+      if (code !== 0) {
+        finish({ status: "failure", category: "process_exit", subprocessCount: 1 });
+        return;
+      }
+
+      const expectedFamilies = new Set(
+        packageDefs.map((packageDef) => windowsStorePackageFamilyName(packageDef).toLowerCase()),
+      );
+      const parsed = parseBulkPowerShellPackageOutput(
+        Buffer.concat(stdoutChunks).toString("utf8"),
+        expectedFamilies,
+      );
+      finish(
+        parsed === null
+          ? { status: "failure", category: "malformed_output", subprocessCount: 1 }
+          : {
+              status: "success",
+              installLocationsByFamily: parsed,
+              subprocessCount: 1,
+            },
+      );
+    };
+    deadline = setTimeout(
+      () => requestTermination("timeout"),
+      WINDOWS_STORE_BULK_LOOKUP_TIMEOUT_MS,
+    );
+    deadline.unref();
+
+    child.stdout.on("data", handleStdout);
+    child.stderr.on("data", handleStderr);
+    child.once("error", handleError);
+    child.once("close", handleClose);
+    options.signal?.addEventListener("abort", handleAbort, { once: true });
+    if (options.signal?.aborted) handleAbort();
+  });
+}
+
 export function resolveWindowsStorePackageDirectoryFromPowerShell(
   packages: readonly WindowsStorePackageDefinition[] | undefined,
   platform: NodeJS.Platform,
@@ -261,10 +533,11 @@ export function resolveWindowsStorePackageDirectoryFromPowerShell(
 
   const packageDefs = uniqueWindowsStorePackageDefinitions(packages);
   if (packageDefs.length === 0) return null;
+  const childEnv = normalizeWindowsChildEnvironment(env);
 
   const now = options.now?.() ?? Date.now();
   const useCache = options.useCache ?? execFile === execFileSync;
-  const cacheKey = useCache ? resolvePowerShellCacheKey(packageDefs, platform, env) : null;
+  const cacheKey = useCache ? resolvePowerShellCacheKey(packageDefs, platform, childEnv) : null;
   if (cacheKey) {
     const cached = readPowerShellAppxLookupCache(cacheKey, now);
     if (cached !== undefined) return cached;
@@ -294,7 +567,7 @@ export function resolveWindowsStorePackageDirectoryFromPowerShell(
   try {
     const stdout = execFile("powershell.exe", ["-NoProfile", "-Command", script], {
       encoding: "utf8",
-      env,
+      env: childEnv,
       stdio: ["ignore", "pipe", "ignore"],
       timeout: POWERSHELL_APPX_LOOKUP_TIMEOUT_MS,
       windowsHide: true,
