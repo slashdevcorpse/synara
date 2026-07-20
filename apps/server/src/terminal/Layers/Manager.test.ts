@@ -25,9 +25,10 @@ import {
   terminalHistoryMetadataPath,
 } from "../terminalHistoryRecord";
 import type {
-  TerminalShellResolver,
+  PosixTerminalShellResolver,
   WindowsExplicitShellChoice,
   WindowsShellSelectionDependencies,
+  WindowsTerminalShellResolver,
 } from "../windowsShellSelection";
 
 class FakePtyProcess implements PtyProcess {
@@ -191,45 +192,50 @@ function multiTerminalHistoryLogPath(
 describe("TerminalManager", () => {
   const tempDirs: string[] = [];
 
+  type MakeManagerOptions = {
+    shellEnvironment?: NodeJS.ProcessEnv;
+    windowsShellSelectionDependencies?: WindowsShellSelectionDependencies;
+    subprocessChecker?: (terminalPid: number) => Promise<boolean | TerminalSubprocessActivity>;
+    processTreeKiller?: ProcessTreeKiller;
+    subprocessPollIntervalMs?: number;
+    processKillGraceMs?: number;
+    maxRetainedInactiveSessions?: number;
+    ptyAdapter?: FakePtyAdapter;
+    prepareLogs?: (logsDir: string) => void;
+  } & (
+    | {
+        shellPlatform: "win32";
+        shellResolver?: WindowsTerminalShellResolver;
+      }
+    | {
+        shellPlatform: Exclude<NodeJS.Platform, "win32">;
+        shellResolver?: PosixTerminalShellResolver;
+      }
+    | {
+        shellPlatform?: undefined;
+        shellResolver?: never;
+      }
+  );
+
   afterEach(() => {
     for (const dir of tempDirs.splice(0, tempDirs.length)) {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  function makeManager(
-    historyLineLimit = 5,
-    options: {
-      shellResolver?: TerminalShellResolver;
-      shellPlatform?: NodeJS.Platform;
-      shellEnvironment?: NodeJS.ProcessEnv;
-      windowsShellSelectionDependencies?: WindowsShellSelectionDependencies;
-      subprocessChecker?: (terminalPid: number) => Promise<boolean | TerminalSubprocessActivity>;
-      processTreeKiller?: ProcessTreeKiller;
-      subprocessPollIntervalMs?: number;
-      processKillGraceMs?: number;
-      maxRetainedInactiveSessions?: number;
-      ptyAdapter?: FakePtyAdapter;
-      prepareLogs?: (logsDir: string) => void;
-    } = {},
-  ) {
+  function makeManager(historyLineLimit = 5, options: MakeManagerOptions = {}) {
     const logsDir = fs.mkdtempSync(path.join(os.tmpdir(), "synara-terminal-"));
     tempDirs.push(logsDir);
     options.prepareLogs?.(logsDir);
     const ptyAdapter = options.ptyAdapter ?? new FakePtyAdapter();
-    const shellPlatform = options.shellPlatform ?? process.platform;
     const defaultShellChoice: WindowsExplicitShellChoice = {
       executable: "C:\\Synara Test\\fake-shell.exe",
       args: [],
     };
-    const manager = new TerminalManagerRuntime({
+    const commonOptions = {
       logsDir,
       ptyAdapter,
       historyLineLimit,
-      shellResolver:
-        options.shellResolver ??
-        (() => (shellPlatform === "win32" ? defaultShellChoice : "/bin/bash")),
-      shellPlatform,
       ...(options.shellEnvironment ? { shellEnvironment: options.shellEnvironment } : {}),
       ...(options.windowsShellSelectionDependencies
         ? { windowsShellSelectionDependencies: options.windowsShellSelectionDependencies }
@@ -243,7 +249,31 @@ describe("TerminalManager", () => {
       ...(options.maxRetainedInactiveSessions
         ? { maxRetainedInactiveSessions: options.maxRetainedInactiveSessions }
         : {}),
-    });
+    };
+    const manager =
+      options.shellPlatform === "win32"
+        ? new TerminalManagerRuntime({
+            ...commonOptions,
+            shellPlatform: "win32",
+            shellResolver: options.shellResolver ?? (() => defaultShellChoice),
+          })
+        : options.shellPlatform !== undefined
+          ? new TerminalManagerRuntime({
+              ...commonOptions,
+              shellPlatform: options.shellPlatform,
+              shellResolver: options.shellResolver ?? (() => "/bin/bash"),
+            })
+          : process.platform === "win32"
+            ? new TerminalManagerRuntime({
+                ...commonOptions,
+                shellPlatform: "win32",
+                shellResolver: () => defaultShellChoice,
+              })
+            : new TerminalManagerRuntime({
+                ...commonOptions,
+                shellPlatform: process.platform,
+                shellResolver: () => "/bin/bash",
+              });
     return { logsDir, ptyAdapter, manager };
   }
 
@@ -288,7 +318,7 @@ describe("TerminalManager", () => {
   ])("fails closed on explicit Windows %s", async (_label, shellResolver, expectedMessage) => {
     const { manager, ptyAdapter } = makeManager(5, {
       shellPlatform: "win32",
-      shellResolver: shellResolver as TerminalShellResolver,
+      shellResolver,
     });
     const events: TerminalEvent[] = [];
     manager.on("event", (event) => events.push(event));

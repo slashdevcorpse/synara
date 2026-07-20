@@ -78,7 +78,8 @@ import {
   automaticWindowsShellLaunchError,
   createWindowsShellSelection,
   explicitWindowsShellLaunchError,
-  type TerminalShellResolver,
+  type PosixTerminalShellResolver,
+  type WindowsTerminalShellResolver,
   type WindowsShellSelectionDependencies,
 } from "../windowsShellSelection";
 
@@ -275,7 +276,7 @@ function uniqueShellCandidates(candidates: Array<ShellCandidate | null>): ShellC
 }
 
 function resolveShellCandidates(
-  shellResolver: TerminalShellResolver,
+  shellResolver: PosixTerminalShellResolver,
   options: ShellResolutionOptions = {},
 ): ShellCandidate[] {
   const platform = options.platform ?? process.platform;
@@ -996,13 +997,11 @@ interface TerminalManagerEvents {
   event: [event: TerminalEvent];
 }
 
-interface TerminalManagerOptions {
+interface TerminalManagerCommonOptions {
   logsDir?: string;
   historyLineLimit?: number;
   historyByteLimit?: number;
   ptyAdapter: PtyAdapterShape;
-  shellResolver?: TerminalShellResolver;
-  shellPlatform?: NodeJS.Platform;
   shellEnvironment?: NodeJS.ProcessEnv;
   windowsShellSelectionDependencies?: WindowsShellSelectionDependencies;
   subprocessChecker?: TerminalSubprocessChecker;
@@ -1011,6 +1010,32 @@ interface TerminalManagerOptions {
   processKillGraceMs?: number;
   maxRetainedInactiveSessions?: number;
 }
+
+type TerminalManagerShellOptions =
+  | {
+      shellPlatform: "win32";
+      shellResolver?: WindowsTerminalShellResolver;
+    }
+  | {
+      shellPlatform: Exclude<NodeJS.Platform, "win32">;
+      shellResolver?: PosixTerminalShellResolver;
+    }
+  | {
+      shellPlatform?: undefined;
+      shellResolver?: never;
+    };
+
+type TerminalManagerOptions = TerminalManagerCommonOptions & TerminalManagerShellOptions;
+
+type TerminalShellConfiguration =
+  | {
+      readonly platform: "win32";
+      readonly resolver: WindowsTerminalShellResolver;
+    }
+  | {
+      readonly platform: Exclude<NodeJS.Platform, "win32">;
+      readonly resolver: PosixTerminalShellResolver;
+    };
 
 interface KillEscalationHandle {
   timer: ReturnType<typeof setTimeout>;
@@ -1027,8 +1052,7 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
   private readonly historyLineLimit: number;
   private readonly historyByteLimit: number;
   private readonly ptyAdapter: PtyAdapterShape;
-  private readonly shellResolver: TerminalShellResolver;
-  private readonly shellPlatform: NodeJS.Platform;
+  private readonly shellConfiguration: TerminalShellConfiguration;
   private readonly shellEnvironment: NodeJS.ProcessEnv;
   private readonly windowsShellSelectionDependencies: WindowsShellSelectionDependencies;
   private readonly persistQueues = new Map<string, Promise<void>>();
@@ -1071,10 +1095,26 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
     this.historyLineLimit = options.historyLineLimit ?? DEFAULT_HISTORY_LINE_LIMIT;
     this.historyByteLimit = options.historyByteLimit ?? DEFAULT_HISTORY_BYTE_LIMIT;
     this.ptyAdapter = options.ptyAdapter;
-    this.shellPlatform = options.shellPlatform ?? process.platform;
     this.shellEnvironment = options.shellEnvironment ?? process.env;
     this.windowsShellSelectionDependencies = options.windowsShellSelectionDependencies ?? {};
-    this.shellResolver = options.shellResolver ?? (() => defaultShellResolver(this.shellPlatform));
+    if (options.shellPlatform === "win32") {
+      this.shellConfiguration = {
+        platform: "win32",
+        resolver: options.shellResolver ?? (() => null),
+      };
+    } else if (options.shellPlatform !== undefined) {
+      this.shellConfiguration = {
+        platform: options.shellPlatform,
+        resolver: options.shellResolver ?? (() => defaultShellResolver(options.shellPlatform)),
+      };
+    } else if (process.platform === "win32") {
+      this.shellConfiguration = { platform: "win32", resolver: () => null };
+    } else {
+      this.shellConfiguration = {
+        platform: process.platform,
+        resolver: () => defaultShellResolver(process.platform),
+      };
+    }
     this.persistDebounceMs = DEFAULT_PERSIST_DEBOUNCE_MS;
     this.subprocessChecker = options.subprocessChecker ?? defaultSubprocessChecker;
     this.processTreeKiller = options.processTreeKiller ?? defaultProcessTreeKiller;
@@ -1540,9 +1580,9 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
           }),
         );
 
-      if (this.shellPlatform === "win32") {
+      if (this.shellConfiguration.platform === "win32") {
         const selection = createWindowsShellSelection({
-          resolveExplicit: this.shellResolver,
+          resolveExplicit: this.shellConfiguration.resolver,
           env: this.shellEnvironment,
           dependencies: this.windowsShellSelectionDependencies,
         });
@@ -1568,8 +1608,8 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
         }
         if (!ptyProcess) throw selection.exhaustedError();
       } else {
-        const shellCandidates = resolveShellCandidates(this.shellResolver, {
-          platform: this.shellPlatform,
+        const shellCandidates = resolveShellCandidates(this.shellConfiguration.resolver, {
+          platform: this.shellConfiguration.platform,
           ...(this.shellEnvironment.SHELL !== undefined
             ? { envShell: this.shellEnvironment.SHELL }
             : {}),

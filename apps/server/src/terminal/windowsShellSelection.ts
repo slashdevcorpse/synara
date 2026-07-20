@@ -17,6 +17,7 @@ const POWERSHELL_PROBE_ARGS = [
 const POWERSHELL_INTERACTIVE_ARGS = ["-NoLogo"] as const;
 const POWERSHELL_PROBE_TIMEOUT_MS = 1_500;
 const POWERSHELL_PROBE_OUTPUT_LIMIT_BYTES = 32 * 1024;
+const POWERSHELL_PROBE_TERMINATION_GRACE_MS = 250;
 const POWERSHELL_PROBE_REAP_TIMEOUT_MS = 250;
 const WINDOWS_EXECUTABLE_VALIDATION_TIMEOUT_MS = 500;
 const WINDOWS_EXECUTABLE_EXTENSION_PATTERN = /\.(?:com|exe)$/i;
@@ -26,7 +27,8 @@ export interface WindowsExplicitShellChoice {
   readonly args: readonly string[];
 }
 
-export type TerminalShellResolver = () => string | WindowsExplicitShellChoice | null | undefined;
+export type WindowsTerminalShellResolver = () => WindowsExplicitShellChoice | null | undefined;
+export type PosixTerminalShellResolver = () => string | null | undefined;
 
 export type WindowsShellCandidateLabel =
   | "explicit shell"
@@ -84,7 +86,7 @@ export interface WindowsShellSelectionDependencies {
 }
 
 export interface WindowsShellSelectionInput {
-  readonly resolveExplicit: TerminalShellResolver;
+  readonly resolveExplicit: WindowsTerminalShellResolver;
   readonly env?: NodeJS.ProcessEnv;
   readonly dependencies?: WindowsShellSelectionDependencies;
 }
@@ -223,7 +225,6 @@ async function runPowerShellProbe({
     ): void => {
       if (settled) return;
       settled = true;
-      const terminationAccepted = shouldTerminate ? terminate() : true;
       cleanup();
 
       if (!shouldTerminate) {
@@ -231,34 +232,41 @@ async function runPowerShellProbe({
         return;
       }
 
-      guardLateErrorsUntilClose();
-      if (terminationAccepted) {
-        resolve(category);
-        return;
-      }
-
       let completed = false;
-      const completeFallback = (): void => {
+      const completeTermination = (): void => {
         if (completed) return;
         completed = true;
         if (timeout) {
           clearTimeout(timeout);
           timeout = null;
         }
-        child.off("close", completeFallback);
+        child.off("close", completeTermination);
         resolve(category);
       };
-      child.once("close", completeFallback);
-      try {
-        forceTerminateProcess(child);
-      } catch {
-        // The bounded reap window below still prevents probe selection from hanging.
-      }
-      if (probeHasExited(child)) {
-        completeFallback();
+
+      const forceTerminateAndReap = (): void => {
+        if (completed) return;
+        timeout = null;
+        try {
+          forceTerminateProcess(child);
+        } catch {
+          // The bounded reap window below still prevents probe selection from hanging.
+        }
+        if (completed) return;
+        timeout = setTimeout(completeTermination, POWERSHELL_PROBE_REAP_TIMEOUT_MS);
+      };
+
+      guardLateErrorsUntilClose();
+      child.once("close", completeTermination);
+      const terminationAccepted = terminate();
+      if (completed) return;
+
+      if (!terminationAccepted) {
+        forceTerminateAndReap();
         return;
       }
-      timeout = setTimeout(completeFallback, POWERSHELL_PROBE_REAP_TIMEOUT_MS);
+
+      timeout = setTimeout(forceTerminateAndReap, POWERSHELL_PROBE_TERMINATION_GRACE_MS);
     };
 
     const onOutput = (chunk: Buffer | string): void => {
@@ -570,7 +578,7 @@ class WindowsShellSelectionPlanImpl implements WindowsShellSelectionPlan {
 export function createWindowsShellSelection(
   input: WindowsShellSelectionInput,
 ): WindowsShellSelectionPlan {
-  let resolved: ReturnType<TerminalShellResolver>;
+  let resolved: ReturnType<WindowsTerminalShellResolver>;
   try {
     resolved = input.resolveExplicit();
   } catch {
@@ -605,6 +613,7 @@ export const __windowsShellSelectionTesting = {
   powerShellProbeArgs: POWERSHELL_PROBE_ARGS,
   powerShellProbeOutputLimitBytes: POWERSHELL_PROBE_OUTPUT_LIMIT_BYTES,
   powerShellProbeReapTimeoutMs: POWERSHELL_PROBE_REAP_TIMEOUT_MS,
+  powerShellProbeTerminationGraceMs: POWERSHELL_PROBE_TERMINATION_GRACE_MS,
   powerShellProbeTimeoutMs: POWERSHELL_PROBE_TIMEOUT_MS,
   runPowerShellProbe,
   validateWindowsExecutable,

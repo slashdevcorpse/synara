@@ -540,12 +540,10 @@ describe("bounded profile-free PowerShell probes", () => {
 
     child.stdout.write(Buffer.alloc(half));
     child.stderr.write(Buffer.alloc(half + 1));
+    child.close(null, "SIGTERM");
 
     await expect(result).resolves.toBe("probe output limit exceeded");
     expect(child.killCalls).toBe(1);
-    expect(child.listenerCount("close")).toBe(1);
-    expect(child.listenerCount("error")).toBe(1);
-    child.close(null, "SIGTERM");
     expect(child.listenerCount("close")).toBe(0);
     expect(child.listenerCount("error")).toBe(0);
   });
@@ -560,11 +558,51 @@ describe("bounded profile-free PowerShell probes", () => {
     });
 
     await vi.advanceTimersByTimeAsync(__windowsShellSelectionTesting.powerShellProbeTimeoutMs);
+    child.close(null, "SIGTERM");
 
     await expect(result).resolves.toBe("probe timed out");
     expect(child.killCalls).toBe(1);
     expect(vi.getTimerCount()).toBe(0);
-    child.close(null, "SIGTERM");
+    expect(child.listenerCount("close")).toBe(0);
+    expect(child.listenerCount("error")).toBe(0);
+  });
+
+  it("force-terminates an accepted direct termination that does not close", async () => {
+    vi.useFakeTimers();
+    const child = new FakeProbeChild();
+    let forceTerminationCalls = 0;
+    let resolved = false;
+    const result = __windowsShellSelectionTesting.runPowerShellProbe({
+      executable: "pwsh",
+      env: {},
+      spawnProcess: () => child.asChildProcess(),
+      forceTerminateProcess: () => {
+        forceTerminationCalls += 1;
+        queueMicrotask(() => child.close(null, "SIGKILL"));
+        return true;
+      },
+    });
+    void result.then(() => {
+      resolved = true;
+    });
+
+    child.stdout.write(
+      Buffer.alloc(__windowsShellSelectionTesting.powerShellProbeOutputLimitBytes + 1),
+    );
+    await vi.advanceTimersByTimeAsync(
+      __windowsShellSelectionTesting.powerShellProbeTerminationGraceMs - 1,
+    );
+
+    expect(resolved).toBe(false);
+    expect(child.killCalls).toBe(1);
+    expect(forceTerminationCalls).toBe(0);
+
+    await vi.advanceTimersByTimeAsync(1);
+
+    await expect(result).resolves.toBe("probe output limit exceeded");
+    expect(forceTerminationCalls).toBe(1);
+    expect(child.signalCode).toBe("SIGKILL");
+    expect(vi.getTimerCount()).toBe(0);
     expect(child.listenerCount("close")).toBe(0);
     expect(child.listenerCount("error")).toBe(0);
   });
