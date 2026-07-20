@@ -8,7 +8,10 @@ import { ThreadId } from "@synara/contracts";
 import { page } from "vitest/browser";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { shouldClearThreadSelectionOnMouseDown } from "../components/Sidebar.logic";
+import {
+  archiveSelectedThreadEntriesAndReconcileSelection,
+  shouldClearThreadSelectionOnMouseDown,
+} from "../components/Sidebar.logic";
 import { showContextMenuFallback } from "../contextMenuFallback";
 import { useThreadSelectionStore } from "../threadSelectionStore";
 
@@ -49,7 +52,7 @@ describe("showContextMenuFallback", () => {
     await expect(result).resolves.toBe("delete");
   });
 
-  it("reconciles archived rows without clearing a newer selection", async () => {
+  it("drives a bulk archive outcome without clearing a newer selection", async () => {
     const first = ThreadId.makeUnsafe("thread-first");
     const second = ThreadId.makeUnsafe("thread-second");
     const newlySelected = ThreadId.makeUnsafe("thread-newly-selected");
@@ -75,10 +78,30 @@ describe("showContextMenuFallback", () => {
       await expect(result).resolves.toBe("archive");
       expect([...useThreadSelectionStore.getState().selectedThreadIds]).toEqual([first, second]);
 
-      // A sequential batch remains interactive after the menu resolves. Model the user selecting
-      // a different row before the original archive snapshot finishes, then reconcile that batch.
+      let releaseFirstArchive: (() => void) | undefined;
+      const firstArchiveGate = new Promise<void>((resolve) => {
+        releaseFirstArchive = resolve;
+      });
+      const pendingOutcome = archiveSelectedThreadEntriesAndReconcileSelection({
+        entries: [first, second],
+        archive: async (threadId, onArchived) => {
+          if (threadId === first) {
+            await firstArchiveGate;
+          }
+          onArchived();
+          return true;
+        },
+        removeFromSelection: (threadIds) => {
+          useThreadSelectionStore.getState().removeFromSelection(threadIds);
+        },
+      });
+
+      // The menu snapshot remains in flight while the user selects a different row.
       useThreadSelectionStore.getState().toggleThread(newlySelected);
-      useThreadSelectionStore.getState().removeFromSelection([first, second]);
+      releaseFirstArchive?.();
+      const outcome = await pendingOutcome;
+
+      expect(outcome.archivedThreadIds).toEqual([first, second]);
       expect([...useThreadSelectionStore.getState().selectedThreadIds]).toEqual([newlySelected]);
     } finally {
       window.removeEventListener("mousedown", clearUnsafeSelection);

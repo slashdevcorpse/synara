@@ -14,10 +14,18 @@ export interface NormalizedContextMenuItem {
 }
 
 export function normalizeContextMenuItems(
-  items: readonly ContextMenuItem[],
+  items: readonly unknown[],
 ): readonly NormalizedContextMenuItem[] {
   return items
-    .filter((item) => typeof item.id === "string" && typeof item.label === "string")
+    .filter(
+      (item): item is ContextMenuItem =>
+        typeof item === "object" &&
+        item !== null &&
+        "id" in item &&
+        typeof item.id === "string" &&
+        "label" in item &&
+        typeof item.label === "string",
+    )
     .map((item) => ({
       id: item.id,
       label: item.label,

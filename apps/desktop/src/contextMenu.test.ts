@@ -33,6 +33,9 @@ describe("normalizeContextMenuItems", () => {
 
   it("drops malformed rows before building a native menu", () => {
     const malformedItems = [
+      null,
+      undefined,
+      "not-an-item",
       { id: 42, label: "Wrong id" },
       { id: "missing-label" },
       { id: "valid", label: "Valid" },

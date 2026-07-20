@@ -177,6 +177,24 @@ export async function archiveSelectedThreadEntries<TThreadId extends string>(inp
   };
 }
 
+/** Archives a menu snapshot and reconciles only the rows whose mutations completed. */
+export async function archiveSelectedThreadEntriesAndReconcileSelection<
+  TThreadId extends string,
+>(input: {
+  readonly entries: readonly TThreadId[];
+  readonly archive: (threadId: TThreadId, onArchived: () => void) => Promise<boolean>;
+  readonly removeFromSelection: (threadIds: readonly TThreadId[]) => void;
+}): Promise<ArchiveSelectedThreadEntriesOutcome<TThreadId>> {
+  const outcome = await archiveSelectedThreadEntries({
+    entries: input.entries,
+    archive: input.archive,
+  });
+  if (outcome.archivedThreadIds.length > 0) {
+    input.removeFromSelection(outcome.archivedThreadIds);
+  }
+  return outcome;
+}
+
 /** Runs the route follow-up against the route that is current after the archive mutation. */
 export async function runThreadArchiveWithCurrentRoute<TThreadId extends string>(input: {
   readonly threadId: TThreadId;

@@ -293,7 +293,7 @@ import {
 import { useThreadSelectionStore } from "../threadSelectionStore";
 import { formatWorktreePathForDisplay, getOrphanedWorktreePathForThread } from "../worktreeCleanup";
 import {
-  archiveSelectedThreadEntries,
+  archiveSelectedThreadEntriesAndReconcileSelection,
   archiveThreadEntry,
   buildMultiSelectThreadContextMenuItems,
   describeAddProjectError,
@@ -4110,21 +4110,15 @@ export default function Sidebar() {
         }
 
         const fallbackExcludedThreadIds = new Set(ids);
-        const outcome = await archiveSelectedThreadEntries({
+        const outcome = await archiveSelectedThreadEntriesAndReconcileSelection({
           entries: ids,
           archive: (id, onArchived) =>
             archiveThread(id, {
               onArchived,
               fallbackExcludedThreadIds,
             }),
+          removeFromSelection,
         });
-
-        // Reconcile only the rows from this menu snapshot. A sequential archive can take long
-        // enough for the user to select another thread while it is running; that newer selection
-        // must survive even when every originally selected thread archived successfully.
-        if (outcome.archivedThreadIds.length > 0) {
-          removeFromSelection(outcome.archivedThreadIds);
-        }
 
         if (outcome.followupFailures.length > 0) {
           for (const failure of outcome.followupFailures) {
