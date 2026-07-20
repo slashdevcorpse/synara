@@ -219,6 +219,19 @@ describe("Super Synara workflow contracts", () => {
 
     expect(() =>
       verifySuperSynaraWorkflowText(
+        main.replace("  publish:\n", "  publish:\n    continue-on-error: true\n"),
+        audit,
+      ),
+    ).toThrow("publish job must fail closed");
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace("  publish:\n", "  publish:\n    continue-on-error: false\n"),
+        audit,
+      ),
+    ).not.toThrow();
+
+    expect(() =>
+      verifySuperSynaraWorkflowText(
         main.replace(
           "      - name: Download macOS lane\n        if: ${{ needs.preflight.outputs.include_macos == 'true' }}",
           "      - name: Download macOS lane",
@@ -317,6 +330,24 @@ describe("Super Synara workflow contracts", () => {
         audit,
       ),
     ).toThrow("bind the selected scope");
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          "            windows-only)\n              include_macos=false\n              asset_count=6",
+          "            windows-only)\n              include_macos=true\n              asset_count=8",
+        ),
+        audit,
+      ),
+    ).toThrow("must map windows-only to include_macos=false and asset_count=6");
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          "            windows-and-macos)\n              include_macos=true\n              asset_count=8",
+          "            windows-and-macos)\n              include_macos=false\n              asset_count=6",
+        ),
+        audit,
+      ),
+    ).toThrow("must map windows-and-macos to include_macos=true and asset_count=8");
   });
 
   it("rejects removal of native Windows installer lifecycle qualification", () => {

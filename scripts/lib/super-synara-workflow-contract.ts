@@ -88,6 +88,68 @@ function publicationJob(jobs: UnknownRecord, jobName: string): UnknownRecord {
   return job;
 }
 
+function verifyReleaseScopeCase(preflightJob: UnknownRecord): void {
+  const steps = preflightJob.steps;
+  if (!Array.isArray(steps)) {
+    throw new Error("Publication workflow must define preflight steps.");
+  }
+  const metadataSteps = steps.filter(
+    (step) => isRecord(step) && step.id === "meta" && typeof step.run === "string",
+  );
+  if (metadataSteps.length !== 1) {
+    throw new Error("Publication release-scope contract must define exactly one metadata step.");
+  }
+
+  const lines = executableShellLines(metadataSteps[0]!.run as string);
+  const caseStarts = lines
+    .map((line, index) => (line === 'case "$RELEASE_SCOPE" in' ? index : -1))
+    .filter((index) => index >= 0);
+  if (caseStarts.length !== 1) {
+    throw new Error("Publication release-scope contract must define exactly one scope case.");
+  }
+  const caseStart = caseStarts[0]!;
+  const caseEnd = lines.indexOf("esac", caseStart + 1);
+  if (caseEnd < 0) {
+    throw new Error("Publication release-scope contract must terminate its scope case.");
+  }
+
+  const arms = new Map<string, readonly string[]>();
+  let index = caseStart + 1;
+  while (index < caseEnd) {
+    const armMatch = /^([*a-z0-9-]+)\)$/.exec(lines[index]!);
+    if (!armMatch) {
+      throw new Error("Publication release-scope contract contains an invalid scope case arm.");
+    }
+    const arm = armMatch[1]!;
+    if (arms.has(arm)) {
+      throw new Error(`Publication release-scope contract duplicates the ${arm} case arm.`);
+    }
+    const commands: string[] = [];
+    index += 1;
+    while (index < caseEnd && lines[index] !== ";;") {
+      commands.push(lines[index]!);
+      index += 1;
+    }
+    if (index >= caseEnd) {
+      throw new Error(`Publication release-scope contract does not terminate the ${arm} case arm.`);
+    }
+    arms.set(arm, commands);
+    index += 1;
+  }
+
+  const expectedArms = new Map<string, readonly string[]>([
+    [WINDOWS_RELEASE_SCOPE, ["include_macos=false", "asset_count=6"]],
+    [MACOS_RELEASE_SCOPE, ["include_macos=true", "asset_count=8"]],
+  ]);
+  for (const [scope, expectedCommands] of expectedArms) {
+    if (JSON.stringify(arms.get(scope)) !== JSON.stringify(expectedCommands)) {
+      throw new Error(
+        `Publication release-scope case must map ${scope} to ${expectedCommands.join(" and ")}.`,
+      );
+    }
+  }
+}
+
 function nativeJobRunSteps(jobs: UnknownRecord, jobName: string): readonly WorkflowRunStep[] {
   const job = publicationJob(jobs, jobName);
   const steps = job.steps;
@@ -303,6 +365,7 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
   const windowsJob = publicationJob(jobs, "windows_x64");
   const macosJob = publicationJob(jobs, "macos_arm64");
   const publishJob = publicationJob(jobs, "publish");
+  verifyReleaseScopeCase(preflightJob);
   verifyNativeJobCommands(
     windowsJob,
     "windows_x64",
@@ -327,6 +390,9 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
     throw new Error(
       "Publication workflow publish job must fail closed over the exact selected native lanes.",
     );
+  }
+  if (publishJob["continue-on-error"] !== undefined && publishJob["continue-on-error"] !== false) {
+    throw new Error("Publication workflow publish job must fail closed.");
   }
   const publishSteps = publishJob.steps;
   if (!Array.isArray(publishSteps)) {
@@ -372,9 +438,6 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
     `default: ${WINDOWS_RELEASE_SCOPE}`,
     `- ${WINDOWS_RELEASE_SCOPE}`,
     `- ${MACOS_RELEASE_SCOPE}`,
-    'case "$RELEASE_SCOPE" in',
-    "asset_count=6",
-    "asset_count=8",
   ]) {
     requireText(main, scopeNeedle, `Publication release-scope contract is missing ${scopeNeedle}.`);
   }

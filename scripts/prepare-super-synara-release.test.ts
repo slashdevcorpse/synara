@@ -62,5 +62,16 @@ describe("Super Synara release admission CLI", () => {
         "scripts/super-synara-macos-signature-allowlist.json",
       ]),
     ).toThrow("does not accept --mac-signature-allowlist");
+
+    expect(() =>
+      parseArgs([
+        "prepare",
+        ...commonArguments,
+        "--release-scope",
+        "windows-only",
+        "--mac-signature-allowlist",
+        "",
+      ]),
+    ).toThrow("does not accept --mac-signature-allowlist");
   });
 });

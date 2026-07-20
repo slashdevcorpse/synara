@@ -68,6 +68,7 @@ export function parseArgs(argv: ReadonlyArray<string>): {
     );
   }
   const releaseScope: SuperSynaraReleaseScope = releaseScopeValue;
+  const hasMacSignatureAllowlistArgument = values.has("--mac-signature-allowlist");
   const macSignatureAllowlistPath = values.get("--mac-signature-allowlist");
   if (mode === "prepare" && !licensePath) {
     throw new Error("Prepare mode requires --license.");
@@ -77,7 +78,7 @@ export function parseArgs(argv: ReadonlyArray<string>): {
       "Combined release admission requires --mac-signature-allowlist with a committed reviewed policy.",
     );
   }
-  if (releaseScope === "windows-only" && macSignatureAllowlistPath) {
+  if (releaseScope === "windows-only" && hasMacSignatureAllowlistArgument) {
     throw new Error("Windows-only release admission does not accept --mac-signature-allowlist.");
   }
   return {

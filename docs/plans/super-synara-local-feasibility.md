@@ -1,6 +1,6 @@
 # Plan — Super Synara local downstream and unsigned downloads
 
-> Status: **IMPLEMENTED — Windows-first release path active; combined macOS admission deferred**
+> Status: **IN DELIVERY — Windows path implemented; first prerelease qualification pending; combined macOS admission deferred**
 > Downstream repository: `slashdevcorpse/synara` (public fork)
 > Canonical upstream: `Emanuele-web04/synara`
 > Primary use: a personal Windows build with durable public downloads
