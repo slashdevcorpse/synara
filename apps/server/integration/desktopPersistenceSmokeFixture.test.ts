@@ -51,7 +51,13 @@ function runFixtureCli(mode: "arm", synaraHome: string) {
   });
 }
 
-async function persistCrashRecoveryOutcome(synaraHome: string): Promise<void> {
+async function persistCrashRecoveryOutcome(
+  synaraHome: string,
+  options: {
+    readonly includeArmMarker?: boolean;
+    readonly lastRuntimeEventAt?: string;
+  } = {},
+): Promise<void> {
   const { directory, runtime } = await openProviderDirectory(synaraHome);
   try {
     const bindingOption = await runtime.runPromise(
@@ -71,7 +77,10 @@ async function persistCrashRecoveryOutcome(synaraHome: string): Promise<void> {
           ...runtimePayload,
           activeTurnId: null,
           lastRuntimeEvent: "provider.startupCrashRecovery",
-          lastRuntimeEventAt: "2026-07-20T12:01:00.000Z",
+          lastRuntimeEventAt: options.lastRuntimeEventAt ?? "2026-07-20T12:01:00.000Z",
+          ...(options.includeArmMarker
+            ? { desktopPersistenceSmokeArm: DESKTOP_PERSISTENCE_SMOKE_ARM_MARKER }
+            : {}),
         },
       }),
     );
@@ -97,6 +106,25 @@ describe("desktop persistence smoke fixture", () => {
       expect(armResult.status).toBe(1);
       expect(armResult.stderr).toContain(
         "arm requires launch A to be running and holding the desktop database lifecycle lock",
+      );
+    } finally {
+      FS.rmSync(synaraHome, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a parseable but non-ISO crash-recovery timestamp", async () => {
+    const synaraHome = FS.mkdtempSync(Path.join(OS.tmpdir(), "synara-desktop-timestamp-"));
+    const nonIsoTimestamp = new Date("2026-07-20T12:01:00.000Z").toUTCString();
+    try {
+      expect(Number.isNaN(Date.parse(nonIsoTimestamp))).toBe(false);
+      await seedDesktopPersistenceSmokeFixture(synaraHome);
+      await persistCrashRecoveryOutcome(synaraHome, {
+        includeArmMarker: true,
+        lastRuntimeEventAt: nonIsoTimestamp,
+      });
+
+      await expect(assertDesktopPersistenceSmokeFixture(synaraHome)).rejects.toThrow(
+        "provider startup crash-recovery timestamp must be an ISO date-time",
       );
     } finally {
       FS.rmSync(synaraHome, { recursive: true, force: true });

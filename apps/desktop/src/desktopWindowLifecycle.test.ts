@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   resolveDesktopWindowReopenDecision,
+  shouldOpenDesktopMainWindowAfterBackendLaunch,
   shouldKeepDesktopRuntimeAliveAfterWindowAllClosed,
 } from "./desktopWindowLifecycle";
 
@@ -116,6 +117,16 @@ describe("resolveDesktopWindowReopenDecision", () => {
   });
 });
 
+describe("shouldOpenDesktopMainWindowAfterBackendLaunch", () => {
+  it("retains the initial or explicitly requested open intent across backend recovery", () => {
+    expect(shouldOpenDesktopMainWindowAfterBackendLaunch("open-requested")).toBe(true);
+  });
+
+  it("preserves a deliberately closed renderer across backend recovery", () => {
+    expect(shouldOpenDesktopMainWindowAfterBackendLaunch("closed")).toBe(false);
+  });
+});
+
 describe("desktop window lifecycle integration", () => {
   it("routes second-instance and macOS activation through one reopen function", () => {
     expect(desktopMainSource).toContain(
@@ -131,6 +142,7 @@ describe("desktop window lifecycle integration", () => {
       "// Show a native OS notification",
     );
     expect(reopenPath).toContain("resolveDesktopWindowReopenDecision");
+    expect(reopenPath).toContain('desktopMainWindowOpenIntent = "open-requested"');
     expect(reopenPath).toContain(
       "openDesktopMainWindowAgainstCurrentBackend(reason, backendHttpUrl)",
     );
@@ -160,6 +172,7 @@ describe("desktop window lifecycle integration", () => {
     expect(lastWindowHandler).toContain("shouldKeepDesktopRuntimeAliveAfterWindowAllClosed");
     expect(lastWindowHandler).toContain("flavor: desktopIdentity.flavor");
     expect(lastWindowHandler).toContain("platform: process.platform");
+    expect(lastWindowHandler).toContain('desktopMainWindowOpenIntent = "closed"');
     expect(lastWindowHandler).toContain("app.quit()");
     expect(desktopMainSource).toContain('requestGracefulAppQuit("before-quit")');
   });
@@ -170,8 +183,30 @@ describe("desktop window lifecycle integration", () => {
       "async function bootstrap()",
       'app.on("before-quit",',
     );
-    expect(bootstrap).toContain('deferredMainWindowReopenReason ?? "bootstrap"');
-    expect(bootstrap).toContain("openDesktopMainWindowAgainstCurrentBackend");
+    expect(bootstrap).toContain(
+      'openDesktopMainWindowAfterBackendLaunch("bootstrap", launchedBackend.baseUrl)',
+    );
     expect(bootstrap.match(/beginAutomaticBackendStart\(/g)).toHaveLength(1);
+  });
+
+  it("gates automatic backend restart window creation on the persisted open intent", () => {
+    const restartPath = sourceBetween(
+      desktopMainSource,
+      "async function launchScheduledBackendRestart(",
+      "async function beginAutomaticBackendStart(",
+    );
+    expect(restartPath).toContain(
+      'openDesktopMainWindowAfterBackendLaunch("backend-restart", launched.baseUrl)',
+    );
+    expect(restartPath).not.toContain("ensureInitialBackendWindowOpen");
+
+    const backendLaunchBoundary = sourceBetween(
+      desktopMainSource,
+      "function openDesktopMainWindowAfterBackendLaunch(",
+      "function openDesktopMainWindowAgainstCurrentBackend(",
+    );
+    expect(backendLaunchBoundary).toContain("shouldOpenDesktopMainWindowAfterBackendLaunch");
+    expect(backendLaunchBoundary).toContain("desktopMainWindowOpenIntent");
+    expect(backendLaunchBoundary).toContain("openDesktopMainWindowAgainstCurrentBackend");
   });
 });

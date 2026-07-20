@@ -502,9 +502,12 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
       Effect.suspend(() => {
         const displacedIdleStop =
           runtimeIdleStopsInFlight.has(threadId) || runtimeIdleTimers.has(threadId);
-        return acquireIdleSensitiveWork(threadId).pipe(
-          Effect.flatMap(() => effect),
-          Effect.onExit((exit) =>
+        // Make acquisition and release one interruption-safe handshake while
+        // preserving the caller's interruptibility for the provider operation.
+        return Effect.acquireUseRelease(
+          acquireIdleSensitiveWork(threadId),
+          () => effect,
+          (_acquired, exit) =>
             Effect.sync(() => {
               releaseIdleSensitiveWork(threadId);
               if (
@@ -516,7 +519,6 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
                 retireRuntimeIdleGeneration(threadId);
               }
             }),
-          ),
         );
       });
 

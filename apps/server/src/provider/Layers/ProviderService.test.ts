@@ -3580,6 +3580,101 @@ idleCleanup.layer("ProviderServiceLive idle cleanup", (it) => {
     }),
   );
 
+  it.effect("accounts for idle-work acquisition before honoring interruption", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService;
+      const threadId = asThreadId("thread-idle-interrupted-acquisition");
+      let listSessionsStarted = false;
+      let releaseListSessions: ReleaseListSessions | undefined;
+      let activeStartEntered = false;
+      let releaseActiveStart: ReleaseVoid | undefined;
+      const defaultStartSession = idleCleanup.codex.startSession.getMockImplementation();
+      if (!defaultStartSession) {
+        assert.fail("Expected the default startSession implementation");
+      }
+
+      const session = yield* provider.startSession(threadId, {
+        provider: "codex",
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const stopRuntimeSessionIfIdle = provider.stopRuntimeSessionIfIdle;
+      if (!stopRuntimeSessionIfIdle) {
+        assert.fail("stopRuntimeSessionIfIdle unavailable");
+      }
+
+      idleCleanup.codex.sendTurn.mockClear();
+      idleCleanup.codex.stopSession.mockClear();
+      idleCleanup.codex.listSessions.mockImplementationOnce(() =>
+        Effect.promise(
+          () =>
+            new Promise<ReadonlyArray<ProviderSession>>((resolve) => {
+              listSessionsStarted = true;
+              releaseListSessions = resolve;
+            }),
+        ),
+      );
+
+      const stopFiber = yield* stopRuntimeSessionIfIdle({ threadId }).pipe(Effect.forkChild);
+      yield* waitUntil(() => listSessionsStarted, 500, 20, "registered idle teardown");
+      const waitingWorkFiber = yield* provider
+        .sendTurn({ threadId, input: "interrupt while acquiring ownership", attachments: [] })
+        .pipe(Effect.forkChild);
+      yield* sleep(30);
+      assert.equal(idleCleanup.codex.sendTurn.mock.calls.length, 0);
+
+      const interruptFiber = yield* Fiber.interrupt(waitingWorkFiber).pipe(
+        Effect.forkChild({ startImmediately: true }),
+      );
+      yield* Effect.yieldNow;
+      yield* Effect.yieldNow;
+      assert.equal(
+        interruptFiber.pollUnsafe(),
+        undefined,
+        "interruption must wait until ownership acquisition either succeeds or fails",
+      );
+
+      requireReleaseListSessions(releaseListSessions)([session]);
+      yield* Fiber.join(stopFiber);
+      yield* Fiber.join(interruptFiber);
+      assert.equal(idleCleanup.codex.sendTurn.mock.calls.length, 0);
+
+      idleCleanup.codex.stopSession.mockClear();
+      idleCleanup.codex.listSessions.mockClear();
+      idleCleanup.codex.startSession.mockClear();
+      idleCleanup.codex.startSession.mockImplementationOnce((input) =>
+        Effect.gen(function* () {
+          activeStartEntered = true;
+          yield* Effect.promise(
+            () =>
+              new Promise<void>((resolve) => {
+                releaseActiveStart = resolve;
+              }),
+          );
+          return yield* defaultStartSession(input);
+        }),
+      );
+
+      const activeStartFiber = yield* provider
+        .startSession(threadId, { provider: "codex", threadId, runtimeMode: "full-access" })
+        .pipe(Effect.forkChild);
+      yield* waitUntil(() => activeStartEntered, 500, 20, "active session restart");
+      yield* stopRuntimeSessionIfIdle({ threadId });
+
+      assert.equal(idleCleanup.codex.stopSession.mock.calls.length, 0);
+      assert.equal(idleCleanup.codex.listSessions.mock.calls.length, 0);
+      requireReleaseVoid(releaseActiveStart)();
+      yield* Fiber.join(activeStartFiber);
+
+      if (!provider.stopRuntimeSession) {
+        assert.fail("stopRuntimeSession unavailable");
+      }
+      yield* provider.stopRuntimeSession({ threadId });
+      idleCleanup.codex.stopSession.mockClear();
+      idleCleanup.codex.startSession.mockClear();
+    }),
+  );
+
   it.effect("fails closed when adapter ownership snapshots contradict each other", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService;

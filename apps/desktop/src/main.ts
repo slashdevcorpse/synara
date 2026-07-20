@@ -177,7 +177,9 @@ import { isBrokenPipeError } from "./desktopProcessErrors";
 import { createDesktopStaticProtocolResolver } from "./desktopStaticProtocol";
 import {
   resolveDesktopWindowReopenDecision,
+  shouldOpenDesktopMainWindowAfterBackendLaunch,
   shouldKeepDesktopRuntimeAliveAfterWindowAllClosed,
+  type DesktopMainWindowOpenIntent,
 } from "./desktopWindowLifecycle";
 import {
   createDesktopWindowMaximizeIntentGuard,
@@ -327,8 +329,13 @@ let browserUsePipeServer: BrowserUsePipeServer | null = null;
 let appSnapManager: DesktopAppSnapManager | null = null;
 let configuredGitHubUpdateSource: ReturnType<typeof resolveGitHubUpdateSource> = null;
 let configuredUpdaterCacheDirName: string | null = null;
-type DesktopMainWindowOpenReason = "bootstrap" | "activate" | "second-instance";
-let deferredMainWindowReopenReason: Exclude<DesktopMainWindowOpenReason, "bootstrap"> | null = null;
+type DesktopMainWindowBackendOpenReason = "bootstrap" | "backend-restart";
+type DesktopMainWindowExplicitOpenReason = "activate" | "second-instance";
+type DesktopMainWindowOpenReason =
+  | DesktopMainWindowBackendOpenReason
+  | DesktopMainWindowExplicitOpenReason;
+let desktopMainWindowOpenIntent: DesktopMainWindowOpenIntent = "open-requested";
+let deferredMainWindowReopenReason: DesktopMainWindowExplicitOpenReason | null = null;
 const backendRestartController = new BackendRestartController({
   onRestartDue: (request) => {
     void launchScheduledBackendRestart(request);
@@ -1708,6 +1715,20 @@ function focusMainWindow(options: { stealAppFocus?: boolean } = {}): void {
   window.focus();
 }
 
+function openDesktopMainWindowAfterBackendLaunch(
+  reason: DesktopMainWindowBackendOpenReason,
+  baseUrl: string,
+): void {
+  if (!shouldOpenDesktopMainWindowAfterBackendLaunch(desktopMainWindowOpenIntent)) {
+    writeDesktopLogHeader(`${reason} preserved closed main window intent`);
+    return;
+  }
+
+  const openReason = deferredMainWindowReopenReason ?? reason;
+  deferredMainWindowReopenReason = null;
+  openDesktopMainWindowAgainstCurrentBackend(openReason, baseUrl);
+}
+
 function openDesktopMainWindowAgainstCurrentBackend(
   reason: DesktopMainWindowOpenReason,
   baseUrl: string,
@@ -1756,7 +1777,7 @@ function openDesktopMainWindowAgainstCurrentBackend(
   developmentMainWindowOpenInFlight = nextOpen;
 }
 
-function reopenDesktopMainWindow(reason: Exclude<DesktopMainWindowOpenReason, "bootstrap">): void {
+function reopenDesktopMainWindow(reason: DesktopMainWindowExplicitOpenReason): void {
   const decision = resolveDesktopWindowReopenDecision({
     startupBlocked: desktopStartupBlockedForMigrationRecovery,
     isQuitting,
@@ -1768,6 +1789,7 @@ function reopenDesktopMainWindow(reason: Exclude<DesktopMainWindowOpenReason, "b
     deferredMainWindowReopenReason = null;
     return;
   }
+  desktopMainWindowOpenIntent = "open-requested";
   if (decision === "defer") {
     deferredMainWindowReopenReason = reason;
     writeDesktopLogHeader(`${reason} main window reopen deferred until backend endpoint is ready`);
@@ -2982,7 +3004,7 @@ async function launchScheduledBackendRestart(request: BackendRestartRequest): Pr
     reserveEndpoint: true,
   });
   if (launched) {
-    ensureInitialBackendWindowOpen(launched.baseUrl);
+    openDesktopMainWindowAfterBackendLaunch("backend-restart", launched.baseUrl);
   }
 }
 
@@ -4048,10 +4070,7 @@ async function bootstrap(): Promise<void> {
   if (!launchedBackend) {
     return;
   }
-  const bootstrapBackendHttpUrl = launchedBackend.baseUrl;
-  const windowOpenReason = deferredMainWindowReopenReason ?? "bootstrap";
-  deferredMainWindowReopenReason = null;
-  openDesktopMainWindowAgainstCurrentBackend(windowOpenReason, bootstrapBackendHttpUrl);
+  openDesktopMainWindowAfterBackendLaunch("bootstrap", launchedBackend.baseUrl);
 }
 
 app.on("before-quit", (event) => {
@@ -4159,6 +4178,8 @@ app.on("window-all-closed", () => {
       platform: process.platform,
     })
   ) {
+    desktopMainWindowOpenIntent = "closed";
+    deferredMainWindowReopenReason = null;
     writeDesktopLogHeader("last window closed; desktop runtime remains warm");
     return;
   }

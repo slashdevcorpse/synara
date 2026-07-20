@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { realpathSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, resolve } from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -21,6 +22,7 @@ import {
 
 const FIXTURE_TIMEOUT_MS = 60_000;
 export const DESKTOP_PERSISTENCE_SMOKE_DIAGNOSTIC_TAIL_CHARS = 64 * 1024;
+const DESKTOP_PERSISTENCE_SMOKE_OUTPUT_STREAMS = ["stdout", "stderr"];
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const desktopDir = resolve(__dirname, "..");
@@ -43,27 +45,50 @@ function requireFile(path, description) {
   }
 }
 
-export function createDesktopPersistenceSmokeOutputState() {
+function createDesktopPersistenceSmokeOutputStreamState() {
   return {
-    output: "",
-    outputTruncated: false,
+    decoder: new StringDecoder("utf8"),
+    ended: false,
     patternScanTail: "",
-    observedPatterns: new Set(),
   };
 }
 
-export function appendDesktopPersistenceSmokeOutput(state, chunk, patterns = []) {
-  const text = chunk.toString();
-  const maxPatternLength = patterns.reduce(
-    (maximum, pattern) => Math.max(maximum, pattern.length),
-    0,
-  );
-  if (maxPatternLength > 0) {
-    const scanText = state.patternScanTail + text;
-    for (const pattern of patterns) {
+export function createDesktopPersistenceSmokeOutputState(patterns = []) {
+  const uniquePatterns = [...new Set(patterns)];
+  return {
+    output: "",
+    outputTruncated: false,
+    patterns: uniquePatterns,
+    maxPatternLength: uniquePatterns.reduce(
+      (maximum, pattern) => Math.max(maximum, pattern.length),
+      0,
+    ),
+    observedPatterns: new Set(),
+    streamStates: {
+      stdout: createDesktopPersistenceSmokeOutputStreamState(),
+      stderr: createDesktopPersistenceSmokeOutputStreamState(),
+    },
+  };
+}
+
+function desktopPersistenceSmokeOutputStreamState(state, streamName) {
+  const streamState = state.streamStates[streamName];
+  if (streamState === undefined) {
+    throw new Error(`Unsupported desktop persistence smoke output stream '${streamName}'.`);
+  }
+  return streamState;
+}
+
+function appendDecodedDesktopPersistenceSmokeOutput(state, streamState, text) {
+  if (text.length === 0) return;
+
+  if (state.maxPatternLength > 0) {
+    const scanText = streamState.patternScanTail + text;
+    for (const pattern of state.patterns) {
       if (scanText.includes(pattern)) state.observedPatterns.add(pattern);
     }
-    state.patternScanTail = maxPatternLength === 1 ? "" : scanText.slice(-(maxPatternLength - 1));
+    streamState.patternScanTail =
+      state.maxPatternLength === 1 ? "" : scanText.slice(-(state.maxPatternLength - 1));
   }
 
   const combinedLength = state.output.length + text.length;
@@ -76,6 +101,38 @@ export function appendDesktopPersistenceSmokeOutput(state, chunk, patterns = [])
   }
   const retainedPrefixChars = DESKTOP_PERSISTENCE_SMOKE_DIAGNOSTIC_TAIL_CHARS - text.length;
   state.output = state.output.slice(-retainedPrefixChars) + text;
+}
+
+export function appendDesktopPersistenceSmokeOutput(state, streamName, chunk) {
+  const streamState = desktopPersistenceSmokeOutputStreamState(state, streamName);
+  if (streamState.ended) {
+    throw new Error(`Desktop persistence smoke output stream '${streamName}' already ended.`);
+  }
+  const encodedChunk = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+  appendDecodedDesktopPersistenceSmokeOutput(
+    state,
+    streamState,
+    streamState.decoder.write(encodedChunk),
+  );
+}
+
+export function endDesktopPersistenceSmokeOutputStream(state, streamName) {
+  const streamState = desktopPersistenceSmokeOutputStreamState(state, streamName);
+  if (streamState.ended) return;
+  streamState.ended = true;
+  appendDecodedDesktopPersistenceSmokeOutput(state, streamState, streamState.decoder.end());
+}
+
+function captureDesktopPersistenceSmokeProcessOutput(child, state) {
+  for (const streamName of DESKTOP_PERSISTENCE_SMOKE_OUTPUT_STREAMS) {
+    const stream = child[streamName];
+    stream?.on("data", (chunk) => {
+      appendDesktopPersistenceSmokeOutput(state, streamName, chunk);
+    });
+    stream?.once("end", () => {
+      endDesktopPersistenceSmokeOutputStream(state, streamName);
+    });
+  }
 }
 
 function capturedOutputSuffix(state) {
@@ -120,8 +177,7 @@ function runBoundedCommand({ command, args, cwd, env, description, timeoutMs }) 
       );
     }, timeoutMs);
 
-    child.stdout?.on("data", (chunk) => appendDesktopPersistenceSmokeOutput(state, chunk));
-    child.stderr?.on("data", (chunk) => appendDesktopPersistenceSmokeOutput(state, chunk));
+    captureDesktopPersistenceSmokeProcessOutput(child, state);
     child.on("error", (error) => {
       if (settled) return;
       settled = true;
@@ -249,14 +305,10 @@ async function main() {
     const launch = {
       child,
       description,
-      ...createDesktopPersistenceSmokeOutputState(),
+      ...createDesktopPersistenceSmokeOutputState(launchOutputPatterns),
       processError: null,
     };
-    const appendOutput = (chunk) => {
-      appendDesktopPersistenceSmokeOutput(launch, chunk, launchOutputPatterns);
-    };
-    child.stdout?.on("data", appendOutput);
-    child.stderr?.on("data", appendOutput);
+    captureDesktopPersistenceSmokeProcessOutput(child, launch);
     child.on("error", (error) => {
       launch.processError ??= error;
     });

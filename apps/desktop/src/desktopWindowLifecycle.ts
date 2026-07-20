@@ -1,7 +1,7 @@
 // FILE: desktopWindowLifecycle.ts
 // Purpose: Defines pure desktop last-window and reopen lifecycle policy.
 // Layer: Desktop main-process utility
-// Exports: window-all-closed keep-alive policy and reopen decisions.
+// Exports: window-all-closed keep-alive policy, reopen decisions, and open-intent policy.
 
 import type { SynaraDesktopFlavor } from "@synara/shared/desktopIdentity";
 
@@ -18,6 +18,7 @@ export interface DesktopWindowReopenInput {
 }
 
 export type DesktopWindowReopenDecision = "ignore" | "focus" | "defer" | "create";
+export type DesktopMainWindowOpenIntent = "open-requested" | "closed";
 
 export function shouldKeepDesktopRuntimeAliveAfterWindowAllClosed(
   input: DesktopWindowAllClosedPolicyInput,
@@ -42,4 +43,10 @@ export function resolveDesktopWindowReopenDecision(
     return "defer";
   }
   return "create";
+}
+
+export function shouldOpenDesktopMainWindowAfterBackendLaunch(
+  intent: DesktopMainWindowOpenIntent,
+): boolean {
+  return intent === "open-requested";
 }

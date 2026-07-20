@@ -317,8 +317,10 @@ function assertCrashRecoveredBinding(
   assert.equal(payload.activeTurnId, null);
   assert.equal(payload.lastRuntimeEvent, "provider.startupCrashRecovery");
   assert.equal(typeof payload.lastRuntimeEventAt, "string");
+  const recoveryTimestamp = Date.parse(payload.lastRuntimeEventAt as string);
   assert(
-    !Number.isNaN(Date.parse(payload.lastRuntimeEventAt as string)),
+    Number.isFinite(recoveryTimestamp) &&
+      new Date(recoveryTimestamp).toISOString() === payload.lastRuntimeEventAt,
     "provider startup crash-recovery timestamp must be an ISO date-time",
   );
   if (options.mustContainArmMarker) {
