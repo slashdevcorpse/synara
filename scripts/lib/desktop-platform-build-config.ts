@@ -8,6 +8,7 @@ import {
   synaraDesktopIdentity,
   type SynaraDesktopIdentity,
 } from "@synara/shared/desktopIdentity";
+import type { DesktopBuildArch } from "./desktop-build-options.ts";
 
 export const MICROPHONE_USAGE_DESCRIPTION =
   "Synara needs microphone access so you can record voice notes and transcribe them into the chat composer.";
@@ -27,8 +28,6 @@ export const MAC_FOREIGN_NATIVE_EXCLUSIONS = [
   "!node_modules/node-pty/third_party/conpty/**",
   "!node_modules/node-pty/deps/winpty/**",
 ] as const;
-
-export type DesktopBuildArch = "arm64" | "x64" | "universal";
 
 export function resolveMacNativeExclusions(arch: DesktopBuildArch): ReadonlyArray<string> {
   const oppositeArch = arch === "arm64" ? "x64" : arch === "x64" ? "arm64" : null;

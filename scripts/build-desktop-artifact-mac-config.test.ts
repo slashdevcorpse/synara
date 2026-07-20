@@ -15,6 +15,7 @@ import {
   WINDOWS_INSTALLER_GUID,
 } from "./lib/desktop-platform-build-config.ts";
 import { BRAND_ASSET_PATHS } from "./lib/brand-assets.ts";
+import { DESKTOP_BUILD_ARCHES } from "./lib/desktop-build-options.ts";
 import { synaraDesktopIdentity } from "@synara/shared/desktopIdentity";
 
 describe("createDesktopPlatformBuildConfig", () => {
@@ -75,19 +76,27 @@ describe("createDesktopPlatformBuildConfig", () => {
     const nodePtyArm64 = "!node_modules/node-pty/prebuilds/darwin-arm64/**";
     const nodePtyX64 = "!node_modules/node-pty/prebuilds/darwin-x64/**";
 
-    assert.deepStrictEqual(resolveMacNativeExclusions("arm64"), [
-      ...MAC_FOREIGN_NATIVE_EXCLUSIONS,
-      piTuiX64,
-      nodePtyX64,
-    ]);
-    assert.deepStrictEqual(resolveMacNativeExclusions("x64"), [
-      ...MAC_FOREIGN_NATIVE_EXCLUSIONS,
-      piTuiArm64,
-      nodePtyArm64,
-    ]);
-    assert.deepStrictEqual(resolveMacNativeExclusions("universal"), [
-      ...MAC_FOREIGN_NATIVE_EXCLUSIONS,
-    ]);
+    const exclusionsByArch = {
+      arm64: [...MAC_FOREIGN_NATIVE_EXCLUSIONS, piTuiX64, nodePtyX64],
+      x64: [...MAC_FOREIGN_NATIVE_EXCLUSIONS, piTuiArm64, nodePtyArm64],
+      universal: [...MAC_FOREIGN_NATIVE_EXCLUSIONS],
+    } as const;
+
+    for (const arch of DESKTOP_BUILD_ARCHES) {
+      const expected = exclusionsByArch[arch];
+      assert.deepStrictEqual(resolveMacNativeExclusions(arch), expected);
+
+      const config = createDesktopPlatformBuildConfig({
+        arch,
+        platform: "mac",
+        target: "dmg",
+      });
+      assert.deepStrictEqual(config.files, [
+        "**/*",
+        ...expected,
+        MAC_APPSNAP_HELPER_ASAR_EXCLUSION,
+      ]);
+    }
   });
 
   it("leaves non-macOS platform configs unchanged", () => {
