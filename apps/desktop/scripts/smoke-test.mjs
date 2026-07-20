@@ -1,10 +1,12 @@
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
   createDesktopSmokeEnvironment,
+  createDesktopSmokeSpawnSpec,
   superviseDesktopSmokeProcess,
 } from "./smoke-test-lifecycle.mjs";
 
@@ -13,16 +15,22 @@ const desktopDir = resolve(__dirname, "..");
 const require = createRequire(import.meta.url);
 const electronBin = require("electron");
 const mainJs = resolve(desktopDir, "dist-electron/main.js");
+const windowsHelperPath = resolve(__dirname, "smoke-test-windows-job.ps1");
+const windowsJobRunId = randomUUID();
 
 console.log("\nLaunching Electron smoke test...");
 
-const child = spawn(electronBin, [mainJs], {
-  stdio: ["pipe", "pipe", "pipe"],
-  detached: process.platform !== "win32",
-  env: createDesktopSmokeEnvironment(),
+const spawnSpec = createDesktopSmokeSpawnSpec({
+  executable: electronBin,
+  args: [mainJs],
+  environment: createDesktopSmokeEnvironment(),
+  windowsHelperPath,
+  windowsJobRunId,
+  workingDirectory: desktopDir,
 });
+const child = spawn(spawnSpec.command, spawnSpec.args, spawnSpec.options);
 
-const result = await superviseDesktopSmokeProcess({ child });
+const result = await superviseDesktopSmokeProcess({ child, windowsJobRunId });
 if (!result.ok) {
   console.error("\nDesktop smoke test failed:");
   for (const failure of result.failures) {

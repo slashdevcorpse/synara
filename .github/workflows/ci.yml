@@ -179,6 +179,8 @@ jobs:
           src/desktopStorageMigration.test.ts
           src/windowState.test.ts
           src/updateState.test.ts
+          scripts/smoke-test.test.mjs
+          scripts/smoke-test-windows-job.windows.integration.test.mjs
 
       - name: Run Super Synara Windows release contract regressions
         run: >-
