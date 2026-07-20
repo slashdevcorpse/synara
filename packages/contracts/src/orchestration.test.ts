@@ -17,6 +17,7 @@ import {
   ProjectMetaUpdatedPayload,
   OrchestrationProposedPlan,
   OrchestrationSession,
+  OrchestrationSubscribeShellInput,
   OrchestrationThreadPullRequest,
   PROVIDER_SEND_TURN_MAX_ATTACHMENTS,
   PROVIDER_SEND_TURN_MAX_INPUT_CHARS,
@@ -52,6 +53,19 @@ const decodeClientOrchestrationCommand = Schema.decodeUnknownEffect(ClientOrches
 const decodeOrchestrationCommand = Schema.decodeUnknownEffect(OrchestrationCommand);
 const decodeOrchestrationEvent = Schema.decodeUnknownEffect(OrchestrationEvent);
 const decodeThreadPullRequest = Schema.decodeUnknownEffect(OrchestrationThreadPullRequest);
+const decodeSubscribeShellInput = Schema.decodeUnknownEffect(OrchestrationSubscribeShellInput);
+
+it.effect("accepts an optional shell resume cursor, including fallback cursors", () =>
+  Effect.gen(function* () {
+    assert.deepStrictEqual(yield* decodeSubscribeShellInput({}), {});
+    assert.deepStrictEqual(yield* decodeSubscribeShellInput({ afterSequence: 42 }), {
+      afterSequence: 42,
+    });
+    assert.deepStrictEqual(yield* decodeSubscribeShellInput({ afterSequence: -1 }), {
+      afterSequence: -1,
+    });
+  }),
+);
 
 it.effect("decodes last-known PRs persisted before draft/mergeability/diff fields existed", () =>
   Effect.gen(function* () {

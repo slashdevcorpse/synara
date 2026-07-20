@@ -17,8 +17,6 @@ import {
   type OrchestrationCommand,
   type OrchestrationEvent,
   type ProjectDevServerEvent,
-  type OrchestrationShellStreamEvent,
-  type OrchestrationShellStreamItem,
   type OrchestrationThreadDetailSnapshot,
   type OrchestrationThreadStreamItem,
   type ServerConfigStreamEvent,
@@ -74,6 +72,11 @@ import {
 import { Open } from "./open";
 import { makeDispatchCommandNormalizer } from "./orchestration/dispatchCommandNormalization";
 import { makeImportThreadHandler } from "./orchestration/importThreadRoute";
+import {
+  coalesceShellStream,
+  projectShellEvent,
+  SHELL_SYNC_RESUME_REPLAY_LIMIT,
+} from "./orchestration/shellSync";
 import { OrchestrationEngineService } from "./orchestration/Services/OrchestrationEngine";
 import { ProviderCommandReactor } from "./orchestration/Services/ProviderCommandReactor";
 import { ProjectionSnapshotQuery } from "./orchestration/Services/ProjectionSnapshotQuery";
@@ -221,6 +224,34 @@ function toWsRpcError(cause: unknown, fallbackMessage: string) {
       });
 }
 
+export function ensureShellProjectionReady<E>(
+  readSnapshotSequence: () => Effect.Effect<{ readonly snapshotSequence: number }, E>,
+  throughSequenceInclusive: number,
+): Effect.Effect<void, WsRpcError> {
+  return readSnapshotSequence().pipe(
+    Effect.mapError(
+      (cause) =>
+        new WsRpcError({
+          message: "Failed to read the shell projection readiness fence.",
+          cause,
+          code: "ORCHESTRATION_SHELL_PROJECTION_FENCE_READ_FAILED",
+          retryable: true,
+        }),
+    ),
+    Effect.flatMap(({ snapshotSequence }) =>
+      snapshotSequence >= throughSequenceInclusive
+        ? Effect.void
+        : Effect.fail(
+            new WsRpcError({
+              message: `Shell projections are still catching up (applied ${snapshotSequence}, required ${throughSequenceInclusive}); restarting from the last delivered sequence.`,
+              code: "ORCHESTRATION_SHELL_PROJECTION_NOT_READY",
+              retryable: true,
+            }),
+          ),
+    ),
+  );
+}
+
 const failLiveUiStreamForSnapshotResync = (report: LiveUiStreamDropReport) =>
   Effect.fail(
     new WsRpcError({
@@ -247,9 +278,8 @@ export function makeEditorAvailabilityConfigUpdateStream<E, R>(
   );
 }
 
-// Must mirror the cases of toShellStreamEvent: events rejected here are dropped
-// before the live-UI buffer so the sliding window only holds events that can
-// actually project to a shell update.
+// Events rejected here are dropped before the live-UI buffer so the sliding
+// window only holds events that can project to a shell update.
 function isShellRelevantEvent(event: OrchestrationEvent): boolean {
   return (
     event.type === "project.created" ||
@@ -550,55 +580,6 @@ const makeWsRpcHandlersLayer = () =>
         ),
       );
 
-      const toShellStreamEvent = (
-        event: OrchestrationEvent,
-      ): Effect.Effect<Option.Option<OrchestrationShellStreamEvent>, never> => {
-        switch (event.type) {
-          case "project.created":
-          case "project.meta-updated":
-            return projectionReadModelQuery.getProjectShellById(event.payload.projectId).pipe(
-              Effect.map((project) =>
-                Option.map(project, (nextProject) => ({
-                  kind: "project-upserted" as const,
-                  sequence: event.sequence,
-                  project: nextProject,
-                })),
-              ),
-              Effect.catch(() => Effect.succeed(Option.none())),
-            );
-          case "project.deleted":
-            return Effect.succeed(
-              Option.some({
-                kind: "project-removed" as const,
-                sequence: event.sequence,
-                projectId: event.payload.projectId,
-              }),
-            );
-          case "thread.deleted":
-            return Effect.succeed(
-              Option.some({
-                kind: "thread-removed" as const,
-                sequence: event.sequence,
-                threadId: event.payload.threadId,
-              }),
-            );
-          default:
-            if (event.aggregateKind !== "thread") return Effect.succeed(Option.none());
-            return projectionReadModelQuery
-              .getThreadShellById(ThreadId.makeUnsafe(String(event.aggregateId)))
-              .pipe(
-                Effect.map((thread) =>
-                  Option.map(thread, (nextThread) => ({
-                    kind: "thread-upserted" as const,
-                    sequence: event.sequence,
-                    thread: nextThread,
-                  })),
-                ),
-                Effect.catch(() => Effect.succeed(Option.none())),
-              );
-        }
-      };
-
       const rpcEffect = <A, E, R>(effect: Effect.Effect<A, E, R>, fallbackMessage: string) =>
         effect.pipe(Effect.mapError((cause) => toWsRpcError(cause, fallbackMessage)));
 
@@ -684,49 +665,65 @@ const makeWsRpcHandlersLayer = () =>
             }),
             "Failed to reconcile provider delivery",
           ),
-        [ORCHESTRATION_WS_METHODS.subscribeShell]: (_, { clientId }) =>
+        [ORCHESTRATION_WS_METHODS.subscribeShell]: (input, { clientId }) =>
           streamAdmission.guard(
             clientId,
             { key: "orchestration.shell" },
-            makeCursorSafeSnapshotLiveStream({
-              subscribeLive: orchestrationEngine.subscribeDomainEvents.pipe(
-                Effect.map((stream) =>
-                  bufferLiveUiStream(stream.pipe(Stream.filter(isShellRelevantEvent)), {
-                    label: "orchestration.shell",
-                    onDroppedEvents: failLiveUiStreamForSnapshotResync,
-                  }),
+            coalesceShellStream(
+              makeCursorSafeSnapshotLiveStream({
+                subscribeLive: orchestrationEngine.subscribeDomainEvents.pipe(
+                  Effect.map((stream) =>
+                    bufferLiveUiStream(stream.pipe(Stream.filter(isShellRelevantEvent)), {
+                      label: "orchestration.shell",
+                      onDroppedEvents: failLiveUiStreamForSnapshotResync,
+                    }),
+                  ),
                 ),
-              ),
-              snapshot: projectionReadModelQuery
-                .getShellSnapshot()
-                .pipe(
-                  Effect.mapError((cause) => toWsRpcError(cause, "Failed to load shell snapshot")),
-                ),
-              snapshotSequence: (snapshot) => snapshot.snapshotSequence,
-              getHighWaterSequence: getOrchestrationHighWaterSequence,
-              replay: (fromSequenceExclusive, throughSequenceInclusive) =>
-                orchestrationEngine
-                  .readEventsThrough(fromSequenceExclusive, throughSequenceInclusive)
+                snapshot: projectionReadModelQuery
+                  .getShellSnapshot()
                   .pipe(
-                    Stream.filter(isShellRelevantEvent),
-                    Stream.mapError((cause) =>
-                      toWsRpcError(cause, "Failed to replay shell events"),
+                    Effect.mapError((cause) =>
+                      toWsRpcError(cause, "Failed to load shell snapshot"),
                     ),
                   ),
-            }).pipe(
-              Stream.mapEffect((item) =>
-                item.kind === "snapshot"
-                  ? Effect.succeed(
-                      Option.some<OrchestrationShellStreamItem>({
-                        kind: "snapshot",
-                        snapshot: item.snapshot,
+                snapshotSequence: (snapshot) => snapshot.snapshotSequence,
+                getHighWaterSequence: getOrchestrationHighWaterSequence,
+                ...(input.afterSequence === undefined
+                  ? {}
+                  : { afterSequence: input.afterSequence }),
+                resumeReplayLimit: SHELL_SYNC_RESUME_REPLAY_LIMIT,
+                includeEvent: isShellRelevantEvent,
+                replay: (fromSequenceExclusive, throughSequenceInclusive) =>
+                  orchestrationEngine
+                    .readEventsThrough(fromSequenceExclusive, throughSequenceInclusive)
+                    .pipe(
+                      Stream.mapError((cause) =>
+                        toWsRpcError(cause, "Failed to replay shell events"),
+                      ),
+                    ),
+              }),
+              (event) =>
+                projectShellEvent(event, {
+                  getProjectShellById: (projectId) =>
+                    projectionReadModelQuery.getProjectShellById(projectId),
+                  getThreadShellById: (threadId) =>
+                    projectionReadModelQuery.getThreadShellById(threadId),
+                }).pipe(
+                  Effect.mapError(
+                    (failure) =>
+                      new WsRpcError({
+                        message: "Failed to refresh a shell projection after retry.",
+                        cause: failure.error,
+                        code: "ORCHESTRATION_SHELL_PROJECTION_READ_FAILED",
+                        retryable: true,
                       }),
-                    )
-                  : toShellStreamEvent(item.event),
-              ),
-              Stream.flatMap((item) =>
-                Option.isSome(item) ? Stream.succeed(item.value) : Stream.empty,
-              ),
+                  ),
+                ),
+              (throughSequenceInclusive) =>
+                ensureShellProjectionReady(
+                  () => projectionReadModelQuery.getSnapshotSequence(),
+                  throughSequenceInclusive,
+                ),
             ),
           ),
         [ORCHESTRATION_WS_METHODS.unsubscribeShell]: () => Effect.void,
@@ -772,11 +769,11 @@ const makeWsRpcHandlersLayer = () =>
               ),
               snapshotSequence: (snapshot) => snapshot.snapshotSequence,
               getHighWaterSequence: getOrchestrationHighWaterSequence,
+              includeEvent: (event) => isThreadDetailEventFor(input.threadId, event),
               replay: (fromSequenceExclusive, throughSequenceInclusive) =>
                 orchestrationEngine
                   .readEventsThrough(fromSequenceExclusive, throughSequenceInclusive)
                   .pipe(
-                    Stream.filter((event) => isThreadDetailEventFor(input.threadId, event)),
                     Stream.mapError((cause) =>
                       toWsRpcError(cause, "Failed to replay thread events"),
                     ),

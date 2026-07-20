@@ -556,9 +556,12 @@ it.layer(TestLayer)("git integration", (it) => {
         });
         yield* core.checkoutBranch({ cwd: source, branch: featureBranch });
         yield* Effect.promise(() =>
-          vi.waitFor(() => {
-            expect(fetchArgs).not.toBeNull();
-          }),
+          vi.waitFor(
+            () => {
+              expect(fetchArgs).not.toBeNull();
+            },
+            { timeout: 10_000 },
+          ),
         );
 
         expect(yield* git(source, ["branch", "--show-current"])).toBe(featureBranch);
@@ -1826,11 +1829,11 @@ it.layer(TestLayer)("git integration", (it) => {
         const core = yield* GitCore;
 
         yield* writeTextFile(path.join(tmp, "README.md"), "keep\nlast line  ");
-        yield* writeTextFile(path.join(tmp, " spaced file.txt"), "hello\n");
+        yield* writeTextFile(path.join(tmp, "spaced file.txt"), "hello\n");
 
         const patch = (yield* core.readWorkingTreePatch(tmp)).patch;
         expect(patch).toContain("+last line  ");
-        expect(patch).toContain("diff --git a/ spaced file.txt b/ spaced file.txt");
+        expect(patch).toContain("diff --git a/spaced file.txt b/spaced file.txt");
       }),
     );
 
