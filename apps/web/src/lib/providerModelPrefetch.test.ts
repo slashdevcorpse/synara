@@ -25,6 +25,7 @@ function makeSettings(
 ): ProviderModelPrefetchSettings {
   return {
     defaultProvider: "codex",
+    commandCodeBinaryPath: "",
     cursorBinaryPath: "",
     cursorApiEndpoint: "",
     antigravityBinaryPath: "",
