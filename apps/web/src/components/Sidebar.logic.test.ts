@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  archiveSelectedThreadEntries,
+  archiveThreadEntry,
+  buildMultiSelectThreadContextMenuItems,
   buildProjectThreadTree,
   createSidebarThreadHoverAnchorId,
   derivePinnedProjectIdsForSidebar,
@@ -42,6 +45,8 @@ import {
   resolveThreadHoverCardMetadata,
   resolveThreadRowClassName,
   resolveThreadStatusPill,
+  runArchiveFallbackNavigation,
+  runThreadArchiveWithCurrentRoute,
   shouldShowDebugFeatureFlagsMenu,
   shouldPrunePinnedThreads,
   shouldClearThreadSelectionOnMouseDown,
@@ -56,6 +61,240 @@ import {
   type SidebarThreadSummary,
   type Thread,
 } from "../types";
+
+describe("buildMultiSelectThreadContextMenuItems", () => {
+  it("includes the selected count and disables only archive when a selected turn is running", () => {
+    expect(
+      buildMultiSelectThreadContextMenuItems({
+        count: 3,
+        archiveDisabled: true,
+      }),
+    ).toEqual([
+      { id: "mark-unread", label: "Mark unread (3)" },
+      { id: "archive", label: "Archive (3)", disabled: true },
+      { id: "delete", label: "Delete (3)", destructive: true },
+    ]);
+  });
+
+  it("keeps archive enabled when every selected thread is idle", () => {
+    expect(
+      buildMultiSelectThreadContextMenuItems({
+        count: 2,
+        archiveDisabled: false,
+      })[1],
+    ).toEqual({ id: "archive", label: "Archive (2)", disabled: false });
+  });
+});
+
+describe("archiveSelectedThreadEntries", () => {
+  const first = ThreadId.makeUnsafe("thread-first");
+  const second = ThreadId.makeUnsafe("thread-second");
+  const third = ThreadId.makeUnsafe("thread-third");
+
+  it("archives every entry sequentially and reports full success", async () => {
+    const order: string[] = [];
+    let activeArchives = 0;
+    let maximumActiveArchives = 0;
+
+    const outcome = await archiveSelectedThreadEntries({
+      entries: [first, second, third],
+      archive: async (threadId, onArchived) => {
+        order.push(`start:${threadId}`);
+        activeArchives += 1;
+        maximumActiveArchives = Math.max(maximumActiveArchives, activeArchives);
+        await Promise.resolve();
+        onArchived();
+        activeArchives -= 1;
+        order.push(`finish:${threadId}`);
+        return true;
+      },
+    });
+
+    expect(maximumActiveArchives).toBe(1);
+    expect(order).toEqual([
+      `start:${first}`,
+      `finish:${first}`,
+      `start:${second}`,
+      `finish:${second}`,
+      `start:${third}`,
+      `finish:${third}`,
+    ]);
+    expect(outcome).toEqual({
+      archivedThreadIds: [first, second, third],
+      mutationFailure: null,
+      followupFailures: [],
+    });
+  });
+
+  it("stops on the first false result before mutation and preserves later entries", async () => {
+    const attempted: ThreadId[] = [];
+
+    const outcome = await archiveSelectedThreadEntries({
+      entries: [first, second, third],
+      archive: async (threadId, onArchived) => {
+        attempted.push(threadId);
+        if (threadId === first) {
+          onArchived();
+          return true;
+        }
+        return false;
+      },
+    });
+
+    expect(attempted).toEqual([first, second]);
+    expect(outcome).toEqual({
+      archivedThreadIds: [first],
+      mutationFailure: { threadId: second, kind: "returned-false" },
+      followupFailures: [],
+    });
+  });
+
+  it("captures a thrown mutation failure instead of rejecting", async () => {
+    const mutationError = new Error("archive mutation failed");
+
+    const outcome = await archiveSelectedThreadEntries({
+      entries: [first, second],
+      archive: async () => {
+        throw mutationError;
+      },
+    });
+
+    expect(outcome).toEqual({
+      archivedThreadIds: [],
+      mutationFailure: { threadId: first, kind: "thrown", error: mutationError },
+      followupFailures: [],
+    });
+  });
+
+  it("continues after false and thrown post-mutation failures", async () => {
+    const navigationError = new Error("fallback navigation failed");
+    const attempted: ThreadId[] = [];
+
+    const outcome = await archiveSelectedThreadEntries({
+      entries: [first, second, third],
+      archive: async (threadId, onArchived) => {
+        attempted.push(threadId);
+        if (threadId === first) {
+          onArchived();
+          return false;
+        }
+        if (threadId === second) {
+          onArchived();
+          throw navigationError;
+        }
+        onArchived();
+        return true;
+      },
+    });
+
+    expect(attempted).toEqual([first, second, third]);
+    expect(outcome).toEqual({
+      archivedThreadIds: [first, second, third],
+      mutationFailure: null,
+      followupFailures: [
+        { threadId: first, kind: "returned-false" },
+        { threadId: second, kind: "thrown", error: navigationError },
+      ],
+    });
+  });
+
+  it("treats a true result as success even when a legacy seam omits the callback", async () => {
+    const outcome = await archiveSelectedThreadEntries({
+      entries: [first],
+      archive: async () => true,
+    });
+
+    expect(outcome).toEqual({
+      archivedThreadIds: [first],
+      mutationFailure: null,
+      followupFailures: [],
+    });
+  });
+});
+
+describe("archive route follow-up", () => {
+  const first = ThreadId.makeUnsafe("thread-first");
+  const second = ThreadId.makeUnsafe("thread-second");
+
+  it("does not overwrite an intervening route change after the mutation resolves", async () => {
+    let resolveMutation: (() => void) | undefined;
+    const mutation = new Promise<void>((resolve) => {
+      resolveMutation = resolve;
+    });
+    let currentRouteThreadId: ThreadId | null = first;
+    const navigations: ThreadId[] = [];
+
+    const pending = runThreadArchiveWithCurrentRoute({
+      threadId: first,
+      archiveMutation: () => mutation,
+      getCurrentRouteThreadId: () => currentRouteThreadId,
+      navigateFromArchivedThread: async () => {
+        navigations.push(first);
+      },
+    });
+
+    currentRouteThreadId = second;
+    resolveMutation?.();
+    await pending;
+
+    expect(navigations).toEqual([]);
+  });
+
+  it("navigates when the archived thread became the current route during the mutation", async () => {
+    let resolveMutation: (() => void) | undefined;
+    const mutation = new Promise<void>((resolve) => {
+      resolveMutation = resolve;
+    });
+    let currentRouteThreadId: ThreadId | null = second;
+    const navigations: ThreadId[] = [];
+
+    const pending = runThreadArchiveWithCurrentRoute({
+      threadId: first,
+      archiveMutation: () => mutation,
+      getCurrentRouteThreadId: () => currentRouteThreadId,
+      navigateFromArchivedThread: async () => {
+        navigations.push(first);
+      },
+    });
+
+    currentRouteThreadId = first;
+    resolveMutation?.();
+    await pending;
+
+    expect(navigations).toEqual([first]);
+  });
+
+  it("classifies a resolved fresh-chat failure as a post-mutation failure", async () => {
+    const outcome = await archiveThreadEntry({
+      threadId: first,
+      archive: async (_threadId, onArchived) => {
+        await runThreadArchiveWithCurrentRoute({
+          threadId: first,
+          archiveMutation: async () => undefined,
+          onArchived,
+          getCurrentRouteThreadId: () => first,
+          navigateFromArchivedThread: () =>
+            runArchiveFallbackNavigation({
+              startFreshChat: async () => ({
+                ok: false,
+                error: "Unable to prepare a new chat.",
+              }),
+            }),
+        });
+        return true;
+      },
+    });
+
+    expect(outcome).toMatchObject({
+      status: "followup-failure",
+      failure: {
+        threadId: first,
+        kind: "thrown",
+        error: { message: "Unable to prepare a new chat." },
+      },
+    });
+  });
+});
 
 function makeLatestTurn(overrides?: {
   completedAt?: string | null;
@@ -1944,6 +2183,32 @@ describe("getFallbackThreadIdAfterDelete", () => {
     });
 
     expect(fallbackThreadId).toBe(ThreadId.makeUnsafe("thread-next"));
+  });
+
+  it("returns no stale fallback when every same-project thread is in one bulk action", () => {
+    const activeThreadId = ThreadId.makeUnsafe("thread-active");
+    const otherBatchThreadId = ThreadId.makeUnsafe("thread-other-batch");
+    const fallbackThreadId = getFallbackThreadIdAfterDelete({
+      threads: [
+        makeThread({
+          id: activeThreadId,
+          projectId: ProjectId.makeUnsafe("project-1"),
+          createdAt: "2026-03-09T10:05:00.000Z",
+          messages: [],
+        }),
+        makeThread({
+          id: otherBatchThreadId,
+          projectId: ProjectId.makeUnsafe("project-1"),
+          createdAt: "2026-03-09T10:10:00.000Z",
+          messages: [],
+        }),
+      ],
+      deletedThreadId: activeThreadId,
+      deletedThreadIds: new Set([activeThreadId, otherBatchThreadId]),
+      sortOrder: "created_at",
+    });
+
+    expect(fallbackThreadId).toBeNull();
   });
 });
 

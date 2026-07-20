@@ -18,6 +18,7 @@ export function showContextMenuFallback<T extends string>(
     overlay.style.cssText = "position:fixed;inset:0;z-index:9999";
 
     const menu = document.createElement("div");
+    menu.dataset.threadSelectionSafe = "";
     menu.className =
       "fixed z-[10000] min-w-[180px] rounded-xl border border-white/[0.08] shadow-xl animate-in fade-in zoom-in-95";
 
@@ -34,7 +35,7 @@ export function showContextMenuFallback<T extends string>(
     menu.appendChild(inner);
 
     let focusedIndex = -1;
-    const buttons: HTMLButtonElement[] = [];
+    const enabledEntries: Array<{ button: HTMLButtonElement; id: T }> = [];
 
     function cleanup(result: T | null) {
       document.removeEventListener("keydown", onKeyDown);
@@ -44,11 +45,11 @@ export function showContextMenuFallback<T extends string>(
     }
 
     function focusItem(index: number) {
-      if (index < 0 || index >= buttons.length) return;
-      buttons[focusedIndex]?.classList.remove("bg-[var(--sidebar-accent)]");
+      if (index < 0 || index >= enabledEntries.length) return;
+      enabledEntries[focusedIndex]?.button.classList.remove("bg-[var(--sidebar-accent)]");
       focusedIndex = index;
-      buttons[focusedIndex]?.classList.add("bg-[var(--sidebar-accent)]");
-      buttons[focusedIndex]?.focus();
+      enabledEntries[focusedIndex]?.button.classList.add("bg-[var(--sidebar-accent)]");
+      enabledEntries[focusedIndex]?.button.focus();
     }
 
     function onKeyDown(e: KeyboardEvent) {
@@ -57,14 +58,15 @@ export function showContextMenuFallback<T extends string>(
         cleanup(null);
       } else if (e.key === "ArrowDown") {
         e.preventDefault();
-        focusItem(focusedIndex < buttons.length - 1 ? focusedIndex + 1 : 0);
+        focusItem(focusedIndex < enabledEntries.length - 1 ? focusedIndex + 1 : 0);
       } else if (e.key === "ArrowUp") {
         e.preventDefault();
-        focusItem(focusedIndex > 0 ? focusedIndex - 1 : buttons.length - 1);
+        focusItem(focusedIndex > 0 ? focusedIndex - 1 : enabledEntries.length - 1);
       } else if (e.key === "Enter") {
         e.preventDefault();
-        if (focusedIndex >= 0 && focusedIndex < items.length) {
-          cleanup(items[focusedIndex]!.id);
+        const focusedEntry = enabledEntries[focusedIndex];
+        if (focusedEntry) {
+          cleanup(focusedEntry.id);
         }
       }
     }
@@ -75,6 +77,7 @@ export function showContextMenuFallback<T extends string>(
     for (let i = 0; i < items.length; i++) {
       const item = items[i]!;
       const isDestructive = item.destructive === true || item.id === "delete";
+      const isDisabled = item.disabled === true;
 
       // Keep explicit groups visible in the browser fallback; destructive items remain isolated by default.
       if ((item.separatorBefore === true || isDestructive) && i > 0) {
@@ -86,8 +89,9 @@ export function showContextMenuFallback<T extends string>(
       const btn = document.createElement("button");
       btn.type = "button";
       btn.className = isDestructive
-        ? "flex w-full min-h-7 cursor-default select-none items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-[length:var(--app-font-size-ui,12px)] text-foreground/86 transition-colors"
-        : "flex w-full min-h-7 cursor-default select-none items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-left text-[length:var(--app-font-size-ui,12px)] text-foreground/86 transition-colors";
+        ? "flex w-full min-h-7 cursor-default select-none items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-[length:var(--app-font-size-ui,12px)] text-foreground/86 transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+        : "flex w-full min-h-7 cursor-default select-none items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-left text-[length:var(--app-font-size-ui,12px)] text-foreground/86 transition-colors disabled:cursor-not-allowed disabled:opacity-50";
+      btn.disabled = isDisabled;
 
       if (item.icon) {
         const iconWrapper = document.createElement("span");
@@ -100,15 +104,25 @@ export function showContextMenuFallback<T extends string>(
       label.textContent = item.label;
       btn.appendChild(label);
 
-      btn.addEventListener("click", () => cleanup(item.id));
-      btn.addEventListener("mouseenter", () =>
-        focusItem(buttons.length > 0 ? buttons.indexOf(btn) : 0),
-      );
+      btn.addEventListener("click", () => {
+        if (!isDisabled) {
+          cleanup(item.id);
+        }
+      });
+      btn.addEventListener("mouseenter", () => {
+        if (!isDisabled) {
+          focusItem(enabledEntries.findIndex((entry) => entry.button === btn));
+        }
+      });
       btn.addEventListener("mouseleave", () => {
         btn.classList.remove("bg-[var(--sidebar-accent)]");
-        focusedIndex = -1;
+        if (enabledEntries[focusedIndex]?.button === btn) {
+          focusedIndex = -1;
+        }
       });
-      buttons.push(btn);
+      if (!isDisabled) {
+        enabledEntries.push({ button: btn, id: item.id });
+      }
       inner.appendChild(btn);
     }
 
