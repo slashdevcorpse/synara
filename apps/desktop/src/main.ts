@@ -65,7 +65,11 @@ import {
   type BackendRestartGeneration,
   type BackendRestartRequest,
 } from "./backendRestartController";
-import { stopWindowsBackendAndWait } from "./backendShutdown";
+import { stopWindowsBackendAndWait, type WindowsBackendShutdownResult } from "./backendShutdown";
+import {
+  stopPosixBackendAndWait,
+  type PosixBackendShutdownDisposition,
+} from "./posixBackendShutdown";
 import {
   bundleSignatureFromStats,
   isBundleStable,
@@ -2590,10 +2594,10 @@ async function installDownloadedUpdate(): Promise<{
     isQuitting = true;
     isUpdaterInstallPreparing = true;
     clearUpdatePollTimer();
-    const backendStopResult = await stopBackendAndWaitForExit();
-    if (backendStopResult === "timed-out") {
+    const shutdownDisposition = await stopBackendAndWaitForExit();
+    if (!shutdownDisposition.exitConfirmed) {
       throw new Error(
-        "Timed out waiting for the desktop backend to exit before update installation.",
+        "The desktop backend did not confirm shutdown. Update installation was not started.",
       );
     }
     await logMacUpdateDiagnostics("before install handoff");
@@ -3025,13 +3029,8 @@ async function launchAdmittedBackendGeneration(
     backendSessionClosed = true;
     writeBackendSessionBoundary("END", details);
   };
-  const failGeneration = (reason: string, exitProven = false): void => {
+  const settleGenerationAfterConfirmedExit = (reason: string): void => {
     cancelBackendGenerationReadinessWait(generation);
-    const ownershipReleaseProven =
-      exitProven || child.exitCode !== null || child.signalCode !== null || child.pid === undefined;
-    if (!ownershipReleaseProven) {
-      return;
-    }
     if (backendProcess === child) {
       backendProcess = null;
     }
@@ -3061,10 +3060,16 @@ async function launchAdmittedBackendGeneration(
       listeningDetector.fail(error);
       backendListeningDetector = null;
     }
+    if (child.pid !== undefined && !hasBackendProcessExited(child)) {
+      writeDesktopLogHeader(
+        `backend process error without exit proof generation=${generation.id} pid=${child.pid} replacement-blocked=true`,
+      );
+      return;
+    }
     closeBackendSession(
       `generation=${generation.id} pid=${child.pid ?? "unknown"} error=${error.message}`,
     );
-    failGeneration(error.message);
+    settleGenerationAfterConfirmedExit(error.message);
   });
 
   child.on("exit", (code, signal) => {
@@ -3079,7 +3084,7 @@ async function launchAdmittedBackendGeneration(
     closeBackendSession(
       `generation=${generation.id} pid=${child.pid ?? "unknown"} code=${code ?? "null"} signal=${signal ?? "null"}`,
     );
-    failGeneration(`code=${code ?? "null"} signal=${signal ?? "null"}`, true);
+    settleGenerationAfterConfirmedExit(`code=${code ?? "null"} signal=${signal ?? "null"}`);
   });
 
   monitorBackendGenerationReadiness(generation, child, generationBaseUrl);
@@ -3104,40 +3109,28 @@ async function settleBackendGenerationAfterReadinessFailure(
   writeDesktopLogHeader(
     `backend readiness failed generation=${generation.id}; graceful shutdown before replacement reason=${sanitizeLogValue(readinessFailure)}`,
   );
-  let shutdownFailure: string | null = null;
-  try {
-    const shutdownResult = await stopBackendAndWaitForExit(BACKEND_SHUTDOWN_TIMEOUT_MS, {
-      expectedChild: child,
-      preserveRestartGeneration: generation,
-      shutdownHttpUrl: baseUrl,
-    });
-    if (shutdownResult === "timed-out") {
-      shutdownFailure = "timed out waiting for the desktop backend to exit";
-    }
-  } catch (error: unknown) {
-    shutdownFailure = formatErrorMessage(error);
-  } finally {
+  const shutdownDisposition = await stopBackendAndWaitForExit(BACKEND_SHUTDOWN_TIMEOUT_MS, {
+    expectedChild: child,
+    preserveRestartGeneration: generation,
+    shutdownHttpUrl: baseUrl,
+  }).finally(() => {
     settlingBackendGenerations.delete(generation.id);
+  });
+
+  if (!shutdownDisposition.exitConfirmed) {
+    writeDesktopLogHeader(
+      `backend readiness replacement blocked generation=${generation.id} pid=${child.pid ?? "unknown"} disposition=${shutdownDisposition.type} forced=${shutdownDisposition.forced} replacement-blocked=true`,
+    );
+    return;
   }
 
   if (isQuitting) {
     backendRestartController.retireGeneration(generation);
     return;
   }
-  if (shutdownFailure && isCurrentBackendGeneration(generation, child)) {
-    writeDesktopLogHeader(
-      `backend generation ${generation.id} remains owned after shutdown failure; automatic restart suppressed reason=${sanitizeLogValue(shutdownFailure)}`,
-    );
-    return;
-  }
-  if (backendGeneration === generation) {
-    backendGeneration = null;
-  }
   recordBackendGenerationFailure(
     generation,
-    shutdownFailure
-      ? `startup readiness failed: ${readinessFailure}; shutdown failed: ${shutdownFailure}`
-      : `startup readiness failed: ${readinessFailure}`,
+    `startup readiness failed: ${readinessFailure}; shutdown=${shutdownDisposition.type} forced=${shutdownDisposition.forced}`,
   );
 }
 
@@ -3172,117 +3165,130 @@ interface StopBackendAndWaitOptions {
   readonly shutdownHttpUrl?: string;
 }
 
-type BackendStopResult = "not-running" | "exited" | "timed-out";
+type BackendStopDisposition =
+  | PosixBackendShutdownDisposition
+  | { readonly type: "no-process"; readonly exitConfirmed: true; readonly forced: false }
+  | {
+      readonly type: "expected-child-mismatch";
+      readonly exitConfirmed: false;
+      readonly forced: false;
+    };
+
+function hasBackendProcessExited(child: ChildProcess.ChildProcess): boolean {
+  return child.exitCode !== null || child.signalCode !== null;
+}
+
+function fromWindowsBackendShutdownResult(
+  result: WindowsBackendShutdownResult,
+): BackendStopDisposition {
+  if (result.type === "already-exited") {
+    return { ...result, exitConfirmed: true };
+  }
+  if (result.type === "exited") {
+    return { ...result, exitConfirmed: true };
+  }
+  return { ...result, exitConfirmed: false };
+}
+
+function settleConfirmedBackendStop(
+  child: ChildProcess.ChildProcess | null,
+  generation: BackendRestartGeneration | null,
+  preserveRestartGeneration: BackendRestartGeneration | undefined,
+): void {
+  if (child && backendProcess === child) {
+    backendProcess = null;
+  }
+  if (generation && backendGeneration === generation) {
+    backendGeneration = null;
+  }
+  if (generation && generation !== preserveRestartGeneration) {
+    backendRestartController.retireGeneration(generation);
+  }
+}
+
+function logBackendStopDisposition(
+  child: ChildProcess.ChildProcess | null,
+  generation: BackendRestartGeneration | null,
+  disposition: BackendStopDisposition,
+): void {
+  writeDesktopLogHeader(
+    `backend stop disposition generation=${generation?.id ?? "none"} pid=${child?.pid ?? "unknown"} disposition=${disposition.type} forced=${disposition.forced} exit-confirmed=${disposition.exitConfirmed}${disposition.exitConfirmed ? "" : " replacement-blocked=true"}`,
+  );
+}
 
 async function stopBackendAndWaitForExit(
   timeoutMs = BACKEND_SHUTDOWN_TIMEOUT_MS,
   options: StopBackendAndWaitOptions = {},
-): Promise<BackendStopResult> {
+): Promise<BackendStopDisposition> {
   const child = backendProcess;
   if (options.expectedChild && child !== options.expectedChild) {
-    return "not-running";
+    return {
+      type: "expected-child-mismatch",
+      exitConfirmed: false,
+      forced: false,
+    };
   }
 
+  const generation = backendGeneration;
   cancelBackendReadinessWait();
   cancelBackendGenerationReadinessWait(options.preserveRestartGeneration);
   backendListeningDetector = null;
 
-  const generation = backendGeneration;
   if (!child) {
-    if (generation && generation !== options.preserveRestartGeneration) {
-      if (backendGeneration === generation) {
-        backendGeneration = null;
-      }
-      backendRestartController.retireGeneration(generation);
-    }
-    return "not-running";
-  }
-  const backendChild = child;
-  const releaseExitedBackendOwnership = (): void => {
-    if (backendProcess === backendChild) {
-      backendProcess = null;
-    }
-    if (generation && generation !== options.preserveRestartGeneration) {
-      if (backendGeneration === generation) {
-        backendGeneration = null;
-      }
-      backendRestartController.retireGeneration(generation);
-    }
-  };
-  const backendChildHasExited = (): boolean =>
-    backendChild.exitCode !== null || backendChild.signalCode !== null;
-  if (backendChildHasExited()) {
-    releaseExitedBackendOwnership();
-    return "exited";
+    const disposition = {
+      type: "no-process",
+      exitConfirmed: true,
+      forced: false,
+    } as const;
+    settleConfirmedBackendStop(null, generation, options.preserveRestartGeneration);
+    logBackendStopDisposition(null, generation, disposition);
+    return disposition;
   }
 
-  if (process.platform === "win32") {
+  let disposition: BackendStopDisposition;
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    disposition = { type: "failed", exitConfirmed: false, forced: false };
+  } else if (hasBackendProcessExited(child)) {
+    disposition = { type: "already-exited", exitConfirmed: true, forced: false };
+  } else {
     const forceKillDelayMs = Math.min(BACKEND_FORCE_KILL_DELAY_MS, Math.max(0, timeoutMs - 500));
-    const shutdownResult = await stopWindowsBackendAndWait({
-      child: backendChild,
-      backendHttpUrl: options.shutdownHttpUrl ?? backendHttpUrl,
-      shutdownToken: DESKTOP_BACKEND_SHUTDOWN_TOKEN,
-      forceKillDelayMs,
-      timeoutMs,
-    });
-    if (shutdownResult.type === "timed-out") {
-      if (backendChildHasExited()) {
-        releaseExitedBackendOwnership();
-        return "exited";
+    try {
+      if (process.platform === "win32") {
+        disposition = fromWindowsBackendShutdownResult(
+          await stopWindowsBackendAndWait({
+            child,
+            backendHttpUrl: options.shutdownHttpUrl ?? backendHttpUrl,
+            shutdownToken: DESKTOP_BACKEND_SHUTDOWN_TOKEN,
+            forceKillDelayMs,
+            timeoutMs,
+          }),
+        );
+      } else {
+        disposition = await stopPosixBackendAndWait({
+          child,
+          forceKillDelayMs,
+          timeoutMs,
+        });
       }
-      return "timed-out";
+    } catch {
+      disposition = hasBackendProcessExited(child)
+        ? { type: "exited", exitConfirmed: true, forced: false }
+        : { type: "failed", exitConfirmed: false, forced: false };
     }
-    releaseExitedBackendOwnership();
-    return "exited";
   }
 
-  const shutdownResult = await new Promise<"exited" | "timed-out">((resolve) => {
-    let settled = false;
-    let forceKillTimer: ReturnType<typeof setTimeout> | null = null;
-    let exitTimeoutTimer: ReturnType<typeof setTimeout> | null = null;
-
-    function settle(result: "exited" | "timed-out"): void {
-      if (settled) return;
-      settled = true;
-      backendChild.off("exit", onExit);
-      if (forceKillTimer) {
-        clearTimeout(forceKillTimer);
-      }
-      if (exitTimeoutTimer) {
-        clearTimeout(exitTimeoutTimer);
-      }
-      resolve(result);
-    }
-
-    function onExit(): void {
-      settle("exited");
-    }
-
-    backendChild.once("exit", onExit);
-    backendChild.kill("SIGTERM");
-
-    const forceKillDelayMs = Math.min(BACKEND_FORCE_KILL_DELAY_MS, Math.max(1, timeoutMs - 500));
-    forceKillTimer = setTimeout(() => {
-      if (backendChild.exitCode === null && backendChild.signalCode === null) {
-        backendChild.kill("SIGKILL");
-      }
-    }, forceKillDelayMs);
-    forceKillTimer.unref();
-
-    exitTimeoutTimer = setTimeout(() => {
-      settle("timed-out");
-    }, timeoutMs);
-    exitTimeoutTimer.unref();
-  });
-  if (shutdownResult === "timed-out") {
-    if (backendChildHasExited()) {
-      releaseExitedBackendOwnership();
-      return "exited";
-    }
-    return "timed-out";
+  if (!disposition.exitConfirmed && hasBackendProcessExited(child)) {
+    disposition = {
+      type: "exited",
+      exitConfirmed: true,
+      forced: disposition.forced,
+    };
   }
-  releaseExitedBackendOwnership();
-  return "exited";
+  if (disposition.exitConfirmed) {
+    settleConfirmedBackendStop(child, generation, options.preserveRestartGeneration);
+  }
+  logBackendStopDisposition(child, generation, disposition);
+  return disposition;
 }
 
 async function disposeBrowserUsePipeServerForShutdown(reason: string): Promise<void> {
@@ -3318,19 +3324,14 @@ async function shutdownDesktopRuntime(reason: string): Promise<void> {
       appSnapManager?.dispose();
       appSnapManager = null;
       await disposeBrowserUsePipeServerForShutdown(reason);
-      try {
-        const backendStopResult = await stopBackendAndWaitForExit();
-        if (backendStopResult === "timed-out") {
-          writeDesktopLogHeader(`${reason} shutdown timed out waiting for backend exit`);
-        }
-      } catch (error: unknown) {
-        writeDesktopLogHeader(
-          `${reason} shutdown failed while stopping backend message=${sanitizeLogValue(formatErrorMessage(error))}`,
-        );
-      }
+      const shutdownDisposition = await stopBackendAndWaitForExit();
       browserManager.dispose();
       restoreStdIoCapture?.();
-      writeDesktopLogHeader(`${reason} shutdown complete`);
+      writeDesktopLogHeader(
+        shutdownDisposition.exitConfirmed
+          ? `${reason} shutdown complete disposition=${shutdownDisposition.type} forced=${shutdownDisposition.forced}`
+          : `${reason} shutdown incomplete disposition=${shutdownDisposition.type} forced=${shutdownDisposition.forced} backend-exit-unconfirmed=true`,
+      );
     } finally {
       desktopShutdownComplete = true;
     }
