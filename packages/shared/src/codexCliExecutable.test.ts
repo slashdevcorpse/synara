@@ -71,7 +71,7 @@ describe("resolveCodexCliExecutable", () => {
   ])(
     "resolves the explicit extensionless command $configured exactly once",
     ({ configured, resolved }) => {
-      const spawnSync = whereOutput(configured, resolved);
+      const spawnSync = whereOutput(resolved);
 
       expect(
         resolveCodexCliExecutable(configured, {
