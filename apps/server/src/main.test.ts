@@ -177,6 +177,7 @@ it.layer(testLayer)("server CLI command", (it) => {
       assert.equal(resolvedConfig?.authToken, "auth-secret");
       assert.equal(resolvedConfig?.publicUrl, undefined);
       assert.equal(resolvedConfig?.allowInsecureRemote, false);
+      assert.equal(resolvedConfig?.allowUnauthenticatedLoopback, true);
       assert.equal(resolvedConfig?.autoBootstrapProjectFromCwd, false);
       assert.equal(resolvedConfig?.logProviderEvents, false);
       assert.equal(resolvedConfig?.logWebSocketEvents, false);
@@ -190,6 +191,24 @@ it.layer(testLayer)("server CLI command", (it) => {
 
       assert.equal(start.mock.calls.length, 1);
       assert.equal(resolvedConfig?.authToken, "token-secret");
+    }),
+  );
+
+  it.effect("supports hardened loopback auth through the negative CLI policy flag", () =>
+    Effect.gen(function* () {
+      yield* runCli(["--require-loopback-auth"]);
+
+      assert.equal(start.mock.calls.length, 1);
+      assert.equal(resolvedConfig?.allowUnauthenticatedLoopback, false);
+    }),
+  );
+
+  it.effect("reads the unauthenticated loopback policy from the environment", () =>
+    Effect.gen(function* () {
+      yield* runCli([], { SYNARA_ALLOW_UNAUTHENTICATED_LOOPBACK: "false" });
+
+      assert.equal(start.mock.calls.length, 1);
+      assert.equal(resolvedConfig?.allowUnauthenticatedLoopback, false);
     }),
   );
 

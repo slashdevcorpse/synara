@@ -9,6 +9,7 @@ import {
   type SynaraDesktopIdentity,
 } from "@synara/shared/desktopIdentity";
 import type { DesktopBuildArch } from "./desktop-build-options.ts";
+import launcherConfig from "../../apps/server/native/windows-job-launcher/launcher.config.json" with { type: "json" };
 
 export const MICROPHONE_USAGE_DESCRIPTION =
   "Synara needs microphone access so you can record voice notes and transcribe them into the chat composer.";
@@ -23,7 +24,7 @@ export const MAC_PRESIGNED_VENDOR_SIGN_IGNORE_PATTERNS = [
   String.raw`/Contents/Resources/app\.asar\.unpacked/node_modules/@anthropic-ai/claude-agent-sdk-darwin-(?:arm64|x64)/claude$`,
 ] as const;
 export const WINDOWS_INSTALLER_GUID = SYNARA_WINDOWS_INSTALLER_GUID;
-export const WINDOWS_JOB_LAUNCHER_EXECUTABLE = "synara-windows-job-launcher.exe";
+export const WINDOWS_JOB_LAUNCHER_EXECUTABLE = launcherConfig.executableName;
 export const WINDOWS_JOB_LAUNCHER_EXTRA_FILE_DESTINATION = `resources/synara-native/${WINDOWS_JOB_LAUNCHER_EXECUTABLE}`;
 const MAC_DMG_ICON_PATH = "icon.icns";
 export const NODE_PTY_ASAR_UNPACK_GLOBS = ["node_modules/node-pty/**"] as const;

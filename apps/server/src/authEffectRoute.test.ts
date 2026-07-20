@@ -11,6 +11,7 @@ import {
   ATTACHMENT_UPLOAD_ROUTE_PATH,
   VOICE_TRANSCRIPTION_UPLOAD_ROUTE_PATH,
 } from "@synara/shared/binaryTransfer";
+import { SYNARA_CSRF_HEADER_NAME, SYNARA_CSRF_HEADER_VALUE } from "@synara/shared/authSecurity";
 import { DateTime, Effect, Exit, Layer, Scope } from "effect";
 import { HttpRouter } from "effect/unstable/http";
 import { describe, expect, it } from "vitest";
@@ -193,6 +194,7 @@ function mutationRequest(input: {
   readonly origin?: string;
   readonly credential: "bearer" | "cookie";
   readonly body?: unknown;
+  readonly csrf?: boolean;
 }): RequestInit {
   return {
     method: "POST",
@@ -200,7 +202,12 @@ function mutationRequest(input: {
       ...(input.origin === undefined ? {} : { Origin: input.origin }),
       ...(input.credential === "bearer"
         ? { Authorization: "Bearer bearer-token" }
-        : { Cookie: "synara_session=cookie-token" }),
+        : {
+            Cookie: "synara_session=cookie-token",
+            ...(input.csrf === false
+              ? {}
+              : { [SYNARA_CSRF_HEADER_NAME]: SYNARA_CSRF_HEADER_VALUE }),
+          }),
       ...(input.body === undefined ? {} : { "Content-Type": "application/json" }),
     },
     ...(input.body === undefined ? {} : { body: JSON.stringify(input.body) }),
@@ -262,6 +269,62 @@ describe("authEffectRouteLayer", () => {
         body: JSON.stringify({ credential: "PAIRINGTOKEN" }),
       });
       expect(validResponse.status).toBe(200);
+      expect(validResponse.headers.get("set-cookie")).toContain("SameSite=Strict");
+      expect(sideEffects.count).toBe(1);
+    });
+  });
+
+  it("advertises the CSRF header on trusted auth mutation preflights", async () => {
+    const config = { host: "127.0.0.1", publicUrl: undefined } as ServerConfigShape;
+    await withAuthEffectServer(config, makeServerAuth({ count: 0 }), async (serverOrigin) => {
+      const response = await fetch(`${serverOrigin}/api/auth/logout`, {
+        method: "OPTIONS",
+        headers: {
+          Origin: "synara-canary://app",
+          "Access-Control-Request-Method": "POST",
+          "Access-Control-Request-Headers": `content-type, ${SYNARA_CSRF_HEADER_NAME}`,
+        },
+      });
+
+      expect(response.status).toBe(204);
+      expect(response.headers.get("access-control-allow-origin")).toBe("synara-canary://app");
+      expect(response.headers.get("access-control-allow-headers")?.toLowerCase()).toContain(
+        SYNARA_CSRF_HEADER_NAME.toLowerCase(),
+      );
+    });
+  });
+
+  it("returns credentialed CORS headers to trusted custom-scheme auth callers", async () => {
+    const sideEffects = { count: 0 };
+    const config = { host: "127.0.0.1", publicUrl: undefined } as ServerConfigShape;
+    await withAuthEffectServer(config, makeServerAuth(sideEffects), async (serverOrigin) => {
+      const origin = "synara-canary://app";
+      for (const rejectedOrigin of ["null", "not a url", "https://evil.example.test"]) {
+        const rejectedBootstrapResponse = await fetch(`${serverOrigin}/api/auth/bootstrap`, {
+          method: "POST",
+          headers: { Origin: rejectedOrigin, "Content-Type": "application/json" },
+          body: JSON.stringify({ credential: "PAIRINGTOKEN" }),
+        });
+        expect(rejectedBootstrapResponse.status, rejectedOrigin).toBe(403);
+      }
+      expect(sideEffects.count).toBe(0);
+
+      const bootstrapResponse = await fetch(`${serverOrigin}/api/auth/bootstrap`, {
+        method: "POST",
+        headers: { Origin: origin, "Content-Type": "application/json" },
+        body: JSON.stringify({ credential: "PAIRINGTOKEN" }),
+      });
+
+      expect(bootstrapResponse.status).toBe(200);
+      expect(bootstrapResponse.headers.get("access-control-allow-origin")).toBe(origin);
+      expect(bootstrapResponse.headers.get("access-control-allow-credentials")).toBe("true");
+
+      const sessionResponse = await fetch(`${serverOrigin}/api/auth/session`, {
+        headers: { Origin: origin },
+      });
+      expect(sessionResponse.status).toBe(200);
+      expect(sessionResponse.headers.get("access-control-allow-origin")).toBe(origin);
+      expect(sessionResponse.headers.get("access-control-allow-credentials")).toBe("true");
       expect(sideEffects.count).toBe(1);
     });
   });
@@ -334,6 +397,25 @@ describe("authEffectRouteLayer", () => {
     });
   });
 
+  it("rejects a trusted-origin cookie mutation without the CSRF header", async () => {
+    const sideEffects = { count: 0 };
+    const config = { host: "127.0.0.1", publicUrl: undefined } as ServerConfigShape;
+    await withAuthEffectServer(config, makeServerAuth(sideEffects), async (serverOrigin) => {
+      const response = await fetch(
+        `${serverOrigin}/api/auth/logout`,
+        mutationRequest({
+          origin: serverOrigin,
+          credential: "cookie",
+          csrf: false,
+        }),
+      );
+
+      expect(response.status).toBe(403);
+      await expect(response.json()).resolves.toEqual({ error: "CSRF header required." });
+      expect(sideEffects.count).toBe(0);
+    });
+  });
+
   it("logs out either role and clears the exact cookie with secure public-mode attributes", async () => {
     const sideEffects = { count: 0 };
     const config = {
@@ -357,7 +439,7 @@ describe("authEffectRouteLayer", () => {
       expect(cookie).toContain("Max-Age=0");
       expect(cookie).toContain("HttpOnly");
       expect(cookie).toContain("Path=/");
-      expect(cookie).toContain("SameSite=Lax");
+      expect(cookie).toContain("SameSite=Strict");
       expect(cookie).toContain("Secure");
       expect(sideEffects.count).toBe(1);
     });
@@ -390,6 +472,9 @@ describe("binaryUploadEffectRouteLayer", () => {
           expect(response.headers.get("access-control-allow-methods")).toContain("POST");
           expect(response.headers.get("access-control-allow-headers")?.toLowerCase()).toContain(
             "content-type",
+          );
+          expect(response.headers.get("access-control-allow-headers")?.toLowerCase()).toContain(
+            SYNARA_CSRF_HEADER_NAME.toLowerCase(),
           );
         },
         binaryUploadEffectRouteLayer,
@@ -425,6 +510,30 @@ describe("binaryUploadEffectRouteLayer", () => {
           });
           expect(cookieResponse.status).toBe(403);
           expect(fs.readdirSync(attachmentsDir)).toEqual([]);
+
+          const missingCsrfResponse = await fetch(url, {
+            method: "POST",
+            headers: {
+              Origin: "https://synara.example.test",
+              Cookie: "synara_session=cookie-token",
+            },
+            body: Uint8Array.from([1]),
+          });
+          expect(missingCsrfResponse.status).toBe(403);
+
+          const cookieWithCsrfResponse = await fetch(
+            `${serverOrigin}${ATTACHMENT_UPLOAD_ROUTE_PATH}`,
+            {
+              method: "POST",
+              headers: {
+                Origin: "https://synara.example.test",
+                Cookie: "synara_session=cookie-token",
+                [SYNARA_CSRF_HEADER_NAME]: SYNARA_CSRF_HEADER_VALUE,
+              },
+              body: Uint8Array.from([1]),
+            },
+          );
+          expect(cookieWithCsrfResponse.status).toBe(400);
 
           const oversizedStatus = await new Promise<number>((resolve, reject) => {
             const target = new URL(url);

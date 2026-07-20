@@ -6,7 +6,11 @@ import { Effect, Layer } from "effect";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { ServerConfig, type ServerConfigShape } from "./config";
-import { runManagedAttachmentCleanupBatch } from "./managedAttachmentCleanup";
+import {
+  MANAGED_ATTACHMENT_WRITING_LEASE_MS,
+  runManagedAttachmentCleanupBatch,
+  sweepOrphanManagedAttachmentParts,
+} from "./managedAttachmentCleanup";
 import {
   ManagedAttachmentRepository,
   type ManagedAttachmentCleanupJob,
@@ -75,6 +79,83 @@ function makeRepository(job: ManagedAttachmentCleanupJob) {
 }
 
 describe("managed attachment cleanup", () => {
+  it("sweeps stale orphan parts without a database row while preserving fresh and near-match files", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "synara-managed-staging-sweep-"));
+    temporaryRoots.push(root);
+    const stagingDir = path.join(root, ".staging");
+    const stalePart = path.join(stagingDir, "att_v2_11111111111111111111111111111111.part");
+    const freshPart = path.join(stagingDir, "att_v2_22222222222222222222222222222222.part");
+    const nearMatch = path.join(stagingDir, "att_v2_33333333333333333333333333333333.part.extra");
+    await fs.mkdir(stagingDir, { recursive: true });
+    await Promise.all([
+      fs.writeFile(stalePart, "stale"),
+      fs.writeFile(freshPart, "fresh"),
+      fs.writeFile(nearMatch, "preserve"),
+    ]);
+    const nowMs = Date.now();
+    const staleDate = new Date(nowMs - MANAGED_ATTACHMENT_WRITING_LEASE_MS - 1_000);
+    await fs.utimes(stalePart, staleDate, staleDate);
+
+    const result = await sweepOrphanManagedAttachmentParts({ attachmentsDir: root, nowMs });
+
+    expect(result).toMatchObject({ removed: 1, failures: 0 });
+    await expect(fs.stat(stalePart)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(fs.readFile(freshPart, "utf8")).resolves.toBe("fresh");
+    await expect(fs.readFile(nearMatch, "utf8")).resolves.toBe("preserve");
+  });
+
+  it("bounds startup staging work and rejects a symlinked staging directory", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "synara-managed-staging-contained-"));
+    temporaryRoots.push(root);
+    const outside = await fs.mkdtemp(
+      path.join(os.tmpdir(), "synara-managed-staging-contained-outside-"),
+    );
+    temporaryRoots.push(outside);
+    const outsidePart = path.join(outside, "att_v2_44444444444444444444444444444444.part");
+    await fs.writeFile(outsidePart, "outside");
+    await fs.symlink(
+      outside,
+      path.join(root, ".staging"),
+      process.platform === "win32" ? "junction" : "dir",
+    );
+
+    const result = await sweepOrphanManagedAttachmentParts({
+      attachmentsDir: root,
+      scanLimit: 1,
+      maxRemovals: 1,
+    });
+
+    expect(result).toEqual({ inspected: 0, removed: 0, failures: 1 });
+    await expect(fs.readFile(outsidePart, "utf8")).resolves.toBe("outside");
+  });
+
+  it("preserves an exact-name part replaced between the two stale-file validations", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "synara-managed-staging-race-"));
+    temporaryRoots.push(root);
+    const stagingDir = path.join(root, ".staging");
+    const partPath = path.join(stagingDir, "att_v2_55555555555555555555555555555555.part");
+    const originalPath = `${partPath}.original`;
+    await fs.mkdir(stagingDir, { recursive: true });
+    await fs.writeFile(partPath, "original");
+    const nowMs = Date.now();
+    const staleDate = new Date(nowMs - MANAGED_ATTACHMENT_WRITING_LEASE_MS - 1_000);
+    await fs.utimes(partPath, staleDate, staleDate);
+
+    const result = await sweepOrphanManagedAttachmentParts({
+      attachmentsDir: root,
+      nowMs,
+      beforeFinalStat: async (candidatePath) => {
+        await fs.rename(candidatePath, originalPath);
+        await fs.writeFile(candidatePath, "replacement");
+        await fs.utimes(candidatePath, staleDate, staleDate);
+      },
+    });
+
+    expect(result).toMatchObject({ removed: 0, failures: 0 });
+    await expect(fs.readFile(partPath, "utf8")).resolves.toBe("replacement");
+    await expect(fs.readFile(originalPath, "utf8")).resolves.toBe("original");
+  });
+
   it("removes both crash-left staging bytes and the final blob before completing the job", async () => {
     const fixture = await makeFixture();
     const state = makeRepository(fixture.job);

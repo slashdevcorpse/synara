@@ -61,6 +61,7 @@ import { NetService } from "@synara/shared/Net";
 import { RotatingFileSink } from "@synara/shared/logging";
 import { ensureStaticSnapshot, findAsarArchivePath } from "@synara/shared/staticSnapshot";
 import { applyWebDocumentSecurityHeaders } from "@synara/shared/webSecurity";
+import windowsJobLauncherConfig from "../../server/native/windows-job-launcher/launcher.config.json" with { type: "json" };
 import { isBackendReadinessAborted, waitForHttpReady } from "./backendReadiness";
 import { resolveBackendNodeArgs } from "./backendNodeOptions";
 import {
@@ -1045,7 +1046,7 @@ function resolveBackendEntry(): string {
 }
 
 function resolvePackagedWindowsJobLauncher(): string {
-  return Path.join(process.resourcesPath, "synara-native", "synara-windows-job-launcher.exe");
+  return Path.join(process.resourcesPath, "synara-native", windowsJobLauncherConfig.executableName);
 }
 
 function resolveBackendCwd(): string {

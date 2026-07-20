@@ -22,11 +22,26 @@ export interface ProviderLifecycleCoordinator {
   ) => Effect.Effect<A, E, R>;
   readonly adoptCurrent: (threadId: ThreadId, generation: string) => void;
   readonly currentGeneration: (threadId: ThreadId) => string | undefined;
+  /**
+   * Invalidate a deleted thread immediately and reclaim any generation that
+   * queued lifecycle work attempts to install before the lock becomes idle.
+   */
+  readonly retireThread: (threadId: ThreadId) => void;
+  /** Deterministic lifecycle accounting used by diagnostics and race tests. */
+  readonly diagnostics: (threadId: ThreadId) => {
+    readonly lockUsers: number;
+    readonly retireWhenIdle: boolean;
+  };
+  /** Reclaim idle generations no longer backed by a persisted live binding. */
+  readonly sweepIdle: (isLiveThread: (threadId: ThreadId) => boolean) => number;
 }
 
 /** Serializes provider lifecycle mutations per thread and gives each mutation a unique epoch. */
 export function makeProviderLifecycleCoordinator(): ProviderLifecycleCoordinator {
-  const locks = new Map<ThreadId, { readonly semaphore: Semaphore.Semaphore; users: number }>();
+  const locks = new Map<
+    ThreadId,
+    { readonly semaphore: Semaphore.Semaphore; users: number; retireWhenIdle: boolean }
+  >();
   const currentGenerations = new Map<ThreadId, string>();
 
   const withThreadLock = <A, E, R>(
@@ -36,7 +51,7 @@ export function makeProviderLifecycleCoordinator(): ProviderLifecycleCoordinator
     Effect.suspend(() => {
       let entry = locks.get(threadId);
       if (entry === undefined) {
-        entry = { semaphore: Semaphore.makeUnsafe(1), users: 0 };
+        entry = { semaphore: Semaphore.makeUnsafe(1), users: 0, retireWhenIdle: false };
         locks.set(threadId, entry);
       }
       entry.users += 1;
@@ -49,6 +64,9 @@ export function makeProviderLifecycleCoordinator(): ProviderLifecycleCoordinator
             Effect.sync(() => {
               acquiredEntry.users -= 1;
               if (acquiredEntry.users === 0 && locks.get(threadId) === acquiredEntry) {
+                if (acquiredEntry.retireWhenIdle) {
+                  currentGenerations.delete(threadId);
+                }
                 locks.delete(threadId);
               }
             }),
@@ -102,5 +120,32 @@ export function makeProviderLifecycleCoordinator(): ProviderLifecycleCoordinator
       ),
     adoptCurrent: (threadId, generation) => currentGenerations.set(threadId, generation),
     currentGeneration: (threadId) => currentGenerations.get(threadId),
+    retireThread: (threadId) => {
+      currentGenerations.delete(threadId);
+      const entry = locks.get(threadId);
+      if (entry !== undefined) {
+        entry.retireWhenIdle = true;
+      }
+    },
+    diagnostics: (threadId) => {
+      const entry = locks.get(threadId);
+      return {
+        lockUsers: entry?.users ?? 0,
+        retireWhenIdle: entry?.retireWhenIdle ?? false,
+      };
+    },
+    sweepIdle: (isLiveThread) => {
+      let swept = 0;
+      for (const threadId of currentGenerations.keys()) {
+        const entry = locks.get(threadId);
+        if ((entry?.users ?? 0) > 0 || isLiveThread(threadId)) continue;
+        currentGenerations.delete(threadId);
+        if (entry !== undefined && locks.get(threadId) === entry) {
+          locks.delete(threadId);
+        }
+        swept += 1;
+      }
+      return swept;
+    },
   };
 }

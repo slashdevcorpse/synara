@@ -199,6 +199,12 @@ describe("production Effect HTTP routes", () => {
         url: new URL("http://127.0.0.1/attachments/id?token=desktop-secret"),
       }),
     ).toBe(false);
+    expect(
+      isLegacyTokenAuthorized({
+        config: { ...loopback, allowUnauthenticatedLoopback: false },
+        url: new URL("http://127.0.0.1/attachments/id?token=desktop-secret"),
+      }),
+    ).toBe(false);
   });
 
   it("serves readiness without authentication for a private loopback deployment", async () => {

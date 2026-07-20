@@ -19,6 +19,7 @@ import {
   ATTACHMENT_CANCEL_ROUTE_PATH,
   ATTACHMENT_UPLOAD_ROUTE_PATH,
 } from "@synara/shared/binaryTransfer";
+import { SYNARA_CSRF_HEADER_NAME, SYNARA_CSRF_HEADER_VALUE } from "@synara/shared/authSecurity";
 import { applyClaudePromptEffortPrefix, getModelCapabilities } from "@synara/shared/model";
 
 import type {
@@ -259,7 +260,10 @@ async function cancelManagedAttachments(attachmentIds: readonly string[]): Promi
         await fetch(resolveWsHttpUrl(ATTACHMENT_CANCEL_ROUTE_PATH), {
           method: "POST",
           credentials: "include",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            [SYNARA_CSRF_HEADER_NAME]: SYNARA_CSRF_HEADER_VALUE,
+          },
           body,
         });
       } catch {
@@ -304,6 +308,7 @@ export async function stageUploadComposerAttachments(input: {
         {
           method: "POST",
           credentials: "include",
+          headers: { [SYNARA_CSRF_HEADER_NAME]: SYNARA_CSRF_HEADER_VALUE },
           body: attachment.file,
         },
       );

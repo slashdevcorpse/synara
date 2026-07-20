@@ -130,6 +130,13 @@ export interface ProviderServiceShape {
   ) => Effect.Effect<void, ProviderServiceError>;
 
   /**
+   * Invalidate lifecycle state as soon as a thread deletion is observed.
+   * This is intentionally separate from stopSession so deletion can retire an
+   * in-flight generation before waiting for provider teardown.
+   */
+  readonly retireThreadLifecycle?: (input: { readonly threadId: ThreadId }) => Effect.Effect<void>;
+
+  /**
    * Stop only the live adapter process/session while preserving the persisted
    * provider binding and resume cursor for a subsequent restart.
    */

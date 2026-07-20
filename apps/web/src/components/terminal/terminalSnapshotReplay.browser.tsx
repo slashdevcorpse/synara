@@ -914,6 +914,185 @@ describe("recovered terminal snapshot replay in real xterm", () => {
     }
   });
 
+  it("cancels a queued exit callback when recovery confirms a renewed running session", async () => {
+    const host = document.createElement("div");
+    host.style.cssText = "position:absolute;left:0;top:0;width:900px;height:320px;display:block;";
+    document.body.append(host);
+    hosts.push(host);
+
+    let terminalEventListener: ((event: TerminalEvent) => void) | undefined;
+    const onSessionExited = vi.fn();
+    const nativeApi = {
+      terminal: {
+        waitUntilEventStreamReady: async () => ({
+          type: "ready" as const,
+          generation: "generation-1",
+        }),
+        open: async () => legacySnapshot("BEFORE-RENEWAL"),
+        snapshot: async () => ({
+          snapshot: legacySnapshot("RENEWED-RUNNING-SESSION"),
+          generation: "generation-1",
+          watermark: 1,
+        }),
+        write: async () => undefined,
+        ackOutput: async () => undefined,
+        resize: async () => undefined,
+        clear: async () => undefined,
+        restart: async () => legacySnapshot(""),
+        close: async () => undefined,
+        onEvent: (listener: (event: TerminalEvent) => void) => {
+          terminalEventListener = listener;
+          return () => {
+            if (terminalEventListener === listener) terminalEventListener = undefined;
+          };
+        },
+      },
+    } as unknown as NativeApi;
+    const previousNativeApi = window.nativeApi;
+    window.nativeApi = nativeApi;
+    const entry = createRuntimeEntry({
+      runtimeKey: "thread::renewed-running",
+      threadId: "thread",
+      terminalId: "renewed-running",
+      terminalLabel: "Terminal",
+      cwd: "C:\\project",
+      callbacks: {
+        onSessionExited,
+        onTerminalMetadataChange: () => undefined,
+        onTerminalActivityChange: () => undefined,
+      },
+    });
+
+    try {
+      attachRuntimeToContainer(entry, { autoFocus: false, isVisible: true }, host);
+      await waitForCondition(() => entry.opened && entry.runtimeStatus === "ready", "renewal open");
+      terminalEventListener?.({
+        type: "exited",
+        threadId: "thread",
+        terminalId: "renewed-running",
+        createdAt: new Date().toISOString(),
+        generation: "generation-1",
+        sequence: 1,
+        exitCode: 1,
+        exitSignal: null,
+      });
+      expect(entry.hasHandledExit).toBe(true);
+
+      emitTerminalResnapshotRequired();
+      await waitForCondition(
+        () =>
+          !entry.needsAuthoritativeRecovery &&
+          !entry.authoritativeRecoveryInFlight &&
+          !entry.hasHandledExit &&
+          bufferText(entry.terminal).includes("RENEWED-RUNNING-SESSION"),
+        "renewed running recovery",
+      );
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      expect(onSessionExited).not.toHaveBeenCalled();
+      expect(entry.runtimeStatus).toBe("ready");
+    } finally {
+      disposeRuntimeEntry(entry);
+      restoreWindowNativeApi(previousNativeApi);
+      document.getElementById("synara-terminal-parking")?.remove();
+    }
+  });
+
+  it("unwinds interrupted recovery and resumes ACK delivery when the runtime closes", async () => {
+    const host = document.createElement("div");
+    host.style.cssText = "position:absolute;left:0;top:0;width:900px;height:320px;display:block;";
+    document.body.append(host);
+    hosts.push(host);
+
+    let snapshotCalls = 0;
+    let resolveRecoverySnapshot!: (value: {
+      snapshot: TerminalSessionSnapshot;
+      generation: string;
+      watermark: number;
+    }) => void;
+    const recoverySnapshot = new Promise<{
+      snapshot: TerminalSessionSnapshot;
+      generation: string;
+      watermark: number;
+    }>((resolve) => {
+      resolveRecoverySnapshot = resolve;
+    });
+    const acknowledgedBytes: number[] = [];
+    const nativeApi = {
+      terminal: {
+        waitUntilEventStreamReady: async () => ({
+          type: "ready" as const,
+          generation: "generation-1",
+        }),
+        open: async () => legacySnapshot(""),
+        snapshot: () => {
+          snapshotCalls += 1;
+          return recoverySnapshot;
+        },
+        write: async () => undefined,
+        ackOutput: async (input: { bytes: number }) => {
+          acknowledgedBytes.push(input.bytes);
+        },
+        resize: async () => undefined,
+        clear: async () => undefined,
+        restart: async () => legacySnapshot(""),
+        close: async () => undefined,
+        onEvent: () => () => undefined,
+      },
+    } as unknown as NativeApi;
+    const previousNativeApi = window.nativeApi;
+    window.nativeApi = nativeApi;
+    const entry = createRuntimeEntry({
+      runtimeKey: "thread::interrupted-recovery",
+      threadId: "thread",
+      terminalId: "interrupted-recovery",
+      terminalLabel: "Terminal",
+      cwd: "C:\\project",
+      callbacks: {
+        onSessionExited: () => undefined,
+        onTerminalMetadataChange: () => undefined,
+        onTerminalActivityChange: () => undefined,
+      },
+    });
+
+    try {
+      attachRuntimeToContainer(entry, { autoFocus: false, isVisible: true }, host);
+      await waitForCondition(
+        () => entry.opened && entry.runtimeStatus === "ready",
+        "interrupted recovery open",
+      );
+      emitTerminalResnapshotRequired();
+      await waitForCondition(
+        () => snapshotCalls === 1 && entry.authoritativeRecoveryInFlight,
+        "interrupted recovery snapshot",
+      );
+
+      entry.opened = false;
+      resolveRecoverySnapshot({
+        snapshot: legacySnapshot("IGNORED-AFTER-CLOSE"),
+        generation: "generation-1",
+        watermark: 0,
+      });
+      await waitForCondition(
+        () =>
+          !entry.authoritativeRecoveryInFlight &&
+          !entry.needsAuthoritativeRecovery &&
+          entry.authoritativeRecoveryRetryTimer === null &&
+          !entry.terminalEventRecovery.isRecovering(),
+        "interrupted recovery cleanup",
+      );
+
+      entry.terminalOutputAckQueue.enqueue(9);
+      await waitForCondition(() => acknowledgedBytes.includes(9), "resumed ACK delivery");
+      expect(entry.authoritativeRecoveryAttempt).toBe(0);
+      expect(bufferText(entry.terminal)).not.toContain("IGNORED-AFTER-CLOSE");
+    } finally {
+      disposeRuntimeEntry(entry);
+      restoreWindowNativeApi(previousNativeApi);
+      document.getElementById("synara-terminal-parking")?.remove();
+    }
+  });
+
   it("finalizes a dropped exited event from a non-starting recovery snapshot", async () => {
     const host = document.createElement("div");
     host.style.cssText = "position:absolute;left:0;top:0;width:900px;height:320px;display:block;";

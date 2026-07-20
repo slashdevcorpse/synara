@@ -1,3 +1,5 @@
+import { normalizePeerAddress } from "./peerAddress";
+
 export const MAX_UPLOADS_PER_MINUTE_PER_PRINCIPAL = 20;
 export const MAX_UPLOADS_PER_MINUTE_PER_PEER = 50;
 export const UPLOAD_ADMISSION_IDLE_KEY_TTL_MS = 2 * 60_000;
@@ -71,11 +73,7 @@ function retryAfterMs(tokens: number, refillPerMs: number): number {
   return Math.max(1, Math.ceil((1 - tokens) / refillPerMs));
 }
 
-export function normalizeUploadPeerAddress(remoteAddress: string | null | undefined): string {
-  const normalized = remoteAddress?.trim().toLowerCase();
-  if (!normalized) return "unknown";
-  return normalized.startsWith("::ffff:") ? normalized.slice("::ffff:".length) : normalized;
-}
+export const normalizeUploadPeerAddress = normalizePeerAddress;
 
 function normalizePrincipalKey(principalKey: string): string {
   const normalized = principalKey.trim();

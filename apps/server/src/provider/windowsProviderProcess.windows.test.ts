@@ -118,6 +118,23 @@ describeWindows("Windows Job launcher native integration", () => {
     expect(result.status).toBe(0);
   });
 
+  it("launches successfully with mixed piped and ignored helper stdio", () => {
+    const helper = resolveWindowsJobLauncherPath();
+    const result = spawnSync(
+      helper,
+      helperArgs(process.execPath, ["-e", "process.stdout.write('mixed-stdio')"]),
+      {
+        stdio: ["ignore", "pipe", "ignore"],
+        encoding: "utf8",
+        windowsHide: true,
+      },
+    );
+
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(0);
+    expect(result.stdout).toBe("mixed-stdio");
+  });
+
   it("kills the provider root and nested descendant when the helper is terminated", async () => {
     const helper = resolveWindowsJobLauncherPath();
     const rootScript = [

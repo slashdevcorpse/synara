@@ -43,6 +43,19 @@ export class MigrationRecoveryRequiredError extends Error {
   }
 }
 
+export class MigrationWalCheckpointError extends Error {
+  readonly _tag = "MigrationWalCheckpointError";
+
+  constructor(
+    readonly dbPath: string,
+    detail: string,
+    options?: ErrorOptions,
+  ) {
+    super(`Cannot create a migration backup for ${dbPath}: ${detail}`, options);
+    this.name = "MigrationWalCheckpointError";
+  }
+}
+
 type MigrationBackupPlan = {
   readonly sourceVersion: string;
   readonly targetVersion: number;
@@ -418,6 +431,58 @@ export const createMigrationBackup = (
     const finalName = `${basename}.pre-migration-${safeVersionLabel(plan.sourceVersion)}-to-v${plan.targetVersion}-${uniqueSuffix}.sqlite`;
     const backupPath = path.join(backupDirectory, finalName);
     const temporaryPath = path.join(backupDirectory, `.${finalName}.partial`);
+
+    const checkpointRows = yield* sql<{
+      readonly busy: number;
+      readonly log: number;
+      readonly checkpointed: number;
+    }>`PRAGMA wal_checkpoint(TRUNCATE)`.pipe(
+      Effect.mapError(
+        (cause) =>
+          new MigrationWalCheckpointError(dbPath, "SQLite WAL checkpoint failed.", { cause }),
+      ),
+    );
+    const checkpoint = checkpointRows[0];
+    const checkpointCountsAreDrained =
+      checkpoint !== undefined &&
+      ((checkpoint.log === 0 && checkpoint.checkpointed === 0) ||
+        (checkpoint.log === -1 && checkpoint.checkpointed === -1));
+    if (
+      checkpointRows.length !== 1 ||
+      checkpoint === undefined ||
+      checkpoint.busy !== 0 ||
+      !checkpointCountsAreDrained
+    ) {
+      return yield* Effect.fail(
+        new MigrationWalCheckpointError(
+          dbPath,
+          checkpoint === undefined
+            ? "SQLite returned no checkpoint result."
+            : `SQLite could not drain the WAL (busy=${checkpoint.busy}, log=${checkpoint.log}, checkpointed=${checkpoint.checkpointed}).`,
+        ),
+      );
+    }
+    const walSize = yield* attemptPromise(async () => {
+      try {
+        return (await fs.stat(`${dbPath}-wal`)).size;
+      } catch (cause) {
+        if ((cause as NodeJS.ErrnoException).code === "ENOENT") return 0;
+        throw cause;
+      }
+    }).pipe(
+      Effect.mapError(
+        (cause) =>
+          new MigrationWalCheckpointError(dbPath, "Source WAL verification failed.", { cause }),
+      ),
+    );
+    if (walSize !== 0) {
+      return yield* Effect.fail(
+        new MigrationWalCheckpointError(
+          dbPath,
+          `Source WAL remained ${walSize} bytes after TRUNCATE checkpoint.`,
+        ),
+      );
+    }
 
     yield* sql`VACUUM INTO ${temporaryPath}`.pipe(
       Effect.tapError(() => attemptPromise(() => fs.unlink(temporaryPath)).pipe(Effect.ignore)),

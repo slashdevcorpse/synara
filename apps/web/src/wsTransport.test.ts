@@ -253,6 +253,37 @@ describe("WsTransport", () => {
     emitWsCompatibilityIssue(null);
   });
 
+  it("rejects terminal readiness on compatibility failure without retrying", async () => {
+    vi.useFakeTimers();
+    const issue = new WsCompatibilityError({
+      message: "Update this client.",
+      code: "WS_PROTOCOL_INCOMPATIBLE",
+      retryable: false,
+      action: "update-client",
+      serverBuild: "0.5.2",
+      protocolEpoch: WS_PROTOCOL_EPOCH,
+      minRevision: WS_PROTOCOL_MIN_REVISION,
+      maxRevision: WS_PROTOCOL_MAX_REVISION,
+    });
+    const transport = new WsTransport("ws://localhost:3020");
+    const getClient = vi.fn().mockRejectedValue(issue);
+    const internals = transport as unknown as {
+      getClient: () => Promise<never>;
+      listeners: Map<string, Set<(message: unknown) => void>>;
+    };
+    internals.getClient = getClient;
+    internals.listeners.set(WS_CHANNELS.terminalEvent, new Set([vi.fn()]));
+
+    try {
+      await expect(transport.waitForTerminalEventStreamReady()).rejects.toBe(issue);
+      await vi.advanceTimersByTimeAsync(500);
+      expect(getClient).toHaveBeenCalledTimes(1);
+    } finally {
+      await transport.dispose();
+      vi.useRealTimers();
+    }
+  });
+
   it("owns request deadlines and external aborts without leaving timers active", async () => {
     vi.useFakeTimers();
     try {

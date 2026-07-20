@@ -136,17 +136,26 @@ export async function teardownProviderProcessTree(
   }
 
   const deps = { ...defaultDependencies, ...dependencies };
-  const tree = await deps.processTreeKiller.capture(input.rootPid);
   const signalErrors: Error[] = [];
   let rootExited = false;
+  let captureFinished = false;
+  let rootExitedBeforeCaptureFinished = false;
   void input.rootExited.then(
     () => {
       rootExited = true;
+      if (!captureFinished) {
+        rootExitedBeforeCaptureFinished = true;
+      }
     },
     () => {
       // A rejected watcher is not evidence that the owned process exited.
     },
   );
+  const tree = await deps.processTreeKiller.capture(input.rootPid);
+  captureFinished = true;
+  // Flush a root-exit resolution queued in the same turn as capture completion.
+  await Promise.resolve();
+  const captureComplete = tree.captureComplete !== false && !rootExitedBeforeCaptureFinished;
 
   const signal = async (
     killSignal: TerminalKillSignal,
@@ -171,7 +180,7 @@ export async function teardownProviderProcessTree(
       remainingDescendants = inspection?.verified === true ? inspection.survivors : null;
       if (
         rootExited &&
-        tree.captureComplete !== false &&
+        captureComplete &&
         remainingDescendants !== null &&
         remainingDescendants.length === 0
       ) {
@@ -184,7 +193,10 @@ export async function teardownProviderProcessTree(
     return { proven: false as const, remainingDescendants };
   };
 
-  await signal("SIGTERM", true);
+  // If the owned root exited while descendants were being captured, its numeric
+  // PID may already identify an unrelated process. Signal only captured identities
+  // and keep the result unproven because reparenting may have hidden descendants.
+  await signal("SIGTERM", !rootExited);
   const graceful = await waitForExitProof(
     positiveDuration(input.termGraceMs, DEFAULT_TERM_GRACE_MS),
   );
@@ -205,6 +217,6 @@ export async function teardownProviderProcessTree(
     rootExited,
     remainingDescendantPids:
       forced.remainingDescendants?.map((descendant) => descendant.pid) ?? null,
-    captureComplete: tree.captureComplete !== false,
+    captureComplete,
   });
 }

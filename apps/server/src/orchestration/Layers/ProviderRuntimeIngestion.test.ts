@@ -26,7 +26,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { OrchestrationEventStoreLive } from "../../persistence/Layers/OrchestrationEventStore.ts";
 import { OrchestrationCommandReceiptRepositoryLive } from "../../persistence/Layers/OrchestrationCommandReceipts.ts";
-import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite.ts";
+import {
+  makeSqlitePersistenceLive,
+  SqlitePersistenceMemory,
+} from "../../persistence/Layers/Sqlite.ts";
 import { ProviderRuntimeEventRepositoryLive } from "../../persistence/Layers/ProviderRuntimeEvents.ts";
 import {
   PROVIDER_RUNTIME_INGESTION_CONSUMER,
@@ -83,6 +86,9 @@ function createProviderServiceHarness() {
   const stopRuntimeSession = vi.fn<NonNullable<ProviderServiceShape["stopRuntimeSession"]>>(
     () => Effect.void,
   );
+  const hasLiveRuntimeTasks = vi.fn<NonNullable<ProviderServiceShape["hasLiveRuntimeTasks"]>>(() =>
+    Effect.succeed(false),
+  );
   const service: ProviderServiceShape = {
     startSession: () => unsupported(),
     sendTurn: () => unsupported(),
@@ -97,6 +103,7 @@ function createProviderServiceHarness() {
     respondToUserInput,
     stopSession,
     stopRuntimeSession,
+    hasLiveRuntimeTasks,
     listSessions: () => Effect.succeed([...runtimeSessions]),
     getCapabilities: (provider) =>
       Effect.succeed({
@@ -161,6 +168,7 @@ function createProviderServiceHarness() {
     respondToUserInput,
     stopSession,
     stopRuntimeSession,
+    hasLiveRuntimeTasks,
   };
 }
 
@@ -246,7 +254,7 @@ describe("ProviderRuntimeIngestion", () => {
     return dir;
   }
 
-  afterEach(async () => {
+  async function disposeHarnessRuntime(): Promise<void> {
     if (scope) {
       await Effect.runPromise(Scope.close(scope, Exit.void));
     }
@@ -255,14 +263,23 @@ describe("ProviderRuntimeIngestion", () => {
       await runtime.dispose();
     }
     runtime = null;
+  }
+
+  afterEach(async () => {
+    await disposeHarnessRuntime();
     for (const dir of tempDirs.splice(0)) {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  async function createHarness(options?: { readonly startIngestion?: boolean }) {
-    const workspaceRoot = makeTempDir("synara-provider-project-");
-    fs.mkdirSync(path.join(workspaceRoot, ".git"));
+  async function createHarness(options?: {
+    readonly startIngestion?: boolean;
+    readonly dbPath?: string;
+    readonly workspaceRoot?: string;
+    readonly createdAt?: string;
+  }) {
+    const workspaceRoot = options?.workspaceRoot ?? makeTempDir("synara-provider-project-");
+    fs.mkdirSync(path.join(workspaceRoot, ".git"), { recursive: true });
     const provider = createProviderServiceHarness();
     const orchestrationLayer = OrchestrationEngineLive.pipe(
       Layer.provide(OrchestrationProjectionPipelineLive),
@@ -270,13 +287,16 @@ describe("ProviderRuntimeIngestion", () => {
       Layer.provide(OrchestrationEventStoreLive),
       Layer.provide(OrchestrationCommandReceiptRepositoryLive),
     );
+    const persistenceLayer = options?.dbPath
+      ? makeSqlitePersistenceLive(options.dbPath).pipe(Layer.provide(NodeServices.layer))
+      : SqlitePersistenceMemory;
     const runtimeEventRepositoryLayer = ProviderRuntimeEventRepositoryLive.pipe(
-      Layer.provideMerge(SqlitePersistenceMemory),
+      Layer.provideMerge(persistenceLayer),
     );
     const layer = ProviderRuntimeIngestionLive.pipe(
       Layer.provideMerge(orchestrationLayer),
       Layer.provideMerge(OrchestrationProjectionSnapshotQueryLive),
-      Layer.provideMerge(SqlitePersistenceMemory),
+      Layer.provideMerge(persistenceLayer),
       Layer.provideMerge(runtimeEventRepositoryLayer),
       Layer.provideMerge(Layer.succeed(ProviderService, provider.service)),
       Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
@@ -303,7 +323,7 @@ describe("ProviderRuntimeIngestion", () => {
     }
     const drain = () => Effect.runPromise(ingestion.drain);
 
-    const createdAt = new Date().toISOString();
+    const createdAt = options?.createdAt ?? new Date().toISOString();
     await Effect.runPromise(
       engine.dispatch({
         type: "project.create",
@@ -420,6 +440,7 @@ describe("ProviderRuntimeIngestion", () => {
       respondToUserInput: provider.respondToUserInput,
       stopSession: provider.stopSession,
       stopRuntimeSession: provider.stopRuntimeSession,
+      hasLiveRuntimeTasks: provider.hasLiveRuntimeTasks,
       createAdditionalThread,
     };
   }
@@ -4939,7 +4960,15 @@ describe("ProviderRuntimeIngestion", () => {
   });
 
   it("preserves durable unresolved capacity across ingestion restart and reconnect", async () => {
-    const harness = await createHarness({ startIngestion: false });
+    const dbPath = path.join(makeTempDir("synara-provider-restart-"), "state.sqlite");
+    const workspaceRoot = makeTempDir("synara-provider-restart-project-");
+    const createdAt = "2026-07-20T16:00:00.000Z";
+    let harness = await createHarness({
+      startIngestion: false,
+      dbPath,
+      workspaceRoot,
+      createdAt,
+    });
     const generation = "restart-generation";
     for (let index = 0; index < 10; index++) {
       const identity = {
@@ -4970,6 +4999,13 @@ describe("ProviderRuntimeIngestion", () => {
       );
     }
 
+    await disposeHarnessRuntime();
+    harness = await createHarness({
+      startIngestion: false,
+      dbPath,
+      workspaceRoot,
+      createdAt,
+    });
     await harness.startIngestion();
     await Effect.runPromise(
       harness.runtimeEventRepository.append({
@@ -5034,6 +5070,63 @@ describe("ProviderRuntimeIngestion", () => {
         .find((thread) => thread.id === asThreadId("thread-1"))
         ?.activities.some((activity) => activity.id === "evt-overflow-failure-11"),
     ).toBe(false);
+  });
+
+  it("preserves a runtime with live background tasks when overflow decline fails", async () => {
+    const harness = await createHarness();
+    harness.hasLiveRuntimeTasks.mockImplementation(() => Effect.succeed(true));
+    for (let index = 0; index < 10; index++) {
+      harness.emit({
+        type: "request.opened",
+        eventId: asEventId(`evt-overflow-live-task-open-${index}`),
+        provider: "claudeAgent",
+        createdAt: new Date().toISOString(),
+        threadId: asThreadId("thread-1"),
+        lifecycleGeneration: "overflow-live-task-generation",
+        requestId: ApprovalRequestId.makeUnsafe(`req-overflow-live-task-${index}`),
+        payload: { requestType: "command_execution_approval" },
+      });
+    }
+    await waitForThread(
+      harness.engine,
+      (thread) =>
+        thread.activities.filter((activity) => activity.kind === "approval.requested").length ===
+        10,
+    );
+    harness.respondToRequest.mockImplementationOnce(
+      () => Effect.fail(new Error("decline transport failed")) as never,
+    );
+    const overflowEvent = {
+      type: "request.opened" as const,
+      eventId: asEventId("evt-overflow-live-task-11"),
+      provider: "claudeAgent" as const,
+      createdAt: new Date().toISOString(),
+      threadId: asThreadId("thread-1"),
+      lifecycleGeneration: "overflow-live-task-generation",
+      requestId: ApprovalRequestId.makeUnsafe("req-overflow-live-task-11"),
+      payload: { requestType: "command_execution_approval" },
+    };
+    harness.emit(overflowEvent);
+    await waitForCondition(() => harness.respondToRequest.mock.calls.length === 1);
+    harness.emit({ ...overflowEvent, eventId: asEventId("evt-overflow-live-task-retry") });
+    harness.emit({
+      type: "runtime.warning",
+      eventId: asEventId("evt-overflow-live-task-fence"),
+      provider: "claudeAgent",
+      createdAt: new Date().toISOString(),
+      threadId: asThreadId("thread-1"),
+      payload: { message: "overflow live task fence" },
+    });
+    await waitForThread(harness.engine, (thread) =>
+      thread.activities.some((activity) => activity.id === "evt-overflow-live-task-fence"),
+    );
+
+    expect(harness.hasLiveRuntimeTasks).toHaveBeenCalledWith({
+      threadId: asThreadId("thread-1"),
+    });
+    expect(harness.stopRuntimeSession).not.toHaveBeenCalled();
+    expect(harness.stopSession).not.toHaveBeenCalled();
+    expect(harness.respondToRequest).toHaveBeenCalledTimes(1);
   });
 
   it("isolates unresolved request capacity per thread", async () => {

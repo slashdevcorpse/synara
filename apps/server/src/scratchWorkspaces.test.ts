@@ -3,7 +3,7 @@
 //          temp root even when thread ids contain path-like characters.
 // Layer: Server filesystem utility tests
 
-import { mkdirSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdirSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -152,13 +152,81 @@ describe("scratch workspace cleanup", () => {
     }
   });
 
+  it("preserves a candidate replaced immediately before recursive deletion", async () => {
+    const rootDir = await mkdtemp(path.join(tmpdir(), "synara-scratch-replaced-candidate-"));
+    const candidate = path.join(
+      rootDir,
+      scratchWorkspaceSegment(ThreadId.makeUnsafe("replaced-candidate-thread")),
+    );
+    const originalCandidate = `${candidate}-original`;
+    mkdirSync(candidate);
+    writeFileSync(path.join(candidate, "proof.txt"), "original");
+    const nowMs = Date.now();
+    const staleDate = new Date(nowMs - 48 * 60 * 60 * 1_000);
+    utimesSync(candidate, staleDate, staleDate);
+
+    try {
+      const result = await sweepStaleScratchWorkspaces({
+        activeThreadIds: new Set(),
+        rootDir,
+        nowMs,
+        beforeFinalDelete: async () => {
+          renameSync(candidate, originalCandidate);
+          mkdirSync(candidate);
+          writeFileSync(path.join(candidate, "proof.txt"), "replacement");
+          utimesSync(candidate, staleDate, staleDate);
+        },
+      });
+
+      expect(result).toMatchObject({ removed: 0, preservedUnsafe: 1 });
+      expect(() => writeFileSync(path.join(candidate, "still-here.txt"), "safe")).not.toThrow();
+      expect(() =>
+        writeFileSync(path.join(originalCandidate, "still-here.txt"), "safe"),
+      ).not.toThrow();
+    } finally {
+      rmSync(rootDir, { recursive: true, force: true });
+    }
+  });
+
   it("removes the exact thread directory on explicit deletion", async () => {
     const threadId = ThreadId.makeUnsafe(`delete-thread-${Date.now()}`);
     const workspace = ensureIsolatedScratchWorkspace(threadId);
-    writeFileSync(path.join(workspace, "proof.txt"), "delete me");
+    try {
+      writeFileSync(path.join(workspace, "proof.txt"), "delete me");
 
-    await removeIsolatedScratchWorkspace(threadId);
-    await expect(removeIsolatedScratchWorkspace(threadId)).resolves.toBeUndefined();
-    expect(() => writeFileSync(path.join(workspace, "gone.txt"), "gone")).toThrow();
+      await removeIsolatedScratchWorkspace(threadId);
+      await expect(removeIsolatedScratchWorkspace(threadId)).resolves.toBeUndefined();
+      expect(() => writeFileSync(path.join(workspace, "gone.txt"), "gone")).toThrow();
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a replaced scratch root without deleting through its junction", async () => {
+    const parentDir = await mkdtemp(path.join(tmpdir(), "synara-scratch-root-replaced-"));
+    const outsideDir = await mkdtemp(path.join(tmpdir(), "synara-scratch-root-outside-"));
+    const rootDir = path.join(parentDir, "managed");
+    const originalRootDir = path.join(parentDir, "managed-original");
+    const threadId = ThreadId.makeUnsafe("root-replacement-thread");
+    const segment = scratchWorkspaceSegment(threadId);
+    mkdirSync(path.join(rootDir, segment), { recursive: true });
+    mkdirSync(path.join(outsideDir, segment), { recursive: true });
+    const outsideProof = path.join(outsideDir, segment, "must-survive.txt");
+    writeFileSync(outsideProof, "outside");
+
+    try {
+      renameSync(rootDir, originalRootDir);
+      symlinkSync(outsideDir, rootDir, process.platform === "win32" ? "junction" : "dir");
+
+      await expect(removeIsolatedScratchWorkspace(threadId, { rootDir })).rejects.toThrow(
+        "Scratch workspace root is not a managed directory.",
+      );
+      expect(() => writeFileSync(outsideProof, "still outside")).not.toThrow();
+    } finally {
+      rmSync(rootDir, { recursive: true, force: true });
+      rmSync(originalRootDir, { recursive: true, force: true });
+      rmSync(parentDir, { recursive: true, force: true });
+      rmSync(outsideDir, { recursive: true, force: true });
+    }
   });
 });

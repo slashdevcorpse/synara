@@ -97,6 +97,65 @@ describe("Windows provider process containment", () => {
     expect(wrapped.args[5]).toBe("D:\\work\\bin\\agent.exe");
   });
 
+  it("qualifies a drive-rooted target against the provider cwd drive", () => {
+    const wrapped = containPreparedWindowsProviderProcess(
+      { command: "\\tools\\agent.exe", args: [], shell: false },
+      {
+        platform: "win32",
+        arch: "x64",
+        cwd: "D:\\work\\repo",
+        launcherPath: launcher,
+        fileExists: () => true,
+      },
+    );
+
+    expect(wrapped.args[5]).toBe("D:\\tools\\agent.exe");
+  });
+
+  it.each([
+    ["drive-absolute", "C:\\tools\\agent.exe", "D:\\work", "C:\\tools\\agent.exe"],
+    [
+      "UNC absolute",
+      "\\\\server\\share\\tools\\agent.exe",
+      "D:\\work",
+      "\\\\server\\share\\tools\\agent.exe",
+    ],
+    [
+      "drive-rooted on UNC cwd",
+      "\\tools\\agent.exe",
+      "\\\\server\\share\\work",
+      "\\\\server\\share\\tools\\agent.exe",
+    ],
+  ])("keeps %s targets launcher-valid across host platforms", (_label, command, cwd, expected) => {
+    const wrapped = containPreparedWindowsProviderProcess(
+      { command, args: [], shell: false },
+      {
+        platform: "win32",
+        arch: "x64",
+        cwd,
+        launcherPath: launcher,
+        fileExists: () => true,
+      },
+    );
+
+    expect(wrapped.args[5]).toBe(expected);
+  });
+
+  it("fails closed when a drive-rooted target has no absolute Windows cwd", () => {
+    expect(() =>
+      containPreparedWindowsProviderProcess(
+        { command: "\\tools\\agent.exe", args: [], shell: false },
+        {
+          platform: "win32",
+          arch: "x64",
+          cwd: "relative-worktree",
+          launcherPath: launcher,
+          fileExists: () => true,
+        },
+      ),
+    ).toThrow("no absolute Windows cwd was available");
+  });
+
   it("fails closed when a bare provider command was not resolved", () => {
     expect(() =>
       containPreparedWindowsProviderProcess(

@@ -9,7 +9,7 @@ import { it, assert, describe, vi } from "@effect/vitest";
 import { Effect, Fiber, Layer, Stream } from "effect";
 
 import { ServerConfig } from "../../config.ts";
-import { ProviderAdapterValidationError } from "../Errors.ts";
+import { ProviderAdapterProcessError, ProviderAdapterValidationError } from "../Errors.ts";
 import { CommandCodeAdapter } from "../Services/CommandCodeAdapter.ts";
 import {
   buildCommandCodeTurnArgs,
@@ -314,6 +314,31 @@ it.effect("treats the prepared process command as authoritative for turn launche
         assert.strictEqual(options.shell, false);
         assert.strictEqual(options.windowsHide, true);
         mock.close(0);
+      }).pipe(Effect.provide(layer));
+    }),
+  ),
+);
+
+it.effect("maps synchronous process preparation failures to ProviderAdapterProcessError", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const mock = makeMockChild();
+      const prepareProcess = vi.fn<PrepareProcess>(() => {
+        throw new Error("containment helper is unavailable");
+      });
+      const { layer, spawnProcess } = adapterLayer({ child: mock, prepareProcess });
+      const threadId = ThreadId.makeUnsafe("command-code-prepare-failure");
+
+      yield* Effect.gen(function* () {
+        const adapter = yield* CommandCodeAdapter;
+        yield* adapter.startSession(startInput(threadId));
+        const failure = yield* adapter
+          .sendTurn({ threadId, input: "must stay contained" })
+          .pipe(Effect.flip);
+        assert.ok(failure instanceof ProviderAdapterProcessError);
+        assert.strictEqual(failure.threadId, threadId);
+        assert.match(failure.detail, /containment helper is unavailable/u);
+        assert.strictEqual(spawnProcess.mock.calls.length, 0);
       }).pipe(Effect.provide(layer));
     }),
   ),

@@ -327,7 +327,7 @@ describe("TerminalManager", () => {
         ? { subprocessPollIntervalMs: options.subprocessPollIntervalMs }
         : {}),
       ...(options.processKillGraceMs ? { processKillGraceMs: options.processKillGraceMs } : {}),
-      ...(options.maxRetainedInactiveSessions
+      ...(options.maxRetainedInactiveSessions !== undefined
         ? { maxRetainedInactiveSessions: options.maxRetainedInactiveSessions }
         : {}),
     };
@@ -547,6 +547,24 @@ describe("TerminalManager", () => {
       message: "Explicit Windows terminal shell failed to start.",
     });
     expect(JSON.stringify(events)).not.toMatch(/private|secret|missing\.exe/i);
+    manager.dispose();
+  });
+
+  it("sequences a start failure before zero-retention eviction", async () => {
+    const { manager, ptyAdapter } = makeManager(5, {
+      shellPlatform: "win32",
+      shellResolver: () => ({ executable: "C:\\missing.exe", args: [] }),
+      maxRetainedInactiveSessions: 0,
+    });
+    const events: TerminalEvent[] = [];
+    manager.on("event", (event) => events.push(event));
+    ptyAdapter.spawnFailures.push(Object.assign(new Error("missing"), { code: "ENOENT" }));
+
+    const snapshot = await manager.open(openInput());
+
+    expect(snapshot.status).toBe("error");
+    expect(events).toMatchObject([{ type: "error", sequence: 1 }]);
+    expect((manager as unknown as { sessions: Map<string, unknown> }).sessions.size).toBe(0);
     manager.dispose();
   });
 
@@ -1928,6 +1946,27 @@ describe("TerminalManager", () => {
 
     await manager.disposeForShutdown();
 
+    expect(process.killSignals[0]).toBe("SIGTERM");
+    expect(process.killSignals).toContain("SIGKILL");
+  });
+
+  it("flushes pending output before shutdown removes terminal event clocks", async () => {
+    const { manager, ptyAdapter } = makeManager(5, { processKillGraceMs: 10 });
+    const events: TerminalEvent[] = [];
+    manager.on("event", (event) => events.push(event));
+    await manager.open(openInput());
+    const process = ptyAdapter.processes[0];
+    expect(process).toBeDefined();
+    if (!process) return;
+    process.emitData("pending-before-shutdown");
+
+    await manager.disposeForShutdown();
+
+    expect(events.find((event) => event.type === "output")).toMatchObject({
+      type: "output",
+      sequence: 2,
+      data: "pending-before-shutdown",
+    });
     expect(process.killSignals[0]).toBe("SIGTERM");
     expect(process.killSignals).toContain("SIGKILL");
   });

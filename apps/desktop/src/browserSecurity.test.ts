@@ -44,6 +44,26 @@ describe("desktop browser security policy", () => {
     expect(onBlocked).toHaveBeenCalledWith("file:///sensitive");
   });
 
+  it.each(["file:///sensitive", "data:text/html,unsafe", "synara-oauth://callback"])(
+    "prevents dangerous normal-tab navigation to %s",
+    (url) => {
+      const preventDefault = vi.fn();
+
+      expect(enforceBrowserNavigationPolicy({ url, preventDefault })).toBe(false);
+      expect(preventDefault).toHaveBeenCalledOnce();
+    },
+  );
+
+  it.each(["https://example.test/path", "http://127.0.0.1/callback", "about:blank"])(
+    "allows normal-tab navigation to %s",
+    (url) => {
+      const preventDefault = vi.fn();
+
+      expect(enforceBrowserNavigationPolicy({ url, preventDefault })).toBe(true);
+      expect(preventDefault).not.toHaveBeenCalled();
+    },
+  );
+
   it("allows same-origin OAuth navigation and a callback to the opener origin", () => {
     const policy = createBrowserPopupNavigationPolicy({
       openerUrl: "https://app.example.test/settings/integrations",
@@ -177,8 +197,13 @@ describe("desktop browser security policy", () => {
     expect(mainSource).toContain("applyWebDocumentSecurityHeaders(");
     expect(mainSource).toContain('window.webContents.on("will-attach-webview"');
     expect(mainSource).toContain("secureBrowserWebviewAttachment(webPreferences, params)");
-    expect(browserManagerSource).toContain('webContents.on("will-navigate", willNavigate)');
-    expect(browserManagerSource).toContain('webContents.on("will-redirect", willRedirect)');
+    const runtimeSecuritySource = browserManagerSource.slice(
+      browserManagerSource.indexOf("private configureRuntimeWebContents"),
+      browserManagerSource.indexOf("private syncRuntimeState"),
+    );
+    expect(runtimeSecuritySource).toContain("enforceBrowserNavigationPolicy(event)");
+    expect(runtimeSecuritySource).toContain('webContents.on("will-navigate", willNavigate)');
+    expect(runtimeSecuritySource).toContain('webContents.on("will-redirect", willRedirect)');
     expect(browserManagerSource).toContain("this.registerOAuthPopupWindow(nested");
     expect(browserManagerSource).toContain("runtime.navigationPolicy.deriveNested(details.url)");
     expect(browserManagerSource).toContain("createBrowserPopupNavigationPolicy({");

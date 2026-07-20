@@ -23,6 +23,7 @@ import {
   type WsPush,
   type ServerProviderStatus,
 } from "@synara/contracts";
+import { SYNARA_CSRF_HEADER_NAME, SYNARA_CSRF_HEADER_VALUE } from "@synara/shared/authSecurity";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const requestMock = vi.fn<(...args: Array<unknown>) => Promise<unknown>>();
@@ -679,6 +680,10 @@ describe("wsNativeApi", () => {
   });
 
   it("fetches auth session state over HTTP", async () => {
+    Object.defineProperty(getWindowForTest(), "desktopBridge", {
+      configurable: true,
+      value: { getWsUrl: () => "ws://127.0.0.1:3773/ws?token=desktop-secret" },
+    });
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(
         JSON.stringify({
@@ -700,13 +705,17 @@ describe("wsNativeApi", () => {
     const result = await api.server.getAuthSession();
 
     expect(fetchMock).toHaveBeenCalledWith(
-      "/api/auth/session",
-      expect.objectContaining({ credentials: "same-origin", method: "GET" }),
+      expect.stringContaining("http://127.0.0.1:3773/api/auth/session"),
+      expect.objectContaining({ credentials: "include", method: "GET" }),
     );
     expect(result).toMatchObject({ authenticated: false });
   });
 
   it("posts auth bootstrap payloads over HTTP", async () => {
+    Object.defineProperty(getWindowForTest(), "desktopBridge", {
+      configurable: true,
+      value: { getWsUrl: () => "ws://127.0.0.1:3773/ws?token=desktop-secret" },
+    });
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(
         JSON.stringify({
@@ -725,17 +734,23 @@ describe("wsNativeApi", () => {
     const result = await api.server.bootstrapAuth({ credential: "PAIRINGTOKEN" });
 
     expect(fetchMock).toHaveBeenCalledWith(
-      "/api/auth/bootstrap",
+      expect.stringContaining("http://127.0.0.1:3773/api/auth/bootstrap"),
       expect.objectContaining({
         method: "POST",
-        credentials: "same-origin",
+        credentials: "include",
         body: JSON.stringify({ credential: "PAIRINGTOKEN" }),
       }),
     );
+    const bootstrapHeaders = fetchMock.mock.calls[0]?.[1]?.headers as Record<string, string>;
+    expect(bootstrapHeaders[SYNARA_CSRF_HEADER_NAME]).toBeUndefined();
     expect(result).toMatchObject({ authenticated: true, sessionMethod: "browser-session-cookie" });
   });
 
   it("logs out over HTTP and disposes the authenticated websocket transport", async () => {
+    Object.defineProperty(getWindowForTest(), "desktopBridge", {
+      configurable: true,
+      value: { getWsUrl: () => "ws://127.0.0.1:3773/ws?token=desktop-secret" },
+    });
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ revoked: true }), {
         status: 200,
@@ -749,10 +764,13 @@ describe("wsNativeApi", () => {
     await expect(api.server.logoutAuthSession()).resolves.toEqual({ revoked: true });
 
     expect(fetchMock).toHaveBeenCalledWith(
-      "/api/auth/logout",
+      expect.stringContaining("http://127.0.0.1:3773/api/auth/logout"),
       expect.objectContaining({
         method: "POST",
-        credentials: "same-origin",
+        credentials: "include",
+        headers: expect.objectContaining({
+          [SYNARA_CSRF_HEADER_NAME]: SYNARA_CSRF_HEADER_VALUE,
+        }),
       }),
     );
     expect(disposeMock).toHaveBeenCalledTimes(1);
@@ -988,7 +1006,13 @@ describe("wsNativeApi", () => {
     expect(result).toEqual({ text: "hello" });
     expect(fetchMock).toHaveBeenCalledWith(
       expect.stringContaining("/api/voice/transcribe?"),
-      expect.objectContaining({ method: "POST", body: Uint8Array.from([1, 2, 3]) }),
+      expect.objectContaining({
+        method: "POST",
+        body: Uint8Array.from([1, 2, 3]),
+        headers: expect.objectContaining({
+          [SYNARA_CSRF_HEADER_NAME]: SYNARA_CSRF_HEADER_VALUE,
+        }),
+      }),
     );
     expect(requestMock).not.toHaveBeenCalledWith(
       WS_METHODS.serverTranscribeVoice,

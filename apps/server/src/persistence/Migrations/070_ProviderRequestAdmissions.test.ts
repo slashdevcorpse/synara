@@ -20,6 +20,16 @@ layer("070_ProviderRequestAdmissions", (it) => {
       const sql = yield* SqlClient.SqlClient;
       const admissions = yield* ProviderRequestAdmissionRepository;
       const threadId = ThreadId.makeUnsafe("thread-upgrade-admissions");
+      const parentThreadId = ThreadId.makeUnsafe("thread-upgrade-parent");
+      const childThreadId = ThreadId.makeUnsafe(
+        "subagent:thread-upgrade-parent:child-provider-thread",
+      );
+      const wildcardParentThreadId = ThreadId.makeUnsafe("Case_Parent%");
+      const caseCollisionParentThreadId = ThreadId.makeUnsafe("case_parent%");
+      const wildcardChildThreadId = ThreadId.makeUnsafe("subagent:Case_Parent%:wildcard-child");
+      const shortNestedParentThreadId = ThreadId.makeUnsafe("nested");
+      const nestedParentThreadId = ThreadId.makeUnsafe("nested:parent");
+      const nestedChildThreadId = ThreadId.makeUnsafe("subagent:nested:parent:nested-child");
       yield* runMigrations({ toMigrationInclusive: 69 });
 
       yield* sql`
@@ -59,6 +69,58 @@ layer("070_ProviderRequestAdmissions", (it) => {
             ${row[0]}, ${row[1]}, ${threadId}, 'generation-upgrade', ${row[2]},
             ${row[2] === "responding" ? "2026-07-20T12:00:03.000Z" : null},
             '2026-07-20T12:00:02.000Z'
+          )
+        `;
+      }
+
+      for (const [syntheticThreadId, createdAt] of [
+        [parentThreadId, "2026-07-20T13:00:00.000Z"],
+        [childThreadId, "2026-07-20T13:00:00.000Z"],
+        [wildcardParentThreadId, "2026-07-20T13:00:00.000Z"],
+        [caseCollisionParentThreadId, "2026-07-20T12:59:00.000Z"],
+        [wildcardChildThreadId, "2026-07-20T13:00:00.000Z"],
+        [shortNestedParentThreadId, "2026-07-20T12:58:00.000Z"],
+        [nestedParentThreadId, "2026-07-20T13:00:00.000Z"],
+        [nestedChildThreadId, "2026-07-20T13:00:00.000Z"],
+      ] as const) {
+        yield* sql`
+          INSERT INTO projection_threads (
+            thread_id, project_id, title, model_selection_json, runtime_mode,
+            interaction_mode, env_mode, created_at, updated_at, deleted_at
+          ) VALUES (
+            ${syntheticThreadId}, 'project-upgrade-parent', ${syntheticThreadId},
+            '{"provider":"opencode","model":"openai/gpt-5.4"}',
+            'approval-required', 'default', 'local',
+            ${createdAt}, ${createdAt}, NULL
+          )
+        `;
+      }
+      for (const sessionThreadId of [
+        parentThreadId,
+        wildcardParentThreadId,
+        nestedParentThreadId,
+      ]) {
+        yield* sql`
+        INSERT INTO projection_thread_sessions (
+          thread_id, status, provider_name, updated_at, runtime_mode
+        ) VALUES (
+          ${sessionThreadId}, 'running', 'opencode',
+          '2026-07-20T13:00:00.000Z', 'approval-required'
+        )
+        `;
+      }
+      for (const [requestId, syntheticChildThreadId] of [
+        ["request-synthetic-child", childThreadId],
+        ["request-wildcard-child", wildcardChildThreadId],
+        ["request-nested-child", nestedChildThreadId],
+      ] as const) {
+        yield* sql`
+          INSERT INTO projection_pending_interactions (
+            interaction_kind, request_id, thread_id, lifecycle_generation,
+            status, response_requested_at, created_at
+          ) VALUES (
+            'approval', ${requestId}, ${syntheticChildThreadId}, 'generation-parent',
+            'pending', NULL, '2026-07-20T13:00:01.000Z'
           )
         `;
       }
@@ -122,6 +184,33 @@ layer("070_ProviderRequestAdmissions", (it) => {
         freshResults.map((result) => result._tag),
         ["Accepted", "Accepted", "Accepted", "Accepted", "Accepted", "Accepted", "Overflow"],
       );
+
+      const rows = yield* sql<{
+        readonly providerSessionThreadId: string;
+        readonly provider: string;
+      }>`
+        SELECT
+          provider_session_thread_id AS "providerSessionThreadId",
+          provider
+        FROM provider_request_admissions
+        WHERE thread_id IN (${childThreadId}, ${wildcardChildThreadId}, ${nestedChildThreadId})
+        ORDER BY thread_id ASC
+      `;
+      assert.deepStrictEqual(rows, [
+        { providerSessionThreadId: wildcardParentThreadId, provider: "opencode" },
+        { providerSessionThreadId: nestedParentThreadId, provider: "opencode" },
+        { providerSessionThreadId: parentThreadId, provider: "opencode" },
+      ]);
+
+      const terminalRecords = yield* admissions.beginTerminalTeardown({
+        providerSessionThreadId: parentThreadId,
+        lifecycleGeneration: "generation-parent",
+        eventId: EventId.makeUnsafe("event-parent-exited"),
+        occurredAt: "2026-07-20T13:01:00.000Z",
+      });
+      assert.deepStrictEqual(terminalRecords.map((record) => record.threadId).sort(), [
+        childThreadId,
+      ]);
     }),
   );
 });

@@ -120,7 +120,12 @@ export function shouldRejectAuthMutationOrigin(input: {
 
 /** Remote-reachable sockets always require a real authenticated session. */
 export function requiresWebSocketAuthentication(
-  config: Pick<ServerConfigShape, "authToken" | "host" | "publicUrl">,
+  config: Pick<ServerConfigShape, "authToken" | "host" | "publicUrl"> &
+    Partial<Pick<ServerConfigShape, "allowUnauthenticatedLoopback">>,
 ): boolean {
-  return Boolean(config.authToken) || Boolean(config.publicUrl) || !isLoopbackHost(config.host);
+  const unauthenticatedPrivateLoopbackAllowed =
+    isLoopbackHost(config.host) &&
+    !config.publicUrl &&
+    config.allowUnauthenticatedLoopback !== false;
+  return Boolean(config.authToken) || !unauthenticatedPrivateLoopbackAllowed;
 }

@@ -46,6 +46,7 @@ import {
 import {
   BROWSER_SESSION_PARTITION,
   createBrowserPopupNavigationPolicy,
+  enforceBrowserNavigationPolicy,
   enforceBrowserPopupNavigationPolicy,
   isAllowedBrowserNavigationUrl,
   type BrowserPopupNavigationPolicy,
@@ -1573,6 +1574,19 @@ export class DesktopBrowserManager {
     // Belt-and-suspenders alongside the session-level UA: also covers an adopted renderer
     // <webview> for any navigation after it attaches.
     webContents.setUserAgent(this.resolveSpoofedUserAgent());
+
+    const willNavigate = (event: Electron.Event<Electron.WebContentsWillNavigateEventParams>) => {
+      enforceBrowserNavigationPolicy(event);
+    };
+    const willRedirect = (event: Electron.Event<Electron.WebContentsWillRedirectEventParams>) => {
+      enforceBrowserNavigationPolicy(event);
+    };
+    webContents.on("will-navigate", willNavigate);
+    webContents.on("will-redirect", willRedirect);
+    runtime.listenerDisposers.push(() => {
+      webContents.removeListener("will-navigate", willNavigate);
+      webContents.removeListener("will-redirect", willRedirect);
+    });
 
     webContents.setWindowOpenHandler((details) => {
       const { url } = details;

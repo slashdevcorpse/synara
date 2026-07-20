@@ -576,17 +576,18 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
           runtimeMode: context.session.runtimeMode,
           plan: input.interactionMode === "plan",
         });
-        const prepared = prepareProcess(executable, args, { cwd, env });
         const child = yield* Effect.try({
-          try: () =>
-            spawnProcess(prepared.command, prepared.args, {
+          try: () => {
+            const prepared = prepareProcess(executable, args, { cwd, env });
+            return spawnProcess(prepared.command, prepared.args, {
               cwd,
               env,
               stdio: ["pipe", "pipe", "pipe"],
               shell: prepared.shell,
               windowsHide: prepared.windowsHide,
               windowsVerbatimArguments: prepared.windowsVerbatimArguments,
-            }),
+            });
+          },
           catch: (cause) =>
             new ProviderAdapterProcessError({
               provider: PROVIDER,

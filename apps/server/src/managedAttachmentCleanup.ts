@@ -11,6 +11,7 @@ import {
   ManagedAttachmentRepository,
   type ManagedAttachmentCleanupJob,
 } from "./persistence/Services/ManagedAttachments";
+import { resolveRealPathWithinRoot } from "./workspace/realPathContainment";
 
 export const MANAGED_ATTACHMENT_WRITING_LEASE_MS = 10 * 60 * 1_000;
 export const MANAGED_ATTACHMENT_CLEANUP_BATCH_SIZE = 64;
@@ -32,6 +33,105 @@ function isMissingFileError(cause: unknown): boolean {
 }
 
 const MANAGED_ATTACHMENT_ID_PATTERN = /^att_v2_[0-9a-f]{32}$/u;
+const MANAGED_ATTACHMENT_STAGING_PART_PATTERN = /^att_v2_[0-9a-f]{32}\.part$/u;
+const MANAGED_ATTACHMENT_STAGING_SWEEP_SCAN_LIMIT = MANAGED_ATTACHMENT_CLEANUP_BATCH_SIZE * 4;
+
+export interface ManagedAttachmentStagingSweepResult {
+  readonly inspected: number;
+  readonly removed: number;
+  readonly failures: number;
+}
+
+/**
+ * Remove crash-left upload parts even when the process died before a database
+ * reservation was persisted. Work is intentionally bounded for startup.
+ */
+export async function sweepOrphanManagedAttachmentParts(input: {
+  readonly attachmentsDir: string;
+  readonly nowMs?: number;
+  readonly maxRemovals?: number;
+  readonly scanLimit?: number;
+  /** Test seam for a replacement race between the two identity checks. */
+  readonly beforeFinalStat?: (candidatePath: string) => Promise<void>;
+}): Promise<ManagedAttachmentStagingSweepResult> {
+  const emptyResult = { inspected: 0, removed: 0, failures: 0 } as const;
+  const stagingDir = path.join(input.attachmentsDir, ".staging");
+  let stagingStat: Awaited<ReturnType<typeof fs.lstat>>;
+  try {
+    stagingStat = await fs.lstat(stagingDir);
+  } catch (cause) {
+    if (isMissingFileError(cause)) return emptyResult;
+    throw cause;
+  }
+  if (!stagingStat.isDirectory() || stagingStat.isSymbolicLink()) {
+    return { inspected: 0, removed: 0, failures: 1 };
+  }
+
+  let realStagingDir: string | null;
+  try {
+    realStagingDir = await resolveRealPathWithinRoot(input.attachmentsDir, stagingDir);
+  } catch (cause) {
+    if (isMissingFileError(cause)) return emptyResult;
+    throw cause;
+  }
+  if (realStagingDir === null) {
+    return { inspected: 0, removed: 0, failures: 1 };
+  }
+
+  const nowMs = input.nowMs ?? Date.now();
+  const staleBeforeMs = nowMs - MANAGED_ATTACHMENT_WRITING_LEASE_MS;
+  const maxRemovals = Math.max(
+    0,
+    Math.floor(input.maxRemovals ?? MANAGED_ATTACHMENT_CLEANUP_BATCH_SIZE),
+  );
+  const scanLimit = Math.max(
+    0,
+    Math.floor(input.scanLimit ?? MANAGED_ATTACHMENT_STAGING_SWEEP_SCAN_LIMIT),
+  );
+  let inspected = 0;
+  let removed = 0;
+  let failures = 0;
+  const directory = await fs.opendir(realStagingDir);
+
+  for await (const entry of directory) {
+    if (inspected >= scanLimit || removed >= maxRemovals) break;
+    inspected += 1;
+    if (!MANAGED_ATTACHMENT_STAGING_PART_PATTERN.test(entry.name)) continue;
+
+    const candidatePath = path.join(realStagingDir, entry.name);
+    try {
+      const firstStat = await fs.lstat(candidatePath);
+      if (!firstStat.isFile() || firstStat.isSymbolicLink() || firstStat.mtimeMs >= staleBeforeMs) {
+        continue;
+      }
+      const realCandidate = await resolveRealPathWithinRoot(realStagingDir, candidatePath);
+      if (realCandidate === null) {
+        failures += 1;
+        continue;
+      }
+
+      // Re-read immediately before unlink so a fresh writer that replaced or
+      // touched the part after enumeration remains protected by the lease.
+      await input.beforeFinalStat?.(realCandidate);
+      const finalStat = await fs.lstat(realCandidate);
+      if (
+        !finalStat.isFile() ||
+        finalStat.isSymbolicLink() ||
+        finalStat.dev !== firstStat.dev ||
+        finalStat.ino !== firstStat.ino ||
+        finalStat.mtimeMs >= staleBeforeMs
+      ) {
+        continue;
+      }
+      await fs.unlink(realCandidate);
+      removed += 1;
+    } catch (cause) {
+      if (!isMissingFileError(cause)) failures += 1;
+    }
+  }
+
+  return { inspected, removed, failures };
+}
 
 const unlinkIfPresent = (filePath: string) =>
   Effect.tryPromise({
@@ -161,6 +261,23 @@ export const ManagedAttachmentCleanupLive = Layer.effect(
       runManagedAttachmentCleanupBatch.pipe(
         Effect.provideService(ManagedAttachmentRepository, repository),
         Effect.provideService(ServerConfig, config),
+      ),
+    );
+    yield* Effect.tryPromise({
+      try: () => sweepOrphanManagedAttachmentParts({ attachmentsDir: config.attachmentsDir }),
+      catch: (cause) => cause,
+    }).pipe(
+      Effect.tap((result) =>
+        result.failures > 0
+          ? Effect.logWarning("managed attachment startup staging sweep skipped unsafe entries", {
+              inspected: result.inspected,
+              removed: result.removed,
+              failures: result.failures,
+            })
+          : Effect.void,
+      ),
+      Effect.catch((cause) =>
+        Effect.logWarning("managed attachment startup staging sweep failed", { cause }),
       ),
     );
     yield* runBatch.pipe(

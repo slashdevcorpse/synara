@@ -211,6 +211,10 @@
     "./migrationRecovery": {
       "types": "./src/migrationRecovery.ts",
       "import": "./src/migrationRecovery.ts"
+    },
+    "./authSecurity": {
+      "types": "./src/authSecurity.ts",
+      "import": "./src/authSecurity.ts"
     }
   },
   "scripts": {

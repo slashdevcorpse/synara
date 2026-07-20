@@ -13,14 +13,15 @@ import {
 import { resolveCatalogDependencies } from "../../../scripts/lib/resolve-catalog.ts";
 import rootPackageJson from "../../../package.json" with { type: "json" };
 import serverPackageJson from "../package.json" with { type: "json" };
+import launcherConfig from "../native/windows-job-launcher/launcher.config.json" with { type: "json" };
 
 class CliError extends Data.TaggedError("CliError")<{
   readonly message: string;
   readonly cause?: unknown;
 }> {}
 
-const WINDOWS_JOB_LAUNCHER_ARCHITECTURES = ["x64", "arm64"] as const;
-const WINDOWS_JOB_LAUNCHER_EXECUTABLE = "synara-windows-job-launcher.exe";
+const WINDOWS_JOB_LAUNCHER_ARCHITECTURES = launcherConfig.architectures;
+const WINDOWS_JOB_LAUNCHER_EXECUTABLE = launcherConfig.executableName;
 
 // Some desktop builds do not expose workspace metadata in the root package.json.
 // Publish prep only needs the catalog map when it exists.

@@ -285,39 +285,44 @@ int wmain(int argc, wchar_t* argv[]) {
 
   STARTUPINFOEXW startup{};
   startup.StartupInfo.cb = sizeof(startup);
-  startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+  startup.StartupInfo.dwFlags = STARTF_USESHOWWINDOW;
   startup.StartupInfo.wShowWindow = SW_HIDE;
-  startup.StartupInfo.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
-  startup.StartupInfo.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
-  startup.StartupInfo.hStdError = GetStdHandle(STD_ERROR_HANDLE);
 
   std::array<HANDLE, 3> standard_handles{
-      startup.StartupInfo.hStdInput,
-      startup.StartupInfo.hStdOutput,
-      startup.StartupInfo.hStdError,
+      GetStdHandle(STD_INPUT_HANDLE),
+      GetStdHandle(STD_OUTPUT_HANDLE),
+      GetStdHandle(STD_ERROR_HANDLE),
   };
   std::vector<HANDLE> inherited_handles;
   inherited_handles.reserve(standard_handles.size());
-  for (const HANDLE handle : standard_handles) {
-    if (!IsUsableStandardHandle(handle)) {
-      continue;
-    }
-    bool duplicate = false;
-    for (const HANDLE existing : inherited_handles) {
-      if (existing == handle) {
-        duplicate = true;
-        break;
+  const bool has_complete_standard_handle_set =
+      IsUsableStandardHandle(standard_handles[0]) &&
+      IsUsableStandardHandle(standard_handles[1]) &&
+      IsUsableStandardHandle(standard_handles[2]);
+  if (has_complete_standard_handle_set) {
+    startup.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
+    startup.StartupInfo.hStdInput = standard_handles[0];
+    startup.StartupInfo.hStdOutput = standard_handles[1];
+    startup.StartupInfo.hStdError = standard_handles[2];
+
+    for (const HANDLE handle : standard_handles) {
+      bool duplicate = false;
+      for (const HANDLE existing : inherited_handles) {
+        if (existing == handle) {
+          duplicate = true;
+          break;
+        }
       }
+      if (duplicate) {
+        continue;
+      }
+      if (!SetHandleInformation(handle, HANDLE_FLAG_INHERIT,
+                                HANDLE_FLAG_INHERIT)) {
+        ExitWithFailure(kHandleExitCode, L"mark-stdio-inheritable",
+                        GetLastError());
+      }
+      inherited_handles.push_back(handle);
     }
-    if (duplicate) {
-      continue;
-    }
-    if (!SetHandleInformation(handle, HANDLE_FLAG_INHERIT,
-                              HANDLE_FLAG_INHERIT)) {
-      ExitWithFailure(kHandleExitCode, L"mark-stdio-inheritable",
-                      GetLastError());
-    }
-    inherited_handles.push_back(handle);
   }
 
   AttributeList attributes;

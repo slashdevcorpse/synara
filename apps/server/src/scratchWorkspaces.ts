@@ -7,7 +7,7 @@
 // Exports: ensureIsolatedScratchWorkspace
 
 import { createHash } from "node:crypto";
-import { mkdirSync, utimesSync } from "node:fs";
+import { mkdirSync, type Stats, utimesSync } from "node:fs";
 import fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -58,13 +58,92 @@ function isMissingPathError(cause: unknown): boolean {
   );
 }
 
-export async function removeIsolatedScratchWorkspace(threadId: ThreadId): Promise<void> {
-  const workspaceRoot = resolveScratchWorkspacesRoot();
-  const workspaceDir = resolveIsolatedScratchWorkspace(threadId);
-  if (!isPathInside(workspaceDir, workspaceRoot)) {
+function isSamePathIdentity(left: Stats, right: Stats): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+async function resolveVerifiedScratchRoot(rootDir: string): Promise<{
+  readonly realRoot: string;
+  readonly identity: Stats;
+} | null> {
+  const resolvedRoot = path.resolve(rootDir);
+  let identity: Stats;
+  try {
+    identity = await fs.lstat(resolvedRoot);
+  } catch (cause) {
+    if (isMissingPathError(cause)) return null;
+    throw cause;
+  }
+  if (identity.isSymbolicLink() || !identity.isDirectory()) {
+    throw new Error("Scratch workspace root is not a managed directory.");
+  }
+
+  const realRoot = await fs.realpath(resolvedRoot);
+  const verifiedIdentity = await fs.lstat(resolvedRoot);
+  if (
+    verifiedIdentity.isSymbolicLink() ||
+    !verifiedIdentity.isDirectory() ||
+    !isSamePathIdentity(identity, verifiedIdentity)
+  ) {
+    throw new Error("Scratch workspace root changed during verification.");
+  }
+  return { realRoot, identity };
+}
+
+export async function removeIsolatedScratchWorkspace(
+  threadId: ThreadId,
+  options: { readonly rootDir?: string } = {},
+): Promise<void> {
+  const workspaceRoot = options.rootDir ?? resolveScratchWorkspacesRoot();
+  const verifiedRoot = await resolveVerifiedScratchRoot(workspaceRoot);
+  if (!verifiedRoot) return;
+
+  const workspaceDir = path.join(verifiedRoot.realRoot, scratchWorkspaceSegment(threadId));
+  if (!isPathInside(workspaceDir, verifiedRoot.realRoot)) {
     throw new Error("Scratch workspace deletion target escaped its managed root.");
   }
-  await fs.rm(workspaceDir, { recursive: true, force: true });
+  const workspaceIdentity = await fs.lstat(workspaceDir).catch((cause) => {
+    if (isMissingPathError(cause)) return null;
+    throw cause;
+  });
+  if (!workspaceIdentity) return;
+  if (workspaceIdentity.isSymbolicLink() || !workspaceIdentity.isDirectory()) {
+    throw new Error("Scratch workspace deletion target is not a managed directory.");
+  }
+  const realWorkspace = await fs.realpath(workspaceDir);
+  if (!isPathInside(realWorkspace, verifiedRoot.realRoot)) {
+    throw new Error("Scratch workspace deletion target escaped its managed root.");
+  }
+
+  const finalRootIdentity = await fs.lstat(path.resolve(workspaceRoot));
+  if (
+    finalRootIdentity.isSymbolicLink() ||
+    !finalRootIdentity.isDirectory() ||
+    !isSamePathIdentity(verifiedRoot.identity, finalRootIdentity)
+  ) {
+    throw new Error("Scratch workspace root changed before deletion.");
+  }
+
+  const finalWorkspaceIdentity = await fs.lstat(workspaceDir).catch((cause) => {
+    if (isMissingPathError(cause)) return null;
+    throw cause;
+  });
+  if (!finalWorkspaceIdentity) return;
+  if (
+    finalWorkspaceIdentity.isSymbolicLink() ||
+    !finalWorkspaceIdentity.isDirectory() ||
+    !isSamePathIdentity(workspaceIdentity, finalWorkspaceIdentity)
+  ) {
+    throw new Error("Scratch workspace deletion target changed before deletion.");
+  }
+  const finalRealWorkspace = await fs.realpath(workspaceDir);
+  if (
+    path.resolve(finalRealWorkspace) !== path.resolve(realWorkspace) ||
+    !isPathInside(finalRealWorkspace, verifiedRoot.realRoot)
+  ) {
+    throw new Error("Scratch workspace deletion target changed before deletion.");
+  }
+  await fs.rm(realWorkspace, { recursive: true, force: true });
 }
 
 export interface ScratchWorkspaceSweepResult {
@@ -79,20 +158,24 @@ export async function sweepStaleScratchWorkspaces(input: {
   readonly rootDir?: string;
   readonly nowMs?: number;
   readonly maxIdleMs?: number;
+  /** Test seam for a replacement race immediately before recursive deletion. */
+  readonly beforeFinalDelete?: (candidatePath: string) => Promise<void>;
 }): Promise<ScratchWorkspaceSweepResult> {
   const rootDir = input.rootDir ?? resolveScratchWorkspacesRoot();
   const nowMs = input.nowMs ?? Date.now();
   const maxIdleMs = input.maxIdleMs ?? SCRATCH_WORKSPACE_MAX_IDLE_MS;
   const result = { inspected: 0, removed: 0, preservedActive: 0, preservedUnsafe: 0 };
+  const verifiedRoot = await resolveVerifiedScratchRoot(rootDir);
+  if (!verifiedRoot) return result;
   let entries;
   try {
-    entries = await fs.readdir(rootDir, { withFileTypes: true });
+    entries = await fs.readdir(verifiedRoot.realRoot, { withFileTypes: true });
   } catch (cause) {
     if (isMissingPathError(cause)) return result;
     throw cause;
   }
 
-  const realRoot = await fs.realpath(rootDir);
+  const realRoot = verifiedRoot.realRoot;
   const activeSegments = new Set(
     Array.from(input.activeThreadIds, (threadId) =>
       scratchWorkspaceSegment(ThreadId.makeUnsafe(threadId)),
@@ -113,7 +196,7 @@ export async function sweepStaleScratchWorkspaces(input: {
       continue;
     }
 
-    const candidate = path.join(rootDir, entry.name);
+    const candidate = path.join(realRoot, entry.name);
     const stat = await fs.lstat(candidate).catch(() => null);
     if (!stat || nowMs - stat.mtimeMs < maxIdleMs) continue;
     const realCandidate = await fs.realpath(candidate).catch(() => null);
@@ -121,7 +204,40 @@ export async function sweepStaleScratchWorkspaces(input: {
       result.preservedUnsafe += 1;
       continue;
     }
-    await fs.rm(candidate, { recursive: true, force: true });
+    await input.beforeFinalDelete?.(candidate);
+
+    const finalRootIdentity = await fs.lstat(path.resolve(rootDir)).catch(() => null);
+    if (
+      !finalRootIdentity ||
+      finalRootIdentity.isSymbolicLink() ||
+      !finalRootIdentity.isDirectory() ||
+      !isSamePathIdentity(verifiedRoot.identity, finalRootIdentity)
+    ) {
+      result.preservedUnsafe += 1;
+      break;
+    }
+
+    const finalCandidateIdentity = await fs.lstat(candidate).catch(() => null);
+    if (
+      !finalCandidateIdentity ||
+      finalCandidateIdentity.isSymbolicLink() ||
+      !finalCandidateIdentity.isDirectory() ||
+      !isSamePathIdentity(stat, finalCandidateIdentity)
+    ) {
+      result.preservedUnsafe += 1;
+      continue;
+    }
+    const finalRealCandidate = await fs.realpath(candidate).catch(() => null);
+    if (
+      !finalRealCandidate ||
+      path.resolve(finalRealCandidate) !== path.resolve(realCandidate) ||
+      !isPathInside(finalRealCandidate, realRoot)
+    ) {
+      result.preservedUnsafe += 1;
+      continue;
+    }
+
+    await fs.rm(realCandidate, { recursive: true, force: true });
     result.removed += 1;
   }
   return result;

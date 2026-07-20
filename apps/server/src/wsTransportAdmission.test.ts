@@ -163,6 +163,12 @@ describe("WebSocket transport admission", () => {
     ).toBe("standard");
     expect(classifyWsMessage(terminalAckFrame("ack-2", { extra: true }), false)).toBe("standard");
     expect(classifyWsMessage(terminalAckFrame("ack-3", { bytes: 0 }), false)).toBe("standard");
+    expect(
+      classifyWsMessage(terminalAckFrame("ack-4", { terminalId: "t".repeat(128) }), false),
+    ).toBe("terminal-ack");
+    expect(
+      classifyWsMessage(terminalAckFrame("ack-5", { terminalId: "t".repeat(129) }), false),
+    ).toBe("standard");
     expect(classifyWsMessage(`${valid}${" ".repeat(4 * 1024)}`, false)).toBe("standard");
   });
 

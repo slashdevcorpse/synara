@@ -6,6 +6,8 @@ import { existsSync, statSync } from "node:fs";
 import * as Path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import launcherConfig from "../../native/windows-job-launcher/launcher.config.json" with { type: "json" };
+
 import {
   prepareResolvedWindowsSafeProcess,
   prepareWindowsSafeProcess,
@@ -14,8 +16,8 @@ import {
 } from "@synara/shared/windowsProcess";
 
 export const WINDOWS_JOB_LAUNCHER_ENV = "SYNARA_WINDOWS_JOB_LAUNCHER_PATH";
-export const WINDOWS_JOB_LAUNCHER_EXECUTABLE = "synara-windows-job-launcher.exe";
-export const WINDOWS_JOB_LAUNCHER_PROTOCOL_VERSION = "1";
+export const WINDOWS_JOB_LAUNCHER_EXECUTABLE = launcherConfig.executableName;
+export const WINDOWS_JOB_LAUNCHER_PROTOCOL_VERSION = launcherConfig.protocolVersion;
 
 export interface WindowsProviderProcessInput extends WindowsSafeProcessInput {
   readonly arch?: NodeJS.Architecture | undefined;
@@ -98,8 +100,18 @@ export function resolveWindowsJobLauncherPath(input: WindowsProviderProcessInput
 }
 
 function resolveAbsolutePreparedCommand(command: string, cwd: string | undefined): string {
-  if (Path.win32.isAbsolute(command)) {
+  if (/^[A-Za-z]:[\\/]/u.test(command) || command.startsWith("\\\\")) {
     return Path.win32.normalize(command);
+  }
+  if (/^[\\/](?![\\/])/u.test(command)) {
+    const baseDirectory = cwd ?? process.cwd();
+    const baseRoot = Path.win32.parse(baseDirectory).root;
+    if (!/^[A-Za-z]:[\\/]$/u.test(baseRoot) && !baseRoot.startsWith("\\\\")) {
+      throw new Error(
+        `Windows provider target '${command}' is drive-rooted but no absolute Windows cwd was available to qualify it.`,
+      );
+    }
+    return Path.win32.resolve(baseDirectory, command);
   }
   if (/[\\/]/.test(command)) {
     return Path.win32.resolve(cwd ?? process.cwd(), command);

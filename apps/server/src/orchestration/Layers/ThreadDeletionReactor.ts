@@ -99,6 +99,9 @@ const make = Effect.gen(function* () {
   const stopProviderSession = Effect.fn(function* (
     threadId: ThreadDeletedEvent["payload"]["threadId"],
   ) {
+    if (providerService.retireThreadLifecycle !== undefined) {
+      yield* providerService.retireThreadLifecycle({ threadId });
+    }
     return yield* providerService.stopSession({ threadId }).pipe(
       Effect.as(true),
       Effect.catchCause((cause) => {

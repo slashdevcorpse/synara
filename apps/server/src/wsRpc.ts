@@ -1552,7 +1552,8 @@ function trustedWebSocketRequestUrl(
 }
 
 export function authenticateRpcWebSocketUpgrade(input: {
-  readonly config: Pick<ServerConfigShape, "authToken" | "host" | "publicUrl">;
+  readonly config: Pick<ServerConfigShape, "authToken" | "host" | "publicUrl"> &
+    Partial<Pick<ServerConfigShape, "allowUnauthenticatedLoopback">>;
   readonly legacyToken: string | null;
   readonly request: AuthRequest;
   readonly serverAuth: Pick<ServerAuthShape, "authenticateWebSocketUpgrade">;
@@ -1561,6 +1562,7 @@ export function authenticateRpcWebSocketUpgrade(input: {
     !requiresWebSocketAuthentication(input.config) ||
     (isLoopbackHost(input.config.host) &&
       !input.config.publicUrl &&
+      input.config.allowUnauthenticatedLoopback !== false &&
       input.legacyToken === input.config.authToken)
   ) {
     return Effect.succeed(null);
@@ -1671,12 +1673,19 @@ function makeWebsocketBootstrapRouteLayer<R>(
         Effect.gen(function* () {
           const request = yield* HttpServerRequest.HttpServerRequest;
           const config = yield* ServerConfig;
+          const serverAuth = yield* ServerAuth;
           const url = trustedWebSocketRequestUrl(request, config);
           if (!url) {
             return HttpServerResponse.text("Forbidden", { status: 403 });
           }
+          yield* authenticateRpcWebSocketUpgrade({
+            config,
+            legacyToken: url.searchParams.get("token"),
+            request: makeEffectAuthRequest(request),
+            serverAuth,
+          });
           return yield* bootstrapWebSocketHttpEffect;
-        }),
+        }).pipe(Effect.catchTag("AuthError", (error) => Effect.succeed(authErrorResponse(error)))),
       );
     }),
   );

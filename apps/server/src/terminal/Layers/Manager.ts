@@ -1594,13 +1594,18 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
   private async disposeInternal(options: { keepEscalationTimers: boolean }): Promise<number> {
     this.stopSubprocessPolling();
     const sessions = [...this.sessions.values()];
-    this.sessions.clear();
     const processStops: Promise<void>[] = [];
+    // Drain every session while all event clocks remain addressable. A later
+    // stop can enforce inactive-session retention and evict a different entry.
     for (const session of sessions) {
-      // Flush any remaining batched output before tearing down.
       this.flushOutputBuffer(session);
+    }
+    for (const session of sessions) {
+      // stopProcess synchronously detaches PTY callbacks before returning its
+      // asynchronous escalation promise, so no output can race the map clear.
       processStops.push(this.stopProcess(session));
     }
+    this.sessions.clear();
     for (const timer of this.persistTimers.values()) {
       clearTimeout(timer);
     }
@@ -1777,7 +1782,6 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
       session.managedAgentState = null;
       session.managedAgentObserved = false;
       session.updatedAt = new Date().toISOString();
-      this.evictInactiveSessionsIfNeeded();
       this.updateSubprocessPollingState();
       const message = describeErrorMessage(error, "Terminal start failed");
       this.emitEvent({
@@ -1788,6 +1792,7 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
         generation: this.generation,
         message,
       });
+      this.evictInactiveSessionsIfNeeded();
       this.logger.error("failed to start terminal", {
         threadId: session.threadId,
         terminalId: session.terminalId,
@@ -2253,7 +2258,7 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
 
   private evictInactiveSessionsIfNeeded(): void {
     const inactiveSessions = [...this.sessions.values()].filter(
-      (session) => session.status !== "running",
+      (session) => session.status === "exited" || session.status === "error",
     );
     if (inactiveSessions.length <= this.maxRetainedInactiveSessions) {
       return;

@@ -1,6 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { TERMINAL_ACK_MAX_BYTES, TerminalOutputAckQueue } from "./terminalOutputAckQueue";
+import {
+  TERMINAL_ACK_MAX_BYTES,
+  TERMINAL_ACK_RETRY_INITIAL_MS,
+  TerminalOutputAckQueue,
+} from "./terminalOutputAckQueue";
 
 function deferred(): { promise: Promise<void>; resolve: () => void; reject: () => void } {
   let resolve!: () => void;
@@ -28,15 +32,24 @@ describe("TerminalOutputAckQueue", () => {
     expect(send.mock.calls.map(([bytes]) => bytes)).toEqual([1, TERMINAL_ACK_MAX_BYTES, 7]);
   });
 
-  it("contains rejection and continues draining without an unhandled promise", async () => {
-    const first = deferred();
-    const send = vi.fn().mockReturnValueOnce(first.promise).mockResolvedValue(undefined);
-    const queue = new TerminalOutputAckQueue(send);
-    queue.enqueue(3);
-    queue.enqueue(4);
-    first.reject();
-    await expect(first.promise).rejects.toThrow("ack failed");
-    await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(2));
+  it("retains failed credit and retries it with bytes queued behind the failure", async () => {
+    vi.useFakeTimers();
+    try {
+      const first = deferred();
+      const send = vi.fn().mockReturnValueOnce(first.promise).mockResolvedValue(undefined);
+      const queue = new TerminalOutputAckQueue(send);
+      queue.enqueue(3);
+      queue.enqueue(4);
+      first.reject();
+      await expect(first.promise).rejects.toThrow("ack failed");
+
+      await vi.advanceTimersByTimeAsync(TERMINAL_ACK_RETRY_INITIAL_MS - 1);
+      expect(send).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(send.mock.calls.map(([bytes]) => bytes)).toEqual([3, 7]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("keeps terminals independent", () => {
@@ -60,6 +73,24 @@ describe("TerminalOutputAckQueue", () => {
     await Promise.resolve();
     queue.enqueue(3);
     expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it("cancels retained credit when disposal wins a failed ACK retry", async () => {
+    vi.useFakeTimers();
+    try {
+      const first = deferred();
+      const send = vi.fn().mockReturnValueOnce(first.promise).mockResolvedValue(undefined);
+      const queue = new TerminalOutputAckQueue(send);
+      queue.enqueue(5);
+      first.reject();
+      await expect(first.promise).rejects.toThrow("ack failed");
+
+      queue.dispose();
+      await vi.advanceTimersByTimeAsync(TERMINAL_ACK_RETRY_INITIAL_MS);
+      expect(send).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("waits for a stale in-flight ACK and sends no old credit across a rebase", async () => {

@@ -63,7 +63,9 @@ describe("server runtime pipeline shutdown", () => {
       "engine-stopped",
     ]);
   });
+});
 
+describe("server runtime pipeline startup", () => {
   it("completes managed worktree reconciliation before HTTP listen can begin", async () => {
     const order: string[] = [];
 

@@ -1161,9 +1161,25 @@ function failAuthoritativeRecovery(
   requestId: number,
   error: unknown,
 ): void {
-  if (entry.disposed || !entry.opened || entry.snapshotReconcileRequestId !== requestId) return;
+  if (entry.disposed || entry.snapshotReconcileRequestId !== requestId) return;
   entry.authoritativeRecoveryInFlight = false;
   entry.authoritativeRecoveryRetryRequested = false;
+  if (!entry.opened) {
+    entry.needsAuthoritativeRecovery = false;
+    entry.authoritativeRecoveryAttempt = 0;
+    if (entry.authoritativeRecoveryRetryTimer !== null) {
+      window.clearTimeout(entry.authoritativeRecoveryRetryTimer);
+      entry.authoritativeRecoveryRetryTimer = null;
+    }
+    entry.terminalOutputAckQueue.resumeAfterRebase();
+    if (entry.terminalEventRecovery.isRecovering()) {
+      entry.terminalEventRecovery.finish(
+        () => undefined,
+        () => undefined,
+      );
+    }
+    return;
+  }
   setRuntimeStatus(entry, "connecting");
   if (entry.authoritativeRecoveryAttempt === 0) {
     writeSystemMessage(
@@ -1199,14 +1215,16 @@ function runAuthoritativeRecoveryAttempt(entry: TerminalRuntimeEntry): void {
       waitForTerminalEventStreamReady(api),
       entry.terminalOutputAckQueue.quiesceForRebase(),
     ]);
-    if (entry.disposed || !entry.opened || entry.snapshotReconcileRequestId !== requestId) return;
+    if (entry.disposed || entry.snapshotReconcileRequestId !== requestId) return;
+    if (!entry.opened) throw new Error("Terminal recovery was interrupted");
     if (ready) entry.terminalEventRecovery.prepareGeneration(ready.generation);
 
     const recovery = await api.terminal.snapshot({
       threadId: entry.threadId,
       terminalId: entry.terminalId,
     });
-    if (entry.disposed || !entry.opened || entry.snapshotReconcileRequestId !== requestId) return;
+    if (entry.disposed || entry.snapshotReconcileRequestId !== requestId) return;
+    if (!entry.opened) throw new Error("Terminal recovery was interrupted");
     if (ready && recovery.generation !== ready.generation) {
       throw new Error("Terminal event stream changed while its recovery snapshot was captured");
     }
@@ -1216,9 +1234,18 @@ function runAuthoritativeRecoveryAttempt(entry: TerminalRuntimeEntry): void {
     ) {
       throw new Error("Terminal event generation changed during recovery");
     }
+    if (recovery.snapshot.status === "running") {
+      // The authoritative process state supersedes any exit callback that was
+      // queued before this recovery snapshot established the renewed session.
+      entry.hasHandledExit = false;
+    }
 
     const finishRecovery = () => {
       if (entry.disposed || entry.snapshotReconcileRequestId !== requestId) return;
+      if (!entry.opened) {
+        failAuthoritativeRecovery(entry, requestId, new Error("Terminal recovery was interrupted"));
+        return;
+      }
       entry.authoritativeRecoveryInFlight = false;
       if (entry.authoritativeRecoveryRetryRequested) {
         scheduleAuthoritativeRecoveryRetry(entry, 0);

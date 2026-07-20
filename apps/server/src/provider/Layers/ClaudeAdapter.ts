@@ -6,7 +6,6 @@
  *
  * @module ClaudeAdapterLive
  */
-import { spawn as spawnChildProcess } from "node:child_process";
 import {
   type AgentInfo,
   type CanUseTool,
@@ -137,7 +136,7 @@ import {
   teardownProviderProcessTree,
   type ProcessExitHandle,
 } from "../supervisedProcessTeardown.ts";
-import { prepareWindowsProviderProcess } from "../windowsProviderProcess.ts";
+import { spawnContainedClaudeSdkProcess } from "../containedClaudeSdkProcess.ts";
 
 const PROVIDER = "claudeAgent" as const;
 type ClaudeTextStreamKind = Extract<RuntimeContentStreamKind, "assistant_text" | "reasoning_text">;
@@ -374,19 +373,7 @@ interface ClaudeProcessOwner {
 }
 
 function spawnOwnedClaudeCodeProcess(options: ClaudeSpawnOptions): ClaudeOwnedProcess {
-  const prepared = prepareWindowsProviderProcess(options.command, options.args, {
-    cwd: options.cwd,
-    env: options.env,
-  });
-  return spawnChildProcess(prepared.command, prepared.args, {
-    ...(options.cwd ? { cwd: options.cwd } : {}),
-    env: options.env,
-    signal: options.signal,
-    shell: prepared.shell,
-    ...(prepared.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
-    stdio: ["pipe", "pipe", "inherit"],
-    windowsHide: true,
-  }) as unknown as ClaudeOwnedProcess;
+  return spawnContainedClaudeSdkProcess(options) as unknown as ClaudeOwnedProcess;
 }
 
 export interface ClaudeAdapterLiveOptions {

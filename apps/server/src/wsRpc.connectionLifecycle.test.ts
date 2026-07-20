@@ -46,6 +46,7 @@ interface RunningTestServer {
   readonly transportFinalizers: { count: number };
   readonly observedRpc: { decoderCalls: number; handlerCalls: number };
   readonly observedSlowRpc: { started: number; completed: number; finalized: number };
+  readonly listenerCounts: () => { readonly request: number; readonly upgrade: number };
   readonly close: () => Promise<void>;
 }
 
@@ -304,6 +305,10 @@ async function startTestServer(
     transportFinalizers,
     observedRpc,
     observedSlowRpc,
+    listenerCounts: () => ({
+      request: nodeServer?.listenerCount("request") ?? 0,
+      upgrade: nodeServer?.listenerCount("upgrade") ?? 0,
+    }),
     close: () => Effect.runPromise(Scope.close(scope, Exit.void)),
   };
 }
@@ -347,6 +352,15 @@ async function waitForObserved(predicate: () => boolean, timeoutMs = 2_000): Pro
 }
 
 describe("websocket RPC payload admission", () => {
+  it("removes request and upgrade listeners when the bounded server scope closes", async () => {
+    const server = await startTestServer();
+    expect(server.listenerCounts()).toEqual({ request: 1, upgrade: 1 });
+
+    await server.close();
+
+    expect(server.listenerCounts()).toEqual({ request: 0, upgrade: 0 });
+  });
+
   it("rejects feature sockets before auth or RPC decoding when negotiation is missing", async () => {
     const server = await startTestServer();
     try {

@@ -2,6 +2,8 @@ import * as Crypto from "node:crypto";
 
 import { WS_METHODS } from "@synara/contracts";
 
+import { normalizePeerAddress } from "./peerAddress";
+
 export const MAX_CONCURRENT_WS_CONNECTIONS = 50;
 export const MAX_WS_CONNECTIONS_PER_MINUTE_PER_PEER = 10;
 export const WS_MESSAGE_RATE_BURST = 100;
@@ -49,11 +51,7 @@ function normalizePositiveInteger(value: number | undefined, fallback: number): 
     : fallback;
 }
 
-export function normalizeWsPeerAddress(remoteAddress: string | null | undefined): string {
-  const normalized = remoteAddress?.trim().toLowerCase();
-  if (!normalized) return "unknown";
-  return normalized.startsWith("::ffff:") ? normalized.slice("::ffff:".length) : normalized;
-}
+export const normalizeWsPeerAddress = normalizePeerAddress;
 
 function readBoundedTextMessage(data: unknown, isBinary: unknown): string | null {
   if (isBinary !== false) return null;
@@ -147,7 +145,9 @@ export function classifyWsMessage(data: unknown, isBinary: unknown): WsMessageCl
     typeof payload.threadId !== "string" ||
     payload.threadId.trim().length === 0 ||
     (terminalId !== undefined &&
-      (typeof terminalId !== "string" || terminalId.trim().length === 0)) ||
+      (typeof terminalId !== "string" ||
+        terminalId.trim().length === 0 ||
+        terminalId.trim().length > 128)) ||
     typeof payload.bytes !== "number" ||
     !Number.isSafeInteger(payload.bytes) ||
     payload.bytes <= 0 ||

@@ -41,7 +41,19 @@ export default Effect.gen(function* () {
     )
     SELECT
       pending.thread_id,
-      COALESCE(thread.parent_thread_id, pending.thread_id),
+      COALESCE(
+        thread.parent_thread_id,
+        (
+          SELECT parent.thread_id
+          FROM projection_threads AS parent
+          WHERE substr(pending.thread_id, 1, length(parent.thread_id) + 10) =
+              ('subagent:' || parent.thread_id || ':') COLLATE BINARY
+            AND parent.deleted_at IS NULL
+          ORDER BY length(parent.thread_id) DESC, parent.created_at ASC, parent.thread_id ASC
+          LIMIT 1
+        ),
+        pending.thread_id
+      ),
       pending.interaction_kind,
       pending.request_id,
       COALESCE(pending.lifecycle_generation, ''),
@@ -98,7 +110,19 @@ export default Effect.gen(function* () {
     LEFT JOIN projection_threads AS thread
       ON thread.thread_id = pending.thread_id
     LEFT JOIN projection_thread_sessions AS session
-      ON session.thread_id = COALESCE(thread.parent_thread_id, pending.thread_id)
+      ON session.thread_id = COALESCE(
+        thread.parent_thread_id,
+        (
+          SELECT parent.thread_id
+          FROM projection_threads AS parent
+          WHERE substr(pending.thread_id, 1, length(parent.thread_id) + 10) =
+              ('subagent:' || parent.thread_id || ':') COLLATE BINARY
+            AND parent.deleted_at IS NULL
+          ORDER BY length(parent.thread_id) DESC, parent.created_at ASC, parent.thread_id ASC
+          LIMIT 1
+        ),
+        pending.thread_id
+      )
     WHERE pending.status IN ('pending', 'responding', 'retryable', 'uncertain')
     ON CONFLICT (thread_id, interaction_kind, request_id, lifecycle_generation)
     DO NOTHING

@@ -1865,10 +1865,18 @@ const make = Effect.gen(function* () {
     }
   });
 
-  const stopProviderRuntimeForRequestGuard = (threadId: ThreadId) =>
-    providerService.stopRuntimeSession
+  const stopProviderRuntimeForRequestGuard = Effect.fnUntraced(function* (threadId: ThreadId) {
+    const hasLiveRuntimeTasks = providerService.hasLiveRuntimeTasks
+      ? yield* providerService.hasLiveRuntimeTasks({ threadId })
+      : false;
+    if (hasLiveRuntimeTasks) {
+      return "preserved-live-tasks" as const;
+    }
+    yield* providerService.stopRuntimeSession
       ? providerService.stopRuntimeSession({ threadId })
       : providerService.stopSession({ threadId });
+    return "stopped" as const;
+  });
 
   const settleOverflowedProviderRequest = Effect.fnUntraced(function* (
     event: Extract<
@@ -1926,12 +1934,26 @@ const make = Effect.gen(function* () {
     }
 
     const responseFailed = responseExit !== null;
+    const runtimePreserved = stopExit.value === "preserved-live-tasks";
     yield* requestAdmissions.markOverflowSettled({
       ...identity,
-      failed: responseFailed,
+      failed: responseFailed || runtimePreserved,
       updatedAt: event.createdAt,
     });
     yield* requestAdmissions.pruneSettled(identity.threadId);
+    if (runtimePreserved) {
+      yield* Effect.logWarning("provider.request.admission.overflow_failed_live_tasks_preserved", {
+        threadId: identity.threadId,
+        providerSessionThreadId: event.threadId,
+        provider: event.provider,
+        requestId: identity.requestId,
+        interactionKind: identity.interactionKind,
+        lifecycleGeneration: event.lifecycleGeneration ?? "legacy",
+        limit: PROVIDER_REQUEST_LIMIT_PER_THREAD,
+        ...(responseExit !== null ? { responseFailure: Cause.pretty(responseExit.cause) } : {}),
+      });
+      return;
+    }
     yield* Effect.logWarning(
       responseFailed
         ? "provider.request.admission.overflow_decline_failed_session_stopped"
@@ -1974,13 +1996,18 @@ const make = Effect.gen(function* () {
           ),
         );
       }
-      yield* Effect.logError("provider.request.admission.missing_request_id_session_stopped", {
-        threadId,
-        providerSessionThreadId: event.threadId,
-        provider: event.provider,
-        interactionKind,
-        lifecycleGeneration: event.lifecycleGeneration ?? "legacy",
-      });
+      yield* Effect.logError(
+        stopExit.value === "preserved-live-tasks"
+          ? "provider.request.admission.missing_request_id_live_tasks_preserved"
+          : "provider.request.admission.missing_request_id_session_stopped",
+        {
+          threadId,
+          providerSessionThreadId: event.threadId,
+          provider: event.provider,
+          interactionKind,
+          lifecycleGeneration: event.lifecycleGeneration ?? "legacy",
+        },
+      );
       return null;
     }
 

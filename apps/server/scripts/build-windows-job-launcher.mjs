@@ -15,6 +15,8 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import launcherConfig from "../native/windows-job-launcher/launcher.config.json" with { type: "json" };
+
 const scriptPath = fileURLToPath(import.meta.url);
 const serverDirectory = resolve(dirname(scriptPath), "..");
 const projectPath = join(
@@ -23,9 +25,29 @@ const projectPath = join(
   "windows-job-launcher",
   "windows-job-launcher.vcxproj",
 );
-const executableName = "synara-windows-job-launcher.exe";
+const executableName = launcherConfig.executableName;
 
-export const supportedWindowsJobLauncherArchitectures = Object.freeze(["x64", "arm64"]);
+export const supportedWindowsJobLauncherArchitectures = Object.freeze([
+  ...launcherConfig.architectures,
+]);
+
+export function publishWindowsJobLauncherArtifact(
+  builtPath,
+  resolvedOutputPath,
+  { copyFile = copyFileSync, removeFile = rmSync, renameFile = renameSync } = {},
+) {
+  const pendingPath = `${resolvedOutputPath}.pending-${process.pid}`;
+  removeFile(pendingPath, { force: true });
+  try {
+    copyFile(builtPath, pendingPath);
+    // rename(2)/MoveFileEx replaces the destination as one filesystem operation.
+    // Do not unlink the last known-good launcher first: if replacement fails (for
+    // example because Windows still has the binary open), callers keep using it.
+    renameFile(pendingPath, resolvedOutputPath);
+  } finally {
+    removeFile(pendingPath, { force: true });
+  }
+}
 
 export function defaultWindowsJobLauncherPath(arch = process.arch) {
   if (!supportedWindowsJobLauncherArchitectures.includes(arch)) {
@@ -149,11 +171,7 @@ export function buildWindowsJobLauncher({ arch = process.arch, outputPath } = {}
     }
     assertPeArchitecture(builtPath, arch);
     mkdirSync(dirname(resolvedOutputPath), { recursive: true });
-    const pendingPath = `${resolvedOutputPath}.pending-${process.pid}`;
-    rmSync(pendingPath, { force: true });
-    copyFileSync(builtPath, pendingPath);
-    rmSync(resolvedOutputPath, { force: true });
-    renameSync(pendingPath, resolvedOutputPath);
+    publishWindowsJobLauncherArtifact(builtPath, resolvedOutputPath);
     const digest = createHash("sha256").update(readFileSync(resolvedOutputPath)).digest("hex");
     console.error(
       `[windows-job-launcher] Built win32-${arch} ${resolvedOutputPath} sha256=${digest}`,

@@ -143,12 +143,6 @@ export const makeBoundedNodeHttpServer = Effect.fnUntraced(function* (
         },
       );
 
-      yield* Effect.addFinalizer(() =>
-        Effect.sync(() => {
-          server.off("request", handler);
-          server.off("upgrade", admittedUpgradeHandler);
-        }),
-      );
       const admittedUpgradeHandler: typeof upgradeHandler = (request, socket, head) => {
         const outcome = transportAdmission.acquireConnection(
           socket instanceof Socket ? socket.remoteAddress : undefined,
@@ -172,6 +166,12 @@ export const makeBoundedNodeHttpServer = Effect.fnUntraced(function* (
         socket.once("error", release);
         upgradeHandler(request, socket, head);
       };
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          server.off("request", handler);
+          server.off("upgrade", admittedUpgradeHandler);
+        }),
+      );
       server.on("request", handler);
       server.on("upgrade", admittedUpgradeHandler);
     }),

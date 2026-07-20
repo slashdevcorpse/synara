@@ -378,7 +378,7 @@ export class WsTransport {
   private terminalEventStreamReady: {
     readonly promise: Promise<TerminalEventStreamReady>;
     readonly resolve: (ready: TerminalEventStreamReady) => void;
-    readonly reject: (error: Error) => void;
+    readonly reject: (error: unknown) => void;
   } | null = null;
   private shellSubscription: ShellSubscriptionResumeState | null = null;
   private readonly threadSubscriptions = new Map<string, unknown>();
@@ -843,6 +843,10 @@ export class WsTransport {
         }
       })
       .catch((error) => {
+        if (channel === WS_CHANNELS.terminalEvent && isTerminalCompatibilityFailure(error)) {
+          this.invalidateTerminalEventStreamReady(error);
+          return;
+        }
         if (
           !this.disposed &&
           this.listeners.has(channel) &&
@@ -1026,7 +1030,7 @@ export class WsTransport {
   private ensureTerminalEventStreamReady() {
     if (this.terminalEventStreamReady) return this.terminalEventStreamReady;
     let resolve!: (ready: TerminalEventStreamReady) => void;
-    let reject!: (error: Error) => void;
+    let reject!: (error: unknown) => void;
     const promise = new Promise<TerminalEventStreamReady>((resolveReady, rejectReady) => {
       resolve = resolveReady;
       reject = rejectReady;
@@ -1036,7 +1040,7 @@ export class WsTransport {
     return this.terminalEventStreamReady;
   }
 
-  private invalidateTerminalEventStreamReady(error: Error): void {
+  private invalidateTerminalEventStreamReady(error: unknown): void {
     const ready = this.terminalEventStreamReady;
     this.terminalEventStreamReady = null;
     ready?.reject(error);

@@ -20,6 +20,7 @@ import {
 import {
   MIGRATION_BACKUP_RETENTION,
   MigrationRecoveryRequiredError,
+  MigrationWalCheckpointError,
   createMigrationBackup,
   migrationBackupDirectory,
   migrationRecoveryMarkerPath,
@@ -411,6 +412,7 @@ describe("migration backups", () => {
         expect(walStat.size).toBeGreaterThan(0);
 
         yield* runWithPreMigrationBackup(dbPath, Effect.void);
+        expect((yield* Effect.promise(() => fs.stat(`${dbPath}-wal`))).size).toBe(0);
       }),
     );
 
@@ -427,6 +429,41 @@ describe("migration backups", () => {
     } finally {
       backup.close();
     }
+  });
+
+  it("fails closed before VACUUM when a live reader prevents WAL truncation", async () => {
+    const dbPath = await makeDbPath();
+    let reader: DatabaseSync | undefined;
+
+    try {
+      await expect(
+        runWithDatabase(
+          dbPath,
+          Effect.gen(function* () {
+            const sql = yield* SqlClient.SqlClient;
+            yield* sql`PRAGMA journal_mode = WAL`;
+            yield* sql`PRAGMA wal_autocheckpoint = 0`;
+            yield* sql`PRAGMA busy_timeout = 1`;
+            yield* sql`CREATE TABLE checkpoint_busy_probe(value TEXT NOT NULL)`;
+            yield* sql`INSERT INTO checkpoint_busy_probe(value) VALUES ('reader-snapshot')`;
+            reader = new DatabaseSync(dbPath);
+            reader.exec("BEGIN");
+            reader.prepare("SELECT value FROM checkpoint_busy_probe").all();
+            yield* sql`INSERT INTO checkpoint_busy_probe(value) VALUES ('writer-after-reader')`;
+
+            yield* createMigrationBackup(dbPath, {
+              sourceVersion: "checkpoint-busy",
+              targetVersion: 1,
+            });
+          }),
+        ),
+      ).rejects.toBeInstanceOf(MigrationWalCheckpointError);
+    } finally {
+      reader?.exec("ROLLBACK");
+      reader?.close();
+    }
+
+    expect(await backupPaths(dbPath)).toEqual([]);
   });
 
   it("validates the migrated live database while the recovery marker is still durable", async () => {

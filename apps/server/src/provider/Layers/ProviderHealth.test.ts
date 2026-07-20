@@ -63,6 +63,10 @@ const encoder = new TextEncoder();
 const originalProviderHealthTestPath = process.env.PATH;
 let providerHealthTestCommandDirectory: string | undefined;
 
+function configuredTestBinary(name: string): string {
+  return process.platform === "win32" ? `C:\\custom\\bin\\${name}` : `/custom/bin/${name}`;
+}
+
 beforeAll(() => {
   if (process.platform !== "win32") return;
   providerHealthTestCommandDirectory = mkdtempSync(
@@ -1145,12 +1149,12 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
     it.effect("uses configured codex binary for version and auth probes", () =>
       Effect.gen(function* () {
         yield* withTempCodexHome();
-        const status = yield* makeCheckCodexProviderStatus("  /custom/bin/codex  ");
+        const status = yield* makeCheckCodexProviderStatus(`  ${configuredTestBinary("codex")}  `);
         assert.strictEqual(status.status, "ready");
       }).pipe(
         Effect.provide(
           mockSpawnerLayer((args, command) => {
-            assert.strictEqual(command, "/custom/bin/codex");
+            assert.strictEqual(command, configuredTestBinary("codex"));
             const joined = args.join(" ");
             if (joined === "--version") return { stdout: "codex 1.0.0\n", stderr: "", code: 0 };
             if (joined === "login status") return { stdout: "Logged in\n", stderr: "", code: 0 };
@@ -1617,12 +1621,15 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
 
     it.effect("uses configured claude binary for version and auth probes", () =>
       Effect.gen(function* () {
-        const status = yield* makeCheckClaudeProviderStatus(undefined, "/custom/bin/claude");
+        const status = yield* makeCheckClaudeProviderStatus(
+          undefined,
+          configuredTestBinary("claude"),
+        );
         assert.strictEqual(status.status, "ready");
       }).pipe(
         Effect.provide(
           mockSpawnerLayer((args, command) => {
-            assert.strictEqual(command, "/custom/bin/claude");
+            assert.strictEqual(command, configuredTestBinary("claude"));
             const joined = args.join(" ");
             if (joined === "--version") return { stdout: "1.0.0\n", stderr: "", code: 0 };
             if (joined === "auth status")
@@ -2095,12 +2102,12 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
 
     it.effect("uses configured opencode binary for version probe", () =>
       Effect.gen(function* () {
-        const status = yield* makeCheckOpenCodeProviderStatus("/custom/bin/opencode");
+        const status = yield* makeCheckOpenCodeProviderStatus(configuredTestBinary("opencode"));
         assert.strictEqual(status.status, "ready");
       }).pipe(
         Effect.provide(
           mockSpawnerLayer((args, command) => {
-            assert.strictEqual(command, "/custom/bin/opencode");
+            assert.strictEqual(command, configuredTestBinary("opencode"));
             const joined = args.join(" ");
             if (joined === "--version") return { stdout: "opencode 1.3.17\n", stderr: "", code: 0 };
             throw new Error(`Unexpected args: ${joined}`);
@@ -2127,12 +2134,12 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
   describe("checkKiloProviderStatus", () => {
     it.effect("uses configured Kilo binary for version probe", () =>
       Effect.gen(function* () {
-        const status = yield* makeCheckKiloProviderStatus("/custom/bin/kilo");
+        const status = yield* makeCheckKiloProviderStatus(configuredTestBinary("kilo"));
         assert.strictEqual(status.status, "ready");
       }).pipe(
         Effect.provide(
           mockSpawnerLayer((args, command) => {
-            assert.strictEqual(command, "/custom/bin/kilo");
+            assert.strictEqual(command, configuredTestBinary("kilo"));
             const joined = args.join(" ");
             if (joined === "--version") return { stdout: "kilo 7.2.52\n", stderr: "", code: 0 };
             throw new Error(`Unexpected args: ${joined}`);
@@ -2176,7 +2183,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
 
     it.effect("uses configured Pi binary and agent dir without SDK registry reads", () =>
       Effect.gen(function* () {
-        const status = yield* checkPiProviderStatus("/tmp/pi-agent", "/custom/bin/pi");
+        const status = yield* checkPiProviderStatus("/tmp/pi-agent", configuredTestBinary("pi"));
         assert.strictEqual(status.status, "ready");
         assert.strictEqual(
           status.message,
@@ -2185,7 +2192,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
       }).pipe(
         Effect.provide(
           mockSpawnerLayer((args, command) => {
-            assert.strictEqual(command, "/custom/bin/pi");
+            assert.strictEqual(command, configuredTestBinary("pi"));
             const joined = args.join(" ");
             if (joined === "--version") return { stdout: "pi 0.74.0\n", stderr: "", code: 0 };
             throw new Error(`Unexpected args: ${joined}`);
@@ -2280,12 +2287,12 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
 
     it.effect("uses the configured Antigravity binary", () =>
       Effect.gen(function* () {
-        const status = yield* checkAntigravityProviderStatus("/custom/bin/agy");
+        const status = yield* checkAntigravityProviderStatus(configuredTestBinary("agy"));
         assert.strictEqual(status.status, "ready");
       }).pipe(
         Effect.provide(
           mockSpawnerLayer((args, command) => {
-            assert.strictEqual(command, "/custom/bin/agy");
+            assert.strictEqual(command, configuredTestBinary("agy"));
             return args.join(" ") === "--version"
               ? { stdout: "1.1.2\n", stderr: "", code: 0 }
               : { stdout: "GPT-OSS 120B (Medium)\n", stderr: "", code: 0 };
@@ -2370,12 +2377,12 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
 
     it.effect("uses configured Grok binary for version probe", () =>
       Effect.gen(function* () {
-        const status = yield* makeCheckGrokProviderStatus("/custom/bin/grok");
+        const status = yield* makeCheckGrokProviderStatus(configuredTestBinary("grok"));
         assert.strictEqual(status.status, "ready");
       }).pipe(
         Effect.provide(
           mockSpawnerLayer((args, command) => {
-            assert.strictEqual(command, "/custom/bin/grok");
+            assert.strictEqual(command, configuredTestBinary("grok"));
             const joined = args.join(" ");
             if (joined === "--version") return { stdout: "grok 0.1.0\n", stderr: "", code: 0 };
             throw new Error(`Unexpected args: ${joined}`);
@@ -2454,12 +2461,12 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
 
     it.effect("uses configured Cursor Agent binary for version probe", () =>
       Effect.gen(function* () {
-        const status = yield* makeCheckCursorProviderStatus("/custom/bin/agent");
+        const status = yield* makeCheckCursorProviderStatus(configuredTestBinary("agent"));
         assert.strictEqual(status.status, "ready");
       }).pipe(
         Effect.provide(
           mockSpawnerLayer((args, command) => {
-            assert.strictEqual(command, "/custom/bin/agent");
+            assert.strictEqual(command, configuredTestBinary("agent"));
             const joined = args.join(" ");
             if (joined === "--version") {
               return { stdout: "agent 2026.04.27\n", stderr: "", code: 0 };
@@ -2494,12 +2501,12 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
                 }
               }),
           );
-          const status = yield* makeCheckCursorProviderStatus("/custom/bin/cursor");
+          const status = yield* makeCheckCursorProviderStatus(configuredTestBinary("cursor"));
           assert.strictEqual(status.status, "ready");
         }).pipe(
           Effect.provide(
             mockSpawnerLayer((args, command) => {
-              assert.strictEqual(command, "/custom/bin/cursor");
+              assert.strictEqual(command, configuredTestBinary("cursor"));
               const joined = args.join(" ");
               if (joined === "agent --version") {
                 return { stdout: "cursor 2026.04.27\n", stderr: "", code: 0 };

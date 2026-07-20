@@ -75,6 +75,7 @@ export interface ProviderServiceLiveOptions {
 }
 
 const DEFAULT_PROVIDER_RUNTIME_IDLE_STOP_MS = 10 * 60 * 1000;
+const PROVIDER_LIFECYCLE_SWEEP_INTERVAL = "5 minutes";
 export const PROVIDER_RUNTIME_EVENT_BUFFER_CAPACITY = 2_048;
 const configuredProviderRuntimeIdleStopMs = process.env.SYNARA_PROVIDER_RUNTIME_IDLE_STOP_MS;
 const PROVIDER_RUNTIME_IDLE_STOP_MS = Number.isFinite(Number(configuredProviderRuntimeIdleStopMs))
@@ -301,6 +302,23 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
         lifecycle.adoptCurrent(binding.threadId, binding.lifecycleGeneration);
       }
     }
+    yield* Effect.forkScoped(
+      Effect.forever(
+        Effect.sleep(PROVIDER_LIFECYCLE_SWEEP_INTERVAL).pipe(
+          Effect.andThen(
+            directory.listBindings().pipe(
+              Effect.map((bindings) => new Set(bindings.map((binding) => binding.threadId))),
+              Effect.tap((liveThreadIds) =>
+                Effect.sync(() => lifecycle.sweepIdle((threadId) => liveThreadIds.has(threadId))),
+              ),
+              Effect.catch((cause) =>
+                Effect.logWarning("provider lifecycle sweep failed", { cause }),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
     const runtimeEventBufferCapacity = Math.max(
       1,
       Math.floor(options?.runtimeEventBufferCapacity ?? PROVIDER_RUNTIME_EVENT_BUFFER_CAPACITY),
@@ -1819,6 +1837,16 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
         );
       });
 
+    const retireThreadLifecycle: NonNullable<ProviderServiceShape["retireThreadLifecycle"]> = ({
+      threadId,
+    }) =>
+      Effect.sync(() => {
+        clearRuntimeIdleTimer(threadId);
+        liveRuntimeTaskIds.delete(threadId);
+        retireRuntimeIdleGeneration(threadId);
+        lifecycle.retireThread(threadId);
+      });
+
     const stopRuntimeSessionInternal = (
       rawInput: StopRuntimeSessionInput,
       expectedIdleGeneration?: symbol,
@@ -2227,6 +2255,7 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
       respondToRequest,
       respondToUserInput,
       stopSession,
+      retireThreadLifecycle,
       stopRuntimeSession,
       hasLiveRuntimeTasks,
       clearSessionResumeCursor,

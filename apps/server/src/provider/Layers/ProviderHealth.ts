@@ -9,7 +9,6 @@
  * @module ProviderHealthLive
  */
 import * as OS from "node:os";
-import { spawn as spawnChildProcess } from "node:child_process";
 import type {
   ProviderKind,
   ServerSettings,
@@ -111,6 +110,7 @@ import {
 } from "../providerMaintenance";
 import { collectUint8StreamText } from "../../stream/collectUint8StreamText";
 import { buildCodexProcessEnv } from "../../codexProcessEnv.ts";
+import { spawnContainedClaudeSdkProcess } from "../containedClaudeSdkProcess.ts";
 
 export { parseClaudeAuthStatusFromOutput } from "../claudeAuthStatus";
 export type { CommandResult } from "../providerCliOutput";
@@ -483,19 +483,7 @@ function waitForAbortSignal(signal: AbortSignal): Promise<void> {
 }
 
 function spawnContainedClaudeProbe(options: ClaudeSpawnOptions): ClaudeSpawnedProcess {
-  const prepared = prepareWindowsProviderProcess(options.command, options.args, {
-    cwd: options.cwd,
-    env: options.env,
-  });
-  return spawnChildProcess(prepared.command, prepared.args, {
-    ...(options.cwd ? { cwd: options.cwd } : {}),
-    env: options.env,
-    signal: options.signal,
-    shell: prepared.shell,
-    ...(prepared.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
-    stdio: ["pipe", "pipe", "inherit"],
-    windowsHide: true,
-  }) as unknown as ClaudeSpawnedProcess;
+  return spawnContainedClaudeSdkProcess(options) as unknown as ClaudeSpawnedProcess;
 }
 
 const probeClaudeSubscription = () => {
