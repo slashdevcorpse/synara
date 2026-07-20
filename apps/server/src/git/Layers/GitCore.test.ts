@@ -1484,13 +1484,15 @@ it.layer(TestLayer)("git integration", (it) => {
           yield* git(tmp, ["remote", "add", "origin", "git@github.com:example-org/synara.git"]);
 
           const core = yield* makeIsolatedGitCore((input) =>
-            realGitCore.execute(input).pipe(
-              Effect.map((result) =>
-                input.args.join(" ") === "remote -v"
-                  ? { ...result, stdout: result.stdout.replace(/\r?\n/g, "\r\n") }
-                  : result,
+            realGitCore
+              .execute(input)
+              .pipe(
+                Effect.map((result) =>
+                  input.args.join(" ") === "remote -v"
+                    ? { ...result, stdout: result.stdout.replace(/\r?\n/g, "\r\n") }
+                    : result,
+                ),
               ),
-            ),
           );
 
           const remoteName = yield* core.ensureRemote({

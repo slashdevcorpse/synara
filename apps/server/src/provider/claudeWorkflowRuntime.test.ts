@@ -237,7 +237,7 @@ describe("collectClaudeWorkflowRuntime", () => {
         // A CRLF split across ticks remains unconsumed until its LF arrives.
         appendFileSync(path.join(dir, "agent-a423ae8cef86a1ed4.jsonl"), `${AGENT_FINAL_LINE}\r`);
         expect(yield* collectClaudeWorkflowRuntime(fileSystem, dir, state)).toBe(false);
-        appendFileSync(path.join(dir, "agent-a423ae8cef86a1ed4.jsonl"), "\n{\"tr");
+        appendFileSync(path.join(dir, "agent-a423ae8cef86a1ed4.jsonl"), '\n{"tr');
         appendFileSync(path.join(dir, "journal.jsonl"), `${JOURNAL_RESULT}\r\n`);
         expect(yield* collectClaudeWorkflowRuntime(fileSystem, dir, state)).toBe(true);
         expect(agent.state).toBe("completed");
