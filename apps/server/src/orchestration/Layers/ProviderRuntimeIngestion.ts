@@ -3219,7 +3219,7 @@ const make = Effect.gen(function* () {
               status: "error",
               providerName: event.provider,
               runtimeMode: thread.session?.runtimeMode ?? "full-access",
-              activeTurnId: eventTurnId ?? null,
+              activeTurnId: null,
               lastError: runtimeErrorMessage,
               updatedAt: now,
             },

@@ -638,8 +638,7 @@ describe("ProviderRuntimeIngestion", () => {
 
       await waitForThread(
         harness.engine,
-        (thread) =>
-          thread.session?.status === "running" && thread.session?.activeTurnId === turnId,
+        (thread) => thread.session?.status === "running" && thread.session?.activeTurnId === turnId,
       );
 
       harness.emit({
@@ -678,8 +677,7 @@ describe("ProviderRuntimeIngestion", () => {
 
       await waitForThread(
         harness.engine,
-        (thread) =>
-          thread.session?.status === "running" && thread.session?.activeTurnId === turnId,
+        (thread) => thread.session?.status === "running" && thread.session?.activeTurnId === turnId,
       );
 
       harness.emit({
@@ -4889,7 +4887,7 @@ describe("ProviderRuntimeIngestion", () => {
     expect(JSON.stringify(data).length).toBeLessThanOrEqual(16_000);
   });
 
-  it("maps runtime.error into errored session state", async () => {
+  it("maps runtime.error into errored session state and clears the active turn", async () => {
     const harness = await createHarness();
     const now = new Date().toISOString();
 
@@ -4909,10 +4907,11 @@ describe("ProviderRuntimeIngestion", () => {
       harness.engine,
       (entry) =>
         entry.session?.status === "error" &&
-        entry.session?.activeTurnId === "turn-3" &&
+        entry.session?.activeTurnId === null &&
         entry.session?.lastError === "runtime exploded",
     );
     expect(thread.session?.status).toBe("error");
+    expect(thread.session?.activeTurnId).toBeNull();
     expect(thread.session?.lastError).toBe("runtime exploded");
   });
 
