@@ -85,9 +85,9 @@ describe("isAllowedBrowserNavigation", () => {
 
   it("denies username and password credentials on ordinary HTTP(S) navigation", () => {
     expect(isAllowedBrowserNavigation({ url: "https://user@example.com/private" })).toBe(false);
-    expect(
-      isAllowedBrowserNavigation({ url: "http://user:password@localhost:5173/private" }),
-    ).toBe(false);
+    expect(isAllowedBrowserNavigation({ url: "http://user:password@localhost:5173/private" })).toBe(
+      false,
+    );
   });
 
   it("denies raw file URLs, custom schemes, malformed URLs, and unmarked capability routes", () => {

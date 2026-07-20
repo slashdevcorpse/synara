@@ -526,9 +526,7 @@ export class DesktopBrowserManager {
       this.newTab({
         threadId: activeContext.threadId,
         url,
-        ...(activeContext.localFilePath
-          ? { localFilePath: activeContext.localFilePath }
-          : {}),
+        ...(activeContext.localFilePath ? { localFilePath: activeContext.localFilePath } : {}),
         activate: true,
       });
       const bounds = this.getVisibleBoundsForThread(activeContext.threadId);

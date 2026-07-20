@@ -192,9 +192,9 @@ describe("splitViewStore", () => {
     const hydrated = readerStore.getState().splitViewsById[splitViewId];
     expect(hydrated).toBeDefined();
     if (!hydrated) return;
-    expect(
-      collectLeaves(hydrated.root).every((leaf) => leaf.panel.browserRequest === null),
-    ).toBe(true);
+    expect(collectLeaves(hydrated.root).every((leaf) => leaf.panel.browserRequest === null)).toBe(
+      true,
+    );
   });
 
   it("replaces an existing source split when creating a drop split for the same source", () => {
