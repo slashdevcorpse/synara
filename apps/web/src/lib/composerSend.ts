@@ -206,6 +206,7 @@ export function resolvePromptEffortFromModelSelection(
 ): string | null {
   switch (modelSelection.provider) {
     case "antigravity":
+    case "commandCode":
       return null;
     case "codex":
       return modelSelection.options?.reasoningEffort ?? null;

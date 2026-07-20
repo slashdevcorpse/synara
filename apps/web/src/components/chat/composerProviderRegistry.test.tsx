@@ -181,6 +181,42 @@ describe("getComposerProviderState", () => {
     });
   });
 
+  it("does not expose or dispatch unverified Command Code traits", () => {
+    const threadId = ThreadId.makeUnsafe("thread-command-code-no-traits");
+    const state = getComposerProviderState({
+      provider: "commandCode",
+      model: "gpt-5.6-sol",
+      prompt: "",
+      modelOptions: { commandCode: {} },
+    });
+
+    expect(state).toEqual({
+      provider: "commandCode",
+      promptEffort: null,
+      modelOptionsForDispatch: undefined,
+    });
+    expect(
+      renderProviderTraitsPicker({
+        provider: "commandCode",
+        threadId,
+        model: "gpt-5.6-sol",
+        modelOptions: { commandCode: {} },
+        prompt: "",
+        onPromptChange: vi.fn(),
+      }),
+    ).toBeNull();
+    expect(
+      renderProviderTraitsMenuContent({
+        provider: "commandCode",
+        threadId,
+        model: "gpt-5.6-sol",
+        modelOptions: { commandCode: {} },
+        prompt: "",
+        onPromptChange: vi.fn(),
+      }),
+    ).toBeNull();
+  });
+
   it("normalizes codex dispatch options while preserving the selected effort", () => {
     const state = getComposerProviderState({
       provider: "codex",
