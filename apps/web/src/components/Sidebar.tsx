@@ -373,6 +373,7 @@ import {
   SIDEBAR_SECTION_LABEL_CLASS_NAME,
 } from "../sidebarRowStyles";
 import { SettingsSidebarNav } from "./SettingsSidebarNav";
+import { WorkspaceAgentSection } from "./workspace/WorkspaceAgentSection";
 import { ComposerPickerMenuPopup } from "./chat/ComposerPickerMenuPopup";
 import {
   resolveSplitViewFocusedThreadId,
@@ -7506,6 +7507,9 @@ export default function Sidebar() {
             </div>
           </>
         )}
+        {!isOnSettings ? (
+          <WorkspaceAgentSection onOpenThread={activateThreadFromSidebarIntent} />
+        ) : null}
         {!isOnSettings && !isOnStudio && chatsSectionVisible ? (
           // sidebar-surface-enter: mounts on the Studio -> Projects switch, so it
           // animates in step with the keyed surface wrapper above.
