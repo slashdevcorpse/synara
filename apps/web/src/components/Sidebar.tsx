@@ -182,6 +182,8 @@ import {
   groupHeartbeatAutomationsByTargetThread,
 } from "../routes/-automations.shared";
 import { shouldRenderTerminalWorkspace } from "./ChatView.logic";
+import { AgentActivityPulse } from "./chat/AgentActivityPulse";
+import type { AgentActivityState } from "./chat/agentActivityPulse.logic";
 import { CHAT_SURFACE_HEADER_HEIGHT_CLASS } from "./chat/chatHeaderControls";
 import { ProviderIcon } from "./ProviderIcon";
 import { SidebarLeadingControls } from "./SidebarHeaderNavigationControls";
@@ -567,9 +569,16 @@ function WorktreeBadgeGlyph({ className }: { className?: string }) {
   return <WorktreeIcon aria-hidden="true" className={sidebarGlyphClass("meta", className)} />;
 }
 
-// Trailing row status: spinner while working, check when completed, otherwise a
-// colored status dot. Thread rows and project headers use the same glyph so a
-// collapsed project still advertises active child chats.
+const SIDEBAR_WORKING_ACTIVITY_STATE = {
+  phase: "thinking",
+  toolCount: 0,
+  subagentCount: 0,
+} satisfies Pick<AgentActivityState, "phase" | "toolCount" | "subagentCount">;
+
+// Trailing row status: activity pulse while working, spinner while connecting,
+// check when completed, otherwise a colored status dot. Thread rows and project
+// headers use the same glyph so a collapsed project still advertises active
+// child chats.
 function SidebarStatusTrailingGlyph({ status }: { status: ThreadStatusPill }) {
   if (status.label === "Completed") {
     // Match the worktree/other trailing chips' optical size (15px) so the green
@@ -580,6 +589,9 @@ function SidebarStatusTrailingGlyph({ status }: { status: ThreadStatusPill }) {
         className={cn(SIDEBAR_TRAILING_ICON_CLASS, status.colorClass)}
       />
     );
+  }
+  if (status.label === "Working") {
+    return <AgentActivityPulse state={SIDEBAR_WORKING_ACTIVITY_STATE} variant="dot" />;
   }
   if (status.pulse) {
     return <ThreadRunningSpinner />;

@@ -3,18 +3,15 @@
 // Layer: Persistence compatibility helper
 // Exports: normalizeLegacyModelSelection, normalizePersistedModelSelection
 
-import { MODEL_OPTIONS_BY_PROVIDER } from "@synara/contracts";
+import { MODEL_OPTIONS_BY_PROVIDER, type ProviderKind } from "@synara/contracts";
 
-type ModelProviderKind =
-  | "codex"
-  | "claudeAgent"
-  | "cursor"
-  | "antigravity"
-  | "grok"
-  | "droid"
-  | "kilo"
-  | "opencode"
-  | "pi";
+type ModelProviderKind = ProviderKind;
+
+const MODEL_PROVIDER_KINDS = new Set<string>(Object.keys(MODEL_OPTIONS_BY_PROVIDER));
+
+function isModelProviderKind(value: unknown): value is ModelProviderKind {
+  return typeof value === "string" && MODEL_PROVIDER_KINDS.has(value);
+}
 
 const NON_DROID_MODEL_SLUGS = new Set(
   Object.entries(MODEL_OPTIONS_BY_PROVIDER).flatMap(([provider, models]) =>
@@ -75,6 +72,9 @@ function inferProviderFromLabel(label: string): ModelProviderKind | undefined {
   if (lowerLabel.includes("droid") || lowerLabel.includes("factory")) {
     return "droid";
   }
+  if (lowerLabel.includes("command code") || lowerLabel.includes("commandcode")) {
+    return "commandCode";
+  }
   if (lowerLabel.includes("codex")) {
     return "codex";
   }
@@ -82,17 +82,7 @@ function inferProviderFromLabel(label: string): ModelProviderKind | undefined {
 }
 
 function inferLegacyModelProvider(provider: unknown, model: string): ModelProviderKind {
-  if (
-    provider === "codex" ||
-    provider === "claudeAgent" ||
-    provider === "cursor" ||
-    provider === "antigravity" ||
-    provider === "grok" ||
-    provider === "droid" ||
-    provider === "kilo" ||
-    provider === "opencode" ||
-    provider === "pi"
-  ) {
+  if (isModelProviderKind(provider)) {
     return provider;
   }
   if (provider === "gemini") {

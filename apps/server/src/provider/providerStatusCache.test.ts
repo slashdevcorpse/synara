@@ -106,9 +106,23 @@ describe("providerStatusCache", () => {
           checkedAt: "2026-04-15T10:04:00.000Z",
         },
         readyCodexStatus,
+        {
+          provider: "commandCode",
+          status: "ready",
+          available: true,
+          authStatus: "authenticated",
+          checkedAt: "2026-04-15T10:00:30.000Z",
+        },
       ]),
     ).toEqual([
       readyCodexStatus,
+      {
+        provider: "commandCode",
+        status: "ready",
+        available: true,
+        authStatus: "authenticated",
+        checkedAt: "2026-04-15T10:00:30.000Z",
+      },
       {
         provider: "claudeAgent",
         status: "warning",

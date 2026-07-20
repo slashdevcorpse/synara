@@ -27,6 +27,29 @@ const PROVIDED_THEME_STRING =
   'codex-theme-v1:{"codeThemeId":"linear","theme":{"accent":"#606acc","contrast":30,"fonts":{"code":"\\"Jetbrains Mono\\"","ui":"Inter"},"ink":"#e3e4e6","opaqueWindows":true,"semanticColors":{"diffAdded":"#69c967","diffRemoved":"#ff7e78","skill":"#c2a1ff"},"surface":"#0f0f11"},"variant":"dark"}';
 
 describe("parseStoredThemeState", () => {
+  const darkDefaultState = {
+    ...DEFAULT_THEME_STATE,
+    mode: "dark" as const,
+  };
+
+  it.each([null, undefined, "", "not-json"])(
+    "uses the supplied dark default for an absent or unreadable value: %s",
+    (rawValue) => {
+      expect(parseStoredThemeState(rawValue, darkDefaultState)).toEqual(darkDefaultState);
+    },
+  );
+
+  it.each(["light", "dark", "system"] as const)(
+    "preserves an explicit saved %s preference over the supplied default",
+    (mode) => {
+      expect(parseStoredThemeState(mode, darkDefaultState).mode).toBe(mode);
+    },
+  );
+
+  it("uses the supplied mode when a valid legacy state omitted its preference", () => {
+    expect(parseStoredThemeState('{"systemUiFont":false}', darkDefaultState).mode).toBe("dark");
+  });
+
   it("migrates the legacy mode-only value into the new theme store", () => {
     expect(parseStoredThemeState("dark")).toEqual({
       ...DEFAULT_THEME_STATE,
