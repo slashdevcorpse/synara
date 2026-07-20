@@ -127,22 +127,24 @@ export function flattenEffectRpcRequestPayload(
 export function createShellSnapshotFromReadModel(
   snapshot: OrchestrationReadModel,
 ): OrchestrationShellSnapshot {
+  const activeProjects = snapshot.projects.filter(
+    (project) => project.deletedAt === null && (project.archivedAt ?? null) === null,
+  );
+  const activeProjectIds = new Set(activeProjects.map((project) => project.id));
   return {
     snapshotSequence: snapshot.snapshotSequence,
-    projects: snapshot.projects
-      .filter((project) => project.deletedAt === null)
-      .map((project) => ({
-        id: project.id,
-        kind: project.kind,
-        title: project.title,
-        workspaceRoot: project.workspaceRoot,
-        defaultModelSelection: project.defaultModelSelection,
-        scripts: project.scripts,
-        createdAt: project.createdAt,
-        updatedAt: project.updatedAt,
-      })),
+    projects: activeProjects.map((project) => ({
+      id: project.id,
+      kind: project.kind,
+      title: project.title,
+      workspaceRoot: project.workspaceRoot,
+      defaultModelSelection: project.defaultModelSelection,
+      scripts: project.scripts,
+      createdAt: project.createdAt,
+      updatedAt: project.updatedAt,
+    })),
     threads: snapshot.threads
-      .filter((thread) => thread.deletedAt === null)
+      .filter((thread) => thread.deletedAt === null && activeProjectIds.has(thread.projectId))
       .map((thread) => ({
         id: thread.id,
         projectId: thread.projectId,

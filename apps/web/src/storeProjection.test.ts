@@ -9,6 +9,7 @@ import {
   ThreadMarkerId,
   TurnId,
   type OrchestrationReadModel,
+  type OrchestrationShellSnapshot,
   type OrchestrationShellStreamEvent,
   type ThreadMarker,
 } from "@synara/contracts";
@@ -21,6 +22,7 @@ import {
   removeDeletedThreadFromClientState,
   syncServerShellSnapshot,
   syncServerReadModel,
+  syncServerThreadDetail,
   syncServerThreadDetailHotPath,
 } from "./storeProjection";
 import type { AppState } from "./storeState";
@@ -245,6 +247,159 @@ describe("store projection", () => {
     expect(threadsOf(afterStaleShellSnapshot)).toEqual([]);
     expect(afterStaleReadModel.projects).toEqual([]);
     expect(threadsOf(afterStaleReadModel)).toEqual([]);
+  });
+
+  it("removes archived project visibility without tombstones and restores the same ids", () => {
+    const projectId = ProjectId.makeUnsafe("project-archive-cycle");
+    const threadId = ThreadId.makeUnsafe("thread-archive-cycle");
+    const shellThread = {
+      id: threadId,
+      projectId,
+      title: "Preserved thread",
+      modelSelection: {
+        provider: "codex" as const,
+        model: "gpt-5.3-codex",
+      },
+      runtimeMode: DEFAULT_RUNTIME_MODE,
+      interactionMode: DEFAULT_INTERACTION_MODE,
+      envMode: "local" as const,
+      branch: null,
+      worktreePath: null,
+      forkSourceThreadId: null,
+      sidechatSourceThreadId: null,
+      latestTurn: null,
+      createdAt: "2026-02-27T00:00:00.000Z",
+      updatedAt: "2026-02-27T00:00:30.000Z",
+      handoff: null,
+      session: null,
+    } satisfies OrchestrationShellSnapshot["threads"][number];
+    const visibleSnapshot = {
+      snapshotSequence: 1,
+      updatedAt: "2026-02-27T00:01:00.000Z",
+      projects: [
+        {
+          id: projectId,
+          title: "Archive cycle",
+          workspaceRoot: "/tmp/archive-cycle",
+          defaultModelSelection: null,
+          scripts: [],
+          createdAt: "2026-02-27T00:00:00.000Z",
+          updatedAt: "2026-02-27T00:00:30.000Z",
+        },
+      ],
+      threads: [shellThread],
+    } satisfies OrchestrationShellSnapshot;
+    const initialState = syncServerShellSnapshot(
+      {
+        projects: [],
+        sidebarThreadSummaryById: {},
+        threadsHydrated: false,
+      },
+      visibleSnapshot,
+    );
+
+    const invalidationState = applyShellEvent(initialState, {
+      kind: "snapshot-invalidated",
+      sequence: 2,
+      reason: "project-visibility-changed",
+    } satisfies OrchestrationShellStreamEvent);
+    const archivedState = syncServerShellSnapshot(invalidationState, {
+      snapshotSequence: 2,
+      updatedAt: "2026-02-27T00:02:00.000Z",
+      projects: [],
+      threads: [],
+    });
+    const afterLateHotDetail = syncServerThreadDetailHotPath(
+      archivedState,
+      makeReadModelThread({
+        id: threadId,
+        projectId,
+        title: "Late detail after archive",
+      }),
+    );
+    const afterLateDetail = syncServerThreadDetail(
+      afterLateHotDetail,
+      makeReadModelThread({
+        id: threadId,
+        projectId,
+        title: "Late direct detail after archive",
+      }),
+    );
+    const afterLateShell = applyShellEvent(afterLateDetail, {
+      kind: "thread-upserted",
+      sequence: 3,
+      thread: {
+        ...shellThread,
+        title: "Late shell after archive",
+      },
+    } satisfies OrchestrationShellStreamEvent);
+    const restoredState = syncServerShellSnapshot(afterLateShell, {
+      ...visibleSnapshot,
+      snapshotSequence: 4,
+      updatedAt: "2026-02-27T00:04:00.000Z",
+    });
+    const restoredDetailState = syncServerThreadDetail(
+      restoredState,
+      makeReadModelThread({
+        id: threadId,
+        projectId,
+        title: "Restored preserved thread",
+      }),
+    );
+
+    expect(invalidationState).toBe(initialState);
+    expect(archivedState.projects).toEqual([]);
+    expect(threadsOf(archivedState)).toEqual([]);
+    expect(afterLateHotDetail.projects).toEqual([]);
+    expect(threadsOf(afterLateHotDetail)).toEqual([]);
+    expect(threadsOf(afterLateDetail)).toEqual([]);
+    expect(threadsOf(afterLateShell)).toEqual([]);
+    expect(archivedState.deletedProjectIdsById?.[projectId]).toBeUndefined();
+    expect(archivedState.deletedThreadIdsById?.[threadId]).toBeUndefined();
+    expect(restoredState.projects.map((project) => project.id)).toEqual([projectId]);
+    expect(threadsOf(restoredState).map((thread) => thread.id)).toEqual([threadId]);
+    expect(threadsOf(restoredDetailState)).toEqual([
+      expect.objectContaining({ id: threadId, title: "Restored preserved thread" }),
+    ]);
+  });
+
+  it("filters archived projects and their threads from full read-model repair snapshots", () => {
+    const activeProjectId = ProjectId.makeUnsafe("project-active-repair");
+    const archivedProjectId = ProjectId.makeUnsafe("project-archived-repair");
+    const activeThreadId = ThreadId.makeUnsafe("thread-active-repair");
+    const archivedThreadId = ThreadId.makeUnsafe("thread-archived-repair");
+    const next = syncServerReadModel(
+      {
+        projects: [],
+        sidebarThreadSummaryById: {},
+        threadsHydrated: false,
+      },
+      {
+        snapshotSequence: 4,
+        updatedAt: "2026-02-27T00:04:00.000Z",
+        projects: [
+          makeReadModelProject({
+            id: activeProjectId,
+            workspaceRoot: "/tmp/active-repair",
+            archivedAt: null,
+          }),
+          makeReadModelProject({
+            id: archivedProjectId,
+            workspaceRoot: "/tmp/archived-repair",
+            archivedAt: "2026-02-27T00:03:00.000Z",
+          }),
+        ],
+        threads: [
+          makeReadModelThread({ id: activeThreadId, projectId: activeProjectId }),
+          makeReadModelThread({ id: archivedThreadId, projectId: archivedProjectId }),
+        ],
+      },
+    );
+
+    expect(next.projects.map((project) => project.id)).toEqual([activeProjectId]);
+    expect(threadsOf(next).map((thread) => thread.id)).toEqual([activeThreadId]);
+    expect(next.deletedProjectIdsById?.[archivedProjectId]).toBeUndefined();
+    expect(next.deletedThreadIdsById?.[archivedThreadId]).toBeUndefined();
   });
 
   it("reuses the existing project slot for shell upserts that keep the same workspace root", () => {

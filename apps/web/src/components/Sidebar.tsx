@@ -1,8 +1,9 @@
 // FILE: Sidebar.tsx
 // Purpose: Renders the project/thread sidebar, including row status, sorting, and thread actions.
-// Exports: Sidebar
+// Exports: Sidebar, workspace route classification helpers
 
 import {
+  AppsIcon,
   ArchiveIcon,
   CheckCircle2Icon,
   ChevronDownIcon,
@@ -360,6 +361,27 @@ import {
   createOrRecoverProjectFromPath,
   PROJECT_CREATE_EXISTING_SYNC_ERROR,
 } from "../lib/projectCreation";
+
+export const WORKSPACE_DASHBOARD_PATH = "/workspace" as const;
+
+export function resolveSidebarWorkspaceRoute(pathname: string): {
+  isDashboard: boolean;
+  isTerminalWorkspace: boolean;
+} {
+  const isDashboard =
+    pathname === WORKSPACE_DASHBOARD_PATH || pathname === `${WORKSPACE_DASHBOARD_PATH}/`;
+  return {
+    isDashboard,
+    isTerminalWorkspace: !isDashboard && pathname.startsWith(`${WORKSPACE_DASHBOARD_PATH}/`),
+  };
+}
+
+export function shouldRedirectHiddenTerminalWorkspaceRoute(
+  pathname: string,
+  workspaceSectionVisible: boolean,
+): boolean {
+  return !workspaceSectionVisible && resolveSidebarWorkspaceRoute(pathname).isTerminalWorkspace;
+}
 
 const EMPTY_KEYBINDINGS: ResolvedKeybindingsConfig = [];
 const THREAD_PREVIEW_LIMIT = 5;
@@ -1231,7 +1253,9 @@ export default function Sidebar() {
   const isOnSettings = useLocation({
     select: (loc) => loc.pathname === "/settings",
   });
-  const isOnWorkspace = pathname.startsWith("/workspace");
+  const workspaceRoute = resolveSidebarWorkspaceRoute(pathname);
+  const isOnWorkspaceDashboard = workspaceRoute.isDashboard;
+  const isOnTerminalWorkspace = workspaceRoute.isTerminalWorkspace;
   const isOnStudioRoute = pathname.startsWith("/studio");
   const isOnKanban = pathname.startsWith("/kanban");
   const isOnAutomations = pathname.startsWith("/automations");
@@ -1284,8 +1308,9 @@ export default function Sidebar() {
     [automationListQuery.data],
   );
   const { settings: appSettings, updateSettings } = useAppSettings();
-  // Threads is always available; Studio, Workspace, and the standalone Chats footer
-  // can be hidden independently from Settings.
+  // Projects is always available; Studio, terminal Workspace, and the standalone Chats
+  // footer can be hidden independently from Settings. The workspace dashboard remains an
+  // always-visible Projects action regardless of the terminal Workspace preference.
   const chatsSectionVisible = appSettings.showChatsSection;
   const studioSectionVisible = appSettings.showStudioSection;
   const workspaceSectionVisible = appSettings.showWorkspaceSection;
@@ -2235,14 +2260,14 @@ export default function Sidebar() {
       handleSidebarViewChange("threads");
       return;
     }
-    if (isOnWorkspace && !workspaceSectionVisible) {
+    if (shouldRedirectHiddenTerminalWorkspaceRoute(pathname, workspaceSectionVisible)) {
       handleSidebarViewChange("threads");
     }
   }, [
     handleSidebarViewChange,
     isOnSettings,
     isOnStudio,
-    isOnWorkspace,
+    pathname,
     studioSectionVisible,
     workspaceSectionVisible,
   ]);
@@ -3700,7 +3725,7 @@ export default function Sidebar() {
   ]);
 
   useEffect(() => {
-    if (isOnWorkspace || isOnSettings || routeThreadId === null) {
+    if (isOnTerminalWorkspace || isOnSettings || routeThreadId === null) {
       return;
     }
 
@@ -3720,7 +3745,7 @@ export default function Sidebar() {
       });
     }, 0);
     return () => window.clearTimeout(settle);
-  }, [isOnSettings, isOnWorkspace, routeSearch.splitViewId, routeThreadId]);
+  }, [isOnSettings, isOnTerminalWorkspace, routeSearch.splitViewId, routeThreadId]);
 
   useEffect(() => {
     if (!activeSidebarThreadId) {
@@ -5223,6 +5248,10 @@ export default function Sidebar() {
   const addProjectShortcutLabel =
     shortcutLabelForCommand(keybindings, "sidebar.addProject") ??
     (isMacPlatform(navigator.platform) ? "⇧⌘O" : "Ctrl+Shift+O");
+  const workspaceDashboardShortcutLabel = shortcutLabelForCommand(
+    keybindings,
+    "workspace.openDashboard",
+  );
   const usageSettingsShortcutLabel = shortcutLabelForCommand(keybindings, "settings.usage");
   const searchPaletteProjects: SidebarSearchProject[] = projects.map((project) => ({
     id: project.id,
@@ -5606,7 +5635,7 @@ export default function Sidebar() {
                 "threads",
                 ...(workspaceSectionVisible ? (["workspace"] as const) : []),
               ]}
-              activeView={isOnStudio ? "studio" : isOnWorkspace ? "workspace" : "threads"}
+              activeView={isOnStudio ? "studio" : isOnTerminalWorkspace ? "workspace" : "threads"}
               onSelectView={handleSidebarViewChange}
               onPrewarmView={prewarmSidebarViewTarget}
             />
@@ -5615,13 +5644,13 @@ export default function Sidebar() {
                 instead of a hard cut. The picker above stays outside the key so
                 its thumb can glide across the switch. */}
             <div
-              key={isOnWorkspace ? "workspace" : isOnStudio ? "studio" : "threads"}
+              key={isOnTerminalWorkspace ? "workspace" : isOnStudio ? "studio" : "threads"}
               className="sidebar-surface-enter"
             >
               {/* Primary sidebar actions stay limited to features we currently ship. */}
               <SidebarGroup className="px-1.5 pt-1 pb-1.5">
                 <SidebarMenu className="gap-0.5">
-                  {isOnWorkspace ? (
+                  {isOnTerminalWorkspace ? (
                     <SidebarPrimaryAction
                       icon={TerminalIcon}
                       label="New workspace"
@@ -5663,6 +5692,15 @@ export default function Sidebar() {
                         shortcutLabel={searchShortcutLabel}
                       />
                       <SidebarPrimaryAction
+                        icon={AppsIcon}
+                        label="Workspace"
+                        active={isOnWorkspaceDashboard}
+                        onClick={() => {
+                          void navigate({ to: WORKSPACE_DASHBOARD_PATH });
+                        }}
+                        shortcutLabel={workspaceDashboardShortcutLabel}
+                      />
+                      <SidebarPrimaryAction
                         icon={KanbanIcon}
                         label="Kanban"
                         active={isOnKanban}
@@ -5696,7 +5734,7 @@ export default function Sidebar() {
                 </SidebarMenu>
               </SidebarGroup>
 
-              {isOnWorkspace ? (
+              {isOnTerminalWorkspace ? (
                 <SidebarGroup className="px-1.5 pt-1 pb-1.5">
                   <div className="my-2 h-px w-full bg-border" />
                   <div className="mb-1.5 flex items-center px-2">

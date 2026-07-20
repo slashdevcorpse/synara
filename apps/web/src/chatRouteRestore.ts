@@ -12,6 +12,18 @@ export type EmptyRouteRestoreRecoveryState = "idle" | "pending" | "done";
 
 export const EMPTY_ROUTE_RESTORE_FALLBACK_DELAY_MS = 1_800;
 
+export function shouldOpenWorkspaceDashboardOnEmptyHome(input: {
+  readonly availableThreadCount: number;
+  readonly draftThreadCount: number;
+  readonly lastThreadRoute: LastThreadRoute | null;
+}): boolean {
+  return (
+    input.availableThreadCount === 0 &&
+    input.draftThreadCount === 0 &&
+    input.lastThreadRoute === null
+  );
+}
+
 export function resolveRestorableThreadRoute(input: {
   lastThreadRoute: LastThreadRoute | null;
   availableThreadIds: ReadonlySet<string>;

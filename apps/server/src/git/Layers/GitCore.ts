@@ -61,8 +61,11 @@ const NON_REPOSITORY_STATUS_DETAILS = Object.freeze({
   isRepo: false,
   hasOriginRemote: false,
   isDefaultBranch: false,
+  hasCommits: false,
+  isDetached: false,
   branch: null,
   upstreamRef: null,
+  upstreamRefreshStatus: "not-configured" as const,
   upstreamBranch: null,
   hasWorkingTreeChanges: false,
   workingTree: { files: [], insertions: 0, deletions: 0 },
@@ -92,6 +95,28 @@ interface ExecuteGitOptions {
 }
 
 type WorkingTreeStatSummary = ReturnType<typeof summarizeGitNumstatOutputs>;
+
+function makeGitCommandEnvironment(
+  inherited: NodeJS.ProcessEnv,
+  unsetEnv: ReadonlyArray<string> | undefined,
+  overrides: NodeJS.ProcessEnv | undefined,
+  traceEnv: NodeJS.ProcessEnv,
+): NodeJS.ProcessEnv {
+  const environment = { ...inherited };
+  if (unsetEnv && unsetEnv.length > 0) {
+    const normalizeKey =
+      process.platform === "win32" ? (key: string) => key.toUpperCase() : (key: string) => key;
+    const keysToRemove = new Set(unsetEnv.map(normalizeKey));
+    for (const key of Object.keys(environment)) {
+      if (keysToRemove.has(normalizeKey(key))) delete environment[key];
+    }
+  }
+  return {
+    ...environment,
+    ...overrides,
+    ...traceEnv,
+  };
+}
 
 function resolveGitPath(cwd: string, gitPath: string): string {
   return nodePath.isAbsolute(gitPath) ? gitPath : nodePath.join(cwd, gitPath);
@@ -489,6 +514,28 @@ const createTrace2Monitor = Effect.fn(function* (
   };
 });
 
+export function splitCompleteProcessOutputFrames(
+  buffer: string,
+  flush = false,
+): { readonly frames: ReadonlyArray<string>; readonly remainder: string } {
+  const frames: string[] = [];
+  let remainder = buffer;
+  let newlineIndex = remainder.search(/[\r\n]/);
+  while (newlineIndex >= 0) {
+    const line = remainder.slice(0, newlineIndex);
+    const separatorWidth =
+      remainder[newlineIndex] === "\r" && remainder[newlineIndex + 1] === "\n" ? 2 : 1;
+    remainder = remainder.slice(newlineIndex + separatorWidth);
+    if (line.length > 0) frames.push(line);
+    newlineIndex = remainder.search(/[\r\n]/);
+  }
+  if (flush && remainder.length > 0) {
+    frames.push(remainder);
+    remainder = "";
+  }
+  return { frames, remainder };
+}
+
 const collectOutput = Effect.fn(function* <E>(
   input: Pick<ExecuteGitInput, "operation" | "cwd" | "args">,
   stream: Stream.Stream<Uint8Array, E>,
@@ -502,21 +549,11 @@ const collectOutput = Effect.fn(function* <E>(
 
   const emitCompleteLines = (flush: boolean) =>
     Effect.gen(function* () {
-      let newlineIndex = lineBuffer.indexOf("\n");
-      while (newlineIndex >= 0) {
-        const line = lineBuffer.slice(0, newlineIndex).replace(/\r$/, "");
-        lineBuffer = lineBuffer.slice(newlineIndex + 1);
-        if (line.length > 0 && onLine) {
+      const drained = splitCompleteProcessOutputFrames(lineBuffer, flush);
+      lineBuffer = drained.remainder;
+      if (onLine) {
+        for (const line of drained.frames) {
           yield* onLine(line);
-        }
-        newlineIndex = lineBuffer.indexOf("\n");
-      }
-
-      if (flush) {
-        const trailing = lineBuffer.replace(/\r$/, "");
-        lineBuffer = "";
-        if (trailing.length > 0 && onLine) {
-          yield* onLine(trailing);
         }
       }
     });
@@ -546,11 +583,17 @@ const collectOutput = Effect.fn(function* <E>(
   return text;
 });
 
-export const makeGitCore = (options?: { executeOverride?: GitCoreShape["execute"] }) =>
+export const makeGitCore = (options?: {
+  readonly executeOverride?: GitCoreShape["execute"];
+  readonly readUntrackedFileOverride?: (path: string) => Promise<Uint8Array>;
+}) =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const { worktreesDir } = yield* ServerConfig;
+    const readUntrackedFile =
+      options?.readUntrackedFileOverride ??
+      ((filePath: string): Promise<Uint8Array> => nodeFs.readFile(filePath));
 
     const buildGeneratedDetachedWorktreePath = () =>
       Effect.gen(function* () {
@@ -597,11 +640,13 @@ export const makeGitCore = (options?: { executeOverride?: GitCoreShape["execute"
             .spawn(
               ChildProcess.make("git", commandInput.args, {
                 cwd: commandInput.cwd,
-                env: {
-                  ...process.env,
-                  ...input.env,
-                  ...trace2Monitor.env,
-                },
+                env: makeGitCommandEnvironment(
+                  process.env,
+                  commandInput.unsetEnv,
+                  commandInput.env,
+                  trace2Monitor.env,
+                ),
+                ...(commandInput.stdin === undefined ? {} : { stdin: commandInput.stdin }),
               }),
             )
             .pipe(Effect.mapError(toGitCommandError(commandInput, "failed to spawn.")));
@@ -961,7 +1006,20 @@ export const makeGitCore = (options?: { executeOverride?: GitCoreShape["execute"
           allowNonZeroExit: true,
           timeoutMs: Duration.toMillis(STATUS_UPSTREAM_REFRESH_TIMEOUT),
         },
-      ).pipe(Effect.asVoid);
+      ).pipe(
+        Effect.flatMap((result) =>
+          result.code === 0
+            ? Effect.void
+            : Effect.fail(
+                createGitCommandError(
+                  "GitCore.fetchUpstreamRefForStatus",
+                  cwd,
+                  ["fetch", "--quiet", "--no-tags", upstream.remoteName, refspec],
+                  result.stderr.trim() || `git fetch failed: code=${result.code}`,
+                ),
+              ),
+        ),
+      );
     };
 
     const statusUpstreamRefreshCache = yield* Cache.makeWith({
@@ -973,26 +1031,30 @@ export const makeGitCore = (options?: { executeOverride?: GitCoreShape["execute"
             remoteName: cacheKey.remoteName,
             upstreamBranch: cacheKey.upstreamBranch,
           });
-          return true as const;
+          return "succeeded" as const;
         }),
       // Keep successful refreshes warm; drop failures immediately so next request can retry.
       timeToLive: (exit) =>
         Exit.isSuccess(exit) ? STATUS_UPSTREAM_REFRESH_INTERVAL : Duration.zero,
     });
 
-    const refreshStatusUpstreamIfStale = (cwd: string): Effect.Effect<void, GitCommandError> =>
+    const refreshStatusUpstreamIfStale = (
+      cwd: string,
+      forceRefresh = false,
+    ): Effect.Effect<"not-configured" | "succeeded", GitCommandError> =>
       Effect.gen(function* () {
         const upstream = yield* resolveCurrentUpstream(cwd);
-        if (!upstream) return;
-        yield* Cache.get(
-          statusUpstreamRefreshCache,
-          new StatusUpstreamRefreshCacheKey({
-            cwd,
-            upstreamRef: upstream.upstreamRef,
-            remoteName: upstream.remoteName,
-            upstreamBranch: upstream.upstreamBranch,
-          }),
-        );
+        if (!upstream) return "not-configured" as const;
+        const cacheKey = new StatusUpstreamRefreshCacheKey({
+          cwd,
+          upstreamRef: upstream.upstreamRef,
+          remoteName: upstream.remoteName,
+          upstreamBranch: upstream.upstreamBranch,
+        });
+        if (forceRefresh) {
+          yield* Cache.invalidate(statusUpstreamRefreshCache, cacheKey);
+        }
+        return yield* Cache.get(statusUpstreamRefreshCache, cacheKey);
       });
 
     const refreshCheckedOutBranchUpstream = (cwd: string): Effect.Effect<void, GitCommandError> =>
@@ -1239,8 +1301,9 @@ export const makeGitCore = (options?: { executeOverride?: GitCoreShape["execute"
         return branchLastCommit;
       });
 
-    const statusDetails: GitCoreShape["statusDetails"] = (cwd) =>
+    const statusDetails: GitCoreShape["statusDetails"] = (cwd, options) =>
       Effect.gen(function* () {
+        const workingTreeMode = options?.workingTreeMode ?? "detailed";
         const operation = "GitCore.statusDetails.isInsideWorkTree";
         const args = ["rev-parse", "--is-inside-work-tree"] as const;
         const isInsideWorkTree = yield* executeGit(operation, cwd, args, {
@@ -1272,15 +1335,18 @@ export const makeGitCore = (options?: { executeOverride?: GitCoreShape["execute"
           return NON_REPOSITORY_STATUS_DETAILS;
         }
 
-        yield* refreshStatusUpstreamIfStale(cwd).pipe(
-          Effect.catchIf(isMissingGitCwdError, () => Effect.void),
-          Effect.ignoreCause({ log: true }),
-        );
+        const upstreamRefreshStatus =
+          options?.refreshUpstream === false
+            ? ("skipped" as const)
+            : yield* refreshStatusUpstreamIfStale(cwd, options?.forceUpstreamRefresh === true).pipe(
+                Effect.catch(() => Effect.succeed("failed" as const)),
+              );
 
         const statusStdout = yield* runGitStdout("GitCore.statusDetails.status", cwd, [
           "status",
           "--porcelain=2",
           "--branch",
+          ...(workingTreeMode === "summary" ? ["--untracked-files=all"] : []),
           "-z",
         ]).pipe(Effect.catchIf(isMissingGitCwdError, () => Effect.succeed(null)));
         if (statusStdout === null) {
@@ -1288,6 +1354,8 @@ export const makeGitCore = (options?: { executeOverride?: GitCoreShape["execute"
         }
 
         const parsedStatus = parseGitStatusPorcelain(statusStdout);
+        const hasCommits = parsedStatus.hasCommits;
+        const isDetached = parsedStatus.isDetached;
         const branch = parsedStatus.branch;
         const upstreamRef = parsedStatus.upstreamRef;
         let upstreamBranch: string | null = null;
@@ -1339,7 +1407,27 @@ export const makeGitCore = (options?: { executeOverride?: GitCoreShape["execute"
           hasOriginRemote: primaryRemoteName === "origin",
           isDefaultBranch:
             branch !== null && defaultBranchName !== null && branch === defaultBranchName,
+          hasCommits,
+          isDetached,
+          upstreamRefreshStatus,
         } as const;
+
+        if (workingTreeMode === "summary") {
+          const files = [...changedFilesWithoutNumstat]
+            .toSorted((a, b) => a.localeCompare(b))
+            .map((path) => ({ path, insertions: 0, deletions: 0 }));
+          return {
+            ...repoMetadata,
+            branch,
+            upstreamRef,
+            upstreamBranch,
+            hasWorkingTreeChanges,
+            workingTree: { files, insertions: 0, deletions: 0 },
+            hasUpstream: upstreamRef !== null,
+            aheadCount,
+            behindCount,
+          };
+        }
 
         const moveAwareWorkingTree =
           hasWorkingTreeChanges &&
@@ -1392,7 +1480,7 @@ export const makeGitCore = (options?: { executeOverride?: GitCoreShape["execute"
           if (filePathsWithStats.has(filePath)) continue;
 
           const insertions = untrackedFilesWithoutNumstat.has(filePath)
-            ? yield* Effect.tryPromise(() => nodeFs.readFile(nodePath.join(cwd, filePath))).pipe(
+            ? yield* Effect.tryPromise(() => readUntrackedFile(nodePath.join(cwd, filePath))).pipe(
                 Effect.map((contents) => countTextFileLines(new Uint8Array(contents))),
                 Effect.catch(() => Effect.succeed(0)),
               )

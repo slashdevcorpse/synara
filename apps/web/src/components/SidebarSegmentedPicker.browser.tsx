@@ -9,7 +9,7 @@ import { page } from "vitest/browser";
 import { afterEach, describe, expect, it } from "vitest";
 import { render } from "vitest-browser-react";
 
-import { SidebarSegmentedPicker } from "./Sidebar";
+import { resolveSidebarWorkspaceRoute, SidebarSegmentedPicker } from "./Sidebar";
 import type { SidebarView } from "./Sidebar.logic";
 
 function selectedSegment(): string | null {
@@ -56,5 +56,24 @@ describe("SidebarSegmentedPicker", () => {
 
     await page.getByRole("button", { name: "Browser back" }).click();
     expect(selectedSegment()).toBe("Projects");
+  });
+
+  it("keeps the dashboard on Projects when the terminal Workspace segment is hidden", async () => {
+    const route = resolveSidebarWorkspaceRoute("/workspace");
+
+    await render(
+      <SidebarSegmentedPicker
+        views={["studio", "threads"]}
+        activeView={route.isTerminalWorkspace ? "workspace" : "threads"}
+        onSelectView={() => undefined}
+      />,
+    );
+
+    expect(selectedSegment()).toBe("Projects");
+    expect(
+      Array.from(document.querySelectorAll("button")).some(
+        (button) => button.textContent === "Workspace",
+      ),
+    ).toBe(false);
   });
 });

@@ -1,16 +1,19 @@
 // FILE: _chat.index.tsx
-// Purpose: Restores the last chat route on app launch, falling back to a fresh home-chat draft.
+// Purpose: Restores the last chat route on app launch, opening Workspace on a truly fresh install.
 // Layer: Routing
 // Depends on: the shared restore/create route surface plus the home-chat new-chat handler.
 
-import { createFileRoute } from "@tanstack/react-router";
+import { createFileRoute, useNavigate } from "@tanstack/react-router";
 
 import {
   RestoreOrCreateChatRoute,
   type RestoreRouteResolver,
 } from "../components/RestoreOrCreateChatRoute";
 import { readSidebarUiState } from "../components/Sidebar.uiState";
-import { resolveRestorableThreadRoute } from "../chatRouteRestore";
+import {
+  resolveRestorableThreadRoute,
+  shouldOpenWorkspaceDashboardOnEmptyHome,
+} from "../chatRouteRestore";
 import { useComposerDraftStore } from "../composerDraftStore";
 import { useHandleNewChat } from "../hooks/useHandleNewChat";
 import { collectStudioProjectIds } from "../lib/studioProjects";
@@ -18,6 +21,7 @@ import { EMPTY_THREAD_IDS, useStore } from "../store";
 import { useWorkspaceStore } from "../workspaceStore";
 
 function ChatIndexRouteView() {
+  const navigate = useNavigate();
   const { handleNewChat } = useHandleNewChat();
   const threadIds = useStore((state) => state.threadIds ?? EMPTY_THREAD_IDS);
   const projects = useStore((state) => state.projects);
@@ -26,7 +30,6 @@ function ChatIndexRouteView() {
   const homeDir = useWorkspaceStore((state) => state.homeDir);
   const chatWorkspaceRoot = useWorkspaceStore((state) => state.chatWorkspaceRoot);
   const studioWorkspaceRoot = useWorkspaceStore((state) => state.studioWorkspaceRoot);
-  const createFreshChat = () => handleNewChat({ fresh: true });
 
   // Home chats restore the last visited route, except Studio threads — those belong to the
   // /studio surface, and restoring one from "/" would silently switch the user into the Studio
@@ -53,6 +56,19 @@ function ChatIndexRouteView() {
       nonStudioDraftThreadIds.add(threadId);
     }
   }
+  const createFreshChat = async () => {
+    if (
+      shouldOpenWorkspaceDashboardOnEmptyHome({
+        availableThreadCount: threadIds.length,
+        draftThreadCount: nonStudioDraftThreadIds.size,
+        lastThreadRoute: readSidebarUiState().lastThreadRoute,
+      })
+    ) {
+      await navigate({ to: "/workspace", replace: true });
+      return { ok: true, threadId: null } as const;
+    }
+    return handleNewChat({ fresh: true });
+  };
   const resolveRestoreRoute: RestoreRouteResolver = ({ availableSplitViewIds }) => {
     const availableThreadIds = new Set<string>(
       threadIds.filter((threadId) => {

@@ -55,6 +55,7 @@ const project: OrchestrationProjectShell = {
   isPinned: false,
   createdAt: now,
   updatedAt: now,
+  archivedAt: null,
 };
 
 const dispatchedCommands: OrchestrationCommand[] = [];
@@ -92,6 +93,8 @@ let failDispatchType: OrchestrationCommand["type"] | null = null;
 let dispatchHook:
   | ((command: OrchestrationCommand) => Effect.Effect<void, OrchestrationCommandInternalError>)
   | null = null;
+const knownProjectIds = new Set<ProjectId>([projectId]);
+const hiddenProjectIds = new Set<ProjectId>();
 
 function resetHarness() {
   dispatchedCommands.length = 0;
@@ -420,7 +423,19 @@ const projectionSnapshotQuery = {
       updatedAt: now,
     }),
   getActiveProjectByWorkspaceRoot: () => Effect.succeed(Option.some(project as never)),
-  getProjectShellById: () => Effect.succeed(Option.some(project)),
+  getProjectShellById: (candidateProjectId: ProjectId) =>
+    Effect.succeed(
+      !knownProjectIds.has(candidateProjectId) || hiddenProjectIds.has(candidateProjectId)
+        ? Option.none()
+        : Option.some({
+            ...project,
+            id: candidateProjectId,
+            workspaceRoot:
+              candidateProjectId === project.id
+                ? project.workspaceRoot
+                : `/tmp/${candidateProjectId}`,
+          }),
+    ),
   getFirstActiveThreadIdByProjectId: () => Effect.succeed(Option.none()),
   getThreadCheckpointContext: () => Effect.succeed(Option.none()),
   getFullThreadDiffContext: () => Effect.succeed(Option.none()),
@@ -574,6 +589,30 @@ layer("AutomationService", (it) => {
       assert.strictEqual(result.run.messageId, turnStart.message.messageId);
       assert.strictEqual(result.run.threadCreateCommandId, threadCreate.commandId);
       assert.strictEqual(result.run.turnStartCommandId, turnStart.commandId);
+    }),
+  );
+
+  it.effect("rejects a manual run before persisting work when its project is not active", () =>
+    Effect.gen(function* () {
+      resetHarness();
+      const service = yield* AutomationService;
+      const inactiveProjectId = ProjectId.makeUnsafe("automation-project-inactive-manual");
+      knownProjectIds.add(inactiveProjectId);
+      const created = yield* service.create({
+        ...createInput("local"),
+        projectId: inactiveProjectId,
+      });
+      hiddenProjectIds.add(inactiveProjectId);
+
+      const error = yield* service.runNow({ automationId: created.id }).pipe(Effect.flip);
+      const listed = yield* service.list({ projectId: inactiveProjectId });
+
+      assert.match(error.message, /Automation project was not found/);
+      assert.strictEqual(listed.definitions.length, 1);
+      assert.strictEqual(listed.runs.length, 0);
+      assert.strictEqual(dispatchedCommands.length, 0);
+      hiddenProjectIds.delete(inactiveProjectId);
+      knownProjectIds.delete(inactiveProjectId);
     }),
   );
 

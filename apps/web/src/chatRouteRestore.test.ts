@@ -2,11 +2,45 @@ import { describe, expect, it } from "vitest";
 
 import {
   resolveRestorableThreadRoute,
+  shouldOpenWorkspaceDashboardOnEmptyHome,
   shouldHoldMissingThreadRouteFallback,
   shouldHoldRememberedRouteFallback,
   shouldStartMissingThreadRouteRecovery,
   shouldStartRememberedRouteRecovery,
 } from "./chatRouteRestore";
+
+describe("shouldOpenWorkspaceDashboardOnEmptyHome", () => {
+  it("opens the dashboard only for a truly fresh home route", () => {
+    expect(
+      shouldOpenWorkspaceDashboardOnEmptyHome({
+        availableThreadCount: 0,
+        draftThreadCount: 0,
+        lastThreadRoute: null,
+      }),
+    ).toBe(true);
+    expect(
+      shouldOpenWorkspaceDashboardOnEmptyHome({
+        availableThreadCount: 1,
+        draftThreadCount: 0,
+        lastThreadRoute: null,
+      }),
+    ).toBe(false);
+    expect(
+      shouldOpenWorkspaceDashboardOnEmptyHome({
+        availableThreadCount: 0,
+        draftThreadCount: 1,
+        lastThreadRoute: null,
+      }),
+    ).toBe(false);
+    expect(
+      shouldOpenWorkspaceDashboardOnEmptyHome({
+        availableThreadCount: 0,
+        draftThreadCount: 0,
+        lastThreadRoute: { threadId: "remembered-thread" },
+      }),
+    ).toBe(false);
+  });
+});
 
 describe("resolveRestorableThreadRoute", () => {
   it("returns the last thread route when the thread still exists", () => {

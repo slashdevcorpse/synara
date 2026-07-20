@@ -5,9 +5,11 @@ import { ProjectId } from "@synara/contracts";
 import { describe, expect, it } from "vitest";
 
 import {
+  extractArchivedProjectCreateProjectId,
   extractDuplicateProjectCreateProjectId,
   findRecoverableProject,
   findRecoverableProjectForDuplicateCreate,
+  isArchivedProjectCreateError,
   isDuplicateProjectCreateError,
   waitForRecoverableProjectInReadModel,
   waitForRecoverableProjectForDuplicateCreate,
@@ -28,6 +30,15 @@ describe("projectCreateRecovery", () => {
         "Orchestration command invariant failed (project.create): Project 'project-123' already uses workspace root '/Users/tester/Code/one'.",
       ),
     ).toBe("project-123");
+  });
+
+  it("detects archived workspace owners and extracts the original project id", () => {
+    const message =
+      "Orchestration command invariant failed (project.create): Project 'project-archived' is archived and reserves workspace root '/Users/tester/Code/one'. Restore project 'project-archived' instead of creating a new project.";
+
+    expect(isArchivedProjectCreateError(message)).toBe(true);
+    expect(extractArchivedProjectCreateProjectId(message)).toBe("project-archived");
+    expect(isDuplicateProjectCreateError(message)).toBe(false);
   });
 
   it("prefers the explicit duplicate project id when recovering from a server snapshot", () => {

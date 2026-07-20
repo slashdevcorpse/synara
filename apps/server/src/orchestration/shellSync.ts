@@ -10,6 +10,7 @@ import {
 import { Cause, Duration, Effect, Fiber, Option, Queue, Semaphore, Stream } from "effect";
 
 import type { SnapshotLiveStreamItem } from "../wsSnapshotLiveStream";
+import { isProjectVisibilityEvent, toProjectVisibilityShellEvent } from "../wsShellVisibility";
 
 export const SHELL_SYNC_COALESCE_WINDOW = Duration.millis(50);
 export const SHELL_SYNC_MAX_BATCH_SIZE = 512;
@@ -101,6 +102,9 @@ export function projectShellEvent<E>(
   event: OrchestrationEvent,
   queries: ShellProjectionQueries<E>,
 ): Effect.Effect<Option.Option<OrchestrationShellStreamEvent>, ShellProjectionReadFailure<E>> {
+  if (isProjectVisibilityEvent(event)) {
+    return Effect.succeed(Option.some(toProjectVisibilityShellEvent(event)));
+  }
   switch (event.type) {
     case "project.created":
     case "project.meta-updated":

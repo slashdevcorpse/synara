@@ -183,6 +183,44 @@ describe("shell synchronization", () => {
     expect(reportedFailures).toBe(1);
   });
 
+  it.each(["project.archived", "project.unarchived"] as const)(
+    "invalidates the shell snapshot for %s without reading a stale projection",
+    async (type) => {
+      const projectId = ProjectId.makeUnsafe("project-visibility");
+      const source: OrchestrationEvent =
+        type === "project.archived"
+          ? {
+              ...eventBase(9, "project", projectId),
+              type,
+              payload: { projectId, archivedAt: TEST_TIMESTAMP },
+            }
+          : {
+              ...eventBase(9, "project", projectId),
+              type,
+              payload: { projectId, unarchivedAt: TEST_TIMESTAMP },
+            };
+      let projectionReads = 0;
+
+      const projected = await Effect.runPromise(
+        projectShellEvent(source, {
+          getProjectShellById: () =>
+            Effect.sync(() => {
+              projectionReads += 1;
+              return Option.none();
+            }),
+          getThreadShellById: () => Effect.die("unexpected thread projection read"),
+        }),
+      );
+
+      expect(Option.getOrNull(projected)).toEqual({
+        kind: "snapshot-invalidated",
+        sequence: 9,
+        reason: "project-visibility-changed",
+      });
+      expect(projectionReads).toBe(0);
+    },
+  );
+
   it("does not advance delivery past a persistent projection failure", async () => {
     const deliveredSequences: number[] = [];
     const failure = {

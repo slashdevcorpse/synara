@@ -20,12 +20,31 @@ function shellSnapshotHasThreads(snapshot: OrchestrationShellSnapshot): boolean 
   return snapshot.threads.length > 0;
 }
 
+function getActiveReadModelProjectIds(snapshot: OrchestrationReadModel) {
+  return new Set(
+    snapshot.projects
+      .filter(
+        (project) => (project.deletedAt ?? null) === null && (project.archivedAt ?? null) === null,
+      )
+      .map((project) => project.id),
+  );
+}
+
 function readModelHasProjectsOrThreads(snapshot: OrchestrationReadModel): boolean {
-  return snapshot.projects.length > 0 || snapshot.threads.length > 0;
+  const activeProjectIds = getActiveReadModelProjectIds(snapshot);
+  return (
+    activeProjectIds.size > 0 ||
+    snapshot.threads.some(
+      (thread) => (thread.deletedAt ?? null) === null && activeProjectIds.has(thread.projectId),
+    )
+  );
 }
 
 function readModelHasThreads(snapshot: OrchestrationReadModel): boolean {
-  return snapshot.threads.length > 0;
+  const activeProjectIds = getActiveReadModelProjectIds(snapshot);
+  return snapshot.threads.some(
+    (thread) => (thread.deletedAt ?? null) === null && activeProjectIds.has(thread.projectId),
+  );
 }
 
 export function waitForEmptyRouteRestoreFallbackDelay(): Promise<void> {

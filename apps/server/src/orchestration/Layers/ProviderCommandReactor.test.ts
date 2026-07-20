@@ -7338,6 +7338,265 @@ describe("ProviderCommandReactor", () => {
     expect(thread?.session?.activeTurnId).toBeNull();
   });
 
+  it("settles archive-triggered session cleanup after the parent becomes archived", async () => {
+    const harness = await createHarness();
+    const now = new Date().toISOString();
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.makeUnsafe("cmd-session-set-before-project-archive"),
+        threadId: ThreadId.makeUnsafe("thread-1"),
+        session: {
+          threadId: ThreadId.makeUnsafe("thread-1"),
+          status: "ready",
+          providerName: "codex",
+          runtimeMode: "approval-required",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: now,
+        },
+        createdAt: now,
+      }),
+    );
+
+    const archived = await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "project.archive",
+        commandId: CommandId.makeUnsafe("cmd-project-archive-with-provider-cleanup"),
+        projectId: asProjectId("project-1"),
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(async () => {
+      const readModel = await Effect.runPromise(harness.engine.getReadModel());
+      return (
+        harness.stopSession.mock.calls.length === 1 &&
+        readModel.projects.find((project) => project.id === asProjectId("project-1"))
+          ?.archivedAt === now &&
+        readModel.threads.find((thread) => thread.id === ThreadId.makeUnsafe("thread-1"))?.session
+          ?.status === "stopped"
+      );
+    });
+
+    const events = Array.from(
+      await Effect.runPromise(
+        Stream.runCollect(harness.engine.readEventsThrough(0, archived.sequence)),
+      ),
+    );
+    const stopIntent = events.find(
+      (event) =>
+        event.type === "thread.session-stop-requested" &&
+        event.commandId === "cmd-project-archive-with-provider-cleanup",
+    );
+    expect(stopIntent).toBeDefined();
+    await waitFor(
+      async () =>
+        Option.getOrUndefined(
+          await Effect.runPromise(
+            harness.deliveryRepository.getDelivery({
+              consumerName: "provider-command-reactor.v1",
+              eventSequence: stopIntent!.sequence,
+            }),
+          ),
+        )?.state === "succeeded",
+    );
+    const delivery = await Effect.runPromise(
+      harness.deliveryRepository.getDelivery({
+        consumerName: "provider-command-reactor.v1",
+        eventSequence: stopIntent!.sequence,
+      }),
+    );
+    expect(Option.getOrUndefined(delivery)?.state).toBe("succeeded");
+  });
+
+  it("does not unarchive until the archive-triggered stop delivery has settled", async () => {
+    const harness = await createHarness({ startReactor: false });
+    const now = new Date().toISOString();
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.makeUnsafe("cmd-session-ready-before-delayed-archive-cleanup"),
+        threadId: ThreadId.makeUnsafe("thread-1"),
+        session: {
+          threadId: ThreadId.makeUnsafe("thread-1"),
+          status: "ready",
+          providerName: "codex",
+          runtimeMode: "approval-required",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: now,
+        },
+        createdAt: now,
+      }),
+    );
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "project.archive",
+        commandId: CommandId.makeUnsafe("cmd-archive-before-delayed-cleanup"),
+        projectId: asProjectId("project-1"),
+        createdAt: now,
+      }),
+    );
+
+    await expect(
+      Effect.runPromise(
+        harness.engine.dispatch({
+          type: "project.unarchive",
+          commandId: CommandId.makeUnsafe("cmd-unarchive-before-delayed-cleanup"),
+          projectId: asProjectId("project-1"),
+          createdAt: now,
+        }),
+      ),
+    ).rejects.toThrow(/archive session cleanup have settled/);
+
+    await harness.startReactor();
+    await waitFor(async () => {
+      const readModel = await Effect.runPromise(harness.engine.getReadModel());
+      return (
+        harness.stopSession.mock.calls.length === 1 &&
+        readModel.threads.find((thread) => thread.id === ThreadId.makeUnsafe("thread-1"))?.session
+          ?.status === "stopped"
+      );
+    });
+
+    await expect(
+      Effect.runPromise(
+        harness.engine.dispatch({
+          type: "project.unarchive",
+          commandId: CommandId.makeUnsafe("cmd-unarchive-after-delayed-cleanup"),
+          projectId: asProjectId("project-1"),
+          createdAt: now,
+        }),
+      ),
+    ).resolves.toBeDefined();
+    const restored = await Effect.runPromise(harness.engine.getReadModel());
+    expect(
+      restored.projects.find((project) => project.id === asProjectId("project-1"))?.archivedAt,
+    ).toBeNull();
+  });
+
+  it("rejects archive while a committed turn-start intent is not yet acknowledged", async () => {
+    const harness = await createHarness({ startReactor: false });
+    const now = new Date().toISOString();
+
+    const started = await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.makeUnsafe("cmd-turn-before-project-archive"),
+        threadId: ThreadId.makeUnsafe("thread-1"),
+        message: {
+          messageId: asMessageId("message-before-project-archive"),
+          role: "user",
+          text: "Do not let archive overtake this provider intent.",
+          attachments: [],
+        },
+        runtimeMode: "approval-required",
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        createdAt: now,
+      }),
+    );
+    const events = Array.from(
+      await Effect.runPromise(
+        Stream.runCollect(harness.engine.readEventsThrough(0, started.sequence)),
+      ),
+    );
+    expect(events.some((event) => event.type === "thread.turn-start-requested")).toBe(true);
+
+    await expect(
+      Effect.runPromise(
+        harness.engine.dispatch({
+          type: "project.archive",
+          commandId: CommandId.makeUnsafe("cmd-archive-over-unacked-turn-start"),
+          projectId: asProjectId("project-1"),
+          createdAt: now,
+        }),
+      ),
+    ).rejects.toThrow(/cannot be archived while thread/);
+
+    const readModel = await Effect.runPromise(harness.engine.getReadModel());
+    expect(
+      readModel.projects.find((project) => project.id === asProjectId("project-1"))?.archivedAt,
+    ).toBeNull();
+  });
+
+  it("rejects archive across the committed-event to queued-promotion persistence gap", async () => {
+    const harness = await createHarness({ startReactor: false });
+    const now = new Date().toISOString();
+    const activeTurnId = asTurnId("turn-active-before-queued-archive");
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.makeUnsafe("cmd-running-before-queued-archive"),
+        threadId: ThreadId.makeUnsafe("thread-1"),
+        session: {
+          threadId: ThreadId.makeUnsafe("thread-1"),
+          status: "running",
+          providerName: "codex",
+          runtimeMode: "approval-required",
+          activeTurnId,
+          lastError: null,
+          updatedAt: now,
+        },
+        createdAt: now,
+      }),
+    );
+    const queued = await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.makeUnsafe("cmd-queued-before-project-archive"),
+        threadId: ThreadId.makeUnsafe("thread-1"),
+        message: {
+          messageId: asMessageId("message-queued-before-project-archive"),
+          role: "user",
+          text: "Remain durable until promotion.",
+          attachments: [],
+        },
+        dispatchMode: "queue",
+        runtimeMode: "approval-required",
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        createdAt: now,
+      }),
+    );
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.makeUnsafe("cmd-ready-after-queued-before-archive"),
+        threadId: ThreadId.makeUnsafe("thread-1"),
+        session: {
+          threadId: ThreadId.makeUnsafe("thread-1"),
+          status: "ready",
+          providerName: "codex",
+          runtimeMode: "approval-required",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: now,
+        },
+        createdAt: now,
+      }),
+    );
+    const events = Array.from(
+      await Effect.runPromise(
+        Stream.runCollect(harness.engine.readEventsThrough(0, queued.sequence)),
+      ),
+    );
+    expect(events.some((event) => event.type === "thread.turn-queued")).toBe(true);
+
+    await expect(
+      Effect.runPromise(
+        harness.engine.dispatch({
+          type: "project.archive",
+          commandId: CommandId.makeUnsafe("cmd-archive-over-unpersisted-queue"),
+          projectId: asProjectId("project-1"),
+          createdAt: now,
+        }),
+      ),
+    ).rejects.toThrow(/cannot be archived while thread/);
+  });
+
   it("does not restore pending sidechat context after an explicit session stop", async () => {
     const threadId = ThreadId.makeUnsafe("thread-stopped-droid-sidechat");
     const harness = await createHarness({

@@ -8,7 +8,10 @@ import type {
   ProjectId,
   ThreadId,
 } from "@synara/contracts";
-import { THREAD_NOT_ARCHIVED_INVARIANT_MARKER } from "@synara/shared/errorMessages";
+import {
+  PROJECT_ARCHIVED_WORKSPACE_ROOT_INVARIANT_MARKER,
+  THREAD_NOT_ARCHIVED_INVARIANT_MARKER,
+} from "@synara/shared/errorMessages";
 import { normalizeWorkspaceRootForComparison } from "@synara/shared/threadWorkspace";
 import { Effect } from "effect";
 
@@ -56,8 +59,10 @@ export function findProjectById(
   return readModel.projects.find((project) => project.id === projectId);
 }
 
-// Finds active projects by workspace root using the same comparison rules as import flows.
-export function listActiveProjectsByWorkspaceRoot(
+// Finds every non-deleted project by workspace root using the same comparison
+// rules as import flows. Archived rows remain workspace identity owners even
+// while hidden from the active shell.
+export function listProjectsByWorkspaceRoot(
   readModel: OrchestrationReadModel,
   workspaceRoot: string,
   options?: { readonly kinds?: ReadonlySet<ProjectKind> },
@@ -73,6 +78,17 @@ export function listActiveProjectsByWorkspaceRoot(
       normalizeWorkspaceRootForComparison(project.workspaceRoot, {
         platform: process.platform,
       }) === normalizedWorkspaceRoot,
+  );
+}
+
+// Active-only view retained for flows that intentionally ignore archived rows.
+export function listActiveProjectsByWorkspaceRoot(
+  readModel: OrchestrationReadModel,
+  workspaceRoot: string,
+  options?: { readonly kinds?: ReadonlySet<ProjectKind> },
+): ReadonlyArray<OrchestrationProject> {
+  return listProjectsByWorkspaceRoot(readModel, workspaceRoot, options).filter(
+    (project) => project.archivedAt === null,
   );
 }
 
@@ -125,7 +141,7 @@ export function requireProjectWorkspaceRootAvailable(input: {
 }): Effect.Effect<void, OrchestrationCommandInvariantError> {
   // Skip the excluded project BEFORE picking, not after: if corrupt state ever leaves two
   // active owners on one root, the project being updated must not mask the other owner.
-  const existingProject = listActiveProjectsByWorkspaceRoot(
+  const existingProject = listProjectsByWorkspaceRoot(
     input.readModel,
     input.workspaceRoot,
     input.kinds ? { kinds: input.kinds } : undefined,
@@ -136,7 +152,66 @@ export function requireProjectWorkspaceRootAvailable(input: {
   return Effect.fail(
     invariantError(
       input.command.type,
-      `Project '${existingProject.id}' already uses workspace root '${existingProject.workspaceRoot}'.`,
+      existingProject.archivedAt === null
+        ? `Project '${existingProject.id}' already uses workspace root '${existingProject.workspaceRoot}'.`
+        : `Project '${existingProject.id}' ${PROJECT_ARCHIVED_WORKSPACE_ROOT_INVARIANT_MARKER} '${existingProject.workspaceRoot}'. Restore project '${existingProject.id}' instead of creating a new project.`,
+    ),
+  );
+}
+
+const PROJECT_ARCHIVE_MUTATION_EXEMPT_COMMANDS = new Set<OrchestrationCommand["type"]>([
+  "project.create",
+  "project.archive",
+  "project.unarchive",
+  "project.delete",
+]);
+
+function projectForCommand(
+  readModel: OrchestrationReadModel,
+  command: OrchestrationCommand,
+): OrchestrationProject | undefined {
+  if (PROJECT_ARCHIVE_MUTATION_EXEMPT_COMMANDS.has(command.type)) {
+    return undefined;
+  }
+  if ("projectId" in command) {
+    return findProjectById(readModel, command.projectId);
+  }
+  if ("threadId" in command) {
+    const thread = findThreadById(readModel, command.threadId);
+    return thread ? findProjectById(readModel, thread.projectId) : undefined;
+  }
+  return undefined;
+}
+
+/**
+ * Reject every mutation routed through an archived project, including crafted
+ * internal/provider commands. Archive, unarchive, and terminal delete remain
+ * explicit escape hatches and enforce their own state invariants.
+ */
+export function requireCommandProjectNotArchived(input: {
+  readonly readModel: OrchestrationReadModel;
+  readonly command: OrchestrationCommand;
+}): Effect.Effect<void, OrchestrationCommandInvariantError> {
+  const project = projectForCommand(input.readModel, input.command);
+  if (!project || project.archivedAt === null) {
+    return Effect.void;
+  }
+  // Archive emits a stop intent before changing project visibility. The provider
+  // reactor settles that intent asynchronously after the project is archived;
+  // permit only its terminal, inactive session state. Client command schemas do
+  // not expose thread.session.set, and every start/resume/nonterminal mutation
+  // remains blocked by this centralized guard.
+  if (
+    input.command.type === "thread.session.set" &&
+    input.command.session.status === "stopped" &&
+    input.command.session.activeTurnId === null
+  ) {
+    return Effect.void;
+  }
+  return Effect.fail(
+    invariantError(
+      input.command.type,
+      `Project '${project.id}' is archived and cannot handle command '${input.command.type}'.`,
     ),
   );
 }

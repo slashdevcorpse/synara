@@ -338,10 +338,24 @@ const makeAutomationRepository = Effect.gen(function* () {
           created_at AS "createdAt",
           updated_at AS "updatedAt",
           archived_at AS "archivedAt"
-        FROM automation_definitions
-        WHERE (${projectId ?? null} IS NULL OR project_id = ${projectId ?? null})
-          AND (${includeArchived ? 1 : 0} = 1 OR archived_at IS NULL)
-        ORDER BY updated_at DESC, automation_id ASC
+        FROM automation_definitions definitions
+        WHERE (${projectId ?? null} IS NULL OR definitions.project_id = ${projectId ?? null})
+          AND (${includeArchived ? 1 : 0} = 1 OR definitions.archived_at IS NULL)
+          AND (
+            NOT EXISTS (
+              SELECT 1
+              FROM projection_projects projects
+              WHERE projects.project_id = definitions.project_id
+            )
+            OR EXISTS (
+              SELECT 1
+              FROM projection_projects projects
+              WHERE projects.project_id = definitions.project_id
+                AND projects.deleted_at IS NULL
+                AND projects.archived_at IS NULL
+            )
+          )
+        ORDER BY definitions.updated_at DESC, definitions.automation_id ASC
       `,
   });
 
@@ -388,6 +402,20 @@ const makeAutomationRepository = Effect.gen(function* () {
         FROM automation_definitions definitions
         WHERE definitions.enabled = 1
           AND definitions.archived_at IS NULL
+          AND (
+            NOT EXISTS (
+              SELECT 1
+              FROM projection_projects projects
+              WHERE projects.project_id = definitions.project_id
+            )
+            OR EXISTS (
+              SELECT 1
+              FROM projection_projects projects
+              WHERE projects.project_id = definitions.project_id
+                AND projects.deleted_at IS NULL
+                AND projects.archived_at IS NULL
+            )
+          )
           AND definitions.next_run_at IS NOT NULL
           AND definitions.next_run_at <= ${now}
           AND NOT (
@@ -427,6 +455,10 @@ const makeAutomationRepository = Effect.gen(function* () {
 
   const insertRun = SqlSchema.void({
     Request: AutomationRunDbRow,
+    // Once the project projection exists, run creation and project archive contend on the
+    // same SQLite database: either this insert wins and archive observes active work, or
+    // archive wins and this insert becomes a no-op. The absent-row branch preserves import/
+    // repair compatibility; AutomationService independently requires an active shell project.
     execute: (run) =>
       sql`
         INSERT OR IGNORE INTO automation_runs (
@@ -474,13 +506,29 @@ const makeAutomationRepository = Effect.gen(function* () {
           ${run.permissionSnapshot},
           ${run.createdAt},
           ${run.updatedAt}
-        WHERE ${run.threadId} IS NULL
-           OR NOT EXISTS (
-             SELECT 1
-             FROM automation_runs
-             WHERE thread_id = ${run.threadId}
-               AND status IN ('pending', 'claimed', 'running', 'waiting-for-approval')
-           )
+        WHERE (
+          NOT EXISTS (
+            SELECT 1
+            FROM projection_projects
+            WHERE project_id = ${run.projectId}
+          )
+          OR EXISTS (
+            SELECT 1
+            FROM projection_projects
+            WHERE project_id = ${run.projectId}
+              AND deleted_at IS NULL
+              AND archived_at IS NULL
+          )
+        )
+          AND (
+            ${run.threadId} IS NULL
+            OR NOT EXISTS (
+              SELECT 1
+              FROM automation_runs
+              WHERE thread_id = ${run.threadId}
+                AND status IN ('pending', 'claimed', 'running', 'waiting-for-approval')
+            )
+          )
       `,
   });
 
@@ -588,6 +636,20 @@ const makeAutomationRepository = Effect.gen(function* () {
           ON definitions.automation_id = runs.automation_id
         WHERE (${projectId ?? null} IS NULL OR runs.project_id = ${projectId ?? null})
           AND (${includeArchived ? 1 : 0} = 1 OR definitions.archived_at IS NULL)
+          AND (
+            NOT EXISTS (
+              SELECT 1
+              FROM projection_projects projects
+              WHERE projects.project_id = runs.project_id
+            )
+            OR EXISTS (
+              SELECT 1
+              FROM projection_projects projects
+              WHERE projects.project_id = runs.project_id
+                AND projects.deleted_at IS NULL
+                AND projects.archived_at IS NULL
+            )
+          )
         ORDER BY runs.scheduled_for DESC, runs.run_id DESC
         LIMIT ${MAX_RUN_LIST_ROWS}
       `,

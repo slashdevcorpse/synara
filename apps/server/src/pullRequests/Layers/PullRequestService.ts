@@ -65,6 +65,14 @@ type PullRequestListBatch = {
 
 type PullRequestListError = PullRequestsListResult["errors"][number];
 
+function isActivePullRequestProject(project: OrchestrationProject): boolean {
+  return (
+    project.kind === "project" &&
+    project.deletedAt === null &&
+    (project.archivedAt ?? null) === null
+  );
+}
+
 export interface PullRequestServiceDependencies {
   readonly homeDir: string;
   readonly github: GitHubCliShape;
@@ -252,10 +260,7 @@ export const makePullRequestService = (
       dependencies.getSnapshot().pipe(
         Effect.flatMap((snapshot) => {
           const project = snapshot.projects.find(
-            (candidate) =>
-              candidate.id === projectId &&
-              candidate.kind === "project" &&
-              candidate.deletedAt === null,
+            (candidate) => candidate.id === projectId && isActivePullRequestProject(candidate),
           );
           return project ? Effect.succeed(project) : Effect.fail(new Error("Project not found."));
         }),
@@ -302,8 +307,7 @@ export const makePullRequestService = (
         const snapshot = yield* dependencies.getSnapshot();
         const projects = snapshot.projects.filter(
           (project) =>
-            project.deletedAt === null &&
-            project.kind === "project" &&
+            isActivePullRequestProject(project) &&
             (input.projectId == null || project.id === input.projectId),
         );
         const projectById = new Map(projects.map((project) => [project.id, project]));
@@ -504,8 +508,7 @@ export const makePullRequestService = (
         const snapshot = yield* dependencies.getSnapshot();
         const projects = snapshot.projects.filter(
           (project) =>
-            project.deletedAt === null &&
-            project.kind === "project" &&
+            isActivePullRequestProject(project) &&
             (input.projectId == null || project.id === input.projectId),
         );
         const resolved = yield* resolveProjectRepositoryInventories({

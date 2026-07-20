@@ -95,6 +95,47 @@ it.effect("accepts project script discovery requests", () =>
   }),
 );
 
+it.effect("accepts bounded workspace git-state requests and clone defaults", () =>
+  Effect.gen(function* () {
+    const list = yield* decode(WebSocketRequest, {
+      id: "req-workspace-list",
+      body: {
+        _tag: WS_METHODS.workspaceListGitStates,
+        projectIds: ["project-1", "project-1"],
+      },
+    });
+    const clone = yield* decode(WebSocketRequest, {
+      id: "req-workspace-clone",
+      body: {
+        _tag: WS_METHODS.workspaceCloneRepository,
+        cloneId: "clone-1",
+        url: "https://github.com/example/repo.git",
+        targetPath: "/repos/repo",
+      },
+    });
+
+    assert.strictEqual(list.body._tag, WS_METHODS.workspaceListGitStates);
+    assert.strictEqual(clone.body._tag, WS_METHODS.workspaceCloneRepository);
+    if (clone.body._tag === WS_METHODS.workspaceCloneRepository) {
+      assert.strictEqual(clone.body.createProject, true);
+      assert.strictEqual(clone.body.createParentDirectories, true);
+    }
+  }),
+);
+
+it.effect("accepts the zero-input archived-project summary request", () =>
+  Effect.gen(function* () {
+    const parsed = yield* decode(WebSocketRequest, {
+      id: "req-workspace-archived",
+      body: {
+        _tag: WS_METHODS.workspaceListArchivedProjects,
+      },
+    });
+
+    assert.strictEqual(parsed.body._tag, WS_METHODS.workspaceListArchivedProjects);
+  }),
+);
+
 it.effect("accepts automation create requests", () =>
   Effect.gen(function* () {
     const parsed = yield* decode(WebSocketRequest, {
@@ -182,6 +223,36 @@ it.effect("accepts git.actionProgress push envelopes", () =>
     }
 
     assert.strictEqual(parsed.channel, WS_CHANNELS.gitActionProgress);
+  }),
+);
+
+it.effect("accepts workspace.cloneProgress push envelopes", () =>
+  Effect.gen(function* () {
+    const parsed = yield* decode(WsResponse, {
+      type: "push",
+      sequence: 5,
+      channel: WS_CHANNELS.workspaceCloneProgress,
+      data: {
+        _tag: "clone_progress",
+        snapshot: {
+          cloneId: "clone-1",
+          status: "running",
+          stage: "cloning",
+          percent: 50,
+          message: "Receiving objects: 50%",
+          result: null,
+          updatedAt: "2026-07-20T12:00:00.000Z",
+        },
+        phase: "Receiving objects",
+        completed: 5,
+        total: 10,
+      },
+    });
+
+    if (!("type" in parsed) || parsed.type !== "push") {
+      assert.fail("expected websocket response to decode as a push envelope");
+    }
+    assert.strictEqual(parsed.channel, WS_CHANNELS.workspaceCloneProgress);
   }),
 );
 

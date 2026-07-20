@@ -77,6 +77,7 @@ describe("createOrRecoverProjectFromPath", () => {
       projectId: createdProjectId,
       project: expect.objectContaining({ id: createdProjectId }),
       created: true,
+      restored: false,
     });
   });
 
@@ -99,6 +100,91 @@ describe("createOrRecoverProjectFromPath", () => {
       projectId: existingProject.id,
       project: existingProject,
       created: false,
+      restored: false,
     });
+  });
+
+  it("restores an archived workspace owner and preserves its original project id", async () => {
+    const archivedProject = makeProject("project-archived");
+    let restored = false;
+    const dispatchCommand = vi.fn(async (command: { type: string; projectId?: ProjectId }) => {
+      if (command.type === "project.create") {
+        throw new Error(
+          "Orchestration command invariant failed (project.create): Project 'project-archived' is archived and reserves workspace root '/Users/tester/Developer/synara'. Restore project 'project-archived' instead of creating a new project.",
+        );
+      }
+      restored = true;
+      return { sequence: 3 };
+    });
+    const loadSnapshot = vi.fn(async () => makeSnapshot(restored ? [archivedProject] : []));
+
+    const result = await createOrRecoverProjectFromPath({
+      api: makeApi(dispatchCommand),
+      workspaceRoot: WORKSPACE_ROOT,
+      loadSnapshot,
+      delayMs: 0,
+    });
+
+    expect(dispatchCommand).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        type: "project.unarchive",
+        projectId: archivedProject.id,
+      }),
+    );
+    expect(result).toMatchObject({
+      projectId: archivedProject.id,
+      project: archivedProject,
+      created: false,
+      restored: true,
+    });
+  });
+
+  it("recovers the same id when another client wins the archived-project restore race", async () => {
+    const archivedProject = makeProject("project-archived-race");
+    const dispatchCommand = vi.fn(async (command: { type: string }) => {
+      if (command.type === "project.create") {
+        throw new Error(
+          "Orchestration command invariant failed (project.create): Project 'project-archived-race' is archived and reserves workspace root '/Users/tester/Developer/synara'. Restore project 'project-archived-race' instead of creating a new project.",
+        );
+      }
+      throw new Error("Project 'project-archived-race' is not archived.");
+    });
+
+    const result = await createOrRecoverProjectFromPath({
+      api: makeApi(dispatchCommand),
+      workspaceRoot: WORKSPACE_ROOT,
+      loadSnapshot: async () => makeSnapshot([archivedProject]),
+      maxAttempts: 1,
+      delayMs: 0,
+    });
+
+    expect(result).toMatchObject({
+      projectId: archivedProject.id,
+      project: archivedProject,
+      created: false,
+      restored: false,
+    });
+  });
+
+  it("surfaces an actionable unarchive failure when the original project is still hidden", async () => {
+    const dispatchCommand = vi.fn(async (command: { type: string }) => {
+      if (command.type === "project.create") {
+        throw new Error(
+          "Orchestration command invariant failed (project.create): Project 'project-archived' is archived and reserves workspace root '/Users/tester/Developer/synara'. Restore project 'project-archived' instead of creating a new project.",
+        );
+      }
+      throw new Error("Wait for archive session cleanup to settle before restoring this project.");
+    });
+
+    await expect(
+      createOrRecoverProjectFromPath({
+        api: makeApi(dispatchCommand),
+        workspaceRoot: WORKSPACE_ROOT,
+        loadSnapshot: async () => makeSnapshot([]),
+        maxAttempts: 1,
+        delayMs: 0,
+      }),
+    ).rejects.toThrow(/archive session cleanup/);
   });
 });

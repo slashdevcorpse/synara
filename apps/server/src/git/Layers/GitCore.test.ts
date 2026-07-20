@@ -11,7 +11,7 @@ import { splitLines } from "@synara/shared/text";
 import { Effect, Exit, FileSystem, Layer, PlatformError, Schema, Scope } from "effect";
 import { describe, expect, vi } from "vitest";
 
-import { GitCoreLive, makeGitCore } from "./GitCore.ts";
+import { GitCoreLive, makeGitCore, splitCompleteProcessOutputFrames } from "./GitCore.ts";
 import { GitCore, type GitCoreShape } from "../Services/GitCore.ts";
 import { GitCheckoutDirtyWorktreeError, GitCommandError } from "../Errors.ts";
 import { type ProcessRunResult, runProcess } from "../../processRunner.ts";
@@ -91,8 +91,13 @@ function runTruncatedNodeCommand(input: {
   );
 }
 
-const makeIsolatedGitCore = (executeOverride: GitCoreShape["execute"]) =>
-  makeGitCore({ executeOverride }).pipe(
+const makeIsolatedGitCore = (
+  executeOverride: GitCoreShape["execute"],
+  options?: {
+    readonly readUntrackedFileOverride?: (path: string) => Promise<Uint8Array>;
+  },
+) =>
+  makeGitCore({ executeOverride, ...options }).pipe(
     Effect.provide(Layer.provideMerge(ServerConfigLayer, NodeServices.layer)),
   );
 
@@ -1609,6 +1614,140 @@ it.layer(TestLayer)("git integration", (it) => {
         }),
     );
 
+    it.effect("frames LF, CR, CRLF, fragmented CRLF, and trailing process output", () =>
+      Effect.sync(() => {
+        expect(splitCompleteProcessOutputFrames("one\ntwo\n")).toEqual({
+          frames: ["one", "two"],
+          remainder: "",
+        });
+        expect(splitCompleteProcessOutputFrames("one\rtwo\r")).toEqual({
+          frames: ["one", "two"],
+          remainder: "",
+        });
+        expect(splitCompleteProcessOutputFrames("one\r\ntwo\r\n")).toEqual({
+          frames: ["one", "two"],
+          remainder: "",
+        });
+        const splitCrLf = splitCompleteProcessOutputFrames("one\r");
+        expect(splitCrLf).toEqual({ frames: ["one"], remainder: "" });
+        expect(splitCompleteProcessOutputFrames(`${splitCrLf.remainder}\ntwo`)).toEqual({
+          frames: [],
+          remainder: "two",
+        });
+        expect(splitCompleteProcessOutputFrames("trailing", true)).toEqual({
+          frames: ["trailing"],
+          remainder: "",
+        });
+      }),
+    );
+
+    it.effect("reports unborn and detached HEAD metadata", () =>
+      Effect.gen(function* () {
+        const unbornRoot = yield* makeTmpDir();
+        const core = yield* GitCore;
+        yield* core.initRepo({ cwd: unbornRoot });
+
+        const unborn = yield* core.statusDetails(unbornRoot);
+        expect(unborn.isRepo).toBe(true);
+        expect(unborn.hasCommits).toBe(false);
+        expect(unborn.isDetached).toBe(false);
+
+        const detachedRoot = yield* makeTmpDir();
+        yield* initRepoWithCommit(detachedRoot);
+        yield* git(detachedRoot, ["checkout", "--detach", "HEAD"]);
+
+        const detached = yield* core.statusDetails(detachedRoot);
+        expect(detached.hasCommits).toBe(true);
+        expect(detached.isDetached).toBe(true);
+        expect(detached.branch).toBeNull();
+      }),
+    );
+
+    it.effect("bypasses the upstream refresh cache when status details are forced", () =>
+      Effect.gen(function* () {
+        const remote = yield* makeTmpDir();
+        const source = yield* makeTmpDir();
+        const writer = yield* makeTmpDir();
+        yield* git(remote, ["init", "--bare"]);
+        const { initialBranch } = yield* initRepoWithCommit(source);
+        yield* git(source, ["remote", "add", "origin", remote]);
+        yield* git(source, ["push", "-u", "origin", initialBranch]);
+
+        const core = yield* GitCore;
+        const primed = yield* core.statusDetails(source);
+        expect(primed.behindCount).toBe(0);
+
+        yield* git(writer, ["clone", remote, "."]);
+        yield* git(writer, ["config", "user.email", "test@test.com"]);
+        yield* git(writer, ["config", "user.name", "Test"]);
+        yield* writeTextFile(path.join(writer, "remote.txt"), "remote update\n");
+        yield* git(writer, ["add", "remote.txt"]);
+        yield* git(writer, ["commit", "-m", "remote update"]);
+        yield* git(writer, ["push", "origin", initialBranch]);
+
+        const cached = yield* core.statusDetails(source);
+        expect(cached.behindCount).toBe(0);
+        const forced = yield* core.statusDetails(source, { forceUpstreamRefresh: true });
+        expect(forced.behindCount).toBe(1);
+      }),
+    );
+
+    it.effect("can read local status without contacting the configured upstream", () =>
+      Effect.gen(function* () {
+        const remote = yield* makeTmpDir();
+        const source = yield* makeTmpDir();
+        const writer = yield* makeTmpDir();
+        yield* git(remote, ["init", "--bare"]);
+        const { initialBranch } = yield* initRepoWithCommit(source);
+        yield* git(source, ["remote", "add", "origin", remote]);
+        yield* git(source, ["push", "-u", "origin", initialBranch]);
+
+        const core = yield* GitCore;
+        yield* core.statusDetails(source);
+
+        yield* git(writer, ["clone", remote, "."]);
+        yield* git(writer, ["config", "user.email", "test@test.com"]);
+        yield* git(writer, ["config", "user.name", "Test"]);
+        yield* writeTextFile(path.join(writer, "remote.txt"), "remote update\n");
+        yield* git(writer, ["add", "remote.txt"]);
+        yield* git(writer, ["commit", "-m", "remote update"]);
+        yield* git(writer, ["push", "origin", initialBranch]);
+
+        const local = yield* core.statusDetails(source, {
+          refreshUpstream: false,
+          forceUpstreamRefresh: true,
+        });
+        expect(local.upstreamRefreshStatus).toBe("skipped");
+        expect(local.behindCount).toBe(0);
+
+        const refreshed = yield* core.statusDetails(source, { forceUpstreamRefresh: true });
+        expect(refreshed.upstreamRefreshStatus).toBe("succeeded");
+        expect(refreshed.behindCount).toBe(1);
+      }),
+    );
+
+    it.effect("reports an upstream refresh failure without discarding local status", () =>
+      Effect.gen(function* () {
+        const remote = yield* makeTmpDir();
+        const source = yield* makeTmpDir();
+        yield* git(remote, ["init", "--bare"]);
+        const { initialBranch } = yield* initRepoWithCommit(source);
+        yield* git(source, ["remote", "add", "origin", remote]);
+        yield* git(source, ["push", "-u", "origin", initialBranch]);
+
+        const core = yield* GitCore;
+        yield* git(source, ["remote", "set-url", "origin", path.join(remote, "missing.git")]);
+        const failed = yield* core.statusDetails(source, { forceUpstreamRefresh: true });
+        expect(failed.isRepo).toBe(true);
+        expect(failed.branch).toBe(initialBranch);
+        expect(failed.upstreamRefreshStatus).toBe("failed");
+
+        yield* git(source, ["remote", "set-url", "origin", remote]);
+        const recovered = yield* core.statusDetails(source, { forceUpstreamRefresh: true });
+        expect(recovered.upstreamRefreshStatus).toBe("succeeded");
+      }),
+    );
+
     it.effect("reports status details and dirty state", () =>
       Effect.gen(function* () {
         const tmp = yield* makeTmpDir();
@@ -1768,6 +1907,77 @@ it.layer(TestLayer)("git integration", (it) => {
           { path: "new-file.ts", insertions: 2, deletions: 0 },
           { path: "README.md", insertions: 1, deletions: 1 },
         ]);
+      }),
+    );
+
+    it.effect("summarizes dirty files without detailed stats or untracked content reads", () =>
+      Effect.gen(function* () {
+        const tmp = yield* makeTmpDir();
+        yield* initRepoWithCommit(tmp);
+        const fileSystem = yield* FileSystem.FileSystem;
+        const realGitCore = yield* GitCore;
+
+        yield* writeTextFile(path.join(tmp, "README.md"), "updated\n");
+        yield* fileSystem.makeDirectory(path.join(tmp, "nested"));
+        yield* writeTextFile(path.join(tmp, "nested", "first.txt"), "alpha\nbeta\n");
+        yield* writeTextFile(path.join(tmp, "nested", "second.txt"), "gamma\n");
+
+        const operations: Array<{ operation: string; args: ReadonlyArray<string> }> = [];
+        const untrackedContentReads: string[] = [];
+        const core = yield* makeIsolatedGitCore(
+          (input) => {
+            operations.push({ operation: input.operation, args: input.args });
+            return realGitCore.execute(input);
+          },
+          {
+            readUntrackedFileOverride: async (filePath) => {
+              untrackedContentReads.push(filePath);
+              return new TextEncoder().encode("instrumented content\n");
+            },
+          },
+        );
+
+        const summary = yield* core.statusDetails(tmp, { workingTreeMode: "summary" });
+        expect(summary.hasWorkingTreeChanges).toBe(true);
+        expect(summary.workingTree.files).toHaveLength(3);
+        expect(new Set(summary.workingTree.files.map((file) => file.path))).toEqual(
+          new Set(["README.md", "nested/first.txt", "nested/second.txt"]),
+        );
+        expect(summary.workingTree.files.every((file) => file.insertions === 0)).toBe(true);
+        expect(summary.workingTree.files.every((file) => file.deletions === 0)).toBe(true);
+        expect(summary.workingTree.insertions).toBe(0);
+        expect(summary.workingTree.deletions).toBe(0);
+        expect(untrackedContentReads).toEqual([]);
+        expect(
+          operations.find((entry) => entry.operation === "GitCore.statusDetails.status")?.args,
+        ).toContain("--untracked-files=all");
+        expect(
+          operations.some((entry) =>
+            [
+              "GitCore.statusDetails.unstagedNumstat",
+              "GitCore.statusDetails.stagedNumstat",
+              "GitCore.statusDetails.moveAwareIndexPath",
+              "GitCore.statusDetails.moveAwareAddAll",
+              "GitCore.statusDetails.moveAwareNumstat",
+            ].includes(entry.operation),
+          ),
+        ).toBe(false);
+
+        yield* git(tmp, ["add", "nested"]);
+        yield* writeTextFile(path.join(tmp, "root-untracked.txt"), "root\n");
+        operations.length = 0;
+        const detailed = yield* core.statusDetails(tmp);
+        expect(detailed.hasWorkingTreeChanges).toBe(true);
+        expect(untrackedContentReads).toEqual([path.join(tmp, "root-untracked.txt")]);
+        expect(
+          operations.find((entry) => entry.operation === "GitCore.statusDetails.status")?.args,
+        ).not.toContain("--untracked-files=all");
+        expect(
+          operations.some((entry) => entry.operation === "GitCore.statusDetails.unstagedNumstat"),
+        ).toBe(true);
+        expect(
+          operations.some((entry) => entry.operation === "GitCore.statusDetails.stagedNumstat"),
+        ).toBe(true);
       }),
     );
 
