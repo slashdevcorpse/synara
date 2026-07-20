@@ -15,7 +15,11 @@ import {
   validateDesktopNativeBuildHost,
   WINDOWS_INSTALLER_GUID,
 } from "./lib/desktop-platform-build-config.ts";
-import { BRAND_ASSET_PATHS } from "./lib/brand-assets.ts";
+import {
+  BRAND_ASSET_PATHS,
+  resolveDesktopBrandAssetPaths,
+  SUPER_DESKTOP_BRAND_ASSET_PATHS,
+} from "./lib/brand-assets.ts";
 import { DESKTOP_BUILD_ARCHES } from "./lib/desktop-build-options.ts";
 import { synaraDesktopIdentity } from "@synara/shared/desktopIdentity";
 
@@ -237,6 +241,25 @@ describe("createDesktopPlatformBuildConfig", () => {
       BRAND_ASSET_PATHS.productionMacLegacyIconPng,
       "assets/prod/black-macos-legacy-1024.png",
     );
+  });
+
+  it("uses dedicated Super Synara desktop artwork without changing upstream flavors", () => {
+    assert.deepStrictEqual(resolveDesktopBrandAssetPaths("super"), {
+      macIconSource: "assets/super/super-synara-1024.png",
+      macLegacyIconSource: "assets/super/super-synara-macos-legacy-1024.png",
+      windowsIconIco: "assets/super/super-synara-windows.ico",
+      windowsNotificationIconPng: "assets/super/super-synara-1024.png",
+    });
+    assert.deepStrictEqual(resolveDesktopBrandAssetPaths("super"), SUPER_DESKTOP_BRAND_ASSET_PATHS);
+
+    for (const flavor of ["production", "canary"] as const) {
+      assert.deepStrictEqual(resolveDesktopBrandAssetPaths(flavor), {
+        macIconSource: "assets/prod/black-macos-1024.png",
+        macLegacyIconSource: "assets/prod/black-macos-legacy-1024.png",
+        windowsIconIco: "assets/prod/synara-black-windows.ico",
+        windowsNotificationIconPng: "assets/prod/black-universal-1024.png",
+      });
+    }
   });
 
   it("uses explicit macOS ad-hoc signing and isolated Super Synara Windows registration", () => {
