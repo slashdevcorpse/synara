@@ -1946,13 +1946,13 @@ describe("windowsProcess", () => {
     it.runIf(process.platform === "win32")("clears the process-local cache", () => {
       clearWindowsCommandDiscoveryCache();
       expect(
-        resolveWindowsCommandCandidates("cmd", {
+        resolveWindowsCommandCandidates("synara-process-local-cache-probe-that-must-not-exist", {
           platform: "win32",
           cwd: process.cwd(),
           env: process.env,
-        }).length,
-      ).toBeGreaterThan(0);
-      expect(getWindowsCommandDiscoveryCacheStats().size).toBeGreaterThan(0);
+        }),
+      ).toEqual([]);
+      expect(getWindowsCommandDiscoveryCacheStats()).toEqual({ size: 1 });
       clearWindowsCommandDiscoveryCache();
       expect(getWindowsCommandDiscoveryCacheStats()).toEqual({ size: 0 });
     });
