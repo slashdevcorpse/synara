@@ -385,6 +385,24 @@ describe("Super Synara workflow contracts", () => {
         audit,
       ),
     ).toThrow("must map *");
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          '          case "$RELEASE_SCOPE" in',
+          '          RELEASE_SCOPE=windows-and-macos\n          case "$RELEASE_SCOPE" in',
+        ),
+        audit,
+      ),
+    ).toThrow("complete scope metadata data flow");
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          '          esac\n          echo "version=$VERSION"',
+          '          esac\n          include_macos=true\n          asset_count=8\n          echo "version=$VERSION"',
+        ),
+        audit,
+      ),
+    ).toThrow("complete scope metadata data flow");
   });
 
   it("rejects removal of native Windows installer lifecycle qualification", () => {

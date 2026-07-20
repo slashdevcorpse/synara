@@ -112,6 +112,28 @@ function verifyReleaseScopeCase(preflightJob: UnknownRecord): void {
   if (caseEnd < 0) {
     throw new Error("Publication release-scope contract must terminate its scope case.");
   }
+  const expectedPrefix = [
+    "set -euo pipefail",
+    '[[ "$CONFIRMED" == "true" ]]',
+    '[[ "$REF_PROTECTED" == "true" ]]',
+    '[[ "$VERSION" =~ ^[0-9]+\\.[0-9]+\\.[0-9]+-super\\.[1-9][0-9]*$ ]]',
+    '[[ "$TAG" == "super-v$VERSION" ]]',
+  ];
+  const expectedOutputs = [
+    'echo "version=$VERSION" >> "$GITHUB_OUTPUT"',
+    'echo "tag=$TAG" >> "$GITHUB_OUTPUT"',
+    'echo "release_scope=$RELEASE_SCOPE" >> "$GITHUB_OUTPUT"',
+    'echo "include_macos=$include_macos" >> "$GITHUB_OUTPUT"',
+    'echo "asset_count=$asset_count" >> "$GITHUB_OUTPUT"',
+  ];
+  if (
+    JSON.stringify(lines.slice(0, caseStart)) !== JSON.stringify(expectedPrefix) ||
+    JSON.stringify(lines.slice(caseEnd + 1)) !== JSON.stringify(expectedOutputs)
+  ) {
+    throw new Error(
+      "Publication release-scope contract must preserve the complete scope metadata data flow.",
+    );
+  }
 
   const arms = new Map<string, readonly string[]>();
   let index = caseStart + 1;
@@ -371,7 +393,6 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
   const windowsJob = publicationJob(jobs, "windows_x64");
   const macosJob = publicationJob(jobs, "macos_arm64");
   const publishJob = publicationJob(jobs, "publish");
-  verifyReleaseScopeCase(preflightJob);
   verifyNativeJobCommands(
     windowsJob,
     "windows_x64",
@@ -708,6 +729,8 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
   for (const prohibitedAsset of [".blockmap", "latest.yml", "latest-mac.yml", ".AppImage"]) {
     prohibitText(main, prohibitedAsset, `Publication must not expose ${prohibitedAsset}.`);
   }
+
+  verifyReleaseScopeCase(preflightJob);
 
   requireText(audit, "permissions:\n  contents: read", "Audit must be read-only.");
   requireText(
