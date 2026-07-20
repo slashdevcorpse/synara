@@ -3,7 +3,7 @@
 //          folders while always creating chats as rows inside the shared Chats container.
 // Layer: Chat / empty-state entrypoint
 
-import { memo, useCallback, useDeferredValue, useEffect, useMemo, useState } from "react";
+import { memo, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { type ProjectDirectoryEntry, type ProjectId } from "@synara/contracts";
 import { readNativeApi } from "../../nativeApi";
 import { useStore } from "../../store";
@@ -101,8 +101,18 @@ export const ProjectPicker = memo(function ProjectPicker({
   const [isLoadingDirectories, setIsLoadingDirectories] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [directoryEntries, setDirectoryEntries] = useState<readonly ProjectDirectoryEntry[]>([]);
+  const mountedRef = useRef(false);
+  const directoryRequestGenerationRef = useRef(0);
   const isProjectSelectionMode = selectionMode === "project";
 
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  // Manual memoization kept: this file does not compile under React Compiler (see compile-report).
   const activeFolderOptions = useMemo(() => {
     const seen = new Set<string>();
     const nextOptions: ActiveFolderOption[] = [];
@@ -258,48 +268,70 @@ export const ProjectPicker = memo(function ProjectPicker({
   }, []);
 
   useEffect(() => {
-    if (
-      isProjectSelectionMode ||
-      !open ||
-      !homeDir ||
-      directoryEntries.length > 0 ||
-      isLoadingDirectories
-    ) {
-      return;
-    }
-    const api = readNativeApi();
-    if (!api) {
-      setErrorMessage("App is still connecting. Try again in a moment.");
-      return;
-    }
+    const requestGeneration = ++directoryRequestGenerationRef.current;
+    const isCurrentRequest = () =>
+      mountedRef.current && directoryRequestGenerationRef.current === requestGeneration;
+    let timeoutId: number | null = null;
 
-    setIsLoadingDirectories(true);
-    setErrorMessage(null);
-    void api.projects
-      .listDirectories({ cwd: homeDir })
-      .then((result) => {
-        setDirectoryEntries(
-          result.entries.flatMap((entry) =>
-            entry.kind === "directory"
-              ? [
-                  {
-                    path: entry.path,
-                    name: entry.name,
-                    hasChildren: entry.hasChildren ?? false,
-                    ...(entry.parentPath ? { parentPath: entry.parentPath } : {}),
-                  } satisfies ProjectDirectoryEntry,
-                ]
-              : [],
-          ),
-        );
-      })
-      .catch((error) => {
-        setErrorMessage(error instanceof Error ? error.message : "Unable to load folders.");
-      })
-      .finally(() => {
+    const cancelRequest = () => {
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId);
+      }
+      if (directoryRequestGenerationRef.current === requestGeneration) {
+        directoryRequestGenerationRef.current += 1;
+      }
+    };
+
+    if (isProjectSelectionMode || !open || !homeDir || directoryEntries.length > 0) {
+      // A prior request may already have entered its loading state. Defer the
+      // reset so a replacement effect can claim a newer generation first.
+      timeoutId = window.setTimeout(() => {
+        if (!isCurrentRequest()) return;
         setIsLoadingDirectories(false);
-      });
-  }, [directoryEntries.length, homeDir, isLoadingDirectories, isProjectSelectionMode, open]);
+      }, 0);
+      return cancelRequest;
+    }
+    // Timeout-0 keeps every state write asynchronous (no wasted pre-paint
+    // render), which also keeps this component eligible for React Compiler.
+    timeoutId = window.setTimeout(() => {
+      if (!isCurrentRequest()) return;
+      const api = readNativeApi();
+      if (!api) {
+        setIsLoadingDirectories(false);
+        setErrorMessage("App is still connecting. Try again in a moment.");
+        return;
+      }
+
+      setIsLoadingDirectories(true);
+      setErrorMessage(null);
+      void api.projects
+        .listDirectories({ cwd: homeDir })
+        .then((result) => {
+          if (!isCurrentRequest()) return;
+          setIsLoadingDirectories(false);
+          setDirectoryEntries(
+            result.entries.flatMap((entry) =>
+              entry.kind === "directory"
+                ? [
+                    {
+                      path: entry.path,
+                      name: entry.name,
+                      hasChildren: entry.hasChildren ?? false,
+                      ...(entry.parentPath ? { parentPath: entry.parentPath } : {}),
+                    } satisfies ProjectDirectoryEntry,
+                  ]
+                : [],
+            ),
+          );
+        })
+        .catch((error) => {
+          if (!isCurrentRequest()) return;
+          setIsLoadingDirectories(false);
+          setErrorMessage(error instanceof Error ? error.message : "Unable to load folders.");
+        });
+    }, 0);
+    return cancelRequest;
+  }, [directoryEntries.length, homeDir, isProjectSelectionMode, open]);
 
   const handleSelectActiveFolder = useCallback(
     (folder: ActiveFolderOption) => {
@@ -313,12 +345,15 @@ export const ProjectPicker = memo(function ProjectPicker({
               : onSelectWorkspaceRoot?.(folder.cwd);
         void Promise.resolve(selection)
           .then(() => {
+            if (!mountedRef.current) return;
             setOpen(false);
           })
           .catch((error) => {
+            if (!mountedRef.current) return;
             setErrorMessage(error instanceof Error ? error.message : "Unable to select project.");
           });
       } catch (error) {
+        if (!mountedRef.current) return;
         setErrorMessage(error instanceof Error ? error.message : "Unable to select project.");
       }
     },
@@ -337,6 +372,7 @@ export const ProjectPicker = memo(function ProjectPicker({
     setErrorMessage(null);
     try {
       const pickedPath = await api.dialogs.pickFolder();
+      if (!mountedRef.current) return;
       if (!pickedPath) {
         setIsPicking(false);
         return;
@@ -346,9 +382,11 @@ export const ProjectPicker = memo(function ProjectPicker({
       } else {
         onSelectWorkspaceRoot?.(pickedPath);
       }
+      if (!mountedRef.current) return;
       setIsPicking(false);
       setOpen(false);
     } catch (error) {
+      if (!mountedRef.current) return;
       setIsPicking(false);
       setErrorMessage(error instanceof Error ? error.message : "Unable to open the folder picker.");
     }
@@ -358,12 +396,15 @@ export const ProjectPicker = memo(function ProjectPicker({
     try {
       void Promise.resolve(onResetToHome?.())
         .then(() => {
+          if (!mountedRef.current) return;
           setOpen(false);
         })
         .catch((error) => {
+          if (!mountedRef.current) return;
           setErrorMessage(error instanceof Error ? error.message : "Unable to update project.");
         });
     } catch (error) {
+      if (!mountedRef.current) return;
       setErrorMessage(error instanceof Error ? error.message : "Unable to update project.");
     }
   }, [onResetToHome]);

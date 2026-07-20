@@ -8,6 +8,7 @@ import {
   synaraDesktopIdentity,
   type SynaraDesktopIdentity,
 } from "@synara/shared/desktopIdentity";
+import type { DesktopBuildArch } from "./desktop-build-options.ts";
 
 export const MICROPHONE_USAGE_DESCRIPTION =
   "Synara needs microphone access so you can record voice notes and transcribe them into the chat composer.";
@@ -18,12 +19,33 @@ export const MAC_APPSNAP_HELPER_STAGE_PATH =
   "apps/desktop/native/appsnap/build/synara-appsnap-helper";
 export const MAC_APPSNAP_HELPER_ASAR_EXCLUSION = "!apps/desktop/native/appsnap/build/**";
 export const MAC_APPSNAP_HELPER_BUNDLE_PATH = "Contents/Helpers/synara-appsnap-helper";
+export const MAC_PRESIGNED_VENDOR_SIGN_IGNORE_PATTERNS = [
+  String.raw`/Contents/Resources/app\.asar\.unpacked/node_modules/@anthropic-ai/claude-agent-sdk-darwin-(?:arm64|x64)/claude$`,
+] as const;
 export const WINDOWS_INSTALLER_GUID = SYNARA_WINDOWS_INSTALLER_GUID;
 const MAC_DMG_ICON_PATH = "icon.icns";
 export const NODE_PTY_ASAR_UNPACK_GLOBS = ["node_modules/node-pty/**"] as const;
+export const MAC_FOREIGN_NATIVE_EXCLUSIONS = [
+  "!node_modules/@earendil-works/pi-tui/native/win32/**",
+  "!node_modules/node-pty/prebuilds/win32-*/**",
+  "!node_modules/node-pty/third_party/conpty/**",
+  "!node_modules/node-pty/deps/winpty/**",
+] as const;
+
+export function resolveMacNativeExclusions(arch: DesktopBuildArch): ReadonlyArray<string> {
+  const oppositeArch = arch === "arm64" ? "x64" : arch === "x64" ? "arm64" : null;
+  if (!oppositeArch) return [...MAC_FOREIGN_NATIVE_EXCLUSIONS];
+
+  return [
+    ...MAC_FOREIGN_NATIVE_EXCLUSIONS,
+    `!node_modules/@earendil-works/pi-tui/native/darwin/prebuilds/darwin-${oppositeArch}/**`,
+    `!node_modules/node-pty/prebuilds/darwin-${oppositeArch}/**`,
+  ];
+}
 
 export interface DesktopPlatformBuildConfig {
   readonly asarUnpack?: ReadonlyArray<string>;
+  readonly dmg?: Record<string, unknown>;
   readonly extraFiles?: ReadonlyArray<Record<string, string>>;
   readonly extraResources?: ReadonlyArray<Record<string, string>>;
   readonly files?: ReadonlyArray<string>;
@@ -34,6 +56,7 @@ export interface DesktopPlatformBuildConfig {
 }
 
 export interface CreateDesktopPlatformBuildConfigInput {
+  readonly arch: DesktopBuildArch;
   readonly platform: "linux" | "mac" | "win";
   readonly target: string;
   readonly signed?: boolean;
@@ -43,7 +66,7 @@ export interface CreateDesktopPlatformBuildConfigInput {
 }
 
 export interface DesktopNativeBuildHostInput {
-  readonly arch: "arm64" | "x64" | "universal";
+  readonly arch: DesktopBuildArch;
   readonly hostArch: string;
   readonly hostPlatform: NodeJS.Platform;
   readonly platform: "linux" | "mac" | "win";
@@ -82,15 +105,21 @@ export function createDesktopPlatformBuildConfig(
 
   if (input.platform === "mac") {
     const mac = {
-      target: input.target === "dmg" ? [input.target, "zip"] : [input.target],
+      target:
+        input.target === "dmg"
+          ? input.disableUpdates
+            ? [input.target]
+            : [input.target, "zip"]
+          : [input.target],
       icon: MAC_DMG_ICON_PATH,
       category: "public.app-category.developer-tools",
       hardenedRuntime: input.signed === true,
       notarize: input.signed === true,
-      ...(input.signed === true ? {} : { identity: null }),
+      ...(input.signed === true ? {} : { identity: "-" }),
       entitlements: MAC_ENTITLEMENTS_PATH,
       entitlementsInherit: MAC_INHERITED_ENTITLEMENTS_PATH,
       binaries: [MAC_APPSNAP_HELPER_BUNDLE_PATH],
+      signIgnore: [...MAC_PRESIGNED_VENDOR_SIGN_IGNORE_PATTERNS],
       // The universal build stages the same pre-lipo'd helper in both app trees.
       // @electron/universal needs this pattern to preserve that existing fat binary.
       x64ArchFiles: MAC_APPSNAP_HELPER_BUNDLE_PATH,
@@ -101,13 +130,16 @@ export function createDesktopPlatformBuildConfig(
 
     return {
       ...licensedPackaging,
-      files: ["**/*", MAC_APPSNAP_HELPER_ASAR_EXCLUSION],
+      files: ["**/*", ...resolveMacNativeExclusions(input.arch), MAC_APPSNAP_HELPER_ASAR_EXCLUSION],
       extraFiles: [
         {
           from: MAC_APPSNAP_HELPER_STAGE_PATH,
           to: "Helpers/synara-appsnap-helper",
         },
       ],
+      ...(input.disableUpdates && input.target === "dmg"
+        ? { dmg: { writeUpdateInfo: false } }
+        : {}),
       mac,
     };
   }

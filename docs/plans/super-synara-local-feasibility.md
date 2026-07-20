@@ -1,10 +1,10 @@
 # Plan — Super Synara local downstream and unsigned downloads
 
-> Status: **PLANNED — feasible, not yet implemented**
+> Status: **IN DELIVERY — Windows path implemented; first prerelease qualification pending; combined macOS admission deferred**
 > Downstream repository: `slashdevcorpse/synara` (public fork)
 > Canonical upstream: `Emanuele-web04/synara`
 > Primary use: a personal Windows build with durable public downloads
-> Supported downloads: Windows x64 and macOS Apple Silicon (arm64)
+> Current download: Windows x64; macOS Apple Silicon (arm64) is an optional combined scope
 > Release trigger: manual GitHub Actions dispatch only
 
 ## 1. Outcome
@@ -14,8 +14,8 @@ Maintain **Super Synara** as an isolated downstream application that can:
 1. carry Windows fixes, performance work, and other custom enhancements;
 2. repeatedly absorb upstream Synara changes without rewriting released history;
 3. run PR/push validation on standard GitHub-hosted runners;
-4. produce manually triggered, persistent GitHub prerelease downloads for Windows x64 and
-   macOS arm64; and
+4. produce manually triggered, persistent GitHub prerelease downloads for Windows x64, with an
+   optional combined macOS arm64 lane after its separate admission is ready; and
 5. coexist with upstream Synara without overwriting its install, state, protocol, or updater.
 
 This is locally and operationally feasible. A public GitHub repository can use standard hosted
@@ -33,7 +33,7 @@ prereleases, not as unpublished or verified-signed artifacts.
 | Product name       | `Super Synara`                                                                                                                   |
 | Repository         | Public fork at `slashdevcorpse/synara`                                                                                           |
 | Primary platform   | Windows x64                                                                                                                      |
-| Secondary platform | macOS Apple Silicon / arm64                                                                                                      |
+| Optional platform  | macOS Apple Silicon / arm64 through the explicitly selected combined scope                                                       |
 | Excluded downloads | Linux, macOS Intel/x64, universal macOS                                                                                          |
 | CI hosts           | Standard `ubuntu-24.04`, `windows-2022`, and ARM64 `macos-15` runners only                                                       |
 | Linux meaning      | Ubuntu may run portable CI; no Linux application is packaged or published                                                        |
@@ -427,8 +427,9 @@ ordinary PRs do not repeatedly perform distribution work.
 
 ## 12. Manual unsigned prerelease workflow
 
-Add `.github/workflows/super-synara-prerelease.yml`. It has only `workflow_dispatch`, always builds
-both supported platforms, and never runs from an automatic tag/push event.
+Add `.github/workflows/super-synara-prerelease.yml`. It has only `workflow_dispatch`, defaults to a
+Windows-only release, can explicitly select a combined Windows and macOS release after macOS
+admission is ready, and never runs from an automatic tag/push event.
 
 ### Inputs
 
@@ -436,6 +437,8 @@ both supported platforms, and never runs from an automatic tag/push event.
   `0.5.5-super.1`.
 - `tag` — required; must equal `super-v<version>`, for example
   `super-v0.5.5-super.1`. The `super-v` prefix does not match upstream's `v*.*.*` trigger.
+- `release_scope` — required choice; `windows-only` by default or `windows-and-macos` when both
+  native lanes and the reviewed macOS signature policy are ready.
 - `confirm_unsigned` — required boolean and must be `true`.
 
 The selected workflow ref must be protected downstream `main`. The workflow captures one immutable
@@ -481,10 +484,13 @@ successful release; the same exact dispatch may be rerun.
 
 ### Job 4 — `macos_arm64` (`macos-15`, read-only)
 
+This job runs only for the explicit `windows-and-macos` release scope. A Windows-only publication
+does not read or require the macOS signature allowlist.
+
 1. Check out the exact tagged commit and install frozen dependencies.
-2. Build the arm64 DMG without a Developer ID identity or notarization. Set `mac.identity: null`
-   and `CSC_IDENTITY_AUTO_DISCOVERY=false` so electron-builder cannot silently select a keychain
-   certificate.
+2. Build the arm64 DMG without a Developer ID identity or notarization. Use the explicit ad-hoc
+   identity `-` and `CSC_IDENTITY_AUTO_DISCOVERY=false` so electron-builder seals the bundle while
+   never silently selecting a keychain certificate.
 3. Use any generated zip only for local packaged-startup verification; do not publish it.
 4. Inspect the finished app and every nested binary. Record expected ad-hoc signatures on
    Super Synara-owned binaries—including the AppSnap helper—as `ad-hoc-only`. Separately inventory
@@ -497,7 +503,18 @@ successful release; the same exact dispatch may be rerun.
 
 ### Job 5 — `publish` (`ubuntu-24.04`, `contents: write` only)
 
-The final staging directory must contain exactly:
+For `windows-only`, the final staging directory must contain exactly:
+
+```text
+Super-Synara-<version>-windows-x64-unsigned.exe
+artifact-windows-x64.provenance.json
+release-index.json
+SHA256SUMS.txt
+UNSIGNED-BUILD.md
+LICENSE
+```
+
+For `windows-and-macos`, the final staging directory must contain exactly:
 
 ```text
 Super-Synara-<version>-windows-x64-unsigned.exe
@@ -531,8 +548,9 @@ fail and report that draft. The owner must inspect and delete the matching draft
 the workflow never silently resumes, replaces, or deletes draft assets.
 
 `SHA256SUMS.txt` uses lowercase SHA-256, two spaces before each filename, UTF-8, LF line endings,
-and bytewise filename ordering. It covers the installer, DMG, both platform provenance manifests,
-`UNSIGNED-BUILD.md`, and `LICENSE`; it excludes itself and `release-index.json` to avoid recursion.
+and bytewise filename ordering. It covers the selected native payloads, their platform provenance
+manifests, `UNSIGNED-BUILD.md`, and `LICENSE`; it excludes itself and `release-index.json` to avoid
+recursion.
 `release-index.json` hashes every published file except itself, including `SHA256SUMS.txt`, and
 records the exact tag, source commit, absorbed upstream SHA, and platform set.
 
@@ -551,9 +569,11 @@ Every prerelease title and notes must prominently state:
 - manual updates only;
 - exact downstream commit and absorbed upstream SHA;
 - Windows `Unknown publisher` / SmartScreen warning;
-- macOS Gatekeeper warning and the documented Finder/System Settings override;
 - SHA-256 verification instructions; and
 - no recommendation to disable a system-wide security protection.
+
+A combined Windows and macOS prerelease must additionally state the macOS Gatekeeper warning and
+the documented Finder/System Settings override.
 
 ## 13. Explicit updater disablement
 
@@ -666,7 +686,8 @@ Exit: custom PRs, sync PRs, and pushes receive the agreed platform gates using o
 ### Phase 3 — Manual unsigned prerelease
 
 - Add provenance schema/policy and release-index validation.
-- Add the manual Windows/macOS workflow and exact asset allowlist.
+- Add the manual Windows-first workflow, optional combined macOS scope, and exact scoped asset
+  allowlists.
 - Add warning/license/checksum generation.
 - Exercise the workflow state machine with contract tests and local staging fixtures, including
   failure, tag/rerun, draft-ownership, and asset-policy cases. This rehearsal creates no Git tag,
@@ -693,10 +714,11 @@ the next target SHA and complete a sync checkpoint before starting the next phas
 - Run a full sync against a pinned upstream SHA.
 - Run the complete CI and migration/state-copy gates.
 - Qualify Windows fresh install, upgrade, uninstall, and side-by-side behavior.
-- Qualify macOS arm64 bundle/profile isolation. Document Gatekeeper behavior from Apple's guidance;
-  do not claim that a same-run local DMG reproduces browser quarantine.
+- For an explicitly selected combined release, qualify macOS arm64 bundle/profile isolation.
+  Document Gatekeeper behavior from Apple's guidance; do not claim that a same-run local DMG
+  reproduces browser quarantine.
 - Manually publish the first Super Synara public prerelease.
-- Download both assets again and independently verify checksums/provenance.
+- Download every selected asset again and independently verify checksums/provenance.
 
 Exit: the public prerelease maps to one immutable green commit and exact absorbed upstream SHA.
 
@@ -762,7 +784,8 @@ hashing, validation, or platform configuration can be parameterized safely.
 - [ ] They have distinct installer/uninstaller registration, AppUserModelID, protocol, process
       lock, Electron profile, and backend home.
 - [ ] Super Synara never reads or mutates live `.synara` state during qualification.
-- [ ] Equivalent bundle/profile isolation passes on macOS arm64.
+- [ ] When the combined scope is selected, equivalent bundle/profile isolation passes on macOS
+      arm64.
 - [ ] Packaged identity tests prove upstream production identity remains unchanged.
 
 ### Prerelease
@@ -770,19 +793,19 @@ hashing, validation, or platform configuration can be parameterized safely.
 - [ ] Dispatch works only from protected `main` with explicit unsigned confirmation.
 - [ ] Both workflow actor fields, protected publication environment, immutable `super-v*` tags, and
       the non-cancelling release concurrency lock are enforced.
-- [ ] It builds exactly Windows x64 and macOS arm64.
+- [ ] It always builds Windows x64 and builds macOS arm64 only for the explicit combined scope.
 - [ ] No Azure, Apple Developer ID/notarization, OIDC, secret, larger-runner, Linux, or Intel path
       is invoked.
 - [ ] No updater config, updater metadata, `.blockmap`, or updater YAML is embedded/published.
-- [ ] macOS provenance lists expected product-owned ad-hoc signatures, validates the reviewed
-      third-party signature allowlist, and proves no Super Synara Developer ID/Team ID or app
-      notarization ticket is present.
+- [ ] When the combined scope is selected, macOS provenance lists expected product-owned ad-hoc
+      signatures, validates the reviewed third-party signature allowlist, and proves no Super
+      Synara Developer ID/Team ID or app notarization ticket is present.
 - [ ] Intermediate artifacts stay within the measured account budget and expire after one day.
 - [ ] Published assets exactly match the allowlist and SHA-256 file.
 - [ ] Provenance truthfully says public, unsigned, prerelease, not Latest, and no updater feed.
 - [ ] Release is public, is marked prerelease, and is not Latest.
 - [ ] Release notes contain exact commits, unsigned warnings, license, and manual-update status.
-- [ ] Downloaded Windows and macOS bytes independently match published hashes.
+- [ ] Every selected platform's downloaded bytes independently match published hashes.
 
 ### Windows qualification
 
@@ -801,7 +824,7 @@ Do not publish if any condition holds:
 - the tag/version already identifies different bytes or a different commit;
 - before draft creation, any public or draft release uses the tag; or after draft creation, any
   draft other than the exact current-run release ID/tag/commit is present;
-- either platform build is missing;
+- any build selected by the release scope is missing;
 - any identity surface collides with upstream Synara;
 - any test uses the live `.synara` or `.super-synara` home;
 - provenance claims signed, verified, or unpublished status incorrectly;

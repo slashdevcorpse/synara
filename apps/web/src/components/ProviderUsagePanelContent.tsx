@@ -4,7 +4,6 @@
 
 import type { ProviderKind } from "@synara/contracts";
 import { providerUsageLabel } from "@synara/shared/providerUsage";
-import { memo, useMemo } from "react";
 
 import { ExternalLinkIcon, TriangleAlertIcon } from "~/lib/icons";
 import type { OpenUsageUsageLine } from "~/lib/openUsageRateLimits";
@@ -38,7 +37,7 @@ export function ProviderUsagePlanPill({ planName }: { planName: string }) {
   );
 }
 
-export const ProviderUsagePanelContent = memo(function ProviderUsagePanelContent(props: {
+export function ProviderUsagePanelContent(props: {
   provider: ProviderKind | null | undefined;
   rateLimits: ReadonlyArray<ProviderRateLimit>;
   usageLines?: ReadonlyArray<OpenUsageUsageLine> | undefined;
@@ -52,17 +51,11 @@ export const ProviderUsagePanelContent = memo(function ProviderUsagePanelContent
   showLearnMore?: boolean | undefined;
   className?: string | undefined;
 }) {
-  const visibleRows = useMemo(
-    () => deriveProviderUsageDisplayRows(props.rateLimits),
-    [props.rateLimits],
-  );
-  const learnMoreHref = useMemo(
-    () =>
-      props.learnMoreHref ??
-      deriveRateLimitLearnMoreHref(props.rateLimits) ??
-      deriveProviderUsageLearnMoreHref(props.provider),
-    [props.learnMoreHref, props.provider, props.rateLimits],
-  );
+  const visibleRows = deriveProviderUsageDisplayRows(props.rateLimits);
+  const learnMoreHref =
+    props.learnMoreHref ??
+    deriveRateLimitLearnMoreHref(props.rateLimits) ??
+    deriveProviderUsageLearnMoreHref(props.provider);
 
   return (
     <div className={cn("space-y-2", props.className)}>
@@ -112,4 +105,4 @@ export const ProviderUsagePanelContent = memo(function ProviderUsagePanelContent
       ) : null}
     </div>
   );
-});
+}

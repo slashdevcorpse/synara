@@ -98,6 +98,34 @@ interface PullRequestsSearchPatch {
   q?: string | undefined;
 }
 
+export interface PullRequestRouteSelection {
+  projectId: ProjectId;
+  repository: string;
+  number: number;
+}
+
+export function resolveRenderedPullRequestInput(
+  selectedInput: PullRequestRouteSelection | null,
+  retainedInput: PullRequestRouteSelection | null,
+): PullRequestRouteSelection | null {
+  return selectedInput ?? retainedInput;
+}
+
+export function retainActivePullRequestInput(
+  selectedInput: PullRequestRouteSelection | null,
+  retainedInput: PullRequestRouteSelection | null,
+): PullRequestRouteSelection | null {
+  if (!selectedInput) return retainedInput;
+  if (
+    retainedInput?.projectId === selectedInput.projectId &&
+    retainedInput.repository === selectedInput.repository &&
+    retainedInput.number === selectedInput.number
+  ) {
+    return retainedInput;
+  }
+  return selectedInput;
+}
+
 // Every filter change and the panel close drop the current selection the same way; keep the
 // patch in one place so a new selection field can't be forgotten by one of the call sites.
 const CLEARED_SELECTION = {
@@ -154,6 +182,7 @@ function PullRequestsRouteView() {
   const queryClient = useQueryClient();
   // One fetch per (state, project): the server returns the "all" involvement superset and the
   // Reviewing/Authored tabs are derived below, so involvement switches never hit the network.
+  // Manual memoization kept: this file does not compile under React Compiler (see compile-report).
   const listInput = useMemo(
     () => ({ state: search.state, projectId: search.projectId ?? null }),
     [search.projectId, search.state],
@@ -279,18 +308,21 @@ function PullRequestsRouteView() {
         }
       : null;
   const detailOpen = selectedInput !== null;
-  const [renderedInput, setRenderedInput] = useState(selectedInput);
-  useEffect(() => {
-    if (selectedInput) setRenderedInput(selectedInput);
-    // selectedInput is a fresh object literal every render; depend on its primitive
-    // fields instead so this only re-fires when the actual selection changes.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [search.selectedProjectId, search.selectedRepo, search.number]);
+  const [retainedInput, setRetainedInput] = useState(selectedInput);
+  const nextRetainedInput = retainActivePullRequestInput(selectedInput, retainedInput);
+  if (nextRetainedInput !== retainedInput) {
+    // Reconcile during render so an active A -> B selection is retained before
+    // any close can cancel or outrun it. React retries this render immediately.
+    setRetainedInput(nextRetainedInput);
+  }
   useEffect(() => {
     if (detailOpen) return;
-    const timeout = window.setTimeout(() => setRenderedInput(null), 300);
+    const timeout = window.setTimeout(() => setRetainedInput(null), 300);
     return () => window.clearTimeout(timeout);
   }, [detailOpen]);
+  // The live selection must win immediately on A -> B switches. Retention is
+  // only for keeping the last pane mounted during the close animation.
+  const renderedInput = resolveRenderedPullRequestInput(selectedInput, retainedInput);
 
   const closeDetail = useCallback(() => {
     const focusWasInsideDock = isFocusInsideRightDock(document.activeElement);

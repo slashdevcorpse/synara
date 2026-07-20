@@ -18,6 +18,7 @@ const MISSING_NOTARIZATION_TICKET_QUERY =
   /CloudKit query for .+ failed due to ["“]Record not found["”]\./i;
 const MISSING_NOTARIZATION_TICKET_RESPONSE =
   /Could not find base64 encoded ticket in response for /i;
+const MISSING_NOTARIZATION_TICKET_STAPLER = /^[^\r\n]+ does not have a ticket stapled to it\.$/im;
 const AMBIGUOUS_NOTARIZATION_FAILURE =
   /Could not validate ticket|NSURLError|timed?\s*out|Could not establish secure connection/i;
 const SIGNED_BUNDLE_DIRECTORY = /\.(?:app|bundle|framework|xpc)$/i;
@@ -183,11 +184,13 @@ export function hasExplicitMissingNotarizationTicketEvidence(evidence: {
   readonly exitCode: number;
   readonly output: string;
 }): boolean {
+  const hasCloudKitAbsence =
+    MISSING_NOTARIZATION_TICKET_QUERY.test(evidence.output) &&
+    MISSING_NOTARIZATION_TICKET_RESPONSE.test(evidence.output);
   return (
     evidence.command === "xcrun stapler validate" &&
     evidence.exitCode === MISSING_NOTARIZATION_TICKET_EXIT_CODE &&
-    MISSING_NOTARIZATION_TICKET_QUERY.test(evidence.output) &&
-    MISSING_NOTARIZATION_TICKET_RESPONSE.test(evidence.output) &&
+    (hasCloudKitAbsence || MISSING_NOTARIZATION_TICKET_STAPLER.test(evidence.output)) &&
     !AMBIGUOUS_NOTARIZATION_FAILURE.test(evidence.output)
   );
 }
@@ -225,10 +228,13 @@ export function collectMacSignatureCandidatePaths(root: string): ReadonlyArray<s
 
 export function classifyMacSignatureCandidateFileDescription(
   description: string,
+  candidatePath?: string,
 ): "mach-o" | "script" {
   if (/\bMach-O\b/i.test(description)) return "mach-o";
   if (/\bscript\b|\btext executable\b/i.test(description)) return "script";
-  throw new Error(`Executable candidate has unsupported native file type: ${description}.`);
+  throw new Error(
+    `Executable candidate${candidatePath ? ` ${candidatePath}` : ""} has unsupported native file type: ${description}.`,
+  );
 }
 
 function assertDiskImageEvidence(evidence: MacDiskImageEvidence): void {

@@ -5,7 +5,7 @@
 // Layer: Web PDF viewer chrome
 // Exports: PdfViewerToolbar
 
-import { memo, useEffect, useState } from "react";
+import { useState } from "react";
 
 import {
   ChevronDownIcon,
@@ -51,7 +51,7 @@ function zoomSelectionValue(mode: PdfZoomMode, scale: number): string {
   return String(Math.round(scale * 100));
 }
 
-export const PdfViewerToolbar = memo(function PdfViewerToolbar(props: PdfViewerToolbarProps) {
+export const PdfViewerToolbar = function PdfViewerToolbar(props: PdfViewerToolbarProps) {
   const selectionValue = zoomSelectionValue(props.zoomMode, props.scale);
 
   return (
@@ -153,7 +153,7 @@ export const PdfViewerToolbar = memo(function PdfViewerToolbar(props: PdfViewerT
       </div>
     </div>
   );
-});
+};
 
 function PdfPageIndicator({
   currentPage,
@@ -165,14 +165,17 @@ function PdfPageIndicator({
   onJumpToPage: (pageNumber: number) => void;
 }) {
   const [draft, setDraft] = useState(String(currentPage));
-  useEffect(() => {
-    setDraft(String(currentPage));
-  }, [currentPage]);
+  const [editing, setEditing] = useState(false);
+  const value = editing ? draft : String(currentPage);
 
   const commit = () => {
     const parsed = Number.parseInt(draft, 10);
     if (Number.isFinite(parsed)) {
-      onJumpToPage(Math.min(Math.max(parsed, 1), Math.max(numPages, 1)));
+      const clamped = Math.min(Math.max(parsed, 1), Math.max(numPages, 1));
+      onJumpToPage(clamped);
+      // Canonicalize in place for jumps that clamp to the current page: the
+      // controlled page value takes over again after editing finishes.
+      setDraft(String(clamped));
     } else {
       setDraft(String(currentPage));
     }
@@ -181,12 +184,19 @@ function PdfPageIndicator({
   return (
     <span className="flex items-center gap-1 text-[11px] tabular-nums text-muted-foreground">
       <input
-        value={draft}
+        value={value}
         inputMode="numeric"
         aria-label="Current page"
         className="h-6 w-8 rounded-sm border border-border/60 bg-transparent text-center text-[11px] text-foreground tabular-nums outline-none focus-visible:border-[color:var(--color-border-focus)]"
+        onFocus={() => {
+          setDraft(String(currentPage));
+          setEditing(true);
+        }}
         onChange={(event) => setDraft(event.target.value.replace(/[^0-9]/g, ""))}
-        onBlur={commit}
+        onBlur={() => {
+          commit();
+          setEditing(false);
+        }}
         onKeyDown={(event) => {
           if (event.key === "Enter") {
             event.currentTarget.blur();
