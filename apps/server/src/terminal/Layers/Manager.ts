@@ -1126,6 +1126,7 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
   private subprocessPollTimer: ReturnType<typeof setTimeout> | null = null;
   private subprocessPollInFlight = false;
   private subprocessPollAbortController: AbortController | null = null;
+  private windowsSnapshotFailureEpisodeActive = false;
   /** Delay of the currently scheduled poll, so activity can pull it forward. */
   private currentSubprocessPollDelayMs = 0;
   private readonly killEscalationTimers = new Map<PtyProcess, KillEscalationHandle>();
@@ -2543,11 +2544,15 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
         }
 
         if (windowsSnapshotResult.kind === "unknown") {
-          this.logger.warn("failed to capture Windows terminal process snapshot", {
-            reason: windowsSnapshotResult.reason,
-          });
+          if (!this.windowsSnapshotFailureEpisodeActive) {
+            this.logger.warn("failed to capture Windows terminal process snapshot", {
+              reason: windowsSnapshotResult.reason,
+            });
+            this.windowsSnapshotFailureEpisodeActive = true;
+          }
           return;
         }
+        this.windowsSnapshotFailureEpisodeActive = false;
         sharedChildrenMap = windowsSnapshotResult.childrenByParentPid;
       } else if (this.useDefaultSubprocessChecker) {
         // Preserve the existing POSIX behavior: one full-system `ps` snapshot

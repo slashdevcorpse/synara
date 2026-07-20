@@ -1094,7 +1094,7 @@ describe("TerminalManager", () => {
     },
   );
 
-  it("preserves last-known Windows activity on unknown and collects afresh next cycle", async () => {
+  it("preserves Windows activity and warns once per contiguous snapshot failure", async () => {
     let result: WindowsProcessSnapshotResult = completeWindowsSnapshot([]);
     let collectorCalls = 0;
     const { manager } = makeManager(5, {
@@ -1126,6 +1126,8 @@ describe("TerminalManager", () => {
     events.length = 0;
     result = { kind: "unknown", reason: "capture_failed" };
     await pollSubprocessActivity(manager);
+    result = { kind: "unknown", reason: "timed_out" };
+    await pollSubprocessActivity(manager);
 
     expect(subprocessState(manager)).toMatchObject({
       detectedCliKind: "codex",
@@ -1143,7 +1145,20 @@ describe("TerminalManager", () => {
       hasRunningSubprocess: false,
       providerDescendantObserved: false,
     });
-    expect(collectorCalls).toBe(2);
+
+    events.length = 0;
+    result = { kind: "unknown", reason: "empty_snapshot" };
+    await pollSubprocessActivity(manager);
+
+    expect(subprocessState(manager)).toMatchObject({
+      detectedCliKind: null,
+      hasRunningSubprocess: false,
+      providerDescendantObserved: false,
+    });
+    expect(events.filter((event) => event.type === "activity")).toHaveLength(0);
+    expect(warn).toHaveBeenCalledTimes(2);
+    expect(String(warn.mock.calls[1]?.[0])).toContain("empty_snapshot");
+    expect(collectorCalls).toBe(4);
 
     manager.dispose();
   });

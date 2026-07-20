@@ -347,12 +347,14 @@ async function main(): Promise<void> {
   const eightTerminals = results.find((result) => result.terminals === 8);
   const thirtyTwoTerminals = results.find((result) => result.terminals === 32);
   const queryCountsPass = results.every((result) => result.acceptance.queryCountsPass);
+  const allRequestedP95WithinBudget = results.every((result) => result.acceptance.p95WithinBudget);
   const oneTerminalP95Pass = oneTerminal?.acceptance.p95WithinBudget === true;
   const eightTerminalP95Improved = eightTerminals?.acceptance.p95WithinBudget === true;
   const thirtyTwoTerminalP95Improved = thirtyTwoTerminals?.acceptance.p95WithinBudget === true;
   const passed =
     missingTerminalCounts.length === 0 &&
     queryCountsPass &&
+    allRequestedP95WithinBudget &&
     oneTerminalP95Pass &&
     eightTerminalP95Improved &&
     thirtyTwoTerminalP95Improved;
@@ -389,6 +391,7 @@ async function main(): Promise<void> {
     acceptance: {
       missingTerminalCounts,
       queryCountsPass,
+      allRequestedP95WithinBudget,
       oneTerminalP95Pass,
       eightTerminalP95Improved,
       thirtyTwoTerminalP95Improved,
