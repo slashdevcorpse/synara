@@ -57,9 +57,15 @@ describe("normalizeCustomModelSlugs", () => {
 });
 
 describe("getAppModelOptions", () => {
-  it("uses the minimal verified Command Code fallback model catalog", () => {
+  it("uses the verified Command Code fallback model catalog", () => {
     expect(getAppModelOptions("commandCode", [])).toMatchObject([
       { slug: "gpt-5.6-sol", name: "GPT-5.6 Sol", provider: "commandCode" },
+      { slug: "gpt-5.6-terra", name: "GPT-5.6 Terra", provider: "commandCode" },
+      { slug: "gpt-5.6-luna", name: "GPT-5.6 Luna", provider: "commandCode" },
+      { slug: "gpt-5.5", name: "GPT-5.5", provider: "commandCode" },
+      { slug: "gpt-5.4", name: "GPT-5.4", provider: "commandCode" },
+      { slug: "gpt-5.3-codex", name: "GPT-5.3 Codex", provider: "commandCode" },
+      { slug: "gpt-5.4-mini", name: "GPT-5.4 Mini", provider: "commandCode" },
     ]);
   });
 
@@ -461,10 +467,7 @@ describe("normalizeStoredAppSettings", () => {
     );
 
     expect(normalized.commandCodeBinaryPath).toBe("C:/tools/commandcode.exe");
-    expect(normalized.customCommandCodeModels).toEqual([
-      "gpt-5.6-terra",
-      "openai/custom-command-model",
-    ]);
+    expect(normalized.customCommandCodeModels).toEqual(["openai/custom-command-model"]);
   });
 });
 
