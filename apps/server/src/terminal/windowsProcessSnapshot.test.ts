@@ -105,6 +105,9 @@ describe("createWindowsProcessSnapshotCollector", () => {
     expect(args).toHaveLength(5);
     const script = args?.[4] ?? "";
     expect(script.match(/Get-CimInstance Win32_Process/g)).toHaveLength(1);
+    expect(script).toContain(
+      "-Property ProcessId, ParentProcessId, Name, ExecutablePath, CommandLine",
+    );
     expect(script).toContain("$ErrorActionPreference = 'Stop'");
     expect(script).toContain("System.Text.UTF8Encoding");
     expect(script).toContain(
@@ -120,7 +123,7 @@ describe("createWindowsProcessSnapshotCollector", () => {
       signal: controller.signal,
       timeoutMs: WINDOWS_PROCESS_SNAPSHOT_TIMEOUT_MS,
     });
-    expect(WINDOWS_PROCESS_SNAPSHOT_TIMEOUT_MS).toBe(1_500);
+    expect(WINDOWS_PROCESS_SNAPSHOT_TIMEOUT_MS).toBe(5_000);
     expect(WINDOWS_PROCESS_SNAPSHOT_MAX_BUFFER_BYTES).toBe(8 * 1024 * 1024);
   });
 
