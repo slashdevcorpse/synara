@@ -79,4 +79,19 @@ describe("inspectSubprocessActivity", () => {
       hasRunningSubprocess: false,
     });
   });
+
+  it("terminates safely when a malformed snapshot contains a process cycle", () => {
+    const map = buildChildrenMap([
+      { ppid: 100, pid: 200, command: "zsh" },
+      { ppid: 200, pid: 300, command: "codex" },
+      { ppid: 300, pid: 100, command: "bash" },
+    ]);
+
+    expect(inspectSubprocessActivity(100, map)).toEqual({
+      cliKind: "codex",
+      hasNonProviderSubprocess: false,
+      hasProviderDescendant: true,
+      hasRunningSubprocess: true,
+    });
+  });
 });

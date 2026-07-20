@@ -21,6 +21,26 @@ describe("runProcess", () => {
     expect(result.stderrTruncated).toBe(false);
   });
 
+  it("decodes UTF-8 code points split across delayed stdout and stderr writes", async () => {
+    const result = await runProcess(process.execPath, [
+      "-e",
+      [
+        "const bytes = Buffer.from([0xf0, 0x9f, 0x8c, 0x8d]);",
+        "process.stdout.write(bytes.subarray(0, 2));",
+        "process.stderr.write(bytes.subarray(0, 2));",
+        "setTimeout(() => {",
+        "  process.stdout.write(bytes.subarray(2));",
+        "  process.stderr.write(bytes.subarray(2));",
+        "}, 30);",
+      ].join("\n"),
+    ]);
+
+    expect(result.stdout).toBe("\u{1f30d}");
+    expect(result.stderr).toBe("\u{1f30d}");
+    expect(result.stdout).not.toContain("\uFFFD");
+    expect(result.stderr).not.toContain("\uFFFD");
+  });
+
   it("rejects without spawning when the signal is already aborted", async () => {
     const controller = new AbortController();
     controller.abort();

@@ -2,6 +2,7 @@ import { assert, it } from "@effect/vitest";
 import { Effect, Schema } from "effect";
 
 import { ORCHESTRATION_WS_CHANNELS, ORCHESTRATION_WS_METHODS } from "./orchestration";
+import { ServerConfigStreamEvent } from "./server";
 import { WebSocketRequest, WsResponse, WS_CHANNELS, WS_METHODS } from "./ws";
 
 const decode = <S extends Schema.Top>(
@@ -214,6 +215,43 @@ it.effect("rejects push envelopes when channel payload does not match the channe
         data: {
           cwd: "/tmp/workspace",
           projectName: "workspace",
+        },
+      }),
+    );
+
+    assert.strictEqual(result._tag, "Failure");
+  }),
+);
+
+it.effect("accepts optional editor availability on server config update events", () =>
+  Effect.gen(function* () {
+    const withEditors = yield* decode(ServerConfigStreamEvent, {
+      type: "configUpdated",
+      payload: {
+        issues: [],
+        providers: [],
+        availableEditors: ["vscode", "cursor"],
+      },
+    });
+    const legacy = yield* decode(ServerConfigStreamEvent, {
+      type: "configUpdated",
+      payload: { issues: [], providers: [] },
+    });
+
+    assert.strictEqual(withEditors.type, "configUpdated");
+    assert.strictEqual(legacy.type, "configUpdated");
+  }),
+);
+
+it.effect("rejects unknown editor ids on server config update events", () =>
+  Effect.gen(function* () {
+    const result = yield* Effect.exit(
+      decode(ServerConfigStreamEvent, {
+        type: "configUpdated",
+        payload: {
+          issues: [],
+          providers: [],
+          availableEditors: ["not-an-editor"],
         },
       }),
     );
