@@ -24,7 +24,7 @@ import { Schema } from "effect";
 const SIDEBAR_COOKIE_NAME = "sidebar_state";
 const SIDEBAR_COOKIE_MAX_AGE = 60 * 60 * 24 * 7;
 const SIDEBAR_WIDTH = "16rem";
-const SIDEBAR_WIDTH_MOBILE = "calc(100vw - var(--spacing(3)))";
+const SIDEBAR_WIDTH_MOBILE = "calc(100vw - var(--spacing) * 3)";
 const SIDEBAR_WIDTH_ICON = "3rem";
 const SIDEBAR_RESIZE_DEFAULT_MIN_WIDTH = 16 * 16;
 
@@ -630,18 +630,22 @@ function SidebarRail({
     toggleSidebar();
   };
 
-  React.useEffect(() => {
+  React.useLayoutEffect(() => {
     if (!resolvedResizable?.storageKey || typeof window === "undefined") return;
     const rail = railRef.current;
     if (!rail) return;
     const wrapper = rail.closest<HTMLElement>("[data-slot='sidebar-wrapper']");
     if (!wrapper) return;
 
-    const storedWidth = getLocalStorageItem(resolvedResizable.storageKey, Schema.Finite);
-    if (storedWidth === null) return;
-    const clampedWidth = clampSidebarWidth(storedWidth, resolvedResizable);
-    wrapper.style.setProperty("--sidebar-width", `${clampedWidth}px`);
-    resolvedResizable.onResize?.(clampedWidth);
+    try {
+      const storedWidth = getLocalStorageItem(resolvedResizable.storageKey, Schema.Finite);
+      if (storedWidth === null) return;
+      const clampedWidth = clampSidebarWidth(storedWidth, resolvedResizable);
+      wrapper.style.setProperty("--sidebar-width", `${clampedWidth}px`);
+      resolvedResizable.onResize?.(clampedWidth);
+    } catch (error) {
+      console.warn("[sidebar] Failed to restore persisted width:", error);
+    }
   }, [resolvedResizable]);
 
   React.useEffect(() => {
