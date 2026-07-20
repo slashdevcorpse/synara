@@ -100,6 +100,12 @@ export const CodexModelOptions = Schema.Struct({
 });
 export type CodexModelOptions = typeof CodexModelOptions.Type;
 
+// Command Code currently exposes model selection at process start but no
+// machine-readable per-turn trait flags. Keep an explicit options schema so
+// the provider remains exhaustive without borrowing unsupported Codex knobs.
+export const CommandCodeModelOptions = Schema.Struct({});
+export type CommandCodeModelOptions = typeof CommandCodeModelOptions.Type;
+
 export const ClaudeModelOptions = Schema.Struct({
   thinking: Schema.optional(Schema.Boolean),
   effort: Schema.optional(Schema.Literals(CLAUDE_CODE_EFFORT_OPTIONS)),
@@ -146,6 +152,7 @@ export type DroidModelOptions = typeof DroidModelOptions.Type;
 
 export const ProviderModelOptions = Schema.Struct({
   codex: Schema.optional(CodexModelOptions),
+  commandCode: Schema.optional(CommandCodeModelOptions),
   claudeAgent: Schema.optional(ClaudeModelOptions),
   cursor: Schema.optional(CursorModelOptions),
   antigravity: Schema.optional(AntigravityModelOptions),
@@ -220,6 +227,14 @@ const CODEX_GPT_5_5_CAPABILITIES: ModelCapabilities = {
     { value: "high", label: "High" },
     { value: "xhigh", label: "Extra High" },
   ],
+};
+
+const COMMAND_CODE_MODEL_CAPABILITIES: ModelCapabilities = {
+  reasoningEffortLevels: [],
+  supportsFastMode: false,
+  supportsThinkingToggle: false,
+  promptInjectedEffortLevels: [],
+  contextWindowOptions: [],
 };
 
 const GROK_BUILD_CAPABILITIES: ModelCapabilities = {
@@ -470,6 +485,13 @@ export const MODEL_OPTIONS_BY_PROVIDER = {
       slug: "gpt-5.2",
       name: "GPT-5.2",
       capabilities: CODEX_GPT_5_CAPABILITIES,
+    },
+  ],
+  commandCode: [
+    {
+      slug: "gpt-5.6-sol",
+      name: "GPT-5.6 Sol",
+      capabilities: COMMAND_CODE_MODEL_CAPABILITIES,
     },
   ],
   claudeAgent: [
@@ -824,6 +846,7 @@ export type ProviderWithDefaultModel = Exclude<ProviderKind, "pi">;
 
 export const DEFAULT_MODEL_BY_PROVIDER: Record<ProviderWithDefaultModel, ModelSlug> = {
   codex: "gpt-5.5",
+  commandCode: "gpt-5.6-sol",
   claudeAgent: "claude-sonnet-5",
   cursor: "auto",
   antigravity: "Gemini 3.5 Flash",
@@ -846,6 +869,19 @@ export const MODEL_SLUG_ALIASES_BY_PROVIDER: Record<ProviderKind, Record<string,
     "gpt-5.3": "gpt-5.3-codex",
     "5.3-spark": "gpt-5.3-codex-spark",
     "gpt-5.3-spark": "gpt-5.3-codex-spark",
+  },
+  commandCode: {
+    sol: "gpt-5.6-sol",
+    "5.6-sol": "gpt-5.6-sol",
+    terra: "gpt-5.6-terra",
+    "5.6-terra": "gpt-5.6-terra",
+    luna: "gpt-5.6-luna",
+    "5.6-luna": "gpt-5.6-luna",
+    "5.5": "gpt-5.5",
+    "5.4": "gpt-5.4",
+    "5.3": "gpt-5.3-codex",
+    "gpt-5.3": "gpt-5.3-codex",
+    "5.4-mini": "gpt-5.4-mini",
   },
   claudeAgent: {
     fable: "claude-fable-5",
@@ -970,6 +1006,7 @@ export const MODEL_CAPABILITIES_INDEX = Object.fromEntries(
 
 export const PROVIDER_DISPLAY_NAMES: Record<ProviderKind, string> = {
   codex: "Codex",
+  commandCode: "Command Code",
   claudeAgent: "Claude",
   cursor: "Cursor",
   antigravity: "Antigravity",

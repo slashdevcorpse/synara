@@ -88,6 +88,7 @@ export type DraftThreadEnvMode = typeof DraftThreadEnvModeSchema.Type;
 const DraftThreadEntryPointSchema = Schema.Literals(["chat", "terminal"]);
 const COMPOSER_PROVIDER_KINDS = [
   "codex",
+  "commandCode",
   "claudeAgent",
   "cursor",
   "antigravity",
@@ -1318,6 +1319,16 @@ function makeModelSelection(
           ? { options: options as Extract<ModelSelection, { provider: "codex" }>["options"] }
           : {}),
       };
+    case "commandCode":
+      return {
+        provider,
+        model,
+        ...(options
+          ? {
+              options: options as Extract<ModelSelection, { provider: "commandCode" }>["options"],
+            }
+          : {}),
+      };
     case "claudeAgent":
       return {
         provider,
@@ -1389,6 +1400,10 @@ function normalizeProviderModelOptions(
     candidate?.codex && typeof candidate.codex === "object"
       ? (candidate.codex as Record<string, unknown>)
       : null;
+  const commandCodeCandidate =
+    candidate?.commandCode && typeof candidate.commandCode === "object"
+      ? (candidate.commandCode as Record<string, unknown>)
+      : null;
   const claudeCandidate =
     candidate?.claudeAgent && typeof candidate.claudeAgent === "object"
       ? (candidate.claudeAgent as Record<string, unknown>)
@@ -1441,6 +1456,7 @@ function normalizeProviderModelOptions(
           ...(codexFastMode !== undefined ? { fastMode: codexFastMode } : {}),
         }
       : undefined;
+  const commandCode = commandCodeCandidate ? {} : undefined;
 
   const claudeThinking =
     claudeCandidate?.thinking === true
@@ -1558,6 +1574,7 @@ function normalizeProviderModelOptions(
   const pi = piThinkingLevel !== undefined ? { thinkingLevel: piThinkingLevel } : undefined;
   if (
     !codex &&
+    !commandCode &&
     !claude &&
     !cursor &&
     !antigravity &&
@@ -1571,6 +1588,7 @@ function normalizeProviderModelOptions(
   }
   return {
     ...(codex ? { codex } : {}),
+    ...(commandCode ? { commandCode } : {}),
     ...(claude ? { claudeAgent: claude } : {}),
     ...(cursor ? { cursor } : {}),
     ...(antigravity ? { antigravity } : {}),
@@ -1630,6 +1648,8 @@ function normalizeModelSelection(
   const options =
     provider === "codex"
       ? modelOptions?.codex
+      : provider === "commandCode"
+        ? modelOptions?.commandCode
       : provider === "claudeAgent"
         ? inferredClaudeAutoCompactWindow !== undefined
           ? {

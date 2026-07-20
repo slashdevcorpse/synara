@@ -890,6 +890,8 @@ function getProviderStartOptionsCustomBinaryPath(
   switch (provider) {
     case "codex":
       return normalizeCustomBinaryPath(providerOptions?.codex?.binaryPath);
+    case "commandCode":
+      return normalizeCustomBinaryPath(providerOptions?.commandCode?.binaryPath);
     case "claudeAgent":
       return normalizeCustomBinaryPath(providerOptions?.claudeAgent?.binaryPath);
     case "antigravity":
@@ -2113,6 +2115,7 @@ export default function ChatView({
 
     return {
       codex: resolveHint("codex"),
+      commandCode: resolveHint("commandCode"),
       claudeAgent: resolveHint("claudeAgent"),
       cursor: resolveHint("cursor"),
       antigravity: resolveHint("antigravity"),
@@ -2136,6 +2139,15 @@ export default function ChatView({
     providerModelsQueryOptions({ provider: "claudeAgent" }),
   );
   const codexDynamicModelsQuery = useQuery(providerModelsQueryOptions({ provider: "codex" }));
+  const commandCodeModelDiscoveryEnabled =
+    selectedProvider === "commandCode" || lockedProvider === "commandCode" || isModelPickerOpen;
+  const commandCodeDynamicModelsQuery = useQuery(
+    providerModelsQueryOptions({
+      provider: "commandCode",
+      binaryPath: settings.commandCodeBinaryPath || null,
+      enabled: commandCodeModelDiscoveryEnabled,
+    }),
+  );
   const openCodeModelDiscoveryEnabled =
     selectedProvider === "opencode" || lockedProvider === "opencode" || isModelPickerOpen;
   const kiloModelDiscoveryEnabled =
@@ -2226,6 +2238,13 @@ export default function ChatView({
   );
   const cursorModelDiscoveryEnabled =
     selectedProvider === "cursor" || lockedProvider === "cursor" || isModelPickerOpen;
+  const hasResolvedCommandCodeModelDiscovery =
+    commandCodeDynamicModelsQuery.data?.source === "command-code.cli" &&
+    (commandCodeDynamicModelsQuery.data.models.length ?? 0) > 0;
+  const commandCodeModelDiscoveryPending =
+    commandCodeModelDiscoveryEnabled &&
+    !hasResolvedCommandCodeModelDiscovery &&
+    isInitialModelDiscoveryPending(commandCodeDynamicModelsQuery);
   const hasResolvedCursorModelDiscovery =
     (cursorDynamicModelsQuery.data?.source === "cursor.cli" ||
       cursorDynamicModelsQuery.data?.source === "cursor.acp") &&
@@ -2276,6 +2295,11 @@ export default function ChatView({
         customModelsByProvider.codex,
         composerModelHintByProvider.codex,
       ),
+      commandCode: getAppModelOptions(
+        "commandCode",
+        customModelsByProvider.commandCode,
+        composerModelHintByProvider.commandCode,
+      ),
       claudeAgent: getAppModelOptions(
         "claudeAgent",
         customModelsByProvider.claudeAgent,
@@ -2321,6 +2345,7 @@ export default function ChatView({
     const dynamicSources: Record<ProviderKind, typeof claudeDynamicModelsQuery.data> = {
       claudeAgent: claudeDynamicModelsQuery.data,
       codex: codexDynamicModelsQuery.data,
+      commandCode: commandCodeDynamicModelsQuery.data,
       cursor:
         cursorDynamicModelsQuery.data === undefined
           ? undefined
@@ -2336,6 +2361,7 @@ export default function ChatView({
     for (const provider of [
       "claudeAgent",
       "codex",
+      "commandCode",
       "cursor",
       "antigravity",
       "grok",
@@ -2357,6 +2383,7 @@ export default function ChatView({
     return result;
   }, [
     claudeDynamicModelsQuery.data,
+    commandCodeDynamicModelsQuery.data,
     composerModelHintByProvider,
     codexDynamicModelsQuery.data,
     cursorDynamicModelsQuery.data,
@@ -2381,6 +2408,7 @@ export default function ChatView({
     () => ({
       claudeAgent: claudeDynamicModelsQuery.data?.models ?? [],
       codex: codexDynamicModelsQuery.data?.models ?? [],
+      commandCode: commandCodeDynamicModelsQuery.data?.models ?? [],
       cursor: cursorRuntimeModels,
       antigravity: antigravityModelsQuery.data?.models ?? [],
       grok: grokDynamicModelsQuery.data?.models ?? [],
@@ -2391,6 +2419,7 @@ export default function ChatView({
     }),
     [
       claudeDynamicModelsQuery.data?.models,
+      commandCodeDynamicModelsQuery.data?.models,
       codexDynamicModelsQuery.data?.models,
       cursorRuntimeModels,
       droidDynamicModelsQuery.data?.models,
@@ -2404,6 +2433,7 @@ export default function ChatView({
   const providerModelsQueryByProvider = {
     claudeAgent: claudeDynamicModelsQuery,
     codex: codexDynamicModelsQuery,
+    commandCode: commandCodeDynamicModelsQuery,
     cursor: cursorDynamicModelsQuery,
     antigravity: antigravityModelsQuery,
     grok: grokDynamicModelsQuery,
@@ -3700,7 +3730,9 @@ export default function ChatView({
     activeThread !== undefined &&
     threadExportBlockedReason(activeThread) === null;
   const selectedDynamicAgents =
-    selectedProvider === "claudeAgent"
+    selectedProvider === "commandCode"
+      ? EMPTY_PROVIDER_AGENTS
+      : selectedProvider === "claudeAgent"
       ? (claudeDynamicAgentsQuery.data?.agents ?? EMPTY_PROVIDER_AGENTS)
       : selectedProvider === "kilo"
         ? (kiloDynamicAgentsQuery.data?.agents ?? EMPTY_PROVIDER_AGENTS)
@@ -9404,6 +9436,7 @@ export default function ChatView({
         providers={providerStatuses}
         modelOptionsByProvider={modelOptionsByProvider}
         loadingModelProviders={{
+          commandCode: commandCodeModelDiscoveryPending,
           antigravity: antigravityModelDiscoveryPending,
           cursor: cursorModelDiscoveryPending,
           droid: droidModelDiscoveryPending,
@@ -9447,6 +9480,7 @@ export default function ChatView({
       providers={providerStatuses}
       modelOptionsByProvider={modelOptionsByProvider}
       loadingModelProviders={{
+        commandCode: commandCodeModelDiscoveryPending,
         antigravity: antigravityModelDiscoveryPending,
         cursor: cursorModelDiscoveryPending,
         droid: droidModelDiscoveryPending,

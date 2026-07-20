@@ -21,6 +21,12 @@ export const CodexServerProviderSettings = Schema.Struct({
 });
 export type CodexServerProviderSettings = typeof CodexServerProviderSettings.Type;
 
+export const CommandCodeServerProviderSettings = Schema.Struct({
+  ...ProviderSettingsBase,
+  binaryPath: StringSetting.pipe(Schema.withDecodingDefault(() => "commandcode")),
+});
+export type CommandCodeServerProviderSettings = typeof CommandCodeServerProviderSettings.Type;
+
 export const ClaudeServerProviderSettings = Schema.Struct({
   ...ProviderSettingsBase,
   binaryPath: StringSetting.pipe(Schema.withDecodingDefault(() => "claude")),
@@ -103,6 +109,7 @@ export const ServerSettings = Schema.Struct({
   ),
   providers: Schema.Struct({
     codex: CodexServerProviderSettings.pipe(Schema.withDecodingDefault(() => ({}))),
+    commandCode: CommandCodeServerProviderSettings.pipe(Schema.withDecodingDefault(() => ({}))),
     claudeAgent: ClaudeServerProviderSettings.pipe(Schema.withDecodingDefault(() => ({}))),
     cursor: CursorServerProviderSettings.pipe(Schema.withDecodingDefault(() => ({}))),
     antigravity: AntigravityServerProviderSettings.pipe(Schema.withDecodingDefault(() => ({}))),
@@ -151,6 +158,12 @@ export const ServerSettingsPatch = Schema.Struct({
         Schema.Struct({
           ...ProviderSettingsBasePatch,
           homePath: Schema.optionalKey(StringSetting),
+        }),
+      ),
+      commandCode: Schema.optionalKey(
+        Schema.Struct({
+          ...ProviderSettingsBasePatch,
+          binaryPath: Schema.optionalKey(StringSetting),
         }),
       ),
       claudeAgent: Schema.optionalKey(

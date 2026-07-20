@@ -9,6 +9,16 @@ import { describe, expect, it } from "vitest";
 import { ProviderIcon, PROVIDER_ICON_COMPONENT_BY_PROVIDER } from "./ProviderIcon";
 
 describe("ProviderIcon", () => {
+  it("renders a distinct accessible Command Code icon", () => {
+    const markup = renderToStaticMarkup(
+      <ProviderIcon provider="commandCode" aria-hidden={false} aria-label="Command Code" />,
+    );
+
+    expect(PROVIDER_ICON_COMPONENT_BY_PROVIDER.commandCode).toBeDefined();
+    expect(markup).toContain("Command Code");
+    expect(markup).toContain("agentic-coding");
+  });
+
   it("uses Antigravity branding", () => {
     expect(PROVIDER_ICON_COMPONENT_BY_PROVIDER).not.toHaveProperty("gemini");
 

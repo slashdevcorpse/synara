@@ -41,6 +41,7 @@ function ClaudeTraitsPickerHarness(props: {
     projectModelSelection: null,
     customModelsByProvider: {
       codex: [],
+      commandCode: [],
       claudeAgent: [],
       cursor: [],
       antigravity: [],
@@ -641,6 +642,7 @@ function OpenCodeTraitsPickerHarness(props: {
     projectModelSelection: null,
     customModelsByProvider: {
       codex: [],
+      commandCode: [],
       claudeAgent: [],
       cursor: [],
       antigravity: [],

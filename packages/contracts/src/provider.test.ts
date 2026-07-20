@@ -7,6 +7,33 @@ const decodeProviderSessionStartInput = Schema.decodeUnknownSync(ProviderSession
 const decodeProviderSendTurnInput = Schema.decodeUnknownSync(ProviderSendTurnInput);
 
 describe("ProviderSessionStartInput", () => {
+  it("accepts standalone Command Code sessions and binary overrides", () => {
+    const parsed = decodeProviderSessionStartInput({
+      threadId: "thread-command-code",
+      provider: "commandCode",
+      cwd: "/tmp/workspace",
+      modelSelection: {
+        provider: "commandCode",
+        model: "gpt-5.6-sol",
+      },
+      providerOptions: {
+        commandCode: {
+          binaryPath: "/usr/local/bin/commandcode",
+        },
+      },
+      runtimeMode: "full-access",
+    });
+
+    expect(parsed.provider).toBe("commandCode");
+    expect(parsed.modelSelection).toEqual({
+      provider: "commandCode",
+      model: "gpt-5.6-sol",
+    });
+    expect(parsed.providerOptions?.commandCode?.binaryPath).toBe(
+      "/usr/local/bin/commandcode",
+    );
+  });
+
   it("accepts codex-compatible payloads", () => {
     const parsed = decodeProviderSessionStartInput({
       threadId: "thread-1",

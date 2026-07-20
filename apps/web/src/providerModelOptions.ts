@@ -10,6 +10,8 @@ import type {
   ClaudeModelSelection,
   CodexModelOptions,
   CodexModelSelection,
+  CommandCodeModelOptions,
+  CommandCodeModelSelection,
   CursorModelOptions,
   CursorModelSelection,
   DroidModelOptions,
@@ -57,7 +59,12 @@ export function formatProviderModelOptionName(input: {
     return trimmedSlug;
   }
 
-  if (input.provider === "kilo" || input.provider === "opencode" || input.provider === "pi") {
+  if (
+    input.provider === "commandCode" ||
+    input.provider === "kilo" ||
+    input.provider === "opencode" ||
+    input.provider === "pi"
+  ) {
     const modelIdentifier = trimmedSlug.includes("/")
       ? trimmedSlug.slice(trimmedSlug.lastIndexOf("/") + 1)
       : trimmedSlug;
@@ -158,6 +165,7 @@ export function mergeDynamicModelOptions(input: {
   );
   const missingStaticBuiltIns =
     (input.provider === "antigravity" ||
+      input.provider === "commandCode" ||
       input.provider === "kilo" ||
       input.provider === "opencode" ||
       input.provider === "cursor" ||
@@ -273,6 +281,12 @@ export function buildNextProviderOptions(
   if (provider === "codex") {
     return { ...(modelOptions as CodexModelOptions | undefined), ...patch } as CodexModelOptions;
   }
+  if (provider === "commandCode") {
+    return {
+      ...(modelOptions as CommandCodeModelOptions | undefined),
+      ...patch,
+    } as CommandCodeModelOptions;
+  }
   if (provider === "claudeAgent") {
     return { ...(modelOptions as ClaudeModelOptions | undefined), ...patch } as ClaudeModelOptions;
   }
@@ -322,6 +336,11 @@ export function buildModelSelection(
   model: string,
   options?: CodexModelOptions | null | undefined,
 ): CodexModelSelection;
+export function buildModelSelection(
+  provider: "commandCode",
+  model: string,
+  options?: CommandCodeModelOptions | null | undefined,
+): CommandCodeModelSelection;
 export function buildModelSelection(
   provider: "claudeAgent",
   model: string,
@@ -387,6 +406,14 @@ export function buildModelSelection(
             provider,
             model,
             options: options as CodexModelOptions,
+          }
+        : { provider, model };
+    case "commandCode":
+      return options
+        ? {
+            provider,
+            model,
+            options: options as CommandCodeModelOptions,
           }
         : { provider, model };
     case "claudeAgent":

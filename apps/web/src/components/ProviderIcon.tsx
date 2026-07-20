@@ -63,8 +63,27 @@ const OpenCodeProviderIcon = ({
   );
 };
 
+const CommandCodeProviderIcon: Icon = ({
+  className,
+  style,
+  "aria-hidden": ariaHidden,
+  "aria-label": ariaLabel,
+}) => (
+  <CentralIcon
+    name="agentic-coding"
+    label={
+      ariaHidden === true || ariaHidden === "true" || typeof ariaLabel !== "string"
+        ? undefined
+        : ariaLabel
+    }
+    className={className}
+    style={style}
+  />
+);
+
 export const PROVIDER_ICON_COMPONENT_BY_PROVIDER: Record<ProviderKind, Icon> = {
   codex: OpenAI,
+  commandCode: CommandCodeProviderIcon,
   claudeAgent: ClaudeAI,
   cursor: CursorIcon,
   antigravity: AntigravityIcon,

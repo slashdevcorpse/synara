@@ -44,6 +44,10 @@
       "types": "./src/codexCliExecutable.ts",
       "import": "./src/codexCliExecutable.ts"
     },
+    "./commandCodeCliExecutable": {
+      "types": "./src/commandCodeCliExecutable.ts",
+      "import": "./src/commandCodeCliExecutable.ts"
+    },
     "./windowsCertificate": {
       "types": "./src/windowsCertificate.ts",
       "import": "./src/windowsCertificate.ts"

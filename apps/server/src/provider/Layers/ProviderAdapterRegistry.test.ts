@@ -6,6 +6,10 @@ import { Effect, Layer, Stream } from "effect";
 
 import { ClaudeAdapter, ClaudeAdapterShape } from "../Services/ClaudeAdapter.ts";
 import { CodexAdapter, CodexAdapterShape } from "../Services/CodexAdapter.ts";
+import {
+  CommandCodeAdapter,
+  CommandCodeAdapterShape,
+} from "../Services/CommandCodeAdapter.ts";
 import { CursorAdapter, CursorAdapterShape } from "../Services/CursorAdapter.ts";
 import { DroidAdapter, DroidAdapterShape } from "../Services/DroidAdapter.ts";
 import { GrokAdapter, GrokAdapterShape } from "../Services/GrokAdapter.ts";
@@ -20,6 +24,23 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 
 const fakeCodexAdapter: CodexAdapterShape = {
   provider: "codex",
+  capabilities: { sessionModelSwitch: "in-session" },
+  startSession: vi.fn(),
+  sendTurn: vi.fn(),
+  interruptTurn: vi.fn(),
+  respondToRequest: vi.fn(),
+  respondToUserInput: vi.fn(),
+  stopSession: vi.fn(),
+  listSessions: vi.fn(),
+  hasSession: vi.fn(),
+  readThread: vi.fn(),
+  rollbackThread: vi.fn(),
+  stopAll: vi.fn(),
+  streamEvents: Stream.empty,
+};
+
+const fakeCommandCodeAdapter: CommandCodeAdapterShape = {
+  provider: "commandCode",
   capabilities: { sessionModelSwitch: "in-session" },
   startSession: vi.fn(),
   sendTurn: vi.fn(),
@@ -180,6 +201,7 @@ const layer = it.layer(
       ProviderAdapterRegistryLive,
       Layer.mergeAll(
         Layer.succeed(CodexAdapter, fakeCodexAdapter),
+        Layer.succeed(CommandCodeAdapter, fakeCommandCodeAdapter),
         Layer.succeed(ClaudeAdapter, fakeClaudeAdapter),
         Layer.succeed(CursorAdapter, fakeCursorAdapter),
         Layer.succeed(AntigravityAdapter, fakeAntigravityAdapter),
@@ -199,6 +221,7 @@ layer("ProviderAdapterRegistryLive", (it) => {
     Effect.gen(function* () {
       const registry = yield* ProviderAdapterRegistry;
       const codex = yield* registry.getByProvider("codex");
+      const commandCode = yield* registry.getByProvider("commandCode");
       const claude = yield* registry.getByProvider("claudeAgent");
       const cursor = yield* registry.getByProvider("cursor");
       const antigravity = yield* registry.getByProvider("antigravity");
@@ -208,6 +231,7 @@ layer("ProviderAdapterRegistryLive", (it) => {
       const opencode = yield* registry.getByProvider("opencode");
       const pi = yield* registry.getByProvider("pi");
       assert.equal(codex, fakeCodexAdapter);
+      assert.equal(commandCode, fakeCommandCodeAdapter);
       assert.equal(claude, fakeClaudeAdapter);
       assert.equal(cursor, fakeCursorAdapter);
       assert.equal(antigravity, fakeAntigravityAdapter);
@@ -220,6 +244,7 @@ layer("ProviderAdapterRegistryLive", (it) => {
       const providers = yield* registry.listProviders();
       assert.deepEqual(providers, [
         "codex",
+        "commandCode",
         "claudeAgent",
         "cursor",
         "antigravity",

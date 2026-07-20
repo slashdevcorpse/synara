@@ -6,7 +6,7 @@ import type { ServerProviderStatus } from "@synara/contracts";
 import { DEFAULT_SERVER_SETTINGS, ServerProviderUpdateError } from "@synara/contracts";
 import { buildWindowsBatchCommandArgs, resolveWindowsComSpec } from "@synara/shared/windowsProcess";
 import { describe, it, assert } from "@effect/vitest";
-import { Effect, FileSystem, Layer, Path, Sink, Stream } from "effect";
+import { Effect, Fiber, FileSystem, Layer, Path, Sink, Stream } from "effect";
 import { TestClock } from "effect/testing";
 import * as PlatformError from "effect/PlatformError";
 import { ChildProcessSpawner } from "effect/unstable/process";
@@ -32,6 +32,7 @@ import {
   hasCustomModelProvider,
   makeDisabledProviderStatus,
   makeCheckClaudeProviderStatus,
+  makeCheckCommandCodeProviderStatus,
   makeCheckCodexProviderStatus,
   makeCheckCursorProviderStatus,
   makeCheckGrokProviderStatus,
@@ -40,6 +41,7 @@ import {
   makeProviderHealthLive,
   parseAuthStatusFromOutput,
   parseClaudeAuthStatusFromOutput,
+  parseCommandCodeStatusJson,
   PACKAGE_MANAGED_PROVIDER_UPDATES,
   providerStatusesEqual,
   ProviderHealthLive,
@@ -271,6 +273,7 @@ function hangingSpawnerLayer(input: {
 const allProvidersDisabledSettings = {
   providers: {
     codex: { enabled: false },
+    commandCode: { enabled: false },
     claudeAgent: { enabled: false },
     cursor: { enabled: false },
     antigravity: { enabled: false },
@@ -286,6 +289,7 @@ const allProvidersDisabledServerSettings = {
   ...DEFAULT_SERVER_SETTINGS,
   providers: {
     codex: { ...DEFAULT_SERVER_SETTINGS.providers.codex, enabled: false },
+    commandCode: { ...DEFAULT_SERVER_SETTINGS.providers.commandCode, enabled: false },
     claudeAgent: { ...DEFAULT_SERVER_SETTINGS.providers.claudeAgent, enabled: false },
     cursor: { ...DEFAULT_SERVER_SETTINGS.providers.cursor, enabled: false },
     antigravity: { ...DEFAULT_SERVER_SETTINGS.providers.antigravity, enabled: false },
@@ -369,7 +373,143 @@ function withTempCodexHome(configContent?: string) {
 }
 
 it.layer(NodeServices.layer)("ProviderHealth", (it) => {
+  describe("Command Code health", () => {
+    it("parses the documented automation status JSON defensively", () => {
+      assert.deepStrictEqual(
+        parseCommandCodeStatusJson(
+          JSON.stringify({
+            authenticated: true,
+            version: "0.52.1",
+            user: "operator@example.com",
+            provider: "openai",
+            model: "gpt-5.6-sol",
+          }),
+        ),
+        {
+          authenticated: true,
+          version: "0.52.1",
+          user: "operator@example.com",
+          provider: "openai",
+          model: "gpt-5.6-sol",
+        },
+      );
+      assert.strictEqual(parseCommandCodeStatusJson("not-json"), undefined);
+      assert.strictEqual(parseCommandCodeStatusJson('{"authenticated":"yes"}'), undefined);
+    });
+
+    it.effect("reports installed version and authenticated JSON status", () => {
+      const calls: ReadonlyArray<string>[] = [];
+      return makeCheckCommandCodeProviderStatus("commandcode.exe").pipe(
+        Effect.provide(
+          mockSpawnerLayer((args) => {
+            calls.push(args);
+            if (args.includes("--version")) {
+              return { stdout: "command-code 0.52.1", stderr: "", code: 0 };
+            }
+            return {
+              stdout: JSON.stringify({
+                authenticated: true,
+                version: "0.52.1",
+                user: "operator@example.com",
+                provider: "openai",
+                model: "gpt-5.6-sol",
+              }),
+              stderr: "",
+              code: 0,
+            };
+          }),
+        ),
+        Effect.tap((status) =>
+          Effect.sync(() => {
+            assert.strictEqual(status.status, "ready");
+            assert.strictEqual(status.authStatus, "authenticated");
+            assert.strictEqual(status.version, "0.52.1");
+            assert.strictEqual(status.authLabel, "operator@example.com");
+            assert.ok(calls.some((args) => JSON.stringify(args) === JSON.stringify(["status", "--json"])));
+          }),
+        ),
+      );
+    });
+
+    it.effect("reports unauthenticated and malformed status responses as warnings", () =>
+      Effect.gen(function* () {
+        let statusResponse = JSON.stringify({ authenticated: false, error: "Login required" });
+        const spawner = mockSpawnerLayer((args) =>
+          args.includes("--version")
+            ? { stdout: "0.52.1", stderr: "", code: 0 }
+            : { stdout: statusResponse, stderr: "", code: 1 },
+        );
+        const unauthenticated = yield* makeCheckCommandCodeProviderStatus("commandcode.exe").pipe(
+          Effect.provide(spawner),
+        );
+        assert.strictEqual(unauthenticated.status, "warning");
+        assert.strictEqual(unauthenticated.authStatus, "unauthenticated");
+        assert.strictEqual(unauthenticated.message, "Login required");
+
+        statusResponse = "not-json";
+        const malformed = yield* makeCheckCommandCodeProviderStatus("commandcode.exe").pipe(
+          Effect.provide(spawner),
+        );
+        assert.strictEqual(malformed.authStatus, "unknown");
+        assert.match(malformed.message ?? "", /malformed/u);
+      }),
+    );
+
+    it.effect("reports a missing launcher as unavailable", () =>
+      makeCheckCommandCodeProviderStatus("missing-commandcode.exe").pipe(
+        Effect.provide(failingSpawnerLayer("not found")),
+        Effect.tap((status) =>
+          Effect.sync(() => {
+            assert.strictEqual(status.status, "error");
+            assert.strictEqual(status.available, false);
+            assert.strictEqual(status.authStatus, "unknown");
+          }),
+        ),
+      ),
+    );
+
+    it.effect("times out a hung JSON authentication probe", () =>
+      Effect.gen(function* () {
+        let killed = false;
+        const checking = yield* makeCheckCommandCodeProviderStatus("commandcode.exe").pipe(
+          Effect.provide(
+            hangingSpawnerLayer({
+              onKill: () => {
+                killed = true;
+              },
+              shouldHang: (args) => args.includes("status"),
+            }),
+          ),
+          Effect.forkChild,
+        );
+        yield* Effect.yieldNow;
+        yield* TestClock.adjust(15_000);
+        const status = yield* Fiber.join(checking);
+        assert.strictEqual(status.authStatus, "unknown");
+        assert.match(status.message ?? "", /timed out/u);
+        assert.strictEqual(killed, true);
+      }),
+    );
+  });
+
   describe("provider update commands", () => {
+    it("registers Command Code's supported native updater", () => {
+      const definition = PACKAGE_MANAGED_PROVIDER_UPDATES.commandCode;
+      assert.ok(definition);
+      const capabilities = resolvePackageManagedProviderMaintenance(definition, {
+        binaryPath: "commandcode",
+        realCommandPath: "/usr/local/bin/commandcode",
+        commandDirectory: "/usr/local/bin",
+      });
+      assert.deepStrictEqual(capabilities.update, {
+        command: "commandcode update",
+        executable: "commandcode",
+        args: ["update"],
+        lockKey: "command-code-native",
+        pathPrepend: "/usr/local/bin",
+      });
+    });
+
     it("registers Antigravity's native updater", () => {
       const definition = PACKAGE_MANAGED_PROVIDER_UPDATES.antigravity;
       assert.ok(definition);
@@ -515,7 +655,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
       );
       const codex = statuses.find((status) => status.provider === "codex");
 
-      assert.strictEqual(statuses.length, 9);
+      assert.strictEqual(statuses.length, 10);
       assert.strictEqual(codex?.available, false);
       assert.strictEqual(codex?.message, "Provider is disabled in Synara settings.");
     });
@@ -650,7 +790,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
         const providerHealth = yield* ProviderHealth;
         const statuses = yield* providerHealth.refresh;
 
-        assert.strictEqual(statuses.length, 9);
+        assert.strictEqual(statuses.length, 10);
         for (const status of statuses) {
           assert.strictEqual(status.available, false);
           assert.strictEqual(status.message, "Provider is disabled in Synara settings.");

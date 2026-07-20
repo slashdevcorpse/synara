@@ -284,6 +284,7 @@ function AppSnapPermissionBadge({ permission }: { permission: DesktopAppSnapPerm
 type InstallBinarySettingsKey =
   | "claudeBinaryPath"
   | "codexBinaryPath"
+  | "commandCodeBinaryPath"
   | "cursorBinaryPath"
   | "antigravityBinaryPath"
   | "grokBinaryPath"
@@ -408,6 +409,18 @@ const INSTALL_PROVIDER_SETTINGS: readonly InstallProviderSettings[] = [
     homePathKey: "codexHomePath",
     homePlaceholder: "CODEX_HOME",
     homeDescription: "Optional custom Codex home and config directory.",
+  },
+  {
+    provider: "commandCode",
+    title: "Command Code",
+    docs: [{ label: "Docs", href: "https://commandcode.ai/docs" }],
+    binaryPathKey: "commandCodeBinaryPath",
+    binaryPlaceholder: "Command Code binary path",
+    binaryDescription: (
+      <>
+        Leave blank to use <code>commandcode</code> from your PATH.
+      </>
+    ),
   },
   {
     provider: "claudeAgent",
@@ -731,6 +744,7 @@ function SettingsRouteView() {
   const environmentPanelRef = useRef<HTMLDivElement | null>(null);
   const [openInstallProviders, setOpenInstallProviders] = useState<Record<ProviderKind, boolean>>({
     codex: Boolean(settings.codexBinaryPath || settings.codexHomePath),
+    commandCode: Boolean(settings.commandCodeBinaryPath),
     claudeAgent: Boolean(settings.claudeBinaryPath),
     cursor: Boolean(settings.cursorBinaryPath || settings.cursorApiEndpoint),
     antigravity: Boolean(settings.antigravityBinaryPath),
@@ -756,6 +770,7 @@ function SettingsRouteView() {
     Record<ProviderKind, string>
   >({
     codex: "",
+    commandCode: "",
     claudeAgent: "",
     cursor: "",
     antigravity: "",
@@ -835,6 +850,7 @@ function SettingsRouteView() {
   const isProviderOrderDirty = !sameProviderOrder(settings.providerOrder, defaults.providerOrder);
   const codexBinaryPath = settings.codexBinaryPath;
   const codexHomePath = settings.codexHomePath;
+  const commandCodeBinaryPath = settings.commandCodeBinaryPath;
   const claudeBinaryPath = settings.claudeBinaryPath;
   const cursorBinaryPath = settings.cursorBinaryPath;
   const cursorApiEndpoint = settings.cursorApiEndpoint;
@@ -1039,6 +1055,7 @@ function SettingsRouteView() {
     settings.kiloServerPasswordConfigured !== defaults.kiloServerPasswordConfigured ||
     settings.codexBinaryPath !== defaults.codexBinaryPath ||
     settings.codexHomePath !== defaults.codexHomePath ||
+    settings.commandCodeBinaryPath !== defaults.commandCodeBinaryPath ||
     settings.openCodeBinaryPath !== defaults.openCodeBinaryPath ||
     settings.openCodeExperimentalWebSockets !== defaults.openCodeExperimentalWebSockets ||
     settings.openCodeServerUrl !== defaults.openCodeServerUrl ||
@@ -1097,6 +1114,7 @@ function SettingsRouteView() {
       : []),
     ...(isGitTextGenerationModelDirty ? ["Git writing model"] : []),
     ...(settings.customCodexModels.length > 0 ||
+    settings.customCommandCodeModels.length > 0 ||
     settings.customClaudeModels.length > 0 ||
     settings.customCursorModels.length > 0 ||
     settings.customAntigravityModels.length > 0 ||
@@ -1294,6 +1312,7 @@ function SettingsRouteView() {
     resetSettings();
     setOpenInstallProviders({
       codex: false,
+      commandCode: false,
       claudeAgent: false,
       cursor: false,
       antigravity: false,
@@ -1306,6 +1325,7 @@ function SettingsRouteView() {
     setSelectedCustomModelProvider("codex");
     setCustomModelInputByProvider({
       codex: "",
+      commandCode: "",
       claudeAgent: "",
       cursor: "",
       antigravity: "",
@@ -2796,6 +2816,7 @@ function SettingsRouteView() {
                 onClick={() => {
                   updateSettings({
                     customCodexModels: defaults.customCodexModels,
+                    customCommandCodeModels: defaults.customCommandCodeModels,
                     customClaudeModels: defaults.customClaudeModels,
                     customCursorModels: defaults.customCursorModels,
                     customAntigravityModels: defaults.customAntigravityModels,
@@ -2818,6 +2839,7 @@ function SettingsRouteView() {
                 onValueChange={(value) => {
                   if (
                     value !== "codex" &&
+                    value !== "commandCode" &&
                     value !== "claudeAgent" &&
                     value !== "cursor" &&
                     value !== "antigravity" &&
@@ -3100,6 +3122,7 @@ function SettingsRouteView() {
                     claudeBinaryPath: defaults.claudeBinaryPath,
                     codexBinaryPath: defaults.codexBinaryPath,
                     codexHomePath: defaults.codexHomePath,
+                    commandCodeBinaryPath: defaults.commandCodeBinaryPath,
                     cursorBinaryPath: defaults.cursorBinaryPath,
                     cursorApiEndpoint: defaults.cursorApiEndpoint,
                     antigravityBinaryPath: defaults.antigravityBinaryPath,
@@ -3117,6 +3140,7 @@ function SettingsRouteView() {
                   });
                   setOpenInstallProviders({
                     codex: false,
+                    commandCode: false,
                     claudeAgent: false,
                     cursor: false,
                     antigravity: false,
@@ -3139,6 +3163,8 @@ function SettingsRouteView() {
                   providerSettings.provider === "codex"
                     ? settings.codexBinaryPath !== defaults.codexBinaryPath ||
                       settings.codexHomePath !== defaults.codexHomePath
+                    : providerSettings.provider === "commandCode"
+                      ? settings.commandCodeBinaryPath !== defaults.commandCodeBinaryPath
                     : providerSettings.provider === "claudeAgent"
                       ? settings.claudeBinaryPath !== defaults.claudeBinaryPath
                       : providerSettings.provider === "cursor"
@@ -3167,6 +3193,8 @@ function SettingsRouteView() {
                 const binaryPathValue =
                   providerSettings.binaryPathKey === "claudeBinaryPath"
                     ? claudeBinaryPath
+                    : providerSettings.binaryPathKey === "commandCodeBinaryPath"
+                      ? commandCodeBinaryPath
                     : providerSettings.binaryPathKey === "cursorBinaryPath"
                       ? cursorBinaryPath
                       : providerSettings.binaryPathKey === "antigravityBinaryPath"
@@ -3328,6 +3356,8 @@ function SettingsRouteView() {
                                   updateSettings(
                                     providerSettings.binaryPathKey === "claudeBinaryPath"
                                       ? { claudeBinaryPath: nextValue }
+                                      : providerSettings.binaryPathKey === "commandCodeBinaryPath"
+                                        ? { commandCodeBinaryPath: nextValue }
                                       : providerSettings.binaryPathKey === "cursorBinaryPath"
                                         ? { cursorBinaryPath: nextValue }
                                         : providerSettings.binaryPathKey === "antigravityBinaryPath"

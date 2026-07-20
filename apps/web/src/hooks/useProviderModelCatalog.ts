@@ -65,6 +65,13 @@ export function useProviderModelCatalog(input: {
     providerModelsQueryOptions({ provider: "claudeAgent" }),
   );
   const codexDynamicModelsQuery = useQuery(providerModelsQueryOptions({ provider: "codex" }));
+  const commandCodeDynamicModelsQuery = useQuery(
+    providerModelsQueryOptions({
+      provider: "commandCode",
+      binaryPath: settings.commandCodeBinaryPath || null,
+      enabled: selectedProvider === "commandCode" || discoveryEnabled,
+    }),
+  );
   const cursorDynamicModelsQuery = useQuery(
     providerModelsQueryOptions({
       provider: "cursor",
@@ -155,6 +162,15 @@ export function useProviderModelCatalog(input: {
     cursorDynamicModelsQuery.data?.models ?? [],
   );
 
+  const commandCodeModelDiscoveryEnabled = selectedProvider === "commandCode" || discoveryEnabled;
+  const hasResolvedCommandCodeModelDiscovery =
+    commandCodeDynamicModelsQuery.data?.source === "command-code.cli" &&
+    (commandCodeDynamicModelsQuery.data.models.length ?? 0) > 0;
+  const commandCodeModelDiscoveryPending =
+    commandCodeModelDiscoveryEnabled &&
+    !hasResolvedCommandCodeModelDiscovery &&
+    isInitialModelDiscoveryPending(commandCodeDynamicModelsQuery);
+
   const cursorModelDiscoveryEnabled = selectedProvider === "cursor" || discoveryEnabled;
   const hasResolvedCursorModelDiscovery =
     (cursorDynamicModelsQuery.data?.source === "cursor.cli" ||
@@ -206,6 +222,11 @@ export function useProviderModelCatalog(input: {
 
   const staticOptions: Record<ProviderKind, ReturnType<typeof getAppModelOptions>> = {
     codex: getAppModelOptions("codex", customModelsByProvider.codex, modelHintByProvider?.codex),
+    commandCode: getAppModelOptions(
+      "commandCode",
+      customModelsByProvider.commandCode,
+      modelHintByProvider?.commandCode,
+    ),
     claudeAgent: getAppModelOptions(
       "claudeAgent",
       customModelsByProvider.claudeAgent,
@@ -239,6 +260,7 @@ export function useProviderModelCatalog(input: {
   const dynamicSources: Record<ProviderKind, typeof claudeDynamicModelsQuery.data> = {
     claudeAgent: claudeDynamicModelsQuery.data,
     codex: codexDynamicModelsQuery.data,
+    commandCode: commandCodeDynamicModelsQuery.data,
     cursor:
       cursorDynamicModelsQuery.data === undefined
         ? undefined
@@ -254,6 +276,7 @@ export function useProviderModelCatalog(input: {
   for (const provider of [
     "claudeAgent",
     "codex",
+    "commandCode",
     "cursor",
     "antigravity",
     "grok",
@@ -273,6 +296,7 @@ export function useProviderModelCatalog(input: {
   }
 
   const loadingModelProviders: Partial<Record<ProviderKind, boolean>> = {
+    commandCode: commandCodeModelDiscoveryPending,
     antigravity: antigravityModelDiscoveryPending,
     cursor: cursorModelDiscoveryPending,
     droid: droidModelDiscoveryPending,
@@ -284,6 +308,7 @@ export function useProviderModelCatalog(input: {
   const runtimeModelsByProvider: Record<ProviderKind, ReadonlyArray<ProviderModelDescriptor>> = {
     claudeAgent: claudeDynamicModelsQuery.data?.models ?? [],
     codex: codexDynamicModelsQuery.data?.models ?? [],
+    commandCode: commandCodeDynamicModelsQuery.data?.models ?? [],
     cursor: cursorRuntimeModels,
     antigravity: antigravityModelsQuery.data?.models ?? [],
     grok: grokDynamicModelsQuery.data?.models ?? [],
@@ -300,7 +325,9 @@ export function useProviderModelCatalog(input: {
   });
 
   const selectedDynamicAgents =
-    selectedProvider === "claudeAgent"
+    selectedProvider === "commandCode"
+      ? EMPTY_PROVIDER_AGENTS
+      : selectedProvider === "claudeAgent"
       ? (claudeDynamicAgentsQuery.data?.agents ?? EMPTY_PROVIDER_AGENTS)
       : selectedProvider === "kilo"
         ? (kiloDynamicAgentsQuery.data?.agents ?? EMPTY_PROVIDER_AGENTS)
