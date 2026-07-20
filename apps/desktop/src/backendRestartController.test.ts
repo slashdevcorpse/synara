@@ -9,7 +9,10 @@ import {
   type BackendRestartRequest,
 } from "./backendRestartController";
 
-const desktopMainSource = readFileSync(new URL("./main.ts", import.meta.url), "utf8");
+const desktopMainSource = readFileSync(new URL("./main.ts", import.meta.url), "utf8").replaceAll(
+  "\r\n",
+  "\n",
+);
 
 function sourceBetween(source: string, start: string, end: string): string {
   const startIndex = source.indexOf(start);
