@@ -1,11 +1,24 @@
 import { Schema } from "effect";
 import { describe, expect, it } from "vitest";
 
-import { ProviderListModelsResult } from "./providerDiscovery";
+import { ProviderListModelsInput, ProviderListModelsResult } from "./providerDiscovery";
 
 const decodeProviderListModelsResult = Schema.decodeUnknownSync(ProviderListModelsResult);
+const decodeProviderListModelsInput = Schema.decodeUnknownSync(ProviderListModelsInput);
 
 describe("ProviderListModelsResult", () => {
+  it("accepts Command Code model discovery requests", () => {
+    expect(
+      decodeProviderListModelsInput({
+        provider: "commandCode",
+        binaryPath: "C:\\tools\\commandcode.cmd",
+      }),
+    ).toEqual({
+      provider: "commandCode",
+      binaryPath: "C:\\tools\\commandcode.cmd",
+    });
+  });
+
   it("preserves optional runtime model descriptions", () => {
     const result = decodeProviderListModelsResult({
       models: [

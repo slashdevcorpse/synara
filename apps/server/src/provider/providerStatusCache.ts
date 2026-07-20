@@ -12,6 +12,7 @@ import { writeFileStringAtomically } from "../atomicWrite";
 
 const PROVIDER_STATUS_CACHE_IDS = [
   "codex",
+  "commandCode",
   "claudeAgent",
   "cursor",
   "antigravity",
