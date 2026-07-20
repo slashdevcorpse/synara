@@ -11,6 +11,12 @@ vi.mock("./terminal/terminalRuntimeRegistry", () => ({
   },
 }));
 
+// Keep this project-run smoke test scoped to Sidebar wiring. The workspace
+// agent section has its own focused unit and browser coverage.
+vi.mock("./workspace/WorkspaceAgentSection", () => ({
+  WorkspaceAgentSection: () => null,
+}));
+
 describe("Sidebar module", () => {
   it("loads after project-run wiring", async () => {
     vi.stubGlobal("self", globalThis);
