@@ -328,6 +328,18 @@ describe("workflow contracts", () => {
       );
     }
 
+    const distinctScript = validFiles();
+    distinctScript.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace(
+        "      - run: bun run --cwd apps/desktop smoke-test\n",
+        "      - run: bun run --cwd apps/desktop smoke-test\n      - run: bun run test:desktop-smoke-helper\n",
+      ),
+    );
+    expect(validateWorkflowContracts(distinctScript, policy()).join("\n")).not.toContain(
+      "without the Turbo rebuild wrapper",
+    );
+
     const earlySmoke = validFiles();
     earlySmoke.set(
       ".github/workflows/ci.yml",
