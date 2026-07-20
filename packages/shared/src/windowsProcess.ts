@@ -183,7 +183,7 @@ function resolveAbsoluteWindowsPath(value: string, cwd: string): string {
   return Path.win32.resolve(cwd, stripWrappingQuotes(value).replaceAll("/", "\\"));
 }
 
-function foldWindowsAsciiCase(value: string): string {
+export function foldWindowsAsciiCase(value: string): string {
   return value.replace(/[A-Z]/g, (character) =>
     String.fromCharCode(character.charCodeAt(0) + 0x20),
   );

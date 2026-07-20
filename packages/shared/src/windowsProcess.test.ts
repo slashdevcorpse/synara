@@ -13,6 +13,7 @@ import {
   buildWindowsBatchCommandArgs,
   clearWindowsCommandDiscoveryCache,
   createWindowsCommandDiscoveryCache,
+  foldWindowsAsciiCase,
   getWindowsCommandDiscoveryCacheStats,
   isWindowsBatchCommand,
   normalizeWindowsChildEnvironment,
@@ -85,6 +86,11 @@ describe("windowsProcess", () => {
       PATH: undefined,
       PaTh: "C:\\alternating",
     });
+  });
+
+  it("folds only Windows ASCII case for shared path and environment identities", () => {
+    expect(foldWindowsAsciiCase("C:\\TOOLS\\İD\\PATH")).toBe("c:\\tools\\İd\\path");
+    expect(foldWindowsAsciiCase("i\u0307D")).toBe("i\u0307d");
   });
 
   it("leaves non-Windows commands shell-free and otherwise unchanged", () => {
