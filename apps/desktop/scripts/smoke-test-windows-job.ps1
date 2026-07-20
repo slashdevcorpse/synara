@@ -2,7 +2,7 @@ $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 Set-StrictMode -Version 2
 
-function Stop-SmokeJob([string]$Message, [int]$ExitCode = 70) {
+function Write-SmokeJobError([string]$Message, [int]$ExitCode = 70) {
   [Console]::Error.WriteLine("SYNARA_SMOKE_JOB_ERROR " + $Message)
   [Console]::Error.Flush()
   [Environment]::Exit($ExitCode)
@@ -23,16 +23,16 @@ if (
   [string]::IsNullOrWhiteSpace($runId) -or
   $runId -notmatch "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
 ) {
-  Stop-SmokeJob "missing or invalid run id"
+  Write-SmokeJobError "missing or invalid run id"
 }
 
 $commandParts = @($args)
 if ($commandParts.Count -lt 2 -or $commandParts[0] -ne "--") {
-  Stop-SmokeJob "expected -- followed by an executable"
+  Write-SmokeJobError "expected -- followed by an executable"
 }
 $executablePath = $commandParts[1]
 if (!(Test-SmokeJobFullyQualifiedPath $executablePath) -or ![IO.File]::Exists($executablePath)) {
-  Stop-SmokeJob "executable path is not an existing absolute file"
+  Write-SmokeJobError "executable path is not an existing absolute file"
 }
 $childArguments = @()
 if ($commandParts.Count -gt 2) {
@@ -335,5 +335,5 @@ try {
   $child.Dispose()
   [Environment]::Exit($childExitCode)
 } catch {
-  Stop-SmokeJob $_.Exception.Message
+  Write-SmokeJobError $_.Exception.Message
 }

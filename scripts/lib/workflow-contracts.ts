@@ -86,6 +86,12 @@ function invokesRootTest(command: string): boolean {
   );
 }
 
+function invokesDesktopSmokeTurboWrapper(command: string): boolean {
+  return executableShellLines(command).some((line) =>
+    /(?:^|(?:&&|\|\||;)\s*)bun run test:desktop-smoke(?=$|\s|&&|\|\||;)/.test(line),
+  );
+}
+
 function jobRunSteps(
   jobs: UnknownRecord,
   jobName: string,
@@ -176,7 +182,7 @@ function validateNativeJobCommands(
         );
       }
     }
-    if (steps.some((step) => step.command === "bun run test:desktop-smoke")) {
+    if (steps.some((step) => invokesDesktopSmokeTurboWrapper(step.rawCommand))) {
       errors.push(
         `${workflowPath} ${jobName} must invoke the built desktop smoke directly without the Turbo rebuild wrapper.`,
       );
