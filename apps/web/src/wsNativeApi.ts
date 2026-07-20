@@ -661,7 +661,8 @@ export function createWsNativeApi(): NativeApi {
         transport.request(ORCHESTRATION_WS_METHODS.listProviderDeliveryBlockers, input),
       reconcileProviderDelivery: (input) =>
         transport.request(ORCHESTRATION_WS_METHODS.reconcileProviderDelivery, input),
-      subscribeShell: () => transport.request<void>(ORCHESTRATION_WS_METHODS.subscribeShell, {}),
+      subscribeShell: (input) =>
+        transport.request<void>(ORCHESTRATION_WS_METHODS.subscribeShell, input ?? {}),
       unsubscribeShell: () =>
         transport.request<void>(ORCHESTRATION_WS_METHODS.unsubscribeShell, {}),
       subscribeThread: (input) =>

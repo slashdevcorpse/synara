@@ -1075,13 +1075,15 @@ function EventRouter() {
     };
 
     const ensureScopedSubscriptions = async () => {
-      shellSnapshotSequence = -1;
-      pendingShellEvents = [];
+      const shellAfterSequence = shellSnapshotSequence;
+      if (shellAfterSequence < 0) pendingShellEvents = [];
       threadSnapshotSequenceById.clear();
       pendingThreadEventsById.clear();
       threadSnapshotRequestInFlight.clear();
       threadReplayRequestInFlight.clear();
-      await api.orchestration.subscribeShell().catch(() => loadShellSnapshotOnce());
+      await api.orchestration
+        .subscribeShell(shellAfterSequence < 0 ? undefined : { afterSequence: shellAfterSequence })
+        .catch(() => loadShellSnapshotOnce());
       await enqueueThreadSubscriptionReconcile(visibleThreadIdsRef.current);
     };
 

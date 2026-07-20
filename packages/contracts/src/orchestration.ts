@@ -2165,7 +2165,9 @@ export const OrchestrationReconcileProviderDeliveryResult = Schema.Struct({
 export type OrchestrationReconcileProviderDeliveryResult =
   typeof OrchestrationReconcileProviderDeliveryResult.Type;
 
-export const OrchestrationSubscribeShellInput = Schema.Struct({});
+export const OrchestrationSubscribeShellInput = Schema.Struct({
+  afterSequence: Schema.optional(Schema.Int),
+});
 export type OrchestrationSubscribeShellInput = typeof OrchestrationSubscribeShellInput.Type;
 
 export const OrchestrationUnsubscribeShellInput = Schema.Struct({});

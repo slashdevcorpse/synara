@@ -162,6 +162,7 @@ import type {
   OrchestrationReadModel,
   OrchestrationShellSnapshot,
   OrchestrationShellStreamItem,
+  OrchestrationSubscribeShellInput,
   OrchestrationSubscribeThreadInput,
   OrchestrationThreadStreamItem,
 } from "./orchestration";
@@ -673,7 +674,7 @@ export interface NativeApi {
     reconcileProviderDelivery: (
       input: OrchestrationReconcileProviderDeliveryInput,
     ) => Promise<OrchestrationReconcileProviderDeliveryResult>;
-    subscribeShell: () => Promise<void>;
+    subscribeShell: (input?: OrchestrationSubscribeShellInput) => Promise<void>;
     unsubscribeShell: () => Promise<void>;
     subscribeThread: (input: OrchestrationSubscribeThreadInput) => Promise<void>;
     unsubscribeThread: (input: OrchestrationSubscribeThreadInput) => Promise<void>;
