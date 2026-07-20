@@ -1,5 +1,6 @@
 import {
   DEFAULT_PROVIDER_INTERACTION_MODE,
+  EventId,
   ProjectId,
   ThreadId,
   type OrchestrationEvent,
@@ -24,21 +25,45 @@ import {
   SHELL_SYNC_PROJECTION_CONCURRENCY,
 } from "./shellSync";
 
+const TEST_TIMESTAMP = "2026-07-20T00:00:00.000Z";
+
+const eventBase = (
+  sequence: number,
+  aggregateKind: "project" | "thread",
+  aggregateId: ProjectId | ThreadId,
+) => ({
+  sequence,
+  eventId: EventId.makeUnsafe(`shell-sync-event-${sequence}`),
+  aggregateKind,
+  aggregateId,
+  occurredAt: TEST_TIMESTAMP,
+  commandId: null,
+  causationEventId: null,
+  correlationId: null,
+  metadata: {},
+});
+
 const event = (
   sequence: number,
   aggregateKind: "project" | "thread",
   aggregateId: string,
-): OrchestrationEvent =>
-  ({
-    sequence,
-    aggregateKind,
-    aggregateId,
-    type: aggregateKind === "project" ? "project.meta-updated" : "thread.meta-updated",
-    payload:
-      aggregateKind === "project"
-        ? { projectId: ProjectId.makeUnsafe(aggregateId), patch: {} }
-        : { threadId: ThreadId.makeUnsafe(aggregateId), patch: {} },
-  }) as OrchestrationEvent;
+): OrchestrationEvent => {
+  if (aggregateKind === "project") {
+    const projectId = ProjectId.makeUnsafe(aggregateId);
+    return {
+      ...eventBase(sequence, aggregateKind, projectId),
+      type: "project.meta-updated",
+      payload: { projectId, updatedAt: TEST_TIMESTAMP },
+    } satisfies OrchestrationEvent;
+  }
+
+  const threadId = ThreadId.makeUnsafe(aggregateId);
+  return {
+    ...eventBase(sequence, aggregateKind, threadId),
+    type: "thread.meta-updated",
+    payload: { threadId, updatedAt: TEST_TIMESTAMP },
+  } satisfies OrchestrationEvent;
+};
 
 const removalFor = (source: OrchestrationEvent): Option.Option<OrchestrationShellStreamEvent> =>
   Option.some(
@@ -63,9 +88,7 @@ const proposedPlanEvent = (
   planId: string,
 ): OrchestrationEvent =>
   ({
-    sequence,
-    aggregateKind: "thread",
-    aggregateId: threadId,
+    ...eventBase(sequence, "thread", threadId),
     type: "thread.proposed-plan-upserted",
     payload: {
       threadId,
@@ -75,11 +98,11 @@ const proposedPlanEvent = (
         planMarkdown: "# Ready plan",
         implementedAt: null,
         implementationThreadId: null,
-        createdAt: "2026-07-20T00:00:00.000Z",
-        updatedAt: "2026-07-20T00:00:00.000Z",
+        createdAt: TEST_TIMESTAMP,
+        updatedAt: TEST_TIMESTAMP,
       },
     },
-  }) as OrchestrationEvent;
+  }) satisfies OrchestrationEvent;
 
 describe("shell synchronization", () => {
   it("retries a failed projection read once and distinguishes absence from failure", async () => {

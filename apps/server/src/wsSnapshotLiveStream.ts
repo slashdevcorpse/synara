@@ -70,7 +70,7 @@ export function makeCursorSafeSnapshotLiveStream<Snapshot, E>(input: {
             (event) => event.sequence > afterSequence && event.sequence <= highWaterSequence,
           ),
           Stream.runCollect,
-          Effect.map(Array.from),
+          Effect.map((events): ReadonlyArray<OrchestrationEvent> => Array.from(events)),
         );
 
       const afterSequence = input.afterSequence;
