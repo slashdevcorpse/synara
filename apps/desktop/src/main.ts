@@ -79,6 +79,7 @@ import {
 } from "./bundleSwapDetection";
 import { waitForBackendStartupReady } from "./backendStartupReadiness";
 import { showDesktopConfirmDialog } from "./confirmDialog";
+import { buildContextMenuTemplate, normalizeContextMenuItems } from "./contextMenu";
 import {
   hasPendingDesktopMigrationRecovery,
   recoverDesktopMigrationIfRequired,
@@ -3459,14 +3460,7 @@ function registerIpcHandlers(): void {
   ipcMain.handle(
     IPC.contextMenu,
     async (_event, items: ContextMenuItem[], position?: { x: number; y: number }) => {
-      const normalizedItems = items
-        .filter((item) => typeof item.id === "string" && typeof item.label === "string")
-        .map((item) => ({
-          id: item.id,
-          label: item.label,
-          separatorBefore: item.separatorBefore === true,
-          destructive: item.destructive === true,
-        }));
+      const normalizedItems = normalizeContextMenuItems(items);
       if (normalizedItems.length === 0) {
         return null;
       }
@@ -3487,30 +3481,11 @@ function registerIpcHandlers(): void {
       if (!window) return null;
 
       return new Promise<string | null>((resolve) => {
-        const template: MenuItemConstructorOptions[] = [];
-        let hasInsertedDestructiveSeparator = false;
-        for (const item of normalizedItems) {
-          const shouldInsertSeparator =
-            item.separatorBefore ||
-            (item.destructive && !hasInsertedDestructiveSeparator && template.length > 0);
-          if (shouldInsertSeparator && template.length > 0) {
-            template.push({ type: "separator" });
-          }
-          if (item.destructive) {
-            hasInsertedDestructiveSeparator = true;
-          }
-          const itemOption: MenuItemConstructorOptions = {
-            label: item.label,
-            click: () => resolve(item.id),
-          };
-          if (item.destructive) {
-            const destructiveIcon = getDestructiveMenuIcon();
-            if (destructiveIcon) {
-              itemOption.icon = destructiveIcon;
-            }
-          }
-          template.push(itemOption);
-        }
+        const template = buildContextMenuTemplate({
+          items: normalizedItems,
+          onSelect: resolve,
+          getDestructiveIcon: getDestructiveMenuIcon,
+        });
 
         const menu = Menu.buildFromTemplate(template);
         menu.popup({
