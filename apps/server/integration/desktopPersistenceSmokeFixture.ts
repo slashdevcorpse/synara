@@ -84,7 +84,7 @@ interface FixtureCliOptions {
 }
 
 class FixtureInputError extends Error {
-  readonly name = "FixtureInputError";
+  override readonly name = "FixtureInputError";
 }
 
 function failInput(message: string): never {
