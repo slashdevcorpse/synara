@@ -106,7 +106,7 @@ describe("desktop smoke process lifecycle", () => {
     const spec = createDesktopSmokeSpawnSpec({
       platform: "win32",
       executable: "C:\\Program Files\\Electron\\electron.exe",
-      args: ["C:\\repo with spaces\\dist-electron\\main \"quoted\".js"],
+      args: ['C:\\repo with spaces\\dist-electron\\main "quoted".js'],
       environment,
       windowsHelperPath: "C:\\repo with spaces\\scripts\\smoke-test-windows-job.ps1",
       windowsJobRunId: WINDOWS_JOB_RUN_ID,
@@ -119,9 +119,7 @@ describe("desktop smoke process lifecycle", () => {
     expect(() => resolveWindowsPowerShellPath({ Path: "C:\\Tools" })).toThrow(
       "absolute, clean SystemRoot",
     );
-    expect(spec.command).toBe(
-      "D:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
-    );
+    expect(spec.command).toBe("D:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
     expect(spec.args).toEqual([
       "-NoLogo",
       "-NoProfile",
@@ -132,7 +130,7 @@ describe("desktop smoke process lifecycle", () => {
       "C:\\repo with spaces\\scripts\\smoke-test-windows-job.ps1",
       "--",
       "C:\\Program Files\\Electron\\electron.exe",
-      "C:\\repo with spaces\\dist-electron\\main \"quoted\".js",
+      'C:\\repo with spaces\\dist-electron\\main "quoted".js',
     ]);
     expect(spec.options.cwd).toBe("C:\\repo with spaces\\apps\\desktop");
     expect(spec.options.env[WINDOWS_SMOKE_JOB_RUN_ID_ENV]).toBe(WINDOWS_JOB_RUN_ID);
@@ -587,9 +585,7 @@ describe("desktop smoke process lifecycle", () => {
 
     await expectSettled(resultPromise, {
       ok: false,
-      teardownDiagnostics: [
-        expect.stringContaining("did not close after the shutdown token"),
-      ],
+      teardownDiagnostics: [expect.stringContaining("did not close after the shutdown token")],
     });
     expect(killWindowsTree).toHaveBeenCalledOnce();
     expect(killWindowsTree).toHaveBeenCalledWith(child.pid, { timeoutMs: 5_900 });
@@ -616,10 +612,7 @@ describe("desktop smoke process lifecycle", () => {
     const child = new FakeSmokeProcess();
     const resultPromise = superviseWindowsSmoke(child);
     emitWindowsJobReady(child);
-    child.stderr.emit(
-      "data",
-      "SYNARA_SMOKE_JOB_ERROR TerminateJobObject failed: 5\n",
-    );
+    child.stderr.emit("data", "SYNARA_SMOKE_JOB_ERROR TerminateJobObject failed: 5\n");
     await vi.advanceTimersByTimeAsync(8_000);
     child.exitAndClose(5);
     await vi.advanceTimersByTimeAsync(DESKTOP_SMOKE_WINDOWS_SETTLEMENT_MS);

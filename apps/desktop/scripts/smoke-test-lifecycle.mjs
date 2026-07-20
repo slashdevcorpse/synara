@@ -339,7 +339,9 @@ function supervisePosixDesktopSmokeProcess({
     };
     const signalPosixTree = (signal) => {
       if (!Number.isInteger(child.pid) || child.pid <= 0) {
-        addTeardownDiagnostic("Cannot signal process group without a valid pid (" + child.pid + ").");
+        addTeardownDiagnostic(
+          "Cannot signal process group without a valid pid (" + child.pid + ").",
+        );
         directKill(signal);
         return false;
       }
@@ -348,9 +350,7 @@ function supervisePosixDesktopSmokeProcess({
         return true;
       } catch (error) {
         if (signal === "SIGKILL" && error?.code === "ESRCH") return true;
-        addTeardownDiagnostic(
-          "Process-group " + signal + " failed: " + formatError(error),
-        );
+        addTeardownDiagnostic("Process-group " + signal + " failed: " + formatError(error));
         directKill(signal);
         return false;
       }
@@ -541,7 +541,9 @@ function superviseWindowsJobDesktopSmokeProcess({
       addTeardownDiagnostic(reason);
       if (!Number.isInteger(child.pid) || child.pid <= 0) {
         fallbackComplete = true;
-        addTeardownDiagnostic("Cannot run taskkill cleanup without a valid pid (" + child.pid + ").");
+        addTeardownDiagnostic(
+          "Cannot run taskkill cleanup without a valid pid (" + child.pid + ").",
+        );
         directKill();
         maybeFinishAfterClose();
         return;
@@ -549,10 +551,7 @@ function superviseWindowsJobDesktopSmokeProcess({
 
       const remainingMs =
         teardownDeadlineAt === null ? teardownMs : Math.max(1, teardownDeadlineAt - now());
-      const cleanupBudgetMs = Math.max(
-        1,
-        remainingMs - WINDOWS_SMOKE_FINAL_CLEANUP_RESERVE_MS,
-      );
+      const cleanupBudgetMs = Math.max(1, remainingMs - WINDOWS_SMOKE_FINAL_CLEANUP_RESERVE_MS);
       let cleanupResult;
       try {
         cleanupResult = killWindowsTree(child.pid, {
@@ -604,46 +603,49 @@ function superviseWindowsJobDesktopSmokeProcess({
       if (startupTimer !== undefined) clearTimer(startupTimer);
       if (observationTimer !== undefined) clearTimer(observationTimer);
       teardownDeadlineAt = now() + teardownMs;
-      teardownDeadlineTimer = setTimer(() => {
-        forcedCleanupStarted = true;
-        addFailure(
-          "Windows Job Object wrapper required forced cleanup before the " +
-            teardownMs +
-            "ms teardown deadline.",
-        );
-        if (!fallbackStarted) {
-          addTeardownDiagnostic(
-            "Windows Job Object teardown deadline expired before taskkill cleanup could start.",
+      teardownDeadlineTimer = setTimer(
+        () => {
+          forcedCleanupStarted = true;
+          addFailure(
+            "Windows Job Object wrapper required forced cleanup before the " +
+              teardownMs +
+              "ms teardown deadline.",
           );
-        } else if (!fallbackComplete) {
-          addTeardownDiagnostic(
-            "Windows taskkill cleanup did not settle before the final cleanup reserve expired.",
-          );
-          fallbackAbandoned = true;
-          fallbackComplete = true;
-        }
-        directKill();
-        if (closeObserved && closeSettlementComplete) {
-          finish();
-          return;
-        }
-        forceCloseProofTimer = setTimer(() => {
-          if (!closeObserved) {
+          if (!fallbackStarted) {
             addTeardownDiagnostic(
-              "Direct SIGKILL cleanup did not produce wrapper close proof within the " +
-                WINDOWS_SMOKE_FINAL_CLEANUP_RESERVE_MS +
-                "ms reserve.",
+              "Windows Job Object teardown deadline expired before taskkill cleanup could start.",
             );
-          } else if (!closeSettlementComplete) {
+          } else if (!fallbackComplete) {
             addTeardownDiagnostic(
-              "Windows Job Object wrapper close did not complete the " +
-                settlementMs +
-                "ms descendant settlement interval within the final reserve.",
+              "Windows taskkill cleanup did not settle before the final cleanup reserve expired.",
             );
+            fallbackAbandoned = true;
+            fallbackComplete = true;
           }
-          finish();
-        }, WINDOWS_SMOKE_FINAL_CLEANUP_RESERVE_MS);
-      }, Math.max(1, teardownMs - WINDOWS_SMOKE_FINAL_CLEANUP_RESERVE_MS));
+          directKill();
+          if (closeObserved && closeSettlementComplete) {
+            finish();
+            return;
+          }
+          forceCloseProofTimer = setTimer(() => {
+            if (!closeObserved) {
+              addTeardownDiagnostic(
+                "Direct SIGKILL cleanup did not produce wrapper close proof within the " +
+                  WINDOWS_SMOKE_FINAL_CLEANUP_RESERVE_MS +
+                  "ms reserve.",
+              );
+            } else if (!closeSettlementComplete) {
+              addTeardownDiagnostic(
+                "Windows Job Object wrapper close did not complete the " +
+                  settlementMs +
+                  "ms descendant settlement interval within the final reserve.",
+              );
+            }
+            finish();
+          }, WINDOWS_SMOKE_FINAL_CLEANUP_RESERVE_MS);
+        },
+        Math.max(1, teardownMs - WINDOWS_SMOKE_FINAL_CLEANUP_RESERVE_MS),
+      );
 
       try {
         if (jobReady) {
@@ -658,9 +660,7 @@ function superviseWindowsJobDesktopSmokeProcess({
         }
         child.stdin.end();
       } catch (error) {
-        addTeardownDiagnostic(
-          "Windows Job Object shutdown control failed: " + formatError(error),
-        );
+        addTeardownDiagnostic("Windows Job Object shutdown control failed: " + formatError(error));
         immediateFallback = true;
         fallbackReason =
           "Windows Job Object shutdown control failed; taskkill cleanup was required.";
@@ -668,15 +668,19 @@ function superviseWindowsJobDesktopSmokeProcess({
 
       if (immediateFallback) {
         startTaskkillFallback(
-          fallbackReason ?? "Windows Job Object initialization failed; taskkill cleanup was required.",
+          fallbackReason ??
+            "Windows Job Object initialization failed; taskkill cleanup was required.",
         );
         return;
       }
-      fallbackTimer = setTimer(() => {
-        startTaskkillFallback(
-          "Windows Job Object wrapper did not close after the shutdown token; taskkill cleanup was required.",
-        );
-      }, Math.min(fallbackDelayMs, Math.max(1, teardownMs - 1)));
+      fallbackTimer = setTimer(
+        () => {
+          startTaskkillFallback(
+            "Windows Job Object wrapper did not close after the shutdown token; taskkill cleanup was required.",
+          );
+        },
+        Math.min(fallbackDelayMs, Math.max(1, teardownMs - 1)),
+      );
     };
     const armObservation = () => {
       if (jobReady || shutdownRequested || settled) return;
@@ -726,9 +730,7 @@ function superviseWindowsJobDesktopSmokeProcess({
     }
     function onStdinError(error) {
       if (settled) return;
-      addTeardownDiagnostic(
-        "Windows Job Object shutdown control failed: " + formatError(error),
-      );
+      addTeardownDiagnostic("Windows Job Object shutdown control failed: " + formatError(error));
       requestJobShutdown({
         immediateFallback: true,
         fallbackReason:
