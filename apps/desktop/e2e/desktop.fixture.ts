@@ -280,8 +280,11 @@ function isolatedElectronEnv(input: {
   readonly invocationLogPath: string;
   readonly runtimeDir: string;
   readonly workspaceDir: string;
-}): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...process.env };
+}): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value !== undefined) env[key] = value;
+  }
   for (const key of Object.keys(env)) {
     const upperKey = key.toUpperCase();
     if (
