@@ -66,12 +66,16 @@
     "clean": "rm -rf node_modules apps/*/node_modules packages/*/node_modules scripts/node_modules apps/*/dist apps/*/dist-electron packages/*/dist .turbo apps/*/.turbo packages/*/.turbo"
   },
   "devDependencies": {
+    "@babel/core": "7.29.7",
     "@effect/language-service": "catalog:",
     "@types/node": "catalog:",
+    "js-yaml": "4.2.0",
     "oxfmt": "^0.40.0",
     "oxlint": "^1.55.0",
+    "picomatch": "2.3.2",
     "turbo": "^2.9.14",
     "typescript": "catalog:",
+    "undici": "7.28.0",
     "vitest": "catalog:"
   },
   "overrides": {
