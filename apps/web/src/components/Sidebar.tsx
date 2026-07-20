@@ -44,6 +44,7 @@ import { IoFilter } from "react-icons/io5";
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   lazy,
   startTransition,
   useMemo,
@@ -290,6 +291,9 @@ import {
 import { useThreadSelectionStore } from "../threadSelectionStore";
 import { formatWorktreePathForDisplay, getOrphanedWorktreePathForThread } from "../worktreeCleanup";
 import {
+  archiveSelectedThreadEntries,
+  archiveThreadEntry,
+  buildMultiSelectThreadContextMenuItems,
   describeAddProjectError,
   buildProjectThreadTree,
   derivePinnedProjectIdsForSidebar,
@@ -324,6 +328,8 @@ import {
   resolveThreadRowClassName,
   resolveThreadRowTrailingReserveClass,
   resolveThreadStatusPill,
+  runArchiveFallbackNavigation,
+  runThreadArchiveWithCurrentRoute,
   type ThreadStatusPill,
   type SidebarDerivedProjectData,
   type SidebarActionBadge,
@@ -1511,6 +1517,10 @@ export default function Sidebar() {
     strict: false,
     select: (params) => (params.threadId ? ThreadId.makeUnsafe(params.threadId) : null),
   });
+  const routeThreadIdRef = useRef(routeThreadId);
+  useLayoutEffect(() => {
+    routeThreadIdRef.current = routeThreadId;
+  }, [routeThreadId]);
   const routeWorkspaceId = useParams({
     strict: false,
     select: (params) => (typeof params.workspaceId === "string" ? params.workspaceId : null),
@@ -3327,7 +3337,13 @@ export default function Sidebar() {
    * Archived threads are hidden from the sidebar but can be restored later.
    */
   const archiveThread = useCallback(
-    async (threadId: ThreadId): Promise<boolean> => {
+    async (
+      threadId: ThreadId,
+      options?: {
+        readonly onArchived?: () => void;
+        readonly fallbackExcludedThreadIds?: ReadonlySet<ThreadId>;
+      },
+    ): Promise<boolean> => {
       const api = readNativeApi();
       if (!api) return false;
       const thread = getThreadFromState(useStore.getState(), threadId);
@@ -3348,27 +3364,31 @@ export default function Sidebar() {
 
       pendingThreadIds.add(threadId);
       const runArchive = async (): Promise<boolean> => {
-        await archiveThreadFromClient(api.orchestration, threadId);
-
-        // Navigate away before surfacing Undo so a quick restore cannot be
-        // overwritten by the fallback route change for the archived thread.
-        if (routeThreadId === threadId) {
-          const fallbackThreadId = getFallbackThreadIdAfterDelete({
-            threads: sidebarThreads,
-            deletedThreadId: threadId,
-            deletedThreadIds: new Set<ThreadId>(),
-            sortOrder: appSettings.sidebarThreadSortOrder,
-          });
-          if (fallbackThreadId) {
-            await navigate({
-              to: "/$threadId",
-              params: { threadId: fallbackThreadId },
-              replace: true,
+        await runThreadArchiveWithCurrentRoute({
+          threadId,
+          archiveMutation: () => archiveThreadFromClient(api.orchestration, threadId),
+          onArchived: options?.onArchived,
+          getCurrentRouteThreadId: () => routeThreadIdRef.current,
+          navigateFromArchivedThread: async () => {
+            const fallbackThreadId = getFallbackThreadIdAfterDelete({
+              threads: sidebarThreads,
+              deletedThreadId: threadId,
+              deletedThreadIds: options?.fallbackExcludedThreadIds ?? new Set<ThreadId>(),
+              sortOrder: appSettings.sidebarThreadSortOrder,
             });
-          } else {
-            await handleNewChat({ fresh: true });
-          }
-        }
+            if (fallbackThreadId) {
+              await navigate({
+                to: "/$threadId",
+                params: { threadId: fallbackThreadId },
+                replace: true,
+              });
+              return;
+            }
+            await runArchiveFallbackNavigation({
+              startFreshChat: () => handleNewChat({ fresh: true }),
+            });
+          },
+        });
 
         return true;
       };
@@ -3376,7 +3396,7 @@ export default function Sidebar() {
         pendingThreadIds.delete(threadId);
       });
     },
-    [appSettings.sidebarThreadSortOrder, handleNewChat, navigate, routeThreadId, sidebarThreads],
+    [appSettings.sidebarThreadSortOrder, handleNewChat, navigate, sidebarThreads],
   );
 
   // Restore an archived thread (used by the inline "Undo" affordance).
@@ -3473,21 +3493,38 @@ export default function Sidebar() {
   // so the inline row affordance archives instantly without a confirmation step.
   const archiveThreadWithUndo = useCallback(
     async (threadId: ThreadId) => {
-      try {
-        const returnToThreadOnUndo = routeThreadId === threadId;
-        const archived = await archiveThread(threadId);
-        if (archived) {
-          showArchiveUndoToast(threadId, { returnToThreadOnUndo });
-        }
-      } catch (error) {
+      const returnToThreadOnUndo = routeThreadIdRef.current === threadId;
+      const outcome = await archiveThreadEntry({
+        threadId,
+        archive: (id, onArchived) => archiveThread(id, { onArchived }),
+      });
+      if (outcome.status !== "mutation-failure") {
+        showArchiveUndoToast(threadId, { returnToThreadOnUndo });
+      }
+      if (outcome.status === "followup-failure") {
+        console.error("Thread archived but follow-up navigation failed", outcome.failure);
+        toastManager.add({
+          type: "warning",
+          title: "Thread archived; navigation failed",
+          description:
+            outcome.failure.kind === "thrown" && outcome.failure.error instanceof Error
+              ? outcome.failure.error.message
+              : "The sidebar could not navigate away from the archived thread.",
+        });
+        return;
+      }
+      if (outcome.status === "mutation-failure" && outcome.failure.kind === "thrown") {
         toastManager.add({
           type: "error",
           title: "Could not archive thread",
-          description: error instanceof Error ? error.message : "Unable to archive the thread.",
+          description:
+            outcome.failure.error instanceof Error
+              ? outcome.failure.error.message
+              : "Unable to archive the thread.",
         });
       }
     },
-    [archiveThread, routeThreadId, showArchiveUndoToast],
+    [archiveThread, showArchiveUndoToast],
   );
 
   // Context-menu archive still honors the opt-in `confirmThreadArchive` dialog
@@ -3573,42 +3610,68 @@ export default function Sidebar() {
       if (!archiveConfirmed) return;
 
       let archivedCount = 0;
+      const archivedThreadIds: ThreadId[] = [];
       let failureCount = 0;
+      let followupFailureCount = 0;
+      const fallbackExcludedThreadIds = new Set(archivableThreads.map((thread) => thread.id));
       for (const thread of archivableThreads) {
-        try {
-          const archived = await archiveThread(thread.id);
-          if (archived) {
-            archivedCount += 1;
-          } else {
-            failureCount += 1;
-          }
-        } catch (error) {
+        const outcome = await archiveThreadEntry({
+          threadId: thread.id,
+          archive: (id, onArchived) =>
+            archiveThread(id, {
+              onArchived,
+              fallbackExcludedThreadIds,
+            }),
+        });
+        if (outcome.status === "success") {
+          archivedCount += 1;
+          archivedThreadIds.push(thread.id);
+          continue;
+        }
+        if (outcome.status === "followup-failure") {
+          archivedCount += 1;
+          archivedThreadIds.push(thread.id);
+          followupFailureCount += 1;
+          console.error("Thread archived but follow-up navigation failed during project archive", {
+            threadId: thread.id,
+            projectId,
+            failure: outcome.failure,
+          });
+        } else {
           failureCount += 1;
           console.error("Failed to archive thread during bulk archive", {
             threadId: thread.id,
             projectId,
-            error,
+            failure: outcome.failure,
           });
         }
       }
 
-      // Clear any transient selection that pointed at just-archived rows.
-      removeFromSelection(archivableThreads.map((thread) => thread.id));
+      // Preserve failed rows in any transient selection and remove only confirmed archives.
+      removeFromSelection(archivedThreadIds);
 
       if (archivedCount > 0) {
-        const skippedDescription =
-          runningCount > 0
-            ? ` Skipped ${runningCount} running ${pluralize(runningCount, "thread")}.`
-            : "";
+        const archiveSummary: string[] = [];
+        if (failureCount > 0) {
+          archiveSummary.push(
+            `Failed to archive ${failureCount} ${pluralize(failureCount, "thread")}.`,
+          );
+        }
+        if (followupFailureCount > 0) {
+          archiveSummary.push(
+            `Navigation failed after archiving ${followupFailureCount} ${pluralize(followupFailureCount, "thread")}.`,
+          );
+        }
+        if (runningCount > 0) {
+          archiveSummary.push(
+            `Skipped ${runningCount} running ${pluralize(runningCount, "thread")}.`,
+          );
+        }
         toastManager.add({
-          type: failureCount > 0 ? "warning" : "success",
+          type: failureCount > 0 || followupFailureCount > 0 ? "warning" : "success",
           title: archivedCount === 1 ? "Thread archived" : `Archived ${archivedCount} threads`,
           description:
-            failureCount > 0
-              ? `Failed to archive ${failureCount} ${pluralize(failureCount, "thread")}.${skippedDescription}`
-              : runningCount > 0
-                ? skippedDescription.trim()
-                : `"${project.name}" cleared.`,
+            archiveSummary.length > 0 ? archiveSummary.join(" ") : `"${project.name}" cleared.`,
         });
       } else if (failureCount > 0) {
         toastManager.add({
@@ -3971,15 +4034,31 @@ export default function Sidebar() {
       const ids = [...selectedThreadIds];
       if (ids.length === 0) return;
       const count = ids.length;
+      const currentState = useStore.getState();
+      const hasRunningSelectedThread = ids.some((id) => {
+        const thread = getThreadFromState(currentState, id);
+        return thread !== undefined && isThreadRunningTurn(thread);
+      });
 
-      const clicked = await api.contextMenu.show(
-        [
-          { id: "mark-unread", label: `Mark unread (${count})` },
-          { id: "archive", label: `Archive (${count})` },
-          { id: "delete", label: `Delete (${count})`, destructive: true },
-        ],
-        position,
-      );
+      const clicked = await (async () => {
+        try {
+          return await api.contextMenu.show(
+            buildMultiSelectThreadContextMenuItems({
+              count,
+              archiveDisabled: hasRunningSelectedThread,
+            }),
+            position,
+          );
+        } catch (error) {
+          console.error("Failed to open the selected-thread context menu", error);
+          toastManager.add({
+            type: "error",
+            title: "Could not open thread actions",
+            description: error instanceof Error ? error.message : "An unexpected error occurred.",
+          });
+          return null;
+        }
+      })();
 
       if (clicked === "mark-unread") {
         for (const id of ids) {
@@ -3991,20 +4070,86 @@ export default function Sidebar() {
       }
 
       if (clicked === "archive") {
+        // Native and browser menus both prevent this activation. Keep the action guarded in case
+        // a stale or third-party bridge still returns a disabled item.
+        if (hasRunningSelectedThread) return;
+
         if (appSettings.confirmThreadArchive) {
-          const confirmed = await api.dialogs.confirm(
-            [
-              `Archive ${count} ${pluralize(count, "thread")}?`,
-              "Archived threads are hidden from the sidebar but can be restored later.",
-            ].join("\n"),
-          );
+          const confirmed = await (async () => {
+            try {
+              return await api.dialogs.confirm(
+                [
+                  `Archive ${count} ${pluralize(count, "thread")}?`,
+                  "Archived threads are hidden from the sidebar but can be restored later.",
+                ].join("\n"),
+              );
+            } catch (error) {
+              console.error("Failed to confirm selected-thread archive", error);
+              toastManager.add({
+                type: "error",
+                title: "Could not confirm archive",
+                description:
+                  error instanceof Error ? error.message : "An unexpected error occurred.",
+              });
+              return false;
+            }
+          })();
           if (!confirmed) return;
         }
 
-        for (const id of ids) {
-          await archiveThread(id);
+        const fallbackExcludedThreadIds = new Set(ids);
+        const outcome = await archiveSelectedThreadEntries({
+          entries: ids,
+          archive: (id, onArchived) =>
+            archiveThread(id, {
+              onArchived,
+              fallbackExcludedThreadIds,
+            }),
+        });
+
+        // Reconcile only the rows from this menu snapshot. A sequential archive can take long
+        // enough for the user to select another thread while it is running; that newer selection
+        // must survive even when every originally selected thread archived successfully.
+        if (outcome.archivedThreadIds.length > 0) {
+          removeFromSelection(outcome.archivedThreadIds);
         }
-        removeFromSelection(ids);
+
+        if (outcome.followupFailures.length > 0) {
+          for (const failure of outcome.followupFailures) {
+            console.error("Thread archived but follow-up navigation failed", failure);
+          }
+          const firstFailure = outcome.followupFailures[0]!;
+          const detail =
+            firstFailure.kind === "thrown" && firstFailure.error instanceof Error
+              ? firstFailure.error.message
+              : "The sidebar could not navigate away from an archived thread.";
+          toastManager.add({
+            type: "warning",
+            title:
+              outcome.archivedThreadIds.length === 1
+                ? "Thread archived; navigation failed"
+                : "Threads archived; navigation failed",
+            description: detail,
+          });
+        }
+
+        if (outcome.mutationFailure) {
+          console.error("Selected-thread archive stopped at the first mutation failure", {
+            failure: outcome.mutationFailure,
+            archivedThreadIds: outcome.archivedThreadIds,
+          });
+          const detail =
+            outcome.mutationFailure.kind === "thrown" &&
+            outcome.mutationFailure.error instanceof Error
+              ? outcome.mutationFailure.error.message
+              : "The archive request did not complete.";
+          const unarchivedCount = ids.length - outcome.archivedThreadIds.length;
+          toastManager.add({
+            type: "error",
+            title: "Failed to archive threads",
+            description: `${detail} Stopped with ${unarchivedCount} selected ${pluralize(unarchivedCount, "thread")} unarchived.`,
+          });
+        }
         return;
       }
 

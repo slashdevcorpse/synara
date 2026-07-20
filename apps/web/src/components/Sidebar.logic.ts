@@ -3,6 +3,7 @@
 // Exports: Sidebar row state derivation, add-project error helpers, sort utilities, and visibility helpers.
 
 import {
+  type ContextMenuItem,
   MAX_PINNED_PROJECTS,
   type KeybindingCommand,
   type ProjectId,
@@ -52,6 +53,158 @@ export type SidebarActionBadge = {
   readonly text: string;
   readonly accessibleLabel: string;
 };
+
+export type MultiSelectThreadContextMenuAction = "mark-unread" | "archive" | "delete";
+
+export function buildMultiSelectThreadContextMenuItems(input: {
+  readonly count: number;
+  readonly archiveDisabled: boolean;
+}): readonly ContextMenuItem<MultiSelectThreadContextMenuAction>[] {
+  return [
+    { id: "mark-unread", label: `Mark unread (${input.count})` },
+    {
+      id: "archive",
+      label: `Archive (${input.count})`,
+      disabled: input.archiveDisabled,
+    },
+    { id: "delete", label: `Delete (${input.count})`, destructive: true },
+  ];
+}
+
+export type ArchiveSelectedThreadFailure<TThreadId extends string = ThreadId> =
+  | {
+      readonly threadId: TThreadId;
+      readonly kind: "returned-false";
+    }
+  | {
+      readonly threadId: TThreadId;
+      readonly kind: "thrown";
+      readonly error: unknown;
+    };
+
+export type ArchiveThreadEntryOutcome<TThreadId extends string = ThreadId> =
+  | {
+      readonly status: "success";
+      readonly threadId: TThreadId;
+    }
+  | {
+      readonly status: "mutation-failure";
+      readonly failure: ArchiveSelectedThreadFailure<TThreadId>;
+    }
+  | {
+      readonly status: "followup-failure";
+      readonly failure: ArchiveSelectedThreadFailure<TThreadId>;
+    };
+
+/** Classifies whether an archive failed before or after the mutation completed. */
+export async function archiveThreadEntry<TThreadId extends string>(input: {
+  readonly threadId: TThreadId;
+  readonly archive: (threadId: TThreadId, onArchived: () => void) => Promise<boolean>;
+}): Promise<ArchiveThreadEntryOutcome<TThreadId>> {
+  let mutationCompleted = false;
+  const onArchived = (): void => {
+    mutationCompleted = true;
+  };
+
+  try {
+    const succeeded = await input.archive(input.threadId, onArchived);
+    if (succeeded) {
+      return { status: "success", threadId: input.threadId };
+    }
+
+    const failure: ArchiveSelectedThreadFailure<TThreadId> = {
+      threadId: input.threadId,
+      kind: "returned-false",
+    };
+    return mutationCompleted
+      ? { status: "followup-failure", failure }
+      : { status: "mutation-failure", failure };
+  } catch (error) {
+    const failure: ArchiveSelectedThreadFailure<TThreadId> = {
+      threadId: input.threadId,
+      kind: "thrown",
+      error,
+    };
+    return mutationCompleted
+      ? { status: "followup-failure", failure }
+      : { status: "mutation-failure", failure };
+  }
+}
+
+export interface ArchiveSelectedThreadEntriesOutcome<TThreadId extends string = ThreadId> {
+  readonly archivedThreadIds: readonly TThreadId[];
+  readonly mutationFailure: ArchiveSelectedThreadFailure<TThreadId> | null;
+  readonly followupFailures: readonly ArchiveSelectedThreadFailure<TThreadId>[];
+}
+
+/**
+ * Archives selected threads one at a time and distinguishes a failed archive mutation from a
+ * failure that happened after the archive completed (for example, fallback navigation).
+ */
+export async function archiveSelectedThreadEntries<TThreadId extends string>(input: {
+  readonly entries: readonly TThreadId[];
+  readonly archive: (threadId: TThreadId, onArchived: () => void) => Promise<boolean>;
+}): Promise<ArchiveSelectedThreadEntriesOutcome<TThreadId>> {
+  const archivedThreadIds: TThreadId[] = [];
+  const followupFailures: ArchiveSelectedThreadFailure<TThreadId>[] = [];
+
+  for (const threadId of input.entries) {
+    const outcome = await archiveThreadEntry({
+      threadId,
+      archive: input.archive,
+    });
+    if (outcome.status === "success") {
+      archivedThreadIds.push(threadId);
+      continue;
+    }
+    if (outcome.status === "followup-failure") {
+      archivedThreadIds.push(threadId);
+      followupFailures.push(outcome.failure);
+      continue;
+    }
+
+    return {
+      archivedThreadIds,
+      mutationFailure: outcome.failure,
+      followupFailures,
+    };
+  }
+
+  return {
+    archivedThreadIds,
+    mutationFailure: null,
+    followupFailures,
+  };
+}
+
+/** Runs the route follow-up against the route that is current after the archive mutation. */
+export async function runThreadArchiveWithCurrentRoute<TThreadId extends string>(input: {
+  readonly threadId: TThreadId;
+  readonly archiveMutation: () => Promise<void>;
+  readonly onArchived?: () => void;
+  readonly getCurrentRouteThreadId: () => TThreadId | null;
+  readonly navigateFromArchivedThread: () => Promise<void>;
+}): Promise<void> {
+  await input.archiveMutation();
+  input.onArchived?.();
+  if (input.getCurrentRouteThreadId() === input.threadId) {
+    await input.navigateFromArchivedThread();
+  }
+}
+
+export type ArchiveFallbackNavigationResult =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly error: string };
+
+/** Converts a resolved fresh-chat failure into a rejected post-mutation navigation failure. */
+export async function runArchiveFallbackNavigation(input: {
+  readonly startFreshChat: () => Promise<ArchiveFallbackNavigationResult>;
+}): Promise<void> {
+  const result = await input.startFreshChat();
+  if (!result.ok) {
+    throw new Error(result.error);
+  }
+}
 
 /** Keep partial review counts visible without presenting them as exact. */
 export function resolvePullRequestReviewBadge(
