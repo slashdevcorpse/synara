@@ -7,7 +7,6 @@ import { useEffect, useSyncExternalStore } from "react";
 import { isElectron } from "../env";
 import { isMacPlatform } from "../lib/utils";
 import {
-  DEFAULT_THEME_STATE,
   type ChromeTheme,
   type ThemeFonts,
   type ThemeMode,
@@ -28,6 +27,7 @@ import {
   updateChromeTheme,
   updateThemePackFromShareString,
 } from "../theme/theme.logic";
+import { resolveDefaultThemeState } from "../theme/themeDefaults";
 
 type ThemeSnapshot = {
   state: ThemeState;
@@ -58,15 +58,21 @@ function getSystemDark(): boolean {
   return typeof window !== "undefined" && window.matchMedia(MEDIA_QUERY).matches;
 }
 
+function getDefaultThemeState(): ThemeState {
+  const protocol = typeof window === "undefined" ? undefined : window.location?.protocol;
+  return resolveDefaultThemeState(protocol);
+}
+
 function readStoredThemeState(): ThemeState {
+  const defaultState = getDefaultThemeState();
   if (!hasThemeStorage()) {
-    return DEFAULT_THEME_STATE;
+    return defaultState;
   }
 
   try {
-    return parseStoredThemeState(localStorage.getItem(STORAGE_KEY));
+    return parseStoredThemeState(localStorage.getItem(STORAGE_KEY), defaultState);
   } catch {
-    return DEFAULT_THEME_STATE;
+    return defaultState;
   }
 }
 
@@ -231,7 +237,7 @@ function resetThemeVariant(variant: ThemeVariant) {
 }
 
 function resetAllThemes() {
-  updateStoredThemeState(() => DEFAULT_THEME_STATE);
+  updateStoredThemeState(() => getDefaultThemeState());
 }
 
 function updateThemePack(variant: ThemeVariant, patch: Partial<ChromeTheme>) {
@@ -247,8 +253,9 @@ function setCodeThemeId(variant: ThemeVariant, codeThemeId: string) {
 }
 
 export function useTheme() {
+  const defaultThemeState = getDefaultThemeState();
   const snapshot = useSyncExternalStore(subscribe, getSnapshot, () => ({
-    state: DEFAULT_THEME_STATE,
+    state: defaultThemeState,
     systemDark: false,
   }));
   const theme = snapshot.state.mode;
@@ -256,7 +263,7 @@ export function useTheme() {
   const activeTheme = resolveThemePack(snapshot.state, resolvedTheme);
   const darkTheme = resolveThemePack(snapshot.state, "dark");
   const lightTheme = resolveThemePack(snapshot.state, "light");
-  const defaultActiveTheme = resolveThemePack(DEFAULT_THEME_STATE, resolvedTheme);
+  const defaultActiveTheme = resolveThemePack(defaultThemeState, resolvedTheme);
   const isDefaultActiveTheme = areThemePacksEqual(activeTheme, defaultActiveTheme);
 
   const canImportThemeString = (value: string, variant: ThemeVariant = resolvedTheme) =>
@@ -276,7 +283,7 @@ export function useTheme() {
   const isDefaultThemePack = (variant: ThemeVariant) =>
     areThemePacksEqual(
       resolveThemePack(snapshot.state, variant),
-      resolveThemePack(DEFAULT_THEME_STATE, variant),
+      resolveThemePack(defaultThemeState, variant),
     );
 
   // Keep the DOM synced if something bypassed the immediate module-load apply.
@@ -290,6 +297,7 @@ export function useTheme() {
     systemUiFont: snapshot.state.systemUiFont,
     setSystemUiFont,
     darkTheme,
+    defaultThemeMode: defaultThemeState.mode,
     defaultActiveTheme,
     exportThemeString,
     importThemeString,
