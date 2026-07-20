@@ -209,6 +209,11 @@ const desktopFlavor = resolveSynaraDesktopFlavor({
   packagedFlavor: app.isPackaged ? __SYNARA_PACKAGED_DESKTOP_FLAVOR__ : undefined,
 });
 const desktopIdentity = synaraDesktopIdentity(desktopFlavor);
+if (desktopIdentity.defaultThemeMode === "dark") {
+  // Establish Super's appearance before BrowserWindow creation so the native shell
+  // and Chromium preference agree during the renderer's first paint.
+  nativeTheme.themeSource = desktopIdentity.defaultThemeMode;
+}
 const packagedUpdatesDisabled = app.isPackaged && __SYNARA_PACKAGED_UPDATES_DISABLED__;
 const BASE_DIR = resolveDesktopBackendHomePath({
   homeDirectory: OS.homedir(),

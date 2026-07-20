@@ -19,6 +19,7 @@ export const SYNARA_WINDOWS_INSTALLER_GUID = "368107a8-afe6-5db5-ab3b-d4f3316848
 export const SYNARA_SUPER_WINDOWS_INSTALLER_GUID = "ab3ea852-4edf-4caa-977e-9d00ccab2b1e";
 
 export type SynaraDesktopFlavor = "production" | "development" | "canary" | "super";
+export type SynaraDesktopDefaultThemeMode = "dark" | "system";
 export type SynaraDesktopUpdateStrategy = "automatic" | "development" | "scripted" | "manual";
 
 export interface SynaraDesktopIdentity {
@@ -30,6 +31,7 @@ export interface SynaraDesktopIdentity {
   readonly scheme: string;
   readonly origin: string;
   readonly entryUrl: string;
+  readonly defaultThemeMode: SynaraDesktopDefaultThemeMode;
   readonly userDataDirectoryName: string;
   readonly defaultHomeDirectoryName: string;
   readonly windowsInstallerGuid: string;
@@ -73,6 +75,7 @@ export function synaraDesktopIdentity(flavor: SynaraDesktopFlavor): SynaraDeskto
       scheme: SYNARA_SUPER_DESKTOP_SCHEME,
       origin: SYNARA_SUPER_DESKTOP_ORIGIN,
       entryUrl: SYNARA_SUPER_DESKTOP_ENTRY_URL,
+      defaultThemeMode: "dark",
       userDataDirectoryName: "super-synara",
       defaultHomeDirectoryName: ".super-synara",
       windowsInstallerGuid: SYNARA_SUPER_WINDOWS_INSTALLER_GUID,
@@ -92,6 +95,7 @@ export function synaraDesktopIdentity(flavor: SynaraDesktopFlavor): SynaraDeskto
       scheme: SYNARA_CANARY_DESKTOP_SCHEME,
       origin: SYNARA_CANARY_DESKTOP_ORIGIN,
       entryUrl: SYNARA_CANARY_DESKTOP_ENTRY_URL,
+      defaultThemeMode: "system",
       userDataDirectoryName: "synara-canary",
       defaultHomeDirectoryName: ".synara-canary",
       windowsInstallerGuid: SYNARA_WINDOWS_INSTALLER_GUID,
@@ -110,6 +114,7 @@ export function synaraDesktopIdentity(flavor: SynaraDesktopFlavor): SynaraDeskto
       scheme: SYNARA_DESKTOP_SCHEME,
       origin: SYNARA_DESKTOP_ORIGIN,
       entryUrl: SYNARA_DESKTOP_ENTRY_URL,
+      defaultThemeMode: "system",
       userDataDirectoryName: "synara-dev",
       defaultHomeDirectoryName: ".synara",
       windowsInstallerGuid: SYNARA_WINDOWS_INSTALLER_GUID,
@@ -127,6 +132,7 @@ export function synaraDesktopIdentity(flavor: SynaraDesktopFlavor): SynaraDeskto
     scheme: SYNARA_DESKTOP_SCHEME,
     origin: SYNARA_DESKTOP_ORIGIN,
     entryUrl: SYNARA_DESKTOP_ENTRY_URL,
+    defaultThemeMode: "system",
     userDataDirectoryName: "synara",
     defaultHomeDirectoryName: ".synara",
     windowsInstallerGuid: SYNARA_WINDOWS_INSTALLER_GUID,
