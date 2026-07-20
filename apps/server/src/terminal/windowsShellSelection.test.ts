@@ -50,12 +50,10 @@ function fakeStats(file: boolean): Stats {
   return { isFile: () => file } as Stats;
 }
 
-function successfulDependencies(
-  calls?: {
-    probes?: string[];
-    validations?: string[];
-  },
-): WindowsShellSelectionDependencies {
+function successfulDependencies(calls?: {
+  probes?: string[];
+  validations?: string[];
+}): WindowsShellSelectionDependencies {
   return {
     probePowerShell: async (executable) => {
       calls?.probes?.push(executable);
@@ -335,10 +333,7 @@ describe("Windows automatic terminal shell selection", () => {
 
   it.each([
     ["relative SystemRoot", { SystemRoot: "Windows", ComSpec: "C:\\Windows\\cmd.exe" }],
-    [
-      "quoted SystemRoot",
-      { SystemRoot: '"C:\\Windows"', ComSpec: "C:\\Windows\\cmd.exe" },
-    ],
+    ["quoted SystemRoot", { SystemRoot: '"C:\\Windows"', ComSpec: "C:\\Windows\\cmd.exe" }],
     ["empty SystemRoot", { SystemRoot: "", ComSpec: "C:\\Windows\\cmd.exe" }],
     ["NUL SystemRoot", { SystemRoot: "C:\\Win\0dows", ComSpec: "C:\\cmd.exe" }],
     ["relative ComSpec", { SystemRoot: "C:\\Windows", ComSpec: "cmd.exe" }],
@@ -502,9 +497,7 @@ describe("bounded Windows executable validation", () => {
 describe("bounded profile-free PowerShell probes", () => {
   it("uses the exact profile-free command, hidden shell-free launch, ignored stdin, and aggregate cap", async () => {
     const child = new FakeProbeChild();
-    let received:
-      | { command: string; args: readonly string[]; options: SpawnOptions }
-      | undefined;
+    let received: { command: string; args: readonly string[]; options: SpawnOptions } | undefined;
     const result = __windowsShellSelectionTesting.runPowerShellProbe({
       executable: "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
       env: { PATH: "C:\\safe" },
@@ -646,8 +639,7 @@ describe("bounded profile-free PowerShell probes", () => {
     async () => {
       const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "synara-shell-profile-"));
       const markerPath = path.join(homeDir, "profile-loaded.txt");
-      const profileBody =
-        "[System.IO.File]::WriteAllText($env:SYNARA_PROFILE_MARKER, 'loaded')";
+      const profileBody = "[System.IO.File]::WriteAllText($env:SYNARA_PROFILE_MARKER, 'loaded')";
       for (const profileDirectory of ["PowerShell", "WindowsPowerShell"]) {
         const directory = path.join(homeDir, "Documents", profileDirectory);
         fs.mkdirSync(directory, { recursive: true });

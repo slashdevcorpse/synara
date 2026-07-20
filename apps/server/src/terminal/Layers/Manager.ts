@@ -1074,8 +1074,7 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
     this.shellPlatform = options.shellPlatform ?? process.platform;
     this.shellEnvironment = options.shellEnvironment ?? process.env;
     this.windowsShellSelectionDependencies = options.windowsShellSelectionDependencies ?? {};
-    this.shellResolver =
-      options.shellResolver ?? (() => defaultShellResolver(this.shellPlatform));
+    this.shellResolver = options.shellResolver ?? (() => defaultShellResolver(this.shellPlatform));
     this.persistDebounceMs = DEFAULT_PERSIST_DEBOUNCE_MS;
     this.subprocessChecker = options.subprocessChecker ?? defaultSubprocessChecker;
     this.processTreeKiller = options.processTreeKiller ?? defaultProcessTreeKiller;

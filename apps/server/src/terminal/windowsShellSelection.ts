@@ -25,11 +25,7 @@ export interface WindowsExplicitShellChoice {
   readonly args: readonly string[];
 }
 
-export type TerminalShellResolver = () =>
-  | string
-  | WindowsExplicitShellChoice
-  | null
-  | undefined;
+export type TerminalShellResolver = () => string | WindowsExplicitShellChoice | null | undefined;
 
 export type WindowsShellCandidateLabel =
   | "explicit shell"
@@ -59,11 +55,7 @@ export interface WindowsSelectedShell {
   readonly source: "explicit" | "automatic";
 }
 
-type ProbeSpawn = (
-  command: string,
-  args: readonly string[],
-  options: SpawnOptions,
-) => ChildProcess;
+type ProbeSpawn = (command: string, args: readonly string[], options: SpawnOptions) => ChildProcess;
 
 interface PowerShellProbeInput {
   readonly executable: string;
@@ -81,9 +73,7 @@ type PowerShellProbe = (
   env: NodeJS.ProcessEnv,
 ) => Promise<WindowsShellFailureCategory | null>;
 
-type ExecutableValidator = (
-  executable: string,
-) => Promise<WindowsShellFailureCategory | null>;
+type ExecutableValidator = (executable: string) => Promise<WindowsShellFailureCategory | null>;
 
 export interface WindowsShellSelectionDependencies {
   readonly probePowerShell?: PowerShellProbe;
@@ -390,12 +380,7 @@ function buildAutomaticCandidates(env: NodeJS.ProcessEnv): AutomaticCandidate[] 
       true,
     ),
     automaticAbsoluteCandidate("configured command shell", comSpec, [], false),
-    automaticAbsoluteCandidate(
-      "system command shell",
-      systemRoot,
-      ["System32", "cmd.exe"],
-      false,
-    ),
+    automaticAbsoluteCandidate("system command shell", systemRoot, ["System32", "cmd.exe"], false),
   ]);
 }
 
@@ -536,9 +521,7 @@ export function createWindowsShellSelection(
   try {
     resolved = input.resolveExplicit();
   } catch {
-    throw new WindowsShellSelectionError(
-      "Explicit Windows terminal shell could not be resolved.",
-    );
+    throw new WindowsShellSelectionError("Explicit Windows terminal shell could not be resolved.");
   }
 
   const explicitCandidate =

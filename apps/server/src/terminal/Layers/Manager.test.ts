@@ -17,10 +17,7 @@ import {
   type PtyProcess,
   type PtySpawnInput,
 } from "../Services/PTY";
-import {
-  TerminalManagerRuntime,
-  type TerminalSubprocessActivity,
-} from "./Manager";
+import { TerminalManagerRuntime, type TerminalSubprocessActivity } from "./Manager";
 import type { ProcessTreeKiller } from "../processTreeKiller";
 import { Effect, Encoding } from "effect";
 import {
@@ -266,9 +263,7 @@ describe("TerminalManager", () => {
     expect(snapshot.status).toBe("running");
     expect(resolveExplicit).toHaveBeenCalledTimes(1);
     expect(ptyAdapter.spawnInputs).toHaveLength(1);
-    expect(ptyAdapter.spawnInputs[0]?.shell).toBe(
-      "C:\\Program Files\\Éditeur & Tools\\shell.exe",
-    );
+    expect(ptyAdapter.spawnInputs[0]?.shell).toBe("C:\\Program Files\\Éditeur & Tools\\shell.exe");
     expect(ptyAdapter.spawnInputs[0]?.args).toEqual(explicitArgs);
     expect(ptyAdapter.spawnInputs[0]?.args).not.toBe(explicitArgs);
 
