@@ -58,4 +58,19 @@ describe("desktop stage install", () => {
       "changed package.json",
     );
   });
+
+  it("rejects a staged lockfile line-ending rewrite", () => {
+    const root = mkdtempSync(join(tmpdir(), "desktop-stage-lockfile-"));
+    temporaryRoots.push(root);
+    const repository = join(root, "repository");
+    const stage = join(root, "stage");
+    mkdirSync(repository, { recursive: true });
+    mkdirSync(stage, { recursive: true });
+    writeFileSync(join(repository, "bun.lock"), 'lockfileVersion = 1\nentry = "same"\n');
+    writeFileSync(join(stage, "bun.lock"), 'lockfileVersion = 1\r\nentry = "same"\r\n');
+
+    expect(() => assertDesktopStageFilesUnchanged(repository, stage, ["bun.lock"])).toThrow(
+      "changed bun.lock",
+    );
+  });
 });

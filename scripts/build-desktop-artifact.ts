@@ -5,7 +5,6 @@
 // Depends on: apps/desktop package metadata, electron-builder, and GitHub release config.
 
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -39,6 +38,10 @@ import {
   RELEASE_WORKSPACE_MANIFEST_PATHS,
 } from "./lib/release-workspace-manifests.ts";
 import { resolveCatalogDependencies } from "./lib/resolve-catalog.ts";
+import {
+  resolveReleaseLockfileSha256,
+  verifyReleaseLockfileSha256,
+} from "./lib/release-lockfile-provenance.ts";
 import {
   assertDesktopStageFilesUnchanged,
   verifyDesktopStagePatchedDependencies,
@@ -172,12 +175,6 @@ function resolveGitCommitHash(repoRoot: string): string | undefined {
     return undefined;
   }
   return hash.toLowerCase();
-}
-
-function resolveLockfileSha256(repoRoot: string): string {
-  return createHash("sha256")
-    .update(readFileSync(join(repoRoot, "bun.lock")))
-    .digest("hex");
 }
 
 function resolvePythonForNodeGyp(): string | undefined {
@@ -912,17 +909,18 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
     });
   }
   const commitHash = resolvedCommitHash ?? "unknown";
-  const resolvedLockfileSha256 = resolveLockfileSha256(repoRoot);
-  if (options.lockfileSha256 && !/^[0-9a-f]{64}$/i.test(options.lockfileSha256)) {
-    return yield* new BuildScriptError({
-      message: `Expected a 64-character lockfile SHA-256, got '${options.lockfileSha256}'.`,
-    });
-  }
-  if (options.lockfileSha256 && resolvedLockfileSha256 !== options.lockfileSha256.toLowerCase()) {
-    return yield* new BuildScriptError({
-      message: `Release lockfile digest mismatch: expected ${options.lockfileSha256}, got ${resolvedLockfileSha256}.`,
-    });
-  }
+  const sourceLockfileBytes = readFileSync(join(repoRoot, RELEASE_LOCKFILE_PATH));
+  const resolvedLockfileSha256 = yield* Effect.try({
+    try: () =>
+      options.lockfileSha256
+        ? verifyReleaseLockfileSha256(sourceLockfileBytes, options.lockfileSha256)
+        : resolveReleaseLockfileSha256(sourceLockfileBytes),
+    catch: (cause) =>
+      new BuildScriptError({
+        message: cause instanceof Error ? cause.message : String(cause),
+        cause,
+      }),
+  });
   const expectedSourceTag = resolveDesktopSourceTag(options.flavor, appVersion);
   if (options.sourceTag && options.sourceTag !== expectedSourceTag) {
     return yield* new BuildScriptError({
