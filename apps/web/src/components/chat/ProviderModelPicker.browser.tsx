@@ -16,6 +16,7 @@ const MODEL_OPTIONS_BY_PROVIDER = {
     { slug: "gpt-5-codex", name: "GPT-5 Codex" },
     { slug: "gpt-5.3-codex", name: "GPT-5.3 Codex" },
   ],
+  commandCode: [{ slug: "gpt-5.6-sol", name: "GPT-5.6 Sol" }],
   cursor: [
     { slug: "auto", name: "Auto" },
     { slug: "composer-2", name: "Composer 2" },
@@ -188,12 +189,47 @@ describe("ProviderModelPicker", () => {
       await vi.waitFor(() => {
         const text = document.body.textContent ?? "";
         expect(text).toContain("Codex");
+        expect(text).toContain("Command Code");
         expect(text).toContain("Claude");
         expect(text).not.toContain("Claude Sonnet 4.6");
         expect(
           document.querySelector('[role="menu"]')?.classList.contains("composer-picker-menu-fixed"),
         ).toBe(true);
       });
+    } finally {
+      await mounted.cleanup();
+    }
+  });
+
+  it("selects Command Code with its gpt-5.6-sol default model", async () => {
+    const mounted = await mountPicker({
+      provider: "codex",
+      model: "gpt-5-codex",
+      lockedProvider: null,
+      providers: [
+        {
+          provider: "codex",
+          status: "ready",
+          available: true,
+          authStatus: "authenticated",
+          checkedAt: "2026-07-20T12:00:00.000Z",
+        },
+        {
+          provider: "commandCode",
+          status: "ready",
+          available: true,
+          authStatus: "authenticated",
+          checkedAt: "2026-07-20T12:00:00.000Z",
+        },
+      ],
+    });
+
+    try {
+      await page.getByRole("button").click();
+      await page.getByRole("menuitem", { name: "Command Code" }).hover();
+      await page.getByRole("menuitemradio", { name: "GPT-5.6 Sol" }).click();
+
+      expect(mounted.onProviderModelChange).toHaveBeenCalledWith("commandCode", "gpt-5.6-sol");
     } finally {
       await mounted.cleanup();
     }

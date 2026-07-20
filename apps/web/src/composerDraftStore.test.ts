@@ -2468,6 +2468,7 @@ describe("composerDraftStore modelSelection", () => {
       projectModelSelection: null,
       customModelsByProvider: {
         codex: [],
+        commandCode: [],
         claudeAgent: [],
         cursor: [],
         antigravity: [],
@@ -2496,6 +2497,7 @@ describe("composerDraftStore modelSelection", () => {
       projectModelSelection: null,
       customModelsByProvider: {
         codex: [],
+        commandCode: [],
         claudeAgent: [],
         cursor: [],
         antigravity: [],
@@ -2529,6 +2531,7 @@ describe("composerDraftStore modelSelection", () => {
       projectModelSelection: null,
       customModelsByProvider: {
         codex: [],
+        commandCode: [],
         claudeAgent: [],
         cursor: [],
         antigravity: [],
@@ -2562,6 +2565,7 @@ describe("composerDraftStore modelSelection", () => {
       projectModelSelection: null,
       customModelsByProvider: {
         codex: [],
+        commandCode: [],
         claudeAgent: [],
         cursor: [],
         antigravity: [],
