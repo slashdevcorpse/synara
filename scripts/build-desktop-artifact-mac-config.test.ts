@@ -10,15 +10,18 @@ import {
   MAC_INHERITED_ENTITLEMENTS_PATH,
   MICROPHONE_USAGE_DESCRIPTION,
   NODE_PTY_ASAR_UNPACK_GLOBS,
+  resolveMacNativeExclusions,
   validateDesktopNativeBuildHost,
   WINDOWS_INSTALLER_GUID,
 } from "./lib/desktop-platform-build-config.ts";
 import { BRAND_ASSET_PATHS } from "./lib/brand-assets.ts";
+import { DESKTOP_BUILD_ARCHES } from "./lib/desktop-build-options.ts";
 import { synaraDesktopIdentity } from "@synara/shared/desktopIdentity";
 
 describe("createDesktopPlatformBuildConfig", () => {
   it("adds explicit microphone entitlements to macOS builds", () => {
     const config = createDesktopPlatformBuildConfig({
+      arch: "arm64",
       platform: "mac",
       target: "dmg",
       signed: true,
@@ -43,7 +46,7 @@ describe("createDesktopPlatformBuildConfig", () => {
     assert.equal(MAC_APPSNAP_HELPER_ASAR_EXCLUSION, "!apps/desktop/native/appsnap/build/**");
     assert.deepStrictEqual(config.files, [
       "**/*",
-      ...MAC_FOREIGN_NATIVE_EXCLUSIONS,
+      ...resolveMacNativeExclusions("arm64"),
       MAC_APPSNAP_HELPER_ASAR_EXCLUSION,
     ]);
     assert.deepStrictEqual(
@@ -66,12 +69,44 @@ describe("createDesktopPlatformBuildConfig", () => {
     assert.equal(extendInfo.NSScreenCaptureUsageDescription, undefined);
   });
 
+  it("keeps only target-architecture Darwin prebuilds in single-architecture macOS apps", () => {
+    const piTuiArm64 =
+      "!node_modules/@earendil-works/pi-tui/native/darwin/prebuilds/darwin-arm64/**";
+    const piTuiX64 = "!node_modules/@earendil-works/pi-tui/native/darwin/prebuilds/darwin-x64/**";
+    const nodePtyArm64 = "!node_modules/node-pty/prebuilds/darwin-arm64/**";
+    const nodePtyX64 = "!node_modules/node-pty/prebuilds/darwin-x64/**";
+
+    const exclusionsByArch = {
+      arm64: [...MAC_FOREIGN_NATIVE_EXCLUSIONS, piTuiX64, nodePtyX64],
+      x64: [...MAC_FOREIGN_NATIVE_EXCLUSIONS, piTuiArm64, nodePtyArm64],
+      universal: [...MAC_FOREIGN_NATIVE_EXCLUSIONS],
+    } as const;
+
+    for (const arch of DESKTOP_BUILD_ARCHES) {
+      const expected = exclusionsByArch[arch];
+      assert.deepStrictEqual(resolveMacNativeExclusions(arch), expected);
+
+      const config = createDesktopPlatformBuildConfig({
+        arch,
+        platform: "mac",
+        target: "dmg",
+      });
+      assert.deepStrictEqual(config.files, [
+        "**/*",
+        ...expected,
+        MAC_APPSNAP_HELPER_ASAR_EXCLUSION,
+      ]);
+    }
+  });
+
   it("leaves non-macOS platform configs unchanged", () => {
     const linux = createDesktopPlatformBuildConfig({
+      arch: "x64",
       platform: "linux",
       target: "AppImage",
     });
     const win = createDesktopPlatformBuildConfig({
+      arch: "x64",
       platform: "win",
       target: "nsis",
       windowsAzureSignOptions: { publisherName: "Synara" },
@@ -113,6 +148,7 @@ describe("createDesktopPlatformBuildConfig", () => {
 
   it("omits Azure signing options for unsigned build-only artifacts", () => {
     const config = createDesktopPlatformBuildConfig({
+      arch: "x64",
       platform: "win",
       target: "nsis",
     });
@@ -126,6 +162,7 @@ describe("createDesktopPlatformBuildConfig", () => {
 
   it("keeps node-pty unpacked from ASAR in generated build config", () => {
     const config = createDesktopPlatformBuildConfig({
+      arch: "x64",
       platform: "linux",
       target: "AppImage",
     });
@@ -196,6 +233,7 @@ describe("createDesktopPlatformBuildConfig", () => {
   it("uses an explicit unsigned mac identity and isolated Super Synara Windows registration", () => {
     const identity = synaraDesktopIdentity("super");
     const mac = createDesktopPlatformBuildConfig({
+      arch: "arm64",
       platform: "mac",
       target: "dmg",
       signed: false,
@@ -203,6 +241,7 @@ describe("createDesktopPlatformBuildConfig", () => {
       disableUpdates: true,
     });
     const win = createDesktopPlatformBuildConfig({
+      arch: "x64",
       platform: "win",
       target: "nsis",
       identity,

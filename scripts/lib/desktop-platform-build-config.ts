@@ -8,6 +8,7 @@ import {
   synaraDesktopIdentity,
   type SynaraDesktopIdentity,
 } from "@synara/shared/desktopIdentity";
+import type { DesktopBuildArch } from "./desktop-build-options.ts";
 
 export const MICROPHONE_USAGE_DESCRIPTION =
   "Synara needs microphone access so you can record voice notes and transcribe them into the chat composer.";
@@ -28,6 +29,17 @@ export const MAC_FOREIGN_NATIVE_EXCLUSIONS = [
   "!node_modules/node-pty/deps/winpty/**",
 ] as const;
 
+export function resolveMacNativeExclusions(arch: DesktopBuildArch): ReadonlyArray<string> {
+  const oppositeArch = arch === "arm64" ? "x64" : arch === "x64" ? "arm64" : null;
+  if (!oppositeArch) return [...MAC_FOREIGN_NATIVE_EXCLUSIONS];
+
+  return [
+    ...MAC_FOREIGN_NATIVE_EXCLUSIONS,
+    `!node_modules/@earendil-works/pi-tui/native/darwin/prebuilds/darwin-${oppositeArch}/**`,
+    `!node_modules/node-pty/prebuilds/darwin-${oppositeArch}/**`,
+  ];
+}
+
 export interface DesktopPlatformBuildConfig {
   readonly asarUnpack?: ReadonlyArray<string>;
   readonly dmg?: Record<string, unknown>;
@@ -41,6 +53,7 @@ export interface DesktopPlatformBuildConfig {
 }
 
 export interface CreateDesktopPlatformBuildConfigInput {
+  readonly arch: DesktopBuildArch;
   readonly platform: "linux" | "mac" | "win";
   readonly target: string;
   readonly signed?: boolean;
@@ -50,7 +63,7 @@ export interface CreateDesktopPlatformBuildConfigInput {
 }
 
 export interface DesktopNativeBuildHostInput {
-  readonly arch: "arm64" | "x64" | "universal";
+  readonly arch: DesktopBuildArch;
   readonly hostArch: string;
   readonly hostPlatform: NodeJS.Platform;
   readonly platform: "linux" | "mac" | "win";
@@ -113,7 +126,7 @@ export function createDesktopPlatformBuildConfig(
 
     return {
       ...licensedPackaging,
-      files: ["**/*", ...MAC_FOREIGN_NATIVE_EXCLUSIONS, MAC_APPSNAP_HELPER_ASAR_EXCLUSION],
+      files: ["**/*", ...resolveMacNativeExclusions(input.arch), MAC_APPSNAP_HELPER_ASAR_EXCLUSION],
       extraFiles: [
         {
           from: MAC_APPSNAP_HELPER_STAGE_PATH,
