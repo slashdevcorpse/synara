@@ -78,7 +78,7 @@ export class ProviderProcessExitUnprovenError extends Error {
 
 const defaultDependencies: SupervisedProcessTeardownDependencies = {
   processTreeKiller: defaultProcessTreeKiller,
-  now: performance.now,
+  now: () => performance.now(),
   sleep: (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
 };
 

@@ -22,6 +22,28 @@ function deterministicClock() {
 }
 
 describe("teardownProviderProcessTree", () => {
+  it("uses the default monotonic clock with its required receiver intact", async () => {
+    let resolveRootExit!: () => void;
+    const rootExited = new Promise<void>((resolve) => {
+      resolveRootExit = resolve;
+    });
+
+    await expect(
+      teardownProviderProcessTree(
+        { rootPid: 91, rootExited, termGraceMs: 50, forceExitMs: 50, pollMs: 5 },
+        {
+          processTreeKiller: {
+            capture: () => ({ descendants: [], captureComplete: true }),
+            inspect: () => ({ verified: true, survivors: [] }),
+            signal: ({ signal }) => {
+              if (signal === "SIGTERM") resolveRootExit();
+            },
+          },
+        },
+      ),
+    ).resolves.toEqual({ escalated: false, signalErrors: [] });
+  });
+
   it("escalates ignored TERM and returns only after root and descendants prove exit", async () => {
     const tree: CapturedProcessTree = {
       descendants: [{ pid: 102, command: "provider-worker" }],
