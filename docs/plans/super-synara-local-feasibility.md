@@ -427,8 +427,9 @@ ordinary PRs do not repeatedly perform distribution work.
 
 ## 12. Manual unsigned prerelease workflow
 
-Add `.github/workflows/super-synara-prerelease.yml`. It has only `workflow_dispatch`, always builds
-both supported platforms, and never runs from an automatic tag/push event.
+Add `.github/workflows/super-synara-prerelease.yml`. It has only `workflow_dispatch`, defaults to a
+Windows-only release, can explicitly select a combined Windows and macOS release after macOS
+admission is ready, and never runs from an automatic tag/push event.
 
 ### Inputs
 
@@ -436,6 +437,8 @@ both supported platforms, and never runs from an automatic tag/push event.
   `0.5.5-super.1`.
 - `tag` — required; must equal `super-v<version>`, for example
   `super-v0.5.5-super.1`. The `super-v` prefix does not match upstream's `v*.*.*` trigger.
+- `release_scope` — required choice; `windows-only` by default or `windows-and-macos` when both
+  native lanes and the reviewed macOS signature policy are ready.
 - `confirm_unsigned` — required boolean and must be `true`.
 
 The selected workflow ref must be protected downstream `main`. The workflow captures one immutable
@@ -481,10 +484,13 @@ successful release; the same exact dispatch may be rerun.
 
 ### Job 4 — `macos_arm64` (`macos-15`, read-only)
 
+This job runs only for the explicit `windows-and-macos` release scope. A Windows-only publication
+does not read or require the macOS signature allowlist.
+
 1. Check out the exact tagged commit and install frozen dependencies.
-2. Build the arm64 DMG without a Developer ID identity or notarization. Set `mac.identity: null`
-   and `CSC_IDENTITY_AUTO_DISCOVERY=false` so electron-builder cannot silently select a keychain
-   certificate.
+2. Build the arm64 DMG without a Developer ID identity or notarization. Use the explicit ad-hoc
+   identity `-` and `CSC_IDENTITY_AUTO_DISCOVERY=false` so electron-builder seals the bundle while
+   never silently selecting a keychain certificate.
 3. Use any generated zip only for local packaged-startup verification; do not publish it.
 4. Inspect the finished app and every nested binary. Record expected ad-hoc signatures on
    Super Synara-owned binaries—including the AppSnap helper—as `ad-hoc-only`. Separately inventory
@@ -497,7 +503,18 @@ successful release; the same exact dispatch may be rerun.
 
 ### Job 5 — `publish` (`ubuntu-24.04`, `contents: write` only)
 
-The final staging directory must contain exactly:
+For `windows-only`, the final staging directory must contain exactly:
+
+```text
+Super-Synara-<version>-windows-x64-unsigned.exe
+artifact-windows-x64.provenance.json
+release-index.json
+SHA256SUMS.txt
+UNSIGNED-BUILD.md
+LICENSE
+```
+
+For `windows-and-macos`, the final staging directory must contain exactly:
 
 ```text
 Super-Synara-<version>-windows-x64-unsigned.exe
@@ -531,8 +548,9 @@ fail and report that draft. The owner must inspect and delete the matching draft
 the workflow never silently resumes, replaces, or deletes draft assets.
 
 `SHA256SUMS.txt` uses lowercase SHA-256, two spaces before each filename, UTF-8, LF line endings,
-and bytewise filename ordering. It covers the installer, DMG, both platform provenance manifests,
-`UNSIGNED-BUILD.md`, and `LICENSE`; it excludes itself and `release-index.json` to avoid recursion.
+and bytewise filename ordering. It covers the selected native payloads, their platform provenance
+manifests, `UNSIGNED-BUILD.md`, and `LICENSE`; it excludes itself and `release-index.json` to avoid
+recursion.
 `release-index.json` hashes every published file except itself, including `SHA256SUMS.txt`, and
 records the exact tag, source commit, absorbed upstream SHA, and platform set.
 
@@ -770,7 +788,7 @@ hashing, validation, or platform configuration can be parameterized safely.
 - [ ] Dispatch works only from protected `main` with explicit unsigned confirmation.
 - [ ] Both workflow actor fields, protected publication environment, immutable `super-v*` tags, and
       the non-cancelling release concurrency lock are enforced.
-- [ ] It builds exactly Windows x64 and macOS arm64.
+- [ ] It always builds Windows x64 and builds macOS arm64 only for the explicit combined scope.
 - [ ] No Azure, Apple Developer ID/notarization, OIDC, secret, larger-runner, Linux, or Intel path
       is invoked.
 - [ ] No updater config, updater metadata, `.blockmap`, or updater YAML is embedded/published.
@@ -782,7 +800,7 @@ hashing, validation, or platform configuration can be parameterized safely.
 - [ ] Provenance truthfully says public, unsigned, prerelease, not Latest, and no updater feed.
 - [ ] Release is public, is marked prerelease, and is not Latest.
 - [ ] Release notes contain exact commits, unsigned warnings, license, and manual-update status.
-- [ ] Downloaded Windows and macOS bytes independently match published hashes.
+- [ ] Every selected platform's downloaded bytes independently match published hashes.
 
 ### Windows qualification
 
@@ -801,7 +819,7 @@ Do not publish if any condition holds:
 - the tag/version already identifies different bytes or a different commit;
 - before draft creation, any public or draft release uses the tag; or after draft creation, any
   draft other than the exact current-run release ID/tag/commit is present;
-- either platform build is missing;
+- any build selected by the release scope is missing;
 - any identity surface collides with upstream Synara;
 - any test uses the live `.synara` or `.super-synara` home;
 - provenance claims signed, verified, or unpublished status incorrectly;

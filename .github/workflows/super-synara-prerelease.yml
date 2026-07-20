@@ -11,6 +11,14 @@ on:
         description: "Exact immutable tag (for example super-v0.5.5-super.1)"
         required: true
         type: string
+      release_scope:
+        description: "Exact platform set to publish"
+        required: true
+        default: windows-only
+        type: choice
+        options:
+          - windows-only
+          - windows-and-macos
       confirm_unsigned:
         description: "I understand this publishes unsigned installers with operating-system warnings"
         required: true
@@ -32,6 +40,9 @@ jobs:
     outputs:
       version: ${{ steps.meta.outputs.version }}
       tag: ${{ steps.meta.outputs.tag }}
+      release_scope: ${{ steps.meta.outputs.release_scope }}
+      include_macos: ${{ steps.meta.outputs.include_macos }}
+      asset_count: ${{ steps.meta.outputs.asset_count }}
       source_commit: ${{ steps.source.outputs.source_commit }}
       source_tag: ${{ steps.source.outputs.source_tag }}
       lockfile_sha256: ${{ steps.source.outputs.lockfile_sha256 }}
@@ -69,6 +80,7 @@ jobs:
         env:
           VERSION: ${{ inputs.version }}
           TAG: ${{ inputs.tag }}
+          RELEASE_SCOPE: ${{ inputs.release_scope }}
           CONFIRMED: ${{ inputs.confirm_unsigned }}
           REF_PROTECTED: ${{ github.ref_protected }}
         run: |
@@ -77,8 +89,25 @@ jobs:
           [[ "$REF_PROTECTED" == "true" ]]
           [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+-super\.[1-9][0-9]*$ ]]
           [[ "$TAG" == "super-v$VERSION" ]]
+          case "$RELEASE_SCOPE" in
+            windows-only)
+              include_macos=false
+              asset_count=6
+              ;;
+            windows-and-macos)
+              include_macos=true
+              asset_count=8
+              ;;
+            *)
+              echo "Unsupported release scope: $RELEASE_SCOPE" >&2
+              exit 1
+              ;;
+          esac
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "release_scope=$RELEASE_SCOPE" >> "$GITHUB_OUTPUT"
+          echo "include_macos=$include_macos" >> "$GITHUB_OUTPUT"
+          echo "asset_count=$asset_count" >> "$GITHUB_OUTPUT"
 
       - id: budget
         name: Bind repository artifact byte budgets
@@ -87,20 +116,24 @@ jobs:
           WINDOWS_BYTES: ${{ vars.SUPER_SYNARA_MAX_WINDOWS_BYTES }}
           MACOS_BYTES: ${{ vars.SUPER_SYNARA_MAX_MACOS_BYTES }}
           TOTAL_BYTES: ${{ vars.SUPER_SYNARA_MAX_TOTAL_BYTES }}
+          RELEASE_SCOPE: ${{ steps.meta.outputs.release_scope }}
         run: |
           set -euo pipefail
           [[ "$WINDOWS_BYTES" =~ ^[1-9][0-9]*$ ]]
-          [[ "$MACOS_BYTES" =~ ^[1-9][0-9]*$ ]]
           [[ "$TOTAL_BYTES" =~ ^[1-9][0-9]*$ ]]
           (( WINDOWS_BYTES <= TOTAL_BYTES ))
-          (( MACOS_BYTES <= TOTAL_BYTES ))
-          (( WINDOWS_BYTES + MACOS_BYTES <= TOTAL_BYTES ))
+          if [[ "$RELEASE_SCOPE" == "windows-and-macos" ]]; then
+            [[ "$MACOS_BYTES" =~ ^[1-9][0-9]*$ ]]
+            (( MACOS_BYTES <= TOTAL_BYTES ))
+            (( WINDOWS_BYTES + MACOS_BYTES <= TOTAL_BYTES ))
+          fi
           (( TOTAL_BYTES <= 858986863 ))
           echo "max_windows_bytes=$WINDOWS_BYTES" >> "$GITHUB_OUTPUT"
           echo "max_macos_bytes=$MACOS_BYTES" >> "$GITHUB_OUTPUT"
           echo "max_total_bytes=$TOTAL_BYTES" >> "$GITHUB_OUTPUT"
 
       - name: Require reviewed macOS signature policy
+        if: ${{ steps.meta.outputs.include_macos == 'true' }}
         run: |
           node scripts/verify-super-synara-macos-allowlist.ts \
             scripts/super-synara-macos-signature-allowlist.json \
@@ -501,6 +534,7 @@ jobs:
   macos_arm64:
     name: Build unsigned macOS arm64 disk image
     needs: [preflight, reserve_tag]
+    if: ${{ needs.preflight.outputs.include_macos == 'true' }}
     runs-on: macos-15
     timeout-minutes: 45
     steps:
@@ -667,6 +701,13 @@ jobs:
   publish:
     name: Admit and publish exact unsigned prerelease
     needs: [preflight, reserve_tag, windows_x64, macos_arm64]
+    if: >-
+      ${{ always() &&
+          needs.preflight.result == 'success' &&
+          needs.reserve_tag.result == 'success' &&
+          needs.windows_x64.result == 'success' &&
+          ((needs.preflight.outputs.include_macos == 'true' && needs.macos_arm64.result == 'success') ||
+           (needs.preflight.outputs.include_macos == 'false' && needs.macos_arm64.result == 'skipped')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     environment: super-synara-prerelease
@@ -703,6 +744,7 @@ jobs:
           path: release-stage
 
       - name: Download macOS lane
+        if: ${{ needs.preflight.outputs.include_macos == 'true' }}
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: super-synara-macos-arm64
@@ -725,7 +767,7 @@ jobs:
             --tag "$TAG" \
             --source-commit "$SOURCE_COMMIT"
 
-      - name: Prepare exact eight-file release set
+      - name: Prepare exact scoped release set
         shell: bash
         env:
           VERSION: ${{ needs.preflight.outputs.version }}
@@ -733,11 +775,20 @@ jobs:
           SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
           ABSORBED_UPSTREAM_SHA: ${{ needs.preflight.outputs.absorbed_upstream_sha }}
           MAX_TOTAL_BYTES: ${{ needs.preflight.outputs.max_total_bytes }}
+          RELEASE_SCOPE: ${{ needs.preflight.outputs.release_scope }}
         run: |
+          set -euo pipefail
+          macos_allowlist_args=()
+          if [[ "$RELEASE_SCOPE" == "windows-and-macos" ]]; then
+            macos_allowlist_args=(
+              --mac-signature-allowlist scripts/super-synara-macos-signature-allowlist.json
+            )
+          fi
           node scripts/prepare-super-synara-release.ts prepare \
             --directory release-stage \
             --license LICENSE \
-            --mac-signature-allowlist scripts/super-synara-macos-signature-allowlist.json \
+            --release-scope "$RELEASE_SCOPE" \
+            "${macos_allowlist_args[@]}" \
             --version "$VERSION" \
             --tag "$TAG" \
             --source-commit "$SOURCE_COMMIT" \
@@ -795,19 +846,27 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.preflight.outputs.tag }}
           VERSION: ${{ needs.preflight.outputs.version }}
+          INCLUDE_MACOS: ${{ needs.preflight.outputs.include_macos }}
+          EXPECTED_ASSET_COUNT: ${{ needs.preflight.outputs.asset_count }}
         run: |
           set -euo pipefail
           assets=(
             "release-stage/Super-Synara-$VERSION-windows-x64-unsigned.exe"
-            "release-stage/Super-Synara-$VERSION-macos-arm64-unsigned.dmg"
             release-stage/artifact-windows-x64.provenance.json
-            release-stage/artifact-macos-arm64.provenance.json
+          )
+          if [[ "$INCLUDE_MACOS" == "true" ]]; then
+            assets+=(
+              "release-stage/Super-Synara-$VERSION-macos-arm64-unsigned.dmg"
+              release-stage/artifact-macos-arm64.provenance.json
+            )
+          fi
+          assets+=(
             release-stage/release-index.json
             release-stage/SHA256SUMS.txt
             release-stage/UNSIGNED-BUILD.md
             release-stage/LICENSE
           )
-          [[ "${#assets[@]}" -eq 8 ]]
+          [[ "${#assets[@]}" -eq "$EXPECTED_ASSET_COUNT" ]]
           for asset in "${assets[@]}"; do [[ -f "$asset" ]]; done
           gh release upload "$TAG" "${assets[@]}" --repo "$GITHUB_REPOSITORY"
 
@@ -816,11 +875,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           DRAFT_ID: ${{ steps.draft.outputs.id }}
+          EXPECTED_ASSET_COUNT: ${{ needs.preflight.outputs.asset_count }}
         run: |
           set -euo pipefail
           mkdir release-redownload
           assets_json="$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases/$DRAFT_ID/assets?per_page=100")"
-          [[ "$(jq '[.[][]] | length' <<< "$assets_json")" -eq 8 ]]
+          [[ "$(jq '[.[][]] | length' <<< "$assets_json")" -eq "$EXPECTED_ASSET_COUNT" ]]
           while IFS=$'\t' read -r asset_id asset_name; do
             [[ -f "release-stage/$asset_name" ]]
             gh api \
@@ -841,10 +901,19 @@ jobs:
           SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
           ABSORBED_UPSTREAM_SHA: ${{ needs.preflight.outputs.absorbed_upstream_sha }}
           MAX_TOTAL_BYTES: ${{ needs.preflight.outputs.max_total_bytes }}
+          RELEASE_SCOPE: ${{ needs.preflight.outputs.release_scope }}
         run: |
+          set -euo pipefail
+          macos_allowlist_args=()
+          if [[ "$RELEASE_SCOPE" == "windows-and-macos" ]]; then
+            macos_allowlist_args=(
+              --mac-signature-allowlist scripts/super-synara-macos-signature-allowlist.json
+            )
+          fi
           node scripts/prepare-super-synara-release.ts verify \
             --directory release-stage \
-            --mac-signature-allowlist scripts/super-synara-macos-signature-allowlist.json \
+            --release-scope "$RELEASE_SCOPE" \
+            "${macos_allowlist_args[@]}" \
             --version "$VERSION" \
             --tag "$TAG" \
             --source-commit "$SOURCE_COMMIT" \
