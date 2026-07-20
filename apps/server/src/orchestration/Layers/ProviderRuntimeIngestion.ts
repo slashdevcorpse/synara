@@ -7,6 +7,7 @@ import {
   type OrchestrationEvent,
   type OrchestrationProjectShell,
   type OrchestrationProposedPlanId,
+  type OrchestrationSessionStatus,
   CheckpointRef,
   isToolLifecycleItemType,
   STUDIO_OUTPUTS_ACTIVITY_KIND,
@@ -108,6 +109,10 @@ const MAX_ACTIVITY_DATA_OBJECT_KEYS = 64;
 const ACTIVITY_DATA_TRUNCATION_MARKER = "__synaraTruncated";
 const BUFFERED_TEXT_TRUNCATION_MARKER = "... [truncated]";
 const STRICT_PROVIDER_LIFECYCLE_GUARD = process.env.SYNARA_STRICT_PROVIDER_LIFECYCLE_GUARD !== "0";
+
+function sessionStatusAllowsActiveTurn(status: OrchestrationSessionStatus): boolean {
+  return status === "starting" || status === "running";
+}
 
 type RuntimeIngestionDomainEvent = Extract<
   OrchestrationEvent,
@@ -2833,18 +2838,7 @@ const make = Effect.gen(function* () {
         event.type === "turn.completed" ||
         event.type === "turn.aborted"
       ) {
-        const nextActiveTurnId =
-          event.type === "turn.started"
-            ? (eventTurnId ?? null)
-            : isTerminalTurnEvent ||
-                event.type === "session.exited" ||
-                (event.type === "session.state.changed" &&
-                  (event.payload.state === "ready" ||
-                    event.payload.state === "stopped" ||
-                    event.payload.state === "error"))
-              ? null
-              : activeTurnId;
-        const status = (() => {
+        const status: OrchestrationSessionStatus = (() => {
           switch (event.type) {
             case "session.state.changed":
               return event.payload.state === "waiting" ? "running" : event.payload.state;
@@ -2863,6 +2857,14 @@ const make = Effect.gen(function* () {
               return activeTurnId !== null ? "running" : "ready";
           }
         })();
+        const nextActiveTurnId =
+          event.type === "turn.started"
+            ? (eventTurnId ?? null)
+            : isTerminalTurnEvent || event.type === "session.exited"
+              ? null
+              : event.type === "session.state.changed" && !sessionStatusAllowsActiveTurn(status)
+                ? null
+                : activeTurnId;
         const lastError =
           event.type === "session.state.changed" && event.payload.state === "error"
             ? (event.payload.reason ?? thread.session?.lastError ?? "Provider session error")
