@@ -1,3 +1,6 @@
+# Keep formatter-managed text byte-identical across all runner platforms.
+* text=auto eol=lf
+
 # Release provenance hashes bun.lock bytes, so every checkout must materialize
 # the committed lockfile identically on Windows, macOS, and Linux.
 bun.lock text eol=lf
