@@ -1075,13 +1075,14 @@ function EventRouter() {
     };
 
     const ensureScopedSubscriptions = async () => {
-      shellSnapshotSequence = -1;
-      pendingShellEvents = [];
-      threadSnapshotSequenceById.clear();
-      pendingThreadEventsById.clear();
-      threadSnapshotRequestInFlight.clear();
-      threadReplayRequestInFlight.clear();
-      await api.orchestration.subscribeShell().catch(() => loadShellSnapshotOnce());
+      const shellAfterSequence = shellSnapshotSequence;
+      if (shellAfterSequence < 0) pendingShellEvents = [];
+      // Thread streams reconnect independently and may deliver their replacement snapshots before
+      // welcome. Preserve their cursors, buffers, and in-flight guards because reconciliation only
+      // starts additions; clearing active state here would strand the already-restarted streams.
+      await api.orchestration
+        .subscribeShell(shellAfterSequence < 0 ? undefined : { afterSequence: shellAfterSequence })
+        .catch(() => loadShellSnapshotOnce());
       await enqueueThreadSubscriptionReconcile(visibleThreadIdsRef.current);
     };
 
