@@ -3,12 +3,12 @@
 // Layer: Release preflight
 
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
 import { appendFileSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { releasePackageFiles } from "./update-release-package-versions.ts";
+import { resolveReleaseLockfileSha256 } from "./lib/release-lockfile-provenance.ts";
 import { validateReleaseSourcePolicy } from "./lib/release-source-provenance-policy.ts";
 import type { ReleaseDistributionKind } from "./lib/release-artifact-provenance.ts";
 import { verifyReleaseWorktreeCleanliness } from "./lib/release-worktree-cleanliness.ts";
@@ -118,9 +118,7 @@ if (distributionKind === "github-unsigned-prerelease" && requireReservedTag) {
   );
 }
 
-const lockfileSha256 = createHash("sha256")
-  .update(readFileSync(resolve(repoRoot, "bun.lock")))
-  .digest("hex");
+const lockfileSha256 = resolveReleaseLockfileSha256(readFileSync(resolve(repoRoot, "bun.lock")));
 
 const output = {
   source_commit: sourceCommit,
