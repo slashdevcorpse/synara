@@ -333,6 +333,48 @@ describe("BackendRestartController", () => {
     expect(restartRequests).toHaveLength(1);
   });
 
+  it.each(["Windows timed-out shutdown", "POSIX exit deadline"])(
+    "retains ownership after %s and records exactly one failure only on later exit",
+    (shutdownDisposition) => {
+      const generation = admit("readiness probe");
+
+      // An unconfirmed shutdown disposition must not be translated into a
+      // controller failure: the still-owned generation remains the admission lock.
+      vi.advanceTimersByTime(10_000);
+      expect(controller.getSnapshot()).toMatchObject({
+        activeGenerationId: generation.id,
+        activeGenerationPhase: "starting",
+        recentFailures: 0,
+        pendingTimer: null,
+      });
+      expect(restartRequests).toEqual([]);
+      expect(controller.admitAutomatic("update recovery")).toEqual({
+        type: "denied",
+        reason: "generation-active",
+      });
+
+      expect(
+        controller.recordFailure(generation, `late exit after ${shutdownDisposition}`),
+      ).toEqual({
+        type: "restart-scheduled",
+        delayMs: 500,
+      });
+      expect(controller.recordFailure(generation, "duplicate exit")).toEqual({ type: "ignored" });
+      expect(controller.getSnapshot()).toMatchObject({
+        activeGenerationId: null,
+        recentFailures: 1,
+        restartAttempt: 1,
+        pendingTimer: "restart",
+      });
+
+      vi.advanceTimersByTime(499);
+      expect(restartRequests).toEqual([]);
+      vi.advanceTimersByTime(1);
+      expect(restartRequests).toHaveLength(1);
+      expect(restartRequests[0]?.generation.id).toBe(2);
+    },
+  );
+
   it("retires an intentional generation without recording failure or firing its stability timer", () => {
     const first = admit();
     controller.markStartupReady(first);
@@ -445,87 +487,85 @@ describe("desktop backend restart integration", () => {
     expect(desktopMainSource.match(/beginAutomaticBackendStart\(/g)).toHaveLength(6);
   });
 
-  it("settles a failed-readiness generation through bounded shutdown before recording failure", () => {
+  it("keeps all restart ownership until bounded shutdown confirms the child exited", () => {
     const readinessFailure = sourceBetween(
       desktopMainSource,
       "async function settleBackendGenerationAfterReadinessFailure(",
       "function stopBackend(",
     );
+    const unconfirmedBranch = readinessFailure.indexOf("if (!shutdownDisposition.exitConfirmed)");
+    const failureRecording = readinessFailure.indexOf("recordBackendGenerationFailure(");
+
     expect(readinessFailure.indexOf("await stopBackendAndWaitForExit(")).toBeLessThan(
-      readinessFailure.indexOf("recordBackendGenerationFailure("),
+      unconfirmedBranch,
     );
+    expect(unconfirmedBranch).toBeLessThan(failureRecording);
     expect(readinessFailure).toContain("preserveRestartGeneration: generation");
     expect(readinessFailure).toContain("shutdownHttpUrl: baseUrl");
+    expect(readinessFailure).toContain("replacement-blocked=true");
+    expect(readinessFailure).toContain("return;");
+    expect(readinessFailure).not.toContain("backendGeneration = null");
+    expect(readinessFailure.indexOf("settlingBackendGenerations.delete")).toBeLessThan(
+      unconfirmedBranch,
+    );
   });
 
-  it("keeps an unconfirmed backend owned and suppresses its replacement", () => {
-    const readinessFailure = sourceBetween(
-      desktopMainSource,
-      "async function settleBackendGenerationAfterReadinessFailure(",
-      "function stopBackend(",
-    );
-    expect(readinessFailure).toContain(
-      "shutdownFailure && isCurrentBackendGeneration(generation, child)",
-    );
-    expect(readinessFailure).toContain("automatic restart suppressed");
-    expect(readinessFailure.indexOf("automatic restart suppressed")).toBeLessThan(
-      readinessFailure.indexOf("recordBackendGenerationFailure("),
-    );
-
-    const generationFailure = sourceBetween(
-      desktopMainSource,
-      "const failGeneration = (",
-      'writeBackendSessionBoundary(\n    "START"',
-    );
-    expect(generationFailure).toContain(
-      "exitProven || child.exitCode !== null || child.signalCode !== null || child.pid === undefined",
-    );
-    expect(generationFailure.indexOf("if (!ownershipReleaseProven)")).toBeLessThan(
-      generationFailure.indexOf("backendProcess = null"),
-    );
-    const generationExit = sourceBetween(
-      desktopMainSource,
-      'child.on("exit", (code, signal) => {',
-      "monitorBackendGenerationReadiness(generation, child, generationBaseUrl)",
-    );
-    expect(generationExit).toContain(
-      'failGeneration(`code=${code ?? "null"} signal=${signal ?? "null"}`, true)',
-    );
-
-    const boundedShutdown = sourceBetween(
+  it("returns and consumes cross-platform exit proof without eager ownership release", () => {
+    const stopBackendAndWait = sourceBetween(
       desktopMainSource,
       "async function stopBackendAndWaitForExit(",
       "async function disposeBrowserUsePipeServerForShutdown(",
     );
-    expect(boundedShutdown).toContain('shutdownResult.type === "timed-out"');
-    expect(boundedShutdown).toContain('return "timed-out"');
-    const windowsShutdown = sourceBetween(
-      boundedShutdown,
-      'if (process.platform === "win32")',
-      'const shutdownResult = await new Promise<"exited" | "timed-out">',
+    const mismatch = stopBackendAndWait.indexOf(
+      "options.expectedChild && child !== options.expectedChild",
     );
-    expect(windowsShutdown.indexOf('shutdownResult.type === "timed-out"')).toBeLessThan(
-      windowsShutdown.indexOf("releaseExitedBackendOwnership()"),
-    );
-    expect(windowsShutdown.indexOf("backendChildHasExited()")).toBeLessThan(
-      windowsShutdown.indexOf('return "timed-out"'),
-    );
-    const posixTimeout = sourceBetween(
-      boundedShutdown,
-      'if (shutdownResult === "timed-out")',
-      'return "timed-out"',
-    );
-    expect(posixTimeout).toContain("backendChildHasExited()");
-    expect(posixTimeout).toContain("releaseExitedBackendOwnership()");
+    const readinessCancellation = stopBackendAndWait.indexOf("cancelBackendReadinessWait()");
 
+    expect(mismatch).toBeGreaterThanOrEqual(0);
+    expect(mismatch).toBeLessThan(readinessCancellation);
+    expect(stopBackendAndWait).toContain("Promise<BackendStopDisposition>");
+    expect(stopBackendAndWait).toContain(
+      "fromWindowsBackendShutdownResult(\n          await stopWindowsBackendAndWait({",
+    );
+    expect(stopBackendAndWait).toContain("if (!disposition.exitConfirmed");
+    expect(stopBackendAndWait).toContain("if (disposition.exitConfirmed)");
+    expect(stopBackendAndWait).toContain("settleConfirmedBackendStop(");
+    expect(stopBackendAndWait).not.toContain("backendProcess = null");
+    expect(stopBackendAndWait).not.toContain("backendGeneration = null");
+
+    const posixStop = sourceBetween(
+      desktopMainSource,
+      "async function stopPosixBackendAndWait(",
+      "async function stopBackendAndWaitForExit(",
+    );
+    expect(posixStop).toContain('settle({ type: "timed-out", exitConfirmed: false, forced })');
+
+    const admittedLaunch = sourceBetween(
+      desktopMainSource,
+      "async function launchAdmittedBackendGeneration(",
+      "async function settleBackendGenerationAfterReadinessFailure(",
+    );
+    expect(admittedLaunch).toContain("child.pid !== undefined && !hasBackendProcessExited(child)");
+    expect(admittedLaunch).toContain("settleGenerationAfterConfirmedExit(");
+  });
+
+  it("fails update preparation closed when backend exit remains unconfirmed", () => {
     const updateInstall = sourceBetween(
       desktopMainSource,
       "async function installDownloadedUpdate(",
       "async function recordDownloadedUpdateIdentity(",
     );
-    expect(updateInstall).toContain('backendStopResult === "timed-out"');
-    expect(updateInstall.indexOf('backendStopResult === "timed-out"')).toBeLessThan(
-      updateInstall.indexOf('logMacUpdateDiagnostics("before install handoff")'),
+    const stop = updateInstall.indexOf(
+      "const shutdownDisposition = await stopBackendAndWaitForExit()",
+    );
+    const rejectUnconfirmed = updateInstall.indexOf("if (!shutdownDisposition.exitConfirmed)");
+    const installHandoff = updateInstall.indexOf("autoUpdater.quitAndInstall()");
+
+    expect(stop).toBeGreaterThanOrEqual(0);
+    expect(stop).toBeLessThan(rejectUnconfirmed);
+    expect(rejectUnconfirmed).toBeLessThan(installHandoff);
+    expect(updateInstall).toContain(
+      "The desktop backend did not confirm shutdown. Update installation was not started.",
     );
   });
 
@@ -541,11 +581,7 @@ describe("desktop backend restart integration", () => {
     expect(shutdown.indexOf("cancelBackendGenerationReadinessWait()")).toBeLessThan(
       shutdown.indexOf("await stopBackendAndWaitForExit()"),
     );
-    expect(shutdown.indexOf('backendStopResult === "timed-out"')).toBeLessThan(
-      shutdown.indexOf("browserManager.dispose()"),
-    );
-    expect(shutdown.indexOf("browserManager.dispose()")).toBeLessThan(
-      shutdown.indexOf("restoreStdIoCapture?.()"),
-    );
+    expect(shutdown).toContain("shutdown incomplete disposition=");
+    expect(shutdown).toContain("backend-exit-unconfirmed=true");
   });
 });
