@@ -125,7 +125,7 @@ export function useComposerDropzone(input: {
         readonly genericFiles: "fallthrough";
       };
   readonly appendReferenceText?: ((text: string) => void) | undefined;
-  readonly canAppendReferenceText?: boolean | undefined;
+  readonly canAppendReferenceText?: (() => boolean) | undefined;
   readonly onReferenceDropRejected?: (() => void) | undefined;
   /** Absolute paths from desktop OS drops that should become @mentions (folders). */
   readonly appendPathMentions?: ((paths: readonly string[]) => void) | undefined;
@@ -137,7 +137,7 @@ export function useComposerDropzone(input: {
     addImages,
     fileSupport,
     appendReferenceText,
-    canAppendReferenceText = true,
+    canAppendReferenceText,
     onReferenceDropRejected,
     appendPathMentions,
     focusComposer,
@@ -169,7 +169,7 @@ export function useComposerDropzone(input: {
   }, [dragDepthRef, setIsDragOverComposer]);
 
   const insertReferenceText = (referenceText: string): boolean => {
-    if (!appendReferenceText || !canAppendReferenceText) {
+    if (!appendReferenceText || canAppendReferenceText?.() === false) {
       return false;
     }
     appendReferenceText(referenceText);

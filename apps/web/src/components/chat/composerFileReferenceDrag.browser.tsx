@@ -20,7 +20,7 @@ function DropzoneHarness(props: {
   readonly addFiles: (files: readonly File[]) => void;
   readonly addImages: (files: readonly File[]) => void;
   readonly appendReferenceText: (text: string) => void;
-  readonly canAppendReferenceText: boolean;
+  readonly canAppendReferenceText: () => boolean;
   readonly onNestedDrop: () => void;
   readonly onReferenceDropRejected: () => void;
 }) {
@@ -66,7 +66,7 @@ function DropzoneHarness(props: {
   );
 }
 
-async function mountDropzone(options?: { readonly busy?: boolean }) {
+async function mountDropzone(options?: { readonly canAppendReferenceText?: () => boolean }) {
   const addFiles = vi.fn<(files: readonly File[]) => void>();
   const addImages = vi.fn<(files: readonly File[]) => void>();
   const appendReferenceText = vi.fn<(text: string) => void>();
@@ -79,7 +79,7 @@ async function mountDropzone(options?: { readonly busy?: boolean }) {
       addFiles={addFiles}
       addImages={addImages}
       appendReferenceText={appendReferenceText}
-      canAppendReferenceText={!options?.busy}
+      canAppendReferenceText={options?.canAppendReferenceText ?? (() => true)}
       onNestedDrop={onNestedDrop}
       onReferenceDropRejected={onReferenceDropRejected}
     />,
@@ -172,8 +172,12 @@ describe("explorer-to-composer file reference drag", () => {
     expect(mounted.onReferenceDropRejected).not.toHaveBeenCalled();
   });
 
-  it("rejects a busy custom drop exactly once without inserting", async () => {
-    await using mounted = await mountDropzone({ busy: true });
+  it("checks preflight availability at drop time without requiring a rerender", async () => {
+    let sendPreflightInFlight = false;
+    await using mounted = await mountDropzone({
+      canAppendReferenceText: () => !sendPreflightInFlight,
+    });
+    sendPreflightInFlight = true;
     const dropEvent = dispatchDragEvent(
       requireElement('[data-testid="nested-editor"]'),
       "drop",

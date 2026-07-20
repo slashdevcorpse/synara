@@ -6819,12 +6819,14 @@ export default function ChatView({
       addFiles: addComposerFiles,
     },
     appendReferenceText: (referenceText) => appendComposerPromptText(threadId, referenceText),
-    canAppendReferenceText: canAcceptComposerFileReferenceDrop({
-      isConnecting,
-      isComposerApprovalState,
-      isSendBusy,
-      pendingUserInputCount: pendingUserInputs.length,
-    }),
+    canAppendReferenceText: () =>
+      !sendPreflightInFlightRef.current &&
+      canAcceptComposerFileReferenceDrop({
+        isConnecting,
+        isComposerApprovalState,
+        isSendBusy,
+        pendingUserInputCount: pendingUserInputs.length,
+      }),
     onReferenceDropRejected: () => {
       toastManager.add({
         type: "error",
