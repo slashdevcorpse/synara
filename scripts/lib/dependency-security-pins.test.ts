@@ -5,6 +5,12 @@ const packageManifest = JSON.parse(
   readFileSync(new URL("../../package.json", import.meta.url), "utf8"),
 ) as {
   readonly devDependencies?: Readonly<Record<string, string>>;
+  readonly overrides?: Readonly<Record<string, string>>;
+};
+const serverPackageManifest = JSON.parse(
+  readFileSync(new URL("../../apps/server/package.json", import.meta.url), "utf8"),
+) as {
+  readonly dependencies?: Readonly<Record<string, string>>;
 };
 const webPackageManifest = JSON.parse(
   readFileSync(new URL("../../apps/web/package.json", import.meta.url), "utf8"),
@@ -20,14 +26,20 @@ const lockfile = readFileSync(new URL("../../bun.lock", import.meta.url), "utf8"
 
 const securityPins = {
   "@babel/core": "7.29.7",
-  "js-yaml": "4.2.0",
+  "js-yaml": "4.3.0",
   picomatch: "2.3.2",
   undici: "7.28.0",
+} as const;
+const piSdkPins = {
+  "@earendil-works/pi-agent-core": "0.80.6",
+  "@earendil-works/pi-ai": "0.80.6",
+  "@earendil-works/pi-coding-agent": "0.80.6",
 } as const;
 
 describe("dependency security pins", () => {
   it("keeps the audited compatible major resolutions explicit", () => {
     expect(packageManifest.devDependencies).toMatchObject(securityPins);
+    expect(packageManifest.overrides).toMatchObject({ "js-yaml": "4.3.0" });
     for (const [packageName, version] of Object.entries(securityPins)) {
       expect(lockfile).toContain(
         `${JSON.stringify(packageName)}: [${JSON.stringify(`${packageName}@${version}`)}`,
@@ -45,6 +57,22 @@ describe("dependency security pins", () => {
     expect(lockfile).not.toContain('"react-icons": ["react-icons@5.7.0"');
   });
 
+  it("keeps the Pi SDK on the adapter-compatible API surface", () => {
+    expect(serverPackageManifest.dependencies).toMatchObject(piSdkPins);
+    expect(packageManifest.overrides).toMatchObject({
+      ...piSdkPins,
+      "@earendil-works/pi-tui": "0.80.6",
+    });
+    for (const packageName of [...Object.keys(piSdkPins), "@earendil-works/pi-tui"]) {
+      expect(lockfile).toContain(
+        `${JSON.stringify(packageName)}: [${JSON.stringify(`${packageName}@0.80.6`)}`,
+      );
+      expect(lockfile).not.toContain(
+        `${JSON.stringify(packageName)}: [${JSON.stringify(`${packageName}@0.80.10`)}`,
+      );
+    }
+  });
+
   it("keeps the marketing build beyond the audited Astro and esbuild ranges", () => {
     expect(marketingPackageManifest.dependencies).toMatchObject({ astro: "7.1.1" });
     expect(lockfile).toContain('"astro": ["astro@7.1.1"');
@@ -56,6 +84,7 @@ describe("dependency security pins", () => {
     for (const resolution of [
       "@babel/core@7.29.0",
       "js-yaml@4.1.1",
+      "js-yaml@4.2.0",
       "picomatch@2.3.1",
       "undici@7.24.4",
     ]) {
