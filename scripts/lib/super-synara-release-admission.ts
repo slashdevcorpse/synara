@@ -122,7 +122,17 @@ function assertReleaseScope(value: string): asserts value is SuperSynaraReleaseS
 function assertMacSignatureAllowlistScope(input: {
   readonly releaseScope: SuperSynaraReleaseScope;
   readonly macSignatureAllowlist?: MacSignatureAllowlist;
-}): void {
+}): asserts input is typeof input &
+  (
+    | {
+        readonly releaseScope: "windows-only";
+        readonly macSignatureAllowlist?: never;
+      }
+    | {
+        readonly releaseScope: "windows-and-macos";
+        readonly macSignatureAllowlist: MacSignatureAllowlist;
+      }
+  ) {
   if (input.releaseScope === "windows-only" && input.macSignatureAllowlist !== undefined) {
     throw new Error("Windows-only release admission must not include a macOS signature allowlist.");
   }
