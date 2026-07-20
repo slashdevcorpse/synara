@@ -2274,6 +2274,7 @@ const make = Effect.gen(function* () {
         const erroredTurnId = eventTurnId ?? activeTurnId ?? undefined;
 
         if (erroredTurnId) {
+          yield* forgetOutstandingTurn(thread.id, erroredTurnId);
           yield* finalizeBufferedAssistantMessagesForTurn({
             event,
             threadId: thread.id,
