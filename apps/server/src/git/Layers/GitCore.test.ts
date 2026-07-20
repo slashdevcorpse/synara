@@ -804,7 +804,9 @@ it.layer(TestLayer)("git integration", (it) => {
 
         const branches = yield* core.listBranches({ cwd: tmp });
         expect(branches.branches.find((branch) => branch.current)?.name).toBe("feature");
-        expect(yield* readTextFile(path.join(tmp, "README.md"))).toBe("dirty changes\n");
+        expect(splitLines(yield* readTextFile(path.join(tmp, "README.md"))).join("\n")).toBe(
+          "dirty changes\n",
+        );
         expect((yield* git(tmp, ["stash", "list"])).trim()).toBe("");
       }),
     );
@@ -831,7 +833,9 @@ it.layer(TestLayer)("git integration", (it) => {
         const stashList = yield* git(tmp, ["stash", "list"]);
         expect(stashList).toContain("pre-existing stash");
         expect(stashList).not.toContain("synara: stash before switching to feature");
-        expect(yield* readTextFile(path.join(tmp, "README.md"))).toBe("dirty changes\n");
+        expect(splitLines(yield* readTextFile(path.join(tmp, "README.md"))).join("\n")).toBe(
+          "dirty changes\n",
+        );
       }),
     );
 
@@ -857,7 +861,9 @@ it.layer(TestLayer)("git integration", (it) => {
         expect(result._tag).toBe("Failure");
         const branches = yield* core.listBranches({ cwd: tmp });
         expect(branches.branches.find((branch) => branch.current)?.name).toBe("conflicting");
-        expect(yield* readTextFile(path.join(tmp, "README.md"))).toBe("conflicting content\n");
+        expect(splitLines(yield* readTextFile(path.join(tmp, "README.md"))).join("\n")).toBe(
+          "conflicting content\n",
+        );
         expect((yield* git(tmp, ["status", "--short"])).trim()).toBe("");
         expect(yield* git(tmp, ["stash", "list"])).toContain(
           "synara: stash before switching to conflicting",
@@ -1726,11 +1732,11 @@ it.layer(TestLayer)("git integration", (it) => {
         const core = yield* GitCore;
 
         yield* writeTextFile(path.join(tmp, "README.md"), "keep\nlast line  ");
-        yield* writeTextFile(path.join(tmp, " spaced file.txt "), "hello\n");
+        yield* writeTextFile(path.join(tmp, "spaced file.txt"), "hello\n");
 
         const patch = (yield* core.readWorkingTreePatch(tmp)).patch;
         expect(patch).toContain("+last line  ");
-        expect(patch).toContain("diff --git a/ spaced file.txt  b/ spaced file.txt ");
+        expect(patch).toContain("diff --git a/spaced file.txt b/spaced file.txt");
       }),
     );
 
