@@ -35,9 +35,9 @@ describe("shouldKeepDesktopRuntimeAliveAfterWindowAllClosed", () => {
   it.each(["win32", "linux"] as const)(
     "keeps the Super runtime alive after the last window closes on %s",
     (platform) => {
-      expect(
-        shouldKeepDesktopRuntimeAliveAfterWindowAllClosed({ flavor: "super", platform }),
-      ).toBe(true);
+      expect(shouldKeepDesktopRuntimeAliveAfterWindowAllClosed({ flavor: "super", platform })).toBe(
+        true,
+      );
     },
   );
 

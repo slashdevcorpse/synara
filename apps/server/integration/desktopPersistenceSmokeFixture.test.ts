@@ -27,10 +27,7 @@ import {
   seedDesktopPersistenceSmokeFixture,
 } from "./desktopPersistenceSmokeFixture.ts";
 
-const FIXTURE_CLI_PATH = Path.join(
-  import.meta.dirname,
-  "desktopPersistenceSmokeFixture.ts",
-);
+const FIXTURE_CLI_PATH = Path.join(import.meta.dirname, "desktopPersistenceSmokeFixture.ts");
 
 async function openProviderDirectory(synaraHome: string) {
   const { dbPath } = await Effect.runPromise(
@@ -47,15 +44,11 @@ async function openProviderDirectory(synaraHome: string) {
 }
 
 function runFixtureCli(mode: "arm", synaraHome: string) {
-  return spawnSync(
-    "bun",
-    ["run", FIXTURE_CLI_PATH, mode, "--home-dir", synaraHome],
-    {
-      cwd: Path.resolve(import.meta.dirname, ".."),
-      encoding: "utf8",
-      timeout: 30_000,
-    },
-  );
+  return spawnSync("bun", ["run", FIXTURE_CLI_PATH, mode, "--home-dir", synaraHome], {
+    cwd: Path.resolve(import.meta.dirname, ".."),
+    encoding: "utf8",
+    timeout: 30_000,
+  });
 }
 
 async function persistCrashRecoveryOutcome(synaraHome: string): Promise<void> {
@@ -134,9 +127,7 @@ describe("desktop persistence smoke fixture", () => {
         const armedBinding = armedBindingOption.value;
         const armedPayload = armedBinding.runtimePayload as Record<string, unknown>;
         expect(armedBinding.status).toBe("running");
-        expect(armedPayload.activeTurnId).toBe(
-          DESKTOP_PERSISTENCE_SMOKE_ACTIVE_TURN_ID,
-        );
+        expect(armedPayload.activeTurnId).toBe(DESKTOP_PERSISTENCE_SMOKE_ACTIVE_TURN_ID);
         expect(armedPayload.desktopPersistenceSmokeArm).toEqual(
           DESKTOP_PERSISTENCE_SMOKE_ARM_MARKER,
         );

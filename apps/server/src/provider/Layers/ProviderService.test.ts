@@ -824,10 +824,7 @@ it.effect(
         assert.equal(normalized.value.adapterKey, crashedRuntime.adapterKey);
         assert.equal(normalized.value.runtimeMode, crashedRuntime.runtimeMode);
         assert.equal(normalized.value.status, "stopped");
-        assert.equal(
-          normalized.value.lifecycleGeneration,
-          crashedRuntime.lifecycleGeneration,
-        );
+        assert.equal(normalized.value.lifecycleGeneration, crashedRuntime.lifecycleGeneration);
         assert.deepEqual(normalized.value.resumeCursor, resumeCursor);
         const normalizedPayload = asRuntimePayloadRecord(normalized.value.runtimePayload);
         assert.equal(normalizedPayload.cwd, crashedRuntime.runtimePayload.cwd);
@@ -862,10 +859,7 @@ it.effect(
           normalizedStartingPayload.retainedMetadata,
           startingRuntime.runtimePayload.retainedMetadata,
         );
-        assert.equal(
-          normalizedStartingPayload.lastRuntimeEvent,
-          "provider.startupCrashRecovery",
-        );
+        assert.equal(normalizedStartingPayload.lastRuntimeEvent, "provider.startupCrashRecovery");
 
         const liveAfterStartup = yield* repository.getByThreadId({ threadId: liveThreadId });
         const stoppedAfterStartup = yield* repository.getByThreadId({ threadId: stoppedThreadId });

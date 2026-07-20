@@ -222,9 +222,7 @@ function validateNativePersistenceSmoke(
   steps: readonly WorkflowRunStep[],
   errors: string[],
 ): void {
-  const smokeSteps = steps.filter(
-    (step) => step.command === CI_DESKTOP_PERSISTENCE_SMOKE_COMMAND,
-  );
+  const smokeSteps = steps.filter((step) => step.command === CI_DESKTOP_PERSISTENCE_SMOKE_COMMAND);
   if (smokeSteps.length !== 1) {
     errors.push(
       `${workflowPath} ${jobName} must run exactly one post-build desktop persistence smoke command: ${CI_DESKTOP_PERSISTENCE_SMOKE_COMMAND}.`,

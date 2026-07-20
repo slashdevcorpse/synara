@@ -322,19 +322,14 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
         continue;
       }
 
-      const hasLiveSessionExit = yield* Effect.exit(
-        adapterExit.value.hasSession(binding.threadId),
-      );
+      const hasLiveSessionExit = yield* Effect.exit(adapterExit.value.hasSession(binding.threadId));
       if (Exit.isFailure(hasLiveSessionExit)) {
-        yield* Effect.logWarning(
-          "provider startup recovery could not inspect persisted session",
-          {
-            threadId: binding.threadId,
-            provider: binding.provider,
-            persistedStatus: binding.status,
-            cause: Cause.pretty(hasLiveSessionExit.cause),
-          },
-        );
+        yield* Effect.logWarning("provider startup recovery could not inspect persisted session", {
+          threadId: binding.threadId,
+          provider: binding.provider,
+          persistedStatus: binding.status,
+          cause: Cause.pretty(hasLiveSessionExit.cause),
+        });
         continue;
       }
       if (hasLiveSessionExit.value) {
@@ -482,10 +477,7 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
         // registered stop. A safe stop registered afterwards sees this count;
         // one registered beforehand is awaited above.
         clearRuntimeIdleTimer(threadId);
-        idleSensitiveWorkCounts.set(
-          threadId,
-          (idleSensitiveWorkCounts.get(threadId) ?? 0) + 1,
-        );
+        idleSensitiveWorkCounts.set(threadId, (idleSensitiveWorkCounts.get(threadId) ?? 0) + 1);
         return Effect.void;
       });
 
@@ -1256,9 +1248,7 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
           threadId,
           lifecycle.run(threadId, (lease) =>
             Effect.gen(function* () {
-              const persistedBinding = Option.getOrUndefined(
-                yield* directory.getBinding(threadId),
-              );
+              const persistedBinding = Option.getOrUndefined(yield* directory.getBinding(threadId));
               const effectiveResumeCursor =
                 input.resumeCursor ??
                 (persistedBinding?.provider === input.provider
@@ -1428,7 +1418,8 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
                   ...(effectiveProviderOptions !== undefined
                     ? { providerOptions: effectiveProviderOptions }
                     : {}),
-                  ...(sourceBinding.resumeCursor !== null && sourceBinding.resumeCursor !== undefined
+                  ...(sourceBinding.resumeCursor !== null &&
+                  sourceBinding.resumeCursor !== undefined
                     ? { sourceResumeCursor: sourceBinding.resumeCursor }
                     : {}),
                   ...(sourceCwd ? { sourceCwd } : {}),

@@ -104,10 +104,7 @@ export function makeProviderLifecycleCoordinator(): ProviderLifecycleCoordinator
       }),
     );
 
-  const runConditional: ProviderLifecycleCoordinator["runConditional"] = (
-    threadId,
-    operation,
-  ) =>
+  const runConditional: ProviderLifecycleCoordinator["runConditional"] = (threadId, operation) =>
     withThreadLock(
       threadId,
       Effect.suspend(() => {

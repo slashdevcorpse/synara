@@ -90,11 +90,7 @@ function runBoundedCommand({ command, args, cwd, env, description, timeoutMs }) 
       clearTimeout(timeout);
       rejectCommand(
         new Error(
-          commandFailureMessage(
-            description,
-            `failed to run: ${error.message}`,
-            state.output,
-          ),
+          commandFailureMessage(description, `failed to run: ${error.message}`, state.output),
         ),
       );
     });
@@ -264,7 +260,9 @@ async function main() {
       );
     }
     assertHealthyOutput(launch);
-    console.log(`${launch.description} process tree force-stopped and confirmed (pid=${result.pid}).`);
+    console.log(
+      `${launch.description} process tree force-stopped and confirmed (pid=${result.pid}).`,
+    );
   };
 
   const cleanupDesktop = async (launch) => {

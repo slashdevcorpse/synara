@@ -78,9 +78,7 @@ function makeLayer(input: {
 function makeProviderService(input: {
   readonly stopSession: ProviderServiceShape["stopSession"];
   readonly stopRuntimeSession?: NonNullable<ProviderServiceShape["stopRuntimeSession"]>;
-  readonly stopRuntimeSessionIfIdle?: NonNullable<
-    ProviderServiceShape["stopRuntimeSessionIfIdle"]
-  >;
+  readonly stopRuntimeSessionIfIdle?: NonNullable<ProviderServiceShape["stopRuntimeSessionIfIdle"]>;
   readonly hasLiveRuntimeTasks?: NonNullable<ProviderServiceShape["hasLiveRuntimeTasks"]>;
 }): ProviderServiceShape {
   return {
@@ -186,9 +184,9 @@ describe("ProviderSessionReaperLive", () => {
     const threadId = ThreadId.makeUnsafe("thread-reaper-active");
     const turnId = TurnId.makeUnsafe("turn-reaper-active");
     const stopSession = vi.fn<ProviderServiceShape["stopSession"]>(() => Effect.void);
-    const stopRuntimeSession = vi.fn<
-      NonNullable<ProviderServiceShape["stopRuntimeSession"]>
-    >(() => Effect.void);
+    const stopRuntimeSession = vi.fn<NonNullable<ProviderServiceShape["stopRuntimeSession"]>>(
+      () => Effect.void,
+    );
     const stopRuntimeSessionIfIdle = vi.fn<
       NonNullable<ProviderServiceShape["stopRuntimeSessionIfIdle"]>
     >(() => Effect.void);
@@ -291,12 +289,12 @@ describe("ProviderSessionReaperLive", () => {
   it("delegates all background-task safety to the atomic runtime operation", async () => {
     const threadId = ThreadId.makeUnsafe("thread-reaper-background-task");
     const stopSession = vi.fn<ProviderServiceShape["stopSession"]>(() => Effect.void);
-    const stopRuntimeSession = vi.fn<
-      NonNullable<ProviderServiceShape["stopRuntimeSession"]>
-    >(() => Effect.void);
-    const hasLiveRuntimeTasks = vi.fn<
-      NonNullable<ProviderServiceShape["hasLiveRuntimeTasks"]>
-    >(() => Effect.succeed(true));
+    const stopRuntimeSession = vi.fn<NonNullable<ProviderServiceShape["stopRuntimeSession"]>>(
+      () => Effect.void,
+    );
+    const hasLiveRuntimeTasks = vi.fn<NonNullable<ProviderServiceShape["hasLiveRuntimeTasks"]>>(
+      () => Effect.succeed(true),
+    );
     const stopRuntimeSessionIfIdle = vi.fn<
       NonNullable<ProviderServiceShape["stopRuntimeSessionIfIdle"]>
     >(() => Effect.void);
@@ -352,12 +350,12 @@ describe("ProviderSessionReaperLive", () => {
   it("contains atomic idle-stop failures without falling back to destructive cleanup", async () => {
     const threadId = ThreadId.makeUnsafe("thread-reaper-atomic-stop-failure");
     const stopSession = vi.fn<ProviderServiceShape["stopSession"]>(() => Effect.void);
-    const stopRuntimeSession = vi.fn<
-      NonNullable<ProviderServiceShape["stopRuntimeSession"]>
-    >(() => Effect.void);
-    const hasLiveRuntimeTasks = vi.fn<
-      NonNullable<ProviderServiceShape["hasLiveRuntimeTasks"]>
-    >(() => Effect.succeed(false));
+    const stopRuntimeSession = vi.fn<NonNullable<ProviderServiceShape["stopRuntimeSession"]>>(
+      () => Effect.void,
+    );
+    const hasLiveRuntimeTasks = vi.fn<NonNullable<ProviderServiceShape["hasLiveRuntimeTasks"]>>(
+      () => Effect.succeed(false),
+    );
     const stopRuntimeSessionIfIdle = vi.fn<
       NonNullable<ProviderServiceShape["stopRuntimeSessionIfIdle"]>
     >(() => Effect.die(new Error("synthetic atomic stop failure")));

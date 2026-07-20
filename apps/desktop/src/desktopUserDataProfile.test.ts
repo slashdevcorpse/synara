@@ -44,9 +44,7 @@ describe("desktopUserDataProfile", () => {
   });
 
   it("uses an explicit absolute persistence-smoke profile instead of canonical userData", () => {
-    const persistenceSmokeUserDataPath = Path.resolve(
-      "/isolated/synara-home/electron-user-data",
-    );
+    const persistenceSmokeUserDataPath = Path.resolve("/isolated/synara-home/electron-user-data");
 
     expect(
       resolveDesktopUserDataPath({

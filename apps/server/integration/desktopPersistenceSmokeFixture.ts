@@ -21,14 +21,10 @@ import { Effect, Layer, ManagedRuntime, Option } from "effect";
 import { deriveServerPaths, ServerConfig } from "../src/config.ts";
 import { OrchestrationEngineLive } from "../src/orchestration/Layers/OrchestrationEngine.ts";
 import { OrchestrationProjectionPipelineLive } from "../src/orchestration/Layers/ProjectionPipeline.ts";
-import {
-  OrchestrationProjectionSnapshotQueryLive,
-} from "../src/orchestration/Layers/ProjectionSnapshotQuery.ts";
+import { OrchestrationProjectionSnapshotQueryLive } from "../src/orchestration/Layers/ProjectionSnapshotQuery.ts";
 import { OrchestrationEngineService } from "../src/orchestration/Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../src/orchestration/Services/ProjectionSnapshotQuery.ts";
-import {
-  OrchestrationCommandReceiptRepositoryLive,
-} from "../src/persistence/Layers/OrchestrationCommandReceipts.ts";
+import { OrchestrationCommandReceiptRepositoryLive } from "../src/persistence/Layers/OrchestrationCommandReceipts.ts";
 import { OrchestrationEventStoreLive } from "../src/persistence/Layers/OrchestrationEventStore.ts";
 import { ProviderSessionRuntimeRepositoryLive } from "../src/persistence/Layers/ProviderSessionRuntime.ts";
 import { makeSqlitePersistenceLive } from "../src/persistence/Layers/Sqlite.ts";
@@ -72,8 +68,7 @@ export const DESKTOP_PERSISTENCE_SMOKE_ARM_MARKER = {
   targetLaunch: "A",
   version: 1,
 };
-export const DESKTOP_PERSISTENCE_SMOKE_ARM_EVENT =
-  "provider.desktopPersistenceSmokeArmed";
+export const DESKTOP_PERSISTENCE_SMOKE_ARM_EVENT = "provider.desktopPersistenceSmokeArmed";
 
 export interface DesktopPersistenceSmokeFixturePaths {
   readonly synaraHome: string;
@@ -298,10 +293,7 @@ function assertFixtureBindingIdentity(
   assert.equal(binding.provider, "codex");
   assert.equal(binding.adapterKey, DESKTOP_PERSISTENCE_SMOKE_ADAPTER_KEY);
   assert.equal(binding.runtimeMode, "approval-required");
-  assert.equal(
-    binding.lifecycleGeneration,
-    DESKTOP_PERSISTENCE_SMOKE_LIFECYCLE_GENERATION,
-  );
+  assert.equal(binding.lifecycleGeneration, DESKTOP_PERSISTENCE_SMOKE_LIFECYCLE_GENERATION);
   assert.deepEqual(binding.resumeCursor, DESKTOP_PERSISTENCE_SMOKE_RESUME_CURSOR);
 
   const expectedPayload = runtimePayloadFor(paths);
@@ -330,10 +322,7 @@ function assertCrashRecoveredBinding(
     "provider startup crash-recovery timestamp must be an ISO date-time",
   );
   if (options.mustContainArmMarker) {
-    assert.deepEqual(
-      payload.desktopPersistenceSmokeArm,
-      DESKTOP_PERSISTENCE_SMOKE_ARM_MARKER,
-    );
+    assert.deepEqual(payload.desktopPersistenceSmokeArm, DESKTOP_PERSISTENCE_SMOKE_ARM_MARKER);
   } else {
     assert.equal(
       payload.desktopPersistenceSmokeArm,
@@ -351,10 +340,7 @@ function assertArmedBinding(
   const payload = assertFixtureBindingIdentity(binding, paths);
   assert.equal(binding.status, "running");
   assert.equal(payload.activeTurnId, DESKTOP_PERSISTENCE_SMOKE_ACTIVE_TURN_ID);
-  assert.deepEqual(
-    payload.desktopPersistenceSmokeArm,
-    DESKTOP_PERSISTENCE_SMOKE_ARM_MARKER,
-  );
+  assert.deepEqual(payload.desktopPersistenceSmokeArm, DESKTOP_PERSISTENCE_SMOKE_ARM_MARKER);
   assert.equal(payload.lastRuntimeEvent, DESKTOP_PERSISTENCE_SMOKE_ARM_EVENT);
   assert.equal(payload.lastRuntimeEventAt, armedAt);
 }
@@ -423,9 +409,7 @@ async function requireLiveExternalLifecycleLockOwner(
     !Number.isSafeInteger(owner.pid) ||
     (owner.pid as number) <= 0 ||
     typeof owner.token !== "string" ||
-    !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(
-      owner.token,
-    ) ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(owner.token) ||
     typeof owner.createdAt !== "string" ||
     Number.isNaN(Date.parse(owner.createdAt))
   ) {
@@ -629,10 +613,7 @@ export async function assertDesktopPersistenceSmokeFixture(
 }
 
 function parseCliOptions(argv: ReadonlyArray<string>): FixtureCliOptions {
-  if (
-    argv.length !== 3 ||
-    (argv[0] !== "seed" && argv[0] !== "arm" && argv[0] !== "assert")
-  ) {
+  if (argv.length !== 3 || (argv[0] !== "seed" && argv[0] !== "arm" && argv[0] !== "assert")) {
     failInput("usage: <seed|arm|assert> --home-dir <absolute-SYNARA_HOME>.");
   }
   if (argv[1] !== "--home-dir") {

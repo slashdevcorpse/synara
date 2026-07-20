@@ -22,15 +22,12 @@ const WINDOWS_SMOKE_RUN_ID_PATTERN =
 export const DESKTOP_PERSISTENCE_SMOKE_READINESS_MS = 30_000;
 export const DESKTOP_PERSISTENCE_SMOKE_TREE_CONFIRMATION_MS = 8_000;
 export const DESKTOP_PERSISTENCE_SMOKE_TREE_POLL_MS = 100;
-export const DESKTOP_PERSISTENCE_SMOKE_USER_DATA_ENV =
-  "SYNARA_DESKTOP_PERSISTENCE_SMOKE_USER_DATA";
+export const DESKTOP_PERSISTENCE_SMOKE_USER_DATA_ENV = "SYNARA_DESKTOP_PERSISTENCE_SMOKE_USER_DATA";
 export const DESKTOP_PERSISTENCE_SMOKE_USER_DATA_DIRECTORY = "electron-user-data";
 export const DESKTOP_PERSISTENCE_SMOKE_USER_DATA_LOG_PREFIX =
   "[desktop] persistence-smoke userData=";
 
-export const DESKTOP_PERSISTENCE_SMOKE_READINESS_PATTERNS = Object.freeze([
-  "Synara running",
-]);
+export const DESKTOP_PERSISTENCE_SMOKE_READINESS_PATTERNS = Object.freeze(["Synara running"]);
 
 export const DESKTOP_SMOKE_FATAL_PATTERNS = Object.freeze([
   "Cannot find module",
@@ -173,15 +170,19 @@ function formatError(error) {
   return error instanceof Error ? error.message : String(error);
 }
 
+function isPosixProcessGroupSignalRace(error) {
+  // Neither code is teardown proof: ESRCH can race with root exit, while EPERM can persist until
+  // the group disappears. The caller must still prove both root exit and process-group absence.
+  return error?.code === "EPERM" || error?.code === "ESRCH";
+}
+
 function defaultSignalProcess(pid, signal) {
   process.kill(pid, signal);
 }
 
 function windowsTaskkillVerificationPids(output) {
   const pids = new Set();
-  for (const match of output.matchAll(
-    /\b(?:SUCCESS|ERROR): The process with PID\s+(\d+)\b/giu,
-  )) {
+  for (const match of output.matchAll(/\b(?:SUCCESS|ERROR): The process with PID\s+(\d+)\b/giu)) {
     const pid = Number(match[1]);
     if (Number.isSafeInteger(pid) && pid > 0) pids.add(pid);
   }
@@ -199,9 +200,7 @@ function isUnsupportedWindowsTaskkillRace(output) {
 
   for (const line of lines) {
     if (line.startsWith("SUCCESS:")) continue;
-    if (
-      /^ERROR: The process with PID \d+\b.* could not be terminated\.$/u.test(line)
-    ) {
+    if (/^ERROR: The process with PID \d+\b.* could not be terminated\.$/u.test(line)) {
       unsupportedTerminationCount += 1;
       continue;
     }
@@ -212,9 +211,7 @@ function isUnsupportedWindowsTaskkillRace(output) {
     return false;
   }
 
-  return (
-    unsupportedTerminationCount > 0 && unsupportedTerminationCount === unsupportedReasonCount
-  );
+  return unsupportedTerminationCount > 0 && unsupportedTerminationCount === unsupportedReasonCount;
 }
 
 export function classifyWindowsTaskkillClose({ code, signal, output }) {
@@ -337,10 +334,7 @@ function isSameOrContainedPath(parent, candidate, platform) {
   const comparableParent = comparablePath(parent, platform);
   const comparableCandidate = comparablePath(candidate, platform);
   const pathFromParent = relative(comparableParent, comparableCandidate);
-  return (
-    pathFromParent === "" ||
-    (!pathFromParent.startsWith("..") && !isAbsolute(pathFromParent))
-  );
+  return pathFromParent === "" || (!pathFromParent.startsWith("..") && !isAbsolute(pathFromParent));
 }
 
 export function validateDesktopPersistenceSmokeEnvironment({
@@ -350,16 +344,12 @@ export function validateDesktopPersistenceSmokeEnvironment({
 } = {}) {
   const flavor = environment.SYNARA_DESKTOP_FLAVOR?.trim().toLowerCase();
   if (flavor !== "super") {
-    throw new Error(
-      "Desktop persistence smoke requires SYNARA_DESKTOP_FLAVOR=super.",
-    );
+    throw new Error("Desktop persistence smoke requires SYNARA_DESKTOP_FLAVOR=super.");
   }
 
   const configuredHome = environment.SYNARA_HOME?.trim();
   if (!configuredHome) {
-    throw new Error(
-      "Desktop persistence smoke requires an explicit absolute SYNARA_HOME.",
-    );
+    throw new Error("Desktop persistence smoke requires an explicit absolute SYNARA_HOME.");
   }
   if (!isAbsolute(configuredHome)) {
     throw new Error(
@@ -382,9 +372,7 @@ export function validateDesktopPersistenceSmokeEnvironment({
   }
 
   if (environment.SYNARA_DESKTOP_DISABLE_UPDATES !== "1") {
-    throw new Error(
-      'Desktop persistence smoke requires SYNARA_DESKTOP_DISABLE_UPDATES="1".',
-    );
+    throw new Error('Desktop persistence smoke requires SYNARA_DESKTOP_DISABLE_UPDATES="1".');
   }
 
   return resolvedHome;
@@ -607,6 +595,8 @@ function defaultIsPosixTreeAlive(pid) {
     return true;
   } catch (error) {
     if (error?.code === "ESRCH") return false;
+    // EPERM proves the group cannot currently be signaled, not that it is absent.
+    if (error?.code === "EPERM") return true;
     throw error;
   }
 }
@@ -711,9 +701,7 @@ export async function forceStopDesktopSmokeProcessTree({
     const exitProof = waitForExit(child, timeoutMs);
     let treeKillResult;
     try {
-      treeKillResult = normalizeWindowsTreeKillResult(
-        await killWindowsTree(pid, { timeoutMs }),
-      );
+      treeKillResult = normalizeWindowsTreeKillResult(await killWindowsTree(pid, { timeoutMs }));
     } catch (error) {
       treeKillResult = {
         ok: false,
@@ -731,9 +719,7 @@ export async function forceStopDesktopSmokeProcessTree({
       const verificationPids = [...new Set([pid, ...treeKillResult.verificationPids])];
       nonzeroTaskkillTreeGone = await waitForTreeGone({
         isTreeAlive: () =>
-          verificationPids.some((verificationPid) =>
-            isWindowsProcessAlive(verificationPid),
-          ),
+          verificationPids.some((verificationPid) => isWindowsProcessAlive(verificationPid)),
         timeoutMs,
       });
     }
@@ -756,9 +742,11 @@ export async function forceStopDesktopSmokeProcessTree({
   try {
     signalProcess(-pid, "SIGKILL");
   } catch (error) {
-    throw new Error(
-      `${description} process-group SIGKILL failed before teardown proof: ${formatError(error)}.`,
-    );
+    if (!isPosixProcessGroupSignalRace(error)) {
+      throw new Error(
+        `${description} process-group SIGKILL failed before teardown proof: ${formatError(error)}.`,
+      );
+    }
   }
 
   const [exitConfirmed, treeGone] = await Promise.all([

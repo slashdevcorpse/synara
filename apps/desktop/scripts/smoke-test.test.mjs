@@ -5,6 +5,7 @@ import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  DESKTOP_PERSISTENCE_SMOKE_TREE_POLL_MS,
   DESKTOP_PERSISTENCE_SMOKE_USER_DATA_ENV,
   DESKTOP_SMOKE_WINDOWS_JOB_STARTUP_MS,
   DESKTOP_SMOKE_WINDOWS_SETTLEMENT_MS,
@@ -879,12 +880,8 @@ describe("desktop smoke process lifecycle", () => {
     });
 
     expect(result.userDataPath).toBe(resolve(synaraHome, "electron-user-data"));
-    expect(result.environment[DESKTOP_PERSISTENCE_SMOKE_USER_DATA_ENV]).toBe(
-      result.userDataPath,
-    );
-    expect(result.environment).not.toHaveProperty(
-      "Synara_Desktop_Persistence_Smoke_User_Data",
-    );
+    expect(result.environment[DESKTOP_PERSISTENCE_SMOKE_USER_DATA_ENV]).toBe(result.userDataPath);
+    expect(result.environment).not.toHaveProperty("Synara_Desktop_Persistence_Smoke_User_Data");
     expect(result.environment.APPDATA).toBe(inheritedEnvironment.APPDATA);
     expect(result.environment).not.toHaveProperty("VITE_DEV_SERVER_URL");
     expect(
@@ -940,9 +937,10 @@ describe("desktop smoke process lifecycle", () => {
       .mockReturnValue({ isDirectory: () => true });
     const makeDirectory = vi.fn();
 
-    expect(
-      ensureDesktopPersistenceSmokeHome(isolatedHome, { statPath, makeDirectory }),
-    ).toEqual({ homePath: isolatedHome, created: true });
+    expect(ensureDesktopPersistenceSmokeHome(isolatedHome, { statPath, makeDirectory })).toEqual({
+      homePath: isolatedHome,
+      created: true,
+    });
     expect(makeDirectory).toHaveBeenCalledExactlyOnceWith(isolatedHome, { recursive: true });
     expect(statPath).toHaveBeenCalledTimes(2);
   });
@@ -952,9 +950,10 @@ describe("desktop smoke process lifecycle", () => {
     const statPath = vi.fn(() => ({ isDirectory: () => true }));
     const makeDirectory = vi.fn();
 
-    expect(
-      ensureDesktopPersistenceSmokeHome(isolatedHome, { statPath, makeDirectory }),
-    ).toEqual({ homePath: isolatedHome, created: false });
+    expect(ensureDesktopPersistenceSmokeHome(isolatedHome, { statPath, makeDirectory })).toEqual({
+      homePath: isolatedHome,
+      created: false,
+    });
     expect(makeDirectory).not.toHaveBeenCalled();
     expect(statPath).toHaveBeenCalledExactlyOnceWith(isolatedHome);
   });
@@ -1032,6 +1031,125 @@ describe("desktop smoke process lifecycle", () => {
     expect(signalProcess).toHaveBeenCalledExactlyOnceWith(-child.pid, "SIGKILL");
     expect(child.kill).not.toHaveBeenCalled();
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each(["EPERM", "ESRCH"])(
+    "accepts a POSIX %s signal race only after root exit and process-group absence are proven",
+    async (code) => {
+      const child = new FakeSmokeProcess();
+      const signalProcess = vi.fn(() => {
+        throw Object.assign(new Error(`kill ${code}`), { code });
+      });
+      const waitForExit = vi.fn(async () => true);
+      const waitForTreeGone = vi.fn(async () => true);
+
+      const result = await forceStopDesktopSmokeProcessTree({
+        child,
+        description: "launch A",
+        platform: "darwin",
+        timeoutMs: 250,
+        signalProcess,
+        waitForExit,
+        waitForTreeGone,
+      });
+
+      expect(result).toEqual({ mode: "force", platform: "darwin", pid: child.pid });
+      expect(signalProcess).toHaveBeenCalledExactlyOnceWith(-child.pid, "SIGKILL");
+      expect(waitForExit).toHaveBeenCalledExactlyOnceWith(child, 250);
+      expect(waitForTreeGone).toHaveBeenCalledOnce();
+    },
+  );
+
+  it.each([
+    ["EPERM", true, false, "POSIX process-tree confirmation timed out after 250ms"],
+    ["ESRCH", false, true, "root process exit confirmation timed out after 250ms"],
+  ])(
+    "fails closed when a POSIX %s signal race lacks complete teardown proof",
+    async (code, exitConfirmed, treeGone, expectedFailure) => {
+      const child = new FakeSmokeProcess();
+      const signalProcess = vi.fn(() => {
+        throw Object.assign(new Error(`kill ${code}`), { code });
+      });
+      const waitForExit = vi.fn(async () => exitConfirmed);
+      const waitForTreeGone = vi.fn(async () => treeGone);
+
+      await expect(
+        forceStopDesktopSmokeProcessTree({
+          child,
+          description: "launch A",
+          platform: "darwin",
+          timeoutMs: 250,
+          signalProcess,
+          waitForExit,
+          waitForTreeGone,
+        }),
+      ).rejects.toThrow(expectedFailure);
+
+      expect(waitForExit).toHaveBeenCalledExactlyOnceWith(child, 250);
+      expect(waitForTreeGone).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("treats POSIX EPERM probes as live until ESRCH proves process-group absence", async () => {
+    const child = new FakeSmokeProcess();
+    const signalProcess = vi.fn();
+    let probeCount = 0;
+    const processKill = vi.spyOn(process, "kill").mockImplementation(() => {
+      probeCount += 1;
+      const code = probeCount === 1 ? "EPERM" : "ESRCH";
+      throw Object.assign(new Error(`kill ${code}`), { code });
+    });
+
+    try {
+      const resultPromise = forceStopDesktopSmokeProcessTree({
+        child,
+        description: "launch A",
+        platform: "darwin",
+        timeoutMs: 250,
+        signalProcess,
+        waitForExit: async () => true,
+      });
+
+      expect(probeCount).toBe(1);
+      await vi.advanceTimersByTimeAsync(DESKTOP_PERSISTENCE_SMOKE_TREE_POLL_MS);
+
+      await expect(resultPromise).resolves.toEqual({
+        mode: "force",
+        platform: "darwin",
+        pid: child.pid,
+      });
+      expect(processKill.mock.calls).toEqual([
+        [-child.pid, 0],
+        [-child.pid, 0],
+      ]);
+      expect(signalProcess).toHaveBeenCalledExactlyOnceWith(-child.pid, "SIGKILL");
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      processKill.mockRestore();
+    }
+  });
+
+  it("rejects POSIX signal errors that are not teardown races before proof polling", async () => {
+    const child = new FakeSmokeProcess();
+    const signalProcess = vi.fn(() => {
+      throw Object.assign(new Error("kill EACCES"), { code: "EACCES" });
+    });
+    const waitForExit = vi.fn();
+    const waitForTreeGone = vi.fn();
+
+    await expect(
+      forceStopDesktopSmokeProcessTree({
+        child,
+        description: "launch A",
+        platform: "darwin",
+        timeoutMs: 250,
+        signalProcess,
+        waitForExit,
+        waitForTreeGone,
+      }),
+    ).rejects.toThrow("launch A process-group SIGKILL failed before teardown proof: kill EACCES.");
+    expect(waitForExit).not.toHaveBeenCalled();
+    expect(waitForTreeGone).not.toHaveBeenCalled();
   });
 
   it("requires successful Windows taskkill and root exit proof in force mode", async () => {
@@ -1254,13 +1372,7 @@ describe("desktop smoke process lifecycle", () => {
       }),
     ).rejects.toThrow("arm failed");
 
-    expect(events).toEqual([
-      "seed",
-      "launch A:start",
-      "launch A:ready",
-      "arm",
-      "launch A:cleanup",
-    ]);
+    expect(events).toEqual(["seed", "launch A:start", "launch A:ready", "arm", "launch A:cleanup"]);
     expect(forceStopDesktop).not.toHaveBeenCalled();
   });
 });

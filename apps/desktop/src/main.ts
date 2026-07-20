@@ -328,9 +328,7 @@ let appSnapManager: DesktopAppSnapManager | null = null;
 let configuredGitHubUpdateSource: ReturnType<typeof resolveGitHubUpdateSource> = null;
 let configuredUpdaterCacheDirName: string | null = null;
 type DesktopMainWindowOpenReason = "bootstrap" | "activate" | "second-instance";
-let deferredMainWindowReopenReason:
-  | Exclude<DesktopMainWindowOpenReason, "bootstrap">
-  | null = null;
+let deferredMainWindowReopenReason: Exclude<DesktopMainWindowOpenReason, "bootstrap"> | null = null;
 const backendRestartController = new BackendRestartController({
   onRestartDue: (request) => {
     void launchScheduledBackendRestart(request);
@@ -1756,9 +1754,7 @@ function openDesktopMainWindowAgainstCurrentBackend(
   developmentMainWindowOpenInFlight = nextOpen;
 }
 
-function reopenDesktopMainWindow(
-  reason: Exclude<DesktopMainWindowOpenReason, "bootstrap">,
-): void {
+function reopenDesktopMainWindow(reason: Exclude<DesktopMainWindowOpenReason, "bootstrap">): void {
   const decision = resolveDesktopWindowReopenDecision({
     startupBlocked: desktopStartupBlockedForMigrationRecovery,
     isQuitting,
@@ -1772,9 +1768,7 @@ function reopenDesktopMainWindow(
   }
   if (decision === "defer") {
     deferredMainWindowReopenReason = reason;
-    writeDesktopLogHeader(
-      `${reason} main window reopen deferred until backend endpoint is ready`,
-    );
+    writeDesktopLogHeader(`${reason} main window reopen deferred until backend endpoint is ready`);
     return;
   }
 
