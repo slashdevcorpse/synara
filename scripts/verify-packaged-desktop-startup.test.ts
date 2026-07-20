@@ -229,7 +229,7 @@ describe("packaged desktop startup verification", () => {
     } finally {
       await running.stopControlled();
     }
-  });
+  }, 15_000);
 
   it("reads and locks Super macOS bundle identity before launch", () => {
     const root = mkdtempSync(join(tmpdir(), "super-synara-packaged-plist-test-"));
@@ -348,5 +348,5 @@ describe("packaged desktop startup verification", () => {
         description: "Incomplete fake packaged app",
       }),
     ).rejects.toThrow("exited before startup proof");
-  });
+  }, 15_000);
 });

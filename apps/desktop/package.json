@@ -10,7 +10,7 @@
     "build": "tsdown",
     "start": "bun run scripts/start-electron.mjs",
     "typecheck": "tsc --noEmit && tsc --noEmit --project e2e/tsconfig.json",
-    "test": "vitest run --passWithNoTests",
+    "test": "vitest run --maxWorkers=50% --passWithNoTests",
     "test:local-preview-security": "node scripts/local-preview-runtime-security-runner.mjs",
     "test:e2e": "playwright test --config e2e/playwright.config.ts",
     "smoke-test": "node scripts/smoke-test.mjs",

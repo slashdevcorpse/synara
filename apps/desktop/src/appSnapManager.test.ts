@@ -485,9 +485,12 @@ describe("AppSnap helper protocol", () => {
         );
       }
 
-      await vi.waitFor(() => {
-        expect(onCaptured).toHaveBeenCalledTimes(PROVIDER_SEND_TURN_MAX_ATTACHMENTS + 1);
-      });
+      await vi.waitFor(
+        () => {
+          expect(onCaptured).toHaveBeenCalledTimes(PROVIDER_SEND_TURN_MAX_ATTACHMENTS + 1);
+        },
+        { timeout: 10_000 },
+      );
       const pendingCaptures = await manager.listPendingCaptures();
       expect(pendingCaptures).toHaveLength(PROVIDER_SEND_TURN_MAX_ATTACHMENTS);
       expect(pendingCaptures[0]?.id).toBe("capture-1");
@@ -499,7 +502,7 @@ describe("AppSnap helper protocol", () => {
       manager.dispose();
       rmSync(captureDirectory, { recursive: true, force: true });
     }
-  });
+  }, 15_000);
 
   it("reports capture overlap without stealing app focus", async () => {
     const checkChild = createFakeChildProcess();

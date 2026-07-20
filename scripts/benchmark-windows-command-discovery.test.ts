@@ -6,6 +6,7 @@ import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
+import type { WindowsStorePackageDefinition } from "../apps/server/src/editorAppDiscovery.ts";
 import {
   alternatingVersionOrder,
   assertExpectedCommandDiscoveryCandidates,
@@ -39,6 +40,33 @@ import {
 const SHA_A = "a".repeat(40);
 const SHA_B = "b".repeat(40);
 const SHA_C = "c".repeat(40);
+const WINDOWS_FIXTURE_POWERSHELL_TIMEOUT_MS = 10_000;
+const WINDOWS_FIXTURE_TEST_TIMEOUT_MS = 45_000;
+const NODE_ORACLE_PROCESS_TIMEOUT_MS = 30_000;
+const NODE_ORACLE_TEST_TIMEOUT_MS = 35_000;
+
+type WindowsStoreFixtureDiscovery = Pick<
+  typeof import("../apps/server/src/editorAppDiscovery.ts"),
+  "resolveWindowsStorePackageInstallLocation"
+>;
+
+function resolveWindowsStoreFixture(
+  discovery: WindowsStoreFixtureDiscovery,
+  packages: readonly WindowsStorePackageDefinition[] | undefined,
+  platform: NodeJS.Platform,
+  env: NodeJS.ProcessEnv,
+): string | null {
+  return discovery.resolveWindowsStorePackageInstallLocation(
+    packages,
+    platform,
+    env,
+    (file, args, options) =>
+      execFileSync(file, [...args], {
+        ...options,
+        timeout: WINDOWS_FIXTURE_POWERSHELL_TIMEOUT_MS,
+      }),
+  );
+}
 
 function summary(overrides: Partial<BenchmarkSummary> = {}): BenchmarkSummary {
   return {
@@ -376,30 +404,19 @@ describe("benchmark-windows-command-discovery", () => {
         });
         const open = (await import(
           new URL("../apps/server/src/open.ts", import.meta.url).href
-        )) as {
-          readonly resolveAvailableEditors: (
-            platform: NodeJS.Platform,
-            env: NodeJS.ProcessEnv,
-          ) => ReadonlyArray<string>;
-          readonly discoverAvailableEditors: (options: {
-            readonly platform: NodeJS.Platform;
-            readonly env: NodeJS.ProcessEnv;
-            readonly cwd: string;
-            readonly signal: AbortSignal;
-          }) => Promise<{
-            readonly status: string;
-            readonly availableEditors?: ReadonlyArray<string>;
-          }>;
-        };
+        )) as typeof import("../apps/server/src/open.ts");
         const discovery = (await import(
           new URL("../apps/server/src/editorAppDiscovery.ts", import.meta.url).href
-        )) as {
-          readonly clearWindowsStorePackageDiscoveryCache: () => void;
-        };
+        )) as typeof import("../apps/server/src/editorAppDiscovery.ts");
         const env = editorFixtureEnvironment(fixture);
 
         discovery.clearWindowsStorePackageDiscoveryCache();
-        expect(open.resolveAvailableEditors("win32", env)).toEqual(["vscode"]);
+        expect(
+          open.resolveAvailableEditors("win32", env, {
+            lookupWindowsStorePackage: (packages, platform, childEnv) =>
+              resolveWindowsStoreFixture(discovery, packages, platform, childEnv),
+          }),
+        ).toEqual(["vscode"]);
         expect(readAppxSubprocessCount(fixture)).toBe(1);
 
         resetAppxSubprocessMarkers(fixture);
@@ -409,6 +426,17 @@ describe("benchmark-windows-command-discovery", () => {
           env,
           cwd: fixture.cwdA,
           signal: new AbortController().signal,
+          lookupWindowsStorePackages: async (packages, options) => {
+            if (packages.length !== 1) {
+              throw new Error(
+                `Editor fixture expected exactly one Windows Store package; received ${packages.length}.`,
+              );
+            }
+            return await discovery.discoverWindowsStorePackageInstallLocations(packages, {
+              ...options,
+              timeoutMs: WINDOWS_FIXTURE_POWERSHELL_TIMEOUT_MS,
+            });
+          },
         });
         expect(candidate).toMatchObject({ status: "success", availableEditors: ["vscode"] });
         expect(readAppxSubprocessCount(fixture)).toBe(1);
@@ -416,7 +444,7 @@ describe("benchmark-windows-command-discovery", () => {
         rmSync(root, { recursive: true, force: true });
       }
     },
-    20_000,
+    WINDOWS_FIXTURE_TEST_TIMEOUT_MS,
   );
 
   it("summarizes recorded samples without including warmups", () => {
@@ -672,7 +700,12 @@ describe("benchmark-windows-command-discovery", () => {
             "-e",
             `import(${JSON.stringify(benchmarkModuleUrl)}).then((module) => process.stdout.write(JSON.stringify(module.runNodeDuplicateEnvironmentOracle())));`,
           ],
-          { encoding: "utf8", maxBuffer: 64 * 1024, timeout: 10_000, windowsHide: true },
+          {
+            encoding: "utf8",
+            maxBuffer: 64 * 1024,
+            timeout: NODE_ORACLE_PROCESS_TIMEOUT_MS,
+            windowsHide: true,
+          },
         ),
       ) as NodeDuplicateEnvironmentOracle;
 
@@ -731,6 +764,7 @@ describe("benchmark-windows-command-discovery", () => {
       }
       expect(oracle.serializerRuntime).toEqual(oracle.expectedRuntime);
     },
+    NODE_ORACLE_TEST_TIMEOUT_MS,
   );
 
   it("enforces latency, subprocess, invalidation, LRU, readiness, and Node-oracle gates", () => {

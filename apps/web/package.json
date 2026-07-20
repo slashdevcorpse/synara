@@ -8,7 +8,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run --passWithNoTests",
+    "test": "vitest run --maxWorkers=50% --passWithNoTests",
     "test:browser": "vitest run --config vitest.browser.config.ts",
     "test:browser:stable": "vitest run --config vitest.browser.stable.config.ts",
     "test:browser:geometry": "vitest run --config vitest.browser.geometry.config.ts",

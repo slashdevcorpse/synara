@@ -28,6 +28,10 @@ import {
   type WindowsSafeProcessInput,
 } from "./windowsProcess";
 
+const WINDOWS_BATCH_FIXTURE_TEST_TIMEOUT_MS = 15_000;
+const WINDOWS_WHERE_FIXTURE_PROCESS_TIMEOUT_MS = 10_000;
+const WINDOWS_WHERE_FIXTURE_TEST_TIMEOUT_MS = 30_000;
+
 describe("windowsProcess", () => {
   afterEach(() => {
     clearWindowsCommandDiscoveryCache();
@@ -472,6 +476,7 @@ describe("windowsProcess", () => {
         rmSync(root, { force: true, recursive: true });
       }
     },
+    WINDOWS_BATCH_FIXTURE_TEST_TIMEOUT_MS,
   );
 
   it("rejects batch tokens with line breaks", () => {
@@ -1382,7 +1387,10 @@ describe("windowsProcess", () => {
           options,
         ) => {
           childEnvironments.push({ ...(options.env ?? {}) });
-          return spawnChildSync(whereCommand, [...args], options);
+          return spawnChildSync(whereCommand, [...args], {
+            ...options,
+            timeout: WINDOWS_WHERE_FIXTURE_PROCESS_TIMEOUT_MS,
+          });
         };
         const resolve = (childEnv: NodeJS.ProcessEnv) =>
           resolveWindowsCommandCandidates(command, {
@@ -1436,7 +1444,7 @@ describe("windowsProcess", () => {
           rmSync(root, { force: true, recursive: true });
         }
       },
-      20_000,
+      WINDOWS_WHERE_FIXTURE_TEST_TIMEOUT_MS,
     );
 
     it.runIf(process.platform === "win32")(

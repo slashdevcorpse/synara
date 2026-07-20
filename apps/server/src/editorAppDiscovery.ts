@@ -94,6 +94,7 @@ export interface WindowsStoreBulkLookupOptions {
   readonly env?: NodeJS.ProcessEnv;
   readonly signal?: AbortSignal;
   readonly spawnProcess?: SpawnWindowsStorePowerShell;
+  readonly timeoutMs?: number;
 }
 
 export function getEditorMacApplications(editor: EditorDefinition): readonly string[] | undefined {
@@ -511,7 +512,7 @@ export async function discoverWindowsStorePackageInstallLocations(
     };
     deadline = setTimeout(
       () => requestTermination("timeout"),
-      WINDOWS_STORE_BULK_LOOKUP_TIMEOUT_MS,
+      options.timeoutMs ?? WINDOWS_STORE_BULK_LOOKUP_TIMEOUT_MS,
     );
     deadline.unref();
 
