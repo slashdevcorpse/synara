@@ -300,10 +300,13 @@ export function createProcessTreeKiller(
         }
       }
       if (includeRootTree) {
-        deps.signalTree(rootPid, signal, (err) => {
-          if (err) {
-            onError(err, { pid: rootPid, source: "tree-kill" });
-          }
+        await new Promise<void>((resolve) => {
+          deps.signalTree(rootPid, signal, (err) => {
+            if (err) {
+              onError(err, { pid: rootPid, source: "tree-kill" });
+            }
+            resolve();
+          });
         });
       }
     },

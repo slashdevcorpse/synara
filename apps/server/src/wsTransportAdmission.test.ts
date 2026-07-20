@@ -120,6 +120,25 @@ describe("WebSocket transport admission", () => {
     expect(admission.admitMessage()).toEqual({ admitted: true });
   });
 
+  it("preserves the WebSocket bucket clock policy across a clock rollback", () => {
+    let nowMs = 1_000;
+    const admission = makeWsMessageAdmission({
+      now: () => nowMs,
+      messageBurstPerConnection: 1,
+      messageRatePerSecondPerConnection: 1,
+    });
+
+    expect(admission.admitMessage()).toEqual({ admitted: true });
+    expect(admission.admitMessage()).toEqual({ admitted: false, retryAfterMs: 1_000 });
+
+    nowMs = 0;
+    expect(admission.admitMessage()).toEqual({ admitted: false, retryAfterMs: 1_000 });
+    nowMs = 500;
+    expect(admission.admitMessage()).toEqual({ admitted: false, retryAfterMs: 500 });
+    nowMs = 1_000;
+    expect(admission.admitMessage()).toEqual({ admitted: true });
+  });
+
   it("keeps terminal ACK admission independent and strictly bounded", () => {
     const admission = makeWsMessageAdmission({
       now: () => 0,

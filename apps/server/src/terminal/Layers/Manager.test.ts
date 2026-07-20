@@ -1950,6 +1950,39 @@ describe("TerminalManager", () => {
     expect(process.killSignals).toContain("SIGKILL");
   });
 
+  it("keeps sessions addressable until asynchronous shutdown stops settle", async () => {
+    const capturedTree = deferred<{
+      descendants: Array<{ pid: number; command: string }>;
+      captureComplete: boolean;
+    }>();
+    const treeSignals: Array<{ signal: string; includeRootTree: boolean | undefined }> = [];
+    const processTreeKiller: ProcessTreeKiller = {
+      capture: () => capturedTree.promise,
+      signal: ({ signal, includeRootTree }) => {
+        treeSignals.push({ signal, includeRootTree });
+      },
+    };
+    const { manager, ptyAdapter } = makeManager(5, { processTreeKiller });
+    await manager.open(openInput());
+    const process = ptyAdapter.processes[0];
+    expect(process).toBeDefined();
+    if (!process) return;
+    const sessions = (manager as unknown as { sessions: Map<string, unknown> }).sessions;
+
+    const shutdown = manager.disposeForShutdown();
+
+    expect(sessions.size).toBe(1);
+    process.emitExit({ exitCode: 0, signal: 15 });
+    expect(sessions.size).toBe(1);
+
+    capturedTree.resolve({ descendants: [], captureComplete: true });
+    await shutdown;
+
+    expect(treeSignals).toEqual([{ signal: "SIGTERM", includeRootTree: false }]);
+    expect(process.killSignals).toEqual([]);
+    expect(sessions.size).toBe(0);
+  });
+
   it("flushes pending output before shutdown removes terminal event clocks", async () => {
     const { manager, ptyAdapter } = makeManager(5, { processKillGraceMs: 10 });
     const events: TerminalEvent[] = [];

@@ -258,6 +258,47 @@ describe("processTreeKiller", () => {
     expect(signaledPids).toEqual([103, 102]);
   });
 
+  it("waits for root tree signaling while preserving callback error reporting", async () => {
+    const treeKillError = new Error("tree kill failed");
+    const errors: Array<{
+      error: Error;
+      context: { pid: number; source: "tree-kill" | "captured" };
+    }> = [];
+    let completeSignalTree: ((error?: Error | null) => void) | undefined;
+    const killer = createProcessTreeKiller({
+      platform: "linux",
+      signalTree: (_rootPid, _signal, callback) => {
+        completeSignalTree = callback;
+      },
+    });
+
+    let settled = false;
+    const signaling = Promise.resolve(
+      killer.signal({
+        rootPid: 100,
+        signal: "SIGTERM",
+        tree: { descendants: [] },
+        onError: (error, context) => errors.push({ error, context }),
+      }),
+    ).then(() => {
+      settled = true;
+    });
+
+    await Promise.resolve();
+    expect(completeSignalTree).toBeTypeOf("function");
+    expect(settled).toBe(false);
+    completeSignalTree?.(treeKillError);
+    await signaling;
+
+    expect(settled).toBe(true);
+    expect(errors).toEqual([
+      {
+        error: treeKillError,
+        context: { pid: 100, source: "tree-kill" },
+      },
+    ]);
+  });
+
   it("can skip root tree signaling while still signaling captured children", async () => {
     const signaledPids: number[] = [];
     const treeSignals: number[] = [];

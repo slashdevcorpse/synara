@@ -2,6 +2,12 @@ import * as Crypto from "node:crypto";
 
 import { WS_METHODS } from "@synara/contracts";
 
+import {
+  admissionRetryAfterMs,
+  type AdmissionTokenBucket,
+  normalizeAdmissionPositiveInteger,
+  refillAdmissionTokenBucket,
+} from "./admissionTokenBucket";
 import { normalizePeerAddress } from "./peerAddress";
 
 export const MAX_CONCURRENT_WS_CONNECTIONS = 50;
@@ -26,12 +32,6 @@ export interface WsTransportAdmissionOptions {
 
 export type WsMessageClass = "standard" | "terminal-ack";
 
-interface TokenBucket {
-  readonly tokens: number;
-  readonly refilledAtMs: number;
-  readonly lastSeenAtMs: number;
-}
-
 export interface WsConnectionLease {
   readonly id: string;
   readonly peer: string;
@@ -44,12 +44,6 @@ export type WsConnectionAdmissionOutcome =
       readonly reason: "global-capacity" | "peer-rate";
       readonly retryAfterMs: number;
     };
-
-function normalizePositiveInteger(value: number | undefined, fallback: number): number {
-  return Number.isFinite(value) && value !== undefined && value > 0
-    ? Math.max(1, Math.floor(value))
-    : fallback;
-}
 
 export const normalizeWsPeerAddress = normalizePeerAddress;
 
@@ -158,45 +152,24 @@ export function classifyWsMessage(data: unknown, isBinary: unknown): WsMessageCl
   return "terminal-ack";
 }
 
-function refillBucket(input: {
-  readonly bucket: TokenBucket | undefined;
-  readonly nowMs: number;
-  readonly capacity: number;
-  readonly refillPerMs: number;
-}): TokenBucket {
-  if (!input.bucket) {
-    return {
-      tokens: input.capacity,
-      refilledAtMs: input.nowMs,
-      lastSeenAtMs: input.nowMs,
-    };
-  }
-  const elapsedMs = Math.max(0, input.nowMs - input.bucket.refilledAtMs);
-  return {
-    tokens: Math.min(input.capacity, input.bucket.tokens + elapsedMs * input.refillPerMs),
-    refilledAtMs: input.nowMs,
-    lastSeenAtMs: input.nowMs,
-  };
-}
-
 export function makeWsTransportAdmission(options: WsTransportAdmissionOptions = {}) {
   const now = options.now ?? Date.now;
-  const maxConcurrentConnections = normalizePositiveInteger(
+  const maxConcurrentConnections = normalizeAdmissionPositiveInteger(
     options.maxConcurrentConnections,
     MAX_CONCURRENT_WS_CONNECTIONS,
   );
-  const connectionBurstPerPeer = normalizePositiveInteger(
+  const connectionBurstPerPeer = normalizeAdmissionPositiveInteger(
     options.connectionBurstPerPeer,
     MAX_WS_CONNECTIONS_PER_MINUTE_PER_PEER,
   );
-  const connectionRatePerMinutePerPeer = normalizePositiveInteger(
+  const connectionRatePerMinutePerPeer = normalizeAdmissionPositiveInteger(
     options.connectionRatePerMinutePerPeer,
     MAX_WS_CONNECTIONS_PER_MINUTE_PER_PEER,
   );
   const connectionPeerRateLimitEnabled = options.connectionPeerRateLimitEnabled ?? true;
   const connectionRefillPerMs = connectionRatePerMinutePerPeer / 60_000;
   const activeLeases = new Map<string, WsConnectionLease>();
-  const peerBuckets = new Map<string, TokenBucket>();
+  const peerBuckets = new Map<string, AdmissionTokenBucket>();
 
   const pruneIdlePeerBuckets = (nowMs: number): void => {
     const fullyRefilledAfterMs = Math.ceil(connectionBurstPerPeer / connectionRefillPerMs);
@@ -216,7 +189,7 @@ export function makeWsTransportAdmission(options: WsTransportAdmissionOptions = 
     if (connectionPeerRateLimitEnabled) {
       const nowMs = now();
       pruneIdlePeerBuckets(nowMs);
-      const bucket = refillBucket({
+      const bucket = refillAdmissionTokenBucket({
         bucket: peerBuckets.get(peer),
         nowMs,
         capacity: connectionBurstPerPeer,
@@ -227,7 +200,7 @@ export function makeWsTransportAdmission(options: WsTransportAdmissionOptions = 
         return {
           admitted: false,
           reason: "peer-rate",
-          retryAfterMs: Math.max(1, Math.ceil((1 - bucket.tokens) / connectionRefillPerMs)),
+          retryAfterMs: admissionRetryAfterMs(bucket.tokens, connectionRefillPerMs),
         };
       }
       peerBuckets.set(peer, { ...bucket, tokens: bucket.tokens - 1 });
@@ -252,26 +225,26 @@ export function makeWsTransportAdmission(options: WsTransportAdmissionOptions = 
 
 export function makeWsMessageAdmission(options: WsTransportAdmissionOptions = {}) {
   const now = options.now ?? Date.now;
-  const standardCapacity = normalizePositiveInteger(
+  const standardCapacity = normalizeAdmissionPositiveInteger(
     options.messageBurstPerConnection,
     WS_MESSAGE_RATE_BURST,
   );
   const standardRefillPerMs =
-    normalizePositiveInteger(
+    normalizeAdmissionPositiveInteger(
       options.messageRatePerSecondPerConnection,
       WS_MESSAGE_RATE_PER_SECOND,
     ) / 1_000;
-  const terminalAckCapacity = normalizePositiveInteger(
+  const terminalAckCapacity = normalizeAdmissionPositiveInteger(
     options.terminalAckMessageBurstPerConnection,
     WS_TERMINAL_ACK_MESSAGE_RATE_BURST,
   );
   const terminalAckRefillPerMs =
-    normalizePositiveInteger(
+    normalizeAdmissionPositiveInteger(
       options.terminalAckMessageRatePerSecondPerConnection,
       WS_TERMINAL_ACK_MESSAGE_RATE_PER_SECOND,
     ) / 1_000;
-  let standardBucket: TokenBucket | undefined;
-  let terminalAckBucket: TokenBucket | undefined;
+  let standardBucket: AdmissionTokenBucket | undefined;
+  let terminalAckBucket: AdmissionTokenBucket | undefined;
 
   const admitMessage = (
     messageClass: WsMessageClass = "standard",
@@ -280,7 +253,7 @@ export function makeWsMessageAdmission(options: WsTransportAdmissionOptions = {}
     const terminalAck = messageClass === "terminal-ack";
     const capacity = terminalAck ? terminalAckCapacity : standardCapacity;
     const refillPerMs = terminalAck ? terminalAckRefillPerMs : standardRefillPerMs;
-    let bucket = refillBucket({
+    let bucket = refillAdmissionTokenBucket({
       bucket: terminalAck ? terminalAckBucket : standardBucket,
       nowMs,
       capacity,
@@ -291,7 +264,7 @@ export function makeWsMessageAdmission(options: WsTransportAdmissionOptions = {}
       else standardBucket = bucket;
       return {
         admitted: false,
-        retryAfterMs: Math.max(1, Math.ceil((1 - bucket.tokens) / refillPerMs)),
+        retryAfterMs: admissionRetryAfterMs(bucket.tokens, refillPerMs),
       };
     }
     bucket = { ...bucket, tokens: bucket.tokens - 1 };

@@ -25,6 +25,7 @@ import {
   TurnId,
 } from "@synara/contracts";
 import { decodeOutboundJson, decodeOutboundText, outboundHttp } from "@synara/shared/outboundHttp";
+import type { WindowsSafeProcessCommand } from "@synara/shared/windowsProcess";
 import {
   Cause,
   DateTime,
@@ -188,6 +189,18 @@ function mapGrokModelDiscoveryError(cause: unknown): ProviderAdapterRequestError
     method: "model/list",
     detail: cause instanceof Error ? cause.message : String(cause),
     cause,
+  });
+}
+
+export function makeGrokModelListChildProcess(
+  prepared: WindowsSafeProcessCommand,
+  env: NodeJS.ProcessEnv,
+): ChildProcess.StandardCommand {
+  return ChildProcess.make(prepared.command, prepared.args, {
+    shell: prepared.shell,
+    ...(prepared.windowsHide ? { windowsHide: true } : {}),
+    ...(prepared.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
+    env,
   });
 }
 
@@ -2214,11 +2227,7 @@ export function makeGrokAdapter(
             env: childEnv,
           });
           const child = yield* childProcessSpawner.spawn(
-            ChildProcess.make(prepared.command, prepared.args, {
-              shell: prepared.shell,
-              ...(prepared.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
-              env: childEnv,
-            }),
+            makeGrokModelListChildProcess(prepared, childEnv),
           );
           const [stdout, stderr, exitCode] = yield* Effect.all(
             [

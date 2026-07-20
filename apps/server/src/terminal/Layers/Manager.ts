@@ -1601,11 +1601,11 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
       this.flushOutputBuffer(session);
     }
     for (const session of sessions) {
-      // stopProcess synchronously detaches PTY callbacks before returning its
-      // asynchronous escalation promise, so no output can race the map clear.
+      // stopProcess synchronously detaches the session's PTY callbacks, while
+      // process-tree capture and the escalation-only exit listener can continue
+      // asynchronously until the returned promise settles.
       processStops.push(this.stopProcess(session));
     }
-    this.sessions.clear();
     for (const timer of this.persistTimers.values()) {
       clearTimeout(timer);
     }
@@ -1614,6 +1614,7 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
     this.threadLocks.clear();
     this.persistQueues.clear();
     await Promise.all(processStops);
+    this.sessions.clear();
     if (!options.keepEscalationTimers) {
       this.clearAllKillEscalationTimers();
     }

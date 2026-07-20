@@ -1,3 +1,9 @@
+import {
+  admissionRetryAfterMs,
+  type AdmissionTokenBucket,
+  normalizeAdmissionPositiveInteger,
+  refillAdmissionTokenBucket,
+} from "./admissionTokenBucket";
 import { normalizePeerAddress } from "./peerAddress";
 
 export const MAX_UPLOADS_PER_MINUTE_PER_PRINCIPAL = 20;
@@ -6,15 +12,9 @@ export const UPLOAD_ADMISSION_IDLE_KEY_TTL_MS = 2 * 60_000;
 export const MAX_TRACKED_UPLOAD_PRINCIPALS = 4_096;
 export const MAX_TRACKED_UPLOAD_PEERS = 4_096;
 
-interface TokenBucket {
-  readonly tokens: number;
-  readonly refilledAtMs: number;
-  readonly lastSeenAtMs: number;
-}
-
 interface BucketSlot {
-  readonly bucket: TokenBucket | undefined;
-  readonly commit: (bucket: TokenBucket) => void;
+  readonly bucket: AdmissionTokenBucket | undefined;
+  readonly commit: (bucket: AdmissionTokenBucket) => void;
 }
 
 export interface UploadAdmissionOptions {
@@ -41,36 +41,14 @@ export type UploadAdmissionOutcome =
       readonly retryAfterMs: number;
     };
 
-function positiveInteger(value: number | undefined, fallback: number): number {
-  return Number.isFinite(value) && value !== undefined && value > 0
-    ? Math.max(1, Math.floor(value))
-    : fallback;
-}
-
 function refillBucket(input: {
-  readonly bucket: TokenBucket | undefined;
+  readonly bucket: AdmissionTokenBucket | undefined;
   readonly nowMs: number;
   readonly capacity: number;
   readonly refillPerMs: number;
-}): TokenBucket {
-  if (!input.bucket) {
-    return {
-      tokens: input.capacity,
-      refilledAtMs: input.nowMs,
-      lastSeenAtMs: input.nowMs,
-    };
-  }
-  const effectiveNowMs = Math.max(input.nowMs, input.bucket.refilledAtMs);
-  const elapsedMs = effectiveNowMs - input.bucket.refilledAtMs;
-  return {
-    tokens: Math.min(input.capacity, input.bucket.tokens + elapsedMs * input.refillPerMs),
-    refilledAtMs: effectiveNowMs,
-    lastSeenAtMs: effectiveNowMs,
-  };
-}
-
-function retryAfterMs(tokens: number, refillPerMs: number): number {
-  return Math.max(1, Math.ceil((1 - tokens) / refillPerMs));
+}): AdmissionTokenBucket {
+  const effectiveNowMs = Math.max(input.nowMs, input.bucket?.refilledAtMs ?? input.nowMs);
+  return refillAdmissionTokenBucket({ ...input, nowMs: effectiveNowMs });
 }
 
 export const normalizeUploadPeerAddress = normalizePeerAddress;
@@ -82,11 +60,11 @@ function normalizePrincipalKey(principalKey: string): string {
 
 export function makeUploadAdmission(options: UploadAdmissionOptions = {}) {
   const now = options.now ?? Date.now;
-  const principalCapacity = positiveInteger(
+  const principalCapacity = normalizeAdmissionPositiveInteger(
     options.uploadsPerMinutePerPrincipal,
     MAX_UPLOADS_PER_MINUTE_PER_PRINCIPAL,
   );
-  const peerCapacity = positiveInteger(
+  const peerCapacity = normalizeAdmissionPositiveInteger(
     options.uploadsPerMinutePerPeer,
     MAX_UPLOADS_PER_MINUTE_PER_PEER,
   );
@@ -94,18 +72,21 @@ export function makeUploadAdmission(options: UploadAdmissionOptions = {}) {
   const peerRefillPerMs = peerCapacity / 60_000;
   const idleKeyTtlMs = Math.max(
     60_000,
-    positiveInteger(options.idleKeyTtlMs, UPLOAD_ADMISSION_IDLE_KEY_TTL_MS),
+    normalizeAdmissionPositiveInteger(options.idleKeyTtlMs, UPLOAD_ADMISSION_IDLE_KEY_TTL_MS),
   );
-  const maxTrackedPrincipals = positiveInteger(
+  const maxTrackedPrincipals = normalizeAdmissionPositiveInteger(
     options.maxTrackedPrincipals,
     MAX_TRACKED_UPLOAD_PRINCIPALS,
   );
-  const maxTrackedPeers = positiveInteger(options.maxTrackedPeers, MAX_TRACKED_UPLOAD_PEERS);
+  const maxTrackedPeers = normalizeAdmissionPositiveInteger(
+    options.maxTrackedPeers,
+    MAX_TRACKED_UPLOAD_PEERS,
+  );
 
-  const principalBuckets = new Map<string, TokenBucket>();
-  const peerBuckets = new Map<string, TokenBucket>();
-  let overflowPrincipalBucket: TokenBucket | undefined;
-  let overflowPeerBucket: TokenBucket | undefined;
+  const principalBuckets = new Map<string, AdmissionTokenBucket>();
+  const peerBuckets = new Map<string, AdmissionTokenBucket>();
+  let overflowPrincipalBucket: AdmissionTokenBucket | undefined;
+  let overflowPeerBucket: AdmissionTokenBucket | undefined;
   let nextPruneAtMs = 0;
 
   const pruneIdleKeys = (nowMs: number): void => {
@@ -188,10 +169,10 @@ export function makeUploadAdmission(options: UploadAdmissionOptions = {}) {
       principal.commit(principalBucket);
       if (peer && peerBucket) peer.commit(peerBucket);
       const principalRetryAfter = principalRejected
-        ? retryAfterMs(principalBucket.tokens, principalRefillPerMs)
+        ? admissionRetryAfterMs(principalBucket.tokens, principalRefillPerMs)
         : 0;
       const peerRetryAfter =
-        peerRejected && peerBucket ? retryAfterMs(peerBucket.tokens, peerRefillPerMs) : 0;
+        peerRejected && peerBucket ? admissionRetryAfterMs(peerBucket.tokens, peerRefillPerMs) : 0;
       return {
         admitted: false,
         reason: principalRejected ? "principal-rate" : "peer-rate",

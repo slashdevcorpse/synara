@@ -3608,6 +3608,20 @@ function readCodexProviderOptions(input: CodexAppServerStartSessionInput): {
   };
 }
 
+export function formatCodexCliVersionCheckFailure(input: {
+  readonly binaryPath: string;
+  readonly status: number | null;
+  readonly stdout: string;
+  readonly stderr: string;
+}): string {
+  if (input.status === 241 && /(?:^|\s)stage=target(?:\s|$)/iu.test(input.stderr)) {
+    return `Codex CLI (${input.binaryPath}) is not installed or not executable.`;
+  }
+  const detail =
+    input.stderr.trim() || input.stdout.trim() || `Command exited with code ${input.status}.`;
+  return `Codex CLI version check failed. ${detail}`;
+}
+
 async function assertSupportedCodexCliVersion(input: {
   readonly binaryPath: string;
   readonly cwd: string;
@@ -3646,8 +3660,14 @@ async function assertSupportedCodexCliVersion(input: {
   const stdout = result.stdout ?? "";
   const stderr = result.stderr ?? "";
   if (result.status !== 0) {
-    const detail = stderr.trim() || stdout.trim() || `Command exited with code ${result.status}.`;
-    throw new Error(`Codex CLI version check failed. ${detail}`);
+    throw new Error(
+      formatCodexCliVersionCheckFailure({
+        binaryPath: input.binaryPath,
+        status: result.status,
+        stdout,
+        stderr,
+      }),
+    );
   }
 
   const parsedVersion = parseCodexCliVersion(`${stdout}\n${stderr}`);

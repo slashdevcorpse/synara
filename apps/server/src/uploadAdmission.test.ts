@@ -168,4 +168,35 @@ describe("upload admission", () => {
       usingOverflowPeerBucket: false,
     });
   });
+
+  it("preserves its monotonic clock policy while rejecting and refilling", () => {
+    let nowMs = 1_000;
+    const admission = makeUploadAdmission({
+      now: () => nowMs,
+      uploadsPerMinutePerPrincipal: 1,
+      uploadsPerMinutePerPeer: 10,
+    });
+    const input = {
+      principalKey: "session:owner",
+      remoteAddress: "127.0.0.1",
+      rateLimitPeer: false,
+    } as const;
+
+    expect(admission.admit(input)).toEqual({ admitted: true });
+    expect(admission.admit(input)).toEqual({
+      admitted: false,
+      reason: "principal-rate",
+      retryAfterMs: 60_000,
+    });
+
+    nowMs = 0;
+    expect(admission.admit(input)).toEqual({
+      admitted: false,
+      reason: "principal-rate",
+      retryAfterMs: 60_000,
+    });
+
+    nowMs = 61_000;
+    expect(admission.admit(input)).toEqual({ admitted: true });
+  });
 });
