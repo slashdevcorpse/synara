@@ -24,6 +24,7 @@ import {
   resolveWindowsComSpec,
   resolveWindowsSystemRoot,
   type WindowsCommandDiscoveryObservation,
+  type WindowsSafeProcessInput,
 } from "./windowsProcess";
 
 describe("windowsProcess", () => {
@@ -1369,12 +1370,12 @@ describe("windowsProcess", () => {
         const cache = createWindowsCommandDiscoveryCache();
         const observations: WindowsCommandDiscoveryObservation[] = [];
         const childEnvironments: NodeJS.ProcessEnv[] = [];
-        const spawnSync = (
-          whereCommand: string,
-          args: ReadonlyArray<string>,
-          options: Parameters<typeof spawnChildSync>[2],
+        const spawnSync: NonNullable<WindowsSafeProcessInput["spawnSync"]> = (
+          whereCommand,
+          args,
+          options,
         ) => {
-          childEnvironments.push({ ...(options?.env ?? {}) });
+          childEnvironments.push({ ...(options.env ?? {}) });
           return spawnChildSync(whereCommand, [...args], options);
         };
         const resolve = (childEnv: NodeJS.ProcessEnv) =>
