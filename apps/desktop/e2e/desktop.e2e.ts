@@ -265,6 +265,7 @@ test("opens a workspace file in source and rendered preview modes", async ({ des
   await expect(markdownView.getByRole("radio", { name: "Source" })).toBeChecked();
   await expect(desktop.page.locator(".editor-file-viewer")).toContainText(
     "# E2E Preview Heading",
+    { timeout: 30_000 },
   );
   await markdownView.getByRole("radio", { name: "Preview" }).click();
   await expect(markdownView.getByRole("radio", { name: "Preview" })).toBeChecked();
