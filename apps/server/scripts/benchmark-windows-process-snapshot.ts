@@ -9,7 +9,7 @@ import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
 
 import { runProcess } from "../src/processRunner";
-import { inspectSubprocessActivity } from "../src/terminal/Layers/Manager";
+import { inspectSubprocessActivity } from "../src/terminal/subprocessActivity";
 import { captureWindowsProcessSnapshot } from "../src/terminal/windowsProcessSnapshot";
 
 const ACTIVATION_BASE_SHA = "760f4f0679660e122477046f89d3a8b315e42f79";

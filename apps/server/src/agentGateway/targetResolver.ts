@@ -87,6 +87,10 @@ type ProviderTargetOptionKey<P extends ProviderKind> = keyof NonNullable<
 > &
   string;
 
+type ProviderPrimaryOptionKey<P extends ProviderKind> = [ProviderTargetOptionKey<P>] extends [never]
+  ? "model"
+  : ProviderTargetOptionKey<P>;
+
 type ProviderOptionValidation =
   | { readonly kind: "effort" }
   | {
@@ -110,7 +114,7 @@ type ProviderTargetOptionRuleRegistry<P extends ProviderKind> = {
 };
 
 interface ProviderTargetOptionConfigInput<P extends ProviderKind> {
-  readonly primaryOptionKey: ProviderTargetOptionKey<P>;
+  readonly primaryOptionKey: ProviderPrimaryOptionKey<P>;
   readonly options: ProviderTargetOptionRuleRegistry<P>;
 }
 
@@ -155,6 +159,10 @@ const PROVIDER_TARGET_OPTION_RULES = {
         validation: { kind: "boolean-capability", capability: "supportsFastMode" },
       }),
     },
+  }),
+  commandCode: defineProviderOptionConfig<"commandCode">({
+    primaryOptionKey: "model",
+    options: {},
   }),
   cursor: defineProviderOptionConfig<"cursor">({
     primaryOptionKey: "reasoningEffort",

@@ -53,6 +53,26 @@ function makeVariantDescriptor(slug: string): ProviderModelDescriptor {
 }
 
 describe("agent gateway target resolver", () => {
+  it("builds model-only guidance for Command Code", () => {
+    const guidance = agentGatewayTargetOptionGuidance({
+      provider: "commandCode",
+      defaultModel: "openai/gpt-5.6-sol",
+      enabled: true,
+      available: true,
+      models: [{ slug: "openai/gpt-5.6-sol", name: "GPT-5.6 Sol" }],
+    });
+
+    assert.equal(guidance.primaryOptionKey, "model");
+    assert.deepEqual(guidance.alternativeOptionKeys, []);
+    assert.deepEqual(guidance.providerOptions, []);
+    assert.deepEqual(guidance.optionsByModel, { "openai/gpt-5.6-sol": [] });
+    assert.deepEqual(guidance.exampleTarget, {
+      provider: "commandCode",
+      model: "openai/gpt-5.6-sol",
+      options: {},
+    });
+  });
+
   it.effect("builds examples from the exact model restrictions and preserves option types", () =>
     Effect.gen(function* () {
       const codexCatalog = {
