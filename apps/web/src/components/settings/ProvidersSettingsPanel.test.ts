@@ -14,6 +14,7 @@ describe("isProviderInstallSettingsDirty", () => {
     const dirtyPatches = [
       { codexBinaryPath: "/opt/codex" },
       { codexHomePath: "/tmp/codex-home" },
+      { commandCodeBinaryPath: "/opt/commandcode" },
       { claudeBinaryPath: "/opt/claude" },
       { cursorBinaryPath: "/opt/cursor" },
       { cursorApiEndpoint: "https://cursor.example" },
@@ -65,6 +66,7 @@ describe("createProviderInstallResetPatch", () => {
         "claudeBinaryPath",
         "codexBinaryPath",
         "codexHomePath",
+        "commandCodeBinaryPath",
         "cursorApiEndpoint",
         "cursorBinaryPath",
         "droidBinaryPath",

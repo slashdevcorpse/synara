@@ -106,6 +106,7 @@ const harness = vi.hoisted(() => ({
 vi.mock("react", () => ({
   useCallback: reactHarness.useCallback,
   useEffect: reactHarness.useEffect,
+  useLayoutEffect: reactHarness.useEffect,
   useMemo: reactHarness.useMemo,
   useRef: reactHarness.useRef,
   useState: reactHarness.useState,
@@ -412,6 +413,92 @@ describe("useSidebarThreadActions", () => {
     expect(harness.navigate).toHaveBeenCalledWith(
       expect.objectContaining({ params: { threadId: FALLBACK_ID }, replace: true }),
     );
+  });
+
+  it("does not overwrite a route change that finishes during an archive", async () => {
+    let releaseArchive!: () => void;
+    harness.archiveThread.mockImplementation(
+      () => new Promise<void>((resolve) => (releaseArchive = resolve)),
+    );
+    const controller = render({ routeThreadId: THREAD_ID });
+
+    const pending = controller.archiveThread(THREAD_ID);
+    await vi.waitFor(() => expect(harness.archiveThread).toHaveBeenCalledOnce());
+    render({ routeThreadId: FALLBACK_ID });
+    releaseArchive();
+
+    await expect(pending).resolves.toBe(true);
+    expect(harness.navigate).not.toHaveBeenCalled();
+    expect(harness.handleNewChat).not.toHaveBeenCalled();
+  });
+
+  it("keeps the Undo affordance when fallback navigation fails after archiving", async () => {
+    const navigationError = new Error("fallback navigation failed");
+    harness.navigate.mockRejectedValue(navigationError);
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    try {
+      await render({ routeThreadId: THREAD_ID }).archiveThreadWithUndo(THREAD_ID);
+    } finally {
+      consoleError.mockRestore();
+    }
+
+    expect(harness.toast).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ archiveUndo: expect.anything() }),
+      }),
+    );
+    expect(harness.toast).toHaveBeenCalledWith({
+      type: "warning",
+      title: "Thread archived; navigation failed",
+      description: navigationError.message,
+    });
+  });
+
+  it("removes only successfully archived project threads from selection", async () => {
+    harness.archiveThread
+      .mockRejectedValueOnce(new Error("first archive failed"))
+      .mockResolvedValueOnce(undefined);
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    try {
+      await render().archiveAllThreadsInProject(PROJECT_ID);
+    } finally {
+      consoleError.mockRestore();
+    }
+
+    expect(harness.archiveThread).toHaveBeenCalledTimes(2);
+    expect(harness.removeFromSelection).toHaveBeenCalledWith([FALLBACK_ID]);
+    expect(harness.toast).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "warning",
+        title: "Thread archived",
+        description: "Failed to archive 1 thread.",
+      }),
+    );
+  });
+
+  it("classifies a resolved fresh-chat failure after mutation as a follow-up failure", async () => {
+    sidebarThreads = [makeThread(THREAD_ID)];
+    harness.handleNewChat.mockResolvedValue({ ok: false, error: "fresh chat failed" });
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    try {
+      await render({ routeThreadId: THREAD_ID }).archiveThreadWithUndo(THREAD_ID);
+    } finally {
+      consoleError.mockRestore();
+    }
+
+    expect(harness.toast).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ archiveUndo: expect.anything() }),
+      }),
+    );
+    expect(harness.toast).toHaveBeenCalledWith({
+      type: "warning",
+      title: "Thread archived; navigation failed",
+      description: "fresh chat failed",
+    });
   });
 
   it("treats an already-restored invariant as successful Undo", async () => {

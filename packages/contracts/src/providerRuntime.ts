@@ -21,6 +21,7 @@ const RuntimeEventRawSource = Schema.Literals([
   "codex.app-server.notification",
   "codex.app-server.request",
   "codex.eventmsg",
+  "command-code.cli.event",
   "claude.sdk.message",
   "claude.sdk.permission",
   "claude.sdk.hook",

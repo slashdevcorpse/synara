@@ -29,9 +29,12 @@ import { MessageTrail } from "./MessageTrail";
 import { createActiveTrailStore, deriveMessageTrailItems } from "./messageTrail.logic";
 import { AgentActivityDetailView } from "./AgentActivityDetailView";
 import type { AgentActivityDetail } from "./agentActivity.logic";
+import { AgentActivityPulse } from "./AgentActivityPulse";
+import type { AgentActivityState } from "./agentActivityPulse.logic";
 
 interface ChatTranscriptPaneProps {
   activeThreadId: string;
+  agentActivityState?: AgentActivityState;
   activeTurnId?: TurnId | null;
   activeTurnInProgress: boolean;
   activeTurnStartedAt: string | null;
@@ -92,6 +95,7 @@ interface ChatTranscriptPaneProps {
 
 export function ChatTranscriptPane({
   activeThreadId,
+  agentActivityState,
   activeTurnId,
   activeTurnInProgress,
   activeTurnStartedAt,
@@ -175,6 +179,14 @@ export function ChatTranscriptPane({
       )}
     >
       <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden">
+        {agentActivityState ? (
+          <AgentActivityPulse
+            state={agentActivityState}
+            variant="bar"
+            announce
+            className="absolute inset-x-0 top-0 z-20"
+          />
+        ) : null}
         {agentActivityDetail && onCloseAgentActivityDetail ? (
           <AgentActivityDetailView
             detail={agentActivityDetail}

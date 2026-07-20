@@ -6,6 +6,7 @@
 import { Duration, Effect, Exit, Fiber, Layer, Scope, Sink, Stream } from "effect";
 import { ChildProcessSpawner } from "effect/unstable/process";
 import { TestClock } from "effect/testing";
+import { pathToFileURL } from "node:url";
 import type { ChatAttachment } from "@synara/contracts";
 import { describe, expect, it } from "vitest";
 
@@ -119,6 +120,7 @@ function openCodeRuntimePoolTestLayer(state: {
 
 describe("toOpenCodeFileParts", () => {
   it("materializes image attachments as SDK file parts", () => {
+    const attachmentPath = "/tmp/synara-attachments/screenshot.png";
     const attachment = {
       type: "image",
       id: "thread-attachment-image",
@@ -130,14 +132,14 @@ describe("toOpenCodeFileParts", () => {
     expect(
       toOpenCodeFileParts({
         attachments: [attachment],
-        resolveAttachmentPath: () => "/tmp/synara-attachments/screenshot.png",
+        resolveAttachmentPath: () => attachmentPath,
       }),
     ).toEqual([
       {
         type: "file",
         mime: "image/png",
         filename: "screenshot.png",
-        url: "file:///tmp/synara-attachments/screenshot.png",
+        url: pathToFileURL(attachmentPath).href,
       },
     ]);
   });
@@ -198,6 +200,34 @@ describe("buildOpenCodeServerProcessEnv", () => {
 });
 
 describe("OpenCodeRuntime startup diagnostics", () => {
+  it("detects the ready server URL in CRLF process output", async () => {
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const runtime = yield* OpenCodeRuntime;
+          return yield* runtime.startOpenCodeServerProcess({ binaryPath: "/custom/bin/opencode" });
+        }),
+      ).pipe(
+        Effect.provide(
+          makeOpenCodeRuntimeLive({
+            teardownProcessTree: async () => ({ escalated: false, signalErrors: [] }),
+          }).pipe(
+            Layer.provide(
+              mockOpenCodeServerSpawnerLayer({
+                stdout:
+                  "booting custom OpenCode wrapper\r\n" +
+                  "opencode server listening on http://127.0.0.1:59000\r\n",
+                stderr: "",
+              }),
+            ),
+          ),
+        ),
+      ),
+    );
+
+    expect(result.url).toBe("http://127.0.0.1:59000");
+  });
+
   it("includes command and partial process output when server startup times out", async () => {
     const error = await Effect.runPromise(
       Effect.scoped(

@@ -59,7 +59,7 @@ function listPidsByExactProcessName(processName) {
     return [];
   }
   return output
-    .split("\n")
+    .split(/\r?\n/)
     .map((value) => Number(value.trim()))
     .filter((pid) => Number.isInteger(pid) && pid > 0);
 }

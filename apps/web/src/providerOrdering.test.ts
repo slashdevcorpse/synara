@@ -36,4 +36,12 @@ describe("providerOrdering", () => {
     expect(normalizeProviderOrder(["pi", "codex"])[0]).toBe("pi");
     expect(normalizeHiddenProviders(["bogus", "pi", "pi"])).toEqual(["pi"]);
   });
+
+  it("keeps Command Code visible and ordered as a standalone provider", () => {
+    expect(isProviderKind("commandCode")).toBe(true);
+    expect(normalizeProviderOrder(["commandCode", "codex"])[0]).toBe("commandCode");
+    expect(normalizeHiddenProviders(["bogus", "commandCode", "commandCode"])).toEqual([
+      "commandCode",
+    ]);
+  });
 });

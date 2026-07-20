@@ -52,11 +52,13 @@ const agentQueries = new Map<ProviderKind, QueryResultLike>();
 const MODEL_HINTS = { cursor: "composer-2" } as const;
 const SETTINGS = {
   antigravityBinaryPath: "",
+  commandCodeBinaryPath: "",
   cursorApiEndpoint: "",
   cursorBinaryPath: "",
   customAntigravityModels: [],
   customClaudeModels: [],
   customCodexModels: [],
+  customCommandCodeModels: [],
   customCursorModels: ["cursor-custom"],
   customDroidModels: [],
   customGrokModels: [],
@@ -172,5 +174,33 @@ describe("useProviderModelCatalog", () => {
     expect(catalog?.runtimeModelsByProvider.cursor).toEqual([
       { slug: "composer-2", name: "Composer 2" },
     ]);
+  });
+
+  it("projects Command Code discovery through the shared catalog", () => {
+    modelQueries.set("commandCode", {
+      data: {
+        models: [{ slug: "gpt-5.6-sol", name: "GPT-5.6 Sol" }],
+        source: "command-code.cli",
+        cached: false,
+      },
+      isFetching: false,
+      isLoading: false,
+      isPlaceholderData: false,
+    });
+
+    const catalog = readCatalogRenders({
+      selectedProvider: "commandCode",
+      discoveryEnabled: false,
+      modelHintByProvider: { commandCode: "gpt-5.6-sol" },
+    }).at(-1);
+
+    expect(catalog?.modelOptionsByProvider.commandCode.map((model) => model.slug)).toContain(
+      "gpt-5.6-sol",
+    );
+    expect(catalog?.loadingModelProviders.commandCode).toBe(false);
+    expect(catalog?.runtimeModelsByProvider.commandCode).toEqual([
+      { slug: "gpt-5.6-sol", name: "GPT-5.6 Sol" },
+    ]);
+    expect(catalog?.selectedRuntimeAgents).toEqual([]);
   });
 });

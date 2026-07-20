@@ -4,7 +4,29 @@
 // Depends on: Vitest and text helpers
 
 import { describe, expect, it } from "vitest";
-import { pluralize } from "./text";
+import { pluralize, splitLines } from "./text";
+
+describe("splitLines", () => {
+  it("splits LF, CRLF, and mixed line endings", () => {
+    expect(splitLines("alpha\nbeta\ngamma")).toEqual(["alpha", "beta", "gamma"]);
+    expect(splitLines("alpha\r\nbeta\r\ngamma")).toEqual(["alpha", "beta", "gamma"]);
+    expect(splitLines("alpha\r\nbeta\ngamma\r\n")).toEqual(["alpha", "beta", "gamma", ""]);
+  });
+
+  it("preserves empty input and a trailing carriage return for incremental consumers", () => {
+    expect(splitLines("")).toEqual([""]);
+    expect(splitLines("alpha\r")).toEqual(["alpha\r"]);
+
+    const firstPass = splitLines("alpha\r");
+    const remainder = firstPass.pop() ?? "";
+    const secondPass = splitLines(`${remainder}\nbeta\r\n`);
+    const nextRemainder = secondPass.pop() ?? "";
+
+    expect(firstPass).toEqual([]);
+    expect(secondPass).toEqual(["alpha", "beta"]);
+    expect(nextRemainder).toBe("");
+  });
+});
 
 describe("pluralize", () => {
   it("returns the singular form for a count of one", () => {

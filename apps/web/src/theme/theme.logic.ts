@@ -373,7 +373,10 @@ function hasStoredCustomUiFont(state: Record<string, unknown>): boolean {
   });
 }
 
-export function normalizeThemeState(value: unknown): ThemeState {
+export function normalizeThemeState(
+  value: unknown,
+  defaultState: ThemeState = DEFAULT_THEME_STATE,
+): ThemeState {
   const state = isRecord(value) ? value : {};
   const codeThemeIds = isRecord(state.codeThemeIds) ? state.codeThemeIds : {};
   const chromeThemes = isRecord(state.chromeThemes) ? state.chromeThemes : {};
@@ -386,18 +389,18 @@ export function normalizeThemeState(value: unknown): ThemeState {
         ? normalizeChromeTheme(chromeThemes.dark, "dark")
         : isRecord(packs.dark)
           ? legacyDarkPack.theme
-          : DEFAULT_THEME_STATE.chromeThemes.dark,
+          : defaultState.chromeThemes.dark,
       light: isRecord(chromeThemes.light)
         ? normalizeChromeTheme(chromeThemes.light, "light")
         : isRecord(packs.light)
           ? legacyLightPack.theme
-          : DEFAULT_THEME_STATE.chromeThemes.light,
+          : defaultState.chromeThemes.light,
     },
     codeThemeIds: {
       dark: normalizeCodeThemeId(codeThemeIds.dark ?? legacyDarkPack.codeThemeId, "dark"),
       light: normalizeCodeThemeId(codeThemeIds.light ?? legacyLightPack.codeThemeId, "light"),
     },
-    mode: isThemeMode(state.mode) ? state.mode : DEFAULT_THEME_STATE.mode,
+    mode: isThemeMode(state.mode) ? state.mode : defaultState.mode,
     // Preserve the UI font older theme states already rendered. New/default states use the
     // native stack, while an explicit preference always wins after the first save.
     systemUiFont:
@@ -405,21 +408,24 @@ export function normalizeThemeState(value: unknown): ThemeState {
   };
 }
 
-export function parseStoredThemeState(rawValue: string | null | undefined): ThemeState {
+export function parseStoredThemeState(
+  rawValue: string | null | undefined,
+  defaultState: ThemeState = DEFAULT_THEME_STATE,
+): ThemeState {
   if (!rawValue) {
-    return DEFAULT_THEME_STATE;
+    return defaultState;
   }
   if (isThemeMode(rawValue)) {
     return {
-      ...DEFAULT_THEME_STATE,
+      ...defaultState,
       mode: rawValue,
     };
   }
 
   try {
-    return normalizeThemeState(JSON.parse(rawValue));
+    return normalizeThemeState(JSON.parse(rawValue), defaultState);
   } catch {
-    return DEFAULT_THEME_STATE;
+    return defaultState;
   }
 }
 

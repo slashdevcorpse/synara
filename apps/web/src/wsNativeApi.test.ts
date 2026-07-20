@@ -302,6 +302,11 @@ describe("wsNativeApi", () => {
         textGenerationModelSelection: { provider: "codex", model: "gpt-5.4-mini" },
         providers: {
           codex: { enabled: true, binaryPath: "codex", homePath: "", customModels: [] },
+          commandCode: {
+            enabled: true,
+            binaryPath: "commandcode",
+            customModels: ["gpt-5.6-sol"],
+          },
           claudeAgent: { enabled: true, binaryPath: "claude", launchArgs: "", customModels: [] },
           cursor: { enabled: false, binaryPath: "agent", apiEndpoint: "", customModels: [] },
           antigravity: { enabled: true, binaryPath: "agy", customModels: [] },
@@ -336,6 +341,24 @@ describe("wsNativeApi", () => {
     onServerSettingsUpdated(lateListener);
     expect(lateListener).toHaveBeenCalledTimes(1);
     expect(lateListener).toHaveBeenCalledWith(payload);
+  });
+
+  it("forwards Command Code settings patches over the settings RPC", async () => {
+    const { createWsNativeApi } = await import("./wsNativeApi");
+    requestMock.mockResolvedValue({});
+    const api = createWsNativeApi();
+    const patch = {
+      providers: {
+        commandCode: {
+          binaryPath: "C:/tools/commandcode.exe",
+          customModels: ["openai/custom-command-model"],
+        },
+      },
+    } as const;
+
+    await api.server.updateSettings(patch);
+
+    expect(requestMock).toHaveBeenCalledWith(WS_METHODS.serverUpdateSettings, patch);
   });
 
   it("forwards valid terminal and orchestration events", async () => {

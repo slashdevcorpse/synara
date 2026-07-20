@@ -265,6 +265,13 @@ export const SETTINGS_SEARCH_ENTRIES: readonly SettingsSearchEntry[] = [
     keywords: "Set the default wrap state when the diff panel opens. word wrap",
   },
   {
+    id: "behavior:terminal-right-click-paste",
+    section: "behavior",
+    title: "Terminal right-click paste",
+    keywords:
+      "Paste clipboard text with a bare right-click. Ctrl+right-click keeps the context menu. terminal windows mouse",
+  },
+  {
     id: "behavior:delete-confirmation",
     section: "behavior",
     title: "Delete confirmation",

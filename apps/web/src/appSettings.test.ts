@@ -17,6 +17,7 @@ import {
   getAppModelOptions,
   getCustomBinaryPathForProvider,
   getDefaultNativeFontSmoothing,
+  getDefaultTerminalRightClickToPaste,
   getCustomModelOptionsByProvider,
   getCustomModelsByProvider,
   getCustomModelsForProvider,
@@ -58,6 +59,18 @@ describe("normalizeCustomModelSlugs", () => {
 });
 
 describe("getAppModelOptions", () => {
+  it("uses the verified Command Code fallback model catalog", () => {
+    expect(getAppModelOptions("commandCode", [])).toMatchObject([
+      { slug: "gpt-5.6-sol", name: "GPT-5.6 Sol", provider: "commandCode" },
+      { slug: "gpt-5.6-terra", name: "GPT-5.6 Terra", provider: "commandCode" },
+      { slug: "gpt-5.6-luna", name: "GPT-5.6 Luna", provider: "commandCode" },
+      { slug: "gpt-5.5", name: "GPT-5.5", provider: "commandCode" },
+      { slug: "gpt-5.4", name: "GPT-5.4", provider: "commandCode" },
+      { slug: "gpt-5.3-codex", name: "GPT-5.3 Codex", provider: "commandCode" },
+      { slug: "gpt-5.4-mini", name: "GPT-5.4 Mini", provider: "commandCode" },
+    ]);
+  });
+
   it("does not expose a hardcoded Antigravity model catalog", () => {
     expect(getAppModelOptions("antigravity", [])).toEqual([]);
   });
@@ -201,12 +214,34 @@ describe("isGitTextGenerationSettingsDirty", () => {
 });
 
 describe("resolveAppModelSelection", () => {
+  it("defaults Command Code to GPT-5.6 Sol", () => {
+    expect(
+      resolveAppModelSelection(
+        "commandCode",
+        {
+          codex: [],
+          commandCode: [],
+          claudeAgent: [],
+          cursor: [],
+          antigravity: [],
+          grok: [],
+          droid: [],
+          kilo: [],
+          opencode: [],
+          pi: [],
+        },
+        "",
+      ),
+    ).toBe("gpt-5.6-sol");
+  });
+
   it("preserves saved custom model slugs instead of falling back to the default", () => {
     expect(
       resolveAppModelSelection(
         "codex",
         {
           codex: ["galapagos-alpha"],
+          commandCode: [],
           claudeAgent: [],
           cursor: [],
           antigravity: [],
@@ -227,6 +262,7 @@ describe("resolveAppModelSelection", () => {
         "codex",
         {
           codex: [],
+          commandCode: [],
           claudeAgent: [],
           cursor: [],
           antigravity: [],
@@ -247,6 +283,7 @@ describe("resolveAppModelSelection", () => {
         "codex",
         {
           codex: [],
+          commandCode: [],
           claudeAgent: [],
           cursor: [],
           antigravity: [],
@@ -267,6 +304,7 @@ describe("resolveAppModelSelection", () => {
         "claudeAgent",
         {
           codex: [],
+          commandCode: [],
           claudeAgent: [],
           cursor: [],
           antigravity: [],
@@ -287,6 +325,7 @@ describe("resolveAppModelSelection", () => {
         "codex",
         {
           codex: [],
+          commandCode: [],
           claudeAgent: [],
           cursor: [],
           antigravity: [],
@@ -369,6 +408,24 @@ describe("sidebar sort defaults", () => {
 });
 
 describe("normalizeStoredAppSettings", () => {
+  it("defaults terminal right-click paste by platform", () => {
+    expect(getDefaultTerminalRightClickToPaste("Win32")).toBe(true);
+    expect(getDefaultTerminalRightClickToPaste("Win64")).toBe(true);
+    expect(getDefaultTerminalRightClickToPaste("MacIntel")).toBe(false);
+    expect(getDefaultTerminalRightClickToPaste("Linux x86_64")).toBe(false);
+  });
+
+  it("preserves explicitly stored terminal right-click paste preferences", () => {
+    const decode = Schema.decodeSync(Schema.fromJsonString(AppSettingsSchema));
+
+    expect(
+      decode(JSON.stringify({ terminalRightClickToPaste: false })).terminalRightClickToPaste,
+    ).toBe(false);
+    expect(
+      decode(JSON.stringify({ terminalRightClickToPaste: true })).terminalRightClickToPaste,
+    ).toBe(true);
+  });
+
   it("defaults native font smoothing by platform", () => {
     expect(getDefaultNativeFontSmoothing("MacIntel")).toBe(true);
     expect(getDefaultNativeFontSmoothing("Win32")).toBe(false);
@@ -404,6 +461,7 @@ describe("normalizeStoredAppSettings", () => {
       JSON.stringify({
         claudeBinaryPath: "claude",
         codexBinaryPath: "codex",
+        commandCodeBinaryPath: "commandcode",
         cursorBinaryPath: "cursor-agent",
         antigravityBinaryPath: "agy",
         grokBinaryPath: "grok",
@@ -418,6 +476,7 @@ describe("normalizeStoredAppSettings", () => {
     expect(normalized).toMatchObject({
       claudeBinaryPath: "",
       codexBinaryPath: "",
+      commandCodeBinaryPath: "",
       cursorBinaryPath: "",
       antigravityBinaryPath: "",
       grokBinaryPath: "",
@@ -427,6 +486,22 @@ describe("normalizeStoredAppSettings", () => {
       piBinaryPath: "",
     });
     expect(getCustomBinaryPathForProvider(normalized, "opencode")).toBe("");
+    expect(getCustomBinaryPathForProvider(normalized, "commandCode")).toBe("");
+  });
+
+  it("preserves Command Code binary and model overrides through persisted normalization", () => {
+    const decode = Schema.decodeSync(Schema.fromJsonString(AppSettingsSchema));
+    const normalized = normalizeStoredAppSettings(
+      decode(
+        JSON.stringify({
+          commandCodeBinaryPath: " C:/tools/commandcode.exe ",
+          customCommandCodeModels: [" terra ", "openai/custom-command-model"],
+        }),
+      ),
+    );
+
+    expect(normalized.commandCodeBinaryPath).toBe("C:/tools/commandcode.exe");
+    expect(normalized.customCommandCodeModels).toEqual(["openai/custom-command-model"]);
   });
 });
 
@@ -445,6 +520,7 @@ describe("getProviderStartOptions", () => {
         claudeBinaryPath: "/usr/local/bin/claude",
         codexBinaryPath: "",
         codexHomePath: "/Users/you/.codex",
+        commandCodeBinaryPath: "C:/tools/commandcode.exe",
         cursorApiEndpoint: "http://localhost:3000",
         cursorBinaryPath: "/usr/local/bin/agent",
         antigravityBinaryPath: "/usr/local/bin/agy",
@@ -465,6 +541,9 @@ describe("getProviderStartOptions", () => {
       codex: {
         homePath: "/Users/you/.codex",
       },
+      commandCode: {
+        binaryPath: "C:/tools/commandcode.exe",
+      },
       cursor: {
         apiEndpoint: "http://localhost:3000",
         binaryPath: "/usr/local/bin/agent",
@@ -484,6 +563,7 @@ describe("getProviderStartOptions", () => {
         claudeBinaryPath: "",
         codexBinaryPath: "",
         codexHomePath: "",
+        commandCodeBinaryPath: "",
         cursorApiEndpoint: "",
         cursorBinaryPath: "",
         antigravityBinaryPath: "",
@@ -506,6 +586,7 @@ describe("getProviderStartOptions", () => {
         claudeBinaryPath: "claude",
         codexBinaryPath: "codex",
         codexHomePath: "",
+        commandCodeBinaryPath: "commandcode",
         cursorApiEndpoint: "",
         cursorBinaryPath: "cursor-agent",
         antigravityBinaryPath: "agy",
@@ -526,6 +607,7 @@ describe("getProviderStartOptions", () => {
 describe("provider-indexed custom model settings", () => {
   const settings = {
     customCodexModels: ["custom/codex-model"],
+    customCommandCodeModels: ["openai/custom-command-model"],
     customClaudeModels: ["claude/custom-opus"],
     customCursorModels: ["cursor/custom-model"],
     customAntigravityModels: ["Gemini 3.5 Flash (Experimental)"],
@@ -539,6 +621,7 @@ describe("provider-indexed custom model settings", () => {
   it("exports one provider config per provider", () => {
     expect(MODEL_PROVIDER_SETTINGS.map((config) => config.provider)).toEqual([
       "codex",
+      "commandCode",
       "claudeAgent",
       "cursor",
       "antigravity",
@@ -558,6 +641,9 @@ describe("provider-indexed custom model settings", () => {
 
   it("reads custom models for each provider", () => {
     expect(getCustomModelsForProvider(settings, "codex")).toEqual(["custom/codex-model"]);
+    expect(getCustomModelsForProvider(settings, "commandCode")).toEqual([
+      "openai/custom-command-model",
+    ]);
     expect(getCustomModelsForProvider(settings, "claudeAgent")).toEqual(["claude/custom-opus"]);
     expect(getCustomModelsForProvider(settings, "cursor")).toEqual(["cursor/custom-model"]);
     expect(getCustomModelsForProvider(settings, "grok")).toEqual(["grok/custom-fast"]);
@@ -570,6 +656,7 @@ describe("provider-indexed custom model settings", () => {
   it("reads default custom models for each provider", () => {
     const defaults = {
       customCodexModels: ["default/codex-model"],
+      customCommandCodeModels: ["openai/default-command-model"],
       customClaudeModels: ["claude/default-opus"],
       customCursorModels: ["cursor/default-model"],
       customAntigravityModels: ["Gemini 3.5 Flash (Experimental)"],
@@ -581,6 +668,9 @@ describe("provider-indexed custom model settings", () => {
     } as const;
 
     expect(getDefaultCustomModelsForProvider(defaults, "codex")).toEqual(["default/codex-model"]);
+    expect(getDefaultCustomModelsForProvider(defaults, "commandCode")).toEqual([
+      "openai/default-command-model",
+    ]);
     expect(getDefaultCustomModelsForProvider(defaults, "claudeAgent")).toEqual([
       "claude/default-opus",
     ]);
@@ -598,6 +688,12 @@ describe("provider-indexed custom model settings", () => {
   it("patches custom models for codex", () => {
     expect(patchCustomModels("codex", ["custom/codex-model"])).toEqual({
       customCodexModels: ["custom/codex-model"],
+    });
+  });
+
+  it("patches custom models for Command Code", () => {
+    expect(patchCustomModels("commandCode", ["openai/custom-command-model"])).toEqual({
+      customCommandCodeModels: ["openai/custom-command-model"],
     });
   });
 
@@ -652,6 +748,7 @@ describe("provider-indexed custom model settings", () => {
   it("builds a complete provider-indexed custom model record", () => {
     expect(getCustomModelsByProvider(settings)).toEqual({
       codex: ["custom/codex-model"],
+      commandCode: ["openai/custom-command-model"],
       claudeAgent: ["claude/custom-opus"],
       cursor: ["cursor/custom-model"],
       antigravity: ["Gemini 3.5 Flash (Experimental)"],
@@ -668,6 +765,11 @@ describe("provider-indexed custom model settings", () => {
 
     expect(
       modelOptionsByProvider.codex.some((option) => option.slug === "custom/codex-model"),
+    ).toBe(true);
+    expect(
+      modelOptionsByProvider.commandCode.some(
+        (option) => option.slug === "openai/custom-command-model",
+      ),
     ).toBe(true);
     expect(
       modelOptionsByProvider.claudeAgent.some((option) => option.slug === "claude/custom-opus"),
@@ -697,6 +799,11 @@ describe("provider-indexed custom model settings", () => {
   it("normalizes and deduplicates custom model options per provider", () => {
     const modelOptionsByProvider = getCustomModelOptionsByProvider({
       customCodexModels: ["  custom/codex-model ", "gpt-5.4", "custom/codex-model"],
+      customCommandCodeModels: [
+        " terra ",
+        "openai/custom-command-model",
+        "openai/custom-command-model",
+      ],
       customClaudeModels: [" sonnet ", "claude/custom-opus", "claude/custom-opus"],
       customCursorModels: [" composer-2 ", "cursor/custom-model", "cursor/custom-model"],
       customAntigravityModels: [
@@ -723,6 +830,14 @@ describe("provider-indexed custom model settings", () => {
       modelOptionsByProvider.codex.filter((option) => option.slug === "custom/codex-model"),
     ).toHaveLength(1);
     expect(modelOptionsByProvider.codex.some((option) => option.slug === "gpt-5.4")).toBe(true);
+    expect(
+      modelOptionsByProvider.commandCode.filter(
+        (option) => option.slug === "openai/custom-command-model",
+      ),
+    ).toHaveLength(1);
+    expect(modelOptionsByProvider.commandCode.some((option) => option.slug === "gpt-5.6-sol")).toBe(
+      true,
+    );
     expect(
       modelOptionsByProvider.claudeAgent.filter((option) => option.slug === "claude/custom-opus"),
     ).toHaveLength(1);
@@ -823,10 +938,12 @@ describe("AppSettingsSchema", () => {
       chatFontSizePx: DEFAULT_CHAT_FONT_SIZE_PX,
       codexBinaryPath: "/usr/local/bin/codex",
       codexHomePath: "",
+      commandCodeBinaryPath: "",
       grokBinaryPath: "",
       defaultThreadEnvMode: "local",
       confirmThreadDelete: false,
       confirmTerminalTabClose: true,
+      terminalRightClickToPaste: getDefaultTerminalRightClickToPaste(),
       enableAppSnap: false,
       appSnapPlaySound: true,
       enableAssistantStreaming: true,
@@ -835,6 +952,7 @@ describe("AppSettingsSchema", () => {
       showStudioSection: true,
       timestampFormat: DEFAULT_TIMESTAMP_FORMAT,
       customCodexModels: [],
+      customCommandCodeModels: [],
       customClaudeModels: [],
       customCursorModels: [],
       customGrokModels: [],

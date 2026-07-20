@@ -63,6 +63,7 @@ type ProviderInstallTextKey =
   | "claudeBinaryPath"
   | "codexBinaryPath"
   | "codexHomePath"
+  | "commandCodeBinaryPath"
   | "cursorBinaryPath"
   | "cursorApiEndpoint"
   | "antigravityBinaryPath"
@@ -143,6 +144,23 @@ const PROVIDER_INSTALL_SETTINGS: readonly ProviderInstallSettings[] = [
         label: "CODEX_HOME path",
         placeholder: "CODEX_HOME",
         description: "Optional custom Codex home and config directory.",
+      },
+    ],
+  },
+  {
+    provider: "commandCode",
+    docs: [{ label: "Docs", href: "https://commandcode.ai/docs" }],
+    fields: [
+      {
+        kind: "text",
+        settingsKey: "commandCodeBinaryPath",
+        label: "Command Code binary path",
+        placeholder: "Command Code binary path",
+        description: (
+          <>
+            Leave blank to use <code>commandcode</code> from your PATH.
+          </>
+        ),
       },
     ],
   },

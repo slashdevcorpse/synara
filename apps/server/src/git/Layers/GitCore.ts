@@ -42,6 +42,7 @@ import {
 } from "../Services/GitCore.ts";
 import { ServerConfig } from "../../config.ts";
 import { decodeJsonResult } from "@synara/shared/schemaJson";
+import { splitLines } from "@synara/shared/text";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 1_000_000;
@@ -136,8 +137,7 @@ function parseBranchLine(line: string): { name: string; current: boolean } | nul
 }
 
 function parseRemoteNames(stdout: string): ReadonlyArray<string> {
-  return stdout
-    .split("\n")
+  return splitLines(stdout)
     .map((line) => line.trim())
     .filter((line) => line.length > 0)
     .toSorted((a, b) => b.length - a.length);
@@ -161,7 +161,7 @@ function normalizeRemoteUrl(value: string): string {
 
 function parseRemoteFetchUrls(stdout: string): Map<string, string> {
   const remotes = new Map<string, string>();
-  for (const line of stdout.split("\n")) {
+  for (const line of splitLines(stdout)) {
     const trimmed = line.trim();
     if (trimmed.length === 0) continue;
     const match = /^(\S+)\s+(\S+)\s+\((fetch|push)\)$/.exec(trimmed);
@@ -202,7 +202,7 @@ function parseRemoteRefWithRemoteNames(
 }
 
 function parseTrackingBranchByUpstreamRef(stdout: string, upstreamRef: string): string | null {
-  for (const line of stdout.split("\n")) {
+  for (const line of splitLines(stdout)) {
     const trimmedLine = line.trim();
     if (trimmedLine.length === 0) {
       continue;
@@ -278,8 +278,7 @@ const UNTRACKED_OVERWRITE_PATTERN =
 function parseDirtyWorktreeFiles(stderr: string): string[] | null {
   const match = DIRTY_WORKTREE_PATTERN.exec(stderr) ?? UNTRACKED_OVERWRITE_PATTERN.exec(stderr);
   if (!match?.[1]) return null;
-  const files = match[1]
-    .split(/\r?\n/)
+  const files = splitLines(match[1])
     .map((line) => line.trim())
     .filter((line) => line.length > 0);
   return files.length > 0 ? files : null;
@@ -293,9 +292,7 @@ function explainPullBlockedByLocalChanges(error: GitCommandError): string | null
 }
 
 function parseNonEmptyLineList(input: string): string[] {
-  return input
-    .trim()
-    .split(/\r?\n/)
+  return splitLines(input.trim())
     .map((line) => line.trim())
     .filter((line) => line.length > 0);
 }
@@ -439,11 +436,11 @@ const createTrace2Monitor = Effect.fn(function* (
 
             const appended = contents.slice(processedChars);
             const combined = remainder + appended;
-            const lines = combined.split("\n");
+            const lines = splitLines(combined);
             const nextRemainder = lines.pop() ?? "";
 
             return [
-              lines.map((line) => line.replace(/\r$/, "")),
+              lines,
               {
                 processedChars: contents.length,
                 remainder: nextRemainder,
@@ -1227,7 +1224,7 @@ export const makeGitCore = (options?: { executeOverride?: GitCoreShape["execute"
           return branchLastCommit;
         }
 
-        for (const line of branchRecency.stdout.split("\n")) {
+        for (const line of splitLines(branchRecency.stdout)) {
           if (line.length === 0) {
             continue;
           }
@@ -1959,7 +1956,7 @@ export const makeGitCore = (options?: { executeOverride?: GitCoreShape["execute"
         const worktreeMap = new Map<string, string>();
         if (worktreeList.code === 0) {
           let currentPath: string | null = null;
-          for (const line of worktreeList.stdout.split("\n")) {
+          for (const line of splitLines(worktreeList.stdout)) {
             if (line.startsWith("worktree ")) {
               const candidatePath = line.slice("worktree ".length);
               const exists = yield* fileSystem.stat(candidatePath).pipe(
@@ -1975,8 +1972,7 @@ export const makeGitCore = (options?: { executeOverride?: GitCoreShape["execute"
           }
         }
 
-        const localBranches = localBranchResult.stdout
-          .split("\n")
+        const localBranches = splitLines(localBranchResult.stdout)
           .map(parseBranchLine)
           .filter((branch): branch is { name: string; current: boolean } => branch !== null)
           .map((branch) => ({
@@ -1999,8 +1995,7 @@ export const makeGitCore = (options?: { executeOverride?: GitCoreShape["execute"
 
         const remoteBranches =
           remoteBranchResult.code === 0
-            ? remoteBranchResult.stdout
-                .split("\n")
+            ? splitLines(remoteBranchResult.stdout)
                 .map(parseBranchLine)
                 .filter((branch): branch is { name: string; current: boolean } => branch !== null)
                 .map((branch) => {
@@ -2681,8 +2676,7 @@ export const makeGitCore = (options?: { executeOverride?: GitCoreShape["execute"
         "--format=%(refname:short)",
       ]).pipe(
         Effect.map((stdout) =>
-          stdout
-            .split("\n")
+          splitLines(stdout)
             .map((line) => line.trim())
             .filter((line) => line.length > 0),
         ),

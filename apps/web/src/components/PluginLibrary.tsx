@@ -401,6 +401,10 @@ export function PluginLibrary() {
       plugins: supportsPluginDiscovery(codexCapabilitiesQuery.data),
       skills: supportsSkillDiscovery(codexCapabilitiesQuery.data),
     },
+    commandCode: {
+      plugins: false,
+      skills: false,
+    },
     claudeAgent: {
       plugins: supportsPluginDiscovery(claudeCapabilitiesQuery.data),
       skills: supportsSkillDiscovery(claudeCapabilitiesQuery.data),

@@ -90,8 +90,15 @@ export function getDefaultNativeFontSmoothing(platform = globalThis.navigator?.p
   return /mac|iphone|ipad|ipod/i.test(platform);
 }
 
+export function getDefaultTerminalRightClickToPaste(
+  platform = globalThis.navigator?.platform ?? "",
+) {
+  return /^win/i.test(platform);
+}
+
 type CustomModelSettingsKey =
   | "customCodexModels"
+  | "customCommandCodeModels"
   | "customClaudeModels"
   | "customCursorModels"
   | "customAntigravityModels"
@@ -112,6 +119,7 @@ export type ProviderCustomModelConfig = {
 
 const BUILT_IN_MODEL_SLUGS_BY_PROVIDER: Record<ProviderKind, ReadonlySet<string>> = {
   codex: new Set(getModelOptions("codex").map((option) => option.slug)),
+  commandCode: new Set(getModelOptions("commandCode").map((option) => option.slug)),
   claudeAgent: new Set(getModelOptions("claudeAgent").map((option) => option.slug)),
   cursor: new Set(getModelOptions("cursor").map((option) => option.slug)),
   antigravity: new Set(getModelOptions("antigravity").map((option) => option.slug)),
@@ -137,6 +145,7 @@ const withDefaults =
 
 const PersistedProviderKind = Schema.Literals([
   "codex",
+  "commandCode",
   "claudeAgent",
   "cursor",
   "antigravity",
@@ -167,6 +176,7 @@ export const AppSettingsSchema = Schema.Struct({
   ),
   codexBinaryPath: Schema.String.check(Schema.isMaxLength(4096)).pipe(withDefaults(() => "")),
   codexHomePath: Schema.String.check(Schema.isMaxLength(4096)).pipe(withDefaults(() => "")),
+  commandCodeBinaryPath: Schema.String.check(Schema.isMaxLength(4096)).pipe(withDefaults(() => "")),
   cursorBinaryPath: Schema.String.check(Schema.isMaxLength(4096)).pipe(withDefaults(() => "")),
   cursorApiEndpoint: Schema.String.check(Schema.isMaxLength(4096)).pipe(withDefaults(() => "")),
   antigravityBinaryPath: Schema.String.check(Schema.isMaxLength(4096)).pipe(withDefaults(() => "")),
@@ -191,6 +201,7 @@ export const AppSettingsSchema = Schema.Struct({
   confirmThreadDelete: Schema.Boolean.pipe(withDefaults(() => true)),
   confirmThreadArchive: Schema.Boolean.pipe(withDefaults(() => false)),
   confirmTerminalTabClose: Schema.Boolean.pipe(withDefaults(() => true)),
+  terminalRightClickToPaste: Schema.Boolean.pipe(withDefaults(getDefaultTerminalRightClickToPaste)),
   diffWordWrap: Schema.Boolean.pipe(withDefaults(() => false)),
   // Local-only UI preferences for hiding sidebar surfaces a user doesn't want.
   // `showChatsSection` controls the standalone "Chats" list in the sidebar footer
@@ -236,6 +247,7 @@ export const AppSettingsSchema = Schema.Struct({
   ),
   timestampFormat: TimestampFormat.pipe(withDefaults(() => DEFAULT_TIMESTAMP_FORMAT)),
   customCodexModels: Schema.Array(Schema.String).pipe(withDefaults(() => [])),
+  customCommandCodeModels: Schema.Array(Schema.String).pipe(withDefaults(() => [])),
   customClaudeModels: Schema.Array(Schema.String).pipe(withDefaults(() => [])),
   customCursorModels: Schema.Array(Schema.String).pipe(withDefaults(() => [])),
   customAntigravityModels: Schema.Array(Schema.String).pipe(withDefaults(() => [])),
@@ -309,6 +321,15 @@ const PROVIDER_CUSTOM_MODEL_CONFIG: Record<ProviderKind, ProviderCustomModelConf
     description: "Save additional Codex model slugs for the picker and `/model` command.",
     placeholder: "your-codex-model-slug",
     example: "gpt-6.7-codex-ultra-preview",
+  },
+  commandCode: {
+    provider: "commandCode",
+    settingsKey: "customCommandCodeModels",
+    defaultSettingsKey: "customCommandCodeModels",
+    title: "Command Code",
+    description: "Save additional Command Code model slugs for the picker.",
+    placeholder: "provider/model-or-short-name",
+    example: "gpt-5.6-sol",
   },
   claudeAgent: {
     provider: "claudeAgent",
@@ -501,6 +522,10 @@ function normalizeAppSettings(settings: AppSettings): AppSettings {
     openCodeServerPassword: "",
     claudeBinaryPath: normalizeProviderBinaryPathOverride("claudeAgent", settings.claudeBinaryPath),
     codexBinaryPath: normalizeProviderBinaryPathOverride("codex", settings.codexBinaryPath),
+    commandCodeBinaryPath: normalizeProviderBinaryPathOverride(
+      "commandCode",
+      settings.commandCodeBinaryPath,
+    ),
     cursorBinaryPath: normalizeProviderBinaryPathOverride("cursor", settings.cursorBinaryPath),
     antigravityBinaryPath: normalizeProviderBinaryPathOverride(
       "antigravity",
@@ -519,6 +544,10 @@ function normalizeAppSettings(settings: AppSettings): AppSettings {
     terminalFontSizePx: normalizeTerminalFontSizePx(settings.terminalFontSizePx),
     terminalFontFamily: normalizeTerminalFontFamily(settings.terminalFontFamily),
     customCodexModels: normalizeCustomModelSlugs(settings.customCodexModels, "codex"),
+    customCommandCodeModels: normalizeCustomModelSlugs(
+      settings.customCommandCodeModels,
+      "commandCode",
+    ),
     customClaudeModels: normalizeCustomModelSlugs(settings.customClaudeModels, "claudeAgent"),
     customCursorModels: normalizeCustomModelSlugs(settings.customCursorModels, "cursor"),
     customAntigravityModels: normalizeCustomModelSlugs(
@@ -541,6 +570,7 @@ function serverSettingsToAppSettings(settings: ServerSettingsView): Partial<AppS
     claudeBinaryPath: settings.providers.claudeAgent.binaryPath,
     codexBinaryPath: settings.providers.codex.binaryPath,
     codexHomePath: settings.providers.codex.homePath,
+    commandCodeBinaryPath: settings.providers.commandCode.binaryPath,
     cursorApiEndpoint: settings.providers.cursor.apiEndpoint,
     cursorBinaryPath: settings.providers.cursor.binaryPath,
     defaultThreadEnvMode: settings.defaultThreadEnvMode,
@@ -559,6 +589,7 @@ function serverSettingsToAppSettings(settings: ServerSettingsView): Partial<AppS
     piAgentDir: settings.providers.pi.agentDir,
     piBinaryPath: settings.providers.pi.binaryPath,
     customCodexModels: settings.providers.codex.customModels,
+    customCommandCodeModels: settings.providers.commandCode.customModels,
     customClaudeModels: settings.providers.claudeAgent.customModels,
     customCursorModels: settings.providers.cursor.customModels,
     customAntigravityModels: settings.providers.antigravity.customModels,
@@ -589,6 +620,7 @@ function hasOwn<Key extends keyof AppSettings>(patch: Partial<AppSettings>, key:
 
 function touchesProviderDiscoverySettings(patch: Partial<AppSettings>): boolean {
   return (
+    hasOwn(patch, "commandCodeBinaryPath") ||
     hasOwn(patch, "kiloBinaryPath") ||
     hasOwn(patch, "kiloServerPassword") ||
     hasOwn(patch, "kiloServerUrl") ||
@@ -636,6 +668,16 @@ function appSettingsPatchToServerSettingsPatch(patch: Partial<AppSettings>): Ser
       ...(hasOwn(patch, "codexHomePath") ? { homePath: patch.codexHomePath ?? "" } : {}),
       ...(hasOwn(patch, "customCodexModels")
         ? { customModels: patch.customCodexModels ?? [] }
+        : {}),
+    };
+  }
+  if (hasOwn(patch, "commandCodeBinaryPath") || hasOwn(patch, "customCommandCodeModels")) {
+    providers.commandCode = {
+      ...(hasOwn(patch, "commandCodeBinaryPath")
+        ? { binaryPath: patch.commandCodeBinaryPath ?? "" }
+        : {}),
+      ...(hasOwn(patch, "customCommandCodeModels")
+        ? { customModels: patch.customCommandCodeModels ?? [] }
         : {}),
     };
   }
@@ -753,6 +795,7 @@ function buildInitialServerSettingsMigrationPatch(settings: AppSettings): Server
     "claudeBinaryPath",
     "codexBinaryPath",
     "codexHomePath",
+    "commandCodeBinaryPath",
     "cursorApiEndpoint",
     "cursorBinaryPath",
     "defaultThreadEnvMode",
@@ -789,6 +832,7 @@ function buildInitialServerSettingsMigrationPatch(settings: AppSettings): Server
 
   for (const key of [
     "customCodexModels",
+    "customCommandCodeModels",
     "customClaudeModels",
     "customCursorModels",
     "customAntigravityModels",
@@ -838,6 +882,7 @@ export function getCustomModelsByProvider(
 ): Record<ProviderKind, readonly string[]> {
   return {
     codex: getCustomModelsForProvider(settings, "codex"),
+    commandCode: getCustomModelsForProvider(settings, "commandCode"),
     claudeAgent: getCustomModelsForProvider(settings, "claudeAgent"),
     cursor: getCustomModelsForProvider(settings, "cursor"),
     antigravity: getCustomModelsForProvider(settings, "antigravity"),
@@ -986,6 +1031,7 @@ export function getCustomModelOptionsByProvider(
   const customModelsByProvider = getCustomModelsByProvider(settings);
   return {
     codex: getAppModelOptions("codex", customModelsByProvider.codex),
+    commandCode: getAppModelOptions("commandCode", customModelsByProvider.commandCode),
     claudeAgent: getAppModelOptions("claudeAgent", customModelsByProvider.claudeAgent),
     cursor: getAppModelOptions("cursor", customModelsByProvider.cursor),
     antigravity: getAppModelOptions("antigravity", customModelsByProvider.antigravity),
@@ -1003,6 +1049,7 @@ export function getProviderStartOptions(
     | "claudeBinaryPath"
     | "codexBinaryPath"
     | "codexHomePath"
+    | "commandCodeBinaryPath"
     | "cursorApiEndpoint"
     | "cursorBinaryPath"
     | "antigravityBinaryPath"
@@ -1022,6 +1069,10 @@ export function getProviderStartOptions(
     settings.claudeBinaryPath,
   );
   const codexBinaryPath = normalizeProviderBinaryPathOverride("codex", settings.codexBinaryPath);
+  const commandCodeBinaryPath = normalizeProviderBinaryPathOverride(
+    "commandCode",
+    settings.commandCodeBinaryPath,
+  );
   const cursorBinaryPath = normalizeProviderBinaryPathOverride("cursor", settings.cursorBinaryPath);
   const antigravityBinaryPath = normalizeProviderBinaryPathOverride(
     "antigravity",
@@ -1044,6 +1095,13 @@ export function getProviderStartOptions(
           codex: {
             ...(codexBinaryPath ? { binaryPath: codexBinaryPath } : {}),
             ...(settings.codexHomePath ? { homePath: settings.codexHomePath } : {}),
+          },
+        }
+      : {}),
+    ...(commandCodeBinaryPath
+      ? {
+          commandCode: {
+            binaryPath: commandCodeBinaryPath,
           },
         }
       : {}),
@@ -1128,6 +1186,7 @@ export function getCustomBinaryPathForProvider(
     AppSettings,
     | "claudeBinaryPath"
     | "codexBinaryPath"
+    | "commandCodeBinaryPath"
     | "cursorBinaryPath"
     | "antigravityBinaryPath"
     | "grokBinaryPath"
@@ -1141,6 +1200,8 @@ export function getCustomBinaryPathForProvider(
   switch (provider) {
     case "codex":
       return normalizeProviderBinaryPathOverride(provider, settings.codexBinaryPath);
+    case "commandCode":
+      return normalizeProviderBinaryPathOverride(provider, settings.commandCodeBinaryPath);
     case "claudeAgent":
       return normalizeProviderBinaryPathOverride(provider, settings.claudeBinaryPath);
     case "cursor":

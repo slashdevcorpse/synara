@@ -182,6 +182,7 @@ function SettingsRouteView() {
   const activeSectionItem = SETTINGS_NAV_ITEMS.find((item) => item.id === activeSection)!;
 
   const {
+    defaultThemeMode,
     isDefaultActiveTheme,
     resetAllThemes,
     resolvedTheme,
@@ -222,7 +223,7 @@ function SettingsRouteView() {
   }, [activeSection, settingsTarget]);
 
   const changedSettingLabels = [
-    ...(theme !== "system" ? ["Theme"] : []),
+    ...(theme !== defaultThemeMode ? ["Theme"] : []),
     ...(!isDefaultActiveTheme ? [`${resolvedTheme === "dark" ? "Dark" : "Light"} theme pack`] : []),
     ...(settings.defaultProvider !== defaults.defaultProvider ? ["Default provider"] : []),
     ...(settings.defaultThreadEnvMode !== defaults.defaultThreadEnvMode ? ["New thread mode"] : []),
@@ -271,8 +272,12 @@ function SettingsRouteView() {
     ...(settings.confirmTerminalTabClose !== defaults.confirmTerminalTabClose
       ? ["Terminal close confirmation"]
       : []),
+    ...(settings.terminalRightClickToPaste !== defaults.terminalRightClickToPaste
+      ? ["Terminal right-click paste"]
+      : []),
     ...(isGitTextGenerationModelDirty ? ["Git writing model"] : []),
     ...(settings.customCodexModels.length > 0 ||
+    settings.customCommandCodeModels.length > 0 ||
     settings.customClaudeModels.length > 0 ||
     settings.customCursorModels.length > 0 ||
     settings.customAntigravityModels.length > 0 ||
@@ -299,7 +304,6 @@ function SettingsRouteView() {
     );
     if (!confirmed) return;
 
-    setTheme("system");
     resetAllThemes();
     resetSettings();
     setResetEpoch((current) => current + 1);
@@ -631,8 +635,8 @@ function SettingsRouteView() {
             title="Theme"
             description="Choose how Synara looks across the app."
             resetAction={
-              theme !== "system" ? (
-                <SettingResetButton label="theme" onClick={() => setTheme("system")} />
+              theme !== defaultThemeMode ? (
+                <SettingResetButton label="theme" onClick={() => setTheme(defaultThemeMode)} />
               ) : null
             }
             control={
@@ -933,6 +937,15 @@ function SettingsRouteView() {
             "Set the default wrap state when the diff panel opens. The in-panel wrap toggle only affects the current diff session.",
           resetLabel: "diff line wrapping",
           ariaLabel: "Wrap diff lines by default",
+        })}
+
+        {renderBooleanSettingRow({
+          settingKey: "terminalRightClickToPaste",
+          title: "Terminal right-click paste",
+          description:
+            "Paste clipboard text with a bare right-click. Ctrl+right-click keeps the context menu.",
+          resetLabel: "terminal right-click paste",
+          ariaLabel: "Paste in the terminal with right-click",
         })}
       </SettingsSection>
 

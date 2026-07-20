@@ -157,6 +157,8 @@ import {
   groupHeartbeatAutomationsByTargetThread,
 } from "../routes/-automations.shared";
 import { shouldRenderTerminalWorkspace } from "./ChatView.logic";
+import { AgentActivityPulse } from "./chat/AgentActivityPulse";
+import type { AgentActivityState } from "./chat/agentActivityPulse.logic";
 import { CHAT_SURFACE_HEADER_HEIGHT_CLASS } from "./chat/chatHeaderControls";
 import { SidebarLeadingControls } from "./SidebarHeaderNavigationControls";
 import { SynaraLogo } from "./SynaraLogo";
@@ -260,6 +262,8 @@ import {
 } from "./ui/sidebar";
 import { useThreadSelectionStore } from "../threadSelectionStore";
 import {
+  archiveSelectedThreadEntriesAndReconcileSelection,
+  buildMultiSelectThreadContextMenuItems,
   describeAddProjectError,
   buildProjectThreadTree,
   derivePinnedProjectIdsForSidebar,
@@ -516,9 +520,16 @@ function WorktreeBadgeGlyph({ className }: { className?: string }) {
   return <WorktreeIcon aria-hidden="true" className={sidebarGlyphClass("meta", className)} />;
 }
 
-// Trailing row status: spinner while working, check when completed, otherwise a
-// colored status dot. Thread rows and project headers use the same glyph so a
-// collapsed project still advertises active child chats.
+const SIDEBAR_WORKING_ACTIVITY_STATE = {
+  phase: "thinking",
+  toolCount: 0,
+  subagentCount: 0,
+} satisfies Pick<AgentActivityState, "phase" | "toolCount" | "subagentCount">;
+
+// Trailing row status: activity pulse while working, spinner while connecting,
+// check when completed, otherwise a colored status dot. Thread rows and project
+// headers use the same glyph so a collapsed project still advertises active
+// child chats.
 function SidebarStatusTrailingGlyph({ status }: { status: ThreadStatusPill }) {
   if (status.label === "Completed") {
     // Match the worktree/other trailing chips' optical size (15px) so the green
@@ -529,6 +540,9 @@ function SidebarStatusTrailingGlyph({ status }: { status: ThreadStatusPill }) {
         className={cn(SIDEBAR_TRAILING_ICON_CLASS, status.colorClass)}
       />
     );
+  }
+  if (status.label === "Working") {
+    return <AgentActivityPulse state={SIDEBAR_WORKING_ACTIVITY_STATE} variant="dot" />;
   }
   if (status.pulse) {
     return <ThreadRunningSpinner />;
@@ -2998,15 +3012,31 @@ export default function Sidebar() {
       const ids = [...selectedThreadIds];
       if (ids.length === 0) return;
       const count = ids.length;
+      const currentState = useStore.getState();
+      const hasRunningSelectedThread = ids.some((id) => {
+        const thread = getThreadFromState(currentState, id);
+        return thread !== undefined && isThreadRunningTurn(thread);
+      });
 
-      const clicked = await api.contextMenu.show(
-        [
-          { id: "mark-unread", label: `Mark unread (${count})` },
-          { id: "archive", label: `Archive (${count})` },
-          { id: "delete", label: `Delete (${count})`, destructive: true },
-        ],
-        position,
-      );
+      const clicked = await (async () => {
+        try {
+          return await api.contextMenu.show(
+            buildMultiSelectThreadContextMenuItems({
+              count,
+              archiveDisabled: hasRunningSelectedThread,
+            }),
+            position,
+          );
+        } catch (error) {
+          console.error("Failed to open the selected-thread context menu", error);
+          toastManager.add({
+            type: "error",
+            title: "Could not open thread actions",
+            description: error instanceof Error ? error.message : "An unexpected error occurred.",
+          });
+          return null;
+        }
+      })();
 
       if (clicked === "mark-unread") {
         for (const id of ids) {
@@ -3018,20 +3048,80 @@ export default function Sidebar() {
       }
 
       if (clicked === "archive") {
+        // Native and browser menus both prevent this activation. Keep the action guarded in case
+        // a stale or third-party bridge still returns a disabled item.
+        if (hasRunningSelectedThread) return;
+
         if (appSettings.confirmThreadArchive) {
-          const confirmed = await api.dialogs.confirm(
-            [
-              `Archive ${count} ${pluralize(count, "thread")}?`,
-              "Archived threads are hidden from the sidebar but can be restored later.",
-            ].join("\n"),
-          );
+          const confirmed = await (async () => {
+            try {
+              return await api.dialogs.confirm(
+                [
+                  `Archive ${count} ${pluralize(count, "thread")}?`,
+                  "Archived threads are hidden from the sidebar but can be restored later.",
+                ].join("\n"),
+              );
+            } catch (error) {
+              console.error("Failed to confirm selected-thread archive", error);
+              toastManager.add({
+                type: "error",
+                title: "Could not confirm archive",
+                description:
+                  error instanceof Error ? error.message : "An unexpected error occurred.",
+              });
+              return false;
+            }
+          })();
           if (!confirmed) return;
         }
 
-        for (const id of ids) {
-          await archiveThread(id);
+        const fallbackExcludedThreadIds = new Set(ids);
+        const outcome = await archiveSelectedThreadEntriesAndReconcileSelection({
+          entries: ids,
+          archive: (id, onArchived) =>
+            archiveThread(id, {
+              onArchived,
+              fallbackExcludedThreadIds,
+            }),
+          removeFromSelection,
+        });
+
+        if (outcome.followupFailures.length > 0) {
+          for (const failure of outcome.followupFailures) {
+            console.error("Thread archived but follow-up navigation failed", failure);
+          }
+          const firstFailure = outcome.followupFailures[0]!;
+          const detail =
+            firstFailure.kind === "thrown" && firstFailure.error instanceof Error
+              ? firstFailure.error.message
+              : "The sidebar could not navigate away from an archived thread.";
+          toastManager.add({
+            type: "warning",
+            title:
+              outcome.archivedThreadIds.length === 1
+                ? "Thread archived; navigation failed"
+                : "Threads archived; navigation failed",
+            description: detail,
+          });
         }
-        removeFromSelection(ids);
+
+        if (outcome.mutationFailure) {
+          console.error("Selected-thread archive stopped at the first mutation failure", {
+            failure: outcome.mutationFailure,
+            archivedThreadIds: outcome.archivedThreadIds,
+          });
+          const detail =
+            outcome.mutationFailure.kind === "thrown" &&
+            outcome.mutationFailure.error instanceof Error
+              ? outcome.mutationFailure.error.message
+              : "The archive request did not complete.";
+          const unarchivedCount = ids.length - outcome.archivedThreadIds.length;
+          toastManager.add({
+            type: "error",
+            title: "Failed to archive threads",
+            description: `${detail} Stopped with ${unarchivedCount} selected ${pluralize(unarchivedCount, "thread")} unarchived.`,
+          });
+        }
         return;
       }
 

@@ -220,10 +220,10 @@ describe("collectClaudeWorkflowRuntime", () => {
         // Nothing on disk yet: quiet no-op.
         expect(yield* collectClaudeWorkflowRuntime(fileSystem, dir, state)).toBe(false);
 
-        writeFileSync(path.join(dir, "journal.jsonl"), `${JOURNAL_STARTED}\n`);
+        writeFileSync(path.join(dir, "journal.jsonl"), `${JOURNAL_STARTED}\r\n`);
         writeFileSync(
           path.join(dir, "agent-a423ae8cef86a1ed4.jsonl"),
-          `${AGENT_USER_LINE}\n${AGENT_TOOL_USE_LINE}\n`,
+          `${AGENT_USER_LINE}\r\n${AGENT_TOOL_USE_LINE}\r\n`,
         );
         expect(yield* collectClaudeWorkflowRuntime(fileSystem, dir, state)).toBe(true);
         const agent = state.agents.get("a423ae8cef86a1ed4")!;
@@ -234,13 +234,11 @@ describe("collectClaudeWorkflowRuntime", () => {
         // No growth: no change reported.
         expect(yield* collectClaudeWorkflowRuntime(fileSystem, dir, state)).toBe(false);
 
-        // Appended lines (including a trailing partial) are picked up; the
-        // partial line stays unconsumed.
-        appendFileSync(
-          path.join(dir, "agent-a423ae8cef86a1ed4.jsonl"),
-          `${AGENT_FINAL_LINE}\n{"tr`,
-        );
-        appendFileSync(path.join(dir, "journal.jsonl"), `${JOURNAL_RESULT}\n`);
+        // A CRLF split across ticks remains unconsumed until its LF arrives.
+        appendFileSync(path.join(dir, "agent-a423ae8cef86a1ed4.jsonl"), `${AGENT_FINAL_LINE}\r`);
+        expect(yield* collectClaudeWorkflowRuntime(fileSystem, dir, state)).toBe(false);
+        appendFileSync(path.join(dir, "agent-a423ae8cef86a1ed4.jsonl"), '\n{"tr');
+        appendFileSync(path.join(dir, "journal.jsonl"), `${JOURNAL_RESULT}\r\n`);
         expect(yield* collectClaudeWorkflowRuntime(fileSystem, dir, state)).toBe(true);
         expect(agent.state).toBe("completed");
         expect(agent.toolCalls).toBe(2);

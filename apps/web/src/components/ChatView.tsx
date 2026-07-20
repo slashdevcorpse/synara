@@ -336,6 +336,7 @@ import { useTemporaryThreadStore } from "../temporaryThreadStore";
 import { useComposerFocusRequestStore } from "../composerFocusRequestStore";
 import { useWorkflowRunUiStore, useWorkflowRunUiThreadState } from "../workflowRunUiStore";
 import { appendComposerPromptText } from "../lib/chatReferences";
+import { canAcceptComposerFileReferenceDrop } from "../lib/composerFileReferenceDrag";
 import {
   appendOriginalComposerPromptBlocks,
   appendTerminalContextsToPrompt,
@@ -433,6 +434,8 @@ import { ChatTranscriptPane } from "./chat/ChatTranscriptPane";
 import type { MessagesTimelineController } from "./chat/MessagesTimeline";
 import { buildTurnDiffSummaryByAssistantMessageId } from "./chat/MessagesTimeline.logic";
 import { deriveAgentActivityTimelineState } from "./chat/agentActivity.logic";
+import { AgentActivityPulse } from "./chat/AgentActivityPulse";
+import { useAgentActivityState } from "./chat/useAgentActivityState";
 import { ExpandedImagePreview } from "./chat/ExpandedImagePreview";
 import {
   AVAILABLE_PROVIDER_OPTIONS,
@@ -480,6 +483,7 @@ import {
 } from "./chat/WorkflowRunCard.logic";
 import { ComposerColumnFrame } from "./chat/ComposerColumnFrame";
 import { useTranscriptAssistantSelectionAction } from "./chat/useTranscriptAssistantSelectionAction";
+import { useAgentActivityScrollPause } from "./chat/useAgentActivityScrollPause";
 import { resolveTranscriptMarkerRange } from "./chat/chatSelectionActions";
 import {
   dispatchThreadMarkerAdd,
@@ -860,6 +864,8 @@ function getProviderStartOptionsCustomBinaryPath(
   switch (provider) {
     case "codex":
       return normalizeCustomBinaryPath(providerOptions?.codex?.binaryPath);
+    case "commandCode":
+      return normalizeCustomBinaryPath(providerOptions?.commandCode?.binaryPath);
     case "claudeAgent":
       return normalizeCustomBinaryPath(providerOptions?.claudeAgent?.binaryPath);
     case "antigravity":
@@ -1388,6 +1394,8 @@ export default function ChatView({
   const [isTraitsPickerOpen, setIsTraitsPickerOpen] = useState(false);
   const legendListRef = useRef<LegendListRef | null>(null);
   const timelineControllerRef = useRef<MessagesTimelineController | null>(null);
+  const { scopeRef: agentActivityScopeRef, markTranscriptScrollActivity } =
+    useAgentActivityScrollPause();
   const isAtEndRef = useRef(true);
   const autoFollowThreadIdRef = useRef<ThreadId | null>(null);
   const pendingInteractionAnchorRef = useRef<{
@@ -2034,6 +2042,7 @@ export default function ChatView({
 
     return {
       codex: resolveHint("codex"),
+      commandCode: resolveHint("commandCode"),
       claudeAgent: resolveHint("claudeAgent"),
       cursor: resolveHint("cursor"),
       antigravity: resolveHint("antigravity"),
@@ -2630,6 +2639,18 @@ export default function ChatView({
     ],
   );
   const isSendBusy = localDispatch !== null && !serverAcknowledgedLocalDispatch;
+  const agentActivityState = useAgentActivityState({
+    threadId: activeThread?.id ?? null,
+    hasMessages: (activeThread?.messages.length ?? 0) > 0,
+    localDispatchPending: isSendBusy,
+    session: activeThread?.session ?? null,
+    latestTurn: activeLatestTurn,
+    messages: activeThread?.messages ?? EMPTY_MESSAGES,
+    activities: threadActivities,
+    hasPendingApproval: activePendingApproval !== null,
+    hasPendingUserInput: activePendingUserInput !== null,
+    threadError: activeThread?.error ?? null,
+  });
   const activeWorktreeSetup = localDispatch?.worktreeSetup ?? null;
   const isPreparingWorktree = activeWorktreeSetup !== null;
   const hasLiveTurn = phase === "running";
@@ -4612,7 +4633,9 @@ export default function ChatView({
     clearTranscriptAutoFollow();
   }, [clearTranscriptAutoFollow]);
   const onMessagesPointerUpBase = useCallback(() => {}, []);
-  const onMessagesScrollBase = useCallback(() => {}, []);
+  const onMessagesScrollBase = useCallback(() => {
+    markTranscriptScrollActivity();
+  }, [markTranscriptScrollActivity]);
   const onMessagesTouchEndBase = useCallback(() => {}, []);
   const onMessagesTouchMoveBase = useCallback(() => {
     clearTranscriptAutoFollow();
@@ -5899,6 +5922,10 @@ export default function ChatView({
     onComposerDragOver,
     onComposerDragLeave,
     onComposerDrop,
+    onComposerReferenceDragEnterCapture,
+    onComposerReferenceDragOverCapture,
+    onComposerReferenceDragLeaveCapture,
+    onComposerReferenceDropCapture,
   } = useComposerDropzone({
     addImages: addComposerImages,
     fileSupport: {
@@ -5906,6 +5933,21 @@ export default function ChatView({
       addFiles: addComposerFiles,
     },
     appendReferenceText: (referenceText) => appendComposerPromptText(threadId, referenceText),
+    canAppendReferenceText: () =>
+      !sendPreflightInFlightRef.current &&
+      canAcceptComposerFileReferenceDrop({
+        isConnecting,
+        isComposerApprovalState,
+        isSendBusy,
+        pendingUserInputCount: pendingUserInputs.length,
+      }),
+    onReferenceDropRejected: () => {
+      toastManager.add({
+        type: "error",
+        title: "Unable to add to chat",
+        description: "The composer is busy. Try again when it is ready.",
+      });
+    },
     appendPathMentions: (paths) => {
       for (const absolutePath of paths) {
         appendComposerPromptText(threadId, formatComposerMentionToken(absolutePath));
@@ -9868,6 +9910,7 @@ export default function ChatView({
     availableEditors,
     activeThreadId: activeThread.id,
     activeProvider: activeThread.session?.provider ?? activeThread.modelSelection.provider,
+    agentActivityState,
     isStudioChat: isStudioContainer,
     showGitActions,
     diffOpen: resolvedDiffOpen,
@@ -10058,6 +10101,7 @@ export default function ChatView({
                   composerMenuOpen && !isComposerApprovalState && "overflow-visible",
                 )}
               >
+                <AgentActivityPulse state={agentActivityState} variant="composer" />
                 <ComposerInputBanners
                   roundedTopReset={false}
                   planFollowUp={
@@ -10474,10 +10518,15 @@ export default function ChatView({
 
   return (
     <div
+      ref={agentActivityScopeRef}
       className={cn(
         "relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden",
         CHAT_BACKGROUND_CLASS_NAME,
       )}
+      onDragEnterCapture={onComposerReferenceDragEnterCapture}
+      onDragOverCapture={onComposerReferenceDragOverCapture}
+      onDragLeaveCapture={onComposerReferenceDragLeaveCapture}
+      onDropCapture={onComposerReferenceDropCapture}
       onDragEnter={onComposerDragEnter}
       onDragOver={onComposerDragOver}
       onDragLeave={onComposerDragLeave}
@@ -10713,6 +10762,7 @@ export default function ChatView({
                 <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden">
                   <ChatTranscriptPane
                     activeThreadId={activeThread.id}
+                    agentActivityState={agentActivityState}
                     activeTurnId={activeThread.session?.activeTurnId ?? null}
                     agentActivityDetail={openAgentActivityDetail}
                     hasMessages={timelineEntries.length > 0}

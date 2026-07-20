@@ -7,20 +7,24 @@ import { type ProjectId, ThreadId } from "@synara/contracts";
 import { pluralize } from "@synara/shared/text";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import type { AppSettings } from "../appSettings";
 import { useComposerDraftStore } from "../composerDraftStore";
 import { showConfirmDialogFallback } from "../confirmDialogFallback";
 import {
-  getFallbackThreadIdAfterDelete,
+  archiveThreadEntry,
   derivePinnedThreadIdsForSidebar,
+  getFallbackThreadIdAfterDelete,
   isLatestPinnedThreadMutation,
+  runArchiveFallbackNavigation,
+  runThreadArchiveWithCurrentRoute,
 } from "../components/Sidebar.logic";
 import { toastManager } from "../components/ui/toast";
 import { deleteActiveThreadFromClient } from "../lib/activeThreadDelete";
 import { reconcileDeletedThreadsFromClient } from "../lib/deletedThreadClientReconciliation";
 import { gitRemoveWorktreeMutationOptions } from "../lib/gitReactQuery";
+import type { StartContainerChatResult } from "../lib/startContainerChat";
 import {
   archiveThreadFromClient,
   isThreadAlreadyUnarchivedError,
@@ -59,7 +63,7 @@ export function useSidebarThreadActions(input: {
     "confirmThreadArchive" | "confirmThreadDelete" | "sidebarThreadSortOrder"
   >;
   readonly clearTerminalState: (threadId: ThreadId) => void;
-  readonly handleNewChat: (options?: { fresh?: boolean }) => Promise<unknown>;
+  readonly handleNewChat: (options?: { fresh?: boolean }) => Promise<StartContainerChatResult>;
   readonly projectById: ReadonlyMap<ProjectId, Project>;
   readonly routeSplitViewId: string | null;
   readonly routeThreadId: ThreadId | null;
@@ -98,6 +102,7 @@ export function useSidebarThreadActions(input: {
 
   const archivePendingThreadIdsRef = useRef<Set<ThreadId>>(new Set());
   const archiveUndoPendingThreadIdsRef = useRef<Set<ThreadId>>(new Set());
+  const routeThreadIdRef = useRef(routeThreadId);
   const legacyPinMigrationThreadIdsRef = useRef(new Set<ThreadId>());
   const optimisticPinnedStateByThreadIdRef = useRef(new Map<ThreadId, boolean>());
   const latestPinnedMutationVersionByThreadIdRef = useRef(new Map<ThreadId, number>());
@@ -105,6 +110,10 @@ export function useSidebarThreadActions(input: {
   const [optimisticPinnedStateByThreadId, setOptimisticPinnedStateByThreadId] = useState<
     ReadonlyMap<ThreadId, boolean>
   >(() => new Map());
+
+  useLayoutEffect(() => {
+    routeThreadIdRef.current = routeThreadId;
+  }, [routeThreadId]);
 
   useEffect(() => {
     sidebarThreadSummaryByIdRef.current = sidebarThreadSummaryById;
@@ -371,7 +380,13 @@ export function useSidebarThreadActions(input: {
   );
 
   const archiveThread = useCallback(
-    async (threadId: ThreadId): Promise<boolean> => {
+    async (
+      threadId: ThreadId,
+      options?: {
+        readonly onArchived?: () => void;
+        readonly fallbackExcludedThreadIds?: ReadonlySet<ThreadId>;
+      },
+    ): Promise<boolean> => {
       const api = readNativeApi();
       if (!api) return false;
       const thread = getThreadFromState(useStore.getState(), threadId);
@@ -389,31 +404,38 @@ export function useSidebarThreadActions(input: {
 
       pendingThreadIds.add(threadId);
       const runArchive = async (): Promise<boolean> => {
-        await archiveThreadFromClient(api.orchestration, threadId);
-        if (routeThreadId === threadId) {
-          const fallbackThreadId = getFallbackThreadIdAfterDelete({
-            threads: sidebarThreads,
-            deletedThreadId: threadId,
-            deletedThreadIds: new Set<ThreadId>(),
-            sortOrder: appSettings.sidebarThreadSortOrder,
-          });
-          if (fallbackThreadId) {
-            await navigate({
-              to: "/$threadId",
-              params: { threadId: fallbackThreadId },
-              replace: true,
+        await runThreadArchiveWithCurrentRoute({
+          threadId,
+          archiveMutation: () => archiveThreadFromClient(api.orchestration, threadId),
+          ...(options?.onArchived === undefined ? {} : { onArchived: options.onArchived }),
+          getCurrentRouteThreadId: () => routeThreadIdRef.current,
+          navigateFromArchivedThread: async () => {
+            const fallbackThreadId = getFallbackThreadIdAfterDelete({
+              threads: sidebarThreads,
+              deletedThreadId: threadId,
+              deletedThreadIds: options?.fallbackExcludedThreadIds ?? new Set<ThreadId>(),
+              sortOrder: appSettings.sidebarThreadSortOrder,
             });
-          } else {
-            await handleNewChat({ fresh: true });
-          }
-        }
+            if (fallbackThreadId) {
+              await navigate({
+                to: "/$threadId",
+                params: { threadId: fallbackThreadId },
+                replace: true,
+              });
+              return;
+            }
+            await runArchiveFallbackNavigation({
+              startFreshChat: () => handleNewChat({ fresh: true }),
+            });
+          },
+        });
         return true;
       };
       return runArchive().finally(() => {
         pendingThreadIds.delete(threadId);
       });
     },
-    [appSettings.sidebarThreadSortOrder, handleNewChat, routeThreadId, sidebarThreads, navigate],
+    [appSettings.sidebarThreadSortOrder, handleNewChat, navigate, sidebarThreads],
   );
 
   const restoreArchivedThreadFromToast = useCallback(
@@ -492,19 +514,38 @@ export function useSidebarThreadActions(input: {
 
   const archiveThreadWithUndo = useCallback(
     async (threadId: ThreadId) => {
-      try {
-        const returnToThreadOnUndo = routeThreadId === threadId;
-        const archived = await archiveThread(threadId);
-        if (archived) showArchiveUndoToast(threadId, { returnToThreadOnUndo });
-      } catch (error) {
+      const returnToThreadOnUndo = routeThreadIdRef.current === threadId;
+      const outcome = await archiveThreadEntry({
+        threadId,
+        archive: (id, onArchived) => archiveThread(id, { onArchived }),
+      });
+      if (outcome.status !== "mutation-failure") {
+        showArchiveUndoToast(threadId, { returnToThreadOnUndo });
+      }
+      if (outcome.status === "followup-failure") {
+        console.error("Thread archived but follow-up navigation failed", outcome.failure);
+        toastManager.add({
+          type: "warning",
+          title: "Thread archived; navigation failed",
+          description:
+            outcome.failure.kind === "thrown" && outcome.failure.error instanceof Error
+              ? outcome.failure.error.message
+              : "The sidebar could not navigate away from the archived thread.",
+        });
+        return;
+      }
+      if (outcome.status === "mutation-failure" && outcome.failure.kind === "thrown") {
         toastManager.add({
           type: "error",
           title: "Could not archive thread",
-          description: error instanceof Error ? error.message : "Unable to archive the thread.",
+          description:
+            outcome.failure.error instanceof Error
+              ? outcome.failure.error.message
+              : "Unable to archive the thread.",
         });
       }
     },
-    [archiveThread, routeThreadId, showArchiveUndoToast],
+    [archiveThread, showArchiveUndoToast],
   );
 
   const confirmAndArchiveThread = useCallback(
@@ -572,35 +613,65 @@ export function useSidebarThreadActions(input: {
       if (!confirmed) return;
 
       let archivedCount = 0;
+      const archivedThreadIds: ThreadId[] = [];
       let failureCount = 0;
+      let followupFailureCount = 0;
+      const fallbackExcludedThreadIds = new Set(archivableThreads.map((thread) => thread.id));
       for (const thread of archivableThreads) {
-        try {
-          if (await archiveThread(thread.id)) archivedCount += 1;
-          else failureCount += 1;
-        } catch (error) {
+        const outcome = await archiveThreadEntry({
+          threadId: thread.id,
+          archive: (id, onArchived) =>
+            archiveThread(id, {
+              onArchived,
+              fallbackExcludedThreadIds,
+            }),
+        });
+        if (outcome.status === "success") {
+          archivedCount += 1;
+          archivedThreadIds.push(thread.id);
+          continue;
+        }
+        if (outcome.status === "followup-failure") {
+          archivedCount += 1;
+          archivedThreadIds.push(thread.id);
+          followupFailureCount += 1;
+          console.error("Thread archived but follow-up navigation failed during project archive", {
+            threadId: thread.id,
+            projectId,
+            failure: outcome.failure,
+          });
+        } else {
           failureCount += 1;
           console.error("Failed to archive thread during bulk archive", {
             threadId: thread.id,
             projectId,
-            error,
+            failure: outcome.failure,
           });
         }
       }
-      removeFromSelection(archivableThreads.map((thread) => thread.id));
+      removeFromSelection(archivedThreadIds);
       if (archivedCount > 0) {
-        const skippedDescription =
-          runningCount > 0
-            ? ` Skipped ${runningCount} running ${pluralize(runningCount, "thread")}.`
-            : "";
+        const archiveSummary: string[] = [];
+        if (failureCount > 0) {
+          archiveSummary.push(
+            `Failed to archive ${failureCount} ${pluralize(failureCount, "thread")}.`,
+          );
+        }
+        if (followupFailureCount > 0) {
+          archiveSummary.push(
+            `Navigation failed after archiving ${followupFailureCount} ${pluralize(followupFailureCount, "thread")}.`,
+          );
+        }
+        if (runningCount > 0) {
+          archiveSummary.push(
+            `Skipped ${runningCount} running ${pluralize(runningCount, "thread")}.`,
+          );
+        }
         toastManager.add({
-          type: failureCount > 0 ? "warning" : "success",
+          type: failureCount > 0 || followupFailureCount > 0 ? "warning" : "success",
           title: archivedCount === 1 ? "Thread archived" : `Archived ${archivedCount} threads`,
           description:
-            failureCount > 0
-              ? `Failed to archive ${failureCount} ${pluralize(failureCount, "thread")}.${skippedDescription}`
-              : runningCount > 0
-                ? skippedDescription.trim()
-                : `"${project.name}" cleared.`,
+            archiveSummary.length > 0 ? archiveSummary.join(" ") : `"${project.name}" cleared.`,
         });
       } else if (failureCount > 0) {
         toastManager.add({

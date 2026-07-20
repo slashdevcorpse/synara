@@ -15,6 +15,7 @@ import {
   sanitizeFeatureBranchName,
 } from "@synara/shared/git";
 import { parseGitHubRepositoryNameWithOwnerFromRemoteUrl } from "@synara/shared/githubRepository";
+import { splitLines } from "@synara/shared/text";
 import { resolveWorktreeHandoffIntent } from "@synara/shared/worktreeHandoff";
 
 import { GitManagerError } from "../Errors.ts";
@@ -1720,8 +1721,7 @@ export const makeGitManager = Effect.gen(function* () {
         timeoutMs: 5_000,
       });
       if (listResult.code !== 0) return;
-      const index = listResult.stdout
-        .split("\n")
+      const index = splitLines(listResult.stdout)
         .map((line) => line.trim())
         .filter((line) => line.length > 0)
         .indexOf(stashSha);

@@ -64,6 +64,26 @@ describe("formatProviderModelOptionName", () => {
 });
 
 describe("mergeDynamicModelOptions", () => {
+  it("uses Command Code runtime discovery as authoritative while retaining saved custom models", () => {
+    expect(
+      mergeDynamicModelOptions({
+        provider: "commandCode",
+        staticOptions: [
+          { slug: "gpt-5.6-sol", name: "GPT-5.6 Sol" },
+          { slug: "private/custom-model", name: "Custom Model", isCustom: true },
+        ],
+        dynamicModels: [
+          { slug: "gpt-5.6-terra", name: "GPT-5.6 Terra" },
+          { slug: "gpt-5.6-luna", name: "GPT-5.6 Luna" },
+        ],
+      }),
+    ).toEqual([
+      { slug: "gpt-5.6-terra", name: "GPT-5.6 Terra" },
+      { slug: "gpt-5.6-luna", name: "GPT-5.6 Luna" },
+      { slug: "private/custom-model", name: "Custom Model", isCustom: true },
+    ]);
+  });
+
   it("uses the live Antigravity catalog as authoritative and includes newly discovered models", () => {
     expect(
       mergeDynamicModelOptions({

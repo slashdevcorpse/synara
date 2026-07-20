@@ -3,6 +3,7 @@ import {
   AntigravityModelOptions,
   ClaudeModelOptions,
   CodexModelOptions,
+  CommandCodeModelOptions,
   CursorModelOptions,
   DroidModelOptions,
   GrokModelOptions,
@@ -53,6 +54,7 @@ export const ORCHESTRATION_WS_CHANNELS = {
 
 export const ProviderKind = Schema.Literals([
   "codex",
+  "commandCode",
   "claudeAgent",
   "cursor",
   "antigravity",
@@ -84,6 +86,13 @@ export const CodexModelSelection = Schema.Struct({
   options: Schema.optional(CodexModelOptions),
 });
 export type CodexModelSelection = typeof CodexModelSelection.Type;
+
+export const CommandCodeModelSelection = Schema.Struct({
+  provider: Schema.Literal("commandCode"),
+  model: TrimmedNonEmptyString,
+  options: Schema.optional(CommandCodeModelOptions),
+});
+export type CommandCodeModelSelection = typeof CommandCodeModelSelection.Type;
 
 export const ClaudeModelSelection = Schema.Struct({
   provider: Schema.Literal("claudeAgent"),
@@ -143,6 +152,7 @@ export type PiModelSelection = typeof PiModelSelection.Type;
 
 export const ModelSelection = Schema.Union([
   CodexModelSelection,
+  CommandCodeModelSelection,
   ClaudeModelSelection,
   CursorModelSelection,
   AntigravityModelSelection,
@@ -157,6 +167,10 @@ export type ModelSelection = typeof ModelSelection.Type;
 export const CodexProviderStartOptions = Schema.Struct({
   binaryPath: Schema.optional(TrimmedNonEmptyString),
   homePath: Schema.optional(TrimmedNonEmptyString),
+});
+
+export const CommandCodeProviderStartOptions = Schema.Struct({
+  binaryPath: Schema.optional(TrimmedNonEmptyString),
 });
 
 export const ClaudeProviderStartOptions = Schema.Struct({
@@ -200,6 +214,7 @@ export const PiProviderStartOptions = Schema.Struct({
 
 export const ProviderStartOptions = Schema.Struct({
   codex: Schema.optional(CodexProviderStartOptions),
+  commandCode: Schema.optional(CommandCodeProviderStartOptions),
   claudeAgent: Schema.optional(ClaudeProviderStartOptions),
   cursor: Schema.optional(CursorProviderStartOptions),
   antigravity: Schema.optional(AntigravityProviderStartOptions),

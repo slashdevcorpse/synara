@@ -26,6 +26,7 @@ import {
 const MODEL_SLUG_SET_BY_PROVIDER: Record<ProviderKind, ReadonlySet<ModelSlug>> = {
   claudeAgent: new Set(MODEL_OPTIONS_BY_PROVIDER.claudeAgent.map((option) => option.slug)),
   codex: new Set(MODEL_OPTIONS_BY_PROVIDER.codex.map((option) => option.slug)),
+  commandCode: new Set(MODEL_OPTIONS_BY_PROVIDER.commandCode.map((option) => option.slug)),
   cursor: new Set(MODEL_OPTIONS_BY_PROVIDER.cursor.map((option) => option.slug)),
   // Antigravity's built-in list is intentionally empty; its CLI supplies the live catalog.
   antigravity: new Set<ModelSlug>(),

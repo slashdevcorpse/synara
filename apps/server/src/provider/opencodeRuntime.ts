@@ -39,6 +39,7 @@ import * as Semaphore from "effect/Semaphore";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 
 import { NetService, type NetServiceShape } from "@synara/shared/Net";
+import { splitLines } from "@synara/shared/text";
 import { prepareWindowsSafeProcess } from "@synara/shared/windowsProcess";
 import { buildProviderChildEnvironment } from "../providerChildEnvironment.ts";
 import {
@@ -240,7 +241,7 @@ export interface OpenCodeRuntimeShape {
 }
 
 function parseServerUrlFromOutput(output: string, readyPrefix: string): string | null {
-  for (const line of output.split("\n")) {
+  for (const line of splitLines(output)) {
     if (!line.startsWith(readyPrefix)) {
       continue;
     }
