@@ -316,6 +316,16 @@ function verifyDesktopStageLockAuthority(): void {
   );
   assertContains(
     buildScript,
+    "verifyReleaseWorktreeCleanliness(repoRoot)",
+    "Expected exact-provenance desktop builds to use content-aware worktree verification.",
+  );
+  assertNotContains(
+    buildScript,
+    '"--porcelain=v1"',
+    "Desktop release verification must not reject Windows stat-only worktree entries.",
+  );
+  assertContains(
+    buildScript,
     "synaraWindowsPublisherSubject: resolvedBuildConfig.windowsPublisherSubject",
     "Expected signed Windows packages to carry the independently configured certificate subject DN.",
   );
