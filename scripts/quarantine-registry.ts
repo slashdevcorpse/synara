@@ -49,7 +49,12 @@ function parseArgs(args: readonly string[]): {
   if (command === "run" && !platform) usage();
   if (command !== "summary" && githubStepSummary) usage();
   if (command !== "summary" && baselineRef) usage();
-  return { command, platform, baselineRef, githubStepSummary };
+  return {
+    command,
+    ...(platform === undefined ? {} : { platform }),
+    ...(baselineRef === undefined ? {} : { baselineRef }),
+    githubStepSummary,
+  };
 }
 
 function loadRegistry(repositoryRoot: string): QuarantineRegistry {
@@ -141,7 +146,10 @@ function main(): void {
     const baseline = args.baselineRef
       ? loadBaselineRegistry(repositoryRoot, args.baselineRef)
       : undefined;
-    const summary = formatQuarantineSummary(registry, { platform: args.platform, baseline });
+    const summary = formatQuarantineSummary(registry, {
+      ...(args.platform === undefined ? {} : { platform: args.platform }),
+      ...(baseline === undefined ? {} : { baseline }),
+    });
     process.stdout.write(summary);
     if (args.githubStepSummary) {
       const outputPath = process.env.GITHUB_STEP_SUMMARY;

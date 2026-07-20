@@ -6,7 +6,6 @@ import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
-import type { WindowsStorePackageDefinition } from "../apps/server/src/editorAppDiscovery.ts";
 import {
   alternatingVersionOrder,
   assertExpectedCommandDiscoveryCandidates,
@@ -45,10 +44,82 @@ const WINDOWS_FIXTURE_TEST_TIMEOUT_MS = 45_000;
 const NODE_ORACLE_PROCESS_TIMEOUT_MS = 30_000;
 const NODE_ORACLE_TEST_TIMEOUT_MS = 35_000;
 
-type WindowsStoreFixtureDiscovery = Pick<
-  typeof import("../apps/server/src/editorAppDiscovery.ts"),
-  "resolveWindowsStorePackageInstallLocation"
->;
+interface WindowsStorePackageDefinition {
+  readonly packageName: string;
+  readonly publisherId: string;
+}
+
+type WindowsStoreBulkLookupResult =
+  | {
+      readonly status: "success";
+      readonly installLocationsByFamily: Readonly<Record<string, string>>;
+      readonly subprocessCount: 0 | 1;
+    }
+  | {
+      readonly status: "failure";
+      readonly category: string;
+      readonly subprocessCount: 0 | 1;
+    };
+
+interface WindowsStoreFixtureDiscovery {
+  readonly clearWindowsStorePackageDiscoveryCache: () => void;
+  readonly resolveWindowsStorePackageInstallLocation: (
+    packages: readonly WindowsStorePackageDefinition[] | undefined,
+    platform: NodeJS.Platform,
+    env: NodeJS.ProcessEnv,
+    execFile: (
+      file: string,
+      args: readonly string[],
+      options: {
+        readonly encoding: "utf8";
+        readonly env: NodeJS.ProcessEnv;
+        readonly stdio: ["ignore", "pipe", "ignore"];
+        readonly timeout: number;
+        readonly windowsHide: true;
+      },
+    ) => string | Buffer,
+  ) => string | null;
+  readonly discoverWindowsStorePackageInstallLocations: (
+    packages: readonly WindowsStorePackageDefinition[],
+    options: {
+      readonly platform?: NodeJS.Platform;
+      readonly env?: NodeJS.ProcessEnv;
+      readonly signal?: AbortSignal;
+      readonly timeoutMs?: number;
+    },
+  ) => Promise<WindowsStoreBulkLookupResult>;
+}
+
+interface WindowsStoreFixtureOpen {
+  readonly resolveAvailableEditors: (
+    platform: NodeJS.Platform,
+    env: NodeJS.ProcessEnv,
+    options: {
+      readonly lookupWindowsStorePackage: (
+        packages: readonly WindowsStorePackageDefinition[] | undefined,
+        platform: NodeJS.Platform,
+        env: NodeJS.ProcessEnv,
+      ) => string | null;
+    },
+  ) => ReadonlyArray<string>;
+  readonly discoverAvailableEditors: (options: {
+    readonly platform: NodeJS.Platform;
+    readonly env: NodeJS.ProcessEnv;
+    readonly cwd: string;
+    readonly signal: AbortSignal;
+    readonly lookupWindowsStorePackages: (
+      packages: readonly WindowsStorePackageDefinition[],
+      options: {
+        readonly platform: NodeJS.Platform;
+        readonly env: NodeJS.ProcessEnv;
+        readonly signal?: AbortSignal;
+      },
+    ) => Promise<WindowsStoreBulkLookupResult>;
+  }) => Promise<{
+    readonly status: string;
+    readonly availableEditors?: ReadonlyArray<string>;
+  }>;
+}
 
 function resolveWindowsStoreFixture(
   discovery: WindowsStoreFixtureDiscovery,
@@ -404,10 +475,10 @@ describe("benchmark-windows-command-discovery", () => {
         });
         const open = (await import(
           new URL("../apps/server/src/open.ts", import.meta.url).href
-        )) as typeof import("../apps/server/src/open.ts");
+        )) as WindowsStoreFixtureOpen;
         const discovery = (await import(
           new URL("../apps/server/src/editorAppDiscovery.ts", import.meta.url).href
-        )) as typeof import("../apps/server/src/editorAppDiscovery.ts");
+        )) as WindowsStoreFixtureDiscovery;
         const env = editorFixtureEnvironment(fixture);
 
         discovery.clearWindowsStorePackageDiscoveryCache();
