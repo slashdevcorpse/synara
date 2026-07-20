@@ -89,7 +89,7 @@ function expectUnknown(
 
 describe("createWindowsProcessSnapshotCollector", () => {
   it("invokes absolute Windows PowerShell 5.1 once with the exact bounds and caller signal", async () => {
-    const runner = vi.fn(async (): Promise<ProcessRunResult> => processResult());
+    const runner = vi.fn<WindowsProcessSnapshotRunner>(async () => processResult());
     const capture = createWindowsProcessSnapshotCollector({
       platform: "win32",
       env: { SystemRoot: SYSTEM_ROOT },
