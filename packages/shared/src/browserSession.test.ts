@@ -2,9 +2,11 @@ import { describe, expect, it } from "vitest";
 
 import {
   BROWSER_SEARCH_URL_PREFIX,
+  BrowserLocalInputError,
   buildAcceptLanguageHeader,
   buildChromeClientHints,
   chromeMajorVersionFromUserAgent,
+  classifyBrowserInput,
   classifyBrowserWindowOpen,
   deriveChromeUserAgent,
   isLikelyOAuthHost,
@@ -68,6 +70,147 @@ describe("buildAcceptLanguageHeader", () => {
   });
 });
 
+describe("classifyBrowserInput", () => {
+  it("classifies blank, explicit web, about, domain, local-host, and search inputs", () => {
+    expect(classifyBrowserInput(undefined)).toEqual({ kind: "web-url", url: "about:blank" });
+    expect(classifyBrowserInput("https://example.com/path")).toEqual({
+      kind: "web-url",
+      url: "https://example.com/path",
+    });
+    expect(classifyBrowserInput("about:blank")).toEqual({
+      kind: "web-url",
+      url: "about:blank",
+    });
+    expect(classifyBrowserInput("phodex.app")).toEqual({
+      kind: "web-url",
+      url: "https://phodex.app/",
+    });
+    expect(classifyBrowserInput("localhost:5173")).toEqual({
+      kind: "web-url",
+      url: "http://localhost:5173/",
+    });
+    expect(classifyBrowserInput("how to bake bread")).toEqual({
+      kind: "search",
+      query: "how to bake bread",
+      url: `${BROWSER_SEARCH_URL_PREFIX}how%20to%20bake%20bread`,
+    });
+  });
+
+  it("recognizes Windows drive paths in both slash styles, including spaces", () => {
+    expect(classifyBrowserInput("C:\\work tree\\preview page.html")).toEqual({
+      kind: "local-file",
+      path: "C:\\work tree\\preview page.html",
+      source: "path",
+    });
+    expect(classifyBrowserInput("d:/work tree/preview page.html")).toEqual({
+      kind: "local-file",
+      path: "d:/work tree/preview page.html",
+      source: "path",
+    });
+  });
+
+  it("recognizes POSIX absolute paths", () => {
+    expect(classifyBrowserInput("/Users/test/work tree/index.html")).toEqual({
+      kind: "local-file",
+      path: "/Users/test/work tree/index.html",
+      source: "path",
+    });
+  });
+
+  it("decodes local Windows and POSIX file URLs", () => {
+    expect(classifyBrowserInput("file:///C:/work%20tree/index.html")).toEqual({
+      kind: "local-file",
+      path: "C:/work tree/index.html",
+      source: "file-url",
+    });
+    expect(classifyBrowserInput("file://localhost/Users/test/index.html")).toEqual({
+      kind: "local-file",
+      path: "/Users/test/index.html",
+      source: "file-url",
+    });
+  });
+
+  it("rejects UNC paths and non-local file URL hosts", () => {
+    expect(classifyBrowserInput("\\\\server\\share\\index.html")).toEqual({
+      kind: "rejected-local",
+      input: "\\\\server\\share\\index.html",
+      reason: "network-path",
+    });
+    expect(classifyBrowserInput("//server/share/index.html")).toEqual({
+      kind: "rejected-local",
+      input: "//server/share/index.html",
+      reason: "network-path",
+    });
+    expect(classifyBrowserInput("file://server/share/index.html")).toEqual({
+      kind: "rejected-local",
+      input: "file://server/share/index.html",
+      reason: "network-file-url",
+    });
+  });
+
+  it("rejects Windows device and root-relative candidates instead of searching", () => {
+    expect(classifyBrowserInput(String.raw`\\?\C:\work\index.html`)).toMatchObject({
+      kind: "rejected-local",
+    });
+    expect(classifyBrowserInput(String.raw`\\.\C:\work\index.html`)).toMatchObject({
+      kind: "rejected-local",
+    });
+    expect(classifyBrowserInput(String.raw`\??\C:\work\index.html`)).toEqual({
+      kind: "rejected-local",
+      input: String.raw`\??\C:\work\index.html`,
+      reason: "malformed-windows-path",
+    });
+    expect(classifyBrowserInput(String.raw`\Windows\System32\drivers\etc\hosts`)).toEqual({
+      kind: "rejected-local",
+      input: String.raw`\Windows\System32\drivers\etc\hosts`,
+      reason: "malformed-windows-path",
+    });
+  });
+
+  it("rejects encoded UNC file URLs and relative file URL syntax", () => {
+    expect(classifyBrowserInput("file:///%5C%5Cserver%5Cshare%5Cindex.html")).toMatchObject({
+      kind: "rejected-local",
+    });
+    expect(classifyBrowserInput("file:///%5C%5C?%5CC:%5Cwork%5Cindex.html")).toMatchObject({
+      kind: "rejected-local",
+    });
+    expect(classifyBrowserInput("file:///%5C%3F%3F%5CC:%5Cwork%5Cindex.html")).toMatchObject({
+      kind: "rejected-local",
+    });
+    expect(
+      classifyBrowserInput("file:///%5CWindows%5CSystem32%5Cdrivers%5Cetc%5Chosts"),
+    ).toMatchObject({ kind: "rejected-local" });
+    expect(classifyBrowserInput("file:relative/index.html")).toEqual({
+      kind: "rejected-local",
+      input: "file:relative/index.html",
+      reason: "malformed-file-url",
+    });
+    expect(classifyBrowserInput("file:C:relative\\index.html")).toEqual({
+      kind: "rejected-local",
+      input: "file:C:relative\\index.html",
+      reason: "malformed-file-url",
+    });
+  });
+
+  it("rejects malformed local inputs instead of treating them as searches", () => {
+    expect(classifyBrowserInput("C:relative\\index.html")).toEqual({
+      kind: "rejected-local",
+      input: "C:relative\\index.html",
+      reason: "malformed-windows-path",
+    });
+    expect(classifyBrowserInput("file:///C:/bad%E0%A4%A.html")).toEqual({
+      kind: "rejected-local",
+      input: "file:///C:/bad%E0%A4%A.html",
+      reason: "malformed-file-url",
+    });
+    expect(classifyBrowserInput("C:\\bad\0name.html")).toEqual({
+      kind: "rejected-local",
+      input: "C:\\bad\0name.html",
+      reason: "nul-byte",
+    });
+  });
+});
+
 describe("normalizeBrowserUrlInput", () => {
   it("adds https to naked domains", () => {
     expect(normalizeBrowserUrlInput("phodex.app")).toBe("https://phodex.app/");
@@ -80,6 +223,21 @@ describe("normalizeBrowserUrlInput", () => {
   it("turns spaced text into a search url", () => {
     expect(normalizeBrowserUrlInput("how to bake bread")).toBe(
       `${BROWSER_SEARCH_URL_PREFIX}how%20to%20bake%20bread`,
+    );
+  });
+
+  it("throws for recognized or rejected local inputs", () => {
+    expect(() => normalizeBrowserUrlInput("C:\\work tree\\index.html")).toThrow(
+      BrowserLocalInputError,
+    );
+    expect(() => normalizeBrowserUrlInput("file:///C:/work/index.html")).toThrow(
+      "Local files require an authorized preview capability.",
+    );
+    expect(() => normalizeBrowserUrlInput("\\\\server\\share\\index.html")).toThrow(
+      "This local file input is not supported.",
+    );
+    expect(() => normalizeBrowserUrlInput(String.raw`\Windows\System32\drivers\etc\hosts`)).toThrow(
+      BrowserLocalInputError,
     );
   });
 });
@@ -102,6 +260,19 @@ describe("resolveCopyableBrowserTabUrl", () => {
       }),
     ).toBe("https://current.example/");
     expect(resolveCopyableBrowserTabUrl({ url: "about:blank", lastCommittedUrl: null })).toBeNull();
+  });
+
+  it("never exposes an internal capability URL for a local-file tab", () => {
+    expect(
+      resolveCopyableBrowserTabUrl(
+        {
+          url: "http://127.0.0.1:58090/api/local-preview/token/index.html",
+          lastCommittedUrl: "http://127.0.0.1:58090/api/local-preview/token/index.html",
+          localFilePath: "C:\\work\\index.html",
+        },
+        "http://127.0.0.1:58090/api/local-preview/token/index.html",
+      ),
+    ).toBeNull();
   });
 });
 

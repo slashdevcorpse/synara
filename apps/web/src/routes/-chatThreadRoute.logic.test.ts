@@ -308,6 +308,24 @@ describe("resolveSplitPaneMaximizeDecision", () => {
       }),
     ).toBeNull();
   });
+
+  it("preserves an embedded file preview for transfer into the single-chat dock", () => {
+    expect(
+      resolveSplitPaneMaximizeDecision({
+        splitViewId: "split-files",
+        focusedThreadId: THREAD_ID,
+        focusedPanelState: {
+          panel: "file",
+          diffTurnId: null,
+          diffFilePath: null,
+          filePath: "README.md",
+        },
+      }),
+    ).toMatchObject({
+      threadId: THREAD_ID,
+      panelState: { panel: "file", filePath: "README.md" },
+    });
+  });
 });
 
 describe("resolveSplitPaneCloseDecision", () => {

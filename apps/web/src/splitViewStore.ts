@@ -8,6 +8,7 @@ import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
 
 import { type ChatRightPanel } from "./diffRouteSearch";
+import type { BrowserNavigationRequest } from "./browserNavigationRequest";
 import { randomUUID } from "./lib/utils";
 import {
   canSubdividePane,
@@ -29,9 +30,11 @@ export type SplitDirection = "horizontal" | "vertical";
 export type SplitDropSide = "first" | "second";
 
 export interface SplitViewPanePanelState {
-  panel: ChatRightPanel | null;
+  panel: ChatRightPanel | "file" | null;
   diffTurnId: TurnId | null;
   diffFilePath: string | null;
+  filePath: string | null;
+  browserRequest: BrowserNavigationRequest | null;
   hasOpenedPanel: boolean;
   lastOpenPanel: ChatRightPanel;
 }
@@ -115,9 +118,9 @@ interface SplitViewStore {
 // Keep the v1 suffix stable while using the Synara namespace; legacy
 // `synara:*` and `synara:*` keys are copied over by
 // `storageKeyMigration` before this store hydrates, so older payloads still
-// flow through the v1 -> v2 schema migration below.
+// flow through the versioned schema migrations below.
 const SPLIT_VIEW_STORAGE_KEY = "synara:split-view-state:v1";
-const SPLIT_VIEW_STORAGE_VERSION = 2;
+const SPLIT_VIEW_STORAGE_VERSION = 3;
 const DEFAULT_RATIO = 0.5;
 const MIN_RATIO = 0.25;
 const MAX_RATIO = 0.75;
@@ -132,6 +135,8 @@ function createDefaultPanePanelState(): SplitViewPanePanelState {
     panel: null,
     diffTurnId: null,
     diffFilePath: null,
+    filePath: null,
+    browserRequest: null,
     hasOpenedPanel: false,
     lastOpenPanel: "browser",
   };
@@ -211,13 +216,13 @@ function migrateLegacySplitView(legacy: LegacySplitViewLike): SplitView | null {
     kind: "leaf",
     id: randomUUID(),
     threadId: legacy.leftThreadId ?? null,
-    panel: { ...legacy.leftPanel },
+    panel: { ...createDefaultPanePanelState(), ...legacy.leftPanel },
   };
   const rightLeaf: LeafPane = {
     kind: "leaf",
     id: randomUUID(),
     threadId: legacy.rightThreadId ?? null,
-    panel: { ...legacy.rightPanel },
+    panel: { ...createDefaultPanePanelState(), ...legacy.rightPanel },
   };
 
   if (!leftLeaf.threadId && !rightLeaf.threadId) {
@@ -267,6 +272,67 @@ function migrateLegacyPersistedState(state: unknown): SplitViewStoreState | null
   return {
     splitViewsById,
     splitViewIdBySourceThreadId,
+  };
+}
+
+function mapPanePanelState(
+  pane: Pane,
+  transform: (panel: SplitViewPanePanelState) => SplitViewPanePanelState,
+): Pane {
+  if (pane.kind === "leaf") {
+    return { ...pane, panel: transform(pane.panel) };
+  }
+  return {
+    ...pane,
+    first: mapPanePanelState(pane.first, transform),
+    second: mapPanePanelState(pane.second, transform),
+  };
+}
+
+function migrateV2PersistedState(state: unknown): SplitViewStoreState {
+  if (!state || typeof state !== "object") {
+    return { splitViewsById: {}, splitViewIdBySourceThreadId: {} };
+  }
+  const candidate = state as Partial<SplitViewStoreState>;
+  const splitViewsById = Object.fromEntries(
+    Object.entries(candidate.splitViewsById ?? {}).map(([id, splitView]) => [
+      id,
+      splitView
+        ? {
+            ...splitView,
+            root: mapPanePanelState(splitView.root, (panel) => ({
+              ...createDefaultPanePanelState(),
+              ...panel,
+              filePath: null,
+              browserRequest: null,
+            })),
+          }
+        : splitView,
+    ]),
+  );
+  return {
+    splitViewsById,
+    splitViewIdBySourceThreadId: candidate.splitViewIdBySourceThreadId ?? {},
+  };
+}
+
+function stripTransientBrowserRequests(state: SplitViewStoreState): SplitViewStoreState {
+  return {
+    ...state,
+    splitViewsById: Object.fromEntries(
+      Object.entries(state.splitViewsById).map(([id, splitView]) => [
+        id,
+        splitView
+          ? {
+              ...splitView,
+              root: mapPanePanelState(splitView.root, (panel) => ({
+                ...panel,
+                browserRequest: null,
+              })),
+            }
+          : splitView,
+      ]),
+    ),
   };
 }
 
@@ -655,6 +721,8 @@ export const useSplitViewStore = create<SplitViewStore>()(
               leaf.panel.panel === nextPanel.panel &&
               leaf.panel.diffTurnId === nextPanel.diffTurnId &&
               leaf.panel.diffFilePath === nextPanel.diffFilePath &&
+              leaf.panel.filePath === nextPanel.filePath &&
+              leaf.panel.browserRequest === nextPanel.browserRequest &&
               leaf.panel.hasOpenedPanel === nextPanel.hasOpenedPanel &&
               leaf.panel.lastOpenPanel === nextPanel.lastOpenPanel
             ) {
@@ -742,25 +810,39 @@ export const useSplitViewStore = create<SplitViewStore>()(
       name: SPLIT_VIEW_STORAGE_KEY,
       version: SPLIT_VIEW_STORAGE_VERSION,
       storage: createJSONStorage(() => localStorage),
-      partialize: (state) => ({
-        splitViewsById: state.splitViewsById,
-        splitViewIdBySourceThreadId: state.splitViewIdBySourceThreadId,
-      }),
-      merge: (persistedState, currentState) => ({
-        ...currentState,
-        ...(persistedState as Partial<SplitViewStoreState>),
-        hasHydrated: currentState.hasHydrated,
-      }),
+      partialize: (state) =>
+        stripTransientBrowserRequests({
+          splitViewsById: state.splitViewsById,
+          splitViewIdBySourceThreadId: state.splitViewIdBySourceThreadId,
+        }),
+      merge: (persistedState, currentState) => {
+        const persisted =
+          persistedState && typeof persistedState === "object"
+            ? (persistedState as Partial<SplitViewStoreState>)
+            : {};
+        const sanitized = stripTransientBrowserRequests({
+          splitViewsById: persisted.splitViewsById ?? {},
+          splitViewIdBySourceThreadId: persisted.splitViewIdBySourceThreadId ?? {},
+        });
+        return {
+          ...currentState,
+          ...sanitized,
+          hasHydrated: currentState.hasHydrated,
+        };
+      },
       onRehydrateStorage: () => {
         return (state) => {
           state?.setHasHydrated(true);
         };
       },
-      // Pre-v2 storage used a flat left/right pane shape. We migrate any persisted state to the
-      // tree shape; if migration cannot recover anything, we silently drop it instead of crashing.
+      // Pre-v2 storage used a flat left/right pane shape. V2 added the tree; V3 adds file-panel
+      // metadata while keeping one-shot browser requests out of persistence.
       migrate: (persistedState, version) => {
         if (version >= SPLIT_VIEW_STORAGE_VERSION) {
           return persistedState as SplitViewStoreState;
+        }
+        if (version >= 2) {
+          return migrateV2PersistedState(persistedState);
         }
         return (
           migrateLegacyPersistedState(persistedState) ?? {

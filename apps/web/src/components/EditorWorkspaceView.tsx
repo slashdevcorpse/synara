@@ -37,6 +37,7 @@ import {
 import { showFileReferenceContextMenu } from "~/lib/fileReferenceContextMenu";
 import type { ChatFileReference } from "~/lib/chatReferences";
 import type { FileCommentSelection } from "~/lib/fileComments";
+import type { WorkspaceHtmlBrowserOpenHandler } from "~/lib/workspaceFileOpener";
 import { cn } from "~/lib/utils";
 import { useTheme } from "~/hooks/useTheme";
 import { Skeleton } from "./ui/skeleton";
@@ -73,6 +74,7 @@ const EDITOR_CHAT_PANE_KEYBOARD_STEP = 24;
 
 interface EditorWorkspaceViewProps {
   workspaceRoot: string | null;
+  referenceRoot?: string | null;
   projectName: string | null;
   currentProjectId?: ProjectId | null;
   projectOptions?: ReadonlyArray<ProjectMenuPickerOption>;
@@ -93,6 +95,7 @@ interface EditorWorkspaceViewProps {
   onReferenceInChat?: (reference: ChatFileReference) => void;
   onAskWhyInChat?: (reference: ChatFileReference) => void;
   onCommentInChat?: (comment: FileCommentSelection) => void;
+  onOpenInBrowser?: WorkspaceHtmlBrowserOpenHandler;
   onSelectProject?: (projectId: ProjectId) => void;
 }
 
@@ -591,11 +594,13 @@ export function EditorWorkspaceView(props: EditorWorkspaceViewProps) {
           {!sidebarVisible ? null : searchPaneActive ? (
             <WorkspaceSearchSidebar
               workspaceRoot={props.workspaceRoot}
+              referenceRoot={props.referenceRoot}
               query={searchQuery}
               onQueryChange={setSearchQuery}
               selectedFilePath={props.selectedFilePath}
               onSelectFile={props.onSelectFile}
               onReferenceInChat={props.onReferenceInChat}
+              onOpenInBrowser={props.onOpenInBrowser}
             />
           ) : props.centerMode === "diff" ? (
             <DiffFilesSidebar
@@ -610,11 +615,13 @@ export function EditorWorkspaceView(props: EditorWorkspaceViewProps) {
           ) : (
             <WorkspaceFilesSidebar
               workspaceRoot={props.workspaceRoot}
+              referenceRoot={props.referenceRoot}
               selectedFilePath={props.selectedFilePath}
               expandedDirectories={props.expandedDirectories}
               onSelectFile={props.onSelectFile}
               onToggleDirectory={props.onToggleDirectory}
               onReferenceInChat={props.onReferenceInChat}
+              onOpenInBrowser={props.onOpenInBrowser}
             />
           )}
           <main className="flex min-h-[16rem] min-w-0 flex-1 border-b border-border/65 lg:h-full lg:border-b-0">
@@ -629,9 +636,11 @@ export function EditorWorkspaceView(props: EditorWorkspaceViewProps) {
                 <WorkspaceFilePreview
                   workspaceRoot={props.workspaceRoot}
                   filePath={props.selectedFilePath}
+                  referenceRoot={props.referenceRoot}
                   onReferenceInChat={props.onReferenceInChat}
                   onAskWhyInChat={props.onAskWhyInChat}
                   onCommentInChat={props.onCommentInChat}
+                  onOpenInBrowser={props.onOpenInBrowser}
                 />
               </div>
             ) : null}

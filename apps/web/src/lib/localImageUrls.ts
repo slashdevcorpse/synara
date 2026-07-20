@@ -1,12 +1,13 @@
 // FILE: localImageUrls.ts
 // Purpose: Builds authenticated local-image URLs for markdown image previews and downloads.
 // Layer: Web utility
-// Exports: local image URL detection and builders
+// Exports: local image URL detection and builders, token-only capability URL builder
 // Depends on: wsHttpUrl (so desktop requests carry the legacy startup token used by attachments)
 //             and @synara/shared/localPreviewFiles for the canonical route + extension allowlist.
 
 import {
   LOCAL_IMAGE_ROUTE_PATH,
+  LOCAL_PREVIEW_ROUTE_PREFIX,
   SUPPORTED_LOCAL_IMAGE_EXTENSION_REGEX,
 } from "@synara/shared/localPreviewFiles";
 import { isWindowsAbsolutePath } from "@synara/shared/path";
@@ -73,6 +74,38 @@ export function buildLocalImageUrl(input: {
   // include the same legacy startup token attachments already use; in web/dev (where
   // the page and server share an origin) this falls back to the same relative path.
   return resolveWsHttpUrl(`${LOCAL_IMAGE_ROUTE_PATH}?${params.toString()}`);
+}
+
+/**
+ * Resolve a server-minted local-preview capability against the active HTTP
+ * server without forwarding the legacy WebSocket/startup token. The grant in
+ * the URL path is the complete authorization for this narrowly scoped route.
+ */
+export function buildLocalPreviewCapabilityUrl(urlPath: string): string {
+  const rawPath = urlPath.trim();
+  const validationBase = new URL("http://synara.invalid");
+  const parsedPath = new URL(rawPath, validationBase);
+  if (
+    !rawPath.startsWith(`${LOCAL_PREVIEW_ROUTE_PREFIX}/`) ||
+    rawPath.includes("\\") ||
+    parsedPath.origin !== validationBase.origin ||
+    !parsedPath.pathname.startsWith(`${LOCAL_PREVIEW_ROUTE_PREFIX}/`)
+  ) {
+    throw new Error("Invalid local preview capability path.");
+  }
+  parsedPath.searchParams.delete("token");
+  const capabilityPath = `${parsedPath.pathname}${parsedPath.search}${parsedPath.hash}`;
+  const resolved = resolveWsHttpUrl(capabilityPath);
+  if (typeof window === "undefined") {
+    return resolved;
+  }
+  try {
+    const url = new URL(resolved, window.location.origin);
+    url.searchParams.delete("token");
+    return url.toString();
+  } catch {
+    return urlPath;
+  }
 }
 
 export function localImageFileName(src: string): string {

@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Synara local HTML preview demo</title>
+    <link rel="stylesheet" href="./demo-assets/styles/demo.css" />
+  </head>
+  <body>
+    <main class="demo-card">
+      <img
+        class="demo-mark"
+        src="./demo-assets/images/synara-preview.svg"
+        alt="Abstract layered preview windows"
+      />
+      <p class="eyebrow">Local capability preview</p>
+      <h1>Nested assets resolve from this HTML file.</h1>
+      <p>
+        The stylesheet, script, and image all live below <code>docs/demo-assets</code>. The
+        sandboxed in-app preview blocks scripts; opening this file in Synara's browser allows the
+        small status enhancement below.
+      </p>
+      <p id="script-status" class="status" role="status">Sandboxed preview: scripts are blocked.</p>
+    </main>
+    <script src="./demo-assets/scripts/demo.js"></script>
+  </body>
+</html>

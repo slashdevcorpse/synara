@@ -1,7 +1,9 @@
 import { type ProjectId, type ProviderKind, type ThreadId, type TurnId } from "@synara/contracts";
+import { useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import {
   type CSSProperties,
+  lazy,
   type PointerEvent as ReactPointerEvent,
   type ReactNode,
   startTransition,
@@ -16,6 +18,8 @@ import { Schema } from "effect";
 import { ProviderIcon } from "../ProviderIcon";
 import { ChatPaneDropOverlay } from "../chat-drop-overlay/ChatPaneDropOverlay";
 import { PanelStateMessage } from "./PanelStateMessage";
+import { useComposerDraftStore } from "../../composerDraftStore";
+import { isElectron } from "../../env";
 import {
   ChatMountSkeleton,
   DeferredChatView,
@@ -33,6 +37,15 @@ import {
   removePanelResizeOverlay,
 } from "../../lib/panelResize";
 import { splitViewPaneScopeId } from "../../lib/chatPaneScope";
+import {
+  prefetchWorkspaceFile,
+  resolveDockFileOpenTarget,
+  resolveWorkspaceFileOpenTarget,
+  WorkspaceFileOpenerContext,
+  type WorkspaceFileOpener,
+  type WorkspaceHtmlBrowserOpenRequest,
+} from "../../lib/workspaceFileOpener";
+import { useRightDockStore } from "../../rightDockStore";
 import { resolveActiveSplitView } from "../../splitViewRoute";
 import { canSubdividePane, collectLeaves, findLeafPaneById } from "../../splitView.logic";
 import {
@@ -51,9 +64,15 @@ import {
   useSplitViewStore,
 } from "../../splitViewStore";
 import { useStore } from "../../store";
-import { createAllThreadsSelector } from "../../storeSelectors";
+import {
+  createAllThreadsSelector,
+  createProjectSelector,
+  createThreadProjectIdSelector,
+  createThreadWorkspaceMetadataSelector,
+} from "../../storeSelectors";
 import {
   normalizeSingleSearchFromPane,
+  resolveFilePreviewWorkspaceRoot,
   resolveSplitPaneCloseDecision,
   resolveSplitPaneMaximizeDecision,
   resolveThreadPickerTitle,
@@ -76,7 +95,13 @@ import {
   CHAT_MAIN_CONTENT_SURFACE_CLASS_NAME,
   CHAT_MAIN_VIEWPORT_SHELL_CLASS_NAME,
 } from "./composerPickerStyles";
-import { cn } from "~/lib/utils";
+import { cn, randomUUID } from "~/lib/utils";
+
+const DockFilePane = lazy(() =>
+  import("./DockFilePane").then((module) => ({
+    default: module.DockFilePane,
+  })),
+);
 
 const SPLIT_PANE_PANEL_DEFAULT_WIDTH_PX = 22 * 16;
 const BROWSER_SPLIT_PANE_PANEL_DEFAULT_WIDTH_PX = 30 * 16;
@@ -99,13 +124,24 @@ function SplitPaneEmbeddedPanel(props: {
   paneId: PaneId;
   paneScopeId: string;
   panelOpen: boolean;
-  panel: ChatRightPanel | null | undefined;
+  panel: SplitViewPanePanelState["panel"] | undefined;
   threadId: ThreadId | null;
+  workspaceRoot: string | null;
+  referenceRoot: string | null;
+  onOpenInBrowser?: ((request: WorkspaceHtmlBrowserOpenRequest) => void) | undefined;
   onClosePanel: () => void;
-  panelState: Pick<SplitViewPanePanelState, "panel" | "diffTurnId" | "diffFilePath">;
+  panelState: Pick<
+    SplitViewPanePanelState,
+    "panel" | "diffTurnId" | "diffFilePath" | "filePath" | "browserRequest"
+  >;
   isFocused: boolean;
   onUpdatePanelState: (
-    patch: Partial<Pick<SplitViewPanePanelState, "panel" | "diffTurnId" | "diffFilePath">>,
+    patch: Partial<
+      Pick<
+        SplitViewPanePanelState,
+        "panel" | "diffTurnId" | "diffFilePath" | "filePath" | "browserRequest"
+      >
+    >,
   ) => void;
 }) {
   const wrapperRef = useRef<HTMLDivElement>(null);
@@ -210,9 +246,26 @@ function SplitPaneEmbeddedPanel(props: {
             mode="sidebar"
             threadId={props.threadId}
             onClosePanel={props.onClosePanel}
+            workspaceRoot={props.workspaceRoot}
+            referenceRoot={props.referenceRoot}
+            navigationRequest={props.panelState.browserRequest}
+            onNavigationRequestHandled={(requestId) => {
+              if (props.panelState.browserRequest?.id === requestId) {
+                props.onUpdatePanelState({ browserRequest: null });
+              }
+            }}
           />
         </Suspense>
-      ) : (
+      ) : props.panel === "file" ? (
+        <Suspense fallback={<PanelStateMessage>Loading file...</PanelStateMessage>}>
+          <DockFilePane
+            workspaceRoot={props.workspaceRoot}
+            referenceRoot={props.referenceRoot}
+            filePath={props.panelState.filePath}
+            onOpenInBrowser={props.onOpenInBrowser}
+          />
+        </Suspense>
+      ) : props.panel === "diff" ? (
         <LazyDiffPanel
           mode="sidebar"
           threadId={props.threadId}
@@ -221,7 +274,7 @@ function SplitPaneEmbeddedPanel(props: {
           liveRefreshEnabled={props.isFocused}
           onUpdatePanelState={props.onUpdatePanelState}
         />
-      )}
+      ) : null}
     </div>
   );
 }
@@ -470,7 +523,12 @@ function SplitPaneSurface(props: {
   onOpenTurnDiff: (turnId: TurnId, filePath?: string) => void;
   onClosePanel: () => void;
   onUpdatePanelState: (
-    patch: Partial<Pick<SplitViewPanePanelState, "panel" | "diffTurnId" | "diffFilePath">>,
+    patch: Partial<
+      Pick<
+        SplitViewPanePanelState,
+        "panel" | "diffTurnId" | "diffFilePath" | "filePath" | "browserRequest"
+      >
+    >,
   ) => void;
   onMaximize: () => void;
   onCloseThreadPane: () => void;
@@ -483,6 +541,55 @@ function SplitPaneSurface(props: {
     side: SplitDropSide;
   }) => void;
 }) {
+  const queryClient = useQueryClient();
+  const splitThreadProjectId = useStore(
+    useMemo(() => createThreadProjectIdSelector(props.threadId), [props.threadId]),
+  );
+  const splitProject = useStore(
+    useMemo(() => createProjectSelector(splitThreadProjectId), [splitThreadProjectId]),
+  );
+  const splitWorkspaceMetadata = useStore(
+    useMemo(() => createThreadWorkspaceMetadataSelector(props.threadId), [props.threadId]),
+  );
+  const splitDraftThread = useComposerDraftStore((store) =>
+    props.threadId ? (store.draftThreadsByThreadId[props.threadId] ?? null) : null,
+  );
+  const workspaceRoot = resolveFilePreviewWorkspaceRoot({
+    projectCwd: splitProject?.cwd ?? null,
+    threadEnvMode: splitWorkspaceMetadata.envMode ?? splitDraftThread?.envMode ?? null,
+    threadWorktreePath:
+      splitWorkspaceMetadata.worktreePath ?? splitDraftThread?.worktreePath ?? null,
+  });
+  const splitFileOpener = useMemo<WorkspaceFileOpener>(
+    () => ({
+      openFile: (path) => {
+        const targetPath = resolveDockFileOpenTarget(
+          path,
+          workspaceRoot,
+          splitProject?.cwd ?? null,
+        );
+        if (!targetPath) {
+          return false;
+        }
+        props.onUpdatePanelState({ panel: "file", filePath: targetPath });
+        return true;
+      },
+      prefetchFile: (path) => {
+        if (!workspaceRoot) {
+          return;
+        }
+        const relativePath = resolveWorkspaceFileOpenTarget(
+          path,
+          workspaceRoot,
+          splitProject?.cwd ?? null,
+        );
+        if (relativePath) {
+          prefetchWorkspaceFile(queryClient, workspaceRoot, relativePath);
+        }
+      },
+    }),
+    [props.onUpdatePanelState, queryClient, splitProject?.cwd, workspaceRoot],
+  );
   const paneScopeId = splitViewPaneScopeId(props.splitView.id, props.paneId);
   const panelOpen = props.panelState.panel !== null;
   const shouldRenderPanelContent = panelOpen || props.panelState.hasOpenedPanel;
@@ -501,86 +608,104 @@ function SplitPaneSurface(props: {
   };
 
   return (
-    <div
-      className={cn(
-        "group relative flex min-h-0 min-w-0 flex-1 [contain:layout_style_paint]",
-        CHAT_BACKGROUND_CLASS_NAME,
-      )}
-    >
-      <ChatPaneDropOverlay
-        paneScopeId={paneScopeId}
-        canDropInDirection={props.canDropInDirection}
-        excludedThreadIds={props.excludedThreadIds}
-        onDrop={handleDrop}
-        className="flex min-h-0 min-w-0 flex-1"
+    <WorkspaceFileOpenerContext.Provider value={splitFileOpener}>
+      <div
+        className={cn(
+          "group relative flex min-h-0 min-w-0 flex-1 [contain:layout_style_paint]",
+          CHAT_BACKGROUND_CLASS_NAME,
+        )}
       >
-        <SidebarInset
-          className={cn(
-            "min-h-0 min-w-0 overflow-hidden overscroll-y-none text-foreground transition-shadow",
-            props.isFocused ? "ring-2 ring-inset ring-primary/70" : "",
-          )}
-          surfaceClassName={CHAT_BACKGROUND_CLASS_NAME}
-          onMouseDown={props.onFocus}
+        <ChatPaneDropOverlay
+          paneScopeId={paneScopeId}
+          canDropInDirection={props.canDropInDirection}
+          excludedThreadIds={props.excludedThreadIds}
+          onDrop={handleDrop}
+          className="flex min-h-0 min-w-0 flex-1"
         >
-          {props.threadId ? (
-            <DeferredChatView
-              threadId={props.threadId}
-              paneScopeId={paneScopeId}
-              deferMount={props.deferChatMount}
-              surfaceMode="split"
-              isFocusedPane={props.isFocused}
-              panelState={props.panelState}
-              onToggleDiff={props.onToggleDiff}
-              onToggleBrowser={props.onToggleBrowser}
-              onOpenBrowserUrl={props.onOpenBrowserUrl}
-              onOpenTurnDiff={props.onOpenTurnDiff}
-              onMaximize={props.onMaximize}
-              onChangeThread={props.onChooseThread}
-              onCloseThreadPane={props.onCloseThreadPane}
-              onMounted={props.onChatMounted}
-            />
-          ) : (
-            <SplitPaneEmptyState
-              isFocused={props.isFocused}
-              onFocus={props.onFocus}
-              threads={props.threads}
-              projects={props.projects}
-              excludedThreadIds={props.excludedThreadIds}
-              onSelectThread={props.onSelectThread}
-            />
-          )}
-        </SidebarInset>
-      </ChatPaneDropOverlay>
-      <SplitPaneEmbeddedPanel
-        splitViewId={props.splitView.id}
-        paneId={props.paneId}
-        paneScopeId={paneScopeId}
-        panelOpen={panelOpen && shouldRenderPanelContent}
-        panel={props.panelState.panel}
-        threadId={props.threadId}
-        onClosePanel={props.onClosePanel}
-        panelState={props.panelState}
-        isFocused={props.isFocused}
-        onUpdatePanelState={props.onUpdatePanelState}
-      />
-      {props.isFocused ? (
-        <div
-          aria-hidden="true"
-          className="pointer-events-none absolute inset-[0.9px] z-20 border border-[color-mix(in_srgb,var(--info)_45%,transparent)] shadow-[inset_0_0_0_1px_color-mix(in_srgb,var(--info)_12%,transparent)] transition-opacity duration-150"
+          <SidebarInset
+            className={cn(
+              "min-h-0 min-w-0 overflow-hidden overscroll-y-none text-foreground transition-shadow",
+              props.isFocused ? "ring-2 ring-inset ring-primary/70" : "",
+            )}
+            surfaceClassName={CHAT_BACKGROUND_CLASS_NAME}
+            onMouseDown={props.onFocus}
+          >
+            {props.threadId ? (
+              <DeferredChatView
+                threadId={props.threadId}
+                paneScopeId={paneScopeId}
+                deferMount={props.deferChatMount}
+                surfaceMode="split"
+                isFocusedPane={props.isFocused}
+                panelState={props.panelState}
+                onToggleDiff={props.onToggleDiff}
+                onToggleBrowser={props.onToggleBrowser}
+                onOpenBrowserUrl={props.onOpenBrowserUrl}
+                onOpenTurnDiff={props.onOpenTurnDiff}
+                onMaximize={props.onMaximize}
+                onChangeThread={props.onChooseThread}
+                onCloseThreadPane={props.onCloseThreadPane}
+                onMounted={props.onChatMounted}
+              />
+            ) : (
+              <SplitPaneEmptyState
+                isFocused={props.isFocused}
+                onFocus={props.onFocus}
+                threads={props.threads}
+                projects={props.projects}
+                excludedThreadIds={props.excludedThreadIds}
+                onSelectThread={props.onSelectThread}
+              />
+            )}
+          </SidebarInset>
+        </ChatPaneDropOverlay>
+        <SplitPaneEmbeddedPanel
+          splitViewId={props.splitView.id}
+          paneId={props.paneId}
+          paneScopeId={paneScopeId}
+          panelOpen={panelOpen && shouldRenderPanelContent}
+          panel={props.panelState.panel}
+          threadId={props.threadId}
+          workspaceRoot={workspaceRoot}
+          referenceRoot={splitProject?.cwd ?? null}
+          onOpenInBrowser={
+            isElectron
+              ? (request) =>
+                  props.onUpdatePanelState({
+                    panel: "browser",
+                    browserRequest: {
+                      id: randomUUID(),
+                      url: request.url,
+                      localFilePath: request.localFilePath,
+                    },
+                  })
+              : undefined
+          }
+          onClosePanel={props.onClosePanel}
+          panelState={props.panelState}
+          isFocused={props.isFocused}
+          onUpdatePanelState={props.onUpdatePanelState}
         />
-      ) : null}
-      {!props.isFocused ? (
-        <div
-          aria-hidden="true"
-          className="pointer-events-none absolute inset-0 z-10 bg-foreground/[0.060] transition-opacity duration-150"
-        />
-      ) : null}
-    </div>
+        {props.isFocused ? (
+          <div
+            aria-hidden="true"
+            className="pointer-events-none absolute inset-[0.9px] z-20 border border-[color-mix(in_srgb,var(--info)_45%,transparent)] shadow-[inset_0_0_0_1px_color-mix(in_srgb,var(--info)_12%,transparent)] transition-opacity duration-150"
+          />
+        ) : null}
+        {!props.isFocused ? (
+          <div
+            aria-hidden="true"
+            className="pointer-events-none absolute inset-0 z-10 bg-foreground/[0.060] transition-opacity duration-150"
+          />
+        ) : null}
+      </div>
+    </WorkspaceFileOpenerContext.Provider>
   );
 }
 
 export function SplitChatSurface(props: { splitViewId: SplitViewId; routeThreadId: ThreadId }) {
   const navigate = useNavigate();
+  const openDockPane = useRightDockStore((store) => store.openPane);
   const { handleNewChat } = useHandleNewChat();
   const selectAllThreads = createAllThreadsSelector();
   const threads = useStore(selectAllThreads);
@@ -693,7 +818,12 @@ export function SplitChatSurface(props: { splitViewId: SplitViewId; routeThreadI
 
   const updatePanePanelState = (
     paneId: PaneId,
-    patch: Partial<Pick<SplitViewPanePanelState, "panel" | "diffTurnId" | "diffFilePath">>,
+    patch: Partial<
+      Pick<
+        SplitViewPanePanelState,
+        "panel" | "diffTurnId" | "diffFilePath" | "filePath" | "browserRequest"
+      >
+    >,
   ) => {
     if (!activeSplitView) return;
     const leaf = findLeafPaneById(activeSplitView.root, paneId);
@@ -749,6 +879,19 @@ export function SplitChatSurface(props: { splitViewId: SplitViewId; routeThreadI
     });
 
     if (decision) {
+      if (decision.panelState?.panel === "file" && decision.panelState.filePath) {
+        openDockPane(decision.threadId, {
+          kind: "file",
+          filePath: decision.panelState.filePath,
+        });
+      } else if (decision.panelState?.panel === "browser") {
+        openDockPane(decision.threadId, {
+          kind: "browser",
+          ...(decision.panelState.browserRequest
+            ? { browserRequest: decision.panelState.browserRequest }
+            : {}),
+        });
+      }
       removeSplitView(decision.splitViewIdToRemove);
       void navigate({
         to: "/$threadId",
@@ -904,6 +1047,9 @@ export function SplitChatSurface(props: { splitViewId: SplitViewId; routeThreadI
       setPanePanelState(activeSplitView.id, paneId, {
         diffTurnId: null,
         diffFilePath: null,
+        filePath: null,
+        browserRequest: null,
+        ...(leaf.panel.panel === "file" ? { panel: null } : {}),
       });
     }
 
@@ -939,7 +1085,12 @@ export function SplitChatSurface(props: { splitViewId: SplitViewId; routeThreadI
         onFocus={() => setPaneFocus(leaf.id)}
         onToggleDiff={() => togglePanePanel(leaf.id, "diff")}
         onToggleBrowser={() => togglePanePanel(leaf.id, "browser")}
-        onOpenBrowserUrl={() => updatePanePanelState(leaf.id, { panel: "browser" })}
+        onOpenBrowserUrl={(url) =>
+          updatePanePanelState(leaf.id, {
+            panel: "browser",
+            browserRequest: { id: randomUUID(), url, localFilePath: null },
+          })
+        }
         onOpenTurnDiff={(turnId, filePath) => openPaneTurnDiff(leaf.id, turnId, filePath)}
         onClosePanel={() => closePanePanel(leaf.id)}
         onUpdatePanelState={(patch) => updatePanePanelState(leaf.id, patch)}

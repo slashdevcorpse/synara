@@ -140,6 +140,7 @@ describe("pullRequestDetailInputFromPane", () => {
     diffTurnId: null,
     diffFilePath: null,
     filePath: null,
+    browserRequest: null,
     pullRequestProjectId: "project-1" as RightDockPane["pullRequestProjectId"],
     pullRequestRepository: "acme/widgets",
     pullRequestNumber: 350,

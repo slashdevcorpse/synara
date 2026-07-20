@@ -820,7 +820,36 @@ const makeWsRpcHandlersLayer = () =>
           rpcEffect(workspaceFileSystem.readFile(input), "Failed to read workspace file"),
         [WS_METHODS.projectsCreateLocalFilePreviewGrant]: (input) =>
           rpcEffect(
-            Effect.promise(() => createLocalPreviewGrant({ requestedPath: input.path })),
+            Effect.gen(function* () {
+              const allowedWorkspaceRoots = new Set<string>();
+              if (input.scope === "directory") {
+                // The renderer may name a cwd, but only durable server-known
+                // projects/worktrees are allowed to confer HTML capability authority.
+                const snapshot = yield* projectionReadModelQuery.getShellSnapshot();
+                for (const project of snapshot.projects) {
+                  allowedWorkspaceRoots.add(project.workspaceRoot);
+                }
+                for (const thread of snapshot.threads) {
+                  if (thread.worktreePath) {
+                    allowedWorkspaceRoots.add(thread.worktreePath);
+                  }
+                  if (thread.associatedWorktreePath) {
+                    allowedWorkspaceRoots.add(thread.associatedWorktreePath);
+                  }
+                }
+              }
+              return yield* Effect.promise(() =>
+                createLocalPreviewGrant({
+                  requestedPath: input.path,
+                  ...(input.cwd !== undefined ? { cwd: input.cwd } : {}),
+                  ...(input.scope !== undefined ? { scope: input.scope } : {}),
+                  ...(input.purpose !== undefined ? { purpose: input.purpose } : {}),
+                  ...(input.scope === "directory"
+                    ? { allowedWorkspaceRoots: Array.from(allowedWorkspaceRoots) }
+                    : {}),
+                }),
+              );
+            }),
             "Failed to create local file preview grant",
           ),
         [WS_METHODS.projectsWriteFile]: (input) =>

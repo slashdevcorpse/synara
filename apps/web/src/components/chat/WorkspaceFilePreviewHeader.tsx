@@ -11,7 +11,7 @@
 // Exports: WorkspaceFilePreviewHeader
 
 import { isWorkspaceRelativePathSafe, joinWorkspaceRelativePath } from "@synara/shared/path";
-import { Fragment } from "react";
+import { Fragment, useId } from "react";
 
 import { basenameOfPath } from "~/file-icons";
 import type { ChatFileReference } from "~/lib/chatReferences";
@@ -22,17 +22,24 @@ import { CHAT_SURFACE_HEADER_DIVIDER_CLASS_NAME, ChatHeaderIconButton } from "./
 import { ComposerPickerMenuPopup } from "./ComposerPickerMenuPopup";
 import { OpenInPicker } from "./OpenInPicker";
 
+export type WorkspaceFileRenderedPreviewKind = "markdown" | "html";
+
 interface WorkspaceFilePreviewHeaderProps {
   workspaceRoot: string | null;
   filePath: string;
-  /** Markdown files get an inline Source/Preview segmented switcher. */
-  isMarkdown: boolean;
+  /** Markdown and HTML files get an inline Source/Preview segmented switcher. */
+  renderedPreviewKind: WorkspaceFileRenderedPreviewKind | null;
   /** True while the rendered preview is shown; false for the source view. */
-  markdownPreviewEnabled: boolean;
-  onMarkdownPreviewChange: (rendered: boolean) => void;
+  renderedPreviewEnabled: boolean;
+  onRenderedPreviewChange: (rendered: boolean) => void;
   /** Whole-file chat actions, surfaced in the overflow menu when wired. */
   onReferenceInChat?: ((reference: ChatFileReference) => void) | undefined;
   onAskWhyInChat?: ((reference: ChatFileReference) => void) | undefined;
+  /** HTML-only actions. Omitted for every other file type. */
+  onOpenInBrowser?: (() => void) | undefined;
+  onCopyPreviewUrl?: (() => void) | undefined;
+  onRefreshPreview?: (() => void) | undefined;
+  openingInBrowser?: boolean;
   /** Shown when the preview only holds a partial read of a large file. */
   truncated?: boolean;
 }
@@ -40,7 +47,7 @@ interface WorkspaceFilePreviewHeaderProps {
 // Source (raw file, where selecting text yields a precise line/column chat
 // reference) vs. Preview (rendered markdown, read-only — browse + task lists).
 // Ordered Source-first so the interactive mode reads as the primary surface.
-const MARKDOWN_VIEW_SEGMENTS = [
+const VIEW_SEGMENTS = [
   {
     rendered: false,
     label: "Source",
@@ -50,7 +57,7 @@ const MARKDOWN_VIEW_SEGMENTS = [
   {
     rendered: true,
     label: "Preview",
-    title: "Rendered preview — browse and toggle task lists",
+    title: "Rendered preview",
     Icon: EyeIcon,
   },
 ] as const;
@@ -59,6 +66,7 @@ export const WorkspaceFilePreviewHeader = function WorkspaceFilePreviewHeader(
   props: WorkspaceFilePreviewHeaderProps,
 ) {
   const { filePath, workspaceRoot } = props;
+  const viewGroupName = useId();
 
   // Out-of-workspace previews (e.g. a session's scratch directory under the
   // OS temp dir) arrive as absolute paths; everything in-workspace is relative.
@@ -91,7 +99,13 @@ export const WorkspaceFilePreviewHeader = function WorkspaceFilePreviewHeader(
     onAskWhyInChat?.({ path: filePath });
   };
 
-  const hasChatActions = Boolean(onReferenceInChat || onAskWhyInChat);
+  const hasOverflowActions = Boolean(
+    onReferenceInChat ||
+    onAskWhyInChat ||
+    props.onOpenInBrowser ||
+    props.onCopyPreviewUrl ||
+    props.onRefreshPreview,
+  );
 
   return (
     <div
@@ -132,40 +146,50 @@ export const WorkspaceFilePreviewHeader = function WorkspaceFilePreviewHeader(
       ) : null}
 
       <div className="flex shrink-0 items-center gap-1.5">
-        {props.isMarkdown ? (
+        {props.renderedPreviewKind ? (
           <div
             role="radiogroup"
-            aria-label="Markdown view"
+            aria-label={`${props.renderedPreviewKind === "html" ? "HTML" : "Markdown"} view`}
             className="flex h-7 shrink-0 items-center rounded-lg bg-[var(--color-background-elevated-secondary)] p-0.5"
           >
-            {MARKDOWN_VIEW_SEGMENTS.map((segment) => {
-              const selected = segment.rendered === props.markdownPreviewEnabled;
+            {VIEW_SEGMENTS.map((segment) => {
+              const selected = segment.rendered === props.renderedPreviewEnabled;
+              const title =
+                props.renderedPreviewKind === "markdown" && segment.rendered
+                  ? "Rendered preview — browse and toggle task lists"
+                  : props.renderedPreviewKind === "html" && segment.rendered
+                    ? "Sandboxed rendered preview"
+                    : segment.title;
               return (
-                <button
+                <label
                   key={segment.label}
-                  type="button"
-                  role="radio"
-                  aria-checked={selected}
-                  title={segment.title}
+                  title={title}
                   className={cn(
-                    "flex h-6 cursor-pointer items-center gap-1.5 rounded-md px-2 text-[11px] transition-colors",
+                    "flex h-6 cursor-pointer items-center gap-1.5 rounded-md px-2 text-[11px] transition-colors has-[:focus-visible]:ring-1 has-[:focus-visible]:ring-ring",
                     selected
                       ? "bg-[var(--color-background-button-secondary)] text-[var(--color-text-foreground)]"
                       : "text-muted-foreground hover:text-foreground",
                   )}
-                  onClick={() => props.onMarkdownPreviewChange(segment.rendered)}
                 >
+                  <input
+                    type="radio"
+                    name={viewGroupName}
+                    value={segment.rendered ? "preview" : "source"}
+                    checked={selected}
+                    className="sr-only"
+                    onChange={() => props.onRenderedPreviewChange(segment.rendered)}
+                  />
                   <segment.Icon aria-hidden="true" className="size-3.5 shrink-0" />
                   {/* Label collapses to icon-only on a narrow pane; the title +
                       sr-only text keep both modes labelled for a11y/tooltips. */}
                   <span className="sr-only @sm/header-actions:not-sr-only">{segment.label}</span>
-                </button>
+                </label>
               );
             })}
           </div>
         ) : null}
 
-        {hasChatActions ? (
+        {hasOverflowActions ? (
           <Menu>
             <MenuTrigger render={<ChatHeaderIconButton label="More actions" tone="plain" />}>
               <EllipsisIcon aria-hidden="true" className="size-3.5" />
@@ -176,6 +200,17 @@ export const WorkspaceFilePreviewHeader = function WorkspaceFilePreviewHeader(
               ) : null}
               {onAskWhyInChat ? (
                 <MenuItem onClick={askWhyWholeFile}>Ask why this changed</MenuItem>
+              ) : null}
+              {props.onOpenInBrowser ? (
+                <MenuItem disabled={props.openingInBrowser} onClick={props.onOpenInBrowser}>
+                  {props.openingInBrowser ? "Opening in browser..." : "Open in browser"}
+                </MenuItem>
+              ) : null}
+              {props.onCopyPreviewUrl ? (
+                <MenuItem onClick={props.onCopyPreviewUrl}>Copy preview URL</MenuItem>
+              ) : null}
+              {props.onRefreshPreview ? (
+                <MenuItem onClick={props.onRefreshPreview}>Refresh preview</MenuItem>
               ) : null}
             </ComposerPickerMenuPopup>
           </Menu>

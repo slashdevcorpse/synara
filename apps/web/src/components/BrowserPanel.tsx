@@ -11,6 +11,7 @@ import { useQuery } from "@tanstack/react-query";
 import {
   PROVIDER_SEND_TURN_MAX_ATTACHMENTS,
   PROVIDER_SEND_TURN_MAX_IMAGE_BYTES,
+  type BrowserTabState,
   type ServerLocalServerProcess,
   type ThreadId,
 } from "@synara/contracts";
@@ -30,6 +31,7 @@ import {
 } from "~/lib/icons";
 
 import { localServerPrimaryLabel } from "@synara/shared/localServers";
+import { isScratchWorkspacePath } from "@synara/shared/threadWorkspace";
 import {
   BROWSER_BLANK_URL,
   isBlankBrowserTabUrl,
@@ -46,6 +48,8 @@ import type { DockPaneRuntimeMode } from "~/lib/dockPaneActivation";
 import { IMAGE_SIZE_LIMIT_LABEL } from "~/lib/composerSend";
 import { PANEL_RESIZE_OVERLAY_SYNC_EVENT } from "~/lib/panelResize";
 import { serverLocalServersQueryOptions } from "~/lib/serverReactQuery";
+import { buildLocalPreviewCapabilityUrl } from "~/lib/localImageUrls";
+import { resolveLocalFileOpenIntent } from "~/lib/localFileOpenIntent";
 import { cn, isMacPlatform } from "~/lib/utils";
 
 import {
@@ -61,8 +65,10 @@ import {
 } from "../lib/browserPromptContext";
 import {
   browserAddressDisplayValue,
+  browserNavigationRetryDelay,
+  browserWebviewSecurityIdentity,
   buildBrowserAddressSuggestions,
-  normalizeBrowserAddressInput,
+  resolveBrowserAddressInput,
   resolveBrowserChromeStatus,
   resolveBrowserAddressSync,
   type BrowserAddressSuggestion,
@@ -75,6 +81,7 @@ import { Input } from "./ui/input";
 import { Menu, MenuItem, MenuSeparator, MenuTrigger } from "./ui/menu";
 import { Skeleton } from "./ui/skeleton";
 import { toastManager } from "./ui/toast";
+import type { BrowserNavigationRequest } from "../browserNavigationRequest";
 
 interface BrowserPanelProps {
   mode: DiffPanelMode;
@@ -82,6 +89,10 @@ interface BrowserPanelProps {
   onClosePanel: () => void;
   runtimeMode?: DockPaneRuntimeMode;
   onRequestLive?: () => void;
+  workspaceRoot?: string | null;
+  referenceRoot?: string | null;
+  navigationRequest?: BrowserNavigationRequest | null;
+  onNavigationRequestHandled?: (requestId: string) => void;
 }
 
 const BROWSER_BOUNDS_SYNC_BURST_FRAMES = 30;
@@ -190,6 +201,26 @@ function formatBrowserActionError(error: unknown): string | null {
     return null;
   }
   return "Couldn't complete that browser action.";
+}
+
+interface LocalBrowserNavigation {
+  url: string;
+  displayValue: string;
+  localFilePath: string;
+}
+
+function formatLocalPreviewGrantError(error: unknown): string {
+  const message = error instanceof Error ? error.message : "";
+  if (/outside|untrusted workspace/i.test(message)) {
+    return "This file is outside the active workspace.";
+  }
+  if (/not found|workspace directory was not found/i.test(message)) {
+    return "File not found in this worktree.";
+  }
+  if (/HTML or HTM|unsupported entry/i.test(message)) {
+    return "Only HTML and HTM files can open in the in-app browser.";
+  }
+  return "Preview grant failed. Try again.";
 }
 
 function ignoreBrowserBoundsSyncError(): void {
@@ -503,6 +534,10 @@ export function BrowserPanel({
   onClosePanel,
   runtimeMode = "live",
   onRequestLive,
+  workspaceRoot = null,
+  referenceRoot = null,
+  navigationRequest = null,
+  onNavigationRequestHandled,
 }: BrowserPanelProps) {
   const api = readNativeApi();
   const isLiveRuntime = runtimeMode === "live";
@@ -524,7 +559,9 @@ export function BrowserPanel({
   const browserViewportRef = useRef<HTMLDivElement>(null);
   const browserWebviewRef = useRef<BrowserWebviewElement | null>(null);
   const browserWebviewTabIdRef = useRef<string | null>(null);
+  const browserWebviewSecurityIdentityRef = useRef<string | null>(null);
   const browserWebviewAttachKeyRef = useRef<string | null>(null);
+  const runtimeRestorePendingRef = useRef(true);
   const copyScreenshotButtonRef = useRef<HTMLButtonElement>(null);
   const addressDraftsByTabIdRef = useRef(new Map<string, string>());
   const lastSyncedAddressByTabIdRef = useRef(new Map<string, string>());
@@ -549,20 +586,34 @@ export function BrowserPanel({
     transitionSignals: 0,
     ignoredTransitionSignals: 0,
   });
+  const inFlightNavigationRequestIdsRef = useRef(new Set<string>());
+  const navigationRequestAttemptsRef = useRef(new Map<string, number>());
+  const onNavigationRequestHandledRef = useRef(onNavigationRequestHandled);
   const [addressValue, setAddressValue] = useState("");
   const [isAddressFocused, setIsAddressFocused] = useState(false);
   const [workspaceReady, setWorkspaceReady] = useState(false);
   const [localError, setLocalError] = useState<string | null>(null);
-  const runtimeReady = isLiveRuntime ? workspaceReady : true;
+  const [blockedLocalTabId, setBlockedLocalTabId] = useState<string | null>(null);
+  const [runtimeRestoreBlocked, setRuntimeRestoreBlocked] = useState(false);
+  const [navigationRetryVersion, setNavigationRetryVersion] = useState(0);
+  useEffect(() => {
+    onNavigationRequestHandledRef.current = onNavigationRequestHandled;
+  }, [onNavigationRequestHandled]);
+  const runtimeRestorePending = isLiveRuntime && runtimeRestorePendingRef.current;
+  const runtimeReady = isLiveRuntime
+    ? workspaceReady && !runtimeRestorePending && !runtimeRestoreBlocked
+    : true;
   const activeTab =
     threadBrowserState?.tabs.find((tab) => tab.id === threadBrowserState.activeTabId) ??
     threadBrowserState?.tabs[0] ??
     null;
   const loading = activeTab?.isLoading ?? false;
   const activeTabIsBlank = isBlankBrowserTabUrl(activeTab);
-  const showLocalServersHome = isLiveRuntime && workspaceReady && (!activeTab || activeTabIsBlank);
+  const showLocalServersHome = isLiveRuntime && runtimeReady && (!activeTab || activeTabIsBlank);
   const localServersQuery = useQuery(serverLocalServersQueryOptions(showLocalServersHome));
   const activeTabStatus = activeTab?.status ?? "suspended";
+  const activeLocalRestoreBlocked =
+    runtimeRestorePending || runtimeRestoreBlocked || activeTab?.id === blockedLocalTabId;
   const browserChromeStatus = resolveBrowserChromeStatus({
     localError,
     threadLastError: threadBrowserState?.lastError,
@@ -602,6 +653,65 @@ export function BrowserPanel({
     }
   }, []);
 
+  const mintLocalBrowserNavigation = useCallback(
+    async (rawPath: string): Promise<LocalBrowserNavigation | null> => {
+      if (!api) {
+        return null;
+      }
+      if (!isElectron) {
+        setLocalError("Opening local files in the browser requires the desktop app.");
+        return null;
+      }
+      const scratchPath = isScratchWorkspacePath(rawPath);
+      if (!workspaceRoot && !scratchPath) {
+        setLocalError("This thread does not have an active workspace for local file access.");
+        return null;
+      }
+
+      const localIntent = resolveLocalFileOpenIntent({
+        rawPath,
+        runtimeRoot: workspaceRoot,
+        referenceRoot,
+        action: "browser",
+      });
+      if (localIntent.kind === "failure") {
+        setLocalError(
+          localIntent.reason === "unsupported-browser-file"
+            ? "Only HTML and HTM files can open in the in-app browser."
+            : "This file is outside the active workspace.",
+        );
+        return null;
+      }
+      if (localIntent.kind !== "browser-html") {
+        setLocalError("Only HTML and HTM files can open in the in-app browser.");
+        return null;
+      }
+
+      const resolvedLocalPath = localIntent.absolutePath;
+      try {
+        const grant = await api.projects.createLocalFilePreviewGrant({
+          path: resolvedLocalPath,
+          ...(!scratchPath && workspaceRoot ? { cwd: workspaceRoot } : {}),
+          scope: "directory",
+          purpose: "browser",
+        });
+        if (!grant.urlPath) {
+          setLocalError("Preview grant failed. Try again.");
+          return null;
+        }
+        return {
+          url: buildLocalPreviewCapabilityUrl(grant.urlPath),
+          displayValue: resolvedLocalPath,
+          localFilePath: resolvedLocalPath,
+        };
+      } catch (error) {
+        setLocalError(formatLocalPreviewGrantError(error));
+        return null;
+      }
+    },
+    [api, referenceRoot, workspaceRoot],
+  );
+
   // Renderer-owned <webview>s are adopted by the desktop manager. Always detach before
   // removing the DOM node so main never keeps a stale webContents runtime.
   const detachRendererBrowserWebview = useCallback(() => {
@@ -625,8 +735,17 @@ export function BrowserPanel({
     webview?.remove();
     browserWebviewRef.current = null;
     browserWebviewTabIdRef.current = null;
+    browserWebviewSecurityIdentityRef.current = null;
     browserWebviewAttachKeyRef.current = null;
   }, [api, isLiveRuntime, threadId]);
+
+  // Invalidate the renderer-owned guest synchronously whenever the live-runtime
+  // identity changes. The passive restore below can then mint a fresh local
+  // capability without a kept-mounted pane briefly reusing the previous URL.
+  useLayoutEffect(() => {
+    runtimeRestorePendingRef.current = true;
+    detachRendererBrowserWebview();
+  }, [api, detachRendererBrowserWebview, isLiveRuntime, referenceRoot, threadId, workspaceRoot]);
 
   useEffect(() => {
     if (!api || !isLiveRuntime) {
@@ -652,18 +771,61 @@ export function BrowserPanel({
       }
       setWorkspaceReady(false);
       setLocalError(null);
+      setBlockedLocalTabId(null);
+      setRuntimeRestoreBlocked(false);
 
-      void runBrowserAction(() => api.browser.open({ threadId })).then((state) => {
+      void (async () => {
+        // Keep a suspended local tab dormant until its short-lived capability
+        // has been replaced. Otherwise returning to a thread after the grant
+        // TTL would briefly force-load the stale bearer URL into the webview.
+        await api.browser
+          .setPanelBounds({ threadId, bounds: null, surface: "renderer" })
+          .catch(ignoreBrowserBoundsSyncError);
+        const state = await runBrowserAction(() => api.browser.open({ threadId }));
         if (cancelled) {
           return;
         }
         if (!state) {
+          runtimeRestorePendingRef.current = false;
+          setRuntimeRestoreBlocked(true);
           setWorkspaceReady(true);
           return;
         }
         upsertThreadState(state);
+
+        const currentTab =
+          state.tabs.find((tab) => tab.id === state.activeTabId) ?? state.tabs[0] ?? null;
+        if (currentTab?.localFilePath) {
+          const navigation = await mintLocalBrowserNavigation(currentTab.localFilePath);
+          if (cancelled) {
+            return;
+          }
+          if (navigation) {
+            const refreshedState = await runBrowserAction(() =>
+              api.browser.navigate({
+                threadId,
+                tabId: currentTab.id,
+                url: navigation.url,
+                localFilePath: navigation.localFilePath,
+              }),
+            );
+            if (cancelled) {
+              return;
+            }
+            if (refreshedState) {
+              upsertThreadState(refreshedState);
+              setBlockedLocalTabId(null);
+            } else {
+              setBlockedLocalTabId(currentTab.id);
+            }
+          } else {
+            setBlockedLocalTabId(currentTab.id);
+          }
+        }
+
+        runtimeRestorePendingRef.current = false;
         setWorkspaceReady(true);
-      });
+      })();
     }, 0);
 
     return () => {
@@ -671,7 +833,72 @@ export function BrowserPanel({
       window.clearTimeout(timeoutId);
       void api.browser.hide({ threadId });
     };
-  }, [api, isLiveRuntime, runBrowserAction, threadId, upsertThreadState]);
+  }, [
+    api,
+    isLiveRuntime,
+    mintLocalBrowserNavigation,
+    runBrowserAction,
+    threadId,
+    upsertThreadState,
+  ]);
+
+  useEffect(() => {
+    if (!api || !isLiveRuntime || !navigationRequest) {
+      return;
+    }
+    if (inFlightNavigationRequestIdsRef.current.has(navigationRequest.id)) {
+      return;
+    }
+    inFlightNavigationRequestIdsRef.current.add(navigationRequest.id);
+    let cancelled = false;
+    let retryTimeoutId: number | null = null;
+    void runBrowserAction(() =>
+      api.browser.open({
+        threadId,
+        initialUrl: navigationRequest.url,
+        ...(navigationRequest.localFilePath
+          ? { localFilePath: navigationRequest.localFilePath }
+          : {}),
+      }),
+    ).then((state) => {
+      inFlightNavigationRequestIdsRef.current.delete(navigationRequest.id);
+      if (cancelled) {
+        return;
+      }
+      if (!state) {
+        const nextAttempt =
+          (navigationRequestAttemptsRef.current.get(navigationRequest.id) ?? 0) + 1;
+        navigationRequestAttemptsRef.current.set(navigationRequest.id, nextAttempt);
+        const retryDelay = browserNavigationRetryDelay(nextAttempt);
+        if (retryDelay !== null) {
+          retryTimeoutId = window.setTimeout(() => {
+            setNavigationRetryVersion((version) => version + 1);
+          }, retryDelay);
+        }
+        return;
+      }
+      navigationRequestAttemptsRef.current.delete(navigationRequest.id);
+      upsertThreadState(state);
+      setBlockedLocalTabId(null);
+      setRuntimeRestoreBlocked(false);
+      onNavigationRequestHandledRef.current?.(navigationRequest.id);
+    });
+
+    return () => {
+      cancelled = true;
+      if (retryTimeoutId !== null) {
+        window.clearTimeout(retryTimeoutId);
+      }
+    };
+  }, [
+    api,
+    isLiveRuntime,
+    navigationRequest,
+    navigationRetryVersion,
+    runBrowserAction,
+    threadId,
+    upsertThreadState,
+  ]);
 
   useEffect(() => {
     const activeTabId = activeTab?.id ?? null;
@@ -701,11 +928,18 @@ export function BrowserPanel({
   }, [activeTab]);
 
   useLayoutEffect(() => {
-    if (!api || !isLiveRuntime || !workspaceReady || !activeTab) {
+    if (
+      !api ||
+      !isLiveRuntime ||
+      !workspaceReady ||
+      runtimeRestorePendingRef.current ||
+      !activeTab
+    ) {
+      detachRendererBrowserWebview();
       return;
     }
 
-    if (showLocalServersHome) {
+    if (showLocalServersHome || activeLocalRestoreBlocked) {
       detachRendererBrowserWebview();
       return;
     }
@@ -715,6 +949,19 @@ export function BrowserPanel({
       return;
     }
 
+    const securityIdentity = browserWebviewSecurityIdentity(activeTab);
+    if (
+      browserWebviewRef.current &&
+      browserWebviewSecurityIdentityRef.current !== securityIdentity
+    ) {
+      detachRendererBrowserWebview();
+    }
+
+    // Every guest starts inert. The main process independently enforces this
+    // value at will-attach-webview, then the browser manager loads the desired
+    // page after adoption. Local documents therefore cannot run before their
+    // document-start network guard is installed and verified.
+    const initialGuestUrl = BROWSER_BLANK_URL;
     let webview = browserWebviewRef.current;
     if (!webview) {
       webview = document.createElement("webview") as BrowserWebviewElement;
@@ -734,17 +981,20 @@ export function BrowserPanel({
       // UA on the shared persistent partition, so this webview (and OAuth popups) inherit the
       // same identity. This keeps in-app Google/OAuth sign-in working without duplicating the
       // UA string into the renderer.
+      browserWebviewTabIdRef.current = activeTab.id;
+      browserWebviewAttachKeyRef.current = null;
+      webview.setAttribute("src", initialGuestUrl.length > 0 ? initialGuestUrl : BROWSER_BLANK_URL);
       browserWebviewRef.current = webview;
+      browserWebviewSecurityIdentityRef.current = securityIdentity;
       host.append(webview);
     } else if (webview.parentElement !== host) {
       host.append(webview);
     }
 
-    const initialUrl = activeTab.lastCommittedUrl ?? activeTab.url ?? BROWSER_BLANK_URL;
     if (browserWebviewTabIdRef.current !== activeTab.id) {
       browserWebviewTabIdRef.current = activeTab.id;
       browserWebviewAttachKeyRef.current = null;
-      webview.setAttribute("src", initialUrl.length > 0 ? initialUrl : BROWSER_BLANK_URL);
+      webview.setAttribute("src", initialGuestUrl.length > 0 ? initialGuestUrl : BROWSER_BLANK_URL);
     }
 
     const attachVisibleWebview = () => {
@@ -786,6 +1036,7 @@ export function BrowserPanel({
     };
   }, [
     activeTab,
+    activeLocalRestoreBlocked,
     api,
     detachRendererBrowserWebview,
     isLiveRuntime,
@@ -844,7 +1095,11 @@ export function BrowserPanel({
       // While the local-servers home is up, force the browser surface hidden instead of
       // trusting the obscuring-overlay heuristic. The native/inline webview otherwise paints
       // about:blank white over our dark DOM home — the "always white" empty state.
-      const obscuredByOverlay = showLocalServersHome || hasNativeBrowserObscuringOverlay(element);
+      const obscuredByOverlay =
+        !workspaceReady ||
+        showLocalServersHome ||
+        activeLocalRestoreBlocked ||
+        hasNativeBrowserObscuringOverlay(element);
       lastOverlayObscuredRef.current = obscuredByOverlay;
       setBrowserWebviewOverlayOcclusion(browserWebviewRef.current, obscuredByOverlay);
       const rect = element.getBoundingClientRect();
@@ -979,7 +1234,111 @@ export function BrowserPanel({
       burstFramesRemainingRef.current = 0;
       burstStableFramesRef.current = 0;
     };
-  }, [api, isLiveRuntime, showLocalServersHome, threadId]);
+  }, [
+    activeLocalRestoreBlocked,
+    api,
+    isLiveRuntime,
+    showLocalServersHome,
+    threadId,
+    workspaceReady,
+  ]);
+
+  const navigateToAddressInput = useCallback(
+    async (rawAddress: string, requestedTabId?: string) => {
+      if (!ensureLiveRuntime() || !api) {
+        return;
+      }
+      const resolution = resolveBrowserAddressInput(rawAddress);
+      if (resolution.kind === "error") {
+        setLocalError(resolution.message);
+        return;
+      }
+
+      let url: string;
+      let displayValue: string;
+      let localFilePath: string | null = null;
+      if (resolution.kind === "local-file") {
+        const navigation = await mintLocalBrowserNavigation(resolution.path);
+        if (!navigation) {
+          return;
+        }
+        url = navigation.url;
+        displayValue = navigation.displayValue;
+        localFilePath = navigation.localFilePath;
+      } else {
+        url = resolution.url;
+        displayValue = resolution.url;
+      }
+
+      isAddressEditingRef.current = false;
+      setIsAddressFocused(false);
+      const tabId = requestedTabId ?? activeTab?.id;
+      if (tabId) {
+        addressDraftsByTabIdRef.current.set(tabId, displayValue);
+      }
+      setAddressValue(displayValue);
+      const state = await runBrowserAction(() =>
+        api.browser.navigate({
+          threadId,
+          url,
+          ...(tabId ? { tabId } : {}),
+          ...(localFilePath ? { localFilePath } : {}),
+        }),
+      );
+      if (state) {
+        upsertThreadState(state);
+        setBlockedLocalTabId(null);
+        setRuntimeRestoreBlocked(false);
+      }
+    },
+    [
+      activeTab?.id,
+      api,
+      ensureLiveRuntime,
+      mintLocalBrowserNavigation,
+      runBrowserAction,
+      threadId,
+      upsertThreadState,
+    ],
+  );
+
+  const selectBrowserTab = useCallback(
+    async (tab: BrowserTabState): Promise<void> => {
+      if (!api) {
+        return;
+      }
+
+      if (tab.status === "suspended" && tab.localFilePath) {
+        const navigation = await mintLocalBrowserNavigation(tab.localFilePath);
+        if (!navigation) {
+          return;
+        }
+        const refreshedState = await runBrowserAction(() =>
+          api.browser.navigate({
+            threadId,
+            tabId: tab.id,
+            url: navigation.url,
+            localFilePath: navigation.localFilePath,
+          }),
+        );
+        if (!refreshedState) {
+          return;
+        }
+        upsertThreadState(refreshedState);
+        setBlockedLocalTabId(null);
+        setRuntimeRestoreBlocked(false);
+      }
+
+      const state = await runBrowserAction(() =>
+        api.browser.selectTab({ threadId, tabId: tab.id }),
+      );
+      if (state) {
+        upsertThreadState(state);
+        setRuntimeRestoreBlocked(false);
+      }
+    },
+    [api, mintLocalBrowserNavigation, runBrowserAction, threadId, upsertThreadState],
+  );
 
   const onSubmitAddress = useCallback(() => {
     if (!ensureLiveRuntime()) {
@@ -988,31 +1347,8 @@ export function BrowserPanel({
     if (!api || !activeTab) {
       return;
     }
-    isAddressEditingRef.current = false;
-    setIsAddressFocused(false);
-    const normalizedAddress = normalizeBrowserAddressInput(addressValue);
-    addressDraftsByTabIdRef.current.set(activeTab.id, normalizedAddress);
-    setAddressValue(normalizedAddress);
-    void runBrowserAction(() =>
-      api.browser.navigate({
-        threadId,
-        tabId: activeTab.id,
-        url: normalizedAddress,
-      }),
-    ).then((state) => {
-      if (state) {
-        upsertThreadState(state);
-      }
-    });
-  }, [
-    activeTab,
-    addressValue,
-    api,
-    ensureLiveRuntime,
-    runBrowserAction,
-    threadId,
-    upsertThreadState,
-  ]);
+    void navigateToAddressInput(addressValue, activeTab.id);
+  }, [activeTab, addressValue, api, ensureLiveRuntime, navigateToAddressInput]);
 
   const onChooseSuggestion = useCallback(
     (suggestion: BrowserAddressSuggestion) => {
@@ -1025,14 +1361,13 @@ export function BrowserPanel({
 
       isAddressEditingRef.current = false;
       setIsAddressFocused(false);
-      setAddressValue(suggestion.url);
-
       const tabId = suggestion.tabId;
       if (suggestion.kind === "tab" && typeof tabId === "string") {
-        void runBrowserAction(() => api.browser.selectTab({ threadId, tabId })).then((state) => {
-          if (state) {
-            upsertThreadState(state);
-          }
+        const tab = threadBrowserState?.tabs.find((candidate) => candidate.id === tabId);
+        if (!tab) {
+          return;
+        }
+        void selectBrowserTab(tab).then(() => {
           window.requestAnimationFrame(() => {
             addressInputRef.current?.focus();
             addressInputRef.current?.select();
@@ -1041,23 +1376,16 @@ export function BrowserPanel({
         return;
       }
 
-      if (activeTab) {
-        addressDraftsByTabIdRef.current.set(activeTab.id, suggestion.url);
-      }
-
-      void runBrowserAction(() =>
-        api.browser.navigate({
-          threadId,
-          url: suggestion.url,
-          ...(activeTab ? { tabId: activeTab.id } : {}),
-        }),
-      ).then((state) => {
-        if (state) {
-          upsertThreadState(state);
-        }
-      });
+      void navigateToAddressInput(suggestion.url, activeTab?.id);
     },
-    [activeTab, api, ensureLiveRuntime, runBrowserAction, threadId, upsertThreadState],
+    [
+      activeTab?.id,
+      api,
+      ensureLiveRuntime,
+      navigateToAddressInput,
+      selectBrowserTab,
+      threadBrowserState?.tabs,
+    ],
   );
 
   const onOpenLocalServer = useCallback(
@@ -1342,6 +1670,10 @@ export function BrowserPanel({
             onClick={() => {
               if (!ensureLiveRuntime()) return;
               if (!api || !activeTab) return;
+              if (activeTab.localFilePath) {
+                void navigateToAddressInput(activeTab.localFilePath, activeTab.id);
+                return;
+              }
               void runBrowserAction(() =>
                 api.browser.reload({ threadId, tabId: activeTab.id }),
               ).then((state) => {
@@ -1392,6 +1724,7 @@ export function BrowserPanel({
               setIsAddressFocused(false);
             }}
             placeholder="Search or enter a URL"
+            aria-label="Browser address"
             className={cn(
               "min-w-0 [-webkit-app-region:no-drag]",
               BROWSER_CHROME_CONTROL_CLASS_NAME,
@@ -1453,9 +1786,13 @@ export function BrowserPanel({
           variant="ghost"
           size="icon-sm"
           className="size-7"
-          disabled={!activeTab}
-          aria-label="Copy link"
-          title="Copy link"
+          disabled={!activeTab || Boolean(activeTab.localFilePath)}
+          aria-label={
+            activeTab?.localFilePath ? "Copy link unavailable for local previews" : "Copy link"
+          }
+          title={
+            activeTab?.localFilePath ? "Copy link unavailable for local previews" : "Copy link"
+          }
           onClick={copyActiveTabLink}
         >
           <LinkIcon className="size-3.5" />
@@ -1486,7 +1823,7 @@ export function BrowserPanel({
             </MenuItem>
             <MenuItem
               className={BROWSER_ACTION_MENU_ITEM_CLASS_NAME}
-              disabled={!activeTab}
+              disabled={!activeTab || Boolean(activeTab.localFilePath)}
               onClick={onCaptureScreenshot}
             >
               <BrowserActionMenuIcon icon={CameraIcon} />
@@ -1494,7 +1831,7 @@ export function BrowserPanel({
             </MenuItem>
             <MenuItem
               className={BROWSER_ACTION_MENU_ITEM_CLASS_NAME}
-              disabled={!activeTab}
+              disabled={!activeTab || Boolean(activeTab.localFilePath)}
               onClick={() => {
                 if (!ensureLiveRuntime()) return;
                 if (!api || !activeTab) return;
@@ -1564,13 +1901,7 @@ export function BrowserPanel({
                     onClick={() => {
                       if (!ensureLiveRuntime()) return;
                       if (!api) return;
-                      void runBrowserAction(() =>
-                        api.browser.selectTab({ threadId, tabId: tab.id }),
-                      ).then((state) => {
-                        if (state) {
-                          upsertThreadState(state);
-                        }
-                      });
+                      void selectBrowserTab(tab);
                     }}
                   >
                     {tab.title || "Untitled"}
@@ -1610,9 +1941,14 @@ export function BrowserPanel({
           {!isLiveRuntime ? (
             <BrowserRuntimePreview
               title={activeTab?.title || "Browser is sleeping"}
-              detail={activeTab?.lastCommittedUrl ?? activeTab?.url ?? "Restoring cached browser"}
+              detail={
+                activeTab?.localFilePath ??
+                activeTab?.lastCommittedUrl ??
+                activeTab?.url ??
+                "Restoring cached browser"
+              }
             />
-          ) : !workspaceReady ? (
+          ) : !workspaceReady || runtimeRestorePending ? (
             <div className="absolute inset-0 z-10">
               <DiffPanelLoadingState label="Starting browser..." />
             </div>

@@ -14,6 +14,16 @@ describe("rewriteMarkdownFileUriHref", () => {
       "/Users/julius/project/file%2520name.md",
     );
   });
+
+  it("preserves file URL hosts as Windows UNC paths", () => {
+    expect(rewriteMarkdownFileUriHref("file://build-server/share/demo%20site/index.html#L8")).toBe(
+      "\\\\build-server\\share\\demo%20site\\index.html#L8",
+    );
+  });
+
+  it("preserves drive letters in two-slash Windows file URLs", () => {
+    expect(rewriteMarkdownFileUriHref("file://C:/repo/demo.html#L3")).toBe("C:/repo/demo.html#L3");
+  });
 });
 
 describe("resolveMarkdownFileLinkTarget", () => {
@@ -38,6 +48,18 @@ describe("resolveMarkdownFileLinkTarget", () => {
   it("resolves bare file names against cwd", () => {
     expect(resolveMarkdownFileLinkTarget("AGENTS.md", "/Users/julius/project")).toBe(
       "/Users/julius/project/AGENTS.md",
+    );
+  });
+
+  it("resolves relative links against Windows worktree roots", () => {
+    expect(resolveMarkdownFileLinkTarget("docs/demo.html:9", "D:\\worktrees\\feature")).toBe(
+      "D:\\worktrees\\feature\\docs\\demo.html:9",
+    );
+  });
+
+  it("resolves UNC file URLs without dropping the server name", () => {
+    expect(resolveMarkdownFileLinkTarget("file://build-server/share/demo.html#L5")).toBe(
+      "\\\\build-server\\share\\demo.html:5",
     );
   });
 

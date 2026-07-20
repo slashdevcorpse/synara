@@ -17,6 +17,10 @@ import {
   VOICE_TRANSCRIPTION_UPLOAD_ROUTE_PATH,
 } from "@synara/shared/binaryTransfer";
 import { EDITOR_ICON_ROUTE_PATH } from "@synara/shared/editorIcons";
+import {
+  LOCAL_PREVIEW_ROUTE_PREFIX,
+  localPreviewContentTypeForPath,
+} from "@synara/shared/localPreviewFiles";
 import { threadExportBlockedReason } from "@synara/shared/threadExport";
 import { Cause, DateTime, Effect, FileSystem, Layer, Option, Path, Schema, Stream } from "effect";
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/unstable/http";
@@ -33,7 +37,11 @@ import { SessionCredentialService } from "./auth/Services/SessionCredentialServi
 import { deriveAuthClientMetadata } from "./auth/utils";
 import { ServerConfig, type ServerConfigShape } from "./config";
 import { resolveCachedEditorIcon } from "./editorAppIcons";
-import { LOCAL_IMAGE_ROUTE_PATH, resolveAllowedLocalPreviewFile } from "./localImageFiles.ts";
+import {
+  LOCAL_IMAGE_ROUTE_PATH,
+  resolveAllowedLocalPreviewFile,
+  resolveLocalPreviewGrantResource,
+} from "./localImageFiles.ts";
 import { ProjectFaviconResolver } from "./project/Services/ProjectFaviconResolver";
 import { ProjectionSnapshotQuery } from "./orchestration/Services/ProjectionSnapshotQuery";
 import { ProviderAdapterRegistry } from "./provider/Services/ProviderAdapterRegistry";
@@ -69,6 +77,50 @@ const SVG_DOCUMENT_SECURITY_HEADERS = {
   "Content-Security-Policy": "sandbox; default-src 'none'; style-src 'unsafe-inline'",
   "X-Content-Type-Options": "nosniff",
 } as const;
+const LOCAL_PREVIEW_IFRAME_CSP = [
+  "sandbox",
+  "default-src 'none'",
+  "script-src 'none'",
+  "connect-src 'none'",
+  "style-src 'self' 'unsafe-inline'",
+  "img-src 'self' data: blob:",
+  "font-src 'self' data:",
+  "media-src 'self' data: blob:",
+  "frame-src 'none'",
+  "child-src 'none'",
+  "worker-src 'none'",
+  "object-src 'none'",
+  "base-uri 'none'",
+  "form-action 'none'",
+].join("; ");
+function localPreviewBrowserCsp(origin: string, token: string): string {
+  // A browser-purpose document may execute its own scripts, but every fetched
+  // resource stays under the exact capability path. Using bare 'self' here
+  // would also authorize Synara's other same-origin HTTP APIs. Workers and
+  // nested frames remain disabled so a two-minute grant cannot install
+  // persistent code or create another unguarded realm. The document keeps an
+  // opaque origin so localStorage, cookies, IndexedDB, and caches cannot cross
+  // capabilities. Electron independently removes WebRTC before navigation;
+  // the directive below becomes an extra browser-native control when supported.
+  const capabilitySource = `${origin}${LOCAL_PREVIEW_ROUTE_PREFIX}/${encodeURIComponent(token)}/`;
+  return [
+    "sandbox allow-scripts",
+    "default-src 'none'",
+    `script-src 'unsafe-inline' 'wasm-unsafe-eval' ${capabilitySource}`,
+    `style-src 'unsafe-inline' ${capabilitySource}`,
+    `img-src ${capabilitySource} data: blob:`,
+    `font-src ${capabilitySource} data:`,
+    `media-src ${capabilitySource} data: blob:`,
+    `connect-src ${capabilitySource}`,
+    "webrtc 'block'",
+    "frame-src 'none'",
+    "child-src 'none'",
+    "worker-src 'none'",
+    "object-src 'none'",
+    "base-uri 'none'",
+    "form-action 'none'",
+  ].join("; ");
+}
 export const AUTH_JSON_BODY_MAX_BYTES = 16 * 1024;
 const decodeBootstrapInput = Schema.decodeUnknownEffect(AuthBootstrapInput);
 const decodeCreatePairingCredentialInput = Schema.decodeUnknownEffect(
@@ -755,16 +807,17 @@ function streamedFileResponse(input: {
   readonly path: string;
   readonly sizeBytes: number;
   readonly headers: Record<string, string>;
+  readonly contentType?: string;
 }): HttpServerResponse.HttpServerResponse {
   return HttpServerResponse.stream(input.fileSystem.stream(input.path), {
     status: 200,
-    contentType: Mime.getType(input.path) ?? "application/octet-stream",
+    contentType: input.contentType ?? Mime.getType(input.path) ?? "application/octet-stream",
     contentLength: input.sizeBytes,
     headers: input.headers,
   });
 }
 
-export const localImageEffectRouteLayer = HttpRouter.add(
+const legacyLocalImageEffectRouteLayer = HttpRouter.add(
   "GET",
   LOCAL_IMAGE_ROUTE_PATH,
   Effect.gen(function* () {
@@ -814,6 +867,107 @@ export const localImageEffectRouteLayer = HttpRouter.add(
       },
     });
   }).pipe(Effect.catchTag("AuthError", (error) => Effect.succeed(authErrorResponse(error)))),
+);
+
+function parseLocalPreviewCapabilityPath(
+  pathname: string,
+): { readonly token: string; readonly encodedRelativePath: string } | null {
+  const routePrefix = `${LOCAL_PREVIEW_ROUTE_PREFIX}/`;
+  if (!pathname.startsWith(routePrefix)) {
+    return null;
+  }
+  const suffix = pathname.slice(routePrefix.length);
+  const separatorIndex = suffix.indexOf("/");
+  if (separatorIndex <= 0 || separatorIndex === suffix.length - 1) {
+    return null;
+  }
+
+  const encodedToken = suffix.slice(0, separatorIndex);
+  let token: string;
+  try {
+    token = decodeURIComponent(encodedToken);
+  } catch {
+    return null;
+  }
+  if (!token || token.includes("\0") || token.includes("/") || token.includes("\\")) {
+    return null;
+  }
+  return {
+    token,
+    encodedRelativePath: suffix.slice(separatorIndex + 1),
+  };
+}
+
+function rawPathnameFromRequestTarget(requestTarget: string): string | null {
+  const queryIndex = requestTarget.indexOf("?");
+  const withoutQuery = queryIndex === -1 ? requestTarget : requestTarget.slice(0, queryIndex);
+  if (withoutQuery.startsWith("/")) {
+    return withoutQuery;
+  }
+
+  // HTTP proxies may use the absolute-form request target. Extract its path
+  // without URL parsing so encoded dot segments remain visible to validation.
+  const schemeIndex = withoutQuery.indexOf("://");
+  if (schemeIndex === -1) {
+    return null;
+  }
+  const pathIndex = withoutQuery.indexOf("/", schemeIndex + 3);
+  return pathIndex === -1 ? "/" : withoutQuery.slice(pathIndex);
+}
+
+const localPreviewCapabilityEffectRouteLayer = HttpRouter.add(
+  "GET",
+  `${LOCAL_PREVIEW_ROUTE_PREFIX}/:grant/*`,
+  Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const rawPathname = rawPathnameFromRequestTarget(request.url);
+    if (!rawPathname) return HttpServerResponse.text("Bad Request", { status: 400 });
+
+    const requestUrl = HttpServerRequest.toURL(request);
+    if (!requestUrl) return HttpServerResponse.text("Bad Request", { status: 400 });
+
+    const capabilityPath = parseLocalPreviewCapabilityPath(rawPathname);
+    if (!capabilityPath) {
+      return HttpServerResponse.text("Not Found", { status: 404 });
+    }
+    const previewFile = yield* Effect.promise(() =>
+      resolveLocalPreviewGrantResource(capabilityPath).catch(() => null),
+    );
+    if (!previewFile) {
+      return HttpServerResponse.text("Not Found", { status: 404 });
+    }
+
+    const contentType = localPreviewContentTypeForPath(previewFile.path);
+    if (!contentType) {
+      return HttpServerResponse.text("Not Found", { status: 404 });
+    }
+    const fileSystem = yield* FileSystem.FileSystem;
+    const isSvg = nodePath.extname(previewFile.path).toLowerCase() === ".svg";
+    return streamedFileResponse({
+      fileSystem,
+      path: previewFile.path,
+      sizeBytes: previewFile.sizeBytes,
+      contentType,
+      headers: {
+        "Cache-Control": "no-store",
+        Pragma: "no-cache",
+        "X-Content-Type-Options": "nosniff",
+        "Referrer-Policy": "no-referrer",
+        "X-DNS-Prefetch-Control": "off",
+        "Content-Security-Policy":
+          previewFile.purpose === "browser"
+            ? localPreviewBrowserCsp(requestUrl.origin, capabilityPath.token)
+            : LOCAL_PREVIEW_IFRAME_CSP,
+        ...(previewFile.purpose === "browser" ? { "Access-Control-Allow-Origin": "null" } : {}),
+        ...(isSvg ? SVG_DOCUMENT_SECURITY_HEADERS : {}),
+      },
+    });
+  }),
+);
+
+export const localImageEffectRouteLayer = Layer.mergeAll(
+  legacyLocalImageEffectRouteLayer,
+  localPreviewCapabilityEffectRouteLayer,
 );
 
 const binaryUploadEffectHandler = Effect.gen(function* () {

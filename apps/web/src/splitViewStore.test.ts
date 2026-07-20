@@ -1,6 +1,6 @@
 // FILE: splitViewStore.test.ts
 // Purpose: Verify tree-aware split view state operations: drop creation, perpendicular subdivision,
-// pane focus/ratio mutations, deleted-thread collapse semantics, and v1 -> v2 persisted-state migration.
+// pane focus/ratio mutations, deleted-thread collapse semantics, and persisted-state migration.
 
 import { ProjectId, ThreadId, TurnId } from "@synara/contracts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -9,6 +9,7 @@ import { collectLeaves, findParentSplitNode } from "./splitView.logic";
 import {
   resolvePreferredSplitViewIdForThread,
   resolveSplitViewFocusedThreadId,
+  resolveSplitViewLeaves,
   resolveSplitViewPaneIdForThread,
   resolveSplitViewThreadIds,
   useSplitViewStore,
@@ -117,7 +118,85 @@ describe("splitViewStore", () => {
     const persisted = globalThis.localStorage.getItem("synara:split-view-state:v1");
     expect(persisted).not.toBeNull();
     expect(globalThis.localStorage.getItem("synara:split-view-state:v2")).toBeNull();
-    expect(JSON.parse(persisted ?? "{}")).toMatchObject({ version: 2 });
+    expect(JSON.parse(persisted ?? "{}")).toMatchObject({ version: 3 });
+  });
+
+  it("finishes hydration when the persisted storage key is absent", async () => {
+    vi.resetModules();
+    globalThis.localStorage = createMemoryStorage();
+    const { useSplitViewStore: freshSplitViewStore } = await import("./splitViewStore");
+
+    await vi.waitFor(() => {
+      expect(freshSplitViewStore.getState().hasHydrated).toBe(true);
+    });
+    expect(freshSplitViewStore.persist.hasHydrated()).toBe(true);
+    expect(freshSplitViewStore.getState().splitViewsById).toEqual({});
+    expect(freshSplitViewStore.getState().splitViewIdBySourceThreadId).toEqual({});
+  });
+
+  it("keeps one-shot browser capability requests out of persisted split state", async () => {
+    vi.resetModules();
+    globalThis.localStorage = createMemoryStorage();
+    const { useSplitViewStore: freshSplitViewStore } = await import("./splitViewStore");
+    const splitViewId = freshSplitViewStore.getState().createFromThread({
+      sourceThreadId: THREAD_A,
+      ownerProjectId: PROJECT_ID,
+    });
+    const splitView = freshSplitViewStore.getState().splitViewsById[splitViewId];
+    expect(splitView).toBeDefined();
+    if (!splitView) return;
+    const paneId = findLeafIdForThread(splitView, THREAD_A);
+
+    freshSplitViewStore.getState().setPanePanelState(splitViewId, paneId, {
+      panel: "browser",
+      hasOpenedPanel: true,
+      browserRequest: {
+        id: "request-1",
+        url: "http://127.0.0.1:58090/api/local-preview/secret-token/docs/demo.html",
+        localFilePath: "C:\\workspace\\docs\\demo.html",
+      },
+    });
+
+    const runtimeLeaf = resolveSplitViewLeaves(
+      freshSplitViewStore.getState().splitViewsById[splitViewId]!,
+    ).find((leaf) => leaf.id === paneId);
+    expect(runtimeLeaf?.panel.browserRequest?.id).toBe("request-1");
+    const persisted = globalThis.localStorage.getItem("synara:split-view-state:v1") ?? "";
+    expect(persisted).not.toContain("secret-token");
+    expect(persisted).not.toContain("request-1");
+  });
+
+  it("strips a capability request injected into a current-version persisted leaf", async () => {
+    vi.resetModules();
+    globalThis.localStorage = createMemoryStorage();
+    const { useSplitViewStore: writerStore } = await import("./splitViewStore");
+    const splitViewId = writerStore.getState().createFromThread({
+      sourceThreadId: THREAD_A,
+      ownerProjectId: PROJECT_ID,
+    });
+    const storageKey = "synara:split-view-state:v1";
+    const payload = JSON.parse(globalThis.localStorage.getItem(storageKey) ?? "{}") as {
+      state: { splitViewsById: Record<string, { root: SplitNode }> };
+    };
+    const root = payload.state.splitViewsById[splitViewId]?.root;
+    expect(root).toBeDefined();
+    if (!root || root.first.kind !== "leaf") return;
+    root.first.panel.browserRequest = {
+      id: "injected-request",
+      url: "http://127.0.0.1:58090/api/local-preview/injected/docs/demo.html",
+      localFilePath: "C:\\workspace\\docs\\demo.html",
+    };
+    globalThis.localStorage.setItem(storageKey, JSON.stringify(payload));
+
+    vi.resetModules();
+    const { resolveSplitViewLeaves: resolveFreshLeaves, useSplitViewStore: readerStore } =
+      await import("./splitViewStore");
+    const hydrated = readerStore.getState().splitViewsById[splitViewId];
+    expect(hydrated).toBeDefined();
+    if (!hydrated) return;
+    expect(resolveFreshLeaves(hydrated).every((leaf) => leaf.panel.browserRequest === null)).toBe(
+      true,
+    );
   });
 
   it("replaces an existing source split when creating a drop split for the same source", () => {
@@ -195,6 +274,10 @@ describe("splitViewStore", () => {
     expect(migrated.root.kind).toBe("split");
     expect(resolveFreshThreadIds(migrated).toSorted()).toEqual([THREAD_A, THREAD_B].toSorted());
     expect(resolveFreshFocusedThreadId(migrated)).toBe(THREAD_B);
+    for (const leaf of resolveSplitViewLeaves(migrated)) {
+      expect(leaf.panel.filePath).toBeNull();
+      expect(leaf.panel.browserRequest).toBeNull();
+    }
   });
 
   it("subdivides a target leaf perpendicular to its parent on dropThreadOnPane", () => {

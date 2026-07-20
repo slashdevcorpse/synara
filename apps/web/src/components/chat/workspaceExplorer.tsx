@@ -6,6 +6,7 @@
 //          ExplorerActivityBarButton, useExplorerEntryPrefetch, setFileReferenceDragData.
 
 import type { ProjectEntry, ProjectFileSystemEntry } from "@synara/contracts";
+import { isSupportedLocalHtmlPath } from "@synara/shared/localPreviewFiles";
 import { useDebouncedValue } from "@tanstack/react-pacer";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -21,6 +22,7 @@ import type { ChatFileReference } from "~/lib/chatReferences";
 import { setComposerFileReferenceDragData as setFileReferenceDragData } from "~/lib/composerFileReferenceDrag";
 import { splitRepoRelativePath } from "~/lib/diffRendering";
 import { showFileReferenceContextMenu } from "~/lib/fileReferenceContextMenu";
+import { localFilePreviewKindForPath } from "~/lib/localFileOpenIntent";
 import {
   projectListDirectoriesQueryOptions,
   projectReadFileQueryOptions,
@@ -28,11 +30,16 @@ import {
 } from "~/lib/projectReactQuery";
 import { getSyntaxHighlighterPromise, getSyntaxLanguageForPath } from "~/lib/syntaxHighlighting";
 import { cn } from "~/lib/utils";
+import {
+  createWorkspaceHtmlBrowserOpenRequest,
+  type WorkspaceHtmlBrowserOpenHandler,
+} from "~/lib/workspaceFileOpener";
 import { Skeleton } from "../ui/skeleton";
 import { Collapsible, CollapsiblePanel, CollapsibleTrigger } from "../ui/collapsible";
 import { DisclosureChevron } from "../ui/DisclosureChevron";
 import { SearchInput } from "../ui/search-input";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
+import { toastManager } from "../ui/toast";
 import { EXPLORER_ROW_PROPS, useExplorerListNavigation } from "./explorerListNavigation";
 import { FileEntryIcon } from "./FileEntryIcon";
 import { fileRowClassName, fileRowIndentStyle } from "./fileRowStyles";
@@ -98,6 +105,10 @@ export function useExplorerEntryPrefetch(cwd: string | null) {
           includeFiles: true,
         }),
       );
+      return;
+    }
+    const previewKind = localFilePreviewKindForPath(entry.path);
+    if (previewKind === "image" || previewKind === "pdf" || previewKind === "unsupported-binary") {
       return;
     }
     void queryClient.prefetchQuery(projectReadFileQueryOptions({ cwd, relativePath: entry.path }));
@@ -295,21 +306,74 @@ function WorkspaceDirectory(props: {
 }
 
 // Opening the file-reference context menu from a tree row (full entry) or a
-// search-result row (path only). Both wrap the same menu, so they live here
-// instead of being re-declared in every sidebar that renders these rows.
-function useTreeEntryContextMenu(
+// search-result row (path only). Capability minting stays centralized so every
+// explorer surface gets the same fresh-grant and error behavior.
+function useFileEntryContextMenu(
+  workspaceRoot: string | null,
+  referenceRoot: string | null | undefined,
   onReferenceInChat: ((reference: ChatFileReference) => void) | undefined,
+  onOpenInBrowser: WorkspaceHtmlBrowserOpenHandler | undefined,
 ) {
+  const queryClient = useQueryClient();
+  return (path: string, position: { x: number; y: number }, allowBrowserOpen: boolean) => {
+    const openInBrowser =
+      allowBrowserOpen && isSupportedLocalHtmlPath(path) && onOpenInBrowser
+        ? () => {
+            void createWorkspaceHtmlBrowserOpenRequest({
+              queryClient,
+              filePath: path,
+              workspaceRoot,
+              referenceRoot,
+            }).then(onOpenInBrowser, (error) => {
+              toastManager.add({
+                type: "error",
+                title: "Could not open HTML in browser",
+                description:
+                  error instanceof Error ? error.message : "An unexpected error occurred.",
+              });
+            });
+          }
+        : undefined;
+    void showFileReferenceContextMenu({
+      path,
+      position,
+      onReferenceInChat,
+      onOpenInBrowser: openInBrowser,
+    });
+  };
+}
+
+function useTreeEntryContextMenu(
+  workspaceRoot: string | null,
+  referenceRoot: string | null | undefined,
+  onReferenceInChat: ((reference: ChatFileReference) => void) | undefined,
+  onOpenInBrowser: WorkspaceHtmlBrowserOpenHandler | undefined,
+) {
+  const showEntryContextMenu = useFileEntryContextMenu(
+    workspaceRoot,
+    referenceRoot,
+    onReferenceInChat,
+    onOpenInBrowser,
+  );
   return (entry: ProjectFileSystemEntry, position: { x: number; y: number }) => {
-    void showFileReferenceContextMenu({ path: entry.path, position, onReferenceInChat });
+    showEntryContextMenu(entry.path, position, entry.kind === "file");
   };
 }
 
 function useResultEntryContextMenu(
+  workspaceRoot: string | null,
+  referenceRoot: string | null | undefined,
   onReferenceInChat: ((reference: ChatFileReference) => void) | undefined,
+  onOpenInBrowser: WorkspaceHtmlBrowserOpenHandler | undefined,
 ) {
+  const showEntryContextMenu = useFileEntryContextMenu(
+    workspaceRoot,
+    referenceRoot,
+    onReferenceInChat,
+    onOpenInBrowser,
+  );
   return (path: string, position: { x: number; y: number }) => {
-    void showFileReferenceContextMenu({ path, position, onReferenceInChat });
+    showEntryContextMenu(path, position, true);
   };
 }
 
@@ -349,15 +413,22 @@ function WorkspaceFilesTreeBody(props: {
 
 export function WorkspaceFilesSidebar(props: {
   workspaceRoot: string | null;
+  referenceRoot?: string | null | undefined;
   selectedFilePath: string | null;
   expandedDirectories: ReadonlySet<string>;
   containerClassName?: string;
   onSelectFile: (path: string) => void;
   onToggleDirectory: (path: string) => void;
   onReferenceInChat: ((reference: ChatFileReference) => void) | undefined;
+  onOpenInBrowser?: WorkspaceHtmlBrowserOpenHandler | undefined;
 }) {
   const prefetchEntry = useExplorerEntryPrefetch(props.workspaceRoot);
-  const handleEntryContextMenu = useTreeEntryContextMenu(props.onReferenceInChat);
+  const handleEntryContextMenu = useTreeEntryContextMenu(
+    props.workspaceRoot,
+    props.referenceRoot,
+    props.onReferenceInChat,
+    props.onOpenInBrowser,
+  );
   const handleListKeyDown = useExplorerListNavigation();
   return (
     <aside
@@ -576,15 +647,22 @@ function WorkspaceSearchResultsBody(props: {
 
 export function WorkspaceSearchSidebar(props: {
   workspaceRoot: string | null;
+  referenceRoot?: string | null | undefined;
   query: string;
   onQueryChange: (query: string) => void;
   selectedFilePath: string | null;
   containerClassName?: string;
   onSelectFile: (path: string) => void;
   onReferenceInChat: ((reference: ChatFileReference) => void) | undefined;
+  onOpenInBrowser?: WorkspaceHtmlBrowserOpenHandler | undefined;
 }) {
   const prefetchEntry = useExplorerEntryPrefetch(props.workspaceRoot);
-  const handleEntryContextMenu = useResultEntryContextMenu(props.onReferenceInChat);
+  const handleEntryContextMenu = useResultEntryContextMenu(
+    props.workspaceRoot,
+    props.referenceRoot,
+    props.onReferenceInChat,
+    props.onOpenInBrowser,
+  );
   const handleListKeyDown = useExplorerListNavigation();
   const search = useWorkspaceFileSearch(props.workspaceRoot, props.query);
 
@@ -625,6 +703,7 @@ export function WorkspaceSearchSidebar(props: {
 // the user types — no separate Files/Search activity rail needed.
 export function WorkspaceExplorerSidebar(props: {
   workspaceRoot: string | null;
+  referenceRoot?: string | null | undefined;
   selectedFilePath: string | null;
   expandedDirectories: ReadonlySet<string>;
   query: string;
@@ -633,10 +712,21 @@ export function WorkspaceExplorerSidebar(props: {
   onSelectFile: (path: string) => void;
   onToggleDirectory: (path: string) => void;
   onReferenceInChat: ((reference: ChatFileReference) => void) | undefined;
+  onOpenInBrowser?: WorkspaceHtmlBrowserOpenHandler | undefined;
 }) {
   const prefetchEntry = useExplorerEntryPrefetch(props.workspaceRoot);
-  const handleTreeEntryContextMenu = useTreeEntryContextMenu(props.onReferenceInChat);
-  const handleResultEntryContextMenu = useResultEntryContextMenu(props.onReferenceInChat);
+  const handleTreeEntryContextMenu = useTreeEntryContextMenu(
+    props.workspaceRoot,
+    props.referenceRoot,
+    props.onReferenceInChat,
+    props.onOpenInBrowser,
+  );
+  const handleResultEntryContextMenu = useResultEntryContextMenu(
+    props.workspaceRoot,
+    props.referenceRoot,
+    props.onReferenceInChat,
+    props.onOpenInBrowser,
+  );
   const handleListKeyDown = useExplorerListNavigation();
   const search = useWorkspaceFileSearch(props.workspaceRoot, props.query);
 
