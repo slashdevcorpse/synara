@@ -14,6 +14,7 @@ import desktopPackageJson from "../apps/desktop/package.json" with { type: "json
 import serverPackageJson from "../apps/server/package.json" with { type: "json" };
 
 import { BRAND_ASSET_PATHS } from "./lib/brand-assets.ts";
+import { DESKTOP_BUILD_ARCHES } from "./lib/desktop-build-options.ts";
 import { createDesktopBuilderCommandPlan } from "./lib/desktop-builder-command.ts";
 import {
   createDesktopPlatformBuildConfig,
@@ -50,7 +51,7 @@ import { Command, Flag } from "effect/unstable/cli";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 
 const BuildPlatform = Schema.Literals(["mac", "linux", "win"]);
-const BuildArch = Schema.Literals(["arm64", "x64", "universal"]);
+const BuildArch = Schema.Literals(DESKTOP_BUILD_ARCHES);
 const PackagedDesktopFlavor = Schema.Literals(["production", "canary", "super"]);
 
 const RepoRoot = Effect.service(Path.Path).pipe(
@@ -716,6 +717,7 @@ const copyPreparedSuperStageDependencies = Effect.fn("copyPreparedSuperStageDepe
 const createBuildConfig = Effect.fn("createBuildConfig")(function* (
   platform: typeof BuildPlatform.Type,
   target: string,
+  arch: typeof BuildArch.Type,
   flavor: Exclude<SynaraDesktopFlavor, "development">,
   signed: boolean,
   disableUpdates: boolean,
@@ -748,6 +750,7 @@ const createBuildConfig = Effect.fn("createBuildConfig")(function* (
     : undefined;
 
   const platformBuildConfigInput = {
+    arch,
     platform,
     target,
     signed,
@@ -1022,6 +1025,7 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
   const resolvedBuildConfig = yield* createBuildConfig(
     options.platform,
     options.target,
+    options.arch,
     options.flavor,
     options.signed,
     options.disableUpdates,
