@@ -22,6 +22,15 @@ interface ObservedLiveTurn {
   turnKey: string | null;
 }
 
+interface DisplaySnapshot {
+  threadId: string | null;
+  state: AgentActivityState;
+}
+
+export interface AgentActivityPresentationState extends AgentActivityState {
+  presentationThreadId: string | null;
+}
+
 function initialDisplayState(target: AgentActivityState): AgentActivityState {
   return isTerminalAgentActivityPhase(target.phase) ? IDLE_AGENT_ACTIVITY_STATE : target;
 }
@@ -41,7 +50,7 @@ function activityStatesEqual(left: AgentActivityState, right: AgentActivityState
  * replay on mount, active phase churn has a short minimum dwell, and terminal
  * states appear once for a turn before successful/failed work dissolves.
  */
-export function useAgentActivityState(input: AgentActivityInput): AgentActivityState {
+export function useAgentActivityState(input: AgentActivityInput): AgentActivityPresentationState {
   const target = useMemo(
     () => deriveAgentActivityState(input),
     [
@@ -57,10 +66,11 @@ export function useAgentActivityState(input: AgentActivityInput): AgentActivityS
       input.threadId,
     ],
   );
-  const [displayState, setDisplayState] = useState<AgentActivityState>(() =>
-    initialDisplayState(target),
-  );
-  const displayStateRef = useRef(displayState);
+  const [displaySnapshot, setDisplaySnapshot] = useState<DisplaySnapshot>(() => ({
+    threadId: input.threadId,
+    state: initialDisplayState(target),
+  }));
+  const displayStateRef = useRef(displaySnapshot.state);
   const activeThreadIdRef = useRef(input.threadId);
   const observedLiveTurnRef = useRef<ObservedLiveTurn | null>(null);
   const presentedTerminalKeyRef = useRef<string | null>(null);
@@ -86,7 +96,12 @@ export function useAgentActivityState(input: AgentActivityInput): AgentActivityS
       lastPhaseChangeAtRef.current = now;
     }
     displayStateRef.current = next;
-    setDisplayState((current) => (activityStatesEqual(current, next) ? current : next));
+    setDisplaySnapshot((current) => {
+      const threadId = activeThreadIdRef.current;
+      return current.threadId === threadId && activityStatesEqual(current.state, next)
+        ? current
+        : { threadId, state: next };
+    });
   }, []);
 
   const schedulePhaseCommit = useCallback(
@@ -240,5 +255,15 @@ export function useAgentActivityState(input: AgentActivityInput): AgentActivityS
     [cancelPhaseFrame, cancelTerminalFrame],
   );
 
-  return displayState;
+  // A thread switch renders before its layout effect resets presentation memory. Keep the
+  // displayed state tagged with its source thread so any render before the state update lands
+  // masks the outgoing phase synchronously.
+  if (displaySnapshot.threadId !== input.threadId) {
+    return {
+      ...(isLiveAgentActivityPhase(target.phase) ? target : IDLE_AGENT_ACTIVITY_STATE),
+      presentationThreadId: input.threadId,
+    };
+  }
+
+  return { ...displaySnapshot.state, presentationThreadId: input.threadId };
 }

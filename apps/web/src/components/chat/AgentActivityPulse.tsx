@@ -37,7 +37,9 @@ export type AgentActivityVisualState = Pick<
   AgentActivityState,
   "phase" | "toolCount" | "subagentCount"
 > &
-  Partial<Pick<AgentActivityState, "lastEventTimestamp">>;
+  Partial<Pick<AgentActivityState, "lastEventTimestamp">> & {
+    presentationThreadId?: string | null;
+  };
 
 interface AgentActivityRenderableState extends AgentActivityVisualState {
   motionIdentity: string;
@@ -312,6 +314,7 @@ export function AgentActivityPulse(props: AgentActivityPulseProps) {
   if (props.variant === "bar") {
     return (
       <AgentActivityBar
+        key={state.presentationThreadId ?? undefined}
         state={state}
         announce={props.announce === true}
         {...(props.className !== undefined ? { className: props.className } : {})}

@@ -66,15 +66,23 @@
     "clean": "rm -rf node_modules apps/*/node_modules packages/*/node_modules scripts/node_modules apps/*/dist apps/*/dist-electron packages/*/dist .turbo apps/*/.turbo packages/*/.turbo"
   },
   "devDependencies": {
+    "@babel/core": "7.29.7",
     "@effect/language-service": "catalog:",
     "@types/node": "catalog:",
+    "js-yaml": "4.3.0",
     "oxfmt": "^0.40.0",
     "oxlint": "^1.55.0",
+    "picomatch": "2.3.2",
     "turbo": "^2.9.14",
     "typescript": "catalog:",
+    "undici": "7.28.0",
     "vitest": "catalog:"
   },
   "overrides": {
+    "@earendil-works/pi-agent-core": "0.80.6",
+    "@earendil-works/pi-ai": "0.80.6",
+    "@earendil-works/pi-coding-agent": "0.80.6",
+    "@earendil-works/pi-tui": "0.80.6",
     "axios": "^1.16.0",
     "defu": "^6.1.5",
     "fast-uri": "^3.1.2",
@@ -83,6 +91,7 @@
     "hono": "^4.12.25",
     "ip-address": "^10.2.0",
     "joi": "^18.2.1",
+    "js-yaml": "4.3.0",
     "lodash": "^4.18.1",
     "postcss": "^8.5.10",
     "protobufjs": "^7.6.3",

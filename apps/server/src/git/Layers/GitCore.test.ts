@@ -8,7 +8,7 @@ import path from "node:path";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
 import { splitLines } from "@synara/shared/text";
-import { Effect, FileSystem, Layer, PlatformError, Schema, Scope } from "effect";
+import { Effect, Exit, FileSystem, Layer, PlatformError, Schema, Scope } from "effect";
 import { describe, expect, vi } from "vitest";
 
 import { GitCoreLive, makeGitCore } from "./GitCore.ts";
@@ -72,31 +72,6 @@ function git(
       timeoutMs: 10_000,
     });
     return result.stdout.trim();
-  });
-}
-
-function runShellCommand(input: {
-  command: string;
-  cwd: string;
-  timeoutMs?: number;
-  maxOutputBytes?: number;
-}): Effect.Effect<ProcessRunResult, Error> {
-  return Effect.promise(() => {
-    const shellPath =
-      process.platform === "win32"
-        ? (process.env.ComSpec ?? "cmd.exe")
-        : (process.env.SHELL ?? "/bin/sh");
-
-    const args =
-      process.platform === "win32" ? ["/d", "/s", "/c", input.command] : ["-lc", input.command];
-
-    return runProcess(shellPath, args, {
-      cwd: input.cwd,
-      timeoutMs: input.timeoutMs ?? 30_000,
-      allowNonZeroExit: true,
-      maxBufferBytes: input.maxOutputBytes ?? 1_000_000,
-      outputMode: "truncate",
-    });
   });
 }
 
@@ -581,9 +556,12 @@ it.layer(TestLayer)("git integration", (it) => {
         });
         yield* core.checkoutBranch({ cwd: source, branch: featureBranch });
         yield* Effect.promise(() =>
-          vi.waitFor(() => {
-            expect(fetchArgs).not.toBeNull();
-          }),
+          vi.waitFor(
+            () => {
+              expect(fetchArgs).not.toBeNull();
+            },
+            { timeout: 10_000 },
+          ),
         );
 
         expect(yield* git(source, ["branch", "--show-current"])).toBe(featureBranch);
@@ -804,9 +782,10 @@ it.layer(TestLayer)("git integration", (it) => {
 
         const branches = yield* core.listBranches({ cwd: tmp });
         expect(branches.branches.find((branch) => branch.current)?.name).toBe("feature");
-        expect(splitLines(yield* readTextFile(path.join(tmp, "README.md"))).join("\n")).toBe(
-          "dirty changes\n",
-        );
+        expect(splitLines(yield* readTextFile(path.join(tmp, "README.md")))).toEqual([
+          "dirty changes",
+          "",
+        ]);
         expect((yield* git(tmp, ["stash", "list"])).trim()).toBe("");
       }),
     );
@@ -833,9 +812,10 @@ it.layer(TestLayer)("git integration", (it) => {
         const stashList = yield* git(tmp, ["stash", "list"]);
         expect(stashList).toContain("pre-existing stash");
         expect(stashList).not.toContain("synara: stash before switching to feature");
-        expect(splitLines(yield* readTextFile(path.join(tmp, "README.md"))).join("\n")).toBe(
-          "dirty changes\n",
-        );
+        expect(splitLines(yield* readTextFile(path.join(tmp, "README.md")))).toEqual([
+          "dirty changes",
+          "",
+        ]);
       }),
     );
 
@@ -861,9 +841,10 @@ it.layer(TestLayer)("git integration", (it) => {
         expect(result._tag).toBe("Failure");
         const branches = yield* core.listBranches({ cwd: tmp });
         expect(branches.branches.find((branch) => branch.current)?.name).toBe("conflicting");
-        expect(splitLines(yield* readTextFile(path.join(tmp, "README.md"))).join("\n")).toBe(
-          "conflicting content\n",
-        );
+        expect(splitLines(yield* readTextFile(path.join(tmp, "README.md")))).toEqual([
+          "conflicting content",
+          "",
+        ]);
         expect((yield* git(tmp, ["status", "--short"])).trim()).toBe("");
         expect(yield* git(tmp, ["stash", "list"])).toContain(
           "synara: stash before switching to conflicting",
@@ -1170,6 +1151,122 @@ it.layer(TestLayer)("git integration", (it) => {
         expect(branchOutput).toBe("wt-check");
 
         yield* (yield* GitCore).removeWorktree({ cwd: tmp, path: wtPath });
+      }),
+    );
+
+    it.effect("verifies a clean unchanged worktree through its Git-admin ownership marker", () =>
+      Effect.gen(function* () {
+        const tmp = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(tmp);
+        const core = yield* GitCore;
+        const wtPath = path.join(tmp, "wt-owned");
+        yield* core.createWorktree({
+          cwd: tmp,
+          branch: initialBranch,
+          newBranch: "wt-owned",
+          path: wtPath,
+        });
+        const proof = yield* core.recordWorktreeOwnership({
+          path: wtPath,
+          branch: "wt-owned",
+          token: "operation-token",
+        });
+        expect(yield* core.verifyWorktreeOwnership({ path: wtPath, proof })).toEqual({
+          verified: true,
+          reason: null,
+        });
+
+        yield* writeTextFile(path.join(wtPath, "untracked.txt"), "do not remove\n");
+        expect(yield* core.verifyWorktreeOwnership({ path: wtPath, proof })).toEqual({
+          verified: false,
+          reason: "worktree has uncommitted changes",
+        });
+        yield* core.removeWorktree({ cwd: tmp, path: wtPath, force: true });
+        yield* core.deleteBranchIfUnchanged({
+          cwd: tmp,
+          branch: "wt-owned",
+          expectedHead: proof.head,
+        });
+      }),
+    );
+
+    it.effect("rejects a same-path same-branch replacement without the original marker", () =>
+      Effect.gen(function* () {
+        const tmp = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(tmp);
+        const core = yield* GitCore;
+        const wtPath = path.join(tmp, "wt-replaced");
+        yield* core.createWorktree({
+          cwd: tmp,
+          branch: initialBranch,
+          newBranch: "wt-replaced",
+          path: wtPath,
+        });
+        const proof = yield* core.recordWorktreeOwnership({
+          path: wtPath,
+          branch: "wt-replaced",
+          token: "original-operation-token",
+        });
+        yield* core.removeWorktree({ cwd: tmp, path: wtPath, force: true });
+        yield* core.deleteBranchIfUnchanged({
+          cwd: tmp,
+          branch: "wt-replaced",
+          expectedHead: proof.head,
+        });
+        yield* core.createWorktree({
+          cwd: tmp,
+          branch: initialBranch,
+          newBranch: "wt-replaced",
+          path: wtPath,
+        });
+
+        const verification = yield* core.verifyWorktreeOwnership({ path: wtPath, proof });
+        expect(verification.verified).toBe(false);
+        expect(verification.reason).toMatch(/Git directory changed|marker is missing/);
+        yield* core.removeWorktree({ cwd: tmp, path: wtPath, force: true });
+      }),
+    );
+
+    it.effect("rejects a moved HEAD and conditionally preserves the changed branch", () =>
+      Effect.gen(function* () {
+        const tmp = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(tmp);
+        const core = yield* GitCore;
+        const wtPath = path.join(tmp, "wt-head-moved");
+        yield* core.createWorktree({
+          cwd: tmp,
+          branch: initialBranch,
+          newBranch: "wt-head-moved",
+          path: wtPath,
+        });
+        const proof = yield* core.recordWorktreeOwnership({
+          path: wtPath,
+          branch: "wt-head-moved",
+          token: "head-moved-token",
+        });
+        yield* writeTextFile(path.join(wtPath, "new-commit.txt"), "preserve me\n");
+        yield* git(wtPath, ["add", "new-commit.txt"]);
+        yield* git(wtPath, ["commit", "-m", "advance owned branch"]);
+
+        expect(yield* core.verifyWorktreeOwnership({ path: wtPath, proof })).toEqual({
+          verified: false,
+          reason: "worktree HEAD changed",
+        });
+        yield* core.removeWorktree({ cwd: tmp, path: wtPath, force: false });
+        const deletion = yield* Effect.exit(
+          core.deleteBranchIfUnchanged({
+            cwd: tmp,
+            branch: "wt-head-moved",
+            expectedHead: proof.head,
+          }),
+        );
+        expect(Exit.isFailure(deletion)).toBe(true);
+        expect(
+          (yield* core.listBranches({ cwd: tmp })).branches.some(
+            (branch) => branch.name === "wt-head-moved",
+          ),
+        ).toBe(true);
+        yield* core.deleteBranch({ cwd: tmp, branch: "wt-head-moved", force: true });
       }),
     );
 

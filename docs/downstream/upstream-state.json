@@ -2,8 +2,8 @@
   "schemaVersion": 1,
   "repository": "slashdevcorpse/synara",
   "canonicalUpstream": "Emanuele-web04/synara",
-  "lastEffectiveUpstreamSha": "710e3e4ddd0d5b69bde7267cc2c4b4acbe834dd6",
-  "lastVerifiedOn": "2026-07-19",
+  "lastEffectiveUpstreamSha": "1664ce2f152cd6131a30d1ee8d7c9b60235bb0fe",
+  "lastVerifiedOn": "2026-07-20",
   "acceptedSyncs": [
     {
       "id": "baseline-2026-07-19-f4a020d0",
@@ -27,6 +27,18 @@
       "assessmentPath": "docs/downstream/syncs/2026-07-19-f4a020d0-710e3e4d.md",
       "acceptedOn": "2026-07-19",
       "rollbackSha": "f4a020d064317f285984ad31a09f4f7d9b2bfd65",
+      "classificationComplete": true
+    },
+    {
+      "id": "sync-2026-07-20-1664ce2f",
+      "previousUpstreamSha": "710e3e4ddd0d5b69bde7267cc2c4b4acbe834dd6",
+      "effectiveUpstreamSha": "1664ce2f152cd6131a30d1ee8d7c9b60235bb0fe",
+      "downstreamCommit": "41fe079cc0af07bfbfe3f7c640b1ddc367a900e2",
+      "integrationMethod": "merge-commit",
+      "pullRequest": "https://github.com/slashdevcorpse/synara/pull/47",
+      "assessmentPath": "docs/downstream/syncs/2026-07-20-710e3e4d-1664ce2f.md",
+      "acceptedOn": "2026-07-20",
+      "rollbackSha": "710e3e4ddd0d5b69bde7267cc2c4b4acbe834dd6",
       "classificationComplete": true
     }
   ],
