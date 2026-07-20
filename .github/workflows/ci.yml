@@ -179,6 +179,10 @@ jobs:
           src/desktopStorageMigration.test.ts
           src/windowState.test.ts
           src/updateState.test.ts
+
+      - name: Run Windows desktop smoke containment regressions
+        run: >-
+          bun run --cwd apps/desktop test
           scripts/smoke-test.test.mjs
           scripts/smoke-test-windows-job.windows.integration.test.mjs
 
