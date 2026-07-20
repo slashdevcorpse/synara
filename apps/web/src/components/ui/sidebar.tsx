@@ -472,16 +472,26 @@ function SidebarRail({
       resizeState.transitionTargets.forEach((element) => {
         element.style.removeProperty("transition-duration");
       });
-      if (resolvedResizable?.storageKey && typeof window !== "undefined") {
-        setLocalStorageItem(resolvedResizable.storageKey, resizeState.width, Schema.Finite);
+      try {
+        if (resolvedResizable?.storageKey && typeof window !== "undefined") {
+          try {
+            setLocalStorageItem(resolvedResizable.storageKey, resizeState.width, Schema.Finite);
+          } catch (error) {
+            console.warn("[sidebar] Failed to persist resized width:", error);
+          }
+        }
+        resolvedResizable?.onResize?.(resizeState.width);
+      } finally {
+        resizeStateRef.current = null;
+        try {
+          if (resizeState.rail.hasPointerCapture(pointerId)) {
+            resizeState.rail.releasePointerCapture(pointerId);
+          }
+        } finally {
+          document.body.style.removeProperty("cursor");
+          document.body.style.removeProperty("user-select");
+        }
       }
-      resolvedResizable?.onResize?.(resizeState.width);
-      resizeStateRef.current = null;
-      if (resizeState.rail.hasPointerCapture(pointerId)) {
-        resizeState.rail.releasePointerCapture(pointerId);
-      }
-      document.body.style.removeProperty("cursor");
-      document.body.style.removeProperty("user-select");
     },
     [resolvedResizable],
   );
