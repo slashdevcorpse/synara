@@ -1,5 +1,7 @@
 import { spawn } from "node:child_process";
-import { win32 } from "node:path";
+import { mkdirSync, statSync } from "node:fs";
+import { homedir } from "node:os";
+import { isAbsolute, parse, relative, resolve, win32 } from "node:path";
 
 export const DESKTOP_SMOKE_OBSERVATION_MS = 8_000;
 export const DESKTOP_SMOKE_GRACEFUL_SHUTDOWN_MS = 5_000;
@@ -17,6 +19,18 @@ const WINDOWS_SMOKE_TASKKILL_CLOSE_PROOF_MS = 500;
 const WINDOWS_SMOKE_TASKKILL_MARGIN_MS = 100;
 const WINDOWS_SMOKE_RUN_ID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+export const DESKTOP_PERSISTENCE_SMOKE_READINESS_MS = 30_000;
+export const DESKTOP_PERSISTENCE_SMOKE_TREE_CONFIRMATION_MS = 8_000;
+export const DESKTOP_PERSISTENCE_SMOKE_TREE_POLL_MS = 100;
+export const DESKTOP_PERSISTENCE_SMOKE_USER_DATA_ENV =
+  "SYNARA_DESKTOP_PERSISTENCE_SMOKE_USER_DATA";
+export const DESKTOP_PERSISTENCE_SMOKE_USER_DATA_DIRECTORY = "electron-user-data";
+export const DESKTOP_PERSISTENCE_SMOKE_USER_DATA_LOG_PREFIX =
+  "[desktop] persistence-smoke userData=";
+
+export const DESKTOP_PERSISTENCE_SMOKE_READINESS_PATTERNS = Object.freeze([
+  "Synara running",
+]);
 
 export const DESKTOP_SMOKE_FATAL_PATTERNS = Object.freeze([
   "Cannot find module",
@@ -163,7 +177,61 @@ function defaultSignalProcess(pid, signal) {
   process.kill(pid, signal);
 }
 
-function defaultKillWindowsTree(pid, { timeoutMs, environment }) {
+function windowsTaskkillVerificationPids(output) {
+  const pids = new Set();
+  for (const match of output.matchAll(
+    /\b(?:SUCCESS|ERROR): The process with PID\s+(\d+)\b/giu,
+  )) {
+    const pid = Number(match[1]);
+    if (Number.isSafeInteger(pid) && pid > 0) pids.add(pid);
+  }
+  return [...pids];
+}
+
+function isUnsupportedWindowsTaskkillRace(output) {
+  const lines = output
+    .replaceAll("\r", "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  let unsupportedTerminationCount = 0;
+  let unsupportedReasonCount = 0;
+
+  for (const line of lines) {
+    if (line.startsWith("SUCCESS:")) continue;
+    if (
+      /^ERROR: The process with PID \d+\b.* could not be terminated\.$/u.test(line)
+    ) {
+      unsupportedTerminationCount += 1;
+      continue;
+    }
+    if (line === "Reason: The operation attempted is not supported.") {
+      unsupportedReasonCount += 1;
+      continue;
+    }
+    return false;
+  }
+
+  return (
+    unsupportedTerminationCount > 0 && unsupportedTerminationCount === unsupportedReasonCount
+  );
+}
+
+export function classifyWindowsTaskkillClose({ code, signal, output }) {
+  if (code === 0) return { ok: true };
+
+  const diagnostic = `Windows taskkill did not confirm teardown (${processDescription(
+    code,
+    signal,
+  )})${output.trim().length === 0 ? "." : `: ${output.trim()}`}`;
+  const verificationPids = windowsTaskkillVerificationPids(output);
+  if (verificationPids.length > 0 && isUnsupportedWindowsTaskkillRace(output)) {
+    return { ok: false, diagnostic, verificationPids };
+  }
+  return { ok: false, diagnostic };
+}
+
+function defaultKillWindowsTree(pid, { timeoutMs, environment = process.env }) {
   return new Promise((resolve) => {
     let taskkillPath;
     try {
@@ -179,7 +247,7 @@ function defaultKillWindowsTree(pid, { timeoutMs, environment }) {
     let taskkill;
     try {
       taskkill = spawn(taskkillPath, ["/PID", String(pid), "/T", "/F"], {
-        stdio: "ignore",
+        stdio: ["ignore", "pipe", "pipe"],
         windowsHide: true,
         env: environment,
       });
@@ -192,6 +260,7 @@ function defaultKillWindowsTree(pid, { timeoutMs, environment }) {
     let closeObserved = false;
     let operationTimeout;
     let closeProofTimeout;
+    let output = "";
     const guardLateErrorsUntilClose = () => {
       if (closeObserved) return;
       const ignoreLateError = () => {};
@@ -216,17 +285,15 @@ function defaultKillWindowsTree(pid, { timeoutMs, environment }) {
     };
     const onClose = (code, signal) => {
       closeObserved = true;
-      if (code === 0) {
-        finish({ ok: true });
-        return;
-      }
-      finish({
-        ok: false,
-        diagnostic:
-          "Windows taskkill did not confirm cleanup (" + processDescription(code, signal) + ").",
-      });
+      finish(classifyWindowsTaskkillClose({ code, signal, output }));
     };
 
+    const appendOutput = (chunk) => {
+      output += chunk.toString();
+      if (output.length > 8_192) output = output.slice(-8_192);
+    };
+    taskkill.stdout?.on("data", appendOutput);
+    taskkill.stderr?.on("data", appendOutput);
     taskkill.on("error", onError);
     taskkill.on("close", onClose);
     const closeProofMs = Math.min(
@@ -260,6 +327,511 @@ function stageTaskkillTimeout(stageMs) {
     Math.max(1, Math.floor(stageMs / 10)),
   );
   return Math.max(1, stageMs - deadlineMarginMs);
+}
+
+function comparablePath(path, platform) {
+  return platform === "win32" ? path.toLowerCase() : path;
+}
+
+function isSameOrContainedPath(parent, candidate, platform) {
+  const comparableParent = comparablePath(parent, platform);
+  const comparableCandidate = comparablePath(candidate, platform);
+  const pathFromParent = relative(comparableParent, comparableCandidate);
+  return (
+    pathFromParent === "" ||
+    (!pathFromParent.startsWith("..") && !isAbsolute(pathFromParent))
+  );
+}
+
+export function validateDesktopPersistenceSmokeEnvironment({
+  environment = process.env,
+  homeDirectory = homedir(),
+  platform = process.platform,
+} = {}) {
+  const flavor = environment.SYNARA_DESKTOP_FLAVOR?.trim().toLowerCase();
+  if (flavor !== "super") {
+    throw new Error(
+      "Desktop persistence smoke requires SYNARA_DESKTOP_FLAVOR=super.",
+    );
+  }
+
+  const configuredHome = environment.SYNARA_HOME?.trim();
+  if (!configuredHome) {
+    throw new Error(
+      "Desktop persistence smoke requires an explicit absolute SYNARA_HOME.",
+    );
+  }
+  if (!isAbsolute(configuredHome)) {
+    throw new Error(
+      `Desktop persistence smoke requires an absolute SYNARA_HOME; received '${configuredHome}'.`,
+    );
+  }
+
+  const resolvedHome = resolve(configuredHome);
+  if (resolvedHome === parse(resolvedHome).root) {
+    throw new Error("Desktop persistence smoke refuses to use a filesystem root as SYNARA_HOME.");
+  }
+
+  for (const liveHomeName of [".synara", ".synara-canary", ".super-synara"]) {
+    const liveHome = resolve(homeDirectory, liveHomeName);
+    if (isSameOrContainedPath(liveHome, resolvedHome, platform)) {
+      throw new Error(
+        `Desktop persistence smoke refuses to use live desktop state at '${resolvedHome}'.`,
+      );
+    }
+  }
+
+  if (environment.SYNARA_DESKTOP_DISABLE_UPDATES !== "1") {
+    throw new Error(
+      'Desktop persistence smoke requires SYNARA_DESKTOP_DISABLE_UPDATES="1".',
+    );
+  }
+
+  return resolvedHome;
+}
+
+export function validateDesktopPersistenceSmokeProfileIsolation({
+  environment,
+  synaraHome,
+  platform = process.platform,
+}) {
+  const configuredUserData = environment[DESKTOP_PERSISTENCE_SMOKE_USER_DATA_ENV]?.trim();
+  if (!configuredUserData) {
+    throw new Error(
+      `Desktop persistence smoke requires ${DESKTOP_PERSISTENCE_SMOKE_USER_DATA_ENV}.`,
+    );
+  }
+  if (!isAbsolute(configuredUserData)) {
+    throw new Error(
+      `Desktop persistence smoke requires ${DESKTOP_PERSISTENCE_SMOKE_USER_DATA_ENV} to be absolute.`,
+    );
+  }
+
+  const resolvedHome = resolve(synaraHome);
+  const resolvedUserData = resolve(configuredUserData);
+  if (
+    resolvedUserData === resolvedHome ||
+    !isSameOrContainedPath(resolvedHome, resolvedUserData, platform)
+  ) {
+    throw new Error(
+      `Desktop persistence smoke requires ${DESKTOP_PERSISTENCE_SMOKE_USER_DATA_ENV} to remain inside SYNARA_HOME.`,
+    );
+  }
+  return resolvedUserData;
+}
+
+export function createDesktopPersistenceSmokeEnvironment({
+  environment = process.env,
+  synaraHome,
+  platform = process.platform,
+}) {
+  const resolvedHome = resolve(synaraHome);
+  const smokeEnvironment = createDesktopSmokeEnvironment(environment);
+  for (const key of Object.keys(smokeEnvironment)) {
+    if (key.toLowerCase() === DESKTOP_PERSISTENCE_SMOKE_USER_DATA_ENV.toLowerCase()) {
+      delete smokeEnvironment[key];
+    }
+  }
+  smokeEnvironment[DESKTOP_PERSISTENCE_SMOKE_USER_DATA_ENV] = resolve(
+    resolvedHome,
+    DESKTOP_PERSISTENCE_SMOKE_USER_DATA_DIRECTORY,
+  );
+  const userDataPath = validateDesktopPersistenceSmokeProfileIsolation({
+    environment: smokeEnvironment,
+    synaraHome: resolvedHome,
+    platform,
+  });
+  return { environment: smokeEnvironment, userDataPath };
+}
+
+export function desktopPersistenceSmokeUserDataEvidence(userDataPath) {
+  return `${DESKTOP_PERSISTENCE_SMOKE_USER_DATA_LOG_PREFIX}${resolve(userDataPath)}`;
+}
+
+export function ensureDesktopPersistenceSmokeHome(
+  homePath,
+  { statPath = statSync, makeDirectory = mkdirSync } = {},
+) {
+  let homeStat;
+  try {
+    homeStat = statPath(homePath);
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      throw new Error(
+        `Desktop persistence smoke could not inspect SYNARA_HOME '${homePath}': ${formatError(error)}`,
+      );
+    }
+
+    makeDirectory(homePath, { recursive: true });
+    homeStat = statPath(homePath);
+    if (!homeStat.isDirectory()) {
+      throw new Error(
+        `Desktop persistence smoke created SYNARA_HOME '${homePath}', but it is not a directory.`,
+      );
+    }
+    return { homePath, created: true };
+  }
+
+  if (!homeStat.isDirectory()) {
+    throw new Error(
+      `Desktop persistence smoke requires SYNARA_HOME '${homePath}' to be a directory.`,
+    );
+  }
+  return { homePath, created: false };
+}
+
+function outputDiagnostic(output) {
+  return output.length === 0 ? "" : `\nCaptured output:\n${output}`;
+}
+
+export function waitForDesktopSmokeReadiness({
+  child,
+  description = "Desktop",
+  timeoutMs = DESKTOP_PERSISTENCE_SMOKE_READINESS_MS,
+  readinessPatterns = DESKTOP_PERSISTENCE_SMOKE_READINESS_PATTERNS,
+  fatalPatterns = DESKTOP_SMOKE_FATAL_PATTERNS,
+  initialOutput = "",
+  setTimer = setTimeout,
+  clearTimer = clearTimeout,
+}) {
+  if (readinessPatterns.length === 0) {
+    throw new Error("Desktop readiness requires at least one semantic evidence pattern.");
+  }
+
+  return new Promise((resolveReadiness, rejectReadiness) => {
+    let output = initialOutput;
+    let settled = false;
+    let timeout;
+
+    const cleanup = () => {
+      if (timeout !== undefined) clearTimer(timeout);
+      child.stdout?.off("data", onOutput);
+      child.stderr?.off("data", onOutput);
+      child.off("error", onError);
+      child.off("exit", onExit);
+      child.off("close", onClose);
+    };
+
+    const fail = (message) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      rejectReadiness(new Error(`${message}${outputDiagnostic(output)}`));
+    };
+
+    const inspectOutput = () => {
+      const fatalPattern = fatalPatterns.find((pattern) => output.includes(pattern));
+      if (fatalPattern !== undefined) {
+        fail(`${description} emitted fatal startup output '${fatalPattern}'.`);
+        return;
+      }
+
+      const evidence = readinessPatterns.find((pattern) => output.includes(pattern));
+      if (evidence === undefined || settled) return;
+      settled = true;
+      cleanup();
+      resolveReadiness({ evidence, output });
+    };
+
+    function onOutput(chunk) {
+      output += chunk.toString();
+      inspectOutput();
+    }
+
+    function onError(error) {
+      fail(`${description} process error before startup readiness: ${formatError(error)}.`);
+    }
+
+    function onExit(code, signal) {
+      fail(
+        `${description} exited before semantic startup readiness (${processDescription(code, signal)}).`,
+      );
+    }
+
+    function onClose(code, signal) {
+      fail(
+        `${description} closed before semantic startup readiness (${processDescription(code, signal)}).`,
+      );
+    }
+
+    child.stdout?.on("data", onOutput);
+    child.stderr?.on("data", onOutput);
+    child.on("error", onError);
+    child.on("exit", onExit);
+    child.on("close", onClose);
+
+    if (child.exitCode !== null || child.signalCode !== null) {
+      fail(
+        `${description} had already exited before semantic startup readiness (${processDescription(
+          child.exitCode,
+          child.signalCode,
+        )}).`,
+      );
+      return;
+    }
+
+    inspectOutput();
+    if (settled) return;
+    timeout = setTimer(() => {
+      fail(`${description} semantic startup readiness timed out after ${timeoutMs}ms.`);
+    }, timeoutMs);
+  });
+}
+
+function waitForDesktopProcessExit(
+  child,
+  timeoutMs,
+  { setTimer = setTimeout, clearTimer = clearTimeout } = {},
+) {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
+
+  return new Promise((resolveExit) => {
+    let timeout;
+    const finish = (exited) => {
+      if (timeout !== undefined) clearTimer(timeout);
+      child.off("exit", onExit);
+      child.off("close", onExit);
+      resolveExit(exited);
+    };
+    const onExit = () => finish(true);
+
+    child.once("exit", onExit);
+    child.once("close", onExit);
+    timeout = setTimer(() => finish(false), timeoutMs);
+  });
+}
+
+function defaultIsPosixTreeAlive(pid) {
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (error) {
+    if (error?.code === "ESRCH") return false;
+    throw error;
+  }
+}
+
+function defaultIsWindowsProcessAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (error?.code === "ESRCH") return false;
+    if (error?.code === "EPERM") return true;
+    throw error;
+  }
+}
+
+export function waitForDesktopProcessTreeGone({
+  isTreeAlive,
+  timeoutMs,
+  pollIntervalMs = DESKTOP_PERSISTENCE_SMOKE_TREE_POLL_MS,
+  setTimer = setTimeout,
+  clearTimer = clearTimeout,
+}) {
+  return new Promise((resolveGone, rejectGone) => {
+    let remainingMs = timeoutMs;
+    let timer;
+    let settled = false;
+
+    const finish = (result, error) => {
+      if (settled) return;
+      settled = true;
+      if (timer !== undefined) clearTimer(timer);
+      if (error !== undefined) {
+        rejectGone(error);
+        return;
+      }
+      resolveGone(result);
+    };
+
+    const check = () => {
+      let treeAlive;
+      try {
+        treeAlive = isTreeAlive();
+      } catch (error) {
+        finish(false, error);
+        return;
+      }
+
+      if (!treeAlive) {
+        finish(true);
+        return;
+      }
+      if (remainingMs <= 0) {
+        finish(false);
+        return;
+      }
+
+      const delayMs = Math.min(pollIntervalMs, remainingMs);
+      remainingMs -= delayMs;
+      timer = setTimer(check, delayMs);
+    };
+
+    check();
+  });
+}
+
+function normalizeWindowsTreeKillResult(result) {
+  if (typeof result === "boolean") {
+    return {
+      ok: result,
+      diagnostic: result ? undefined : "Windows taskkill did not confirm process-tree teardown.",
+    };
+  }
+  return result;
+}
+
+export async function forceStopDesktopSmokeProcessTree({
+  child,
+  description = "Desktop",
+  platform = process.platform,
+  timeoutMs = DESKTOP_PERSISTENCE_SMOKE_TREE_CONFIRMATION_MS,
+  signalProcess = defaultSignalProcess,
+  killWindowsTree = defaultKillWindowsTree,
+  isWindowsProcessAlive = defaultIsWindowsProcessAlive,
+  isPosixTreeAlive = defaultIsPosixTreeAlive,
+  waitForExit = waitForDesktopProcessExit,
+  waitForTreeGone = waitForDesktopProcessTreeGone,
+}) {
+  if (!Number.isInteger(child.pid) || child.pid <= 0) {
+    throw new Error(`${description} cannot prove process-tree teardown without a valid pid.`);
+  }
+  if (child.exitCode !== null || child.signalCode !== null) {
+    throw new Error(
+      `${description} exited before forced process-tree teardown began (${processDescription(
+        child.exitCode,
+        child.signalCode,
+      )}).`,
+    );
+  }
+
+  const pid = child.pid;
+  if (platform === "win32") {
+    const exitProof = waitForExit(child, timeoutMs);
+    let treeKillResult;
+    try {
+      treeKillResult = normalizeWindowsTreeKillResult(
+        await killWindowsTree(pid, { timeoutMs }),
+      );
+    } catch (error) {
+      treeKillResult = {
+        ok: false,
+        diagnostic: `Windows taskkill failed: ${formatError(error)}`,
+      };
+    }
+    const exitConfirmed = await exitProof;
+
+    let nonzeroTaskkillTreeGone = false;
+    if (
+      !treeKillResult?.ok &&
+      Array.isArray(treeKillResult?.verificationPids) &&
+      treeKillResult.verificationPids.length > 0
+    ) {
+      const verificationPids = [...new Set([pid, ...treeKillResult.verificationPids])];
+      nonzeroTaskkillTreeGone = await waitForTreeGone({
+        isTreeAlive: () =>
+          verificationPids.some((verificationPid) =>
+            isWindowsProcessAlive(verificationPid),
+          ),
+        timeoutMs,
+      });
+    }
+
+    if (!treeKillResult?.ok && !nonzeroTaskkillTreeGone) {
+      throw new Error(
+        `${description} forced process-tree teardown was not confirmed: ${
+          treeKillResult?.diagnostic ?? "Windows taskkill returned no confirmation."
+        }`,
+      );
+    }
+    if (!exitConfirmed) {
+      throw new Error(
+        `${description} Windows process-tree exit confirmation timed out after ${timeoutMs}ms.`,
+      );
+    }
+    return { mode: "force", platform, pid };
+  }
+
+  try {
+    signalProcess(-pid, "SIGKILL");
+  } catch (error) {
+    throw new Error(
+      `${description} process-group SIGKILL failed before teardown proof: ${formatError(error)}.`,
+    );
+  }
+
+  const [exitConfirmed, treeGone] = await Promise.all([
+    waitForExit(child, timeoutMs),
+    waitForTreeGone({
+      isTreeAlive: () => isPosixTreeAlive(pid),
+      timeoutMs,
+    }),
+  ]);
+
+  if (!treeGone) {
+    throw new Error(
+      `${description} POSIX process-tree confirmation timed out after ${timeoutMs}ms.`,
+    );
+  }
+  if (!exitConfirmed) {
+    throw new Error(
+      `${description} root process exit confirmation timed out after ${timeoutMs}ms.`,
+    );
+  }
+  return { mode: "force", platform, pid };
+}
+
+export async function runDesktopPersistenceSmokeSequence({
+  seedFixture,
+  armFixture,
+  launchDesktop,
+  waitForReadiness,
+  forceStopDesktop,
+  assertFixture,
+  cleanupDesktop,
+}) {
+  let activeLaunch = null;
+  let activeLabel = null;
+  let primaryFailure = null;
+
+  try {
+    await seedFixture();
+
+    for (const label of ["launch A", "launch B"]) {
+      activeLabel = label;
+      activeLaunch = await launchDesktop(label);
+      await waitForReadiness(activeLaunch, label);
+      if (label === "launch A") {
+        await armFixture();
+      }
+      await forceStopDesktop(activeLaunch, label);
+      activeLaunch = null;
+      activeLabel = null;
+    }
+
+    await assertFixture();
+  } catch (error) {
+    primaryFailure = error;
+  }
+
+  let cleanupFailure = null;
+  if (activeLaunch !== null) {
+    try {
+      await cleanupDesktop(activeLaunch, activeLabel);
+    } catch (error) {
+      cleanupFailure = error;
+    }
+  }
+
+  if (primaryFailure !== null && cleanupFailure !== null) {
+    throw new AggregateError(
+      [primaryFailure, cleanupFailure],
+      "Desktop persistence smoke failed and active process cleanup also failed.",
+    );
+  }
+  if (primaryFailure !== null) throw primaryFailure;
+  if (cleanupFailure !== null) throw cleanupFailure;
 }
 
 function supervisePosixDesktopSmokeProcess({

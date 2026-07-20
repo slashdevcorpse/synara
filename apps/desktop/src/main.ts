@@ -166,6 +166,8 @@ import {
 } from "./browserUsePipeServer";
 import { normalizeDesktopWsUrl, resolveDesktopWsUrlFromEnv } from "./desktopWsBridge";
 import {
+  DESKTOP_PERSISTENCE_SMOKE_USER_DATA_ENV,
+  DESKTOP_PERSISTENCE_SMOKE_USER_DATA_LOG_PREFIX,
   repairBrowserProfileFromBridgeManifest,
   resolveDesktopBackendHomePath,
   resolveDesktopAppDataBase,
@@ -173,6 +175,10 @@ import {
 } from "./desktopUserDataProfile";
 import { isBrokenPipeError } from "./desktopProcessErrors";
 import { createDesktopStaticProtocolResolver } from "./desktopStaticProtocol";
+import {
+  resolveDesktopWindowReopenDecision,
+  shouldKeepDesktopRuntimeAliveAfterWindowAllClosed,
+} from "./desktopWindowLifecycle";
 import {
   createDesktopWindowMaximizeIntentGuard,
   createDesktopWindowStateController,
@@ -248,6 +254,9 @@ const DESKTOP_BACKEND_SHUTDOWN_TOKEN = Crypto.randomBytes(32).toString("hex");
 // Set the flavor-specific profile first so Stable, Dev, and Canary never contend
 // for the same lock even when they use the same Electron executable.
 const userDataPath = resolveUserDataPath();
+if (process.env[DESKTOP_PERSISTENCE_SMOKE_USER_DATA_ENV] !== undefined) {
+  console.info(`${DESKTOP_PERSISTENCE_SMOKE_USER_DATA_LOG_PREFIX}${userDataPath}`);
+}
 app.setPath("userData", userDataPath);
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
 const AUTO_UPDATE_STARTUP_DELAY_MS = 15_000;
@@ -290,6 +299,7 @@ let backendHttpUrl = "";
 let backendWsUrl = "";
 let backendReadinessAbortController: AbortController | null = null;
 let backendInitialWindowOpenInFlight: Promise<void> | null = null;
+let developmentMainWindowOpenInFlight: Promise<void> | null = null;
 let backendListeningDetector: ServerListeningDetector | null = null;
 let backendGeneration: BackendRestartGeneration | null = null;
 let backendGenerationReadinessMonitor: {
@@ -317,6 +327,10 @@ let browserUsePipeServer: BrowserUsePipeServer | null = null;
 let appSnapManager: DesktopAppSnapManager | null = null;
 let configuredGitHubUpdateSource: ReturnType<typeof resolveGitHubUpdateSource> = null;
 let configuredUpdaterCacheDirName: string | null = null;
+type DesktopMainWindowOpenReason = "bootstrap" | "activate" | "second-instance";
+let deferredMainWindowReopenReason:
+  | Exclude<DesktopMainWindowOpenReason, "bootstrap">
+  | null = null;
 const backendRestartController = new BackendRestartController({
   onRestartDue: (request) => {
     void launchScheduledBackendRestart(request);
@@ -1665,18 +1679,26 @@ function clearUnreadNotificationBadge(): void {
   syncUnreadNotificationBadge();
 }
 
+function getExistingDesktopMainWindow(): BrowserWindow | null {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    return mainWindow;
+  }
+  mainWindow = BrowserWindow.getAllWindows().find((window) => !window.isDestroyed()) ?? null;
+  return mainWindow;
+}
+
 // Reuse the existing desktop window when the app is launched again so users
 // don't end up with multiple packaged instances racing the same local state.
 function focusMainWindow(options: { stealAppFocus?: boolean } = {}): void {
-  if (!mainWindow || mainWindow.isDestroyed()) {
-    mainWindow = null;
+  const window = getExistingDesktopMainWindow();
+  if (!window) {
     return;
   }
-  if (mainWindow.isMinimized()) {
-    mainWindow.restore();
+  if (window.isMinimized()) {
+    window.restore();
   }
-  if (!mainWindow.isVisible()) {
-    mainWindow.show();
+  if (!window.isVisible()) {
+    window.show();
   }
   if (process.platform === "darwin" && options.stealAppFocus === true) {
     // BrowserWindow.focus() alone does not activate an app while another macOS
@@ -1685,7 +1707,84 @@ function focusMainWindow(options: { stealAppFocus?: boolean } = {}): void {
     app.show();
     app.focus({ steal: true });
   }
-  mainWindow.focus();
+  window.focus();
+}
+
+function openDesktopMainWindowAgainstCurrentBackend(
+  reason: DesktopMainWindowOpenReason,
+  baseUrl: string,
+): void {
+  if (isQuitting || baseUrl.length === 0 || getExistingDesktopMainWindow()) {
+    return;
+  }
+  if (!isDevelopment) {
+    ensureInitialBackendWindowOpen(baseUrl);
+    return;
+  }
+  if (developmentMainWindowOpenInFlight) {
+    return;
+  }
+
+  let readinessWarning = false;
+  const nextOpen = waitForBackendWindowReady(baseUrl)
+    .then((source) => {
+      writeDesktopLogHeader(`${reason} backend ready source=${source}`);
+    })
+    .catch((error) => {
+      if (isBackendReadinessAborted(error)) {
+        return;
+      }
+      readinessWarning = true;
+      writeDesktopLogHeader(
+        `${reason} backend readiness warning message=${formatErrorMessage(error)}`,
+      );
+      console.warn(`[desktop] backend readiness check timed out during dev ${reason}`, error);
+    })
+    .finally(() => {
+      if (developmentMainWindowOpenInFlight === nextOpen) {
+        developmentMainWindowOpenInFlight = null;
+      }
+      if (!getExistingDesktopMainWindow() && !isQuitting) {
+        mainWindow = createWindow();
+        writeDesktopLogHeader(
+          reason === "bootstrap" && readinessWarning
+            ? "bootstrap main window created after readiness warning"
+            : `${reason} main window created`,
+        );
+      }
+    });
+  developmentMainWindowOpenInFlight = nextOpen;
+}
+
+function reopenDesktopMainWindow(
+  reason: Exclude<DesktopMainWindowOpenReason, "bootstrap">,
+): void {
+  const decision = resolveDesktopWindowReopenDecision({
+    startupBlocked: desktopStartupBlockedForMigrationRecovery,
+    isQuitting,
+    hasExistingWindow: getExistingDesktopMainWindow() !== null,
+    hasBackendEndpoint: backendHttpUrl.length > 0,
+  });
+
+  if (decision === "ignore") {
+    deferredMainWindowReopenReason = null;
+    return;
+  }
+  if (decision === "defer") {
+    deferredMainWindowReopenReason = reason;
+    writeDesktopLogHeader(
+      `${reason} main window reopen deferred until backend endpoint is ready`,
+    );
+    return;
+  }
+
+  deferredMainWindowReopenReason = null;
+  handleDesktopAppForegrounded();
+  if (decision === "focus") {
+    focusMainWindow();
+    return;
+  }
+  openDesktopMainWindowAgainstCurrentBackend(reason, backendHttpUrl);
 }
 
 // Show a native OS notification and refocus the app window when the alert is clicked.
@@ -1739,6 +1838,7 @@ function resolveUserDataPath(): string {
   return resolveDesktopUserDataPath({
     appDataBase,
     userDataDirectoryName: desktopIdentity.userDataDirectoryName,
+    persistenceSmokeUserDataPath: process.env[DESKTOP_PERSISTENCE_SMOKE_USER_DATA_ENV],
   });
 }
 
@@ -3926,7 +4026,7 @@ if (!hasSingleInstanceLock) {
   app.quit();
 } else {
   app.on("second-instance", () => {
-    focusMainWindow();
+    reopenDesktopMainWindow("second-instance");
   });
 }
 
@@ -3953,33 +4053,9 @@ async function bootstrap(): Promise<void> {
     return;
   }
   const bootstrapBackendHttpUrl = launchedBackend.baseUrl;
-
-  if (isDevelopment) {
-    void waitForBackendWindowReady(bootstrapBackendHttpUrl)
-      .then((source) => {
-        writeDesktopLogHeader(`bootstrap backend ready source=${source}`);
-        if (!mainWindow) {
-          mainWindow = createWindow();
-          writeDesktopLogHeader("bootstrap main window created");
-        }
-      })
-      .catch((error) => {
-        if (isBackendReadinessAborted(error)) {
-          return;
-        }
-        writeDesktopLogHeader(
-          `bootstrap backend readiness warning message=${formatErrorMessage(error)}`,
-        );
-        console.warn("[desktop] backend readiness check timed out during dev bootstrap", error);
-        if (!mainWindow) {
-          mainWindow = createWindow();
-          writeDesktopLogHeader("bootstrap main window created after readiness warning");
-        }
-      });
-    return;
-  }
-
-  ensureInitialBackendWindowOpen(bootstrapBackendHttpUrl);
+  const windowOpenReason = deferredMainWindowReopenReason ?? "bootstrap";
+  deferredMainWindowReopenReason = null;
+  openDesktopMainWindowAgainstCurrentBackend(windowOpenReason, bootstrapBackendHttpUrl);
 }
 
 app.on("before-quit", (event) => {
@@ -4072,33 +4148,7 @@ if (hasSingleInstanceLock) {
       });
 
       app.on("activate", () => {
-        if (desktopStartupBlockedForMigrationRecovery || isQuitting) {
-          return;
-        }
-        handleDesktopAppForegrounded();
-        if (BrowserWindow.getAllWindows().length === 0) {
-          if (!isDevelopment) {
-            ensureInitialBackendWindowOpen(backendHttpUrl);
-            return;
-          }
-          void waitForBackendWindowReady(backendHttpUrl)
-            .catch((error) => {
-              if (isBackendReadinessAborted(error)) {
-                return;
-              }
-              console.warn(
-                "[desktop] backend readiness check timed out during dev activate",
-                error,
-              );
-            })
-            .finally(() => {
-              if (!mainWindow) {
-                mainWindow = createWindow();
-              }
-            });
-          return;
-        }
-        focusMainWindow();
+        reopenDesktopMainWindow("activate");
       });
     })
     .catch((error) => {
@@ -4107,9 +4157,16 @@ if (hasSingleInstanceLock) {
 }
 
 app.on("window-all-closed", () => {
-  if (process.platform !== "darwin") {
-    app.quit();
+  if (
+    shouldKeepDesktopRuntimeAliveAfterWindowAllClosed({
+      flavor: desktopIdentity.flavor,
+      platform: process.platform,
+    })
+  ) {
+    writeDesktopLogHeader("last window closed; desktop runtime remains warm");
+    return;
   }
+  app.quit();
 });
 
 if (process.platform !== "win32") {

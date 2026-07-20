@@ -51,6 +51,19 @@ const CI_MACOS_REQUIRED_COMMANDS = [
   "node scripts/node-pty-smoke.mjs",
   "bun run --cwd apps/desktop test",
 ] as const;
+const CI_DESKTOP_BUILD_COMMAND = "bun run build:desktop";
+const CI_DESKTOP_STARTUP_SMOKE_COMMANDS = {
+  windows_x64: CI_WINDOWS_POST_BUILD_COMMAND,
+  macos_arm64: "bun run test:desktop-smoke",
+} as const;
+const CI_DESKTOP_PERSISTENCE_SMOKE_COMMAND = "bun run test:desktop-persistence-smoke";
+const CI_DESKTOP_PERSISTENCE_SMOKE_STEP_NAME = "Verify two-launch desktop persistence";
+const CI_DESKTOP_PERSISTENCE_SMOKE_TIMEOUT_MINUTES = 5;
+const CI_DESKTOP_PERSISTENCE_SMOKE_HOMES = {
+  windows_x64: "${{ runner.temp }}\\super-synara-persistence-windows-home",
+  macos_arm64: "${{ runner.temp }}/super-synara-persistence-macos-home",
+} as const;
+type CiNativeJobName = keyof typeof CI_DESKTOP_PERSISTENCE_SMOKE_HOMES;
 
 function isRecord(value: unknown): value is UnknownRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -69,8 +82,11 @@ interface WorkflowRunStep {
   readonly command: string;
   readonly continueOnError: unknown;
   readonly condition: unknown;
+  readonly environment: unknown;
   readonly index: number;
+  readonly name: unknown;
   readonly rawCommand: string;
+  readonly timeoutMinutes: unknown;
 }
 
 function executableShellLines(command: string): readonly string[] {
@@ -110,8 +126,11 @@ function jobRunSteps(
         command: normalizeShellCommand(step.run),
         continueOnError: step["continue-on-error"],
         condition: step.if,
+        environment: step.env,
         index,
+        name: step.name,
         rawCommand: step.run,
+        timeoutMinutes: step["timeout-minutes"],
       };
     })
     .filter((step): step is WorkflowRunStep => step !== null);
@@ -125,7 +144,7 @@ function validateNativeJobCommands(
   errors: string[],
   postBuildCommand?: string,
 ): void {
-  const buildSteps = steps.filter((step) => step.command === "bun run build:desktop");
+  const buildSteps = steps.filter((step) => step.command === CI_DESKTOP_BUILD_COMMAND);
   if (buildSteps.length !== 1) {
     errors.push(`${workflowPath} ${jobName} must retain the native desktop build step.`);
   }
@@ -193,6 +212,77 @@ function validateNativeJobCommands(
   }
 }
 
+function workflowStepEnvironmentValue(step: WorkflowRunStep, key: string): unknown {
+  return isRecord(step.environment) ? step.environment[key] : undefined;
+}
+
+function validateNativePersistenceSmoke(
+  workflowPath: string,
+  jobName: CiNativeJobName,
+  steps: readonly WorkflowRunStep[],
+  errors: string[],
+): void {
+  const smokeSteps = steps.filter(
+    (step) => step.command === CI_DESKTOP_PERSISTENCE_SMOKE_COMMAND,
+  );
+  if (smokeSteps.length !== 1) {
+    errors.push(
+      `${workflowPath} ${jobName} must run exactly one post-build desktop persistence smoke command: ${CI_DESKTOP_PERSISTENCE_SMOKE_COMMAND}.`,
+    );
+    return;
+  }
+
+  const smokeStep = smokeSteps[0]!;
+  const buildStep = steps.find((step) => step.command === CI_DESKTOP_BUILD_COMMAND);
+  if (buildStep && smokeStep.index <= buildStep.index) {
+    errors.push(`${workflowPath} ${jobName} desktop persistence smoke must run after the build.`);
+  }
+  if (
+    smokeStep.condition !== undefined ||
+    (smokeStep.continueOnError !== undefined && smokeStep.continueOnError !== false)
+  ) {
+    errors.push(
+      `${workflowPath} ${jobName} desktop persistence smoke must be unconditional and fail closed.`,
+    );
+  }
+  if (smokeStep.name !== CI_DESKTOP_PERSISTENCE_SMOKE_STEP_NAME) {
+    errors.push(
+      `${workflowPath} ${jobName} desktop persistence smoke step must be named ${CI_DESKTOP_PERSISTENCE_SMOKE_STEP_NAME}.`,
+    );
+  }
+  if (smokeStep.timeoutMinutes !== CI_DESKTOP_PERSISTENCE_SMOKE_TIMEOUT_MINUTES) {
+    errors.push(
+      `${workflowPath} ${jobName} desktop persistence smoke timeout-minutes must equal ${CI_DESKTOP_PERSISTENCE_SMOKE_TIMEOUT_MINUTES}.`,
+    );
+  }
+  if (workflowStepEnvironmentValue(smokeStep, "SYNARA_DESKTOP_FLAVOR") !== "super") {
+    errors.push(
+      `${workflowPath} ${jobName} desktop persistence smoke must set SYNARA_DESKTOP_FLAVOR to super.`,
+    );
+  }
+  if (workflowStepEnvironmentValue(smokeStep, "SYNARA_DESKTOP_DISABLE_UPDATES") !== "1") {
+    errors.push(
+      `${workflowPath} ${jobName} desktop persistence smoke must set SYNARA_DESKTOP_DISABLE_UPDATES to "1".`,
+    );
+  }
+
+  const smokeHome = workflowStepEnvironmentValue(smokeStep, "SYNARA_HOME");
+  const expectedHome = CI_DESKTOP_PERSISTENCE_SMOKE_HOMES[jobName];
+  if (smokeHome !== expectedHome) {
+    errors.push(
+      `${workflowPath} ${jobName} desktop persistence smoke must use isolated SYNARA_HOME ${expectedHome}.`,
+    );
+  }
+  const sharesStartupHome = steps
+    .filter((step) => step.command === CI_DESKTOP_STARTUP_SMOKE_COMMANDS[jobName])
+    .some((step) => workflowStepEnvironmentValue(step, "SYNARA_HOME") === smokeHome);
+  if (typeof smokeHome === "string" && sharesStartupHome) {
+    errors.push(
+      `${workflowPath} ${jobName} desktop persistence smoke must not share SYNARA_HOME with startup smoke.`,
+    );
+  }
+}
+
 function validateRootTestOwnership(
   jobs: UnknownRecord,
   ownerJobName: string,
@@ -214,8 +304,11 @@ function validateRootTestOwnership(
           command: normalizeShellCommand(step.run),
           continueOnError: step["continue-on-error"],
           condition: step.if,
+          environment: step.env,
           index,
+          name: step.name,
           rawCommand: step.run,
+          timeoutMinutes: step["timeout-minutes"],
         },
       });
     }
@@ -430,6 +523,7 @@ function validateCiArchitecture(workflow: UnknownRecord, errors: string[]): void
       errors,
       CI_WINDOWS_POST_BUILD_COMMAND,
     );
+    validateNativePersistenceSmoke(workflowPath, "windows_x64", windowsSteps, errors);
   }
   if (macosSteps) {
     validateNativeJobCommands(
@@ -439,6 +533,7 @@ function validateCiArchitecture(workflow: UnknownRecord, errors: string[]): void
       CI_MACOS_REQUIRED_COMMANDS,
       errors,
     );
+    validateNativePersistenceSmoke(workflowPath, "macos_arm64", macosSteps, errors);
   }
 }
 

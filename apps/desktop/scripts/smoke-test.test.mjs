@@ -1,17 +1,29 @@
 import { EventEmitter } from "node:events";
+import { homedir } from "node:os";
+import { join, resolve } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
-  createDesktopSmokeEnvironment,
-  createDesktopSmokeSpawnSpec,
+  DESKTOP_PERSISTENCE_SMOKE_USER_DATA_ENV,
   DESKTOP_SMOKE_WINDOWS_JOB_STARTUP_MS,
   DESKTOP_SMOKE_WINDOWS_SETTLEMENT_MS,
-  resolveWindowsPowerShellPath,
-  superviseDesktopSmokeProcess,
   WINDOWS_SMOKE_JOB_READY_PREFIX,
   WINDOWS_SMOKE_JOB_RUN_ID_ENV,
   WINDOWS_SMOKE_JOB_TERMINATE_PREFIX,
+  classifyWindowsTaskkillClose,
+  createDesktopPersistenceSmokeEnvironment,
+  createDesktopSmokeEnvironment,
+  createDesktopSmokeSpawnSpec,
+  ensureDesktopPersistenceSmokeHome,
+  forceStopDesktopSmokeProcessTree,
+  resolveWindowsPowerShellPath,
+  runDesktopPersistenceSmokeSequence,
+  superviseDesktopSmokeProcess,
+  validateDesktopPersistenceSmokeEnvironment,
+  validateDesktopPersistenceSmokeProfileIsolation,
+  waitForDesktopProcessTreeGone,
+  waitForDesktopSmokeReadiness,
 } from "./smoke-test-lifecycle.mjs";
 
 const WINDOWS_JOB_RUN_ID = "123e4567-e89b-42d3-a456-426614174000";
@@ -792,5 +804,463 @@ describe("desktop smoke process lifecycle", () => {
 
     await expectSettled(resultPromise, { ok: true });
     expect(signalProcess).toHaveBeenCalledTimes(2);
+  });
+
+  it("requires the Super flavor for the persistence smoke", () => {
+    expect(() =>
+      validateDesktopPersistenceSmokeEnvironment({
+        environment: {
+          SYNARA_DESKTOP_FLAVOR: "production",
+          SYNARA_HOME: resolve(homedir(), "desktop-persistence-smoke-test"),
+        },
+      }),
+    ).toThrow("requires SYNARA_DESKTOP_FLAVOR=super");
+  });
+
+  it("rejects a missing persistence-smoke home", () => {
+    expect(() =>
+      validateDesktopPersistenceSmokeEnvironment({
+        environment: { SYNARA_DESKTOP_FLAVOR: "super" },
+      }),
+    ).toThrow("requires an explicit absolute SYNARA_HOME");
+  });
+
+  it("rejects a relative persistence-smoke home", () => {
+    expect(() =>
+      validateDesktopPersistenceSmokeEnvironment({
+        environment: {
+          SYNARA_DESKTOP_FLAVOR: "super",
+          SYNARA_HOME: "relative-persistence-smoke-home",
+        },
+      }),
+    ).toThrow("requires an absolute SYNARA_HOME");
+  });
+
+  it.each([".synara", ".synara-canary", ".super-synara"])(
+    "rejects the canonical live %s home",
+    (liveHomeName) => {
+      const homeDirectory = homedir();
+      expect(() =>
+        validateDesktopPersistenceSmokeEnvironment({
+          environment: {
+            SYNARA_DESKTOP_FLAVOR: " SUPER ",
+            SYNARA_HOME: join(homeDirectory, liveHomeName),
+          },
+          homeDirectory,
+        }),
+      ).toThrow("refuses to use live desktop state");
+    },
+  );
+
+  it("preserves a caller-provided isolated absolute persistence-smoke home", () => {
+    const isolatedHome = resolve(homedir(), "desktop-persistence-smoke-test");
+    expect(
+      validateDesktopPersistenceSmokeEnvironment({
+        environment: {
+          SYNARA_DESKTOP_FLAVOR: "super",
+          SYNARA_DESKTOP_DISABLE_UPDATES: "1",
+          SYNARA_HOME: isolatedHome,
+        },
+      }),
+    ).toBe(isolatedHome);
+  });
+
+  it("derives an isolated Electron profile inside the validated persistence home", () => {
+    const synaraHome = resolve(homedir(), "desktop-persistence-smoke-test");
+    const inheritedEnvironment = {
+      APPDATA: "C:\\Users\\tester\\AppData\\Roaming",
+      Synara_Desktop_Persistence_Smoke_User_Data: resolve(homedir(), "unsafe-profile"),
+      VITE_DEV_SERVER_URL: "http://localhost:5173",
+    };
+
+    const result = createDesktopPersistenceSmokeEnvironment({
+      environment: inheritedEnvironment,
+      synaraHome,
+    });
+
+    expect(result.userDataPath).toBe(resolve(synaraHome, "electron-user-data"));
+    expect(result.environment[DESKTOP_PERSISTENCE_SMOKE_USER_DATA_ENV]).toBe(
+      result.userDataPath,
+    );
+    expect(result.environment).not.toHaveProperty(
+      "Synara_Desktop_Persistence_Smoke_User_Data",
+    );
+    expect(result.environment.APPDATA).toBe(inheritedEnvironment.APPDATA);
+    expect(result.environment).not.toHaveProperty("VITE_DEV_SERVER_URL");
+    expect(
+      validateDesktopPersistenceSmokeProfileIsolation({
+        environment: result.environment,
+        synaraHome,
+      }),
+    ).toBe(result.userDataPath);
+  });
+
+  it("fails closed when the isolated Electron profile contract is absent or escapes the home", () => {
+    const synaraHome = resolve(homedir(), "desktop-persistence-smoke-test");
+
+    expect(() =>
+      validateDesktopPersistenceSmokeProfileIsolation({
+        environment: {},
+        synaraHome,
+      }),
+    ).toThrow(`requires ${DESKTOP_PERSISTENCE_SMOKE_USER_DATA_ENV}`);
+    expect(() =>
+      validateDesktopPersistenceSmokeProfileIsolation({
+        environment: {
+          [DESKTOP_PERSISTENCE_SMOKE_USER_DATA_ENV]: resolve(homedir(), "outside-profile"),
+        },
+        synaraHome,
+      }),
+    ).toThrow("to remain inside SYNARA_HOME");
+  });
+
+  it.each([undefined, "0", "true"])(
+    "requires the exact updater-disable flag for persistence smoke (%s)",
+    (disableUpdates) => {
+      expect(() =>
+        validateDesktopPersistenceSmokeEnvironment({
+          environment: {
+            SYNARA_DESKTOP_FLAVOR: "super",
+            SYNARA_DESKTOP_DISABLE_UPDATES: disableUpdates,
+            SYNARA_HOME: resolve(homedir(), "desktop-persistence-smoke-test"),
+          },
+        }),
+      ).toThrow('requires SYNARA_DESKTOP_DISABLE_UPDATES="1"');
+    },
+  );
+
+  it("creates a missing validated home without deleting caller state", () => {
+    const isolatedHome = resolve(homedir(), "desktop-persistence-smoke-created-test");
+    const missingError = Object.assign(new Error("missing"), { code: "ENOENT" });
+    const statPath = vi
+      .fn()
+      .mockImplementationOnce(() => {
+        throw missingError;
+      })
+      .mockReturnValue({ isDirectory: () => true });
+    const makeDirectory = vi.fn();
+
+    expect(
+      ensureDesktopPersistenceSmokeHome(isolatedHome, { statPath, makeDirectory }),
+    ).toEqual({ homePath: isolatedHome, created: true });
+    expect(makeDirectory).toHaveBeenCalledExactlyOnceWith(isolatedHome, { recursive: true });
+    expect(statPath).toHaveBeenCalledTimes(2);
+  });
+
+  it("preserves an existing validated home", () => {
+    const isolatedHome = resolve(homedir(), "desktop-persistence-smoke-existing-test");
+    const statPath = vi.fn(() => ({ isDirectory: () => true }));
+    const makeDirectory = vi.fn();
+
+    expect(
+      ensureDesktopPersistenceSmokeHome(isolatedHome, { statPath, makeDirectory }),
+    ).toEqual({ homePath: isolatedHome, created: false });
+    expect(makeDirectory).not.toHaveBeenCalled();
+    expect(statPath).toHaveBeenCalledExactlyOnceWith(isolatedHome);
+  });
+
+  it("rejects an early desktop exit before semantic readiness", async () => {
+    const child = new FakeSmokeProcess();
+    const readinessPromise = waitForDesktopSmokeReadiness({
+      child,
+      description: "launch A",
+      timeoutMs: 1_000,
+    });
+
+    child.exitAndClose(0);
+
+    await expect(readinessPromise).rejects.toThrow(
+      "launch A exited before semantic startup readiness",
+    );
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("accepts semantic readiness evidence split across output chunks", async () => {
+    const child = new FakeSmokeProcess();
+    const readinessPromise = waitForDesktopSmokeReadiness({
+      child,
+      description: "launch A",
+      timeoutMs: 1_000,
+    });
+
+    child.stdout.emit("data", Buffer.from("[server] Synara "));
+    child.stdout.emit("data", Buffer.from("running { port: 3773 }\n"));
+
+    await expect(readinessPromise).resolves.toMatchObject({
+      evidence: "Synara running",
+      output: expect.stringContaining("port: 3773"),
+    });
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("rejects fatal output even when semantic readiness appears in the same chunk", async () => {
+    const child = new FakeSmokeProcess();
+    const readinessPromise = waitForDesktopSmokeReadiness({
+      child,
+      description: "launch A",
+      timeoutMs: 1_000,
+    });
+
+    child.stderr.emit(
+      "data",
+      Buffer.from("Uncaught TypeError: startup failed\nSynara running { port: 3773 }\n"),
+    );
+
+    await expect(readinessPromise).rejects.toThrow(
+      "launch A emitted fatal startup output 'Uncaught TypeError'",
+    );
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("force-stops the detached POSIX process group without a graceful signal", async () => {
+    const child = new FakeSmokeProcess();
+    let treeAlive = true;
+    const signalProcess = vi.fn((_pid, signal) => {
+      treeAlive = false;
+      child.exitAndClose(null, signal);
+    });
+
+    const result = await forceStopDesktopSmokeProcessTree({
+      child,
+      description: "launch A",
+      platform: "linux",
+      signalProcess,
+      isPosixTreeAlive: () => treeAlive,
+    });
+
+    expect(result).toEqual({ mode: "force", platform: "linux", pid: child.pid });
+    expect(signalProcess).toHaveBeenCalledExactlyOnceWith(-child.pid, "SIGKILL");
+    expect(child.kill).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("requires successful Windows taskkill and root exit proof in force mode", async () => {
+    const child = new FakeSmokeProcess();
+    const killWindowsTree = vi.fn(async () => {
+      child.exitAndClose(null, "SIGKILL");
+      return { ok: true };
+    });
+
+    const result = await forceStopDesktopSmokeProcessTree({
+      child,
+      description: "launch A",
+      platform: "win32",
+      timeoutMs: 500,
+      killWindowsTree,
+    });
+
+    expect(result).toEqual({ mode: "force", platform: "win32", pid: child.pid });
+    expect(killWindowsTree).toHaveBeenCalledExactlyOnceWith(child.pid, { timeoutMs: 500 });
+    expect(child.kill).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("classifies only the known unsupported-termination taskkill race for PID proof", () => {
+    const output = [
+      "SUCCESS: The process with PID 5001 (child process of PID 4312) has been terminated.",
+      "ERROR: The process with PID 5002 (child process of PID 4312) could not be terminated.",
+      "Reason: The operation attempted is not supported.",
+    ].join("\r\n");
+
+    expect(classifyWindowsTaskkillClose({ code: 128, signal: null, output })).toEqual({
+      ok: false,
+      diagnostic: expect.stringContaining("code=128"),
+      verificationPids: [5001, 5002],
+    });
+    expect(
+      classifyWindowsTaskkillClose({
+        code: 5,
+        signal: null,
+        output:
+          "ERROR: The process with PID 5002 could not be terminated.\r\nReason: Access is denied.",
+      }),
+    ).toEqual({
+      ok: false,
+      diagnostic: expect.stringContaining("Access is denied"),
+    });
+  });
+
+  it("classifies interleaved taskkill stdout and stderr only when every error has its reason", () => {
+    const output = [
+      "ERROR: The process with PID 12112 (child process of PID 68156) could not be terminated.\r",
+      "SUCCESS: The process with PID 106640 (child process of PID 56436) has been terminated.",
+      "Reason: The operation attempted is not supported.",
+      "ERROR: The process with PID 60956 (child process of PID 68156) could not be terminated.",
+      "SUCCESS: The process with PID 54948 (child process of PID 68156) has been terminated.",
+      "Reason: The operation attempted is not supported.",
+    ].join("\r\n");
+
+    expect(classifyWindowsTaskkillClose({ code: 128, signal: null, output })).toEqual({
+      ok: false,
+      diagnostic: expect.stringContaining("code=128"),
+      verificationPids: [12112, 106640, 60956, 54948],
+    });
+    expect(
+      classifyWindowsTaskkillClose({
+        code: 128,
+        signal: null,
+        output: output.replace(
+          "Reason: The operation attempted is not supported.",
+          "Reason: Access is denied.",
+        ),
+      }),
+    ).not.toHaveProperty("verificationPids");
+  });
+
+  it("accepts the unsupported-termination race only after every reported PID is gone", async () => {
+    const child = new FakeSmokeProcess();
+    const killWindowsTree = vi.fn(async () => {
+      child.exitAndClose(null, "SIGKILL");
+      return {
+        ok: false,
+        diagnostic: "taskkill encountered already-terminating processes",
+        verificationPids: [5001, 5002],
+      };
+    });
+    const isWindowsProcessAlive = vi.fn(() => false);
+
+    const result = await forceStopDesktopSmokeProcessTree({
+      child,
+      description: "launch A",
+      platform: "win32",
+      timeoutMs: 500,
+      killWindowsTree,
+      isWindowsProcessAlive,
+    });
+
+    expect(result).toEqual({ mode: "force", platform: "win32", pid: child.pid });
+    expect(isWindowsProcessAlive).toHaveBeenCalledWith(child.pid);
+    expect(isWindowsProcessAlive).toHaveBeenCalledWith(5001);
+    expect(isWindowsProcessAlive).toHaveBeenCalledWith(5002);
+  });
+
+  it("fails closed when Windows taskkill does not confirm the full tree", async () => {
+    const child = new FakeSmokeProcess();
+    const killWindowsTree = vi.fn(async () => ({
+      ok: false,
+      diagnostic: "taskkill access denied",
+    }));
+
+    await expect(
+      forceStopDesktopSmokeProcessTree({
+        child,
+        description: "launch A",
+        platform: "win32",
+        timeoutMs: 500,
+        killWindowsTree,
+        waitForExit: async () => true,
+      }),
+    ).rejects.toThrow(
+      "launch A forced process-tree teardown was not confirmed: taskkill access denied",
+    );
+    expect(killWindowsTree).toHaveBeenCalledExactlyOnceWith(child.pid, { timeoutMs: 500 });
+  });
+
+  it("fails closed when POSIX process-tree confirmation times out", async () => {
+    const child = new FakeSmokeProcess();
+    const signalProcess = vi.fn(() => child.exitAndClose(null, "SIGKILL"));
+    const waitForTreeGone = vi.fn(async () => false);
+
+    await expect(
+      forceStopDesktopSmokeProcessTree({
+        child,
+        description: "launch A",
+        platform: "linux",
+        timeoutMs: 250,
+        signalProcess,
+        waitForTreeGone,
+      }),
+    ).rejects.toThrow("POSIX process-tree confirmation timed out after 250ms");
+    expect(waitForTreeGone).toHaveBeenCalledOnce();
+    expect(signalProcess).toHaveBeenCalledExactlyOnceWith(-child.pid, "SIGKILL");
+  });
+
+  it("bounds process-tree polling when the tree never disappears", async () => {
+    const isTreeAlive = vi.fn(() => true);
+    const treeGonePromise = waitForDesktopProcessTreeGone({
+      isTreeAlive,
+      timeoutMs: 250,
+      pollIntervalMs: 50,
+    });
+
+    await vi.advanceTimersByTimeAsync(250);
+
+    await expect(treeGonePromise).resolves.toBe(false);
+    expect(isTreeAlive).toHaveBeenCalledTimes(6);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("does not launch B or assert until each force-stop tree proof completes", async () => {
+    const events = [];
+    const launches = new Map();
+    await runDesktopPersistenceSmokeSequence({
+      seedFixture: async () => events.push("seed"),
+      armFixture: async () => events.push("arm"),
+      launchDesktop: async (label) => {
+        events.push(`${label}:start`);
+        const launch = { label };
+        launches.set(label, launch);
+        return launch;
+      },
+      waitForReadiness: async (launch) => events.push(`${launch.label}:ready`),
+      forceStopDesktop: async (launch) => {
+        events.push(`${launch.label}:force-start`);
+        await Promise.resolve();
+        events.push(`${launch.label}:tree-gone`);
+      },
+      assertFixture: async () => events.push("assert"),
+      cleanupDesktop: vi.fn(),
+    });
+
+    expect(events).toEqual([
+      "seed",
+      "launch A:start",
+      "launch A:ready",
+      "arm",
+      "launch A:force-start",
+      "launch A:tree-gone",
+      "launch B:start",
+      "launch B:ready",
+      "launch B:force-start",
+      "launch B:tree-gone",
+      "assert",
+    ]);
+    expect(launches.size).toBe(2);
+  });
+
+  it("cleans up launch A and stops the sequence when fixture arming fails", async () => {
+    const events = [];
+    const launch = { label: "launch A" };
+    const forceStopDesktop = vi.fn();
+
+    await expect(
+      runDesktopPersistenceSmokeSequence({
+        seedFixture: async () => events.push("seed"),
+        armFixture: async () => {
+          events.push("arm");
+          throw new Error("arm failed");
+        },
+        launchDesktop: async (label) => {
+          events.push(`${label}:start`);
+          return launch;
+        },
+        waitForReadiness: async (_activeLaunch, label) => events.push(`${label}:ready`),
+        forceStopDesktop,
+        assertFixture: vi.fn(),
+        cleanupDesktop: async (activeLaunch, label) => {
+          expect(activeLaunch).toBe(launch);
+          events.push(`${label}:cleanup`);
+        },
+      }),
+    ).rejects.toThrow("arm failed");
+
+    expect(events).toEqual([
+      "seed",
+      "launch A:start",
+      "launch A:ready",
+      "arm",
+      "launch A:cleanup",
+    ]);
+    expect(forceStopDesktop).not.toHaveBeenCalled();
   });
 });

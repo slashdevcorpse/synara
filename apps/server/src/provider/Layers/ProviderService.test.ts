@@ -31,6 +31,7 @@ import { Deferred, Effect, Exit, Fiber, Layer, Option, PubSub, Ref, Scope, Strea
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import {
+  ProviderAdapterProcessError,
   ProviderAdapterSessionNotFoundError,
   ProviderSessionDirectoryPersistenceError,
   ProviderUnsupportedError,
@@ -71,11 +72,19 @@ type LegacyProviderRuntimeEvent = {
 };
 
 type ReleaseListSessions = (sessions: ReadonlyArray<ProviderSession>) => void;
+type ReleaseVoid = () => void;
 
 // Converts deferred listSessions callbacks into typed release handles for race tests.
 function requireReleaseListSessions(release: ReleaseListSessions | undefined): ReleaseListSessions {
   if (typeof release !== "function") {
     assert.fail("Expected listSessions release callback");
+  }
+  return release;
+}
+
+function requireReleaseVoid(release: ReleaseVoid | undefined): ReleaseVoid {
+  if (typeof release !== "function") {
+    assert.fail("Expected deferred operation release callback");
   }
   return release;
 }
@@ -655,6 +664,230 @@ it.effect(
       const rollbackCall = secondCodex.rollbackThread.mock.calls[0];
       assert.equal(typeof rollbackCall?.[0], "string");
       assert.equal(rollbackCall?.[1], 1);
+
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect(
+  "ProviderServiceLive reconciles crash-orphaned runtime rows without losing resume state",
+  () =>
+    Effect.gen(function* () {
+      const tempDir = fs.mkdtempSync(
+        path.join(os.tmpdir(), "synara-provider-service-crash-recovery-"),
+      );
+      const dbPath = path.join(tempDir, "orchestration.sqlite");
+      const persistenceLayer = makeSqlitePersistenceLive(dbPath);
+      const runtimeRepositoryLayer = ProviderSessionRuntimeRepositoryLive.pipe(
+        Layer.provide(persistenceLayer),
+      );
+      const directoryLayer = ProviderSessionDirectoryLive.pipe(
+        Layer.provide(runtimeRepositoryLayer),
+      );
+      const codex = makeFakeCodexAdapter();
+      const registry: typeof ProviderAdapterRegistry.Service = {
+        getByProvider: (provider) =>
+          provider === "codex"
+            ? Effect.succeed(codex.adapter)
+            : Effect.fail(new ProviderUnsupportedError({ provider })),
+        listProviders: () => Effect.succeed(["codex"]),
+      };
+      const providerLayer = makeProviderServiceLive().pipe(
+        Layer.provide(Layer.succeed(ProviderAdapterRegistry, registry)),
+        Layer.provide(directoryLayer),
+        Layer.provide(AnalyticsService.layerTest),
+      );
+      const serviceLayer = Layer.mergeAll(providerLayer, runtimeRepositoryLayer);
+
+      const crashedThreadId = asThreadId("thread-crash-orphaned");
+      const startingThreadId = asThreadId("thread-starting-crash-orphaned");
+      const liveThreadId = asThreadId("thread-live-during-service-construction");
+      const stoppedThreadId = asThreadId("thread-already-stopped");
+      const errorThreadId = asThreadId("thread-already-error");
+      const resumeCursor = { threadId: "provider-thread-before-crash", opaque: { revision: 7 } };
+      const providerOptions = {
+        codex: {
+          homePath: "/tmp/codex-home-before-crash",
+          binaryPath: "/usr/local/bin/codex-before-crash",
+        },
+      };
+      const modelSelection = { provider: "codex" as const, model: "gpt-5.6" };
+      const crashedRuntime = {
+        threadId: crashedThreadId,
+        providerName: "codex",
+        adapterKey: "codex-before-crash",
+        runtimeMode: "approval-required" as const,
+        status: "running" as const,
+        lifecycleGeneration: "generation-before-crash",
+        lastSeenAt: "2026-07-20T12:00:00.000Z",
+        resumeCursor,
+        runtimePayload: {
+          cwd: "/tmp/project-before-crash",
+          model: modelSelection.model,
+          modelSelection,
+          providerOptions,
+          activeTurnId: "turn-interrupted-by-force-kill",
+          lastError: null,
+          retainedMetadata: { source: "force-kill-fixture" },
+        },
+      };
+      const startingRuntime = {
+        threadId: startingThreadId,
+        providerName: "codex",
+        adapterKey: "codex-starting-before-crash",
+        runtimeMode: "full-access" as const,
+        status: "starting" as const,
+        lifecycleGeneration: "generation-starting-before-crash",
+        lastSeenAt: "2026-07-20T12:00:30.000Z",
+        resumeCursor: { threadId: "provider-thread-starting-before-crash" },
+        runtimePayload: {
+          cwd: "/tmp/project-starting-before-crash",
+          activeTurnId: "turn-starting-before-crash",
+          retainedMetadata: { source: "starting-force-kill-fixture" },
+        },
+      };
+      const liveRuntime = {
+        threadId: liveThreadId,
+        providerName: "codex",
+        adapterKey: "codex-live",
+        runtimeMode: "full-access" as const,
+        status: "starting" as const,
+        lifecycleGeneration: "generation-live",
+        lastSeenAt: "2026-07-20T12:01:00.000Z",
+        resumeCursor: { threadId: "provider-thread-live" },
+        runtimePayload: {
+          cwd: "/tmp/project-live",
+          activeTurnId: "turn-live",
+          lastRuntimeEvent: "provider.startSession",
+        },
+      };
+      const stoppedRuntime = {
+        threadId: stoppedThreadId,
+        providerName: "codex",
+        adapterKey: "codex-stopped",
+        runtimeMode: "approval-required" as const,
+        status: "stopped" as const,
+        lifecycleGeneration: "generation-stopped",
+        lastSeenAt: "2026-07-20T12:02:00.000Z",
+        resumeCursor: { threadId: "provider-thread-stopped" },
+        runtimePayload: {
+          cwd: "/tmp/project-stopped",
+          activeTurnId: null,
+          lastRuntimeEvent: "provider.stopRuntimeSession",
+        },
+      };
+      const errorRuntime = {
+        threadId: errorThreadId,
+        providerName: "codex",
+        adapterKey: "codex-error",
+        runtimeMode: "full-access" as const,
+        status: "error" as const,
+        lifecycleGeneration: "generation-error",
+        lastSeenAt: "2026-07-20T12:03:00.000Z",
+        resumeCursor: { threadId: "provider-thread-error" },
+        runtimePayload: {
+          cwd: "/tmp/project-error",
+          activeTurnId: null,
+          lastError: "provider failed before restart",
+          lastRuntimeEvent: "runtime.error",
+        },
+      };
+
+      yield* Effect.gen(function* () {
+        const repository = yield* ProviderSessionRuntimeRepository;
+        yield* repository.upsert(crashedRuntime);
+        yield* repository.upsert(startingRuntime);
+        yield* repository.upsert(liveRuntime);
+        yield* repository.upsert(stoppedRuntime);
+        yield* repository.upsert(errorRuntime);
+      }).pipe(Effect.provide(runtimeRepositoryLayer));
+
+      yield* codex.startSession({
+        threadId: liveThreadId,
+        provider: "codex",
+        cwd: "/tmp/project-live",
+        runtimeMode: "full-access",
+        resumeCursor: liveRuntime.resumeCursor,
+      });
+      codex.startSession.mockClear();
+
+      yield* Effect.gen(function* () {
+        const provider = yield* ProviderService;
+        const repository = yield* ProviderSessionRuntimeRepository;
+
+        const normalized = yield* repository.getByThreadId({ threadId: crashedThreadId });
+        assert.equal(Option.isSome(normalized), true);
+        if (Option.isNone(normalized)) {
+          assert.fail("Expected the crash-orphaned provider runtime row to remain persisted");
+        }
+        assert.equal(normalized.value.providerName, crashedRuntime.providerName);
+        assert.equal(normalized.value.adapterKey, crashedRuntime.adapterKey);
+        assert.equal(normalized.value.runtimeMode, crashedRuntime.runtimeMode);
+        assert.equal(normalized.value.status, "stopped");
+        assert.equal(
+          normalized.value.lifecycleGeneration,
+          crashedRuntime.lifecycleGeneration,
+        );
+        assert.deepEqual(normalized.value.resumeCursor, resumeCursor);
+        const normalizedPayload = asRuntimePayloadRecord(normalized.value.runtimePayload);
+        assert.equal(normalizedPayload.cwd, crashedRuntime.runtimePayload.cwd);
+        assert.equal(normalizedPayload.model, crashedRuntime.runtimePayload.model);
+        assert.deepEqual(normalizedPayload.modelSelection, modelSelection);
+        assert.deepEqual(normalizedPayload.providerOptions, providerOptions);
+        assert.deepEqual(
+          normalizedPayload.retainedMetadata,
+          crashedRuntime.runtimePayload.retainedMetadata,
+        );
+        assert.equal(normalizedPayload.activeTurnId, null);
+        assert.equal(normalizedPayload.lastRuntimeEvent, "provider.startupCrashRecovery");
+        assert.equal(typeof normalizedPayload.lastRuntimeEventAt, "string");
+
+        const normalizedStarting = yield* repository.getByThreadId({
+          threadId: startingThreadId,
+        });
+        if (Option.isNone(normalizedStarting)) {
+          assert.fail("Expected the starting crash orphan to remain persisted");
+        }
+        assert.equal(normalizedStarting.value.status, "stopped");
+        assert.equal(
+          normalizedStarting.value.lifecycleGeneration,
+          startingRuntime.lifecycleGeneration,
+        );
+        assert.deepEqual(normalizedStarting.value.resumeCursor, startingRuntime.resumeCursor);
+        const normalizedStartingPayload = asRuntimePayloadRecord(
+          normalizedStarting.value.runtimePayload,
+        );
+        assert.equal(normalizedStartingPayload.activeTurnId, null);
+        assert.deepEqual(
+          normalizedStartingPayload.retainedMetadata,
+          startingRuntime.runtimePayload.retainedMetadata,
+        );
+        assert.equal(
+          normalizedStartingPayload.lastRuntimeEvent,
+          "provider.startupCrashRecovery",
+        );
+
+        const liveAfterStartup = yield* repository.getByThreadId({ threadId: liveThreadId });
+        const stoppedAfterStartup = yield* repository.getByThreadId({ threadId: stoppedThreadId });
+        const errorAfterStartup = yield* repository.getByThreadId({ threadId: errorThreadId });
+        assert.deepEqual(Option.getOrUndefined(liveAfterStartup), liveRuntime);
+        assert.deepEqual(Option.getOrUndefined(stoppedAfterStartup), stoppedRuntime);
+        assert.deepEqual(Option.getOrUndefined(errorAfterStartup), errorRuntime);
+
+        yield* provider.sendTurn({
+          threadId: crashedThreadId,
+          input: "resume after abrupt process exit",
+          attachments: [],
+        });
+
+        assert.equal(codex.startSession.mock.calls.length, 1);
+        const resumedInput = codex.startSession.mock.calls[0]?.[0];
+        assert.deepEqual(resumedInput?.resumeCursor, resumeCursor);
+        assert.equal(resumedInput?.cwd, crashedRuntime.runtimePayload.cwd);
+        assert.deepEqual(resumedInput?.modelSelection, modelSelection);
+        assert.deepEqual(resumedInput?.providerOptions, providerOptions);
+        assert.equal(resumedInput?.runtimeMode, crashedRuntime.runtimeMode);
+      }).pipe(Effect.provide(serviceLayer));
 
       fs.rmSync(tempDir, { recursive: true, force: true });
     }).pipe(Effect.provide(NodeServices.layer)),
@@ -3059,6 +3292,530 @@ idleCleanup.layer("ProviderServiceLive idle cleanup", (it) => {
       assert.equal(binding?.status, "running");
       assert.equal(payload.activeTurnId, firstTurnId);
       assert.equal(payload.lastRuntimeEvent, "turn.started");
+    }),
+  );
+
+  it.effect("preserves an old-generation task that starts during idle inspection", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService;
+      const directory = yield* ProviderSessionDirectory;
+      const threadId = asThreadId("thread-idle-task-during-inspection");
+      let listSessionsStarted = false;
+      let releaseListSessions: ReleaseListSessions | undefined;
+
+      const session = yield* provider.startSession(threadId, {
+        provider: "codex",
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const bindingBefore = Option.getOrUndefined(yield* directory.getBinding(threadId));
+      const lifecycleGeneration = bindingBefore?.lifecycleGeneration;
+      if (lifecycleGeneration === undefined) {
+        assert.fail("Expected a persisted lifecycle generation");
+      }
+      const stopRuntimeSessionIfIdle = provider.stopRuntimeSessionIfIdle;
+      if (!stopRuntimeSessionIfIdle) {
+        assert.fail("stopRuntimeSessionIfIdle unavailable");
+      }
+
+      idleCleanup.codex.stopSession.mockClear();
+      idleCleanup.codex.listSessions.mockImplementationOnce(() =>
+        Effect.promise(
+          () =>
+            new Promise<ReadonlyArray<ProviderSession>>((resolve) => {
+              listSessionsStarted = true;
+              releaseListSessions = resolve;
+            }),
+        ),
+      );
+      yield* idleCleanup.codex.waitForRuntimeSubscribers();
+
+      const stopFiber = yield* stopRuntimeSessionIfIdle({ threadId }).pipe(Effect.forkChild);
+      yield* waitUntil(() => listSessionsStarted, 500, 20, "idle inspection start");
+      idleCleanup.codex.emit({
+        type: "task.started",
+        eventId: asEventId("runtime-task-started-during-idle-inspection"),
+        provider: "codex",
+        createdAt: "2026-07-20T14:00:00.000Z",
+        threadId,
+        lifecycleGeneration,
+        payload: { taskId: "task-started-during-idle-inspection" },
+      });
+      if (!provider.hasLiveRuntimeTasks) {
+        assert.fail("hasLiveRuntimeTasks unavailable");
+      }
+      yield* waitUntilEffect(
+        () => provider.hasLiveRuntimeTasks!({ threadId }),
+        500,
+        20,
+        "old-generation task registration",
+      );
+
+      requireReleaseListSessions(releaseListSessions)([session]);
+      yield* Fiber.join(stopFiber);
+
+      assert.equal(idleCleanup.codex.stopSession.mock.calls.length, 0);
+      assert.equal(yield* idleCleanup.codex.hasSession(threadId), true);
+      const bindingAfter = Option.getOrUndefined(yield* directory.getBinding(threadId));
+      assert.equal(bindingAfter?.lifecycleGeneration, lifecycleGeneration);
+      assert.equal(bindingAfter?.status, "running");
+
+      if (!provider.stopRuntimeSession) {
+        assert.fail("stopRuntimeSession unavailable");
+      }
+      yield* provider.stopRuntimeSession({ threadId });
+      idleCleanup.codex.stopSession.mockClear();
+    }),
+  );
+
+  it.effect("cancels idle cleanup registered after turn dispatch owns the runtime", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService;
+      const directory = yield* ProviderSessionDirectory;
+      const threadId = asThreadId("thread-idle-dispatch-owned-before-registration");
+      let dispatchStarted = false;
+      let releaseDispatch: ReleaseVoid | undefined;
+
+      yield* provider.startSession(threadId, {
+        provider: "codex",
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const defaultSendTurn = idleCleanup.codex.sendTurn.getMockImplementation();
+      if (!defaultSendTurn) {
+        assert.fail("Expected the default sendTurn implementation");
+      }
+      const stopRuntimeSessionIfIdle = provider.stopRuntimeSessionIfIdle;
+      if (!stopRuntimeSessionIfIdle) {
+        assert.fail("stopRuntimeSessionIfIdle unavailable");
+      }
+
+      idleCleanup.codex.stopSession.mockClear();
+      idleCleanup.codex.listSessions.mockClear();
+      idleCleanup.codex.sendTurn.mockImplementationOnce((input) =>
+        Effect.gen(function* () {
+          dispatchStarted = true;
+          yield* Effect.promise(
+            () =>
+              new Promise<void>((resolve) => {
+                releaseDispatch = resolve;
+              }),
+          );
+          return yield* defaultSendTurn(input);
+        }),
+      );
+
+      const dispatchFiber = yield* provider
+        .sendTurn({ threadId, input: "dispatch owns runtime", attachments: [] })
+        .pipe(Effect.forkChild);
+      yield* waitUntil(() => dispatchStarted, 500, 20, "turn dispatch start");
+      yield* stopRuntimeSessionIfIdle({ threadId });
+
+      assert.equal(idleCleanup.codex.stopSession.mock.calls.length, 0);
+      assert.equal(idleCleanup.codex.listSessions.mock.calls.length, 0);
+      requireReleaseVoid(releaseDispatch)();
+      const turn = yield* Fiber.join(dispatchFiber);
+      assert.equal(turn.turnId, asTurnId(`turn-${String(threadId)}`));
+      const binding = Option.getOrUndefined(yield* directory.getBinding(threadId));
+      assert.equal(binding?.status, "running");
+      assert.equal(asRuntimePayloadRecord(binding?.runtimePayload).activeTurnId, turn.turnId);
+
+      if (!provider.stopRuntimeSession) {
+        assert.fail("stopRuntimeSession unavailable");
+      }
+      yield* provider.stopRuntimeSession({ threadId });
+      idleCleanup.codex.stopSession.mockClear();
+    }),
+  );
+
+  it.effect("cancels idle cleanup registered after session startup owns the runtime", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService;
+      const directory = yield* ProviderSessionDirectory;
+      const threadId = asThreadId("thread-idle-start-owned-before-registration");
+      let adapterStartEntered = false;
+      let releaseAdapterStart: ReleaseVoid | undefined;
+      const defaultStartSession = idleCleanup.codex.startSession.getMockImplementation();
+      if (!defaultStartSession) {
+        assert.fail("Expected the default startSession implementation");
+      }
+      const stopRuntimeSessionIfIdle = provider.stopRuntimeSessionIfIdle;
+      if (!stopRuntimeSessionIfIdle) {
+        assert.fail("stopRuntimeSessionIfIdle unavailable");
+      }
+
+      idleCleanup.codex.stopSession.mockClear();
+      idleCleanup.codex.listSessions.mockClear();
+      idleCleanup.codex.startSession.mockImplementationOnce((input) =>
+        Effect.gen(function* () {
+          adapterStartEntered = true;
+          yield* Effect.promise(
+            () =>
+              new Promise<void>((resolve) => {
+                releaseAdapterStart = resolve;
+              }),
+          );
+          return yield* defaultStartSession(input);
+        }),
+      );
+
+      const startFiber = yield* provider
+        .startSession(threadId, { provider: "codex", threadId, runtimeMode: "full-access" })
+        .pipe(Effect.forkChild);
+      yield* waitUntil(() => adapterStartEntered, 500, 20, "adapter session start");
+      yield* stopRuntimeSessionIfIdle({ threadId });
+
+      assert.equal(idleCleanup.codex.stopSession.mock.calls.length, 0);
+      assert.equal(idleCleanup.codex.listSessions.mock.calls.length, 0);
+      requireReleaseVoid(releaseAdapterStart)();
+      yield* Fiber.join(startFiber);
+      assert.equal(yield* idleCleanup.codex.hasSession(threadId), true);
+      const binding = Option.getOrUndefined(yield* directory.getBinding(threadId));
+      assert.equal(binding?.status, "running");
+
+      if (!provider.stopRuntimeSession) {
+        assert.fail("stopRuntimeSession unavailable");
+      }
+      yield* provider.stopRuntimeSession({ threadId });
+      idleCleanup.codex.stopSession.mockClear();
+    }),
+  );
+
+  it.effect("waits for registered idle teardown before restarting a session", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService;
+      const directory = yield* ProviderSessionDirectory;
+      const threadId = asThreadId("thread-idle-registered-before-session-restart");
+      let listSessionsStarted = false;
+      let releaseListSessions: ReleaseListSessions | undefined;
+      const session = yield* provider.startSession(threadId, {
+        provider: "codex",
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const stopRuntimeSessionIfIdle = provider.stopRuntimeSessionIfIdle;
+      if (!stopRuntimeSessionIfIdle) {
+        assert.fail("stopRuntimeSessionIfIdle unavailable");
+      }
+
+      idleCleanup.codex.stopSession.mockClear();
+      idleCleanup.codex.startSession.mockClear();
+      idleCleanup.codex.listSessions.mockImplementationOnce(() =>
+        Effect.promise(
+          () =>
+            new Promise<ReadonlyArray<ProviderSession>>((resolve) => {
+              listSessionsStarted = true;
+              releaseListSessions = resolve;
+            }),
+        ),
+      );
+
+      const stopFiber = yield* stopRuntimeSessionIfIdle({ threadId }).pipe(Effect.forkChild);
+      yield* waitUntil(() => listSessionsStarted, 500, 20, "registered idle teardown");
+      const restartFiber = yield* provider
+        .startSession(threadId, { provider: "codex", threadId, runtimeMode: "full-access" })
+        .pipe(Effect.forkChild);
+      yield* sleep(30);
+      assert.equal(idleCleanup.codex.startSession.mock.calls.length, 0);
+
+      requireReleaseListSessions(releaseListSessions)([session]);
+      yield* Fiber.join(stopFiber);
+      yield* Fiber.join(restartFiber);
+
+      assert.equal(idleCleanup.codex.stopSession.mock.calls.length, 1);
+      assert.equal(idleCleanup.codex.startSession.mock.calls.length, 1);
+      assert.equal(yield* idleCleanup.codex.hasSession(threadId), true);
+      const binding = Option.getOrUndefined(yield* directory.getBinding(threadId));
+      assert.equal(binding?.status, "running");
+
+      if (!provider.stopRuntimeSession) {
+        assert.fail("stopRuntimeSession unavailable");
+      }
+      yield* provider.stopRuntimeSession({ threadId });
+      idleCleanup.codex.stopSession.mockClear();
+      idleCleanup.codex.startSession.mockClear();
+    }),
+  );
+
+  it.effect("fails closed when adapter ownership snapshots contradict each other", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService;
+      const directory = yield* ProviderSessionDirectory;
+      const threadId = asThreadId("thread-idle-contradictory-adapter-snapshot");
+      yield* provider.startSession(threadId, {
+        provider: "codex",
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const bindingBefore = Option.getOrUndefined(yield* directory.getBinding(threadId));
+      const stopRuntimeSessionIfIdle = provider.stopRuntimeSessionIfIdle;
+      if (!stopRuntimeSessionIfIdle) {
+        assert.fail("stopRuntimeSessionIfIdle unavailable");
+      }
+
+      idleCleanup.codex.stopSession.mockClear();
+      idleCleanup.codex.hasSession.mockImplementationOnce(() => Effect.succeed(true));
+      idleCleanup.codex.listSessions.mockImplementationOnce(() => Effect.succeed([]));
+      yield* stopRuntimeSessionIfIdle({ threadId });
+
+      assert.equal(idleCleanup.codex.stopSession.mock.calls.length, 0);
+      assert.equal(yield* idleCleanup.codex.hasSession(threadId), true);
+      const bindingAfter = Option.getOrUndefined(yield* directory.getBinding(threadId));
+      assert.equal(bindingAfter?.status, "running");
+      assert.equal(bindingAfter?.lifecycleGeneration, bindingBefore?.lifecycleGeneration);
+
+      if (!provider.stopRuntimeSession) {
+        assert.fail("stopRuntimeSession unavailable");
+      }
+      yield* provider.stopRuntimeSession({ threadId });
+      idleCleanup.codex.stopSession.mockClear();
+    }),
+  );
+
+  it.effect("persists the freshest live cursor during atomic idle teardown", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService;
+      const runtimeRepository = yield* ProviderSessionRuntimeRepository;
+      const threadId = asThreadId("thread-idle-fresh-live-cursor");
+      const freshResumeCursor = { threadId: "provider-thread-fresh", revision: 2 };
+      yield* provider.startSession(threadId, {
+        provider: "codex",
+        threadId,
+        runtimeMode: "full-access",
+        resumeCursor: { threadId: "provider-thread-stale", revision: 1 },
+      });
+      idleCleanup.codex.updateSession(threadId, (session) => ({
+        ...session,
+        resumeCursor: freshResumeCursor,
+      }));
+      const stopRuntimeSessionIfIdle = provider.stopRuntimeSessionIfIdle;
+      if (!stopRuntimeSessionIfIdle) {
+        assert.fail("stopRuntimeSessionIfIdle unavailable");
+      }
+
+      idleCleanup.codex.stopSession.mockClear();
+      yield* stopRuntimeSessionIfIdle({ threadId });
+
+      assert.deepEqual(idleCleanup.codex.stopSession.mock.calls[0]?.[0], threadId);
+      const runtime = yield* runtimeRepository.getByThreadId({ threadId });
+      if (Option.isNone(runtime)) {
+        assert.fail("Expected the stopped runtime binding");
+      }
+      assert.equal(runtime.value.status, "stopped");
+      assert.deepEqual(runtime.value.resumeCursor, freshResumeCursor);
+      idleCleanup.codex.stopSession.mockClear();
+    }),
+  );
+
+  it.effect("normalizes an absent adapter session without deleting durable identity", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService;
+      const runtimeRepository = yield* ProviderSessionRuntimeRepository;
+      const threadId = asThreadId("thread-idle-adapter-session-absent");
+      const resumeCursor = { threadId: "provider-thread-absent-at-idle-stop" };
+      yield* provider.startSession(threadId, {
+        provider: "codex",
+        threadId,
+        runtimeMode: "full-access",
+        resumeCursor,
+      });
+      yield* idleCleanup.codex.stopSession(threadId);
+      idleCleanup.codex.stopSession.mockClear();
+      const stopRuntimeSessionIfIdle = provider.stopRuntimeSessionIfIdle;
+      if (!stopRuntimeSessionIfIdle) {
+        assert.fail("stopRuntimeSessionIfIdle unavailable");
+      }
+
+      yield* stopRuntimeSessionIfIdle({ threadId });
+
+      assert.equal(idleCleanup.codex.stopSession.mock.calls.length, 0);
+      const runtime = yield* runtimeRepository.getByThreadId({ threadId });
+      if (Option.isNone(runtime)) {
+        assert.fail("Expected the normalized runtime binding");
+      }
+      assert.equal(runtime.value.status, "stopped");
+      assert.deepEqual(runtime.value.resumeCursor, resumeCursor);
+    }),
+  );
+
+  it.effect("keeps the current generation when adapter teardown fails before commit", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService;
+      const directory = yield* ProviderSessionDirectory;
+      const threadId = asThreadId("thread-idle-adapter-stop-failure");
+      yield* provider.startSession(threadId, {
+        provider: "codex",
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const bindingBefore = Option.getOrUndefined(yield* directory.getBinding(threadId));
+      const stopRuntimeSessionIfIdle = provider.stopRuntimeSessionIfIdle;
+      if (!stopRuntimeSessionIfIdle) {
+        assert.fail("stopRuntimeSessionIfIdle unavailable");
+      }
+      const stopFailure = new ProviderAdapterProcessError({
+        provider: "codex",
+        threadId,
+        detail: "synthetic idle-stop failure",
+      });
+
+      idleCleanup.codex.stopSession.mockClear();
+      idleCleanup.codex.stopSession.mockImplementationOnce(() => Effect.fail(stopFailure));
+      const result = yield* Effect.result(stopRuntimeSessionIfIdle({ threadId }));
+
+      assertFailure(result, stopFailure);
+      assert.equal(yield* idleCleanup.codex.hasSession(threadId), true);
+      const bindingAfter = Option.getOrUndefined(yield* directory.getBinding(threadId));
+      assert.equal(bindingAfter?.status, "running");
+      assert.equal(bindingAfter?.lifecycleGeneration, bindingBefore?.lifecycleGeneration);
+
+      if (!provider.stopRuntimeSession) {
+        assert.fail("stopRuntimeSession unavailable");
+      }
+      yield* provider.stopRuntimeSession({ threadId });
+      idleCleanup.codex.stopSession.mockClear();
+    }),
+  );
+
+  it.effect("does not retain a queued old-generation turn after idle teardown commits", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService;
+      const directory = yield* ProviderSessionDirectory;
+      const threadId = asThreadId("thread-idle-queued-old-generation-turn");
+      let adapterStopEntered = false;
+      let releaseAdapterStop: ReleaseVoid | undefined;
+      yield* provider.startSession(threadId, {
+        provider: "codex",
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const bindingBefore = Option.getOrUndefined(yield* directory.getBinding(threadId));
+      const lifecycleGeneration = bindingBefore?.lifecycleGeneration;
+      if (lifecycleGeneration === undefined) {
+        assert.fail("Expected a persisted lifecycle generation");
+      }
+      const defaultStopSession = idleCleanup.codex.stopSession.getMockImplementation();
+      if (!defaultStopSession) {
+        assert.fail("Expected the default stopSession implementation");
+      }
+      const stopRuntimeSessionIfIdle = provider.stopRuntimeSessionIfIdle;
+      if (!stopRuntimeSessionIfIdle) {
+        assert.fail("stopRuntimeSessionIfIdle unavailable");
+      }
+
+      idleCleanup.codex.stopSession.mockClear();
+      idleCleanup.codex.stopSession.mockImplementationOnce((inputThreadId) =>
+        Effect.gen(function* () {
+          adapterStopEntered = true;
+          yield* Effect.promise(
+            () =>
+              new Promise<void>((resolve) => {
+                releaseAdapterStop = resolve;
+              }),
+          );
+          yield* defaultStopSession(inputThreadId);
+        }),
+      );
+      yield* idleCleanup.codex.waitForRuntimeSubscribers();
+
+      const firstStopFiber = yield* stopRuntimeSessionIfIdle({ threadId }).pipe(Effect.forkChild);
+      yield* waitUntil(() => adapterStopEntered, 500, 20, "adapter teardown start");
+      idleCleanup.codex.emit({
+        type: "turn.started",
+        eventId: asEventId("runtime-old-turn-queued-behind-idle-stop"),
+        provider: "codex",
+        createdAt: "2026-07-20T14:00:30.000Z",
+        threadId,
+        turnId: asTurnId("turn-old-queued-behind-idle-stop"),
+        lifecycleGeneration,
+        payload: { state: "running" },
+      });
+      yield* sleep(30);
+      requireReleaseVoid(releaseAdapterStop)();
+      yield* Fiber.join(firstStopFiber);
+      yield* sleep(30);
+
+      yield* provider.startSession(threadId, {
+        provider: "codex",
+        threadId,
+        runtimeMode: "full-access",
+      });
+      idleCleanup.codex.stopSession.mockClear();
+      yield* stopRuntimeSessionIfIdle({ threadId });
+
+      assert.equal(idleCleanup.codex.stopSession.mock.calls.length, 1);
+      assert.equal(yield* idleCleanup.codex.hasSession(threadId), false);
+      const bindingAfter = Option.getOrUndefined(yield* directory.getBinding(threadId));
+      assert.equal(bindingAfter?.status, "stopped");
+      idleCleanup.codex.stopSession.mockClear();
+    }),
+  );
+
+  it.effect("finishes stopped persistence after teardown begins despite late invalidation", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService;
+      const directory = yield* ProviderSessionDirectory;
+      const threadId = asThreadId("thread-idle-invalidation-after-stop-started");
+      let adapterStopEntered = false;
+      let releaseAdapterStop: ReleaseVoid | undefined;
+      yield* provider.startSession(threadId, {
+        provider: "codex",
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const bindingBefore = Option.getOrUndefined(yield* directory.getBinding(threadId));
+      const defaultStopSession = idleCleanup.codex.stopSession.getMockImplementation();
+      if (!defaultStopSession) {
+        assert.fail("Expected the default stopSession implementation");
+      }
+      const stopRuntimeSessionIfIdle = provider.stopRuntimeSessionIfIdle;
+      if (!stopRuntimeSessionIfIdle) {
+        assert.fail("stopRuntimeSessionIfIdle unavailable");
+      }
+
+      idleCleanup.codex.stopSession.mockClear();
+      idleCleanup.codex.stopSession.mockImplementationOnce((inputThreadId) =>
+        Effect.gen(function* () {
+          adapterStopEntered = true;
+          yield* Effect.promise(
+            () =>
+              new Promise<void>((resolve) => {
+                releaseAdapterStop = resolve;
+              }),
+          );
+          yield* defaultStopSession(inputThreadId);
+        }),
+      );
+      yield* idleCleanup.codex.waitForRuntimeSubscribers();
+
+      const stopFiber = yield* stopRuntimeSessionIfIdle({ threadId }).pipe(Effect.forkChild);
+      yield* waitUntil(() => adapterStopEntered, 500, 20, "adapter teardown start");
+      idleCleanup.codex.emit({
+        type: "task.started",
+        eventId: asEventId("runtime-task-started-after-idle-teardown-boundary"),
+        provider: "codex",
+        createdAt: "2026-07-20T14:01:00.000Z",
+        threadId,
+        payload: { taskId: "task-after-idle-teardown-boundary" },
+      });
+      if (!provider.hasLiveRuntimeTasks) {
+        assert.fail("hasLiveRuntimeTasks unavailable");
+      }
+      yield* waitUntilEffect(
+        () => provider.hasLiveRuntimeTasks!({ threadId }),
+        500,
+        20,
+        "late idle-stop invalidation",
+      );
+      requireReleaseVoid(releaseAdapterStop)();
+      yield* Fiber.join(stopFiber);
+
+      const bindingAfter = Option.getOrUndefined(yield* directory.getBinding(threadId));
+      assert.equal(bindingAfter?.status, "stopped");
+      assert.notEqual(bindingAfter?.lifecycleGeneration, bindingBefore?.lifecycleGeneration);
+      assert.equal(yield* provider.hasLiveRuntimeTasks({ threadId }), false);
+      assert.equal(yield* idleCleanup.codex.hasSession(threadId), false);
+      idleCleanup.codex.stopSession.mockClear();
     }),
   );
 
