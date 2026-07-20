@@ -429,6 +429,7 @@ const SKILL_ORIGIN_ROOTS = {
 
 const PROVIDER_SKILL_ORIGIN_PREFERENCES = {
   codex: ["codex", "agents"],
+  commandCode: ["codex", "agents"],
   claudeAgent: ["claude"],
   cursor: ["cursor", "agents", "claude", "codex"],
   antigravity: ["agents"],

@@ -454,6 +454,8 @@ import { ChatTranscriptPane } from "./chat/ChatTranscriptPane";
 import type { MessagesTimelineController } from "./chat/MessagesTimeline";
 import { buildTurnDiffSummaryByAssistantMessageId } from "./chat/MessagesTimeline.logic";
 import { deriveAgentActivityTimelineState } from "./chat/agentActivity.logic";
+import { AgentActivityPulse } from "./chat/AgentActivityPulse";
+import { useAgentActivityState } from "./chat/useAgentActivityState";
 import { ComposerSlashStatusDialog } from "./chat/ComposerSlashStatusDialog";
 import { ExpandedImagePreview } from "./chat/ExpandedImagePreview";
 import {
@@ -498,6 +500,7 @@ import {
 } from "./chat/WorkflowRunCard.logic";
 import { ComposerColumnFrame } from "./chat/ComposerColumnFrame";
 import { useTranscriptAssistantSelectionAction } from "./chat/useTranscriptAssistantSelectionAction";
+import { useAgentActivityScrollPause } from "./chat/useAgentActivityScrollPause";
 import { resolveTranscriptMarkerRange } from "./chat/chatSelectionActions";
 import {
   dispatchThreadMarkerAdd,
@@ -890,6 +893,8 @@ function getProviderStartOptionsCustomBinaryPath(
   switch (provider) {
     case "codex":
       return normalizeCustomBinaryPath(providerOptions?.codex?.binaryPath);
+    case "commandCode":
+      return normalizeCustomBinaryPath(providerOptions?.commandCode?.binaryPath);
     case "claudeAgent":
       return normalizeCustomBinaryPath(providerOptions?.claudeAgent?.binaryPath);
     case "antigravity":
@@ -1430,6 +1435,8 @@ export default function ChatView({
   const [isTraitsPickerOpen, setIsTraitsPickerOpen] = useState(false);
   const legendListRef = useRef<LegendListRef | null>(null);
   const timelineControllerRef = useRef<MessagesTimelineController | null>(null);
+  const { scopeRef: agentActivityScopeRef, markTranscriptScrollActivity } =
+    useAgentActivityScrollPause();
   const isAtEndRef = useRef(true);
   const autoFollowThreadIdRef = useRef<ThreadId | null>(null);
   const pendingInteractionAnchorRef = useRef<{
@@ -2113,6 +2120,7 @@ export default function ChatView({
 
     return {
       codex: resolveHint("codex"),
+      commandCode: resolveHint("commandCode"),
       claudeAgent: resolveHint("claudeAgent"),
       cursor: resolveHint("cursor"),
       antigravity: resolveHint("antigravity"),
@@ -2136,6 +2144,16 @@ export default function ChatView({
     providerModelsQueryOptions({ provider: "claudeAgent" }),
   );
   const codexDynamicModelsQuery = useQuery(providerModelsQueryOptions({ provider: "codex" }));
+  const commandCodeModelDiscoveryEnabled =
+    selectedProvider === "commandCode" || lockedProvider === "commandCode" || isModelPickerOpen;
+  const commandCodeDynamicModelsQuery = useQuery(
+    providerModelsQueryOptions({
+      provider: "commandCode",
+      binaryPath: settings.commandCodeBinaryPath || null,
+      cwd: providerModelDiscoveryCwd,
+      enabled: commandCodeModelDiscoveryEnabled,
+    }),
+  );
   const openCodeModelDiscoveryEnabled =
     selectedProvider === "opencode" || lockedProvider === "opencode" || isModelPickerOpen;
   const kiloModelDiscoveryEnabled =
@@ -2226,6 +2244,13 @@ export default function ChatView({
   );
   const cursorModelDiscoveryEnabled =
     selectedProvider === "cursor" || lockedProvider === "cursor" || isModelPickerOpen;
+  const hasResolvedCommandCodeModelDiscovery =
+    commandCodeDynamicModelsQuery.data?.source === "command-code.cli" &&
+    (commandCodeDynamicModelsQuery.data.models.length ?? 0) > 0;
+  const commandCodeModelDiscoveryPending =
+    commandCodeModelDiscoveryEnabled &&
+    !hasResolvedCommandCodeModelDiscovery &&
+    isInitialModelDiscoveryPending(commandCodeDynamicModelsQuery);
   const hasResolvedCursorModelDiscovery =
     (cursorDynamicModelsQuery.data?.source === "cursor.cli" ||
       cursorDynamicModelsQuery.data?.source === "cursor.acp") &&
@@ -2276,6 +2301,11 @@ export default function ChatView({
         customModelsByProvider.codex,
         composerModelHintByProvider.codex,
       ),
+      commandCode: getAppModelOptions(
+        "commandCode",
+        customModelsByProvider.commandCode,
+        composerModelHintByProvider.commandCode,
+      ),
       claudeAgent: getAppModelOptions(
         "claudeAgent",
         customModelsByProvider.claudeAgent,
@@ -2321,6 +2351,7 @@ export default function ChatView({
     const dynamicSources: Record<ProviderKind, typeof claudeDynamicModelsQuery.data> = {
       claudeAgent: claudeDynamicModelsQuery.data,
       codex: codexDynamicModelsQuery.data,
+      commandCode: commandCodeDynamicModelsQuery.data,
       cursor:
         cursorDynamicModelsQuery.data === undefined
           ? undefined
@@ -2336,6 +2367,7 @@ export default function ChatView({
     for (const provider of [
       "claudeAgent",
       "codex",
+      "commandCode",
       "cursor",
       "antigravity",
       "grok",
@@ -2357,6 +2389,7 @@ export default function ChatView({
     return result;
   }, [
     claudeDynamicModelsQuery.data,
+    commandCodeDynamicModelsQuery.data,
     composerModelHintByProvider,
     codexDynamicModelsQuery.data,
     cursorDynamicModelsQuery.data,
@@ -2381,6 +2414,7 @@ export default function ChatView({
     () => ({
       claudeAgent: claudeDynamicModelsQuery.data?.models ?? [],
       codex: codexDynamicModelsQuery.data?.models ?? [],
+      commandCode: commandCodeDynamicModelsQuery.data?.models ?? [],
       cursor: cursorRuntimeModels,
       antigravity: antigravityModelsQuery.data?.models ?? [],
       grok: grokDynamicModelsQuery.data?.models ?? [],
@@ -2391,6 +2425,7 @@ export default function ChatView({
     }),
     [
       claudeDynamicModelsQuery.data?.models,
+      commandCodeDynamicModelsQuery.data?.models,
       codexDynamicModelsQuery.data?.models,
       cursorRuntimeModels,
       droidDynamicModelsQuery.data?.models,
@@ -2404,6 +2439,7 @@ export default function ChatView({
   const providerModelsQueryByProvider = {
     claudeAgent: claudeDynamicModelsQuery,
     codex: codexDynamicModelsQuery,
+    commandCode: commandCodeDynamicModelsQuery,
     cursor: cursorDynamicModelsQuery,
     antigravity: antigravityModelsQuery,
     grok: grokDynamicModelsQuery,
@@ -3026,6 +3062,18 @@ export default function ChatView({
     ],
   );
   const isSendBusy = localDispatch !== null && !serverAcknowledgedLocalDispatch;
+  const agentActivityState = useAgentActivityState({
+    threadId: activeThread?.id ?? null,
+    hasMessages: (activeThread?.messages.length ?? 0) > 0,
+    localDispatchPending: isSendBusy,
+    session: activeThread?.session ?? null,
+    latestTurn: activeLatestTurn,
+    messages: activeThread?.messages ?? EMPTY_MESSAGES,
+    activities: threadActivities,
+    hasPendingApproval: activePendingApproval !== null,
+    hasPendingUserInput: activePendingUserInput !== null,
+    threadError: activeThread?.error ?? null,
+  });
   const activeWorktreeSetup = localDispatch?.worktreeSetup ?? null;
   const isPreparingWorktree = activeWorktreeSetup !== null;
   const hasLiveTurn = phase === "running";
@@ -3700,13 +3748,15 @@ export default function ChatView({
     activeThread !== undefined &&
     threadExportBlockedReason(activeThread) === null;
   const selectedDynamicAgents =
-    selectedProvider === "claudeAgent"
-      ? (claudeDynamicAgentsQuery.data?.agents ?? EMPTY_PROVIDER_AGENTS)
-      : selectedProvider === "kilo"
-        ? (kiloDynamicAgentsQuery.data?.agents ?? EMPTY_PROVIDER_AGENTS)
-        : selectedProvider === "opencode"
-          ? (openCodeDynamicAgentsQuery.data?.agents ?? EMPTY_PROVIDER_AGENTS)
-          : (codexDynamicAgentsQuery.data?.agents ?? EMPTY_PROVIDER_AGENTS);
+    selectedProvider === "commandCode"
+      ? EMPTY_PROVIDER_AGENTS
+      : selectedProvider === "claudeAgent"
+        ? (claudeDynamicAgentsQuery.data?.agents ?? EMPTY_PROVIDER_AGENTS)
+        : selectedProvider === "kilo"
+          ? (kiloDynamicAgentsQuery.data?.agents ?? EMPTY_PROVIDER_AGENTS)
+          : selectedProvider === "opencode"
+            ? (openCodeDynamicAgentsQuery.data?.agents ?? EMPTY_PROVIDER_AGENTS)
+            : (codexDynamicAgentsQuery.data?.agents ?? EMPTY_PROVIDER_AGENTS);
   const dynamicAgents = useMemo(
     () =>
       selectedDynamicAgents.map((agent) =>
@@ -5300,7 +5350,9 @@ export default function ChatView({
     clearTranscriptAutoFollow();
   }, [clearTranscriptAutoFollow]);
   const onMessagesPointerUpBase = useCallback(() => {}, []);
-  const onMessagesScrollBase = useCallback(() => {}, []);
+  const onMessagesScrollBase = useCallback(() => {
+    markTranscriptScrollActivity();
+  }, [markTranscriptScrollActivity]);
   const onMessagesTouchEndBase = useCallback(() => {}, []);
   const onMessagesTouchMoveBase = useCallback(() => {
     clearTranscriptAutoFollow();
@@ -9404,6 +9456,7 @@ export default function ChatView({
         providers={providerStatuses}
         modelOptionsByProvider={modelOptionsByProvider}
         loadingModelProviders={{
+          commandCode: commandCodeModelDiscoveryPending,
           antigravity: antigravityModelDiscoveryPending,
           cursor: cursorModelDiscoveryPending,
           droid: droidModelDiscoveryPending,
@@ -9447,6 +9500,7 @@ export default function ChatView({
       providers={providerStatuses}
       modelOptionsByProvider={modelOptionsByProvider}
       loadingModelProviders={{
+        commandCode: commandCodeModelDiscoveryPending,
         antigravity: antigravityModelDiscoveryPending,
         cursor: cursorModelDiscoveryPending,
         droid: droidModelDiscoveryPending,
@@ -10832,6 +10886,7 @@ export default function ChatView({
     availableEditors,
     activeThreadId: activeThread.id,
     activeProvider: activeThread.session?.provider ?? activeThread.modelSelection.provider,
+    agentActivityState,
     isStudioChat: isStudioContainer,
     showGitActions,
     diffOpen: resolvedDiffOpen,
@@ -11022,6 +11077,7 @@ export default function ChatView({
                   composerMenuOpen && !isComposerApprovalState && "overflow-visible",
                 )}
               >
+                <AgentActivityPulse state={agentActivityState} variant="composer" />
                 <ComposerInputBanners
                   roundedTopReset={false}
                   planFollowUp={
@@ -11438,6 +11494,7 @@ export default function ChatView({
 
   return (
     <div
+      ref={agentActivityScopeRef}
       className={cn(
         "relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden",
         CHAT_BACKGROUND_CLASS_NAME,
@@ -11682,6 +11739,7 @@ export default function ChatView({
                 <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden">
                   <ChatTranscriptPane
                     activeThreadId={activeThread.id}
+                    agentActivityState={agentActivityState}
                     activeTurnId={activeThread.session?.activeTurnId ?? null}
                     agentActivityDetail={openAgentActivityDetail}
                     hasMessages={timelineEntries.length > 0}

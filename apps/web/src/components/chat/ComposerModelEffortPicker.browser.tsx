@@ -20,6 +20,7 @@ describe("ComposerModelEffortPicker", () => {
         modelOptionsByProvider={{
           claudeAgent: [],
           codex: [],
+          commandCode: [],
           cursor: [],
           antigravity: [],
           grok: [{ slug: GROK_4_5, name: "Grok 4.5" }],

@@ -147,6 +147,10 @@ function getProviderStateFromCapabilities(
       normalizedOptions = Object.keys(nextOptions).length > 0 ? nextOptions : undefined;
       break;
     }
+    case "commandCode": {
+      normalizedOptions = undefined;
+      break;
+    }
     case "claudeAgent": {
       const providerOptions = modelOptions?.claudeAgent;
       rawEffort = trimOrNull(providerOptions?.effort);
@@ -278,6 +282,11 @@ const composerProviderRegistry: Record<ProviderKind, ProviderRegistryEntry> = {
     getState: (input) => getProviderStateFromCapabilities(input),
     renderTraitsMenuContent: (input) => renderTraitsMenuContentForProvider("codex", input),
     renderTraitsPicker: (input) => renderTraitsPickerForProvider("codex", input),
+  },
+  commandCode: {
+    getState: (input) => getProviderStateFromCapabilities(input),
+    renderTraitsMenuContent: (input) => renderTraitsMenuContentForProvider("commandCode", input),
+    renderTraitsPicker: (input) => renderTraitsPickerForProvider("commandCode", input),
   },
   claudeAgent: {
     getState: (input) => getProviderStateFromCapabilities(input),

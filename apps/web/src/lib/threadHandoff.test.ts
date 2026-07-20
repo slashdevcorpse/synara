@@ -10,6 +10,7 @@ describe("threadHandoff", () => {
   it("lists all supported handoff targets except the active provider", () => {
     const providers = [
       "codex",
+      "commandCode",
       "claudeAgent",
       "cursor",
       "antigravity",
@@ -76,6 +77,25 @@ describe("threadHandoff", () => {
     ).toEqual({
       provider: "codex",
       model: "gpt-5.5",
+    });
+  });
+
+  it("uses GPT-5.6 Sol as the default Command Code handoff model", () => {
+    expect(
+      resolveThreadHandoffModelSelection({
+        sourceThread: {
+          modelSelection: {
+            provider: "codex",
+            model: "gpt-5.5",
+          },
+        },
+        targetProvider: "commandCode",
+        projectDefaultModelSelection: null,
+        stickyModelSelectionByProvider: {},
+      }),
+    ).toEqual({
+      provider: "commandCode",
+      model: "gpt-5.6-sol",
     });
   });
 });
