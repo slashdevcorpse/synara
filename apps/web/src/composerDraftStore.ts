@@ -1650,29 +1650,29 @@ function normalizeModelSelection(
       ? modelOptions?.codex
       : provider === "commandCode"
         ? modelOptions?.commandCode
-      : provider === "claudeAgent"
-        ? inferredClaudeAutoCompactWindow !== undefined
-          ? {
-              ...modelOptions?.claudeAgent,
-              autoCompactWindow:
-                modelOptions?.claudeAgent?.autoCompactWindow ?? inferredClaudeAutoCompactWindow,
-            }
-          : modelOptions?.claudeAgent
-        : provider === "antigravity"
-          ? modelOptions?.antigravity
-          : provider === "grok"
-            ? modelOptions?.grok
-            : provider === "droid"
-              ? modelOptions?.droid
-              : provider === "kilo"
-                ? modelOptions?.kilo
-                : provider === "cursor"
-                  ? modelOptions?.cursor
-                  : provider === "opencode"
-                    ? modelOptions?.opencode
-                    : provider === "pi"
-                      ? modelOptions?.pi
-                      : undefined;
+        : provider === "claudeAgent"
+          ? inferredClaudeAutoCompactWindow !== undefined
+            ? {
+                ...modelOptions?.claudeAgent,
+                autoCompactWindow:
+                  modelOptions?.claudeAgent?.autoCompactWindow ?? inferredClaudeAutoCompactWindow,
+              }
+            : modelOptions?.claudeAgent
+          : provider === "antigravity"
+            ? modelOptions?.antigravity
+            : provider === "grok"
+              ? modelOptions?.grok
+              : provider === "droid"
+                ? modelOptions?.droid
+                : provider === "kilo"
+                  ? modelOptions?.kilo
+                  : provider === "cursor"
+                    ? modelOptions?.cursor
+                    : provider === "opencode"
+                      ? modelOptions?.opencode
+                      : provider === "pi"
+                        ? modelOptions?.pi
+                        : undefined;
   const normalizedOptions =
     provider === "antigravity" && hasLegacyAntigravityEffort
       ? {

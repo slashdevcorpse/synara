@@ -425,7 +425,9 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
             assert.strictEqual(status.authStatus, "authenticated");
             assert.strictEqual(status.version, "0.52.1");
             assert.strictEqual(status.authLabel, "operator@example.com");
-            assert.ok(calls.some((args) => JSON.stringify(args) === JSON.stringify(["status", "--json"])));
+            assert.ok(
+              calls.some((args) => JSON.stringify(args) === JSON.stringify(["status", "--json"])),
+            );
           }),
         ),
       );

@@ -798,9 +798,9 @@ describe("provider-indexed custom model settings", () => {
         (option) => option.slug === "openai/custom-command-model",
       ),
     ).toHaveLength(1);
-    expect(
-      modelOptionsByProvider.commandCode.some((option) => option.slug === "gpt-5.6-sol"),
-    ).toBe(true);
+    expect(modelOptionsByProvider.commandCode.some((option) => option.slug === "gpt-5.6-sol")).toBe(
+      true,
+    );
     expect(
       modelOptionsByProvider.claudeAgent.filter((option) => option.slug === "claude/custom-opus"),
     ).toHaveLength(1);

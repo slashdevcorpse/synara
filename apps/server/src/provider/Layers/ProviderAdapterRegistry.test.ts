@@ -6,10 +6,7 @@ import { Effect, Layer, Stream } from "effect";
 
 import { ClaudeAdapter, ClaudeAdapterShape } from "../Services/ClaudeAdapter.ts";
 import { CodexAdapter, CodexAdapterShape } from "../Services/CodexAdapter.ts";
-import {
-  CommandCodeAdapter,
-  CommandCodeAdapterShape,
-} from "../Services/CommandCodeAdapter.ts";
+import { CommandCodeAdapter, CommandCodeAdapterShape } from "../Services/CommandCodeAdapter.ts";
 import { CursorAdapter, CursorAdapterShape } from "../Services/CursorAdapter.ts";
 import { DroidAdapter, DroidAdapterShape } from "../Services/DroidAdapter.ts";
 import { GrokAdapter, GrokAdapterShape } from "../Services/GrokAdapter.ts";

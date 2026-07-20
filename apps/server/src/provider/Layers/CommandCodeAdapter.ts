@@ -1,11 +1,14 @@
 /**
  * Command Code adapter backed by the CLI's supported headless interface.
  *
- * Command Code does not expose app-server, ACP, an SDK, or structured event
- * streaming. Synara therefore owns the session/process lifecycle and invokes
- * `commandcode -p --verbose` once per turn, resuming with the stable session id
- * printed by the CLI. Stdout is projected as assistant content; no unstructured
- * stderr text is promoted into fake tool or approval lifecycle events.
+ * Command Code's interactive TUI can be hosted directly by terminal-first apps,
+ * where its JSON hooks expose tool lifecycle events. Synara's native transcript
+ * instead uses the supported headless interface and owns the session/process
+ * lifecycle: `commandcode -p --verbose` runs once per turn and resumes with the
+ * stable session id printed by the CLI. Command Code 0.52.1 does not dispatch
+ * those hooks from its headless tool loop, so stdout is projected as assistant
+ * content without promoting human-readable stderr into synthetic tool or
+ * approval events.
  */
 import { randomUUID } from "node:crypto";
 import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
@@ -53,10 +56,15 @@ const MAX_STDOUT_BYTES = 8 * 1024 * 1024;
 const MAX_STDERR_BYTES = 1024 * 1024;
 const MAX_MODEL_LIST_BYTES = 2 * 1024 * 1024;
 const MODEL_LIST_TIMEOUT_MS = 15_000;
-const SESSION_LINE_PATTERN = /^session:\s*([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\s*$/iu;
+const SESSION_LINE_PATTERN =
+  /^session:\s*([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\s*$/iu;
 const ANSI_PATTERN = /\u001b\[[0-?]*[ -/]*[@-~]/gu;
 
-type SpawnProcess = (command: string, args: ReadonlyArray<string>, options: SpawnOptions) => ChildProcess;
+type SpawnProcess = (
+  command: string,
+  args: ReadonlyArray<string>,
+  options: SpawnOptions,
+) => ChildProcess;
 type TeardownProcessTree = (child: ChildProcess) => Promise<unknown>;
 type ResolveExecutable = (
   command: string,
@@ -118,7 +126,11 @@ function resolveAndValidateExecutable(
   input: { readonly cwd: string; readonly env: NodeJS.ProcessEnv },
 ): string {
   const executable = resolveCommandCodeCliExecutable(command, input);
-  if (isPathLikeExecutable(command) || Path.isAbsolute(executable) || Path.win32.isAbsolute(executable)) {
+  if (
+    isPathLikeExecutable(command) ||
+    Path.isAbsolute(executable) ||
+    Path.win32.isAbsolute(executable)
+  ) {
     try {
       if (!statSync(executable).isFile()) throw new Error("not a regular file");
     } catch {
@@ -160,7 +172,11 @@ export function parseCommandCodeModelList(stdout: string): CommandCodeModelDescr
   for (const rawLine of stripAnsi(stdout).split(/\r?\n/u)) {
     const line = rawLine.trimEnd();
     const trimmed = line.trim();
-    if (!trimmed || /^Available models\b/iu.test(trimmed) || /^Pass the full id\b/iu.test(trimmed)) {
+    if (
+      !trimmed ||
+      /^Available models\b/iu.test(trimmed) ||
+      /^Pass the full id\b/iu.test(trimmed)
+    ) {
       continue;
     }
     if (/^Docs:/iu.test(trimmed) || /^cmdc\s+--model\b/iu.test(trimmed)) break;
@@ -203,9 +219,7 @@ export function buildCommandCodeTurnArgs(input: {
     ...(input.providerSessionId ? ["--resume", input.providerSessionId] : []),
     ...(input.model ? ["--model", input.model] : []),
     ...(input.plan ? ["--plan"] : []),
-    ...(input.runtimeMode === "full-access" && !input.plan
-      ? ["--dangerously-skip-permissions"]
-      : []),
+    ...(input.runtimeMode === "full-access" && !input.plan ? ["--yolo"] : []),
   ];
 }
 
@@ -213,7 +227,9 @@ function readResumeSessionId(value: unknown): string | undefined {
   if (typeof value === "string") return parseCommandCodeSessionLine(`session: ${value}`);
   if (!value || typeof value !== "object") return undefined;
   const sessionId = (value as { sessionId?: unknown }).sessionId;
-  return typeof sessionId === "string" ? parseCommandCodeSessionLine(`session: ${sessionId}`) : undefined;
+  return typeof sessionId === "string"
+    ? parseCommandCodeSessionLine(`session: ${sessionId}`)
+    : undefined;
 }
 
 function processErrorMessage(stderr: string, exitCode: number | null): string {
@@ -289,7 +305,11 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
       } satisfies ProviderRuntimeEvent);
     };
 
-    const consumeStderr = (context: CommandCodeSessionContext, active: ActiveCommandCodeTurn, chunk: string) => {
+    const consumeStderr = (
+      context: CommandCodeSessionContext,
+      active: ActiveCommandCodeTurn,
+      chunk: string,
+    ) => {
       active.stderr += chunk;
       active.stderrLineBuffer += chunk;
       const lines = active.stderrLineBuffer.split(/\r?\n/u);
@@ -416,8 +436,7 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
         }
         const now = new Date().toISOString();
         const providerSessionId = readResumeSessionId(input.resumeCursor);
-        const binaryPath =
-          input.providerOptions?.commandCode?.binaryPath?.trim() || DEFAULT_BINARY;
+        const binaryPath = input.providerOptions?.commandCode?.binaryPath?.trim() || DEFAULT_BINARY;
         const cwd = input.cwd ?? process.cwd();
         const env = buildProviderChildEnvironment({ provider: PROVIDER });
         const executable = yield* Effect.try({
@@ -430,9 +449,7 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
             }),
         });
         const model =
-          input.modelSelection?.provider === PROVIDER
-            ? input.modelSelection.model
-            : DEFAULT_MODEL;
+          input.modelSelection?.provider === PROVIDER ? input.modelSelection.model : DEFAULT_MODEL;
         const existing = sessions.get(input.threadId);
         if (existing) {
           existing.stopped = true;
@@ -455,9 +472,7 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
         };
         const context: CommandCodeSessionContext = {
           session,
-          ...(input.lifecycleGeneration
-            ? { lifecycleGeneration: input.lifecycleGeneration }
-            : {}),
+          ...(input.lifecycleGeneration ? { lifecycleGeneration: input.lifecycleGeneration } : {}),
           executable,
           ...(providerSessionId ? { providerSessionId } : {}),
           turns: [],
@@ -499,7 +514,10 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
             maxChars: 48_000,
           });
           const mentionText = (input.mentions ?? [])
-            .map((mention) => `<mention name=${JSON.stringify(mention.name)} path=${JSON.stringify(mention.path)} />`)
+            .map(
+              (mention) =>
+                `<mention name=${JSON.stringify(mention.name)} path=${JSON.stringify(mention.path)} />`,
+            )
             .join("\n");
           return [skillText, mentionText, userText].filter(Boolean).join("\n\n").trim();
         },
@@ -753,7 +771,9 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
               stdoutBytes += chunkByteLength(chunk);
               if (stdoutBytes > MAX_MODEL_LIST_BYTES) {
                 terminate(
-                  new Error(`Command Code model discovery stdout exceeded ${MAX_MODEL_LIST_BYTES} bytes.`),
+                  new Error(
+                    `Command Code model discovery stdout exceeded ${MAX_MODEL_LIST_BYTES} bytes.`,
+                  ),
                 );
                 return;
               }
@@ -763,7 +783,9 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
               stderrBytes += chunkByteLength(chunk);
               if (stderrBytes > MAX_MODEL_LIST_BYTES) {
                 terminate(
-                  new Error(`Command Code model discovery stderr exceeded ${MAX_MODEL_LIST_BYTES} bytes.`),
+                  new Error(
+                    `Command Code model discovery stderr exceeded ${MAX_MODEL_LIST_BYTES} bytes.`,
+                  ),
                 );
                 return;
               }

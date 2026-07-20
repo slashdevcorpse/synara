@@ -63,8 +63,7 @@ function adapterLayer(input: {
   readonly teardownProcessTree?: (child: ChildProcess) => Promise<unknown>;
   readonly resolveExecutable?: (command: string) => string;
 }) {
-  const spawnProcess =
-    input.spawnProcess ?? vi.fn(() => input.child.child);
+  const spawnProcess = input.spawnProcess ?? vi.fn(() => input.child.child);
   return {
     spawnProcess,
     layer: makeCommandCodeAdapterLive({
@@ -74,8 +73,7 @@ function adapterLayer(input: {
         (async () => {
           if (input.child.child.exitCode === null) input.child.close(130);
         }),
-      resolveExecutable:
-        input.resolveExecutable ?? (() => "C:\\tools\\commandcode.cmd"),
+      resolveExecutable: input.resolveExecutable ?? (() => "C:\\tools\\commandcode.cmd"),
     }).pipe(
       Layer.provide(
         ServerConfig.layerTest(process.cwd(), { prefix: "command-code-adapter-test-" }),
@@ -127,7 +125,7 @@ describe("Command Code CLI helpers", () => {
       runtimeMode: "full-access",
     });
     assert.ok(args.includes("--trust"));
-    assert.ok(args.includes("--dangerously-skip-permissions"));
+    assert.ok(args.includes("--yolo"));
     assert.ok(!args.includes("--plan"));
   });
 
@@ -207,9 +205,9 @@ it.effect("spawns only on send, uses Windows-safe argv, resumes, and projects fi
       const threadId = ThreadId.makeUnsafe("command-code-thread");
       const program = Effect.gen(function* () {
         const adapter = yield* CommandCodeAdapter;
-        const eventFiber = yield* Stream.runCollect(
-          adapter.streamEvents.pipe(Stream.take(8)),
-        ).pipe(Effect.forkChild);
+        const eventFiber = yield* Stream.runCollect(adapter.streamEvents.pipe(Stream.take(8))).pipe(
+          Effect.forkChild,
+        );
         yield* adapter.startSession(startInput(threadId));
         assert.strictEqual(spawnProcess.mock.calls.length, 0);
 
@@ -232,9 +230,7 @@ it.effect("spawns only on send, uses Windows-safe argv, resumes, and projects fi
         assert.match(providerArgv, /--model[^\n]*gpt-5\.6-sol/u);
         assert.ok(!/hello/u.test(providerArgv));
 
-        const concurrent = yield* adapter
-          .sendTurn({ threadId, input: "second" })
-          .pipe(Effect.flip);
+        const concurrent = yield* adapter.sendTurn({ threadId, input: "second" }).pipe(Effect.flip);
         assert.ok(concurrent instanceof ProviderAdapterValidationError);
 
         mock.stderr.write("session: d37c825d-d4f7-4f7c-");
@@ -243,16 +239,19 @@ it.effect("spawns only on send, uses Windows-safe argv, resumes, and projects fi
         mock.stdout.write(Buffer.from([0x98, 0x80, 0x0a]));
         mock.close(0);
         const events = Array.from(yield* Fiber.join(eventFiber));
-        assert.deepStrictEqual(events.map((event) => event.type), [
-          "session.started",
-          "thread.started",
-          "turn.started",
-          "thread.started",
-          "item.started",
-          "content.delta",
-          "item.completed",
-          "turn.completed",
-        ]);
+        assert.deepStrictEqual(
+          events.map((event) => event.type),
+          [
+            "session.started",
+            "thread.started",
+            "turn.started",
+            "thread.started",
+            "item.started",
+            "content.delta",
+            "item.completed",
+            "turn.completed",
+          ],
+        );
         assert.ok(!events.some((event) => event.type === "tool.progress"));
         const sessions = yield* adapter.listSessions();
         assert.deepStrictEqual(sessions[0]?.resumeCursor, {
@@ -268,10 +267,7 @@ it.effect("spawns only on send, uses Windows-safe argv, resumes, and projects fi
         const resumedArgs = spawnProcess.mock.calls[1]![1] as ReadonlyArray<string>;
         const resumedArgv =
           process.platform === "win32" ? String(resumedArgs[4]) : resumedArgs.join(" ");
-        assert.match(
-          resumedArgv,
-          /--resume[^\n]*d37c825d-d4f7-4f7c-bfa2-f5c8a7c00119/u,
-        );
+        assert.match(resumedArgv, /--resume[^\n]*d37c825d-d4f7-4f7c-bfa2-f5c8a7c00119/u);
         assert.ok(!/follow-up prompt/u.test(resumedArgv));
         resumedMock.close(0);
       });
@@ -320,9 +316,9 @@ it.effect("surfaces exit code 8 as a max-turn-cap failure", () =>
       const threadId = ThreadId.makeUnsafe("command-code-max-turns");
       const events = yield* Effect.gen(function* () {
         const adapter = yield* CommandCodeAdapter;
-        const eventFiber = yield* Stream.runCollect(
-          adapter.streamEvents.pipe(Stream.take(5)),
-        ).pipe(Effect.forkChild);
+        const eventFiber = yield* Stream.runCollect(adapter.streamEvents.pipe(Stream.take(5))).pipe(
+          Effect.forkChild,
+        );
         yield* adapter.startSession(startInput(threadId));
         yield* adapter.sendTurn({ threadId, input: "bounded task" });
         mock.close(8);
@@ -345,19 +341,24 @@ it.effect("discovers models through the mocked CLI without a vendor call", () =>
       const { layer, spawnProcess } = adapterLayer({ child: mock });
       const result = yield* Effect.gen(function* () {
         const adapter = yield* CommandCodeAdapter;
-        const fiber = yield* adapter
-          .listModels!({ provider: "commandCode", cwd: process.cwd() })
-          .pipe(Effect.forkChild);
+        const fiber = yield* adapter.listModels!({
+          provider: "commandCode",
+          cwd: process.cwd(),
+        }).pipe(Effect.forkChild);
         yield* Effect.yieldNow;
-        mock.stdout.write(
-          "Available models · 1 model\n\nOpenAI\n\ngpt-5.6-sol  frontier model\n",
-        );
+        mock.stdout.write("Available models · 1 model\n\nOpenAI\n\ngpt-5.6-sol  frontier model\n");
         mock.close(0);
         return yield* Fiber.join(fiber);
       }).pipe(Effect.provide(layer));
-      assert.deepStrictEqual(result.models.map((model) => model.slug), ["gpt-5.6-sol"]);
+      assert.deepStrictEqual(
+        result.models.map((model) => model.slug),
+        ["gpt-5.6-sol"],
+      );
       assert.strictEqual(result.source, "command-code.cli");
-      assert.match((spawnProcess.mock.calls[0]?.[1] as ReadonlyArray<string>).join(" "), /--list-models/u);
+      assert.match(
+        (spawnProcess.mock.calls[0]?.[1] as ReadonlyArray<string>).join(" "),
+        /--list-models/u,
+      );
     }),
   ),
 );
@@ -371,9 +372,9 @@ it.effect("tears down the process tree and maps exit 130 to interrupted", () =>
       const threadId = ThreadId.makeUnsafe("command-code-interrupt");
       const events = yield* Effect.gen(function* () {
         const adapter = yield* CommandCodeAdapter;
-        const eventFiber = yield* Stream.runCollect(
-          adapter.streamEvents.pipe(Stream.take(4)),
-        ).pipe(Effect.forkChild);
+        const eventFiber = yield* Stream.runCollect(adapter.streamEvents.pipe(Stream.take(4))).pipe(
+          Effect.forkChild,
+        );
         yield* adapter.startSession(startInput(threadId));
         const turn = yield* adapter.sendTurn({ threadId, input: "long task" });
         yield* adapter.interruptTurn(threadId, turn.turnId);

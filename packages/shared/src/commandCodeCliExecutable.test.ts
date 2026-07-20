@@ -13,9 +13,9 @@ function regularFiles(...paths: string[]) {
 describe("resolveCommandCodeCliExecutable", () => {
   it("preserves non-Windows commands without probing", () => {
     const spawnSync = vi.fn();
-    expect(
-      resolveCommandCodeCliExecutable("commandcode", { platform: "linux", spawnSync }),
-    ).toBe("commandcode");
+    expect(resolveCommandCodeCliExecutable("commandcode", { platform: "linux", spawnSync })).toBe(
+      "commandcode",
+    );
     expect(spawnSync).not.toHaveBeenCalled();
   });
 
@@ -55,9 +55,7 @@ describe("resolveCommandCodeCliExecutable", () => {
   it("falls back from commandcode to command-code", () => {
     const commandCode = "C:\\npm\\command-code.cmd";
     const spawnSync = vi.fn((_command: string, args: ReadonlyArray<string>) =>
-      args[0] === "commandcode"
-        ? { stdout: "", status: 1 }
-        : { stdout: commandCode, status: 0 },
+      args[0] === "commandcode" ? { stdout: "", status: 1 } : { stdout: commandCode, status: 0 },
     );
     expect(
       resolveCommandCodeCliExecutable("commandcode", {

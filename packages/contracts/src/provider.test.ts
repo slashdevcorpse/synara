@@ -29,9 +29,7 @@ describe("ProviderSessionStartInput", () => {
       provider: "commandCode",
       model: "gpt-5.6-sol",
     });
-    expect(parsed.providerOptions?.commandCode?.binaryPath).toBe(
-      "/usr/local/bin/commandcode",
-    );
+    expect(parsed.providerOptions?.commandCode?.binaryPath).toBe("/usr/local/bin/commandcode");
   });
 
   it("accepts codex-compatible payloads", () => {

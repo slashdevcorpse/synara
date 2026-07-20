@@ -2500,9 +2500,7 @@ export function makeProviderHealthLive(options?: { readonly providerUpdateTimeou
                 checkProviderWhenEnabled(
                   settings,
                   COMMAND_CODE_PROVIDER,
-                  makeCheckCommandCodeProviderStatus(
-                    settings.providers.commandCode.binaryPath,
-                  ),
+                  makeCheckCommandCodeProviderStatus(settings.providers.commandCode.binaryPath),
                 ),
                 checkProviderWhenEnabled(
                   settings,

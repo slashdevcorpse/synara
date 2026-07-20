@@ -229,10 +229,7 @@ describe("ProviderModelPicker", () => {
       await page.getByRole("menuitem", { name: "Command Code" }).hover();
       await page.getByRole("menuitemradio", { name: "GPT-5.6 Sol" }).click();
 
-      expect(mounted.onProviderModelChange).toHaveBeenCalledWith(
-        "commandCode",
-        "gpt-5.6-sol",
-      );
+      expect(mounted.onProviderModelChange).toHaveBeenCalledWith("commandCode", "gpt-5.6-sol");
     } finally {
       await mounted.cleanup();
     }
