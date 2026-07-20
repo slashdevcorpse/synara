@@ -1,0 +1,426 @@
+// FILE: processTree.test.ts
+// Purpose: Verifies process identity classification used by packaged desktop teardown.
+
+import type { ChildProcess } from "node:child_process";
+import { EventEmitter } from "node:events";
+import type { ElectronApplication } from "@playwright/test";
+import { describe, expect, it, vi } from "vitest";
+import {
+  classifyProcessAncestry,
+  classifyProcessIdentity,
+  closeElectronApplication,
+  collectDescendants,
+  mergeTrackedProcesses,
+  parseLinuxProcessStat,
+  type ProcessTreeDependencies,
+  type ProcessSnapshotRow,
+  type TrackedProcess,
+} from "./processTree";
+
+const expectedProcess = {
+  pid: 42,
+  identity: "windows:start-a",
+  commandFingerprint: "command-a",
+} satisfies TrackedProcess;
+
+function processRow(overrides: Partial<ProcessSnapshotRow> = {}): ProcessSnapshotRow {
+  return {
+    pid: expectedProcess.pid,
+    parentPid: 1,
+    identity: expectedProcess.identity,
+    commandFingerprint: expectedProcess.commandFingerprint,
+    ...overrides,
+  };
+}
+
+describe("classifyProcessIdentity", () => {
+  it("recognizes the same process identity", () => {
+    expect(classifyProcessIdentity(expectedProcess, processRow())).toBe("same");
+  });
+
+  it("recognizes an exited process", () => {
+    expect(classifyProcessIdentity(expectedProcess, undefined)).toBe("gone");
+  });
+
+  it("recognizes a reused pid from a different creation identity", () => {
+    expect(
+      classifyProcessIdentity(expectedProcess, processRow({ identity: "windows:start-b" })),
+    ).toBe("reused");
+  });
+
+  it("fails closed when creation identity evidence is missing", () => {
+    expect(classifyProcessIdentity(expectedProcess, processRow({ identity: null }))).toBe(
+      "unknown",
+    );
+  });
+
+  it("fails closed when command identity evidence changes", () => {
+    expect(
+      classifyProcessIdentity(
+        expectedProcess,
+        processRow({ commandFingerprint: "command-b" }),
+      ),
+    ).toBe("unknown");
+  });
+});
+
+describe("parseLinuxProcessStat", () => {
+  it("derives ancestry and creation identity from one proc stat record", () => {
+    const statFields = ["S", "7", ...Array.from({ length: 17 }, () => "0"), "12345"];
+    const parsed = parseLinuxProcessStat(
+      42,
+      `42 (electron (renderer)) ${statFields.join(" ")}`,
+      "boot-a",
+    );
+
+    expect(parsed).toMatchObject({
+      pid: 42,
+      parentPid: 7,
+      identity: "linux:boot-a:12345",
+    });
+    expect(parsed.commandFingerprint).toMatch(/^[a-f\d]{64}$/u);
+  });
+
+  it("rejects a proc stat record for a different pid", () => {
+    const statFields = ["S", "7", ...Array.from({ length: 17 }, () => "0"), "12345"];
+
+    expect(() =>
+      parseLinuxProcessStat(42, `43 (electron) ${statFields.join(" ")}`, "boot-a"),
+    ).toThrow("malformed Linux stat data for pid 42");
+  });
+});
+
+describe("classifyProcessAncestry", () => {
+  it("accepts children created after their Windows parent", () => {
+    expect(
+      classifyProcessAncestry(
+        { identity: "windows:2026-07-20T20:00:00.0000000Z" },
+        { identity: "windows:2026-07-20T20:00:00.1000000Z" },
+      ),
+    ).toBe("valid");
+  });
+
+  it("rejects a stale Windows parent-pid relationship", () => {
+    expect(
+      classifyProcessAncestry(
+        { identity: "windows:2026-07-20T20:00:00.1000000Z" },
+        { identity: "windows:2026-07-20T20:00:00.0000000Z" },
+      ),
+    ).toBe("stale");
+  });
+
+  it("compares Linux start ticks within the same boot", () => {
+    expect(
+      classifyProcessAncestry(
+        { identity: "linux:boot-a:100" },
+        { identity: "linux:boot-a:101" },
+      ),
+    ).toBe("valid");
+    expect(
+      classifyProcessAncestry(
+        { identity: "linux:boot-a:101" },
+        { identity: "linux:boot-a:100" },
+      ),
+    ).toBe("stale");
+  });
+
+  it("fails closed when ancestry identity evidence is incompatible", () => {
+    expect(
+      classifyProcessAncestry(
+        { identity: "linux:boot-a:100" },
+        { identity: "linux:boot-b:101" },
+      ),
+    ).toBe("unknown");
+    expect(classifyProcessAncestry({ identity: null }, { identity: "linux:boot-a:101" })).toBe(
+      "unknown",
+    );
+  });
+});
+
+class FakeChildProcess extends EventEmitter {
+  readonly pid: number;
+  exitCode: number | null = null;
+  signalCode: NodeJS.Signals | null = null;
+  readonly kill = vi.fn((signal: NodeJS.Signals = "SIGTERM") => {
+    this.signalCode = signal;
+    this.emit("exit", null, signal);
+    return true;
+  });
+
+  constructor(pid: number) {
+    super();
+    this.pid = pid;
+  }
+}
+
+function fakeElectronApplication(child: FakeChildProcess): ElectronApplication {
+  return {
+    process: () => child as unknown as ChildProcess,
+    close: vi.fn(async () => undefined),
+  } as unknown as ElectronApplication;
+}
+
+function windowsProcessRow(input: {
+  pid: number;
+  parentPid: number;
+  startedAt: string;
+  commandFingerprint: string;
+}): ProcessSnapshotRow {
+  return {
+    pid: input.pid,
+    parentPid: input.parentPid,
+    identity: `windows:${input.startedAt}`,
+    commandFingerprint: input.commandFingerprint,
+  };
+}
+
+describe("desktop process teardown orchestration", () => {
+  it("uses the original child handle when a later identity snapshot fails", async () => {
+    const child = new FakeChildProcess(101);
+    const root = windowsProcessRow({
+      pid: child.pid,
+      parentPid: 1,
+      startedAt: "2026-07-20T20:00:00.0000000Z",
+      commandFingerprint: "root-command",
+    });
+    let snapshotCount = 0;
+    const dependencies: ProcessTreeDependencies = {
+      platform: "win32",
+      readProcessSnapshot: vi.fn(() => {
+        snapshotCount += 1;
+        if (snapshotCount === 1) return [root];
+        throw new Error("identity snapshot unavailable");
+      }),
+      signalProcess: vi.fn(),
+    };
+
+    await expect(
+      closeElectronApplication(fakeElectronApplication(child), dependencies),
+    ).rejects.toThrow("Desktop process snapshot and process-tree cleanup failed");
+    expect(child.kill).toHaveBeenCalledWith("SIGKILL");
+    expect(dependencies.signalProcess).not.toHaveBeenCalled();
+  });
+
+  it("continues targeted cleanup when a later full snapshot fails", async () => {
+    const child = new FakeChildProcess(151);
+    const root = windowsProcessRow({
+      pid: child.pid,
+      parentPid: 1,
+      startedAt: "2026-07-20T20:00:00.0000000Z",
+      commandFingerprint: "root-command",
+    });
+    const descendant = windowsProcessRow({
+      pid: 152,
+      parentPid: root.pid,
+      startedAt: "2026-07-20T20:00:00.1000000Z",
+      commandFingerprint: "child-command",
+    });
+    let fullSnapshotCount = 0;
+    const signalProcess = vi.fn();
+    const dependencies: ProcessTreeDependencies = {
+      platform: "win32",
+      readProcessSnapshot: vi.fn((requestedPids) => {
+        if (requestedPids?.[0] === descendant.pid) return [descendant];
+        if (requestedPids?.[0] === root.pid) return [root];
+        fullSnapshotCount += 1;
+        if (fullSnapshotCount === 1) return [root, descendant];
+        if (fullSnapshotCount === 2) throw new Error("late snapshot unavailable");
+        return [];
+      }),
+      signalProcess,
+    };
+
+    await expect(
+      closeElectronApplication(fakeElectronApplication(child), dependencies),
+    ).rejects.toThrow("late snapshot unavailable");
+    expect(signalProcess).toHaveBeenCalledWith(descendant.pid, "SIGKILL");
+    expect(signalProcess).toHaveBeenCalledWith(root.pid, "SIGKILL");
+    expect(child.kill).toHaveBeenCalledWith("SIGKILL");
+  });
+
+  it("waits for a delayed child exit after the kill handle reports false", async () => {
+    const child = new FakeChildProcess(181);
+    const root = windowsProcessRow({
+      pid: child.pid,
+      parentPid: 1,
+      startedAt: "2026-07-20T20:00:00.0000000Z",
+      commandFingerprint: "root-command",
+    });
+    let fullSnapshotCount = 0;
+    const dependencies: ProcessTreeDependencies = {
+      platform: "win32",
+      readProcessSnapshot: vi.fn((requestedPids) => {
+        if (requestedPids) return [];
+        fullSnapshotCount += 1;
+        return fullSnapshotCount === 1 ? [root] : [];
+      }),
+      signalProcess: vi.fn(),
+    };
+    child.kill.mockImplementationOnce((signal: NodeJS.Signals = "SIGTERM") => {
+      setTimeout(() => {
+        child.signalCode = signal;
+        child.emit("exit", null, signal);
+      }, 0);
+      return false;
+    });
+
+    await expect(
+      closeElectronApplication(fakeElectronApplication(child), dependencies),
+    ).resolves.toBeUndefined();
+    expect(child.kill).toHaveBeenCalledWith("SIGKILL");
+  });
+
+  it("fails at the force deadline when the child handle never confirms exit", async () => {
+    vi.useFakeTimers();
+    try {
+      const child = new FakeChildProcess(191);
+      const root = windowsProcessRow({
+        pid: child.pid,
+        parentPid: 1,
+        startedAt: "2026-07-20T20:00:00.0000000Z",
+        commandFingerprint: "root-command",
+      });
+      let fullSnapshotCount = 0;
+      const dependencies: ProcessTreeDependencies = {
+        platform: "win32",
+        readProcessSnapshot: vi.fn((requestedPids) => {
+          if (requestedPids) return [];
+          fullSnapshotCount += 1;
+          return fullSnapshotCount === 1 ? [root] : [];
+        }),
+        signalProcess: vi.fn(),
+      };
+      child.kill.mockReturnValueOnce(false);
+
+      const close = closeElectronApplication(fakeElectronApplication(child), dependencies);
+      const closeExpectation = expect(close).rejects.toThrow(
+        "Timed out while terminating the Electron child handle",
+      );
+      await vi.advanceTimersByTimeAsync(5_000);
+
+      await closeExpectation;
+      expect(child.kill).toHaveBeenCalledWith("SIGKILL");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("accepts confirmed child state at the force deadline without an exit event", async () => {
+    vi.useFakeTimers();
+    try {
+      const child = new FakeChildProcess(196);
+      const root = windowsProcessRow({
+        pid: child.pid,
+        parentPid: 1,
+        startedAt: "2026-07-20T20:00:00.0000000Z",
+        commandFingerprint: "root-command",
+      });
+      let fullSnapshotCount = 0;
+      const dependencies: ProcessTreeDependencies = {
+        platform: "win32",
+        readProcessSnapshot: vi.fn((requestedPids) => {
+          if (requestedPids) return [];
+          fullSnapshotCount += 1;
+          return fullSnapshotCount === 1 ? [root] : [];
+        }),
+        signalProcess: vi.fn(),
+      };
+      child.kill.mockReturnValueOnce(false);
+      setTimeout(() => {
+        child.signalCode = "SIGKILL";
+      }, 5_000);
+
+      const close = closeElectronApplication(fakeElectronApplication(child), dependencies);
+      const closeExpectation = expect(close).resolves.toBeUndefined();
+      await vi.advanceTimersByTimeAsync(5_000);
+
+      await closeExpectation;
+      expect(child.kill).toHaveBeenCalledWith("SIGKILL");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not signal a descendant whose pid was reused before termination", async () => {
+    const childProcess = new FakeChildProcess(201);
+    const root = windowsProcessRow({
+      pid: childProcess.pid,
+      parentPid: 1,
+      startedAt: "2026-07-20T20:00:00.0000000Z",
+      commandFingerprint: "root-command",
+    });
+    const descendant = windowsProcessRow({
+      pid: 202,
+      parentPid: root.pid,
+      startedAt: "2026-07-20T20:00:00.1000000Z",
+      commandFingerprint: "child-command",
+    });
+    const reusedDescendant = {
+      ...descendant,
+      identity: "windows:2026-07-20T20:00:01.0000000Z",
+      parentPid: 999,
+    };
+    let fullSnapshotCount = 0;
+    const signalProcess = vi.fn();
+    const dependencies: ProcessTreeDependencies = {
+      platform: "win32",
+      readProcessSnapshot: vi.fn((requestedPids) => {
+        if (requestedPids?.[0] === descendant.pid) return [reusedDescendant];
+        if (requestedPids?.[0] === root.pid) return [root];
+        fullSnapshotCount += 1;
+        return fullSnapshotCount <= 3 ? [root, descendant] : [];
+      }),
+      signalProcess,
+    };
+
+    await closeElectronApplication(fakeElectronApplication(childProcess), dependencies);
+
+    expect(signalProcess).toHaveBeenCalledTimes(1);
+    expect(signalProcess).toHaveBeenCalledWith(root.pid, "SIGKILL");
+    expect(signalProcess).not.toHaveBeenCalledWith(descendant.pid, expect.anything());
+  });
+
+  it("preserves valid descendant branches when another branch lacks identity evidence", () => {
+    const root = windowsProcessRow({
+      pid: 301,
+      parentPid: 1,
+      startedAt: "2026-07-20T20:00:00.0000000Z",
+      commandFingerprint: "root-command",
+    });
+    const validChild = windowsProcessRow({
+      pid: 302,
+      parentPid: root.pid,
+      startedAt: "2026-07-20T20:00:00.1000000Z",
+      commandFingerprint: "valid-child-command",
+    });
+    const unknownChild = {
+      ...validChild,
+      pid: 303,
+      identity: null,
+      commandFingerprint: null,
+    };
+
+    const collected = collectDescendants(root.pid, [root, validChild, unknownChild]);
+
+    expect(collected.processes).toEqual([
+      {
+        pid: validChild.pid,
+        identity: validChild.identity,
+        commandFingerprint: validChild.commandFingerprint,
+      },
+    ]);
+    expect(collected.errors).toHaveLength(1);
+    expect(collected.errors[0]?.message).toContain("lacked creation identity");
+  });
+
+  it("keeps the original command fingerprint when late snapshots duplicate an identity", () => {
+    const original = {
+      pid: 401,
+      identity: "windows:2026-07-20T20:00:00.0000000Z",
+      commandFingerprint: "original-command",
+    } satisfies TrackedProcess;
+    const late = { ...original, commandFingerprint: "late-command" };
+
+    expect(mergeTrackedProcesses([original], [late])).toEqual([original]);
+  });
+});

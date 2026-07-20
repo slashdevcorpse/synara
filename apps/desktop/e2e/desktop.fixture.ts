@@ -77,6 +77,7 @@ const PROJECT_SKILL_ROOTS = [
   [".agents", "skills"],
 ] as const;
 const BROWSER_SESSION_PARTITION = "persist:synara-browser";
+const PROVIDER_DISCOVERY_PREFLIGHT_TIMEOUT_MS = 60_000;
 
 function isPathWithin(parentPath: string, candidatePath: string): boolean {
   const relative = Path.relative(Path.resolve(parentPath), Path.resolve(candidatePath));
@@ -596,7 +597,10 @@ export class DesktopHarness {
                 guardedFakeArgs.has(JSON.stringify(["login", "status"])),
             };
           },
-          { timeout: 35_000, intervals: [100, 250, 500, 1_000] },
+          {
+            timeout: PROVIDER_DISCOVERY_PREFLIGHT_TIMEOUT_MS,
+            intervals: [100, 250, 500, 1_000],
+          },
         )
         .toEqual({
           version: true,
@@ -664,6 +668,11 @@ export class DesktopHarness {
       {
         name: "server-log",
         path: Path.join(preservedBackendLogsPath, "server.log"),
+        contentType: "text/plain",
+      },
+      {
+        name: "desktop-main-log",
+        path: Path.join(preservedBackendLogsPath, "desktop-main.log"),
         contentType: "text/plain",
       },
       {

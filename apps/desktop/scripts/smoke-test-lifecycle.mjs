@@ -323,13 +323,6 @@ function defaultKillWindowsTree(pid, { timeoutMs, environment = process.env }) {
   });
 }
 
-export function killWindowsProcessTree(
-  pid,
-  { timeoutMs, environment = process.env },
-) {
-  return defaultKillWindowsTree(pid, { timeoutMs, environment });
-}
-
 function stageTaskkillTimeout(stageMs) {
   const deadlineMarginMs = Math.min(
     WINDOWS_SMOKE_TASKKILL_MARGIN_MS,

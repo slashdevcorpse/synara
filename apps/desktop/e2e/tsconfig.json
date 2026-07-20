@@ -5,5 +5,5 @@
     "types": ["node", "electron"],
     "lib": ["ES2023", "DOM", "esnext.disposable"]
   },
-  "include": ["**/*.ts", "../scripts/smoke-test-lifecycle.d.mts"]
+  "include": ["**/*.ts"]
 }
