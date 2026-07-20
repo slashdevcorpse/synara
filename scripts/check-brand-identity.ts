@@ -42,9 +42,9 @@ const forbiddenPatterns = [
   new RegExp(escapeRegExp(incorrectBundleDomain), "i"),
 ] as const;
 
-// Raster images cannot be searched for embedded text. Keep the user-facing
-// screenshots behind reviewed digests so changing either one requires another
-// explicit visual identity audit instead of silently bypassing this guard.
+// Raster images cannot be searched for embedded text. Keep user-facing screenshots
+// and the canonical Super Synara desktop artwork behind reviewed digests so changing
+// them requires another explicit visual identity audit.
 const approvedVisualAssetDigests = new Map<string, string>([
   [
     "apps/marketing/public/screenshot.jpeg",
@@ -53,6 +53,22 @@ const approvedVisualAssetDigests = new Map<string, string>([
   [
     "assets/prod/readme-screenshot.jpeg",
     "0b4be139f13dd08885a1aac26fc1f7c623697db157777d16360e985c93d47bcf",
+  ],
+  [
+    "assets/super/super-synara-source.jpg",
+    "beaeeb2ea812801acc01365e5ccc999310ee9ea8fb10d1085900cae1d77ab3c4",
+  ],
+  [
+    "assets/super/super-synara-1024.png",
+    "ea72cdd5ba37f5f0e274b9f4f8517a3797c007d4d26158706ca41598cdfc2001",
+  ],
+  [
+    "assets/super/super-synara-macos-legacy-1024.png",
+    "1bb3f27bb1a143e64a8c7c29fa28e5f8decc1616d190bd0c90d4e8f57943ad6a",
+  ],
+  [
+    "assets/super/super-synara-windows.ico",
+    "3f05e1348e6aad6a6eb690be11f2d655676c6005d403759c8eb78afc5186bf0a",
   ],
 ]);
 

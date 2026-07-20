@@ -680,6 +680,7 @@ function SettingsRouteView() {
   const activeSectionItem = SETTINGS_NAV_ITEMS.find((item) => item.id === activeSection)!;
 
   const {
+    defaultThemeMode,
     isDefaultActiveTheme,
     resetAllThemes,
     resolvedTheme,
@@ -1046,7 +1047,7 @@ function SettingsRouteView() {
     settings.piBinaryPath !== defaults.piBinaryPath ||
     settings.piAgentDir !== defaults.piAgentDir;
   const changedSettingLabels = [
-    ...(theme !== "system" ? ["Theme"] : []),
+    ...(theme !== defaultThemeMode ? ["Theme"] : []),
     ...(!isDefaultActiveTheme ? [`${resolvedTheme === "dark" ? "Dark" : "Light"} theme pack`] : []),
     ...(settings.defaultProvider !== defaults.defaultProvider ? ["Default provider"] : []),
     ...(settings.defaultThreadEnvMode !== defaults.defaultThreadEnvMode ? ["New thread mode"] : []),
@@ -1289,7 +1290,6 @@ function SettingsRouteView() {
     );
     if (!confirmed) return;
 
-    setTheme("system");
     resetAllThemes();
     resetSettings();
     setOpenInstallProviders({
@@ -2000,8 +2000,8 @@ function SettingsRouteView() {
             title="Theme"
             description="Choose how Synara looks across the app."
             resetAction={
-              theme !== "system" ? (
-                <SettingResetButton label="theme" onClick={() => setTheme("system")} />
+              theme !== defaultThemeMode ? (
+                <SettingResetButton label="theme" onClick={() => setTheme(defaultThemeMode)} />
               ) : null
             }
             control={
