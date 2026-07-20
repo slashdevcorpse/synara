@@ -454,6 +454,8 @@ import { ChatTranscriptPane } from "./chat/ChatTranscriptPane";
 import type { MessagesTimelineController } from "./chat/MessagesTimeline";
 import { buildTurnDiffSummaryByAssistantMessageId } from "./chat/MessagesTimeline.logic";
 import { deriveAgentActivityTimelineState } from "./chat/agentActivity.logic";
+import { AgentActivityPulse } from "./chat/AgentActivityPulse";
+import { useAgentActivityState } from "./chat/useAgentActivityState";
 import { ComposerSlashStatusDialog } from "./chat/ComposerSlashStatusDialog";
 import { ExpandedImagePreview } from "./chat/ExpandedImagePreview";
 import {
@@ -498,6 +500,7 @@ import {
 } from "./chat/WorkflowRunCard.logic";
 import { ComposerColumnFrame } from "./chat/ComposerColumnFrame";
 import { useTranscriptAssistantSelectionAction } from "./chat/useTranscriptAssistantSelectionAction";
+import { useAgentActivityScrollPause } from "./chat/useAgentActivityScrollPause";
 import { resolveTranscriptMarkerRange } from "./chat/chatSelectionActions";
 import {
   dispatchThreadMarkerAdd,
@@ -1432,6 +1435,8 @@ export default function ChatView({
   const [isTraitsPickerOpen, setIsTraitsPickerOpen] = useState(false);
   const legendListRef = useRef<LegendListRef | null>(null);
   const timelineControllerRef = useRef<MessagesTimelineController | null>(null);
+  const { scopeRef: agentActivityScopeRef, markTranscriptScrollActivity } =
+    useAgentActivityScrollPause();
   const isAtEndRef = useRef(true);
   const autoFollowThreadIdRef = useRef<ThreadId | null>(null);
   const pendingInteractionAnchorRef = useRef<{
@@ -3057,6 +3062,18 @@ export default function ChatView({
     ],
   );
   const isSendBusy = localDispatch !== null && !serverAcknowledgedLocalDispatch;
+  const agentActivityState = useAgentActivityState({
+    threadId: activeThread?.id ?? null,
+    hasMessages: (activeThread?.messages.length ?? 0) > 0,
+    localDispatchPending: isSendBusy,
+    session: activeThread?.session ?? null,
+    latestTurn: activeLatestTurn,
+    messages: activeThread?.messages ?? EMPTY_MESSAGES,
+    activities: threadActivities,
+    hasPendingApproval: activePendingApproval !== null,
+    hasPendingUserInput: activePendingUserInput !== null,
+    threadError: activeThread?.error ?? null,
+  });
   const activeWorktreeSetup = localDispatch?.worktreeSetup ?? null;
   const isPreparingWorktree = activeWorktreeSetup !== null;
   const hasLiveTurn = phase === "running";
@@ -5333,7 +5350,9 @@ export default function ChatView({
     clearTranscriptAutoFollow();
   }, [clearTranscriptAutoFollow]);
   const onMessagesPointerUpBase = useCallback(() => {}, []);
-  const onMessagesScrollBase = useCallback(() => {}, []);
+  const onMessagesScrollBase = useCallback(() => {
+    markTranscriptScrollActivity();
+  }, [markTranscriptScrollActivity]);
   const onMessagesTouchEndBase = useCallback(() => {}, []);
   const onMessagesTouchMoveBase = useCallback(() => {
     clearTranscriptAutoFollow();
@@ -10867,6 +10886,7 @@ export default function ChatView({
     availableEditors,
     activeThreadId: activeThread.id,
     activeProvider: activeThread.session?.provider ?? activeThread.modelSelection.provider,
+    agentActivityState,
     isStudioChat: isStudioContainer,
     showGitActions,
     diffOpen: resolvedDiffOpen,
@@ -11057,6 +11077,7 @@ export default function ChatView({
                   composerMenuOpen && !isComposerApprovalState && "overflow-visible",
                 )}
               >
+                <AgentActivityPulse state={agentActivityState} variant="composer" />
                 <ComposerInputBanners
                   roundedTopReset={false}
                   planFollowUp={
@@ -11473,6 +11494,7 @@ export default function ChatView({
 
   return (
     <div
+      ref={agentActivityScopeRef}
       className={cn(
         "relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden",
         CHAT_BACKGROUND_CLASS_NAME,
@@ -11717,6 +11739,7 @@ export default function ChatView({
                 <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden">
                   <ChatTranscriptPane
                     activeThreadId={activeThread.id}
+                    agentActivityState={agentActivityState}
                     activeTurnId={activeThread.session?.activeTurnId ?? null}
                     agentActivityDetail={openAgentActivityDetail}
                     hasMessages={timelineEntries.length > 0}

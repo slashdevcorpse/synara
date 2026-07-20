@@ -35,6 +35,7 @@ import { IconButton } from "~/components/ui/icon-button";
 import type { RepoDiffTotals } from "~/hooks/useRepoDiffTotals";
 import { ArrowUpRightIcon, ChangesIcon, GitHubIcon, SettingsIcon } from "~/lib/icons";
 import { cn } from "~/lib/utils";
+import type { AgentActivityState } from "~/components/chat/agentActivityPulse.logic";
 
 import { EnvironmentEditorSection } from "./EnvironmentEditorSection";
 import {
@@ -50,6 +51,7 @@ import { EnvironmentNotesSection } from "./EnvironmentNotesSection";
 import { EnvironmentPinnedSection } from "./EnvironmentPinnedSection";
 import { EnvironmentProjectInstructionsSection } from "./EnvironmentProjectInstructionsSection";
 import { ENVIRONMENT_PANEL_RECAP_MARKDOWN_CLASS_NAME } from "./environmentPanelStyles";
+import { EnvironmentAgentActivityRow } from "./EnvironmentAgentActivityRow";
 import {
   ENVIRONMENT_ROW_ICON_CLASS_NAME,
   EnvironmentCollapsibleSection,
@@ -91,6 +93,8 @@ export interface EnvironmentPanelProps {
   activeThreadId: ThreadId | null;
   /** Active provider for the usage row (same chip the header used to show). */
   activeProvider: ProviderKind;
+  /** Provider-agnostic activity state shared with the transcript and composer. */
+  agentActivityState: AgentActivityState;
   /**
    * Whether the active thread is a Studio chat. Studio chats show the Output section:
    * the Outbox files THIS chat produced, so its output stays attached to the chat.
@@ -206,6 +210,7 @@ export function EnvironmentPanel({
   availableEditors,
   activeThreadId,
   activeProvider,
+  agentActivityState,
   isStudioChat,
   showGitActions,
   diffOpen,
@@ -285,6 +290,8 @@ export function EnvironmentPanel({
           <SettingsIcon className="size-3.5" />
         </IconButton>
       </div>
+
+      <EnvironmentAgentActivityRow provider={activeProvider} state={agentActivityState} />
 
       {isGitRepo ? (
         <EnvironmentRow
