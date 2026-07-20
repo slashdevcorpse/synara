@@ -104,7 +104,9 @@ describe("resolveModelSlug", () => {
   });
 
   it("resolves every Command Code alias to a supported canonical model", () => {
-    const supportedModels = new Set(MODEL_OPTIONS_BY_PROVIDER.commandCode.map(({ slug }) => slug));
+    const supportedModels = new Set<string>(
+      MODEL_OPTIONS_BY_PROVIDER.commandCode.map(({ slug }) => slug),
+    );
 
     for (const [alias, canonicalModel] of Object.entries(
       MODEL_SLUG_ALIASES_BY_PROVIDER.commandCode,
