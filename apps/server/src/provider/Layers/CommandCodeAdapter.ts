@@ -252,6 +252,9 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
     const teardown = options?.teardownProcessTree;
     const resolveExecutable = options?.resolveExecutable ?? resolveAndValidateExecutable;
 
+    const teardownProcess = (child: ChildProcess): Promise<unknown> =>
+      teardown ? teardown(child) : teardownChildProcessTree(child);
+
     const offerEvent = (event: ProviderRuntimeEvent): void => {
       Effect.runFork(Queue.offer(runtimeEventQueue, event));
       if (options?.nativeEventLogger) {
@@ -285,7 +288,9 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
         : {}),
     });
 
-    const requireSession = (threadId: ThreadId) => {
+    const requireSession = (
+      threadId: ThreadId,
+    ): Effect.Effect<CommandCodeSessionContext, ProviderAdapterSessionNotFoundError> => {
       const context = sessions.get(threadId);
       return context
         ? Effect.succeed(context)
@@ -324,7 +329,7 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
     ): void => {
       if (active.settled || active.failure) return;
       active.failure = error;
-      void teardownChildProcessTree(active.child, teardown)
+      void teardownProcess(active.child)
         .catch(() => undefined)
         .then(() => finishTurn(context, active, null, null, error));
     };
@@ -421,7 +426,7 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
       if (turn && active.output) {
         turn.items.push({ type: "assistant_message", text: active.output });
       }
-      if (context.active === active) context.active = undefined;
+      if (context.active === active) delete context.active;
       context.session = snapshotSession(context);
     };
 
@@ -454,9 +459,10 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
         if (existing) {
           existing.stopped = true;
           sessions.delete(input.threadId);
-          if (existing.active) {
-            existing.active.interrupted = true;
-            yield* Effect.promise(() => teardownChildProcessTree(existing.active.child, teardown));
+          const active = existing.active;
+          if (active) {
+            active.interrupted = true;
+            yield* Effect.promise(() => teardownProcess(active.child));
           }
         }
         const session: ProviderSession = {
@@ -680,7 +686,7 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
         const active = context.active;
         if (!active || (turnId && active.turnId !== turnId)) return;
         active.interrupted = true;
-        yield* Effect.promise(() => teardownChildProcessTree(active.child, teardown));
+        yield* Effect.promise(() => teardownProcess(active.child));
       });
 
     const stopSession: CommandCodeAdapterShape["stopSession"] = (threadId) =>
@@ -691,7 +697,7 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
         const active = context.active;
         if (active) {
           active.interrupted = true;
-          yield* Effect.promise(() => teardownChildProcessTree(active.child, teardown));
+          yield* Effect.promise(() => teardownProcess(active.child));
         }
         offerEvent({
           ...eventBase(context),
@@ -759,7 +765,7 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
             };
             const terminate = (error: Error): void => {
               if (settled) return;
-              void teardownChildProcessTree(child, teardown)
+              void teardownProcess(child)
                 .catch(() => undefined)
                 .then(() => finish(error));
             };
@@ -827,6 +833,7 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
 
     yield* Effect.addFinalizer(() =>
       stopAll().pipe(
+        Effect.ignore,
         Effect.ensuring(options?.nativeEventLogger?.close() ?? Effect.void),
         Effect.ensuring(Queue.shutdown(runtimeEventQueue)),
       ),

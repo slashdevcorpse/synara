@@ -16,7 +16,11 @@ import {
   makeCommandCodeAdapterLive,
   parseCommandCodeModelList,
   parseCommandCodeSessionLine,
+  type CommandCodeAdapterLiveOptions,
 } from "./CommandCodeAdapter.ts";
+
+type SpawnProcess = NonNullable<CommandCodeAdapterLiveOptions["spawnProcess"]>;
+type SpawnProcessMock = ReturnType<typeof vi.fn<SpawnProcess>>;
 
 interface MockChild {
   readonly child: ChildProcess;
@@ -37,9 +41,6 @@ function makeMockChild(): MockChild {
     stdin,
     stdout,
     stderr,
-    error(cause) {
-      emitter.emit("error", cause);
-    },
     exitCode: null,
     signalCode: null,
     killed: false,
@@ -50,6 +51,9 @@ function makeMockChild(): MockChild {
     stdin,
     stdout,
     stderr,
+    error(cause) {
+      emitter.emit("error", cause);
+    },
     close(code, signal = null) {
       Object.assign(emitter, { exitCode: code, signalCode: signal });
       emitter.emit("close", code, signal);
@@ -59,11 +63,11 @@ function makeMockChild(): MockChild {
 
 function adapterLayer(input: {
   readonly child: MockChild;
-  readonly spawnProcess?: ReturnType<typeof vi.fn>;
+  readonly spawnProcess?: SpawnProcessMock;
   readonly teardownProcessTree?: (child: ChildProcess) => Promise<unknown>;
   readonly resolveExecutable?: (command: string) => string;
 }) {
-  const spawnProcess = input.spawnProcess ?? vi.fn(() => input.child.child);
+  const spawnProcess = input.spawnProcess ?? vi.fn<SpawnProcess>(() => input.child.child);
   return {
     spawnProcess,
     layer: makeCommandCodeAdapterLive({
@@ -190,7 +194,7 @@ it.effect("spawns only on send, uses Windows-safe argv, resumes, and projects fi
       const mock = makeMockChild();
       const resumedMock = makeMockChild();
       const children = [mock, resumedMock];
-      const spawnProcess = vi.fn(() => children.shift()!.child);
+      const spawnProcess = vi.fn<SpawnProcess>(() => children.shift()!.child);
       const teardownProcessTree = async (child: ChildProcess) => {
         if (child === mock.child && mock.child.exitCode === null) mock.close(130);
         if (child === resumedMock.child && resumedMock.child.exitCode === null) {

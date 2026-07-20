@@ -1077,21 +1077,18 @@ export function parseCommandCodeStatusJson(stdout: string): CommandCodeStatusJso
     if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
     const record = value as Record<string, unknown>;
     if (typeof record.authenticated !== "boolean") return undefined;
+    const version = optionalJsonString(record, "version");
+    const error = optionalJsonString(record, "error");
+    const user = optionalJsonString(record, "user");
+    const provider = optionalJsonString(record, "provider");
+    const model = optionalJsonString(record, "model");
     return {
       authenticated: record.authenticated,
-      ...(optionalJsonString(record, "version")
-        ? { version: optionalJsonString(record, "version") }
-        : {}),
-      ...(optionalJsonString(record, "error")
-        ? { error: optionalJsonString(record, "error") }
-        : {}),
-      ...(optionalJsonString(record, "user") ? { user: optionalJsonString(record, "user") } : {}),
-      ...(optionalJsonString(record, "provider")
-        ? { provider: optionalJsonString(record, "provider") }
-        : {}),
-      ...(optionalJsonString(record, "model")
-        ? { model: optionalJsonString(record, "model") }
-        : {}),
+      ...(version ? { version } : {}),
+      ...(error ? { error } : {}),
+      ...(user ? { user } : {}),
+      ...(provider ? { provider } : {}),
+      ...(model ? { model } : {}),
     };
   } catch {
     return undefined;
