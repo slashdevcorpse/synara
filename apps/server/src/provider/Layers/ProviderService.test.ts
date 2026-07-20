@@ -701,6 +701,7 @@ it.effect(
 
       const crashedThreadId = asThreadId("thread-crash-orphaned");
       const startingThreadId = asThreadId("thread-starting-crash-orphaned");
+      const unregisteredThreadId = asThreadId("thread-unregistered-provider-crash-orphaned");
       const liveThreadId = asThreadId("thread-live-during-service-construction");
       const stoppedThreadId = asThreadId("thread-already-stopped");
       const errorThreadId = asThreadId("thread-already-error");
@@ -744,6 +745,21 @@ it.effect(
           cwd: "/tmp/project-starting-before-crash",
           activeTurnId: "turn-starting-before-crash",
           retainedMetadata: { source: "starting-force-kill-fixture" },
+        },
+      };
+      const unregisteredRuntime = {
+        threadId: unregisteredThreadId,
+        providerName: "claudeAgent",
+        adapterKey: "claudeAgent-before-crash",
+        runtimeMode: "approval-required" as const,
+        status: "running" as const,
+        lifecycleGeneration: "generation-removed-provider-before-crash",
+        lastSeenAt: "2026-07-20T12:00:45.000Z",
+        resumeCursor: { threadId: "removed-provider-thread-before-crash" },
+        runtimePayload: {
+          cwd: "/tmp/project-removed-provider-before-crash",
+          activeTurnId: "turn-removed-provider-before-crash",
+          retainedMetadata: { source: "removed-provider-force-kill-fixture" },
         },
       };
       const liveRuntime = {
@@ -797,6 +813,7 @@ it.effect(
         const repository = yield* ProviderSessionRuntimeRepository;
         yield* repository.upsert(crashedRuntime);
         yield* repository.upsert(startingRuntime);
+        yield* repository.upsert(unregisteredRuntime);
         yield* repository.upsert(liveRuntime);
         yield* repository.upsert(stoppedRuntime);
         yield* repository.upsert(errorRuntime);
@@ -860,6 +877,38 @@ it.effect(
           startingRuntime.runtimePayload.retainedMetadata,
         );
         assert.equal(normalizedStartingPayload.lastRuntimeEvent, "provider.startupCrashRecovery");
+
+        const normalizedUnregistered = yield* repository.getByThreadId({
+          threadId: unregisteredThreadId,
+        });
+        if (Option.isNone(normalizedUnregistered)) {
+          assert.fail("Expected the unregistered-provider crash orphan to remain persisted");
+        }
+        assert.equal(normalizedUnregistered.value.providerName, unregisteredRuntime.providerName);
+        assert.equal(normalizedUnregistered.value.adapterKey, unregisteredRuntime.adapterKey);
+        assert.equal(normalizedUnregistered.value.runtimeMode, unregisteredRuntime.runtimeMode);
+        assert.equal(normalizedUnregistered.value.status, "stopped");
+        assert.equal(
+          normalizedUnregistered.value.lifecycleGeneration,
+          unregisteredRuntime.lifecycleGeneration,
+        );
+        assert.deepEqual(
+          normalizedUnregistered.value.resumeCursor,
+          unregisteredRuntime.resumeCursor,
+        );
+        const normalizedUnregisteredPayload = asRuntimePayloadRecord(
+          normalizedUnregistered.value.runtimePayload,
+        );
+        assert.equal(normalizedUnregisteredPayload.cwd, unregisteredRuntime.runtimePayload.cwd);
+        assert.equal(normalizedUnregisteredPayload.activeTurnId, null);
+        assert.deepEqual(
+          normalizedUnregisteredPayload.retainedMetadata,
+          unregisteredRuntime.runtimePayload.retainedMetadata,
+        );
+        assert.equal(
+          normalizedUnregisteredPayload.lastRuntimeEvent,
+          "provider.startupCrashRecovery",
+        );
 
         const liveAfterStartup = yield* repository.getByThreadId({ threadId: liveThreadId });
         const stoppedAfterStartup = yield* repository.getByThreadId({ threadId: stoppedThreadId });

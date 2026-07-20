@@ -143,6 +143,11 @@ describe("desktop window lifecycle integration", () => {
     );
     expect(openPath).toContain("ensureInitialBackendWindowOpen(baseUrl)");
     expect(openPath).toContain("waitForBackendWindowReady(baseUrl)");
+    expect(openPath).toContain("let readinessAborted = false;");
+    expect(openPath).toContain("readinessAborted = true;");
+    expect(openPath).toContain(
+      "if (!readinessAborted && !getExistingDesktopMainWindow() && !isQuitting)",
+    );
     expect(openPath).not.toContain("beginAutomaticBackendStart");
   });
 

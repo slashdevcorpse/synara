@@ -20,6 +20,7 @@ import {
 } from "./smoke-test-lifecycle.mjs";
 
 const FIXTURE_TIMEOUT_MS = 60_000;
+export const DESKTOP_PERSISTENCE_SMOKE_DIAGNOSTIC_TAIL_CHARS = 64 * 1024;
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const desktopDir = resolve(__dirname, "..");
@@ -42,12 +43,51 @@ function requireFile(path, description) {
   }
 }
 
-function appendCommandOutput(state, chunk) {
-  state.output += chunk.toString();
+export function createDesktopPersistenceSmokeOutputState() {
+  return {
+    output: "",
+    outputTruncated: false,
+    patternScanTail: "",
+    observedPatterns: new Set(),
+  };
 }
 
-function commandFailureMessage(description, detail, output) {
-  return `${description} ${detail}.${output.length === 0 ? "" : `\nCaptured output:\n${output}`}`;
+export function appendDesktopPersistenceSmokeOutput(state, chunk, patterns = []) {
+  const text = chunk.toString();
+  const maxPatternLength = patterns.reduce(
+    (maximum, pattern) => Math.max(maximum, pattern.length),
+    0,
+  );
+  if (maxPatternLength > 0) {
+    const scanText = state.patternScanTail + text;
+    for (const pattern of patterns) {
+      if (scanText.includes(pattern)) state.observedPatterns.add(pattern);
+    }
+    state.patternScanTail = maxPatternLength === 1 ? "" : scanText.slice(-(maxPatternLength - 1));
+  }
+
+  const combinedLength = state.output.length + text.length;
+  if (combinedLength > DESKTOP_PERSISTENCE_SMOKE_DIAGNOSTIC_TAIL_CHARS) {
+    state.outputTruncated = true;
+  }
+  if (text.length >= DESKTOP_PERSISTENCE_SMOKE_DIAGNOSTIC_TAIL_CHARS) {
+    state.output = text.slice(-DESKTOP_PERSISTENCE_SMOKE_DIAGNOSTIC_TAIL_CHARS);
+    return;
+  }
+  const retainedPrefixChars = DESKTOP_PERSISTENCE_SMOKE_DIAGNOSTIC_TAIL_CHARS - text.length;
+  state.output = state.output.slice(-retainedPrefixChars) + text;
+}
+
+function capturedOutputSuffix(state) {
+  if (state.output.length === 0) return "";
+  const truncationNotice = state.outputTruncated
+    ? `[output truncated; showing final ${DESKTOP_PERSISTENCE_SMOKE_DIAGNOSTIC_TAIL_CHARS} characters]\n`
+    : "";
+  return `\nCaptured output:\n${truncationNotice}${state.output}`;
+}
+
+function commandFailureMessage(description, detail, state) {
+  return `${description} ${detail}.${capturedOutputSuffix(state)}`;
 }
 
 function runBoundedCommand({ command, args, cwd, env, description, timeoutMs }) {
@@ -65,7 +105,7 @@ function runBoundedCommand({ command, args, cwd, env, description, timeoutMs }) 
       return;
     }
 
-    const state = { output: "" };
+    const state = createDesktopPersistenceSmokeOutputState();
     let settled = false;
     const timeout = setTimeout(() => {
       if (settled) return;
@@ -76,22 +116,18 @@ function runBoundedCommand({ command, args, cwd, env, description, timeoutMs }) 
         // The bounded command failure remains authoritative; cleanup is best-effort.
       }
       rejectCommand(
-        new Error(
-          commandFailureMessage(description, `timed out after ${timeoutMs}ms`, state.output),
-        ),
+        new Error(commandFailureMessage(description, `timed out after ${timeoutMs}ms`, state)),
       );
     }, timeoutMs);
 
-    child.stdout?.on("data", (chunk) => appendCommandOutput(state, chunk));
-    child.stderr?.on("data", (chunk) => appendCommandOutput(state, chunk));
+    child.stdout?.on("data", (chunk) => appendDesktopPersistenceSmokeOutput(state, chunk));
+    child.stderr?.on("data", (chunk) => appendDesktopPersistenceSmokeOutput(state, chunk));
     child.on("error", (error) => {
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
       rejectCommand(
-        new Error(
-          commandFailureMessage(description, `failed to run: ${error.message}`, state.output),
-        ),
+        new Error(commandFailureMessage(description, `failed to run: ${error.message}`, state)),
       );
     });
     child.on("close", (code, signal) => {
@@ -104,7 +140,7 @@ function runBoundedCommand({ command, args, cwd, env, description, timeoutMs }) 
             commandFailureMessage(
               description,
               `failed (code=${code ?? "null"}, signal=${signal ?? "null"})`,
-              state.output,
+              state,
             ),
           ),
         );
@@ -124,7 +160,7 @@ function capturedProcessFailure(launch) {
     return `${launch.description} process error: ${launch.processError.message}`;
   }
   const fatalPattern = DESKTOP_SMOKE_FATAL_PATTERNS.find((pattern) =>
-    launch.output.includes(pattern),
+    launch.observedPatterns.has(pattern),
   );
   return fatalPattern === undefined
     ? null
@@ -134,9 +170,7 @@ function capturedProcessFailure(launch) {
 function assertHealthyOutput(launch) {
   const failure = capturedProcessFailure(launch);
   if (failure === null) return;
-  throw new Error(
-    `${failure}${launch.output.length === 0 ? "" : `\nCaptured output:\n${launch.output}`}`,
-  );
+  throw new Error(`${failure}${capturedOutputSuffix(launch)}`);
 }
 
 function formatFailure(error) {
@@ -170,6 +204,7 @@ async function main() {
   });
   const desktopEnvironment = profileIsolation.environment;
   const profileEvidence = desktopPersistenceSmokeUserDataEvidence(profileIsolation.userDataPath);
+  const launchOutputPatterns = [profileEvidence, ...DESKTOP_SMOKE_FATAL_PATTERNS];
   const profilePreparation = ensureDesktopPersistenceSmokeHome(profileIsolation.userDataPath);
   const canonicalUserDataPath = realpathSync(profileIsolation.userDataPath);
   validateDesktopPersistenceSmokeProfileIsolation({
@@ -214,11 +249,11 @@ async function main() {
     const launch = {
       child,
       description,
-      output: "",
+      ...createDesktopPersistenceSmokeOutputState(),
       processError: null,
     };
     const appendOutput = (chunk) => {
-      launch.output += chunk.toString();
+      appendDesktopPersistenceSmokeOutput(launch, chunk, launchOutputPatterns);
     };
     child.stdout?.on("data", appendOutput);
     child.stderr?.on("data", appendOutput);
@@ -235,7 +270,7 @@ async function main() {
       timeoutMs: DESKTOP_PERSISTENCE_SMOKE_READINESS_MS,
       initialOutput: launch.output,
     });
-    if (!launch.output.includes(profileEvidence)) {
+    if (!launch.observedPatterns.has(profileEvidence)) {
       throw new Error(
         `${launch.description} did not prove isolated Electron userData '${profileIsolation.userDataPath}'.`,
       );
@@ -255,9 +290,7 @@ async function main() {
       });
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
-      throw new Error(
-        `${detail}${launch.output.length === 0 ? "" : `\nCaptured output:\n${launch.output}`}`,
-      );
+      throw new Error(`${detail}${capturedOutputSuffix(launch)}`);
     }
     assertHealthyOutput(launch);
     console.log(
@@ -289,10 +322,12 @@ async function main() {
   console.log("Desktop two-launch session persistence smoke passed.");
 }
 
-try {
-  await main();
-} catch (error) {
-  console.error("\nDesktop two-launch session persistence smoke failed:");
-  console.error(formatFailure(error));
-  process.exitCode = 1;
+if (import.meta.main) {
+  try {
+    await main();
+  } catch (error) {
+    console.error("\nDesktop two-launch session persistence smoke failed:");
+    console.error(formatFailure(error));
+    process.exitCode = 1;
+  }
 }

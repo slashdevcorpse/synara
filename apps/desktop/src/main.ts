@@ -1724,12 +1724,14 @@ function openDesktopMainWindowAgainstCurrentBackend(
   }
 
   let readinessWarning = false;
+  let readinessAborted = false;
   const nextOpen = waitForBackendWindowReady(baseUrl)
     .then((source) => {
       writeDesktopLogHeader(`${reason} backend ready source=${source}`);
     })
     .catch((error) => {
       if (isBackendReadinessAborted(error)) {
+        readinessAborted = true;
         return;
       }
       readinessWarning = true;
@@ -1742,7 +1744,7 @@ function openDesktopMainWindowAgainstCurrentBackend(
       if (developmentMainWindowOpenInFlight === nextOpen) {
         developmentMainWindowOpenInFlight = null;
       }
-      if (!getExistingDesktopMainWindow() && !isQuitting) {
+      if (!readinessAborted && !getExistingDesktopMainWindow() && !isQuitting) {
         mainWindow = createWindow();
         writeDesktopLogHeader(
           reason === "bootstrap" && readinessWarning

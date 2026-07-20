@@ -53,6 +53,11 @@ const windowsPersistenceHome = "${{ runner.temp }}\\super-synara-persistence-win
 const windowsStartupHome = "${{ runner.temp }}\\super-synara-ci-home";
 const macosPersistenceHome = "${{ runner.temp }}/super-synara-persistence-macos-home";
 const macosStartupHome = "${{ runner.temp }}/super-synara-ci-home";
+const nativeDesktopBuildStep = [
+  "      - env:",
+  "          SYNARA_DESKTOP_FLAVOR: super",
+  "        run: bun run build:desktop",
+].join("\n");
 const windowsPersistenceSmokeStep = [
   "      - name: Verify two-launch desktop persistence",
   "        timeout-minutes: 5",
@@ -112,7 +117,7 @@ jobs:
       - run: bun run --cwd apps/desktop test src/desktopMigrationRecovery.test.ts src/desktopStorageMigration.test.ts src/windowState.test.ts src/updateState.test.ts
       - run: bun run --cwd scripts test check-brand-identity.test.ts verify-packaged-desktop-startup.test.ts lib/desktop-artifact-policy.test.ts lib/windows-authenticode.test.ts lib/windows-installer-qualification.test.ts lib/release-artifact-provenance.test.ts lib/super-synara-release-admission.test.ts lib/super-synara-workflow-contract.test.ts
       - run: node scripts/verify-workflow-contracts.ts
-      - run: bun run build:desktop
+${nativeDesktopBuildStep}
 ${windowsPersistenceSmokeStep}
 ${windowsStartupSmokeStep}
   macos_arm64:
@@ -122,7 +127,7 @@ ${windowsStartupSmokeStep}
       - run: bun run brand:check
       - run: node scripts/node-pty-smoke.mjs
       - run: bun run --cwd apps/desktop test
-      - run: bun run build:desktop
+${nativeDesktopBuildStep}
 ${macosPersistenceSmokeStep}
 ${macosStartupSmokeStep}
   release_smoke:
@@ -297,10 +302,7 @@ describe("workflow contracts", () => {
       ".github/workflows/ci.yml",
       ciWorkflow
         .replace(gate, "")
-        .replace(
-          "      - run: bun run build:desktop\n",
-          `      - run: bun run build:desktop\n${gate}`,
-        ),
+        .replace(`${nativeDesktopBuildStep}\n`, `${nativeDesktopBuildStep}\n${gate}`),
     );
     expect(validateWorkflowContracts(reorderedGate, policy()).join("\n")).toContain(
       "native gate must run before the desktop build",
@@ -331,8 +333,11 @@ describe("workflow contracts", () => {
     nonFailingBuild.set(
       ".github/workflows/ci.yml",
       ciWorkflow.replace(
-        "      - run: bun run build:desktop\n",
-        "      - run: bun run build:desktop\n        continue-on-error: true\n",
+        nativeDesktopBuildStep,
+        nativeDesktopBuildStep.replace(
+          "        run: bun run build:desktop",
+          "        continue-on-error: true\n        run: bun run build:desktop",
+        ),
       ),
     );
     expect(validateWorkflowContracts(nonFailingBuild, policy()).join("\n")).toContain(
@@ -393,8 +398,8 @@ describe("workflow contracts", () => {
       ciWorkflow
         .replace(`${windowsStartupSmokeStep}\n`, "")
         .replace(
-          "      - run: bun run build:desktop\n",
-          `${windowsStartupSmokeStep}\n      - run: bun run build:desktop\n`,
+          `${nativeDesktopBuildStep}\n`,
+          `${windowsStartupSmokeStep}\n${nativeDesktopBuildStep}\n`,
         ),
     );
     expect(validateWorkflowContracts(earlySmoke, policy()).join("\n")).toContain(
@@ -445,8 +450,8 @@ describe("workflow contracts", () => {
     preBuildSmoke.set(
       ".github/workflows/ci.yml",
       ciWorkflow.replace(
-        `      - run: bun run build:desktop\n${windowsPersistenceSmokeStep}`,
-        `${windowsPersistenceSmokeStep}\n      - run: bun run build:desktop`,
+        `${nativeDesktopBuildStep}\n${windowsPersistenceSmokeStep}`,
+        `${windowsPersistenceSmokeStep}\n${nativeDesktopBuildStep}`,
       ),
     );
     expect(validateWorkflowContracts(preBuildSmoke, policy()).join("\n")).toContain(
@@ -487,6 +492,21 @@ describe("workflow contracts", () => {
   });
 
   it("requires Super flavor and updates disabled for desktop persistence smoke", () => {
+    const wrongBuildFlavor = validFiles();
+    wrongBuildFlavor.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace(
+        nativeDesktopBuildStep,
+        nativeDesktopBuildStep.replace(
+          "          SYNARA_DESKTOP_FLAVOR: super",
+          "          SYNARA_DESKTOP_FLAVOR: production",
+        ),
+      ),
+    );
+    expect(validateWorkflowContracts(wrongBuildFlavor, policy()).join("\n")).toContain(
+      "windows_x64 desktop build must set SYNARA_DESKTOP_FLAVOR to super",
+    );
+
     const wrongFlavor = validFiles();
     wrongFlavor.set(
       ".github/workflows/ci.yml",

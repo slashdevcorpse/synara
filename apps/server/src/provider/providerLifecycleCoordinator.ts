@@ -67,6 +67,17 @@ export function makeProviderLifecycleCoordinator(): ProviderLifecycleCoordinator
         );
     });
 
+  const restorePreviousGeneration = (
+    threadId: ThreadId,
+    previousGeneration: string | undefined,
+  ): void => {
+    if (previousGeneration === undefined) {
+      currentGenerations.delete(threadId);
+    } else {
+      currentGenerations.set(threadId, previousGeneration);
+    }
+  };
+
   const run: ProviderLifecycleCoordinator["run"] = (threadId, operation) =>
     withThreadLock(
       threadId,
@@ -91,13 +102,7 @@ export function makeProviderLifecycleCoordinator(): ProviderLifecycleCoordinator
         }).pipe(
           Effect.onExit((exit) =>
             Exit.isFailure(exit) && isCurrent()
-              ? Effect.sync(() => {
-                  if (previousGeneration === undefined) {
-                    currentGenerations.delete(threadId);
-                  } else {
-                    currentGenerations.set(threadId, previousGeneration);
-                  }
-                })
+              ? Effect.sync(() => restorePreviousGeneration(threadId, previousGeneration))
               : Effect.void,
           ),
         );
@@ -127,13 +132,7 @@ export function makeProviderLifecycleCoordinator(): ProviderLifecycleCoordinator
         }).pipe(
           Effect.onExit((exit) =>
             Exit.isFailure(exit) && advancedGeneration !== undefined && isCurrent()
-              ? Effect.sync(() => {
-                  if (previousGeneration === undefined) {
-                    currentGenerations.delete(threadId);
-                  } else {
-                    currentGenerations.set(threadId, previousGeneration);
-                  }
-                })
+              ? Effect.sync(() => restorePreviousGeneration(threadId, previousGeneration))
               : Effect.void,
           ),
         );

@@ -319,21 +319,25 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
             cause: Cause.pretty(adapterExit.cause),
           },
         );
-        continue;
-      }
-
-      const hasLiveSessionExit = yield* Effect.exit(adapterExit.value.hasSession(binding.threadId));
-      if (Exit.isFailure(hasLiveSessionExit)) {
-        yield* Effect.logWarning("provider startup recovery could not inspect persisted session", {
-          threadId: binding.threadId,
-          provider: binding.provider,
-          persistedStatus: binding.status,
-          cause: Cause.pretty(hasLiveSessionExit.cause),
-        });
-        continue;
-      }
-      if (hasLiveSessionExit.value) {
-        continue;
+      } else {
+        const hasLiveSessionExit = yield* Effect.exit(
+          adapterExit.value.hasSession(binding.threadId),
+        );
+        if (Exit.isFailure(hasLiveSessionExit)) {
+          yield* Effect.logWarning(
+            "provider startup recovery could not inspect persisted session",
+            {
+              threadId: binding.threadId,
+              provider: binding.provider,
+              persistedStatus: binding.status,
+              cause: Cause.pretty(hasLiveSessionExit.cause),
+            },
+          );
+          continue;
+        }
+        if (hasLiveSessionExit.value) {
+          continue;
+        }
       }
 
       const recoveredAt = new Date().toISOString();

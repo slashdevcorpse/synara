@@ -235,6 +235,11 @@ function validateNativePersistenceSmoke(
   if (buildStep && smokeStep.index <= buildStep.index) {
     errors.push(`${workflowPath} ${jobName} desktop persistence smoke must run after the build.`);
   }
+  if (buildStep && workflowStepEnvironmentValue(buildStep, "SYNARA_DESKTOP_FLAVOR") !== "super") {
+    errors.push(
+      `${workflowPath} ${jobName} desktop build must set SYNARA_DESKTOP_FLAVOR to super.`,
+    );
+  }
   if (
     smokeStep.condition !== undefined ||
     (smokeStep.continueOnError !== undefined && smokeStep.continueOnError !== false)
