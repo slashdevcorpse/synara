@@ -50,6 +50,7 @@ import {
   STUDIO_WORKSPACE_SUBDIRECTORIES,
 } from "./studioWorkspaceScaffold";
 import { DevServerManager, findProjectDevServerForLocalServer } from "./devServerManager";
+import { makeEditorAvailability, type EditorAvailabilitySnapshot } from "./editorAvailability";
 import { GitCore } from "./git/Services/GitCore";
 import { GitManager } from "./git/Services/GitManager";
 import { GitHubCliError } from "./git/Errors";
@@ -70,7 +71,7 @@ import {
   CurrentManagedAttachmentPrincipal,
   LOCAL_LOOPBACK_ATTACHMENT_PRINCIPAL,
 } from "./managedAttachmentPrincipal";
-import { Open, resolveAvailableEditors } from "./open";
+import { Open } from "./open";
 import { makeDispatchCommandNormalizer } from "./orchestration/dispatchCommandNormalization";
 import { makeImportThreadHandler } from "./orchestration/importThreadRoute";
 import { OrchestrationEngineService } from "./orchestration/Services/OrchestrationEngine";
@@ -232,6 +233,25 @@ const failLiveUiStreamForSnapshotResync = (report: LiveUiStreamDropReport) =>
     }),
   );
 
+export function makeEditorAvailabilityConfigUpdateStream<E, R>(
+  changes: Stream.Stream<EditorAvailabilitySnapshot, E, R>,
+  afterRevision: number,
+): Stream.Stream<ServerConfigStreamEvent, E, R> {
+  return changes.pipe(
+    Stream.filter((snapshot) => snapshot.revision > afterRevision),
+    Stream.map(
+      (snapshot): ServerConfigStreamEvent => ({
+        type: "configUpdated",
+        payload: {
+          issues: [],
+          providers: [],
+          availableEditors: snapshot.availableEditors,
+        },
+      }),
+    ),
+  );
+}
+
 // Must mirror the cases of toShellStreamEvent: events rejected here are dropped
 // before the live-UI buffer so the sliding window only holds events that can
 // actually project to a shell update.
@@ -302,6 +322,7 @@ const makeWsRpcHandlersLayer = () =>
       const workspaceEntries = yield* WorkspaceEntries;
       const workspaceFileSystem = yield* WorkspaceFileSystem;
       const streamAdmission = yield* makeWsStreamAdmission;
+      const editorAvailability = yield* makeEditorAvailability();
 
       const isGlobalGitHubCliError = (error: unknown): error is GitHubCliError =>
         error instanceof GitHubCliError &&
@@ -498,22 +519,29 @@ const makeWsRpcHandlersLayer = () =>
         return result;
       });
 
-      const loadServerConfig = Effect.gen(function* () {
+      const loadServerConfigSnapshot = Effect.gen(function* () {
         const keybindingsConfig = yield* keybindings.loadConfigState;
         const providerStatuses = yield* providerHealth.getStatuses;
+        const editorSnapshot = yield* editorAvailability.getSnapshotAndSchedule;
         return {
-          cwd: config.cwd,
-          homeDir: config.homeDir,
-          chatWorkspaceRoot: config.chatWorkspaceRoot,
-          studioWorkspaceRoot: config.studioWorkspaceRoot,
-          worktreesDir: config.worktreesDir,
-          keybindingsConfigPath: config.keybindingsConfigPath,
-          keybindings: keybindingsConfig.keybindings,
-          issues: keybindingsConfig.issues,
-          providers: providerStatuses,
-          availableEditors: resolveAvailableEditors(),
+          config: {
+            cwd: config.cwd,
+            homeDir: config.homeDir,
+            chatWorkspaceRoot: config.chatWorkspaceRoot,
+            studioWorkspaceRoot: config.studioWorkspaceRoot,
+            worktreesDir: config.worktreesDir,
+            keybindingsConfigPath: config.keybindingsConfigPath,
+            keybindings: keybindingsConfig.keybindings,
+            issues: keybindingsConfig.issues,
+            providers: providerStatuses,
+            availableEditors: editorSnapshot.availableEditors,
+          },
+          editorRevision: editorSnapshot.revision,
         };
       });
+      const loadServerConfig = loadServerConfigSnapshot.pipe(
+        Effect.map((snapshot) => snapshot.config),
+      );
 
       const refreshGitStatusAfter = <A, E, R>(cwd: string, effect: Effect.Effect<A, E, R>) =>
         effect.pipe(
@@ -1286,45 +1314,54 @@ const makeWsRpcHandlersLayer = () =>
           streamAdmission.guard(
             clientId,
             { key: "server.config" },
-            Stream.concat(
-              Stream.fromEffect(
-                loadServerConfig.pipe(
-                  Effect.map(
-                    (config): ServerConfigStreamEvent => ({
-                      type: "snapshot" as const,
-                      config,
+            Stream.unwrap(
+              loadServerConfigSnapshot.pipe(
+                Effect.map(({ config: initialConfig, editorRevision }) =>
+                  Stream.concat(
+                    Stream.succeed<ServerConfigStreamEvent>({
+                      type: "snapshot",
+                      config: initialConfig,
                     }),
-                  ),
-                ),
-              ),
-              Stream.merge(
-                bufferLiveUiStream(keybindings.streamChanges, {
-                  label: "server.keybindings",
-                  onDroppedEvents: failLiveUiStreamForSnapshotResync,
-                }).pipe(
-                  Stream.map((event) => ({
-                    type: "configUpdated" as const,
-                    payload: { issues: event.issues, providers: [] },
-                  })),
-                ),
-                Stream.merge(
-                  bufferLiveUiStream(providerHealth.streamChanges, {
-                    label: "server.provider-statuses",
-                    onDroppedEvents: failLiveUiStreamForSnapshotResync,
-                  }).pipe(
-                    Stream.map((providers) => ({
-                      type: "providerStatuses" as const,
-                      payload: { providers },
-                    })),
-                  ),
-                  bufferLiveUiStream(serverSettings.streamViews, {
-                    label: "server.settings",
-                    onDroppedEvents: failLiveUiStreamForSnapshotResync,
-                  }).pipe(
-                    Stream.map((settings) => ({
-                      type: "settingsUpdated" as const,
-                      payload: { settings },
-                    })),
+                    Stream.merge(
+                      bufferLiveUiStream(keybindings.streamChanges, {
+                        label: "server.keybindings",
+                        onDroppedEvents: failLiveUiStreamForSnapshotResync,
+                      }).pipe(
+                        Stream.map((event) => ({
+                          type: "configUpdated" as const,
+                          payload: { issues: event.issues, providers: [] },
+                        })),
+                      ),
+                      Stream.merge(
+                        bufferLiveUiStream(providerHealth.streamChanges, {
+                          label: "server.provider-statuses",
+                          onDroppedEvents: failLiveUiStreamForSnapshotResync,
+                        }).pipe(
+                          Stream.map((providers) => ({
+                            type: "providerStatuses" as const,
+                            payload: { providers },
+                          })),
+                        ),
+                        Stream.merge(
+                          bufferLiveUiStream(serverSettings.streamViews, {
+                            label: "server.settings",
+                            onDroppedEvents: failLiveUiStreamForSnapshotResync,
+                          }).pipe(
+                            Stream.map((settings) => ({
+                              type: "settingsUpdated" as const,
+                              payload: { settings },
+                            })),
+                          ),
+                          makeEditorAvailabilityConfigUpdateStream(
+                            bufferLiveUiStream(editorAvailability.streamChanges, {
+                              label: "server.editor-availability",
+                              onDroppedEvents: failLiveUiStreamForSnapshotResync,
+                            }),
+                            editorRevision,
+                          ),
+                        ),
+                      ),
+                    ),
                   ),
                 ),
               ),
