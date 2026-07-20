@@ -4,6 +4,7 @@ import { Cause, Effect, Layer, Stream } from "effect";
 
 import { ProfileStatsArchive } from "../../profileStatsArchive";
 import { ProviderService } from "../../provider/Services/ProviderService";
+import { removeIsolatedScratchWorkspace } from "../../scratchWorkspaces";
 import { TerminalManager } from "../../terminal/Services/Manager";
 import { THREAD_RETENTION_COMMAND_ID_PREFIX } from "../../threadRetention";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine";
@@ -182,6 +183,17 @@ const make = Effect.gen(function* () {
       });
       return;
     }
+    yield* Effect.tryPromise({
+      try: () => removeIsolatedScratchWorkspace(threadId),
+      catch: (cause) => cause,
+    }).pipe(
+      Effect.catch((cause) =>
+        Effect.logWarning("thread deletion cleanup could not remove scratch workspace", {
+          threadId,
+          cause: String(cause),
+        }),
+      ),
+    );
     yield* purgeThreadData(event);
   });
 

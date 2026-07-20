@@ -3,6 +3,8 @@
 // Layer: Provider runtime tests
 // Exports: Vitest suites for opencodeRuntime.ts
 
+import { pathToFileURL } from "node:url";
+
 import { Duration, Effect, Exit, Fiber, Layer, Scope, Sink, Stream } from "effect";
 import { ChildProcessSpawner } from "effect/unstable/process";
 import { TestClock } from "effect/testing";
@@ -101,6 +103,7 @@ function openCodeRuntimePoolTestLayer(state: {
   const processUrls = new Map<number, string>();
   return Layer.merge(
     makeOpenCodeRuntimeLive({
+      prepareProcess: (command, args) => ({ command, args: [...args], shell: false }),
       teardownProcessTree: async ({ rootPid }) => {
         const url = processUrls.get(rootPid);
         if (url) state.killUrls.push(url);
@@ -131,7 +134,7 @@ describe("toOpenCodeFileParts", () => {
         type: "file",
         mime: "image/png",
         filename: "screenshot.png",
-        url: "file:///tmp/synara-attachments/screenshot.png",
+        url: pathToFileURL("/tmp/synara-attachments/screenshot.png").href,
       },
     ]);
   });

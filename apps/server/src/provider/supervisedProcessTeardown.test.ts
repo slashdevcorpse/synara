@@ -124,4 +124,32 @@ describe("teardownProviderProcessTree", () => {
       remainingDescendantPids: [302],
     });
   });
+
+  it("fails closed when asynchronous descendant capture is incomplete", async () => {
+    const clock = deterministicClock();
+    const failure = await teardownProviderProcessTree(
+      {
+        rootPid: 401,
+        rootExited: Promise.resolve(),
+        termGraceMs: 5,
+        forceExitMs: 5,
+      },
+      {
+        processTreeKiller: {
+          capture: async () => ({ descendants: [], captureComplete: false }),
+          inspect: async () => ({ verified: true, survivors: [] }),
+          signal: async () => undefined,
+        },
+        ...clock,
+      },
+    ).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(ProviderProcessExitUnprovenError);
+    expect(failure).toMatchObject({
+      rootPid: 401,
+      rootExited: true,
+      remainingDescendantPids: [],
+      captureComplete: false,
+    });
+  });
 });

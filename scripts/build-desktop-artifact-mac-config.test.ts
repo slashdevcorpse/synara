@@ -14,6 +14,9 @@ import {
   resolveMacNativeExclusions,
   validateDesktopNativeBuildHost,
   WINDOWS_INSTALLER_GUID,
+  WINDOWS_JOB_LAUNCHER_EXTRA_FILE_DESTINATION,
+  WINDOWS_JOB_LAUNCHER_EXECUTABLE,
+  windowsJobLauncherStagePath,
 } from "./lib/desktop-platform-build-config.ts";
 import { BRAND_ASSET_PATHS } from "./lib/brand-assets.ts";
 import { DESKTOP_BUILD_ARCHES } from "./lib/desktop-build-options.ts";
@@ -140,7 +143,21 @@ describe("createDesktopPlatformBuildConfig", () => {
 
     assert.equal(win.mac, undefined);
     assert.equal(win.files, undefined);
-    assert.equal(win.extraFiles, undefined);
+    assert.equal(WINDOWS_JOB_LAUNCHER_EXECUTABLE, "synara-windows-job-launcher.exe");
+    assert.equal(
+      WINDOWS_JOB_LAUNCHER_EXTRA_FILE_DESTINATION,
+      "resources/synara-native/synara-windows-job-launcher.exe",
+    );
+    assert.equal(
+      windowsJobLauncherStagePath("x64"),
+      "apps/server/dist/native/win32-x64/synara-windows-job-launcher.exe",
+    );
+    assert.deepStrictEqual(win.extraFiles, [
+      {
+        from: "apps/server/dist/native/win32-x64/synara-windows-job-launcher.exe",
+        to: "resources/synara-native/synara-windows-job-launcher.exe",
+      },
+    ]);
     assert.deepStrictEqual(win.asarUnpack, ["node_modules/node-pty/**"]);
     assert.equal(WINDOWS_INSTALLER_GUID, "368107a8-afe6-5db5-ab3b-d4f331684868");
     assert.deepStrictEqual(win.nsis, {
@@ -209,6 +226,18 @@ describe("createDesktopPlatformBuildConfig", () => {
     });
 
     assert.ok(issue?.includes("Build linux/x64 on a matching Linux host"));
+  });
+
+  it("blocks unsupported universal Windows native builds", () => {
+    assert.equal(
+      validateDesktopNativeBuildHost({
+        platform: "win",
+        arch: "universal",
+        hostPlatform: "win32",
+        hostArch: "x64",
+      }),
+      "Windows desktop artifacts support x64 or arm64 builds, not universal builds.",
+    );
   });
 
   it("requires a macOS host for the native Swift AppSnap helper", () => {

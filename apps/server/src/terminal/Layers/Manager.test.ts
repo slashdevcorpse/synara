@@ -305,10 +305,15 @@ describe("TerminalManager", () => {
       executable: "C:\\Synara Test\\fake-shell.exe",
       args: [],
     };
+    const inertProcessTreeKiller: ProcessTreeKiller = {
+      capture: () => ({ descendants: [], captureComplete: true }),
+      signal: () => undefined,
+    };
     const commonOptions = {
       logsDir,
       ptyAdapter,
       historyLineLimit,
+      processTreeKiller: options.processTreeKiller ?? inertProcessTreeKiller,
       ...(options.shellEnvironment ? { shellEnvironment: options.shellEnvironment } : {}),
       ...(options.windowsShellSelectionDependencies
         ? { windowsShellSelectionDependencies: options.windowsShellSelectionDependencies }
@@ -318,7 +323,6 @@ describe("TerminalManager", () => {
       ...(options.windowsProcessSnapshotCollector
         ? { windowsProcessSnapshotCollector: options.windowsProcessSnapshotCollector }
         : {}),
-      ...(options.processTreeKiller ? { processTreeKiller: options.processTreeKiller } : {}),
       ...(options.subprocessPollIntervalMs
         ? { subprocessPollIntervalMs: options.subprocessPollIntervalMs }
         : {}),
@@ -353,6 +357,121 @@ describe("TerminalManager", () => {
               });
     return { logsDir, ptyAdapter, manager };
   }
+
+  it("captures an exited recovery snapshot without relaunching a dropped exit", async () => {
+    const { manager, ptyAdapter } = makeManager();
+    const events: TerminalEvent[] = [];
+    manager.on("event", (event) => events.push(event));
+    await manager.open(openInput());
+    const process = ptyAdapter.processes[0];
+    if (!process) throw new Error("missing fake PTY");
+
+    process.emitData("final output\n");
+    process.emitExit({ exitCode: 7, signal: 9 });
+    const recovery = await manager.recoverySnapshot({ threadId: "thread-1" });
+
+    expect(ptyAdapter.spawnInputs).toHaveLength(1);
+    expect(recovery.snapshot).toMatchObject({
+      status: "exited",
+      pid: null,
+      history: "final output\n",
+      exitCode: 7,
+      exitSignal: 9,
+    });
+    expect(events.map((event) => [event.type, event.sequence])).toEqual([
+      ["started", 1],
+      ["output", 2],
+      ["exited", 3],
+    ]);
+    expect(recovery.watermark).toBe(3);
+    expect(recovery.generation).toBe(manager.generation);
+    manager.dispose();
+  });
+
+  it("starts a fresh event generation and sequence namespace after server restart", async () => {
+    const first = makeManager();
+    const firstEvents: TerminalEvent[] = [];
+    first.manager.on("event", (event) => firstEvents.push(event));
+    await first.manager.open(openInput());
+
+    const second = makeManager();
+    const secondEvents: TerminalEvent[] = [];
+    second.manager.on("event", (event) => secondEvents.push(event));
+    await second.manager.open(openInput());
+
+    expect(second.manager.generation).not.toBe(first.manager.generation);
+    expect(firstEvents[0]).toMatchObject({
+      generation: first.manager.generation,
+      sequence: 1,
+    });
+    expect(secondEvents[0]).toMatchObject({
+      generation: second.manager.generation,
+      sequence: 1,
+    });
+    first.manager.dispose();
+    second.manager.dispose();
+  });
+
+  it("flushes through the watermark then atomically rebases ACK accounting", async () => {
+    const { manager, ptyAdapter } = makeManager();
+    const events: TerminalEvent[] = [];
+    manager.on("event", (event) => events.push(event));
+    await manager.open(openInput());
+    await manager.ackOutput({ threadId: "thread-1", bytes: 1 });
+    const process = ptyAdapter.processes[0];
+    if (!process) throw new Error("missing fake PTY");
+
+    process.emitData("before-watermark");
+    const recovery = await manager.recoverySnapshot({ threadId: "thread-1" });
+    const session = (
+      manager as unknown as {
+        sessions: Map<
+          string,
+          { outputUnackedBytes: number; outputAckPauseRequested: boolean; outputPaused: boolean }
+        >;
+      }
+    ).sessions.get("thread-1\u0000default");
+    expect(recovery.snapshot.history).toBe("before-watermark");
+    expect(recovery.watermark).toBe(2);
+    expect(session).toMatchObject({
+      outputUnackedBytes: 0,
+      outputAckPauseRequested: false,
+      outputPaused: false,
+    });
+
+    process.emitExit({ exitCode: 0, signal: null });
+    const exit = events.at(-1);
+    expect(exit).toMatchObject({ type: "exited", sequence: 3 });
+    expect(exit?.sequence).toBeGreaterThan(recovery.watermark);
+    manager.dispose();
+  });
+
+  it("keeps event clocks isolated by both terminal id and thread id", async () => {
+    const { manager, ptyAdapter } = makeManager();
+    const events: TerminalEvent[] = [];
+    manager.on("event", (event) => events.push(event));
+    await manager.open(openInput({ terminalId: "one" }));
+    await manager.open(openInput({ terminalId: "two" }));
+    await manager.open(openInput({ threadId: "thread-2", terminalId: "one" }));
+    ptyAdapter.processes[0]?.emitData("one-extra");
+
+    const first = await manager.recoverySnapshot({ threadId: "thread-1", terminalId: "one" });
+    const second = await manager.recoverySnapshot({ threadId: "thread-1", terminalId: "two" });
+    const otherThread = await manager.recoverySnapshot({
+      threadId: "thread-2",
+      terminalId: "one",
+    });
+
+    expect(first.watermark).toBe(2);
+    expect(second.watermark).toBe(1);
+    expect(otherThread.watermark).toBe(1);
+    expect(
+      events
+        .filter((event) => event.threadId === "thread-1" && event.terminalId === "one")
+        .map((event) => event.sequence),
+    ).toEqual([1, 2]);
+    manager.dispose();
+  });
 
   it("evaluates a structured explicit Windows choice once and forwards its exact arguments", async () => {
     const explicitArgs = ["", "two words", '"quoted"', "&|<>^%", "日本語"];
@@ -1705,6 +1824,37 @@ describe("TerminalManager", () => {
     expect(process.killSignals[0]).toBe("SIGTERM");
     expect(process.killSignals).toContain("SIGKILL");
 
+    manager.dispose();
+  });
+
+  it("waits for asynchronous process-tree capture before signaling terminal shutdown", async () => {
+    const capturedTree = deferred<{
+      descendants: Array<{ pid: number; command: string }>;
+      captureComplete: boolean;
+    }>();
+    const treeSignals: string[] = [];
+    const processTreeKiller: ProcessTreeKiller = {
+      capture: () => capturedTree.promise,
+      signal: ({ signal }) => {
+        treeSignals.push(signal);
+      },
+    };
+    const { manager, ptyAdapter } = makeManager(5, { processTreeKiller });
+    await manager.open(openInput());
+    const process = ptyAdapter.processes[0];
+    expect(process).toBeDefined();
+    if (!process) return;
+
+    const close = manager.close({ threadId: "thread-1" });
+    await Promise.resolve();
+    expect(process.killSignals).toEqual([]);
+    expect(treeSignals).toEqual([]);
+
+    capturedTree.resolve({ descendants: [], captureComplete: true });
+    await close;
+
+    expect(treeSignals).toEqual(["SIGTERM"]);
+    expect(process.killSignals).toEqual(["SIGTERM"]);
     manager.dispose();
   });
 

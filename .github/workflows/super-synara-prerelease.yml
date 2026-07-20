@@ -321,6 +321,15 @@ jobs:
           src/backendShutdown.test.ts
           src/backendShutdown.windows.integration.test.ts
 
+      - name: Build Windows Job launcher
+        run: node apps/server/scripts/build-windows-job-launcher.mjs --arch x64
+
+      - name: Run Windows Job containment regressions
+        run: >-
+          bun run --cwd apps/server test
+          src/provider/windowsProviderProcess.test.ts
+          src/provider/windowsProviderProcess.windows.test.ts
+
       - name: Run Super Synara Windows release contract regressions
         run: >-
           bun run --cwd scripts test

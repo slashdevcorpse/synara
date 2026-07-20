@@ -136,7 +136,7 @@ export async function teardownProviderProcessTree(
   }
 
   const deps = { ...defaultDependencies, ...dependencies };
-  const tree = deps.processTreeKiller.capture(input.rootPid);
+  const tree = await deps.processTreeKiller.capture(input.rootPid);
   const signalErrors: Error[] = [];
   let rootExited = false;
   void input.rootExited.then(
@@ -148,8 +148,11 @@ export async function teardownProviderProcessTree(
     },
   );
 
-  const signal = (killSignal: TerminalKillSignal, includeRootTree: boolean): void => {
-    deps.processTreeKiller.signal({
+  const signal = async (
+    killSignal: TerminalKillSignal,
+    includeRootTree: boolean,
+  ): Promise<void> => {
+    await deps.processTreeKiller.signal({
       rootPid: input.rootPid,
       signal: killSignal,
       tree,
@@ -164,7 +167,7 @@ export async function teardownProviderProcessTree(
     do {
       // Flush a root-exit resolution caused synchronously by a signal test double.
       await Promise.resolve();
-      const inspection = deps.processTreeKiller.inspect?.(tree);
+      const inspection = await deps.processTreeKiller.inspect?.(tree);
       remainingDescendants = inspection?.verified === true ? inspection.survivors : null;
       if (
         rootExited &&
@@ -181,7 +184,7 @@ export async function teardownProviderProcessTree(
     return { proven: false as const, remainingDescendants };
   };
 
-  signal("SIGTERM", true);
+  await signal("SIGTERM", true);
   const graceful = await waitForExitProof(
     positiveDuration(input.termGraceMs, DEFAULT_TERM_GRACE_MS),
   );
@@ -191,7 +194,7 @@ export async function teardownProviderProcessTree(
 
   // A root can exit while descendants ignore TERM and become reparented. Preserve the captured
   // identities and force only those descendants rather than re-signalling a potentially reused PID.
-  signal("SIGKILL", !rootExited);
+  await signal("SIGKILL", !rootExited);
   const forced = await waitForExitProof(positiveDuration(input.forceExitMs, DEFAULT_FORCE_EXIT_MS));
   if (forced.proven) {
     return { escalated: true, signalErrors };

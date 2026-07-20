@@ -65,6 +65,7 @@ import {
   TerminalOpenInput,
   TerminalResizeInput,
   TerminalRestartInput,
+  TerminalSessionInput,
   TerminalWriteInput,
 } from "./terminal";
 import { KeybindingRule } from "./keybindings";
@@ -179,6 +180,7 @@ export const WS_METHODS = {
 
   // Terminal methods
   terminalOpen: "terminal.open",
+  terminalSnapshot: "terminal.snapshot",
   terminalWrite: "terminal.write",
   terminalAckOutput: "terminal.ackOutput",
   terminalResize: "terminal.resize",
@@ -342,6 +344,7 @@ const WebSocketRequestBody = Schema.Union([
 
   // Terminal methods
   tagRequestBody(WS_METHODS.terminalOpen, TerminalOpenInput),
+  tagRequestBody(WS_METHODS.terminalSnapshot, TerminalSessionInput),
   tagRequestBody(WS_METHODS.terminalWrite, TerminalWriteInput),
   tagRequestBody(WS_METHODS.terminalAckOutput, TerminalAckOutputInput),
   tagRequestBody(WS_METHODS.terminalResize, TerminalResizeInput),

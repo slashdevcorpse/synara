@@ -36,6 +36,10 @@
       "types": "./src/staticSnapshot.ts",
       "import": "./src/staticSnapshot.ts"
     },
+    "./webSecurity": {
+      "types": "./src/webSecurity.ts",
+      "import": "./src/webSecurity.ts"
+    },
     "./windowsProcess": {
       "types": "./src/windowsProcess.ts",
       "import": "./src/windowsProcess.ts"

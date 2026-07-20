@@ -1,4 +1,5 @@
-import { realpathSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import * as NodeOs from "node:os";
 import * as NodePath from "node:path";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -10,7 +11,7 @@ import { Effect, FileSystem, Layer, Path, Sink, Stream } from "effect";
 import { TestClock } from "effect/testing";
 import * as PlatformError from "effect/PlatformError";
 import { ChildProcessSpawner } from "effect/unstable/process";
-import { vi } from "vitest";
+import { afterAll, beforeAll, vi } from "vitest";
 
 import { SYNARA_CODEX_HOME_OVERLAY_DIR } from "../../codexHomePaths";
 import { ServerConfig } from "../../config";
@@ -48,10 +49,49 @@ import {
   stabilizeProviderStatusesAgainstTransientTimeouts,
 } from "./ProviderHealth";
 import { resolvePackageManagedProviderMaintenance } from "../providerMaintenance";
+import {
+  WINDOWS_JOB_LAUNCHER_EXECUTABLE,
+  WINDOWS_JOB_LAUNCHER_PROTOCOL_VERSION,
+} from "../windowsProviderProcess.ts";
 
 // ── Test helpers ────────────────────────────────────────────────────
 
 const encoder = new TextEncoder();
+const originalProviderHealthTestPath = process.env.PATH;
+let providerHealthTestCommandDirectory: string | undefined;
+
+beforeAll(() => {
+  if (process.platform !== "win32") return;
+  providerHealthTestCommandDirectory = mkdtempSync(
+    NodePath.join(NodeOs.tmpdir(), "synara-provider-health-commands-"),
+  );
+  for (const command of [
+    "claude",
+    "grok",
+    "opencode",
+    "kilo",
+    "pi",
+    "agy",
+    "droid",
+    "cursor-agent",
+  ]) {
+    writeFileSync(NodePath.join(providerHealthTestCommandDirectory, `${command}.exe`), "");
+  }
+  process.env.PATH = [providerHealthTestCommandDirectory, originalProviderHealthTestPath]
+    .filter((entry): entry is string => Boolean(entry))
+    .join(";");
+});
+
+afterAll(() => {
+  if (originalProviderHealthTestPath === undefined) {
+    delete process.env.PATH;
+  } else {
+    process.env.PATH = originalProviderHealthTestPath;
+  }
+  if (providerHealthTestCommandDirectory) {
+    rmSync(providerHealthTestCommandDirectory, { recursive: true, force: true });
+  }
+});
 
 interface ProviderCommandFixture {
   readonly commandDirectory: string;
@@ -178,6 +218,43 @@ function mockHandle(result: { stdout: string; stderr: string; code: number }) {
   });
 }
 
+type PreparedMockCommand = {
+  readonly command: string;
+  readonly args: ReadonlyArray<string>;
+  readonly options?: {
+    readonly env?: NodeJS.ProcessEnv;
+    readonly windowsVerbatimArguments?: boolean;
+  };
+};
+
+function unwrapContainedProviderCommand(cmd: PreparedMockCommand): PreparedMockCommand {
+  const launcherPrefix = ["--protocol", WINDOWS_JOB_LAUNCHER_PROTOCOL_VERSION, "--argument-mode"];
+  const isContained =
+    process.platform === "win32" &&
+    NodePath.basename(cmd.command).toLowerCase() === WINDOWS_JOB_LAUNCHER_EXECUTABLE &&
+    launcherPrefix.every((value, index) => cmd.args[index] === value) &&
+    cmd.args[4] === "--" &&
+    typeof cmd.args[5] === "string";
+  if (!isContained) return cmd;
+
+  const target = cmd.args[5]!;
+  const normalizedTestDirectory = providerHealthTestCommandDirectory?.toLowerCase();
+  const targetDirectory = NodePath.dirname(target).toLowerCase();
+  const isGlobalMockCommand = targetDirectory.includes("synara-provider-health-commands-");
+  const unwrappedTarget =
+    isGlobalMockCommand || (normalizedTestDirectory && targetDirectory === normalizedTestDirectory)
+      ? NodePath.basename(target, NodePath.extname(target))
+      : target.startsWith("\\") && !target.startsWith("\\\\")
+        ? target.replaceAll("\\", "/")
+        : target;
+  return {
+    command: unwrappedTarget,
+    args: cmd.args.slice(6),
+    options:
+      cmd.args[3] === "verbatim" ? { ...cmd.options, windowsVerbatimArguments: true } : cmd.options,
+  };
+}
+
 function mockSpawnerLayer(
   handler: (
     args: ReadonlyArray<string>,
@@ -206,8 +283,9 @@ function mockSpawnerLayer(
           windowsVerbatimArguments?: boolean;
         };
       };
+      const unwrapped = unwrapContainedProviderCommand(cmd);
       return Effect.succeed(
-        mockHandle(handler(cmd.args, cmd.command, cmd.options?.env, cmd.options)),
+        mockHandle(handler(unwrapped.args, unwrapped.command, cmd.options?.env, unwrapped.options)),
       );
     }),
   );
@@ -261,7 +339,13 @@ function hangingSpawnerLayer(input: {
           windowsVerbatimArguments?: boolean;
         };
       };
-      return input.shouldHang(cmd.args, cmd.command, cmd.options?.env, cmd.options)
+      const unwrapped = unwrapContainedProviderCommand(cmd);
+      return input.shouldHang(
+        unwrapped.args,
+        unwrapped.command,
+        cmd.options?.env,
+        unwrapped.options,
+      )
         ? Effect.succeed(handle)
         : Effect.succeed(mockHandle({ stdout: "", stderr: "", code: 0 }));
     }),
@@ -2409,8 +2493,9 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
                 command: string;
                 args: ReadonlyArray<string>;
               };
-              assert.strictEqual(cmd.command, "cursor-agent");
-              const joined = cmd.args.join(" ");
+              const unwrapped = unwrapContainedProviderCommand(cmd);
+              assert.strictEqual(unwrapped.command, "cursor-agent");
+              const joined = unwrapped.args.join(" ");
               if (joined === "--version") {
                 return Effect.succeed(
                   mockHandle({ stdout: "agent 2026.04.27\n", stderr: "", code: 0 }),

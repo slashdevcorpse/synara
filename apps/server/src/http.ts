@@ -18,6 +18,7 @@ import {
 } from "@synara/shared/binaryTransfer";
 import { EDITOR_ICON_ROUTE_PATH } from "@synara/shared/editorIcons";
 import { threadExportBlockedReason } from "@synara/shared/threadExport";
+import { WEB_DOCUMENT_SECURITY_HEADERS } from "@synara/shared/webSecurity";
 import { Cause, DateTime, Effect, FileSystem, Layer, Option, Path, Schema, Stream } from "effect";
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/unstable/http";
 
@@ -60,6 +61,7 @@ import {
   normalizeCorsOrigin,
   shouldRejectAuthMutationOrigin,
 } from "./trustedOrigins";
+import { makeUploadAdmission, type UploadAdmission } from "./uploadAdmission";
 
 const PROJECT_FAVICON_CACHE_CONTROL = "public, max-age=3600";
 const SITE_FAVICON_CACHE_CONTROL_SUCCESS = "public, max-age=86400"; // 24 h
@@ -189,7 +191,7 @@ export function makeEffectHttpRouteLayer(
     siteFaviconEffectRouteLayer,
     editorIconEffectRouteLayer,
     localImageEffectRouteLayer,
-    binaryUploadEffectRouteLayer,
+    makeBinaryUploadEffectRouteLayer(),
     attachmentsEffectRouteLayer,
     staticAndDevEffectRouteLayer,
   );
@@ -230,21 +232,28 @@ export function makeHealthEffectRouteLayer(readiness: ServerReadiness) {
   return HttpRouter.add(
     "GET",
     "/health",
-    readiness.getSnapshot.pipe(
-      Effect.map((snapshot) =>
-        HttpServerResponse.jsonUnsafe(
-          {
-            status: "ok",
-            startupReady: snapshot.startupReady,
-            pushBusReady: snapshot.pushBusReady,
-            keybindingsReady: snapshot.keybindingsReady,
-            terminalSubscriptionsReady: snapshot.terminalSubscriptionsReady,
-            orchestrationSubscriptionsReady: snapshot.orchestrationSubscriptionsReady,
-          },
-          { status: 200 },
-        ),
-      ),
-    ),
+    Effect.gen(function* () {
+      const config = yield* ServerConfig;
+      const isPrivateLoopbackDeployment = isLoopbackHost(config.host) && !config.publicUrl;
+      if (!isPrivateLoopbackDeployment) {
+        const request = yield* HttpServerRequest.HttpServerRequest;
+        const serverAuth = yield* ServerAuth;
+        yield* serverAuth.authenticateHttpRequest(makeEffectAuthRequest(request));
+      }
+
+      const snapshot = yield* readiness.getSnapshot;
+      return HttpServerResponse.jsonUnsafe(
+        {
+          status: "ok",
+          startupReady: snapshot.startupReady,
+          pushBusReady: snapshot.pushBusReady,
+          keybindingsReady: snapshot.keybindingsReady,
+          terminalSubscriptionsReady: snapshot.terminalSubscriptionsReady,
+          orchestrationSubscriptionsReady: snapshot.orchestrationSubscriptionsReady,
+        },
+        { status: 200 },
+      );
+    }).pipe(Effect.catchTag("AuthError", (error) => Effect.succeed(authErrorResponse(error)))),
   );
 }
 
@@ -816,197 +825,238 @@ export const localImageEffectRouteLayer = HttpRouter.add(
   }).pipe(Effect.catchTag("AuthError", (error) => Effect.succeed(authErrorResponse(error)))),
 );
 
-const binaryUploadEffectHandler = Effect.gen(function* () {
-  const request = yield* HttpServerRequest.HttpServerRequest;
-  const url = HttpServerRequest.toURL(request);
-  if (!url) return HttpServerResponse.text("Bad Request", { status: 400 });
-  const config = yield* ServerConfig;
-  const corsHeaders = trustedMutationCorsHeaders({ request, url, config });
-  if (corsHeaders === null) {
-    return HttpServerResponse.jsonUnsafe(
-      { error: "Trusted request origin required." },
-      { status: 403 },
-    );
-  }
-  if (request.method === "OPTIONS") {
-    return HttpServerResponse.empty({ status: 204, headers: corsHeaders });
-  }
-  if (request.method !== "POST") {
-    return HttpServerResponse.text("Method Not Allowed", { status: 405, headers: corsHeaders });
-  }
-  const attachmentPrincipal = isLegacyTokenAuthorized({ config, url })
-    ? LOCAL_LOOPBACK_ATTACHMENT_PRINCIPAL
-    : attachmentPrincipalForSession((yield* requireAuthenticatedMutationRequest).sessionId);
+function makeBinaryUploadEffectHandler(uploadAdmission: UploadAdmission) {
+  return Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const url = HttpServerRequest.toURL(request);
+    if (!url) return HttpServerResponse.text("Bad Request", { status: 400 });
+    const config = yield* ServerConfig;
+    const corsHeaders = trustedMutationCorsHeaders({ request, url, config });
+    if (corsHeaders === null) {
+      return HttpServerResponse.jsonUnsafe(
+        { error: "Trusted request origin required." },
+        { status: 403 },
+      );
+    }
+    if (request.method === "OPTIONS") {
+      return HttpServerResponse.empty({ status: 204, headers: corsHeaders });
+    }
+    if (request.method !== "POST") {
+      return HttpServerResponse.text("Method Not Allowed", { status: 405, headers: corsHeaders });
+    }
+    const legacyTokenAuthorized = isLegacyTokenAuthorized({ config, url });
+    const authenticatedSession = legacyTokenAuthorized
+      ? null
+      : yield* requireAuthenticatedMutationRequest;
+    const attachmentPrincipal = authenticatedSession
+      ? attachmentPrincipalForSession(authenticatedSession.sessionId)
+      : LOCAL_LOOPBACK_ATTACHMENT_PRINCIPAL;
 
-  if (url.pathname === ATTACHMENT_UPLOAD_ROUTE_PATH) {
-    const type = url.searchParams.get("type");
-    const threadId = url.searchParams.get("threadId")?.trim() ?? "";
-    const name = url.searchParams.get("name") ?? "";
-    const mimeType = url.searchParams.get("mimeType") ?? "";
-    if ((type !== "image" && type !== "file") || !threadId || !name || !mimeType) {
-      return HttpServerResponse.jsonUnsafe(
-        { error: "Attachment upload metadata is invalid." },
-        { status: 400, headers: corsHeaders },
-      );
-    }
-    const maxBytes =
-      type === "image" ? PROVIDER_SEND_TURN_MAX_IMAGE_BYTES : PROVIDER_SEND_TURN_MAX_FILE_BYTES;
-    const declaredLength = Number(request.headers["content-length"] ?? "0");
-    if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
-      return HttpServerResponse.jsonUnsafe(
-        { error: "Request body too large." },
-        { status: 413, headers: corsHeaders },
-      );
-    }
-    const reservedBytes =
-      Number.isSafeInteger(declaredLength) && declaredLength > 0 && declaredLength <= maxBytes
-        ? declaredLength
-        : maxBytes;
-    const repository = yield* ManagedAttachmentRepository;
-    const now = new Date().toISOString();
-    const reservation = yield* reserveManagedAttachmentUpload({
-      type,
-      threadId,
-      name,
-      mimeType,
-      reservedBytes,
-      now,
-      principal: attachmentPrincipal,
-      repository,
-    });
-    const bytes = yield* readEffectBinary(request, maxBytes).pipe(
-      Effect.tapError(() =>
-        repository
-          .cancelStaged({
-            attachmentId: reservation.attachmentId,
-            ownerKind: attachmentPrincipal.ownerKind,
-            ownerId: attachmentPrincipal.ownerId,
-            reason: "upload-body-failed",
-            requestedAt: new Date().toISOString(),
-          })
-          .pipe(Effect.ignore),
-      ),
-    );
-    const attachment = yield* persistReservedManagedAttachment({
-      reservation,
-      bytes,
-      attachmentsDir: config.attachmentsDir,
-      now: new Date().toISOString(),
-      principal: attachmentPrincipal,
-      repository,
-    });
-    return HttpServerResponse.jsonUnsafe(attachment, { status: 201, headers: corsHeaders });
-  }
-
-  if (url.pathname === ATTACHMENT_CANCEL_ROUTE_PATH) {
-    const payload = yield* readEffectJson(request, "Invalid attachment cancellation payload.");
-    const attachmentId =
-      payload && typeof payload === "object" && "attachmentId" in payload
-        ? String((payload as { readonly attachmentId?: unknown }).attachmentId ?? "").trim()
-        : "";
-    if (!attachmentId || attachmentId.length > 128 || !/^[a-z0-9_-]+$/iu.test(attachmentId)) {
-      return HttpServerResponse.jsonUnsafe(
-        { error: "Attachment cancellation payload is invalid." },
-        { status: 400, headers: corsHeaders },
-      );
-    }
-    const repository = yield* ManagedAttachmentRepository;
-    const result = yield* repository.cancelStaged({
-      attachmentId,
-      ownerKind: attachmentPrincipal.ownerKind,
-      ownerId: attachmentPrincipal.ownerId,
-      reason: "client-cancelled",
-      requestedAt: new Date().toISOString(),
-    });
-    if (result.status === "not-found") {
-      return HttpServerResponse.jsonUnsafe(
-        { error: "Attachment not found." },
-        { status: 404, headers: corsHeaders },
-      );
-    }
-    if (result.status === "already-claimed") {
-      return HttpServerResponse.jsonUnsafe(
-        { error: "Attachment is already committed." },
-        { status: 409, headers: corsHeaders },
-      );
-    }
-    return HttpServerResponse.jsonUnsafe(
-      { cancelled: true },
-      { status: 200, headers: corsHeaders },
-    );
-  }
-
-  if (url.pathname === VOICE_TRANSCRIPTION_UPLOAD_ROUTE_PATH) {
-    const provider = url.searchParams.get("provider")?.trim() ?? "";
-    const cwd = url.searchParams.get("cwd")?.trim() ?? "";
-    const threadId = url.searchParams.get("threadId")?.trim() || undefined;
-    const mimeType = url.searchParams.get("mimeType")?.trim() ?? "";
-    const sampleRateHz = Number(url.searchParams.get("sampleRateHz"));
-    const durationMs = Number(url.searchParams.get("durationMs"));
     if (
-      !provider ||
-      !cwd ||
-      !mimeType ||
-      !Number.isSafeInteger(sampleRateHz) ||
-      !Number.isSafeInteger(durationMs)
+      url.pathname === ATTACHMENT_UPLOAD_ROUTE_PATH ||
+      url.pathname === VOICE_TRANSCRIPTION_UPLOAD_ROUTE_PATH
     ) {
-      return HttpServerResponse.jsonUnsafe(
-        { error: "Voice transcription metadata is invalid." },
-        { status: 400, headers: corsHeaders },
-      );
+      const admission = uploadAdmission.admit({
+        principalKey: `${attachmentPrincipal.ownerKind}:${attachmentPrincipal.ownerId}`,
+        remoteAddress: request.remoteAddress,
+        // publicUrl is the explicit HTTPS proxy declaration. Authenticated
+        // sessions are isolated by their durable principal; the socket peer is
+        // the shared proxy and forwarded headers remain untrusted. Legacy
+        // startup-token and every direct deployment retain peer throttling.
+        rateLimitPeer: legacyTokenAuthorized || config.publicUrl === undefined,
+      });
+      if (!admission.admitted) {
+        return HttpServerResponse.jsonUnsafe(
+          { error: "Upload rate limit exceeded." },
+          {
+            status: 429,
+            headers: {
+              ...corsHeaders,
+              "Cache-Control": "no-store",
+              "Retry-After": String(Math.max(1, Math.ceil(admission.retryAfterMs / 1_000))),
+            },
+          },
+        );
+      }
     }
-    const bytes = yield* readEffectBinary(request, SERVER_VOICE_TRANSCRIPTION_MAX_AUDIO_BYTES);
-    const registry = yield* ProviderAdapterRegistry;
-    const adapter = yield* registry.getByProvider(provider as never);
-    if (!adapter.transcribeVoice) {
-      return HttpServerResponse.jsonUnsafe(
-        { error: `Voice transcription is unavailable for provider '${provider}'.` },
-        { status: 400, headers: corsHeaders },
-      );
-    }
-    const result = yield* adapter.transcribeVoice({
-      provider: provider as never,
-      cwd,
-      ...(threadId ? { threadId: ThreadId.makeUnsafe(threadId) } : {}),
-      mimeType,
-      sampleRateHz,
-      durationMs,
-      audioBase64: Buffer.from(bytes).toString("base64"),
-    });
-    return HttpServerResponse.jsonUnsafe(result, { status: 200, headers: corsHeaders });
-  }
 
-  return HttpServerResponse.text("Not Found", { status: 404, headers: corsHeaders });
-}).pipe(
-  Effect.catch((error) =>
-    Effect.succeed(
-      error instanceof AuthError
-        ? authErrorResponse(error)
-        : HttpServerResponse.jsonUnsafe(
-            {
-              error:
-                error instanceof Error
-                  ? error.message
-                  : String((error as { readonly message?: unknown }).message ?? error),
-            },
-            {
-              status:
-                typeof (error as { readonly status?: unknown }).status === "number"
-                  ? (error as { readonly status: number }).status
-                  : 500,
-            },
-          ),
+    if (url.pathname === ATTACHMENT_UPLOAD_ROUTE_PATH) {
+      const type = url.searchParams.get("type");
+      const threadId = url.searchParams.get("threadId")?.trim() ?? "";
+      const name = url.searchParams.get("name") ?? "";
+      const mimeType = url.searchParams.get("mimeType") ?? "";
+      if ((type !== "image" && type !== "file") || !threadId || !name || !mimeType) {
+        return HttpServerResponse.jsonUnsafe(
+          { error: "Attachment upload metadata is invalid." },
+          { status: 400, headers: corsHeaders },
+        );
+      }
+      const maxBytes =
+        type === "image" ? PROVIDER_SEND_TURN_MAX_IMAGE_BYTES : PROVIDER_SEND_TURN_MAX_FILE_BYTES;
+      const declaredLength = Number(request.headers["content-length"] ?? "0");
+      if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+        return HttpServerResponse.jsonUnsafe(
+          { error: "Request body too large." },
+          { status: 413, headers: corsHeaders },
+        );
+      }
+      const reservedBytes =
+        Number.isSafeInteger(declaredLength) && declaredLength > 0 && declaredLength <= maxBytes
+          ? declaredLength
+          : maxBytes;
+      const repository = yield* ManagedAttachmentRepository;
+      const now = new Date().toISOString();
+      const reservation = yield* reserveManagedAttachmentUpload({
+        type,
+        threadId,
+        name,
+        mimeType,
+        reservedBytes,
+        now,
+        principal: attachmentPrincipal,
+        repository,
+      });
+      const bytes = yield* readEffectBinary(request, maxBytes).pipe(
+        Effect.tapError(() =>
+          repository
+            .cancelStaged({
+              attachmentId: reservation.attachmentId,
+              ownerKind: attachmentPrincipal.ownerKind,
+              ownerId: attachmentPrincipal.ownerId,
+              reason: "upload-body-failed",
+              requestedAt: new Date().toISOString(),
+            })
+            .pipe(Effect.ignore),
+        ),
+      );
+      const attachment = yield* persistReservedManagedAttachment({
+        reservation,
+        bytes,
+        attachmentsDir: config.attachmentsDir,
+        now: new Date().toISOString(),
+        principal: attachmentPrincipal,
+        repository,
+      });
+      return HttpServerResponse.jsonUnsafe(attachment, { status: 201, headers: corsHeaders });
+    }
+
+    if (url.pathname === ATTACHMENT_CANCEL_ROUTE_PATH) {
+      const payload = yield* readEffectJson(request, "Invalid attachment cancellation payload.");
+      const attachmentId =
+        payload && typeof payload === "object" && "attachmentId" in payload
+          ? String((payload as { readonly attachmentId?: unknown }).attachmentId ?? "").trim()
+          : "";
+      if (!attachmentId || attachmentId.length > 128 || !/^[a-z0-9_-]+$/iu.test(attachmentId)) {
+        return HttpServerResponse.jsonUnsafe(
+          { error: "Attachment cancellation payload is invalid." },
+          { status: 400, headers: corsHeaders },
+        );
+      }
+      const repository = yield* ManagedAttachmentRepository;
+      const result = yield* repository.cancelStaged({
+        attachmentId,
+        ownerKind: attachmentPrincipal.ownerKind,
+        ownerId: attachmentPrincipal.ownerId,
+        reason: "client-cancelled",
+        requestedAt: new Date().toISOString(),
+      });
+      if (result.status === "not-found") {
+        return HttpServerResponse.jsonUnsafe(
+          { error: "Attachment not found." },
+          { status: 404, headers: corsHeaders },
+        );
+      }
+      if (result.status === "already-claimed") {
+        return HttpServerResponse.jsonUnsafe(
+          { error: "Attachment is already committed." },
+          { status: 409, headers: corsHeaders },
+        );
+      }
+      return HttpServerResponse.jsonUnsafe(
+        { cancelled: true },
+        { status: 200, headers: corsHeaders },
+      );
+    }
+
+    if (url.pathname === VOICE_TRANSCRIPTION_UPLOAD_ROUTE_PATH) {
+      const provider = url.searchParams.get("provider")?.trim() ?? "";
+      const cwd = url.searchParams.get("cwd")?.trim() ?? "";
+      const threadId = url.searchParams.get("threadId")?.trim() || undefined;
+      const mimeType = url.searchParams.get("mimeType")?.trim() ?? "";
+      const sampleRateHz = Number(url.searchParams.get("sampleRateHz"));
+      const durationMs = Number(url.searchParams.get("durationMs"));
+      if (
+        !provider ||
+        !cwd ||
+        !mimeType ||
+        !Number.isSafeInteger(sampleRateHz) ||
+        !Number.isSafeInteger(durationMs)
+      ) {
+        return HttpServerResponse.jsonUnsafe(
+          { error: "Voice transcription metadata is invalid." },
+          { status: 400, headers: corsHeaders },
+        );
+      }
+      const bytes = yield* readEffectBinary(request, SERVER_VOICE_TRANSCRIPTION_MAX_AUDIO_BYTES);
+      const registry = yield* ProviderAdapterRegistry;
+      const adapter = yield* registry.getByProvider(provider as never);
+      if (!adapter.transcribeVoice) {
+        return HttpServerResponse.jsonUnsafe(
+          { error: `Voice transcription is unavailable for provider '${provider}'.` },
+          { status: 400, headers: corsHeaders },
+        );
+      }
+      const result = yield* adapter.transcribeVoice({
+        provider: provider as never,
+        cwd,
+        ...(threadId ? { threadId: ThreadId.makeUnsafe(threadId) } : {}),
+        mimeType,
+        sampleRateHz,
+        durationMs,
+        audioBase64: Buffer.from(bytes).toString("base64"),
+      });
+      return HttpServerResponse.jsonUnsafe(result, { status: 200, headers: corsHeaders });
+    }
+
+    return HttpServerResponse.text("Not Found", { status: 404, headers: corsHeaders });
+  }).pipe(
+    Effect.catch((error) =>
+      Effect.succeed(
+        error instanceof AuthError
+          ? authErrorResponse(error)
+          : HttpServerResponse.jsonUnsafe(
+              {
+                error:
+                  error instanceof Error
+                    ? error.message
+                    : String((error as { readonly message?: unknown }).message ?? error),
+              },
+              {
+                status:
+                  typeof (error as { readonly status?: unknown }).status === "number"
+                    ? (error as { readonly status: number }).status
+                    : 500,
+              },
+            ),
+      ),
     ),
-  ),
-);
+  );
+}
 
-export const binaryUploadEffectRouteLayer = Layer.merge(
-  HttpRouter.add("*", ATTACHMENT_UPLOAD_ROUTE_PATH, binaryUploadEffectHandler),
-  Layer.merge(
-    HttpRouter.add("*", ATTACHMENT_CANCEL_ROUTE_PATH, binaryUploadEffectHandler),
-    HttpRouter.add("*", VOICE_TRANSCRIPTION_UPLOAD_ROUTE_PATH, binaryUploadEffectHandler),
-  ),
-);
+export function makeBinaryUploadEffectRouteLayer(
+  uploadAdmission: UploadAdmission = makeUploadAdmission(),
+) {
+  const handler = makeBinaryUploadEffectHandler(uploadAdmission);
+  return Layer.merge(
+    HttpRouter.add("*", ATTACHMENT_UPLOAD_ROUTE_PATH, handler),
+    Layer.merge(
+      HttpRouter.add("*", ATTACHMENT_CANCEL_ROUTE_PATH, handler),
+      HttpRouter.add("*", VOICE_TRANSCRIPTION_UPLOAD_ROUTE_PATH, handler),
+    ),
+  );
+}
+
+export const binaryUploadEffectRouteLayer = makeBinaryUploadEffectRouteLayer();
 
 export const attachmentsEffectRouteLayer = HttpRouter.add(
   "GET",
@@ -1158,6 +1208,7 @@ export const staticAndDevEffectRouteLayer = HttpRouter.add(
       return HttpServerResponse.uint8Array(indexData, {
         status: 200,
         contentType: "text/html; charset=utf-8",
+        headers: WEB_DOCUMENT_SECURITY_HEADERS,
       });
     }
 
@@ -1165,9 +1216,11 @@ export const staticAndDevEffectRouteLayer = HttpRouter.add(
       .readFile(filePath)
       .pipe(Effect.catch(() => Effect.succeed(null)));
     if (!data) return HttpServerResponse.text("Internal Server Error", { status: 500 });
+    const contentType = Mime.getType(filePath) ?? "application/octet-stream";
     return HttpServerResponse.uint8Array(data, {
       status: 200,
-      contentType: Mime.getType(filePath) ?? "application/octet-stream",
+      contentType,
+      ...(contentType.startsWith("text/html") ? { headers: WEB_DOCUMENT_SECURITY_HEADERS } : {}),
     });
   }),
 );

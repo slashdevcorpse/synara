@@ -114,6 +114,7 @@ function fakeProcessDependencies(
 ): AntigravityProcessDependencies {
   return {
     prepareProcess: (command, args) => ({ command, args: [...args], shell: false }),
+    containProcess: (prepared) => prepared,
     spawnProcess: (_command: string, _args: ReadonlyArray<string>, _options: SpawnOptions) =>
       fake.child,
     teardownProcessTree: async () => undefined,
@@ -548,6 +549,7 @@ describe("Antigravity process spawning and output ownership", () => {
       cwd: "C:\\helper cwd",
       dependencies: {
         prepareProcess: helperPrepare,
+        containProcess: (prepared) => prepared,
         spawnProcess: (_command, _args, options) => {
           helperSpawnOptions = options;
           return helperFake.child;
@@ -585,6 +587,7 @@ describe("Antigravity process spawning and output ownership", () => {
             windowsVerbatimArguments: true,
           };
         },
+        containProcess: (prepared) => prepared,
         spawnProcess: (_command, _args, options) => {
           turnSpawnOptions = options;
           return turnFake.child;

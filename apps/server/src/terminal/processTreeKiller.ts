@@ -6,13 +6,21 @@ import { spawnSync } from "node:child_process";
 
 import treeKill from "tree-kill";
 
+import {
+  captureWindowsProcessSnapshot,
+  type WindowsProcessSnapshotCollector,
+  type WindowsProcessSnapshotResult,
+} from "./windowsProcessSnapshot";
+
 const PROCESS_TREE_SCAN_TIMEOUT_MS = 1_000;
 const PROCESS_TREE_SCAN_MAX_BUFFER_BYTES = 262_144;
 const PROCESS_COMMAND_SCAN_MAX_BUFFER_BYTES = 262_144;
 const POSIX_TREE_WALK_MAX_VISITED = 256;
 
-export type ProcessChildrenMap = Map<number, Array<CapturedProcess>>;
+export type ProcessChildrenMap = ReadonlyMap<number, readonly CapturedProcess[]>;
 export type ProcessCommandMap = Map<number, string>;
+
+type MaybePromise<T> = T | Promise<T>;
 
 export interface CapturedProcess {
   pid: number;
@@ -34,19 +42,21 @@ export interface CapturedProcessTreeInspection {
 export type TerminalKillSignal = "SIGTERM" | "SIGKILL";
 
 export interface ProcessTreeKiller {
-  capture(rootPid: number): CapturedProcessTree;
-  inspect?(tree: CapturedProcessTree): CapturedProcessTreeInspection;
+  capture(rootPid: number): MaybePromise<CapturedProcessTree>;
+  inspect?(tree: CapturedProcessTree): MaybePromise<CapturedProcessTreeInspection>;
   signal(input: {
     rootPid: number;
     signal: TerminalKillSignal;
     tree: CapturedProcessTree;
     includeRootTree?: boolean | undefined;
     onError: (error: Error, context: { pid: number; source: "tree-kill" | "captured" }) => void;
-  }): void;
+  }): MaybePromise<void>;
 }
 
 export interface ProcessTreeKillerDependencies {
+  platform: NodeJS.Platform;
   captureChildrenMap: () => ProcessChildrenMap | null;
+  captureWindowsSnapshot: WindowsProcessSnapshotCollector;
   readCurrentCommands: (pids: readonly number[]) => ProcessCommandMap | null;
   signalPid: (pid: number, signal: TerminalKillSignal) => Error | null;
   signalTree: (
@@ -57,7 +67,7 @@ export interface ProcessTreeKillerDependencies {
 }
 
 export function parseProcessChildrenMap(psOutput: string): ProcessChildrenMap {
-  const childrenByParentPid: ProcessChildrenMap = new Map();
+  const childrenByParentPid = new Map<number, CapturedProcess[]>();
   for (const line of psOutput.split(/\r?\n/g)) {
     const [pidRaw, ppidRaw, ...commandParts] = line.trim().split(/\s+/g);
     const pid = Number(pidRaw);
@@ -89,6 +99,13 @@ export function collectDescendantProcesses(
   parentPid: number,
   childrenByParentPid: ProcessChildrenMap,
 ): CapturedProcess[] {
+  return collectDescendantProcessResult(parentPid, childrenByParentPid).descendants;
+}
+
+function collectDescendantProcessResult(
+  parentPid: number,
+  childrenByParentPid: ProcessChildrenMap,
+): { readonly descendants: CapturedProcess[]; readonly complete: boolean } {
   const descendants: CapturedProcess[] = [];
   const stack = [...(childrenByParentPid.get(parentPid) ?? [])].reverse();
   const visited = new Set<number>([parentPid]);
@@ -107,7 +124,20 @@ export function collectDescendantProcesses(
     }
   }
 
-  return descendants;
+  return { descendants, complete: stack.length === 0 };
+}
+
+function processCommandMapFromWindowsSnapshot(
+  snapshot: WindowsProcessSnapshotResult,
+): ProcessCommandMap | null {
+  if (snapshot.kind !== "ok") return null;
+  const commandsByPid: ProcessCommandMap = new Map();
+  for (const children of snapshot.childrenByParentPid.values()) {
+    for (const child of children) {
+      commandsByPid.set(child.pid, child.command);
+    }
+  }
+  return commandsByPid;
 }
 
 function captureProcessChildrenMapSync(): ProcessChildrenMap | null {
@@ -165,13 +195,15 @@ function shouldSignalCapturedProcess(
   return currentCommands?.get(process.pid) === process.command;
 }
 
-function capturedProcessesForSignal(
+async function capturedProcessesForSignal(
   descendants: readonly CapturedProcess[],
   signal: TerminalKillSignal,
-  readCommands: (pids: readonly number[]) => ProcessCommandMap | null,
-): CapturedProcess[] {
+  readCommands: (pids: readonly number[]) => MaybePromise<ProcessCommandMap | null>,
+): Promise<CapturedProcess[]> {
   const currentCommands =
-    signal === "SIGKILL" ? readCommands(descendants.map((descendant) => descendant.pid)) : null;
+    signal === "SIGKILL"
+      ? await readCommands(descendants.map((descendant) => descendant.pid))
+      : null;
   return descendants.filter((descendant) =>
     shouldSignalCapturedProcess(descendant, signal, currentCommands),
   );
@@ -182,34 +214,65 @@ export function createProcessTreeKiller(
   dependencies: Partial<ProcessTreeKillerDependencies> = {},
 ): ProcessTreeKiller {
   const deps: ProcessTreeKillerDependencies = {
+    platform: globalThis.process.platform,
     captureChildrenMap: captureProcessChildrenMapSync,
+    captureWindowsSnapshot: captureWindowsProcessSnapshot,
     readCurrentCommands,
     signalPid,
     signalTree: treeKill,
     ...dependencies,
   };
 
+  const readCommandsForPlatform = async (
+    pids: readonly number[],
+  ): Promise<ProcessCommandMap | null> => {
+    if (deps.platform !== "win32") {
+      return deps.readCurrentCommands(pids);
+    }
+    if (pids.length === 0) return new Map();
+    try {
+      return processCommandMapFromWindowsSnapshot(await deps.captureWindowsSnapshot());
+    } catch {
+      return null;
+    }
+  };
+
   return {
-    capture: (rootPid) => {
+    capture: async (rootPid) => {
       if (!Number.isInteger(rootPid) || rootPid <= 0) {
         return { descendants: [], captureComplete: false };
       }
-      if (globalThis.process.platform === "win32") {
-        // tree-kill delegates to taskkill /T on Windows, which owns descendant traversal.
-        return { descendants: [], captureComplete: true };
+      if (deps.platform === "win32") {
+        // Provider-scoped kill-on-close containment requires creating the provider suspended,
+        // assigning it to a Job Object, and only then resuming it. Node/Bun child-process APIs do
+        // not expose that atomic sequence; assigning a running PID would race fast descendants.
+        try {
+          const snapshot = await deps.captureWindowsSnapshot();
+          if (snapshot.kind !== "ok") {
+            return { descendants: [], captureComplete: false };
+          }
+          const capture = collectDescendantProcessResult(rootPid, snapshot.childrenByParentPid);
+          return {
+            descendants: capture.descendants,
+            captureComplete: capture.complete,
+          };
+        } catch {
+          return { descendants: [], captureComplete: false };
+        }
       }
       const childrenByParentPid = deps.captureChildrenMap();
       if (!childrenByParentPid) return { descendants: [], captureComplete: false };
+      const capture = collectDescendantProcessResult(rootPid, childrenByParentPid);
       return {
-        descendants: collectDescendantProcesses(rootPid, childrenByParentPid),
-        captureComplete: true,
+        descendants: capture.descendants,
+        captureComplete: capture.complete,
       };
     },
-    inspect: (tree) => {
+    inspect: async (tree) => {
       if (tree.descendants.length === 0) {
         return { verified: true, survivors: [] };
       }
-      const currentCommands = deps.readCurrentCommands(
+      const currentCommands = await readCommandsForPlatform(
         tree.descendants.map((descendant) => descendant.pid),
       );
       if (currentCommands === null) {
@@ -222,13 +285,13 @@ export function createProcessTreeKiller(
         ),
       };
     },
-    signal: ({ rootPid, signal, tree, includeRootTree = true, onError }) => {
+    signal: async ({ rootPid, signal, tree, includeRootTree = true, onError }) => {
       // Signal captured descendants directly as well as through tree-kill. If
       // the PTY root exits, those children may be reparented before escalation.
-      const capturedProcesses = capturedProcessesForSignal(
+      const capturedProcesses = await capturedProcessesForSignal(
         tree.descendants,
         signal,
-        deps.readCurrentCommands,
+        readCommandsForPlatform,
       );
       for (const descendant of capturedProcesses.toReversed()) {
         const error = deps.signalPid(descendant.pid, signal);

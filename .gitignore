@@ -5,6 +5,7 @@ node_modules
 *.log
 *.tsbuildinfo
 apps/*/dist
+apps/server/native/windows-job-launcher/out/
 .astro
 packages/*/dist
 .env

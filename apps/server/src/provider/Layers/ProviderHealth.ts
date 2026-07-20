@@ -9,6 +9,7 @@
  * @module ProviderHealthLive
  */
 import * as OS from "node:os";
+import { spawn as spawnChildProcess } from "node:child_process";
 import type {
   ProviderKind,
   ServerSettings,
@@ -22,10 +23,11 @@ import { resolveCodexCliExecutable } from "@synara/shared/codexCliExecutable";
 import { parseCodexConfigModelProvider } from "@synara/shared/codexConfig";
 import { decodeJsonResult } from "@synara/shared/schemaJson";
 import {
-  prepareResolvedWindowsSafeProcess,
-  prepareWindowsSafeProcess,
-} from "@synara/shared/windowsProcess";
-import { query as claudeQuery, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+  query as claudeQuery,
+  type SDKUserMessage,
+  type SpawnOptions as ClaudeSpawnOptions,
+  type SpawnedProcess as ClaudeSpawnedProcess,
+} from "@anthropic-ai/claude-agent-sdk";
 import {
   Array,
   Cache,
@@ -92,6 +94,10 @@ import {
   writeProviderStatusCache,
 } from "../providerStatusCache";
 import { makeProviderMaintenanceCommandCoordinator } from "../providerMaintenanceCommandCoordinator";
+import {
+  prepareResolvedWindowsProviderProcess,
+  prepareWindowsProviderProcess,
+} from "../windowsProviderProcess.ts";
 import {
   enrichProviderStatusWithVersionAdvisory,
   compareSemverVersions,
@@ -461,6 +467,22 @@ function waitForAbortSignal(signal: AbortSignal): Promise<void> {
   });
 }
 
+function spawnContainedClaudeProbe(options: ClaudeSpawnOptions): ClaudeSpawnedProcess {
+  const prepared = prepareWindowsProviderProcess(options.command, options.args, {
+    cwd: options.cwd,
+    env: options.env,
+  });
+  return spawnChildProcess(prepared.command, prepared.args, {
+    ...(options.cwd ? { cwd: options.cwd } : {}),
+    env: options.env,
+    signal: options.signal,
+    shell: prepared.shell,
+    ...(prepared.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
+    stdio: ["pipe", "pipe", "inherit"],
+    windowsHide: true,
+  }) as unknown as ClaudeSpawnedProcess;
+}
+
 const probeClaudeSubscription = () => {
   const abort = new AbortController();
   return Effect.tryPromise(async () => {
@@ -475,6 +497,7 @@ const probeClaudeSubscription = () => {
         settingSources: ["user", "project", "local"],
         allowedTools: [],
         stderr: () => {},
+        spawnClaudeCodeProcess: spawnContainedClaudeProbe,
       },
     });
     const init = await q.initializationResult();
@@ -658,8 +681,8 @@ const runProviderCommand = (
   Effect.gen(function* () {
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
     const prepared = executableAlreadyResolved
-      ? prepareResolvedWindowsSafeProcess(executable, args, { env })
-      : prepareWindowsSafeProcess(executable, args, { env });
+      ? prepareResolvedWindowsProviderProcess(executable, args, { env })
+      : prepareWindowsProviderProcess(executable, args, { env });
     const command = ChildProcess.make(prepared.command, prepared.args, {
       shell: prepared.shell,
       ...(prepared.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
@@ -2500,7 +2523,9 @@ export function makeProviderHealthLive(options?: { readonly providerUpdateTimeou
                 .join(OS.platform() === "win32" ? ";" : ":"),
             }
           : baseEnv;
-        const prepared = prepareWindowsSafeProcess(input.command, input.args, { env: updateEnv });
+        const prepared = prepareWindowsProviderProcess(input.command, input.args, {
+          env: updateEnv,
+        });
         const child = yield* spawner.spawn(
           ChildProcess.make(prepared.command, prepared.args, {
             shell: prepared.shell,

@@ -8,6 +8,8 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import { type TerminalActivityState, type TerminalCliKind } from "@synara/shared/terminalThreads";
 import { Terminal, type IDisposable } from "@xterm/xterm";
 import type { TerminalLinkMatch } from "../../terminal-links";
+import type { TerminalEventRecovery } from "./terminalEventRecovery";
+import type { TerminalOutputAckQueue } from "./terminalOutputAckQueue";
 
 export interface TerminalRuntimeCallbacks {
   onSessionExited: () => void;
@@ -92,6 +94,13 @@ export interface TerminalRuntimeEntry {
   linkMatchCache: Map<string, TerminalLinkMatch[]>;
   outputEventVersion: number;
   snapshotReconcileRequestId: number;
+  terminalEventRecovery: TerminalEventRecovery;
+  terminalOutputAckQueue: TerminalOutputAckQueue;
+  needsAuthoritativeRecovery: boolean;
+  authoritativeRecoveryInFlight: boolean;
+  authoritativeRecoveryRetryTimer: number | null;
+  authoritativeRecoveryAttempt: number;
+  authoritativeRecoveryRetryRequested: boolean;
   webglLoadFrame: number | null;
   themeRefreshFrame: number;
   themeObserver: MutationObserver | null;

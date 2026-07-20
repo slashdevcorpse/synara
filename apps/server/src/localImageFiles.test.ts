@@ -2,9 +2,13 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
-import { resolveAllowedLocalPreviewFile } from "./localImageFiles.ts";
+import {
+  LocalPreviewGrantCapacityError,
+  makeLocalPreviewGrantRegistry,
+  resolveAllowedLocalPreviewFile,
+} from "./localImageFiles.ts";
 
 const tempDirs: string[] = [];
 
@@ -32,7 +36,7 @@ describe("resolveAllowedLocalPreviewFile", () => {
       cwd: workspace,
     });
 
-    assert.equal(result?.path, realpathSync(imagePath));
+    assert.equal(result?.path, realpathSync.native(imagePath));
     assert.equal(result?.fileName, "preview.png");
   });
 
@@ -51,7 +55,7 @@ describe("resolveAllowedLocalPreviewFile", () => {
         cwd: null,
       });
 
-      assert.equal(result?.path, realpathSync(imagePath));
+      assert.equal(result?.path, realpathSync.native(imagePath));
     } finally {
       if (previousCodexHome === undefined) {
         delete process.env.CODEX_HOME;
@@ -93,7 +97,7 @@ describe("resolveAllowedLocalPreviewFile", () => {
         codexHomePath: sourceHome,
       });
 
-      assert.equal(result?.path, realpathSync(imagePath));
+      assert.equal(result?.path, realpathSync.native(imagePath));
     } finally {
       if (previousSynaraHome === undefined) {
         delete process.env.SYNARA_HOME;
@@ -116,7 +120,7 @@ describe("resolveAllowedLocalPreviewFile", () => {
       cwd: workspace,
     });
 
-    assert.equal(result?.path, realpathSync(pdfPath));
+    assert.equal(result?.path, realpathSync.native(pdfPath));
     assert.equal(result?.fileName, "spec.pdf");
     assert.equal(result?.sizeBytes, 8);
   });
@@ -136,7 +140,7 @@ describe("resolveAllowedLocalPreviewFile", () => {
         cwd: null,
       });
 
-      assert.equal(result?.path, realpathSync(pdfPath));
+      assert.equal(result?.path, realpathSync.native(pdfPath));
       assert.equal(result?.fileName, "viewer-test.pdf");
       assert.equal(result?.sizeBytes, 8);
     } finally {
@@ -171,7 +175,7 @@ describe("resolveAllowedLocalPreviewFile", () => {
       cwd: null,
     });
 
-    assert.equal(result?.path, realpathSync(imagePath));
+    assert.equal(result?.path, realpathSync.native(imagePath));
   });
 
   it("rejects unsupported paths", async () => {
@@ -181,5 +185,60 @@ describe("resolveAllowedLocalPreviewFile", () => {
     });
 
     assert.equal(result, null);
+  });
+});
+
+describe("local preview grant admission", () => {
+  it("bounds outstanding grants and reports when capacity will recover", () => {
+    let nowMs = 1_000;
+    let nextToken = 0;
+    const registry = makeLocalPreviewGrantRegistry({
+      now: () => nowMs,
+      createToken: () => `grant-${nextToken++}`,
+      maxOutstanding: 2,
+      ttlMs: 500,
+    });
+
+    expect(registry.create("C:/preview/one.pdf").grant).toBe("grant-0");
+    expect(registry.create("C:/preview/two.pdf").grant).toBe("grant-1");
+    expect(registry.snapshot()).toEqual({ outstanding: 2 });
+
+    expect(() => registry.create("C:/preview/three.pdf")).toThrow(
+      expect.objectContaining({
+        name: "LocalPreviewGrantCapacityError",
+        code: "LOCAL_PREVIEW_GRANT_CAPACITY_EXCEEDED",
+        retryAfterMs: 500,
+      }),
+    );
+    expect(registry.snapshot()).toEqual({ outstanding: 2 });
+
+    nowMs = 1_500;
+    expect(registry.create("C:/preview/three.pdf").grant).toBe("grant-2");
+    expect(registry.snapshot()).toEqual({ outstanding: 1 });
+  });
+
+  it("keeps reusable grants valid until expiry without consuming capacity", () => {
+    let nowMs = 10;
+    const registry = makeLocalPreviewGrantRegistry({
+      now: () => nowMs,
+      createToken: () => "reusable",
+      maxOutstanding: 1,
+      ttlMs: 100,
+    });
+
+    const grant = registry.create("C:/preview/document.pdf");
+    expect(registry.resolve(grant.grant)).toBe("C:/preview/document.pdf");
+    expect(registry.resolve(grant.grant)).toBe("C:/preview/document.pdf");
+    expect(registry.snapshot()).toEqual({ outstanding: 1 });
+
+    nowMs = 110;
+    expect(registry.resolve(grant.grant)).toBeNull();
+    expect(registry.snapshot()).toEqual({ outstanding: 0 });
+  });
+
+  it("exposes a distinct capacity error type for the RPC boundary", () => {
+    const error = new LocalPreviewGrantCapacityError(250);
+    expect(error).toBeInstanceOf(Error);
+    expect(error.retryAfterMs).toBe(250);
   });
 });

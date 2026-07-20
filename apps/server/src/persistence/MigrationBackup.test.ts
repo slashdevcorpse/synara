@@ -429,6 +429,80 @@ describe("migration backups", () => {
     }
   });
 
+  it("validates the migrated live database while the recovery marker is still durable", async () => {
+    const dbPath = await makeMigrationCandidate();
+    let migrationCompleted = false;
+    let validationObservedMarker = false;
+
+    await runWithDatabase(
+      dbPath,
+      runWithPreMigrationBackup(
+        dbPath,
+        Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          yield* sql`DELETE FROM marker_failure_probe`;
+          migrationCompleted = true;
+        }),
+        {
+          readLiveDatabaseIntegrity: async () => {
+            expect(migrationCompleted).toBe(true);
+            expect(
+              JSON.parse(await fs.readFile(migrationRecoveryMarkerPath(dbPath), "utf8")),
+            ).toMatchObject({ phase: "migration-in-progress" });
+            validationObservedMarker = true;
+            return [{ integrity_check: "ok" }];
+          },
+        },
+      ),
+    );
+
+    expect(validationObservedMarker).toBe(true);
+    await expect(fs.stat(migrationRecoveryMarkerPath(dbPath))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    const migrated = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+      expect(migrated.prepare("SELECT value FROM marker_failure_probe").all()).toEqual([]);
+    } finally {
+      migrated.close();
+    }
+  });
+
+  it.each([
+    ["a non-ok result", [{ integrity_check: "database disk image is malformed" }]],
+    ["more than one ok result", [{ integrity_check: "ok" }, { integrity_check: "ok" }]],
+  ])("fails closed and retains the marker for %s", async (_label, integrityRows) => {
+    const dbPath = await makeMigrationCandidate();
+
+    await expect(
+      runWithDatabase(
+        dbPath,
+        runWithPreMigrationBackup(
+          dbPath,
+          Effect.gen(function* () {
+            const sql = yield* SqlClient.SqlClient;
+            yield* sql`DELETE FROM marker_failure_probe`;
+          }),
+          { readLiveDatabaseIntegrity: async () => integrityRows },
+        ),
+      ),
+    ).rejects.toThrow("Migrated database failed SQLite integrity_check");
+
+    expect(
+      JSON.parse(await fs.readFile(migrationRecoveryMarkerPath(dbPath), "utf8")),
+    ).toMatchObject({ phase: "migration-in-progress" });
+    await expect(Effect.runPromise(requireNoPendingMigrationRecovery(dbPath))).rejects.toThrow(
+      MigrationRecoveryRequiredError,
+    );
+
+    const failedDatabase = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+      expect(failedDatabase.prepare("SELECT value FROM marker_failure_probe").all()).toEqual([]);
+    } finally {
+      failedDatabase.close();
+    }
+  });
+
   it("fails closed without mutating marked files, then restores only when explicitly requested", async () => {
     const dbPath = await makeDbPath();
 
@@ -1439,7 +1513,7 @@ describe("migration backups", () => {
     const backups = await backupPaths(dbPath);
     expect(backups).toHaveLength(1);
     expect(path.basename(backups[0]!)).toMatch(
-      /^state\.sqlite\.pre-migration-imported-v54-from54-to-v69-\d{8}T\d{9}Z-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.sqlite$/,
+      /^state\.sqlite\.pre-migration-imported-v54-from54-to-v70-\d{8}T\d{9}Z-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.sqlite$/,
     );
     const backup = new DatabaseSync(backups[0]!, { readOnly: true });
     try {

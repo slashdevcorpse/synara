@@ -43,8 +43,15 @@ import {
   normalizeBrowserUrlInput as normalizeUrlInput,
   resolveCopyableBrowserTabUrl,
 } from "@synara/shared/browserSession";
+import {
+  BROWSER_SESSION_PARTITION,
+  createBrowserPopupNavigationPolicy,
+  enforceBrowserPopupNavigationPolicy,
+  isAllowedBrowserNavigationUrl,
+  type BrowserPopupNavigationPolicy,
+} from "./browserSecurity";
 
-export const BROWSER_SESSION_PARTITION = "persist:synara-browser";
+export { BROWSER_SESSION_PARTITION } from "./browserSecurity";
 const BROWSER_INACTIVE_TAB_SUSPEND_DELAY_MS = 1_500;
 const BROWSER_INACTIVE_TAB_SUSPEND_DELAY_PRESSURED_MS = 400;
 const BROWSER_MAX_WARM_INACTIVE_RUNTIMES_PER_THREAD = 1;
@@ -67,6 +74,7 @@ interface LiveTabRuntime {
 interface OAuthPopupContext {
   threadId: ThreadId;
   tabId: string;
+  navigationPolicy: BrowserPopupNavigationPolicy;
 }
 
 interface OAuthPopupRuntime extends OAuthPopupContext {
@@ -417,13 +425,35 @@ export class DesktopBrowserManager {
       webContents.removeListener("before-input-event", closeOnInput);
     });
 
+    const closeOnBlockedNavigation = () => {
+      this.closePopupRuntime(runtime);
+    };
+    const willNavigate = (event: Electron.Event<Electron.WebContentsWillNavigateEventParams>) => {
+      enforceBrowserPopupNavigationPolicy(
+        runtime.navigationPolicy,
+        event,
+        closeOnBlockedNavigation,
+      );
+    };
+    const willRedirect = (event: Electron.Event<Electron.WebContentsWillRedirectEventParams>) => {
+      enforceBrowserPopupNavigationPolicy(
+        runtime.navigationPolicy,
+        event,
+        closeOnBlockedNavigation,
+      );
+    };
+    webContents.on("will-navigate", willNavigate);
+    webContents.on("will-redirect", willRedirect);
+    runtime.listenerDisposers.push(() => {
+      webContents.removeListener("will-navigate", willNavigate);
+      webContents.removeListener("will-redirect", willRedirect);
+    });
+
     // Auth providers can chain web popups (provider -> consent). Page-controlled custom
     // schemes are denied here: browser content must never launch an OS handler implicitly.
     webContents.setWindowOpenHandler((details) => {
       const { url } = details;
-      const isWebUrl =
-        url.startsWith("http://") || url.startsWith("https://") || url === ABOUT_BLANK_URL;
-      if (!isWebUrl) {
+      if (!runtime.navigationPolicy.allowsNestedOpen(url)) {
         return { action: "deny" };
       }
 
@@ -452,10 +482,19 @@ export class DesktopBrowserManager {
       return { action: "deny" };
     });
 
-    const nestedWindowHandler = (nested: BrowserWindow) => {
+    const nestedWindowHandler = (
+      nested: BrowserWindow,
+      details: Electron.DidCreateWindowDetails,
+    ) => {
+      const navigationPolicy = runtime.navigationPolicy.deriveNested(details.url);
+      if (!navigationPolicy) {
+        if (!nested.isDestroyed()) nested.destroy();
+        return;
+      }
       this.registerOAuthPopupWindow(nested, {
         threadId: runtime.threadId,
         tabId: runtime.tabId,
+        navigationPolicy,
       });
     };
     webContents.on("did-create-window", nestedWindowHandler);
@@ -1537,9 +1576,7 @@ export class DesktopBrowserManager {
 
     webContents.setWindowOpenHandler((details) => {
       const { url } = details;
-      const isWebUrl =
-        url.startsWith("http://") || url.startsWith("https://") || url === ABOUT_BLANK_URL;
-      if (!isWebUrl) {
+      if (!isAllowedBrowserNavigationUrl(url)) {
         return { action: "deny" };
       }
 
@@ -1570,8 +1607,19 @@ export class DesktopBrowserManager {
       return { action: "deny" };
     });
 
-    const didCreateWindow = (childWindow: BrowserWindow) => {
-      this.registerOAuthPopupWindow(childWindow, { threadId, tabId });
+    const didCreateWindow = (
+      childWindow: BrowserWindow,
+      details: Electron.DidCreateWindowDetails,
+    ) => {
+      this.registerOAuthPopupWindow(childWindow, {
+        threadId,
+        tabId,
+        navigationPolicy: createBrowserPopupNavigationPolicy({
+          openerUrl: webContents.getURL(),
+          initialUrl: details.url,
+          allowAboutBlankOriginBinding: true,
+        }),
+      });
     };
     webContents.on("did-create-window", didCreateWindow);
     runtime.listenerDisposers.push(() => {

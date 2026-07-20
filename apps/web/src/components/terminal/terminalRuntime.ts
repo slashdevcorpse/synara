@@ -20,7 +20,11 @@ import {
   TERMINAL_MIN_COLS,
   TERMINAL_MIN_ROWS,
 } from "@synara/contracts";
-import type { TerminalSessionSnapshot } from "@synara/contracts";
+import type {
+  TerminalEvent,
+  TerminalEventStreamReady,
+  TerminalSessionSnapshot,
+} from "@synara/contracts";
 import { Terminal } from "@xterm/xterm";
 
 import { readNativeApi } from "~/nativeApi";
@@ -36,7 +40,10 @@ import {
   resolveWrappedTerminalLinkRange,
   wrappedTerminalLinkRangeIntersectsBufferLine,
 } from "../../terminal-links";
-import { addWsTransportStateListener } from "../../wsTransportEvents";
+import {
+  addTerminalResnapshotRequiredListener,
+  addWsTransportStateListener,
+} from "../../wsTransportEvents";
 import {
   getTerminalBoldFontWeight,
   getTerminalFontFamily,
@@ -46,6 +53,8 @@ import {
   writeSystemMessage,
 } from "./terminalRuntimeAppearance";
 import { terminalEventDispatcher } from "./terminalEventDispatcher";
+import { TerminalEventRecovery } from "./terminalEventRecovery";
+import { TerminalOutputAckQueue } from "./terminalOutputAckQueue";
 import type {
   TerminalRuntimeConfig,
   TerminalRuntimeEntry,
@@ -57,6 +66,7 @@ import {
   applyReplayOnce,
   createRecoveredGridOutputBuffer,
   hasRecoveredGrid,
+  makeAuthoritativeTerminalResnapshot,
   RecoveredGridFinalizationError,
   replaySnapshotAtBackendOpenGrid,
   replaySnapshotAtDestinationGrid,
@@ -73,7 +83,8 @@ const WRITE_BATCH_SIZE_LIMIT = 262_144;
 const WRITE_BATCH_MAX_LATENCY_MS = 50;
 const LINK_MATCH_CACHE_LIMIT = 512;
 const OPEN_SNAPSHOT_RECONCILE_DELAY_MS = 250;
-const TERMINAL_ACK_MAX_BYTES = 8_388_608;
+const AUTHORITATIVE_RECOVERY_RETRY_INITIAL_MS = 100;
+const AUTHORITATIVE_RECOVERY_RETRY_MAX_MS = 2_000;
 const TERMINAL_TEXT_ENCODER = new TextEncoder();
 const TERMINAL_PARKING_CONTAINER_ID = "synara-terminal-parking";
 const recoveredGridOutputBuffers = new WeakMap<
@@ -102,24 +113,7 @@ function terminalByteLength(data: string): number {
 }
 
 function acknowledgeParsedOutput(entry: TerminalRuntimeEntry, bytes: number): void {
-  if (!Number.isSafeInteger(bytes) || bytes <= 0) return;
-  const api = readNativeApi();
-  if (!api) return;
-  const ackOutput = api.terminal.ackOutput;
-  if (typeof ackOutput !== "function") return;
-
-  let remaining = bytes;
-  while (remaining > 0) {
-    const chunk = Math.min(remaining, TERMINAL_ACK_MAX_BYTES);
-    remaining -= chunk;
-    void ackOutput({
-      threadId: entry.threadId,
-      terminalId: entry.terminalId,
-      bytes: chunk,
-    }).catch(() => {
-      // Flow control is best-effort; reconnect/replay will recover from a missed ACK.
-    });
-  }
+  entry.terminalOutputAckQueue.enqueue(bytes);
 }
 
 function setRuntimeStatus(
@@ -230,6 +224,27 @@ function applyPendingRecoveredGridClear(entry: TerminalRuntimeEntry): boolean {
   return true;
 }
 
+async function writeRecoveredOutputAndWait(
+  entry: TerminalRuntimeEntry,
+  outputs: ReadonlyArray<{ readonly data: string; readonly byteLength: number }>,
+): Promise<void> {
+  if (outputs.length === 0) return;
+  const data = outputs.map((output) => output.data).join("");
+  const byteLength = outputs.reduce((total, output) => total + output.byteLength, 0);
+  const queuedAt = performance.now();
+  await new Promise<void>((resolve, reject) => {
+    try {
+      entry.terminal.write(data, () => {
+        acknowledgeParsedOutput(entry, byteLength);
+        observeTerminalWriteParsed({ runtimeKey: entry.runtimeKey, bytes: byteLength, queuedAt });
+        resolve();
+      });
+    } catch (error) {
+      reject(error);
+    }
+  });
+}
+
 function restoreBackendOpenGridAfterClear(entry: TerminalRuntimeEntry): boolean {
   const backendOpenDimensions = entry.backendOpenDimensions;
   if (!backendOpenDimensions) return false;
@@ -269,7 +284,11 @@ function replaySnapshot(
   entry: TerminalRuntimeEntry,
   snapshot: TerminalSessionSnapshot,
   onParsed?: () => void,
-  options?: { allowExistingOutput?: boolean; allowRecoveredGrid?: boolean },
+  options?: {
+    allowExistingOutput?: boolean;
+    allowRecoveredGrid?: boolean;
+    onFailure?: (error: unknown) => void;
+  },
 ): void {
   const retainedOutputBuffer = recoveredGridOutputBuffers.get(entry);
   const retryingRetainedOutput = retainedOutputBuffer !== undefined;
@@ -396,6 +415,12 @@ function replaySnapshot(
         if (!releaseBufferedOutput && !entry.disposed) setRuntimeStatus(entry, "error");
         throw error;
       } finally {
+        if (releaseBufferedOutput && !entry.disposed) {
+          if (applyPendingRecoveredGridClear(entry)) setRuntimeStatus(entry, "ready");
+          while (outputBuffer.size() > 0) {
+            await writeRecoveredOutputAndWait(entry, outputBuffer.drain());
+          }
+        }
         if (
           (releaseBufferedOutput || entry.disposed) &&
           recoveredGridOutputBuffers.get(entry) === outputBuffer
@@ -403,12 +428,6 @@ function replaySnapshot(
           recoveredGridOutputBuffers.delete(entry);
         }
         entry.recoveredGridReplayInProgress = false;
-        if (releaseBufferedOutput && !entry.disposed) {
-          if (applyPendingRecoveredGridClear(entry)) setRuntimeStatus(entry, "ready");
-          for (const output of outputBuffer.drain()) {
-            scheduleWrite(entry, output.data, output.byteLength);
-          }
-        }
       }
       return;
     }
@@ -438,10 +457,11 @@ function replaySnapshot(
       if (clearPendingAtRequest) entry.appliedHistoryRecordIdentity = null;
       onParsed?.();
     })
-    .catch(() => {
+    .catch((error) => {
       if (!entry.disposed && entry.outputEventVersion === outputEventVersionAtRequest) {
         setRuntimeStatus(entry, "error");
       }
+      options?.onFailure?.(error);
     });
 }
 
@@ -469,7 +489,7 @@ function clearPendingWrites(entry: TerminalRuntimeEntry): void {
   entry.pendingWriteBytes = 0;
 }
 
-function flushPendingWrites(entry: TerminalRuntimeEntry): void {
+function flushPendingWrites(entry: TerminalRuntimeEntry, onParsed?: () => void): void {
   if (entry.writeRafHandle !== null) {
     window.cancelAnimationFrame(entry.writeRafHandle);
     entry.writeRafHandle = null;
@@ -481,6 +501,7 @@ function flushPendingWrites(entry: TerminalRuntimeEntry): void {
   if (entry.pendingWrites.length === 0) {
     entry.pendingWriteLength = 0;
     entry.pendingWriteBytes = 0;
+    onParsed?.();
     return;
   }
   const combined = entry.pendingWrites.map((write) => write.data).join("");
@@ -496,6 +517,7 @@ function flushPendingWrites(entry: TerminalRuntimeEntry): void {
       bytes: byteLength,
       queuedAt,
     });
+    onParsed?.();
   });
 }
 
@@ -961,17 +983,305 @@ async function sendTerminalInput(
   }
 }
 
-function reconcileTerminalSnapshot(entry: TerminalRuntimeEntry): void {
-  if (entry.disposed || !entry.opened || entry.hasHandledExit) return;
+function handleTerminalExit(
+  entry: TerminalRuntimeEntry,
+  exitCode: number | null,
+  exitSignal: number | null,
+): void {
+  flushPendingWrites(entry);
+  const details = [
+    typeof exitCode === "number" ? `code ${exitCode}` : null,
+    typeof exitSignal === "number" ? `signal ${exitSignal}` : null,
+  ]
+    .filter((value): value is string => value !== null)
+    .join(", ");
+  writeSystemMessage(
+    entry.terminal,
+    details.length > 0 ? `Process exited (${details})` : "Process exited",
+  );
+  if (entry.hasHandledExit) return;
+  entry.hasHandledExit = true;
+  window.setTimeout(() => {
+    if (entry.hasHandledExit) {
+      entry.callbacks.onSessionExited();
+    }
+  }, 0);
+}
+
+function applyTerminalEvent(entry: TerminalRuntimeEntry, event: TerminalEvent): void {
+  const terminal = entry.terminal;
+  if (event.type === "output") {
+    const outputBuffer = recoveredGridOutputBuffers.get(entry);
+    if (
+      (!outputBuffer || entry.recoveredGridReplayInProgress) &&
+      !entry.terminalEventRecovery.isRecovering()
+    ) {
+      setRuntimeStatus(entry, "ready");
+    }
+    entry.outputEventVersion += 1;
+    entry.appliedHistoryRecordIdentity = null;
+    const output = {
+      data: event.data,
+      byteLength: event.byteLength ?? terminalByteLength(event.data),
+    };
+    if (outputBuffer) {
+      outputBuffer.enqueue(output);
+    } else {
+      scheduleWrite(entry, output.data, output.byteLength);
+    }
+    return;
+  }
+
+  if (event.type === "started" || event.type === "restarted") {
+    entry.hasHandledExit = false;
+    const retainedOutput = hasRetainedRecoveredOutput(entry);
+    const shouldReplaySnapshot =
+      retainedOutput || event.type === "restarted" || snapshotHasReplayPayload(event.snapshot);
+    if (shouldReplaySnapshot) {
+      const allowRecoveredGrid =
+        event.type === "restarted" ||
+        retainedOutput ||
+        !hasRecoveredGrid(event.snapshot) ||
+        shouldReplayColdSnapshot(event.snapshot, 0, entry.outputEventVersion);
+      if (event.type === "started" && hasRecoveredGrid(event.snapshot) && !allowRecoveredGrid) {
+        setRuntimeStatus(entry, "ready");
+        return;
+      }
+      replaySnapshot(entry, event.snapshot, () => setRuntimeStatus(entry, "ready"), {
+        allowExistingOutput: event.type === "restarted",
+        allowRecoveredGrid,
+      });
+    } else {
+      setRuntimeStatus(entry, "ready");
+    }
+    return;
+  }
+
+  if (event.type === "cleared") {
+    entry.outputEventVersion += 1;
+    entry.appliedHistoryRecordIdentity = null;
+    entry.titleInputBuffer = "";
+    entry.linkMatchCache.clear();
+    clearPendingWrites(entry);
+    const retainedOutputBuffer = recoveredGridOutputBuffers.get(entry);
+    if (retainedOutputBuffer) {
+      discardRecoveredGridOutput(entry, retainedOutputBuffer);
+      recoveredGridClearsPending.add(entry);
+      if (!entry.recoveredGridReplayInProgress) {
+        if (restoreBackendOpenGridAfterClear(entry)) {
+          recoveredGridOutputBuffers.delete(entry);
+          applyPendingRecoveredGridClear(entry);
+          setRuntimeStatus(entry, "ready");
+        } else {
+          setRuntimeStatus(entry, "error");
+        }
+      }
+      return;
+    }
+    terminal.clear();
+    terminal.write("\u001bc");
+    return;
+  }
+
+  if (event.type === "activity") {
+    if (entry.terminalCliKind !== event.cliKind) {
+      entry.terminalCliKind = event.cliKind;
+      entry.callbacks.onTerminalMetadataChange(entry.terminalId, {
+        cliKind: event.cliKind,
+        label: event.cliKind ? defaultTerminalTitleForCliKind(event.cliKind) : "Terminal",
+      });
+    }
+    entry.callbacks.onTerminalActivityChange(entry.terminalId, {
+      hasRunningSubprocess: event.hasRunningSubprocess,
+      agentState: event.agentState,
+    });
+    return;
+  }
+
+  if (event.type === "error") {
+    setRuntimeStatus(entry, "error");
+    writeSystemMessage(terminal, event.message);
+    return;
+  }
+
+  if (event.type === "exited") {
+    handleTerminalExit(entry, event.exitCode, event.exitSignal);
+  }
+}
+
+function receiveTerminalEvent(entry: TerminalRuntimeEntry, event: TerminalEvent): void {
+  const disposition = entry.terminalEventRecovery.ingest(event);
+  if (disposition === "overflow") {
+    entry.terminalEventRecovery.restart();
+    reconcileTerminalSnapshot(entry, { authoritativeReplace: true });
+    return;
+  }
+  if (disposition === "generation-change") {
+    reconcileTerminalSnapshot(entry, { authoritativeReplace: true });
+    return;
+  }
+  if (disposition === "apply") {
+    applyTerminalEvent(entry, event);
+  }
+}
+
+function waitForTerminalEventStreamReady(
+  api: NonNullable<ReturnType<typeof readNativeApi>>,
+): Promise<TerminalEventStreamReady | null> {
+  return api.terminal.waitUntilEventStreamReady?.() ?? Promise.resolve(null);
+}
+
+function scheduleAuthoritativeRecoveryRetry(
+  entry: TerminalRuntimeEntry,
+  delayOverride?: number,
+): void {
+  if (
+    entry.disposed ||
+    !entry.opened ||
+    !entry.needsAuthoritativeRecovery ||
+    entry.authoritativeRecoveryRetryTimer !== null
+  ) {
+    return;
+  }
+  const delay =
+    delayOverride ??
+    Math.min(
+      AUTHORITATIVE_RECOVERY_RETRY_INITIAL_MS * 2 ** entry.authoritativeRecoveryAttempt,
+      AUTHORITATIVE_RECOVERY_RETRY_MAX_MS,
+    );
+  if (delayOverride === undefined) entry.authoritativeRecoveryAttempt += 1;
+  entry.authoritativeRecoveryRetryTimer = window.setTimeout(() => {
+    entry.authoritativeRecoveryRetryTimer = null;
+    runAuthoritativeRecoveryAttempt(entry);
+  }, delay);
+}
+
+function failAuthoritativeRecovery(
+  entry: TerminalRuntimeEntry,
+  requestId: number,
+  error: unknown,
+): void {
+  if (entry.disposed || !entry.opened || entry.snapshotReconcileRequestId !== requestId) return;
+  entry.authoritativeRecoveryInFlight = false;
+  entry.authoritativeRecoveryRetryRequested = false;
+  setRuntimeStatus(entry, "connecting");
+  if (entry.authoritativeRecoveryAttempt === 0) {
+    writeSystemMessage(
+      entry.terminal,
+      error instanceof Error ? error.message : "Failed to recover terminal event stream",
+    );
+  }
+  scheduleAuthoritativeRecoveryRetry(entry);
+}
+
+function runAuthoritativeRecoveryAttempt(entry: TerminalRuntimeEntry): void {
+  if (
+    entry.disposed ||
+    !entry.opened ||
+    !entry.needsAuthoritativeRecovery ||
+    entry.authoritativeRecoveryInFlight
+  ) {
+    return;
+  }
+  const api = readNativeApi();
+  if (!api) {
+    scheduleAuthoritativeRecoveryRetry(entry);
+    return;
+  }
+
+  entry.authoritativeRecoveryInFlight = true;
+  entry.authoritativeRecoveryRetryRequested = false;
+  const requestId = ++entry.snapshotReconcileRequestId;
+  setRuntimeStatus(entry, "connecting");
+
+  void (async () => {
+    const [ready] = await Promise.all([
+      waitForTerminalEventStreamReady(api),
+      entry.terminalOutputAckQueue.quiesceForRebase(),
+    ]);
+    if (entry.disposed || !entry.opened || entry.snapshotReconcileRequestId !== requestId) return;
+    if (ready) entry.terminalEventRecovery.prepareGeneration(ready.generation);
+
+    const recovery = await api.terminal.snapshot({
+      threadId: entry.threadId,
+      terminalId: entry.terminalId,
+    });
+    if (entry.disposed || !entry.opened || entry.snapshotReconcileRequestId !== requestId) return;
+    if (ready && recovery.generation !== ready.generation) {
+      throw new Error("Terminal event stream changed while its recovery snapshot was captured");
+    }
+    if (!ready) entry.terminalEventRecovery.prepareGeneration(recovery.generation);
+    if (
+      entry.terminalEventRecovery.commitSnapshot(recovery.generation, recovery.watermark) === null
+    ) {
+      throw new Error("Terminal event generation changed during recovery");
+    }
+
+    const finishRecovery = () => {
+      if (entry.disposed || entry.snapshotReconcileRequestId !== requestId) return;
+      entry.authoritativeRecoveryInFlight = false;
+      if (entry.authoritativeRecoveryRetryRequested) {
+        scheduleAuthoritativeRecoveryRetry(entry, 0);
+        return;
+      }
+      entry.needsAuthoritativeRecovery = false;
+      entry.authoritativeRecoveryAttempt = 0;
+      if (recovery.snapshot.status === "exited") {
+        handleTerminalExit(entry, recovery.snapshot.exitCode, recovery.snapshot.exitSignal);
+      }
+      entry.terminalOutputAckQueue.resumeAfterRebase();
+      entry.terminalEventRecovery.finish(
+        (event) => applyTerminalEvent(entry, event),
+        () => undefined,
+      );
+      flushPendingWrites(entry, () => {
+        if (entry.disposed || entry.snapshotReconcileRequestId !== requestId) return;
+        if (recovery.snapshot.status === "error" && !entry.hasHandledExit) {
+          setRuntimeStatus(entry, "error");
+        } else if (!entry.hasHandledExit) {
+          setRuntimeStatus(entry, "ready");
+        }
+      });
+    };
+
+    replaySnapshot(entry, makeAuthoritativeTerminalResnapshot(recovery.snapshot), finishRecovery, {
+      allowExistingOutput: true,
+      onFailure: (error) => failAuthoritativeRecovery(entry, requestId, error),
+    });
+  })().catch((error) => failAuthoritativeRecovery(entry, requestId, error));
+}
+
+function reconcileTerminalSnapshot(
+  entry: TerminalRuntimeEntry,
+  options?: { readonly authoritativeReplace?: boolean },
+): void {
+  const authoritativeReplace = options?.authoritativeReplace === true;
+  if (entry.disposed || !entry.opened || (!authoritativeReplace && entry.hasHandledExit)) return;
   const api = readNativeApi();
   if (!api) return;
+
+  if (authoritativeReplace) {
+    entry.needsAuthoritativeRecovery = true;
+    entry.terminalEventRecovery.begin();
+    if (!recoveredGridOutputBuffers.has(entry)) {
+      recoveredGridOutputBuffers.set(entry, createRecoveredGridOutputBuffer());
+    }
+    entry.appliedHistoryRecordIdentity = null;
+    if (entry.authoritativeRecoveryInFlight) {
+      entry.authoritativeRecoveryRetryRequested = true;
+      return;
+    }
+    if (entry.authoritativeRecoveryRetryTimer !== null) return;
+    runAuthoritativeRecoveryAttempt(entry);
+    return;
+  }
 
   const outputEventVersionAtRequest = entry.outputEventVersion;
   const requestId = ++entry.snapshotReconcileRequestId;
   setRuntimeStatus(entry, "connecting");
 
-  void api.terminal
-    .open(buildOpenInput(entry))
+  void waitForTerminalEventStreamReady(api)
+    .then(() => api.terminal.open(buildOpenInput(entry)))
     .then((snapshot) => {
       if (
         entry.disposed ||
@@ -1070,7 +1380,17 @@ export function createRuntimeEntry(config: TerminalRuntimeConfig): TerminalRunti
   }
   terminal.open(wrapper);
 
-  const entry: TerminalRuntimeEntry = {
+  let entry!: TerminalRuntimeEntry;
+  const terminalOutputAckQueue = new TerminalOutputAckQueue(async (bytes) => {
+    const api = readNativeApi();
+    if (!api || typeof api.terminal.ackOutput !== "function") return;
+    await api.terminal.ackOutput({
+      threadId: entry.threadId,
+      terminalId: entry.terminalId,
+      bytes,
+    });
+  });
+  entry = {
     runtimeKey: config.runtimeKey,
     threadId: config.threadId,
     terminalId: config.terminalId,
@@ -1111,6 +1431,13 @@ export function createRuntimeEntry(config: TerminalRuntimeConfig): TerminalRunti
     linkMatchCache: new Map(),
     outputEventVersion: 0,
     snapshotReconcileRequestId: 0,
+    terminalEventRecovery: new TerminalEventRecovery(),
+    terminalOutputAckQueue,
+    needsAuthoritativeRecovery: false,
+    authoritativeRecoveryInFlight: false,
+    authoritativeRecoveryRetryTimer: null,
+    authoritativeRecoveryAttempt: 0,
+    authoritativeRecoveryRetryRequested: false,
     webglLoadFrame: null,
     themeRefreshFrame: 0,
     themeObserver: null,
@@ -1152,9 +1479,17 @@ export function createRuntimeEntry(config: TerminalRuntimeConfig): TerminalRunti
   });
 
   const unsubscribeTransportState = addWsTransportStateListener((state) => {
-    if (entry.disposed || !entry.opened || entry.hasHandledExit) return;
+    if (
+      entry.disposed ||
+      !entry.opened ||
+      (entry.hasHandledExit && !entry.needsAuthoritativeRecovery)
+    ) {
+      return;
+    }
     if (state === "open") {
-      reconcileTerminalSnapshot(entry);
+      reconcileTerminalSnapshot(entry, {
+        authoritativeReplace: entry.needsAuthoritativeRecovery,
+      });
       return;
     }
     if (state === "connecting" || state === "closed") {
@@ -1162,6 +1497,11 @@ export function createRuntimeEntry(config: TerminalRuntimeConfig): TerminalRunti
     }
   });
   entry.persistentDisposables.push(unsubscribeTransportState);
+
+  const unsubscribeTerminalResnapshot = addTerminalResnapshotRequiredListener(() => {
+    reconcileTerminalSnapshot(entry, { authoritativeReplace: true });
+  });
+  entry.persistentDisposables.push(unsubscribeTerminalResnapshot);
 
   terminal.attachCustomKeyEventHandler((event) => {
     if (
@@ -1291,125 +1631,7 @@ export function createRuntimeEntry(config: TerminalRuntimeConfig): TerminalRunti
   entry.unsubscribeTerminalEvents = terminalEventDispatcher.subscribe(
     entry.threadId,
     entry.terminalId,
-    (event) => {
-      if (event.type === "output") {
-        const outputBuffer = recoveredGridOutputBuffers.get(entry);
-        if (!outputBuffer || entry.recoveredGridReplayInProgress) {
-          setRuntimeStatus(entry, "ready");
-        }
-        entry.outputEventVersion += 1;
-        entry.appliedHistoryRecordIdentity = null;
-        const output = {
-          data: event.data,
-          byteLength: event.byteLength ?? terminalByteLength(event.data),
-        };
-        if (outputBuffer) {
-          outputBuffer.enqueue(output);
-        } else {
-          scheduleWrite(entry, output.data, output.byteLength);
-        }
-        return;
-      }
-
-      if (event.type === "started" || event.type === "restarted") {
-        entry.hasHandledExit = false;
-        const retainedOutput = hasRetainedRecoveredOutput(entry);
-        const shouldReplaySnapshot =
-          retainedOutput || event.type === "restarted" || snapshotHasReplayPayload(event.snapshot);
-        if (shouldReplaySnapshot) {
-          const allowRecoveredGrid =
-            event.type === "restarted" ||
-            retainedOutput ||
-            !hasRecoveredGrid(event.snapshot) ||
-            shouldReplayColdSnapshot(event.snapshot, 0, entry.outputEventVersion);
-          if (event.type === "started" && hasRecoveredGrid(event.snapshot) && !allowRecoveredGrid) {
-            setRuntimeStatus(entry, "ready");
-            return;
-          }
-          replaySnapshot(entry, event.snapshot, () => setRuntimeStatus(entry, "ready"), {
-            allowExistingOutput: event.type === "restarted",
-            allowRecoveredGrid,
-          });
-        } else {
-          setRuntimeStatus(entry, "ready");
-        }
-        return;
-      }
-
-      if (event.type === "cleared") {
-        entry.outputEventVersion += 1;
-        entry.appliedHistoryRecordIdentity = null;
-        entry.titleInputBuffer = "";
-        entry.linkMatchCache.clear();
-        clearPendingWrites(entry);
-        const retainedOutputBuffer = recoveredGridOutputBuffers.get(entry);
-        if (retainedOutputBuffer) {
-          // A backend clear supersedes output received before it. Discard those
-          // retained bytes, then either clear immediately at the known backend
-          // grid or defer the clear until a recovered-grid retry is safe.
-          discardRecoveredGridOutput(entry, retainedOutputBuffer);
-          recoveredGridClearsPending.add(entry);
-          if (!entry.recoveredGridReplayInProgress) {
-            if (restoreBackendOpenGridAfterClear(entry)) {
-              recoveredGridOutputBuffers.delete(entry);
-              applyPendingRecoveredGridClear(entry);
-              setRuntimeStatus(entry, "ready");
-            } else {
-              setRuntimeStatus(entry, "error");
-            }
-          }
-          return;
-        }
-        terminal.clear();
-        terminal.write("\u001bc");
-        return;
-      }
-
-      if (event.type === "activity") {
-        if (entry.terminalCliKind !== event.cliKind) {
-          entry.terminalCliKind = event.cliKind;
-          entry.callbacks.onTerminalMetadataChange(entry.terminalId, {
-            cliKind: event.cliKind,
-            label: event.cliKind ? defaultTerminalTitleForCliKind(event.cliKind) : "Terminal",
-          });
-        }
-        entry.callbacks.onTerminalActivityChange(entry.terminalId, {
-          hasRunningSubprocess: event.hasRunningSubprocess,
-          agentState: event.agentState,
-        });
-        return;
-      }
-
-      if (event.type === "error") {
-        setRuntimeStatus(entry, "error");
-        writeSystemMessage(terminal, event.message);
-        return;
-      }
-
-      if (event.type === "exited") {
-        flushPendingWrites(entry);
-        const details = [
-          typeof event.exitCode === "number" ? `code ${event.exitCode}` : null,
-          typeof event.exitSignal === "number" ? `signal ${event.exitSignal}` : null,
-        ]
-          .filter((value): value is string => value !== null)
-          .join(", ");
-        writeSystemMessage(
-          terminal,
-          details.length > 0 ? `Process exited (${details})` : "Process exited",
-        );
-        if (entry.hasHandledExit) {
-          return;
-        }
-        entry.hasHandledExit = true;
-        window.setTimeout(() => {
-          if (!entry.hasHandledExit) {
-            return;
-          }
-          entry.callbacks.onSessionExited();
-        }, 0);
-      }
-    },
+    (event) => receiveTerminalEvent(entry, event),
   );
 
   return entry;
@@ -1427,8 +1649,8 @@ function openTerminal(entry: TerminalRuntimeEntry): void {
   const openInput = buildOpenInput(entry);
   entry.backendOpenDimensions = { cols: openInput.cols, rows: openInput.rows };
 
-  void api.terminal
-    .open(openInput)
+  void waitForTerminalEventStreamReady(api)
+    .then(() => api.terminal.open(openInput))
     .then((snapshot) => {
       if (entry.disposed) return;
       const retainedOutput = hasRetainedRecoveredOutput(entry);
@@ -1452,8 +1674,8 @@ function openTerminal(entry: TerminalRuntimeEntry): void {
           ) {
             return;
           }
-          void api.terminal
-            .open(openInput)
+          void waitForTerminalEventStreamReady(api)
+            .then(() => api.terminal.open(openInput))
             .then((nextSnapshot) => {
               const retainedOutput = hasRetainedRecoveredOutput(entry);
               if (entry.disposed) return;
@@ -1550,11 +1772,18 @@ export function detachRuntimeFromContainer(entry: TerminalRuntimeEntry): void {
 export function disposeRuntimeEntry(entry: TerminalRuntimeEntry): void {
   detachRuntimeFromContainer(entry);
   entry.disposed = true;
+  if (entry.authoritativeRecoveryRetryTimer !== null) {
+    window.clearTimeout(entry.authoritativeRecoveryRetryTimer);
+    entry.authoritativeRecoveryRetryTimer = null;
+  }
+  entry.authoritativeRecoveryInFlight = false;
+  entry.authoritativeRecoveryRetryRequested = false;
   // Closing a terminal should not synchronously paint queued output into a buffer
   // that is about to be destroyed; acknowledge and drop it to keep close latency low.
   clearPendingWrites(entry);
   const retainedOutputBuffer = recoveredGridOutputBuffers.get(entry);
   if (retainedOutputBuffer) discardRecoveredGridOutput(entry, retainedOutputBuffer);
+  entry.terminalOutputAckQueue.dispose();
   recoveredGridOutputBuffers.delete(entry);
   recoveredGridClearsPending.delete(entry);
   entry.recoveredGridReplayInProgress = false;

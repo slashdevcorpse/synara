@@ -14,6 +14,8 @@ import {
   TerminalOpenInput,
   TerminalResizeInput,
   TerminalRestartInput,
+  TerminalRecoverySnapshot,
+  TerminalSessionInput,
   TerminalSessionSnapshot,
   TerminalSessionStatus,
   TerminalWriteInput,
@@ -98,6 +100,8 @@ export interface TerminalSessionState {
   lastOutputAt: number | null;
   /** Normalized visible output used to ignore redraw-only PTY noise. */
   lastOutputSignature: string | null;
+  /** Monotonic event clock scoped to this terminal session. */
+  eventSequence: number;
 }
 
 export interface ShellCandidate {
@@ -114,6 +118,9 @@ export interface TerminalStartInput extends TerminalOpenInput {
  * TerminalManagerShape - Service API for terminal session lifecycle operations.
  */
 export interface TerminalManagerShape {
+  /** Unique event-sequence namespace for this server-side manager instance. */
+  readonly generation: string;
+
   /**
    * Open or attach to a terminal session.
    *
@@ -123,6 +130,11 @@ export interface TerminalManagerShape {
   readonly open: (
     input: TerminalOpenInput,
   ) => Effect.Effect<TerminalSessionSnapshot, TerminalError>;
+
+  /** Capture authoritative state without creating or starting a process. */
+  readonly snapshot: (
+    input: TerminalSessionInput,
+  ) => Effect.Effect<TerminalRecoverySnapshot, TerminalError>;
 
   /**
    * Write input bytes to a terminal session.

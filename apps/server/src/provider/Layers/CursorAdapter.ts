@@ -22,7 +22,6 @@ import {
   type ThreadId,
   TurnId,
 } from "@synara/contracts";
-import { prepareWindowsSafeProcess } from "@synara/shared/windowsProcess";
 import {
   DateTime,
   Deferred,
@@ -43,6 +42,7 @@ import type * as EffectAcpSchema from "effect-acp/schema";
 import { ServerConfig, type ServerConfigShape } from "../../config.ts";
 import { appendFileAttachmentsPromptBlock } from "../attachmentProjection.ts";
 import { loadProviderPromptImageBlocks } from "../promptAttachments.ts";
+import { prepareWindowsProviderProcess } from "../windowsProviderProcess.ts";
 import {
   ProviderAdapterProcessError,
   ProviderAdapterRequestError,
@@ -1412,7 +1412,7 @@ export function makeCursorAdapter(
           ...(effectiveApiEndpoint ? { apiEndpoint: effectiveApiEndpoint } : {}),
         });
         const env = buildCursorAgentHeadlessEnv();
-        const prepared = prepareWindowsSafeProcess(command.command, command.args, {
+        const prepared = prepareWindowsProviderProcess(command.command, command.args, {
           env,
         });
         const child = yield* childProcessSpawner.spawn(

@@ -32,16 +32,77 @@ export interface LocalPreviewGrantResult {
   readonly expiresAt: string;
 }
 
-const LOCAL_PREVIEW_GRANT_TTL_MS = 2 * 60 * 1000;
-const localPreviewGrantByToken = new Map<string, { realFilePath: string; expiresAtMs: number }>();
+export const LOCAL_PREVIEW_GRANT_TTL_MS = 2 * 60 * 1000;
+export const MAX_OUTSTANDING_LOCAL_PREVIEW_GRANTS = 100;
 
-function pruneExpiredPreviewGrants(nowMs = Date.now()): void {
-  for (const [token, grant] of localPreviewGrantByToken) {
-    if (grant.expiresAtMs <= nowMs) {
-      localPreviewGrantByToken.delete(token);
-    }
+interface LocalPreviewGrantRecord {
+  readonly realFilePath: string;
+  readonly expiresAtMs: number;
+}
+
+export class LocalPreviewGrantCapacityError extends Error {
+  readonly code = "LOCAL_PREVIEW_GRANT_CAPACITY_EXCEEDED";
+
+  constructor(readonly retryAfterMs: number) {
+    super("Local preview grant capacity exceeded.");
+    this.name = "LocalPreviewGrantCapacityError";
   }
 }
+
+export function makeLocalPreviewGrantRegistry(
+  options: {
+    readonly now?: () => number;
+    readonly createToken?: () => string;
+    readonly maxOutstanding?: number;
+    readonly ttlMs?: number;
+  } = {},
+) {
+  const now = options.now ?? Date.now;
+  const createToken = options.createToken ?? crypto.randomUUID;
+  const maxOutstanding = options.maxOutstanding ?? MAX_OUTSTANDING_LOCAL_PREVIEW_GRANTS;
+  const ttlMs = options.ttlMs ?? LOCAL_PREVIEW_GRANT_TTL_MS;
+  const grants = new Map<string, LocalPreviewGrantRecord>();
+
+  const pruneExpired = (nowMs = now()): void => {
+    for (const [token, grant] of grants) {
+      if (grant.expiresAtMs <= nowMs) grants.delete(token);
+    }
+  };
+
+  const resolve = (token: string | null | undefined): string | null => {
+    const normalizedToken = token?.trim();
+    if (!normalizedToken) return null;
+    const nowMs = now();
+    pruneExpired(nowMs);
+    const grant = grants.get(normalizedToken);
+    return grant !== undefined && grant.expiresAtMs > nowMs ? grant.realFilePath : null;
+  };
+
+  const create = (realFilePath: string): LocalPreviewGrantResult => {
+    const nowMs = now();
+    pruneExpired(nowMs);
+    if (grants.size >= maxOutstanding) {
+      const earliestExpiryMs = Math.min(
+        ...Array.from(grants.values(), (grant) => grant.expiresAtMs),
+      );
+      throw new LocalPreviewGrantCapacityError(Math.max(1, earliestExpiryMs - nowMs));
+    }
+
+    const grant = createToken();
+    const expiresAtMs = nowMs + ttlMs;
+    grants.set(grant, { realFilePath, expiresAtMs });
+    return { grant, expiresAt: new Date(expiresAtMs).toISOString() };
+  };
+
+  const snapshot = () => {
+    pruneExpired();
+    return { outstanding: grants.size } as const;
+  };
+
+  return { create, resolve, snapshot } as const;
+}
+
+const localPreviewGrants = makeLocalPreviewGrantRegistry();
 
 function hasValidPreviewGrant(input: {
   readonly token: string | null | undefined;
@@ -53,14 +114,7 @@ function hasValidPreviewGrant(input: {
 export function resolveLocalPreviewGrantRealPath(input: {
   readonly token: string | null | undefined;
 }): string | null {
-  const token = input.token?.trim();
-  if (!token) {
-    return null;
-  }
-  const nowMs = Date.now();
-  pruneExpiredPreviewGrants(nowMs);
-  const grant = localPreviewGrantByToken.get(token);
-  return grant !== undefined && grant.expiresAtMs > nowMs ? grant.realFilePath : null;
+  return localPreviewGrants.resolve(input.token);
 }
 
 function isPathInside(candidate: string, root: string): boolean {
@@ -215,9 +269,5 @@ export async function createLocalPreviewGrant(input: {
     throw new Error("Preview path is not a file.");
   }
 
-  const expiresAtMs = Date.now() + LOCAL_PREVIEW_GRANT_TTL_MS;
-  const grant = crypto.randomUUID();
-  localPreviewGrantByToken.set(grant, { realFilePath, expiresAtMs });
-  pruneExpiredPreviewGrants();
-  return { grant, expiresAt: new Date(expiresAtMs).toISOString() };
+  return localPreviewGrants.create(realFilePath);
 }

@@ -9,6 +9,7 @@ import {
   replaySnapshotAtBackendOpenGrid,
   replaySnapshotAtDestinationGrid,
   replaySnapshotAtRecoveredGrid,
+  makeAuthoritativeTerminalResnapshot,
   shouldReplayColdSnapshot,
   snapshotReplayIdentity,
 } from "./terminalSnapshotReplay";
@@ -517,6 +518,31 @@ describe("destination and warm replay compatibility", () => {
     expect(terminal.cols).toBe(100);
     expect(terminal.rows).toBe(30);
     expect(writes).toEqual(["\u001bc", "history"]);
+  });
+
+  it("replaces potentially holed output from an authoritative resnapshot without duplicating history", () => {
+    let rendered = "before-overflow\n";
+    const terminal = {
+      cols: 100,
+      rows: 30,
+      resize() {},
+      write(data: string, callback?: () => void) {
+        if (data === "\u001bc") rendered = "";
+        else rendered += data;
+        callback?.();
+      },
+    };
+    const snapshot = makeAuthoritativeTerminalResnapshot({
+      ...dimensionedSnapshot(80, 24),
+      history: "before-overflow\nmissed-byte-range\nafter-overflow\n",
+    });
+
+    replaySnapshotAtDestinationGrid(terminal, snapshot);
+
+    expect(snapshot.recoveredCols).toBeUndefined();
+    expect(snapshot.recoveredRows).toBeUndefined();
+    expect(snapshot.historyRecordIdentity).toBeUndefined();
+    expect(rendered).toBe("before-overflow\nmissed-byte-range\nafter-overflow\n");
   });
 
   it("does not select cold replay after live output advances", () => {

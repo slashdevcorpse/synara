@@ -71,6 +71,24 @@ export function snapshotHasReplayPayload(snapshot: TerminalSessionSnapshot): boo
   return snapshot.history.length > 0 || (snapshot.replayPreamble?.length ?? 0) > 0;
 }
 
+/**
+ * Overflow recovery must replace the destination grid and deduplicate live
+ * events already represented by the snapshot. Treat the snapshot as
+ * dimensionless so the runtime uses its verified backend-open grid and can
+ * discard the retained pre-response event prefix exactly once.
+ */
+export function makeAuthoritativeTerminalResnapshot(
+  snapshot: TerminalSessionSnapshot,
+): TerminalSessionSnapshot {
+  const {
+    recoveredCols: _recoveredCols,
+    recoveredRows: _recoveredRows,
+    historyRecordIdentity: _historyRecordIdentity,
+    ...dimensionless
+  } = snapshot;
+  return dimensionless;
+}
+
 export async function snapshotReplayIdentity(snapshot: TerminalSessionSnapshot): Promise<string> {
   if (snapshot.historyRecordIdentity) return snapshot.historyRecordIdentity;
   const recoveredGridPrefix = hasRecoveredGrid(snapshot)

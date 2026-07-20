@@ -39,6 +39,7 @@ import { ProjectPullRequestPinsLive } from "./persistence/Layers/ProjectPullRequ
 import { ProjectionTurnRepositoryLive } from "./persistence/Layers/ProjectionTurns";
 import { OrchestrationEventDeliveryRepositoryLive } from "./persistence/Layers/OrchestrationEventDeliveries";
 import { ManagedAttachmentCleanupLive } from "./managedAttachmentCleanup";
+import { ScratchWorkspaceCleanupLive } from "./scratchWorkspaceCleanup";
 import { PullRequestServiceLive } from "./pullRequests/Layers/PullRequestService";
 
 export { makeServerProviderLayer } from "./provider/runtimeLayer";
@@ -58,6 +59,9 @@ export function makeServerRuntimeServicesLayer() {
     RuntimeReceiptBusLive,
   );
   const managedAttachmentCleanupLayer = ManagedAttachmentCleanupLive.pipe(
+    Layer.provideMerge(runtimeServicesLayer),
+  );
+  const scratchWorkspaceCleanupLayer = ScratchWorkspaceCleanupLive.pipe(
     Layer.provideMerge(runtimeServicesLayer),
   );
   const runtimeIngestionLayer = ProviderRuntimeIngestionLive.pipe(
@@ -140,6 +144,7 @@ export function makeServerRuntimeServicesLayer() {
     automationSchedulerLayer,
     automationRunReactorLayer,
     managedAttachmentCleanupLayer,
+    scratchWorkspaceCleanupLayer,
     AutomationRepositoryLive,
     ProjectPullRequestPinsLive,
     pullRequestServiceLayer,

@@ -19,6 +19,9 @@ class CliError extends Data.TaggedError("CliError")<{
   readonly cause?: unknown;
 }> {}
 
+const WINDOWS_JOB_LAUNCHER_ARCHITECTURES = ["x64", "arm64"] as const;
+const WINDOWS_JOB_LAUNCHER_EXECUTABLE = "synara-windows-job-launcher.exe";
+
 // Some desktop builds do not expose workspace metadata in the root package.json.
 // Publish prep only needs the catalog map when it exists.
 function resolveRootWorkspaceCatalog(): Record<string, unknown> {
@@ -115,6 +118,44 @@ const applyDevelopmentIconOverrides = Effect.fn("applyDevelopmentIconOverrides")
   yield* Effect.log("[cli] Applied development icon overrides to dist/client");
 });
 
+const stageWindowsJobLauncherArtifacts = Effect.fn("stageWindowsJobLauncherArtifacts")(function* (
+  serverDir: string,
+) {
+  const path = yield* Path.Path;
+  const fs = yield* FileSystem.FileSystem;
+  const stagedArchitectures: string[] = [];
+
+  for (const arch of WINDOWS_JOB_LAUNCHER_ARCHITECTURES) {
+    const source = path.join(
+      serverDir,
+      "native/windows-job-launcher/out",
+      `win32-${arch}`,
+      WINDOWS_JOB_LAUNCHER_EXECUTABLE,
+    );
+    if (!(yield* fs.exists(source))) continue;
+
+    const destination = path.join(
+      serverDir,
+      "dist/native",
+      `win32-${arch}`,
+      WINDOWS_JOB_LAUNCHER_EXECUTABLE,
+    );
+    yield* fs.makeDirectory(path.dirname(destination), { recursive: true });
+    yield* fs.copyFile(source, destination);
+    stagedArchitectures.push(arch);
+  }
+
+  if (stagedArchitectures.length > 0) {
+    yield* Effect.log(
+      `[cli] Staged Windows Job launcher artifacts: ${stagedArchitectures.join(", ")}`,
+    );
+  } else {
+    yield* Effect.logWarning(
+      "[cli] No Windows Job launcher artifacts were available; Windows provider startup will fail closed until one is built.",
+    );
+  }
+});
+
 // ---------------------------------------------------------------------------
 // build subcommand
 // ---------------------------------------------------------------------------
@@ -141,6 +182,9 @@ const buildCmd = Command.make(
           shell: process.platform === "win32",
         })`bun tsdown`,
       );
+
+      // tsdown cleans dist, so native artifacts must be staged after bundling.
+      yield* stageWindowsJobLauncherArtifacts(serverDir);
 
       const webDist = path.join(repoRoot, "apps/web/dist");
       const clientTarget = path.join(serverDir, "dist/client");
@@ -181,6 +225,9 @@ const publishCmd = Command.make(
         "dist/index.mjs",
         "dist/restoreMigrationBackup.mjs",
         "dist/client/index.html",
+        ...WINDOWS_JOB_LAUNCHER_ARCHITECTURES.map(
+          (arch) => `dist/native/win32-${arch}/${WINDOWS_JOB_LAUNCHER_EXECUTABLE}`,
+        ),
       ]) {
         const abs = path.join(serverDir, relPath);
         if (!(yield* fs.exists(abs))) {

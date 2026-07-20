@@ -19,7 +19,12 @@ import {
   type SessionCredentialServiceShape,
 } from "./auth/Services/SessionCredentialService";
 import { ServerConfig } from "./config";
-import { makeBoundedNodeHttpServer, MAX_WEBSOCKET_MESSAGE_BYTES } from "./nodeHttpServer";
+import {
+  makeBoundedNodeHttpServer,
+  MAX_WEBSOCKET_MESSAGE_BYTES,
+  wsTransportAdmissionOptionsForServerConfig,
+} from "./nodeHttpServer";
+import type { WsTransportAdmissionOptions } from "./wsTransportAdmission";
 import { SqlitePersistenceMemory } from "./persistence/Layers/Sqlite";
 import { makeWebsocketRpcRouteLayer } from "./wsRpc";
 import { makeCurrentWsFeatureCompatibilitySearchParams } from "./wsCompatibility";
@@ -51,9 +56,9 @@ afterEach(() => {
   openSockets.clear();
 });
 
-function connect(url: string): Promise<WebSocket> {
+function connect(url: string, headers: Record<string, string> = {}): Promise<WebSocket> {
   return new Promise((resolve, reject) => {
-    const socket = new WebSocket(url, { perMessageDeflate: false });
+    const socket = new WebSocket(url, { perMessageDeflate: false, headers });
     openSockets.add(socket);
     socket.once("open", () => resolve(socket));
     socket.once("error", reject);
@@ -158,7 +163,10 @@ function ping(socket: WebSocket, timeoutMs = 2_000): Promise<void> {
   });
 }
 
-async function startTestServer(): Promise<RunningTestServer> {
+async function startTestServer(
+  admissionOptions: WsTransportAdmissionOptions = {},
+  publicUrl?: URL,
+): Promise<RunningTestServer> {
   const baseConfigLayer = ServerConfig.layerTest(process.cwd(), {
     prefix: "synara-ws-lifecycle-test-",
   }).pipe(Layer.provide(NodeServices.layer));
@@ -166,7 +174,7 @@ async function startTestServer(): Promise<RunningTestServer> {
     ServerConfig,
     Effect.gen(function* () {
       const config = yield* ServerConfig;
-      return { ...config, authToken: "force-session-auth" };
+      return { ...config, authToken: "force-session-auth", publicUrl };
     }),
   ).pipe(Layer.provide(baseConfigLayer));
   const sessionsLayer = SessionCredentialServiceLive.pipe(
@@ -278,6 +286,7 @@ async function startTestServer(): Promise<RunningTestServer> {
             return nodeServer;
           },
           { port: 0, host: "127.0.0.1" },
+          wsTransportAdmissionOptionsForServerConfig({ publicUrl }, admissionOptions),
         );
         const httpApp = yield* HttpRouter.toHttpEffect(routeLayer);
         yield* httpServer.serve(httpApp);
@@ -302,6 +311,7 @@ async function startTestServer(): Promise<RunningTestServer> {
 async function connectSession(
   server: RunningTestServer,
   ttl?: Duration.Duration,
+  headers?: Record<string, string>,
 ): Promise<{
   readonly sessionId: AuthSessionId;
   readonly token: string;
@@ -309,7 +319,7 @@ async function connectSession(
 }> {
   const issued = await Effect.runPromise(server.sessions.issue(ttl ? { ttl } : undefined));
   const websocket = await Effect.runPromise(server.sessions.issueWebSocketToken(issued.sessionId));
-  const socket = await connect(featureSocketUrl(server, websocket.token));
+  const socket = await connect(featureSocketUrl(server, websocket.token), headers);
   return { sessionId: issued.sessionId, token: websocket.token, socket };
 }
 
@@ -501,7 +511,7 @@ describe("websocketRpcRouteLayer connection lifecycle", () => {
   });
 
   it("returns retryable 429 at the per-session socket cap without affecting other sessions", async () => {
-    const server = await startTestServer();
+    const server = await startTestServer({ connectionBurstPerPeer: 20 });
     try {
       const first = await connectSession(server);
       const saturatedSockets = [first.socket];
@@ -528,6 +538,107 @@ describe("websocketRpcRouteLayer connection lifecycle", () => {
 
       const replacement = await connectExistingSession(server, first.sessionId);
       await expect(ping(replacement.socket)).resolves.toBeUndefined();
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("returns 429 at the global transport cap and releases capacity on close", async () => {
+    const server = await startTestServer({
+      maxConcurrentConnections: 2,
+      connectionBurstPerPeer: 20,
+    });
+    try {
+      const first = await connectSession(server);
+      const second = await connectSession(server);
+      await expect(connectSession(server)).rejects.toMatchObject({
+        statusCode: 429,
+        headers: expect.objectContaining({ "retry-after": "1" }),
+      });
+      await expect(ping(first.socket)).resolves.toBeUndefined();
+      await expect(ping(second.socket)).resolves.toBeUndefined();
+
+      const closed = waitForClose(first.socket);
+      first.socket.close();
+      await closed;
+      const replacement = await connectSession(server);
+      await expect(ping(replacement.socket)).resolves.toBeUndefined();
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("returns 429 when one direct peer exceeds its connection rate", async () => {
+    const server = await startTestServer({
+      maxConcurrentConnections: 20,
+      connectionBurstPerPeer: 2,
+      connectionRatePerMinutePerPeer: 2,
+    });
+    try {
+      const first = await connectSession(server, undefined, {
+        "X-Forwarded-For": "198.51.100.10",
+      });
+      const second = await connectSession(server, undefined, {
+        "X-Forwarded-For": "203.0.113.20",
+      });
+      await expect(
+        connectSession(server, undefined, { "X-Forwarded-For": "192.0.2.30" }),
+      ).rejects.toMatchObject({
+        statusCode: 429,
+        headers: expect.objectContaining({ "retry-after": "30" }),
+      });
+      await expect(ping(first.socket)).resolves.toBeUndefined();
+      await expect(ping(second.socket)).resolves.toBeUndefined();
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("allows repeated authenticated publicUrl loads without weakening global capacity", async () => {
+    const server = await startTestServer(
+      {
+        maxConcurrentConnections: 11,
+        connectionBurstPerPeer: 2,
+        connectionRatePerMinutePerPeer: 2,
+      },
+      new URL("https://synara.example.test/"),
+    );
+    try {
+      const sockets: WebSocket[] = [];
+      for (let index = 0; index < 11; index += 1) {
+        sockets.push((await connectSession(server)).socket);
+      }
+      await expect(ping(sockets[0]!)).resolves.toBeUndefined();
+      await expect(ping(sockets[10]!)).resolves.toBeUndefined();
+      await expect(connectSession(server)).rejects.toMatchObject({
+        statusCode: 429,
+        headers: expect.objectContaining({ "retry-after": "1" }),
+      });
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("keeps per-connection message admission in publicUrl proxy mode", async () => {
+    const server = await startTestServer(
+      {
+        connectionBurstPerPeer: 20,
+        messageBurstPerConnection: 2,
+        messageRatePerSecondPerConnection: 1,
+      },
+      new URL("https://synara.example.test/"),
+    );
+    try {
+      const connected = await connectSession(server);
+      const close = waitForCloseInfo(connected.socket);
+      connected.socket.send(JSON.stringify({ _tag: "Ping" }));
+      connected.socket.send(JSON.stringify({ _tag: "Ping" }));
+      connected.socket.send(JSON.stringify({ _tag: "Ping" }));
+
+      await expect(close).resolves.toMatchObject({
+        code: 1013,
+        reason: "WebSocket message rate exceeded",
+      });
     } finally {
       await server.close();
     }

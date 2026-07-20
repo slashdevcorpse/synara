@@ -40,7 +40,6 @@ import {
 import { resolveCodexCliExecutable } from "@synara/shared/codexCliExecutable";
 import { getModelSelectionBooleanOptionValue, normalizeModelSlug } from "@synara/shared/model";
 import { decodeSubagentReceiverThreadIds } from "@synara/shared/subagents";
-import { prepareResolvedWindowsSafeProcess } from "@synara/shared/windowsProcess";
 import { Effect, ServiceMap } from "effect";
 
 import {
@@ -54,6 +53,7 @@ import {
   teardownChildProcessTree,
   teardownProviderProcessTree,
 } from "./provider/supervisedProcessTeardown.ts";
+import { prepareResolvedWindowsProviderProcess } from "./provider/windowsProviderProcess.ts";
 import { ensureIsolatedScratchWorkspace } from "./scratchWorkspaces.ts";
 import { createLogger } from "./logger";
 import { transcribeVoiceWithChatGptSession } from "./voiceTranscription.ts";
@@ -602,7 +602,7 @@ function spawnCodexAppServer(input: {
   readonly cwd: string;
   readonly env: NodeJS.ProcessEnv;
 }): ChildProcessWithoutNullStreams {
-  const prepared = prepareResolvedWindowsSafeProcess(
+  const prepared = prepareResolvedWindowsProviderProcess(
     input.binaryPath,
     buildCodexAppServerArgs(input.env),
     {
@@ -3613,7 +3613,7 @@ async function assertSupportedCodexCliVersion(input: {
   readonly cwd: string;
   readonly env: NodeJS.ProcessEnv;
 }): Promise<void> {
-  const prepared = prepareResolvedWindowsSafeProcess(input.binaryPath, ["--version"], {
+  const prepared = prepareResolvedWindowsProviderProcess(input.binaryPath, ["--version"], {
     cwd: input.cwd,
     env: input.env,
   });

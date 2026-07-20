@@ -204,6 +204,13 @@ jobs:
         # typecheck, and tests. Artifact jobs only need dependencies available.
         run: bun install --frozen-lockfile --ignore-scripts
 
+      - name: Build Windows Job launcher artifacts
+        if: ${{ matrix.platform == 'win' }}
+        shell: bash
+        run: |
+          node apps/server/scripts/build-windows-job-launcher.mjs --arch x64
+          node apps/server/scripts/build-windows-job-launcher.mjs --arch arm64
+
       - id: build_artifact
         name: Build desktop artifact
         shell: bash
@@ -380,6 +387,14 @@ jobs:
           path: release-publish/*
           if-no-files-found: error
 
+      - name: Upload Windows Job launcher artifacts
+        if: ${{ matrix.platform == 'win' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: windows-job-launchers
+          path: apps/server/native/windows-job-launcher/out/
+          if-no-files-found: error
+
   publish_cli:
     name: Publish CLI to npm
     if: ${{ needs.preflight.outputs.publish_release == 'true' && vars.SYNARA_PUBLISH_CLI == '1' }}
@@ -407,6 +422,12 @@ jobs:
         # Preflight already validates lifecycle scripts; the publish job only
         # needs dependencies available to build the package.
         run: bun install --frozen-lockfile --ignore-scripts
+
+      - name: Download Windows Job launcher artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: windows-job-launchers
+          path: apps/server/native/windows-job-launcher/out
 
       - name: Build CLI package
         run: bun run build --filter=@synara/web --filter=@synara/cli

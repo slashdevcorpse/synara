@@ -1,7 +1,12 @@
 import { Effect, Scope } from "effect";
 import { describe, expect, it } from "vitest";
 
-import { closeServerRuntimePipeline } from "./effectServer.ts";
+import type { GitCoreShape } from "./git/Services/GitCore.ts";
+import type { ProjectionSnapshotQueryShape } from "./orchestration/Services/ProjectionSnapshotQuery.ts";
+import {
+  closeServerRuntimePipeline,
+  reconcileManagedWorktreesBeforeHttpListen,
+} from "./effectServer.ts";
 
 describe("server runtime pipeline shutdown", () => {
   it("persists accepted provider terminal work before the engine stops", async () => {
@@ -57,5 +62,28 @@ describe("server runtime pipeline shutdown", () => {
       "managed-attachments-drained",
       "engine-stopped",
     ]);
+  });
+
+  it("completes managed worktree reconciliation before HTTP listen can begin", async () => {
+    const order: string[] = [];
+
+    await Effect.runPromise(
+      reconcileManagedWorktreesBeforeHttpListen({
+        worktreesDir: `missing-managed-worktrees-${crypto.randomUUID()}`,
+        projectionSnapshotQuery: {
+          getCommandReadModel: () =>
+            Effect.sync(() => {
+              order.push("projection-loaded");
+              return { threads: [] } as never;
+            }),
+        } as Pick<ProjectionSnapshotQueryShape, "getCommandReadModel">,
+        git: {} as Pick<GitCoreShape, "removeWorktree" | "statusDetails">,
+      }).pipe(
+        Effect.tap(() => Effect.sync(() => order.push("worktrees-reconciled"))),
+        Effect.andThen(Effect.sync(() => order.push("http-listen"))),
+      ),
+    );
+
+    expect(order).toEqual(["projection-loaded", "worktrees-reconciled", "http-listen"]);
   });
 });

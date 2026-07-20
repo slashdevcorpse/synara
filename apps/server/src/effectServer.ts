@@ -18,6 +18,7 @@ import { resolveListeningPort } from "./startupAccess";
 import { patchBunWebSocketCloseEventCompatibility } from "./bunWebSocketCompatibility";
 import { makeEffectHttpRouteLayer } from "./http";
 import { Keybindings } from "./keybindings";
+import { GitCore, type GitCoreShape } from "./git/Services/GitCore";
 import {
   ManagedAttachmentCleanup,
   type ManagedAttachmentCleanupShape,
@@ -27,7 +28,10 @@ import {
   type OrchestrationEngineShape,
 } from "./orchestration/Services/OrchestrationEngine";
 import { OrchestrationReactor } from "./orchestration/Services/OrchestrationReactor";
-import { ProjectionSnapshotQuery } from "./orchestration/Services/ProjectionSnapshotQuery";
+import {
+  ProjectionSnapshotQuery,
+  type ProjectionSnapshotQueryShape,
+} from "./orchestration/Services/ProjectionSnapshotQuery";
 import { ThreadDeletionReactor } from "./orchestration/Services/ThreadDeletionReactor";
 import { reconcileRestartStuckTurns } from "./orchestration/startupTurnReconciliation";
 import { ProviderSessionReaper } from "./provider/Services/ProviderSessionReaper";
@@ -37,9 +41,16 @@ import { ServerRuntimeStartup } from "./serverRuntimeStartup";
 import { ServerSettingsService } from "./serverSettings";
 import { makeServerReadiness } from "./server/readiness";
 import { makeServerShutdownController, type ServerShutdownController } from "./serverShutdown";
-import { makeBoundedNodeHttpServer } from "./nodeHttpServer";
+import {
+  makeBoundedNodeHttpServer,
+  wsTransportAdmissionOptionsForServerConfig,
+} from "./nodeHttpServer";
 import { websocketRpcRouteLayer } from "./wsRpc";
 import { recoverGitHandoffOperations } from "./gitHandoffOperations";
+import {
+  logManagedWorktreeReconciliation,
+  reconcileManagedWorktrees,
+} from "./workspace/managedWorktree";
 
 export interface ServerShape {
   readonly start: Effect.Effect<
@@ -49,6 +60,7 @@ export interface ServerShape {
     | ServerConfig
     | FileSystem.FileSystem
     | Path.Path
+    | GitCore
     | Keybindings
     | ManagedAttachmentCleanup
     | AutomationRunReactor
@@ -98,6 +110,24 @@ export function closeServerRuntimePipeline(input: {
   );
 }
 
+export function reconcileManagedWorktreesBeforeHttpListen(input: {
+  readonly worktreesDir: string;
+  readonly git: Pick<GitCoreShape, "removeWorktree" | "statusDetails">;
+  readonly projectionSnapshotQuery: Pick<ProjectionSnapshotQueryShape, "getCommandReadModel">;
+}) {
+  return input.projectionSnapshotQuery.getCommandReadModel().pipe(
+    Effect.flatMap((snapshot) =>
+      reconcileManagedWorktrees({
+        worktreesDir: input.worktreesDir,
+        threads: snapshot.threads,
+        git: input.git,
+        pruneOrphans: true,
+      }),
+    ),
+    Effect.tap((result) => logManagedWorktreeReconciliation("startup", result)),
+  );
+}
+
 export const createEffectServer = Effect.fn(function* (
   shutdownController: ServerShutdownController,
 ) {
@@ -111,11 +141,13 @@ export const createEffectServer = Effect.fn(function* (
   }
   const automationRunReactor = yield* AutomationRunReactor;
   const automationScheduler = yield* AutomationScheduler;
+  const git = yield* GitCore;
   const keybindings = yield* Keybindings;
   const managedAttachmentCleanup = yield* ManagedAttachmentCleanup;
   const lifecycleEvents = yield* ServerLifecycleEvents;
   const orchestrationEngine = yield* OrchestrationEngineService;
   const orchestrationReactor = yield* OrchestrationReactor;
+  const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
   const providerService = yield* ProviderService;
   const providerSessionReaper = yield* ProviderSessionReaper;
   const runtimeStartup = yield* ServerRuntimeStartup;
@@ -136,15 +168,29 @@ export const createEffectServer = Effect.fn(function* (
   yield* readiness.markPushBusReady;
   yield* readiness.markKeybindingsReady;
 
+  yield* reconcileManagedWorktreesBeforeHttpListen({
+    worktreesDir: config.worktreesDir,
+    projectionSnapshotQuery,
+    git,
+  }).pipe(
+    Effect.mapError(
+      (cause) => new ServerLifecycleError({ operation: "loadManagedWorktreeLinks", cause }),
+    ),
+  );
+
   let nodeServer: http.Server | null = null;
   patchBunWebSocketCloseEventCompatibility();
   // Keep embedded/test callers safe if they construct ServerConfig without
   // passing through the CLI's loopback-default resolution.
   const listenOptions = { host: config.host ?? "127.0.0.1", port: config.port };
-  const httpServer = yield* makeBoundedNodeHttpServer(() => {
-    nodeServer = http.createServer();
-    return nodeServer;
-  }, listenOptions).pipe(
+  const httpServer = yield* makeBoundedNodeHttpServer(
+    () => {
+      nodeServer = http.createServer();
+      return nodeServer;
+    },
+    listenOptions,
+    wsTransportAdmissionOptionsForServerConfig(config),
+  ).pipe(
     Effect.mapError((cause) => new ServerLifecycleError({ operation: "httpServerListen", cause })),
   );
 

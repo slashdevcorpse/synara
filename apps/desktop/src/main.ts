@@ -8,6 +8,7 @@ import * as Crypto from "node:crypto";
 import * as FS from "node:fs";
 import * as OS from "node:os";
 import * as Path from "node:path";
+import { pathToFileURL } from "node:url";
 // Electron-only builtin that sees app.asar as a real file instead of a virtual
 // directory — required to stat the archive itself for swap detection.
 import * as OriginalFS from "original-fs";
@@ -19,6 +20,7 @@ import {
   dialog,
   ipcMain,
   Menu,
+  net,
   Notification,
   nativeImage,
   nativeTheme,
@@ -58,6 +60,7 @@ import { renderPackagedDesktopIdentityProof } from "@synara/shared/desktopIdenti
 import { NetService } from "@synara/shared/Net";
 import { RotatingFileSink } from "@synara/shared/logging";
 import { ensureStaticSnapshot, findAsarArchivePath } from "@synara/shared/staticSnapshot";
+import { applyWebDocumentSecurityHeaders } from "@synara/shared/webSecurity";
 import { isBackendReadinessAborted, waitForHttpReady } from "./backendReadiness";
 import { resolveBackendNodeArgs } from "./backendNodeOptions";
 import {
@@ -156,7 +159,8 @@ import {
 } from "./updateArtifactIdentity";
 import { buildGitHubReleasesPageUrl, resolveGitHubUpdateSource } from "./githubUpdateFeed";
 import { isArm64HostRunningIntelBuild, resolveDesktopRuntimeInfo } from "./runtimeArch";
-import { BROWSER_SESSION_PARTITION, DesktopBrowserManager } from "./browserManager";
+import { DesktopBrowserManager } from "./browserManager";
+import { BROWSER_SESSION_PARTITION, secureBrowserWebviewAttachment } from "./browserSecurity";
 import { registerBrowserIpcHandlers, sendBrowserCopyLink, sendBrowserState } from "./browserIpc";
 import {
   BrowserUsePipeServer,
@@ -1024,6 +1028,10 @@ function resolveBackendEntry(): string {
   return Path.join(resolveAppRoot(), "apps/server/dist/index.mjs");
 }
 
+function resolvePackagedWindowsJobLauncher(): string {
+  return Path.join(process.resourcesPath, "synara-native", "synara-windows-job-launcher.exe");
+}
+
 function resolveBackendCwd(): string {
   if (!app.isPackaged) {
     return resolveAppRoot();
@@ -1290,7 +1298,7 @@ function registerDesktopProtocol(): void {
   const staticRootPrefix = `${staticRootResolved}${Path.sep}`;
   const fallbackIndex = Path.join(staticRootResolved, "index.html");
 
-  protocol.registerFileProtocol(DESKTOP_SCHEME, (request, callback) => {
+  protocol.handle(DESKTOP_SCHEME, async (request) => {
     try {
       const candidate = resolveDesktopStaticPath(staticRootResolved, request.url);
       const resolvedCandidate = Path.resolve(candidate);
@@ -1300,16 +1308,20 @@ function registerDesktopProtocol(): void {
 
       if (!isInRoot || !FS.existsSync(resolvedCandidate)) {
         if (isAssetRequest) {
-          callback({ error: -6 });
-          return;
+          return applyWebDocumentSecurityHeaders(new Response(null, { status: 404 }));
         }
-        callback({ path: fallbackIndex });
-        return;
+        return applyWebDocumentSecurityHeaders(
+          await net.fetch(pathToFileURL(fallbackIndex).toString()),
+        );
       }
 
-      callback({ path: resolvedCandidate });
+      return applyWebDocumentSecurityHeaders(
+        await net.fetch(pathToFileURL(resolvedCandidate).toString()),
+      );
     } catch {
-      callback({ path: fallbackIndex });
+      return applyWebDocumentSecurityHeaders(
+        await net.fetch(pathToFileURL(fallbackIndex).toString()),
+      );
     }
   });
 
@@ -3009,6 +3021,9 @@ async function launchAdmittedBackendGeneration(
       env: {
         ...backendEnv(),
         ELECTRON_RUN_AS_NODE: "1",
+        ...(app.isPackaged && process.platform === "win32"
+          ? { SYNARA_WINDOWS_JOB_LAUNCHER_PATH: resolvePackagedWindowsJobLauncher() }
+          : {}),
       },
       stdio: captureBackendLogs ? ["ignore", "pipe", "pipe"] : "inherit",
     });
@@ -3756,6 +3771,13 @@ function createWindow(): BrowserWindow {
       // Let Chromium throttle renderer timers/rAF when the window is hidden.
       backgroundThrottling: true,
     },
+  });
+
+  window.webContents.on("will-attach-webview", (event, webPreferences, params) => {
+    const decision = secureBrowserWebviewAttachment(webPreferences, params);
+    if (!decision.allowed) {
+      event.preventDefault();
+    }
   });
   browserManager.setWindow(window);
   attachDesktopZoomFactorSync(window);

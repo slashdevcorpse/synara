@@ -5,7 +5,6 @@
 
 import { randomUUID } from "node:crypto";
 import * as OfficialAcp from "@agentclientprotocol/sdk";
-import { prepareWindowsSafeProcess } from "@synara/shared/windowsProcess";
 import {
   Cause,
   Deferred,
@@ -30,6 +29,7 @@ import {
   teardownProviderProcessTree,
   type SupervisedProcessTeardownResult,
 } from "../supervisedProcessTeardown.ts";
+import { prepareWindowsProviderProcess } from "../windowsProviderProcess.ts";
 import {
   collectSessionConfigOptionValues,
   extractModelConfigId,
@@ -749,7 +749,7 @@ const makeAcpSessionRuntime = (
       provider: "acp",
       baseEnv: options.spawn.env ? { ...options.spawn.env } : process.env,
     });
-    const prepared = prepareWindowsSafeProcess(options.spawn.command, options.spawn.args, {
+    const prepared = prepareWindowsProviderProcess(options.spawn.command, options.spawn.args, {
       cwd: options.spawn.cwd,
       env,
     });

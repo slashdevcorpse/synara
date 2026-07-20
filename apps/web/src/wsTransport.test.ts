@@ -11,13 +11,16 @@ import {
   WS_PROTOCOL_EPOCH,
   WS_PROTOCOL_MAX_REVISION,
   WS_PROTOCOL_MIN_REVISION,
+  TERMINAL_RESNAPSHOT_REQUIRED_CODE,
   WsCompatibilityError,
 } from "@synara/contracts";
 
 import {
   shouldKeepServerLifecycleStream,
   getTerminalCompatibilityError,
+  handleTerminalResnapshotRequiredFailure,
   isTerminalCompatibilityFailure,
+  isTerminalResnapshotRequiredFailure,
   makeFeatureSocketUrl,
   makeRequestAbortScope,
   shouldReconnectAfterStreamFailure,
@@ -127,6 +130,63 @@ describe("WsTransport", () => {
         retryable: false,
       }),
     ).toBe(true);
+  });
+
+  it("reattaches the terminal stream before requesting authoritative snapshot replacement", async () => {
+    const cause = Cause.fail({
+      code: TERMINAL_RESNAPSHOT_REQUIRED_CODE,
+      retryable: true,
+      retryAfterMs: 0,
+    });
+    const order: string[] = [];
+
+    expect(isTerminalResnapshotRequiredFailure(cause)).toBe(true);
+    expect(shouldReconnectAfterStreamFailure(cause)).toBe(false);
+    expect(
+      handleTerminalResnapshotRequiredFailure(
+        cause,
+        () => order.push("reattach-stream"),
+        () => order.push("replace-from-snapshot"),
+      ),
+    ).toBe(true);
+    expect(order).toEqual(["reattach-stream"]);
+
+    await Promise.resolve();
+    expect(order).toEqual(["reattach-stream", "replace-from-snapshot"]);
+  });
+
+  it("waits for an asynchronous terminal stream reattach before replacing from snapshot", async () => {
+    const cause = Cause.fail({
+      code: TERMINAL_RESNAPSHOT_REQUIRED_CODE,
+      retryable: true,
+      retryAfterMs: 0,
+    });
+    const order: string[] = [];
+    let resolveRestart: (() => void) | undefined;
+
+    expect(
+      handleTerminalResnapshotRequiredFailure(
+        cause,
+        () => {
+          order.push("reattach-requested");
+          return new Promise<void>((resolve) => {
+            resolveRestart = () => {
+              order.push("reattach-started");
+              resolve();
+            };
+          });
+        },
+        () => order.push("replace-from-snapshot"),
+      ),
+    ).toBe(true);
+    expect(order).toEqual(["reattach-requested"]);
+
+    await Promise.resolve();
+    expect(order).toEqual(["reattach-requested"]);
+
+    resolveRestart?.();
+    await Promise.resolve();
+    expect(order).toEqual(["reattach-requested", "reattach-started", "replace-from-snapshot"]);
   });
 
   it("latches terminal compatibility guidance for late UI subscribers", () => {

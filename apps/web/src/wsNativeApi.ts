@@ -435,7 +435,9 @@ export function createWsNativeApi(): NativeApi {
       },
     },
     terminal: {
+      waitUntilEventStreamReady: () => transport.waitForTerminalEventStreamReady(),
       open: (input) => transport.request(WS_METHODS.terminalOpen, input),
+      snapshot: (input) => transport.request(WS_METHODS.terminalSnapshot, input),
       write: (input) => transport.request(WS_METHODS.terminalWrite, input),
       ackOutput: (input) => transport.request(WS_METHODS.terminalAckOutput, input),
       resize: (input) => transport.request(WS_METHODS.terminalResize, input),

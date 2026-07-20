@@ -140,9 +140,12 @@ import type {
   TerminalClearInput,
   TerminalCloseInput,
   TerminalEvent,
+  TerminalEventStreamReady,
   TerminalOpenInput,
+  TerminalRecoverySnapshot,
   TerminalResizeInput,
   TerminalRestartInput,
+  TerminalSessionInput,
   TerminalSessionSnapshot,
   TerminalWriteInput,
 } from "./terminal";
@@ -502,7 +505,9 @@ export interface NativeApi {
     confirm: (message: string) => Promise<boolean>;
   };
   terminal: {
+    waitUntilEventStreamReady?: () => Promise<TerminalEventStreamReady>;
     open: (input: TerminalOpenInput) => Promise<TerminalSessionSnapshot>;
+    snapshot: (input: TerminalSessionInput) => Promise<TerminalRecoverySnapshot>;
     write: (input: TerminalWriteInput) => Promise<void>;
     ackOutput: (input: TerminalAckOutputInput) => Promise<void>;
     resize: (input: TerminalResizeInput) => Promise<void>;
