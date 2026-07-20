@@ -24,6 +24,9 @@ import {
 
 const REPOSITORY = "slashdevcorpse/synara";
 const PROHIBITED_ASSET_PATTERN = /(?:\.blockmap|\.ya?ml|\.zip|\.AppImage)$/i;
+const WINDOWS_ONLY_PROHIBITED_ASSET_PATTERN = /(?:macos|\.dmg$)/i;
+
+export type SuperSynaraReleaseScope = "windows-only" | "windows-and-macos";
 
 export interface SuperSynaraReleaseCoordinates {
   readonly version: string;
@@ -40,7 +43,7 @@ export interface SuperSynaraReleaseIndex {
   readonly tag: string;
   readonly sourceCommit: string;
   readonly absorbedUpstreamSha: string;
-  readonly platforms: readonly ["windows-x64", "macos-arm64"];
+  readonly platforms: readonly ["windows-x64"] | readonly ["windows-x64", "macos-arm64"];
   readonly files: ReadonlyArray<ReleaseArtifactDigest>;
 }
 
@@ -110,15 +113,58 @@ export function superSynaraReleaseFileNames(version: string): SuperSynaraRelease
   };
 }
 
-export function exactSuperSynaraReleaseAllowlist(version: string): ReadonlyArray<string> {
-  return bytewiseSort(Object.values(superSynaraReleaseFileNames(version)));
+function assertReleaseScope(value: string): asserts value is SuperSynaraReleaseScope {
+  if (value !== "windows-only" && value !== "windows-and-macos") {
+    throw new Error(`Unsupported Super Synara release scope: ${value}.`);
+  }
 }
 
-export function assertNoProhibitedReleaseAssets(directory: string): void {
+function assertMacSignatureAllowlistScope(input: {
+  readonly releaseScope: SuperSynaraReleaseScope;
+  readonly macSignatureAllowlist?: MacSignatureAllowlist;
+}): void {
+  if (input.releaseScope === "windows-only" && input.macSignatureAllowlist !== undefined) {
+    throw new Error("Windows-only release admission must not include a macOS signature allowlist.");
+  }
+  if (input.releaseScope === "windows-and-macos" && !input.macSignatureAllowlist) {
+    throw new Error("Combined release admission requires the reviewed macOS signature allowlist.");
+  }
+}
+
+function releasePlatforms(
+  releaseScope: SuperSynaraReleaseScope,
+): SuperSynaraReleaseIndex["platforms"] {
+  return releaseScope === "windows-only" ? ["windows-x64"] : ["windows-x64", "macos-arm64"];
+}
+
+export function exactSuperSynaraReleaseAllowlist(
+  version: string,
+  releaseScope: SuperSynaraReleaseScope,
+): ReadonlyArray<string> {
+  const names = superSynaraReleaseFileNames(version);
+  const fileNames =
+    releaseScope === "windows-only"
+      ? [
+          names.windowsInstaller,
+          names.windowsProvenance,
+          names.releaseIndex,
+          names.checksums,
+          names.warning,
+          names.license,
+        ]
+      : Object.values(names);
+  return bytewiseSort(fileNames);
+}
+
+export function assertNoProhibitedReleaseAssets(
+  directory: string,
+  releaseScope: SuperSynaraReleaseScope,
+): void {
   for (const fileName of readdirSync(directory)) {
     if (
       PROHIBITED_ASSET_PATTERN.test(fileName) ||
-      /(?:linux|intel|x64-macos|macos-x64)/i.test(fileName)
+      /(?:linux|intel|x64-macos|macos-x64)/i.test(fileName) ||
+      (releaseScope === "windows-only" && WINDOWS_ONLY_PROHIBITED_ASSET_PATTERN.test(fileName))
     ) {
       throw new Error(`Prohibited Super Synara release asset: ${fileName}.`);
     }
@@ -143,10 +189,23 @@ export function enforceReleaseByteCap(
   return totalBytes;
 }
 
-export function renderUnsignedBuildWarning(coordinates: SuperSynaraReleaseCoordinates): string {
+export function renderUnsignedBuildWarning(
+  coordinates: SuperSynaraReleaseCoordinates,
+  releaseScope: SuperSynaraReleaseScope,
+): string {
+  const introduction =
+    releaseScope === "windows-only"
+      ? `This is an unofficial downstream Super Synara Windows x64 build. It is publicly distributed without a trusted Windows publisher certificate.\n\n`
+      : `This is an unofficial downstream Super Synara build. It is publicly distributed without a trusted Windows publisher certificate, Apple Developer ID signature, or Apple notarization.\n\n`;
+  const operatingSystemWarnings =
+    releaseScope === "windows-only"
+      ? `Windows may show **Unknown publisher** or Microsoft Defender SmartScreen, and organization policy or Smart App Control may block the installer.\n\n`
+      : `Windows may show **Unknown publisher** or Microsoft Defender SmartScreen, and organization policy or Smart App Control may block the installer.\n\n` +
+        `macOS Gatekeeper may block the app. Use Apple's documented per-app Finder or Privacy & Security override: https://support.apple.com/en-ca/102445. Do not disable Gatekeeper or another system-wide security protection.\n\n`;
+  const downloadedPayload = releaseScope === "windows-only" ? "installer" : "installer or DMG";
   return (
     `# Super Synara unsigned prerelease\n\n` +
-    `This is an unofficial downstream Super Synara build. It is publicly distributed without a trusted Windows publisher certificate, Apple Developer ID signature, or Apple notarization.\n\n` +
+    introduction +
     `- Version: \`${coordinates.version}\`\n` +
     `- Tag: \`${coordinates.tag}\`\n` +
     `- Downstream commit: \`${coordinates.sourceCommit.toLowerCase()}\`\n` +
@@ -154,10 +213,9 @@ export function renderUnsignedBuildWarning(coordinates: SuperSynaraReleaseCoordi
     `- Updates: manual download only; no automatic updater feed is included.\n` +
     `- License and attribution: MIT; the complete license and copyright notice are included in the attached \`LICENSE\` file.\n\n` +
     `## Operating-system warnings\n\n` +
-    `Windows may show **Unknown publisher** or Microsoft Defender SmartScreen, and organization policy or Smart App Control may block the installer.\n\n` +
-    `macOS Gatekeeper may block the app. Use Apple's documented per-app Finder or Privacy & Security override: https://support.apple.com/en-ca/102445. Do not disable Gatekeeper or another system-wide security protection.\n\n` +
+    operatingSystemWarnings +
     `## Verify downloaded bytes\n\n` +
-    `Compute SHA-256 for the installer or DMG and compare it with \`SHA256SUMS.txt\`. The release index binds every published file to this exact tag, downstream commit, and absorbed upstream SHA.\n`
+    `Compute SHA-256 for the ${downloadedPayload} and compare it with \`SHA256SUMS.txt\`. The release index binds every published file to this exact tag, downstream commit, and absorbed upstream SHA.\n`
   );
 }
 
@@ -283,18 +341,21 @@ function validatePlatformManifest(input: {
 export function prepareSuperSynaraRelease(input: {
   readonly directory: string;
   readonly licensePath: string;
-  readonly macSignatureAllowlist: MacSignatureAllowlist;
+  readonly releaseScope: SuperSynaraReleaseScope;
+  readonly macSignatureAllowlist?: MacSignatureAllowlist;
   readonly coordinates: SuperSynaraReleaseCoordinates;
   readonly maxTotalBytes: number;
 }): SuperSynaraReleaseIndex {
   const { coordinates } = input;
+  assertReleaseScope(input.releaseScope);
+  assertMacSignatureAllowlistScope(input);
   assertFullSha("Source commit", coordinates.sourceCommit);
   assertFullSha("Absorbed upstream SHA", coordinates.absorbedUpstreamSha);
   if (coordinates.tag !== `super-v${coordinates.version}`) {
     throw new Error(`Release tag must be super-v${coordinates.version}.`);
   }
   const names = superSynaraReleaseFileNames(coordinates.version);
-  assertNoProhibitedReleaseAssets(input.directory);
+  assertNoProhibitedReleaseAssets(input.directory, input.releaseScope);
 
   const windowsManifest = validatePlatformManifest({
     directory: input.directory,
@@ -303,16 +364,18 @@ export function prepareSuperSynaraRelease(input: {
     platform: "win",
     coordinates,
   });
-  const macosManifest = validatePlatformManifest({
-    directory: input.directory,
-    manifestFileName: names.macosProvenance,
-    payloadFileName: names.macosDiskImage,
-    platform: "mac",
-    coordinates,
-    macSignatureAllowlist: input.macSignatureAllowlist,
-  });
-  if (windowsManifest.source.lockfileSha256 !== macosManifest.source.lockfileSha256) {
-    throw new Error("Platform provenance manifests disagree on bun.lock SHA-256.");
+  if (input.releaseScope === "windows-and-macos") {
+    const macosManifest = validatePlatformManifest({
+      directory: input.directory,
+      manifestFileName: names.macosProvenance,
+      payloadFileName: names.macosDiskImage,
+      platform: "mac",
+      coordinates,
+      macSignatureAllowlist: input.macSignatureAllowlist,
+    });
+    if (windowsManifest.source.lockfileSha256 !== macosManifest.source.lockfileSha256) {
+      throw new Error("Platform provenance manifests disagree on bun.lock SHA-256.");
+    }
   }
 
   const licenseEntry = lstatSync(input.licensePath);
@@ -324,16 +387,21 @@ export function prepareSuperSynaraRelease(input: {
     throw new Error("Release license source must be a regular root LICENSE file.");
   }
   copyFileSync(input.licensePath, join(input.directory, names.license), constants.COPYFILE_EXCL);
-  writeFileSync(join(input.directory, names.warning), renderUnsignedBuildWarning(coordinates), {
-    encoding: "utf8",
-    flag: "wx",
-  });
+  writeFileSync(
+    join(input.directory, names.warning),
+    renderUnsignedBuildWarning(coordinates, input.releaseScope),
+    {
+      encoding: "utf8",
+      flag: "wx",
+    },
+  );
 
   const checksumFiles = bytewiseSort([
     names.windowsInstaller,
-    names.macosDiskImage,
     names.windowsProvenance,
-    names.macosProvenance,
+    ...(input.releaseScope === "windows-and-macos"
+      ? [names.macosDiskImage, names.macosProvenance]
+      : []),
     names.warning,
     names.license,
   ]);
@@ -352,7 +420,7 @@ export function prepareSuperSynaraRelease(input: {
     tag: coordinates.tag,
     sourceCommit: coordinates.sourceCommit.toLowerCase(),
     absorbedUpstreamSha: coordinates.absorbedUpstreamSha.toLowerCase(),
-    platforms: ["windows-x64", "macos-arm64"],
+    platforms: releasePlatforms(input.releaseScope),
     files: indexFileNames.map((fileName) => digestFile(input.directory, fileName)),
   };
   writeFileSync(join(input.directory, names.releaseIndex), `${JSON.stringify(index, null, 2)}\n`, {
@@ -361,29 +429,35 @@ export function prepareSuperSynaraRelease(input: {
   });
 
   const actualFiles = bytewiseSort(readdirSync(input.directory));
-  const expectedFiles = exactSuperSynaraReleaseAllowlist(coordinates.version);
+  const expectedFiles = exactSuperSynaraReleaseAllowlist(coordinates.version, input.releaseScope);
   if (JSON.stringify(actualFiles) !== JSON.stringify(expectedFiles)) {
     throw new Error(
       `Release staging set differs from the exact allowlist. Expected ${JSON.stringify(expectedFiles)}, got ${JSON.stringify(actualFiles)}.`,
     );
   }
-  assertNoProhibitedReleaseAssets(input.directory);
+  assertNoProhibitedReleaseAssets(input.directory, input.releaseScope);
   enforceReleaseByteCap(input.directory, input.maxTotalBytes, actualFiles);
   return index;
 }
 
 export function verifyPreparedSuperSynaraRelease(input: {
   readonly directory: string;
-  readonly macSignatureAllowlist: MacSignatureAllowlist;
+  readonly releaseScope: SuperSynaraReleaseScope;
+  readonly macSignatureAllowlist?: MacSignatureAllowlist;
   readonly coordinates: SuperSynaraReleaseCoordinates;
   readonly maxTotalBytes: number;
 }): SuperSynaraReleaseIndex {
-  const expectedFiles = exactSuperSynaraReleaseAllowlist(input.coordinates.version);
+  assertReleaseScope(input.releaseScope);
+  assertMacSignatureAllowlistScope(input);
+  const expectedFiles = exactSuperSynaraReleaseAllowlist(
+    input.coordinates.version,
+    input.releaseScope,
+  );
   const actualFiles = bytewiseSort(readdirSync(input.directory));
   if (JSON.stringify(actualFiles) !== JSON.stringify(expectedFiles)) {
     throw new Error("Prepared release no longer matches the exact asset allowlist.");
   }
-  assertNoProhibitedReleaseAssets(input.directory);
+  assertNoProhibitedReleaseAssets(input.directory, input.releaseScope);
   const names = superSynaraReleaseFileNames(input.coordinates.version);
   const windowsManifest = validatePlatformManifest({
     directory: input.directory,
@@ -392,16 +466,18 @@ export function verifyPreparedSuperSynaraRelease(input: {
     platform: "win",
     coordinates: input.coordinates,
   });
-  const macosManifest = validatePlatformManifest({
-    directory: input.directory,
-    manifestFileName: names.macosProvenance,
-    payloadFileName: names.macosDiskImage,
-    platform: "mac",
-    coordinates: input.coordinates,
-    macSignatureAllowlist: input.macSignatureAllowlist,
-  });
-  if (windowsManifest.source.lockfileSha256 !== macosManifest.source.lockfileSha256) {
-    throw new Error("Platform provenance manifests disagree on bun.lock SHA-256.");
+  if (input.releaseScope === "windows-and-macos") {
+    const macosManifest = validatePlatformManifest({
+      directory: input.directory,
+      manifestFileName: names.macosProvenance,
+      payloadFileName: names.macosDiskImage,
+      platform: "mac",
+      coordinates: input.coordinates,
+      macSignatureAllowlist: input.macSignatureAllowlist,
+    });
+    if (windowsManifest.source.lockfileSha256 !== macosManifest.source.lockfileSha256) {
+      throw new Error("Platform provenance manifests disagree on bun.lock SHA-256.");
+    }
   }
   const index = JSON.parse(
     readFileSync(join(input.directory, names.releaseIndex), "utf8"),
@@ -414,7 +490,7 @@ export function verifyPreparedSuperSynaraRelease(input: {
     index.tag !== input.coordinates.tag ||
     index.sourceCommit !== input.coordinates.sourceCommit.toLowerCase() ||
     index.absorbedUpstreamSha !== input.coordinates.absorbedUpstreamSha.toLowerCase() ||
-    JSON.stringify(index.platforms) !== JSON.stringify(["windows-x64", "macos-arm64"])
+    JSON.stringify(index.platforms) !== JSON.stringify(releasePlatforms(input.releaseScope))
   ) {
     throw new Error("Release admission index no longer matches release coordinates.");
   }
