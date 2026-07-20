@@ -65,6 +65,11 @@ import {
 } from "../acp/AcpAdapterSessionSupport.ts";
 import { type AcpSessionRuntimeShape } from "../acp/AcpSessionRuntime.ts";
 import {
+  type AcpSessionTeardownState,
+  makeAcpSessionTeardownState,
+  runAcpSessionTeardown,
+} from "../acp/AcpSessionTeardown.ts";
+import {
   makeAcpAssistantItemEvent,
   makeAcpContentDeltaEvent,
   makeAcpPlanUpdatedEvent,
@@ -141,6 +146,7 @@ const collectStreamAsString = <E>(stream: Stream.Stream<Uint8Array, E>): Effect.
 export interface CursorAdapterLiveOptions {
   readonly nativeEventLogPath?: string;
   readonly nativeEventLogger?: EventNdjsonLogger;
+  readonly closeSessionScope?: (scope: Scope.Closeable) => Effect.Effect<void>;
 }
 
 interface PendingApproval {
@@ -173,6 +179,7 @@ interface CursorSessionContext {
   // idle-progress watchdog that force-fails a silently hung turn.
   lastTurnActivityAt: number | undefined;
   latestSessionCostUsd: number | undefined;
+  readonly teardown: AcpSessionTeardownState;
   stopped: boolean;
 }
 
@@ -397,6 +404,8 @@ export function makeCursorAdapter(
   options?: CursorAdapterLiveOptions,
 ) {
   return Effect.gen(function* () {
+    const closeSessionScope =
+      options?.closeSessionScope ?? ((scope: Scope.Closeable) => Scope.close(scope, Exit.void));
     const fileSystem = yield* FileSystem.FileSystem;
     const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
     const serverConfig = yield* Effect.service(ServerConfig);
@@ -571,23 +580,29 @@ export function makeCursorAdapter(
     };
 
     const stopSessionInternal = (ctx: CursorSessionContext) =>
-      Effect.gen(function* () {
-        if (ctx.stopped) return;
-        ctx.stopped = true;
-        yield* settleAcpPendingApprovalsAsCancelled(ctx.pendingApprovals);
-        yield* settleAcpPendingUserInputsAsEmptyAnswers(ctx.pendingUserInputs);
-        if (ctx.notificationFiber) {
-          yield* Fiber.interrupt(ctx.notificationFiber);
-        }
-        yield* Effect.ignore(Scope.close(ctx.scope, Exit.void));
-        sessions.delete(ctx.threadId);
-        yield* offerRuntimeEvent(ctx.lifecycleGeneration, {
-          type: "session.exited",
-          ...(yield* makeEventStamp()),
-          provider: PROVIDER,
-          threadId: ctx.threadId,
-          payload: { exitKind: "graceful" },
-        });
+      runAcpSessionTeardown({
+        state: ctx.teardown,
+        onStart: () => {
+          ctx.stopped = true;
+        },
+        teardown: Effect.gen(function* () {
+          yield* settleAcpPendingApprovalsAsCancelled(ctx.pendingApprovals);
+          yield* settleAcpPendingUserInputsAsEmptyAnswers(ctx.pendingUserInputs);
+          if (ctx.notificationFiber) {
+            yield* Fiber.interrupt(ctx.notificationFiber);
+          }
+          yield* closeSessionScope(ctx.scope);
+          if (sessions.get(ctx.threadId) === ctx) {
+            sessions.delete(ctx.threadId);
+          }
+          yield* offerRuntimeEvent(ctx.lifecycleGeneration, {
+            type: "session.exited",
+            ...(yield* makeEventStamp()),
+            provider: PROVIDER,
+            threadId: ctx.threadId,
+            payload: { exitKind: "graceful" },
+          });
+        }),
       });
 
     const startSession: CursorAdapterShape["startSession"] = (input) =>
@@ -613,7 +628,7 @@ export function makeCursorAdapter(
           const cursorModelSelection =
             input.modelSelection?.provider === PROVIDER ? input.modelSelection : undefined;
           const existing = sessions.get(input.threadId);
-          if (existing && !existing.stopped) {
+          if (existing) {
             yield* stopSessionInternal(existing);
           }
 
@@ -882,6 +897,7 @@ export function makeCursorAdapter(
             updatedAt: now,
           };
 
+          const teardown = yield* makeAcpSessionTeardownState();
           ctx = {
             threadId: input.threadId,
             ...(input.lifecycleGeneration !== undefined
@@ -903,6 +919,7 @@ export function makeCursorAdapter(
             activePromptFiber: undefined,
             lastTurnActivityAt: undefined,
             latestSessionCostUsd: undefined,
+            teardown,
             stopped: false,
           };
 
@@ -1350,7 +1367,13 @@ export function makeCursorAdapter(
       withThreadLock(
         threadId,
         Effect.gen(function* () {
-          const ctx = yield* requireSession(threadId);
+          const ctx = sessions.get(threadId);
+          if (ctx === undefined) {
+            return yield* new ProviderAdapterSessionNotFoundError({
+              provider: PROVIDER,
+              threadId,
+            });
+          }
           yield* stopSessionInternal(ctx);
         }),
       );

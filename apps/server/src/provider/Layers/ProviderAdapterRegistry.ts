@@ -9,7 +9,11 @@
  */
 import { Effect, Layer } from "effect";
 
-import { ProviderUnsupportedError, type ProviderAdapterError } from "../Errors.ts";
+import {
+  ProviderAdapterRequestError,
+  ProviderUnsupportedError,
+  type ProviderAdapterError,
+} from "../Errors.ts";
 import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
 import {
   ProviderAdapterRegistry,
@@ -25,9 +29,74 @@ import { KiloAdapter } from "../Services/KiloAdapter.ts";
 import { OpenCodeAdapter } from "../Services/OpenCodeAdapter.ts";
 import { PiAdapter } from "../Services/PiAdapter.ts";
 import { AntigravityAdapter } from "../Services/AntigravityAdapter.ts";
+import type { ProviderMaintenanceGate } from "../providerMaintenanceGate.ts";
 
 export interface ProviderAdapterRegistryLiveOptions {
   readonly adapters?: ReadonlyArray<ProviderAdapterShape<ProviderAdapterError>>;
+  readonly maintenanceGate?: ProviderMaintenanceGate;
+}
+
+const MAINTENANCE_CONTROL_METHODS = new Set<PropertyKey>([
+  "hasSession",
+  "interruptTurn",
+  "listSessions",
+  "stopAll",
+  "stopSession",
+  "stopTask",
+]);
+
+function gateProviderAdapter(
+  adapter: ProviderAdapterShape<ProviderAdapterError>,
+  maintenanceGate: ProviderMaintenanceGate | undefined,
+): ProviderAdapterShape<ProviderAdapterError> {
+  if (!maintenanceGate) {
+    return adapter;
+  }
+
+  const wrappedMethods = new Map<PropertyKey, unknown>();
+  return new Proxy(adapter, {
+    get(target, property, receiver) {
+      const value = Reflect.get(target, property, receiver) as unknown;
+      if (typeof value !== "function" || MAINTENANCE_CONTROL_METHODS.has(property)) {
+        return value;
+      }
+
+      const cached = wrappedMethods.get(property);
+      if (cached) {
+        return cached;
+      }
+
+      const operation = `ProviderAdapter.${String(property)}`;
+      const wrapped = (...args: ReadonlyArray<unknown>) =>
+        maintenanceGate
+          .withOperation({
+            provider: target.provider,
+            operation,
+            run: Effect.suspend(() =>
+              (
+                value as (
+                  this: ProviderAdapterShape<ProviderAdapterError>,
+                  ...methodArgs: ReadonlyArray<unknown>
+                ) => Effect.Effect<unknown>
+              ).apply(target, args),
+            ),
+          })
+          .pipe(
+            Effect.catchTag("ProviderMaintenanceBusyError", (error) =>
+              Effect.fail(
+                new ProviderAdapterRequestError({
+                  provider: target.provider,
+                  method: operation,
+                  detail: error.message,
+                  cause: error,
+                }),
+              ),
+            ),
+          );
+      wrappedMethods.set(property, wrapped);
+      return wrapped;
+    },
+  }) as ProviderAdapterShape<ProviderAdapterError>;
 }
 
 const makeProviderAdapterRegistry = (options?: ProviderAdapterRegistryLiveOptions) =>
@@ -47,7 +116,12 @@ const makeProviderAdapterRegistry = (options?: ProviderAdapterRegistryLiveOption
             yield* OpenCodeAdapter,
             yield* PiAdapter,
           ];
-    const byProvider = new Map(adapters.map((adapter) => [adapter.provider, adapter]));
+    const byProvider = new Map(
+      adapters.map((adapter) => [
+        adapter.provider,
+        gateProviderAdapter(adapter, options?.maintenanceGate),
+      ]),
+    );
 
     const getByProvider: ProviderAdapterRegistryShape["getByProvider"] = (provider) => {
       const adapter = byProvider.get(provider);
@@ -66,7 +140,8 @@ const makeProviderAdapterRegistry = (options?: ProviderAdapterRegistryLiveOption
     } satisfies ProviderAdapterRegistryShape;
   });
 
-export const ProviderAdapterRegistryLive = Layer.effect(
-  ProviderAdapterRegistry,
-  makeProviderAdapterRegistry(),
-);
+export function makeProviderAdapterRegistryLive(options?: ProviderAdapterRegistryLiveOptions) {
+  return Layer.effect(ProviderAdapterRegistry, makeProviderAdapterRegistry(options));
+}
+
+export const ProviderAdapterRegistryLive = makeProviderAdapterRegistryLive();

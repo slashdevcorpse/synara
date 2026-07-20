@@ -3,35 +3,39 @@
 // Layer: Provider ACP lifecycle coordination
 
 import type { ThreadId } from "@synara/contracts";
-import { Deferred, Effect } from "effect";
+import { Effect } from "effect";
+
+import {
+  type AcpSessionTeardownState,
+  awaitAcpSessionTeardown,
+} from "./AcpSessionTeardown.ts";
 
 export interface DroidSessionTeardownGate {
-  readonly track: (threadId: ThreadId, completion: Deferred.Deferred<void>) => void;
+  readonly track: (threadId: ThreadId, teardown: AcpSessionTeardownState) => void;
   readonly isPending: (threadId: ThreadId) => boolean;
   readonly awaitPending: (threadId: ThreadId) => Effect.Effect<void>;
-  readonly complete: (
+  readonly release: (
     threadId: ThreadId,
-    completion: Deferred.Deferred<void>,
+    teardown: AcpSessionTeardownState,
   ) => Effect.Effect<void>;
 }
 
 export function makeDroidSessionTeardownGate(): DroidSessionTeardownGate {
-  const pendingByThreadId = new Map<ThreadId, Deferred.Deferred<void>>();
+  const pendingByThreadId = new Map<ThreadId, AcpSessionTeardownState>();
 
   return {
-    track: (threadId, completion) => {
-      pendingByThreadId.set(threadId, completion);
+    track: (threadId, teardown) => {
+      pendingByThreadId.set(threadId, teardown);
     },
     isPending: (threadId) => pendingByThreadId.has(threadId),
     awaitPending: (threadId) =>
       Effect.suspend(() => {
         const pending = pendingByThreadId.get(threadId);
-        return pending === undefined ? Effect.void : Deferred.await(pending);
+        return pending === undefined ? Effect.void : awaitAcpSessionTeardown(pending);
       }),
-    complete: (threadId, completion) =>
-      Effect.gen(function* () {
-        yield* Deferred.succeed(completion, undefined);
-        if (pendingByThreadId.get(threadId) === completion) {
+    release: (threadId, teardown) =>
+      Effect.sync(() => {
+        if (pendingByThreadId.get(threadId) === teardown) {
           pendingByThreadId.delete(threadId);
         }
       }),

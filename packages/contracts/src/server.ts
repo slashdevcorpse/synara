@@ -70,7 +70,17 @@ export const ServerProviderStatus = Schema.Struct({
   ),
   updateState: Schema.optionalKey(
     Schema.Struct({
-      status: Schema.Literals(["idle", "queued", "running", "succeeded", "failed", "unchanged"]),
+      status: Schema.Literals([
+        "idle",
+        "queued",
+        "running",
+        "succeeded",
+        "already_current",
+        "failed",
+        "unchanged",
+        "unverified",
+        "still_outdated",
+      ]),
       startedAt: Schema.NullOr(IsoDateTime),
       finishedAt: Schema.NullOr(IsoDateTime),
       message: Schema.NullOr(TrimmedNonEmptyString),

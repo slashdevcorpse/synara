@@ -27,7 +27,19 @@ import {
 import { it, assert, vi } from "@effect/vitest";
 import { assertFailure } from "@effect/vitest/utils";
 
-import { Deferred, Effect, Exit, Fiber, Layer, Option, PubSub, Ref, Scope, Stream } from "effect";
+import {
+  Deferred,
+  Effect,
+  Exit,
+  Fiber,
+  Layer,
+  Option,
+  PubSub,
+  Ref,
+  Result,
+  Scope,
+  Stream,
+} from "effect";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import {
@@ -661,6 +673,135 @@ it.effect(
 );
 
 routing.layer("ProviderServiceLive routing", (it) => {
+  it.effect("persists the freshest live resume cursor during maintenance shutdown", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService;
+      const directory = yield* ProviderSessionDirectory;
+      const threadId = asThreadId("thread-maintenance-fresh-cursor");
+      const freshResumeCursor = { threadId, nativeThreadId: "fresh-native-thread" };
+
+      yield* provider.startSession(threadId, {
+        provider: "codex",
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const before = Option.getOrUndefined(yield* directory.getBinding(threadId));
+      routing.codex.updateSession(threadId, (session) => ({
+        ...session,
+        status: "ready",
+        resumeCursor: freshResumeCursor,
+      }));
+      const stopCount = routing.codex.stopSession.mock.calls.length;
+      assert.equal(typeof provider.prepareForMaintenance, "function");
+      if (!provider.prepareForMaintenance) {
+        assert.fail("prepareForMaintenance unavailable");
+      }
+
+      const stopped = yield* provider.prepareForMaintenance({
+        provider: "codex",
+        stopIdleSessions: true,
+      });
+      const after = Option.getOrUndefined(yield* directory.getBinding(threadId));
+
+      assert.deepEqual(stopped, [threadId]);
+      assert.equal(routing.codex.stopSession.mock.calls.length, stopCount + 1);
+      assert.deepEqual(after?.resumeCursor, freshResumeCursor);
+      assert.equal(after?.status, "stopped");
+      assert.notEqual(after?.lifecycleGeneration, before?.lifecycleGeneration);
+      assert.equal(
+        asRuntimePayloadRecord(after?.runtimePayload).lastRuntimeEvent,
+        "provider.prepareForMaintenance",
+      );
+    }),
+  );
+
+  it.effect("refuses maintenance before stopping when no durable resume cursor exists", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService;
+      const directory = yield* ProviderSessionDirectory;
+      const threadId = asThreadId("thread-maintenance-without-cursor");
+
+      yield* provider.startSession(threadId, {
+        provider: "codex",
+        threadId,
+        runtimeMode: "full-access",
+      });
+      routing.codex.updateSession(threadId, withoutResumeCursor);
+      const binding = Option.getOrUndefined(yield* directory.getBinding(threadId));
+      assert.ok(binding);
+      yield* directory.upsert({ ...binding, resumeCursor: null });
+      const stopCount = routing.codex.stopSession.mock.calls.length;
+      const stopAllCount = routing.codex.stopAll.mock.calls.length;
+      assert.equal(typeof provider.prepareForMaintenance, "function");
+      if (!provider.prepareForMaintenance) {
+        assert.fail("prepareForMaintenance unavailable");
+      }
+
+      const result = yield* provider
+        .prepareForMaintenance({ provider: "codex", stopIdleSessions: true })
+        .pipe(Effect.result);
+
+      assert.equal(Result.isFailure(result), true);
+      if (Result.isFailure(result)) {
+        assert.match(result.failure.message, /no verified resume cursor/u);
+      }
+      assert.equal(routing.codex.stopSession.mock.calls.length, stopCount);
+      assert.equal(routing.codex.stopAll.mock.calls.length, stopAllCount);
+      yield* provider.stopSession({ threadId });
+    }),
+  );
+
+  it.effect("does not stop a replacement provider when a maintenance snapshot becomes stale", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService;
+      const directory = yield* ProviderSessionDirectory;
+      const threadId = asThreadId("thread-maintenance-provider-switch");
+      yield* provider.startSession(threadId, {
+        provider: "codex",
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const staleSessions = yield* routing.codex.listSessions();
+      let listStarted = false;
+      let releaseList: ReleaseListSessions | undefined;
+      routing.codex.listSessions.mockImplementationOnce(() =>
+        Effect.promise(
+          () =>
+            new Promise<ReadonlyArray<ProviderSession>>((resolve) => {
+              listStarted = true;
+              releaseList = resolve;
+            }),
+        ),
+      );
+      const codexStopCount = routing.codex.stopSession.mock.calls.length;
+      const claudeStopCount = routing.claude.stopSession.mock.calls.length;
+      assert.equal(typeof provider.prepareForMaintenance, "function");
+      if (!provider.prepareForMaintenance) {
+        assert.fail("prepareForMaintenance unavailable");
+      }
+
+      const maintenance = yield* provider
+        .prepareForMaintenance({ provider: "codex", stopIdleSessions: true })
+        .pipe(Effect.result, Effect.forkChild);
+      yield* waitUntil(() => listStarted, 500, 10, "maintenance session snapshot");
+      yield* provider.startSession(threadId, {
+        provider: "claudeAgent",
+        threadId,
+        runtimeMode: "full-access",
+      });
+      requireReleaseListSessions(releaseList)(staleSessions);
+      const result = yield* Fiber.join(maintenance);
+      const binding = Option.getOrUndefined(yield* directory.getBinding(threadId));
+
+      assert.equal(Result.isFailure(result), true);
+      assert.equal(binding?.provider, "claudeAgent");
+      assert.equal(routing.codex.stopSession.mock.calls.length, codexStopCount + 1);
+      assert.equal(routing.claude.stopSession.mock.calls.length, claudeStopCount);
+      assert.equal(yield* routing.claude.hasSession(threadId), true);
+      yield* provider.stopSession({ threadId });
+    }),
+  );
+
   it.effect("serializes lifecycle mutations and persists a fresh generation per start", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService;

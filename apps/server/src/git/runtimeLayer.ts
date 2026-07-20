@@ -10,43 +10,94 @@ import {
   makeKiloTextGenerationServiceLive,
   makeOpenCodeTextGenerationServiceLive,
 } from "./Layers/OpenCodeTextGeneration";
-import { ProviderTextGenerationLive } from "./Layers/ProviderTextGeneration";
+import { makeProviderTextGenerationLive } from "./Layers/ProviderTextGeneration";
 import { OpenCodeRuntimeLive } from "../provider/opencodeRuntime";
+import type { ProviderMaintenanceGate } from "../provider/providerMaintenanceGate";
+import type { ProviderMaintenanceOwnedResourceCoordinator } from "../provider/providerMaintenanceOwnedResources";
 import {
   makeProviderServerPasswordResolver,
   ProviderCredentials,
   ProviderCredentialsLive,
 } from "../providerCredentials";
 
-const textGenerationProviderLayers = Effect.gen(function* () {
-  const credentials = yield* ProviderCredentials;
-  const resolveProviderServerPassword = makeProviderServerPasswordResolver(credentials);
-  return Layer.mergeAll(
-    makeKiloTextGenerationServiceLive(resolveProviderServerPassword).pipe(
-      Layer.provide(OpenCodeRuntimeLive),
-    ),
-    makeOpenCodeTextGenerationServiceLive(resolveProviderServerPassword).pipe(
-      Layer.provide(OpenCodeRuntimeLive),
-    ),
+interface GitRuntimeLayerOptions {
+  readonly maintenanceGate?: ProviderMaintenanceGate;
+  readonly maintenanceOwnedResources?: ProviderMaintenanceOwnedResourceCoordinator;
+}
+
+function makeTextGenerationProviderLayers(options?: GitRuntimeLayerOptions) {
+  return Effect.gen(function* () {
+    const credentials = yield* ProviderCredentials;
+    const resolveProviderServerPassword = makeProviderServerPasswordResolver(credentials);
+    const openCodeOptions = options?.maintenanceOwnedResources
+      ? { maintenanceOwnedResources: options.maintenanceOwnedResources }
+      : undefined;
+    return Layer.mergeAll(
+      makeKiloTextGenerationServiceLive(resolveProviderServerPassword, openCodeOptions).pipe(
+        Layer.provide(OpenCodeRuntimeLive),
+      ),
+      makeOpenCodeTextGenerationServiceLive(resolveProviderServerPassword, openCodeOptions).pipe(
+        Layer.provide(OpenCodeRuntimeLive),
+      ),
+    );
+  }).pipe(Effect.provide(ProviderCredentialsLive.pipe(Layer.orDie)), Layer.unwrap);
+}
+
+export function makeTextGenerationLayerLive(options?: GitRuntimeLayerOptions) {
+  return makeProviderTextGenerationLive({
+    ...(options?.maintenanceGate ? { maintenanceGate: options.maintenanceGate } : {}),
+  }).pipe(
+    Layer.provide(CodexTextGenerationServiceLive),
+    Layer.provide(CursorTextGenerationServiceLive),
+    Layer.provide(makeTextGenerationProviderLayers(options)),
   );
-}).pipe(Effect.provide(ProviderCredentialsLive.pipe(Layer.orDie)), Layer.unwrap);
+}
 
-export const TextGenerationLayerLive = ProviderTextGenerationLive.pipe(
-  Layer.provide(CodexTextGenerationServiceLive),
-  Layer.provide(CursorTextGenerationServiceLive),
-  Layer.provide(textGenerationProviderLayers),
+export function makeGitManagerLayerLive(
+  options?: GitRuntimeLayerOptions,
+  textGenerationLayer = makeTextGenerationLayerLive(options),
+) {
+  return GitManagerLive.pipe(
+    Layer.provideMerge(GitCoreLive),
+    Layer.provideMerge(GitHubCliLive),
+    Layer.provideMerge(textGenerationLayer),
+  );
+}
+
+export function makeGitStatusBroadcasterLayerLive(
+  options?: GitRuntimeLayerOptions,
+  gitManagerLayer = makeGitManagerLayerLive(options),
+) {
+  return GitStatusBroadcasterLive.pipe(
+    Layer.provide(Layer.mergeAll(GitCoreLive, gitManagerLayer)),
+  );
+}
+
+export function makeGitLayerLive(
+  options?: GitRuntimeLayerOptions,
+  dependencies?: {
+    readonly textGenerationLayer?: ReturnType<typeof makeTextGenerationLayerLive>;
+  },
+) {
+  const textGenerationLayer =
+    dependencies?.textGenerationLayer ?? makeTextGenerationLayerLive(options);
+  const gitManagerLayer = makeGitManagerLayerLive(options, textGenerationLayer);
+  const gitStatusBroadcasterLayer = makeGitStatusBroadcasterLayerLive(options, gitManagerLayer);
+
+  return Layer.mergeAll(
+    GitCoreLive,
+    GitHubCliLive,
+    gitManagerLayer,
+    gitStatusBroadcasterLayer,
+  );
+}
+
+export const TextGenerationLayerLive = makeTextGenerationLayerLive();
+export const GitManagerLayerLive = makeGitManagerLayerLive(undefined, TextGenerationLayerLive);
+export const GitStatusBroadcasterLayerLive = makeGitStatusBroadcasterLayerLive(
+  undefined,
+  GitManagerLayerLive,
 );
-
-export const GitManagerLayerLive = GitManagerLive.pipe(
-  Layer.provideMerge(GitCoreLive),
-  Layer.provideMerge(GitHubCliLive),
-  Layer.provideMerge(TextGenerationLayerLive),
-);
-
-export const GitStatusBroadcasterLayerLive = GitStatusBroadcasterLive.pipe(
-  Layer.provide(Layer.mergeAll(GitCoreLive, GitManagerLayerLive)),
-);
-
 export const GitLayerLive = Layer.mergeAll(
   GitCoreLive,
   GitHubCliLive,

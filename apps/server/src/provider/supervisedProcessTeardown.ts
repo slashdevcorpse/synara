@@ -1,6 +1,7 @@
 import {
   defaultProcessTreeKiller,
   type CapturedProcess,
+  type CapturedProcessTree,
   type ProcessTreeKiller,
   type TerminalKillSignal,
 } from "../terminal/processTreeKiller";
@@ -9,11 +10,14 @@ import { Effect } from "effect";
 const DEFAULT_TERM_GRACE_MS = 1_500;
 const DEFAULT_FORCE_EXIT_MS = 1_500;
 const DEFAULT_POLL_MS = 25;
+const DEFAULT_CAPTURE_POLL_MS = 100;
 
 export interface SupervisedProcessTeardownInput {
   readonly rootPid: number;
   /** Must resolve only after the owned root process has emitted its terminal exit. */
   readonly rootExited: Promise<unknown>;
+  /** Optional identities captured while the root was alive. */
+  readonly capturedTree?: CapturedProcessTree;
   readonly termGraceMs?: number;
   readonly forceExitMs?: number;
   readonly pollMs?: number;
@@ -41,6 +45,26 @@ export interface SupervisedProcessTeardownDependencies {
   readonly processTreeKiller: ProcessTreeKiller;
   readonly now: () => number;
   readonly sleep: (milliseconds: number) => Promise<void>;
+}
+
+export interface EffectProcessTreeSupervisorOptions {
+  readonly processTreeKiller?: ProcessTreeKiller;
+  readonly teardownProcessTree?: typeof teardownProviderProcessTree;
+  /** Required on POSIX: the isolated process group owned by the spawned updater. */
+  readonly ownedProcessGroupId?: number;
+  readonly platform?: NodeJS.Platform;
+  readonly capturePollMs?: number;
+  readonly proofTimeoutMs?: number;
+  readonly now?: () => number;
+  readonly sleep?: (milliseconds: number) => Promise<void>;
+}
+
+export interface EffectProcessTreeSupervisor {
+  readonly rootPid: number;
+  /** Proves normal root exit and absence of every descendant captured while it was alive. */
+  readonly proveExit: () => Promise<SupervisedProcessTeardownResult>;
+  /** Terminates and proves exit using the same live-captured process identities. */
+  readonly teardown: () => Promise<SupervisedProcessTeardownResult>;
 }
 
 export class ProviderProcessExitUnprovenError extends Error {
@@ -116,8 +140,213 @@ export function teardownEffectProcessTree(
 ): Promise<SupervisedProcessTeardownResult> {
   return teardownProcessTree({
     rootPid: Number(process.pid),
-    rootExited: Effect.runPromise(Effect.exit(process.exitCode)),
+    rootExited: Effect.runPromise(Effect.asVoid(process.exitCode)),
   });
+}
+
+function capturedProcessKey(process: CapturedProcess): string {
+  return `${process.pid}:${process.identity ?? process.command}`;
+}
+
+/**
+ * Starts live ownership capture immediately after spawn. Repeated snapshots preserve descendants
+ * that may be reparented when a short-lived package-manager wrapper exits.
+ */
+export function superviseEffectProcessTree(
+  process: EffectProcessExitHandle,
+  options: EffectProcessTreeSupervisorOptions = {},
+): EffectProcessTreeSupervisor {
+  const rootPid = Number(process.pid);
+  if (!Number.isInteger(rootPid) || rootPid <= 0) {
+    throw new TypeError(`Provider process root PID must be a positive integer, got ${rootPid}.`);
+  }
+
+  const processTreeKiller = options.processTreeKiller ?? defaultProcessTreeKiller;
+  const teardownProcessTree = options.teardownProcessTree ?? teardownProviderProcessTree;
+  const platform = options.platform ?? globalThis.process.platform;
+  const now = options.now ?? Date.now;
+  const sleep = options.sleep ?? defaultDependencies.sleep;
+  const capturePollMs = positiveDuration(options.capturePollMs, DEFAULT_CAPTURE_POLL_MS);
+  const proofTimeoutMs = positiveDuration(options.proofTimeoutMs, DEFAULT_TERM_GRACE_MS);
+  const descendants = new Map<string, CapturedProcess>();
+  let root: CapturedProcess | undefined;
+  let captureComplete = true;
+  let rootSettled = false;
+  let monitorStopped = false;
+  let resolveMonitorStop: (() => void) | undefined;
+  const monitorStop = new Promise<void>((resolve) => {
+    resolveMonitorStop = resolve;
+  });
+
+  if (platform !== "win32" && options.ownedProcessGroupId === undefined) {
+    // Once a POSIX parent exits its children can be reparented between snapshots. An isolated
+    // process group is the only stable enumeration boundary available to this supervisor.
+    captureComplete = false;
+  }
+
+  const captureOwnedTree = (): CapturedProcessTree =>
+    processTreeKiller.capture(rootPid, {
+      ...(options.ownedProcessGroupId !== undefined
+        ? { processGroupId: options.ownedProcessGroupId }
+        : {}),
+    });
+
+  const captureOwnedTreeAsync = (): Promise<CapturedProcessTree> =>
+    processTreeKiller.captureAsync?.(rootPid, {
+      ...(options.ownedProcessGroupId !== undefined
+        ? { processGroupId: options.ownedProcessGroupId }
+        : {}),
+    }) ?? Promise.resolve(captureOwnedTree());
+
+  const mergeCapture = (tree: CapturedProcessTree, requireLiveRoot: boolean): void => {
+    if (tree.captureComplete === false || (requireLiveRoot && tree.root === undefined)) {
+      captureComplete = false;
+    }
+    if (tree.root !== undefined) {
+      if (root === undefined) {
+        root = tree.root;
+      } else if (capturedProcessKey(root) !== capturedProcessKey(tree.root)) {
+        // The PID was reused while supervision still owned the original process.
+        captureComplete = false;
+      }
+      if (tree.root.identity === undefined) captureComplete = false;
+    }
+    for (const descendant of tree.descendants) {
+      if (descendant.identity === undefined) captureComplete = false;
+      descendants.set(capturedProcessKey(descendant), descendant);
+    }
+  };
+
+  // This synchronous first snapshot is the ownership boundary. If the root is already absent,
+  // normal completion is deliberately unprovable rather than assuming it had no children.
+  mergeCapture(captureOwnedTree(), true);
+
+  const rootOutcome = Effect.runPromise(Effect.asVoid(process.exitCode)).then(
+    () => ({ _tag: "Exited" as const }),
+    (error: unknown) => ({ _tag: "WatcherFailed" as const, error }),
+  );
+  void rootOutcome.then(() => {
+    rootSettled = true;
+  });
+
+  const monitor = (async () => {
+    while (!monitorStopped && !rootSettled) {
+      await Promise.race([rootOutcome, sleep(capturePollMs), monitorStop]);
+      if (!monitorStopped && !rootSettled) {
+        try {
+          // The root can exit while an asynchronous snapshot is in flight. Initial capture already
+          // proved ownership, so later root absence is valid; watcher completion proves root exit.
+          mergeCapture(await captureOwnedTreeAsync(), false);
+        } catch {
+          captureComplete = false;
+        }
+      }
+    }
+    if (!monitorStopped) {
+      // Windows retains parent PIDs after root exit; this final snapshot catches children created
+      // between the last poll and the root exit notification. POSIX captures remain additive.
+      try {
+        mergeCapture(await captureOwnedTreeAsync(), false);
+      } catch {
+        captureComplete = false;
+      }
+    }
+  })();
+
+  let stopMonitorPromise: Promise<void> | null = null;
+  const stopMonitor = (): Promise<void> => {
+    if (stopMonitorPromise === null) {
+      monitorStopped = true;
+      resolveMonitorStop?.();
+      stopMonitorPromise = monitor;
+    }
+    return stopMonitorPromise;
+  };
+
+  const capturedTree = (): CapturedProcessTree => ({
+    ...(root !== undefined ? { root } : {}),
+    descendants: [...descendants.values()],
+    captureComplete,
+  });
+
+  const inspectUntil = async (
+    tree: CapturedProcessTree,
+  ): Promise<ReadonlyArray<CapturedProcess> | null> => {
+    const deadline = now() + proofTimeoutMs;
+    let remaining: ReadonlyArray<CapturedProcess> | null = null;
+    do {
+      const inspection = processTreeKiller.inspectAsync
+        ? await processTreeKiller.inspectAsync(tree)
+        : processTreeKiller.inspect?.(tree);
+      remaining = inspection?.verified === true ? inspection.survivors : null;
+      if (tree.captureComplete !== false && remaining !== null && remaining.length === 0) {
+        return remaining;
+      }
+      const remainingMs = deadline - now();
+      if (remainingMs <= 0) break;
+      await sleep(Math.min(DEFAULT_POLL_MS, remainingMs));
+    } while (now() <= deadline);
+    return remaining;
+  };
+
+  const proveExit = async (): Promise<SupervisedProcessTeardownResult> => {
+    const outcome = await rootOutcome;
+    try {
+      mergeCapture(await captureOwnedTreeAsync(), false);
+    } catch {
+      captureComplete = false;
+    }
+    await stopMonitor();
+    const tree = capturedTree();
+    const remaining = await inspectUntil(tree);
+    if (
+      outcome._tag === "Exited" &&
+      tree.captureComplete !== false &&
+      remaining !== null &&
+      remaining.length === 0
+    ) {
+      return { escalated: false, signalErrors: [] };
+    }
+    throw new ProviderProcessExitUnprovenError({
+      rootPid,
+      rootExited: outcome._tag === "Exited",
+      remainingDescendantPids: remaining?.map((descendant) => descendant.pid) ?? null,
+      captureComplete: tree.captureComplete !== false,
+    });
+  };
+
+  let teardownPromise: Promise<SupervisedProcessTeardownResult> | null = null;
+  const teardown = (): Promise<SupervisedProcessTeardownResult> => {
+    if (teardownPromise === null) {
+      const attempt = (async () => {
+        // Preserve one last live snapshot before signalling. Never replace earlier identities.
+        try {
+          mergeCapture(await captureOwnedTreeAsync(), false);
+        } catch {
+          captureComplete = false;
+        }
+        await stopMonitor();
+        return teardownProcessTree({
+          rootPid,
+          rootExited: rootOutcome.then((outcome) => {
+            if (outcome._tag === "WatcherFailed") throw outcome.error;
+          }),
+          capturedTree: capturedTree(),
+        });
+      })();
+      teardownPromise = attempt;
+      void attempt.catch(() => {
+        // Preserve single-flight behavior while an attempt is pending, but allow a later caller to
+        // retry proof with the same retained process identities after an unproven exit.
+        if (teardownPromise === attempt) {
+          teardownPromise = null;
+        }
+      });
+    }
+    return teardownPromise;
+  };
+
+  return { rootPid, proveExit, teardown };
 }
 
 /**
@@ -136,7 +365,7 @@ export async function teardownProviderProcessTree(
   }
 
   const deps = { ...defaultDependencies, ...dependencies };
-  const tree = deps.processTreeKiller.capture(input.rootPid);
+  const tree = input.capturedTree ?? deps.processTreeKiller.capture(input.rootPid);
   const signalErrors: Error[] = [];
   let rootExited = false;
   void input.rootExited.then(
@@ -158,13 +387,19 @@ export async function teardownProviderProcessTree(
     });
   };
 
+  // Observe an already-settled watcher before deciding whether it is safe to address the root PID.
+  // This prevents a normal-exit proof failure from signalling an unrelated process that reused it.
+  await Promise.resolve();
+
   const waitForExitProof = async (timeoutMs: number) => {
     const deadline = deps.now() + timeoutMs;
     let remainingDescendants: ReadonlyArray<CapturedProcess> | null = null;
     do {
       // Flush a root-exit resolution caused synchronously by a signal test double.
       await Promise.resolve();
-      const inspection = deps.processTreeKiller.inspect?.(tree);
+      const inspection = deps.processTreeKiller.inspectAsync
+        ? await deps.processTreeKiller.inspectAsync(tree)
+        : deps.processTreeKiller.inspect?.(tree);
       remainingDescendants = inspection?.verified === true ? inspection.survivors : null;
       if (
         rootExited &&
@@ -181,7 +416,7 @@ export async function teardownProviderProcessTree(
     return { proven: false as const, remainingDescendants };
   };
 
-  signal("SIGTERM", true);
+  signal("SIGTERM", !rootExited);
   const graceful = await waitForExitProof(
     positiveDuration(input.termGraceMs, DEFAULT_TERM_GRACE_MS),
   );

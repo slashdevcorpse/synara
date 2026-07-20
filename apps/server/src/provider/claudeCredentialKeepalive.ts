@@ -95,6 +95,7 @@ export function startClaudeCredentialKeepalive(input?: {
   readonly env?: NodeJS.ProcessEnv;
   readonly binaryPath?: string;
   readonly homeDir?: string;
+  readonly runOperation?: (run: () => Promise<void>) => Promise<void>;
   readonly log?: (message: string) => void;
 }): ClaudeCredentialKeepaliveHandle {
   const platform = input?.platform ?? process.platform;
@@ -118,7 +119,8 @@ export function startClaudeCredentialKeepalive(input?: {
     }
     inFlight = true;
     try {
-      await nudgeClaudeTokenRefresh(binaryPath, homeDir);
+      const run = () => nudgeClaudeTokenRefresh(binaryPath, homeDir);
+      await (input?.runOperation ? input.runOperation(run) : run());
     } catch (cause) {
       // Best-effort: a missing binary, a genuinely logged-out user, or a transient failure
       // must never crash the server. Keep it quiet since it self-heals on the next tick.

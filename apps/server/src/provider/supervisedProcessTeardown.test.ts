@@ -1,3 +1,4 @@
+import { Effect } from "effect";
 import { describe, expect, it } from "vitest";
 
 import type {
@@ -8,6 +9,8 @@ import type {
 } from "../terminal/processTreeKiller";
 import {
   ProviderProcessExitUnprovenError,
+  superviseEffectProcessTree,
+  teardownEffectProcessTree,
   teardownProviderProcessTree,
 } from "./supervisedProcessTeardown";
 
@@ -22,6 +25,23 @@ function deterministicClock() {
 }
 
 describe("teardownProviderProcessTree", () => {
+  it("does not convert a failed Effect exit watcher into false exit proof", async () => {
+    const watcherFailure = new Error("provider exit watcher failed");
+
+    await expect(
+      teardownEffectProcessTree(
+        {
+          pid: 91,
+          exitCode: Effect.die(watcherFailure),
+        },
+        async ({ rootExited }) => {
+          await expect(rootExited).rejects.toBe(watcherFailure);
+          return { escalated: false, signalErrors: [] };
+        },
+      ),
+    ).resolves.toEqual({ escalated: false, signalErrors: [] });
+  });
+
   it("escalates ignored TERM and returns only after root and descendants prove exit", async () => {
     const tree: CapturedProcessTree = {
       descendants: [{ pid: 102, command: "provider-worker" }],
@@ -98,6 +118,26 @@ describe("teardownProviderProcessTree", () => {
     expect(signals.at(-1)).toEqual({ signal: "SIGKILL", includeRootTree: false });
   });
 
+  it("does not signal a root PID whose exit was already proven before teardown", async () => {
+    const signals: Array<{ signal: TerminalKillSignal; includeRootTree: boolean | undefined }> = [];
+    const processTreeKiller: ProcessTreeKiller = {
+      capture: () => ({ descendants: [], captureComplete: true }),
+      inspect: () => ({ verified: true, survivors: [] }),
+      signal: ({ signal, includeRootTree }) => {
+        signals.push({ signal, includeRootTree });
+      },
+    };
+    const clock = deterministicClock();
+
+    await expect(
+      teardownProviderProcessTree(
+        { rootPid: 251, rootExited: Promise.resolve(), termGraceMs: 5, forceExitMs: 5 },
+        { processTreeKiller, ...clock },
+      ),
+    ).resolves.toEqual({ escalated: false, signalErrors: [] });
+    expect(signals).toEqual([{ signal: "SIGTERM", includeRootTree: false }]);
+  });
+
   it("fails closed when forced termination cannot prove process-tree exit", async () => {
     const tree: CapturedProcessTree = {
       descendants: [{ pid: 302, command: "stuck-provider" }],
@@ -123,5 +163,211 @@ describe("teardownProviderProcessTree", () => {
       rootExited: false,
       remainingDescendantPids: [302],
     });
+  });
+});
+
+describe("superviseEffectProcessTree", () => {
+  function controllableEffectProcess(pid: number) {
+    let resolveExit: (() => void) | undefined;
+    const exited = new Promise<void>((resolve) => {
+      resolveExit = resolve;
+    });
+    return {
+      process: {
+        pid,
+        exitCode: Effect.promise(() => exited),
+      },
+      exit: () => resolveExit?.(),
+    };
+  }
+
+  it("proves normal root success only after every live-captured descendant exits", async () => {
+    const owned = controllableEffectProcess(501);
+    const root: CapturedProcess = {
+      pid: 501,
+      command: "provider updater",
+      identity: "501:root-start",
+    };
+    const child: CapturedProcess = {
+      pid: 502,
+      command: "provider postinstall",
+      identity: "502:child-start",
+    };
+    let rootAlive = true;
+    let childAlive = true;
+    const processTreeKiller: ProcessTreeKiller = {
+      capture: () => ({
+        ...(rootAlive ? { root } : {}),
+        descendants: childAlive ? [child] : [],
+        captureComplete: true,
+      }),
+      inspect: (tree) => ({
+        verified: true,
+        survivors: childAlive ? tree.descendants.filter(({ pid }) => pid === child.pid) : [],
+      }),
+      signal: () => undefined,
+    };
+    const supervisor = superviseEffectProcessTree(owned.process, {
+      processTreeKiller,
+      platform: "win32",
+      capturePollMs: 1,
+      proofTimeoutMs: 5,
+    });
+
+    rootAlive = false;
+    owned.exit();
+    const failure = await supervisor.proveExit().catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(ProviderProcessExitUnprovenError);
+    expect(failure).toMatchObject({
+      rootPid: 501,
+      rootExited: true,
+      remainingDescendantPids: [502],
+      captureComplete: true,
+    });
+
+    childAlive = false;
+  });
+
+  it("accepts normal root success when every live-captured descendant is gone", async () => {
+    const owned = controllableEffectProcess(601);
+    const root: CapturedProcess = {
+      pid: 601,
+      command: "provider updater",
+      identity: "601:root-start",
+    };
+    const child: CapturedProcess = {
+      pid: 602,
+      command: "provider postinstall",
+      identity: "602:child-start",
+    };
+    let rootAlive = true;
+    let childAlive = true;
+    const processTreeKiller: ProcessTreeKiller = {
+      capture: () => ({
+        ...(rootAlive ? { root } : {}),
+        descendants: childAlive ? [child] : [],
+        captureComplete: true,
+      }),
+      inspect: (tree) => ({
+        verified: true,
+        survivors: childAlive ? tree.descendants.filter(({ pid }) => pid === child.pid) : [],
+      }),
+      signal: () => undefined,
+    };
+    const supervisor = superviseEffectProcessTree(owned.process, {
+      processTreeKiller,
+      platform: "win32",
+      capturePollMs: 1,
+      proofTimeoutMs: 5,
+    });
+
+    rootAlive = false;
+    childAlive = false;
+    owned.exit();
+
+    await expect(supervisor.proveExit()).resolves.toEqual({
+      escalated: false,
+      signalErrors: [],
+    });
+  });
+
+  it("fails closed on POSIX when the updater has no explicitly owned process group", async () => {
+    const owned = controllableEffectProcess(701);
+    let rootAlive = true;
+    const processTreeKiller: ProcessTreeKiller = {
+      capture: () => ({
+        ...(rootAlive
+          ? {
+              root: {
+                pid: 701,
+                command: "provider updater",
+                identity: "701:root-start",
+              },
+            }
+          : {}),
+        descendants: [],
+        captureComplete: true,
+      }),
+      inspect: () => ({ verified: true, survivors: [] }),
+      signal: () => undefined,
+    };
+    const supervisor = superviseEffectProcessTree(owned.process, {
+      processTreeKiller,
+      platform: "linux",
+      capturePollMs: 1,
+      proofTimeoutMs: 5,
+    });
+
+    rootAlive = false;
+    owned.exit();
+    const failure = await supervisor.proveExit().catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(ProviderProcessExitUnprovenError);
+    expect(failure).toMatchObject({
+      rootPid: 701,
+      rootExited: true,
+      remainingDescendantPids: [],
+      captureComplete: false,
+    });
+  });
+
+  it("keeps teardown single-flight while pending and retries a rejected proof", async () => {
+    const owned = controllableEffectProcess(801);
+    const root: CapturedProcess = {
+      pid: 801,
+      command: "provider updater",
+      identity: "801:root-start",
+    };
+    const child: CapturedProcess = {
+      pid: 802,
+      command: "provider postinstall",
+      identity: "802:child-start",
+    };
+    const capturedTrees: CapturedProcessTree[] = [];
+    let releaseFirstAttempt: (() => void) | undefined;
+    const firstAttemptGate = new Promise<void>((resolve) => {
+      releaseFirstAttempt = resolve;
+    });
+    let teardownAttempts = 0;
+    const supervisor = superviseEffectProcessTree(owned.process, {
+      processTreeKiller: {
+        capture: () => ({ root, descendants: [child], captureComplete: true }),
+        inspect: () => ({ verified: true, survivors: [] }),
+        signal: () => undefined,
+      },
+      teardownProcessTree: async (input) => {
+        teardownAttempts += 1;
+        capturedTrees.push(input.capturedTree ?? { descendants: [], captureComplete: false });
+        if (teardownAttempts === 1) {
+          await firstAttemptGate;
+          throw new ProviderProcessExitUnprovenError({
+            rootPid: 801,
+            rootExited: false,
+            remainingDescendantPids: [802],
+            captureComplete: true,
+          });
+        }
+        return { escalated: false, signalErrors: [] };
+      },
+      platform: "win32",
+      capturePollMs: 1,
+    });
+
+    const first = supervisor.teardown();
+    const concurrent = supervisor.teardown();
+    expect(concurrent).toBe(first);
+    releaseFirstAttempt?.();
+    await expect(first).rejects.toBeInstanceOf(ProviderProcessExitUnprovenError);
+    await expect(concurrent).rejects.toBeInstanceOf(ProviderProcessExitUnprovenError);
+
+    const retry = supervisor.teardown();
+    expect(retry).not.toBe(first);
+    await expect(retry).resolves.toEqual({ escalated: false, signalErrors: [] });
+    expect(supervisor.teardown()).toBe(retry);
+    expect(teardownAttempts).toBe(2);
+    expect(capturedTrees).toHaveLength(2);
+    expect(capturedTrees[0]?.descendants).toContainEqual(child);
+    expect(capturedTrees[1]?.descendants).toContainEqual(child);
   });
 });

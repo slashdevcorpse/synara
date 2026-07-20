@@ -46,7 +46,7 @@ import {
 } from "effect";
 import * as Semaphore from "effect/Semaphore";
 
-import { ProviderValidationError } from "../Errors.ts";
+import { ProviderValidationError, type ProviderServiceError } from "../Errors.ts";
 import { ProviderAdapterRegistry } from "../Services/ProviderAdapterRegistry.ts";
 import { ProviderService, type ProviderServiceShape } from "../Services/ProviderService.ts";
 import {
@@ -63,6 +63,10 @@ import {
 } from "../terminalTurnApplicability.ts";
 import { makeProviderLifecycleCoordinator } from "../providerLifecycleCoordinator.ts";
 import { carryProviderAttachmentPaths } from "../providerAttachmentPaths.ts";
+import {
+  makeProviderMaintenanceGate,
+  type ProviderMaintenanceGate,
+} from "../providerMaintenanceGate.ts";
 
 export interface ProviderServiceLiveOptions {
   readonly canonicalEventLogPath?: string;
@@ -72,6 +76,8 @@ export interface ProviderServiceLiveOptions {
   readonly runtimeEventBufferCapacity?: number;
   /** Production journal hook. The event must be durable before this effect returns. */
   readonly persistRuntimeEvent?: (event: ProviderRuntimeEvent) => Effect.Effect<void>;
+  /** Shared admission gate used to exclude provider process work during CLI maintenance. */
+  readonly maintenanceGate?: ProviderMaintenanceGate;
 }
 
 const DEFAULT_PROVIDER_RUNTIME_IDLE_STOP_MS = 10 * 60 * 1000;
@@ -94,6 +100,7 @@ const ClearSessionResumeCursorInput = Schema.Struct({
 type StopRuntimeSession = NonNullable<ProviderServiceShape["stopRuntimeSession"]>;
 type StopRuntimeSessionInput = Parameters<StopRuntimeSession>[0];
 type StopRuntimeSessionEffect = ReturnType<StopRuntimeSession>;
+type PrepareForMaintenance = NonNullable<ProviderServiceShape["prepareForMaintenance"]>;
 type InteractionResponse =
   | { readonly kind: "approval"; readonly input: ProviderRespondToRequestInput }
   | { readonly kind: "userInput"; readonly input: ProviderRespondToUserInputInput };
@@ -295,6 +302,25 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
 
     const registry = yield* ProviderAdapterRegistry;
     const directory = yield* ProviderSessionDirectory;
+    const maintenanceGate = options?.maintenanceGate ?? (yield* makeProviderMaintenanceGate);
+    const withProviderOperation = <A, E, R>(input: {
+      readonly provider: ProviderSession["provider"];
+      readonly operation: string;
+      readonly run: Effect.Effect<A, E, R>;
+    }): Effect.Effect<A, E | ProviderValidationError, R> =>
+      maintenanceGate
+        .withOperation(input)
+        .pipe(
+          Effect.catchTag("ProviderMaintenanceBusyError", (error) =>
+            Effect.fail(
+              toValidationError(
+                input.operation,
+                error.message,
+                error,
+              ),
+            ),
+          ),
+        );
     const lifecycle = makeProviderLifecycleCoordinator();
     for (const binding of yield* directory.listBindings()) {
       if (binding.lifecycleGeneration !== undefined) {
@@ -1034,15 +1060,19 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
           const persistedModelSelection = readPersistedModelSelection(binding.runtimePayload);
           const persistedProviderOptions = readPersistedProviderOptions(binding.runtimePayload);
 
-          const resumed = yield* adapter.startSession({
-            threadId: binding.threadId,
-            provider: binding.provider,
-            lifecycleGeneration: lease.generation,
-            ...(persistedCwd ? { cwd: persistedCwd } : {}),
-            ...(persistedModelSelection ? { modelSelection: persistedModelSelection } : {}),
-            ...(persistedProviderOptions ? { providerOptions: persistedProviderOptions } : {}),
-            ...(hasPersistedResumeCursor ? { resumeCursor: binding.resumeCursor } : {}),
-            runtimeMode: binding.runtimeMode ?? "full-access",
+          const resumed = yield* withProviderOperation({
+            provider: adapter.provider,
+            operation: input.operation,
+            run: adapter.startSession({
+              threadId: binding.threadId,
+              provider: binding.provider,
+              lifecycleGeneration: lease.generation,
+              ...(persistedCwd ? { cwd: persistedCwd } : {}),
+              ...(persistedModelSelection ? { modelSelection: persistedModelSelection } : {}),
+              ...(persistedProviderOptions ? { providerOptions: persistedProviderOptions } : {}),
+              ...(hasPersistedResumeCursor ? { resumeCursor: binding.resumeCursor } : {}),
+              runtimeMode: binding.runtimeMode ?? "full-access",
+            }),
           });
           if (resumed.provider !== adapter.provider) {
             return yield* toValidationError(
@@ -1159,15 +1189,19 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
             const adapter = yield* registry.getByProvider(input.provider);
             let replacementStarted = false;
             const startAndPersistReplacement = Effect.gen(function* () {
-              const session = yield* adapter.startSession({
-                ...input,
-                lifecycleGeneration: lease.generation,
-                ...(effectiveProviderOptions !== undefined
-                  ? { providerOptions: effectiveProviderOptions }
-                  : {}),
-                ...(effectiveResumeCursor !== undefined
-                  ? { resumeCursor: effectiveResumeCursor }
-                  : {}),
+              const session = yield* withProviderOperation({
+                provider: adapter.provider,
+                operation: "ProviderService.startSession",
+                run: adapter.startSession({
+                  ...input,
+                  lifecycleGeneration: lease.generation,
+                  ...(effectiveProviderOptions !== undefined
+                    ? { providerOptions: effectiveProviderOptions }
+                    : {}),
+                  ...(effectiveResumeCursor !== undefined
+                    ? { resumeCursor: effectiveResumeCursor }
+                    : {}),
+                }),
               });
               replacementStarted = true;
 
@@ -1229,21 +1263,25 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
                       if (replacementStarted) {
                         yield* adapter.stopSession(threadId);
                       }
-                      const restored = yield* previousAdapter.startSession({
-                        threadId,
-                        provider: persistedBinding.provider,
-                        lifecycleGeneration: previousGeneration,
-                        runtimeMode: persistedBinding.runtimeMode ?? "full-access",
-                        ...(previousCwd !== undefined ? { cwd: previousCwd } : {}),
-                        ...(previousModelSelection !== undefined
-                          ? { modelSelection: previousModelSelection }
-                          : {}),
-                        ...(previousProviderOptions !== undefined
-                          ? { providerOptions: previousProviderOptions }
-                          : {}),
-                        ...(persistedBinding.resumeCursor !== undefined
-                          ? { resumeCursor: persistedBinding.resumeCursor }
-                          : {}),
+                      const restored = yield* withProviderOperation({
+                        provider: previousAdapter.provider,
+                        operation: "ProviderService.startSession.restorePreviousProvider",
+                        run: previousAdapter.startSession({
+                          threadId,
+                          provider: persistedBinding.provider,
+                          lifecycleGeneration: previousGeneration,
+                          runtimeMode: persistedBinding.runtimeMode ?? "full-access",
+                          ...(previousCwd !== undefined ? { cwd: previousCwd } : {}),
+                          ...(previousModelSelection !== undefined
+                            ? { modelSelection: previousModelSelection }
+                            : {}),
+                          ...(previousProviderOptions !== undefined
+                            ? { providerOptions: previousProviderOptions }
+                            : {}),
+                          ...(persistedBinding.resumeCursor !== undefined
+                            ? { resumeCursor: persistedBinding.resumeCursor }
+                            : {}),
+                        }),
                       });
                       if (restored.provider !== previousAdapter.provider) {
                         return yield* toValidationError(
@@ -1301,8 +1339,10 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
           return null;
         }
 
-        const forked = yield* adapter
-          .forkThread({
+        const forked = yield* withProviderOperation({
+          provider: adapter.provider,
+          operation: "ProviderService.forkThread",
+          run: adapter.forkThread({
             ...input,
             threadId: input.threadId,
             sourceThreadId: input.sourceThreadId,
@@ -1314,8 +1354,8 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
               : {}),
             ...(sourceCwd ? { sourceCwd } : {}),
             runtimeMode: input.runtimeMode,
-          })
-          .pipe(
+          }),
+        }).pipe(
             Effect.catch((error) =>
               Effect.logWarning("provider native fork failed; falling back", {
                 sourceThreadId: input.sourceThreadId,
@@ -1394,7 +1434,11 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
               operation: "ProviderService.sendTurn",
               allowRecovery: true,
             });
-            const turn = yield* routed.adapter.sendTurn(input);
+            const turn = yield* withProviderOperation({
+              provider: routed.adapter.provider,
+              operation: "ProviderService.sendTurn",
+              run: routed.adapter.sendTurn(input),
+            });
             const persistenceInput: StartedTurnPersistenceInput = {
               threadId: input.threadId,
               provider: routed.adapter.provider,
@@ -1463,7 +1507,11 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
                 `Provider '${routed.adapter.provider}' does not support steering an active turn.`,
               );
             }
-            const turn = yield* routed.adapter.steerTurn(input);
+            const turn = yield* withProviderOperation({
+              provider: routed.adapter.provider,
+              operation: "ProviderService.steerTurn",
+              run: routed.adapter.steerTurn(input),
+            });
             const persistenceInput: StartedTurnPersistenceInput = {
               threadId: input.threadId,
               provider: routed.adapter.provider,
@@ -1511,7 +1559,11 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
               );
             }
 
-            const turn = yield* routed.adapter.startReview(input);
+            const turn = yield* withProviderOperation({
+              provider: routed.adapter.provider,
+              operation: "ProviderService.startReview",
+              run: routed.adapter.startReview(input),
+            });
             const persistenceInput: StartedTurnPersistenceInput = {
               threadId: input.threadId,
               provider: routed.adapter.provider,
@@ -1664,7 +1716,11 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
                   `Provider '${routed.adapter.provider}' does not support backgrounding a provider task.`,
                 );
               }
-              yield* routed.adapter.backgroundTask(input.threadId, input.toolUseId);
+              yield* withProviderOperation({
+                provider: routed.adapter.provider,
+                operation: "ProviderService.backgroundTask",
+                run: routed.adapter.backgroundTask(input.threadId, input.toolUseId),
+              });
               yield* analytics.record("provider.task.backgrounded", {
                 provider: routed.adapter.provider,
               });
@@ -1700,11 +1756,15 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
                 );
               }
               const attachments = carryProviderAttachmentPaths(rawInput, input.attachments ?? []);
-              yield* routed.adapter.steerSubagent(input.threadId, input.providerThreadId, {
-                input: input.input ?? "",
-                ...(attachments.length > 0 ? { attachments } : {}),
-                ...(input.skills !== undefined ? { skills: input.skills } : {}),
-                ...(input.mentions !== undefined ? { mentions: input.mentions } : {}),
+              yield* withProviderOperation({
+                provider: routed.adapter.provider,
+                operation: "ProviderService.steerSubagent",
+                run: routed.adapter.steerSubagent(input.threadId, input.providerThreadId, {
+                  input: input.input ?? "",
+                  ...(attachments.length > 0 ? { attachments } : {}),
+                  ...(input.skills !== undefined ? { skills: input.skills } : {}),
+                  ...(input.mentions !== undefined ? { mentions: input.mentions } : {}),
+                }),
               });
               yield* analytics.record("provider.subagent.steered", {
                 provider: routed.adapter.provider,
@@ -1754,22 +1814,30 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
             );
           }
           if (response.kind === "approval") {
-            yield* routed.adapter.respondToRequest(
-              input.threadId,
-              input.requestId,
-              response.input.decision,
-            );
+            yield* withProviderOperation({
+              provider: routed.adapter.provider,
+              operation,
+              run: routed.adapter.respondToRequest(
+                input.threadId,
+                input.requestId,
+                response.input.decision,
+              ),
+            });
             yield* analytics.record("provider.request.responded", {
               provider: routed.adapter.provider,
               decision: response.input.decision,
             });
             return;
           }
-          yield* routed.adapter.respondToUserInput(
-            input.threadId,
-            input.requestId,
-            response.input.answers,
-          );
+          yield* withProviderOperation({
+            provider: routed.adapter.provider,
+            operation,
+            run: routed.adapter.respondToUserInput(
+              input.threadId,
+              input.requestId,
+              response.input.answers,
+            ),
+          });
         }),
       );
     };
@@ -1888,6 +1956,190 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
 
     const stopRuntimeSession: StopRuntimeSession = (rawInput) =>
       stopRuntimeSessionInternal(rawInput);
+
+    const prepareForMaintenance: PrepareForMaintenance = (input) =>
+      Effect.gen(function* () {
+        const operation = "ProviderService.prepareForMaintenance";
+        const adapter = yield* registry.getByProvider(input.provider);
+        const initialSessions = (yield* adapter.listSessions()).filter(
+          (session) => session.provider === input.provider && session.status !== "closed",
+        );
+
+        if (!input.stopIdleSessions && initialSessions.length > 0) {
+          return yield* toValidationError(
+            operation,
+            `Cannot update '${input.provider}' while ${initialSessions.length} runtime${initialSessions.length === 1 ? " is" : "s are"} open because process ownership cannot be proven safely. Close the affected sessions and retry.`,
+          );
+        }
+
+        const snapshots = yield* Effect.forEach(
+          initialSessions,
+          (session) =>
+            Effect.gen(function* () {
+              const binding = Option.getOrUndefined(yield* directory.getBinding(session.threadId));
+              if (!binding || binding.provider !== input.provider) {
+                return yield* toValidationError(
+                  operation,
+                  `Cannot update '${input.provider}' because runtime '${session.threadId}' does not have a matching persisted provider binding.`,
+                );
+              }
+              const hasActiveWork =
+                session.status === "connecting" ||
+                session.status === "running" ||
+                session.activeTurnId !== undefined ||
+                runtimeActiveTurnId(binding.runtimePayload) !== undefined ||
+                (liveRuntimeTaskIds.get(session.threadId)?.size ?? 0) > 0;
+              if (hasActiveWork) {
+                return yield* toValidationError(
+                  operation,
+                  `Cannot update '${input.provider}' while runtime '${session.threadId}' has active work. Wait for turns and background tasks to finish, then retry.`,
+                );
+              }
+              const resumeCursor = hasResumeCursor(session.resumeCursor)
+                ? session.resumeCursor
+                : binding.resumeCursor;
+              if (!hasResumeCursor(resumeCursor)) {
+                return yield* toValidationError(
+                  operation,
+                  `Cannot update '${input.provider}' because runtime '${session.threadId}' has no verified resume cursor. Close the session explicitly and retry.`,
+                );
+              }
+              return {
+                threadId: session.threadId,
+                lifecycleGeneration: binding.lifecycleGeneration,
+              };
+            }),
+          { concurrency: 1 },
+        );
+
+        for (const snapshot of snapshots) {
+          clearRuntimeIdleTimer(snapshot.threadId);
+          yield* waitForRuntimeIdleStop(snapshot.threadId);
+        }
+
+        type MaintenanceLease = {
+          readonly generation: string;
+          readonly snapshot: (typeof snapshots)[number];
+        };
+        const acquireLifecycleLocks = (
+          index: number,
+          leases: ReadonlyArray<MaintenanceLease>,
+        ): Effect.Effect<ReadonlyArray<ThreadId>, ProviderServiceError> => {
+          const snapshot = snapshots[index];
+          if (!snapshot) {
+            return Effect.gen(function* () {
+              const currentSessions = (yield* adapter.listSessions()).filter(
+                (session) => session.provider === input.provider && session.status !== "closed",
+              );
+              const sessionsByThreadId = new Map(
+                currentSessions.map((session) => [session.threadId, session] as const),
+              );
+              const validated = yield* Effect.forEach(
+                leases,
+                ({ generation, snapshot: lockedSnapshot }) =>
+                  Effect.gen(function* () {
+                    const binding = Option.getOrUndefined(
+                      yield* directory.getBinding(lockedSnapshot.threadId),
+                    );
+                    const session = sessionsByThreadId.get(lockedSnapshot.threadId);
+                    if (
+                      !binding ||
+                      binding.provider !== input.provider ||
+                      binding.lifecycleGeneration !== lockedSnapshot.lifecycleGeneration ||
+                      !session
+                    ) {
+                      return yield* toValidationError(
+                        operation,
+                        `Cannot update '${input.provider}' because runtime '${lockedSnapshot.threadId}' changed during maintenance preparation. Retry the update.`,
+                      );
+                    }
+                    const hasActiveWork =
+                      session.status === "connecting" ||
+                      session.status === "running" ||
+                      session.activeTurnId !== undefined ||
+                      runtimeActiveTurnId(binding.runtimePayload) !== undefined ||
+                      (liveRuntimeTaskIds.get(session.threadId)?.size ?? 0) > 0;
+                    if (hasActiveWork) {
+                      return yield* toValidationError(
+                        operation,
+                        `Cannot update '${input.provider}' while runtime '${session.threadId}' has active work. Wait for turns and background tasks to finish, then retry.`,
+                      );
+                    }
+                    const resumeCursor = hasResumeCursor(session.resumeCursor)
+                      ? session.resumeCursor
+                      : binding.resumeCursor;
+                    if (!hasResumeCursor(resumeCursor)) {
+                      return yield* toValidationError(
+                        operation,
+                        `Cannot update '${input.provider}' because runtime '${session.threadId}' no longer has a verified resume cursor. Close the session explicitly and retry.`,
+                      );
+                    }
+                    return { binding, generation, resumeCursor, session };
+                  }),
+                { concurrency: 1 },
+              );
+
+              yield* Effect.forEach(
+                validated,
+                ({ binding, generation, resumeCursor, session }) =>
+                  Effect.gen(function* () {
+                    yield* adapter.stopSession(session.threadId);
+                    liveRuntimeTaskIds.delete(session.threadId);
+                    yield* withBindingWriteLock(
+                      session.threadId,
+                      directory.upsert({
+                        threadId: session.threadId,
+                        provider: binding.provider,
+                        ...(binding.adapterKey !== undefined
+                          ? { adapterKey: binding.adapterKey }
+                          : {}),
+                        ...(binding.runtimeMode !== undefined
+                          ? { runtimeMode: binding.runtimeMode }
+                          : {}),
+                        status: "stopped",
+                        lifecycleGeneration: generation,
+                        resumeCursor,
+                        runtimePayload: {
+                          ...runtimePayloadRecord(binding.runtimePayload),
+                          activeTurnId: null,
+                          lastRuntimeEvent: "provider.prepareForMaintenance",
+                          lastRuntimeEventAt: new Date().toISOString(),
+                          lifecycleGeneration: generation,
+                        },
+                      }),
+                    );
+                    yield* analytics.record("provider.session.runtime_stopped", {
+                      provider: binding.provider,
+                      reason: "cli-maintenance",
+                    });
+                  }),
+                { concurrency: 1, discard: true },
+              );
+
+              yield* adapter.stopAll();
+              const remaining = (yield* adapter.listSessions()).filter(
+                (session) => session.provider === input.provider && session.status !== "closed",
+              );
+              if (remaining.length > 0) {
+                return yield* toValidationError(
+                  operation,
+                  `Cannot update '${input.provider}' because ${remaining.length} runtime${remaining.length === 1 ? " is" : "s are"} still open after shutdown.`,
+                );
+              }
+              return validated.map(({ session }) => session.threadId);
+            });
+          }
+
+          return lifecycle.run(snapshot.threadId, (lease) =>
+            acquireLifecycleLocks(index + 1, [
+              ...leases,
+              { generation: lease.generation, snapshot },
+            ]),
+          );
+        };
+
+        return yield* acquireLifecycleLocks(0, []);
+      });
 
     const hasLiveRuntimeTasks: NonNullable<ProviderServiceShape["hasLiveRuntimeTasks"]> = (input) =>
       Effect.sync(() => (liveRuntimeTaskIds.get(input.threadId)?.size ?? 0) > 0);
@@ -2090,7 +2342,11 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
                     operation: "ProviderService.rollbackConversation",
                     allowRecovery: true,
                   });
-              yield* active.adapter.rollbackThread(input.threadId, input.numTurns);
+              yield* withProviderOperation({
+                provider: active.adapter.provider,
+                operation: "ProviderService.rollbackConversation",
+                run: active.adapter.rollbackThread(input.threadId, input.numTurns),
+              });
             }
             yield* analytics.record("provider.conversation.rolled_back", {
               provider: routed.adapter.provider,
@@ -2122,7 +2378,11 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
                 `Context compaction is unavailable for provider '${routed.adapter.provider}'.`,
               );
             }
-            yield* routed.adapter.compactThread(input.threadId);
+            yield* withProviderOperation({
+              provider: routed.adapter.provider,
+              operation: "ProviderService.compactThread",
+              run: routed.adapter.compactThread(input.threadId),
+            });
             const binding = Option.getOrUndefined(yield* directory.getBinding(input.threadId));
             if (binding) {
               yield* directory.upsert({
@@ -2228,6 +2488,7 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
       respondToUserInput,
       stopSession,
       stopRuntimeSession,
+      prepareForMaintenance,
       hasLiveRuntimeTasks,
       clearSessionResumeCursor,
       listSessions,

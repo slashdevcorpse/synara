@@ -21,6 +21,11 @@ export type DatabaseLifecycleLock = {
   readonly owner: DatabaseLifecycleLockOwner;
 };
 
+/** Internal synchronization seam used by deterministic lifecycle-lock tests. */
+interface DatabaseLifecycleLockReleaseDependencies {
+  readonly beforeRelease?: () => Promise<void>;
+}
+
 export class DatabaseLifecycleLockedError extends Error {
   readonly _tag = "DatabaseLifecycleLockedError";
 
@@ -164,6 +169,11 @@ async function tryPublishOwnedDirectory(
   targetPath: string,
   owner: DatabaseLifecycleLockOwner,
 ): Promise<boolean> {
+  // POSIX rename may replace an existing empty directory while Windows rename refuses it.
+  // Check first so malformed/ownerless lock directories fail closed consistently. A racing
+  // valid publisher creates a non-empty directory, which the later rename cannot replace.
+  if (await pathExists(targetPath)) return false;
+
   const stagingPath = await prepareOwnedDirectory(targetPath, owner);
   let published = false;
   try {
@@ -359,7 +369,11 @@ async function acquire(dbPath: string): Promise<DatabaseLifecycleLock> {
   throw new DatabaseLifecycleLockedError(canonicalDbPath, lockPath, "acquisition failed");
 }
 
-async function release(lock: DatabaseLifecycleLock): Promise<void> {
+async function release(
+  lock: DatabaseLifecycleLock,
+  dependencies?: DatabaseLifecycleLockReleaseDependencies,
+): Promise<void> {
+  await dependencies?.beforeRelease?.();
   let owner: DatabaseLifecycleLockOwner;
   try {
     owner = await readOwner(lock.lockPath);
@@ -381,18 +395,75 @@ async function release(lock: DatabaseLifecycleLock): Promise<void> {
   await syncDirectory(path.dirname(lock.lockPath));
 }
 
+const releasePromises = new WeakMap<DatabaseLifecycleLock, Promise<void>>();
+// Structural copies do not share WeakMap identity. Collapse their in-flight release by the
+// filesystem authority they carry, then remove the strong key when that attempt settles.
+const authorityReleasePromises = new Map<string, Promise<void>>();
+
+function releaseAuthorityKey(lock: DatabaseLifecycleLock): string {
+  const resolvedLockPath = path.resolve(lock.lockPath);
+  const lockPathIdentity =
+    process.platform === "win32" ? resolvedLockPath.toLowerCase() : resolvedLockPath;
+  return JSON.stringify([lockPathIdentity, lock.owner.pid, lock.owner.token]);
+}
+
+function trackReleaseForHandle(
+  lock: DatabaseLifecycleLock,
+  attempt: Promise<void>,
+): Promise<void> {
+  releasePromises.set(lock, attempt);
+  void attempt.catch(() => {
+    if (releasePromises.get(lock) === attempt) {
+      releasePromises.delete(lock);
+    }
+  });
+  return attempt;
+}
+
+function releaseOnce(
+  lock: DatabaseLifecycleLock,
+  dependencies?: DatabaseLifecycleLockReleaseDependencies,
+): Promise<void> {
+  const existing = releasePromises.get(lock);
+  if (existing !== undefined) return existing;
+
+  const authorityKey = releaseAuthorityKey(lock);
+  const authorityAttempt = authorityReleasePromises.get(authorityKey);
+  if (authorityAttempt !== undefined) {
+    return trackReleaseForHandle(lock, authorityAttempt);
+  }
+
+  const attempt = release(lock, dependencies);
+  authorityReleasePromises.set(authorityKey, attempt);
+  void attempt.then(
+    () => {
+      if (authorityReleasePromises.get(authorityKey) === attempt) {
+        authorityReleasePromises.delete(authorityKey);
+      }
+    },
+    () => {
+      if (authorityReleasePromises.get(authorityKey) === attempt) {
+        authorityReleasePromises.delete(authorityKey);
+      }
+    },
+  );
+  return trackReleaseForHandle(lock, attempt);
+}
+
 const attemptPromise = <A>(action: () => Promise<A>) =>
   Effect.tryPromise({ try: action, catch: (cause) => cause });
 
 export const acquireDatabaseLifecycleLock = (dbPath: string) =>
   attemptPromise(() => acquire(dbPath));
 
-export const releaseDatabaseLifecycleLock = (lock: DatabaseLifecycleLock) =>
-  attemptPromise(() => release(lock));
+export const releaseDatabaseLifecycleLock = (
+  lock: DatabaseLifecycleLock,
+  dependencies?: DatabaseLifecycleLockReleaseDependencies,
+) => attemptPromise(() => releaseOnce(lock, dependencies));
 
 export const withDatabaseLifecycleLock = <A, E, R>(dbPath: string, use: Effect.Effect<A, E, R>) =>
   Effect.acquireUseRelease(
     acquireDatabaseLifecycleLock(dbPath),
     () => use,
-    releaseDatabaseLifecycleLock,
+    (lock) => releaseDatabaseLifecycleLock(lock),
   );

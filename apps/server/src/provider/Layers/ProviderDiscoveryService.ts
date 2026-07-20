@@ -26,6 +26,14 @@ import {
   filterDisabledSkills,
   mergeSkillsIntoCatalog,
 } from "../skillsCatalog.ts";
+import {
+  makeProviderMaintenanceGate,
+  type ProviderMaintenanceGate,
+} from "../providerMaintenanceGate.ts";
+
+export interface ProviderDiscoveryServiceLiveOptions {
+  readonly maintenanceGate?: ProviderMaintenanceGate;
+}
 
 const decodeInputOrValidationError = <S extends Schema.Top>(input: {
   readonly operation: string;
@@ -57,10 +65,29 @@ const disabledCapabilitiesForProvider = (
   supportsThreadImport: false,
 });
 
-const make = Effect.gen(function* () {
+const make = (options?: ProviderDiscoveryServiceLiveOptions) => Effect.gen(function* () {
   const registry = yield* ProviderAdapterRegistry;
   const serverConfig = yield* ServerConfig;
   const serverSettings = yield* ServerSettingsService;
+  const maintenanceGate = options?.maintenanceGate ?? (yield* makeProviderMaintenanceGate);
+  const withProviderDiscovery = <A, E, R>(input: {
+    readonly provider: ProviderListModelsInput["provider"];
+    readonly operation: string;
+    readonly run: Effect.Effect<A, E, R>;
+  }): Effect.Effect<A, E | ProviderValidationError, R> =>
+    maintenanceGate
+      .withOperation(input)
+      .pipe(
+        Effect.catchTag("ProviderMaintenanceBusyError", (error) =>
+          Effect.fail(
+            new ProviderValidationError({
+              operation: input.operation,
+              issue: error.message,
+              cause: error,
+            }),
+          ),
+        ),
+      );
 
   const getComposerCapabilities: ProviderDiscoveryServiceShape["getComposerCapabilities"] = (
     input,
@@ -93,8 +120,11 @@ const make = Effect.gen(function* () {
       });
       const adapter = yield* registry.getByProvider(parsed.provider);
       const nativeResult: ProviderListSkillsResult | null = adapter.listSkills
-        ? yield* adapter
-            .listSkills(parsed)
+        ? yield* withProviderDiscovery({
+            provider: parsed.provider,
+            operation: "ProviderDiscoveryService.listSkills",
+            run: adapter.listSkills(parsed),
+          })
             .pipe(
               Effect.catch((error) =>
                 Effect.logWarning(
@@ -149,7 +179,11 @@ const make = Effect.gen(function* () {
           cached: false,
         };
       }
-      return yield* adapter.listCommands(parsed);
+      return yield* withProviderDiscovery({
+        provider: parsed.provider,
+        operation: "ProviderDiscoveryService.listCommands",
+        run: adapter.listCommands(parsed),
+      });
     });
 
   const listPlugins: ProviderDiscoveryServiceShape["listPlugins"] = (input) =>
@@ -170,7 +204,11 @@ const make = Effect.gen(function* () {
           cached: false,
         };
       }
-      return yield* adapter.listPlugins(parsed);
+      return yield* withProviderDiscovery({
+        provider: parsed.provider,
+        operation: "ProviderDiscoveryService.listPlugins",
+        run: adapter.listPlugins(parsed),
+      });
     });
 
   const readPlugin: ProviderDiscoveryServiceShape["readPlugin"] = (input) =>
@@ -187,7 +225,11 @@ const make = Effect.gen(function* () {
           issue: `Plugin discovery is unavailable for provider '${parsed.provider}'.`,
         });
       }
-      return yield* adapter.readPlugin(parsed);
+      return yield* withProviderDiscovery({
+        provider: parsed.provider,
+        operation: "ProviderDiscoveryService.readPlugin",
+        run: adapter.readPlugin(parsed),
+      });
     });
 
   const listModels: ProviderDiscoveryServiceShape["listModels"] = (input) =>
@@ -205,7 +247,11 @@ const make = Effect.gen(function* () {
           cached: false,
         };
       }
-      return yield* adapter.listModels(parsed);
+      return yield* withProviderDiscovery({
+        provider: parsed.provider,
+        operation: "ProviderDiscoveryService.listModels",
+        run: adapter.listModels(parsed),
+      });
     });
 
   const listAgents: ProviderDiscoveryServiceShape["listAgents"] = (input) =>
@@ -223,7 +269,11 @@ const make = Effect.gen(function* () {
           cached: false,
         };
       }
-      return yield* adapter.listAgents(parsed);
+      return yield* withProviderDiscovery({
+        provider: parsed.provider,
+        operation: "ProviderDiscoveryService.listAgents",
+        run: adapter.listAgents(parsed),
+      });
     });
 
   return {
@@ -237,4 +287,8 @@ const make = Effect.gen(function* () {
   } satisfies ProviderDiscoveryServiceShape;
 });
 
-export const ProviderDiscoveryServiceLive = Layer.effect(ProviderDiscoveryService, make);
+export function makeProviderDiscoveryServiceLive(options?: ProviderDiscoveryServiceLiveOptions) {
+  return Layer.effect(ProviderDiscoveryService, make(options));
+}
+
+export const ProviderDiscoveryServiceLive = makeProviderDiscoveryServiceLive();

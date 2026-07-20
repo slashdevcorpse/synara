@@ -95,9 +95,11 @@ import { providerModelDiscoveryInvalidationFingerprint } from "../lib/providerDi
 import { providerDiscoveryQueryKeys } from "../lib/providerDiscoveryReactQuery";
 import { useAppSettings } from "../appSettings";
 import {
+  getProviderUpdatePresentation,
   getVisibleProviderUpdateStatuses,
   isProviderUpdateActive,
   providerUpdateNotificationKey,
+  resolveProviderUpdateManualCommand,
   PROVIDER_UPDATE_INITIAL_REFRESH_DELAY_MS,
   PROVIDER_UPDATE_REFRESH_INTERVAL_MS,
   withProviderUpdateTimeout,
@@ -366,7 +368,14 @@ async function runProviderUpdateAll(params: {
     timeout: 0,
   });
 
-  const failures: Array<{ provider: ServerProviderStatus; reason: string }> = [];
+  const issues: Array<{
+    provider: ServerProviderStatus;
+    reason: string;
+    severity: "error" | "warning";
+    manualCommand: string | null;
+  }> = [];
+  let alreadyCurrentCount = 0;
+  let updatedCount = 0;
 
   try {
     const api = ensureNativeApi();
@@ -377,31 +386,45 @@ async function runProviderUpdateAll(params: {
           request: api.server.updateProvider({ provider: provider.provider }),
         });
         const refreshed = result.providers.find((entry) => entry.provider === provider.provider);
-        const updateState = refreshed?.updateState;
-        if (updateState?.status === "failed" || updateState?.status === "unchanged") {
-          failures.push({
+        const presentation = getProviderUpdatePresentation(refreshed);
+        if (presentation.severity !== "success") {
+          issues.push({
             provider,
-            reason: updateState.message ?? "The update command did not complete successfully.",
+            reason:
+              presentation.message ??
+              "The provider update returned without a verified terminal result.",
+            severity: presentation.severity,
+            manualCommand: resolveProviderUpdateManualCommand(refreshed, provider),
           });
-        } else if (refreshed?.versionAdvisory?.status === "behind_latest") {
-          failures.push({
+        } else if (presentation.kind === "already_current") {
+          alreadyCurrentCount += 1;
+        } else if (presentation.kind === "succeeded") {
+          updatedCount += 1;
+        } else {
+          issues.push({
             provider,
-            reason: "The provider still appears outdated after updating.",
+            reason: "The provider update returned without a verified terminal result.",
+            severity: "error",
+            manualCommand: resolveProviderUpdateManualCommand(refreshed, provider),
           });
         }
       } catch (error) {
-        failures.push({
+        issues.push({
           provider,
           reason: error instanceof Error ? error.message : "The update request failed.",
+          severity: "error",
+          manualCommand: resolveProviderUpdateManualCommand(provider),
         });
       }
     }
   } catch (error) {
     for (const provider of providers) {
-      failures.push({
+      issues.push({
         provider,
         reason:
           error instanceof Error ? error.message : "The provider update request could not start.",
+        severity: "error",
+        manualCommand: resolveProviderUpdateManualCommand(provider),
       });
     }
   } finally {
@@ -417,34 +440,35 @@ async function runProviderUpdateAll(params: {
     return;
   }
 
-  if (failures.length > 0) {
+  if (issues.length > 0) {
     activeToastRef.current = null;
-    // Surface the exact manual commands so a user whose one-click update
-    // failed (EACCES on global npm, PATH/package-manager mismatch, etc.) can
-    // copy and run them in a terminal instead of being stuck.
-    const manualCommands = Array.from(
-      new Set(
-        failures
-          .map(({ provider }) => provider.versionAdvisory?.updateCommand)
-          .filter(
-            (command): command is string =>
-              typeof command === "string" && command.trim().length > 0,
-          ),
-      ),
-    );
-    const failureLines = failures
+    const issueLines = issues
       .map(({ provider, reason }) => `${PROVIDER_DISPLAY_NAMES[provider.provider]}: ${reason}`)
       .join("\n");
+    const manualCommands = Array.from(
+      new Set(
+        issues
+          .map(({ manualCommand }) => manualCommand)
+          .filter((command): command is string => command !== null),
+      ),
+    );
+    const errorCount = issues.filter(({ severity }) => severity === "error").length;
+    const hasErrors = errorCount > 0;
     toastManager.update(toastId, {
-      type: "error",
-      title:
-        failures.length === providers.length
+      type: hasErrors ? "error" : "warning",
+      title: hasErrors
+        ? errorCount === providers.length
           ? "Provider updates failed"
-          : "Some provider updates failed",
+          : "Some provider updates failed"
+        : providers.length === 1
+          ? `${PROVIDER_DISPLAY_NAMES[providers[0]!.provider]} update needs attention`
+          : issues.length === providers.length
+            ? "Provider updates need attention"
+            : "Some provider updates need attention",
       description:
         manualCommands.length > 0
-          ? `${failureLines}\n\nCopy the command${manualCommands.length === 1 ? "" : "s"} below to update manually in a terminal.`
-          : failureLines,
+          ? `${issueLines}\n\nCopy the command${manualCommands.length === 1 ? "" : "s"} below to update manually in a terminal.`
+          : issueLines,
       data: {
         onClose: dismissProgressToast,
         ...(manualCommands.length > 0 ? { copyText: manualCommands.join("\n") } : {}),
@@ -455,13 +479,21 @@ async function runProviderUpdateAll(params: {
   }
 
   activeToastRef.current = null;
+  const allAlreadyCurrent = alreadyCurrentCount === providers.length;
   toastManager.update(toastId, {
     type: "success",
-    title:
-      providers.length === 1
-        ? `${PROVIDER_DISPLAY_NAMES[providers[0]!.provider]} updated`
-        : `${providers.length} providers updated`,
-    description: "New sessions will use the refreshed provider tools.",
+    title: allAlreadyCurrent
+      ? providers.length === 1
+        ? `${PROVIDER_DISPLAY_NAMES[providers[0]!.provider]} is already current`
+        : `${providers.length} providers are already current`
+      : alreadyCurrentCount > 0
+        ? `${updatedCount} updated, ${alreadyCurrentCount} already current`
+        : providers.length === 1
+          ? `${PROVIDER_DISPLAY_NAMES[providers[0]!.provider]} updated`
+          : `${providers.length} providers updated`,
+    description: allAlreadyCurrent
+      ? "Synara refreshed the CLI statuses; no provider replacement was needed."
+      : "Synara refreshed the CLI statuses. Any idle runtimes stopped for updates will resume when next used.",
     data: { onClose: dismissProgressToast },
     timeout: 6000,
   });

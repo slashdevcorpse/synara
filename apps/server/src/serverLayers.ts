@@ -18,7 +18,7 @@ import { OrchestrationLayerLive } from "./orchestration/runtimeLayer";
 import { DevServerManagerLive } from "./devServerManager";
 import { KeybindingsLive } from "./keybindings";
 import { GitCoreLive } from "./git/Layers/GitCore";
-import { GitLayerLive, TextGenerationLayerLive } from "./git/runtimeLayer";
+import { makeGitLayerLive, makeTextGenerationLayerLive } from "./git/runtimeLayer";
 import { TerminalLayerLive } from "./terminal/runtimeLayer";
 import { AuthControlPlaneLive } from "./auth/Layers/AuthControlPlane";
 import { BootstrapCredentialServiceLive } from "./auth/Layers/BootstrapCredentialService";
@@ -40,10 +40,17 @@ import { ProjectionTurnRepositoryLive } from "./persistence/Layers/ProjectionTur
 import { OrchestrationEventDeliveryRepositoryLive } from "./persistence/Layers/OrchestrationEventDeliveries";
 import { ManagedAttachmentCleanupLive } from "./managedAttachmentCleanup";
 import { PullRequestServiceLive } from "./pullRequests/Layers/PullRequestService";
+import type { ProviderMaintenanceGate } from "./provider/providerMaintenanceGate";
+import type { ProviderMaintenanceOwnedResourceCoordinator } from "./provider/providerMaintenanceOwnedResources";
 
 export { makeServerProviderLayer } from "./provider/runtimeLayer";
 
-export function makeServerRuntimeServicesLayer() {
+export function makeServerRuntimeServicesLayer(options?: {
+  readonly maintenanceGate?: ProviderMaintenanceGate;
+  readonly maintenanceOwnedResources?: ProviderMaintenanceOwnedResourceCoordinator;
+}) {
+  const textGenerationLayer = makeTextGenerationLayerLive(options);
+  const gitLayer = makeGitLayerLive(options, { textGenerationLayer });
   const checkpointStoreLayer = CheckpointStoreLive.pipe(Layer.provide(GitCoreLive));
 
   const checkpointDiffQueryLayer = CheckpointDiffQueryLive.pipe(
@@ -71,7 +78,7 @@ export function makeServerRuntimeServicesLayer() {
     Layer.provideMerge(OrchestrationEventDeliveryRepositoryLive),
     Layer.provideMerge(studioOutputReactorLayer),
     Layer.provideMerge(GitCoreLive),
-    Layer.provideMerge(TextGenerationLayerLive),
+    Layer.provideMerge(textGenerationLayer),
     Layer.provideMerge(ServerSettingsLive),
   );
   const checkpointReactorLayer = CheckpointReactorLive.pipe(
@@ -118,7 +125,7 @@ export function makeServerRuntimeServicesLayer() {
     Layer.provideMerge(AutomationRepositoryLive),
     Layer.provideMerge(ProjectionTurnRepositoryLive),
     Layer.provideMerge(GitCoreLive),
-    Layer.provideMerge(TextGenerationLayerLive),
+    Layer.provideMerge(textGenerationLayer),
     Layer.provideMerge(ServerSettingsLive),
     Layer.provideMerge(runtimeServicesLayer),
   );
@@ -130,7 +137,7 @@ export function makeServerRuntimeServicesLayer() {
     Layer.provideMerge(automationServiceLayer),
   );
   const pullRequestServiceLayer = PullRequestServiceLive.pipe(
-    Layer.provideMerge(GitLayerLive),
+    Layer.provideMerge(gitLayer),
     Layer.provideMerge(ProjectPullRequestPinsLive),
     Layer.provideMerge(OrchestrationLayerLive),
   );
@@ -147,8 +154,8 @@ export function makeServerRuntimeServicesLayer() {
     providerCommandReactorLayer,
     threadDeletionReactorLayer,
     devServerManagerLayer,
-    GitLayerLive,
-    TextGenerationLayerLive,
+    gitLayer,
+    textGenerationLayer,
     TerminalLayerLive,
     KeybindingsLive,
     ServerSettingsLive,

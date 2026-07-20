@@ -22,7 +22,7 @@ export interface CommandCodeCliExecutableInput extends WindowsSafeProcessInput {
 }
 
 const DEFAULT_COMMAND_CODE_COMMAND = "commandcode";
-const COMMAND_CODE_ALIASES = ["commandcode", "command-code", "cmdc"] as const;
+const COMMAND_CODE_ALIASES = ["commandcode", "command-code", "cmdc", "cmd"] as const;
 const WINDOWS_EXECUTABLE_PATTERN = /\.(?:exe|com|cmd|bat)$/i;
 
 function environmentValue(env: NodeJS.ProcessEnv, name: string): string | undefined {
@@ -47,10 +47,17 @@ function isRegularAbsoluteWindowsFile(candidate: string, readStat: StatSyncLike)
 }
 
 function firstValidCandidate(
+  command: (typeof COMMAND_CODE_ALIASES)[number],
   candidates: ReadonlyArray<string>,
   readStat: StatSyncLike,
 ): string | undefined {
-  return candidates.find((candidate) => isRegularAbsoluteWindowsFile(candidate, readStat));
+  return candidates.find(
+    (candidate) =>
+      isRegularAbsoluteWindowsFile(candidate, readStat) &&
+      // `cmd` is also the Windows command processor. The npm package's launcher is a `.cmd`
+      // shim; never reinterpret bare Command Code configuration as `cmd.exe` or `cmd.com`.
+      (command !== "cmd" || Path.win32.basename(candidate).toLowerCase() === "cmd.cmd"),
+  );
 }
 
 function npmShim(
@@ -64,7 +71,7 @@ function npmShim(
 }
 
 /**
- * Resolve the configured Command Code command. On Windows, both official npm
+ * Resolve the configured Command Code command. On Windows, all official npm
  * aliases are considered and `.cmd` shims are returned explicitly so callers
  * can use the shared shell-free batch wrapper.
  */
@@ -90,12 +97,18 @@ export function resolveCommandCodeCliExecutable(
   ];
 
   for (const alias of orderedAliases) {
-    const candidate = firstValidCandidate(resolveWindowsCommandCandidates(alias, input), readStat);
+    const candidate = firstValidCandidate(
+      alias,
+      resolveWindowsCommandCandidates(alias, input),
+      readStat,
+    );
     if (candidate) return candidate;
   }
   for (const alias of orderedAliases) {
     const candidate = npmShim(appData, alias, readStat);
     if (candidate) return candidate;
   }
-  return configured || DEFAULT_COMMAND_CODE_COMMAND;
+  return normalized === "cmd"
+    ? DEFAULT_COMMAND_CODE_COMMAND
+    : configured || DEFAULT_COMMAND_CODE_COMMAND;
 }

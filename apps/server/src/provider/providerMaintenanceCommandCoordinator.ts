@@ -2,10 +2,16 @@ import * as Effect from "effect/Effect";
 import * as Ref from "effect/Ref";
 import * as Semaphore from "effect/Semaphore";
 
+import {
+  ProviderMaintenanceCrossProcessLockError,
+  withProviderMaintenanceCrossProcessLock,
+} from "./providerMaintenanceCrossProcessLock.ts";
+
 export interface ProviderMaintenanceCommandCoordinatorShape<E> {
   readonly withCommandLock: <A, R>(input: {
     readonly targetKey: string;
     readonly lockKey: string;
+    readonly canonicalInstallRoot: string;
     readonly onQueued?: Effect.Effect<void, E, R>;
     readonly run: Effect.Effect<A, E, R>;
   }) => Effect.Effect<A, E, R>;
@@ -13,7 +19,15 @@ export interface ProviderMaintenanceCommandCoordinatorShape<E> {
 
 export const makeProviderMaintenanceCommandCoordinator = Effect.fn(
   "makeProviderMaintenanceCommandCoordinator",
-)(function* <E>(input: { readonly makeAlreadyRunningError: (targetKey: string) => E }) {
+)(function* <E>(input: {
+  readonly makeAlreadyRunningError: (targetKey: string) => E;
+  readonly makeCrossProcessLockError?: (
+    targetKey: string,
+    lockKey: string,
+    cause: ProviderMaintenanceCrossProcessLockError,
+  ) => E;
+  readonly crossProcessLockDirectory?: string;
+}) {
   const runningTargetsRef = yield* Ref.make<ReadonlySet<string>>(new Set());
   const locksRef = yield* Ref.make<ReadonlyMap<string, Semaphore.Semaphore>>(new Map());
 
@@ -58,23 +72,43 @@ export const makeProviderMaintenanceCommandCoordinator = Effect.fn(
   const withCommandLock: ProviderMaintenanceCommandCoordinatorShape<E>["withCommandLock"] = ({
     targetKey,
     lockKey,
+    canonicalInstallRoot,
     onQueued,
     run,
   }) =>
-    Effect.gen(function* () {
-      const acquired = yield* acquireTarget(targetKey);
-      if (!acquired) {
-        return yield* Effect.fail(input.makeAlreadyRunningError(targetKey));
-      }
-
-      return yield* Effect.gen(function* () {
-        const lock = yield* getLock(lockKey);
-        if (onQueued) {
-          yield* onQueued;
+    Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        const acquired = yield* acquireTarget(targetKey);
+        if (!acquired) {
+          return yield* Effect.fail(input.makeAlreadyRunningError(targetKey));
         }
-        return yield* lock.withPermits(1)(run);
-      }).pipe(Effect.ensuring(releaseTarget(targetKey)));
-    });
+
+        return yield* restore(
+          Effect.gen(function* () {
+            const lock = yield* getLock(lockKey);
+            if (onQueued) {
+              yield* onQueued;
+            }
+            return yield* lock.withPermits(1)(
+              withProviderMaintenanceCrossProcessLock(lockKey, run, {
+                canonicalInstallRoot,
+                ...(input.crossProcessLockDirectory
+                  ? { directoryPath: input.crossProcessLockDirectory }
+                  : {}),
+              }).pipe(
+                Effect.mapError((cause) =>
+                  cause instanceof ProviderMaintenanceCrossProcessLockError
+                    ? input.makeCrossProcessLockError
+                      ? input.makeCrossProcessLockError(targetKey, lockKey, cause)
+                      : input.makeAlreadyRunningError(targetKey)
+                    : cause,
+                ),
+              ),
+            );
+          }),
+        ).pipe(Effect.ensuring(releaseTarget(targetKey)));
+      }),
+    );
 
   return {
     withCommandLock,

@@ -1,4 +1,4 @@
-import { Effect, Layer } from "effect";
+import { Deferred, Effect, Fiber, Layer, Result } from "effect";
 import { describe, expect, it, vi } from "vitest";
 
 import {
@@ -9,7 +9,13 @@ import {
   type TextGenerationShape,
   TextGeneration,
 } from "../Services/TextGeneration.ts";
-import { ProviderTextGenerationLive } from "./ProviderTextGeneration.ts";
+import {
+  makeProviderTextGenerationLive,
+  ProviderTextGenerationLive,
+  type ProviderTextGenerationLiveOptions,
+} from "./ProviderTextGeneration.ts";
+import { makeProviderMaintenanceGate } from "../../provider/providerMaintenanceGate.ts";
+import { TextGenerationError } from "../Errors.ts";
 
 function createTextGenerationDouble(label: string) {
   const generateCommitMessage = vi.fn<TextGenerationShape["generateCommitMessage"]>(() =>
@@ -90,12 +96,12 @@ function createTextGenerationDouble(label: string) {
   };
 }
 
-function makeProviderTextGenerationTestLayer() {
+function makeProviderTextGenerationTestLayer(options?: ProviderTextGenerationLiveOptions) {
   const codex = createTextGenerationDouble("codex");
   const cursor = createTextGenerationDouble("cursor");
   const kilo = createTextGenerationDouble("kilo");
   const opencode = createTextGenerationDouble("opencode");
-  const layer = ProviderTextGenerationLive.pipe(
+  const layer = (options ? makeProviderTextGenerationLive(options) : ProviderTextGenerationLive).pipe(
     Layer.provide(Layer.succeed(CodexTextGeneration, codex.service)),
     Layer.provide(Layer.succeed(CursorTextGeneration, cursor.service)),
     Layer.provide(Layer.succeed(KiloTextGeneration, kilo.service)),
@@ -124,6 +130,89 @@ describe("ProviderTextGenerationLive", () => {
     expect(codex.generateDiffSummary).toHaveBeenCalledTimes(1);
     expect(cursor.generateDiffSummary).not.toHaveBeenCalled();
     expect(opencode.generateDiffSummary).not.toHaveBeenCalled();
+  });
+
+  it("refuses git text generation while the selected provider is under maintenance", async () => {
+    const maintenanceGate = Effect.runSync(makeProviderMaintenanceGate);
+    const codex = createTextGenerationDouble("codex");
+    const cursor = createTextGenerationDouble("cursor");
+    const kilo = createTextGenerationDouble("kilo");
+    const opencode = createTextGenerationDouble("opencode");
+    const layer = makeProviderTextGenerationLive({ maintenanceGate }).pipe(
+      Layer.provide(Layer.succeed(CodexTextGeneration, codex.service)),
+      Layer.provide(Layer.succeed(CursorTextGeneration, cursor.service)),
+      Layer.provide(Layer.succeed(KiloTextGeneration, kilo.service)),
+      Layer.provide(Layer.succeed(OpenCodeTextGeneration, opencode.service)),
+    );
+
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const maintenanceStarted = yield* Deferred.make<void>();
+          const releaseMaintenance = yield* Deferred.make<void>();
+          const maintenance = yield* maintenanceGate
+            .withExclusiveMaintenance({
+              provider: "codex",
+              run: Deferred.succeed(maintenanceStarted, undefined).pipe(
+                Effect.andThen(Deferred.await(releaseMaintenance)),
+              ),
+            })
+            .pipe(Effect.forkChild);
+          yield* Deferred.await(maintenanceStarted);
+          const generated = yield* Effect.gen(function* () {
+            const textGeneration = yield* TextGeneration;
+            return yield* textGeneration
+              .generateDiffSummary({
+                cwd: "/repo",
+                patch: "diff --git a/file.ts b/file.ts",
+                model: "gpt-5.4-mini",
+              })
+              .pipe(Effect.result);
+          }).pipe(Effect.provide(layer));
+          yield* Deferred.succeed(releaseMaintenance, undefined);
+          yield* Fiber.join(maintenance);
+          return generated;
+        }),
+      ),
+    );
+
+    expect(Result.isFailure(result)).toBe(true);
+    if (Result.isFailure(result)) {
+      expect(result.failure).toBeInstanceOf(TextGenerationError);
+      expect(result.failure.message).toContain("being updated");
+    }
+    expect(codex.generateDiffSummary).not.toHaveBeenCalled();
+  });
+
+  it("preserves restart guidance when provider maintenance is latched", async () => {
+    const maintenanceGate = Effect.runSync(makeProviderMaintenanceGate);
+    const { layer, codex } = makeProviderTextGenerationTestLayer({ maintenanceGate });
+    await Effect.runPromise(
+      maintenanceGate.latchProvider({
+        provider: "codex",
+        reason: "descendant 42 survived updater teardown",
+      }),
+    );
+
+    const result = await Effect.runPromise(
+      Effect.gen(function* () {
+        const textGeneration = yield* TextGeneration;
+        return yield* textGeneration
+          .generateDiffSummary({
+            cwd: "/repo",
+            patch: "diff --git a/file.ts b/file.ts",
+            model: "gpt-5.4-mini",
+          })
+          .pipe(Effect.result);
+      }).pipe(Effect.provide(layer)),
+    );
+
+    expect(Result.isFailure(result)).toBe(true);
+    if (Result.isFailure(result)) {
+      expect(result.failure.message).toContain("Restart Synara before retrying");
+      expect(result.failure.message).toContain("descendant 42 survived updater teardown");
+    }
+    expect(codex.generateDiffSummary).not.toHaveBeenCalled();
   });
 
   it("routes OpenCode provider/model slugs to OpenCode", async () => {

@@ -3,7 +3,7 @@
 // Layer: Server git/text-generation adapter
 // Depends on: OpenCode SDK runtime, prompt builders, attachment projection, and server config.
 
-import { Effect, Exit, Fiber, Layer, Schema, Scope } from "effect";
+import { Cause, Effect, Exit, Fiber, Layer, Ref, Schema, Scope } from "effect";
 import * as Semaphore from "effect/Semaphore";
 
 import type {
@@ -21,10 +21,16 @@ import { resolveProviderAttachmentPath } from "../../provider/providerAttachment
 import { ServerConfig } from "../../config.ts";
 import { appendFileAttachmentsPromptBlock } from "../../provider/attachmentProjection.ts";
 import {
+  makeProviderMaintenanceOwnedResourceCoordinator,
+  type ProviderMaintenanceOwnedResourceCoordinator,
+  type ProviderMaintenanceOwnedResourceRegistration,
+} from "../../provider/providerMaintenanceOwnedResources.ts";
+import {
   OpenCodeRuntime,
   KILO_CLI_SPEC,
   OPENCODE_CLI_SPEC,
   type OpenCodeCompatibleCliSpec,
+  type OpenCodeOwnedServerProcess,
   type OpenCodeServerConnection,
   type OpenCodeServerProcess,
   openCodeRuntimeErrorDetail,
@@ -100,9 +106,23 @@ function getOpenCodeTextResponse(parts: ReadonlyArray<unknown> | undefined): str
     .trim();
 }
 
-interface SharedOpenCodeTextGenerationServerState {
+interface OwnedOpenCodeTextGenerationServerResource {
+  readonly process: OpenCodeOwnedServerProcess;
   server: OpenCodeServerProcess | null;
-  serverScope: Scope.Closeable | null;
+  readonly serverScope: Scope.Closeable;
+  readonly operation: TextGenerationOperation;
+  registration: ProviderMaintenanceOwnedResourceRegistration | null;
+  closeFailure: TextGenerationError | null;
+  closed: boolean;
+}
+
+interface ReadyOpenCodeTextGenerationServerResource
+  extends OwnedOpenCodeTextGenerationServerResource {
+  server: OpenCodeServerProcess;
+}
+
+interface SharedOpenCodeTextGenerationServerState {
+  resource: ReadyOpenCodeTextGenerationServerResource | null;
   binaryPath: string | null;
   cwd: string | null;
   activeRequests: number;
@@ -110,9 +130,8 @@ interface SharedOpenCodeTextGenerationServerState {
 }
 
 interface AcquiredOpenCodeTextGenerationServer {
-  server: OpenCodeServerProcess;
+  resource: ReadyOpenCodeTextGenerationServerResource;
   shared: boolean;
-  serverScope: Scope.Closeable | null;
 }
 
 type OpenCodeCompatibleTextGenerationProvider = "opencode" | "kilo";
@@ -123,9 +142,14 @@ interface OpenCodeCompatibleTextGenerationConfig {
   readonly displayName: string;
   readonly serviceName: string;
   readonly cliSpec: OpenCodeCompatibleCliSpec;
+  readonly maintenanceOwnedResources?: ProviderMaintenanceOwnedResourceCoordinator;
   readonly resolveServerPassword?: (
     provider: OpenCodeCompatibleTextGenerationProvider,
   ) => Effect.Effect<string | undefined>;
+}
+
+export interface OpenCodeCompatibleTextGenerationLiveOptions {
+  readonly maintenanceOwnedResources?: ProviderMaintenanceOwnedResourceCoordinator;
 }
 
 function resolveOpenCodeCompatibleModelSelection(
@@ -154,29 +178,22 @@ const makeOpenCodeCompatibleTextGeneration = (config: OpenCodeCompatibleTextGene
   Effect.gen(function* () {
     const serverConfig = yield* ServerConfig;
     const openCodeRuntime = yield* OpenCodeRuntime;
+    const maintenanceOwnedResources =
+      config.maintenanceOwnedResources ??
+      (yield* makeProviderMaintenanceOwnedResourceCoordinator);
     const idleFiberScope = yield* Effect.acquireRelease(Scope.make(), (scope) =>
       Scope.close(scope, Exit.void),
     );
     const sharedServerMutex = yield* Semaphore.make(1);
+    let nextOwnedResourceId = 1;
+    const ownedServerResources = new Set<OwnedOpenCodeTextGenerationServerResource>();
     const sharedServerState: SharedOpenCodeTextGenerationServerState = {
-      server: null,
-      serverScope: null,
+      resource: null,
       binaryPath: null,
       cwd: null,
       activeRequests: 0,
       idleCloseFiber: null,
     };
-
-    const closeSharedServer = Effect.fn("closeSharedServer")(function* () {
-      const scope = sharedServerState.serverScope;
-      sharedServerState.server = null;
-      sharedServerState.serverScope = null;
-      sharedServerState.binaryPath = null;
-      sharedServerState.cwd = null;
-      if (scope !== null) {
-        yield* Scope.close(scope, Exit.void).pipe(Effect.ignore);
-      }
-    });
 
     const cancelIdleCloseFiber = Effect.fn("cancelIdleCloseFiber")(function* () {
       const idleCloseFiber = sharedServerState.idleCloseFiber;
@@ -186,19 +203,163 @@ const makeOpenCodeCompatibleTextGeneration = (config: OpenCodeCompatibleTextGene
       }
     });
 
+    const clearSharedServer = (resource: OwnedOpenCodeTextGenerationServerResource) => {
+      if (sharedServerState.resource !== resource) {
+        return;
+      }
+      sharedServerState.resource = null;
+      sharedServerState.binaryPath = null;
+      sharedServerState.cwd = null;
+      sharedServerState.activeRequests = 0;
+    };
+
+    const closeOwnedServerResourceEffect = Effect.fn("closeOwnedOpenCodeTextGenerationServer")(
+      function* (resource: OwnedOpenCodeTextGenerationServerResource) {
+        if (resource.closed) {
+          return;
+        }
+        yield* resource.process.stop.pipe(
+          Effect.mapError(
+            (cause) =>
+              new TextGenerationError({
+                operation: resource.operation,
+                detail: `Failed to prove ${config.displayName} text-generation server process-tree exit: ${openCodeRuntimeErrorDetail(cause)}`,
+                cause,
+              }),
+          ),
+          Effect.tapError((error) =>
+            Effect.sync(() => {
+              resource.closeFailure = error;
+            }),
+          ),
+        );
+        const scopeExit = yield* Effect.exit(Scope.close(resource.serverScope, Exit.void));
+        if (Exit.isFailure(scopeExit)) {
+          const cause = Cause.squash(scopeExit.cause);
+          const error = new TextGenerationError({
+            operation: resource.operation,
+            detail: `Failed to close ${config.displayName} text-generation server scope after process exit: ${openCodeRuntimeErrorDetail(cause)}`,
+            cause,
+          });
+          resource.closeFailure = error;
+          return yield* error;
+        }
+        resource.closeFailure = null;
+        resource.closed = true;
+        if (resource.registration !== null) {
+          yield* resource.registration.unregister;
+        }
+        ownedServerResources.delete(resource);
+        clearSharedServer(resource);
+      },
+    );
+
+    const closeOwnedServerResource = (resource: OwnedOpenCodeTextGenerationServerResource) =>
+      closeOwnedServerResourceEffect(resource).pipe(Effect.uninterruptible);
+
+    const closeRegisteredResource = (resource: OwnedOpenCodeTextGenerationServerResource) =>
+      sharedServerMutex.withPermit(
+        Effect.gen(function* () {
+          if (sharedServerState.resource === resource) {
+            yield* cancelIdleCloseFiber();
+          }
+          yield* closeOwnedServerResource(resource);
+        }),
+      );
+
+    const registerOwnedServerResource = Effect.fn("registerOwnedOpenCodeTextGenerationServer")(
+      function* (input: {
+        readonly process: OpenCodeOwnedServerProcess;
+        readonly serverScope: Scope.Closeable;
+        readonly operation: TextGenerationOperation;
+      }) {
+        const resource: OwnedOpenCodeTextGenerationServerResource = {
+          process: input.process,
+          server: null,
+          serverScope: input.serverScope,
+          operation: input.operation,
+          registration: null,
+          closeFailure: null,
+          closed: false,
+        };
+        ownedServerResources.add(resource);
+        const resourceId = `${config.serviceName}:${nextOwnedResourceId}`;
+        nextOwnedResourceId += 1;
+        resource.registration = yield* maintenanceOwnedResources.register({
+          provider: config.provider,
+          resourceId,
+          close: () => closeRegisteredResource(resource),
+        });
+        return resource;
+      },
+    );
+
+    const closeFailedStartupResources = Effect.fn("closeFailedOpenCodeTextGenerationStarts")(
+      function* () {
+        for (const resource of Array.from(ownedServerResources)) {
+          if (resource.server === null) {
+            yield* closeOwnedServerResource(resource);
+          }
+        }
+      },
+    );
+
+    const closeSharedServer = Effect.fn("closeSharedServer")(function* (
+      expectedResource?: OwnedOpenCodeTextGenerationServerResource,
+    ) {
+      const resource = sharedServerState.resource;
+      if (resource === null || (expectedResource !== undefined && resource !== expectedResource)) {
+        return;
+      }
+      yield* closeOwnedServerResource(resource);
+    });
+
+    const reportBackgroundCloseFailure = (cause: TextGenerationError) =>
+      Effect.logError(
+        `${config.displayName} text-generation server remains registered after shutdown failure`,
+        { cause },
+      );
+
+    const watchReadyServerExit = Effect.fn("watchReadyOpenCodeTextGenerationServerExit")(
+      function* (resource: ReadyOpenCodeTextGenerationServerResource) {
+        yield* resource.server.exitCode.pipe(
+          Effect.flatMap(() =>
+            sharedServerMutex.withPermit(
+              Effect.gen(function* () {
+                if (resource.closed) {
+                  return;
+                }
+                if (sharedServerState.resource === resource) {
+                  yield* cancelIdleCloseFiber();
+                }
+                // A root exit does not prove descendants are gone. Keep the mutex until the exact
+                // owner proves process-tree exit and the shared cache is cleared or retained for retry.
+                yield* closeOwnedServerResource(resource);
+              }),
+            ),
+          ),
+          Effect.catch(reportBackgroundCloseFailure),
+          Effect.forkIn(idleFiberScope),
+        );
+      },
+    );
+
     const scheduleIdleClose = Effect.fn("scheduleIdleClose")(function* (
-      server: OpenCodeServerProcess,
+      resource: OwnedOpenCodeTextGenerationServerResource,
     ) {
       yield* cancelIdleCloseFiber();
       const fiber = yield* Effect.sleep(OPENCODE_TEXT_GENERATION_IDLE_TTL).pipe(
         Effect.andThen(
           sharedServerMutex.withPermit(
             Effect.gen(function* () {
-              if (sharedServerState.server !== server || sharedServerState.activeRequests > 0) {
+              if (
+                sharedServerState.resource !== resource ||
+                sharedServerState.activeRequests > 0
+              ) {
                 return;
               }
               sharedServerState.idleCloseFiber = null;
-              yield* closeSharedServer();
+              yield* closeSharedServer(resource).pipe(Effect.catch(reportBackgroundCloseFailure));
             }),
           ),
         ),
@@ -215,47 +376,85 @@ const makeOpenCodeCompatibleTextGeneration = (config: OpenCodeCompatibleTextGene
       sharedServerMutex.withPermit(
         Effect.gen(function* () {
           yield* cancelIdleCloseFiber();
+          // Failed readiness never exposes a server, but its exact process owner remains here until
+          // either a later request or provider maintenance proves cleanup and unregisters it.
+          yield* closeFailedStartupResources();
 
-          const startServer = Effect.fn("startOpenCodeTextGenerationServer")(function* () {
-            const serverScope = yield* Scope.make();
-            const startedExit = yield* Effect.exit(
-              openCodeRuntime
-                .startOpenCodeServerProcess({
-                  binaryPath: input.binaryPath,
-                  cliSpec: config.cliSpec,
-                  cwd: input.cwd,
-                })
-                .pipe(
-                  Effect.provideService(Scope.Scope, serverScope),
-                  Effect.mapError(
-                    (cause) =>
-                      new TextGenerationError({
-                        operation: input.operation,
-                        detail: openCodeRuntimeErrorDetail(cause),
-                        cause,
-                      }),
+          const startServer = Effect.fn("startOpenCodeTextGenerationServer")(() =>
+            Effect.uninterruptibleMask((restore) =>
+              Effect.gen(function* () {
+                const serverScope = yield* Scope.make();
+                const ownedResourceRef = yield* Ref.make<
+                  OwnedOpenCodeTextGenerationServerResource | null
+                >(null);
+                const startedExit = yield* Effect.exit(
+                  restore(
+                    openCodeRuntime
+                      .startOpenCodeServerProcess({
+                        binaryPath: input.binaryPath,
+                        cliSpec: config.cliSpec,
+                        cwd: input.cwd,
+                        onProcessOwned: (process) =>
+                          registerOwnedServerResource({
+                            process,
+                            serverScope,
+                            operation: input.operation,
+                          }).pipe(Effect.flatMap((resource) => Ref.set(ownedResourceRef, resource))),
+                      })
+                      .pipe(
+                        Effect.provideService(Scope.Scope, serverScope),
+                        Effect.mapError(
+                          (cause) =>
+                            new TextGenerationError({
+                              operation: input.operation,
+                              detail: openCodeRuntimeErrorDetail(cause),
+                              cause,
+                            }),
+                        ),
+                      ),
                   ),
-                ),
-            );
+                );
+                let resource = yield* Ref.get(ownedResourceRef);
 
-            if (startedExit._tag === "Failure") {
-              yield* Scope.close(serverScope, Exit.void).pipe(Effect.ignore);
-              return yield* Effect.failCause(startedExit.cause);
-            }
+                if (startedExit._tag === "Failure") {
+                  if (resource === null) {
+                    yield* Scope.close(serverScope, Exit.void).pipe(Effect.ignore);
+                  } else {
+                    // Preserve the original startup failure while retaining any rejected cleanup
+                    // in both the local owner set and the provider maintenance coordinator.
+                    yield* closeOwnedServerResource(resource).pipe(Effect.ignore);
+                  }
+                  return yield* Effect.failCause(startedExit.cause);
+                }
 
-            return {
-              server: startedExit.value,
-              serverScope,
-            };
-          });
+                // Compatibility fallback for non-live runtime implementations that do not consume
+                // the early ownership hook. Production always registers before readiness awaits.
+                if (resource === null) {
+                  resource = yield* registerOwnedServerResource({
+                    process: startedExit.value,
+                    serverScope,
+                    operation: input.operation,
+                  });
+                }
+                resource.server = startedExit.value;
+                const readyResource = resource as ReadyOpenCodeTextGenerationServerResource;
+                yield* watchReadyServerExit(readyResource);
+                return readyResource;
+              }),
+            ),
+          );
 
-          const existingServer = sharedServerState.server;
-          if (existingServer !== null) {
+          let existingResource = sharedServerState.resource;
+          if (existingResource !== null && existingResource.closeFailure !== null) {
+            yield* closeSharedServer(existingResource);
+            existingResource = sharedServerState.resource;
+          }
+          if (existingResource !== null) {
             const sameConfigScope =
               sharedServerState.binaryPath === input.binaryPath &&
               sharedServerState.cwd === input.cwd;
             if (!sameConfigScope && sharedServerState.activeRequests === 0) {
-              yield* closeSharedServer();
+              yield* closeSharedServer(existingResource);
             } else {
               if (!sameConfigScope) {
                 yield* Effect.logWarning(
@@ -269,34 +468,30 @@ const makeOpenCodeCompatibleTextGeneration = (config: OpenCodeCompatibleTextGene
                     sharedServerState.cwd +
                     "; starting a dedicated server for this request",
                 );
-                const dedicated = yield* startServer();
+                const dedicatedResource = yield* startServer();
                 return {
-                  server: dedicated.server,
+                  resource: dedicatedResource,
                   shared: false,
-                  serverScope: dedicated.serverScope,
                 } satisfies AcquiredOpenCodeTextGenerationServer;
               }
               sharedServerState.activeRequests += 1;
               return {
-                server: existingServer,
+                resource: existingResource,
                 shared: true,
-                serverScope: null,
               } satisfies AcquiredOpenCodeTextGenerationServer;
             }
           }
 
           return yield* Effect.uninterruptibleMask((restore) =>
             Effect.gen(function* () {
-              const { server, serverScope } = yield* restore(startServer());
-              sharedServerState.server = server;
-              sharedServerState.serverScope = serverScope;
+              const resource = yield* restore(startServer());
+              sharedServerState.resource = resource;
               sharedServerState.binaryPath = input.binaryPath;
               sharedServerState.cwd = input.cwd;
               sharedServerState.activeRequests = 1;
               return {
-                server,
+                resource,
                 shared: true,
-                serverScope: null,
               } satisfies AcquiredOpenCodeTextGenerationServer;
             }),
           );
@@ -307,17 +502,17 @@ const makeOpenCodeCompatibleTextGeneration = (config: OpenCodeCompatibleTextGene
       sharedServerMutex.withPermit(
         Effect.gen(function* () {
           if (!acquired.shared) {
-            if (acquired.serverScope !== null) {
-              yield* Scope.close(acquired.serverScope, Exit.void).pipe(Effect.ignore);
-            }
+            yield* closeOwnedServerResource(acquired.resource).pipe(
+              Effect.catch(reportBackgroundCloseFailure),
+            );
             return;
           }
-          if (sharedServerState.server !== acquired.server) {
+          if (sharedServerState.resource !== acquired.resource) {
             return;
           }
           sharedServerState.activeRequests = Math.max(0, sharedServerState.activeRequests - 1);
           if (sharedServerState.activeRequests === 0) {
-            yield* scheduleIdleClose(acquired.server);
+            yield* scheduleIdleClose(acquired.resource);
           }
         }),
       );
@@ -327,9 +522,11 @@ const makeOpenCodeCompatibleTextGeneration = (config: OpenCodeCompatibleTextGene
         Effect.gen(function* () {
           yield* cancelIdleCloseFiber();
           sharedServerState.activeRequests = 0;
-          yield* closeSharedServer();
+          for (const resource of Array.from(ownedServerResources)) {
+            yield* closeOwnedServerResource(resource);
+          }
         }),
-      ),
+      ).pipe(Effect.orDie),
     );
 
     const runOpenCodeJson = Effect.fn("runOpenCodeJson")(function* <S extends Schema.Top>(input: {
@@ -460,7 +657,7 @@ const makeOpenCodeCompatibleTextGeneration = (config: OpenCodeCompatibleTextGene
                 cwd: input.cwd,
                 operation: input.operation,
               }),
-              (acquired) => runAgainstServer(acquired.server),
+              (acquired) => runAgainstServer(acquired.resource.server),
               releaseSharedServer,
             );
 
@@ -724,6 +921,7 @@ const makeOpenCodeCompatibleTextGeneration = (config: OpenCodeCompatibleTextGene
 
 export const makeOpenCodeTextGenerationServiceLive = (
   resolveServerPassword?: OpenCodeCompatibleTextGenerationConfig["resolveServerPassword"],
+  options?: OpenCodeCompatibleTextGenerationLiveOptions,
 ) =>
   Layer.effect(
     OpenCodeTextGeneration,
@@ -733,11 +931,15 @@ export const makeOpenCodeTextGenerationServiceLive = (
       serviceName: "OpenCodeTextGeneration",
       cliSpec: OPENCODE_CLI_SPEC,
       ...(resolveServerPassword ? { resolveServerPassword } : {}),
+      ...(options?.maintenanceOwnedResources
+        ? { maintenanceOwnedResources: options.maintenanceOwnedResources }
+        : {}),
     }),
   );
 
 export const makeKiloTextGenerationServiceLive = (
   resolveServerPassword?: OpenCodeCompatibleTextGenerationConfig["resolveServerPassword"],
+  options?: OpenCodeCompatibleTextGenerationLiveOptions,
 ) =>
   Layer.effect(
     KiloTextGeneration,
@@ -747,6 +949,9 @@ export const makeKiloTextGenerationServiceLive = (
       serviceName: "KiloTextGeneration",
       cliSpec: KILO_CLI_SPEC,
       ...(resolveServerPassword ? { resolveServerPassword } : {}),
+      ...(options?.maintenanceOwnedResources
+        ? { maintenanceOwnedResources: options.maintenanceOwnedResources }
+        : {}),
     }),
   );
 

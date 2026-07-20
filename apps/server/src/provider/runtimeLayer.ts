@@ -17,14 +17,17 @@ import { makeDroidAdapterLive } from "./Layers/DroidAdapter";
 import { makeGrokAdapterLive } from "./Layers/GrokAdapter";
 import { makeKiloAdapterLive, makeOpenCodeAdapterLive } from "./Layers/OpenCodeAdapter";
 import { makePiAdapterLive } from "./Layers/PiAdapter";
-import { ProviderAdapterRegistryLive } from "./Layers/ProviderAdapterRegistry";
-import { ProviderDiscoveryServiceLive } from "./Layers/ProviderDiscoveryService";
+import { makeProviderAdapterRegistryLive } from "./Layers/ProviderAdapterRegistry";
+import { makeProviderDiscoveryServiceLive } from "./Layers/ProviderDiscoveryService";
 import { makeDurableProviderServiceLive } from "./Layers/ProviderService";
 import { ProviderSessionDirectoryLive } from "./Layers/ProviderSessionDirectory";
 import { ProviderSessionRuntimeRepositoryLive } from "../persistence/Layers/ProviderSessionRuntime";
 import { ProviderRuntimeEventRepositoryLive } from "../persistence/Layers/ProviderRuntimeEvents";
+import type { ProviderMaintenanceGate } from "./providerMaintenanceGate";
 
-export function makeServerProviderLayer() {
+export function makeServerProviderLayer(options?: {
+  readonly maintenanceGate?: ProviderMaintenanceGate;
+}) {
   return Effect.gen(function* () {
     const credentials = yield* ProviderCredentials;
     const resolveProviderServerPassword = makeProviderServerPasswordResolver(credentials);
@@ -73,7 +76,9 @@ export function makeServerProviderLayer() {
       nativeEventLogger ? { nativeEventLogger } : undefined,
     );
     const piAdapterLayer = makePiAdapterLive(nativeEventLogger ? { nativeEventLogger } : undefined);
-    const adapterRegistryLayer = ProviderAdapterRegistryLive.pipe(
+    const adapterRegistryLayer = makeProviderAdapterRegistryLive({
+      ...(options?.maintenanceGate ? { maintenanceGate: options.maintenanceGate } : {}),
+    }).pipe(
       Layer.provide(codexAdapterLayer),
       Layer.provide(commandCodeAdapterLayer),
       Layer.provide(claudeAdapterLayer),
@@ -87,13 +92,20 @@ export function makeServerProviderLayer() {
       Layer.provideMerge(providerSessionDirectoryLayer),
     );
     const providerServiceLayer = makeDurableProviderServiceLive(
-      canonicalEventLogger ? { canonicalEventLogger } : undefined,
+      canonicalEventLogger || options?.maintenanceGate
+        ? {
+            ...(canonicalEventLogger ? { canonicalEventLogger } : {}),
+            ...(options?.maintenanceGate ? { maintenanceGate: options.maintenanceGate } : {}),
+          }
+        : undefined,
     ).pipe(
       Layer.provide(adapterRegistryLayer),
       Layer.provide(providerSessionDirectoryLayer),
       Layer.provide(ProviderRuntimeEventRepositoryLive),
     );
-    const providerDiscoveryLayer = ProviderDiscoveryServiceLive.pipe(
+    const providerDiscoveryLayer = makeProviderDiscoveryServiceLive({
+      ...(options?.maintenanceGate ? { maintenanceGate: options.maintenanceGate } : {}),
+    }).pipe(
       Layer.provide(adapterRegistryLayer),
       // Skill toggles live in server settings; the shared ServerSettingsLive
       // layer is memoized so this reuses the instance built at the top level.

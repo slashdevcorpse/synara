@@ -75,6 +75,67 @@ describe("database lifecycle lock", () => {
     );
   });
 
+  it("serializes duplicate releases without deleting a successor lock", async () => {
+    const dbPath = await makeDbPath();
+    const first = await Effect.runPromise(acquireDatabaseLifecycleLock(dbPath));
+
+    await Promise.all([
+      Effect.runPromise(releaseDatabaseLifecycleLock(first)),
+      Effect.runPromise(releaseDatabaseLifecycleLock(first)),
+    ]);
+
+    const successor = await Effect.runPromise(acquireDatabaseLifecycleLock(dbPath));
+    await Effect.runPromise(releaseDatabaseLifecycleLock(first));
+    await expect(fs.readFile(path.join(successor.lockPath, "owner.json"), "utf8")).resolves.toContain(
+      successor.owner.token,
+    );
+    await Effect.runPromise(releaseDatabaseLifecycleLock(successor));
+  });
+
+  it("serializes structural-copy releases and keeps delayed copies away from successors", async () => {
+    const dbPath = await makeDbPath();
+    const first = await Effect.runPromise(acquireDatabaseLifecycleLock(dbPath));
+    let releaseBarrier!: () => void;
+    const waitForRelease = new Promise<void>((resolve) => {
+      releaseBarrier = resolve;
+    });
+    let firstAttemptEntered!: () => void;
+    const waitForFirstAttempt = new Promise<void>((resolve) => {
+      firstAttemptEntered = resolve;
+    });
+    let releaseAttemptCount = 0;
+    const dependencies = {
+      beforeRelease: () => {
+        releaseAttemptCount += 1;
+        firstAttemptEntered();
+        return waitForRelease;
+      },
+    };
+    const copyLock = () => ({ ...first, owner: { ...first.owner } });
+
+    const firstRelease = Effect.runPromise(
+      releaseDatabaseLifecycleLock(copyLock(), dependencies),
+    );
+    await waitForFirstAttempt;
+    const duplicateRelease = Effect.runPromise(
+      releaseDatabaseLifecycleLock(copyLock(), dependencies),
+    );
+
+    expect(releaseAttemptCount).toBe(1);
+    releaseBarrier();
+    await Promise.all([firstRelease, duplicateRelease]);
+    expect(releaseAttemptCount).toBe(1);
+
+    const successor = await Effect.runPromise(acquireDatabaseLifecycleLock(dbPath));
+    await expect(
+      Effect.runPromise(releaseDatabaseLifecycleLock(copyLock())),
+    ).rejects.toBeInstanceOf(DatabaseLifecycleLockedError);
+    await expect(fs.readFile(path.join(successor.lockPath, "owner.json"), "utf8")).resolves.toContain(
+      successor.owner.token,
+    );
+    await Effect.runPromise(releaseDatabaseLifecycleLock(successor));
+  });
+
   it("recovers a well-formed lock owned by a dead process", async () => {
     const dbPath = await makeDbPath();
     const lockPath = `${dbPath}.lifecycle-lock`;
@@ -115,15 +176,16 @@ describe("database lifecycle lock", () => {
     await expect(fs.stat(reaperPath)).resolves.toBeDefined();
   });
 
-  it("recovers an ownerless directory and fails closed for an owner-file symlink", async () => {
+  it("fails closed for ownerless directories and owner-file symlinks", async () => {
     const dbPath = await makeDbPath();
     const lockPath = `${dbPath}.lifecycle-lock`;
     await fs.mkdir(lockPath, { mode: 0o700 });
 
-    const recovered = await Effect.runPromise(acquireDatabaseLifecycleLock(dbPath));
-    expect(recovered.owner.pid).toBe(process.pid);
-    await Effect.runPromise(releaseDatabaseLifecycleLock(recovered));
+    await expect(Effect.runPromise(acquireDatabaseLifecycleLock(dbPath))).rejects.toBeInstanceOf(
+      DatabaseLifecycleLockedError,
+    );
 
+    await fs.rm(lockPath, { recursive: true });
     await fs.mkdir(lockPath, { mode: 0o700 });
     const outsideOwner = path.join(path.dirname(dbPath), "outside-owner.json");
     const outsideContents = `${JSON.stringify({

@@ -9,6 +9,7 @@
  * @module ProviderHealthLive
  */
 import * as OS from "node:os";
+import * as NodePath from "node:path";
 import type {
   ProviderKind,
   ServerSettings,
@@ -30,6 +31,7 @@ import { query as claudeQuery, type SDKUserMessage } from "@anthropic-ai/claude-
 import {
   Array,
   Cache,
+  Cause,
   DateTime,
   Duration,
   Effect,
@@ -46,6 +48,7 @@ import {
   Scope,
   Stream,
 } from "effect";
+import * as Semaphore from "effect/Semaphore";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 
 import {
@@ -86,6 +89,7 @@ import {
   type CommandResult,
 } from "../providerCliOutput";
 import { ProviderHealth, type ProviderHealthShape } from "../Services/ProviderHealth";
+import { ProviderService } from "../Services/ProviderService";
 import {
   orderProviderStatuses,
   readProviderStatusCache,
@@ -94,17 +98,36 @@ import {
 } from "../providerStatusCache";
 import { makeProviderMaintenanceCommandCoordinator } from "../providerMaintenanceCommandCoordinator";
 import {
+  makeProviderMaintenanceOwnedResourceCoordinator,
+  type ProviderMaintenanceOwnedResourceCoordinator,
+} from "../providerMaintenanceOwnedResources";
+import {
   enrichProviderStatusWithVersionAdvisory,
   compareSemverVersions,
+  makeCommandPathSuffixMatcher,
   makeProviderMaintenanceCapabilities,
   normalizeCommandPath,
   parseGenericCliVersion,
+  providerMaintenanceTargetsShareUpdateDestination,
   resolveProviderMaintenanceCapabilitiesEffect,
   type PackageManagedProviderMaintenanceDefinition,
   type ProviderMaintenanceCapabilities,
 } from "../providerMaintenance";
 import { collectUint8StreamText } from "../../stream/collectUint8StreamText";
 import { buildCodexProcessEnv } from "../../codexProcessEnv.ts";
+import type { ProcessTreeKiller } from "../../terminal/processTreeKiller.ts";
+import {
+  makeProviderMaintenanceGate,
+  type ProviderMaintenanceGate,
+} from "../providerMaintenanceGate.ts";
+import { quiesceProviderRuntimesForUpdate } from "../providerUpdateQuiescence.ts";
+import { classifyCompletedProviderUpdate } from "../providerUpdateOutcome.ts";
+import {
+  ProviderProcessExitUnprovenError,
+  superviseEffectProcessTree,
+  teardownEffectProcessTree,
+  teardownProviderProcessTree,
+} from "../supervisedProcessTeardown.ts";
 
 export { parseClaudeAuthStatusFromOutput } from "../claudeAuthStatus";
 export type { CommandResult } from "../providerCliOutput";
@@ -160,8 +183,8 @@ function formatProviderUpdateTimeout(timeoutMs: number): string {
   return `${seconds} ${seconds === 1 ? "second" : "seconds"}`;
 }
 
-function isClaudeNativeCommandPath(commandPath: string): boolean {
-  const normalized = normalizeCommandPath(commandPath);
+function isClaudeNativeCommandPath(commandPath: string, platform: NodeJS.Platform): boolean {
+  const normalized = normalizeCommandPath(commandPath, platform);
   return (
     normalized.endsWith("/.local/bin/claude") ||
     normalized.endsWith("/.local/bin/claude.exe") ||
@@ -169,22 +192,111 @@ function isClaudeNativeCommandPath(commandPath: string): boolean {
   );
 }
 
-function isOpenCodeNativeCommandPath(commandPath: string): boolean {
-  const normalized = normalizeCommandPath(commandPath);
+function isOpenCodeNativeCommandPath(commandPath: string, platform: NodeJS.Platform): boolean {
+  const normalized = normalizeCommandPath(commandPath, platform);
   return (
     normalized.endsWith("/.opencode/bin/opencode") ||
     normalized.endsWith("/.opencode/bin/opencode.exe")
   );
 }
 
-function isKiloNativeCommandPath(commandPath: string): boolean {
-  const normalized = normalizeCommandPath(commandPath);
+function isKiloNativeCommandPath(commandPath: string, platform: NodeJS.Platform): boolean {
+  const normalized = normalizeCommandPath(commandPath, platform);
   return (
     normalized.endsWith("/.kilo/bin/kilo") ||
     normalized.endsWith("/.local/bin/kilo") ||
     normalized.includes("/.local/share/kilo/bin/")
   );
 }
+
+function findUnprovenProcessExit(
+  error: unknown,
+  seen: Set<object> = new Set(),
+): ProviderProcessExitUnprovenError | null {
+  if (error instanceof ProviderProcessExitUnprovenError) {
+    return error;
+  }
+  if (!error || typeof error !== "object" || seen.has(error)) {
+    return null;
+  }
+  seen.add(error);
+  return "cause" in error
+    ? findUnprovenProcessExit((error as { readonly cause?: unknown }).cause, seen)
+    : null;
+}
+
+const isAntigravityNativeCommandPath = makeCommandPathSuffixMatcher([
+  "/.local/bin/agy",
+  "/AppData/Local/agy/bin/agy.exe",
+]);
+
+function isCursorAgentNativeCommandPath(commandPath: string, platform: NodeJS.Platform): boolean {
+  const normalized = normalizeCommandPath(commandPath, platform);
+  return (
+    normalized.includes("/.local/share/cursor-agent/") &&
+    (normalized.endsWith("/cursor-agent") || normalized.endsWith("/cursor-agent.exe"))
+  );
+}
+
+function installRootThroughMarker(
+  input: {
+    readonly visibleCommandPath: string;
+    readonly canonicalCommandPath: string;
+    readonly platform: NodeJS.Platform;
+  },
+  markers: ReadonlyArray<string>,
+): string | null {
+  for (const commandPath of [input.canonicalCommandPath, input.visibleCommandPath]) {
+    const normalized = normalizeCommandPath(commandPath, input.platform);
+    for (const rawMarker of markers) {
+      const marker = normalizeCommandPath(rawMarker, input.platform);
+      const markerIndex = normalized.indexOf(marker);
+      if (markerIndex >= 0) {
+        return commandPath.slice(0, markerIndex + marker.length);
+      }
+    }
+  }
+  return null;
+}
+
+const resolveClaudeNativeInstallRoot = (input: {
+  readonly visibleCommandPath: string;
+  readonly canonicalCommandPath: string;
+  readonly platform: NodeJS.Platform;
+}) => installRootThroughMarker(input, ["/.local/share/claude"]);
+
+const resolveAntigravityNativeInstallRoot = (input: {
+  readonly visibleCommandPath: string;
+  readonly canonicalCommandPath: string;
+  readonly platform: NodeJS.Platform;
+}) => installRootThroughMarker(input, ["/AppData/Local/agy"]);
+
+const resolveKiloNativeInstallRoot = (input: {
+  readonly visibleCommandPath: string;
+  readonly canonicalCommandPath: string;
+  readonly platform: NodeJS.Platform;
+}) => installRootThroughMarker(input, ["/.kilo", "/.local/share/kilo"]);
+
+const resolveOpenCodeNativeInstallRoot = (input: {
+  readonly visibleCommandPath: string;
+  readonly canonicalCommandPath: string;
+  readonly platform: NodeJS.Platform;
+}) => installRootThroughMarker(input, ["/.opencode"]);
+
+const resolveCursorAgentNativeInstallRoot = (input: {
+  readonly visibleCommandPath: string;
+  readonly canonicalCommandPath: string;
+  readonly platform: NodeJS.Platform;
+}) => installRootThroughMarker(input, ["/.local/share/cursor-agent"]);
+
+const isCodexStandaloneCommandPath = makeCommandPathSuffixMatcher([
+  "/Programs/OpenAI/Codex/bin/codex.exe",
+]);
+
+const isWindowsCodexStandaloneCommandPath = (
+  commandPath: string,
+  platform: NodeJS.Platform,
+): boolean => platform === "win32" && isCodexStandaloneCommandPath(commandPath, platform);
 
 export const PACKAGE_MANAGED_PROVIDER_UPDATES: Partial<
   Record<ProviderKind, PackageManagedProviderMaintenanceDefinition>
@@ -193,25 +305,36 @@ export const PACKAGE_MANAGED_PROVIDER_UPDATES: Partial<
     provider: CODEX_PROVIDER,
     binaryName: "codex",
     npmPackageName: "@openai/codex",
+    allowedInstallSources: ["npm", "bun", "pnpm", "homebrew", "native"],
     homebrew: { name: "codex", kind: "cask" },
-    nativeUpdate: null,
+    nativeUpdate: {
+      executable: "codex",
+      args: () => ["update"],
+      lockKey: "codex-native",
+      strategy: "matching-path",
+      isCommandPath: isWindowsCodexStandaloneCommandPath,
+      isVisibleCommandPath: ({ visibleCommandPath, platform }) =>
+        isWindowsCodexStandaloneCommandPath(visibleCommandPath, platform),
+      resolveInstallRoot: ({ visibleCommandPath, platform }) =>
+        isWindowsCodexStandaloneCommandPath(visibleCommandPath, platform)
+          ? NodePath.win32.dirname(NodePath.win32.dirname(visibleCommandPath))
+          : null,
+    },
   },
   commandCode: {
     provider: COMMAND_CODE_PROVIDER,
     binaryName: "commandcode",
+    allowedBinaryNames: ["cmd", "cmdc", "command-code", "commandcode"],
     npmPackageName: "command-code",
+    allowedInstallSources: ["npm"],
     homebrew: null,
-    nativeUpdate: {
-      executable: "commandcode",
-      args: () => ["update"],
-      lockKey: "command-code-native",
-      strategy: "always",
-    },
+    nativeUpdate: null,
   },
   claudeAgent: {
     provider: CLAUDE_AGENT_PROVIDER,
     binaryName: "claude",
     npmPackageName: "@anthropic-ai/claude-code",
+    allowedInstallSources: ["npm", "homebrew", "native"],
     homebrew: { name: "claude-code", kind: "cask" },
     nativeUpdate: {
       executable: "claude",
@@ -219,6 +342,7 @@ export const PACKAGE_MANAGED_PROVIDER_UPDATES: Partial<
       lockKey: "claude-native",
       strategy: "matching-path",
       isCommandPath: isClaudeNativeCommandPath,
+      resolveInstallRoot: resolveClaudeNativeInstallRoot,
     },
   },
   antigravity: {
@@ -226,31 +350,32 @@ export const PACKAGE_MANAGED_PROVIDER_UPDATES: Partial<
     binaryName: "agy",
     // Antigravity is distributed as a native binary and owns its update channel.
     npmPackageName: null,
+    allowedInstallSources: ["native"],
     homebrew: null,
     latestVersionSource: null,
     nativeUpdate: {
       executable: "agy",
       args: () => ["update"],
       lockKey: "antigravity-native",
-      strategy: "always",
+      strategy: "matching-path",
+      isCommandPath: isAntigravityNativeCommandPath,
+      resolveInstallRoot: resolveAntigravityNativeInstallRoot,
     },
   },
   droid: {
     provider: DROID_PROVIDER,
     binaryName: "droid",
-    npmPackageName: "@factory/cli",
+    allowedBinaryNames: ["droid"],
+    npmPackageName: "droid",
+    allowedInstallSources: ["npm"],
     homebrew: null,
-    nativeUpdate: {
-      executable: "droid",
-      args: () => ["update"],
-      lockKey: "droid-native",
-      strategy: "always",
-    },
+    nativeUpdate: null,
   },
   kilo: {
     provider: KILO_PROVIDER,
     binaryName: "kilo",
     npmPackageName: "@kilocode/cli",
+    allowedInstallSources: ["npm", "native"],
     homebrew: null,
     nativeUpdate: {
       executable: "kilo",
@@ -258,14 +383,15 @@ export const PACKAGE_MANAGED_PROVIDER_UPDATES: Partial<
       lockKey: "kilo-native",
       strategy: "matching-path",
       isCommandPath: isKiloNativeCommandPath,
+      resolveInstallRoot: resolveKiloNativeInstallRoot,
     },
   },
   opencode: {
     provider: OPENCODE_PROVIDER,
     binaryName: "opencode",
     npmPackageName: "opencode-ai",
+    allowedInstallSources: ["npm", "bun", "pnpm", "homebrew", "native"],
     homebrew: { name: "anomalyco/tap/opencode", kind: "formula" },
-    latestVersionSource: { kind: "npm", name: "opencode-ai" },
     nativeUpdate: {
       executable: "opencode",
       args: (installSource) =>
@@ -273,21 +399,35 @@ export const PACKAGE_MANAGED_PROVIDER_UPDATES: Partial<
           ? ["upgrade"]
           : ["upgrade", "--method", installSource],
       lockKey: "opencode-native",
-      strategy: "always",
+      strategy: "matching-path",
       excludedInstallSources: ["homebrew"],
       isCommandPath: isOpenCodeNativeCommandPath,
+      resolveInstallRoot: resolveOpenCodeNativeInstallRoot,
     },
   },
   pi: {
     provider: PI_PROVIDER,
     binaryName: "pi",
     npmPackageName: "@earendil-works/pi-coding-agent",
+    allowedInstallSources: ["npm", "bun", "pnpm"],
+    npmInstallFlags: ["--ignore-scripts"],
     homebrew: null,
+    nativeUpdate: null,
+  },
+  cursor: {
+    provider: CURSOR_PROVIDER,
+    binaryName: "cursor-agent",
+    npmPackageName: null,
+    allowedInstallSources: ["native"],
+    homebrew: null,
+    latestVersionSource: null,
     nativeUpdate: {
-      executable: "pi",
+      executable: "cursor-agent",
       args: () => ["update"],
-      lockKey: "pi-native",
-      strategy: "always",
+      lockKey: "cursor-agent-native",
+      strategy: "matching-path",
+      isCommandPath: isCursorAgentNativeCommandPath,
+      resolveInstallRoot: resolveCursorAgentNativeInstallRoot,
     },
   },
 };
@@ -669,6 +809,7 @@ const runProviderCommand = (
   args: ReadonlyArray<string>,
   env: NodeJS.ProcessEnv,
   executableAlreadyResolved = false,
+  teardownProcessTree: typeof teardownProviderProcessTree = teardownProviderProcessTree,
 ) =>
   Effect.gen(function* () {
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
@@ -685,7 +826,15 @@ const runProviderCommand = (
     });
 
     const child = yield* spawner.spawn(command);
-    yield* Effect.addFinalizer(() => child.kill().pipe(Effect.ignore));
+    let completed = false;
+    yield* Effect.addFinalizer(() =>
+      completed
+        ? Effect.void
+        : Effect.tryPromise({
+            try: () => teardownEffectProcessTree(child, teardownProcessTree),
+            catch: (error) => (error instanceof Error ? error : new Error(String(error))),
+          }).pipe(Effect.asVoid, Effect.ignore),
+    );
 
     const [stdout, stderr, exitCode] = yield* Effect.all(
       [
@@ -695,6 +844,7 @@ const runProviderCommand = (
       ],
       { concurrency: "unbounded" },
     );
+    completed = true;
 
     return { stdout, stderr, code: exitCode } satisfies CommandResult;
   }).pipe(Effect.scoped);
@@ -712,8 +862,18 @@ const runCodexCommand = (
     ),
   );
 
-const runCommandCodeCommand = (args: ReadonlyArray<string>, executable = "commandcode") =>
-  runProviderCommand(executable, args, providerCommandEnv(COMMAND_CODE_PROVIDER), true).pipe(
+const runCommandCodeCommand = (
+  args: ReadonlyArray<string>,
+  executable = "commandcode",
+  teardownProcessTree: typeof teardownProviderProcessTree = teardownProviderProcessTree,
+) =>
+  runProviderCommand(
+    executable,
+    args,
+    providerCommandEnv(COMMAND_CODE_PROVIDER),
+    true,
+    teardownProcessTree,
+  ).pipe(
     Effect.flatMap((result) =>
       isWindowsShellCommandMissingResult({ code: result.code, stderr: result.stderr })
         ? Effect.fail(new Error(`spawn ${executable} ENOENT`))
@@ -1097,13 +1257,18 @@ export function parseCommandCodeStatusJson(stdout: string): CommandCodeStatusJso
 
 export const makeCheckCommandCodeProviderStatus = (
   binaryPath?: string,
+  options?: { readonly teardownProcessTree?: typeof teardownProviderProcessTree },
 ): Effect.Effect<ServerProviderStatus, never, ChildProcessSpawner.ChildProcessSpawner> =>
   Effect.gen(function* () {
     const checkedAt = new Date().toISOString();
     const env = providerCommandEnv(COMMAND_CODE_PROVIDER);
     const configured = nonEmptyTrimmed(binaryPath) ?? "commandcode";
     const executable = resolveCommandCodeCliExecutable(configured, { env });
-    const versionProbe = yield* runCommandCodeCommand(["--version"], executable).pipe(
+    const versionProbe = yield* runCommandCodeCommand(
+      ["--version"],
+      executable,
+      options?.teardownProcessTree,
+    ).pipe(
       Effect.timeoutOption(COMMAND_CODE_HEALTH_TIMEOUT_MS),
       Effect.result,
     );
@@ -1147,7 +1312,11 @@ export const makeCheckCommandCodeProviderStatus = (
       } satisfies ServerProviderStatus;
     }
     const version = parseGenericCliVersion(`${versionResult.stdout}\n${versionResult.stderr}`);
-    const authProbe = yield* runCommandCodeCommand(["status", "--json"], executable).pipe(
+    const authProbe = yield* runCommandCodeCommand(
+      ["status", "--json"],
+      executable,
+      options?.teardownProcessTree,
+    ).pipe(
       Effect.timeoutOption(COMMAND_CODE_HEALTH_TIMEOUT_MS),
       Effect.result,
     );
@@ -2232,7 +2401,13 @@ export function projectProviderStatusesForSettings(
 
 // ── Layer ───────────────────────────────────────────────────────────
 
-export function makeProviderHealthLive(options?: { readonly providerUpdateTimeoutMs?: number }) {
+export function makeProviderHealthLive(options?: {
+  readonly providerUpdateTimeoutMs?: number;
+  readonly maintenanceGate?: ProviderMaintenanceGate;
+  readonly maintenanceOwnedResources?: ProviderMaintenanceOwnedResourceCoordinator;
+  readonly processTreeKiller?: ProcessTreeKiller;
+  readonly teardownProcessTree?: typeof teardownProviderProcessTree;
+}) {
   const providerUpdateTimeoutMs = options?.providerUpdateTimeoutMs ?? PROVIDER_UPDATE_TIMEOUT_MS;
   return Layer.effect(
     ProviderHealth,
@@ -2242,6 +2417,12 @@ export function makeProviderHealthLive(options?: { readonly providerUpdateTimeou
       const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
       const serverConfig = yield* ServerConfig;
       const serverSettings = yield* ServerSettingsService;
+      const providerService = yield* ProviderService;
+      const maintenanceGate = options?.maintenanceGate ?? (yield* makeProviderMaintenanceGate);
+      const maintenanceOwnedResources =
+        options?.maintenanceOwnedResources ??
+        (yield* makeProviderMaintenanceOwnedResourceCoordinator);
+      const teardownProcessTree = options?.teardownProcessTree ?? teardownProviderProcessTree;
       const changesPubSub = yield* Effect.acquireRelease(
         PubSub.unbounded<ReadonlyArray<ServerProviderStatus>>(),
         PubSub.shutdown,
@@ -2281,15 +2462,24 @@ export function makeProviderHealthLive(options?: { readonly providerUpdateTimeou
       );
 
       const statusesRef = yield* Ref.make<ProviderStatuses>(cachedStatuses);
+      const providerStatusCommitEpochsRef = yield* Ref.make<
+        ReadonlyMap<ProviderKind, number>
+      >(new Map());
       const updateStatesRef = yield* Ref.make<ReadonlyMap<ProviderKind, ServerProviderUpdateState>>(
         new Map(),
       );
+      const statusCommitMutex = yield* Semaphore.make(1);
       const refreshFiberRef = yield* Ref.make<Fiber.Fiber<ProviderStatuses, never> | null>(null);
       const commandCoordinator = yield* makeProviderMaintenanceCommandCoordinator({
         makeAlreadyRunningError: (provider) =>
           new ServerProviderUpdateError({
             provider: provider as ProviderKind,
             reason: "An update is already running for this provider.",
+          }),
+        makeCrossProcessLockError: (provider, _lockKey, cause) =>
+          new ServerProviderUpdateError({
+            provider: provider as ProviderKind,
+            reason: `Could not acquire the cross-process update lock safely. No update was started. ${cause.message}`,
           }),
       });
 
@@ -2331,9 +2521,9 @@ export function makeProviderHealthLive(options?: { readonly providerUpdateTimeou
         }
       };
 
-      const getProviderMaintenanceCapabilities = Effect.fn("getProviderMaintenanceCapabilities")(
-        function* (provider: ProviderKind) {
-          const settings = yield* serverSettings.getSettings;
+      const resolveProviderMaintenanceCapabilitiesForSettings = Effect.fn(
+        "resolveProviderMaintenanceCapabilitiesForSettings",
+      )(function* (provider: ProviderKind, settings: ServerSettings) {
           if (!isProviderEnabledForSettings(provider, settings)) {
             return makeProviderMaintenanceCapabilities({
               provider,
@@ -2344,16 +2534,14 @@ export function makeProviderHealthLive(options?: { readonly providerUpdateTimeou
               updateLockKey: null,
             });
           }
-          if (provider === "cursor") {
-            const command = buildCursorAgentCommand(getProviderBinaryPath(provider, settings), [
-              "update",
-            ]);
+          if (provider === GROK_PROVIDER) {
             return makeProviderMaintenanceCapabilities({
               provider,
               packageName: null,
-              updateExecutable: command.command,
-              updateArgs: command.args,
-              updateLockKey: "cursor-agent",
+              latestVersionSource: null,
+              updateExecutable: null,
+              updateArgs: [],
+              updateLockKey: null,
             });
           }
           const definition = PACKAGE_MANAGED_PROVIDER_UPDATES[provider];
@@ -2366,11 +2554,38 @@ export function makeProviderHealthLive(options?: { readonly providerUpdateTimeou
               updateLockKey: null,
             });
           }
+          const commandEnv =
+            provider === CODEX_PROVIDER
+              ? yield* Effect.promise(() =>
+                  makeCodexProbeEnv(settings.providers.codex.homePath ?? undefined),
+                )
+              : providerCommandEnv(provider);
+          const configuredBinaryPath = getProviderBinaryPath(provider, settings);
+          const binaryPath =
+            provider === CODEX_PROVIDER
+              ? resolveCodexCliExecutable(configuredBinaryPath ?? "codex", { env: commandEnv })
+              : provider === COMMAND_CODE_PROVIDER
+                ? resolveCommandCodeCliExecutable(configuredBinaryPath ?? "commandcode", {
+                    env: commandEnv,
+                  })
+                : provider === CURSOR_PROVIDER
+                  ? resolveCursorAgentBinaryPath(configuredBinaryPath)
+                  : provider === DROID_PROVIDER
+                    ? process.platform === "win32"
+                      ? configuredBinaryPath ?? "droid"
+                      : resolveDroidCliBinaryPath(configuredBinaryPath ?? undefined)
+                    : configuredBinaryPath;
           return yield* resolveProviderMaintenanceCapabilitiesEffect(definition, {
-            binaryPath: getProviderBinaryPath(provider, settings),
-            env: providerCommandEnv(provider),
+            binaryPath,
+            env: commandEnv,
             platform: process.platform,
           }).pipe(Effect.provideService(FileSystem.FileSystem, fileSystem));
+      });
+
+      const getProviderMaintenanceCapabilities = Effect.fn("getProviderMaintenanceCapabilities")(
+        function* (provider: ProviderKind) {
+          const settings = yield* serverSettings.getSettings;
+          return yield* resolveProviderMaintenanceCapabilitiesForSettings(provider, settings);
         },
       );
 
@@ -2403,28 +2618,90 @@ export function makeProviderHealthLive(options?: { readonly providerUpdateTimeou
         );
       });
 
+      const persistStatuses = (statuses: ProviderStatuses) =>
+        Effect.forEach(
+          statuses,
+          (status) => {
+            const { updateState: _updateState, ...statusToPersist } = status;
+            return writeProviderStatusCache({
+              filePath: cachePathByProvider.get(status.provider)!,
+              provider: statusToPersist,
+            }).pipe(
+              Effect.provideService(FileSystem.FileSystem, fileSystem),
+              Effect.provideService(Path.Path, path),
+              Effect.tapError(Effect.logError),
+              Effect.ignore,
+            );
+          },
+          { concurrency: "unbounded", discard: true },
+        );
+
       const publishProjectedStatuses = Effect.fn("publishProjectedProviderStatuses")(function* () {
-        const rawStatuses = yield* Ref.get(statusesRef);
-        const projectedStatuses = yield* projectStatusesForCurrentSettings(rawStatuses);
-        yield* PubSub.publish(changesPubSub, projectedStatuses);
-        return projectedStatuses;
+        return yield* statusCommitMutex.withPermit(
+          Effect.gen(function* () {
+            const rawStatuses = yield* Ref.get(statusesRef);
+            const projectedStatuses = yield* projectStatusesForCurrentSettings(rawStatuses);
+            yield* PubSub.publish(changesPubSub, projectedStatuses);
+            return projectedStatuses;
+          }),
+        );
+      });
+
+      const advanceProviderStatusCommitEpochs = (
+        providers: ReadonlyArray<ProviderKind>,
+      ) =>
+        Ref.update(providerStatusCommitEpochsRef, (previous) => {
+          const next = new Map(previous);
+          for (const provider of providers) {
+            next.set(provider, (previous.get(provider) ?? 0) + 1);
+          }
+          return next;
+        });
+
+      const commitProviderState = Effect.fn("commitProviderState")(function* (
+        provider: ProviderKind,
+        input: {
+          readonly status?: ServerProviderStatus;
+          readonly updateState?: ServerProviderUpdateState | null;
+        },
+      ) {
+        return yield* statusCommitMutex.withPermit(
+          Effect.uninterruptible(
+            Effect.gen(function* () {
+              if (input.updateState !== undefined) {
+                yield* Ref.update(updateStatesRef, (previous) => {
+                  const next = new Map(previous);
+                  if (!input.updateState || input.updateState.status === "idle") {
+                    next.delete(provider);
+                  } else {
+                    next.set(provider, input.updateState);
+                  }
+                  return next;
+                });
+              }
+
+              let rawStatuses = yield* Ref.get(statusesRef);
+              if (input.status !== undefined) {
+                const { updateState: _updateState, ...rawStatus } = input.status;
+                rawStatuses = mergeProviderStatusUpdates(rawStatuses, [rawStatus]);
+                yield* Ref.set(statusesRef, rawStatuses);
+                yield* persistStatuses(rawStatuses);
+                yield* advanceProviderStatusCommitEpochs([provider]);
+              }
+
+              const projectedStatuses = yield* projectStatusesForCurrentSettings(rawStatuses);
+              yield* PubSub.publish(changesPubSub, projectedStatuses);
+              return projectedStatuses;
+            }),
+          ),
+        );
       });
 
       const setProviderUpdateState = Effect.fn("setProviderUpdateState")(function* (
         provider: ProviderKind,
         state: ServerProviderUpdateState | null,
       ) {
-        yield* Ref.update(updateStatesRef, (previous) => {
-          const next = new Map(previous);
-          if (!state || state.status === "idle") {
-            next.delete(provider);
-          } else {
-            next.set(provider, state);
-          }
-          return next;
-        });
-
-        return yield* publishProjectedStatuses();
+        return yield* commitProviderState(provider, { updateState: state });
       });
 
       const enrichStatuses = Effect.fn("enrichProviderStatuses")(function* (
@@ -2477,76 +2754,78 @@ export function makeProviderHealthLive(options?: { readonly providerUpdateTimeou
         check: Effect.Effect<ServerProviderStatus, never, R>,
       ): Effect.Effect<Option.Option<ServerProviderStatus>, never, R> =>
         isProviderEnabledForSettings(provider, settings)
-          ? check.pipe(Effect.map(Option.some))
+          ? maintenanceGate
+              .withOperation({
+                provider,
+                operation: "ProviderHealth.refresh",
+                run: check,
+              })
+              .pipe(
+                Effect.map(Option.some),
+                Effect.catchTag("ProviderMaintenanceBusyError", () => Effect.succeed(Option.none())),
+              )
           : Effect.succeed(Option.none());
+
+      const checkProviderStatusForSettings = (
+        settings: ServerSettings,
+        provider: ProviderKind,
+      ): Effect.Effect<ServerProviderStatus> => {
+        const check = (() => {
+          switch (provider) {
+            case CODEX_PROVIDER:
+              return makeCheckCodexProviderStatus(
+                settings.providers.codex.binaryPath,
+                settings.providers.codex.homePath,
+              );
+            case COMMAND_CODE_PROVIDER:
+              return makeCheckCommandCodeProviderStatus(
+                settings.providers.commandCode.binaryPath,
+                { teardownProcessTree },
+              );
+            case CLAUDE_AGENT_PROVIDER:
+              return makeCheckClaudeProviderStatus(
+                resolveClaudeSubscription,
+                settings.providers.claudeAgent.binaryPath,
+                serverConfig.homeDir,
+              );
+            case CURSOR_PROVIDER:
+              return makeCheckCursorProviderStatus(settings.providers.cursor.binaryPath);
+            case ANTIGRAVITY_PROVIDER:
+              return checkAntigravityProviderStatus(settings.providers.antigravity.binaryPath);
+            case GROK_PROVIDER:
+              return makeCheckGrokProviderStatus(settings.providers.grok.binaryPath);
+            case DROID_PROVIDER:
+              return makeCheckDroidProviderStatus(settings.providers.droid.binaryPath);
+            case KILO_PROVIDER:
+              return makeCheckKiloProviderStatus(settings.providers.kilo.binaryPath);
+            case OPENCODE_PROVIDER:
+              return makeCheckOpenCodeProviderStatus(settings.providers.opencode.binaryPath);
+            case PI_PROVIDER:
+              return checkPiProviderStatus(
+                settings.providers.pi.agentDir,
+                settings.providers.pi.binaryPath,
+              );
+          }
+        })();
+        return check.pipe(
+          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+          Effect.provideService(FileSystem.FileSystem, fileSystem),
+          Effect.provideService(Path.Path, path),
+        );
+      };
 
       const loadProviderStatuses = serverSettings.ready
         .pipe(
           Effect.flatMap(() => serverSettings.getSettings),
           Effect.flatMap((settings) =>
             Effect.all(
-              [
+              PROVIDERS.map((provider) =>
                 checkProviderWhenEnabled(
                   settings,
-                  CODEX_PROVIDER,
-                  makeCheckCodexProviderStatus(
-                    settings.providers.codex.binaryPath,
-                    settings.providers.codex.homePath,
-                  ),
+                  provider,
+                  checkProviderStatusForSettings(settings, provider),
                 ),
-                checkProviderWhenEnabled(
-                  settings,
-                  COMMAND_CODE_PROVIDER,
-                  makeCheckCommandCodeProviderStatus(settings.providers.commandCode.binaryPath),
-                ),
-                checkProviderWhenEnabled(
-                  settings,
-                  CLAUDE_AGENT_PROVIDER,
-                  makeCheckClaudeProviderStatus(
-                    resolveClaudeSubscription,
-                    settings.providers.claudeAgent.binaryPath,
-                    serverConfig.homeDir,
-                  ),
-                ),
-                checkProviderWhenEnabled(
-                  settings,
-                  CURSOR_PROVIDER,
-                  makeCheckCursorProviderStatus(settings.providers.cursor.binaryPath),
-                ),
-                checkProviderWhenEnabled(
-                  settings,
-                  ANTIGRAVITY_PROVIDER,
-                  checkAntigravityProviderStatus(settings.providers.antigravity.binaryPath),
-                ),
-                checkProviderWhenEnabled(
-                  settings,
-                  GROK_PROVIDER,
-                  makeCheckGrokProviderStatus(settings.providers.grok.binaryPath),
-                ),
-                checkProviderWhenEnabled(
-                  settings,
-                  DROID_PROVIDER,
-                  makeCheckDroidProviderStatus(settings.providers.droid.binaryPath),
-                ),
-                checkProviderWhenEnabled(
-                  settings,
-                  KILO_PROVIDER,
-                  makeCheckKiloProviderStatus(settings.providers.kilo.binaryPath),
-                ),
-                checkProviderWhenEnabled(
-                  settings,
-                  OPENCODE_PROVIDER,
-                  makeCheckOpenCodeProviderStatus(settings.providers.opencode.binaryPath),
-                ),
-                checkProviderWhenEnabled(
-                  settings,
-                  PI_PROVIDER,
-                  checkPiProviderStatus(
-                    settings.providers.pi.agentDir,
-                    settings.providers.pi.binaryPath,
-                  ),
-                ),
-              ],
+              ),
               {
                 concurrency: "unbounded",
               },
@@ -2565,53 +2844,53 @@ export function makeProviderHealthLive(options?: { readonly providerUpdateTimeou
           Effect.flatMap(enrichStatuses),
         );
 
-      const persistStatuses = (statuses: ProviderStatuses) =>
-        Effect.forEach(
-          statuses,
-          (status) => {
-            const { updateState: _updateState, ...statusToPersist } = status;
-            return writeProviderStatusCache({
-              filePath: cachePathByProvider.get(status.provider)!,
-              provider: statusToPersist,
-            }).pipe(
-              Effect.provideService(FileSystem.FileSystem, fileSystem),
-              Effect.provideService(Path.Path, path),
-              Effect.tapError(Effect.logError),
-              Effect.ignore,
-            );
-          },
-          { concurrency: "unbounded", discard: true },
-        );
-
       const refreshNow = Effect.gen(function* () {
         const refreshRevision = (yield* serverSettings.getSnapshot).revision;
+        const refreshStatusCommitEpochs = yield* Ref.get(providerStatusCommitEpochsRef);
         // Drop the cached Claude subscription probe so switching accounts (login
         // / logout / add account outside the app) is reflected on the next
         // refresh instead of being pinned to the old account for up to 5 minutes.
         yield* Cache.invalidate(claudeSubscriptionCache, "claude");
         const loadedStatuses = yield* loadProviderStatuses;
-        if ((yield* serverSettings.getSnapshot).revision !== refreshRevision) {
-          const currentStatuses = yield* Ref.get(statusesRef);
-          return yield* projectStatusesForCurrentSettings(currentStatuses);
-        }
-        const previousRawStatuses = yield* Ref.get(statusesRef);
-        const previousStatuses = yield* projectStatusesForCurrentSettings(previousRawStatuses);
-        const stabilizedLoadedStatuses = stabilizeProviderStatusesAgainstTransientTimeouts(
-          previousRawStatuses,
-          loadedStatuses,
+        return yield* statusCommitMutex.withPermit(
+          Effect.uninterruptible(
+            Effect.gen(function* () {
+              if ((yield* serverSettings.getSnapshot).revision !== refreshRevision) {
+                const currentStatuses = yield* Ref.get(statusesRef);
+                return yield* projectStatusesForCurrentSettings(currentStatuses);
+              }
+              const previousRawStatuses = yield* Ref.get(statusesRef);
+              const previousStatuses = yield* projectStatusesForCurrentSettings(previousRawStatuses);
+              const currentStatusCommitEpochs = yield* Ref.get(providerStatusCommitEpochsRef);
+              const freshLoadedStatuses = loadedStatuses.filter(
+                (status) =>
+                  (refreshStatusCommitEpochs.get(status.provider) ?? 0) ===
+                  (currentStatusCommitEpochs.get(status.provider) ?? 0),
+              );
+              const stabilizedLoadedStatuses = stabilizeProviderStatusesAgainstTransientTimeouts(
+                previousRawStatuses,
+                freshLoadedStatuses,
+              );
+              const nextRawStatuses = mergeProviderStatusUpdates(
+                previousRawStatuses,
+                stabilizedLoadedStatuses,
+              );
+              const nextStatuses = yield* projectStatusesForCurrentSettings(nextRawStatuses);
+              yield* Ref.set(statusesRef, nextRawStatuses);
+              if (freshLoadedStatuses.length > 0) {
+                yield* advanceProviderStatusCommitEpochs(
+                  freshLoadedStatuses.map((status) => status.provider),
+                );
+              }
+              if (providerStatusesEqual(previousStatuses, nextStatuses)) {
+                return nextStatuses;
+              }
+              yield* persistStatuses(nextRawStatuses);
+              yield* PubSub.publish(changesPubSub, nextStatuses);
+              return nextStatuses;
+            }),
+          ),
         );
-        const nextRawStatuses = mergeProviderStatusUpdates(
-          previousRawStatuses,
-          stabilizedLoadedStatuses,
-        );
-        const nextStatuses = yield* projectStatusesForCurrentSettings(nextRawStatuses);
-        yield* Ref.set(statusesRef, nextRawStatuses);
-        if (providerStatusesEqual(previousStatuses, nextStatuses)) {
-          return nextStatuses;
-        }
-        yield* persistStatuses(nextRawStatuses);
-        yield* PubSub.publish(changesPubSub, nextStatuses);
-        return nextStatuses;
       });
 
       // Keep a single refresh in flight so repeated config reads do not spawn
@@ -2680,6 +2959,7 @@ export function makeProviderHealthLive(options?: { readonly providerUpdateTimeou
         readonly command: string;
         readonly args: ReadonlyArray<string>;
         readonly pathPrepend?: string;
+        readonly teardownFailureRef: Ref.Ref<Error | null>;
       }) {
         const baseEnv = providerCommandEnv(input.provider);
         const updateEnv = input.pathPrepend
@@ -2691,14 +2971,63 @@ export function makeProviderHealthLive(options?: { readonly providerUpdateTimeou
             }
           : baseEnv;
         const prepared = prepareWindowsSafeProcess(input.command, input.args, { env: updateEnv });
-        const child = yield* spawner.spawn(
-          ChildProcess.make(prepared.command, prepared.args, {
-            shell: prepared.shell,
-            ...(prepared.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
-            env: updateEnv,
+        const supervised = yield* Effect.uninterruptible(
+          Effect.gen(function* () {
+            const child = yield* spawner.spawn(
+              ChildProcess.make(prepared.command, prepared.args, {
+                detached: OS.platform() !== "win32",
+                shell: prepared.shell,
+                ...(prepared.windowsVerbatimArguments
+                  ? { windowsVerbatimArguments: true }
+                  : {}),
+                env: updateEnv,
+              }),
+            );
+            let processSupervisor: ReturnType<typeof superviseEffectProcessTree> | null = null;
+            let completed = false;
+            yield* Effect.addFinalizer(() =>
+              completed
+                ? Effect.void
+                : Effect.tryPromise({
+                    try: () =>
+                      processSupervisor === null
+                        ? teardownEffectProcessTree(child, teardownProcessTree)
+                        : processSupervisor.teardown(),
+                    catch: (error) =>
+                      error instanceof Error ? error : new Error(String(error)),
+                  }).pipe(
+                    Effect.tapError((error) =>
+                      Ref.set(input.teardownFailureRef, error).pipe(
+                        Effect.andThen(
+                          maintenanceGate.latchProvider({
+                            provider: input.provider,
+                            reason: error.message,
+                          }),
+                        ),
+                      ),
+                    ),
+                    Effect.ignore,
+                  ),
+            );
+            const supervisor = superviseEffectProcessTree(child, {
+              ...(options?.processTreeKiller
+                ? { processTreeKiller: options.processTreeKiller }
+                : {}),
+              teardownProcessTree,
+              platform: OS.platform(),
+              ...(OS.platform() === "win32" ? {} : { ownedProcessGroupId: Number(child.pid) }),
+            });
+            processSupervisor = supervisor;
+            return {
+              child,
+              processSupervisor: supervisor,
+              markCompleted: () => {
+                completed = true;
+              },
+            };
           }),
         );
-        yield* Effect.addFinalizer(() => child.kill().pipe(Effect.ignore));
+        const { child, processSupervisor } = supervised;
         const [stdout, stderr, exitCode] = yield* Effect.all(
           [
             collectUint8StreamText({
@@ -2713,6 +3042,11 @@ export function makeProviderHealthLive(options?: { readonly providerUpdateTimeou
           ],
           { concurrency: "unbounded" },
         );
+        yield* Effect.tryPromise({
+          try: () => processSupervisor.proveExit(),
+          catch: (error) => (error instanceof Error ? error : new Error(String(error))),
+        });
+        supervised.markCompleted();
         return {
           stdout: stdout.text,
           stderr: stderr.text,
@@ -2721,6 +3055,69 @@ export function makeProviderHealthLive(options?: { readonly providerUpdateTimeou
           stderrTruncated: stderr.truncated,
         };
       });
+
+      const updateTargetsEqual = (
+        left: NonNullable<ProviderMaintenanceCapabilities["update"]>,
+        right: NonNullable<ProviderMaintenanceCapabilities["update"]>,
+      ): boolean =>
+        left.executable === right.executable &&
+        left.lockKey === right.lockKey &&
+        left.pathPrepend === right.pathPrepend &&
+        left.targetFingerprint === right.targetFingerprint &&
+        left.args.length === right.args.length &&
+        left.args.every((arg, index) => arg === right.args[index]);
+
+      const providerSettingsFingerprint = (
+        provider: ProviderKind,
+        settings: ServerSettings,
+      ): string => JSON.stringify(settings.providers[provider]);
+
+      interface ProviderUpdateSettingsGeneration {
+        readonly revision: number;
+        readonly settings: ServerSettings;
+        readonly capabilities: ProviderMaintenanceCapabilities;
+      }
+
+      const updateEvidenceGenerationMatches = (
+        provider: ProviderKind,
+        expected: ProviderUpdateSettingsGeneration,
+        current: ProviderUpdateSettingsGeneration,
+      ): boolean => {
+        const expectedUpdate = expected.capabilities.update;
+        const currentUpdate = current.capabilities.update;
+        return (
+          expected.revision === current.revision &&
+          providerSettingsFingerprint(provider, expected.settings) ===
+            providerSettingsFingerprint(provider, current.settings) &&
+          expectedUpdate !== null &&
+          currentUpdate !== null &&
+          updateTargetsEqual(expectedUpdate, currentUpdate) &&
+          providerMaintenanceTargetsShareUpdateDestination(
+            expectedUpdate.target,
+            currentUpdate.target,
+          )
+        );
+      };
+
+      const updateDestinationGenerationMatches = (
+        provider: ProviderKind,
+        expected: ProviderUpdateSettingsGeneration,
+        current: ProviderUpdateSettingsGeneration,
+      ): boolean => {
+        const expectedUpdate = expected.capabilities.update;
+        const currentUpdate = current.capabilities.update;
+        return (
+          expected.revision === current.revision &&
+          providerSettingsFingerprint(provider, expected.settings) ===
+            providerSettingsFingerprint(provider, current.settings) &&
+          expectedUpdate !== null &&
+          currentUpdate !== null &&
+          providerMaintenanceTargetsShareUpdateDestination(
+            expectedUpdate.target,
+            currentUpdate.target,
+          )
+        );
+      };
 
       const updateProvider: ProviderHealthShape["updateProvider"] = Effect.fn(
         "ProviderHealth.updateProvider",
@@ -2731,26 +3128,96 @@ export function makeProviderHealthLive(options?: { readonly providerUpdateTimeou
             provider,
             reason: reason instanceof Error ? reason.message : String(reason),
           });
-        const settings = yield* serverSettings.getSettings.pipe(Effect.mapError(toUpdateError));
-        if (!isProviderEnabledForSettings(provider, settings)) {
+        const readUpdateSettingsGeneration = Effect.fn(
+          "readProviderUpdateSettingsGeneration",
+        )(function* () {
+          const snapshot = yield* serverSettings.getSnapshot.pipe(Effect.mapError(toUpdateError));
+          const capabilities = yield* resolveProviderMaintenanceCapabilitiesForSettings(
+            provider,
+            snapshot.settings,
+          ).pipe(Effect.mapError(toUpdateError));
+          return {
+            revision: snapshot.revision,
+            settings: snapshot.settings,
+            capabilities,
+          } satisfies ProviderUpdateSettingsGeneration;
+        });
+        const initialGeneration = yield* readUpdateSettingsGeneration();
+        const initialSettings = initialGeneration.settings;
+        if (!isProviderEnabledForSettings(provider, initialSettings)) {
           return yield* new ServerProviderUpdateError({
             provider,
             reason: "Provider is disabled in Synara settings.",
           });
         }
-        const capabilities = yield* getProviderMaintenanceCapabilities(provider).pipe(
-          Effect.mapError(toUpdateError),
-        );
-        const update = capabilities.update;
-        if (!update) {
+        const initialCapabilities = initialGeneration.capabilities;
+        const initialUpdate = initialCapabilities.update;
+        if (!initialUpdate) {
           return yield* new ServerProviderUpdateError({
             provider,
             reason: "This provider does not support one-click updates.",
           });
         }
 
+        const jobBeganRef = yield* Ref.make(false);
+        const terminalStateWrittenRef = yield* Ref.make(false);
+        const startedAtRef = yield* Ref.make<string | null>(null);
+        const teardownFailureRef = yield* Ref.make<Error | null>(null);
+
+        const markTerminal = Effect.fn("markProviderUpdateTerminal")(function* (input: {
+          readonly status: Extract<
+            ServerProviderUpdateState["status"],
+            | "already_current"
+            | "failed"
+            | "succeeded"
+            | "still_outdated"
+            | "unchanged"
+            | "unverified"
+          >;
+          readonly message: string;
+          readonly output?: string | null;
+          readonly providerStatus?: ServerProviderStatus;
+        }) {
+          return yield* Effect.uninterruptible(
+            Effect.gen(function* () {
+              const finishedAt = yield* nowIso;
+              const startedAt = yield* Ref.get(startedAtRef);
+              const providers = yield* commitProviderState(provider, {
+                updateState: makeUpdateState({
+                  status: input.status,
+                  startedAt,
+                  finishedAt,
+                  message: input.message,
+                  output: input.output ?? null,
+                }),
+                ...(input.providerStatus !== undefined
+                  ? { status: input.providerStatus }
+                  : {}),
+              });
+              yield* Ref.set(terminalStateWrittenRef, true);
+              return providers;
+            }),
+          );
+        });
+
         const run = Effect.gen(function* () {
+          const lockedGeneration = yield* readUpdateSettingsGeneration();
+          const lockedSettings = lockedGeneration.settings;
+          const lockedCapabilities = lockedGeneration.capabilities;
+          const lockedUpdate = lockedCapabilities.update;
+          if (!lockedUpdate || !updateEvidenceGenerationMatches(provider, initialGeneration, lockedGeneration)) {
+            const providers = yield* markTerminal({
+              status: "failed",
+              message: "Provider settings or the resolved install target changed while the update was queued. Retry the update.",
+            });
+            return { providers };
+          }
+
+          const usesExternalServer =
+            (provider === KILO_PROVIDER || provider === OPENCODE_PROVIDER) &&
+            lockedSettings.providers[provider].serverUrl.trim().length > 0;
           const startedAt = yield* nowIso;
+          yield* Ref.set(startedAtRef, startedAt);
           yield* setProviderUpdateState(
             provider,
             makeUpdateState({
@@ -2761,88 +3228,253 @@ export function makeProviderHealthLive(options?: { readonly providerUpdateTimeou
             }),
           );
 
-          const commandResult = yield* runUpdateCommand({
-            provider,
-            command: update.executable,
-            args: update.args,
-            ...(update.pathPrepend ? { pathPrepend: update.pathPrepend } : {}),
-          }).pipe(
-            Effect.scoped,
-            Effect.timeoutOption(Duration.millis(providerUpdateTimeoutMs)),
-            Effect.result,
-          );
-          const finishedAt = yield* nowIso;
-          if (Result.isFailure(commandResult)) {
-            const providers = yield* setProviderUpdateState(
+          const beforeStatus = yield* checkProviderStatusForSettings(lockedSettings, provider);
+          const beforeVersion = beforeStatus.version ?? null;
+          const stableGeneration = yield* readUpdateSettingsGeneration();
+          const stableCapabilities = stableGeneration.capabilities;
+          const stableUpdate = stableCapabilities.update;
+          if (
+            !stableUpdate ||
+            !updateEvidenceGenerationMatches(provider, lockedGeneration, stableGeneration)
+          ) {
+            const providers = yield* markTerminal({
+              status: "failed",
+              message: "Provider settings or the resolved install target changed during pre-update verification. Retry the update.",
+            });
+            return { providers };
+          }
+
+          const preflightStatus = yield* enrichProviderStatusWithVersionAdvisory(
+            beforeStatus,
+            stableCapabilities,
+            { forceRefresh: true },
+          ).pipe(Effect.catch(() => Effect.succeed(beforeStatus)));
+          const preflightDecisionGeneration = yield* readUpdateSettingsGeneration();
+          if (
+            !updateEvidenceGenerationMatches(
               provider,
-              makeUpdateState({
-                status: "failed",
-                startedAt,
-                finishedAt,
-                message: describeUpdateCommandError(commandResult.failure),
+              stableGeneration,
+              preflightDecisionGeneration,
+            )
+          ) {
+            const providers = yield* markTerminal({
+              status: "failed",
+              message:
+                "Provider settings or the resolved install target changed during pre-update verification. Retry the update.",
+            });
+            return { providers };
+          }
+          if (preflightStatus.versionAdvisory?.status === "current") {
+            const providers = yield* markTerminal({
+              status: "already_current",
+              message: "Provider CLI is already current; no update command was run.",
+              providerStatus: preflightStatus,
+            });
+            return { providers };
+          }
+          yield* commitProviderState(provider, { status: preflightStatus });
+
+          const commandResult = yield* maintenanceGate
+            .withExclusiveMaintenance({
+              provider,
+              latchReasonOnFailure: (cause) =>
+                findUnprovenProcessExit(Cause.squash(cause))?.message ?? null,
+              run: Effect.gen(function* () {
+                const gatedGeneration = yield* readUpdateSettingsGeneration();
+                const gatedCapabilities = gatedGeneration.capabilities;
+                const gatedUpdate = gatedCapabilities.update;
+                if (
+                  !gatedUpdate ||
+                  !updateEvidenceGenerationMatches(
+                    provider,
+                    preflightDecisionGeneration,
+                    gatedGeneration,
+                  )
+                ) {
+                  return yield* new ServerProviderUpdateError({
+                    provider,
+                    reason:
+                      "Provider settings or the resolved install target changed before runtime shutdown. Retry the update.",
+                  });
+                }
+                if (provider !== PI_PROVIDER) {
+                  yield* quiesceProviderRuntimesForUpdate({
+                    provider,
+                    providerService,
+                    stopIdleSessions:
+                      provider !== KILO_PROVIDER && provider !== OPENCODE_PROVIDER,
+                  });
+                }
+                yield* maintenanceOwnedResources.drainProviderResources({ provider });
+                const commandGeneration = yield* readUpdateSettingsGeneration();
+                const commandCapabilities = commandGeneration.capabilities;
+                const commandUpdate = commandCapabilities.update;
+                if (
+                  !commandUpdate ||
+                  !updateEvidenceGenerationMatches(
+                    provider,
+                    gatedGeneration,
+                    commandGeneration,
+                  )
+                ) {
+                  return yield* new ServerProviderUpdateError({
+                    provider,
+                    reason:
+                      "Provider settings or the resolved install target changed while owned runtimes were stopping. Retry the update.",
+                  });
+                }
+                return yield* runUpdateCommand({
+                  provider,
+                  command: commandUpdate.executable,
+                  args: commandUpdate.args,
+                  ...(commandUpdate.pathPrepend
+                    ? { pathPrepend: commandUpdate.pathPrepend }
+                    : {}),
+                  teardownFailureRef,
+                }).pipe(Effect.scoped);
               }),
-            );
+            })
+            .pipe(Effect.result);
+          if (Result.isFailure(commandResult)) {
+            const unprovenExit = findUnprovenProcessExit(commandResult.failure);
+            if (unprovenExit) {
+              yield* maintenanceGate.latchProvider({
+                provider,
+                reason: unprovenExit.message,
+              });
+            }
+            const providers = yield* markTerminal({
+              status: "failed",
+              message: unprovenExit
+                ? `${describeUpdateCommandError(commandResult.failure)} Restart Synara before using this provider again.`
+                : describeUpdateCommandError(commandResult.failure),
+            });
             return { providers };
           }
           const result = commandResult.success;
-          const output = Option.isSome(result)
-            ? [result.value.stderr, result.value.stdout].filter(Boolean).join("\n\n").trim() || null
-            : null;
-          const failed = Option.isNone(result) || result.value.exitCode !== 0;
-          if (failed) {
-            const message = Option.isNone(result)
-              ? `Update timed out after ${formatProviderUpdateTimeout(providerUpdateTimeoutMs)}. The provider process was stopped.`
-              : `Update command exited with code ${result.value.exitCode}.`;
-            const providers = yield* setProviderUpdateState(
-              provider,
-              makeUpdateState({
-                status: "failed",
-                startedAt,
-                finishedAt,
-                message,
-                output: output ? output.slice(0, UPDATE_OUTPUT_MAX_BYTES) : null,
-              }),
-            );
+          const output =
+            [result.stderr, result.stdout].filter(Boolean).join("\n\n").trim() || null;
+          if (result.exitCode !== 0) {
+            const providers = yield* markTerminal({
+              status: "failed",
+              message: `Update command exited with code ${result.exitCode}.`,
+              output: output ? output.slice(0, UPDATE_OUTPUT_MAX_BYTES) : null,
+            });
             return { providers };
           }
 
-          const providers = yield* refreshNow.pipe(Effect.mapError(toUpdateError));
-          const refreshed = providers.find((status) => status.provider === provider);
-          const refreshedAdvisory = refreshed?.versionAdvisory;
-          const stillOutdated = refreshedAdvisory?.status === "behind_latest";
-          const stillOutdatedVersions =
-            refreshedAdvisory?.currentVersion && refreshedAdvisory.latestVersion
-              ? ` (installed ${refreshedAdvisory.currentVersion}, latest ${refreshedAdvisory.latestVersion})`
-              : "";
-          const finalProviders = yield* setProviderUpdateState(
+          const postProbeGeneration = yield* readUpdateSettingsGeneration();
+          const postSettings = postProbeGeneration.settings;
+          const postCapabilities = postProbeGeneration.capabilities;
+          const postUpdate = postCapabilities.update;
+          const targetChangedBeforePostProbe =
+            !postUpdate ||
+            !updateDestinationGenerationMatches(
+              provider,
+              stableGeneration,
+              postProbeGeneration,
+            );
+          const afterStatus = yield* checkProviderStatusForSettings(postSettings, provider);
+          const postStatus = yield* enrichProviderStatusWithVersionAdvisory(
+            afterStatus,
+            postCapabilities,
+            { forceRefresh: true },
+          ).pipe(Effect.catch(() => Effect.succeed(afterStatus)));
+          const postDecisionGeneration = yield* readUpdateSettingsGeneration();
+          const postEvidenceGenerationChanged = !updateEvidenceGenerationMatches(
             provider,
-            makeUpdateState({
-              status: stillOutdated ? "unchanged" : "succeeded",
-              startedAt,
-              finishedAt,
-              message: stillOutdated
-                ? `Update command completed, but Synara still detects an outdated provider version${stillOutdatedVersions}.`
-                : "Provider updated.",
-              output: output ? output.slice(0, UPDATE_OUTPUT_MAX_BYTES) : null,
-            }),
+            postProbeGeneration,
+            postDecisionGeneration,
           );
+          const targetChanged = targetChangedBeforePostProbe || postEvidenceGenerationChanged;
+          const afterVersion = afterStatus.version ?? null;
+          const configuredBinaryUnavailable = !afterStatus.available;
+          const postAdvisory = postStatus.versionAdvisory;
+          const stillOutdated = postAdvisory?.status === "behind_latest";
+          const stillOutdatedVersions =
+            postAdvisory?.currentVersion && postAdvisory.latestVersion
+              ? ` (installed ${postAdvisory.currentVersion}, latest ${postAdvisory.latestVersion})`
+              : "";
+          const verifiedUpgrade =
+            beforeVersion !== null &&
+            afterVersion !== null &&
+            compareSemverVersions(afterVersion, beforeVersion) > 0;
+          const outcome = classifyCompletedProviderUpdate({
+            provider,
+            configuredBinaryUnavailable,
+            ...(afterStatus.message ? { configuredBinaryMessage: afterStatus.message } : {}),
+            targetChanged,
+            beforeVersion,
+            afterVersion,
+            verifiedUpgrade,
+            stillOutdated,
+            currentReported: postAdvisory?.status === "current",
+            stillOutdatedVersions,
+            usesExternalServer,
+          });
+          const finalProviders = yield* markTerminal({
+            status: outcome.status,
+            message: outcome.message,
+            output: output ? output.slice(0, UPDATE_OUTPUT_MAX_BYTES) : null,
+            ...(!targetChanged ? { providerStatus: postStatus } : {}),
+          });
           return { providers: finalProviders };
         });
 
-        return yield* commandCoordinator.withCommandLock({
-          targetKey: provider,
-          lockKey: update.lockKey,
-          onQueued: setProviderUpdateState(
-            provider,
-            makeUpdateState({
-              status: "queued",
-              startedAt: null,
-              finishedAt: null,
-              message: "Waiting for another provider update to finish.",
-            }),
-          ).pipe(Effect.asVoid),
-          run,
-        });
+        const execute = Effect.gen(function* () {
+          const result = yield* commandCoordinator
+            .withCommandLock({
+              targetKey: provider,
+              lockKey: initialUpdate.lockKey,
+              canonicalInstallRoot: initialUpdate.target.canonicalInstallRoot,
+              onQueued: Ref.set(jobBeganRef, true).pipe(
+                Effect.andThen(
+                  setProviderUpdateState(
+                    provider,
+                    makeUpdateState({
+                      status: "queued",
+                      startedAt: null,
+                      finishedAt: null,
+                      message: "Waiting for another provider update to finish.",
+                    }),
+                  ),
+                ),
+                Effect.asVoid,
+              ),
+              run,
+            })
+            .pipe(Effect.timeoutOption(Duration.millis(providerUpdateTimeoutMs)));
+          if (Option.isSome(result)) {
+            return result.value;
+          }
+          const teardownFailure = yield* Ref.get(teardownFailureRef);
+          const providers = yield* markTerminal({
+            status: "failed",
+            message: teardownFailure
+              ? `Update timed out and process exit could not be proven. Restart Synara before using '${provider}' again. ${teardownFailure.message}`
+              : `Update job timed out after ${formatProviderUpdateTimeout(providerUpdateTimeoutMs)}. It was canceled, and any spawned updater process tree was stopped before provider access resumed.`,
+          });
+          return { providers };
+        }).pipe(
+          Effect.onExit(() =>
+            Effect.gen(function* () {
+              const began = yield* Ref.get(jobBeganRef);
+              const terminalStateWritten = yield* Ref.get(terminalStateWrittenRef);
+              if (!began || terminalStateWritten) {
+                return;
+              }
+              const teardownFailure = yield* Ref.get(teardownFailureRef);
+              yield* markTerminal({
+                status: "failed",
+                message: teardownFailure
+                  ? `Update ended without proven process exit. Restart Synara before using '${provider}' again. ${teardownFailure.message}`
+                  : "Update was interrupted before completion. Retry after checking the provider status.",
+              });
+            }).pipe(Effect.ignore),
+          ),
+        );
+
+        return yield* execute;
       });
 
       return {
