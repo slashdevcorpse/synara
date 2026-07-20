@@ -16,6 +16,7 @@ import { type ThreadId } from "@synara/contracts";
 import { type TerminalActivityState, type TerminalCliKind } from "@synara/shared/terminalThreads";
 import { Terminal } from "@xterm/xterm";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useAppSettings } from "~/appSettings";
 import { type TerminalContextSelection } from "~/lib/terminalContext";
 import { readNativeApi } from "~/nativeApi";
 import {
@@ -113,6 +114,7 @@ interface TerminalViewportProps {
   terminalCliKind?: TerminalCliKind | null;
   cwd: string;
   runtimeEnv?: Record<string, string>;
+  terminalRightClickToPaste: boolean;
   onSessionExited: () => void;
   onTerminalMetadataChange: (
     terminalId: string,
@@ -135,6 +137,7 @@ function TerminalViewport({
   terminalCliKind = null,
   cwd,
   runtimeEnv,
+  terminalRightClickToPaste,
   onSessionExited,
   onTerminalMetadataChange,
   onTerminalActivityChange,
@@ -177,6 +180,7 @@ function TerminalViewport({
       terminalLabel,
       terminalCliKind,
       cwd,
+      terminalRightClickToPaste,
       ...(runtimeEnvPayload ? { runtimeEnv: runtimeEnvPayload } : {}),
       callbacks: {
         onSessionExited,
@@ -199,6 +203,7 @@ function TerminalViewport({
       terminalCliKind,
       terminalId,
       terminalLabel,
+      terminalRightClickToPaste,
       threadId,
     ],
   );
@@ -532,6 +537,7 @@ export default function ThreadTerminalDrawer({
   onTogglePanel,
   isPanelOpen,
 }: ThreadTerminalDrawerProps) {
+  const { settings } = useAppSettings();
   const isWorkspaceMode = presentationMode === "workspace";
   const previousRuntimeKeysRef = useRef<Set<string>>(new Set());
   const { drawerHeight, handleResizePointerDown, handleResizePointerMove, handleResizePointerEnd } =
@@ -734,6 +740,7 @@ export default function ThreadTerminalDrawer({
                   terminalCliKind={terminalVisualIdentityById.get(terminalId)?.cliKind ?? null}
                   cwd={cwd}
                   {...(runtimeEnv ? { runtimeEnv } : {})}
+                  terminalRightClickToPaste={settings.terminalRightClickToPaste}
                   onSessionExited={() => onCloseTerminal(terminalId)}
                   onTerminalMetadataChange={onTerminalMetadataChange}
                   onTerminalActivityChange={onTerminalActivityChange}

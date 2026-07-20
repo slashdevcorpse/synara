@@ -354,6 +354,7 @@ import { useTemporaryThreadStore } from "../temporaryThreadStore";
 import { useComposerFocusRequestStore } from "../composerFocusRequestStore";
 import { useWorkflowRunUiStore, useWorkflowRunUiThreadState } from "../workflowRunUiStore";
 import { appendComposerPromptText } from "../lib/chatReferences";
+import { canAcceptComposerFileReferenceDrop } from "../lib/composerFileReferenceDrag";
 import {
   appendOriginalComposerPromptBlocks,
   appendTerminalContextsToPrompt,
@@ -6840,6 +6841,10 @@ export default function ChatView({
     onComposerDragOver,
     onComposerDragLeave,
     onComposerDrop,
+    onComposerReferenceDragEnterCapture,
+    onComposerReferenceDragOverCapture,
+    onComposerReferenceDragLeaveCapture,
+    onComposerReferenceDropCapture,
   } = useComposerDropzone({
     addImages: addComposerImages,
     fileSupport: {
@@ -6847,6 +6852,21 @@ export default function ChatView({
       addFiles: addComposerFiles,
     },
     appendReferenceText: (referenceText) => appendComposerPromptText(threadId, referenceText),
+    canAppendReferenceText: () =>
+      !sendPreflightInFlightRef.current &&
+      canAcceptComposerFileReferenceDrop({
+        isConnecting,
+        isComposerApprovalState,
+        isSendBusy,
+        pendingUserInputCount: pendingUserInputs.length,
+      }),
+    onReferenceDropRejected: () => {
+      toastManager.add({
+        type: "error",
+        title: "Unable to add to chat",
+        description: "The composer is busy. Try again when it is ready.",
+      });
+    },
     appendPathMentions: (paths) => {
       for (const absolutePath of paths) {
         appendComposerPromptText(threadId, formatComposerMentionToken(absolutePath));
@@ -11499,6 +11519,10 @@ export default function ChatView({
         "relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden",
         CHAT_BACKGROUND_CLASS_NAME,
       )}
+      onDragEnterCapture={onComposerReferenceDragEnterCapture}
+      onDragOverCapture={onComposerReferenceDragOverCapture}
+      onDragLeaveCapture={onComposerReferenceDragLeaveCapture}
+      onDropCapture={onComposerReferenceDropCapture}
       onDragEnter={onComposerDragEnter}
       onDragOver={onComposerDragOver}
       onDragLeave={onComposerDragLeave}
