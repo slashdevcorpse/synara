@@ -140,7 +140,13 @@ function verifyReleaseScopeCase(preflightJob: UnknownRecord): void {
   const expectedArms = new Map<string, readonly string[]>([
     [WINDOWS_RELEASE_SCOPE, ["include_macos=false", "asset_count=6"]],
     [MACOS_RELEASE_SCOPE, ["include_macos=true", "asset_count=8"]],
+    ["*", ['echo "Unsupported release scope: $RELEASE_SCOPE" >&2', "exit 1"]],
   ]);
+  if (JSON.stringify([...arms.keys()]) !== JSON.stringify([...expectedArms.keys()])) {
+    throw new Error(
+      "Publication release-scope case must define the exact ordered windows-only, windows-and-macos, and rejecting wildcard arms.",
+    );
+  }
   for (const [scope, expectedCommands] of expectedArms) {
     if (JSON.stringify(arms.get(scope)) !== JSON.stringify(expectedCommands)) {
       throw new Error(

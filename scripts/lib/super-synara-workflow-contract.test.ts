@@ -348,6 +348,43 @@ describe("Super Synara workflow contracts", () => {
         audit,
       ),
     ).toThrow("must map windows-and-macos to include_macos=true and asset_count=8");
+
+    const exactScopeArms = `            windows-only)
+              include_macos=false
+              asset_count=6
+              ;;
+            windows-and-macos)
+              include_macos=true
+              asset_count=8
+              ;;
+            *)
+              echo "Unsupported release scope: $RELEASE_SCOPE" >&2
+              exit 1
+              ;;`;
+    const wildcardFirstScopeArms = `            *)
+              echo "Unsupported release scope: $RELEASE_SCOPE" >&2
+              exit 1
+              ;;
+            windows-only)
+              include_macos=false
+              asset_count=6
+              ;;
+            windows-and-macos)
+              include_macos=true
+              asset_count=8
+              ;;`;
+    expect(() =>
+      verifySuperSynaraWorkflowText(main.replace(exactScopeArms, wildcardFirstScopeArms), audit),
+    ).toThrow("exact ordered windows-only, windows-and-macos, and rejecting wildcard arms");
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          '              echo "Unsupported release scope: $RELEASE_SCOPE" >&2\n              exit 1',
+          "              include_macos=false\n              asset_count=6",
+        ),
+        audit,
+      ),
+    ).toThrow("must map *");
   });
 
   it("rejects removal of native Windows installer lifecycle qualification", () => {
