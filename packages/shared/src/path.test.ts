@@ -61,28 +61,16 @@ describe("workspaceRelativePathOf", () => {
     const workspaceRoot = "\\\\server\\share\\workspace";
 
     expect(
-      workspaceRelativePathOf(
-        "\\\\server\\share\\workspace\\src\\page.tsx",
-        workspaceRoot,
-      ),
+      workspaceRelativePathOf("\\\\server\\share\\workspace\\src\\page.tsx", workspaceRoot),
     ).toBe("src/page.tsx");
     expect(
-      workspaceRelativePathOf(
-        "\\\\server\\share\\workspace-other\\page.tsx",
-        workspaceRoot,
-      ),
+      workspaceRelativePathOf("\\\\server\\share\\workspace-other\\page.tsx", workspaceRoot),
     ).toBeNull();
     expect(
-      workspaceRelativePathOf(
-        "\\\\server\\other-share\\workspace\\page.tsx",
-        workspaceRoot,
-      ),
+      workspaceRelativePathOf("\\\\server\\other-share\\workspace\\page.tsx", workspaceRoot),
     ).toBeNull();
     expect(
-      workspaceRelativePathOf(
-        "\\\\backup-server\\share\\workspace\\page.tsx",
-        workspaceRoot,
-      ),
+      workspaceRelativePathOf("\\\\backup-server\\share\\workspace\\page.tsx", workspaceRoot),
     ).toBeNull();
   });
 

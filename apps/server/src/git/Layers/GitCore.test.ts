@@ -7,6 +7,7 @@ import path from "node:path";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
+import { splitLines } from "@synara/shared/text";
 import { Effect, FileSystem, Layer, PlatformError, Schema, Scope } from "effect";
 import { describe, expect, vi } from "vitest";
 
@@ -15,7 +16,6 @@ import { GitCore, type GitCoreShape } from "../Services/GitCore.ts";
 import { GitCheckoutDirtyWorktreeError, GitCommandError } from "../Errors.ts";
 import { type ProcessRunResult, runProcess } from "../../processRunner.ts";
 import { ServerConfig } from "../../config.ts";
-import { splitLines } from "@synara/shared/text";
 
 // ── Helpers ──
 

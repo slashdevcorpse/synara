@@ -197,9 +197,7 @@ export const AppSettingsSchema = Schema.Struct({
   confirmThreadDelete: Schema.Boolean.pipe(withDefaults(() => true)),
   confirmThreadArchive: Schema.Boolean.pipe(withDefaults(() => false)),
   confirmTerminalTabClose: Schema.Boolean.pipe(withDefaults(() => true)),
-  terminalRightClickToPaste: Schema.Boolean.pipe(
-    withDefaults(getDefaultTerminalRightClickToPaste),
-  ),
+  terminalRightClickToPaste: Schema.Boolean.pipe(withDefaults(getDefaultTerminalRightClickToPaste)),
   diffWordWrap: Schema.Boolean.pipe(withDefaults(() => false)),
   // Local-only UI preferences for hiding sidebar surfaces a user doesn't want.
   // `showChatsSection` controls the standalone "Chats" list in the sidebar footer

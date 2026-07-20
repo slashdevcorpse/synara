@@ -26,11 +26,7 @@ describe("isLexicallyContainedPath", () => {
     const workspaceRoot = "\\\\server\\share\\workspace";
 
     expect(
-      isLexicallyContainedPath(
-        workspaceRoot,
-        "\\\\server\\share\\workspace\\src\\index.ts",
-        win32,
-      ),
+      isLexicallyContainedPath(workspaceRoot, "\\\\server\\share\\workspace\\src\\index.ts", win32),
     ).toBe(true);
     expect(
       isLexicallyContainedPath(

@@ -1,10 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
-type ContainmentPathFlavor = Pick<
-  typeof path,
-  "isAbsolute" | "relative" | "resolve" | "sep"
->;
+type ContainmentPathFlavor = Pick<typeof path, "isAbsolute" | "relative" | "resolve" | "sep">;
 
 function isContainedPath(
   realRoot: string,
