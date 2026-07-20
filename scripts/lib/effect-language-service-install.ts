@@ -2,6 +2,8 @@
 // Purpose: Keeps the Effect TypeScript patch single-owner and isolated from Bun's package cache.
 // Layer: Repository install policy
 
+import { spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import {
   chmodSync,
   copyFileSync,
@@ -12,7 +14,6 @@ import {
   statSync,
 } from "node:fs";
 import { basename, dirname, isAbsolute, relative, resolve } from "node:path";
-import { randomUUID } from "node:crypto";
 
 import { RELEASE_WORKSPACE_MANIFEST_PATHS } from "./release-workspace-manifests.ts";
 
@@ -119,4 +120,35 @@ export function makeEffectLanguageServicePatchTargetsPrivate(
     }
   }
   return replaced;
+}
+
+export function prepareEffectLanguageServiceInstall(repoRoot: string): void {
+  verifyRepositoryEffectLanguageServiceInstallPolicy(repoRoot);
+  const privateTargets = makeEffectLanguageServicePatchTargetsPrivate(
+    resolveEffectLanguageServicePatchDirectory(repoRoot),
+  );
+  if (privateTargets.length > 0) {
+    console.log(
+      `Isolated ${privateTargets.length} TypeScript patch targets from Bun's package cache.`,
+    );
+  }
+
+  const cliPath = resolve(repoRoot, "node_modules/@effect/language-service/cli.js");
+  for (const command of ["patch", "check"]) {
+    const result = spawnSync(process.execPath, [cliPath, command], {
+      cwd: repoRoot,
+      stdio: "inherit",
+      shell: false,
+    });
+    if (result.error) {
+      throw new Error(
+        `Unable to start the Effect language service ${command}: ${result.error.message}`,
+      );
+    }
+    if (result.status !== 0) {
+      throw new Error(
+        `Effect language service ${command} exited with status ${result.status ?? "unknown"}.`,
+      );
+    }
+  }
 }
