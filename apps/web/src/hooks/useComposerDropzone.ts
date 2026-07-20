@@ -3,9 +3,13 @@
 // Layer: Web composer hook
 // Exports: useComposerDropzone
 
-import { useRef, type ClipboardEvent, type DragEvent } from "react";
+import { useCallback, useEffect, useRef, type ClipboardEvent, type DragEvent } from "react";
 
 import { CHAT_FILE_REFERENCE_DRAG_TYPE } from "~/lib/chatReferences";
+import {
+  claimComposerFileReferenceDragEvent,
+  makeComposerFileReferenceDragHandlers,
+} from "~/lib/composerFileReferenceDrag";
 import { isDroppedComposerDirectory, splitDroppedComposerFiles } from "~/lib/composerDropPaths";
 
 export interface ComposerDropzoneFileSplit {
@@ -121,6 +125,8 @@ export function useComposerDropzone(input: {
         readonly genericFiles: "fallthrough";
       };
   readonly appendReferenceText?: ((text: string) => void) | undefined;
+  readonly canAppendReferenceText?: boolean | undefined;
+  readonly onReferenceDropRejected?: (() => void) | undefined;
   /** Absolute paths from desktop OS drops that should become @mentions (folders). */
   readonly appendPathMentions?: ((paths: readonly string[]) => void) | undefined;
   readonly focusComposer?: (() => void) | undefined;
@@ -131,6 +137,8 @@ export function useComposerDropzone(input: {
     addImages,
     fileSupport,
     appendReferenceText,
+    canAppendReferenceText = true,
+    onReferenceDropRejected,
     appendPathMentions,
     focusComposer,
     setIsDragOverComposer,
@@ -155,10 +163,32 @@ export function useComposerDropzone(input: {
     return true;
   };
 
-  const resetComposerDragState = () => {
+  const resetComposerDragState = useCallback(() => {
     writeDragDepth(dragDepthRef, 0);
     setIsDragOverComposer(false);
+  }, [dragDepthRef, setIsDragOverComposer]);
+
+  const insertReferenceText = (referenceText: string): boolean => {
+    if (!appendReferenceText || !canAppendReferenceText) {
+      return false;
+    }
+    appendReferenceText(referenceText);
+    return true;
   };
+
+  const composerFileReferenceDragHandlers = makeComposerFileReferenceDragHandlers({
+    insertReferenceText,
+    setDragActive: setIsDragOverComposer,
+    resetDragState: resetComposerDragState,
+    onInsertRejected: () => onReferenceDropRejected?.(),
+  });
+
+  // Escape/cancel can end an in-page drag without a dragleave on the chat pane.
+  // The explorer source always emits dragend, so use it as the final cleanup.
+  useEffect(() => {
+    window.addEventListener("dragend", resetComposerDragState);
+    return () => window.removeEventListener("dragend", resetComposerDragState);
+  }, [resetComposerDragState]);
 
   const onComposerPaste = (event: ClipboardEvent<HTMLElement>) => {
     const handled = handleSplitFiles(splitComposerDropzoneFiles(event.clipboardData.files));
@@ -191,12 +221,32 @@ export function useComposerDropzone(input: {
     resetComposerDragState();
   };
 
+  // Explorer reference drags are claimed during capture so Lexical never sees
+  // their text/plain fallback. OS Files drags deliberately bypass these handlers
+  // and continue through the existing attachment drop path below.
+  const onComposerReferenceDragEnterCapture = (event: DragEvent<HTMLDivElement>) => {
+    composerFileReferenceDragHandlers.onDragEnter(event);
+  };
+
+  const onComposerReferenceDragOverCapture = (event: DragEvent<HTMLDivElement>) => {
+    composerFileReferenceDragHandlers.onDragOver(event);
+  };
+
+  const onComposerReferenceDragLeaveCapture = (event: DragEvent<HTMLDivElement>) => {
+    if (!claimComposerFileReferenceDragEvent(event)) return;
+    if (isComposerDropzoneInternalDragTransition(event.currentTarget, event.relatedTarget)) {
+      return;
+    }
+    resetComposerDragState();
+  };
+
+  const onComposerReferenceDropCapture = (event: DragEvent<HTMLDivElement>) => {
+    composerFileReferenceDragHandlers.onDrop(event);
+  };
+
   const onComposerDrop = (event: DragEvent<HTMLDivElement>) => {
-    const referenceText = event.dataTransfer.getData(CHAT_FILE_REFERENCE_DRAG_TYPE);
-    if (referenceText) {
-      event.preventDefault();
-      resetComposerDragState();
-      appendReferenceText?.(referenceText);
+    if (event.dataTransfer.types.includes(CHAT_FILE_REFERENCE_DRAG_TYPE)) {
+      composerFileReferenceDragHandlers.onDrop(event);
       return;
     }
     if (!event.dataTransfer.types.includes("Files")) {
@@ -238,6 +288,10 @@ export function useComposerDropzone(input: {
     onComposerDragOver,
     onComposerDragLeave,
     onComposerDrop,
+    onComposerReferenceDragEnterCapture,
+    onComposerReferenceDragOverCapture,
+    onComposerReferenceDragLeaveCapture,
+    onComposerReferenceDropCapture,
     resetComposerDragState,
   };
 }
