@@ -461,9 +461,11 @@ describe("desktop backend restart integration", () => {
       "async function shutdownDesktopRuntime(",
       "function requestGracefulAppQuit(",
     );
-    expect(shutdown.indexOf("backendRestartController.dispose()"))
-      .toBeLessThan(shutdown.indexOf("await stopBackendAndWaitForExit()"));
-    expect(shutdown.indexOf("cancelBackendGenerationReadinessWait()"))
-      .toBeLessThan(shutdown.indexOf("await stopBackendAndWaitForExit()"));
+    expect(shutdown.indexOf("backendRestartController.dispose()")).toBeLessThan(
+      shutdown.indexOf("await stopBackendAndWaitForExit()"),
+    );
+    expect(shutdown.indexOf("cancelBackendGenerationReadinessWait()")).toBeLessThan(
+      shutdown.indexOf("await stopBackendAndWaitForExit()"),
+    );
   });
 });

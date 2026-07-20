@@ -21,12 +21,7 @@ export interface BackendRestartGeneration {
   readonly reason: string;
 }
 
-export type BackendRestartCircuitState =
-  | "closed"
-  | "open"
-  | "half-open"
-  | "latched"
-  | "disposed";
+export type BackendRestartCircuitState = "closed" | "open" | "half-open" | "latched" | "disposed";
 
 export type BackendRestartGenerationPhase = "starting" | "ready" | "stable";
 
@@ -69,10 +64,7 @@ export interface BackendRestartControllerOptions {
   readonly onRestartDue: (request: BackendRestartRequest) => void;
   readonly onGenerationStable?: (generation: BackendRestartGeneration) => void;
   readonly now?: () => number;
-  readonly setTimer?: (
-    callback: () => void,
-    delayMs: number,
-  ) => ReturnType<typeof setTimeout>;
+  readonly setTimer?: (callback: () => void, delayMs: number) => ReturnType<typeof setTimeout>;
   readonly clearTimer?: (timer: ReturnType<typeof setTimeout>) => void;
 }
 
@@ -121,8 +113,7 @@ export class BackendRestartController {
     if (this.activeGeneration) {
       return {
         type: "denied",
-        reason:
-          this.circuitState === "half-open" ? "half-open-active" : "generation-active",
+        reason: this.circuitState === "half-open" ? "half-open-active" : "generation-active",
       };
     }
     if (this.retryTimer || this.cooldownTimer) {
@@ -187,9 +178,7 @@ export class BackendRestartController {
     this.activeGeneration = null;
     const now = this.now();
     const windowStart = now - BACKEND_RESTART_POLICY.failureWindowMs;
-    this.failureTimestamps = this.failureTimestamps.filter(
-      (timestamp) => timestamp >= windowStart,
-    );
+    this.failureTimestamps = this.failureTimestamps.filter((timestamp) => timestamp >= windowStart);
     this.failureTimestamps.push(now);
 
     if (generation.kind === "half-open" && failedPhase !== "stable") {
@@ -330,9 +319,7 @@ export class BackendRestartController {
 
   private pruneFailureWindow(): void {
     const windowStart = this.now() - BACKEND_RESTART_POLICY.failureWindowMs;
-    this.failureTimestamps = this.failureTimestamps.filter(
-      (timestamp) => timestamp >= windowStart,
-    );
+    this.failureTimestamps = this.failureTimestamps.filter((timestamp) => timestamp >= windowStart);
   }
 
   private clearRetryTimer(): void {

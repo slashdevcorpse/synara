@@ -518,9 +518,7 @@ async function isBackendStartupReadyResponse(response: Response): Promise<boolea
   }
 }
 
-function cancelBackendGenerationReadinessWait(
-  generation?: BackendRestartGeneration,
-): void {
+function cancelBackendGenerationReadinessWait(generation?: BackendRestartGeneration): void {
   const monitor = backendGenerationReadinessMonitor;
   if (!monitor || (generation && monitor.generation !== generation)) {
     return;
