@@ -621,44 +621,83 @@ describe("ProviderRuntimeIngestion", () => {
     expect(thread.session?.lastError).toBeNull();
   });
 
-  it("clears active turn state when a provider session reports ready", async () => {
-    const harness = await createHarness();
+  it.each(["starting", "running"] as const)(
+    "preserves active turn state when a provider session reports %s",
+    async (state) => {
+      const harness = await createHarness();
+      const turnId = asTurnId(`turn-${state}-preserved`);
 
-    harness.emit({
-      type: "turn.started",
-      eventId: asEventId("evt-turn-started-before-ready"),
-      provider: "opencode",
-      threadId: asThreadId("thread-1"),
-      createdAt: new Date().toISOString(),
-      turnId: asTurnId("turn-ready-clears"),
-    });
+      harness.emit({
+        type: "turn.started",
+        eventId: asEventId(`evt-turn-started-before-${state}`),
+        provider: "codex",
+        threadId: asThreadId("thread-1"),
+        createdAt: "2026-01-01T00:00:00.000Z",
+        turnId,
+      });
 
-    await waitForThread(
-      harness.engine,
-      (thread) =>
-        thread.session?.status === "running" &&
-        thread.session?.activeTurnId === "turn-ready-clears",
-    );
+      await waitForThread(
+        harness.engine,
+        (thread) => thread.session?.status === "running" && thread.session?.activeTurnId === turnId,
+      );
 
-    harness.emit({
-      type: "session.state.changed",
-      eventId: asEventId("evt-session-ready-clears-turn"),
-      provider: "opencode",
-      threadId: asThreadId("thread-1"),
-      createdAt: new Date().toISOString(),
-      turnId: asTurnId("turn-ready-clears"),
-      payload: {
-        state: "ready",
-      },
-    });
+      harness.emit({
+        type: "session.state.changed",
+        eventId: asEventId(`evt-session-${state}-preserves-turn`),
+        provider: "codex",
+        threadId: asThreadId("thread-1"),
+        createdAt: "2026-01-01T00:00:01.000Z",
+        turnId,
+        payload: { state },
+      });
 
-    const thread = await waitForThread(
-      harness.engine,
-      (entry) => entry.session?.status === "ready" && entry.session?.activeTurnId === null,
-    );
-    expect(thread.session?.status).toBe("ready");
-    expect(thread.session?.activeTurnId).toBeNull();
-  });
+      const thread = await waitForThread(
+        harness.engine,
+        (entry) => entry.session?.status === state && entry.session?.activeTurnId === turnId,
+      );
+      expect(thread.session?.status).toBe(state);
+      expect(thread.session?.activeTurnId).toBe(turnId);
+    },
+  );
+
+  it.each(["ready", "stopped", "error"] as const)(
+    "clears active turn state when a provider session reports %s",
+    async (state) => {
+      const harness = await createHarness();
+      const turnId = asTurnId(`turn-${state}-cleared`);
+
+      harness.emit({
+        type: "turn.started",
+        eventId: asEventId(`evt-turn-started-before-${state}`),
+        provider: "codex",
+        threadId: asThreadId("thread-1"),
+        createdAt: "2026-01-01T00:00:00.000Z",
+        turnId,
+      });
+
+      await waitForThread(
+        harness.engine,
+        (thread) => thread.session?.status === "running" && thread.session?.activeTurnId === turnId,
+      );
+
+      harness.emit({
+        type: "session.state.changed",
+        eventId: asEventId(`evt-session-${state}-clears-turn`),
+        provider: "codex",
+        threadId: asThreadId("thread-1"),
+        createdAt: "2026-01-01T00:00:01.000Z",
+        turnId,
+        payload: state === "error" ? { state, reason: "provider crashed" } : { state },
+      });
+
+      const thread = await waitForThread(
+        harness.engine,
+        (entry) => entry.session?.status === state && entry.session?.activeTurnId === null,
+      );
+      expect(thread.session?.status).toBe(state);
+      expect(thread.session?.activeTurnId).toBeNull();
+    },
+  );
 
   it("does not clear active turn when session/thread started arrives mid-turn", async () => {
     const harness = await createHarness();
@@ -4848,7 +4887,7 @@ describe("ProviderRuntimeIngestion", () => {
     expect(JSON.stringify(data).length).toBeLessThanOrEqual(16_000);
   });
 
-  it("maps runtime.error into errored session state", async () => {
+  it("maps runtime.error into errored session state and clears the active turn", async () => {
     const harness = await createHarness();
     const now = new Date().toISOString();
 
@@ -4868,10 +4907,11 @@ describe("ProviderRuntimeIngestion", () => {
       harness.engine,
       (entry) =>
         entry.session?.status === "error" &&
-        entry.session?.activeTurnId === "turn-3" &&
+        entry.session?.activeTurnId === null &&
         entry.session?.lastError === "runtime exploded",
     );
     expect(thread.session?.status).toBe("error");
+    expect(thread.session?.activeTurnId).toBeNull();
     expect(thread.session?.lastError).toBe("runtime exploded");
   });
 
@@ -6414,10 +6454,11 @@ describe("ProviderRuntimeIngestion", () => {
       harness.engine,
       (entry) =>
         entry.session?.status === "error" &&
-        entry.session?.activeTurnId === "turn-after-failure" &&
+        entry.session?.activeTurnId === null &&
         entry.session?.lastError === "runtime still processed",
     );
     expect(thread.session?.status).toBe("error");
+    expect(thread.session?.activeTurnId).toBeNull();
     expect(thread.session?.lastError).toBe("runtime still processed");
   });
 });
