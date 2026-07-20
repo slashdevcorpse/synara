@@ -3776,6 +3776,7 @@ describe("PROVIDER_OPTIONS", () => {
     const pi = PROVIDER_OPTIONS.find((option) => option.value === "pi");
     expect(PROVIDER_OPTIONS).toEqual([
       { value: "codex", label: "Codex", available: true },
+      { value: "commandCode", label: "Command Code", available: true },
       { value: "claudeAgent", label: "Claude", available: true },
       { value: "cursor", label: "Cursor", available: true },
       { value: "antigravity", label: "Antigravity", available: true },

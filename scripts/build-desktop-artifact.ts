@@ -12,7 +12,7 @@ import rootPackageJson from "../package.json" with { type: "json" };
 import desktopPackageJson from "../apps/desktop/package.json" with { type: "json" };
 import serverPackageJson from "../apps/server/package.json" with { type: "json" };
 
-import { BRAND_ASSET_PATHS } from "./lib/brand-assets.ts";
+import { BRAND_ASSET_PATHS, resolveDesktopBrandAssetPaths } from "./lib/brand-assets.ts";
 import { DESKTOP_BUILD_ARCHES } from "./lib/desktop-build-options.ts";
 import { createDesktopBuilderCommandPlan } from "./lib/desktop-builder-command.ts";
 import {
@@ -62,25 +62,10 @@ const PackagedDesktopFlavor = Schema.Literals(["production", "canary", "super"])
 const RepoRoot = Effect.service(Path.Path).pipe(
   Effect.flatMap((path) => path.fromFileUrl(new URL("..", import.meta.url))),
 );
-const ProductionMacIconSource = Effect.zipWith(
-  RepoRoot,
-  Effect.service(Path.Path),
-  (repoRoot, path) => path.join(repoRoot, BRAND_ASSET_PATHS.productionMacIconPng),
-);
-const ProductionMacLegacyIconSource = Effect.zipWith(
-  RepoRoot,
-  Effect.service(Path.Path),
-  (repoRoot, path) => path.join(repoRoot, BRAND_ASSET_PATHS.productionMacLegacyIconPng),
-);
 const ProductionLinuxIconSource = Effect.zipWith(
   RepoRoot,
   Effect.service(Path.Path),
   (repoRoot, path) => path.join(repoRoot, BRAND_ASSET_PATHS.productionLinuxIconPng),
-);
-const ProductionWindowsIconSource = Effect.zipWith(
-  RepoRoot,
-  Effect.service(Path.Path),
-  (repoRoot, path) => path.join(repoRoot, BRAND_ASSET_PATHS.productionWindowsIconIco),
 );
 const NodePtySmokeScript = Effect.zipWith(RepoRoot, Effect.service(Path.Path), (repoRoot, path) =>
   path.join(repoRoot, "scripts/node-pty-smoke.mjs"),
@@ -463,20 +448,26 @@ function generateMacIconSet(
   });
 }
 
-function stageMacIcons(stageResourcesDir: string, verbose: boolean) {
+function stageMacIcons(
+  stageResourcesDir: string,
+  flavor: Exclude<SynaraDesktopFlavor, "development">,
+  verbose: boolean,
+) {
   return Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
-    const modernIconSource = yield* ProductionMacIconSource;
+    const repoRoot = yield* RepoRoot;
+    const brandAssets = resolveDesktopBrandAssetPaths(flavor);
+    const modernIconSource = path.join(repoRoot, brandAssets.macIconSource);
     if (!(yield* fs.exists(modernIconSource))) {
       return yield* new BuildScriptError({
-        message: `Production macOS icon source is missing at ${modernIconSource}`,
+        message: `Desktop macOS icon source is missing at ${modernIconSource}`,
       });
     }
-    const legacyIconSource = yield* ProductionMacLegacyIconSource;
+    const legacyIconSource = path.join(repoRoot, brandAssets.macLegacyIconSource);
     if (!(yield* fs.exists(legacyIconSource))) {
       return yield* new BuildScriptError({
-        message: `Production legacy macOS icon source is missing at ${legacyIconSource}`,
+        message: `Desktop legacy macOS icon source is missing at ${legacyIconSource}`,
       });
     }
 
@@ -521,19 +512,32 @@ function stageLinuxIcons(stageResourcesDir: string) {
   });
 }
 
-function stageWindowsIcons(stageResourcesDir: string) {
+function stageWindowsIcons(
+  stageResourcesDir: string,
+  flavor: Exclude<SynaraDesktopFlavor, "development">,
+) {
   return Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
-    const iconSource = yield* ProductionWindowsIconSource;
+    const repoRoot = yield* RepoRoot;
+    const brandAssets = resolveDesktopBrandAssetPaths(flavor);
+    const iconSource = path.join(repoRoot, brandAssets.windowsIconIco);
     if (!(yield* fs.exists(iconSource))) {
       return yield* new BuildScriptError({
-        message: `Production Windows icon source is missing at ${iconSource}`,
+        message: `Desktop Windows icon source is missing at ${iconSource}`,
+      });
+    }
+    const notificationIconSource = path.join(repoRoot, brandAssets.windowsNotificationIconPng);
+    if (!(yield* fs.exists(notificationIconSource))) {
+      return yield* new BuildScriptError({
+        message: `Desktop Windows notification icon source is missing at ${notificationIconSource}`,
       });
     }
 
     const iconPath = path.join(stageResourcesDir, "icon.ico");
     yield* fs.copyFile(iconSource, iconPath);
+    const notificationIconPath = path.join(stageResourcesDir, "synara.png");
+    yield* fs.copyFile(notificationIconSource, notificationIconPath);
   });
 }
 
@@ -769,10 +773,11 @@ const createBuildConfig = Effect.fn("createBuildConfig")(function* (
 const assertPlatformBuildResources = Effect.fn("assertPlatformBuildResources")(function* (
   platform: typeof BuildPlatform.Type,
   stageResourcesDir: string,
+  flavor: Exclude<SynaraDesktopFlavor, "development">,
   verbose: boolean,
 ) {
   if (platform === "mac") {
-    yield* stageMacIcons(stageResourcesDir, verbose);
+    yield* stageMacIcons(stageResourcesDir, flavor, verbose);
     return;
   }
 
@@ -782,7 +787,7 @@ const assertPlatformBuildResources = Effect.fn("assertPlatformBuildResources")(f
   }
 
   if (platform === "win") {
-    yield* stageWindowsIcons(stageResourcesDir);
+    yield* stageWindowsIcons(stageResourcesDir, flavor);
     return;
   }
 });
@@ -1016,7 +1021,12 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
     }
   }
 
-  yield* assertPlatformBuildResources(options.platform, stageResourcesDir, options.verbose);
+  yield* assertPlatformBuildResources(
+    options.platform,
+    stageResourcesDir,
+    options.flavor,
+    options.verbose,
+  );
 
   if (options.platform === "mac") {
     yield* stageMacAppSnapHelper(stageAppDir, options.arch, options.verbose);

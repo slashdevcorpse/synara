@@ -20,6 +20,7 @@ import type {
 } from "@synara/contracts";
 import { ServerProviderUpdateError } from "@synara/contracts";
 import { resolveCodexCliExecutable } from "@synara/shared/codexCliExecutable";
+import { resolveCommandCodeCliExecutable } from "@synara/shared/commandCodeCliExecutable";
 import { parseCodexConfigModelProvider } from "@synara/shared/codexConfig";
 import { decodeJsonResult } from "@synara/shared/schemaJson";
 import {
@@ -118,6 +119,7 @@ const DEFAULT_TIMEOUT_MS = 4_000;
 const CLAUDE_HEALTH_TIMEOUT_MS = 20_000;
 const OPENCODE_HEALTH_TIMEOUT_MS = 20_000;
 const CODEX_PROVIDER = "codex" as const;
+const COMMAND_CODE_PROVIDER = "commandCode" as const;
 const CLAUDE_AGENT_PROVIDER = "claudeAgent" as const;
 const CURSOR_PROVIDER = "cursor" as const;
 const ANTIGRAVITY_PROVIDER = "antigravity" as const;
@@ -132,6 +134,7 @@ const MINIMUM_ANTIGRAVITY_CLI_VERSION = "1.0.12";
 
 const PROVIDERS = [
   CODEX_PROVIDER,
+  COMMAND_CODE_PROVIDER,
   CLAUDE_AGENT_PROVIDER,
   CURSOR_PROVIDER,
   ANTIGRAVITY_PROVIDER,
@@ -198,6 +201,18 @@ export const PACKAGE_MANAGED_PROVIDER_UPDATES: Partial<
     npmPackageName: "@openai/codex",
     homebrew: { name: "codex", kind: "cask" },
     nativeUpdate: null,
+  },
+  commandCode: {
+    provider: COMMAND_CODE_PROVIDER,
+    binaryName: "commandcode",
+    npmPackageName: "command-code",
+    homebrew: null,
+    nativeUpdate: {
+      executable: "commandcode",
+      args: () => ["update"],
+      lockKey: "command-code-native",
+      strategy: "always",
+    },
   },
   claudeAgent: {
     provider: CLAUDE_AGENT_PROVIDER,
@@ -693,6 +708,7 @@ const runProviderCommand = (
     });
 
     const child = yield* spawner.spawn(command);
+    yield* Effect.addFinalizer(() => child.kill().pipe(Effect.ignore));
 
     const [stdout, stderr, exitCode] = yield* Effect.all(
       [
@@ -712,6 +728,15 @@ const runCodexCommand = (
   env: NodeJS.ProcessEnv = providerCommandEnv(CODEX_PROVIDER),
 ) =>
   runProviderCommand(executable, args, env, true).pipe(
+    Effect.flatMap((result) =>
+      isWindowsShellCommandMissingResult({ code: result.code, stderr: result.stderr })
+        ? Effect.fail(new Error(`spawn ${executable} ENOENT`))
+        : Effect.succeed(result),
+    ),
+  );
+
+const runCommandCodeCommand = (args: ReadonlyArray<string>, executable = "commandcode") =>
+  runProviderCommand(executable, args, providerCommandEnv(COMMAND_CODE_PROVIDER), true).pipe(
     Effect.flatMap((result) =>
       isWindowsShellCommandMissingResult({ code: result.code, stderr: result.stderr })
         ? Effect.fail(new Error(`spawn ${executable} ENOENT`))
@@ -1050,6 +1075,164 @@ export const makeCheckCodexProviderStatus = (
   });
 
 export const checkCodexProviderStatus = makeCheckCodexProviderStatus();
+
+// ── Command Code health check ──────────────────────────────────────
+
+const COMMAND_CODE_HEALTH_TIMEOUT_MS = 15_000;
+
+export interface CommandCodeStatusJson {
+  readonly authenticated: boolean;
+  readonly version?: string;
+  readonly error?: string;
+  readonly user?: string;
+  readonly provider?: string;
+  readonly model?: string;
+}
+
+function optionalJsonString(record: Record<string, unknown>, key: string): string | undefined {
+  const value = record[key];
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+export function parseCommandCodeStatusJson(stdout: string): CommandCodeStatusJson | undefined {
+  try {
+    const value: unknown = JSON.parse(stdout);
+    if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+    const record = value as Record<string, unknown>;
+    if (typeof record.authenticated !== "boolean") return undefined;
+    const version = optionalJsonString(record, "version");
+    const error = optionalJsonString(record, "error");
+    const user = optionalJsonString(record, "user");
+    const provider = optionalJsonString(record, "provider");
+    const model = optionalJsonString(record, "model");
+    return {
+      authenticated: record.authenticated,
+      ...(version ? { version } : {}),
+      ...(error ? { error } : {}),
+      ...(user ? { user } : {}),
+      ...(provider ? { provider } : {}),
+      ...(model ? { model } : {}),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+export const makeCheckCommandCodeProviderStatus = (
+  binaryPath?: string,
+): Effect.Effect<ServerProviderStatus, never, ChildProcessSpawner.ChildProcessSpawner> =>
+  Effect.gen(function* () {
+    const checkedAt = new Date().toISOString();
+    const env = providerCommandEnv(COMMAND_CODE_PROVIDER);
+    const configured = nonEmptyTrimmed(binaryPath) ?? "commandcode";
+    const executable = resolveCommandCodeCliExecutable(configured, { env });
+    const versionProbe = yield* runCommandCodeCommand(["--version"], executable).pipe(
+      Effect.timeoutOption(COMMAND_CODE_HEALTH_TIMEOUT_MS),
+      Effect.result,
+    );
+
+    if (Result.isFailure(versionProbe)) {
+      const error = versionProbe.failure;
+      return {
+        provider: COMMAND_CODE_PROVIDER,
+        status: "error" as const,
+        available: false,
+        authStatus: "unknown" as const,
+        checkedAt,
+        message: isCommandMissingCause(error)
+          ? "Command Code CLI (`commandcode` or `command-code`) is not installed or not on PATH."
+          : `Failed to execute Command Code CLI health check: ${error instanceof Error ? error.message : String(error)}.`,
+      } satisfies ServerProviderStatus;
+    }
+    if (Option.isNone(versionProbe.success)) {
+      return {
+        provider: COMMAND_CODE_PROVIDER,
+        status: "error" as const,
+        available: false,
+        authStatus: "unknown" as const,
+        checkedAt,
+        message: "Command Code CLI is installed but its version probe timed out.",
+      } satisfies ServerProviderStatus;
+    }
+
+    const versionResult = versionProbe.success.value;
+    if (versionResult.code !== 0) {
+      const detail = detailFromResult(versionResult);
+      return {
+        provider: COMMAND_CODE_PROVIDER,
+        status: "error" as const,
+        available: false,
+        authStatus: "unknown" as const,
+        checkedAt,
+        message: detail
+          ? `Command Code CLI is installed but failed to run. ${detail}`
+          : "Command Code CLI is installed but failed to run.",
+      } satisfies ServerProviderStatus;
+    }
+    const version = parseGenericCliVersion(`${versionResult.stdout}\n${versionResult.stderr}`);
+    const authProbe = yield* runCommandCodeCommand(["status", "--json"], executable).pipe(
+      Effect.timeoutOption(COMMAND_CODE_HEALTH_TIMEOUT_MS),
+      Effect.result,
+    );
+    if (Result.isFailure(authProbe)) {
+      return {
+        provider: COMMAND_CODE_PROVIDER,
+        status: "warning" as const,
+        available: true,
+        authStatus: "unknown" as const,
+        version,
+        checkedAt,
+        message: "Command Code is installed, but authentication could not be verified.",
+      } satisfies ServerProviderStatus;
+    }
+    if (Option.isNone(authProbe.success)) {
+      return {
+        provider: COMMAND_CODE_PROVIDER,
+        status: "warning" as const,
+        available: true,
+        authStatus: "unknown" as const,
+        version,
+        checkedAt,
+        message: "Command Code is installed, but authentication verification timed out.",
+      } satisfies ServerProviderStatus;
+    }
+
+    const authResult = authProbe.success.value;
+    const parsedStatus = parseCommandCodeStatusJson(authResult.stdout);
+    if (!parsedStatus) {
+      return {
+        provider: COMMAND_CODE_PROVIDER,
+        status: "warning" as const,
+        available: true,
+        authStatus: "unknown" as const,
+        version,
+        checkedAt,
+        message: "Command Code returned malformed authentication status JSON.",
+      } satisfies ServerProviderStatus;
+    }
+    const authenticated = authResult.code === 0 && parsedStatus.authenticated;
+    const statusVersion = parsedStatus.version ?? version;
+    return {
+      provider: COMMAND_CODE_PROVIDER,
+      status: authenticated ? ("ready" as const) : ("warning" as const),
+      available: true,
+      authStatus: authenticated ? ("authenticated" as const) : ("unauthenticated" as const),
+      version: statusVersion,
+      checkedAt,
+      ...(authenticated
+        ? {
+            authType: parsedStatus.provider ?? "commandCode",
+            authLabel: parsedStatus.user ?? "Command Code Account",
+          }
+        : {
+            message:
+              parsedStatus.error ??
+              "Command Code is not authenticated. Run `commandcode login` and try again.",
+          }),
+    } satisfies ServerProviderStatus;
+  });
+
+export const checkCommandCodeProviderStatus = makeCheckCommandCodeProviderStatus();
 
 // ── Claude Agent health check ───────────────────────────────────────
 
@@ -2150,6 +2333,8 @@ export function makeProviderHealthLive(options?: { readonly providerUpdateTimeou
         switch (provider) {
           case "codex":
             return settings.providers.codex.binaryPath;
+          case "commandCode":
+            return settings.providers.commandCode.binaryPath;
           case "claudeAgent":
             return settings.providers.claudeAgent.binaryPath;
           case "cursor":
@@ -2331,6 +2516,11 @@ export function makeProviderHealthLive(options?: { readonly providerUpdateTimeou
                     settings.providers.codex.binaryPath,
                     settings.providers.codex.homePath,
                   ),
+                ),
+                checkProviderWhenEnabled(
+                  settings,
+                  COMMAND_CODE_PROVIDER,
+                  makeCheckCommandCodeProviderStatus(settings.providers.commandCode.binaryPath),
                 ),
                 checkProviderWhenEnabled(
                   settings,

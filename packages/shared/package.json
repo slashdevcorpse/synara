@@ -48,6 +48,10 @@
       "types": "./src/codexCliExecutable.ts",
       "import": "./src/codexCliExecutable.ts"
     },
+    "./commandCodeCliExecutable": {
+      "types": "./src/commandCodeCliExecutable.ts",
+      "import": "./src/commandCodeCliExecutable.ts"
+    },
     "./windowsCertificate": {
       "types": "./src/windowsCertificate.ts",
       "import": "./src/windowsCertificate.ts"
@@ -210,7 +214,6 @@
     }
   },
   "scripts": {
-    "prepare": "effect-language-service patch",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },

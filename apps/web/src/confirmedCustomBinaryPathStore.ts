@@ -14,6 +14,7 @@ const STORAGE_KEY = "synara:confirmed-custom-binary-paths:v1";
 // compiler reject this list if a new provider is added without updating it.
 const PROVIDER_KINDS: ReadonlySet<ProviderKind> = new Set<ProviderKind>([
   "codex",
+  "commandCode",
   "claudeAgent",
   "cursor",
   "antigravity",

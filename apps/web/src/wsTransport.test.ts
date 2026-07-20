@@ -23,6 +23,7 @@ import {
   isTerminalResnapshotRequiredFailure,
   makeFeatureSocketUrl,
   makeRequestAbortScope,
+  projectServerConfigUpdatedPayload,
   shouldReconnectAfterStreamFailure,
   WsTransport,
 } from "./wsTransport";
@@ -251,6 +252,38 @@ describe("WsTransport", () => {
       ),
     ).toBe(true);
     expect(shouldKeepServerLifecycleStream(new Set([WS_CHANNELS.serverConfigUpdated]))).toBe(false);
+  });
+
+  it("projects editor availability from config snapshots before replay caching", () => {
+    expect(
+      projectServerConfigUpdatedPayload({
+        type: "snapshot",
+        config: {
+          cwd: "/repo/project",
+          worktreesDir: "/repo/worktrees",
+          keybindingsConfigPath: "/repo/project/.synara-keybindings.json",
+          keybindings: [],
+          issues: [],
+          providers: [],
+          availableEditors: ["vscode", "cursor"],
+        },
+      }),
+    ).toEqual({ issues: [], providers: [], availableEditors: ["vscode", "cursor"] });
+
+    const update = {
+      issues: [],
+      providers: [],
+      availableEditors: ["zed"] as const,
+    };
+    expect(projectServerConfigUpdatedPayload({ type: "configUpdated", payload: update })).toBe(
+      update,
+    );
+    expect(
+      projectServerConfigUpdatedPayload({
+        type: "providerStatuses",
+        payload: { providers: [] },
+      }),
+    ).toBeNull();
   });
 
   it("opens the stable bootstrap endpoint before the feature RPC socket", async () => {

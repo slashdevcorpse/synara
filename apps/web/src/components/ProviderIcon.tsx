@@ -5,7 +5,7 @@
  * branching across every UI surface.
  */
 import { type ProviderKind } from "@synara/contracts";
-import type { ReactNode, SVGProps } from "react";
+import type { HTMLAttributes, ReactNode, SVGProps } from "react";
 
 import { CentralIcon } from "~/lib/central-icons";
 import { cn } from "~/lib/utils";
@@ -24,6 +24,10 @@ import {
 
 export type ProviderIconTone = "default" | "header";
 
+type CentralProviderIconProps = Omit<SVGProps<SVGSVGElement>, "children" | "ref"> & {
+  readonly title?: string;
+};
+
 // The bundled SVG has a dark outer fill, so dark mode swaps to the reversed Central asset.
 // React's SVGProps has no `title`, so accept it via an explicit prop type and forward it
 // only to CentralIcon (an HTML span, which supports `title`); the light-mode SVG conveys
@@ -36,7 +40,7 @@ const OpenCodeProviderIcon = ({
   "aria-hidden": ariaHidden,
   "aria-label": ariaLabel,
   ...svgProps
-}: SVGProps<SVGSVGElement> & { title?: string }) => {
+}: CentralProviderIconProps) => {
   const centralIconLabel =
     ariaHidden === true || ariaHidden === "true" || typeof ariaLabel !== "string"
       ? undefined
@@ -63,8 +67,36 @@ const OpenCodeProviderIcon = ({
   );
 };
 
+const CommandCodeProviderIcon = ({
+  className,
+  style,
+  "aria-hidden": ariaHidden,
+  "aria-label": ariaLabel,
+  ...svgProps
+}: CentralProviderIconProps) => {
+  // ProviderIcon historically exposes SVG props, while CentralIcon renders a span.
+  // Refs and children are excluded above; the remaining DOM attributes and handlers
+  // have the same runtime behavior and are intentionally forwarded to that span.
+  const centralIconProps = svgProps as Omit<HTMLAttributes<HTMLSpanElement>, "children">;
+
+  return (
+    <CentralIcon
+      {...centralIconProps}
+      name="agentic-coding"
+      label={
+        ariaHidden === true || ariaHidden === "true" || typeof ariaLabel !== "string"
+          ? undefined
+          : ariaLabel
+      }
+      className={className}
+      style={style}
+    />
+  );
+};
+
 export const PROVIDER_ICON_COMPONENT_BY_PROVIDER: Record<ProviderKind, Icon> = {
   codex: OpenAI,
+  commandCode: CommandCodeProviderIcon,
   claudeAgent: ClaudeAI,
   cursor: CursorIcon,
   antigravity: AntigravityIcon,
@@ -88,10 +120,11 @@ export function providerIconToneClassName(
   return "text-foreground";
 }
 
-export type ProviderIconProps = Omit<SVGProps<SVGSVGElement>, "ref"> & {
+export type ProviderIconProps = Omit<SVGProps<SVGSVGElement>, "children" | "ref"> & {
   readonly provider: ProviderKind | null | undefined;
   readonly fallback?: ReactNode;
   readonly tone?: ProviderIconTone;
+  readonly title?: string;
 };
 
 export function ProviderIcon({

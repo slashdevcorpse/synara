@@ -2298,6 +2298,32 @@ describe("store read model sync", () => {
     expect(threadsOf(next)[0]?.session?.provider).toBe("opencode");
   });
 
+  it("preserves Command Code as the active session provider", () => {
+    const initialState = makeState(makeThread());
+    const readModel = makeReadModel(
+      makeReadModelThread({
+        modelSelection: {
+          provider: "commandCode",
+          model: "gpt-5.6-sol",
+        },
+        session: {
+          threadId: ThreadId.makeUnsafe("thread-1"),
+          status: "ready",
+          providerName: "commandCode",
+          runtimeMode: "approval-required",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: "2026-02-27T00:00:00.000Z",
+        },
+      }),
+    );
+
+    const next = syncServerReadModel(initialState, readModel);
+
+    expect(threadsOf(next)[0]?.modelSelection.provider).toBe("commandCode");
+    expect(threadsOf(next)[0]?.session?.provider).toBe("commandCode");
+  });
+
   it("preserves Pi as the active session provider", () => {
     const initialState = makeState(makeThread());
     const readModel = makeReadModel(

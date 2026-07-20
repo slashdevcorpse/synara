@@ -14,6 +14,37 @@ export const BRAND_ASSET_PATHS = {
   developmentWebAppleTouchIconPng: "assets/dev/blueprint-web-apple-touch-180.png",
 } as const;
 
+export type PackagedDesktopBrandFlavor = "production" | "canary" | "super";
+
+export interface DesktopBrandAssetPaths {
+  readonly macIconSource: string;
+  readonly macLegacyIconSource: string;
+  readonly windowsIconIco: string;
+  readonly windowsNotificationIconPng: string;
+}
+
+export const SUPER_DESKTOP_BRAND_ASSET_PATHS: DesktopBrandAssetPaths = {
+  macIconSource: "assets/super/super-synara-1024.png",
+  macLegacyIconSource: "assets/super/super-synara-macos-legacy-1024.png",
+  windowsIconIco: "assets/super/super-synara-windows.ico",
+  windowsNotificationIconPng: "assets/super/super-synara-1024.png",
+};
+
+const PRODUCTION_DESKTOP_BRAND_ASSET_PATHS: DesktopBrandAssetPaths = {
+  macIconSource: BRAND_ASSET_PATHS.productionMacIconPng,
+  macLegacyIconSource: BRAND_ASSET_PATHS.productionMacLegacyIconPng,
+  windowsIconIco: BRAND_ASSET_PATHS.productionWindowsIconIco,
+  windowsNotificationIconPng: BRAND_ASSET_PATHS.productionLinuxIconPng,
+};
+
+export function resolveDesktopBrandAssetPaths(
+  flavor: PackagedDesktopBrandFlavor,
+): DesktopBrandAssetPaths {
+  return flavor === "super"
+    ? SUPER_DESKTOP_BRAND_ASSET_PATHS
+    : PRODUCTION_DESKTOP_BRAND_ASSET_PATHS;
+}
+
 export interface IconOverride {
   readonly sourceRelativePath: string;
   readonly targetRelativePath: string;

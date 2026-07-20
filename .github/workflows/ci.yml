@@ -129,8 +129,11 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
-      - name: Build Windows Job launcher
+      - name: Build Windows Job launcher (x64)
         run: node apps/server/scripts/build-windows-job-launcher.mjs --arch x64
+
+      - name: Build Windows Job launcher (ARM64)
+        run: node apps/server/scripts/build-windows-job-launcher.mjs --arch arm64
 
       - name: Run Windows Job containment regressions
         run: >-

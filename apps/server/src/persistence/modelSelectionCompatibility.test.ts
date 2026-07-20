@@ -14,6 +14,34 @@ it("preserves canonical Pi model selections", () => {
   });
 });
 
+it("preserves canonical Command Code selections and scoped options", () => {
+  assert.deepEqual(
+    normalizePersistedModelSelection({
+      provider: "commandCode",
+      model: "gpt-5.6-sol",
+      options: { commandCode: {} },
+    }),
+    {
+      provider: "commandCode",
+      model: "gpt-5.6-sol",
+      options: {},
+    },
+  );
+});
+
+it("infers Command Code from persisted instance labels", () => {
+  assert.deepEqual(
+    normalizePersistedModelSelection({
+      instanceId: "Command Code CLI",
+      model: "gpt-5.6-sol",
+    }),
+    {
+      provider: "commandCode",
+      model: "gpt-5.6-sol",
+    },
+  );
+});
+
 it("migrates combined Antigravity model and effort labels", () => {
   assert.deepEqual(
     normalizePersistedModelSelection({
