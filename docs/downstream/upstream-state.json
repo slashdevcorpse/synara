@@ -33,7 +33,7 @@
       "id": "sync-2026-07-20-1664ce2f",
       "previousUpstreamSha": "710e3e4ddd0d5b69bde7267cc2c4b4acbe834dd6",
       "effectiveUpstreamSha": "1664ce2f152cd6131a30d1ee8d7c9b60235bb0fe",
-      "downstreamCommit": "41fe079cc0af07bfbfe3f7c640b1ddc367a900e2",
+      "downstreamCommit": "b135e0a8cde615c7df5a1922c1f89a08bdc66a46",
       "integrationMethod": "merge-commit",
       "pullRequest": "https://github.com/slashdevcorpse/synara/pull/47",
       "assessmentPath": "docs/downstream/syncs/2026-07-20-710e3e4d-1664ce2f.md",
