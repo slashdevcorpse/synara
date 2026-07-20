@@ -17,11 +17,13 @@ import {
   assertSafeBenchmarkOutputPath,
   assertSingleEditorFixtureSubprocessCount,
   benchmarkDependencyLinks,
+  createNodeRuntimeEvidenceCollector,
   createFixture,
   editorFixtureEnvironment,
   evaluateBenchmarkGates,
   evaluateNodeDuplicateEnvironmentOracle,
   formatBenchmarkFailure,
+  hashFileSha256,
   hashFixtureLabel,
   parseBenchmarkArgs,
   preflightEditorFixture,
@@ -479,6 +481,57 @@ describe("benchmark-windows-command-discovery", () => {
     expect(label).not.toContain("Users");
   });
 
+  it("hashes runtime executable bytes rather than the executable path label", () => {
+    const root = mkdtempSync(join(tmpdir(), "synara-runtime-hash-"));
+    try {
+      const first = join(root, "node-a.exe");
+      const second = join(root, "node-b.exe");
+      writeFileSync(first, "same executable bytes");
+      writeFileSync(second, "same executable bytes");
+
+      expect(hashFileSha256(first)).toBe(hashFileSha256(second));
+      expect(hashFileSha256(first)).not.toBe(hashFixtureLabel(first));
+
+      writeFileSync(second, "changed executable bytes");
+      expect(hashFileSha256(first)).not.toBe(hashFileSha256(second));
+    } finally {
+      rmSync(root, { force: true, recursive: true });
+    }
+  });
+
+  it("reuses executable hashes only within one runtime-evidence collection", () => {
+    const hashedPaths: string[] = [];
+    const hashExecutable = (path: string) => {
+      hashedPaths.push(path);
+      return hashFixtureLabel(`executable-bytes:${path}`);
+    };
+    const collectRuntimeEvidence = createNodeRuntimeEvidenceCollector(hashExecutable);
+    const runtime = { name: "node", version: "v24.15.0", execPath: "C:\\Node\\node.exe" };
+    const expectedHash = hashFixtureLabel(`executable-bytes:${runtime.execPath}`);
+
+    expect(collectRuntimeEvidence(runtime)).toEqual({
+      name: runtime.name,
+      version: runtime.version,
+      execPathSha256: expectedHash,
+    });
+    expect(collectRuntimeEvidence({ ...runtime, version: "v24.15.1" })).toEqual({
+      name: runtime.name,
+      version: "v24.15.1",
+      execPathSha256: expectedHash,
+    });
+    expect(hashedPaths).toEqual([runtime.execPath]);
+
+    const otherExecPath = "D:\\Node\\node.exe";
+    expect(collectRuntimeEvidence({ ...runtime, execPath: otherExecPath }).execPathSha256).toBe(
+      hashFixtureLabel(`executable-bytes:${otherExecPath}`),
+    );
+    expect(hashedPaths).toEqual([runtime.execPath, otherExecPath]);
+
+    const nextCollection = createNodeRuntimeEvidenceCollector(hashExecutable);
+    expect(nextCollection(runtime).execPathSha256).toBe(expectedHash);
+    expect(hashedPaths).toEqual([runtime.execPath, otherExecPath, runtime.execPath]);
+  });
+
   it("requires raw collisions, normalized child evidence, and exact cache behavior", () => {
     const runtime = {
       name: "node",
@@ -493,6 +546,22 @@ describe("benchmark-windows-command-discovery", () => {
         pathKeys: ["PATH", "Path"],
         duplicateKeyCount: 1,
         valueSha256ByKey: { PATH: expectedValueSha256, Path: "c".repeat(64) },
+      },
+      bunToNodeBoundary: {
+        forward: {
+          runtime,
+          inputPathKeys: ["Path", "PATH"],
+          pathKeys: ["PATH", "Path"],
+          duplicateKeyCount: 1,
+          valueSha256ByKey: { PATH: "c".repeat(64), Path: "c".repeat(64) },
+        },
+        reverse: {
+          runtime,
+          inputPathKeys: ["PATH", "Path"],
+          pathKeys: ["PATH", "Path"],
+          duplicateKeyCount: 1,
+          valueSha256ByKey: { PATH: expectedValueSha256, Path: expectedValueSha256 },
+        },
       },
       normalizedChildEnvironment: {
         pathKeys: ["PATH"],
@@ -540,6 +609,18 @@ describe("benchmark-windows-command-discovery", () => {
     expect(
       evaluateNodeDuplicateEnvironmentOracle({
         ...evidence,
+        bunToNodeBoundary: {
+          ...evidence.bunToNodeBoundary,
+          forward: {
+            ...evidence.bunToNodeBoundary.forward,
+            duplicateKeyCount: 0,
+          },
+        },
+      }),
+    ).toBe(false);
+    expect(
+      evaluateNodeDuplicateEnvironmentOracle({
+        ...evidence,
         serializerObservedEnvironment: {
           ...evidence.serializerObservedEnvironment,
           effectiveValueSha256: "d".repeat(64),
@@ -577,7 +658,7 @@ describe("benchmark-windows-command-discovery", () => {
   });
 
   it.runIf(process.platform === "win32")(
-    "normalizes duplicate caller keys before Node and real where.exe",
+    "preserves raw aliases across Bun-to-Node before deterministic normalization",
     () => {
       const benchmarkModuleUrl = new URL(
         "./benchmark-windows-command-discovery.ts",
@@ -600,6 +681,20 @@ describe("benchmark-windows-command-discovery", () => {
         rawCallerEnvironment: {
           pathKeys: ["PATH", "Path"],
           duplicateKeyCount: 1,
+        },
+        bunToNodeBoundary: {
+          forward: {
+            runtime: { name: "node" },
+            inputPathKeys: ["Path", "PATH"],
+            pathKeys: ["PATH", "Path"],
+            duplicateKeyCount: 1,
+          },
+          reverse: {
+            runtime: { name: "node" },
+            inputPathKeys: ["PATH", "Path"],
+            pathKeys: ["PATH", "Path"],
+            duplicateKeyCount: 1,
+          },
         },
         normalizedChildEnvironment: {
           pathKeys: ["PATH"],
@@ -628,6 +723,11 @@ describe("benchmark-windows-command-discovery", () => {
         },
         passed: true,
       });
+      const callerPathHashes = new Set(Object.values(oracle.rawCallerEnvironment.valueSha256ByKey));
+      for (const boundary of [oracle.bunToNodeBoundary.forward, oracle.bunToNodeBoundary.reverse]) {
+        expect(boundary.valueSha256ByKey.PATH).toBe(boundary.valueSha256ByKey.Path);
+        expect(callerPathHashes.has(boundary.valueSha256ByKey.PATH ?? "")).toBe(true);
+      }
       expect(oracle.serializerRuntime).toEqual(oracle.expectedRuntime);
     },
   );
