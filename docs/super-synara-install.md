@@ -1,6 +1,6 @@
 # Install Super Synara
 
-Super Synara is an unofficial, independently maintained downstream build of Synara. Its Windows and macOS prerelease artifacts are unsigned, so your operating system will warn before opening them. Those warnings are expected, but they are also an important security boundary: download only from the downstream release page and verify the checksum before continuing.
+Super Synara is an unofficial, independently maintained downstream build of Synara. Its prerelease artifacts are unsigned, so your operating system will warn before opening them. Releases may be Windows-only; a macOS artifact is available only when that release explicitly includes the macOS lane. Those warnings are expected, but they are also an important security boundary: download only from the downstream release page and verify the checksum before continuing.
 
 ## Before installation
 
