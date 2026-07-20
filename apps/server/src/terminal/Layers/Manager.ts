@@ -74,6 +74,14 @@ import {
   type ProcessTreeKiller,
   type TerminalKillSignal,
 } from "../processTreeKiller";
+import {
+  automaticWindowsShellLaunchError,
+  createWindowsShellSelection,
+  explicitWindowsShellLaunchError,
+  type PosixTerminalShellResolver,
+  type WindowsTerminalShellResolver,
+  type WindowsShellSelectionDependencies,
+} from "../windowsShellSelection";
 
 const DEFAULT_HISTORY_LINE_LIMIT = 5_000;
 const DEFAULT_PERSIST_DEBOUNCE_MS = 250;
@@ -210,18 +218,13 @@ function normalizeProviderOutputSignature(visibleText: string): string {
     .slice(-256);
 }
 
-const WINDOWS_DEFAULT_TERMINAL_SHELL = "powershell.exe";
-
 type ShellResolutionOptions = {
   platform?: NodeJS.Platform;
   envShell?: string;
-  envComSpec?: string;
 };
 
-function defaultShellResolver(): string {
-  if (process.platform === "win32") {
-    return WINDOWS_DEFAULT_TERMINAL_SHELL;
-  }
+function defaultShellResolver(platform: NodeJS.Platform): string | null {
+  if (platform === "win32") return null;
   return process.env.SHELL ?? "bash";
 }
 
@@ -273,23 +276,15 @@ function uniqueShellCandidates(candidates: Array<ShellCandidate | null>): ShellC
 }
 
 function resolveShellCandidates(
-  shellResolver: () => string,
+  shellResolver: PosixTerminalShellResolver,
   options: ShellResolutionOptions = {},
 ): ShellCandidate[] {
   const platform = options.platform ?? process.platform;
+  const resolved = shellResolver();
   const requested = shellCandidateFromCommand(
-    normalizeShellCommand(shellResolver(), platform),
+    normalizeShellCommand(typeof resolved === "string" ? resolved : undefined, platform),
     platform,
   );
-
-  if (platform === "win32") {
-    return uniqueShellCandidates([
-      requested,
-      shellCandidateFromCommand(options.envComSpec ?? process.env.ComSpec ?? null, platform),
-      shellCandidateFromCommand(WINDOWS_DEFAULT_TERMINAL_SHELL, platform),
-      shellCandidateFromCommand("cmd.exe", platform),
-    ]);
-  }
 
   return uniqueShellCandidates([
     requested,
@@ -306,15 +301,11 @@ function resolveShellCandidates(
   ]);
 }
 
-export const __terminalManagerShellTesting = {
-  resolveShellCandidates,
-  windowsDefaultTerminalShell: WINDOWS_DEFAULT_TERMINAL_SHELL,
-};
-
 function isRetryableShellSpawnError(error: unknown): boolean {
   const queue: unknown[] = [error];
   const seen = new Set<unknown>();
   const messages: string[] = [];
+  const codes: string[] = [];
 
   while (queue.length > 0) {
     const current = queue.shift();
@@ -330,6 +321,8 @@ function isRetryableShellSpawnError(error: unknown): boolean {
 
     if (current instanceof Error) {
       messages.push(current.message);
+      const code = (current as NodeJS.ErrnoException).code;
+      if (typeof code === "string") codes.push(code);
       const cause = (current as { cause?: unknown }).cause;
       if (cause) {
         queue.push(cause);
@@ -338,9 +331,12 @@ function isRetryableShellSpawnError(error: unknown): boolean {
     }
 
     if (typeof current === "object") {
-      const value = current as { message?: unknown; cause?: unknown };
+      const value = current as { message?: unknown; cause?: unknown; code?: unknown };
       if (typeof value.message === "string") {
         messages.push(value.message);
+      }
+      if (typeof value.code === "string") {
+        codes.push(value.code);
       }
       if (value.cause) {
         queue.push(value.cause);
@@ -350,6 +346,7 @@ function isRetryableShellSpawnError(error: unknown): boolean {
 
   const message = messages.join(" ").toLowerCase();
   return (
+    codes.some((code) => code.toUpperCase() === "ENOENT") ||
     message.includes("posix_spawnp failed") ||
     message.includes("enoent") ||
     message.includes("not found") ||
@@ -1000,18 +997,45 @@ interface TerminalManagerEvents {
   event: [event: TerminalEvent];
 }
 
-interface TerminalManagerOptions {
+interface TerminalManagerCommonOptions {
   logsDir?: string;
   historyLineLimit?: number;
   historyByteLimit?: number;
   ptyAdapter: PtyAdapterShape;
-  shellResolver?: () => string;
+  shellEnvironment?: NodeJS.ProcessEnv;
+  windowsShellSelectionDependencies?: WindowsShellSelectionDependencies;
   subprocessChecker?: TerminalSubprocessChecker;
   processTreeKiller?: ProcessTreeKiller;
   subprocessPollIntervalMs?: number;
   processKillGraceMs?: number;
   maxRetainedInactiveSessions?: number;
 }
+
+type TerminalManagerShellOptions =
+  | {
+      shellPlatform: "win32";
+      shellResolver?: WindowsTerminalShellResolver;
+    }
+  | {
+      shellPlatform: Exclude<NodeJS.Platform, "win32">;
+      shellResolver?: PosixTerminalShellResolver;
+    }
+  | {
+      shellPlatform?: undefined;
+      shellResolver?: never;
+    };
+
+type TerminalManagerOptions = TerminalManagerCommonOptions & TerminalManagerShellOptions;
+
+type TerminalShellConfiguration =
+  | {
+      readonly platform: "win32";
+      readonly resolver: WindowsTerminalShellResolver;
+    }
+  | {
+      readonly platform: Exclude<NodeJS.Platform, "win32">;
+      readonly resolver: PosixTerminalShellResolver;
+    };
 
 interface KillEscalationHandle {
   timer: ReturnType<typeof setTimeout>;
@@ -1028,7 +1052,9 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
   private readonly historyLineLimit: number;
   private readonly historyByteLimit: number;
   private readonly ptyAdapter: PtyAdapterShape;
-  private readonly shellResolver: () => string;
+  private readonly shellConfiguration: TerminalShellConfiguration;
+  private readonly shellEnvironment: NodeJS.ProcessEnv;
+  private readonly windowsShellSelectionDependencies: WindowsShellSelectionDependencies;
   private readonly persistQueues = new Map<string, Promise<void>>();
   private readonly persistTimers = new Map<string, ReturnType<typeof setTimeout>>();
   /**
@@ -1069,7 +1095,26 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
     this.historyLineLimit = options.historyLineLimit ?? DEFAULT_HISTORY_LINE_LIMIT;
     this.historyByteLimit = options.historyByteLimit ?? DEFAULT_HISTORY_BYTE_LIMIT;
     this.ptyAdapter = options.ptyAdapter;
-    this.shellResolver = options.shellResolver ?? defaultShellResolver;
+    this.shellEnvironment = options.shellEnvironment ?? process.env;
+    this.windowsShellSelectionDependencies = options.windowsShellSelectionDependencies ?? {};
+    if (options.shellPlatform === "win32") {
+      this.shellConfiguration = {
+        platform: "win32",
+        resolver: options.shellResolver ?? (() => null),
+      };
+    } else if (options.shellPlatform !== undefined) {
+      this.shellConfiguration = {
+        platform: options.shellPlatform,
+        resolver: options.shellResolver ?? (() => defaultShellResolver(options.shellPlatform)),
+      };
+    } else if (process.platform === "win32") {
+      this.shellConfiguration = { platform: "win32", resolver: () => null };
+    } else {
+      this.shellConfiguration = {
+        platform: process.platform,
+        resolver: () => defaultShellResolver(process.platform),
+      };
+    }
     this.persistDebounceMs = DEFAULT_PERSIST_DEBOUNCE_MS;
     this.subprocessChecker = options.subprocessChecker ?? defaultSubprocessChecker;
     this.processTreeKiller = options.processTreeKiller ?? defaultProcessTreeKiller;
@@ -1518,12 +1563,10 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
     let ptyProcess: PtyProcess | null = null;
     let startedShell: string | null = null;
     try {
-      const shellCandidates = resolveShellCandidates(this.shellResolver);
       const terminalEnv = createTerminalSpawnEnv(process.env, session.runtimeEnv, {
         binDir: this.managedWrapperBinDir,
         zshDir: this.managedWrapperZshDir,
       });
-      let lastSpawnError: unknown = null;
 
       const spawnWithCandidate = (candidate: ShellCandidate) =>
         Effect.runPromise(
@@ -1537,43 +1580,74 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
           }),
         );
 
-      const trySpawn = async (
-        candidates: ShellCandidate[],
-        index = 0,
-      ): Promise<{ process: PtyProcess; shellLabel: string } | null> => {
-        if (index >= candidates.length) {
-          return null;
-        }
-        const candidate = candidates[index];
-        if (!candidate) {
-          return null;
-        }
-
-        try {
-          const process = await spawnWithCandidate(candidate);
-          return { process, shellLabel: formatShellCandidate(candidate) };
-        } catch (error) {
-          lastSpawnError = error;
-          if (!isRetryableShellSpawnError(error)) {
-            throw error;
+      if (this.shellConfiguration.platform === "win32") {
+        const selection = createWindowsShellSelection({
+          resolveExplicit: this.shellConfiguration.resolver,
+          env: this.shellEnvironment,
+          dependencies: this.windowsShellSelectionDependencies,
+        });
+        let candidate = await selection.next();
+        while (candidate) {
+          try {
+            ptyProcess = await spawnWithCandidate({
+              shell: candidate.shell,
+              args: candidate.args,
+            });
+            startedShell = candidate.label;
+            break;
+          } catch (error) {
+            if (candidate.source === "explicit") {
+              throw explicitWindowsShellLaunchError();
+            }
+            if (!isRetryableShellSpawnError(error)) {
+              throw automaticWindowsShellLaunchError(candidate);
+            }
+            selection.noteLaunchTargetDisappeared(candidate);
+            candidate = await selection.next();
           }
-          return trySpawn(candidates, index + 1);
         }
-      };
+        if (!ptyProcess) throw selection.exhaustedError();
+      } else {
+        const shellCandidates = resolveShellCandidates(this.shellConfiguration.resolver, {
+          platform: this.shellConfiguration.platform,
+          ...(this.shellEnvironment.SHELL !== undefined
+            ? { envShell: this.shellEnvironment.SHELL }
+            : {}),
+        });
+        let lastSpawnError: unknown = null;
 
-      const spawnResult = await trySpawn(shellCandidates);
-      if (spawnResult) {
-        ptyProcess = spawnResult.process;
-        startedShell = spawnResult.shellLabel;
-      }
+        const trySpawn = async (
+          candidates: ShellCandidate[],
+          index = 0,
+        ): Promise<{ process: PtyProcess; shellLabel: string } | null> => {
+          if (index >= candidates.length) return null;
+          const candidate = candidates[index];
+          if (!candidate) return null;
 
-      if (!ptyProcess) {
-        const detail = describeErrorMessage(lastSpawnError, "Terminal start failed");
-        const tried =
-          shellCandidates.length > 0
-            ? ` Tried shells: ${shellCandidates.map((candidate) => formatShellCandidate(candidate)).join(", ")}.`
-            : "";
-        throw new Error(`${detail}.${tried}`.trim());
+          try {
+            const process = await spawnWithCandidate(candidate);
+            return { process, shellLabel: formatShellCandidate(candidate) };
+          } catch (error) {
+            lastSpawnError = error;
+            if (!isRetryableShellSpawnError(error)) throw error;
+            return trySpawn(candidates, index + 1);
+          }
+        };
+
+        const spawnResult = await trySpawn(shellCandidates);
+        if (spawnResult) {
+          ptyProcess = spawnResult.process;
+          startedShell = spawnResult.shellLabel;
+        }
+
+        if (!ptyProcess) {
+          const detail = describeErrorMessage(lastSpawnError, "Terminal start failed");
+          const tried =
+            shellCandidates.length > 0
+              ? ` Tried shells: ${shellCandidates.map((candidate) => formatShellCandidate(candidate)).join(", ")}.`
+              : "";
+          throw new Error(`${detail}.${tried}`.trim());
+        }
       }
 
       session.process = ptyProcess;
