@@ -11,6 +11,11 @@ const webPackageManifest = JSON.parse(
 ) as {
   readonly dependencies?: Readonly<Record<string, string>>;
 };
+const marketingPackageManifest = JSON.parse(
+  readFileSync(new URL("../../apps/marketing/package.json", import.meta.url), "utf8"),
+) as {
+  readonly dependencies?: Readonly<Record<string, string>>;
+};
 const lockfile = readFileSync(new URL("../../bun.lock", import.meta.url), "utf8");
 
 const securityPins = {
@@ -38,6 +43,13 @@ describe("dependency security pins", () => {
     expect(webPackageManifest.dependencies).toMatchObject({ "react-icons": "5.6.0" });
     expect(lockfile).toContain('"react-icons": ["react-icons@5.6.0"');
     expect(lockfile).not.toContain('"react-icons": ["react-icons@5.7.0"');
+  });
+
+  it("keeps the marketing build beyond the audited Astro and esbuild ranges", () => {
+    expect(marketingPackageManifest.dependencies).toMatchObject({ astro: "7.1.1" });
+    expect(lockfile).toContain('"astro": ["astro@7.1.1"');
+    expect(lockfile).not.toContain('["astro@6.4.8"');
+    expect(lockfile).not.toContain('["esbuild@0.27.');
   });
 
   it("does not retain the vulnerable stale resolutions", () => {
