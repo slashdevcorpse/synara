@@ -9,6 +9,7 @@
 
 import { Effect, FileSystem } from "effect";
 import type { WorkflowAgentRuntimeSnapshot } from "@synara/contracts";
+import { splitLines } from "@synara/shared/text";
 
 import { WORKFLOW_PROMPT_PREVIEW_CHARS } from "./claudeWorkflowScript.ts";
 
@@ -255,8 +256,10 @@ const readAppendedLines = (
     if (lastNewline < 0) {
       return undefined;
     }
-    const text = new TextDecoder().decode(chunk.subarray(0, lastNewline));
-    return { lines: text.split("\n"), nextOffset: offset + lastNewline + 1, skipped: false };
+    const text = new TextDecoder().decode(chunk.subarray(0, lastNewline + 1));
+    const lines = splitLines(text);
+    lines.pop();
+    return { lines, nextOffset: offset + lastNewline + 1, skipped: false };
   }).pipe(
     Effect.scoped,
     Effect.orElseSucceed(() => undefined),

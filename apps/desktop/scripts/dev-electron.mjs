@@ -70,7 +70,7 @@ function listStaleComputerUsePids() {
   }
 
   return output
-    .split("\n")
+    .split(/\r?\n/)
     .map((line) => line.trim())
     .filter(Boolean)
     .flatMap((line) => {

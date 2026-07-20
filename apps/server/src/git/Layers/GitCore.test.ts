@@ -7,6 +7,7 @@ import path from "node:path";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
+import { splitLines } from "@synara/shared/text";
 import { Effect, FileSystem, Layer, PlatformError, Schema, Scope } from "effect";
 import { describe, expect, vi } from "vitest";
 
@@ -1478,9 +1479,21 @@ it.layer(TestLayer)("git integration", (it) => {
         Effect.gen(function* () {
           const tmp = yield* makeTmpDir();
           yield* initRepoWithCommit(tmp);
-          const core = yield* GitCore;
+          const realGitCore = yield* GitCore;
 
           yield* git(tmp, ["remote", "add", "origin", "git@github.com:example-org/synara.git"]);
+
+          const core = yield* makeIsolatedGitCore((input) =>
+            realGitCore
+              .execute(input)
+              .pipe(
+                Effect.map((result) =>
+                  input.args.join(" ") === "remote -v"
+                    ? { ...result, stdout: result.stdout.replace(/\r?\n/g, "\r\n") }
+                    : result,
+                ),
+              ),
+          );
 
           const remoteName = yield* core.ensureRemote({
             cwd: tmp,
@@ -1489,7 +1502,7 @@ it.layer(TestLayer)("git integration", (it) => {
           });
 
           expect(remoteName).toBe("origin");
-          expect((yield* git(tmp, ["remote"])).split("\n").filter(Boolean)).toEqual(["origin"]);
+          expect(splitLines(yield* git(tmp, ["remote"])).filter(Boolean)).toEqual(["origin"]);
         }),
     );
 
@@ -2280,6 +2293,61 @@ it.layer(TestLayer)("git integration", (it) => {
         expect(result.branches.length).toBeGreaterThan(0);
         expect(result.branches[0]?.current).toBe(true);
         expect(didFailRecency).toBe(true);
+      }),
+    );
+
+    it.effect("parses CRLF remote, branch, worktree, and recency output", () =>
+      Effect.gen(function* () {
+        const tmp = yield* makeTmpDir();
+        const remote = yield* makeTmpDir();
+        yield* git(remote, ["init", "--bare"]);
+        const { initialBranch } = yield* initRepoWithCommit(tmp);
+        yield* git(tmp, ["remote", "add", "origin", remote]);
+        yield* git(tmp, ["push", "-u", "origin", initialBranch]);
+
+        const realGitCore = yield* GitCore;
+        yield* realGitCore.createBranch({ cwd: tmp, branch: "feature/crlf-output" });
+        yield* git(tmp, ["push", "origin", "feature/crlf-output"]);
+        const worktreePath = path.join(tmp, "crlf-worktree");
+        yield* realGitCore.createWorktree({
+          cwd: tmp,
+          branch: "feature/crlf-output",
+          path: worktreePath,
+        });
+
+        const lineOrientedCommands = new Set([
+          "branch --no-color",
+          "branch --no-color --remotes",
+          "remote",
+          "worktree list --porcelain",
+        ]);
+        const core = yield* makeIsolatedGitCore((input) =>
+          realGitCore.execute(input).pipe(
+            Effect.map((result) => {
+              const command = input.args.join(" ");
+              if (!lineOrientedCommands.has(command) && input.args[0] !== "for-each-ref") {
+                return result;
+              }
+              return { ...result, stdout: result.stdout.replace(/\r?\n/g, "\r\n") };
+            }),
+          ),
+        );
+
+        const result = yield* core.listBranches({ cwd: tmp });
+        const worktreeBranch = result.branches.find(
+          (branch) => !branch.isRemote && branch.name === "feature/crlf-output",
+        );
+        const remoteBranch = result.branches.find(
+          (branch) => branch.isRemote && branch.name === "origin/feature/crlf-output",
+        );
+
+        expect(result.hasOriginRemote).toBe(true);
+        expect(worktreeBranch?.worktreePath).not.toBeNull();
+        expect(path.basename(worktreeBranch?.worktreePath ?? "")).toBe("crlf-worktree");
+        expect(remoteBranch).toMatchObject({ isRemote: true, remoteName: "origin" });
+        expect(result.branches.every((branch) => !branch.name.includes("\r"))).toBe(true);
+
+        yield* realGitCore.removeWorktree({ cwd: tmp, path: worktreePath });
       }),
     );
 
