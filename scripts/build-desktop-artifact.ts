@@ -42,6 +42,7 @@ import {
   resolveReleaseLockfileSha256,
   verifyReleaseLockfileSha256,
 } from "./lib/release-lockfile-provenance.ts";
+import { verifyReleaseWorktreeCleanliness } from "./lib/release-worktree-cleanliness.ts";
 import {
   assertDesktopStageFilesUnchanged,
   verifyDesktopStagePatchedDependencies,
@@ -928,20 +929,14 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
     });
   }
   if (exactProvenanceRequested) {
-    const gitStatus = spawnSync("git", ["status", "--porcelain=v1", "--untracked-files=all"], {
-      cwd: repoRoot,
-      encoding: "utf8",
+    yield* Effect.try({
+      try: () => verifyReleaseWorktreeCleanliness(repoRoot),
+      catch: (cause) =>
+        new BuildScriptError({
+          message: cause instanceof Error ? cause.message : String(cause),
+          cause,
+        }),
     });
-    if (gitStatus.status !== 0) {
-      return yield* new BuildScriptError({
-        message: `Unable to inspect release worktree: ${gitStatus.stderr.trim() || "git failed"}.`,
-      });
-    }
-    if (gitStatus.stdout.trim().length > 0) {
-      return yield* new BuildScriptError({
-        message: "Release source worktree is not clean; refusing to stage uncommitted bytes.",
-      });
-    }
   }
   const mkdir = options.keepStage ? fs.makeTempDirectory : fs.makeTempDirectoryScoped;
   const stageRoot = yield* mkdir({
