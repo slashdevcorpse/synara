@@ -15,6 +15,7 @@ import pathWin32 from "node:path/win32";
 
 import { EDITORS, type EditorId } from "@synara/contracts";
 import {
+  foldWindowsAsciiCase,
   normalizeWindowsChildEnvironment,
   prepareWindowsSafeProcess,
   readEffectiveWindowsEnvironmentValue,
@@ -521,12 +522,6 @@ function mapWindowsStoreLookupFailure(
   category: Exclude<WindowsStoreBulkLookupResult, { status: "success" }>["category"],
 ): EditorDiscoveryFailureCategory {
   return category === "cancelled" ? "cancelled" : `windows_store_${category}`;
-}
-
-function foldWindowsAsciiCase(value: string): string {
-  return value.replace(/[A-Z]/g, (character) =>
-    String.fromCharCode(character.charCodeAt(0) + 0x20),
-  );
 }
 
 function normalizeEditorDiscoveryCwd(cwd: string, platform: NodeJS.Platform): string {

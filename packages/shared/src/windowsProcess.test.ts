@@ -13,6 +13,7 @@ import {
   buildWindowsBatchCommandArgs,
   clearWindowsCommandDiscoveryCache,
   createWindowsCommandDiscoveryCache,
+  foldWindowsAsciiCase,
   getWindowsCommandDiscoveryCacheStats,
   isWindowsBatchCommand,
   normalizeWindowsChildEnvironment,
@@ -85,6 +86,11 @@ describe("windowsProcess", () => {
       PATH: undefined,
       PaTh: "C:\\alternating",
     });
+  });
+
+  it("folds only Windows ASCII case for shared path and environment identities", () => {
+    expect(foldWindowsAsciiCase("C:\\TOOLS\\İD\\PATH")).toBe("c:\\tools\\İd\\path");
+    expect(foldWindowsAsciiCase("i\u0307D")).toBe("i\u0307d");
   });
 
   it("leaves non-Windows commands shell-free and otherwise unchanged", () => {
@@ -1938,17 +1944,27 @@ describe("windowsProcess", () => {
     });
 
     it.runIf(process.platform === "win32")("clears the process-local cache", () => {
-      clearWindowsCommandDiscoveryCache();
-      expect(
-        resolveWindowsCommandCandidates("cmd", {
-          platform: "win32",
-          cwd: process.cwd(),
-          env: process.env,
-        }).length,
-      ).toBeGreaterThan(0);
-      expect(getWindowsCommandDiscoveryCacheStats().size).toBeGreaterThan(0);
-      clearWindowsCommandDiscoveryCache();
-      expect(getWindowsCommandDiscoveryCacheStats()).toEqual({ size: 0 });
+      const root = mkdtempSync(Path.join(tmpdir(), "synara-process-cache-"));
+      try {
+        clearWindowsCommandDiscoveryCache();
+        expect(
+          resolveWindowsCommandCandidates("synara-process-local-cache-probe-that-must-not-exist", {
+            platform: "win32",
+            cwd: root,
+            env: {
+              PATH: "",
+              PATHEXT: ".COM;.EXE;.BAT;.CMD",
+              SYSTEMROOT: resolveWindowsSystemRoot(process.env),
+            },
+          }),
+        ).toEqual([]);
+        expect(getWindowsCommandDiscoveryCacheStats()).toEqual({ size: 1 });
+        clearWindowsCommandDiscoveryCache();
+        expect(getWindowsCommandDiscoveryCacheStats()).toEqual({ size: 0 });
+      } finally {
+        clearWindowsCommandDiscoveryCache();
+        rmSync(root, { force: true, recursive: true });
+      }
     });
   });
 

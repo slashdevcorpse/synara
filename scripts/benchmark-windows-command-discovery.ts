@@ -205,6 +205,22 @@ export interface NodeDuplicateEnvironmentOracle {
     readonly duplicateKeyCount: number;
     readonly valueSha256ByKey: Readonly<Record<string, string>>;
   };
+  readonly bunToNodeBoundary: {
+    readonly forward: {
+      readonly runtime: NodeRuntimeEvidence;
+      readonly inputPathKeys: readonly string[];
+      readonly pathKeys: readonly string[];
+      readonly duplicateKeyCount: number;
+      readonly valueSha256ByKey: Readonly<Record<string, string>>;
+    };
+    readonly reverse: {
+      readonly runtime: NodeRuntimeEvidence;
+      readonly inputPathKeys: readonly string[];
+      readonly pathKeys: readonly string[];
+      readonly duplicateKeyCount: number;
+      readonly valueSha256ByKey: Readonly<Record<string, string>>;
+    };
+  };
   readonly normalizedChildEnvironment: {
     readonly pathKeys: readonly string[];
     readonly duplicateKeyCount: number;
@@ -346,6 +362,10 @@ export function parseBenchmarkArgs(
 
 export function hashFixtureLabel(value: string): string {
   return createHash("sha256").update(value).digest("hex");
+}
+
+export function hashFileSha256(path: string): string {
+  return createHash("sha256").update(readFileSync(path)).digest("hex");
 }
 
 function percentile(sorted: readonly number[], fraction: number): number {
@@ -1535,15 +1555,25 @@ function countCaseInsensitiveDuplicateKeys(keys: readonly string[]): number {
   return keys.length - new Set(keys.map((key) => key.toUpperCase())).size;
 }
 
-function nodeRuntimeEvidence(runtime: {
+export function createNodeRuntimeEvidenceCollector(
+  hashExecutable: (path: string) => string = hashFileSha256,
+): (runtime: {
   readonly name: string;
   readonly version: string;
   readonly execPath: string;
-}): NodeRuntimeEvidence {
-  return {
-    name: runtime.name,
-    version: runtime.version,
-    execPathSha256: hashFixtureLabel(runtime.execPath),
+}) => NodeRuntimeEvidence {
+  const execPathSha256ByPath = new Map<string, string>();
+  return (runtime) => {
+    let execPathSha256 = execPathSha256ByPath.get(runtime.execPath);
+    if (execPathSha256 === undefined) {
+      execPathSha256 = hashExecutable(runtime.execPath);
+      execPathSha256ByPath.set(runtime.execPath, execPathSha256);
+    }
+    return {
+      name: runtime.name,
+      version: runtime.version,
+      execPathSha256,
+    };
   };
 }
 
@@ -1562,6 +1592,25 @@ export function evaluateNodeDuplicateEnvironmentOracle(
   input: Omit<NodeDuplicateEnvironmentOracle, "passed">,
 ): boolean {
   const expectedCandidate = "winner-bin/synara-node-environment-oracle.cmd";
+  const rawMixedPathSha256 = input.rawCallerEnvironment.valueSha256ByKey.Path;
+  const rawWinningPathSha256 = input.rawCallerEnvironment.valueSha256ByKey.PATH;
+  const rawForwardBoundary = input.bunToNodeBoundary.forward;
+  const rawReverseBoundary = input.bunToNodeBoundary.reverse;
+  const isValidRawBoundary = (
+    boundary: typeof rawForwardBoundary,
+    expectedInputPathKeys: string,
+  ) => {
+    const pathValue = boundary.valueSha256ByKey.PATH;
+    return (
+      runtimeMatchesExpected(boundary.runtime, input.expectedRuntime) &&
+      boundary.inputPathKeys.join("\0") === expectedInputPathKeys &&
+      boundary.duplicateKeyCount === 1 &&
+      boundary.pathKeys.join("\0") === "PATH\0Path" &&
+      pathValue !== undefined &&
+      pathValue === boundary.valueSha256ByKey.Path &&
+      (pathValue === rawMixedPathSha256 || pathValue === rawWinningPathSha256)
+    );
+  };
   return (
     input.launcherRuntime.name === "bun" &&
     input.launcherRuntime.version.length > 0 &&
@@ -1571,8 +1620,11 @@ export function evaluateNodeDuplicateEnvironmentOracle(
     runtimeMatchesExpected(input.serializerRuntime, input.expectedRuntime) &&
     input.rawCallerEnvironment.duplicateKeyCount === 1 &&
     input.rawCallerEnvironment.pathKeys.join("\0") === "PATH\0Path" &&
-    input.rawCallerEnvironment.valueSha256ByKey.PATH === input.expectedValueSha256 &&
-    input.rawCallerEnvironment.valueSha256ByKey.Path !== input.expectedValueSha256 &&
+    rawWinningPathSha256 === input.expectedValueSha256 &&
+    rawMixedPathSha256 !== undefined &&
+    rawMixedPathSha256 !== input.expectedValueSha256 &&
+    isValidRawBoundary(rawForwardBoundary, "Path\0PATH") &&
+    isValidRawBoundary(rawReverseBoundary, "PATH\0Path") &&
     input.normalizedChildEnvironment.duplicateKeyCount === 0 &&
     input.normalizedChildEnvironment.pathKeys.length === 1 &&
     input.normalizedChildEnvironment.pathKeys[0] === input.expectedKey &&
@@ -1623,6 +1675,7 @@ export function runNodeDuplicateEnvironmentOracle(): NodeDuplicateEnvironmentOra
       },
     ),
   ) as { readonly name: string; readonly execPath: string; readonly version: string };
+  const collectNodeRuntimeEvidence = createNodeRuntimeEvidenceCollector();
   const root = mkdtempSync(join(tmpdir(), "synara-node-environment-oracle-"));
   const winnerBin = join(root, "winner-bin");
   const mixedBin = join(root, "mixed-bin");
@@ -1659,6 +1712,8 @@ export function runNodeDuplicateEnvironmentOracle(): NodeDuplicateEnvironmentOra
       Object.keys(env)
         .filter((key) => key.toUpperCase() === "PATH")
         .toSorted();
+    const inputPathKeys = (env: NodeJS.ProcessEnv) =>
+      Object.keys(env).filter((key) => key.toUpperCase() === "PATH");
     const rawPathKeys = pathKeys(rawCallerEnvironment);
     const normalizedPathKeys = pathKeys(normalizedChildEnvironment);
     const normalizedEffectiveKey = normalizedPathKeys[0] ?? null;
@@ -1680,15 +1735,7 @@ process.stdout.write(JSON.stringify({
   values: keys.map((key) => process.env[key]),
 }));
 `;
-    const serializerOutput = JSON.parse(
-      execFileSync(nodeDescriptor.execPath, ["-e", observerSource], {
-        encoding: "utf8",
-        env: normalizedChildEnvironment,
-        maxBuffer: NODE_ORACLE_MAX_BUFFER_BYTES,
-        timeout: NODE_ORACLE_TIMEOUT_MS,
-        windowsHide: true,
-      }),
-    ) as {
+    type NodeEnvironmentObservation = {
       readonly runtime: {
         readonly name: string;
         readonly version: string;
@@ -1697,6 +1744,34 @@ process.stdout.write(JSON.stringify({
       readonly keys: readonly string[];
       readonly values: readonly string[];
     };
+    const observeNodeEnvironment = (env: NodeJS.ProcessEnv): NodeEnvironmentObservation =>
+      JSON.parse(
+        execFileSync(nodeDescriptor.execPath, ["-e", observerSource], {
+          encoding: "utf8",
+          env,
+          maxBuffer: NODE_ORACLE_MAX_BUFFER_BYTES,
+          timeout: NODE_ORACLE_TIMEOUT_MS,
+          windowsHide: true,
+        }),
+      ) as NodeEnvironmentObservation;
+    // Deliberately cross the Bun-to-Node boundary with both aliases intact.
+    // The raw observations prove the serializer behavior that makes explicit
+    // normalization necessary; the normalized observation proves our child env.
+    const rawForwardBoundaryOutput = observeNodeEnvironment(rawCallerEnvironment);
+    const rawReverseBoundaryOutput = observeNodeEnvironment(reverseCallerEnvironment);
+    const serializerOutput = observeNodeEnvironment(normalizedChildEnvironment);
+    const toBoundaryEvidence = (
+      output: NodeEnvironmentObservation,
+      inputEnvironment: NodeJS.ProcessEnv,
+    ) => ({
+      runtime: collectNodeRuntimeEvidence(output.runtime),
+      inputPathKeys: inputPathKeys(inputEnvironment),
+      pathKeys: output.keys,
+      duplicateKeyCount: countCaseInsensitiveDuplicateKeys(output.keys),
+      valueSha256ByKey: Object.fromEntries(
+        output.keys.map((key, index) => [key, hashFixtureLabel(output.values[index] ?? "")]),
+      ),
+    });
     const serializerEffectiveKey = serializerOutput.keys[0] ?? null;
     const serializerEffectiveValue = serializerOutput.values[0] ?? null;
     const cache = createWindowsCommandDiscoveryCache();
@@ -1740,17 +1815,17 @@ process.stdout.write(JSON.stringify({
     const expectedValueSha256 = hashFixtureLabel(winnerBin);
     const evidence: Omit<NodeDuplicateEnvironmentOracle, "passed"> = {
       launcherRuntime: { name: "bun", version: Bun.version },
-      expectedRuntime: {
-        name: "node",
-        version: nodeDescriptor.version,
-        execPathSha256: hashFixtureLabel(nodeDescriptor.execPath),
-      },
+      expectedRuntime: collectNodeRuntimeEvidence(nodeDescriptor),
       rawCallerEnvironment: {
         pathKeys: rawPathKeys,
         duplicateKeyCount: countCaseInsensitiveDuplicateKeys(rawPathKeys),
         valueSha256ByKey: Object.fromEntries(
           rawPathKeys.map((key) => [key, hashFixtureLabel(rawCallerEnvironment[key] ?? "")]),
         ),
+      },
+      bunToNodeBoundary: {
+        forward: toBoundaryEvidence(rawForwardBoundaryOutput, rawCallerEnvironment),
+        reverse: toBoundaryEvidence(rawReverseBoundaryOutput, reverseCallerEnvironment),
       },
       normalizedChildEnvironment: {
         pathKeys: normalizedPathKeys,
@@ -1762,7 +1837,7 @@ process.stdout.write(JSON.stringify({
           JSON.stringify(normalizedChildEnvironment) ===
           JSON.stringify(reverseNormalizedChildEnvironment),
       },
-      serializerRuntime: nodeRuntimeEvidence(serializerOutput.runtime),
+      serializerRuntime: collectNodeRuntimeEvidence(serializerOutput.runtime),
       serializerObservedEnvironment: {
         pathKeys: serializerOutput.keys,
         duplicateKeyCount: countCaseInsensitiveDuplicateKeys(serializerOutput.keys),

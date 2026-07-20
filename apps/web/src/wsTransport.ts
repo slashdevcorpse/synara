@@ -27,6 +27,7 @@ import {
   type OrchestrationThreadStreamItem,
   type ProjectDevServerEvent,
   type ServerConfigStreamEvent,
+  type ServerConfigUpdatedPayload,
   type ServerLifecycleStreamEvent,
   type ServerProviderStatusesUpdatedPayload,
   type ServerSettingsUpdatedPayload,
@@ -265,6 +266,19 @@ export function shouldKeepServerLifecycleStream(activeChannels: ReadonlySet<stri
     activeChannels.has(WS_CHANNELS.serverWelcome) ||
     activeChannels.has(WS_CHANNELS.serverMaintenanceUpdated)
   );
+}
+
+export function projectServerConfigUpdatedPayload(
+  event: ServerConfigStreamEvent,
+): ServerConfigUpdatedPayload | null {
+  if (event.type === "snapshot") {
+    return {
+      issues: event.config.issues,
+      providers: event.config.providers,
+      availableEditors: event.config.availableEditors,
+    };
+  }
+  return event.type === "configUpdated" ? event.payload : null;
 }
 
 export class WsTransport {
@@ -662,14 +676,8 @@ export class WsTransport {
             "server.config",
             client[WS_METHODS.subscribeServerConfig]({}),
             (event: ServerConfigStreamEvent) => {
-              if (event.type === "snapshot") {
-                this.emit(WS_CHANNELS.serverConfigUpdated, {
-                  issues: event.config.issues,
-                  providers: event.config.providers,
-                });
-              } else if (event.type === "configUpdated") {
-                this.emit(WS_CHANNELS.serverConfigUpdated, event.payload);
-              }
+              const payload = projectServerConfigUpdatedPayload(event);
+              if (payload) this.emit(WS_CHANNELS.serverConfigUpdated, payload);
             },
             restartChannel,
           );

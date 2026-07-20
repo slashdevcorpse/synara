@@ -49,6 +49,9 @@ interface CachedPowerShellAppxLookup {
 
 const POWERSHELL_APPX_LOOKUP_TIMEOUT_MS = 1_500;
 const POWERSHELL_APPX_LOOKUP_CACHE_TTL_MS = 300_000;
+const POWERSHELL_APPX_PACKAGE_QUERY =
+  "Get-AppxPackage -Name $packageDef.Name -ErrorAction Stop | " +
+  "Where-Object { $_.PackageFamilyName -ieq $packageDef.Family } | Select-Object -First 1";
 const powershellAppxLookupCache = new Map<string, CachedPowerShellAppxLookup>();
 
 export const WINDOWS_STORE_BULK_LOOKUP_TIMEOUT_MS = 2_000;
@@ -318,8 +321,7 @@ function buildBulkPowerShellPackageScript(
     `$packageDefs = ${packageArray}`,
     "$results = @()",
     "foreach ($packageDef in $packageDefs) {",
-    "  $package = Get-AppxPackage -Name $packageDef.Name -ErrorAction Stop | " +
-      "Where-Object { $_.PackageFamilyName -ieq $packageDef.Family } | Select-Object -First 1",
+    `  $package = ${POWERSHELL_APPX_PACKAGE_QUERY}`,
     "  if ($null -ne $package -and $package.InstallLocation) {",
     "    $results += [PSCustomObject]@{ Family = $package.PackageFamilyName; InstallLocation = $package.InstallLocation }",
     "  }",
@@ -554,14 +556,13 @@ export function resolveWindowsStorePackageDirectoryFromPowerShell(
   const script = [
     `$packages = ${packageArray}`,
     "foreach ($packageDef in $packages) {",
-    "  $package = Get-AppxPackage -Name $packageDef.Name -ErrorAction SilentlyContinue | " +
-      "Where-Object { $_.PackageFamilyName -ieq $packageDef.Family } | Select-Object -First 1",
+    `  $package = ${POWERSHELL_APPX_PACKAGE_QUERY}`,
     "  if ($null -ne $package -and $package.InstallLocation) {",
     "    Write-Output $package.InstallLocation",
     "    exit 0",
     "  }",
     "}",
-    "exit 1",
+    "exit 0",
   ].join("; ");
 
   try {
@@ -580,7 +581,6 @@ export function resolveWindowsStorePackageDirectoryFromPowerShell(
     if (cacheKey) writePowerShellAppxLookupCache(cacheKey, result, now);
     return result;
   } catch {
-    if (cacheKey) writePowerShellAppxLookupCache(cacheKey, null, now);
     return null;
   }
 }
