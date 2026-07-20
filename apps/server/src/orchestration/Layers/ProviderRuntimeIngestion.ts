@@ -2,6 +2,7 @@ import {
   type AssistantDeliveryMode,
   CommandId,
   EventId,
+  isToolLifecycleItemType,
   MessageId,
   type OrchestrationEvent,
   type OrchestrationProjectShell,
@@ -2297,6 +2298,7 @@ const make = Effect.gen(function* () {
           : activeTurnId === null || eventTurnId === undefined || sameId(activeTurnId, eventTurnId);
 
         if (shouldApplyRuntimeError) {
+          yield* clearOutstandingTurns(thread.id);
           yield* orchestrationEngine.dispatch({
             type: "thread.session.set",
             commandId: providerCommandId(event, "runtime-error-session-set", thread.id),
@@ -2410,8 +2412,31 @@ const make = Effect.gen(function* () {
             : event.type === "item.updated" && toolOutputKey
               ? withBufferedToolOutputData(event, yield* getBufferedToolOutput(toolOutputKey))
               : event;
-      yield* Effect.forEach(projectProviderRuntimeActivities(activityEvent), (activity) =>
-        dispatchActivityUpdate(activityEvent, thread.id, activity),
+      const isToolActivityEvent =
+        event.type === "tool.progress" ||
+        ((event.type === "item.started" ||
+          event.type === "item.updated" ||
+          event.type === "item.completed") &&
+          isToolLifecycleItemType(event.payload.itemType));
+      const isUnboundToolActivity = rawEventTurnId === undefined && isToolActivityEvent;
+      let correlatedActivityTurnId: TurnId | undefined;
+      if (isUnboundToolActivity) {
+        const activityTurnCandidates = new Set(
+          (yield* Ref.get(outstandingTurnIdsByThreadRef)).get(thread.id) ?? [],
+        );
+        if (activeTurnId !== null) {
+          activityTurnCandidates.add(activeTurnId);
+        }
+        if (activityTurnCandidates.size === 1) {
+          correlatedActivityTurnId = activityTurnCandidates.values().next().value;
+        }
+      }
+      const correlatedActivityEvent =
+        correlatedActivityTurnId !== undefined
+          ? ({ ...activityEvent, turnId: correlatedActivityTurnId } as ProviderRuntimeEvent)
+          : activityEvent;
+      yield* Effect.forEach(projectProviderRuntimeActivities(correlatedActivityEvent), (activity) =>
+        dispatchActivityUpdate(correlatedActivityEvent, thread.id, activity),
       );
 
       if (isTerminalTurnEvent) {

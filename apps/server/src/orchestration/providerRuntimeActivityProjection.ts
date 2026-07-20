@@ -839,6 +839,7 @@ export function projectProviderRuntimeActivities(
               : (event.payload.title ??
                 (event.type === "item.completed" ? "Tool" : "Tool updated")),
           payload: toActivityPayload({
+            ...(event.itemId ? { providerItemId: event.itemId } : {}),
             itemType: event.payload.itemType,
             ...(event.payload.status ? { status: event.payload.status } : {}),
             ...(event.payload.title ? { title: event.payload.title } : {}),

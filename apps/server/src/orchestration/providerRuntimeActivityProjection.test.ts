@@ -146,6 +146,32 @@ describe("provider runtime activity projection", () => {
     expect(providerActivityUpdateFingerprint(activity!)).toContain('"kind":"tool.updated"');
   });
 
+  it("preserves provider item identity on tool lifecycle activities", () => {
+    const [activity] = projectProviderRuntimeActivities(
+      runtimeEvent({
+        type: "item.started",
+        eventId: "tool-started",
+        turnId: TURN_ID,
+        itemId: RuntimeItemId.makeUnsafe("provider-tool-item"),
+        payload: {
+          itemType: "command_execution",
+          status: "inProgress",
+          title: "Run focused tests",
+          data: { command: "bun run test" },
+        },
+      }),
+    );
+
+    expect(activity).toMatchObject({
+      kind: "tool.started",
+      payload: {
+        providerItemId: "provider-tool-item",
+        itemType: "command_execution",
+        data: { command: "bun run test" },
+      },
+    });
+  });
+
   it("maps canonical approvals and structured user input", () => {
     const approval = projectProviderRuntimeActivities(
       runtimeEvent({
