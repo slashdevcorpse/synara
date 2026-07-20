@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createDesktopSmokeEnvironment,
   createDesktopSmokeSpawnSpec,
+  DESKTOP_SMOKE_WINDOWS_JOB_STARTUP_MS,
   DESKTOP_SMOKE_WINDOWS_SETTLEMENT_MS,
   resolveWindowsPowerShellPath,
   superviseDesktopSmokeProcess,
@@ -554,13 +555,13 @@ describe("desktop smoke process lifecycle", () => {
     });
     const resultPromise = superviseWindowsSmoke(child, { killWindowsTree });
 
-    await vi.advanceTimersByTimeAsync(10_000);
+    await vi.advanceTimersByTimeAsync(DESKTOP_SMOKE_WINDOWS_JOB_STARTUP_MS);
     await vi.advanceTimersByTimeAsync(DESKTOP_SMOKE_WINDOWS_SETTLEMENT_MS);
 
     await expectSettled(resultPromise, {
       ok: false,
       failures: expect.arrayContaining([
-        expect.stringContaining("10000ms startup deadline"),
+        expect.stringContaining(DESKTOP_SMOKE_WINDOWS_JOB_STARTUP_MS + "ms startup deadline"),
         expect.stringContaining("closed before its ready marker"),
       ]),
       teardownDiagnostics: [
