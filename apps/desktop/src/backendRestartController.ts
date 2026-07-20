@@ -173,7 +173,12 @@ export class BackendRestartController {
       return { type: "ignored" };
     }
 
-    const failedPhase = this.activeGeneration.phase;
+    const activeGeneration = this.activeGeneration;
+    if (!activeGeneration) {
+      return { type: "ignored" };
+    }
+
+    const failedPhase = activeGeneration.phase;
     this.clearStabilityTimer();
     this.activeGeneration = null;
     const now = this.now();
@@ -265,7 +270,7 @@ export class BackendRestartController {
     }
 
     const generation: BackendRestartGeneration = Object.freeze({
-      [backendRestartGenerationBrand]: true,
+      [backendRestartGenerationBrand]: true as const,
       id: this.nextGenerationId,
       kind,
       admittedAtMs: this.now(),
