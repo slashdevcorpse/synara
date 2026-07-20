@@ -192,6 +192,12 @@ jobs:
           src/windowState.test.ts
           src/updateState.test.ts
 
+      - name: Run Windows desktop smoke containment regressions
+        run: >-
+          bun run --cwd apps/desktop test
+          scripts/smoke-test.test.mjs
+          scripts/smoke-test-windows-job.windows.integration.test.mjs
+
       - name: Run Super Synara Windows release contract regressions
         run: >-
           bun run --cwd scripts test
@@ -219,7 +225,7 @@ jobs:
           SYNARA_DESKTOP_FLAVOR: super
           SYNARA_HOME: ${{ runner.temp }}\super-synara-ci-home
           SYNARA_PORT_OFFSET: "2710"
-        run: bun run test:desktop-smoke
+        run: bun run --cwd apps/desktop smoke-test
 
   macos_arm64:
     name: macos_arm64

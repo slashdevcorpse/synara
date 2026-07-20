@@ -3,6 +3,7 @@ import path from "node:path";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
+import { splitLines } from "@synara/shared/text";
 import { Effect, FileSystem, Layer, PlatformError, Scope } from "effect";
 import { expect } from "vitest";
 import type { GitActionProgressEvent } from "@synara/contracts";
@@ -2559,7 +2560,9 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
         // The uncommitted change should now live inside the new worktree.
         const transferredPath = path.join(result.worktreePath as string, "uncommitted.txt");
         expect(fs.existsSync(transferredPath)).toBe(true);
-        expect(fs.readFileSync(transferredPath, "utf8")).toBe("draft change\n");
+        expect(splitLines(fs.readFileSync(transferredPath, "utf8")).join("\n")).toBe(
+          "draft change\n",
+        );
 
         // The original local checkout should be clean again.
         expect(fs.existsSync(workingFile)).toBe(false);
