@@ -18,6 +18,7 @@ import {
   readReleaseUpdatePolicyConfig,
   resolveReleaseUpdatePolicy,
 } from "./lib/release-update-policy.ts";
+import { verifyRepositoryEffectLanguageServiceInstallPolicy } from "./lib/effect-language-service-install.ts";
 import {
   RELEASE_LOCKFILE_PATH,
   RELEASE_PATCHES_PATH,
@@ -348,6 +349,7 @@ const tempRoot = mkdtempSync(join(tmpdir(), "synara-release-smoke-"));
 
 try {
   verifyCanonicalIdentity();
+  verifyRepositoryEffectLanguageServiceInstallPolicy(repoRoot);
   verifyReleaseWorkflowSafety();
   verifySuperSynaraWorkflowContracts(repoRoot);
   verifyDesktopStageLockAuthority();
