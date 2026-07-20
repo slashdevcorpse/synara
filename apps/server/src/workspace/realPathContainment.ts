@@ -1,13 +1,19 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
-function isContainedPath(realRoot: string, candidatePath: string): boolean {
-  const relativePath = path.relative(realRoot, candidatePath);
+type ContainmentPathFlavor = Pick<typeof path, "isAbsolute" | "relative" | "resolve" | "sep">;
+
+function isContainedPath(
+  realRoot: string,
+  candidatePath: string,
+  pathFlavor: ContainmentPathFlavor = path,
+): boolean {
+  const relativePath = pathFlavor.relative(realRoot, candidatePath);
   return (
     relativePath === "" ||
     (relativePath !== ".." &&
-      !relativePath.startsWith(`..${path.sep}`) &&
-      !path.isAbsolute(relativePath))
+      !relativePath.startsWith(`..${pathFlavor.sep}`) &&
+      !pathFlavor.isAbsolute(relativePath))
   );
 }
 
@@ -19,8 +25,16 @@ function isAlreadyExistsError(cause: unknown): boolean {
   return (cause as NodeJS.ErrnoException | null)?.code === "EEXIST";
 }
 
-function isLexicallyContainedPath(workspaceRoot: string, absolutePath: string): boolean {
-  return isContainedPath(path.resolve(workspaceRoot), path.resolve(absolutePath));
+export function isLexicallyContainedPath(
+  workspaceRoot: string,
+  absolutePath: string,
+  pathFlavor: ContainmentPathFlavor = path,
+): boolean {
+  return isContainedPath(
+    pathFlavor.resolve(workspaceRoot),
+    pathFlavor.resolve(absolutePath),
+    pathFlavor,
+  );
 }
 
 // String-level containment checks (path.resolve + path.relative) cannot see

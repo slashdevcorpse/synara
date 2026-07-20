@@ -23,6 +23,11 @@ import {
 } from "./opencodeRuntime.ts";
 
 const encoder = new TextEncoder();
+const prepareMockProcess = (command: string, args: ReadonlyArray<string>) => ({
+  command,
+  args: [...args],
+  shell: false,
+});
 
 function mockOpenCodeServerHandle(input: {
   stdout: string;
@@ -103,7 +108,7 @@ function openCodeRuntimePoolTestLayer(state: {
   const processUrls = new Map<number, string>();
   return Layer.merge(
     makeOpenCodeRuntimeLive({
-      prepareProcess: (command, args) => ({ command, args: [...args], shell: false }),
+      prepareProcess: prepareMockProcess,
       teardownProcessTree: async ({ rootPid }) => {
         const url = processUrls.get(rootPid);
         if (url) state.killUrls.push(url);
@@ -195,6 +200,35 @@ describe("buildOpenCodeServerProcessEnv", () => {
 });
 
 describe("OpenCodeRuntime startup diagnostics", () => {
+  it("detects the ready server URL in CRLF process output", async () => {
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const runtime = yield* OpenCodeRuntime;
+          return yield* runtime.startOpenCodeServerProcess({ binaryPath: "/custom/bin/opencode" });
+        }),
+      ).pipe(
+        Effect.provide(
+          makeOpenCodeRuntimeLive({
+            prepareProcess: prepareMockProcess,
+            teardownProcessTree: async () => ({ escalated: false, signalErrors: [] }),
+          }).pipe(
+            Layer.provide(
+              mockOpenCodeServerSpawnerLayer({
+                stdout:
+                  "booting custom OpenCode wrapper\r\n" +
+                  "opencode server listening on http://127.0.0.1:59000\r\n",
+                stderr: "",
+              }),
+            ),
+          ),
+        ),
+      ),
+    );
+
+    expect(result.url).toBe("http://127.0.0.1:59000");
+  });
+
   it("includes command and partial process output when server startup times out", async () => {
     const error = await Effect.runPromise(
       Effect.scoped(
@@ -212,6 +246,7 @@ describe("OpenCodeRuntime startup diagnostics", () => {
       ).pipe(
         Effect.provide(
           makeOpenCodeRuntimeLive({
+            prepareProcess: prepareMockProcess,
             teardownProcessTree: async () => ({ escalated: false, signalErrors: [] }),
           }).pipe(
             Layer.provide(
@@ -252,6 +287,7 @@ describe("OpenCodeRuntime startup diagnostics", () => {
       ).pipe(
         Effect.provide(
           makeOpenCodeRuntimeLive({
+            prepareProcess: prepareMockProcess,
             teardownProcessTree: async () => ({ escalated: false, signalErrors: [] }),
           }).pipe(
             Layer.provide(
@@ -286,6 +322,7 @@ describe("OpenCodeRuntime local server pool", () => {
     });
     let teardownCalls = 0;
     const layer = makeOpenCodeRuntimeLive({
+      prepareProcess: prepareMockProcess,
       teardownProcessTree: async ({ rootPid }) => {
         teardownCalls += 1;
         expect(rootPid).toBe(1);

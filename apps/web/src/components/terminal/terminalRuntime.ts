@@ -1335,6 +1335,7 @@ export function syncRuntimeConfig(
   } else {
     entry.runtimeEnv = config.runtimeEnv;
   }
+  entry.terminalRightClickToPaste = config.terminalRightClickToPaste ?? false;
   entry.callbacks = config.callbacks;
 }
 
@@ -1397,6 +1398,7 @@ export function createRuntimeEntry(config: TerminalRuntimeConfig): TerminalRunti
     terminalLabel: config.terminalLabel,
     terminalCliKind: config.terminalCliKind ?? null,
     cwd: config.cwd,
+    terminalRightClickToPaste: config.terminalRightClickToPaste ?? false,
     callbacks: config.callbacks,
     wrapper,
     container: null,
@@ -1476,6 +1478,40 @@ export function createRuntimeEntry(config: TerminalRuntimeConfig): TerminalRunti
   wrapper.addEventListener("copy", handleCopy);
   entry.persistentDisposables.push(() => {
     wrapper.removeEventListener("copy", handleCopy);
+  });
+
+  const handleContextMenu = (event: MouseEvent) => {
+    const clipboard = globalThis.navigator?.clipboard;
+    if (
+      event.button !== 2 ||
+      event.ctrlKey ||
+      !entry.terminalRightClickToPaste ||
+      typeof clipboard?.readText !== "function"
+    ) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    terminal.focus();
+    let clipboardText: Promise<string>;
+    try {
+      clipboardText = clipboard.readText();
+    } catch {
+      return;
+    }
+    void clipboardText
+      .then((text) => {
+        if (entry.disposed || !entry.terminalRightClickToPaste || text.length === 0) {
+          return;
+        }
+        terminal.paste(text);
+      })
+      .catch(() => undefined);
+  };
+  wrapper.addEventListener("contextmenu", handleContextMenu);
+  entry.persistentDisposables.push(() => {
+    wrapper.removeEventListener("contextmenu", handleContextMenu);
   });
 
   const unsubscribeTransportState = addWsTransportStateListener((state) => {
