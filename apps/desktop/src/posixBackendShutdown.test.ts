@@ -9,11 +9,13 @@ class FakePosixBackendProcess implements PosixBackendShutdownProcess {
   signalCode: NodeJS.Signals | null = null;
   readonly signals: ShutdownSignal[] = [];
   onKill: ((signal: ShutdownSignal) => boolean) | null = null;
+  onOnce: (() => void) | null = null;
 
   readonly #exitListeners = new Set<() => void>();
 
   once(event: "exit", listener: () => void): this {
     expect(event).toBe("exit");
+    this.onOnce?.();
     this.#exitListeners.add(listener);
     return this;
   }
@@ -82,6 +84,48 @@ describe("stopPosixBackendAndWait", () => {
     expect(child.signals).toEqual([]);
     expect(child.exitListenerCount).toBe(0);
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("shares one shutdown operation and first-call policy across concurrent callers", async () => {
+    const child = new FakePosixBackendProcess();
+    const firstShutdown = stopChild(child, { forceKillDelayMs: 100, timeoutMs: 250 });
+    const secondShutdown = stopChild(child, { forceKillDelayMs: 10, timeoutMs: 20 });
+
+    expect(secondShutdown).toBe(firstShutdown);
+    expect(child.signals).toEqual(["SIGTERM"]);
+    expect(child.exitListenerCount).toBe(1);
+    expect(vi.getTimerCount()).toBe(2);
+
+    await vi.advanceTimersByTimeAsync(99);
+    expect(child.signals).toEqual(["SIGTERM"]);
+    expect(child.exitListenerCount).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect(child.signals).toEqual(["SIGTERM", "SIGKILL"]);
+    expect(child.exitListenerCount).toBe(1);
+    expect(vi.getTimerCount()).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(149);
+    expect(child.signals).toEqual(["SIGTERM", "SIGKILL"]);
+    expect(child.exitListenerCount).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(1);
+    const [firstDisposition, secondDisposition] = await Promise.all([
+      firstShutdown,
+      secondShutdown,
+    ]);
+    expect(firstDisposition).toEqual({
+      type: "timed-out",
+      exitConfirmed: false,
+      forced: true,
+    });
+    expect(secondDisposition).toBe(firstDisposition);
+    expect(child.signals).toEqual(["SIGTERM", "SIGKILL"]);
+    expect(child.exitListenerCount).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(child.signals).toEqual(["SIGTERM", "SIGKILL"]);
   });
 
   it("confirms a SIGTERM exit and cancels both pending timers", async () => {
@@ -170,23 +214,91 @@ describe("stopPosixBackendAndWait", () => {
     expect(child.exitListenerCount).toBe(0);
     expect(vi.getTimerCount()).toBe(0);
 
-    child.confirmExit(0, null);
     await vi.advanceTimersByTimeAsync(1_000);
     expect(child.signals).toEqual(["SIGTERM", "SIGKILL"]);
+
+    const retry = stopChild(child);
+    expect(retry).not.toBe(shutdown);
+    expect(child.signals).toEqual(["SIGTERM", "SIGKILL", "SIGTERM"]);
+    expect(child.exitListenerCount).toBe(1);
+
+    child.confirmExit(0, null);
+    await expect(retry).resolves.toEqual({
+      type: "exited",
+      exitConfirmed: true,
+      forced: false,
+    });
+    expect(child.exitListenerCount).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("fails synchronously and cleans up when SIGTERM delivery throws", async () => {
+  it("shares a SIGTERM delivery failure and permits a distinct retry", async () => {
     const child = new FakePosixBackendProcess();
     child.onKill = () => {
       throw new Error("SIGTERM unavailable");
     };
 
-    await expect(stopChild(child)).resolves.toEqual({
+    const firstShutdown = stopChild(child);
+    const secondShutdown = stopChild(child, { forceKillDelayMs: 10, timeoutMs: 20 });
+    expect(secondShutdown).toBe(firstShutdown);
+
+    const [firstDisposition, secondDisposition] = await Promise.all([
+      firstShutdown,
+      secondShutdown,
+    ]);
+    expect(firstDisposition).toEqual({
       type: "failed",
       exitConfirmed: false,
       forced: false,
     });
+    expect(secondDisposition).toBe(firstDisposition);
     expect(child.signals).toEqual(["SIGTERM"]);
+    expect(child.exitListenerCount).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+
+    child.onKill = null;
+    const retry = stopChild(child);
+    expect(retry).not.toBe(firstShutdown);
+    expect(child.signals).toEqual(["SIGTERM", "SIGTERM"]);
+    expect(child.exitListenerCount).toBe(1);
+
+    child.confirmExit(0, null);
+    await expect(retry).resolves.toEqual({
+      type: "exited",
+      exitConfirmed: true,
+      forced: false,
+    });
+    expect(child.exitListenerCount).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("shares an unexpected setup rejection and clears it for retry", async () => {
+    const child = new FakePosixBackendProcess();
+    const setupError = new Error("exit listener unavailable");
+    child.onOnce = () => {
+      throw setupError;
+    };
+
+    const firstShutdown = stopChild(child);
+    const secondShutdown = stopChild(child, { forceKillDelayMs: 10, timeoutMs: 20 });
+    expect(secondShutdown).toBe(firstShutdown);
+    await expect(firstShutdown).rejects.toBe(setupError);
+    expect(child.signals).toEqual([]);
+    expect(child.exitListenerCount).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+
+    child.onOnce = null;
+    const retry = stopChild(child);
+    expect(retry).not.toBe(firstShutdown);
+    expect(child.signals).toEqual(["SIGTERM"]);
+    expect(child.exitListenerCount).toBe(1);
+
+    child.confirmExit(0, null);
+    await expect(retry).resolves.toEqual({
+      type: "exited",
+      exitConfirmed: true,
+      forced: false,
+    });
     expect(child.exitListenerCount).toBe(0);
     expect(vi.getTimerCount()).toBe(0);
   });

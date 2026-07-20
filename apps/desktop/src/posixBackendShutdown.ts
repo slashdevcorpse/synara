@@ -12,15 +12,24 @@ export type PosixBackendShutdownDisposition =
   | { readonly type: "timed-out"; readonly exitConfirmed: false; readonly forced: boolean }
   | { readonly type: "failed"; readonly exitConfirmed: false; readonly forced: boolean };
 
+interface PosixBackendShutdownInput {
+  readonly child: PosixBackendShutdownProcess;
+  readonly forceKillDelayMs: number;
+  readonly timeoutMs: number;
+}
+
+const activeShutdowns = new WeakMap<
+  PosixBackendShutdownProcess,
+  Promise<PosixBackendShutdownDisposition>
+>();
+
 function hasBackendProcessExited(child: PosixBackendShutdownProcess): boolean {
   return child.exitCode !== null || child.signalCode !== null;
 }
 
-export async function stopPosixBackendAndWait(input: {
-  readonly child: PosixBackendShutdownProcess;
-  readonly forceKillDelayMs: number;
-  readonly timeoutMs: number;
-}): Promise<PosixBackendShutdownDisposition> {
+async function runPosixBackendShutdown(
+  input: PosixBackendShutdownInput,
+): Promise<PosixBackendShutdownDisposition> {
   if (hasBackendProcessExited(input.child)) {
     return { type: "already-exited", exitConfirmed: true, forced: false };
   }
@@ -101,4 +110,23 @@ export async function stopPosixBackendAndWait(input: {
     }, input.timeoutMs);
     exitTimeoutTimer.unref();
   });
+}
+
+export function stopPosixBackendAndWait(
+  input: PosixBackendShutdownInput,
+): Promise<PosixBackendShutdownDisposition> {
+  const activeShutdown = activeShutdowns.get(input.child);
+  if (activeShutdown) {
+    return activeShutdown;
+  }
+
+  const shutdown = runPosixBackendShutdown(input);
+  activeShutdowns.set(input.child, shutdown);
+  const clearShutdown = (): void => {
+    if (activeShutdowns.get(input.child) === shutdown) {
+      activeShutdowns.delete(input.child);
+    }
+  };
+  void shutdown.then(clearShutdown, clearShutdown);
+  return shutdown;
 }
