@@ -755,8 +755,8 @@ describe("recovered terminal snapshot replay in real xterm", () => {
     const before = "BEFORE-REGISTRATION-GAP";
     const gap = "\r\nOUTPUT-IN-REGISTRATION-GAP";
     let readinessCalls = 0;
-    let resolveRecoveryReadiness: ((ready: { type: "ready"; generation: string }) => void) | null =
-      null;
+    let resolveRecoveryReadiness: (ready: { type: "ready"; generation: string }) => void = () =>
+      undefined;
     let snapshotCalls = 0;
     let terminalEventListener: ((event: TerminalEvent) => void) | undefined;
     const recoveryReadiness = new Promise<{ type: "ready"; generation: string }>((resolve) => {
@@ -828,7 +828,7 @@ describe("recovered terminal snapshot replay in real xterm", () => {
         data: gap,
         byteLength: new TextEncoder().encode(gap).byteLength,
       });
-      resolveRecoveryReadiness?.({ type: "ready", generation: "generation-1" });
+      resolveRecoveryReadiness({ type: "ready", generation: "generation-1" });
 
       await waitForCondition(
         () =>

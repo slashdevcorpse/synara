@@ -146,8 +146,12 @@ describe("WsTransport", () => {
     expect(
       handleTerminalResnapshotRequiredFailure(
         cause,
-        () => order.push("reattach-stream"),
-        () => order.push("replace-from-snapshot"),
+        () => {
+          order.push("reattach-stream");
+        },
+        () => {
+          order.push("replace-from-snapshot");
+        },
       ),
     ).toBe(true);
     expect(order).toEqual(["reattach-stream"]);
@@ -177,7 +181,9 @@ describe("WsTransport", () => {
             };
           });
         },
-        () => order.push("replace-from-snapshot"),
+        () => {
+          order.push("replace-from-snapshot");
+        },
       ),
     ).toBe(true);
     expect(order).toEqual(["reattach-requested"]);
