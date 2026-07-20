@@ -46,20 +46,24 @@ describe("Super Synara workflow contracts", () => {
         audit,
       ),
     ).toThrow("missing or placeholder macOS signature policy");
-    for (const mode of ["prepare", "verify"] as const) {
-      const commandIndex = main.indexOf(`node scripts/prepare-super-synara-release.ts ${mode}`);
-      const forged =
-        main.slice(0, commandIndex) +
-        main
-          .slice(commandIndex)
-          .replace(
-            "--mac-signature-allowlist scripts/super-synara-macos-signature-allowlist.json",
-            "--mac-signature-allowlist forged.json",
-          );
-      expect(() => verifySuperSynaraWorkflowText(forged, audit)).toThrow(
-        "preparation and revalidation must use the reviewed macOS signature allowlist",
-      );
-    }
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replaceAll(
+          "--mac-signature-allowlist scripts/super-synara-macos-signature-allowlist.json",
+          "--mac-signature-allowlist forged.json",
+        ),
+        audit,
+      ),
+    ).toThrow("pass the reviewed macOS allowlist only for the combined scope");
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          "- name: Require reviewed macOS signature policy\n        if: ${{ steps.meta.outputs.include_macos == 'true' }}",
+          "- name: Require reviewed macOS signature policy",
+        ),
+        audit,
+      ),
+    ).toThrow("macOS signature policy must gate only the combined release scope");
   });
 
   it("rejects root Playwright lookup and missing source-cleanliness checks", () => {
@@ -196,6 +200,46 @@ describe("Super Synara workflow contracts", () => {
       ),
     ).toThrow("windows_x64 job must be unconditional and fail closed");
 
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          "    if: ${{ needs.preflight.outputs.include_macos == 'true' }}",
+          "    if: false",
+        ),
+        audit,
+      ),
+    ).toThrow("macos_arm64 job must use the exact release-scope condition");
+
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace("needs.macos_arm64.result == 'skipped'", "true"),
+        audit,
+      ),
+    ).toThrow("publish job must fail closed over the exact selected native lanes");
+
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace("  publish:\n", "  publish:\n    continue-on-error: true\n"),
+        audit,
+      ),
+    ).toThrow("publish job must fail closed");
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace("  publish:\n", "  publish:\n    continue-on-error: false\n"),
+        audit,
+      ),
+    ).not.toThrow();
+
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          "      - name: Download macOS lane\n        if: ${{ needs.preflight.outputs.include_macos == 'true' }}",
+          "      - name: Download macOS lane",
+        ),
+        audit,
+      ),
+    ).toThrow("download macOS only for the combined release scope");
+
     const validatorStep =
       "      - name: Validate workflow contracts\n        run: node scripts/verify-workflow-contracts.ts\n\n";
     const reorderedValidator = main
@@ -274,6 +318,91 @@ describe("Super Synara workflow contracts", () => {
         audit,
       ),
     ).toThrow("plan-locked concurrency group");
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace("default: windows-only", "default: windows-and-macos"),
+        audit,
+      ),
+    ).toThrow("release-scope contract");
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace('--release-scope "$RELEASE_SCOPE"', '--release-scope "windows-x64"'),
+        audit,
+      ),
+    ).toThrow("bind the selected scope");
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          "            windows-only)\n              include_macos=false\n              asset_count=6",
+          "            windows-only)\n              include_macos=true\n              asset_count=8",
+        ),
+        audit,
+      ),
+    ).toThrow("must map windows-only to include_macos=false and asset_count=6");
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          "            windows-and-macos)\n              include_macos=true\n              asset_count=8",
+          "            windows-and-macos)\n              include_macos=false\n              asset_count=6",
+        ),
+        audit,
+      ),
+    ).toThrow("must map windows-and-macos to include_macos=true and asset_count=8");
+
+    const exactScopeArms = `            windows-only)
+              include_macos=false
+              asset_count=6
+              ;;
+            windows-and-macos)
+              include_macos=true
+              asset_count=8
+              ;;
+            *)
+              echo "Unsupported release scope: $RELEASE_SCOPE" >&2
+              exit 1
+              ;;`;
+    const wildcardFirstScopeArms = `            *)
+              echo "Unsupported release scope: $RELEASE_SCOPE" >&2
+              exit 1
+              ;;
+            windows-only)
+              include_macos=false
+              asset_count=6
+              ;;
+            windows-and-macos)
+              include_macos=true
+              asset_count=8
+              ;;`;
+    expect(() =>
+      verifySuperSynaraWorkflowText(main.replace(exactScopeArms, wildcardFirstScopeArms), audit),
+    ).toThrow("exact ordered windows-only, windows-and-macos, and rejecting wildcard arms");
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          '              echo "Unsupported release scope: $RELEASE_SCOPE" >&2\n              exit 1',
+          "              include_macos=false\n              asset_count=6",
+        ),
+        audit,
+      ),
+    ).toThrow("must map *");
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          '          case "$RELEASE_SCOPE" in',
+          '          RELEASE_SCOPE=windows-and-macos\n          case "$RELEASE_SCOPE" in',
+        ),
+        audit,
+      ),
+    ).toThrow("complete scope metadata data flow");
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          '          esac\n          echo "version=$VERSION"',
+          '          esac\n          include_macos=true\n          asset_count=8\n          echo "version=$VERSION"',
+        ),
+        audit,
+      ),
+    ).toThrow("complete scope metadata data flow");
   });
 
   it("rejects removal of native Windows installer lifecycle qualification", () => {
