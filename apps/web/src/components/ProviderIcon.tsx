@@ -5,7 +5,7 @@
  * branching across every UI surface.
  */
 import { type ProviderKind } from "@synara/contracts";
-import type { ReactNode, SVGProps } from "react";
+import type { HTMLAttributes, ReactNode, SVGProps } from "react";
 
 import { CentralIcon } from "~/lib/central-icons";
 import { cn } from "~/lib/utils";
@@ -24,7 +24,7 @@ import {
 
 export type ProviderIconTone = "default" | "header";
 
-type CentralProviderIconProps = Omit<SVGProps<SVGSVGElement>, "ref"> & {
+type CentralProviderIconProps = Omit<SVGProps<SVGSVGElement>, "children" | "ref"> & {
   readonly title?: string;
 };
 
@@ -73,19 +73,26 @@ const CommandCodeProviderIcon = ({
   "aria-hidden": ariaHidden,
   "aria-label": ariaLabel,
   ...svgProps
-}: CentralProviderIconProps) => (
-  <CentralIcon
-    {...svgProps}
-    name="agentic-coding"
-    label={
-      ariaHidden === true || ariaHidden === "true" || typeof ariaLabel !== "string"
-        ? undefined
-        : ariaLabel
-    }
-    className={className}
-    style={style}
-  />
-);
+}: CentralProviderIconProps) => {
+  // ProviderIcon historically exposes SVG props, while CentralIcon renders a span.
+  // Refs and children are excluded above; the remaining DOM attributes and handlers
+  // have the same runtime behavior and are intentionally forwarded to that span.
+  const centralIconProps = svgProps as Omit<HTMLAttributes<HTMLSpanElement>, "children">;
+
+  return (
+    <CentralIcon
+      {...centralIconProps}
+      name="agentic-coding"
+      label={
+        ariaHidden === true || ariaHidden === "true" || typeof ariaLabel !== "string"
+          ? undefined
+          : ariaLabel
+      }
+      className={className}
+      style={style}
+    />
+  );
+};
 
 export const PROVIDER_ICON_COMPONENT_BY_PROVIDER: Record<ProviderKind, Icon> = {
   codex: OpenAI,
@@ -113,7 +120,7 @@ export function providerIconToneClassName(
   return "text-foreground";
 }
 
-export type ProviderIconProps = Omit<SVGProps<SVGSVGElement>, "ref"> & {
+export type ProviderIconProps = Omit<SVGProps<SVGSVGElement>, "children" | "ref"> & {
   readonly provider: ProviderKind | null | undefined;
   readonly fallback?: ReactNode;
   readonly tone?: ProviderIconTone;
