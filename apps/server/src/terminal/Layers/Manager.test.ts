@@ -19,6 +19,10 @@ import {
 } from "../Services/PTY";
 import { TerminalManagerRuntime, type TerminalSubprocessActivity } from "./Manager";
 import type { ProcessTreeKiller } from "../processTreeKiller";
+import type {
+  WindowsProcessSnapshotCollector,
+  WindowsProcessSnapshotResult,
+} from "../windowsProcessSnapshot";
 import { Effect, Encoding } from "effect";
 import {
   createTerminalHistoryMetadata,
@@ -145,6 +149,72 @@ function waitFor(predicate: () => boolean, timeoutMs = 800): Promise<void> {
   });
 }
 
+function pollSubprocessActivity(manager: TerminalManagerRuntime): Promise<void> {
+  return (
+    manager as unknown as { pollSubprocessActivity: () => Promise<void> }
+  ).pollSubprocessActivity();
+}
+
+function isSubprocessPollInFlight(manager: TerminalManagerRuntime): boolean {
+  return (manager as unknown as { subprocessPollInFlight: boolean }).subprocessPollInFlight;
+}
+
+function subprocessState(
+  manager: TerminalManagerRuntime,
+  threadId = "thread-1",
+  terminalId = "default",
+): {
+  readonly detectedCliKind: string | null;
+  readonly hasRunningSubprocess: boolean;
+  readonly providerDescendantObserved: boolean;
+} {
+  const sessions = (
+    manager as unknown as {
+      sessions: Map<
+        string,
+        {
+          detectedCliKind: string | null;
+          hasRunningSubprocess: boolean;
+          providerDescendantObserved: boolean;
+        }
+      >;
+    }
+  ).sessions;
+  const session = sessions.get(`${threadId}\u0000${terminalId}`);
+  if (!session) throw new Error(`Missing test terminal session: ${threadId}/${terminalId}`);
+  return session;
+}
+
+function completeWindowsSnapshot(
+  entries: Array<{ ppid: number; pid: number; command: string }>,
+): WindowsProcessSnapshotResult {
+  const childrenByParentPid = new Map<
+    number,
+    Array<{ readonly pid: number; readonly command: string }>
+  >();
+  for (const { ppid, pid, command } of entries) {
+    const children = childrenByParentPid.get(ppid) ?? [];
+    children.push({ pid, command });
+    childrenByParentPid.set(ppid, children);
+  }
+  return {
+    kind: "ok",
+    processCount: entries.length,
+    childrenByParentPid,
+  };
+}
+
+function deferred<T>(): {
+  readonly promise: Promise<T>;
+  readonly resolve: (value: T) => void;
+} {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
+}
+
 function openInput(overrides: Partial<TerminalOpenInput> = {}): TerminalOpenInput {
   return {
     threadId: "thread-1",
@@ -196,6 +266,8 @@ describe("TerminalManager", () => {
     shellEnvironment?: NodeJS.ProcessEnv;
     windowsShellSelectionDependencies?: WindowsShellSelectionDependencies;
     subprocessChecker?: (terminalPid: number) => Promise<boolean | TerminalSubprocessActivity>;
+    subprocessPlatform?: NodeJS.Platform;
+    windowsProcessSnapshotCollector?: WindowsProcessSnapshotCollector;
     processTreeKiller?: ProcessTreeKiller;
     subprocessPollIntervalMs?: number;
     processKillGraceMs?: number;
@@ -218,6 +290,7 @@ describe("TerminalManager", () => {
   );
 
   afterEach(() => {
+    vi.restoreAllMocks();
     for (const dir of tempDirs.splice(0, tempDirs.length)) {
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -241,6 +314,10 @@ describe("TerminalManager", () => {
         ? { windowsShellSelectionDependencies: options.windowsShellSelectionDependencies }
         : {}),
       ...(options.subprocessChecker ? { subprocessChecker: options.subprocessChecker } : {}),
+      ...(options.subprocessPlatform ? { subprocessPlatform: options.subprocessPlatform } : {}),
+      ...(options.windowsProcessSnapshotCollector
+        ? { windowsProcessSnapshotCollector: options.windowsProcessSnapshotCollector }
+        : {}),
       ...(options.processTreeKiller ? { processTreeKiller: options.processTreeKiller } : {}),
       ...(options.subprocessPollIntervalMs
         ? { subprocessPollIntervalMs: options.subprocessPollIntervalMs }
@@ -959,6 +1036,305 @@ describe("TerminalManager", () => {
         events.some((event) => event.type === "activity" && event.hasRunningSubprocess === false),
       1_200,
     );
+
+    manager.dispose();
+  });
+
+  it.each([1, 8, 32])(
+    "shares one completed Windows snapshot across %i running terminals in a poll cycle",
+    async (terminalCount) => {
+      let result = completeWindowsSnapshot([]);
+      let collectorCalls = 0;
+      const processTreeKiller: ProcessTreeKiller = {
+        capture: () => ({ descendants: [], captureComplete: true }),
+        signal: () => undefined,
+      };
+      const { manager } = makeManager(5, {
+        processTreeKiller,
+        subprocessPlatform: "win32",
+        subprocessPollIntervalMs: 60_000,
+        windowsProcessSnapshotCollector: async () => {
+          collectorCalls += 1;
+          return result;
+        },
+      });
+      const events: TerminalEvent[] = [];
+      manager.on("event", (event) => {
+        events.push(event);
+      });
+
+      const terminalIds = Array.from({ length: terminalCount }, (_, index) =>
+        index === 0 ? "default" : `terminal-${index + 1}`,
+      );
+      for (const terminalId of terminalIds) {
+        await manager.open(openInput({ terminalId }));
+      }
+      await waitFor(() => !isSubprocessPollInFlight(manager));
+
+      collectorCalls = 0;
+      events.length = 0;
+      result = completeWindowsSnapshot(
+        terminalIds.map((_, index) => ({
+          ppid: 9000 + index,
+          pid: 10_000 + index,
+          command: `node task-${index}.js`,
+        })),
+      );
+      await pollSubprocessActivity(manager);
+
+      expect(collectorCalls).toBe(1);
+      expect(
+        events
+          .filter((event) => event.type === "activity" && event.hasRunningSubprocess === true)
+          .map((event) => event.terminalId)
+          .sort(),
+      ).toEqual([...terminalIds].sort());
+
+      manager.dispose();
+    },
+  );
+
+  it("preserves Windows activity and warns once per contiguous snapshot failure", async () => {
+    let result: WindowsProcessSnapshotResult = completeWindowsSnapshot([]);
+    let collectorCalls = 0;
+    const { manager } = makeManager(5, {
+      subprocessPlatform: "win32",
+      subprocessPollIntervalMs: 60_000,
+      windowsProcessSnapshotCollector: async () => {
+        collectorCalls += 1;
+        return result;
+      },
+    });
+    const events: TerminalEvent[] = [];
+    manager.on("event", (event) => {
+      events.push(event);
+    });
+
+    await manager.open(openInput());
+    await waitFor(() => !isSubprocessPollInFlight(manager));
+    await manager.write({ threadId: "thread-1", data: "codex\r" });
+    result = completeWindowsSnapshot([{ ppid: 9000, pid: 9100, command: "codex" }]);
+    await pollSubprocessActivity(manager);
+    expect(subprocessState(manager)).toMatchObject({
+      detectedCliKind: "codex",
+      hasRunningSubprocess: true,
+      providerDescendantObserved: true,
+    });
+
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    collectorCalls = 0;
+    events.length = 0;
+    result = { kind: "unknown", reason: "capture_failed" };
+    await pollSubprocessActivity(manager);
+    result = { kind: "unknown", reason: "timed_out" };
+    await pollSubprocessActivity(manager);
+
+    expect(subprocessState(manager)).toMatchObject({
+      detectedCliKind: "codex",
+      hasRunningSubprocess: true,
+      providerDescendantObserved: true,
+    });
+    expect(events.filter((event) => event.type === "activity")).toHaveLength(0);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0]?.[0])).toContain("capture_failed");
+
+    result = completeWindowsSnapshot([]);
+    await pollSubprocessActivity(manager);
+    expect(subprocessState(manager)).toMatchObject({
+      detectedCliKind: null,
+      hasRunningSubprocess: false,
+      providerDescendantObserved: false,
+    });
+
+    events.length = 0;
+    result = { kind: "unknown", reason: "empty_snapshot" };
+    await pollSubprocessActivity(manager);
+
+    expect(subprocessState(manager)).toMatchObject({
+      detectedCliKind: null,
+      hasRunningSubprocess: false,
+      providerDescendantObserved: false,
+    });
+    expect(events.filter((event) => event.type === "activity")).toHaveLength(0);
+    expect(warn).toHaveBeenCalledTimes(2);
+    expect(String(warn.mock.calls[1]?.[0])).toContain("empty_snapshot");
+    expect(collectorCalls).toBe(4);
+
+    manager.dispose();
+  });
+
+  it("keeps overlapping Windows polls single-flight", async () => {
+    let pending: ReturnType<typeof deferred<WindowsProcessSnapshotResult>> | null = null;
+    let collectorCalls = 0;
+    const { manager } = makeManager(5, {
+      subprocessPlatform: "win32",
+      subprocessPollIntervalMs: 60_000,
+      windowsProcessSnapshotCollector: async () => {
+        collectorCalls += 1;
+        return pending?.promise ?? completeWindowsSnapshot([]);
+      },
+    });
+
+    await manager.open(openInput());
+    await waitFor(() => !isSubprocessPollInFlight(manager));
+    collectorCalls = 0;
+    pending = deferred<WindowsProcessSnapshotResult>();
+
+    const firstPoll = pollSubprocessActivity(manager);
+    await waitFor(() => collectorCalls === 1 && isSubprocessPollInFlight(manager));
+    await pollSubprocessActivity(manager);
+    expect(collectorCalls).toBe(1);
+
+    pending.resolve(completeWindowsSnapshot([]));
+    await firstPoll;
+    expect(isSubprocessPollInFlight(manager)).toBe(false);
+
+    manager.dispose();
+  });
+
+  it("aborts and settles a pending Windows snapshot when disposed", async () => {
+    let collectorSignal: AbortSignal | undefined;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const processTreeKiller: ProcessTreeKiller = {
+      capture: () => ({ descendants: [], captureComplete: true }),
+      signal: () => undefined,
+    };
+    const { manager } = makeManager(5, {
+      processTreeKiller,
+      subprocessPlatform: "win32",
+      subprocessPollIntervalMs: 60_000,
+      windowsProcessSnapshotCollector: (signal) =>
+        new Promise((resolve) => {
+          collectorSignal = signal;
+          signal?.addEventListener(
+            "abort",
+            () => resolve({ kind: "unknown", reason: "cancelled" }),
+            { once: true },
+          );
+        }),
+    });
+
+    await manager.open(openInput());
+    await waitFor(() => collectorSignal !== undefined && isSubprocessPollInFlight(manager));
+    manager.dispose();
+
+    expect(collectorSignal?.aborted).toBe(true);
+    await waitFor(() => !isSubprocessPollInFlight(manager));
+    expect(
+      (manager as unknown as { subprocessPollAbortController: AbortController | null })
+        .subprocessPollAbortController,
+    ).toBeNull();
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  it("aborts and settles a pending Windows snapshot when no running terminal remains", async () => {
+    let collectorSignal: AbortSignal | undefined;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const processTreeKiller: ProcessTreeKiller = {
+      capture: () => ({ descendants: [], captureComplete: true }),
+      signal: () => undefined,
+    };
+    const { manager } = makeManager(5, {
+      processTreeKiller,
+      subprocessPlatform: "win32",
+      subprocessPollIntervalMs: 60_000,
+      windowsProcessSnapshotCollector: (signal) =>
+        new Promise((resolve) => {
+          collectorSignal = signal;
+          signal?.addEventListener(
+            "abort",
+            () => resolve({ kind: "unknown", reason: "cancelled" }),
+            { once: true },
+          );
+        }),
+    });
+
+    await manager.open(openInput());
+    await waitFor(() => collectorSignal !== undefined && isSubprocessPollInFlight(manager));
+    await manager.close({ threadId: "thread-1", terminalId: "default" });
+
+    expect(collectorSignal?.aborted).toBe(true);
+    await waitFor(() => !isSubprocessPollInFlight(manager));
+    expect(warn).toHaveBeenCalledTimes(1);
+
+    manager.dispose();
+  });
+
+  it("keeps a shared Windows cycle alive when one of multiple terminals closes", async () => {
+    let pending: ReturnType<typeof deferred<WindowsProcessSnapshotResult>> | null = null;
+    let collectorSignal: AbortSignal | undefined;
+    let collectorCalls = 0;
+    const processTreeKiller: ProcessTreeKiller = {
+      capture: () => ({ descendants: [], captureComplete: true }),
+      signal: () => undefined,
+    };
+    const { manager } = makeManager(5, {
+      processTreeKiller,
+      subprocessPlatform: "win32",
+      subprocessPollIntervalMs: 60_000,
+      windowsProcessSnapshotCollector: async (signal) => {
+        collectorCalls += 1;
+        collectorSignal = signal;
+        return pending?.promise ?? completeWindowsSnapshot([]);
+      },
+    });
+    const events: TerminalEvent[] = [];
+    manager.on("event", (event) => {
+      events.push(event);
+    });
+
+    await manager.open(openInput({ terminalId: "default" }));
+    await manager.open(openInput({ terminalId: "sidecar" }));
+    await waitFor(() => !isSubprocessPollInFlight(manager));
+    collectorCalls = 0;
+    events.length = 0;
+    pending = deferred<WindowsProcessSnapshotResult>();
+
+    const poll = pollSubprocessActivity(manager);
+    await waitFor(() => collectorCalls === 1 && isSubprocessPollInFlight(manager));
+    await manager.close({ threadId: "thread-1", terminalId: "default" });
+    expect(collectorSignal?.aborted).toBe(false);
+
+    pending.resolve(
+      completeWindowsSnapshot([
+        { ppid: 9000, pid: 9100, command: "node closed.js" },
+        { ppid: 9001, pid: 9101, command: "node active.js" },
+      ]),
+    );
+    await poll;
+
+    expect(collectorCalls).toBe(1);
+    expect(
+      events.filter((event) => event.type === "activity").map((event) => event.terminalId),
+    ).toEqual(["sidecar"]);
+    expect(subprocessState(manager, "thread-1", "sidecar")).toMatchObject({
+      hasRunningSubprocess: true,
+    });
+
+    manager.dispose();
+  });
+
+  it("preserves injected subprocess checkers on Windows", async () => {
+    let checkerCalls = 0;
+    let collectorCalls = 0;
+    const { manager } = makeManager(5, {
+      subprocessChecker: async () => {
+        checkerCalls += 1;
+        return true;
+      },
+      subprocessPlatform: "win32",
+      subprocessPollIntervalMs: 60_000,
+      windowsProcessSnapshotCollector: async () => {
+        collectorCalls += 1;
+        return completeWindowsSnapshot([]);
+      },
+    });
+
+    await manager.open(openInput());
+    await waitFor(() => checkerCalls > 0 && !isSubprocessPollInFlight(manager));
+
+    expect(collectorCalls).toBe(0);
+    expect(subprocessState(manager)).toMatchObject({ hasRunningSubprocess: true });
 
     manager.dispose();
   });

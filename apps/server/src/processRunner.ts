@@ -156,6 +156,8 @@ export async function runProcess(
       windowsHide: prepared.windowsHide,
       windowsVerbatimArguments: prepared.windowsVerbatimArguments,
     });
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
 
     let stdout = "";
     let stderr = "";
