@@ -6454,10 +6454,11 @@ describe("ProviderRuntimeIngestion", () => {
       harness.engine,
       (entry) =>
         entry.session?.status === "error" &&
-        entry.session?.activeTurnId === "turn-after-failure" &&
+        entry.session?.activeTurnId === null &&
         entry.session?.lastError === "runtime still processed",
     );
     expect(thread.session?.status).toBe("error");
+    expect(thread.session?.activeTurnId).toBeNull();
     expect(thread.session?.lastError).toBe("runtime still processed");
   });
 });
