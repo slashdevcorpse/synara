@@ -2,6 +2,7 @@ import type {
   OrchestrationCommand,
   OrchestrationProject,
   OrchestrationReadModel,
+  OrchestrationSession,
   OrchestrationThread,
   ProjectKind,
   ProjectId,
@@ -18,6 +19,27 @@ function invariantError(commandType: string, detail: string): OrchestrationComma
     commandType,
     detail,
   });
+}
+
+/**
+ * True when the thread still has an in-flight / unsettled turn:
+ * session mid-lifecycle ("starting"/"running"), a non-error session with an
+ * activeTurnId, or a latestTurn still projected as "running".
+ *
+ * Runtime errors can retain the failed turn id for attribution even though the
+ * session and turn are terminal, so an errored session's activeTurnId is stale.
+ */
+export function threadHasInFlightTurn(thread: {
+  readonly session: Pick<OrchestrationSession, "status" | "activeTurnId"> | null;
+  readonly latestTurn: { readonly state: string } | null;
+}): boolean {
+  const session = thread.session;
+  return (
+    (session?.status !== "error" && session?.activeTurnId != null) ||
+    session?.status === "starting" ||
+    session?.status === "running" ||
+    thread.latestTurn?.state === "running"
+  );
 }
 
 export function findThreadById(

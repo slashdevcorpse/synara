@@ -669,13 +669,38 @@ it.layer(NodeServices.layer)("resolveAvailableEditors", (it) => {
     assert.equal(result, installLocation);
     assert.equal(script.includes("PackageFamilyName -ieq $packageDef.Family"), true);
     assert.equal(script.includes("Microsoft.VisualStudioCode_8wekyb3d8bbwe"), true);
-    assert.equal(script.includes("-ErrorAction SilentlyContinue"), true);
-    assert.equal(script.includes("-ErrorAction Stop"), false);
+    assert.equal(script.includes("-ErrorAction Stop"), true);
+    assert.equal(script.includes("-ErrorAction SilentlyContinue"), false);
     assert.deepEqual(childEnv, {
       PATH: "D:\\effective-bin",
       SYSTEMROOT: "D:\\Windows",
     });
     assert.deepEqual(callerEnv, callerBefore);
+  });
+
+  it("does not cache terminating AppX lookup failures as authoritative absence", () => {
+    clearWindowsStorePackageDiscoveryCache();
+    const editor = EDITORS.find((candidate) => candidate.id === "vscode");
+    assert.ok(editor);
+    const installLocation =
+      "C:\\Program Files\\WindowsApps\\Microsoft.VisualStudioCode_1.0.0.0_x64__8wekyb3d8bbwe";
+    let calls = 0;
+    const lookup = () =>
+      resolveWindowsStorePackageDirectoryFromPowerShell(
+        getEditorWindowsStorePackages(editor),
+        "win32",
+        { SystemRoot: "C:\\Windows" },
+        () => {
+          calls += 1;
+          if (calls === 1) throw new Error("transient AppX failure");
+          return `${installLocation}\r\n`;
+        },
+        { useCache: true, now: () => 1_000 },
+      );
+
+    assert.equal(lookup(), null);
+    assert.equal(lookup(), installLocation);
+    assert.equal(calls, 2);
   });
 
   it("caches Windows Store AppX registration probes", () => {
