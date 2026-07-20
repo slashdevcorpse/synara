@@ -65,11 +65,11 @@ export function TerminalSearch({ searchAddon, isOpen, onClose }: TerminalSearchP
       window.clearTimeout(searchTimerRef.current);
       searchTimerRef.current = null;
     }
-    const found =
-      direction === "next"
-        ? searchAddon.findNext(query, searchOptions)
-        : searchAddon.findPrevious(query, searchOptions);
-    setHasResults(found);
+    if (direction === "next") {
+      searchAddon.findNext(query, searchOptions);
+    } else {
+      searchAddon.findPrevious(query, searchOptions);
+    }
   };
 
   const clearSearchTimer = useCallback(() => {
@@ -88,7 +88,7 @@ export function TerminalSearch({ searchAddon, isOpen, onClose }: TerminalSearchP
 
     searchTimerRef.current = window.setTimeout(() => {
       searchTimerRef.current = null;
-      setHasResults(searchAddon.findNext(nextQuery, searchOptions));
+      searchAddon.findNext(nextQuery, searchOptions);
     }, SEARCH_DEBOUNCE_MS);
   };
 
@@ -115,7 +115,7 @@ export function TerminalSearch({ searchAddon, isOpen, onClose }: TerminalSearchP
       clearSearchTimer();
       searchTimerRef.current = window.setTimeout(() => {
         searchTimerRef.current = null;
-        setHasResults(searchAddon.findNext(query, searchOptions));
+        searchAddon.findNext(query, searchOptions);
       }, SEARCH_DEBOUNCE_MS);
     }
   }, [searchAddon, query, clearSearchTimer, caseSensitive, searchOptions]);

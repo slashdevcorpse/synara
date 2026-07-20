@@ -29,7 +29,14 @@ describe("TerminalSearch", () => {
       resultListener = listener;
       return { dispose: disposeResultListener };
     });
-    const findNext = vi.fn((_term: string) => false);
+    let synchronousResultCount = 0;
+    const findNext = vi.fn((_term: string) => {
+      resultListener({
+        resultIndex: synchronousResultCount > 0 ? 0 : -1,
+        resultCount: synchronousResultCount,
+      });
+      return false;
+    });
     const searchAddon = {
       clearDecorations: vi.fn(),
       findNext,
@@ -53,6 +60,10 @@ describe("TerminalSearch", () => {
     expect(onDidChangeResults).toHaveBeenCalledTimes(1);
     resultListener({ resultIndex: 0, resultCount: 1 });
 
+    await expect.element(page.getByText("No results")).not.toBeInTheDocument();
+    synchronousResultCount = 1;
+    await page.getByRole("button", { name: "Next match (Enter)" }).click();
+    expect(findNext).toHaveBeenCalledTimes(2);
     await expect.element(page.getByText("No results")).not.toBeInTheDocument();
     await screen.unmount();
     expect(disposeResultListener).toHaveBeenCalledTimes(1);
