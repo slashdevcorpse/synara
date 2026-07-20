@@ -246,7 +246,6 @@ export function useComposerDropzone(input: {
 
   const onComposerDrop = (event: DragEvent<HTMLDivElement>) => {
     if (event.dataTransfer.types.includes(CHAT_FILE_REFERENCE_DRAG_TYPE)) {
-      composerFileReferenceDragHandlers.onDrop(event);
       return;
     }
     if (!event.dataTransfer.types.includes("Files")) {
