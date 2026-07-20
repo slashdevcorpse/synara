@@ -72,6 +72,12 @@ const SVG_DOCUMENT_SECURITY_HEADERS = {
   "Content-Security-Policy": "sandbox; default-src 'none'; style-src 'unsafe-inline'",
   "X-Content-Type-Options": "nosniff",
 } as const;
+
+function isProtectedWebDocumentContentType(contentType: string): boolean {
+  const normalized = contentType.split(";", 1)[0]?.trim().toLowerCase();
+  return normalized === "text/html" || normalized === "application/xhtml+xml";
+}
+
 export const AUTH_JSON_BODY_MAX_BYTES = 16 * 1024;
 const decodeBootstrapInput = Schema.decodeUnknownEffect(AuthBootstrapInput);
 const decodeCreatePairingCredentialInput = Schema.decodeUnknownEffect(
@@ -1053,24 +1059,33 @@ function makeBinaryUploadEffectHandler(uploadAdmission: UploadAdmission) {
     return HttpServerResponse.text("Not Found", { status: 404, headers: corsHeaders });
   }).pipe(
     Effect.catch((error) =>
-      Effect.succeed(
-        error instanceof AuthError
-          ? authErrorResponse(error)
-          : HttpServerResponse.jsonUnsafe(
-              {
-                error:
-                  error instanceof Error
-                    ? error.message
-                    : String((error as { readonly message?: unknown }).message ?? error),
-              },
-              {
-                status:
-                  typeof (error as { readonly status?: unknown }).status === "number"
-                    ? (error as { readonly status: number }).status
-                    : 500,
-              },
-            ),
-      ),
+      Effect.gen(function* () {
+        const response =
+          error instanceof AuthError
+            ? authErrorResponse(error)
+            : HttpServerResponse.jsonUnsafe(
+                {
+                  error:
+                    error instanceof Error
+                      ? error.message
+                      : String((error as { readonly message?: unknown }).message ?? error),
+                },
+                {
+                  status:
+                    typeof (error as { readonly status?: unknown }).status === "number"
+                      ? (error as { readonly status: number }).status
+                      : 500,
+                },
+              );
+        const request = yield* HttpServerRequest.HttpServerRequest;
+        const url = HttpServerRequest.toURL(request);
+        if (!url) return response;
+        const config = yield* ServerConfig;
+        const corsHeaders = trustedMutationCorsHeaders({ request, url, config });
+        return corsHeaders === null
+          ? response
+          : HttpServerResponse.setHeaders(response, corsHeaders);
+      }),
     ),
   );
 }
@@ -1252,7 +1267,9 @@ export const staticAndDevEffectRouteLayer = HttpRouter.add(
     return HttpServerResponse.uint8Array(data, {
       status: 200,
       contentType,
-      ...(contentType.startsWith("text/html") ? { headers: WEB_DOCUMENT_SECURITY_HEADERS } : {}),
+      ...(isProtectedWebDocumentContentType(contentType)
+        ? { headers: WEB_DOCUMENT_SECURITY_HEADERS }
+        : {}),
     });
   }),
 );

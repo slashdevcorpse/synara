@@ -1,4 +1,4 @@
-import { spawn, spawnSync } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
 
 import { describe, expect, it } from "vitest";
@@ -27,6 +27,55 @@ async function waitForProcessExit(pid: number): Promise<boolean> {
     await delay(25);
   }
   return !isProcessAlive(pid);
+}
+
+async function forceKillHelperAndWaitForExit(
+  helperProcess: ChildProcess,
+  timeoutMs = 5_000,
+): Promise<void> {
+  if (helperProcess.exitCode !== null || helperProcess.signalCode !== null) return;
+
+  await new Promise<void>((resolve, reject) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const cleanup = () => {
+      helperProcess.removeListener("exit", onExit);
+      if (timer !== undefined) clearTimeout(timer);
+    };
+    const onExit = () => {
+      cleanup();
+      resolve();
+    };
+    const fail = (error: Error) => {
+      cleanup();
+      reject(error);
+    };
+
+    helperProcess.once("exit", onExit);
+    timer = setTimeout(() => {
+      fail(
+        new Error(
+          `Timed out after ${timeoutMs}ms waiting for helper process ${helperProcess.pid ?? "unknown"} to exit after SIGKILL.`,
+        ),
+      );
+    }, timeoutMs);
+    timer.unref?.();
+
+    try {
+      if (!helperProcess.kill("SIGKILL")) {
+        fail(
+          new Error(
+            `Helper process ${helperProcess.pid ?? "unknown"} rejected the SIGKILL cleanup signal.`,
+          ),
+        );
+      }
+    } catch (cause) {
+      fail(
+        new Error(`Failed to send SIGKILL to helper process ${helperProcess.pid ?? "unknown"}.`, {
+          cause,
+        }),
+      );
+    }
+  });
 }
 
 describeWindows("Windows Job launcher native integration", () => {
@@ -173,8 +222,7 @@ describeWindows("Windows Job launcher native integration", () => {
     expect(isProcessAlive(rootPid)).toBe(true);
     expect(isProcessAlive(descendantPid)).toBe(true);
 
-    helperProcess.kill("SIGKILL");
-    await new Promise<void>((resolve) => helperProcess.once("exit", () => resolve()));
+    await forceKillHelperAndWaitForExit(helperProcess);
 
     expect(await waitForProcessExit(rootPid)).toBe(true);
     expect(await waitForProcessExit(descendantPid)).toBe(true);

@@ -166,8 +166,8 @@ export function makeUploadAdmission(options: UploadAdmissionOptions = {}) {
     const peerRejected = peerBucket !== undefined && peerBucket.tokens < 1;
 
     if (principalRejected || peerRejected) {
-      principal.commit(principalBucket);
-      if (peer && peerBucket) peer.commit(peerBucket);
+      if (principalRejected) principal.commit(principalBucket);
+      if (peerRejected && peer && peerBucket) peer.commit(peerBucket);
       const principalRetryAfter = principalRejected
         ? admissionRetryAfterMs(principalBucket.tokens, principalRefillPerMs)
         : 0;

@@ -1652,7 +1652,7 @@ export function makeWebsocketRpcRouteLayer<R>(
   );
 }
 
-function makeWebsocketBootstrapRouteLayer<R>(
+export function makeWebsocketBootstrapRouteLayer<R>(
   bootstrapWebSocketHttpEffectSource: Effect.Effect<
     Effect.Effect<
       HttpServerResponse.HttpServerResponse,
@@ -1674,18 +1674,43 @@ function makeWebsocketBootstrapRouteLayer<R>(
           const request = yield* HttpServerRequest.HttpServerRequest;
           const config = yield* ServerConfig;
           const serverAuth = yield* ServerAuth;
+          const sessions = yield* SessionCredentialService;
           const url = trustedWebSocketRequestUrl(request, config);
           if (!url) {
             return HttpServerResponse.text("Forbidden", { status: 403 });
           }
-          yield* authenticateRpcWebSocketUpgrade({
+          const authenticatedSession = yield* authenticateRpcWebSocketUpgrade({
             config,
             legacyToken: url.searchParams.get("token"),
             request: makeEffectAuthRequest(request),
             serverAuth,
           });
-          return yield* bootstrapWebSocketHttpEffect;
-        }).pipe(Effect.catchTag("AuthError", (error) => Effect.succeed(authErrorResponse(error)))),
+
+          if (!authenticatedSession) {
+            return yield* bootstrapWebSocketHttpEffect;
+          }
+
+          return yield* sessions.runAuthenticatedConnection(
+            authenticatedSession.sessionId,
+            bootstrapWebSocketHttpEffect,
+          );
+        }).pipe(
+          Effect.catchTags({
+            AuthError: (error) => Effect.succeed(authErrorResponse(error)),
+            SessionCapacityError: (error) =>
+              Effect.succeed(
+                HttpServerResponse.text(error.message, {
+                  status: 429,
+                  headers: {
+                    "Cache-Control": "no-store",
+                    "Retry-After": String(error.retryAfterSeconds),
+                  },
+                }),
+              ),
+            SessionCredentialError: (error) =>
+              Effect.succeed(HttpServerResponse.text(error.message, { status: 401 })),
+          }),
+        ),
       );
     }),
   );

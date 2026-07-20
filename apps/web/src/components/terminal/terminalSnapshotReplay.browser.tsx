@@ -25,6 +25,10 @@ import { emitTerminalResnapshotRequired } from "../../wsTransportEvents";
 
 const terminals: Terminal[] = [];
 const hosts: HTMLDivElement[] = [];
+const waitUntilTerminalEventStreamReady = async () => ({
+  type: "ready" as const,
+  generation: "generation-1",
+});
 
 interface TerminalHarness {
   fitAddon: FitAddon;
@@ -646,6 +650,7 @@ describe("recovered terminal snapshot replay in real xterm", () => {
     let terminalEventListener: ((event: TerminalEvent) => void) | undefined;
     const nativeApi = {
       terminal: {
+        waitUntilEventStreamReady: waitUntilTerminalEventStreamReady,
         open: async () => {
           openCalls += 1;
           return legacySnapshot(`${before}\r\n`);
@@ -1110,6 +1115,7 @@ describe("recovered terminal snapshot replay in real xterm", () => {
     };
     const nativeApi = {
       terminal: {
+        waitUntilEventStreamReady: waitUntilTerminalEventStreamReady,
         open: async () => {
           openCalls += 1;
           return legacySnapshot("");
@@ -1176,6 +1182,7 @@ describe("recovered terminal snapshot replay in real xterm", () => {
       const initialSnapshot = dimensionedSnapshot(80, 24, "0".repeat(64), "");
       const nativeApi = {
         terminal: {
+          waitUntilEventStreamReady: waitUntilTerminalEventStreamReady,
           open: async () => initialSnapshot,
           write: async () => undefined,
           ackOutput: async (input: { bytes: number }) => {
@@ -1477,6 +1484,7 @@ describe("recovered terminal snapshot replay in real xterm", () => {
       let terminalEventListener: ((event: TerminalEvent) => void) | undefined;
       const nativeApi = {
         terminal: {
+          waitUntilEventStreamReady: waitUntilTerminalEventStreamReady,
           open: () => {
             openCalls += 1;
             return openCalls === 1 ? initialOpen : Promise.resolve(firstSnapshot);
@@ -1590,6 +1598,7 @@ describe("recovered terminal snapshot replay in real xterm", () => {
       const order: string[] = [];
       const nativeApi = {
         terminal: {
+          waitUntilEventStreamReady: waitUntilTerminalEventStreamReady,
           open: async () => legacySnapshot(""),
           write: async () => undefined,
           ackOutput: async () => undefined,
@@ -1726,6 +1735,7 @@ describe("recovered terminal snapshot replay in real xterm", () => {
     const acknowledgedBytes: number[] = [];
     const nativeApi = {
       terminal: {
+        waitUntilEventStreamReady: waitUntilTerminalEventStreamReady,
         open: async () => legacySnapshot(""),
         write: async () => undefined,
         ackOutput: async (input: { bytes: number }) => {
@@ -1850,6 +1860,7 @@ describe("recovered terminal snapshot replay in real xterm", () => {
     const acknowledgedBytes: number[] = [];
     const nativeApi = {
       terminal: {
+        waitUntilEventStreamReady: waitUntilTerminalEventStreamReady,
         open: async () => legacySnapshot(""),
         write: async () => undefined,
         ackOutput: async (input: { bytes: number }) => {
@@ -1978,6 +1989,7 @@ describe("recovered terminal snapshot replay in real xterm", () => {
       const acknowledgedBytes: number[] = [];
       const nativeApi = {
         terminal: {
+          waitUntilEventStreamReady: waitUntilTerminalEventStreamReady,
           open: async () => legacySnapshot(""),
           write: async () => undefined,
           ackOutput: async (input: { bytes: number }) => {

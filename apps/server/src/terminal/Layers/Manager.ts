@@ -1556,8 +1556,9 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
       }
 
       const threadSessions = this.sessionsForThread(input.threadId);
+      const processStops = threadSessions.map((session) => this.stopProcess(session));
+      await Promise.all(processStops);
       for (const session of threadSessions) {
-        await this.stopProcess(session);
         this.sessions.delete(toSessionKey(session.threadId, session.terminalId));
       }
       await Promise.all(

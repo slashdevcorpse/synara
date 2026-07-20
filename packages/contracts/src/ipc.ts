@@ -508,7 +508,7 @@ export interface NativeApi {
     confirm: (message: string) => Promise<boolean>;
   };
   terminal: {
-    waitUntilEventStreamReady?: () => Promise<TerminalEventStreamReady>;
+    waitUntilEventStreamReady: () => Promise<TerminalEventStreamReady>;
     open: (input: TerminalOpenInput) => Promise<TerminalSessionSnapshot>;
     snapshot: (input: TerminalSessionInput) => Promise<TerminalRecoverySnapshot>;
     write: (input: TerminalWriteInput) => Promise<void>;

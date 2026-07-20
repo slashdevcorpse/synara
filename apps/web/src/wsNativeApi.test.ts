@@ -556,7 +556,7 @@ describe("wsNativeApi", () => {
     const { createWsNativeApi } = await import("./wsNativeApi");
     const api = createWsNativeApi();
 
-    await expect(api.terminal.waitUntilEventStreamReady?.()).resolves.toEqual({
+    await expect(api.terminal.waitUntilEventStreamReady()).resolves.toEqual({
       type: "ready",
       generation: "generation-1",
     });

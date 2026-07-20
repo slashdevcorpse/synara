@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import type {
   CapturedProcess,
@@ -96,6 +96,156 @@ describe("teardownProviderProcessTree", () => {
       ),
     ).resolves.toEqual({ escalated: true, signalErrors: [] });
     expect(signals.at(-1)).toEqual({ signal: "SIGKILL", includeRootTree: false });
+  });
+
+  it("bounds a hanging graceful inspection by the TERM deadline and escalates", async () => {
+    vi.useFakeTimers();
+    try {
+      const gracefulInspectionStarted = Promise.withResolvers<void>();
+      const signals: TerminalKillSignal[] = [];
+      let inspectCalls = 0;
+      let resolveRootExit: (() => void) | undefined;
+      const rootExited = new Promise<void>((resolve) => {
+        resolveRootExit = resolve;
+      });
+      const teardown = teardownProviderProcessTree(
+        { rootPid: 251, rootExited, termGraceMs: 10, forceExitMs: 10, pollMs: 5 },
+        {
+          processTreeKiller: {
+            capture: () => ({ descendants: [], captureComplete: true }),
+            inspect: () => {
+              inspectCalls += 1;
+              if (inspectCalls === 1) {
+                gracefulInspectionStarted.resolve();
+                return new Promise(() => undefined);
+              }
+              return { verified: true, survivors: [] };
+            },
+            signal: ({ signal }) => {
+              signals.push(signal);
+              if (signal === "SIGKILL") resolveRootExit?.();
+            },
+          },
+          ...deterministicClock(),
+        },
+      );
+
+      await gracefulInspectionStarted.promise;
+      await vi.advanceTimersByTimeAsync(10);
+
+      await expect(teardown).resolves.toEqual({ escalated: true, signalErrors: [] });
+      expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
+      expect(inspectCalls).toBe(2);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("treats a forced-inspection timeout as unverified and fails closed", async () => {
+    vi.useFakeTimers();
+    try {
+      const forcedInspectionStarted = Promise.withResolvers<void>();
+      const tree: CapturedProcessTree = {
+        descendants: [{ pid: 282, command: "provider-worker" }],
+        captureComplete: true,
+      };
+      let inspectCalls = 0;
+      let resolveRootExit: (() => void) | undefined;
+      const rootExited = new Promise<void>((resolve) => {
+        resolveRootExit = resolve;
+      });
+      const teardown = teardownProviderProcessTree(
+        {
+          rootPid: 281,
+          rootExited,
+          termGraceMs: 5,
+          forceExitMs: 10,
+          pollMs: 5,
+        },
+        {
+          processTreeKiller: {
+            capture: () => tree,
+            inspect: () => {
+              inspectCalls += 1;
+              if (inspectCalls === 1) {
+                return { verified: true, survivors: tree.descendants };
+              }
+              forcedInspectionStarted.resolve();
+              return new Promise(() => undefined);
+            },
+            signal: ({ signal }) => {
+              if (signal === "SIGKILL") resolveRootExit?.();
+            },
+          },
+          ...deterministicClock(),
+        },
+      );
+      const failurePromise = teardown.catch((error: unknown) => error);
+
+      await forcedInspectionStarted.promise;
+      await vi.advanceTimersByTimeAsync(10);
+      const failure = await failurePromise;
+
+      expect(failure).toBeInstanceOf(ProviderProcessExitUnprovenError);
+      expect(failure).toMatchObject({
+        rootPid: 281,
+        rootExited: true,
+        remainingDescendantPids: null,
+        captureComplete: true,
+      });
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("treats rejected inspections as unverified, escalates, and fails closed", async () => {
+    vi.useFakeTimers();
+    try {
+      const tree: CapturedProcessTree = {
+        descendants: [{ pid: 292, command: "provider-worker" }],
+        captureComplete: true,
+      };
+      const signals: TerminalKillSignal[] = [];
+      let resolveRootExit: (() => void) | undefined;
+      const rootExited = new Promise<void>((resolve) => {
+        resolveRootExit = resolve;
+      });
+
+      const failure = await teardownProviderProcessTree(
+        {
+          rootPid: 291,
+          rootExited,
+          termGraceMs: 5,
+          forceExitMs: 5,
+          pollMs: 5,
+        },
+        {
+          processTreeKiller: {
+            capture: () => tree,
+            inspect: () => Promise.reject(new Error("inspection failed")),
+            signal: ({ signal }) => {
+              signals.push(signal);
+              if (signal === "SIGKILL") resolveRootExit?.();
+            },
+          },
+          ...deterministicClock(),
+        },
+      ).catch((error: unknown) => error);
+
+      expect(failure).toBeInstanceOf(ProviderProcessExitUnprovenError);
+      expect(failure).toMatchObject({
+        rootPid: 291,
+        rootExited: true,
+        remainingDescendantPids: null,
+        captureComplete: true,
+      });
+      expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("fails closed when forced termination cannot prove process-tree exit", async () => {

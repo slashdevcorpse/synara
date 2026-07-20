@@ -1127,8 +1127,8 @@ function receiveTerminalEvent(entry: TerminalRuntimeEntry, event: TerminalEvent)
 
 function waitForTerminalEventStreamReady(
   api: NonNullable<ReturnType<typeof readNativeApi>>,
-): Promise<TerminalEventStreamReady | null> {
-  return api.terminal.waitUntilEventStreamReady?.() ?? Promise.resolve(null);
+): Promise<TerminalEventStreamReady> {
+  return api.terminal.waitUntilEventStreamReady();
 }
 
 function scheduleAuthoritativeRecoveryRetry(
@@ -1217,7 +1217,7 @@ function runAuthoritativeRecoveryAttempt(entry: TerminalRuntimeEntry): void {
     ]);
     if (entry.disposed || entry.snapshotReconcileRequestId !== requestId) return;
     if (!entry.opened) throw new Error("Terminal recovery was interrupted");
-    if (ready) entry.terminalEventRecovery.prepareGeneration(ready.generation);
+    entry.terminalEventRecovery.prepareGeneration(ready.generation);
 
     const recovery = await api.terminal.snapshot({
       threadId: entry.threadId,

@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { realpathSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 
@@ -20,6 +21,65 @@ import {
 
 export const MANAGED_ATTACHMENT_STAGING_TTL_MS = 60 * 60 * 1_000;
 const MANAGED_ATTACHMENT_ID_PREFIX = "att_v2_";
+const managedAttachmentStagingPathLockTails = new Map<string, Promise<void>>();
+
+function managedAttachmentStagingLockKey(stagingPath: string): string {
+  let existingAncestor = path.resolve(stagingPath);
+  const missingSegments: string[] = [];
+  while (true) {
+    try {
+      const realAncestor = realpathSync.native(existingAncestor);
+      const canonicalPath = path.join(realAncestor, ...missingSegments);
+      return process.platform === "win32" ? canonicalPath.toLowerCase() : canonicalPath;
+    } catch (cause) {
+      if (!isMissingFileError(cause)) throw cause;
+      const parent = path.dirname(existingAncestor);
+      if (parent === existingAncestor) {
+        const unresolved = path.resolve(stagingPath);
+        return process.platform === "win32" ? unresolved.toLowerCase() : unresolved;
+      }
+      missingSegments.unshift(path.basename(existingAncestor));
+      existingAncestor = parent;
+    }
+  }
+}
+
+function isMissingFileError(cause: unknown): boolean {
+  return (
+    typeof cause === "object" &&
+    cause !== null &&
+    "code" in cause &&
+    (cause as { readonly code?: unknown }).code === "ENOENT"
+  );
+}
+
+/**
+ * Serialize writers and recovery cleanup for one managed staging pathname.
+ * The queue is process-local because the database lifecycle lock already
+ * prevents multiple Synara runtimes from sharing one managed home.
+ */
+export async function withManagedAttachmentStagingPathLock<T>(
+  stagingPath: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const key = managedAttachmentStagingLockKey(stagingPath);
+  const previous = managedAttachmentStagingPathLockTails.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const completion = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const tail = previous.catch(() => undefined).then(() => completion);
+  managedAttachmentStagingPathLockTails.set(key, tail);
+  await previous.catch(() => undefined);
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (managedAttachmentStagingPathLockTails.get(key) === tail) {
+      managedAttachmentStagingPathLockTails.delete(key);
+    }
+  }
+}
 
 export type BinaryChatAttachment = ChatImageAttachment | ChatFileAttachment;
 
@@ -174,37 +234,49 @@ export function persistReservedManagedAttachment(input: {
 
     const writeResult = yield* Effect.exit(
       Effect.tryPromise({
-        try: async () => {
-          ensurePrivateDirectorySync(input.attachmentsDir);
-          ensurePrivateDirectorySync(stagingDir);
-          ensurePrivateDirectorySync(path.dirname(finalPath));
-          const handle = await fs.open(temporaryPath, "wx", 0o600);
-          try {
-            await handle.writeFile(input.bytes);
-            await handle.sync();
-          } finally {
-            await handle.close();
-          }
-          await repairPrivateFile(temporaryPath);
-          await fs.rename(temporaryPath, finalPath);
-          // The blob must be durable before the SQLite row can become staged.
-          // Flush the final entry and every managed ancestor that may have
-          // been created for this content-addressed path.
-          const attachmentsRoot = path.resolve(input.attachmentsDir);
-          let directoryToSync = path.dirname(finalPath);
-          while (true) {
-            await syncDirectoryEntry(directoryToSync);
-            if (directoryToSync === attachmentsRoot) break;
-            const parent = path.dirname(directoryToSync);
-            if (
-              parent === directoryToSync ||
-              (parent !== attachmentsRoot && !parent.startsWith(`${attachmentsRoot}${path.sep}`))
-            ) {
-              throw new Error("Managed attachment directory escaped its storage root.");
+        try: () =>
+          withManagedAttachmentStagingPathLock(temporaryPath, async () => {
+            ensurePrivateDirectorySync(input.attachmentsDir);
+            ensurePrivateDirectorySync(stagingDir);
+            ensurePrivateDirectorySync(path.dirname(finalPath));
+            let ownsTemporaryPath = false;
+            try {
+              const handle = await fs.open(temporaryPath, "wx", 0o600);
+              ownsTemporaryPath = true;
+              try {
+                await handle.writeFile(input.bytes);
+                await handle.sync();
+              } finally {
+                await handle.close();
+              }
+              await repairPrivateFile(temporaryPath);
+              await fs.rename(temporaryPath, finalPath);
+              ownsTemporaryPath = false;
+              // The blob must be durable before the SQLite row can become staged.
+              // Flush the final entry and every managed ancestor that may have
+              // been created for this content-addressed path.
+              const attachmentsRoot = path.resolve(input.attachmentsDir);
+              let directoryToSync = path.dirname(finalPath);
+              while (true) {
+                await syncDirectoryEntry(directoryToSync);
+                if (directoryToSync === attachmentsRoot) break;
+                const parent = path.dirname(directoryToSync);
+                if (
+                  parent === directoryToSync ||
+                  (parent !== attachmentsRoot &&
+                    !parent.startsWith(`${attachmentsRoot}${path.sep}`))
+                ) {
+                  throw new Error("Managed attachment directory escaped its storage root.");
+                }
+                directoryToSync = parent;
+              }
+            } catch (cause) {
+              if (ownsTemporaryPath) {
+                await fs.unlink(temporaryPath).catch(() => undefined);
+              }
+              throw cause;
             }
-            directoryToSync = parent;
-          }
-        },
+          }),
         catch: (cause) =>
           new ManagedAttachmentStoreError("Failed to persist attachment bytes.", {
             status: 500,
@@ -223,10 +295,6 @@ export function persistReservedManagedAttachment(input: {
           requestedAt: input.now,
         })
         .pipe(Effect.ignore);
-      yield* Effect.tryPromise({
-        try: () => fs.unlink(temporaryPath),
-        catch: () => undefined,
-      }).pipe(Effect.ignore);
       return yield* Effect.failCause(writeResult.cause);
     }
 

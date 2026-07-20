@@ -503,6 +503,41 @@ describe("binaryUploadEffectRouteLayer", () => {
             mimeType: "image/png",
           });
           const url = `${serverOrigin}${ATTACHMENT_UPLOAD_ROUTE_PATH}?${params.toString()}`;
+          const trustedOrigin = "https://synara.example.test";
+          const untrustedPreflightResponse = await fetch(url, {
+            method: "OPTIONS",
+            headers: {
+              Origin: "https://evil.example.test",
+              "Access-Control-Request-Method": "POST",
+            },
+          });
+          expect(untrustedPreflightResponse.status).toBe(403);
+          expect(untrustedPreflightResponse.headers.get("access-control-allow-origin")).toBeNull();
+
+          const preflightResponse = await fetch(url, {
+            method: "OPTIONS",
+            headers: {
+              Origin: trustedOrigin,
+              "Access-Control-Request-Method": "POST",
+              "Access-Control-Request-Headers": SYNARA_CSRF_HEADER_NAME,
+            },
+          });
+          expect(preflightResponse.status).toBe(204);
+          expect(preflightResponse.headers.get("access-control-allow-origin")).toBe(trustedOrigin);
+
+          const unauthenticatedResponse = await fetch(url, {
+            method: "POST",
+            headers: { Origin: trustedOrigin },
+            body: Uint8Array.from([1]),
+          });
+          expect(unauthenticatedResponse.status).toBe(401);
+          expect(unauthenticatedResponse.headers.get("access-control-allow-origin")).toBe(
+            trustedOrigin,
+          );
+          expect(unauthenticatedResponse.headers.get("access-control-allow-credentials")).toBe(
+            "true",
+          );
+
           const cookieResponse = await fetch(url, {
             method: "POST",
             headers: { Cookie: "synara_session=cookie-token" },
@@ -514,19 +549,23 @@ describe("binaryUploadEffectRouteLayer", () => {
           const missingCsrfResponse = await fetch(url, {
             method: "POST",
             headers: {
-              Origin: "https://synara.example.test",
+              Origin: trustedOrigin,
               Cookie: "synara_session=cookie-token",
             },
             body: Uint8Array.from([1]),
           });
           expect(missingCsrfResponse.status).toBe(403);
+          expect(missingCsrfResponse.headers.get("access-control-allow-origin")).toBe(
+            trustedOrigin,
+          );
+          expect(missingCsrfResponse.headers.get("access-control-allow-credentials")).toBe("true");
 
           const cookieWithCsrfResponse = await fetch(
             `${serverOrigin}${ATTACHMENT_UPLOAD_ROUTE_PATH}`,
             {
               method: "POST",
               headers: {
-                Origin: "https://synara.example.test",
+                Origin: trustedOrigin,
                 Cookie: "synara_session=cookie-token",
                 [SYNARA_CSRF_HEADER_NAME]: SYNARA_CSRF_HEADER_VALUE,
               },

@@ -169,6 +169,64 @@ describe("upload admission", () => {
     });
   });
 
+  it("does not track fresh principals when the peer dimension rejects them", () => {
+    const admission = makeUploadAdmission({
+      now: () => 0,
+      uploadsPerMinutePerPrincipal: 100,
+      uploadsPerMinutePerPeer: 1,
+      maxTrackedPrincipals: 3,
+      maxTrackedPeers: 3,
+    });
+
+    expect(
+      admission.admit({ principalKey: "session:accepted", remoteAddress: "10.0.0.1" }),
+    ).toEqual({ admitted: true });
+    for (let index = 0; index < 10; index += 1) {
+      expect(
+        admission.admit({
+          principalKey: `session:rejected-${index}`,
+          remoteAddress: "10.0.0.1",
+        }),
+      ).toMatchObject({ admitted: false, reason: "peer-rate" });
+    }
+
+    expect(admission.snapshot()).toEqual({
+      trackedPrincipals: 1,
+      trackedPeers: 1,
+      usingOverflowPrincipalBucket: false,
+      usingOverflowPeerBucket: false,
+    });
+  });
+
+  it("does not track fresh peers when the principal dimension rejects them", () => {
+    const admission = makeUploadAdmission({
+      now: () => 0,
+      uploadsPerMinutePerPrincipal: 1,
+      uploadsPerMinutePerPeer: 100,
+      maxTrackedPrincipals: 3,
+      maxTrackedPeers: 3,
+    });
+
+    expect(admission.admit({ principalKey: "session:limited", remoteAddress: "10.0.0.1" })).toEqual(
+      { admitted: true },
+    );
+    for (let index = 0; index < 10; index += 1) {
+      expect(
+        admission.admit({
+          principalKey: "session:limited",
+          remoteAddress: `10.0.0.${index + 2}`,
+        }),
+      ).toMatchObject({ admitted: false, reason: "principal-rate" });
+    }
+
+    expect(admission.snapshot()).toEqual({
+      trackedPrincipals: 1,
+      trackedPeers: 1,
+      usingOverflowPrincipalBucket: false,
+      usingOverflowPeerBucket: false,
+    });
+  });
+
   it("preserves its monotonic clock policy while rejecting and refilling", () => {
     let nowMs = 1_000;
     const admission = makeUploadAdmission({

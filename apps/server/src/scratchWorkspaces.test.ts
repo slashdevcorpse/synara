@@ -174,6 +174,41 @@ describe("scratch workspace cleanup", () => {
           renameSync(candidate, originalCandidate);
           mkdirSync(candidate);
           writeFileSync(path.join(candidate, "proof.txt"), "replacement");
+        },
+      });
+
+      expect(result).toMatchObject({ removed: 0, preservedUnsafe: 1 });
+      expect(() => writeFileSync(path.join(candidate, "still-here.txt"), "safe")).not.toThrow();
+      expect(() =>
+        writeFileSync(path.join(originalCandidate, "still-here.txt"), "safe"),
+      ).not.toThrow();
+    } finally {
+      rmSync(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  it("has the pinned child refuse a candidate replaced after parent validation", async () => {
+    const rootDir = await mkdtemp(path.join(tmpdir(), "synara-scratch-pinned-candidate-"));
+    const candidate = path.join(
+      rootDir,
+      scratchWorkspaceSegment(ThreadId.makeUnsafe("pinned-candidate-thread")),
+    );
+    const originalCandidate = `${candidate}-original`;
+    mkdirSync(candidate);
+    writeFileSync(path.join(candidate, "proof.txt"), "original");
+    const nowMs = Date.now();
+    const staleDate = new Date(nowMs - 48 * 60 * 60 * 1_000);
+    utimesSync(candidate, staleDate, staleDate);
+
+    try {
+      const result = await sweepStaleScratchWorkspaces({
+        activeThreadIds: new Set(),
+        rootDir,
+        nowMs,
+        beforePinnedDelete: async () => {
+          renameSync(candidate, originalCandidate);
+          mkdirSync(candidate);
+          writeFileSync(path.join(candidate, "proof.txt"), "replacement");
           utimesSync(candidate, staleDate, staleDate);
         },
       });
@@ -185,6 +220,76 @@ describe("scratch workspace cleanup", () => {
       ).not.toThrow();
     } finally {
       rmSync(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  it("recovers a stale scratch quarantine left by an interrupted pinned deletion", async () => {
+    const rootDir = await mkdtemp(path.join(tmpdir(), "synara-scratch-quarantine-"));
+    const segment = scratchWorkspaceSegment(ThreadId.makeUnsafe("quarantined-thread"));
+    const quarantine = path.join(
+      rootDir,
+      `.synara-scratch-${segment}.deleting-123e4567-e89b-42d3-a456-426614174000`,
+    );
+    mkdirSync(quarantine);
+    writeFileSync(path.join(quarantine, "proof.txt"), "recover me");
+    const nowMs = Date.now();
+    const staleDate = new Date(nowMs - 48 * 60 * 60 * 1_000);
+    utimesSync(quarantine, staleDate, staleDate);
+
+    try {
+      const result = await sweepStaleScratchWorkspaces({
+        activeThreadIds: new Set(),
+        rootDir,
+        nowMs,
+      });
+
+      expect(result).toMatchObject({ removed: 1, preservedUnsafe: 0 });
+      expect(() => writeFileSync(path.join(quarantine, "gone.txt"), "gone")).toThrow();
+    } finally {
+      rmSync(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a root replaced after sweep validation without deleting either tree", async () => {
+    const parentDir = await mkdtemp(path.join(tmpdir(), "synara-scratch-pinned-sweep-root-"));
+    const outsideDir = await mkdtemp(path.join(tmpdir(), "synara-scratch-pinned-sweep-outside-"));
+    const rootDir = path.join(parentDir, "managed");
+    const originalRootDir = path.join(parentDir, "managed-original");
+    const segment = scratchWorkspaceSegment(ThreadId.makeUnsafe("pinned-sweep-root-thread"));
+    const candidate = path.join(rootDir, segment);
+    const outsideCandidate = path.join(outsideDir, segment);
+    mkdirSync(candidate, { recursive: true });
+    mkdirSync(outsideCandidate, { recursive: true });
+    writeFileSync(path.join(candidate, "original.txt"), "original");
+    writeFileSync(path.join(outsideCandidate, "outside.txt"), "outside");
+    const nowMs = Date.now();
+    const staleDate = new Date(nowMs - 48 * 60 * 60 * 1_000);
+    utimesSync(candidate, staleDate, staleDate);
+    utimesSync(outsideCandidate, staleDate, staleDate);
+
+    try {
+      const result = await sweepStaleScratchWorkspaces({
+        activeThreadIds: new Set(),
+        rootDir,
+        nowMs,
+        beforePinnedDelete: async () => {
+          renameSync(rootDir, originalRootDir);
+          symlinkSync(outsideDir, rootDir, process.platform === "win32" ? "junction" : "dir");
+        },
+      });
+
+      expect(result).toMatchObject({ removed: 0, preservedUnsafe: 1 });
+      expect(() =>
+        writeFileSync(path.join(originalRootDir, segment, "still-original.txt"), "safe"),
+      ).not.toThrow();
+      expect(() =>
+        writeFileSync(path.join(outsideCandidate, "still-outside.txt"), "safe"),
+      ).not.toThrow();
+    } finally {
+      rmSync(rootDir, { recursive: true, force: true });
+      rmSync(originalRootDir, { recursive: true, force: true });
+      rmSync(parentDir, { recursive: true, force: true });
+      rmSync(outsideDir, { recursive: true, force: true });
     }
   });
 
@@ -222,6 +327,44 @@ describe("scratch workspace cleanup", () => {
         "Scratch workspace root is not a managed directory.",
       );
       expect(() => writeFileSync(outsideProof, "still outside")).not.toThrow();
+    } finally {
+      rmSync(rootDir, { recursive: true, force: true });
+      rmSync(originalRootDir, { recursive: true, force: true });
+      rmSync(parentDir, { recursive: true, force: true });
+      rmSync(outsideDir, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a root replaced after explicit-delete validation", async () => {
+    const parentDir = await mkdtemp(path.join(tmpdir(), "synara-scratch-pinned-explicit-root-"));
+    const outsideDir = await mkdtemp(
+      path.join(tmpdir(), "synara-scratch-pinned-explicit-outside-"),
+    );
+    const rootDir = path.join(parentDir, "managed");
+    const originalRootDir = path.join(parentDir, "managed-original");
+    const threadId = ThreadId.makeUnsafe("pinned-explicit-root-thread");
+    const segment = scratchWorkspaceSegment(threadId);
+    mkdirSync(path.join(rootDir, segment), { recursive: true });
+    mkdirSync(path.join(outsideDir, segment), { recursive: true });
+    writeFileSync(path.join(rootDir, segment, "original.txt"), "original");
+    writeFileSync(path.join(outsideDir, segment, "outside.txt"), "outside");
+
+    try {
+      await expect(
+        removeIsolatedScratchWorkspace(threadId, {
+          rootDir,
+          beforePinnedDelete: async () => {
+            renameSync(rootDir, originalRootDir);
+            symlinkSync(outsideDir, rootDir, process.platform === "win32" ? "junction" : "dir");
+          },
+        }),
+      ).rejects.toThrow("root changed before pinned deletion");
+      expect(() =>
+        writeFileSync(path.join(originalRootDir, segment, "still-original.txt"), "safe"),
+      ).not.toThrow();
+      expect(() =>
+        writeFileSync(path.join(outsideDir, segment, "still-outside.txt"), "safe"),
+      ).not.toThrow();
     } finally {
       rmSync(rootDir, { recursive: true, force: true });
       rmSync(originalRootDir, { recursive: true, force: true });

@@ -7,7 +7,7 @@
 // Exports: ensureIsolatedScratchWorkspace
 
 import { createHash } from "node:crypto";
-import { mkdirSync, type Stats, utimesSync } from "node:fs";
+import { mkdirSync, type BigIntStats, utimesSync } from "node:fs";
 import fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -15,8 +15,74 @@ import path from "node:path";
 import { ThreadId } from "@synara/contracts";
 import { SCRATCH_WORKSPACES_DIRNAME } from "@synara/shared/threadWorkspace";
 
+import { runProcess } from "./processRunner";
+
 export const SCRATCH_WORKSPACE_MAX_IDLE_MS = 24 * 60 * 60 * 1_000;
 const SCRATCH_WORKSPACE_SEGMENT_PATTERN = /^[A-Za-z0-9_-][A-Za-z0-9._-]*-[0-9a-f]{12}$/u;
+const SCRATCH_WORKSPACE_QUARANTINE_PATTERN =
+  /^\.synara-scratch-([A-Za-z0-9_-][A-Za-z0-9._-]*-[0-9a-f]{12})\.deleting-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+const PINNED_DELETE_TIMEOUT_MS = 10_000;
+const PINNED_DELETE_ROOT_UNSAFE_EXIT = 72;
+const PINNED_DELETE_MISSING_EXIT = 73;
+const PINNED_DELETE_CANDIDATE_UNSAFE_EXIT = 74;
+const PINNED_DELETE_FAILED_EXIT = 75;
+const PINNED_DELETE_SCRIPT = String.raw`
+const fs = require("node:fs");
+const path = require("node:path");
+const { randomUUID } = require("node:crypto");
+const [candidateName, candidateKind, rootDev, rootIno, candidateDev, candidateIno] = process.argv.slice(1);
+const ROOT_UNSAFE = 72;
+const MISSING = 73;
+const CANDIDATE_UNSAFE = 74;
+const FAILED = 75;
+const sameIdentity = (stat, dev, ino) => String(stat.dev) === dev && String(stat.ino) === ino;
+const fail = (code, detail) => {
+  if (detail) process.stderr.write(String(detail).slice(0, 2048));
+  process.exit(code);
+};
+if (!candidateName || path.basename(candidateName) !== candidateName || candidateName === "." || candidateName === "..") {
+  fail(CANDIDATE_UNSAFE, "invalid candidate basename");
+}
+let quarantineName = null;
+try {
+  const rootStat = fs.lstatSync(".", { bigint: true });
+  if (!rootStat.isDirectory() || rootStat.isSymbolicLink() || !sameIdentity(rootStat, rootDev, rootIno)) {
+    fail(ROOT_UNSAFE, "managed root identity mismatch");
+  }
+  let candidateStat;
+  try {
+    candidateStat = fs.lstatSync(candidateName, { bigint: true });
+  } catch (cause) {
+    if (cause && cause.code === "ENOENT") fail(MISSING);
+    throw cause;
+  }
+  if (!candidateStat.isDirectory() || candidateStat.isSymbolicLink() || !sameIdentity(candidateStat, candidateDev, candidateIno)) {
+    fail(CANDIDATE_UNSAFE, "candidate identity mismatch");
+  }
+  if (candidateKind === "quarantine") {
+    fs.rmSync(candidateName, { recursive: true, force: true, maxRetries: 2, retryDelay: 25 });
+    process.exit(0);
+  }
+  quarantineName = ".synara-scratch-" + candidateName + ".deleting-" + randomUUID();
+  fs.renameSync(candidateName, quarantineName);
+  const quarantinedStat = fs.lstatSync(quarantineName, { bigint: true });
+  if (!quarantinedStat.isDirectory() || quarantinedStat.isSymbolicLink() || !sameIdentity(quarantinedStat, candidateDev, candidateIno)) {
+    try { fs.renameSync(quarantineName, candidateName); } catch {}
+    fail(CANDIDATE_UNSAFE, "quarantined candidate identity mismatch");
+  }
+  fs.rmSync(quarantineName, { recursive: true, force: true, maxRetries: 2, retryDelay: 25 });
+  process.exit(0);
+} catch (cause) {
+  if (quarantineName) {
+    try {
+      if (!fs.existsSync(candidateName) && fs.existsSync(quarantineName)) {
+        fs.renameSync(quarantineName, candidateName);
+      }
+    } catch {}
+  }
+  fail(FAILED, cause && (cause.code || cause.message) || cause);
+}
+`;
 
 export function scratchWorkspaceSegment(threadId: ThreadId): string {
   const raw = String(threadId);
@@ -58,18 +124,18 @@ function isMissingPathError(cause: unknown): boolean {
   );
 }
 
-function isSamePathIdentity(left: Stats, right: Stats): boolean {
+function isSameBigIntPathIdentity(left: BigIntStats, right: BigIntStats): boolean {
   return left.dev === right.dev && left.ino === right.ino;
 }
 
 async function resolveVerifiedScratchRoot(rootDir: string): Promise<{
   readonly realRoot: string;
-  readonly identity: Stats;
+  readonly identity: BigIntStats;
 } | null> {
   const resolvedRoot = path.resolve(rootDir);
-  let identity: Stats;
+  let identity: BigIntStats;
   try {
-    identity = await fs.lstat(resolvedRoot);
+    identity = await fs.lstat(resolvedRoot, { bigint: true });
   } catch (cause) {
     if (isMissingPathError(cause)) return null;
     throw cause;
@@ -79,20 +145,78 @@ async function resolveVerifiedScratchRoot(rootDir: string): Promise<{
   }
 
   const realRoot = await fs.realpath(resolvedRoot);
-  const verifiedIdentity = await fs.lstat(resolvedRoot);
+  const verifiedIdentity = await fs.lstat(resolvedRoot, { bigint: true });
   if (
     verifiedIdentity.isSymbolicLink() ||
     !verifiedIdentity.isDirectory() ||
-    !isSamePathIdentity(identity, verifiedIdentity)
+    !isSameBigIntPathIdentity(identity, verifiedIdentity)
   ) {
     throw new Error("Scratch workspace root changed during verification.");
   }
   return { realRoot, identity };
 }
 
+type PinnedDeleteResult = "removed" | "missing" | "root-unsafe" | "candidate-unsafe";
+
+async function removePinnedScratchDirectory(input: {
+  readonly realRoot: string;
+  readonly rootIdentity: BigIntStats;
+  readonly candidateName: string;
+  readonly candidateIdentity: BigIntStats;
+  readonly kind: "workspace" | "quarantine";
+}): Promise<PinnedDeleteResult> {
+  if (path.basename(input.candidateName) !== input.candidateName) {
+    throw new Error("Scratch workspace deletion target is not a basename.");
+  }
+  const result = await runProcess(
+    process.execPath,
+    [
+      "--eval",
+      PINNED_DELETE_SCRIPT,
+      input.candidateName,
+      input.kind,
+      input.rootIdentity.dev.toString(10),
+      input.rootIdentity.ino.toString(10),
+      input.candidateIdentity.dev.toString(10),
+      input.candidateIdentity.ino.toString(10),
+    ],
+    {
+      cwd: input.realRoot,
+      timeoutMs: PINNED_DELETE_TIMEOUT_MS,
+      allowNonZeroExit: true,
+      maxBufferBytes: 4_096,
+      outputMode: "truncate",
+    },
+  );
+  if (result.timedOut) {
+    throw new Error("Pinned scratch workspace deletion timed out.");
+  }
+  switch (result.code) {
+    case 0:
+      return "removed";
+    case PINNED_DELETE_MISSING_EXIT:
+      return "missing";
+    case PINNED_DELETE_ROOT_UNSAFE_EXIT:
+      return "root-unsafe";
+    case PINNED_DELETE_CANDIDATE_UNSAFE_EXIT:
+      return "candidate-unsafe";
+    case PINNED_DELETE_FAILED_EXIT:
+    default: {
+      const detail = result.stderr.trim().slice(0, 2_048);
+      throw new Error(
+        `Pinned scratch workspace deletion failed (code=${result.code ?? "null"}).${detail ? ` ${detail}` : ""}`,
+      );
+    }
+  }
+}
+
 export async function removeIsolatedScratchWorkspace(
   threadId: ThreadId,
-  options: { readonly rootDir?: string } = {},
+  options: {
+    readonly rootDir?: string;
+    /** Test seam for a replacement after parent validation but before child pinning. */
+    readonly beforePinnedDelete?: (candidatePath: string) => Promise<void>;
+  } = {},
 ): Promise<void> {
   const workspaceRoot = options.rootDir ?? resolveScratchWorkspacesRoot();
   const verifiedRoot = await resolveVerifiedScratchRoot(workspaceRoot);
@@ -102,7 +226,7 @@ export async function removeIsolatedScratchWorkspace(
   if (!isPathInside(workspaceDir, verifiedRoot.realRoot)) {
     throw new Error("Scratch workspace deletion target escaped its managed root.");
   }
-  const workspaceIdentity = await fs.lstat(workspaceDir).catch((cause) => {
+  const workspaceIdentity = await fs.lstat(workspaceDir, { bigint: true }).catch((cause) => {
     if (isMissingPathError(cause)) return null;
     throw cause;
   });
@@ -115,16 +239,16 @@ export async function removeIsolatedScratchWorkspace(
     throw new Error("Scratch workspace deletion target escaped its managed root.");
   }
 
-  const finalRootIdentity = await fs.lstat(path.resolve(workspaceRoot));
+  const finalRootIdentity = await fs.lstat(path.resolve(workspaceRoot), { bigint: true });
   if (
     finalRootIdentity.isSymbolicLink() ||
     !finalRootIdentity.isDirectory() ||
-    !isSamePathIdentity(verifiedRoot.identity, finalRootIdentity)
+    !isSameBigIntPathIdentity(verifiedRoot.identity, finalRootIdentity)
   ) {
     throw new Error("Scratch workspace root changed before deletion.");
   }
 
-  const finalWorkspaceIdentity = await fs.lstat(workspaceDir).catch((cause) => {
+  const finalWorkspaceIdentity = await fs.lstat(workspaceDir, { bigint: true }).catch((cause) => {
     if (isMissingPathError(cause)) return null;
     throw cause;
   });
@@ -132,7 +256,7 @@ export async function removeIsolatedScratchWorkspace(
   if (
     finalWorkspaceIdentity.isSymbolicLink() ||
     !finalWorkspaceIdentity.isDirectory() ||
-    !isSamePathIdentity(workspaceIdentity, finalWorkspaceIdentity)
+    !isSameBigIntPathIdentity(workspaceIdentity, finalWorkspaceIdentity)
   ) {
     throw new Error("Scratch workspace deletion target changed before deletion.");
   }
@@ -143,7 +267,20 @@ export async function removeIsolatedScratchWorkspace(
   ) {
     throw new Error("Scratch workspace deletion target changed before deletion.");
   }
-  await fs.rm(realWorkspace, { recursive: true, force: true });
+  await options.beforePinnedDelete?.(workspaceDir);
+  const deletion = await removePinnedScratchDirectory({
+    realRoot: verifiedRoot.realRoot,
+    rootIdentity: verifiedRoot.identity,
+    candidateName: path.basename(workspaceDir),
+    candidateIdentity: finalWorkspaceIdentity,
+    kind: "workspace",
+  });
+  if (deletion === "root-unsafe") {
+    throw new Error("Scratch workspace root changed before pinned deletion.");
+  }
+  if (deletion === "candidate-unsafe") {
+    throw new Error("Scratch workspace deletion target changed before pinned deletion.");
+  }
 }
 
 export interface ScratchWorkspaceSweepResult {
@@ -160,6 +297,8 @@ export async function sweepStaleScratchWorkspaces(input: {
   readonly maxIdleMs?: number;
   /** Test seam for a replacement race immediately before recursive deletion. */
   readonly beforeFinalDelete?: (candidatePath: string) => Promise<void>;
+  /** Test seam for a replacement after parent validation but before child pinning. */
+  readonly beforePinnedDelete?: (candidatePath: string) => Promise<void>;
 }): Promise<ScratchWorkspaceSweepResult> {
   const rootDir = input.rootDir ?? resolveScratchWorkspacesRoot();
   const nowMs = input.nowMs ?? Date.now();
@@ -183,22 +322,29 @@ export async function sweepStaleScratchWorkspaces(input: {
   );
   for (const entry of entries) {
     result.inspected += 1;
+    const quarantineMatch = SCRATCH_WORKSPACE_QUARANTINE_PATTERN.exec(entry.name);
+    const workspaceSegment = quarantineMatch?.[1] ?? entry.name;
+    const candidateKind = quarantineMatch ? "quarantine" : "workspace";
     if (
       !entry.isDirectory() ||
       entry.isSymbolicLink() ||
-      !SCRATCH_WORKSPACE_SEGMENT_PATTERN.test(entry.name)
+      (candidateKind === "workspace" && !SCRATCH_WORKSPACE_SEGMENT_PATTERN.test(entry.name))
     ) {
       result.preservedUnsafe += 1;
       continue;
     }
-    if (activeSegments.has(entry.name)) {
+    if (candidateKind === "workspace" && activeSegments.has(workspaceSegment)) {
       result.preservedActive += 1;
       continue;
     }
 
     const candidate = path.join(realRoot, entry.name);
-    const stat = await fs.lstat(candidate).catch(() => null);
-    if (!stat || nowMs - stat.mtimeMs < maxIdleMs) continue;
+    const bigintStat = await fs.lstat(candidate, { bigint: true }).catch(() => null);
+    if (!bigintStat || !bigintStat.isDirectory() || bigintStat.isSymbolicLink()) {
+      result.preservedUnsafe += 1;
+      continue;
+    }
+    if (nowMs - Number(bigintStat.mtimeMs) < maxIdleMs) continue;
     const realCandidate = await fs.realpath(candidate).catch(() => null);
     if (!realCandidate || !isPathInside(realCandidate, realRoot)) {
       result.preservedUnsafe += 1;
@@ -206,23 +352,25 @@ export async function sweepStaleScratchWorkspaces(input: {
     }
     await input.beforeFinalDelete?.(candidate);
 
-    const finalRootIdentity = await fs.lstat(path.resolve(rootDir)).catch(() => null);
+    const finalRootIdentity = await fs
+      .lstat(path.resolve(rootDir), { bigint: true })
+      .catch(() => null);
     if (
       !finalRootIdentity ||
       finalRootIdentity.isSymbolicLink() ||
       !finalRootIdentity.isDirectory() ||
-      !isSamePathIdentity(verifiedRoot.identity, finalRootIdentity)
+      !isSameBigIntPathIdentity(verifiedRoot.identity, finalRootIdentity)
     ) {
       result.preservedUnsafe += 1;
       break;
     }
 
-    const finalCandidateIdentity = await fs.lstat(candidate).catch(() => null);
+    const finalCandidateIdentity = await fs.lstat(candidate, { bigint: true }).catch(() => null);
     if (
       !finalCandidateIdentity ||
       finalCandidateIdentity.isSymbolicLink() ||
       !finalCandidateIdentity.isDirectory() ||
-      !isSamePathIdentity(stat, finalCandidateIdentity)
+      !isSameBigIntPathIdentity(bigintStat, finalCandidateIdentity)
     ) {
       result.preservedUnsafe += 1;
       continue;
@@ -236,9 +384,22 @@ export async function sweepStaleScratchWorkspaces(input: {
       result.preservedUnsafe += 1;
       continue;
     }
-
-    await fs.rm(realCandidate, { recursive: true, force: true });
-    result.removed += 1;
+    await input.beforePinnedDelete?.(candidate);
+    const deletion = await removePinnedScratchDirectory({
+      realRoot,
+      rootIdentity: verifiedRoot.identity,
+      candidateName: entry.name,
+      candidateIdentity: finalCandidateIdentity,
+      kind: candidateKind,
+    });
+    if (deletion === "removed") {
+      result.removed += 1;
+    } else if (deletion === "root-unsafe") {
+      result.preservedUnsafe += 1;
+      break;
+    } else if (deletion === "candidate-unsafe") {
+      result.preservedUnsafe += 1;
+    }
   }
   return result;
 }

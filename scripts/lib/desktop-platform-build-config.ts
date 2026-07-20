@@ -26,6 +26,8 @@ export const MAC_PRESIGNED_VENDOR_SIGN_IGNORE_PATTERNS = [
 export const WINDOWS_INSTALLER_GUID = SYNARA_WINDOWS_INSTALLER_GUID;
 export const WINDOWS_JOB_LAUNCHER_EXECUTABLE = launcherConfig.executableName;
 export const WINDOWS_JOB_LAUNCHER_EXTRA_FILE_DESTINATION = `resources/synara-native/${WINDOWS_JOB_LAUNCHER_EXECUTABLE}`;
+const WINDOWS_UNIVERSAL_BUILD_ERROR =
+  "Windows desktop artifacts support x64 or arm64 builds, not universal builds.";
 const MAC_DMG_ICON_PATH = "icon.icns";
 export const NODE_PTY_ASAR_UNPACK_GLOBS = ["node_modules/node-pty/**"] as const;
 export const MAC_FOREIGN_NATIVE_EXCLUSIONS = [
@@ -81,7 +83,7 @@ export interface DesktopNativeBuildHostInput {
 
 export function validateDesktopNativeBuildHost(input: DesktopNativeBuildHostInput): string | null {
   if (input.platform === "win" && input.arch === "universal") {
-    return "Windows desktop artifacts support x64 or arm64 builds, not universal builds.";
+    return WINDOWS_UNIVERSAL_BUILD_ERROR;
   }
   if (input.platform === "mac" && input.hostPlatform !== "darwin") {
     return [
@@ -106,6 +108,9 @@ export function validateDesktopNativeBuildHost(input: DesktopNativeBuildHostInpu
 export function createDesktopPlatformBuildConfig(
   input: CreateDesktopPlatformBuildConfigInput,
 ): DesktopPlatformBuildConfig {
+  if (input.platform === "win" && input.arch === "universal") {
+    throw new TypeError(WINDOWS_UNIVERSAL_BUILD_ERROR);
+  }
   const nativePackaging = { asarUnpack: [...NODE_PTY_ASAR_UNPACK_GLOBS] };
   const identity = input.identity ?? synaraDesktopIdentity("production");
   const licensedPackaging = {

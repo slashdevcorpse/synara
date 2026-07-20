@@ -1,6 +1,9 @@
+import { performance } from "node:perf_hooks";
+
 import {
   defaultProcessTreeKiller,
   type CapturedProcess,
+  type CapturedProcessTreeInspection,
   type ProcessTreeKiller,
   type TerminalKillSignal,
 } from "../terminal/processTreeKiller";
@@ -75,12 +78,36 @@ export class ProviderProcessExitUnprovenError extends Error {
 
 const defaultDependencies: SupervisedProcessTeardownDependencies = {
   processTreeKiller: defaultProcessTreeKiller,
-  now: Date.now,
+  now: performance.now,
   sleep: (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
 };
 
 function positiveDuration(value: number | undefined, fallback: number): number {
   return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+const INSPECTION_TIMED_OUT = Symbol("inspection-timed-out");
+
+function isPromiseLike<T>(value: T | PromiseLike<T> | undefined): value is PromiseLike<T> {
+  return value !== undefined && typeof (value as PromiseLike<T>).then === "function";
+}
+
+async function inspectBeforeDeadline(
+  inspection: PromiseLike<CapturedProcessTreeInspection>,
+  timeoutMs: number,
+): Promise<CapturedProcessTreeInspection | typeof INSPECTION_TIMED_OUT> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      Promise.resolve(inspection),
+      new Promise<typeof INSPECTION_TIMED_OUT>((resolve) => {
+        timer = setTimeout(() => resolve(INSPECTION_TIMED_OUT), timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 function waitForOwnedProcessExit(process: ProcessExitHandle): Promise<void> {
@@ -176,7 +203,20 @@ export async function teardownProviderProcessTree(
     do {
       // Flush a root-exit resolution caused synchronously by a signal test double.
       await Promise.resolve();
-      const inspection = await deps.processTreeKiller.inspect?.(tree);
+      const inspectionBudgetMs = deadline - deps.now();
+      if (inspectionBudgetMs <= 0) break;
+      let inspection: CapturedProcessTreeInspection | typeof INSPECTION_TIMED_OUT | undefined;
+      try {
+        const pendingInspection = deps.processTreeKiller.inspect?.(tree);
+        inspection = isPromiseLike(pendingInspection)
+          ? await inspectBeforeDeadline(pendingInspection, inspectionBudgetMs)
+          : pendingInspection;
+      } catch {
+        inspection = undefined;
+      }
+      if (inspection === INSPECTION_TIMED_OUT) {
+        return { proven: false as const, remainingDescendants: null };
+      }
       remainingDescendants = inspection?.verified === true ? inspection.survivors : null;
       if (
         rootExited &&

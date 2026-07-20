@@ -384,11 +384,20 @@ describe("production Effect HTTP routes", () => {
     mkdirSync(path.join(staticDir, "assets"), { recursive: true });
     writeFileSync(path.join(staticDir, "index.html"), "<main>Synara shell</main>");
     writeFileSync(path.join(staticDir, "assets", "app.js"), "globalThis.synara = true;");
+    writeFileSync(path.join(staticDir, "assets", "document.xhtml"), "<main>XHTML shell</main>");
     await withEffectServer(makeConfig({ staticDir }), { kind: "static" }, async (origin) => {
       const asset = await fetch(`${origin}/assets/app.js`);
       expect(asset.status).toBe(200);
       expect(asset.headers.get("content-security-policy")).toBeNull();
       await expect(asset.text()).resolves.toContain("globalThis.synara");
+
+      const xhtml = await fetch(`${origin}/assets/document.xhtml`);
+      expect(xhtml.status).toBe(200);
+      expect(xhtml.headers.get("content-type")).toContain("application/xhtml+xml");
+      expect(xhtml.headers.get("content-security-policy")).toBe(
+        WEB_DOCUMENT_SECURITY_HEADERS["Content-Security-Policy"],
+      );
+      expect(xhtml.headers.get("x-content-type-options")).toBe("nosniff");
 
       const fallback = await fetch(`${origin}/chat/thread-id`);
       expect(fallback.status).toBe(200);

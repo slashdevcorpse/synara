@@ -26,7 +26,7 @@ import {
 } from "./nodeHttpServer";
 import type { WsTransportAdmissionOptions } from "./wsTransportAdmission";
 import { SqlitePersistenceMemory } from "./persistence/Layers/Sqlite";
-import { makeWebsocketRpcRouteLayer } from "./wsRpc";
+import { makeWebsocketBootstrapRouteLayer, makeWebsocketRpcRouteLayer } from "./wsRpc";
 import { makeCurrentWsFeatureCompatibilitySearchParams } from "./wsCompatibility";
 
 const PingRpc = Rpc.make("test.ping", {
@@ -267,7 +267,10 @@ async function startTestServer(
       ),
     ),
   );
-  const routeLayer = makeWebsocketRpcRouteLayer(rpcHttpEffectSource);
+  const routeLayer = Layer.merge(
+    makeWebsocketBootstrapRouteLayer(rpcHttpEffectSource),
+    makeWebsocketRpcRouteLayer(rpcHttpEffectSource),
+  );
   const scope = await Effect.runPromise(Scope.make("sequential"));
   const context = await Effect.runPromise(
     Layer.buildWithScope(
@@ -337,10 +340,36 @@ async function connectExistingSession(
   return { token: websocket.token, socket };
 }
 
+async function connectBootstrapSession(
+  server: RunningTestServer,
+  ttl?: Duration.Duration,
+): Promise<{
+  readonly sessionId: AuthSessionId;
+  readonly token: string;
+  readonly socket: WebSocket;
+}> {
+  const issued = await Effect.runPromise(server.sessions.issue(ttl ? { ttl } : undefined));
+  const connected = await connectExistingBootstrapSession(server, issued.sessionId);
+  return { sessionId: issued.sessionId, ...connected };
+}
+
+async function connectExistingBootstrapSession(
+  server: RunningTestServer,
+  sessionId: AuthSessionId,
+): Promise<{ readonly token: string; readonly socket: WebSocket }> {
+  const websocket = await Effect.runPromise(server.sessions.issueWebSocketToken(sessionId));
+  const socket = await connect(bootstrapSocketUrl(server, websocket.token));
+  return { token: websocket.token, socket };
+}
+
 function featureSocketUrl(server: RunningTestServer, token: string): string {
   const searchParams = makeCurrentWsFeatureCompatibilitySearchParams("test-client");
   searchParams.set("wsToken", token);
   return `${server.origin}/ws?${searchParams.toString()}`;
+}
+
+function bootstrapSocketUrl(server: RunningTestServer, token: string): string {
+  return `${server.origin}/ws/bootstrap?wsToken=${encodeURIComponent(token)}`;
 }
 
 async function waitForObserved(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
@@ -557,6 +586,39 @@ describe("websocketRpcRouteLayer connection lifecycle", () => {
     }
   });
 
+  it("applies the per-session socket cap to authenticated bootstrap sockets", async () => {
+    const server = await startTestServer({ connectionBurstPerPeer: 20 });
+    try {
+      const issued = await Effect.runPromise(server.sessions.issue());
+      const sockets: WebSocket[] = [];
+      for (let index = 0; index < MAX_AUTHENTICATED_CONNECTIONS_PER_SESSION; index += 1) {
+        sockets.push((await connectExistingBootstrapSession(server, issued.sessionId)).socket);
+      }
+
+      const rejectedTicket = await Effect.runPromise(
+        server.sessions.issueWebSocketToken(issued.sessionId),
+      );
+      await expect(connect(bootstrapSocketUrl(server, rejectedTicket.token))).rejects.toMatchObject(
+        {
+          statusCode: 429,
+          headers: expect.objectContaining({ "retry-after": "1" }),
+        },
+      );
+      await expect(ping(sockets[0]!)).resolves.toBeUndefined();
+
+      const released = sockets.pop()!;
+      const close = waitForClose(released);
+      released.close();
+      await close;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+
+      const replacement = await connectExistingBootstrapSession(server, issued.sessionId);
+      await expect(ping(replacement.socket)).resolves.toBeUndefined();
+    } finally {
+      await server.close();
+    }
+  });
+
   it("returns 429 at the global transport cap and releases capacity on close", async () => {
     const server = await startTestServer({
       maxConcurrentConnections: 2,
@@ -685,6 +747,27 @@ describe("websocketRpcRouteLayer connection lifecycle", () => {
     }
   });
 
+  it("closes every authenticated bootstrap socket when its session is revoked", async () => {
+    const server = await startTestServer();
+    try {
+      const revoked = await connectBootstrapSession(server);
+      const revokedSecond = await connectExistingBootstrapSession(server, revoked.sessionId);
+      const survivor = await connectSession(server);
+      const revokedClose = waitForClose(revoked.socket);
+      const revokedSecondClose = waitForClose(revokedSecond.socket);
+
+      await expect(server.logout(revoked.sessionId)).resolves.toBe(true);
+      await Promise.all([revokedClose, revokedSecondClose]);
+
+      expect(revoked.socket.readyState).toBe(WebSocket.CLOSED);
+      expect(revokedSecond.socket.readyState).toBe(WebSocket.CLOSED);
+      await expect(ping(survivor.socket)).resolves.toBeUndefined();
+      await expect(connect(bootstrapSocketUrl(server, revoked.token))).rejects.toThrow("401");
+    } finally {
+      await server.close();
+    }
+  });
+
   it("closes an established socket at durable session expiry", async () => {
     const server = await startTestServer();
     try {
@@ -697,6 +780,22 @@ describe("websocketRpcRouteLayer connection lifecycle", () => {
       expect(expiring.socket.readyState).toBe(WebSocket.CLOSED);
       expect(server.transportFinalizers.count).toBeGreaterThanOrEqual(1);
       await expect(connect(featureSocketUrl(server, expiring.token))).rejects.toThrow("401");
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("closes an authenticated bootstrap socket at durable session expiry", async () => {
+    const server = await startTestServer();
+    try {
+      const expiring = await connectBootstrapSession(server, Duration.seconds(1));
+      await expect(ping(expiring.socket)).resolves.toBeUndefined();
+      const close = waitForClose(expiring.socket, 3_000);
+
+      await close;
+
+      expect(expiring.socket.readyState).toBe(WebSocket.CLOSED);
+      await expect(connect(bootstrapSocketUrl(server, expiring.token))).rejects.toThrow("401");
     } finally {
       await server.close();
     }

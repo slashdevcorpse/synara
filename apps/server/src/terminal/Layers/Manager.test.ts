@@ -18,7 +18,7 @@ import {
   type PtySpawnInput,
 } from "../Services/PTY";
 import { TerminalManagerRuntime, type TerminalSubprocessActivity } from "./Manager";
-import type { ProcessTreeKiller } from "../processTreeKiller";
+import type { CapturedProcessTree, ProcessTreeKiller } from "../processTreeKiller";
 import type {
   WindowsProcessSnapshotCollector,
   WindowsProcessSnapshotResult,
@@ -1788,6 +1788,70 @@ describe("TerminalManager", () => {
     expect(fs.existsSync(terminalHistoryMetadataPath(defaultHistoryPath))).toBe(false);
     expect(fs.existsSync(terminalHistoryMetadataPath(sidecarHistoryPath))).toBe(false);
 
+    manager.dispose();
+  });
+
+  it("starts every thread terminal stop before awaiting capture and removes sessions after cleanup", async () => {
+    const defaultCapture = deferred<CapturedProcessTree>();
+    const sidecarCapture = deferred<CapturedProcessTree>();
+    const capturesByPid = new Map<number, Promise<CapturedProcessTree>>();
+    const captureStarted: number[] = [];
+    const treeSignals: Array<{
+      rootPid: number;
+      signal: string;
+      includeRootTree: boolean | undefined;
+    }> = [];
+    const processTreeKiller: ProcessTreeKiller = {
+      capture: (rootPid) => {
+        const pendingCapture = capturesByPid.get(rootPid);
+        if (!pendingCapture) throw new Error(`Unexpected capture PID: ${rootPid}`);
+        captureStarted.push(rootPid);
+        return pendingCapture;
+      },
+      signal: ({ rootPid, signal, includeRootTree }) => {
+        treeSignals.push({ rootPid, signal, includeRootTree });
+      },
+    };
+    const { manager, ptyAdapter } = makeManager(5, { processTreeKiller });
+    await manager.open(openInput({ terminalId: "default" }));
+    await manager.open(openInput({ terminalId: "sidecar" }));
+    const defaultProcess = ptyAdapter.processes[0];
+    const sidecarProcess = ptyAdapter.processes[1];
+    expect(defaultProcess).toBeDefined();
+    expect(sidecarProcess).toBeDefined();
+    if (!defaultProcess || !sidecarProcess) {
+      throw new Error("Expected both thread terminal processes to start");
+    }
+    capturesByPid.set(defaultProcess.pid, defaultCapture.promise);
+    capturesByPid.set(sidecarProcess.pid, sidecarCapture.promise);
+    const sessions = (manager as unknown as { sessions: Map<string, unknown> }).sessions;
+    let closeSettled = false;
+
+    const close = manager.close({ threadId: "thread-1" }).then(() => {
+      closeSettled = true;
+    });
+    await waitFor(() => captureStarted.length === 2);
+
+    expect(captureStarted).toEqual([defaultProcess.pid, sidecarProcess.pid]);
+    expect(sessions.size).toBe(2);
+    expect(closeSettled).toBe(false);
+    defaultProcess.emitExit({ exitCode: 0, signal: 15 });
+    sidecarProcess.emitExit({ exitCode: 0, signal: 15 });
+    expect(sessions.size).toBe(2);
+
+    defaultCapture.resolve({ descendants: [], captureComplete: true });
+    await Promise.resolve();
+    expect(closeSettled).toBe(false);
+    sidecarCapture.resolve({ descendants: [], captureComplete: true });
+    await close;
+
+    expect(treeSignals).toEqual([
+      { rootPid: defaultProcess.pid, signal: "SIGTERM", includeRootTree: false },
+      { rootPid: sidecarProcess.pid, signal: "SIGTERM", includeRootTree: false },
+    ]);
+    expect(defaultProcess.killSignals).toEqual([]);
+    expect(sidecarProcess.killSignals).toEqual([]);
+    expect(sessions.size).toBe(0);
     manager.dispose();
   });
 

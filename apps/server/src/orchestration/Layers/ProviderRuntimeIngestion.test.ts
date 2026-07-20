@@ -5072,7 +5072,7 @@ describe("ProviderRuntimeIngestion", () => {
     ).toBe(false);
   });
 
-  it("preserves a runtime with live background tasks when overflow decline fails", async () => {
+  it("retries overflow decline while preserving a runtime with live background tasks", async () => {
     const harness = await createHarness();
     harness.hasLiveRuntimeTasks.mockImplementation(() => Effect.succeed(true));
     for (let index = 0; index < 10; index++) {
@@ -5108,7 +5108,6 @@ describe("ProviderRuntimeIngestion", () => {
     };
     harness.emit(overflowEvent);
     await waitForCondition(() => harness.respondToRequest.mock.calls.length === 1);
-    harness.emit({ ...overflowEvent, eventId: asEventId("evt-overflow-live-task-retry") });
     harness.emit({
       type: "runtime.warning",
       eventId: asEventId("evt-overflow-live-task-fence"),
@@ -5126,7 +5125,17 @@ describe("ProviderRuntimeIngestion", () => {
     });
     expect(harness.stopRuntimeSession).not.toHaveBeenCalled();
     expect(harness.stopSession).not.toHaveBeenCalled();
-    expect(harness.respondToRequest).toHaveBeenCalledTimes(1);
+    expect(harness.respondToRequest).toHaveBeenCalledTimes(2);
+    expect(harness.respondToRequest.mock.calls.map(([request]) => request.requestId)).toEqual([
+      "req-overflow-live-task-11",
+      "req-overflow-live-task-11",
+    ]);
+    const readModel = await Effect.runPromise(harness.engine.getReadModel());
+    expect(
+      readModel.threads
+        .find((thread) => thread.id === asThreadId("thread-1"))
+        ?.activities.some((activity) => activity.id === "evt-overflow-live-task-11"),
+    ).toBe(false);
   });
 
   it("isolates unresolved request capacity per thread", async () => {

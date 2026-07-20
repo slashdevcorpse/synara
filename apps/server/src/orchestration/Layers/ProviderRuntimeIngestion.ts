@@ -1935,25 +1935,30 @@ const make = Effect.gen(function* () {
 
     const responseFailed = responseExit !== null;
     const runtimePreserved = stopExit.value === "preserved-live-tasks";
+    if (runtimePreserved) {
+      // Keep the durable admission in overflowPending and fail this journal
+      // attempt. The bounded replay poll will retry the exact decline instead
+      // of advancing the cursor and permanently suppressing a provider request
+      // that is still open. Live background tasks remain untouched while the
+      // request retains a deterministic settlement path.
+      return yield* Effect.fail(
+        new ProviderRequestOverflowSettlementError(
+          identity.threadId,
+          ApprovalRequestId.makeUnsafe(String(identity.requestId)),
+          identity.interactionKind,
+          responseExit === null
+            ? "Structured user input has no safe generic overflow response."
+            : Cause.pretty(responseExit.cause),
+          "Provider runtime has live tasks and was intentionally preserved for a retry.",
+        ),
+      );
+    }
     yield* requestAdmissions.markOverflowSettled({
       ...identity,
-      failed: responseFailed || runtimePreserved,
+      failed: responseFailed,
       updatedAt: event.createdAt,
     });
     yield* requestAdmissions.pruneSettled(identity.threadId);
-    if (runtimePreserved) {
-      yield* Effect.logWarning("provider.request.admission.overflow_failed_live_tasks_preserved", {
-        threadId: identity.threadId,
-        providerSessionThreadId: event.threadId,
-        provider: event.provider,
-        requestId: identity.requestId,
-        interactionKind: identity.interactionKind,
-        lifecycleGeneration: event.lifecycleGeneration ?? "legacy",
-        limit: PROVIDER_REQUEST_LIMIT_PER_THREAD,
-        ...(responseExit !== null ? { responseFailure: Cause.pretty(responseExit.cause) } : {}),
-      });
-      return;
-    }
     yield* Effect.logWarning(
       responseFailed
         ? "provider.request.admission.overflow_decline_failed_session_stopped"

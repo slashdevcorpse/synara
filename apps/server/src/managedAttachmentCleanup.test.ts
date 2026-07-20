@@ -8,9 +8,13 @@ import { afterEach, describe, expect, it } from "vitest";
 import { ServerConfig, type ServerConfigShape } from "./config";
 import {
   MANAGED_ATTACHMENT_WRITING_LEASE_MS,
+  ManagedAttachmentCleanup,
+  ManagedAttachmentCleanupLive,
   runManagedAttachmentCleanupBatch,
+  runManagedAttachmentStagingRecovery,
   sweepOrphanManagedAttachmentParts,
 } from "./managedAttachmentCleanup";
+import { withManagedAttachmentStagingPathLock } from "./managedAttachmentStore";
 import {
   ManagedAttachmentRepository,
   type ManagedAttachmentCleanupJob,
@@ -79,6 +83,52 @@ function makeRepository(job: ManagedAttachmentCleanupJob) {
 }
 
 describe("managed attachment cleanup", () => {
+  it("completes one bounded staging sweep before the cleanup service becomes available", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "synara-managed-startup-sweep-"));
+    temporaryRoots.push(root);
+    const stagingDir = path.join(root, ".staging");
+    const stalePart = path.join(stagingDir, "att_v2_99999999999999999999999999999999.part");
+    await fs.mkdir(stagingDir, { recursive: true });
+    await fs.writeFile(stalePart, "stale");
+    const staleDate = new Date(Date.now() - MANAGED_ATTACHMENT_WRITING_LEASE_MS - 1_000);
+    await fs.utimes(stalePart, staleDate, staleDate);
+    const repository = {
+      markExpiredForCleanup: () => Effect.succeed([]),
+      leaseCleanup: () => Effect.succeed([]),
+      compactDeleted: () => Effect.succeed([]),
+      listFailedCleanup: () => Effect.succeed([]),
+    } as unknown as ManagedAttachmentRepositoryShape;
+
+    const stalePartMissingAtAcquisition = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* ManagedAttachmentCleanup;
+          return yield* Effect.promise(async () => {
+            try {
+              await fs.stat(stalePart);
+              return false;
+            } catch (cause) {
+              return (cause as NodeJS.ErrnoException).code === "ENOENT";
+            }
+          });
+        }),
+      ).pipe(
+        Effect.provide(
+          ManagedAttachmentCleanupLive.pipe(
+            Layer.provide(
+              Layer.mergeAll(
+                Layer.succeed(ManagedAttachmentRepository, repository),
+                Layer.succeed(ServerConfig, { attachmentsDir: root } as ServerConfigShape),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+
+    expect(stalePartMissingAtAcquisition).toBe(true);
+  });
+
   it("sweeps stale orphan parts without a database row while preserving fresh and near-match files", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "synara-managed-staging-sweep-"));
     temporaryRoots.push(root);
@@ -154,6 +204,135 @@ describe("managed attachment cleanup", () => {
     expect(result).toMatchObject({ removed: 0, failures: 0 });
     await expect(fs.readFile(partPath, "utf8")).resolves.toBe("replacement");
     await expect(fs.readFile(originalPath, "utf8")).resolves.toBe("original");
+  });
+
+  it("preserves an exact-name part replaced after final validation but before quarantine", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "synara-managed-staging-final-race-"));
+    temporaryRoots.push(root);
+    const stagingDir = path.join(root, ".staging");
+    const partPath = path.join(stagingDir, "att_v2_66666666666666666666666666666666.part");
+    const originalPath = `${partPath}.original`;
+    await fs.mkdir(stagingDir, { recursive: true });
+    await fs.writeFile(partPath, "original");
+    const nowMs = Date.now();
+    const staleDate = new Date(nowMs - MANAGED_ATTACHMENT_WRITING_LEASE_MS - 1_000);
+    await fs.utimes(partPath, staleDate, staleDate);
+
+    const result = await sweepOrphanManagedAttachmentParts({
+      attachmentsDir: root,
+      nowMs,
+      beforeQuarantine: async (candidatePath) => {
+        await fs.rename(candidatePath, originalPath);
+        await fs.writeFile(candidatePath, "replacement");
+        await fs.utimes(candidatePath, staleDate, staleDate);
+      },
+    });
+
+    expect(result).toMatchObject({ removed: 0, failures: 0 });
+    await expect(fs.readFile(partPath, "utf8")).resolves.toBe("replacement");
+    await expect(fs.readFile(originalPath, "utf8")).resolves.toBe("original");
+  });
+
+  it("recovers a stale quarantine left by a crash after rename", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "synara-managed-staging-quarantine-"));
+    temporaryRoots.push(root);
+    const stagingDir = path.join(root, ".staging");
+    const partPath = path.join(stagingDir, "att_v2_77777777777777777777777777777777.part");
+    await fs.mkdir(stagingDir, { recursive: true });
+    await fs.writeFile(partPath, "orphan");
+    const nowMs = Date.now();
+    const staleDate = new Date(nowMs - MANAGED_ATTACHMENT_WRITING_LEASE_MS - 1_000);
+    await fs.utimes(partPath, staleDate, staleDate);
+
+    const interrupted = await sweepOrphanManagedAttachmentParts({
+      attachmentsDir: root,
+      nowMs,
+      afterQuarantine: async () => {
+        throw new Error("simulated process interruption");
+      },
+    });
+
+    expect(interrupted).toMatchObject({ removed: 0, failures: 1 });
+    await expect(fs.stat(partPath)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await fs.readdir(stagingDir)).toHaveLength(1);
+
+    const recovered = await sweepOrphanManagedAttachmentParts({ attachmentsDir: root, nowMs });
+
+    expect(recovered).toMatchObject({ removed: 1, failures: 0 });
+    expect(await fs.readdir(stagingDir)).toEqual([]);
+  });
+
+  it("advances a finite recovery snapshot past a fresh prefix and the per-pass cap", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "synara-managed-staging-progress-"));
+    temporaryRoots.push(root);
+    const stagingDir = path.join(root, ".staging");
+    await fs.mkdir(stagingDir, { recursive: true });
+    const nowMs = Date.now();
+    const staleDate = new Date(nowMs - MANAGED_ATTACHMENT_WRITING_LEASE_MS - 1_000);
+    const freshCount = 96;
+    const staleCount = 70;
+
+    for (let index = 0; index < freshCount + staleCount; index += 1) {
+      const attachmentId = `att_v2_${index.toString(16).padStart(32, "0")}`;
+      const partPath = path.join(stagingDir, `${attachmentId}.part`);
+      await fs.writeFile(partPath, index < freshCount ? "fresh" : "stale");
+      if (index >= freshCount) await fs.utimes(partPath, staleDate, staleDate);
+    }
+
+    const result = await Effect.runPromise(
+      runManagedAttachmentStagingRecovery({
+        attachmentsDir: root,
+        nowMs,
+        scanLimit: 32,
+        maxRemovals: 16,
+      }),
+    );
+
+    expect(result).toMatchObject({ inspected: freshCount + staleCount, removed: staleCount });
+    expect(result.passes).toBeGreaterThan(5);
+    expect(await fs.readdir(stagingDir)).toHaveLength(freshCount);
+  });
+
+  it("serializes stale-part quarantine with the managed upload writer lock", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "synara-managed-staging-lock-"));
+    temporaryRoots.push(root);
+    const stagingDir = path.join(root, ".staging");
+    const partPath = path.join(stagingDir, "att_v2_88888888888888888888888888888888.part");
+    await fs.mkdir(stagingDir, { recursive: true });
+    await fs.writeFile(partPath, "orphan");
+    const nowMs = Date.now();
+    const staleDate = new Date(nowMs - MANAGED_ATTACHMENT_WRITING_LEASE_MS - 1_000);
+    await fs.utimes(partPath, staleDate, staleDate);
+
+    let releaseLock!: () => void;
+    const lockReleased = new Promise<void>((resolve) => {
+      releaseLock = resolve;
+    });
+    let lockAcquired!: () => void;
+    const acquired = new Promise<void>((resolve) => {
+      lockAcquired = resolve;
+    });
+    const writer = withManagedAttachmentStagingPathLock(partPath, async () => {
+      lockAcquired();
+      await lockReleased;
+    });
+    await acquired;
+
+    let cleanupEntered = false;
+    const cleanup = sweepOrphanManagedAttachmentParts({
+      attachmentsDir: root,
+      nowMs,
+      beforeFinalStat: async () => {
+        cleanupEntered = true;
+      },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(cleanupEntered).toBe(false);
+    await expect(fs.readFile(partPath, "utf8")).resolves.toBe("orphan");
+
+    releaseLock();
+    await writer;
+    await expect(cleanup).resolves.toMatchObject({ removed: 1, failures: 0 });
   });
 
   it("removes both crash-left staging bytes and the final blob before completing the job", async () => {

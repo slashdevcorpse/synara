@@ -233,6 +233,15 @@ describe("createDesktopPlatformBuildConfig", () => {
   });
 
   it("blocks unsupported universal Windows native builds", () => {
+    assert.throws(
+      () =>
+        createDesktopPlatformBuildConfig({
+          platform: "win",
+          arch: "universal",
+          target: "nsis",
+        }),
+      /Windows desktop artifacts support x64 or arm64 builds, not universal builds\./,
+    );
     assert.equal(
       validateDesktopNativeBuildHost({
         platform: "win",
