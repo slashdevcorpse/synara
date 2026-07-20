@@ -7,6 +7,7 @@ import { readFileSync } from "node:fs";
 
 import {
   prepareSuperSynaraRelease,
+  type SuperSynaraReleaseScope,
   verifyPreparedSuperSynaraRelease,
 } from "./lib/super-synara-release-admission.ts";
 import {
@@ -14,11 +15,12 @@ import {
   validateMacSignatureAllowlist,
 } from "./lib/super-synara-macos-signatures.ts";
 
-function parseArgs(argv: ReadonlyArray<string>): {
+export function parseArgs(argv: ReadonlyArray<string>): {
   readonly mode: "prepare" | "verify";
   readonly directory: string;
   readonly licensePath?: string;
-  readonly macSignatureAllowlistPath: string;
+  readonly releaseScope: SuperSynaraReleaseScope;
+  readonly macSignatureAllowlistPath?: string;
   readonly version: string;
   readonly tag: string;
   readonly sourceCommit: string;
@@ -41,6 +43,7 @@ function parseArgs(argv: ReadonlyArray<string>): {
   const known = new Set([
     "--directory",
     "--license",
+    "--release-scope",
     "--mac-signature-allowlist",
     "--version",
     "--tag",
@@ -58,14 +61,32 @@ function parseArgs(argv: ReadonlyArray<string>): {
   };
   const maxTotalBytes = Number(required("--max-total-bytes"));
   const licensePath = values.get("--license");
+  const releaseScopeValue = required("--release-scope");
+  if (releaseScopeValue !== "windows-only" && releaseScopeValue !== "windows-and-macos") {
+    throw new Error(
+      `Release admission --release-scope must be windows-only or windows-and-macos, got ${releaseScopeValue}.`,
+    );
+  }
+  const releaseScope: SuperSynaraReleaseScope = releaseScopeValue;
+  const hasMacSignatureAllowlistArgument = values.has("--mac-signature-allowlist");
+  const macSignatureAllowlistPath = values.get("--mac-signature-allowlist");
   if (mode === "prepare" && !licensePath) {
     throw new Error("Prepare mode requires --license.");
+  }
+  if (releaseScope === "windows-and-macos" && !macSignatureAllowlistPath) {
+    throw new Error(
+      "Combined release admission requires --mac-signature-allowlist with a committed reviewed policy.",
+    );
+  }
+  if (releaseScope === "windows-only" && hasMacSignatureAllowlistArgument) {
+    throw new Error("Windows-only release admission does not accept --mac-signature-allowlist.");
   }
   return {
     mode,
     directory: required("--directory"),
     ...(licensePath ? { licensePath } : {}),
-    macSignatureAllowlistPath: required("--mac-signature-allowlist"),
+    releaseScope,
+    ...(macSignatureAllowlistPath ? { macSignatureAllowlistPath } : {}),
     version: required("--version"),
     tag: required("--tag"),
     sourceCommit: required("--source-commit"),
@@ -74,29 +95,36 @@ function parseArgs(argv: ReadonlyArray<string>): {
   };
 }
 
-const options = parseArgs(process.argv.slice(2));
-const macSignatureAllowlist = validateMacSignatureAllowlist(
-  JSON.parse(readFileSync(options.macSignatureAllowlistPath, "utf8")) as MacSignatureAllowlist,
-);
-const coordinates = {
-  version: options.version,
-  tag: options.tag,
-  sourceCommit: options.sourceCommit,
-  absorbedUpstreamSha: options.absorbedUpstreamSha,
-};
-const index =
-  options.mode === "prepare"
-    ? prepareSuperSynaraRelease({
-        directory: options.directory,
-        licensePath: options.licensePath!,
-        macSignatureAllowlist,
-        coordinates,
-        maxTotalBytes: options.maxTotalBytes,
-      })
-    : verifyPreparedSuperSynaraRelease({
-        directory: options.directory,
-        macSignatureAllowlist,
-        coordinates,
-        maxTotalBytes: options.maxTotalBytes,
-      });
-console.log(JSON.stringify(index, null, 2));
+export function main(argv: ReadonlyArray<string>): void {
+  const options = parseArgs(argv);
+  const macSignatureAllowlist = options.macSignatureAllowlistPath
+    ? validateMacSignatureAllowlist(
+        JSON.parse(
+          readFileSync(options.macSignatureAllowlistPath, "utf8"),
+        ) as MacSignatureAllowlist,
+      )
+    : undefined;
+  const coordinates = {
+    version: options.version,
+    tag: options.tag,
+    sourceCommit: options.sourceCommit,
+    absorbedUpstreamSha: options.absorbedUpstreamSha,
+  };
+  const releaseInput = {
+    directory: options.directory,
+    releaseScope: options.releaseScope,
+    ...(macSignatureAllowlist ? { macSignatureAllowlist } : {}),
+    coordinates,
+    maxTotalBytes: options.maxTotalBytes,
+  };
+  const index =
+    options.mode === "prepare"
+      ? prepareSuperSynaraRelease({
+          ...releaseInput,
+          licensePath: options.licensePath!,
+        })
+      : verifyPreparedSuperSynaraRelease(releaseInput);
+  console.log(JSON.stringify(index, null, 2));
+}
+
+if (import.meta.main) main(process.argv.slice(2));
