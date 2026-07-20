@@ -6,8 +6,8 @@ import {
   MAC_APPSNAP_HELPER_BUNDLE_PATH,
   MAC_APPSNAP_HELPER_STAGE_PATH,
   MAC_ENTITLEMENTS_PATH,
+  MAC_FOREIGN_NATIVE_EXCLUSIONS,
   MAC_INHERITED_ENTITLEMENTS_PATH,
-  MAC_NODE_PTY_WINDOWS_EXCLUSIONS,
   MICROPHONE_USAGE_DESCRIPTION,
   NODE_PTY_ASAR_UNPACK_GLOBS,
   validateDesktopNativeBuildHost,
@@ -43,12 +43,13 @@ describe("createDesktopPlatformBuildConfig", () => {
     assert.equal(MAC_APPSNAP_HELPER_ASAR_EXCLUSION, "!apps/desktop/native/appsnap/build/**");
     assert.deepStrictEqual(config.files, [
       "**/*",
-      ...MAC_NODE_PTY_WINDOWS_EXCLUSIONS,
+      ...MAC_FOREIGN_NATIVE_EXCLUSIONS,
       MAC_APPSNAP_HELPER_ASAR_EXCLUSION,
     ]);
     assert.deepStrictEqual(
-      [...MAC_NODE_PTY_WINDOWS_EXCLUSIONS],
+      [...MAC_FOREIGN_NATIVE_EXCLUSIONS],
       [
+        "!node_modules/@earendil-works/pi-tui/native/win32/**",
         "!node_modules/node-pty/prebuilds/win32-*/**",
         "!node_modules/node-pty/third_party/conpty/**",
         "!node_modules/node-pty/deps/winpty/**",
