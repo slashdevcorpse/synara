@@ -145,6 +145,13 @@ jobs:
           src/backendShutdown.test.ts
           src/backendShutdown.windows.integration.test.ts
 
+      - name: Run Windows desktop restart regressions
+        run: >-
+          bun run --cwd apps/desktop test
+          src/backendRestartController.test.ts
+          src/backendStartupReadiness.test.ts
+          src/rotatingFileSink.test.ts
+
       - name: Run Windows process regressions
         run: >-
           bun run --cwd packages/shared test
