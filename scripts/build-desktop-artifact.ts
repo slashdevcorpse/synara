@@ -716,6 +716,7 @@ const copyPreparedSuperStageDependencies = Effect.fn("copyPreparedSuperStageDepe
 const createBuildConfig = Effect.fn("createBuildConfig")(function* (
   platform: typeof BuildPlatform.Type,
   target: string,
+  arch: typeof BuildArch.Type,
   flavor: Exclude<SynaraDesktopFlavor, "development">,
   signed: boolean,
   disableUpdates: boolean,
@@ -748,6 +749,7 @@ const createBuildConfig = Effect.fn("createBuildConfig")(function* (
     : undefined;
 
   const platformBuildConfigInput = {
+    arch,
     platform,
     target,
     signed,
@@ -1022,6 +1024,7 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
   const resolvedBuildConfig = yield* createBuildConfig(
     options.platform,
     options.target,
+    options.arch,
     options.flavor,
     options.signed,
     options.disableUpdates,
