@@ -40,6 +40,12 @@ function resolveRuntimeDirectory(): string {
   return Path.dirname(fileURLToPath(import.meta.url));
 }
 
+function resolveLauncherCandidate(candidate: string): string {
+  return /^[A-Za-z]:[\\/]/u.test(candidate) || candidate.startsWith("\\\\")
+    ? Path.win32.normalize(candidate)
+    : Path.resolve(candidate);
+}
+
 export function resolveWindowsJobLauncherPath(input: WindowsProviderProcessInput = {}): string {
   const platform = input.platform ?? process.platform;
   if (platform !== "win32") {
@@ -74,7 +80,7 @@ export function resolveWindowsJobLauncherPath(input: WindowsProviderProcessInput
       ];
   const fileExists = input.fileExists ?? defaultFileExists;
   for (const candidate of candidates) {
-    const resolved = Path.resolve(candidate);
+    const resolved = resolveLauncherCandidate(candidate);
     if (fileExists(resolved)) {
       return resolved;
     }
@@ -83,7 +89,7 @@ export function resolveWindowsJobLauncherPath(input: WindowsProviderProcessInput
   throw new Error(
     [
       `Windows provider containment helper is required for win32-${arch} but was not found.`,
-      `Checked: ${candidates.map((candidate) => Path.resolve(candidate)).join(", ")}.`,
+      `Checked: ${candidates.map(resolveLauncherCandidate).join(", ")}.`,
       "Build it with: node apps/server/scripts/build-windows-job-launcher.mjs --arch " + arch,
       `Packaged desktop builds must set ${WINDOWS_JOB_LAUNCHER_ENV} to their signed extraFile.`,
       "Refusing to fall back to a post-spawn, racy process-tree capture.",

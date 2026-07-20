@@ -52,6 +52,7 @@ import {
 } from "./ProviderHealth";
 import { resolvePackageManagedProviderMaintenance } from "../providerMaintenance";
 import {
+  WINDOWS_JOB_LAUNCHER_ENV,
   WINDOWS_JOB_LAUNCHER_EXECUTABLE,
   WINDOWS_JOB_LAUNCHER_PROTOCOL_VERSION,
 } from "../windowsProviderProcess.ts";
@@ -1162,7 +1163,26 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
     it.effect("propagates verbatim Windows arguments through the Effect command", () => {
       const platform = vi.spyOn(process, "platform", "get").mockReturnValue("win32");
       return Effect.gen(function* () {
-        yield* withTempCodexHome();
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const { tmpDir } = yield* withTempCodexHome();
+        const launcherPath = path.join(tmpDir, WINDOWS_JOB_LAUNCHER_EXECUTABLE);
+        yield* fileSystem.writeFileString(launcherPath, "");
+        yield* Effect.acquireRelease(
+          Effect.sync(() => {
+            const previous = process.env[WINDOWS_JOB_LAUNCHER_ENV];
+            process.env[WINDOWS_JOB_LAUNCHER_ENV] = launcherPath;
+            return previous;
+          }),
+          (previous) =>
+            Effect.sync(() => {
+              if (previous === undefined) {
+                delete process.env[WINDOWS_JOB_LAUNCHER_ENV];
+              } else {
+                process.env[WINDOWS_JOB_LAUNCHER_ENV] = previous;
+              }
+            }),
+        );
         const status = yield* makeCheckCodexProviderStatus("C:\\tools(x86)\\codex.cmd");
         assert.strictEqual(status.status, "ready");
       }).pipe(
