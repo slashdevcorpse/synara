@@ -1,9 +1,11 @@
 import {
+  DEFAULT_PROVIDER_INTERACTION_MODE,
   ProjectId,
   ThreadId,
   type OrchestrationEvent,
   type OrchestrationShellSnapshot,
   type OrchestrationShellStreamEvent,
+  type OrchestrationThreadShell,
 } from "@synara/contracts";
 import { Deferred, Duration, Effect, Exit, Fiber, Option, PubSub, Queue, Stream } from "effect";
 import { describe, expect, it } from "vitest";
@@ -52,6 +54,32 @@ const removalFor = (source: OrchestrationEvent): Option.Option<OrchestrationShel
           threadId: ThreadId.makeUnsafe(String(source.aggregateId)),
         },
   );
+
+const projectionReady = () => Effect.void;
+
+const proposedPlanEvent = (
+  sequence: number,
+  threadId: ThreadId,
+  planId: string,
+): OrchestrationEvent =>
+  ({
+    sequence,
+    aggregateKind: "thread",
+    aggregateId: threadId,
+    type: "thread.proposed-plan-upserted",
+    payload: {
+      threadId,
+      proposedPlan: {
+        id: planId,
+        turnId: null,
+        planMarkdown: "# Ready plan",
+        implementedAt: null,
+        implementationThreadId: null,
+        createdAt: "2026-07-20T00:00:00.000Z",
+        updatedAt: "2026-07-20T00:00:00.000Z",
+      },
+    },
+  }) as OrchestrationEvent;
 
 describe("shell synchronization", () => {
   it("retries a failed projection read once and distinguishes absence from failure", async () => {
@@ -161,10 +189,13 @@ describe("shell synchronization", () => {
             }),
         );
 
-        return yield* coalesceShellStream(source, (sourceEvent) =>
-          sourceEvent.sequence === 2
-            ? Effect.fail(failure)
-            : Effect.succeed(removalFor(sourceEvent)),
+        return yield* coalesceShellStream(
+          source,
+          (sourceEvent) =>
+            sourceEvent.sequence === 2
+              ? Effect.fail(failure)
+              : Effect.succeed(removalFor(sourceEvent)),
+          projectionReady,
         ).pipe(
           Stream.tap((item) =>
             Effect.gen(function* () {
@@ -181,6 +212,106 @@ describe("shell synchronization", () => {
 
     expect(Exit.isFailure(exit)).toBe(true);
     expect(deliveredSequences).toEqual([1]);
+  });
+
+  it("suppresses stale rows until the coalesced projection fence recovers", async () => {
+    const threadId = ThreadId.makeUnsafe("thread-projection-fence");
+    const freshThread: OrchestrationThreadShell = {
+      id: threadId,
+      projectId: ProjectId.makeUnsafe("project-projection-fence"),
+      title: "Projection fence",
+      modelSelection: { provider: "codex", model: "gpt-5-codex" },
+      runtimeMode: "approval-required",
+      interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+      envMode: "local",
+      branch: null,
+      worktreePath: null,
+      associatedWorktreePath: null,
+      associatedWorktreeBranch: null,
+      associatedWorktreeRef: null,
+      createBranchFlowCompleted: false,
+      isPinned: false,
+      parentThreadId: null,
+      subagentAgentId: null,
+      subagentNickname: null,
+      subagentRole: null,
+      forkSourceThreadId: null,
+      sidechatSourceThreadId: null,
+      lastKnownPr: null,
+      latestTurn: null,
+      latestUserMessageAt: null,
+      hasPendingApprovals: false,
+      hasPendingUserInput: false,
+      hasActionableProposedPlan: true,
+      createdAt: "2026-07-20T00:00:00.000Z",
+      updatedAt: "2026-07-20T00:00:09.000Z",
+      archivedAt: null,
+      handoff: null,
+      session: null,
+    };
+    const staleThread: OrchestrationThreadShell = {
+      ...freshThread,
+      hasActionableProposedPlan: false,
+      updatedAt: "2026-07-20T00:00:08.000Z",
+    };
+    const sourceEvents = [
+      proposedPlanEvent(8, threadId, "plan-8"),
+      proposedPlanEvent(9, threadId, "plan-9"),
+    ];
+    const source = () =>
+      Stream.fromIterable(
+        sourceEvents.map((sourceEvent) => ({ kind: "event" as const, event: sourceEvent })),
+      );
+    let appliedSequence = 8;
+    let persistedThread = staleThread;
+    let projectionReads = 0;
+    const fenceReads: number[] = [];
+    const ensureProjectionReady = (throughSequenceInclusive: number) =>
+      Effect.suspend(() => {
+        fenceReads.push(throughSequenceInclusive);
+        return appliedSequence >= throughSequenceInclusive
+          ? Effect.void
+          : Effect.fail("projection-not-ready" as const);
+      });
+    const project = (sourceEvent: OrchestrationEvent) =>
+      projectShellEvent(sourceEvent, {
+        getProjectShellById: () => Effect.die("unexpected project projection read"),
+        getThreadShellById: () =>
+          Effect.sync(() => {
+            projectionReads += 1;
+            return Option.some(persistedThread);
+          }),
+      });
+    const deliveredWhileStale: OrchestrationShellStreamEvent[] = [];
+
+    const staleExit = await Effect.runPromise(
+      coalesceShellStream(source(), project, ensureProjectionReady).pipe(
+        Stream.tap((item) =>
+          Effect.sync(() => {
+            if (item.kind !== "snapshot") deliveredWhileStale.push(item);
+          }),
+        ),
+        Stream.runDrain,
+        Effect.exit,
+      ),
+    );
+
+    expect(Exit.isFailure(staleExit)).toBe(true);
+    expect(fenceReads).toEqual([9]);
+    expect(projectionReads).toBe(0);
+    expect(deliveredWhileStale).toEqual([]);
+
+    appliedSequence = 9;
+    persistedThread = freshThread;
+    const replayed = await Effect.runPromise(
+      coalesceShellStream(source(), project, ensureProjectionReady).pipe(Stream.runCollect),
+    );
+
+    expect(fenceReads).toEqual([9, 9]);
+    expect(projectionReads).toBe(1);
+    expect(Array.from(replayed)).toEqual([
+      { kind: "thread-upserted", sequence: 9, thread: freshThread },
+    ]);
   });
 
   it("coalesces each aggregate to its latest event and emits in sequence order", async () => {
@@ -224,11 +355,14 @@ describe("shell synchronization", () => {
     let projectionReads = 0;
 
     const items = await Effect.runPromise(
-      coalesceShellStream(source, (sourceEvent) =>
-        Effect.sync(() => {
-          projectionReads += 1;
-          return removalFor(sourceEvent);
-        }),
+      coalesceShellStream(
+        source,
+        (sourceEvent) =>
+          Effect.sync(() => {
+            projectionReads += 1;
+            return removalFor(sourceEvent);
+          }),
+        projectionReady,
       ).pipe(Stream.take(1), Stream.runCollect),
     );
 
@@ -268,11 +402,14 @@ describe("shell synchronization", () => {
             replay: () => Stream.fromIterable([second, third]),
           });
 
-          return yield* coalesceShellStream(synchronized, (sourceEvent) =>
-            Effect.sync(() => {
-              projectionReads += 1;
-              return removalFor(sourceEvent);
-            }),
+          return yield* coalesceShellStream(
+            synchronized,
+            (sourceEvent) =>
+              Effect.sync(() => {
+                projectionReads += 1;
+                return removalFor(sourceEvent);
+              }),
+            projectionReady,
           ).pipe(Stream.take(2), Stream.runCollect);
         }),
       ),
@@ -334,11 +471,14 @@ describe("shell synchronization", () => {
     let projectionReads = 0;
 
     const items = await Effect.runPromise(
-      coalesceShellStream(source, (sourceEvent) =>
-        Effect.sync(() => {
-          projectionReads += 1;
-          return removalFor(sourceEvent);
-        }),
+      coalesceShellStream(
+        source,
+        (sourceEvent) =>
+          Effect.sync(() => {
+            projectionReads += 1;
+            return removalFor(sourceEvent);
+          }),
+        projectionReady,
       ).pipe(Stream.runCollect),
     );
 

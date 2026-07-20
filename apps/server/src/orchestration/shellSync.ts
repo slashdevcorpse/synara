@@ -270,12 +270,13 @@ function groupShellSyncItems<E, R>(
   );
 }
 
-export function coalesceShellStream<E, E2>(
+export function coalesceShellStream<E, E2, E3>(
   stream: Stream.Stream<SnapshotLiveStreamItem<OrchestrationShellSnapshot>, E>,
   project: (
     event: OrchestrationEvent,
   ) => Effect.Effect<Option.Option<OrchestrationShellStreamEvent>, E2>,
-): Stream.Stream<OrchestrationShellStreamItem, E | E2> {
+  ensureProjectionReady: (throughSequenceInclusive: number) => Effect.Effect<void, E3>,
+): Stream.Stream<OrchestrationShellStreamItem, E | E2 | E3> {
   return groupShellSyncItems(stream).pipe(
     Stream.mapEffect((batch) =>
       Effect.gen(function* () {
@@ -283,6 +284,11 @@ export function coalesceShellStream<E, E2>(
         let pendingEvents: OrchestrationEvent[] = [];
         const flush = Effect.gen(function* () {
           if (pendingEvents.length === 0) return;
+          const throughSequenceInclusive = pendingEvents.reduce(
+            (maximum, event) => Math.max(maximum, event.sequence),
+            0,
+          );
+          yield* ensureProjectionReady(throughSequenceInclusive);
           const projected = yield* coalesceShellEventBatch(pendingEvents, project);
           output.push(...projected);
           pendingEvents = [];

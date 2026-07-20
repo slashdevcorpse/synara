@@ -229,6 +229,34 @@ function toWsRpcError(cause: unknown, fallbackMessage: string) {
       });
 }
 
+export function ensureShellProjectionReady<E>(
+  readSnapshotSequence: () => Effect.Effect<{ readonly snapshotSequence: number }, E>,
+  throughSequenceInclusive: number,
+): Effect.Effect<void, WsRpcError> {
+  return readSnapshotSequence().pipe(
+    Effect.mapError(
+      (cause) =>
+        new WsRpcError({
+          message: "Failed to read the shell projection readiness fence.",
+          cause,
+          code: "ORCHESTRATION_SHELL_PROJECTION_FENCE_READ_FAILED",
+          retryable: true,
+        }),
+    ),
+    Effect.flatMap(({ snapshotSequence }) =>
+      snapshotSequence >= throughSequenceInclusive
+        ? Effect.void
+        : Effect.fail(
+            new WsRpcError({
+              message: `Shell projections are still catching up (applied ${snapshotSequence}, required ${throughSequenceInclusive}); restarting from the last delivered sequence.`,
+              code: "ORCHESTRATION_SHELL_PROJECTION_NOT_READY",
+              retryable: true,
+            }),
+          ),
+    ),
+  );
+}
+
 const failLiveUiStreamForSnapshotResync = (report: LiveUiStreamDropReport) =>
   Effect.fail(
     new WsRpcError({
@@ -695,6 +723,11 @@ const makeWsRpcHandlersLayer = () =>
                         retryable: true,
                       }),
                   ),
+                ),
+              (throughSequenceInclusive) =>
+                ensureShellProjectionReady(
+                  () => projectionReadModelQuery.getSnapshotSequence(),
+                  throughSequenceInclusive,
                 ),
             ),
           ),
