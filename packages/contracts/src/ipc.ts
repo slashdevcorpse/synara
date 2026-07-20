@@ -199,6 +199,8 @@ export interface ContextMenuItem<T extends string = string> {
   /** Starts a new visual group before this actionable row. */
   separatorBefore?: boolean;
   destructive?: boolean;
+  /** Renders the row as unavailable and prevents pointer or keyboard activation. */
+  disabled?: boolean;
 }
 
 export type DesktopUpdateStatus =
