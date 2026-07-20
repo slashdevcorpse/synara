@@ -24,7 +24,9 @@ export function browserQuarantineTestNamePattern(mode: "stable" | "quarantine"):
     repositoryRoot: REPOSITORY_ROOT,
   });
   if (!result.registry || result.errors.length > 0) {
-    throw new Error(`Browser quarantine registry validation failed:\n- ${result.errors.join("\n- ")}`);
+    throw new Error(
+      `Browser quarantine registry validation failed:\n- ${result.errors.join("\n- ")}`,
+    );
   }
   return quarantineTestNamePattern(result.registry, platform, mode);
 }

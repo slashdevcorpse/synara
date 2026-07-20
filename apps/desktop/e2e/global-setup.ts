@@ -13,8 +13,8 @@ export default function globalSetup(): void {
     "apps/server/dist/index.mjs",
     "apps/web/dist/index.html",
   ];
-  const missing = requiredArtifacts.filter((relativePath) =>
-    !FS.existsSync(Path.join(REPO_ROOT, relativePath)),
+  const missing = requiredArtifacts.filter(
+    (relativePath) => !FS.existsSync(Path.join(REPO_ROOT, relativePath)),
   );
   if (missing.length === 0) return;
 

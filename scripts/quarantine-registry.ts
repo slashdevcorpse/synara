@@ -112,7 +112,10 @@ function loadBaselineRegistry(
   return { ref, registry: result.registry };
 }
 
-function runSuite(repositoryRoot: string, suite: QuarantineRegistry["entries"][number]["suite"]): void {
+function runSuite(
+  repositoryRoot: string,
+  suite: QuarantineRegistry["entries"][number]["suite"],
+): void {
   const commands = {
     "browser-geometry": ["run", "--cwd", "apps/web", "test:browser:geometry"],
   } as const;

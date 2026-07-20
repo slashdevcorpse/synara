@@ -151,10 +151,9 @@ describe("resolveCachedEditorIcon", () => {
       iconFileName: "Square44x44Logo.targetsize-256_altform-unplated.png",
       bytes,
     });
-    vi.spyOn(
-      editorAppDiscovery,
-      "resolveWindowsStorePackageInstallLocation",
-    ).mockReturnValue(installLocation);
+    vi.spyOn(editorAppDiscovery, "resolveWindowsStorePackageInstallLocation").mockReturnValue(
+      installLocation,
+    );
     fs.mkdirSync(
       path.join(
         localAppData,

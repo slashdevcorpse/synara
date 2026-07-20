@@ -5,7 +5,14 @@ import * as FS from "node:fs";
 import * as OS from "node:os";
 import * as Path from "node:path";
 import { createRequire } from "node:module";
-import { test as base, expect, _electron, type ElectronApplication, type Page, type TestInfo } from "@playwright/test";
+import {
+  test as base,
+  expect,
+  _electron,
+  type ElectronApplication,
+  type Page,
+  type TestInfo,
+} from "@playwright/test";
 import { closeElectronApplication } from "./support/processTree";
 
 const requireFromFixture = createRequire(__filename);
@@ -91,7 +98,10 @@ function isolatedOperationalBase(): string {
   const realHomeDir = Path.resolve(OS.homedir());
   const baseDir =
     process.platform === "win32"
-      ? Path.resolve(process.env.PUBLIC?.trim() || Path.join(Path.dirname(realHomeDir), "Public"), "Documents")
+      ? Path.resolve(
+          process.env.PUBLIC?.trim() || Path.join(Path.dirname(realHomeDir), "Public"),
+          "Documents",
+        )
       : Path.resolve(OS.tmpdir());
   if (isPathWithin(realHomeDir, baseDir)) {
     throw new Error(
@@ -170,7 +180,9 @@ function isolatedExecutablePath(fakeCodexDir: string, inheritedPath: string | un
     .filter(Boolean)
     .filter((directory) => {
       const normalized =
-        process.platform === "win32" ? Path.resolve(directory).toLowerCase() : Path.resolve(directory);
+        process.platform === "win32"
+          ? Path.resolve(directory).toLowerCase()
+          : Path.resolve(directory);
       if (seen.has(normalized)) return false;
       seen.add(normalized);
       return !codexNames.some((name) => FS.existsSync(Path.join(directory, name)));
@@ -194,25 +206,36 @@ function assertFakeCodexIsOnlyPathCandidate(
         .filter((candidate) => FS.existsSync(candidate)),
     );
   const normalizedFakePath =
-    process.platform === "win32" ? Path.resolve(fakeCodexPath).toLowerCase() : Path.resolve(fakeCodexPath);
+    process.platform === "win32"
+      ? Path.resolve(fakeCodexPath).toLowerCase()
+      : Path.resolve(fakeCodexPath);
   const unexpected = candidates.filter((candidate) => {
-    const normalized =
-      process.platform === "win32" ? candidate.toLowerCase() : candidate;
+    const normalized = process.platform === "win32" ? candidate.toLowerCase() : candidate;
     return normalized !== normalizedFakePath;
   });
-  if (!candidates.some((candidate) => {
-    const normalized = process.platform === "win32" ? candidate.toLowerCase() : candidate;
-    return normalized === normalizedFakePath;
-  })) {
-    throw new Error(`The fake Codex launcher is not resolvable from the isolated PATH: ${fakeCodexPath}`);
+  if (
+    !candidates.some((candidate) => {
+      const normalized = process.platform === "win32" ? candidate.toLowerCase() : candidate;
+      return normalized === normalizedFakePath;
+    })
+  ) {
+    throw new Error(
+      `The fake Codex launcher is not resolvable from the isolated PATH: ${fakeCodexPath}`,
+    );
   }
   if (unexpected.length > 0) {
-    throw new Error(`The isolated PATH exposes non-fixture Codex candidates: ${unexpected.join(", ")}`);
+    throw new Error(
+      `The isolated PATH exposes non-fixture Codex candidates: ${unexpected.join(", ")}`,
+    );
   }
   return candidates;
 }
 
-async function seedServerSettings(homeDir: string, fakeCodexPath: string, runtimeDir: string): Promise<void> {
+async function seedServerSettings(
+  homeDir: string,
+  fakeCodexPath: string,
+  runtimeDir: string,
+): Promise<void> {
   const settingsDir = Path.join(homeDir, "userdata");
   await FS.promises.mkdir(settingsDir, { recursive: true });
   await FS.promises.writeFile(
@@ -369,9 +392,7 @@ export class DesktopHarness {
   static async create(testInfo: TestInfo): Promise<DesktopHarness> {
     const operationalBase = isolatedOperationalBase();
     await FS.promises.mkdir(operationalBase, { recursive: true });
-    const operationalDir = await FS.promises.mkdtemp(
-      Path.join(operationalBase, "synara-e2e-"),
-    );
+    const operationalDir = await FS.promises.mkdtemp(Path.join(operationalBase, "synara-e2e-"));
     const harness = new DesktopHarness(testInfo, operationalBase, operationalDir);
     try {
       await FS.promises.mkdir(harness.runtimeDir, { recursive: true });
@@ -475,9 +496,7 @@ export class DesktopHarness {
             );
             return {
               desktopMain: events.some(
-                (entry) =>
-                  entry.event === "guard-installed" &&
-                  entry.role === "desktop-main",
+                (entry) => entry.event === "guard-installed" && entry.role === "desktop-main",
               ),
               backend: events.some(
                 (entry) => entry.event === "guard-installed" && entry.role === "backend",
@@ -495,8 +514,7 @@ export class DesktopHarness {
               )?.result,
               browserProxy: events.find(
                 (entry) =>
-                  entry.event === "proxy-resolved" &&
-                  entry.partition === BROWSER_SESSION_PARTITION,
+                  entry.event === "proxy-resolved" && entry.partition === BROWSER_SESSION_PARTITION,
               )?.result,
             };
           },
@@ -663,7 +681,11 @@ export class DesktopHarness {
         path: this.invocationLogPath,
         contentType: "application/x-ndjson",
       },
-      { name: "codex-protocol-log", path: this.protocolLogPath, contentType: "application/x-ndjson" },
+      {
+        name: "codex-protocol-log",
+        path: this.protocolLogPath,
+        contentType: "application/x-ndjson",
+      },
       { name: "network-log", path: this.networkLogPath, contentType: "application/x-ndjson" },
       {
         name: "server-log",
@@ -697,7 +719,9 @@ export class DesktopHarness {
       );
       const missingLayers = ["node", "chromium"].filter((layer) => !installedLayers.has(layer));
       if (missingLayers.length > 0) {
-        errors.push(new Error(`Desktop network guard did not install for: ${missingLayers.join(", ")}.`));
+        errors.push(
+          new Error(`Desktop network guard did not install for: ${missingLayers.join(", ")}.`),
+        );
       }
       const installedNodeRoles = new Set(
         networkEvents.flatMap((entry) =>
@@ -713,7 +737,9 @@ export class DesktopHarness {
       );
       if (missingNodeRoles.length > 0) {
         errors.push(
-          new Error(`Desktop Node network guard did not install for: ${missingNodeRoles.join(", ")}.`),
+          new Error(
+            `Desktop Node network guard did not install for: ${missingNodeRoles.join(", ")}.`,
+          ),
         );
       }
       const installedChromiumPartitions = new Set(

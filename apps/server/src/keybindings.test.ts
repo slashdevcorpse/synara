@@ -864,9 +864,9 @@ it.layer(NodeServices.layer)("keybindings", (it) => {
             })
             .pipe(toDetailResult),
         () =>
-          fs.remove(configDirectory).pipe(
-            Effect.andThen(fs.rename(backupDirectory, configDirectory)),
-          ),
+          fs
+            .remove(configDirectory)
+            .pipe(Effect.andThen(fs.rename(backupDirectory, configDirectory))),
       );
       assertFailure(result, "failed to write keybindings config");
 

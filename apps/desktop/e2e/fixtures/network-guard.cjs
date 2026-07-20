@@ -101,7 +101,9 @@ if (!globalThis[INSTALL_KEY]) {
     const host = normalizeHost(destination.host);
     recordNetworkEvent({ event: "blocked", host, port: destination.port });
     const error = Object.assign(
-      new Error(`Desktop E2E blocked a non-loopback TCP connection to ${host}:${destination.port ?? "?"}.`),
+      new Error(
+        `Desktop E2E blocked a non-loopback TCP connection to ${host}:${destination.port ?? "?"}.`,
+      ),
       { code: "EACCES", host, port: destination.port },
     );
     process.nextTick(() => this.destroy(error));

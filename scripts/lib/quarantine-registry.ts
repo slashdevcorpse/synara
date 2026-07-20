@@ -87,10 +87,12 @@ function sourceFiles(directory: string): readonly string[] {
   const files: string[] = [];
   for (const entry of readdirSync(directory, { withFileTypes: true })) {
     if (entry.isDirectory()) {
-      if (!IGNORED_DIRECTORIES.has(entry.name)) files.push(...sourceFiles(resolve(directory, entry.name)));
+      if (!IGNORED_DIRECTORIES.has(entry.name))
+        files.push(...sourceFiles(resolve(directory, entry.name)));
       continue;
     }
-    if (entry.isFile() && TEST_SOURCE_PATTERN.test(entry.name)) files.push(resolve(directory, entry.name));
+    if (entry.isFile() && TEST_SOURCE_PATTERN.test(entry.name))
+      files.push(resolve(directory, entry.name));
   }
   return files;
 }
@@ -264,7 +266,9 @@ export function validateQuarantineRegistry(
           const entry = registeredMarkers.get(marker);
           if (!entry) errors.push(`Unregistered quarantine marker ${marker} found in ${path}.`);
           else if (entry.path !== path) {
-            errors.push(`Quarantine marker ${marker} is registered for ${entry.path}, not ${path}.`);
+            errors.push(
+              `Quarantine marker ${marker} is registered for ${entry.path}, not ${path}.`,
+            );
           }
         }
       }
@@ -348,7 +352,9 @@ export function formatQuarantineSummary(
   ];
   if (options.baseline) {
     const baselineEntries = options.platform
-      ? options.baseline.registry.entries.filter((entry) => entry.platform.includes(options.platform!))
+      ? options.baseline.registry.entries.filter((entry) =>
+          entry.platform.includes(options.platform!),
+        )
       : options.baseline.registry.entries;
     const baselineCases = baselineEntries.reduce((total, entry) => total + entry.cases, 0);
     const signed = (value: number): string => (value > 0 ? `+${value}` : String(value));

@@ -64,7 +64,8 @@ function latestRequestParam(
   param: string,
 ): unknown {
   const matching = entries.filter((entry) => {
-    if (entry.direction !== "in" || !entry.payload || typeof entry.payload !== "object") return false;
+    if (entry.direction !== "in" || !entry.payload || typeof entry.payload !== "object")
+      return false;
     return (entry.payload as { method?: unknown }).method === method;
   });
   const payload = matching.at(-1)?.payload;
@@ -231,7 +232,7 @@ test("runs a real terminal and renders echoed output", async ({ desktop }) => {
     .last();
   await expect(terminalInput).toBeVisible({ timeout: 30_000 });
   await terminalInput.focus();
-  await desktop.page.keyboard.type('node -e "console.log(\'E2E_TERMINAL_\'+(6*7))"');
+  await desktop.page.keyboard.type("node -e \"console.log('E2E_TERMINAL_'+(6*7))\"");
   await desktop.page.keyboard.press("Enter");
   await desktop.page.keyboard.press("Control+f");
   const findInput = desktop.page.getByRole("textbox", { name: "Find", exact: true });
@@ -263,10 +264,9 @@ test("opens a workspace file in source and rendered preview modes", async ({ des
 
   const markdownView = desktop.page.getByRole("radiogroup", { name: "Markdown view" });
   await expect(markdownView.getByRole("radio", { name: "Source" })).toBeChecked();
-  await expect(desktop.page.locator(".editor-file-viewer")).toContainText(
-    "# E2E Preview Heading",
-    { timeout: 30_000 },
-  );
+  await expect(desktop.page.locator(".editor-file-viewer")).toContainText("# E2E Preview Heading", {
+    timeout: 30_000,
+  });
   await markdownView.getByRole("radio", { name: "Preview" }).click();
   await expect(markdownView.getByRole("radio", { name: "Preview" })).toBeChecked();
   await expect(
@@ -286,7 +286,9 @@ test("loads a localhost page in the real desktop browser pane", async ({ desktop
     await expect(addressInput).toBeVisible({ timeout: 30_000 });
     await addressInput.fill(localPage.origin);
     await addressInput.press("Enter");
-    await expect(addressInput).toHaveValue(new RegExp(`^${localPage.origin.replaceAll(".", "\\.")}`));
+    await expect(addressInput).toHaveValue(
+      new RegExp(`^${localPage.origin.replaceAll(".", "\\.")}`),
+    );
     await expect
       .poll(
         async () =>
@@ -295,7 +297,10 @@ test("loads a localhost page in the real desktop browser pane", async ({ desktop
               .getAllWebContents()
               .find((contents) => contents.getURL().startsWith(expectedOrigin));
             if (!browserContents) return null;
-            return browserContents.executeJavaScript("document.body.innerText", true) as Promise<string>;
+            return browserContents.executeJavaScript(
+              "document.body.innerText",
+              true,
+            ) as Promise<string>;
           }, localPage.origin),
         { timeout: 30_000 },
       )
@@ -314,9 +319,11 @@ test("persists conversation state and resumes the provider after desktop restart
 
   const restartProtocolBaseline = (await desktop.readProtocolLog()).length;
   await desktop.restart();
-  await expect(desktop.page.getByText("E2E_PERSISTENCE_SETUP", { exact: true }).last()).toBeVisible({
-    timeout: 30_000,
-  });
+  await expect(desktop.page.getByText("E2E_PERSISTENCE_SETUP", { exact: true }).last()).toBeVisible(
+    {
+      timeout: 30_000,
+    },
+  );
   await expectAssistantText(desktop.page, "E2E_ASSISTANT_REPLY");
   await sendPrompt(desktop.page, "E2E_AFTER_RECOVERY");
   await expectAssistantText(desktop.page, "E2E_RECOVERY_REPLY");

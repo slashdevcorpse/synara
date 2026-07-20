@@ -57,9 +57,7 @@ describe("quarantine registry", () => {
 
     expect(result.errors).toEqual([]);
     expect(result.registry?.entries).toHaveLength(1);
-    expect(quarantineSuitesForPlatform(result.registry!, "windows")).toEqual([
-      "browser-geometry",
-    ]);
+    expect(quarantineSuitesForPlatform(result.registry!, "windows")).toEqual(["browser-geometry"]);
     expect(QUARANTINE_PLATFORMS).toEqual(["linux", "windows"]);
   });
 
@@ -71,8 +69,7 @@ describe("quarantine registry", () => {
       .replace("2026-07-01", "2026-07-21");
 
     expect(
-      validateQuarantineRegistry(invalid, { repositoryRoot: root, today: "2026-07-20" })
-        .errors,
+      validateQuarantineRegistry(invalid, { repositoryRoot: root, today: "2026-07-20" }).errors,
     ).toEqual(
       expect.arrayContaining([
         "Quarantine entry 1 marker must exactly match its id.",
@@ -109,11 +106,7 @@ describe("quarantine registry", () => {
     const linuxStable = quarantineTestNamePattern(result.registry!, "linux", "stable");
     const linuxQuarantine = quarantineTestNamePattern(result.registry!, "linux", "quarantine");
     const windowsStable = quarantineTestNamePattern(result.registry!, "windows", "stable");
-    const windowsQuarantine = quarantineTestNamePattern(
-      result.registry!,
-      "windows",
-      "quarantine",
-    );
+    const windowsQuarantine = quarantineTestNamePattern(result.registry!, "windows", "quarantine");
     expect(linuxStable.test(`suite ${quarantineMarker("web-geometry")}`)).toBe(false);
     expect(linuxStable.test(`suite ${quarantineMarker("web-windows-only")}`)).toBe(true);
     expect(linuxQuarantine.test(`suite ${quarantineMarker("web-geometry")}`)).toBe(true);

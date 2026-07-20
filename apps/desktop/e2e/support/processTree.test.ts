@@ -56,10 +56,7 @@ describe("classifyProcessIdentity", () => {
 
   it("fails closed when command identity evidence changes", () => {
     expect(
-      classifyProcessIdentity(
-        expectedProcess,
-        processRow({ commandFingerprint: "command-b" }),
-      ),
+      classifyProcessIdentity(expectedProcess, processRow({ commandFingerprint: "command-b" })),
     ).toBe("unknown");
   });
 });
@@ -111,25 +108,16 @@ describe("classifyProcessAncestry", () => {
 
   it("compares Linux start ticks within the same boot", () => {
     expect(
-      classifyProcessAncestry(
-        { identity: "linux:boot-a:100" },
-        { identity: "linux:boot-a:101" },
-      ),
+      classifyProcessAncestry({ identity: "linux:boot-a:100" }, { identity: "linux:boot-a:101" }),
     ).toBe("valid");
     expect(
-      classifyProcessAncestry(
-        { identity: "linux:boot-a:101" },
-        { identity: "linux:boot-a:100" },
-      ),
+      classifyProcessAncestry({ identity: "linux:boot-a:101" }, { identity: "linux:boot-a:100" }),
     ).toBe("stale");
   });
 
   it("fails closed when ancestry identity evidence is incompatible", () => {
     expect(
-      classifyProcessAncestry(
-        { identity: "linux:boot-a:100" },
-        { identity: "linux:boot-b:101" },
-      ),
+      classifyProcessAncestry({ identity: "linux:boot-a:100" }, { identity: "linux:boot-b:101" }),
     ).toBe("unknown");
     expect(classifyProcessAncestry({ identity: null }, { identity: "linux:boot-a:101" })).toBe(
       "unknown",

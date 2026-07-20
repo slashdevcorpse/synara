@@ -188,7 +188,9 @@ function finishApproval(requestId: string, result: unknown): void {
   if (!pending) return;
   pendingApprovals.delete(requestId);
   const decision =
-    result && typeof result === "object" && typeof (result as { decision?: unknown }).decision === "string"
+    result &&
+    typeof result === "object" &&
+    typeof (result as { decision?: unknown }).decision === "string"
       ? (result as { decision: string }).decision
       : "unknown";
   const startedAt = Date.now();
@@ -201,9 +203,7 @@ function finishApproval(requestId: string, result: unknown): void {
           windowsHide: true,
         })
       : null;
-  const output = execution
-    ? `${execution.stdout ?? ""}${execution.stderr ?? ""}`
-    : "";
+  const output = execution ? `${execution.stdout ?? ""}${execution.stderr ?? ""}` : "";
   if (output.length > 0) {
     notify("item/commandExecution/outputDelta", {
       threadId: pending.threadId,
@@ -221,8 +221,7 @@ function finishApproval(requestId: string, result: unknown): void {
       id: pending.itemId,
       command: pending.command,
       cwd: pending.cwd,
-      status:
-        decision === "decline" ? "declined" : commandSucceeded ? "completed" : "failed",
+      status: decision === "decline" ? "declined" : commandSucceeded ? "completed" : "failed",
       aggregatedOutput: output,
       exitCode: execution?.status ?? null,
       durationMs: Date.now() - startedAt,
@@ -310,20 +309,23 @@ function handleRequest(message: JsonRecord): void {
   }
   if (method === "thread/resume") {
     const params = message.params as { threadId?: unknown; cwd?: unknown } | undefined;
-    const threadId = typeof params?.threadId === "string" ? params.threadId : `e2e_thread_${process.pid}`;
+    const threadId =
+      typeof params?.threadId === "string" ? params.threadId : `e2e_thread_${process.pid}`;
     if (typeof params?.cwd === "string") threadCwds.set(threadId, params.cwd);
     respond(id, { thread: { id: threadId } });
     return;
   }
   if (method === "thread/read") {
     const params = message.params as { threadId?: unknown } | undefined;
-    const threadId = typeof params?.threadId === "string" ? params.threadId : `e2e_thread_${process.pid}`;
+    const threadId =
+      typeof params?.threadId === "string" ? params.threadId : `e2e_thread_${process.pid}`;
     respond(id, { thread: { id: threadId, turns: [] } });
     return;
   }
   if (method === "turn/start") {
     const params = message.params as { threadId?: unknown } | undefined;
-    const threadId = typeof params?.threadId === "string" ? params.threadId : `e2e_thread_${process.pid}`;
+    const threadId =
+      typeof params?.threadId === "string" ? params.threadId : `e2e_thread_${process.pid}`;
     const turnId = `e2e_turn_${process.pid}_${nextTurn++}`;
     const prompt = promptFromTurnStart(message.params);
     respond(id, { turn: { id: turnId } });
@@ -339,9 +341,7 @@ function handleRequest(message: JsonRecord): void {
       sendAssistantTurn({
         threadId,
         turnId,
-        text: prompt.includes("E2E_AFTER_RECOVERY")
-          ? "E2E_RECOVERY_REPLY"
-          : "E2E_ASSISTANT_REPLY",
+        text: prompt.includes("E2E_AFTER_RECOVERY") ? "E2E_RECOVERY_REPLY" : "E2E_ASSISTANT_REPLY",
       });
     }, 25);
     return;
@@ -366,7 +366,10 @@ function handleRequest(message: JsonRecord): void {
 
 function startAppServer(): void {
   appendProtocolLog("fixture", { event: "process-started", args });
-  const reader = Readline.createInterface({ input: process.stdin, crlfDelay: Number.POSITIVE_INFINITY });
+  const reader = Readline.createInterface({
+    input: process.stdin,
+    crlfDelay: Number.POSITIVE_INFINITY,
+  });
   reader.on("line", (line) => {
     const trimmed = line.trim();
     if (!trimmed) return;

@@ -17,10 +17,7 @@ describe("TerminalSearch", () => {
   });
 
   it("tracks authoritative result updates after a debounced miss", async () => {
-    type SearchResultsListener = (results: {
-      resultIndex: number;
-      resultCount: number;
-    }) => void;
+    type SearchResultsListener = (results: { resultIndex: number; resultCount: number }) => void;
     let resultListener: SearchResultsListener = () => {
       throw new Error("Terminal search result listener was not registered.");
     };

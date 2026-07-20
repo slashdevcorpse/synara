@@ -108,7 +108,9 @@ function observeCleanProcessExit(child: ChildProcess): {
 
 function trackedProcessFromRow(row: ProcessSnapshotRow, context: string): TrackedProcess {
   if (!row.identity || !row.commandFingerprint) {
-    throw new Error(`Desktop process snapshot lacked creation identity for ${context} pid ${row.pid}.`);
+    throw new Error(
+      `Desktop process snapshot lacked creation identity for ${context} pid ${row.pid}.`,
+    );
   }
   return {
     pid: row.pid,
@@ -157,9 +159,7 @@ async function forceTerminateChildHandle(child: ChildProcess): Promise<void> {
       if ((error as NodeJS.ErrnoException).code === "ESRCH" || childHasExited(child)) {
         settle();
       } else {
-        settle(
-          new Error(`Failed to terminate the Electron child handle: ${errorMessage(error)}.`),
-        );
+        settle(new Error(`Failed to terminate the Electron child handle: ${errorMessage(error)}.`));
       }
     }
   });
@@ -271,7 +271,10 @@ export function parseLinuxProcessStat(
   const command = stat.slice(openingParenthesis + 1, closingParenthesis);
   const fields =
     openingParenthesis > 0 && closingParenthesis > openingParenthesis
-      ? stat.slice(closingParenthesis + 1).trim().split(/\s+/u)
+      ? stat
+          .slice(closingParenthesis + 1)
+          .trim()
+          .split(/\s+/u)
       : [];
   const parentPid = Number(fields[1]);
   const startTicks = fields[19];
@@ -518,8 +521,7 @@ function readMatchingTrackedProcesses(
   dependencies: ProcessTreeDependencies,
 ): TrackedProcess[] {
   try {
-    const requestedPids =
-      trackedProcesses.length === 1 ? [trackedProcesses[0]!.pid] : undefined;
+    const requestedPids = trackedProcesses.length === 1 ? [trackedProcesses[0]!.pid] : undefined;
     return matchingTrackedProcesses(
       trackedProcesses,
       dependencies.readProcessSnapshot(requestedPids),
@@ -616,11 +618,9 @@ async function terminateTrackedProcesses(
   } catch (error) {
     errors.push(error);
   }
-  const allTrackedProcesses = mergeTrackedProcesses(
-    initiallyTrackedDescendants,
-    lateDescendants,
-    [rootProcess],
-  );
+  const allTrackedProcesses = mergeTrackedProcesses(initiallyTrackedDescendants, lateDescendants, [
+    rootProcess,
+  ]);
   if (dependencies.platform === "win32") {
     signalTrackedProcesses(
       allTrackedProcesses,

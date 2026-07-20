@@ -25,23 +25,21 @@ it.layer(NodeServices.layer)("ensureNodePtySpawnHelperExecutable", (it) => {
       }),
   );
 
-  it.effect.skipIf(process.platform === "win32")(
-    "keeps executable helper as executable",
-    () =>
-      Effect.gen(function* () {
-        const fs = yield* FileSystem.FileSystem;
-        const path = yield* Path.Path;
+  it.effect.skipIf(process.platform === "win32")("keeps executable helper as executable", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
 
-        const dir = yield* fs.makeTempDirectoryScoped({ prefix: "pty-helper-test-" });
-        const helperPath = path.join(dir, "spawn-helper");
-        yield* fs.writeFileString(helperPath, "#!/bin/sh\nexit 0\n");
-        yield* fs.chmod(helperPath, 0o755);
+      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "pty-helper-test-" });
+      const helperPath = path.join(dir, "spawn-helper");
+      yield* fs.writeFileString(helperPath, "#!/bin/sh\nexit 0\n");
+      yield* fs.chmod(helperPath, 0o755);
 
-        yield* ensureNodePtySpawnHelperExecutable(helperPath);
+      yield* ensureNodePtySpawnHelperExecutable(helperPath);
 
-        const mode = (yield* fs.stat(helperPath)).mode & 0o777;
-        assert.equal(mode & 0o111, 0o111);
-      }),
+      const mode = (yield* fs.stat(helperPath)).mode & 0o777;
+      assert.equal(mode & 0o111, 0o111);
+    }),
   );
 
   it.effect("defers node-pty native loading until a terminal is spawned", () => {
