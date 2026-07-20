@@ -442,7 +442,7 @@ describe("desktop backend restart integration", () => {
     expect(desktopMainSource.match(/beginAutomaticBackendStart\(/g)).toHaveLength(6);
   });
 
-  it("settles a timed-out generation through bounded shutdown before recording failure", () => {
+  it("settles a failed-readiness generation through bounded shutdown before recording failure", () => {
     const readinessFailure = sourceBetween(
       desktopMainSource,
       "async function settleBackendGenerationAfterReadinessFailure(",
@@ -453,6 +453,77 @@ describe("desktop backend restart integration", () => {
     );
     expect(readinessFailure).toContain("preserveRestartGeneration: generation");
     expect(readinessFailure).toContain("shutdownHttpUrl: baseUrl");
+  });
+
+  it("keeps an unconfirmed backend owned and suppresses its replacement", () => {
+    const readinessFailure = sourceBetween(
+      desktopMainSource,
+      "async function settleBackendGenerationAfterReadinessFailure(",
+      "function stopBackend(",
+    );
+    expect(readinessFailure).toContain(
+      "shutdownFailure && isCurrentBackendGeneration(generation, child)",
+    );
+    expect(readinessFailure).toContain("automatic restart suppressed");
+    expect(readinessFailure.indexOf("automatic restart suppressed")).toBeLessThan(
+      readinessFailure.indexOf("recordBackendGenerationFailure("),
+    );
+
+    const generationFailure = sourceBetween(
+      desktopMainSource,
+      "const failGeneration = (",
+      'writeBackendSessionBoundary(\n    "START"',
+    );
+    expect(generationFailure).toContain(
+      "exitProven || child.exitCode !== null || child.signalCode !== null || child.pid === undefined",
+    );
+    expect(generationFailure.indexOf("if (!ownershipReleaseProven)")).toBeLessThan(
+      generationFailure.indexOf("backendProcess = null"),
+    );
+    const generationExit = sourceBetween(
+      desktopMainSource,
+      'child.on("exit", (code, signal) => {',
+      "monitorBackendGenerationReadiness(generation, child, generationBaseUrl)",
+    );
+    expect(generationExit).toContain(
+      'failGeneration(`code=${code ?? "null"} signal=${signal ?? "null"}`, true)',
+    );
+
+    const boundedShutdown = sourceBetween(
+      desktopMainSource,
+      "async function stopBackendAndWaitForExit(",
+      "async function disposeBrowserUsePipeServerForShutdown(",
+    );
+    expect(boundedShutdown).toContain('shutdownResult.type === "timed-out"');
+    expect(boundedShutdown).toContain('return "timed-out"');
+    const windowsShutdown = sourceBetween(
+      boundedShutdown,
+      'if (process.platform === "win32")',
+      'const shutdownResult = await new Promise<"exited" | "timed-out">',
+    );
+    expect(windowsShutdown.indexOf('shutdownResult.type === "timed-out"')).toBeLessThan(
+      windowsShutdown.indexOf("releaseExitedBackendOwnership()"),
+    );
+    expect(windowsShutdown.indexOf("backendChildHasExited()")).toBeLessThan(
+      windowsShutdown.indexOf('return "timed-out"'),
+    );
+    const posixTimeout = sourceBetween(
+      boundedShutdown,
+      'if (shutdownResult === "timed-out")',
+      'return "timed-out"',
+    );
+    expect(posixTimeout).toContain("backendChildHasExited()");
+    expect(posixTimeout).toContain("releaseExitedBackendOwnership()");
+
+    const updateInstall = sourceBetween(
+      desktopMainSource,
+      "async function installDownloadedUpdate(",
+      "async function recordDownloadedUpdateIdentity(",
+    );
+    expect(updateInstall).toContain('backendStopResult === "timed-out"');
+    expect(updateInstall.indexOf('backendStopResult === "timed-out"')).toBeLessThan(
+      updateInstall.indexOf('logMacUpdateDiagnostics("before install handoff")'),
+    );
   });
 
   it("cancels restart timers and readiness monitors before bounded quit shutdown", () => {
@@ -466,6 +537,12 @@ describe("desktop backend restart integration", () => {
     );
     expect(shutdown.indexOf("cancelBackendGenerationReadinessWait()")).toBeLessThan(
       shutdown.indexOf("await stopBackendAndWaitForExit()"),
+    );
+    expect(shutdown.indexOf('backendStopResult === "timed-out"')).toBeLessThan(
+      shutdown.indexOf("browserManager.dispose()"),
+    );
+    expect(shutdown.indexOf("browserManager.dispose()")).toBeLessThan(
+      shutdown.indexOf("restoreStdIoCapture?.()"),
     );
   });
 });
