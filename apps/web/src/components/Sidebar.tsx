@@ -115,7 +115,11 @@ import {
   createSidebarThreadSummariesSelector,
   createSidebarTreeThreadsSelector,
 } from "../storeSelectors";
-import { derivePendingApprovals, derivePendingUserInputs } from "../session-logic";
+import {
+  derivePendingApprovals,
+  derivePendingUserInputs,
+  isThreadRunningTurn,
+} from "../session-logic";
 import { gitResolvePullRequestQueryOptions, gitStatusQueryOptions } from "../lib/gitReactQuery";
 import {
   providerComposerCapabilitiesQueryOptions,
