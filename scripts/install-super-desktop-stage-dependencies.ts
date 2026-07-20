@@ -68,7 +68,7 @@ function main(): void {
 
   const installArgs = resolveDesktopStageInstallArgs("super");
   console.log(
-    `[desktop-stage] Installing Super Synara production dependencies with frozen=false filtered=false.`,
+    `[desktop-stage] Installing Super Synara production dependencies with frozen=false filtered=true.`,
   );
   const result = spawnSync("bun", [...installArgs], {
     cwd: options.stageAppDir,

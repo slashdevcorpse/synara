@@ -225,10 +225,13 @@ export function collectMacSignatureCandidatePaths(root: string): ReadonlyArray<s
 
 export function classifyMacSignatureCandidateFileDescription(
   description: string,
+  candidatePath?: string,
 ): "mach-o" | "script" {
   if (/\bMach-O\b/i.test(description)) return "mach-o";
   if (/\bscript\b|\btext executable\b/i.test(description)) return "script";
-  throw new Error(`Executable candidate has unsupported native file type: ${description}.`);
+  throw new Error(
+    `Executable candidate${candidatePath ? ` ${candidatePath}` : ""} has unsupported native file type: ${description}.`,
+  );
 }
 
 function assertDiskImageEvidence(evidence: MacDiskImageEvidence): void {
