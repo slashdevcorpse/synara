@@ -73,6 +73,7 @@ jobs:
       - run: bun run --cwd scripts test check-brand-identity.test.ts verify-packaged-desktop-startup.test.ts lib/desktop-artifact-policy.test.ts lib/windows-authenticode.test.ts lib/windows-installer-qualification.test.ts lib/release-artifact-provenance.test.ts lib/super-synara-release-admission.test.ts lib/super-synara-workflow-contract.test.ts
       - run: node scripts/verify-workflow-contracts.ts
       - run: bun run build:desktop
+      - run: bun run --cwd apps/desktop smoke-test
   macos_arm64:
     runs-on: macos-15
     steps:
@@ -293,6 +294,46 @@ describe("workflow contracts", () => {
     );
     expect(validateWorkflowContracts(nonFailingBuild, policy()).join("\n")).toContain(
       "native desktop build must be unconditional and fail closed",
+    );
+  });
+
+  it("requires the Windows smoke to invoke the built desktop directly after the build", () => {
+    const wrapperSmoke = validFiles();
+    wrapperSmoke.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace(
+        "      - run: bun run --cwd apps/desktop smoke-test\n",
+        "      - run: bun run test:desktop-smoke\n",
+      ),
+    );
+    const wrapperErrors = validateWorkflowContracts(wrapperSmoke, policy()).join("\n");
+    expect(wrapperErrors).toContain("must run exact post-build smoke command");
+    expect(wrapperErrors).toContain("without the Turbo rebuild wrapper");
+
+    const earlySmoke = validFiles();
+    earlySmoke.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow
+        .replace("      - run: bun run --cwd apps/desktop smoke-test\n", "")
+        .replace(
+          "      - run: bun run build:desktop\n",
+          "      - run: bun run --cwd apps/desktop smoke-test\n      - run: bun run build:desktop\n",
+        ),
+    );
+    expect(validateWorkflowContracts(earlySmoke, policy()).join("\n")).toContain(
+      "post-build smoke must run after the desktop build",
+    );
+
+    const nonFailingSmoke = validFiles();
+    nonFailingSmoke.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace(
+        "      - run: bun run --cwd apps/desktop smoke-test\n",
+        "      - run: bun run --cwd apps/desktop smoke-test\n        continue-on-error: true\n",
+      ),
+    );
+    expect(validateWorkflowContracts(nonFailingSmoke, policy()).join("\n")).toContain(
+      "post-build smoke must be unconditional and fail closed",
     );
   });
 

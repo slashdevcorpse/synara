@@ -213,7 +213,7 @@ jobs:
           SYNARA_DESKTOP_FLAVOR: super
           SYNARA_HOME: ${{ runner.temp }}\super-synara-ci-home
           SYNARA_PORT_OFFSET: "2710"
-        run: bun run test:desktop-smoke
+        run: bun run --cwd apps/desktop smoke-test
 
   macos_arm64:
     name: macos_arm64

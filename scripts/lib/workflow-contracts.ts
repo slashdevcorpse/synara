@@ -44,6 +44,7 @@ const CI_WINDOWS_REQUIRED_COMMANDS = [
   "bun run --cwd scripts test check-brand-identity.test.ts verify-packaged-desktop-startup.test.ts lib/desktop-artifact-policy.test.ts lib/windows-authenticode.test.ts lib/windows-installer-qualification.test.ts lib/release-artifact-provenance.test.ts lib/super-synara-release-admission.test.ts lib/super-synara-workflow-contract.test.ts",
   "node scripts/verify-workflow-contracts.ts",
 ] as const;
+const CI_WINDOWS_POST_BUILD_COMMAND = "bun run --cwd apps/desktop smoke-test";
 const CI_MACOS_REQUIRED_COMMANDS = [
   'test "$(uname -m)" = arm64',
   "bun run brand:check",
@@ -116,6 +117,7 @@ function validateNativeJobCommands(
   steps: readonly WorkflowRunStep[],
   requiredCommands: readonly string[],
   errors: string[],
+  postBuildCommand?: string,
 ): void {
   const buildSteps = steps.filter((step) => step.command === "bun run build:desktop");
   if (buildSteps.length !== 1) {
@@ -149,6 +151,34 @@ function validateNativeJobCommands(
     if (buildStep && step!.index >= buildStep.index) {
       errors.push(
         `${workflowPath} ${jobName} native gate must run before the desktop build: ${command}.`,
+      );
+    }
+  }
+  if (postBuildCommand) {
+    const matches = steps.filter((step) => step.command === postBuildCommand);
+    if (matches.length !== 1) {
+      errors.push(
+        `${workflowPath} ${jobName} must run exact post-build smoke command: ${postBuildCommand}.`,
+      );
+    } else {
+      const [step] = matches;
+      if (
+        step!.condition !== undefined ||
+        (step!.continueOnError !== undefined && step!.continueOnError !== false)
+      ) {
+        errors.push(
+          `${workflowPath} ${jobName} post-build smoke must be unconditional and fail closed: ${postBuildCommand}.`,
+        );
+      }
+      if (buildStep && step!.index <= buildStep.index) {
+        errors.push(
+          `${workflowPath} ${jobName} post-build smoke must run after the desktop build: ${postBuildCommand}.`,
+        );
+      }
+    }
+    if (steps.some((step) => step.command === "bun run test:desktop-smoke")) {
+      errors.push(
+        `${workflowPath} ${jobName} must invoke the built desktop smoke directly without the Turbo rebuild wrapper.`,
       );
     }
   }
@@ -392,6 +422,7 @@ function validateCiArchitecture(workflow: UnknownRecord, errors: string[]): void
       windowsSteps,
       CI_WINDOWS_REQUIRED_COMMANDS,
       errors,
+      CI_WINDOWS_POST_BUILD_COMMAND,
     );
   }
   if (macosSteps) {
