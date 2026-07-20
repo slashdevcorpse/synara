@@ -569,6 +569,74 @@ describe("bounded profile-free PowerShell probes", () => {
     expect(child.listenerCount("error")).toBe(0);
   });
 
+  it.each(["throws", "returns false"] as const)(
+    "force-terminates and reaps the child when direct termination %s",
+    async (failureMode) => {
+      const child = new FakeProbeChild();
+      child.kill = () => {
+        child.killCalls += 1;
+        if (failureMode === "throws") throw new Error("direct termination failed");
+        return false;
+      };
+      let forceTerminationCalls = 0;
+      const result = __windowsShellSelectionTesting.runPowerShellProbe({
+        executable: "pwsh",
+        env: {},
+        spawnProcess: () => child.asChildProcess(),
+        forceTerminateProcess: () => {
+          forceTerminationCalls += 1;
+          queueMicrotask(() => child.close(null, "SIGKILL"));
+          return true;
+        },
+      });
+
+      child.stdout.write(
+        Buffer.alloc(__windowsShellSelectionTesting.powerShellProbeOutputLimitBytes + 1),
+      );
+
+      await expect(result).resolves.toBe("probe output limit exceeded");
+      expect(child.killCalls).toBe(1);
+      expect(forceTerminationCalls).toBe(1);
+      expect(child.signalCode).toBe("SIGKILL");
+      expect(child.listenerCount("close")).toBe(0);
+      expect(child.listenerCount("error")).toBe(0);
+    },
+  );
+
+  it("bounds fallback reaping when neither termination attempt closes the child", async () => {
+    vi.useFakeTimers();
+    const child = new FakeProbeChild();
+    child.kill = () => {
+      child.killCalls += 1;
+      return false;
+    };
+    let forceTerminationCalls = 0;
+    const result = __windowsShellSelectionTesting.runPowerShellProbe({
+      executable: "pwsh",
+      env: {},
+      spawnProcess: () => child.asChildProcess(),
+      forceTerminateProcess: () => {
+        forceTerminationCalls += 1;
+        return false;
+      },
+    });
+
+    child.stderr.write(
+      Buffer.alloc(__windowsShellSelectionTesting.powerShellProbeOutputLimitBytes + 1),
+    );
+    await vi.advanceTimersByTimeAsync(__windowsShellSelectionTesting.powerShellProbeReapTimeoutMs);
+
+    await expect(result).resolves.toBe("probe output limit exceeded");
+    expect(child.killCalls).toBe(1);
+    expect(forceTerminationCalls).toBe(1);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(child.listenerCount("close")).toBe(1);
+    expect(child.listenerCount("error")).toBe(1);
+    child.close(null, "SIGKILL");
+    expect(child.listenerCount("close")).toBe(0);
+    expect(child.listenerCount("error")).toBe(0);
+  });
+
   it("classifies synchronous and asynchronous spawn failures without leaking messages", async () => {
     await expect(
       __windowsShellSelectionTesting.runPowerShellProbe({

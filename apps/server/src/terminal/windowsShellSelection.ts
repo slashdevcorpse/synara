@@ -17,6 +17,7 @@ const POWERSHELL_PROBE_ARGS = [
 const POWERSHELL_INTERACTIVE_ARGS = ["-NoLogo"] as const;
 const POWERSHELL_PROBE_TIMEOUT_MS = 1_500;
 const POWERSHELL_PROBE_OUTPUT_LIMIT_BYTES = 32 * 1024;
+const POWERSHELL_PROBE_REAP_TIMEOUT_MS = 250;
 const WINDOWS_EXECUTABLE_VALIDATION_TIMEOUT_MS = 500;
 const WINDOWS_EXECUTABLE_EXTENSION_PATTERN = /\.(?:com|exe)$/i;
 
@@ -56,11 +57,13 @@ export interface WindowsSelectedShell {
 }
 
 type ProbeSpawn = (command: string, args: readonly string[], options: SpawnOptions) => ChildProcess;
+type ProbeForceTerminate = (child: ChildProcess) => boolean;
 
 interface PowerShellProbeInput {
   readonly executable: string;
   readonly env: NodeJS.ProcessEnv;
   readonly spawnProcess?: ProbeSpawn;
+  readonly forceTerminateProcess?: ProbeForceTerminate;
 }
 
 interface ExecutableValidationInput {
@@ -138,6 +141,18 @@ function byteLength(chunk: Buffer | string): number {
 
 function ignoreLateProbeError(): void {}
 
+function probeHasExited(child: ChildProcess): boolean {
+  return child.exitCode !== null || child.signalCode !== null;
+}
+
+function forceTerminatePowerShellProbe(child: ChildProcess): boolean {
+  try {
+    return child.kill("SIGKILL");
+  } catch {
+    return probeHasExited(child);
+  }
+}
+
 function probeSpawnFailureCategory(error: unknown): WindowsShellFailureCategory {
   return (error as NodeJS.ErrnoException | null | undefined)?.code === "ENOENT"
     ? "not found"
@@ -148,6 +163,7 @@ async function runPowerShellProbe({
   executable,
   env,
   spawnProcess = spawn,
+  forceTerminateProcess = forceTerminatePowerShellProbe,
 }: PowerShellProbeInput): Promise<WindowsShellFailureCategory | null> {
   const startedAt = performance.now();
 
@@ -180,14 +196,25 @@ async function runPowerShellProbe({
       child.off("close", onClose);
     };
 
-    const terminate = (): void => {
+    const terminate = (): boolean => {
+      let signalSent = false;
       try {
-        child.kill();
+        signalSent = child.kill();
       } catch {
         // The process may already have exited between the deadline and cleanup.
       }
       child.stdout?.destroy();
       child.stderr?.destroy();
+      return signalSent || probeHasExited(child);
+    };
+
+    const guardLateErrorsUntilClose = (): void => {
+      if (probeHasExited(child)) return;
+      const releaseLateErrorGuard = (): void => {
+        child.off("error", ignoreLateProbeError);
+      };
+      child.on("error", ignoreLateProbeError);
+      child.once("close", releaseLateErrorGuard);
     };
 
     const finish = (
@@ -196,16 +223,42 @@ async function runPowerShellProbe({
     ): void => {
       if (settled) return;
       settled = true;
-      if (shouldTerminate) terminate();
+      const terminationAccepted = shouldTerminate ? terminate() : true;
       cleanup();
-      if (shouldTerminate && child.exitCode === null && child.signalCode === null) {
-        const releaseLateErrorGuard = (): void => {
-          child.off("error", ignoreLateProbeError);
-        };
-        child.once("error", ignoreLateProbeError);
-        child.once("close", releaseLateErrorGuard);
+
+      if (!shouldTerminate) {
+        resolve(category);
+        return;
       }
-      resolve(category);
+
+      guardLateErrorsUntilClose();
+      if (terminationAccepted) {
+        resolve(category);
+        return;
+      }
+
+      let completed = false;
+      const completeFallback = (): void => {
+        if (completed) return;
+        completed = true;
+        if (timeout) {
+          clearTimeout(timeout);
+          timeout = null;
+        }
+        child.off("close", completeFallback);
+        resolve(category);
+      };
+      child.once("close", completeFallback);
+      try {
+        forceTerminateProcess(child);
+      } catch {
+        // The bounded reap window below still prevents probe selection from hanging.
+      }
+      if (probeHasExited(child)) {
+        completeFallback();
+        return;
+      }
+      timeout = setTimeout(completeFallback, POWERSHELL_PROBE_REAP_TIMEOUT_MS);
     };
 
     const onOutput = (chunk: Buffer | string): void => {
@@ -551,6 +604,7 @@ export const __windowsShellSelectionTesting = {
   powerShellInteractiveArgs: POWERSHELL_INTERACTIVE_ARGS,
   powerShellProbeArgs: POWERSHELL_PROBE_ARGS,
   powerShellProbeOutputLimitBytes: POWERSHELL_PROBE_OUTPUT_LIMIT_BYTES,
+  powerShellProbeReapTimeoutMs: POWERSHELL_PROBE_REAP_TIMEOUT_MS,
   powerShellProbeTimeoutMs: POWERSHELL_PROBE_TIMEOUT_MS,
   runPowerShellProbe,
   validateWindowsExecutable,
