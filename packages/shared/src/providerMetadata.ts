@@ -24,6 +24,12 @@ export const PROVIDER_DESCRIPTORS = [
     },
   },
   {
+    kind: "commandCode",
+    displayName: PROVIDER_DISPLAY_NAMES.commandCode,
+    available: true,
+    usage: null,
+  },
+  {
     kind: "claudeAgent",
     displayName: PROVIDER_DISPLAY_NAMES.claudeAgent,
     available: true,
