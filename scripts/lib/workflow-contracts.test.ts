@@ -310,17 +310,23 @@ describe("workflow contracts", () => {
     expect(wrapperErrors).toContain("must run exact post-build smoke command");
     expect(wrapperErrors).toContain("without the Turbo rebuild wrapper");
 
-    const argumentWrapper = validFiles();
-    argumentWrapper.set(
-      ".github/workflows/ci.yml",
-      ciWorkflow.replace(
-        "      - run: bun run --cwd apps/desktop smoke-test\n",
-        "      - run: bun run --cwd apps/desktop smoke-test\n      - run: echo preparing && bun run test:desktop-smoke -- --flag\n",
-      ),
-    );
-    expect(validateWorkflowContracts(argumentWrapper, policy()).join("\n")).toContain(
-      "without the Turbo rebuild wrapper",
-    );
+    for (const equivalentWrapper of [
+      "echo preparing && bun run test:desktop-smoke -- --flag",
+      "echo input | bun run test:desktop-smoke",
+      '"& bun run test:desktop-smoke"',
+    ]) {
+      const wrapperFiles = validFiles();
+      wrapperFiles.set(
+        ".github/workflows/ci.yml",
+        ciWorkflow.replace(
+          "      - run: bun run --cwd apps/desktop smoke-test\n",
+          `      - run: bun run --cwd apps/desktop smoke-test\n      - run: ${equivalentWrapper}\n`,
+        ),
+      );
+      expect(validateWorkflowContracts(wrapperFiles, policy()).join("\n")).toContain(
+        "without the Turbo rebuild wrapper",
+      );
+    }
 
     const earlySmoke = validFiles();
     earlySmoke.set(

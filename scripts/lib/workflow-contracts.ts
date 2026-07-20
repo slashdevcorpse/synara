@@ -87,9 +87,7 @@ function invokesRootTest(command: string): boolean {
 }
 
 function invokesDesktopSmokeTurboWrapper(command: string): boolean {
-  return executableShellLines(command).some((line) =>
-    /(?:^|(?:&&|\|\||;)\s*)bun run test:desktop-smoke(?=$|\s|&&|\|\||;)/.test(line),
-  );
+  return executableShellLines(command).some((line) => line.includes("test:desktop-smoke"));
 }
 
 function jobRunSteps(
