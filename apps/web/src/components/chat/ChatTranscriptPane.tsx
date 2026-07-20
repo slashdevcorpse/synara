@@ -7,7 +7,6 @@ import { type MessageId, type ThreadId, type ThreadMarker, type TurnId } from "@
 import { type LegendListRef } from "@legendapp/list/react";
 import {
   useEffect,
-  useRef,
   useState,
   type ComponentProps,
   type CSSProperties,
@@ -56,6 +55,7 @@ interface ChatTranscriptPaneProps {
   onTogglePinMessage?: (messageId: MessageId) => void;
   threadMarkers?: readonly ThreadMarker[];
   enteringUserMessageIds?: ComponentProps<typeof MessagesTimeline>["enteringUserMessageIds"];
+  crossTaskOrigin?: ComponentProps<typeof MessagesTimeline>["crossTaskOrigin"];
   markdownCwd: string | undefined;
   onExpandTimelineImage: (preview: ExpandedImagePreview) => void;
   onMessagesClickCapture: MouseEventHandler<HTMLDivElement>;
@@ -116,6 +116,7 @@ export function ChatTranscriptPane({
   onTogglePinMessage,
   threadMarkers,
   enteringUserMessageIds,
+  crossTaskOrigin,
   markdownCwd,
   onExpandTimelineImage,
   onMessagesClickCapture,
@@ -213,6 +214,7 @@ export function ChatTranscriptPane({
             {...(onTogglePinMessage ? { onTogglePinMessage } : {})}
             {...(threadMarkers ? { threadMarkers } : {})}
             {...(enteringUserMessageIds ? { enteringUserMessageIds } : {})}
+            {...(crossTaskOrigin ? { crossTaskOrigin } : {})}
             timelineEntries={timelineEntries}
             turnDiffSummaryByAssistantMessageId={turnDiffSummaryByAssistantMessageId}
             onOpenTurnDiff={onOpenTurnDiff}

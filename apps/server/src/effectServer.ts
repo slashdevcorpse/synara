@@ -5,6 +5,8 @@ import { Effect, Exit, FileSystem, Layer, Path, Schema, Scope, ServiceMap } from
 import { HttpRouter } from "effect/unstable/http";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
+import { agentGatewayRouteLayer } from "./agentGateway/httpRoute";
+import { AgentGatewayCredentials } from "./agentGateway/Services/AgentGatewayCredentials";
 import { AutomationRunReactor } from "./automation/Services/AutomationRunReactor";
 import { AutomationScheduler } from "./automation/Services/AutomationScheduler";
 import { AutomationService } from "./automation/Services/AutomationService";
@@ -58,6 +60,7 @@ export interface ServerShape {
     ServerLifecycleError | ServerSettingsError,
     | Scope.Scope
     | ServerConfig
+    | AgentGatewayCredentials
     | FileSystem.FileSystem
     | Path.Path
     | GitCore
@@ -139,6 +142,7 @@ export const createEffectServer = Effect.fn(function* (
       cause: new Error(remotePolicyError),
     });
   }
+  const agentGatewayCredentials = yield* AgentGatewayCredentials;
   const automationRunReactor = yield* AutomationRunReactor;
   const automationScheduler = yield* AutomationScheduler;
   const git = yield* GitCore;
@@ -197,6 +201,7 @@ export const createEffectServer = Effect.fn(function* (
   const routesLayer = Layer.mergeAll(
     makeEffectHttpRouteLayer(readiness, shutdownController),
     websocketRpcRouteLayer,
+    agentGatewayRouteLayer,
   );
   const httpApp = yield* HttpRouter.toHttpEffect(routesLayer);
   yield* httpServer
@@ -205,14 +210,16 @@ export const createEffectServer = Effect.fn(function* (
       Effect.mapError((cause) => new ServerLifecycleError({ operation: "httpServerServe", cause })),
     );
 
+  const listeningPort = resolveListeningPort(
+    (nodeServer as http.Server | null)?.address() ?? null,
+    config.port,
+  );
+  agentGatewayCredentials.setListeningPort(listeningPort);
   yield* persistServerRuntimeState({
     path: config.serverRuntimeStatePath,
     state: makePersistedServerRuntimeState({
       config,
-      port: resolveListeningPort(
-        (nodeServer as http.Server | null)?.address() ?? null,
-        config.port,
-      ),
+      port: listeningPort,
     }),
   }).pipe(
     Effect.mapError(

@@ -4,7 +4,7 @@
 
 import type { ProjectId, ThreadEnvironmentMode, ThreadId } from "@synara/contracts";
 
-import type { AppState } from "./store";
+import type { AppState } from "./storeState";
 import { collectByIds, getThreadFromState, getThreadsFromState } from "./threadDerivation";
 import type { Project, SidebarThreadSummary, Thread, ThreadShell } from "./types";
 
@@ -225,6 +225,29 @@ export function createSidebarDisplayThreadsSelector(): (
       (thread) => !thread.parentThreadId && thread.archivedAt == null,
     );
     return previousDisplaySummaries;
+  };
+}
+
+// Sidebar tree source: unlike the flat display selector above, this keeps
+// child (subagent) threads so buildProjectThreadTree can nest them under
+// their parent row behind the "N subagents" expand toggle. Flat consumers
+// (pinned rows, search palette) should keep using the display selector.
+export function createSidebarTreeThreadsSelector(): (
+  state: AppState,
+) => readonly SidebarThreadSummary[] {
+  const selectSidebarSummaries = createSidebarThreadSummariesSelector();
+  let previousSummaries: readonly SidebarThreadSummary[] | undefined;
+  let previousTreeSummaries: readonly SidebarThreadSummary[] = [];
+
+  return (state) => {
+    const sidebarSummaries = selectSidebarSummaries(state);
+    if (sidebarSummaries === previousSummaries) {
+      return previousTreeSummaries;
+    }
+
+    previousSummaries = sidebarSummaries;
+    previousTreeSummaries = sidebarSummaries.filter((thread) => thread.archivedAt == null);
+    return previousTreeSummaries;
   };
 }
 

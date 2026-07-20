@@ -491,7 +491,7 @@ describe("desktop backend restart integration", () => {
     const readinessFailure = sourceBetween(
       desktopMainSource,
       "async function settleBackendGenerationAfterReadinessFailure(",
-      "function stopBackend(",
+      "function takeBackendProcessForShutdown(",
     );
     const unconfirmedBranch = readinessFailure.indexOf("if (!shutdownDisposition.exitConfirmed)");
     const failureRecording = readinessFailure.indexOf("recordBackendGenerationFailure(");

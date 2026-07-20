@@ -1549,8 +1549,11 @@ describe("migration backups", () => {
 
     const backups = await backupPaths(dbPath);
     expect(backups).toHaveLength(1);
+    const currentMigrationId = migrationEntries.at(-1)![0];
     expect(path.basename(backups[0]!)).toMatch(
-      /^state\.sqlite\.pre-migration-imported-v54-from54-to-v70-\d{8}T\d{9}Z-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.sqlite$/,
+      new RegExp(
+        `^state\\.sqlite\\.pre-migration-imported-v54-from54-to-v${currentMigrationId}-\\d{8}T\\d{9}Z-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\\.sqlite$`,
+      ),
     );
     const backup = new DatabaseSync(backups[0]!, { readOnly: true });
     try {

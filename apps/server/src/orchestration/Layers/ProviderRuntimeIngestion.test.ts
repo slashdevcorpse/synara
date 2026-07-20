@@ -5490,6 +5490,68 @@ describe("ProviderRuntimeIngestion", () => {
     expect(thread.session?.lastError).toBe("runtime exploded");
   });
 
+  it("forgets an errored turn before resolving a later terminal event without a turn id", async () => {
+    const harness = await createHarness();
+    const now = new Date().toISOString();
+
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-turn-started-before-runtime-error"),
+      provider: "codex",
+      createdAt: now,
+      threadId: asThreadId("thread-1"),
+      turnId: asTurnId("turn-before-runtime-error"),
+      payload: {},
+    });
+    await waitForThread(
+      harness.engine,
+      (thread) => thread.session?.activeTurnId === "turn-before-runtime-error",
+    );
+
+    harness.emit({
+      type: "runtime.error",
+      eventId: asEventId("evt-runtime-error-before-recovery"),
+      provider: "codex",
+      createdAt: now,
+      threadId: asThreadId("thread-1"),
+      turnId: asTurnId("turn-before-runtime-error"),
+      payload: { message: "runtime exploded before recovery" },
+    });
+    await waitForThread(
+      harness.engine,
+      (thread) => thread.session?.status === "error" && thread.session.activeTurnId === null,
+    );
+
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-turn-started-after-runtime-error"),
+      provider: "codex",
+      createdAt: now,
+      threadId: asThreadId("thread-1"),
+      turnId: asTurnId("turn-after-runtime-error"),
+      payload: {},
+    });
+    await waitForThread(
+      harness.engine,
+      (thread) => thread.session?.activeTurnId === "turn-after-runtime-error",
+    );
+
+    harness.emit({
+      type: "turn.completed",
+      eventId: asEventId("evt-turn-completed-after-runtime-error"),
+      provider: "codex",
+      createdAt: now,
+      threadId: asThreadId("thread-1"),
+      payload: { state: "completed" },
+    });
+
+    const recovered = await waitForThread(
+      harness.engine,
+      (thread) => thread.session?.status === "ready" && thread.session.activeTurnId === null,
+    );
+    expect(recovered.session?.lastError).toBeNull();
+  });
+
   it("keeps the session running when a runtime.warning arrives during an active turn", async () => {
     const harness = await createHarness();
     const now = new Date().toISOString();
@@ -7048,6 +7110,9 @@ describe("ProviderRuntimeIngestion", () => {
     );
 
     expect(childThread.title).toBe("Locke [explorer]");
+    expect(childThread.creationSource).toBe("provider_native");
+    expect(childThread.sourceThreadId).toBe("thread-1");
+    expect(childThread.sourceTurnId).toBe("turn-parent");
 
     const parentThread = await waitForThread(harness.engine, (entry) =>
       entry.activities.some(
@@ -7156,6 +7221,54 @@ describe("ProviderRuntimeIngestion", () => {
     );
 
     expect(childThread.title).toBe("Harper [reviewer]");
+  });
+
+  it("caps native child materialization per parent turn and deduplicates replay", async () => {
+    const harness = await createHarness();
+    const receiverThreadIds = Array.from({ length: 22 }, (_, index) => `native-child-${index}`);
+    const event = {
+      type: "item.updated",
+      eventId: asEventId("evt-collab-overflow"),
+      provider: "codex",
+      createdAt: new Date().toISOString(),
+      threadId: asThreadId("thread-1"),
+      turnId: asTurnId("turn-native-budget"),
+      itemId: asItemId("item-collab-overflow"),
+      payload: {
+        itemType: "collab_agent_tool_call",
+        title: "Task",
+        data: {
+          item: {
+            type: "collabAgentToolCall",
+            receiverThreadIds,
+          },
+        },
+      },
+    } as const;
+
+    harness.emit(event);
+    await harness.drain();
+    harness.emit(event);
+    await harness.drain();
+
+    const readModel = await Effect.runPromise(harness.engine.getReadModel());
+    const nativeChildren = readModel.threads.filter(
+      (thread) =>
+        thread.parentThreadId === "thread-1" && thread.sourceTurnId === "turn-native-budget",
+    );
+    expect(nativeChildren).toHaveLength(20);
+    expect(
+      nativeChildren.every(
+        (thread) =>
+          thread.creationSource === "provider_native" &&
+          thread.sourceThreadId === "thread-1" &&
+          thread.gatewayOperationId === null,
+      ),
+    ).toBe(true);
+    const parent = readModel.threads.find((thread) => thread.id === "thread-1");
+    expect(
+      parent?.activities.filter((activity) => activity.kind === "subagent.materialization.capped"),
+    ).toHaveLength(1);
   });
 
   it("routes fallback-annotated child events without polluting the parent projection", async () => {

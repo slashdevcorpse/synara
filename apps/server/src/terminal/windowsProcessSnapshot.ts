@@ -6,7 +6,7 @@ import path from "node:path";
 
 import { runProcess, type ProcessRunOptions, type ProcessRunResult } from "../processRunner";
 
-export const WINDOWS_PROCESS_SNAPSHOT_TIMEOUT_MS = 1_500;
+export const WINDOWS_PROCESS_SNAPSHOT_TIMEOUT_MS = 5_000;
 export const WINDOWS_PROCESS_SNAPSHOT_MAX_BUFFER_BYTES = 8 * 1024 * 1024;
 
 const WINDOWS_PROCESS_SNAPSHOT_VERSION = 1;
@@ -18,7 +18,7 @@ const WINDOWS_PROCESS_SNAPSHOT_SCRIPT = [
   "$utf8 = New-Object System.Text.UTF8Encoding($false)",
   "[Console]::OutputEncoding = $utf8",
   "$OutputEncoding = $utf8",
-  "$records = @(Get-CimInstance Win32_Process -ErrorAction Stop | Select-Object ProcessId, ParentProcessId, Name, ExecutablePath, CommandLine)",
+  "$records = @(Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId, Name, ExecutablePath, CommandLine -ErrorAction Stop | Select-Object ProcessId, ParentProcessId, Name, ExecutablePath, CommandLine)",
   "$envelope = [ordered]@{ version = 1; complete = $true; recordCount = $records.Count; records = $records }",
   "$envelope | ConvertTo-Json -Compress -Depth 4",
 ].join("; ");
