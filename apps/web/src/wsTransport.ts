@@ -25,6 +25,7 @@ import {
   type GitRunStackedActionResult,
   type OrchestrationEvent,
   type OrchestrationShellStreamItem,
+  type OrchestrationSubscribeShellInput,
   type OrchestrationThreadStreamItem,
   type ProjectDevServerEvent,
   type ServerConfigStreamEvent,
@@ -71,6 +72,42 @@ export class WsTransportRequestInterruptedError extends Data.TaggedError(
 export interface WsRequestOptions {
   readonly timeoutMs?: number | null;
   readonly signal?: AbortSignal;
+}
+
+export interface ShellSubscriptionResumeState {
+  readonly input: OrchestrationSubscribeShellInput;
+  readonly lastDeliveredSequence: number | null;
+}
+
+export function retainShellSubscription(
+  current: ShellSubscriptionResumeState | null,
+  input: OrchestrationSubscribeShellInput,
+): ShellSubscriptionResumeState {
+  return {
+    input,
+    lastDeliveredSequence: current?.lastDeliveredSequence ?? input.afterSequence ?? null,
+  };
+}
+
+export function advanceShellSubscription(
+  state: ShellSubscriptionResumeState,
+  item: OrchestrationShellStreamItem,
+): ShellSubscriptionResumeState {
+  const sequence = item.kind === "snapshot" ? item.snapshot.snapshotSequence : item.sequence;
+  return {
+    input: state.input,
+    lastDeliveredSequence:
+      item.kind === "snapshot" ? sequence : Math.max(state.lastDeliveredSequence ?? -1, sequence),
+  };
+}
+
+export function shellReconnectInput(
+  state: ShellSubscriptionResumeState,
+): OrchestrationSubscribeShellInput {
+  return {
+    ...state.input,
+    ...(state.lastDeliveredSequence === null ? {} : { afterSequence: state.lastDeliveredSequence }),
+  };
 }
 
 interface RequestAbortScope {
@@ -343,7 +380,7 @@ export class WsTransport {
     readonly resolve: (ready: TerminalEventStreamReady) => void;
     readonly reject: (error: Error) => void;
   } | null = null;
-  private shellSubscribed = false;
+  private shellSubscription: ShellSubscriptionResumeState | null = null;
   private readonly threadSubscriptions = new Map<string, unknown>();
   private compatibility: WsBootstrapNegotiateResult | null = null;
   private compatibilityIssue: WsCompatibilityError | null = null;
@@ -374,12 +411,15 @@ export class WsTransport {
       }
 
       if (method === ORCHESTRATION_WS_METHODS.subscribeShell) {
-        this.shellSubscribed = true;
+        this.shellSubscription = retainShellSubscription(
+          this.shellSubscription,
+          (params ?? {}) as OrchestrationSubscribeShellInput,
+        );
         this.startShellStream(client);
         return undefined as T;
       }
       if (method === ORCHESTRATION_WS_METHODS.unsubscribeShell) {
-        this.shellSubscribed = false;
+        this.shellSubscription = null;
         this.stopStream("orchestration.shell");
         return undefined as T;
       }
@@ -683,7 +723,7 @@ export class WsTransport {
     for (const channel of this.listeners.keys()) {
       void this.startChannelStream(channel as WsPushChannel);
     }
-    if (this.shellSubscribed) {
+    if (this.shellSubscription !== null) {
       this.startShellStream(client);
     }
     for (const [threadId, input] of this.threadSubscriptions) {
@@ -860,17 +900,23 @@ export class WsTransport {
 
   private startShellStream(client: RpcClientInstance): void {
     const restartShell = () => {
-      if (!this.shellSubscribed) return;
+      if (this.shellSubscription === null) return;
       void this.getClient()
         .then((nextClient) => this.startShellStream(nextClient))
         .catch((error) => console.warn("WebSocket RPC shell stream failed to restart", error));
     };
+    const subscription = this.shellSubscription;
+    if (subscription === null) return;
     this.startStream(
       client,
       "orchestration.shell",
-      client[ORCHESTRATION_WS_METHODS.subscribeShell]({}),
-      (event: OrchestrationShellStreamItem) =>
-        this.emit(ORCHESTRATION_WS_CHANNELS.shellEvent, event),
+      client[ORCHESTRATION_WS_METHODS.subscribeShell](shellReconnectInput(subscription)),
+      (event: OrchestrationShellStreamItem) => {
+        if (this.shellSubscription !== null) {
+          this.shellSubscription = advanceShellSubscription(this.shellSubscription, event);
+        }
+        this.emit(ORCHESTRATION_WS_CHANNELS.shellEvent, event);
+      },
       restartShell,
     );
   }

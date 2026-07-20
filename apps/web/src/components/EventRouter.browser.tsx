@@ -23,6 +23,8 @@ import { render } from "vitest-browser-react";
 
 import { useComposerDraftStore } from "../composerDraftStore";
 import { getRouter } from "../router";
+// Preload the split route before individual test clocks start on a cold browser run.
+import "../routes/_chat.$threadId?tsr-split=component";
 import { useStore } from "../store";
 import {
   createShellSnapshotFromReadModel,
@@ -51,6 +53,8 @@ interface TestFixture {
 let fixture: TestFixture;
 let shellStreamRequestId: string | null = null;
 let shellStreamClient: EffectRpcWebSocketClient | null = null;
+let lifecycleStreamRequestId: string | null = null;
+let lifecycleStreamClient: EffectRpcWebSocketClient | null = null;
 const threadStreamRequestIdByThreadId = new Map<ThreadId, string>();
 const threadStreamClientByThreadId = new Map<ThreadId, EffectRpcWebSocketClient>();
 let delayNextThreadSnapshot = false;
@@ -231,6 +235,8 @@ const worker = setupWorker(
         return;
       }
       if (method === WS_METHODS.subscribeServerLifecycle) {
+        lifecycleStreamRequestId = request.id;
+        lifecycleStreamClient = client;
         sendEffectRpcChunk(client, request.id, {
           type: "welcome",
           payload: fixture.welcome,
@@ -363,6 +369,16 @@ function sendThreadSnapshotPush(threadId: ThreadId, snapshotSequence: number) {
   });
 }
 
+function sendWelcomePush() {
+  if (!lifecycleStreamRequestId || !lifecycleStreamClient) {
+    throw new Error("Server lifecycle stream is not connected");
+  }
+  sendEffectRpcChunk(lifecycleStreamClient, lifecycleStreamRequestId, {
+    type: "welcome",
+    payload: fixture.welcome,
+  });
+}
+
 function sendShellEventPush(event: OrchestrationShellStreamEvent) {
   if (!shellStreamRequestId || !shellStreamClient) {
     throw new Error("Shell stream is not connected");
@@ -391,6 +407,8 @@ describe("EventRouter scoped orchestration sync", () => {
     document.body.innerHTML = "";
     shellStreamRequestId = null;
     shellStreamClient = null;
+    lifecycleStreamRequestId = null;
+    lifecycleStreamClient = null;
     threadStreamRequestIdByThreadId.clear();
     threadStreamClientByThreadId.clear();
     delayNextThreadSnapshot = false;
@@ -518,6 +536,90 @@ describe("EventRouter scoped orchestration sync", () => {
         },
         { timeout: 8_000, interval: 16 },
       );
+    } finally {
+      await mounted.cleanup();
+    }
+  });
+
+  it("keeps an active thread cursor when its reconnect snapshot arrives before welcome", async () => {
+    const mounted = await mountApp();
+
+    try {
+      fixture = {
+        ...fixture,
+        snapshot: {
+          ...fixture.snapshot,
+          snapshotSequence: 2,
+          threads: fixture.snapshot.threads.map((thread) =>
+            thread.id === THREAD_ID
+              ? {
+                  ...thread,
+                  title: "Snapshot before reconnect welcome",
+                  updatedAt: "2026-03-04T12:00:05.000Z",
+                }
+              : thread,
+          ),
+        },
+        welcome: {
+          ...fixture.welcome,
+          homeDir: "/reconnected-home",
+        },
+      };
+      sendThreadSnapshotPush(THREAD_ID, 2);
+      await vi.waitFor(
+        () => {
+          expect(getThreadFromState(useStore.getState(), THREAD_ID)?.title).toBe(
+            "Snapshot before reconnect welcome",
+          );
+        },
+        { timeout: 4_000, interval: 16 },
+      );
+
+      const subscribeCountBeforeWelcome = subscribeThreadRequestCountById.get(THREAD_ID) ?? 0;
+      sendWelcomePush();
+      await vi.waitFor(
+        () => {
+          expect(useWorkspaceStore.getState().homeDir).toBe("/reconnected-home");
+        },
+        { timeout: 4_000, interval: 16 },
+      );
+
+      delayNextThreadSnapshot = true;
+      const eventAfterWelcome = {
+        sequence: 3,
+        eventId: EventId.makeUnsafe("event-after-reconnect-welcome"),
+        aggregateKind: "thread",
+        aggregateId: THREAD_ID,
+        occurredAt: "2026-03-04T12:00:06.000Z",
+        commandId: null,
+        causationEventId: null,
+        correlationId: null,
+        metadata: {},
+        type: "thread.message-sent",
+        payload: {
+          threadId: THREAD_ID,
+          messageId: MessageId.makeUnsafe("msg-after-reconnect-welcome"),
+          role: "assistant",
+          text: "applied after reconnect welcome",
+          turnId: TurnId.makeUnsafe("turn-after-reconnect-welcome"),
+          source: "native",
+          streaming: false,
+          createdAt: "2026-03-04T12:00:06.000Z",
+          updatedAt: "2026-03-04T12:00:06.000Z",
+        },
+      } satisfies Extract<OrchestrationEvent, { type: "thread.message-sent" }>;
+      sendThreadEventPush(eventAfterWelcome);
+
+      await vi.waitFor(
+        () => {
+          const message = getThreadFromState(useStore.getState(), THREAD_ID)?.messages.find(
+            (entry) => entry.id === MessageId.makeUnsafe("msg-after-reconnect-welcome"),
+          );
+          expect(message?.text).toBe("applied after reconnect welcome");
+        },
+        { timeout: 4_000, interval: 16 },
+      );
+      expect(subscribeThreadRequestCountById.get(THREAD_ID)).toBe(subscribeCountBeforeWelcome);
     } finally {
       await mounted.cleanup();
     }

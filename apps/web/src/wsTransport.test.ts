@@ -12,10 +12,13 @@ import {
   WS_PROTOCOL_MAX_REVISION,
   WS_PROTOCOL_MIN_REVISION,
   TERMINAL_RESNAPSHOT_REQUIRED_CODE,
+  ProjectId,
+  type OrchestrationShellStreamItem,
   WsCompatibilityError,
 } from "@synara/contracts";
 
 import {
+  advanceShellSubscription,
   shouldKeepServerLifecycleStream,
   getTerminalCompatibilityError,
   handleTerminalResnapshotRequiredFailure,
@@ -24,6 +27,8 @@ import {
   makeFeatureSocketUrl,
   makeRequestAbortScope,
   projectServerConfigUpdatedPayload,
+  retainShellSubscription,
+  shellReconnectInput,
   shouldReconnectAfterStreamFailure,
   WsTransport,
 } from "./wsTransport";
@@ -104,6 +109,34 @@ afterEach(() => {
 });
 
 describe("WsTransport", () => {
+  it("retains the shell input and resumes after the last delivered sequence", () => {
+    let state = retainShellSubscription(null, { afterSequence: 10 });
+    state = advanceShellSubscription(state, {
+      kind: "project-removed",
+      sequence: 12,
+      projectId: ProjectId.makeUnsafe("project-1"),
+    });
+    state = retainShellSubscription(state, {});
+
+    expect(state.input).toEqual({});
+    expect(state.lastDeliveredSequence).toBe(12);
+    expect(shellReconnectInput(state)).toEqual({ afterSequence: 12 });
+  });
+
+  it("resets an ahead shell cursor to the sequence of a fallback snapshot", () => {
+    const state = advanceShellSubscription(retainShellSubscription(null, { afterSequence: 100 }), {
+      kind: "snapshot",
+      snapshot: {
+        snapshotSequence: 20,
+        projects: [],
+        threads: [],
+        updatedAt: "2026-07-20T00:00:00.000Z",
+      },
+    } as OrchestrationShellStreamItem);
+
+    expect(shellReconnectInput(state)).toEqual({ afterSequence: 20 });
+  });
+
   it("does not reconnect the socket for typed stream-admission failures", () => {
     expect(
       shouldReconnectAfterStreamFailure(

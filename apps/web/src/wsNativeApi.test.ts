@@ -794,6 +794,18 @@ describe("wsNativeApi", () => {
     });
   });
 
+  it("forwards the shell resume cursor to the orchestration websocket method", async () => {
+    requestMock.mockResolvedValue(undefined);
+    const { createWsNativeApi } = await import("./wsNativeApi");
+
+    const api = createWsNativeApi();
+    await api.orchestration.subscribeShell({ afterSequence: 42 });
+
+    expect(requestMock).toHaveBeenCalledWith(ORCHESTRATION_WS_METHODS.subscribeShell, {
+      afterSequence: 42,
+    });
+  });
+
   it("forwards provider delivery inspection and reconciliation", async () => {
     requestMock.mockResolvedValue([]);
     const { createWsNativeApi } = await import("./wsNativeApi");
