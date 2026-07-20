@@ -17,6 +17,7 @@ import {
   isValidGitHubRepositoryNameWithOwner,
   parseGitHubRepositoryNameWithOwnerFromRemoteUrl,
 } from "@synara/shared/githubRepository";
+import { splitLines } from "@synara/shared/text";
 
 import { runProcess } from "../../processRunner";
 import { GitHubCliError } from "../Errors.ts";
@@ -842,7 +843,7 @@ const makeGitHubCli = Effect.sync(() => {
     runGit({ cwd, args: ["remote", "-v"] }).pipe(
       Effect.map((result) => {
         const target = repository.toLowerCase();
-        for (const line of result.stdout.split("\n")) {
+        for (const line of splitLines(result.stdout)) {
           const match = /^(\S+)\t(\S+)\s+\(fetch\)$/.exec(line);
           const remoteName = match?.[1];
           const remoteUrl = match?.[2];

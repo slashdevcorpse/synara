@@ -1066,8 +1066,8 @@ layer("GitHubCliLive", (it) => {
         .mockRejectedValueOnce(new Error("fatal: bad object 2222222222222222"))
         .mockResolvedValueOnce({
           stdout:
-            "origin\thttps://oauth2:super-secret@github.com/acme/app.git (fetch)\n" +
-            "origin\thttps://oauth2:super-secret@github.com/acme/app.git (push)\n",
+            "origin\thttps://oauth2:super-secret@github.com/acme/app.git (fetch)\r\n" +
+            "origin\thttps://oauth2:super-secret@github.com/acme/app.git (push)\r\n",
           stderr: "",
           code: 0,
           signal: null,

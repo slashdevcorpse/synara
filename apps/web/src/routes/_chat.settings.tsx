@@ -1095,6 +1095,9 @@ function SettingsRouteView() {
     ...(settings.confirmTerminalTabClose !== defaults.confirmTerminalTabClose
       ? ["Terminal close confirmation"]
       : []),
+    ...(settings.terminalRightClickToPaste !== defaults.terminalRightClickToPaste
+      ? ["Terminal right-click paste"]
+      : []),
     ...(isGitTextGenerationModelDirty ? ["Git writing model"] : []),
     ...(settings.customCodexModels.length > 0 ||
     settings.customClaudeModels.length > 0 ||
@@ -2485,6 +2488,15 @@ function SettingsRouteView() {
             "Set the default wrap state when the diff panel opens. The in-panel wrap toggle only affects the current diff session.",
           resetLabel: "diff line wrapping",
           ariaLabel: "Wrap diff lines by default",
+        })}
+
+        {renderBooleanSettingRow({
+          settingKey: "terminalRightClickToPaste",
+          title: "Terminal right-click paste",
+          description:
+            "Paste clipboard text with a bare right-click. Ctrl+right-click keeps the context menu.",
+          resetLabel: "terminal right-click paste",
+          ariaLabel: "Paste in the terminal with right-click",
         })}
       </SettingsSection>
 

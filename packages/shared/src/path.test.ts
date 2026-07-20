@@ -22,9 +22,10 @@ describe("isWorkspaceRelativePathSafe", () => {
     expect(isWorkspaceRelativePathSafe("./src")).toBe(false);
   });
 
-  it("rejects absolute paths", () => {
+  it("rejects absolute and Windows drive-qualified paths", () => {
     expect(isWorkspaceRelativePathSafe("/etc/passwd")).toBe(false);
     expect(isWorkspaceRelativePathSafe("C:\\Windows")).toBe(false);
+    expect(isWorkspaceRelativePathSafe("D:\\outside\\file.txt")).toBe(false);
     expect(isWorkspaceRelativePathSafe("\\\\server\\share")).toBe(false);
   });
 
@@ -50,6 +51,39 @@ describe("workspaceRelativePathOf", () => {
     expect(workspaceRelativePathOf("C:\\repo\\app\\src\\page.tsx", "c:/repo/app")).toBe(
       "src/page.tsx",
     );
+  });
+
+  it("does not derive relative paths across Windows drives", () => {
+    expect(workspaceRelativePathOf("D:\\repo\\app\\src\\page.tsx", "C:\\repo\\app")).toBeNull();
+  });
+
+  it("handles UNC descendants without accepting sibling, share, or server escapes", () => {
+    const workspaceRoot = "\\\\server\\share\\workspace";
+
+    expect(
+      workspaceRelativePathOf(
+        "\\\\server\\share\\workspace\\src\\page.tsx",
+        workspaceRoot,
+      ),
+    ).toBe("src/page.tsx");
+    expect(
+      workspaceRelativePathOf(
+        "\\\\server\\share\\workspace-other\\page.tsx",
+        workspaceRoot,
+      ),
+    ).toBeNull();
+    expect(
+      workspaceRelativePathOf(
+        "\\\\server\\other-share\\workspace\\page.tsx",
+        workspaceRoot,
+      ),
+    ).toBeNull();
+    expect(
+      workspaceRelativePathOf(
+        "\\\\backup-server\\share\\workspace\\page.tsx",
+        workspaceRoot,
+      ),
+    ).toBeNull();
   });
 
   it("returns null for empty inputs", () => {
