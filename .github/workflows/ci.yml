@@ -139,11 +139,15 @@ jobs:
           src/desktopIdentityProof.test.ts
           src/windowsCertificate.test.ts
 
-      - name: Run Windows desktop shutdown and restart regressions
+      - name: Run Windows desktop shutdown regressions
         run: >-
           bun run --cwd apps/desktop test
           src/backendShutdown.test.ts
           src/backendShutdown.windows.integration.test.ts
+
+      - name: Run Windows desktop restart regressions
+        run: >-
+          bun run --cwd apps/desktop test
           src/backendRestartController.test.ts
           src/backendStartupReadiness.test.ts
           src/rotatingFileSink.test.ts
