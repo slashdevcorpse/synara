@@ -1085,7 +1085,7 @@
             {
               "status": "downstream-only",
               "date": "2026-07-19",
-              "evidence": "Shared snapshot polling introduced at 74a8ef37b3fe83524ad0302543dc6adcd2df0fb6 in PR 25 and load-hardened at ace6d4752876ace86c3a18b78a792130b1d77b3a",
+              "evidence": "Shared snapshot polling introduced at 74a8ef37b3fe83524ad0302543dc6adcd2df0fb6 in PR 25, load-hardened at ace6d4752876ace86c3a18b78a792130b1d77b3a, and kept aligned with the extracted subprocess inspector by 55823949107913304c4d3a05f635280a4e1ae9f1",
             },
           ],
       },
@@ -1331,6 +1331,8 @@
         "introducingCommit": "d5ae5ec1148f6e7153c8705e3bad17a908626b32",
         "touchedFiles":
           [
+            "apps/server/src/agentGateway/targetResolver.test.ts",
+            "apps/server/src/agentGateway/targetResolver.ts",
             "apps/server/src/persistence/modelSelectionCompatibility.test.ts",
             "apps/server/src/persistence/modelSelectionCompatibility.ts",
             "apps/server/src/profileStats.ts",
@@ -1396,6 +1398,7 @@
           ["command-code", "providers", "model-selection", "settings", "composer", "contracts"],
         "regressionTests":
           [
+            "apps/server/src/agentGateway/targetResolver.test.ts",
             "apps/server/src/persistence/modelSelectionCompatibility.test.ts",
             "apps/server/src/provider/Layers/CommandCodeAdapter.test.ts",
             "apps/server/src/provider/Layers/ProviderAdapterRegistry.test.ts",
@@ -1425,7 +1428,7 @@
             "packages/shared/src/model.test.ts",
           ],
         "upstreamLinks": ["https://github.com/slashdevcorpse/synara/pull/30"],
-        "overlapResolutionPolicy": "Port Command Code into the frozen upstream's extracted composer-draft, store-normalization, model-catalog, and settings-panel architecture; do not restore obsolete monolithic stores or settings. Register its adapter independently while retaining agent-gateway credential provisioning only for providers that require it.",
+        "overlapResolutionPolicy": "Port Command Code into the frozen upstream's extracted composer-draft, store-normalization, model-catalog, and settings-panel architecture; do not restore obsolete monolithic stores or settings. Register its adapter independently, model its agent-gateway target as model-only without borrowing another provider's option knobs, and retain credential provisioning only for providers that require it.",
         "lastAssessedUpstreamSha": "1664ce2f152cd6131a30d1ee8d7c9b60235bb0fe",
         "verificationDate": "2026-07-20",
         "retirementCondition": "Retire after upstream includes an equivalent standalone Command Code provider with permanent server, contract, settings, model, composer, and lifecycle coverage.",
@@ -1434,7 +1437,7 @@
             {
               "status": "downstream-only",
               "date": "2026-07-20",
-              "evidence": "Standalone Command Code provider merged in downstream PR 30 at d5ae5ec1148f6e7153c8705e3bad17a908626b32",
+              "evidence": "Standalone Command Code provider merged in downstream PR 30 at d5ae5ec1148f6e7153c8705e3bad17a908626b32; model-only agent-gateway target coverage was completed at 55823949107913304c4d3a05f635280a4e1ae9f1",
             },
           ],
       },
