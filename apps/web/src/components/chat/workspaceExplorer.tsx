@@ -17,11 +17,8 @@ import {
   forwardRef,
 } from "react";
 
-import {
-  CHAT_FILE_REFERENCE_DRAG_TYPE,
-  formatChatFileReference,
-  type ChatFileReference,
-} from "~/lib/chatReferences";
+import type { ChatFileReference } from "~/lib/chatReferences";
+import { setComposerFileReferenceDragData as setFileReferenceDragData } from "~/lib/composerFileReferenceDrag";
 import { splitRepoRelativePath } from "~/lib/diffRendering";
 import { showFileReferenceContextMenu } from "~/lib/fileReferenceContextMenu";
 import {
@@ -71,12 +68,7 @@ const EMPTY_WORKSPACE_SEARCH_FILE_MATCHES: ReadonlyArray<ProjectEntry> = [];
 const EXPLORER_SIDEBAR_CONTAINER_CLASS =
   "flex min-h-[11rem] w-full shrink-0 flex-col border-b border-border/65 bg-[var(--color-background-surface)] lg:h-full lg:w-56 lg:border-b-0 lg:border-r";
 
-// Marks the drag payload so the chat composer can accept it as a reference.
-export function setFileReferenceDragData(dataTransfer: DataTransfer, path: string): void {
-  dataTransfer.effectAllowed = "copy";
-  dataTransfer.setData(CHAT_FILE_REFERENCE_DRAG_TYPE, formatChatFileReference({ path }));
-  dataTransfer.setData("text/plain", path);
-}
+export { setComposerFileReferenceDragData as setFileReferenceDragData } from "~/lib/composerFileReferenceDrag";
 
 function shouldShowExplorerEntry(entry: ProjectFileSystemEntry): boolean {
   if (entry.kind !== "directory") {
