@@ -14,7 +14,12 @@ import { dirname, extname, join, resolve } from "node:path";
 import pathWin32 from "node:path/win32";
 
 import { EDITORS, type EditorId } from "@synara/contracts";
-import { prepareWindowsSafeProcess, resolveWindowsSystemRoot } from "@synara/shared/windowsProcess";
+import {
+  normalizeWindowsChildEnvironment,
+  prepareWindowsSafeProcess,
+  readEffectiveWindowsEnvironmentValue,
+  resolveWindowsSystemRoot,
+} from "@synara/shared/windowsProcess";
 import { ServiceMap, Schema, Effect, Layer } from "effect";
 import {
   getEditorMacApplications,
@@ -316,9 +321,10 @@ export function resolveWindowsEditorUriLaunch(
 ): EditorLaunch | null {
   const scheme = getEditorWindowsUriScheme(editor);
   if (platform !== "win32" || !scheme) return null;
+  const childEnv = normalizeWindowsChildEnvironment(env);
 
   return {
-    command: pathWin32.join(resolveWindowsSystemRoot(env), "explorer.exe"),
+    command: pathWin32.join(resolveWindowsSystemRoot(childEnv), "explorer.exe"),
     args: [resolveWindowsEditorUri(scheme, target)],
   };
 }
@@ -333,16 +339,22 @@ export function resolveEffectiveEnvironmentValue(
   requestedName: string,
   platform: NodeJS.Platform = process.platform,
 ): string | undefined {
-  if (platform !== "win32") return env[requestedName];
-  const normalizedName = requestedName.toUpperCase();
-  const effectiveName = Object.keys(env)
-    .filter((name) => name.toUpperCase() === normalizedName)
-    .sort((left, right) => (left < right ? -1 : left > right ? 1 : 0))[0];
-  return effectiveName === undefined ? undefined : env[effectiveName];
+  return platform === "win32"
+    ? readEffectiveWindowsEnvironmentValue(env, requestedName)
+    : env[requestedName];
 }
 
 function resolvePathEnvironmentVariable(env: NodeJS.ProcessEnv, platform: NodeJS.Platform): string {
-  return resolveEffectiveEnvironmentValue(env, "PATH", platform) ?? "";
+  return platform === "win32"
+    ? (resolveEffectiveEnvironmentValue(env, "PATH", platform) ?? "")
+    : (env.PATH ?? env.Path ?? env.path ?? "");
+}
+
+function normalizeEnvironmentForPlatform(
+  env: NodeJS.ProcessEnv,
+  platform: NodeJS.Platform,
+): NodeJS.ProcessEnv {
+  return platform === "win32" ? normalizeWindowsChildEnvironment(env) : env;
 }
 
 function resolveWindowsPathExtensions(env: NodeJS.ProcessEnv): ReadonlyArray<string> {
@@ -415,7 +427,7 @@ export function isCommandAvailable(
   options: CommandAvailabilityOptions = {},
 ): boolean {
   const platform = options.platform ?? process.platform;
-  const env = options.env ?? process.env;
+  const env = normalizeEnvironmentForPlatform(options.env ?? process.env, platform);
   const windowsPathExtensions = platform === "win32" ? resolveWindowsPathExtensions(env) : [];
   const commandCandidates = resolveCommandCandidates(command, platform, windowsPathExtensions);
 
@@ -447,31 +459,38 @@ export function resolveAvailableEditors(
   env: NodeJS.ProcessEnv = process.env,
   options: ResolveAvailableEditorsOptions = {},
 ): ReadonlyArray<EditorId> {
+  const effectiveEnv = normalizeEnvironmentForPlatform(env, platform);
   const available: EditorId[] = [];
   const lookupWindowsStorePackage =
     options.lookupWindowsStorePackage ?? resolveWindowsStorePackageInstallLocation;
 
   for (const editor of EDITORS) {
     if (editor.commands !== null) {
-      if (resolveAvailableCommand(editor.commands, { platform, env }) !== null) {
+      if (resolveAvailableCommand(editor.commands, { platform, env: effectiveEnv }) !== null) {
         available.push(editor.id);
         continue;
       }
     }
 
-    if (resolveAvailableMacApplication(getEditorMacApplications(editor), platform, env) !== null) {
+    if (
+      resolveAvailableMacApplication(getEditorMacApplications(editor), platform, effectiveEnv) !==
+      null
+    ) {
       available.push(editor.id);
       continue;
     }
 
-    if (lookupWindowsStorePackage(getEditorWindowsStorePackages(editor), platform, env) !== null) {
+    if (
+      lookupWindowsStorePackage(getEditorWindowsStorePackages(editor), platform, effectiveEnv) !==
+      null
+    ) {
       available.push(editor.id);
       continue;
     }
 
     if (editor.id === "file-manager") {
       const command = fileManagerCommandForPlatform(platform);
-      if (isCommandAvailable(command, { platform, env })) {
+      if (isCommandAvailable(command, { platform, env: effectiveEnv })) {
         available.push(editor.id);
       }
     }
@@ -518,7 +537,7 @@ export function resolveEditorDiscoveryIdentity(
   options: Pick<EditorDiscoveryOptions, "platform" | "env" | "cwd"> = {},
 ): string {
   const platform = options.platform ?? process.platform;
-  const env = options.env ?? process.env;
+  const env = normalizeEnvironmentForPlatform(options.env ?? process.env, platform);
   const cwd = options.cwd ?? process.cwd();
   const read = (name: string) => resolveEffectiveEnvironmentValue(env, name, platform) ?? null;
   const source = JSON.stringify({
@@ -570,7 +589,7 @@ export async function discoverAvailableEditors(
   options: EditorDiscoveryOptions = {},
 ): Promise<EditorDiscoveryResult> {
   const platform = options.platform ?? process.platform;
-  const env = options.env ?? process.env;
+  const env = normalizeEnvironmentForPlatform(options.env ?? process.env, platform);
   const cwd = options.cwd ?? process.cwd();
   const signal = options.signal;
   let fileSystemOperations = 0;
@@ -765,13 +784,18 @@ export const resolveEditorLaunch = Effect.fnUntraced(function* (
   platform: NodeJS.Platform = process.platform,
   env: NodeJS.ProcessEnv = process.env,
 ): Effect.fn.Return<EditorLaunch, OpenError> {
+  const effectiveEnv = normalizeEnvironmentForPlatform(env, platform);
   const editorDef = EDITORS.find((editor) => editor.id === input.editor);
   if (!editorDef) {
     return yield* new OpenError({ message: `Unknown editor: ${input.editor}` });
   }
 
   const preferredMacApplication = shouldPreferMacApplicationLaunch(editorDef, platform)
-    ? (resolveAvailableMacApplication(getEditorMacApplications(editorDef), platform, env) ??
+    ? (resolveAvailableMacApplication(
+        getEditorMacApplications(editorDef),
+        platform,
+        effectiveEnv,
+      ) ??
       (shouldUseImplicitMacApplicationFallback(editorDef)
         ? (getEditorMacApplications(editorDef)?.[0] ?? null)
         : null))
@@ -784,7 +808,7 @@ export const resolveEditorLaunch = Effect.fnUntraced(function* (
   }
 
   if (editorDef.commands) {
-    const command = resolveAvailableCommand(editorDef.commands, { platform, env });
+    const command = resolveAvailableCommand(editorDef.commands, { platform, env: effectiveEnv });
     if (command) {
       return {
         command,
@@ -793,13 +817,18 @@ export const resolveEditorLaunch = Effect.fnUntraced(function* (
     }
   }
 
-  const windowsUriLaunch = resolveWindowsEditorUriLaunch(editorDef, input.cwd, platform, env);
+  const windowsUriLaunch = resolveWindowsEditorUriLaunch(
+    editorDef,
+    input.cwd,
+    platform,
+    effectiveEnv,
+  );
   if (windowsUriLaunch) {
     return windowsUriLaunch;
   }
 
   const macApplication =
-    resolveAvailableMacApplication(getEditorMacApplications(editorDef), platform, env) ??
+    resolveAvailableMacApplication(getEditorMacApplications(editorDef), platform, effectiveEnv) ??
     (platform === "darwin" ? (getEditorMacApplications(editorDef)?.[0] ?? null) : null);
   if (macApplication) {
     return {

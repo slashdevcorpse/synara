@@ -12,7 +12,11 @@ import pathWin32 from "node:path/win32";
 import type { Readable } from "node:stream";
 
 import { EDITORS } from "@synara/contracts";
-import { resolveWindowsSystemRoot } from "@synara/shared/windowsProcess";
+import {
+  normalizeWindowsChildEnvironment,
+  readEffectiveWindowsEnvironmentValue,
+  resolveWindowsSystemRoot,
+} from "@synara/shared/windowsProcess";
 
 export type EditorDefinition = (typeof EDITORS)[number];
 
@@ -271,8 +275,11 @@ function resolvePowerShellCacheKey(
   return JSON.stringify({
     platform,
     families,
-    path: env.PATH ?? env.Path ?? env.path ?? "",
-    systemRoot: env.SystemRoot ?? env.WINDIR ?? "",
+    path: readEffectiveWindowsEnvironmentValue(env, "PATH") ?? "",
+    systemRoot:
+      readEffectiveWindowsEnvironmentValue(env, "SystemRoot") ??
+      readEffectiveWindowsEnvironmentValue(env, "WINDIR") ??
+      "",
   });
 }
 
@@ -311,7 +318,7 @@ function buildBulkPowerShellPackageScript(
     `$packageDefs = ${packageArray}`,
     "$results = @()",
     "foreach ($packageDef in $packageDefs) {",
-    "  $package = Get-AppxPackage -Name $packageDef.Name -ErrorAction SilentlyContinue | " +
+    "  $package = Get-AppxPackage -Name $packageDef.Name -ErrorAction Stop | " +
       "Where-Object { $_.PackageFamilyName -ieq $packageDef.Family } | Select-Object -First 1",
     "  if ($null -ne $package -and $package.InstallLocation) {",
     "    $results += [PSCustomObject]@{ Family = $package.PackageFamilyName; InstallLocation = $package.InstallLocation }",
@@ -373,7 +380,7 @@ export async function discoverWindowsStorePackageInstallLocations(
     return { status: "failure", category: "cancelled", subprocessCount: 0 };
   }
 
-  const env = options.env ?? process.env;
+  const env = normalizeWindowsChildEnvironment(options.env ?? process.env);
   const powershellPath = pathWin32.join(
     resolveWindowsSystemRoot(env),
     "System32",
@@ -526,10 +533,11 @@ export function resolveWindowsStorePackageDirectoryFromPowerShell(
 
   const packageDefs = uniqueWindowsStorePackageDefinitions(packages);
   if (packageDefs.length === 0) return null;
+  const childEnv = normalizeWindowsChildEnvironment(env);
 
   const now = options.now?.() ?? Date.now();
   const useCache = options.useCache ?? execFile === execFileSync;
-  const cacheKey = useCache ? resolvePowerShellCacheKey(packageDefs, platform, env) : null;
+  const cacheKey = useCache ? resolvePowerShellCacheKey(packageDefs, platform, childEnv) : null;
   if (cacheKey) {
     const cached = readPowerShellAppxLookupCache(cacheKey, now);
     if (cached !== undefined) return cached;
@@ -559,7 +567,7 @@ export function resolveWindowsStorePackageDirectoryFromPowerShell(
   try {
     const stdout = execFile("powershell.exe", ["-NoProfile", "-Command", script], {
       encoding: "utf8",
-      env,
+      env: childEnv,
       stdio: ["ignore", "pipe", "ignore"],
       timeout: POWERSHELL_APPX_LOOKUP_TIMEOUT_MS,
       windowsHide: true,

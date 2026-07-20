@@ -3,7 +3,7 @@
 // Layer: Shared Node runtime utility tests
 
 import { spawnSync as spawnChildSync } from "node:child_process";
-import { copyFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as Path from "node:path";
 
@@ -15,11 +15,14 @@ import {
   createWindowsCommandDiscoveryCache,
   getWindowsCommandDiscoveryCacheStats,
   isWindowsBatchCommand,
+  normalizeWindowsChildEnvironment,
   prepareResolvedWindowsSafeProcess,
   prepareWindowsSafeProcess,
+  readEffectiveWindowsEnvironmentValue,
   resolveWindowsCommandCandidates,
   resolveWindowsCommandPath,
   resolveWindowsComSpec,
+  resolveWindowsSystemRoot,
   type WindowsCommandDiscoveryObservation,
 } from "./windowsProcess";
 
@@ -27,6 +30,60 @@ describe("windowsProcess", () => {
   afterEach(() => {
     clearWindowsCommandDiscoveryCache();
     vi.restoreAllMocks();
+  });
+
+  it("normalizes Windows child environments by defined ordinal winners without mutation", () => {
+    const caller = {
+      Path: "C:\\mixed",
+      path: "C:\\lower",
+      PaTh: "C:\\alternating",
+      PATH: "C:\\upper",
+      PathExt: ".BAD",
+      PATHEXT: "",
+      SystemRoot: "C:\\discarded-windows",
+      SYSTEMROOT: "D:\\Windows",
+      ComSpec: "C:\\discarded-cmd.exe",
+      COMSPEC: "",
+      INVALID: " value with spaces ",
+      UNDEFINED: undefined,
+      İD: "capital-dotted",
+      "i\u0307d": "combining-dot",
+    } satisfies NodeJS.ProcessEnv;
+    const before = { ...caller };
+
+    const normalized = normalizeWindowsChildEnvironment(caller);
+
+    expect(normalized).not.toBe(caller);
+    expect(caller).toEqual(before);
+    expect(Object.keys(normalized).filter((name) => name.toUpperCase() === "PATH")).toEqual([
+      "PATH",
+    ]);
+    expect(readEffectiveWindowsEnvironmentValue(normalized, "PATH")).toBe("C:\\upper");
+    expect(readEffectiveWindowsEnvironmentValue(normalized, "PATHEXT")).toBe("");
+    expect(resolveWindowsSystemRoot(normalized)).toBe("D:\\Windows");
+    expect(resolveWindowsComSpec(normalized)).toBe("D:\\Windows\\System32\\cmd.exe");
+    expect(normalized.INVALID).toBe(" value with spaces ");
+    expect(normalized.UNDEFINED).toBeUndefined();
+    expect(normalized["İD"]).toBe("capital-dotted");
+    expect(normalized["i\u0307d"]).toBe("combining-dot");
+  });
+
+  it("selects the first defined alias when the ordinal uppercase spelling is undefined", () => {
+    const caller = {
+      path: "C:\\lower",
+      Path: "C:\\mixed",
+      PATH: undefined,
+      PaTh: "C:\\alternating",
+    } satisfies NodeJS.ProcessEnv;
+
+    expect(normalizeWindowsChildEnvironment(caller)).toEqual({ PaTh: "C:\\alternating" });
+    expect(readEffectiveWindowsEnvironmentValue(caller, "PATH")).toBe("C:\\alternating");
+    expect(caller).toEqual({
+      path: "C:\\lower",
+      Path: "C:\\mixed",
+      PATH: undefined,
+      PaTh: "C:\\alternating",
+    });
   });
 
   it("leaves non-Windows commands shell-free and otherwise unchanged", () => {
@@ -508,6 +565,44 @@ describe("windowsProcess", () => {
       ]);
     });
 
+    it("shares cwd cache identity across trailing separators while preserving roots", () => {
+      const commandDiscoveryCache = createWindowsCommandDiscoveryCache();
+      const spawnSync = vi.fn(() => ({ stdout: `${resolvedCommand}\r\n`, status: 0 }));
+      const resolveAt = (command: string, workingDirectory: string) =>
+        resolveWindowsCommandCandidates(command, {
+          platform: "win32",
+          cwd: workingDirectory,
+          env,
+          spawnSync,
+          commandDiscoveryCache,
+        });
+
+      resolveAt("codex", "C:\\x");
+      resolveAt("codex", "C:\\x\\");
+      resolveAt("root-tool", "C:\\");
+      resolveAt("root-tool", "C:\\\\");
+
+      expect(spawnSync).toHaveBeenCalledTimes(2);
+      expect(getWindowsCommandDiscoveryCacheStats(commandDiscoveryCache)).toEqual({ size: 2 });
+    });
+
+    it("keeps quoted and whitespace-wrapped invalid cwd values cache-distinct", () => {
+      const commandDiscoveryCache = createWindowsCommandDiscoveryCache();
+      const spawnSync = vi.fn(() => ({ stdout: `${resolvedCommand}\r\n`, status: 0 }));
+      for (const workingDirectory of ["C:\\x", '"C:\\x"', " C:\\x "]) {
+        resolveWindowsCommandCandidates("codex", {
+          platform: "win32",
+          cwd: workingDirectory,
+          env,
+          spawnSync,
+          commandDiscoveryCache,
+        });
+      }
+
+      expect(spawnSync).toHaveBeenCalledTimes(3);
+      expect(getWindowsCommandDiscoveryCacheStats(commandDiscoveryCache)).toEqual({ size: 3 });
+    });
+
     it("expires positive results after 30 seconds", () => {
       let now = 0;
       const commandDiscoveryCache = createWindowsCommandDiscoveryCache({ now: () => now });
@@ -962,7 +1057,8 @@ describe("windowsProcess", () => {
                   candidate.whereExe === whereExe &&
                   candidate.command === args[0] &&
                   candidate.cwd === options.cwd &&
-                  candidate.env === options.env,
+                  JSON.stringify(normalizeWindowsChildEnvironment(candidate.env)) ===
+                    JSON.stringify(options.env),
               );
               if (!variant) throw new Error(`Unexpected launcher input for ${collision.name}`);
               return variant.result;
@@ -1036,13 +1132,13 @@ describe("windowsProcess", () => {
         1,
         "D:\\effective-root\\System32\\where.exe",
         ["codex"],
-        expect.objectContaining({ env: canonicalFirst }),
+        expect.objectContaining({ env: normalizeWindowsChildEnvironment(canonicalFirst) }),
       );
       expect(spawnSync).toHaveBeenNthCalledWith(
         2,
         "D:\\effective-root\\System32\\where.exe",
         ["codex"],
-        expect.objectContaining({ env: uppercaseFirst }),
+        expect.objectContaining({ env: normalizeWindowsChildEnvironment(uppercaseFirst) }),
       );
     });
 
@@ -1089,7 +1185,7 @@ describe("windowsProcess", () => {
       expect(spawnSync).toHaveBeenCalledWith(
         "D:\\effective-root\\System32\\where.exe",
         ["codex"],
-        expect.objectContaining({ env: firstEnv }),
+        expect.objectContaining({ env: normalizeWindowsChildEnvironment(firstEnv) }),
       );
     });
 
@@ -1133,13 +1229,13 @@ describe("windowsProcess", () => {
         1,
         "D:\\effective-root\\System32\\where.exe",
         ["codex"],
-        expect.objectContaining({ env: firstEnv }),
+        expect.objectContaining({ env: normalizeWindowsChildEnvironment(firstEnv) }),
       );
       expect(spawnSync).toHaveBeenNthCalledWith(
         2,
         "E:\\effective-root\\System32\\where.exe",
         ["codex"],
-        expect.objectContaining({ env: changedEffectiveEnv }),
+        expect.objectContaining({ env: normalizeWindowsChildEnvironment(changedEffectiveEnv) }),
       );
     });
 
@@ -1238,6 +1334,103 @@ describe("windowsProcess", () => {
         }
       }
     });
+
+    it.runIf(process.platform === "win32")(
+      "normalizes duplicate child keys before real where.exe lookup and caching",
+      () => {
+        const root = mkdtempSync(Path.join(tmpdir(), "synara-normalized-child-env-"));
+        const winnerBin = Path.join(root, "winner-bin");
+        const discardedBin = Path.join(root, "discarded-bin");
+        const workingDirectory = Path.join(root, "cwd");
+        const command = "synara-normalized-environment-probe";
+        const candidate = Path.join(winnerBin, `${command}.cmd`);
+        const systemRoot = process.env.SystemRoot ?? process.env.SYSTEMROOT ?? "C:\\Windows";
+        const comSpec = process.env.ComSpec ?? Path.join(systemRoot, "System32", "cmd.exe");
+        mkdirSync(winnerBin, { recursive: true });
+        mkdirSync(discardedBin, { recursive: true });
+        mkdirSync(workingDirectory, { recursive: true });
+        writeFileSync(candidate, "@echo off\r\n");
+
+        const caller = {
+          Path: discardedBin,
+          path: discardedBin,
+          PaTh: discardedBin,
+          PATH: winnerBin,
+          PathExt: ".EXE",
+          PATHEXT: ".CMD",
+          SystemRoot: "C:\\discarded-root",
+          SYSTEMROOT: systemRoot,
+          ComSpec: "C:\\discarded-cmd.exe",
+          COMSPEC: comSpec,
+        } satisfies NodeJS.ProcessEnv;
+        const callerBefore = { ...caller };
+        const reverseCaller = Object.fromEntries(Object.entries(caller).reverse());
+        const reverseBefore = { ...reverseCaller };
+        const cache = createWindowsCommandDiscoveryCache();
+        const observations: WindowsCommandDiscoveryObservation[] = [];
+        const childEnvironments: NodeJS.ProcessEnv[] = [];
+        const spawnSync = (
+          whereCommand: string,
+          args: ReadonlyArray<string>,
+          options: Parameters<typeof spawnChildSync>[2],
+        ) => {
+          childEnvironments.push({ ...(options?.env ?? {}) });
+          return spawnChildSync(whereCommand, [...args], options);
+        };
+        const resolve = (childEnv: NodeJS.ProcessEnv) =>
+          resolveWindowsCommandCandidates(command, {
+            platform: "win32",
+            cwd: workingDirectory,
+            env: childEnv,
+            spawnSync,
+            commandDiscoveryCache: cache,
+            onCommandDiscovery: (observation) => observations.push(observation),
+          });
+
+        try {
+          const first = resolve(caller);
+          const reverse = resolve(reverseCaller);
+          const discardedChanged = resolve({ ...caller, Path: `${discardedBin}-changed` });
+          const changedWinner = { ...caller, PATH: discardedBin, Path: winnerBin };
+          const miss = resolve(changedWinner);
+          const reverseMiss = resolve(Object.fromEntries(Object.entries(changedWinner).reverse()));
+
+          expect(first).toHaveLength(1);
+          expect(reverse).toEqual(first);
+          expect(discardedChanged).toEqual(first);
+          const expectedIdentity = statSync(candidate, { bigint: true });
+          const actualIdentity = statSync(first[0]!, { bigint: true });
+          expect({ dev: actualIdentity.dev, ino: actualIdentity.ino }).toEqual({
+            dev: expectedIdentity.dev,
+            ino: expectedIdentity.ino,
+          });
+          expect(miss).toEqual([]);
+          expect(reverseMiss).toEqual([]);
+          expect(observations).toEqual([
+            { outcome: "resolved", source: "where" },
+            { outcome: "resolved", source: "cache" },
+            { outcome: "resolved", source: "cache" },
+            { outcome: "not_found", source: "where" },
+            { outcome: "not_found", source: "cache" },
+          ]);
+          expect(childEnvironments).toHaveLength(2);
+          expect(
+            childEnvironments.map((childEnv) =>
+              Object.keys(childEnv).filter((name) => name.toUpperCase() === "PATH"),
+            ),
+          ).toEqual([["PATH"], ["PATH"]]);
+          expect(childEnvironments.map((childEnv) => childEnv.PATH)).toEqual([
+            winnerBin,
+            discardedBin,
+          ]);
+          expect(caller).toEqual(callerBefore);
+          expect(reverseCaller).toEqual(reverseBefore);
+        } finally {
+          rmSync(root, { force: true, recursive: true });
+        }
+      },
+      20_000,
+    );
 
     it.runIf(process.platform === "win32")(
       "matches native where.exe PATHEXT collisions in both cache lookup orders",

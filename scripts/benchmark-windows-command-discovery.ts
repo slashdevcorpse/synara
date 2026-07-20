@@ -22,6 +22,13 @@ import pathWin32 from "node:path/win32";
 import { pathToFileURL } from "node:url";
 
 import { Effect } from "effect";
+import {
+  createWindowsCommandDiscoveryCache,
+  getWindowsCommandDiscoveryCacheStats,
+  normalizeWindowsChildEnvironment,
+  resolveWindowsCommandCandidates,
+  type WindowsCommandDiscoveryObservation,
+} from "../packages/shared/src/windowsProcess.ts";
 
 const PR397_HEAD_SHA = "7c39415c16415224253c376c8e85df74489596b8";
 const DEFAULT_WARMUPS = 5;
@@ -111,6 +118,12 @@ export interface BenchmarkSample {
   readonly statusCategory: string;
 }
 
+export type CommandDiscoveryFixtureOutcome =
+  | "resolved_exe"
+  | "resolved_cmd"
+  | "not_found"
+  | "transient";
+
 export interface BenchmarkSummary {
   readonly samples: number;
   readonly subprocessCount: number;
@@ -187,19 +200,37 @@ interface NodeRuntimeEvidence {
 export interface NodeDuplicateEnvironmentOracle {
   readonly launcherRuntime: { readonly name: "bun"; readonly version: string };
   readonly expectedRuntime: NodeRuntimeEvidence;
-  readonly parentLaunchEnvironment: {
-    readonly bunConstructedDuplicateKeyCount: number;
-    readonly serializerObservedDuplicateKeyCount: number;
+  readonly rawCallerEnvironment: {
+    readonly pathKeys: readonly string[];
+    readonly duplicateKeyCount: number;
+    readonly valueSha256ByKey: Readonly<Record<string, string>>;
+  };
+  readonly normalizedChildEnvironment: {
+    readonly pathKeys: readonly string[];
+    readonly duplicateKeyCount: number;
+    readonly effectiveKey: string | null;
+    readonly effectiveValueSha256: string | null;
+    readonly reverseInsertionEquivalent: boolean;
   };
   readonly serializerRuntime: NodeRuntimeEvidence;
-  readonly serializerInputEnvironment: {
-    readonly pathKeyCount: number;
+  readonly serializerObservedEnvironment: {
+    readonly pathKeys: readonly string[];
     readonly duplicateKeyCount: number;
+    readonly effectiveKey: string | null;
+    readonly effectiveValueSha256: string | null;
   };
-  readonly observerRuntime: NodeRuntimeEvidence;
-  readonly observedKeys: readonly string[];
-  readonly effectiveKey: string | null;
-  readonly effectiveValueSha256: string | null;
+  readonly commandDiscovery: {
+    readonly winningCandidates: readonly string[];
+    readonly reverseInsertionCandidates: readonly string[];
+    readonly discardedAliasCandidates: readonly string[];
+    readonly changedWinnerCandidates: readonly string[];
+    readonly reverseChangedWinnerCandidates: readonly string[];
+    readonly observations: readonly WindowsCommandDiscoveryObservation[];
+    readonly whereSubprocessCount: number;
+    readonly cacheSize: number;
+    readonly callerUnchanged: boolean;
+    readonly reverseCallerUnchanged: boolean;
+  };
   readonly expectedKey: "PATH";
   readonly expectedValueSha256: string;
   readonly passed: boolean;
@@ -344,6 +375,29 @@ export function summarizeSamples(samples: readonly BenchmarkSample[]): Benchmark
   };
 }
 
+export function assertExpectedCommandDiscoveryCandidates(input: {
+  readonly actual: readonly string[];
+  readonly outcome: CommandDiscoveryFixtureOutcome;
+  readonly exeCandidate: string;
+  readonly cmdCandidate: string;
+  readonly context?: string;
+}): void {
+  const expected =
+    input.outcome === "resolved_exe"
+      ? [input.exeCandidate]
+      : input.outcome === "resolved_cmd"
+        ? [input.cmdCandidate]
+        : [];
+  if (
+    input.actual.length !== expected.length ||
+    input.actual.some((candidate, index) => candidate !== expected[index])
+  ) {
+    throw new Error(
+      `${input.context ?? "command discovery sample"} returned ${JSON.stringify(input.actual)}; expected ${JSON.stringify(expected)} for ${input.outcome}.`,
+    );
+  }
+}
+
 export function alternatingVersionOrder(
   index: number,
 ): readonly ["base", "candidate"] | readonly ["candidate", "base"] {
@@ -461,7 +515,7 @@ export function evaluateBenchmarkGates(
     {
       name: "node_duplicate_environment_oracle",
       passed: structural.nodeEnvironmentOraclePassed,
-      detail: "Node parent serialized duplicate keys and Node child observed PATH/upper",
+      detail: "duplicate caller keys normalized to one PATH child with real where/cache proof",
     },
   ];
 }
@@ -1086,7 +1140,7 @@ function commandInput(input: {
   readonly cache: unknown;
   readonly env: NodeJS.ProcessEnv;
   readonly cwd: string;
-  readonly outcome: "resolved_exe" | "resolved_cmd" | "not_found" | "transient";
+  readonly outcome: CommandDiscoveryFixtureOutcome;
   readonly fixture: BenchmarkFixture;
   readonly counter: { value: number };
 }): Record<string, unknown> {
@@ -1140,7 +1194,7 @@ function makeCommandScenario(
     readonly env?: NodeJS.ProcessEnv;
     readonly cwd?: string;
     readonly command?: string;
-    readonly outcome?: "resolved_exe" | "resolved_cmd" | "not_found" | "transient";
+    readonly outcome?: CommandDiscoveryFixtureOutcome;
     readonly counter: { value: number };
   }) => {
     const outcome = input.outcome ?? "resolved_exe";
@@ -1155,6 +1209,13 @@ function makeCommandScenario(
         counter: input.counter,
       }),
     );
+    assertExpectedCommandDiscoveryCandidates({
+      actual: result,
+      outcome,
+      exeCandidate: fixture.exeCandidate,
+      cmdCandidate: fixture.cmdCandidate,
+      context: `${runtime.label} ${name}`,
+    });
     return {
       result,
       status:
@@ -1500,6 +1561,7 @@ function runtimeMatchesExpected(
 export function evaluateNodeDuplicateEnvironmentOracle(
   input: Omit<NodeDuplicateEnvironmentOracle, "passed">,
 ): boolean {
+  const expectedCandidate = "winner-bin/synara-node-environment-oracle.cmd";
   return (
     input.launcherRuntime.name === "bun" &&
     input.launcherRuntime.version.length > 0 &&
@@ -1507,19 +1569,45 @@ export function evaluateNodeDuplicateEnvironmentOracle(
     input.expectedRuntime.version.length > 0 &&
     /^[0-9a-f]{64}$/.test(input.expectedRuntime.execPathSha256) &&
     runtimeMatchesExpected(input.serializerRuntime, input.expectedRuntime) &&
-    runtimeMatchesExpected(input.observerRuntime, input.expectedRuntime) &&
-    input.parentLaunchEnvironment.bunConstructedDuplicateKeyCount === 0 &&
-    input.parentLaunchEnvironment.serializerObservedDuplicateKeyCount === 0 &&
-    input.serializerInputEnvironment.pathKeyCount === 2 &&
-    input.serializerInputEnvironment.duplicateKeyCount === 1 &&
-    input.observedKeys.length === 1 &&
-    input.observedKeys[0] === input.expectedKey &&
-    input.effectiveKey === input.expectedKey &&
-    input.effectiveValueSha256 === input.expectedValueSha256
+    input.rawCallerEnvironment.duplicateKeyCount === 1 &&
+    input.rawCallerEnvironment.pathKeys.join("\0") === "PATH\0Path" &&
+    input.rawCallerEnvironment.valueSha256ByKey.PATH === input.expectedValueSha256 &&
+    input.rawCallerEnvironment.valueSha256ByKey.Path !== input.expectedValueSha256 &&
+    input.normalizedChildEnvironment.duplicateKeyCount === 0 &&
+    input.normalizedChildEnvironment.pathKeys.length === 1 &&
+    input.normalizedChildEnvironment.pathKeys[0] === input.expectedKey &&
+    input.normalizedChildEnvironment.effectiveKey === input.expectedKey &&
+    input.normalizedChildEnvironment.effectiveValueSha256 === input.expectedValueSha256 &&
+    input.normalizedChildEnvironment.reverseInsertionEquivalent &&
+    input.serializerObservedEnvironment.duplicateKeyCount === 0 &&
+    input.serializerObservedEnvironment.pathKeys.length === 1 &&
+    input.serializerObservedEnvironment.pathKeys[0] === input.expectedKey &&
+    input.serializerObservedEnvironment.effectiveKey === input.expectedKey &&
+    input.serializerObservedEnvironment.effectiveValueSha256 === input.expectedValueSha256 &&
+    input.commandDiscovery.winningCandidates.join("\0") === expectedCandidate &&
+    input.commandDiscovery.reverseInsertionCandidates.join("\0") === expectedCandidate &&
+    input.commandDiscovery.discardedAliasCandidates.join("\0") === expectedCandidate &&
+    input.commandDiscovery.changedWinnerCandidates.length === 0 &&
+    input.commandDiscovery.reverseChangedWinnerCandidates.length === 0 &&
+    input.commandDiscovery.whereSubprocessCount === 2 &&
+    input.commandDiscovery.cacheSize === 2 &&
+    input.commandDiscovery.callerUnchanged &&
+    input.commandDiscovery.reverseCallerUnchanged &&
+    JSON.stringify(input.commandDiscovery.observations) ===
+      JSON.stringify([
+        { outcome: "resolved", source: "where" },
+        { outcome: "resolved", source: "cache" },
+        { outcome: "resolved", source: "cache" },
+        { outcome: "not_found", source: "where" },
+        { outcome: "not_found", source: "cache" },
+      ])
   );
 }
 
 export function runNodeDuplicateEnvironmentOracle(): NodeDuplicateEnvironmentOracle {
+  if (platform() !== "win32") {
+    throw new Error("The normalized child-environment oracle requires Windows.");
+  }
   const nodeDescriptor = JSON.parse(
     execFileSync(
       "node",
@@ -1535,22 +1623,50 @@ export function runNodeDuplicateEnvironmentOracle(): NodeDuplicateEnvironmentOra
       },
     ),
   ) as { readonly name: string; readonly execPath: string; readonly version: string };
-  const parentEnvironmentKeys = new Set<string>();
-  const parentEnvironment = Object.fromEntries(
-    Object.entries(process.env).filter(([name, value]) => {
-      if (value === undefined) return false;
-      const normalizedName = name.toUpperCase();
-      if (parentEnvironmentKeys.has(normalizedName)) return false;
-      parentEnvironmentKeys.add(normalizedName);
-      return true;
-    }),
-  );
-  const bunConstructedDuplicateKeyCount = countCaseInsensitiveDuplicateKeys(
-    Object.keys(parentEnvironment),
-  );
-  const upperValue = "C:\\synara-oracle-upper";
-  const mixedValue = "C:\\synara-oracle-mixed";
-  const observerSource = `
+  const root = mkdtempSync(join(tmpdir(), "synara-node-environment-oracle-"));
+  const winnerBin = join(root, "winner-bin");
+  const mixedBin = join(root, "mixed-bin");
+  const workingDirectory = join(root, "cwd");
+  const command = "synara-node-environment-oracle";
+  const candidate = join(winnerBin, `${command}.cmd`);
+  mkdirSync(winnerBin, { recursive: true });
+  mkdirSync(mixedBin, { recursive: true });
+  mkdirSync(workingDirectory, { recursive: true });
+  writeFileSync(candidate, "@echo off\r\n");
+
+  try {
+    const cleanEnvironment = Object.fromEntries(
+      Object.entries(process.env).filter(
+        ([name, value]) => value !== undefined && name.toUpperCase() !== "PATH",
+      ),
+    );
+    const rawCallerEnvironment = {
+      ...cleanEnvironment,
+      Path: mixedBin,
+      PATH: winnerBin,
+      PATHEXT: ".CMD",
+      SystemRoot: process.env.SystemRoot ?? process.env.WINDIR ?? "C:\\Windows",
+    } satisfies NodeJS.ProcessEnv;
+    const reverseCallerEnvironment = Object.fromEntries(
+      Object.entries(rawCallerEnvironment).reverse(),
+    );
+    const rawCallerBefore = { ...rawCallerEnvironment };
+    const reverseCallerBefore = { ...reverseCallerEnvironment };
+    const normalizedChildEnvironment = normalizeWindowsChildEnvironment(rawCallerEnvironment);
+    const reverseNormalizedChildEnvironment =
+      normalizeWindowsChildEnvironment(reverseCallerEnvironment);
+    const pathKeys = (env: NodeJS.ProcessEnv) =>
+      Object.keys(env)
+        .filter((key) => key.toUpperCase() === "PATH")
+        .toSorted();
+    const rawPathKeys = pathKeys(rawCallerEnvironment);
+    const normalizedPathKeys = pathKeys(normalizedChildEnvironment);
+    const normalizedEffectiveKey = normalizedPathKeys[0] ?? null;
+    const normalizedEffectiveValue =
+      normalizedEffectiveKey === null
+        ? null
+        : (normalizedChildEnvironment[normalizedEffectiveKey] ?? null);
+    const observerSource = `
 const keys = Object.keys(process.env)
   .filter((key) => key.toUpperCase() === "PATH")
   .sort();
@@ -1564,70 +1680,15 @@ process.stdout.write(JSON.stringify({
   values: keys.map((key) => process.env[key]),
 }));
 `;
-  const serializerSource = `
-const { execFileSync } = require("node:child_process");
-const [upperValue, mixedValue, observerSource] = process.argv.slice(1);
-const duplicateCount = (keys) =>
-  keys.length - new Set(keys.map((key) => key.toUpperCase())).size;
-const parentKeys = Object.keys(process.env);
-const cleanEnvironment = Object.fromEntries(
-  Object.entries(process.env).filter(([name]) => name.toUpperCase() !== "PATH"),
-);
-const childEnvironment = {
-  ...cleanEnvironment,
-  Path: mixedValue,
-  PATH: upperValue,
-};
-const serializerInputPathKeys = Object.keys(childEnvironment).filter(
-  (key) => key.toUpperCase() === "PATH",
-);
-const observer = JSON.parse(
-  execFileSync(process.execPath, ["-e", observerSource], {
-    encoding: "utf8",
-    env: childEnvironment,
-    maxBuffer: ${NODE_ORACLE_MAX_BUFFER_BYTES},
-    timeout: ${NODE_ORACLE_TIMEOUT_MS},
-    windowsHide: true,
-  }),
-);
-process.stdout.write(JSON.stringify({
-  serializerRuntime: {
-    name: process.release.name,
-    version: process.version,
-    execPath: process.execPath,
-  },
-  serializerObservedDuplicateKeyCount: duplicateCount(parentKeys),
-  serializerInputEnvironment: {
-    pathKeyCount: serializerInputPathKeys.length,
-    duplicateKeyCount: duplicateCount(Object.keys(childEnvironment)),
-  },
-  observer,
-}));
-`;
-  const oracleOutput = JSON.parse(
-    execFileSync(
-      nodeDescriptor.execPath,
-      ["-e", serializerSource, upperValue, mixedValue, observerSource],
-      {
+    const serializerOutput = JSON.parse(
+      execFileSync(nodeDescriptor.execPath, ["-e", observerSource], {
         encoding: "utf8",
-        env: parentEnvironment,
+        env: normalizedChildEnvironment,
         maxBuffer: NODE_ORACLE_MAX_BUFFER_BYTES,
         timeout: NODE_ORACLE_TIMEOUT_MS,
         windowsHide: true,
-      },
-    ),
-  ) as {
-    readonly serializerRuntime: {
-      readonly name: string;
-      readonly version: string;
-      readonly execPath: string;
-    };
-    readonly serializerObservedDuplicateKeyCount: number;
-    readonly serializerInputEnvironment: {
-      readonly pathKeyCount: number;
-      readonly duplicateKeyCount: number;
-    };
-    readonly observer: {
+      }),
+    ) as {
       readonly runtime: {
         readonly name: string;
         readonly version: string;
@@ -1636,30 +1697,99 @@ process.stdout.write(JSON.stringify({
       readonly keys: readonly string[];
       readonly values: readonly string[];
     };
-  };
-  const effectiveKey = oracleOutput.observer.keys[0] ?? null;
-  const effectiveValue = oracleOutput.observer.values[0] ?? null;
-  const evidence: Omit<NodeDuplicateEnvironmentOracle, "passed"> = {
-    launcherRuntime: { name: "bun", version: Bun.version },
-    expectedRuntime: {
-      name: "node",
-      version: nodeDescriptor.version,
-      execPathSha256: hashFixtureLabel(nodeDescriptor.execPath),
-    },
-    parentLaunchEnvironment: {
-      bunConstructedDuplicateKeyCount,
-      serializerObservedDuplicateKeyCount: oracleOutput.serializerObservedDuplicateKeyCount,
-    },
-    serializerRuntime: nodeRuntimeEvidence(oracleOutput.serializerRuntime),
-    serializerInputEnvironment: oracleOutput.serializerInputEnvironment,
-    observerRuntime: nodeRuntimeEvidence(oracleOutput.observer.runtime),
-    observedKeys: oracleOutput.observer.keys,
-    effectiveKey,
-    effectiveValueSha256: effectiveValue === null ? null : hashFixtureLabel(effectiveValue),
-    expectedKey: "PATH",
-    expectedValueSha256: hashFixtureLabel(upperValue),
-  };
-  return { ...evidence, passed: evaluateNodeDuplicateEnvironmentOracle(evidence) };
+    const serializerEffectiveKey = serializerOutput.keys[0] ?? null;
+    const serializerEffectiveValue = serializerOutput.values[0] ?? null;
+    const cache = createWindowsCommandDiscoveryCache();
+    const observations: WindowsCommandDiscoveryObservation[] = [];
+    const resolveWith = (env: NodeJS.ProcessEnv) =>
+      resolveWindowsCommandCandidates(command, {
+        platform: "win32",
+        cwd: workingDirectory,
+        env,
+        commandDiscoveryCache: cache,
+        onCommandDiscovery: (observation) => observations.push(observation),
+      });
+    const winningCandidates = resolveWith(rawCallerEnvironment);
+    const reverseInsertionCandidates = resolveWith(reverseCallerEnvironment);
+    const discardedAliasCandidates = resolveWith({
+      ...rawCallerEnvironment,
+      Path: `${mixedBin}-discarded-change`,
+    });
+    const changedWinnerEnvironment = {
+      ...rawCallerEnvironment,
+      Path: winnerBin,
+      PATH: mixedBin,
+    };
+    const changedWinnerCandidates = resolveWith(changedWinnerEnvironment);
+    const reverseChangedWinnerCandidates = resolveWith(
+      Object.fromEntries(Object.entries(changedWinnerEnvironment).reverse()),
+    );
+    const expectedCandidateIdentity = statSync(candidate, { bigint: true });
+    const sanitizeCandidates = (candidates: readonly string[]) =>
+      candidates.map((resolvedCandidate) => {
+        assertPathInside(root, resolvedCandidate, "normalized environment oracle candidate");
+        const actualCandidateIdentity = statSync(resolvedCandidate, { bigint: true });
+        if (
+          actualCandidateIdentity.dev !== expectedCandidateIdentity.dev ||
+          actualCandidateIdentity.ino !== expectedCandidateIdentity.ino
+        ) {
+          throw new Error("Normalized environment oracle resolved an unexpected fixture file.");
+        }
+        return `winner-bin/${command}.cmd`;
+      });
+    const expectedValueSha256 = hashFixtureLabel(winnerBin);
+    const evidence: Omit<NodeDuplicateEnvironmentOracle, "passed"> = {
+      launcherRuntime: { name: "bun", version: Bun.version },
+      expectedRuntime: {
+        name: "node",
+        version: nodeDescriptor.version,
+        execPathSha256: hashFixtureLabel(nodeDescriptor.execPath),
+      },
+      rawCallerEnvironment: {
+        pathKeys: rawPathKeys,
+        duplicateKeyCount: countCaseInsensitiveDuplicateKeys(rawPathKeys),
+        valueSha256ByKey: Object.fromEntries(
+          rawPathKeys.map((key) => [key, hashFixtureLabel(rawCallerEnvironment[key] ?? "")]),
+        ),
+      },
+      normalizedChildEnvironment: {
+        pathKeys: normalizedPathKeys,
+        duplicateKeyCount: countCaseInsensitiveDuplicateKeys(normalizedPathKeys),
+        effectiveKey: normalizedEffectiveKey,
+        effectiveValueSha256:
+          normalizedEffectiveValue === null ? null : hashFixtureLabel(normalizedEffectiveValue),
+        reverseInsertionEquivalent:
+          JSON.stringify(normalizedChildEnvironment) ===
+          JSON.stringify(reverseNormalizedChildEnvironment),
+      },
+      serializerRuntime: nodeRuntimeEvidence(serializerOutput.runtime),
+      serializerObservedEnvironment: {
+        pathKeys: serializerOutput.keys,
+        duplicateKeyCount: countCaseInsensitiveDuplicateKeys(serializerOutput.keys),
+        effectiveKey: serializerEffectiveKey,
+        effectiveValueSha256:
+          serializerEffectiveValue === null ? null : hashFixtureLabel(serializerEffectiveValue),
+      },
+      commandDiscovery: {
+        winningCandidates: sanitizeCandidates(winningCandidates),
+        reverseInsertionCandidates: sanitizeCandidates(reverseInsertionCandidates),
+        discardedAliasCandidates: sanitizeCandidates(discardedAliasCandidates),
+        changedWinnerCandidates: sanitizeCandidates(changedWinnerCandidates),
+        reverseChangedWinnerCandidates: sanitizeCandidates(reverseChangedWinnerCandidates),
+        observations,
+        whereSubprocessCount: observations.filter(({ source }) => source === "where").length,
+        cacheSize: getWindowsCommandDiscoveryCacheStats(cache).size,
+        callerUnchanged: JSON.stringify(rawCallerEnvironment) === JSON.stringify(rawCallerBefore),
+        reverseCallerUnchanged:
+          JSON.stringify(reverseCallerEnvironment) === JSON.stringify(reverseCallerBefore),
+      },
+      expectedKey: "PATH",
+      expectedValueSha256,
+    };
+    return { ...evidence, passed: evaluateNodeDuplicateEnvironmentOracle(evidence) };
+  } finally {
+    rmSync(root, { force: true, recursive: true });
+  }
 }
 
 async function measureNativeWhere(

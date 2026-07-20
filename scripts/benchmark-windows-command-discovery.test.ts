@@ -8,6 +8,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   alternatingVersionOrder,
+  assertExpectedCommandDiscoveryCandidates,
   assertComparableEditorBenchmarkRuntime,
   assertCandidateCheckoutIdentity,
   assertMatchingLockfileProvenance,
@@ -434,6 +435,41 @@ describe("benchmark-windows-command-discovery", () => {
     });
   });
 
+  it("rejects wrong resolver candidates and non-empty misses", () => {
+    const fixture = {
+      exeCandidate: "C:\\fixture\\tool.exe",
+      cmdCandidate: "C:\\fixture\\tool.cmd",
+    };
+    expect(() =>
+      assertExpectedCommandDiscoveryCandidates({
+        actual: [fixture.exeCandidate],
+        outcome: "resolved_exe",
+        ...fixture,
+      }),
+    ).not.toThrow();
+    expect(() =>
+      assertExpectedCommandDiscoveryCandidates({
+        actual: [fixture.cmdCandidate],
+        outcome: "resolved_exe",
+        ...fixture,
+      }),
+    ).toThrow("expected");
+    expect(() =>
+      assertExpectedCommandDiscoveryCandidates({
+        actual: [fixture.exeCandidate],
+        outcome: "not_found",
+        ...fixture,
+      }),
+    ).toThrow("expected []");
+    expect(() =>
+      assertExpectedCommandDiscoveryCandidates({
+        actual: [fixture.cmdCandidate],
+        outcome: "transient",
+        ...fixture,
+      }),
+    ).toThrow("expected []");
+  });
+
   it("alternates base/candidate order and hashes fixture labels instead of exposing paths", () => {
     expect(alternatingVersionOrder(0)).toEqual(["base", "candidate"]);
     expect(alternatingVersionOrder(1)).toEqual(["candidate", "base"]);
@@ -443,27 +479,55 @@ describe("benchmark-windows-command-discovery", () => {
     expect(label).not.toContain("Users");
   });
 
-  it("fails the duplicate-environment oracle when either runtime boundary is not Node", () => {
+  it("requires raw collisions, normalized child evidence, and exact cache behavior", () => {
     const runtime = {
       name: "node",
       version: "v24.15.0",
       execPathSha256: "a".repeat(64),
     };
+    const expectedValueSha256 = "b".repeat(64);
     const evidence = {
       launcherRuntime: { name: "bun" as const, version: "1.3.14" },
       expectedRuntime: runtime,
-      parentLaunchEnvironment: {
-        bunConstructedDuplicateKeyCount: 0,
-        serializerObservedDuplicateKeyCount: 0,
+      rawCallerEnvironment: {
+        pathKeys: ["PATH", "Path"],
+        duplicateKeyCount: 1,
+        valueSha256ByKey: { PATH: expectedValueSha256, Path: "c".repeat(64) },
+      },
+      normalizedChildEnvironment: {
+        pathKeys: ["PATH"],
+        duplicateKeyCount: 0,
+        effectiveKey: "PATH",
+        effectiveValueSha256: expectedValueSha256,
+        reverseInsertionEquivalent: true,
       },
       serializerRuntime: runtime,
-      serializerInputEnvironment: { pathKeyCount: 2, duplicateKeyCount: 1 },
-      observerRuntime: runtime,
-      observedKeys: ["PATH"],
-      effectiveKey: "PATH",
-      effectiveValueSha256: "b".repeat(64),
+      serializerObservedEnvironment: {
+        pathKeys: ["PATH"],
+        duplicateKeyCount: 0,
+        effectiveKey: "PATH",
+        effectiveValueSha256: expectedValueSha256,
+      },
+      commandDiscovery: {
+        winningCandidates: ["winner-bin/synara-node-environment-oracle.cmd"],
+        reverseInsertionCandidates: ["winner-bin/synara-node-environment-oracle.cmd"],
+        discardedAliasCandidates: ["winner-bin/synara-node-environment-oracle.cmd"],
+        changedWinnerCandidates: [],
+        reverseChangedWinnerCandidates: [],
+        observations: [
+          { outcome: "resolved" as const, source: "where" as const },
+          { outcome: "resolved" as const, source: "cache" as const },
+          { outcome: "resolved" as const, source: "cache" as const },
+          { outcome: "not_found" as const, source: "where" as const },
+          { outcome: "not_found" as const, source: "cache" as const },
+        ],
+        whereSubprocessCount: 2,
+        cacheSize: 2,
+        callerUnchanged: true,
+        reverseCallerUnchanged: true,
+      },
       expectedKey: "PATH" as const,
-      expectedValueSha256: "b".repeat(64),
+      expectedValueSha256,
     };
 
     expect(evaluateNodeDuplicateEnvironmentOracle(evidence)).toBe(true);
@@ -476,29 +540,44 @@ describe("benchmark-windows-command-discovery", () => {
     expect(
       evaluateNodeDuplicateEnvironmentOracle({
         ...evidence,
-        observerRuntime: { ...runtime, version: "v24.14.0" },
-      }),
-    ).toBe(false);
-    expect(
-      evaluateNodeDuplicateEnvironmentOracle({
-        ...evidence,
-        parentLaunchEnvironment: {
-          ...evidence.parentLaunchEnvironment,
-          bunConstructedDuplicateKeyCount: 1,
+        serializerObservedEnvironment: {
+          ...evidence.serializerObservedEnvironment,
+          effectiveValueSha256: "d".repeat(64),
         },
       }),
     ).toBe(false);
     expect(
       evaluateNodeDuplicateEnvironmentOracle({
         ...evidence,
-        observedKeys: ["Path"],
-        effectiveKey: "Path",
+        rawCallerEnvironment: {
+          ...evidence.rawCallerEnvironment,
+          duplicateKeyCount: 0,
+        },
+      }),
+    ).toBe(false);
+    expect(
+      evaluateNodeDuplicateEnvironmentOracle({
+        ...evidence,
+        normalizedChildEnvironment: {
+          ...evidence.normalizedChildEnvironment,
+          pathKeys: ["Path"],
+          effectiveKey: "Path",
+        },
+      }),
+    ).toBe(false);
+    expect(
+      evaluateNodeDuplicateEnvironmentOracle({
+        ...evidence,
+        commandDiscovery: {
+          ...evidence.commandDiscovery,
+          changedWinnerCandidates: ["winner-bin/synara-node-environment-oracle.cmd"],
+        },
       }),
     ).toBe(false);
   });
 
   it.runIf(process.platform === "win32")(
-    "uses a Node serializer and Node observer for duplicate environment selection",
+    "normalizes duplicate caller keys before Node and real where.exe",
     () => {
       const benchmarkModuleUrl = new URL(
         "./benchmark-windows-command-discovery.ts",
@@ -518,20 +597,38 @@ describe("benchmark-windows-command-discovery", () => {
       expect(oracle).toMatchObject({
         launcherRuntime: { name: "bun" },
         expectedRuntime: { name: "node" },
-        parentLaunchEnvironment: {
-          bunConstructedDuplicateKeyCount: 0,
-          serializerObservedDuplicateKeyCount: 0,
+        rawCallerEnvironment: {
+          pathKeys: ["PATH", "Path"],
+          duplicateKeyCount: 1,
+        },
+        normalizedChildEnvironment: {
+          pathKeys: ["PATH"],
+          duplicateKeyCount: 0,
+          effectiveKey: "PATH",
+          effectiveValueSha256: oracle.expectedValueSha256,
+          reverseInsertionEquivalent: true,
         },
         serializerRuntime: { name: "node" },
-        serializerInputEnvironment: { pathKeyCount: 2, duplicateKeyCount: 1 },
-        observerRuntime: { name: "node" },
-        observedKeys: ["PATH"],
-        effectiveKey: "PATH",
-        effectiveValueSha256: oracle.expectedValueSha256,
+        serializerObservedEnvironment: {
+          pathKeys: ["PATH"],
+          duplicateKeyCount: 0,
+          effectiveKey: "PATH",
+          effectiveValueSha256: oracle.expectedValueSha256,
+        },
+        commandDiscovery: {
+          winningCandidates: ["winner-bin/synara-node-environment-oracle.cmd"],
+          reverseInsertionCandidates: ["winner-bin/synara-node-environment-oracle.cmd"],
+          discardedAliasCandidates: ["winner-bin/synara-node-environment-oracle.cmd"],
+          changedWinnerCandidates: [],
+          reverseChangedWinnerCandidates: [],
+          whereSubprocessCount: 2,
+          cacheSize: 2,
+          callerUnchanged: true,
+          reverseCallerUnchanged: true,
+        },
         passed: true,
       });
       expect(oracle.serializerRuntime).toEqual(oracle.expectedRuntime);
-      expect(oracle.observerRuntime).toEqual(oracle.expectedRuntime);
     },
   );
 

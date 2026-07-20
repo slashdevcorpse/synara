@@ -541,6 +541,27 @@ it.layer(NodeServices.layer)("isCommandAvailable", (it) => {
       assert.equal(isCommandAvailable("code", { platform: "win32", env }), true);
     }),
   );
+
+  it.effect("preserves POSIX Path and path command lookup aliases", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "synara-open-posix-path-" });
+      yield* fs.writeFileString(path.join(dir, "code"), "#!/bin/sh\n");
+      yield* fs.chmod(path.join(dir, "code"), 0o755);
+
+      for (const name of ["Path", "path"] as const) {
+        assert.equal(isCommandAvailable("code", { platform: "linux", env: { [name]: dir } }), true);
+      }
+      assert.equal(
+        isCommandAvailable("code", {
+          platform: "linux",
+          env: { PATH: dir, Path: "/missing-mixed", path: "/missing-lower" },
+        }),
+        true,
+      );
+    }),
+  );
 });
 
 it.layer(NodeServices.layer)("resolveAvailableEditors", (it) => {
@@ -625,13 +646,22 @@ it.layer(NodeServices.layer)("resolveAvailableEditors", (it) => {
     const installLocation =
       "C:\\Program Files\\WindowsApps\\Microsoft.VisualStudioCode_1.0.0.0_x64__8wekyb3d8bbwe";
     let script = "";
+    let childEnv: NodeJS.ProcessEnv | undefined;
+    const callerEnv = {
+      Path: "C:\\discarded-bin",
+      PATH: "D:\\effective-bin",
+      SystemRoot: "C:\\discarded-windows",
+      SYSTEMROOT: "D:\\Windows",
+    } satisfies NodeJS.ProcessEnv;
+    const callerBefore = { ...callerEnv };
 
     const result = resolveWindowsStorePackageDirectoryFromPowerShell(
       getEditorWindowsStorePackages(editor),
       "win32",
-      { PATH: "" },
-      (_file, args) => {
+      callerEnv,
+      (_file, args, options) => {
         script = String(args[2]);
+        childEnv = options.env;
         return `${installLocation}\r\n`;
       },
     );
@@ -639,6 +669,13 @@ it.layer(NodeServices.layer)("resolveAvailableEditors", (it) => {
     assert.equal(result, installLocation);
     assert.equal(script.includes("PackageFamilyName -ieq $packageDef.Family"), true);
     assert.equal(script.includes("Microsoft.VisualStudioCode_8wekyb3d8bbwe"), true);
+    assert.equal(script.includes("-ErrorAction SilentlyContinue"), true);
+    assert.equal(script.includes("-ErrorAction Stop"), false);
+    assert.deepEqual(childEnv, {
+      PATH: "D:\\effective-bin",
+      SYSTEMROOT: "D:\\Windows",
+    });
+    assert.deepEqual(callerEnv, callerBefore);
   });
 
   it("caches Windows Store AppX registration probes", () => {
@@ -809,6 +846,35 @@ it.layer(NodeServices.layer)("discoverAvailableEditors", (it) => {
       }),
   );
 
+  it.effect("preserves POSIX Path and path aliases during asynchronous discovery", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "synara-editor-posix-path-" });
+      yield* fs.writeFileString(path.join(dir, "code"), "#!/bin/sh\n");
+      yield* fs.chmod(path.join(dir, "code"), 0o755);
+
+      for (const name of ["Path", "path"] as const) {
+        const result = yield* Effect.promise(() =>
+          discoverAvailableEditors({
+            platform: "linux",
+            cwd: dir,
+            env: { [name]: dir },
+            lookupWindowsStorePackages: async () => ({
+              status: "success",
+              installLocationsByFamily: {},
+              subprocessCount: 0,
+            }),
+          }),
+        );
+        assert.equal(result.status, "success");
+        if (result.status === "success") {
+          assert.equal(result.availableEditors.includes("vscode"), true);
+        }
+      }
+    }),
+  );
+
   it("caps outstanding asynchronous filesystem probes at eight", async () => {
     let active = 0;
     let maximumActive = 0;
@@ -867,13 +933,24 @@ it("runs one bounded, shell-free PowerShell process for bulk AppX discovery", as
     | {
         readonly command: string;
         readonly args: ReadonlyArray<string>;
-        readonly options: { readonly shell: false; readonly windowsHide: true };
+        readonly options: {
+          readonly env: NodeJS.ProcessEnv;
+          readonly shell: false;
+          readonly windowsHide: true;
+        };
       }
     | undefined;
+  const callerEnv = {
+    Path: "C:\\discarded-bin",
+    PATH: "D:\\effective-bin",
+    SystemRoot: "C:\\discarded-windows",
+    SYSTEMROOT: "D:\\Windows",
+  } satisfies NodeJS.ProcessEnv;
+  const callerBefore = { ...callerEnv };
 
   const result = await discoverWindowsStorePackageInstallLocations(packages, {
     platform: "win32",
-    env: { SystemRoot: "C:\\Windows" },
+    env: callerEnv,
     spawnProcess: (command, args, options) => {
       captured = { command, args, options };
       const child = new EventEmitter() as EventEmitter & {
@@ -900,12 +977,40 @@ it("runs one bounded, shell-free PowerShell process for bulk AppX discovery", as
   });
 
   assert.equal(result.status, "success");
-  assert.equal(captured?.command.endsWith("powershell.exe"), true);
+  assert.equal(captured?.command, "D:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
   assert.equal(captured?.args.includes("-NoProfile"), true);
   assert.equal(captured?.args.includes("-NonInteractive"), true);
   assert.equal(captured?.options.shell, false);
   assert.equal(captured?.options.windowsHide, true);
   assert.equal(captured?.args.at(-1)?.includes("Microsoft.VisualStudioCode"), true);
+  assert.equal(captured?.args.at(-1)?.includes("-ErrorAction Stop"), true);
+  assert.equal(captured?.args.at(-1)?.includes("-ErrorAction SilentlyContinue"), false);
+  assert.deepEqual(captured?.options.env, {
+    PATH: "D:\\effective-bin",
+    SYSTEMROOT: "D:\\Windows",
+  });
+  assert.deepEqual(callerEnv, callerBefore);
+});
+
+it("classifies terminating bulk AppX command failures as process exits", async () => {
+  let script = "";
+  const result = await discoverWindowsStorePackageInstallLocations(vscodeStorePackages(), {
+    platform: "win32",
+    env: { SystemRoot: "C:\\Windows" },
+    spawnProcess: (_command, args) => {
+      script = args.at(-1) ?? "";
+      const child = makeFakeAppxChild();
+      setImmediate(() => {
+        child.stdout.end("[]");
+        child.emit("close", 1);
+      });
+      return child as never;
+    },
+  });
+
+  assert.deepEqual(result, { status: "failure", category: "process_exit", subprocessCount: 1 });
+  assert.equal(script.includes("Get-AppxPackage"), true);
+  assert.equal(script.includes("-ErrorAction Stop"), true);
 });
 
 it("kills AppX discovery when combined output crosses the 256 KiB cap", async () => {

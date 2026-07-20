@@ -121,17 +121,38 @@ export function clearWindowsCommandDiscoveryCache(): void {
   getWindowsCommandDiscoveryCacheState(processWindowsCommandDiscoveryCache).entries.clear();
 }
 
-function readWindowsEnvironmentValue(
+function compareWindowsEnvironmentNames(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+export function normalizeWindowsChildEnvironment(
+  env: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  const normalized: NodeJS.ProcessEnv = {};
+  const selectedNames = new Set<string>();
+  const names = Object.keys(env).toSorted(compareWindowsEnvironmentNames);
+  for (const name of names) {
+    const value = env[name];
+    if (value === undefined) continue;
+    const normalizedName = name.toUpperCase();
+    if (selectedNames.has(normalizedName)) continue;
+    selectedNames.add(normalizedName);
+    normalized[name] = value;
+  }
+  return normalized;
+}
+
+export function readEffectiveWindowsEnvironmentValue(
   env: NodeJS.ProcessEnv,
   requestedName: string,
 ): string | undefined {
   const normalizedName = requestedName.toUpperCase();
   const effectiveName = Object.keys(env)
-    .filter((name) => name.toUpperCase() === normalizedName)
+    .filter((name) => env[name] !== undefined && name.toUpperCase() === normalizedName)
     // Node applies this ordinal lexicographic ordering before de-duplicating
     // Windows environment keys case-insensitively. Do not use localeCompare:
     // locale-sensitive ordering could diverge from the spawned environment.
-    .sort((left, right) => (left < right ? -1 : left > right ? 1 : 0))[0];
+    .sort(compareWindowsEnvironmentNames)[0];
   return effectiveName === undefined ? undefined : env[effectiveName];
 }
 
@@ -141,12 +162,12 @@ function trimNonEmpty(value: string | null | undefined): string | null {
 }
 
 export function resolveWindowsSystemRoot(env: NodeJS.ProcessEnv = process.env): string {
-  return trimNonEmpty(readWindowsEnvironmentValue(env, "SystemRoot")) ?? "C:\\Windows";
+  return trimNonEmpty(readEffectiveWindowsEnvironmentValue(env, "SystemRoot")) ?? "C:\\Windows";
 }
 
 export function resolveWindowsComSpec(env: NodeJS.ProcessEnv = process.env): string {
   return (
-    trimNonEmpty(readWindowsEnvironmentValue(env, "ComSpec")) ??
+    trimNonEmpty(readEffectiveWindowsEnvironmentValue(env, "ComSpec")) ??
     Path.win32.join(resolveWindowsSystemRoot(env), "System32", "cmd.exe")
   );
 }
@@ -174,6 +195,19 @@ function normalizeWindowsPathIdentity(value: string, cwd: string): string {
   const withoutTrailingSeparators =
     normalized.length > root.length ? normalized.replace(/[\\/]+$/, "") : normalized;
   return foldWindowsAsciiCase(withoutTrailingSeparators);
+}
+
+function normalizeWindowsCwdCacheIdentity(cwd: string): string {
+  if (cwd.trim() !== cwd || cwd.startsWith('"') || cwd.endsWith('"')) {
+    return foldWindowsAsciiCase(cwd);
+  }
+  const root = Path.win32.parse(cwd).root;
+  const withoutTrailingSeparators = cwd.replace(/[\\/]+$/, "");
+  const normalized =
+    root.length > 0 && withoutTrailingSeparators.length < root.length
+      ? root
+      : (withoutTrailingSeparators ?? cwd);
+  return foldWindowsAsciiCase(normalized);
 }
 
 function resolveWindowsWhereExe(env: NodeJS.ProcessEnv, cwd: string): string {
@@ -263,7 +297,7 @@ function normalizeWindowsCommandIdentity(
 function resolveWindowsPathCacheIdentity(
   env: NodeJS.ProcessEnv,
 ): { readonly kind: "missing" } | { readonly kind: "configured"; readonly value: string } {
-  const pathValue = readWindowsEnvironmentValue(env, "PATH");
+  const pathValue = readEffectiveWindowsEnvironmentValue(env, "PATH");
   return pathValue === undefined
     ? { kind: "missing" }
     : {
@@ -278,7 +312,7 @@ function resolveWindowsPathCacheIdentity(
 function resolveWindowsPathExtCacheIdentity(
   env: NodeJS.ProcessEnv,
 ): { readonly kind: "missing" } | { readonly kind: "configured"; readonly value: string } {
-  const pathExtValue = readWindowsEnvironmentValue(env, "PATHEXT");
+  const pathExtValue = readEffectiveWindowsEnvironmentValue(env, "PATHEXT");
   return pathExtValue === undefined
     ? { kind: "missing" }
     : {
@@ -307,7 +341,7 @@ function buildWindowsCommandDiscoveryCacheKey(
     mode,
     // Preserve the exact working-directory syntax passed to spawnSync. Quoted
     // or whitespace-wrapped values are not equivalent to a valid directory.
-    cwd: foldWindowsAsciiCase(cwd),
+    cwd: normalizeWindowsCwdCacheIdentity(cwd),
     path: resolveWindowsPathCacheIdentity(env),
     pathExt: resolveWindowsPathExtCacheIdentity(env),
     // Sign the paths that actually select the launched where.exe, rather than
@@ -473,7 +507,7 @@ export function resolveWindowsCommandCandidates(
     return [command];
   }
 
-  const env = input.env ?? process.env;
+  const env = normalizeWindowsChildEnvironment(input.env ?? process.env);
   const cwd = input.cwd ?? process.cwd();
   const discovery = discoverWindowsCommandCandidates(command, input, env, cwd);
   const candidates = [...discovery.candidates];
@@ -523,7 +557,7 @@ export function prepareResolvedWindowsSafeProcess(
     return { command, args: [...args], shell: false };
   }
 
-  const env = input.env ?? process.env;
+  const env = normalizeWindowsChildEnvironment(input.env ?? process.env);
   if (!isWindowsBatchCommand(command)) {
     return {
       command,
