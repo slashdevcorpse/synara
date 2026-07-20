@@ -493,6 +493,36 @@ export const MODEL_OPTIONS_BY_PROVIDER = {
       name: "GPT-5.6 Sol",
       capabilities: COMMAND_CODE_MODEL_CAPABILITIES,
     },
+    {
+      slug: "gpt-5.6-terra",
+      name: "GPT-5.6 Terra",
+      capabilities: COMMAND_CODE_MODEL_CAPABILITIES,
+    },
+    {
+      slug: "gpt-5.6-luna",
+      name: "GPT-5.6 Luna",
+      capabilities: COMMAND_CODE_MODEL_CAPABILITIES,
+    },
+    {
+      slug: "gpt-5.5",
+      name: "GPT-5.5",
+      capabilities: COMMAND_CODE_MODEL_CAPABILITIES,
+    },
+    {
+      slug: "gpt-5.4",
+      name: "GPT-5.4",
+      capabilities: COMMAND_CODE_MODEL_CAPABILITIES,
+    },
+    {
+      slug: "gpt-5.3-codex",
+      name: "GPT-5.3 Codex",
+      capabilities: COMMAND_CODE_MODEL_CAPABILITIES,
+    },
+    {
+      slug: "gpt-5.4-mini",
+      name: "GPT-5.4 Mini",
+      capabilities: COMMAND_CODE_MODEL_CAPABILITIES,
+    },
   ],
   claudeAgent: [
     {

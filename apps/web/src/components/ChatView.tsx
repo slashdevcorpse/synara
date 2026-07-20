@@ -2145,6 +2145,7 @@ export default function ChatView({
     providerModelsQueryOptions({
       provider: "commandCode",
       binaryPath: settings.commandCodeBinaryPath || null,
+      cwd: providerModelDiscoveryCwd,
       enabled: commandCodeModelDiscoveryEnabled,
     }),
   );

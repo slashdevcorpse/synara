@@ -78,6 +78,7 @@ export function providerModelsPrefetchQueryOptions(input: {
       return providerModelsQueryOptions({
         provider: "commandCode",
         binaryPath: settings.commandCodeBinaryPath || null,
+        cwd,
       });
     case "cursor":
       return providerModelsQueryOptions({

@@ -7,6 +7,7 @@ import {
   DEFAULT_MODEL_BY_PROVIDER,
   MODEL_OPTIONS,
   MODEL_OPTIONS_BY_PROVIDER,
+  MODEL_SLUG_ALIASES_BY_PROVIDER,
   CODEX_REASONING_EFFORT_OPTIONS,
   GROK_REASONING_EFFORT_OPTIONS,
 } from "@synara/contracts";
@@ -100,6 +101,17 @@ describe("resolveModelSlug", () => {
     expect(resolveModelSlugForProvider("claudeAgent", "gpt-5.3-codex")).toBe(
       DEFAULT_MODEL_BY_PROVIDER.claudeAgent,
     );
+  });
+
+  it("resolves every Command Code alias to a supported canonical model", () => {
+    const supportedModels = new Set(MODEL_OPTIONS_BY_PROVIDER.commandCode.map(({ slug }) => slug));
+
+    for (const [alias, canonicalModel] of Object.entries(
+      MODEL_SLUG_ALIASES_BY_PROVIDER.commandCode,
+    )) {
+      expect(supportedModels.has(canonicalModel)).toBe(true);
+      expect(resolveModelSlugForProvider("commandCode", alias)).toBe(canonicalModel);
+    }
   });
 
   it("keeps codex defaults for backward compatibility", () => {

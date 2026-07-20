@@ -76,7 +76,8 @@ import {
   AutocompletePopup,
 } from "../components/ui/autocomplete";
 import { Button } from "../components/ui/button";
-import { Collapsible, CollapsibleContent } from "../components/ui/collapsible";
+import { Collapsible, CollapsiblePanel } from "../components/ui/collapsible";
+import { DisclosureChevron } from "../components/ui/DisclosureChevron";
 import { Input } from "../components/ui/input";
 import { Kbd, KbdGroup } from "../components/ui/kbd";
 import {
@@ -3286,11 +3287,9 @@ function SettingsRouteView() {
                               {providerUpdateLabel}
                             </span>
                           ) : null}
-                          <ChevronDownIcon
-                            className={cn(
-                              "size-4 shrink-0 text-muted-foreground transition-transform",
-                              isOpen && "rotate-180",
-                            )}
+                          <DisclosureChevron
+                            open={isOpen}
+                            className="size-4 shrink-0 text-muted-foreground"
                           />
                         </button>
                         {shouldShowProviderUpdateButton ? (
@@ -3319,7 +3318,7 @@ function SettingsRouteView() {
                         ) : null}
                       </div>
 
-                      <CollapsibleContent>
+                      <CollapsiblePanel>
                         <div className="border-t border-border/70 bg-muted/20 px-3 py-3">
                           <div className="space-y-3">
                             <ProviderDocsLinks docs={providerSettings.docs} />
@@ -3583,7 +3582,7 @@ function SettingsRouteView() {
                             ) : null}
                           </div>
                         </div>
-                      </CollapsibleContent>
+                      </CollapsiblePanel>
                     </div>
                   </Collapsible>
                 );

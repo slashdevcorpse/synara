@@ -9,14 +9,34 @@ import { describe, expect, it } from "vitest";
 import { ProviderIcon, PROVIDER_ICON_COMPONENT_BY_PROVIDER } from "./ProviderIcon";
 
 describe("ProviderIcon", () => {
-  it("renders a distinct accessible Command Code icon", () => {
+  it("renders a distinct accessible Command Code icon and forwards compatible props", () => {
     const markup = renderToStaticMarkup(
-      <ProviderIcon provider="commandCode" aria-hidden={false} aria-label="Command Code" />,
+      <ProviderIcon
+        provider="commandCode"
+        aria-hidden={false}
+        aria-label="Command Code"
+        data-provider-icon="command-code"
+        id="command-code-icon"
+        tabIndex={-1}
+        title="Command Code provider"
+      />,
     );
 
     expect(PROVIDER_ICON_COMPONENT_BY_PROVIDER.commandCode).toBeDefined();
-    expect(markup).toContain("Command Code");
+    expect(markup).toContain('role="img"');
+    expect(markup).toContain('aria-label="Command Code"');
+    expect(markup).not.toContain("aria-hidden");
+    expect(markup).toContain('data-provider-icon="command-code"');
+    expect(markup).toContain('id="command-code-icon"');
+    expect(markup).toContain('tabindex="-1"');
+    expect(markup).toContain('title="Command Code provider"');
     expect(markup).toContain("agentic-coding");
+
+    const decorativeMarkup = renderToStaticMarkup(
+      <ProviderIcon provider="commandCode" aria-label="Ignored while hidden" />,
+    );
+    expect(decorativeMarkup).toContain('aria-hidden="true"');
+    expect(decorativeMarkup).not.toContain("Ignored while hidden");
   });
 
   it("uses Antigravity branding", () => {
