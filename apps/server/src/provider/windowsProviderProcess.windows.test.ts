@@ -148,6 +148,9 @@ describeWindows("Windows Job launcher native integration", () => {
       });
     });
     const [rootPid, descendantPid] = line.split(",").map((value) => Number.parseInt(value, 10));
+    if (rootPid === undefined || descendantPid === undefined) {
+      throw new Error(`expected provider root and descendant pids, received: ${line}`);
+    }
     expect(Number.isSafeInteger(rootPid)).toBe(true);
     expect(Number.isSafeInteger(descendantPid)).toBe(true);
     expect(isProcessAlive(rootPid)).toBe(true);

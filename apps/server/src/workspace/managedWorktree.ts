@@ -19,9 +19,9 @@ export interface ManagedWorktreeScanLimits {
 }
 
 export interface ManagedWorktreeThreadReference {
-  readonly worktreePath?: string | null;
-  readonly associatedWorktreePath?: string | null;
-  readonly deletedAt?: string | null;
+  readonly worktreePath?: string | null | undefined;
+  readonly associatedWorktreePath?: string | null | undefined;
+  readonly deletedAt?: string | null | undefined;
 }
 
 export type ManagedWorktreeIssueReason =

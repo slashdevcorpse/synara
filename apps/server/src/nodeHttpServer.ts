@@ -1,5 +1,5 @@
 import http from "node:http";
-import type { ListenOptions } from "node:net";
+import { Socket, type ListenOptions } from "node:net";
 
 import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
 import { Effect, Scope } from "effect";
@@ -39,7 +39,11 @@ export function installWebSocketMessageAdmission(
 ): void {
   const messageAdmission = makeWsMessageAdmission(admissionOptions);
   const originalEmit = webSocket.emit;
-  webSocket.emit = function admittedEmit(eventName, ...args) {
+  webSocket.emit = function admittedEmit(
+    this: WebSocket,
+    eventName: string | symbol,
+    ...args: ReadonlyArray<unknown>
+  ) {
     if (eventName === "message" || eventName === "ping") {
       const messageClass =
         eventName === "message" ? classifyWsMessage(args[0], args[1]) : "standard";
@@ -146,7 +150,9 @@ export const makeBoundedNodeHttpServer = Effect.fnUntraced(function* (
         }),
       );
       const admittedUpgradeHandler: typeof upgradeHandler = (request, socket, head) => {
-        const outcome = transportAdmission.acquireConnection(socket.remoteAddress);
+        const outcome = transportAdmission.acquireConnection(
+          socket instanceof Socket ? socket.remoteAddress : undefined,
+        );
         if (!outcome.admitted) {
           const retryAfterSeconds = Math.max(1, Math.ceil(outcome.retryAfterMs / 1_000));
           const body = "Too Many WebSocket Connections";

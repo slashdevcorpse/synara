@@ -1,12 +1,12 @@
 import { describe, expect, it } from "vitest";
 
 import { inspectSubprocessActivity } from "./Manager";
-import type { ProcessChildrenMap } from "../processTreeKiller";
+import type { CapturedProcess, ProcessChildrenMap } from "../processTreeKiller";
 
 function buildChildrenMap(
   entries: Array<{ ppid: number; pid: number; command: string }>,
 ): ProcessChildrenMap {
-  const map: ProcessChildrenMap = new Map();
+  const map = new Map<number, CapturedProcess[]>();
   for (const { ppid, pid, command } of entries) {
     const siblings = map.get(ppid) ?? [];
     siblings.push({ pid, command });

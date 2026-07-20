@@ -26,7 +26,7 @@ const encoder = new TextEncoder();
 const prepareMockProcess = (command: string, args: ReadonlyArray<string>) => ({
   command,
   args: [...args],
-  shell: false,
+  shell: false as const,
 });
 
 function mockOpenCodeServerHandle(input: {

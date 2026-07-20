@@ -122,9 +122,7 @@ async function withAuthEffectServer(
       }) => Promise<ManagedAttachmentUsage>;
     },
   ) => Promise<void>,
-  routeLayer:
-    | typeof authEffectRouteLayer
-    | typeof binaryUploadEffectRouteLayer = authEffectRouteLayer,
+  routeLayer?: typeof binaryUploadEffectRouteLayer,
 ): Promise<void> {
   const scope = await Effect.runPromise(Scope.make("sequential"));
   let nodeServer: http.Server | null = null;
@@ -155,7 +153,11 @@ async function withAuthEffectServer(
             },
             { port: 0, host: "127.0.0.1" },
           );
-          yield* httpServer.serve(yield* HttpRouter.toHttpEffect(routeLayer));
+          if (routeLayer) {
+            yield* httpServer.serve(yield* HttpRouter.toHttpEffect(routeLayer));
+          } else {
+            yield* httpServer.serve(yield* HttpRouter.toHttpEffect(authEffectRouteLayer));
+          }
         }).pipe(Effect.provideServices(services)),
         scope,
       ),

@@ -51,6 +51,7 @@ import {
   PROVIDER_RUNTIME_INGESTION_CONSUMER,
   ProviderRuntimeEventRepository,
 } from "../../persistence/Services/ProviderRuntimeEvents.ts";
+import type { ProjectionRepositoryError } from "../../persistence/Errors.ts";
 import {
   PROVIDER_REQUEST_LIMIT_PER_THREAD,
   ProviderRequestAdmissionRepository,
@@ -1953,7 +1954,10 @@ const make = Effect.gen(function* () {
       { readonly type: "request.opened" | "user-input.requested" }
     >,
     threadId: ThreadId,
-  ): Effect.fn.Return<ProviderRequestAdmissionIdentity | null> {
+  ): Effect.fn.Return<
+    ProviderRequestAdmissionIdentity | null,
+    ProjectionRepositoryError | ProviderRequestOverflowSettlementError
+  > {
     const interactionKind = guardedProviderRequestKind(event);
     if (interactionKind === null) return null;
     if (event.requestId === undefined) {
@@ -2025,7 +2029,8 @@ const make = Effect.gen(function* () {
     threadId: ThreadId,
   ): Effect.fn.Return<
     | { readonly shouldProject: true; readonly identity: ProviderRequestAdmissionIdentity | null }
-    | { readonly shouldProject: false }
+    | { readonly shouldProject: false },
+    ProjectionRepositoryError
   > {
     const interactionKind = guardedProviderRequestKind(event);
     if (interactionKind === null || event.requestId === undefined) {

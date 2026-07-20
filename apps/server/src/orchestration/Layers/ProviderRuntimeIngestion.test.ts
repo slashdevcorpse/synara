@@ -17,6 +17,7 @@ import {
   MessageId,
   ProjectId,
   RuntimeItemId,
+  RuntimeRequestId,
   ThreadId,
   TurnId,
 } from "@synara/contracts";
@@ -4950,7 +4951,7 @@ describe("ProviderRuntimeIngestion", () => {
         createdAt: new Date().toISOString(),
         threadId: asThreadId("thread-1"),
         lifecycleGeneration: generation,
-        requestId: ApprovalRequestId.makeUnsafe("req-restart-reconnected-overflow"),
+        requestId: RuntimeRequestId.makeUnsafe("req-restart-reconnected-overflow"),
         payload: { requestType: "command_execution_approval" },
       }),
     );

@@ -1457,6 +1457,7 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
         threadId: input.threadId,
         terminalId: input.terminalId,
         createdAt: new Date().toISOString(),
+        generation: this.generation,
       });
     });
   }
@@ -1756,6 +1757,7 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
         threadId: session.threadId,
         terminalId: session.terminalId,
         createdAt: new Date().toISOString(),
+        generation: this.generation,
         snapshot: this.snapshot(session),
       });
       if (session.detectedCliKind) {
@@ -1783,6 +1785,7 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
         threadId: session.threadId,
         terminalId: session.terminalId,
         createdAt: new Date().toISOString(),
+        generation: this.generation,
         message,
       });
       this.logger.error("failed to start terminal", {
@@ -1903,6 +1906,7 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
         threadId: session.threadId,
         terminalId: session.terminalId,
         createdAt: new Date().toISOString(),
+        generation: this.generation,
         data,
         byteLength,
       });
@@ -2070,6 +2074,7 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
       threadId: session.threadId,
       terminalId: session.terminalId,
       createdAt: new Date().toISOString(),
+      generation: this.generation,
       exitCode: session.exitCode,
       exitSignal: session.exitSignal,
     });
@@ -2817,6 +2822,7 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
       threadId: session.threadId,
       terminalId: session.terminalId,
       createdAt: new Date().toISOString(),
+      generation: this.generation,
       hasRunningSubprocess: session.hasRunningSubprocess,
       cliKind: session.detectedCliKind,
       agentState: deriveActivityAgentState(session),

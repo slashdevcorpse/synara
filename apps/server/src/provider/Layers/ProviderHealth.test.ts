@@ -252,11 +252,12 @@ function unwrapContainedProviderCommand(cmd: PreparedMockCommand): PreparedMockC
       : target.startsWith("\\") && !target.startsWith("\\\\")
         ? target.replaceAll("\\", "/")
         : target;
+  const options =
+    cmd.args[3] === "verbatim" ? { ...cmd.options, windowsVerbatimArguments: true } : cmd.options;
   return {
     command: unwrappedTarget,
     args: cmd.args.slice(6),
-    options:
-      cmd.args[3] === "verbatim" ? { ...cmd.options, windowsVerbatimArguments: true } : cmd.options,
+    ...(options ? { options } : {}),
   };
 }
 
