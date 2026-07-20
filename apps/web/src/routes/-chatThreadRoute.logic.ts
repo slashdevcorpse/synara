@@ -13,8 +13,8 @@ export interface ChatPanelStateSnapshot {
   panel: ChatRightPanel | "file" | null;
   diffTurnId: TurnId | null;
   diffFilePath: string | null;
-  filePath?: string | null;
-  browserRequest?: BrowserNavigationRequest | null;
+  filePath: string | null;
+  browserRequest: BrowserNavigationRequest | null;
 }
 
 export interface ChatPanelStatePatch {

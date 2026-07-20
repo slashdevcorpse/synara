@@ -340,7 +340,8 @@ describe("localImageEffectRouteLayer", () => {
     const imagePath = path.join(siteDir, "assets", "hero.png");
     const pdfPath = path.join(siteDir, "assets", "spec.pdf");
     mkdirSync(path.dirname(cssPath), { recursive: true });
-    writeFileSync(entryPath, "<!doctype html><link rel=stylesheet href=assets/site.css>");
+    const entryContents = "<!doctype html><link rel=stylesheet href=assets/site.css>";
+    writeFileSync(entryPath, entryContents);
     writeFileSync(cssPath, "body { color: red; }");
     writeFileSync(jsPath, "globalThis.loaded = true;");
     writeFileSync(wasmPath, Buffer.from([0x00, 0x61, 0x73, 0x6d]));
@@ -362,6 +363,9 @@ describe("localImageEffectRouteLayer", () => {
         const entryResponse = await fetch(`${origin}${grant.urlPath}`);
         expect(entryResponse.status).toBe(200);
         expect(entryResponse.headers.get("content-type")).toBe("text/html; charset=utf-8");
+        expect(entryResponse.headers.get("content-length")).toBe(
+          String(Buffer.byteLength(entryContents)),
+        );
         expect(entryResponse.headers.get("cache-control")).toBe("no-store");
         expect(entryResponse.headers.get("x-content-type-options")).toBe("nosniff");
         expect(entryResponse.headers.get("referrer-policy")).toBe("no-referrer");

@@ -103,4 +103,4 @@ The isolated Windows run exercised the real Electron renderer and `<webview>`. T
 - Grants are small in-memory records; opening a file does not launch a per-click static server.
 - Relative assets reuse the existing server and capability prefix.
 - No transcript virtualization, measurement, or auto-scroll behavior changed, so preview rendering cannot introduce a measure/scroll feedback loop.
-- Expired pages fail closed. The explicit browser toolbar reload remints a capability; raw Chromium reload after expiry intentionally receives Not Found.
+- Expired pages fail closed. The explicit browser toolbar reload mints a fresh capability; raw Chromium reload after expiry intentionally receives Not Found.

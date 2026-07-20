@@ -83,6 +83,13 @@ describe("isAllowedBrowserNavigation", () => {
     expect(isAllowedBrowserNavigation({ url: "about:blank" })).toBe(true);
   });
 
+  it("denies username and password credentials on ordinary HTTP(S) navigation", () => {
+    expect(isAllowedBrowserNavigation({ url: "https://user@example.com/private" })).toBe(false);
+    expect(
+      isAllowedBrowserNavigation({ url: "http://user:password@localhost:5173/private" }),
+    ).toBe(false);
+  });
+
   it("denies raw file URLs, custom schemes, malformed URLs, and unmarked capability routes", () => {
     expect(isAllowedBrowserNavigation({ url: "file:///C:/work/index.html" })).toBe(false);
     expect(isAllowedBrowserNavigation({ url: "synara://browser" })).toBe(false);
@@ -150,6 +157,15 @@ describe("resolveManagedBrowserNavigation", () => {
       localPreviewCapability: null,
       url: "https://example.com/",
     });
+  });
+
+  it("rejects ordinary browser commands containing URL credentials", () => {
+    expect(() =>
+      resolveManagedBrowserNavigation({ url: "https://user@example.com/private" }),
+    ).toThrow("This browser URL is not allowed.");
+    expect(() =>
+      resolveManagedBrowserNavigation({ url: "http://user:password@localhost:5173/private" }),
+    ).toThrow("This browser URL is not allowed.");
   });
 
   it("accepts a trusted capability only when paired with a display path", () => {

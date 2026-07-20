@@ -683,7 +683,7 @@ export function WorkspaceFilePreview(props: WorkspaceFilePreviewProps) {
         onOpenInBrowser={
           fileIsHtml && props.onOpenInBrowser ? () => void handleOpenInBrowser() : undefined
         }
-        onCopyPreviewUrl={fileIsHtml && htmlPreviewUrl ? handleCopyPreviewUrl : undefined}
+        onCopyPreviewUrl={fileIsHtml ? handleCopyPreviewUrl : undefined}
         onRefreshPreview={fileIsHtml ? handleRefreshPreview : undefined}
         openingInBrowser={browserOpenStateForFile?.status === "opening"}
         truncated={fileQuery.data?.truncated ?? false}
@@ -702,7 +702,7 @@ export function WorkspaceFilePreview(props: WorkspaceFilePreviewProps) {
             >
               Retry
             </button>
-          ) : browserOpenStateForFile.action === "copy-url" && htmlPreviewUrl ? (
+          ) : browserOpenStateForFile.action === "copy-url" && fileIsHtml ? (
             <button
               type="button"
               className="shrink-0 cursor-pointer rounded-md border border-border px-2 py-1 text-foreground hover:bg-secondary"

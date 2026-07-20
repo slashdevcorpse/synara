@@ -1,6 +1,7 @@
 import nodePath from "node:path";
 
 import Mime from "@effect/platform-node/Mime";
+import * as NodeStream from "@effect/platform-node/NodeStream";
 import {
   AuthBootstrapInput,
   AuthCreatePairingCredentialInput,
@@ -39,6 +40,7 @@ import { ServerConfig, type ServerConfigShape } from "./config";
 import { resolveCachedEditorIcon } from "./editorAppIcons";
 import {
   LOCAL_IMAGE_ROUTE_PATH,
+  openResolvedLocalPreviewFile,
   resolveAllowedLocalPreviewFile,
   resolveLocalPreviewGrantResource,
 } from "./localImageFiles.ts";
@@ -799,17 +801,17 @@ export const editorIconEffectRouteLayer = HttpRouter.add(
 // Streams a disk file as the response body instead of buffering it in memory:
 // preview files can be large (PDFs especially), and a full-file buffer per
 // request is an easy way to balloon server memory under concurrent loads.
-// Callers must have stat'ed the file already — an unreadable file after that
-// point aborts the connection mid-stream, which clients surface as a failed
-// load (the same outcome the buffered 404 produced, minus the status code).
+// Callers supply the already-selected body stream and its matching size. An
+// unreadable file after that point aborts the connection mid-stream, which
+// clients surface as a failed load without buffering the file in server memory.
 function streamedFileResponse(input: {
-  readonly fileSystem: FileSystem.FileSystem;
+  readonly stream: Stream.Stream<Uint8Array, unknown>;
   readonly path: string;
   readonly sizeBytes: number;
   readonly headers: Record<string, string>;
   readonly contentType?: string;
 }): HttpServerResponse.HttpServerResponse {
-  return HttpServerResponse.stream(input.fileSystem.stream(input.path), {
+  return HttpServerResponse.stream(input.stream, {
     status: 200,
     contentType: input.contentType ?? Mime.getType(input.path) ?? "application/octet-stream",
     contentLength: input.sizeBytes,
@@ -842,16 +844,22 @@ const legacyLocalImageEffectRouteLayer = HttpRouter.add(
       return HttpServerResponse.text("Not Found", { status: 404 });
     }
 
+    const openedPreviewFile = yield* Effect.promise(() =>
+      openResolvedLocalPreviewFile(previewFile),
+    );
+    if (!openedPreviewFile) {
+      return HttpServerResponse.text("Not Found", { status: 404 });
+    }
+
     // Stream (don't use HttpServerResponse.file, which depends on
     // Etag.Generator/Path services and was failing with a 500 here).
-    const fileSystem = yield* FileSystem.FileSystem;
     const isDownload = url.searchParams.get("download") === "1";
-    const safeFileName = previewFile.fileName.replaceAll('"', "");
-    const isSvg = nodePath.extname(previewFile.path).toLowerCase() === ".svg";
+    const safeFileName = openedPreviewFile.fileName.replaceAll('"', "");
+    const isSvg = nodePath.extname(openedPreviewFile.path).toLowerCase() === ".svg";
     return streamedFileResponse({
-      fileSystem,
-      path: previewFile.path,
-      sizeBytes: previewFile.sizeBytes,
+      stream: NodeStream.fromReadable({ evaluate: () => openedPreviewFile.readable }),
+      path: openedPreviewFile.path,
+      sizeBytes: openedPreviewFile.sizeBytes,
       headers: {
         "Cache-Control": "private, max-age=60",
         // The PDF viewer fetches bytes from either the desktop app origin or
@@ -941,12 +949,17 @@ const localPreviewCapabilityEffectRouteLayer = HttpRouter.add(
     if (!contentType) {
       return HttpServerResponse.text("Not Found", { status: 404 });
     }
-    const fileSystem = yield* FileSystem.FileSystem;
-    const isSvg = nodePath.extname(previewFile.path).toLowerCase() === ".svg";
+    const openedPreviewFile = yield* Effect.promise(() =>
+      openResolvedLocalPreviewFile(previewFile),
+    );
+    if (!openedPreviewFile) {
+      return HttpServerResponse.text("Not Found", { status: 404 });
+    }
+    const isSvg = nodePath.extname(openedPreviewFile.path).toLowerCase() === ".svg";
     return streamedFileResponse({
-      fileSystem,
-      path: previewFile.path,
-      sizeBytes: previewFile.sizeBytes,
+      stream: NodeStream.fromReadable({ evaluate: () => openedPreviewFile.readable }),
+      path: openedPreviewFile.path,
+      sizeBytes: openedPreviewFile.sizeBytes,
       contentType,
       headers: {
         "Cache-Control": "no-store",
@@ -1237,7 +1250,7 @@ export const attachmentsEffectRouteLayer = HttpRouter.add(
     // Mirror local-image serving instead of using HttpServerResponse.file; the Effect
     // route stack used by the desktop server can miss that helper's file services.
     return streamedFileResponse({
-      fileSystem,
+      stream: fileSystem.stream(filePath),
       path: filePath,
       sizeBytes: Number(fileInfo.size),
       // Attachment access is session/token gated and attachments are mutable

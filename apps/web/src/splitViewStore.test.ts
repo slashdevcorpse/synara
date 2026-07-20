@@ -9,7 +9,6 @@ import { collectLeaves, findParentSplitNode } from "./splitView.logic";
 import {
   resolvePreferredSplitViewIdForThread,
   resolveSplitViewFocusedThreadId,
-  resolveSplitViewLeaves,
   resolveSplitViewPaneIdForThread,
   resolveSplitViewThreadIds,
   useSplitViewStore,
@@ -157,8 +156,8 @@ describe("splitViewStore", () => {
       },
     });
 
-    const runtimeLeaf = resolveSplitViewLeaves(
-      freshSplitViewStore.getState().splitViewsById[splitViewId]!,
+    const runtimeLeaf = collectLeaves(
+      freshSplitViewStore.getState().splitViewsById[splitViewId]!.root,
     ).find((leaf) => leaf.id === paneId);
     expect(runtimeLeaf?.panel.browserRequest?.id).toBe("request-1");
     const persisted = globalThis.localStorage.getItem("synara:split-view-state:v1") ?? "";
@@ -189,14 +188,13 @@ describe("splitViewStore", () => {
     globalThis.localStorage.setItem(storageKey, JSON.stringify(payload));
 
     vi.resetModules();
-    const { resolveSplitViewLeaves: resolveFreshLeaves, useSplitViewStore: readerStore } =
-      await import("./splitViewStore");
+    const { useSplitViewStore: readerStore } = await import("./splitViewStore");
     const hydrated = readerStore.getState().splitViewsById[splitViewId];
     expect(hydrated).toBeDefined();
     if (!hydrated) return;
-    expect(resolveFreshLeaves(hydrated).every((leaf) => leaf.panel.browserRequest === null)).toBe(
-      true,
-    );
+    expect(
+      collectLeaves(hydrated.root).every((leaf) => leaf.panel.browserRequest === null),
+    ).toBe(true);
   });
 
   it("replaces an existing source split when creating a drop split for the same source", () => {
@@ -274,7 +272,7 @@ describe("splitViewStore", () => {
     expect(migrated.root.kind).toBe("split");
     expect(resolveFreshThreadIds(migrated).toSorted()).toEqual([THREAD_A, THREAD_B].toSorted());
     expect(resolveFreshFocusedThreadId(migrated)).toBe(THREAD_B);
-    for (const leaf of resolveSplitViewLeaves(migrated)) {
+    for (const leaf of collectLeaves(migrated.root)) {
       expect(leaf.panel.filePath).toBeNull();
       expect(leaf.panel.browserRequest).toBeNull();
     }

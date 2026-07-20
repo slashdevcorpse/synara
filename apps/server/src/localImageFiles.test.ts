@@ -1,5 +1,14 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import crypto from "node:crypto";
+import {
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, it } from "vitest";
@@ -8,6 +17,7 @@ import {
   LOCAL_PREVIEW_GRANT_TTL_MS,
   LocalPreviewGrantError,
   createLocalPreviewGrant,
+  openResolvedLocalPreviewFile,
   resolveAllowedLocalPreviewFile,
   resolveLocalPreviewGrantRealPath,
   resolveLocalPreviewGrantResource,
@@ -19,6 +29,18 @@ function makeTempDir(prefix: string): string {
   const directory = mkdtempSync(path.join(os.tmpdir(), prefix));
   tempDirs.push(directory);
   return directory;
+}
+
+function supportsFileSymlinks(targetPath: string, directory: string): boolean {
+  const probePath = path.join(directory, `.symlink-probe-${crypto.randomUUID()}`);
+  try {
+    symlinkSync(targetPath, probePath, "file");
+    rmSync(probePath, { force: true });
+    return true;
+  } catch {
+    rmSync(probePath, { force: true });
+    return false;
+  }
 }
 
 afterEach(() => {
@@ -595,5 +617,79 @@ describe("local preview grants", () => {
       }),
       null,
     );
+  });
+
+  it("rejects a final file replaced by an outside symlink after validation", async () => {
+    const workspace = makeTempDir("synara-directory-preview-open-race-");
+    const outsideRoot = makeTempDir("synara-directory-preview-open-race-outside-");
+    const entryPath = path.join(workspace, "index.html");
+    const assetPath = path.join(workspace, "app.js");
+    const originalAssetPath = path.join(workspace, "app.original.js");
+    const outsidePath = path.join(outsideRoot, "secret.js");
+    writeFileSync(entryPath, "<!doctype html>");
+    writeFileSync(assetPath, "globalThis.safe = true;");
+    writeFileSync(outsidePath, "globalThis.secret = true;");
+    if (!supportsFileSymlinks(outsidePath, workspace)) {
+      return;
+    }
+
+    const grant = await createLocalPreviewGrant({
+      requestedPath: entryPath,
+      cwd: workspace,
+      allowedWorkspaceRoots: [workspace],
+      scope: "directory",
+      purpose: "browser",
+    });
+    const resolved = await resolveLocalPreviewGrantResource({
+      token: grant.grant,
+      encodedRelativePath: "app.js",
+    });
+    assert.ok(resolved);
+
+    renameSync(assetPath, originalAssetPath);
+    symlinkSync(outsidePath, assetPath, "file");
+
+    assert.equal(await openResolvedLocalPreviewFile(resolved), null);
+  });
+
+  it("streams the verified descriptor after the final file path is replaced", async () => {
+    const workspace = makeTempDir("synara-directory-preview-stream-race-");
+    const outsideRoot = makeTempDir("synara-directory-preview-stream-race-outside-");
+    const entryPath = path.join(workspace, "index.html");
+    const assetPath = path.join(workspace, "app.js");
+    const originalAssetPath = path.join(workspace, "app.original.js");
+    const outsidePath = path.join(outsideRoot, "secret.js");
+    const safeBytes = Buffer.from("globalThis.safe = true;");
+    writeFileSync(entryPath, "<!doctype html>");
+    writeFileSync(assetPath, safeBytes);
+    writeFileSync(outsidePath, "globalThis.secret = true;");
+    if (!supportsFileSymlinks(outsidePath, workspace)) {
+      return;
+    }
+
+    const grant = await createLocalPreviewGrant({
+      requestedPath: entryPath,
+      cwd: workspace,
+      allowedWorkspaceRoots: [workspace],
+      scope: "directory",
+      purpose: "browser",
+    });
+    const resolved = await resolveLocalPreviewGrantResource({
+      token: grant.grant,
+      encodedRelativePath: "app.js",
+    });
+    assert.ok(resolved);
+    const opened = await openResolvedLocalPreviewFile(resolved);
+    assert.ok(opened);
+
+    renameSync(assetPath, originalAssetPath);
+    symlinkSync(outsidePath, assetPath, "file");
+
+    const chunks: Buffer[] = [];
+    for await (const chunk of opened.readable) {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    }
+    assert.deepEqual(Buffer.concat(chunks), safeBytes);
+    assert.equal(opened.sizeBytes, safeBytes.byteLength);
   });
 });

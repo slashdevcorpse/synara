@@ -8,6 +8,7 @@ import {
   hardenAttachedBrowserParams,
   hardenAttachedBrowserWebPreferences,
 } from "./browserWebPreferences";
+import { BROWSER_SESSION_PARTITION } from "./browserSessionPolicy";
 
 describe("browser web preferences", () => {
   it("removes renderer-supplied privileges before a guest attaches", () => {
@@ -36,15 +37,15 @@ describe("browser web preferences", () => {
     expect(preferences).not.toHaveProperty("preload");
   });
 
-  it("forces every attached guest to start on an inert document", () => {
+  it("forces every attached guest onto the managed partition and an inert document", () => {
     const params = {
-      partition: "persist:synara-browser",
+      partition: "persist:renderer-controlled-partition",
       src: "http://127.0.0.1:58090/api/local-preview/bearer/index.html",
     };
 
     hardenAttachedBrowserParams(params);
 
     expect(params.src).toBe("about:blank");
-    expect(params.partition).toBe("persist:synara-browser");
+    expect(params.partition).toBe(BROWSER_SESSION_PARTITION);
   });
 });

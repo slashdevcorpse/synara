@@ -4,6 +4,8 @@
 
 import type { WebPreferences } from "electron";
 
+import { BROWSER_SESSION_PARTITION } from "./browserSessionPolicy";
+
 export const ATTACHED_BROWSER_INITIAL_URL = "about:blank";
 
 /**
@@ -28,5 +30,6 @@ export function hardenAttachedBrowserWebPreferences(webPreferences: WebPreferenc
  * verify their document-start guard before any untrusted document can run.
  */
 export function hardenAttachedBrowserParams(params: Record<string, string>): void {
+  params.partition = BROWSER_SESSION_PARTITION;
   params.src = ATTACHED_BROWSER_INITIAL_URL;
 }

@@ -125,7 +125,7 @@ export function isAllowedBrowserNavigation(input: {
     if (url.href === "about:blank") {
       return true;
     }
-    return isHttpUrl(url) && !isLocalPreviewRouteCandidate(url);
+    return isHttpUrl(url) && !hasCredentials(url) && !isLocalPreviewRouteCandidate(url);
   }
 
   if (!isHttpUrl(url) || hasCredentials(url) || url.origin !== capability.origin) {

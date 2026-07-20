@@ -224,6 +224,15 @@ function toWsRpcError(cause: unknown, fallbackMessage: string) {
       });
 }
 
+export function createLocalPreviewGrantRpcEffect(
+  input: Parameters<typeof createLocalPreviewGrant>[0],
+) {
+  return Effect.tryPromise({
+    try: () => createLocalPreviewGrant(input),
+    catch: (cause) => toWsRpcError(cause, "Failed to create local file preview grant"),
+  });
+}
+
 export function ensureShellProjectionReady<E>(
   readSnapshotSequence: () => Effect.Effect<{ readonly snapshotSequence: number }, E>,
   throughSequenceInclusive: number,
@@ -838,17 +847,15 @@ const makeWsRpcHandlersLayer = () =>
                   }
                 }
               }
-              return yield* Effect.promise(() =>
-                createLocalPreviewGrant({
-                  requestedPath: input.path,
-                  ...(input.cwd !== undefined ? { cwd: input.cwd } : {}),
-                  ...(input.scope !== undefined ? { scope: input.scope } : {}),
-                  ...(input.purpose !== undefined ? { purpose: input.purpose } : {}),
-                  ...(input.scope === "directory"
-                    ? { allowedWorkspaceRoots: Array.from(allowedWorkspaceRoots) }
-                    : {}),
-                }),
-              );
+              return yield* createLocalPreviewGrantRpcEffect({
+                requestedPath: input.path,
+                ...(input.cwd !== undefined ? { cwd: input.cwd } : {}),
+                ...(input.scope !== undefined ? { scope: input.scope } : {}),
+                ...(input.purpose !== undefined ? { purpose: input.purpose } : {}),
+                ...(input.scope === "directory"
+                  ? { allowedWorkspaceRoots: Array.from(allowedWorkspaceRoots) }
+                  : {}),
+              });
             }),
             "Failed to create local file preview grant",
           ),

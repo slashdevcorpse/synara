@@ -6,9 +6,11 @@
 // Depends on: fs realpath/stat, trusted workspace roots, and safe preview extensions
 
 import crypto from "node:crypto";
+import { constants as fsConstants } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import type { Readable } from "node:stream";
 
 import {
   LOCAL_IMAGE_ROUTE_PATH,
@@ -27,8 +29,13 @@ export { LOCAL_IMAGE_ROUTE_PATH, LOCAL_PREVIEW_ROUTE_PREFIX };
 export interface ResolvedLocalPreviewFile {
   readonly path: string;
   readonly fileName: string;
-  /** From the allowlist stat, so responses can set Content-Length without re-statting. */
+  /** From validation; verified-open callers replace this with the descriptor size. */
   readonly sizeBytes: number;
+  /** Stable identity captured while validating the canonical path. */
+  readonly fileIdentity: {
+    readonly device: bigint;
+    readonly inode: bigint;
+  };
 }
 
 export interface LocalPreviewGrantResult {
@@ -42,6 +49,11 @@ export type LocalPreviewGrantPurpose = "preview" | "browser";
 export interface ResolvedLocalPreviewGrantResource extends ResolvedLocalPreviewFile {
   readonly purpose: LocalPreviewGrantPurpose;
 }
+
+export type OpenedLocalPreviewFile<T extends ResolvedLocalPreviewFile = ResolvedLocalPreviewFile> =
+  T & {
+    readonly readable: Readable;
+  };
 
 export type LocalPreviewGrantErrorCode =
   | "invalid-path"
@@ -278,14 +290,18 @@ export async function resolveAllowedLocalPreviewFile(input: {
     return null;
   }
 
-  const stat = await fs.stat(realFilePath).catch(() => null);
+  const stat = await fs.lstat(realFilePath, { bigint: true }).catch(() => null);
   if (!stat?.isFile()) {
     return null;
   }
   const resolved: ResolvedLocalPreviewFile = {
     path: realFilePath,
     fileName: path.basename(realFilePath),
-    sizeBytes: stat.size,
+    sizeBytes: Number(stat.size),
+    fileIdentity: {
+      device: stat.dev,
+      inode: stat.ino,
+    },
   };
 
   // The workspace check covers the common case (file previews), so resolve it
@@ -371,16 +387,63 @@ export async function resolveLocalPreviewGrantResource(input: {
     return null;
   }
 
-  const stat = await fs.stat(realFilePath).catch(() => null);
+  const stat = await fs.lstat(realFilePath, { bigint: true }).catch(() => null);
   if (!stat?.isFile()) {
     return null;
   }
   return {
     path: realFilePath,
     fileName: path.basename(realFilePath),
-    sizeBytes: stat.size,
+    sizeBytes: Number(stat.size),
+    fileIdentity: {
+      device: stat.dev,
+      inode: stat.ino,
+    },
     purpose: grant.purpose,
   };
+}
+
+/**
+ * Opens a previously validated preview path and binds all response reads to that
+ * descriptor. The identity check rejects a final-path replacement between
+ * validation and open; streaming the same handle prevents a later replacement
+ * from changing the bytes served.
+ *
+ * Node does not expose portable descriptor-relative open primitives, so this
+ * protects the final file entry but cannot eliminate a malicious concurrent
+ * replacement of an ancestor directory on every supported platform.
+ */
+export async function openResolvedLocalPreviewFile<T extends ResolvedLocalPreviewFile>(
+  resolved: T,
+): Promise<OpenedLocalPreviewFile<T> | null> {
+  let handle: Awaited<ReturnType<typeof fs.open>> | undefined;
+  try {
+    const noFollowFlag = process.platform === "win32" ? 0 : fsConstants.O_NOFOLLOW;
+    handle = await fs.open(resolved.path, fsConstants.O_RDONLY | noFollowFlag);
+    const descriptorStat = await handle.stat({ bigint: true });
+    if (
+      !descriptorStat.isFile() ||
+      descriptorStat.dev !== resolved.fileIdentity.device ||
+      descriptorStat.ino !== resolved.fileIdentity.inode
+    ) {
+      await handle.close().catch(() => undefined);
+      handle = undefined;
+      return null;
+    }
+
+    const readable = handle.createReadStream({ autoClose: true });
+    handle = undefined;
+    return {
+      ...resolved,
+      sizeBytes: Number(descriptorStat.size),
+      readable,
+    };
+  } catch {
+    if (handle) {
+      await handle.close().catch(() => undefined);
+    }
+    return null;
+  }
 }
 
 async function createExactFilePreviewGrant(input: {

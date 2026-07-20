@@ -57,6 +57,7 @@ function createQueryClient(): QueryClient {
 
 function renderHtmlPreview(props?: {
   onOpenInBrowser?: Parameters<typeof WorkspaceFilePreview>[0]["onOpenInBrowser"];
+  queryClient?: QueryClient;
   width?: number;
 }) {
   const host = document.createElement("div");
@@ -68,7 +69,7 @@ function renderHtmlPreview(props?: {
   });
   document.body.append(host);
   return render(
-    <QueryClientProvider client={createQueryClient()}>
+    <QueryClientProvider client={props?.queryClient ?? createQueryClient()}>
       <WorkspaceFilePreview
         workspaceRoot="/repo/worktree"
         filePath="docs/demo.html"
@@ -231,11 +232,17 @@ describe("WorkspaceFilePreview HTML", () => {
 
   it("remints an expired capability before copying the preview URL", async () => {
     const initialNow = Date.now();
-    await renderHtmlPreview();
+    const queryClient = createQueryClient();
+    const preview = await renderHtmlPreview({ queryClient });
     await vi.waitFor(() => expect(document.querySelector("iframe")).not.toBeNull());
 
     const dateNow = vi.spyOn(Date, "now").mockReturnValue(initialNow + 180_000);
     try {
+      await preview.rerender(
+        <QueryClientProvider client={queryClient}>
+          <WorkspaceFilePreview workspaceRoot="/repo/worktree" filePath="docs/demo.html" />
+        </QueryClientProvider>,
+      );
       await page.getByRole("button", { name: "More actions" }).click();
       await page.getByRole("menuitem", { name: "Copy preview URL" }).click();
       await vi.waitFor(() => {
@@ -243,6 +250,46 @@ describe("WorkspaceFilePreview HTML", () => {
           ([input]) => (input as { purpose?: string }).purpose === "preview",
         );
         expect(previewCalls).toHaveLength(2);
+      });
+    } finally {
+      dateNow.mockRestore();
+    }
+  });
+
+  it("keeps copy retry available when reminting an expired capability fails", async () => {
+    const initialNow = Date.now();
+    const queryClient = createQueryClient();
+    const preview = await renderHtmlPreview({ queryClient });
+    await vi.waitFor(() => expect(document.querySelector("iframe")).not.toBeNull());
+
+    const dateNow = vi.spyOn(Date, "now").mockReturnValue(initialNow + 180_000);
+    createGrantMock.mockRejectedValueOnce(new Error("Could not remint the preview capability."));
+    try {
+      await preview.rerender(
+        <QueryClientProvider client={queryClient}>
+          <WorkspaceFilePreview workspaceRoot="/repo/worktree" filePath="docs/demo.html" />
+        </QueryClientProvider>,
+      );
+      await page.getByRole("button", { name: "More actions" }).click();
+      await page.getByRole("menuitem", { name: "Copy preview URL" }).click();
+      const getCopyRetryButton = () => {
+        const copyAlert = [...document.querySelectorAll<HTMLElement>('[role="alert"]')].find(
+          (alert) => alert.textContent?.includes("Could not create a current preview URL."),
+        );
+        return copyAlert?.querySelector<HTMLButtonElement>("button") ?? null;
+      };
+      await vi.waitFor(() => expect(getCopyRetryButton()?.textContent).toBe("Retry"));
+
+      const copyRetryButton = getCopyRetryButton();
+      if (!copyRetryButton) {
+        throw new Error("Copy preview retry button was not rendered.");
+      }
+      copyRetryButton.click();
+      await vi.waitFor(() => {
+        const previewCalls = createGrantMock.mock.calls.filter(
+          ([input]) => (input as { purpose?: string }).purpose === "preview",
+        );
+        expect(previewCalls).toHaveLength(3);
       });
     } finally {
       dateNow.mockRestore();
