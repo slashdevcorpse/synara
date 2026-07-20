@@ -45,6 +45,16 @@ function missingTicketEvidence(name: string) {
   };
 }
 
+function directMissingTicketEvidence(name: string) {
+  return {
+    command: "xcrun stapler validate" as const,
+    exitCode: 65,
+    output: [`Processing: /tmp/${name}`, `${name} does not have a ticket stapled to it.`].join(
+      "\n",
+    ),
+  };
+}
+
 function replaceIdentity(
   identities: ReadonlyArray<MacSignatureIdentity>,
   path: string,
@@ -243,13 +253,46 @@ describe("Super Synara macOS signature evidence", () => {
   });
 
   it("accepts only the reviewed explicit missing-ticket diagnostic", () => {
+    for (const evidence of [
+      validReport().notarization.appBundle.evidence,
+      directMissingTicketEvidence("Super Synara.app"),
+    ]) {
+      expect(hasExplicitMissingNotarizationTicketEvidence(evidence)).toBe(true);
+      expect(classifyMacNotarizationTicket(evidence)).toBe("absent");
+    }
+    const directReport = {
+      ...validReport(),
+      notarization: {
+        diskImage: {
+          ticket: "absent" as const,
+          evidence: directMissingTicketEvidence(
+            "Super-Synara-0.5.5-super.1-macos-arm64-unsigned.dmg",
+          ),
+        },
+        appBundle: {
+          ticket: "absent" as const,
+          evidence: directMissingTicketEvidence("Super Synara.app"),
+        },
+      },
+    };
+    expect(validateMacUnsignedSignatureReport(directReport, allowlist)).toEqual(directReport);
     expect(
-      hasExplicitMissingNotarizationTicketEvidence(validReport().notarization.appBundle.evidence),
-    ).toBe(true);
+      hasExplicitMissingNotarizationTicketEvidence({
+        ...directMissingTicketEvidence("Super Synara.app"),
+        exitCode: 1,
+      }),
+    ).toBe(false);
+    expect(
+      hasExplicitMissingNotarizationTicketEvidence({
+        ...directMissingTicketEvidence("Super Synara.app"),
+        command: "xcrun notarytool history",
+      }),
+    ).toBe(false);
     for (const output of [
       "Could not establish secure connection to api.apple-cloudkit.com",
       "Could not validate ticket for /tmp/Super Synara.app",
       'CloudKit query for Super Synara.app (2/abc) failed due to "Record not found".\nCould not find base64 encoded ticket in response for 2/abc\nNSURLErrorDomain timed out',
+      "Super Synara.app does not have a ticket stapled to it.\nNSURLErrorDomain timed out",
       "CloudKit response was corrupt",
       "",
     ]) {

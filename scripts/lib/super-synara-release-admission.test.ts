@@ -59,6 +59,7 @@ async function createPlatformStaging(): Promise<{
   directory: string;
   licensePath: string;
   macSignatureAllowlist: MacSignatureAllowlist;
+  releaseScope: "windows-and-macos";
 }> {
   const directory = mkdtempSync(join(tmpdir(), "super-synara-release-admission-test-"));
   const licenseRoot = mkdtempSync(join(tmpdir(), "super-synara-release-license-test-"));
@@ -270,21 +271,39 @@ async function createPlatformStaging(): Promise<{
   });
   const licensePath = join(licenseRoot, "LICENSE");
   writeFileSync(licensePath, "MIT fixture\n");
-  return { directory, licensePath, macSignatureAllowlist };
+  return {
+    directory,
+    licensePath,
+    macSignatureAllowlist,
+    releaseScope: "windows-and-macos",
+  };
+}
+
+async function createWindowsPlatformStaging(): Promise<{
+  directory: string;
+  licensePath: string;
+}> {
+  const staged = await createPlatformStaging();
+  const names = superSynaraReleaseFileNames(coordinates.version);
+  unlinkSync(join(staged.directory, names.macosDiskImage));
+  unlinkSync(join(staged.directory, names.macosProvenance));
+  return { directory: staged.directory, licensePath: staged.licensePath };
 }
 
 describe("Super Synara release admission", () => {
   it("creates the exact eight-file set with canonical checksums and a complete index", async () => {
-    const { directory, licensePath, macSignatureAllowlist } = await createPlatformStaging();
+    const { directory, licensePath, macSignatureAllowlist, releaseScope } =
+      await createPlatformStaging();
     const index = prepareSuperSynaraRelease({
       directory,
       licensePath,
+      releaseScope,
       macSignatureAllowlist,
       coordinates,
       maxTotalBytes: 10_000_000,
     });
     expect(index.files.map((file) => file.fileName)).toEqual(
-      exactSuperSynaraReleaseAllowlist(coordinates.version).filter(
+      exactSuperSynaraReleaseAllowlist(coordinates.version, releaseScope).filter(
         (file) => file !== "release-index.json",
       ),
     );
@@ -303,11 +322,79 @@ describe("Super Synara release admission", () => {
     expect(
       verifyPreparedSuperSynaraRelease({
         directory,
+        releaseScope,
         macSignatureAllowlist,
         coordinates,
         maxTotalBytes: 10_000_000,
       }),
     ).toEqual(index);
+  });
+
+  it("creates and verifies the exact Windows-only six-file release", async () => {
+    const staged = await createWindowsPlatformStaging();
+    const releaseScope = "windows-only" as const;
+    const index = prepareSuperSynaraRelease({
+      ...staged,
+      releaseScope,
+      coordinates,
+      maxTotalBytes: 10_000_000,
+    });
+
+    expect(index.platforms).toEqual(["windows-x64"]);
+    expect(index.files.map((file) => file.fileName)).toEqual(
+      exactSuperSynaraReleaseAllowlist(coordinates.version, releaseScope).filter(
+        (file) => file !== "release-index.json",
+      ),
+    );
+    expect(
+      readFileSync(join(staged.directory, "SHA256SUMS.txt"), "utf8").split("\n").filter(Boolean),
+    ).toHaveLength(4);
+    const warning = readFileSync(join(staged.directory, "UNSIGNED-BUILD.md"), "utf8");
+    expect(warning).toContain("Windows x64 build");
+    expect(warning).toContain("SHA-256 for the installer");
+    expect(warning).not.toMatch(/Apple|macOS|Gatekeeper|DMG/);
+    expect(
+      verifyPreparedSuperSynaraRelease({
+        directory: staged.directory,
+        releaseScope,
+        coordinates,
+        maxTotalBytes: 10_000_000,
+      }),
+    ).toEqual(index);
+  });
+
+  it("keeps release scopes fail closed on macOS policy and asset drift", async () => {
+    const combined = await createPlatformStaging();
+    const { macSignatureAllowlist: _macSignatureAllowlist, ...combinedWithoutAllowlist } = combined;
+    expect(() =>
+      prepareSuperSynaraRelease({
+        ...combinedWithoutAllowlist,
+        coordinates,
+        maxTotalBytes: 10_000_000,
+      }),
+    ).toThrow("Combined release admission requires");
+
+    const windows = await createWindowsPlatformStaging();
+    writeFileSync(join(windows.directory, "unexpected-macos-arm64.dmg"), "mac payload");
+    expect(() =>
+      prepareSuperSynaraRelease({
+        ...windows,
+        releaseScope: "windows-only",
+        coordinates,
+        maxTotalBytes: 10_000_000,
+      }),
+    ).toThrow("Prohibited Super Synara release asset");
+
+    const windowsWithMacPolicy = await createWindowsPlatformStaging();
+    expect(() =>
+      prepareSuperSynaraRelease({
+        ...windowsWithMacPolicy,
+        releaseScope: "windows-only",
+        macSignatureAllowlist,
+        coordinates,
+        maxTotalBytes: 10_000_000,
+      }),
+    ).toThrow("must not include a macOS signature allowlist");
   });
 
   it("rejects prohibited files, byte-cap overflow, and post-admission mutation", async () => {
@@ -343,6 +430,7 @@ describe("Super Synara release admission", () => {
     expect(() =>
       verifyPreparedSuperSynaraRelease({
         directory: mutated.directory,
+        releaseScope: mutated.releaseScope,
         macSignatureAllowlist: mutated.macSignatureAllowlist,
         coordinates,
         maxTotalBytes: 10_000_000,
@@ -437,6 +525,7 @@ describe("Super Synara release admission", () => {
     expect(() =>
       verifyPreparedSuperSynaraRelease({
         directory: staged.directory,
+        releaseScope: staged.releaseScope,
         macSignatureAllowlist: staged.macSignatureAllowlist,
         coordinates,
         maxTotalBytes: 10_000_000,

@@ -5,7 +5,6 @@
 // Depends on: apps/desktop package metadata, electron-builder, and GitHub release config.
 
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -14,6 +13,7 @@ import desktopPackageJson from "../apps/desktop/package.json" with { type: "json
 import serverPackageJson from "../apps/server/package.json" with { type: "json" };
 
 import { BRAND_ASSET_PATHS } from "./lib/brand-assets.ts";
+import { DESKTOP_BUILD_ARCHES } from "./lib/desktop-build-options.ts";
 import { createDesktopBuilderCommandPlan } from "./lib/desktop-builder-command.ts";
 import {
   createDesktopPlatformBuildConfig,
@@ -39,6 +39,10 @@ import {
 } from "./lib/release-workspace-manifests.ts";
 import { resolveCatalogDependencies } from "./lib/resolve-catalog.ts";
 import {
+  resolveReleaseLockfileSha256,
+  verifyReleaseLockfileSha256,
+} from "./lib/release-lockfile-provenance.ts";
+import {
   assertDesktopStageFilesUnchanged,
   verifyDesktopStagePatchedDependencies,
 } from "./lib/desktop-stage-install.ts";
@@ -50,7 +54,7 @@ import { Command, Flag } from "effect/unstable/cli";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 
 const BuildPlatform = Schema.Literals(["mac", "linux", "win"]);
-const BuildArch = Schema.Literals(["arm64", "x64", "universal"]);
+const BuildArch = Schema.Literals(DESKTOP_BUILD_ARCHES);
 const PackagedDesktopFlavor = Schema.Literals(["production", "canary", "super"]);
 
 const RepoRoot = Effect.service(Path.Path).pipe(
@@ -171,12 +175,6 @@ function resolveGitCommitHash(repoRoot: string): string | undefined {
     return undefined;
   }
   return hash.toLowerCase();
-}
-
-function resolveLockfileSha256(repoRoot: string): string {
-  return createHash("sha256")
-    .update(readFileSync(join(repoRoot, "bun.lock")))
-    .digest("hex");
 }
 
 function resolvePythonForNodeGyp(): string | undefined {
@@ -716,6 +714,7 @@ const copyPreparedSuperStageDependencies = Effect.fn("copyPreparedSuperStageDepe
 const createBuildConfig = Effect.fn("createBuildConfig")(function* (
   platform: typeof BuildPlatform.Type,
   target: string,
+  arch: typeof BuildArch.Type,
   flavor: Exclude<SynaraDesktopFlavor, "development">,
   signed: boolean,
   disableUpdates: boolean,
@@ -748,6 +747,7 @@ const createBuildConfig = Effect.fn("createBuildConfig")(function* (
     : undefined;
 
   const platformBuildConfigInput = {
+    arch,
     platform,
     target,
     signed,
@@ -909,17 +909,18 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
     });
   }
   const commitHash = resolvedCommitHash ?? "unknown";
-  const resolvedLockfileSha256 = resolveLockfileSha256(repoRoot);
-  if (options.lockfileSha256 && !/^[0-9a-f]{64}$/i.test(options.lockfileSha256)) {
-    return yield* new BuildScriptError({
-      message: `Expected a 64-character lockfile SHA-256, got '${options.lockfileSha256}'.`,
-    });
-  }
-  if (options.lockfileSha256 && resolvedLockfileSha256 !== options.lockfileSha256.toLowerCase()) {
-    return yield* new BuildScriptError({
-      message: `Release lockfile digest mismatch: expected ${options.lockfileSha256}, got ${resolvedLockfileSha256}.`,
-    });
-  }
+  const sourceLockfileBytes = readFileSync(join(repoRoot, RELEASE_LOCKFILE_PATH));
+  const resolvedLockfileSha256 = yield* Effect.try({
+    try: () =>
+      options.lockfileSha256
+        ? verifyReleaseLockfileSha256(sourceLockfileBytes, options.lockfileSha256)
+        : resolveReleaseLockfileSha256(sourceLockfileBytes),
+    catch: (cause) =>
+      new BuildScriptError({
+        message: cause instanceof Error ? cause.message : String(cause),
+        cause,
+      }),
+  });
   const expectedSourceTag = resolveDesktopSourceTag(options.flavor, appVersion);
   if (options.sourceTag && options.sourceTag !== expectedSourceTag) {
     return yield* new BuildScriptError({
@@ -1022,6 +1023,7 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
   const resolvedBuildConfig = yield* createBuildConfig(
     options.platform,
     options.target,
+    options.arch,
     options.flavor,
     options.signed,
     options.disableUpdates,

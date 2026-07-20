@@ -22,6 +22,11 @@ const PRERELEASE_MACOS_REQUIRED_COMMANDS = [
   "bun run --cwd packages/shared test src/desktopIdentity.test.ts src/desktopIdentityProof.test.ts",
   "bun run --cwd scripts test lib/desktop-artifact-policy.test.ts verify-packaged-desktop-startup.test.ts lib/super-synara-macos-signatures.test.ts lib/release-artifact-provenance.test.ts lib/super-synara-release-admission.test.ts lib/super-synara-workflow-contract.test.ts",
 ] as const;
+const WINDOWS_RELEASE_SCOPE = "windows-only";
+const MACOS_RELEASE_SCOPE = "windows-and-macos";
+const MACOS_JOB_CONDITION = "${{ needs.preflight.outputs.include_macos == 'true' }}";
+const PUBLISH_JOB_CONDITION =
+  "${{ always() && needs.preflight.result == 'success' && needs.reserve_tag.result == 'success' && needs.windows_x64.result == 'success' && ((needs.preflight.outputs.include_macos == 'true' && needs.macos_arm64.result == 'success') || (needs.preflight.outputs.include_macos == 'false' && needs.macos_arm64.result == 'skipped')) }}";
 
 function isRecord(value: unknown): value is UnknownRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -60,14 +65,18 @@ interface WorkflowRunStep {
   readonly rawCommand: string;
 }
 
-function publicationJobs(workflowText: string): UnknownRecord {
+function publicationWorkflow(workflowText: string): UnknownRecord {
   const workflow = parseYaml(workflowText, {
     strict: true,
     uniqueKeys: true,
   }) as unknown;
-  if (!isRecord(workflow) || !isRecord(workflow.jobs)) {
-    throw new Error("Publication workflow must define jobs.");
-  }
+  if (!isRecord(workflow)) throw new Error("Publication workflow must be an object.");
+  return workflow;
+}
+
+function publicationJobs(workflowText: string): UnknownRecord {
+  const workflow = publicationWorkflow(workflowText);
+  if (!isRecord(workflow.jobs)) throw new Error("Publication workflow must define jobs.");
   return workflow.jobs;
 }
 
@@ -77,6 +86,96 @@ function publicationJob(jobs: UnknownRecord, jobName: string): UnknownRecord {
     throw new Error(`Publication workflow must define the ${jobName} job with steps.`);
   }
   return job;
+}
+
+function verifyReleaseScopeCase(preflightJob: UnknownRecord): void {
+  const steps = preflightJob.steps;
+  if (!Array.isArray(steps)) {
+    throw new Error("Publication workflow must define preflight steps.");
+  }
+  const metadataSteps = steps.filter(
+    (step) => isRecord(step) && step.id === "meta" && typeof step.run === "string",
+  );
+  if (metadataSteps.length !== 1) {
+    throw new Error("Publication release-scope contract must define exactly one metadata step.");
+  }
+
+  const lines = executableShellLines(metadataSteps[0]!.run as string);
+  const caseStarts = lines
+    .map((line, index) => (line === 'case "$RELEASE_SCOPE" in' ? index : -1))
+    .filter((index) => index >= 0);
+  if (caseStarts.length !== 1) {
+    throw new Error("Publication release-scope contract must define exactly one scope case.");
+  }
+  const caseStart = caseStarts[0]!;
+  const caseEnd = lines.indexOf("esac", caseStart + 1);
+  if (caseEnd < 0) {
+    throw new Error("Publication release-scope contract must terminate its scope case.");
+  }
+  const expectedPrefix = [
+    "set -euo pipefail",
+    '[[ "$CONFIRMED" == "true" ]]',
+    '[[ "$REF_PROTECTED" == "true" ]]',
+    '[[ "$VERSION" =~ ^[0-9]+\\.[0-9]+\\.[0-9]+-super\\.[1-9][0-9]*$ ]]',
+    '[[ "$TAG" == "super-v$VERSION" ]]',
+  ];
+  const expectedOutputs = [
+    'echo "version=$VERSION" >> "$GITHUB_OUTPUT"',
+    'echo "tag=$TAG" >> "$GITHUB_OUTPUT"',
+    'echo "release_scope=$RELEASE_SCOPE" >> "$GITHUB_OUTPUT"',
+    'echo "include_macos=$include_macos" >> "$GITHUB_OUTPUT"',
+    'echo "asset_count=$asset_count" >> "$GITHUB_OUTPUT"',
+  ];
+  if (
+    JSON.stringify(lines.slice(0, caseStart)) !== JSON.stringify(expectedPrefix) ||
+    JSON.stringify(lines.slice(caseEnd + 1)) !== JSON.stringify(expectedOutputs)
+  ) {
+    throw new Error(
+      "Publication release-scope contract must preserve the complete scope metadata data flow.",
+    );
+  }
+
+  const arms = new Map<string, readonly string[]>();
+  let index = caseStart + 1;
+  while (index < caseEnd) {
+    const armMatch = /^([*a-z0-9-]+)\)$/.exec(lines[index]!);
+    if (!armMatch) {
+      throw new Error("Publication release-scope contract contains an invalid scope case arm.");
+    }
+    const arm = armMatch[1]!;
+    if (arms.has(arm)) {
+      throw new Error(`Publication release-scope contract duplicates the ${arm} case arm.`);
+    }
+    const commands: string[] = [];
+    index += 1;
+    while (index < caseEnd && lines[index] !== ";;") {
+      commands.push(lines[index]!);
+      index += 1;
+    }
+    if (index >= caseEnd) {
+      throw new Error(`Publication release-scope contract does not terminate the ${arm} case arm.`);
+    }
+    arms.set(arm, commands);
+    index += 1;
+  }
+
+  const expectedArms = new Map<string, readonly string[]>([
+    [WINDOWS_RELEASE_SCOPE, ["include_macos=false", "asset_count=6"]],
+    [MACOS_RELEASE_SCOPE, ["include_macos=true", "asset_count=8"]],
+    ["*", ['echo "Unsupported release scope: $RELEASE_SCOPE" >&2', "exit 1"]],
+  ]);
+  if (JSON.stringify([...arms.keys()]) !== JSON.stringify([...expectedArms.keys()])) {
+    throw new Error(
+      "Publication release-scope case must define the exact ordered windows-only, windows-and-macos, and rejecting wildcard arms.",
+    );
+  }
+  for (const [scope, expectedCommands] of expectedArms) {
+    if (JSON.stringify(arms.get(scope)) !== JSON.stringify(expectedCommands)) {
+      throw new Error(
+        `Publication release-scope case must map ${scope} to ${expectedCommands.join(" and ")}.`,
+      );
+    }
+  }
 }
 
 function nativeJobRunSteps(jobs: UnknownRecord, jobName: string): readonly WorkflowRunStep[] {
@@ -149,15 +248,20 @@ function verifyNativeJobCommands(
   steps: readonly WorkflowRunStep[],
   requiredCommands: readonly string[],
   buildCommandStart: string,
+  expectedJobCondition?: string,
 ): void {
   if (job["runs-on"] !== expectedRunner) {
     throw new Error(`Publication workflow ${jobName} must run on ${expectedRunner}.`);
   }
-  if (
-    job.if !== undefined ||
-    (job["continue-on-error"] !== undefined && job["continue-on-error"] !== false)
-  ) {
-    throw new Error(`Publication workflow ${jobName} job must be unconditional and fail closed.`);
+  if (job.if !== expectedJobCondition) {
+    throw new Error(
+      expectedJobCondition === undefined
+        ? `Publication workflow ${jobName} job must be unconditional and fail closed.`
+        : `Publication workflow ${jobName} job must use the exact release-scope condition.`,
+    );
+  }
+  if (job["continue-on-error"] !== undefined && job["continue-on-error"] !== false) {
+    throw new Error(`Publication workflow ${jobName} job must fail closed.`);
   }
   const buildSteps = steps.filter((step) => hasExecutableLine(step.rawCommand, buildCommandStart));
   if (buildSteps.length !== 1) {
@@ -260,6 +364,21 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
     requireText(main, `\n  ${job}:`, `Publication workflow is missing the ${job} job.`);
   }
   const jobs = publicationJobs(main);
+  const workflow = publicationWorkflow(main);
+  const triggers = workflow.on;
+  const dispatch = isRecord(triggers) ? triggers.workflow_dispatch : undefined;
+  const inputs = isRecord(dispatch) ? dispatch.inputs : undefined;
+  const releaseScopeInput = isRecord(inputs) ? inputs.release_scope : undefined;
+  if (
+    !isRecord(releaseScopeInput) ||
+    releaseScopeInput.type !== "choice" ||
+    releaseScopeInput.required !== true ||
+    releaseScopeInput.default !== WINDOWS_RELEASE_SCOPE ||
+    JSON.stringify(releaseScopeInput.options) !==
+      JSON.stringify([WINDOWS_RELEASE_SCOPE, MACOS_RELEASE_SCOPE])
+  ) {
+    throw new Error("Publication release-scope contract must default to exact Windows x64.");
+  }
   verifyRootTestOwnership(jobs);
   const preflightJob = publicationJob(jobs, "preflight");
   if (preflightJob["runs-on"] !== "ubuntu-24.04") {
@@ -273,6 +392,7 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
   }
   const windowsJob = publicationJob(jobs, "windows_x64");
   const macosJob = publicationJob(jobs, "macos_arm64");
+  const publishJob = publicationJob(jobs, "publish");
   verifyNativeJobCommands(
     windowsJob,
     "windows_x64",
@@ -288,7 +408,31 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
     nativeJobRunSteps(jobs, "macos_arm64"),
     PRERELEASE_MACOS_REQUIRED_COMMANDS,
     "bun run dist:desktop:super:mac --",
+    MACOS_JOB_CONDITION,
   );
+  if (
+    typeof publishJob.if !== "string" ||
+    normalizeShellCommand(publishJob.if) !== PUBLISH_JOB_CONDITION
+  ) {
+    throw new Error(
+      "Publication workflow publish job must fail closed over the exact selected native lanes.",
+    );
+  }
+  if (publishJob["continue-on-error"] !== undefined && publishJob["continue-on-error"] !== false) {
+    throw new Error("Publication workflow publish job must fail closed.");
+  }
+  const publishSteps = publishJob.steps;
+  if (!Array.isArray(publishSteps)) {
+    throw new Error("Publication workflow must define publish steps.");
+  }
+  const macosDownloadStep = publishSteps.find(
+    (step) => isRecord(step) && step.name === "Download macOS lane",
+  );
+  if (!isRecord(macosDownloadStep) || macosDownloadStep.if !== MACOS_JOB_CONDITION) {
+    throw new Error(
+      "Publication workflow must download macOS only for the combined release scope.",
+    );
+  }
   const macosBuildStep = nativeJobRunSteps(jobs, "macos_arm64").find((step) =>
     hasExecutableLine(step.rawCommand, "bun run dist:desktop:super:mac --"),
   );
@@ -316,6 +460,14 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
     "Publication must use the plan-locked confirmation input name.",
   );
   requireText(main, "\n      tag:\n", "Publication dispatch must require an explicit tag input.");
+  for (const scopeNeedle of [
+    "release_scope:",
+    `default: ${WINDOWS_RELEASE_SCOPE}`,
+    `- ${WINDOWS_RELEASE_SCOPE}`,
+    `- ${MACOS_RELEASE_SCOPE}`,
+  ]) {
+    requireText(main, scopeNeedle, `Publication release-scope contract is missing ${scopeNeedle}.`);
+  }
   requireText(
     main,
     '[[ "$TAG" == "super-v$VERSION" ]]',
@@ -355,6 +507,11 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
     main,
     "verify-super-synara-macos-allowlist.ts",
     "Preflight must reject a missing or placeholder macOS signature policy.",
+  );
+  requireText(
+    main,
+    "- name: Require reviewed macOS signature policy\n        if: ${{ steps.meta.outputs.include_macos == 'true' }}",
+    "macOS signature policy must gate only the combined release scope.",
   );
   for (const variable of [
     "SUPER_SYNARA_MAX_WINDOWS_BYTES",
@@ -506,16 +663,42 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
     releaseAdmissionCommands.length !== 2 ||
     releaseAdmissionCommands.some(
       (command) =>
-        !command.includes(
-          "--mac-signature-allowlist scripts/super-synara-macos-signature-allowlist.json",
-        ),
+        !command.includes('--release-scope "$RELEASE_SCOPE"') ||
+        !command.includes('"${macos_allowlist_args[@]}"'),
     )
   ) {
     throw new Error(
-      "Final release preparation and revalidation must use the reviewed macOS signature allowlist.",
+      "Final release preparation and revalidation must bind the selected scope and reviewed macOS signature allowlist.",
     );
   }
-  requireText(main, '[[ "${#assets[@]}" -eq 8 ]]', "Publication must upload exactly eight files.");
+  const scopedAllowlistCondition = 'if [[ "$RELEASE_SCOPE" == "windows-and-macos" ]]; then';
+  const scopedAllowlistPath =
+    "--mac-signature-allowlist scripts/super-synara-macos-signature-allowlist.json";
+  if (
+    (main.match(/macos_allowlist_args=\(\)/g)?.length ?? 0) !== 2 ||
+    (main.match(/macos_allowlist_args=\(/g)?.length ?? 0) !== 4 ||
+    main.split(scopedAllowlistCondition).length - 1 !== 3 ||
+    main.split(scopedAllowlistPath).length - 1 !== 3
+  ) {
+    throw new Error(
+      "Final release admission must pass the reviewed macOS allowlist only for the combined scope.",
+    );
+  }
+  requireText(
+    main,
+    '[[ "${#assets[@]}" -eq "$EXPECTED_ASSET_COUNT" ]]',
+    "Publication must upload the exact scoped asset count.",
+  );
+  requireText(
+    main,
+    '[[ "$(jq \'[.[][]] | length\' <<< "$assets_json")" -eq "$EXPECTED_ASSET_COUNT" ]]',
+    "Publication must redownload the exact scoped asset count.",
+  );
+  requireText(
+    main,
+    'if [[ "$INCLUDE_MACOS" == "true" ]]; then',
+    "Publication must add macOS assets only for the combined scope.",
+  );
   for (const asset of [
     "windows-x64-unsigned.exe",
     "macos-arm64-unsigned.dmg",
@@ -546,6 +729,8 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
   for (const prohibitedAsset of [".blockmap", "latest.yml", "latest-mac.yml", ".AppImage"]) {
     prohibitText(main, prohibitedAsset, `Publication must not expose ${prohibitedAsset}.`);
   }
+
+  verifyReleaseScopeCase(preflightJob);
 
   requireText(audit, "permissions:\n  contents: read", "Audit must be read-only.");
   requireText(
