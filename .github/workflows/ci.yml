@@ -157,6 +157,9 @@ jobs:
           bun run --cwd packages/shared test
           src/windowsProcess.test.ts
 
+      - name: Run Windows Codex executable regressions
+        run: bun run --cwd packages/shared test src/codexCliExecutable.test.ts
+
       - name: Run Windows provider startup and migration regressions
         run: >-
           bun run --cwd apps/server test
@@ -165,6 +168,9 @@ jobs:
           src/provider/Layers/ProviderHealth.test.ts
           src/persistence/MigrationBackup.test.ts
           src/restoreMigrationBackup.test.ts
+
+      - name: Run Windows Codex overlay ownership regressions
+        run: bun run --cwd apps/server test src/codexProcessEnv.test.ts
 
       - name: Run Windows desktop lifecycle regressions
         run: >-
