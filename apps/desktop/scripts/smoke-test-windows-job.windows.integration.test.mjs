@@ -1,10 +1,10 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createConnection, createServer } from "node:net";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, resolve, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -12,8 +12,10 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   createDesktopSmokeEnvironment,
   createDesktopSmokeSpawnSpec,
+  resolveWindowsPowerShellPath,
   superviseDesktopSmokeProcess,
   WINDOWS_SMOKE_JOB_READY_PREFIX,
+  WINDOWS_SMOKE_JOB_RUN_ID_ENV,
 } from "./smoke-test-lifecycle.mjs";
 
 const scriptsDirectory = dirname(fileURLToPath(import.meta.url));
@@ -247,6 +249,56 @@ describe.skipIf(process.platform !== "win32")(
       expect(output).not.toContain("SYNARA_SMOKE_JOB_ERROR");
       const pid = Number((await readFile(pidFile, "utf8")).trim().split(":")[1]);
       await waitFor(() => !processExists(pid), "the EOF target to be killed by Job teardown");
+    }, 20_000);
+
+    it("rejects an existing drive-root-relative target before READY in the helper itself", async () => {
+      await access(process.execPath);
+      const executableRoot = win32.parse(process.execPath).root;
+      expect(executableRoot).toMatch(/^[A-Za-z]:\\$/);
+      const rootRelativeExecutable = "\\" + process.execPath.slice(executableRoot.length);
+      expect(win32.resolve(dirname(process.execPath), rootRelativeExecutable)).toBe(
+        win32.normalize(process.execPath),
+      );
+
+      const runId = randomUUID();
+      const environment = createDesktopSmokeEnvironment();
+      environment[WINDOWS_SMOKE_JOB_RUN_ID_ENV] = runId;
+      const child = spawn(
+        resolveWindowsPowerShellPath(environment),
+        [
+          "-NoLogo",
+          "-NoProfile",
+          "-NonInteractive",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-File",
+          helperPath,
+          "--",
+          rootRelativeExecutable,
+          "--version",
+        ],
+        {
+          stdio: ["pipe", "pipe", "pipe"],
+          windowsHide: true,
+          cwd: dirname(process.execPath),
+          env: environment,
+        },
+      );
+      spawnedChildren.push(child);
+      let output = "";
+      child.stdout.on("data", (chunk) => {
+        output += chunk.toString();
+      });
+      child.stderr.on("data", (chunk) => {
+        output += chunk.toString();
+      });
+      const [code, signal] = await once(child, "close");
+
+      expect({ code, signal }).toEqual({ code: 70, signal: null });
+      expect(output).toContain(
+        "SYNARA_SMOKE_JOB_ERROR executable path is not an existing absolute file",
+      );
+      expect(output).not.toContain(WINDOWS_SMOKE_JOB_READY_PREFIX);
     }, 20_000);
 
     it("fails initialization before READY when the target executable cannot launch", async () => {

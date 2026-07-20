@@ -48,6 +48,14 @@ function environmentValueCaseInsensitive(environment, name) {
   return undefined;
 }
 
+function isWindowsDriveAbsoluteOrUncPath(value) {
+  if (typeof value !== "string") return false;
+  return (
+    /^[A-Za-z]:[\\/]/.test(value) ||
+    /^\\\\[^\\/:*?"<>|]+[\\/][^\\/:*?"<>|]+(?:[\\/].*)?$/.test(value)
+  );
+}
+
 function resolveWindowsSystemRoot(environment) {
   const systemRoot =
     environmentValueCaseInsensitive(environment, "SystemRoot") ||
@@ -57,7 +65,7 @@ function resolveWindowsSystemRoot(environment) {
     systemRoot === "" ||
     systemRoot.trim() !== systemRoot ||
     /[\0\r\n]/.test(systemRoot) ||
-    !win32.isAbsolute(systemRoot)
+    !isWindowsDriveAbsoluteOrUncPath(systemRoot)
   ) {
     throw new Error("Windows smoke test requires an absolute, clean SystemRoot.");
   }
@@ -75,13 +83,13 @@ export function resolveWindowsPowerShellPath(environment = process.env) {
 }
 
 function validateWindowsSmokeLaunchInput({ executable, helperPath, runId, workingDirectory }) {
-  if (!win32.isAbsolute(executable) || /[\0\r\n]/.test(executable)) {
+  if (!isWindowsDriveAbsoluteOrUncPath(executable) || /[\0\r\n]/.test(executable)) {
     throw new Error("Windows smoke executable path must be absolute and clean.");
   }
-  if (!win32.isAbsolute(helperPath) || /[\0\r\n]/.test(helperPath)) {
+  if (!isWindowsDriveAbsoluteOrUncPath(helperPath) || /[\0\r\n]/.test(helperPath)) {
     throw new Error("Windows smoke Job Object helper path must be absolute and clean.");
   }
-  if (!win32.isAbsolute(workingDirectory) || /[\0\r\n]/.test(workingDirectory)) {
+  if (!isWindowsDriveAbsoluteOrUncPath(workingDirectory) || /[\0\r\n]/.test(workingDirectory)) {
     throw new Error("Windows smoke working directory must be absolute and clean.");
   }
   if (!WINDOWS_SMOKE_RUN_ID_PATTERN.test(runId)) {
@@ -155,11 +163,11 @@ function defaultSignalProcess(pid, signal) {
   process.kill(pid, signal);
 }
 
-function defaultKillWindowsTree(pid, { timeoutMs }) {
+function defaultKillWindowsTree(pid, { timeoutMs, environment }) {
   return new Promise((resolve) => {
     let taskkillPath;
     try {
-      taskkillPath = win32.join(resolveWindowsSystemRoot(process.env), "System32", "taskkill.exe");
+      taskkillPath = win32.join(resolveWindowsSystemRoot(environment), "System32", "taskkill.exe");
     } catch (error) {
       resolve({
         ok: false,
@@ -173,6 +181,7 @@ function defaultKillWindowsTree(pid, { timeoutMs }) {
       taskkill = spawn(taskkillPath, ["/PID", String(pid), "/T", "/F"], {
         stdio: "ignore",
         windowsHide: true,
+        env: environment,
       });
     } catch (error) {
       resolve({ ok: false, diagnostic: "Windows taskkill launch failed: " + formatError(error) });
@@ -442,6 +451,7 @@ function superviseWindowsJobDesktopSmokeProcess({
   teardownMs,
   settlementMs,
   fallbackDelayMs,
+  windowsEnvironment,
   windowsJobRunId,
   fatalPatterns,
   killWindowsTree,
@@ -556,6 +566,7 @@ function superviseWindowsJobDesktopSmokeProcess({
       try {
         cleanupResult = killWindowsTree(child.pid, {
           timeoutMs: stageTaskkillTimeout(cleanupBudgetMs),
+          environment: windowsEnvironment,
         });
       } catch (error) {
         cleanupResult = {
@@ -855,6 +866,7 @@ export function superviseDesktopSmokeProcess({
   windowsTeardownMs = DESKTOP_SMOKE_WINDOWS_TEARDOWN_MS,
   windowsSettlementMs = DESKTOP_SMOKE_WINDOWS_SETTLEMENT_MS,
   windowsFallbackDelayMs = WINDOWS_SMOKE_FALLBACK_DELAY_MS,
+  windowsEnvironment = process.env,
   windowsJobRunId,
   fatalPatterns = DESKTOP_SMOKE_FATAL_PATTERNS,
   signalProcess = defaultSignalProcess,
@@ -871,6 +883,7 @@ export function superviseDesktopSmokeProcess({
       teardownMs: windowsTeardownMs,
       settlementMs: windowsSettlementMs,
       fallbackDelayMs: windowsFallbackDelayMs,
+      windowsEnvironment,
       windowsJobRunId,
       fatalPatterns,
       killWindowsTree,

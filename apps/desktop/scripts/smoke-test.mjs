@@ -20,17 +20,22 @@ const windowsJobRunId = randomUUID();
 
 console.log("\nLaunching Electron smoke test...");
 
+const smokeEnvironment = createDesktopSmokeEnvironment();
 const spawnSpec = createDesktopSmokeSpawnSpec({
   executable: electronBin,
   args: [mainJs],
-  environment: createDesktopSmokeEnvironment(),
+  environment: smokeEnvironment,
   windowsHelperPath,
   windowsJobRunId,
   workingDirectory: desktopDir,
 });
 const child = spawn(spawnSpec.command, spawnSpec.args, spawnSpec.options);
 
-const result = await superviseDesktopSmokeProcess({ child, windowsJobRunId });
+const result = await superviseDesktopSmokeProcess({
+  child,
+  windowsEnvironment: spawnSpec.options.env,
+  windowsJobRunId,
+});
 if (!result.ok) {
   console.error("\nDesktop smoke test failed:");
   for (const failure of result.failures) {

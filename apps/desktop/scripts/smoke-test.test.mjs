@@ -120,6 +120,9 @@ describe("desktop smoke process lifecycle", () => {
     expect(() => resolveWindowsPowerShellPath({ Path: "C:\\Tools" })).toThrow(
       "absolute, clean SystemRoot",
     );
+    expect(() => resolveWindowsPowerShellPath({ SystemRoot: "\\Windows" })).toThrow(
+      "absolute, clean SystemRoot",
+    );
     expect(spec.command).toBe("D:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
     expect(spec.args).toEqual([
       "-NoLogo",
@@ -135,6 +138,38 @@ describe("desktop smoke process lifecycle", () => {
     ]);
     expect(spec.options.cwd).toBe("C:\\repo with spaces\\apps\\desktop");
     expect(spec.options.env[WINDOWS_SMOKE_JOB_RUN_ID_ENV]).toBe(WINDOWS_JOB_RUN_ID);
+  });
+
+  it("rejects drive-root-relative Windows launch paths while accepting UNC paths", () => {
+    const launchInput = {
+      platform: "win32",
+      executable: "C:\\Tools\\electron.exe",
+      args: [],
+      environment: { SystemRoot: "C:\\Windows" },
+      windowsHelperPath: "C:\\repo\\scripts\\smoke-test-windows-job.ps1",
+      windowsJobRunId: WINDOWS_JOB_RUN_ID,
+      workingDirectory: "C:\\repo\\apps\\desktop",
+    };
+    const rootRelativePaths = [
+      ["executable", "\\tools\\electron.exe", "executable path"],
+      ["windowsHelperPath", "\\repo\\smoke-test-windows-job.ps1", "helper path"],
+      ["workingDirectory", "\\repo\\apps\\desktop", "working directory"],
+    ];
+
+    for (const [field, value, expectedMessage] of rootRelativePaths) {
+      expect(() => createDesktopSmokeSpawnSpec({ ...launchInput, [field]: value })).toThrow(
+        expectedMessage,
+      );
+    }
+
+    const uncSpec = createDesktopSmokeSpawnSpec({
+      ...launchInput,
+      executable: "\\\\server\\share\\electron.exe",
+      windowsHelperPath: "\\\\server\\share\\scripts\\smoke-test-windows-job.ps1",
+      workingDirectory: "\\\\server\\share\\apps\\desktop",
+    });
+    expect(uncSpec.args).toContain("\\\\server\\share\\electron.exe");
+    expect(uncSpec.options.cwd).toBe("\\\\server\\share\\apps\\desktop");
   });
 
   it("keeps the direct detached Electron launch on non-Windows platforms", () => {
@@ -575,11 +610,15 @@ describe("desktop smoke process lifecycle", () => {
 
   it("treats taskkill as failure-only cleanup even when fallback succeeds", async () => {
     const child = new FakeSmokeProcess();
+    const windowsEnvironment = {
+      SystemRoot: "Q:\\Sanitized Windows",
+      Path: "Q:\\Tools",
+    };
     const killWindowsTree = vi.fn(() => {
       child.exitAndClose(null, "SIGKILL");
       return { ok: true };
     });
-    const resultPromise = superviseWindowsSmoke(child, { killWindowsTree });
+    const resultPromise = superviseWindowsSmoke(child, { killWindowsTree, windowsEnvironment });
     emitWindowsJobReady(child);
 
     await vi.advanceTimersByTimeAsync(15_000);
@@ -589,7 +628,10 @@ describe("desktop smoke process lifecycle", () => {
       teardownDiagnostics: [expect.stringContaining("did not close after the shutdown token")],
     });
     expect(killWindowsTree).toHaveBeenCalledOnce();
-    expect(killWindowsTree).toHaveBeenCalledWith(child.pid, { timeoutMs: 5_900 });
+    expect(killWindowsTree).toHaveBeenCalledWith(child.pid, {
+      timeoutMs: 5_900,
+      environment: windowsEnvironment,
+    });
     expect(child.kill).not.toHaveBeenCalled();
   });
 
