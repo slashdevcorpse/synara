@@ -23,6 +23,8 @@ import { render } from "vitest-browser-react";
 
 import { useComposerDraftStore } from "../composerDraftStore";
 import { getRouter } from "../router";
+// Preload the split route before individual test clocks start on a cold browser run.
+import "../routes/_chat.$threadId?tsr-split=component";
 import { useStore } from "../store";
 import {
   createShellSnapshotFromReadModel,
