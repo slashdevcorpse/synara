@@ -6,6 +6,11 @@ const packageManifest = JSON.parse(
 ) as {
   readonly devDependencies?: Readonly<Record<string, string>>;
 };
+const webPackageManifest = JSON.parse(
+  readFileSync(new URL("../../apps/web/package.json", import.meta.url), "utf8"),
+) as {
+  readonly dependencies?: Readonly<Record<string, string>>;
+};
 const lockfile = readFileSync(new URL("../../bun.lock", import.meta.url), "utf8");
 
 const securityPins = {
@@ -27,6 +32,12 @@ describe("dependency security pins", () => {
 
   it("retains the web build's Babel 8 dependency beside the audited Babel 7 pin", () => {
     expect(lockfile).toContain('"@synara/web/@babel/core": ["@babel/core@8.0.1"');
+  });
+
+  it("keeps react-icons on the upstream-compatible export surface", () => {
+    expect(webPackageManifest.dependencies).toMatchObject({ "react-icons": "5.6.0" });
+    expect(lockfile).toContain('"react-icons": ["react-icons@5.6.0"');
+    expect(lockfile).not.toContain('"react-icons": ["react-icons@5.7.0"');
   });
 
   it("does not retain the vulnerable stale resolutions", () => {
