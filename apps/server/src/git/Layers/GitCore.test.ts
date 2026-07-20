@@ -1775,23 +1775,24 @@ it.layer(TestLayer)("git integration", (it) => {
       }),
     );
 
-    it.effect("preserves adversarial filenames in status details", () =>
-      Effect.gen(function* () {
-        if (process.platform === "win32") return;
-        const tmp = yield* makeTmpDir();
-        yield* initRepoWithCommit(tmp);
-        const fileName = "line\nbreak\tname.txt";
-        yield* writeTextFile(path.join(tmp, fileName), "before\n");
-        yield* git(tmp, ["add", "--", fileName]);
-        yield* git(tmp, ["commit", "-m", "add adversarial filename"]);
-        yield* writeTextFile(path.join(tmp, fileName), "after\nsecond\n");
+    it.effect.skipIf(process.platform === "win32")(
+      "preserves adversarial filenames in status details",
+      () =>
+        Effect.gen(function* () {
+          const tmp = yield* makeTmpDir();
+          yield* initRepoWithCommit(tmp);
+          const fileName = "line\nbreak\tname.txt";
+          yield* writeTextFile(path.join(tmp, fileName), "before\n");
+          yield* git(tmp, ["add", "--", fileName]);
+          yield* git(tmp, ["commit", "-m", "add adversarial filename"]);
+          yield* writeTextFile(path.join(tmp, fileName), "after\nsecond\n");
 
-        const details = yield* (yield* GitCore).statusDetails(tmp);
+          const details = yield* (yield* GitCore).statusDetails(tmp);
 
-        expect(details.workingTree.files).toEqual([
-          { path: fileName, insertions: 2, deletions: 1 },
-        ]);
-      }),
+          expect(details.workingTree.files).toEqual([
+            { path: fileName, insertions: 2, deletions: 1 },
+          ]);
+        }),
     );
 
     it.effect("does not resolve upstream before rejecting non-repository directories", () =>

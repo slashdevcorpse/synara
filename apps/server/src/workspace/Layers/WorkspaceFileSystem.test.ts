@@ -439,36 +439,36 @@ it.layer(TestLayer)("WorkspaceFileSystemLive", (it) => {
       }),
     );
 
-    it.effect("preserves exact permissions when replacement creation is masked by umask", () =>
-      Effect.gen(function* () {
-        if (process.platform === "win32") return;
+    it.effect.skipIf(process.platform === "win32")(
+      "preserves exact permissions when replacement creation is masked by umask",
+      () =>
+        Effect.gen(function* () {
+          const workspaceFileSystem = yield* WorkspaceFileSystem;
+          const path = yield* Path.Path;
+          const cwd = yield* makeTempDir;
+          const absolutePath = path.join(cwd, "mode-preserved.txt");
+          yield* writeTextFile(cwd, "mode-preserved.txt", "before\n");
+          yield* Effect.promise(() => NodeFs.chmod(absolutePath, 0o664));
 
-        const workspaceFileSystem = yield* WorkspaceFileSystem;
-        const path = yield* Path.Path;
-        const cwd = yield* makeTempDir;
-        const absolutePath = path.join(cwd, "mode-preserved.txt");
-        yield* writeTextFile(cwd, "mode-preserved.txt", "before\n");
-        yield* Effect.promise(() => NodeFs.chmod(absolutePath, 0o664));
+          yield* Effect.acquireUseRelease(
+            Effect.sync(() => process.umask(0o077)),
+            () =>
+              workspaceFileSystem.writeFile({
+                cwd,
+                relativePath: "mode-preserved.txt",
+                contents: "after\n",
+              }),
+            (previousUmask) =>
+              Effect.sync(() => {
+                process.umask(previousUmask);
+              }),
+          );
 
-        yield* Effect.acquireUseRelease(
-          Effect.sync(() => process.umask(0o077)),
-          () =>
-            workspaceFileSystem.writeFile({
-              cwd,
-              relativePath: "mode-preserved.txt",
-              contents: "after\n",
-            }),
-          (previousUmask) =>
-            Effect.sync(() => {
-              process.umask(previousUmask);
-            }),
-        );
-
-        const saved = yield* Effect.promise(() => NodeFs.readFile(absolutePath, "utf8"));
-        const savedStat = yield* Effect.promise(() => NodeFs.stat(absolutePath));
-        expect(saved).toBe("after\n");
-        expect(savedStat.mode & 0o777).toBe(0o664);
-      }),
+          const saved = yield* Effect.promise(() => NodeFs.readFile(absolutePath, "utf8"));
+          const savedStat = yield* Effect.promise(() => NodeFs.stat(absolutePath));
+          expect(saved).toBe("after\n");
+          expect(savedStat.mode & 0o777).toBe(0o664);
+        }),
     );
 
     it.effect("rejects dangling symlink write targets", () =>

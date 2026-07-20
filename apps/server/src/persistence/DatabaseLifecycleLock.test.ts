@@ -115,15 +115,22 @@ describe("database lifecycle lock", () => {
     await expect(fs.stat(reaperPath)).resolves.toBeDefined();
   });
 
-  it("recovers an ownerless directory and fails closed for an owner-file symlink", async () => {
+  it.skipIf(process.platform === "win32")(
+    "recovers an ownerless directory using atomic POSIX directory replacement",
+    async () => {
+      const dbPath = await makeDbPath();
+      const lockPath = `${dbPath}.lifecycle-lock`;
+      await fs.mkdir(lockPath, { mode: 0o700 });
+
+      const recovered = await Effect.runPromise(acquireDatabaseLifecycleLock(dbPath));
+      expect(recovered.owner.pid).toBe(process.pid);
+      await Effect.runPromise(releaseDatabaseLifecycleLock(recovered));
+    },
+  );
+
+  it("fails closed for an owner-file symlink without changing its target", async () => {
     const dbPath = await makeDbPath();
     const lockPath = `${dbPath}.lifecycle-lock`;
-    await fs.mkdir(lockPath, { mode: 0o700 });
-
-    const recovered = await Effect.runPromise(acquireDatabaseLifecycleLock(dbPath));
-    expect(recovered.owner.pid).toBe(process.pid);
-    await Effect.runPromise(releaseDatabaseLifecycleLock(recovered));
-
     await fs.mkdir(lockPath, { mode: 0o700 });
     const outsideOwner = path.join(path.dirname(dbPath), "outside-owner.json");
     const outsideContents = `${JSON.stringify({

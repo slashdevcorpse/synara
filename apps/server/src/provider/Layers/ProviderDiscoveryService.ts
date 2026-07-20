@@ -57,10 +57,15 @@ const disabledCapabilitiesForProvider = (
   supportsThreadImport: false,
 });
 
-const make = Effect.gen(function* () {
+export interface ProviderDiscoveryServiceLiveOptions {
+  readonly projectRootBoundary?: string;
+}
+
+function* make(this: ProviderDiscoveryServiceLiveOptions) {
   const registry = yield* ProviderAdapterRegistry;
   const serverConfig = yield* ServerConfig;
   const serverSettings = yield* ServerSettingsService;
+  const projectRootBoundary = this.projectRootBoundary;
 
   const getComposerCapabilities: ProviderDiscoveryServiceShape["getComposerCapabilities"] = (
     input,
@@ -107,6 +112,7 @@ const make = Effect.gen(function* () {
       const catalogSkills = yield* Effect.tryPromise(() =>
         discoverSkillsCatalog({
           cwd: parsed.cwd,
+          ...(projectRootBoundary ? { projectRootBoundary } : {}),
           homeDir: serverConfig.homeDir,
           synaraBaseDir: serverConfig.baseDir,
           provider: parsed.provider,
@@ -235,6 +241,12 @@ const make = Effect.gen(function* () {
     listModels,
     listAgents,
   } satisfies ProviderDiscoveryServiceShape;
-});
+}
 
-export const ProviderDiscoveryServiceLive = Layer.effect(ProviderDiscoveryService, make);
+export function makeProviderDiscoveryServiceLive(
+  options: ProviderDiscoveryServiceLiveOptions = {},
+) {
+  return Layer.effect(ProviderDiscoveryService, Effect.gen({ self: options }, make));
+}
+
+export const ProviderDiscoveryServiceLive = makeProviderDiscoveryServiceLive();

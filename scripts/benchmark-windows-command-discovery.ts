@@ -1059,6 +1059,7 @@ export function preflightEditorFixture(fixture: BenchmarkFixture): EditorFixture
     encoding: "utf8",
     env: environment,
     shell: false,
+    timeout: 2_000,
     windowsHide: true,
   });
   if (whereProbe.error) throw whereProbe.error;

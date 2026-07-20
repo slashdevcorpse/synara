@@ -1,7 +1,7 @@
 import * as os from "node:os";
 import * as path from "node:path";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
@@ -25,23 +25,40 @@ function shellSingleQuote(value: string): string {
 
 function makeAcpAgentWrapper(dir: string, env: Record<string, string>): string {
   const binDir = path.join(dir, "bin");
-  const agentPath = path.join(binDir, "agent");
+  const launcherPath = path.join(binDir, "agent-launcher.ts");
+  const agentPath = path.join(binDir, process.platform === "win32" ? "agent.cmd" : "agent");
+  const bunExecutableForCmd = process.execPath.replaceAll("%", "%%");
   mkdirSync(binDir, { recursive: true });
   writeFileSync(
-    agentPath,
+    launcherPath,
     [
-      "#!/bin/sh",
-      ...Object.entries(env).map(([key, value]) => `export ${key}=${shellSingleQuote(value)}`),
-      'if [ "$1" != "acp" ]; then',
-      '  printf "%s\\n" "unexpected args: $*" >&2',
-      "  exit 11",
-      "fi",
-      `exec bun ${JSON.stringify(mockAgentPath)}`,
+      'import { writeFileSync } from "node:fs";',
+      `Object.assign(process.env, ${JSON.stringify(env)});`,
+      "const pidLogPath = process.env.SYNARA_ACP_PID_LOG_PATH;",
+      'if (pidLogPath) writeFileSync(pidLogPath, `${process.pid}\\n`, "utf8");',
+      'if (process.argv[2] !== "acp") {',
+      '  console.error(`unexpected args: ${process.argv.slice(2).join(" ")}`);',
+      "  process.exit(11);",
+      "}",
+      `await import(${JSON.stringify(pathToFileURL(mockAgentPath).href)});`,
       "",
     ].join("\n"),
     "utf8",
   );
-  chmodSync(agentPath, 0o755);
+  writeFileSync(
+    agentPath,
+    process.platform === "win32"
+      ? ["@echo off", `"${bunExecutableForCmd}" "%~dp0agent-launcher.ts" %*`, ""].join(
+          "\r\n",
+        )
+      : [
+          "#!/bin/sh",
+          `exec ${shellSingleQuote(process.execPath)} ${shellSingleQuote(launcherPath)} "$@"`,
+          "",
+        ].join("\n"),
+    "utf8",
+  );
+  if (process.platform !== "win32") chmodSync(agentPath, 0o755);
   return agentPath;
 }
 
@@ -75,6 +92,24 @@ function waitForFileContent(filePath: string): Effect.Effect<string> {
         if (Date.now() >= deadline) {
           throw error instanceof Error ? error : new Error(String(error));
         }
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  });
+}
+
+function waitForProcessExit(pid: number): Effect.Effect<void> {
+  return Effect.promise(async () => {
+    const deadline = Date.now() + 5_000;
+    for (;;) {
+      try {
+        process.kill(pid, 0);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ESRCH") return;
+        throw error;
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(`ACP child process ${pid} did not exit`);
       }
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
@@ -335,10 +370,12 @@ it.layer(CursorTextGenerationTestLayer)("CursorTextGenerationLive", (it) => {
   it.effect("closes the ACP child process after text generation completes", () => {
     const exitLogDir = mkdtempSync(path.join(os.tmpdir(), "synara-cursor-text-exit-log-"));
     const exitLogPath = path.join(exitLogDir, "exit.log");
+    const pidLogPath = path.join(exitLogDir, "pid.log");
 
     return withFakeAcpAgent(
       {
         SYNARA_ACP_EXIT_LOG_PATH: exitLogPath,
+        SYNARA_ACP_PID_LOG_PATH: pidLogPath,
         SYNARA_ACP_PROMPT_RESPONSE_TEXT: JSON.stringify({
           title: '"Trim reconnect spinner status after resume."',
         }),
@@ -363,8 +400,13 @@ it.layer(CursorTextGenerationTestLayer)("CursorTextGenerationLive", (it) => {
 
           expect(generated.title).toBe("Trim reconnect spinner status after resume");
 
-          const exitLog = yield* waitForFileContent(exitLogPath);
-          expect(exitLog).toContain("exit:0");
+          const childPid = Number.parseInt((yield* waitForFileContent(pidLogPath)).trim(), 10);
+          expect(Number.isSafeInteger(childPid)).toBe(true);
+          yield* waitForProcessExit(childPid);
+          if (process.platform !== "win32") {
+            const exitLog = yield* waitForFileContent(exitLogPath);
+            expect(exitLog).toContain("exit:0");
+          }
 
           rmSync(exitLogDir, { recursive: true, force: true });
         }),

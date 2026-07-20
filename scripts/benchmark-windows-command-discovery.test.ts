@@ -416,6 +416,7 @@ describe("benchmark-windows-command-discovery", () => {
         rmSync(root, { recursive: true, force: true });
       }
     },
+    20_000,
   );
 
   it("summarizes recorded samples without including warmups", () => {

@@ -1,3 +1,5 @@
+import nodePath from "node:path";
+
 import { TurnId } from "@synara/contracts";
 import { describe, expect, it } from "vitest";
 import { SYNARA_HARNESS_POLICY_MARKER } from "../../agentGateway/harnessPolicy.ts";
@@ -30,11 +32,15 @@ const serverConfig = {
 
 describe("resolveDroidSessionCwd", () => {
   it("prefers an explicit cwd over the active thread session cwd", () => {
-    expect(resolveDroidSessionCwd("/explicit", serverConfig, "/thread")).toBe("/explicit");
+    expect(resolveDroidSessionCwd("/explicit", serverConfig, "/thread")).toBe(
+      nodePath.resolve("/explicit"),
+    );
   });
 
   it("uses the active thread session cwd before the server fallback", () => {
-    expect(resolveDroidSessionCwd(undefined, serverConfig, "/thread")).toBe("/thread");
+    expect(resolveDroidSessionCwd(undefined, serverConfig, "/thread")).toBe(
+      nodePath.resolve("/thread"),
+    );
   });
 });
 

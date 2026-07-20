@@ -32,7 +32,7 @@ import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
 import { ProviderAdapterRegistry } from "../Services/ProviderAdapterRegistry.ts";
 import { ProviderDiscoveryService } from "../Services/ProviderDiscoveryService.ts";
 import { clearSkillsCatalogCacheForTests } from "../skillsCatalog.ts";
-import { ProviderDiscoveryServiceLive } from "./ProviderDiscoveryService.ts";
+import { makeProviderDiscoveryServiceLive } from "./ProviderDiscoveryService.ts";
 
 let root: string;
 let homeDir: string;
@@ -92,7 +92,9 @@ const runListSkills = (input: {
     ServerSettingsService.layerTest({ skills: { disabled: input.disabled ?? [] } }),
     makeRegistryLayer(input.adapter),
   ).pipe(Layer.provideMerge(NodeServices.layer));
-  const testLayer = ProviderDiscoveryServiceLive.pipe(Layer.provideMerge(baseLayer));
+  const testLayer = makeProviderDiscoveryServiceLive({ projectRootBoundary: root }).pipe(
+    Layer.provideMerge(baseLayer),
+  );
   const program = Effect.gen(function* () {
     const discovery = yield* ProviderDiscoveryService;
     return yield* discovery.listSkills({ provider: input.provider, cwd });
@@ -122,6 +124,11 @@ describe("ProviderDiscoveryService.listSkills", () => {
     const result = await runListSkills({ adapter: {}, provider: "antigravity" });
 
     expect(result.skills.map((skill) => skill.name)).toEqual(["portable"]);
+    expect(result.skills.find((skill) => skill.name === "portable")).toMatchObject({
+      path: path.join(baseDir, "skills", "portable", "SKILL.md"),
+      scope: "synara",
+      enabled: true,
+    });
   });
 
   it("prefers provider-native entries and appends catalog-only skills", async () => {
@@ -143,8 +150,12 @@ describe("ProviderDiscoveryService.listSkills", () => {
     });
 
     const shared = result.skills.find((skill) => skill.name === "shared");
+    expect(result.skills.map((skill) => skill.name)).toEqual(["shared", "portable"]);
     expect(shared?.path).toBe(nativeShared.path);
-    expect(result.skills.some((skill) => skill.name === "portable")).toBe(true);
+    expect(result.skills.find((skill) => skill.name === "portable")).toMatchObject({
+      path: path.join(baseDir, "skills", "portable", "SKILL.md"),
+      scope: "synara",
+    });
   });
 
   it("filters user-disabled skills from merged results", async () => {
@@ -158,6 +169,10 @@ describe("ProviderDiscoveryService.listSkills", () => {
     });
 
     expect(result.skills.map((skill) => skill.name)).toEqual(["portable"]);
+    expect(result.skills.find((skill) => skill.name === "portable")).toMatchObject({
+      path: path.join(baseDir, "skills", "portable", "SKILL.md"),
+      scope: "synara",
+    });
   });
 
   it("falls back to the catalog when native discovery fails", async () => {
@@ -178,6 +193,10 @@ describe("ProviderDiscoveryService.listSkills", () => {
     });
 
     expect(result.skills.map((skill) => skill.name)).toEqual(["portable"]);
+    expect(result.skills.find((skill) => skill.name === "portable")).toMatchObject({
+      path: path.join(baseDir, "skills", "portable", "SKILL.md"),
+      scope: "synara",
+    });
   });
 });
 
@@ -188,7 +207,9 @@ describe("ProviderDiscoveryService.getComposerCapabilities", () => {
       ServerSettingsService.layerTest(),
       makeRegistryLayer({}),
     ).pipe(Layer.provideMerge(NodeServices.layer));
-    const testLayer = ProviderDiscoveryServiceLive.pipe(Layer.provideMerge(baseLayer));
+    const testLayer = makeProviderDiscoveryServiceLive({ projectRootBoundary: root }).pipe(
+      Layer.provideMerge(baseLayer),
+    );
 
     const program = Effect.gen(function* () {
       const discovery = yield* ProviderDiscoveryService;

@@ -3,10 +3,12 @@
 // Layer: Provider runtime tests
 // Exports: Vitest suites for opencodeRuntime.ts
 
+import nodePath from "node:path";
+import { pathToFileURL } from "node:url";
+
 import { Duration, Effect, Exit, Fiber, Layer, Scope, Sink, Stream } from "effect";
 import { ChildProcessSpawner } from "effect/unstable/process";
 import { TestClock } from "effect/testing";
-import { pathToFileURL } from "node:url";
 import type { ChatAttachment } from "@synara/contracts";
 import { describe, expect, it } from "vitest";
 
@@ -126,7 +128,12 @@ function openCodeRuntimePoolTestLayer(state: {
 
 describe("toOpenCodeFileParts", () => {
   it("materializes image attachments as SDK file parts", () => {
-    const attachmentPath = "/tmp/synara-attachments/screenshot.png";
+    const attachmentPath = nodePath.join(
+      nodePath.parse(process.cwd()).root,
+      "tmp",
+      "synara-attachments",
+      "screenshot.png",
+    );
     const attachment = {
       type: "image",
       id: "thread-attachment-image",

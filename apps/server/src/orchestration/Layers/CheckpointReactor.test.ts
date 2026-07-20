@@ -1766,7 +1766,9 @@ describe("CheckpointReactor", () => {
       threadId: ThreadId.makeUnsafe("thread-1"),
       numTurns: 1,
     });
-    expect(fs.readFileSync(path.join(harness.cwd, "README.md"), "utf8")).toBe("v2\n");
+    expect(
+      fs.readFileSync(path.join(harness.cwd, "README.md"), "utf8").replace(/\r\n?/g, "\n"),
+    ).toBe("v2\n");
     expect(
       gitRefExists(harness.cwd, checkpointRefForThreadTurn(ThreadId.makeUnsafe("thread-1"), 2)),
     ).toBe(false);
@@ -1833,7 +1835,9 @@ describe("CheckpointReactor", () => {
     );
 
     await waitForEvent(harness.engine, (event) => event.type === "thread.reverted");
-    expect(fs.readFileSync(path.join(harness.cwd, "README.md"), "utf8")).toBe("v1\n");
+    expect(
+      fs.readFileSync(path.join(harness.cwd, "README.md"), "utf8").replace(/\r\n?/g, "\n"),
+    ).toBe("v1\n");
   });
 
   it("refuses turn zero when the exact baseline is missing without touching the workspace", async () => {

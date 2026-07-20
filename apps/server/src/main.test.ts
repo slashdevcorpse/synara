@@ -212,46 +212,48 @@ it.layer(testLayer)("server CLI command", (it) => {
     }),
   );
 
-  it.effect("creates fresh local state directories with private permissions", () =>
-    Effect.gen(function* () {
-      if (process.platform === "win32") return;
-      const homeDir = makeTempHome("synara-main-private-fresh-");
+  it.effect.skipIf(process.platform === "win32")(
+    "creates fresh local state directories with private permissions",
+    () =>
+      Effect.gen(function* () {
+        const homeDir = makeTempHome("synara-main-private-fresh-");
 
-      yield* runCli(["--home-dir", homeDir]);
+        yield* runCli(["--home-dir", homeDir]);
 
-      const stateDir = path.join(homeDir, "userdata");
-      for (const directoryPath of [
-        stateDir,
-        path.join(stateDir, "secrets"),
-        path.join(stateDir, "attachments"),
-        path.join(stateDir, "logs"),
-        path.join(stateDir, "logs", "provider"),
-        path.join(stateDir, "logs", "terminals"),
-      ]) {
-        assert.equal(permissionMode(directoryPath), 0o700);
-      }
-      assert.equal(permissionMode(path.join(stateDir, "logs", "server.log")), 0o600);
-    }),
+        const stateDir = path.join(homeDir, "userdata");
+        for (const directoryPath of [
+          stateDir,
+          path.join(stateDir, "secrets"),
+          path.join(stateDir, "attachments"),
+          path.join(stateDir, "logs"),
+          path.join(stateDir, "logs", "provider"),
+          path.join(stateDir, "logs", "terminals"),
+        ]) {
+          assert.equal(permissionMode(directoryPath), 0o700);
+        }
+        assert.equal(permissionMode(path.join(stateDir, "logs", "server.log")), 0o600);
+      }),
   );
 
-  it.effect("repairs permissions for an upgraded local state directory", () =>
-    Effect.gen(function* () {
-      if (process.platform === "win32") return;
-      const homeDir = makeTempHome("synara-main-private-upgrade-");
-      const stateDir = path.join(homeDir, "userdata");
-      const attachmentDir = path.join(stateDir, "attachments");
-      const attachmentPath = path.join(attachmentDir, "existing.bin");
-      fs.mkdirSync(attachmentDir, { recursive: true, mode: 0o755 });
-      fs.writeFileSync(attachmentPath, "existing", { mode: 0o644 });
-      fs.chmodSync(stateDir, 0o755);
-      fs.chmodSync(attachmentDir, 0o755);
+  it.effect.skipIf(process.platform === "win32")(
+    "repairs permissions for an upgraded local state directory",
+    () =>
+      Effect.gen(function* () {
+        const homeDir = makeTempHome("synara-main-private-upgrade-");
+        const stateDir = path.join(homeDir, "userdata");
+        const attachmentDir = path.join(stateDir, "attachments");
+        const attachmentPath = path.join(attachmentDir, "existing.bin");
+        fs.mkdirSync(attachmentDir, { recursive: true, mode: 0o755 });
+        fs.writeFileSync(attachmentPath, "existing", { mode: 0o644 });
+        fs.chmodSync(stateDir, 0o755);
+        fs.chmodSync(attachmentDir, 0o755);
 
-      yield* runCli(["--home-dir", homeDir]);
+        yield* runCli(["--home-dir", homeDir]);
 
-      assert.equal(permissionMode(stateDir), 0o700);
-      assert.equal(permissionMode(attachmentDir), 0o700);
-      assert.equal(permissionMode(attachmentPath), 0o600);
-    }),
+        assert.equal(permissionMode(stateDir), 0o700);
+        assert.equal(permissionMode(attachmentDir), 0o700);
+        assert.equal(permissionMode(attachmentPath), 0o600);
+      }),
   );
 
   it.effect("uses env fallbacks when flags are not provided", () =>

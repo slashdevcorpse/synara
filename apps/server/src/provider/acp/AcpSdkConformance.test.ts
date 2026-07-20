@@ -1,7 +1,7 @@
 // Verifies the current Synara ACP boundary against an official-SDK subprocess.
 
 import { spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Readable, Writable } from "node:stream";
@@ -490,8 +490,20 @@ describe("official ACP SDK client against the official SDK mock agent", () => {
       child.kill("SIGTERM");
       const exit = await exited;
       if (workflowCompleted) {
-        expect(exit).toEqual({ code: 0, signal: null });
-        expect(readFileSync(exitLogPath, "utf8").trim().split("\n")).toEqual(["SIGTERM", "exit:0"]);
+        expect(exit).toEqual(
+          process.platform === "win32"
+            ? { code: null, signal: "SIGTERM" }
+            : { code: 0, signal: null },
+        );
+        if (process.platform === "win32") {
+          // Windows process termination does not deliver a catchable SIGTERM to the child.
+          expect(existsSync(exitLogPath)).toBe(false);
+        } else {
+          expect(readFileSync(exitLogPath, "utf8").trim().split("\n")).toEqual([
+            "SIGTERM",
+            "exit:0",
+          ]);
+        }
         expect(Buffer.concat(stderrChunks).toString("utf8")).toBe("");
       }
     }

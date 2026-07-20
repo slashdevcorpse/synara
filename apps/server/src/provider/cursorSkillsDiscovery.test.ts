@@ -58,15 +58,32 @@ description: Help globally
 `,
       );
 
-      const skills = await discoverCursorSkills({ cwd, homeDir });
+      const skills = await discoverCursorSkills({ cwd, homeDir, projectRootBoundary: root });
 
       expect(skills.map((skill) => skill.name)).toEqual(["reviewer", "writer", "global-helper"]);
-      expect(skills[0]).toMatchObject({
-        name: "reviewer",
-        description: "Review code",
-        enabled: true,
-        scope: "project",
-      });
+      expect(skills).toEqual([
+        expect.objectContaining({
+          name: "reviewer",
+          description: "Review code",
+          path: path.join(projectSkill, "SKILL.md"),
+          enabled: true,
+          scope: "project",
+        }),
+        expect.objectContaining({
+          name: "writer",
+          description: "Write docs",
+          path: path.join(nestedSkill, "SKILL.md"),
+          enabled: true,
+          scope: "project",
+        }),
+        expect.objectContaining({
+          name: "global-helper",
+          description: "Help globally",
+          path: path.join(userSkill, "SKILL.md"),
+          enabled: true,
+          scope: "cursor",
+        }),
+      ]);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -92,10 +109,15 @@ description: Help globally
 `,
       );
 
-      const skills = await discoverCursorSkills({ cwd, homeDir });
+      const skills = await discoverCursorSkills({ cwd, homeDir, projectRootBoundary: root });
 
-      expect(skills).toHaveLength(1);
-      expect(skills[0]).toMatchObject({ name: "global-helper", scope: "cursor" });
+      expect(skills).toEqual([
+        expect.objectContaining({
+          name: "global-helper",
+          path: path.join(userSkill, "SKILL.md"),
+          scope: "cursor",
+        }),
+      ]);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

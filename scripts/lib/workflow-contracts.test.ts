@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+
 import { describe, expect, it } from "vitest";
 
 import {
@@ -11,18 +13,22 @@ import {
 
 const pinnedCheckout = "actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6";
 const pinnedCodecov = "codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5.5.5";
-const codecovCondition =
-  "${{ !cancelled() && (steps.unit_tests.outcome == 'success' || steps.unit_tests.outcome == 'failure') }}";
-const codecovToken = "${{ secrets.CODECOV_TOKEN }}";
 const pinnedMergify = "Mergifyio/gha-mergify-ci@8173bc3c1d337d3367454672d50cfdf6f0273396 # v23";
+const codecovCondition =
+  "${{ matrix.platform == 'linux' && !cancelled() && (steps.unit_tests.outcome == 'success' || steps.unit_tests.outcome == 'failure') }}";
 const mergifyCondition =
-  "${{ !cancelled() && (steps.unit_tests.outcome == 'success' || steps.unit_tests.outcome == 'failure') && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) }}";
+  "${{ matrix.platform == 'linux' && !cancelled() && (steps.unit_tests.outcome == 'success' || steps.unit_tests.outcome == 'failure') && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) }}";
+const codecovToken = "${{ secrets.CODECOV_TOKEN }}";
 const disabledPaths = [
   ".github/workflows/issue-labels.yml",
   ".github/workflows/pr-size.yml",
   ".github/workflows/pr-vouch.yml",
   ".github/workflows/release.yml",
 ] as const;
+const ciWorkflow = readFileSync(
+  new URL("../../.github/workflows/ci.yml", import.meta.url),
+  "utf8",
+).replace(/\r\n?/g, "\n");
 
 const policy = (): WorkflowPolicy => ({
   schemaVersion: 1,
@@ -77,7 +83,9 @@ const windowsStartupHome = "${{ runner.temp }}\\super-synara-ci-home";
 const macosPersistenceHome = "${{ runner.temp }}/super-synara-persistence-macos-home";
 const macosStartupHome = "${{ runner.temp }}/super-synara-ci-home";
 const nativeDesktopBuildStep = [
-  "      - env:",
+  "      - name: Build desktop pipeline",
+  "        env:",
+  '          SYNARA_DESKTOP_DISABLE_UPDATES: "1"',
   "          SYNARA_DESKTOP_FLAVOR: super",
   "        run: bun run build:desktop",
 ].join("\n");
@@ -120,7 +128,15 @@ const macosStartupSmokeStep = [
 const ciRootTestStep = [
   "      - name: Test with coverage and JUnit",
   "        id: unit_tests",
+  "        if: matrix.platform == 'linux'",
+  "        timeout-minutes: 30",
   "        run: bun run test:ci",
+].join("\n");
+const nonLinuxUnitTestStep = [
+  "      - name: Run cross-platform unit suite",
+  "        if: matrix.platform != 'linux'",
+  "        timeout-minutes: 30",
+  "        run: bun turbo test",
 ].join("\n");
 const codecovCoverageUploadStep = [
   "      - name: Upload coverage reports to Codecov",
@@ -131,6 +147,8 @@ const codecovCoverageUploadStep = [
   "          files: ./apps/desktop/coverage/lcov.info,./apps/server/coverage/lcov.info,./apps/web/coverage/lcov.info,./packages/contracts/coverage/lcov.info,./packages/shared/coverage/lcov.info,./scripts/coverage/lcov.info",
   "          disable_search: true",
   "          fail_ci_if_error: true",
+  "          flags: unit",
+  "          name: super-synara-unit-coverage",
 ].join("\n");
 const codecovTestResultsUploadStep = [
   "      - name: Upload test results to Codecov",
@@ -141,6 +159,8 @@ const codecovTestResultsUploadStep = [
   "          files: ./apps/desktop/test-report.junit.xml,./apps/server/test-report.junit.xml,./apps/web/test-report.junit.xml,./packages/contracts/test-report.junit.xml,./packages/shared/test-report.junit.xml,./scripts/test-report.junit.xml",
   "          disable_search: true",
   "          fail_ci_if_error: true",
+  "          flags: unit",
+  "          name: super-synara-unit-test-results",
   "          report_type: test_results",
 ].join("\n");
 const mergifyUploadStep = [
@@ -168,60 +188,22 @@ const mergifyVerificationStep = [
   "          MERGIFY_UPLOAD_OUTCOME: ${{ steps.mergify_ci.outputs.test_results_upload }}",
   '        run: test "$MERGIFY_UPLOAD_OUTCOME" = "success"',
 ].join("\n");
-const ciWorkflow = `name: CI
+const watchWorkflow = `name: Watch
 on:
-  pull_request:
-  push:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
-  quality:
+  inspect:
     runs-on: ubuntu-24.04
-    steps:
-      - uses: ${pinnedCheckout}
-${ciRootTestStep}
-${mergifyUploadStep}
-${mergifyVerificationStep}
-${codecovCoverageUploadStep}
-${codecovTestResultsUploadStep}
-  windows_x64:
-    runs-on: windows-2022
-    steps:
-      - run: bun run brand:check
-      - run: node apps/server/scripts/build-windows-job-launcher.mjs --arch x64
-      - run: node apps/server/scripts/build-windows-job-launcher.mjs --arch arm64
-      - run: bun run --cwd apps/server test src/provider/windowsProviderProcess.test.ts src/provider/windowsProviderProcess.windows.test.ts
-      - run: bun run --cwd packages/shared test src/desktopIdentity.test.ts src/desktopIdentityProof.test.ts src/windowsCertificate.test.ts
-      - run: bun run --cwd apps/desktop test src/backendShutdown.test.ts src/backendShutdown.windows.integration.test.ts
-      - run: bun run --cwd packages/shared test src/windowsProcess.test.ts
-      - run: bun run --cwd apps/server test src/windowsProcessEffect.test.ts src/codexAppServerManager.test.ts src/provider/Layers/ProviderHealth.test.ts src/persistence/MigrationBackup.test.ts src/restoreMigrationBackup.test.ts
-      - run: bun run --cwd apps/desktop test src/desktopMigrationRecovery.test.ts src/desktopStorageMigration.test.ts src/windowState.test.ts src/updateState.test.ts
-      - run: bun run --cwd scripts test check-brand-identity.test.ts verify-packaged-desktop-startup.test.ts lib/desktop-artifact-policy.test.ts lib/windows-authenticode.test.ts lib/windows-installer-qualification.test.ts lib/release-artifact-provenance.test.ts lib/super-synara-release-admission.test.ts lib/super-synara-workflow-contract.test.ts
-      - run: node scripts/verify-workflow-contracts.ts
-${nativeDesktopBuildStep}
-${windowsPersistenceSmokeStep}
-${windowsStartupSmokeStep}
-  macos_arm64:
-    runs-on: macos-15
-    steps:
-      - run: test "$(uname -m)" = arm64
-      - run: bun run brand:check
-      - run: node scripts/node-pty-smoke.mjs
-      - run: bun run --cwd apps/desktop test
-${nativeDesktopBuildStep}
-${macosPersistenceSmokeStep}
-${macosStartupSmokeStep}
-  release_smoke:
+  report:
     runs-on: ubuntu-24.04
-    steps:
-      - run: echo bun run test
-      - run: bun run test:desktop-smoke
-      - run: bun run --cwd scripts test
-      - run: |
-          # bun run test
-          echo safe
+    permissions:
+      contents: read
+      issues: write
 `;
-const watchWorkflow = `name: Watch\non:\n  schedule:\n    - cron: "17 */6 * * *"\n  workflow_dispatch:\npermissions:\n  contents: read\njobs:\n  inspect:\n    runs-on: ubuntu-24.04\n  report:\n    runs-on: ubuntu-24.04\n    permissions:\n      contents: read\n      issues: write\n`;
 const dependencyReviewWorkflow = `name: Dependency Review
 on:
   pull_request:
@@ -310,7 +292,6 @@ jobs:
     permissions:
       contents: write
 `;
-
 const mergifyConfiguration = `merge_queue:
   mode: serial
   max_parallel_checks: 1
@@ -335,10 +316,10 @@ queue_rules:
       - base = main
 `;
 
-function validFiles(): Map<string, string> {
+function validFiles(ci = ciWorkflow): Map<string, string> {
   return new Map([
     ...disabledPaths.map((path) => [path, disabledWorkflow] as const),
-    [".github/workflows/ci.yml", ciWorkflow],
+    [".github/workflows/ci.yml", ci],
     [".github/workflows/dependency-review.yml", dependencyReviewWorkflow],
     [".github/workflows/codeql.yml", codeqlWorkflow],
     [".github/workflows/release-drafter.yml", releaseDrafterWorkflow],
@@ -346,8 +327,30 @@ function validFiles(): Map<string, string> {
   ]);
 }
 
+function errorsFor(ci: string): string {
+  return validateWorkflowContracts(validFiles(ci), policy()).join("\n");
+}
+
+function replaceOccurrence(
+  source: string,
+  search: string,
+  replacement: string,
+  occurrence: number,
+): string {
+  let offset = 0;
+  for (let index = 1; index <= occurrence; index += 1) {
+    const match = source.indexOf(search, offset);
+    if (match < 0) throw new Error(`Missing occurrence ${occurrence}: ${search}`);
+    if (index === occurrence) {
+      return source.slice(0, match) + replacement + source.slice(match + search.length);
+    }
+    offset = match + search.length;
+  }
+  return source;
+}
+
 describe("workflow contracts", () => {
-  it("accepts pinned, read-only PR CI and the narrowly scoped watcher", () => {
+  it("accepts the pinned, cross-platform CI architecture and narrowly scoped watcher", () => {
     expect(validateWorkflowContracts(validFiles(), policy())).toEqual([]);
     expect(validateMergifyConfiguration(mergifyConfiguration)).toEqual([]);
   });
@@ -390,227 +393,382 @@ describe("workflow contracts", () => {
   });
 
   it("rejects pull_request_target and write permission in allowed CI", () => {
-    const files = validFiles();
-    files.set(
-      ".github/workflows/ci.yml",
+    const errors = errorsFor(
       ciWorkflow
         .replace("pull_request:", "pull_request_target:")
         .replace("contents: read", "contents: write"),
     );
-    const errors = validateWorkflowContracts(files, policy()).join("\n");
     expect(errors).toContain("must not use pull_request_target");
     expect(errors).toContain("unsupported contents: write");
   });
 
-  it("rejects non-standard runners in allowed workflows", () => {
-    const files = validFiles();
-    files.set(".github/workflows/ci.yml", ciWorkflow.replace("ubuntu-24.04", "macos-15-intel"));
-    expect(validateWorkflowContracts(files, policy()).join("\n")).toContain(
+  it("requires approved direct and static-matrix runners", () => {
+    expect(errorsFor(ciWorkflow.replace("runner: macos-15", "runner: macos-15-intel"))).toContain(
       "references unsupported runner macos-15-intel",
     );
+    expect(
+      errorsFor(
+        ciWorkflow.replace("runs-on: ${{ matrix.runner }}", "runs-on: ${{ inputs.runner }}"),
+      ),
+    ).toContain("references unsupported runner ${{ inputs.runner }}");
   });
 
-  it("requires the macOS lane to prove its arm64 architecture", () => {
-    const files = validFiles();
-    files.set(
-      ".github/workflows/ci.yml",
-      ciWorkflow.replace('test "$(uname -m)" = arm64', "uname -m"),
+  it("requires the exact three-runner unit matrix with fail-fast disabled", () => {
+    expect(errorsFor(ciWorkflow.replace("fail-fast: false", "fail-fast: true"))).toContain(
+      "unit must use a fail-fast: false static include matrix",
     );
-    expect(validateWorkflowContracts(files, policy()).join("\n")).toContain(
-      "macos_arm64 must fail closed",
-    );
+    expect(
+      errorsFor(
+        ciWorkflow.replace(
+          "runner: windows-2022\n          - platform: macos",
+          "runner: ubuntu-24.04\n          - platform: macos",
+        ),
+      ),
+    ).toContain("unit matrix entry 2 has drifted");
   });
 
-  it("requires exact native CI gates and rejects broad suites only in native jobs", () => {
-    const missingWindowsGate = validFiles();
-    missingWindowsGate.set(
-      ".github/workflows/ci.yml",
-      ciWorkflow.replace("src/desktopIdentityProof.test.ts", "src/forgedIdentityProof.test.ts"),
+  it("requires Linux coverage tests and non-Linux full unit suites", () => {
+    const filteredLinux = errorsFor(
+      ciWorkflow.replace("run: bun run test:ci", "run: bun run test:ci --filter=@synara/web"),
     );
-    expect(validateWorkflowContracts(missingWindowsGate, policy()).join("\n")).toContain(
-      "windows_x64 must run exact native gate command",
-    );
+    expect(filteredLinux).toContain("unit must run exactly one Linux-only bun run test:ci command");
+    expect(filteredLinux).toContain("must not own an additional, filtered, or chained");
 
-    const missingArm64LauncherBuild = validFiles();
-    missingArm64LauncherBuild.set(
-      ".github/workflows/ci.yml",
+    const filteredNonLinux = errorsFor(
+      ciWorkflow.replace("run: bun turbo test", "run: bun turbo test --filter=@synara/web"),
+    );
+    expect(filteredNonLinux).toContain(
+      "unit must run exactly one non-Linux bun turbo test command",
+    );
+    expect(filteredNonLinux).toContain("must not own an additional, filtered, or chained");
+
+    const broadLinuxCondition = errorsFor(
       ciWorkflow.replace(
-        "node apps/server/scripts/build-windows-job-launcher.mjs --arch arm64",
+        ciRootTestStep,
+        ciRootTestStep.replace(
+          "if: matrix.platform == 'linux'",
+          "if: matrix.platform != 'windows'",
+        ),
+      ),
+    );
+    expect(broadLinuxCondition).toContain(
+      "unit bun run test:ci command must run only for matrix.platform == 'linux' and fail closed",
+    );
+
+    const broadNonLinuxCondition = errorsFor(
+      ciWorkflow.replace(
+        nonLinuxUnitTestStep,
+        nonLinuxUnitTestStep.replace(
+          "if: matrix.platform != 'linux'",
+          "if: matrix.platform != 'windows'",
+        ),
+      ),
+    );
+    expect(broadNonLinuxCondition).toContain(
+      "unit bun turbo test command must run only when matrix.platform != 'linux' and fail closed",
+    );
+
+    const nonFailingLinux = errorsFor(
+      ciWorkflow.replace(
+        ciRootTestStep,
+        ciRootTestStep.replace(
+          "        timeout-minutes: 30",
+          "        continue-on-error: true\n        timeout-minutes: 30",
+        ),
+      ),
+    );
+    expect(nonFailingLinux).toContain(
+      "unit bun run test:ci command must run only for matrix.platform == 'linux' and fail closed",
+    );
+
+    const nonFailingNonLinux = errorsFor(
+      ciWorkflow.replace(
+        nonLinuxUnitTestStep,
+        nonLinuxUnitTestStep.replace(
+          "        timeout-minutes: 30",
+          "        continue-on-error: true\n        timeout-minutes: 30",
+        ),
+      ),
+    );
+    expect(nonFailingNonLinux).toContain(
+      "unit bun turbo test command must run only when matrix.platform != 'linux' and fail closed",
+    );
+  });
+
+  it("prepares the Windows Job launcher before the Windows full-suite member", () => {
+    const missingSetup = errorsFor(
+      ciWorkflow.replace(
+        "run: node apps/server/scripts/build-windows-job-launcher.mjs --arch x64",
+        "run: echo skipped-launcher-build",
+      ),
+    );
+    expect(missingSetup).toContain("unit must run exactly one Windows launcher setup command");
+
+    const broadSetup = errorsFor(
+      ciWorkflow.replace("if: matrix.platform == 'windows'", "if: matrix.platform != 'macos'"),
+    );
+    expect(broadSetup).toContain(
+      "unit Windows launcher setup must run only for matrix.platform == 'windows' and fail closed",
+    );
+
+    const setupStep = [
+      "      - name: Build Windows Job launcher for unit suite",
+      "        if: matrix.platform == 'windows'",
+      "        run: node apps/server/scripts/build-windows-job-launcher.mjs --arch x64",
+    ].join("\n");
+    const misplacedSetup = errorsFor(
+      ciWorkflow
+        .replace(`${setupStep}\n\n`, "")
+        .replace(`${nonLinuxUnitTestStep}\n`, `${nonLinuxUnitTestStep}\n\n${setupStep}\n`),
+    );
+    expect(misplacedSetup).toContain("unit Windows launcher setup must run before bun turbo test");
+  });
+
+  it("retains unit-matrix timeout headroom", () => {
+    const shortJob = errorsFor(
+      ciWorkflow.replace(
+        "  unit:\n    name: unit_${{ matrix.platform }}\n    runs-on: ${{ matrix.runner }}\n    timeout-minutes: 40",
+        "  unit:\n    name: unit_${{ matrix.platform }}\n    runs-on: ${{ matrix.runner }}\n    timeout-minutes: 30",
+      ),
+    );
+    expect(shortJob).toContain("unit job timeout must be 40 minutes");
+
+    const shortLinuxStep = errorsFor(
+      ciWorkflow.replace(
+        ciRootTestStep,
+        ciRootTestStep.replace("timeout-minutes: 30", "timeout-minutes: 20"),
+      ),
+    );
+    expect(shortLinuxStep).toContain("unit bun run test:ci timeout must be 30 minutes");
+
+    const shortNonLinuxStep = errorsFor(
+      ciWorkflow.replace(
+        nonLinuxUnitTestStep,
+        nonLinuxUnitTestStep.replace("timeout-minutes: 30", "timeout-minutes: 20"),
+      ),
+    );
+    expect(shortNonLinuxStep).toContain("unit bun turbo test timeout must be 30 minutes");
+  });
+
+  it("rejects duplicated curated or broad unit suites in native jobs", () => {
+    const curatedWindows = replaceOccurrence(
+      ciWorkflow,
+      "      - name: Verify Super Synara identity\n        run: bun run brand:check",
+      "      - name: Verify Super Synara identity\n        run: bun run brand:check\n\n      - name: Curated regression\n        run: bun run --cwd apps/server test src/main.test.ts",
+      1,
+    );
+    expect(errorsFor(curatedWindows)).toContain(
+      "windows_x64 must not duplicate unit suites or maintain a curated test allowlist",
+    );
+
+    const broadMac = replaceOccurrence(
+      ciWorkflow,
+      "      - name: Build desktop pipeline\n        env:",
+      "      - name: Duplicate desktop suite\n        run: bun run --cwd apps/desktop test\n\n      - name: Build desktop pipeline\n        env:",
+      2,
+    );
+    expect(errorsFor(broadMac)).toContain(
+      "macos_arm64 must not duplicate unit suites or maintain a curated test allowlist",
+    );
+  });
+
+  it("retains the exact Windows Job launcher and containment gates", () => {
+    for (const [command, sourceCommand, occurrence] of [
+      [
         "node apps/server/scripts/build-windows-job-launcher.mjs --arch x64",
-      ),
+        "node apps/server/scripts/build-windows-job-launcher.mjs --arch x64",
+        2,
+      ],
+      [
+        "node apps/server/scripts/build-windows-job-launcher.mjs --arch arm64",
+        "node apps/server/scripts/build-windows-job-launcher.mjs --arch arm64",
+        1,
+      ],
+      [
+        "bun run --cwd apps/server test src/provider/windowsProviderProcess.test.ts src/provider/windowsProviderProcess.windows.test.ts",
+        "bun run --cwd apps/server test\n          src/provider/windowsProviderProcess.test.ts\n          src/provider/windowsProviderProcess.windows.test.ts",
+        1,
+      ],
+    ] as const) {
+      const drifted = replaceOccurrence(
+        ciWorkflow,
+        sourceCommand,
+        `echo replaced ${command}`,
+        occurrence,
+      );
+      expect(errorsFor(drifted)).toContain(`windows_x64 must run exact gate command: ${command}`);
+    }
+  });
+
+  it("binds monorepo test ownership to the unit matrix only", () => {
+    const missingLinux = errorsFor(ciWorkflow.replace("run: bun run test:ci", "run: echo skipped"));
+    expect(missingLinux).toContain("unit must run exactly one Linux-only bun run test:ci command");
+
+    const missingNonLinux = errorsFor(
+      ciWorkflow.replace("run: bun turbo test", "run: echo skipped"),
     );
-    expect(validateWorkflowContracts(missingArm64LauncherBuild, policy()).join("\n")).toContain(
-      "windows_x64 must run exact native gate command: node apps/server/scripts/build-windows-job-launcher.mjs --arch arm64",
+    expect(missingNonLinux).toContain("unit must run exactly one non-Linux bun turbo test command");
+
+    const duplicateLinux = errorsFor(
+      ciWorkflow.replace(`${ciRootTestStep}\n`, `${ciRootTestStep}\n\n${ciRootTestStep}\n`),
+    );
+    expect(duplicateLinux).toContain(
+      "unit must run exactly one Linux-only bun run test:ci command",
     );
 
-    const broadWindowsSuite = validFiles();
-    broadWindowsSuite.set(
-      ".github/workflows/ci.yml",
+    const duplicateNonLinux = errorsFor(
       ciWorkflow.replace(
-        "      - run: bun run brand:check\n",
-        "      - run: bun run brand:check\n      - run: bun run test\n",
+        `${nonLinuxUnitTestStep}\n`,
+        `${nonLinuxUnitTestStep}\n\n${nonLinuxUnitTestStep}\n`,
       ),
     );
-    expect(validateWorkflowContracts(broadWindowsSuite, policy()).join("\n")).toContain(
-      "windows_x64 must not run the monorepo-wide bun run test suite",
+    expect(duplicateNonLinux).toContain(
+      "unit must run exactly one non-Linux bun turbo test command",
     );
 
-    const broadMacosSuite = validFiles();
-    broadMacosSuite.set(
-      ".github/workflows/ci.yml",
+    const missingUnitTestId = errorsFor(
+      ciWorkflow.replace(ciRootTestStep, ciRootTestStep.replace("        id: unit_tests\n", "")),
+    );
+    expect(missingUnitTestId).toContain(
+      "unit bun run test:ci must use id unit_tests for report upload conditions",
+    );
+
+    const duplicate = errorsFor(
       ciWorkflow.replace(
-        "      - run: bun run --cwd apps/desktop test\n",
-        "      - run: bun run --cwd apps/desktop test\n      - run: bun run test\n",
+        "      - name: Build desktop pipeline\n        run: bun run build:desktop",
+        "      - name: Duplicate full suite\n        run: bun run test\n\n      - name: Build desktop pipeline\n        run: bun run build:desktop",
       ),
     );
-    expect(validateWorkflowContracts(broadMacosSuite, policy()).join("\n")).toContain(
-      "macos_arm64 must not run the monorepo-wide bun run test suite",
+    expect(duplicate).toContain(
+      "quality_linux must not own an additional, filtered, or chained monorepo-wide unit suite",
     );
   });
 
-  it("binds CI suite ownership and native runners", () => {
-    const missingQualitySuite = validFiles();
-    missingQualitySuite.set(
-      ".github/workflows/ci.yml",
-      ciWorkflow.replace(`${ciRootTestStep}\n`, ""),
+  it("requires fail-closed, Linux-only Codecov coverage and test-result uploads", () => {
+    const missingCoverageUpload = errorsFor(
+      ciWorkflow.replace(`${codecovCoverageUploadStep}\n\n`, ""),
     );
-    expect(validateWorkflowContracts(missingQualitySuite, policy()).join("\n")).toContain(
-      "quality must run exactly one bun run test:ci suite",
+    expect(missingCoverageUpload).toContain(
+      "unit must define exactly one Upload coverage reports to Codecov step",
     );
 
-    const duplicateQualitySuite = validFiles();
-    duplicateQualitySuite.set(
-      ".github/workflows/ci.yml",
-      ciWorkflow.replace(`${ciRootTestStep}\n`, `${ciRootTestStep}\n${ciRootTestStep}\n`),
-    );
-    expect(validateWorkflowContracts(duplicateQualitySuite, policy()).join("\n")).toContain(
-      "quality must run exactly one bun run test:ci suite",
-    );
-
-    const swappedWindowsRunner = validFiles();
-    swappedWindowsRunner.set(
-      ".github/workflows/ci.yml",
-      ciWorkflow.replace("    runs-on: windows-2022", "    runs-on: ubuntu-24.04"),
-    );
-    expect(validateWorkflowContracts(swappedWindowsRunner, policy()).join("\n")).toContain(
-      "windows_x64 must run on windows-2022",
-    );
-
-    const conditionalQuality = validFiles();
-    conditionalQuality.set(
-      ".github/workflows/ci.yml",
-      ciWorkflow.replace("  quality:\n", "  quality:\n    if: false\n"),
-    );
-    expect(validateWorkflowContracts(conditionalQuality, policy()).join("\n")).toContain(
-      "quality job must be unconditional and fail closed",
-    );
-
-    const chainedReleaseSuite = validFiles();
-    chainedReleaseSuite.set(
-      ".github/workflows/ci.yml",
-      ciWorkflow.replace("          echo safe", "          bun run test && echo done"),
-    );
-    expect(validateWorkflowContracts(chainedReleaseSuite, policy()).join("\n")).toContain(
-      "release_smoke must not own an additional or chained monorepo-wide bun run test suite",
-    );
-  });
-
-  it("requires fail-closed Codecov coverage and test-result uploads", () => {
-    const missingCoverageUpload = validFiles();
-    missingCoverageUpload.set(
-      ".github/workflows/ci.yml",
-      ciWorkflow.replace(`${codecovCoverageUploadStep}\n`, ""),
-    );
-    expect(validateWorkflowContracts(missingCoverageUpload, policy()).join("\n")).toContain(
-      "must define exactly one Upload coverage reports to Codecov step",
-    );
-
-    const wrongTestReportType = validFiles();
-    wrongTestReportType.set(
-      ".github/workflows/ci.yml",
+    const wrongTestReportType = errorsFor(
       ciWorkflow.replace("report_type: test_results", "report_type: coverage"),
     );
-    expect(validateWorkflowContracts(wrongTestReportType, policy()).join("\n")).toContain(
+    expect(wrongTestReportType).toContain(
       "Upload test results to Codecov must set report_type to test_results",
     );
 
-    const nonBlockingCoverageUpload = validFiles();
-    nonBlockingCoverageUpload.set(
-      ".github/workflows/ci.yml",
+    const permissiveCoverageInput = errorsFor(
       ciWorkflow.replace(
-        `${codecovCoverageUploadStep}`,
+        codecovCoverageUploadStep,
         codecovCoverageUploadStep.replace("fail_ci_if_error: true", "fail_ci_if_error: false"),
       ),
     );
-    expect(validateWorkflowContracts(nonBlockingCoverageUpload, policy()).join("\n")).toContain(
+    expect(permissiveCoverageInput).toContain(
       "Upload coverage reports to Codecov must fail closed on Codecov upload errors",
     );
 
-    const missingUnitTestId = validFiles();
-    missingUnitTestId.set(
-      ".github/workflows/ci.yml",
-      ciWorkflow.replace("        id: unit_tests\n", ""),
+    const nonBlockingCoverageStep = errorsFor(
+      ciWorkflow.replace(
+        codecovCoverageUploadStep,
+        codecovCoverageUploadStep.replace(
+          "      - name: Upload coverage reports to Codecov",
+          "      - name: Upload coverage reports to Codecov\n        continue-on-error: true",
+        ),
+      ),
     );
-    expect(validateWorkflowContracts(missingUnitTestId, policy()).join("\n")).toContain(
-      "bun run test:ci must use id unit_tests for report upload conditions",
+    expect(nonBlockingCoverageStep).toContain(
+      "Upload coverage reports to Codecov must fail closed",
     );
 
-    const uploadBeforeTests = validFiles();
-    uploadBeforeTests.set(
-      ".github/workflows/ci.yml",
-      ciWorkflow
-        .replace(`${codecovCoverageUploadStep}\n`, "")
-        .replace(`${ciRootTestStep}\n`, `${codecovCoverageUploadStep}\n${ciRootTestStep}\n`),
+    const nonLinuxCoverage = errorsFor(
+      ciWorkflow.replace(
+        codecovCondition,
+        codecovCondition.replace("matrix.platform == 'linux' && ", ""),
+      ),
     );
-    expect(validateWorkflowContracts(uploadBeforeTests, policy()).join("\n")).toContain(
+    expect(nonLinuxCoverage).toContain(
+      "Upload coverage reports to Codecov must run only for completed Linux unit tests",
+    );
+
+    const uploadBeforeTests = errorsFor(
+      ciWorkflow
+        .replace(`${codecovCoverageUploadStep}\n\n`, "")
+        .replace(`${ciRootTestStep}\n`, `${codecovCoverageUploadStep}\n\n${ciRootTestStep}\n`),
+    );
+    expect(uploadBeforeTests).toContain(
       "Upload coverage reports to Codecov must run after bun run test:ci",
     );
   });
 
-  it("requires fork-safe, fail-closed Mergify JUnit ingestion", () => {
-    const missingUpload = validFiles();
-    missingUpload.set(".github/workflows/ci.yml", ciWorkflow.replace(`${mergifyUploadStep}\n`, ""));
-    expect(validateWorkflowContracts(missingUpload, policy()).join("\n")).toContain(
-      "must define exactly one Upload test results to Mergify CI Insights step",
+  it("requires fork-safe, fail-closed, Linux-only Mergify JUnit ingestion", () => {
+    const missingUpload = errorsFor(ciWorkflow.replace(`${mergifyUploadStep}\n\n`, ""));
+    expect(missingUpload).toContain(
+      "unit must define exactly one Upload test results to Mergify CI Insights step",
     );
 
-    const unsafeForkUpload = validFiles();
-    unsafeForkUpload.set(
-      ".github/workflows/ci.yml",
-      ciWorkflow.replace(mergifyCondition, codecovCondition),
-    );
-    expect(validateWorkflowContracts(unsafeForkUpload, policy()).join("\n")).toContain(
-      "Mergify upload must be completed-test and fork safe",
+    const unsafeForkUpload = errorsFor(ciWorkflow.replace(mergifyCondition, codecovCondition));
+    expect(unsafeForkUpload).toContain(
+      "Mergify upload must be Linux-only, completed-test, and fork safe",
     );
 
-    const wrongCredential = validFiles();
-    wrongCredential.set(
-      ".github/workflows/ci.yml",
+    const nonLinuxUpload = errorsFor(
+      ciWorkflow.replace(
+        mergifyCondition,
+        mergifyCondition.replace("matrix.platform == 'linux' && ", ""),
+      ),
+    );
+    expect(nonLinuxUpload).toContain(
+      "Mergify upload must be Linux-only, completed-test, and fork safe",
+    );
+
+    const wrongCredential = errorsFor(
       ciWorkflow.replace("token: ${{ secrets.MERGIFY_TOKEN }}", "token: ${{ github.token }}"),
     );
-    expect(validateWorkflowContracts(wrongCredential, policy()).join("\n")).toContain(
+    expect(wrongCredential).toContain(
       "Mergify upload must ingest only the six expected JUnit reports",
     );
 
-    const missingVerification = validFiles();
-    missingVerification.set(
-      ".github/workflows/ci.yml",
-      ciWorkflow.replace(`${mergifyVerificationStep}\n`, ""),
+    const nonBlockingUpload = errorsFor(
+      ciWorkflow.replace(
+        mergifyUploadStep,
+        mergifyUploadStep.replace(
+          "      - name: Upload test results to Mergify CI Insights",
+          "      - name: Upload test results to Mergify CI Insights\n        continue-on-error: true",
+        ),
+      ),
     );
-    expect(validateWorkflowContracts(missingVerification, policy()).join("\n")).toContain(
-      "must define exactly one Verify Mergify test results upload step",
+    expect(nonBlockingUpload).toContain("Mergify upload must fail closed");
+
+    const missingVerification = errorsFor(ciWorkflow.replace(`${mergifyVerificationStep}\n\n`, ""));
+    expect(missingVerification).toContain(
+      "unit must define exactly one Verify Mergify test results upload step",
     );
 
-    const permissiveVerification = validFiles();
-    permissiveVerification.set(
-      ".github/workflows/ci.yml",
+    const permissiveVerification = errorsFor(
       ciWorkflow.replace(
         'run: test "$MERGIFY_UPLOAD_OUTCOME" = "success"',
         'run: test "$MERGIFY_UPLOAD_OUTCOME" != "rejected"',
       ),
     );
-    expect(validateWorkflowContracts(permissiveVerification, policy()).join("\n")).toContain(
-      "Mergify upload verification must fail closed unless upload succeeds",
+    expect(permissiveVerification).toContain(
+      "Mergify upload verification must fail closed unless the Linux upload succeeds",
+    );
+  });
+
+  it("keeps test reporting owned by the Linux member of the unit matrix", () => {
+    const offOwnerCoverage = errorsFor(
+      ciWorkflow
+        .replace(`${codecovCoverageUploadStep}\n\n`, "")
+        .replace(
+          "      - name: Build desktop pipeline\n        run: bun run build:desktop",
+          `${codecovCoverageUploadStep}\n\n      - name: Build desktop pipeline\n        run: bun run build:desktop`,
+        ),
+    );
+    expect(offOwnerCoverage).toContain("must define exactly two unit-owned Codecov upload actions");
+    expect(offOwnerCoverage).toContain(
+      "test reporting steps must belong only to the Linux member of the unit matrix",
     );
   });
 
@@ -739,65 +897,46 @@ jobs:
     );
   });
 
-  it("requires native CI gates to fail closed before the build", () => {
-    const skippedGate = validFiles();
-    skippedGate.set(
-      ".github/workflows/ci.yml",
-      ciWorkflow.replace(
-        "      - run: node scripts/verify-workflow-contracts.ts",
-        "      - run: node scripts/verify-workflow-contracts.ts\n        continue-on-error: true",
-      ),
+  it("keeps formatting, lint, and typechecking blocking on Linux and Windows", () => {
+    expect(errorsFor(ciWorkflow.replace("run: bun run fmt:check", "run: bun run fmt"))).toContain(
+      "quality_linux must run exact gate command: bun run fmt:check",
     );
-    expect(validateWorkflowContracts(skippedGate, policy()).join("\n")).toContain(
-      "native gate must be unconditional and fail closed",
-    );
-
-    const gate = "      - run: node scripts/verify-workflow-contracts.ts\n";
-    const reorderedGate = validFiles();
-    reorderedGate.set(
-      ".github/workflows/ci.yml",
-      ciWorkflow
-        .replace(gate, "")
-        .replace(`${nativeDesktopBuildStep}\n`, `${nativeDesktopBuildStep}\n${gate}`),
-    );
-    expect(validateWorkflowContracts(reorderedGate, policy()).join("\n")).toContain(
-      "native gate must run before the desktop build",
-    );
-
-    const conditionalArchitecture = validFiles();
-    conditionalArchitecture.set(
-      ".github/workflows/ci.yml",
-      ciWorkflow.replace(
-        '      - run: test "$(uname -m)" = arm64',
-        '      - if: false\n        run: test "$(uname -m)" = arm64',
-      ),
-    );
-    expect(validateWorkflowContracts(conditionalArchitecture, policy()).join("\n")).toContain(
-      "native gate must be unconditional and fail closed",
-    );
-
-    const conditionalJob = validFiles();
-    conditionalJob.set(
-      ".github/workflows/ci.yml",
-      ciWorkflow.replace("  windows_x64:\n", "  windows_x64:\n    if: false\n"),
-    );
-    expect(validateWorkflowContracts(conditionalJob, policy()).join("\n")).toContain(
-      "windows_x64 job must be unconditional and fail closed",
-    );
-
-    const nonFailingBuild = validFiles();
-    nonFailingBuild.set(
-      ".github/workflows/ci.yml",
-      ciWorkflow.replace(
-        nativeDesktopBuildStep,
-        nativeDesktopBuildStep.replace(
-          "        run: bun run build:desktop",
-          "        continue-on-error: true\n        run: bun run build:desktop",
+    expect(
+      errorsFor(
+        ciWorkflow.replace(
+          "      - name: Typecheck\n        run: bun run typecheck",
+          "      - name: Typecheck\n        continue-on-error: true\n        run: bun run typecheck",
         ),
       ),
+    ).toContain("quality_linux gate must be unconditional and fail closed: bun run typecheck");
+
+    const windowsTypecheck = ciWorkflow.lastIndexOf("run: bun run typecheck");
+    const driftedWindows =
+      ciWorkflow.slice(0, windowsTypecheck) +
+      "run: bun run typecheck --filter=web" +
+      ciWorkflow.slice(windowsTypecheck + "run: bun run typecheck".length);
+    expect(errorsFor(driftedWindows)).toContain(
+      "quality_windows must run exact gate command: bun run typecheck",
     );
-    expect(validateWorkflowContracts(nonFailingBuild, policy()).join("\n")).toContain(
-      "native desktop build must be unconditional and fail closed",
+
+    const serializedQuality = errorsFor(
+      ciWorkflow.replace(
+        "      - name: Verify Super Synara identity\n        run: bun run brand:check",
+        "      - name: Verify Super Synara identity\n        run: bun run brand:check\n\n      - name: Duplicate format gate\n        run: bun run fmt:check",
+      ),
+    );
+    expect(serializedQuality).toContain(
+      "windows_x64 must not serialize Windows formatting, lint, or typechecking before its artifact",
+    );
+
+    const delayedQuality = errorsFor(
+      ciWorkflow.replace(
+        "  quality_windows:\n    name: quality_windows\n    runs-on: windows-2022",
+        "  quality_windows:\n    name: quality_windows\n    needs: windows_x64\n    runs-on: windows-2022",
+      ),
+    );
+    expect(delayedQuality).toContain(
+      "quality_windows must run independently of artifact producers",
     );
   });
 
@@ -906,8 +1045,8 @@ jobs:
     preBuildSmoke.set(
       ".github/workflows/ci.yml",
       ciWorkflow.replace(
-        `${nativeDesktopBuildStep}\n${windowsPersistenceSmokeStep}`,
-        `${windowsPersistenceSmokeStep}\n${nativeDesktopBuildStep}`,
+        `${nativeDesktopBuildStep}\n\n${windowsPersistenceSmokeStep}`,
+        `${windowsPersistenceSmokeStep}\n\n${nativeDesktopBuildStep}`,
       ),
     );
     expect(validateWorkflowContracts(preBuildSmoke, policy()).join("\n")).toContain(
@@ -1020,18 +1159,157 @@ jobs:
     );
   });
 
-  it("rejects job-level write-all in allowed workflows", () => {
-    const files = validFiles();
-    files.set(
-      ".github/workflows/ci.yml",
+  it("keeps stable browser tests blocking and only registry-backed geometry nonblocking", () => {
+    const stableNonblocking = ciWorkflow.replace(
+      "      - name: Browser test (stable)\n        timeout-minutes: 20",
+      "      - name: Browser test (stable)\n        continue-on-error: true\n        timeout-minutes: 20",
+    );
+    expect(errorsFor(stableNonblocking)).toContain(
+      "quality_linux gate must be unconditional and fail closed: bun run --cwd apps/web test:browser:stable",
+    );
+    expect(errorsFor(stableNonblocking)).toContain(
+      "may use continue-on-error only for registered quarantine runs",
+    );
+
+    const directGeometry = errorsFor(
       ciWorkflow.replace(
-        "    runs-on: ubuntu-24.04",
-        "    permissions: write-all\n    runs-on: ubuntu-24.04",
+        "node scripts/quarantine-registry.ts run --platform linux",
+        "bun run --cwd apps/web test:browser:geometry",
       ),
     );
-    expect(validateWorkflowContracts(files, policy()).join("\n")).toContain(
-      "unsupported *: write at jobs.quality.permissions",
+    expect(directGeometry).toContain(
+      "must run the registered linux quarantine as the sole nonblocking test step",
     );
+
+    const missingBaseline = errorsFor(
+      ciWorkflow.replace(
+        ' --baseline-ref "${{ github.event.pull_request.base.sha || github.event.before }}"',
+        "",
+      ),
+    );
+    expect(missingBaseline).toContain("must publish the linux quarantine summary");
+  });
+
+  it("keeps the required quality context as an exact fail-closed aggregate", () => {
+    const missingBrowserDependency = errorsFor(ciWorkflow.replace("      - browser_windows\n", ""));
+    expect(missingBrowserDependency).toContain(
+      "quality aggregate must depend on the exact merge-blocking quality job set",
+    );
+
+    const missingUnitDependency = errorsFor(ciWorkflow.replace("      - unit\n", ""));
+    expect(missingUnitDependency).toContain(
+      "quality aggregate must depend on the exact merge-blocking quality job set",
+    );
+
+    const weakenedBrowserResult = errorsFor(
+      ciWorkflow.replace(
+        '          test "${{ needs.browser_windows.result }}" = success',
+        '          test "${{ needs.browser_windows.result }}" != failure',
+      ),
+    );
+    expect(weakenedBrowserResult).toContain("quality must run exact gate command");
+
+    const weakenedUnitResult = errorsFor(
+      ciWorkflow.replace(
+        '          test "${{ needs.unit.result }}" = success',
+        '          test "${{ needs.unit.result }}" != failure',
+      ),
+    );
+    expect(weakenedUnitResult).toContain("quality must run exact gate command");
+
+    const reportingInAggregate = errorsFor(
+      ciWorkflow.replace(
+        "      - name: Require every quality dependency to succeed",
+        `${codecovCoverageUploadStep}\n\n      - name: Require every quality dependency to succeed`,
+      ),
+    );
+    expect(reportingInAggregate).toContain(
+      "test reporting steps must belong only to the Linux member of the unit matrix",
+    );
+    expect(reportingInAggregate).toContain("quality aggregate must contain only its result gate");
+
+    expect(
+      errorsFor(
+        ciWorkflow.replace(
+          "  quality:\n    name: quality\n    if: always()",
+          "  quality:\n    name: quality\n    if: success()",
+        ),
+      ),
+    ).toContain("quality aggregate must run with always() and fail closed");
+  });
+
+  it("pins artifact layout so E2E downloads land at repository-relative runtime paths", () => {
+    expect(errorsFor(ciWorkflow.replace("            apps/web/dist/**\n", ""))).toContain(
+      "artifact desktop-build-linux paths have drifted",
+    );
+    expect(
+      errorsFor(
+        ciWorkflow.replace(
+          "          path: .\n\n      - name: Install Linux desktop browser dependencies",
+          "          path: apps\n\n      - name: Install Linux desktop browser dependencies",
+        ),
+      ),
+    ).toContain("e2e_linux artifact desktop-build-linux must use path .");
+  });
+
+  it("keeps Linux and Windows E2E blocking and independently bound to their producers", () => {
+    expect(
+      errorsFor(ciWorkflow.replace("xvfb-run -a bun run test:e2e", "bun run test:e2e")),
+    ).toContain("e2e_linux must run exact gate command: xvfb-run -a bun run test:e2e");
+
+    expect(
+      errorsFor(
+        ciWorkflow.replace(
+          "  e2e_linux:\n    name: e2e_linux\n    needs: quality_linux",
+          "  e2e_linux:\n    name: e2e_linux\n    needs: windows_x64",
+        ),
+      ),
+    ).toContain("e2e_linux must depend only on its quality_linux artifact producer");
+
+    expect(
+      errorsFor(
+        ciWorkflow.replace(
+          "      - name: Run Windows desktop E2E\n        run: bun run test:e2e",
+          "      - name: Run Windows desktop E2E\n        continue-on-error: true\n        run: bun run test:e2e",
+        ),
+      ),
+    ).toContain("may use continue-on-error only for registered quarantine runs");
+
+    expect(
+      errorsFor(
+        ciWorkflow.replace(
+          "  e2e_windows:\n    name: e2e_windows\n    needs: windows_x64",
+          "  e2e_windows:\n    name: e2e_windows\n    needs: quality",
+        ),
+      ),
+    ).toContain("e2e_windows must depend only on its windows_x64 artifact producer");
+  });
+
+  it("requires native architecture, build, and smoke gates in order", () => {
+    expect(errorsFor(ciWorkflow.replace('test "$(uname -m)" = arm64', "uname -m"))).toContain(
+      'macos_arm64 must run exact gate command: test "$(uname -m)" = arm64',
+    );
+    expect(
+      errorsFor(
+        replaceOccurrence(
+          ciWorkflow,
+          "      - name: Smoke unpacked desktop in isolated state\n        env:",
+          "      - name: Smoke unpacked desktop in isolated state\n        continue-on-error: true\n        env:",
+          2,
+        ),
+      ),
+    ).toContain("gate must be unconditional and fail closed: bun run test:desktop-smoke");
+  });
+
+  it("rejects job-level write-all in allowed workflows", () => {
+    expect(
+      errorsFor(
+        ciWorkflow.replace(
+          "  quality:\n    name: quality",
+          "  quality:\n    permissions: write-all\n    name: quality",
+        ),
+      ),
+    ).toContain("unsupported *: write at jobs.quality.permissions");
   });
 
   it("requires the exact four inherited workflows to remain manually disabled", () => {
@@ -1050,14 +1328,11 @@ jobs:
     );
   });
 
-  it("parses and validates the policy identity", () => {
+  it("parses policy identity and restricts the downstream vouch source", () => {
     expect(parseWorkflowPolicy(JSON.stringify(policy())).repository).toBe("slashdevcorpse/synara");
     expect(() =>
       parseWorkflowPolicy(JSON.stringify({ ...policy(), repository: "other/repository" })),
     ).toThrow("must equal slashdevcorpse/synara");
-  });
-
-  it("allows only slashdevcorpse in the downstream vouch source", () => {
     expect(validateVouchedConfiguration("# owner only\ngithub:slashdevcorpse\n")).toEqual([]);
     expect(validateVouchedConfiguration("github:slashdevcorpse\ngithub:Emanuele-web04\n")).toEqual([
       ".github/VOUCHED.td must contain exactly one trusted identity: github:slashdevcorpse.",

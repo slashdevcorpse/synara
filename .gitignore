@@ -23,6 +23,8 @@ release/
 .idea/
 apps/web/.playwright
 apps/web/playwright-report
+apps/desktop/playwright-report
+apps/desktop/test-results
 .playwright-cli/
 output/playwright/
 apps/web/src/components/__screenshots__
