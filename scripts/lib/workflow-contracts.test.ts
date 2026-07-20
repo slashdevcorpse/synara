@@ -314,6 +314,7 @@ describe("workflow contracts", () => {
       "echo preparing && bun run test:desktop-smoke -- --flag",
       "echo input | bun run test:desktop-smoke",
       '"& bun run test:desktop-smoke"',
+      "bun run test:desktop-smoke>smoke.log",
     ]) {
       const wrapperFiles = validFiles();
       wrapperFiles.set(
