@@ -180,6 +180,34 @@ type ProviderRuntimeTestProposedPlan = ProviderRuntimeTestThread["proposedPlans"
 type ProviderRuntimeTestActivity = ProviderRuntimeTestThread["activities"][number];
 type ProviderRuntimeTestCheckpoint = ProviderRuntimeTestThread["checkpoints"][number];
 
+async function waitForThreadActivities(
+  engine: OrchestrationEngineShape,
+  activityIds: readonly string[],
+  timeoutMs = 2000,
+  threadId: ThreadId = asThreadId("thread-1"),
+): Promise<{
+  readonly thread: ProviderRuntimeTestThread;
+  readonly activities: readonly ProviderRuntimeTestActivity[];
+}> {
+  const thread = await waitForThread(
+    engine,
+    (entry) =>
+      activityIds.every((activityId) =>
+        entry.activities.some((activity) => activity.id === activityId),
+      ),
+    timeoutMs,
+    threadId,
+  );
+  const activities = activityIds.map((activityId) => {
+    const activity = thread.activities.find((entry) => entry.id === activityId);
+    if (!activity) {
+      throw new Error(`Thread activity ${activityId} disappeared after collection`);
+    }
+    return activity;
+  });
+  return { thread, activities };
+}
+
 describe("ProviderRuntimeIngestion", () => {
   let runtime: ManagedRuntime.ManagedRuntime<
     OrchestrationEngineService | ProviderRuntimeIngestionService | ProviderRuntimeEventRepository,
@@ -5103,6 +5131,417 @@ describe("ProviderRuntimeIngestion", () => {
         (activity: ProviderRuntimeTestActivity) => activity.kind === "tool.started",
       ),
     ).toBe(true);
+    const anonymousToolActivity = thread.activities.find(
+      (activity: ProviderRuntimeTestActivity) => activity.id === "evt-tool-started",
+    );
+    expect(anonymousToolActivity?.payload).not.toHaveProperty("providerItemId");
+  });
+
+  it("preserves provider item identity across tool lifecycle activities", async () => {
+    const harness = await createHarness();
+    const now = new Date().toISOString();
+    const threadId = asThreadId("thread-1");
+    const turnId = asTurnId("turn-tool-identity");
+    const itemId = asItemId("item-tool-identity");
+
+    harness.emit({
+      type: "item.started",
+      eventId: asEventId("evt-tool-identity-started"),
+      provider: "codex",
+      createdAt: now,
+      threadId,
+      turnId,
+      itemId,
+      payload: {
+        itemType: "command_execution",
+        status: "inProgress",
+        title: "Run tests",
+        data: { command: "bun run test", nested: { keep: true } },
+      },
+    });
+    harness.emit({
+      type: "item.updated",
+      eventId: asEventId("evt-tool-identity-updated"),
+      provider: "codex",
+      createdAt: now,
+      threadId,
+      turnId,
+      itemId,
+      payload: {
+        itemType: "command_execution",
+        status: "inProgress",
+        title: "Run tests",
+        data: { command: "bun run test", progress: 50 },
+      },
+    });
+    harness.emit({
+      type: "item.completed",
+      eventId: asEventId("evt-tool-identity-completed"),
+      provider: "codex",
+      createdAt: now,
+      threadId,
+      turnId,
+      itemId,
+      payload: {
+        itemType: "command_execution",
+        status: "completed",
+        title: "Run tests",
+        data: { command: "bun run test", exitCode: 0 },
+      },
+    });
+
+    const { activities: lifecycleActivities } = await waitForThreadActivities(harness.engine, [
+      "evt-tool-identity-started",
+      "evt-tool-identity-updated",
+      "evt-tool-identity-completed",
+    ]);
+
+    expect(lifecycleActivities).toHaveLength(3);
+    for (const activity of lifecycleActivities) {
+      expect(activity.payload).toMatchObject({ providerItemId: "item-tool-identity" });
+    }
+    const startedActivity = lifecycleActivities.find(
+      (activity) => activity.id === "evt-tool-identity-started",
+    );
+    expect(startedActivity?.payload).toMatchObject({
+      data: { command: "bun run test", nested: { keep: true } },
+    });
+  });
+
+  it("assigns missing tool lifecycle turn ids to the sole projected active turn", async () => {
+    const harness = await createHarness();
+    const now = new Date().toISOString();
+    const threadId = asThreadId("thread-1");
+    const turnId = asTurnId("turn-tool-fallback");
+    const itemId = asItemId("item-tool-fallback");
+
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-tool-fallback-turn-started"),
+      provider: "codex",
+      createdAt: now,
+      threadId,
+      turnId,
+    });
+    await waitForThread(
+      harness.engine,
+      (entry) => entry.session?.status === "running" && entry.session.activeTurnId === turnId,
+    );
+
+    harness.emit({
+      type: "item.started",
+      eventId: asEventId("evt-tool-fallback-started"),
+      provider: "codex",
+      createdAt: now,
+      threadId,
+      itemId,
+      payload: {
+        itemType: "command_execution",
+        status: "inProgress",
+        title: "Run focused tests",
+      },
+    });
+    harness.emit({
+      type: "item.updated",
+      eventId: asEventId("evt-tool-fallback-updated"),
+      provider: "codex",
+      createdAt: now,
+      threadId,
+      itemId,
+      payload: {
+        itemType: "command_execution",
+        status: "inProgress",
+        title: "Run focused tests",
+      },
+    });
+    harness.emit({
+      type: "tool.progress",
+      eventId: asEventId("evt-tool-fallback-progress"),
+      provider: "codex",
+      createdAt: now,
+      threadId,
+      payload: {
+        toolUseId: "mcp-tool-fallback",
+        toolName: "mcp__synara__focused_test",
+        summary: "Running focused tests",
+        elapsedSeconds: 1.5,
+      },
+    });
+    harness.emit({
+      type: "item.completed",
+      eventId: asEventId("evt-tool-fallback-completed"),
+      provider: "codex",
+      createdAt: now,
+      threadId,
+      itemId,
+      payload: {
+        itemType: "command_execution",
+        status: "completed",
+        title: "Run focused tests",
+      },
+    });
+
+    const { activities: lifecycleActivities } = await waitForThreadActivities(harness.engine, [
+      "evt-tool-fallback-started",
+      "evt-tool-fallback-updated",
+      "evt-tool-fallback-progress",
+      "evt-tool-fallback-completed",
+    ]);
+
+    expect(lifecycleActivities).toHaveLength(4);
+    expect(lifecycleActivities.map((activity) => activity.turnId)).toEqual([
+      turnId,
+      turnId,
+      turnId,
+      turnId,
+    ]);
+  });
+
+  it("assigns a missing tool lifecycle turn id from the sole outstanding turn", async () => {
+    const harness = await createHarness();
+    const now = new Date().toISOString();
+    const threadId = asThreadId("thread-1");
+    const turnId = asTurnId("turn-tool-outstanding-fallback");
+
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-tool-outstanding-turn-started"),
+      provider: "codex",
+      createdAt: now,
+      threadId,
+      turnId,
+    });
+    await waitForThread(
+      harness.engine,
+      (entry) => entry.session?.status === "running" && entry.session.activeTurnId === turnId,
+    );
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.makeUnsafe("cmd-tool-outstanding-projection-gap"),
+        threadId,
+        session: {
+          threadId,
+          status: "ready",
+          providerName: "codex",
+          runtimeMode: "approval-required",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: now,
+        },
+        createdAt: now,
+      }),
+    );
+
+    harness.emit({
+      type: "item.started",
+      eventId: asEventId("evt-tool-outstanding-unbound"),
+      provider: "codex",
+      createdAt: now,
+      threadId,
+      itemId: asItemId("item-tool-outstanding-unbound"),
+      payload: {
+        itemType: "command_execution",
+        status: "inProgress",
+        title: "Run before projection catches up",
+      },
+    });
+
+    const {
+      thread,
+      activities: [activity],
+    } = await waitForThreadActivities(harness.engine, ["evt-tool-outstanding-unbound"]);
+
+    expect(thread.session?.activeTurnId).toBeNull();
+    expect(activity?.turnId).toBe(turnId);
+  });
+
+  it("rebinds missing tool lifecycle turn ids after a runtime error and provider restart", async () => {
+    const harness = await createHarness();
+    const now = new Date().toISOString();
+    const threadId = asThreadId("thread-1");
+    const failedTurnId = asTurnId("turn-tool-runtime-error");
+    const restartedTurnId = asTurnId("turn-tool-after-restart");
+
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-tool-runtime-error-turn-started"),
+      provider: "codex",
+      createdAt: now,
+      threadId,
+      turnId: failedTurnId,
+    });
+    await waitForThread(
+      harness.engine,
+      (entry) => entry.session?.status === "running" && entry.session.activeTurnId === failedTurnId,
+    );
+
+    harness.emit({
+      type: "runtime.error",
+      eventId: asEventId("evt-tool-runtime-error"),
+      provider: "codex",
+      createdAt: now,
+      threadId,
+      turnId: failedTurnId,
+      payload: { message: "provider exited" },
+    });
+    await waitForThread(
+      harness.engine,
+      (entry) => entry.session?.status === "error" && entry.session.activeTurnId === null,
+    );
+
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-tool-after-restart-turn-started"),
+      provider: "codex",
+      createdAt: now,
+      threadId,
+      turnId: restartedTurnId,
+    });
+    await waitForThread(
+      harness.engine,
+      (entry) =>
+        entry.session?.status === "running" && entry.session.activeTurnId === restartedTurnId,
+    );
+
+    harness.emit({
+      type: "item.started",
+      eventId: asEventId("evt-tool-after-restart-unbound"),
+      provider: "codex",
+      createdAt: now,
+      threadId,
+      itemId: asItemId("item-tool-after-restart-unbound"),
+      payload: {
+        itemType: "command_execution",
+        status: "inProgress",
+        title: "Run after restart",
+      },
+    });
+
+    const {
+      activities: [activity],
+    } = await waitForThreadActivities(harness.engine, ["evt-tool-after-restart-unbound"]);
+
+    expect(activity?.turnId).toBe(restartedTurnId);
+  });
+
+  it("leaves missing tool lifecycle turn ids unbound when turns overlap", async () => {
+    const harness = await createHarness();
+    const now = new Date().toISOString();
+    const threadId = asThreadId("thread-1");
+    const activeTurnId = asTurnId("turn-tool-overlap-active");
+
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-tool-overlap-active-started"),
+      provider: "codex",
+      createdAt: now,
+      threadId,
+      turnId: activeTurnId,
+    });
+    await waitForThread(
+      harness.engine,
+      (entry) => entry.session?.status === "running" && entry.session.activeTurnId === activeTurnId,
+    );
+
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-tool-overlap-second-started"),
+      provider: "codex",
+      createdAt: now,
+      threadId,
+      turnId: asTurnId("turn-tool-overlap-second"),
+    });
+    await harness.drain();
+
+    harness.emit({
+      type: "item.started",
+      eventId: asEventId("evt-tool-overlap-unbound"),
+      provider: "codex",
+      createdAt: now,
+      threadId,
+      itemId: asItemId("item-tool-overlap-unbound"),
+      payload: {
+        itemType: "command_execution",
+        status: "inProgress",
+        title: "Ambiguous command",
+      },
+    });
+
+    const {
+      thread,
+      activities: [activity],
+    } = await waitForThreadActivities(harness.engine, ["evt-tool-overlap-unbound"]);
+
+    expect(thread.session?.activeTurnId).toBe(activeTurnId);
+    expect(activity?.turnId).toBeNull();
+  });
+
+  it("maps non-Codex provider tool lifecycle activities with provider identity", async () => {
+    const harness = await createHarness();
+    const now = new Date().toISOString();
+    const threadId = asThreadId("thread-1");
+    const turnId = asTurnId("turn-opencode-tool");
+    const itemId = asItemId("item-opencode-tool");
+
+    harness.emit({
+      type: "item.started",
+      eventId: asEventId("evt-opencode-tool-started"),
+      provider: "opencode",
+      createdAt: now,
+      threadId,
+      turnId,
+      itemId,
+      payload: {
+        itemType: "command_execution",
+        status: "inProgress",
+        title: "OpenCode command",
+      },
+    });
+    harness.emit({
+      type: "item.updated",
+      eventId: asEventId("evt-opencode-tool-updated"),
+      provider: "opencode",
+      createdAt: now,
+      threadId,
+      turnId,
+      itemId,
+      payload: {
+        itemType: "command_execution",
+        status: "inProgress",
+        title: "OpenCode command",
+      },
+    });
+    harness.emit({
+      type: "item.completed",
+      eventId: asEventId("evt-opencode-tool-completed"),
+      provider: "opencode",
+      createdAt: now,
+      threadId,
+      turnId,
+      itemId,
+      payload: {
+        itemType: "command_execution",
+        status: "completed",
+        title: "OpenCode command",
+      },
+    });
+
+    const { activities: lifecycleActivities } = await waitForThreadActivities(harness.engine, [
+      "evt-opencode-tool-started",
+      "evt-opencode-tool-updated",
+      "evt-opencode-tool-completed",
+    ]);
+
+    expect(lifecycleActivities).toHaveLength(3);
+    expect(lifecycleActivities.map((activity) => activity.kind)).toEqual(
+      expect.arrayContaining(["tool.started", "tool.updated", "tool.completed"]),
+    );
+    for (const activity of lifecycleActivities) {
+      expect(activity.turnId).toBe(turnId);
+      expect(activity.payload).toMatchObject({ providerItemId: "item-opencode-tool" });
+    }
   });
 
   it("consumes P1 runtime events into thread metadata, diff checkpoints, and activities", async () => {
