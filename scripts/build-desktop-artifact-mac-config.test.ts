@@ -8,6 +8,7 @@ import {
   MAC_ENTITLEMENTS_PATH,
   MAC_FOREIGN_NATIVE_EXCLUSIONS,
   MAC_INHERITED_ENTITLEMENTS_PATH,
+  MAC_PRESIGNED_VENDOR_SIGN_IGNORE_PATTERNS,
   MICROPHONE_USAGE_DESCRIPTION,
   NODE_PTY_ASAR_UNPACK_GLOBS,
   resolveMacNativeExclusions,
@@ -34,10 +35,18 @@ describe("createDesktopPlatformBuildConfig", () => {
     assert.deepStrictEqual(config.asarUnpack, ["node_modules/node-pty/**"]);
     assert.equal(mac.hardenedRuntime, true);
     assert.equal(mac.notarize, true);
+    assert.equal(mac.identity, undefined);
     assert.equal(mac.entitlements, MAC_ENTITLEMENTS_PATH);
     assert.equal(mac.entitlementsInherit, MAC_INHERITED_ENTITLEMENTS_PATH);
     assert.equal(MAC_APPSNAP_HELPER_BUNDLE_PATH, "Contents/Helpers/synara-appsnap-helper");
     assert.deepStrictEqual(mac.binaries, ["Contents/Helpers/synara-appsnap-helper"]);
+    assert.deepStrictEqual(
+      [...MAC_PRESIGNED_VENDOR_SIGN_IGNORE_PATTERNS],
+      [
+        String.raw`/Contents/Resources/app\.asar\.unpacked/node_modules/@anthropic-ai/claude-agent-sdk-darwin-(?:arm64|x64)/claude$`,
+      ],
+    );
+    assert.deepStrictEqual(mac.signIgnore, [...MAC_PRESIGNED_VENDOR_SIGN_IGNORE_PATTERNS]);
     assert.equal(mac.x64ArchFiles, "Contents/Helpers/synara-appsnap-helper");
     assert.equal(
       MAC_APPSNAP_HELPER_STAGE_PATH,
@@ -230,7 +239,7 @@ describe("createDesktopPlatformBuildConfig", () => {
     );
   });
 
-  it("uses an explicit unsigned mac identity and isolated Super Synara Windows registration", () => {
+  it("uses explicit macOS ad-hoc signing and isolated Super Synara Windows registration", () => {
     const identity = synaraDesktopIdentity("super");
     const mac = createDesktopPlatformBuildConfig({
       arch: "arm64",
@@ -248,8 +257,11 @@ describe("createDesktopPlatformBuildConfig", () => {
       disableUpdates: true,
     });
 
-    assert.equal((mac.mac as Record<string, unknown>).identity, null);
-    assert.deepStrictEqual((mac.mac as Record<string, unknown>).target, ["dmg"]);
+    const macOptions = mac.mac as Record<string, unknown>;
+    assert.equal(macOptions.identity, "-");
+    assert.equal(macOptions.hardenedRuntime, false);
+    assert.equal(macOptions.notarize, false);
+    assert.deepStrictEqual(macOptions.target, ["dmg"]);
     assert.deepStrictEqual(mac.dmg, { writeUpdateInfo: false });
     assert.deepStrictEqual(mac.extraResources, [{ from: "LICENSE", to: "LICENSE" }]);
     assert.deepStrictEqual(win.nsis, {
