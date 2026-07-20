@@ -1944,17 +1944,27 @@ describe("windowsProcess", () => {
     });
 
     it.runIf(process.platform === "win32")("clears the process-local cache", () => {
-      clearWindowsCommandDiscoveryCache();
-      expect(
-        resolveWindowsCommandCandidates("synara-process-local-cache-probe-that-must-not-exist", {
-          platform: "win32",
-          cwd: process.cwd(),
-          env: process.env,
-        }),
-      ).toEqual([]);
-      expect(getWindowsCommandDiscoveryCacheStats()).toEqual({ size: 1 });
-      clearWindowsCommandDiscoveryCache();
-      expect(getWindowsCommandDiscoveryCacheStats()).toEqual({ size: 0 });
+      const root = mkdtempSync(Path.join(tmpdir(), "synara-process-cache-"));
+      try {
+        clearWindowsCommandDiscoveryCache();
+        expect(
+          resolveWindowsCommandCandidates("synara-process-local-cache-probe-that-must-not-exist", {
+            platform: "win32",
+            cwd: root,
+            env: {
+              PATH: "",
+              PATHEXT: ".COM;.EXE;.BAT;.CMD",
+              SYSTEMROOT: resolveWindowsSystemRoot(process.env),
+            },
+          }),
+        ).toEqual([]);
+        expect(getWindowsCommandDiscoveryCacheStats()).toEqual({ size: 1 });
+        clearWindowsCommandDiscoveryCache();
+        expect(getWindowsCommandDiscoveryCacheStats()).toEqual({ size: 0 });
+      } finally {
+        clearWindowsCommandDiscoveryCache();
+        rmSync(root, { force: true, recursive: true });
+      }
     });
   });
 
