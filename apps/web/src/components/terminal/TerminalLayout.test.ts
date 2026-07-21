@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 
 import { createTerminalGroup } from "../../terminalPaneLayout";
-import { resolveThreadTerminalLayout } from "./TerminalLayout";
+import {
+  findMostRecentlyArchivedTerminalGroup,
+  resolveThreadTerminalLayout,
+} from "./TerminalLayout";
 
 function resolve(groups: ReturnType<typeof createTerminalGroup>[]) {
   return resolveThreadTerminalLayout({
@@ -32,6 +35,18 @@ describe("resolveThreadTerminalLayout", () => {
     expect(result.resolvedArchivedTerminalGroups.map((group) => group.id)).toEqual(["archived"]);
     expect(result.resolvedActiveGroupId).toBe("active");
     expect(result.visibleTerminalIds).toEqual(["one"]);
+    expect(result.showGroupHeaders).toBe(true);
+  });
+
+  it("finds the newest archived group independently of resolver order", () => {
+    const older = createTerminalGroup("older", "one", { archivedAt: 10, originalIndex: 0 });
+    const newest = createTerminalGroup("newest", "two", { archivedAt: 30, originalIndex: 1 });
+    const middle = createTerminalGroup("middle", "three", { archivedAt: 20, originalIndex: 2 });
+    const result = resolve([older, newest, middle]);
+
+    expect(findMostRecentlyArchivedTerminalGroup(result.resolvedArchivedTerminalGroups)?.id).toBe(
+      "newest",
+    );
   });
 
   it("returns an empty active viewport when every group is archived", () => {
@@ -65,6 +80,7 @@ describe("resolveThreadTerminalLayout", () => {
     expect(result.resolvedTerminalGroups).toEqual([]);
     expect(result.resolvedActiveGroupId).toBeNull();
     expect(result.activeGroupLayout).toBeNull();
+    expect(result.showGroupHeaders).toBe(false);
   });
 
   it("projects persisted terminal exit state into tab visual identity", () => {

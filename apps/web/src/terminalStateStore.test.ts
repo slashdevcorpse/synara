@@ -567,6 +567,24 @@ describe("terminalStateStore actions", () => {
     expect(normalizeThreadTerminalState(migrated)).toBe(migrated);
   });
 
+  it("normalizes corrupted persisted exit and launch metadata without throwing", () => {
+    const defaultState = selectThreadTerminalState({}, THREAD_ID);
+    const corruptedState = {
+      ...defaultState,
+      terminalExitStatesById: {
+        default: { kind: "failed", exitCode: "not-a-number", exitSignal: 9 },
+      },
+      terminalLaunchMetadataById: { default: null },
+    } as unknown as typeof defaultState;
+
+    expect(normalizeThreadTerminalState(corruptedState)).toMatchObject({
+      terminalExitStatesById: {
+        default: { kind: "failed", exitCode: null, exitSignal: null },
+      },
+      terminalLaunchMetadataById: { default: { cwd: null } },
+    });
+  });
+
   it("archives, restores, renames, and changes roles without losing group contents", () => {
     const store = useTerminalStateStore.getState();
     store.newTerminal(THREAD_ID, "terminal-2");

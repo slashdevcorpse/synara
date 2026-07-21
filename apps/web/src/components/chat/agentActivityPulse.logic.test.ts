@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import type { AgentActivityInput } from "./agentActivityPulse.logic";
 import { deriveAgentActivityState } from "./agentActivityPulse.logic";
+import { activityStatesEqual } from "./useAgentActivityState";
 
 const TURN_ID = "turn-1" as never;
 const USER_MESSAGE = {
@@ -248,6 +249,76 @@ describe("deriveAgentActivityState", () => {
       }),
     );
     expect(fallback).toMatchObject({ phase: "tool-running", toolCount: 1 });
+  });
+
+  it("uses the latest parallel tool edge for detail copy", () => {
+    const state = deriveAgentActivityState(
+      baseInput({
+        activities: [
+          toolActivity("tool.started", { toolCallId: "call-a", title: "First tool" }),
+          toolActivity(
+            "tool.started",
+            { toolCallId: "call-b", title: "Second tool" },
+            { createdAt: "2026-07-20T12:00:03.000Z" },
+          ),
+          toolActivity(
+            "tool.updated",
+            { toolCallId: "call-a", title: "First tool updated" },
+            { createdAt: "2026-07-20T12:00:04.000Z" },
+          ),
+        ],
+      }),
+    );
+
+    expect(state).toMatchObject({
+      phase: "tool-running",
+      toolCount: 2,
+      latestToolName: "First tool updated",
+    });
+  });
+
+  it("compares independently-derived subagent state maps structurally", () => {
+    const left = deriveAgentActivityState(
+      baseInput({
+        subagentStates: new Map([
+          [
+            "child-1",
+            {
+              id: "child-1",
+              phase: "thinking",
+              latestToolName: "Inspect",
+              streamPreview: null,
+            },
+          ],
+        ]),
+      }),
+    );
+    const right = deriveAgentActivityState(
+      baseInput({
+        subagentStates: new Map([
+          [
+            "child-1",
+            {
+              id: "child-1",
+              phase: "thinking",
+              latestToolName: "Inspect",
+              streamPreview: null,
+            },
+          ],
+        ]),
+      }),
+    );
+
+    expect(left.subagentStates).not.toBe(right.subagentStates);
+    expect(activityStatesEqual(left, right)).toBe(true);
+    expect(
+      activityStatesEqual(left, {
+        ...right,
+        subagentStates: new Map([
+          ["child-1", { ...right.subagentStates.get("child-1")!, phase: "completed" }],
+        ]),
+      }),
+    ).toBe(false);
   });
 
   it("correlates canonical no-ID tool summaries through the top-level title", () => {

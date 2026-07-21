@@ -1799,7 +1799,7 @@ function openTerminal(entry: TerminalRuntimeEntry): void {
             return;
           }
           void waitForTerminalEventStreamReady(api)
-            .then(() => (isCurrentOpenRequest() ? api.terminal.open(openInput) : null))
+            .then(() => (isCurrentOpenRequest() ? api.terminal.open(buildOpenInput(entry)) : null))
             .then((nextSnapshot) => {
               if (!nextSnapshot || !isCurrentOpenRequest()) return;
               const retainedOutput = hasRetainedRecoveredOutput(entry);

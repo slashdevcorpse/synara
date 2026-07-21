@@ -415,7 +415,7 @@ export function WorkspaceAgentPanel({
   const aggregateLabel = [
     baseAggregateLabel,
     `${mainAgentCount} ${mainAgentCount === 1 ? "agent" : "agents"}`,
-    `${subagentCount} subagents (${subagentRunningCount} running)`,
+    `${subagentCount} ${subagentCount === 1 ? "subagent" : "subagents"} (${subagentRunningCount} running)`,
     `${terminalProcessCount} terminal ${terminalProcessCount === 1 ? "process" : "processes"}`,
   ].join(" · ");
 

@@ -47,6 +47,10 @@ export async function closeTerminalGroupTransaction(input: {
   disposeTerminal: (terminalId: string) => void;
   removeGroup: () => void;
 }): Promise<CloseTerminalGroupResult> {
+  if (input.terminalIds.length === 0) {
+    input.removeGroup();
+    return { closed: true, failedTerminalIds: [] };
+  }
   try {
     await input.closeTerminals(input.terminalIds);
   } catch {

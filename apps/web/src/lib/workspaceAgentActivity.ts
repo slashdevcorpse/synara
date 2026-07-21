@@ -997,7 +997,8 @@ export function deriveWorkspaceAgentThreadActivity(input: {
     depth: number,
     ancestors: ReadonlySet<ThreadId>,
   ): AgentThreadTreeNode[] => {
-    if (depth >= 3) return [];
+    // Hover cards intentionally show direct subagents plus one nested level.
+    if (depth >= 2) return [];
     return (childrenByParentId.get(parentId) ?? []).flatMap((entry) => {
       if (ancestors.has(entry.threadId)) return [];
       const nextAncestors = new Set(ancestors).add(entry.threadId);

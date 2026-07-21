@@ -623,6 +623,7 @@ describe("workspace agent shell selection", () => {
     const targetId = ThreadId.makeUnsafe("thread-target");
     const childId = ThreadId.makeUnsafe("thread-child");
     const grandchildId = ThreadId.makeUnsafe("thread-grandchild");
+    const greatGrandchildId = ThreadId.makeUnsafe("thread-great-grandchild");
     const unrelatedId = ThreadId.makeUnsafe("thread-unrelated");
     const base = {
       id: targetId,
@@ -648,6 +649,12 @@ describe("workspace agent shell selection", () => {
       { ...base, parentThreadId: parentId },
       { ...base, id: childId, parentThreadId: targetId, title: "Child" },
       { ...base, id: grandchildId, parentThreadId: childId, title: "Grandchild" },
+      {
+        ...base,
+        id: greatGrandchildId,
+        parentThreadId: grandchildId,
+        title: "Great-grandchild",
+      },
       { ...base, id: unrelatedId, title: "Unrelated" },
     ];
     const project = {
@@ -687,6 +694,7 @@ describe("workspace agent shell selection", () => {
       parentId,
       childId,
       grandchildId,
+      greatGrandchildId,
     ]);
 
     summaryReadCount = 0;

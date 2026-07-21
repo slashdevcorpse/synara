@@ -36,14 +36,35 @@ function initialDisplayState(target: AgentActivityState): AgentActivityState {
   return isTerminalAgentActivityPhase(target.phase) ? IDLE_AGENT_ACTIVITY_STATE : target;
 }
 
-function activityStatesEqual(left: AgentActivityState, right: AgentActivityState): boolean {
+function subagentStatesEqual(
+  left: AgentActivityState["subagentStates"],
+  right: AgentActivityState["subagentStates"],
+): boolean {
+  if (left === right) return true;
+  if (left.size !== right.size) return false;
+  for (const [id, leftState] of left) {
+    const rightState = right.get(id);
+    if (
+      !rightState ||
+      leftState.id !== rightState.id ||
+      leftState.phase !== rightState.phase ||
+      leftState.latestToolName !== rightState.latestToolName ||
+      leftState.streamPreview !== rightState.streamPreview
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+export function activityStatesEqual(left: AgentActivityState, right: AgentActivityState): boolean {
   return (
     left.phase === right.phase &&
     left.queueCount === right.queueCount &&
     left.toolCount === right.toolCount &&
     left.subagentCount === right.subagentCount &&
     left.subagentRunningCount === right.subagentRunningCount &&
-    left.subagentStates === right.subagentStates &&
+    subagentStatesEqual(left.subagentStates, right.subagentStates) &&
     left.latestToolName === right.latestToolName &&
     left.streamPreview === right.streamPreview &&
     left.durationMs === right.durationMs &&

@@ -1297,6 +1297,14 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
           return session ? [session] : [];
         });
         await Promise.all(sessions.map((session) => this.stopProcess(session)));
+        // stopProcess flushes any trailing PTY output into the debounced
+        // persistence queue. Drain that work before deleting history so a
+        // delayed write cannot recreate a history file after this close.
+        await Promise.all(
+          terminalIds.map((terminalId) =>
+            this.flushPersistQueue(input.threadId, terminalId).catch(() => undefined),
+          ),
+        );
         for (const terminalId of terminalIds) {
           const key = toSessionKey(input.threadId, terminalId);
           this.sessions.delete(key);

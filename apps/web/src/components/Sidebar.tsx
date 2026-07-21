@@ -164,7 +164,7 @@ import {
 import { shouldRenderTerminalWorkspace } from "./ChatView.logic";
 import { AgentActivityPulse } from "./chat/AgentActivityPulse";
 import type { AgentActivityState } from "./chat/agentActivityPulse.logic";
-import { IDLE_AGENT_ACTIVITY_STATE } from "../lib/agentActivity";
+import { IDLE_AGENT_ACTIVITY_STATE, isLiveAgentActivityPhase } from "../lib/agentActivity";
 import { CHAT_SURFACE_HEADER_HEIGHT_CLASS } from "./chat/chatHeaderControls";
 import { SidebarLeadingControls } from "./SidebarHeaderNavigationControls";
 import { SynaraLogo } from "./SynaraLogo";
@@ -295,6 +295,7 @@ import {
   type SettingsBackTarget,
   resolveSidebarNewThreadEnvMode,
   sidebarProjectActivityAccessibleLabel,
+  shouldAnnounceSidebarAgentActivity,
   projectSidebarTransientTerminalActivity,
   scheduleSidebarTransientTerminalDismiss,
   resolveThreadRowClassName,
@@ -1231,6 +1232,10 @@ export default function Sidebar() {
   const projects = useStore((store) => store.projects);
   const threadsHydrated = useStore((store) => store.threadsHydrated);
   const sidebarThreadSummaryById = useStore((store) => store.sidebarThreadSummaryById);
+  const sidebarThreadSummaries = useMemo(
+    () => Object.values(sidebarThreadSummaryById),
+    [sidebarThreadSummaryById],
+  );
   const syncServerShellSnapshot = useStore((store) => store.syncServerShellSnapshot);
   const markThreadVisited = useStore((store) => store.markThreadVisited);
   const markThreadUnread = useStore((store) => store.markThreadUnread);
@@ -1535,12 +1540,34 @@ export default function Sidebar() {
   const presentedTerminalTurnByThreadIdRef = useRef(new Map<ThreadId, string>());
   const terminalActivityTimersRef = useRef(new Map<ThreadId, number>());
   useEffect(() => {
+    const activities = workspaceAgentActivity.threads.map((entry) => ({
+      threadId: entry.threadId,
+      phase: entry.activityState.phase,
+      turnKey: entry.activityState.turnKey,
+    }));
+    const currentThreadIds = new Set(sidebarThreads.map((thread) => thread.id));
+    const liveThreadIds = new Set(
+      activities
+        .filter((activity) => isLiveAgentActivityPhase(activity.phase) && activity.turnKey)
+        .map((activity) => activity.threadId),
+    );
+    for (const [threadId, timer] of terminalActivityTimersRef.current) {
+      if (currentThreadIds.has(threadId) && !liveThreadIds.has(threadId)) continue;
+      window.clearTimeout(timer);
+      terminalActivityTimersRef.current.delete(threadId);
+    }
+    setTransientTerminalActivityByThreadId((current) => {
+      const next = new Map(current);
+      for (const threadId of current.keys()) {
+        if (!currentThreadIds.has(threadId) || liveThreadIds.has(threadId)) {
+          next.delete(threadId);
+        }
+      }
+      return next.size === current.size ? current : next;
+    });
+
     const terminalProjections = projectSidebarTransientTerminalActivity({
-      activities: workspaceAgentActivity.threads.map((entry) => ({
-        threadId: entry.threadId,
-        phase: entry.activityState.phase,
-        turnKey: entry.activityState.turnKey,
-      })),
+      activities,
       threads: sidebarThreads,
       observedLiveTurnByThreadId: observedLiveTurnByThreadIdRef.current,
       presentedTerminalTurnByThreadId: presentedTerminalTurnByThreadIdRef.current,
@@ -4100,7 +4127,7 @@ export default function Sidebar() {
     hoverActions: ReactNode;
   }) {
     const activityLabel =
-      input.agentActivityState && input.agentActivityState.phase !== "idle"
+      input.agentActivityState && shouldAnnounceSidebarAgentActivity(input.agentActivityState.phase)
         ? `Agent status: ${agentStatusPresentation(input.agentActivityState.phase).label}`
         : null;
     return (
@@ -4626,7 +4653,7 @@ export default function Sidebar() {
     const isProjectRunning = projectRun !== null || projectRunServer !== null;
     const gitActionRunning = hasActiveGitActionForProject({
       project,
-      threads: Object.values(sidebarThreadSummaryById),
+      threads: sidebarThreadSummaries,
       activeActionCwds: activeGitActionCwds,
       platform: isWindowsAbsolutePath(project.cwd) ? "windows" : "posix",
     });

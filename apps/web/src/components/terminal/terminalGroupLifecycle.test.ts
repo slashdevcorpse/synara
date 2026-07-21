@@ -49,6 +49,23 @@ describe("stopTerminalGroupForArchive", () => {
 });
 
 describe("closeTerminalGroupTransaction", () => {
+  it("removes an empty group locally without issuing a server close", async () => {
+    const closeTerminals = vi.fn().mockResolvedValue(undefined);
+    const disposeTerminal = vi.fn();
+    const removeGroup = vi.fn();
+    const result = await closeTerminalGroupTransaction({
+      terminalIds: [],
+      closeTerminals,
+      disposeTerminal,
+      removeGroup,
+    });
+
+    expect(result).toEqual({ closed: true, failedTerminalIds: [] });
+    expect(closeTerminals).not.toHaveBeenCalled();
+    expect(disposeTerminal).not.toHaveBeenCalled();
+    expect(removeGroup).toHaveBeenCalledOnce();
+  });
+
   it("removes local state and runtimes only after every server close succeeds", async () => {
     const disposeTerminal = vi.fn();
     const removeGroup = vi.fn();

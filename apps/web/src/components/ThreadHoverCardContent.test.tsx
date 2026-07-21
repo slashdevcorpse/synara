@@ -228,9 +228,12 @@ describe("ThreadHoverCardContent", () => {
       subagentTree,
     });
 
-    expect(markup).toContain(`<summary`);
+    expect(markup).not.toContain(`<details`);
+    expect(markup).toContain(`aria-expanded="false"`);
+    expect(markup).toContain(`aria-controls=`);
     expect(markup).toContain(`${summary} · details`);
     expect(markup).toContain("Subagent activity details");
+    expect(markup).toContain(`aria-hidden="true"`);
     expect(markup).toContain("Child 1");
     expect(markup).toContain("Child 2");
   });

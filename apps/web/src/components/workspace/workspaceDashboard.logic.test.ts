@@ -12,6 +12,7 @@ import {
   filterAndSortWorkspaceCards,
   githubRepositoryFromUrl,
   hasActiveGitActionForProject,
+  indexWorkspaceProcessSourcesByProject,
   orderWorkspaceCardsPinnedFirst,
   type WorkspaceRepositoryState,
   validateCloneInput,
@@ -86,6 +87,58 @@ const gitState = (
 });
 
 describe("workspace dashboard derivation", () => {
+  it("indexes process sources by project before deriving dashboard summaries", () => {
+    const oneMain = thread("one-main", "one");
+    const oneArchived = thread("one-archived", "one", {
+      archivedAt: "2026-07-20T12:00:00.000Z",
+    });
+    const twoMain = thread("two-main", "two");
+    const oneAgent = agentActivity("thinking");
+    const oneSubagent = agentActivity("tool-running");
+    const twoAgent = agentActivity("streaming");
+
+    const sources = indexWorkspaceProcessSourcesByProject({
+      agents: [
+        {
+          projectId: projectId("one"),
+          activityState: oneAgent,
+          isSubagent: false,
+        },
+        {
+          projectId: projectId("one"),
+          activityState: oneSubagent,
+          isSubagent: true,
+        },
+        {
+          projectId: projectId("two"),
+          activityState: twoAgent,
+          isSubagent: false,
+        },
+      ],
+      threads: [oneMain, oneArchived, twoMain],
+      terminalStateByThreadId: {
+        [oneMain.id]: { runningTerminalIds: ["one-a", "one-b"] },
+        [twoMain.id]: { runningTerminalIds: ["two-a"] },
+        [threadId("orphan")]: { runningTerminalIds: ["orphan-a"] },
+      },
+    });
+
+    expect(sources.get(projectId("one"))).toEqual({
+      agents: [
+        { state: oneAgent, isSubagent: false },
+        { state: oneSubagent, isSubagent: true },
+      ],
+      terminalProcessCount: 2,
+      threads: [oneMain, oneArchived],
+    });
+    expect(sources.get(projectId("two"))).toEqual({
+      agents: [{ state: twoAgent, isSubagent: false }],
+      terminalProcessCount: 1,
+      threads: [twoMain],
+    });
+    expect(sources.has(projectId("orphan"))).toBe(false);
+  });
+
   it("matches active Git actions to project and live worktree paths", () => {
     const target = project("one", "One");
     const threads = [
@@ -145,7 +198,7 @@ describe("workspace dashboard derivation", () => {
     expect(cards[0]?.repository).toEqual({ kind: "loading" });
   });
 
-  it("selects actionable activity before working and aggregates unique worktrees/providers", () => {
+  it("prefers approval over newer input and working activity", () => {
     const repositoryByProjectId = new Map([[projectId("one"), gitState(2)]]);
     const cards = deriveWorkspaceCards({
       projects: [project("one", "One")],
@@ -178,6 +231,17 @@ describe("workspace dashboard derivation", () => {
           associatedWorktreePath: "c:/code/one-wt",
           associatedWorktreeBranch: "feature",
           updatedAt: "2026-07-19T14:00:00.000Z",
+        }),
+        thread("input", "one", {
+          hasPendingUserInput: true,
+          session: {
+            provider: "codex",
+            status: "running",
+            createdAt: "2026-07-19T12:00:00.000Z",
+            updatedAt: "2026-07-19T15:00:00.000Z",
+            orchestrationStatus: "running",
+          },
+          updatedAt: "2026-07-19T15:00:00.000Z",
         }),
       ],
     });

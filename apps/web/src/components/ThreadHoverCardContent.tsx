@@ -7,7 +7,7 @@
 //      wrappers retain ownership of store reads, navigation, and interruption.
 
 import { PROVIDER_DISPLAY_NAMES, type ProviderKind } from "@synara/contracts";
-import type { MouseEvent, ReactNode } from "react";
+import { useId, useState, type MouseEvent, type ReactNode } from "react";
 
 import { formatClockDuration } from "~/session-logic";
 import {
@@ -27,6 +27,8 @@ import {
   resolvePrStatePresentation,
 } from "./pullRequest/pullRequestStatePresentation";
 import { ProviderIcon } from "./ProviderIcon";
+import { DisclosureChevron } from "./ui/DisclosureChevron";
+import { DisclosureRegion } from "./ui/DisclosureRegion";
 import {
   SIDEBAR_HOVER_CARD_CONTAINER_PADDING_CLASS_NAME,
   SIDEBAR_HOVER_CARD_ROW_CLASS_NAME,
@@ -171,6 +173,8 @@ export function ThreadHoverCardContent({
   const hasContext = worktreeLabel !== null || (prTitle !== null && prState !== null);
   const prPresentation = prState ? resolvePrStatePresentation(PR_INPUT_BY_STATE[prState]) : null;
   const PrIcon = prPresentation ? PR_STATE_PRESENTATION_ICONS[prPresentation.iconKind] : null;
+  const subagentDetailsId = useId();
+  const [subagentDetailsOpen, setSubagentDetailsOpen] = useState(false);
 
   return (
     <div
@@ -197,16 +201,31 @@ export function ThreadHoverCardContent({
 
       {subagentTree.length > 0 ? (
         settledSubagentSummary ? (
-          <details className="mt-1 text-[10px] text-muted-foreground/68">
-            <summary className="cursor-pointer select-none rounded-sm outline-none focus-visible:ring-1 focus-visible:ring-ring">
-              {settledSubagentSummary.label} · details
-            </summary>
-            <ul className="mt-1 space-y-1" aria-label="Subagent activity details">
-              {subagentTree.map((node) => (
-                <SubagentActivityTreeRow key={node.entry.threadId} node={node} depth={0} />
-              ))}
-            </ul>
-          </details>
+          <div className="mt-1 text-[10px] text-muted-foreground/68">
+            <button
+              type="button"
+              className="flex w-full cursor-pointer select-none items-center rounded-sm text-left outline-none focus-visible:ring-1 focus-visible:ring-ring"
+              aria-expanded={subagentDetailsOpen}
+              aria-controls={subagentDetailsId}
+              onClick={(event) =>
+                invokeAction(event, () => setSubagentDetailsOpen((open) => !open))
+              }
+            >
+              <span className="min-w-0 flex-1 truncate">
+                {settledSubagentSummary.label} · details
+              </span>
+              <DisclosureChevron open={subagentDetailsOpen} className="size-3 shrink-0" />
+            </button>
+            <div id={subagentDetailsId}>
+              <DisclosureRegion open={subagentDetailsOpen}>
+                <ul className="mt-1 space-y-1" aria-label="Subagent activity details">
+                  {subagentTree.map((node) => (
+                    <SubagentActivityTreeRow key={node.entry.threadId} node={node} depth={0} />
+                  ))}
+                </ul>
+              </DisclosureRegion>
+            </div>
+          </div>
         ) : (
           <ul className="mt-1 space-y-1" aria-label="Subagent activity">
             {subagentTree.map((node) => (

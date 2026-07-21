@@ -60,6 +60,7 @@ import {
   deriveWorkspaceCards,
   filterAndSortWorkspaceCards,
   hasActiveGitActionForProject,
+  indexWorkspaceProcessSourcesByProject,
   orderWorkspaceCardsPinnedFirst,
   type WorkspaceCardModel,
   type WorkspaceFilter,
@@ -211,31 +212,26 @@ export function WorkspaceDashboardRoute() {
     [activeGitActionIdsByCwd],
   );
   const processActivityByProjectId = useMemo(() => {
-    const projectIdByThreadId = new Map(threads.map((thread) => [thread.id, thread.projectId]));
+    const sourcesByProjectId = indexWorkspaceProcessSourcesByProject({
+      agents: workspaceAgentActivity.threads,
+      threads,
+      terminalStateByThreadId,
+    });
     return new Map(
       projectIds.map((projectId) => {
         const project = projectById.get(projectId);
-        const agents = workspaceAgentActivity.threads
-          .filter((entry) => entry.projectId === projectId)
-          .map((entry) => ({ state: entry.activityState, isSubagent: entry.isSubagent }));
-        const terminalProcessCount = Object.entries(terminalStateByThreadId).reduce(
-          (count, [threadId, terminalState]) =>
-            projectIdByThreadId.get(threadId as ThreadId) === projectId
-              ? count + terminalState.runningTerminalIds.length
-              : count,
-          0,
-        );
+        const sources = sourcesByProjectId.get(projectId);
         return [
           projectId,
           deriveProjectProcessActivity({
-            agents,
-            terminalProcessCount,
+            agents: sources?.agents ?? [],
+            terminalProcessCount: sources?.terminalProcessCount ?? 0,
             devServerRunning: projectRunsByProjectId[projectId] !== undefined,
             gitActionRunning:
               project !== undefined &&
               hasActiveGitActionForProject({
                 project,
-                threads,
+                threads: sources?.threads ?? [],
                 activeActionCwds: activeGitActionCwds,
                 platform: worktreePathPlatform,
               }),

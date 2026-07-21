@@ -43,6 +43,15 @@ export interface ResolvedThreadTerminalLayout {
   terminalVisualIdentityById: ReadonlyMap<string, ResolvedTerminalVisualIdentity>;
 }
 
+export function findMostRecentlyArchivedTerminalGroup(
+  groups: readonly ResolvedTerminalGroupLayout[],
+): ResolvedTerminalGroupLayout | undefined {
+  return groups.reduce<ResolvedTerminalGroupLayout | undefined>((newest, group) => {
+    if (!newest || (group.archivedAt ?? 0) > (newest.archivedAt ?? 0)) return group;
+    return newest;
+  }, undefined);
+}
+
 function assignUniqueGroupId(groupId: string, usedGroupIds: Set<string>): string {
   if (!usedGroupIds.has(groupId)) {
     usedGroupIds.add(groupId);
@@ -168,9 +177,7 @@ export function resolveThreadTerminalLayout(input: {
   const visibleTerminalIds = activeGroup?.terminalIds ?? [];
   const hasTerminalSidebar = false;
   const isSplitView = visibleTerminalIds.length > 1;
-  const showGroupHeaders =
-    resolvedTerminalGroups.length > 0 ||
-    resolvedTerminalGroups.some((terminalGroup) => terminalGroup.terminalIds.length > 1);
+  const showGroupHeaders = resolvedTerminalGroups.length > 0;
   const hasReachedSplitLimit = visibleTerminalIds.length >= MAX_TERMINALS_PER_GROUP;
   const terminalVisualIdentityById = resolveTerminalVisualIdentityMap({
     terminalIds: normalizedTerminalIds,

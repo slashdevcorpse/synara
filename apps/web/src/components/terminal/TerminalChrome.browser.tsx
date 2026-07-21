@@ -1,6 +1,6 @@
 import "../../index.css";
 
-import { page } from "vitest/browser";
+import { page, userEvent } from "vitest/browser";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { render } from "vitest-browser-react";
 
@@ -310,14 +310,15 @@ describe("TerminalWorkspaceTabBar", () => {
     );
 
     expect(document.querySelector('option[value="two"]')?.textContent).toBe("Two — 1 stopped");
-    await page.getByRole("button", { name: "Manage One" }).click();
-    await page
-      .getByRole("menuitem", { name: "Move 1 selected to Two — 1 stopped", exact: true })
-      .click();
+    const manageButton = page.getByRole("button", { name: "Manage One" });
+    manageButton.element().focus();
+    await userEvent.keyboard("{Enter}");
+    await userEvent.keyboard("{ArrowDown}{Enter}");
     expect(onMoveTerminalsToGroup).toHaveBeenCalledWith(["terminal-one"], "two");
 
-    await page.getByRole("button", { name: "Manage One" }).click();
-    await page.getByRole("menuitem", { name: "Move 1 selected to new group", exact: true }).click();
+    manageButton.element().focus();
+    await userEvent.keyboard("{Enter}");
+    await userEvent.keyboard("{ArrowDown}{ArrowDown} ");
     expect(onMoveTerminalsToNewGroup).toHaveBeenCalledWith(["terminal-one"]);
   });
 

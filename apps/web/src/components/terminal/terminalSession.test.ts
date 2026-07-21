@@ -6,7 +6,6 @@ const runtimeRegistry = vi.hoisted(() => ({ disposeTerminal: vi.fn() }));
 vi.mock("./terminalRuntimeRegistry", () => ({ terminalRuntimeRegistry: runtimeRegistry }));
 
 import {
-  closeTerminalSessionStrict,
   closeTerminalSessionsStrict,
   restartTerminalSession,
   shouldAttachTerminalRuntime,
@@ -51,6 +50,20 @@ describe("terminal session lifecycle", () => {
       deleteHistory: false,
     });
     expect(runtimeRegistry.disposeTerminal).toHaveBeenCalledWith("thread", "terminal");
+  });
+
+  it("does not write exit or dispose when acknowledged preserving close is unavailable", async () => {
+    const write = vi.fn().mockResolvedValue(undefined);
+
+    await expect(
+      stopTerminalSessionPreservingHistory({
+        api: apiWithTerminal({ write }),
+        threadId: "thread",
+        terminalId: "terminal",
+      }),
+    ).rejects.toThrow("Acknowledged terminal close is unavailable");
+    expect(write).not.toHaveBeenCalled();
+    expect(runtimeRegistry.disposeTerminal).not.toHaveBeenCalled();
   });
 
   it("restarts with the retained cwd and reports success only after the API resolves", async () => {
@@ -99,6 +112,9 @@ describe("terminal session lifecycle", () => {
       terminalExitStateFromRecovery({ status: "running", exitCode: null, exitSignal: null }),
     ).toBeNull();
     expect(
+      terminalExitStateFromRecovery({ status: "starting", exitCode: null, exitSignal: null }),
+    ).toBeNull();
+    expect(
       terminalExitStateFromRecovery({ status: "exited", exitCode: null, exitSignal: 9 }),
     ).toEqual({ kind: "failed", exitCode: null, exitSignal: "9" });
   });
@@ -114,31 +130,6 @@ describe("terminal session lifecycle", () => {
       exitCode: 0,
       exitSignal: "0",
     });
-  });
-
-  it("strictly closes server history without disposing the local runtime", async () => {
-    const close = vi.fn().mockResolvedValue(undefined);
-    await closeTerminalSessionStrict({
-      api: apiWithTerminal({ close }),
-      threadId: "thread",
-      terminalId: "terminal",
-    });
-    expect(close).toHaveBeenCalledWith({
-      threadId: "thread",
-      terminalId: "terminal",
-      deleteHistory: true,
-    });
-    expect(runtimeRegistry.disposeTerminal).not.toHaveBeenCalled();
-  });
-
-  it("rejects a strict close when no acknowledged close API exists", async () => {
-    await expect(
-      closeTerminalSessionStrict({
-        api: apiWithTerminal({ write: vi.fn() }),
-        threadId: "thread",
-        terminalId: "terminal",
-      }),
-    ).rejects.toThrow("Strict terminal close is unavailable");
   });
 
   it("closes a terminal group with one acknowledged atomic batch", async () => {

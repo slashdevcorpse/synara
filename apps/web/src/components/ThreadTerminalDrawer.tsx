@@ -58,7 +58,10 @@ import {
   TerminalSidebar,
   TerminalWorkspaceTabBar,
 } from "./terminal/TerminalChrome";
-import { resolveThreadTerminalLayout } from "./terminal/TerminalLayout";
+import {
+  findMostRecentlyArchivedTerminalGroup,
+  resolveThreadTerminalLayout,
+} from "./terminal/TerminalLayout";
 import {
   resolveTerminalSelectionActionPosition,
   shouldHandleTerminalSelectionMouseUp,
@@ -69,6 +72,7 @@ import {
   terminalRuntimeRegistry,
 } from "./terminal/terminalRuntimeRegistry";
 import type {
+  TerminalRecoveryResolution,
   TerminalRuntimeConfig,
   TerminalRuntimeStatus,
   TerminalRuntimeViewState,
@@ -202,14 +206,7 @@ interface TerminalViewportProps {
   terminalRightClickToPaste: boolean;
   exitState?: TerminalExitState | undefined;
   reattachOnly: boolean;
-  onRecoveryResolved: (
-    terminalId: string,
-    recovery: {
-      status: "starting" | "running" | "exited" | "error";
-      exitCode: number | null;
-      exitSignal: number | null;
-    },
-  ) => void;
+  onRecoveryResolved: (terminalId: string, recovery: TerminalRecoveryResolution) => void;
   onSessionExited: (exit: { exitCode: number | null; exitSignal: number | null }) => void;
   onRestart: () => Promise<void>;
   onTerminalMetadataChange: (
@@ -747,6 +744,10 @@ export default function ThreadTerminalDrawer({
       terminalTitleOverridesById,
     ],
   );
+  const mostRecentlyArchivedGroup = useMemo(
+    () => findMostRecentlyArchivedTerminalGroup(resolvedArchivedTerminalGroups),
+    [resolvedArchivedTerminalGroups],
+  );
 
   useEffect(() => {
     const nextRuntimeKeySet = new Set(
@@ -1076,6 +1077,7 @@ export default function ThreadTerminalDrawer({
       }
       const command = resolveTerminalWorkspaceShortcut({
         key: event.key,
+        code: event.code,
         altKey: event.altKey,
         shiftKey: event.shiftKey,
         ctrlKey: event.ctrlKey,
@@ -1092,11 +1094,8 @@ export default function ThreadTerminalDrawer({
         requestArchiveGroup(resolvedActiveGroupId);
         handled = true;
       } else if (command === "restore-recent-group") {
-        const mostRecentlyArchived = resolvedArchivedTerminalGroups.toSorted(
-          (left, right) => (right.archivedAt ?? 0) - (left.archivedAt ?? 0),
-        )[0];
-        if (mostRecentlyArchived) {
-          restoreGroupAndFocus(mostRecentlyArchived.id);
+        if (mostRecentlyArchivedGroup) {
+          restoreGroupAndFocus(mostRecentlyArchivedGroup.id);
           handled = true;
         }
       } else if (command === "toggle-archived-groups") {
@@ -1137,8 +1136,8 @@ export default function ThreadTerminalDrawer({
       reorderTerminalGroup,
       requestArchiveGroup,
       resolvedActiveGroupId,
-      resolvedArchivedTerminalGroups,
       resolvedTerminalGroups,
+      mostRecentlyArchivedGroup,
       restoreGroupAndFocus,
       setShowArchivedTerminalGroups,
       threadId,
@@ -1381,7 +1380,7 @@ export default function ThreadTerminalDrawer({
                 />
               ) : (
                 <TerminalEmptyState
-                  archivedGroupId={resolvedArchivedTerminalGroups[0]?.id}
+                  archivedGroupId={mostRecentlyArchivedGroup?.id}
                   onRestoreGroup={restoreGroupAndFocus}
                   onNewGroup={onNewTerminalAction}
                 />

@@ -1051,6 +1051,50 @@ describe("TerminalManager", () => {
     await manager.dispose();
   });
 
+  it("drains trailing batch persistence after stopping and tolerates cleanup flush failures", async () => {
+    const { manager, logsDir } = makeManager();
+    await manager.open(openInput({ terminalId: "one" }));
+    await manager.open(openInput({ terminalId: "two" }));
+    const oneHistoryPath = multiTerminalHistoryLogPath(logsDir, "thread-1", "one");
+    const twoHistoryPath = multiTerminalHistoryLogPath(logsDir, "thread-1", "two");
+
+    const internals = manager as unknown as {
+      flushPersistQueue: (threadId: string, terminalId: string) => Promise<void>;
+      sessions: Map<string, unknown>;
+    };
+    const flushPersistQueue = internals.flushPersistQueue.bind(manager);
+    const callCounts = new Map<string, number>();
+    vi.spyOn(internals, "flushPersistQueue").mockImplementation(async (threadId, terminalId) => {
+      const callCount = (callCounts.get(terminalId) ?? 0) + 1;
+      callCounts.set(terminalId, callCount);
+      if (terminalId === "two" && callCount === 2) {
+        throw new Error("trailing persistence failed");
+      }
+      await flushPersistQueue(threadId, terminalId);
+    });
+
+    await expect(
+      manager.close({
+        threadId: "thread-1",
+        terminalIds: ["one", "two"],
+        deleteHistory: true,
+      }),
+    ).resolves.toBeUndefined();
+
+    expect(callCounts).toEqual(
+      new Map([
+        ["one", 2],
+        ["two", 2],
+      ]),
+    );
+    expect(internals.sessions.has("thread-1\u0000one")).toBe(false);
+    expect(internals.sessions.has("thread-1\u0000two")).toBe(false);
+    expect(fs.existsSync(oneHistoryPath)).toBe(false);
+    expect(fs.existsSync(twoHistoryPath)).toBe(false);
+
+    await manager.dispose();
+  });
+
   it("keeps pty reads paused until renderer output ACKs drain", async () => {
     const { manager, ptyAdapter } = makeManager();
     const events: TerminalEvent[] = [];

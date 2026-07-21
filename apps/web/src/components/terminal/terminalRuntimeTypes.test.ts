@@ -17,22 +17,27 @@ describe("buildTerminalRuntimeKey", () => {
 });
 
 describe("shouldScheduleTerminalSnapshotReconcile", () => {
-  it("never issues the delayed create-capable open for a reattach-only identity", () => {
-    expect(
-      shouldScheduleTerminalSnapshotReconcile({
-        reattachOnly: true,
-        unavailableRecovery: false,
-        outputUnchanged: true,
-      }),
-    ).toBe(false);
-    expect(
-      shouldScheduleTerminalSnapshotReconcile({
-        reattachOnly: false,
-        unavailableRecovery: false,
-        outputUnchanged: true,
-      }),
-    ).toBe(true);
-  });
+  it.each([
+    [false, false, false, false],
+    [false, false, true, true],
+    [false, true, false, false],
+    [false, true, true, false],
+    [true, false, false, false],
+    [true, false, true, false],
+    [true, true, false, false],
+    [true, true, true, false],
+  ] as const)(
+    "returns %s/%s/%s => %s for every reconcile guard permutation",
+    (reattachOnly, unavailableRecovery, outputUnchanged, expected) => {
+      expect(
+        shouldScheduleTerminalSnapshotReconcile({
+          reattachOnly,
+          unavailableRecovery,
+          outputUnchanged,
+        }),
+      ).toBe(expected);
+    },
+  );
 });
 
 describe("isUnavailableTerminalRecovery", () => {

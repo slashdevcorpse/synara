@@ -176,6 +176,8 @@ describe("WorkspaceAgentPanel", () => {
     expect(markup).toContain('aria-label="Collapse Synara agents"');
     expect(markup).toContain('aria-label="Dismiss Child thread"');
     expect(markup).not.toContain('aria-label="Dismiss Parent thread"');
+    expect(markup).toContain("1 subagent (0 running)");
+    expect(markup).not.toContain("1 subagents");
     expect(markup).toContain("grid-rows-[0fr]");
     expect(markup).toContain("Parent thread");
     expect(markup).toContain("Child thread");

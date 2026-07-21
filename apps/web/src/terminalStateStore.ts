@@ -110,7 +110,7 @@ function normalizeTerminalExitStates(
             typeof state.exitCode === "number" && Number.isFinite(state.exitCode)
               ? state.exitCode
               : null,
-          exitSignal: state.exitSignal?.trim() || null,
+          exitSignal: typeof state.exitSignal === "string" ? state.exitSignal.trim() || null : null,
         } satisfies TerminalExitState,
       ]),
   );
@@ -127,8 +127,8 @@ function normalizeTerminalLaunchMetadata(
       .map(([terminalId, metadata]) => [
         terminalId,
         {
-          cwd: metadata.cwd?.trim() || null,
-          ...(metadata.reattachOnly === true ? { reattachOnly: true as const } : {}),
+          cwd: typeof metadata?.cwd === "string" ? metadata.cwd.trim() || null : null,
+          ...(metadata?.reattachOnly === true ? { reattachOnly: true as const } : {}),
         } satisfies TerminalLaunchMetadata,
       ]),
   );

@@ -989,6 +989,7 @@ describe("workspace agent labels and timing", () => {
     const connectingId = ThreadId.makeUnsafe("thread-hover-connecting");
     const completedId = ThreadId.makeUnsafe("thread-hover-completed");
     const grandchildId = ThreadId.makeUnsafe("thread-hover-grandchild");
+    const greatGrandchildId = ThreadId.makeUnsafe("thread-hover-great-grandchild");
     const archivedId = ThreadId.makeUnsafe("thread-hover-archived");
     const root = shellThread({
       threadId: rootId,
@@ -1016,12 +1017,16 @@ describe("workspace agent labels and timing", () => {
       hasLiveTailWork: false,
     });
     const grandchild = shellThread({ threadId: grandchildId, parentThreadId: runningId });
+    const greatGrandchild = shellThread({
+      threadId: greatGrandchildId,
+      parentThreadId: grandchildId,
+    });
     const archived = shellThread({
       threadId: archivedId,
       parentThreadId: rootId,
       archivedAt: BASE_TIME,
     });
-    const threads = [root, running, connecting, completed, grandchild, archived];
+    const threads = [root, running, connecting, completed, grandchild, greatGrandchild, archived];
     const rootActivity = deriveWorkspaceAgentThreadActivity({
       threadId: rootId,
       projects: [project],
@@ -1053,6 +1058,11 @@ describe("workspace agent labels and timing", () => {
       subagentCount: 1,
       subagentRunningCount: 1,
     });
+    const runningTreeNode = rootActivity.subagentTree.find(
+      (node) => node.entry.threadId === runningId,
+    );
+    expect(runningTreeNode?.children.map((node) => node.entry.threadId)).toEqual([grandchildId]);
+    expect(runningTreeNode?.children[0]?.children).toEqual([]);
   });
 
   it("keeps idle and terminal targets available to the per-thread activity hook", () => {

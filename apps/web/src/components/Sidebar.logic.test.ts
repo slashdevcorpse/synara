@@ -42,6 +42,7 @@ import {
   resolveProjectStatusIndicator,
   resolveSidebarNewThreadEnvMode,
   sidebarProjectActivityAccessibleLabel,
+  shouldAnnounceSidebarAgentActivity,
   projectSidebarTransientTerminalActivity,
   scheduleSidebarTransientTerminalDismiss,
   resolveThreadHoverCardWorkspaceLabel,
@@ -196,6 +197,43 @@ describe("sidebar transient terminal activity", () => {
       },
     ]);
     expect(projectSidebarTransientTerminalActivity(terminalInput)).toEqual([]);
+  });
+
+  it("replaces stale turn keys and prunes deleted thread lifecycle state", () => {
+    const observed = new Map([
+      ["live-thread", "old-live-turn"],
+      ["deleted-thread", "deleted-turn"],
+    ]);
+    const presented = new Map([
+      ["live-thread", "old-terminal-turn"],
+      ["deleted-thread", "deleted-turn"],
+    ]);
+
+    expect(
+      projectSidebarTransientTerminalActivity({
+        activities: [
+          { threadId: "live-thread", phase: "thinking", turnKey: "new-live-turn" },
+          { threadId: "deleted-thread", phase: "thinking", turnKey: "deleted-new-turn" },
+        ],
+        threads: [
+          {
+            id: "live-thread",
+            latestTurn: { turnId: "new-live-turn", state: "running", completedAt: null },
+          },
+        ],
+        observedLiveTurnByThreadId: observed,
+        presentedTerminalTurnByThreadId: presented,
+      }),
+    ).toEqual([]);
+    expect(observed).toEqual(new Map([["live-thread", "new-live-turn"]]));
+    expect(presented).toEqual(new Map());
+  });
+
+  it("announces only phases represented by the activity glyph", () => {
+    expect(shouldAnnounceSidebarAgentActivity("thinking")).toBe(true);
+    expect(shouldAnnounceSidebarAgentActivity("completed")).toBe(true);
+    expect(shouldAnnounceSidebarAgentActivity("idle")).toBe(false);
+    expect(shouldAnnounceSidebarAgentActivity("stopped")).toBe(false);
   });
 
   it("dismisses a projected terminal phase after exactly three seconds", () => {
@@ -1194,7 +1232,7 @@ describe("resolveThreadStatusPill", () => {
         hasPendingApprovals: true,
         hasPendingUserInput: true,
       }),
-    ).toMatchObject({ label: "Pending Approval", pulse: false });
+    ).toMatchObject({ kind: "pending-approval", label: "Pending Approval", pulse: false });
   });
 
   it("shows awaiting input when plan mode is blocked on user answers", () => {
@@ -1204,7 +1242,7 @@ describe("resolveThreadStatusPill", () => {
         hasPendingApprovals: false,
         hasPendingUserInput: true,
       }),
-    ).toMatchObject({ label: "Awaiting Input", pulse: false });
+    ).toMatchObject({ kind: "awaiting-input", label: "Awaiting Input", pulse: false });
   });
 
   it("falls back to working when the thread is actively running without blockers", () => {
@@ -1374,44 +1412,53 @@ describe("resolveProjectStatusIndicator", () => {
     expect(
       resolveProjectStatusIndicator([
         {
+          kind: "completed",
           label: "Completed",
           colorClass: "text-emerald-600",
           dotClass: "bg-emerald-500",
           pulse: false,
         },
         {
+          kind: "pending-approval",
           label: "Pending Approval",
           colorClass: "text-amber-600",
           dotClass: "bg-amber-500",
           pulse: false,
         },
         {
+          kind: "working",
           label: "Working",
           colorClass: "text-sky-600",
           dotClass: "bg-sky-500",
           pulse: true,
         },
       ]),
-    ).toMatchObject({ label: "Pending Approval", dotClass: "bg-amber-500" });
+    ).toMatchObject({
+      kind: "pending-approval",
+      label: "Pending Approval",
+      dotClass: "bg-amber-500",
+    });
   });
 
   it("prefers plan-ready over completed when no stronger action is needed", () => {
     expect(
       resolveProjectStatusIndicator([
         {
+          kind: "completed",
           label: "Completed",
           colorClass: "text-emerald-600",
           dotClass: "bg-emerald-500",
           pulse: false,
         },
         {
+          kind: "plan-ready",
           label: "Plan Ready",
           colorClass: "text-violet-600",
           dotClass: "bg-violet-500",
           pulse: false,
         },
       ]),
-    ).toMatchObject({ label: "Plan Ready", dotClass: "bg-violet-500" });
+    ).toMatchObject({ kind: "plan-ready", label: "Plan Ready", dotClass: "bg-violet-500" });
   });
 });
 

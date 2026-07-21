@@ -297,6 +297,9 @@ function deriveActiveLifecycleCounts(activities: ReadonlyArray<AgentActivityLike
       openToolCounts.set(lifecycleKey, 1);
       openToolNames.set(lifecycleKey, toolLifecycleName(activity));
     } else {
+      // Map#set preserves an existing key's insertion position. Refresh the key
+      // so the last value remains the most recent active lifecycle edge.
+      openToolNames.delete(lifecycleKey);
       openToolNames.set(lifecycleKey, toolLifecycleName(activity));
     }
 

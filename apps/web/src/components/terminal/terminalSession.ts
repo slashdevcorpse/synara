@@ -9,6 +9,7 @@ import { type NativeApi } from "@synara/contracts";
 
 import { randomUUID } from "~/lib/utils";
 import { terminalRuntimeRegistry } from "./terminalRuntimeRegistry";
+import type { TerminalRecoveryResolution } from "./terminalRuntimeTypes";
 import type { TerminalExitState } from "../../types";
 
 // Stable, collision-resistant id for a new terminal pane/tab/split.
@@ -51,11 +52,9 @@ export function shouldAttachTerminalRuntime(input: {
   return input.runtimeCwdReady && input.exitState === undefined;
 }
 
-export function terminalExitStateFromRecovery(input: {
-  status: "starting" | "running" | "exited" | "error";
-  exitCode: number | null;
-  exitSignal: number | null;
-}): TerminalExitState | null {
+export function terminalExitStateFromRecovery(
+  input: TerminalRecoveryResolution,
+): TerminalExitState | null {
   if (input.status === "running" || input.status === "starting") return null;
   const exitState = terminalExitStateFromProcessExit(input);
   return {
@@ -77,24 +76,6 @@ export function terminalExitStateFromProcessExit(input: {
     exitCode: input.exitCode,
     exitSignal: input.exitSignal === null ? null : String(input.exitSignal),
   };
-}
-
-// Strict server-side close used by transactional group removal. The caller owns
-// local-runtime disposal so no local entry is removed until every close succeeds.
-export async function closeTerminalSessionStrict(input: {
-  api: NativeApi | undefined;
-  threadId: string;
-  terminalId: string;
-  clearHistoryBeforeClose?: boolean;
-}): Promise<void> {
-  const { api, threadId, terminalId } = input;
-  if (!api || !("close" in api.terminal) || typeof api.terminal.close !== "function") {
-    throw new Error("Strict terminal close is unavailable");
-  }
-  if (input.clearHistoryBeforeClose) {
-    await api.terminal.clear({ threadId, terminalId });
-  }
-  await api.terminal.close({ threadId, terminalId, deleteHistory: true });
 }
 
 // One acknowledged server request closes a complete group. The server preflights
@@ -126,15 +107,10 @@ export async function stopTerminalSessionPreservingHistory(input: {
   terminalId: string;
 }): Promise<void> {
   const { api, threadId, terminalId } = input;
-  if (!api) {
-    throw new Error("Terminal API is unavailable");
+  if (!api || !("close" in api.terminal) || typeof api.terminal.close !== "function") {
+    throw new Error("Acknowledged terminal close is unavailable");
   }
-  if ("close" in api.terminal && typeof api.terminal.close === "function") {
-    await api.terminal.close({ threadId, terminalId, deleteHistory: false });
-    terminalRuntimeRegistry.disposeTerminal(threadId, terminalId);
-    return;
-  }
-  await api.terminal.write({ threadId, terminalId, data: "exit\n" });
+  await api.terminal.close({ threadId, terminalId, deleteHistory: false });
   terminalRuntimeRegistry.disposeTerminal(threadId, terminalId);
 }
 

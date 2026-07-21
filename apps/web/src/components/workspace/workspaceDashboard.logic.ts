@@ -115,6 +115,65 @@ export interface WorkspaceCardModel {
   readonly recentAtMs: number;
 }
 
+export interface WorkspaceProjectProcessSources {
+  readonly agents: ReadonlyArray<{
+    readonly state: AgentActivityState;
+    readonly isSubagent: boolean;
+  }>;
+  readonly terminalProcessCount: number;
+  readonly threads: ReadonlyArray<SidebarThreadSummary>;
+}
+
+type MutableWorkspaceProjectProcessSources = {
+  agents: Array<{ state: AgentActivityState; isSubagent: boolean }>;
+  terminalProcessCount: number;
+  threads: SidebarThreadSummary[];
+};
+
+export function indexWorkspaceProcessSourcesByProject(input: {
+  agents: ReadonlyArray<{
+    readonly projectId: ProjectId;
+    readonly activityState: AgentActivityState;
+    readonly isSubagent: boolean;
+  }>;
+  threads: readonly SidebarThreadSummary[];
+  terminalStateByThreadId: Readonly<
+    Partial<Record<ThreadId, { readonly runningTerminalIds: readonly unknown[] }>>
+  >;
+}): ReadonlyMap<ProjectId, WorkspaceProjectProcessSources> {
+  const sourcesByProjectId = new Map<ProjectId, MutableWorkspaceProjectProcessSources>();
+  const projectIdByThreadId = new Map<ThreadId, ProjectId>();
+  const sourcesForProject = (projectId: ProjectId) => {
+    const existing = sourcesByProjectId.get(projectId);
+    if (existing) return existing;
+    const created: MutableWorkspaceProjectProcessSources = {
+      agents: [],
+      terminalProcessCount: 0,
+      threads: [],
+    };
+    sourcesByProjectId.set(projectId, created);
+    return created;
+  };
+
+  for (const thread of input.threads) {
+    sourcesForProject(thread.projectId).threads.push(thread);
+    projectIdByThreadId.set(thread.id, thread.projectId);
+  }
+  for (const agent of input.agents) {
+    sourcesForProject(agent.projectId).agents.push({
+      state: agent.activityState,
+      isSubagent: agent.isSubagent,
+    });
+  }
+  for (const [threadId, terminalState] of Object.entries(input.terminalStateByThreadId)) {
+    const projectId = projectIdByThreadId.get(threadId as ThreadId);
+    if (projectId === undefined || terminalState === undefined) continue;
+    sourcesForProject(projectId).terminalProcessCount += terminalState.runningTerminalIds.length;
+  }
+
+  return sourcesByProjectId;
+}
+
 function automationStatusLabel(status: AutomationRun["status"]): string {
   switch (status) {
     case "pending":
@@ -159,6 +218,16 @@ const AGENT_ACTIVITY_PRIORITY: Partial<Record<AgentActivityState["phase"] | "que
   queued: 1,
 } as const;
 
+type DashboardInteractionKind = Extract<
+  ThreadStatusPill["kind"],
+  "pending-approval" | "awaiting-input"
+>;
+
+const DASHBOARD_INTERACTION_PRIORITY: Record<DashboardInteractionKind, number> = {
+  "pending-approval": 7,
+  "awaiting-input": 6,
+};
+
 function timestampMs(value: string | null | undefined): number {
   if (!value) return 0;
   const parsed = Date.parse(value);
@@ -177,8 +246,8 @@ function threadTimestamp(thread: SidebarThreadSummary): string {
 
 function isDashboardInteraction(
   status: ThreadStatusPill | null,
-): status is ThreadStatusPill & { label: "Pending Approval" | "Awaiting Input" } {
-  return status?.label === "Pending Approval" || status?.label === "Awaiting Input";
+): status is ThreadStatusPill & { kind: DashboardInteractionKind } {
+  return status?.kind === "pending-approval" || status?.kind === "awaiting-input";
 }
 
 function deriveActivity(
@@ -199,7 +268,7 @@ function deriveActivity(
           colorClass: status.colorClass,
           dotClass: status.dotClass,
           pulse: status.pulse,
-          priority: status.label === "Pending Approval" ? 7 : 6,
+          priority: DASHBOARD_INTERACTION_PRIORITY[status.kind],
           updatedAtMs: timestampMs(threadTimestamp(thread)),
         },
       ];
