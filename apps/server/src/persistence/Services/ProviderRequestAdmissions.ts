@@ -13,6 +13,7 @@ import type { Effect } from "effect";
 import type { ProjectionRepositoryError } from "../Errors.ts";
 
 export const PROVIDER_REQUEST_LIMIT_PER_THREAD = 10;
+export const PROVIDER_REQUEST_LEGACY_GENERATION = "legacy";
 
 export const ProviderRequestAdmissionKind = Schema.Literals(["approval", "userInput"]);
 export type ProviderRequestAdmissionKind = typeof ProviderRequestAdmissionKind.Type;

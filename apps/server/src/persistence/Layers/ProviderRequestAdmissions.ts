@@ -4,13 +4,15 @@ import { Effect, Layer } from "effect";
 import { toPersistenceSqlError } from "../Errors.ts";
 import {
   PROVIDER_REQUEST_LIMIT_PER_THREAD,
+  PROVIDER_REQUEST_LEGACY_GENERATION,
   ProviderRequestAdmissionRepository,
   type ProviderRequestAdmissionIdentity,
   type ProviderRequestAdmissionRecord,
   type ProviderRequestAdmissionRepositoryShape,
 } from "../Services/ProviderRequestAdmissions.ts";
 
-const generationKey = (generation: string | undefined) => generation ?? "";
+const generationKey = (generation: string | undefined) =>
+  generation ?? PROVIDER_REQUEST_LEGACY_GENERATION;
 
 const makeProviderRequestAdmissionRepository = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;

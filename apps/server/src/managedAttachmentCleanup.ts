@@ -1161,13 +1161,18 @@ async function stagingRecoveryCursorIsCurrent(
  * Every call has hard scan, pass, and wall-clock budgets; later scheduled calls
  * resume the same generation so a large or mutating prefix cannot starve later
  * stale parts. Reaching EOF closes the generation so future entries are found
- * by the next call.
+ * by the next call. Calls share one cursor and are serialized in FIFO order.
+ * Queue wait is outside each call's wall-clock budget; the budget starts only
+ * after that call owns the cursor.
  */
 export function makeManagedAttachmentStagingRecovery(): ManagedAttachmentStagingRecovery {
   let cursor: ManagedAttachmentStagingRecoveryCursor | null = null;
   let deferredCursorClose: { readonly completion: Promise<void>; settled: boolean } | null = null;
   const deferredCleanup = makeManagedAttachmentDeferredCleanupTracker();
   const activeRuns = new Set<Promise<void>>();
+  // Every gate is settlement-only and released in the run's finally block, so
+  // a rejected operation cannot poison later queued work.
+  let runQueue: Promise<void> = Promise.resolve();
   let closed = false;
   let closePromise: Promise<void> | null = null;
 
@@ -1205,6 +1210,13 @@ export function makeManagedAttachmentStagingRecovery(): ManagedAttachmentStaging
           completeRun = resolve;
         });
         activeRuns.add(completion);
+        let releaseRun!: () => void;
+        // Enroll before the first await so close() cannot miss accepted work.
+        const precedingRun = runQueue;
+        runQueue = new Promise<void>((resolve) => {
+          releaseRun = resolve;
+        });
+        await precedingRun;
         const trackDeferredCleanup = (completion: Promise<void>) => {
           deferredCleanup.track(completion);
           input.onDeferredCleanup?.(completion);
@@ -1454,6 +1466,7 @@ export function makeManagedAttachmentStagingRecovery(): ManagedAttachmentStaging
         } finally {
           activeRuns.delete(completion);
           completeRun();
+          releaseRun();
         }
       },
       catch: (cause) => cause,

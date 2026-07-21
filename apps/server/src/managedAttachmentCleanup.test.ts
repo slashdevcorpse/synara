@@ -742,6 +742,110 @@ describe("managed attachment cleanup", () => {
     }
   });
 
+  it("serializes direct recovery runs, starts queued budgets on execution, and drains on close", async () => {
+    const firstRoot = await fs.mkdtemp(path.join(os.tmpdir(), "synara-managed-recovery-queue-a-"));
+    const secondRoot = await fs.mkdtemp(path.join(os.tmpdir(), "synara-managed-recovery-queue-b-"));
+    temporaryRoots.push(firstRoot, secondRoot);
+    await Promise.all([
+      fs.mkdir(path.join(firstRoot, ".staging")),
+      fs.mkdir(path.join(secondRoot, ".staging")),
+    ]);
+
+    const originalOpendir = fs.opendir;
+    const directoryCloseCalls: number[] = [];
+    const opendir = vi.spyOn(fs, "opendir").mockImplementation((async (target: string) => {
+      const directory = await originalOpendir(target);
+      const directoryIndex = directoryCloseCalls.push(0) - 1;
+      const closeDirectory = directory.close.bind(directory);
+      vi.spyOn(directory, "close").mockImplementation(async () => {
+        directoryCloseCalls[directoryIndex] = (directoryCloseCalls[directoryIndex] ?? 0) + 1;
+        await closeDirectory();
+      });
+      return directory;
+    }) as never);
+    const recovery = makeManagedAttachmentStagingRecovery();
+    let releaseFirst!: () => void;
+    const firstReleased = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let markFirstEntered!: () => void;
+    const firstEntered = new Promise<void>((resolve) => {
+      markFirstEntered = resolve;
+    });
+    let secondEntered = false;
+    let queuedClock = 0;
+
+    const first = Effect.runPromise(
+      recovery.run({
+        attachmentsDir: firstRoot,
+        monotonicNow: () => 0,
+        readDirectoryEntry: async () => {
+          markFirstEntered();
+          await firstReleased;
+          throw new Error("simulated first queued run failure");
+        },
+      }),
+    );
+    const firstOutcome = first.then(
+      () => ({ _tag: "Succeeded" as const }),
+      (cause: unknown) => ({ _tag: "Failed" as const, cause }),
+    );
+
+    try {
+      await firstEntered;
+      const second = Effect.runPromise(
+        recovery.run({
+          attachmentsDir: secondRoot,
+          invocationTimeBudgetMs: 250,
+          monotonicNow: () => queuedClock,
+          beforePinnedSessionReady: async () => {
+            secondEntered = true;
+            expect(queuedClock).toBe(10_000);
+          },
+        }),
+      );
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(secondEntered).toBe(false);
+      expect(opendir).toHaveBeenCalledTimes(1);
+
+      queuedClock = 10_000;
+      let closeSettled = false;
+      const close = Effect.runPromise(recovery.close).then(() => {
+        closeSettled = true;
+      });
+      await Promise.resolve();
+      expect(closeSettled).toBe(false);
+
+      releaseFirst();
+      const [failedFirst, secondResult] = await Promise.all([firstOutcome, second]);
+      expect(failedFirst).toMatchObject({
+        _tag: "Failed",
+        cause: { message: "simulated first queued run failure" },
+      });
+      expect(secondResult).toEqual({
+        inspected: 0,
+        removed: 0,
+        failures: 0,
+        passes: 0,
+        exhausted: true,
+      });
+      await close;
+
+      expect(secondEntered).toBe(true);
+      expect(opendir).toHaveBeenCalledTimes(2);
+      expect(directoryCloseCalls).toEqual([1, 1]);
+      expect(closeSettled).toBe(true);
+      await expect(Effect.runPromise(recovery.run({ attachmentsDir: firstRoot }))).rejects.toThrow(
+        "Managed attachment staging recovery is closed.",
+      );
+    } finally {
+      releaseFirst();
+      await firstOutcome;
+      await Effect.runPromise(recovery.close);
+      opendir.mockRestore();
+    }
+  });
+
   it.skipIf(process.platform === "win32")(
     "keeps deletion on the opened staging directory when its pathname is swapped",
     async () => {

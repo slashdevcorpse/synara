@@ -413,6 +413,10 @@ export class WsTransport {
     readonly resolve: (ready: TerminalEventStreamReady) => void;
     readonly reject: (error: unknown) => void;
   } | null = null;
+  // Terminal readiness is a transport-lifetime contract: once a runtime can
+  // open or snapshot a terminal, its event stream must survive temporary gaps
+  // in ordinary push listeners until the transport itself is disposed.
+  private terminalEventStreamRequired = false;
   private shellSubscription: ShellSubscriptionResumeState | null = null;
   private readonly threadSubscriptions = new Map<string, unknown>();
   private compatibility: WsBootstrapNegotiateResult | null = null;
@@ -548,6 +552,7 @@ export class WsTransport {
 
   waitForTerminalEventStreamReady(): Promise<TerminalEventStreamReady> {
     if (this.disposed) return Promise.reject(new Error("Transport disposed"));
+    this.terminalEventStreamRequired = true;
     const ready = this.ensureTerminalEventStreamReady();
     if (!this.streamCleanups.has("terminal.events")) {
       void this.startChannelStream(WS_CHANNELS.terminalEvent);
@@ -596,6 +601,7 @@ export class WsTransport {
   async dispose(): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
+    this.terminalEventStreamRequired = false;
     this.invalidateTerminalEventStreamReady(new Error("Transport disposed"));
     this.setState("disposed");
     for (const cleanup of this.streamCleanups.values()) cleanup();
@@ -762,6 +768,9 @@ export class WsTransport {
     for (const channel of this.listeners.keys()) {
       void this.startChannelStream(channel as WsPushChannel);
     }
+    if (this.terminalEventStreamRequired && !this.listeners.has(WS_CHANNELS.terminalEvent)) {
+      void this.startChannelStream(WS_CHANNELS.terminalEvent);
+    }
     if (this.shellSubscription !== null) {
       this.startShellStream(client);
     }
@@ -793,8 +802,9 @@ export class WsTransport {
   private startChannelStream(channel: WsPushChannel): Promise<void> {
     return this.getClient()
       .then((client) => {
+        if (this.disposed || !this.shouldKeepChannelStream(channel)) return;
         const restartChannel = () => {
-          if (this.listeners.has(channel)) {
+          if (this.shouldKeepChannelStream(channel)) {
             return this.startChannelStream(channel);
           }
           return Promise.resolve();
@@ -888,7 +898,7 @@ export class WsTransport {
         }
         if (
           !this.disposed &&
-          this.listeners.has(channel) &&
+          this.shouldKeepChannelStream(channel) &&
           !isTerminalCompatibilityFailure(error)
         ) {
           console.warn("WebSocket RPC channel failed to start", error);
@@ -907,6 +917,7 @@ export class WsTransport {
       this.stopStream("server.providers");
     else if (channel === WS_CHANNELS.serverSettingsUpdated) this.stopStream("server.settings");
     else if (channel === WS_CHANNELS.terminalEvent) {
+      if (this.shouldKeepChannelStream(channel)) return;
       this.invalidateTerminalEventStreamReady(new Error("Terminal event stream stopped"));
       this.stopStream("terminal.events");
     } else if (channel === WS_CHANNELS.projectDevServerEvent) this.stopStream("project.devServers");
@@ -917,6 +928,13 @@ export class WsTransport {
 
   private shouldKeepLifecycleStream(): boolean {
     return shouldKeepServerLifecycleStream(new Set(this.listeners.keys()));
+  }
+
+  private shouldKeepChannelStream(channel: WsPushChannel): boolean {
+    return (
+      this.listeners.has(channel) ||
+      (channel === WS_CHANNELS.terminalEvent && this.terminalEventStreamRequired)
+    );
   }
 
   private startLifecycleStream(client: RpcClientInstance): void {

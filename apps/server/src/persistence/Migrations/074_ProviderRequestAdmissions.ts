@@ -1,6 +1,11 @@
 import * as Effect from "effect/Effect";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
+// Migration values are historical data, not runtime configuration. Keep this
+// literal embedded so lineage reconciliation cannot change migration 74 by
+// loading a future admission-service default.
+const LEGACY_LIFECYCLE_GENERATION = "legacy";
+
 /** Durable provider-request admission authority used before requests reach the transcript. */
 export default Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
@@ -56,7 +61,7 @@ export default Effect.gen(function* () {
       ),
       pending.interaction_kind,
       pending.request_id,
-      COALESCE(pending.lifecycle_generation, ''),
+      COALESCE(pending.lifecycle_generation, ${LEGACY_LIFECYCLE_GENERATION}),
       COALESCE(
         session.provider_name,
         json_extract(thread.model_selection_json, '$.provider'),
