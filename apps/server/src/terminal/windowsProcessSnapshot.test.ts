@@ -123,7 +123,7 @@ describe("createWindowsProcessSnapshotCollector", () => {
       signal: controller.signal,
       timeoutMs: WINDOWS_PROCESS_SNAPSHOT_TIMEOUT_MS,
     });
-    expect(WINDOWS_PROCESS_SNAPSHOT_TIMEOUT_MS).toBe(5_000);
+    expect(WINDOWS_PROCESS_SNAPSHOT_TIMEOUT_MS).toBe(10_000);
     expect(WINDOWS_PROCESS_SNAPSHOT_MAX_BUFFER_BYTES).toBe(8 * 1024 * 1024);
   });
 
@@ -460,8 +460,9 @@ it.runIf(process.platform === "win32")(
   async () => {
     const result = await captureWindowsProcessSnapshot();
 
-    expect(result.kind).toBe("ok");
-    if (result.kind !== "ok") return;
+    if (result.kind !== "ok") {
+      throw new Error(`Native Windows process snapshot was unavailable: ${result.reason}.`);
+    }
     const allChildren = [...result.childrenByParentPid.values()].flat();
     expect(result.processCount).toBe(allChildren.length);
     expect(allChildren.some((child) => child.pid === process.pid)).toBe(true);

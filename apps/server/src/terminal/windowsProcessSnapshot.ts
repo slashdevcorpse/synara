@@ -6,7 +6,7 @@ import path from "node:path";
 
 import { runProcess, type ProcessRunOptions, type ProcessRunResult } from "../processRunner";
 
-export const WINDOWS_PROCESS_SNAPSHOT_TIMEOUT_MS = 5_000;
+export const WINDOWS_PROCESS_SNAPSHOT_TIMEOUT_MS = 10_000;
 export const WINDOWS_PROCESS_SNAPSHOT_MAX_BUFFER_BYTES = 8 * 1024 * 1024;
 
 const WINDOWS_PROCESS_SNAPSHOT_VERSION = 1;
