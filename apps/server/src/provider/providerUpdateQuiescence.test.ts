@@ -9,6 +9,10 @@ import {
   quiesceProviderRuntimesForUpdate,
 } from "./providerUpdateQuiescence.ts";
 
+type StopRuntimeSessionInput = Parameters<
+  NonNullable<ProviderServiceShape["stopRuntimeSession"]>
+>[0];
+
 const THREAD_ID = "00000000-0000-4000-8000-000000000001" as ThreadId;
 
 function session(overrides: Partial<ProviderSession> = {}): ProviderSession {
@@ -31,7 +35,7 @@ function providerService(input: {
   return {
     listSessions: () => Effect.succeed(input.sessions),
     hasLiveRuntimeTasks: () => Effect.succeed(input.hasLiveTasks ?? false),
-    stopRuntimeSession: ({ threadId }) =>
+    stopRuntimeSession: ({ threadId }: StopRuntimeSessionInput) =>
       Effect.sync(() => {
         input.onStop?.(threadId);
         const index = input.sessions.findIndex((candidate) => candidate.threadId === threadId);

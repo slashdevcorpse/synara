@@ -201,23 +201,22 @@ const fakeAntigravityAdapter: AntigravityAdapterShape = {
   streamEvents: Stream.empty,
 };
 
+const providerAdapterServices = Layer.mergeAll(
+  Layer.succeed(CodexAdapter, fakeCodexAdapter),
+  Layer.succeed(CommandCodeAdapter, fakeCommandCodeAdapter),
+  Layer.succeed(ClaudeAdapter, fakeClaudeAdapter),
+  Layer.succeed(CursorAdapter, fakeCursorAdapter),
+  Layer.succeed(AntigravityAdapter, fakeAntigravityAdapter),
+  Layer.succeed(GrokAdapter, fakeGrokAdapter),
+  Layer.succeed(DroidAdapter, fakeDroidAdapter),
+  Layer.succeed(KiloAdapter, fakeKiloAdapter),
+  Layer.succeed(OpenCodeAdapter, fakeOpenCodeAdapter),
+  Layer.succeed(PiAdapter, fakePiAdapter),
+);
+
 const layer = it.layer(
   Layer.mergeAll(
-    Layer.provide(
-      ProviderAdapterRegistryLive,
-      Layer.mergeAll(
-        Layer.succeed(CodexAdapter, fakeCodexAdapter),
-        Layer.succeed(CommandCodeAdapter, fakeCommandCodeAdapter),
-        Layer.succeed(ClaudeAdapter, fakeClaudeAdapter),
-        Layer.succeed(CursorAdapter, fakeCursorAdapter),
-        Layer.succeed(AntigravityAdapter, fakeAntigravityAdapter),
-        Layer.succeed(GrokAdapter, fakeGrokAdapter),
-        Layer.succeed(DroidAdapter, fakeDroidAdapter),
-        Layer.succeed(KiloAdapter, fakeKiloAdapter),
-        Layer.succeed(OpenCodeAdapter, fakeOpenCodeAdapter),
-        Layer.succeed(PiAdapter, fakePiAdapter),
-      ),
-    ),
+    ProviderAdapterRegistryLive.pipe(Layer.provide(providerAdapterServices)),
     NodeServices.layer,
   ),
 );
@@ -290,7 +289,7 @@ it.effect("gates direct adapter work while leaving maintenance controls availabl
       const registryLayer = makeProviderAdapterRegistryLive({
         adapters: [adapter],
         maintenanceGate,
-      });
+      }).pipe(Layer.provide(providerAdapterServices));
       const maintenanceStarted = yield* Deferred.make<void>();
       const releaseMaintenance = yield* Deferred.make<void>();
       const maintenance = yield* maintenanceGate

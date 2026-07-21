@@ -158,9 +158,17 @@ function npmVersionResponse(version: string): Response {
   });
 }
 
+function makeFetchMock(
+  implementation: (...args: Parameters<typeof fetch>) => ReturnType<typeof fetch>,
+): typeof fetch {
+  return Object.assign(implementation, {
+    preconnect: (_url: string | URL) => undefined,
+  });
+}
+
 function makeDeferredFetchMock(controlledRequestCount: number) {
   const requests: Array<{ readonly resolve: (response: Response) => void }> = [];
-  const fetchMock = (() => {
+  const fetchMock = makeFetchMock(() => {
     if (requests.length >= controlledRequestCount) {
       requests.push({ resolve: () => undefined });
       return Promise.resolve(npmVersionResponse("99.0.0"));
@@ -168,7 +176,7 @@ function makeDeferredFetchMock(controlledRequestCount: number) {
     return new Promise<Response>((resolve) => {
       requests.push({ resolve });
     });
-  }) as typeof fetch;
+  });
   return { fetchMock, requests };
 }
 

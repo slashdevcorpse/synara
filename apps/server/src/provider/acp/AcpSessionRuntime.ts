@@ -31,6 +31,7 @@ import {
   teardownEffectProcessTree,
   teardownProviderProcessTree,
   superviseEffectProcessTree,
+  type EffectProcessExitHandle,
   type EffectProcessTreeSupervisor,
   type SupervisedProcessTeardownResult,
 } from "../supervisedProcessTeardown.ts";
@@ -281,11 +282,7 @@ interface EnsureActiveAssistantSegmentResult {
   readonly startedEvent?: Extract<AcpParsedSessionEvent, { readonly _tag: "AssistantItemStarted" }>;
 }
 
-interface AcpOwnedChildProcess {
-  readonly pid: number;
-  readonly exitCode: Effect.Effect<unknown, unknown>;
-  readonly isRunning?: Effect.Effect<boolean, unknown> | undefined;
-}
+type AcpOwnedChildProcess = EffectProcessExitHandle;
 
 function superviseWindowsAcpJobProcess(
   child: ChildProcessSpawner.ChildProcessHandle,
@@ -293,7 +290,8 @@ function superviseWindowsAcpJobProcess(
   const ownedChild = child as ChildProcessSpawner.ChildProcessHandle & {
     readonly synaraTerminateExact?: (() => boolean) | undefined;
   };
-  if (typeof ownedChild.synaraTerminateExact !== "function") {
+  const terminateExact = ownedChild.synaraTerminateExact;
+  if (typeof terminateExact !== "function") {
     throw new Error("Windows ACP Job Object wrapper is missing exact-handle termination support.");
   }
 
@@ -337,7 +335,7 @@ function superviseWindowsAcpJobProcess(
           // Use Node's retained native process handle rather than Effect's PID-based taskkill path.
           // Terminating the exact wrapper closes its non-inheritable Job handle, and Windows then
           // terminates every process that inherited the Job before provider code could start.
-          ownedChild.synaraTerminateExact();
+          terminateExact();
         }
         await awaitWrapperExit();
         return { escalated: running, signalErrors: [] };

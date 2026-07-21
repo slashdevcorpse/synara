@@ -676,7 +676,6 @@ function makeProviderMaintenanceForInstallSource(input: {
     });
   }
   if (
-    installSource !== "unknown" &&
     definition.nativeUpdate?.strategy === "always" &&
     !definition.nativeUpdate.excludedInstallSources?.includes(installSource)
   ) {
@@ -1619,7 +1618,9 @@ const resolveVerifiedCandidateMaintenance = Effect.fn("resolveVerifiedCandidateM
         canonicalInstallRoot,
         env: input.env,
         platform: input.platform,
-        preferredManagerExecutablePath: input.preferredManagerExecutablePath,
+        ...(input.preferredManagerExecutablePath !== undefined
+          ? { preferredManagerExecutablePath: input.preferredManagerExecutablePath }
+          : {}),
       },
       fileSystem,
     );
@@ -1727,7 +1728,9 @@ export const resolveProviderMaintenanceCapabilitiesEffect = Effect.fn(
         packageManifestPath,
         env,
         platform,
-        preferredManagerExecutablePath: options?.managerExecutablePath,
+        ...(options?.managerExecutablePath !== undefined
+          ? { preferredManagerExecutablePath: options.managerExecutablePath }
+          : {}),
       },
       fileSystem,
     );

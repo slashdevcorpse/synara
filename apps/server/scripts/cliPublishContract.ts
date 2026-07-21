@@ -72,14 +72,22 @@ function isExternalSupervisionFinalizer(node: ts.Node): boolean {
     node.expression.operatorToken.kind !== ts.SyntaxKind.EqualsEqualsEqualsToken ||
     !expressionHasPath(node.expression.left, ["cmd", "options", "synaraExternallySupervised"]) ||
     node.expression.right.kind !== ts.SyntaxKind.TrueKeyword ||
-    !ts.isReturnStatement(node.thenStatement) ||
-    node.thenStatement.expression === undefined ||
-    !ts.isYieldExpression(node.thenStatement.expression) ||
-    node.thenStatement.expression.asteriskToken === undefined
+    !ts.isReturnStatement(node.thenStatement)
   ) {
     return false;
   }
-  const yieldedPath = expressionPath(node.thenStatement.expression.expression);
+
+  const returnedExpression = node.thenStatement.expression;
+  if (
+    returnedExpression === undefined ||
+    !ts.isYieldExpression(returnedExpression) ||
+    returnedExpression.asteriskToken === undefined ||
+    returnedExpression.expression === undefined
+  ) {
+    return false;
+  }
+
+  const yieldedPath = expressionPath(returnedExpression.expression);
   return yieldedPath?.at(-1) === "void";
 }
 
@@ -132,16 +140,25 @@ function isPatchedHandleReturn(node: ts.Node): boolean {
     !ts.isReturnStatement(node.parent) ||
     !belongsToStandardCommandCase(node) ||
     !expressionHasPath(node.expression, ["Object", "assign"]) ||
-    node.arguments.length !== 2 ||
-    !ts.isIdentifier(node.arguments[0]) ||
-    node.arguments[0].text !== "handle" ||
-    !ts.isObjectLiteralExpression(node.arguments[1])
+    node.arguments.length !== 2
   ) {
     return false;
   }
+
+  const [handleArgument, patchArgument] = node.arguments;
+  if (
+    handleArgument === undefined ||
+    patchArgument === undefined ||
+    !ts.isIdentifier(handleArgument) ||
+    handleArgument.text !== "handle" ||
+    !ts.isObjectLiteralExpression(patchArgument)
+  ) {
+    return false;
+  }
+
   return (
-    node.arguments[1].properties.some(isExactTerminateProperty) &&
-    node.arguments[1].properties.some(isStdinCloseProperty)
+    patchArgument.properties.some(isExactTerminateProperty) &&
+    patchArgument.properties.some(isStdinCloseProperty)
   );
 }
 

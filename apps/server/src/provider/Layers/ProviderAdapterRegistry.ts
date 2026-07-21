@@ -78,7 +78,7 @@ function gateProviderAdapter(
                   this: ProviderAdapterShape<ProviderAdapterError>,
                   ...methodArgs: ReadonlyArray<unknown>
                 ) => Effect.Effect<unknown>
-              ).apply(target, args),
+              ).apply(target, [...args]),
             ),
           })
           .pipe(

@@ -4,7 +4,10 @@ import * as Path from "node:path";
 
 import { describe, expect, it } from "vitest";
 
-import { buildWindowsCreateProcessCommandLine } from "@synara/shared/windowsProcess";
+import {
+  buildWindowsCreateProcessCommandLine,
+  type WindowsSafeProcessCommand,
+} from "@synara/shared/windowsProcess";
 
 import { buildAcpWindowsJobLaunch, ensureAcpWindowsJobExecutable } from "./AcpWindowsJob.ts";
 import { headerOnlyPortableExecutableFixture } from "./AcpWindowsJobTestSupport.ts";
@@ -43,11 +46,7 @@ function validPortableExecutableFixture(): Buffer {
 
 function launchInputAtOuterCommandLength(targetLength: number): {
   readonly helperExecutablePath: string;
-  readonly provider: {
-    readonly command: string;
-    readonly args: ReadonlyArray<string>;
-    readonly shell: false;
-  };
+  readonly provider: WindowsSafeProcessCommand;
 } {
   const providerCommand = "C:\\provider.exe";
   for (let helperPadding = 0; helperPadding < 8; helperPadding += 1) {

@@ -66,6 +66,24 @@ interface ProviderMaintenanceGateState {
 
 type ProviderMaintenanceGateStates = ReadonlyMap<ProviderKind, ProviderMaintenanceGateState>;
 
+type ProviderOperationAcquisition =
+  | { readonly acquired: true; readonly reason: null }
+  | { readonly acquired: false; readonly reason: string | null };
+
+type ProviderMaintenanceAcquisition =
+  | {
+      readonly acquired: true;
+      readonly activeOperations: number;
+      readonly latchedReason: null;
+    }
+  | {
+      readonly acquired: false;
+      readonly activeOperations: 0;
+      readonly latchedReason: string | null;
+    };
+
+type ProviderMaintenanceGateTransition<A> = readonly [A, ProviderMaintenanceGateStates];
+
 /**
  * Creates an isolated, dependency-free gate for coordinating short provider
  * operations with exclusive CLI maintenance.
@@ -74,20 +92,23 @@ export const makeProviderMaintenanceGate = Effect.gen(function* () {
   const statesRef = yield* Ref.make<ProviderMaintenanceGateStates>(new Map());
 
   const acquireOperation = (provider: ProviderKind) =>
-    Ref.modify(statesRef, (states) => {
-      const current = states.get(provider);
-      if (current !== undefined && (current.drain !== null || current.latchedReason !== null)) {
-        return [{ acquired: false as const, reason: current.latchedReason }, states] as const;
-      }
+    Ref.modify(
+      statesRef,
+      (states): ProviderMaintenanceGateTransition<ProviderOperationAcquisition> => {
+        const current = states.get(provider);
+        if (current !== undefined && (current.drain !== null || current.latchedReason !== null)) {
+          return [{ acquired: false as const, reason: current.latchedReason }, states] as const;
+        }
 
-      const next = new Map(states);
-      next.set(provider, {
-        activeOperations: (current?.activeOperations ?? 0) + 1,
-        drain: null,
-        latchedReason: null,
-      });
-      return [{ acquired: true as const, reason: null }, next] as const;
-    });
+        const next = new Map(states);
+        next.set(provider, {
+          activeOperations: (current?.activeOperations ?? 0) + 1,
+          drain: null,
+          latchedReason: null,
+        });
+        return [{ acquired: true as const, reason: null }, next] as const;
+      },
+    );
 
   const releaseOperation = (provider: ProviderKind) =>
     Ref.modify(statesRef, (states) => {
@@ -115,30 +136,33 @@ export const makeProviderMaintenanceGate = Effect.gen(function* () {
     }).pipe(Effect.flatten);
 
   const requestMaintenance = (provider: ProviderKind, drain: Deferred.Deferred<void>) =>
-    Ref.modify(statesRef, (states) => {
-      const current = states.get(provider);
-      if (current?.latchedReason !== null && current?.latchedReason !== undefined) {
-        return [
-          {
-            acquired: false as const,
-            activeOperations: 0,
-            latchedReason: current.latchedReason,
-          },
-          states,
-        ] as const;
-      }
-      if (current !== undefined && current.drain !== null) {
-        return [
-          { acquired: false as const, activeOperations: 0, latchedReason: null },
-          states,
-        ] as const;
-      }
+    Ref.modify(
+      statesRef,
+      (states): ProviderMaintenanceGateTransition<ProviderMaintenanceAcquisition> => {
+        const current = states.get(provider);
+        if (current?.latchedReason !== null && current?.latchedReason !== undefined) {
+          return [
+            {
+              acquired: false as const,
+              activeOperations: 0,
+              latchedReason: current.latchedReason,
+            },
+            states,
+          ] as const;
+        }
+        if (current !== undefined && current.drain !== null) {
+          return [
+            { acquired: false as const, activeOperations: 0, latchedReason: null },
+            states,
+          ] as const;
+        }
 
-      const activeOperations = current?.activeOperations ?? 0;
-      const next = new Map(states);
-      next.set(provider, { activeOperations, drain, latchedReason: null });
-      return [{ acquired: true as const, activeOperations, latchedReason: null }, next] as const;
-    });
+        const activeOperations = current?.activeOperations ?? 0;
+        const next = new Map(states);
+        next.set(provider, { activeOperations, drain, latchedReason: null });
+        return [{ acquired: true as const, activeOperations, latchedReason: null }, next] as const;
+      },
+    );
 
   const releaseMaintenance = (provider: ProviderKind, drain: Deferred.Deferred<void>) =>
     Ref.update(statesRef, (states) => {

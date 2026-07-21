@@ -59,6 +59,14 @@ import { resolvePackageManagedProviderMaintenance } from "../providerMaintenance
 
 const encoder = new TextEncoder();
 
+function makeFetchMock(
+  implementation: (...args: Parameters<typeof fetch>) => ReturnType<typeof fetch>,
+): typeof fetch {
+  return Object.assign(implementation, {
+    preconnect: (_url: string | URL) => undefined,
+  });
+}
+
 function latestPackageChannel(installedVersion: string, metadataPath: string) {
   return {
     kind: "package-dist-tag" as const,
@@ -206,13 +214,14 @@ function withLatestNpmVersion<A, E, R>(
   return Effect.acquireUseRelease(
     Effect.sync(() => {
       const previousFetch = globalThis.fetch;
-      globalThis.fetch = (() =>
+      globalThis.fetch = makeFetchMock(() =>
         Promise.resolve(
           new Response(JSON.stringify({ version }), {
             status: 200,
             headers: { "content-type": "application/json" },
           }),
-        )) as typeof fetch;
+        ),
+      );
       return previousFetch;
     }),
     () => use,
@@ -895,13 +904,14 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
         Effect.acquireUseRelease(
           Effect.sync(() => {
             const previousFetch = globalThis.fetch;
-            globalThis.fetch = (() =>
+            globalThis.fetch = makeFetchMock(() =>
               Promise.resolve(
                 new Response(JSON.stringify({ version: "7.4.10" }), {
                   status: 200,
                   headers: { "content-type": "application/json" },
                 }),
-              )) as typeof fetch;
+              ),
+            );
             return previousFetch;
           }),
           () =>
@@ -1082,7 +1092,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
           const previousFetch = yield* Effect.acquireRelease(
             Effect.sync(() => {
               const previous = globalThis.fetch;
-              globalThis.fetch = (() =>
+              globalThis.fetch = makeFetchMock(() =>
                 Effect.runPromise(
                   Deferred.succeed(fetchStarted, undefined).pipe(
                     Effect.andThen(Deferred.await(releaseFetch)),
@@ -1093,7 +1103,8 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
                       }),
                     ),
                   ),
-                )) as typeof fetch;
+                ),
+              );
               return previous;
             }),
             (previous) =>
@@ -1155,7 +1166,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
             yield* Effect.acquireRelease(
               Effect.sync(() => {
                 const previous = globalThis.fetch;
-                globalThis.fetch = (() => {
+                globalThis.fetch = makeFetchMock(() => {
                   fetchCount += 1;
                   const response = new Response(JSON.stringify({ version: "7.4.11" }), {
                     status: 200,
@@ -1169,7 +1180,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
                           Effect.as(response),
                         ),
                       );
-                }) as typeof fetch;
+                });
                 return previous;
               }),
               (previous) =>
@@ -1327,7 +1338,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
           yield* Effect.acquireRelease(
             Effect.sync(() => {
               const previous = globalThis.fetch;
-              globalThis.fetch = (() => {
+              globalThis.fetch = makeFetchMock(() => {
                 fetchCount += 1;
                 const response = new Response(JSON.stringify({ version: "7.4.11" }), {
                   status: 200,
@@ -1341,7 +1352,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
                       ),
                     )
                   : Promise.resolve(response);
-              }) as typeof fetch;
+              });
               return previous;
             }),
             (previous) =>
@@ -1435,13 +1446,14 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
         Effect.acquireUseRelease(
           Effect.sync(() => {
             const previousFetch = globalThis.fetch;
-            globalThis.fetch = (() =>
+            globalThis.fetch = makeFetchMock(() =>
               Promise.resolve(
                 new Response(JSON.stringify({ version: "7.4.11" }), {
                   status: 200,
                   headers: { "content-type": "application/json" },
                 }),
-              )) as typeof fetch;
+              ),
+            );
             return previousFetch;
           }),
           () =>

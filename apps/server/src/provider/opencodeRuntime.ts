@@ -1240,6 +1240,24 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
     const closePooledServer = (pooledServer: PooledOpenCodeServer) =>
       closePooledServerEffect(pooledServer).pipe(Effect.uninterruptible);
 
+    const reportPooledServerCloseFailure = (
+      phase: "connection-release" | "idle-timeout" | "process-exit" | "runtime-shutdown",
+      error: OpenCodeRuntimeError,
+    ) =>
+      Effect.logError("OpenCode pooled server cleanup failed", {
+        phase,
+        operation: error.operation,
+        reason: error.detail,
+      });
+
+    const closePooledServerTotal = (
+      pooledServer: PooledOpenCodeServer,
+      phase: "idle-timeout" | "process-exit" | "runtime-shutdown",
+    ) =>
+      closePooledServer(pooledServer).pipe(
+        Effect.catch((error) => reportPooledServerCloseFailure(phase, error)),
+      );
+
     const schedulePooledServerIdleClose = Effect.fn("schedulePooledServerIdleClose")(function* (
       pooledServer: PooledOpenCodeServer,
     ) {
@@ -1255,7 +1273,7 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
                 return;
               }
               pooledServer.idleCloseFiber = null;
-              yield* closePooledServer(pooledServer);
+              yield* closePooledServerTotal(pooledServer, "idle-timeout");
             }),
           ),
         ),
@@ -1279,11 +1297,10 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
                 return;
               }
               pooledServer.exitWatchFiber = null;
-              yield* closePooledServer(pooledServer);
+              yield* closePooledServerTotal(pooledServer, "process-exit");
             }),
           ),
         ),
-        Effect.ignore,
         Effect.forkIn(pooledServerScope),
       );
       pooledServer.exitWatchFiber = exitWatchFiber;
@@ -1428,7 +1445,7 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
       pooledServerMutex.withPermit(
         Effect.gen(function* () {
           for (const pooledServer of Array.from(pooledServers.values())) {
-            yield* closePooledServer(pooledServer);
+            yield* closePooledServerTotal(pooledServer, "runtime-shutdown");
           }
         }),
       ),
@@ -1467,7 +1484,12 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
             detail: `${(input.cliSpec ?? OPENCODE_CLI_SPEC).displayName} local server is unavailable because startup cleanup remains incomplete.`,
           });
         }
-        yield* Scope.addFinalizer(callerScope, releasePooledServer(pooledServer));
+        yield* Scope.addFinalizer(
+          callerScope,
+          releasePooledServer(pooledServer).pipe(
+            Effect.catch((error) => reportPooledServerCloseFailure("connection-release", error)),
+          ),
+        );
         return {
           url: server.url,
           exitCode: server.exitCode,
