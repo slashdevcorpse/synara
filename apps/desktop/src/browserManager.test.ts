@@ -118,7 +118,7 @@ class FakeWebContents extends EventEmitter {
     goForward: vi.fn(),
   };
   readonly stop = vi.fn();
-  readonly loadURL = vi.fn(async () => undefined);
+  readonly loadURL = vi.fn(async (): Promise<void> => undefined);
   readonly openDevTools = vi.fn();
   readonly setUserAgent = vi.fn();
   windowOpenHandler: ((details: FakeWindowOpenDetails) => FakeWindowOpenResult) | null = null;
