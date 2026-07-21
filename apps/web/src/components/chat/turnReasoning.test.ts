@@ -557,7 +557,7 @@ describe("buildTurnReasoningSummaryByAssistantMessageId", () => {
         kind: string,
         offsetMs: number,
         sequence: number,
-        payload: Record<string, unknown>,
+        payload: OrchestrationThreadActivity["payload"],
       ): OrchestrationThreadActivity => ({
         ...activity({
           id,
