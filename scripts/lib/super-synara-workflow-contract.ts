@@ -24,6 +24,10 @@ const PRERELEASE_MACOS_REQUIRED_COMMANDS = [
 ] as const;
 const WINDOWS_RELEASE_SCOPE = "windows-only";
 const MACOS_RELEASE_SCOPE = "windows-and-macos";
+const PREFLIGHT_ROUTE_TREE_SETUP_COMMAND = [
+  "set -euo pipefail",
+  `printf 'SYNARA_GENERATED_ROUTE_TREE=%s\\n' "$RUNNER_TEMP/super-synara-preflight-route-tree/routeTree.gen.ts" >> "$GITHUB_ENV"`,
+].join("\n");
 const MACOS_JOB_CONDITION = "${{ needs.preflight.outputs.include_macos == 'true' }}";
 const PUBLISH_JOB_CONDITION =
   "${{ always() && needs.preflight.result == 'success' && needs.reserve_tag.result == 'success' && needs.windows_x64.result == 'success' && ((needs.preflight.outputs.include_macos == 'true' && needs.macos_arm64.result == 'success') || (needs.preflight.outputs.include_macos == 'false' && needs.macos_arm64.result == 'skipped')) }}";
@@ -286,6 +290,70 @@ function verifyPreflightSourceCleanliness(jobs: UnknownRecord): void {
   }
 }
 
+function verifyPreflightRouteTreeIsolation(preflightJob: UnknownRecord): void {
+  const environment = preflightJob.env;
+  if (
+    isRecord(environment) &&
+    Object.keys(environment).some((key) => key.toUpperCase() === "SYNARA_GENERATED_ROUTE_TREE")
+  ) {
+    throw new Error(
+      "Publication workflow preflight must set the isolated route-tree path at runner execution time.",
+    );
+  }
+  const steps = preflightJob.steps as ReadonlyArray<unknown>;
+  const setupSteps = steps
+    .map((step, index) => ({ index, step }))
+    .filter(({ step }) => isRecord(step) && step.name === "Isolate generated route tree");
+  if (setupSteps.length !== 1) {
+    throw new Error(
+      "Publication workflow preflight must redirect route generation outside tracked source.",
+    );
+  }
+  const [setupEntry] = setupSteps;
+  const setupStep = setupEntry!.step;
+  if (
+    !isRecord(setupStep) ||
+    setupStep.shell !== "bash" ||
+    typeof setupStep.run !== "string" ||
+    normalizeShellCommand(setupStep.run) !==
+      normalizeShellCommand(PREFLIGHT_ROUTE_TREE_SETUP_COMMAND) ||
+    setupStep.if !== undefined ||
+    (setupStep["continue-on-error"] !== undefined && setupStep["continue-on-error"] !== false)
+  ) {
+    throw new Error(
+      "Publication workflow preflight must redirect route generation outside tracked source.",
+    );
+  }
+  const installIndex = steps.findIndex(
+    (step) => isRecord(step) && step.run === "bun install --frozen-lockfile",
+  );
+  if (installIndex < 0 || setupEntry!.index >= installIndex) {
+    throw new Error(
+      "Publication workflow preflight must establish route-tree isolation before dependency install.",
+    );
+  }
+  for (const [index, step] of steps.entries()) {
+    if (!isRecord(step)) continue;
+    if (
+      isRecord(step.env) &&
+      Object.keys(step.env).some((key) => key.toUpperCase() === "SYNARA_GENERATED_ROUTE_TREE")
+    ) {
+      throw new Error(
+        "Publication workflow preflight steps must not override the isolated route-tree path.",
+      );
+    }
+    if (
+      index !== setupEntry!.index &&
+      typeof step.run === "string" &&
+      step.run.includes("SYNARA_GENERATED_ROUTE_TREE")
+    ) {
+      throw new Error(
+        "Publication workflow preflight steps must not override the isolated route-tree path.",
+      );
+    }
+  }
+}
+
 function verifyNativeJobCommands(
   job: UnknownRecord,
   jobName: string,
@@ -427,6 +495,7 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
   verifyRootTestOwnership(jobs);
   verifyPreflightSourceCleanliness(jobs);
   const preflightJob = publicationJob(jobs, "preflight");
+  verifyPreflightRouteTreeIsolation(preflightJob);
   if (preflightJob["runs-on"] !== "ubuntu-24.04") {
     throw new Error("Publication workflow preflight must run on ubuntu-24.04.");
   }

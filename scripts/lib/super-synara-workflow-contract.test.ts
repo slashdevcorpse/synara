@@ -129,6 +129,36 @@ describe("Super Synara workflow contracts", () => {
     );
   });
 
+  it("requires preflight route generation outside tracked source", () => {
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          '\n      - name: Isolate generated route tree\n        shell: bash\n        run: |\n          set -euo pipefail\n          printf \'SYNARA_GENERATED_ROUTE_TREE=%s\\n\' "$RUNNER_TEMP/super-synara-preflight-route-tree/routeTree.gen.ts" >> "$GITHUB_ENV"\n',
+          "",
+        ),
+        audit,
+      ),
+    ).toThrow("preflight must redirect route generation outside tracked source");
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          "$RUNNER_TEMP/super-synara-preflight-route-tree/routeTree.gen.ts",
+          "apps/web/src/routeTree.gen.ts",
+        ),
+        audit,
+      ),
+    ).toThrow("preflight must redirect route generation outside tracked source");
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          "      - name: Run stable browser tests\n        run: bun run --cwd apps/web test:browser:stable",
+          "      - name: Run stable browser tests\n        env:\n          SYNARA_GENERATED_ROUTE_TREE: apps/web/src/routeTree.gen.ts\n        run: bun run --cwd apps/web test:browser:stable",
+        ),
+        audit,
+      ),
+    ).toThrow("preflight steps must not override the isolated route-tree path");
+  });
+
   it("requires exact native prerelease gates and rejects broad native suites", () => {
     expect(() =>
       verifySuperSynaraWorkflowText(
