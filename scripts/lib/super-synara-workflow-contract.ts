@@ -241,6 +241,51 @@ function verifyRootTestOwnership(jobs: UnknownRecord): void {
   }
 }
 
+function verifyPreflightSourceCleanliness(jobs: UnknownRecord): void {
+  const preflightJob = publicationJob(jobs, "preflight");
+  const preflightSteps = preflightJob.steps;
+  if (!Array.isArray(preflightSteps)) {
+    throw new Error("Publication workflow must define the preflight job with steps.");
+  }
+  const steps = nativeJobRunSteps(jobs, "preflight");
+  const installSteps = steps.filter((step) => step.command === "bun install --frozen-lockfile");
+  const releaseSmokeSteps = steps.filter((step) => step.command === "bun run release:smoke");
+  const cleanlinessSteps = steps.filter(
+    (step) => step.command === "node scripts/verify-release-worktree-clean.ts",
+  );
+  if (
+    installSteps.length !== 1 ||
+    releaseSmokeSteps.length !== 1 ||
+    cleanlinessSteps.length !== 2
+  ) {
+    throw new Error(
+      "Publication workflow preflight must verify source cleanliness after install and after all preflight execution.",
+    );
+  }
+  const [installStep] = installSteps;
+  const [releaseSmokeStep] = releaseSmokeSteps;
+  const [afterInstall, afterExecution] = cleanlinessSteps;
+  if (
+    !installStep ||
+    !releaseSmokeStep ||
+    !afterInstall ||
+    !afterExecution ||
+    afterInstall.index <= installStep.index ||
+    afterInstall.index >= releaseSmokeStep.index ||
+    afterExecution.index <= releaseSmokeStep.index ||
+    afterExecution.index !== preflightSteps.length - 1 ||
+    cleanlinessSteps.some(
+      (step) =>
+        step.condition !== undefined ||
+        (step.continueOnError !== undefined && step.continueOnError !== false),
+    )
+  ) {
+    throw new Error(
+      "Publication workflow preflight source-cleanliness checks must be ordered and fail closed.",
+    );
+  }
+}
+
 function verifyNativeJobCommands(
   job: UnknownRecord,
   jobName: string,
@@ -380,6 +425,7 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
     throw new Error("Publication release-scope contract must default to exact Windows x64.");
   }
   verifyRootTestOwnership(jobs);
+  verifyPreflightSourceCleanliness(jobs);
   const preflightJob = publicationJob(jobs, "preflight");
   if (preflightJob["runs-on"] !== "ubuntu-24.04") {
     throw new Error("Publication workflow preflight must run on ubuntu-24.04.");
@@ -612,7 +658,7 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
   prohibitText(main, "--desktop-flavor", "Publication must not use the superseded flavor flag.");
   const mainCleanlinessChecks =
     main.match(/node scripts\/verify-release-worktree-clean\.ts/g)?.length ?? 0;
-  if (mainCleanlinessChecks < 7) {
+  if (mainCleanlinessChecks < 8) {
     throw new Error(
       "Publication must prove source cleanliness after installs, builds, and staging.",
     );

@@ -202,6 +202,9 @@ jobs:
       - name: Run release contract smoke tests
         run: bun run release:smoke
 
+      - name: Verify preflight preserved source
+        run: node scripts/verify-release-worktree-clean.ts
+
   reserve_tag:
     name: Reserve immutable downstream tag
     needs: preflight
