@@ -986,8 +986,7 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
 
 const RELEASE_DRAFTER_ACTION =
   "release-drafter/release-drafter@eada3c96a64734dd381cfbda23511034e328ddb0";
-const RELEASE_DRAFTER_SETUP_NODE_ACTION =
-  "actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38";
+const SETUP_NODE_ACTION = "actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38";
 const RELEASE_DRAFTER_GATE_CONDITION = "steps.changes.outputs.should_release == 'true'";
 const RELEASE_DRAFTER_DISPATCH_CONDITION =
   "${{ github.event_name != 'push' && needs.draft.outputs.should_release == 'true' }}";
@@ -1061,17 +1060,23 @@ export function verifySuperSynaraReleaseDrafterText(
   const checkoutIndex = draftSteps.findIndex(
     (step) => isRecord(step) && step.name === "Checkout exact main source",
   );
-  const setupNodeIndex = draftSteps.findIndex(
-    (step) => isRecord(step) && step.name === "Setup Node",
+  const setupNodeIndexes = draftSteps.flatMap((step, index) =>
+    isRecord(step) && typeof step.uses === "string" && /^actions\/setup-node@/i.test(step.uses)
+      ? [index]
+      : [],
   );
+  const setupNodeIndex = setupNodeIndexes[0] ?? -1;
   const plannerIndex = draftSteps.findIndex((step) => isRecord(step) && step.id === "plan");
   const setupNodeStep = draftSteps[setupNodeIndex];
   if (
+    setupNodeIndexes.length !== 1 ||
     checkoutIndex < 0 ||
     setupNodeIndex <= checkoutIndex ||
     plannerIndex <= setupNodeIndex ||
     !isRecord(setupNodeStep) ||
-    setupNodeStep.uses !== RELEASE_DRAFTER_SETUP_NODE_ACTION ||
+    "if" in setupNodeStep ||
+    setupNodeStep.name !== "Set up Node.js" ||
+    setupNodeStep.uses !== SETUP_NODE_ACTION ||
     !isRecord(setupNodeStep.with) ||
     setupNodeStep.with["node-version-file"] !== "package.json"
   ) {

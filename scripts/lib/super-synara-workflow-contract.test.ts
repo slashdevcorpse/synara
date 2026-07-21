@@ -247,37 +247,56 @@ describe("Super Synara workflow contracts", () => {
     ).toThrow("super-v$RESOLVED_VERSION");
   });
 
-  it("pins the repository Node runtime before release planning", () => {
+  it("pins exactly one unconditional repository Node runtime between checkout and planning", () => {
     const setupNode = [
-      "      - name: Setup Node",
+      "      - name: Set up Node.js",
       "        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6",
       "        with:",
       "          node-version-file: package.json",
       "",
     ].join("\n");
-    expect(() =>
-      verifySuperSynaraReleaseDrafterText(
-        releaseDrafter.replace(setupNode, ""),
-        releaseDrafterConfig,
+
+    const expectInvalidRuntime = (scheduler: string): void => {
+      expect(() => verifySuperSynaraReleaseDrafterText(scheduler, releaseDrafterConfig)).toThrow(
+        "pin the repository Node runtime between checkout and planning",
+      );
+    };
+
+    expectInvalidRuntime(releaseDrafter.replace(setupNode, ""));
+    expectInvalidRuntime(
+      releaseDrafter.replace("node-version-file: package.json", "node-version: 22"),
+    );
+    expectInvalidRuntime(
+      releaseDrafter.replace(
+        "actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38",
+        "actions/setup-node@0000000000000000000000000000000000000000",
       ),
-    ).toThrow("pin the repository Node runtime between checkout and planning");
-    expect(() =>
-      verifySuperSynaraReleaseDrafterText(
-        releaseDrafter.replace("node-version-file: package.json", "node-version: 22"),
-        releaseDrafterConfig,
+    );
+    expectInvalidRuntime(
+      releaseDrafter
+        .replace(setupNode, "")
+        .replace(
+          "      - name: Checkout exact main source",
+          `${setupNode}      - name: Checkout exact main source`,
+        ),
+    );
+    expectInvalidRuntime(
+      releaseDrafter.replace(
+        "      - id: plan",
+        `${setupNode.replace("actions/setup-node@", "Actions/setup-node@")}      - id: plan`,
       ),
-    ).toThrow("pin the repository Node runtime between checkout and planning");
-    expect(() =>
-      verifySuperSynaraReleaseDrafterText(
-        releaseDrafter
-          .replace(setupNode, "")
-          .replace(
-            "      - name: Checkout exact main source",
-            `${setupNode}      - name: Checkout exact main source`,
-          ),
-        releaseDrafterConfig,
+    );
+    expectInvalidRuntime(
+      releaseDrafter.replace(
+        "      - name: Set up Node.js\n",
+        "      - name: Set up Node.js\n        if: false\n",
       ),
-    ).toThrow("pin the repository Node runtime between checkout and planning");
+    );
+    expectInvalidRuntime(
+      releaseDrafter
+        .replace(setupNode, "")
+        .replace("      - id: changes", `${setupNode}      - id: changes`),
+    );
   });
 
   it("rejects removal of the reviewed allowlist gate", () => {
