@@ -133,7 +133,7 @@ const ciRootTestStep = [
   "        if: matrix.platform == 'linux'",
   "        timeout-minutes: 30",
   "        env:",
-  '          TURBO_CONCURRENCY: "50%"',
+  "          TURBO_CONCURRENCY: ${{ matrix.turbo_concurrency }}",
   "        run: bun run test:ci",
 ].join("\n");
 const nonLinuxUnitTestStep = [
@@ -141,7 +141,7 @@ const nonLinuxUnitTestStep = [
   "        if: matrix.platform != 'linux'",
   "        timeout-minutes: 30",
   "        env:",
-  '          TURBO_CONCURRENCY: "50%"',
+  "          TURBO_CONCURRENCY: ${{ matrix.turbo_concurrency }}",
   "        run: bun turbo test",
 ].join("\n");
 const codecovCoverageUploadStep = [
@@ -426,8 +426,8 @@ describe("workflow contracts", () => {
     expect(
       errorsFor(
         ciWorkflow.replace(
-          "runner: windows-2022\n          - platform: macos",
-          "runner: ubuntu-24.04\n          - platform: macos",
+          'runner: windows-2022\n            turbo_concurrency: "1"\n          - platform: macos',
+          'runner: ubuntu-24.04\n            turbo_concurrency: "1"\n          - platform: macos',
         ),
       ),
     ).toContain("unit matrix entry 2 has drifted");
@@ -530,7 +530,7 @@ describe("workflow contracts", () => {
     expect(misplacedSetup).toContain("unit Windows launcher setup must run before bun turbo test");
   });
 
-  it("bounds Turbo concurrency for both matrix test commands", () => {
+  it("bounds Turbo concurrency per platform for both matrix test commands", () => {
     for (const [step, command] of [
       [ciRootTestStep, "bun run test:ci"],
       [nonLinuxUnitTestStep, "bun turbo test"],
@@ -538,19 +538,37 @@ describe("workflow contracts", () => {
       const missing = errorsFor(
         ciWorkflow.replace(
           step,
-          step.replace('        env:\n          TURBO_CONCURRENCY: "50%"\n', ""),
+          step.replace(
+            "        env:\n          TURBO_CONCURRENCY: ${{ matrix.turbo_concurrency }}\n",
+            "",
+          ),
         ),
       );
-      expect(missing).toContain(`unit ${command} must set TURBO_CONCURRENCY to 50%`);
+      expect(missing).toContain(
+        `unit ${command} must set TURBO_CONCURRENCY to \${{ matrix.turbo_concurrency }}`,
+      );
 
-      const unbounded = errorsFor(
+      const detachedFromMatrix = errorsFor(
         ciWorkflow.replace(
           step,
-          step.replace('          TURBO_CONCURRENCY: "50%"', '          TURBO_CONCURRENCY: "100%"'),
+          step.replace(
+            "          TURBO_CONCURRENCY: ${{ matrix.turbo_concurrency }}",
+            '          TURBO_CONCURRENCY: "100%"',
+          ),
         ),
       );
-      expect(unbounded).toContain(`unit ${command} must set TURBO_CONCURRENCY to 50%`);
+      expect(detachedFromMatrix).toContain(
+        `unit ${command} must set TURBO_CONCURRENCY to \${{ matrix.turbo_concurrency }}`,
+      );
     }
+
+    const concurrentWindows = errorsFor(
+      ciWorkflow.replace(
+        '            runner: windows-2022\n            turbo_concurrency: "1"',
+        '            runner: windows-2022\n            turbo_concurrency: "50%"',
+      ),
+    );
+    expect(concurrentWindows).toContain("unit matrix entry 2 has drifted");
   });
 
   it("retains unit-matrix timeout headroom", () => {

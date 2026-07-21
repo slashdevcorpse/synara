@@ -52,7 +52,7 @@ const WINDOWS_JOB_LAUNCHER_ARM64_COMMAND =
 const WINDOWS_JOB_CONTAINMENT_TEST_COMMAND =
   "bun run --cwd apps/server test src/provider/windowsProviderProcess.test.ts src/provider/windowsProviderProcess.windows.test.ts";
 const UNIT_WINDOWS_SETUP_CONDITION = "matrix.platform == 'windows'";
-const UNIT_TURBO_CONCURRENCY = "50%";
+const UNIT_TURBO_CONCURRENCY_EXPRESSION = "${{ matrix.turbo_concurrency }}";
 const CI_QUALITY_REQUIRED_COMMANDS = [
   "node scripts/validate-downstream-state.ts",
   "node scripts/verify-workflow-contracts.ts",
@@ -118,9 +118,9 @@ const CI_DESKTOP_PERSISTENCE_SMOKE_HOMES = {
 } as const;
 type CiNativeJobName = keyof typeof CI_DESKTOP_PERSISTENCE_SMOKE_HOMES;
 const UNIT_MATRIX = [
-  { platform: "linux", runner: "ubuntu-24.04" },
-  { platform: "windows", runner: "windows-2022" },
-  { platform: "macos", runner: "macos-15" },
+  { platform: "linux", runner: "ubuntu-24.04", turbo_concurrency: "50%" },
+  { platform: "windows", runner: "windows-2022", turbo_concurrency: "1" },
+  { platform: "macos", runner: "macos-15", turbo_concurrency: "50%" },
 ] as const;
 const UNIT_JOB_TIMEOUT_MINUTES = 40;
 const UNIT_STEP_TIMEOUT_MINUTES = 30;
@@ -395,9 +395,11 @@ function validateUnitTestConcurrency(
   step: WorkflowRunStep,
   errors: string[],
 ): void {
-  if (workflowStepEnvironmentValue(step, "TURBO_CONCURRENCY") !== UNIT_TURBO_CONCURRENCY) {
+  if (
+    workflowStepEnvironmentValue(step, "TURBO_CONCURRENCY") !== UNIT_TURBO_CONCURRENCY_EXPRESSION
+  ) {
     errors.push(
-      `${workflowPath} unit ${step.command} must set TURBO_CONCURRENCY to ${UNIT_TURBO_CONCURRENCY}.`,
+      `${workflowPath} unit ${step.command} must set TURBO_CONCURRENCY to ${UNIT_TURBO_CONCURRENCY_EXPRESSION}.`,
     );
   }
 }

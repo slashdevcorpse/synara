@@ -130,10 +130,13 @@ jobs:
         include:
           - platform: linux
             runner: ubuntu-24.04
+            turbo_concurrency: "50%"
           - platform: windows
             runner: windows-2022
+            turbo_concurrency: "1"
           - platform: macos
             runner: macos-15
+            turbo_concurrency: "50%"
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -173,14 +176,14 @@ jobs:
         if: matrix.platform == 'linux'
         timeout-minutes: 30
         env:
-          TURBO_CONCURRENCY: "50%"
+          TURBO_CONCURRENCY: ${{ matrix.turbo_concurrency }}
         run: bun run test:ci
 
       - name: Run cross-platform unit suite
         if: matrix.platform != 'linux'
         timeout-minutes: 30
         env:
-          TURBO_CONCURRENCY: "50%"
+          TURBO_CONCURRENCY: ${{ matrix.turbo_concurrency }}
         run: bun turbo test
 
       - name: Upload test results to Mergify CI Insights
