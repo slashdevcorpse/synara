@@ -44,12 +44,11 @@ function isRetryableGhFailure(output: string): boolean {
 
 export class GhCliRequestError extends Error {
   override readonly name = "GhCliRequestError";
+  readonly retryable: boolean;
 
-  constructor(
-    message: string,
-    readonly retryable: boolean,
-  ) {
+  constructor(message: string, retryable: boolean) {
     super(message);
+    this.retryable = retryable;
   }
 }
 

@@ -224,6 +224,18 @@ describe("Super Synara workflow contracts", () => {
     ).toThrow("super-v$RESOLVED_VERSION");
   });
 
+  it("pins the repository Node runtime before executing release planners", () => {
+    expect(() =>
+      verifySuperSynaraReleaseDrafterText(
+        releaseDrafter.replace(
+          "          node-version-file: package.json",
+          "          node-version: 22",
+        ),
+        releaseDrafterConfig,
+      ),
+    ).toThrow("pin the repository Node runtime");
+  });
+
   it("rejects removal of the reviewed allowlist gate", () => {
     expect(() =>
       verifySuperSynaraWorkflowText(
