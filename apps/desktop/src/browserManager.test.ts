@@ -323,11 +323,10 @@ describe("DesktopBrowserManager local-preview lifecycle", () => {
     ).toEqual({ action: "deny" });
     for (const eventName of ["will-navigate", "will-redirect"]) {
       const preventNavigation = vi.fn();
-      tabContents.emit(
-        eventName,
-        { preventDefault: preventNavigation },
-        "https://attacker.example/pre-adoption",
-      );
+      tabContents.emit(eventName, {
+        url: "https://attacker.example/pre-adoption",
+        preventDefault: preventNavigation,
+      });
       expect(preventNavigation).toHaveBeenCalledOnce();
     }
     access.configureRuntimeWebContents({
@@ -349,11 +348,10 @@ describe("DesktopBrowserManager local-preview lifecycle", () => {
     expect(tabContents.listenerCount("will-redirect")).toBe(1);
 
     const preventManagedNavigation = vi.fn();
-    tabContents.emit(
-      "will-navigate",
-      { preventDefault: preventManagedNavigation },
-      "https://managed.example/after-adoption",
-    );
+    tabContents.emit("will-navigate", {
+      url: "https://managed.example/after-adoption",
+      preventDefault: preventManagedNavigation,
+    });
     expect(preventManagedNavigation).not.toHaveBeenCalled();
     access.configureOAuthPopupRuntime({
       threadId: THREAD_ID,
@@ -412,14 +410,10 @@ describe("DesktopBrowserManager local-preview lifecycle", () => {
     }
 
     const preventNavigation = vi.fn();
-    tabContents.emit(
-      "will-navigate",
-      {
-        url: "file:///sensitive",
-        preventDefault: preventNavigation,
-      },
-      "file:///sensitive",
-    );
+    tabContents.emit("will-navigate", {
+      url: "file:///sensitive",
+      preventDefault: preventNavigation,
+    });
     expect(preventNavigation).toHaveBeenCalledOnce();
   });
 
@@ -450,24 +444,16 @@ describe("DesktopBrowserManager local-preview lifecycle", () => {
     expect(popup.setMenuBarVisibility).toHaveBeenCalledWith(false);
     expect(nested.setMenuBarVisibility).toHaveBeenCalledWith(false);
     const preventBoundNavigation = vi.fn();
-    nested.webContents.emit(
-      "will-navigate",
-      {
-        url: "https://accounts.example.test/oauth/consent",
-        preventDefault: preventBoundNavigation,
-      },
-      "https://accounts.example.test/oauth/consent",
-    );
+    nested.webContents.emit("will-navigate", {
+      url: "https://accounts.example.test/oauth/consent",
+      preventDefault: preventBoundNavigation,
+    });
     expect(preventBoundNavigation).not.toHaveBeenCalled();
     const preventUnboundNavigation = vi.fn();
-    nested.webContents.emit(
-      "will-navigate",
-      {
-        url: "https://attacker.example/phish",
-        preventDefault: preventUnboundNavigation,
-      },
-      "https://attacker.example/phish",
-    );
+    nested.webContents.emit("will-navigate", {
+      url: "https://attacker.example/phish",
+      preventDefault: preventUnboundNavigation,
+    });
     expect(preventUnboundNavigation).toHaveBeenCalledOnce();
     expect(nested.isDestroyed()).toBe(true);
   });
@@ -793,14 +779,14 @@ describe("DesktopBrowserManager local-preview lifecycle", () => {
     managerInternals(manager).configureRuntimeWebContents(runtime);
 
     managerInternals(manager).prepareLocalPreviewRuntimeGuard(runtime, tab);
-    const blockedBeforeGuard = { preventDefault: vi.fn() };
-    webContents.emit("will-navigate", blockedBeforeGuard, FIRST_PREVIEW_URL);
+    const blockedBeforeGuard = { url: FIRST_PREVIEW_URL, preventDefault: vi.fn() };
+    webContents.emit("will-navigate", blockedBeforeGuard);
     expect(blockedBeforeGuard.preventDefault).toHaveBeenCalledOnce();
     expect(runtime.localPreviewGuardInstalled).toBe(false);
     await runtime.localPreviewGuardReady;
 
-    const allowedAfterGuard = { preventDefault: vi.fn() };
-    webContents.emit("will-navigate", allowedAfterGuard, FIRST_PREVIEW_URL);
+    const allowedAfterGuard = { url: FIRST_PREVIEW_URL, preventDefault: vi.fn() };
+    webContents.emit("will-navigate", allowedAfterGuard);
     expect(allowedAfterGuard.preventDefault).not.toHaveBeenCalled();
     expect(runtime.localPreviewGuardInstalled).toBe(true);
 
@@ -929,17 +915,29 @@ describe("DesktopBrowserManager local-preview lifecycle", () => {
       recover,
       listenerDisposers,
     );
-    const willNavigateEvent = { preventDefault: vi.fn() };
-    const willRedirectEvent = { preventDefault: vi.fn() };
+    const allowedWillNavigateEvent = { url: FIRST_PREVIEW_URL, preventDefault: vi.fn() };
+    const allowedWillRedirectEvent = { url: FIRST_PREVIEW_URL, preventDefault: vi.fn() };
+    const blockedWillNavigateEvent = {
+      url: "https://example.com/outside",
+      preventDefault: vi.fn(),
+    };
+    const blockedWillRedirectEvent = {
+      url: "file:///C:/outside.html",
+      preventDefault: vi.fn(),
+    };
 
-    webContents.emit("will-navigate", willNavigateEvent, "https://example.com/outside");
-    webContents.emit("will-redirect", willRedirectEvent, "file:///C:/outside.html");
+    webContents.emit("will-navigate", allowedWillNavigateEvent);
+    webContents.emit("will-redirect", allowedWillRedirectEvent);
+    webContents.emit("will-navigate", blockedWillNavigateEvent);
+    webContents.emit("will-redirect", blockedWillRedirectEvent);
     webContents.emit("did-navigate", {}, "https://example.com/outside");
     webContents.emit("did-navigate-in-page", {}, "https://example.com/outside#hash", true);
     webContents.emit("did-navigate-in-page", {}, "https://example.com/frame", false);
 
-    expect(willNavigateEvent.preventDefault).toHaveBeenCalledOnce();
-    expect(willRedirectEvent.preventDefault).toHaveBeenCalledOnce();
+    expect(allowedWillNavigateEvent.preventDefault).not.toHaveBeenCalled();
+    expect(allowedWillRedirectEvent.preventDefault).not.toHaveBeenCalled();
+    expect(blockedWillNavigateEvent.preventDefault).toHaveBeenCalledOnce();
+    expect(blockedWillRedirectEvent.preventDefault).toHaveBeenCalledOnce();
     expect(recover).toHaveBeenCalledTimes(2);
     listenerDisposers[0]?.();
     expect(webContents.listenerCount("will-navigate")).toBe(0);

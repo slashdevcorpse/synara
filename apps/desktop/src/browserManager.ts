@@ -467,8 +467,12 @@ export class DesktopBrowserManager {
     onDisallowedNavigation: () => void,
     listenerDisposers: Array<() => void>,
   ): void {
-    const preventDisallowedNavigation = (event: Electron.Event, url: string) => {
-      if (!isAllowed(url)) {
+    const preventDisallowedNavigation = (
+      event:
+        | Electron.Event<Electron.WebContentsWillNavigateEventParams>
+        | Electron.Event<Electron.WebContentsWillRedirectEventParams>,
+    ) => {
+      if (!isAllowed(event.url)) {
         event.preventDefault();
       }
     };

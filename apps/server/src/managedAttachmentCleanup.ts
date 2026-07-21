@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import type { BigIntStats, Dir } from "node:fs";
+import type { BigIntStats, Dir, Dirent } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
@@ -191,6 +191,10 @@ export interface ManagedAttachmentStagingSweepInput {
   readonly monotonicNow?: () => number;
   /** Skip an active writer instead of waiting behind its process-local path lock. */
   readonly skipLocked?: boolean;
+  /** Test seam for a stalled directory enumeration. */
+  readonly readDirectoryEntry?: (directory: Dir) => Promise<Dirent | null>;
+  /** Own cleanup that must finish after a deadline-bounded sweep returns. */
+  readonly onDeferredCleanup?: (completion: Promise<void>) => void;
   /** Test seam for a replacement race between the two identity checks. */
   readonly beforeFinalStat?: (candidatePath: string) => Promise<void>;
   /** Test seam for a replacement after final validation but before quarantine. */
@@ -355,6 +359,7 @@ async function createPinnedStagingDeleteSession(input: {
   readonly remainingTimeoutMs?: () => number;
   readonly beforeReady?: () => Promise<void>;
   readonly waitForForceClose?: (timeoutMs: number) => Promise<void>;
+  readonly onDeferredCleanup?: (completion: Promise<void>) => void;
 }): Promise<PinnedStagingDeleteSessionResult> {
   const child = spawn(
     process.execPath,
@@ -386,12 +391,20 @@ async function createPinnedStagingDeleteSession(input: {
   });
   const lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
   const iterator = lines[Symbol.asyncIterator]();
+  let childClosed = false;
+  const childCloseCompletion = new Promise<void>((resolve) => {
+    child.once("close", () => {
+      childClosed = true;
+      resolve();
+    });
+  });
   const releaseChildHandles = (): void => {
     lines.close();
     child.stdin.destroy();
     child.stdout.destroy();
     child.stderr.destroy();
     child.unref();
+    if (!childClosed) input.onDeferredCleanup?.(childCloseCompletion);
   };
   const waitForChildExit = async (timeoutMs: number): Promise<void> => {
     if (child.exitCode !== null || child.signalCode !== null) return;
@@ -548,11 +561,88 @@ type PinnedStagingResources =
       readonly session: PinnedStagingDeleteSession;
     };
 
+type BoundedDirectoryReadResult =
+  | { readonly _tag: "Entry"; readonly entry: Dirent | null }
+  | { readonly _tag: "DeadlineExceeded"; readonly settled?: Promise<void> };
+
+async function readDirectoryEntryWithinDeadline(input: {
+  readonly directory: Dir;
+  readonly remainingTimeoutMs?: () => number;
+  readonly read?: (directory: Dir) => Promise<Dirent | null>;
+}): Promise<BoundedDirectoryReadResult> {
+  if (input.remainingTimeoutMs) {
+    const initialBudgetMs = input.remainingTimeoutMs() - PINNED_STAGING_DEADLINE_CLEANUP_RESERVE_MS;
+    if (!Number.isFinite(initialBudgetMs) || initialBudgetMs <= 0) {
+      return { _tag: "DeadlineExceeded" };
+    }
+  }
+  const readOutcome = (input.read?.(input.directory) ?? input.directory.read()).then(
+    (entry) => ({ _tag: "Entry", entry }) as const,
+    (cause: unknown) => ({ _tag: "Failed", cause }) as const,
+  );
+  if (!input.remainingTimeoutMs) {
+    const outcome = await readOutcome;
+    if (outcome._tag === "Failed") throw outcome.cause;
+    return outcome;
+  }
+
+  const settled = readOutcome.then(() => undefined);
+  const remainingMs = input.remainingTimeoutMs() - PINNED_STAGING_DEADLINE_CLEANUP_RESERVE_MS;
+  if (!Number.isFinite(remainingMs) || remainingMs <= 0) {
+    return { _tag: "DeadlineExceeded", settled };
+  }
+
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const outcome = await Promise.race([
+    readOutcome,
+    new Promise<{ readonly _tag: "DeadlineExceeded"; readonly settled: Promise<void> }>(
+      (resolve) => {
+        timeout = setTimeout(
+          () => resolve({ _tag: "DeadlineExceeded", settled }),
+          Math.max(0, Math.floor(remainingMs)),
+        );
+      },
+    ),
+  ]);
+  if (timeout) clearTimeout(timeout);
+  if (outcome._tag === "Failed") throw outcome.cause;
+  return outcome;
+}
+
+function closeDirectoryAfterPendingRead(directory: Dir, settled: Promise<void>): Promise<void> {
+  return settled.then(() => directory.close()).catch(() => undefined);
+}
+
+interface ManagedAttachmentDeferredCleanupTracker {
+  readonly track: (completion: Promise<void>) => void;
+  readonly drain: () => Promise<void>;
+}
+
+function makeManagedAttachmentDeferredCleanupTracker(): ManagedAttachmentDeferredCleanupTracker {
+  const pending = new Set<Promise<void>>();
+  return {
+    track: (completion) => {
+      if (pending.has(completion)) return;
+      pending.add(completion);
+      void completion.then(
+        () => pending.delete(completion),
+        () => pending.delete(completion),
+      );
+    },
+    drain: async () => {
+      while (pending.size > 0) {
+        await Promise.allSettled([...pending]);
+      }
+    },
+  };
+}
+
 async function openPinnedStagingResources(input: {
   readonly staging: Extract<VerifiedStagingDirectory, { readonly _tag: "Verified" }>;
   readonly remainingTimeoutMs?: () => number;
   readonly beforeReady?: () => Promise<void>;
   readonly waitForForceClose?: (timeoutMs: number) => Promise<void>;
+  readonly onDeferredCleanup?: (completion: Promise<void>) => void;
 }): Promise<PinnedStagingResources> {
   const opened = await openVerifiedStagingDirectory(input.staging);
   if (opened._tag !== "Opened") return opened;
@@ -563,6 +653,7 @@ async function openPinnedStagingResources(input: {
       ...(input.remainingTimeoutMs ? { remainingTimeoutMs: input.remainingTimeoutMs } : {}),
       ...(input.beforeReady ? { beforeReady: input.beforeReady } : {}),
       ...(input.waitForForceClose ? { waitForForceClose: input.waitForForceClose } : {}),
+      ...(input.onDeferredCleanup ? { onDeferredCleanup: input.onDeferredCleanup } : {}),
     });
     if (pinned._tag === "DirectoryUnsafe") {
       await opened.directory.close();
@@ -733,16 +824,27 @@ export async function sweepOrphanManagedAttachmentParts(
     ...(input.waitForPinnedSessionForceClose
       ? { waitForForceClose: input.waitForPinnedSessionForceClose }
       : {}),
+    ...(input.onDeferredCleanup ? { onDeferredCleanup: input.onDeferredCleanup } : {}),
   });
   if (resources._tag === "Missing") return emptyResult;
   if (resources._tag === "Unsafe") return { inspected: 0, removed: 0, failures: 1 };
+  let pendingDirectoryRead: Promise<void> | undefined;
   try {
     while (
       inspected < scanLimit &&
       removed < maxRemovals &&
       (deadline === null || monotonicNow() < deadline)
     ) {
-      const entry = await resources.directory.read();
+      const read = await readDirectoryEntryWithinDeadline({
+        directory: resources.directory,
+        ...(remainingTimeoutMs ? { remainingTimeoutMs } : {}),
+        ...(input.readDirectoryEntry ? { read: input.readDirectoryEntry } : {}),
+      });
+      if (read._tag === "DeadlineExceeded") {
+        pendingDirectoryRead = read.settled;
+        break;
+      }
+      const entry = read.entry;
       if (entry === null) break;
       inspected += 1;
       const result = await processManagedAttachmentStagingEntry({
@@ -762,17 +864,21 @@ export async function sweepOrphanManagedAttachmentParts(
     const remainingCloseMs = remainingTimeoutMs
       ? pinnedStagingCloseTimeoutMs(remainingTimeoutMs)
       : undefined;
-    await Promise.all([
-      resources.directory.close(),
-      resources.session.close(
-        remainingTimeoutMs
-          ? {
-              force: true,
-              ...(remainingCloseMs !== undefined ? { exitWaitMs: remainingCloseMs } : {}),
-            }
-          : undefined,
-      ),
-    ]);
+    const closeSession = resources.session.close(
+      remainingTimeoutMs
+        ? {
+            force: true,
+            ...(remainingCloseMs !== undefined ? { exitWaitMs: remainingCloseMs } : {}),
+          }
+        : undefined,
+    );
+    if (pendingDirectoryRead) {
+      const completion = closeDirectoryAfterPendingRead(resources.directory, pendingDirectoryRead);
+      input.onDeferredCleanup?.(completion);
+      await closeSession;
+    } else {
+      await Promise.all([resources.directory.close(), closeSession]);
+    }
   }
 
   return { inspected, removed, failures };
@@ -818,22 +924,31 @@ async function closeStagingRecoveryCursor(
   options: {
     readonly force?: boolean;
     readonly remainingTimeoutMs?: () => number;
+    readonly pendingDirectoryRead?: Promise<void>;
+    readonly onDeferredDirectoryClose?: (completion: Promise<void>) => void;
   } = {},
 ): Promise<void> {
   const remainingCloseMs = options.remainingTimeoutMs
     ? pinnedStagingCloseTimeoutMs(options.remainingTimeoutMs)
     : undefined;
-  await Promise.all([
-    cursor.directory.close(),
-    cursor.pinnedDeleteSession.close(
-      options.force
-        ? {
-            force: true,
-            ...(remainingCloseMs !== undefined ? { exitWaitMs: remainingCloseMs } : {}),
-          }
-        : undefined,
-    ),
-  ]);
+  const closeSession = cursor.pinnedDeleteSession.close(
+    options.force
+      ? {
+          force: true,
+          ...(remainingCloseMs !== undefined ? { exitWaitMs: remainingCloseMs } : {}),
+        }
+      : undefined,
+  );
+  if (options.pendingDirectoryRead) {
+    const completion = closeDirectoryAfterPendingRead(
+      cursor.directory,
+      options.pendingDirectoryRead,
+    );
+    options.onDeferredDirectoryClose?.(completion);
+    await closeSession;
+  } else {
+    await Promise.all([cursor.directory.close(), closeSession]);
+  }
 }
 
 async function stagingRecoveryCursorIsCurrent(
@@ -861,12 +976,27 @@ async function stagingRecoveryCursorIsCurrent(
  */
 export function makeManagedAttachmentStagingRecovery(): ManagedAttachmentStagingRecovery {
   let cursor: ManagedAttachmentStagingRecoveryCursor | null = null;
+  let deferredCursorClose: { readonly completion: Promise<void>; settled: boolean } | null = null;
+  const activeRuns = new Set<Promise<void>>();
+  let closed = false;
+  let closePromise: Promise<void> | null = null;
 
   const close = Effect.tryPromise({
-    try: async () => {
-      const current = cursor;
-      cursor = null;
-      if (current) await closeStagingRecoveryCursor(current);
+    try: () => {
+      if (closePromise) return closePromise;
+      closed = true;
+      closePromise = (async () => {
+        while (activeRuns.size > 0) {
+          await Promise.all([...activeRuns]);
+        }
+        const current = cursor;
+        cursor = null;
+        if (current) await closeStagingRecoveryCursor(current);
+        const deferred = deferredCursorClose;
+        deferredCursorClose = null;
+        if (deferred) await deferred.completion;
+      })();
+      return closePromise;
     },
     catch: (cause) => cause,
   });
@@ -876,6 +1006,14 @@ export function makeManagedAttachmentStagingRecovery(): ManagedAttachmentStaging
   ): Effect.Effect<ManagedAttachmentStagingRecoveryResult, unknown> =>
     Effect.tryPromise({
       try: async () => {
+        if (closed) {
+          throw new Error("Managed attachment staging recovery is closed.");
+        }
+        let completeRun!: () => void;
+        const completion = new Promise<void>((resolve) => {
+          completeRun = resolve;
+        });
+        activeRuns.add(completion);
         try {
           const maxRemovals = Math.max(
             0,
@@ -906,6 +1044,13 @@ export function makeManagedAttachmentStagingRecovery(): ManagedAttachmentStaging
           let passes = 0;
           if (scanLimit === 0 || maxRemovals === 0) {
             return { inspected, removed, failures, passes, exhausted: false };
+          }
+          if (deferredCursorClose) {
+            if (!deferredCursorClose.settled) {
+              return { inspected, removed, failures, passes, exhausted: false };
+            }
+            await deferredCursorClose.completion;
+            deferredCursorClose = null;
           }
 
           const attachmentsDir = path.resolve(input.attachmentsDir);
@@ -958,6 +1103,7 @@ export function makeManagedAttachmentStagingRecovery(): ManagedAttachmentStaging
                 ...(input.waitForPinnedSessionForceClose
                   ? { waitForForceClose: input.waitForPinnedSessionForceClose }
                   : {}),
+                ...(input.onDeferredCleanup ? { onDeferredCleanup: input.onDeferredCleanup } : {}),
               });
             } catch (cause) {
               if (cause instanceof ManagedAttachmentStagingDeadlineExceeded) {
@@ -998,7 +1144,33 @@ export function makeManagedAttachmentStagingRecovery(): ManagedAttachmentStaging
               inspected + passInspected < invocationScanLimit &&
               monotonicNow() < deadline
             ) {
-              const entry = await activeCursor.directory.read();
+              const read = await readDirectoryEntryWithinDeadline({
+                directory: activeCursor.directory,
+                remainingTimeoutMs,
+                ...(input.readDirectoryEntry ? { read: input.readDirectoryEntry } : {}),
+              });
+              if (read._tag === "DeadlineExceeded") {
+                passes += passInspected > 0 ? 1 : 0;
+                inspected += passInspected;
+                removed += passRemoved;
+                failures += passFailures;
+                cursor = null;
+                await closeStagingRecoveryCursor(activeCursor, {
+                  force: true,
+                  remainingTimeoutMs,
+                  ...(read.settled ? { pendingDirectoryRead: read.settled } : {}),
+                  onDeferredDirectoryClose: (completion) => {
+                    const deferred = { completion, settled: false };
+                    deferredCursorClose = deferred;
+                    input.onDeferredCleanup?.(completion);
+                    void completion.then(() => {
+                      deferred.settled = true;
+                    });
+                  },
+                });
+                return { inspected, removed, failures, passes, exhausted: false };
+              }
+              const entry = read.entry;
               if (entry === null) {
                 exhausted = true;
                 break;
@@ -1056,6 +1228,9 @@ export function makeManagedAttachmentStagingRecovery(): ManagedAttachmentStaging
             }).catch(() => undefined);
           }
           throw cause;
+        } finally {
+          activeRuns.delete(completion);
+          completeRun();
         }
       },
       catch: (cause) => cause,
@@ -1211,16 +1386,28 @@ export const ManagedAttachmentCleanupLive = Layer.effect(
     const config = yield* ServerConfig;
     const cleanupLock = yield* Semaphore.make(1);
     const stagingRecoveryLock = yield* Semaphore.make(1);
+    const deferredCleanup = makeManagedAttachmentDeferredCleanupTracker();
     const stagingRecovery = makeManagedAttachmentStagingRecovery();
-    yield* Effect.addFinalizer(() =>
-      stagingRecovery.close.pipe(
+    yield* Effect.addFinalizer(() => {
+      const closeRecovery = stagingRecovery.close.pipe(
         Effect.catch((cause) =>
           Effect.logWarning("failed to close managed attachment staging recovery cursor", {
             cause,
           }),
         ),
-      ),
-    );
+      );
+      const drainDeferredCleanup = Effect.tryPromise({
+        try: deferredCleanup.drain,
+        catch: (cause) => cause,
+      }).pipe(
+        Effect.catch((cause) =>
+          Effect.logWarning("failed to drain deferred managed attachment staging cleanup", {
+            cause,
+          }),
+        ),
+      );
+      return closeRecovery.pipe(Effect.andThen(drainDeferredCleanup));
+    });
     const runBatch = cleanupLock.withPermits(1)(
       runManagedAttachmentCleanupBatch.pipe(
         Effect.provideService(ManagedAttachmentRepository, repository),
@@ -1229,16 +1416,29 @@ export const ManagedAttachmentCleanupLive = Layer.effect(
     );
     const runStartupStagingSweep = stagingRecoveryLock.withPermits(1)(
       Effect.tryPromise({
-        try: () =>
-          sweepOrphanManagedAttachmentParts({
+        try: () => {
+          const operation = sweepOrphanManagedAttachmentParts({
             attachmentsDir: config.attachmentsDir,
             timeBudgetMs: MANAGED_ATTACHMENT_STAGING_STARTUP_TIME_MS,
-          }),
+            skipLocked: true,
+            onDeferredCleanup: deferredCleanup.track,
+          });
+          deferredCleanup.track(
+            operation.then(
+              () => undefined,
+              () => undefined,
+            ),
+          );
+          return operation;
+        },
         catch: (cause) => cause,
       }),
     );
     const runStagingRecovery = stagingRecoveryLock.withPermits(1)(
-      stagingRecovery.run({ attachmentsDir: config.attachmentsDir }),
+      stagingRecovery.run({
+        attachmentsDir: config.attachmentsDir,
+        onDeferredCleanup: deferredCleanup.track,
+      }),
     );
     const runStartupStagingSweepSafely = runStartupStagingSweep.pipe(
       Effect.tap((result) =>

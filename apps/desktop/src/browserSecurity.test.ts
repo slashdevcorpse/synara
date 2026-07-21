@@ -134,8 +134,11 @@ describe("desktop browser security policy", () => {
     }
 
     const managedUrl = "https://managed.example/";
-    const owningNavigationPolicy = (event: { preventDefault(): void }, url: string): void => {
-      if (url !== managedUrl) event.preventDefault();
+    const owningNavigationPolicy = (event: {
+      readonly url: string;
+      preventDefault(): void;
+    }): void => {
+      if (event.url !== managedUrl) event.preventDefault();
     };
     const runtimeWindowOpenHandler: TestWindowOpenHandler = ({ url }) => ({
       action: url === managedUrl ? "allow" : "deny",
@@ -146,7 +149,10 @@ describe("desktop browser security policy", () => {
         guest.on("will-redirect", owningNavigationPolicy);
         guest.setWindowOpenHandler(runtimeWindowOpenHandler);
         const preventDuringHandoff = vi.fn();
-        guest.emit("will-navigate", { preventDefault: preventDuringHandoff }, managedUrl);
+        guest.emit("will-navigate", {
+          url: managedUrl,
+          preventDefault: preventDuringHandoff,
+        });
         expect(preventDuringHandoff).toHaveBeenCalledOnce();
       }),
     ).toBe(true);
@@ -154,14 +160,16 @@ describe("desktop browser security policy", () => {
     expect(guest.listenerCount("will-redirect")).toBe(1);
 
     const preventManagedNavigation = vi.fn();
-    guest.emit("will-navigate", { preventDefault: preventManagedNavigation }, managedUrl);
+    guest.emit("will-navigate", {
+      url: managedUrl,
+      preventDefault: preventManagedNavigation,
+    });
     expect(preventManagedNavigation).not.toHaveBeenCalled();
     const preventUnmanagedNavigation = vi.fn();
-    guest.emit(
-      "will-redirect",
-      { preventDefault: preventUnmanagedNavigation },
-      "https://attacker.example/redirect",
-    );
+    guest.emit("will-redirect", {
+      url: "https://attacker.example/redirect",
+      preventDefault: preventUnmanagedNavigation,
+    });
     expect(preventUnmanagedNavigation).toHaveBeenCalledOnce();
     expect(guest.windowOpenHandler?.({ url: managedUrl })).toEqual({ action: "allow" });
     expect(guest.windowOpenHandler?.({ url: "https://attacker.example/popup" })).toEqual({
