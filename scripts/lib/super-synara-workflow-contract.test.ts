@@ -469,8 +469,8 @@ describe("Super Synara workflow contracts", () => {
     );
 
     const alternatePhaseInReadOnlyWindows = main.replace(
-      "      - name: Revalidate tagged source",
-      "      - name: Reintroduced native-lane release-state validation\n        shell: bash\n        run: node scripts/verify-super-synara-github-state.ts --phase before-draft\n\n      - name: Revalidate tagged source",
+      "      - name: Revalidate exact planned source",
+      "      - name: Reintroduced native-lane release-state validation\n        shell: bash\n        run: node scripts/verify-super-synara-github-state.ts --phase before-draft\n\n      - name: Revalidate exact planned source",
     );
     expect(alternatePhaseInReadOnlyWindows).not.toBe(main);
     expect(() => verifySuperSynaraWorkflowText(alternatePhaseInReadOnlyWindows, audit)).toThrow(
@@ -491,6 +491,33 @@ describe("Super Synara workflow contracts", () => {
         "preflight-phase draft validation must run exactly once in draft admission",
       );
     }
+  });
+
+  it("validates native builds against the admitted draft source without reserving its tag", () => {
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace("github-unsigned-prerelease false", "github-unsigned-prerelease true"),
+        audit,
+      ),
+    ).toThrow("without requiring a pre-publication tag");
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          "      - name: Checkout exact planned source",
+          "      - name: Checkout exact tagged source",
+        ),
+        audit,
+      ),
+    ).toThrow("without requiring a pre-publication tag");
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          "            github-unsigned-prerelease false",
+          "            github-unsigned-prerelease false || true",
+        ),
+        audit,
+      ),
+    ).toThrow("without requiring a pre-publication tag");
   });
 
   it("rejects removal of the reviewed allowlist gate", () => {

@@ -296,7 +296,7 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 45
     steps:
-      - name: Checkout exact tagged source
+      - name: Checkout exact planned source
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           ref: ${{ needs.preflight.outputs.source_commit }}
@@ -319,7 +319,7 @@ jobs:
       - name: Verify dependency install preserved source
         run: node scripts/verify-release-worktree-clean.ts
 
-      - name: Revalidate tagged source
+      - name: Revalidate exact planned source
         shell: bash
         env:
           VERSION: ${{ needs.preflight.outputs.version }}
@@ -328,7 +328,7 @@ jobs:
         run: |
           node scripts/verify-release-source-provenance.ts \
             "$VERSION" "$TAG" true "$SOURCE_COMMIT" branch main \
-            github-unsigned-prerelease true
+            github-unsigned-prerelease false
 
       - name: Verify Super Synara identity
         run: bun run brand:check
@@ -572,7 +572,7 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 45
     steps:
-      - name: Checkout exact tagged source
+      - name: Checkout exact planned source
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           ref: ${{ needs.preflight.outputs.source_commit }}
@@ -595,7 +595,7 @@ jobs:
       - name: Verify dependency install preserved source
         run: node scripts/verify-release-worktree-clean.ts
 
-      - name: Revalidate tagged source
+      - name: Revalidate exact planned source
         shell: bash
         env:
           VERSION: ${{ needs.preflight.outputs.version }}
@@ -604,7 +604,7 @@ jobs:
         run: |
           node scripts/verify-release-source-provenance.ts \
             "$VERSION" "$TAG" true "$SOURCE_COMMIT" branch main \
-            github-unsigned-prerelease true
+            github-unsigned-prerelease false
 
       - name: Verify Super Synara identity
         run: bun run brand:check
