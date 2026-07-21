@@ -3,6 +3,7 @@ import * as NodeOs from "node:os";
 import * as NodePath from "node:path";
 
 import * as EffectNodeFileSystem from "@effect/platform-node/NodeFileSystem";
+import * as EffectNodeChildProcessSpawner from "@effect/platform-node/NodeChildProcessSpawner";
 import * as EffectNodePath from "@effect/platform-node/NodePath";
 import { ProjectId, WorkspaceCloneId } from "@synara/contracts";
 import { Effect, Exit, Layer, Scope, Sink, Stream } from "effect";
@@ -50,6 +51,11 @@ interface CapturedGitCommand {
   };
 }
 
+interface CapturedCloneCommands {
+  readonly resolution: CapturedGitCommand;
+  readonly clone: CapturedGitCommand;
+}
+
 function cloneCommandError(cwd: string): GitCommandError {
   return new GitCommandError({
     operation: "workspace clone",
@@ -59,14 +65,21 @@ function cloneCommandError(cwd: string): GitCommandError {
   });
 }
 
-function successfulChildProcessHandle() {
+function withResolvedCloneUrl(executeClone: GitCoreShape["execute"]): GitCoreShape["execute"] {
+  return (input) =>
+    input.operation === "WorkspaceCloneJobs.resolveRepositoryUrl"
+      ? Effect.succeed({ code: 0, stdout: `${input.args.at(-1) ?? ""}\n`, stderr: "" })
+      : executeClone(input);
+}
+
+function successfulChildProcessHandle(stdout = "") {
   return ChildProcessSpawner.makeHandle({
     pid: ChildProcessSpawner.ProcessId(1),
     exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(0)),
     isRunning: Effect.succeed(false),
     kill: () => Effect.void,
     stdin: Sink.drain,
-    stdout: Stream.empty,
+    stdout: stdout.length > 0 ? Stream.make(new TextEncoder().encode(stdout)) : Stream.empty,
     stderr: Stream.empty,
     all: Stream.empty,
     getInputFd: () => Sink.drain,
@@ -74,19 +87,25 @@ function successfulChildProcessHandle() {
   });
 }
 
-async function captureSpawnedCloneCommand(url: string): Promise<CapturedGitCommand> {
+async function captureSpawnedCloneCommands(url: string): Promise<CapturedCloneCommands> {
   const parent = await makeTempDir();
   const targetPath = NodePath.join(parent, "repo");
-  let captured: CapturedGitCommand | null = null;
+  let capturedResolution: CapturedGitCommand | null = null;
+  let capturedClone: CapturedGitCommand | null = null;
   const spawner = ChildProcessSpawner.make((command) => {
     if (command._tag !== "StandardCommand") {
       return Effect.die(new Error("Expected workspace clone to spawn one standard git command."));
     }
-    captured = {
+    const captured = {
       command: command.command,
       args: command.args,
       options: command.options,
     };
+    if (command.args.includes("ls-remote") && command.args.includes("--get-url")) {
+      capturedResolution = captured;
+      return Effect.succeed(successfulChildProcessHandle(`${url}\n`));
+    }
+    capturedClone = captured;
     return Effect.succeed(successfulChildProcessHandle());
   });
   const processLayer = Layer.mergeAll(
@@ -117,8 +136,10 @@ async function captureSpawnedCloneCommand(url: string): Promise<CapturedGitComma
     ),
   ).at(-1);
   expect(result).toMatchObject({ result: { clonedPath: targetPath, failure: null } });
-  if (!captured) throw new Error("Workspace clone did not spawn git.");
-  return captured;
+  if (!capturedResolution || !capturedClone) {
+    throw new Error("Workspace clone did not spawn URL resolution and clone commands.");
+  }
+  return { resolution: capturedResolution, clone: capturedClone };
 }
 
 async function withTemporaryProcessEnvironment<A>(
@@ -258,7 +279,7 @@ describe("workspace clone progress", () => {
     const targetPath = NodePath.join(parent, "repo");
     const calls: Array<{ cwd: string; args: ReadonlyArray<string>; env?: NodeJS.ProcessEnv }> = [];
     const git: Pick<GitCoreShape, "execute"> = {
-      execute: (input: Parameters<GitCoreShape["execute"]>[0]) => {
+      execute: withResolvedCloneUrl((input) => {
         calls.push({
           cwd: input.cwd,
           args: input.args,
@@ -270,7 +291,7 @@ describe("workspace clone progress", () => {
               .onStderrLine("Receiving objects: 50% (5/10)")
               .pipe(Effect.andThen(failure))
           : failure;
-      },
+      }),
     };
     const jobs = makeWorkspaceCloneJobs({
       git,
@@ -300,13 +321,21 @@ describe("workspace clone progress", () => {
           "credential.interactive=false",
           "-c",
           "core.askPass=",
+          "-c",
+          "http.curloptResolve=",
+          "-c",
+          "http.sslVerify=true",
           "clone",
           "--progress",
           "--",
           "https://github.com/example/repo.git",
           targetPath,
         ],
-        env: { GIT_TERMINAL_PROMPT: "0", GCM_INTERACTIVE: "Never" },
+        env: {
+          GIT_ALLOW_PROTOCOL: "https",
+          GIT_TERMINAL_PROMPT: "0",
+          GCM_INTERACTIVE: "Never",
+        },
       },
     ]);
     expect(events.at(-1)).toMatchObject({
@@ -322,10 +351,12 @@ describe("workspace clone progress", () => {
     let cloneCalls = 0;
     let projectCalls = 0;
     const git = {
-      execute: () => {
+      execute: withResolvedCloneUrl((input) => {
         cloneCalls += 1;
-        return Effect.succeed({ code: 0, stdout: "", stderr: "" });
-      },
+        return (input.progress?.onStderrLine?.("Updating files: 100% (1/1)") ?? Effect.void).pipe(
+          Effect.andThen(Effect.succeed({ code: 0, stdout: "", stderr: "" })),
+        );
+      }),
     } as Pick<GitCoreShape, "execute">;
     const jobs = makeWorkspaceCloneJobs({
       git,
@@ -355,6 +386,7 @@ describe("workspace clone progress", () => {
     expect(first.at(-1)).toMatchObject({
       result: { clonedPath: targetPath, failure: { stage: "project" } },
     });
+    expect(first.map((event) => event.snapshot.percent)).toEqual([0, 100, 100, 100]);
     await expect(NodeFs.stat(targetPath)).resolves.toBeDefined();
 
     const retried = Array.from(
@@ -363,6 +395,7 @@ describe("workspace clone progress", () => {
     expect(retried.at(-1)).toMatchObject({
       result: { clonedPath: targetPath, projectId: "project-1", failure: null },
     });
+    expect(retried.map((event) => event.snapshot.percent)).toEqual([100, 100]);
     expect(cloneCalls).toBe(1);
     expect(projectCalls).toBe(2);
   });
@@ -376,7 +409,7 @@ describe("workspace clone progress", () => {
     let projectCalls = 0;
     const jobs = makeWorkspaceCloneJobs({
       git: {
-        execute: () => Effect.succeed({ code: 0, stdout: "", stderr: "" }),
+        execute: withResolvedCloneUrl(() => Effect.succeed({ code: 0, stdout: "", stderr: "" })),
       } as Pick<GitCoreShape, "execute">,
       homeDir: parent,
       createProject: () => {
@@ -461,10 +494,10 @@ describe("workspace clone progress", () => {
       failFirstClone = () => reject(new Error("release first clone"));
     });
     const git = {
-      execute: () => {
+      execute: withResolvedCloneUrl(() => {
         signalStarted();
         return Effect.tryPromise(() => blockedClone);
-      },
+      }),
     } as Pick<GitCoreShape, "execute">;
     const jobs = makeWorkspaceCloneJobs({
       git,
@@ -515,11 +548,12 @@ describe("workspace clone progress", () => {
     });
     const jobs = makeWorkspaceCloneJobs({
       git: {
-        execute: () =>
+        execute: withResolvedCloneUrl(() =>
           Effect.tryPromise(async () => {
             await cloneGate;
             return { code: 0, stdout: "", stderr: "" };
           }),
+        ),
       } as Pick<GitCoreShape, "execute">,
       homeDir: parent,
       createProject: () => Effect.succeed(ProjectId.makeUnsafe("project-1")),
@@ -593,11 +627,12 @@ describe("workspace clone progress", () => {
     });
     const jobs = makeWorkspaceCloneJobs({
       git: {
-        execute: () =>
+        execute: withResolvedCloneUrl(() =>
           Effect.tryPromise(async () => {
             await cloneGate;
             return { code: 0, stdout: "", stderr: "" };
           }),
+        ),
       } as Pick<GitCoreShape, "execute">,
       homeDir: parent,
     });
@@ -686,7 +721,7 @@ describe("workspace clone progress", () => {
           yield* Effect.addFinalizer(() => Scope.close(serverScope, Exit.void));
           jobs = makeWorkspaceCloneJobs({
             git: {
-              execute: () => Effect.never,
+              execute: withResolvedCloneUrl(() => Effect.never),
             } as Pick<GitCoreShape, "execute">,
             homeDir: parent,
             createProject: () => Effect.succeed(ProjectId.makeUnsafe("project-1")),
@@ -724,10 +759,11 @@ describe("workspace clone progress", () => {
           yield* Effect.addFinalizer(() => Scope.close(serverScope, Exit.void));
           const jobs = makeWorkspaceCloneJobs({
             git: {
-              execute: (command) =>
+              execute: withResolvedCloneUrl((command) =>
                 command.args.at(-1) === NodePath.join(parent, "active-0")
                   ? Effect.never
                   : Effect.succeed({ code: 0, stdout: "", stderr: "" }),
+              ),
             } as Pick<GitCoreShape, "execute">,
             homeDir: parent,
             startBackground: (effect) => effect.pipe(Effect.forkIn(serverScope), Effect.asVoid),
@@ -771,7 +807,7 @@ describe("workspace clone progress", () => {
     const cloneId = WorkspaceCloneId.makeUnsafe("clone-id-single-use");
     const jobs = makeWorkspaceCloneJobs({
       git: {
-        execute: () => Effect.succeed({ code: 0, stdout: "", stderr: "" }),
+        execute: withResolvedCloneUrl(() => Effect.succeed({ code: 0, stdout: "", stderr: "" })),
       } as Pick<GitCoreShape, "execute">,
       homeDir: parent,
       createProject: () => Effect.succeed(ProjectId.makeUnsafe("project-1")),
@@ -857,67 +893,225 @@ describe("workspace clone process hardening", () => {
   const inheritedPromptEnvironment = {
     DISPLAY: ":99",
     GIT_ASKPASS: "inherited-git-askpass",
+    GIT_ALLOW_PROTOCOL: "file:ssh",
+    GIT_CONFIG_COUNT: "1",
+    GIT_CONFIG_GLOBAL: "inherited-global-config",
+    GIT_CONFIG_KEY_0: "url.file:///attacker/.insteadOf",
+    GIT_CONFIG_SYSTEM: "inherited-system-config",
+    GIT_CONFIG_VALUE_0: "https://github.com/",
+    GIT_EXEC_PATH: "inherited-git-exec-path",
     GIT_SSH: "inherited-ssh-wrapper",
     GIT_SSH_COMMAND: "inherited ssh command",
     GIT_SSH_VARIANT: "plink",
+    SSH_AGENT_PID: "1234",
+    SSH_AUTH_SOCK: "/tmp/synara-test-agent.sock",
     SSH_ASKPASS: "inherited-ssh-askpass",
     SSH_ASKPASS_REQUIRE: "force",
+    SSH_SK_PROVIDER: "inherited-security-key-provider",
+    GCM_CREDENTIAL_STORE: "inherited-credential-store",
+    HTTPS_PROXY: "http://proxy.example:8080",
     SYNARA_CLONE_TEST_INHERITED: "retained",
     WAYLAND_DISPLAY: "wayland-99",
   } as const;
 
-  function expectCommonNoninteractiveSpawn(command: CapturedGitCommand, url: string): void {
+  function expectHardenedSpawnEnvironment(command: CapturedGitCommand, url: string): void {
     expect(command.command).toBe("git");
-    expect(command.args).toEqual([
-      "-c",
-      "credential.interactive=false",
-      "-c",
-      "core.askPass=",
-      "clone",
-      "--progress",
-      "--",
-      url,
-      expect.stringMatching(/[\\/]repo$/),
-    ]);
     expect(command.options.stdin).toBe("ignore");
     expect(command.options.env).toMatchObject({
       GCM_INTERACTIVE: "Never",
+      GCM_CREDENTIAL_STORE: "inherited-credential-store",
+      GIT_ALLOW_PROTOCOL: url.startsWith("https:") ? "https" : "ssh",
       GIT_TERMINAL_PROMPT: "0",
+      HTTPS_PROXY: "http://proxy.example:8080",
+      SSH_AGENT_PID: "1234",
+      SSH_AUTH_SOCK: "/tmp/synara-test-agent.sock",
       SYNARA_CLONE_TEST_INHERITED: "retained",
     });
     for (const key of [
       "DISPLAY",
       "GIT_ASKPASS",
+      "GIT_CONFIG_COUNT",
+      "GIT_CONFIG_GLOBAL",
+      "GIT_CONFIG_KEY_0",
+      "GIT_CONFIG_SYSTEM",
+      "GIT_CONFIG_VALUE_0",
+      "GIT_EXEC_PATH",
       "GIT_SSH",
       "GIT_SSH_VARIANT",
       "SSH_ASKPASS",
       "SSH_ASKPASS_REQUIRE",
+      "SSH_SK_PROVIDER",
       "WAYLAND_DISPLAY",
     ]) {
       expect(command.options.env).not.toHaveProperty(key);
     }
   }
 
-  it("spawns HTTPS clone with ignored stdin and no inherited prompt helpers", async () => {
+  function expectResolutionSpawn(command: CapturedGitCommand, url: string): void {
+    expect(command.args).toEqual([
+      "-c",
+      "credential.interactive=false",
+      "-c",
+      "core.askPass=",
+      ...(url.startsWith("https:")
+        ? ["-c", "http.curloptResolve=", "-c", "http.sslVerify=true"]
+        : []),
+      "ls-remote",
+      "--get-url",
+      "--",
+      url,
+    ]);
+    expectHardenedSpawnEnvironment(command, url);
+  }
+
+  function expectCloneSpawn(command: CapturedGitCommand, url: string): void {
+    expect(command.args).toEqual([
+      "-c",
+      "credential.interactive=false",
+      "-c",
+      "core.askPass=",
+      ...(url.startsWith("https:")
+        ? ["-c", "http.curloptResolve=", "-c", "http.sslVerify=true"]
+        : []),
+      "clone",
+      "--progress",
+      "--",
+      url,
+      expect.stringMatching(/[\\/]repo$/),
+    ]);
+    expectHardenedSpawnEnvironment(command, url);
+  }
+
+  it("rejects an effective Git config URL rewrite before cloning", async () => {
+    const parent = await makeTempDir();
+    const targetPath = NodePath.join(parent, "repo");
+    let cloneCalls = 0;
+    const jobs = makeWorkspaceCloneJobs({
+      git: {
+        execute: (input) => {
+          if (input.operation === "WorkspaceCloneJobs.resolveRepositoryUrl") {
+            return Effect.succeed({
+              code: 0,
+              stdout: "ssh://git@attacker.example/example/repo.git\n",
+              stderr: "",
+            });
+          }
+          cloneCalls += 1;
+          return Effect.succeed({ code: 0, stdout: "", stderr: "" });
+        },
+      },
+      homeDir: parent,
+    });
+
+    const events = Array.from(
+      await Effect.runPromise(
+        Stream.runCollect(
+          jobs.cloneRepository({
+            cloneId: WorkspaceCloneId.makeUnsafe("clone-rewritten-url"),
+            url: "https://github.com/example/repo.git",
+            targetPath,
+            createProject: false,
+            createParentDirectories: true,
+          }),
+        ),
+      ),
+    );
+
+    expect(events.at(-1)).toMatchObject({
+      _tag: "clone_finished",
+      result: {
+        clonedPath: null,
+        failure: {
+          code: "WORKSPACE_CLONE_URL_REWRITE_BLOCKED",
+          retryable: false,
+        },
+      },
+    });
+    expect(cloneCalls).toBe(0);
+    await expect(NodeFs.stat(targetPath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("rejects a URL rewrite loaded by GitCore from the user config file", async () => {
+    const parent = await makeTempDir();
+    const gitHome = await makeTempDir();
+    const targetPath = NodePath.join(parent, "repo");
+    await NodeFs.writeFile(
+      NodePath.join(gitHome, ".gitconfig"),
+      '[url "ssh://git@attacker.example/"]\n\tinsteadOf = https://github.com/\n',
+      "utf8",
+    );
+
+    await withTemporaryProcessEnvironment(
+      {
+        HOME: gitHome,
+        XDG_CONFIG_HOME: NodePath.join(gitHome, ".config"),
+      },
+      async () => {
+        const fileSystemAndPathLayer = Layer.merge(
+          EffectNodeFileSystem.layer,
+          EffectNodePath.layer,
+        );
+        const processLayer = Layer.merge(
+          fileSystemAndPathLayer,
+          EffectNodeChildProcessSpawner.layer.pipe(Layer.provide(fileSystemAndPathLayer)),
+        );
+        const configLayer = ServerConfig.layerTest(parent, {
+          prefix: "synara-workspace-clone-global-config-test-",
+        }).pipe(Layer.provide(processLayer));
+        const git = await Effect.runPromise(
+          makeGitCore().pipe(Effect.provide(Layer.merge(processLayer, configLayer))),
+        );
+        const jobs = makeWorkspaceCloneJobs({ git, homeDir: parent });
+        const events = Array.from(
+          await Effect.runPromise(
+            Stream.runCollect(
+              jobs.cloneRepository({
+                cloneId: WorkspaceCloneId.makeUnsafe("clone-global-config-rewrite"),
+                url: "https://github.com/example/repo.git",
+                targetPath,
+                createProject: false,
+                createParentDirectories: true,
+              }),
+            ),
+          ),
+        );
+
+        expect(events.at(-1)).toMatchObject({
+          result: {
+            clonedPath: null,
+            failure: { code: "WORKSPACE_CLONE_URL_REWRITE_BLOCKED", retryable: false },
+          },
+        });
+        await expect(NodeFs.stat(targetPath)).rejects.toMatchObject({ code: "ENOENT" });
+      },
+    );
+  });
+
+  it("spawns HTTPS resolution and clone with inherited Git and SSH controls neutralized", async () => {
     const url = "https://github.com/example/repo.git";
     await withTemporaryProcessEnvironment(inheritedPromptEnvironment, async () => {
-      const command = await captureSpawnedCloneCommand(url);
-      expectCommonNoninteractiveSpawn(command, url);
-      expect(command.options.env).not.toHaveProperty("GIT_SSH_COMMAND");
+      const commands = await captureSpawnedCloneCommands(url);
+      expectResolutionSpawn(commands.resolution, url);
+      expectCloneSpawn(commands.clone, url);
+      expect(commands.resolution.options.env).not.toHaveProperty("GIT_SSH_COMMAND");
+      expect(commands.clone.options.env).not.toHaveProperty("GIT_SSH_COMMAND");
     });
   });
 
-  it("spawns accepted SSH forms with strict batch-mode OpenSSH and no inherited prompt helpers", async () => {
+  it("spawns accepted SSH forms with config-free batch-mode OpenSSH and agent auth", async () => {
     await withTemporaryProcessEnvironment(inheritedPromptEnvironment, async () => {
       for (const url of [
         "git@github.com:example/repo.git",
         "ssh://git@github.com/example/repo.git",
       ]) {
-        const command = await captureSpawnedCloneCommand(url);
-        expectCommonNoninteractiveSpawn(command, url);
-        expect(command.options.env?.GIT_SSH_COMMAND).toBe(
-          "ssh -o BatchMode=yes -o StrictHostKeyChecking=yes",
-        );
+        const commands = await captureSpawnedCloneCommands(url);
+        expectResolutionSpawn(commands.resolution, url);
+        expectCloneSpawn(commands.clone, url);
+        for (const command of [commands.resolution, commands.clone]) {
+          expect(command.options.env?.GIT_SSH_COMMAND).toBe(
+            "ssh -F none -o BatchMode=yes -o StrictHostKeyChecking=yes",
+          );
+        }
       }
     });
   });

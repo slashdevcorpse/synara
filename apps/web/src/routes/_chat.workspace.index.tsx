@@ -103,6 +103,10 @@ const SORTS: ReadonlyArray<{ value: WorkspaceSort; label: string }> = [
   { value: "manual", label: "Manual" },
 ];
 
+type WorkspaceRefreshOutcome =
+  | { readonly ok: false }
+  | { readonly ok: true; readonly repository: WorkspaceRepositoryState | null };
+
 function SortableWorkspaceCard({
   card,
   dragEnabled,
@@ -269,25 +273,35 @@ export function WorkspaceDashboardRoute() {
     await handleNewThread(projectId);
   };
 
-  const refresh = async (projectId: ProjectId | null = null) => {
+  const refresh = async (projectId: ProjectId | null = null): Promise<WorkspaceRefreshOutcome> => {
     if (projectId) setRefreshingProjectId(projectId);
     else setRefreshingAll(true);
     try {
       if (projectId) {
-        await refreshWorkspaceGitProject({
+        const repository = await refreshWorkspaceGitProject({
           queryClient,
           dashboardProjectIds: projectIds,
           projectId,
         });
+        if (!repository || repository.kind === "unavailable") {
+          throw new Error(
+            repository?.kind === "unavailable"
+              ? repository.message
+              : "Workspace status did not return a result.",
+          );
+        }
+        return { ok: true, repository };
       } else {
         await refreshWorkspaceGitStates({ queryClient, projectIds });
       }
+      return { ok: true, repository: null };
     } catch (cause) {
       toastManager.add({
         type: "error",
         title: "Could not refresh workspace status",
         description: cause instanceof Error ? cause.message : undefined,
       });
+      return { ok: false };
     } finally {
       setRefreshingProjectId(null);
       setRefreshingAll(false);
@@ -298,7 +312,16 @@ export function WorkspaceDashboardRoute() {
     setInitializingProjectId(card.project.id);
     try {
       await ensureNativeApi().git.init({ cwd: card.project.cwd });
-      await refresh(card.project.id);
+      const refreshOutcome = await refresh(card.project.id);
+      if (!refreshOutcome.ok) return;
+      if (refreshOutcome.repository?.kind !== "git") {
+        toastManager.add({
+          type: "error",
+          title: "Could not confirm Git initialization",
+          description: "The refreshed workspace status did not report a Git repository.",
+        });
+        return;
+      }
       toastManager.add({ type: "success", title: `Initialized Git in ${card.project.name}` });
     } catch (cause) {
       toastManager.add({

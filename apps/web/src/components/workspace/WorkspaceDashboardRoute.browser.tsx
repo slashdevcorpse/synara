@@ -21,6 +21,7 @@ const mocks = vi.hoisted(() => ({
   automationList: vi.fn(),
   confirm: vi.fn(),
   dispatchCommand: vi.fn(),
+  gitInit: vi.fn(),
   gitItems: [] as WorkspaceGitStateItem[],
   listArchivedProjects: vi.fn(),
   listGitStates: vi.fn(),
@@ -32,6 +33,7 @@ const mocks = vi.hoisted(() => ({
   syncServerShellSnapshot: vi.fn(),
   threads: [] as SidebarThreadSummary[],
   threadsHydrated: true,
+  toastAdd: vi.fn(),
   unpinProject: vi.fn(),
 }));
 
@@ -42,6 +44,10 @@ vi.mock("@tanstack/react-router", async (importOriginal) => {
 
 vi.mock("~/components/SidebarHeaderNavigationControls", () => ({
   SidebarHeaderNavigationControls: () => null,
+}));
+
+vi.mock("~/components/ui/toast", () => ({
+  toastManager: { add: mocks.toastAdd },
 }));
 
 vi.mock("~/components/workspace/WorkspaceProjectDialogs", () => ({
@@ -63,6 +69,7 @@ vi.mock("~/nativeApi", () => ({
   ensureNativeApi: () => ({
     automation: { list: mocks.automationList },
     dialogs: { confirm: mocks.confirm },
+    git: { init: mocks.gitInit },
     orchestration: { dispatchCommand: mocks.dispatchCommand },
     workspace: {
       listArchivedProjects: mocks.listArchivedProjects,
@@ -163,6 +170,16 @@ function gitState(input: {
   };
 }
 
+function notGitState(projectId: ProjectId): WorkspaceGitStateItem {
+  return {
+    _tag: "not-git",
+    projectId,
+    workspaceRoot: `C:\\code\\${projectId}`,
+    refreshedAt,
+    errors: { local: null, remote: null },
+  };
+}
+
 function archivedProject(
   overrides: Partial<OrchestrationArchivedProjectSummary> = {},
 ): OrchestrationArchivedProjectSummary {
@@ -235,15 +252,18 @@ beforeEach(() => {
   mocks.listArchivedProjects.mockReset();
   mocks.confirm.mockReset();
   mocks.dispatchCommand.mockReset();
+  mocks.gitInit.mockReset();
   mocks.automationList.mockReset();
   mocks.pinProject.mockReset();
   mocks.pinProject.mockReturnValue(true);
   mocks.prunePinnedProjects.mockReset();
+  mocks.toastAdd.mockReset();
   mocks.unpinProject.mockReset();
   mocks.automationList.mockResolvedValue({ definitions: [], runs: [] });
   mocks.listArchivedProjects.mockResolvedValue({ projects: [] });
   mocks.confirm.mockResolvedValue(true);
   mocks.dispatchCommand.mockResolvedValue({ sequence: 1 });
+  mocks.gitInit.mockResolvedValue(undefined);
   mocks.listGitStates.mockImplementation(({ projectIds }: { projectIds: ProjectId[] }) =>
     Promise.resolve({
       items: mocks.gitItems.filter((item) => projectIds.includes(item.projectId)),
@@ -413,6 +433,93 @@ describe("WorkspaceDashboardRoute", () => {
     });
     expect(mocks.listGitStates.mock.calls.filter(([input]) => input.forceRefresh === true)).toEqual(
       [[{ projectIds: [first.id], forceRefresh: true }]],
+    );
+  });
+
+  it("shows Git initialization success only after status refresh succeeds", async () => {
+    const uninitialized = project("initialize-success", "Initialize success");
+    mocks.projects = [uninitialized];
+    mocks.gitItems = [notGitState(uninitialized.id)];
+    await renderDashboard();
+
+    await expect.element(page.getByRole("button", { name: "Initialize Git" })).toBeVisible();
+    mocks.gitItems = [gitState({ projectId: uninitialized.id, dirtyFileCount: 0 })];
+    await page.getByRole("button", { name: "Initialize Git" }).click();
+
+    await vi.waitFor(() => {
+      expect(mocks.gitInit).toHaveBeenCalledWith({ cwd: uninitialized.cwd });
+      expect(mocks.listGitStates).toHaveBeenCalledWith({
+        projectIds: [uninitialized.id],
+        forceRefresh: true,
+      });
+      expect(mocks.toastAdd).toHaveBeenCalledWith({
+        type: "success",
+        title: "Initialized Git in Initialize success",
+      });
+    });
+    expect(mocks.toastAdd).not.toHaveBeenCalledWith(expect.objectContaining({ type: "error" }));
+  });
+
+  it("reports one postcondition error when refreshed status remains not-git", async () => {
+    const uninitialized = project("initialize-still-not-git", "Initialize still not Git");
+    mocks.projects = [uninitialized];
+    mocks.gitItems = [notGitState(uninitialized.id)];
+    await renderDashboard();
+
+    await expect.element(page.getByRole("button", { name: "Initialize Git" })).toBeVisible();
+    await page.getByRole("button", { name: "Initialize Git" }).click();
+
+    await vi.waitFor(() => {
+      expect(mocks.gitInit).toHaveBeenCalledWith({ cwd: uninitialized.cwd });
+      expect(mocks.listGitStates).toHaveBeenCalledWith({
+        projectIds: [uninitialized.id],
+        forceRefresh: true,
+      });
+      expect(mocks.toastAdd).toHaveBeenCalledWith({
+        type: "error",
+        title: "Could not confirm Git initialization",
+        description: "The refreshed workspace status did not report a Git repository.",
+      });
+    });
+    expect(mocks.toastAdd).toHaveBeenCalledTimes(1);
+    expect(mocks.toastAdd).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "success",
+        title: expect.stringContaining("Initialized Git"),
+      }),
+    );
+    expect(mocks.toastAdd).not.toHaveBeenCalledWith(
+      expect.objectContaining({ title: "Could not initialize Git" }),
+    );
+  });
+
+  it("reports a status refresh failure once and suppresses Git initialization success", async () => {
+    const uninitialized = project("initialize-refresh-failure", "Initialize refresh failure");
+    mocks.projects = [uninitialized];
+    mocks.gitItems = [notGitState(uninitialized.id)];
+    await renderDashboard();
+
+    await expect.element(page.getByRole("button", { name: "Initialize Git" })).toBeVisible();
+    mocks.listGitStates.mockRejectedValueOnce(new Error("Status refresh failed"));
+    await page.getByRole("button", { name: "Initialize Git" }).click();
+
+    await vi.waitFor(() => {
+      expect(mocks.gitInit).toHaveBeenCalledWith({ cwd: uninitialized.cwd });
+      expect(mocks.toastAdd).toHaveBeenCalledWith({
+        type: "error",
+        title: "Could not refresh workspace status",
+        description: "Status refresh failed",
+      });
+    });
+    expect(mocks.toastAdd).toHaveBeenCalledTimes(1);
+    expect(mocks.toastAdd).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "success",
+        title: expect.stringContaining("Initialized Git"),
+      }),
+    );
+    expect(mocks.toastAdd).not.toHaveBeenCalledWith(
+      expect.objectContaining({ title: "Could not initialize Git" }),
     );
   });
 

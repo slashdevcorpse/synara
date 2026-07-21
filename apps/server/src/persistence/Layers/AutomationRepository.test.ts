@@ -122,6 +122,7 @@ layer("AutomationRepository", (it) => {
     Effect.gen(function* () {
       const repository = yield* AutomationRepository;
       yield* runMigrations();
+      yield* upsertActiveProjectProjection(ProjectId.makeUnsafe("project-2"));
 
       yield* repository.createDefinition({
         id: AutomationId.makeUnsafe("automation-2"),
@@ -197,6 +198,110 @@ layer("AutomationRepository", (it) => {
       assert.match(error.message, /AutomationRepository\.createRun:missingRow/);
       assert.strictEqual(listed.definitions.length, 0);
       assert.strictEqual(listed.runs.length, 0);
+    }),
+  );
+
+  it.effect("rejects scheduled dedupe readback after the project is archived", () =>
+    Effect.gen(function* () {
+      const repository = yield* AutomationRepository;
+      const sql = yield* SqlClient.SqlClient;
+      yield* runMigrations();
+      const projectId = ProjectId.makeUnsafe("project-archived-run-dedupe");
+      const automationId = AutomationId.makeUnsafe("automation-archived-run-dedupe");
+      const existingRunId = AutomationRunId.makeUnsafe("run-archived-run-dedupe-existing");
+      const rejectedRunId = AutomationRunId.makeUnsafe("run-archived-run-dedupe-rejected");
+      const scheduledFor = "2026-06-16T10:05:00.000Z";
+
+      yield* upsertActiveProjectProjection(projectId);
+      yield* repository.createDefinition({
+        id: automationId,
+        input: createInputForProject(projectId),
+        now: "2026-06-16T10:00:00.000Z",
+      });
+      yield* repository.createRun({
+        id: existingRunId,
+        automationId,
+        projectId,
+        threadId: null,
+        trigger: { type: "scheduled" },
+        scheduledFor,
+        permissionSnapshot,
+        now: "2026-06-16T10:00:00.000Z",
+      });
+      yield* sql`
+        UPDATE projection_projects
+        SET archived_at = '2026-06-16T10:01:00.000Z'
+        WHERE project_id = ${projectId}
+      `;
+
+      const error = yield* repository
+        .createRun({
+          id: rejectedRunId,
+          automationId,
+          projectId,
+          threadId: null,
+          trigger: { type: "scheduled" },
+          scheduledFor,
+          permissionSnapshot,
+          now: "2026-06-16T10:02:00.000Z",
+        })
+        .pipe(Effect.flip);
+
+      assert.match(error.message, /AutomationRepository\.createRun:missingRow/);
+      assert.isTrue(Option.isSome(yield* repository.getRunById({ id: existingRunId })));
+      assert.isTrue(Option.isNone(yield* repository.getRunById({ id: rejectedRunId })));
+    }),
+  );
+
+  it.effect("rejects active-thread readback after the project is deleted", () =>
+    Effect.gen(function* () {
+      const repository = yield* AutomationRepository;
+      const sql = yield* SqlClient.SqlClient;
+      yield* runMigrations();
+      const projectId = ProjectId.makeUnsafe("project-deleted-run-thread");
+      const automationId = AutomationId.makeUnsafe("automation-deleted-run-thread");
+      const threadId = ThreadId.makeUnsafe("thread-deleted-run-thread");
+      const existingRunId = AutomationRunId.makeUnsafe("run-deleted-run-thread-existing");
+      const rejectedRunId = AutomationRunId.makeUnsafe("run-deleted-run-thread-rejected");
+
+      yield* upsertActiveProjectProjection(projectId);
+      yield* repository.createDefinition({
+        id: automationId,
+        input: createInputForProject(projectId),
+        now: "2026-06-16T10:00:00.000Z",
+      });
+      yield* repository.createRun({
+        id: existingRunId,
+        automationId,
+        projectId,
+        threadId,
+        trigger: { type: "manual" },
+        scheduledFor: "2026-06-16T10:01:00.000Z",
+        permissionSnapshot,
+        now: "2026-06-16T10:01:00.000Z",
+      });
+      yield* sql`
+        UPDATE projection_projects
+        SET deleted_at = '2026-06-16T10:02:00.000Z'
+        WHERE project_id = ${projectId}
+      `;
+
+      const error = yield* repository
+        .createRun({
+          id: rejectedRunId,
+          automationId,
+          projectId,
+          threadId,
+          trigger: { type: "manual" },
+          scheduledFor: "2026-06-16T10:03:00.000Z",
+          permissionSnapshot,
+          now: "2026-06-16T10:03:00.000Z",
+        })
+        .pipe(Effect.flip);
+
+      assert.match(error.message, /AutomationRepository\.createRun:missingRow/);
+      assert.isTrue(Option.isSome(yield* repository.getRunById({ id: existingRunId })));
+      assert.isTrue(Option.isNone(yield* repository.getRunById({ id: rejectedRunId })));
     }),
   );
 

@@ -15,18 +15,12 @@ import { ServerConfig } from "../config";
 import { GitCore, type GitCoreShape } from "../git/Services/GitCore";
 
 const CLONE_TIMEOUT_MS = 30 * 60 * 1_000;
+const CLONE_URL_RESOLUTION_TIMEOUT_MS = 5_000;
 const CLONE_MAX_OUTPUT_BYTES = 2_000_000;
-const CLONE_NONINTERACTIVE_UNSET_ENV = [
-  "DISPLAY",
-  "GIT_ASKPASS",
-  "GIT_SSH",
-  "GIT_SSH_COMMAND",
-  "GIT_SSH_VARIANT",
-  "SSH_ASKPASS",
-  "SSH_ASKPASS_REQUIRE",
-  "WAYLAND_DISPLAY",
-] as const;
-const CLONE_SSH_COMMAND = "ssh -o BatchMode=yes -o StrictHostKeyChecking=yes";
+const CLONE_URL_RESOLUTION_MAX_OUTPUT_BYTES = 64_000;
+const CLONE_PROMPT_ENV = ["DISPLAY", "WAYLAND_DISPLAY"] as const;
+const CLONE_PRESERVED_SSH_ENV = new Set(["SSH_AGENT_PID", "SSH_AUTH_SOCK"]);
+const CLONE_SSH_COMMAND = "ssh -F none -o BatchMode=yes -o StrictHostKeyChecking=yes";
 export const WORKSPACE_CLONE_MAX_ACTIVE_JOBS = 4;
 export const WORKSPACE_CLONE_MAX_RETAINED_JOBS = 100;
 
@@ -126,6 +120,50 @@ export function validateWorkspaceCloneUrl(input: string): string {
 function isWorkspaceSshCloneUrl(url: string): boolean {
   const normalized = url.toLowerCase();
   return normalized.startsWith("git@") || normalized.startsWith("ssh://");
+}
+
+function cloneInheritedEnvironmentKeysToUnset(
+  environment: NodeJS.ProcessEnv,
+): ReadonlyArray<string> {
+  const keys = new Set<string>(CLONE_PROMPT_ENV);
+  for (const key of Object.keys(environment)) {
+    const normalized = key.toUpperCase();
+    if (
+      normalized.startsWith("GIT_") ||
+      (normalized.startsWith("SSH_") && !CLONE_PRESERVED_SSH_ENV.has(normalized))
+    ) {
+      keys.add(key);
+    }
+  }
+  return [...keys];
+}
+
+function cloneGitEnvironment(url: string): {
+  readonly unsetEnv: ReadonlyArray<string>;
+  readonly env: NodeJS.ProcessEnv;
+} {
+  const ssh = isWorkspaceSshCloneUrl(url);
+  return {
+    unsetEnv: cloneInheritedEnvironmentKeysToUnset(process.env),
+    env: {
+      GIT_ALLOW_PROTOCOL: ssh ? "ssh" : "https",
+      GIT_TERMINAL_PROMPT: "0",
+      GCM_INTERACTIVE: "Never",
+      ...(ssh ? { GIT_SSH_COMMAND: CLONE_SSH_COMMAND } : {}),
+    },
+  };
+}
+
+function cloneGitConfigArgs(url: string): ReadonlyArray<string> {
+  return [
+    "-c",
+    "credential.interactive=false",
+    "-c",
+    "core.askPass=",
+    ...(isWorkspaceSshCloneUrl(url)
+      ? []
+      : ["-c", "http.curloptResolve=", "-c", "http.sslVerify=true"]),
+  ];
 }
 
 export interface ValidatedWorkspaceCloneTarget {
@@ -377,7 +415,6 @@ export function makeWorkspaceCloneJobs(input: {
     subscriber: CloneSubscriber,
     cloneId: WorkspaceCloneId,
     result: WorkspaceCloneRepositoryResult,
-    retainJob = false,
   ) => {
     const terminal: WorkspaceCloneJobSnapshot = {
       cloneId,
@@ -388,7 +425,6 @@ export function makeWorkspaceCloneJobs(input: {
       result,
       updatedAt: new Date().toISOString(),
     };
-    if (retainJob) retain(terminal);
     return subscriber
       .offer({ _tag: "clone_finished", snapshot: terminal, result })
       .pipe(Effect.andThen(subscriber.end), Effect.asVoid);
@@ -524,6 +560,27 @@ export function makeWorkspaceCloneJobs(input: {
           );
         }
         activeTargets.set(target.lockKey, request.cloneId);
+        const gitEnvironment = cloneGitEnvironment(url);
+        const gitConfigArgs = cloneGitConfigArgs(url);
+        // Keep installed/user credential helpers available, but reject any
+        // url.*.insteadOf expansion before Git talks to the remote.
+        const resolution = yield* input.git.execute({
+          operation: "WorkspaceCloneJobs.resolveRepositoryUrl",
+          cwd: target.parentPath,
+          args: [...gitConfigArgs, "ls-remote", "--get-url", "--", url],
+          ...gitEnvironment,
+          stdin: "ignore",
+          timeoutMs: CLONE_URL_RESOLUTION_TIMEOUT_MS,
+          maxOutputBytes: CLONE_URL_RESOLUTION_MAX_OUTPUT_BYTES,
+        });
+        if (resolution.stdout.trim() !== url) {
+          return yield* Effect.fail(
+            new WorkspaceCloneValidationError(
+              "WORKSPACE_CLONE_URL_REWRITE_BLOCKED",
+              "Git configuration must not rewrite the validated GitHub repository URL.",
+            ),
+          );
+        }
         ownedDirectory = yield* Effect.tryPromise({
           try: () => createOwnedCloneDirectory(target!),
           catch: (cause) => cause,
@@ -541,23 +598,8 @@ export function makeWorkspaceCloneJobs(input: {
         yield* input.git.execute({
           operation: "WorkspaceCloneJobs.cloneRepository",
           cwd: target.parentPath,
-          args: [
-            "-c",
-            "credential.interactive=false",
-            "-c",
-            "core.askPass=",
-            "clone",
-            "--progress",
-            "--",
-            url,
-            target.targetPath,
-          ],
-          unsetEnv: CLONE_NONINTERACTIVE_UNSET_ENV,
-          env: {
-            GIT_TERMINAL_PROMPT: "0",
-            GCM_INTERACTIVE: "Never",
-            ...(isWorkspaceSshCloneUrl(url) ? { GIT_SSH_COMMAND: CLONE_SSH_COMMAND } : {}),
-          },
+          args: [...gitConfigArgs, "clone", "--progress", "--", url, target.targetPath],
+          ...gitEnvironment,
           stdin: "ignore",
           timeoutMs: CLONE_TIMEOUT_MS,
           maxOutputBytes: CLONE_MAX_OUTPUT_BYTES,
@@ -599,7 +641,7 @@ export function makeWorkspaceCloneJobs(input: {
         const projectSnapshot = snapshot(request.cloneId, {
           status: "running",
           stage: "creating-project",
-          percent: 99,
+          percent: Math.max(latestPercent, 99),
           message: "Creating Synara project…",
           result: null,
         });
@@ -714,7 +756,7 @@ export function makeWorkspaceCloneJobs(input: {
         const progress = snapshot(cloneId, {
           status: "running",
           stage: "creating-project",
-          percent: 99,
+          percent: Math.max(current.percent ?? 0, 99),
           message: "Retrying Synara project creation…",
           result: null,
         });

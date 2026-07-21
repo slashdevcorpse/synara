@@ -525,6 +525,30 @@ const makeAutomationRepository = Effect.gen(function* () {
       `,
   });
 
+  // INSERT OR IGNORE can mean either legitimate dedupe or a blocked project. Recheck the
+  // same durable visibility fence immediately before returning any readback row. Missing
+  // projections remain allowed for import/repair compatibility, matching insertRun above.
+  const getRunAdmissionRow = SqlSchema.findOneOption({
+    Request: Schema.Struct({ projectId: ProjectId }),
+    Result: Schema.Struct({ projectId: ProjectId }),
+    execute: ({ projectId }) =>
+      sql`
+        SELECT ${projectId} AS "projectId"
+        WHERE NOT EXISTS (
+          SELECT 1
+          FROM projection_projects
+          WHERE project_id = ${projectId}
+        )
+          OR EXISTS (
+            SELECT 1
+            FROM projection_projects
+            WHERE project_id = ${projectId}
+              AND deleted_at IS NULL
+              AND archived_at IS NULL
+          )
+      `,
+  });
+
   const getRunRowById = SqlSchema.findOneOption({
     Request: GetAutomationRunInput,
     Result: AutomationRunDbRow,
@@ -1275,28 +1299,40 @@ const makeAutomationRepository = Effect.gen(function* () {
       createdAt: input.now,
       updatedAt: input.now,
     };
-    const decodeInserted = (rowOption: Option.Option<AutomationRunDbRow>) =>
+    const missingRun = () =>
+      Effect.fail(
+        toPersistenceDecodeCauseError("AutomationRepository.createRun:missingRow")(
+          new Error("Automation run was not inserted or found."),
+        ),
+      );
+    const decodeAdmitted = (rowOption: Option.Option<AutomationRunDbRow>) =>
       Option.match(rowOption, {
-        onNone: () =>
-          Effect.fail(
-            toPersistenceDecodeCauseError("AutomationRepository.createRun:missingRow")(
-              new Error("Automation run was not inserted or found."),
+        onNone: missingRun,
+        onSome: (row) =>
+          getRunAdmissionRow({ projectId: input.projectId }).pipe(
+            Effect.mapError(
+              toPersistenceSqlError("AutomationRepository.createRun:selectProjectAdmission"),
+            ),
+            Effect.flatMap(
+              Option.match({
+                onNone: missingRun,
+                onSome: () => toRun(row),
+              }),
             ),
           ),
-        onSome: toRun,
       });
-    const decodeInsertedOrActiveThread = (rowOption: Option.Option<AutomationRunDbRow>) =>
+    const decodeAdmittedOrActiveThread = (rowOption: Option.Option<AutomationRunDbRow>) =>
       Option.match(rowOption, {
-        onSome: toRun,
+        onSome: (row) => decodeAdmitted(Option.some(row)),
         onNone: () =>
           input.threadId
             ? getRunRowByThread({ threadId: input.threadId }).pipe(
                 Effect.mapError(
                   toPersistenceSqlError("AutomationRepository.createRun:selectActiveThread"),
                 ),
-                Effect.flatMap(decodeInserted),
+                Effect.flatMap(decodeAdmitted),
               )
-            : decodeInserted(rowOption),
+            : decodeAdmitted(rowOption),
       });
     const inserted = insertRun({
       ...run,
@@ -1314,7 +1350,7 @@ const makeAutomationRepository = Effect.gen(function* () {
             scheduledFor: input.scheduledFor,
           }).pipe(
             Effect.mapError(toPersistenceSqlError("AutomationRepository.createRun:select")),
-            Effect.flatMap(decodeInsertedOrActiveThread),
+            Effect.flatMap(decodeAdmittedOrActiveThread),
           ),
         ),
       );
@@ -1323,7 +1359,7 @@ const makeAutomationRepository = Effect.gen(function* () {
       Effect.flatMap(() =>
         getRunRowById({ id: input.id }).pipe(
           Effect.mapError(toPersistenceSqlError("AutomationRepository.createRun:select")),
-          Effect.flatMap(decodeInsertedOrActiveThread),
+          Effect.flatMap(decodeAdmittedOrActiveThread),
         ),
       ),
     );

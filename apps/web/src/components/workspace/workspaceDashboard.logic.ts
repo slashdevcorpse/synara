@@ -134,7 +134,7 @@ function automationStatusLabel(status: AutomationRun["status"]): string {
 }
 
 function deriveAutomation(run: WorkspaceAutomationRun): WorkspaceAutomationActivity {
-  const occurredAt = run.finishedAt ?? run.startedAt ?? run.updatedAt ?? run.createdAt;
+  const occurredAt = run.finishedAt ?? run.updatedAt ?? run.startedAt ?? run.createdAt;
   return {
     runId: run.id,
     threadId: run.threadId,

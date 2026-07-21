@@ -343,8 +343,79 @@ describe("workspace dashboard derivation", () => {
       label: "Automation running",
       isActive: true,
       threadId: threadId("automation-thread"),
+      occurredAt: "2026-07-20T12:01:00.000Z",
     });
+    expect(cards[0]?.recentAt).toBe("2026-07-20T12:01:00.000Z");
     expect(filterAndSortWorkspaceCards(cards, "active", "recent")).toHaveLength(1);
+  });
+
+  it("selects unfinished automation by its latest update rather than its start", () => {
+    const cards = deriveWorkspaceCards({
+      projects: [project("one", "One")],
+      repositoryByProjectId: new Map([[projectId("one"), gitState(0)]]),
+      worktreePathPlatform: "windows",
+      threads: [],
+      automationRuns: [
+        {
+          id: "long-running",
+          projectId: projectId("one"),
+          threadId: threadId("long-running-thread"),
+          status: "running",
+          startedAt: "2026-07-20T10:00:00.000Z",
+          finishedAt: null,
+          updatedAt: "2026-07-20T15:00:00.000Z",
+          createdAt: "2026-07-20T10:00:00.000Z",
+        },
+        {
+          id: "newer-start",
+          projectId: projectId("one"),
+          threadId: threadId("newer-start-thread"),
+          status: "claimed",
+          startedAt: "2026-07-20T14:00:00.000Z",
+          finishedAt: null,
+          updatedAt: "2026-07-20T14:05:00.000Z",
+          createdAt: "2026-07-20T14:00:00.000Z",
+        },
+      ],
+    });
+
+    expect(cards[0]?.automation).toMatchObject({
+      runId: "long-running",
+      occurredAt: "2026-07-20T15:00:00.000Z",
+    });
+    expect(cards[0]?.recentAt).toBe("2026-07-20T15:00:00.000Z");
+  });
+
+  it("sorts recent projects using unfinished automation updates", () => {
+    const cards = deriveWorkspaceCards({
+      projects: [project("automation", "Automation"), project("thread", "Thread")],
+      repositoryByProjectId: new Map([
+        [projectId("automation"), gitState(0)],
+        [projectId("thread"), gitState(0)],
+      ]),
+      worktreePathPlatform: "windows",
+      threads: [
+        thread("recent-thread", "thread", {
+          updatedAt: "2026-07-20T14:30:00.000Z",
+        }),
+      ],
+      automationRuns: [
+        {
+          id: "recently-updated",
+          projectId: projectId("automation"),
+          threadId: threadId("automation-thread"),
+          status: "waiting-for-approval",
+          startedAt: "2026-07-20T10:00:00.000Z",
+          finishedAt: null,
+          updatedAt: "2026-07-20T15:00:00.000Z",
+          createdAt: "2026-07-20T10:00:00.000Z",
+        },
+      ],
+    });
+
+    expect(
+      filterAndSortWorkspaceCards(cards, "all", "recent").map((card) => card.project.id),
+    ).toEqual([projectId("automation"), projectId("thread")]);
   });
 
   it("keeps a live automation visible when a newer run has already finished", () => {
@@ -371,7 +442,7 @@ describe("workspace dashboard derivation", () => {
           status: "succeeded",
           startedAt: "2026-07-20T12:30:00.000Z",
           finishedAt: "2026-07-20T13:00:00.000Z",
-          updatedAt: "2026-07-20T13:00:00.000Z",
+          updatedAt: "2026-07-20T14:00:00.000Z",
           createdAt: "2026-07-20T12:30:00.000Z",
         },
       ],
