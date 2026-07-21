@@ -172,11 +172,15 @@ jobs:
         id: unit_tests
         if: matrix.platform == 'linux'
         timeout-minutes: 30
+        env:
+          TURBO_CONCURRENCY: "50%"
         run: bun run test:ci
 
       - name: Run cross-platform unit suite
         if: matrix.platform != 'linux'
         timeout-minutes: 30
+        env:
+          TURBO_CONCURRENCY: "50%"
         run: bun turbo test
 
       - name: Upload test results to Mergify CI Insights

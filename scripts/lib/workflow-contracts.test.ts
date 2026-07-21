@@ -132,12 +132,16 @@ const ciRootTestStep = [
   "        id: unit_tests",
   "        if: matrix.platform == 'linux'",
   "        timeout-minutes: 30",
+  "        env:",
+  '          TURBO_CONCURRENCY: "50%"',
   "        run: bun run test:ci",
 ].join("\n");
 const nonLinuxUnitTestStep = [
   "      - name: Run cross-platform unit suite",
   "        if: matrix.platform != 'linux'",
   "        timeout-minutes: 30",
+  "        env:",
+  '          TURBO_CONCURRENCY: "50%"',
   "        run: bun turbo test",
 ].join("\n");
 const codecovCoverageUploadStep = [
@@ -524,6 +528,29 @@ describe("workflow contracts", () => {
         .replace(`${nonLinuxUnitTestStep}\n`, `${nonLinuxUnitTestStep}\n\n${setupStep}\n`),
     );
     expect(misplacedSetup).toContain("unit Windows launcher setup must run before bun turbo test");
+  });
+
+  it("bounds Turbo concurrency for both matrix test commands", () => {
+    for (const [step, command] of [
+      [ciRootTestStep, "bun run test:ci"],
+      [nonLinuxUnitTestStep, "bun turbo test"],
+    ] as const) {
+      const missing = errorsFor(
+        ciWorkflow.replace(
+          step,
+          step.replace('        env:\n          TURBO_CONCURRENCY: "50%"\n', ""),
+        ),
+      );
+      expect(missing).toContain(`unit ${command} must set TURBO_CONCURRENCY to 50%`);
+
+      const unbounded = errorsFor(
+        ciWorkflow.replace(
+          step,
+          step.replace('          TURBO_CONCURRENCY: "50%"', '          TURBO_CONCURRENCY: "100%"'),
+        ),
+      );
+      expect(unbounded).toContain(`unit ${command} must set TURBO_CONCURRENCY to 50%`);
+    }
   });
 
   it("retains unit-matrix timeout headroom", () => {

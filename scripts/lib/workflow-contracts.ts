@@ -52,6 +52,7 @@ const WINDOWS_JOB_LAUNCHER_ARM64_COMMAND =
 const WINDOWS_JOB_CONTAINMENT_TEST_COMMAND =
   "bun run --cwd apps/server test src/provider/windowsProviderProcess.test.ts src/provider/windowsProviderProcess.windows.test.ts";
 const UNIT_WINDOWS_SETUP_CONDITION = "matrix.platform == 'windows'";
+const UNIT_TURBO_CONCURRENCY = "50%";
 const CI_QUALITY_REQUIRED_COMMANDS = [
   "node scripts/validate-downstream-state.ts",
   "node scripts/verify-workflow-contracts.ts",
@@ -389,6 +390,18 @@ function validateNativePersistenceSmoke(
   }
 }
 
+function validateUnitTestConcurrency(
+  workflowPath: string,
+  step: WorkflowRunStep,
+  errors: string[],
+): void {
+  if (workflowStepEnvironmentValue(step, "TURBO_CONCURRENCY") !== UNIT_TURBO_CONCURRENCY) {
+    errors.push(
+      `${workflowPath} unit ${step.command} must set TURBO_CONCURRENCY to ${UNIT_TURBO_CONCURRENCY}.`,
+    );
+  }
+}
+
 function validateUnitMatrix(jobs: UnknownRecord, workflowPath: string, errors: string[]): void {
   const unitJob = jobs.unit;
   if (!isRecord(unitJob)) {
@@ -460,6 +473,7 @@ function validateUnitMatrix(jobs: UnknownRecord, workflowPath: string, errors: s
         `${workflowPath} unit ${CI_ROOT_TEST_COMMAND} must use id unit_tests for report upload conditions.`,
       );
     }
+    validateUnitTestConcurrency(workflowPath, linuxTestStep, errors);
   }
 
   const nonLinuxTestSteps = unitSteps.filter((step) => step.command === FULL_UNIT_COMMAND);
@@ -482,6 +496,7 @@ function validateUnitMatrix(jobs: UnknownRecord, workflowPath: string, errors: s
         `${workflowPath} unit ${FULL_UNIT_COMMAND} timeout must be ${UNIT_STEP_TIMEOUT_MINUTES} minutes.`,
       );
     }
+    validateUnitTestConcurrency(workflowPath, nonLinuxTestStep, errors);
   }
 
   const windowsSetupSteps = unitSteps.filter(
