@@ -253,6 +253,13 @@ export interface DesktopUpdateActionResult {
 
 export interface BrowserTabState {
   id: string;
+  /**
+   * User-facing path for a server-authorized local preview. When present,
+   * `url` is the internal HTTP capability URL and must not be shown or shared.
+   */
+  localFilePath?: string | null;
+  /** Changes whenever the tab crosses a local-preview security identity. */
+  securityEpoch?: number;
   url: string;
   title: string;
   status: "live" | "suspended";
@@ -276,6 +283,8 @@ export interface ThreadBrowserState {
 export interface BrowserOpenInput {
   threadId: ThreadId;
   initialUrl?: string;
+  /** Pairs `initialUrl` with an already-minted local-preview capability. */
+  localFilePath?: string | null;
 }
 
 export interface BrowserThreadInput {
@@ -291,11 +300,15 @@ export interface BrowserNavigateInput {
   threadId: ThreadId;
   tabId?: string;
   url: string;
+  /** Pairs `url` with an already-minted local-preview capability. */
+  localFilePath?: string | null;
 }
 
 export interface BrowserNewTabInput {
   threadId: ThreadId;
   url?: string;
+  /** Pairs `url` with an already-minted local-preview capability. */
+  localFilePath?: string | null;
   activate?: boolean;
 }
 

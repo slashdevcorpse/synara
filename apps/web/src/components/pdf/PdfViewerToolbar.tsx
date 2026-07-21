@@ -3,7 +3,7 @@
 //          file name + "PDF" label on the left, centered page navigation, and
 //          zoom controls + the shared "Open in editor" split button on the right.
 // Layer: Web PDF viewer chrome
-// Exports: PdfViewerToolbar
+// Exports: PdfViewerToolbar, PdfPanelCloseButton
 
 import { useState } from "react";
 
@@ -12,6 +12,7 @@ import {
   ChevronLeftIcon,
   ChevronRightIcon,
   MinusIcon,
+  PanelRightCloseIcon,
   PlusIcon,
 } from "~/lib/icons";
 import { formatZoomPercent, PDF_ZOOM_PRESETS, type PdfZoomMode } from "~/lib/pdf/pdfZoom";
@@ -39,6 +40,23 @@ interface PdfViewerToolbarProps {
   onFitWidth: () => void;
   onFitPage: () => void;
   openInTarget: string | null;
+  onClosePanel?: (() => void) | undefined;
+}
+
+export function PdfPanelCloseButton(props: {
+  onClosePanel?: (() => void) | undefined;
+  className?: string;
+}) {
+  return props.onClosePanel ? (
+    <ChatHeaderIconButton
+      label="Close file panel"
+      tone="plain"
+      className={props.className}
+      onClick={props.onClosePanel}
+    >
+      <PanelRightCloseIcon aria-hidden="true" className="size-3.5" />
+    </ChatHeaderIconButton>
+  ) : null;
 }
 
 function zoomSelectionValue(mode: PdfZoomMode, scale: number): string {
@@ -150,6 +168,7 @@ export const PdfViewerToolbar = function PdfViewerToolbar(props: PdfViewerToolba
           labelMode="always"
           defaultEditor="system-default"
         />
+        <PdfPanelCloseButton onClosePanel={props.onClosePanel} />
       </div>
     </div>
   );

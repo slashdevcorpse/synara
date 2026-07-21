@@ -5,7 +5,7 @@
 import { spawnSync } from "node:child_process";
 
 export interface ReleaseWorktreeCleanlinessInput {
-  readonly trackedBytesDiffer: boolean;
+  readonly trackedPaths: ReadonlyArray<string>;
   readonly untrackedPaths: ReadonlyArray<string>;
   readonly allowedOutputRoots: ReadonlyArray<string>;
 }
@@ -24,8 +24,10 @@ function normalizeOutputRoot(value: string): string {
 }
 
 export function validateReleaseWorktreeCleanliness(input: ReleaseWorktreeCleanlinessInput): void {
-  if (input.trackedBytesDiffer) {
-    throw new Error("Tracked release source bytes differ from the recorded HEAD commit.");
+  if (input.trackedPaths.length > 0) {
+    throw new Error(
+      `Tracked release source bytes differ from the recorded HEAD commit: ${input.trackedPaths.join(", ")}.`,
+    );
   }
   const allowedRoots = input.allowedOutputRoots.map(normalizeOutputRoot);
   const unexpected = input.untrackedPaths
@@ -59,8 +61,8 @@ export function verifyReleaseWorktreeCleanliness(
   repoRoot: string,
   allowedOutputRoots: ReadonlyArray<string> = [],
 ): void {
-  const diff = runGit(repoRoot, ["diff", "--quiet", "--no-ext-diff", "HEAD", "--", "."]);
-  if (diff.status !== 0 && diff.status !== 1) {
+  const diff = runGit(repoRoot, ["diff", "--name-only", "--no-ext-diff", "-z", "HEAD", "--", "."]);
+  if (diff.status !== 0) {
     throw new Error(`Unable to compare release worktree with HEAD: ${diff.stderr.trim()}.`);
   }
   const untracked = runGit(repoRoot, ["ls-files", "--others", "--exclude-standard", "-z"]);
@@ -68,7 +70,7 @@ export function verifyReleaseWorktreeCleanliness(
     throw new Error(`Unable to enumerate untracked release files: ${untracked.stderr.trim()}.`);
   }
   validateReleaseWorktreeCleanliness({
-    trackedBytesDiffer: diff.status === 1,
+    trackedPaths: diff.stdout.split("\0").filter(Boolean),
     untrackedPaths: untracked.stdout.split("\0").filter(Boolean),
     allowedOutputRoots,
   });

@@ -7,20 +7,25 @@
 
 import type { ChatFileReference } from "~/lib/chatReferences";
 import type { FileCommentSelection } from "~/lib/fileComments";
+import type { WorkspaceHtmlBrowserOpenHandler } from "~/lib/workspaceFileOpener";
 import { WorkspaceFilePreview } from "../WorkspaceFilePreview";
 import { PanelStateMessage } from "./PanelStateMessage";
 
 export function DockFilePane(props: {
   workspaceRoot: string | null;
   filePath: string | null;
+  referenceRoot?: string | null;
   onReferenceInChat?: ((reference: ChatFileReference) => void) | undefined;
   onAskWhyInChat?: ((reference: ChatFileReference) => void) | undefined;
   onCommentInChat?: ((comment: FileCommentSelection) => void) | undefined;
+  onOpenInBrowser?: WorkspaceHtmlBrowserOpenHandler | undefined;
+  onClosePanel?: (() => void) | undefined;
 }) {
   return (
     <WorkspaceFilePreview
       workspaceRoot={props.workspaceRoot}
       filePath={props.filePath}
+      referenceRoot={props.referenceRoot}
       markdownPreviewDefault
       emptyState={
         <PanelStateMessage density="compact" fill="flex">
@@ -30,6 +35,8 @@ export function DockFilePane(props: {
       onReferenceInChat={props.onReferenceInChat}
       onAskWhyInChat={props.onAskWhyInChat}
       onCommentInChat={props.onCommentInChat}
+      onOpenInBrowser={props.onOpenInBrowser}
+      onClosePanel={props.onClosePanel}
     />
   );
 }

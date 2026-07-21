@@ -11,7 +11,9 @@
     "start": "bun run scripts/start-electron.mjs",
     "typecheck": "tsc --noEmit",
     "test": "vitest run --passWithNoTests",
-    "smoke-test": "node scripts/smoke-test.mjs"
+    "test:local-preview-security": "node scripts/local-preview-runtime-security-runner.mjs",
+    "smoke-test": "node scripts/smoke-test.mjs",
+    "persistence-smoke-test": "node scripts/session-persistence-smoke.mjs"
   },
   "dependencies": {
     "effect": "catalog:",

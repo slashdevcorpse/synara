@@ -4,6 +4,7 @@ import {
   isLocalPreviewGrantUsable,
   LOCAL_PREVIEW_GRANT_MAX_REFETCH_INTERVAL_MS,
   localPreviewGrantRefetchIntervalMs,
+  projectLocalHtmlPreviewGrantQueryOptions,
   projectLocalPreviewGrantQueryOptions,
 } from "./projectReactQuery";
 
@@ -55,5 +56,23 @@ describe("local preview grant query options", () => {
         state: { data: { grant: "grant-token", expiresAt: "not-a-date" } },
       } as never),
     ).toBe(LOCAL_PREVIEW_GRANT_MAX_REFETCH_INTERVAL_MS);
+  });
+
+  it("keeps directory HTML grants purpose-scoped and free of background polling", () => {
+    const options = projectLocalHtmlPreviewGrantQueryOptions({
+      path: "docs/demo.html",
+      cwd: "/repo/worktree",
+      purpose: "preview",
+    });
+
+    expect(options.queryKey).toEqual([
+      "projects",
+      "local-html-preview-grant",
+      "docs/demo.html",
+      "/repo/worktree",
+      "preview",
+    ]);
+    expect(options.refetchInterval).toBe(false);
+    expect(options.refetchOnWindowFocus).toBe(false);
   });
 });

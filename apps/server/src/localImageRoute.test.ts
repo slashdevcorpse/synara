@@ -2,7 +2,7 @@
 // Boots the same `localImageEffectRouteLayer` that `makeEffectHttpRouteLayer` wires
 // into `effectServer.ts` and exercises it through a real HTTP listener.
 import http from "node:http";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -11,7 +11,7 @@ import { DateTime, Effect, Exit, Layer, Scope } from "effect";
 import { HttpRouter } from "effect/unstable/http";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { ServerAuth, type ServerAuthShape } from "./auth/Services/ServerAuth";
+import { AuthError, ServerAuth, type ServerAuthShape } from "./auth/Services/ServerAuth";
 import {
   resolveDefaultChatWorkspaceRoot,
   resolveDefaultStudioWorkspaceRoot,
@@ -19,7 +19,7 @@ import {
   type ServerConfigShape,
 } from "./config";
 import { attachmentsEffectRouteLayer, localImageEffectRouteLayer } from "./http";
-import { createLocalPreviewGrant } from "./localImageFiles";
+import { LOCAL_PREVIEW_GRANT_TTL_MS, createLocalPreviewGrant } from "./localImageFiles";
 import { ManagedAttachmentRepositoryLive } from "./persistence/Layers/ManagedAttachments";
 import { SqlitePersistenceMemory } from "./persistence/Layers/Sqlite";
 
@@ -64,7 +64,7 @@ function makeServerConfig(overrides: Partial<ServerConfigShape> = {}): ServerCon
   } as ServerConfigShape;
 }
 
-function makeFakeServerAuth(): ServerAuthShape {
+function makeFakeServerAuth(options: { rejectHttpAuthentication?: boolean } = {}): ServerAuthShape {
   const expiresAt = Effect.runSync(DateTime.now);
   const descriptor = {
     policy: "loopback-browser" as const,
@@ -108,7 +108,10 @@ function makeFakeServerAuth(): ServerAuthShape {
     revokeClientSession: () => Effect.succeed(true),
     revokeOtherClientSessions: () => Effect.succeed(1),
     logoutSession: () => Effect.succeed(true),
-    authenticateHttpRequest: () => Effect.succeed({ ...session, credentialSource: "cookie" }),
+    authenticateHttpRequest: () =>
+      options.rejectHttpAuthentication === true
+        ? Effect.fail(new AuthError({ message: "Authentication required.", status: 401 }))
+        : Effect.succeed({ ...session, credentialSource: "cookie" }),
     authenticateWebSocketUpgrade: () => Effect.succeed(session),
     issueWebSocketToken: () => Effect.succeed({ token: "ws-token", expiresAt }),
     issueStartupPairingUrl: () => Effect.succeed("http://127.0.0.1:3773/pair#token=PAIRINGTOKEN"),
@@ -119,6 +122,7 @@ async function withEffectServer(
   config: ServerConfigShape,
   routeLayer: typeof localImageEffectRouteLayer | typeof attachmentsEffectRouteLayer,
   run: (origin: string) => Promise<void>,
+  serverAuth: ServerAuthShape = makeFakeServerAuth(),
 ): Promise<void> {
   const scope = await Effect.runPromise(Scope.make("sequential"));
   let nodeServer: http.Server | null = null;
@@ -141,7 +145,7 @@ async function withEffectServer(
           Effect.provide(
             Layer.mergeAll(
               Layer.succeed(ServerConfig, config),
-              Layer.succeed(ServerAuth, makeFakeServerAuth()),
+              Layer.succeed(ServerAuth, serverAuth),
               ManagedAttachmentRepositoryLive.pipe(Layer.provideMerge(SqlitePersistenceMemory)),
               NodeHttpServer.layerHttpServices,
             ),
@@ -159,6 +163,31 @@ async function withEffectServer(
   } finally {
     await Effect.runPromise(Scope.close(scope, Exit.void));
   }
+}
+
+async function requestRawPath(
+  origin: string,
+  requestPath: string,
+): Promise<{ readonly status: number; readonly headers: http.IncomingHttpHeaders }> {
+  const url = new URL(origin);
+  return await new Promise((resolve, reject) => {
+    const request = http.request(
+      {
+        host: url.hostname,
+        port: url.port,
+        method: "GET",
+        path: requestPath,
+      },
+      (response) => {
+        response.resume();
+        response.once("end", () =>
+          resolve({ status: response.statusCode ?? 0, headers: response.headers }),
+        );
+      },
+    );
+    request.once("error", reject);
+    request.end();
+  });
 }
 
 describe("localImageEffectRouteLayer", () => {
@@ -298,6 +327,222 @@ describe("localImageEffectRouteLayer", () => {
       const params = new URLSearchParams({ path: ghostPath, cwd: workspace });
       const response = await fetch(`${origin}/api/local-image?${params}`);
       expect(response.status).toBe(404);
+    });
+  });
+
+  it("serves a preview capability and nested assets without request authentication", async () => {
+    const workspace = makeTempDir("synara-effect-directory-preview-");
+    const siteDir = path.join(workspace, "site");
+    const entryPath = path.join(siteDir, "index.html");
+    const cssPath = path.join(siteDir, "assets", "site.css");
+    const jsPath = path.join(siteDir, "assets", "app.js");
+    const wasmPath = path.join(siteDir, "assets", "app.wasm");
+    const imagePath = path.join(siteDir, "assets", "hero.png");
+    const pdfPath = path.join(siteDir, "assets", "spec.pdf");
+    mkdirSync(path.dirname(cssPath), { recursive: true });
+    const entryContents = "<!doctype html><link rel=stylesheet href=assets/site.css>";
+    writeFileSync(entryPath, entryContents);
+    writeFileSync(cssPath, "body { color: red; }");
+    writeFileSync(jsPath, "globalThis.loaded = true;");
+    writeFileSync(wasmPath, Buffer.from([0x00, 0x61, 0x73, 0x6d]));
+    writeFileSync(imagePath, Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+    writeFileSync(pdfPath, Buffer.from("%PDF-1.4"));
+    const grant = await createLocalPreviewGrant({
+      requestedPath: entryPath,
+      cwd: workspace,
+      allowedWorkspaceRoots: [workspace],
+      scope: "directory",
+      purpose: "preview",
+    });
+    const config = makeServerConfig({ cwd: workspace, authToken: "desktop-secret" });
+
+    await withEffectServer(
+      config,
+      localImageEffectRouteLayer,
+      async (origin) => {
+        const entryResponse = await fetch(`${origin}${grant.urlPath}`);
+        expect(entryResponse.status).toBe(200);
+        expect(entryResponse.headers.get("content-type")).toBe("text/html; charset=utf-8");
+        expect(entryResponse.headers.get("content-length")).toBe(
+          String(Buffer.byteLength(entryContents)),
+        );
+        expect(entryResponse.headers.get("cache-control")).toBe("no-store");
+        expect(entryResponse.headers.get("x-content-type-options")).toBe("nosniff");
+        expect(entryResponse.headers.get("referrer-policy")).toBe("no-referrer");
+        const previewCsp = entryResponse.headers.get("content-security-policy") ?? "";
+        expect(previewCsp).toContain("sandbox");
+        expect(previewCsp).toContain("script-src 'none'");
+        expect(previewCsp).toContain("connect-src 'none'");
+
+        const routeRoot = grant.urlPath?.slice(0, grant.urlPath.lastIndexOf("/") + 1);
+        const cssResponse = await fetch(`${origin}${routeRoot}assets/site.css`, {
+          headers: { Origin: "null" },
+        });
+        const jsResponse = await fetch(`${origin}${routeRoot}assets/app.js`);
+        const wasmResponse = await fetch(`${origin}${routeRoot}assets/app.wasm`);
+        const imageResponse = await fetch(`${origin}${routeRoot}assets/hero.png`);
+        const pdfResponse = await fetch(`${origin}${routeRoot}assets/spec.pdf`);
+        expect(cssResponse.headers.get("content-type")).toBe("text/css; charset=utf-8");
+        expect(cssResponse.headers.get("access-control-allow-origin")).toBe("null");
+        expect(cssResponse.headers.get("vary")).toBe("Origin");
+        expect(jsResponse.headers.get("content-type")).toBe("text/javascript; charset=utf-8");
+        expect(wasmResponse.headers.get("content-type")).toBe("application/wasm");
+        expect(imageResponse.headers.get("content-type")).toBe("image/png");
+        expect(pdfResponse.headers.get("content-type")).toBe("application/pdf");
+
+        const untrustedOriginResponse = await fetch(`${origin}${routeRoot}assets/site.css`, {
+          headers: { Origin: "https://example.test" },
+        });
+        expect(untrustedOriginResponse.headers.get("access-control-allow-origin")).toBeNull();
+        expect(untrustedOriginResponse.headers.get("vary")).toBe("Origin");
+      },
+      makeFakeServerAuth({ rejectHttpAuthentication: true }),
+    );
+  });
+
+  it("limits browser-purpose CSP access to the exact capability path", async () => {
+    const workspace = makeTempDir("synara-effect-directory-browser-");
+    const entryPath = path.join(workspace, "index.html");
+    writeFileSync(entryPath, "<!doctype html><script src=app.js></script>");
+    writeFileSync(path.join(workspace, "app.js"), "globalThis.loaded = true;");
+    const grant = await createLocalPreviewGrant({
+      requestedPath: entryPath,
+      cwd: workspace,
+      allowedWorkspaceRoots: [workspace],
+      scope: "directory",
+      purpose: "browser",
+    });
+    const config = makeServerConfig({ cwd: workspace });
+
+    await withEffectServer(config, localImageEffectRouteLayer, async (origin) => {
+      const response = await fetch(`${origin}${grant.urlPath}`);
+      expect(response.status).toBe(200);
+      const csp = response.headers.get("content-security-policy") ?? "";
+      const capabilitySource = `${origin}${grant.urlPath?.slice(0, grant.urlPath.lastIndexOf("/") + 1)}`;
+      expect(csp).toContain(`script-src 'unsafe-inline' 'wasm-unsafe-eval' ${capabilitySource}`);
+      expect(csp).toContain(`connect-src ${capabilitySource}`);
+      expect(csp).toContain("webrtc 'block'");
+      expect(csp).toContain("frame-src 'none'");
+      expect(csp).toContain("child-src 'none'");
+      expect(csp).toContain("worker-src 'none'");
+      expect(csp).not.toContain("'self'");
+      expect(csp).not.toContain("ws:");
+      expect(csp).not.toContain(`${origin}/api/auth`);
+      expect(csp).toMatch(/(^|;)\s*sandbox allow-scripts(?:;|$)/);
+      expect(csp).not.toContain("allow-same-origin");
+      expect(response.headers.get("access-control-allow-origin")).toBe("null");
+      expect(response.headers.get("x-dns-prefetch-control")).toBe("off");
+
+      const scriptResponse = await fetch(
+        `${origin}${grant.urlPath?.slice(0, grant.urlPath.lastIndexOf("/") + 1)}app.js`,
+        { headers: { Origin: "null" } },
+      );
+      expect(scriptResponse.status).toBe(200);
+      expect(scriptResponse.headers.get("access-control-allow-origin")).toBe("null");
+    });
+  });
+
+  it("rejects wrong and expired capabilities, unsupported assets, and traversal", async () => {
+    const workspace = makeTempDir("synara-effect-directory-rejections-");
+    const entryPath = path.join(workspace, "index.html");
+    writeFileSync(entryPath, "<!doctype html>");
+    writeFileSync(path.join(workspace, "secret.js"), "globalThis.secret = true;");
+    writeFileSync(path.join(workspace, "payload.bin"), Buffer.from([0, 1, 2]));
+    const grant = await createLocalPreviewGrant({
+      requestedPath: entryPath,
+      cwd: workspace,
+      allowedWorkspaceRoots: [workspace],
+      scope: "directory",
+      purpose: "preview",
+    });
+    const expiredGrant = await createLocalPreviewGrant({
+      requestedPath: entryPath,
+      cwd: workspace,
+      allowedWorkspaceRoots: [workspace],
+      scope: "directory",
+      purpose: "preview",
+      nowMs: Date.now() - LOCAL_PREVIEW_GRANT_TTL_MS - 1_000,
+    });
+    const config = makeServerConfig({ cwd: workspace });
+
+    await withEffectServer(config, localImageEffectRouteLayer, async (origin) => {
+      const routeRoot = grant.urlPath?.slice(0, grant.urlPath.lastIndexOf("/") + 1);
+      expect((await fetch(`${origin}/api/local-preview/wrong-token/index.html`)).status).toBe(404);
+      expect((await fetch(`${origin}${expiredGrant.urlPath}`)).status).toBe(404);
+      expect((await fetch(`${origin}${routeRoot}payload.bin`)).status).toBe(404);
+
+      const literalTraversal = await requestRawPath(
+        origin,
+        `/api/local-preview/${grant.grant}/../secret.js`,
+      );
+      const encodedTraversal = await requestRawPath(
+        origin,
+        `/api/local-preview/${grant.grant}/assets/%2e%2e/secret.js`,
+      );
+      const encodedBackslash = await requestRawPath(
+        origin,
+        `/api/local-preview/${grant.grant}/assets%5Csecret.js`,
+      );
+      expect(literalTraversal.status).toBe(404);
+      expect(encodedTraversal.status).toBe(404);
+      expect(encodedBackslash.status).toBe(404);
+    });
+  });
+
+  it("preserves hardened SVG document headers under a directory capability", async () => {
+    const workspace = makeTempDir("synara-effect-directory-svg-");
+    const entryPath = path.join(workspace, "index.html");
+    writeFileSync(entryPath, "<!doctype html>");
+    writeFileSync(path.join(workspace, "graphic.svg"), "<svg xmlns='http://www.w3.org/2000/svg'/>");
+    const grant = await createLocalPreviewGrant({
+      requestedPath: entryPath,
+      cwd: workspace,
+      allowedWorkspaceRoots: [workspace],
+      scope: "directory",
+      purpose: "browser",
+    });
+    const config = makeServerConfig({ cwd: workspace });
+
+    await withEffectServer(config, localImageEffectRouteLayer, async (origin) => {
+      const routeRoot = grant.urlPath?.slice(0, grant.urlPath.lastIndexOf("/") + 1);
+      const response = await fetch(`${origin}${routeRoot}graphic.svg`);
+      expect(response.status).toBe(200);
+      expect(response.headers.get("content-type")).toBe("image/svg+xml");
+      expect(response.headers.get("content-security-policy")).toBe(
+        "sandbox; default-src 'none'; style-src 'unsafe-inline'",
+      );
+      expect(response.headers.get("x-content-type-options")).toBe("nosniff");
+    });
+  });
+
+  it("rejects a symlinked asset that escapes the granted directory when supported", async () => {
+    const workspace = makeTempDir("synara-effect-directory-symlink-");
+    const siteDir = path.join(workspace, "site");
+    const outsideDir = path.join(workspace, "site-private");
+    const entryPath = path.join(siteDir, "index.html");
+    const outsideScript = path.join(outsideDir, "secret.js");
+    const linkedScript = path.join(siteDir, "secret.js");
+    mkdirSync(siteDir);
+    mkdirSync(outsideDir);
+    writeFileSync(entryPath, "<!doctype html>");
+    writeFileSync(outsideScript, "globalThis.secret = true;");
+    try {
+      symlinkSync(outsideScript, linkedScript, "file");
+    } catch {
+      return;
+    }
+    const grant = await createLocalPreviewGrant({
+      requestedPath: entryPath,
+      cwd: workspace,
+      allowedWorkspaceRoots: [workspace],
+      scope: "directory",
+      purpose: "browser",
+    });
+    const config = makeServerConfig({ cwd: workspace });
+
+    await withEffectServer(config, localImageEffectRouteLayer, async (origin) => {
+      const routeRoot = grant.urlPath?.slice(0, grant.urlPath.lastIndexOf("/") + 1);
+      expect((await fetch(`${origin}${routeRoot}secret.js`)).status).toBe(404);
     });
   });
 });

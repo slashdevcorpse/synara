@@ -34,6 +34,8 @@ function makePanel(): SplitViewPanePanelState {
     panel: null,
     diffTurnId: null,
     diffFilePath: null,
+    filePath: null,
+    browserRequest: null,
     hasOpenedPanel: false,
     lastOpenPanel: "browser",
   };

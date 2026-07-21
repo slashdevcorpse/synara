@@ -4,6 +4,7 @@
 // Exports: dock pane types, default-state factory, and immutable open/close/activate helpers.
 
 import type { ProjectId, ThreadId, TurnId } from "@synara/contracts";
+import type { BrowserNavigationRequest } from "./browserNavigationRequest";
 import { isPlainObject, sanitizeStringKeyedRecord } from "./persistedRecord";
 
 // Single source of truth for the dock pane kinds. The union type, the runtime
@@ -35,6 +36,9 @@ export interface RightDockPane {
   diffFilePath: string | null;
   // file panes preview one workspace-relative file.
   filePath: string | null;
+  // Browser requests are one-shot, in-memory-only values. Persistence strips
+  // them so short-lived capability URLs never reach localStorage.
+  browserRequest: BrowserNavigationRequest | null;
   pullRequestProjectId: ProjectId | null;
   pullRequestRepository: string | null;
   pullRequestNumber: number | null;
@@ -92,6 +96,7 @@ function sanitizePersistedPane(value: unknown): RightDockPane | null {
     diffTurnId: typeof candidate.diffTurnId === "string" ? (candidate.diffTurnId as TurnId) : null,
     diffFilePath: typeof candidate.diffFilePath === "string" ? candidate.diffFilePath : null,
     filePath: typeof candidate.filePath === "string" ? candidate.filePath : null,
+    browserRequest: null,
     pullRequestProjectId:
       typeof candidate.pullRequestProjectId === "string"
         ? (candidate.pullRequestProjectId as ProjectId)
@@ -143,6 +148,22 @@ export function sanitizeRightDockStateByThreadId(
   );
 }
 
+export function stripTransientRightDockBrowserRequests(
+  value: Record<string, RightDockThreadState | undefined>,
+): Record<string, RightDockThreadState | undefined> {
+  return Object.fromEntries(
+    Object.entries(value).map(([threadId, dockState]) => [
+      threadId,
+      dockState
+        ? {
+            ...dockState,
+            panes: dockState.panes.map((pane) => ({ ...pane, browserRequest: null })),
+          }
+        : dockState,
+    ]),
+  );
+}
+
 export interface OpenPaneInput {
   paneId: string;
   kind: RightDockPaneKind;
@@ -150,6 +171,7 @@ export interface OpenPaneInput {
   diffTurnId?: TurnId | null;
   diffFilePath?: string | null;
   filePath?: string | null;
+  browserRequest?: BrowserNavigationRequest | null;
   pullRequestProjectId?: ProjectId | null;
   pullRequestRepository?: string | null;
   pullRequestNumber?: number | null;
@@ -164,6 +186,7 @@ function createPane(input: OpenPaneInput): RightDockPane {
     diffTurnId: input.diffTurnId ?? null,
     diffFilePath: input.diffFilePath ?? null,
     filePath: input.filePath ?? null,
+    browserRequest: input.browserRequest ?? null,
     pullRequestProjectId: input.pullRequestProjectId ?? null,
     pullRequestRepository: input.pullRequestRepository ?? null,
     pullRequestNumber: input.pullRequestNumber ?? null,
@@ -175,6 +198,9 @@ function createPane(input: OpenPaneInput): RightDockPane {
 // overwrite content metadata when the caller explicitly targets new content,
 // so a bare re-open/toggle keeps the pane focused on what it currently shows.
 function singletonPaneReopenPatch(input: OpenPaneInput): Partial<RightDockPane> | null {
+  if (input.kind === "browser" && input.browserRequest !== undefined) {
+    return { browserRequest: input.browserRequest };
+  }
   if (
     input.kind === "diff" &&
     (input.diffTurnId !== undefined || input.diffFilePath !== undefined)
@@ -327,6 +353,7 @@ export function updatePaneInState(
       | "diffTurnId"
       | "diffFilePath"
       | "filePath"
+      | "browserRequest"
       | "threadId"
       | "pullRequestProjectId"
       | "pullRequestRepository"
@@ -345,6 +372,7 @@ export function updatePaneInState(
       nextPane.diffTurnId !== pane.diffTurnId ||
       nextPane.diffFilePath !== pane.diffFilePath ||
       nextPane.filePath !== pane.filePath ||
+      nextPane.browserRequest !== pane.browserRequest ||
       nextPane.threadId !== pane.threadId ||
       nextPane.pullRequestProjectId !== pane.pullRequestProjectId ||
       nextPane.pullRequestRepository !== pane.pullRequestRepository ||

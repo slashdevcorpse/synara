@@ -22,7 +22,7 @@ import { usePdfPageNavigation } from "~/lib/pdf/usePdfPageNavigation";
 import { usePdfZoomController } from "~/lib/pdf/usePdfZoomController";
 import { cn } from "~/lib/utils";
 import { PdfPageView } from "./pdf/PdfPageView";
-import { PdfViewerToolbar } from "./pdf/PdfViewerToolbar";
+import { PdfPanelCloseButton, PdfViewerToolbar } from "./pdf/PdfViewerToolbar";
 
 export function PdfFilePreview(props: {
   /**
@@ -34,6 +34,8 @@ export function PdfFilePreview(props: {
   previewGrant?: string | null | undefined;
   /** Pre-resolved target for the "Open in editor" control in the toolbar. */
   openInTarget: string | null;
+  /** Closes the containing panel when the PDF viewer is embedded in one. */
+  onClosePanel?: (() => void) | undefined;
   className?: string;
 }) {
   const previewUrl = buildLocalImageUrl({
@@ -63,7 +65,7 @@ export function PdfFilePreview(props: {
   const pageNumbers = Array.from({ length: doc.numPages }, (_, index) => index + 1);
 
   const outerClassName = cn(
-    "flex h-full min-h-0 min-w-0 flex-1 flex-col bg-[var(--color-background-surface)]",
+    "relative flex h-full min-h-0 min-w-0 flex-1 flex-col bg-[var(--color-background-surface)]",
     props.className,
   );
 
@@ -85,6 +87,7 @@ export function PdfFilePreview(props: {
           onFitWidth={zoom.onFitWidth}
           onFitPage={zoom.onFitPage}
           openInTarget={props.openInTarget}
+          onClosePanel={props.onClosePanel}
         />
         <div ref={setScrollRoot} className="pdf-viewer-scroll min-h-0 flex-1 overflow-auto">
           {containerSize
@@ -109,6 +112,10 @@ export function PdfFilePreview(props: {
   if (doc.status === "error") {
     return (
       <div className={outerClassName}>
+        <PdfPanelCloseButton
+          onClosePanel={props.onClosePanel}
+          className="absolute right-3 top-2 z-10"
+        />
         <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 px-4 text-center">
           <TriangleAlertIcon className="size-5 text-destructive/80" aria-hidden="true" />
           <p className="text-[12px] text-muted-foreground">
@@ -121,6 +128,10 @@ export function PdfFilePreview(props: {
 
   return (
     <div className={outerClassName}>
+      <PdfPanelCloseButton
+        onClosePanel={props.onClosePanel}
+        className="absolute right-3 top-2 z-10"
+      />
       <div
         className="flex min-h-0 flex-1 items-center justify-center"
         role="status"

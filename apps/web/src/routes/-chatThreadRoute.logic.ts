@@ -7,11 +7,14 @@ import type { ProjectId, ThreadEnvironmentMode, ThreadId, TurnId } from "@synara
 import { resolveThreadWorkspaceCwd } from "@synara/shared/threadEnvironment";
 
 import type { ChatRightPanel, DiffRouteSearch } from "../diffRouteSearch";
+import type { BrowserNavigationRequest } from "../browserNavigationRequest";
 
 export interface ChatPanelStateSnapshot {
-  panel: ChatRightPanel | null;
+  panel: ChatRightPanel | "file" | null;
   diffTurnId: TurnId | null;
   diffFilePath: string | null;
+  filePath: string | null;
+  browserRequest: BrowserNavigationRequest | null;
 }
 
 export interface ChatPanelStatePatch {

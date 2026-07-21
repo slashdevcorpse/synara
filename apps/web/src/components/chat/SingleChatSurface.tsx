@@ -19,6 +19,7 @@ import { useComposerDraftStore } from "../../composerDraftStore";
 import type { DiffRouteSearch } from "../../diffRouteSearch";
 import { stripDiffSearchParams } from "../../diffRouteSearch";
 import { readEditorViewState, storeEditorViewState } from "../../editorViewState";
+import { isElectron } from "../../env";
 import { basenameOfPath } from "../../file-icons";
 import { useBrowserPanelDesktopBridge } from "../../hooks/useBrowserPanelDesktopBridge";
 import { useDockPaneRuntimeActivation } from "../../hooks/useDockPaneRuntimeActivation";
@@ -45,6 +46,7 @@ import {
   resolveDockFileOpenTarget,
   resolveWorkspaceFileOpenTarget,
   WorkspaceFileOpenerContext,
+  type WorkspaceHtmlBrowserOpenRequest,
   type WorkspaceFileOpener,
 } from "../../lib/workspaceFileOpener";
 import { selectRightDockState, useRightDockStore } from "../../rightDockStore";
@@ -96,7 +98,7 @@ import {
   resolveRoutePanelBootstrap,
   stripEditorViewSearchParams,
 } from "../../routes/-chatThreadRoute.logic";
-import { cn } from "~/lib/utils";
+import { cn, randomUUID } from "~/lib/utils";
 
 const PullRequestDockPane = lazy(() => import("../pullRequest/PullRequestDockPane"));
 const EditorWorkspaceView = lazy(() =>
@@ -160,6 +162,8 @@ const DOCK_EMBEDDED_PANEL_STATE: SplitViewPanePanelState = {
   panel: null,
   diffTurnId: null,
   diffFilePath: null,
+  filePath: null,
+  browserRequest: null,
   hasOpenedPanel: false,
   lastOpenPanel: "browser",
 };
@@ -273,6 +277,8 @@ export function SingleChatSurface(props: {
         : null,
     diffTurnId: activePane?.kind === "diff" ? activePane.diffTurnId : null,
     diffFilePath: activePane?.kind === "diff" ? activePane.diffFilePath : null,
+    filePath: activePane?.kind === "file" ? activePane.filePath : null,
+    browserRequest: activePane?.kind === "browser" ? activePane.browserRequest : null,
     hasOpenedPanel: dockState.panes.length > 0,
     lastOpenPanel: "browser",
   };
@@ -285,9 +291,22 @@ export function SingleChatSurface(props: {
     requestImmediateDockHydration("browser");
     toggleSingletonPane(props.threadId, { kind: "browser" });
   };
-  const handleOpenBrowserUrl = () => {
+  const enqueueBrowserRequest = (request: { url: string; localFilePath: string | null }) => {
     requestImmediateDockHydration("browser");
-    openPane(props.threadId, { kind: "browser" });
+    openPane(props.threadId, {
+      kind: "browser",
+      browserRequest: {
+        id: randomUUID(),
+        url: request.url,
+        localFilePath: request.localFilePath,
+      },
+    });
+  };
+  const handleOpenBrowserRequest = (request: WorkspaceHtmlBrowserOpenRequest) => {
+    enqueueBrowserRequest(request);
+  };
+  const handleOpenBrowserUrl = (url: string) => {
+    enqueueBrowserRequest({ url, localFilePath: null });
   };
   const handleOpenTurnDiff = (turnId: TurnId, filePath?: string) => {
     requestImmediateDockHydration("diff");
@@ -403,7 +422,11 @@ export function SingleChatSurface(props: {
     if (!workspaceRoot) {
       return;
     }
-    const relativePath = resolveWorkspaceFileOpenTarget(path, workspaceRoot);
+    const relativePath = resolveWorkspaceFileOpenTarget(
+      path,
+      workspaceRoot,
+      activeProject?.cwd ?? null,
+    );
     if (relativePath) {
       prefetchWorkspaceFile(queryClient, workspaceRoot, relativePath);
     }
@@ -416,7 +439,7 @@ export function SingleChatSurface(props: {
       // In-workspace references map to relative paths for the file-read RPC;
       // binary previews in a session's scratch workspace (outside the chat
       // workspace) open by absolute path through the local-image route.
-      const targetPath = resolveDockFileOpenTarget(path, workspaceRoot);
+      const targetPath = resolveDockFileOpenTarget(path, workspaceRoot, activeProject?.cwd ?? null);
       if (!targetPath) {
         return false;
       }
@@ -433,7 +456,11 @@ export function SingleChatSurface(props: {
       if (!workspaceRoot) {
         return false;
       }
-      const relativePath = resolveWorkspaceFileOpenTarget(path, workspaceRoot);
+      const relativePath = resolveWorkspaceFileOpenTarget(
+        path,
+        workspaceRoot,
+        activeProject?.cwd ?? null,
+      );
       if (!relativePath) {
         return false;
       }
@@ -662,6 +689,14 @@ export function SingleChatSurface(props: {
               onClosePanel={() => closePane(props.threadId, pane.id)}
               runtimeMode={context.runtimeMode}
               onRequestLive={requestActiveDockPaneLive}
+              workspaceRoot={workspaceRoot}
+              referenceRoot={activeProject?.cwd ?? null}
+              navigationRequest={pane.browserRequest}
+              onNavigationRequestHandled={(requestId) => {
+                if (pane.browserRequest?.id === requestId) {
+                  updatePane(props.threadId, pane.id, { browserRequest: null });
+                }
+              }}
             />
           </Suspense>
         );
@@ -729,9 +764,11 @@ export function SingleChatSurface(props: {
           <Suspense fallback={<PanelStateMessage>Loading explorer...</PanelStateMessage>}>
             <DockExplorerPane
               workspaceRoot={workspaceRoot}
+              referenceRoot={activeProject?.cwd ?? null}
               onReferenceInChat={handleReferenceInChat}
               onAskWhyInChat={handleAskWhyInChat}
               onCommentInChat={handleCommentInChat}
+              onOpenInBrowser={isElectron ? handleOpenBrowserRequest : undefined}
             />
           </Suspense>
         );
@@ -740,10 +777,12 @@ export function SingleChatSurface(props: {
           <Suspense fallback={<PanelStateMessage>Loading file...</PanelStateMessage>}>
             <DockFilePane
               workspaceRoot={workspaceRoot}
+              referenceRoot={activeProject?.cwd ?? null}
               filePath={pane.filePath}
               onReferenceInChat={handleReferenceInChat}
               onAskWhyInChat={handleAskWhyInChat}
               onCommentInChat={handleCommentInChat}
+              onOpenInBrowser={isElectron ? handleOpenBrowserRequest : undefined}
             />
           </Suspense>
         );
@@ -764,7 +803,7 @@ export function SingleChatSurface(props: {
             panelState={DOCK_EMBEDDED_PANEL_STATE}
             onToggleDiff={noopChatSurfaceAction}
             onToggleBrowser={noopChatSurfaceAction}
-            onOpenBrowserUrl={noopChatSurfaceAction}
+            onOpenBrowserUrl={handleOpenBrowserUrl}
             onOpenTurnDiff={noopChatSurfaceAction}
             onCloseThreadPane={() => closePane(props.threadId, pane.id)}
           />
@@ -834,6 +873,8 @@ export function SingleChatSurface(props: {
     panel: editorCenterMode === "diff" ? "diff" : null,
     diffTurnId: editorDiffPanelState.diffTurnId,
     diffFilePath: editorDiffPanelState.diffFilePath,
+    filePath: props.search.editorFilePath ?? null,
+    browserRequest: null,
     hasOpenedPanel: true,
     lastOpenPanel: "browser",
   };
@@ -847,6 +888,7 @@ export function SingleChatSurface(props: {
           <Suspense fallback={<ChatMountSkeleton />}>
             <EditorWorkspaceView
               workspaceRoot={workspaceRoot}
+              referenceRoot={activeProject?.cwd ?? null}
               projectName={activeProject?.name ?? null}
               currentProjectId={activeProject?.id ?? null}
               projectOptions={editorProjectOptions}
@@ -865,6 +907,14 @@ export function SingleChatSurface(props: {
               onReferenceInChat={handleReferenceInChat}
               onAskWhyInChat={handleAskWhyInChat}
               onCommentInChat={handleCommentInChat}
+              {...(isElectron
+                ? {
+                    onOpenInBrowser: (request: WorkspaceHtmlBrowserOpenRequest) => {
+                      handleOpenBrowserRequest(request);
+                      handleCloseEditorView();
+                    },
+                  }
+                : {})}
               onSelectProject={handleSelectEditorProject}
               diffPanel={
                 <LazyDiffPanel

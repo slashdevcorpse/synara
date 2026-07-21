@@ -58,6 +58,12 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Isolate generated route tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'SYNARA_GENERATED_ROUTE_TREE=%s\n' "$RUNNER_TEMP/super-synara-preflight-route-tree/routeTree.gen.ts" >> "$GITHUB_ENV"
+
       - name: Setup Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
@@ -201,6 +207,9 @@ jobs:
 
       - name: Run release contract smoke tests
         run: bun run release:smoke
+
+      - name: Verify preflight preserved source
+        run: node scripts/verify-release-worktree-clean.ts
 
   reserve_tag:
     name: Reserve immutable downstream tag

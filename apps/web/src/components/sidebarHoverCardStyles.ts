@@ -8,10 +8,10 @@
 //          SIDEBAR_HOVER_CARD_SURFACE_CLASS_NAME,
 //          SIDEBAR_HOVER_CARD_CONTAINER_PADDING_CLASS_NAME,
 //          SIDEBAR_HOVER_CARD_ROW_PADDING_CLASS_NAME, SIDEBAR_HOVER_CARD_ROW_CLASS_NAME
-// Why: The thread card is a Base UI Tooltip and the project card a PreviewCard —
-//      two different primitives. Centralizing every shared characteristic here is
-//      what keeps the two reading as one component instead of two look-alikes.
+// Why: Centralizing every shared characteristic here keeps the thread and project
+//      surfaces reading as one component instead of two look-alikes.
 
+import { DISCLOSURE_TIMING_CLASS } from "~/lib/disclosureMotion";
 import { APP_TOOLTIP_SURFACE_CLASS_NAME } from "./chat/composerPickerStyles";
 
 /** Outer inset on the hover-card content container (sits inside the popup surface). */
@@ -36,12 +36,12 @@ export const SIDEBAR_HOVER_CARD_ROW_CLASS_NAME = `flex w-full min-w-0 items-cent
  * own, and the surface itself is sourced from the tooltip token so the cards and
  * plain tooltips can never drift apart.
  */
-export const SIDEBAR_HOVER_CARD_SURFACE_CLASS_NAME = `${APP_TOOLTIP_SURFACE_CLASS_NAME} w-[16rem]`;
+export const SIDEBAR_HOVER_CARD_SURFACE_CLASS_NAME = `${APP_TOOLTIP_SURFACE_CLASS_NAME} w-[16rem] ${DISCLOSURE_TIMING_CLASS}`;
 
 /**
  * Open/close timing spread onto BOTH cards' triggers. In Base UI v1.5 `delay`/
- * `closeDelay` live on the trigger (Tooltip.Trigger and PreviewCard.Trigger), NOT
- * the root — passing them to the root is silently ignored. `delay: 0` surfaces the
+ * `closeDelay` live on the trigger, NOT the root — passing them to the root is
+ * silently ignored. `delay: 0` surfaces the
  * card the instant the pointer lands; `closeDelay: 0` dismisses it the instant the
  * pointer leaves, matching the tooltip's natural snappy close. The project card's
  * controls stay reachable while dismissing via PreviewCard's hoverable safe area

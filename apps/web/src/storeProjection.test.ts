@@ -145,6 +145,34 @@ describe("store projection", () => {
     });
   });
 
+  it("projects runtime mode and invalidates summary identity when it changes", () => {
+    const readModel = makeReadModel(
+      makeReadModelThread({
+        runtimeMode: "full-access",
+        updatedAt: "2026-02-27T00:00:00.000Z",
+      }),
+    );
+    const hydrated = syncServerReadModel(makeState(makeThread()), readModel);
+    const initialSummary = hydrated.sidebarThreadSummaryById["thread-1"];
+    const unchanged = syncServerReadModel(hydrated, readModel);
+    const changed = syncServerReadModel(hydrated, {
+      ...readModel,
+      snapshotSequence: readModel.snapshotSequence + 1,
+      updatedAt: "2026-02-27T00:01:00.000Z",
+      threads: [
+        makeReadModelThread({
+          runtimeMode: "approval-required",
+          updatedAt: "2026-02-27T00:01:00.000Z",
+        }),
+      ],
+    });
+
+    expect(initialSummary?.runtimeMode).toBe("full-access");
+    expect(unchanged.sidebarThreadSummaryById["thread-1"]).toBe(initialSummary);
+    expect(changed.sidebarThreadSummaryById["thread-1"]).not.toBe(initialSummary);
+    expect(changed.sidebarThreadSummaryById["thread-1"]?.runtimeMode).toBe("approval-required");
+  });
+
   it("falls back to local derivation when server summary metadata is absent", () => {
     const next = syncServerReadModel(
       makeState(makeThread()),

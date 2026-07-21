@@ -7,6 +7,9 @@ import * as Path from "node:path";
 
 const BRIDGE_PROFILE_MANIFEST_FILE_NAME = "synara-profile-seed.json";
 const CANONICAL_BROWSER_PARTITION_NAME = "synara-browser";
+export const DESKTOP_PERSISTENCE_SMOKE_USER_DATA_ENV = "SYNARA_DESKTOP_PERSISTENCE_SMOKE_USER_DATA";
+export const DESKTOP_PERSISTENCE_SMOKE_USER_DATA_LOG_PREFIX =
+  "[desktop] persistence-smoke userData=";
 const BROWSER_PARTITION_SEED_ENTRY_GROUPS = [
   ["Cookies", "Cookies-journal", "Cookies-wal", "Cookies-shm"],
   ["Local Storage"],
@@ -52,7 +55,15 @@ export function resolveDesktopAppDataBase(input?: {
 export function resolveDesktopUserDataPath(input: {
   readonly appDataBase: string;
   readonly userDataDirectoryName: string;
+  readonly persistenceSmokeUserDataPath?: string | undefined;
 }): string {
+  if (input.persistenceSmokeUserDataPath !== undefined) {
+    const overridePath = input.persistenceSmokeUserDataPath.trim();
+    if (!Path.isAbsolute(overridePath)) {
+      throw new Error(`${DESKTOP_PERSISTENCE_SMOKE_USER_DATA_ENV} must be an absolute path.`);
+    }
+    return Path.resolve(overridePath);
+  }
   return Path.join(input.appDataBase, input.userDataDirectoryName);
 }
 

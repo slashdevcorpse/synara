@@ -176,6 +176,73 @@ describe("browser-use pipe path resolution", () => {
   });
 });
 
+describe("browser-use tab serialization", () => {
+  it("uses the display path for local previews without exposing capability URLs", async () => {
+    const capabilityUrl = "http://127.0.0.1:58090/api/local-preview/secret_token/index.html";
+    const browserManager = {
+      getBrowserUseSnapshot: () => ({
+        threadId: "thread-1",
+        state: {
+          open: true,
+          activeTabId: "local-tab",
+          tabs: [
+            {
+              id: "local-tab",
+              title: "index.html",
+              localFilePath: "C:\\work\\index.html",
+              url: capabilityUrl,
+              lastCommittedUrl: capabilityUrl,
+            },
+            {
+              id: "web-tab",
+              title: "Example",
+              url: "https://example.com/pending",
+              lastCommittedUrl: "https://example.com/committed",
+            },
+            {
+              id: "unpaired-local-tab",
+              title: "Invalid local preview state",
+              url: capabilityUrl,
+              lastCommittedUrl: capabilityUrl,
+            },
+            {
+              id: "blank-path-local-tab",
+              title: "Invalid blank display path",
+              localFilePath: "   ",
+              url: capabilityUrl,
+              lastCommittedUrl: capabilityUrl,
+            },
+          ],
+        },
+      }),
+    };
+
+    await withPipeServer({ browserManager }, async (socket) => {
+      await request(socket, {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "getInfo",
+        params: { session_id: "codex-session-local-preview" },
+      });
+      const response = await request(socket, {
+        jsonrpc: "2.0",
+        id: 2,
+        method: "getTabs",
+        params: { session_id: "codex-session-local-preview" },
+      });
+      const tabs = response.result as Array<{ url: string }>;
+
+      expect(tabs.map((tab) => tab.url)).toEqual([
+        "C:\\work\\index.html",
+        "https://example.com/committed",
+        "about:blank",
+        "about:blank",
+      ]);
+      expect(JSON.stringify(response)).not.toContain("secret_token");
+    });
+  });
+});
+
 describe("browser-use pipe RPC compatibility", () => {
   it("echoes and binds the Codex session id expected by IAB discovery", async () => {
     await withPipeServer({}, async (socket) => {

@@ -289,6 +289,7 @@ export interface SidebarThreadSummary {
   projectId: ProjectId;
   title: string;
   modelSelection: ModelSelection;
+  runtimeMode: RuntimeMode;
   interactionMode: ProviderInteractionMode;
   envMode?: ThreadEnvironmentMode | undefined;
   branch: string | null;

@@ -1,6 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { QueryClient } from "@tanstack/react-query";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  createWorkspaceHtmlBrowserOpenRequest,
+  prefetchWorkspaceFile,
   resolveDockFileOpenTarget,
   resolveScratchPreviewFileOpenTarget,
   resolveWorkspaceFileOpenTarget,
@@ -24,6 +27,16 @@ describe("resolveWorkspaceFileOpenTarget", () => {
     expect(resolveWorkspaceFileOpenTarget("/repo/app/src/page.tsx", "/repo/app")).toBe(
       "src/page.tsx",
     );
+  });
+
+  it("remaps absolute references from the original project into the active worktree", () => {
+    expect(
+      resolveWorkspaceFileOpenTarget(
+        "C:\\projects\\synara\\apps\\web\\index.html:14",
+        "D:\\worktrees\\feature",
+        "c:\\PROJECTS\\SYNARA",
+      ),
+    ).toBe("apps/web/index.html");
   });
 
   it("maps Synara public asset URLs to their workspace files", () => {
@@ -62,10 +75,10 @@ describe("resolveScratchPreviewFileOpenTarget", () => {
     expect(resolveScratchPreviewFileOpenTarget(`${scratchPdf}:3:14`)).toBe(scratchPdf);
   });
 
-  it("returns null for scratch-workspace files without an in-app binary preview", () => {
+  it("preserves scratch-workspace text paths for grant-backed source previews", () => {
     expect(
       resolveScratchPreviewFileOpenTarget("/tmp/synara-codex-workspaces/thread-1/notes.ts"),
-    ).toBeNull();
+    ).toBe("/tmp/synara-codex-workspaces/thread-1/notes.ts");
   });
 
   it("returns null for absolute preview paths outside a scratch workspace", () => {
@@ -99,9 +112,79 @@ describe("resolveDockFileOpenTarget", () => {
     expect(resolveDockFileOpenTarget("src/page.tsx", "/repo/app")).toBe("src/page.tsx");
   });
 
-  it("opens absolute local paths directly instead of falling back to the editor", () => {
+  it("preserves exact-file previews for absolute non-HTML files", () => {
+    expect(resolveDockFileOpenTarget("/Users/dev/Downloads/shot.png", "/repo/app")).toBe(
+      "/Users/dev/Downloads/shot.png",
+    );
+    expect(resolveDockFileOpenTarget("/Users/dev/Downloads/report.pdf", "/repo/app")).toBe(
+      "/Users/dev/Downloads/report.pdf",
+    );
+    expect(resolveDockFileOpenTarget("/Users/dev/Downloads/README.md", "/repo/app")).toBe(
+      "/Users/dev/Downloads/README.md",
+    );
     expect(resolveDockFileOpenTarget("/Users/dev/Downloads/report.txt:4", "/repo/app")).toBe(
       "/Users/dev/Downloads/report.txt",
     );
+  });
+
+  it("rejects outside-workspace HTML and network paths", () => {
+    expect(resolveDockFileOpenTarget("/Users/dev/Downloads/demo.html", "/repo/app")).toBeNull();
+    expect(resolveDockFileOpenTarget("\\\\server\\share\\shot.png", "/repo/app")).toBeNull();
+    expect(resolveDockFileOpenTarget("//server/share/shot.png", "/repo/app")).toBeNull();
+  });
+
+  it("remaps original-root paths for dock activation", () => {
+    expect(
+      resolveDockFileOpenTarget(
+        "/repo/project/docs/demo.html:4",
+        "/repo/worktrees/feature",
+        "/repo/project",
+      ),
+    ).toBe("docs/demo.html");
+  });
+});
+
+describe("createWorkspaceHtmlBrowserOpenRequest", () => {
+  afterEach(() => {
+    delete (globalThis as { window?: unknown }).window;
+  });
+
+  it("emits an active-worktree display path and token-only capability URL", async () => {
+    (globalThis as unknown as { window: object }).window = {
+      desktopBridge: { getWsUrl: () => "ws://127.0.0.1:58090/?token=startup-secret" },
+      location: { origin: "app://synara/" },
+    };
+    const queryClient = new QueryClient();
+    const fetchQuery = vi.spyOn(queryClient, "fetchQuery").mockResolvedValue({
+      grant: "grant-id",
+      expiresAt: new Date(Date.now() + 120_000).toISOString(),
+      urlPath: "/api/local-preview/grant-id/demo.html",
+    });
+
+    await expect(
+      createWorkspaceHtmlBrowserOpenRequest({
+        queryClient,
+        filePath: "/repo/project/docs/demo.html",
+        workspaceRoot: "/repo/worktrees/feature",
+        referenceRoot: "/repo/project",
+      }),
+    ).resolves.toEqual({
+      url: "http://127.0.0.1:58090/api/local-preview/grant-id/demo.html",
+      localFilePath: "/repo/worktrees/feature/docs/demo.html",
+    });
+    expect(fetchQuery).toHaveBeenCalledOnce();
+  });
+});
+
+describe("prefetchWorkspaceFile", () => {
+  it("preserves source prefetch for nested HTML while skipping standalone binaries", () => {
+    const queryClient = new QueryClient();
+    const prefetchQuery = vi.spyOn(queryClient, "prefetchQuery").mockResolvedValue(undefined);
+
+    prefetchWorkspaceFile(queryClient, "/repo/worktree", "docs/demo.html");
+    prefetchWorkspaceFile(queryClient, "/repo/worktree", "assets/screenshot.png");
+    prefetchWorkspaceFile(queryClient, "/repo/worktree", "artifacts/archive.zip");
+
+    expect(prefetchQuery).toHaveBeenCalledOnce();
   });
 });
