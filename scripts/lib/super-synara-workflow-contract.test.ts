@@ -124,16 +124,8 @@ describe("Super Synara workflow contracts", () => {
     expect(() => verifySuperSynaraWorkflowText(main, audit)).not.toThrow();
 
     for (const [startMarker, endMarker, command] of [
-      [
-        "\n  preflight:",
-        "\n  windows_x64:",
-        "github-unsigned-prerelease \\\n            false",
-      ],
-      [
-        "\n  windows_x64:",
-        "\n  macos_arm64:",
-        "github-unsigned-prerelease false",
-      ],
+      ["\n  preflight:", "\n  windows_x64:", "github-unsigned-prerelease \\\n            false"],
+      ["\n  windows_x64:", "\n  macos_arm64:", "github-unsigned-prerelease false"],
       ["\n  macos_arm64:", "\n  publish:", "github-unsigned-prerelease false"],
     ] as const) {
       const start = main.indexOf(startMarker);
