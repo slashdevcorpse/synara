@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 
 import {
   containPreparedWindowsProviderProcess,
+  isWindowsJobContainedProviderProcess,
+  markWindowsProviderProcessSpawn,
   prepareResolvedWindowsProviderProcess,
   resolveWindowsJobLauncherPath,
   WINDOWS_JOB_LAUNCHER_EXECUTABLE,
@@ -47,7 +49,36 @@ describe("Windows provider process containment", () => {
       ],
       shell: false,
       windowsHide: true,
+      containment: "windows-job-object",
     });
+  });
+
+  it("marks only a child spawned from an explicitly contained command", () => {
+    const containedChild = {};
+    const injectedChild = {};
+    const ordinaryChild = {};
+    const contained = prepareResolvedWindowsProviderProcess(
+      "C:\\Program Files\\Codex\\codex.exe",
+      ["app-server"],
+      {
+        platform: "win32",
+        arch: "x64",
+        launcherPath: launcher,
+        fileExists: () => true,
+      },
+    );
+    const ordinary = containPreparedWindowsProviderProcess(
+      { command: "/usr/bin/codex", args: ["app-server"], shell: false },
+      { platform: "linux" },
+    );
+
+    markWindowsProviderProcessSpawn(containedChild, contained, true);
+    markWindowsProviderProcessSpawn(injectedChild, contained, false);
+    markWindowsProviderProcessSpawn(ordinaryChild, ordinary, true);
+
+    expect(isWindowsJobContainedProviderProcess(containedChild)).toBe(true);
+    expect(isWindowsJobContainedProviderProcess(injectedChild)).toBe(false);
+    expect(isWindowsJobContainedProviderProcess(ordinaryChild)).toBe(false);
   });
 
   it("preserves the existing cmd.exe verbatim argument mode", () => {

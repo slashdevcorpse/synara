@@ -54,7 +54,10 @@ import {
   teardownChildProcessTree,
   teardownProviderProcessTree,
 } from "./provider/supervisedProcessTeardown.ts";
-import { prepareResolvedWindowsProviderProcess } from "./provider/windowsProviderProcess.ts";
+import {
+  markWindowsProviderProcessSpawn,
+  prepareResolvedWindowsProviderProcess,
+} from "./provider/windowsProviderProcess.ts";
 import { ensureIsolatedScratchWorkspace } from "./scratchWorkspaces.ts";
 import { createLogger } from "./logger";
 import { transcribeVoiceWithChatGptSession } from "./voiceTranscription.ts";
@@ -629,14 +632,18 @@ function spawnCodexAppServer(input: {
       env: input.env,
     },
   );
-  return spawn(prepared.command, prepared.args, {
-    cwd: input.cwd,
-    env: input.env,
-    stdio: ["pipe", "pipe", "pipe"],
-    shell: prepared.shell,
-    windowsHide: prepared.windowsHide,
-    windowsVerbatimArguments: prepared.windowsVerbatimArguments,
-  });
+  return markWindowsProviderProcessSpawn(
+    spawn(prepared.command, prepared.args, {
+      cwd: input.cwd,
+      env: input.env,
+      stdio: ["pipe", "pipe", "pipe"],
+      shell: prepared.shell,
+      windowsHide: prepared.windowsHide,
+      windowsVerbatimArguments: prepared.windowsVerbatimArguments,
+    }),
+    prepared,
+    true,
+  );
 }
 
 async function resolveCodexLaunch(input: {

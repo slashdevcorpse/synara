@@ -25,6 +25,32 @@ export interface WindowsProviderProcessInput extends WindowsSafeProcessInput {
   readonly fileExists?: ((path: string) => boolean) | undefined;
 }
 
+export interface WindowsProviderProcessCommand extends WindowsSafeProcessCommand {
+  /** Present only when the returned command is the native kill-on-close Job Object launcher. */
+  readonly containment?: "windows-job-object" | undefined;
+}
+
+const windowsJobContainedProcesses = new WeakSet<object>();
+
+/**
+ * Records the exact spawned handle whose PID belongs to the native Job Object launcher.
+ * Teardown uses this identity marker instead of inferring containment from platform or filename.
+ */
+export function markWindowsProviderProcessSpawn<T extends object>(
+  process: T,
+  prepared: WindowsProviderProcessCommand,
+  spawnedPreparedCommand: boolean,
+): T {
+  if (spawnedPreparedCommand && prepared.containment === "windows-job-object") {
+    windowsJobContainedProcesses.add(process);
+  }
+  return process;
+}
+
+export function isWindowsJobContainedProviderProcess(process: object): boolean {
+  return windowsJobContainedProcesses.has(process);
+}
+
 function defaultFileExists(path: string): boolean {
   try {
     return existsSync(path) && statSync(path).isFile();
@@ -124,7 +150,7 @@ function resolveAbsolutePreparedCommand(command: string, cwd: string | undefined
 export function containPreparedWindowsProviderProcess(
   prepared: WindowsSafeProcessCommand,
   input: WindowsProviderProcessInput = {},
-): WindowsSafeProcessCommand {
+): WindowsProviderProcessCommand {
   const platform = input.platform ?? process.platform;
   if (platform !== "win32") {
     return prepared;
@@ -146,6 +172,7 @@ export function containPreparedWindowsProviderProcess(
     ],
     shell: false,
     windowsHide: true,
+    containment: "windows-job-object",
   };
 }
 
@@ -153,7 +180,7 @@ export function prepareWindowsProviderProcess(
   command: string,
   args: ReadonlyArray<string>,
   input: WindowsProviderProcessInput = {},
-): WindowsSafeProcessCommand {
+): WindowsProviderProcessCommand {
   return containPreparedWindowsProviderProcess(
     prepareWindowsSafeProcess(command, args, input),
     input,
@@ -164,7 +191,7 @@ export function prepareResolvedWindowsProviderProcess(
   command: string,
   args: ReadonlyArray<string>,
   input: WindowsProviderProcessInput = {},
-): WindowsSafeProcessCommand {
+): WindowsProviderProcessCommand {
   return containPreparedWindowsProviderProcess(
     prepareResolvedWindowsSafeProcess(command, args, input),
     input,

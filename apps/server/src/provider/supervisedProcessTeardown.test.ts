@@ -10,8 +10,10 @@ import {
 } from "../terminal/processTreeKiller";
 import {
   ProviderProcessExitUnprovenError,
+  teardownChildProcessTree,
   teardownProviderProcessTree,
 } from "./supervisedProcessTeardown";
+import { markWindowsProviderProcessSpawn } from "./windowsProviderProcess.ts";
 
 function deterministicClock() {
   let now = 0;
@@ -541,6 +543,111 @@ describe("teardownProviderProcessTree", () => {
       captureComplete: false,
       descendantExitProof: "not-captured",
       rootTreeSignalSucceeded: false,
+    });
+  });
+
+  it("uses root-tree signaling instead of PID capture for an explicitly marked launcher", async () => {
+    let captureCalls = 0;
+    let signalCalls = 0;
+    const rootExit = deferred<void>();
+
+    await expect(
+      teardownProviderProcessTree(
+        {
+          rootPid: 451,
+          rootExited: rootExit.promise,
+          descendantExitProof: "root-tree-signal",
+          termGraceMs: 5,
+          forceExitMs: 5,
+        },
+        {
+          processTreeKiller: {
+            capture: () => {
+              captureCalls += 1;
+              throw new Error("capture must not run for a marked Windows launcher");
+            },
+            inspect: () => ({ verified: true, survivors: [] }),
+            signal: async ({ includeRootTree }) => {
+              signalCalls += 1;
+              rootExit.resolve(undefined);
+              return { rootTreeSignalSucceeded: includeRootTree === true };
+            },
+          },
+          ...deterministicClock(),
+        },
+      ),
+    ).resolves.toEqual({ escalated: false, signalErrors: [] });
+    expect(captureCalls).toBe(0);
+    expect(signalCalls).toBe(1);
+  });
+
+  it("waits beyond the exit grace for delayed root-tree signal proof", async () => {
+    let signalCalls = 0;
+    const rootExit = deferred<void>();
+
+    await expect(
+      teardownProviderProcessTree(
+        {
+          rootPid: 452,
+          rootExited: rootExit.promise,
+          descendantExitProof: "root-tree-signal",
+          termGraceMs: 5,
+          forceExitMs: 5,
+        },
+        {
+          processTreeKiller: {
+            capture: () => {
+              throw new Error("capture must not run for a marked Windows launcher");
+            },
+            inspect: () => ({ verified: true, survivors: [] }),
+            signal: ({ signal }) => {
+              signalCalls += 1;
+              if (signal !== "SIGTERM") {
+                return Promise.resolve({ rootTreeSignalSucceeded: false });
+              }
+              return new Promise((resolve) => {
+                setTimeout(() => {
+                  rootExit.resolve(undefined);
+                  resolve({ rootTreeSignalSucceeded: true });
+                }, 20);
+              });
+            },
+          },
+          ...deterministicClock(),
+        },
+      ),
+    ).resolves.toEqual({ escalated: false, signalErrors: [] });
+    expect(signalCalls).toBe(1);
+  });
+
+  it("propagates root-tree signal proof only for the exact marked child handle", async () => {
+    const markedChild = {
+      pid: 461,
+      exitCode: null,
+      signalCode: null,
+      once: () => undefined,
+      removeListener: () => undefined,
+    };
+    const teardown = vi.fn(async () => ({ escalated: false, signalErrors: [] }));
+    markWindowsProviderProcessSpawn(
+      markedChild,
+      {
+        command: "C:\\Synara\\synara-windows-job-launcher.exe",
+        args: [],
+        shell: false,
+        containment: "windows-job-object",
+      },
+      true,
+    );
+
+    await expect(teardownChildProcessTree(markedChild, teardown)).resolves.toEqual({
+      escalated: false,
+      signalErrors: [],
+    });
+    expect(teardown).toHaveBeenCalledOnce();
+    expect(teardown.mock.calls[0]?.[0]).toMatchObject({
+      rootPid: 461,
+      descendantExitProof: "root-tree-signal",
     });
   });
 

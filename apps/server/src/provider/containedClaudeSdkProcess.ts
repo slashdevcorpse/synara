@@ -11,6 +11,7 @@ import {
 import type { SpawnOptions as ClaudeSpawnOptions } from "@anthropic-ai/claude-agent-sdk";
 
 import {
+  markWindowsProviderProcessSpawn,
   prepareWindowsProviderProcess,
   type WindowsProviderProcessInput,
 } from "./windowsProviderProcess.ts";
@@ -38,13 +39,17 @@ export function spawnContainedClaudeSdkProcess(
   };
   const prepared = prepareProcess(options.command, options.args, processInput);
 
-  return spawnProcess(prepared.command, prepared.args, {
-    ...(options.cwd ? { cwd: options.cwd } : {}),
-    env: options.env,
-    signal: options.signal,
-    shell: prepared.shell,
-    ...(prepared.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
-    stdio: ["pipe", "pipe", "inherit"],
-    windowsHide: true,
-  });
+  return markWindowsProviderProcessSpawn(
+    spawnProcess(prepared.command, prepared.args, {
+      ...(options.cwd ? { cwd: options.cwd } : {}),
+      env: options.env,
+      signal: options.signal,
+      shell: prepared.shell,
+      ...(prepared.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
+      stdio: ["pipe", "pipe", "inherit"],
+      windowsHide: true,
+    }),
+    prepared,
+    dependencies.spawnProcess === undefined,
+  );
 }

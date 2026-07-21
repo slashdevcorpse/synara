@@ -46,7 +46,10 @@ import {
   teardownProviderProcessTree,
 } from "./supervisedProcessTeardown.ts";
 import { isWindowsShellCommandMissingResult } from "../shell-command-detection.ts";
-import { prepareWindowsProviderProcess } from "./windowsProviderProcess.ts";
+import {
+  markWindowsProviderProcessSpawn,
+  prepareWindowsProviderProcess,
+} from "./windowsProviderProcess.ts";
 
 const DEFAULT_OPENCODE_SERVER_TIMEOUT_MS = 20_000;
 const DEFAULT_HOSTNAME = "127.0.0.1";
@@ -945,7 +948,7 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
           },
         );
 
-        const child = yield* spawner
+        const spawnedChild = yield* spawner
           .spawn(
             ChildProcess.make(prepared.command, prepared.args, {
               env: childEnv,
@@ -969,6 +972,7 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
                 }),
             ),
           );
+        const child = markWindowsProviderProcessSpawn(spawnedChild, prepared, true);
         yield* Scope.addFinalizer(
           runtimeScope,
           Effect.tryPromise({

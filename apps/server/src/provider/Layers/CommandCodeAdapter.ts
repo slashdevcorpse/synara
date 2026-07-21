@@ -31,7 +31,10 @@ import { Effect, Layer, Queue, Stream } from "effect";
 
 import { ServerConfig } from "../../config.ts";
 import { buildProviderChildEnvironment } from "../../providerChildEnvironment.ts";
-import { prepareWindowsProviderProcess } from "../windowsProviderProcess.ts";
+import {
+  markWindowsProviderProcessSpawn,
+  prepareWindowsProviderProcess,
+} from "../windowsProviderProcess.ts";
 import { appendFileAttachmentsPromptBlock } from "../attachmentProjection.ts";
 import {
   ProviderAdapterProcessError,
@@ -579,14 +582,18 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
         const child = yield* Effect.try({
           try: () => {
             const prepared = prepareProcess(executable, args, { cwd, env });
-            return spawnProcess(prepared.command, prepared.args, {
-              cwd,
-              env,
-              stdio: ["pipe", "pipe", "pipe"],
-              shell: prepared.shell,
-              windowsHide: prepared.windowsHide,
-              windowsVerbatimArguments: prepared.windowsVerbatimArguments,
-            });
+            return markWindowsProviderProcessSpawn(
+              spawnProcess(prepared.command, prepared.args, {
+                cwd,
+                env,
+                stdio: ["pipe", "pipe", "pipe"],
+                shell: prepared.shell,
+                windowsHide: prepared.windowsHide,
+                windowsVerbatimArguments: prepared.windowsVerbatimArguments,
+              }),
+              prepared,
+              options?.spawnProcess === undefined,
+            );
           },
           catch: (cause) =>
             new ProviderAdapterProcessError({
@@ -744,14 +751,18 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
             const configured = input.binaryPath?.trim() || DEFAULT_BINARY;
             const executable = resolveExecutable(configured, { cwd, env });
             const prepared = prepareProcess(executable, ["--list-models"], { cwd, env });
-            const child = spawnProcess(prepared.command, prepared.args, {
-              cwd,
-              env,
-              stdio: ["ignore", "pipe", "pipe"],
-              shell: prepared.shell,
-              windowsHide: prepared.windowsHide,
-              windowsVerbatimArguments: prepared.windowsVerbatimArguments,
-            });
+            const child = markWindowsProviderProcessSpawn(
+              spawnProcess(prepared.command, prepared.args, {
+                cwd,
+                env,
+                stdio: ["ignore", "pipe", "pipe"],
+                shell: prepared.shell,
+                windowsHide: prepared.windowsHide,
+                windowsVerbatimArguments: prepared.windowsVerbatimArguments,
+              }),
+              prepared,
+              options?.spawnProcess === undefined,
+            );
             let stdout = "";
             let stderr = "";
             let stdoutBytes = 0;

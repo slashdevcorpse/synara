@@ -32,7 +32,10 @@ import {
 import type { ProviderThreadSnapshot } from "../Services/ProviderAdapter.ts";
 import { appendFileAttachmentsPromptBlock } from "../attachmentProjection.ts";
 import { teardownChildProcessTree } from "../supervisedProcessTeardown.ts";
-import { containPreparedWindowsProviderProcess } from "../windowsProviderProcess.ts";
+import {
+  containPreparedWindowsProviderProcess,
+  markWindowsProviderProcessSpawn,
+} from "../windowsProviderProcess.ts";
 
 const PROVIDER = "antigravity" as const;
 const DEFAULT_MODEL = "Gemini 3.5 Flash";
@@ -289,14 +292,18 @@ function spawnAntigravityProcess(
     ),
     prepareInput,
   );
-  return (options.dependencies?.spawnProcess ?? spawn)(prepared.command, prepared.args, {
-    ...(options.cwd ? { cwd: options.cwd } : {}),
-    env: options.env,
-    shell: prepared.shell,
-    ...(prepared.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
-    stdio: ["ignore", "pipe", "pipe"],
-    windowsHide: true,
-  });
+  return markWindowsProviderProcessSpawn(
+    (options.dependencies?.spawnProcess ?? spawn)(prepared.command, prepared.args, {
+      ...(options.cwd ? { cwd: options.cwd } : {}),
+      env: options.env,
+      shell: prepared.shell,
+      ...(prepared.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    }),
+    prepared,
+    options.dependencies?.spawnProcess === undefined,
+  );
 }
 
 export async function runAntigravityHelperProcess(

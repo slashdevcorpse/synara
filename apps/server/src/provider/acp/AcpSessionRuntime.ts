@@ -29,7 +29,10 @@ import {
   teardownProviderProcessTree,
   type SupervisedProcessTeardownResult,
 } from "../supervisedProcessTeardown.ts";
-import { prepareWindowsProviderProcess } from "../windowsProviderProcess.ts";
+import {
+  markWindowsProviderProcessSpawn,
+  prepareWindowsProviderProcess,
+} from "../windowsProviderProcess.ts";
 import {
   collectSessionConfigOptionValues,
   extractModelConfigId,
@@ -766,7 +769,7 @@ const makeAcpSessionRuntime = (
       cwd: options.spawn.cwd,
       env,
     });
-    const child = yield* spawner
+    const spawnedChild = yield* spawner
       .spawn(
         ChildProcess.make(prepared.command, prepared.args, {
           ...(options.spawn.cwd ? { cwd: options.spawn.cwd } : {}),
@@ -785,6 +788,7 @@ const makeAcpSessionRuntime = (
             }),
         ),
       );
+    const child = markWindowsProviderProcessSpawn(spawnedChild, prepared, true);
 
     yield* Effect.addFinalizer(() => teardownAcpChildProcess(child, options.teardownProcessTree));
 

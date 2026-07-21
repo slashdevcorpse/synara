@@ -154,7 +154,13 @@ describe("Pi Bash process supervision", () => {
       observeTeardown = resolve;
     });
     const supervisor = makePiBashProcessSupervisor({
-      getShellConfig: () => ({ shell: "/bin/sh", args: ["-c"] }),
+      getShellConfig: () =>
+        process.platform === "win32"
+          ? {
+              shell: path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "cmd.exe"),
+              args: ["/d", "/s", "/c"],
+            }
+          : { shell: "/bin/sh", args: ["-c"] },
       spawnProcess: () => child,
       teardownProcessTree: async (input) => {
         observeTeardown();
@@ -166,7 +172,7 @@ describe("Pi Bash process supervision", () => {
       },
     });
     const abortController = new AbortController();
-    const command = supervisor.operations.exec("sleep 10", "/tmp", {
+    const command = supervisor.operations.exec("sleep 10", process.cwd(), {
       signal: abortController.signal,
       onData: () => undefined,
     });

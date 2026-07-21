@@ -16,7 +16,7 @@ const PROCESS_TREE_SCAN_TIMEOUT_MS = 1_000;
 const POSIX_PROCESS_TREE_SIGNAL_TIMEOUT_MS = 2_000;
 // taskkill /T can take longer to report completion on loaded Windows hosts. Give it a wider
 // callback bound without allowing a stalled callback to hang teardown forever.
-const WINDOWS_PROCESS_TREE_SIGNAL_TIMEOUT_MS = 10_000;
+export const WINDOWS_PROCESS_TREE_SIGNAL_TIMEOUT_MS = 10_000;
 const PROCESS_TREE_SCAN_MAX_BUFFER_BYTES = 262_144;
 const PROCESS_COMMAND_SCAN_MAX_BUFFER_BYTES = 262_144;
 const POSIX_TREE_WALK_MAX_VISITED = 256;

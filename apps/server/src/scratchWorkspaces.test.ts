@@ -6,6 +6,7 @@
 import {
   chmodSync,
   mkdirSync,
+  realpathSync,
   renameSync,
   rmSync,
   statSync,
@@ -38,7 +39,7 @@ import {
 } from "./scratchWorkspaces";
 
 function scratchRoot(): string {
-  return path.join(tmpdir(), SCRATCH_WORKSPACES_DIRNAME);
+  return path.join(realpathSync(tmpdir()), SCRATCH_WORKSPACES_DIRNAME);
 }
 
 describe("ensureIsolatedScratchWorkspace", () => {
@@ -76,7 +77,9 @@ describe("ensureIsolatedScratchWorkspace", () => {
         chmodSync(rootDir, 0o755);
         chmodSync(workspaceDir, 0o755);
 
-        expect(ensureIsolatedScratchWorkspace(threadId, { rootDir })).toBe(workspaceDir);
+        expect(ensureIsolatedScratchWorkspace(threadId, { rootDir })).toBe(
+          realpathSync(workspaceDir),
+        );
         expect(statSync(rootDir).mode & 0o777).toBe(0o700);
         expect(statSync(workspaceDir).mode & 0o777).toBe(0o700);
       } finally {

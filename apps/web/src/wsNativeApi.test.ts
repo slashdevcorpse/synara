@@ -26,6 +26,7 @@ import {
 } from "@synara/contracts";
 import { SYNARA_CSRF_HEADER_NAME, SYNARA_CSRF_HEADER_VALUE } from "@synara/shared/authSecurity";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { WsTransportState } from "./wsTransportEvents";
 
 const requestMock = vi.fn<(...args: Array<unknown>) => Promise<unknown>>();
 const disposeMock = vi.fn();
@@ -39,6 +40,8 @@ const showContextMenuFallbackMock =
   >();
 const channelListeners = new Map<string, Set<(message: WsPush) => void>>();
 const latestPushByChannel = new Map<string, WsPush>();
+let sessionVersion = 1;
+let transportState: WsTransportState = "open";
 const subscribeMock = vi.fn<
   (
     channel: string,
@@ -77,7 +80,10 @@ vi.mock("./wsTransport", () => {
         return latestPushByChannel.get(channel) ?? null;
       }
       getState() {
-        return "open" as const;
+        return transportState;
+      }
+      getSessionVersion() {
+        return sessionVersion;
       }
       dispose = disposeMock;
     },
@@ -138,8 +144,11 @@ beforeEach(() => {
   subscribeMock.mockClear();
   channelListeners.clear();
   latestPushByChannel.clear();
+  sessionVersion = 1;
+  transportState = "open";
   nextPushSequence = 1;
   Reflect.deleteProperty(getWindowForTest(), "desktopBridge");
+  Reflect.deleteProperty(getWindowForTest(), "__synaraE2e");
 });
 
 afterEach(() => {
@@ -148,6 +157,230 @@ afterEach(() => {
 });
 
 describe("wsNativeApi", () => {
+  it("does not expose the renderer readiness probe outside the desktop E2E harness", async () => {
+    const { createWsNativeApi } = await import("./wsNativeApi");
+
+    createWsNativeApi();
+
+    expect(Reflect.has(getWindowForTest(), "__synaraE2e")).toBe(false);
+  });
+
+  it("removes the renderer readiness probe when the native API is reset", async () => {
+    Object.defineProperty(getWindowForTest(), "desktopBridge", {
+      configurable: true,
+      value: { isE2eHarness: true },
+    });
+    const { createWsNativeApi, resetWsNativeApiForTest } = await import("./wsNativeApi");
+
+    createWsNativeApi();
+    expect(Reflect.has(getWindowForTest(), "__synaraE2e")).toBe(true);
+
+    await resetWsNativeApiForTest();
+
+    expect(Reflect.has(getWindowForTest(), "__synaraE2e")).toBe(false);
+    expect(disposeMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("runs the narrow desktop E2E probe on one feature-session generation", async () => {
+    Object.defineProperty(getWindowForTest(), "desktopBridge", {
+      configurable: true,
+      value: { isE2eHarness: true },
+    });
+    requestMock.mockImplementation(async (method) => {
+      if (method === ORCHESTRATION_WS_METHODS.getShellSnapshot) {
+        return {
+          snapshotSequence: 7,
+          projects: [],
+          threads: [],
+          updatedAt: "2026-01-01T00:00:00.000Z",
+        };
+      }
+      if (method === WS_METHODS.serverRefreshProviders) {
+        return { providers: defaultProviders };
+      }
+      throw new Error(`Unexpected RPC method: ${String(method)}`);
+    });
+    const { createWsNativeApi } = await import("./wsNativeApi");
+
+    createWsNativeApi();
+    const harness = (
+      getWindowForTest() as typeof window & {
+        __synaraE2e?: { probeReadiness: () => Promise<unknown> };
+      }
+    ).__synaraE2e;
+
+    await expect(harness?.probeReadiness()).resolves.toEqual({
+      sessionVersion: 1,
+      snapshotSequence: 7,
+      providers: defaultProviders,
+    });
+    expect(requestMock.mock.calls.map(([method]) => method)).toEqual([
+      ORCHESTRATION_WS_METHODS.getShellSnapshot,
+      WS_METHODS.serverRefreshProviders,
+      ORCHESTRATION_WS_METHODS.getShellSnapshot,
+    ]);
+    for (const call of requestMock.mock.calls) {
+      expect(call.slice(1)).toEqual([undefined, { retryOnSessionInterruption: true }]);
+    }
+  });
+
+  it("restarts the desktop E2E probe once when its final check changes sessions", async () => {
+    Object.defineProperty(getWindowForTest(), "desktopBridge", {
+      configurable: true,
+      value: { isE2eHarness: true },
+    });
+    const secondProviders: ReadonlyArray<ServerProviderStatus> = [
+      { ...defaultProviders[0]!, checkedAt: "2026-01-02T00:00:00.000Z" },
+    ];
+    let shellRequests = 0;
+    let refreshRequests = 0;
+    requestMock.mockImplementation(async (method) => {
+      if (method === ORCHESTRATION_WS_METHODS.getShellSnapshot) {
+        shellRequests += 1;
+        if (shellRequests === 2) sessionVersion += 1;
+        return {
+          snapshotSequence: shellRequests * 10,
+          projects: [],
+          threads: [],
+          updatedAt: "2026-01-01T00:00:00.000Z",
+        };
+      }
+      if (method === WS_METHODS.serverRefreshProviders) {
+        refreshRequests += 1;
+        return { providers: refreshRequests === 1 ? defaultProviders : secondProviders };
+      }
+      throw new Error(`Unexpected RPC method: ${String(method)}`);
+    });
+    const { createWsNativeApi } = await import("./wsNativeApi");
+
+    createWsNativeApi();
+    const harness = (
+      getWindowForTest() as typeof window & {
+        __synaraE2e?: { probeReadiness: () => Promise<unknown> };
+      }
+    ).__synaraE2e;
+
+    await expect(harness?.probeReadiness()).resolves.toEqual({
+      sessionVersion: 2,
+      snapshotSequence: 40,
+      providers: secondProviders,
+    });
+    expect(requestMock.mock.calls.map(([method]) => method)).toEqual([
+      ORCHESTRATION_WS_METHODS.getShellSnapshot,
+      WS_METHODS.serverRefreshProviders,
+      ORCHESTRATION_WS_METHODS.getShellSnapshot,
+      ORCHESTRATION_WS_METHODS.getShellSnapshot,
+      WS_METHODS.serverRefreshProviders,
+      ORCHESTRATION_WS_METHODS.getShellSnapshot,
+    ]);
+    for (const call of requestMock.mock.calls) {
+      expect(call.slice(1)).toEqual([undefined, { retryOnSessionInterruption: true }]);
+    }
+  });
+
+  it("restarts the desktop E2E probe once when its final transport state is unstable", async () => {
+    Object.defineProperty(getWindowForTest(), "desktopBridge", {
+      configurable: true,
+      value: { isE2eHarness: true },
+    });
+    let shellRequests = 0;
+    requestMock.mockImplementation(async (method) => {
+      if (method === ORCHESTRATION_WS_METHODS.getShellSnapshot) {
+        shellRequests += 1;
+        if (shellRequests === 2) transportState = "connecting";
+        if (shellRequests === 3) transportState = "open";
+        return {
+          snapshotSequence: shellRequests,
+          projects: [],
+          threads: [],
+          updatedAt: "2026-01-01T00:00:00.000Z",
+        };
+      }
+      if (method === WS_METHODS.serverRefreshProviders) return { providers: defaultProviders };
+      throw new Error(`Unexpected RPC method: ${String(method)}`);
+    });
+    const { createWsNativeApi } = await import("./wsNativeApi");
+
+    createWsNativeApi();
+    const harness = (
+      getWindowForTest() as typeof window & {
+        __synaraE2e?: { probeReadiness: () => Promise<unknown> };
+      }
+    ).__synaraE2e;
+
+    await expect(harness?.probeReadiness()).resolves.toEqual({
+      sessionVersion: 1,
+      snapshotSequence: 4,
+      providers: defaultProviders,
+    });
+    expect(requestMock).toHaveBeenCalledTimes(6);
+  });
+
+  it("rejects the desktop E2E probe after two superseded feature sessions", async () => {
+    Object.defineProperty(getWindowForTest(), "desktopBridge", {
+      configurable: true,
+      value: { isE2eHarness: true },
+    });
+    let shellRequests = 0;
+    requestMock.mockImplementation(async (method) => {
+      if (method === ORCHESTRATION_WS_METHODS.getShellSnapshot) {
+        shellRequests += 1;
+        if (shellRequests % 2 === 0) sessionVersion += 1;
+        return {
+          snapshotSequence: 8,
+          projects: [],
+          threads: [],
+          updatedAt: "2026-01-01T00:00:00.000Z",
+        };
+      }
+      if (method === WS_METHODS.serverRefreshProviders) return { providers: defaultProviders };
+      throw new Error(`Unexpected RPC method: ${String(method)}`);
+    });
+    const { createWsNativeApi } = await import("./wsNativeApi");
+
+    createWsNativeApi();
+    const harness = (
+      getWindowForTest() as typeof window & {
+        __synaraE2e?: { probeReadiness: () => Promise<unknown> };
+      }
+    ).__synaraE2e;
+
+    await expect(harness?.probeReadiness()).rejects.toThrow(
+      "Desktop E2E renderer transport changed sessions or left the open state during readiness probe.",
+    );
+    expect(requestMock).toHaveBeenCalledTimes(6);
+  });
+
+  it("propagates the original desktop E2E readiness RPC failure", async () => {
+    Object.defineProperty(getWindowForTest(), "desktopBridge", {
+      configurable: true,
+      value: { isE2eHarness: true },
+    });
+    const rpcFailure = new Error("provider refresh transport failure");
+    requestMock
+      .mockResolvedValueOnce({
+        snapshotSequence: 9,
+        projects: [],
+        threads: [],
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      })
+      .mockRejectedValueOnce(rpcFailure);
+    const { createWsNativeApi } = await import("./wsNativeApi");
+
+    createWsNativeApi();
+    const harness = (
+      getWindowForTest() as typeof window & {
+        __synaraE2e?: { probeReadiness: () => Promise<unknown> };
+      }
+    ).__synaraE2e;
+
+    await expect(harness?.probeReadiness()).rejects.toBe(rpcFailure);
+    expect(requestMock.mock.calls.map(([method]) => method)).toEqual([
+      ORCHESTRATION_WS_METHODS.getShellSnapshot,
+      WS_METHODS.serverRefreshProviders,
+    ]);
+  });
+
   it("delivers and caches valid server.welcome payloads", async () => {
     const { createWsNativeApi, onServerWelcome } = await import("./wsNativeApi");
 
@@ -512,9 +745,13 @@ describe("wsNativeApi", () => {
     } as const;
     await api.orchestration.dispatchCommand(command);
 
-    expect(requestMock).toHaveBeenCalledWith(ORCHESTRATION_WS_METHODS.dispatchCommand, {
-      command,
-    });
+    expect(requestMock).toHaveBeenCalledWith(
+      ORCHESTRATION_WS_METHODS.dispatchCommand,
+      { command },
+      {
+        retryOnSessionInterruption: true,
+      },
+    );
   });
 
   it("forwards terminal output ACKs to the websocket transport", async () => {
@@ -583,14 +820,20 @@ describe("wsNativeApi", () => {
     } as const;
     await api.orchestration.dispatchCommand(command);
 
-    expect(requestMock).toHaveBeenCalledWith(ORCHESTRATION_WS_METHODS.dispatchCommand, {
-      command: {
-        ...command,
-        answers: {
-          Runtime: "Bun",
+    expect(requestMock).toHaveBeenCalledWith(
+      ORCHESTRATION_WS_METHODS.dispatchCommand,
+      {
+        command: {
+          ...command,
+          answers: {
+            Runtime: "Bun",
+          },
         },
       },
-    });
+      {
+        retryOnSessionInterruption: true,
+      },
+    );
   });
 
   it("forwards workspace file writes to the websocket project method", async () => {

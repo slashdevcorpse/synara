@@ -50,6 +50,41 @@ import { emitWsCompatibilityIssue, emitWsTransportState } from "./wsTransportEve
 import { resolveWsHttpUrl } from "./lib/wsHttpUrl";
 
 let instance: { api: NativeApi; transport: WsTransport } | null = null;
+const RETRY_ON_SESSION_INTERRUPTION = { retryOnSessionInterruption: true } as const;
+
+function clearE2eRendererHarness(): void {
+  if (typeof window !== "undefined") {
+    delete window.__synaraE2e;
+  }
+}
+
+function installE2eRendererHarness(api: NativeApi, transport: WsTransport): void {
+  clearE2eRendererHarness();
+  if (typeof window === "undefined" || window.desktopBridge?.isE2eHarness !== true) return;
+
+  window.__synaraE2e = {
+    probeReadiness: async () => {
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        // Establish a usable feature session first. The desktop fixture invokes this only after
+        // the root UI has committed its initial shell snapshot ("Loading projects" is hidden).
+        await api.orchestration.getShellSnapshot();
+        const refreshed = await api.server.refreshProviders();
+        const sessionVersion = transport.getSessionVersion();
+        const snapshot = await api.orchestration.getShellSnapshot();
+        if (transport.getState() === "open" && transport.getSessionVersion() === sessionVersion) {
+          return {
+            sessionVersion,
+            snapshotSequence: snapshot.snapshotSequence,
+            providers: refreshed.providers,
+          };
+        }
+      }
+      throw new Error(
+        "Desktop E2E renderer transport changed sessions or left the open state during readiness probe.",
+      );
+    },
+  };
+}
 
 function createListenerRegistry<T>() {
   const listeners = new Set<(payload: T) => void>();
@@ -628,7 +663,12 @@ export function createWsNativeApi(): NativeApi {
         await transport.dispose();
         return result;
       },
-      refreshProviders: () => transport.request(WS_METHODS.serverRefreshProviders),
+      refreshProviders: () =>
+        transport.request(
+          WS_METHODS.serverRefreshProviders,
+          undefined,
+          RETRY_ON_SESSION_INTERRUPTION,
+        ),
       // Provider updates run up to 2 minutes server-side; callers wrap this in
       // withProviderUpdateTimeout, which owns the client-side watchdog.
       updateProvider: (input) =>
@@ -678,11 +718,20 @@ export function createWsNativeApi(): NativeApi {
     },
     orchestration: {
       getSnapshot: () => transport.request(ORCHESTRATION_WS_METHODS.getSnapshot),
-      getShellSnapshot: () => transport.request(ORCHESTRATION_WS_METHODS.getShellSnapshot),
+      getShellSnapshot: () =>
+        transport.request(
+          ORCHESTRATION_WS_METHODS.getShellSnapshot,
+          undefined,
+          RETRY_ON_SESSION_INTERRUPTION,
+        ),
       dispatchCommand: (command) => {
-        return transport.request(ORCHESTRATION_WS_METHODS.dispatchCommand, {
-          command: omitNullUserInputAnswers(command),
-        });
+        return transport.request(
+          ORCHESTRATION_WS_METHODS.dispatchCommand,
+          {
+            command: omitNullUserInputAnswers(command),
+          },
+          RETRY_ON_SESSION_INTERRUPTION,
+        );
       },
       importThread: (input) => transport.request(ORCHESTRATION_WS_METHODS.importThread, input),
       repairState: () => transport.request(ORCHESTRATION_WS_METHODS.repairState),
@@ -915,6 +964,7 @@ export function createWsNativeApi(): NativeApi {
   };
 
   instance = { api, transport };
+  installE2eRendererHarness(api, transport);
   return api;
 }
 
@@ -925,6 +975,7 @@ export async function resetWsNativeApiForTest(): Promise<void> {
   instance = null;
   clearWsNativeApiListeners();
   fallbackBrowserStates.clear();
+  clearE2eRendererHarness();
   await transport?.dispose();
 }
 
@@ -933,5 +984,6 @@ if (import.meta.hot) {
     void instance?.transport.dispose();
     instance = null;
     clearWsNativeApiListeners();
+    clearE2eRendererHarness();
   });
 }

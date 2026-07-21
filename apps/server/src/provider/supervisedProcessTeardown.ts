@@ -8,12 +8,15 @@ import {
   type ProcessTreeDescendantExitProof,
   type ProcessTreeSignalResult,
   type TerminalKillSignal,
+  WINDOWS_PROCESS_TREE_SIGNAL_TIMEOUT_MS,
 } from "../terminal/processTreeKiller";
 import { Effect } from "effect";
+import { isWindowsJobContainedProviderProcess } from "./windowsProviderProcess.ts";
 
 const DEFAULT_TERM_GRACE_MS = 1_500;
 const DEFAULT_FORCE_EXIT_MS = 1_500;
 const DEFAULT_POLL_MS = 25;
+const ROOT_TREE_SIGNAL_SETTLEMENT_SLACK_MS = 250;
 
 export interface SupervisedProcessTeardownInput {
   readonly rootPid: number;
@@ -22,6 +25,8 @@ export interface SupervisedProcessTeardownInput {
   readonly termGraceMs?: number;
   readonly forceExitMs?: number;
   readonly pollMs?: number;
+  /** Trusted spawn-time proof that Windows root-tree signaling replaces PID-based capture. */
+  readonly descendantExitProof?: "root-tree-signal" | undefined;
 }
 
 export interface ProcessExitHandle {
@@ -183,6 +188,9 @@ export async function teardownChildProcessTree(
   return teardownProcessTree({
     rootPid: process.pid,
     rootExited: waitForOwnedProcessExit(process),
+    ...(isWindowsJobContainedProviderProcess(process)
+      ? { descendantExitProof: "root-tree-signal" as const }
+      : {}),
   });
 }
 
@@ -193,12 +201,16 @@ export function teardownEffectProcessTree(
   return teardownProcessTree({
     rootPid: Number(process.pid),
     rootExited: Effect.runPromise(Effect.exit(process.exitCode)),
+    ...(isWindowsJobContainedProviderProcess(process)
+      ? { descendantExitProof: "root-tree-signal" as const }
+      : {}),
   });
 }
 
 /**
  * Owns the complete provider process-tree stop sequence. Success means the exact root emitted exit
- * and every identity-matched descendant captured before TERM is gone; sending a signal is not
+ * and every identity-matched descendant captured before TERM is gone, or an explicitly marked
+ * Windows launcher completed root-tree signaling and exited. Sending a signal alone is not
  * considered completion.
  */
 export async function teardownProviderProcessTree(
@@ -245,7 +257,14 @@ export async function teardownProviderProcessTree(
   await Promise.resolve();
   if (rootExited) failUncapturedExit();
 
-  const capturedTree = await deps.processTreeKiller.capture(input.rootPid);
+  const capturedTree =
+    input.descendantExitProof === "root-tree-signal"
+      ? ({
+          descendants: [],
+          captureComplete: true,
+          descendantExitProof: "root-tree-signal",
+        } as const)
+      : await deps.processTreeKiller.capture(input.rootPid);
   captureFinished = true;
 
   // An asynchronous process-table scan can overlap root exit. Flush an exit
@@ -337,8 +356,15 @@ export async function teardownProviderProcessTree(
   // If the owned root exited while descendants were being captured, its numeric
   // PID may already identify an unrelated process. The untrusted capture was
   // discarded above; skip the root tree and keep the result unproven.
+  const signalDeadlineMs = (exitWaitMs: number): number =>
+    input.descendantExitProof === "root-tree-signal"
+      ? Math.max(
+          exitWaitMs,
+          WINDOWS_PROCESS_TREE_SIGNAL_TIMEOUT_MS + ROOT_TREE_SIGNAL_SETTLEMENT_SLACK_MS,
+        )
+      : exitWaitMs;
   const termGraceMs = positiveDuration(input.termGraceMs, DEFAULT_TERM_GRACE_MS);
-  await signal("SIGTERM", !rootExited, termGraceMs);
+  await signal("SIGTERM", !rootExited, signalDeadlineMs(termGraceMs));
   const graceful = await waitForExitProof(termGraceMs);
   if (graceful.proven) {
     return { escalated: false, signalErrors };
@@ -347,7 +373,7 @@ export async function teardownProviderProcessTree(
   // A root can exit while descendants ignore TERM and become reparented. Preserve the captured
   // identities and force only those descendants rather than re-signalling a potentially reused PID.
   const forceExitMs = positiveDuration(input.forceExitMs, DEFAULT_FORCE_EXIT_MS);
-  await signal("SIGKILL", !rootExited, forceExitMs);
+  await signal("SIGKILL", !rootExited, signalDeadlineMs(forceExitMs));
   const forced = await waitForExitProof(forceExitMs);
   if (forced.proven) {
     return { escalated: true, signalErrors };

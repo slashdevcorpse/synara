@@ -23,6 +23,11 @@ const ELECTRON_BOOTSTRAP_PATH = Path.join(__dirname, "fixtures/electron-bootstra
 const FAKE_CODEX_SOURCE_PATH = Path.join(__dirname, "fixtures/fake-codex.ts");
 const NETWORK_GUARD_PATH = Path.join(__dirname, "fixtures/network-guard.cjs");
 type JsonRecord = Record<string, unknown>;
+interface RendererReadinessResult {
+  readonly sessionVersion: number;
+  readonly snapshotSequence: number;
+  readonly providers: ReadonlyArray<JsonRecord>;
+}
 
 function formatAggregateError(error: unknown): string {
   if (error instanceof AggregateError) {
@@ -87,7 +92,6 @@ const BROWSER_SESSION_PARTITION = "persist:synara-browser";
 const FAKE_CODEX_PREFLIGHT_TIMEOUT_MS = 15_000;
 const FAKE_CODEX_RUNTIME_BUILD_TIMEOUT_MS = 30_000;
 const NETWORK_GUARD_PREFLIGHT_TIMEOUT_MS = 5_000;
-const PROVIDER_HEALTH_READY_TIMEOUT_MS = 30_000;
 const BUN_RUNTIME_COMMAND = resolveExecutableOnPath("bun");
 const NODE_RUNTIME_COMMAND = resolveExecutableOnPath("node");
 
@@ -635,6 +639,9 @@ export class DesktopHarness {
       ].join("\n"),
       "utf8",
     );
+    // Exclude the direct launcher preflight while retaining every provider probe from this
+    // Electron launch, including a startup refresh that begins before renderer readiness.
+    const rendererRpcInvocationBaseline = (await this.readJsonLines(this.invocationLogPath)).length;
     const electronApp = await _electron.launch({
       executablePath: electronPath,
       args: [...CHROMIUM_NETWORK_GUARD_ARGS, ELECTRON_BOOTSTRAP_PATH],
@@ -726,67 +733,64 @@ export class DesktopHarness {
         timeout: 60_000,
       });
       await expect(page.getByLabel("Loading projects")).toBeHidden({ timeout: 60_000 });
-      const rendererRpcInvocationBaseline = (await this.readJsonLines(this.invocationLogPath))
-        .length;
-      await page.bringToFront();
       await expect.poll(() => page.evaluate(() => document.visibilityState)).toBe("visible");
-      await expect
-        .poll(
-          async () => {
-            // The production focus hook refreshes provider status through the renderer's
-            // WsTransport. Re-dispatching focus also crosses its 15-second retry throttle if
-            // the first request raced startup, while the fresh CLI records prove the RPC
-            // reached the server before the harness yields to mutation tests.
-            await page.evaluate(() => window.dispatchEvent(new Event("focus")));
-            const invocations = (await this.readJsonLines(this.invocationLogPath)).slice(
-              rendererRpcInvocationBaseline,
-            );
-            const networkEvents = (await this.readJsonLines(this.networkLogPath)).slice(
-              networkEventBaseline,
-            );
-            const guardedProcesses = new Set(
-              networkEvents.flatMap((entry) =>
-                entry.event === "guard-installed" &&
-                entry.role === "fake-codex" &&
-                typeof entry.pid === "number" &&
-                Array.isArray(entry.args)
-                  ? [JSON.stringify([entry.pid, entry.args])]
-                  : [],
-              ),
-            );
-            const healthInvocations = invocations.filter(
-              (entry) =>
-                typeof entry.pid === "number" &&
-                Array.isArray(entry.args) &&
-                (JSON.stringify(entry.args) === JSON.stringify(["--version"]) ||
-                  JSON.stringify(entry.args) === JSON.stringify(["login", "status"])),
-            );
-            return {
-              version: healthInvocations.some(
-                (entry) => JSON.stringify(entry.args) === JSON.stringify(["--version"]),
-              ),
-              auth: healthInvocations.some(
-                (entry) => JSON.stringify(entry.args) === JSON.stringify(["login", "status"]),
-              ),
-              guarded:
-                healthInvocations.length >= 2 &&
-                healthInvocations.every((entry) =>
-                  guardedProcesses.has(JSON.stringify([entry.pid, entry.args])),
-                ),
-            };
-          },
-          {
-            timeout: PROVIDER_HEALTH_READY_TIMEOUT_MS,
-            intervals: [100, 250, 500, 1_000],
-          },
-        )
-        .toEqual({ version: true, auth: true, guarded: true });
-      await page.evaluate(
-        () =>
-          new Promise<void>((resolve) =>
-            window.requestAnimationFrame(() => window.requestAnimationFrame(() => resolve())),
-          ),
+      const rendererReadiness = await page.evaluate(async () => {
+        const harness = (
+          window as typeof window & {
+            __synaraE2e?: { probeReadiness: () => Promise<RendererReadinessResult> };
+          }
+        ).__synaraE2e;
+        if (!harness) {
+          throw new Error("Desktop E2E renderer readiness probe is unavailable.");
+        }
+        return harness.probeReadiness();
+      });
+      expect(rendererReadiness.sessionVersion).toBeGreaterThan(0);
+      expect(rendererReadiness.snapshotSequence).toBeGreaterThanOrEqual(0);
+      expect(
+        rendererReadiness.providers.find((provider) => provider.provider === "codex"),
+      ).toMatchObject({
+        status: "ready",
+        available: true,
+        authStatus: "authenticated",
+      });
+
+      const invocations = (await this.readJsonLines(this.invocationLogPath)).slice(
+        rendererRpcInvocationBaseline,
       );
+      const networkEvents = (await this.readJsonLines(this.networkLogPath)).slice(
+        networkEventBaseline,
+      );
+      const guardedProcesses = new Set(
+        networkEvents.flatMap((entry) =>
+          entry.event === "guard-installed" &&
+          entry.role === "fake-codex" &&
+          typeof entry.pid === "number" &&
+          Array.isArray(entry.args)
+            ? [JSON.stringify([entry.pid, entry.args])]
+            : [],
+        ),
+      );
+      const healthInvocations = invocations.filter(
+        (entry) =>
+          typeof entry.pid === "number" &&
+          Array.isArray(entry.args) &&
+          (JSON.stringify(entry.args) === JSON.stringify(["--version"]) ||
+            JSON.stringify(entry.args) === JSON.stringify(["login", "status"])),
+      );
+      expect({
+        version: healthInvocations.some(
+          (entry) => JSON.stringify(entry.args) === JSON.stringify(["--version"]),
+        ),
+        auth: healthInvocations.some(
+          (entry) => JSON.stringify(entry.args) === JSON.stringify(["login", "status"]),
+        ),
+        guarded:
+          healthInvocations.length >= 2 &&
+          healthInvocations.every((entry) =>
+            guardedProcesses.has(JSON.stringify([entry.pid, entry.args])),
+          ),
+      }).toEqual({ version: true, auth: true, guarded: true });
     } catch (error) {
       try {
         await this.stop();
