@@ -1378,7 +1378,7 @@ describe("windowsProcess", () => {
         const callerBefore = { ...caller };
         const reverseCaller = Object.fromEntries(Object.entries(caller).reverse());
         const reverseBefore = { ...reverseCaller };
-        const cache = createWindowsCommandDiscoveryCache();
+        const cache = createWindowsCommandDiscoveryCache({ now: () => 0 });
         const observations: WindowsCommandDiscoveryObservation[] = [];
         const childEnvironments: NodeJS.ProcessEnv[] = [];
         const spawnSync: NonNullable<WindowsSafeProcessInput["spawnSync"]> = (
@@ -1504,7 +1504,7 @@ describe("windowsProcess", () => {
               [collision.left, collision.right],
               [collision.right, collision.left],
             ] as const) {
-              const commandDiscoveryCache = createWindowsCommandDiscoveryCache();
+              const commandDiscoveryCache = createWindowsCommandDiscoveryCache({ now: () => 0 });
               const observations: WindowsCommandDiscoveryObservation[] = [];
               const spawnSync: NonNullable<WindowsSafeProcessInput["spawnSync"]> = (
                 command,
@@ -1637,7 +1637,7 @@ describe("windowsProcess", () => {
             [left, right],
             [right, left],
           ] as const) {
-            const commandDiscoveryCache = createWindowsCommandDiscoveryCache();
+            const commandDiscoveryCache = createWindowsCommandDiscoveryCache({ now: () => 0 });
             const observations: WindowsCommandDiscoveryObservation[] = [];
             const resolve = (variant: (typeof variants)[number]) =>
               resolveWindowsCommandCandidates(variant.command, {
