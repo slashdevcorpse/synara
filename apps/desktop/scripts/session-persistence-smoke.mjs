@@ -135,12 +135,12 @@ function captureDesktopPersistenceSmokeProcessOutput(child, state) {
   }
 }
 
-function capturedOutputSuffix(state) {
+function capturedOutputSuffix(state, label = "Captured output") {
   if (state.output.length === 0) return "";
   const truncationNotice = state.outputTruncated
     ? `[output truncated; showing final ${DESKTOP_PERSISTENCE_SMOKE_DIAGNOSTIC_TAIL_CHARS} characters]\n`
     : "";
-  return `\nCaptured output:\n${truncationNotice}${state.output}`;
+  return `\n${label}:\n${truncationNotice}${state.output}`;
 }
 
 function commandFailureMessage(description, detail, state) {
@@ -235,6 +235,18 @@ function formatFailure(error) {
   }
   if (error instanceof Error) return error.stack ?? `${error.name}: ${error.message}`;
   return String(error);
+}
+
+export function withDesktopPersistenceSmokeLaunchOutput(error, launch) {
+  const outputSuffix = capturedOutputSuffix(launch, `Active ${launch.description} output`);
+  const suffix =
+    outputSuffix.length === 0
+      ? `\nActive ${launch.description} output:\n<no output captured>`
+      : outputSuffix;
+  const detail = error instanceof Error ? error.message : String(error);
+  const wrapped = new Error(`${detail}${suffix}`, { cause: error });
+  wrapped.stack = `${formatFailure(error)}${suffix}`;
+  return wrapped;
 }
 
 async function main() {
@@ -363,7 +375,13 @@ async function main() {
 
   await runDesktopPersistenceSmokeSequence({
     seedFixture: () => runFixture("seed"),
-    armFixture: () => runFixture("arm"),
+    armFixture: async (launch) => {
+      try {
+        await runFixture("arm");
+      } catch (error) {
+        throw withDesktopPersistenceSmokeLaunchOutput(error, launch);
+      }
+    },
     launchDesktop,
     waitForReadiness,
     forceStopDesktop,

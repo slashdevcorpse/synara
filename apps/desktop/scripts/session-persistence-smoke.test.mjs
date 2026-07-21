@@ -5,6 +5,7 @@ import {
   appendDesktopPersistenceSmokeOutput,
   createDesktopPersistenceSmokeOutputState,
   endDesktopPersistenceSmokeOutputStream,
+  withDesktopPersistenceSmokeLaunchOutput,
 } from "./session-persistence-smoke.mjs";
 
 describe("desktop persistence smoke output capture", () => {
@@ -77,5 +78,58 @@ describe("desktop persistence smoke output capture", () => {
 
     expect(state.output).not.toContain("�");
     expect(state.observedPatterns).toEqual(new Set([stdoutPattern, stderrPattern]));
+  });
+
+  it("preserves the arm failure and appends launch A output", () => {
+    const launch = {
+      description: "launch A",
+      ...createDesktopPersistenceSmokeOutputState(),
+    };
+    const failure = new Error("arm failed");
+    appendDesktopPersistenceSmokeOutput(launch, "stderr", "launch A server exited unexpectedly\n");
+
+    const wrapped = withDesktopPersistenceSmokeLaunchOutput(failure, launch);
+
+    expect(wrapped).not.toBe(failure);
+    expect(wrapped).toBeInstanceOf(Error);
+    expect(wrapped.cause).toBe(failure);
+    expect(wrapped.stack?.slice(0, failure.stack?.length)).toBe(failure.stack);
+    expect(wrapped.message).toContain("arm failed");
+    expect(wrapped.message).toContain("Active launch A output");
+    expect(wrapped.message).toContain("launch A server exited unexpectedly");
+  });
+
+  it("reports explicitly when launch A emitted no output", () => {
+    const launch = {
+      description: "launch A",
+      ...createDesktopPersistenceSmokeOutputState(),
+    };
+    const failure = new Error("arm failed");
+
+    const wrapped = withDesktopPersistenceSmokeLaunchOutput(failure, launch);
+
+    expect(wrapped.cause).toBe(failure);
+    expect(wrapped.stack?.slice(0, failure.stack?.length)).toBe(failure.stack);
+    expect(wrapped.message).toContain("Active launch A output:\n<no output captured>");
+  });
+
+  it("labels truncated launch A output and retains only its bounded tail", () => {
+    const launch = {
+      description: "launch A",
+      ...createDesktopPersistenceSmokeOutputState(),
+    };
+    appendDesktopPersistenceSmokeOutput(launch, "stdout", "discarded-prefix\n");
+    appendDesktopPersistenceSmokeOutput(
+      launch,
+      "stdout",
+      "x".repeat(DESKTOP_PERSISTENCE_SMOKE_DIAGNOSTIC_TAIL_CHARS),
+    );
+
+    const wrapped = withDesktopPersistenceSmokeLaunchOutput(new Error("arm failed"), launch);
+
+    expect(wrapped.message).toContain("Active launch A output");
+    expect(wrapped.message).toContain("[output truncated; showing final 65536 characters]");
+    expect(wrapped.message).not.toContain("discarded-prefix");
+    expect(wrapped.message.endsWith("x".repeat(256))).toBe(true);
   });
 });

@@ -109,7 +109,7 @@ const CI_DESKTOP_STARTUP_SMOKE_COMMANDS = {
   windows_x64: CI_WINDOWS_POST_BUILD_COMMAND,
   macos_arm64: "bun run test:desktop-smoke",
 } as const;
-const CI_DESKTOP_PERSISTENCE_SMOKE_COMMAND = "bun run test:desktop-persistence-smoke";
+const CI_DESKTOP_PERSISTENCE_SMOKE_COMMAND = "bun run --cwd apps/desktop persistence-smoke-test";
 const CI_DESKTOP_PERSISTENCE_SMOKE_STEP_NAME = "Verify two-launch desktop persistence";
 const CI_DESKTOP_PERSISTENCE_SMOKE_TIMEOUT_MINUTES = 5;
 const CI_DESKTOP_PERSISTENCE_SMOKE_HOMES = {

@@ -98,7 +98,7 @@ const windowsPersistenceSmokeStep = [
   '          SYNARA_DESKTOP_DISABLE_UPDATES: "1"',
   "          SYNARA_DESKTOP_FLAVOR: super",
   `          SYNARA_HOME: ${windowsPersistenceHome}`,
-  "        run: bun run test:desktop-persistence-smoke",
+  "        run: bun run --cwd apps/desktop persistence-smoke-test",
 ].join("\n");
 const windowsStartupSmokeStep = [
   "      - name: Smoke unpacked desktop in isolated state",
@@ -116,7 +116,7 @@ const macosPersistenceSmokeStep = [
   '          SYNARA_DESKTOP_DISABLE_UPDATES: "1"',
   "          SYNARA_DESKTOP_FLAVOR: super",
   `          SYNARA_HOME: ${macosPersistenceHome}`,
-  "        run: bun run test:desktop-persistence-smoke",
+  "        run: bun run --cwd apps/desktop persistence-smoke-test",
 ].join("\n");
 const macosStartupSmokeStep = [
   "      - name: Smoke unpacked desktop in isolated state",
@@ -1084,6 +1084,25 @@ jobs:
     );
     expect(validateWorkflowContracts(duplicateSmoke, policy()).join("\n")).toContain(
       "macos_arm64 must run exactly one post-build desktop persistence smoke command",
+    );
+  });
+
+  it("rejects the root Turbo wrapper for native desktop persistence smoke", () => {
+    const wrapperSmoke = validFiles();
+    wrapperSmoke.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace(
+        windowsPersistenceSmokeStep,
+        windowsPersistenceSmokeStep.replace(
+          "        run: bun run --cwd apps/desktop persistence-smoke-test",
+          "        run: bun run test:desktop-persistence-smoke",
+        ),
+      ),
+    );
+
+    const errors = validateWorkflowContracts(wrapperSmoke, policy()).join("\n");
+    expect(errors).toContain(
+      "windows_x64 must run exactly one post-build desktop persistence smoke command: bun run --cwd apps/desktop persistence-smoke-test",
     );
   });
 

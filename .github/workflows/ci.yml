@@ -336,7 +336,7 @@ jobs:
           SYNARA_DESKTOP_DISABLE_UPDATES: "1"
           SYNARA_DESKTOP_FLAVOR: super
           SYNARA_HOME: ${{ runner.temp }}\super-synara-persistence-windows-home
-        run: bun run test:desktop-persistence-smoke
+        run: bun run --cwd apps/desktop persistence-smoke-test
 
       - name: Smoke unpacked desktop in isolated state
         env:
@@ -414,7 +414,7 @@ jobs:
           SYNARA_DESKTOP_DISABLE_UPDATES: "1"
           SYNARA_DESKTOP_FLAVOR: super
           SYNARA_HOME: ${{ runner.temp }}/super-synara-persistence-macos-home
-        run: bun run test:desktop-persistence-smoke
+        run: bun run --cwd apps/desktop persistence-smoke-test
 
       - name: Smoke unpacked desktop in isolated state
         env:

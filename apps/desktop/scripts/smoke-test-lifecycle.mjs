@@ -6,7 +6,7 @@ import { isAbsolute, parse, relative, resolve, win32 } from "node:path";
 export const DESKTOP_SMOKE_OBSERVATION_MS = 8_000;
 export const DESKTOP_SMOKE_GRACEFUL_SHUTDOWN_MS = 5_000;
 export const DESKTOP_SMOKE_EXIT_PROOF_MS = 2_000;
-export const DESKTOP_SMOKE_WINDOWS_JOB_STARTUP_MS = 30_000;
+export const DESKTOP_SMOKE_WINDOWS_JOB_STARTUP_MS = 45_000;
 export const DESKTOP_SMOKE_WINDOWS_TEARDOWN_MS = 13_000;
 export const DESKTOP_SMOKE_WINDOWS_SETTLEMENT_MS = 2_000;
 export const WINDOWS_SMOKE_JOB_READY_PREFIX = "SYNARA_SMOKE_JOB_READY ";
@@ -796,7 +796,7 @@ export async function runDesktopPersistenceSmokeSequence({
       activeLaunch = await launchDesktop(label);
       await waitForReadiness(activeLaunch, label);
       if (label === "launch A") {
-        await armFixture();
+        await armFixture(activeLaunch, activeLabel);
       }
       await forceStopDesktop(activeLaunch, label);
       activeLaunch = null;

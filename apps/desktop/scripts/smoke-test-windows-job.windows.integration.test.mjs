@@ -108,6 +108,10 @@ async function canConnect(port) {
   });
 }
 
+function capturedResultOutput(result) {
+  return `Captured output:\n${result.output || "<none>"}`;
+}
+
 function spawnFixture({ fixturePath, arguments: fixtureArguments, workingDirectory, runId }) {
   const spawnSpec = createDesktopSmokeSpawnSpec({
     platform: "win32",
@@ -181,7 +185,11 @@ describe.skipIf(process.platform !== "win32")(
           observationMs: WINDOWS_JOB_INTEGRATION_OBSERVATION_MS,
         });
 
-        expect(result).toMatchObject({ ok: true, failures: [], teardownDiagnostics: [] });
+        expect(result, capturedResultOutput(result)).toMatchObject({
+          ok: true,
+          failures: [],
+          teardownDiagnostics: [],
+        });
         expect(result.output).toContain("FIXTURE_ARGV:[]");
       },
       WINDOWS_JOB_INTEGRATION_TEST_TIMEOUT_MS,
@@ -224,7 +232,11 @@ describe.skipIf(process.platform !== "win32")(
         await waitFor(() => canConnect(port), "the grandchild listener");
 
         const result = await resultPromise;
-        expect(result).toMatchObject({ ok: true, failures: [], teardownDiagnostics: [] });
+        expect(result, capturedResultOutput(result)).toMatchObject({
+          ok: true,
+          failures: [],
+          teardownDiagnostics: [],
+        });
         expect(result.output).toContain(`FIXTURE_ARGV:${JSON.stringify(targetArguments)}`);
 
         const processIds = (await readFile(pidFile, "utf8"))

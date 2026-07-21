@@ -7,7 +7,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   DESKTOP_PERSISTENCE_SMOKE_TREE_POLL_MS,
   DESKTOP_PERSISTENCE_SMOKE_USER_DATA_ENV,
-  DESKTOP_SMOKE_WINDOWS_JOB_STARTUP_MS,
   DESKTOP_SMOKE_WINDOWS_SETTLEMENT_MS,
   WINDOWS_SMOKE_JOB_READY_PREFIX,
   WINDOWS_SMOKE_JOB_RUN_ID_ENV,
@@ -596,25 +595,35 @@ describe("desktop smoke process lifecycle", () => {
   });
 
   it("fails a missing Windows Job Object marker at the bounded startup deadline", async () => {
+    const expectedStartupMs = 45_000;
     const child = new FakeSmokeProcess();
     const killWindowsTree = vi.fn(() => {
       child.exitAndClose(null, "SIGKILL");
       return { ok: true };
     });
     const resultPromise = superviseWindowsSmoke(child, { killWindowsTree });
+    child.stdout.emit("data", "helper initialization is still running\n");
+    child.stderr.emit("data", "compiler startup is still running\n");
 
-    await vi.advanceTimersByTimeAsync(DESKTOP_SMOKE_WINDOWS_JOB_STARTUP_MS);
+    await vi.advanceTimersByTimeAsync(expectedStartupMs - 1);
+    expect(child.stdin.end).not.toHaveBeenCalled();
+    expect(killWindowsTree).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(1);
     await vi.advanceTimersByTimeAsync(DESKTOP_SMOKE_WINDOWS_SETTLEMENT_MS);
 
     await expectSettled(resultPromise, {
       ok: false,
       failures: expect.arrayContaining([
-        expect.stringContaining(DESKTOP_SMOKE_WINDOWS_JOB_STARTUP_MS + "ms startup deadline"),
+        expect.stringContaining(expectedStartupMs + "ms startup deadline"),
         expect.stringContaining("closed before its ready marker"),
       ]),
       teardownDiagnostics: [
         expect.stringContaining("startup was unconfirmed; taskkill cleanup was required"),
       ],
+      output: expect.stringMatching(
+        /helper initialization is still running[\s\S]*compiler startup is still running/,
+      ),
     });
     expect(child.stdin.write).not.toHaveBeenCalled();
     expect(child.stdin.end).toHaveBeenCalledOnce();
@@ -1435,7 +1444,11 @@ describe("desktop smoke process lifecycle", () => {
     const launches = new Map();
     await runDesktopPersistenceSmokeSequence({
       seedFixture: async () => events.push("seed"),
-      armFixture: async () => events.push("arm"),
+      armFixture: async (activeLaunch, label) => {
+        expect(activeLaunch).toBe(launches.get("launch A"));
+        expect(label).toBe("launch A");
+        events.push("arm");
+      },
       launchDesktop: async (label) => {
         events.push(`${label}:start`);
         const launch = { label };
@@ -1472,11 +1485,18 @@ describe("desktop smoke process lifecycle", () => {
     const events = [];
     const launch = { label: "launch A" };
     const forceStopDesktop = vi.fn();
+    const assertFixture = vi.fn();
+    const cleanupDesktop = vi.fn(async (activeLaunch, label) => {
+      expect(activeLaunch).toBe(launch);
+      events.push(`${label}:cleanup`);
+    });
 
     await expect(
       runDesktopPersistenceSmokeSequence({
         seedFixture: async () => events.push("seed"),
-        armFixture: async () => {
+        armFixture: async (activeLaunch, label) => {
+          expect(activeLaunch).toBe(launch);
+          expect(label).toBe("launch A");
           events.push("arm");
           throw new Error("arm failed");
         },
@@ -1486,15 +1506,45 @@ describe("desktop smoke process lifecycle", () => {
         },
         waitForReadiness: async (_activeLaunch, label) => events.push(`${label}:ready`),
         forceStopDesktop,
-        assertFixture: vi.fn(),
-        cleanupDesktop: async (activeLaunch, label) => {
-          expect(activeLaunch).toBe(launch);
-          events.push(`${label}:cleanup`);
-        },
+        assertFixture,
+        cleanupDesktop,
       }),
     ).rejects.toThrow("arm failed");
 
     expect(events).toEqual(["seed", "launch A:start", "launch A:ready", "arm", "launch A:cleanup"]);
+    expect(cleanupDesktop).toHaveBeenCalledOnce();
     expect(forceStopDesktop).not.toHaveBeenCalled();
+    expect(assertFixture).not.toHaveBeenCalled();
+  });
+
+  it("aggregates fixture arming and launch A cleanup failures", async () => {
+    const launch = { label: "launch A" };
+    const armFailure = new Error("arm failed");
+    const cleanupFailure = new Error("cleanup failed");
+
+    let failure;
+    try {
+      await runDesktopPersistenceSmokeSequence({
+        seedFixture: vi.fn(),
+        armFixture: async () => {
+          throw armFailure;
+        },
+        launchDesktop: async () => launch,
+        waitForReadiness: vi.fn(),
+        forceStopDesktop: vi.fn(),
+        assertFixture: vi.fn(),
+        cleanupDesktop: async () => {
+          throw cleanupFailure;
+        },
+      });
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect(failure.message).toBe(
+      "Desktop persistence smoke failed and active process cleanup also failed.",
+    );
+    expect(failure.errors).toEqual([armFailure, cleanupFailure]);
   });
 });
