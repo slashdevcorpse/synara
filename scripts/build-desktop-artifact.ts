@@ -47,6 +47,10 @@ import {
   assertDesktopStageFilesUnchanged,
   verifyDesktopStagePatchedDependencies,
 } from "./lib/desktop-stage-install.ts";
+import {
+  createDesktopSourceBuildEnvironment,
+  resolveDesktopGeneratedRouteTreePath,
+} from "./lib/desktop-source-build-environment.ts";
 
 import * as NodeRuntime from "@effect/platform-node/NodeRuntime";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -950,6 +954,12 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
 
   const stageAppDir = path.join(stageRoot, "app");
   const stageResourcesDir = path.join(stageAppDir, "apps/desktop/resources");
+  const generatedRouteTreePath = exactProvenanceRequested
+    ? resolveDesktopGeneratedRouteTreePath(repoRoot)
+    : undefined;
+  const generatedRouteTreeRoot = generatedRouteTreePath
+    ? path.dirname(generatedRouteTreePath)
+    : undefined;
   const distDirs = {
     desktopDist: path.join(repoRoot, "apps/desktop/dist-electron"),
     desktopResources: path.join(repoRoot, "apps/desktop/resources"),
@@ -959,19 +969,28 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
 
   if (!options.skipBuild) {
     yield* Effect.log("[desktop-artifact] Building desktop/server/web artifacts...");
-    yield* runCommand(
+    const sourceBuild = runCommand(
       ChildProcess.make({
         cwd: repoRoot,
-        env: {
-          ...process.env,
-          SYNARA_DESKTOP_FLAVOR: options.flavor,
-          SYNARA_DESKTOP_DISABLE_UPDATES: options.disableUpdates ? "1" : "0",
-        },
+        env: createDesktopSourceBuildEnvironment({
+          baseEnvironment: process.env,
+          flavor: options.flavor,
+          disableUpdates: options.disableUpdates,
+          exactProvenanceRequested,
+          ...(generatedRouteTreePath ? { generatedRouteTreePath } : {}),
+        }),
         ...commandOutputOptions(options.verbose),
         // Windows needs shell mode to resolve .cmd shims (e.g. bun.cmd).
         shell: process.platform === "win32",
       })`bun run build:desktop`,
     );
+    yield* generatedRouteTreeRoot
+      ? sourceBuild.pipe(
+          Effect.ensuring(
+            fs.remove(generatedRouteTreeRoot, { force: true, recursive: true }).pipe(Effect.orDie),
+          ),
+        )
+      : sourceBuild;
   }
 
   for (const [label, dir] of Object.entries(distDirs)) {
