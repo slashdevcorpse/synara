@@ -205,22 +205,28 @@ export const usePinnedProjectsStore = create<PinnedProjectsStoreState>()(
           serverState,
         );
         observedProjectPinStateByProjectId.set(projectId, acceptedServerState);
-        const projectPinLifecycleByProjectId = new Map(state.projectPinLifecycleByProjectId);
-        projectPinLifecycleByProjectId.set(
+        const lifecycle = beginPinMutationLifecycle({
+          lifecycle: state.projectPinLifecycleByProjectId.get(projectId),
+          requestVersion,
+          desiredPinned: isPinned,
+          serverPinned: acceptedServerState.isPinned === true,
+          serverSequence: acceptedServerState.serverSequence,
+        });
+        const maps: MutableProjectPinMaps = {
+          lifecycle: new Map(state.projectPinLifecycleByProjectId),
+          optimistic: optimisticPinnedStateByProjectId,
+        };
+        settleProjectPinLifecycleIfConfirmed({
           projectId,
-          beginPinMutationLifecycle({
-            lifecycle: projectPinLifecycleByProjectId.get(projectId),
-            requestVersion,
-            desiredPinned: isPinned,
-            serverPinned: acceptedServerState.isPinned === true,
-            serverSequence: acceptedServerState.serverSequence,
-          }),
-        );
+          lifecycle,
+          serverState: acceptedServerState,
+          maps,
+        });
         set({
           pinnedProjectIds: pinResult.pinnedIds,
-          optimisticPinnedStateByProjectId,
+          optimisticPinnedStateByProjectId: maps.optimistic,
           latestPinnedMutationVersionByProjectId,
-          projectPinLifecycleByProjectId,
+          projectPinLifecycleByProjectId: maps.lifecycle,
           observedProjectPinStateByProjectId,
         });
         return { projectId, isPinned, requestVersion };

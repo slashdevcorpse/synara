@@ -66,6 +66,63 @@ describe("usePinnedProjectsStore", () => {
     expect(usePinnedProjectsStore.getState().pinnedProjectIds).toEqual([p3, p2, p4]);
   });
 
+  it("settles an already-pinned intent without dispatching or reordering persisted pins", () => {
+    const projectId = "project-1" as ProjectId;
+    const otherProjectId = "project-2" as ProjectId;
+    usePinnedProjectsStore.setState({ pinnedProjectIds: [otherProjectId, projectId] });
+
+    const intent = usePinnedProjectsStore.getState().beginProjectPinMutation(projectId, true, {
+      id: projectId,
+      isPinned: true,
+      serverSequence: 10,
+    });
+
+    expect(intent).toEqual({ projectId, isPinned: true, requestVersion: 1 });
+    expect(usePinnedProjectsStore.getState().takeNextProjectPinMutation(projectId)).toBeNull();
+    expect(usePinnedProjectsStore.getState().pinnedProjectIds).toEqual([otherProjectId, projectId]);
+    expect(usePinnedProjectsStore.getState().optimisticPinnedStateByProjectId).toEqual(new Map());
+    expect(usePinnedProjectsStore.getState().projectPinLifecycleByProjectId).toEqual(new Map());
+  });
+
+  it("settles an already-unpinned intent without dispatching or changing persisted pins", () => {
+    const projectId = "project-1" as ProjectId;
+    const pinnedProjectId = "project-2" as ProjectId;
+    usePinnedProjectsStore.setState({ pinnedProjectIds: [pinnedProjectId] });
+
+    const intent = usePinnedProjectsStore.getState().beginProjectPinMutation(projectId, false, {
+      id: projectId,
+      isPinned: false,
+      serverSequence: 20,
+    });
+
+    expect(intent).toEqual({ projectId, isPinned: false, requestVersion: 1 });
+    expect(usePinnedProjectsStore.getState().takeNextProjectPinMutation(projectId)).toBeNull();
+    expect(usePinnedProjectsStore.getState().pinnedProjectIds).toEqual([pinnedProjectId]);
+    expect(usePinnedProjectsStore.getState().optimisticPinnedStateByProjectId).toEqual(new Map());
+    expect(usePinnedProjectsStore.getState().projectPinLifecycleByProjectId).toEqual(new Map());
+  });
+
+  it("settles a queued pin when a newer unpin restores the accepted server state", () => {
+    const projectId = "project-1" as ProjectId;
+    usePinnedProjectsStore.getState().beginProjectPinMutation(projectId, true, {
+      id: projectId,
+      isPinned: false,
+      serverSequence: 30,
+    });
+
+    const intent = usePinnedProjectsStore.getState().beginProjectPinMutation(projectId, false, {
+      id: projectId,
+      isPinned: false,
+      serverSequence: 30,
+    });
+
+    expect(intent).toEqual({ projectId, isPinned: false, requestVersion: 2 });
+    expect(usePinnedProjectsStore.getState().takeNextProjectPinMutation(projectId)).toBeNull();
+    expect(usePinnedProjectsStore.getState().pinnedProjectIds).toEqual([]);
+    expect(usePinnedProjectsStore.getState().optimisticPinnedStateByProjectId).toEqual(new Map());
+    expect(usePinnedProjectsStore.getState().projectPinLifecycleByProjectId).toEqual(new Map());
+  });
+
   it("retains optimistic pin intent across stale server rows and settles after confirmation", () => {
     const projectId = "project-1" as ProjectId;
     const intent = usePinnedProjectsStore.getState().beginProjectPinMutation(projectId, true, {

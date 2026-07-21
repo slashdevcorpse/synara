@@ -19,11 +19,58 @@ import {
   parseGitCloneProgressFrame,
   validateWorkspaceCloneTarget,
   validateWorkspaceCloneUrl,
+  WORKSPACE_CLONE_FAILURE_MESSAGE_MAX_CHARS,
   WORKSPACE_CLONE_MAX_ACTIVE_JOBS,
   WORKSPACE_CLONE_MAX_RETAINED_JOBS,
 } from "./cloneRepository";
 
 const tempDirs: string[] = [];
+const CLONE_FAILURE_TRUNCATION_MARKER = "\n[... clone diagnostic truncated ...]\n";
+const ASTRAL_BOUNDARY_CHARACTER = "\u{1f680}";
+
+interface BoundaryDiagnostic {
+  readonly value: string;
+  readonly headBoundary: number;
+  readonly tailBoundary: number;
+  readonly headContext: string;
+  readonly tailContext: string;
+}
+
+function makeBoundaryDiagnostic(label: string): BoundaryDiagnostic {
+  const retainedChars =
+    WORKSPACE_CLONE_FAILURE_MESSAGE_MAX_CHARS - CLONE_FAILURE_TRUNCATION_MARKER.length;
+  const headBoundary = Math.ceil(retainedChars / 2);
+  const tailChars = retainedChars - headBoundary;
+  const totalChars = WORKSPACE_CLONE_FAILURE_MESSAGE_MAX_CHARS * 2;
+  const tailBoundary = totalChars - tailChars;
+  const headContext = `${label} diagnostic head`;
+  const tailContext = `${label} fatal diagnostic tail`;
+  const betweenBoundaries = tailBoundary - headBoundary - 2;
+  const trailingPadding = totalChars - tailBoundary - 1 - tailContext.length;
+  const value =
+    headContext +
+    "h".repeat(headBoundary - 1 - headContext.length) +
+    ASTRAL_BOUNDARY_CHARACTER +
+    "m".repeat(betweenBoundaries) +
+    ASTRAL_BOUNDARY_CHARACTER +
+    "t".repeat(trailingPadding) +
+    tailContext;
+  return { value, headBoundary, tailBoundary, headContext, tailContext };
+}
+
+function hasLoneSurrogate(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const codeUnit = value.charCodeAt(index);
+    if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (next < 0xdc00 || next > 0xdfff) return true;
+      index += 1;
+    } else if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff) {
+      return true;
+    }
+  }
+  return false;
+}
 
 async function makeTempDir(): Promise<string> {
   const value = await NodeFs.mkdtemp(NodePath.join(NodeOs.tmpdir(), "synara-workspace-clone-"));
@@ -71,12 +118,16 @@ interface CapturedCloneCommands {
   readonly clone: CapturedGitCommand;
 }
 
-function cloneCommandError(cwd: string): GitCommandError {
+function cloneCommandError(
+  cwd: string,
+  detail = "network failed",
+  command = "git clone",
+): GitCommandError {
   return new GitCommandError({
     operation: "workspace clone",
-    command: "git clone",
+    command,
     cwd,
-    detail: "network failed",
+    detail,
   });
 }
 
@@ -366,8 +417,68 @@ describe("workspace clone progress", () => {
         },
       },
     });
+    expect(events.at(-1)?.snapshot.message).toContain("network failed");
+    expect(events.at(-1)?.snapshot.message).not.toContain("[... clone diagnostic truncated ...]");
+    expect(events.at(-1)?.snapshot.message.length).toBeLessThanOrEqual(
+      WORKSPACE_CLONE_FAILURE_MESSAGE_MAX_CHARS,
+    );
     await expect(NodeFs.stat(targetPath)).resolves.toBeDefined();
     await expect(NodeFs.readdir(targetPath)).resolves.toEqual([]);
+  });
+
+  it("bounds and redacts large clone diagnostics in terminal and retained state", async () => {
+    const parent = await makeTempDir();
+    const targetPath = NodePath.join(parent, "large-failure");
+    const url = "https://github.com/example/private-repo.git";
+    const headContext = `remote: starting fetch from ${url}`;
+    const tailContext = `fatal: unable to access ${url}: connection reset by peer`;
+    const hugeDetail =
+      `${headContext}\n` +
+      "x".repeat(WORKSPACE_CLONE_FAILURE_MESSAGE_MAX_CHARS * 4) +
+      `\n${tailContext}`;
+    const git = {
+      execute: withResolvedCloneUrl((input) =>
+        Effect.fail(cloneCommandError(input.cwd, hugeDetail, `git clone ${url}`)),
+      ),
+    } as Pick<GitCoreShape, "execute">;
+    const jobs = makeWorkspaceCloneJobs({ git, homeDir: parent });
+    const cloneId = WorkspaceCloneId.makeUnsafe("clone-large-failure");
+
+    const events = Array.from(
+      await Effect.runPromise(
+        Stream.runCollect(
+          jobs.cloneRepository({
+            cloneId,
+            url,
+            targetPath,
+            createProject: false,
+            createParentDirectories: true,
+          }),
+        ),
+      ),
+    );
+    const terminal = events.at(-1);
+    if (!terminal || terminal._tag !== "clone_finished" || !terminal.result.failure) {
+      throw new Error("Expected clone failure terminal event.");
+    }
+
+    const failureMessage = terminal.result.failure.message;
+    const retained = jobs.getStatus(cloneId);
+    expect(failureMessage).toHaveLength(WORKSPACE_CLONE_FAILURE_MESSAGE_MAX_CHARS);
+    expect(failureMessage).toContain("[... clone diagnostic truncated ...]");
+    expect(failureMessage).toContain(headContext.replaceAll(url, "[repository URL]"));
+    expect(failureMessage).toContain(tailContext.replaceAll(url, "[repository URL]"));
+    expect(failureMessage).toContain(`Partial clone data may remain at ${targetPath}.`);
+    expect(failureMessage).toContain(
+      "Synara did not remove it because safe automatic cleanup cannot be guaranteed.",
+    );
+    expect(failureMessage).not.toContain(url);
+    expect(terminal.snapshot.message).toBe(failureMessage);
+    expect(terminal.snapshot.result?.failure?.message).toBe(failureMessage);
+    expect(retained?.message).toBe(failureMessage);
+    expect(retained?.result?.failure?.message).toBe(failureMessage);
+    expect(retained?.result).toEqual(terminal.result);
+    await expect(NodeFs.stat(targetPath)).resolves.toBeDefined();
   });
 
   it("never mutates a target substituted after clone ownership was established", async () => {
@@ -520,7 +631,10 @@ describe("workspace clone progress", () => {
       ),
     );
     expect(first.at(-1)).toMatchObject({
-      result: { clonedPath: targetPath, failure: { stage: "project" } },
+      result: {
+        clonedPath: targetPath,
+        failure: { stage: "project", message: "projection unavailable" },
+      },
     });
     expect(first.map((event) => event.snapshot.percent)).toEqual([0, 100, 100, 100]);
     await expect(NodeFs.stat(targetPath)).resolves.toBeDefined();
@@ -533,6 +647,81 @@ describe("workspace clone progress", () => {
     });
     expect(retried.map((event) => event.snapshot.percent)).toEqual([100, 100]);
     expect(cloneCalls).toBe(1);
+    expect(projectCalls).toBe(2);
+  });
+
+  it("bounds Unicode-safe project creation and retry diagnostics", async () => {
+    const parent = await makeTempDir();
+    const targetPath = NodePath.join(parent, "project-failure-boundaries");
+    const cloneId = WorkspaceCloneId.makeUnsafe("clone-project-failure-boundaries");
+    const diagnostics = [makeBoundaryDiagnostic("initial"), makeBoundaryDiagnostic("retry")];
+    let projectCalls = 0;
+    const jobs = makeWorkspaceCloneJobs({
+      git: {
+        execute: withResolvedCloneUrl(() => Effect.succeed({ code: 0, stdout: "", stderr: "" })),
+      } as Pick<GitCoreShape, "execute">,
+      homeDir: parent,
+      createProject: () => {
+        const diagnostic = diagnostics[projectCalls];
+        projectCalls += 1;
+        return Effect.fail(new Error(diagnostic?.value ?? "unexpected project creation call"));
+      },
+    });
+
+    const initialEvents = Array.from(
+      await Effect.runPromise(
+        Stream.runCollect(
+          jobs.cloneRepository({
+            cloneId,
+            url: "https://github.com/example/repo.git",
+            targetPath,
+            createProject: true,
+            createParentDirectories: true,
+          }),
+        ),
+      ),
+    );
+    const initialRetained = jobs.getStatus(cloneId);
+    const retryEvents = Array.from(
+      await Effect.runPromise(Stream.runCollect(jobs.retryProjectCreation(cloneId))),
+    );
+    const retryRetained = jobs.getStatus(cloneId);
+
+    const outcomes = [
+      { events: initialEvents, retained: initialRetained, diagnostic: diagnostics[0]! },
+      { events: retryEvents, retained: retryRetained, diagnostic: diagnostics[1]! },
+    ];
+    for (const { events, retained, diagnostic } of outcomes) {
+      expect(diagnostic.value).toHaveLength(WORKSPACE_CLONE_FAILURE_MESSAGE_MAX_CHARS * 2);
+      expect([
+        diagnostic.value.charCodeAt(diagnostic.headBoundary - 1),
+        diagnostic.value.charCodeAt(diagnostic.headBoundary),
+        diagnostic.value.charCodeAt(diagnostic.tailBoundary - 1),
+        diagnostic.value.charCodeAt(diagnostic.tailBoundary),
+      ]).toEqual([0xd83d, 0xde80, 0xd83d, 0xde80]);
+
+      const terminal = events.at(-1);
+      if (!terminal || terminal._tag !== "clone_finished" || !terminal.result.failure) {
+        throw new Error("Expected project failure terminal event.");
+      }
+      const failureMessage = terminal.result.failure.message;
+      expect(terminal.result.failure.stage).toBe("project");
+      expect(failureMessage).toHaveLength(WORKSPACE_CLONE_FAILURE_MESSAGE_MAX_CHARS - 2);
+      expect(failureMessage).toContain(CLONE_FAILURE_TRUNCATION_MARKER);
+      expect(failureMessage).toContain(diagnostic.headContext);
+      expect(failureMessage).toContain(diagnostic.tailContext);
+      expect(failureMessage).not.toContain(ASTRAL_BOUNDARY_CHARACTER);
+      expect(failureMessage).not.toContain("\uFFFD");
+      expect(hasLoneSurrogate(failureMessage)).toBe(false);
+      expect(new TextDecoder().decode(new TextEncoder().encode(failureMessage))).toBe(
+        failureMessage,
+      );
+      expect(terminal.snapshot.message).toBe(failureMessage);
+      expect(terminal.snapshot.result?.failure?.message).toBe(failureMessage);
+      expect(retained?.message).toBe(failureMessage);
+      expect(retained?.result?.failure?.message).toBe(failureMessage);
+      expect(retained?.result).toEqual(terminal.result);
+    }
     expect(projectCalls).toBe(2);
   });
 

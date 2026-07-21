@@ -18,11 +18,15 @@ const CLONE_TIMEOUT_MS = 30 * 60 * 1_000;
 const CLONE_URL_RESOLUTION_TIMEOUT_MS = 5_000;
 const CLONE_MAX_OUTPUT_BYTES = 2_000_000;
 const CLONE_URL_RESOLUTION_MAX_OUTPUT_BYTES = 64_000;
+const CLONE_FAILURE_DIAGNOSTIC_TRUNCATION_MARKER = "\n[... clone diagnostic truncated ...]\n";
+const CLONE_FAILURE_TARGET_PATH_MAX_CHARS = 4_096;
+const CLONE_FAILURE_TARGET_PATH_TRUNCATION_MARKER = "[... target path truncated ...]";
 const CLONE_PROMPT_ENV = ["DISPLAY", "WAYLAND_DISPLAY"] as const;
 const CLONE_PRESERVED_SSH_ENV = new Set(["SSH_AGENT_PID", "SSH_AUTH_SOCK"]);
 const CLONE_SSH_COMMAND = "ssh -F none -o BatchMode=yes -o StrictHostKeyChecking=yes";
 export const WORKSPACE_CLONE_MAX_ACTIVE_JOBS = 4;
 export const WORKSPACE_CLONE_MAX_RETAINED_JOBS = 100;
+export const WORKSPACE_CLONE_FAILURE_MESSAGE_MAX_CHARS = 8_192;
 
 export class WorkspaceCloneValidationError extends Error {
   constructor(
@@ -304,8 +308,69 @@ function redactError(cause: unknown, url: string): string {
   return raw.replaceAll(url, "[repository URL]").trim() || "The clone operation failed.";
 }
 
+function splitsSurrogatePair(value: string, boundary: number): boolean {
+  if (boundary <= 0 || boundary >= value.length) return false;
+  const precedingCodeUnit = value.charCodeAt(boundary - 1);
+  const followingCodeUnit = value.charCodeAt(boundary);
+  return (
+    precedingCodeUnit >= 0xd800 &&
+    precedingCodeUnit <= 0xdbff &&
+    followingCodeUnit >= 0xdc00 &&
+    followingCodeUnit <= 0xdfff
+  );
+}
+
+function truncateWithHeadAndTail(value: string, maxChars: number, marker: string): string {
+  if (maxChars <= 0) return "";
+  if (value.length <= maxChars) return value;
+  if (maxChars <= marker.length) return marker.slice(0, maxChars);
+  const retainedChars = maxChars - marker.length;
+  const headChars = Math.ceil(retainedChars / 2);
+  const tailChars = retainedChars - headChars;
+  const headEnd = splitsSurrogatePair(value, headChars) ? headChars - 1 : headChars;
+  const requestedTailStart = value.length - tailChars;
+  const tailStart = splitsSurrogatePair(value, requestedTailStart)
+    ? requestedTailStart + 1
+    : requestedTailStart;
+  return `${value.slice(0, headEnd)}${marker}${value.slice(tailStart)}`;
+}
+
+function retainedCloneTargetGuidance(targetPath: string): string {
+  const displayedTargetPath = truncateWithHeadAndTail(
+    targetPath,
+    CLONE_FAILURE_TARGET_PATH_MAX_CHARS,
+    CLONE_FAILURE_TARGET_PATH_TRUNCATION_MARKER,
+  );
+  return (
+    ` Partial clone data may remain at ${displayedTargetPath}. ` +
+    "Synara did not remove it because safe automatic cleanup cannot be guaranteed. " +
+    "Inspect or remove that destination manually before retrying."
+  );
+}
+
+function boundedCloneFailureMessage(
+  cause: unknown,
+  url: string,
+  retainedTargetPath: string | null,
+): string {
+  const guidance = retainedTargetPath ? retainedCloneTargetGuidance(retainedTargetPath) : "";
+  const diagnosticMaxChars = WORKSPACE_CLONE_FAILURE_MESSAGE_MAX_CHARS - guidance.length;
+  const diagnostic = truncateWithHeadAndTail(
+    redactError(cause, url),
+    diagnosticMaxChars,
+    CLONE_FAILURE_DIAGNOSTIC_TRUNCATION_MARKER,
+  );
+  return `${diagnostic}${guidance}`;
+}
+
 function describeError(cause: unknown): string {
-  return cause instanceof Error && cause.message.trim() ? cause.message.trim() : String(cause);
+  const description =
+    cause instanceof Error && cause.message.trim() ? cause.message.trim() : String(cause);
+  return truncateWithHeadAndTail(
+    description,
+    WORKSPACE_CLONE_FAILURE_MESSAGE_MAX_CHARS,
+    CLONE_FAILURE_DIAGNOSTIC_TRUNCATION_MARKER,
+  );
 }
 
 export interface WorkspaceCloneJobsShape {
@@ -480,7 +545,7 @@ export function makeWorkspaceCloneJobs(input: {
         );
       const cloneFailure = (code: string, cause: unknown, retryable: boolean) => {
         const retainedTargetPath = createdTargetPath;
-        const failureMessage = redactError(cause, request.url);
+        const failureMessage = boundedCloneFailureMessage(cause, request.url, retainedTargetPath);
         // Node has no portable descriptor-relative recursive delete. Any
         // path-based cleanup after Git starts can race with replacement, so
         // fail closed and leave the exact target entry untouched.
@@ -491,11 +556,7 @@ export function makeWorkspaceCloneJobs(input: {
           failure: {
             stage: "clone",
             code,
-            message: retainedTargetPath
-              ? `${failureMessage} Partial clone data may remain at ${retainedTargetPath}. ` +
-                "Synara did not remove it because safe automatic cleanup cannot be guaranteed. " +
-                "Inspect or remove that destination manually before retrying."
-              : failureMessage,
+            message: failureMessage,
             retryable: retainedTargetPath ? false : retryable,
           },
         });
