@@ -131,16 +131,18 @@ describe("classifyBrowserInput", () => {
   });
 
   it("rejects UNC paths and non-local file URL hosts", () => {
-    expect(classifyBrowserInput("\\\\server\\share\\index.html")).toEqual({
-      kind: "rejected-local",
-      input: "\\\\server\\share\\index.html",
-      reason: "network-path",
-    });
-    expect(classifyBrowserInput("//server/share/index.html")).toEqual({
-      kind: "rejected-local",
-      input: "//server/share/index.html",
-      reason: "network-path",
-    });
+    for (const input of [
+      "\\\\server\\share\\index.html",
+      "//server/share/index.html",
+      String.raw`/\server\share\index.html`,
+      String.raw`\/server/share/index.html`,
+    ]) {
+      expect(classifyBrowserInput(input)).toEqual({
+        kind: "rejected-local",
+        input,
+        reason: "network-path",
+      });
+    }
     expect(classifyBrowserInput("file://server/share/index.html")).toEqual({
       kind: "rejected-local",
       input: "file://server/share/index.html",

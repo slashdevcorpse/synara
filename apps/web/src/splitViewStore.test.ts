@@ -133,6 +133,141 @@ describe("splitViewStore", () => {
     expect(freshSplitViewStore.getState().splitViewIdBySourceThreadId).toEqual({});
   });
 
+  it.each([
+    ["missing root", undefined],
+    [
+      "missing split child",
+      {
+        kind: "split",
+        id: "root-corrupt",
+        direction: "horizontal",
+        ratio: 0.5,
+        first: {
+          kind: "leaf",
+          id: "leaf-valid",
+          threadId: THREAD_A,
+          panel: {
+            panel: null,
+            diffTurnId: null,
+            diffFilePath: null,
+            hasOpenedPanel: false,
+            lastOpenPanel: "browser",
+          },
+        },
+      },
+    ],
+    [
+      "source thread absent from its leaves",
+      {
+        kind: "leaf",
+        id: "leaf-valid",
+        threadId: THREAD_B,
+        panel: {
+          panel: null,
+          diffTurnId: null,
+          diffFilePath: null,
+          hasOpenedPanel: false,
+          lastOpenPanel: "browser",
+        },
+      },
+    ],
+    [
+      "empty thread id",
+      {
+        kind: "split",
+        id: "root-corrupt",
+        direction: "horizontal",
+        ratio: 0.5,
+        first: {
+          kind: "leaf",
+          id: "leaf-valid",
+          threadId: THREAD_A,
+          panel: {
+            panel: null,
+            diffTurnId: null,
+            diffFilePath: null,
+            hasOpenedPanel: false,
+            lastOpenPanel: "browser",
+          },
+        },
+        second: {
+          kind: "leaf",
+          id: "leaf-empty-thread",
+          threadId: "",
+          panel: {
+            panel: null,
+            diffTurnId: null,
+            diffFilePath: null,
+            hasOpenedPanel: false,
+            lastOpenPanel: "browser",
+          },
+        },
+      },
+    ],
+    [
+      "duplicate non-empty thread id",
+      {
+        kind: "split",
+        id: "root-corrupt",
+        direction: "horizontal",
+        ratio: 0.5,
+        first: {
+          kind: "leaf",
+          id: "leaf-valid",
+          threadId: THREAD_A,
+          panel: {
+            panel: null,
+            diffTurnId: null,
+            diffFilePath: null,
+            hasOpenedPanel: false,
+            lastOpenPanel: "browser",
+          },
+        },
+        second: {
+          kind: "leaf",
+          id: "leaf-duplicate-thread",
+          threadId: THREAD_A,
+          panel: {
+            panel: null,
+            diffTurnId: null,
+            diffFilePath: null,
+            hasOpenedPanel: false,
+            lastOpenPanel: "browser",
+          },
+        },
+      },
+    ],
+  ])("discards a v2 split view with a %s without aborting hydration", async (_label, root) => {
+    vi.resetModules();
+    globalThis.localStorage = createMemoryStorage();
+    globalThis.localStorage.setItem(
+      "synara:split-view-state:v1",
+      JSON.stringify({
+        state: {
+          splitViewsById: {
+            "split-corrupt": {
+              id: "split-corrupt",
+              sourceThreadId: THREAD_A,
+              ownerProjectId: PROJECT_ID,
+              root,
+              focusedPaneId: "leaf-valid",
+              createdAt: "2026-04-01T00:00:00.000Z",
+              updatedAt: "2026-04-01T00:00:00.000Z",
+            },
+          },
+          splitViewIdBySourceThreadId: { [THREAD_A]: "split-corrupt" },
+        },
+        version: 2,
+      }),
+    );
+
+    const { useSplitViewStore: freshSplitViewStore } = await import("./splitViewStore");
+
+    await vi.waitFor(() => expect(freshSplitViewStore.getState().hasHydrated).toBe(true));
+    expect(freshSplitViewStore.getState().splitViewsById).toEqual({});
+    expect(freshSplitViewStore.getState().splitViewIdBySourceThreadId).toEqual({});
+  });
+
   it("keeps one-shot browser capability requests out of persisted split state", async () => {
     vi.resetModules();
     globalThis.localStorage = createMemoryStorage();
@@ -185,6 +320,15 @@ describe("splitViewStore", () => {
       url: "http://127.0.0.1:58090/api/local-preview/injected/docs/demo.html",
       localFilePath: "C:\\workspace\\docs\\demo.html",
     };
+    payload.state.splitViewsById["split-corrupt"] = {
+      root: undefined as never,
+    };
+    Object.assign(payload.state, {
+      splitViewIdBySourceThreadId: {
+        [THREAD_A]: splitViewId,
+        [THREAD_B]: "split-corrupt",
+      },
+    });
     globalThis.localStorage.setItem(storageKey, JSON.stringify(payload));
 
     vi.resetModules();
@@ -195,6 +339,10 @@ describe("splitViewStore", () => {
     expect(collectLeaves(hydrated.root).every((leaf) => leaf.panel.browserRequest === null)).toBe(
       true,
     );
+    expect(readerStore.getState().splitViewsById["split-corrupt"]).toBeUndefined();
+    expect(readerStore.getState().splitViewIdBySourceThreadId).toEqual({
+      [THREAD_A]: splitViewId,
+    });
   });
 
   it("replaces an existing source split when creating a drop split for the same source", () => {

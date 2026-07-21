@@ -440,6 +440,71 @@ describe("BrowserPanel one-shot navigation requests", () => {
     vi.restoreAllMocks();
   });
 
+  it("cancels stale tab restoration when a navigation request arrives", async () => {
+    const harness = createNativeApiHarness();
+    nativeApiSlot.api = harness.api;
+    const staleState = makeState(makeTab());
+    const requestedState = makeState(
+      makeTab({
+        url: FRESH_CAPABILITY_PATH,
+        lastCommittedUrl: FRESH_CAPABILITY_PATH,
+        status: "live",
+      }),
+      2,
+    );
+    const staleRestore = deferred<ThreadBrowserState>();
+    harness.browser.open.mockImplementation(async (input?: { initialUrl?: string }) => {
+      if (input?.initialUrl) {
+        return requestedState;
+      }
+      return staleRestore.promise;
+    });
+    const onHandled = vi.fn();
+
+    const mounted = await mountBrowserPanel();
+    await vi.waitFor(() =>
+      expect(harness.browser.open).toHaveBeenCalledWith({ threadId: THREAD_ID }),
+    );
+
+    await mounted.rerender({
+      navigationRequest: {
+        id: "request-wins-restore-race",
+        url: FRESH_CAPABILITY_PATH,
+        localFilePath: LOCAL_FILE_PATH,
+      },
+      onNavigationRequestHandled: onHandled,
+    });
+    await vi.waitFor(() =>
+      expect(harness.browser.open).toHaveBeenCalledWith({
+        threadId: THREAD_ID,
+        initialUrl: FRESH_CAPABILITY_PATH,
+        localFilePath: LOCAL_FILE_PATH,
+      }),
+    );
+    await vi.waitFor(() => expect(onHandled).toHaveBeenCalledWith("request-wins-restore-race"));
+    await vi.waitFor(() => expect(document.querySelector("webview")).not.toBeNull());
+
+    await mounted.rerender({ navigationRequest: null });
+    await new Promise<void>((resolve) => {
+      window.setTimeout(resolve, 10);
+    });
+    expect(
+      harness.browser.open.mock.calls.filter(
+        ([input]) => !(input as { initialUrl?: string } | undefined)?.initialUrl,
+      ),
+    ).toHaveLength(1);
+
+    staleRestore.resolve(staleState);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(harness.projects.createLocalFilePreviewGrant).not.toHaveBeenCalled();
+    expect(harness.browser.navigate).not.toHaveBeenCalled();
+    expect(useBrowserStateStore.getState().threadStatesByThreadId[THREAD_ID]).toEqual(
+      requestedState,
+    );
+  });
+
   it("retries at 250ms and 500ms, then handles the request exactly once", async () => {
     const harness = createNativeApiHarness();
     nativeApiSlot.api = harness.api;
@@ -505,6 +570,64 @@ describe("BrowserPanel one-shot navigation requests", () => {
     expect(requestAttempts).toBe(3);
     expect(onHandled).toHaveBeenCalledTimes(1);
     expect(onHandled).toHaveBeenCalledWith("request-retry");
+  });
+
+  it("handles a terminal navigation failure and clears its retry state", async () => {
+    const harness = createNativeApiHarness();
+    nativeApiSlot.api = harness.api;
+    const liveState = makeState(
+      makeTab({
+        id: "tab-web",
+        localFilePath: null,
+        url: "https://initial.example/",
+        lastCommittedUrl: "https://initial.example/",
+        status: "live",
+      }),
+    );
+    harness.browser.open.mockResolvedValue(liveState);
+    const mounted = await mountBrowserPanel();
+    await vi.waitFor(() => expect(document.querySelector("webview")).not.toBeNull());
+
+    let requestAttempts = 0;
+    harness.browser.open.mockImplementation(async (input?: { initialUrl?: string }) => {
+      if (!input?.initialUrl) {
+        return liveState;
+      }
+      requestAttempts += 1;
+      throw new Error("browser startup race");
+    });
+    const onHandled = vi.fn();
+    const request = {
+      id: "request-terminal-failure",
+      url: "https://target.example/",
+      localFilePath: null,
+    };
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+
+    await mounted.rerender({
+      navigationRequest: request,
+      onNavigationRequestHandled: onHandled,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(requestAttempts).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(250);
+    await mounted.rerender({});
+    await vi.advanceTimersByTimeAsync(0);
+    expect(requestAttempts).toBe(2);
+
+    await vi.advanceTimersByTimeAsync(500);
+    await mounted.rerender({});
+    await vi.advanceTimersByTimeAsync(0);
+    expect(requestAttempts).toBe(3);
+    expect(onHandled).toHaveBeenCalledTimes(1);
+    expect(onHandled).toHaveBeenCalledWith(request.id);
+
+    await mounted.rerender({ navigationRequest: null });
+    await mounted.rerender({ navigationRequest: request });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(requestAttempts).toBe(4);
+    expect(onHandled).toHaveBeenCalledTimes(1);
   });
 
   it("cancels a pending retry when the navigation request is withdrawn", async () => {

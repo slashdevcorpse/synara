@@ -70,6 +70,7 @@ export type BrowserInputClassification =
 
 const WINDOWS_ABSOLUTE_PATH_PATTERN = /^[A-Za-z]:[\\/]/;
 const WINDOWS_DRIVE_PREFIX_PATTERN = /^[A-Za-z]:/;
+const NETWORK_PATH_PREFIX_PATTERN = /^[\\/]{2}/;
 
 function rejectedLocalInput(
   input: string,
@@ -149,7 +150,7 @@ export function classifyBrowserInput(input: string | undefined): BrowserInputCla
   if (trimmed.toLowerCase().startsWith("file:")) {
     return classifyFileUrlInput(trimmed);
   }
-  if (trimmed.startsWith("\\\\") || trimmed.startsWith("//")) {
+  if (NETWORK_PATH_PREFIX_PATTERN.test(trimmed)) {
     return rejectedLocalInput(trimmed, "network-path");
   }
   if (trimmed.startsWith("\\")) {

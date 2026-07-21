@@ -596,6 +596,7 @@ export function BrowserPanel({
   const [blockedLocalTabId, setBlockedLocalTabId] = useState<string | null>(null);
   const [runtimeRestoreBlocked, setRuntimeRestoreBlocked] = useState(false);
   const [navigationRetryVersion, setNavigationRetryVersion] = useState(0);
+  const hasNavigationRequest = navigationRequest !== null;
   useEffect(() => {
     onNavigationRequestHandledRef.current = onNavigationRequestHandled;
   }, [onNavigationRequestHandled]);
@@ -758,7 +759,7 @@ export function BrowserPanel({
   }, [api, isLiveRuntime, upsertThreadState]);
 
   useEffect(() => {
-    if (!api || !isLiveRuntime) {
+    if (!api || !isLiveRuntime || hasNavigationRequest || !runtimeRestorePendingRef.current) {
       return;
     }
 
@@ -835,6 +836,7 @@ export function BrowserPanel({
     };
   }, [
     api,
+    hasNavigationRequest,
     isLiveRuntime,
     mintLocalBrowserNavigation,
     runBrowserAction,
@@ -874,6 +876,9 @@ export function BrowserPanel({
           retryTimeoutId = window.setTimeout(() => {
             setNavigationRetryVersion((version) => version + 1);
           }, retryDelay);
+        } else {
+          navigationRequestAttemptsRef.current.delete(navigationRequest.id);
+          onNavigationRequestHandledRef.current?.(navigationRequest.id);
         }
         return;
       }
@@ -881,6 +886,8 @@ export function BrowserPanel({
       upsertThreadState(state);
       setBlockedLocalTabId(null);
       setRuntimeRestoreBlocked(false);
+      runtimeRestorePendingRef.current = false;
+      setWorkspaceReady(true);
       onNavigationRequestHandledRef.current?.(navigationRequest.id);
     });
 

@@ -26,16 +26,24 @@ import { resolveCodexGeneratedImagesRoots } from "./codexGeneratedImages.ts";
 
 export { LOCAL_IMAGE_ROUTE_PATH, LOCAL_PREVIEW_ROUTE_PREFIX };
 
+interface LocalPreviewFileIdentity {
+  readonly device: bigint;
+  readonly inode: bigint;
+}
+
+interface LocalPreviewDirectoryIdentity extends LocalPreviewFileIdentity {
+  readonly path: string;
+}
+
 export interface ResolvedLocalPreviewFile {
   readonly path: string;
   readonly fileName: string;
   /** From validation; verified-open callers replace this with the descriptor size. */
   readonly sizeBytes: number;
   /** Stable identity captured while validating the canonical path. */
-  readonly fileIdentity: {
-    readonly device: bigint;
-    readonly inode: bigint;
-  };
+  readonly fileIdentity: LocalPreviewFileIdentity;
+  /** Canonical directory chain captured before opening a granted nested asset. */
+  readonly ancestorDirectoryIdentities?: ReadonlyArray<LocalPreviewDirectoryIdentity>;
 }
 
 export interface LocalPreviewGrantResult {
@@ -87,6 +95,7 @@ interface ExactFilePreviewGrant {
 interface DirectoryPreviewGrant {
   readonly kind: "directory";
   readonly realDirectoryPath: string;
+  readonly directoryIdentity: LocalPreviewFileIdentity;
   readonly entryRealPath: string;
   readonly purpose: LocalPreviewGrantPurpose;
   readonly expiresAtMs: number;
@@ -139,7 +148,81 @@ function isPathInside(candidate: string, root: string): boolean {
 
 function isNetworkPath(candidate: string): boolean {
   const trimmed = candidate.trim();
-  return trimmed.startsWith("\\\\") || trimmed.startsWith("//");
+  return /^[\\/]{2}/.test(trimmed);
+}
+
+function isSameCanonicalPath(left: string, right: string): boolean {
+  return path.relative(left, right) === "" && path.relative(right, left) === "";
+}
+
+function hasSameIdentity(left: LocalPreviewFileIdentity, right: LocalPreviewFileIdentity): boolean {
+  return left.device === right.device && left.inode === right.inode;
+}
+
+async function readDirectoryIdentity(
+  directoryPath: string,
+): Promise<LocalPreviewDirectoryIdentity | null> {
+  const linkState = await fs
+    .readlink(directoryPath)
+    .then(() => "link" as const)
+    .catch((cause: unknown) =>
+      (cause as NodeJS.ErrnoException).code === "EINVAL" ? ("not-link" as const) : null,
+    );
+  if (linkState !== "not-link") {
+    return null;
+  }
+
+  const stat = await fs.lstat(directoryPath, { bigint: true }).catch(() => null);
+  return stat?.isDirectory() && !stat.isSymbolicLink()
+    ? { path: directoryPath, device: stat.dev, inode: stat.ino }
+    : null;
+}
+
+async function captureAncestorDirectoryIdentities(input: {
+  readonly rootPath: string;
+  readonly filePath: string;
+  readonly expectedRootIdentity: LocalPreviewFileIdentity;
+}): Promise<ReadonlyArray<LocalPreviewDirectoryIdentity> | null> {
+  const parentPath = path.dirname(input.filePath);
+  if (!isPathInside(parentPath, input.rootPath)) {
+    return null;
+  }
+
+  const relativeParentPath = path.relative(input.rootPath, parentPath);
+  const directoryPaths = [input.rootPath];
+  if (relativeParentPath) {
+    let currentPath = input.rootPath;
+    for (const segment of relativeParentPath.split(path.sep)) {
+      currentPath = path.join(currentPath, segment);
+      directoryPaths.push(currentPath);
+    }
+  }
+
+  const identities: LocalPreviewDirectoryIdentity[] = [];
+  for (const directoryPath of directoryPaths) {
+    const identity = await readDirectoryIdentity(directoryPath);
+    if (!identity) {
+      return null;
+    }
+    identities.push(identity);
+  }
+  return hasSameIdentity(identities[0] as LocalPreviewDirectoryIdentity, input.expectedRootIdentity)
+    ? identities
+    : null;
+}
+
+function hasSameDirectoryIdentityChain(
+  left: ReadonlyArray<LocalPreviewDirectoryIdentity>,
+  right: ReadonlyArray<LocalPreviewDirectoryIdentity>,
+): boolean {
+  return (
+    left.length === right.length &&
+    left.every(
+      (identity, index) =>
+        isSameCanonicalPath(identity.path, (right[index] as LocalPreviewDirectoryIdentity).path) &&
+        hasSameIdentity(identity, right[index] as LocalPreviewDirectoryIdentity),
+    )
+  );
 }
 
 function encodeUrlPathSegment(segment: string): string {
@@ -378,6 +461,16 @@ export async function resolveLocalPreviewGrantResource(input: {
   if (!isPathInside(candidatePath, grant.realDirectoryPath)) {
     return null;
   }
+
+  const initialAncestorDirectoryIdentities = await captureAncestorDirectoryIdentities({
+    rootPath: grant.realDirectoryPath,
+    filePath: candidatePath,
+    expectedRootIdentity: grant.directoryIdentity,
+  });
+  if (!initialAncestorDirectoryIdentities) {
+    return null;
+  }
+
   const realFilePath = await realpathOrNull(candidatePath);
   if (
     !realFilePath ||
@@ -387,7 +480,24 @@ export async function resolveLocalPreviewGrantResource(input: {
     return null;
   }
 
-  const stat = await fs.lstat(realFilePath, { bigint: true }).catch(() => null);
+  const ancestorDirectoryIdentities = await captureAncestorDirectoryIdentities({
+    rootPath: grant.realDirectoryPath,
+    filePath: realFilePath,
+    expectedRootIdentity: grant.directoryIdentity,
+  });
+  if (
+    !ancestorDirectoryIdentities ||
+    !hasSameDirectoryIdentityChain(initialAncestorDirectoryIdentities, ancestorDirectoryIdentities)
+  ) {
+    return null;
+  }
+
+  const confirmedRealFilePath = await realpathOrNull(candidatePath);
+  if (!confirmedRealFilePath || !isSameCanonicalPath(confirmedRealFilePath, realFilePath)) {
+    return null;
+  }
+
+  const stat = await fs.lstat(confirmedRealFilePath, { bigint: true }).catch(() => null);
   if (!stat?.isFile()) {
     return null;
   }
@@ -399,6 +509,7 @@ export async function resolveLocalPreviewGrantResource(input: {
       device: stat.dev,
       inode: stat.ino,
     },
+    ancestorDirectoryIdentities,
     purpose: grant.purpose,
   };
 }
@@ -409,9 +520,15 @@ export async function resolveLocalPreviewGrantResource(input: {
  * validation and open; streaming the same handle prevents a later replacement
  * from changing the bytes served.
  *
- * Node does not expose portable descriptor-relative open primitives, so this
- * protects the final file entry but cannot eliminate a malicious concurrent
- * replacement of an ancestor directory on every supported platform.
+ * Directory capabilities additionally bind their canonical ancestor identities
+ * before open, then revalidate the chain, canonical path, and final file identity
+ * against the open descriptor. This catches a one-way ancestor replacement while
+ * keeping the bytes bound to the descriptor selected by these checks.
+ *
+ * Portable Node does not expose descriptor-relative traversal (`openat`) or a
+ * Windows final-path-by-handle API. A coordinated same-user process that can
+ * toggle filesystem entries between every check is therefore outside this
+ * boundary; sandboxed preview content itself has no filesystem mutation ability.
  */
 export async function openResolvedLocalPreviewFile<T extends ResolvedLocalPreviewFile>(
   resolved: T,
@@ -429,6 +546,37 @@ export async function openResolvedLocalPreviewFile<T extends ResolvedLocalPrevie
       await handle.close().catch(() => undefined);
       handle = undefined;
       return null;
+    }
+
+    if (resolved.ancestorDirectoryIdentities) {
+      const expectedRoot = resolved.ancestorDirectoryIdentities[0];
+      if (!expectedRoot) {
+        await handle.close().catch(() => undefined);
+        handle = undefined;
+        return null;
+      }
+      const confirmedAncestors = await captureAncestorDirectoryIdentities({
+        rootPath: expectedRoot.path,
+        filePath: resolved.path,
+        expectedRootIdentity: expectedRoot,
+      });
+      const confirmedRealPath = await realpathOrNull(resolved.path);
+      const confirmedPathStat = confirmedRealPath
+        ? await fs.lstat(confirmedRealPath, { bigint: true }).catch(() => null)
+        : null;
+      if (
+        !confirmedAncestors ||
+        !hasSameDirectoryIdentityChain(resolved.ancestorDirectoryIdentities, confirmedAncestors) ||
+        !confirmedRealPath ||
+        !isSameCanonicalPath(confirmedRealPath, resolved.path) ||
+        !confirmedPathStat?.isFile() ||
+        confirmedPathStat.dev !== descriptorStat.dev ||
+        confirmedPathStat.ino !== descriptorStat.ino
+      ) {
+        await handle.close().catch(() => undefined);
+        handle = undefined;
+        return null;
+      }
     }
 
     const readable = handle.createReadStream({ autoClose: true });
@@ -581,10 +729,18 @@ async function createDirectoryPreviewGrant(input: {
   const expiresAtMs = input.nowMs + LOCAL_PREVIEW_GRANT_TTL_MS;
   const grant = crypto.randomUUID();
   const realDirectoryPath = path.dirname(realFilePath);
+  const directoryIdentity = await readDirectoryIdentity(realDirectoryPath);
+  if (!directoryIdentity) {
+    throw new LocalPreviewGrantError(
+      "symlink-escape",
+      "Preview directory identity changed while the grant was being created.",
+    );
+  }
   pruneExpiredPreviewGrants(input.nowMs);
   localPreviewGrantByToken.set(grant, {
     kind: "directory",
     realDirectoryPath,
+    directoryIdentity,
     entryRealPath: realFilePath,
     purpose: input.purpose,
     expiresAtMs,

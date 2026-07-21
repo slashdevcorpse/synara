@@ -169,7 +169,7 @@ describe("AgentActivityPulse lifecycle", () => {
           })}
         />,
       );
-      await vi.waitFor(() => expect(currentPhase(screen.container)).toBeNull());
+      expect(currentPhase(screen.container)).toBeNull();
     } finally {
       await screen.unmount();
     }

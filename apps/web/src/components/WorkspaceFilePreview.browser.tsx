@@ -9,10 +9,6 @@ import { page } from "vitest/browser";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { render } from "vitest-browser-react";
 
-import demoHtml from "../../../../docs/demo.html?raw";
-import demoHtmlUrl from "../../../../docs/demo.html?url";
-import demoScript from "../../../../docs/demo-assets/scripts/demo.js?raw";
-
 const { createGrantMock, listDirectoriesMock, readFileMock } = vi.hoisted(() => ({
   createGrantMock: vi.fn(),
   listDirectoriesMock: vi.fn(),
@@ -46,6 +42,80 @@ import { WorkspaceFilePreview } from "./WorkspaceFilePreview";
 import { DockExplorerPane } from "./chat/DockExplorerPane";
 
 const DEMO_SCRIPT_EXECUTED_MESSAGE = "synara-demo-script-executed";
+
+interface DemoScriptExecution {
+  cardPaddingTop: string | null;
+  corsProbe: {
+    containsDemoCardRule: boolean;
+    error: string | null;
+    ok: boolean;
+    status: number | null;
+  };
+  href: string;
+  imageComplete: boolean;
+  imageNaturalWidth: number;
+  imageSrc: string | null;
+  scriptSrc: string | null;
+  status: string | null;
+  stylesheetHref: string | null;
+  stylesheetLoaded: boolean;
+  stylesheetPresent: boolean;
+  type: typeof DEMO_SCRIPT_EXECUTED_MESSAGE;
+}
+
+function isDemoScriptExecution(value: unknown): value is DemoScriptExecution {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "type" in value &&
+    value.type === DEMO_SCRIPT_EXECUTED_MESSAGE &&
+    "cardPaddingTop" in value &&
+    (value.cardPaddingTop === null || typeof value.cardPaddingTop === "string") &&
+    "corsProbe" in value &&
+    typeof value.corsProbe === "object" &&
+    value.corsProbe !== null &&
+    "containsDemoCardRule" in value.corsProbe &&
+    typeof value.corsProbe.containsDemoCardRule === "boolean" &&
+    "error" in value.corsProbe &&
+    (value.corsProbe.error === null || typeof value.corsProbe.error === "string") &&
+    "ok" in value.corsProbe &&
+    typeof value.corsProbe.ok === "boolean" &&
+    "status" in value.corsProbe &&
+    (value.corsProbe.status === null || typeof value.corsProbe.status === "number") &&
+    "href" in value &&
+    typeof value.href === "string" &&
+    "imageComplete" in value &&
+    typeof value.imageComplete === "boolean" &&
+    "imageNaturalWidth" in value &&
+    typeof value.imageNaturalWidth === "number" &&
+    "imageSrc" in value &&
+    (value.imageSrc === null || typeof value.imageSrc === "string") &&
+    "scriptSrc" in value &&
+    (value.scriptSrc === null || typeof value.scriptSrc === "string") &&
+    "status" in value &&
+    (value.status === null || typeof value.status === "string") &&
+    "stylesheetHref" in value &&
+    (value.stylesheetHref === null || typeof value.stylesheetHref === "string") &&
+    "stylesheetLoaded" in value &&
+    typeof value.stylesheetLoaded === "boolean" &&
+    "stylesheetPresent" in value &&
+    typeof value.stylesheetPresent === "boolean"
+  );
+}
+
+function waitForNextPreviewIframeLoad(): Promise<HTMLIFrameElement> {
+  return new Promise((resolve) => {
+    const observer = new MutationObserver(() => {
+      const iframe = document.querySelector<HTMLIFrameElement>(
+        'iframe[title="Preview of demo.html"]',
+      );
+      if (!iframe) return;
+      observer.disconnect();
+      iframe.addEventListener("load", () => resolve(iframe), { once: true });
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+  });
+}
 
 function createQueryClient(): QueryClient {
   return new QueryClient({
@@ -107,6 +177,124 @@ describe("WorkspaceFilePreview HTML", () => {
     document.body.innerHTML = "";
   });
 
+  it("loads nested browser-purpose assets while the in-app preview remains script-locked", async () => {
+    const executions: Array<{
+      data: DemoScriptExecution;
+      origin: string;
+      source: MessageEventSource | null;
+    }> = [];
+    const handleMessage = (event: MessageEvent<unknown>) => {
+      if (isDemoScriptExecution(event.data)) {
+        executions.push({ data: event.data, origin: event.origin, source: event.source });
+      }
+    };
+    window.addEventListener("message", handleMessage);
+    try {
+      let browserUrl: string | null = null;
+      const previewLoaded = waitForNextPreviewIframeLoad();
+      await renderHtmlPreview({
+        onOpenInBrowser: (request) => {
+          browserUrl = request.url;
+        },
+      });
+      const previewFrame = await previewLoaded;
+      expect(previewFrame.getAttribute("sandbox")).toBe("");
+      const previewUrl = previewFrame.src;
+      expect(previewUrl).toContain("/api/local-preview/preview-grant-");
+      const previewResponse = await fetch(previewUrl);
+      expect(previewResponse.status).toBe(200);
+      expect(previewResponse.headers.get("content-type")).toBe("text/html; charset=utf-8");
+      expect(previewResponse.headers.get("cache-control")).toBe("no-store");
+      expect(previewResponse.headers.get("pragma")).toBe("no-cache");
+      expect(previewResponse.headers.get("x-content-type-options")).toBe("nosniff");
+      expect(previewResponse.headers.get("referrer-policy")).toBe("no-referrer");
+      expect(previewResponse.headers.get("x-dns-prefetch-control")).toBe("off");
+      expect(previewResponse.headers.get("vary")).toBe("Origin");
+      const previewCsp = previewResponse.headers.get("content-security-policy") ?? "";
+      expect(previewCsp).toContain("sandbox");
+      expect(previewCsp).toContain("script-src 'none'");
+      expect(previewCsp).toContain("connect-src 'none'");
+      expect(previewResponse.headers.get("access-control-allow-origin")).toBeNull();
+      await previewResponse.body?.cancel();
+      await new Promise<void>((resolve) => {
+        requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+      });
+      expect(executions).toHaveLength(0);
+
+      await page.getByRole("button", { name: "More actions" }).click();
+      await page.getByRole("menuitem", { name: "Open in browser" }).click();
+      await vi.waitFor(() => expect(browserUrl).not.toBeNull());
+      if (!browserUrl) throw new Error("Expected a browser-purpose capability URL.");
+      const resolvedBrowserUrl = browserUrl;
+      expect(resolvedBrowserUrl).toContain("/api/local-preview/browser-grant-");
+      expect(createGrantMock).toHaveBeenCalledWith({
+        path: "docs/demo.html",
+        cwd: "/repo/worktree",
+        scope: "directory",
+        purpose: "browser",
+      });
+      const browserResponse = await fetch(resolvedBrowserUrl);
+      expect(browserResponse.status).toBe(200);
+      expect(browserResponse.headers.get("content-type")).toBe("text/html; charset=utf-8");
+      expect(browserResponse.headers.get("cache-control")).toBe("no-store");
+      expect(browserResponse.headers.get("pragma")).toBe("no-cache");
+      expect(browserResponse.headers.get("x-content-type-options")).toBe("nosniff");
+      expect(browserResponse.headers.get("referrer-policy")).toBe("no-referrer");
+      expect(browserResponse.headers.get("x-dns-prefetch-control")).toBe("off");
+      expect(browserResponse.headers.get("access-control-allow-origin")).toBe("null");
+      const browserCsp = browserResponse.headers.get("content-security-policy") ?? "";
+      const browserCapabilityRoot = new URL(".", resolvedBrowserUrl).toString();
+      expect(browserCsp).toContain("sandbox allow-scripts");
+      expect(browserCsp).toContain(
+        `script-src 'unsafe-inline' 'wasm-unsafe-eval' ${browserCapabilityRoot}`,
+      );
+      expect(browserCsp).toContain(`connect-src ${browserCapabilityRoot}`);
+      expect(browserCsp).toContain("webrtc 'block'");
+      expect(browserCsp).not.toContain("'self'");
+      await browserResponse.body?.cancel();
+
+      const browserFrame = document.createElement("iframe");
+      browserFrame.title = "Browser-purpose demo";
+      browserFrame.src = resolvedBrowserUrl;
+      document.body.append(browserFrame);
+
+      await vi.waitFor(() => {
+        expect(executions.some((execution) => execution.data.href === resolvedBrowserUrl)).toBe(
+          true,
+        );
+      });
+      const execution = executions.find((candidate) => candidate.data.href === resolvedBrowserUrl);
+      expect(execution).toBeDefined();
+      expect(execution?.origin).toBe("null");
+      expect(execution?.source).toBe(browserFrame.contentWindow);
+      expect(execution?.data.status).toBe(
+        "Browser preview: the nested script loaded successfully.",
+      );
+      expect(execution?.data.scriptSrc).toBe(
+        new URL("demo-assets/scripts/demo.js", browserCapabilityRoot).toString(),
+      );
+      expect(execution?.data.stylesheetHref).toBe(
+        new URL("demo-assets/styles/demo.css", browserCapabilityRoot).toString(),
+      );
+      expect(execution?.data.stylesheetPresent).toBe(true);
+      expect(execution?.data.stylesheetLoaded).toBe(true);
+      expect(execution?.data.cardPaddingTop).toBe("40px");
+      expect(execution?.data.imageSrc).toBe(
+        new URL("demo-assets/images/synara-preview.svg", browserCapabilityRoot).toString(),
+      );
+      expect(execution?.data.imageComplete).toBe(true);
+      expect(execution?.data.imageNaturalWidth ?? 0).toBeGreaterThan(0);
+      expect(execution?.data.corsProbe).toEqual({
+        ok: true,
+        status: 200,
+        containsDemoCardRule: true,
+        error: null,
+      });
+    } finally {
+      window.removeEventListener("message", handleMessage);
+    }
+  });
+
   it("renders HTML by default in a locked-down iframe and switches to source", async () => {
     await renderHtmlPreview();
 
@@ -133,70 +321,6 @@ describe("WorkspaceFilePreview HTML", () => {
     document.querySelector<HTMLInputElement>('input[type="radio"][value="source"]')?.click();
     await vi.waitFor(() => expect(document.querySelector("iframe")).toBeNull());
     expect(document.body.textContent).toContain("Source title");
-  });
-
-  it("loads nested browser-purpose assets while the in-app preview remains script-locked", async () => {
-    const executedUrls: string[] = [];
-    const handleMessage = (event: MessageEvent<unknown>) => {
-      if (
-        typeof event.data === "object" &&
-        event.data !== null &&
-        "type" in event.data &&
-        event.data.type === DEMO_SCRIPT_EXECUTED_MESSAGE &&
-        "href" in event.data &&
-        typeof event.data.href === "string"
-      ) {
-        executedUrls.push(event.data.href);
-      }
-    };
-    window.addEventListener("message", handleMessage);
-    try {
-      let browserUrl: string | null = null;
-      await renderHtmlPreview({
-        onOpenInBrowser: (request) => {
-          browserUrl = request.url;
-        },
-      });
-      await vi.waitFor(() => expect(document.querySelector("iframe")).not.toBeNull());
-      const previewFrame = document.querySelector<HTMLIFrameElement>("iframe");
-      expect(previewFrame?.getAttribute("sandbox")).toBe("");
-      const demoBaseUrl = new URL(".", new URL(demoHtmlUrl, window.location.origin)).toString();
-      if (previewFrame) {
-        previewFrame.srcdoc = demoHtml
-          .replace("<head>", `<head><base href="${demoBaseUrl}" />`)
-          .replace(
-            '<script src="./demo-assets/scripts/demo.js"></script>',
-            `<script>${demoScript}\nwindow.parent.postMessage({ type: "${DEMO_SCRIPT_EXECUTED_MESSAGE}", href: window.location.href }, "*");</script>`,
-          );
-      }
-      await new Promise<void>((resolve) => {
-        requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
-      });
-      expect(executedUrls).toHaveLength(0);
-
-      await page.getByRole("button", { name: "More actions" }).click();
-      await page.getByRole("menuitem", { name: "Open in browser" }).click();
-      await vi.waitFor(() => expect(browserUrl).not.toBeNull());
-      expect(browserUrl).toContain("/api/local-preview/browser-grant-");
-      const browserFrame = document.createElement("iframe");
-      browserFrame.title = "Browser-purpose demo";
-      browserFrame.srcdoc = demoHtml.replace("<head>", `<head><base href="${demoBaseUrl}" />`);
-      document.body.append(browserFrame);
-
-      await vi.waitFor(() => {
-        const browserDocument = browserFrame.contentDocument;
-        const status = browserDocument?.querySelector("#script-status");
-        const stylesheet =
-          browserDocument?.querySelector<HTMLLinkElement>('link[rel="stylesheet"]');
-        const image = browserDocument?.querySelector<HTMLImageElement>("img.demo-mark");
-        expect(status?.textContent).toBe("Browser preview: the nested script loaded successfully.");
-        expect(stylesheet?.sheet).not.toBeNull();
-        expect(image?.complete).toBe(true);
-        expect(image?.naturalWidth ?? 0).toBeGreaterThan(0);
-      });
-    } finally {
-      window.removeEventListener("message", handleMessage);
-    }
   });
 
   it("mints browser capabilities on demand and Refresh remints the iframe capability", async () => {
@@ -254,6 +378,25 @@ describe("WorkspaceFilePreview HTML", () => {
     } finally {
       dateNow.mockRestore();
     }
+  });
+
+  it("mints a fresh capability for every copied preview URL", async () => {
+    await renderHtmlPreview();
+    await vi.waitFor(() => expect(document.querySelector("iframe")).not.toBeNull());
+
+    const copyPreviewUrl = async () => {
+      await page.getByRole("button", { name: "More actions" }).click();
+      await page.getByRole("menuitem", { name: "Copy preview URL" }).click();
+    };
+    const previewGrantCalls = () =>
+      createGrantMock.mock.calls.filter(
+        ([input]) => (input as { purpose?: string }).purpose === "preview",
+      );
+
+    await copyPreviewUrl();
+    await vi.waitFor(() => expect(previewGrantCalls()).toHaveLength(2));
+    await copyPreviewUrl();
+    await vi.waitFor(() => expect(previewGrantCalls()).toHaveLength(3));
   });
 
   it("keeps copy retry available when reminting an expired capability fails", async () => {

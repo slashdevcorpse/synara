@@ -263,6 +263,7 @@ function SplitPaneEmbeddedPanel(props: {
             referenceRoot={props.referenceRoot}
             filePath={props.panelState.filePath}
             onOpenInBrowser={props.onOpenInBrowser}
+            onClosePanel={props.onClosePanel}
           />
         </Suspense>
       ) : props.panel === "diff" ? (

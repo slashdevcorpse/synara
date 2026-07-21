@@ -123,6 +123,18 @@ function localPreviewBrowserCsp(origin: string, token: string): string {
     "form-action 'none'",
   ].join("; ");
 }
+
+function localPreviewCapabilityCorsHeaders(input: {
+  readonly purpose: "preview" | "browser";
+  readonly requestOrigin: string | undefined;
+}): Record<string, string> {
+  if (input.purpose === "browser") {
+    return { "Access-Control-Allow-Origin": "null" };
+  }
+  return input.requestOrigin?.trim().toLowerCase() === "null"
+    ? { "Access-Control-Allow-Origin": "null", Vary: "Origin" }
+    : { Vary: "Origin" };
+}
 export const AUTH_JSON_BODY_MAX_BYTES = 16 * 1024;
 const decodeBootstrapInput = Schema.decodeUnknownEffect(AuthBootstrapInput);
 const decodeCreatePairingCredentialInput = Schema.decodeUnknownEffect(
@@ -971,7 +983,10 @@ const localPreviewCapabilityEffectRouteLayer = HttpRouter.add(
           previewFile.purpose === "browser"
             ? localPreviewBrowserCsp(requestUrl.origin, capabilityPath.token)
             : LOCAL_PREVIEW_IFRAME_CSP,
-        ...(previewFile.purpose === "browser" ? { "Access-Control-Allow-Origin": "null" } : {}),
+        ...localPreviewCapabilityCorsHeaders({
+          purpose: previewFile.purpose,
+          requestOrigin: request.headers.origin,
+        }),
         ...(isSvg ? SVG_DOCUMENT_SECURITY_HEADERS : {}),
       },
     });

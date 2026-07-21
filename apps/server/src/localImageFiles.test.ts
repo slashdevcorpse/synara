@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import {
+  linkSync,
   mkdirSync,
   mkdtempSync,
   realpathSync,
   renameSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -35,6 +37,18 @@ function supportsFileSymlinks(targetPath: string, directory: string): boolean {
   const probePath = path.join(directory, `.symlink-probe-${crypto.randomUUID()}`);
   try {
     symlinkSync(targetPath, probePath, "file");
+    rmSync(probePath, { force: true });
+    return true;
+  } catch {
+    rmSync(probePath, { force: true });
+    return false;
+  }
+}
+
+function supportsDirectorySymlinks(targetPath: string, directory: string): boolean {
+  const probePath = path.join(directory, `.directory-symlink-probe-${crypto.randomUUID()}`);
+  try {
+    symlinkSync(targetPath, probePath, "dir");
     rmSync(probePath, { force: true });
     return true;
   } catch {
@@ -380,6 +394,7 @@ describe("local preview grants", () => {
 
     for (const requestedPath of [
       "\\\\server\\share\\index.html",
+      String.raw`/\server\share\index.html`,
       "\\\\?\\C:\\workspace\\index.html",
       "\\\\.\\C:\\workspace\\index.html",
     ]) {
@@ -617,6 +632,48 @@ describe("local preview grants", () => {
       }),
       null,
     );
+  });
+
+  it("rejects an ancestor directory replacement during verified open despite matching file identity", async () => {
+    const workspace = makeTempDir("synara-directory-preview-ancestor-open-");
+    const outsideRoot = makeTempDir("synara-directory-preview-ancestor-open-outside-");
+    const entryPath = path.join(workspace, "index.html");
+    const assetDirectory = path.join(workspace, "assets");
+    const originalAssetDirectory = path.join(workspace, "assets-original");
+    const assetPath = path.join(assetDirectory, "app.js");
+    const outsideAssetPath = path.join(outsideRoot, "app.js");
+    mkdirSync(assetDirectory);
+    writeFileSync(entryPath, "<!doctype html>");
+    writeFileSync(assetPath, "globalThis.safe = true;");
+    linkSync(assetPath, outsideAssetPath);
+    if (!supportsDirectorySymlinks(outsideRoot, workspace)) {
+      return;
+    }
+
+    const grant = await createLocalPreviewGrant({
+      requestedPath: entryPath,
+      cwd: workspace,
+      allowedWorkspaceRoots: [workspace],
+      scope: "directory",
+      purpose: "browser",
+    });
+    const resolved = await resolveLocalPreviewGrantResource({
+      token: grant.grant,
+      encodedRelativePath: "assets/app.js",
+    });
+    assert.ok(resolved);
+
+    const originalStat = statSync(assetPath, { bigint: true });
+    const outsideStat = statSync(outsideAssetPath, { bigint: true });
+    assert.equal(outsideStat.dev, originalStat.dev);
+    assert.equal(outsideStat.ino, originalStat.ino);
+
+    renameSync(assetDirectory, originalAssetDirectory);
+    symlinkSync(outsideRoot, assetDirectory, "dir");
+
+    const opened = await openResolvedLocalPreviewFile(resolved);
+    opened?.readable.destroy();
+    assert.equal(opened, null);
   });
 
   it("rejects a final file replaced by an outside symlink after validation", async () => {

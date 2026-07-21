@@ -8,7 +8,7 @@
 
 Super Synara now has one policy for opening project-local files from chat references, the explorer, editor surfaces, split chat, preview actions, and the in-app browser. Markdown opens in the existing rendered preview flow, HTML opens as a sandboxed document with a Source toggle, and desktop users can explicitly open workspace HTML in a contained browser tab. Pasted `file:` URLs and absolute paths are classified as local input instead of becoming searches.
 
-HTML is served through short-lived loopback capabilities rather than raw `file:` navigation. Directory-scoped grants serve relative CSS, classic and module JavaScript, fetched JSON/WebAssembly, fonts, images, media, and PDF resources while rejecting traversal, unsupported extensions, symlink escapes, and paths outside server-authoritative roots. Browser-purpose responses use narrowly scoped opaque-origin CORS so those bytes remain confined to the capability document.
+HTML is served through short-lived loopback capabilities rather than raw `file:` navigation. Directory-scoped grants serve relative CSS, classic and module JavaScript, fetched JSON/WebAssembly, fonts, images, media, and PDF resources while rejecting traversal, unsupported extensions, static symlink escapes, and paths outside server-authoritative roots. Resolution binds the canonical grant root and ancestor identities, then revalidates them after opening the final descriptor. A coordinated same-user process that can repeatedly swap filesystem entries between every check is outside this browser-content boundary: portable Node exposes neither descriptor-relative `openat` traversal nor Windows final-path-by-handle verification, and such a process already has the local file authority the sandboxed document lacks.
 
 ---
 
@@ -54,8 +54,8 @@ HTML is served through short-lived loopback capabilities rather than raw `file:`
 ### Phase 4: Relative Assets and Polish
 
 - Added directory-scoped relative assets with a fixed MIME allowlist for HTML, CSS, JavaScript, WebAssembly, fonts, JSON, images, audio/video, and PDF.
-- Added opaque-origin CORS for browser-purpose assets only. Modules, same-capability fetches, fonts, and WebAssembly work without making Synara APIs or another grant same-origin.
-- Added Refresh, Retry, Copy preview URL, and explicit Open in browser actions. Refresh and expired-copy paths mint a fresh capability.
+- Added narrowly scoped opaque-origin CORS for both sandboxed preview assets and browser-purpose assets. Modules, same-capability fetches, fonts, and WebAssembly work without making Synara APIs or another grant same-origin.
+- Added Refresh, Retry, Copy preview URL, and explicit Open in browser actions. Refresh and every copy action mint a fresh capability.
 - Kept transient capability requests out of persisted browser, dock, and split-view state.
 
 ---
@@ -92,9 +92,9 @@ Legacy exact-file previews remain available for supported absolute image, PDF, M
 | Production build                       | 6 of 6 workspace build tasks passed                                                                                          |
 | Isolated Windows Electron flow         | Project import → explorer → HTML Preview/Source/Retry → Open in browser → web transition → pasted Windows path remint passed |
 
-The Chromium component harness covers the checked-in fixture, Source mode, fresh browser/refresh grants, expiry-aware copying, Retry, scratch paths, narrow layout, rendered Markdown defaults, stale-webview detachment, and security-epoch remounts. Its browser-purpose asset case is a UI harness, not server-header proof. Actual MIME/CSP/CORS responses are covered by the server route suite; the separate Electron 40.10.6 smoke app consumes the exact production guard source and proves document-start enforcement across five frame types, including failed assignment/redefine/delete bypass attempts.
+The Chromium component harness covers the checked-in fixture, Source mode, fresh browser/refresh/copy grants, Retry, scratch paths, narrow layout, rendered Markdown defaults, stale-webview detachment, and security-epoch remounts. Its browser-purpose asset case is a UI harness, not server-header proof. Actual MIME/CSP/CORS responses are covered by the server route suite; the separate Electron 40.10.6 smoke app consumes the exact production guard source and proves document-start enforcement across five frame types, including failed assignment/redefine/delete bypass attempts.
 
-The isolated Windows run exercised the real Electron renderer and `<webview>`. The sandboxed preview loaded nested CSS and SVG while leaving the script status unchanged; the browser tab loaded the same assets, executed the nested script, and exposed all three guarded WebRTC constructors as non-configurable `undefined` values. Navigating toward a web URL synchronously cleared `localFilePath`, incremented `securityEpoch`, and failed closed to `about:blank`; pasting the absolute Windows path then minted a fresh capability and restored the guarded local tab. A pre-existing missing-key split-view hydration issue left the thread route blank in the isolated profile, so the live proof set that store's hydration flag at runtime only; this PR does not include an unrelated persistence fix.
+The isolated Windows run exercised the real Electron renderer and `<webview>`. The sandboxed preview loaded nested CSS and SVG while leaving the script status unchanged; the browser tab loaded the same assets, executed the nested script, and exposed all three guarded WebRTC constructors as non-configurable `undefined` values. Navigating toward a web URL synchronously cleared `localFilePath`, incremented `securityEpoch`, and failed closed to `about:blank`; pasting the absolute Windows path then minted a fresh capability and restored the guarded local tab. The run also exposed a malformed persisted split-view entry; hydration now validates recursive pane state, discards corrupt entries, and rebuilds the source index instead of aborting the store.
 
 ---
 

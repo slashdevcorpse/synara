@@ -324,6 +324,8 @@ export interface WorkspaceFilePreviewProps {
   onCommentInChat?: ((comment: FileCommentSelection) => void) | undefined;
   /** HTML-only, freshly minted browser navigation request. */
   onOpenInBrowser?: WorkspaceHtmlBrowserOpenHandler | undefined;
+  /** Optional close action for embedded panel surfaces. */
+  onClosePanel?: (() => void) | undefined;
 }
 
 export function WorkspaceFilePreview(props: WorkspaceFilePreviewProps) {
@@ -501,10 +503,7 @@ export function WorkspaceFilePreview(props: WorkspaceFilePreviewProps) {
     }
     setBrowserOpenState(null);
     try {
-      let grantResult = htmlPreviewGrantQuery.data;
-      if (!isLocalPreviewGrantUsable(grantResult) || !grantResult?.urlPath) {
-        grantResult = (await htmlPreviewGrantQuery.refetch()).data;
-      }
+      const grantResult = (await htmlPreviewGrantQuery.refetch()).data;
       if (!isLocalPreviewGrantUsable(grantResult) || !grantResult?.urlPath) {
         throw new Error("Could not create a current preview URL.");
       }
@@ -663,6 +662,7 @@ export function WorkspaceFilePreview(props: WorkspaceFilePreviewProps) {
         cwd={props.workspaceRoot}
         previewGrant={localPreviewGrant}
         openInTarget={openInTarget}
+        onClosePanel={props.onClosePanel}
       />
     );
   }
@@ -687,6 +687,7 @@ export function WorkspaceFilePreview(props: WorkspaceFilePreviewProps) {
         onRefreshPreview={fileIsHtml ? handleRefreshPreview : undefined}
         openingInBrowser={browserOpenStateForFile?.status === "opening"}
         truncated={fileQuery.data?.truncated ?? false}
+        onClosePanel={props.onClosePanel}
       />
       {browserOpenStateForFile?.status === "error" ? (
         <div

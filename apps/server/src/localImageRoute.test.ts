@@ -375,16 +375,26 @@ describe("localImageEffectRouteLayer", () => {
         expect(previewCsp).toContain("connect-src 'none'");
 
         const routeRoot = grant.urlPath?.slice(0, grant.urlPath.lastIndexOf("/") + 1);
-        const cssResponse = await fetch(`${origin}${routeRoot}assets/site.css`);
+        const cssResponse = await fetch(`${origin}${routeRoot}assets/site.css`, {
+          headers: { Origin: "null" },
+        });
         const jsResponse = await fetch(`${origin}${routeRoot}assets/app.js`);
         const wasmResponse = await fetch(`${origin}${routeRoot}assets/app.wasm`);
         const imageResponse = await fetch(`${origin}${routeRoot}assets/hero.png`);
         const pdfResponse = await fetch(`${origin}${routeRoot}assets/spec.pdf`);
         expect(cssResponse.headers.get("content-type")).toBe("text/css; charset=utf-8");
+        expect(cssResponse.headers.get("access-control-allow-origin")).toBe("null");
+        expect(cssResponse.headers.get("vary")).toBe("Origin");
         expect(jsResponse.headers.get("content-type")).toBe("text/javascript; charset=utf-8");
         expect(wasmResponse.headers.get("content-type")).toBe("application/wasm");
         expect(imageResponse.headers.get("content-type")).toBe("image/png");
         expect(pdfResponse.headers.get("content-type")).toBe("application/pdf");
+
+        const untrustedOriginResponse = await fetch(`${origin}${routeRoot}assets/site.css`, {
+          headers: { Origin: "https://example.test" },
+        });
+        expect(untrustedOriginResponse.headers.get("access-control-allow-origin")).toBeNull();
+        expect(untrustedOriginResponse.headers.get("vary")).toBe("Origin");
       },
       makeFakeServerAuth({ rejectHttpAuthentication: true }),
     );

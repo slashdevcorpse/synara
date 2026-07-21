@@ -19,6 +19,7 @@ export function DockFilePane(props: {
   onAskWhyInChat?: ((reference: ChatFileReference) => void) | undefined;
   onCommentInChat?: ((comment: FileCommentSelection) => void) | undefined;
   onOpenInBrowser?: WorkspaceHtmlBrowserOpenHandler | undefined;
+  onClosePanel?: (() => void) | undefined;
 }) {
   return (
     <WorkspaceFilePreview
@@ -35,6 +36,7 @@ export function DockFilePane(props: {
       onAskWhyInChat={props.onAskWhyInChat}
       onCommentInChat={props.onCommentInChat}
       onOpenInBrowser={props.onOpenInBrowser}
+      onClosePanel={props.onClosePanel}
     />
   );
 }

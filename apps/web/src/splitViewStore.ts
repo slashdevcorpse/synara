@@ -289,31 +289,148 @@ function mapPanePanelState(
   };
 }
 
-function migrateV2PersistedState(state: unknown): SplitViewStoreState {
-  if (!state || typeof state !== "object") {
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function sanitizePersistedPanelState(
+  value: unknown,
+  resetFilePath: boolean,
+): SplitViewPanePanelState {
+  const panel = isRecord(value) ? value : {};
+  const persistedPanel =
+    panel.panel === "browser" ||
+    panel.panel === "diff" ||
+    panel.panel === "file" ||
+    panel.panel === null
+      ? panel.panel
+      : null;
+  return {
+    panel: resetFilePath && persistedPanel === "file" ? null : persistedPanel,
+    diffTurnId: typeof panel.diffTurnId === "string" ? (panel.diffTurnId as TurnId) : null,
+    diffFilePath: typeof panel.diffFilePath === "string" ? panel.diffFilePath : null,
+    filePath: !resetFilePath && typeof panel.filePath === "string" ? panel.filePath : null,
+    browserRequest: null,
+    hasOpenedPanel: typeof panel.hasOpenedPanel === "boolean" ? panel.hasOpenedPanel : false,
+    lastOpenPanel: panel.lastOpenPanel === "diff" ? "diff" : "browser",
+  };
+}
+
+function sanitizePersistedPane(
+  value: unknown,
+  resetFilePath: boolean,
+  depth: number,
+  paneIds: Set<string>,
+): Pane | null {
+  if (!isRecord(value) || depth > 2 || typeof value.id !== "string" || value.id.length === 0) {
+    return null;
+  }
+  if (paneIds.has(value.id)) {
+    return null;
+  }
+  paneIds.add(value.id);
+
+  if (value.kind === "leaf") {
+    if (
+      value.threadId !== null &&
+      (typeof value.threadId !== "string" ||
+        value.threadId.length === 0 ||
+        value.threadId.trim() !== value.threadId)
+    ) {
+      return null;
+    }
+    return {
+      kind: "leaf",
+      id: value.id,
+      threadId: value.threadId as ThreadId | null,
+      panel: sanitizePersistedPanelState(value.panel, resetFilePath),
+    };
+  }
+
+  if (
+    value.kind !== "split" ||
+    (value.direction !== "horizontal" && value.direction !== "vertical") ||
+    typeof value.ratio !== "number" ||
+    !Number.isFinite(value.ratio)
+  ) {
+    return null;
+  }
+  const first = sanitizePersistedPane(value.first, resetFilePath, depth + 1, paneIds);
+  const second = sanitizePersistedPane(value.second, resetFilePath, depth + 1, paneIds);
+  if (!first || !second) {
+    return null;
+  }
+  return {
+    kind: "split",
+    id: value.id,
+    direction: value.direction,
+    first,
+    second,
+    ratio: clampRatio(value.ratio),
+  };
+}
+
+function sanitizePersistedSplitView(
+  splitViewId: string,
+  value: unknown,
+  resetFilePath: boolean,
+): SplitView | null {
+  if (
+    !isRecord(value) ||
+    value.id !== splitViewId ||
+    typeof value.sourceThreadId !== "string" ||
+    value.sourceThreadId.length === 0 ||
+    typeof value.ownerProjectId !== "string" ||
+    value.ownerProjectId.length === 0 ||
+    typeof value.focusedPaneId !== "string" ||
+    typeof value.createdAt !== "string" ||
+    typeof value.updatedAt !== "string"
+  ) {
+    return null;
+  }
+  const root = sanitizePersistedPane(value.root, resetFilePath, 0, new Set<string>());
+  const leaves = root ? collectLeaves(root) : [];
+  const threadIds = leaves.flatMap((leaf) => (leaf.threadId ? [leaf.threadId] : []));
+  if (
+    !root ||
+    !findLeafPaneById(root, value.focusedPaneId) ||
+    !threadIds.includes(value.sourceThreadId as ThreadId) ||
+    new Set(threadIds).size !== threadIds.length
+  ) {
+    return null;
+  }
+  return {
+    id: value.id,
+    sourceThreadId: value.sourceThreadId as ThreadId,
+    ownerProjectId: value.ownerProjectId as ProjectId,
+    root,
+    focusedPaneId: value.focusedPaneId,
+    createdAt: value.createdAt,
+    updatedAt: value.updatedAt,
+  };
+}
+
+function sanitizePersistedState(state: unknown, resetFilePath: boolean): SplitViewStoreState {
+  if (!isRecord(state) || !isRecord(state.splitViewsById)) {
     return { splitViewsById: {}, splitViewIdBySourceThreadId: {} };
   }
-  const candidate = state as Partial<SplitViewStoreState>;
-  const splitViewsById = Object.fromEntries(
-    Object.entries(candidate.splitViewsById ?? {}).map(([id, splitView]) => [
-      id,
-      splitView
-        ? {
-            ...splitView,
-            root: mapPanePanelState(splitView.root, (panel) => ({
-              ...createDefaultPanePanelState(),
-              ...panel,
-              filePath: null,
-              browserRequest: null,
-            })),
-          }
-        : splitView,
-    ]),
-  );
-  return {
-    splitViewsById,
-    splitViewIdBySourceThreadId: candidate.splitViewIdBySourceThreadId ?? {},
-  };
+  const splitViewsById: Record<SplitViewId, SplitView | undefined> = {};
+  const splitViewIdBySourceThreadId: Record<string, SplitViewId | undefined> = {};
+
+  for (const [splitViewId, value] of Object.entries(state.splitViewsById)) {
+    const splitView = sanitizePersistedSplitView(splitViewId, value, resetFilePath);
+    if (!splitView || splitViewIdBySourceThreadId[splitView.sourceThreadId]) {
+      continue;
+    }
+    splitViewsById[splitViewId] = splitView;
+    splitViewIdBySourceThreadId[splitView.sourceThreadId] = splitViewId;
+  }
+
+  return { splitViewsById, splitViewIdBySourceThreadId };
+}
+
+function migrateV2PersistedState(state: unknown): SplitViewStoreState {
+  return sanitizePersistedState(state, true);
 }
 
 function stripTransientBrowserRequests(state: SplitViewStoreState): SplitViewStoreState {
@@ -816,14 +933,7 @@ export const useSplitViewStore = create<SplitViewStore>()(
           splitViewIdBySourceThreadId: state.splitViewIdBySourceThreadId,
         }),
       merge: (persistedState, currentState) => {
-        const persisted =
-          persistedState && typeof persistedState === "object"
-            ? (persistedState as Partial<SplitViewStoreState>)
-            : {};
-        const sanitized = stripTransientBrowserRequests({
-          splitViewsById: persisted.splitViewsById ?? {},
-          splitViewIdBySourceThreadId: persisted.splitViewIdBySourceThreadId ?? {},
-        });
+        const sanitized = sanitizePersistedState(persistedState, false);
         return {
           ...currentState,
           ...sanitized,
