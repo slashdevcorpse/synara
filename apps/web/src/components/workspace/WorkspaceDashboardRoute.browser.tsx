@@ -200,6 +200,7 @@ function activeChildThread(projectId: ProjectId): SidebarThreadSummary {
     projectId,
     title: "Active child",
     modelSelection: { provider: "codex", model: "gpt-5" },
+    runtimeMode: "full-access",
     interactionMode: "default",
     branch: "feature/child",
     worktreePath: null,

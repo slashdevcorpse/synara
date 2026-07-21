@@ -45,6 +45,7 @@ function thread(
     projectId: projectId(owner),
     title: id,
     modelSelection: { provider: "codex", model: "gpt-5" },
+    runtimeMode: "full-access",
     interactionMode: "default",
     branch: "main",
     worktreePath: null,
