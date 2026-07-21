@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "repository": "slashdevcorpse/synara",
   "canonicalUpstream": "Emanuele-web04/synara",
-  "verifiedOn": "2026-07-20",
+  "verifiedOn": "2026-07-21",
   "patches":
     [
       {
@@ -317,15 +317,21 @@
         "purpose": "Stop the Windows desktop backend through an authenticated loopback request so the scoped server can drain runtime work and finalizers before a bounded process fallback.",
         "userVisibleConsequence": "Closing or restarting the Windows desktop app no longer abruptly terminates its backend before provider, persistence, and server cleanup can finish.",
         "owner": "slashdevcorpse",
-        "status": "upstream-pending",
-        "upstreamSourceCommit": "606c49b0288a46941e4e0f417f40754e975a29f2",
+        "status": "upstreamed",
+        "upstreamSourceCommit": "ee3317726edec13754e493144b0fcdbc64b48383",
         "introducingCommit": "443d2c22df9b07498dd5aa717cc01494ee202501",
         "touchedFiles":
           [
+            "apps/desktop/src/backendRestartController.test.ts",
             "apps/desktop/src/backendShutdown.test.ts",
             "apps/desktop/src/backendShutdown.ts",
             "apps/desktop/src/backendShutdown.windows.integration.test.ts",
+            "apps/desktop/src/desktopWindowLifecycle.test.ts",
             "apps/desktop/src/main.ts",
+            "apps/desktop/src/updateInstallMarker.test.ts",
+            "apps/desktop/src/updateInstallMarker.ts",
+            "apps/desktop/src/updateInstallPreparation.test.ts",
+            "apps/desktop/src/updateInstallPreparation.ts",
             "apps/server/src/config.ts",
             "apps/server/src/effectServer.remoteAccess.test.ts",
             "apps/server/src/effectServer.ts",
@@ -333,24 +339,31 @@
             "apps/server/src/http.ts",
             "apps/server/src/main.test.ts",
             "apps/server/src/main.ts",
+            "apps/server/src/nodeHttpServer.ts",
             "apps/server/src/serverShutdown.test.ts",
             "apps/server/src/serverShutdown.ts",
+            "apps/server/src/wsRpc.connectionLifecycle.test.ts",
           ],
         "subsystems":
           ["desktop", "server-lifecycle", "http", "process-shutdown", "security", "windows"],
         "regressionTests":
           [
+            "apps/desktop/src/backendRestartController.test.ts",
             "apps/desktop/src/backendShutdown.test.ts",
             "apps/desktop/src/backendShutdown.windows.integration.test.ts",
+            "apps/desktop/src/desktopWindowLifecycle.test.ts",
+            "apps/desktop/src/updateInstallMarker.test.ts",
+            "apps/desktop/src/updateInstallPreparation.test.ts",
             "apps/server/src/effectServer.remoteAccess.test.ts",
             "apps/server/src/http.test.ts",
             "apps/server/src/main.test.ts",
             "apps/server/src/serverShutdown.test.ts",
+            "apps/server/src/wsRpc.connectionLifecycle.test.ts",
           ],
         "upstreamLinks": ["https://github.com/Emanuele-web04/synara/pull/430"],
-        "overlapResolutionPolicy": "Preserve the per-launch secret boundary, desktop-only loopback authorization, secret redaction, actual-child-exit proof, single bounded force fallback, and scoped finalizer ordering. The canonical PR's CI-only hunk is intentionally excluded because downstream windows_x64 already runs the full workspace and desktop integration suites.",
+        "overlapResolutionPolicy": "Preserve the per-launch secret boundary, desktop-only loopback authorization, secret redaction, actual-child-exit proof, retryable timeout eviction, restart ownership until confirmed exit, single bounded force fallback, established-WebSocket termination, idempotent durable update-failure recording, and downstream Super warm-runtime policy. Never quit the app or hand off an update without proven backend exit. The canonical PR's CI-only hunk remains excluded because downstream windows_x64 already runs the full workspace and desktop integration suites.",
         "lastAssessedUpstreamSha": "1664ce2f152cd6131a30d1ee8d7c9b60235bb0fe",
-        "verificationDate": "2026-07-20",
+        "verificationDate": "2026-07-21",
         "retirementCondition": "Retire after authenticated graceful desktop shutdown, scoped server draining, and equivalent Windows process integration coverage merge upstream and are absorbed downstream.",
         "statusHistory":
           [
@@ -358,6 +371,11 @@
               "status": "upstream-pending",
               "date": "2026-07-19",
               "evidence": "Open upstream PR 430 at a1ba31bb487522d62e7e7be9a46fffa473cec2d4; rebased downstream at 443d2c22df9b07498dd5aa717cc01494ee202501 with the redundant canonical CI hunk excluded",
+            },
+            {
+              "status": "upstreamed",
+              "date": "2026-07-21",
+              "evidence": "Upstream PR 430 merged as 925b7dacb00b632d7ddbdc897b77352d542933d3 from final head ee3317726edec13754e493144b0fcdbc64b48383. Canonical a1ba31bb487522d62e7e7be9a46fffa473cec2d4 and 606c49b0288a46941e4e0f417f40754e975a29f2 map to downstream 443d2c22df9b07498dd5aa717cc01494ee202501; f5d9b16be8925740407f4f4340783f76c4b5fa28 maps to 3b1e5b4270606ce1e81d057b0872f6b11ee56e2f; 50748e85ab70115343802a75903a321883e0caf3 maps to downstream exit-proof commits 9b1e453ccd19379f737fc918d9bd6353af46e6cf, c487d22abb223d40907146bd683974b07deb2562, and 543cbc005b39d4a4923e3b82c53a1941b42b2354 plus final convergence 3b1e5b4270606ce1e81d057b0872f6b11ee56e2f, retry ownership follow-up 259165e82e09c1eebf1cb43cd0186386829db95b, and hosted-review invariant clarification eb5ffaa403fd6c73355b2ccf5ae42c8f142fe0eb; afe2767b35d25ff473bc3432a625ca9fe30b6267 maps to 3b1e5b4270606ce1e81d057b0872f6b11ee56e2f while preserving downstream production hardening 1ffb166715d1337233c930a5d7b5c6b01803edb0.",
             },
           ],
       },
