@@ -275,6 +275,7 @@ jobs:
   analyze_swift:
     name: codeql-swift
     runs-on: macos-15
+    timeout-minutes: 60
     permissions:
       contents: read
       security-events: write
@@ -653,6 +654,15 @@ describe("workflow contracts", () => {
     );
     expect(validateWorkflowContracts(wrongCategory, policy()).join("\n")).toContain(
       "codeql-swift must publish the fixed analysis category",
+    );
+
+    const undersizedSwiftTimeout = validFiles();
+    undersizedSwiftTimeout.set(
+      ".github/workflows/codeql.yml",
+      codeqlWorkflow.replace("    timeout-minutes: 60", "    timeout-minutes: 30"),
+    );
+    expect(validateWorkflowContracts(undersizedSwiftTimeout, policy()).join("\n")).toContain(
+      "codeql-swift timeout-minutes must equal 60",
     );
   });
 
