@@ -67,7 +67,7 @@ function activity(input: {
   turnId: string;
   createdAt: string;
   summary?: string;
-  payload?: Record<string, unknown>;
+  payload?: OrchestrationThreadActivity["payload"];
 }): OrchestrationThreadActivity {
   return {
     id: EventId.makeUnsafe(input.id),

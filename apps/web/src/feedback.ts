@@ -47,7 +47,7 @@ interface FeedbackThreadContextSource {
     readonly provider: string;
     readonly model: string;
   };
-  readonly envMode: string;
+  readonly envMode?: string | undefined;
   readonly runtimeMode: string;
   readonly interactionMode: string;
   readonly session: { readonly status: string } | null;
