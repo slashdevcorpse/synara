@@ -169,7 +169,9 @@ function sumKnown(values: ReadonlyArray<number | null | undefined>): number | nu
   return found ? total : null;
 }
 
-function countToolNames(values: ReadonlyArray<string | null | undefined>): TurnReasoningToolCount[] {
+function countToolNames(
+  values: ReadonlyArray<string | null | undefined>,
+): TurnReasoningToolCount[] {
   const counts = new Map<string, TurnReasoningToolCount>();
   for (const value of values) {
     const name = asTrimmedString(value);
@@ -252,18 +254,13 @@ function compareDurableTurns(
   left: TurnReasoningDurableTurn,
   right: TurnReasoningDurableTurn,
 ): number {
-  const requestedDelta =
-    (timestamp(left.requestedAt) ?? 0) - (timestamp(right.requestedAt) ?? 0);
+  const requestedDelta = (timestamp(left.requestedAt) ?? 0) - (timestamp(right.requestedAt) ?? 0);
   return requestedDelta !== 0
     ? requestedDelta
     : String(left.turnId).localeCompare(String(right.turnId));
 }
 
-function appendSegmentIndex<Key>(
-  index: Map<Key, number[]>,
-  key: Key,
-  segmentIndex: number,
-): void {
+function appendSegmentIndex<Key>(index: Map<Key, number[]>, key: Key, segmentIndex: number): void {
   const existing = index.get(key);
   if (existing) {
     existing.push(segmentIndex);
@@ -298,8 +295,7 @@ function indexDurableTurnsBySegment(
       matchingSegmentIndexes.add(segmentIndex);
     }
     if (turn.assistantMessageId !== null) {
-      for (const segmentIndex of
-        segmentIndexesByAssistantId.get(turn.assistantMessageId) ?? []) {
+      for (const segmentIndex of segmentIndexesByAssistantId.get(turn.assistantMessageId) ?? []) {
         matchingSegmentIndexes.add(segmentIndex);
       }
     }
@@ -451,7 +447,9 @@ function activityToolName(activity: OrchestrationThreadActivity): string | null 
   return normalized.length > 0 ? normalized : null;
 }
 
-function deriveActivityTools(activities: ReadonlyArray<OrchestrationThreadActivity>): ToolAggregate {
+function deriveActivityTools(
+  activities: ReadonlyArray<OrchestrationThreadActivity>,
+): ToolAggregate {
   const invocationNames = new Map<string, string>();
   const openFallbackByName = new Map<string, string>();
   let fallbackOrdinal = 0;
@@ -501,7 +499,9 @@ function deriveTimelineTools(
   entries: ReadonlyArray<TimelineEntry>,
 ): ToolAggregate {
   const turnIds = new Set(segment.turnIds);
-  const start = timestamp(segment.userMessage?.createdAt ?? segment.assistantMessages[0]?.createdAt);
+  const start = timestamp(
+    segment.userMessage?.createdAt ?? segment.assistantMessages[0]?.createdAt,
+  );
   const end = timestamp(
     segment.terminalAssistantMessage.completedAt ?? segment.terminalAssistantMessage.createdAt,
   );
@@ -542,9 +542,7 @@ function deriveTools(
     return { count: durableCount ?? 0, nameCounts: durableNameCounts };
   }
   const activityTools = deriveActivityTools(activities);
-  return activityTools.count > 0
-    ? activityTools
-    : deriveTimelineTools(segment, timelineEntries);
+  return activityTools.count > 0 ? activityTools : deriveTimelineTools(segment, timelineEntries);
 }
 
 function activityRequestId(activity: OrchestrationThreadActivity): string | null {
@@ -692,17 +690,13 @@ function buildSegmentSummary(
     reasoningEffort:
       lastNonNull(durableTurns.map((turn) => turn.reasoningEffort)) ??
       explicitReasoningEffort(modelSelection),
-    assistantDeliveryMode: lastNonNull(
-      durableTurns.map((turn) => turn.assistantDeliveryMode),
-    ),
+    assistantDeliveryMode: lastNonNull(durableTurns.map((turn) => turn.assistantDeliveryMode)),
     contextUsedTokens: latestContextUsage?.contextUsedTokens ?? null,
     contextWindowTokens: latestContextUsage?.contextWindowTokens ?? null,
     inputTokens,
     cachedInputTokens: sumKnown(tokenUsages.map((usage) => usage.cachedInputTokens)),
     outputTokens,
-    reasoningOutputTokens: sumKnown(
-      tokenUsages.map((usage) => usage.reasoningOutputTokens),
-    ),
+    reasoningOutputTokens: sumKnown(tokenUsages.map((usage) => usage.reasoningOutputTokens)),
     totalTokens:
       explicitTotalTokens ??
       (inputTokens !== null && outputTokens !== null ? inputTokens + outputTokens : null),
@@ -713,10 +707,7 @@ function buildSegmentSummary(
     distinctToolNames: allToolNameCounts
       .slice(0, MAX_TURN_REASONING_TOOL_NAMES)
       .map((entry) => entry.name),
-    toolNameOverflowCount: Math.max(
-      0,
-      allToolNameCounts.length - MAX_TURN_REASONING_TOOL_NAMES,
-    ),
+    toolNameOverflowCount: Math.max(0, allToolNameCounts.length - MAX_TURN_REASONING_TOOL_NAMES),
     approvalCount: approvals.approvals,
     rejectionCount: approvals.rejections,
     filesChangedCount: deriveFilesChangedCount(segment, input.turnDiffSummaries ?? []),

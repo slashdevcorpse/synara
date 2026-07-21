@@ -792,10 +792,7 @@ export function syncServerShellSnapshot(
     threadShellById: {},
     threadSessionById: {},
     threadTurnStateById: {},
-    turnSummariesByThreadId: retainThreadScopedRecord(
-      state.turnSummariesByThreadId,
-      nextThreadIds,
-    ),
+    turnSummariesByThreadId: retainThreadScopedRecord(state.turnSummariesByThreadId, nextThreadIds),
     messageIdsByThreadId: retainThreadScopedRecord(state.messageIdsByThreadId, nextThreadIds),
     messageByThreadId: retainThreadScopedRecord(state.messageByThreadId, nextThreadIds),
     activityIdsByThreadId: retainThreadScopedRecord(state.activityIdsByThreadId, nextThreadIds),
@@ -954,10 +951,7 @@ export function syncServerReadModel(state: AppState, readModel: OrchestrationRea
     threadShellById: retainThreadScopedRecord(state.threadShellById, nextThreadIds),
     threadSessionById: retainThreadScopedRecord(state.threadSessionById, nextThreadIds),
     threadTurnStateById: retainThreadScopedRecord(state.threadTurnStateById, nextThreadIds),
-    turnSummariesByThreadId: retainThreadScopedRecord(
-      state.turnSummariesByThreadId,
-      nextThreadIds,
-    ),
+    turnSummariesByThreadId: retainThreadScopedRecord(state.turnSummariesByThreadId, nextThreadIds),
     messageIdsByThreadId: retainThreadScopedRecord(state.messageIdsByThreadId, nextThreadIds),
     messageByThreadId: retainThreadScopedRecord(state.messageByThreadId, nextThreadIds),
     activityIdsByThreadId: retainThreadScopedRecord(state.activityIdsByThreadId, nextThreadIds),

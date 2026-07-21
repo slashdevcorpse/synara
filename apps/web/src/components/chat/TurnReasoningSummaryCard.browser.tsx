@@ -13,10 +13,7 @@ import type { FeedbackThreadContext } from "~/feedback";
 import { useFeedbackDialogStore } from "~/feedbackDialogStore";
 
 import { TurnReasoningSummaryCard } from "./TurnReasoningSummaryCard";
-import {
-  formatTurnReasoningSummaryForClipboard,
-  type TurnReasoningSummary,
-} from "./turnReasoning";
+import { formatTurnReasoningSummaryForClipboard, type TurnReasoningSummary } from "./turnReasoning";
 
 const FEEDBACK_CONTEXT: FeedbackThreadContext = {
   provider: "claudeAgent",
@@ -160,9 +157,7 @@ describe("TurnReasoningSummaryCard interactions", () => {
       interactionMode: null,
       envMode: null,
     };
-    const mounted = await render(
-      <ControlledCard initiallyExpanded summary={historicalSummary} />,
-    );
+    const mounted = await render(<ControlledCard initiallyExpanded summary={historicalSummary} />);
     try {
       await page.getByRole("button", { name: "Send feedback about Turn 3" }).click();
 

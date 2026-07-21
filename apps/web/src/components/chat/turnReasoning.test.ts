@@ -1,9 +1,4 @@
-import {
-  EventId,
-  MessageId,
-  TurnId,
-  type OrchestrationThreadActivity,
-} from "@synara/contracts";
+import { EventId, MessageId, TurnId, type OrchestrationThreadActivity } from "@synara/contracts";
 import { describe, expect, it } from "vitest";
 import type { TimelineEntry } from "../../workLog";
 import type { ChatMessage, TurnDiffSummary } from "../../types";
@@ -485,9 +480,7 @@ describe("buildTurnReasoningSummaryByAssistantMessageId", () => {
 
     const iso = (responseIndex: number, offsetMs: number) =>
       new Date(Date.UTC(2026, 6, 21, 10, responseIndex, 0) + offsetMs).toISOString();
-    const withoutDurableCounts = (
-      turn: TurnReasoningDurableTurn,
-    ): TurnReasoningDurableTurn => {
+    const withoutDurableCounts = (turn: TurnReasoningDurableTurn): TurnReasoningDurableTurn => {
       const {
         toolCallCount: _toolCallCount,
         toolNames: _toolNames,

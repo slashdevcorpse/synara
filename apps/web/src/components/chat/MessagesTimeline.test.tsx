@@ -233,9 +233,7 @@ describe("MessagesTimeline", () => {
     );
     expect((markup.match(/data-expanded="false"/gu) ?? []).length).toBe(1);
     expect((markup.match(/data-expanded="true"/gu) ?? []).length).toBe(1);
-    expect(markup.indexOf("First response")).toBeLessThan(
-      markup.indexOf('data-expanded="false"'),
-    );
+    expect(markup.indexOf("First response")).toBeLessThan(markup.indexOf('data-expanded="false"'));
     expect(markup.indexOf("Second response")).toBeLessThan(markup.indexOf('data-expanded="true"'));
   });
 

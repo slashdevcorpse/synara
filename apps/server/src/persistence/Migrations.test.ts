@@ -36,7 +36,10 @@ turnSummaryMigrationLayer("projection turn summary migration", (it) => {
       `;
 
       const executed = yield* runMigrations();
-      assert.deepStrictEqual(executed.map(([id]) => id), [74]);
+      assert.deepStrictEqual(
+        executed.map(([id]) => id),
+        [74],
+      );
 
       const columns = yield* sql<{ readonly name: string }>`
         SELECT name FROM pragma_table_info('projection_turns')

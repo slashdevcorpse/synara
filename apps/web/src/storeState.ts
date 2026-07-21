@@ -42,10 +42,7 @@ Object.freeze(EMPTY_THREAD_IDS);
 export const EMPTY_THREAD_SHELL_BY_ID: Record<ThreadId, ThreadShell> = {};
 export const EMPTY_THREAD_SESSION_BY_ID: Record<ThreadId, ThreadSession | null> = {};
 export const EMPTY_THREAD_TURN_STATE_BY_ID: Record<ThreadId, ThreadTurnState> = {};
-export const EMPTY_TURN_SUMMARIES_BY_THREAD: Record<
-  ThreadId,
-  NonNullable<Thread["turns"]>
-> = {};
+export const EMPTY_TURN_SUMMARIES_BY_THREAD: Record<ThreadId, NonNullable<Thread["turns"]>> = {};
 export const EMPTY_MESSAGE_IDS_BY_THREAD: Record<ThreadId, MessageId[]> = {};
 export const EMPTY_MESSAGE_BY_THREAD: Record<ThreadId, Record<MessageId, ChatMessage>> = {};
 export const EMPTY_ACTIVITY_IDS_BY_THREAD: Record<ThreadId, string[]> = {};

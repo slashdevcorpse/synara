@@ -190,10 +190,7 @@ function contextWindowTurnTokenUsage(
         )
       : null,
     totalTokens: exact
-      ? payloadNonNegativeNumber(
-          activity.payload,
-          last ? "lastUsedTokens" : "totalProcessedTokens",
-        )
+      ? payloadNonNegativeNumber(activity.payload, last ? "lastUsedTokens" : "totalProcessedTokens")
       : null,
     contextUsedTokens: payloadNonNegativeNumber(activity.payload, "usedTokens"),
     contextWindowTokens: payloadNonNegativeNumber(activity.payload, "maxTokens"),
@@ -315,8 +312,7 @@ function upsertToolCall(
     ];
   }
   const index = toolCalls.findIndex((toolCall) => toolCall.id === id);
-  if (index < 0)
-    return [...toolCalls, { id, name, completed: activity.kind === "tool.completed" }];
+  if (index < 0) return [...toolCalls, { id, name, completed: activity.kind === "tool.completed" }];
   return toolCalls.map((toolCall, currentIndex) =>
     currentIndex === index
       ? {

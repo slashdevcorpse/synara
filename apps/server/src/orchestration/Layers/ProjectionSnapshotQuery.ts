@@ -416,7 +416,9 @@ function toProjectedLatestTurn(row: ProjectionLatestTurnDbRow): OrchestrationLat
   };
 }
 
-function toProjectedTurn(row: ProjectionTurnDbRow & { readonly turnId: TurnId }): OrchestrationTurnSummary {
+function toProjectedTurn(
+  row: ProjectionTurnDbRow & { readonly turnId: TurnId },
+): OrchestrationTurnSummary {
   const toolNames = row.toolCalls.flatMap((toolCall) =>
     toolCall.name === null ? [] : [toolCall.name],
   );

@@ -67,10 +67,7 @@ const SUMMARY: TurnReasoningSummary = {
   envMode: "local",
 };
 
-function renderCard(
-  summary: TurnReasoningSummary,
-  expanded: boolean,
-): string {
+function renderCard(summary: TurnReasoningSummary, expanded: boolean): string {
   return renderToStaticMarkup(
     <TurnReasoningSummaryCard
       summary={summary}

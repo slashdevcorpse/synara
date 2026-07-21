@@ -14,10 +14,7 @@ import { ProviderIcon } from "../ProviderIcon";
 import { Collapsible, CollapsiblePanel, CollapsibleTrigger } from "../ui/collapsible";
 import { DisclosureChevron } from "../ui/DisclosureChevron";
 import { APP_TOOLTIP_SURFACE_CLASS_NAME } from "./composerPickerStyles";
-import {
-  formatTurnReasoningSummaryForClipboard,
-  type TurnReasoningSummary,
-} from "./turnReasoning";
+import { formatTurnReasoningSummaryForClipboard, type TurnReasoningSummary } from "./turnReasoning";
 
 const UNSUPPORTED_VALUE = "—";
 
@@ -251,7 +248,8 @@ export function TurnReasoningSummaryCard({
               {pluralizedCount(summary.rejectionCount, "rejection")}
             </SummaryDetail>
             <SummaryDetail label="Completion">
-              <span className={status.textClassName}>{status.completionLabel}</span> · {filesChanged}
+              <span className={status.textClassName}>{status.completionLabel}</span> ·{" "}
+              {filesChanged}
             </SummaryDetail>
             <SummaryDetail label="Access">{expandedAccess}</SummaryDetail>
           </dl>

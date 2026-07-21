@@ -3883,9 +3883,7 @@ it.layer(
         "approval-1",
         "approval-2",
       ]);
-      assert.deepEqual(JSON.parse(rows[0]?.rejectedApprovalRequestIdsJson ?? "[]"), [
-        "approval-1",
-      ]);
+      assert.deepEqual(JSON.parse(rows[0]?.rejectedApprovalRequestIdsJson ?? "[]"), ["approval-1"]);
       assert.deepEqual(JSON.parse(rows[0]?.tokenUsageJson ?? "null"), {
         provider: "codex",
         inputTokens: 120,

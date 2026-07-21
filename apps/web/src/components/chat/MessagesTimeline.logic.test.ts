@@ -449,7 +449,14 @@ describe("computeStableMessagesTimelineRows", () => {
     });
     const first = computeStableMessagesTimelineRows([makeRow(baseSummary)], emptyStableRows());
     const unchanged = computeStableMessagesTimelineRows(
-      [makeRow({ ...baseSummary, turnIds: [...baseSummary.turnIds], toolNameCounts: baseSummary.toolNameCounts.map((entry) => ({ ...entry })), distinctToolNames: [...baseSummary.distinctToolNames] })],
+      [
+        makeRow({
+          ...baseSummary,
+          turnIds: [...baseSummary.turnIds],
+          toolNameCounts: baseSummary.toolNameCounts.map((entry) => ({ ...entry })),
+          distinctToolNames: [...baseSummary.distinctToolNames],
+        }),
+      ],
       first,
     );
     expect(unchanged).toBe(first);
@@ -1053,9 +1060,7 @@ describe("deriveMessagesTimelineRows", () => {
     });
     const rows = deriveMessagesTimelineRows({
       ...baseInput,
-      turnReasoningSummaryByAssistantMessageId: new Map([
-        [MessageId.makeUnsafe("a2"), summary],
-      ]),
+      turnReasoningSummaryByAssistantMessageId: new Map([[MessageId.makeUnsafe("a2"), summary]]),
       timelineEntries: [
         userEntry("u1", "2026-07-21T10:00:00.000Z"),
         assistantEntry("a1", "2026-07-21T10:00:01.000Z", {
@@ -1075,11 +1080,7 @@ describe("deriveMessagesTimelineRows", () => {
       rows.map((row) =>
         row.kind === "message" ? `message:${String(row.message.id)}` : `${row.kind}:${row.id}`,
       ),
-    ).toEqual([
-      "message:u1",
-      "message:a2",
-      "turn-reasoning-summary:turn-summary:a2",
-    ]);
+    ).toEqual(["message:u1", "message:a2", "turn-reasoning-summary:turn-summary:a2"]);
     const summaryRow = rows[2];
     expect(summaryRow).toMatchObject({
       kind: "turn-reasoning-summary",

@@ -2421,10 +2421,7 @@ describe("ChatView timeline estimator parity (full app)", () => {
         interval: 16,
       });
       const assistantRow = await waitForElement(
-        () =>
-          document.querySelector<HTMLElement>(
-            `[data-message-id="${liveAssistantMessage.id}"]`,
-          ),
+        () => document.querySelector<HTMLElement>(`[data-message-id="${liveAssistantMessage.id}"]`),
         "Unable to find the settled assistant row.",
       );
       await vi.waitFor(() => expect(assistantRow.textContent).toContain("Edited 2 files"), {
@@ -2487,9 +2484,7 @@ describe("ChatView timeline estimator parity (full app)", () => {
         () => document.querySelector<HTMLButtonElement>(activeSummaryTriggerSelector),
         "Durable completed-turn data did not render a summary card.",
       );
-      const summaryCard = summaryTrigger.closest<HTMLElement>(
-        "[data-turn-reasoning-summary-card]",
-      );
+      const summaryCard = summaryTrigger.closest<HTMLElement>("[data-turn-reasoning-summary-card]");
       expect(summaryCard, "Summary trigger was not contained by its card.").not.toBeNull();
       if (!summaryCard) throw new Error("Summary trigger was not contained by its card.");
       await vi.waitFor(
@@ -2507,17 +2502,18 @@ describe("ChatView timeline estimator parity (full app)", () => {
         { timeout: 4_000, interval: 16 },
       );
       const committedAssistantRow = await waitForElement(
-        () =>
-          document.querySelector<HTMLElement>(
-            `[data-message-id="${liveAssistantMessage.id}"]`,
-          ),
+        () => document.querySelector<HTMLElement>(`[data-message-id="${liveAssistantMessage.id}"]`),
         "Settled assistant row was replaced without a committed successor.",
       );
       const summaryTimelineRow = summaryCard.closest<HTMLElement>(
         '[data-timeline-row-kind="turn-reasoning-summary"]',
       );
-      expect(summaryTimelineRow, "Summary card was not rendered in its timeline row.").not.toBeNull();
-      if (!summaryTimelineRow) throw new Error("Summary card was not rendered in its timeline row.");
+      expect(
+        summaryTimelineRow,
+        "Summary card was not rendered in its timeline row.",
+      ).not.toBeNull();
+      if (!summaryTimelineRow)
+        throw new Error("Summary card was not rendered in its timeline row.");
       expect(committedAssistantRow.textContent).toContain("Edited 2 files");
       expect(summaryTimelineRow.getBoundingClientRect().top).toBeGreaterThanOrEqual(
         committedAssistantRow.getBoundingClientRect().bottom - 1,
