@@ -307,7 +307,6 @@ jobs:
   dispatch:
     uses: ./.github/workflows/super-synara-prerelease.yml
     permissions:
-      actions: read
       contents: write
 `;
 
@@ -671,8 +670,8 @@ describe("workflow contracts", () => {
     excessiveDispatchPermission.set(
       ".github/workflows/release-drafter.yml",
       releaseDrafterWorkflow.replace(
-        "      actions: read\n      contents: write",
-        "      actions: write\n      contents: write",
+        "  dispatch:\n    uses: ./.github/workflows/super-synara-prerelease.yml\n    permissions:\n      contents: write",
+        "  dispatch:\n    uses: ./.github/workflows/super-synara-prerelease.yml\n    permissions:\n      actions: write\n      contents: write",
       ),
     );
     expect(validateWorkflowContracts(excessiveDispatchPermission, policy()).join("\n")).toContain(

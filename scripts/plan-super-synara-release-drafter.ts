@@ -7,7 +7,7 @@ import { appendFileSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { runGh } from "./lib/gh-cli.ts";
+import { GH_CLI_BULK_TIMEOUT_MS, runGh } from "./lib/gh-cli.ts";
 import { serializeReleaseGithubOutput } from "./lib/release-github-output.ts";
 import {
   assertSuperSynaraCoreVersion,
@@ -71,7 +71,9 @@ const tags = parseSuperSynaraMatchingTagRefs(
 );
 const releases = parseSuperSynaraReleasePages(
   JSON.parse(
-    runGh(["api", "--paginate", "--slurp", `repos/${repository}/releases?per_page=100`]),
+    runGh(["api", "--paginate", "--slurp", `repos/${repository}/releases?per_page=100`], {
+      timeoutMs: GH_CLI_BULK_TIMEOUT_MS,
+    }),
   ) as unknown,
 );
 const plan = resolveSuperSynaraDraftPlan({ coreVersion, sourceCommit, tags, releases });

@@ -6,6 +6,7 @@ import { spawnSync } from "node:child_process";
 
 export interface GhSpawnResult {
   readonly error?: Error;
+  readonly signal: NodeJS.Signals | null;
   readonly status: number | null;
   readonly stderr: string;
   readonly stdout: string;
@@ -18,6 +19,7 @@ export type GhSpawn = (
 ) => GhSpawnResult;
 
 export const GH_CLI_TIMEOUT_MS = 30_000;
+export const GH_CLI_BULK_TIMEOUT_MS = 120_000;
 
 const defaultSpawn: GhSpawn = (command, args, options) =>
   spawnSync(command, [...args], options) as GhSpawnResult;
@@ -53,18 +55,22 @@ export class GhCliRequestError extends Error {
 
 export function runGh(
   args: ReadonlyArray<string>,
-  options: { readonly allowNotFound?: boolean } = {},
+  options: { readonly allowNotFound?: boolean; readonly timeoutMs?: number } = {},
   spawn: GhSpawn = defaultSpawn,
 ): string {
+  const timeoutMs = options.timeoutMs ?? GH_CLI_TIMEOUT_MS;
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 300_000) {
+    throw new Error("GitHub CLI timeout must be a positive safe integer no greater than 300000ms.");
+  }
   const result = spawn("gh", args, {
     encoding: "utf8",
     shell: false,
-    timeout: GH_CLI_TIMEOUT_MS,
+    timeout: timeoutMs,
   });
   if (result.error) {
     if ("code" in result.error && result.error.code === "ETIMEDOUT") {
       throw new GhCliRequestError(
-        `gh ${args.join(" ")} timed out after ${GH_CLI_TIMEOUT_MS}ms: ${result.error.message}`,
+        `gh ${args.join(" ")} timed out after ${timeoutMs}ms: ${result.error.message}`,
         true,
       );
     }
@@ -73,8 +79,13 @@ export function runGh(
   if (result.status !== 0) {
     const output = [result.stderr, result.stdout].filter(Boolean).join("\n");
     if (options.allowNotFound && /HTTP\s+404\b/i.test(output)) return "";
+    const diagnostic =
+      output.trim() ||
+      (result.signal
+        ? `terminated by signal ${result.signal}`
+        : `exited with status ${String(result.status)}`);
     throw new GhCliRequestError(
-      `gh ${args.join(" ")} failed: ${output.trim()}`,
+      `gh ${args.join(" ")} failed: ${diagnostic}`,
       isRetryableGhFailure(result.stderr) || isRetryableGhFailure(result.stdout),
     );
   }

@@ -1166,8 +1166,7 @@ export function verifySuperSynaraReleaseDrafterText(
     dispatchJob.uses !== "./.github/workflows/super-synara-prerelease.yml" ||
     dispatchJob.needs !== "draft" ||
     !isRecord(dispatchPermissions) ||
-    dispatchPermissions.actions !== "read" ||
-    dispatchPermissions.contents !== "write" ||
+    JSON.stringify(dispatchPermissions) !== JSON.stringify({ contents: "write" }) ||
     !isRecord(dispatchInputs) ||
     dispatchInputs.version !== "${{ needs.draft.outputs.version }}" ||
     dispatchInputs.tag !== "${{ needs.draft.outputs.tag }}" ||
@@ -1226,8 +1225,13 @@ export function verifySuperSynaraGithubStateScriptText(script: string): void {
   }
   requireText(
     script,
-    'runGh(["api", "--paginate", "--slurp", `repos/${repository}/releases?per_page=100`])',
+    "`repos/${repository}/releases?per_page=100`",
     "GitHub release-state visibility retries must re-read the complete release list.",
+  );
+  requireText(
+    script,
+    "timeoutMs: GH_CLI_BULK_TIMEOUT_MS",
+    "GitHub release-state pagination must use the bounded bulk timeout.",
   );
   requireText(
     script,
@@ -1266,6 +1270,11 @@ export function verifySuperSynaraReleasePlannerScriptText(script: string): void 
     script,
     "parseSuperSynaraReleasePages(",
     "Release planner must decode release pages at the GitHub boundary.",
+  );
+  requireText(
+    script,
+    "timeoutMs: GH_CLI_BULK_TIMEOUT_MS",
+    "Release planner pagination must use the bounded bulk timeout.",
   );
 }
 

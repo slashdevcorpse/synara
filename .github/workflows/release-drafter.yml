@@ -180,7 +180,6 @@ jobs:
     needs: draft
     uses: ./.github/workflows/super-synara-prerelease.yml
     permissions:
-      actions: read
       contents: write
     with:
       version: ${{ needs.draft.outputs.version }}

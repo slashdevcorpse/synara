@@ -10,7 +10,7 @@ import {
   validateSuperSynaraGitHubPolicy,
   validateSuperSynaraGitHubState,
 } from "./lib/super-synara-release-state.ts";
-import { GhCliRequestError, runGh } from "./lib/gh-cli.ts";
+import { GH_CLI_BULK_TIMEOUT_MS, GhCliRequestError, runGh } from "./lib/gh-cli.ts";
 import {
   parseSuperSynaraReleasePages,
   parseSuperSynaraTagObject,
@@ -87,7 +87,9 @@ for (let attempt = 1; attempt <= visibilityAttempts; attempt += 1) {
     });
     tagObject = refJson ? parseSuperSynaraTagObject(JSON.parse(refJson)) : undefined;
     const releasePages = JSON.parse(
-      runGh(["api", "--paginate", "--slurp", `repos/${repository}/releases?per_page=100`]),
+      runGh(["api", "--paginate", "--slurp", `repos/${repository}/releases?per_page=100`], {
+        timeoutMs: GH_CLI_BULK_TIMEOUT_MS,
+      }),
     );
     releases = parseSuperSynaraReleasePages(releasePages);
   } catch (error) {

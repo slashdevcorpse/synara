@@ -572,8 +572,8 @@ describe("Super Synara workflow contracts", () => {
     expect(() =>
       verifySuperSynaraWorkflowText(
         main.replace(
-          "permissions:\n  actions: read\n  contents: read",
-          "permissions:\n  actions: read\n  contents: read\n\nconcurrency:\n  group: alternate-release",
+          "permissions:\n  contents: read",
+          "permissions:\n  contents: read\n\nconcurrency:\n  group: alternate-release",
         ),
         audit,
       ),

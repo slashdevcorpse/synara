@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  GH_CLI_BULK_TIMEOUT_MS,
   GH_CLI_TIMEOUT_MS,
   GhCliRequestError,
   GhCliStartError,
@@ -9,6 +10,7 @@ import {
 } from "./gh-cli.ts";
 
 const result = (overrides: Partial<GhSpawnResult> = {}): GhSpawnResult => ({
+  signal: null,
   status: 0,
   stderr: "",
   stdout: "ok",
@@ -62,6 +64,29 @@ describe("runGh", () => {
       shell: false,
       timeout: GH_CLI_TIMEOUT_MS,
     });
+  });
+
+  it("allows a larger bounded timeout for paginated reads", () => {
+    const spawn = vi.fn(() => result());
+    expect(
+      runGh(["api", "--paginate", "releases"], { timeoutMs: GH_CLI_BULK_TIMEOUT_MS }, spawn),
+    ).toBe("ok");
+    expect(spawn).toHaveBeenCalledWith("gh", ["api", "--paginate", "releases"], {
+      encoding: "utf8",
+      shell: false,
+      timeout: GH_CLI_BULK_TIMEOUT_MS,
+    });
+    expect(() => runGh(["api"], { timeoutMs: 300_001 }, spawn)).toThrow("no greater than 300000ms");
+  });
+
+  it("reports signal termination when GitHub CLI returns no output", () => {
+    expect(() =>
+      runGh(
+        ["api", "rate_limit"],
+        {},
+        vi.fn(() => result({ signal: "SIGTERM", status: null, stdout: "" })),
+      ),
+    ).toThrow("terminated by signal SIGTERM");
   });
 
   for (const [stderr, retryable] of [
