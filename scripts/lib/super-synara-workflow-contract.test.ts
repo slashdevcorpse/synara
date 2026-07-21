@@ -105,6 +105,28 @@ describe("Super Synara workflow contracts", () => {
         audit,
       ),
     ).toThrow("source-cleanliness checks must be ordered and fail closed");
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          "      - name: Install dependencies\n        run: bun install --frozen-lockfile",
+          "      - name: Install dependencies\n        continue-on-error: true\n        run: bun install --frozen-lockfile",
+        ),
+        audit,
+      ),
+    ).toThrow(
+      "install, release smoke, and source-cleanliness checks must be ordered and fail closed",
+    );
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          "      - name: Run release contract smoke tests\n        run: bun run release:smoke",
+          "      - name: Run release contract smoke tests\n        if: false\n        run: bun run release:smoke",
+        ),
+        audit,
+      ),
+    ).toThrow(
+      "install, release smoke, and source-cleanliness checks must be ordered and fail closed",
+    );
   });
 
   it("requires exact native prerelease gates and rejects broad native suites", () => {

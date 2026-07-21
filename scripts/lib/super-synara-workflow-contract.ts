@@ -274,14 +274,14 @@ function verifyPreflightSourceCleanliness(jobs: UnknownRecord): void {
     afterInstall.index >= releaseSmokeStep.index ||
     afterExecution.index <= releaseSmokeStep.index ||
     afterExecution.index !== preflightSteps.length - 1 ||
-    cleanlinessSteps.some(
+    [installStep, releaseSmokeStep, ...cleanlinessSteps].some(
       (step) =>
         step.condition !== undefined ||
         (step.continueOnError !== undefined && step.continueOnError !== false),
     )
   ) {
     throw new Error(
-      "Publication workflow preflight source-cleanliness checks must be ordered and fail closed.",
+      "Publication workflow preflight install, release smoke, and source-cleanliness checks must be ordered and fail closed.",
     );
   }
 }
