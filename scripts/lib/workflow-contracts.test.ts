@@ -9,6 +9,15 @@ import {
 } from "./workflow-contracts";
 
 const pinnedCheckout = "actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6";
+const pinnedCodecov =
+  "codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5.5.5";
+const codecovCondition =
+  "${{ !cancelled() && (steps.unit_tests.outcome == 'success' || steps.unit_tests.outcome == 'failure') }}";
+const codecovToken = "${{ secrets.CODECOV_TOKEN }}";
+const pinnedMergify =
+  "Mergifyio/gha-mergify-ci@8173bc3c1d337d3367454672d50cfdf6f0273396 # v23";
+const mergifyCondition =
+  "${{ !cancelled() && (steps.unit_tests.outcome == 'success' || steps.unit_tests.outcome == 'failure') && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) }}";
 const disabledPaths = [
   ".github/workflows/issue-labels.yml",
   ".github/workflows/pr-size.yml",
@@ -29,6 +38,21 @@ const policy = (): WorkflowPolicy => ({
       path: ".github/workflows/ci.yml",
       requiredOnDefaultBranch: true,
       triggers: ["pull_request", "push"],
+    },
+    {
+      path: ".github/workflows/dependency-review.yml",
+      requiredOnDefaultBranch: true,
+      triggers: ["pull_request"],
+    },
+    {
+      path: ".github/workflows/codeql.yml",
+      requiredOnDefaultBranch: true,
+      triggers: ["pull_request", "push", "schedule"],
+    },
+    {
+      path: ".github/workflows/release-drafter.yml",
+      requiredOnDefaultBranch: true,
+      triggers: ["push", "schedule", "workflow_dispatch"],
     },
     {
       path: ".github/workflows/upstream-watch.yml",
@@ -94,6 +118,50 @@ const macosStartupSmokeStep = [
   '          SYNARA_PORT_OFFSET: "2810"',
   "        run: bun run test:desktop-smoke",
 ].join("\n");
+const ciRootTestStep = [
+  "      - name: Test with coverage and JUnit",
+  "        id: unit_tests",
+  "        run: bun run test:ci",
+].join("\n");
+const codecovCoverageUploadStep = [
+  "      - name: Upload coverage reports to Codecov",
+  `        if: ${codecovCondition}`,
+  `        uses: ${pinnedCodecov}`,
+  "        with:",
+  `          token: ${codecovToken}`,
+  "          files: ./apps/desktop/coverage/lcov.info,./apps/server/coverage/lcov.info,./apps/web/coverage/lcov.info,./packages/contracts/coverage/lcov.info,./packages/shared/coverage/lcov.info,./scripts/coverage/lcov.info",
+  "          disable_search: true",
+  "          fail_ci_if_error: true",
+].join("\n");
+const codecovTestResultsUploadStep = [
+  "      - name: Upload test results to Codecov",
+  `        if: ${codecovCondition}`,
+  `        uses: ${pinnedCodecov}`,
+  "        with:",
+  `          token: ${codecovToken}`,
+  "          files: ./apps/desktop/test-report.junit.xml,./apps/server/test-report.junit.xml,./apps/web/test-report.junit.xml,./packages/contracts/test-report.junit.xml,./packages/shared/test-report.junit.xml,./scripts/test-report.junit.xml",
+  "          disable_search: true",
+  "          fail_ci_if_error: true",
+  "          report_type: test_results",
+].join("\n");
+const mergifyUploadStep = [
+  "      - name: Upload test results to Mergify CI Insights",
+  "        id: mergify_ci",
+  `        if: ${mergifyCondition}`,
+  `        uses: ${pinnedMergify}`,
+  "        with:",
+  "          action: junit-process",
+  "          token: ${{ secrets.MERGIFY_TOKEN }}",
+  "          job_name: quality",
+  "          report_path: >-",
+  "            ./apps/desktop/test-report.junit.xml",
+  "            ./apps/server/test-report.junit.xml",
+  "            ./apps/web/test-report.junit.xml",
+  "            ./packages/contracts/test-report.junit.xml",
+  "            ./packages/shared/test-report.junit.xml",
+  "            ./scripts/test-report.junit.xml",
+  "          test_step_outcome: ${{ steps.unit_tests.outcome }}",
+].join("\n");
 const ciWorkflow = `name: CI
 on:
   pull_request:
@@ -105,7 +173,10 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: ${pinnedCheckout}
-      - run: bun run test
+${ciRootTestStep}
+${mergifyUploadStep}
+${codecovCoverageUploadStep}
+${codecovTestResultsUploadStep}
   windows_x64:
     runs-on: windows-2022
     steps:
@@ -141,11 +212,102 @@ ${macosStartupSmokeStep}
           echo safe
 `;
 const watchWorkflow = `name: Watch\non:\n  schedule:\n    - cron: "17 */6 * * *"\n  workflow_dispatch:\npermissions:\n  contents: read\njobs:\n  inspect:\n    runs-on: ubuntu-24.04\n  report:\n    runs-on: ubuntu-24.04\n    permissions:\n      contents: read\n      issues: write\n`;
+const dependencyReviewWorkflow = `name: Dependency Review
+on:
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  dependency-review:
+    name: dependency-review
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+`;
+const codeqlWorkflow = `name: CodeQL
+on:
+  pull_request:
+  push:
+  schedule:
+    - cron: "41 6 * * 1"
+permissions:
+  contents: read
+jobs:
+  analyze_actions:
+    name: codeql-actions
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: github/codeql-action/init@e0647621c2984b5ed2f768cb892365bf2a616ad1 # v4.37.2
+        with:
+          languages: actions
+          build-mode: none
+      - uses: github/codeql-action/analyze@e0647621c2984b5ed2f768cb892365bf2a616ad1 # v4.37.2
+        with:
+          category: /language:actions
+  analyze_javascript_typescript:
+    name: codeql-javascript-typescript
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: github/codeql-action/init@e0647621c2984b5ed2f768cb892365bf2a616ad1 # v4.37.2
+        with:
+          languages: javascript-typescript
+          build-mode: none
+      - uses: github/codeql-action/analyze@e0647621c2984b5ed2f768cb892365bf2a616ad1 # v4.37.2
+        with:
+          category: /language:javascript-typescript
+  analyze_swift:
+    name: codeql-swift
+    runs-on: macos-15
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: github/codeql-action/init@e0647621c2984b5ed2f768cb892365bf2a616ad1 # v4.37.2
+        with:
+          languages: swift
+          build-mode: manual
+      - run: node apps/desktop/scripts/build-appsnap-helper.mjs --arch arm64 --output "\${{ runner.temp }}/synara-appsnap-helper"
+      - uses: github/codeql-action/analyze@e0647621c2984b5ed2f768cb892365bf2a616ad1 # v4.37.2
+        with:
+          category: /language:swift
+`;
+const releaseDrafterWorkflow = `name: Release Drafter
+on:
+  push:
+  schedule:
+    - cron: "23 14 * * 1"
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  draft:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: read
+    steps:
+      - uses: release-drafter/release-drafter@eada3c96a64734dd381cfbda23511034e328ddb0 # v7.6.0
+  dispatch:
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+      contents: read
+`;
 
 function validFiles(): Map<string, string> {
   return new Map([
     ...disabledPaths.map((path) => [path, disabledWorkflow] as const),
     [".github/workflows/ci.yml", ciWorkflow],
+    [".github/workflows/dependency-review.yml", dependencyReviewWorkflow],
+    [".github/workflows/codeql.yml", codeqlWorkflow],
+    [".github/workflows/release-drafter.yml", releaseDrafterWorkflow],
     [".github/workflows/upstream-watch.yml", watchWorkflow],
   ]);
 }
@@ -237,22 +399,19 @@ describe("workflow contracts", () => {
     const missingQualitySuite = validFiles();
     missingQualitySuite.set(
       ".github/workflows/ci.yml",
-      ciWorkflow.replace("      - run: bun run test\n", ""),
+      ciWorkflow.replace(`${ciRootTestStep}\n`, ""),
     );
     expect(validateWorkflowContracts(missingQualitySuite, policy()).join("\n")).toContain(
-      "quality must run exactly one bare bun run test suite",
+      "quality must run exactly one bun run test:ci suite",
     );
 
     const duplicateQualitySuite = validFiles();
     duplicateQualitySuite.set(
       ".github/workflows/ci.yml",
-      ciWorkflow.replace(
-        "      - run: bun run test\n",
-        "      - run: bun run test\n      - run: bun run test\n",
-      ),
+      ciWorkflow.replace(`${ciRootTestStep}\n`, `${ciRootTestStep}\n${ciRootTestStep}\n`),
     );
     expect(validateWorkflowContracts(duplicateQualitySuite, policy()).join("\n")).toContain(
-      "quality must run exactly one bare bun run test suite",
+      "quality must run exactly one bun run test:ci suite",
     );
 
     const swappedWindowsRunner = validFiles();
@@ -280,6 +439,168 @@ describe("workflow contracts", () => {
     );
     expect(validateWorkflowContracts(chainedReleaseSuite, policy()).join("\n")).toContain(
       "release_smoke must not own an additional or chained monorepo-wide bun run test suite",
+    );
+  });
+
+  it("requires fail-closed Codecov coverage and test-result uploads", () => {
+    const missingCoverageUpload = validFiles();
+    missingCoverageUpload.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace(`${codecovCoverageUploadStep}\n`, ""),
+    );
+    expect(validateWorkflowContracts(missingCoverageUpload, policy()).join("\n")).toContain(
+      "must define exactly one Upload coverage reports to Codecov step",
+    );
+
+    const wrongTestReportType = validFiles();
+    wrongTestReportType.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace("report_type: test_results", "report_type: coverage"),
+    );
+    expect(validateWorkflowContracts(wrongTestReportType, policy()).join("\n")).toContain(
+      "Upload test results to Codecov must set report_type to test_results",
+    );
+
+    const nonBlockingCoverageUpload = validFiles();
+    nonBlockingCoverageUpload.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace(
+        `${codecovCoverageUploadStep}`,
+        codecovCoverageUploadStep.replace("fail_ci_if_error: true", "fail_ci_if_error: false"),
+      ),
+    );
+    expect(validateWorkflowContracts(nonBlockingCoverageUpload, policy()).join("\n")).toContain(
+      "Upload coverage reports to Codecov must fail closed on Codecov upload errors",
+    );
+
+    const missingUnitTestId = validFiles();
+    missingUnitTestId.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace("        id: unit_tests\n", ""),
+    );
+    expect(validateWorkflowContracts(missingUnitTestId, policy()).join("\n")).toContain(
+      "bun run test:ci must use id unit_tests for report upload conditions",
+    );
+
+    const uploadBeforeTests = validFiles();
+    uploadBeforeTests.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow
+        .replace(`${codecovCoverageUploadStep}\n`, "")
+        .replace(`${ciRootTestStep}\n`, `${codecovCoverageUploadStep}\n${ciRootTestStep}\n`),
+    );
+    expect(validateWorkflowContracts(uploadBeforeTests, policy()).join("\n")).toContain(
+      "Upload coverage reports to Codecov must run after bun run test:ci",
+    );
+  });
+
+  it("requires fork-safe, fail-closed Mergify JUnit ingestion", () => {
+    const missingUpload = validFiles();
+    missingUpload.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace(`${mergifyUploadStep}\n`, ""),
+    );
+    expect(validateWorkflowContracts(missingUpload, policy()).join("\n")).toContain(
+      "must define exactly one Upload test results to Mergify CI Insights step",
+    );
+
+    const unsafeForkUpload = validFiles();
+    unsafeForkUpload.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace(mergifyCondition, codecovCondition),
+    );
+    expect(validateWorkflowContracts(unsafeForkUpload, policy()).join("\n")).toContain(
+      "Mergify upload must be completed-test and fork safe",
+    );
+
+    const wrongCredential = validFiles();
+    wrongCredential.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace("token: ${{ secrets.MERGIFY_TOKEN }}", "token: ${{ github.token }}"),
+    );
+    expect(validateWorkflowContracts(wrongCredential, policy()).join("\n")).toContain(
+      "Mergify upload must ingest only the six expected JUnit reports",
+    );
+  });
+
+  it("requires the pinned fail-closed Dependency Review lane", () => {
+    const wrongAction = validFiles();
+    wrongAction.set(
+      ".github/workflows/dependency-review.yml",
+      dependencyReviewWorkflow.replace(
+        "actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294",
+        "actions/dependency-review-action@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      ),
+    );
+    expect(validateWorkflowContracts(wrongAction, policy()).join("\n")).toContain(
+      "must run exactly one pinned Dependency Review v5 action",
+    );
+
+    const nonFailingReview = validFiles();
+    nonFailingReview.set(
+      ".github/workflows/dependency-review.yml",
+      dependencyReviewWorkflow.replace(
+        "      - uses: actions/dependency-review-action@",
+        "      - continue-on-error: true\n        uses: actions/dependency-review-action@",
+      ),
+    );
+    expect(validateWorkflowContracts(nonFailingReview, policy()).join("\n")).toContain(
+      "dependency review must be unconditional and fail closed",
+    );
+  });
+
+  it("locks CodeQL languages, permissions, action SHA, and result categories", () => {
+    const missingPermission = validFiles();
+    missingPermission.set(
+      ".github/workflows/codeql.yml",
+      codeqlWorkflow.replace("      security-events: write\n", ""),
+    );
+    expect(validateWorkflowContracts(missingPermission, policy()).join("\n")).toContain(
+      "codeql-actions must grant only required CodeQL permissions",
+    );
+
+    const wrongAction = validFiles();
+    wrongAction.set(
+      ".github/workflows/codeql.yml",
+      codeqlWorkflow.replaceAll(
+        "e0647621c2984b5ed2f768cb892365bf2a616ad1",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      ),
+    );
+    expect(validateWorkflowContracts(wrongAction, policy()).join("\n")).toContain(
+      "codeql-actions must initialize the expected language and build mode",
+    );
+
+    const wrongCategory = validFiles();
+    wrongCategory.set(
+      ".github/workflows/codeql.yml",
+      codeqlWorkflow.replace("category: /language:swift", "category: /language:javascript-typescript"),
+    );
+    expect(validateWorkflowContracts(wrongCategory, policy()).join("\n")).toContain(
+      "codeql-swift must publish the fixed analysis category",
+    );
+  });
+
+  it("limits release scheduling writes to draft contents and workflow dispatch", () => {
+    const excessiveDraftPermission = validFiles();
+    excessiveDraftPermission.set(
+      ".github/workflows/release-drafter.yml",
+      releaseDrafterWorkflow.replace("      pull-requests: read", "      pull-requests: write"),
+    );
+    expect(validateWorkflowContracts(excessiveDraftPermission, policy()).join("\n")).toContain(
+      "unsupported pull-requests: write at jobs.draft.permissions",
+    );
+
+    const excessiveDispatchPermission = validFiles();
+    excessiveDispatchPermission.set(
+      ".github/workflows/release-drafter.yml",
+      releaseDrafterWorkflow.replace(
+        "      actions: write\n      contents: read",
+        "      actions: write\n      contents: write",
+      ),
+    );
+    expect(validateWorkflowContracts(excessiveDispatchPermission, policy()).join("\n")).toContain(
+      "unsupported contents: write at jobs.dispatch.permissions",
     );
   });
 
@@ -582,6 +903,9 @@ describe("workflow contracts", () => {
     const states = [
       ...disabledPaths.map((path) => ({ path, state: "disabled_manually" })),
       { path: ".github/workflows/ci.yml", state: "active" },
+      { path: ".github/workflows/dependency-review.yml", state: "active" },
+      { path: ".github/workflows/codeql.yml", state: "active" },
+      { path: ".github/workflows/release-drafter.yml", state: "active" },
       { path: ".github/workflows/upstream-watch.yml", state: "active" },
     ];
     expect(validateRepositoryWorkflowStates(states, policy())).toEqual([]);

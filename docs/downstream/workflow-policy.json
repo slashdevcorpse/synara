@@ -30,6 +30,21 @@
       "triggers": ["pull_request", "push"]
     },
     {
+      "path": ".github/workflows/dependency-review.yml",
+      "requiredOnDefaultBranch": true,
+      "triggers": ["pull_request"]
+    },
+    {
+      "path": ".github/workflows/codeql.yml",
+      "requiredOnDefaultBranch": true,
+      "triggers": ["pull_request", "push", "schedule"]
+    },
+    {
+      "path": ".github/workflows/release-drafter.yml",
+      "requiredOnDefaultBranch": true,
+      "triggers": ["push", "schedule", "workflow_dispatch"]
+    },
+    {
       "path": ".github/workflows/upstream-watch.yml",
       "requiredOnDefaultBranch": true,
       "triggers": ["schedule", "workflow_dispatch"]

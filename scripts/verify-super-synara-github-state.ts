@@ -55,51 +55,81 @@ const required = (name: string): string => {
   return value;
 };
 const phase = required("--phase") as SuperSynaraReleasePhase;
-if (
-  !["preflight", "reserve-tag", "before-draft", "after-draft", "before-publish"].includes(phase)
-) {
+if (![
+  "preflight",
+  "before-draft",
+  "after-draft",
+  "before-publish",
+  "after-publish",
+].includes(phase)) {
   throw new Error(`Unsupported GitHub state phase: ${phase}.`);
 }
 const repository = required("--repository");
 const tag = required("--tag");
 const encodedTag = encodeURIComponent(tag);
-const refJson = runGh(["api", `repos/${repository}/git/ref/tags/${encodedTag}`], true);
-const refObject = refJson
-  ? (JSON.parse(refJson) as { object?: { sha?: string; type?: string } }).object
-  : undefined;
-const tagCommit = refObject?.sha ?? null;
-const tagObjectType = refObject?.type ?? null;
-const releasePages = JSON.parse(
-  runGh(["api", "--paginate", "--slurp", `repos/${repository}/releases?per_page=100`]),
-) as ReadonlyArray<
-  ReadonlyArray<{
-    id: number;
-    tag_name: string;
-    target_commitish: string;
-    draft: boolean;
-    prerelease: boolean;
-  }>
->;
-const releases: ReadonlyArray<GitHubReleaseState> = releasePages.flat().map((release) => ({
-  id: release.id,
-  tagName: release.tag_name,
-  targetCommitish: release.target_commitish,
-  draft: release.draft,
-  prerelease: release.prerelease,
-}));
 const draftIdInput = values.get("--current-run-draft-id");
-validateSuperSynaraGitHubState({
-  phase,
-  repository,
-  refName: required("--ref-name"),
-  actor: required("--actor"),
-  triggeringActor: required("--triggering-actor"),
-  owner: required("--owner"),
-  tag,
-  sourceCommit: required("--source-commit"),
-  tagCommit,
-  tagObjectType,
-  releases,
-  ...(draftIdInput ? { currentRunDraftId: Number(draftIdInput) } : {}),
-});
-console.log(`GitHub release state admitted for ${phase}.`);
+const refName = required("--ref-name");
+const actor = required("--actor");
+const triggeringActor = required("--triggering-actor");
+const owner = required("--owner");
+const sourceCommit = required("--source-commit");
+const visibilityAttempts = 30;
+let lastValidationError: unknown;
+
+for (let attempt = 1; attempt <= visibilityAttempts; attempt += 1) {
+  const refJson = runGh(["api", `repos/${repository}/git/ref/tags/${encodedTag}`], true);
+  const refObject = refJson
+    ? (JSON.parse(refJson) as { object?: { sha?: string; type?: string } }).object
+    : undefined;
+  const releasePages = JSON.parse(
+    runGh(["api", "--paginate", "--slurp", `repos/${repository}/releases?per_page=100`]),
+  ) as ReadonlyArray<
+    ReadonlyArray<{
+      id: number;
+      tag_name: string;
+      target_commitish: string;
+      name: string | null;
+      body: string | null;
+      draft: boolean;
+      prerelease: boolean;
+    }>
+  >;
+  const releases: ReadonlyArray<GitHubReleaseState> = releasePages.flat().map((release) => ({
+    id: release.id,
+    tagName: release.tag_name,
+    targetCommitish: release.target_commitish,
+    name: release.name ?? "",
+    body: release.body ?? "",
+    draft: release.draft,
+    prerelease: release.prerelease,
+  }));
+
+  try {
+    validateSuperSynaraGitHubState({
+      phase,
+      repository,
+      refName,
+      actor,
+      triggeringActor,
+      owner,
+      tag,
+      sourceCommit,
+      tagCommit: refObject?.sha ?? null,
+      tagObjectType: refObject?.type ?? null,
+      releases,
+      ...(draftIdInput ? { currentRunDraftId: Number(draftIdInput) } : {}),
+    });
+    console.log(`GitHub release state admitted for ${phase}.`);
+    process.exit(0);
+  } catch (error) {
+    lastValidationError = error;
+    if (attempt < visibilityAttempts) {
+      console.error(
+        `GitHub release state not yet visible for ${phase} (attempt ${attempt}/${visibilityAttempts}); retrying.`,
+      );
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1_000);
+    }
+  }
+}
+
+throw lastValidationError;

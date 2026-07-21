@@ -11,6 +11,24 @@ on:
         description: "Exact immutable tag (for example super-v0.5.5-super.1)"
         required: true
         type: string
+      expected_source_sha:
+        description: "Exact protected-main commit selected by Release Drafter"
+        required: true
+        type: string
+      release_draft_id:
+        description: "Exact owned Release Drafter draft ID"
+        required: true
+        type: string
+      controller_actor:
+        description: "Verified initiating actor from the release controller"
+        required: false
+        default: ""
+        type: string
+      controller_triggering_actor:
+        description: "Verified initiating rerun actor from the release controller"
+        required: false
+        default: ""
+        type: string
       release_scope:
         description: "Exact platform set to publish"
         required: true
@@ -30,6 +48,7 @@ permissions:
 
 concurrency:
   group: super-synara-prerelease
+  queue: max
   cancel-in-progress: false
 
 jobs:
@@ -43,6 +62,9 @@ jobs:
       release_scope: ${{ steps.meta.outputs.release_scope }}
       include_macos: ${{ steps.meta.outputs.include_macos }}
       asset_count: ${{ steps.meta.outputs.asset_count }}
+      release_draft_id: ${{ steps.meta.outputs.release_draft_id }}
+      validation_actor: ${{ steps.meta.outputs.validation_actor }}
+      validation_triggering_actor: ${{ steps.meta.outputs.validation_triggering_actor }}
       source_commit: ${{ steps.source.outputs.source_commit }}
       source_tag: ${{ steps.source.outputs.source_tag }}
       lockfile_sha256: ${{ steps.source.outputs.lockfile_sha256 }}
@@ -54,7 +76,7 @@ jobs:
       - name: Checkout exact workflow commit
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ inputs.expected_source_sha }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -89,10 +111,28 @@ jobs:
           RELEASE_SCOPE: ${{ inputs.release_scope }}
           CONFIRMED: ${{ inputs.confirm_unsigned }}
           REF_PROTECTED: ${{ github.ref_protected }}
+          EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+          WORKFLOW_SOURCE_SHA: ${{ github.sha }}
+          RELEASE_DRAFT_ID: ${{ inputs.release_draft_id }}
+          CONTROLLER_ACTOR: ${{ inputs.controller_actor }}
+          CONTROLLER_TRIGGERING_ACTOR: ${{ inputs.controller_triggering_actor }}
+          EVENT_ACTOR: ${{ github.actor }}
+          EVENT_TRIGGERING_ACTOR: ${{ github.triggering_actor }}
         run: |
           set -euo pipefail
           [[ "$CONFIRMED" == "true" ]]
           [[ "$REF_PROTECTED" == "true" ]]
+          [[ "$EXPECTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$WORKFLOW_SOURCE_SHA" == "$EXPECTED_SOURCE_SHA" ]]
+          [[ "$RELEASE_DRAFT_ID" =~ ^[1-9][0-9]*$ ]]
+          validation_actor="$EVENT_ACTOR"
+          validation_triggering_actor="$EVENT_TRIGGERING_ACTOR"
+          if [[ "$EVENT_ACTOR" == "github-actions[bot]" ]]; then
+            validation_actor="$CONTROLLER_ACTOR"
+            validation_triggering_actor="$CONTROLLER_TRIGGERING_ACTOR"
+          fi
+          [[ -n "$validation_actor" ]]
+          [[ -n "$validation_triggering_actor" ]]
           [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+-super\.[1-9][0-9]*$ ]]
           [[ "$TAG" == "super-v$VERSION" ]]
           case "$RELEASE_SCOPE" in
@@ -114,6 +154,19 @@ jobs:
           echo "release_scope=$RELEASE_SCOPE" >> "$GITHUB_OUTPUT"
           echo "include_macos=$include_macos" >> "$GITHUB_OUTPUT"
           echo "asset_count=$asset_count" >> "$GITHUB_OUTPUT"
+          echo "release_draft_id=$RELEASE_DRAFT_ID" >> "$GITHUB_OUTPUT"
+          echo "validation_actor=$validation_actor" >> "$GITHUB_OUTPUT"
+          echo "validation_triggering_actor=$validation_triggering_actor" >> "$GITHUB_OUTPUT"
+
+      - name: Require the exact scheduled protected-main commit
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+        run: |
+          set -euo pipefail
+          current_main_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)"
+          [[ "$current_main_sha" == "$EXPECTED_SOURCE_SHA" ]]
 
       - id: budget
         name: Bind repository artifact byte budgets
@@ -156,7 +209,7 @@ jobs:
         env:
           VERSION: ${{ steps.meta.outputs.version }}
           TAG: ${{ steps.meta.outputs.tag }}
-          SOURCE_COMMIT: ${{ github.sha }}
+          SOURCE_COMMIT: ${{ inputs.expected_source_sha }}
         run: |
           node scripts/verify-release-source-provenance.ts \
             "$VERSION" \
@@ -173,16 +226,20 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.meta.outputs.tag }}
+          DRAFT_ID: ${{ steps.meta.outputs.release_draft_id }}
+          VALIDATION_ACTOR: ${{ steps.meta.outputs.validation_actor }}
+          VALIDATION_TRIGGERING_ACTOR: ${{ steps.meta.outputs.validation_triggering_actor }}
         run: |
           node scripts/verify-super-synara-github-state.ts \
             --phase preflight \
             --repository "$GITHUB_REPOSITORY" \
             --ref-name "$GITHUB_REF_NAME" \
-            --actor "$GITHUB_ACTOR" \
-            --triggering-actor "$GITHUB_TRIGGERING_ACTOR" \
+            --actor "$VALIDATION_ACTOR" \
+            --triggering-actor "$VALIDATION_TRIGGERING_ACTOR" \
             --owner "$GITHUB_REPOSITORY_OWNER" \
             --tag "$TAG" \
-            --source-commit "$GITHUB_SHA"
+            --source-commit "$GITHUB_SHA" \
+            --current-run-draft-id "$DRAFT_ID"
 
       - name: Verify Super Synara identity
         run: bun run brand:check
@@ -211,72 +268,9 @@ jobs:
       - name: Verify preflight preserved source
         run: node scripts/verify-release-worktree-clean.ts
 
-  reserve_tag:
-    name: Reserve immutable downstream tag
-    needs: preflight
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    permissions:
-      contents: write
-    steps:
-      - name: Checkout exact source
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
-        with:
-          ref: ${{ needs.preflight.outputs.source_commit }}
-          fetch-depth: 0
-
-      - name: Validate reservation state
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.preflight.outputs.tag }}
-          SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
-        run: |
-          node scripts/verify-super-synara-github-state.ts \
-            --phase reserve-tag \
-            --repository "$GITHUB_REPOSITORY" \
-            --ref-name "$GITHUB_REF_NAME" \
-            --actor "$GITHUB_ACTOR" \
-            --triggering-actor "$GITHUB_TRIGGERING_ACTOR" \
-            --owner "$GITHUB_REPOSITORY_OWNER" \
-            --tag "$TAG" \
-            --source-commit "$SOURCE_COMMIT"
-
-      - name: Create lightweight tag only when absent
-        shell: bash
-        env:
-          TAG: ${{ needs.preflight.outputs.tag }}
-          SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
-        run: |
-          set -euo pipefail
-          if git show-ref --verify --quiet "refs/tags/$TAG"; then
-            [[ "$(git cat-file -t "$TAG")" == "commit" ]]
-            [[ "$(git rev-parse "$TAG")" == "$SOURCE_COMMIT" ]]
-          else
-            git tag "$TAG" "$SOURCE_COMMIT"
-            git push origin "refs/tags/$TAG"
-          fi
-
-      - name: Revalidate reserved tag
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.preflight.outputs.tag }}
-          SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
-        run: |
-          node scripts/verify-super-synara-github-state.ts \
-            --phase reserve-tag \
-            --repository "$GITHUB_REPOSITORY" \
-            --ref-name "$GITHUB_REF_NAME" \
-            --actor "$GITHUB_ACTOR" \
-            --triggering-actor "$GITHUB_TRIGGERING_ACTOR" \
-            --owner "$GITHUB_REPOSITORY_OWNER" \
-            --tag "$TAG" \
-            --source-commit "$SOURCE_COMMIT"
-
   windows_x64:
     name: Build unsigned Windows x64 installer
-    needs: [preflight, reserve_tag]
+    needs: preflight
     runs-on: windows-2022
     timeout-minutes: 45
     steps:
@@ -542,7 +536,7 @@ jobs:
 
   macos_arm64:
     name: Build unsigned macOS arm64 disk image
-    needs: [preflight, reserve_tag]
+    needs: preflight
     if: ${{ needs.preflight.outputs.include_macos == 'true' }}
     runs-on: macos-15
     timeout-minutes: 45
@@ -709,11 +703,10 @@ jobs:
 
   publish:
     name: Admit and publish exact unsigned prerelease
-    needs: [preflight, reserve_tag, windows_x64, macos_arm64]
+    needs: [preflight, windows_x64, macos_arm64]
     if: >-
       ${{ always() &&
           needs.preflight.result == 'success' &&
-          needs.reserve_tag.result == 'success' &&
           needs.windows_x64.result == 'success' &&
           ((needs.preflight.outputs.include_macos == 'true' && needs.macos_arm64.result == 'success') ||
            (needs.preflight.outputs.include_macos == 'false' && needs.macos_arm64.result == 'skipped')) }}
@@ -759,22 +752,26 @@ jobs:
           name: super-synara-macos-arm64
           path: release-stage
 
-      - name: Validate state before draft creation
+      - name: Validate exact Release Drafter draft before staging
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.preflight.outputs.tag }}
           SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
+          DRAFT_ID: ${{ needs.preflight.outputs.release_draft_id }}
+          VALIDATION_ACTOR: ${{ needs.preflight.outputs.validation_actor }}
+          VALIDATION_TRIGGERING_ACTOR: ${{ needs.preflight.outputs.validation_triggering_actor }}
         run: |
           node scripts/verify-super-synara-github-state.ts \
             --phase before-draft \
             --repository "$GITHUB_REPOSITORY" \
             --ref-name "$GITHUB_REF_NAME" \
-            --actor "$GITHUB_ACTOR" \
-            --triggering-actor "$GITHUB_TRIGGERING_ACTOR" \
+            --actor "$VALIDATION_ACTOR" \
+            --triggering-actor "$VALIDATION_TRIGGERING_ACTOR" \
             --owner "$GITHUB_REPOSITORY_OWNER" \
             --tag "$TAG" \
-            --source-commit "$SOURCE_COMMIT"
+            --source-commit "$SOURCE_COMMIT" \
+            --current-run-draft-id "$DRAFT_ID"
 
       - name: Prepare exact scoped release set
         shell: bash
@@ -805,36 +802,22 @@ jobs:
             --max-total-bytes "$MAX_TOTAL_BYTES"
 
       - id: draft
-        name: Create owned draft prerelease
+        name: Adopt exact owned Release Drafter draft
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ needs.preflight.outputs.version }}
           TAG: ${{ needs.preflight.outputs.tag }}
           SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
+          DRAFT_ID: ${{ needs.preflight.outputs.release_draft_id }}
         run: |
           set -euo pipefail
-          gh release create "$TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --target "$SOURCE_COMMIT" \
-            --title "Unofficial downstream Super Synara $VERSION (unsigned prerelease)" \
-            --notes-file release-stage/UNSIGNED-BUILD.md \
-            --draft \
-            --prerelease \
-            --verify-tag \
-            --latest=false
-          releases_json="$(
-            gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100"
-          )"
-          draft_id="$(
-            jq -er \
-              --arg tag "$TAG" \
-              --arg source_commit "$SOURCE_COMMIT" \
-              '[.[][] | select(.tag_name == $tag and .draft == true and .prerelease == true and .target_commitish == $source_commit)] | if length == 1 then .[0].id else error("expected one owned draft") end' \
-              <<< "$releases_json"
-          )"
-          [[ "$draft_id" =~ ^[1-9][0-9]*$ ]]
-          echo "id=$draft_id" >> "$GITHUB_OUTPUT"
+          [[ "$DRAFT_ID" =~ ^[1-9][0-9]*$ ]]
+          release="$(gh api "repos/$GITHUB_REPOSITORY/releases/$DRAFT_ID")"
+          [[ "$(jq -r .tag_name <<< "$release")" == "$TAG" ]]
+          [[ "$(jq -r .target_commitish <<< "$release")" == "$SOURCE_COMMIT" ]]
+          [[ "$(jq -r .draft <<< "$release")" == "true" ]]
+          [[ "$(jq -r .prerelease <<< "$release")" == "true" ]]
+          echo "id=$DRAFT_ID" >> "$GITHUB_OUTPUT"
 
       - name: Validate exact current-run draft
         shell: bash
@@ -843,13 +826,15 @@ jobs:
           TAG: ${{ needs.preflight.outputs.tag }}
           SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
           DRAFT_ID: ${{ steps.draft.outputs.id }}
+          VALIDATION_ACTOR: ${{ needs.preflight.outputs.validation_actor }}
+          VALIDATION_TRIGGERING_ACTOR: ${{ needs.preflight.outputs.validation_triggering_actor }}
         run: |
           node scripts/verify-super-synara-github-state.ts \
             --phase after-draft \
             --repository "$GITHUB_REPOSITORY" \
             --ref-name "$GITHUB_REF_NAME" \
-            --actor "$GITHUB_ACTOR" \
-            --triggering-actor "$GITHUB_TRIGGERING_ACTOR" \
+            --actor "$VALIDATION_ACTOR" \
+            --triggering-actor "$VALIDATION_TRIGGERING_ACTOR" \
             --owner "$GITHUB_REPOSITORY_OWNER" \
             --tag "$TAG" \
             --source-commit "$SOURCE_COMMIT" \
@@ -861,6 +846,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.preflight.outputs.tag }}
           VERSION: ${{ needs.preflight.outputs.version }}
+          DRAFT_ID: ${{ steps.draft.outputs.id }}
           INCLUDE_MACOS: ${{ needs.preflight.outputs.include_macos }}
           EXPECTED_ASSET_COUNT: ${{ needs.preflight.outputs.asset_count }}
         run: |
@@ -883,7 +869,23 @@ jobs:
           )
           [[ "${#assets[@]}" -eq "$EXPECTED_ASSET_COUNT" ]]
           for asset in "${assets[@]}"; do [[ -f "$asset" ]]; done
-          gh release upload "$TAG" "${assets[@]}" --repo "$GITHUB_REPOSITORY"
+
+          declare -A expected_names=()
+          for asset in "${assets[@]}"; do
+            asset_name="$(basename "$asset")"
+            [[ -z "${expected_names[$asset_name]+present}" ]]
+            expected_names["$asset_name"]=1
+          done
+
+          existing_assets_json="$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases/$DRAFT_ID/assets?per_page=100")"
+          [[ "$(jq '[.[][]] | length' <<< "$existing_assets_json")" -le "$EXPECTED_ASSET_COUNT" ]]
+          while IFS= read -r existing_name; do
+            [[ -n "$existing_name" ]]
+            [[ -n "${expected_names[$existing_name]+present}" ]]
+          done < <(jq -r '.[][] | .name' <<< "$existing_assets_json")
+          [[ "$(jq '[.[][] | .name] | length' <<< "$existing_assets_json")" -eq "$(jq '[.[][] | .name] | unique | length' <<< "$existing_assets_json")" ]]
+
+          gh release upload "$TAG" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
 
       - name: Redownload and compare uploaded bytes
         shell: bash
@@ -957,13 +959,17 @@ jobs:
           TAG: ${{ needs.preflight.outputs.tag }}
           SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
           DRAFT_ID: ${{ steps.draft.outputs.id }}
+          VALIDATION_ACTOR: ${{ needs.preflight.outputs.validation_actor }}
+          VALIDATION_TRIGGERING_ACTOR: ${{ needs.preflight.outputs.validation_triggering_actor }}
         run: |
+          current_main_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)"
+          [[ "$current_main_sha" == "$SOURCE_COMMIT" ]]
           node scripts/verify-super-synara-github-state.ts \
             --phase before-publish \
             --repository "$GITHUB_REPOSITORY" \
             --ref-name "$GITHUB_REF_NAME" \
-            --actor "$GITHUB_ACTOR" \
-            --triggering-actor "$GITHUB_TRIGGERING_ACTOR" \
+            --actor "$VALIDATION_ACTOR" \
+            --triggering-actor "$VALIDATION_TRIGGERING_ACTOR" \
             --owner "$GITHUB_REPOSITORY_OWNER" \
             --tag "$TAG" \
             --source-commit "$SOURCE_COMMIT" \
@@ -974,12 +980,36 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           DRAFT_ID: ${{ steps.draft.outputs.id }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
+          VALIDATION_ACTOR: ${{ needs.preflight.outputs.validation_actor }}
+          VALIDATION_TRIGGERING_ACTOR: ${{ needs.preflight.outputs.validation_triggering_actor }}
         run: |
-          gh api --method PATCH \
+          set -euo pipefail
+          published="$(gh api --method PATCH \
             "repos/$GITHUB_REPOSITORY/releases/$DRAFT_ID" \
+            -f tag_name="$TAG" \
+            -f target_commitish="$SOURCE_COMMIT" \
             -F draft=false \
             -F prerelease=true \
-            -f make_latest=false
+            -f make_latest=false)"
+          [[ "$(jq -r .id <<< "$published")" == "$DRAFT_ID" ]]
+          [[ "$(jq -r .tag_name <<< "$published")" == "$TAG" ]]
+          [[ "$(jq -r .target_commitish <<< "$published")" == "$SOURCE_COMMIT" ]]
+          [[ "$(jq -r .draft <<< "$published")" == "false" ]]
+          [[ "$(jq -r .prerelease <<< "$published")" == "true" ]]
+          [[ "$(jq -r .published_at <<< "$published")" != "null" ]]
+
+          node scripts/verify-super-synara-github-state.ts \
+            --phase after-publish \
+            --repository "$GITHUB_REPOSITORY" \
+            --ref-name "$GITHUB_REF_NAME" \
+            --actor "$VALIDATION_ACTOR" \
+            --triggering-actor "$VALIDATION_TRIGGERING_ACTOR" \
+            --owner "$GITHUB_REPOSITORY_OWNER" \
+            --tag "$TAG" \
+            --source-commit "$SOURCE_COMMIT" \
+            --current-run-draft-id "$DRAFT_ID"
 
       - name: Verify public prerelease state
         shell: bash

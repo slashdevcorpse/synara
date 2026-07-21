@@ -30,7 +30,7 @@ const PREFLIGHT_ROUTE_TREE_SETUP_COMMAND = [
 ].join("\n");
 const MACOS_JOB_CONDITION = "${{ needs.preflight.outputs.include_macos == 'true' }}";
 const PUBLISH_JOB_CONDITION =
-  "${{ always() && needs.preflight.result == 'success' && needs.reserve_tag.result == 'success' && needs.windows_x64.result == 'success' && ((needs.preflight.outputs.include_macos == 'true' && needs.macos_arm64.result == 'success') || (needs.preflight.outputs.include_macos == 'false' && needs.macos_arm64.result == 'skipped')) }}";
+  "${{ always() && needs.preflight.result == 'success' && needs.windows_x64.result == 'success' && ((needs.preflight.outputs.include_macos == 'true' && needs.macos_arm64.result == 'success') || (needs.preflight.outputs.include_macos == 'false' && needs.macos_arm64.result == 'skipped')) }}";
 
 function isRecord(value: unknown): value is UnknownRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -120,6 +120,17 @@ function verifyReleaseScopeCase(preflightJob: UnknownRecord): void {
     "set -euo pipefail",
     '[[ "$CONFIRMED" == "true" ]]',
     '[[ "$REF_PROTECTED" == "true" ]]',
+    '[[ "$EXPECTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]',
+    '[[ "$WORKFLOW_SOURCE_SHA" == "$EXPECTED_SOURCE_SHA" ]]',
+    '[[ "$RELEASE_DRAFT_ID" =~ ^[1-9][0-9]*$ ]]',
+    'validation_actor="$EVENT_ACTOR"',
+    'validation_triggering_actor="$EVENT_TRIGGERING_ACTOR"',
+    'if [[ "$EVENT_ACTOR" == "github-actions[bot]" ]]; then',
+    'validation_actor="$CONTROLLER_ACTOR"',
+    'validation_triggering_actor="$CONTROLLER_TRIGGERING_ACTOR"',
+    "fi",
+    '[[ -n "$validation_actor" ]]',
+    '[[ -n "$validation_triggering_actor" ]]',
     '[[ "$VERSION" =~ ^[0-9]+\\.[0-9]+\\.[0-9]+-super\\.[1-9][0-9]*$ ]]',
     '[[ "$TAG" == "super-v$VERSION" ]]',
   ];
@@ -129,6 +140,9 @@ function verifyReleaseScopeCase(preflightJob: UnknownRecord): void {
     'echo "release_scope=$RELEASE_SCOPE" >> "$GITHUB_OUTPUT"',
     'echo "include_macos=$include_macos" >> "$GITHUB_OUTPUT"',
     'echo "asset_count=$asset_count" >> "$GITHUB_OUTPUT"',
+    'echo "release_draft_id=$RELEASE_DRAFT_ID" >> "$GITHUB_OUTPUT"',
+    'echo "validation_actor=$validation_actor" >> "$GITHUB_OUTPUT"',
+    'echo "validation_triggering_actor=$validation_triggering_actor" >> "$GITHUB_OUTPUT"',
   ];
   if (
     JSON.stringify(lines.slice(0, caseStart)) !== JSON.stringify(expectedPrefix) ||
@@ -472,8 +486,9 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
     prohibitText(workflow, "secrets.", `${label} must not consume signing or publication secrets.`);
     prohibitText(workflow, "id-token:", `${label} must not request identity-token permission.`);
   }
+  requireText(main, "queue: max", "Publication workflow must preserve every serialized rerun.");
 
-  for (const job of ["preflight", "reserve_tag", "windows_x64", "macos_arm64", "publish"]) {
+  for (const job of ["preflight", "windows_x64", "macos_arm64", "publish"]) {
     requireText(main, `\n  ${job}:`, `Publication workflow is missing the ${job} job.`);
   }
   const jobs = publicationJobs(main);
@@ -541,37 +556,24 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
     throw new Error("Publication workflow must define publish steps.");
   }
   const draftStep = publishSteps.find(
-    (step) => isRecord(step) && step.name === "Create owned draft prerelease",
+    (step) => isRecord(step) && step.name === "Adopt exact owned Release Drafter draft",
   );
   if (!isRecord(draftStep) || typeof draftStep.run !== "string") {
-    throw new Error("Publication workflow must define the owned draft creation step.");
+    throw new Error("Publication workflow must define the exact Release Drafter adoption step.");
   }
-  const draftCommands = continuedShellCommands(draftStep.run, "gh api");
-  if (draftCommands.some((command) => command.includes("--slurp") && command.includes("--jq"))) {
-    throw new Error(
-      "Publication draft lookup must not combine the incompatible gh api --slurp and --jq flags.",
-    );
-  }
-  const releaseQueryCommands = draftCommands.filter((command) =>
-    command.includes('"repos/$GITHUB_REPOSITORY/releases?per_page=100"'),
-  );
-  if (
-    releaseQueryCommands.length !== 1 ||
-    !releaseQueryCommands[0]!.includes("gh api --paginate --slurp")
-  ) {
-    throw new Error(
-      "Publication draft lookup must capture the complete paginated release response.",
-    );
-  }
-  const draftFilterCommands = continuedShellCommands(draftStep.run, "jq -er");
-  if (
-    draftFilterCommands.length !== 1 ||
-    !draftFilterCommands[0]!.includes('--arg tag "$TAG"') ||
-    !draftFilterCommands[0]!.includes('--arg source_commit "$SOURCE_COMMIT"') ||
-    !draftFilterCommands[0]!.includes('<<< "$releases_json"')
-  ) {
-    throw new Error(
-      "Publication draft lookup must filter the captured response with standalone jq arguments.",
+  for (const adoptionNeedle of [
+    '[[ "$DRAFT_ID" =~ ^[1-9][0-9]*$ ]]',
+    'gh api "repos/$GITHUB_REPOSITORY/releases/$DRAFT_ID"',
+    '[[ "$(jq -r .tag_name <<< "$release")" == "$TAG" ]]',
+    '[[ "$(jq -r .target_commitish <<< "$release")" == "$SOURCE_COMMIT" ]]',
+    '[[ "$(jq -r .draft <<< "$release")" == "true" ]]',
+    '[[ "$(jq -r .prerelease <<< "$release")" == "true" ]]',
+    'echo "id=$DRAFT_ID" >> "$GITHUB_OUTPUT"',
+  ]) {
+    requireText(
+      draftStep.run,
+      adoptionNeedle,
+      "Publication must adopt only the exact planned Release Drafter draft ID, tag, and source SHA.",
     );
   }
   const macosDownloadStep = publishSteps.find(
@@ -671,10 +673,10 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
   }
   for (const phase of [
     "preflight",
-    "reserve-tag",
     "before-draft",
     "after-draft",
     "before-publish",
+    "after-publish",
   ]) {
     requireText(main, `--phase ${phase}`, `Publication must validate GitHub state at ${phase}.`);
   }
@@ -848,6 +850,21 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
     'if [[ "$INCLUDE_MACOS" == "true" ]]; then',
     "Publication must add macOS assets only for the combined scope.",
   );
+  requireText(
+    main,
+    'existing_assets_json="$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases/$DRAFT_ID/assets?per_page=100")"',
+    "Publication retries must inspect only the admitted draft's existing assets.",
+  );
+  requireText(
+    main,
+    '[[ -n "${expected_names[$existing_name]+present}" ]]',
+    "Publication retries must reject unexpected existing draft assets.",
+  );
+  requireText(
+    main,
+    "[.[][] | .name] | unique | length",
+    "Publication retries must reject duplicate existing draft asset names.",
+  );
   for (const asset of [
     "windows-x64-unsigned.exe",
     "macos-arm64-unsigned.dmg",
@@ -860,13 +877,32 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
   ]) {
     requireText(main, asset, `Publication contract is missing ${asset}.`);
   }
-  requireText(main, "gh release create", "Publication must start from an owned GitHub draft.");
+  prohibitText(main, "gh release create", "Publication must never create an arbitrary release draft.");
   requireText(
     main,
-    '--title "Unofficial downstream Super Synara $VERSION (unsigned prerelease)"',
-    "Release title must prominently identify the unofficial downstream and unsigned prerelease.",
+    "Adopt exact owned Release Drafter draft",
+    "Publication must adopt the exact owned Release Drafter draft.",
   );
-  requireText(main, "gh release upload", "Publication must upload to the owned draft.");
+  requireText(
+    main,
+    'gh release upload "$TAG" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber',
+    "Publication must replace only the exact expected assets on the owned draft during recovery.",
+  );
+  prohibitText(
+    main,
+    'git push origin "refs/tags/$TAG"',
+    "Publication must not reserve an immutable tag before atomic draft publication.",
+  );
+  requireText(
+    main,
+    'published="$(gh api --method PATCH',
+    "Publication must create the immutable tag through the atomic GitHub draft publication transition.",
+  );
+  requireText(
+    main,
+    '-f tag_name="$TAG" \\\n            -f target_commitish="$SOURCE_COMMIT"',
+    "Atomic draft publication must bind the exact immutable tag and source commit.",
+  );
   requireText(main, "cmp ", "Publication must compare redownloaded bytes exactly.");
   requireText(main, "make_latest=false", "Unsigned prerelease must not become GitHub Latest.");
   prohibitText(
@@ -874,7 +910,6 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
     "gh release delete",
     "Failure handling must never delete a draft automatically.",
   );
-  prohibitText(main, "--clobber", "Draft assets must never be silently overwritten on rerun.");
   for (const prohibitedAsset of [".blockmap", "latest.yml", "latest-mac.yml", ".AppImage"]) {
     prohibitText(main, prohibitedAsset, `Publication must not expose ${prohibitedAsset}.`);
   }
@@ -930,6 +965,230 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
   prohibitText(audit, "git push", "Audit must not mutate repository refs.");
 }
 
+const RELEASE_DRAFTER_ACTION =
+  "release-drafter/release-drafter@eada3c96a64734dd381cfbda23511034e328ddb0";
+const RELEASE_DRAFTER_GATE_CONDITION = "steps.changes.outputs.should_release == 'true'";
+const RELEASE_DRAFTER_DISPATCH_CONDITION =
+  "${{ github.event_name != 'push' && needs.draft.outputs.should_release == 'true' }}";
+
+export function verifySuperSynaraReleaseDrafterText(
+  schedulerText: string,
+  configText: string,
+): void {
+  const scheduler = schedulerText.replaceAll("\r\n", "\n");
+  const config = configText.replaceAll("\r\n", "\n");
+  const workflow = publicationWorkflow(scheduler);
+  const triggers = workflow.on;
+  if (!isRecord(triggers)) {
+    throw new Error("Release Drafter scheduler must define explicit triggers.");
+  }
+  const push = triggers.push;
+  const schedule = triggers.schedule;
+  const dispatch = triggers.workflow_dispatch;
+  if (
+    !isRecord(push) ||
+    JSON.stringify(push.branches) !== JSON.stringify(["main"]) ||
+    !Array.isArray(schedule) ||
+    schedule.length !== 1 ||
+    !isRecord(schedule[0]) ||
+    schedule[0].cron !== "23 14 * * 1" ||
+    !isRecord(dispatch)
+  ) {
+    throw new Error(
+      "Release Drafter scheduler must run on protected main pushes, one weekly cron, and manual dispatch only.",
+    );
+  }
+  prohibitText(scheduler, "pull_request:", "Release Drafter scheduler must not run on pull requests.");
+  requireText(
+    scheduler,
+    "group: super-synara-prerelease\n  queue: max\n  cancel-in-progress: false",
+    "Release Drafter scheduler must serialize draft mutation with artifact publication.",
+  );
+  requirePinnedActions(scheduler, "Release Drafter scheduler");
+  prohibitText(
+    scheduler,
+    "secrets.",
+    "Release Drafter scheduler must use only the scoped GitHub token.",
+  );
+  prohibitText(
+    scheduler,
+    "id-token:",
+    "Release Drafter scheduler must not request identity-token permission.",
+  );
+
+  const jobs = publicationJobs(scheduler);
+  const draftJob = publicationJob(jobs, "draft");
+  const dispatchJob = publicationJob(jobs, "dispatch");
+  const draftOutputs = draftJob.outputs;
+  if (
+    !isRecord(draftOutputs) ||
+    draftOutputs.should_release !== "${{ steps.changes.outputs.should_release }}"
+  ) {
+    throw new Error("Release Drafter scheduler must expose the no-change gate to dispatch.");
+  }
+  const draftSteps = draftJob.steps;
+  if (!Array.isArray(draftSteps)) {
+    throw new Error("Release Drafter scheduler must define draft steps.");
+  }
+  const gateIndex = draftSteps.findIndex((step) => isRecord(step) && step.id === "changes");
+  const authorizationIndex = draftSteps.findIndex(
+    (step) => isRecord(step) && step.name === "Authorize manual release controller before mutation",
+  );
+  const actionIndex = draftSteps.findIndex(
+    (step) => isRecord(step) && step.id === "release_drafter",
+  );
+  if (
+    gateIndex < 0 ||
+    authorizationIndex < 0 ||
+    actionIndex < 0 ||
+    gateIndex >= authorizationIndex ||
+    authorizationIndex >= actionIndex
+  ) {
+    throw new Error(
+      "Release Drafter scheduler must prove new commits and authorize manual actors before Release Drafter can mutate a draft.",
+    );
+  }
+  const gateStep = draftSteps[gateIndex];
+  const actionStep = draftSteps[actionIndex];
+  if (!isRecord(gateStep) || typeof gateStep.run !== "string" || !isRecord(actionStep)) {
+    throw new Error("Release Drafter scheduler must define a fail-closed no-change gate.");
+  }
+  for (const gateNeedle of [
+    '[[ "$(git rev-parse "$LATEST_TAG^{commit}")" == "$LATEST_TAG_COMMIT" ]]',
+    'git merge-base --is-ancestor "$LATEST_TAG_COMMIT" "$SOURCE_SHA"',
+    'commit_count="$(git rev-list --count "$LATEST_TAG_COMMIT..$SOURCE_SHA")"',
+    'if [[ "$commit_count" == "0" ]]; then',
+    'echo "should_release=false" >> "$GITHUB_OUTPUT"',
+    'echo "should_release=true" >> "$GITHUB_OUTPUT"',
+  ]) {
+    requireText(
+      gateStep.run,
+      gateNeedle,
+      "Release Drafter scheduler no-change gate must fail closed before draft mutation.",
+    );
+  }
+  prohibitText(
+    gateStep.run,
+    "exit 0",
+    "Release Drafter scheduler must not bypass commit counting for push reruns.",
+  );
+  const authorizationStep = draftSteps[authorizationIndex];
+  if (
+    !isRecord(authorizationStep) ||
+    authorizationStep.if !== "github.event_name == 'workflow_dispatch'" ||
+    typeof authorizationStep.run !== "string" ||
+    JSON.stringify(executableShellLines(authorizationStep.run)) !==
+      JSON.stringify([
+        "set -euo pipefail",
+        '[[ "$ACTOR" == "$OWNER" ]]',
+        '[[ "$TRIGGERING_ACTOR" == "$OWNER" ]]',
+      ])
+  ) {
+    throw new Error(
+      "Release Drafter manual dispatch must authorize the real owner before any draft mutation.",
+    );
+  }
+  requireText(
+    scheduler,
+    "github.event_name == 'workflow_dispatch' && github.actor || 'github-actions[bot]'",
+    "Release Drafter manual dispatch must preserve the initiating actor.",
+  );
+  for (const actorBinding of [
+    '-f "controller_actor=$CONTROLLER_ACTOR"',
+    '-f "controller_triggering_actor=$CONTROLLER_TRIGGERING_ACTOR"',
+  ]) {
+    requireText(
+      scheduler,
+      actorBinding,
+      "Release Drafter dispatch must propagate verified controller provenance.",
+    );
+  }
+  if (
+    actionStep.uses !== RELEASE_DRAFTER_ACTION ||
+    actionStep.if !== RELEASE_DRAFTER_GATE_CONDITION ||
+    !isRecord(actionStep.with) ||
+    actionStep.with.publish !== false ||
+    actionStep.with.prerelease !== true ||
+    actionStep.with.latest !== false ||
+    actionStep.with.commitish !== "${{ steps.source.outputs.source_sha }}"
+  ) {
+    throw new Error(
+      "Release Drafter action must be exact-source, draft-only, prerelease-only, non-Latest, pinned, and gated on changes.",
+    );
+  }
+  for (const stepName of [
+    "Admit only the planned Release Drafter draft",
+    "Reject a raced main update",
+  ]) {
+    const step = draftSteps.find((candidate) => isRecord(candidate) && candidate.name === stepName);
+    if (!isRecord(step) || step.if !== RELEASE_DRAFTER_GATE_CONDITION) {
+      throw new Error(
+        "Release Drafter scheduler must gate all post-action draft work on new commits.",
+      );
+    }
+  }
+  if (dispatchJob.if !== RELEASE_DRAFTER_DISPATCH_CONDITION) {
+    throw new Error(
+      "Release Drafter dispatch must be unreachable for pushes and no-change schedules.",
+    );
+  }
+  requireText(
+    scheduler,
+    '-f "expected_source_sha=$SOURCE_SHA"',
+    "Release Drafter dispatch must bind the exact protected-main SHA.",
+  );
+  requireText(
+    scheduler,
+    '-f "release_draft_id=$DRAFT_ID"',
+    "Release Drafter dispatch must bind the exact owned draft ID.",
+  );
+
+  for (const configNeedle of [
+    'tag-template: "super-v$RESOLVED_VERSION"',
+    'tag-prefix: "super-v"',
+    "<!-- super-synara-release-drafter-owned -->",
+    "unofficial, unsigned Super Synara prerelease",
+    "Installation updates remain manual",
+    "This prerelease is never the GitHub Latest release",
+    "$PREVIOUS_TAG...super-v$RESOLVED_VERSION",
+  ]) {
+    requireText(config, configNeedle, `Release Drafter config is missing ${configNeedle}.`);
+  }
+  prohibitText(
+    `${scheduler}\n${config}`,
+    "semantic-release",
+    "Super Synara release automation must use exactly one release system.",
+  );
+}
+
+export function verifySuperSynaraGithubStateScriptText(script: string): void {
+  script = script.replaceAll("\r\n", "\n");
+  const orderedNeedles = [
+    "const visibilityAttempts = 30;",
+    "for (let attempt = 1; attempt <= visibilityAttempts; attempt += 1)",
+    "validateSuperSynaraGitHubState({",
+    "} catch (error) {",
+    "if (attempt < visibilityAttempts)",
+    "Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1_000);",
+    "throw lastValidationError;",
+  ];
+  let previousIndex = -1;
+  for (const needle of orderedNeedles) {
+    const index = script.indexOf(needle);
+    if (index <= previousIndex) {
+      throw new Error(
+        "GitHub release-state verification must retry visibility boundedly and fail closed.",
+      );
+    }
+    previousIndex = index;
+  }
+  requireText(
+    script,
+    "const releasePages = JSON.parse(\n    runGh([\"api\", \"--paginate\", \"--slurp\", `repos/${repository}/releases?per_page=100`]),",
+    "GitHub release-state visibility retries must re-read the complete release list.",
+  );
+}
+
 export function verifySuperSynaraWorkflowContracts(repoRoot: string): void {
   verifySuperSynaraWorkflowText(
     readFileSync(resolve(repoRoot, ".github/workflows/super-synara-prerelease.yml"), "utf8"),
@@ -937,5 +1196,12 @@ export function verifySuperSynaraWorkflowContracts(repoRoot: string): void {
       resolve(repoRoot, ".github/workflows/super-synara-macos-signature-audit.yml"),
       "utf8",
     ),
+  );
+  verifySuperSynaraReleaseDrafterText(
+    readFileSync(resolve(repoRoot, ".github/workflows/release-drafter.yml"), "utf8"),
+    readFileSync(resolve(repoRoot, ".github/release-drafter.yml"), "utf8"),
+  );
+  verifySuperSynaraGithubStateScriptText(
+    readFileSync(resolve(repoRoot, "scripts/verify-super-synara-github-state.ts"), "utf8"),
   );
 }

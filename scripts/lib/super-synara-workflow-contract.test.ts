@@ -5,6 +5,8 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 import {
+  verifySuperSynaraGithubStateScriptText,
+  verifySuperSynaraReleaseDrafterText,
   verifySuperSynaraWorkflowContracts,
   verifySuperSynaraWorkflowText,
 } from "./super-synara-workflow-contract.ts";
@@ -18,10 +20,39 @@ const audit = readFileSync(
   resolve(repoRoot, ".github/workflows/super-synara-macos-signature-audit.yml"),
   "utf8",
 ).replaceAll("\r\n", "\n");
+const releaseDrafter = readFileSync(
+  resolve(repoRoot, ".github/workflows/release-drafter.yml"),
+  "utf8",
+).replaceAll("\r\n", "\n");
+const releaseDrafterConfig = readFileSync(
+  resolve(repoRoot, ".github/release-drafter.yml"),
+  "utf8",
+).replaceAll("\r\n", "\n");
+const githubStateScript = readFileSync(
+  resolve(repoRoot, "scripts/verify-super-synara-github-state.ts"),
+  "utf8",
+).replaceAll("\r\n", "\n");
 
 describe("Super Synara workflow contracts", () => {
   it("admits the manual fail-closed workflow pair", () => {
     expect(() => verifySuperSynaraWorkflowContracts(repoRoot)).not.toThrow();
+  });
+
+  it("requires bounded fail-closed GitHub release visibility polling", () => {
+    expect(() => verifySuperSynaraGithubStateScriptText(githubStateScript)).not.toThrow();
+    expect(() =>
+      verifySuperSynaraGithubStateScriptText(
+        githubStateScript.replace("const visibilityAttempts = 30;", "const visibilityAttempts = 1;"),
+      ),
+    ).toThrow("retry visibility boundedly");
+    expect(() =>
+      verifySuperSynaraGithubStateScriptText(
+        githubStateScript.replace(
+          "Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1_000);",
+          "return;",
+        ),
+      ),
+    ).toThrow("retry visibility boundedly");
   });
 
   it("rejects automatic triggers and mutable action tags", () => {
@@ -39,31 +70,107 @@ describe("Super Synara workflow contracts", () => {
     ).toThrow("not pinned to a full commit");
   });
 
-  it("requires a GitHub CLI-compatible owned draft lookup", () => {
-    expect(() =>
-      verifySuperSynaraWorkflowText(
-        main.replace(
-          'gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100"',
-          'gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" \\\n              --jq .',
-        ),
-        audit,
-      ),
-    ).toThrow("must not combine the incompatible gh api --slurp and --jq flags");
-    expect(() =>
-      verifySuperSynaraWorkflowText(
-        main.replace("            jq -er \\", "            jq -r \\"),
-        audit,
-      ),
-    ).toThrow("must filter the captured response with standalone jq arguments");
+  it("adopts only the exact planned Release Drafter draft", () => {
     for (const [binding, replacement] of [
-      ['--arg tag "$TAG"', '--arg tag "$FORGED_TAG"'],
-      ['--arg source_commit "$SOURCE_COMMIT"', '--arg source_commit "$FORGED_COMMIT"'],
-      ['<<< "$releases_json"', '<<< "$FORGED_RELEASES_JSON"'],
+      [
+        'gh api "repos/$GITHUB_REPOSITORY/releases/$DRAFT_ID"',
+        'gh api "repos/$GITHUB_REPOSITORY/releases/latest"',
+      ],
+      [
+        '[[ "$(jq -r .tag_name <<< "$release")" == "$TAG" ]]',
+        '[[ "$(jq -r .tag_name <<< "$release")" == "$FORGED_TAG" ]]',
+      ],
+      [
+        '[[ "$(jq -r .target_commitish <<< "$release")" == "$SOURCE_COMMIT" ]]',
+        '[[ "$(jq -r .target_commitish <<< "$release")" == "$FORGED_COMMIT" ]]',
+      ],
+      ['echo "id=$DRAFT_ID"', 'echo "id=$FORGED_DRAFT_ID"'],
     ] as const) {
       expect(() =>
         verifySuperSynaraWorkflowText(main.replace(binding, replacement), audit),
-      ).toThrow("must filter the captured response with standalone jq arguments");
+      ).toThrow("adopt only the exact planned Release Drafter draft ID, tag, and source SHA");
     }
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          "      - id: draft\n        name: Adopt exact owned Release Drafter draft",
+          "      - id: draft\n        name: Create owned draft prerelease",
+        ),
+        audit,
+      ),
+    ).toThrow("exact Release Drafter adoption step");
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          '          release="$(gh api "repos/$GITHUB_REPOSITORY/releases/$DRAFT_ID")"',
+          '          gh release create "$TAG"\n          release="$(gh api "repos/$GITHUB_REPOSITORY/releases/$DRAFT_ID")"',
+        ),
+        audit,
+      ),
+    ).toThrow("must never create an arbitrary release draft");
+  });
+
+  it("makes no-change schedules unable to reach Release Drafter or dispatch", () => {
+    expect(() =>
+      verifySuperSynaraReleaseDrafterText(releaseDrafter, releaseDrafterConfig),
+    ).not.toThrow();
+    expect(() =>
+      verifySuperSynaraReleaseDrafterText(
+        releaseDrafter.replace(
+          "        if: steps.changes.outputs.should_release == 'true'\n        uses: release-drafter/",
+          "        if: always()\n        uses: release-drafter/",
+        ),
+        releaseDrafterConfig,
+      ),
+    ).toThrow("gated on changes");
+    expect(() =>
+      verifySuperSynaraReleaseDrafterText(
+        releaseDrafter.replace(
+          'echo "should_release=false" >> "$GITHUB_OUTPUT"',
+          'echo "should_release=true" >> "$GITHUB_OUTPUT"',
+        ),
+        releaseDrafterConfig,
+      ),
+    ).toThrow("no-change gate must fail closed");
+    expect(() =>
+      verifySuperSynaraReleaseDrafterText(
+        releaseDrafter.replace(
+          '          commit_count="$(git rev-list --count "$LATEST_TAG_COMMIT..$SOURCE_SHA")"',
+          '          if [[ "$EVENT_NAME" == "push" ]]; then echo "should_release=true" >> "$GITHUB_OUTPUT"; exit 0; fi\n          commit_count="$(git rev-list --count "$LATEST_TAG_COMMIT..$SOURCE_SHA")"',
+        ),
+        releaseDrafterConfig,
+      ),
+    ).toThrow("must not bypass commit counting for push reruns");
+    expect(() =>
+      verifySuperSynaraReleaseDrafterText(
+        releaseDrafter.replace('[[ "$ACTOR" == "$OWNER" ]]', "true"),
+        releaseDrafterConfig,
+      ),
+    ).toThrow("authorize the real owner before any draft mutation");
+    expect(() =>
+      verifySuperSynaraReleaseDrafterText(
+        releaseDrafter.replace('-f "controller_actor=$CONTROLLER_ACTOR" \\\n', ""),
+        releaseDrafterConfig,
+      ),
+    ).toThrow("propagate verified controller provenance");
+    expect(() =>
+      verifySuperSynaraReleaseDrafterText(
+        releaseDrafter.replace(
+          "if: ${{ github.event_name != 'push' && needs.draft.outputs.should_release == 'true' }}",
+          "if: ${{ github.event_name != 'push' }}",
+        ),
+        releaseDrafterConfig,
+      ),
+    ).toThrow("dispatch must be unreachable for pushes and no-change schedules");
+    expect(() =>
+      verifySuperSynaraReleaseDrafterText(
+        releaseDrafter,
+        releaseDrafterConfig.replace(
+          "$PREVIOUS_TAG...super-v$RESOLVED_VERSION",
+          "$PREVIOUS_TAG...$RESOLVED_VERSION",
+        ),
+      ),
+    ).toThrow("super-v$RESOLVED_VERSION");
   });
 
   it("rejects removal of the reviewed allowlist gate", () => {
@@ -126,8 +233,8 @@ describe("Super Synara workflow contracts", () => {
     expect(() =>
       verifySuperSynaraWorkflowText(
         main.replace(
-          "\n  reserve_tag:",
-          "\n      - name: Mutate source after final check\n        run: echo dirty >> package.json\n\n  reserve_tag:",
+          "\n  windows_x64:",
+          "\n      - name: Mutate source after final check\n        run: echo dirty >> package.json\n\n  windows_x64:",
         ),
         audit,
       ),
@@ -575,7 +682,7 @@ describe("Super Synara workflow contracts", () => {
     );
   });
 
-  it("rejects unprotected dispatches and weakened release labeling", () => {
+  it("rejects unprotected dispatches and weakened exact-source ownership", () => {
     expect(() =>
       verifySuperSynaraWorkflowText(
         main.replace('[[ "$REF_PROTECTED" == "true" ]]', "true"),
@@ -590,22 +697,34 @@ describe("Super Synara workflow contracts", () => {
     ).toThrow("dispatch ref is protected");
     expect(() =>
       verifySuperSynaraWorkflowText(
-        main.replace(
-          "Unofficial downstream Super Synara $VERSION (unsigned prerelease)",
-          "Super Synara $VERSION (unsigned prerelease)",
-        ),
+        main.replace('[[ "$WORKFLOW_SOURCE_SHA" == "$EXPECTED_SOURCE_SHA" ]]', "true"),
         audit,
       ),
-    ).toThrow("unofficial downstream and unsigned prerelease");
+    ).toThrow("complete scope metadata data flow");
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace('[[ "$RELEASE_DRAFT_ID" =~ ^[1-9][0-9]*$ ]]', "true"),
+        audit,
+      ),
+    ).toThrow("complete scope metadata data flow");
+  });
+
+  it("rejects a publication path that cannot safely retry partial asset uploads", () => {
     expect(() =>
       verifySuperSynaraWorkflowText(
         main.replace(
-          "Unofficial downstream Super Synara $VERSION (unsigned prerelease)",
-          "Unofficial downstream Super Synara $VERSION (prerelease)",
+          '[[ -n "${expected_names[$existing_name]+present}" ]]',
+          '[[ -n "$existing_name" ]]',
         ),
         audit,
       ),
-    ).toThrow("unofficial downstream and unsigned prerelease");
+    ).toThrow("reject unexpected existing draft assets");
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(' --repo "$GITHUB_REPOSITORY" --clobber', ' --repo "$GITHUB_REPOSITORY"'),
+        audit,
+      ),
+    ).toThrow("replace only the exact expected assets");
   });
 
   it("rejects production-default startup smoke and ZIP-only macOS evidence", () => {

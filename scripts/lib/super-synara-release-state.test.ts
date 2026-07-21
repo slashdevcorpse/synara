@@ -4,6 +4,10 @@ import {
   type SuperSynaraGitHubStateInput,
   validateSuperSynaraGitHubState,
 } from "./super-synara-release-state.ts";
+import {
+  SUPER_SYNARA_RELEASE_DRAFTER_MARKER,
+  superSynaraReleaseTitle,
+} from "./super-synara-release-drafter.ts";
 
 function state(overrides: Partial<SuperSynaraGitHubStateInput> = {}): SuperSynaraGitHubStateInput {
   return {
@@ -17,25 +21,47 @@ function state(overrides: Partial<SuperSynaraGitHubStateInput> = {}): SuperSynar
     sourceCommit: "a".repeat(40),
     tagCommit: null,
     tagObjectType: null,
-    releases: [],
+    releases: [exactDraft()],
+    currentRunDraftId: 42,
     ...overrides,
   };
 }
 
+function exactDraft() {
+  const version = "0.5.5-super.1";
+  return {
+    id: 42,
+    tagName: `super-v${version}`,
+    targetCommitish: "a".repeat(40),
+    name: superSynaraReleaseTitle(version),
+    body: `${SUPER_SYNARA_RELEASE_DRAFTER_MARKER}\n\nchanges`,
+    draft: true,
+    prerelease: true,
+  };
+}
+
 describe("Super Synara GitHub release state", () => {
-  it("allows a first attempt and an exact orphan-tag rerun", () => {
+  it("allows an exact owned draft with no tag or an exact preexisting tag", () => {
     expect(() => validateSuperSynaraGitHubState(state())).not.toThrow();
     expect(() =>
       validateSuperSynaraGitHubState(
-        state({ phase: "reserve-tag", tagCommit: "a".repeat(40), tagObjectType: "commit" }),
+        state({ phase: "before-publish", tagCommit: "a".repeat(40), tagObjectType: "commit" }),
       ),
     ).not.toThrow();
   });
 
-  it("rejects non-owner reruns, moved tags, and any pre-existing release", () => {
+  it("allows the exact scheduler identity", () => {
+    expect(() =>
+      validateSuperSynaraGitHubState(
+        state({ actor: "github-actions[bot]", triggeringActor: "github-actions[bot]" }),
+      ),
+    ).not.toThrow();
+  });
+
+  it("rejects unknown reruns, moved tags, and unowned releases", () => {
     expect(() =>
       validateSuperSynaraGitHubState(state({ triggeringActor: "someone-else" })),
-    ).toThrow("triggering_actor");
+    ).toThrow("repository owner or its exact GitHub Actions scheduler");
     expect(() =>
       validateSuperSynaraGitHubState(state({ tagCommit: "b".repeat(40), tagObjectType: "commit" })),
     ).toThrow("points to");
@@ -45,35 +71,25 @@ describe("Super Synara GitHub release state", () => {
     expect(() =>
       validateSuperSynaraGitHubState(
         state({
-          releases: [
-            {
-              id: 1,
-              tagName: "super-v0.5.5-super.1",
-              targetCommitish: "a".repeat(40),
-              draft: true,
-              prerelease: true,
-            },
-          ],
+          releases: [exactDraft(), { ...exactDraft(), id: 1 }],
         }),
       ),
-    ).toThrow("already has a draft release");
+    ).toThrow("found 2");
+    expect(() =>
+      validateSuperSynaraGitHubState(
+        state({ releases: [{ ...exactDraft(), body: "missing marker" }] }),
+      ),
+    ).toThrow("exact owned Release Drafter");
   });
 
   it("admits only the exact current-run draft before publication", () => {
-    const exactDraft = {
-      id: 42,
-      tagName: "super-v0.5.5-super.1",
-      targetCommitish: "a".repeat(40),
-      draft: true,
-      prerelease: true,
-    };
     expect(() =>
       validateSuperSynaraGitHubState(
         state({
           phase: "before-publish",
           tagCommit: "a".repeat(40),
           tagObjectType: "commit",
-          releases: [exactDraft],
+          releases: [exactDraft()],
           currentRunDraftId: 42,
         }),
       ),
@@ -84,10 +100,38 @@ describe("Super Synara GitHub release state", () => {
           phase: "before-publish",
           tagCommit: "a".repeat(40),
           tagObjectType: "commit",
-          releases: [exactDraft],
+          releases: [exactDraft()],
           currentRunDraftId: 43,
         }),
       ),
-    ).toThrow("not the exact current-run");
+    ).toThrow("not the exact owned Release Drafter");
+  });
+
+  it("requires the exact published prerelease and tag after publication", () => {
+    expect(() =>
+      validateSuperSynaraGitHubState(
+        state({
+          phase: "after-publish",
+          tagCommit: "a".repeat(40),
+          tagObjectType: "commit",
+          releases: [{ ...exactDraft(), draft: false }],
+        }),
+      ),
+    ).not.toThrow();
+    expect(() =>
+      validateSuperSynaraGitHubState(
+        state({ phase: "after-publish", releases: [{ ...exactDraft(), draft: false }] }),
+      ),
+    ).toThrow("requires the immutable tag");
+    expect(() =>
+      validateSuperSynaraGitHubState(
+        state({
+          phase: "after-publish",
+          tagCommit: "a".repeat(40),
+          tagObjectType: "commit",
+          releases: [exactDraft()],
+        }),
+      ),
+    ).toThrow("exact owned Release Drafter prerelease");
   });
 });

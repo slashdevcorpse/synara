@@ -45,6 +45,26 @@ const CI_WINDOWS_REQUIRED_COMMANDS = [
   "node scripts/verify-workflow-contracts.ts",
 ] as const;
 const CI_WINDOWS_POST_BUILD_COMMAND = "bun run --cwd apps/desktop smoke-test";
+const CI_ROOT_TEST_COMMAND = "bun run test:ci";
+const CI_CODECV_ACTION =
+  "codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac";
+const CI_CODECV_UPLOAD_CONDITION =
+  "${{ !cancelled() && (steps.unit_tests.outcome == 'success' || steps.unit_tests.outcome == 'failure') }}";
+const CI_CODECV_TOKEN = "${{ secrets.CODECOV_TOKEN }}";
+const CI_CODECV_COVERAGE_FILES =
+  "./apps/desktop/coverage/lcov.info,./apps/server/coverage/lcov.info,./apps/web/coverage/lcov.info,./packages/contracts/coverage/lcov.info,./packages/shared/coverage/lcov.info,./scripts/coverage/lcov.info";
+const CI_CODECV_TEST_RESULT_FILES =
+  "./apps/desktop/test-report.junit.xml,./apps/server/test-report.junit.xml,./apps/web/test-report.junit.xml,./packages/contracts/test-report.junit.xml,./packages/shared/test-report.junit.xml,./scripts/test-report.junit.xml";
+const CI_MERGIFY_ACTION =
+  "Mergifyio/gha-mergify-ci@8173bc3c1d337d3367454672d50cfdf6f0273396";
+const CI_MERGIFY_UPLOAD_CONDITION =
+  "${{ !cancelled() && (steps.unit_tests.outcome == 'success' || steps.unit_tests.outcome == 'failure') && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) }}";
+const CI_MERGIFY_REPORT_FILES =
+  "./apps/desktop/test-report.junit.xml ./apps/server/test-report.junit.xml ./apps/web/test-report.junit.xml ./packages/contracts/test-report.junit.xml ./packages/shared/test-report.junit.xml ./scripts/test-report.junit.xml";
+const DEPENDENCY_REVIEW_ACTION =
+  "actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294";
+const CODEQL_ACTION = "github/codeql-action";
+const CODEQL_ACTION_SHA = "e0647621c2984b5ed2f768cb892365bf2a616ad1";
 const CI_MACOS_REQUIRED_COMMANDS = [
   'test "$(uname -m)" = arm64',
   "bun run brand:check",
@@ -83,6 +103,7 @@ interface WorkflowRunStep {
   readonly continueOnError: unknown;
   readonly condition: unknown;
   readonly environment: unknown;
+  readonly id: unknown;
   readonly index: number;
   readonly name: unknown;
   readonly rawCommand: string;
@@ -98,7 +119,7 @@ function executableShellLines(command: string): readonly string[] {
 
 function invokesRootTest(command: string): boolean {
   return executableShellLines(command).some((line) =>
-    /(?:^|(?:&&|\|\||;)\s*)bun run test(?=$|\s|&&|\|\||;)/.test(line),
+    /(?:^|(?:&&|\|\||;)\s*)bun run test(?::ci)?(?=$|\s|&&|\|\||;)/.test(line),
   );
 }
 
@@ -127,6 +148,7 @@ function jobRunSteps(
         continueOnError: step["continue-on-error"],
         condition: step.if,
         environment: step.env,
+        id: step.id,
         index,
         name: step.name,
         rawCommand: step.run,
@@ -308,6 +330,7 @@ function validateRootTestOwnership(
           continueOnError: step["continue-on-error"],
           condition: step.if,
           environment: step.env,
+          id: step.id,
           index,
           name: step.name,
           rawCommand: step.run,
@@ -317,24 +340,262 @@ function validateRootTestOwnership(
     }
   }
   const owned = occurrences.filter(({ jobName }) => jobName === ownerJobName);
-  const bareOwned = owned.filter(({ step }) => step.command === "bun run test");
-  if (bareOwned.length !== 1) {
-    errors.push(`${workflowPath} ${ownerJobName} must run exactly one bare bun run test suite.`);
+  const expectedOwned = owned.filter(({ step }) => step.command === CI_ROOT_TEST_COMMAND);
+  if (expectedOwned.length !== 1) {
+    errors.push(
+      `${workflowPath} ${ownerJobName} must run exactly one ${CI_ROOT_TEST_COMMAND} suite.`,
+    );
   } else if (
-    bareOwned[0]!.step.condition !== undefined ||
-    (bareOwned[0]!.step.continueOnError !== undefined &&
-      bareOwned[0]!.step.continueOnError !== false)
+    expectedOwned[0]!.step.condition !== undefined ||
+    (expectedOwned[0]!.step.continueOnError !== undefined &&
+      expectedOwned[0]!.step.continueOnError !== false)
   ) {
     errors.push(
-      `${workflowPath} ${ownerJobName} bare bun run test must be unconditional and fail closed.`,
+      `${workflowPath} ${ownerJobName} ${CI_ROOT_TEST_COMMAND} must be unconditional and fail closed.`,
+    );
+  } else if (expectedOwned[0]!.step.id !== "unit_tests") {
+    errors.push(
+      `${workflowPath} ${ownerJobName} ${CI_ROOT_TEST_COMMAND} must use id unit_tests for report upload conditions.`,
     );
   }
   for (const occurrence of occurrences) {
-    if (occurrence.jobName !== ownerJobName || occurrence.step.command !== "bun run test") {
+    if (occurrence.jobName !== ownerJobName || occurrence.step.command !== CI_ROOT_TEST_COMMAND) {
       errors.push(
         `${workflowPath} ${occurrence.jobName} must not own an additional or chained monorepo-wide bun run test suite.`,
       );
     }
+  }
+}
+
+function booleanActionInput(value: unknown): boolean {
+  return value === true || value === "true";
+}
+
+function validateCodecovUploads(
+  qualityJob: UnknownRecord,
+  workflowPath: string,
+  errors: string[],
+): void {
+  if (!Array.isArray(qualityJob.steps)) {
+    errors.push(`${workflowPath} quality must define steps.`);
+    return;
+  }
+
+  const expectedUploads = [
+    {
+      files: CI_CODECV_COVERAGE_FILES,
+      name: "Upload coverage reports to Codecov",
+      reportType: undefined,
+    },
+    {
+      files: CI_CODECV_TEST_RESULT_FILES,
+      name: "Upload test results to Codecov",
+      reportType: "test_results",
+    },
+  ] as const;
+  const unitTestStepIndex = qualityJob.steps.findIndex(
+    (step) =>
+      isRecord(step) &&
+      typeof step.run === "string" &&
+      normalizeShellCommand(step.run) === CI_ROOT_TEST_COMMAND,
+  );
+
+  for (const expected of expectedUploads) {
+    const matches = qualityJob.steps.filter(
+      (step) => isRecord(step) && step.name === expected.name,
+    );
+    if (matches.length !== 1) {
+      errors.push(`${workflowPath} quality must define exactly one ${expected.name} step.`);
+      continue;
+    }
+
+    const step = matches[0]!;
+    if (!isRecord(step)) continue;
+    const uploadIndex = qualityJob.steps.indexOf(step);
+    if (unitTestStepIndex < 0 || uploadIndex <= unitTestStepIndex) {
+      errors.push(`${workflowPath} ${expected.name} must run after ${CI_ROOT_TEST_COMMAND}.`);
+    }
+    if (step.uses !== CI_CODECV_ACTION) {
+      errors.push(`${workflowPath} ${expected.name} must use the pinned Codecov Action v5.5.5.`);
+    }
+    if (step.if !== CI_CODECV_UPLOAD_CONDITION) {
+      errors.push(
+        `${workflowPath} ${expected.name} must run for completed successful or failed unit tests.`,
+      );
+    }
+    if (!isRecord(step.with)) {
+      errors.push(`${workflowPath} ${expected.name} must define Codecov inputs.`);
+      continue;
+    }
+    if (step.with.token !== CI_CODECV_TOKEN) {
+      errors.push(`${workflowPath} ${expected.name} must use secrets.CODECOV_TOKEN.`);
+    }
+    if (step.with.files !== expected.files || !booleanActionInput(step.with.disable_search)) {
+      errors.push(`${workflowPath} ${expected.name} must upload only the expected report files.`);
+    }
+    if (!booleanActionInput(step.with.fail_ci_if_error)) {
+      errors.push(`${workflowPath} ${expected.name} must fail closed on Codecov upload errors.`);
+    }
+    if (step.with.report_type !== expected.reportType) {
+      errors.push(
+        `${workflowPath} ${expected.name} must set report_type to ${expected.reportType ?? "coverage (default)"}.`,
+      );
+    }
+  }
+}
+
+function validateMergifyUpload(
+  qualityJob: UnknownRecord,
+  workflowPath: string,
+  errors: string[],
+): void {
+  if (!Array.isArray(qualityJob.steps)) return;
+  const matches = qualityJob.steps.filter(
+    (step) => isRecord(step) && step.name === "Upload test results to Mergify CI Insights",
+  );
+  if (matches.length !== 1) {
+    errors.push(
+      `${workflowPath} quality must define exactly one Upload test results to Mergify CI Insights step.`,
+    );
+    return;
+  }
+  const step = matches[0]!;
+  if (!isRecord(step)) return;
+  const unitTestIndex = qualityJob.steps.findIndex(
+    (candidate) =>
+      isRecord(candidate) &&
+      typeof candidate.run === "string" &&
+      normalizeShellCommand(candidate.run) === CI_ROOT_TEST_COMMAND,
+  );
+  if (unitTestIndex < 0 || qualityJob.steps.indexOf(step) <= unitTestIndex) {
+    errors.push(`${workflowPath} Mergify upload must run after ${CI_ROOT_TEST_COMMAND}.`);
+  }
+  if (step.id !== "mergify_ci" || step.uses !== CI_MERGIFY_ACTION) {
+    errors.push(`${workflowPath} Mergify upload must use the pinned Mergify CI v23 action.`);
+  }
+  if (step.if !== CI_MERGIFY_UPLOAD_CONDITION) {
+    errors.push(`${workflowPath} Mergify upload must be completed-test and fork safe.`);
+  }
+  if (!isRecord(step.with)) {
+    errors.push(`${workflowPath} Mergify upload must define inputs.`);
+    return;
+  }
+  if (
+    step.with.action !== "junit-process" ||
+    step.with.token !== "${{ secrets.MERGIFY_TOKEN }}" ||
+    step.with.job_name !== "quality" ||
+    step.with.report_path !== CI_MERGIFY_REPORT_FILES ||
+    step.with.test_step_outcome !== "${{ steps.unit_tests.outcome }}"
+  ) {
+    errors.push(
+      `${workflowPath} Mergify upload must ingest only the six expected JUnit reports with the unit-test outcome.`,
+    );
+  }
+}
+
+function workflowJob(workflow: UnknownRecord, jobName: string): UnknownRecord | null {
+  return isRecord(workflow.jobs) && isRecord(workflow.jobs[jobName])
+    ? workflow.jobs[jobName]
+    : null;
+}
+
+function actionSteps(job: UnknownRecord, action: string): readonly UnknownRecord[] {
+  if (!Array.isArray(job.steps)) return [];
+  return job.steps.filter(
+    (step): step is UnknownRecord =>
+      isRecord(step) && typeof step.uses === "string" && step.uses === action,
+  );
+}
+
+function validateDependencyReviewWorkflow(workflow: UnknownRecord, errors: string[]): void {
+  const path = ".github/workflows/dependency-review.yml";
+  const job = workflowJob(workflow, "dependency-review");
+  if (!job || job.name !== "dependency-review" || job["runs-on"] !== "ubuntu-24.04") {
+    errors.push(`${path} must define the fixed dependency-review Ubuntu job.`);
+    return;
+  }
+  const steps = actionSteps(job, DEPENDENCY_REVIEW_ACTION);
+  if (steps.length !== 1) {
+    errors.push(`${path} must run exactly one pinned Dependency Review v5 action.`);
+  } else if (
+    steps[0]!.if !== undefined ||
+    (steps[0]!["continue-on-error"] !== undefined && steps[0]!["continue-on-error"] !== false)
+  ) {
+    errors.push(`${path} dependency review must be unconditional and fail closed.`);
+  }
+}
+
+function validateCodeqlWorkflow(workflow: UnknownRecord, errors: string[]): void {
+  const path = ".github/workflows/codeql.yml";
+  const expected = [
+    {
+      jobName: "analyze_actions",
+      displayName: "codeql-actions",
+      runner: "ubuntu-24.04",
+      language: "actions",
+      buildMode: "none",
+      category: "/language:actions",
+    },
+    {
+      jobName: "analyze_javascript_typescript",
+      displayName: "codeql-javascript-typescript",
+      runner: "ubuntu-24.04",
+      language: "javascript-typescript",
+      buildMode: "none",
+      category: "/language:javascript-typescript",
+    },
+    {
+      jobName: "analyze_swift",
+      displayName: "codeql-swift",
+      runner: "macos-15",
+      language: "swift",
+      buildMode: "manual",
+      category: "/language:swift",
+    },
+  ] as const;
+  for (const lane of expected) {
+    const job = workflowJob(workflow, lane.jobName);
+    if (!job || job.name !== lane.displayName || job["runs-on"] !== lane.runner) {
+      errors.push(`${path} must define fixed ${lane.displayName} on ${lane.runner}.`);
+      continue;
+    }
+    if (
+      !isRecord(job.permissions) ||
+      job.permissions.contents !== "read" ||
+      job.permissions["security-events"] !== "write"
+    ) {
+      errors.push(`${path} ${lane.displayName} must grant only required CodeQL permissions.`);
+    }
+    const init = actionSteps(job, `${CODEQL_ACTION}/init@${CODEQL_ACTION_SHA}`);
+    const analyze = actionSteps(job, `${CODEQL_ACTION}/analyze@${CODEQL_ACTION_SHA}`);
+    if (
+      init.length !== 1 ||
+      !isRecord(init[0]!.with) ||
+      init[0]!.with.languages !== lane.language ||
+      init[0]!.with["build-mode"] !== lane.buildMode
+    ) {
+      errors.push(`${path} ${lane.displayName} must initialize the expected language and build mode.`);
+    }
+    if (
+      analyze.length !== 1 ||
+      !isRecord(analyze[0]!.with) ||
+      analyze[0]!.with.category !== lane.category
+    ) {
+      errors.push(`${path} ${lane.displayName} must publish the fixed analysis category.`);
+    }
+  }
+  const swift = workflowJob(workflow, "analyze_swift");
+  const swiftBuilds = swift
+    ? jobRunSteps({ analyze_swift: swift }, "analyze_swift", path, errors)
+    : null;
+  if (
+    !swiftBuilds?.some(
+      (step) =>
+        step.command ===
+        'node apps/desktop/scripts/build-appsnap-helper.mjs --arch arm64 --output "${{ runner.temp }}/synara-appsnap-helper"',
+    )
+  ) {
+    errors.push(`${path} codeql-swift must build the tracked AppSnap Swift helper.`);
   }
 }
 
@@ -459,6 +720,19 @@ function validateActionPins(path: string, contents: string, errors: string[]): v
 }
 
 function allowedWritePermission(path: string, location: string, scope: string): boolean {
+  if (path === ".github/workflows/release-drafter.yml") {
+    return (
+      (location === "jobs.draft.permissions" && scope === "contents") ||
+      (location === "jobs.dispatch.permissions" && scope === "actions")
+    );
+  }
+  if (
+    path === ".github/workflows/codeql.yml" &&
+    location.startsWith("jobs.analyze_") &&
+    scope === "security-events"
+  ) {
+    return true;
+  }
   if (
     path === ".github/workflows/upstream-watch.yml" &&
     location === "jobs.report.permissions" &&
@@ -494,6 +768,10 @@ function validateCiArchitecture(workflow: UnknownRecord, errors: string[]): void
       (qualityJob["continue-on-error"] !== undefined && qualityJob["continue-on-error"] !== false))
   ) {
     errors.push(`${workflowPath} quality job must be unconditional and fail closed.`);
+  }
+  if (isRecord(qualityJob)) {
+    validateMergifyUpload(qualityJob, workflowPath, errors);
+    validateCodecovUploads(qualityJob, workflowPath, errors);
   }
   if (isRecord(windowsJob) && windowsJob["runs-on"] !== "windows-2022") {
     errors.push(`${workflowPath} windows_x64 must run on windows-2022.`);
@@ -595,6 +873,10 @@ function validateAllowedWorkflow(
     }
   }
   if (policy.path === ".github/workflows/ci.yml") validateCiArchitecture(workflow, errors);
+  if (policy.path === ".github/workflows/dependency-review.yml") {
+    validateDependencyReviewWorkflow(workflow, errors);
+  }
+  if (policy.path === ".github/workflows/codeql.yml") validateCodeqlWorkflow(workflow, errors);
 }
 
 export function validateWorkflowContracts(
