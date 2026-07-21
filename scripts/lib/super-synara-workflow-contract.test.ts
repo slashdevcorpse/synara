@@ -78,6 +78,37 @@ describe("Super Synara workflow contracts", () => {
         "must poll boundedly for GitHub release-list visibility",
       );
     }
+
+    const retryFailureBlock = [
+      "            else",
+      "              query_status=$?",
+      '              if [[ "$query_status" -ne 4 ]]; then',
+      '                exit "$query_status"',
+      "              fi",
+      "            fi",
+    ].join("\n");
+    const unreachableFailureBlock = [
+      "              break",
+      "              query_status=$?",
+      '              if [[ "$query_status" -ne 4 ]]; then',
+      '                exit "$query_status"',
+      "              fi",
+      "            else",
+      "              true",
+      "            fi",
+    ].join("\n");
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(retryFailureBlock, unreachableFailureBlock),
+        audit,
+      ),
+    ).toThrow("must poll boundedly for GitHub release-list visibility");
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace("            sleep 1\n          done", "          done\n          sleep 1"),
+        audit,
+      ),
+    ).toThrow("must poll boundedly for GitHub release-list visibility");
   });
 
   it("rejects removal of the reviewed allowlist gate", () => {
