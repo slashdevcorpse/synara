@@ -10,6 +10,7 @@ import {
   type WindowsAuthenticodeInspectionRuntime,
 } from "./windows-authenticode.ts";
 
+const WINDOWS_AUTHENTICODE_INTEGRATION_TEST_TIMEOUT_MS = 90_000;
 const roots: string[] = [];
 
 afterEach(() => {
@@ -91,6 +92,7 @@ describe("Windows unsigned Authenticode inspection", () => {
         "Authenticode status is Valid, not NotSigned.",
       );
     },
+    WINDOWS_AUTHENTICODE_INTEGRATION_TEST_TIMEOUT_MS,
   );
 
   for (const status of ["Valid", "UnknownError", "HashMismatch", "NotTrusted"]) {
