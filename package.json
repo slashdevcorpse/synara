@@ -16,6 +16,7 @@
       "@effect/language-service": "0.75.1",
       "@types/bun": "^1.3.9",
       "@types/node": "^24.10.13",
+      "@vitest/coverage-v8": "^4.1.10",
       "tsdown": "^0.20.3",
       "typescript": "^5.7.3",
       "vitest": "^4.1.10"
@@ -40,6 +41,7 @@
     "typecheck": "turbo run typecheck",
     "lint": "oxlint --report-unused-disable-directives",
     "test": "turbo run test",
+    "test:ci": "turbo run test --continue=dependencies-successful -- --coverage --coverage.provider=v8 --coverage.reporter=text --coverage.reporter=lcov --coverage.reportOnFailure --testTimeout=90000 --hookTimeout=90000 --reporter=default --reporter=github-actions --reporter=junit --outputFile.junit=test-report.junit.xml",
     "brand:check": "node scripts/check-brand-identity.ts",
     "downstream:validate": "node scripts/validate-downstream-state.ts",
     "workflows:validate": "node scripts/verify-workflow-contracts.ts",
@@ -70,6 +72,7 @@
     "@babel/core": "7.29.7",
     "@effect/language-service": "catalog:",
     "@types/node": "catalog:",
+    "@vitest/coverage-v8": "catalog:",
     "js-yaml": "4.3.0",
     "oxfmt": "^0.40.0",
     "oxlint": "^1.55.0",

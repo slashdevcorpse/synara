@@ -27,6 +27,8 @@ apps/web/playwright-report
 output/playwright/
 apps/web/src/components/__screenshots__
 .vitest-*
+coverage/
+test-report.junit.xml
 __screenshots__/
 .tanstack
 /.pi/

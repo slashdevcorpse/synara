@@ -1,0 +1,20 @@
+name-template: "Unofficial downstream Super Synara $RESOLVED_VERSION (unsigned prerelease)"
+tag-template: "super-v$RESOLVED_VERSION"
+tag-prefix: "super-v"
+change-template: "- $TITLE (#$NUMBER) $AUTHORS"
+change-title-escapes: "\\<*_&"
+exclude-labels:
+  - skip-changelog
+template: |
+  <!-- super-synara-release-drafter-owned -->
+
+  > [!WARNING]
+  > This is an unofficial, unsigned Super Synara prerelease. Verify the published SHA-256 checksum before running an installer. Windows SmartScreen and macOS Gatekeeper warnings are expected. Do not disable operating-system protections globally.
+
+  Installation updates remain manual. This prerelease is never the GitHub Latest release and does not publish an updater feed.
+
+  ## Changes
+
+  $CHANGES
+
+  **Full comparison:** $PREVIOUS_TAG...super-v$RESOLVED_VERSION
