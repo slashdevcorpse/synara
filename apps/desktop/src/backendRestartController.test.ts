@@ -552,8 +552,8 @@ describe("desktop backend restart integration", () => {
   it("fails update preparation closed when backend exit remains unconfirmed", () => {
     const updateInstall = sourceBetween(
       desktopMainSource,
+      "async function runDownloadedUpdateInstall(",
       "async function installDownloadedUpdate(",
-      "async function recordDownloadedUpdateIdentity(",
     );
     const stop = updateInstall.indexOf(
       "const shutdownDisposition = await stopBackendAndWaitForExit()",
@@ -567,21 +567,70 @@ describe("desktop backend restart integration", () => {
     expect(updateInstall).toContain(
       "The desktop backend did not confirm shutdown. Update installation was not started.",
     );
+    expect(
+      updateInstall.indexOf("updateInstallPreparation.requireActive(preparationAttempt)"),
+    ).toBeLessThan(installHandoff);
   });
 
-  it("cancels restart timers and readiness monitors before bounded quit shutdown", () => {
+  it("cancels in-flight updater preparation without double-running recovery", () => {
+    const installEntry = sourceBetween(
+      desktopMainSource,
+      "async function installDownloadedUpdate(",
+      "async function recordDownloadedUpdateIdentity(",
+    );
+    expect(installEntry.indexOf("updateInstallPreparation.begin()")).toBeLessThan(
+      installEntry.indexOf("runDownloadedUpdateInstall(preparationAttempt)"),
+    );
+    expect(installEntry).toContain("updateInstallPreparation.release(preparationAttempt)");
+
+    const clearInstall = sourceBetween(
+      desktopMainSource,
+      "function clearUpdaterInstallInFlightAfterError(",
+      "function clearUpdateInstallWatchdogTimer(",
+    );
+    expect(clearInstall).toContain("updateInstallPreparation.cancel()");
+    expect(clearInstall).toContain("input?.preservePendingPreparation");
+
+    const updaterConfiguration = sourceBetween(
+      desktopMainSource,
+      "function configureAutoUpdater(",
+      "async function launchScheduledBackendRestart(",
+    );
+    expect(updaterConfiguration).toContain("preservePendingPreparation: true");
+    expect(updaterConfiguration).toContain(
+      'if (errorContext === "install" && !installPreparationPending)',
+    );
+  });
+
+  it("requires backend exit proof before cleanup or app quit and resets failed shutdowns for retry", () => {
     const shutdown = sourceBetween(
       desktopMainSource,
       "async function shutdownDesktopRuntime(",
       "function requestGracefulAppQuit(",
     );
     expect(shutdown.indexOf("backendRestartController.dispose()")).toBeLessThan(
-      shutdown.indexOf("await stopBackendAndWaitForExit()"),
+      shutdown.indexOf("stopBackendAndWaitForExit()"),
     );
     expect(shutdown.indexOf("cancelBackendGenerationReadinessWait()")).toBeLessThan(
-      shutdown.indexOf("await stopBackendAndWaitForExit()"),
+      shutdown.indexOf("stopBackendAndWaitForExit()"),
     );
     expect(shutdown).toContain("shutdown incomplete disposition=");
     expect(shutdown).toContain("backend-exit-unconfirmed=true");
+    expect(shutdown).toContain("if (!disposition.exitConfirmed)");
+    expect(shutdown.indexOf("if (!disposition.exitConfirmed)")).toBeLessThan(
+      shutdown.indexOf("browserManager.dispose()"),
+    );
+    expect(shutdown).toContain("desktopShutdownPromise = null");
+    expect(shutdown).toContain("isQuitting = false");
+
+    const requestQuit = sourceBetween(
+      desktopMainSource,
+      "function requestGracefulAppQuit(",
+      "function registerIpcHandlers(",
+    );
+    expect(requestQuit).toContain(
+      "runAfterDesktopShutdown(shutdownDesktopRuntime(reason), () => app.quit())",
+    );
+    expect(requestQuit).not.toContain(".finally(");
   });
 });

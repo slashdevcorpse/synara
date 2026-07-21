@@ -177,6 +177,32 @@ describe("desktop window lifecycle integration", () => {
     expect(desktopMainSource).toContain('requestGracefulAppQuit("before-quit")');
   });
 
+  it("preserves Super Windows warm-close while gating quit-on-close flavors", () => {
+    const createWindow = sourceBetween(
+      desktopMainSource,
+      "function createWindow()",
+      "function configureMediaPermissions()",
+    );
+    const closeHandler = sourceBetween(
+      createWindow,
+      'window.on("close", (event) => {',
+      "if (isDevelopment) {",
+    );
+
+    expect(closeHandler).toContain("windowStateController.flush()");
+    expect(closeHandler).toContain("shouldDeferDesktopWindowClose({");
+    expect(closeHandler).toContain("shutdownComplete: desktopShutdownComplete");
+    expect(closeHandler).toContain("updaterHandoffActive: isUpdaterQuitAndInstallInFlight");
+    expect(closeHandler).toContain(
+      "keepRuntimeAliveAfterWindowClose: shouldKeepDesktopRuntimeAliveAfterWindowAllClosed({",
+    );
+    expect(closeHandler).toContain("flavor: desktopIdentity.flavor");
+    expect(closeHandler).toContain("platform: process.platform");
+    expect(closeHandler.indexOf("event.preventDefault()")).toBeLessThan(
+      closeHandler.indexOf('requestGracefulAppQuit("window-close")'),
+    );
+  });
+
   it("consumes deferred startup reopen requests without starting another backend", () => {
     const bootstrap = sourceBetween(
       desktopMainSource,
