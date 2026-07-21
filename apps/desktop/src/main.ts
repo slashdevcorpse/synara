@@ -3436,9 +3436,7 @@ async function shutdownDesktopRuntime(reason: string): Promise<void> {
   isQuitting = true;
   cancelBackendGenerationReadinessWait();
   writeDesktopLogHeader(`${reason} shutdown start`);
-  let shutdownDisposition: BackendStopDisposition | null = null;
   const backendShutdown = stopBackendAndWaitForExit().then((disposition) => {
-    shutdownDisposition = disposition;
     if (!disposition.exitConfirmed) {
       writeDesktopLogHeader(
         `${reason} shutdown incomplete disposition=${disposition.type} forced=${disposition.forced} backend-exit-unconfirmed=true`,
@@ -3447,8 +3445,9 @@ async function shutdownDesktopRuntime(reason: string): Promise<void> {
         `Desktop backend exit was not confirmed (disposition=${disposition.type}, forced=${disposition.forced}).`,
       );
     }
+    return disposition;
   });
-  const shutdown = runAfterDesktopShutdown(backendShutdown, async () => {
+  const shutdown = runAfterDesktopShutdown(backendShutdown, async (shutdownDisposition) => {
     clearUpdateBackgroundBlurTimer();
     clearUpdateCheckTimeoutTimer();
     clearUpdatePollTimer();
@@ -3458,9 +3457,6 @@ async function shutdownDesktopRuntime(reason: string): Promise<void> {
     await disposeBrowserUsePipeServerForShutdown(reason);
     browserManager.dispose();
     restoreStdIoCapture?.();
-    if (shutdownDisposition === null || !shutdownDisposition.exitConfirmed) {
-      throw new Error("Desktop backend exit proof was lost during shutdown cleanup.");
-    }
     backendRestartController.dispose();
     desktopShutdownComplete = true;
     writeDesktopLogHeader(

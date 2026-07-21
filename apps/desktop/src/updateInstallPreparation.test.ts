@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   makeUpdateInstallPreparationCoordinator,
   UpdateInstallPreparationCancelledError,
+  UpdateInstallPreparationStateError,
 } from "./updateInstallPreparation";
 
 describe("update install preparation coordination", () => {
@@ -30,5 +31,6 @@ describe("update install preparation coordination", () => {
     if (active === null) throw new Error("Expected an active preparation attempt");
     coordinator.release(active);
     expect(coordinator.cancel()).toBe(false);
+    expect(() => coordinator.release(active)).toThrow(UpdateInstallPreparationStateError);
   });
 });

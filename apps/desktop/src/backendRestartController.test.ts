@@ -630,12 +630,10 @@ describe("desktop backend restart integration", () => {
     expect(shutdown.indexOf("backendRestartController.dispose()")).toBeLessThan(
       shutdown.indexOf("desktopShutdownComplete = true"),
     );
-    expect(shutdown.indexOf("browserManager.dispose()")).toBeLessThan(
-      shutdown.indexOf("if (shutdownDisposition === null"),
+    expect(shutdown).toContain(
+      "runAfterDesktopShutdown(backendShutdown, async (shutdownDisposition) => {",
     );
-    expect(shutdown.indexOf("if (shutdownDisposition === null")).toBeLessThan(
-      shutdown.indexOf("backendRestartController.dispose()"),
-    );
+    expect(shutdown).not.toContain("shutdownDisposition === null");
     expect(shutdown.indexOf("cancelBackendGenerationReadinessWait()")).toBeLessThan(
       shutdown.indexOf("stopBackendAndWaitForExit()"),
     );

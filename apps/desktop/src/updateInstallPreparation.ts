@@ -7,6 +7,13 @@ export class UpdateInstallPreparationCancelledError extends Error {
   }
 }
 
+export class UpdateInstallPreparationStateError extends Error {
+  constructor() {
+    super("Cannot release an unrecognized update install preparation attempt.");
+    this.name = "UpdateInstallPreparationStateError";
+  }
+}
+
 export function makeUpdateInstallPreparationCoordinator() {
   let activeAttempt: {
     readonly token: UpdateInstallPreparationAttempt;
@@ -36,7 +43,7 @@ export function makeUpdateInstallPreparationCoordinator() {
     },
     release(attempt: UpdateInstallPreparationAttempt): void {
       if (activeAttempt?.token !== attempt) {
-        throw new UpdateInstallPreparationCancelledError();
+        throw new UpdateInstallPreparationStateError();
       }
       activeAttempt = null;
     },

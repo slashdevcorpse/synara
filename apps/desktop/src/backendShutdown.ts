@@ -44,12 +44,12 @@ export function requireWindowsBackendExit(result: WindowsBackendShutdownResult):
   }
 }
 
-export async function runAfterDesktopShutdown(
-  shutdown: Promise<void>,
-  afterShutdown: () => void | Promise<void>,
+export async function runAfterDesktopShutdown<Result>(
+  shutdown: Promise<Result>,
+  afterShutdown: (result: Result) => void | Promise<void>,
 ): Promise<void> {
-  await shutdown;
-  await afterShutdown();
+  const result = await shutdown;
+  await afterShutdown(result);
 }
 
 export function shouldDeferDesktopWindowClose(input: {

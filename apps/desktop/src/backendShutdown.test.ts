@@ -459,9 +459,9 @@ describe("runAfterDesktopShutdown", () => {
     const afterShutdown = vi.fn();
 
     await expect(
-      runAfterDesktopShutdown(Promise.resolve(), afterShutdown),
+      runAfterDesktopShutdown(Promise.resolve("confirmed-exit"), afterShutdown),
     ).resolves.toBeUndefined();
-    expect(afterShutdown).toHaveBeenCalledOnce();
+    expect(afterShutdown).toHaveBeenCalledExactlyOnceWith("confirmed-exit");
 
     const shutdownError = new Error("backend still running");
     const afterFailedShutdown = vi.fn();
