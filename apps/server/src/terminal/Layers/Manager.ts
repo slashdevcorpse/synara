@@ -1298,13 +1298,16 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
         });
         await Promise.all(sessions.map((session) => this.stopProcess(session)));
         // stopProcess flushes any trailing PTY output into the debounced
-        // persistence queue. Drain that work before deleting history so a
-        // delayed write cannot recreate a history file after this close.
-        await Promise.all(
-          terminalIds.map((terminalId) =>
-            this.flushPersistQueue(input.threadId, terminalId).catch(() => undefined),
-          ),
+        // persistence queue. Settle every drain before deciding whether group
+        // cleanup can commit; retaining stopped sessions on failure keeps the
+        // unacknowledged close retryable without deleting their history.
+        const trailingFlushes = await Promise.allSettled(
+          terminalIds.map((terminalId) => this.flushPersistQueue(input.threadId, terminalId)),
         );
+        const failedTrailingFlush = trailingFlushes.find(
+          (result): result is PromiseRejectedResult => result.status === "rejected",
+        );
+        if (failedTrailingFlush) throw failedTrailingFlush.reason;
         for (const terminalId of terminalIds) {
           const key = toSessionKey(input.threadId, terminalId);
           this.sessions.delete(key);

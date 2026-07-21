@@ -1051,12 +1051,15 @@ describe("TerminalManager", () => {
     await manager.dispose();
   });
 
-  it("drains trailing batch persistence after stopping and tolerates cleanup flush failures", async () => {
-    const { manager, logsDir } = makeManager();
+  it("retains a stopped batch for retry when trailing persistence fails", async () => {
+    const { manager, ptyAdapter, logsDir } = makeManager();
     await manager.open(openInput({ terminalId: "one" }));
     await manager.open(openInput({ terminalId: "two" }));
+    ptyAdapter.processes[0]?.emitData("one history\n");
+    ptyAdapter.processes[1]?.emitData("two history\n");
     const oneHistoryPath = multiTerminalHistoryLogPath(logsDir, "thread-1", "one");
     const twoHistoryPath = multiTerminalHistoryLogPath(logsDir, "thread-1", "two");
+    await waitFor(() => fs.existsSync(oneHistoryPath) && fs.existsSync(twoHistoryPath));
 
     const internals = manager as unknown as {
       flushPersistQueue: (threadId: string, terminalId: string) => Promise<void>;
@@ -1073,18 +1076,33 @@ describe("TerminalManager", () => {
       await flushPersistQueue(threadId, terminalId);
     });
 
-    await expect(
-      manager.close({
-        threadId: "thread-1",
-        terminalIds: ["one", "two"],
-        deleteHistory: true,
-      }),
-    ).resolves.toBeUndefined();
+    const closeInput = {
+      threadId: "thread-1",
+      terminalIds: ["one", "two"],
+      deleteHistory: true,
+    };
+
+    await expect(manager.close(closeInput)).rejects.toThrow("trailing persistence failed");
 
     expect(callCounts).toEqual(
       new Map([
         ["one", 2],
         ["two", 2],
+      ]),
+    );
+    expect(ptyAdapter.processes[0]?.killed).toBe(true);
+    expect(ptyAdapter.processes[1]?.killed).toBe(true);
+    expect(internals.sessions.has("thread-1\u0000one")).toBe(true);
+    expect(internals.sessions.has("thread-1\u0000two")).toBe(true);
+    expect(fs.readFileSync(oneHistoryPath, "utf8")).toContain("one history");
+    expect(fs.readFileSync(twoHistoryPath, "utf8")).toContain("two history");
+
+    await expect(manager.close(closeInput)).resolves.toBeUndefined();
+
+    expect(callCounts).toEqual(
+      new Map([
+        ["one", 4],
+        ["two", 4],
       ]),
     );
     expect(internals.sessions.has("thread-1\u0000one")).toBe(false);
