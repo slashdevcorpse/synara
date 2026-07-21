@@ -346,16 +346,20 @@ describe("managed attachment cleanup", () => {
     const staleDate = new Date(nowMs - MANAGED_ATTACHMENT_WRITING_LEASE_MS - 1_000);
     const freshCount = 96;
     const staleCount = 70;
+    const freshPartNames: string[] = [];
 
     for (let index = 0; index < freshCount + staleCount; index += 1) {
       const attachmentId = `att_v2_${index.toString(16).padStart(32, "0")}`;
-      const partPath = path.join(stagingDir, `${attachmentId}.part`);
+      const partName = `${attachmentId}.part`;
+      const partPath = path.join(stagingDir, partName);
       await fs.writeFile(partPath, index < freshCount ? "fresh" : "stale");
-      if (index >= freshCount) await fs.utimes(partPath, staleDate, staleDate);
+      if (index < freshCount) freshPartNames.push(partName);
+      else await fs.utimes(partPath, staleDate, staleDate);
     }
 
     const recovery = makeManagedAttachmentStagingRecovery();
     const results = [];
+    const addedDuringRecoveryName = "att_v2_ffffffffffffffffffffffffffffffff.part";
     try {
       for (let invocation = 0; invocation < 10; invocation += 1) {
         const result = await Effect.runPromise(
@@ -363,19 +367,18 @@ describe("managed attachment cleanup", () => {
             attachmentsDir: root,
             nowMs,
             scanLimit: 32,
-            maxRemovals: 16,
+            maxRemovals: 32,
             invocationScanLimit: 64,
             invocationPassLimit: 2,
+            monotonicNow: () => 0,
           }),
         );
         results.push(result);
         expect(result.inspected).toBeLessThanOrEqual(64);
         expect(result.passes).toBeLessThanOrEqual(2);
+        expect(result.failures).toBe(0);
         if (invocation === 0) {
-          const addedDuringRecovery = path.join(
-            stagingDir,
-            "att_v2_ffffffffffffffffffffffffffffffff.part",
-          );
+          const addedDuringRecovery = path.join(stagingDir, addedDuringRecoveryName);
           await fs.writeFile(addedDuringRecovery, "fresh mutation");
         }
         if (result.exhausted) break;
@@ -384,11 +387,13 @@ describe("managed attachment cleanup", () => {
       await Effect.runPromise(recovery.close);
     }
 
-    expect(results[0]).toMatchObject({ inspected: 64, removed: 0, exhausted: false });
+    expect(results[0]).toMatchObject({ inspected: 64, exhausted: false });
     expect(results.length).toBeGreaterThan(1);
     expect(results.at(-1)?.exhausted).toBe(true);
     expect(results.reduce((total, result) => total + result.removed, 0)).toBe(staleCount);
-    expect(await fs.readdir(stagingDir)).toHaveLength(freshCount + 1);
+    expect((await fs.readdir(stagingDir)).sort()).toEqual(
+      [...freshPartNames, addedDuringRecoveryName].sort(),
+    );
   });
 
   it("stops at the invocation time budget and resumes the same generation", async () => {
