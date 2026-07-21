@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   createDedupedBrowserStateStorage,
+  browserHistoryEntryFromTab,
   sanitizeRecentHistoryByThreadId,
   selectThreadBrowserHistory,
 } from "./browserStateStore";
@@ -24,6 +25,36 @@ describe("browserStateStore selectors", () => {
 
     expect(first).toBe(second);
     expect(first).toEqual([]);
+  });
+});
+
+describe("browserHistoryEntryFromTab", () => {
+  it("omits local preview tabs so bearer URLs never reach history", () => {
+    expect(
+      browserHistoryEntryFromTab({
+        id: "tab-local",
+        title: "demo.html",
+        url: "http://127.0.0.1:58090/api/local-preview/secret/docs/demo.html",
+        lastCommittedUrl: null,
+        localFilePath: "C:\\workspace\\docs\\demo.html",
+      }),
+    ).toBeNull();
+  });
+
+  it("keeps ordinary web tabs", () => {
+    expect(
+      browserHistoryEntryFromTab({
+        id: "tab-web",
+        title: "Example",
+        url: "https://example.com/",
+        lastCommittedUrl: "https://example.com/docs",
+        localFilePath: null,
+      }),
+    ).toEqual({
+      url: "https://example.com/docs",
+      title: "Example",
+      tabId: "tab-web",
+    });
   });
 });
 
@@ -90,6 +121,13 @@ describe("sanitizeRecentHistoryByThreadId", () => {
         { url: 5, title: "C", tabId: "synara" },
       ],
       "thread-2": "not-an-array",
+      "thread-3": [
+        {
+          url: "http://127.0.0.1:58090/api/local-preview/secret/docs/demo.html",
+          title: "Leaked preview",
+          tabId: "local",
+        },
+      ],
     });
 
     expect(result).toEqual({

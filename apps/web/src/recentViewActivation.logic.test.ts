@@ -24,6 +24,8 @@ function makeSplitView(input: {
     panel: null,
     diffTurnId: null,
     diffFilePath: null,
+    filePath: null,
+    browserRequest: null,
     hasOpenedPanel: false,
     lastOpenPanel: "browser" as const,
   };

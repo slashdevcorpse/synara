@@ -9,9 +9,15 @@ import * as Net from "node:net";
 import * as OS from "node:os";
 import * as Path from "node:path";
 
-import type { BrowserExecuteCdpInput, ThreadBrowserState, ThreadId } from "@synara/contracts";
+import type {
+  BrowserExecuteCdpInput,
+  BrowserTabState,
+  ThreadBrowserState,
+  ThreadId,
+} from "@synara/contracts";
 
 import type { DesktopBrowserManager } from "./browserManager";
+import { isLoopbackLocalPreviewRouteUrl } from "./browserNavigationPolicy";
 
 const BROWSER_USE_HEADER_BYTES = 4;
 const BROWSER_USE_MAX_MESSAGE_BYTES = 8 * 1024 * 1024;
@@ -107,6 +113,18 @@ function asString(value: unknown): string | null {
 
 function asNumber(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function browserUseTabDisplayUrl(
+  tab: Pick<BrowserTabState, "lastCommittedUrl" | "localFilePath" | "url">,
+): string {
+  const localFilePath = tab.localFilePath?.trim();
+  if (localFilePath) {
+    return localFilePath;
+  }
+
+  const browserUrl = tab.lastCommittedUrl || tab.url;
+  return isLoopbackLocalPreviewRouteUrl(browserUrl) ? BROWSER_USE_INITIAL_URL : browserUrl;
 }
 
 function requireCodexSessionId(params: unknown, expectedSessionId: string | null): void {
@@ -495,7 +513,7 @@ export class BrowserUsePipeServer {
         active:
           client.selectedTrackedTabId === tracked.id ||
           (client.selectedTrackedTabId === null && snapshot.state.activeTabId === tab.id),
-        url: tab.lastCommittedUrl ?? tab.url,
+        url: browserUseTabDisplayUrl(tab),
       };
     });
   }
@@ -527,7 +545,7 @@ export class BrowserUsePipeServer {
       id: tracked.id,
       title: activeTab.title,
       active: true,
-      url: activeTab.lastCommittedUrl ?? activeTab.url,
+      url: browserUseTabDisplayUrl(activeTab),
     };
   }
 

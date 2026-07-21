@@ -2,11 +2,30 @@ import { describe, expect, it } from "vitest";
 
 import {
   browserAddressDisplayValue,
+  browserNavigationRetryDelay,
+  browserWebviewSecurityIdentity,
   buildBrowserAddressSuggestions,
   normalizeBrowserAddressInput,
+  resolveBrowserAddressInput,
   resolveBrowserChromeStatus,
   resolveBrowserAddressSync,
 } from "./BrowserPanel.logic";
+
+describe("browserWebviewSecurityIdentity", () => {
+  it("changes across tabs and local-preview identity transitions", () => {
+    expect(browserWebviewSecurityIdentity({ id: "tab-1" })).toBe("tab-1:0");
+    expect(browserWebviewSecurityIdentity({ id: "tab-1", securityEpoch: 1 })).toBe("tab-1:1");
+    expect(browserWebviewSecurityIdentity({ id: "tab-2", securityEpoch: 1 })).toBe("tab-2:1");
+  });
+});
+
+describe("browserNavigationRetryDelay", () => {
+  it("retries a one-shot navigation twice and then stops", () => {
+    expect(browserNavigationRetryDelay(1)).toBe(250);
+    expect(browserNavigationRetryDelay(2)).toBe(500);
+    expect(browserNavigationRetryDelay(3)).toBeNull();
+  });
+});
 
 describe("browserAddressDisplayValue", () => {
   it("hides about:blank for new tabs", () => {
@@ -15,6 +34,46 @@ describe("browserAddressDisplayValue", () => {
 
   it("keeps real urls visible", () => {
     expect(browserAddressDisplayValue({ url: "https://x.com/" })).toBe("https://x.com/");
+  });
+
+  it("shows the canonical local path instead of a capability URL", () => {
+    expect(
+      browserAddressDisplayValue({
+        url: "http://127.0.0.1:58090/api/local-preview/secret/docs/demo.html",
+        localFilePath: "C:\\workspace\\docs\\demo.html",
+      }),
+    ).toBe("C:\\workspace\\docs\\demo.html");
+  });
+});
+
+describe("resolveBrowserAddressInput", () => {
+  it("keeps local Windows and file URL inputs out of search navigation", () => {
+    expect(resolveBrowserAddressInput("C:\\workspace\\docs\\demo.html")).toEqual({
+      kind: "local-file",
+      path: "C:\\workspace\\docs\\demo.html",
+    });
+    expect(resolveBrowserAddressInput("file:///C:/workspace/docs/demo.html")).toEqual({
+      kind: "local-file",
+      path: "C:/workspace/docs/demo.html",
+    });
+  });
+
+  it("returns a visible denial for network paths", () => {
+    expect(resolveBrowserAddressInput("\\\\server\\share\\demo.html")).toMatchObject({
+      kind: "error",
+      message: expect.stringContaining("Network file paths"),
+    });
+  });
+
+  it("preserves ordinary navigation and search behavior", () => {
+    expect(resolveBrowserAddressInput("example.com")).toEqual({
+      kind: "navigate",
+      url: "https://example.com/",
+    });
+    expect(resolveBrowserAddressInput("find local docs")).toMatchObject({
+      kind: "navigate",
+      url: expect.stringContaining("google.com/search"),
+    });
   });
 });
 

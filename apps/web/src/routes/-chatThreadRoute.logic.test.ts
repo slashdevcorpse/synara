@@ -248,6 +248,8 @@ describe("resolveToggledChatPanelPatch", () => {
           panel: "diff",
           diffTurnId: TURN_ID,
           diffFilePath: "src/chat.tsx",
+          filePath: null,
+          browserRequest: null,
         },
         "browser",
       ),
@@ -265,6 +267,8 @@ describe("resolveToggledChatPanelPatch", () => {
           panel: "browser",
           diffTurnId: OTHER_TURN_ID,
           diffFilePath: "src/browser.tsx",
+          filePath: null,
+          browserRequest: null,
         },
         "browser",
       ),
@@ -286,6 +290,8 @@ describe("resolveSplitPaneMaximizeDecision", () => {
           panel: "diff",
           diffTurnId: TURN_ID,
           diffFilePath: "src/chat.tsx",
+          filePath: null,
+          browserRequest: null,
         },
       }),
     ).toEqual({
@@ -295,6 +301,8 @@ describe("resolveSplitPaneMaximizeDecision", () => {
         panel: "diff",
         diffTurnId: TURN_ID,
         diffFilePath: "src/chat.tsx",
+        filePath: null,
+        browserRequest: null,
       },
     });
   });
@@ -307,6 +315,32 @@ describe("resolveSplitPaneMaximizeDecision", () => {
         focusedPanelState: null,
       }),
     ).toBeNull();
+  });
+
+  it("preserves an embedded file preview for transfer into the single-chat dock", () => {
+    expect(
+      resolveSplitPaneMaximizeDecision({
+        splitViewId: "split-files",
+        focusedThreadId: THREAD_ID,
+        focusedPanelState: {
+          panel: "file",
+          diffTurnId: null,
+          diffFilePath: null,
+          filePath: "README.md",
+          browserRequest: null,
+        },
+      }),
+    ).toEqual({
+      splitViewIdToRemove: "split-files",
+      threadId: THREAD_ID,
+      panelState: {
+        panel: "file",
+        diffTurnId: null,
+        diffFilePath: null,
+        filePath: "README.md",
+        browserRequest: null,
+      },
+    });
   });
 });
 

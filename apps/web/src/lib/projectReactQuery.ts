@@ -18,6 +18,11 @@ export const projectQueryKeys = {
   readFile: (cwd: string | null, relativePath: string | null) =>
     ["projects", "read-file", cwd, relativePath] as const,
   localPreviewGrant: (path: string | null) => ["projects", "local-preview-grant", path] as const,
+  localHtmlPreviewGrant: (
+    path: string | null,
+    cwd: string | null,
+    purpose: "preview" | "browser",
+  ) => ["projects", "local-html-preview-grant", path, cwd, purpose] as const,
   discoverScripts: (cwd: string | null, depth: number) =>
     ["projects", "discover-scripts", cwd, depth] as const,
   searchEntries: (
@@ -176,6 +181,41 @@ export function projectLocalPreviewGrantQueryOptions(input: {
     enabled: (input.enabled ?? true) && input.path !== null,
     staleTime: input.staleTime ?? 60_000,
     refetchInterval: (query) => localPreviewGrantRefetchIntervalMs(query.state.data),
+  });
+}
+
+/**
+ * Directory-scoped HTML capabilities are deliberately separate from the
+ * legacy exact-file grant query above. They never poll: a rendered iframe must
+ * not reload every 30 seconds, and explicit Refresh remints on demand.
+ */
+export function projectLocalHtmlPreviewGrantQueryOptions(input: {
+  path: string | null;
+  cwd: string | null;
+  purpose: "preview" | "browser";
+  enabled?: boolean;
+  staleTime?: number;
+}) {
+  return queryOptions<ProjectCreateLocalFilePreviewGrantResult>({
+    queryKey: projectQueryKeys.localHtmlPreviewGrant(input.path, input.cwd, input.purpose),
+    queryFn: async () => {
+      const api = ensureNativeApi();
+      if (!input.path) {
+        throw new Error("Local HTML preview grant is unavailable.");
+      }
+      return api.projects.createLocalFilePreviewGrant({
+        path: input.path,
+        ...(input.cwd ? { cwd: input.cwd } : {}),
+        scope: "directory",
+        purpose: input.purpose,
+      });
+    },
+    enabled: (input.enabled ?? true) && input.path !== null,
+    // Reuse a freshly minted capability during quick view toggles, but a pane
+    // reopened later remints on mount. Staleness alone never schedules polling.
+    staleTime: input.staleTime ?? 60_000,
+    refetchInterval: false,
+    refetchOnWindowFocus: false,
   });
 }
 

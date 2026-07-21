@@ -9,6 +9,7 @@ import { useState } from "react";
 
 import type { ChatFileReference } from "~/lib/chatReferences";
 import type { FileCommentSelection } from "~/lib/fileComments";
+import type { WorkspaceHtmlBrowserOpenHandler } from "~/lib/workspaceFileOpener";
 import { WorkspaceFilePreview } from "../WorkspaceFilePreview";
 import { PanelStateMessage } from "./PanelStateMessage";
 import { WorkspaceExplorerSidebar } from "./workspaceExplorer";
@@ -22,9 +23,11 @@ const DOCK_EXPLORER_SIDEBAR_CLASS =
 
 export const DockExplorerPane = function DockExplorerPane(props: {
   workspaceRoot: string | null;
+  referenceRoot?: string | null | undefined;
   onReferenceInChat?: ((reference: ChatFileReference) => void) | undefined;
   onAskWhyInChat?: ((reference: ChatFileReference) => void) | undefined;
   onCommentInChat?: ((comment: FileCommentSelection) => void) | undefined;
+  onOpenInBrowser?: WorkspaceHtmlBrowserOpenHandler | undefined;
 }) {
   const [selectedFilePath, setSelectedFilePath] = useState<string | null>(null);
   const [expandedDirectories, setExpandedDirectories] = useState<ReadonlySet<string>>(
@@ -60,11 +63,15 @@ export const DockExplorerPane = function DockExplorerPane(props: {
         onSelectFile={handleSelectFile}
         onToggleDirectory={handleToggleDirectory}
         onReferenceInChat={props.onReferenceInChat}
+        referenceRoot={props.referenceRoot}
+        onOpenInBrowser={props.onOpenInBrowser}
       />
       <div className="flex min-h-0 min-w-0 flex-1">
         <WorkspaceFilePreview
           workspaceRoot={props.workspaceRoot}
           filePath={selectedFilePath}
+          referenceRoot={props.referenceRoot}
+          markdownPreviewDefault
           emptyState={
             <PanelStateMessage density="compact" fill="flex">
               <p>Select a file from the tree to view it.</p>
@@ -73,6 +80,7 @@ export const DockExplorerPane = function DockExplorerPane(props: {
           onReferenceInChat={props.onReferenceInChat}
           onAskWhyInChat={props.onAskWhyInChat}
           onCommentInChat={props.onCommentInChat}
+          onOpenInBrowser={props.onOpenInBrowser}
         />
       </div>
     </div>

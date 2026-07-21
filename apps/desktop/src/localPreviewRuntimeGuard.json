@@ -1,0 +1,3 @@
+{
+  "source": "(() => { 'use strict'; for (const name of ['RTCPeerConnection', 'webkitRTCPeerConnection', 'RTCDataChannel']) { Object.defineProperty(globalThis, name, { configurable: false, enumerable: false, get() { return undefined; }, set() {} }); if (typeof globalThis[name] !== 'undefined') { throw new Error('Failed to block ' + name); } } })();"
+}

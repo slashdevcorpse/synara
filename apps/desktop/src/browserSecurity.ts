@@ -5,8 +5,11 @@
 import type { WebContents } from "electron";
 
 import { BROWSER_SESSION_PARTITION } from "./browserSessionPolicy";
-
-const ABOUT_BLANK_URL = "about:blank";
+import {
+  ATTACHED_BROWSER_INITIAL_URL,
+  hardenAttachedBrowserParams,
+  hardenAttachedBrowserWebPreferences,
+} from "./browserWebPreferences";
 
 function isAboutBlankUrl(rawUrl: string): boolean {
   try {
@@ -195,20 +198,14 @@ export function secureBrowserWebviewAttachment(
   if (partition !== BROWSER_SESSION_PARTITION) {
     return { allowed: false, reason: "partition" };
   }
-  if (!isAllowedBrowserNavigationUrl(params.src ?? ABOUT_BLANK_URL)) {
+  if (!isAllowedBrowserNavigationUrl(params.src ?? ATTACHED_BROWSER_INITIAL_URL)) {
     return { allowed: false, reason: "source" };
   }
 
-  delete webPreferences.preload;
+  hardenAttachedBrowserWebPreferences(webPreferences);
+  hardenAttachedBrowserParams(params);
   delete params.preload;
   webPreferences.partition = BROWSER_SESSION_PARTITION;
-  webPreferences.contextIsolation = true;
-  webPreferences.nodeIntegration = false;
-  webPreferences.nodeIntegrationInSubFrames = false;
-  webPreferences.nodeIntegrationInWorker = false;
-  webPreferences.sandbox = true;
-  webPreferences.webSecurity = true;
-  webPreferences.allowRunningInsecureContent = false;
   webPreferences.webviewTag = false;
   return { allowed: true };
 }

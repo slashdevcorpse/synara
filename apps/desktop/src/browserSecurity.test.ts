@@ -94,19 +94,29 @@ describe("desktop browser security policy", () => {
     expect(installBrowserWebviewAttachmentSecurity(host as unknown as Electron.WebContents)).toBe(
       false,
     );
+    expect(host.listenerCount("will-attach-webview")).toBe(1);
+    expect(host.listenerCount("did-attach-webview")).toBe(1);
     host.emit("will-attach-webview", { preventDefault: preventAttachment }, webPreferences, params);
     expect(preventAttachment).toHaveBeenCalledOnce();
 
     const preventApprovedAttachment = vi.fn();
     const approvedPreferences = { partition: BROWSER_SESSION_PARTITION, nodeIntegration: true };
+    const approvedParams = {
+      partition: BROWSER_SESSION_PARTITION,
+      src: "https://example.test/",
+    };
     host.emit(
       "will-attach-webview",
       { preventDefault: preventApprovedAttachment },
       approvedPreferences,
-      { partition: BROWSER_SESSION_PARTITION, src: "https://example.test/" },
+      approvedParams,
     );
     expect(preventApprovedAttachment).not.toHaveBeenCalled();
     expect(approvedPreferences.nodeIntegration).toBe(false);
+    expect(approvedParams).toEqual({
+      partition: BROWSER_SESSION_PARTITION,
+      src: "about:blank",
+    });
 
     host.emit("did-attach-webview", {}, guest);
     expect(guest.windowOpenHandler?.({ url: "https://attacker.example/popup" })).toEqual({
@@ -247,21 +257,52 @@ describe("desktop browser security policy", () => {
       webviewTag: false,
     });
     expect(preferences).not.toHaveProperty("preload");
-    expect(params).not.toHaveProperty("preload");
+    expect(params).toEqual({
+      partition: BROWSER_SESSION_PARTITION,
+      src: "about:blank",
+    });
   });
 
   it("rejects webviews outside the dedicated partition or with a dangerous source", () => {
+    const wrongPartitionPreferences = { partition: "persist:other", nodeIntegration: true };
+    const wrongPartitionParams = {
+      partition: "persist:other",
+      preload: "file:///C:/untrusted/preload.js",
+      src: "https://example.test/",
+    };
+    expect(secureBrowserWebviewAttachment(wrongPartitionPreferences, wrongPartitionParams)).toEqual(
+      { allowed: false, reason: "partition" },
+    );
+    expect(wrongPartitionPreferences).toEqual({
+      partition: "persist:other",
+      nodeIntegration: true,
+    });
+    expect(wrongPartitionParams).toEqual({
+      partition: "persist:other",
+      preload: "file:///C:/untrusted/preload.js",
+      src: "https://example.test/",
+    });
+
+    const dangerousSourcePreferences = {
+      partition: BROWSER_SESSION_PARTITION,
+      nodeIntegration: true,
+    };
+    const dangerousSourceParams = {
+      partition: BROWSER_SESSION_PARTITION,
+      preload: "file:///C:/untrusted/preload.js",
+      src: "file:///sensitive",
+    };
     expect(
-      secureBrowserWebviewAttachment(
-        { partition: "persist:other" },
-        { partition: "persist:other", src: "https://example.test/" },
-      ),
-    ).toEqual({ allowed: false, reason: "partition" });
-    expect(
-      secureBrowserWebviewAttachment(
-        { partition: BROWSER_SESSION_PARTITION },
-        { partition: BROWSER_SESSION_PARTITION, src: "file:///sensitive" },
-      ),
+      secureBrowserWebviewAttachment(dangerousSourcePreferences, dangerousSourceParams),
     ).toEqual({ allowed: false, reason: "source" });
+    expect(dangerousSourcePreferences).toEqual({
+      partition: BROWSER_SESSION_PARTITION,
+      nodeIntegration: true,
+    });
+    expect(dangerousSourceParams).toEqual({
+      partition: BROWSER_SESSION_PARTITION,
+      preload: "file:///C:/untrusted/preload.js",
+      src: "file:///sensitive",
+    });
   });
 });
