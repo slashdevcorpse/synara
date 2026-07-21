@@ -6,6 +6,8 @@
     "lib": ["ES2023", "esnext.disposable"],
     "noEmit": true,
     "allowImportingTsExtensions": true,
+    "erasableSyntaxOnly": true,
+    "verbatimModuleSyntax": true,
     "plugins": [
       {
         "name": "@effect/language-service"

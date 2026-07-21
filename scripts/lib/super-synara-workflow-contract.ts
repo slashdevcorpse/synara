@@ -1245,10 +1245,33 @@ export function verifySuperSynaraReleaseDrafterText(
   if (!Array.isArray(draftSteps)) {
     throw new Error("Release Drafter scheduler must define draft steps.");
   }
-  const runtimeIndex = draftSteps.findIndex(
-    (step) => isRecord(step) && step.name === "Set up Node.js",
+  const checkoutIndex = draftSteps.findIndex(
+    (step) => isRecord(step) && step.name === "Checkout exact main source",
   );
+  const setupNodeIndexes = draftSteps.flatMap((step, index) =>
+    isRecord(step) && typeof step.uses === "string" && /^actions\/setup-node@/i.test(step.uses)
+      ? [index]
+      : [],
+  );
+  const setupNodeIndex = setupNodeIndexes[0] ?? -1;
   const plannerIndex = draftSteps.findIndex((step) => isRecord(step) && step.id === "plan");
+  const setupNodeStep = draftSteps[setupNodeIndex];
+  if (
+    setupNodeIndexes.length !== 1 ||
+    checkoutIndex < 0 ||
+    setupNodeIndex <= checkoutIndex ||
+    plannerIndex <= setupNodeIndex ||
+    !isRecord(setupNodeStep) ||
+    "if" in setupNodeStep ||
+    setupNodeStep.name !== "Set up Node.js" ||
+    setupNodeStep.uses !== SETUP_NODE_ACTION ||
+    !isRecord(setupNodeStep.with) ||
+    setupNodeStep.with["node-version-file"] !== "package.json"
+  ) {
+    throw new Error(
+      "Release Drafter scheduler must pin the repository Node runtime between checkout and planning.",
+    );
+  }
   const gateIndex = draftSteps.findIndex((step) => isRecord(step) && step.id === "changes");
   const authorizationIndex = draftSteps.findIndex(
     (step) => isRecord(step) && step.name === "Authorize manual release controller before mutation",
@@ -1259,20 +1282,6 @@ export function verifySuperSynaraReleaseDrafterText(
   const actionIndex = draftSteps.findIndex(
     (step) => isRecord(step) && step.id === "release_drafter",
   );
-  const runtimeStep = draftSteps[runtimeIndex];
-  if (
-    runtimeIndex < 0 ||
-    plannerIndex < 0 ||
-    runtimeIndex >= plannerIndex ||
-    !isRecord(runtimeStep) ||
-    runtimeStep.uses !== SETUP_NODE_ACTION ||
-    !isRecord(runtimeStep.with) ||
-    runtimeStep.with["node-version-file"] !== "package.json"
-  ) {
-    throw new Error(
-      "Release Drafter scheduler must pin the repository Node runtime before executing TypeScript planners.",
-    );
-  }
   if (
     gateIndex < 0 ||
     authorizationIndex < 0 ||

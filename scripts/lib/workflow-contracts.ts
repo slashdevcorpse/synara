@@ -67,6 +67,7 @@ const DEPENDENCY_REVIEW_ACTION =
   "actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294";
 const CODEQL_ACTION = "github/codeql-action";
 const CODEQL_ACTION_SHA = "e0647621c2984b5ed2f768cb892365bf2a616ad1";
+const CODEQL_SWIFT_TIMEOUT_MINUTES = 60;
 const CI_MACOS_REQUIRED_COMMANDS = [
   'test "$(uname -m)" = arm64',
   "bun run brand:check",
@@ -616,6 +617,9 @@ function validateCodeqlWorkflow(workflow: UnknownRecord, errors: string[]): void
     }
   }
   const swift = workflowJob(workflow, "analyze_swift");
+  if (swift?.["timeout-minutes"] !== CODEQL_SWIFT_TIMEOUT_MINUTES) {
+    errors.push(`${path} codeql-swift timeout-minutes must equal ${CODEQL_SWIFT_TIMEOUT_MINUTES}.`);
+  }
   const swiftBuilds = swift
     ? jobRunSteps({ analyze_swift: swift }, "analyze_swift", path, errors)
     : null;
@@ -967,7 +971,7 @@ export function validateMergifyConfiguration(contents: string): readonly string[
     return [`.mergify.yml is not valid YAML: ${error instanceof Error ? error.message : error}`];
   }
   const expected = {
-    merge_queue: { mode: "serial" },
+    merge_queue: { mode: "serial", max_parallel_checks: 1 },
     merge_protections_settings: { auto_merge_conditions: ["label = ready-to-merge"] },
     merge_protections: [
       {
@@ -983,12 +987,13 @@ export function validateMergifyConfiguration(contents: string): readonly string[
         branch_protection_injection_mode: "queue",
         merge_method: "squash",
         queue_conditions: ["base = main"],
+        merge_conditions: ["base = main"],
       },
     ],
   };
   if (JSON.stringify(raw) === JSON.stringify(expected)) return [];
   return [
-    ".mergify.yml must preserve serial, label-gated squash merging and inject the strict protected-main ruleset into the queue.",
+    ".mergify.yml must preserve serial, label-gated squash merging, use strict-ruleset-compatible in-place checks, and inject the strict protected-main ruleset into the queue.",
   ];
 }
 

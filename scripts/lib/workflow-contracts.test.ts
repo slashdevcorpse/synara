@@ -275,6 +275,7 @@ jobs:
   analyze_swift:
     name: codeql-swift
     runs-on: macos-15
+    timeout-minutes: 60
     permissions:
       contents: read
       security-events: write
@@ -312,6 +313,7 @@ jobs:
 
 const mergifyConfiguration = `merge_queue:
   mode: serial
+  max_parallel_checks: 1
 merge_protections_settings:
   auto_merge_conditions:
     - label = ready-to-merge
@@ -328,6 +330,8 @@ queue_rules:
     branch_protection_injection_mode: queue
     merge_method: squash
     queue_conditions:
+      - base = main
+    merge_conditions:
       - base = main
 `;
 
@@ -357,6 +361,21 @@ describe("workflow contracts", () => {
         ),
       ).join("\n"),
     ).toContain("inject the strict protected-main ruleset");
+
+    expect(
+      validateMergifyConfiguration(
+        mergifyConfiguration.replace("max_parallel_checks: 1", "max_parallel_checks: 2"),
+      ).join("\n"),
+    ).toContain("strict-ruleset-compatible in-place checks");
+
+    expect(
+      validateMergifyConfiguration(
+        mergifyConfiguration.replace(
+          "merge_conditions:\n      - base = main",
+          "merge_conditions:\n      - check-success = impossible",
+        ),
+      ).join("\n"),
+    ).toContain("strict-ruleset-compatible in-place checks");
   });
 
   it("rejects mutable action tags even in disabled workflows", () => {
@@ -653,6 +672,15 @@ describe("workflow contracts", () => {
     );
     expect(validateWorkflowContracts(wrongCategory, policy()).join("\n")).toContain(
       "codeql-swift must publish the fixed analysis category",
+    );
+
+    const undersizedSwiftTimeout = validFiles();
+    undersizedSwiftTimeout.set(
+      ".github/workflows/codeql.yml",
+      codeqlWorkflow.replace("    timeout-minutes: 60", "    timeout-minutes: 30"),
+    );
+    expect(validateWorkflowContracts(undersizedSwiftTimeout, policy()).join("\n")).toContain(
+      "codeql-swift timeout-minutes must equal 60",
     );
   });
 

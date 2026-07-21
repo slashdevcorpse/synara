@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -41,6 +42,28 @@ const releasePlannerScript = readFileSync(
 describe("Super Synara workflow contracts", () => {
   it("admits the controller-called publication and manual audit workflows", () => {
     expect(() => verifySuperSynaraWorkflowContracts(repoRoot)).not.toThrow();
+  });
+
+  it("loads both release entrypoints with native Node TypeScript", () => {
+    for (const [script, expectedGuard] of [
+      [
+        "scripts/plan-super-synara-release-drafter.ts",
+        "Missing Release Drafter planner argument: --repository.",
+      ],
+      ["scripts/verify-super-synara-github-state.ts", "Missing GitHub state argument: --phase."],
+    ] as const) {
+      const result = spawnSync("node", [resolve(repoRoot, script)], {
+        cwd: repoRoot,
+        encoding: "utf8",
+        timeout: 10_000,
+      });
+      const output = `${result.stdout}\n${result.stderr}`;
+      expect(result.error).toBeUndefined();
+      expect(result.signal).toBeNull();
+      expect(result.status).not.toBe(0);
+      expect(output).not.toContain("ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX");
+      expect(output).toContain(expectedGuard);
+    }
   });
 
   it("requires bounded fail-closed GitHub release visibility polling", () => {
@@ -224,16 +247,56 @@ describe("Super Synara workflow contracts", () => {
     ).toThrow("super-v$RESOLVED_VERSION");
   });
 
-  it("pins the repository Node runtime before executing release planners", () => {
-    expect(() =>
-      verifySuperSynaraReleaseDrafterText(
-        releaseDrafter.replace(
-          "          node-version-file: package.json",
-          "          node-version: 22",
-        ),
-        releaseDrafterConfig,
+  it("pins exactly one unconditional repository Node runtime between checkout and planning", () => {
+    const setupNode = [
+      "      - name: Set up Node.js",
+      "        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6",
+      "        with:",
+      "          node-version-file: package.json",
+      "",
+    ].join("\n");
+
+    const expectInvalidRuntime = (scheduler: string): void => {
+      expect(() => verifySuperSynaraReleaseDrafterText(scheduler, releaseDrafterConfig)).toThrow(
+        "pin the repository Node runtime between checkout and planning",
+      );
+    };
+
+    expectInvalidRuntime(releaseDrafter.replace(setupNode, ""));
+    expectInvalidRuntime(
+      releaseDrafter.replace("node-version-file: package.json", "node-version: 22"),
+    );
+    expectInvalidRuntime(
+      releaseDrafter.replace(
+        "actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38",
+        "actions/setup-node@0000000000000000000000000000000000000000",
       ),
-    ).toThrow("pin the repository Node runtime");
+    );
+    expectInvalidRuntime(
+      releaseDrafter
+        .replace(setupNode, "")
+        .replace(
+          "      - name: Checkout exact main source",
+          `${setupNode}      - name: Checkout exact main source`,
+        ),
+    );
+    expectInvalidRuntime(
+      releaseDrafter.replace(
+        "      - id: plan",
+        `${setupNode.replace("actions/setup-node@", "Actions/setup-node@")}      - id: plan`,
+      ),
+    );
+    expectInvalidRuntime(
+      releaseDrafter.replace(
+        "      - name: Set up Node.js\n",
+        "      - name: Set up Node.js\n        if: false\n",
+      ),
+    );
+    expectInvalidRuntime(
+      releaseDrafter
+        .replace(setupNode, "")
+        .replace("      - id: changes", `${setupNode}      - id: changes`),
+    );
   });
 
   it("isolates draft visibility in an authenticated minimal write-scoped job", () => {
