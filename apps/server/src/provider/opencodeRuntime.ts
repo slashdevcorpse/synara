@@ -40,13 +40,13 @@ import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 
 import { NetService, type NetServiceShape } from "@synara/shared/Net";
 import { splitLines } from "@synara/shared/text";
-import { prepareWindowsSafeProcess } from "@synara/shared/windowsProcess";
 import { buildProviderChildEnvironment } from "../providerChildEnvironment.ts";
 import {
   teardownEffectProcessTree,
   teardownProviderProcessTree,
 } from "./supervisedProcessTeardown.ts";
 import { isWindowsShellCommandMissingResult } from "../shell-command-detection.ts";
+import { prepareWindowsProviderProcess } from "./windowsProviderProcess.ts";
 
 const DEFAULT_OPENCODE_SERVER_TIMEOUT_MS = 20_000;
 const DEFAULT_HOSTNAME = "127.0.0.1";
@@ -840,6 +840,7 @@ const collectStreamAsString = <E>(stream: Stream.Stream<Uint8Array, E>): Effect.
   );
 
 export interface OpenCodeRuntimeLiveOptions {
+  readonly prepareProcess?: typeof prepareWindowsProviderProcess;
   readonly teardownProcessTree?: typeof teardownProviderProcessTree;
   readonly netService?: NetServiceShape;
 }
@@ -859,13 +860,18 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
         const childEnv = buildOpenCodeServerProcessEnv({
           ...(input.cliSpec ? { cliSpec: input.cliSpec } : {}),
         });
-        const prepared = prepareWindowsSafeProcess(input.binaryPath, input.args, {
-          cwd: input.cwd,
-          env: childEnv,
-        });
+        const prepared = (options?.prepareProcess ?? prepareWindowsProviderProcess)(
+          input.binaryPath,
+          input.args,
+          {
+            cwd: input.cwd,
+            env: childEnv,
+          },
+        );
         const child = yield* spawner.spawn(
           ChildProcess.make(prepared.command, prepared.args, {
             shell: prepared.shell,
+            ...(prepared.windowsHide ? { windowsHide: true } : {}),
             ...(prepared.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
             ...(input.cwd ? { cwd: input.cwd } : {}),
             env: childEnv,
@@ -924,17 +930,29 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
           ));
         const timeoutMs = input.timeoutMs ?? DEFAULT_OPENCODE_SERVER_TIMEOUT_MS;
         const args = ["serve", "--hostname", hostname, "--port", String(port)];
+        const childEnv = buildOpenCodeServerProcessEnv({
+          cliSpec,
+          ...(input.experimentalWebSockets !== undefined
+            ? { experimentalWebSockets: input.experimentalWebSockets }
+            : {}),
+        });
+        const prepared = (options?.prepareProcess ?? prepareWindowsProviderProcess)(
+          input.binaryPath,
+          args,
+          {
+            cwd: input.cwd,
+            env: childEnv,
+          },
+        );
 
         const child = yield* spawner
           .spawn(
-            ChildProcess.make(input.binaryPath, args, {
-              env: buildOpenCodeServerProcessEnv({
-                cliSpec,
-                ...(input.experimentalWebSockets !== undefined
-                  ? { experimentalWebSockets: input.experimentalWebSockets }
-                  : {}),
-              }),
+            ChildProcess.make(prepared.command, prepared.args, {
+              env: childEnv,
               ...(input.cwd ? { cwd: input.cwd } : {}),
+              shell: prepared.shell,
+              ...(prepared.windowsHide ? { windowsHide: true } : {}),
+              ...(prepared.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
               detached: false,
               killSignal: "SIGKILL",
               forceKillAfter: "1500 millis",

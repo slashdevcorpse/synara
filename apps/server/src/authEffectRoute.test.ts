@@ -9,7 +9,9 @@ import { AuthSessionId } from "@synara/contracts";
 import {
   ATTACHMENT_CANCEL_ROUTE_PATH,
   ATTACHMENT_UPLOAD_ROUTE_PATH,
+  VOICE_TRANSCRIPTION_UPLOAD_ROUTE_PATH,
 } from "@synara/shared/binaryTransfer";
+import { SYNARA_CSRF_HEADER_NAME, SYNARA_CSRF_HEADER_VALUE } from "@synara/shared/authSecurity";
 import { DateTime, Effect, Exit, Layer, Scope } from "effect";
 import { HttpRouter } from "effect/unstable/http";
 import { describe, expect, it } from "vitest";
@@ -21,13 +23,19 @@ import {
 } from "./auth/Services/SessionCredentialService";
 import { ServerConfig, type ServerConfigShape } from "./config";
 import { ManagedAttachmentRepositoryLive } from "./persistence/Layers/ManagedAttachments";
+import {
+  ManagedAttachmentRepository,
+  type ManagedAttachmentUsage,
+} from "./persistence/Services/ManagedAttachments";
 import { SqlitePersistenceMemory } from "./persistence/Layers/Sqlite";
 import {
   AUTH_JSON_BODY_MAX_BYTES,
   authEffectRouteLayer,
   binaryUploadEffectRouteLayer,
+  makeBinaryUploadEffectRouteLayer,
 } from "./http";
 import { ProviderAdapterRegistry } from "./provider/Services/ProviderAdapterRegistry";
+import { makeUploadAdmission } from "./uploadAdmission";
 
 const currentSessionId = AuthSessionId.makeUnsafe("11111111-1111-4111-8111-111111111111");
 const otherSessionId = AuthSessionId.makeUnsafe("22222222-2222-4222-8222-222222222222");
@@ -106,10 +114,16 @@ function makeServerAuth(sideEffects: { count: number }): ServerAuthShape {
 async function withAuthEffectServer(
   config: ServerConfigShape,
   serverAuth: ServerAuthShape,
-  run: (origin: string) => Promise<void>,
-  routeLayer:
-    | typeof authEffectRouteLayer
-    | typeof binaryUploadEffectRouteLayer = authEffectRouteLayer,
+  run: (
+    origin: string,
+    harness: {
+      readonly getManagedAttachmentUsage: (input: {
+        readonly ownerKind: string;
+        readonly ownerId: string;
+      }) => Promise<ManagedAttachmentUsage>;
+    },
+  ) => Promise<void>,
+  routeLayer?: typeof binaryUploadEffectRouteLayer,
 ): Promise<void> {
   const scope = await Effect.runPromise(Scope.make("sequential"));
   let nodeServer: http.Server | null = null;
@@ -140,10 +154,10 @@ async function withAuthEffectServer(
             },
             { port: 0, host: "127.0.0.1" },
           );
-          if (routeLayer === authEffectRouteLayer) {
-            yield* httpServer.serve(yield* HttpRouter.toHttpEffect(authEffectRouteLayer));
+          if (routeLayer) {
+            yield* httpServer.serve(yield* HttpRouter.toHttpEffect(routeLayer));
           } else {
-            yield* httpServer.serve(yield* HttpRouter.toHttpEffect(binaryUploadEffectRouteLayer));
+            yield* httpServer.serve(yield* HttpRouter.toHttpEffect(authEffectRouteLayer));
           }
         }).pipe(Effect.provideServices(services)),
         scope,
@@ -151,7 +165,17 @@ async function withAuthEffectServer(
     );
     const address = (nodeServer as http.Server | null)?.address();
     if (!address || typeof address !== "object") throw new Error("Expected server address");
-    await run(`http://127.0.0.1:${address.port}`);
+    const getManagedAttachmentUsage = (input: {
+      readonly ownerKind: string;
+      readonly ownerId: string;
+    }) =>
+      Effect.runPromise(
+        Effect.gen(function* () {
+          const repository = yield* ManagedAttachmentRepository;
+          return yield* repository.getUsage(input);
+        }).pipe(Effect.provideServices(services)),
+      );
+    await run(`http://127.0.0.1:${address.port}`, { getManagedAttachmentUsage });
   } finally {
     await Effect.runPromise(Scope.close(scope, Exit.void));
   }
@@ -170,6 +194,7 @@ function mutationRequest(input: {
   readonly origin?: string;
   readonly credential: "bearer" | "cookie";
   readonly body?: unknown;
+  readonly csrf?: boolean;
 }): RequestInit {
   return {
     method: "POST",
@@ -177,7 +202,12 @@ function mutationRequest(input: {
       ...(input.origin === undefined ? {} : { Origin: input.origin }),
       ...(input.credential === "bearer"
         ? { Authorization: "Bearer bearer-token" }
-        : { Cookie: "synara_session=cookie-token" }),
+        : {
+            Cookie: "synara_session=cookie-token",
+            ...(input.csrf === false
+              ? {}
+              : { [SYNARA_CSRF_HEADER_NAME]: SYNARA_CSRF_HEADER_VALUE }),
+          }),
       ...(input.body === undefined ? {} : { "Content-Type": "application/json" }),
     },
     ...(input.body === undefined ? {} : { body: JSON.stringify(input.body) }),
@@ -239,7 +269,78 @@ describe("authEffectRouteLayer", () => {
         body: JSON.stringify({ credential: "PAIRINGTOKEN" }),
       });
       expect(validResponse.status).toBe(200);
+      expect(validResponse.headers.get("set-cookie")).toContain("SameSite=Strict");
       expect(sideEffects.count).toBe(1);
+    });
+  });
+
+  it("advertises the CSRF header on trusted auth mutation preflights", async () => {
+    const config = { host: "127.0.0.1", publicUrl: undefined } as ServerConfigShape;
+    await withAuthEffectServer(config, makeServerAuth({ count: 0 }), async (serverOrigin) => {
+      const response = await fetch(`${serverOrigin}/api/auth/logout`, {
+        method: "OPTIONS",
+        headers: {
+          Origin: "synara-canary://app",
+          "Access-Control-Request-Method": "POST",
+          "Access-Control-Request-Headers": `content-type, ${SYNARA_CSRF_HEADER_NAME}`,
+        },
+      });
+
+      expect(response.status).toBe(204);
+      expect(response.headers.get("access-control-allow-origin")).toBe("synara-canary://app");
+      expect(response.headers.get("access-control-allow-headers")?.toLowerCase()).toContain(
+        SYNARA_CSRF_HEADER_NAME.toLowerCase(),
+      );
+    });
+  });
+
+  it("returns credentialed CORS headers to trusted custom-scheme auth callers", async () => {
+    const sideEffects = { count: 0 };
+    const config = { host: "127.0.0.1", publicUrl: undefined } as ServerConfigShape;
+    await withAuthEffectServer(config, makeServerAuth(sideEffects), async (serverOrigin) => {
+      const origin = "synara-canary://app";
+      for (const rejectedOrigin of ["null", "not a url", "https://evil.example.test"]) {
+        const rejectedBootstrapResponse = await fetch(`${serverOrigin}/api/auth/bootstrap`, {
+          method: "POST",
+          headers: { Origin: rejectedOrigin, "Content-Type": "application/json" },
+          body: JSON.stringify({ credential: "PAIRINGTOKEN" }),
+        });
+        expect(rejectedBootstrapResponse.status, rejectedOrigin).toBe(403);
+      }
+      expect(sideEffects.count).toBe(0);
+
+      const bootstrapResponse = await fetch(`${serverOrigin}/api/auth/bootstrap`, {
+        method: "POST",
+        headers: { Origin: origin, "Content-Type": "application/json" },
+        body: JSON.stringify({ credential: "PAIRINGTOKEN" }),
+      });
+
+      expect(bootstrapResponse.status).toBe(200);
+      expect(bootstrapResponse.headers.get("access-control-allow-origin")).toBe(origin);
+      expect(bootstrapResponse.headers.get("access-control-allow-credentials")).toBe("true");
+      const bootstrapCookie = bootstrapResponse.headers.get("set-cookie") ?? "";
+      expect(bootstrapCookie).toContain("SameSite=None");
+      expect(bootstrapCookie).toContain("Secure");
+      expect(bootstrapCookie).not.toContain("SameSite=Strict");
+
+      const sessionResponse = await fetch(`${serverOrigin}/api/auth/session`, {
+        headers: { Origin: origin },
+      });
+      expect(sessionResponse.status).toBe(200);
+      expect(sessionResponse.headers.get("access-control-allow-origin")).toBe(origin);
+      expect(sessionResponse.headers.get("access-control-allow-credentials")).toBe("true");
+
+      const logoutResponse = await fetch(
+        `${serverOrigin}/api/auth/logout`,
+        mutationRequest({ origin, credential: "cookie" }),
+      );
+      expect(logoutResponse.status).toBe(200);
+      const expiredCookie = logoutResponse.headers.get("set-cookie") ?? "";
+      expect(expiredCookie).toContain("Max-Age=0");
+      expect(expiredCookie).toContain("SameSite=None");
+      expect(expiredCookie).toContain("Secure");
+      expect(expiredCookie).not.toContain("SameSite=Strict");
+      expect(sideEffects.count).toBe(2);
     });
   });
 
@@ -311,6 +412,25 @@ describe("authEffectRouteLayer", () => {
     });
   });
 
+  it("rejects a trusted-origin cookie mutation without the CSRF header", async () => {
+    const sideEffects = { count: 0 };
+    const config = { host: "127.0.0.1", publicUrl: undefined } as ServerConfigShape;
+    await withAuthEffectServer(config, makeServerAuth(sideEffects), async (serverOrigin) => {
+      const response = await fetch(
+        `${serverOrigin}/api/auth/logout`,
+        mutationRequest({
+          origin: serverOrigin,
+          credential: "cookie",
+          csrf: false,
+        }),
+      );
+
+      expect(response.status).toBe(403);
+      await expect(response.json()).resolves.toEqual({ error: "CSRF header required." });
+      expect(sideEffects.count).toBe(0);
+    });
+  });
+
   it("logs out either role and clears the exact cookie with secure public-mode attributes", async () => {
     const sideEffects = { count: 0 };
     const config = {
@@ -334,7 +454,7 @@ describe("authEffectRouteLayer", () => {
       expect(cookie).toContain("Max-Age=0");
       expect(cookie).toContain("HttpOnly");
       expect(cookie).toContain("Path=/");
-      expect(cookie).toContain("SameSite=Lax");
+      expect(cookie).toContain("SameSite=Strict");
       expect(cookie).toContain("Secure");
       expect(sideEffects.count).toBe(1);
     });
@@ -368,6 +488,9 @@ describe("binaryUploadEffectRouteLayer", () => {
           expect(response.headers.get("access-control-allow-headers")?.toLowerCase()).toContain(
             "content-type",
           );
+          expect(response.headers.get("access-control-allow-headers")?.toLowerCase()).toContain(
+            SYNARA_CSRF_HEADER_NAME.toLowerCase(),
+          );
         },
         binaryUploadEffectRouteLayer,
       );
@@ -395,6 +518,41 @@ describe("binaryUploadEffectRouteLayer", () => {
             mimeType: "image/png",
           });
           const url = `${serverOrigin}${ATTACHMENT_UPLOAD_ROUTE_PATH}?${params.toString()}`;
+          const trustedOrigin = "https://synara.example.test";
+          const untrustedPreflightResponse = await fetch(url, {
+            method: "OPTIONS",
+            headers: {
+              Origin: "https://evil.example.test",
+              "Access-Control-Request-Method": "POST",
+            },
+          });
+          expect(untrustedPreflightResponse.status).toBe(403);
+          expect(untrustedPreflightResponse.headers.get("access-control-allow-origin")).toBeNull();
+
+          const preflightResponse = await fetch(url, {
+            method: "OPTIONS",
+            headers: {
+              Origin: trustedOrigin,
+              "Access-Control-Request-Method": "POST",
+              "Access-Control-Request-Headers": SYNARA_CSRF_HEADER_NAME,
+            },
+          });
+          expect(preflightResponse.status).toBe(204);
+          expect(preflightResponse.headers.get("access-control-allow-origin")).toBe(trustedOrigin);
+
+          const unauthenticatedResponse = await fetch(url, {
+            method: "POST",
+            headers: { Origin: trustedOrigin },
+            body: Uint8Array.from([1]),
+          });
+          expect(unauthenticatedResponse.status).toBe(401);
+          expect(unauthenticatedResponse.headers.get("access-control-allow-origin")).toBe(
+            trustedOrigin,
+          );
+          expect(unauthenticatedResponse.headers.get("access-control-allow-credentials")).toBe(
+            "true",
+          );
+
           const cookieResponse = await fetch(url, {
             method: "POST",
             headers: { Cookie: "synara_session=cookie-token" },
@@ -402,6 +560,34 @@ describe("binaryUploadEffectRouteLayer", () => {
           });
           expect(cookieResponse.status).toBe(403);
           expect(fs.readdirSync(attachmentsDir)).toEqual([]);
+
+          const missingCsrfResponse = await fetch(url, {
+            method: "POST",
+            headers: {
+              Origin: trustedOrigin,
+              Cookie: "synara_session=cookie-token",
+            },
+            body: Uint8Array.from([1]),
+          });
+          expect(missingCsrfResponse.status).toBe(403);
+          expect(missingCsrfResponse.headers.get("access-control-allow-origin")).toBe(
+            trustedOrigin,
+          );
+          expect(missingCsrfResponse.headers.get("access-control-allow-credentials")).toBe("true");
+
+          const cookieWithCsrfResponse = await fetch(
+            `${serverOrigin}${ATTACHMENT_UPLOAD_ROUTE_PATH}`,
+            {
+              method: "POST",
+              headers: {
+                Origin: trustedOrigin,
+                Cookie: "synara_session=cookie-token",
+                [SYNARA_CSRF_HEADER_NAME]: SYNARA_CSRF_HEADER_VALUE,
+              },
+              body: Uint8Array.from([1]),
+            },
+          );
+          expect(cookieWithCsrfResponse.status).toBe(400);
 
           const oversizedStatus = await new Promise<number>((resolve, reject) => {
             const target = new URL(url);
@@ -458,6 +644,246 @@ describe("binaryUploadEffectRouteLayer", () => {
           expect((await cancel()).status).toBe(200);
         },
         binaryUploadEffectRouteLayer,
+      );
+    } finally {
+      fs.rmSync(attachmentsDir, { recursive: true, force: true });
+    }
+  });
+
+  it("rate-limits before body, reservation, and file side effects, then refills by clock", async () => {
+    const attachmentsDir = fs.mkdtempSync(path.join(os.tmpdir(), "synara-upload-rate-"));
+    let nowMs = 0;
+    const admission = makeUploadAdmission({
+      now: () => nowMs,
+      uploadsPerMinutePerPrincipal: 1,
+      uploadsPerMinutePerPeer: 5,
+    });
+    const config = {
+      host: "127.0.0.1",
+      authToken: "desktop-secret",
+      attachmentsDir,
+    } as ServerConfigShape;
+    try {
+      await withAuthEffectServer(
+        config,
+        makeServerAuth({ count: 0 }),
+        async (serverOrigin, harness) => {
+          const params = new URLSearchParams({
+            type: "image",
+            threadId: "thread-1",
+            name: "screen.png",
+            mimeType: "image/png",
+          });
+          const uploadUrl = `${serverOrigin}${ATTACHMENT_UPLOAD_ROUTE_PATH}?${params.toString()}`;
+          const first = await fetch(uploadUrl, {
+            method: "POST",
+            headers: { Authorization: "Bearer bearer-token" },
+            body: Uint8Array.from([1]),
+          });
+          expect(first.status).toBe(201);
+          const firstPayload = (await first.json()) as { readonly id: string };
+
+          const usageBefore = await harness.getManagedAttachmentUsage({
+            ownerKind: "session",
+            ownerId: currentSessionId,
+          });
+          const filesBefore = fs
+            .readdirSync(attachmentsDir, { recursive: true })
+            .map(String)
+            .sort();
+          const rejected = await fetch(uploadUrl, {
+            method: "POST",
+            headers: { Authorization: "Bearer bearer-token" },
+            body: Uint8Array.from([9]),
+          });
+          expect(rejected.status).toBe(429);
+          expect(rejected.headers.get("retry-after")).toBe("60");
+          await expect(rejected.json()).resolves.toEqual({ error: "Upload rate limit exceeded." });
+          expect(
+            await harness.getManagedAttachmentUsage({
+              ownerKind: "session",
+              ownerId: currentSessionId,
+            }),
+          ).toEqual(usageBefore);
+          expect(fs.readdirSync(attachmentsDir, { recursive: true }).map(String).sort()).toEqual(
+            filesBefore,
+          );
+
+          const cancel = await fetch(`${serverOrigin}${ATTACHMENT_CANCEL_ROUTE_PATH}`, {
+            method: "POST",
+            headers: {
+              Authorization: "Bearer bearer-token",
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({ attachmentId: firstPayload.id }),
+          });
+          expect(cancel.status).toBe(200);
+
+          const legacy = await fetch(`${uploadUrl}&token=desktop-secret`, {
+            method: "POST",
+            body: Uint8Array.from([2]),
+          });
+          expect(legacy.status).toBe(201);
+
+          nowMs = 60_000;
+          const refilled = await fetch(uploadUrl, {
+            method: "POST",
+            headers: { Authorization: "Bearer bearer-token" },
+            body: Uint8Array.from([3]),
+          });
+          expect(refilled.status).toBe(201);
+        },
+        makeBinaryUploadEffectRouteLayer(admission),
+      );
+    } finally {
+      fs.rmSync(attachmentsDir, { recursive: true, force: true });
+    }
+  });
+
+  it("uses the normalized direct peer for legacy uploads and ignores forwarded IPs", async () => {
+    const attachmentsDir = fs.mkdtempSync(path.join(os.tmpdir(), "synara-upload-peer-"));
+    const admission = makeUploadAdmission({
+      now: () => 0,
+      uploadsPerMinutePerPrincipal: 10,
+      uploadsPerMinutePerPeer: 1,
+    });
+    const admissionInputs: Array<{
+      readonly principalKey: string;
+      readonly remoteAddress: string | null | undefined;
+      readonly rateLimitPeer?: boolean;
+    }> = [];
+    const recordingAdmission = {
+      admit: (input: (typeof admissionInputs)[number]) => {
+        admissionInputs.push(input);
+        return admission.admit(input);
+      },
+      snapshot: admission.snapshot,
+    };
+    const config = {
+      host: "127.0.0.1",
+      authToken: "desktop-secret",
+      attachmentsDir,
+    } as ServerConfigShape;
+    try {
+      await withAuthEffectServer(
+        config,
+        makeServerAuth({ count: 0 }),
+        async (serverOrigin) => {
+          const first = await fetch(`${serverOrigin}${ATTACHMENT_UPLOAD_ROUTE_PATH}`, {
+            method: "POST",
+            headers: {
+              Authorization: "Bearer bearer-token",
+              "X-Forwarded-For": "198.51.100.10",
+            },
+          });
+          expect(first.status).toBe(400);
+
+          const legacy = await fetch(
+            `${serverOrigin}${ATTACHMENT_UPLOAD_ROUTE_PATH}?token=desktop-secret`,
+            {
+              method: "POST",
+              headers: { "X-Forwarded-For": "203.0.113.20" },
+            },
+          );
+          const voice = await fetch(
+            `${serverOrigin}${VOICE_TRANSCRIPTION_UPLOAD_ROUTE_PATH}?provider=codex&cwd=C%3A%5Crepo&mimeType=audio%2Fwebm&sampleRateHz=48000&durationMs=1000`,
+            {
+              method: "POST",
+              headers: {
+                Authorization: "Bearer bearer-token",
+                "X-Forwarded-For": "192.0.2.30",
+              },
+              body: Uint8Array.from([1]),
+            },
+          );
+          expect(admissionInputs).toHaveLength(3);
+          expect(new Set(admissionInputs.map((input) => input.remoteAddress)).size).toBe(1);
+          expect(admissionInputs.map((input) => input.principalKey)).toEqual([
+            `session:${currentSessionId}`,
+            "local-loopback:local-loopback",
+            `session:${currentSessionId}`,
+          ]);
+          expect(admissionInputs.map((input) => input.rateLimitPeer)).toEqual([true, true, true]);
+          expect(legacy.status).toBe(429);
+          expect(legacy.headers.get("retry-after")).toBe("60");
+          expect(voice.status).toBe(429);
+          expect(fs.readdirSync(attachmentsDir)).toEqual([]);
+        },
+        makeBinaryUploadEffectRouteLayer(recordingAdmission),
+      );
+    } finally {
+      fs.rmSync(attachmentsDir, { recursive: true, force: true });
+    }
+  });
+
+  it("isolates publicUrl session uploads from the shared proxy peer", async () => {
+    const attachmentsDir = fs.mkdtempSync(path.join(os.tmpdir(), "synara-upload-proxy-"));
+    const admission = makeUploadAdmission({
+      now: () => 0,
+      uploadsPerMinutePerPrincipal: 10,
+      uploadsPerMinutePerPeer: 1,
+    });
+    const admissionInputs: Array<{
+      readonly principalKey: string;
+      readonly remoteAddress: string | null | undefined;
+      readonly rateLimitPeer?: boolean;
+    }> = [];
+    const recordingAdmission = {
+      admit: (input: (typeof admissionInputs)[number]) => {
+        admissionInputs.push(input);
+        return admission.admit(input);
+      },
+      snapshot: admission.snapshot,
+    };
+    const config = {
+      host: "127.0.0.1",
+      publicUrl: new URL("https://synara.example.test/"),
+      authToken: "proxy-secret",
+      attachmentsDir,
+    } as ServerConfigShape;
+    try {
+      await withAuthEffectServer(
+        config,
+        makeServerAuth({ count: 0 }),
+        async (serverOrigin) => {
+          const unauthenticated = await fetch(`${serverOrigin}${ATTACHMENT_UPLOAD_ROUTE_PATH}`, {
+            method: "POST",
+            headers: { "X-Forwarded-For": "192.0.2.1" },
+          });
+          expect(unauthenticated.status).toBe(401);
+          expect(admissionInputs).toEqual([]);
+
+          const authenticatedAttachment = await fetch(
+            `${serverOrigin}${ATTACHMENT_UPLOAD_ROUTE_PATH}`,
+            {
+              method: "POST",
+              headers: {
+                Authorization: "Bearer bearer-token",
+                "X-Forwarded-For": "198.51.100.10",
+              },
+            },
+          );
+          const authenticatedVoice = await fetch(
+            `${serverOrigin}${VOICE_TRANSCRIPTION_UPLOAD_ROUTE_PATH}`,
+            {
+              method: "POST",
+              headers: {
+                Authorization: "Bearer bearer-token",
+                "X-Forwarded-For": "203.0.113.20",
+              },
+            },
+          );
+          expect(authenticatedAttachment.status).toBe(400);
+          expect(authenticatedVoice.status).toBe(400);
+          expect(admissionInputs.map((input) => input.rateLimitPeer)).toEqual([false, false]);
+          expect(new Set(admissionInputs.map((input) => input.remoteAddress)).size).toBe(1);
+          expect(admission.snapshot()).toMatchObject({
+            trackedPrincipals: 1,
+            trackedPeers: 0,
+          });
+          expect(fs.readdirSync(attachmentsDir)).toEqual([]);
+        },
+        makeBinaryUploadEffectRouteLayer(recordingAdmission),
       );
     } finally {
       fs.rmSync(attachmentsDir, { recursive: true, force: true });

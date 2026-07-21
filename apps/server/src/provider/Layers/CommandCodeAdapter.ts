@@ -27,11 +27,11 @@ import {
   type ProviderSession,
 } from "@synara/contracts";
 import { resolveCommandCodeCliExecutable } from "@synara/shared/commandCodeCliExecutable";
-import { prepareWindowsSafeProcess } from "@synara/shared/windowsProcess";
 import { Effect, Layer, Queue, Stream } from "effect";
 
 import { ServerConfig } from "../../config.ts";
 import { buildProviderChildEnvironment } from "../../providerChildEnvironment.ts";
+import { prepareWindowsProviderProcess } from "../windowsProviderProcess.ts";
 import { appendFileAttachmentsPromptBlock } from "../attachmentProjection.ts";
 import {
   ProviderAdapterProcessError,
@@ -73,6 +73,7 @@ type ResolveExecutable = (
 
 export interface CommandCodeAdapterLiveOptions {
   readonly spawnProcess?: SpawnProcess;
+  readonly prepareProcess?: typeof prepareWindowsProviderProcess;
   readonly teardownProcessTree?: TeardownProcessTree;
   readonly resolveExecutable?: ResolveExecutable;
   readonly nativeEventLogger?: EventNdjsonLogger;
@@ -249,6 +250,7 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
     const runtimeEventQueue = yield* Queue.unbounded<ProviderRuntimeEvent>();
     const sessions = new Map<ThreadId, CommandCodeSessionContext>();
     const spawnProcess = options?.spawnProcess ?? spawn;
+    const prepareProcess = options?.prepareProcess ?? prepareWindowsProviderProcess;
     const teardown = options?.teardownProcessTree;
     const resolveExecutable = options?.resolveExecutable ?? resolveAndValidateExecutable;
 
@@ -574,17 +576,18 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
           runtimeMode: context.session.runtimeMode,
           plan: input.interactionMode === "plan",
         });
-        const prepared = prepareWindowsSafeProcess(executable, args, { cwd, env });
         const child = yield* Effect.try({
-          try: () =>
-            spawnProcess(prepared.command, prepared.args, {
+          try: () => {
+            const prepared = prepareProcess(executable, args, { cwd, env });
+            return spawnProcess(prepared.command, prepared.args, {
               cwd,
               env,
               stdio: ["pipe", "pipe", "pipe"],
               shell: prepared.shell,
               windowsHide: prepared.windowsHide,
               windowsVerbatimArguments: prepared.windowsVerbatimArguments,
-            }),
+            });
+          },
           catch: (cause) =>
             new ProviderAdapterProcessError({
               provider: PROVIDER,
@@ -740,7 +743,7 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
             const env = buildProviderChildEnvironment({ provider: PROVIDER });
             const configured = input.binaryPath?.trim() || DEFAULT_BINARY;
             const executable = resolveExecutable(configured, { cwd, env });
-            const prepared = prepareWindowsSafeProcess(executable, ["--list-models"], { cwd, env });
+            const prepared = prepareProcess(executable, ["--list-models"], { cwd, env });
             const child = spawnProcess(prepared.command, prepared.args, {
               cwd,
               env,

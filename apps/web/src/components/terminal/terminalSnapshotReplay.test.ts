@@ -3,14 +3,17 @@ import { describe, expect, it } from "vitest";
 
 import {
   applyReplayOnce,
+  batchDeferredTerminalOutput,
   createRecoveredGridOutputBuffer,
   RecoveredGridFinalizationError,
   type ReplayIdentityState,
   replaySnapshotAtBackendOpenGrid,
   replaySnapshotAtDestinationGrid,
   replaySnapshotAtRecoveredGrid,
+  makeAuthoritativeTerminalResnapshot,
   shouldReplayColdSnapshot,
   snapshotReplayIdentity,
+  TERMINAL_WRITE_BATCH_SIZE_LIMIT,
 } from "./terminalSnapshotReplay";
 
 function dimensionedSnapshot(
@@ -46,6 +49,38 @@ function legacySnapshot(): TerminalSessionSnapshot {
     updatedAt: new Date(0).toISOString(),
   };
 }
+
+describe("batchDeferredTerminalOutput", () => {
+  it("bounds UTF-8 writes while preserving retained text, order, and ACK bytes", () => {
+    const encoder = new TextEncoder();
+    const first = `${"a".repeat(TERMINAL_WRITE_BATCH_SIZE_LIMIT - 2)}é`;
+    const second = `🙂${"b".repeat(17)}`;
+    const outputs = [first, second].map((data) => ({
+      data,
+      byteLength: encoder.encode(data).byteLength,
+    }));
+
+    const batches = [...batchDeferredTerminalOutput(outputs)];
+
+    expect(batches).toHaveLength(2);
+    expect(
+      batches.every(
+        ({ data }) => encoder.encode(data).byteLength <= TERMINAL_WRITE_BATCH_SIZE_LIMIT,
+      ),
+    ).toBe(true);
+    expect(batches.map(({ data }) => data).join("")).toBe(`${first}${second}`);
+    expect(batches.reduce((total, output) => total + output.byteLength, 0)).toBe(
+      outputs.reduce((total, output) => total + output.byteLength, 0),
+    );
+  });
+
+  it("does not ACK mismatched event metadata until its final payload slice", () => {
+    expect([...batchDeferredTerminalOutput([{ data: "abcdef", byteLength: 42 }], 4)]).toEqual([
+      { data: "abcd", byteLength: 0 },
+      { data: "ef", byteLength: 42 },
+    ]);
+  });
+});
 
 describe("replaySnapshotAtRecoveredGrid", () => {
   it.each([
@@ -517,6 +552,31 @@ describe("destination and warm replay compatibility", () => {
     expect(terminal.cols).toBe(100);
     expect(terminal.rows).toBe(30);
     expect(writes).toEqual(["\u001bc", "history"]);
+  });
+
+  it("replaces potentially holed output from an authoritative resnapshot without duplicating history", () => {
+    let rendered = "before-overflow\n";
+    const terminal = {
+      cols: 100,
+      rows: 30,
+      resize() {},
+      write(data: string, callback?: () => void) {
+        if (data === "\u001bc") rendered = "";
+        else rendered += data;
+        callback?.();
+      },
+    };
+    const snapshot = makeAuthoritativeTerminalResnapshot({
+      ...dimensionedSnapshot(80, 24),
+      history: "before-overflow\nmissed-byte-range\nafter-overflow\n",
+    });
+
+    replaySnapshotAtDestinationGrid(terminal, snapshot);
+
+    expect(snapshot.recoveredCols).toBeUndefined();
+    expect(snapshot.recoveredRows).toBeUndefined();
+    expect(snapshot.historyRecordIdentity).toBeUndefined();
+    expect(rendered).toBe("before-overflow\nmissed-byte-range\nafter-overflow\n");
   });
 
   it("does not select cold replay after live output advances", () => {

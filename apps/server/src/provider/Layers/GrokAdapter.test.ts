@@ -10,6 +10,7 @@ import { SYNARA_HARNESS_POLICY_MARKER } from "../../agentGateway/harnessPolicy.t
 import {
   isGrokContextCompactionToolCall,
   isRenderableGrokAssistantDelta,
+  makeGrokModelListChildProcess,
   mergeGrokModelDescriptors,
   parseXaiLanguageModelDescriptors,
   scopeGrokRuntimeItemIdForTurn,
@@ -28,6 +29,27 @@ describe("Grok Synara harness policy", () => {
 });
 
 describe("GrokAdapter runtime event scoping", () => {
+  it("forwards prepared Windows model-list spawn options", () => {
+    const env = { SYNARA_TEST: "grok-model-list" };
+    const command = makeGrokModelListChildProcess(
+      {
+        command: "C:\\tools\\synara-windows-job-launcher.exe",
+        args: ["--", "C:\\tools\\grok.exe", "models"],
+        shell: false,
+        windowsHide: true,
+        windowsVerbatimArguments: true,
+      },
+      env,
+    );
+
+    expect(command.options).toMatchObject({
+      env,
+      shell: false,
+      windowsHide: true,
+      windowsVerbatimArguments: true,
+    });
+  });
+
   it("makes reused ACP assistant segment ids unique per DP turn", () => {
     const providerItemId = "assistant:grok-session:segment:5";
 

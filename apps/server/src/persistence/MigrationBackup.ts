@@ -43,6 +43,19 @@ export class MigrationRecoveryRequiredError extends Error {
   }
 }
 
+export class MigrationWalCheckpointError extends Error {
+  readonly _tag = "MigrationWalCheckpointError";
+
+  constructor(
+    readonly dbPath: string,
+    detail: string,
+    options?: ErrorOptions,
+  ) {
+    super(`Cannot create a migration backup for ${dbPath}: ${detail}`, options);
+    this.name = "MigrationWalCheckpointError";
+  }
+}
+
 type MigrationBackupPlan = {
   readonly sourceVersion: string;
   readonly targetVersion: number;
@@ -69,6 +82,14 @@ export type MigrationRecoveryFileOperations = {
   readonly syncDirectory?: (directoryPath: string) => Promise<void>;
   readonly validateTemporary?: (filePath: string) => Promise<void>;
 };
+
+export type MigrationIntegrityOperations = {
+  readonly readLiveDatabaseIntegrity?: () => Promise<
+    ReadonlyArray<{ readonly integrity_check: string }>
+  >;
+};
+
+type MigrationRecoveryOperations = MigrationRecoveryFileOperations & MigrationIntegrityOperations;
 
 export type MigrationBackupResult = MigrationBackupPlan & {
   readonly backupPath: string;
@@ -411,6 +432,58 @@ export const createMigrationBackup = (
     const backupPath = path.join(backupDirectory, finalName);
     const temporaryPath = path.join(backupDirectory, `.${finalName}.partial`);
 
+    const checkpointRows = yield* sql<{
+      readonly busy: number;
+      readonly log: number;
+      readonly checkpointed: number;
+    }>`PRAGMA wal_checkpoint(TRUNCATE)`.pipe(
+      Effect.mapError(
+        (cause) =>
+          new MigrationWalCheckpointError(dbPath, "SQLite WAL checkpoint failed.", { cause }),
+      ),
+    );
+    const checkpoint = checkpointRows[0];
+    const checkpointCountsAreDrained =
+      checkpoint !== undefined &&
+      ((checkpoint.log === 0 && checkpoint.checkpointed === 0) ||
+        (checkpoint.log === -1 && checkpoint.checkpointed === -1));
+    if (
+      checkpointRows.length !== 1 ||
+      checkpoint === undefined ||
+      checkpoint.busy !== 0 ||
+      !checkpointCountsAreDrained
+    ) {
+      return yield* Effect.fail(
+        new MigrationWalCheckpointError(
+          dbPath,
+          checkpoint === undefined
+            ? "SQLite returned no checkpoint result."
+            : `SQLite could not drain the WAL (busy=${checkpoint.busy}, log=${checkpoint.log}, checkpointed=${checkpoint.checkpointed}).`,
+        ),
+      );
+    }
+    const walSize = yield* attemptPromise(async () => {
+      try {
+        return (await fs.stat(`${dbPath}-wal`)).size;
+      } catch (cause) {
+        if ((cause as NodeJS.ErrnoException).code === "ENOENT") return 0;
+        throw cause;
+      }
+    }).pipe(
+      Effect.mapError(
+        (cause) =>
+          new MigrationWalCheckpointError(dbPath, "Source WAL verification failed.", { cause }),
+      ),
+    );
+    if (walSize !== 0) {
+      return yield* Effect.fail(
+        new MigrationWalCheckpointError(
+          dbPath,
+          `Source WAL remained ${walSize} bytes after TRUNCATE checkpoint.`,
+        ),
+      );
+    }
+
     yield* sql`VACUUM INTO ${temporaryPath}`.pipe(
       Effect.tapError(() => attemptPromise(() => fs.unlink(temporaryPath)).pipe(Effect.ignore)),
     );
@@ -496,26 +569,45 @@ const removeRecoveryMarker = (dbPath: string) =>
     await syncDirectory(path.dirname(dbPath));
   });
 
+const validateLiveDatabaseIntegrity = (dbPath: string, operations: MigrationIntegrityOperations) =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const rows = operations.readLiveDatabaseIntegrity
+      ? yield* attemptPromise(operations.readLiveDatabaseIntegrity)
+      : yield* sql<{ readonly integrity_check: string }>`PRAGMA integrity_check`;
+    if (rows.length !== 1 || rows[0]?.integrity_check !== "ok") {
+      return yield* Effect.fail(
+        new Error(
+          `Migrated database failed SQLite integrity_check: ${dbPath}. Expected exactly one ok result, received ${JSON.stringify(rows)}.`,
+        ),
+      );
+    }
+  });
+
 export const runWithPreMigrationBackup = <A, E, R>(
   dbPath: string,
   migration: Effect.Effect<A, E, R>,
-  fileOperations: MigrationRecoveryFileOperations = {},
+  operations: MigrationRecoveryOperations = {},
 ) =>
   Effect.gen(function* () {
     // Production startup invokes this while holding the database lifecycle lock.
     // Sweep before plan inspection so an already-current database still removes
     // interrupted marker publication debris.
-    yield* attemptPromise(() => removeStaleMarkerPartials(dbPath, fileOperations));
+    yield* attemptPromise(() => removeStaleMarkerPartials(dbPath, operations));
     const plan = yield* inspectMigrationBackupPlan;
     const backup = plan ? yield* createMigrationBackup(dbPath, plan) : null;
     if (backup) {
       // This write-ahead marker must be durable before migrations can mutate
       // the live database. A later startup will fail closed until an operator
       // explicitly restores the known-good snapshot.
-      yield* writeRecoveryMarker(dbPath, backup, fileOperations);
+      yield* writeRecoveryMarker(dbPath, backup, operations);
     }
     const result = yield* migration;
     if (backup) {
+      // The recovery marker remains durable until the migrated live database
+      // proves healthy. Any validation failure leaves startup fail-closed and
+      // preserves the pre-migration snapshot for explicit operator recovery.
+      yield* validateLiveDatabaseIntegrity(dbPath, operations);
       yield* removeRecoveryMarker(dbPath);
     }
     return result;

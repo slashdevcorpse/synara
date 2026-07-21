@@ -22,6 +22,11 @@ import {
 } from "./opencodeRuntime.ts";
 
 const encoder = new TextEncoder();
+const prepareMockProcess = (command: string, args: ReadonlyArray<string>) => ({
+  command,
+  args: [...args],
+  shell: false as const,
+});
 
 function mockOpenCodeServerHandle(input: {
   stdout: string;
@@ -102,6 +107,7 @@ function openCodeRuntimePoolTestLayer(state: {
   const processUrls = new Map<number, string>();
   return Layer.merge(
     makeOpenCodeRuntimeLive({
+      prepareProcess: prepareMockProcess,
       netService: {
         canListenOnHost: () => Effect.succeed(true),
         isPortAvailableOnLoopback: () => Effect.succeed(true),
@@ -200,6 +206,59 @@ describe("buildOpenCodeServerProcessEnv", () => {
 });
 
 describe("OpenCodeRuntime startup diagnostics", () => {
+  it("forwards prepared hidden-window policy to command and server launches", async () => {
+    const observedWindowsHide: Array<boolean | undefined> = [];
+    const spawnerLayer = Layer.succeed(
+      ChildProcessSpawner.ChildProcessSpawner,
+      ChildProcessSpawner.make((command) => {
+        const preparedCommand = command as unknown as {
+          readonly args: ReadonlyArray<string>;
+          readonly options?: { readonly windowsHide?: boolean };
+        };
+        observedWindowsHide.push(preparedCommand.options?.windowsHide);
+        const isServer = preparedCommand.args.includes("serve");
+        return Effect.succeed(
+          mockOpenCodeServerHandle({
+            stdout: isServer
+              ? "opencode server listening on http://127.0.0.1:59000\n"
+              : "models listed\n",
+            stderr: "",
+            exitCode: isServer ? Effect.never : Effect.succeed(ChildProcessSpawner.ExitCode(0)),
+          }),
+        );
+      }),
+    );
+    const layer = makeOpenCodeRuntimeLive({
+      prepareProcess: (command, args) => ({
+        command,
+        args: [...args],
+        shell: false,
+        windowsHide: true,
+      }),
+      teardownProcessTree: async () => ({ escalated: false, signalErrors: [] }),
+    }).pipe(Layer.provide(spawnerLayer));
+
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const runtime = yield* OpenCodeRuntime;
+          const commandResult = yield* runtime.runOpenCodeCommand({
+            binaryPath: "/custom/bin/opencode",
+            args: ["models"],
+          });
+          expect(commandResult.code).toBe(0);
+          const server = yield* runtime.startOpenCodeServerProcess({
+            binaryPath: "/custom/bin/opencode",
+            port: 59_000,
+          });
+          expect(server.url).toBe("http://127.0.0.1:59000");
+        }),
+      ).pipe(Effect.provide(layer)),
+    );
+
+    expect(observedWindowsHide).toEqual([true, true]);
+  });
+
   it("detects the ready server URL in CRLF process output", async () => {
     const result = await Effect.runPromise(
       Effect.scoped(
@@ -210,6 +269,7 @@ describe("OpenCodeRuntime startup diagnostics", () => {
       ).pipe(
         Effect.provide(
           makeOpenCodeRuntimeLive({
+            prepareProcess: prepareMockProcess,
             teardownProcessTree: async () => ({ escalated: false, signalErrors: [] }),
           }).pipe(
             Layer.provide(
@@ -245,6 +305,7 @@ describe("OpenCodeRuntime startup diagnostics", () => {
       ).pipe(
         Effect.provide(
           makeOpenCodeRuntimeLive({
+            prepareProcess: prepareMockProcess,
             teardownProcessTree: async () => ({ escalated: false, signalErrors: [] }),
           }).pipe(
             Layer.provide(
@@ -285,6 +346,7 @@ describe("OpenCodeRuntime startup diagnostics", () => {
       ).pipe(
         Effect.provide(
           makeOpenCodeRuntimeLive({
+            prepareProcess: prepareMockProcess,
             teardownProcessTree: async () => ({ escalated: false, signalErrors: [] }),
           }).pipe(
             Layer.provide(
@@ -319,6 +381,7 @@ describe("OpenCodeRuntime local server pool", () => {
     });
     let teardownCalls = 0;
     const layer = makeOpenCodeRuntimeLive({
+      prepareProcess: prepareMockProcess,
       netService: {
         canListenOnHost: () => Effect.succeed(true),
         isPortAvailableOnLoopback: () => Effect.succeed(true),

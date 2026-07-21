@@ -3,18 +3,43 @@ import * as path from "node:path";
 
 type ContainmentPathFlavor = Pick<typeof path, "isAbsolute" | "relative" | "resolve" | "sep">;
 
-function isContainedPath(
-  realRoot: string,
+function normalizeContainmentPath(value: string): string {
+  return value.normalize("NFC");
+}
+
+function relativeContainmentPath(
+  rootPath: string,
   candidatePath: string,
   pathFlavor: ContainmentPathFlavor = path,
-): boolean {
-  const relativePath = pathFlavor.relative(realRoot, candidatePath);
+): string {
+  return pathFlavor.relative(rootPath, candidatePath);
+}
+
+function isContainedRelativePath(relativePath: string, pathFlavor: ContainmentPathFlavor): boolean {
   return (
     relativePath === "" ||
     (relativePath !== ".." &&
       !relativePath.startsWith(`..${pathFlavor.sep}`) &&
       !pathFlavor.isAbsolute(relativePath))
   );
+}
+
+function isContainedPath(
+  realRoot: string,
+  candidatePath: string,
+  pathFlavor: ContainmentPathFlavor = path,
+): boolean {
+  const rawRelativePath = relativeContainmentPath(realRoot, candidatePath, pathFlavor);
+  if (!isContainedRelativePath(rawRelativePath, pathFlavor)) return false;
+
+  // Unicode normalization is an additional guard only. Raw structural
+  // containment remains mandatory because filesystems such as ext4 and NTFS
+  // can store canonically equivalent NFC/NFD names as distinct siblings.
+  const normalizedRelativePath = pathFlavor.relative(
+    normalizeContainmentPath(realRoot),
+    normalizeContainmentPath(candidatePath),
+  );
+  return isContainedRelativePath(normalizedRelativePath, pathFlavor);
 }
 
 function isFileNotFoundError(cause: unknown): boolean {
@@ -70,7 +95,7 @@ export async function resolveRealPathForCreateWithinRoot(
   const lexicalRoot = path.resolve(workspaceRoot);
   const lexicalTarget = path.resolve(absolutePath);
   const realRoot = await fs.realpath(lexicalRoot);
-  const relativeTarget = path.relative(lexicalRoot, lexicalTarget);
+  const relativeTarget = relativeContainmentPath(lexicalRoot, lexicalTarget);
   const components = relativeTarget === "" ? [] : relativeTarget.split(path.sep);
   let currentPath = realRoot;
 
@@ -121,7 +146,7 @@ export async function prepareRealPathForWriteWithinRoot(
   const lexicalRoot = path.resolve(workspaceRoot);
   const lexicalTarget = path.resolve(absolutePath);
   const realRoot = await fs.realpath(lexicalRoot);
-  const relativeTarget = path.relative(lexicalRoot, lexicalTarget);
+  const relativeTarget = relativeContainmentPath(lexicalRoot, lexicalTarget);
   const components = relativeTarget === "" ? [] : relativeTarget.split(path.sep);
   const targetName = components.pop();
   let currentPath = realRoot;

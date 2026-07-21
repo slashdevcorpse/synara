@@ -162,10 +162,12 @@ import {
   TerminalAckOutputInput,
   TerminalClearInput,
   TerminalCloseInput,
-  TerminalEvent,
+  TerminalEventStreamItem,
   TerminalOpenInput,
+  TerminalRecoverySnapshot,
   TerminalResizeInput,
   TerminalRestartInput,
+  TerminalSessionInput,
   TerminalSessionSnapshot,
   TerminalWriteInput,
 } from "./terminal";
@@ -651,6 +653,12 @@ export const WsTerminalOpenRpc = Rpc.make(WS_METHODS.terminalOpen, {
   error: WsRpcError,
 });
 
+export const WsTerminalSnapshotRpc = Rpc.make(WS_METHODS.terminalSnapshot, {
+  payload: TerminalSessionInput,
+  success: TerminalRecoverySnapshot,
+  error: WsRpcError,
+});
+
 export const WsTerminalWriteRpc = Rpc.make(WS_METHODS.terminalWrite, {
   payload: TerminalWriteInput,
   success: Schema.Void,
@@ -689,7 +697,7 @@ export const WsTerminalCloseRpc = Rpc.make(WS_METHODS.terminalClose, {
 
 export const WsSubscribeTerminalEventsRpc = Rpc.make(WS_METHODS.subscribeTerminalEvents, {
   payload: Schema.Struct({}),
-  success: TerminalEvent,
+  success: TerminalEventStreamItem,
   error: WsRpcError,
   stream: true,
 });
@@ -1019,6 +1027,7 @@ export const WsFeatureRpcGroup = RpcGroup.make(
   WsGitUnstageFilesRpc,
   WsGitHandoffThreadRpc,
   WsTerminalOpenRpc,
+  WsTerminalSnapshotRpc,
   WsTerminalWriteRpc,
   WsTerminalAckOutputRpc,
   WsTerminalResizeRpc,

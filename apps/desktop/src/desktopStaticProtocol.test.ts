@@ -1,8 +1,12 @@
 import * as Path from "node:path";
 
-import { describe, expect, it } from "vitest";
+import { WEB_DOCUMENT_SECURITY_HEADERS } from "@synara/shared/webSecurity";
+import { describe, expect, it, vi } from "vitest";
 
-import { createDesktopStaticProtocolResolver } from "./desktopStaticProtocol";
+import {
+  createDesktopStaticProtocolHandler,
+  createDesktopStaticProtocolResolver,
+} from "./desktopStaticProtocol";
 
 const staticRoot = Path.resolve("/virtual/synara-static");
 const rootIndex = Path.join(staticRoot, "index.html");
@@ -56,5 +60,66 @@ describe("createDesktopStaticProtocolResolver", () => {
         (candidate) => candidate === staticRoot || candidate.startsWith(`${staticRoot}${Path.sep}`),
       ),
     ).toBe(true);
+  });
+});
+
+describe("createDesktopStaticProtocolHandler", () => {
+  it("applies packaged document security headers to fetched responses", async () => {
+    const fetchFile = vi.fn(async () =>
+      Promise.resolve(new Response("Synara", { headers: { "Content-Type": "text/html" } })),
+    );
+    const handle = createDesktopStaticProtocolHandler({
+      resolveRequest: () => ({ path: rootIndex }),
+      fetchFile,
+      fallbackUrl: "synara://app/",
+    });
+
+    const response = await handle({ url: "synara://app/settings" });
+
+    expect(fetchFile).toHaveBeenCalledWith(rootIndex);
+    expect(response.headers.get("content-security-policy")).toBe(
+      WEB_DOCUMENT_SECURITY_HEADERS["Content-Security-Policy"],
+    );
+    expect(response.headers.get("x-content-type-options")).toBe("nosniff");
+    await expect(response.text()).resolves.toBe("Synara");
+  });
+
+  it("applies packaged document security headers to missing responses", async () => {
+    const handle = createDesktopStaticProtocolHandler({
+      resolveRequest: () => ({ error: -6 }),
+      fetchFile: vi.fn(),
+      fallbackUrl: "synara://app/",
+    });
+
+    const response = await handle({ url: "synara://app/assets/missing.js" });
+
+    expect(response.status).toBe(404);
+    expect(response.headers.get("content-security-policy")).toBe(
+      WEB_DOCUMENT_SECURITY_HEADERS["Content-Security-Policy"],
+    );
+  });
+
+  it("applies packaged document security headers after falling back from a fetch failure", async () => {
+    const fetchFile = vi
+      .fn<(path: string) => Promise<Response>>()
+      .mockRejectedValueOnce(new Error("bundle read failed"))
+      .mockResolvedValueOnce(new Response("fallback"));
+    const resolveRequest = vi.fn((requestUrl: string) => ({
+      path: requestUrl === "synara://app/" ? rootIndex : Path.join(staticRoot, "settings.html"),
+    }));
+    const handle = createDesktopStaticProtocolHandler({
+      resolveRequest,
+      fetchFile,
+      fallbackUrl: "synara://app/",
+    });
+
+    const response = await handle({ url: "synara://app/settings" });
+
+    expect(fetchFile).toHaveBeenCalledTimes(2);
+    expect(fetchFile).toHaveBeenLastCalledWith(rootIndex);
+    expect(response.headers.get("content-security-policy")).toBe(
+      WEB_DOCUMENT_SECURITY_HEADERS["Content-Security-Policy"],
+    );
+    await expect(response.text()).resolves.toBe("fallback");
   });
 });

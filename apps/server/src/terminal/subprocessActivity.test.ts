@@ -6,7 +6,7 @@ import type { ProcessChildrenMap } from "./processTreeKiller";
 function buildChildrenMap(
   entries: Array<{ ppid: number; pid: number; command: string }>,
 ): ProcessChildrenMap {
-  const map: ProcessChildrenMap = new Map();
+  const map = new Map<number, Array<{ readonly pid: number; readonly command: string }>>();
   for (const { ppid, pid, command } of entries) {
     const siblings = map.get(ppid) ?? [];
     siblings.push({ pid, command });

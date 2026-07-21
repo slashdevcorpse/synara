@@ -19,9 +19,14 @@ import {
   type SessionCredentialServiceShape,
 } from "./auth/Services/SessionCredentialService";
 import { ServerConfig } from "./config";
-import { makeBoundedNodeHttpServer, MAX_WEBSOCKET_MESSAGE_BYTES } from "./nodeHttpServer";
+import {
+  makeBoundedNodeHttpServer,
+  MAX_WEBSOCKET_MESSAGE_BYTES,
+  wsTransportAdmissionOptionsForServerConfig,
+} from "./nodeHttpServer";
+import type { WsTransportAdmissionOptions } from "./wsTransportAdmission";
 import { SqlitePersistenceMemory } from "./persistence/Layers/Sqlite";
-import { makeWebsocketRpcRouteLayer } from "./wsRpc";
+import { makeWebsocketBootstrapRouteLayer, makeWebsocketRpcRouteLayer } from "./wsRpc";
 import { makeCurrentWsFeatureCompatibilitySearchParams } from "./wsCompatibility";
 
 const PingRpc = Rpc.make("test.ping", {
@@ -41,6 +46,7 @@ interface RunningTestServer {
   readonly transportFinalizers: { count: number };
   readonly observedRpc: { decoderCalls: number; handlerCalls: number };
   readonly observedSlowRpc: { started: number; completed: number; finalized: number };
+  readonly listenerCounts: () => { readonly request: number; readonly upgrade: number };
   readonly close: () => Promise<void>;
 }
 
@@ -51,9 +57,9 @@ afterEach(() => {
   openSockets.clear();
 });
 
-function connect(url: string): Promise<WebSocket> {
+function connect(url: string, headers: Record<string, string> = {}): Promise<WebSocket> {
   return new Promise((resolve, reject) => {
-    const socket = new WebSocket(url, { perMessageDeflate: false });
+    const socket = new WebSocket(url, { perMessageDeflate: false, headers });
     openSockets.add(socket);
     socket.once("open", () => resolve(socket));
     socket.once("error", reject);
@@ -158,7 +164,10 @@ function ping(socket: WebSocket, timeoutMs = 2_000): Promise<void> {
   });
 }
 
-async function startTestServer(): Promise<RunningTestServer> {
+async function startTestServer(
+  admissionOptions: WsTransportAdmissionOptions = {},
+  publicUrl?: URL,
+): Promise<RunningTestServer> {
   const baseConfigLayer = ServerConfig.layerTest(process.cwd(), {
     prefix: "synara-ws-lifecycle-test-",
   }).pipe(Layer.provide(NodeServices.layer));
@@ -166,7 +175,7 @@ async function startTestServer(): Promise<RunningTestServer> {
     ServerConfig,
     Effect.gen(function* () {
       const config = yield* ServerConfig;
-      return { ...config, authToken: "force-session-auth" };
+      return { ...config, authToken: "force-session-auth", publicUrl };
     }),
   ).pipe(Layer.provide(baseConfigLayer));
   const sessionsLayer = SessionCredentialServiceLive.pipe(
@@ -258,7 +267,10 @@ async function startTestServer(): Promise<RunningTestServer> {
       ),
     ),
   );
-  const routeLayer = makeWebsocketRpcRouteLayer(rpcHttpEffectSource);
+  const routeLayer = Layer.merge(
+    makeWebsocketBootstrapRouteLayer(rpcHttpEffectSource),
+    makeWebsocketRpcRouteLayer(rpcHttpEffectSource),
+  );
   const scope = await Effect.runPromise(Scope.make("sequential"));
   const context = await Effect.runPromise(
     Layer.buildWithScope(
@@ -278,6 +290,7 @@ async function startTestServer(): Promise<RunningTestServer> {
             return nodeServer;
           },
           { port: 0, host: "127.0.0.1" },
+          wsTransportAdmissionOptionsForServerConfig({ publicUrl }, admissionOptions),
         );
         const httpApp = yield* HttpRouter.toHttpEffect(routeLayer);
         yield* httpServer.serve(httpApp);
@@ -295,6 +308,10 @@ async function startTestServer(): Promise<RunningTestServer> {
     transportFinalizers,
     observedRpc,
     observedSlowRpc,
+    listenerCounts: () => ({
+      request: nodeServer?.listenerCount("request") ?? 0,
+      upgrade: nodeServer?.listenerCount("upgrade") ?? 0,
+    }),
     close: () => Effect.runPromise(Scope.close(scope, Exit.void)),
   };
 }
@@ -302,6 +319,7 @@ async function startTestServer(): Promise<RunningTestServer> {
 async function connectSession(
   server: RunningTestServer,
   ttl?: Duration.Duration,
+  headers?: Record<string, string>,
 ): Promise<{
   readonly sessionId: AuthSessionId;
   readonly token: string;
@@ -309,7 +327,7 @@ async function connectSession(
 }> {
   const issued = await Effect.runPromise(server.sessions.issue(ttl ? { ttl } : undefined));
   const websocket = await Effect.runPromise(server.sessions.issueWebSocketToken(issued.sessionId));
-  const socket = await connect(featureSocketUrl(server, websocket.token));
+  const socket = await connect(featureSocketUrl(server, websocket.token), headers);
   return { sessionId: issued.sessionId, token: websocket.token, socket };
 }
 
@@ -322,10 +340,36 @@ async function connectExistingSession(
   return { token: websocket.token, socket };
 }
 
+async function connectBootstrapSession(
+  server: RunningTestServer,
+  ttl?: Duration.Duration,
+): Promise<{
+  readonly sessionId: AuthSessionId;
+  readonly token: string;
+  readonly socket: WebSocket;
+}> {
+  const issued = await Effect.runPromise(server.sessions.issue(ttl ? { ttl } : undefined));
+  const connected = await connectExistingBootstrapSession(server, issued.sessionId);
+  return { sessionId: issued.sessionId, ...connected };
+}
+
+async function connectExistingBootstrapSession(
+  server: RunningTestServer,
+  sessionId: AuthSessionId,
+): Promise<{ readonly token: string; readonly socket: WebSocket }> {
+  const websocket = await Effect.runPromise(server.sessions.issueWebSocketToken(sessionId));
+  const socket = await connect(bootstrapSocketUrl(server, websocket.token));
+  return { token: websocket.token, socket };
+}
+
 function featureSocketUrl(server: RunningTestServer, token: string): string {
   const searchParams = makeCurrentWsFeatureCompatibilitySearchParams("test-client");
   searchParams.set("wsToken", token);
   return `${server.origin}/ws?${searchParams.toString()}`;
+}
+
+function bootstrapSocketUrl(server: RunningTestServer, token: string): string {
+  return `${server.origin}/ws/bootstrap?wsToken=${encodeURIComponent(token)}`;
 }
 
 async function waitForObserved(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
@@ -337,6 +381,15 @@ async function waitForObserved(predicate: () => boolean, timeoutMs = 2_000): Pro
 }
 
 describe("websocket RPC payload admission", () => {
+  it("removes request and upgrade listeners when the bounded server scope closes", async () => {
+    const server = await startTestServer();
+    expect(server.listenerCounts()).toEqual({ request: 1, upgrade: 1 });
+
+    await server.close();
+
+    expect(server.listenerCounts()).toEqual({ request: 0, upgrade: 0 });
+  });
+
   it("rejects feature sockets before auth or RPC decoding when negotiation is missing", async () => {
     const server = await startTestServer();
     try {
@@ -501,7 +554,7 @@ describe("websocketRpcRouteLayer connection lifecycle", () => {
   });
 
   it("returns retryable 429 at the per-session socket cap without affecting other sessions", async () => {
-    const server = await startTestServer();
+    const server = await startTestServer({ connectionBurstPerPeer: 20 });
     try {
       const first = await connectSession(server);
       const saturatedSockets = [first.socket];
@@ -528,6 +581,140 @@ describe("websocketRpcRouteLayer connection lifecycle", () => {
 
       const replacement = await connectExistingSession(server, first.sessionId);
       await expect(ping(replacement.socket)).resolves.toBeUndefined();
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("applies the per-session socket cap to authenticated bootstrap sockets", async () => {
+    const server = await startTestServer({ connectionBurstPerPeer: 20 });
+    try {
+      const issued = await Effect.runPromise(server.sessions.issue());
+      const sockets: WebSocket[] = [];
+      for (let index = 0; index < MAX_AUTHENTICATED_CONNECTIONS_PER_SESSION; index += 1) {
+        sockets.push((await connectExistingBootstrapSession(server, issued.sessionId)).socket);
+      }
+
+      const rejectedTicket = await Effect.runPromise(
+        server.sessions.issueWebSocketToken(issued.sessionId),
+      );
+      await expect(connect(bootstrapSocketUrl(server, rejectedTicket.token))).rejects.toMatchObject(
+        {
+          statusCode: 429,
+          headers: expect.objectContaining({ "retry-after": "1" }),
+        },
+      );
+      await expect(ping(sockets[0]!)).resolves.toBeUndefined();
+
+      const released = sockets.pop()!;
+      const close = waitForClose(released);
+      released.close();
+      await close;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+
+      const replacement = await connectExistingBootstrapSession(server, issued.sessionId);
+      await expect(ping(replacement.socket)).resolves.toBeUndefined();
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("returns 429 at the global transport cap and releases capacity on close", async () => {
+    const server = await startTestServer({
+      maxConcurrentConnections: 2,
+      connectionBurstPerPeer: 20,
+    });
+    try {
+      const first = await connectSession(server);
+      const second = await connectSession(server);
+      await expect(connectSession(server)).rejects.toMatchObject({
+        statusCode: 429,
+        headers: expect.objectContaining({ "retry-after": "1" }),
+      });
+      await expect(ping(first.socket)).resolves.toBeUndefined();
+      await expect(ping(second.socket)).resolves.toBeUndefined();
+
+      const closed = waitForClose(first.socket);
+      first.socket.close();
+      await closed;
+      const replacement = await connectSession(server);
+      await expect(ping(replacement.socket)).resolves.toBeUndefined();
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("returns 429 when one direct peer exceeds its connection rate", async () => {
+    const server = await startTestServer({
+      maxConcurrentConnections: 20,
+      connectionBurstPerPeer: 2,
+      connectionRatePerMinutePerPeer: 2,
+    });
+    try {
+      const first = await connectSession(server, undefined, {
+        "X-Forwarded-For": "198.51.100.10",
+      });
+      const second = await connectSession(server, undefined, {
+        "X-Forwarded-For": "203.0.113.20",
+      });
+      await expect(
+        connectSession(server, undefined, { "X-Forwarded-For": "192.0.2.30" }),
+      ).rejects.toMatchObject({
+        statusCode: 429,
+        headers: expect.objectContaining({ "retry-after": "30" }),
+      });
+      await expect(ping(first.socket)).resolves.toBeUndefined();
+      await expect(ping(second.socket)).resolves.toBeUndefined();
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("allows repeated authenticated publicUrl loads without weakening global capacity", async () => {
+    const server = await startTestServer(
+      {
+        maxConcurrentConnections: 11,
+        connectionBurstPerPeer: 2,
+        connectionRatePerMinutePerPeer: 2,
+      },
+      new URL("https://synara.example.test/"),
+    );
+    try {
+      const sockets: WebSocket[] = [];
+      for (let index = 0; index < 11; index += 1) {
+        sockets.push((await connectSession(server)).socket);
+      }
+      await expect(ping(sockets[0]!)).resolves.toBeUndefined();
+      await expect(ping(sockets[10]!)).resolves.toBeUndefined();
+      await expect(connectSession(server)).rejects.toMatchObject({
+        statusCode: 429,
+        headers: expect.objectContaining({ "retry-after": "1" }),
+      });
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("keeps per-connection message admission in publicUrl proxy mode", async () => {
+    const server = await startTestServer(
+      {
+        connectionBurstPerPeer: 20,
+        messageBurstPerConnection: 2,
+        messageRatePerSecondPerConnection: 1,
+      },
+      new URL("https://synara.example.test/"),
+    );
+    try {
+      const connected = await connectSession(server);
+      const close = waitForCloseInfo(connected.socket);
+      connected.socket.send(JSON.stringify({ _tag: "Ping" }));
+      connected.socket.send(JSON.stringify({ _tag: "Ping" }));
+      connected.socket.send(JSON.stringify({ _tag: "Ping" }));
+
+      await expect(close).resolves.toMatchObject({
+        code: 1013,
+        reason: "WebSocket message rate exceeded",
+      });
     } finally {
       await server.close();
     }
@@ -560,6 +747,27 @@ describe("websocketRpcRouteLayer connection lifecycle", () => {
     }
   });
 
+  it("closes every authenticated bootstrap socket when its session is revoked", async () => {
+    const server = await startTestServer();
+    try {
+      const revoked = await connectBootstrapSession(server);
+      const revokedSecond = await connectExistingBootstrapSession(server, revoked.sessionId);
+      const survivor = await connectSession(server);
+      const revokedClose = waitForClose(revoked.socket);
+      const revokedSecondClose = waitForClose(revokedSecond.socket);
+
+      await expect(server.logout(revoked.sessionId)).resolves.toBe(true);
+      await Promise.all([revokedClose, revokedSecondClose]);
+
+      expect(revoked.socket.readyState).toBe(WebSocket.CLOSED);
+      expect(revokedSecond.socket.readyState).toBe(WebSocket.CLOSED);
+      await expect(ping(survivor.socket)).resolves.toBeUndefined();
+      await expect(connect(bootstrapSocketUrl(server, revoked.token))).rejects.toThrow("401");
+    } finally {
+      await server.close();
+    }
+  });
+
   it("closes an established socket at durable session expiry", async () => {
     const server = await startTestServer();
     try {
@@ -572,6 +780,22 @@ describe("websocketRpcRouteLayer connection lifecycle", () => {
       expect(expiring.socket.readyState).toBe(WebSocket.CLOSED);
       expect(server.transportFinalizers.count).toBeGreaterThanOrEqual(1);
       await expect(connect(featureSocketUrl(server, expiring.token))).rejects.toThrow("401");
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("closes an authenticated bootstrap socket at durable session expiry", async () => {
+    const server = await startTestServer();
+    try {
+      const expiring = await connectBootstrapSession(server, Duration.seconds(1));
+      await expect(ping(expiring.socket)).resolves.toBeUndefined();
+      const close = waitForClose(expiring.socket, 3_000);
+
+      await close;
+
+      expect(expiring.socket.readyState).toBe(WebSocket.CLOSED);
+      await expect(connect(bootstrapSocketUrl(server, expiring.token))).rejects.toThrow("401");
     } finally {
       await server.close();
     }

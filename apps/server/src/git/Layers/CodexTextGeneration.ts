@@ -8,9 +8,9 @@ import { sanitizeGeneratedThreadTitle } from "@synara/shared/chatThreads";
 import { resolveCodexCliExecutable } from "@synara/shared/codexCliExecutable";
 import { resolveCodexHome } from "@synara/shared/codexConfig";
 import { sanitizeBranchFragment, sanitizeFeatureBranchName } from "@synara/shared/git";
-import { prepareResolvedWindowsSafeProcess } from "@synara/shared/windowsProcess";
 
 import { resolveProviderAttachmentPath } from "../../provider/providerAttachmentPaths.ts";
+import { prepareResolvedWindowsProviderProcess } from "../../provider/windowsProviderProcess.ts";
 import { buildCodexProcessEnv } from "../../codexProcessEnv.ts";
 import { ServerConfig } from "../../config.ts";
 import { TextGenerationError } from "../Errors.ts";
@@ -326,7 +326,7 @@ const makeCodexTextGeneration = Effect.gen(function* () {
           "-",
         ];
         const executable = resolveCodexCliExecutable(codexBinaryPath, { cwd, env });
-        const prepared = prepareResolvedWindowsSafeProcess(executable, args, { cwd, env });
+        const prepared = prepareResolvedWindowsProviderProcess(executable, args, { cwd, env });
         const command = ChildProcess.make(prepared.command, prepared.args, {
           cwd,
           env,

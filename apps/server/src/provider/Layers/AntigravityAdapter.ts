@@ -32,6 +32,7 @@ import {
 import type { ProviderThreadSnapshot } from "../Services/ProviderAdapter.ts";
 import { appendFileAttachmentsPromptBlock } from "../attachmentProjection.ts";
 import { teardownChildProcessTree } from "../supervisedProcessTeardown.ts";
+import { containPreparedWindowsProviderProcess } from "../windowsProviderProcess.ts";
 
 const PROVIDER = "antigravity" as const;
 const DEFAULT_MODEL = "Gemini 3.5 Flash";
@@ -53,6 +54,7 @@ type TeardownProcessTree = (child: ChildProcess) => Promise<unknown>;
 export interface AntigravityProcessDependencies {
   readonly spawnProcess?: SpawnProcess;
   readonly prepareProcess?: typeof prepareWindowsSafeProcess;
+  readonly containProcess?: typeof containPreparedWindowsProviderProcess;
   readonly teardownProcessTree?: TeardownProcessTree;
 }
 
@@ -275,13 +277,17 @@ function spawnAntigravityProcess(
     readonly dependencies?: AntigravityProcessDependencies;
   },
 ): ChildProcess {
-  const prepared = (options.dependencies?.prepareProcess ?? prepareWindowsSafeProcess)(
-    command,
-    args,
-    {
-      cwd: options.cwd,
-      env: options.env,
-    },
+  const prepareInput = {
+    cwd: options.cwd,
+    env: options.env,
+  };
+  const prepared = (options.dependencies?.containProcess ?? containPreparedWindowsProviderProcess)(
+    (options.dependencies?.prepareProcess ?? prepareWindowsSafeProcess)(
+      command,
+      args,
+      prepareInput,
+    ),
+    prepareInput,
   );
   return (options.dependencies?.spawnProcess ?? spawn)(prepared.command, prepared.args, {
     ...(options.cwd ? { cwd: options.cwd } : {}),
@@ -354,14 +360,13 @@ export async function runAntigravityHelperProcess(
     };
     const timer = setTimeout(() => {
       if (!claim()) return;
+      const timeoutError = new Error(
+        `Antigravity helper timed out after ${timeoutMs}ms: ${command} ${args.join(" ")}`,
+      );
       void beginTeardown().then(
-        () =>
-          reject(
-            new Error(
-              `Antigravity helper timed out after ${timeoutMs}ms: ${command} ${args.join(" ")}`,
-            ),
-          ),
-        reject,
+        () => reject(timeoutError),
+        (teardownError) =>
+          reject(new AggregateError([timeoutError, teardownError], timeoutError.message)),
       );
     }, timeoutMs);
 

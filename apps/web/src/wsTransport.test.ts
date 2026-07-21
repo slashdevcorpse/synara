@@ -11,8 +11,11 @@ import {
   WS_PROTOCOL_EPOCH,
   WS_PROTOCOL_MAX_REVISION,
   WS_PROTOCOL_MIN_REVISION,
+  WS_METHODS,
+  TERMINAL_RESNAPSHOT_REQUIRED_CODE,
   ProjectId,
   type OrchestrationShellStreamItem,
+  type TerminalEventStreamItem,
   WorkspaceCloneId,
   WsCompatibilityError,
 } from "@synara/contracts";
@@ -21,7 +24,9 @@ import {
   advanceShellSubscription,
   shouldKeepServerLifecycleStream,
   getTerminalCompatibilityError,
+  handleTerminalResnapshotRequiredFailure,
   isTerminalCompatibilityFailure,
+  isTerminalResnapshotRequiredFailure,
   makeFeatureSocketUrl,
   makeRequestAbortScope,
   projectServerConfigUpdatedPayload,
@@ -231,6 +236,248 @@ describe("WsTransport", () => {
     ).toBe(true);
   });
 
+  it("reattaches the terminal stream before requesting authoritative snapshot replacement", async () => {
+    const cause = Cause.fail({
+      code: TERMINAL_RESNAPSHOT_REQUIRED_CODE,
+      retryable: true,
+      retryAfterMs: 0,
+    });
+    const order: string[] = [];
+
+    expect(isTerminalResnapshotRequiredFailure(cause)).toBe(true);
+    expect(shouldReconnectAfterStreamFailure(cause)).toBe(false);
+    expect(
+      handleTerminalResnapshotRequiredFailure(
+        cause,
+        () => {
+          order.push("reattach-stream");
+        },
+        () => {
+          order.push("replace-from-snapshot");
+        },
+      ),
+    ).toBe(true);
+    expect(order).toEqual(["reattach-stream"]);
+
+    await Promise.resolve();
+    expect(order).toEqual(["reattach-stream", "replace-from-snapshot"]);
+  });
+
+  it("waits for an asynchronous terminal stream reattach before replacing from snapshot", async () => {
+    const cause = Cause.fail({
+      code: TERMINAL_RESNAPSHOT_REQUIRED_CODE,
+      retryable: true,
+      retryAfterMs: 0,
+    });
+    const order: string[] = [];
+    let resolveRestart: (() => void) | undefined;
+
+    expect(
+      handleTerminalResnapshotRequiredFailure(
+        cause,
+        () => {
+          order.push("reattach-requested");
+          return new Promise<void>((resolve) => {
+            resolveRestart = () => {
+              order.push("reattach-started");
+              resolve();
+            };
+          });
+        },
+        () => {
+          order.push("replace-from-snapshot");
+        },
+      ),
+    ).toBe(true);
+    expect(order).toEqual(["reattach-requested"]);
+
+    await Promise.resolve();
+    expect(order).toEqual(["reattach-requested"]);
+
+    resolveRestart?.();
+    await Promise.resolve();
+    expect(order).toEqual(["reattach-requested", "reattach-started", "replace-from-snapshot"]);
+  });
+
+  it("keeps a readiness-only terminal stream live across recovery and reconnect", async () => {
+    vi.useFakeTimers();
+    (window as unknown as { setTimeout: typeof globalThis.setTimeout }).setTimeout =
+      globalThis.setTimeout;
+    const transport = new WsTransport("ws://localhost:3020");
+    const subscribeTerminalEvents = vi.fn(() => ({ stream: "terminal" }));
+    const subscribeServerConfig = vi.fn(() => ({ stream: "server-config" }));
+    const client = {
+      [WS_METHODS.subscribeTerminalEvents]: subscribeTerminalEvents,
+      [WS_METHODS.subscribeServerConfig]: subscribeServerConfig,
+    };
+    type TerminalStreamAttempt = {
+      readonly listener: (event: TerminalEventStreamItem) => void;
+      readonly restart?: () => void | Promise<void>;
+      readonly handleFailure?: (cause: Cause.Cause<unknown>) => boolean;
+      readonly onExit?: () => void;
+      readonly cleanup: ReturnType<typeof vi.fn>;
+    };
+    const attempts: TerminalStreamAttempt[] = [];
+    const internals = transport as unknown as {
+      getClient: () => Promise<unknown>;
+      startStream: <T>(
+        client: unknown,
+        key: string,
+        stream: unknown,
+        listener: (event: T) => void,
+        restart?: () => void | Promise<void>,
+        handleFailure?: (cause: Cause.Cause<unknown>) => boolean,
+        onExit?: () => void,
+      ) => void;
+      streamCleanups: Map<string, () => void>;
+      listeners: Map<string, Set<(message: unknown) => void>>;
+      runtime: unknown;
+      clientScope: unknown;
+      createSession: () => {
+        runtime: unknown;
+        clientScope: unknown;
+        clientPromise: Promise<unknown>;
+      };
+      openReconnectSession: () => Promise<unknown>;
+      invalidateTerminalEventStreamReady: (error: unknown) => void;
+    };
+    internals.getClient = () => Promise.resolve(client);
+    internals.startStream = <T>(
+      _client: unknown,
+      key: string,
+      _stream: unknown,
+      listener: (event: T) => void,
+      restart?: () => void | Promise<void>,
+      handleFailure?: (cause: Cause.Cause<unknown>) => boolean,
+      onExit?: () => void,
+    ) => {
+      if (internals.streamCleanups.has(key)) return;
+      const cleanup = vi.fn();
+      internals.streamCleanups.set(key, cleanup);
+      attempts.push({
+        listener: listener as (event: TerminalEventStreamItem) => void,
+        ...(restart ? { restart } : {}),
+        ...(handleFailure ? { handleFailure } : {}),
+        ...(onExit ? { onExit } : {}),
+        cleanup,
+      });
+    };
+
+    try {
+      const initialReady = transport.waitForTerminalEventStreamReady();
+      await Promise.resolve();
+      expect(internals.listeners.has(WS_CHANNELS.terminalEvent)).toBe(false);
+      expect(attempts).toHaveLength(1);
+      expect(subscribeServerConfig).not.toHaveBeenCalled();
+
+      attempts[0]?.listener({ type: "ready", generation: "generation-1" });
+      await expect(initialReady).resolves.toEqual({
+        type: "ready",
+        generation: "generation-1",
+      });
+
+      internals.streamCleanups.delete("terminal.events");
+      attempts[0]?.onExit?.();
+      expect(
+        attempts[0]?.handleFailure?.(
+          Cause.fail({
+            code: TERMINAL_RESNAPSHOT_REQUIRED_CODE,
+            retryable: true,
+            retryAfterMs: 0,
+          }),
+        ),
+      ).toBe(true);
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(attempts).toHaveLength(2);
+
+      attempts[1]?.listener({ type: "ready", generation: "generation-2" });
+      const recoveredOutput = {
+        type: "output" as const,
+        threadId: "thread-1",
+        terminalId: "terminal-1",
+        createdAt: "2026-07-21T00:00:00.000Z",
+        generation: "generation-2",
+        sequence: 1,
+        data: "recovered output",
+      };
+      attempts[1]?.listener(recoveredOutput);
+      expect(transport.getLatestPush(WS_CHANNELS.terminalEvent)?.data).toEqual(recoveredOutput);
+      const unsubscribe = transport.subscribe(WS_CHANNELS.terminalEvent, vi.fn());
+      await Promise.resolve();
+      unsubscribe();
+      expect(internals.listeners.has(WS_CHANNELS.terminalEvent)).toBe(false);
+      expect(internals.streamCleanups.has("terminal.events")).toBe(true);
+      expect(attempts).toHaveLength(2);
+
+      internals.invalidateTerminalEventStreamReady(new Error("socket reconnecting"));
+      internals.streamCleanups.clear();
+      const runtime = internals.runtime;
+      const clientScope = internals.clientScope;
+      internals.createSession = () => ({
+        runtime,
+        clientScope,
+        clientPromise: Promise.resolve(client),
+      });
+      const reconnect = internals.openReconnectSession();
+      await vi.advanceTimersByTimeAsync(500);
+      await reconnect;
+      await Promise.resolve();
+
+      expect(internals.listeners.has(WS_CHANNELS.terminalEvent)).toBe(false);
+      expect(attempts).toHaveLength(3);
+      attempts[2]?.listener({ type: "ready", generation: "generation-3" });
+      const reconnectedOutput = {
+        ...recoveredOutput,
+        generation: "generation-3",
+        sequence: 2,
+        data: "reconnected output",
+      };
+      attempts[2]?.listener(reconnectedOutput);
+      expect(transport.getLatestPush(WS_CHANNELS.terminalEvent)?.data).toEqual(reconnectedOutput);
+      expect(subscribeServerConfig).not.toHaveBeenCalled();
+      await transport.dispose();
+      expect(attempts[2]?.cleanup).toHaveBeenCalledTimes(1);
+    } finally {
+      await transport.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not start a readiness-only terminal stream after disposal wins the client race", async () => {
+    const transport = new WsTransport("ws://localhost:3020");
+    let resolveClient!: (client: unknown) => void;
+    const getClient = vi.fn(
+      () =>
+        new Promise<unknown>((resolve) => {
+          resolveClient = resolve;
+        }),
+    );
+    const startStream = vi.fn();
+    const internals = transport as unknown as {
+      getClient: () => Promise<unknown>;
+      startStream: typeof startStream;
+      streamCleanups: Map<string, () => void>;
+      terminalEventStreamReady: unknown;
+    };
+    internals.getClient = getClient;
+    internals.startStream = startStream;
+
+    const ready = transport.waitForTerminalEventStreamReady();
+    await transport.dispose();
+    resolveClient({
+      [WS_METHODS.subscribeTerminalEvents]: () => ({ stream: "terminal" }),
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    await expect(ready).rejects.toThrow("Transport disposed");
+    expect(getClient).toHaveBeenCalledTimes(1);
+    expect(startStream).not.toHaveBeenCalled();
+    expect(internals.terminalEventStreamReady).toBeNull();
+    expect(internals.streamCleanups.size).toBe(0);
+  });
+
   it("latches terminal compatibility guidance for late UI subscribers", () => {
     const issue = new WsCompatibilityError({
       message: "Update this client.",
@@ -253,6 +500,35 @@ describe("WsTransport", () => {
 
     unsubscribe();
     emitWsCompatibilityIssue(null);
+  });
+
+  it("rejects terminal readiness on compatibility failure without retrying", async () => {
+    vi.useFakeTimers();
+    const issue = new WsCompatibilityError({
+      message: "Update this client.",
+      code: "WS_PROTOCOL_INCOMPATIBLE",
+      retryable: false,
+      action: "update-client",
+      serverBuild: "0.5.2",
+      protocolEpoch: WS_PROTOCOL_EPOCH,
+      minRevision: WS_PROTOCOL_MIN_REVISION,
+      maxRevision: WS_PROTOCOL_MAX_REVISION,
+    });
+    const transport = new WsTransport("ws://localhost:3020");
+    const getClient = vi.fn().mockRejectedValue(issue);
+    const internals = transport as unknown as {
+      getClient: () => Promise<never>;
+    };
+    internals.getClient = getClient;
+
+    try {
+      await expect(transport.waitForTerminalEventStreamReady()).rejects.toBe(issue);
+      await vi.advanceTimersByTimeAsync(500);
+      expect(getClient).toHaveBeenCalledTimes(1);
+    } finally {
+      await transport.dispose();
+      vi.useRealTimers();
+    }
   });
 
   it("owns request deadlines and external aborts without leaving timers active", async () => {

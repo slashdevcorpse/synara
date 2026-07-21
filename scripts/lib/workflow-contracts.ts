@@ -36,6 +36,9 @@ const EXPECTED_DISABLED_PATHS = new Set([
 ]);
 const CI_WINDOWS_REQUIRED_COMMANDS = [
   "bun run brand:check",
+  "node apps/server/scripts/build-windows-job-launcher.mjs --arch x64",
+  "node apps/server/scripts/build-windows-job-launcher.mjs --arch arm64",
+  "bun run --cwd apps/server test src/provider/windowsProviderProcess.test.ts src/provider/windowsProviderProcess.windows.test.ts",
   "bun run --cwd packages/shared test src/desktopIdentity.test.ts src/desktopIdentityProof.test.ts src/windowsCertificate.test.ts",
   "bun run --cwd apps/desktop test src/backendShutdown.test.ts src/backendShutdown.windows.integration.test.ts",
   "bun run --cwd packages/shared test src/windowsProcess.test.ts",

@@ -1,4 +1,5 @@
 import {
+  ApprovalRequestId,
   type AssistantDeliveryMode,
   CommandId,
   EventId,
@@ -18,7 +19,7 @@ import {
   type ProviderRuntimeEvent,
   type RuntimeMode,
 } from "@synara/contracts";
-import { Cache, Cause, Deferred, Duration, Effect, Layer, Option, Ref, Stream } from "effect";
+import { Cache, Cause, Deferred, Duration, Effect, Exit, Layer, Option, Ref, Stream } from "effect";
 import * as Semaphore from "effect/Semaphore";
 import { makeDrainableWorker, startDrainableWorkerProducers } from "@synara/shared/DrainableWorker";
 import {
@@ -42,6 +43,7 @@ import {
 } from "../../provider/terminalTurnApplicability.ts";
 import { ProjectionTurnRepository } from "../../persistence/Services/ProjectionTurns.ts";
 import { ProjectionTurnRepositoryLive } from "../../persistence/Layers/ProjectionTurns.ts";
+import { ProviderRequestAdmissionRepositoryLive } from "../../persistence/Layers/ProviderRequestAdmissions.ts";
 import { ProviderRuntimeEventRepositoryLive } from "../../persistence/Layers/ProviderRuntimeEvents.ts";
 import { OrchestrationCommandReceiptRepositoryLive } from "../../persistence/Layers/OrchestrationCommandReceipts.ts";
 import { OrchestrationCommandReceiptRepository } from "../../persistence/Services/OrchestrationCommandReceipts.ts";
@@ -49,6 +51,14 @@ import {
   PROVIDER_RUNTIME_INGESTION_CONSUMER,
   ProviderRuntimeEventRepository,
 } from "../../persistence/Services/ProviderRuntimeEvents.ts";
+import type { ProjectionRepositoryError } from "../../persistence/Errors.ts";
+import {
+  PROVIDER_REQUEST_LIMIT_PER_THREAD,
+  ProviderRequestAdmissionRepository,
+  type ProviderRequestAdmissionIdentity,
+  type ProviderRequestAdmissionKind,
+  type ProviderRequestAdmissionRecord,
+} from "../../persistence/Services/ProviderRequestAdmissions.ts";
 import { resolveThreadWorkspaceCwd } from "../../checkpointing/Utils.ts";
 import { isGitRepository } from "../../git/isRepo.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
@@ -78,6 +88,9 @@ import {
 const providerTurnKey = (threadId: ThreadId, turnId: TurnId) => `${threadId}:${turnId}`;
 const providerCommandId = (event: ProviderRuntimeEvent, tag: string, target = "event"): CommandId =>
   CommandId.makeUnsafe(`provider:${event.eventId}:${tag}:${target}`);
+
+const toActivityPayload = (payload: unknown): OrchestrationThreadActivity["payload"] =>
+  payload as OrchestrationThreadActivity["payload"];
 
 const DEFAULT_ASSISTANT_DELIVERY_MODE: AssistantDeliveryMode = "buffered";
 const PROVIDER_RUNTIME_INGESTION_CAPACITY = 1_024;
@@ -122,9 +135,30 @@ function sessionStatusAllowsActiveTurn(status: OrchestrationSessionStatus): bool
 type RuntimeIngestionDomainEvent = Extract<
   OrchestrationEvent,
   {
-    type: "thread.turn-start-requested" | "thread.reverted" | "thread.conversation-rolled-back";
+    type:
+      | "thread.turn-start-requested"
+      | "thread.reverted"
+      | "thread.conversation-rolled-back"
+      | "thread.deleted";
   }
 >;
+
+class ProviderRequestOverflowSettlementError extends Error {
+  readonly _tag = "ProviderRequestOverflowSettlementError";
+
+  constructor(
+    readonly threadId: ThreadId,
+    readonly requestId: ApprovalRequestId,
+    readonly interactionKind: ProviderRequestAdmissionKind,
+    readonly responseFailure: string,
+    readonly stopFailure: string,
+  ) {
+    super(
+      `Provider request overflow could not be settled for ${threadId}/${interactionKind}/${requestId}`,
+    );
+    this.name = "ProviderRequestOverflowSettlementError";
+  }
+}
 
 type RuntimeIngestionInput =
   | {
@@ -540,6 +574,57 @@ const takeCached = <Key, Value>(cache: Cache.Cache<Key, Value>, key: Key) =>
     Effect.flatMap((value) => Cache.invalidate(cache, key).pipe(Effect.as(value))),
   );
 
+type GuardedProviderRequestEvent = Extract<
+  ProviderRuntimeEvent,
+  {
+    readonly type:
+      | "request.opened"
+      | "request.resolved"
+      | "user-input.requested"
+      | "user-input.resolved";
+  }
+>;
+
+function guardedProviderRequestKind(
+  event: GuardedProviderRequestEvent,
+): ProviderRequestAdmissionKind | null {
+  if (
+    (event.type === "request.opened" || event.type === "request.resolved") &&
+    event.payload.requestType === "tool_user_input"
+  ) {
+    return null;
+  }
+  return event.type === "user-input.requested" || event.type === "user-input.resolved"
+    ? "userInput"
+    : "approval";
+}
+
+function terminalProviderRequestActivity(
+  event: Extract<ProviderRuntimeEvent, { readonly type: "session.exited" }>,
+  record: ProviderRequestAdmissionRecord,
+): OrchestrationThreadActivity {
+  const lifecycleGeneration = record.lifecycleGeneration || undefined;
+  return {
+    id: EventId.makeUnsafe(
+      `provider-request-terminal:${event.eventId}:${record.interactionKind}:${record.requestId}`,
+    ),
+    createdAt: event.createdAt,
+    tone: record.interactionKind === "approval" ? "approval" : "info",
+    kind: record.interactionKind === "approval" ? "approval.resolved" : "user-input.resolved",
+    summary:
+      record.interactionKind === "approval"
+        ? "Approval cancelled when provider session ended"
+        : "User input request cancelled when provider session ended",
+    payload: toActivityPayload({
+      requestId: record.requestId,
+      ...(lifecycleGeneration ? { lifecycleGeneration } : {}),
+      ...(record.interactionKind === "approval" ? { decision: "cancel" } : {}),
+      resolutionReason: "provider-session-ended",
+    }),
+    turnId: record.turnId,
+  };
+}
+
 const make = Effect.gen(function* () {
   const orchestrationEngine = yield* OrchestrationEngineService;
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
@@ -547,6 +632,7 @@ const make = Effect.gen(function* () {
   const projectionTurnRepository = yield* ProjectionTurnRepository;
   const runtimeEvents = yield* ProviderRuntimeEventRepository;
   const commandReceipts = yield* OrchestrationCommandReceiptRepository;
+  const requestAdmissions = yield* ProviderRequestAdmissionRepository;
   const outstandingTurnIdsByThreadRef = yield* Ref.make<ReadonlyMap<ThreadId, ReadonlySet<TurnId>>>(
     new Map(),
   );
@@ -827,6 +913,272 @@ const make = Effect.gen(function* () {
     });
     if (key && fingerprint) {
       yield* Cache.set(latestActivityUpdateFingerprintByKey, key, fingerprint);
+    }
+  });
+
+  const stopProviderRuntimeForRequestGuard = Effect.fnUntraced(function* (threadId: ThreadId) {
+    const hasLiveRuntimeTasks = providerService.hasLiveRuntimeTasks
+      ? yield* providerService.hasLiveRuntimeTasks({ threadId })
+      : false;
+    if (hasLiveRuntimeTasks) {
+      return "preserved-live-tasks" as const;
+    }
+    yield* providerService.stopRuntimeSession
+      ? providerService.stopRuntimeSession({ threadId })
+      : providerService.stopSession({ threadId });
+    return "stopped" as const;
+  });
+
+  const settleOverflowedProviderRequest = Effect.fnUntraced(function* (
+    event: Extract<
+      ProviderRuntimeEvent,
+      { readonly type: "request.opened" | "user-input.requested" }
+    >,
+    identity: ProviderRequestAdmissionIdentity,
+  ) {
+    const isApproval = event.type === "request.opened";
+    const responseExit = isApproval
+      ? yield* Effect.exit(
+          providerService.respondToRequest({
+            threadId: event.threadId,
+            requestId: ApprovalRequestId.makeUnsafe(String(identity.requestId)),
+            ...(event.lifecycleGeneration === undefined
+              ? {}
+              : { lifecycleGeneration: event.lifecycleGeneration }),
+            decision: "decline",
+          }),
+        )
+      : null;
+
+    if (responseExit !== null && Exit.isSuccess(responseExit)) {
+      yield* requestAdmissions.markOverflowSettled({
+        ...identity,
+        failed: false,
+        updatedAt: event.createdAt,
+      });
+      yield* requestAdmissions.pruneSettled(identity.threadId);
+      yield* Effect.logWarning("provider.request.admission.overflow_declined", {
+        threadId: identity.threadId,
+        providerSessionThreadId: event.threadId,
+        provider: event.provider,
+        requestId: identity.requestId,
+        interactionKind: identity.interactionKind,
+        lifecycleGeneration: event.lifecycleGeneration ?? "legacy",
+        limit: PROVIDER_REQUEST_LIMIT_PER_THREAD,
+      });
+      return;
+    }
+
+    const stopExit = yield* Effect.exit(stopProviderRuntimeForRequestGuard(event.threadId));
+    if (Exit.isFailure(stopExit)) {
+      return yield* Effect.fail(
+        new ProviderRequestOverflowSettlementError(
+          identity.threadId,
+          ApprovalRequestId.makeUnsafe(String(identity.requestId)),
+          identity.interactionKind,
+          responseExit === null
+            ? "Structured user input has no safe generic overflow response."
+            : Cause.pretty(responseExit.cause),
+          Cause.pretty(stopExit.cause),
+        ),
+      );
+    }
+
+    const responseFailed = responseExit !== null;
+    const runtimePreserved = stopExit.value === "preserved-live-tasks";
+    if (runtimePreserved) {
+      // Keep the durable admission in overflowPending and fail this journal
+      // attempt. The bounded replay poll will retry the exact decline instead
+      // of advancing the cursor and permanently suppressing a provider request
+      // that is still open. Live background tasks remain untouched while the
+      // request retains a deterministic settlement path.
+      return yield* Effect.fail(
+        new ProviderRequestOverflowSettlementError(
+          identity.threadId,
+          ApprovalRequestId.makeUnsafe(String(identity.requestId)),
+          identity.interactionKind,
+          responseExit === null
+            ? "Structured user input has no safe generic overflow response."
+            : Cause.pretty(responseExit.cause),
+          "Provider runtime has live tasks and was intentionally preserved for a retry.",
+        ),
+      );
+    }
+    yield* requestAdmissions.markOverflowSettled({
+      ...identity,
+      failed: responseFailed,
+      updatedAt: event.createdAt,
+    });
+    yield* requestAdmissions.pruneSettled(identity.threadId);
+    yield* Effect.logWarning(
+      responseFailed
+        ? "provider.request.admission.overflow_decline_failed_session_stopped"
+        : "provider.request.admission.overflow_user_input_session_stopped",
+      {
+        threadId: identity.threadId,
+        providerSessionThreadId: event.threadId,
+        provider: event.provider,
+        requestId: identity.requestId,
+        interactionKind: identity.interactionKind,
+        lifecycleGeneration: event.lifecycleGeneration ?? "legacy",
+        limit: PROVIDER_REQUEST_LIMIT_PER_THREAD,
+        ...(responseExit !== null ? { responseFailure: Cause.pretty(responseExit.cause) } : {}),
+      },
+    );
+  });
+
+  const admitProviderRequest = Effect.fnUntraced(function* (
+    event: Extract<
+      ProviderRuntimeEvent,
+      { readonly type: "request.opened" | "user-input.requested" }
+    >,
+    threadId: ThreadId,
+  ): Effect.fn.Return<
+    ProviderRequestAdmissionIdentity | null,
+    ProjectionRepositoryError | ProviderRequestOverflowSettlementError
+  > {
+    const interactionKind = guardedProviderRequestKind(event);
+    if (interactionKind === null) return null;
+    if (event.requestId === undefined) {
+      const stopExit = yield* Effect.exit(stopProviderRuntimeForRequestGuard(event.threadId));
+      if (Exit.isFailure(stopExit)) {
+        return yield* Effect.fail(
+          new ProviderRequestOverflowSettlementError(
+            threadId,
+            ApprovalRequestId.makeUnsafe("missing-provider-request-id"),
+            interactionKind,
+            "Provider request did not include a canonical request id.",
+            Cause.pretty(stopExit.cause),
+          ),
+        );
+      }
+      yield* Effect.logError(
+        stopExit.value === "preserved-live-tasks"
+          ? "provider.request.admission.missing_request_id_live_tasks_preserved"
+          : "provider.request.admission.missing_request_id_session_stopped",
+        {
+          threadId,
+          providerSessionThreadId: event.threadId,
+          provider: event.provider,
+          interactionKind,
+          lifecycleGeneration: event.lifecycleGeneration ?? "legacy",
+        },
+      );
+      return null;
+    }
+
+    const identity: ProviderRequestAdmissionIdentity = {
+      threadId,
+      interactionKind,
+      requestId: ApprovalRequestId.makeUnsafe(event.requestId),
+      ...(event.lifecycleGeneration === undefined
+        ? {}
+        : { lifecycleGeneration: event.lifecycleGeneration }),
+    };
+    const result = yield* requestAdmissions.admit({
+      ...identity,
+      providerSessionThreadId: event.threadId,
+      provider: event.provider,
+      ...(event.type === "request.opened"
+        ? { requestType: event.payload.requestType }
+        : { requestType: "structured_user_input" }),
+      ...(event.turnId === undefined ? {} : { turnId: event.turnId }),
+      eventId: event.eventId,
+      createdAt: event.createdAt,
+    });
+    switch (result._tag) {
+      case "Accepted":
+      case "RetryAccepted":
+        return identity;
+      case "Overflow":
+      case "RetryOverflow":
+        yield* settleOverflowedProviderRequest(event, identity);
+        return null;
+      case "Duplicate":
+        yield* Effect.logDebug("provider.request.admission.duplicate_suppressed", {
+          threadId,
+          requestId: identity.requestId,
+          interactionKind,
+          lifecycleGeneration: event.lifecycleGeneration ?? "legacy",
+        });
+        return null;
+    }
+  });
+
+  const beginProviderRequestResolution = Effect.fnUntraced(function* (
+    event: Extract<
+      ProviderRuntimeEvent,
+      { readonly type: "request.resolved" | "user-input.resolved" }
+    >,
+    threadId: ThreadId,
+  ): Effect.fn.Return<
+    | { readonly shouldProject: true; readonly identity: ProviderRequestAdmissionIdentity | null }
+    | { readonly shouldProject: false },
+    ProjectionRepositoryError
+  > {
+    const interactionKind = guardedProviderRequestKind(event);
+    if (interactionKind === null || event.requestId === undefined) {
+      return { shouldProject: true, identity: null };
+    }
+    const identity: ProviderRequestAdmissionIdentity = {
+      threadId,
+      interactionKind,
+      requestId: ApprovalRequestId.makeUnsafe(event.requestId),
+      ...(event.lifecycleGeneration === undefined
+        ? {}
+        : { lifecycleGeneration: event.lifecycleGeneration }),
+    };
+    const result = yield* requestAdmissions.beginResolution({
+      ...identity,
+      eventId: event.eventId,
+      resolvedAt: event.createdAt,
+    });
+    if (result._tag === "Project") {
+      return { shouldProject: true, identity };
+    }
+    if (result._tag === "Untracked") {
+      return { shouldProject: true, identity: null };
+    }
+    if (result._tag === "StaleGeneration") {
+      yield* Effect.logWarning("provider.request.admission.stale_resolution_suppressed", {
+        threadId,
+        requestId: identity.requestId,
+        interactionKind,
+        lifecycleGeneration: event.lifecycleGeneration ?? "legacy",
+      });
+    }
+    return { shouldProject: false };
+  });
+
+  const settleProviderRequestsForTerminalSession = Effect.fnUntraced(function* (
+    event: Extract<ProviderRuntimeEvent, { readonly type: "session.exited" }>,
+  ) {
+    const records = yield* requestAdmissions.beginTerminalTeardown({
+      providerSessionThreadId: event.threadId,
+      ...(event.lifecycleGeneration === undefined
+        ? {}
+        : { lifecycleGeneration: event.lifecycleGeneration }),
+      eventId: event.eventId,
+      occurredAt: event.createdAt,
+    });
+    for (const record of records) {
+      const targetThread = yield* projectionSnapshotQuery.getThreadShellById(record.threadId);
+      if (Option.isSome(targetThread)) {
+        yield* dispatchActivityUpdate(
+          event,
+          record.threadId,
+          terminalProviderRequestActivity(event, record),
+        );
+      }
+      yield* requestAdmissions.markTerminalProjected({
+        threadId: record.threadId,
+        interactionKind: record.interactionKind,
+        requestId: record.requestId,
+        ...(record.lifecycleGeneration ? { lifecycleGeneration: record.lifecycleGeneration } : {}),
+        eventId: event.eventId,
+        updatedAt: event.createdAt,
+      });
+      yield* requestAdmissions.pruneSettled(record.threadId);
     }
   });
 
@@ -1862,6 +2214,26 @@ const make = Effect.gen(function* () {
         return;
       }
       const thread = targetThreadResolution.thread;
+      const admittedRequestIdentity =
+        event.type === "request.opened" || event.type === "user-input.requested"
+          ? yield* admitProviderRequest(event, thread.id)
+          : null;
+      if (
+        (event.type === "request.opened" || event.type === "user-input.requested") &&
+        admittedRequestIdentity === null
+      ) {
+        return;
+      }
+      const requestResolution =
+        event.type === "request.resolved" || event.type === "user-input.resolved"
+          ? yield* beginProviderRequestResolution(event, thread.id)
+          : null;
+      if (requestResolution !== null && !requestResolution.shouldProject) {
+        return;
+      }
+      if (event.type === "session.exited") {
+        yield* settleProviderRequestsForTerminalSession(event);
+      }
       const activeTurnId = thread.session?.activeTurnId ?? null;
       const isTerminalTurnEvent = event.type === "turn.completed" || event.type === "turn.aborted";
       const rawEventTurnId = toTurnId(event.turnId);
@@ -2438,6 +2810,21 @@ const make = Effect.gen(function* () {
       yield* Effect.forEach(projectProviderRuntimeActivities(correlatedActivityEvent), (activity) =>
         dispatchActivityUpdate(correlatedActivityEvent, thread.id, activity),
       );
+      if (admittedRequestIdentity !== null) {
+        yield* requestAdmissions.markVisible({
+          ...admittedRequestIdentity,
+          eventId: event.eventId,
+          updatedAt: event.createdAt,
+        });
+      }
+      if (requestResolution?.identity) {
+        yield* requestAdmissions.markResolutionProjected({
+          ...requestResolution.identity,
+          eventId: event.eventId,
+          updatedAt: event.createdAt,
+        });
+        yield* requestAdmissions.pruneSettled(requestResolution.identity.threadId);
+      }
 
       if (isTerminalTurnEvent) {
         yield* settleBufferedReasoningSummaries(thread.id, event, toTurnId(event.turnId));
@@ -2462,6 +2849,10 @@ const make = Effect.gen(function* () {
 
   const processDomainEvent = (event: RuntimeIngestionDomainEvent) =>
     Effect.gen(function* () {
+      if (event.type === "thread.deleted") {
+        yield* requestAdmissions.deleteByThreadId(event.payload.threadId);
+        return;
+      }
       if (event.type === "thread.reverted" || event.type === "thread.conversation-rolled-back") {
         yield* clearActivityUpdateFingerprints(event.payload.threadId);
         yield* clearAssistantDeliveryModeBindingsForThread(event.payload.threadId);
@@ -2704,7 +3095,8 @@ const make = Effect.gen(function* () {
           if (
             event.type !== "thread.turn-start-requested" &&
             event.type !== "thread.reverted" &&
-            event.type !== "thread.conversation-rolled-back"
+            event.type !== "thread.conversation-rolled-back" &&
+            event.type !== "thread.deleted"
           ) {
             return Effect.void;
           }
@@ -2756,4 +3148,5 @@ export const ProviderRuntimeIngestionLive = Layer.effect(
       OrchestrationCommandReceiptRepositoryLive,
     ),
   ),
+  Layer.provideMerge(ProviderRequestAdmissionRepositoryLive),
 );
