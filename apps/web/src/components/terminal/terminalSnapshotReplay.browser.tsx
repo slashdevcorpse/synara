@@ -22,7 +22,7 @@ import {
   createRuntimeEntry,
   disposeRuntimeEntry,
 } from "./terminalRuntime";
-import { emitTerminalResnapshotRequired } from "../../wsTransportEvents";
+import { emitTerminalResnapshotRequired, emitWsTransportState } from "../../wsTransportEvents";
 
 const terminals: Terminal[] = [];
 const hosts: HTMLDivElement[] = [];
@@ -906,6 +906,120 @@ describe("recovered terminal snapshot replay in real xterm", () => {
       } finally {
         settleDelayedOpen({ ...legacySnapshot(""), terminalId });
         disposeRuntimeEntry(entry);
+        restoreWindowNativeApi(previousNativeApi);
+        document.getElementById("synara-terminal-parking")?.remove();
+      }
+    },
+  );
+
+  it.each(["superseded", "disposed", "no longer open"] as const)(
+    "does not send a reconnect open after readiness resolves for a %s request",
+    async (interruption) => {
+      const host = document.createElement("div");
+      host.style.cssText = "position:absolute;left:0;top:0;width:900px;height:320px;display:block;";
+      document.body.append(host);
+      hosts.push(host);
+
+      const terminalId = `stale-readiness-${interruption.replaceAll(" ", "-")}`;
+      const openInputs: Array<{ cols: number; rows: number }> = [];
+      let readinessCalls = 0;
+      let snapshotCalls = 0;
+      let resolveReconnectReadiness!: (ready: { type: "ready"; generation: string }) => void;
+      let reconnectReadinessResolved = false;
+      const reconnectReadiness = new Promise<{ type: "ready"; generation: string }>((resolve) => {
+        resolveReconnectReadiness = resolve;
+      });
+      const settleReconnectReadiness = () => {
+        if (reconnectReadinessResolved) return;
+        reconnectReadinessResolved = true;
+        resolveReconnectReadiness({ type: "ready", generation: "generation-1" });
+      };
+      const nativeApi = {
+        terminal: {
+          waitUntilEventStreamReady: () => {
+            readinessCalls += 1;
+            return readinessCalls === 2
+              ? reconnectReadiness
+              : Promise.resolve({ type: "ready" as const, generation: "generation-1" });
+          },
+          open: async (input: { cols: number; rows: number }) => {
+            openInputs.push({ cols: input.cols, rows: input.rows });
+            return { ...legacySnapshot("INITIAL-SESSION"), terminalId };
+          },
+          snapshot: async () => {
+            snapshotCalls += 1;
+            return {
+              snapshot: { ...legacySnapshot("AUTHORITATIVE-SESSION"), terminalId },
+              generation: "generation-1",
+              watermark: 0,
+            };
+          },
+          write: async () => undefined,
+          ackOutput: async () => undefined,
+          resize: async () => undefined,
+          clear: async () => undefined,
+          restart: async () => ({ ...legacySnapshot(""), terminalId }),
+          close: async () => undefined,
+          onEvent: () => () => undefined,
+        },
+      } as unknown as NativeApi;
+      const previousNativeApi = window.nativeApi;
+      window.nativeApi = nativeApi;
+      const entry = createRuntimeEntry({
+        runtimeKey: `thread::${terminalId}`,
+        threadId: "thread",
+        terminalId,
+        terminalLabel: "Terminal",
+        cwd: "C:\\project",
+        callbacks: {
+          onSessionExited: () => undefined,
+          onTerminalMetadataChange: () => undefined,
+          onTerminalActivityChange: () => undefined,
+        },
+      });
+      let disposed = false;
+
+      try {
+        attachRuntimeToContainer(entry, { autoFocus: false, isVisible: true }, host);
+        await waitForCondition(
+          () => openInputs.length === 1 && entry.runtimeStatus === "ready",
+          `${interruption} initial open`,
+        );
+
+        emitWsTransportState("open");
+        await waitForCondition(() => readinessCalls === 2, `${interruption} reconnect readiness`);
+        const reconnectRequestId = entry.snapshotReconcileRequestId;
+
+        if (interruption === "superseded") {
+          emitTerminalResnapshotRequired();
+          await waitForCondition(
+            () => snapshotCalls === 1 && entry.snapshotReconcileRequestId !== reconnectRequestId,
+            "authoritative recovery superseding reconnect",
+          );
+        } else if (interruption === "disposed") {
+          disposeRuntimeEntry(entry);
+          disposed = true;
+        } else {
+          entry.opened = false;
+        }
+
+        settleReconnectReadiness();
+        await new Promise((resolve) => window.setTimeout(resolve, 25));
+
+        expect(openInputs).toHaveLength(1);
+        if (interruption === "superseded") {
+          await waitForCondition(
+            () =>
+              !entry.needsAuthoritativeRecovery &&
+              !entry.authoritativeRecoveryInFlight &&
+              entry.runtimeStatus === "ready",
+            "authoritative recovery completion",
+          );
+          expect(bufferText(entry.terminal)).toContain("AUTHORITATIVE-SESSION");
+        }
+      } finally {
+        settleReconnectReadiness();
+        if (!disposed) disposeRuntimeEntry(entry);
         restoreWindowNativeApi(previousNativeApi);
         document.getElementById("synara-terminal-parking")?.remove();
       }

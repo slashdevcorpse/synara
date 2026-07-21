@@ -38,6 +38,7 @@ import {
   resolveCopyableBrowserTabUrl,
 } from "@synara/shared/browserSession";
 import {
+  adoptAttachedBrowserWebContentsSecurity,
   createBrowserPopupNavigationPolicy,
   enforceBrowserPopupNavigationPolicy,
   type BrowserPopupNavigationPolicy,
@@ -1934,25 +1935,32 @@ export class DesktopBrowserManager {
     // Belt-and-suspenders alongside the session-level UA: also covers an adopted renderer
     // <webview> for any navigation after it attaches.
     this.sessionPolicy.applyUserAgent(webContents);
-    this.registerPageNavigationGuards(
-      webContents,
-      (url) => url === ABOUT_BLANK_URL || this.isRuntimePageNavigationAllowed(runtime, url),
-      () => {
-        webContents.stop();
-        void this.loadTab(threadId, tabId, { force: true, runtime });
-      },
-      runtime.listenerDisposers,
-    );
+    adoptAttachedBrowserWebContentsSecurity(webContents, () => {
+      this.registerPageNavigationGuards(
+        webContents,
+        (url) => url === ABOUT_BLANK_URL || this.isRuntimePageNavigationAllowed(runtime, url),
+        () => {
+          webContents.stop();
+          void this.loadTab(threadId, tabId, { force: true, runtime });
+        },
+        runtime.listenerDisposers,
+      );
 
-    const windowOpenContext = this.popupContextForTab(threadId, tabId);
-    if (windowOpenContext) {
-      this.configureWindowOpenHandling(webContents, windowOpenContext, runtime.listenerDisposers, {
-        isUrlAllowed: (url) => this.isRuntimePageNavigationAllowed(runtime, url),
-        resolveContext: () => this.popupContextForTab(threadId, tabId),
-      });
-    } else {
-      webContents.setWindowOpenHandler(() => ({ action: "deny" }));
-    }
+      const windowOpenContext = this.popupContextForTab(threadId, tabId);
+      if (windowOpenContext) {
+        this.configureWindowOpenHandling(
+          webContents,
+          windowOpenContext,
+          runtime.listenerDisposers,
+          {
+            isUrlAllowed: (url) => this.isRuntimePageNavigationAllowed(runtime, url),
+            resolveContext: () => this.popupContextForTab(threadId, tabId),
+          },
+        );
+      } else {
+        webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+      }
+    });
 
     // The native page owns keyboard focus while browsing, so the renderer never sees the
     // copy-link chord. Intercept it here, copy the live URL, and let the shell toast.

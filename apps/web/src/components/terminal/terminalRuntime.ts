@@ -1322,19 +1322,17 @@ function reconcileTerminalSnapshot(
 
   const outputEventVersionAtRequest = entry.outputEventVersion;
   const requestId = ++entry.snapshotReconcileRequestId;
+  const isCurrentReconnectRequest = () =>
+    !entry.disposed &&
+    entry.opened &&
+    !entry.hasHandledExit &&
+    entry.snapshotReconcileRequestId === requestId;
   setRuntimeStatus(entry, "connecting");
 
   void waitForTerminalEventStreamReady(api)
-    .then(() => api.terminal.open(buildOpenInput(entry)))
+    .then(() => (isCurrentReconnectRequest() ? api.terminal.open(buildOpenInput(entry)) : null))
     .then((snapshot) => {
-      if (
-        entry.disposed ||
-        !entry.opened ||
-        entry.hasHandledExit ||
-        entry.snapshotReconcileRequestId !== requestId
-      ) {
-        return;
-      }
+      if (!snapshot || !isCurrentReconnectRequest()) return;
 
       const retainedOutput = hasRetainedRecoveredOutput(entry);
       if (entry.outputEventVersion !== outputEventVersionAtRequest && !retainedOutput) {
@@ -1343,9 +1341,7 @@ function reconcileTerminalSnapshot(
 
       if (snapshotHasReplayPayload(snapshot) || retainedOutput) {
         replaySnapshot(entry, snapshot, () => {
-          if (!entry.disposed && entry.snapshotReconcileRequestId === requestId) {
-            setRuntimeStatus(entry, "ready");
-          }
+          if (isCurrentReconnectRequest()) setRuntimeStatus(entry, "ready");
         });
         return;
       }
@@ -1353,9 +1349,7 @@ function reconcileTerminalSnapshot(
       setRuntimeStatus(entry, "ready");
     })
     .catch((error) => {
-      if (entry.disposed || !entry.opened || entry.snapshotReconcileRequestId !== requestId) {
-        return;
-      }
+      if (!isCurrentReconnectRequest()) return;
       setRuntimeStatus(entry, "error");
       writeSystemMessage(
         entry.terminal,

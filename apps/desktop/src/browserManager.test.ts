@@ -321,6 +321,15 @@ describe("DesktopBrowserManager local-preview lifecycle", () => {
         disposition: "new-window",
       }),
     ).toEqual({ action: "deny" });
+    for (const eventName of ["will-navigate", "will-redirect"]) {
+      const preventNavigation = vi.fn();
+      tabContents.emit(
+        eventName,
+        { preventDefault: preventNavigation },
+        "https://attacker.example/pre-adoption",
+      );
+      expect(preventNavigation).toHaveBeenCalledOnce();
+    }
     access.configureRuntimeWebContents({
       key: `${THREAD_ID}:${tabId}`,
       threadId: THREAD_ID,
@@ -336,8 +345,16 @@ describe("DesktopBrowserManager local-preview lifecycle", () => {
       false,
     );
     expect(tabContents.windowOpenHandler).toBe(runtimeHandler);
-    expect(tabContents.listenerCount("will-navigate")).toBe(2);
-    expect(tabContents.listenerCount("will-redirect")).toBe(2);
+    expect(tabContents.listenerCount("will-navigate")).toBe(1);
+    expect(tabContents.listenerCount("will-redirect")).toBe(1);
+
+    const preventManagedNavigation = vi.fn();
+    tabContents.emit(
+      "will-navigate",
+      { preventDefault: preventManagedNavigation },
+      "https://managed.example/after-adoption",
+    );
+    expect(preventManagedNavigation).not.toHaveBeenCalled();
     access.configureOAuthPopupRuntime({
       threadId: THREAD_ID,
       tabId,
@@ -403,7 +420,7 @@ describe("DesktopBrowserManager local-preview lifecycle", () => {
       },
       "file:///sensitive",
     );
-    expect(preventNavigation).toHaveBeenCalledTimes(2);
+    expect(preventNavigation).toHaveBeenCalledOnce();
   });
 
   it("derives nested popup navigation guards through the runtime window chain", () => {

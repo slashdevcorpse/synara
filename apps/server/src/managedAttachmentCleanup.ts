@@ -49,6 +49,7 @@ const MANAGED_ATTACHMENT_STAGING_RECOVERY_INVOCATION_SCAN_LIMIT =
   MANAGED_ATTACHMENT_STAGING_SWEEP_SCAN_LIMIT * 4;
 const MANAGED_ATTACHMENT_STAGING_RECOVERY_INVOCATION_PASS_LIMIT = 4;
 const MANAGED_ATTACHMENT_STAGING_RECOVERY_INVOCATION_TIME_MS = 250;
+export const MANAGED_ATTACHMENT_STAGING_STARTUP_TIME_MS = 250;
 const PINNED_STAGING_DELETE_TIMEOUT_MS = 5_000;
 const PINNED_STAGING_DEADLINE_CLEANUP_RESERVE_MS = 25;
 class ManagedAttachmentStagingDeadlineExceeded extends Error {
@@ -73,6 +74,14 @@ function pinnedStagingOperationTimeout(remainingMs?: () => number): {
     timeoutMs: Math.max(1, Math.floor(Math.min(PINNED_STAGING_DELETE_TIMEOUT_MS, operationBudget))),
     deadlineBounded: true,
   };
+}
+
+function pinnedStagingCloseTimeoutMs(remainingMs?: () => number): number {
+  if (!remainingMs) return PINNED_STAGING_DELETE_TIMEOUT_MS;
+  return Math.max(
+    0,
+    Math.floor(Math.min(PINNED_STAGING_DEADLINE_CLEANUP_RESERVE_MS, remainingMs())),
+  );
 }
 
 const PINNED_STAGING_DELETE_SCRIPT = String.raw`
@@ -176,6 +185,10 @@ export interface ManagedAttachmentStagingSweepInput {
   readonly nowMs?: number;
   readonly maxRemovals?: number;
   readonly scanLimit?: number;
+  /** Optional total wall-clock budget shared by helper startup, entries, and forced close. */
+  readonly timeBudgetMs?: number;
+  /** Test seam for deterministic total-deadline coverage. */
+  readonly monotonicNow?: () => number;
   /** Skip an active writer instead of waiting behind its process-local path lock. */
   readonly skipLocked?: boolean;
   /** Test seam for a replacement race between the two identity checks. */
@@ -295,7 +308,10 @@ interface PinnedStagingDeleteSession {
     readonly remainingTimeoutMs?: () => number;
     readonly beforeRequest?: () => Promise<void>;
   }) => Promise<PinnedStagingDeleteResult>;
-  readonly close: (options?: { readonly force?: boolean }) => Promise<void>;
+  readonly close: (options?: {
+    readonly force?: boolean;
+    readonly exitWaitMs?: number;
+  }) => Promise<void>;
 }
 
 type PinnedStagingDeleteSessionResult =
@@ -439,31 +455,22 @@ async function createPinnedStagingDeleteSession(input: {
     ready = await readResponse(pinnedStagingOperationTimeout(input.remainingTimeoutMs));
   } catch (cause) {
     child.kill("SIGKILL");
-    await waitForChildExit(
-      input.remainingTimeoutMs
-        ? PINNED_STAGING_DEADLINE_CLEANUP_RESERVE_MS
-        : PINNED_STAGING_DELETE_TIMEOUT_MS,
-    );
+    const closeTimeoutMs = pinnedStagingCloseTimeoutMs(input.remainingTimeoutMs);
+    if (closeTimeoutMs > 0) await waitForChildExit(closeTimeoutMs);
     releaseChildHandles();
     throw cause;
   }
   if (ready._tag === "DirectoryUnsafe") {
     child.stdin.end();
-    await waitForChildExit(
-      input.remainingTimeoutMs
-        ? PINNED_STAGING_DEADLINE_CLEANUP_RESERVE_MS
-        : PINNED_STAGING_DELETE_TIMEOUT_MS,
-    );
+    const closeTimeoutMs = pinnedStagingCloseTimeoutMs(input.remainingTimeoutMs);
+    if (closeTimeoutMs > 0) await waitForChildExit(closeTimeoutMs);
     releaseChildHandles();
     return { _tag: "DirectoryUnsafe" };
   }
   if (ready._tag !== "Ready") {
     child.kill("SIGKILL");
-    await waitForChildExit(
-      input.remainingTimeoutMs
-        ? PINNED_STAGING_DEADLINE_CLEANUP_RESERVE_MS
-        : PINNED_STAGING_DELETE_TIMEOUT_MS,
-    );
+    const closeTimeoutMs = pinnedStagingCloseTimeoutMs(input.remainingTimeoutMs);
+    if (closeTimeoutMs > 0) await waitForChildExit(closeTimeoutMs);
     releaseChildHandles();
     throw new Error("Pinned staging deletion did not become ready.");
   }
@@ -500,12 +507,18 @@ async function createPinnedStagingDeleteSession(input: {
       } else {
         child.stdin.end();
       }
-      const exitWaitMs = options?.force
-        ? PINNED_STAGING_DEADLINE_CLEANUP_RESERVE_MS
-        : PINNED_STAGING_DELETE_TIMEOUT_MS;
+      const exitWaitMs = Math.max(
+        0,
+        Math.floor(
+          options?.exitWaitMs ??
+            (options?.force
+              ? PINNED_STAGING_DEADLINE_CLEANUP_RESERVE_MS
+              : PINNED_STAGING_DELETE_TIMEOUT_MS),
+        ),
+      );
       if (options?.force && input.waitForForceClose) {
         await input.waitForForceClose(exitWaitMs);
-      } else if (child.exitCode === null && child.signalCode === null) {
+      } else if (exitWaitMs > 0 && child.exitCode === null && child.signalCode === null) {
         await waitForChildExit(exitWaitMs);
       }
       releaseChildHandles();
@@ -686,6 +699,13 @@ export async function sweepOrphanManagedAttachmentParts(
   input: ManagedAttachmentStagingSweepInput,
 ): Promise<ManagedAttachmentStagingSweepResult> {
   const emptyResult = { inspected: 0, removed: 0, failures: 0 } as const;
+  const monotonicNow = input.monotonicNow ?? (() => performance.now());
+  const timeBudgetMs =
+    input.timeBudgetMs === undefined
+      ? null
+      : boundedPositiveInteger(input.timeBudgetMs, MANAGED_ATTACHMENT_STAGING_STARTUP_TIME_MS);
+  const deadline = timeBudgetMs === null ? null : monotonicNow() + timeBudgetMs;
+  const remainingTimeoutMs = deadline === null ? undefined : () => deadline - monotonicNow();
   const verifiedStagingDir = await resolveVerifiedStagingDirectory(input.attachmentsDir);
   if (verifiedStagingDir._tag === "Missing") return emptyResult;
   if (verifiedStagingDir._tag === "Unsafe") {
@@ -708,6 +728,7 @@ export async function sweepOrphanManagedAttachmentParts(
   if (scanLimit === 0 || maxRemovals === 0) return emptyResult;
   const resources = await openPinnedStagingResources({
     staging: verifiedStagingDir,
+    ...(remainingTimeoutMs ? { remainingTimeoutMs } : {}),
     ...(input.beforePinnedSessionReady ? { beforeReady: input.beforePinnedSessionReady } : {}),
     ...(input.waitForPinnedSessionForceClose
       ? { waitForForceClose: input.waitForPinnedSessionForceClose }
@@ -716,7 +737,11 @@ export async function sweepOrphanManagedAttachmentParts(
   if (resources._tag === "Missing") return emptyResult;
   if (resources._tag === "Unsafe") return { inspected: 0, removed: 0, failures: 1 };
   try {
-    while (inspected < scanLimit && removed < maxRemovals) {
+    while (
+      inspected < scanLimit &&
+      removed < maxRemovals &&
+      (deadline === null || monotonicNow() < deadline)
+    ) {
       const entry = await resources.directory.read();
       if (entry === null) break;
       inspected += 1;
@@ -726,12 +751,28 @@ export async function sweepOrphanManagedAttachmentParts(
         pinnedDeleteSession: resources.session,
         entryName: entry.name,
         staleBeforeMs,
+        ...(remainingTimeoutMs ? { remainingTimeoutMs } : {}),
       });
       removed += result.removed;
       failures += result.failures;
     }
+  } catch (cause) {
+    if (!(cause instanceof ManagedAttachmentStagingDeadlineExceeded)) throw cause;
   } finally {
-    await Promise.all([resources.directory.close(), resources.session.close()]);
+    const remainingCloseMs = remainingTimeoutMs
+      ? pinnedStagingCloseTimeoutMs(remainingTimeoutMs)
+      : undefined;
+    await Promise.all([
+      resources.directory.close(),
+      resources.session.close(
+        remainingTimeoutMs
+          ? {
+              force: true,
+              ...(remainingCloseMs !== undefined ? { exitWaitMs: remainingCloseMs } : {}),
+            }
+          : undefined,
+      ),
+    ]);
   }
 
   return { inspected, removed, failures };
@@ -742,12 +783,13 @@ export interface ManagedAttachmentStagingRecoveryResult extends ManagedAttachmen
   readonly exhausted: boolean;
 }
 
-export interface ManagedAttachmentStagingRecoveryInput extends ManagedAttachmentStagingSweepInput {
+export interface ManagedAttachmentStagingRecoveryInput extends Omit<
+  ManagedAttachmentStagingSweepInput,
+  "timeBudgetMs"
+> {
   readonly invocationScanLimit?: number;
   readonly invocationPassLimit?: number;
   readonly invocationTimeBudgetMs?: number;
-  /** Test seam for deterministic per-invocation deadline coverage. */
-  readonly monotonicNow?: () => number;
 }
 
 interface ManagedAttachmentStagingRecoveryCursor {
@@ -773,11 +815,24 @@ function boundedPositiveInteger(value: number | undefined, fallback: number): nu
 
 async function closeStagingRecoveryCursor(
   cursor: ManagedAttachmentStagingRecoveryCursor,
-  options: { readonly force?: boolean } = {},
+  options: {
+    readonly force?: boolean;
+    readonly remainingTimeoutMs?: () => number;
+  } = {},
 ): Promise<void> {
+  const remainingCloseMs = options.remainingTimeoutMs
+    ? pinnedStagingCloseTimeoutMs(options.remainingTimeoutMs)
+    : undefined;
   await Promise.all([
     cursor.directory.close(),
-    cursor.pinnedDeleteSession.close(options.force ? { force: true } : undefined),
+    cursor.pinnedDeleteSession.close(
+      options.force
+        ? {
+            force: true,
+            ...(remainingCloseMs !== undefined ? { exitWaitMs: remainingCloseMs } : {}),
+          }
+        : undefined,
+    ),
   ]);
 }
 
@@ -861,20 +916,33 @@ export function makeManagedAttachmentStagingRecovery(): ManagedAttachmentStaging
           ) {
             const staleCursor = cursor;
             cursor = null;
-            await closeStagingRecoveryCursor(staleCursor);
+            await closeStagingRecoveryCursor(staleCursor, {
+              force: true,
+              remainingTimeoutMs,
+            });
           }
 
           const verifiedStagingDir = await resolveVerifiedStagingDirectory(attachmentsDir);
           if (verifiedStagingDir._tag === "Missing") {
             const missingCursor = cursor;
             cursor = null;
-            if (missingCursor) await closeStagingRecoveryCursor(missingCursor);
+            if (missingCursor) {
+              await closeStagingRecoveryCursor(missingCursor, {
+                force: true,
+                remainingTimeoutMs,
+              });
+            }
             return { inspected, removed, failures, passes, exhausted: true };
           }
           if (verifiedStagingDir._tag === "Unsafe") {
             const unsafeCursor = cursor;
             cursor = null;
-            if (unsafeCursor) await closeStagingRecoveryCursor(unsafeCursor);
+            if (unsafeCursor) {
+              await closeStagingRecoveryCursor(unsafeCursor, {
+                force: true,
+                remainingTimeoutMs,
+              });
+            }
             return { inspected, removed, failures: 1, passes, exhausted: true };
           }
 
@@ -953,7 +1021,10 @@ export function makeManagedAttachmentStagingRecovery(): ManagedAttachmentStaging
                 removed += passRemoved;
                 failures += passFailures;
                 cursor = null;
-                await closeStagingRecoveryCursor(activeCursor, { force: true });
+                await closeStagingRecoveryCursor(activeCursor, {
+                  force: true,
+                  remainingTimeoutMs,
+                });
                 return { inspected, removed, failures, passes, exhausted: false };
               }
               passRemoved += result.removed;
@@ -969,14 +1040,20 @@ export function makeManagedAttachmentStagingRecovery(): ManagedAttachmentStaging
 
           if (exhausted) {
             cursor = null;
-            await closeStagingRecoveryCursor(activeCursor);
+            await closeStagingRecoveryCursor(activeCursor, {
+              force: true,
+              remainingTimeoutMs,
+            });
           }
           return { inspected, removed, failures, passes, exhausted };
         } catch (cause) {
           const failedCursor = cursor;
           cursor = null;
           if (failedCursor) {
-            await closeStagingRecoveryCursor(failedCursor).catch(() => undefined);
+            await closeStagingRecoveryCursor(failedCursor, {
+              force: true,
+              remainingTimeoutMs: () => 0,
+            }).catch(() => undefined);
           }
           throw cause;
         }
@@ -1152,7 +1229,11 @@ export const ManagedAttachmentCleanupLive = Layer.effect(
     );
     const runStartupStagingSweep = stagingRecoveryLock.withPermits(1)(
       Effect.tryPromise({
-        try: () => sweepOrphanManagedAttachmentParts({ attachmentsDir: config.attachmentsDir }),
+        try: () =>
+          sweepOrphanManagedAttachmentParts({
+            attachmentsDir: config.attachmentsDir,
+            timeBudgetMs: MANAGED_ATTACHMENT_STAGING_STARTUP_TIME_MS,
+          }),
         catch: (cause) => cause,
       }),
     );

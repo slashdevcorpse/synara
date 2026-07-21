@@ -88,12 +88,14 @@ export class LocalPreviewGrantError extends Error {
 
 interface ExactFilePreviewGrant {
   readonly kind: "file";
+  readonly ownerKey: string;
   readonly realFilePath: string;
   readonly expiresAtMs: number;
 }
 
 interface DirectoryPreviewGrant {
   readonly kind: "directory";
+  readonly ownerKey: string;
   readonly realDirectoryPath: string;
   readonly directoryIdentity: LocalPreviewFileIdentity;
   readonly entryRealPath: string;
@@ -105,9 +107,12 @@ type LocalPreviewGrant = ExactFilePreviewGrant | DirectoryPreviewGrant;
 
 export const LOCAL_PREVIEW_GRANT_TTL_MS = 2 * 60 * 1000;
 export const MAX_OUTSTANDING_LOCAL_PREVIEW_GRANTS = 100;
+export const MAX_OUTSTANDING_LOCAL_PREVIEW_GRANTS_PER_OWNER = 20;
+const DEFAULT_LOCAL_PREVIEW_GRANT_OWNER_KEY = "local-process";
 const localPreviewGrantByToken = new Map<string, LocalPreviewGrant>();
 
 interface LocalPreviewGrantRecord {
+  readonly ownerKey: string;
   readonly realFilePath: string;
   readonly expiresAtMs: number;
 }
@@ -130,12 +135,23 @@ function pruneExpiredGrants<T extends { readonly expiresAtMs: number }>(
   }
 }
 
-function assertLocalPreviewGrantCapacity<T extends { readonly expiresAtMs: number }>(input: {
+function assertLocalPreviewGrantCapacity<
+  T extends { readonly expiresAtMs: number; readonly ownerKey: string },
+>(input: {
   readonly grants: Map<string, T>;
   readonly nowMs: number;
   readonly maxOutstanding: number;
+  readonly maxOutstandingPerOwner: number;
+  readonly ownerKey: string;
 }): void {
   pruneExpiredGrants(input.grants, input.nowMs);
+  const ownerGrants = Array.from(input.grants.values()).filter(
+    (grant) => grant.ownerKey === input.ownerKey,
+  );
+  if (ownerGrants.length >= input.maxOutstandingPerOwner) {
+    const earliestOwnerExpiryMs = Math.min(...ownerGrants.map((grant) => grant.expiresAtMs));
+    throw new LocalPreviewGrantCapacityError(Math.max(1, earliestOwnerExpiryMs - input.nowMs));
+  }
   if (input.grants.size < input.maxOutstanding) return;
 
   const earliestExpiryMs = Math.min(
@@ -152,26 +168,51 @@ type NewLocalPreviewGrant =
   | Omit<ExactFilePreviewGrant, "expiresAtMs">
   | Omit<DirectoryPreviewGrant, "expiresAtMs">;
 
+function grantsSameResource(left: NewLocalPreviewGrant, right: LocalPreviewGrant): boolean {
+  if (left.ownerKey !== right.ownerKey) return false;
+  if (left.kind === "file") {
+    return right.kind === "file" && isSameCanonicalPath(left.realFilePath, right.realFilePath);
+  }
+  return (
+    right.kind === "directory" &&
+    left.purpose === right.purpose &&
+    isSameCanonicalPath(left.realDirectoryPath, right.realDirectoryPath) &&
+    isSameCanonicalPath(left.entryRealPath, right.entryRealPath) &&
+    hasSameIdentity(left.directoryIdentity, right.directoryIdentity)
+  );
+}
+
 function storeLocalPreviewGrant(
   previewGrant: NewLocalPreviewGrant,
   nowMs: number,
 ): LocalPreviewGrantResult {
+  pruneExpiredPreviewGrants(nowMs);
+  for (const [grant, existing] of localPreviewGrantByToken) {
+    const issuedAtMs = existing.expiresAtMs - LOCAL_PREVIEW_GRANT_TTL_MS;
+    if (issuedAtMs <= nowMs && grantsSameResource(previewGrant, existing)) {
+      return { grant, expiresAt: new Date(existing.expiresAtMs).toISOString() };
+    }
+  }
   assertLocalPreviewGrantCapacity({
     grants: localPreviewGrantByToken,
     nowMs,
     maxOutstanding: MAX_OUTSTANDING_LOCAL_PREVIEW_GRANTS,
+    maxOutstandingPerOwner: MAX_OUTSTANDING_LOCAL_PREVIEW_GRANTS_PER_OWNER,
+    ownerKey: previewGrant.ownerKey,
   });
   const grant = crypto.randomUUID();
   const expiresAtMs = nowMs + LOCAL_PREVIEW_GRANT_TTL_MS;
   if (previewGrant.kind === "file") {
     localPreviewGrantByToken.set(grant, {
       kind: "file",
+      ownerKey: previewGrant.ownerKey,
       realFilePath: previewGrant.realFilePath,
       expiresAtMs,
     });
   } else {
     localPreviewGrantByToken.set(grant, {
       kind: "directory",
+      ownerKey: previewGrant.ownerKey,
       realDirectoryPath: previewGrant.realDirectoryPath,
       directoryIdentity: previewGrant.directoryIdentity,
       entryRealPath: previewGrant.entryRealPath,
@@ -187,12 +228,15 @@ export function makeLocalPreviewGrantRegistry(
     readonly now?: () => number;
     readonly createToken?: () => string;
     readonly maxOutstanding?: number;
+    readonly maxOutstandingPerOwner?: number;
     readonly ttlMs?: number;
   } = {},
 ) {
   const now = options.now ?? Date.now;
   const createToken = options.createToken ?? crypto.randomUUID;
   const maxOutstanding = options.maxOutstanding ?? MAX_OUTSTANDING_LOCAL_PREVIEW_GRANTS;
+  const maxOutstandingPerOwner =
+    options.maxOutstandingPerOwner ?? MAX_OUTSTANDING_LOCAL_PREVIEW_GRANTS_PER_OWNER;
   const ttlMs = options.ttlMs ?? LOCAL_PREVIEW_GRANT_TTL_MS;
   const grants = new Map<string, LocalPreviewGrantRecord>();
 
@@ -207,13 +251,33 @@ export function makeLocalPreviewGrantRegistry(
     return grant !== undefined && grant.expiresAtMs > nowMs ? grant.realFilePath : null;
   };
 
-  const create = (realFilePath: string): LocalPreviewGrantResult => {
+  const create = (
+    realFilePath: string,
+    ownerKey = DEFAULT_LOCAL_PREVIEW_GRANT_OWNER_KEY,
+  ): LocalPreviewGrantResult => {
     const nowMs = now();
-    assertLocalPreviewGrantCapacity({ grants, nowMs, maxOutstanding });
+    pruneExpired(nowMs);
+    for (const [grant, existing] of grants) {
+      const issuedAtMs = existing.expiresAtMs - ttlMs;
+      if (
+        issuedAtMs <= nowMs &&
+        existing.ownerKey === ownerKey &&
+        isSameCanonicalPath(existing.realFilePath, realFilePath)
+      ) {
+        return { grant, expiresAt: new Date(existing.expiresAtMs).toISOString() };
+      }
+    }
+    assertLocalPreviewGrantCapacity({
+      grants,
+      nowMs,
+      maxOutstanding,
+      maxOutstandingPerOwner,
+      ownerKey,
+    });
 
     const grant = createToken();
     const expiresAtMs = nowMs + ttlMs;
-    grants.set(grant, { realFilePath, expiresAtMs });
+    grants.set(grant, { ownerKey, realFilePath, expiresAtMs });
     return { grant, expiresAt: new Date(expiresAtMs).toISOString() };
   };
 
@@ -707,6 +771,7 @@ export async function openResolvedLocalPreviewFile<T extends ResolvedLocalPrevie
 
 async function createExactFilePreviewGrant(input: {
   readonly requestedPath: string;
+  readonly ownerKey: string;
   readonly nowMs: number;
 }): Promise<LocalPreviewGrantResult> {
   const requestedPath = input.requestedPath.trim();
@@ -723,11 +788,15 @@ async function createExactFilePreviewGrant(input: {
     throw new Error("Preview path is not a file.");
   }
 
-  return storeLocalPreviewGrant({ kind: "file", realFilePath }, input.nowMs);
+  return storeLocalPreviewGrant(
+    { kind: "file", ownerKey: input.ownerKey, realFilePath },
+    input.nowMs,
+  );
 }
 
 async function createDirectoryPreviewGrant(input: {
   readonly requestedPath: string;
+  readonly ownerKey: string;
   readonly cwd?: string;
   readonly allowedWorkspaceRoots: ReadonlyArray<string>;
   readonly purpose?: LocalPreviewGrantPurpose;
@@ -844,6 +913,7 @@ async function createDirectoryPreviewGrant(input: {
   const result = storeLocalPreviewGrant(
     {
       kind: "directory",
+      ownerKey: input.ownerKey,
       realDirectoryPath,
       directoryIdentity,
       entryRealPath: realFilePath,
@@ -860,6 +930,8 @@ async function createDirectoryPreviewGrant(input: {
 
 export async function createLocalPreviewGrant(input: {
   readonly requestedPath: string;
+  /** Server-derived admission bucket only; the random grant remains the bearer capability. */
+  readonly ownerKey?: string;
   readonly cwd?: string;
   readonly allowedWorkspaceRoots?: ReadonlyArray<string>;
   readonly scope?: "file" | "directory";
@@ -867,11 +939,13 @@ export async function createLocalPreviewGrant(input: {
   readonly nowMs?: number;
 }): Promise<LocalPreviewGrantResult> {
   const nowMs = input.nowMs ?? Date.now();
+  const ownerKey = input.ownerKey?.trim() || DEFAULT_LOCAL_PREVIEW_GRANT_OWNER_KEY;
   if (input.scope !== "directory") {
-    return createExactFilePreviewGrant({ requestedPath: input.requestedPath, nowMs });
+    return createExactFilePreviewGrant({ requestedPath: input.requestedPath, ownerKey, nowMs });
   }
   return createDirectoryPreviewGrant({
     requestedPath: input.requestedPath,
+    ownerKey,
     ...(input.cwd !== undefined ? { cwd: input.cwd } : {}),
     allowedWorkspaceRoots: input.allowedWorkspaceRoots ?? [],
     ...(input.purpose !== undefined ? { purpose: input.purpose } : {}),

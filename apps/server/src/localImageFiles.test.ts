@@ -230,21 +230,23 @@ describe("resolveAllowedLocalPreviewFile", () => {
 });
 
 describe("local preview grant admission", () => {
-  it("bounds outstanding grants and reports when capacity will recover", () => {
+  it("limits one owner without denying another while retaining the global bound", () => {
     let nowMs = 1_000;
     let nextToken = 0;
     const registry = makeLocalPreviewGrantRegistry({
       now: () => nowMs,
       createToken: () => `grant-${nextToken++}`,
-      maxOutstanding: 2,
+      maxOutstanding: 3,
+      maxOutstandingPerOwner: 2,
       ttlMs: 500,
     });
 
-    expect(registry.create("C:/preview/one.pdf").grant).toBe("grant-0");
-    expect(registry.create("C:/preview/two.pdf").grant).toBe("grant-1");
+    const firstOwnerGrant = registry.create("C:/preview/one.pdf", "owner-a");
+    expect(firstOwnerGrant.grant).toBe("grant-0");
+    expect(registry.create("C:/preview/two.pdf", "owner-a").grant).toBe("grant-1");
     expect(registry.snapshot()).toEqual({ outstanding: 2 });
 
-    expect(() => registry.create("C:/preview/three.pdf")).toThrow(
+    expect(() => registry.create("C:/preview/three.pdf", "owner-a")).toThrow(
       expect.objectContaining({
         name: "LocalPreviewGrantCapacityError",
         code: "LOCAL_PREVIEW_GRANT_CAPACITY_EXCEEDED",
@@ -253,8 +255,21 @@ describe("local preview grant admission", () => {
     );
     expect(registry.snapshot()).toEqual({ outstanding: 2 });
 
+    const secondOwnerGrant = registry.create("C:/preview/one.pdf", "owner-b");
+    expect(secondOwnerGrant.grant).toBe("grant-2");
+    expect(secondOwnerGrant).not.toEqual(firstOwnerGrant);
+    expect(registry.snapshot()).toEqual({ outstanding: 3 });
+
+    expect(() => registry.create("C:/preview/four.pdf", "owner-b")).toThrow(
+      expect.objectContaining({
+        name: "LocalPreviewGrantCapacityError",
+        code: "LOCAL_PREVIEW_GRANT_CAPACITY_EXCEEDED",
+        retryAfterMs: 500,
+      }),
+    );
+
     nowMs = 1_500;
-    expect(registry.create("C:/preview/three.pdf").grant).toBe("grant-2");
+    expect(registry.create("C:/preview/three.pdf", "owner-a").grant).toBe("grant-3");
     expect(registry.snapshot()).toEqual({ outstanding: 1 });
   });
 
@@ -299,6 +314,77 @@ describe("local preview grants", () => {
       resolveLocalPreviewGrantRealPath({ token: result.grant, nowMs }),
       realpathSync.native(filePath),
     );
+  });
+
+  it("reuses an exact-file capability without extending its lifetime", async () => {
+    const externalRoot = makeTempDir("synara-exact-preview-reuse-");
+    const filePath = path.join(externalRoot, "spec.pdf");
+    writeFileSync(filePath, Buffer.from("%PDF-1.4"));
+    const nowMs = Date.parse("2026-07-20T12:00:00.000Z");
+
+    const first = await createLocalPreviewGrant({ requestedPath: filePath, nowMs });
+    const reused = await createLocalPreviewGrant({ requestedPath: filePath, nowMs: nowMs + 1_000 });
+    const afterExpiry = await createLocalPreviewGrant({
+      requestedPath: filePath,
+      nowMs: nowMs + LOCAL_PREVIEW_GRANT_TTL_MS,
+    });
+
+    assert.deepEqual(reused, first);
+    assert.notEqual(afterExpiry.grant, first.grant);
+    assert.equal(
+      afterExpiry.expiresAt,
+      new Date(nowMs + 2 * LOCAL_PREVIEW_GRANT_TTL_MS).toISOString(),
+    );
+  });
+
+  it("reuses exact-file capabilities only within the same owner", async () => {
+    const externalRoot = makeTempDir("synara-exact-preview-owner-reuse-");
+    const filePath = path.join(externalRoot, "spec.pdf");
+    writeFileSync(filePath, Buffer.from("%PDF-1.4"));
+    const nowMs = Date.parse("2026-07-20T12:30:00.000Z");
+
+    const first = await createLocalPreviewGrant({
+      requestedPath: filePath,
+      ownerKey: "owner-a",
+      nowMs,
+    });
+    const sameOwner = await createLocalPreviewGrant({
+      requestedPath: filePath,
+      ownerKey: "owner-a",
+      nowMs,
+    });
+    const differentOwner = await createLocalPreviewGrant({
+      requestedPath: filePath,
+      ownerKey: "owner-b",
+      nowMs,
+    });
+
+    assert.deepEqual(sameOwner, first);
+    assert.notEqual(differentOwner.grant, first.grant);
+  });
+
+  it("reuses directory capabilities only for the same canonical resource and purpose", async () => {
+    const workspace = makeTempDir("synara-directory-preview-reuse-");
+    const entryPath = path.join(workspace, "index.html");
+    writeFileSync(entryPath, "<!doctype html>");
+    const nowMs = Date.parse("2026-07-20T13:00:00.000Z");
+    const create = (purpose: "preview" | "browser") =>
+      createLocalPreviewGrant({
+        requestedPath: entryPath,
+        cwd: workspace,
+        allowedWorkspaceRoots: [workspace],
+        scope: "directory",
+        purpose,
+        nowMs,
+      });
+
+    const preview = await create("preview");
+    const reusedPreview = await create("preview");
+    const browser = await create("browser");
+
+    assert.deepEqual(reusedPreview, preview);
+    assert.notEqual(browser.grant, preview.grant);
+    assert.notEqual(browser.urlPath, preview.urlPath);
   });
 
   it("mints a directory grant for a relative HTML entry inside the active workspace", async () => {

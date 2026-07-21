@@ -3,6 +3,7 @@ import { EventEmitter } from "node:events";
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  adoptAttachedBrowserWebContentsSecurity,
   createBrowserPopupNavigationPolicy,
   enforceBrowserNavigationPolicy,
   enforceBrowserPopupNavigationPolicy,
@@ -81,7 +82,7 @@ describe("desktop browser security policy", () => {
     }
   });
 
-  it("denies guest popups immediately when a browser webview attaches", () => {
+  it("keeps a guest fail-closed until its owning policy is installed", () => {
     const host = new EventEmitter();
     const guest = new FakeBrowserWebContents();
     const preventAttachment = vi.fn();
@@ -123,14 +124,79 @@ describe("desktop browser security policy", () => {
       action: "deny",
     });
 
-    const preventNavigation = vi.fn();
-    guest.emit("will-navigate", { url: "file:///sensitive", preventDefault: preventNavigation });
-    expect(preventNavigation).toHaveBeenCalledOnce();
-    const originalHandler = guest.windowOpenHandler;
+    for (const eventName of ["will-navigate", "will-redirect"]) {
+      const preventNavigation = vi.fn();
+      guest.emit(eventName, {
+        url: "https://attacker.example/pre-adoption",
+        preventDefault: preventNavigation,
+      });
+      expect(preventNavigation).toHaveBeenCalledOnce();
+    }
+
+    const managedUrl = "https://managed.example/";
+    const owningNavigationPolicy = (event: { preventDefault(): void }, url: string): void => {
+      if (url !== managedUrl) event.preventDefault();
+    };
+    const runtimeWindowOpenHandler: TestWindowOpenHandler = ({ url }) => ({
+      action: url === managedUrl ? "allow" : "deny",
+    });
+    expect(
+      adoptAttachedBrowserWebContentsSecurity(guest as unknown as Electron.WebContents, () => {
+        guest.on("will-navigate", owningNavigationPolicy);
+        guest.on("will-redirect", owningNavigationPolicy);
+        guest.setWindowOpenHandler(runtimeWindowOpenHandler);
+        const preventDuringHandoff = vi.fn();
+        guest.emit("will-navigate", { preventDefault: preventDuringHandoff }, managedUrl);
+        expect(preventDuringHandoff).toHaveBeenCalledOnce();
+      }),
+    ).toBe(true);
+    expect(guest.listenerCount("will-navigate")).toBe(1);
+    expect(guest.listenerCount("will-redirect")).toBe(1);
+
+    const preventManagedNavigation = vi.fn();
+    guest.emit("will-navigate", { preventDefault: preventManagedNavigation }, managedUrl);
+    expect(preventManagedNavigation).not.toHaveBeenCalled();
+    const preventUnmanagedNavigation = vi.fn();
+    guest.emit(
+      "will-redirect",
+      { preventDefault: preventUnmanagedNavigation },
+      "https://attacker.example/redirect",
+    );
+    expect(preventUnmanagedNavigation).toHaveBeenCalledOnce();
+    expect(guest.windowOpenHandler?.({ url: managedUrl })).toEqual({ action: "allow" });
+    expect(guest.windowOpenHandler?.({ url: "https://attacker.example/popup" })).toEqual({
+      action: "deny",
+    });
+
     expect(ensureAttachedBrowserWebContentsSecurity(guest as unknown as Electron.WebContents)).toBe(
       false,
     );
-    expect(guest.windowOpenHandler).toBe(originalHandler);
+    expect(guest.windowOpenHandler).toBe(runtimeWindowOpenHandler);
+  });
+
+  it("retains provisional denial when owning policy installation fails", () => {
+    const guest = new FakeBrowserWebContents();
+    expect(ensureAttachedBrowserWebContentsSecurity(guest as unknown as Electron.WebContents)).toBe(
+      true,
+    );
+
+    expect(() =>
+      adoptAttachedBrowserWebContentsSecurity(guest as unknown as Electron.WebContents, () => {
+        throw new Error("policy installation failed");
+      }),
+    ).toThrow("policy installation failed");
+
+    for (const eventName of ["will-navigate", "will-redirect"]) {
+      const preventNavigation = vi.fn();
+      guest.emit(eventName, {
+        url: "https://attacker.example/fail-open-check",
+        preventDefault: preventNavigation,
+      });
+      expect(preventNavigation).toHaveBeenCalledOnce();
+    }
+    expect(guest.windowOpenHandler?.({ url: "https://attacker.example/popup" })).toEqual({
+      action: "deny",
+    });
   });
 
   it.each(["file:///sensitive", "data:text/html,unsafe", "synara-oauth://callback"])(

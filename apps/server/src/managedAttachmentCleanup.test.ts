@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ServerConfig, type ServerConfigShape } from "./config";
 import {
+  MANAGED_ATTACHMENT_STAGING_STARTUP_TIME_MS,
   MANAGED_ATTACHMENT_WRITING_LEASE_MS,
   ManagedAttachmentCleanup,
   ManagedAttachmentCleanupLive,
@@ -128,6 +129,50 @@ describe("managed attachment cleanup", () => {
     );
 
     expect(stalePartMissingAtAcquisition).toBe(true);
+  });
+
+  it("shares one total startup deadline across entries and leaves remainder for recovery", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "synara-managed-startup-deadline-"));
+    temporaryRoots.push(root);
+    const stagingDir = path.join(root, ".staging");
+    await fs.mkdir(stagingDir);
+    const nowMs = Date.now();
+    const staleDate = new Date(nowMs - MANAGED_ATTACHMENT_WRITING_LEASE_MS - 1_000);
+    for (let index = 0; index < 3; index += 1) {
+      const partPath = path.join(
+        stagingDir,
+        `att_v2_${(index + 1).toString(16).padStart(32, "0")}.part`,
+      );
+      await fs.writeFile(partPath, "stale");
+      await fs.utimes(partPath, staleDate, staleDate);
+    }
+    let clock = 0;
+    let forceCloseWaitMs: number | null = null;
+
+    const startup = await sweepOrphanManagedAttachmentParts({
+      attachmentsDir: root,
+      nowMs,
+      scanLimit: 16,
+      maxRemovals: 16,
+      timeBudgetMs: MANAGED_ATTACHMENT_STAGING_STARTUP_TIME_MS,
+      monotonicNow: () => clock,
+      beforePinnedSessionRequest: async () => {
+        clock += 100;
+      },
+      waitForPinnedSessionForceClose: async (timeoutMs) => {
+        forceCloseWaitMs = timeoutMs;
+      },
+    });
+
+    expect(startup).toMatchObject({ inspected: 3, removed: 2, failures: 0 });
+    expect(forceCloseWaitMs).toBe(0);
+    expect(await fs.readdir(stagingDir)).toHaveLength(1);
+
+    const recovery = await Effect.runPromise(
+      runManagedAttachmentStagingRecovery({ attachmentsDir: root, nowMs }),
+    );
+    expect(recovery).toMatchObject({ removed: 1, failures: 0, exhausted: true });
+    expect(await fs.readdir(stagingDir)).toEqual([]);
   });
 
   it("does not let an active upload-path lock stall the shutdown drain", async () => {
@@ -690,7 +735,7 @@ describe("managed attachment cleanup", () => {
         passes: 1,
         exhausted: false,
       });
-      expect(forceCloseWaitMs).toBe(25);
+      expect(forceCloseWaitMs).toBe(0);
       await expect(fs.readFile(stalePart, "utf8")).resolves.toBe("stale");
 
       clock = 0;
@@ -708,6 +753,50 @@ describe("managed attachment cleanup", () => {
     } finally {
       await Effect.runPromise(recovery.close);
       opendir.mockRestore();
+    }
+  });
+
+  it("force-closes an invalid recovery cursor within the remaining deadline", async () => {
+    const firstRoot = await fs.mkdtemp(path.join(os.tmpdir(), "synara-managed-stale-cursor-a-"));
+    const secondRoot = await fs.mkdtemp(path.join(os.tmpdir(), "synara-managed-stale-cursor-b-"));
+    temporaryRoots.push(firstRoot, secondRoot);
+    for (const root of [firstRoot, secondRoot]) {
+      const stagingDir = path.join(root, ".staging");
+      await fs.mkdir(stagingDir);
+      for (let index = 0; index < 2; index += 1) {
+        await fs.writeFile(
+          path.join(stagingDir, `att_v2_${(index + 10).toString(16).padStart(32, "0")}.part`),
+          "fresh",
+        );
+      }
+    }
+    let forceCloseWaitMs: number | null = null;
+    const recovery = makeManagedAttachmentStagingRecovery();
+    try {
+      const first = await Effect.runPromise(
+        recovery.run({
+          attachmentsDir: firstRoot,
+          invocationScanLimit: 1,
+          waitForPinnedSessionForceClose: async (timeoutMs) => {
+            forceCloseWaitMs = timeoutMs;
+          },
+        }),
+      );
+      expect(first).toMatchObject({ inspected: 1, exhausted: false });
+
+      const times = [0, 240, 240, 240];
+      let timeIndex = 0;
+      await Effect.runPromise(
+        recovery.run({
+          attachmentsDir: secondRoot,
+          invocationTimeBudgetMs: 250,
+          monotonicNow: () => times[Math.min(timeIndex++, times.length - 1)] ?? 240,
+        }),
+      );
+
+      expect(forceCloseWaitMs).toBe(10);
+    } finally {
+      await Effect.runPromise(recovery.close);
     }
   });
 

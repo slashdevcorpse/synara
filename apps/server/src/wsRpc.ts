@@ -865,9 +865,14 @@ const makeWsRpcHandlersLayer = () =>
           rpcEffect(workspaceEntries.searchLocal(input), "Failed to search local entries"),
         [WS_METHODS.projectsReadFile]: (input) =>
           rpcEffect(workspaceFileSystem.readFile(input), "Failed to read workspace file"),
-        [WS_METHODS.projectsCreateLocalFilePreviewGrant]: (input) =>
+        [WS_METHODS.projectsCreateLocalFilePreviewGrant]: (input, { clientId }) =>
           rpcEffect(
             Effect.gen(function* () {
+              const principal = yield* CurrentManagedAttachmentPrincipal;
+              const ownerKey =
+                principal.ownerKind === "session"
+                  ? `session:${principal.ownerId}`
+                  : `client:${clientId}`;
               const allowedWorkspaceRoots = new Set<string>();
               if (input.scope === "directory") {
                 // The renderer may name a cwd, but only durable server-known
@@ -887,6 +892,7 @@ const makeWsRpcHandlersLayer = () =>
               }
               return yield* createLocalPreviewGrantRpcEffect({
                 requestedPath: input.path,
+                ownerKey,
                 ...(input.cwd !== undefined ? { cwd: input.cwd } : {}),
                 ...(input.scope !== undefined ? { scope: input.scope } : {}),
                 ...(input.purpose !== undefined ? { purpose: input.purpose } : {}),

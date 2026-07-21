@@ -120,13 +120,20 @@ export function enforceBrowserNavigationPolicy(
 
 const guardedBrowserWebContents = new WeakSet<WebContents>();
 const attachmentSecuredBrowserWebContents = new WeakSet<WebContents>();
+const provisionalAttachmentPolicies = new WeakMap<
+  WebContents,
+  {
+    readonly willNavigate: (
+      event: Electron.Event<Electron.WebContentsWillNavigateEventParams>,
+    ) => void;
+    readonly willRedirect: (
+      event: Electron.Event<Electron.WebContentsWillRedirectEventParams>,
+    ) => void;
+  }
+>();
 const securedBrowserWebviewHosts = new WeakSet<WebContents>();
 
-/**
- * Install the normal-tab scheme policy once for the full lifetime of a guest.
- * Keeping the listeners until WebContents destruction closes the interval
- * between Electron attachment and the renderer's later browser IPC handshake.
- */
+/** Install a standalone normal-tab scheme policy once for a WebContents lifetime. */
 export function ensureBrowserNavigationPolicy(webContents: WebContents): boolean {
   if (guardedBrowserWebContents.has(webContents)) return false;
   guardedBrowserWebContents.add(webContents);
@@ -148,15 +155,46 @@ export function ensureBrowserNavigationPolicy(webContents: WebContents): boolean
 
 /**
  * Close the interval between Electron attaching a guest and the browser runtime
- * adopting it. Runtime configuration replaces this deny-all handler with the
- * normal popup/tab policy once the guest has an owning terminal tab.
+ * adopting it. Runtime configuration atomically replaces these provisional
+ * guards with the normal popup/tab policy once the guest has an owning tab.
  */
 export function ensureAttachedBrowserWebContentsSecurity(webContents: WebContents): boolean {
   if (attachmentSecuredBrowserWebContents.has(webContents)) return false;
 
-  ensureBrowserNavigationPolicy(webContents);
+  const willNavigate = (
+    event: Electron.Event<Electron.WebContentsWillNavigateEventParams>,
+  ): void => {
+    event.preventDefault();
+  };
+  const willRedirect = (
+    event: Electron.Event<Electron.WebContentsWillRedirectEventParams>,
+  ): void => {
+    event.preventDefault();
+  };
+  webContents.on("will-navigate", willNavigate);
+  webContents.on("will-redirect", willRedirect);
   webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  provisionalAttachmentPolicies.set(webContents, { willNavigate, willRedirect });
   attachmentSecuredBrowserWebContents.add(webContents);
+  return true;
+}
+
+/**
+ * Install an owning tab's complete policy before releasing attachment-time
+ * deny-all navigation. If installation throws, the provisional policy remains
+ * active and the guest stays fail-closed.
+ */
+export function adoptAttachedBrowserWebContentsSecurity(
+  webContents: WebContents,
+  installOwningPolicy: () => void,
+): boolean {
+  const provisionalPolicy = provisionalAttachmentPolicies.get(webContents);
+  installOwningPolicy();
+  if (!provisionalPolicy) return false;
+
+  webContents.removeListener("will-navigate", provisionalPolicy.willNavigate);
+  webContents.removeListener("will-redirect", provisionalPolicy.willRedirect);
+  provisionalAttachmentPolicies.delete(webContents);
   return true;
 }
 
