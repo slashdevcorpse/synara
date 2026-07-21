@@ -462,24 +462,19 @@ export function makeWorkspaceCloneJobs(input: {
         });
       }
       if (activeCloneIds.size >= WORKSPACE_CLONE_MAX_ACTIVE_JOBS) {
-        return directTerminal(
-          subscriber,
-          request.cloneId,
-          {
-            cloneId: request.cloneId,
-            clonedPath: null,
-            projectId: null,
-            failure: {
-              stage: "clone",
-              code: "WORKSPACE_CLONE_CAPACITY_EXCEEDED",
-              message:
-                `The server is already running ${WORKSPACE_CLONE_MAX_ACTIVE_JOBS} clone operations. ` +
-                "Retry after one finishes.",
-              retryable: true,
-            },
+        return directTerminal(subscriber, request.cloneId, {
+          cloneId: request.cloneId,
+          clonedPath: null,
+          projectId: null,
+          failure: {
+            stage: "clone",
+            code: "WORKSPACE_CLONE_CAPACITY_EXCEEDED",
+            message:
+              `The server is already running ${WORKSPACE_CLONE_MAX_ACTIVE_JOBS} clone operations. ` +
+              "Retry after one finishes.",
+            retryable: true,
           },
-          true,
-        );
+        });
       }
       activeCloneIds.add(request.cloneId);
       addSubscriber(request.cloneId, subscriber);

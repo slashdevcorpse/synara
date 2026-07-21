@@ -642,10 +642,7 @@ describe("workspace clone progress", () => {
         failure: { code: "WORKSPACE_CLONE_CAPACITY_EXCEEDED", retryable: true },
       },
     });
-    expect(jobs.getStatus(rejectedCloneId)).toMatchObject({
-      status: "failed",
-      result: { failure: { code: "WORKSPACE_CLONE_CAPACITY_EXCEEDED" } },
-    });
+    expect(jobs.getStatus(rejectedCloneId)).toBeNull();
 
     releaseClones();
     await Promise.all(
@@ -658,9 +655,9 @@ describe("workspace clone progress", () => {
       await Effect.runPromise(
         Stream.runCollect(
           jobs.cloneRepository({
-            cloneId: WorkspaceCloneId.makeUnsafe("clone-capacity-after-completion"),
+            cloneId: rejectedCloneId,
             url: "https://github.com/example/repo.git",
-            targetPath: NodePath.join(parent, "capacity-after-completion"),
+            targetPath: NodePath.join(parent, "capacity-rejected"),
             createProject: false,
             createParentDirectories: true,
           }),
@@ -668,6 +665,10 @@ describe("workspace clone progress", () => {
       ),
     );
     expect(afterCapacity.at(-1)).toMatchObject({
+      result: { failure: null },
+    });
+    expect(jobs.getStatus(rejectedCloneId)).toMatchObject({
+      status: "succeeded",
       result: { failure: null },
     });
   });
