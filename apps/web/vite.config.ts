@@ -11,6 +11,7 @@ import babel from "@rolldown/plugin-babel";
 import { tanstackRouter } from "@tanstack/router-plugin/vite";
 import { defineConfig, type Plugin } from "vite";
 import pkg from "./package.json" with { type: "json" };
+import { resolveGeneratedRouteTree } from "./viteRouteGeneration";
 
 const port = Number(process.env.PORT ?? 5733);
 const sourcemapEnv = process.env.SYNARA_WEB_SOURCEMAP?.trim().toLowerCase();
@@ -21,6 +22,7 @@ const buildSourcemap =
     : sourcemapEnv === "hidden"
       ? "hidden"
       : false;
+const generatedRouteTree = resolveGeneratedRouteTree(process.env);
 
 const CENTRAL_ICON_DIR = "central-icons-reversed";
 const CENTRAL_ICON_NAME_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
@@ -105,6 +107,7 @@ export default defineConfig({
     tanstackRouter({
       target: "react",
       autoCodeSplitting: true,
+      ...(generatedRouteTree ? { generatedRouteTree } : {}),
     }),
     react(),
     babel({
@@ -132,6 +135,9 @@ export default defineConfig({
     "import.meta.env.APP_VERSION": JSON.stringify(pkg.version),
   },
   resolve: {
+    ...(generatedRouteTree
+      ? { alias: [{ find: /^\.\/routeTree\.gen$/, replacement: generatedRouteTree }] }
+      : {}),
     tsconfigPaths: true,
   },
   server: {

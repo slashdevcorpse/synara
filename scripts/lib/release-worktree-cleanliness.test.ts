@@ -14,14 +14,14 @@ describe("release worktree cleanliness", () => {
   it("admits only untracked files beneath declared output roots", () => {
     expect(() =>
       validateReleaseWorktreeCleanliness({
-        trackedBytesDiffer: false,
+        trackedPaths: [],
         untrackedPaths: ["release-build/app.exe", "release-publish/provenance.json"],
         allowedOutputRoots: ["release-build", "release-publish"],
       }),
     ).not.toThrow();
     expect(() =>
       validateReleaseWorktreeCleanliness({
-        trackedBytesDiffer: false,
+        trackedPaths: [],
         untrackedPaths: ["release-build-input.txt"],
         allowedOutputRoots: ["release-build"],
       }),
@@ -31,14 +31,16 @@ describe("release worktree cleanliness", () => {
   it("rejects tracked mutations and unsafe output roots", () => {
     expect(() =>
       validateReleaseWorktreeCleanliness({
-        trackedBytesDiffer: true,
+        trackedPaths: ["apps/web/src/routeTree.gen.ts"],
         untrackedPaths: [],
         allowedOutputRoots: [],
       }),
-    ).toThrow("Tracked release source bytes differ");
+    ).toThrow(
+      "Tracked release source bytes differ from the recorded HEAD commit: apps/web/src/routeTree.gen.ts",
+    );
     expect(() =>
       validateReleaseWorktreeCleanliness({
-        trackedBytesDiffer: false,
+        trackedPaths: [],
         untrackedPaths: [],
         allowedOutputRoots: ["../outside"],
       }),
