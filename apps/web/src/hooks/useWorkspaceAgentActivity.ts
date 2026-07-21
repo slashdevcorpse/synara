@@ -549,7 +549,21 @@ export function createWorkspaceAgentThreadShellSelector(
   threadId: ThreadId,
 ): (state: AppState) => WorkspaceAgentShellSnapshot {
   let previous: WorkspaceAgentShellSnapshot = { projects: [], threads: [] };
+  let previousProjects: AppState["projects"] | undefined;
+  let previousThreadIds: AppState["threadIds"];
+  let previousSummaryById: AppState["sidebarThreadSummaryById"] | undefined;
   return (state) => {
+    if (
+      state.projects === previousProjects &&
+      state.threadIds === previousThreadIds &&
+      state.sidebarThreadSummaryById === previousSummaryById
+    ) {
+      return previous;
+    }
+    previousProjects = state.projects;
+    previousThreadIds = state.threadIds;
+    previousSummaryById = state.sidebarThreadSummaryById;
+
     const target = state.sidebarThreadSummaryById[threadId];
     if (!target) {
       if (previous.projects.length === 0 && previous.threads.length === 0) return previous;

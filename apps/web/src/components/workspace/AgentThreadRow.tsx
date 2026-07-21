@@ -7,11 +7,11 @@ import { PROVIDER_DISPLAY_NAMES, type ThreadId } from "@synara/contracts";
 import { useId } from "react";
 
 import { formatClockDuration } from "~/session-logic";
+import { agentStatusToSubagentStatusKind } from "~/lib/agentStatusPresentation";
 import { GitBranchIcon, LoaderIcon, StopIcon, XIcon } from "~/lib/icons";
 import {
   subagentStatusDotClassName,
   subagentStatusTextToneClassName,
-  type SubagentStatusKind,
 } from "~/lib/subagentPresentation";
 import { cn } from "~/lib/utils";
 
@@ -46,22 +46,6 @@ const STATUS_LABEL: Record<AgentStatus, string> = {
   stopped: "Stopped",
 };
 
-function coarseStatus(status: AgentStatus): SubagentStatusKind {
-  switch (status) {
-    case "thinking":
-    case "streaming":
-    case "tool-running":
-    case "connecting":
-      return "running";
-    case "queued":
-    case "completed":
-    case "failed":
-    case "stopped":
-    case "idle":
-      return status;
-  }
-}
-
 export function AgentThreadRow({
   entry,
   depth,
@@ -72,7 +56,7 @@ export function AgentThreadRow({
 }: AgentThreadRowProps) {
   const descriptionId = useId();
   const interruptible = isLiveAgentStatus(entry.status) && entry.turnId !== null;
-  const statusKind = coarseStatus(entry.status);
+  const statusKind = agentStatusToSubagentStatusKind(entry.status);
   const providerName = PROVIDER_DISPLAY_NAMES[entry.providerKind];
   const cappedDepth = Math.min(Math.max(0, depth), 6);
   const actionLabel = entry.subagentNickname ?? entry.threadTitle;

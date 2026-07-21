@@ -4,6 +4,7 @@
 
 import { ProjectId, ThreadId, TurnId } from "@synara/contracts";
 
+import { isLiveAgentStatus } from "../../lib/workspaceAgentActivity";
 import type {
   AgentThreadEntry,
   AgentThreadTreeNode,
@@ -45,13 +46,7 @@ export function makeWorkspaceAgentEntry(
 function summarize(entries: ReadonlyArray<AgentThreadEntry>): WorkspaceAgentSummary {
   return {
     total: entries.length,
-    running: entries.filter(
-      (entry) =>
-        entry.status === "connecting" ||
-        entry.status === "thinking" ||
-        entry.status === "streaming" ||
-        entry.status === "tool-running",
-    ).length,
+    running: entries.filter((entry) => isLiveAgentStatus(entry.status)).length,
     queued: entries.filter((entry) => entry.status === "queued").length,
     completed: entries.filter((entry) => entry.status === "completed").length,
     failed: entries.filter((entry) => entry.status === "failed").length,

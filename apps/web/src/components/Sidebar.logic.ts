@@ -15,6 +15,7 @@ import { isWorkspaceRootWithin, workspaceRootsEqual } from "@synara/shared/threa
 import type { SidebarProjectSortOrder, SidebarThreadSortOrder } from "../appSettings";
 import { resolveRestorableThreadRoute, type LastThreadRoute } from "../chatRouteRestore";
 import type { ChatMessage, Project, SidebarThreadSummary, Thread } from "../types";
+import { worktreePathBasename } from "../worktreeCleanup";
 import { cn } from "../lib/utils";
 import {
   derivePinnedIds,
@@ -293,26 +294,13 @@ function nonEmptyDisplayValue(value: string | null | undefined): string | null {
   return trimmed && trimmed.length > 0 ? trimmed : null;
 }
 
-function crossPlatformPathBasename(path: string | null | undefined): string | null {
-  const normalizedPath = nonEmptyDisplayValue(path)?.replace(/[\\/]+$/, "");
-  if (!normalizedPath || /^[A-Za-z]:$/.test(normalizedPath)) {
-    return null;
-  }
-
-  const finalSeparatorIndex = Math.max(
-    normalizedPath.lastIndexOf("/"),
-    normalizedPath.lastIndexOf("\\"),
-  );
-  return nonEmptyDisplayValue(normalizedPath.slice(finalSeparatorIndex + 1));
-}
-
 export function resolveThreadHoverCardWorkspaceLabel(input: {
   thread: Pick<SidebarThreadSummary, "associatedWorktreeBranch" | "associatedWorktreePath">;
   project: Pick<Project, "folderName" | "name"> | null;
 }): string | null {
   return (
     nonEmptyDisplayValue(input.thread.associatedWorktreeBranch) ??
-    crossPlatformPathBasename(input.thread.associatedWorktreePath) ??
+    worktreePathBasename(input.thread.associatedWorktreePath) ??
     nonEmptyDisplayValue(input.project?.folderName) ??
     nonEmptyDisplayValue(input.project?.name)
   );

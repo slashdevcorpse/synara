@@ -10,14 +10,14 @@ import { PROVIDER_DISPLAY_NAMES, type ProviderKind } from "@synara/contracts";
 import type { MouseEvent, ReactNode } from "react";
 
 import { formatClockDuration } from "~/session-logic";
+import { agentStatusToSubagentStatusKind } from "~/lib/agentStatusPresentation";
 import { ArrowRightIcon, StopIcon, WorktreeIcon } from "~/lib/icons";
 import {
   subagentStatusDotClassName,
   subagentStatusTextToneClassName,
-  type SubagentStatusKind,
 } from "~/lib/subagentPresentation";
 import { cn } from "~/lib/utils";
-import type { AgentStatus } from "~/lib/workspaceAgentActivity";
+import { isLiveAgentStatus, type AgentStatus } from "~/lib/workspaceAgentActivity";
 import {
   PR_STATE_PRESENTATION_ICONS,
   resolvePrStatePresentation,
@@ -56,13 +56,6 @@ const META_ROW_CLASS_NAME = cn(ROW_CLASS_NAME, "text-foreground/80");
 const META_ICON_CLASS_NAME = "size-3.5 shrink-0 text-muted-foreground";
 const DIVIDER_CLASS_NAME = "-mx-0.5 my-0.5 h-px bg-[color:var(--color-border)]";
 
-const LIVE_STATUS_VALUES = new Set<AgentStatus>([
-  "thinking",
-  "streaming",
-  "tool-running",
-  "connecting",
-]);
-
 const PR_INPUT_BY_STATE = {
   open: { state: "open" },
   draft: { state: "open", isDraft: true },
@@ -70,26 +63,6 @@ const PR_INPUT_BY_STATE = {
   merged: { state: "merged" },
   closed: { state: "closed" },
 } as const;
-
-function coarseStatus(status: AgentStatus): SubagentStatusKind {
-  switch (status) {
-    case "thinking":
-    case "streaming":
-    case "tool-running":
-    case "connecting":
-      return "running";
-    case "queued":
-      return "queued";
-    case "completed":
-      return "completed";
-    case "failed":
-      return "failed";
-    case "stopped":
-      return "stopped";
-    case "idle":
-      return "idle";
-  }
-}
 
 function formatStatusCopy(
   status: AgentStatus,
@@ -180,7 +153,7 @@ export function ThreadHoverCardContent({
   onInterrupt,
 }: ThreadHoverCardContentProps) {
   const providerName = PROVIDER_DISPLAY_NAMES[provider];
-  const statusKind = coarseStatus(status);
+  const statusKind = agentStatusToSubagentStatusKind(status);
   const statusCopy = formatStatusCopy(status, duration, toolLabel);
   const subagentCopy = formatSubagentCount(subagentCount, subagentRunningCount);
   const hasContext = worktreeLabel !== null || (prTitle !== null && prState !== null);
@@ -224,7 +197,7 @@ export function ThreadHoverCardContent({
           className={cn(
             "size-1.5 shrink-0 rounded-full",
             subagentStatusDotClassName(statusKind),
-            LIVE_STATUS_VALUES.has(status) && "animate-pulse motion-reduce:animate-none",
+            isLiveAgentStatus(status) && "animate-pulse motion-reduce:animate-none",
           )}
         />
         <span

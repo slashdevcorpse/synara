@@ -16,16 +16,9 @@ import type {
 
 import { formatSubagentModelLabel } from "./subagentPresentation";
 
-export type AgentStatus =
-  | "idle"
-  | "thinking"
-  | "streaming"
-  | "tool-running"
-  | "connecting"
-  | "queued"
-  | "completed"
-  | "failed"
-  | "stopped";
+export type LiveAgentStatus = "thinking" | "streaming" | "tool-running" | "connecting";
+
+export type AgentStatus = "idle" | LiveAgentStatus | "queued" | "completed" | "failed" | "stopped";
 
 export interface AgentToolActivity {
   name: string;
@@ -631,7 +624,7 @@ export function deriveAgentDuration(input: {
   const turnStart =
     timestamp(input.latestTurn?.startedAt) || timestamp(input.latestTurn?.requestedAt);
   const start =
-    input.status === "queued"
+    input.status === "queued" || input.status === "connecting"
       ? timestamp(input.queuedAt) || timestamp(input.sessionUpdatedAt) || turnStart
       : turnStart || timestamp(input.queuedAt) || timestamp(input.sessionUpdatedAt);
   if (start === 0) return 0;
@@ -643,7 +636,7 @@ export function deriveAgentDuration(input: {
   return Math.max(0, end - start);
 }
 
-export function isLiveAgentStatus(status: AgentStatus): boolean {
+export function isLiveAgentStatus(status: AgentStatus): status is LiveAgentStatus {
   return (
     status === "connecting" ||
     status === "thinking" ||

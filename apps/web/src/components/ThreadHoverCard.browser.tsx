@@ -243,6 +243,8 @@ describe("ThreadHoverCardFrame", () => {
       await page.getByTestId("dismiss-row").hover();
       await expect.element(page.getByTestId("dismiss-content")).toBeVisible();
       await expect.element(page.getByTestId("nested-pr-control")).toBeVisible();
+      await page.getByTestId("dismiss-content").hover();
+      await expect.element(page.getByTestId("dismiss-content")).toBeVisible();
       await page.getByTestId("dismiss-outside").hover();
       const closingPopup = document.querySelector<HTMLElement>('[data-slot="preview-card-popup"]');
       expect(closingPopup?.hasAttribute("data-ending-style")).toBe(true);

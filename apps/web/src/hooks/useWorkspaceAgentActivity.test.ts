@@ -662,21 +662,47 @@ describe("workspace agent shell selection", () => {
       expanded: true,
       scripts: [],
     } satisfies Project;
-    const selector = createWorkspaceAgentThreadShellSelector(targetId);
-    const selected = selector({
+    const threadIds = summaries.map((summary) => summary.id);
+    const summaryRecord = Object.fromEntries(
+      summaries.map((summary) => [summary.id, summary]),
+    ) as AppState["sidebarThreadSummaryById"];
+    let summaryReadCount = 0;
+    const sidebarThreadSummaryById = new Proxy(summaryRecord, {
+      get(target, property, receiver) {
+        if (typeof property === "string") summaryReadCount += 1;
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const state = {
       projects: [project],
       threadsHydrated: true,
-      threadIds: summaries.map((summary) => summary.id),
-      sidebarThreadSummaryById: Object.fromEntries(
-        summaries.map((summary) => [summary.id, summary]),
-      ),
-    } as AppState);
+      threadIds,
+      sidebarThreadSummaryById,
+    } as AppState;
+    const selector = createWorkspaceAgentThreadShellSelector(targetId);
+    const selected = selector(state);
 
     expect(selected.threads.map((thread) => thread.threadId)).toEqual([
       targetId,
       parentId,
       childId,
     ]);
+
+    summaryReadCount = 0;
+    expect(selector({ ...state, threadsHydrated: false })).toBe(selected);
+    expect(summaryReadCount).toBe(0);
+
+    const replacementSummaryById = new Proxy(
+      { ...summaryRecord },
+      {
+        get(target, property, receiver) {
+          if (typeof property === "string") summaryReadCount += 1;
+          return Reflect.get(target, property, receiver);
+        },
+      },
+    );
+    selector({ ...state, sidebarThreadSummaryById: replacementSummaryById });
+    expect(summaryReadCount).toBeGreaterThan(0);
   });
 });
 

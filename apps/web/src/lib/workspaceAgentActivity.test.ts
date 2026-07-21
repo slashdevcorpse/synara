@@ -1154,4 +1154,32 @@ describe("workspace agent labels and timing", () => {
       }),
     ).toBe(2_000);
   });
+
+  it("measures a new connection from its session timestamp instead of an older turn", () => {
+    const start = Date.parse(BASE_TIME);
+    const activity = deriveWorkspaceAgentThreadActivity({
+      threadId: THREAD_ID,
+      projects: [project],
+      threads: [
+        shellThread({
+          session: {
+            ...shellThread().session!,
+            status: "starting",
+            activeTurnId: null,
+            updatedAt: new Date(start + 8_000).toISOString(),
+          },
+          latestTurn: {
+            ...shellThread().latestTurn!,
+            state: "completed",
+            completedAt: new Date(start + 1_000).toISOString(),
+          },
+          hasLiveTailWork: false,
+        }),
+      ],
+      eventState: createInitialWorkspaceAgentEventState(),
+      nowMs: start + 10_000,
+    });
+
+    expect(activity.entry).toMatchObject({ status: "connecting", duration: 2_000 });
+  });
 });
