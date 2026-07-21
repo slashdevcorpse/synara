@@ -1,13 +1,19 @@
 // FILE: errorMessages.ts
 // Purpose: Normalizes nested Error-like values into readable messages.
 // Layer: Shared utility
-// Exports: collectErrorMessages, describeErrorMessage, THREAD_NOT_ARCHIVED_INVARIANT_MARKER
+// Exports: collectErrorMessages, describeErrorMessage, stable orchestration invariant markers
 
 // Stable phrase embedded in the server's "thread is not archived" orchestration
 // invariant message. Shared so the server (which builds the message) and the
 // client (which detects an Undo that raced another restore) reference one source
 // of truth and cannot silently drift apart when the wording is edited.
 export const THREAD_NOT_ARCHIVED_INVARIANT_MARKER = "is not archived for command";
+
+// Stable phrase embedded when an archived project still owns a workspace root.
+// Shared with project-create recovery so adding the same folder restores the
+// original project id instead of creating a second project over preserved chats.
+export const PROJECT_ARCHIVED_WORKSPACE_ROOT_INVARIANT_MARKER =
+  "is archived and reserves workspace root";
 
 export function collectErrorMessages(
   error: unknown,

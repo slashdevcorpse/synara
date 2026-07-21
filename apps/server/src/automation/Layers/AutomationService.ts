@@ -609,16 +609,17 @@ export const AutomationServiceLive = Layer.effect(
       );
 
     const requireProject = (projectId: AutomationDefinition["projectId"]) =>
-      projectionSnapshotQuery.getShellSnapshot().pipe(
-        Effect.mapError(toServiceError("Failed to load project snapshot.")),
-        Effect.flatMap((snapshot) => {
-          const project = snapshot.projects.find((entry) => entry.id === projectId);
-          return project
-            ? Effect.succeed(project)
-            : Effect.fail(
+      projectionSnapshotQuery.getProjectShellById(projectId).pipe(
+        Effect.mapError(toServiceError("Failed to load automation project.")),
+        Effect.flatMap(
+          Option.match({
+            onNone: () =>
+              Effect.fail(
                 new AutomationServiceError({ message: "Automation project was not found." }),
-              );
-        }),
+              ),
+            onSome: Effect.succeed,
+          }),
+        ),
       );
 
     const validateHeartbeatTarget = (input: {
@@ -2143,6 +2144,7 @@ export const AutomationServiceLive = Layer.effect(
     const runNow: AutomationServiceShape["runNow"] = (input) =>
       Effect.gen(function* () {
         const definition = yield* requireDefinition(input.automationId);
+        yield* requireProject(definition.projectId);
         const now = isoNow();
         // Heartbeat automations continue a single shared thread, so a manual run must not
         // race a scheduled (or earlier manual) run that is still in flight. Standalone
@@ -2231,6 +2233,7 @@ export const AutomationServiceLive = Layer.effect(
     // schedule advancement, so dispatch failures still leave auditable history.
     const runDueDefinition = (definition: AutomationDefinition, now: string) =>
       Effect.gen(function* () {
+        yield* requireProject(definition.projectId);
         if (
           definition.maxIterations !== null &&
           definition.iterationCount >= definition.maxIterations

@@ -16,7 +16,7 @@ import { ProviderCommandReactorLive } from "./orchestration/Layers/ProviderComma
 import { ProviderRuntimeIngestionLive } from "./orchestration/Layers/ProviderRuntimeIngestion";
 import { RuntimeReceiptBusLive } from "./orchestration/Layers/RuntimeReceiptBus";
 import { ThreadDeletionReactorLive } from "./orchestration/Layers/ThreadDeletionReactor";
-import { OrchestrationLayerLive } from "./orchestration/runtimeLayer";
+import { OrchestrationLayerWithDevServerLifecycleLive } from "./orchestration/runtimeLayer";
 
 import { DevServerManagerLive } from "./devServerManager";
 import { KeybindingsLive } from "./keybindings";
@@ -56,15 +56,21 @@ export function makeServerRuntimeServicesLayer(
   const agentGatewayCredentialsLayer =
     options.agentGatewayCredentialsLayer ?? AgentGatewayCredentialsWithSecretsLive;
   const providerHealthLayer = ProviderHealthLive.pipe(Layer.provideMerge(ServerSettingsLive));
+  // Both orchestration archive admission and WebSocket dev-server RPCs receive
+  // this exact memoized manager instance, making their lifecycle lock authoritative.
+  const devServerManagerLayer = DevServerManagerLive.pipe(Layer.provide(TerminalLayerLive));
+  const orchestrationLayer = OrchestrationLayerWithDevServerLifecycleLive.pipe(
+    Layer.provideMerge(devServerManagerLayer),
+  );
   const checkpointStoreLayer = CheckpointStoreLive.pipe(Layer.provide(GitCoreLive));
 
   const checkpointDiffQueryLayer = CheckpointDiffQueryLive.pipe(
-    Layer.provideMerge(OrchestrationLayerLive),
+    Layer.provideMerge(orchestrationLayer),
     Layer.provideMerge(checkpointStoreLayer),
   );
 
   const runtimeServicesLayer = Layer.mergeAll(
-    OrchestrationLayerLive,
+    orchestrationLayer,
     checkpointStoreLayer,
     checkpointDiffQueryLayer,
     RuntimeReceiptBusLive,
@@ -100,11 +106,9 @@ export function makeServerRuntimeServicesLayer(
   );
   const threadDeletionReactorLayer = ThreadDeletionReactorLive.pipe(
     Layer.provideMerge(profileStatsArchiveLayer),
-    Layer.provideMerge(OrchestrationLayerLive),
+    Layer.provideMerge(orchestrationLayer),
     Layer.provideMerge(TerminalLayerLive),
   );
-  // Shares the single memoized TerminalManager with the top-level TerminalLayerLive.
-  const devServerManagerLayer = DevServerManagerLive.pipe(Layer.provide(TerminalLayerLive));
   const sessionCredentialLayer = SessionCredentialServiceLive.pipe(
     Layer.provide(ServerSecretStoreLive),
   );
@@ -154,7 +158,11 @@ export function makeServerRuntimeServicesLayer(
   const pullRequestServiceLayer = PullRequestServiceLive.pipe(
     Layer.provideMerge(GitLayerLive),
     Layer.provideMerge(ProjectPullRequestPinsLive),
-    Layer.provideMerge(OrchestrationLayerLive),
+    Layer.provideMerge(orchestrationLayer),
+  );
+  const workspaceLayer = WorkspaceLayerLive.pipe(
+    Layer.provideMerge(GitLayerLive),
+    Layer.provideMerge(orchestrationLayer),
   );
 
   return Layer.mergeAll(
@@ -172,7 +180,7 @@ export function makeServerRuntimeServicesLayer(
     orchestrationReactorLayer,
     providerCommandReactorLayer,
     threadDeletionReactorLayer,
-    devServerManagerLayer,
+    orchestrationLayer,
     GitLayerLive,
     TextGenerationLayerLive,
     TerminalLayerLive,
@@ -183,7 +191,7 @@ export function makeServerRuntimeServicesLayer(
     authServicesLayer,
     ServerLifecycleEventsLive,
     ServerRuntimeStartupLive,
-    WorkspaceLayerLive,
+    workspaceLayer,
     ProjectFaviconResolverLive,
   ).pipe(Layer.provideMerge(NodeServices.layer));
 }

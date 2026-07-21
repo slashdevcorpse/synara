@@ -31,6 +31,8 @@ describe("git status parsing", () => {
     const parsed = parseGitStatusPorcelain(stdout);
 
     expect(parsed).toMatchObject({
+      hasCommits: true,
+      isDetached: false,
       branch: "feature/status",
       upstreamRef: "origin/feature/status",
       aheadCount: 2,
@@ -47,6 +49,28 @@ describe("git status parsing", () => {
     ]);
     expect([...parsed.untrackedFilesWithoutNumstat]).toEqual([untrackedPath, "new-directory/"]);
     expect(parsed.changedFilesWithoutNumstat.has(originalPath)).toBe(false);
+  });
+
+  it("reports unborn and detached metadata while preserving parenthesized branch names", () => {
+    expect(parseGitStatusPorcelain("# branch.oid (initial)\0# branch.head main\0")).toMatchObject({
+      hasCommits: false,
+      isDetached: false,
+      branch: "main",
+    });
+    expect(
+      parseGitStatusPorcelain("# branch.oid 0123456789abcdef\0# branch.head (detached)\0"),
+    ).toMatchObject({
+      hasCommits: true,
+      isDetached: true,
+      branch: null,
+    });
+    expect(
+      parseGitStatusPorcelain("# branch.oid 0123456789abcdef\0# branch.head (release)\0"),
+    ).toMatchObject({
+      hasCommits: true,
+      isDetached: false,
+      branch: "(release)",
+    });
   });
 
   it("normalizes only configured local merge refs", () => {

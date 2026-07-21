@@ -46,6 +46,7 @@ const makeProjectionProjectRepository = Effect.gen(function* () {
           is_pinned,
           created_at,
           updated_at,
+          archived_at,
           deleted_at
         )
         VALUES (
@@ -58,6 +59,7 @@ const makeProjectionProjectRepository = Effect.gen(function* () {
           ${row.isPinned ? 1 : 0},
           ${row.createdAt},
           ${row.updatedAt},
+          ${row.archivedAt},
           ${row.deletedAt}
         )
         ON CONFLICT (project_id)
@@ -70,6 +72,7 @@ const makeProjectionProjectRepository = Effect.gen(function* () {
           is_pinned = excluded.is_pinned,
           created_at = excluded.created_at,
           updated_at = excluded.updated_at,
+          archived_at = excluded.archived_at,
           deleted_at = excluded.deleted_at
       `,
   });
@@ -89,6 +92,7 @@ const makeProjectionProjectRepository = Effect.gen(function* () {
           is_pinned AS "isPinned",
           created_at AS "createdAt",
           updated_at AS "updatedAt",
+          archived_at AS "archivedAt",
           deleted_at AS "deletedAt"
         FROM projection_projects
         WHERE project_id = ${projectId}
@@ -110,6 +114,7 @@ const makeProjectionProjectRepository = Effect.gen(function* () {
           is_pinned AS "isPinned",
           created_at AS "createdAt",
           updated_at AS "updatedAt",
+          archived_at AS "archivedAt",
           deleted_at AS "deletedAt"
         FROM projection_projects
         ORDER BY created_at ASC, project_id ASC

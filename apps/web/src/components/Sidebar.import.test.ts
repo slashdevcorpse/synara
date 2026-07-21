@@ -18,11 +18,35 @@ vi.mock("./workspace/WorkspaceAgentSection", () => ({
 }));
 
 describe("Sidebar module", () => {
-  it("loads after project-run wiring", async () => {
+  it("loads and keeps the dashboard separate from optional terminal workspaces", async () => {
     vi.stubGlobal("self", globalThis);
     const module = await import("./Sidebar");
 
     expect(module.default).toBeTypeOf("function");
+    expect(module.WORKSPACE_DASHBOARD_PATH).toBe("/workspace");
+    expect(module.resolveSidebarWorkspaceRoute("/workspace")).toEqual({
+      isDashboard: true,
+      isTerminalWorkspace: false,
+    });
+    expect(module.resolveSidebarWorkspaceRoute("/workspace/")).toEqual({
+      isDashboard: true,
+      isTerminalWorkspace: false,
+    });
+    expect(module.resolveSidebarWorkspaceRoute("/workspace/terminal-1")).toEqual({
+      isDashboard: false,
+      isTerminalWorkspace: true,
+    });
+    expect(module.resolveSidebarWorkspaceRoute("/workspace-extra")).toEqual({
+      isDashboard: false,
+      isTerminalWorkspace: false,
+    });
+    expect(module.shouldRedirectHiddenTerminalWorkspaceRoute("/workspace", false)).toBe(false);
+    expect(module.shouldRedirectHiddenTerminalWorkspaceRoute("/workspace/terminal-1", false)).toBe(
+      true,
+    );
+    expect(module.shouldRedirectHiddenTerminalWorkspaceRoute("/workspace/terminal-1", true)).toBe(
+      false,
+    );
     // Full-suite runs transform many web files concurrently; this import can cross Vitest's 5s default.
   }, 15_000);
 });

@@ -10,6 +10,7 @@ import type {
 } from "@synara/contracts";
 
 import { EMPTY_ROUTE_RESTORE_FALLBACK_DELAY_MS } from "./chatRouteRestore";
+import { isActiveReadModelProject } from "./projectVisibility";
 import { useStore } from "./store";
 
 function shellSnapshotHasProjectsOrThreads(snapshot: OrchestrationShellSnapshot): boolean {
@@ -20,12 +21,25 @@ function shellSnapshotHasThreads(snapshot: OrchestrationShellSnapshot): boolean 
   return snapshot.threads.length > 0;
 }
 
+function getActiveReadModelProjectIds(snapshot: OrchestrationReadModel) {
+  return new Set(snapshot.projects.filter(isActiveReadModelProject).map((project) => project.id));
+}
+
 function readModelHasProjectsOrThreads(snapshot: OrchestrationReadModel): boolean {
-  return snapshot.projects.length > 0 || snapshot.threads.length > 0;
+  const activeProjectIds = getActiveReadModelProjectIds(snapshot);
+  return (
+    activeProjectIds.size > 0 ||
+    snapshot.threads.some(
+      (thread) => (thread.deletedAt ?? null) === null && activeProjectIds.has(thread.projectId),
+    )
+  );
 }
 
 function readModelHasThreads(snapshot: OrchestrationReadModel): boolean {
-  return snapshot.threads.length > 0;
+  const activeProjectIds = getActiveReadModelProjectIds(snapshot);
+  return snapshot.threads.some(
+    (thread) => (thread.deletedAt ?? null) === null && activeProjectIds.has(thread.projectId),
+  );
 }
 
 export function waitForEmptyRouteRestoreFallbackDelay(): Promise<void> {

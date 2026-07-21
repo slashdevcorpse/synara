@@ -13,6 +13,7 @@ import {
 import { Effect, Layer, Option, Schema } from "effect";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import * as SqlSchema from "effect/unstable/sql/SqlSchema";
+import type { Fragment } from "effect/unstable/sql/Statement";
 
 import {
   toPersistenceDecodeCauseError,
@@ -145,6 +146,27 @@ function toRun(row: AutomationRunDbRow) {
 
 const makeAutomationRepository = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
+
+  const activeProjectProjection = (projectId: Fragment) => sql`
+    EXISTS (
+      SELECT 1
+      FROM projection_projects projects
+      WHERE projects.project_id = ${projectId}
+        AND projects.deleted_at IS NULL
+        AND projects.archived_at IS NULL
+    )
+  `;
+
+  const missingOrActiveProjectProjection = (projectId: Fragment) => sql`
+    (
+      NOT EXISTS (
+        SELECT 1
+        FROM projection_projects projects
+        WHERE projects.project_id = ${projectId}
+      )
+      OR ${activeProjectProjection(projectId)}
+    )
+  `;
 
   const insertDefinition = SqlSchema.void({
     Request: AutomationDefinitionDbRow,
@@ -338,10 +360,11 @@ const makeAutomationRepository = Effect.gen(function* () {
           created_at AS "createdAt",
           updated_at AS "updatedAt",
           archived_at AS "archivedAt"
-        FROM automation_definitions
-        WHERE (${projectId ?? null} IS NULL OR project_id = ${projectId ?? null})
-          AND (${includeArchived ? 1 : 0} = 1 OR archived_at IS NULL)
-        ORDER BY updated_at DESC, automation_id ASC
+        FROM automation_definitions definitions
+        WHERE (${projectId ?? null} IS NULL OR definitions.project_id = ${projectId ?? null})
+          AND (${includeArchived ? 1 : 0} = 1 OR definitions.archived_at IS NULL)
+          AND ${missingOrActiveProjectProjection(sql`definitions.project_id`)}
+        ORDER BY definitions.updated_at DESC, definitions.automation_id ASC
       `,
   });
 
@@ -388,6 +411,7 @@ const makeAutomationRepository = Effect.gen(function* () {
         FROM automation_definitions definitions
         WHERE definitions.enabled = 1
           AND definitions.archived_at IS NULL
+          AND ${activeProjectProjection(sql`definitions.project_id`)}
           AND definitions.next_run_at IS NOT NULL
           AND definitions.next_run_at <= ${now}
           AND NOT (
@@ -427,6 +451,10 @@ const makeAutomationRepository = Effect.gen(function* () {
 
   const insertRun = SqlSchema.void({
     Request: AutomationRunDbRow,
+    // Once the project projection exists, run creation and project archive contend on the
+    // same SQLite database: either this insert wins and archive observes active work, or
+    // archive wins and this insert becomes a no-op. The absent-row branch preserves import/
+    // repair compatibility; AutomationService independently requires an active shell project.
     execute: (run) =>
       sql`
         INSERT OR IGNORE INTO automation_runs (
@@ -474,13 +502,29 @@ const makeAutomationRepository = Effect.gen(function* () {
           ${run.permissionSnapshot},
           ${run.createdAt},
           ${run.updatedAt}
-        WHERE ${run.threadId} IS NULL
-           OR NOT EXISTS (
-             SELECT 1
-             FROM automation_runs
-             WHERE thread_id = ${run.threadId}
-               AND status IN ('pending', 'claimed', 'running', 'waiting-for-approval')
-           )
+        WHERE ${missingOrActiveProjectProjection(sql`${run.projectId}`)}
+          AND (
+            ${run.threadId} IS NULL
+            OR NOT EXISTS (
+              SELECT 1
+              FROM automation_runs
+              WHERE thread_id = ${run.threadId}
+                AND status IN ('pending', 'claimed', 'running', 'waiting-for-approval')
+            )
+          )
+      `,
+  });
+
+  // INSERT OR IGNORE can mean either legitimate dedupe or a blocked project. Recheck the
+  // same durable visibility fence immediately before returning any readback row. Missing
+  // projections remain allowed for import/repair compatibility, matching insertRun above.
+  const getRunAdmissionRow = SqlSchema.findOneOption({
+    Request: Schema.Struct({ projectId: ProjectId }),
+    Result: Schema.Struct({ projectId: ProjectId }),
+    execute: ({ projectId }) =>
+      sql`
+        SELECT ${projectId} AS "projectId"
+        WHERE ${missingOrActiveProjectProjection(sql`${projectId}`)}
       `,
   });
 
@@ -588,6 +632,7 @@ const makeAutomationRepository = Effect.gen(function* () {
           ON definitions.automation_id = runs.automation_id
         WHERE (${projectId ?? null} IS NULL OR runs.project_id = ${projectId ?? null})
           AND (${includeArchived ? 1 : 0} = 1 OR definitions.archived_at IS NULL)
+          AND ${missingOrActiveProjectProjection(sql`runs.project_id`)}
         ORDER BY runs.scheduled_for DESC, runs.run_id DESC
         LIMIT ${MAX_RUN_LIST_ROWS}
       `,
@@ -822,14 +867,15 @@ const makeAutomationRepository = Effect.gen(function* () {
           permission_snapshot_json AS "permissionSnapshot",
           created_at AS "createdAt",
           updated_at AS "updatedAt"
-        FROM automation_runs
-        WHERE status IN ('pending', 'claimed', 'running', 'waiting-for-approval')
+        FROM automation_runs runs
+        WHERE runs.status IN ('pending', 'claimed', 'running', 'waiting-for-approval')
+          AND ${missingOrActiveProjectProjection(sql`runs.project_id`)}
           AND (
             ${afterCreatedAt ?? null} IS NULL
-            OR created_at > ${afterCreatedAt ?? null}
-            OR (created_at = ${afterCreatedAt ?? null} AND run_id > ${afterRunId ?? ""})
+            OR runs.created_at > ${afterCreatedAt ?? null}
+            OR (runs.created_at = ${afterCreatedAt ?? null} AND runs.run_id > ${afterRunId ?? ""})
           )
-        ORDER BY created_at ASC, run_id ASC
+        ORDER BY runs.created_at ASC, runs.run_id ASC
         LIMIT ${limit}
       `,
   });
@@ -864,6 +910,7 @@ const makeAutomationRepository = Effect.gen(function* () {
         FROM automation_runs runs
         INNER JOIN automation_pending_completion_evaluations pending
           ON pending.run_id = runs.run_id
+        WHERE ${missingOrActiveProjectProjection(sql`runs.project_id`)}
         ORDER BY pending.finished_at ASC, pending.run_id ASC
         LIMIT ${limit}
       `,
@@ -948,6 +995,7 @@ const makeAutomationRepository = Effect.gen(function* () {
         WHERE definitions.enabled = 1
           AND definitions.archived_at IS NULL
           AND definitions.next_run_at IS NOT NULL
+          AND ${activeProjectProjection(sql`definitions.project_id`)}
           AND NOT (
             definitions.mode = 'heartbeat'
             AND definitions.target_thread_id IS NOT NULL
@@ -1162,7 +1210,7 @@ const makeAutomationRepository = Effect.gen(function* () {
     }).pipe(Effect.mapError(toPersistenceSqlError("AutomationRepository.list:query")));
   };
 
-  const createRun: AutomationRepositoryShape["createRun"] = (input) => {
+  const createRunInCurrentTransaction: AutomationRepositoryShape["createRun"] = (input) => {
     const run: AutomationRun = {
       id: input.id,
       automationId: input.automationId,
@@ -1185,28 +1233,40 @@ const makeAutomationRepository = Effect.gen(function* () {
       createdAt: input.now,
       updatedAt: input.now,
     };
-    const decodeInserted = (rowOption: Option.Option<AutomationRunDbRow>) =>
+    const missingRun = () =>
+      Effect.fail(
+        toPersistenceDecodeCauseError("AutomationRepository.createRun:missingRow")(
+          new Error("Automation run was not inserted or found."),
+        ),
+      );
+    const decodeAdmitted = (rowOption: Option.Option<AutomationRunDbRow>) =>
       Option.match(rowOption, {
-        onNone: () =>
-          Effect.fail(
-            toPersistenceDecodeCauseError("AutomationRepository.createRun:missingRow")(
-              new Error("Automation run was not inserted or found."),
+        onNone: missingRun,
+        onSome: (row) =>
+          getRunAdmissionRow({ projectId: input.projectId }).pipe(
+            Effect.mapError(
+              toPersistenceSqlError("AutomationRepository.createRun:selectProjectAdmission"),
+            ),
+            Effect.flatMap(
+              Option.match({
+                onNone: missingRun,
+                onSome: () => toRun(row),
+              }),
             ),
           ),
-        onSome: toRun,
       });
-    const decodeInsertedOrActiveThread = (rowOption: Option.Option<AutomationRunDbRow>) =>
+    const decodeAdmittedOrActiveThread = (rowOption: Option.Option<AutomationRunDbRow>) =>
       Option.match(rowOption, {
-        onSome: toRun,
+        onSome: (row) => decodeAdmitted(Option.some(row)),
         onNone: () =>
           input.threadId
             ? getRunRowByThread({ threadId: input.threadId }).pipe(
                 Effect.mapError(
                   toPersistenceSqlError("AutomationRepository.createRun:selectActiveThread"),
                 ),
-                Effect.flatMap(decodeInserted),
+                Effect.flatMap(decodeAdmitted),
               )
-            : decodeInserted(rowOption),
+            : decodeAdmitted(rowOption),
       });
     const inserted = insertRun({
       ...run,
@@ -1224,7 +1284,7 @@ const makeAutomationRepository = Effect.gen(function* () {
             scheduledFor: input.scheduledFor,
           }).pipe(
             Effect.mapError(toPersistenceSqlError("AutomationRepository.createRun:select")),
-            Effect.flatMap(decodeInsertedOrActiveThread),
+            Effect.flatMap(decodeAdmittedOrActiveThread),
           ),
         ),
       );
@@ -1233,18 +1293,27 @@ const makeAutomationRepository = Effect.gen(function* () {
       Effect.flatMap(() =>
         getRunRowById({ id: input.id }).pipe(
           Effect.mapError(toPersistenceSqlError("AutomationRepository.createRun:select")),
-          Effect.flatMap(decodeInsertedOrActiveThread),
+          Effect.flatMap(decodeAdmittedOrActiveThread),
         ),
       ),
     );
   };
+
+  const createRun: AutomationRepositoryShape["createRun"] = (input) =>
+    sql
+      .withTransaction(createRunInCurrentTransaction(input))
+      .pipe(
+        Effect.catchTag("SqlError", (error) =>
+          Effect.fail(toPersistenceSqlError("AutomationRepository.createRun:transaction")(error)),
+        ),
+      );
 
   const createRunAndIncrementDefinition: AutomationRepositoryShape["createRunAndIncrementDefinition"] =
     (input, scheduleAdvance) =>
       sql
         .withTransaction(
           Effect.gen(function* () {
-            const run = yield* createRun(input);
+            const run = yield* createRunInCurrentTransaction(input);
             const inserted = run.id === input.id;
             if (inserted) {
               const updated = yield* incrementIterationIfRunnableRow({

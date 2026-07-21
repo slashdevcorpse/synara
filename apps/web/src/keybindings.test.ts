@@ -201,6 +201,10 @@ const DEFAULT_BINDINGS = compile([
     whenAst: whenNot(whenIdentifier("terminalFocus")),
   },
   {
+    shortcut: modShortcut("w", { shiftKey: true }),
+    command: "workspace.openDashboard",
+  },
+  {
     shortcut: modShortcut("n"),
     command: "chat.new",
     whenAst: whenCreationAllowed,
@@ -499,6 +503,50 @@ describe("settings shortcuts", () => {
         platform: "MacIntel",
         context: { terminalFocus: true },
       }),
+    );
+  });
+});
+
+describe("workspace dashboard shortcut", () => {
+  it("resolves the best-effort global default across terminal focus", () => {
+    assert.strictEqual(
+      resolveShortcutCommand(event({ key: "w", metaKey: true, shiftKey: true }), DEFAULT_BINDINGS, {
+        platform: "MacIntel",
+        context: { terminalFocus: true },
+      }),
+      "workspace.openDashboard",
+    );
+    assert.strictEqual(
+      resolveShortcutCommand(event({ key: "w", ctrlKey: true, shiftKey: true }), DEFAULT_BINDINGS, {
+        platform: "Linux",
+        context: { terminalFocus: false },
+      }),
+      "workspace.openDashboard",
+    );
+    assert.strictEqual(
+      resolveShortcutCommand(event({ key: "w", ctrlKey: true, shiftKey: true }), DEFAULT_BINDINGS, {
+        platform: "Linux",
+        context: { terminalFocus: true },
+      }),
+      "workspace.openDashboard",
+    );
+  });
+
+  it("falls back when an older runtime config omits the registered command", () => {
+    const olderBindings = DEFAULT_BINDINGS.filter(
+      (binding) => binding.command !== "workspace.openDashboard",
+    );
+
+    assert.strictEqual(
+      resolveShortcutCommand(event({ key: "w", metaKey: true, shiftKey: true }), olderBindings, {
+        platform: "MacIntel",
+        context: { terminalFocus: false },
+      }),
+      "workspace.openDashboard",
+    );
+    assert.strictEqual(
+      shortcutLabelForCommand(olderBindings, "workspace.openDashboard", "Linux"),
+      "Ctrl+Shift+W",
     );
   });
 });

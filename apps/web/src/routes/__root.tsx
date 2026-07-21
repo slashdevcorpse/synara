@@ -110,6 +110,7 @@ import {
   shouldInvalidateGitQueriesForEvent,
   shouldInvalidateProviderQueriesForEvent,
 } from "./-rootEventInvalidation";
+import { shellResnapshotRetryDelayMs, shouldCommitShellSnapshot } from "./-shellSnapshotCursor";
 
 const SHELL_SNAPSHOT_BOOTSTRAP_FALLBACK_DELAY_MS = 1_500;
 const THREAD_DETAIL_CATCHUP_INTERVAL_MS = 1_500;
@@ -953,6 +954,10 @@ function EventRouter() {
     let providerDiscoveryInvalidationFingerprint: string | null = null;
     let shellSnapshotSequence = -1;
     let pendingShellEvents: OrchestrationShellStreamEvent[] = [];
+    let shellResnapshotRequiredSequence = -1;
+    let shellResnapshotInFlight: Promise<void> | null = null;
+    let shellResnapshotRetryTimer: number | null = null;
+    let shellResnapshotFailureAttempts = 0;
     const subscribedThreadIds = new Set<ThreadId>();
     const threadSnapshotSequenceById = new Map<ThreadId, number>();
     const pendingThreadEventsById = new Map<ThreadId, OrchestrationEvent[]>();
@@ -1003,6 +1008,13 @@ function EventRouter() {
         .toSorted((left, right) => left.sequence - right.sequence);
       pendingShellEvents = [];
       for (const event of nextPending) {
+        if (event.kind === "snapshot-invalidated") {
+          shellResnapshotRequiredSequence = Math.max(
+            shellResnapshotRequiredSequence,
+            event.sequence,
+          );
+          continue;
+        }
         shellSnapshotSequence = Math.max(shellSnapshotSequence, event.sequence);
         applyShellEvent(event);
       }
@@ -1062,16 +1074,104 @@ function EventRouter() {
       );
     };
 
-    const loadShellSnapshotOnce = async () => {
-      const snapshot = await api.orchestration.getShellSnapshot();
-      if (!shouldApplyBootstrapShellSnapshot(snapshot)) {
-        return;
+    const commitShellSnapshot = (snapshot: OrchestrationShellSnapshot): boolean => {
+      if (
+        !shouldCommitShellSnapshot({
+          snapshotSequence: snapshot.snapshotSequence,
+          currentSequence: shellSnapshotSequence,
+          requiredSequence: shellResnapshotRequiredSequence,
+        })
+      ) {
+        return false;
       }
       shellSnapshotSequence = snapshot.snapshotSequence;
       syncServerShellSnapshot(snapshot);
       reconcilePromotedDraftsFromShellThreads(snapshot.threads);
       removeOrphanedTerminalsForCurrentState();
       flushShellBuffer(snapshot.snapshotSequence);
+      if (
+        shellSnapshotSequence >= shellResnapshotRequiredSequence &&
+        shellResnapshotRetryTimer !== null
+      ) {
+        window.clearTimeout(shellResnapshotRetryTimer);
+        shellResnapshotRetryTimer = null;
+      }
+      shellResnapshotFailureAttempts = 0;
+      return true;
+    };
+
+    const requestShellVisibilityResnapshot = (minimumSequence: number): void => {
+      shellResnapshotRequiredSequence = Math.max(shellResnapshotRequiredSequence, minimumSequence);
+      if (disposed || shellResnapshotInFlight) {
+        return;
+      }
+
+      const task = (async () => {
+        let staleSnapshotAttempts = 0;
+        while (!disposed && shellSnapshotSequence < shellResnapshotRequiredSequence) {
+          const requiredSequence = shellResnapshotRequiredSequence;
+          const snapshot = await api.orchestration.getShellSnapshot();
+          if (disposed) {
+            return;
+          }
+          if (shellSnapshotSequence >= shellResnapshotRequiredSequence) {
+            return;
+          }
+          if (
+            !shouldCommitShellSnapshot({
+              snapshotSequence: snapshot.snapshotSequence,
+              currentSequence: shellSnapshotSequence,
+              requiredSequence,
+            })
+          ) {
+            // Projection commits and domain-event delivery are separate async boundaries.
+            // Do not regress visibility by applying a snapshot older than the invalidation.
+            const retryDelayMs = shellResnapshotRetryDelayMs(staleSnapshotAttempts);
+            staleSnapshotAttempts += 1;
+            await new Promise<void>((resolve) => window.setTimeout(resolve, retryDelayMs));
+            continue;
+          }
+          staleSnapshotAttempts = 0;
+          commitShellSnapshot(snapshot);
+        }
+      })();
+      shellResnapshotInFlight = task;
+      void task
+        .catch(() => {
+          if (disposed || shellResnapshotRetryTimer !== null) {
+            return;
+          }
+          const retryDelayMs = shellResnapshotRetryDelayMs(shellResnapshotFailureAttempts);
+          shellResnapshotFailureAttempts += 1;
+          shellResnapshotRetryTimer = window.setTimeout(() => {
+            shellResnapshotRetryTimer = null;
+            requestShellVisibilityResnapshot(shellResnapshotRequiredSequence);
+          }, retryDelayMs);
+        })
+        .finally(() => {
+          if (shellResnapshotInFlight === task) {
+            shellResnapshotInFlight = null;
+          }
+          if (
+            !disposed &&
+            shellResnapshotRetryTimer === null &&
+            shellSnapshotSequence < shellResnapshotRequiredSequence
+          ) {
+            requestShellVisibilityResnapshot(shellResnapshotRequiredSequence);
+          }
+        });
+    };
+
+    const loadShellSnapshotOnce = async () => {
+      const snapshot = await api.orchestration.getShellSnapshot();
+      if (snapshot.snapshotSequence < shellResnapshotRequiredSequence) {
+        requestShellVisibilityResnapshot(shellResnapshotRequiredSequence);
+        return;
+      }
+      if (!shouldApplyBootstrapShellSnapshot(snapshot)) {
+        return;
+      }
+      commitShellSnapshot(snapshot);
     };
 
     const ensureScopedSubscriptions = async () => {
@@ -1258,15 +1358,24 @@ function EventRouter() {
 
     const unsubShellEvent = api.orchestration.onShellEvent((item) => {
       if (item.kind === "snapshot") {
-        shellSnapshotSequence = item.snapshot.snapshotSequence;
-        syncServerShellSnapshot(item.snapshot);
-        reconcilePromotedDraftsFromShellThreads(item.snapshot.threads);
-        removeOrphanedTerminalsForCurrentState();
-        flushShellBuffer(item.snapshot.snapshotSequence);
+        if (item.snapshot.snapshotSequence >= shellResnapshotRequiredSequence) {
+          commitShellSnapshot(item.snapshot);
+        }
         return;
       }
 
-      if (shellSnapshotSequence < 0) {
+      if (item.kind === "snapshot-invalidated") {
+        if (item.sequence > shellSnapshotSequence) {
+          requestShellVisibilityResnapshot(item.sequence);
+        }
+        return;
+      }
+
+      if (
+        shellSnapshotSequence < 0 ||
+        shellResnapshotInFlight ||
+        shellSnapshotSequence < shellResnapshotRequiredSequence
+      ) {
         appendBounded(pendingShellEvents, item, PENDING_SHELL_EVENT_BUFFER_LIMIT);
         return;
       }
@@ -1513,6 +1622,10 @@ function EventRouter() {
       flushPendingDomainEvents();
       disposed = true;
       window.clearTimeout(shellBootstrapFallbackTimer);
+      if (shellResnapshotRetryTimer !== null) {
+        window.clearTimeout(shellResnapshotRetryTimer);
+        shellResnapshotRetryTimer = null;
+      }
       window.clearInterval(threadDetailCatchupInterval);
       needsProviderInvalidation = false;
       needsBroadGitInvalidation = false;

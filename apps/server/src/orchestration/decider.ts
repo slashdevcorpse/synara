@@ -15,6 +15,7 @@ import {
   deriveAssociatedWorktreeMetadata,
   deriveAssociatedWorktreeMetadataPatch,
 } from "@synara/shared/threadWorkspace";
+import { PROJECT_ARCHIVED_WORKSPACE_ROOT_INVARIANT_MARKER } from "@synara/shared/errorMessages";
 import { doThreadMarkerRangesOverlap } from "@synara/shared/threadMarkers";
 import {
   collectTailTurnIds,
@@ -27,7 +28,9 @@ import { hasNativeHandoffMessages } from "./handoff.ts";
 import { resolveStableMessageTurnId } from "./messageTurnId.ts";
 import {
   listActiveProjectsByWorkspaceRoot,
+  listProjectsByWorkspaceRoot,
   listThreadsByProjectId,
+  requireCommandProjectNotArchived,
   requireProject,
   requireProjectAbsent,
   requireProjectHasNoThreads,
@@ -42,6 +45,11 @@ import {
 const nowIso = () => new Date().toISOString();
 const DEFAULT_ASSISTANT_DELIVERY_MODE = "buffered" as const;
 const STUDIO_PROJECT_KIND_SET = new Set<ProjectKind>(["studio"]);
+const ARCHIVE_SESSION_STOP_STATUS_SET: ReadonlySet<string> = new Set([
+  "idle",
+  "ready",
+  "interrupted",
+]);
 // Kinds that claim exclusive ownership of a workspace root. Chat containers are excluded: they
 // use placeholder roots (e.g. the home dir) that legitimately coexist with real projects.
 const WORKSPACE_OWNING_PROJECT_KIND_SET = new Set<ProjectKind>(["project", "studio"]);
@@ -92,6 +100,7 @@ function countPinnedProjects(
   return readModel.projects.filter(
     (project) =>
       project.deletedAt === null &&
+      project.archivedAt === null &&
       project.kind === "project" &&
       project.isPinned === true &&
       !options?.excludeProjectIds?.has(project.id),
@@ -219,23 +228,44 @@ function deriveConversationRollbackTarget(
 export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand")(function* ({
   command,
   readModel,
+  pendingArchiveWorkThreadIds = new Set<string>(),
+  hasPendingArchiveAutomationWork = false,
+  hasActiveProjectDevServer = false,
 }: {
   readonly command: OrchestrationCommand;
   readonly readModel: OrchestrationReadModel;
+  readonly pendingArchiveWorkThreadIds?: ReadonlySet<string>;
+  readonly hasPendingArchiveAutomationWork?: boolean;
+  readonly hasActiveProjectDevServer?: boolean;
 }): Effect.fn.Return<
   Omit<OrchestrationEvent, "sequence"> | ReadonlyArray<Omit<OrchestrationEvent, "sequence">>,
   OrchestrationCommandInvariantError
 > {
+  yield* requireCommandProjectNotArchived({ readModel, command });
+
   switch (command.type) {
     case "project.create": {
+      const events: Array<Omit<OrchestrationEvent, "sequence">> = [];
+      const staleProjects: Array<OrchestrationReadModel["projects"][number]> = [];
+      const nextProjectKind = command.kind ?? "project";
+      if (nextProjectKind !== "chat") {
+        const archivedOwningProject = listProjectsByWorkspaceRoot(
+          readModel,
+          command.workspaceRoot,
+          { kinds: WORKSPACE_OWNING_PROJECT_KIND_SET },
+        ).find((project) => project.archivedAt !== null);
+        if (archivedOwningProject) {
+          return yield* new OrchestrationCommandInvariantError({
+            commandType: command.type,
+            detail: `Project '${archivedOwningProject.id}' ${PROJECT_ARCHIVED_WORKSPACE_ROOT_INVARIANT_MARKER} '${archivedOwningProject.workspaceRoot}'. Restore project '${archivedOwningProject.id}' instead of creating a new project.`,
+          });
+        }
+      }
       yield* requireProjectAbsent({
         readModel,
         command,
         projectId: command.projectId,
       });
-      const events: Array<Omit<OrchestrationEvent, "sequence">> = [];
-      const staleProjects: Array<OrchestrationReadModel["projects"][number]> = [];
-      const nextProjectKind = command.kind ?? "project";
       if (nextProjectKind === "project") {
         // The app-managed Studio container owns its root exclusively and is never retired here:
         // silently deleting it would orphan Studio threads, so adding its folder as a project
@@ -411,6 +441,159 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         payload: {
           projectId: command.projectId,
           deletedAt: occurredAt,
+        },
+      };
+    }
+
+    case "project.archive": {
+      const project = yield* requireProject({
+        readModel,
+        command,
+        projectId: command.projectId,
+      });
+      if (project.deletedAt !== null) {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: `Deleted project '${command.projectId}' cannot be archived.`,
+        });
+      }
+      if (project.kind !== "project") {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: `Only regular projects can be archived.`,
+        });
+      }
+      if (project.archivedAt !== null) {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: `Project '${command.projectId}' is already archived.`,
+        });
+      }
+
+      if (hasActiveProjectDevServer) {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: `Project '${command.projectId}' cannot be archived while its dev server is running. Stop the dev server first.`,
+        });
+      }
+
+      if (hasPendingArchiveAutomationWork) {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: `Project '${command.projectId}' cannot be archived while it has enabled automations, active automation runs, or pending automation completion checks. Disable its automations and wait for active work to settle first.`,
+        });
+      }
+
+      const liveThreads = listThreadsByProjectId(readModel, command.projectId).filter(
+        (thread) => thread.deletedAt === null,
+      );
+      for (const thread of liveThreads) {
+        const hasPendingInteraction =
+          thread.hasPendingApprovals === true ||
+          thread.hasPendingUserInput === true ||
+          (thread.pendingInteractions ?? []).some(
+            (interaction) => interaction.status !== "confirmed",
+          );
+        const hasActiveWork =
+          pendingArchiveWorkThreadIds.has(thread.id) ||
+          threadHasInFlightTurn(thread) ||
+          hasPendingInteraction;
+        if (hasActiveWork) {
+          return yield* new OrchestrationCommandInvariantError({
+            commandType: command.type,
+            detail: `Project '${command.projectId}' cannot be archived while thread '${thread.id}' has queued, starting, running, active-turn, approval, or user-input work.`,
+          });
+        }
+      }
+
+      const sessionStopEvents: Array<Omit<OrchestrationEvent, "sequence">> = liveThreads
+        .filter(
+          (thread) =>
+            thread.session !== null && ARCHIVE_SESSION_STOP_STATUS_SET.has(thread.session.status),
+        )
+        .map((thread) => ({
+          ...withEventBase({
+            aggregateKind: "thread",
+            aggregateId: thread.id,
+            occurredAt: command.createdAt,
+            commandId: command.commandId,
+          }),
+          type: "thread.session-stop-requested",
+          payload: {
+            threadId: thread.id,
+            createdAt: command.createdAt,
+          },
+        }));
+      const archivedEvent: Omit<OrchestrationEvent, "sequence"> = {
+        ...withEventBase({
+          aggregateKind: "project",
+          aggregateId: command.projectId,
+          occurredAt: command.createdAt,
+          commandId: command.commandId,
+        }),
+        type: "project.archived",
+        payload: {
+          projectId: command.projectId,
+          archivedAt: command.createdAt,
+        },
+      };
+      return [...sessionStopEvents, archivedEvent];
+    }
+
+    case "project.unarchive": {
+      const project = yield* requireProject({
+        readModel,
+        command,
+        projectId: command.projectId,
+      });
+      if (project.deletedAt !== null) {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: `Deleted project '${command.projectId}' cannot be unarchived.`,
+        });
+      }
+      if (project.kind !== "project") {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: `Only regular projects can be unarchived.`,
+        });
+      }
+      if (project.archivedAt === null) {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: `Project '${command.projectId}' is not archived.`,
+        });
+      }
+      if (pendingArchiveWorkThreadIds.size > 0) {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: `Project '${command.projectId}' cannot be unarchived until its queued work and archive session cleanup have settled.`,
+        });
+      }
+      yield* requireProjectWorkspaceRootAvailable({
+        readModel,
+        command,
+        workspaceRoot: project.workspaceRoot,
+        excludeProjectId: project.id,
+        kinds: WORKSPACE_OWNING_PROJECT_KIND_SET,
+      });
+      if (project.isPinned && countPinnedProjects(readModel) >= MAX_PINNED_PROJECTS) {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: `Project '${command.projectId}' cannot be unarchived while ${MAX_PINNED_PROJECTS} active projects are pinned. Unpin another project first.`,
+        });
+      }
+      return {
+        ...withEventBase({
+          aggregateKind: "project",
+          aggregateId: command.projectId,
+          occurredAt: command.createdAt,
+          commandId: command.commandId,
+        }),
+        type: "project.unarchived",
+        payload: {
+          projectId: command.projectId,
+          unarchivedAt: command.createdAt,
         },
       };
     }

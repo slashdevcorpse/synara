@@ -175,6 +175,7 @@ export interface Project {
   defaultModelSelection: ModelSelection | null;
   expanded: boolean;
   isPinned?: boolean;
+  serverSequence?: number | undefined;
   createdAt?: string | undefined;
   updatedAt?: string | undefined;
   scripts: ProjectScript[];

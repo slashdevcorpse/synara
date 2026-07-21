@@ -7,7 +7,14 @@ import type { ProjectionStateRepositoryShape } from "../persistence/Services/Pro
 
 export type ProjectMetadataOrchestrationEvent = Extract<
   OrchestrationEvent,
-  { type: "project.created" | "project.meta-updated" | "project.deleted" }
+  {
+    type:
+      | "project.created"
+      | "project.meta-updated"
+      | "project.archived"
+      | "project.unarchived"
+      | "project.deleted";
+  }
 >;
 
 export const PROJECT_METADATA_SNAPSHOT_PROJECTORS = [
@@ -38,6 +45,7 @@ export const applyProjectMetadataProjection = (input: {
           isPinned: input.event.payload.isPinned ?? false,
           createdAt: input.event.payload.createdAt,
           updatedAt: input.event.payload.updatedAt,
+          archivedAt: null,
           deletedAt: null,
         });
         break;
@@ -80,6 +88,34 @@ export const applyProjectMetadataProjection = (input: {
             ...existingRow.value,
             deletedAt: input.event.payload.deletedAt,
             updatedAt: input.event.payload.deletedAt,
+          });
+        }
+        break;
+      }
+
+      case "project.archived": {
+        const existingRow = yield* input.projectionProjectRepository.getById({
+          projectId: input.event.payload.projectId,
+        });
+        if (Option.isSome(existingRow)) {
+          yield* input.projectionProjectRepository.upsert({
+            ...existingRow.value,
+            archivedAt: input.event.payload.archivedAt,
+            updatedAt: input.event.payload.archivedAt,
+          });
+        }
+        break;
+      }
+
+      case "project.unarchived": {
+        const existingRow = yield* input.projectionProjectRepository.getById({
+          projectId: input.event.payload.projectId,
+        });
+        if (Option.isSome(existingRow)) {
+          yield* input.projectionProjectRepository.upsert({
+            ...existingRow.value,
+            archivedAt: null,
+            updatedAt: input.event.payload.unarchivedAt,
           });
         }
         break;
