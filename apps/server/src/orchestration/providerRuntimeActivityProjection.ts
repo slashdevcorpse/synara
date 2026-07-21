@@ -538,6 +538,7 @@ export function projectProviderRuntimeActivities(
           kind: "model.rerouted",
           summary: `Model switched: ${event.payload.fromModel} -> ${event.payload.toModel}`,
           payload: toActivityPayload({
+            provider: event.provider,
             fromModel: event.payload.fromModel,
             toModel: event.payload.toModel,
             detail: truncateDetail(event.payload.reason, 500),
@@ -791,6 +792,44 @@ export function projectProviderRuntimeActivities(
       ];
     }
 
+    case "turn.started": {
+      return [
+        {
+          id: event.eventId,
+          createdAt: event.createdAt,
+          tone: "info",
+          kind: "turn.started",
+          summary: "Turn started",
+          payload: toActivityPayload({
+            provider: event.provider,
+            ...(event.payload.model ? { model: event.payload.model } : {}),
+            ...(event.payload.effort ? { effort: event.payload.effort } : {}),
+          }),
+          turnId: toTurnId(event.turnId) ?? null,
+          ...maybeSequence,
+        },
+      ];
+    }
+
+    case "turn.aborted": {
+      const reason = asString(runtimePayloadRecord(event)?.reason);
+      return [
+        {
+          id: event.eventId,
+          createdAt: event.createdAt,
+          tone: "info",
+          kind: "turn.aborted",
+          summary: "Turn interrupted",
+          payload: toActivityPayload({
+            provider: event.provider,
+            ...(reason ? { reason: truncateDetail(reason, 500) } : {}),
+          }),
+          turnId: toTurnId(event.turnId) ?? null,
+          ...maybeSequence,
+        },
+      ];
+    }
+
     case "item.updated":
     case "item.completed":
     case "item.started": {
@@ -879,6 +918,7 @@ export function projectProviderRuntimeActivities(
           kind: "turn.completed",
           summary: state === "failed" ? "Turn failed" : "Turn completed",
           payload: toActivityPayload({
+            provider: event.provider,
             state,
             ...(modelUsage ? { modelUsage } : {}),
             ...(typeof event.payload.totalCostUsd === "number"

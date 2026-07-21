@@ -11,7 +11,10 @@ import { ProjectionTurnRepositoryLive } from "./ProjectionTurns.ts";
 import { ProjectionProjectRepository } from "../Services/ProjectionProjects.ts";
 import { ProjectionThreadRepository } from "../Services/ProjectionThreads.ts";
 import { ProjectionStateRepository } from "../Services/ProjectionState.ts";
-import { ProjectionTurnRepository } from "../Services/ProjectionTurns.ts";
+import {
+  EMPTY_PROJECTION_TURN_SUMMARY_FIELDS,
+  ProjectionTurnRepository,
+} from "../Services/ProjectionTurns.ts";
 
 const projectionRepositoriesLayer = it.layer(
   Layer.mergeAll(
@@ -203,6 +206,7 @@ projectionRepositoriesLayer("Projection repositories", (it) => {
       yield* threads.upsert(makeThread("thread-wait-active", null));
       yield* threads.upsert(makeThread("thread-wait-deleted", now));
       yield* turns.upsertByTurnId({
+        ...EMPTY_PROJECTION_TURN_SUMMARY_FIELDS,
         threadId: ThreadId.makeUnsafe("thread-wait-active"),
         turnId: TurnId.makeUnsafe("turn-wait-active"),
         pendingMessageId: null,
@@ -219,6 +223,7 @@ projectionRepositoriesLayer("Projection repositories", (it) => {
         checkpointFiles: [],
       });
       yield* turns.upsertByTurnId({
+        ...EMPTY_PROJECTION_TURN_SUMMARY_FIELDS,
         threadId: ThreadId.makeUnsafe("thread-wait-deleted"),
         turnId: TurnId.makeUnsafe("turn-wait-deleted"),
         pendingMessageId: null,

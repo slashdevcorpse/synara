@@ -28,6 +28,7 @@ type ThreadSliceRefs = {
   shell: ThreadShell | undefined;
   session: ThreadSession | null | undefined;
   turnState: ThreadTurnState | undefined;
+  turnSummaries: Thread["turns"] | undefined;
   messageIds: readonly MessageId[] | undefined;
   messages: Record<MessageId, ChatMessage> | undefined;
   activityIds: readonly string[] | undefined;
@@ -56,6 +57,7 @@ function collectThreadSliceRefs(state: AppState, threadId: ThreadIdType): Thread
     shell: state.threadShellById?.[threadId],
     session: state.threadSessionById?.[threadId],
     turnState: state.threadTurnStateById?.[threadId],
+    turnSummaries: state.turnSummariesByThreadId?.[threadId],
     messageIds: state.messageIdsByThreadId?.[threadId],
     messages: state.messageByThreadId?.[threadId],
     activityIds: state.activityIdsByThreadId?.[threadId],
@@ -84,6 +86,7 @@ function threadSliceRefsEqual(left: ThreadSliceRefs | undefined, right: ThreadSl
     left.shell === right.shell &&
     left.session === right.session &&
     left.turnState === right.turnState &&
+    left.turnSummaries === right.turnSummaries &&
     left.messageIds === right.messageIds &&
     left.messages === right.messages &&
     left.activityIds === right.activityIds &&

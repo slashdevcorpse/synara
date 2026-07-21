@@ -138,6 +138,7 @@ export function ThreadHoverCardActivityContent({
       permissionMode={permissionMode}
       subagentCount={activity.subagentCount}
       subagentRunningCount={activity.subagentRunningCount}
+      subagentTree={activity.subagentTree}
       worktreeLabel={worktreeLabel}
       prTitle={pullRequest ? `#${pullRequest.number}: ${pullRequest.title}` : null}
       prState={pullRequest ? resolvePullRequestState(pullRequest) : null}

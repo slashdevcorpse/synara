@@ -7,7 +7,7 @@ export const GENERIC_TERMINAL_THREAD_TITLE = "New terminal";
 export type TerminalCliKind = "codex" | "claude" | "antigravity";
 export type TerminalIconKey = "terminal" | "openai" | "claude" | "antigravity";
 export type TerminalActivityState = "running" | "attention" | "review";
-export type TerminalVisualState = "idle" | TerminalActivityState;
+export type TerminalVisualState = "idle" | "stopped" | "failed" | TerminalActivityState;
 export type TerminalAgentHookEventType = "Start" | "Stop" | "PermissionRequest";
 export const SYNARA_TERMINAL_CLI_KIND_ENV_KEY = "SYNARA_TERMINAL_CLI_KIND";
 export const SYNARA_TERMINAL_HOOK_OSC_PREFIX = "633;SYNARA_AGENT_EVENT=";

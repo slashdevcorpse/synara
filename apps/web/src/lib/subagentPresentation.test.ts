@@ -7,6 +7,7 @@ import {
   resolveSubagentPresentation,
   resolveSubagentPresentationForThread,
   subagentAccentColor,
+  summarizeSettledSubagents,
 } from "./subagentPresentation";
 
 describe("resolveSubagentPresentation", () => {
@@ -260,5 +261,25 @@ describe("formatSubagentModelLabel", () => {
     expect(formatSubagentModelLabel("claude-haiku-4-5-20251001")).toBe("Haiku 4.5");
     expect(formatSubagentModelLabel("claude-sonnet-4-6")).toBe("Sonnet 4.6");
     expect(formatSubagentModelLabel("haiku")).toBe("Haiku");
+  });
+});
+
+describe("summarizeSettledSubagents", () => {
+  it.each([
+    [["completed", "completed"], "2 subagents completed"],
+    [["failed", "failed"], "2 subagents failed"],
+    [["stopped"], "1 subagent stopped"],
+    [["completed", "failed"], "2 subagents settled · 1 completed · 1 failed"],
+    [
+      ["completed", "failed", "stopped"],
+      "3 subagents settled · 1 completed · 1 failed · 1 stopped",
+    ],
+  ] as const)("summarizes %j", (statuses, label) => {
+    expect(summarizeSettledSubagents(statuses)).toMatchObject({ label });
+  });
+
+  it("does not compact a partially live or queued set", () => {
+    expect(summarizeSettledSubagents(["completed", "running"])).toBeNull();
+    expect(summarizeSettledSubagents(["failed", "queued"])).toBeNull();
   });
 });

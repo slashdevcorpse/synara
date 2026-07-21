@@ -21,6 +21,45 @@ const projectionThreadsColumnNames = (sql: SqlClient.SqlClient) =>
     SELECT name FROM pragma_table_info('projection_threads')
   `.pipe(Effect.map((rows) => rows.map((row) => row.name)));
 
+const turnSummaryMigrationLayer = it.layer(Layer.mergeAll(NodeSqliteClient.layerMemory()));
+
+turnSummaryMigrationLayer("projection turn summary migration", (it) => {
+  it.effect("adds durable columns and resets only the turn projector for historical replay", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* runMigrations({ toMigrationInclusive: 74 });
+      yield* sql`
+        INSERT INTO projection_state (projector, last_applied_sequence, updated_at)
+        VALUES
+          ('projection.thread-turns', 42, '2026-07-20T10:00:00.000Z'),
+          ('projection.thread-activities', 42, '2026-07-20T10:00:00.000Z')
+      `;
+
+      const executed = yield* runMigrations();
+      assert.deepStrictEqual(
+        executed.map(([id]) => id),
+        [75],
+      );
+
+      const columns = yield* sql<{ readonly name: string }>`
+        SELECT name FROM pragma_table_info('projection_turns')
+      `;
+      const columnNames = new Set(columns.map((row) => row.name));
+      assert.isTrue(columnNames.has("model_selection_json"));
+      assert.isTrue(columnNames.has("token_usage_json"));
+      assert.isTrue(columnNames.has("tool_calls_json"));
+
+      const projectorRows = yield* sql<{ readonly projector: string }>`
+        SELECT projector
+        FROM projection_state
+        WHERE projector IN ('projection.thread-turns', 'projection.thread-activities')
+        ORDER BY projector ASC
+      `;
+      assert.deepStrictEqual(projectorRows, [{ projector: "projection.thread-activities" }]);
+    }),
+  );
+});
+
 layer("reconcileMigrationLineage", (it) => {
   // An imported database whose tracker high-water
   // mark is at or beyond Synara's latest migration ID. The migrator's max-ID
@@ -311,10 +350,11 @@ managedAttachmentsLegacyLayer("managed attachment migration after private migrat
         [72, "AgentGatewayOperationRetention"],
         [73, "ProjectionProjectsArchivedAt"],
         [74, "ProviderRequestAdmissions"],
+        [75, "ProjectionTurnSummaries"],
       ]);
 
       const tracker = yield* trackerRows(sql);
-      assert.deepStrictEqual(tracker.slice(-21), [
+      assert.deepStrictEqual(tracker.slice(-22), [
         { migration_id: 54, name: "DurableProviderCommandDelivery" },
         { migration_id: 55, name: "ManagedAttachments" },
         { migration_id: 56, name: "CommandReceiptFingerprints" },
@@ -336,6 +376,7 @@ managedAttachmentsLegacyLayer("managed attachment migration after private migrat
         { migration_id: 72, name: "AgentGatewayOperationRetention" },
         { migration_id: 73, name: "ProjectionProjectsArchivedAt" },
         { migration_id: 74, name: "ProviderRequestAdmissions" },
+        { migration_id: 75, name: "ProjectionTurnSummaries" },
       ]);
       const preserved = yield* sql<{ readonly count: number }>`
         SELECT COUNT(*) AS count FROM orchestration_consumer_state

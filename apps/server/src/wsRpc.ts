@@ -1266,8 +1266,18 @@ const makeWsRpcHandlersLayer = () =>
           ),
         [WS_METHODS.terminalClose]: (input) =>
           rpcEffect(
-            resetTerminalTitleBuffer(input.threadId, input.terminalId ?? null).pipe(
-              Effect.andThen(terminalManager.close(input)),
+            terminalManager.close(input).pipe(
+              Effect.andThen(
+                Effect.sync(() => {
+                  if (input.terminalIds) {
+                    for (const terminalId of input.terminalIds) {
+                      terminalTitleTracker.reset(input.threadId, terminalId);
+                    }
+                  } else {
+                    terminalTitleTracker.reset(input.threadId, input.terminalId ?? null);
+                  }
+                }),
+              ),
             ),
             "Failed to close terminal",
           ),

@@ -21,12 +21,14 @@ import {
 
 const AGENT_ACTIVITY_LABELS: Record<AgentActivityPhase, string> = {
   idle: "Idle",
+  connecting: "Connecting",
   thinking: "Thinking",
   streaming: "Responding",
   "tool-running": "Running tools",
   interrupted: "Interrupted",
   completed: "Completed",
   failed: "Failed",
+  stopped: "Stopped",
 };
 
 export function EnvironmentAgentActivityRow({

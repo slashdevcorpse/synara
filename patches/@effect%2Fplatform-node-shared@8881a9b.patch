@@ -1,8 +1,8 @@
 diff --git a/dist/NodeChildProcessSpawner.js b/dist/NodeChildProcessSpawner.js
-index ff15212..b3655b0 100644
+index 7e51c003..d26fd1a9 100644
 --- a/dist/NodeChildProcessSpawner.js
 +++ b/dist/NodeChildProcessSpawner.js
-@@ -314,10 +314,15 @@ const make = /*#__PURE__*/Effect.gen(function* () {
+@@ -314,8 +314,13 @@ const make = /*#__PURE__*/Effect.gen(function* () {
              env,
              stdio,
              detached: cmd.options.detached ?? process.platform !== "win32",
@@ -17,9 +17,7 @@ index ff15212..b3655b0 100644
              const exited = yield* Deferred.isDone(exitSignal);
              const killWithTimeout = withTimeout(childProcess, cmd, cmd.options);
              if (exited) {
-               // Process already exited, check if children need cleanup
-               const [code] = yield* Deferred.await(exitSignal);
-@@ -356,7 +360,7 @@ const make = /*#__PURE__*/Effect.gen(function* () {
+@@ -356,7 +361,7 @@ const make = /*#__PURE__*/Effect.gen(function* () {
              const killWithTimeout = withTimeout(childProcess, cmd, options);
              return killWithTimeout((command, childProcess, signal) => Effect.catch(killProcessGroup(command, childProcess, signal), () => killProcess(command, childProcess, signal))).pipe(Effect.andThen(Deferred.await(exitSignal)), Effect.asVoid);
            };
@@ -28,7 +26,7 @@ index ff15212..b3655b0 100644
              pid,
              exitCode,
              isRunning,
-@@ -368,6 +372,14 @@ const make = /*#__PURE__*/Effect.gen(function* () {
+@@ -368,6 +373,14 @@ const make = /*#__PURE__*/Effect.gen(function* () {
              getInputFd,
              getOutputFd
            });
@@ -44,10 +42,10 @@ index ff15212..b3655b0 100644
        case "PipedCommand":
          {
 diff --git a/src/NodeChildProcessSpawner.ts b/src/NodeChildProcessSpawner.ts
-index dc53baf..8aba0ea 100644
+index dc53bafb..be26b5d4 100644
 --- a/src/NodeChildProcessSpawner.ts
 +++ b/src/NodeChildProcessSpawner.ts
-@@ -430,11 +430,30 @@ const make = Effect.gen(function*() {
+@@ -430,9 +430,28 @@ const make = Effect.gen(function*() {
              env,
              stdio,
              detached: cmd.options.detached ?? process.platform !== "win32",
@@ -77,15 +75,16 @@ index dc53baf..8aba0ea 100644
              const exited = yield* Deferred.isDone(exitSignal)
              const killWithTimeout = withTimeout(childProcess, cmd, cmd.options)
              if (exited) {
-               // Process already exited, check if children need cleanup
-               const [code] = yield* Deferred.await(exitSignal)
-@@ -488,4 +502,4 @@ const make = Effect.gen(function*() {
+@@ -485,7 +504,7 @@ const make = Effect.gen(function*() {
+           )
+         }
+
 -        return makeHandle({
 +        const handle = makeHandle({
            pid,
            exitCode,
            isRunning,
-@@ -497,6 +511,14 @@ const make = Effect.gen(function*() {
+@@ -497,6 +516,14 @@ const make = Effect.gen(function*() {
            getInputFd,
            getOutputFd
          })

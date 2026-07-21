@@ -1362,7 +1362,7 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
       const turnRequestPayload = {
         threadId: command.threadId,
         messageId: command.message.messageId,
-        ...(command.modelSelection !== undefined ? { modelSelection: command.modelSelection } : {}),
+        modelSelection: command.modelSelection ?? targetThread.modelSelection,
         ...(command.providerOptions !== undefined
           ? { providerOptions: command.providerOptions }
           : {}),
@@ -1371,6 +1371,7 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         dispatchMode,
         runtimeMode: command.runtimeMode,
         interactionMode: command.interactionMode,
+        envMode: targetThread.envMode,
         ...(sourceProposedPlan !== undefined ? { sourceProposedPlan } : {}),
         createdAt: command.createdAt,
       } as const;

@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 
 import {
   parseWorkflowPolicy,
+  validateMergifyConfiguration,
   validateRepositoryWorkflowStates,
   validateVouchedConfiguration,
   validateWorkflowContracts,
@@ -67,6 +68,9 @@ async function main(): Promise<void> {
     ...validateVouchedConfiguration(
       readFileSync(resolve(repositoryRoot, ".github/VOUCHED.td"), "utf8"),
     ),
+  );
+  errors.push(
+    ...validateMergifyConfiguration(readFileSync(resolve(repositoryRoot, ".mergify.yml"), "utf8")),
   );
   if (args.has("--check-github-state")) {
     const token = process.env.GITHUB_TOKEN?.trim() || process.env.GH_TOKEN?.trim();

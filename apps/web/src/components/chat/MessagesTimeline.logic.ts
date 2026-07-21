@@ -13,8 +13,11 @@ import {
   type WorktreeSetupSnapshot,
   type WorktreeSetupStep,
 } from "../../types";
+import type { TurnReasoningSummary } from "./turnReasoning";
 
 export const MAX_VISIBLE_WORK_LOG_ENTRIES = 6;
+
+const EMPTY_TURN_REASONING_SUMMARY_MAP: ReadonlyMap<MessageId, TurnReasoningSummary> = new Map();
 
 // Ordered item folded into a settled turn's single "Worked for Xs" disclosure.
 // A turn can interleave tool work and intermediate assistant narration
@@ -70,6 +73,13 @@ export type MessagesTimelineRow =
       id: string;
       createdAt: string;
       proposedPlan: ProposedPlan;
+    }
+  | {
+      kind: "turn-reasoning-summary";
+      id: string;
+      createdAt: string;
+      summary: TurnReasoningSummary;
+      isLatestCompleted: boolean;
     }
   | { kind: "working"; id: string; createdAt: string | null }
   | {
@@ -311,6 +321,7 @@ export function deriveMessagesTimelineRows(input: {
   activeTurnId?: TurnId | null | undefined;
   activeTurnStartedAt: string | null;
   turnDiffSummaryByAssistantMessageId: ReadonlyMap<MessageId, TurnDiffSummary>;
+  turnReasoningSummaryByAssistantMessageId?: ReadonlyMap<MessageId, TurnReasoningSummary>;
   revertTurnCountByUserMessageId: ReadonlyMap<MessageId, number>;
 }): MessagesTimelineRow[] {
   const nextRows: MessagesTimelineRow[] = [];
@@ -469,6 +480,14 @@ export function deriveMessagesTimelineRows(input: {
     activeTurnId: input.activeTurnId ?? null,
   });
 
+  insertTurnReasoningSummaryRows(nextRows, {
+    terminalAssistantMessageIds,
+    summaryByAssistantMessageId:
+      input.turnReasoningSummaryByAssistantMessageId ?? EMPTY_TURN_REASONING_SUMMARY_MAP,
+    activeTurnInProgress: input.activeTurnInProgress ?? false,
+    activeTurnId: input.activeTurnId ?? null,
+  });
+
   // The live turn wears a "Working for Xs" header + divider — the counting-up
   // twin of a settled turn's "Worked for Xs" disclosure. It anchors to the top
   // of the active turn (right after the user message that opened it) and needs a
@@ -487,6 +506,47 @@ export function deriveMessagesTimelineRows(input: {
   }
 
   return nextRows;
+}
+
+// Inserts summary cards only after response collapse has established the single
+// terminal assistant row for each user-visible response. The active tail is
+// withheld during both normal execution and the brief missing-turn-id grace
+// window, so a completed-looking provider message cannot pre-empt live chrome.
+function insertTurnReasoningSummaryRows(
+  rows: MessagesTimelineRow[],
+  options: {
+    terminalAssistantMessageIds: ReadonlySet<string>;
+    summaryByAssistantMessageId: ReadonlyMap<MessageId, TurnReasoningSummary>;
+    activeTurnInProgress: boolean;
+    activeTurnId: TurnId | null;
+  },
+): void {
+  if (options.summaryByAssistantMessageId.size === 0) return;
+  const tailTerminalAssistantMessageId = options.activeTurnInProgress
+    ? findTailTerminalAssistantMessageId(rows, options.terminalAssistantMessageIds)
+    : null;
+
+  for (let index = rows.length - 1; index >= 0; index -= 1) {
+    const row = rows[index]!;
+    if (row.kind !== "message" || row.message.role !== "assistant") continue;
+    if (!options.terminalAssistantMessageIds.has(row.message.id) || row.message.streaming) continue;
+    const summary = options.summaryByAssistantMessageId.get(row.message.id);
+    if (!summary) continue;
+
+    const activeTail =
+      options.activeTurnInProgress &&
+      ((options.activeTurnId !== null && row.message.turnId === options.activeTurnId) ||
+        row.message.id === tailTerminalAssistantMessageId);
+    if (activeTail) continue;
+
+    rows.splice(index + 1, 0, {
+      kind: "turn-reasoning-summary",
+      id: `turn-summary:${row.message.id}`,
+      createdAt: summary.completedAt ?? row.message.completedAt ?? row.message.createdAt,
+      summary,
+      isLatestCompleted: summary.isLatestCompleted,
+    });
+  }
 }
 
 // The live turn starts at the most recent user message, so its header slots in
@@ -856,6 +916,60 @@ function collapsedTurnItemsEqual(
   });
 }
 
+function turnReasoningToolNameCountsEqual(
+  left: TurnReasoningSummary["toolNameCounts"],
+  right: TurnReasoningSummary["toolNameCounts"],
+): boolean {
+  if (left === right) return true;
+  return (
+    left.length === right.length &&
+    left.every((entry, index) => {
+      const other = right[index];
+      return other !== undefined && entry.name === other.name && entry.count === other.count;
+    })
+  );
+}
+
+function turnReasoningSummariesEqual(
+  left: TurnReasoningSummary,
+  right: TurnReasoningSummary,
+): boolean {
+  if (left === right) return true;
+  return (
+    left.turnNumber === right.turnNumber &&
+    stringArraysEqual(left.turnIds, right.turnIds) &&
+    left.terminalAssistantMessageId === right.terminalAssistantMessageId &&
+    left.status === right.status &&
+    left.isLatestCompleted === right.isLatestCompleted &&
+    left.startedAt === right.startedAt &&
+    left.completedAt === right.completedAt &&
+    left.durationMs === right.durationMs &&
+    left.provider === right.provider &&
+    left.model === right.model &&
+    left.reasoningEffort === right.reasoningEffort &&
+    left.assistantDeliveryMode === right.assistantDeliveryMode &&
+    left.contextUsedTokens === right.contextUsedTokens &&
+    left.contextWindowTokens === right.contextWindowTokens &&
+    left.inputTokens === right.inputTokens &&
+    left.cachedInputTokens === right.cachedInputTokens &&
+    left.outputTokens === right.outputTokens &&
+    left.reasoningOutputTokens === right.reasoningOutputTokens &&
+    left.totalTokens === right.totalTokens &&
+    left.tokenUsageProvider === right.tokenUsageProvider &&
+    left.toolCallCount === right.toolCallCount &&
+    left.distinctToolCount === right.distinctToolCount &&
+    turnReasoningToolNameCountsEqual(left.toolNameCounts, right.toolNameCounts) &&
+    stringArraysEqual(left.distinctToolNames, right.distinctToolNames) &&
+    left.toolNameOverflowCount === right.toolNameOverflowCount &&
+    left.approvalCount === right.approvalCount &&
+    left.rejectionCount === right.rejectionCount &&
+    left.filesChangedCount === right.filesChangedCount &&
+    left.runtimeMode === right.runtimeMode &&
+    left.interactionMode === right.interactionMode &&
+    left.envMode === right.envMode
+  );
+}
+
 function isRowUnchanged(a: MessagesTimelineRow, b: MessagesTimelineRow): boolean {
   if (a.kind !== b.kind || a.id !== b.id) return false;
 
@@ -880,6 +994,15 @@ function isRowUnchanged(a: MessagesTimelineRow, b: MessagesTimelineRow): boolean
 
     case "proposed-plan":
       return a.proposedPlan === (b as typeof a).proposedPlan;
+
+    case "turn-reasoning-summary": {
+      const bs = b as typeof a;
+      return (
+        a.createdAt === bs.createdAt &&
+        a.isLatestCompleted === bs.isLatestCompleted &&
+        turnReasoningSummariesEqual(a.summary, bs.summary)
+      );
+    }
 
     case "work":
       return (

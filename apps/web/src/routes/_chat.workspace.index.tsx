@@ -59,6 +59,8 @@ import {
   canDragWorkspaceCard,
   deriveWorkspaceCards,
   filterAndSortWorkspaceCards,
+  hasActiveGitActionForProject,
+  indexWorkspaceProcessSourcesByProject,
   orderWorkspaceCardsPinnedFirst,
   type WorkspaceCardModel,
   type WorkspaceFilter,
@@ -70,9 +72,11 @@ import {
   useDesktopTopBarWindowControlsGutterClassName,
 } from "~/hooks/useDesktopTopBarGutter";
 import { useHandleNewThread } from "~/hooks/useHandleNewThread";
+import { useWorkspaceAgentActivity } from "~/hooks/useWorkspaceAgentActivity";
 import { useProjectPinController } from "~/hooks/useProjectPinController";
 import { ArchiveIcon, FolderOpenIcon, GitBranchIcon, PlusIcon, RefreshCwIcon } from "~/lib/icons";
 import { archiveProjectFromClient } from "~/lib/projectArchive";
+import { deriveProjectProcessActivity } from "~/lib/agentActivity";
 import { cn, newCommandId } from "~/lib/utils";
 import {
   refreshWorkspaceGitProject,
@@ -85,6 +89,9 @@ import { ensureNativeApi } from "~/nativeApi";
 import { automationQueryKey } from "~/routes/-automations.shared";
 import { createSidebarThreadSummariesSelector } from "~/storeSelectors";
 import { useStore } from "~/store";
+import { useProjectRunStore } from "~/projectRunStore";
+import { useGitActionActivityStore } from "~/gitActionActivityStore";
+import { useTerminalStateStore } from "~/terminalStateStore";
 import { useWorkspaceStore } from "~/workspaceStore";
 
 const FILTERS: ReadonlyArray<{ value: WorkspaceFilter; label: string }> = [
@@ -183,6 +190,65 @@ export function WorkspaceDashboardRoute() {
   const serverPathSample = homeDir ?? dashboardProjectRows[0]?.cwd ?? "";
   const worktreePathPlatform = isWindowsAbsolutePath(serverPathSample) ? "windows" : "posix";
   const projectIds = useMemo(() => projectRows.map((project) => project.id), [projectRows]);
+  const projectById = useMemo(
+    () => new Map(projectRows.map((project) => [project.id, project])),
+    [projectRows],
+  );
+  const workspaceAgentActivity = useWorkspaceAgentActivity(projectIds);
+  const agentActivityByThreadId = useMemo(
+    () =>
+      new Map(
+        workspaceAgentActivity.threads.map(
+          (entry) => [entry.threadId, entry.activityState] as const,
+        ),
+      ),
+    [workspaceAgentActivity.threads],
+  );
+  const terminalStateByThreadId = useTerminalStateStore((state) => state.terminalStateByThreadId);
+  const projectRunsByProjectId = useProjectRunStore((state) => state.runsByProjectId);
+  const activeGitActionIdsByCwd = useGitActionActivityStore((state) => state.activeActionIdsByCwd);
+  const activeGitActionCwds = useMemo(
+    () => [...activeGitActionIdsByCwd.keys()],
+    [activeGitActionIdsByCwd],
+  );
+  const processActivityByProjectId = useMemo(() => {
+    const sourcesByProjectId = indexWorkspaceProcessSourcesByProject({
+      agents: workspaceAgentActivity.threads,
+      threads,
+      terminalStateByThreadId,
+    });
+    return new Map(
+      projectIds.map((projectId) => {
+        const project = projectById.get(projectId);
+        const sources = sourcesByProjectId.get(projectId);
+        return [
+          projectId,
+          deriveProjectProcessActivity({
+            agents: sources?.agents ?? [],
+            terminalProcessCount: sources?.terminalProcessCount ?? 0,
+            devServerRunning: projectRunsByProjectId[projectId] !== undefined,
+            gitActionRunning:
+              project !== undefined &&
+              hasActiveGitActionForProject({
+                project,
+                threads: sources?.threads ?? [],
+                activeActionCwds: activeGitActionCwds,
+                platform: worktreePathPlatform,
+              }),
+          }),
+        ] as const;
+      }),
+    );
+  }, [
+    activeGitActionCwds,
+    projectIds,
+    projectById,
+    projectRunsByProjectId,
+    terminalStateByThreadId,
+    threads,
+    worktreePathPlatform,
+    workspaceAgentActivity.threads,
+  ]);
   const gitStatesQuery = useQuery(workspaceGitStatesQueryOptions({ projectIds }));
   const repositoryByProjectId = useMemo(
     () =>
@@ -224,12 +290,16 @@ export function WorkspaceDashboardRoute() {
         threads,
         automationRuns: automationQuery.data?.runs ?? [],
         repositoryByProjectId,
+        processActivityByProjectId,
+        agentActivityByThreadId,
         worktreePathPlatform,
       }),
     [
       automationQuery.data?.runs,
+      agentActivityByThreadId,
       dashboardProjectRows,
       repositoryByProjectId,
+      processActivityByProjectId,
       threads,
       worktreePathPlatform,
     ],

@@ -52,6 +52,16 @@ function card(overrides: Partial<WorkspaceCardModel> = {}): WorkspaceCardModel {
     },
     recentThread: null,
     activity: null,
+    processActivity: {
+      agentCount: 0,
+      agentRunningCount: 0,
+      subagentCount: 0,
+      subagentRunningCount: 0,
+      terminalProcessCount: 0,
+      devServerRunning: false,
+      gitActionRunning: false,
+      anyProcessRunning: false,
+    },
     worktrees: [],
     providers: [],
     automation: null,
@@ -182,17 +192,35 @@ describe("WorkspaceProjectCard", () => {
       card({
         activity: {
           threadId,
-          label: "Working",
-          colorClass: "text-sky-600",
-          dotClass: "bg-sky-500",
+          label: "Thinking",
+          colorClass: "text-warning",
+          dotClass: "bg-warning",
           pulse: true,
         },
       }),
     );
     await render(<WorkspaceProjectCard {...callbacks} />);
 
-    await page.getByRole("button", { name: "Working" }).click();
+    await page.getByRole("button", { name: "Thinking" }).click();
     expect(callbacks.onOpenThread).toHaveBeenCalledWith(threadId);
     expect(callbacks.onOpenProject).not.toHaveBeenCalled();
+  });
+
+  it("includes Git work in the visible process summary", async () => {
+    await render(
+      <WorkspaceProjectCard
+        {...props(
+          card({
+            processActivity: {
+              ...card().processActivity,
+              gitActionRunning: true,
+              anyProcessRunning: true,
+            },
+          }),
+        )}
+      />,
+    );
+
+    await expect.element(page.getByText(/Git operation running/)).toBeVisible();
   });
 });

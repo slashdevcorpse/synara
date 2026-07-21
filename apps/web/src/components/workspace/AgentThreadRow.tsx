@@ -7,12 +7,8 @@ import { PROVIDER_DISPLAY_NAMES, type ThreadId } from "@synara/contracts";
 import { useId } from "react";
 
 import { formatClockDuration } from "~/session-logic";
-import { agentStatusToSubagentStatusKind } from "~/lib/agentStatusPresentation";
+import { agentStatusPresentation } from "~/lib/agentStatusPresentation";
 import { GitBranchIcon, LoaderIcon, StopIcon, XIcon } from "~/lib/icons";
-import {
-  subagentStatusDotClassName,
-  subagentStatusTextToneClassName,
-} from "~/lib/subagentPresentation";
 import { cn } from "~/lib/utils";
 
 import { ProviderIcon } from "../ProviderIcon";
@@ -43,6 +39,7 @@ const STATUS_LABEL: Record<AgentStatus, string> = {
   queued: "Queued",
   completed: "Completed",
   failed: "Failed",
+  interrupted: "Interrupted",
   stopped: "Stopped",
 };
 
@@ -56,7 +53,7 @@ export function AgentThreadRow({
 }: AgentThreadRowProps) {
   const descriptionId = useId();
   const interruptible = isLiveAgentStatus(entry.status) && entry.turnId !== null;
-  const statusKind = agentStatusToSubagentStatusKind(entry.status);
+  const statusPresentation = agentStatusPresentation(entry.status);
   const providerName = PROVIDER_DISPLAY_NAMES[entry.providerKind];
   const cappedDepth = Math.min(Math.max(0, depth), 6);
   const actionLabel = entry.subagentNickname ?? entry.threadTitle;
@@ -120,7 +117,7 @@ export function AgentThreadRow({
             aria-hidden="true"
             className={cn(
               "size-1.5 shrink-0 rounded-full",
-              subagentStatusDotClassName(statusKind),
+              statusPresentation.dotClassName,
               isLiveAgentStatus(entry.status) && "animate-pulse motion-reduce:animate-none",
             )}
           />
@@ -139,7 +136,7 @@ export function AgentThreadRow({
             {entry.modelLabel}
             {entry.effortLabel ? ` · ${entry.effortLabel}` : ""}
           </span>
-          <span className={cn("ml-auto shrink-0", subagentStatusTextToneClassName(statusKind))}>
+          <span className={cn("ml-auto shrink-0", statusPresentation.textClassName)}>
             {STATUS_LABEL[entry.status]}
           </span>
         </span>
