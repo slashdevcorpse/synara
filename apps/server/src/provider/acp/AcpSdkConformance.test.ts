@@ -13,7 +13,11 @@ import { it } from "@effect/vitest";
 import { Deferred, Effect, Exit, Fiber, Schema, Stream } from "effect";
 import { afterEach, describe, expect, it as test } from "vitest";
 
-import { AcpSessionRuntime } from "./AcpSessionRuntime.ts";
+import { AcpSessionRuntime, type AcpSessionRuntimeOptions } from "./AcpSessionRuntime.ts";
+import type {
+  SupervisedProcessTeardownInput,
+  SupervisedProcessTeardownResult,
+} from "../supervisedProcessTeardown.ts";
 
 const fixturePath = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -83,7 +87,18 @@ function captureByteStream(
   );
 }
 
-function runtimeLayer(logPath: string, env: Record<string, string> = {}) {
+async function awaitExitedFixtureTeardown(
+  input: SupervisedProcessTeardownInput,
+): Promise<SupervisedProcessTeardownResult> {
+  await input.rootExited;
+  return { escalated: false, signalErrors: [] };
+}
+
+function runtimeLayer(
+  logPath: string,
+  env: Record<string, string> = {},
+  options: Pick<AcpSessionRuntimeOptions, "teardownProcessTree"> = {},
+) {
   return AcpSessionRuntime.layer({
     spawn: {
       command: process.execPath,
@@ -107,6 +122,7 @@ function runtimeLayer(logPath: string, env: Record<string, string> = {}) {
       primitive: 11,
       nested: { source: "synara-auth" },
     },
+    ...options,
   });
 }
 
@@ -219,7 +235,9 @@ describe("official ACP SDK conformance at the current Synara boundary", () => {
       expect(Exit.isFailure(exit)).toBe(true);
       expect(readFixtureLog(logPath).some((entry) => entry.type === "conformance/exit")).toBe(true);
     }).pipe(
-      Effect.provide(runtimeLayer(logPath)),
+      Effect.provide(
+        runtimeLayer(logPath, {}, { teardownProcessTree: awaitExitedFixtureTeardown }),
+      ),
       Effect.scoped,
       Effect.provide(NodeServices.layer),
     );

@@ -42,6 +42,8 @@ export interface SupervisedProcessTeardownResult {
   readonly signalErrors: ReadonlyArray<Error>;
 }
 
+export type ProviderProcessDescendantExitProof = ProcessTreeDescendantExitProof | "not-captured";
+
 export interface SupervisedProcessTeardownDependencies {
   readonly processTreeKiller: ProcessTreeKiller;
   readonly now: () => number;
@@ -53,7 +55,7 @@ export class ProviderProcessExitUnprovenError extends Error {
   readonly rootExited: boolean;
   readonly remainingDescendantPids: ReadonlyArray<number> | null;
   readonly captureComplete: boolean;
-  readonly descendantExitProof: ProcessTreeDescendantExitProof;
+  readonly descendantExitProof: ProviderProcessDescendantExitProof;
   readonly rootTreeSignalSucceeded: boolean;
 
   constructor(input: {
@@ -61,7 +63,7 @@ export class ProviderProcessExitUnprovenError extends Error {
     readonly rootExited: boolean;
     readonly remainingDescendantPids: ReadonlyArray<number> | null;
     readonly captureComplete: boolean;
-    readonly descendantExitProof: ProcessTreeDescendantExitProof;
+    readonly descendantExitProof: ProviderProcessDescendantExitProof;
     readonly rootTreeSignalSucceeded: boolean;
   }) {
     const descendantDetail =
@@ -226,18 +228,34 @@ export async function teardownProviderProcessTree(
       // A rejected watcher is not evidence that the owned process exited.
     },
   );
+
+  const failUncapturedExit = (): never => {
+    throw new ProviderProcessExitUnprovenError({
+      rootPid: input.rootPid,
+      rootExited: true,
+      remainingDescendantPids: null,
+      captureComplete: false,
+      descendantExitProof: "not-captured",
+      rootTreeSignalSucceeded: false,
+    });
+  };
+
+  // Observe an already-settled exit before using the PID. Once the owned root is gone, that PID
+  // may identify an unrelated process, so neither capture nor signaling is safe.
+  await Promise.resolve();
+  if (rootExited) failUncapturedExit();
+
   const capturedTree = await deps.processTreeKiller.capture(input.rootPid);
   captureFinished = true;
-  // Flush a root-exit resolution queued in the same turn as capture completion.
+
+  // An asynchronous process-table scan can overlap root exit. Flush an exit
+  // resolution queued in the same turn as capture completion, then discard the
+  // PID-keyed result if the owned root exited before capture finished.
   await Promise.resolve();
-  const captureComplete =
-    capturedTree.captureComplete !== false && !rootExitedBeforeCaptureFinished;
-  // A capture that completed after the owned root exited may describe an
-  // unrelated process that reused the numeric root PID. None of its descendant
-  // identities are safe to signal, even though exit proof must still fail closed.
-  const tree = rootExitedBeforeCaptureFinished
-    ? { ...capturedTree, descendants: [], captureComplete: false }
-    : capturedTree;
+  if (rootExitedBeforeCaptureFinished) failUncapturedExit();
+
+  const captureComplete = capturedTree.captureComplete !== false;
+  const tree = capturedTree;
 
   const signal = async (
     killSignal: TerminalKillSignal,

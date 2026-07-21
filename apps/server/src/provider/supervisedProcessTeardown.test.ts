@@ -472,10 +472,11 @@ describe("teardownProviderProcessTree", () => {
 
   it("fails closed when asynchronous descendant capture is incomplete", async () => {
     const clock = deterministicClock();
+    const rootExit = deferred<void>();
     const failure = await teardownProviderProcessTree(
       {
         rootPid: 401,
-        rootExited: Promise.resolve(),
+        rootExited: rootExit.promise,
         termGraceMs: 5,
         forceExitMs: 5,
       },
@@ -487,7 +488,10 @@ describe("teardownProviderProcessTree", () => {
             descendantExitProof: "captured-identities",
           }),
           inspect: async () => ({ verified: true, survivors: [] }),
-          signal: async () => ({ rootTreeSignalSucceeded: false }),
+          signal: async () => {
+            rootExit.resolve(undefined);
+            return { rootTreeSignalSucceeded: false };
+          },
         },
         ...clock,
       },
@@ -504,7 +508,43 @@ describe("teardownProviderProcessTree", () => {
     });
   });
 
-  it("observes root exit during capture, avoids stale-PID signalling, and fails closed", async () => {
+  it("does not capture or signal a root that exited before teardown starts", async () => {
+    let captureCalls = 0;
+    let signalCalls = 0;
+
+    const failure = await teardownProviderProcessTree(
+      {
+        rootPid: 351,
+        rootExited: Promise.resolve(),
+      },
+      {
+        processTreeKiller: {
+          capture: () => {
+            captureCalls += 1;
+            throw new Error("capture must not run for an exited root");
+          },
+          signal: async () => {
+            signalCalls += 1;
+            throw new Error("signal must not run for an exited root");
+          },
+        },
+      },
+    ).catch((error: unknown) => error);
+
+    expect(captureCalls).toBe(0);
+    expect(signalCalls).toBe(0);
+    expect(failure).toBeInstanceOf(ProviderProcessExitUnprovenError);
+    expect(failure).toMatchObject({
+      rootPid: 351,
+      rootExited: true,
+      remainingDescendantPids: null,
+      captureComplete: false,
+      descendantExitProof: "not-captured",
+      rootTreeSignalSucceeded: false,
+    });
+  });
+
+  it("does not signal when the root exits during asynchronous process-tree capture", async () => {
     const clock = deterministicClock();
     let releaseCapture: (() => void) | undefined;
     let resolveRootExit: (() => void) | undefined;
@@ -512,11 +552,7 @@ describe("teardownProviderProcessTree", () => {
     const rootExited = new Promise<void>((resolve) => {
       resolveRootExit = resolve;
     });
-    const signals: Array<{
-      signal: TerminalKillSignal;
-      includeRootTree: boolean | undefined;
-      descendantPids: number[];
-    }> = [];
+    let signalCalls = 0;
     const processTreeKiller: ProcessTreeKiller = {
       capture: async () => {
         captureStarted.resolve();
@@ -530,12 +566,8 @@ describe("teardownProviderProcessTree", () => {
         };
       },
       inspect: () => ({ verified: true, survivors: [] }),
-      signal: async ({ signal, includeRootTree, tree }) => {
-        signals.push({
-          signal,
-          includeRootTree,
-          descendantPids: tree.descendants.map(({ pid }) => pid),
-        });
+      signal: async () => {
+        signalCalls += 1;
         return { rootTreeSignalSucceeded: false };
       },
     };
@@ -554,15 +586,12 @@ describe("teardownProviderProcessTree", () => {
     expect(failure).toMatchObject({
       rootPid: 501,
       rootExited: true,
-      remainingDescendantPids: [],
+      remainingDescendantPids: null,
       captureComplete: false,
-      descendantExitProof: "captured-identities",
+      descendantExitProof: "not-captured",
       rootTreeSignalSucceeded: false,
     });
-    expect(signals).toEqual([
-      { signal: "SIGTERM", includeRootTree: false, descendantPids: [] },
-      { signal: "SIGKILL", includeRootTree: false, descendantPids: [] },
-    ]);
+    expect(signalCalls).toBe(0);
   });
 
   it("waits for completed Windows root-tree signal proof after the root exits", async () => {
