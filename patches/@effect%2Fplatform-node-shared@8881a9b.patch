@@ -1,8 +1,8 @@
 diff --git a/dist/NodeChildProcessSpawner.js b/dist/NodeChildProcessSpawner.js
-index ff15212e4..e7cf12c4d 100644
+index ff15212..b3655b0 100644
 --- a/dist/NodeChildProcessSpawner.js
 +++ b/dist/NodeChildProcessSpawner.js
-@@ -314,7 +314,8 @@ const make = /*#__PURE__*/Effect.gen(function* () {
+@@ -314,10 +314,14 @@ const make = /*#__PURE__*/Effect.gen(function* () {
              env,
              stdio,
              detached: cmd.options.detached ?? process.platform !== "win32",
@@ -12,11 +12,41 @@ index ff15212e4..e7cf12c4d 100644
            }), Effect.fnUntraced(function* ([childProcess, exitSignal]) {
              const exited = yield* Deferred.isDone(exitSignal);
              const killWithTimeout = withTimeout(childProcess, cmd, cmd.options);
++            if (cmd.options.synaraExternallySupervised === true) {
++              return yield* Effect.void;
++            }
+             if (exited) {
+               // Process already exited, check if children need cleanup
+               const [code] = yield* Deferred.await(exitSignal);
+@@ -356,7 +360,7 @@ const make = /*#__PURE__*/Effect.gen(function* () {
+             const killWithTimeout = withTimeout(childProcess, cmd, options);
+             return killWithTimeout((command, childProcess, signal) => Effect.catch(killProcessGroup(command, childProcess, signal), () => killProcess(command, childProcess, signal))).pipe(Effect.andThen(Deferred.await(exitSignal)), Effect.asVoid);
+           };
+-          return makeHandle({
++          const handle = makeHandle({
+             pid,
+             exitCode,
+             isRunning,
+@@ -368,6 +372,14 @@ const make = /*#__PURE__*/Effect.gen(function* () {
+             getInputFd,
+             getOutputFd
+           });
++          return Object.assign(handle, {
++            synaraTerminateExact: () => childProcess.kill(),
++            synaraCloseStdin: () => {
++              if (childProcess.stdin !== null && !childProcess.stdin.destroyed) {
++                childProcess.stdin.end();
++              }
++            }
++          });
+         }
+       case "PipedCommand":
+         {
 diff --git a/src/NodeChildProcessSpawner.ts b/src/NodeChildProcessSpawner.ts
-index dc53bafb7..fe867fbfc 100644
+index dc53baf..8aba0ea 100644
 --- a/src/NodeChildProcessSpawner.ts
 +++ b/src/NodeChildProcessSpawner.ts
-@@ -430,7 +430,12 @@ const make = Effect.gen(function*() {
+@@ -430,11 +430,25 @@ const make = Effect.gen(function*() {
              env,
              stdio,
              detached: cmd.options.detached ?? process.platform !== "win32",
@@ -30,3 +60,37 @@ index dc53bafb7..fe867fbfc 100644
            }),
            Effect.fnUntraced(function*([childProcess, exitSignal]) {
              const exited = yield* Deferred.isDone(exitSignal)
+             const killWithTimeout = withTimeout(childProcess, cmd, cmd.options)
++            if (
++              (
++                cmd.options as ChildProcess.CommandOptions & {
++                  readonly synaraExternallySupervised?: boolean | undefined
++                }
++              ).synaraExternallySupervised === true
++            ) {
++              return yield* Effect.void
++            }
+             if (exited) {
+               // Process already exited, check if children need cleanup
+               const [code] = yield* Deferred.await(exitSignal)
+@@ -488,4 +502,4 @@ const make = Effect.gen(function*() {
+-        return makeHandle({
++        const handle = makeHandle({
+           pid,
+           exitCode,
+           isRunning,
+@@ -497,6 +511,14 @@ const make = Effect.gen(function*() {
+           getInputFd,
+           getOutputFd
+         })
++        return Object.assign(handle, {
++          synaraTerminateExact: () => childProcess.kill(),
++          synaraCloseStdin: () => {
++            if (childProcess.stdin !== null && !childProcess.stdin.destroyed) {
++              childProcess.stdin.end()
++            }
++          }
++        })
+       }
+       case "PipedCommand": {
+         const { commands, pipeOptions } = flattenCommand(cmd)

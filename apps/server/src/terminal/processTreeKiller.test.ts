@@ -126,7 +126,7 @@ describe("processTreeKiller", () => {
     );
   });
 
-  it("validates captured child commands before delayed SIGKILL", () => {
+  it("validates captured children without signalling an uncaptured root", () => {
     const signaledPids: Array<{ pid: number; signal: TerminalKillSignal }> = [];
     const treeSignals: Array<{ rootPid: number; signal: TerminalKillSignal }> = [];
     const commandReadCalls: number[][] = [];
@@ -163,7 +163,7 @@ describe("processTreeKiller", () => {
 
     expect(signaledPids).toEqual([{ pid: 102, signal: "SIGKILL" }]);
     expect(commandReadCalls).toEqual([[102, 103]]);
-    expect(treeSignals).toEqual([{ rootPid: 100, signal: "SIGKILL" }]);
+    expect(treeSignals).toEqual([]);
   });
 
   it("does not TERM a reused PID whose stable creation identity changed", () => {

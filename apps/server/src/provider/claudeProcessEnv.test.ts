@@ -2,6 +2,8 @@
 // Purpose: Covers Claude env sanitization so stale process tokens do not shadow CLI OAuth.
 // Layer: Provider utility tests.
 // Exports: Vitest coverage for apps/server/src/provider/claudeProcessEnv.ts.
+import nodePath from "node:path";
+
 import { describe, it, assert } from "@effect/vitest";
 
 import {
@@ -91,12 +93,19 @@ describe("claudeProcessEnv", () => {
   });
 
   it("checks CLAUDE_CONFIG_DIR before the default Claude home", () => {
+    const root = nodePath.parse(process.cwd()).root;
+    const configDir = nodePath.join(root, "tmp", "custom-claude");
+    const homeDir = nodePath.join(root, "home", "tester");
+
     assert.deepEqual(
       resolveClaudeCredentialsPaths({
-        env: { CLAUDE_CONFIG_DIR: "/tmp/custom-claude" },
-        homeDir: "/home/tester",
+        env: { CLAUDE_CONFIG_DIR: configDir },
+        homeDir,
       }),
-      ["/tmp/custom-claude/.credentials.json", "/home/tester/.claude/.credentials.json"],
+      [
+        nodePath.join(configDir, ".credentials.json"),
+        nodePath.join(homeDir, ".claude", ".credentials.json"),
+      ],
     );
   });
 
@@ -165,15 +174,19 @@ describe("claudeProcessEnv", () => {
 
   it("reads the first usable credentials path", () => {
     const seen: string[] = [];
+    const root = nodePath.parse(process.cwd()).root;
+    const configDir = nodePath.join(root, "tmp", "custom-claude");
+    const homeDir = nodePath.join(root, "home", "tester");
+    const configCredentialsPath = nodePath.join(configDir, ".credentials.json");
 
     assert.equal(
       hasUsableClaudeCliCredentials({
-        env: { CLAUDE_CONFIG_DIR: "/tmp/custom-claude" },
-        homeDir: "/home/tester",
+        env: { CLAUDE_CONFIG_DIR: configDir },
+        homeDir,
         nowMs: 1_000,
         readFile: (path) => {
           seen.push(path);
-          if (path === "/tmp/custom-claude/.credentials.json") {
+          if (path === configCredentialsPath) {
             throw new Error("missing");
           }
           return JSON.stringify({
@@ -187,8 +200,8 @@ describe("claudeProcessEnv", () => {
       true,
     );
     assert.deepEqual(seen, [
-      "/tmp/custom-claude/.credentials.json",
-      "/home/tester/.claude/.credentials.json",
+      configCredentialsPath,
+      nodePath.join(homeDir, ".claude", ".credentials.json"),
     ]);
   });
 });

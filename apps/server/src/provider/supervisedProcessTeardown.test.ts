@@ -42,6 +42,24 @@ describe("teardownProviderProcessTree", () => {
     ).resolves.toEqual({ escalated: false, signalErrors: [] });
   });
 
+  it("accepts signal-driven exit failure only when the owned handle proves it stopped", async () => {
+    const signalExit = new Error("Process interrupted due to receipt of signal: 'SIGTERM'");
+
+    await expect(
+      teardownEffectProcessTree(
+        {
+          pid: 92,
+          exitCode: Effect.fail(signalExit),
+          isRunning: Effect.succeed(false),
+        },
+        async ({ rootExited }) => {
+          await expect(rootExited).resolves.toBeUndefined();
+          return { escalated: false, signalErrors: [] };
+        },
+      ),
+    ).resolves.toEqual({ escalated: false, signalErrors: [] });
+  });
+
   it("escalates ignored TERM and returns only after root and descendants prove exit", async () => {
     const tree: CapturedProcessTree = {
       descendants: [{ pid: 102, command: "provider-worker" }],
@@ -138,6 +156,62 @@ describe("teardownProviderProcessTree", () => {
     expect(signals).toEqual([{ signal: "SIGTERM", includeRootTree: false }]);
   });
 
+  it("refreshes ownership after TERM before proving a late child exited", async () => {
+    const lateChild: CapturedProcess = {
+      pid: 272,
+      command: "provider-late-child",
+      identity: "272:late-start",
+    };
+    let lateChildRunning = false;
+    let resolveRootExit: (() => void) | undefined;
+    const rootExited = new Promise<void>((resolve) => {
+      resolveRootExit = resolve;
+    });
+    const signals: TerminalKillSignal[] = [];
+    const processTreeKiller: ProcessTreeKiller = {
+      capture: () => ({ descendants: [], captureComplete: true }),
+      inspect: (tree) => ({
+        verified: true,
+        survivors: lateChildRunning
+          ? tree.descendants.filter(({ pid }) => pid === lateChild.pid)
+          : [],
+      }),
+      signal: ({ signal }) => {
+        signals.push(signal);
+        if (signal === "SIGTERM") {
+          lateChildRunning = true;
+          resolveRootExit?.();
+        } else {
+          lateChildRunning = false;
+        }
+      },
+    };
+    const clock = deterministicClock();
+    let refreshes = 0;
+
+    await expect(
+      teardownProviderProcessTree(
+        {
+          rootPid: 271,
+          rootExited,
+          capturedTree: { descendants: [], captureComplete: true },
+          refreshCapturedTree: async () => {
+            refreshes += 1;
+            return {
+              descendants: lateChildRunning ? [lateChild] : [],
+              captureComplete: true,
+            };
+          },
+          termGraceMs: 5,
+          forceExitMs: 5,
+        },
+        { processTreeKiller, ...clock },
+      ),
+    ).resolves.toEqual({ escalated: true, signalErrors: [] });
+    expect(refreshes).toBeGreaterThanOrEqual(2);
+    expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
+  });
+
   it("fails closed when forced termination cannot prove process-tree exit", async () => {
     const tree: CapturedProcessTree = {
       descendants: [{ pid: 302, command: "stuck-provider" }],
@@ -229,6 +303,76 @@ describe("superviseEffectProcessTree", () => {
     childAlive = false;
   });
 
+  it("bounds background ownership capture to one delayed startup refresh", async () => {
+    const owned = controllableEffectProcess(551);
+    const root: CapturedProcess = {
+      pid: 551,
+      command: "provider session",
+      identity: "551:root-start",
+    };
+    let releaseStartupCapture: (() => void) | undefined;
+    const startupCaptureDelay = new Promise<void>((resolve) => {
+      releaseStartupCapture = resolve;
+    });
+    let asynchronousCaptures = 0;
+    const tree = { root, descendants: [], captureComplete: true };
+    const supervisor = superviseEffectProcessTree(owned.process, {
+      processTreeKiller: {
+        capture: () => tree,
+        captureAsync: async () => {
+          asynchronousCaptures += 1;
+          return tree;
+        },
+        inspect: () => ({ verified: true, survivors: [] }),
+        signal: () => undefined,
+      },
+      platform: "win32",
+      sleep: () => startupCaptureDelay,
+    });
+
+    releaseStartupCapture?.();
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(asynchronousCaptures).toBe(1);
+
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(asynchronousCaptures).toBe(1);
+    owned.exit();
+    await expect(supervisor.proveExit()).resolves.toEqual({
+      escalated: false,
+      signalErrors: [],
+    });
+    expect(asynchronousCaptures).toBe(2);
+  });
+
+  it("uses the injected process-tree killer for default teardown signalling", async () => {
+    const owned = controllableEffectProcess(2_147_483_647);
+    const root: CapturedProcess = {
+      pid: 2_147_483_647,
+      command: "synthetic provider",
+      identity: "2147483647:root-start",
+    };
+    const signals: TerminalKillSignal[] = [];
+    const supervisor = superviseEffectProcessTree(owned.process, {
+      processTreeKiller: {
+        capture: () => ({ root, descendants: [], captureComplete: true }),
+        inspect: () => ({ verified: true, survivors: [] }),
+        signal: ({ signal }) => {
+          signals.push(signal);
+          owned.exit();
+        },
+      },
+      platform: "win32",
+      capturePollMs: 60_000,
+    });
+
+    await expect(supervisor.teardown()).resolves.toEqual({
+      escalated: false,
+      signalErrors: [],
+    });
+    expect(signals).toEqual(["SIGTERM"]);
+  });
+
   it("accepts normal root success when every live-captured descendant is gone", async () => {
     const owned = controllableEffectProcess(601);
     const root: CapturedProcess = {
@@ -266,6 +410,38 @@ describe("superviseEffectProcessTree", () => {
     childAlive = false;
     owned.exit();
 
+    await expect(supervisor.proveExit()).resolves.toEqual({
+      escalated: false,
+      signalErrors: [],
+    });
+  });
+
+  it("proves a signal-driven exit after the owned handle reports it stopped", async () => {
+    const root: CapturedProcess = {
+      pid: 651,
+      command: "provider updater",
+      identity: "651:root-start",
+    };
+    let rootAlive = true;
+    const supervisor = superviseEffectProcessTree(
+      {
+        pid: 651,
+        exitCode: Effect.fail(new Error("Process interrupted due to receipt of signal: 'SIGTERM'")),
+        isRunning: Effect.succeed(false),
+      },
+      {
+        processTreeKiller: {
+          capture: () => ({ ...(rootAlive ? { root } : {}), descendants: [] }),
+          inspect: () => ({ verified: true, survivors: [] }),
+          signal: () => undefined,
+        },
+        platform: "win32",
+        capturePollMs: 1,
+        proofTimeoutMs: 5,
+      },
+    );
+
+    rootAlive = false;
     await expect(supervisor.proveExit()).resolves.toEqual({
       escalated: false,
       signalErrors: [],

@@ -32,7 +32,7 @@ import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
 import { ProviderAdapterRegistry } from "../Services/ProviderAdapterRegistry.ts";
 import { ProviderDiscoveryService } from "../Services/ProviderDiscoveryService.ts";
 import { clearSkillsCatalogCacheForTests } from "../skillsCatalog.ts";
-import { ProviderDiscoveryServiceLive } from "./ProviderDiscoveryService.ts";
+import { makeProviderDiscoveryServiceLive } from "./ProviderDiscoveryService.ts";
 
 let root: string;
 let homeDir: string;
@@ -91,7 +91,9 @@ const runListSkills = (input: {
     ServerSettingsService.layerTest({ skills: { disabled: input.disabled ?? [] } }),
     makeRegistryLayer(input.adapter),
   ).pipe(Layer.provideMerge(NodeServices.layer));
-  const testLayer = ProviderDiscoveryServiceLive.pipe(Layer.provideMerge(baseLayer));
+  const testLayer = makeProviderDiscoveryServiceLive({ projectRootBoundary: root }).pipe(
+    Layer.provideMerge(baseLayer),
+  );
   const program = Effect.gen(function* () {
     const discovery = yield* ProviderDiscoveryService;
     return yield* discovery.listSkills({ provider: input.provider, cwd });
@@ -187,7 +189,9 @@ describe("ProviderDiscoveryService.getComposerCapabilities", () => {
       ServerSettingsService.layerTest(),
       makeRegistryLayer({}),
     ).pipe(Layer.provideMerge(NodeServices.layer));
-    const testLayer = ProviderDiscoveryServiceLive.pipe(Layer.provideMerge(baseLayer));
+    const testLayer = makeProviderDiscoveryServiceLive({ projectRootBoundary: root }).pipe(
+      Layer.provideMerge(baseLayer),
+    );
 
     const program = Effect.gen(function* () {
       const discovery = yield* ProviderDiscoveryService;

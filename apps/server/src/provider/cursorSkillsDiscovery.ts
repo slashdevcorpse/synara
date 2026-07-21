@@ -13,6 +13,7 @@ import { collectSkillsFromRoots, providerNativeSkillRoots } from "./skillsCatalo
 export interface CursorSkillDiscoveryInput {
   readonly cwd: string;
   readonly homeDir: string;
+  readonly projectRootBoundary?: string;
 }
 
 export async function discoverCursorSkills(
@@ -21,6 +22,7 @@ export async function discoverCursorSkills(
   return collectSkillsFromRoots(
     providerNativeSkillRoots({
       cwd: input.cwd,
+      ...(input.projectRootBoundary ? { projectRootBoundary: input.projectRootBoundary } : {}),
       homeDir: input.homeDir,
       synaraBaseDir: nodePath.join(input.homeDir, ".synara"),
       provider: "cursor",

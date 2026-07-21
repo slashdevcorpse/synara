@@ -16,6 +16,7 @@ import {
   superviseDesktopSmokeProcess,
   WINDOWS_SMOKE_JOB_READY_PREFIX,
   WINDOWS_SMOKE_JOB_RUN_ID_ENV,
+  WINDOWS_SMOKE_JOB_TERMINATE_PREFIX,
 } from "./smoke-test-lifecycle.mjs";
 
 const scriptsDirectory = dirname(fileURLToPath(import.meta.url));
@@ -162,15 +163,29 @@ describe.skipIf(process.platform !== "win32")(
 
     it("preserves a one-element argument array through Windows PowerShell 5.1", async () => {
       const { child, runId } = startFixture();
-      const result = await superviseDesktopSmokeProcess({
-        child,
-        platform: "win32",
-        windowsJobRunId: runId,
-        observationMs: 250,
+      let output = "";
+      child.stdout.on("data", (chunk) => {
+        output += chunk.toString();
       });
+      child.stderr.on("data", (chunk) => {
+        output += chunk.toString();
+      });
+      const closePromise = once(child, "close");
 
-      expect(result).toMatchObject({ ok: true, failures: [], teardownDiagnostics: [] });
-      expect(result.output).toContain("FIXTURE_ARGV:[]");
+      await waitFor(
+        () => output.includes(WINDOWS_SMOKE_JOB_READY_PREFIX + runId),
+        "the wrapper ready marker",
+      );
+      await waitFor(
+        () => output.includes("FIXTURE_ARGV:[]"),
+        "the one-element target argv to cross the PowerShell output relay",
+      );
+      child.stdin.end(WINDOWS_SMOKE_JOB_TERMINATE_PREFIX + runId + "\n");
+      const [code, signal] = await closePromise;
+
+      expect({ code, signal }).toEqual({ code: 137, signal: null });
+      expect(output).toContain("FIXTURE_ARGV:[]");
+      expect(output).not.toContain("SYNARA_SMOKE_JOB_ERROR");
     }, 20_000);
 
     it("preserves literal -- argv and contains root, child, grandchild, and TCP listener", async () => {

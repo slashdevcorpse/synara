@@ -21,6 +21,7 @@ let finishCancelledPrompt: (() => void) | undefined;
 
 process.once("SIGTERM", () => process.exit(0));
 process.once("SIGINT", () => process.exit(0));
+process.stdin.once("end", () => process.exit(0));
 
 if (malformedPrefix) {
   process.stdout.write("{not-json}\n");

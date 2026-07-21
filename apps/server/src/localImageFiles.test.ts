@@ -32,7 +32,7 @@ describe("resolveAllowedLocalPreviewFile", () => {
       cwd: workspace,
     });
 
-    assert.equal(result?.path, realpathSync(imagePath));
+    assert.equal(result?.path, realpathSync.native(imagePath));
     assert.equal(result?.fileName, "preview.png");
   });
 
@@ -51,7 +51,7 @@ describe("resolveAllowedLocalPreviewFile", () => {
         cwd: null,
       });
 
-      assert.equal(result?.path, realpathSync(imagePath));
+      assert.equal(result?.path, realpathSync.native(imagePath));
     } finally {
       if (previousCodexHome === undefined) {
         delete process.env.CODEX_HOME;
@@ -93,7 +93,7 @@ describe("resolveAllowedLocalPreviewFile", () => {
         codexHomePath: sourceHome,
       });
 
-      assert.equal(result?.path, realpathSync(imagePath));
+      assert.equal(result?.path, realpathSync.native(imagePath));
     } finally {
       if (previousSynaraHome === undefined) {
         delete process.env.SYNARA_HOME;
@@ -116,7 +116,7 @@ describe("resolveAllowedLocalPreviewFile", () => {
       cwd: workspace,
     });
 
-    assert.equal(result?.path, realpathSync(pdfPath));
+    assert.equal(result?.path, realpathSync.native(pdfPath));
     assert.equal(result?.fileName, "spec.pdf");
     assert.equal(result?.sizeBytes, 8);
   });
@@ -136,7 +136,7 @@ describe("resolveAllowedLocalPreviewFile", () => {
         cwd: null,
       });
 
-      assert.equal(result?.path, realpathSync(pdfPath));
+      assert.equal(result?.path, realpathSync.native(pdfPath));
       assert.equal(result?.fileName, "viewer-test.pdf");
       assert.equal(result?.sizeBytes, 8);
     } finally {
@@ -171,7 +171,7 @@ describe("resolveAllowedLocalPreviewFile", () => {
       cwd: null,
     });
 
-    assert.equal(result?.path, realpathSync(imagePath));
+    assert.equal(result?.path, realpathSync.native(imagePath));
   });
 
   it("rejects unsupported paths", async () => {

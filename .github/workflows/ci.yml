@@ -100,6 +100,9 @@ jobs:
       - name: Build desktop pipeline
         run: bun run build:desktop
 
+      - name: Verify isolated packaged CLI runtime
+        run: node apps/server/scripts/cli.ts publish --dry-run
+
       - name: Verify preload bundle output
         run: |
           test -f apps/desktop/dist-electron/preload.js
@@ -166,6 +169,8 @@ jobs:
           src/windowsProcessEffect.test.ts
           src/codexAppServerManager.test.ts
           src/provider/Layers/ProviderHealth.test.ts
+          src/provider/acp/AcpWindowsJob.windows.integration.test.ts
+          src/provider/acp/AcpJsonRpcConnection.test.ts
           src/persistence/MigrationBackup.test.ts
           src/restoreMigrationBackup.test.ts
 

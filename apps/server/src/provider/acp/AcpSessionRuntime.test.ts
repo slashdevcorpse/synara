@@ -8,6 +8,7 @@ import {
   awaitAcpChildExit,
   decodeSetSessionConfigOptionResponse,
   makeAcpIncomingFrameGuard,
+  registerAcpProcessOwnership,
   sessionConfigOptionsFromSetup,
   teardownAcpChildProcess,
 } from "./AcpSessionRuntime.ts";
@@ -71,6 +72,64 @@ describe("teardownAcpChildProcess", () => {
     Deferred.doneUnsafe(processExited, Effect.succeed(0));
     await closing;
     expect(scopeClosed).toBe(true);
+  });
+});
+
+describe("registerAcpProcessOwnership", () => {
+  it("owns fallback teardown before a supervisor installation can fail", async () => {
+    const processExited = Deferred.makeUnsafe<number>();
+    const child = { pid: 4_243, exitCode: Deferred.await(processExited) };
+    const scope = await Effect.runPromise(Scope.make("sequential"));
+    let fallbackTeardowns = 0;
+    const ownership = await Effect.runPromise(
+      registerAcpProcessOwnership(child, scope, {
+        teardownProcessTree: async ({ rootPid }) => {
+          fallbackTeardowns += 1;
+          expect(rootPid).toBe(child.pid);
+          return { escalated: false, signalErrors: [] };
+        },
+      }),
+    );
+
+    expect(() =>
+      ownership.installSupervisor(() => {
+        throw new Error("initial ownership capture failed");
+      }),
+    ).toThrow("initial ownership capture failed");
+
+    await Effect.runPromise(Scope.close(scope, Exit.void));
+    expect(fallbackTeardowns).toBe(1);
+  });
+
+  it("refreshes ownership before closing the cooperative transport", async () => {
+    const processExited = Deferred.makeUnsafe<number>();
+    const child = { pid: 4_244, exitCode: Deferred.await(processExited) };
+    const scope = await Effect.runPromise(Scope.make("sequential"));
+    const sequence: string[] = [];
+    const ownership = await Effect.runPromise(registerAcpProcessOwnership(child, scope));
+    ownership.installSupervisor(() => ({
+      rootPid: child.pid,
+      captureNow: async () => {
+        sequence.push("capture");
+      },
+      proveExit: async () => {
+        sequence.push("prove");
+        return { escalated: false, signalErrors: [] };
+      },
+      teardown: async () => {
+        sequence.push("teardown");
+        return { escalated: false, signalErrors: [] };
+      },
+    }));
+    ownership.setCloseTransport(
+      Effect.sync(() => {
+        sequence.push("close");
+        Deferred.doneUnsafe(processExited, Effect.succeed(0));
+      }),
+    );
+
+    await Effect.runPromise(Scope.close(scope, Exit.void));
+    expect(sequence).toEqual(["capture", "close", "prove"]);
   });
 });
 

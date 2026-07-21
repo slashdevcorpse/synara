@@ -814,26 +814,41 @@ it.layer(NodeServices.layer)("keybindings", (it) => {
     }).pipe(Effect.provide(makeKeybindingsLayer())),
   );
 
-  it.effect("fails when config directory is not writable", () =>
+  it.effect("fails without data loss when the config path cannot accept writes", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
       const { keybindingsConfigPath } = yield* ServerConfig;
       const { dirname } = yield* Path.Path;
+      const configDirectory = dirname(keybindingsConfigPath);
+      const backupDirectory = `${configDirectory}.write-failure-backup`;
       yield* writeKeybindingsConfig(keybindingsConfigPath, [
         { key: "mod+j", command: "terminal.toggle" },
       ]);
-      yield* fs.chmod(dirname(keybindingsConfigPath), 0o500);
+      const keybindings = yield* Keybindings;
+      yield* keybindings.loadConfigState;
 
-      const result = yield* Effect.gen(function* () {
-        const keybindings = yield* Keybindings;
-        return yield* keybindings.upsertKeybindingRule({
-          key: "mod+shift+r",
-          command: "script.run-tests.run",
-        });
-      }).pipe(toDetailResult);
-      assertFailure(result, "failed to write keybindings config");
-
-      yield* fs.chmod(dirname(keybindingsConfigPath), 0o700);
+      const result = yield* Effect.acquireUseRelease(
+        Effect.gen(function* () {
+          yield* fs.rename(configDirectory, backupDirectory);
+          yield* fs.writeFileString(configDirectory, "blocks directory recreation");
+        }),
+        () =>
+          keybindings
+            .upsertKeybindingRule({
+              key: "mod+shift+r",
+              command: "script.run-tests.run",
+            })
+            .pipe(toDetailResult),
+        () =>
+          fs
+            .remove(configDirectory)
+            .pipe(Effect.andThen(fs.rename(backupDirectory, configDirectory))),
+      );
+      assert.isTrue(Result.isFailure(result));
+      assert.include(
+        ["failed to access keybindings config", "failed to write keybindings config"],
+        Result.isFailure(result) ? result.failure : "",
+      );
 
       const persisted = yield* readKeybindingsConfig(keybindingsConfigPath);
       const persistedView = persisted.map(({ key, command }) => ({ key, command }));

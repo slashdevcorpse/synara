@@ -33,6 +33,7 @@ import {
 
 export interface ProviderDiscoveryServiceLiveOptions {
   readonly maintenanceGate?: ProviderMaintenanceGate;
+  readonly projectRootBoundary?: string;
 }
 
 const decodeInputOrValidationError = <S extends Schema.Top>(input: {
@@ -70,6 +71,7 @@ const make = (options?: ProviderDiscoveryServiceLiveOptions) => Effect.gen(funct
   const serverConfig = yield* ServerConfig;
   const serverSettings = yield* ServerSettingsService;
   const maintenanceGate = options?.maintenanceGate ?? (yield* makeProviderMaintenanceGate);
+  const projectRootBoundary = options?.projectRootBoundary;
   const withProviderDiscovery = <A, E, R>(input: {
     readonly provider: ProviderListModelsInput["provider"];
     readonly operation: string;
@@ -137,6 +139,7 @@ const make = (options?: ProviderDiscoveryServiceLiveOptions) => Effect.gen(funct
       const catalogSkills = yield* Effect.tryPromise(() =>
         discoverSkillsCatalog({
           cwd: parsed.cwd,
+          ...(projectRootBoundary ? { projectRootBoundary } : {}),
           homeDir: serverConfig.homeDir,
           synaraBaseDir: serverConfig.baseDir,
           provider: parsed.provider,

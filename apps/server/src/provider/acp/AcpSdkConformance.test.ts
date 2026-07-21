@@ -1,7 +1,7 @@
 // Verifies the current Synara ACP boundary against an official-SDK subprocess.
 
 import { spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Readable, Writable } from "node:stream";
@@ -14,6 +14,7 @@ import { Deferred, Effect, Exit, Fiber, Schema, Stream } from "effect";
 import { afterEach, describe, expect, it as test } from "vitest";
 
 import { AcpSessionRuntime } from "./AcpSessionRuntime.ts";
+import { makeAcpFixtureRuntimeLayer } from "./AcpSessionRuntimeTestSupport.ts";
 
 const fixturePath = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -84,7 +85,7 @@ function captureByteStream(
 }
 
 function runtimeLayer(logPath: string, env: Record<string, string> = {}) {
-  return AcpSessionRuntime.layer({
+  return makeAcpFixtureRuntimeLayer({
     spawn: {
       command: process.execPath,
       args: [fixturePath],
@@ -181,7 +182,11 @@ describe("official ACP SDK conformance at the current Synara boundary", () => {
       const result = yield* runtime.prompt({
         prompt: [{ type: "text", text: "continue" }],
       });
-      const events = Array.from(yield* Stream.runCollect(Stream.take(runtime.getEvents(), 7)));
+      const events = Array.from(
+        yield* Stream.runCollect(Stream.take(runtime.getEvents(), 7)).pipe(
+          Effect.timeout("10 seconds"),
+        ),
+      );
 
       expect(result).toEqual({ stopReason: "end_turn" });
       expect(events.map((event) => event._tag)).toEqual([
@@ -490,8 +495,20 @@ describe("official ACP SDK client against the official SDK mock agent", () => {
       child.kill("SIGTERM");
       const exit = await exited;
       if (workflowCompleted) {
-        expect(exit).toEqual({ code: 0, signal: null });
-        expect(readFileSync(exitLogPath, "utf8").trim().split("\n")).toEqual(["SIGTERM", "exit:0"]);
+        expect(exit).toEqual(
+          process.platform === "win32"
+            ? { code: null, signal: "SIGTERM" }
+            : { code: 0, signal: null },
+        );
+        if (process.platform === "win32") {
+          // Windows process termination does not deliver a catchable SIGTERM to the child.
+          expect(existsSync(exitLogPath)).toBe(false);
+        } else {
+          expect(readFileSync(exitLogPath, "utf8").trim().split("\n")).toEqual([
+            "SIGTERM",
+            "exit:0",
+          ]);
+        }
         expect(Buffer.concat(stderrChunks).toString("utf8")).toBe("");
       }
     }

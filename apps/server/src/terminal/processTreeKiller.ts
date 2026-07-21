@@ -435,12 +435,8 @@ export function createProcessTreeKiller(
       }
       const shouldSignalRootTree =
         includeRootTree &&
-        (tree.root?.identity === undefined ||
-          shouldSignalCapturedProcess(
-            tree.root,
-            signal,
-            currentProcesses,
-          ));
+        tree.root?.identity !== undefined &&
+        shouldSignalCapturedProcess(tree.root, signal, currentProcesses);
       if (shouldSignalRootTree) {
         deps.signalTree(rootPid, signal, (err) => {
           if (err) {

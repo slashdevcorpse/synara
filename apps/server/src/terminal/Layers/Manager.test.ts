@@ -305,10 +305,15 @@ describe("TerminalManager", () => {
       executable: "C:\\Synara Test\\fake-shell.exe",
       args: [],
     };
+    const inertProcessTreeKiller: ProcessTreeKiller = {
+      capture: () => ({ descendants: [], captureComplete: true }),
+      signal: () => undefined,
+    };
     const commonOptions = {
       logsDir,
       ptyAdapter,
       historyLineLimit,
+      processTreeKiller: options.processTreeKiller ?? inertProcessTreeKiller,
       ...(options.shellEnvironment ? { shellEnvironment: options.shellEnvironment } : {}),
       ...(options.windowsShellSelectionDependencies
         ? { windowsShellSelectionDependencies: options.windowsShellSelectionDependencies }
@@ -318,7 +323,6 @@ describe("TerminalManager", () => {
       ...(options.windowsProcessSnapshotCollector
         ? { windowsProcessSnapshotCollector: options.windowsProcessSnapshotCollector }
         : {}),
-      ...(options.processTreeKiller ? { processTreeKiller: options.processTreeKiller } : {}),
       ...(options.subprocessPollIntervalMs
         ? { subprocessPollIntervalMs: options.subprocessPollIntervalMs }
         : {}),

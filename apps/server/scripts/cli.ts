@@ -11,6 +11,10 @@ import {
   PUBLISH_ICON_OVERRIDES,
 } from "../../../scripts/lib/brand-assets.ts";
 import { resolveCatalogDependencies } from "../../../scripts/lib/resolve-catalog.ts";
+import {
+  assertPatchedEffectProcessSpawnerIsBundled,
+  bytesEqual,
+} from "./cliPublishContract.ts";
 import rootPackageJson from "../../../package.json" with { type: "json" };
 import serverPackageJson from "../package.json" with { type: "json" };
 
@@ -18,6 +22,8 @@ class CliError extends Data.TaggedError("CliError")<{
   readonly message: string;
   readonly cause?: unknown;
 }> {}
+
+const ACP_WINDOWS_JOB_HELPER_FILES = ["acp-windows-job.ps1", "acp-windows-job-native.cs"] as const;
 
 // Some desktop builds do not expose workspace metadata in the root package.json.
 // Publish prep only needs the catalog map when it exists.
@@ -57,6 +63,151 @@ const runCommand = Effect.fn("runCommand")(function* (command: ChildProcess.Comm
       message: `Command exited with non-zero exit code (${exitCode})`,
     });
   }
+});
+
+const makeNpmCommand = Effect.fn("makeNpmCommand")(function* (
+  args: ReadonlyArray<string>,
+  options: {
+    readonly cwd: string;
+    readonly verbose: boolean;
+  },
+) {
+  if (process.platform !== "win32") {
+    return ChildProcess.make("npm", args, {
+      cwd: options.cwd,
+      stdout: options.verbose ? "inherit" : "ignore",
+      stderr: "inherit",
+      shell: false,
+    });
+  }
+
+  const path = yield* Path.Path;
+  const fs = yield* FileSystem.FileSystem;
+  const configuredNpmCli = process.env.npm_execpath?.trim();
+  const npmCliCandidates = [
+    ...(configuredNpmCli && /\.(?:c?js|mjs)$/iu.test(configuredNpmCli)
+      ? [configuredNpmCli]
+      : []),
+    path.join(path.dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js"),
+  ];
+  for (const npmCliPath of npmCliCandidates) {
+    if (path.isAbsolute(npmCliPath) && (yield* fs.exists(npmCliPath))) {
+      return ChildProcess.make(process.execPath, [npmCliPath, ...args], {
+        cwd: options.cwd,
+        stdout: options.verbose ? "inherit" : "ignore",
+        stderr: "inherit",
+        shell: false,
+      });
+    }
+  }
+
+  return yield* new CliError({
+    message: `Cannot locate npm's JavaScript CLI beside Node: ${process.execPath}`,
+  });
+});
+
+const packStagedPackage = Effect.fn("packStagedPackage")(function* (input: {
+  readonly stagedPackageDir: string;
+  readonly verbose: boolean;
+}) {
+  const path = yield* Path.Path;
+  const fs = yield* FileSystem.FileSystem;
+  const packDirectory = yield* fs.makeTempDirectoryScoped({
+    prefix: "synara-cli-pack-",
+  });
+  const packCommand = yield* makeNpmCommand(
+    [
+      "pack",
+      "--pack-destination",
+      packDirectory,
+      ...(input.verbose ? [] : ["--loglevel=error"]),
+    ],
+    { cwd: input.stagedPackageDir, verbose: input.verbose },
+  );
+  yield* runCommand(packCommand);
+
+  const tarballs = (yield* fs.readDirectory(packDirectory))
+    .filter((entry) => entry.endsWith(".tgz"))
+    .sort();
+  if (tarballs.length !== 1) {
+    return yield* new CliError({
+      message: `Expected exactly one packed CLI tarball, found: ${tarballs.join(", ") || "none"}`,
+    });
+  }
+  return path.join(packDirectory, tarballs[0] ?? "");
+});
+
+const verifyIsolatedPackageInstall = Effect.fn("verifyIsolatedPackageInstall")(function* (input: {
+  readonly packageName: string;
+  readonly serverDir: string;
+  readonly tarballPath: string;
+  readonly verbose: boolean;
+}) {
+  const path = yield* Path.Path;
+  const fs = yield* FileSystem.FileSystem;
+  if (!/^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/iu.test(input.packageName)) {
+    return yield* new CliError({
+      message: `Cannot verify an invalid npm package name: ${input.packageName}`,
+    });
+  }
+
+  const installDirectory = yield* fs.makeTempDirectoryScoped({
+    prefix: "synara-cli-install-",
+  });
+  yield* fs.writeFileString(
+    path.join(installDirectory, "package.json"),
+    `${JSON.stringify({ name: "synara-cli-install-smoke", private: true }, null, 2)}\n`,
+  );
+  const installCommand = yield* makeNpmCommand(
+    [
+      "install",
+      "--ignore-scripts",
+      "--no-audit",
+      "--no-fund",
+      "--package-lock=false",
+      ...(input.verbose ? [] : ["--loglevel=error"]),
+      input.tarballPath,
+    ],
+    { cwd: installDirectory, verbose: input.verbose },
+  );
+  yield* runCommand(installCommand);
+
+  const installedPackageDirectory = path.join(
+    installDirectory,
+    "node_modules",
+    ...input.packageName.split("/"),
+  );
+  const installedDistDirectory = path.join(installedPackageDirectory, "dist");
+  const installedRuntimeEntries = (yield* fs.readDirectory(installedDistDirectory))
+    .filter((entry) => entry.endsWith(".mjs") || entry.endsWith(".cjs"))
+    .sort();
+  const installedRuntimeBundles = yield* Effect.forEach(installedRuntimeEntries, (entry) =>
+    fs.readFileString(path.join(installedDistDirectory, entry)).pipe(
+      Effect.map((source) => ({ path: entry, source })),
+    ),
+  );
+  yield* Effect.try({
+    try: () => assertPatchedEffectProcessSpawnerIsBundled(installedRuntimeBundles),
+    catch: (cause) =>
+      new CliError({
+        message: cause instanceof Error ? cause.message : String(cause),
+        cause,
+      }),
+  });
+
+  for (const helperFile of ACP_WINDOWS_JOB_HELPER_FILES) {
+    const [source, installed] = yield* Effect.all([
+      fs.readFile(path.join(input.serverDir, "scripts", helperFile)),
+      fs.readFile(path.join(installedDistDirectory, helperFile)),
+    ]);
+    if (!bytesEqual(source, installed)) {
+      return yield* new CliError({
+        message: `Packed CLI contains a stale Windows ACP helper: ${helperFile}`,
+      });
+    }
+  }
+
+  yield* Effect.log("[cli] Verified patched runtime from an isolated packed CLI install");
 });
 
 const applyPublishIconOverrides = Effect.fn("applyPublishIconOverrides")(function* (
@@ -142,6 +293,17 @@ const buildCmd = Command.make(
         })`bun tsdown`,
       );
 
+      for (const helperFile of ACP_WINDOWS_JOB_HELPER_FILES) {
+        const helperSource = path.join(serverDir, "scripts", helperFile);
+        if (!(yield* fs.exists(helperSource))) {
+          return yield* new CliError({
+            message: `Missing Windows ACP Job Object helper: ${helperSource}`,
+          });
+        }
+        yield* fs.copyFile(helperSource, path.join(serverDir, "dist", helperFile));
+      }
+      yield* Effect.log("[cli] Bundled Windows ACP Job Object helper");
+
       const webDist = path.join(repoRoot, "apps/web/dist");
       const clientTarget = path.join(serverDir, "dist/client");
 
@@ -179,7 +341,10 @@ const publishCmd = Command.make(
       // Assert build assets exist
       for (const relPath of [
         "dist/index.mjs",
+        "dist/index.cjs",
         "dist/restoreMigrationBackup.mjs",
+        "dist/acp-windows-job.ps1",
+        "dist/acp-windows-job-native.cs",
         "dist/client/index.html",
       ]) {
         const abs = path.join(serverDir, relPath);
@@ -189,6 +354,45 @@ const publishCmd = Command.make(
           });
         }
       }
+
+      for (const helperFile of ACP_WINDOWS_JOB_HELPER_FILES) {
+        const sourcePath = path.join(serverDir, "scripts", helperFile);
+        const distPath = path.join(serverDir, "dist", helperFile);
+        if (!(yield* fs.exists(sourcePath))) {
+          return yield* new CliError({
+            message: `Missing Windows ACP helper source: ${sourcePath}`,
+          });
+        }
+        const [source, built] = yield* Effect.all([
+          fs.readFile(sourcePath),
+          fs.readFile(distPath),
+        ]);
+        if (!bytesEqual(source, built)) {
+          return yield* new CliError({
+            message: `Stale Windows ACP helper in dist: ${helperFile}. Run the build subcommand again.`,
+          });
+        }
+      }
+
+      const runtimeBundleEntries = (yield* fs.readDirectory(path.join(serverDir, "dist")))
+        .filter((entry) => entry.endsWith(".mjs") || entry.endsWith(".cjs"))
+        .sort();
+      if (runtimeBundleEntries.length === 0) {
+        return yield* new CliError({ message: "No server runtime bundles were produced." });
+      }
+      const runtimeBundles = yield* Effect.forEach(runtimeBundleEntries, (entry) =>
+        fs.readFileString(path.join(serverDir, "dist", entry)).pipe(
+          Effect.map((source) => ({ path: entry, source })),
+        ),
+      );
+      yield* Effect.try({
+        try: () => assertPatchedEffectProcessSpawnerIsBundled(runtimeBundles),
+        catch: (cause) =>
+          new CliError({
+            message: cause instanceof Error ? cause.message : String(cause),
+            cause,
+          }),
+      });
 
       const version = Option.getOrElse(config.appVersion, () => serverPackageJson.version);
       const pkg = {
@@ -214,7 +418,8 @@ const publishCmd = Command.make(
       for (const binTarget of Object.values(pkg.bin)) {
         if (typeof binTarget !== "string" || !binTarget.startsWith("dist/")) {
           return yield* new CliError({
-            message: `CLI bin target must stay inside the staged dist directory: ${String(binTarget)}`,
+            message:
+              `CLI bin target must stay inside the staged dist directory: ${String(binTarget)}`,
           });
         }
         const stagedBinPath = path.join(stagedPackageDir, binTarget);
@@ -245,20 +450,35 @@ const publishCmd = Command.make(
         });
       }
 
-      const args = ["publish", "--access", config.access, "--tag", config.tag];
+      const tarballPath = yield* packStagedPackage({
+        stagedPackageDir,
+        verbose: config.verbose,
+      });
+      yield* verifyIsolatedPackageInstall({
+        packageName: pkg.name,
+        serverDir,
+        tarballPath,
+        verbose: config.verbose,
+      });
+
+      const args = [
+        "publish",
+        tarballPath,
+        "--access",
+        config.access,
+        "--tag",
+        config.tag,
+      ];
       if (config.provenance) args.push("--provenance");
       if (config.dryRun) args.push("--dry-run");
+      if (!config.verbose) args.push("--loglevel=error");
 
-      yield* Effect.log(`[cli] Running from isolated stage: npm ${args.join(" ")}`);
-      yield* runCommand(
-        ChildProcess.make("npm", [...args], {
-          cwd: stagedPackageDir,
-          stdout: config.verbose ? "inherit" : "ignore",
-          stderr: "inherit",
-          // Windows needs shell mode to resolve .cmd shims.
-          shell: process.platform === "win32",
-        }),
-      );
+      yield* Effect.log(`[cli] Publishing the exact verified tarball: npm ${args.join(" ")}`);
+      const publishCommand = yield* makeNpmCommand(args, {
+        cwd: stagedPackageDir,
+        verbose: config.verbose,
+      });
+      yield* runCommand(publishCommand);
     }),
 ).pipe(Command.withDescription("Publish the server package to npm."));
 

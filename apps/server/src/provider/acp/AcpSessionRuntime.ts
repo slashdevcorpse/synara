@@ -9,7 +9,9 @@ import { prepareWindowsSafeProcess } from "@synara/shared/windowsProcess";
 import {
   Cause,
   Deferred,
+  Duration,
   Effect,
+  Exit,
   Fiber,
   Layer,
   Option,
@@ -28,8 +30,12 @@ import { buildProviderChildEnvironment } from "../../providerChildEnvironment.ts
 import {
   teardownEffectProcessTree,
   teardownProviderProcessTree,
+  superviseEffectProcessTree,
+  type EffectProcessTreeSupervisor,
   type SupervisedProcessTeardownResult,
 } from "../supervisedProcessTeardown.ts";
+import type { ProcessTreeKiller } from "../../terminal/processTreeKiller.ts";
+import { prepareAcpWindowsJobLaunch } from "./AcpWindowsJob.ts";
 import {
   collectSessionConfigOptionValues,
   extractModelConfigId,
@@ -44,6 +50,8 @@ import {
 
 const CONFIG_OPTION_UPDATE_TIMEOUT = "5 seconds";
 const ACP_INCOMING_CHUNK_QUEUE_CAPACITY = 64;
+const ACP_TRANSPORT_CLOSE_GRACE = "1 second";
+const ACP_WINDOWS_JOB_TERMINATION_TIMEOUT_MS = 5_000;
 export const ACP_MAX_INCOMING_FRAME_BYTES = 8 * 1024 * 1024;
 
 export interface AcpProtocolLogEvent {
@@ -134,6 +142,10 @@ export interface AcpSessionRuntimeOptions {
   };
   /** Test seam for the single shared ACP subprocess teardown owner. */
   readonly teardownProcessTree?: typeof teardownProviderProcessTree;
+  /** Test seam for immediate process-identity capture and later inspection/signalling. */
+  readonly processTreeKiller?: ProcessTreeKiller;
+  /** Grace allowed for a cooperative stdin close before supervised termination begins. */
+  readonly gracefulShutdownTimeout?: Duration.Input;
 }
 
 export interface AcpSessionRequestLogEvent {
@@ -272,6 +284,78 @@ interface EnsureActiveAssistantSegmentResult {
 interface AcpOwnedChildProcess {
   readonly pid: number;
   readonly exitCode: Effect.Effect<unknown, unknown>;
+  readonly isRunning?: Effect.Effect<boolean, unknown> | undefined;
+}
+
+function superviseWindowsAcpJobProcess(
+  child: ChildProcessSpawner.ChildProcessHandle,
+): EffectProcessTreeSupervisor {
+  const ownedChild = child as ChildProcessSpawner.ChildProcessHandle & {
+    readonly synaraTerminateExact?: (() => boolean) | undefined;
+  };
+  if (typeof ownedChild.synaraTerminateExact !== "function") {
+    throw new Error("Windows ACP Job Object wrapper is missing exact-handle termination support.");
+  }
+
+  const awaitWrapperExit = async (): Promise<void> => {
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        Effect.runPromise(awaitAcpChildExit(child)),
+        new Promise<never>((_resolve, reject) => {
+          timeout = setTimeout(
+            () =>
+              reject(
+                new Error(
+                  `Timed out waiting for Windows ACP Job Object wrapper ${Number(child.pid)} to exit.`,
+                ),
+              ),
+            ACP_WINDOWS_JOB_TERMINATION_TIMEOUT_MS,
+          );
+        }),
+      ]);
+    } finally {
+      if (timeout !== undefined) clearTimeout(timeout);
+    }
+  };
+
+  const proveExit = async (): Promise<SupervisedProcessTeardownResult> => {
+    await awaitWrapperExit();
+    const running = await Effect.runPromise(child.isRunning);
+    if (running) {
+      throw new Error(`Windows ACP Job Object wrapper ${Number(child.pid)} still reports running.`);
+    }
+    return { escalated: false, signalErrors: [] };
+  };
+
+  let teardownPromise: Promise<SupervisedProcessTeardownResult> | null = null;
+  const teardown = (): Promise<SupervisedProcessTeardownResult> => {
+    if (teardownPromise === null) {
+      const attempt = (async () => {
+        const running = await Effect.runPromise(child.isRunning);
+        if (running) {
+          // Use Node's retained native process handle rather than Effect's PID-based taskkill path.
+          // Terminating the exact wrapper closes its non-inheritable Job handle, and Windows then
+          // terminates every process that inherited the Job before provider code could start.
+          ownedChild.synaraTerminateExact();
+        }
+        await awaitWrapperExit();
+        return { escalated: running, signalErrors: [] };
+      })();
+      teardownPromise = attempt;
+      void attempt.catch(() => {
+        if (teardownPromise === attempt) teardownPromise = null;
+      });
+    }
+    return teardownPromise;
+  };
+
+  return {
+    rootPid: Number(child.pid),
+    captureNow: () => Promise.resolve(),
+    proveExit,
+    teardown,
+  };
 }
 
 export const awaitAcpChildExit = (child: AcpOwnedChildProcess): Effect.Effect<void> =>
@@ -291,6 +375,81 @@ export const teardownAcpChildProcess = (
       try: () => teardownEffectProcessTree(child, teardownProcessTree),
       catch: (error) => (error instanceof Error ? error : new Error(String(error))),
     }).pipe(Effect.orDie);
+  });
+
+export interface AcpProcessOwnership {
+  /** Installs the identity-capturing supervisor after fallback cleanup already owns the child. */
+  readonly installSupervisor: (
+    factory: () => EffectProcessTreeSupervisor,
+  ) => EffectProcessTreeSupervisor;
+  readonly setCloseTransport: (closeTransport: Effect.Effect<void, unknown>) => void;
+}
+
+/**
+ * Acquires teardown ownership before any fallible process inspection or ACP SDK setup. Until the
+ * stronger identity-capturing supervisor installs, scope closure uses the exact spawned handle's
+ * exit watcher and the caller's teardown implementation.
+ */
+export const registerAcpProcessOwnership = (
+  child: AcpOwnedChildProcess,
+  runtimeScope: Scope.Scope,
+  options: {
+    readonly teardownProcessTree?: typeof teardownProviderProcessTree;
+    readonly gracefulShutdownTimeout?: Duration.Input;
+  } = {},
+): Effect.Effect<AcpProcessOwnership> =>
+  Effect.gen(function* () {
+    let processSupervisor: EffectProcessTreeSupervisor | null = null;
+    let closeTransport: Effect.Effect<void, unknown> | undefined;
+
+    yield* Scope.addFinalizer(
+      runtimeScope,
+      Effect.suspend(() => {
+        const supervisor = processSupervisor;
+        if (supervisor === null) {
+          return teardownAcpChildProcess(child, options.teardownProcessTree);
+        }
+
+        return Effect.gen(function* () {
+          if (closeTransport !== undefined) {
+            // Capture immediately before cooperative shutdown. The bounded startup refresh handles
+            // wrapper handoff; this refresh covers work spawned later in a long-lived ACP session.
+            yield* Effect.tryPromise({
+              try: supervisor.captureNow,
+              catch: (error) => (error instanceof Error ? error : new Error(String(error))),
+            }).pipe(Effect.ignore);
+            const gracefulExit = yield* closeTransport.pipe(
+              Effect.andThen(awaitAcpChildExit(child)),
+              Effect.timeout(options.gracefulShutdownTimeout ?? ACP_TRANSPORT_CLOSE_GRACE),
+              Effect.exit,
+            );
+            if (Exit.isSuccess(gracefulExit)) {
+              const proof = yield* Effect.tryPromise({
+                try: supervisor.proveExit,
+                catch: (error) => (error instanceof Error ? error : new Error(String(error))),
+              }).pipe(Effect.exit);
+              if (Exit.isSuccess(proof)) return proof.value;
+            }
+          }
+
+          return yield* Effect.tryPromise({
+            try: supervisor.teardown,
+            catch: (error) => (error instanceof Error ? error : new Error(String(error))),
+          });
+        }).pipe(Effect.orDie);
+      }),
+    );
+
+    return {
+      installSupervisor: (factory) => {
+        const supervisor = factory();
+        processSupervisor = supervisor;
+        return supervisor;
+      },
+      setCloseTransport: (effect) => {
+        closeTransport = effect;
+      },
+    };
   });
 
 function officialSdkError(error: unknown): EffectAcpErrors.AcpError {
@@ -431,6 +590,18 @@ const makeOfficialSdkClient = Effect.fnUntraced(function* (
 
   const outgoing = yield* Queue.bounded<Uint8Array>(256);
   yield* Stream.fromQueue(outgoing).pipe(Stream.run(child.stdin), Effect.forkIn(runtimeScope));
+  yield* Scope.addFinalizer(runtimeScope, Queue.shutdown(outgoing));
+  const ownedChild = child as ChildProcessSpawner.ChildProcessHandle & {
+    readonly synaraCloseStdin?: (() => void) | undefined;
+  };
+  // Stop new writes, then close the exact Node stream owned by this spawned handle. The downstream
+  // platform patch supplies this hook; alternate test spawners can omit it and rely on supervision.
+  const closeTransport = Queue.shutdown(outgoing).pipe(
+    Effect.andThen(Effect.sync(() => ownedChild.synaraCloseStdin?.())),
+  );
+  // ACP uses stdout for JSON-RPC; stderr is diagnostic-only but still must be consumed so a verbose
+  // provider cannot block forever on a full pipe.
+  yield* child.stderr.pipe(Stream.runDrain, Effect.forkIn(runtimeScope));
   const output = new WritableStream<Uint8Array>({
     write: (chunk) =>
       Effect.runPromise(
@@ -567,6 +738,7 @@ const makeOfficialSdkClient = Effect.fnUntraced(function* (
     );
   const register = (set: () => void) => Effect.sync(set);
   const client = {
+    closeTransport,
     raw: {
       notifications: Stream.empty,
       request: requestCustom,
@@ -583,7 +755,7 @@ const makeOfficialSdkClient = Effect.fnUntraced(function* (
         request(OfficialAcp.methods.agent.session.new, {
           ...payload,
           mcpServers: toOfficialMcpServers(payload.mcpServers),
-        }),
+        }).pipe(Effect.tap(() => fromPromise(awaitSessionUpdateDrain))),
       loadSession: (payload: EffectAcpSchema.LoadSessionRequest) =>
         request(OfficialAcp.methods.agent.session.load, {
           ...payload,
@@ -766,29 +938,80 @@ const makeAcpSessionRuntime = (
       cwd: options.spawn.cwd,
       env,
     });
-    const child = yield* spawner
-      .spawn(
-        ChildProcess.make(prepared.command, prepared.args, {
-          ...(options.spawn.cwd ? { cwd: options.spawn.cwd } : {}),
-          env,
-          shell: prepared.shell,
-          ...(prepared.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
-        }),
-      )
-      .pipe(
-        Effect.provideService(Scope.Scope, runtimeScope),
-        Effect.mapError(
-          (cause) =>
-            new EffectAcpErrors.AcpSpawnError({
-              command: options.spawn.command,
-              cause,
-            }),
-        ),
-      );
-
-    yield* Effect.addFinalizer(() => teardownAcpChildProcess(child, options.teardownProcessTree));
+    const launch =
+      process.platform === "win32"
+        ? yield* Effect.tryPromise({
+            try: () =>
+              prepareAcpWindowsJobLaunch({
+                provider: prepared,
+                env,
+                cwd: options.spawn.cwd ?? process.cwd(),
+              }),
+            catch: (cause) =>
+              new EffectAcpErrors.AcpSpawnError({ command: options.spawn.command, cause }),
+          })
+        : prepared;
+    const childCommandOptions: ChildProcess.CommandOptions & {
+      readonly synaraExternallySupervised: true;
+      readonly windowsVerbatimArguments?: boolean | undefined;
+    } = {
+      ...(options.spawn.cwd ? { cwd: options.spawn.cwd } : {}),
+      env,
+      shell: prepared.shell,
+      ...(launch.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
+      // The downstream Effect patch recognizes this flag and disables its PID-based scope
+      // finalizer. The identity-capturing Synara supervisor below is the sole teardown owner.
+      synaraExternallySupervised: true,
+    };
+    const { child, processOwnership } = yield* Effect.uninterruptible(
+      Effect.gen(function* () {
+        const child = yield* spawner
+          .spawn(ChildProcess.make(launch.command, launch.args, childCommandOptions))
+          .pipe(
+            Effect.provideService(Scope.Scope, runtimeScope),
+            Effect.mapError(
+              (cause) =>
+                new EffectAcpErrors.AcpSpawnError({
+                  command: options.spawn.command,
+                  cause,
+                }),
+            ),
+          );
+        // Keep spawn and fallback-finalizer registration in one uninterruptible acquisition. A
+        // pending cancellation cannot land after Effect's disabled release and before Synara owns
+        // the exact returned handle.
+        const processOwnership = yield* registerAcpProcessOwnership(child, runtimeScope, {
+          ...(options.teardownProcessTree
+            ? { teardownProcessTree: options.teardownProcessTree }
+            : {}),
+          ...(options.gracefulShutdownTimeout
+            ? { gracefulShutdownTimeout: options.gracefulShutdownTimeout }
+            : {}),
+        });
+        // Install the stable owner before leaving the same uninterruptible acquisition. The
+        // already-registered fallback remains authoritative if initial capture or hook validation
+        // throws, but cancellation can never land between spawn and the stronger owner handoff.
+        processOwnership.installSupervisor(() =>
+          process.platform === "win32" && options.processTreeKiller === undefined
+            ? superviseWindowsAcpJobProcess(child)
+            : superviseEffectProcessTree(child, {
+                ...(options.processTreeKiller
+                  ? { processTreeKiller: options.processTreeKiller }
+                  : {}),
+                ...(options.teardownProcessTree
+                  ? { teardownProcessTree: options.teardownProcessTree }
+                  : {}),
+                ...(process.platform === "win32"
+                  ? {}
+                  : { ownedProcessGroupId: Number(child.pid) }),
+              }),
+        );
+        return { child, processOwnership };
+      }),
+    );
 
     const acp = yield* makeOfficialSdkClient(child, runtimeScope, options.protocolLogging);
+    processOwnership.setCloseTransport(acp.closeTransport);
 
     const resolveConfigOptionUpdateWaiters = (
       configOptions: ReadonlyArray<EffectAcpSchema.SessionConfigOption>,
