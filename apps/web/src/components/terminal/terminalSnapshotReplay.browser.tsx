@@ -2402,7 +2402,8 @@ describe("recovered terminal snapshot replay in real xterm", () => {
         () =>
           entry.pendingHistoryReplayPromise === null &&
           acknowledgedBytes.reduce((total, bytes) => total + bytes, 0) ===
-            encoder.encode(expectedRetainedOutput).byteLength,
+            encoder.encode(expectedRetainedOutput).byteLength &&
+          bufferText(entry.terminal).includes("LIVE-DURING-FINAL-END"),
         "batched live output after final resize",
         10_000,
       );
