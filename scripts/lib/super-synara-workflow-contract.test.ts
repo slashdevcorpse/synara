@@ -133,8 +133,17 @@ describe("Super Synara workflow contracts", () => {
     expect(() =>
       verifySuperSynaraWorkflowText(
         main.replace(
-          "    env:\n      SYNARA_GENERATED_ROUTE_TREE: ${{ runner.temp }}/super-synara-preflight-route-tree/routeTree.gen.ts\n",
+          '\n      - name: Isolate generated route tree\n        shell: bash\n        run: |\n          set -euo pipefail\n          printf \'SYNARA_GENERATED_ROUTE_TREE=%s\\n\' "$RUNNER_TEMP/super-synara-preflight-route-tree/routeTree.gen.ts" >> "$GITHUB_ENV"\n',
           "",
+        ),
+        audit,
+      ),
+    ).toThrow("preflight must redirect route generation outside tracked source");
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          "$RUNNER_TEMP/super-synara-preflight-route-tree/routeTree.gen.ts",
+          "apps/web/src/routeTree.gen.ts",
         ),
         audit,
       ),

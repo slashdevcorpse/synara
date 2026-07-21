@@ -37,8 +37,6 @@ jobs:
     name: Validate immutable source and release policy
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    env:
-      SYNARA_GENERATED_ROUTE_TREE: ${{ runner.temp }}/super-synara-preflight-route-tree/routeTree.gen.ts
     outputs:
       version: ${{ steps.meta.outputs.version }}
       tag: ${{ steps.meta.outputs.tag }}
@@ -59,6 +57,12 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Isolate generated route tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'SYNARA_GENERATED_ROUTE_TREE=%s\n' "$RUNNER_TEMP/super-synara-preflight-route-tree/routeTree.gen.ts" >> "$GITHUB_ENV"
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
