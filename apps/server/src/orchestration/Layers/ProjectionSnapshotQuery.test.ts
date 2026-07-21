@@ -501,11 +501,12 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
       const detail = yield* snapshotQuery.getThreadDetailById(asThreadId("thread-1"));
       assert.equal(detail._tag, "Some");
       if (detail._tag === "Some") {
+        const turns = detail.value.turns ?? [];
         assert.deepEqual(
-          detail.value.turns.map((turn) => turn.turnId),
+          turns.map((turn) => turn.turnId),
           [asTurnId("turn-placeholder"), asTurnId("turn-1")],
         );
-        assert.deepEqual(detail.value.turns.at(-1)?.tokenUsage, {
+        assert.deepEqual(turns.at(-1)?.tokenUsage, {
           provider: "codex",
           inputTokens: 120,
           cachedInputTokens: 20,
@@ -671,7 +672,7 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
         assert.equal(detail._tag, "Some");
         if (detail._tag === "Some") {
           assert.deepEqual(
-            detail.value.turns.map((turn) => [turn.turnId, turn.toolNames]),
+            (detail.value.turns ?? []).map((turn) => [turn.turnId, turn.toolNames]),
             [
               [asTurnId("turn-target-1"), ["read_file"]],
               [asTurnId("turn-target-2"), ["write_file"]],
