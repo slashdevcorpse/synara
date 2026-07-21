@@ -12,6 +12,9 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   createDesktopSmokeEnvironment,
   createDesktopSmokeSpawnSpec,
+  DESKTOP_SMOKE_WINDOWS_JOB_STARTUP_MS,
+  DESKTOP_SMOKE_WINDOWS_SETTLEMENT_MS,
+  DESKTOP_SMOKE_WINDOWS_TEARDOWN_MS,
   resolveWindowsPowerShellPath,
   superviseDesktopSmokeProcess,
   WINDOWS_SMOKE_JOB_READY_PREFIX,
@@ -20,6 +23,13 @@ import {
 
 const scriptsDirectory = dirname(fileURLToPath(import.meta.url));
 const helperPath = resolve(scriptsDirectory, "smoke-test-windows-job.ps1");
+const WINDOWS_JOB_INTEGRATION_OBSERVATION_MS = 4_000;
+const WINDOWS_JOB_GRANDCHILD_STARTUP_WAIT_MS = DESKTOP_SMOKE_WINDOWS_JOB_STARTUP_MS + 5_000;
+const WINDOWS_JOB_INTEGRATION_TEST_TIMEOUT_MS =
+  DESKTOP_SMOKE_WINDOWS_JOB_STARTUP_MS +
+  DESKTOP_SMOKE_WINDOWS_TEARDOWN_MS +
+  DESKTOP_SMOKE_WINDOWS_SETTLEMENT_MS +
+  15_000;
 
 const fixtureSource = String.raw`
 import { appendFileSync } from "node:fs";
@@ -160,96 +170,113 @@ describe.skipIf(process.platform !== "win32")(
       return { child, runId };
     };
 
-    it("preserves a one-element argument array through Windows PowerShell 5.1", async () => {
-      const { child, runId } = startFixture();
-      const result = await superviseDesktopSmokeProcess({
-        child,
-        platform: "win32",
-        windowsJobRunId: runId,
-        observationMs: 250,
-      });
+    it(
+      "preserves a one-element argument array through Windows PowerShell 5.1",
+      async () => {
+        const { child, runId } = startFixture();
+        const result = await superviseDesktopSmokeProcess({
+          child,
+          platform: "win32",
+          windowsJobRunId: runId,
+          observationMs: WINDOWS_JOB_INTEGRATION_OBSERVATION_MS,
+        });
 
-      expect(result).toMatchObject({ ok: true, failures: [], teardownDiagnostics: [] });
-      expect(result.output).toContain("FIXTURE_ARGV:[]");
-    }, 20_000);
+        expect(result).toMatchObject({ ok: true, failures: [], teardownDiagnostics: [] });
+        expect(result.output).toContain("FIXTURE_ARGV:[]");
+      },
+      WINDOWS_JOB_INTEGRATION_TEST_TIMEOUT_MS,
+    );
 
-    it("preserves literal -- argv and contains root, child, grandchild, and TCP listener", async () => {
-      const pidFile = join(temporaryDirectory, "owned process ids.txt");
-      const port = await reservePort();
-      const targetArguments = [
-        "root",
-        pidFile,
-        String(port),
-        "--",
-        "literal value",
-        'quoted "value"',
-        "trailing space \\",
-      ];
-      const { child, runId } = startFixture(targetArguments);
-      const resultPromise = superviseDesktopSmokeProcess({
-        child,
-        platform: "win32",
-        windowsJobRunId: runId,
-        observationMs: 4_000,
-      });
+    it(
+      "preserves literal -- argv and contains root, child, grandchild, and TCP listener",
+      async () => {
+        const pidFile = join(temporaryDirectory, "owned process ids.txt");
+        const port = await reservePort();
+        const targetArguments = [
+          "root",
+          pidFile,
+          String(port),
+          "--",
+          "literal value",
+          'quoted "value"',
+          "trailing space \\",
+        ];
+        const { child, runId } = startFixture(targetArguments);
+        const resultPromise = superviseDesktopSmokeProcess({
+          child,
+          platform: "win32",
+          windowsJobRunId: runId,
+          observationMs: WINDOWS_JOB_INTEGRATION_OBSERVATION_MS,
+        });
 
-      await waitFor(async () => {
-        try {
-          return (await readFile(pidFile, "utf8")).includes("grandchild:");
-        } catch (error) {
-          if (error?.code === "ENOENT") return false;
-          throw error;
-        }
-      }, "the grandchild to start");
-      await waitFor(() => canConnect(port), "the grandchild listener");
+        await waitFor(
+          async () => {
+            try {
+              return (await readFile(pidFile, "utf8")).includes("grandchild:");
+            } catch (error) {
+              if (error?.code === "ENOENT") return false;
+              throw error;
+            }
+          },
+          "the grandchild to start",
+          WINDOWS_JOB_GRANDCHILD_STARTUP_WAIT_MS,
+        );
+        await waitFor(() => canConnect(port), "the grandchild listener");
 
-      const result = await resultPromise;
-      expect(result).toMatchObject({ ok: true, failures: [], teardownDiagnostics: [] });
-      expect(result.output).toContain(`FIXTURE_ARGV:${JSON.stringify(targetArguments)}`);
+        const result = await resultPromise;
+        expect(result).toMatchObject({ ok: true, failures: [], teardownDiagnostics: [] });
+        expect(result.output).toContain(`FIXTURE_ARGV:${JSON.stringify(targetArguments)}`);
 
-      const processIds = (await readFile(pidFile, "utf8"))
-        .trim()
-        .split(/\r?\n/)
-        .map((line) => Number(line.split(":")[1]));
-      expect(processIds).toHaveLength(3);
-      await waitFor(
-        () => processIds.every((pid) => !processExists(pid)),
-        "all Job-owned PIDs to exit",
-      );
-      await expect(canConnect(port)).resolves.toBe(false);
-    }, 25_000);
+        const processIds = (await readFile(pidFile, "utf8"))
+          .trim()
+          .split(/\r?\n/)
+          .map((line) => Number(line.split(":")[1]));
+        expect(processIds).toHaveLength(3);
+        await waitFor(
+          () => processIds.every((pid) => !processExists(pid)),
+          "all Job-owned PIDs to exit",
+        );
+        await expect(canConnect(port)).resolves.toBe(false);
+      },
+      WINDOWS_JOB_INTEGRATION_TEST_TIMEOUT_MS,
+    );
 
-    it("treats wrapper stdin EOF as a contained Job shutdown", async () => {
-      const pidFile = join(temporaryDirectory, "eof target pid.txt");
-      const { child, runId } = startFixture(["hold", pidFile, "0"]);
-      let output = "";
-      child.stdout.on("data", (chunk) => {
-        output += chunk.toString();
-      });
-      child.stderr.on("data", (chunk) => {
-        output += chunk.toString();
-      });
+    it(
+      "treats wrapper stdin EOF as a contained Job shutdown",
+      async () => {
+        const pidFile = join(temporaryDirectory, "eof target pid.txt");
+        const { child, runId } = startFixture(["hold", pidFile, "0"]);
+        let output = "";
+        child.stdout.on("data", (chunk) => {
+          output += chunk.toString();
+        });
+        child.stderr.on("data", (chunk) => {
+          output += chunk.toString();
+        });
 
-      await waitFor(
-        () => output.includes(WINDOWS_SMOKE_JOB_READY_PREFIX + runId),
-        "the wrapper ready marker",
-      );
-      await waitFor(async () => {
-        try {
-          return (await readFile(pidFile, "utf8")).includes("hold:");
-        } catch (error) {
-          if (error?.code === "ENOENT") return false;
-          throw error;
-        }
-      }, "the EOF target PID");
-      child.stdin.end();
-      const [code, signal] = await once(child, "close");
+        await waitFor(
+          () => output.includes(WINDOWS_SMOKE_JOB_READY_PREFIX + runId),
+          "the wrapper ready marker",
+          DESKTOP_SMOKE_WINDOWS_JOB_STARTUP_MS,
+        );
+        await waitFor(async () => {
+          try {
+            return (await readFile(pidFile, "utf8")).includes("hold:");
+          } catch (error) {
+            if (error?.code === "ENOENT") return false;
+            throw error;
+          }
+        }, "the EOF target PID");
+        child.stdin.end();
+        const [code, signal] = await once(child, "close");
 
-      expect({ code, signal }).toEqual({ code: 137, signal: null });
-      expect(output).not.toContain("SYNARA_SMOKE_JOB_ERROR");
-      const pid = Number((await readFile(pidFile, "utf8")).trim().split(":")[1]);
-      await waitFor(() => !processExists(pid), "the EOF target to be killed by Job teardown");
-    }, 20_000);
+        expect({ code, signal }).toEqual({ code: 137, signal: null });
+        expect(output).not.toContain("SYNARA_SMOKE_JOB_ERROR");
+        const pid = Number((await readFile(pidFile, "utf8")).trim().split(":")[1]);
+        await waitFor(() => !processExists(pid), "the EOF target to be killed by Job teardown");
+      },
+      WINDOWS_JOB_INTEGRATION_TEST_TIMEOUT_MS,
+    );
 
     it("rejects an existing drive-root-relative target before READY in the helper itself", async () => {
       await access(process.execPath);
