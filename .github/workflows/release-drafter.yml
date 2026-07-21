@@ -1,0 +1,190 @@
+name: Release Drafter
+
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: "23 14 * * 1"
+  workflow_dispatch:
+    inputs:
+      release_scope:
+        description: "Exact platform set to publish when changes exist"
+        required: true
+        default: windows-only
+        type: choice
+        options:
+          - windows-only
+          - windows-and-macos
+
+permissions:
+  contents: read
+
+concurrency:
+  group: super-synara-prerelease
+  queue: max
+  cancel-in-progress: false
+
+jobs:
+  draft:
+    name: Update exact unsigned prerelease draft
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: read
+    outputs:
+      source_sha: ${{ steps.source.outputs.source_sha }}
+      version: ${{ steps.plan.outputs.version }}
+      tag: ${{ steps.plan.outputs.tag }}
+      latest_tag: ${{ steps.plan.outputs.latest_tag }}
+      latest_tag_commit: ${{ steps.plan.outputs.latest_tag_commit }}
+      should_release: ${{ steps.changes.outputs.should_release }}
+      draft_id: ${{ steps.release_drafter.outputs.id }}
+    steps:
+      - id: source
+        name: Bind exact protected main source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUSH_SHA: ${{ github.event_name == 'push' && github.sha || '' }}
+        run: |
+          set -euo pipefail
+          main_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)"
+          [[ "$main_sha" =~ ^[0-9a-f]{40}$ ]]
+          if [[ -n "$PUSH_SHA" ]]; then
+            [[ "$PUSH_SHA" == "$main_sha" ]]
+          fi
+          echo "source_sha=$main_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout exact main source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ steps.source.outputs.source_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - id: plan
+        name: Resolve the one owned next draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ steps.source.outputs.source_sha }}
+        run: >-
+          node scripts/plan-super-synara-release-drafter.ts
+          --repository "$GITHUB_REPOSITORY"
+          --source-commit "$SOURCE_SHA"
+          --github-output "$GITHUB_OUTPUT"
+
+      - id: changes
+        name: Gate scheduled release work on new commits
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ steps.source.outputs.source_sha }}
+          LATEST_TAG: ${{ steps.plan.outputs.latest_tag }}
+          LATEST_TAG_COMMIT: ${{ steps.plan.outputs.latest_tag_commit }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$LATEST_TAG_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$(git rev-parse "$LATEST_TAG^{commit}")" == "$LATEST_TAG_COMMIT" ]]
+          git merge-base --is-ancestor "$LATEST_TAG_COMMIT" "$SOURCE_SHA"
+          commit_count="$(git rev-list --count "$LATEST_TAG_COMMIT..$SOURCE_SHA")"
+          [[ "$commit_count" =~ ^[0-9]+$ ]]
+          if [[ "$commit_count" == "0" ]]; then
+            echo "No commits exist after $LATEST_TAG; no draft will be created or updated."
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "$commit_count commits exist after $LATEST_TAG."
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Authorize manual release controller before mutation
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          ACTOR: ${{ github.actor }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          [[ "$ACTOR" == "$OWNER" ]]
+          [[ "$TRIGGERING_ACTOR" == "$OWNER" ]]
+
+      - name: Authorize workflow rerun before mutation
+        if: github.run_attempt > 1
+        shell: bash
+        env:
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          [[ "$TRIGGERING_ACTOR" == "$OWNER" ]]
+
+      - id: release_drafter
+        name: Release Drafter
+        if: steps.changes.outputs.should_release == 'true'
+        uses: release-drafter/release-drafter@eada3c96a64734dd381cfbda23511034e328ddb0 # v7.6.0
+        with:
+          token: ${{ github.token }}
+          config-name: release-drafter.yml
+          name: Unofficial downstream Super Synara ${{ steps.plan.outputs.version }} (unsigned prerelease)
+          tag: ${{ steps.plan.outputs.tag }}
+          version: ${{ steps.plan.outputs.version }}
+          publish: false
+          prerelease: true
+          latest: false
+          commitish: ${{ steps.source.outputs.source_sha }}
+
+      - name: Admit only the planned Release Drafter draft
+        if: steps.changes.outputs.should_release == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ steps.source.outputs.source_sha }}
+          TAG: ${{ steps.plan.outputs.tag }}
+          EXISTING_DRAFT_ID: ${{ steps.plan.outputs.existing_draft_id }}
+          DRAFT_ID: ${{ steps.release_drafter.outputs.id }}
+          VALIDATION_ACTOR: ${{ github.run_attempt > 1 && github.triggering_actor || (github.event_name == 'workflow_dispatch' && github.actor || 'github-actions[bot]') }}
+          VALIDATION_TRIGGERING_ACTOR: ${{ github.run_attempt > 1 && github.triggering_actor || (github.event_name == 'workflow_dispatch' && github.triggering_actor || 'github-actions[bot]') }}
+        run: |
+          set -euo pipefail
+          [[ "$DRAFT_ID" =~ ^[1-9][0-9]*$ ]]
+          if [[ -n "$EXISTING_DRAFT_ID" ]]; then
+            [[ "$DRAFT_ID" == "$EXISTING_DRAFT_ID" ]]
+          fi
+          node scripts/verify-super-synara-github-state.ts \
+            --phase preflight \
+            --repository "$GITHUB_REPOSITORY" \
+            --ref-name main \
+            --actor "$VALIDATION_ACTOR" \
+            --triggering-actor "$VALIDATION_TRIGGERING_ACTOR" \
+            --owner "$GITHUB_REPOSITORY_OWNER" \
+            --tag "$TAG" \
+            --source-commit "$SOURCE_SHA" \
+            --current-run-draft-id "$DRAFT_ID"
+
+      - name: Reject a raced main update
+        if: steps.changes.outputs.should_release == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ steps.source.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          current_main_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)"
+          [[ "$current_main_sha" == "$SOURCE_SHA" ]]
+
+  dispatch:
+    name: Dispatch weekly exact-artifact prerelease
+    if: ${{ github.event_name != 'push' && needs.draft.outputs.should_release == 'true' }}
+    needs: draft
+    uses: ./.github/workflows/super-synara-prerelease.yml
+    permissions:
+      contents: write
+    with:
+      version: ${{ needs.draft.outputs.version }}
+      tag: ${{ needs.draft.outputs.tag }}
+      release_scope: ${{ github.event_name == 'workflow_dispatch' && inputs.release_scope || 'windows-only' }}
+      expected_source_sha: ${{ needs.draft.outputs.source_sha }}
+      release_draft_id: ${{ needs.draft.outputs.draft_id }}
+      confirm_unsigned: true

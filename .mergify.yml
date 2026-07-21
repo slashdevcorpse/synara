@@ -1,0 +1,23 @@
+merge_queue:
+  mode: serial
+
+merge_protections_settings:
+  auto_merge_conditions:
+    - label = ready-to-merge
+
+merge_protections:
+  - name: protected-main
+    if:
+      - base = main
+    success_conditions:
+      - -draft
+      - -conflict
+
+queue_rules:
+  - name: default
+    batch_size: 1
+    # The active strict main ruleset is the single source of truth for required checks.
+    branch_protection_injection_mode: queue
+    merge_method: squash
+    queue_conditions:
+      - base = main
