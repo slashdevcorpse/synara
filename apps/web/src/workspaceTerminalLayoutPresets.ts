@@ -232,6 +232,6 @@ export function createWorkspaceTerminalGroupFromPreset(input: {
       terminalIds: normalizedTerminalIds,
       activeTerminalId: resolvedActiveTerminalId,
     }),
-    ...normalizeTerminalGroupMetadata(input.metadata),
+    ...normalizeTerminalGroupMetadata(input.metadata ?? {}),
   };
 }

@@ -7,6 +7,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { Thread } from "../../types";
 import type { AgentThreadEntry } from "../../hooks/useWorkspaceAgentActivity";
+import { IDLE_AGENT_ACTIVITY_STATE } from "../../lib/agentActivity";
 import {
   dispatchWorkspaceAgentInterrupt,
   dispatchWorkspaceAgentInterruptBatch,
@@ -76,6 +77,7 @@ function makeEntry(threadId: ThreadId = THREAD_A): AgentThreadEntry {
     effortLabel: "high",
     providerKind: "codex",
     status: "thinking",
+    activityState: { ...IDLE_AGENT_ACTIVITY_STATE, phase: "thinking" },
     duration: 1_000,
     latestTool: null,
     streamPreview: null,

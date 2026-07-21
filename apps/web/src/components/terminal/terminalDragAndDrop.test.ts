@@ -13,7 +13,7 @@ describe("terminal drag payloads", () => {
       effectAllowed: "none",
       getData: (type: string) => values.get(type) ?? "",
       setData: (type: string, value: string) => values.set(type, value),
-    } as DataTransfer;
+    } as unknown as DataTransfer;
 
     writeTerminalDragPayload(dataTransfer, {
       kind: "terminals",

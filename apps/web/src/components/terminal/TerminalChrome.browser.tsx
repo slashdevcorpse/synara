@@ -23,6 +23,84 @@ function resolvedGroup(
 describe("TerminalWorkspaceTabBar", () => {
   afterEach(() => {
     document.body.innerHTML = "";
+    vi.restoreAllMocks();
+  });
+
+  it("renames the exact desktop terminal group through the shared dialog", async () => {
+    await page.viewport(1_200, 800);
+    const onRenameGroup = vi.fn();
+    const promptSpy = vi.spyOn(window, "prompt").mockReturnValue(null);
+    await render(
+      <TerminalWorkspaceTabBar
+        terminalGroups={[
+          resolvedGroup("development", "dev", { name: "Development", role: "app" }),
+          resolvedGroup("verification", "verify", { name: "Verification", role: "verify" }),
+        ]}
+        activeGroupId="development"
+        terminalVisualIdentityById={new Map()}
+        actions={[]}
+        onActiveGroupChange={vi.fn()}
+        onRenameGroup={onRenameGroup}
+        onCloseGroup={vi.fn()}
+      />,
+    );
+
+    await page.getByRole("button", { name: "Manage Verification" }).click();
+    await page.getByRole("menuitem", { name: "Rename…" }).click();
+
+    await expect.element(page.getByRole("dialog", { name: "Rename terminal group" })).toBeVisible();
+    const input = page.getByRole("textbox");
+    await expect.element(input).toHaveValue("Verification");
+    await input.fill("  Build verification  ");
+    await page.getByRole("button", { name: "Rename", exact: true }).click();
+    await vi.waitFor(() =>
+      expect(document.querySelector('[data-slot="dialog-viewport"]')).toBeNull(),
+    );
+
+    expect(onRenameGroup).toHaveBeenCalledExactlyOnceWith("verification", "Build verification");
+    expect(promptSpy).not.toHaveBeenCalled();
+  });
+
+  it("provides the same confirm, cancel, and empty-name behavior on narrow screens", async () => {
+    await page.viewport(390, 800);
+    const onRenameGroup = vi.fn();
+    const promptSpy = vi.spyOn(window, "prompt").mockReturnValue(null);
+    await render(
+      <TerminalWorkspaceTabBar
+        terminalGroups={[resolvedGroup("development", "dev", { name: "Development" })]}
+        activeGroupId="development"
+        terminalVisualIdentityById={new Map()}
+        actions={[]}
+        onActiveGroupChange={vi.fn()}
+        onRenameGroup={onRenameGroup}
+        onCloseGroup={vi.fn()}
+      />,
+    );
+
+    await page.getByRole("button", { name: "Manage Development" }).click();
+    await page.getByRole("menuitem", { name: "Rename…" }).click();
+    await expect.element(page.getByRole("textbox")).toHaveValue("Development");
+    await page.getByRole("textbox").fill("Draft name");
+    document
+      .querySelector<HTMLInputElement>('[role="dialog"] input')
+      ?.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "Escape" }));
+    await vi.waitFor(() =>
+      expect(document.querySelector('[data-slot="dialog-viewport"]')).toBeNull(),
+    );
+    expect(onRenameGroup).not.toHaveBeenCalled();
+
+    await page.getByRole("button", { name: "Manage Development" }).click();
+    await page.getByRole("menuitem", { name: "Rename…" }).click();
+    await page.getByRole("textbox").fill("   ");
+    await expect.element(page.getByRole("button", { name: "Rename", exact: true })).toBeDisabled();
+    await page.getByRole("textbox").fill("  Mobile development  ");
+    await page.getByRole("button", { name: "Rename", exact: true }).click();
+    await vi.waitFor(() =>
+      expect(document.querySelector('[data-slot="dialog-viewport"]')).toBeNull(),
+    );
+
+    expect(onRenameGroup).toHaveBeenCalledExactlyOnceWith("development", "Mobile development");
+    expect(promptSpy).not.toHaveBeenCalled();
   });
 
   it("exposes semantic status, direct archive, and archived restore controls", async () => {

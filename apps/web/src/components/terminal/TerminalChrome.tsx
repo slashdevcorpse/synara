@@ -8,7 +8,7 @@
 // rather than generic action buttons, so they live outside the shadcn Button
 // taxonomy. When/if we introduce a shared Tabs primitive, these can migrate.
 
-import { Fragment } from "react";
+import { Fragment, useState } from "react";
 import type { DragEvent, KeyboardEvent, ReactNode } from "react";
 
 import type { ResolvedTerminalVisualIdentity } from "@synara/shared/terminalThreads";
@@ -17,6 +17,7 @@ import { IconButton } from "~/components/ui/icon-button";
 import { Button } from "~/components/ui/button";
 import { DisclosureRegion } from "~/components/ui/DisclosureRegion";
 import { ComposerPickerMenuPopup } from "~/components/chat/ComposerPickerMenuPopup";
+import { RenameDialog } from "~/components/RenameDialog";
 import {
   Menu,
   MenuCheckboxItem,
@@ -126,6 +127,10 @@ export function TerminalWorkspaceTabBar(props: {
   onShowArchivedChange?: ((show: boolean) => void) | undefined;
   onCloseGroup: (groupId: string) => void;
 }) {
+  const [renameTarget, setRenameTarget] = useState<{
+    groupId: string;
+    name: string;
+  } | null>(null);
   const archivedGroups = props.archivedTerminalGroups ?? [];
   const selectedTerminalIds = props.selectedTerminalIds ?? [];
   const runningTerminalIdSet = new Set(props.runningTerminalIds ?? []);
@@ -290,8 +295,10 @@ export function TerminalWorkspaceTabBar(props: {
               <MenuSeparator />
               <MenuItem
                 onClick={() => {
-                  const nextName = window.prompt("Rename terminal group", narrowActiveGroup.name);
-                  if (nextName?.trim()) props.onRenameGroup?.(narrowActiveGroup.id, nextName);
+                  setRenameTarget({
+                    groupId: narrowActiveGroup.id,
+                    name: narrowActiveGroup.name,
+                  });
                 }}
               >
                 <PencilIcon />
@@ -440,11 +447,10 @@ export function TerminalWorkspaceTabBar(props: {
                       <MenuSeparator />
                       <MenuItem
                         onClick={() => {
-                          const nextName = window.prompt(
-                            "Rename terminal group",
-                            terminalGroup.name,
-                          );
-                          if (nextName?.trim()) props.onRenameGroup?.(terminalGroup.id, nextName);
+                          setRenameTarget({
+                            groupId: terminalGroup.id,
+                            name: terminalGroup.name,
+                          });
                         }}
                       >
                         <PencilIcon />
@@ -507,6 +513,20 @@ export function TerminalWorkspaceTabBar(props: {
           <TerminalChromeActions actions={props.actions} variant="workspace" />
         </div>
       </div>
+      <RenameDialog
+        open={renameTarget !== null}
+        title="Rename terminal group"
+        description="Choose a short, recognizable group name."
+        initialValue={renameTarget?.name ?? ""}
+        saveLabel="Rename"
+        onOpenChange={(open) => {
+          if (!open) setRenameTarget(null);
+        }}
+        onSave={(nextName) => {
+          if (!renameTarget) return;
+          props.onRenameGroup?.(renameTarget.groupId, nextName);
+        }}
+      />
       <DisclosureRegion open={props.showArchived === true && archivedGroups.length > 0}>
         <div
           className="flex flex-wrap gap-1 border-t border-border/50 px-2 py-1.5"

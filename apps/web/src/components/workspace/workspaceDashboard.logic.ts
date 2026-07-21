@@ -151,7 +151,7 @@ function deriveAutomation(run: WorkspaceAutomationRun): WorkspaceAutomationActiv
   };
 }
 
-const AGENT_ACTIVITY_PRIORITY = {
+const AGENT_ACTIVITY_PRIORITY: Partial<Record<AgentActivityState["phase"] | "queued", number>> = {
   "tool-running": 5,
   streaming: 4,
   thinking: 3,
@@ -220,7 +220,7 @@ function deriveActivity(
         colorClass: presentation.textClassName,
         dotClass: presentation.dotClassName,
         pulse: isLiveAgentActivityPhase(activity.phase),
-        priority: AGENT_ACTIVITY_PRIORITY[agentStatus],
+        priority: AGENT_ACTIVITY_PRIORITY[agentStatus] ?? 0,
         updatedAtMs: timestampMs(threadTimestamp(thread)),
       },
     ];

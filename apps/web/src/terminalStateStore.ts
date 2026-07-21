@@ -560,6 +560,7 @@ export function normalizeThreadTerminalState(
       : group,
   );
 
+  const terminalHeight = state.terminalHeight;
   const normalized: ThreadTerminalState = {
     entryPoint: state.entryPoint === "terminal" ? "terminal" : "chat",
     terminalOpen: state.terminalOpen === true,
@@ -567,8 +568,8 @@ export function normalizeThreadTerminalState(
     workspaceLayout: state.workspaceLayout === "terminal-only" ? "terminal-only" : "both",
     workspaceActiveTab: state.workspaceActiveTab === "chat" ? "chat" : "terminal",
     terminalHeight:
-      Number.isFinite(state.terminalHeight) && state.terminalHeight > 0
-        ? state.terminalHeight
+      typeof terminalHeight === "number" && Number.isFinite(terminalHeight) && terminalHeight > 0
+        ? terminalHeight
         : DEFAULT_THREAD_TERMINAL_HEIGHT,
     terminalIds: nextTerminalIds,
     terminalLabelsById: ensuredTerminalLabelsById,
@@ -1492,6 +1493,7 @@ function moveThreadTerminals(
     );
     nextTargetGroupId = targetGroup.id;
   } else {
+    if (target.kind !== "new-group") return normalized;
     const firstMovedTerminalId = requestedTerminalIds[0];
     if (!firstMovedTerminalId) return normalized;
     const usedGroupIds = new Set(groupsAfterRemoval.map((group) => group.id));

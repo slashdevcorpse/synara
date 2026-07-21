@@ -2667,7 +2667,7 @@ export default function ChatView({
     hasPendingApproval: activePendingApproval !== null,
     hasPendingUserInput: activePendingUserInput !== null,
     threadError: activeThread?.error ?? null,
-    subagentStates: childAgentActivityStates,
+    ...(childAgentActivityStates ? { subagentStates: childAgentActivityStates } : {}),
   });
   const activeWorktreeSetup = localDispatch?.worktreeSetup ?? null;
   const isPreparingWorktree = activeWorktreeSetup !== null;

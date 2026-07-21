@@ -127,7 +127,10 @@ export function normalizeTerminalGroupMetadata(
     group.name?.trim() || options.fallbackName?.trim() || `Terminal ${fallbackIndex + 1}`;
   const role = isRole(group.role)
     ? group.role
-    : inferTerminalGroupRole({ cliKinds: options.cliKinds, token });
+    : inferTerminalGroupRole({
+        token,
+        ...(options.cliKinds !== undefined ? { cliKinds: options.cliKinds } : {}),
+      });
   const presentation = terminalGroupPresentation(role);
   const createdAt = finiteTimestamp(group.createdAt, LEGACY_TERMINAL_GROUP_TIMESTAMP);
   const updatedAt = finiteTimestamp(group.updatedAt, createdAt);

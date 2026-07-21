@@ -126,9 +126,15 @@ describe("gitActionActivityStore", () => {
   });
 
   it("keeps projecting terminal events through the global subscription lifecycle", () => {
-    let listener: ((event: GitActionProgressEvent) => void) | null = null;
-    let transportListener: ((state: "connecting" | "open" | "closed") => void) | null = null;
-    let welcomeListener: (() => void) | null = null;
+    let listener: (event: GitActionProgressEvent) => void = () => {
+      throw new Error("Progress listener was not registered");
+    };
+    let transportListener: (state: "connecting" | "open" | "closed") => void = () => {
+      throw new Error("Transport listener was not registered");
+    };
+    let welcomeListener: () => void = () => {
+      throw new Error("Welcome listener was not registered");
+    };
     const unsubscribeProgress = vi.fn();
     const unsubscribeTransport = vi.fn();
     const unsubscribeWelcome = vi.fn();
@@ -149,21 +155,21 @@ describe("gitActionActivityStore", () => {
       },
     });
 
-    listener?.(started("action-a"));
+    listener(started("action-a"));
     expect(useGitActionActivityStore.getState().activeActionIdsByCwd.get(CWD)).toEqual(
       new Set(["action-a"]),
     );
 
     // The root subscription remains mounted while route-local controls can unmount.
-    listener?.(finished("action-a"));
+    listener(finished("action-a"));
     expect(useGitActionActivityStore.getState().activeActionIdsByCwd.has(CWD)).toBe(false);
 
-    listener?.(started("action-interrupted"));
-    transportListener?.("connecting");
+    listener(started("action-interrupted"));
+    transportListener("connecting");
     expect(useGitActionActivityStore.getState().activeActionIdsByCwd.size).toBe(0);
 
-    listener?.(started("action-before-welcome"));
-    welcomeListener?.();
+    listener(started("action-before-welcome"));
+    welcomeListener();
     expect(useGitActionActivityStore.getState().activeActionIdsByCwd.size).toBe(0);
 
     stopProjection();

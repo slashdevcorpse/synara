@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { render } from "vitest-browser-react";
 
 import type { TimelineEntry } from "../../session-logic";
-import type { AgentActivityState } from "./agentActivityPulse.logic";
+import { IDLE_AGENT_ACTIVITY_STATE, type AgentActivityState } from "./agentActivityPulse.logic";
 import { ChatTranscriptPane } from "./ChatTranscriptPane";
 
 const NOOP = () => {};
@@ -31,6 +31,7 @@ const TIMELINE_ENTRIES = Array.from(
 
 function state(phase: AgentActivityState["phase"]): AgentActivityState {
   return {
+    ...IDLE_AGENT_ACTIVITY_STATE,
     phase,
     toolCount: phase === "tool-running" ? 1 : 0,
     subagentCount: 0,
