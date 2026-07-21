@@ -44,6 +44,7 @@
     "downstream:validate": "node scripts/validate-downstream-state.ts",
     "workflows:validate": "node scripts/verify-workflow-contracts.ts",
     "test:desktop-smoke": "turbo run smoke-test --filter=@synara/desktop",
+    "test:desktop-persistence-smoke": "turbo run persistence-smoke-test --filter=@synara/desktop",
     "fmt": "oxfmt",
     "fmt:check": "oxfmt --check",
     "build:contracts": "turbo run build --filter=@synara/contracts",

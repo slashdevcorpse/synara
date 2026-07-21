@@ -145,6 +145,15 @@ export interface ProviderServiceShape {
   }) => Effect.Effect<void, ProviderServiceError>;
 
   /**
+   * Stop an adapter runtime only when the provider service can atomically prove
+   * that no foreground dispatch or provider-native background task owns it.
+   * A busy or inconsistent runtime is preserved as a successful no-op.
+   */
+  readonly stopRuntimeSessionIfIdle?: (input: {
+    readonly threadId: ThreadId;
+  }) => Effect.Effect<void, ProviderServiceError>;
+
+  /**
    * Whether provider-native background tasks are currently keeping the
    * thread's runtime alive. Restart-oriented recovery paths must check this
    * before stopRuntimeSession: killing the shared subprocess silently

@@ -49,6 +49,51 @@ const policy = (): WorkflowPolicy => ({
 });
 
 const disabledWorkflow = `name: Disabled\non: workflow_dispatch\njobs:\n  noop:\n    runs-on: ubuntu-24.04\n    steps:\n      - uses: ${pinnedCheckout}\n`;
+const windowsPersistenceHome = "${{ runner.temp }}\\super-synara-persistence-windows-home";
+const windowsStartupHome = "${{ runner.temp }}\\super-synara-ci-home";
+const macosPersistenceHome = "${{ runner.temp }}/super-synara-persistence-macos-home";
+const macosStartupHome = "${{ runner.temp }}/super-synara-ci-home";
+const nativeDesktopBuildStep = [
+  "      - env:",
+  "          SYNARA_DESKTOP_FLAVOR: super",
+  "        run: bun run build:desktop",
+].join("\n");
+const windowsPersistenceSmokeStep = [
+  "      - name: Verify two-launch desktop persistence",
+  "        timeout-minutes: 5",
+  "        env:",
+  '          SYNARA_DESKTOP_DISABLE_UPDATES: "1"',
+  "          SYNARA_DESKTOP_FLAVOR: super",
+  `          SYNARA_HOME: ${windowsPersistenceHome}`,
+  "        run: bun run test:desktop-persistence-smoke",
+].join("\n");
+const windowsStartupSmokeStep = [
+  "      - name: Smoke unpacked desktop in isolated state",
+  "        env:",
+  '          SYNARA_DESKTOP_DISABLE_UPDATES: "1"',
+  "          SYNARA_DESKTOP_FLAVOR: super",
+  `          SYNARA_HOME: ${windowsStartupHome}`,
+  '          SYNARA_PORT_OFFSET: "2710"',
+  "        run: bun run --cwd apps/desktop smoke-test",
+].join("\n");
+const macosPersistenceSmokeStep = [
+  "      - name: Verify two-launch desktop persistence",
+  "        timeout-minutes: 5",
+  "        env:",
+  '          SYNARA_DESKTOP_DISABLE_UPDATES: "1"',
+  "          SYNARA_DESKTOP_FLAVOR: super",
+  `          SYNARA_HOME: ${macosPersistenceHome}`,
+  "        run: bun run test:desktop-persistence-smoke",
+].join("\n");
+const macosStartupSmokeStep = [
+  "      - name: Smoke unpacked desktop in isolated state",
+  "        env:",
+  '          SYNARA_DESKTOP_DISABLE_UPDATES: "1"',
+  "          SYNARA_DESKTOP_FLAVOR: super",
+  `          SYNARA_HOME: ${macosStartupHome}`,
+  '          SYNARA_PORT_OFFSET: "2810"',
+  "        run: bun run test:desktop-smoke",
+].join("\n");
 const ciWorkflow = `name: CI
 on:
   pull_request:
@@ -75,8 +120,9 @@ jobs:
       - run: bun run --cwd apps/desktop test src/desktopMigrationRecovery.test.ts src/desktopStorageMigration.test.ts src/windowState.test.ts src/updateState.test.ts
       - run: bun run --cwd scripts test check-brand-identity.test.ts verify-packaged-desktop-startup.test.ts lib/desktop-artifact-policy.test.ts lib/windows-authenticode.test.ts lib/windows-installer-qualification.test.ts lib/release-artifact-provenance.test.ts lib/super-synara-release-admission.test.ts lib/super-synara-workflow-contract.test.ts
       - run: node scripts/verify-workflow-contracts.ts
-      - run: bun run build:desktop
-      - run: bun run --cwd apps/desktop smoke-test
+${nativeDesktopBuildStep}
+${windowsPersistenceSmokeStep}
+${windowsStartupSmokeStep}
   macos_arm64:
     runs-on: macos-15
     steps:
@@ -84,7 +130,9 @@ jobs:
       - run: bun run brand:check
       - run: node scripts/node-pty-smoke.mjs
       - run: bun run --cwd apps/desktop test
-      - run: bun run build:desktop
+${nativeDesktopBuildStep}
+${macosPersistenceSmokeStep}
+${macosStartupSmokeStep}
   release_smoke:
     runs-on: ubuntu-24.04
     steps:
@@ -269,10 +317,7 @@ describe("workflow contracts", () => {
       ".github/workflows/ci.yml",
       ciWorkflow
         .replace(gate, "")
-        .replace(
-          "      - run: bun run build:desktop\n",
-          `      - run: bun run build:desktop\n${gate}`,
-        ),
+        .replace(`${nativeDesktopBuildStep}\n`, `${nativeDesktopBuildStep}\n${gate}`),
     );
     expect(validateWorkflowContracts(reorderedGate, policy()).join("\n")).toContain(
       "native gate must run before the desktop build",
@@ -303,8 +348,11 @@ describe("workflow contracts", () => {
     nonFailingBuild.set(
       ".github/workflows/ci.yml",
       ciWorkflow.replace(
-        "      - run: bun run build:desktop\n",
-        "      - run: bun run build:desktop\n        continue-on-error: true\n",
+        nativeDesktopBuildStep,
+        nativeDesktopBuildStep.replace(
+          "        run: bun run build:desktop",
+          "        continue-on-error: true\n        run: bun run build:desktop",
+        ),
       ),
     );
     expect(validateWorkflowContracts(nonFailingBuild, policy()).join("\n")).toContain(
@@ -317,8 +365,11 @@ describe("workflow contracts", () => {
     wrapperSmoke.set(
       ".github/workflows/ci.yml",
       ciWorkflow.replace(
-        "      - run: bun run --cwd apps/desktop smoke-test\n",
-        "      - run: bun run test:desktop-smoke\n",
+        windowsStartupSmokeStep,
+        windowsStartupSmokeStep.replace(
+          "        run: bun run --cwd apps/desktop smoke-test",
+          "        run: bun run test:desktop-smoke",
+        ),
       ),
     );
     const wrapperErrors = validateWorkflowContracts(wrapperSmoke, policy()).join("\n");
@@ -335,8 +386,8 @@ describe("workflow contracts", () => {
       wrapperFiles.set(
         ".github/workflows/ci.yml",
         ciWorkflow.replace(
-          "      - run: bun run --cwd apps/desktop smoke-test\n",
-          `      - run: bun run --cwd apps/desktop smoke-test\n      - run: ${equivalentWrapper}\n`,
+          windowsStartupSmokeStep,
+          `${windowsStartupSmokeStep}\n      - run: ${equivalentWrapper}`,
         ),
       );
       expect(validateWorkflowContracts(wrapperFiles, policy()).join("\n")).toContain(
@@ -348,8 +399,8 @@ describe("workflow contracts", () => {
     distinctScript.set(
       ".github/workflows/ci.yml",
       ciWorkflow.replace(
-        "      - run: bun run --cwd apps/desktop smoke-test\n",
-        "      - run: bun run --cwd apps/desktop smoke-test\n      - run: bun run test:desktop-smoke-helper\n",
+        windowsStartupSmokeStep,
+        `${windowsStartupSmokeStep}\n      - run: bun run test:desktop-smoke-helper`,
       ),
     );
     expect(validateWorkflowContracts(distinctScript, policy()).join("\n")).not.toContain(
@@ -360,10 +411,10 @@ describe("workflow contracts", () => {
     earlySmoke.set(
       ".github/workflows/ci.yml",
       ciWorkflow
-        .replace("      - run: bun run --cwd apps/desktop smoke-test\n", "")
+        .replace(`${windowsStartupSmokeStep}\n`, "")
         .replace(
-          "      - run: bun run build:desktop\n",
-          "      - run: bun run --cwd apps/desktop smoke-test\n      - run: bun run build:desktop\n",
+          `${nativeDesktopBuildStep}\n`,
+          `${windowsStartupSmokeStep}\n${nativeDesktopBuildStep}\n`,
         ),
     );
     expect(validateWorkflowContracts(earlySmoke, policy()).join("\n")).toContain(
@@ -374,12 +425,157 @@ describe("workflow contracts", () => {
     nonFailingSmoke.set(
       ".github/workflows/ci.yml",
       ciWorkflow.replace(
-        "      - run: bun run --cwd apps/desktop smoke-test\n",
-        "      - run: bun run --cwd apps/desktop smoke-test\n        continue-on-error: true\n",
+        windowsStartupSmokeStep,
+        windowsStartupSmokeStep.replace(
+          "        run: bun run --cwd apps/desktop smoke-test",
+          "        continue-on-error: true\n        run: bun run --cwd apps/desktop smoke-test",
+        ),
       ),
     );
     expect(validateWorkflowContracts(nonFailingSmoke, policy()).join("\n")).toContain(
       "post-build smoke must be unconditional and fail closed",
+    );
+  });
+
+  it("requires exactly one desktop persistence smoke in each native job", () => {
+    const missingSmoke = validFiles();
+    missingSmoke.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace(`${windowsPersistenceSmokeStep}\n`, ""),
+    );
+    expect(validateWorkflowContracts(missingSmoke, policy()).join("\n")).toContain(
+      "windows_x64 must run exactly one post-build desktop persistence smoke command",
+    );
+
+    const duplicateSmoke = validFiles();
+    duplicateSmoke.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace(
+        macosPersistenceSmokeStep,
+        `${macosPersistenceSmokeStep}\n${macosPersistenceSmokeStep}`,
+      ),
+    );
+    expect(validateWorkflowContracts(duplicateSmoke, policy()).join("\n")).toContain(
+      "macos_arm64 must run exactly one post-build desktop persistence smoke command",
+    );
+  });
+
+  it("requires the desktop persistence smoke to run after the native build", () => {
+    const preBuildSmoke = validFiles();
+    preBuildSmoke.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace(
+        `${nativeDesktopBuildStep}\n${windowsPersistenceSmokeStep}`,
+        `${windowsPersistenceSmokeStep}\n${nativeDesktopBuildStep}`,
+      ),
+    );
+    expect(validateWorkflowContracts(preBuildSmoke, policy()).join("\n")).toContain(
+      "windows_x64 desktop persistence smoke must run after the build",
+    );
+  });
+
+  it("requires desktop persistence smoke steps to be unconditional and fail closed", () => {
+    const conditionalSmoke = validFiles();
+    conditionalSmoke.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace(
+        windowsPersistenceSmokeStep,
+        windowsPersistenceSmokeStep.replace(
+          "        timeout-minutes: 5",
+          "        if: false\n        timeout-minutes: 5",
+        ),
+      ),
+    );
+    expect(validateWorkflowContracts(conditionalSmoke, policy()).join("\n")).toContain(
+      "windows_x64 desktop persistence smoke must be unconditional and fail closed",
+    );
+
+    const nonFailingSmoke = validFiles();
+    nonFailingSmoke.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace(
+        macosPersistenceSmokeStep,
+        macosPersistenceSmokeStep.replace(
+          "        timeout-minutes: 5",
+          "        continue-on-error: true\n        timeout-minutes: 5",
+        ),
+      ),
+    );
+    expect(validateWorkflowContracts(nonFailingSmoke, policy()).join("\n")).toContain(
+      "macos_arm64 desktop persistence smoke must be unconditional and fail closed",
+    );
+  });
+
+  it("requires Super flavor and updates disabled for desktop persistence smoke", () => {
+    const wrongBuildFlavor = validFiles();
+    wrongBuildFlavor.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace(
+        nativeDesktopBuildStep,
+        nativeDesktopBuildStep.replace(
+          "          SYNARA_DESKTOP_FLAVOR: super",
+          "          SYNARA_DESKTOP_FLAVOR: production",
+        ),
+      ),
+    );
+    expect(validateWorkflowContracts(wrongBuildFlavor, policy()).join("\n")).toContain(
+      "windows_x64 desktop build must set SYNARA_DESKTOP_FLAVOR to super",
+    );
+
+    const wrongFlavor = validFiles();
+    wrongFlavor.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace(
+        windowsPersistenceSmokeStep,
+        windowsPersistenceSmokeStep.replace(
+          "          SYNARA_DESKTOP_FLAVOR: super",
+          "          SYNARA_DESKTOP_FLAVOR: production",
+        ),
+      ),
+    );
+    expect(validateWorkflowContracts(wrongFlavor, policy()).join("\n")).toContain(
+      "windows_x64 desktop persistence smoke must set SYNARA_DESKTOP_FLAVOR to super",
+    );
+
+    const updatesEnabled = validFiles();
+    updatesEnabled.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace(
+        macosPersistenceSmokeStep,
+        macosPersistenceSmokeStep.replace(
+          '          SYNARA_DESKTOP_DISABLE_UPDATES: "1"',
+          '          SYNARA_DESKTOP_DISABLE_UPDATES: "0"',
+        ),
+      ),
+    );
+    expect(validateWorkflowContracts(updatesEnabled, policy()).join("\n")).toContain(
+      'macos_arm64 desktop persistence smoke must set SYNARA_DESKTOP_DISABLE_UPDATES to "1"',
+    );
+  });
+
+  it("requires a bounded persistence timeout and an isolated home", () => {
+    const unboundedSmoke = validFiles();
+    unboundedSmoke.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace(
+        windowsPersistenceSmokeStep,
+        windowsPersistenceSmokeStep.replace("        timeout-minutes: 5\n", ""),
+      ),
+    );
+    expect(validateWorkflowContracts(unboundedSmoke, policy()).join("\n")).toContain(
+      "windows_x64 desktop persistence smoke timeout-minutes must equal 5",
+    );
+
+    const sharedHome = validFiles();
+    sharedHome.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace(
+        windowsPersistenceSmokeStep,
+        windowsPersistenceSmokeStep.replace(windowsPersistenceHome, windowsStartupHome),
+      ),
+    );
+    expect(validateWorkflowContracts(sharedHome, policy()).join("\n")).toContain(
+      "windows_x64 desktop persistence smoke must not share SYNARA_HOME with startup smoke",
     );
   });
 

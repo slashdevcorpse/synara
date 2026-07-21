@@ -11,6 +11,12 @@ export interface ProviderLifecycleLease {
   readonly retire: () => void;
 }
 
+export interface ProviderConditionalLifecycleLease {
+  readonly currentGeneration: string | undefined;
+  readonly isCurrent: () => boolean;
+  readonly advance: () => string;
+}
+
 export interface ProviderLifecycleCoordinator {
   readonly run: <A, E, R>(
     threadId: ThreadId,
@@ -19,6 +25,11 @@ export interface ProviderLifecycleCoordinator {
   readonly runCurrent: <A, E, R>(
     threadId: ThreadId,
     operation: (generation: string | undefined) => Effect.Effect<A, E, R>,
+  ) => Effect.Effect<A, E, R>;
+  /** Hold lifecycle ownership while preserving the current generation until advance() commits. */
+  readonly runConditional: <A, E, R>(
+    threadId: ThreadId,
+    operation: (lease: ProviderConditionalLifecycleLease) => Effect.Effect<A, E, R>,
   ) => Effect.Effect<A, E, R>;
   readonly adoptCurrent: (threadId: ThreadId, generation: string) => void;
   readonly currentGeneration: (threadId: ThreadId) => string | undefined;
@@ -74,6 +85,17 @@ export function makeProviderLifecycleCoordinator(): ProviderLifecycleCoordinator
         );
     });
 
+  const restorePreviousGeneration = (
+    threadId: ThreadId,
+    previousGeneration: string | undefined,
+  ): void => {
+    if (previousGeneration === undefined) {
+      currentGenerations.delete(threadId);
+    } else {
+      currentGenerations.set(threadId, previousGeneration);
+    }
+  };
+
   const run: ProviderLifecycleCoordinator["run"] = (threadId, operation) =>
     withThreadLock(
       threadId,
@@ -98,13 +120,37 @@ export function makeProviderLifecycleCoordinator(): ProviderLifecycleCoordinator
         }).pipe(
           Effect.onExit((exit) =>
             Exit.isFailure(exit) && isCurrent()
-              ? Effect.sync(() => {
-                  if (previousGeneration === undefined) {
-                    currentGenerations.delete(threadId);
-                  } else {
-                    currentGenerations.set(threadId, previousGeneration);
-                  }
-                })
+              ? Effect.sync(() => restorePreviousGeneration(threadId, previousGeneration))
+              : Effect.void,
+          ),
+        );
+      }),
+    );
+
+  const runConditional: ProviderLifecycleCoordinator["runConditional"] = (threadId, operation) =>
+    withThreadLock(
+      threadId,
+      Effect.suspend(() => {
+        const previousGeneration = currentGenerations.get(threadId);
+        let advancedGeneration: string | undefined;
+        const isCurrent = () =>
+          currentGenerations.get(threadId) === (advancedGeneration ?? previousGeneration);
+        const advance = () => {
+          if (advancedGeneration === undefined) {
+            advancedGeneration = randomUUID();
+            currentGenerations.set(threadId, advancedGeneration);
+          }
+          return advancedGeneration;
+        };
+
+        return operation({
+          currentGeneration: previousGeneration,
+          isCurrent,
+          advance,
+        }).pipe(
+          Effect.onExit((exit) =>
+            Exit.isFailure(exit) && advancedGeneration !== undefined && isCurrent()
+              ? Effect.sync(() => restorePreviousGeneration(threadId, previousGeneration))
               : Effect.void,
           ),
         );
@@ -113,6 +159,7 @@ export function makeProviderLifecycleCoordinator(): ProviderLifecycleCoordinator
 
   return {
     run,
+    runConditional,
     runCurrent: (threadId, operation) =>
       withThreadLock(
         threadId,
