@@ -59,6 +59,7 @@ const CI_MERGIFY_UPLOAD_CONDITION =
   "${{ !cancelled() && (steps.unit_tests.outcome == 'success' || steps.unit_tests.outcome == 'failure') && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) }}";
 const CI_MERGIFY_REPORT_FILES =
   "./apps/desktop/test-report.junit.xml ./apps/server/test-report.junit.xml ./apps/web/test-report.junit.xml ./packages/contracts/test-report.junit.xml ./packages/shared/test-report.junit.xml ./scripts/test-report.junit.xml";
+const CI_MERGIFY_VERIFY_COMMAND = 'test "$MERGIFY_UPLOAD_OUTCOME" = "success"';
 const DEPENDENCY_REVIEW_ACTION =
   "actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294";
 const CODEQL_ACTION = "github/codeql-action";
@@ -487,6 +488,33 @@ function validateMergifyUpload(
   ) {
     errors.push(
       `${workflowPath} Mergify upload must ingest only the six expected JUnit reports with the unit-test outcome.`,
+    );
+  }
+
+  const verificationMatches = qualityJob.steps.filter(
+    (candidate) => isRecord(candidate) && candidate.name === "Verify Mergify test results upload",
+  );
+  if (verificationMatches.length !== 1) {
+    errors.push(
+      `${workflowPath} quality must define exactly one Verify Mergify test results upload step.`,
+    );
+    return;
+  }
+  const verification = verificationMatches[0]!;
+  if (!isRecord(verification)) return;
+  if (qualityJob.steps.indexOf(verification) !== qualityJob.steps.indexOf(step) + 1) {
+    errors.push(`${workflowPath} Mergify upload verification must run immediately after upload.`);
+  }
+  if (
+    verification.if !== CI_MERGIFY_UPLOAD_CONDITION ||
+    !isRecord(verification.env) ||
+    verification.env.MERGIFY_UPLOAD_OUTCOME !==
+      "${{ steps.mergify_ci.outputs.test_results_upload }}" ||
+    typeof verification.run !== "string" ||
+    normalizeShellCommand(verification.run) !== CI_MERGIFY_VERIFY_COMMAND
+  ) {
+    errors.push(
+      `${workflowPath} Mergify upload verification must fail closed unless upload succeeds.`,
     );
   }
 }

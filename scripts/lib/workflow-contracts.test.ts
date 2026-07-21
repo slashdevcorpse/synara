@@ -160,6 +160,13 @@ const mergifyUploadStep = [
   "            ./scripts/test-report.junit.xml",
   "          test_step_outcome: ${{ steps.unit_tests.outcome }}",
 ].join("\n");
+const mergifyVerificationStep = [
+  "      - name: Verify Mergify test results upload",
+  `        if: ${mergifyCondition}`,
+  "        env:",
+  "          MERGIFY_UPLOAD_OUTCOME: ${{ steps.mergify_ci.outputs.test_results_upload }}",
+  '        run: test "$MERGIFY_UPLOAD_OUTCOME" = "success"',
+].join("\n");
 const ciWorkflow = `name: CI
 on:
   pull_request:
@@ -173,6 +180,7 @@ jobs:
       - uses: ${pinnedCheckout}
 ${ciRootTestStep}
 ${mergifyUploadStep}
+${mergifyVerificationStep}
 ${codecovCoverageUploadStep}
 ${codecovTestResultsUploadStep}
   windows_x64:
@@ -515,6 +523,27 @@ describe("workflow contracts", () => {
     );
     expect(validateWorkflowContracts(wrongCredential, policy()).join("\n")).toContain(
       "Mergify upload must ingest only the six expected JUnit reports",
+    );
+
+    const missingVerification = validFiles();
+    missingVerification.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace(`${mergifyVerificationStep}\n`, ""),
+    );
+    expect(validateWorkflowContracts(missingVerification, policy()).join("\n")).toContain(
+      "must define exactly one Verify Mergify test results upload step",
+    );
+
+    const permissiveVerification = validFiles();
+    permissiveVerification.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace(
+        'run: test "$MERGIFY_UPLOAD_OUTCOME" = "success"',
+        'run: test "$MERGIFY_UPLOAD_OUTCOME" != "rejected"',
+      ),
+    );
+    expect(validateWorkflowContracts(permissiveVerification, policy()).join("\n")).toContain(
+      "Mergify upload verification must fail closed unless upload succeeds",
     );
   });
 

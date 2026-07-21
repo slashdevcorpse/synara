@@ -98,6 +98,12 @@ jobs:
             ./scripts/test-report.junit.xml
           test_step_outcome: ${{ steps.unit_tests.outcome }}
 
+      - name: Verify Mergify test results upload
+        if: ${{ !cancelled() && (steps.unit_tests.outcome == 'success' || steps.unit_tests.outcome == 'failure') && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        env:
+          MERGIFY_UPLOAD_OUTCOME: ${{ steps.mergify_ci.outputs.test_results_upload }}
+        run: test "$MERGIFY_UPLOAD_OUTCOME" = "success"
+
       - name: Upload coverage reports to Codecov
         if: ${{ !cancelled() && (steps.unit_tests.outcome == 'success' || steps.unit_tests.outcome == 'failure') }}
         uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5.5.5
