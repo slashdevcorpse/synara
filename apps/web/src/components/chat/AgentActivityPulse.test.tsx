@@ -16,10 +16,7 @@ function activityState(
   counts: Partial<
     Pick<AgentActivityState, "toolCount" | "subagentCount" | "subagentRunningCount">
   > = {},
-): Pick<
-  AgentActivityState,
-  "phase" | "toolCount" | "subagentCount" | "subagentRunningCount"
-> {
+): Pick<AgentActivityState, "phase" | "toolCount" | "subagentCount" | "subagentRunningCount"> {
   return {
     phase,
     toolCount: counts.toolCount ?? 0,
@@ -182,9 +179,7 @@ describe("AgentActivityPulse", () => {
   });
 
   it("assigns every visible lifecycle group an explicit semantic color", () => {
-    expect(AGENT_ACTIVITY_CSS).toContain(
-      '.agent-activity[data-agent-activity-phase="connecting"]',
-    );
+    expect(AGENT_ACTIVITY_CSS).toContain('.agent-activity[data-agent-activity-phase="connecting"]');
     expect(AGENT_ACTIVITY_CSS).toMatch(
       /data-agent-activity-phase="thinking"\] \{[\s\S]*?--agent-activity-color: var\(--warning\);/u,
     );

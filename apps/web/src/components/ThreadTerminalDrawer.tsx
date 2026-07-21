@@ -179,11 +179,13 @@ export function TerminalEmptyState(props: {
             variant="outline"
             onClick={() => props.onRestoreGroup(props.archivedGroupId ?? "")}
           >
-            <RefreshCwIcon />Restore last group
+            <RefreshCwIcon />
+            Restore last group
           </Button>
         ) : null}
         <Button size="sm" variant="secondary" onClick={props.onNewGroup}>
-          <Plus />New group
+          <Plus />
+          New group
         </Button>
       </div>
     </div>
@@ -551,8 +553,19 @@ function TerminalViewport({
         <TerminalRuntimeStatusOverlay status={runtimeStatus} />
         {exitState ? (
           <div className="absolute inset-x-0 top-1 z-20 flex justify-center">
-            <div className={cn("flex items-center gap-2 rounded-md border px-2 py-1 text-xs shadow-sm backdrop-blur", exitState.kind === "failed" ? "border-destructive/40 bg-destructive/10 text-destructive" : "border-border/70 bg-background/90 text-muted-foreground")}>
-              <span>{exitState.kind === "failed" ? `Exited with code ${exitState.exitCode ?? "unknown"}` : "Terminal stopped"}</span>
+            <div
+              className={cn(
+                "flex items-center gap-2 rounded-md border px-2 py-1 text-xs shadow-sm backdrop-blur",
+                exitState.kind === "failed"
+                  ? "border-destructive/40 bg-destructive/10 text-destructive"
+                  : "border-border/70 bg-background/90 text-muted-foreground",
+              )}
+            >
+              <span>
+                {exitState.kind === "failed"
+                  ? `Exited with code ${exitState.exitCode ?? "unknown"}`
+                  : "Terminal stopped"}
+              </span>
               <Button
                 size="xs"
                 variant="outline"
@@ -778,9 +791,7 @@ export default function ThreadTerminalDrawer({
             restoreTerminalGroup(threadId, groupId);
             window.requestAnimationFrame(() => {
               document
-                .querySelector<HTMLElement>(
-                  `[data-terminal-group-id="${CSS.escape(groupId)}"]`,
-                )
+                .querySelector<HTMLElement>(`[data-terminal-group-id="${CSS.escape(groupId)}"]`)
                 ?.focus();
             });
           },
@@ -823,10 +834,7 @@ export default function ThreadTerminalDrawer({
   );
 
   const moveTerminalSelection = useCallback(
-    (
-      terminalIdsToMove: readonly string[],
-      target: TerminalMoveTarget,
-    ) => {
+    (terminalIdsToMove: readonly string[], target: TerminalMoveTarget) => {
       moveTerminals(threadId, terminalIdsToMove, target);
       setTerminalTabSelection({ anchorId: null, selectedIds: new Set() });
     },
@@ -877,7 +885,13 @@ export default function ThreadTerminalDrawer({
         }
       });
     },
-    [addArchiveUndoToast, archiveTerminalGroup, resolvedTerminalGroups, runningTerminalIds, threadId],
+    [
+      addArchiveUndoToast,
+      archiveTerminalGroup,
+      resolvedTerminalGroups,
+      runningTerminalIds,
+      threadId,
+    ],
   );
 
   const stopAndArchivePendingGroup = useCallback(async () => {
@@ -919,9 +933,7 @@ export default function ThreadTerminalDrawer({
     window.requestAnimationFrame(() => {
       if (nextFocusGroup) {
         document
-          .querySelector<HTMLElement>(
-            `[data-terminal-group-id="${CSS.escape(nextFocusGroup.id)}"]`,
-          )
+          .querySelector<HTMLElement>(`[data-terminal-group-id="${CSS.escape(nextFocusGroup.id)}"]`)
           ?.focus();
       } else {
         document.querySelector<HTMLElement>("[data-terminal-archived-toggle]")?.focus();
@@ -962,7 +974,8 @@ export default function ThreadTerminalDrawer({
         });
       }
       return result.closed;
-    }, [onCloseTerminalGroup, resolvedArchivedTerminalGroups, resolvedTerminalGroups, threadId],
+    },
+    [onCloseTerminalGroup, resolvedArchivedTerminalGroups, resolvedTerminalGroups, threadId],
   );
 
   const restoreGroupAndFocus = useCallback(
@@ -1012,7 +1025,8 @@ export default function ThreadTerminalDrawer({
             : `Stopped ${terminalIds.length} terminal${terminalIds.length === 1 ? "" : "s"}`,
         data: { threadId },
       });
-    }, [resolvedTerminalGroups, runningTerminalIds, setTerminalExitState, threadId],
+    },
+    [resolvedTerminalGroups, runningTerminalIds, setTerminalExitState, threadId],
   );
 
   const restartTerminal = useCallback(
@@ -1046,7 +1060,8 @@ export default function ThreadTerminalDrawer({
           data: { threadId },
         });
       }
-    }, [cwd, lifecycleState.terminalLaunchMetadataById, runtimeEnv, setTerminalExitState, threadId],
+    },
+    [cwd, lifecycleState.terminalLaunchMetadataById, runtimeEnv, setTerminalExitState, threadId],
   );
 
   const handleTerminalWorkspaceKeyDown = useCallback(
@@ -1077,17 +1092,15 @@ export default function ThreadTerminalDrawer({
         requestArchiveGroup(resolvedActiveGroupId);
         handled = true;
       } else if (command === "restore-recent-group") {
-        const mostRecentlyArchived = resolvedArchivedTerminalGroups
-          .toSorted((left, right) => (right.archivedAt ?? 0) - (left.archivedAt ?? 0))[0];
+        const mostRecentlyArchived = resolvedArchivedTerminalGroups.toSorted(
+          (left, right) => (right.archivedAt ?? 0) - (left.archivedAt ?? 0),
+        )[0];
         if (mostRecentlyArchived) {
           restoreGroupAndFocus(mostRecentlyArchived.id);
           handled = true;
         }
       } else if (command === "toggle-archived-groups") {
-        setShowArchivedTerminalGroups(
-          threadId,
-          !lifecycleState.showArchivedTerminalGroups,
-        );
+        setShowArchivedTerminalGroups(threadId, !lifecycleState.showArchivedTerminalGroups);
         handled = true;
       } else if (command === "move-group-left" && activeGroupIndex > 0) {
         const group = resolvedTerminalGroups[activeGroupIndex];
@@ -1206,247 +1219,247 @@ export default function ThreadTerminalDrawer({
 
   return (
     <>
-    <aside
-      className={cn(
-        "thread-terminal-drawer relative flex w-full min-w-0 flex-col overflow-hidden bg-[var(--color-background-surface)]",
-        isWorkspaceMode ? "h-full min-h-0" : "shrink-0 border-t border-border/70",
-      )}
-      style={isWorkspaceMode ? undefined : { height: `${drawerHeight}px` }}
-      onKeyDownCapture={handleTerminalWorkspaceKeyDown}
-    >
-      {!isWorkspaceMode ? (
-        <div
-          className="absolute inset-x-0 top-0 z-20 h-1.5 cursor-row-resize"
-          onPointerDown={handleResizePointerDown}
-          onPointerMove={handleResizePointerMove}
-          onPointerUp={handleResizePointerEnd}
-          onPointerCancel={handleResizePointerEnd}
-        />
-      ) : null}
+      <aside
+        className={cn(
+          "thread-terminal-drawer relative flex w-full min-w-0 flex-col overflow-hidden bg-[var(--color-background-surface)]",
+          isWorkspaceMode ? "h-full min-h-0" : "shrink-0 border-t border-border/70",
+        )}
+        style={isWorkspaceMode ? undefined : { height: `${drawerHeight}px` }}
+        onKeyDownCapture={handleTerminalWorkspaceKeyDown}
+      >
+        {!isWorkspaceMode ? (
+          <div
+            className="absolute inset-x-0 top-0 z-20 h-1.5 cursor-row-resize"
+            onPointerDown={handleResizePointerDown}
+            onPointerMove={handleResizePointerMove}
+            onPointerUp={handleResizePointerEnd}
+            onPointerCancel={handleResizePointerEnd}
+          />
+        ) : null}
 
-      {showTerminalGroupTabs ? (
-        <TerminalWorkspaceTabBar
-          terminalGroups={resolvedTerminalGroups}
-          archivedTerminalGroups={resolvedArchivedTerminalGroups}
-          activeGroupId={resolvedActiveGroupId}
-          showArchived={lifecycleState.showArchivedTerminalGroups}
-          runningTerminalIds={runningTerminalIds}
-          terminalAttentionStatesById={terminalAttentionStatesById}
-          terminalExitStatesById={lifecycleState.terminalExitStatesById}
-          terminalVisualIdentityById={terminalVisualIdentityById}
-          actions={topTabBarActions}
-          createMenu={createTerminalMenu}
-          onActiveGroupChange={(groupId) => {
-            const nextGroup = resolvedTerminalGroups.find((group) => group.id === groupId);
-            if (!nextGroup) return;
-            onActiveTerminalChange(nextGroup.activeTerminalId);
-          }}
-          onArchiveGroup={requestArchiveGroup}
-          onRestoreGroup={restoreGroupAndFocus}
-          onRenameGroup={(groupId, name) => renameTerminalGroup(threadId, groupId, name)}
-          onRoleChange={(groupId, role) => setTerminalGroupRole(threadId, groupId, role)}
-          onStopGroup={(groupId) => void stopAllInGroup(groupId)}
-          onReorderGroup={(groupId, toIndex) => reorderTerminalGroup(threadId, groupId, toIndex)}
-          selectedTerminalIds={activeGroupTerminalIds.filter((terminalId) =>
-            terminalTabSelection.selectedIds.has(terminalId),
-          )}
-          onMoveTerminalsToGroup={(terminalIdsToMove, groupId) =>
-            moveTerminalSelection(terminalIdsToMove, { kind: "group", groupId })
-          }
-          onMoveTerminalsToNewGroup={(terminalIdsToMove, toIndex) =>
-            moveTerminalSelection(terminalIdsToMove, { kind: "new-group", toIndex })
-          }
-          onShowArchivedChange={(show) => setShowArchivedTerminalGroups(threadId, show)}
-          onCloseGroup={setPendingCloseGroupId}
-        />
-      ) : null}
+        {showTerminalGroupTabs ? (
+          <TerminalWorkspaceTabBar
+            terminalGroups={resolvedTerminalGroups}
+            archivedTerminalGroups={resolvedArchivedTerminalGroups}
+            activeGroupId={resolvedActiveGroupId}
+            showArchived={lifecycleState.showArchivedTerminalGroups}
+            runningTerminalIds={runningTerminalIds}
+            terminalAttentionStatesById={terminalAttentionStatesById}
+            terminalExitStatesById={lifecycleState.terminalExitStatesById}
+            terminalVisualIdentityById={terminalVisualIdentityById}
+            actions={topTabBarActions}
+            createMenu={createTerminalMenu}
+            onActiveGroupChange={(groupId) => {
+              const nextGroup = resolvedTerminalGroups.find((group) => group.id === groupId);
+              if (!nextGroup) return;
+              onActiveTerminalChange(nextGroup.activeTerminalId);
+            }}
+            onArchiveGroup={requestArchiveGroup}
+            onRestoreGroup={restoreGroupAndFocus}
+            onRenameGroup={(groupId, name) => renameTerminalGroup(threadId, groupId, name)}
+            onRoleChange={(groupId, role) => setTerminalGroupRole(threadId, groupId, role)}
+            onStopGroup={(groupId) => void stopAllInGroup(groupId)}
+            onReorderGroup={(groupId, toIndex) => reorderTerminalGroup(threadId, groupId, toIndex)}
+            selectedTerminalIds={activeGroupTerminalIds.filter((terminalId) =>
+              terminalTabSelection.selectedIds.has(terminalId),
+            )}
+            onMoveTerminalsToGroup={(terminalIdsToMove, groupId) =>
+              moveTerminalSelection(terminalIdsToMove, { kind: "group", groupId })
+            }
+            onMoveTerminalsToNewGroup={(terminalIdsToMove, toIndex) =>
+              moveTerminalSelection(terminalIdsToMove, { kind: "new-group", toIndex })
+            }
+            onShowArchivedChange={(show) => setShowArchivedTerminalGroups(threadId, show)}
+            onCloseGroup={setPendingCloseGroupId}
+          />
+        ) : null}
 
-      <div className="min-h-0 w-full flex-1">
-        <div
-          id={
-            resolvedActiveGroupId
-              ? `terminal-group-panel-${resolvedActiveGroupId}`
-              : undefined
-          }
-          role={resolvedActiveGroupId ? "tabpanel" : undefined}
-          aria-labelledby={
-            resolvedActiveGroupId
-              ? `terminal-group-tab-${resolvedActiveGroupId}`
-              : undefined
-          }
-          className={cn(
-            "flex h-full min-h-0",
-            hasTerminalSidebar && !isWorkspaceMode ? "gap-1.5" : "",
-          )}
-        >
-          <div className="min-w-0 flex-1 h-full">
-            {resolvedActiveGroupId && activeGroupLayout ? (
-            <TerminalViewportPane
-              groupId={resolvedActiveGroupId}
-              layout={activeGroupLayout}
-              resolvedActiveTerminalId={resolvedActiveTerminalId}
-              terminalVisualIdentityById={terminalVisualIdentityById}
-              onActiveTerminalChange={onActiveTerminalChange}
-              onResizeSplit={onResizeTerminalSplit}
-              onSplitTerminalRight={
-                hasReachedSplitLimit
-                  ? undefined
-                  : (terminalId) => {
-                      onActiveTerminalChange(terminalId);
-                      onSplitTerminal();
-                    }
-              }
-              onSplitTerminalDown={
-                hasReachedSplitLimit
-                  ? undefined
-                  : (terminalId) => {
-                      onActiveTerminalChange(terminalId);
-                      onSplitTerminalDown();
-                    }
-              }
-              onNewTerminalTab={
-                hasReachedSplitLimit
-                  ? undefined
-                  : (terminalId) => {
-                      onNewTerminalTab(terminalId);
-                    }
-              }
-              onMoveTerminalToGroup={isWorkspaceMode ? onMoveTerminalToGroup : undefined}
-              onCloseTerminal={onCloseTerminal}
-              selectedTerminalIds={terminalTabSelection.selectedIds}
-              onTerminalSelectionChange={selectTerminalTab}
-              onTerminalDragStart={startTerminalTabDrag}
-              onTerminalDrop={(terminalIdsToMove, targetTerminalId) =>
-                moveTerminalSelection(terminalIdsToMove, {
-                  kind: "group",
-                  groupId: resolvedActiveGroupId,
-                  targetTerminalId,
-                })
-              }
-              presentationMode={presentationMode}
-              onTogglePresentationMode={onTogglePresentationMode}
-              onTogglePanel={onTogglePanel}
-              isPanelOpen={isPanelOpen}
-              renderViewport={(terminalId, options) => (
-                <TerminalViewport
-                  key={terminalId}
-                  threadId={threadId}
-                  terminalId={terminalId}
-                  terminalLabel={terminalVisualIdentityById.get(terminalId)?.title ?? "Terminal"}
-                  terminalCliKind={terminalVisualIdentityById.get(terminalId)?.cliKind ?? null}
-                  cwd={cwd}
-                  {...(runtimeEnv ? { runtimeEnv } : {})}
-                  terminalRightClickToPaste={settings.terminalRightClickToPaste}
-                  exitState={lifecycleState.terminalExitStatesById[terminalId]}
-                  reattachOnly={
-                    lifecycleState.terminalLaunchMetadataById[terminalId]?.reattachOnly === true
+        <div className="min-h-0 w-full flex-1">
+          <div
+            id={resolvedActiveGroupId ? `terminal-group-panel-${resolvedActiveGroupId}` : undefined}
+            role={resolvedActiveGroupId ? "tabpanel" : undefined}
+            aria-labelledby={
+              resolvedActiveGroupId ? `terminal-group-tab-${resolvedActiveGroupId}` : undefined
+            }
+            className={cn(
+              "flex h-full min-h-0",
+              hasTerminalSidebar && !isWorkspaceMode ? "gap-1.5" : "",
+            )}
+          >
+            <div className="min-w-0 flex-1 h-full">
+              {resolvedActiveGroupId && activeGroupLayout ? (
+                <TerminalViewportPane
+                  groupId={resolvedActiveGroupId}
+                  layout={activeGroupLayout}
+                  resolvedActiveTerminalId={resolvedActiveTerminalId}
+                  terminalVisualIdentityById={terminalVisualIdentityById}
+                  onActiveTerminalChange={onActiveTerminalChange}
+                  onResizeSplit={onResizeTerminalSplit}
+                  onSplitTerminalRight={
+                    hasReachedSplitLimit
+                      ? undefined
+                      : (terminalId) => {
+                          onActiveTerminalChange(terminalId);
+                          onSplitTerminal();
+                        }
                   }
-                  onRecoveryResolved={(recoveredTerminalId, recovery) => {
-                    const launchMetadata =
-                      lifecycleState.terminalLaunchMetadataById[recoveredTerminalId];
-                    setTerminalLaunchMetadata(threadId, recoveredTerminalId, {
-                      cwd: launchMetadata?.cwd ?? cwd,
-                      reattachOnly: true,
-                    });
-                    const recoveredExitState = terminalExitStateFromRecovery(recovery);
-                    if (recoveredExitState) {
-                      setTerminalExitState(threadId, recoveredTerminalId, recoveredExitState);
-                    }
-                  }}
-                  onSessionExited={(exit) =>
-                    setTerminalExitState(
-                      threadId,
-                      terminalId,
-                      terminalExitStateFromProcessExit(exit),
-                    )
+                  onSplitTerminalDown={
+                    hasReachedSplitLimit
+                      ? undefined
+                      : (terminalId) => {
+                          onActiveTerminalChange(terminalId);
+                          onSplitTerminalDown();
+                        }
                   }
-                  onRestart={() => restartTerminal(terminalId)}
-                  onTerminalMetadataChange={onTerminalMetadataChange}
-                  onTerminalActivityChange={onTerminalActivityChange}
-                  onAddTerminalContext={onAddTerminalContext}
-                  focusRequestId={focusRequestId}
-                  autoFocus={options.autoFocus}
-                  isVisible={isVisible && options.isVisible}
+                  onNewTerminalTab={
+                    hasReachedSplitLimit
+                      ? undefined
+                      : (terminalId) => {
+                          onNewTerminalTab(terminalId);
+                        }
+                  }
+                  onMoveTerminalToGroup={isWorkspaceMode ? onMoveTerminalToGroup : undefined}
+                  onCloseTerminal={onCloseTerminal}
+                  selectedTerminalIds={terminalTabSelection.selectedIds}
+                  onTerminalSelectionChange={selectTerminalTab}
+                  onTerminalDragStart={startTerminalTabDrag}
+                  onTerminalDrop={(terminalIdsToMove, targetTerminalId) =>
+                    moveTerminalSelection(terminalIdsToMove, {
+                      kind: "group",
+                      groupId: resolvedActiveGroupId,
+                      targetTerminalId,
+                    })
+                  }
+                  presentationMode={presentationMode}
+                  onTogglePresentationMode={onTogglePresentationMode}
+                  onTogglePanel={onTogglePanel}
+                  isPanelOpen={isPanelOpen}
+                  renderViewport={(terminalId, options) => (
+                    <TerminalViewport
+                      key={terminalId}
+                      threadId={threadId}
+                      terminalId={terminalId}
+                      terminalLabel={
+                        terminalVisualIdentityById.get(terminalId)?.title ?? "Terminal"
+                      }
+                      terminalCliKind={terminalVisualIdentityById.get(terminalId)?.cliKind ?? null}
+                      cwd={cwd}
+                      {...(runtimeEnv ? { runtimeEnv } : {})}
+                      terminalRightClickToPaste={settings.terminalRightClickToPaste}
+                      exitState={lifecycleState.terminalExitStatesById[terminalId]}
+                      reattachOnly={
+                        lifecycleState.terminalLaunchMetadataById[terminalId]?.reattachOnly === true
+                      }
+                      onRecoveryResolved={(recoveredTerminalId, recovery) => {
+                        const launchMetadata =
+                          lifecycleState.terminalLaunchMetadataById[recoveredTerminalId];
+                        setTerminalLaunchMetadata(threadId, recoveredTerminalId, {
+                          cwd: launchMetadata?.cwd ?? cwd,
+                          reattachOnly: true,
+                        });
+                        const recoveredExitState = terminalExitStateFromRecovery(recovery);
+                        if (recoveredExitState) {
+                          setTerminalExitState(threadId, recoveredTerminalId, recoveredExitState);
+                        }
+                      }}
+                      onSessionExited={(exit) =>
+                        setTerminalExitState(
+                          threadId,
+                          terminalId,
+                          terminalExitStateFromProcessExit(exit),
+                        )
+                      }
+                      onRestart={() => restartTerminal(terminalId)}
+                      onTerminalMetadataChange={onTerminalMetadataChange}
+                      onTerminalActivityChange={onTerminalActivityChange}
+                      onAddTerminalContext={onAddTerminalContext}
+                      focusRequestId={focusRequestId}
+                      autoFocus={options.autoFocus}
+                      isVisible={isVisible && options.isVisible}
+                    />
+                  )}
+                />
+              ) : (
+                <TerminalEmptyState
+                  archivedGroupId={resolvedArchivedTerminalGroups[0]?.id}
+                  onRestoreGroup={restoreGroupAndFocus}
+                  onNewGroup={onNewTerminalAction}
                 />
               )}
-            />
-            ) : (
-              <TerminalEmptyState
-                archivedGroupId={resolvedArchivedTerminalGroups[0]?.id}
-                onRestoreGroup={restoreGroupAndFocus}
-                onNewGroup={onNewTerminalAction}
-              />
-            )}
-          </div>
+            </div>
 
-          {hasTerminalSidebar && !isWorkspaceMode && resolvedActiveGroupId ? (
-            <TerminalSidebar
-              terminalIds={normalizedTerminalIds}
-              terminalGroups={resolvedTerminalGroups}
-              activeTerminalId={resolvedActiveTerminalId}
-              activeGroupId={resolvedActiveGroupId}
-              showGroupHeaders={showGroupHeaders}
-              closeShortcutLabel={resolvedCloseShortcutLabel}
-              terminalVisualIdentityById={terminalVisualIdentityById}
-              actions={terminalChromeActions}
-              onActiveTerminalChange={onActiveTerminalChange}
-              onCloseTerminal={onCloseTerminal}
-            />
-          ) : null}
+            {hasTerminalSidebar && !isWorkspaceMode && resolvedActiveGroupId ? (
+              <TerminalSidebar
+                terminalIds={normalizedTerminalIds}
+                terminalGroups={resolvedTerminalGroups}
+                activeTerminalId={resolvedActiveTerminalId}
+                activeGroupId={resolvedActiveGroupId}
+                showGroupHeaders={showGroupHeaders}
+                closeShortcutLabel={resolvedCloseShortcutLabel}
+                terminalVisualIdentityById={terminalVisualIdentityById}
+                actions={terminalChromeActions}
+                onActiveTerminalChange={onActiveTerminalChange}
+                onCloseTerminal={onCloseTerminal}
+              />
+            ) : null}
+          </div>
         </div>
-      </div>
-    </aside>
-    <AlertDialog
-      open={pendingArchiveGroupId !== null}
-      onOpenChange={(open) => {
-        if (!open) setPendingArchiveGroupId(null);
-      }}
-    >
-      <AlertDialogPopup>
-        <AlertDialogHeader>
-          <AlertDialogTitle>Stop running terminals and archive?</AlertDialogTitle>
-          <AlertDialogDescription>
-            This group has running processes. Synara will stop them, preserve the terminal history and layout, and archive the group.
-          </AlertDialogDescription>
-        </AlertDialogHeader>
-        <AlertDialogFooter>
-          <AlertDialogClose render={<Button variant="outline" />}>Cancel</AlertDialogClose>
-          <Button autoFocus variant="default" onClick={() => void stopAndArchivePendingGroup()}>
-            Stop and archive
-          </Button>
-        </AlertDialogFooter>
-      </AlertDialogPopup>
-    </AlertDialog>
-    <AlertDialog
-      open={pendingCloseGroup !== undefined}
-      onOpenChange={(open) => {
-        if (!open) setPendingCloseGroupId(null);
-      }}
-    >
-      <AlertDialogPopup>
-        <AlertDialogHeader>
-          <AlertDialogTitle>Close and remove {pendingCloseGroup?.name ?? "terminal group"}?</AlertDialogTitle>
-          <AlertDialogDescription>
-            This permanently removes the group, closes every terminal in it, and deletes their terminal history. Archive the group instead if you may need it later.
-          </AlertDialogDescription>
-        </AlertDialogHeader>
-        <AlertDialogFooter>
-          <AlertDialogClose render={<Button variant="outline" />}>Cancel</AlertDialogClose>
-          <Button
-            autoFocus
-            variant="destructive"
-            onClick={() => {
-              if (!pendingCloseGroup) return;
-              void closeTerminalGroupDestructively(pendingCloseGroup.id).then((closed) => {
-                if (closed) setPendingCloseGroupId(null);
-              });
-            }}
-          >
-            Close and remove
-          </Button>
-        </AlertDialogFooter>
-      </AlertDialogPopup>
-    </AlertDialog>
+      </aside>
+      <AlertDialog
+        open={pendingArchiveGroupId !== null}
+        onOpenChange={(open) => {
+          if (!open) setPendingArchiveGroupId(null);
+        }}
+      >
+        <AlertDialogPopup>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Stop running terminals and archive?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This group has running processes. Synara will stop them, preserve the terminal history
+              and layout, and archive the group.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogClose render={<Button variant="outline" />}>Cancel</AlertDialogClose>
+            <Button autoFocus variant="default" onClick={() => void stopAndArchivePendingGroup()}>
+              Stop and archive
+            </Button>
+          </AlertDialogFooter>
+        </AlertDialogPopup>
+      </AlertDialog>
+      <AlertDialog
+        open={pendingCloseGroup !== undefined}
+        onOpenChange={(open) => {
+          if (!open) setPendingCloseGroupId(null);
+        }}
+      >
+        <AlertDialogPopup>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              Close and remove {pendingCloseGroup?.name ?? "terminal group"}?
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              This permanently removes the group, closes every terminal in it, and deletes their
+              terminal history. Archive the group instead if you may need it later.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogClose render={<Button variant="outline" />}>Cancel</AlertDialogClose>
+            <Button
+              autoFocus
+              variant="destructive"
+              onClick={() => {
+                if (!pendingCloseGroup) return;
+                void closeTerminalGroupDestructively(pendingCloseGroup.id).then((closed) => {
+                  if (closed) setPendingCloseGroupId(null);
+                });
+              }}
+            >
+              Close and remove
+            </Button>
+          </AlertDialogFooter>
+        </AlertDialogPopup>
+      </AlertDialog>
     </>
   );
 }

@@ -109,10 +109,7 @@ function resolveTerminalGroups(input: {
 
   return [
     {
-      ...createTerminalGroup(
-        `group-${DEFAULT_THREAD_TERMINAL_ID}`,
-        DEFAULT_THREAD_TERMINAL_ID,
-      ),
+      ...createTerminalGroup(`group-${DEFAULT_THREAD_TERMINAL_ID}`, DEFAULT_THREAD_TERMINAL_ID),
       terminalIds: [DEFAULT_THREAD_TERMINAL_ID],
     },
   ];

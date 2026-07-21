@@ -564,11 +564,7 @@ function SidebarStatusTrailingGlyph({
   status: ThreadStatusPill;
   activityState?: AgentActivityState | null | undefined;
 }) {
-  if (
-    activityState &&
-    activityState.phase !== "idle" &&
-    activityState.phase !== "stopped"
-  ) {
+  if (activityState && activityState.phase !== "idle" && activityState.phase !== "stopped") {
     return <AgentActivityPulse state={activityState} variant="dot" />;
   }
   if (status.label === "Completed") {
@@ -1252,7 +1248,9 @@ export default function Sidebar() {
   const agentActivityByThreadId = useMemo(
     () =>
       new Map(
-        workspaceAgentActivity.threads.map((entry) => [entry.threadId, entry.activityState] as const),
+        workspaceAgentActivity.threads.map(
+          (entry) => [entry.threadId, entry.activityState] as const,
+        ),
       ),
     [workspaceAgentActivity.threads],
   );
@@ -1264,9 +1262,7 @@ export default function Sidebar() {
     }
     return counts;
   }, [workspaceAgentActivity.threads]);
-  const activeGitActionIdsByCwd = useGitActionActivityStore(
-    (state) => state.activeActionIdsByCwd,
-  );
+  const activeGitActionIdsByCwd = useGitActionActivityStore((state) => state.activeActionIdsByCwd);
   const activeGitActionCwds = useMemo(
     () => [...activeGitActionIdsByCwd.keys()],
     [activeGitActionIdsByCwd],
@@ -4541,8 +4537,7 @@ export default function Sidebar() {
                     className={cn(
                       "inline-flex h-5 min-w-5 items-center justify-center gap-0.5 rounded-full border px-[5px] transition-colors",
                       toggleButtonClassName,
-                      activeSubagentCount > 0 &&
-                        "border-violet-400/35 text-violet-300",
+                      activeSubagentCount > 0 && "border-violet-400/35 text-violet-300",
                     )}
                     onClick={(event) => {
                       event.preventDefault();

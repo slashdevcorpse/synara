@@ -30,17 +30,29 @@ describe("terminal group semantics", () => {
   });
 
   it("archives and restores at the original active index", () => {
-    const archived = archiveTerminalGroupInList({ groups: groups(), groupId: "verify", archivedAt: 10 });
+    const archived = archiveTerminalGroupInList({
+      groups: groups(),
+      groupId: "verify",
+      archivedAt: 10,
+    });
     expect(activeTerminalGroups(archived).map((group) => group.id)).toEqual(["app", "observe"]);
     expect(archived[1]).toMatchObject({ archivedAt: 10, originalIndex: 1 });
 
-    const restored = restoreTerminalGroupInList({ groups: archived, groupId: "verify", restoredAt: 20 });
+    const restored = restoreTerminalGroupInList({
+      groups: archived,
+      groupId: "verify",
+      restoredAt: 20,
+    });
     expect(restored.map((group) => group.id)).toEqual(["app", "verify", "observe"]);
     expect(restored[1]).toMatchObject({ archivedAt: null, originalIndex: null });
   });
 
   it("reorders active groups without moving archived slots", () => {
-    const archived = archiveTerminalGroupInList({ groups: groups(), groupId: "verify", archivedAt: 10 });
+    const archived = archiveTerminalGroupInList({
+      groups: groups(),
+      groupId: "verify",
+      archivedAt: 10,
+    });
     const reordered = reorderActiveTerminalGroupInList({
       groups: archived,
       groupId: "observe",

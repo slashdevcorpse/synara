@@ -47,9 +47,7 @@ export const useGitActionActivityStore = create<GitActionActivityStoreState>((se
   applyProgressEvent: (event) =>
     set((state) => {
       const activeActionIdsByCwd = projectGitActionProgress(state.activeActionIdsByCwd, event);
-      return activeActionIdsByCwd === state.activeActionIdsByCwd
-        ? state
-        : { activeActionIdsByCwd };
+      return activeActionIdsByCwd === state.activeActionIdsByCwd ? state : { activeActionIdsByCwd };
     }),
   reset: () => set({ activeActionIdsByCwd: new Map() }),
 }));

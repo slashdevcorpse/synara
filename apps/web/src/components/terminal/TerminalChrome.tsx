@@ -48,11 +48,7 @@ import {
 import { cn } from "~/lib/utils";
 import { resolveTerminalGroupStatus } from "~/lib/terminalGroups";
 import { terminalVisualStateLabel } from "~/terminalVisualIdentity";
-import type {
-  TerminalExitState,
-  TerminalGroupAccent,
-  TerminalGroupRole,
-} from "~/types";
+import type { TerminalExitState, TerminalGroupAccent, TerminalGroupRole } from "~/types";
 
 import { DOCK_HEADER_ICON_BUTTON_CLASS } from "../chat/chatHeaderControls";
 import type { ResolvedTerminalGroupLayout } from "./TerminalLayout";
@@ -123,9 +119,7 @@ export function TerminalWorkspaceTabBar(props: {
   onRestoreGroup?: ((groupId: string) => void) | undefined;
   onReorderGroup?: ((groupId: string, toIndex: number) => void) | undefined;
   selectedTerminalIds?: readonly string[] | undefined;
-  onMoveTerminalsToGroup?:
-    | ((terminalIds: readonly string[], groupId: string) => void)
-    | undefined;
+  onMoveTerminalsToGroup?: ((terminalIds: readonly string[], groupId: string) => void) | undefined;
   onMoveTerminalsToNewGroup?:
     | ((terminalIds: readonly string[], toIndex?: number) => void)
     | undefined;
@@ -149,7 +143,9 @@ export function TerminalWorkspaceTabBar(props: {
     if (!group) return;
     props.onActiveGroupChange(group.id);
     window.requestAnimationFrame(() => {
-      document.querySelector<HTMLElement>(`[data-terminal-group-id="${CSS.escape(group.id)}"]`)?.focus();
+      document
+        .querySelector<HTMLElement>(`[data-terminal-group-id="${CSS.escape(group.id)}"]`)
+        ?.focus();
     });
   };
   const onGroupKeyDown = (event: KeyboardEvent<HTMLButtonElement>, index: number) => {
@@ -216,9 +212,7 @@ export function TerminalWorkspaceTabBar(props: {
         <span className="h-4 w-px border-l border-dashed border-border group-hover/gap:border-foreground/60" />
       </button>
     ) : null;
-  const narrowActiveGroup = props.terminalGroups.find(
-    (group) => group.id === props.activeGroupId,
-  );
+  const narrowActiveGroup = props.terminalGroups.find((group) => group.id === props.activeGroupId);
   const narrowActiveGroupIndex = narrowActiveGroup
     ? props.terminalGroups.indexOf(narrowActiveGroup)
     : -1;
@@ -240,7 +234,9 @@ export function TerminalWorkspaceTabBar(props: {
                 </option>
               );
             })}
-            {props.terminalGroups.length === 0 ? <option value="">All groups archived</option> : null}
+            {props.terminalGroups.length === 0 ? (
+              <option value="">All groups archived</option>
+            ) : null}
           </select>
         </label>
         {narrowActiveGroup ? (
@@ -255,15 +251,21 @@ export function TerminalWorkspaceTabBar(props: {
             <ComposerPickerMenuPopup align="end" side="bottom" className="min-w-48">
               <MenuItem
                 disabled={narrowActiveGroupIndex <= 0}
-                onClick={() => props.onReorderGroup?.(narrowActiveGroup.id, narrowActiveGroupIndex - 1)}
+                onClick={() =>
+                  props.onReorderGroup?.(narrowActiveGroup.id, narrowActiveGroupIndex - 1)
+                }
               >
-                <ArrowLeftIcon />Move left
+                <ArrowLeftIcon />
+                Move left
               </MenuItem>
               <MenuItem
                 disabled={narrowActiveGroupIndex >= props.terminalGroups.length - 1}
-                onClick={() => props.onReorderGroup?.(narrowActiveGroup.id, narrowActiveGroupIndex + 1)}
+                onClick={() =>
+                  props.onReorderGroup?.(narrowActiveGroup.id, narrowActiveGroupIndex + 1)
+                }
               >
-                <ArrowRightIcon />Move right
+                <ArrowRightIcon />
+                Move right
               </MenuItem>
               {selectedTerminalIds.length > 0
                 ? props.terminalGroups
@@ -271,30 +273,41 @@ export function TerminalWorkspaceTabBar(props: {
                     .map((group) => (
                       <MenuItem
                         key={group.id}
-                        onClick={() => props.onMoveTerminalsToGroup?.(selectedTerminalIds, group.id)}
+                        onClick={() =>
+                          props.onMoveTerminalsToGroup?.(selectedTerminalIds, group.id)
+                        }
                       >
-                        Move {selectedTerminalIds.length} selected to {group.name} — {statusForGroup(group).label}
+                        Move {selectedTerminalIds.length} selected to {group.name} —{" "}
+                        {statusForGroup(group).label}
                       </MenuItem>
                     ))
                 : null}
               {selectedTerminalIds.length > 0 ? (
-                <MenuItem
-                  onClick={() => props.onMoveTerminalsToNewGroup?.(selectedTerminalIds)}
-                >
+                <MenuItem onClick={() => props.onMoveTerminalsToNewGroup?.(selectedTerminalIds)}>
                   Move {selectedTerminalIds.length} selected to new group
                 </MenuItem>
               ) : null}
               <MenuSeparator />
-              <MenuItem onClick={() => {
-                const nextName = window.prompt("Rename terminal group", narrowActiveGroup.name);
-                if (nextName?.trim()) props.onRenameGroup?.(narrowActiveGroup.id, nextName);
-              }}><PencilIcon />Rename…</MenuItem>
+              <MenuItem
+                onClick={() => {
+                  const nextName = window.prompt("Rename terminal group", narrowActiveGroup.name);
+                  if (nextName?.trim()) props.onRenameGroup?.(narrowActiveGroup.id, nextName);
+                }}
+              >
+                <PencilIcon />
+                Rename…
+              </MenuItem>
               <MenuSub>
                 <MenuSubTrigger>Change role</MenuSubTrigger>
                 <MenuSubPopup surface="composer">
                   {TERMINAL_GROUP_ROLES.map((role) => (
-                    <MenuItem key={role} onClick={() => props.onRoleChange?.(narrowActiveGroup.id, role)}>
-                      {role === narrowActiveGroup.role ? "✓ " : ""}{role[0]?.toUpperCase()}{role.slice(1)}
+                    <MenuItem
+                      key={role}
+                      onClick={() => props.onRoleChange?.(narrowActiveGroup.id, role)}
+                    >
+                      {role === narrowActiveGroup.role ? "✓ " : ""}
+                      {role[0]?.toUpperCase()}
+                      {role.slice(1)}
                     </MenuItem>
                   ))}
                 </MenuSubPopup>
@@ -306,9 +319,18 @@ export function TerminalWorkspaceTabBar(props: {
                   Stop all running terminals
                 </MenuItem>
               ) : null}
-              <MenuItem onClick={() => props.onArchiveGroup?.(narrowActiveGroup.id)}><ArchiveIcon />Archive group</MenuItem>
+              <MenuItem onClick={() => props.onArchiveGroup?.(narrowActiveGroup.id)}>
+                <ArchiveIcon />
+                Archive group
+              </MenuItem>
               <MenuSeparator />
-              <MenuItem variant="destructive" onClick={() => props.onCloseGroup(narrowActiveGroup.id)}><Trash2 />Close and remove</MenuItem>
+              <MenuItem
+                variant="destructive"
+                onClick={() => props.onCloseGroup(narrowActiveGroup.id)}
+              >
+                <Trash2 />
+                Close and remove
+              </MenuItem>
             </ComposerPickerMenuPopup>
           </Menu>
         ) : null}
@@ -317,108 +339,156 @@ export function TerminalWorkspaceTabBar(props: {
           role="tablist"
           aria-label="Terminal groups"
         >
-        {props.terminalGroups.map((terminalGroup, index) => {
-          const RoleIcon = ROLE_ICON[terminalGroup.role];
-          const isActive = terminalGroup.id === props.activeGroupId;
-          const status = statusForGroup(terminalGroup);
-          const activityState =
-            status.status === "attention"
-              ? "attention"
-              : status.status === "running"
-                ? "running"
-                : status.status === "failed" || status.status === "stopped"
-                  ? status.status
-                  : null;
-          return (
-            <Fragment key={terminalGroup.id}>
-            {newGroupGap(index, false)}
-            <div
-              className="group flex shrink-0 items-center rounded-md border border-transparent data-[active=true]:border-border/70 data-[active=true]:bg-secondary/60"
-              data-active={isActive}
-              onDragOver={allowTerminalDragOver}
-              onDrop={(event) => dropOnGroup(event, terminalGroup.id, index)}
-            >
-              <button
-                type="button"
-                role="tab"
-                id={`terminal-group-tab-${terminalGroup.id}`}
-                aria-controls={`terminal-group-panel-${terminalGroup.id}`}
-                aria-selected={isActive}
-                aria-label={`${terminalGroup.name}, ${status.label}, ${terminalGroup.terminalIds.length} terminal${terminalGroup.terminalIds.length === 1 ? "" : "s"}`}
-                tabIndex={isActive || props.activeGroupId === null ? 0 : -1}
-                data-terminal-group-id={terminalGroup.id}
-                className="flex h-7 max-w-48 items-center gap-1.5 rounded-l-md px-2 text-xs text-muted-foreground outline-none hover:text-foreground focus-visible:ring-1 focus-visible:ring-ring/60 data-[active=true]:text-foreground"
-                data-active={isActive}
-                draggable
-                onClick={() => props.onActiveGroupChange(terminalGroup.id)}
-                onKeyDown={(event) => onGroupKeyDown(event, index)}
-                onDragStart={(event) =>
-                  writeTerminalDragPayload(event.dataTransfer, {
-                    kind: "group",
-                    groupId: terminalGroup.id,
-                  })
-                }
-              >
-                <RoleIcon className={cn("size-3.5", ACCENT_CLASS[terminalGroup.accent])} />
-                {activityState ? <TerminalActivityIndicator className="text-foreground/70" state={activityState} /> : null}
-                <span className="truncate">{terminalGroup.name}</span>
-                {status.runningCount > 0 ? <span className="text-[10px] text-current/60">{status.runningCount}</span> : null}
-              </button>
-              <button
-                type="button"
-                className="flex size-7 items-center justify-center text-muted-foreground opacity-0 hover:bg-secondary hover:text-foreground focus:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring/60 group-hover:opacity-100"
-                aria-label={`Archive ${terminalGroup.name}`}
-                onClick={() => props.onArchiveGroup?.(terminalGroup.id)}
-              >
-                <ArchiveIcon className="size-3.5" />
-              </button>
-              <Menu>
-                <MenuTrigger
-                  aria-label={`Manage ${terminalGroup.name}`}
-                  render={<button type="button" className="flex size-7 items-center justify-center rounded-r-md text-muted-foreground hover:bg-secondary hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring/60" />}
+          {props.terminalGroups.map((terminalGroup, index) => {
+            const RoleIcon = ROLE_ICON[terminalGroup.role];
+            const isActive = terminalGroup.id === props.activeGroupId;
+            const status = statusForGroup(terminalGroup);
+            const activityState =
+              status.status === "attention"
+                ? "attention"
+                : status.status === "running"
+                  ? "running"
+                  : status.status === "failed" || status.status === "stopped"
+                    ? status.status
+                    : null;
+            return (
+              <Fragment key={terminalGroup.id}>
+                {newGroupGap(index, false)}
+                <div
+                  className="group flex shrink-0 items-center rounded-md border border-transparent data-[active=true]:border-border/70 data-[active=true]:bg-secondary/60"
+                  data-active={isActive}
+                  onDragOver={allowTerminalDragOver}
+                  onDrop={(event) => dropOnGroup(event, terminalGroup.id, index)}
                 >
-                  <EllipsisIcon className="size-3.5" />
-                </MenuTrigger>
-                <ComposerPickerMenuPopup align="end" side="bottom" className="min-w-48">
-                  <MenuItem disabled={index === 0} onClick={() => props.onReorderGroup?.(terminalGroup.id, index - 1)}><ArrowLeftIcon />Move left</MenuItem>
-                  <MenuItem disabled={index === props.terminalGroups.length - 1} onClick={() => props.onReorderGroup?.(terminalGroup.id, index + 1)}><ArrowRightIcon />Move right</MenuItem>
-                  {selectedTerminalIds.length > 0 ? (
-                    <MenuItem
-                      onClick={() =>
-                        props.onMoveTerminalsToGroup?.(selectedTerminalIds, terminalGroup.id)
+                  <button
+                    type="button"
+                    role="tab"
+                    id={`terminal-group-tab-${terminalGroup.id}`}
+                    aria-controls={`terminal-group-panel-${terminalGroup.id}`}
+                    aria-selected={isActive}
+                    aria-label={`${terminalGroup.name}, ${status.label}, ${terminalGroup.terminalIds.length} terminal${terminalGroup.terminalIds.length === 1 ? "" : "s"}`}
+                    tabIndex={isActive || props.activeGroupId === null ? 0 : -1}
+                    data-terminal-group-id={terminalGroup.id}
+                    className="flex h-7 max-w-48 items-center gap-1.5 rounded-l-md px-2 text-xs text-muted-foreground outline-none hover:text-foreground focus-visible:ring-1 focus-visible:ring-ring/60 data-[active=true]:text-foreground"
+                    data-active={isActive}
+                    draggable
+                    onClick={() => props.onActiveGroupChange(terminalGroup.id)}
+                    onKeyDown={(event) => onGroupKeyDown(event, index)}
+                    onDragStart={(event) =>
+                      writeTerminalDragPayload(event.dataTransfer, {
+                        kind: "group",
+                        groupId: terminalGroup.id,
+                      })
+                    }
+                  >
+                    <RoleIcon className={cn("size-3.5", ACCENT_CLASS[terminalGroup.accent])} />
+                    {activityState ? (
+                      <TerminalActivityIndicator
+                        className="text-foreground/70"
+                        state={activityState}
+                      />
+                    ) : null}
+                    <span className="truncate">{terminalGroup.name}</span>
+                    {status.runningCount > 0 ? (
+                      <span className="text-[10px] text-current/60">{status.runningCount}</span>
+                    ) : null}
+                  </button>
+                  <button
+                    type="button"
+                    className="flex size-7 items-center justify-center text-muted-foreground opacity-0 hover:bg-secondary hover:text-foreground focus:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring/60 group-hover:opacity-100"
+                    aria-label={`Archive ${terminalGroup.name}`}
+                    onClick={() => props.onArchiveGroup?.(terminalGroup.id)}
+                  >
+                    <ArchiveIcon className="size-3.5" />
+                  </button>
+                  <Menu>
+                    <MenuTrigger
+                      aria-label={`Manage ${terminalGroup.name}`}
+                      render={
+                        <button
+                          type="button"
+                          className="flex size-7 items-center justify-center rounded-r-md text-muted-foreground hover:bg-secondary hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring/60"
+                        />
                       }
                     >
-                      Move {selectedTerminalIds.length} selected here
-                    </MenuItem>
-                  ) : null}
-                  <MenuSeparator />
-                  <MenuItem onClick={() => {
-                    const nextName = window.prompt("Rename terminal group", terminalGroup.name);
-                    if (nextName?.trim()) props.onRenameGroup?.(terminalGroup.id, nextName);
-                  }}><PencilIcon />Rename…</MenuItem>
-                  <MenuSub>
-                    <MenuSubTrigger>Change role</MenuSubTrigger>
-                    <MenuSubPopup surface="composer">
-                      {TERMINAL_GROUP_ROLES.map((role) => (
-                        <MenuItem key={role} onClick={() => props.onRoleChange?.(terminalGroup.id, role)}>
-                          {role === terminalGroup.role ? "✓ " : ""}{role[0]?.toUpperCase()}{role.slice(1)}
+                      <EllipsisIcon className="size-3.5" />
+                    </MenuTrigger>
+                    <ComposerPickerMenuPopup align="end" side="bottom" className="min-w-48">
+                      <MenuItem
+                        disabled={index === 0}
+                        onClick={() => props.onReorderGroup?.(terminalGroup.id, index - 1)}
+                      >
+                        <ArrowLeftIcon />
+                        Move left
+                      </MenuItem>
+                      <MenuItem
+                        disabled={index === props.terminalGroups.length - 1}
+                        onClick={() => props.onReorderGroup?.(terminalGroup.id, index + 1)}
+                      >
+                        <ArrowRightIcon />
+                        Move right
+                      </MenuItem>
+                      {selectedTerminalIds.length > 0 ? (
+                        <MenuItem
+                          onClick={() =>
+                            props.onMoveTerminalsToGroup?.(selectedTerminalIds, terminalGroup.id)
+                          }
+                        >
+                          Move {selectedTerminalIds.length} selected here
                         </MenuItem>
-                      ))}
-                    </MenuSubPopup>
-                  </MenuSub>
-                  {status.runningCount > 0 ? (
-                    <MenuItem onClick={() => props.onStopGroup?.(terminalGroup.id)}>Stop all running terminals</MenuItem>
-                  ) : null}
-                  <MenuItem onClick={() => props.onArchiveGroup?.(terminalGroup.id)}><ArchiveIcon />Archive group</MenuItem>
-                  <MenuSeparator />
-                  <MenuItem variant="destructive" onClick={() => props.onCloseGroup(terminalGroup.id)}><Trash2 />Close and remove</MenuItem>
-                </ComposerPickerMenuPopup>
-              </Menu>
-            </div>
-            </Fragment>
-          );
-        })}
-        {newGroupGap(props.terminalGroups.length, true)}
+                      ) : null}
+                      <MenuSeparator />
+                      <MenuItem
+                        onClick={() => {
+                          const nextName = window.prompt(
+                            "Rename terminal group",
+                            terminalGroup.name,
+                          );
+                          if (nextName?.trim()) props.onRenameGroup?.(terminalGroup.id, nextName);
+                        }}
+                      >
+                        <PencilIcon />
+                        Rename…
+                      </MenuItem>
+                      <MenuSub>
+                        <MenuSubTrigger>Change role</MenuSubTrigger>
+                        <MenuSubPopup surface="composer">
+                          {TERMINAL_GROUP_ROLES.map((role) => (
+                            <MenuItem
+                              key={role}
+                              onClick={() => props.onRoleChange?.(terminalGroup.id, role)}
+                            >
+                              {role === terminalGroup.role ? "✓ " : ""}
+                              {role[0]?.toUpperCase()}
+                              {role.slice(1)}
+                            </MenuItem>
+                          ))}
+                        </MenuSubPopup>
+                      </MenuSub>
+                      {status.runningCount > 0 ? (
+                        <MenuItem onClick={() => props.onStopGroup?.(terminalGroup.id)}>
+                          Stop all running terminals
+                        </MenuItem>
+                      ) : null}
+                      <MenuItem onClick={() => props.onArchiveGroup?.(terminalGroup.id)}>
+                        <ArchiveIcon />
+                        Archive group
+                      </MenuItem>
+                      <MenuSeparator />
+                      <MenuItem
+                        variant="destructive"
+                        onClick={() => props.onCloseGroup(terminalGroup.id)}
+                      >
+                        <Trash2 />
+                        Close and remove
+                      </MenuItem>
+                    </ComposerPickerMenuPopup>
+                  </Menu>
+                </div>
+              </Fragment>
+            );
+          })}
+          {newGroupGap(props.terminalGroups.length, true)}
         </div>
         <div className="flex shrink-0 items-center">
           {archivedGroups.length > 0 ? (
@@ -438,17 +508,29 @@ export function TerminalWorkspaceTabBar(props: {
         </div>
       </div>
       <DisclosureRegion open={props.showArchived === true && archivedGroups.length > 0}>
-        <div className="flex flex-wrap gap-1 border-t border-border/50 px-2 py-1.5" aria-label="Archived terminal groups">
+        <div
+          className="flex flex-wrap gap-1 border-t border-border/50 px-2 py-1.5"
+          aria-label="Archived terminal groups"
+        >
           {archivedGroups.map((group) => (
             <div
               key={group.id}
               className="flex items-center gap-1 rounded-md border border-dashed border-border/70 px-2 py-1 text-xs text-muted-foreground"
-              title={group.archivedAt === null ? "Archived" : `Archived ${new Date(group.archivedAt).toLocaleString()}`}
+              title={
+                group.archivedAt === null
+                  ? "Archived"
+                  : `Archived ${new Date(group.archivedAt).toLocaleString()}`
+              }
             >
               <ArchiveIcon className="size-3" />
               <span>{group.name}</span>
-              <button type="button" className="rounded px-1 text-foreground hover:bg-secondary focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring/60" onClick={() => props.onRestoreGroup?.(group.id)}>
-                <RefreshCwIcon className="mr-1 inline size-3" />Restore
+              <button
+                type="button"
+                className="rounded px-1 text-foreground hover:bg-secondary focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring/60"
+                onClick={() => props.onRestoreGroup?.(group.id)}
+              >
+                <RefreshCwIcon className="mr-1 inline size-3" />
+                Restore
               </button>
               <button
                 type="button"

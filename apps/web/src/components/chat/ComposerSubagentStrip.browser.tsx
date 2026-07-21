@@ -49,13 +49,19 @@ describe("ComposerSubagentStrip settled details", () => {
   it("auto-compacts once and preserves a user's expansion through equivalent refreshes", async () => {
     const view = await render(<Harness />);
 
-    await expect.element(page.getByText("2 subagents settled · 1 completed · 1 failed")).toBeVisible();
+    await expect
+      .element(page.getByText("2 subagents settled · 1 completed · 1 failed"))
+      .toBeVisible();
     await page.getByRole("button", { name: "Expand subagent strip" }).click();
-    await expect.element(page.getByRole("button", { name: "Collapse subagent strip" })).toBeVisible();
+    await expect
+      .element(page.getByRole("button", { name: "Collapse subagent strip" }))
+      .toBeVisible();
     await expect.element(page.getByText("completed-child", { exact: true })).toBeVisible();
     await expect.element(page.getByText("failed-child", { exact: true })).toBeVisible();
 
     await view.rerender(<Harness items={[...SETTLED_ITEMS]} />);
-    await expect.element(page.getByRole("button", { name: "Collapse subagent strip" })).toBeVisible();
+    await expect
+      .element(page.getByRole("button", { name: "Collapse subagent strip" }))
+      .toBeVisible();
   });
 });

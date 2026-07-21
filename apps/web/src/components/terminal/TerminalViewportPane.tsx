@@ -64,9 +64,7 @@ interface TerminalViewportPaneProps {
   onTerminalDragStart?:
     | ((event: ReactDragEvent<HTMLDivElement>, terminalId: string) => void)
     | undefined;
-  onTerminalDrop?:
-    | ((terminalIds: readonly string[], targetTerminalId: string) => void)
-    | undefined;
+  onTerminalDrop?: ((terminalIds: readonly string[], targetTerminalId: string) => void) | undefined;
   presentationMode: ThreadTerminalPresentationMode;
   onTogglePresentationMode?: (() => void) | undefined;
   onTogglePanel?: (() => void) | undefined;
@@ -193,7 +191,8 @@ export default function TerminalViewportPane({
                     }}
                     onDragStart={(event) => onTerminalDragStart?.(event, terminalId)}
                     onDragOver={(event) => {
-                      if (!Array.from(event.dataTransfer.types).includes(TERMINAL_DRAG_MIME)) return;
+                      if (!Array.from(event.dataTransfer.types).includes(TERMINAL_DRAG_MIME))
+                        return;
                       event.preventDefault();
                       event.dataTransfer.dropEffect = "move";
                     }}

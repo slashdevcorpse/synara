@@ -109,9 +109,7 @@ function activityLabel(state: AgentActivityRenderableState): string {
   }
   const runningSubagentCount = state.subagentRunningCount ?? state.subagentCount;
   if (runningSubagentCount > 0) {
-    parts.push(
-      `${runningSubagentCount} ${runningSubagentCount === 1 ? "subagent" : "subagents"}`,
-    );
+    parts.push(`${runningSubagentCount} ${runningSubagentCount === 1 ? "subagent" : "subagents"}`);
   }
 
   return parts.length > 0 ? `Agent is running ${parts.join(" and ")}` : "Agent is running tools";
@@ -131,10 +129,7 @@ function ActivityVisual({
 }) {
   const phase = state.phase as Exclude<AgentActivityPhase, "idle">;
   const runningSubagentCount = state.subagentRunningCount ?? state.subagentCount;
-  const visibleSubagentCount = Math.min(
-    runningSubagentCount,
-    MAX_VISIBLE_SUBAGENT_SEGMENTS,
-  );
+  const visibleSubagentCount = Math.min(runningSubagentCount, MAX_VISIBLE_SUBAGENT_SEGMENTS);
   const hasOverflow = runningSubagentCount > MAX_VISIBLE_SUBAGENT_SEGMENTS;
   const segments = [
     { key: "primary", role: "primary" },

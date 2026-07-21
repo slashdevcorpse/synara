@@ -197,15 +197,15 @@ export function WorkspaceDashboardRoute() {
   const agentActivityByThreadId = useMemo(
     () =>
       new Map(
-        workspaceAgentActivity.threads.map((entry) => [entry.threadId, entry.activityState] as const),
+        workspaceAgentActivity.threads.map(
+          (entry) => [entry.threadId, entry.activityState] as const,
+        ),
       ),
     [workspaceAgentActivity.threads],
   );
   const terminalStateByThreadId = useTerminalStateStore((state) => state.terminalStateByThreadId);
   const projectRunsByProjectId = useProjectRunStore((state) => state.runsByProjectId);
-  const activeGitActionIdsByCwd = useGitActionActivityStore(
-    (state) => state.activeActionIdsByCwd,
-  );
+  const activeGitActionIdsByCwd = useGitActionActivityStore((state) => state.activeActionIdsByCwd);
   const activeGitActionCwds = useMemo(
     () => [...activeGitActionIdsByCwd.keys()],
     [activeGitActionIdsByCwd],

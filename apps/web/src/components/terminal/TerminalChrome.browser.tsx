@@ -31,9 +31,7 @@ describe("TerminalWorkspaceTabBar", () => {
     const onRestoreGroup = vi.fn();
     await render(
       <TerminalWorkspaceTabBar
-        terminalGroups={[
-          resolvedGroup("development", "dev", { name: "Development", role: "app" }),
-        ]}
+        terminalGroups={[resolvedGroup("development", "dev", { name: "Development", role: "app" })]}
         archivedTerminalGroups={[
           resolvedGroup("logs", "logs-terminal", {
             name: "Logs",
@@ -58,7 +56,9 @@ describe("TerminalWorkspaceTabBar", () => {
 
     await expect.element(page.getByRole("tab", { name: /Development, 1 running/ })).toBeVisible();
     expect(
-      document.querySelector('[data-terminal-group-id="development"]')?.getAttribute("aria-controls"),
+      document
+        .querySelector('[data-terminal-group-id="development"]')
+        ?.getAttribute("aria-controls"),
     ).toBe("terminal-group-panel-development");
     await page.getByRole("button", { name: "Archive Development" }).click();
     expect(onArchiveGroup).toHaveBeenCalledWith("development");
@@ -102,10 +102,7 @@ describe("TerminalWorkspaceTabBar", () => {
     document
       .querySelector<HTMLElement>('[data-terminal-group-id="two"]')
       ?.dispatchEvent(new DragEvent("drop", { bubbles: true, dataTransfer: terminalTransfer }));
-    expect(onMoveTerminalsToGroup).toHaveBeenCalledWith(
-      ["terminal-one", "terminal-extra"],
-      "two",
-    );
+    expect(onMoveTerminalsToGroup).toHaveBeenCalledWith(["terminal-one", "terminal-extra"], "two");
 
     const groupTransfer = new DataTransfer();
     writeTerminalDragPayload(groupTransfer, { kind: "group", groupId: "one" });
@@ -118,10 +115,7 @@ describe("TerminalWorkspaceTabBar", () => {
     document
       .querySelector<HTMLElement>('[data-terminal-new-group-index="1"]')
       ?.dispatchEvent(new DragEvent("drop", { bubbles: true, dataTransfer: terminalTransfer }));
-    expect(onMoveTerminalsToNewGroup).toHaveBeenCalledWith(
-      ["terminal-one", "terminal-extra"],
-      1,
-    );
+    expect(onMoveTerminalsToNewGroup).toHaveBeenCalledWith(["terminal-one", "terminal-extra"], 1);
 
     await page
       .getByRole("button", { name: "Move selected terminals to new group", exact: true })
@@ -193,17 +187,21 @@ describe("TerminalWorkspaceTabBar", () => {
       />,
     );
 
-    await expect.element(
-      page.getByRole("button", { name: "Stopped shell, Stopped", exact: true }),
-    ).toBeVisible();
-    await expect.element(
-      page.getByRole("button", { name: "Failed build, Failed", exact: true }),
-    ).toBeVisible();
+    await expect
+      .element(page.getByRole("button", { name: "Stopped shell, Stopped", exact: true }))
+      .toBeVisible();
+    await expect
+      .element(page.getByRole("button", { name: "Failed build, Failed", exact: true }))
+      .toBeVisible();
     expect(
-      document.querySelector('[data-terminal-tab-id="stopped"]')?.getAttribute("data-terminal-state"),
+      document
+        .querySelector('[data-terminal-tab-id="stopped"]')
+        ?.getAttribute("data-terminal-state"),
     ).toBe("stopped");
     expect(
-      document.querySelector('[data-terminal-tab-id="failed"]')?.getAttribute("data-terminal-state"),
+      document
+        .querySelector('[data-terminal-tab-id="failed"]')
+        ?.getAttribute("data-terminal-state"),
     ).toBe("failed");
     expect(document.querySelector('[data-terminal-visual-state="stopped"]')).not.toBeNull();
     expect(document.querySelector('[data-terminal-visual-state="failed"]')).not.toBeNull();
@@ -241,9 +239,7 @@ describe("TerminalWorkspaceTabBar", () => {
     expect(onMoveTerminalsToGroup).toHaveBeenCalledWith(["terminal-one"], "two");
 
     await page.getByRole("button", { name: "Manage One" }).click();
-    await page
-      .getByRole("menuitem", { name: "Move 1 selected to new group", exact: true })
-      .click();
+    await page.getByRole("menuitem", { name: "Move 1 selected to new group", exact: true }).click();
     expect(onMoveTerminalsToNewGroup).toHaveBeenCalledWith(["terminal-one"]);
   });
 

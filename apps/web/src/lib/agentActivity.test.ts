@@ -10,7 +10,9 @@ import {
 
 const TURN_ID = "turn-activity" as never;
 
-function input(overrides: Partial<AgentActivityDerivationInput> = {}): AgentActivityDerivationInput {
+function input(
+  overrides: Partial<AgentActivityDerivationInput> = {},
+): AgentActivityDerivationInput {
   return {
     threadId: "thread-activity",
     hasMessages: true,
@@ -42,15 +44,19 @@ describe("deriveAgentActivityState", () => {
       "connecting",
     );
     expect(deriveAgentActivityState(input()).phase).toBe("thinking");
-    expect(
-      deriveAgentActivityState(input({ hasStreamingAssistantMessage: true })).phase,
-    ).toBe("streaming");
+    expect(deriveAgentActivityState(input({ hasStreamingAssistantMessage: true })).phase).toBe(
+      "streaming",
+    );
     expect(deriveAgentActivityState(input({ activeToolCount: 1 })).phase).toBe("tool-running");
     expect(
       deriveAgentActivityState(
         input({
           session: { ...input().session!, status: "ready", activeTurnId: null },
-          latestTurn: { ...input().latestTurn!, state: "completed", completedAt: "2026-07-21T12:00:04.000Z" },
+          latestTurn: {
+            ...input().latestTurn!,
+            state: "completed",
+            completedAt: "2026-07-21T12:00:04.000Z",
+          },
           hasLiveTailWork: false,
         }),
       ).phase,
@@ -76,7 +82,12 @@ describe("deriveAgentActivityState", () => {
     const subagentStates = new Map([
       [
         "child-1",
-        { id: "child-1", phase: "streaming" as const, latestToolName: null, streamPreview: "child" },
+        {
+          id: "child-1",
+          phase: "streaming" as const,
+          latestToolName: null,
+          streamPreview: "child",
+        },
       ],
       [
         "child-2",

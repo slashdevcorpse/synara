@@ -102,10 +102,7 @@ export function isLiveAgentActivityPhase(phase: AgentActivityPhase): boolean {
 
 export function isTerminalAgentActivityPhase(phase: AgentActivityPhase): boolean {
   return (
-    phase === "completed" ||
-    phase === "failed" ||
-    phase === "interrupted" ||
-    phase === "stopped"
+    phase === "completed" || phase === "failed" || phase === "interrupted" || phase === "stopped"
   );
 }
 
@@ -116,10 +113,7 @@ function timestamp(value: string | null | undefined): number {
 }
 
 function resolveActiveTurnId(input: AgentActivityDerivationInput): TurnId | null {
-  if (
-    input.session?.status === "running" &&
-    input.session.activeTurnId !== null
-  ) {
+  if (input.session?.status === "running" && input.session.activeTurnId !== null) {
     return input.session.activeTurnId;
   }
   if (input.latestTurn?.state === "running" && input.latestTurn.completedAt === null) {
@@ -198,9 +192,7 @@ function withEvidence(
   };
 }
 
-export function deriveAgentActivityState(
-  input: AgentActivityDerivationInput,
-): AgentActivityState {
+export function deriveAgentActivityState(input: AgentActivityDerivationInput): AgentActivityState {
   if (!input.threadId) return IDLE_AGENT_ACTIVITY_STATE;
 
   const subagentStates = input.subagentStates ?? EMPTY_SUBAGENT_STATES;
@@ -240,8 +232,7 @@ export function deriveAgentActivityState(
     beginningLifecycle ||
     activeTurnId !== null ||
     hasRunningSubagent ||
-    (input.hasLiveTailWork &&
-      (input.latestTurn === null || input.latestTurn.state === "running"));
+    (input.hasLiveTailWork && (input.latestTurn === null || input.latestTurn.state === "running"));
   if (
     !live ||
     (!input.hasMessages && !beginningLifecycle && activeTurnId === null && !hasRunningSubagent)

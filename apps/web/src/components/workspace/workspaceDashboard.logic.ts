@@ -192,15 +192,17 @@ function deriveActivity(
       hasPendingUserInput: thread.hasPendingUserInput,
     });
     if (isDashboardInteraction(status)) {
-      return [{
-        threadId: thread.id,
-        label: status.label,
-        colorClass: status.colorClass,
-        dotClass: status.dotClass,
-        pulse: status.pulse,
-        priority: status.label === "Pending Approval" ? 7 : 6,
-        updatedAtMs: timestampMs(threadTimestamp(thread)),
-      }];
+      return [
+        {
+          threadId: thread.id,
+          label: status.label,
+          colorClass: status.colorClass,
+          dotClass: status.dotClass,
+          pulse: status.pulse,
+          priority: status.label === "Pending Approval" ? 7 : 6,
+          updatedAtMs: timestampMs(threadTimestamp(thread)),
+        },
+      ];
     }
 
     const activity = agentActivityByThreadId?.get(thread.id);
@@ -211,20 +213,21 @@ function deriveActivity(
         : activity.phase;
     if (agentStatus !== "queued" && !isLiveAgentActivityPhase(agentStatus)) return [];
     const presentation = agentStatusPresentation(agentStatus);
-    return [{
-      threadId: thread.id,
-      label: presentation.label,
-      colorClass: presentation.textClassName,
-      dotClass: presentation.dotClassName,
-      pulse: isLiveAgentActivityPhase(activity.phase),
-      priority: AGENT_ACTIVITY_PRIORITY[agentStatus],
-      updatedAtMs: timestampMs(threadTimestamp(thread)),
-    }];
+    return [
+      {
+        threadId: thread.id,
+        label: presentation.label,
+        colorClass: presentation.textClassName,
+        dotClass: presentation.dotClassName,
+        pulse: isLiveAgentActivityPhase(activity.phase),
+        priority: AGENT_ACTIVITY_PRIORITY[agentStatus],
+        updatedAtMs: timestampMs(threadTimestamp(thread)),
+      },
+    ];
   });
 
   const selected = candidates.toSorted(
-    (left, right) =>
-      right.priority - left.priority || right.updatedAtMs - left.updatedAtMs,
+    (left, right) => right.priority - left.priority || right.updatedAtMs - left.updatedAtMs,
   )[0];
   if (!selected) return null;
   return {

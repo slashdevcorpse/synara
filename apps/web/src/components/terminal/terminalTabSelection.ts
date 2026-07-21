@@ -45,7 +45,8 @@ export function pruneTerminalTabSelection(
 ): TerminalTabSelection {
   const validIds = new Set(validTerminalIds);
   const selectedIds = new Set([...selection.selectedIds].filter((id) => validIds.has(id)));
-  const anchorId = selection.anchorId && validIds.has(selection.anchorId) ? selection.anchorId : null;
+  const anchorId =
+    selection.anchorId && validIds.has(selection.anchorId) ? selection.anchorId : null;
   if (selectedIds.size === selection.selectedIds.size && anchorId === selection.anchorId) {
     return selection;
   }

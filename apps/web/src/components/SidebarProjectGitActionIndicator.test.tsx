@@ -5,9 +5,7 @@ import { SidebarProjectGitActionIndicator } from "./SidebarProjectGitActionIndic
 
 describe("SidebarProjectGitActionIndicator", () => {
   it("is visibly distinct and exposes the matched project in its accessible name", () => {
-    const markup = renderToStaticMarkup(
-      <SidebarProjectGitActionIndicator projectName="Synara" />,
-    );
+    const markup = renderToStaticMarkup(<SidebarProjectGitActionIndicator projectName="Synara" />);
 
     expect(markup).toContain('role="status"');
     expect(markup).toContain('aria-label="Git operation running for Synara"');

@@ -25,11 +25,7 @@ import {
 } from "../../lib/agentActivity";
 import type { ChatMessage, ThreadSession } from "../../types";
 
-export {
-  IDLE_AGENT_ACTIVITY_STATE,
-  isLiveAgentActivityPhase,
-  isTerminalAgentActivityPhase,
-};
+export { IDLE_AGENT_ACTIVITY_STATE, isLiveAgentActivityPhase, isTerminalAgentActivityPhase };
 export type { AgentActivityPhase, AgentActivityState };
 
 type AgentActivityLike = Pick<
@@ -83,14 +79,17 @@ export function deriveAgentActivityState(input: AgentActivityInput): AgentActivi
     ...relevantMessages.map((message) => message.completedAt ?? message.createdAt),
   ]);
 
-  const { activeToolCount, latestToolName, subagentStates: eventSubagentStates } =
-    activeTurnId === null
-      ? {
-          activeToolCount: 0,
-          latestToolName: null,
-          subagentStates: new Map<string, AgentSubagentActivityState>(),
-        }
-      : deriveActiveLifecycleCounts(relevantActivities);
+  const {
+    activeToolCount,
+    latestToolName,
+    subagentStates: eventSubagentStates,
+  } = activeTurnId === null
+    ? {
+        activeToolCount: 0,
+        latestToolName: null,
+        subagentStates: new Map<string, AgentSubagentActivityState>(),
+      }
+    : deriveActiveLifecycleCounts(relevantActivities);
   const subagentStates = input.subagentStates ?? eventSubagentStates;
   const latestStreamingMessage = [...relevantMessages]
     .reverse()

@@ -98,8 +98,9 @@ function normalizeTerminalExitStates(
   const validIds = new Set(terminalIds);
   return Object.fromEntries(
     Object.entries(states ?? {})
-      .filter(([terminalId, state]) =>
-        validIds.has(terminalId) && (state?.kind === "stopped" || state?.kind === "failed"),
+      .filter(
+        ([terminalId, state]) =>
+          validIds.has(terminalId) && (state?.kind === "stopped" || state?.kind === "failed"),
       )
       .map(([terminalId, state]) => [
         terminalId,
@@ -355,11 +356,14 @@ function normalizeTerminalGroups(
       createTerminalGroup(
         assignUniqueGroupId(fallbackGroupId(terminalId), usedGroupIds),
         terminalId,
-        normalizeTerminalGroupMetadata({}, {
-          fallbackIndex: nextGroups.length,
-          fallbackName: terminalLabelsById[terminalId] ?? null,
-          cliKinds: [terminalCliKindsById[terminalId]],
-        }),
+        normalizeTerminalGroupMetadata(
+          {},
+          {
+            fallbackIndex: nextGroups.length,
+            fallbackName: terminalLabelsById[terminalId] ?? null,
+            cliKinds: [terminalCliKindsById[terminalId]],
+          },
+        ),
       ),
     );
   }
@@ -1094,8 +1098,10 @@ function newThreadTerminalTab(
   }
 
   const terminalGroups = copyTerminalGroups(normalized.terminalGroups);
-  let activeGroupIndex = terminalGroups.findIndex((group) =>
-    group.archivedAt === null && collectTerminalIdsFromLayout(group.layout).includes(targetTerminalId),
+  let activeGroupIndex = terminalGroups.findIndex(
+    (group) =>
+      group.archivedAt === null &&
+      collectTerminalIdsFromLayout(group.layout).includes(targetTerminalId),
   );
   if (activeGroupIndex < 0) {
     activeGroupIndex = terminalGroups.findIndex(
@@ -1142,8 +1148,10 @@ function setThreadActiveTerminal(
     return normalized;
   }
   const activeTerminalGroupId =
-    normalized.terminalGroups.find((group) =>
-      group.archivedAt === null && collectTerminalIdsFromLayout(group.layout).includes(terminalId),
+    normalized.terminalGroups.find(
+      (group) =>
+        group.archivedAt === null &&
+        collectTerminalIdsFromLayout(group.layout).includes(terminalId),
     )?.id ?? normalized.activeTerminalGroupId;
   if (
     !normalized.terminalGroups.some(
@@ -1366,8 +1374,11 @@ function restoreThreadTerminalGroup(
     groupId,
     restoredAt: Date.now(),
   });
-  const restored = terminalGroups.find((group) => group.id === groupId && group.archivedAt === null);
-  if (!restored || terminalGroupsEqual(terminalGroups, normalized.terminalGroups)) return normalized;
+  const restored = terminalGroups.find(
+    (group) => group.id === groupId && group.archivedAt === null,
+  );
+  if (!restored || terminalGroupsEqual(terminalGroups, normalized.terminalGroups))
+    return normalized;
   return normalizeThreadTerminalState({
     ...normalized,
     terminalGroups,
@@ -1421,14 +1432,14 @@ function moveThreadTerminals(
   if (target.kind === "group" && (!targetGroup || targetGroup.archivedAt !== null)) {
     return normalized;
   }
-  const targetTerminalId =
-    target.kind === "group" ? target.targetTerminalId?.trim() || null : null;
+  const targetTerminalId = target.kind === "group" ? target.targetTerminalId?.trim() || null : null;
 
   if (targetGroup) {
     const targetTerminalIds = collectTerminalIdsFromLayout(targetGroup.layout);
     if (
       targetTerminalId &&
-      (!targetTerminalIds.includes(targetTerminalId) || requestedTerminalIds.includes(targetTerminalId))
+      (!targetTerminalIds.includes(targetTerminalId) ||
+        requestedTerminalIds.includes(targetTerminalId))
     ) {
       return normalized;
     }
@@ -1484,21 +1495,10 @@ function moveThreadTerminals(
     const firstMovedTerminalId = requestedTerminalIds[0];
     if (!firstMovedTerminalId) return normalized;
     const usedGroupIds = new Set(groupsAfterRemoval.map((group) => group.id));
-    nextTargetGroupId = assignUniqueGroupId(
-      fallbackGroupId(firstMovedTerminalId),
-      usedGroupIds,
-    );
-    let nextGroup = createNamedTerminalGroup(
-      normalized,
-      nextTargetGroupId,
-      firstMovedTerminalId,
-    );
+    nextTargetGroupId = assignUniqueGroupId(fallbackGroupId(firstMovedTerminalId), usedGroupIds);
+    let nextGroup = createNamedTerminalGroup(normalized, nextTargetGroupId, firstMovedTerminalId);
     for (const terminalId of requestedTerminalIds.slice(1)) {
-      nextGroup = addTerminalTabToGroupLayout(
-        nextGroup,
-        nextGroup.activeTerminalId,
-        terminalId,
-      );
+      nextGroup = addTerminalTabToGroupLayout(nextGroup, nextGroup.activeTerminalId, terminalId);
     }
     groupsAfterRemoval.push(nextGroup);
     if (target.toIndex !== undefined) {
@@ -1785,11 +1785,7 @@ interface TerminalStateStoreState {
   closeTerminal: (threadId: ThreadId, terminalId: string) => void;
   closeTerminalGroup: (threadId: ThreadId, groupId: string) => void;
   renameTerminalGroup: (threadId: ThreadId, groupId: string, name: string) => void;
-  setTerminalGroupRole: (
-    threadId: ThreadId,
-    groupId: string,
-    role: TerminalGroupRole,
-  ) => void;
+  setTerminalGroupRole: (threadId: ThreadId, groupId: string, role: TerminalGroupRole) => void;
   archiveTerminalGroup: (threadId: ThreadId, groupId: string) => void;
   restoreTerminalGroup: (threadId: ThreadId, groupId: string) => void;
   reorderTerminalGroup: (threadId: ThreadId, groupId: string, toIndex: number) => void;
@@ -1931,13 +1927,9 @@ export const useTerminalStateStore = create<TerminalStateStoreState>()(
         restoreTerminalGroup: (threadId, groupId) =>
           updateTerminal(threadId, (state) => restoreThreadTerminalGroup(state, groupId)),
         reorderTerminalGroup: (threadId, groupId, toIndex) =>
-          updateTerminal(threadId, (state) =>
-            reorderThreadTerminalGroup(state, groupId, toIndex),
-          ),
+          updateTerminal(threadId, (state) => reorderThreadTerminalGroup(state, groupId, toIndex)),
         moveTerminals: (threadId, terminalIds, target) =>
-          updateTerminal(threadId, (state) =>
-            moveThreadTerminals(state, terminalIds, target),
-          ),
+          updateTerminal(threadId, (state) => moveThreadTerminals(state, terminalIds, target)),
         setShowArchivedTerminalGroups: (threadId, show) =>
           updateTerminal(threadId, (state) => {
             const normalized = normalizeThreadTerminalState(state);

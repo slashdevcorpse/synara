@@ -31,10 +31,7 @@ import {
   SIDEBAR_THREAD_ROW_BASE_CLASS_NAME,
 } from "../sidebarRowStyles";
 import { isDuplicateProjectCreateError } from "../lib/projectCreateRecovery";
-import {
-  isLiveAgentActivityPhase,
-  type AgentActivityPhase,
-} from "../lib/agentActivity";
+import { isLiveAgentActivityPhase, type AgentActivityPhase } from "../lib/agentActivity";
 import {
   canSessionAnswerPendingRequests,
   hasLiveLatestTurn,

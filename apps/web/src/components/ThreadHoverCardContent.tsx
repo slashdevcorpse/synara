@@ -304,13 +304,7 @@ function flattenSubagentStatuses(nodes: readonly AgentThreadTreeNode[]): AgentSt
   return nodes.flatMap((node) => [node.entry.status, ...flattenSubagentStatuses(node.children)]);
 }
 
-function SubagentActivityTreeRow({
-  node,
-  depth,
-}: {
-  node: AgentThreadTreeNode;
-  depth: number;
-}) {
+function SubagentActivityTreeRow({ node, depth }: { node: AgentThreadTreeNode; depth: number }) {
   const { entry } = node;
   const statusPresentation = agentStatusPresentation(entry.status);
   const label = entry.subagentNickname ?? entry.threadTitle;

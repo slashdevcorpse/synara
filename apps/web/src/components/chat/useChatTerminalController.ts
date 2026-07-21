@@ -81,9 +81,10 @@ export function useChatTerminalController({
     terminalState.terminalGroups.find(
       (group) => group.id === terminalState.activeTerminalGroupId && group.archivedAt == null,
     ) ??
-    terminalState.terminalGroups.find((group) =>
-      group.archivedAt == null &&
-      collectTerminalIdsFromLayout(group.layout).includes(terminalState.activeTerminalId),
+    terminalState.terminalGroups.find(
+      (group) =>
+        group.archivedAt == null &&
+        collectTerminalIdsFromLayout(group.layout).includes(terminalState.activeTerminalId),
     ) ??
     null;
   const hasReachedSplitLimit =

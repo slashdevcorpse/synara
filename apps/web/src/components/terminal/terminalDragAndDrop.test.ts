@@ -32,9 +32,7 @@ describe("terminal drag payloads", () => {
     expect(
       readTerminalDragPayload({
         getData: (type) =>
-          type === TERMINAL_DRAG_MIME
-            ? JSON.stringify({ kind: "terminals", terminalIds: [] })
-            : "",
+          type === TERMINAL_DRAG_MIME ? JSON.stringify({ kind: "terminals", terminalIds: [] }) : "",
       }),
     ).toBeNull();
   });

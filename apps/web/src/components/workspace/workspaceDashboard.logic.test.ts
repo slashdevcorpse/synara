@@ -151,9 +151,7 @@ describe("workspace dashboard derivation", () => {
       projects: [project("one", "One")],
       repositoryByProjectId,
       worktreePathPlatform: "windows",
-      agentActivityByThreadId: new Map([
-        [threadId("working"), agentActivity("thinking")],
-      ]),
+      agentActivityByThreadId: new Map([[threadId("working"), agentActivity("thinking")]]),
       threads: [
         thread("working", "one", {
           hasLiveTailWork: true,

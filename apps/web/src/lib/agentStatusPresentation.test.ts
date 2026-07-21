@@ -33,7 +33,10 @@ describe("agentStatusPresentation", () => {
     ["interrupted", "text-warning", "bg-warning"],
     ["completed", "text-success", "bg-success"],
     ["failed", "text-destructive", "bg-destructive"],
-  ] as const)("uses the explicit semantic palette for %s", (status, textClassName, dotClassName) => {
-    expect(agentStatusPresentation(status)).toMatchObject({ textClassName, dotClassName });
-  });
+  ] as const)(
+    "uses the explicit semantic palette for %s",
+    (status, textClassName, dotClassName) => {
+      expect(agentStatusPresentation(status)).toMatchObject({ textClassName, dotClassName });
+    },
+  );
 });

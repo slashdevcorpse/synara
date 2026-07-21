@@ -123,7 +123,8 @@ export function normalizeTerminalGroupMetadata(
   } = {},
 ): Omit<NormalizedThreadTerminalGroup, "id" | "activeTerminalId" | "layout"> {
   const fallbackIndex = options.fallbackIndex ?? 0;
-  const token = group.name?.trim() || options.fallbackName?.trim() || `Terminal ${fallbackIndex + 1}`;
+  const token =
+    group.name?.trim() || options.fallbackName?.trim() || `Terminal ${fallbackIndex + 1}`;
   const role = isRole(group.role)
     ? group.role
     : inferTerminalGroupRole({ cliKinds: options.cliKinds, token });
@@ -148,7 +149,9 @@ export function normalizeTerminalGroupMetadata(
   };
 }
 
-export function activeTerminalGroups(groups: readonly ThreadTerminalGroup[]): ThreadTerminalGroup[] {
+export function activeTerminalGroups(
+  groups: readonly ThreadTerminalGroup[],
+): ThreadTerminalGroup[] {
   return groups.filter((group) => group.archivedAt == null);
 }
 

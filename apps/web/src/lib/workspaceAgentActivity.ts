@@ -704,15 +704,16 @@ function deriveWorkspaceThreadAgentActivity(
     : [];
   const latestTool = newestBySequence(openTools);
   const latestStream = newestBySequence(streamingMessages);
-  const lastEventTimestamp = [
-    eventState?.lastActivityAt,
-    thread.session?.updatedAt,
-    thread.latestTurn?.requestedAt,
-    thread.latestTurn?.startedAt,
-    thread.latestTurn?.completedAt,
-  ]
-    .filter((value): value is string => Boolean(value))
-    .toSorted((left, right) => timestamp(right) - timestamp(left))[0] ?? null;
+  const lastEventTimestamp =
+    [
+      eventState?.lastActivityAt,
+      thread.session?.updatedAt,
+      thread.latestTurn?.requestedAt,
+      thread.latestTurn?.startedAt,
+      thread.latestTurn?.completedAt,
+    ]
+      .filter((value): value is string => Boolean(value))
+      .toSorted((left, right) => timestamp(right) - timestamp(left))[0] ?? null;
   return deriveAgentActivityState({
     threadId: thread.threadId,
     hasMessages: true,

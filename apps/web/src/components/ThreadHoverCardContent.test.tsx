@@ -54,11 +54,7 @@ describe("ThreadHoverCardContent", () => {
   it("preserves aggregate-only legacy props when no subagent tree is supplied", () => {
     const { subagentTree: _subagentTree, ...legacyProps } = BASE_PROPS;
     const markup = renderToStaticMarkup(
-      <ThreadHoverCardContent
-        {...legacyProps}
-        subagentCount={2}
-        subagentRunningCount={1}
-      />,
+      <ThreadHoverCardContent {...legacyProps} subagentCount={2} subagentRunningCount={1} />,
     );
 
     expect(markup).toContain("1 of 2 subagents running");

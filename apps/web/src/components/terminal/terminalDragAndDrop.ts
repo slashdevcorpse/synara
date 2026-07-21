@@ -19,7 +19,10 @@ export function writeTerminalDragPayload(
 ): void {
   dataTransfer.effectAllowed = "move";
   dataTransfer.setData(TERMINAL_DRAG_MIME, JSON.stringify(payload));
-  dataTransfer.setData("text/plain", payload.kind === "group" ? payload.groupId : payload.terminalIds.join(","));
+  dataTransfer.setData(
+    "text/plain",
+    payload.kind === "group" ? payload.groupId : payload.terminalIds.join(","),
+  );
 }
 
 export function readTerminalDragPayload(

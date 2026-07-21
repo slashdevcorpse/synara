@@ -1028,12 +1028,10 @@ describe("TerminalManager", () => {
       sessions: Map<string, unknown>;
     };
     const flushPersistQueue = internals.flushPersistQueue.bind(manager);
-    vi.spyOn(internals, "flushPersistQueue").mockImplementation(
-      async (threadId, terminalId) => {
-        if (terminalId === "two") throw new Error("preflight failed");
-        await flushPersistQueue(threadId, terminalId);
-      },
-    );
+    vi.spyOn(internals, "flushPersistQueue").mockImplementation(async (threadId, terminalId) => {
+      if (terminalId === "two") throw new Error("preflight failed");
+      await flushPersistQueue(threadId, terminalId);
+    });
 
     await expect(
       manager.close({

@@ -67,9 +67,7 @@ export const ComposerSubagentStrip = function ComposerSubagentStrip({
     (item): item is ComposerSubagentStripItem => item.kind === "subagent",
   );
   const runningCount = subagentItems.filter((item) => item.isActive).length;
-  const settledSummary = summarizeSettledSubagents(
-    subagentItems.map((item) => item.statusKind),
-  );
+  const settledSummary = summarizeSettledSubagents(subagentItems.map((item) => item.statusKind));
   const settledEpisodeKey = settledSummary
     ? subagentItems
         .map((item) => item.key)
@@ -110,8 +108,8 @@ export const ComposerSubagentStrip = function ComposerSubagentStrip({
             {settledSummary
               ? settledSummary.label
               : runningCount > 0
-              ? `${runningCount} of ${subagentItems.length} ${pluralize(subagentItems.length, "subagent")} running`
-              : `${subagentItems.length} ${pluralize(subagentItems.length, "subagent")}`}
+                ? `${runningCount} of ${subagentItems.length} ${pluralize(subagentItems.length, "subagent")} running`
+                : `${subagentItems.length} ${pluralize(subagentItems.length, "subagent")}`}
           </ComposerStackedPanelRowLabel>
         </ComposerStackedPanelRowMain>
         {onStopAll && runningCount > 1 ? (

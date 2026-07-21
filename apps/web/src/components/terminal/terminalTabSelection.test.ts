@@ -1,9 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import {
-  pruneTerminalTabSelection,
-  updateTerminalTabSelection,
-} from "./terminalTabSelection";
+import { pruneTerminalTabSelection, updateTerminalTabSelection } from "./terminalTabSelection";
 
 const ORDER = ["one", "two", "three", "four"];
 
@@ -38,10 +35,10 @@ describe("terminal tab selection", () => {
 
   it("prunes selections and anchors when drawer membership changes", () => {
     expect(
-      pruneTerminalTabSelection(
-        { anchorId: "three", selectedIds: new Set(["one", "three"]) },
-        ["one", "two"],
-      ),
+      pruneTerminalTabSelection({ anchorId: "three", selectedIds: new Set(["one", "three"]) }, [
+        "one",
+        "two",
+      ]),
     ).toEqual({ anchorId: null, selectedIds: new Set(["one"]) });
   });
 });

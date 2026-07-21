@@ -419,9 +419,7 @@ export function summarizeSettledSubagents(
 ): SettledSubagentSummary | null {
   if (
     statuses.length === 0 ||
-    statuses.some(
-      (status) => status !== "completed" && status !== "failed" && status !== "stopped",
-    )
+    statuses.some((status) => status !== "completed" && status !== "failed" && status !== "stopped")
   ) {
     return null;
   }

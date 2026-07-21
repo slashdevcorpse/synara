@@ -91,15 +91,12 @@ export type TerminalRestartInput = Schema.Codec.Encoded<typeof TerminalRestartIn
 export const TerminalCloseInput = Schema.Struct({
   ...TerminalThreadInput.fields,
   terminalId: Schema.optional(TerminalIdSchema),
-  terminalIds: Schema.optional(
-    Schema.Array(TerminalIdSchema).check(Schema.isMinLength(1)),
-  ),
+  terminalIds: Schema.optional(Schema.Array(TerminalIdSchema).check(Schema.isMinLength(1))),
   deleteHistory: Schema.optional(Schema.Boolean),
 }).check(
-  Schema.makeFilter(
-    (input) => input.terminalId === undefined || input.terminalIds === undefined,
-    { message: "terminalId and terminalIds cannot both be provided" },
-  ),
+  Schema.makeFilter((input) => input.terminalId === undefined || input.terminalIds === undefined, {
+    message: "terminalId and terminalIds cannot both be provided",
+  }),
 );
 export type TerminalCloseInput = Schema.Codec.Encoded<typeof TerminalCloseInput>;
 
