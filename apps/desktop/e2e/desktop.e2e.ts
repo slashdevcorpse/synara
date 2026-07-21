@@ -27,6 +27,17 @@ async function addAndSelectProject(desktop: DesktopHarness): Promise<void> {
   await expect(page.getByText(PROJECT_NAME, { exact: true }).first()).toBeVisible();
   await expect(page.getByTestId("composer-editor")).toBeVisible({ timeout: 30_000 });
   await expect.poll(() => new URL(page.url()).pathname).not.toBe("/");
+
+  // A selectable Codex entry proves the focus refresh reached the UI cache with
+  // an available, non-unauthenticated status after the real CLI health probes.
+  const modelPicker = page.getByRole("button", { name: "GPT-5.5", exact: true });
+  await expect(modelPicker).toBeVisible({ timeout: 30_000 });
+  await modelPicker.click();
+  await expect(modelPicker).toHaveAttribute("aria-expanded", "true", { timeout: 30_000 });
+  await expect(page.getByRole("menuitem", { name: /^Codex(?:\s|$)/u })).toBeEnabled({
+    timeout: 30_000,
+  });
+  await page.keyboard.press("Escape");
 }
 
 async function sendPrompt(page: Page, prompt: string): Promise<void> {
@@ -155,11 +166,17 @@ test("creates and selects a project, then sends and renders an assistant respons
   await codexProvider.hover();
   await expect(e2eModel).toBeChecked();
   await desktop.page.keyboard.press("Escape");
+  const protocolBaseline = (await desktop.readProtocolLog()).length;
   await sendPrompt(desktop.page, "E2E_BASIC_SEND");
-  await expectAssistantText(desktop.page, "E2E_ASSISTANT_REPLY");
   await expect
-    .poll(async () => requestMethods(await desktop.readProtocolLog()))
+    .poll(async () => requestMethods((await desktop.readProtocolLog()).slice(protocolBaseline)), {
+      timeout: 30_000,
+    })
     .toContain("turn/start");
+  await expectAssistantText(desktop.page, "E2E_ASSISTANT_REPLY");
+  await expect(desktop.page.getByText("E2E Test Thread", { exact: true }).first()).toBeVisible({
+    timeout: 30_000,
+  });
   await expect
     .poll(async () => latestRequestParam(await desktop.readProtocolLog(), "turn/start", "model"))
     .toBe("gpt-5.3-codex");

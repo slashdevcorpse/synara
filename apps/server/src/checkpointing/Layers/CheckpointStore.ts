@@ -89,13 +89,14 @@ const makeCheckpointStore = Effect.gen(function* () {
         }),
       );
 
-  const isGitRepository: CheckpointStoreShape["isGitRepository"] = (cwd) =>
+  const isGitRepository: CheckpointStoreShape["isGitRepository"] = (cwd, options) =>
     git
       .execute({
         operation: "CheckpointStore.isGitRepository",
         cwd,
         args: ["rev-parse", "--is-inside-work-tree"],
         allowNonZeroExit: true,
+        ...(options?.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
       })
       .pipe(
         Effect.map((result) => result.code === 0 && result.stdout.trim() === "true"),

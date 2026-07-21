@@ -3343,9 +3343,12 @@ describe("ProviderCommandReactor", () => {
     const captureCheckpoint = vi.fn<CheckpointStoreShape["captureCheckpoint"]>(() =>
       Effect.promise(() => captureGate),
     );
+    const isGitRepository = vi.fn<CheckpointStoreShape["isGitRepository"]>(() =>
+      Effect.succeed(true),
+    );
     const harness = await createHarness({
       checkpointStore: {
-        isGitRepository: vi.fn<CheckpointStoreShape["isGitRepository"]>(() => Effect.succeed(true)),
+        isGitRepository,
         captureCheckpoint,
       },
     });
@@ -3380,6 +3383,9 @@ describe("ProviderCommandReactor", () => {
       cwd: "/tmp/provider-project",
     });
     expect(captureCheckpoint.mock.calls[0]?.[0].checkpointRef).toContain("/message-start/");
+    expect(isGitRepository).toHaveBeenCalledWith("/tmp/provider-project", {
+      timeoutMs: 5_000,
+    });
   });
 
   it("waits for the Studio output baseline before sending the provider turn", async () => {

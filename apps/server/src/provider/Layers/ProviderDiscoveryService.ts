@@ -211,7 +211,20 @@ function* make(this: ProviderDiscoveryServiceLiveOptions) {
           cached: false,
         };
       }
-      return yield* adapter.listModels(parsed);
+      if (parsed.provider !== "codex") {
+        return yield* adapter.listModels(parsed);
+      }
+      const settings = yield* serverSettings.getSettings.pipe(
+        Effect.orElseSucceed(() => DEFAULT_SERVER_SETTINGS),
+      );
+      const binaryPath = parsed.binaryPath ?? settings.providers.codex.binaryPath;
+      const homePath = parsed.homePath ?? settings.providers.codex.homePath;
+      return yield* adapter.listModels({
+        ...parsed,
+        binaryPath,
+        cwd: parsed.cwd ?? serverConfig.cwd,
+        ...(homePath ? { homePath } : {}),
+      });
     });
 
   const listAgents: ProviderDiscoveryServiceShape["listAgents"] = (input) =>

@@ -1945,7 +1945,11 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
     try {
       capturedTree = await this.processTreeKiller.capture(pid);
     } catch (error) {
-      capturedTree = { descendants: [], captureComplete: false };
+      capturedTree = {
+        descendants: [],
+        captureComplete: false,
+        descendantExitProof: "captured-identities",
+      };
       this.logger.warn("process tree capture failed", {
         threadId,
         terminalId,
@@ -1957,7 +1961,11 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
     // Flush an exit callback queued in the same turn as capture completion.
     await Promise.resolve();
     const tree = rootExitedBeforeCaptureFinished
-      ? { descendants: [], captureComplete: false }
+      ? {
+          descendants: [],
+          captureComplete: false,
+          descendantExitProof: "captured-identities" as const,
+        }
       : capturedTree;
     retainAfterRootExit = tree.descendants.length > 0 || tree.captureComplete === false;
     const signalProcess = (signal: TerminalKillSignal) => {

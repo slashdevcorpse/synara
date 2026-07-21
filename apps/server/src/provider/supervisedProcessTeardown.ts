@@ -5,6 +5,8 @@ import {
   type CapturedProcess,
   type CapturedProcessTreeInspection,
   type ProcessTreeKiller,
+  type ProcessTreeDescendantExitProof,
+  type ProcessTreeSignalResult,
   type TerminalKillSignal,
 } from "../terminal/processTreeKiller";
 import { Effect } from "effect";
@@ -51,12 +53,16 @@ export class ProviderProcessExitUnprovenError extends Error {
   readonly rootExited: boolean;
   readonly remainingDescendantPids: ReadonlyArray<number> | null;
   readonly captureComplete: boolean;
+  readonly descendantExitProof: ProcessTreeDescendantExitProof;
+  readonly rootTreeSignalSucceeded: boolean;
 
   constructor(input: {
     readonly rootPid: number;
     readonly rootExited: boolean;
     readonly remainingDescendantPids: ReadonlyArray<number> | null;
     readonly captureComplete: boolean;
+    readonly descendantExitProof: ProcessTreeDescendantExitProof;
+    readonly rootTreeSignalSucceeded: boolean;
   }) {
     const descendantDetail =
       input.remainingDescendantPids === null
@@ -66,13 +72,17 @@ export class ProviderProcessExitUnprovenError extends Error {
           : "no captured descendants remain";
     super(
       `Provider process tree ${input.rootPid} did not prove exit ` +
-        `(rootExited=${String(input.rootExited)}, captureComplete=${String(input.captureComplete)}; ${descendantDetail}).`,
+        `(rootExited=${String(input.rootExited)}, captureComplete=${String(input.captureComplete)}, ` +
+        `descendantExitProof=${input.descendantExitProof}, ` +
+        `rootTreeSignalSucceeded=${String(input.rootTreeSignalSucceeded)}; ${descendantDetail}).`,
     );
     this.name = "ProviderProcessExitUnprovenError";
     this.rootPid = input.rootPid;
     this.rootExited = input.rootExited;
     this.remainingDescendantPids = input.remainingDescendantPids;
     this.captureComplete = input.captureComplete;
+    this.descendantExitProof = input.descendantExitProof;
+    this.rootTreeSignalSucceeded = input.rootTreeSignalSucceeded;
   }
 }
 
@@ -112,10 +122,10 @@ async function inspectBeforeDeadline(
 }
 
 async function signalBeforeDeadline(
-  signal: PromiseLike<void>,
+  signal: PromiseLike<ProcessTreeSignalResult>,
   timeoutMs: number,
   abortController: AbortController,
-): Promise<void | typeof SIGNAL_TIMED_OUT> {
+): Promise<ProcessTreeSignalResult | typeof SIGNAL_TIMED_OUT> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([
@@ -204,6 +214,7 @@ export async function teardownProviderProcessTree(
   let rootExited = false;
   let captureFinished = false;
   let rootExitedBeforeCaptureFinished = false;
+  let rootTreeSignalSucceeded = false;
   void input.rootExited.then(
     () => {
       rootExited = true;
@@ -225,7 +236,7 @@ export async function teardownProviderProcessTree(
   // unrelated process that reused the numeric root PID. None of its descendant
   // identities are safe to signal, even though exit proof must still fail closed.
   const tree = rootExitedBeforeCaptureFinished
-    ? { descendants: [], captureComplete: false }
+    ? { ...capturedTree, descendants: [], captureComplete: false }
     : capturedTree;
 
   const signal = async (
@@ -256,6 +267,8 @@ export async function teardownProviderProcessTree(
             `Provider process tree ${input.rootPid} ${killSignal} signaling did not settle within ${timeoutMs}ms.`,
           ),
         );
+      } else {
+        rootTreeSignalSucceeded ||= outcome.rootTreeSignalSucceeded;
       }
     } catch (cause) {
       signalErrors.push(signalFailure(cause, { rootPid: input.rootPid, signal: killSignal }));
@@ -285,9 +298,12 @@ export async function teardownProviderProcessTree(
         return { proven: false as const, remainingDescendants: null };
       }
       remainingDescendants = inspection?.verified === true ? inspection.survivors : null;
+      const requiredDescendantProofCompleted =
+        tree.descendantExitProof !== "root-tree-signal" || rootTreeSignalSucceeded;
       if (
         rootExited &&
         captureComplete &&
+        requiredDescendantProofCompleted &&
         remainingDescendants !== null &&
         remainingDescendants.length === 0
       ) {
@@ -325,5 +341,7 @@ export async function teardownProviderProcessTree(
     remainingDescendantPids:
       forced.remainingDescendants?.map((descendant) => descendant.pid) ?? null,
     captureComplete,
+    descendantExitProof: tree.descendantExitProof,
+    rootTreeSignalSucceeded,
   });
 }

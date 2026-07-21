@@ -31,6 +31,86 @@ describe("CheckpointStoreLive", () => {
     runtime = null;
   });
 
+  it("forwards an explicit repository detection timeout", async () => {
+    const execute = vi.fn<GitCoreShape["execute"]>(() =>
+      Effect.succeed({ code: 0, stdout: "true\n", stderr: "" }),
+    );
+    const layer = CheckpointStoreLive.pipe(
+      Layer.provide(Layer.succeed(GitCore, { execute } as unknown as GitCoreShape)),
+      Layer.provide(NodeServices.layer),
+    );
+    runtime = ManagedRuntime.make(layer);
+
+    const isRepository = await runtime.runPromise(
+      Effect.gen(function* () {
+        const store = yield* CheckpointStore;
+        return yield* store.isGitRepository("/repo", { timeoutMs: 5_000 });
+      }),
+    );
+
+    expect(isRepository).toBe(true);
+    expect(execute).toHaveBeenCalledWith({
+      operation: "CheckpointStore.isGitRepository",
+      cwd: "/repo",
+      args: ["rev-parse", "--is-inside-work-tree"],
+      allowNonZeroExit: true,
+      timeoutMs: 5_000,
+    });
+  });
+
+  it("retains GitCore's default timeout when repository detection has no override", async () => {
+    const execute = vi.fn<GitCoreShape["execute"]>(() =>
+      Effect.succeed({ code: 0, stdout: "false\n", stderr: "" }),
+    );
+    const layer = CheckpointStoreLive.pipe(
+      Layer.provide(Layer.succeed(GitCore, { execute } as unknown as GitCoreShape)),
+      Layer.provide(NodeServices.layer),
+    );
+    runtime = ManagedRuntime.make(layer);
+
+    const isRepository = await runtime.runPromise(
+      Effect.gen(function* () {
+        const store = yield* CheckpointStore;
+        return yield* store.isGitRepository("/repo");
+      }),
+    );
+
+    expect(isRepository).toBe(false);
+    expect(execute).toHaveBeenCalledWith({
+      operation: "CheckpointStore.isGitRepository",
+      cwd: "/repo",
+      args: ["rev-parse", "--is-inside-work-tree"],
+      allowNonZeroExit: true,
+    });
+  });
+
+  it("treats a failed repository probe as a non-Git workspace", async () => {
+    const execute = vi.fn<GitCoreShape["execute"]>(() =>
+      Effect.fail(
+        new GitCommandError({
+          operation: "CheckpointStore.isGitRepository",
+          command: "git rev-parse --is-inside-work-tree",
+          cwd: "/repo",
+          detail: "timed out",
+        }),
+      ),
+    );
+    const layer = CheckpointStoreLive.pipe(
+      Layer.provide(Layer.succeed(GitCore, { execute } as unknown as GitCoreShape)),
+      Layer.provide(NodeServices.layer),
+    );
+    runtime = ManagedRuntime.make(layer);
+
+    const isRepository = await runtime.runPromise(
+      Effect.gen(function* () {
+        const store = yield* CheckpointStore;
+        return yield* store.isGitRepository("/repo", { timeoutMs: 5_000 });
+      }),
+    );
+
+    expect(isRepository).toBe(false);
+  });
+
   it("deduplicates concurrent captures for the same checkpoint ref", async () => {
     let releaseAdd: (() => void) | undefined;
     const addGate = new Promise<void>((resolve) => {

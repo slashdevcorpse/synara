@@ -435,8 +435,14 @@ function sanitizeLogValue(value: string): string {
 }
 
 function writeDesktopLogHeader(message: string): void {
-  if (!desktopLogSink) return;
-  desktopLogSink.write(`[${logTimestamp()}] [${logScope("desktop")}] ${message}\n`);
+  const line = `[${logTimestamp()}] [${logScope("desktop")}] ${message}`;
+  if (desktopLogSink) {
+    desktopLogSink.write(`${line}\n`);
+    return;
+  }
+  if (process.env.SYNARA_E2E_DESKTOP_MAIN_PATH) {
+    safeConsoleError(line);
+  }
 }
 
 function writeBackendSessionBoundary(phase: "START" | "END", details: string): void {
@@ -4011,6 +4017,7 @@ function createWindow(): BrowserWindow {
   window.on("enter-full-screen", () => emitDesktopWindowState(window));
   window.on("leave-full-screen", () => emitDesktopWindowState(window));
   window.on("close", (event) => {
+    writeDesktopLogHeader("main window close received");
     windowStateController.flush();
     if (
       shouldDeferDesktopWindowClose({
@@ -4027,6 +4034,9 @@ function createWindow(): BrowserWindow {
       requestGracefulAppQuit("window-close");
     }
   });
+  window.webContents.on("will-prevent-unload", () => {
+    writeDesktopLogHeader("main window renderer prevented unload");
+  });
 
   if (isDevelopment) {
     void window.loadURL(process.env.VITE_DEV_SERVER_URL as string);
@@ -4036,6 +4046,7 @@ function createWindow(): BrowserWindow {
   }
 
   window.on("closed", () => {
+    writeDesktopLogHeader("main window closed");
     if (revealSettleTimer !== null) {
       clearTimeout(revealSettleTimer);
       revealSettleTimer = null;
@@ -4190,6 +4201,14 @@ app.on("before-quit", (event) => {
 
   event.preventDefault();
   requestGracefulAppQuit("before-quit");
+});
+
+app.on("will-quit", () => {
+  writeDesktopLogHeader("will-quit received");
+});
+
+app.on("quit", (_event, exitCode) => {
+  writeDesktopLogHeader(`quit received exit-code=${exitCode}`);
 });
 
 if (hasSingleInstanceLock) {

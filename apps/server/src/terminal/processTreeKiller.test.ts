@@ -5,7 +5,7 @@
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   collectDescendantProcesses,
@@ -70,6 +70,7 @@ describe("processTreeKiller", () => {
         { pid: 102, command: "worker.exe --serve" },
       ],
       captureComplete: true,
+      descendantExitProof: "captured-identities",
     });
   });
 
@@ -90,6 +91,7 @@ describe("processTreeKiller", () => {
     await expect(killer.capture(100)).resolves.toMatchObject({
       descendants: children.slice(0, 256),
       captureComplete: false,
+      descendantExitProof: "captured-identities",
     });
   });
 
@@ -104,6 +106,7 @@ describe("processTreeKiller", () => {
       await expect(killer.capture(100)).resolves.toEqual({
         descendants: [],
         captureComplete: false,
+        descendantExitProof: "captured-identities",
       });
     },
   );
@@ -115,6 +118,7 @@ describe("processTreeKiller", () => {
         { pid: 102, command: "worker.exe --serve" },
       ],
       captureComplete: true,
+      descendantExitProof: "captured-identities",
     };
     const killer = createProcessTreeKiller({
       platform: "win32",
@@ -138,6 +142,7 @@ describe("processTreeKiller", () => {
     const tree: CapturedProcessTree = {
       descendants: [{ pid: 101, command: "provider.exe" }],
       captureComplete: true,
+      descendantExitProof: "captured-identities",
     };
     const killer = createProcessTreeKiller({
       platform: "win32",
@@ -171,7 +176,7 @@ describe("processTreeKiller", () => {
       },
     });
 
-    await killer.signal({
+    const result = await killer.signal({
       rootPid: 100,
       signal: "SIGKILL",
       includeRootTree: false,
@@ -181,11 +186,13 @@ describe("processTreeKiller", () => {
           { pid: 102, command: "worker.exe" },
         ],
         captureComplete: true,
+        descendantExitProof: "captured-identities",
       },
       onError: () => undefined,
     });
 
     expect(signaledPids).toEqual([101]);
+    expect(result).toEqual({ rootTreeSignalSucceeded: false });
   });
 
   it("rechecks root ownership after delayed Windows identity preparation", async () => {
@@ -222,6 +229,7 @@ describe("processTreeKiller", () => {
       tree: {
         descendants: [{ pid: 101, command: "provider.exe" }],
         captureComplete: true,
+        descendantExitProof: "captured-identities",
       },
       onError: () => undefined,
     });
@@ -229,10 +237,23 @@ describe("processTreeKiller", () => {
     await identityPreparationStarted.promise;
     rootOwned = false;
     releaseIdentityPreparation.resolve();
-    await signaling;
+    await expect(signaling).resolves.toEqual({ rootTreeSignalSucceeded: false });
 
     expect(signaledPids).toEqual([101]);
     expect(treeSignals).toEqual([]);
+  });
+
+  it("marks POSIX captures as using identity-verified descendant proof", async () => {
+    const killer = createProcessTreeKiller({
+      platform: "linux",
+      captureChildrenMap: () => new Map([[100, [{ pid: 101, command: "provider-worker" }]]]),
+    });
+
+    await expect(killer.capture(100)).resolves.toEqual({
+      descendants: [{ pid: 101, command: "provider-worker" }],
+      captureComplete: true,
+      descendantExitProof: "captured-identities",
+    });
   });
 
   it("validates captured child commands before delayed SIGKILL", async () => {
@@ -244,6 +265,7 @@ describe("processTreeKiller", () => {
         { pid: 102, command: "bun run dev" },
         { pid: 103, command: "tsdown --watch" },
       ],
+      descendantExitProof: "captured-identities",
     };
     const killer = createProcessTreeKiller({
       platform: "linux",
@@ -298,52 +320,12 @@ describe("processTreeKiller", () => {
           { pid: 102, command: "bun run dev" },
           { pid: 103, command: "tsdown --watch" },
         ],
+        descendantExitProof: "captured-identities",
       },
       onError: () => undefined,
     });
 
     expect(signaledPids).toEqual([103, 102]);
-  });
-
-  it("waits for root tree signaling while preserving callback error reporting", async () => {
-    const treeKillError = new Error("tree kill failed");
-    const errors: Array<{
-      error: Error;
-      context: { pid: number; source: "tree-kill" | "captured" };
-    }> = [];
-    let completeSignalTree: ((error?: Error | null) => void) | undefined;
-    const killer = createProcessTreeKiller({
-      platform: "linux",
-      signalTree: (_rootPid, _signal, callback) => {
-        completeSignalTree = callback;
-      },
-    });
-
-    let settled = false;
-    const signaling = Promise.resolve(
-      killer.signal({
-        rootPid: 100,
-        signal: "SIGTERM",
-        tree: { descendants: [] },
-        onError: (error, context) => errors.push({ error, context }),
-      }),
-    ).then(() => {
-      settled = true;
-    });
-
-    await Promise.resolve();
-    expect(completeSignalTree).toBeTypeOf("function");
-    expect(settled).toBe(false);
-    completeSignalTree?.(treeKillError);
-    await signaling;
-
-    expect(settled).toBe(true);
-    expect(errors).toEqual([
-      {
-        error: treeKillError,
-        context: { pid: 100, source: "tree-kill" },
-      },
-    ]);
   });
 
   it("can skip root tree signaling while still signaling captured children", async () => {
@@ -362,18 +344,183 @@ describe("processTreeKiller", () => {
       },
     });
 
-    await killer.signal({
+    const result = await killer.signal({
       rootPid: 100,
       signal: "SIGKILL",
       includeRootTree: false,
       tree: {
         descendants: [{ pid: 103, command: "tsdown --watch" }],
+        descendantExitProof: "captured-identities",
       },
       onError: () => undefined,
     });
 
     expect(signaledPids).toEqual([103]);
     expect(treeSignals).toEqual([]);
+    expect(result).toEqual({ rootTreeSignalSucceeded: false });
+  });
+
+  it("waits for root-tree signal completion before reporting success", async () => {
+    let completeSignal!: (error?: Error | null) => void;
+    const errors: Error[] = [];
+    const killer = createProcessTreeKiller({
+      signalTree: (_rootPid, _signal, callback) => {
+        completeSignal = callback;
+      },
+    });
+
+    const signaling = killer.signal({
+      rootPid: 100,
+      signal: "SIGTERM",
+      tree: { descendants: [], descendantExitProof: "captured-identities" },
+      onError: (error) => errors.push(error),
+    });
+    let settled = false;
+    void signaling.finally(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+
+    expect(settled).toBe(false);
+    completeSignal(null);
+
+    await expect(signaling).resolves.toEqual({ rootTreeSignalSucceeded: true });
+    expect(errors).toEqual([]);
+  });
+
+  it("normalizes callback errors into a failed root-tree signal result", async () => {
+    const failure = new Error("taskkill failed");
+    const errors: Array<{
+      error: Error;
+      context: { pid: number; source: "tree-kill" | "captured" };
+    }> = [];
+    const killer = createProcessTreeKiller({
+      signalTree: (_rootPid, _signal, callback) => callback(failure),
+    });
+
+    await expect(
+      killer.signal({
+        rootPid: 100,
+        signal: "SIGKILL",
+        tree: { descendants: [], descendantExitProof: "captured-identities" },
+        onError: (error, context) => errors.push({ error, context }),
+      }),
+    ).resolves.toEqual({ rootTreeSignalSucceeded: false });
+    expect(errors).toEqual([{ error: failure, context: { pid: 100, source: "tree-kill" } }]);
+  });
+
+  it("normalizes synchronous root-tree signal failures", async () => {
+    const failure = new Error("signalTree threw");
+    const onError = vi.fn();
+    const killer = createProcessTreeKiller({
+      signalTree: () => {
+        throw failure;
+      },
+    });
+
+    await expect(
+      killer.signal({
+        rootPid: 100,
+        signal: "SIGKILL",
+        tree: { descendants: [], descendantExitProof: "captured-identities" },
+        onError,
+      }),
+    ).resolves.toEqual({ rootTreeSignalSucceeded: false });
+    expect(onError).toHaveBeenCalledOnce();
+    expect(onError).toHaveBeenCalledWith(failure, { pid: 100, source: "tree-kill" });
+  });
+
+  it("settles when reporting a root-tree signal error throws", async () => {
+    const reportingFailure = new Error("signal error reporter failed");
+    const killer = createProcessTreeKiller({
+      signalTree: (_rootPid, _signal, callback) => callback(new Error("taskkill failed")),
+    });
+
+    await expect(
+      killer.signal({
+        rootPid: 100,
+        signal: "SIGKILL",
+        tree: { descendants: [], descendantExitProof: "captured-identities" },
+        onError: () => {
+          throw reportingFailure;
+        },
+      }),
+    ).rejects.toBe(reportingFailure);
+  });
+
+  it("allows a loaded Windows root-tree signal to complete after two seconds", async () => {
+    vi.useFakeTimers();
+    try {
+      let completeSignal!: (error?: Error | null) => void;
+      const onError = vi.fn();
+      const killer = createProcessTreeKiller({
+        platform: "win32",
+        signalTree: (_rootPid, _signal, callback) => {
+          completeSignal = callback;
+        },
+      });
+      const signaling = killer.signal({
+        rootPid: 100,
+        signal: "SIGKILL",
+        tree: { descendants: [], descendantExitProof: "root-tree-signal" },
+        onError,
+      });
+      let settled = false;
+      void signaling.finally(() => {
+        settled = true;
+      });
+
+      await vi.advanceTimersByTimeAsync(2_001);
+      expect(settled).toBe(false);
+      expect(onError).not.toHaveBeenCalled();
+
+      completeSignal(null);
+
+      await expect(signaling).resolves.toEqual({ rootTreeSignalSucceeded: true });
+      expect(onError).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("times out a stalled Windows root-tree signal and ignores its late callback", async () => {
+    vi.useFakeTimers();
+    try {
+      let completeSignal!: (error?: Error | null) => void;
+      const onError = vi.fn();
+      const killer = createProcessTreeKiller({
+        platform: "win32",
+        signalTree: (_rootPid, _signal, callback) => {
+          completeSignal = callback;
+        },
+      });
+      const signaling = killer.signal({
+        rootPid: 100,
+        signal: "SIGKILL",
+        tree: { descendants: [], descendantExitProof: "captured-identities" },
+        onError,
+      });
+      let settled = false;
+      void signaling.finally(() => {
+        settled = true;
+      });
+
+      await vi.advanceTimersByTimeAsync(9_999);
+      expect(settled).toBe(false);
+      expect(onError).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(1);
+
+      await expect(signaling).resolves.toEqual({ rootTreeSignalSucceeded: false });
+      expect(onError).toHaveBeenCalledOnce();
+      expect(onError.mock.calls[0]?.[0]).toMatchObject({
+        message: expect.stringContaining("Timed out after"),
+      });
+      completeSignal(new Error("late taskkill failure"));
+      expect(onError).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -388,6 +535,8 @@ it.runIf(process.platform === "win32")(
 
     try {
       const tree = await createProcessTreeKiller().capture(process.pid);
+
+      expect(tree.descendantExitProof).toBe("captured-identities");
 
       if (tree.captureComplete) {
         expect(tree.descendants.some((descendant) => descendant.pid === child.pid)).toBe(true);

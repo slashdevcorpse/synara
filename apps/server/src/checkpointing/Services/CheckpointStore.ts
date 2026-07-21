@@ -69,7 +69,10 @@ export interface CheckpointStoreShape {
   /**
    * Check whether cwd is inside a Git worktree.
    */
-  readonly isGitRepository: (cwd: string) => Effect.Effect<boolean, CheckpointStoreError>;
+  readonly isGitRepository: (
+    cwd: string,
+    options?: { readonly timeoutMs?: number },
+  ) => Effect.Effect<boolean, CheckpointStoreError>;
 
   /**
    * Capture a checkpoint commit and store it at the provided checkpoint ref.

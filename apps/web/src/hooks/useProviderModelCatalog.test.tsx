@@ -9,6 +9,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ProviderModelCatalog } from "./useProviderModelCatalog";
 import { useProviderModelCatalog } from "./useProviderModelCatalog";
+import { providerDiscoveryQueryKeys } from "../lib/providerDiscoveryReactQuery";
 
 const mocks = vi.hoisted(() => ({
   useAppSettings: vi.fn(),
@@ -53,6 +54,8 @@ const MODEL_HINTS = { cursor: "composer-2" } as const;
 const SETTINGS = {
   antigravityBinaryPath: "",
   commandCodeBinaryPath: "",
+  codexBinaryPath: "",
+  codexHomePath: "",
   cursorApiEndpoint: "",
   cursorBinaryPath: "",
   customAntigravityModels: [],
@@ -117,6 +120,37 @@ beforeEach(() => {
 });
 
 describe("useProviderModelCatalog", () => {
+  it("scopes Codex model discovery to the configured binary and cwd", () => {
+    mocks.useAppSettings.mockReturnValue({
+      settings: {
+        ...SETTINGS,
+        codexBinaryPath: "/bin/codex",
+        codexHomePath: "/home/codex",
+      },
+    });
+
+    readCatalogRenders({
+      selectedProvider: "codex",
+      discoveryEnabled: true,
+      cwd: "/tmp/project",
+    });
+
+    const codexModelQuery = mocks.useQuery.mock.calls.find(([value]) => {
+      const queryKey = (value as QueryOptionsLike).queryKey;
+      return queryKey[1] === "models" && queryKey[2] === "codex";
+    });
+    expect(codexModelQuery?.[0].queryKey).toEqual(
+      providerDiscoveryQueryKeys.models(
+        "codex",
+        "/bin/codex",
+        null,
+        null,
+        "/tmp/project",
+        "/home/codex",
+      ),
+    );
+  });
+
   it("keeps aggregate identities stable when inputs and query data are unchanged", () => {
     const [first, second] = readCatalogRenders({
       selectedProvider: "cursor",

@@ -19,7 +19,30 @@ interface PendingApproval {
 
 const args = process.argv.slice(2);
 const protocolLogPath = process.env.SYNARA_FAKE_CODEX_PROTOCOL_LOG_PATH;
+const invocationLogPath = process.env.SYNARA_FAKE_CODEX_INVOCATION_LOG_PATH;
+const networkGuardPath = process.env.SYNARA_FAKE_CODEX_NETWORK_GUARD_PATH;
 const controlledWorkspacePath = process.env.SYNARA_FAKE_CODEX_WORKSPACE_PATH;
+if (!invocationLogPath) {
+  throw new Error("Fake Codex requires SYNARA_FAKE_CODEX_INVOCATION_LOG_PATH.");
+}
+if (!networkGuardPath) {
+  throw new Error("Fake Codex requires SYNARA_FAKE_CODEX_NETWORK_GUARD_PATH.");
+}
+FS.mkdirSync(Path.dirname(invocationLogPath), { recursive: true });
+FS.appendFileSync(
+  invocationLogPath,
+  `${JSON.stringify({
+    at: new Date().toISOString(),
+    pid: process.pid,
+    ppid: process.ppid,
+    args,
+    runtime: {
+      executable: process.execPath,
+      bun: typeof process.versions.bun === "string",
+    },
+  })}\n`,
+  "utf8",
+);
 let nextThread = 1;
 let nextTurn = 1;
 let nextApproval = 10_000;
@@ -42,12 +65,46 @@ function appendProtocolLog(direction: string, payload: unknown): void {
     `${JSON.stringify({
       at: new Date().toISOString(),
       pid: process.pid,
+      ppid: process.ppid,
       provider: "codex",
       direction,
       payload,
     })}\n`,
     "utf8",
   );
+}
+
+process.once("exit", (code) => {
+  appendProtocolLog("fixture", { event: "process-exit", code });
+});
+
+function argumentValue(name: string): string | null {
+  const index = args.indexOf(name);
+  const value = index >= 0 ? args[index + 1] : undefined;
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function runTextGeneration(): void {
+  const schemaPath = argumentValue("--output-schema");
+  const outputPath = argumentValue("--output-last-message");
+  if (!schemaPath || !outputPath) {
+    throw new Error("Fake Codex text generation requires schema and output paths.");
+  }
+  const schema = JSON.parse(FS.readFileSync(schemaPath, "utf8")) as {
+    readonly properties?: Record<string, unknown>;
+  };
+  if (!schema.properties || !("title" in schema.properties)) {
+    throw new Error("Fake Codex text generation only supports the thread-title schema.");
+  }
+  appendProtocolLog("fixture", { event: "text-generation-awaiting-stdin" });
+  FS.readFileSync(0, "utf8");
+  appendProtocolLog("fixture", { event: "text-generation-stdin-complete" });
+  FS.writeFileSync(outputPath, JSON.stringify({ title: "E2E Test Thread" }), "utf8");
+  appendProtocolLog("fixture", { event: "text-generation-output-written" });
+}
+
+function writeStdoutAndExit(output: string): void {
+  process.stdout.write(output, () => process.exit(0));
 }
 
 function writeMessage(message: JsonRecord): void {
@@ -185,7 +242,14 @@ function beginApproval(threadId: string, turnId: string): void {
 
 function finishApproval(requestId: string, result: unknown): void {
   const pending = pendingApprovals.get(requestId);
-  if (!pending) return;
+  if (!pending) {
+    appendProtocolLog("fixture", {
+      event: "unexpected-response",
+      requestId,
+      result,
+    });
+    return;
+  }
   pendingApprovals.delete(requestId);
   const decision =
     result &&
@@ -196,13 +260,29 @@ function finishApproval(requestId: string, result: unknown): void {
   const startedAt = Date.now();
   const execution =
     decision === "accept"
-      ? spawnSync(process.execPath, ["-e", APPROVAL_COMMAND_SCRIPT], {
-          cwd: pending.cwd,
-          encoding: "utf8",
-          env: process.env,
-          windowsHide: true,
-        })
+      ? spawnSync(
+          process.execPath,
+          ["--require", networkGuardPath, "-e", APPROVAL_COMMAND_SCRIPT],
+          {
+            cwd: pending.cwd,
+            encoding: "utf8",
+            env: {
+              ...process.env,
+              SYNARA_E2E_NETWORK_ROLE: "approval-child",
+            },
+            windowsHide: true,
+          },
+        )
       : null;
+  if (execution) {
+    appendProtocolLog("fixture", {
+      event: "approval-command-completed",
+      pid: execution.pid,
+      status: execution.status,
+      signal: execution.signal,
+      error: execution.error?.message ?? null,
+    });
+  }
   const output = execution ? `${execution.stdout ?? ""}${execution.stderr ?? ""}` : "";
   if (output.length > 0) {
     notify("item/commandExecution/outputDelta", {
@@ -388,15 +468,28 @@ function startAppServer(): void {
     }
     if (typeof message.method === "string" && "id" in message) {
       handleRequest(message);
+      return;
+    }
+    if (message.method !== "initialized") {
+      appendProtocolLog("fixture", {
+        event: "unexpected-notification",
+        message,
+      });
     }
   });
-  reader.on("close", () => process.exit(0));
+  reader.on("close", () => {
+    appendProtocolLog("fixture", { event: "process-stdin-closed" });
+    process.exit(0);
+  });
 }
 
 if (args.length === 1 && args[0] === "--version") {
-  process.stdout.write("codex-cli 0.99.0\n");
+  writeStdoutAndExit("codex-cli 0.99.0\n");
 } else if (args[0] === "login" && args[1] === "status") {
-  process.stdout.write("Logged in\n");
+  writeStdoutAndExit("Logged in\n");
+} else if (args[0] === "exec") {
+  runTextGeneration();
+  process.exit(0);
 } else if (args.includes("app-server")) {
   startAppServer();
 } else {

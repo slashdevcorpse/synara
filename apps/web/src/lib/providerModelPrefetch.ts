@@ -18,6 +18,8 @@ import {
 export type ProviderModelPrefetchSettings = Pick<
   AppSettings,
   | "defaultProvider"
+  | "codexBinaryPath"
+  | "codexHomePath"
   | "commandCodeBinaryPath"
   | "cursorBinaryPath"
   | "cursorApiEndpoint"
@@ -73,7 +75,12 @@ export function providerModelsPrefetchQueryOptions(input: {
     case "claudeAgent":
       return providerModelsQueryOptions({ provider: "claudeAgent" });
     case "codex":
-      return providerModelsQueryOptions({ provider: "codex" });
+      return providerModelsQueryOptions({
+        provider: "codex",
+        binaryPath: settings.codexBinaryPath || null,
+        homePath: settings.codexHomePath || null,
+        cwd,
+      });
     case "commandCode":
       return providerModelsQueryOptions({
         provider: "commandCode",

@@ -4,6 +4,7 @@
 import * as FS from "node:fs";
 import * as OS from "node:os";
 import * as Path from "node:path";
+import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import {
   test as base,
@@ -19,10 +20,50 @@ const requireFromFixture = createRequire(__filename);
 const REPO_ROOT = Path.resolve(__dirname, "../../..");
 const DESKTOP_MAIN_PATH = Path.join(REPO_ROOT, "apps/desktop/dist-electron/main.js");
 const ELECTRON_BOOTSTRAP_PATH = Path.join(__dirname, "fixtures/electron-bootstrap.cjs");
-const FAKE_CODEX_SCRIPT_PATH = Path.join(__dirname, "fixtures/fake-codex.ts");
-const LAUNCHER_LOG_SCRIPT_PATH = Path.join(__dirname, "fixtures/launcher-log.cjs");
+const FAKE_CODEX_SOURCE_PATH = Path.join(__dirname, "fixtures/fake-codex.ts");
 const NETWORK_GUARD_PATH = Path.join(__dirname, "fixtures/network-guard.cjs");
 type JsonRecord = Record<string, unknown>;
+
+function authenticatedAccountReadPids(events: readonly JsonRecord[]): ReadonlySet<number> {
+  const requests = new Set<string>();
+  for (const entry of events) {
+    const payload =
+      entry.payload !== null && typeof entry.payload === "object"
+        ? (entry.payload as JsonRecord)
+        : null;
+    if (
+      entry.direction === "in" &&
+      typeof entry.pid === "number" &&
+      payload?.method === "account/read" &&
+      (typeof payload.id === "number" || typeof payload.id === "string")
+    ) {
+      requests.add(JSON.stringify([entry.pid, payload.id]));
+    }
+  }
+
+  const authenticatedPids = new Set<number>();
+  for (const entry of events) {
+    const payload =
+      entry.payload !== null && typeof entry.payload === "object"
+        ? (entry.payload as JsonRecord)
+        : null;
+    const result =
+      payload?.result !== null && typeof payload?.result === "object"
+        ? (payload.result as JsonRecord)
+        : null;
+    if (
+      entry.direction === "out" &&
+      typeof entry.pid === "number" &&
+      (typeof payload?.id === "number" || typeof payload?.id === "string") &&
+      result?.account !== null &&
+      typeof result?.account === "object" &&
+      requests.has(JSON.stringify([entry.pid, payload.id]))
+    ) {
+      authenticatedPids.add(entry.pid);
+    }
+  }
+  return authenticatedPids;
+}
 
 function formatAggregateError(error: unknown): string {
   if (error instanceof AggregateError) {
@@ -84,7 +125,36 @@ const PROJECT_SKILL_ROOTS = [
   [".agents", "skills"],
 ] as const;
 const BROWSER_SESSION_PARTITION = "persist:synara-browser";
-const PROVIDER_DISCOVERY_PREFLIGHT_TIMEOUT_MS = 60_000;
+const FAKE_CODEX_PREFLIGHT_TIMEOUT_MS = 15_000;
+const FAKE_CODEX_RUNTIME_BUILD_TIMEOUT_MS = 30_000;
+const NETWORK_GUARD_PREFLIGHT_TIMEOUT_MS = 5_000;
+const PROVIDER_HEALTH_READY_TIMEOUT_MS = 30_000;
+const BUN_RUNTIME_COMMAND = resolveExecutableOnPath("bun");
+const NODE_RUNTIME_COMMAND = resolveExecutableOnPath("node");
+
+function resolveExecutableOnPath(command: string): string {
+  const extensions =
+    process.platform === "win32"
+      ? (process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD")
+          .split(";")
+          .map((extension) => extension.trim())
+          .filter(Boolean)
+      : [""];
+  for (const rawDirectory of (process.env.PATH ?? "").split(Path.delimiter)) {
+    const directory = rawDirectory.trim().replace(/^"|"$/gu, "");
+    if (!directory) continue;
+    for (const extension of extensions) {
+      const candidate = Path.join(directory, `${command}${extension}`);
+      try {
+        FS.accessSync(candidate, FS.constants.X_OK);
+        if (FS.statSync(candidate).isFile()) return candidate;
+      } catch {
+        // Continue through the remaining PATH candidates.
+      }
+    }
+  }
+  throw new Error(`Desktop E2E requires ${command} on PATH.`);
+}
 
 function isPathWithin(parentPath: string, candidatePath: string): boolean {
   const relative = Path.relative(Path.resolve(parentPath), Path.resolve(candidatePath));
@@ -138,7 +208,34 @@ function quotePosixArgument(value: string): string {
   return `'${value.replaceAll("'", `'\\''`)}'`;
 }
 
-async function createFakeCodexLauncher(runtimeDir: string): Promise<string> {
+async function buildFakeCodexRuntime(runtimeDir: string): Promise<string> {
+  const outputPath = Path.join(runtimeDir, "fake-codex-runtime.mjs");
+  const result = spawnSync(
+    BUN_RUNTIME_COMMAND,
+    ["build", FAKE_CODEX_SOURCE_PATH, "--target=node", "--format=esm", "--outfile", outputPath],
+    {
+      cwd: REPO_ROOT,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: FAKE_CODEX_RUNTIME_BUILD_TIMEOUT_MS,
+      maxBuffer: 1024 * 1024,
+      windowsHide: true,
+    },
+  );
+  if (result.error) {
+    throw new Error(`Failed to build the fake Codex Node runtime: ${result.error.message}`);
+  }
+  if (result.status !== 0 || !FS.existsSync(outputPath)) {
+    const detail = result.stderr?.trim() || result.stdout?.trim() || `exit status ${result.status}`;
+    throw new Error(`Failed to build the fake Codex Node runtime: ${detail}`);
+  }
+  return outputPath;
+}
+
+async function createFakeCodexLauncher(
+  runtimeDir: string,
+  fakeCodexRuntimePath: string,
+): Promise<string> {
   const launcherDir = Path.join(runtimeDir, "fake-codex");
   const fakeCodexHome = Path.join(runtimeDir, "fake-codex-home");
   await FS.promises.mkdir(launcherDir, { recursive: true });
@@ -147,9 +244,8 @@ async function createFakeCodexLauncher(runtimeDir: string): Promise<string> {
     const launcherPath = Path.join(launcherDir, "codex.cmd");
     const contents = [
       "@echo off",
-      `${quoteCmdArgument(process.execPath)} ${quoteCmdArgument(LAUNCHER_LOG_SCRIPT_PATH)} %*`,
-      "if errorlevel 1 exit /b %errorlevel%",
-      `${quoteCmdArgument(process.execPath)} ${quoteCmdArgument(FAKE_CODEX_SCRIPT_PATH)} %*`,
+      `${quoteCmdArgument(NODE_RUNTIME_COMMAND)} ${quoteCmdArgument(fakeCodexRuntimePath)} %*`,
+      "exit /b %errorlevel%",
       "",
     ].join("\r\n");
     await FS.promises.writeFile(launcherPath, contents, "utf8");
@@ -159,13 +255,105 @@ async function createFakeCodexLauncher(runtimeDir: string): Promise<string> {
   const launcherPath = Path.join(launcherDir, "codex");
   const contents = [
     "#!/usr/bin/env sh",
-    `${quotePosixArgument(process.execPath)} ${quotePosixArgument(LAUNCHER_LOG_SCRIPT_PATH)} "$@" || exit $?`,
-    `exec ${quotePosixArgument(process.execPath)} ${quotePosixArgument(FAKE_CODEX_SCRIPT_PATH)} "$@"`,
+    `exec ${quotePosixArgument(NODE_RUNTIME_COMMAND)} ${quotePosixArgument(fakeCodexRuntimePath)} "$@"`,
     "",
   ].join("\n");
   await FS.promises.writeFile(launcherPath, contents, { encoding: "utf8", mode: 0o755 });
   await FS.promises.chmod(launcherPath, 0o755);
   return launcherPath;
+}
+
+async function preflightFakeCodexLauncher(input: {
+  readonly binaryPath: string;
+  readonly cwd: string;
+  readonly env: NodeJS.ProcessEnv;
+}): Promise<void> {
+  const { prepareResolvedWindowsSafeProcess } = await import("@synara/shared/windowsProcess");
+  const probes = [
+    { args: ["--version"], expectedOutput: "codex-cli 0.99.0" },
+    { args: ["login", "status"], expectedOutput: "Logged in" },
+  ] as const;
+  for (const probe of probes) {
+    const prepared = prepareResolvedWindowsSafeProcess(input.binaryPath, probe.args, {
+      cwd: input.cwd,
+      env: input.env,
+    });
+    const result = spawnSync(prepared.command, prepared.args, {
+      cwd: input.cwd,
+      env: input.env,
+      encoding: "utf8",
+      shell: prepared.shell,
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: FAKE_CODEX_PREFLIGHT_TIMEOUT_MS,
+      maxBuffer: 1024 * 1024,
+      windowsHide: prepared.windowsHide,
+      windowsVerbatimArguments: prepared.windowsVerbatimArguments,
+    });
+    const stdout = result.stdout ?? "";
+    const stderr = result.stderr ?? "";
+    if (result.error) {
+      throw new Error(
+        `Fake Codex preflight ${JSON.stringify(probe.args)} failed: ${result.error.message}`,
+      );
+    }
+    if (result.status !== 0) {
+      const detail = stderr.trim() || stdout.trim() || `exit status ${result.status ?? "null"}`;
+      throw new Error(`Fake Codex preflight ${JSON.stringify(probe.args)} failed: ${detail}`);
+    }
+    if (stdout.trim() !== probe.expectedOutput || stderr.trim().length > 0) {
+      throw new Error(
+        `Fake Codex preflight ${JSON.stringify(probe.args)} returned unexpected output: ${JSON.stringify({ stdout, stderr })}`,
+      );
+    }
+  }
+}
+
+function preflightNodeNetworkGuard(input: {
+  readonly cwd: string;
+  readonly networkGuardPath: string;
+  readonly networkLogPath: string;
+}): void {
+  const script = [
+    'const Net = require("node:net");',
+    'const socket = Net.connect({ host: "203.0.113.1", port: 9 });',
+    'const timeout = setTimeout(() => { console.error("guard timeout"); socket.destroy(); process.exit(3); }, 1_000);',
+    'socket.once("connect", () => { clearTimeout(timeout); console.error("guard connected"); socket.destroy(); process.exit(4); });',
+    'socket.once("error", (error) => { clearTimeout(timeout); if (error?.code !== "EACCES") { console.error(error); process.exit(5); } console.log("EACCES"); });',
+  ].join("\n");
+  const result = spawnSync(
+    NODE_RUNTIME_COMMAND,
+    ["--require", input.networkGuardPath, "-e", script],
+    {
+      cwd: input.cwd,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        SYNARA_E2E_NETWORK_ROLE: "guard-probe",
+        SYNARA_FAKE_CODEX_NETWORK_LOG_PATH: input.networkLogPath,
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: NETWORK_GUARD_PREFLIGHT_TIMEOUT_MS,
+      maxBuffer: 1024 * 1024,
+      windowsHide: true,
+    },
+  );
+  const stdout = result.stdout ?? "";
+  const stderr = result.stderr ?? "";
+  if (
+    result.error ||
+    result.status !== 0 ||
+    stdout.trim() !== "EACCES" ||
+    stderr.trim().length > 0
+  ) {
+    throw new Error(
+      `Desktop E2E Node network guard preflight failed: ${JSON.stringify({
+        error: result.error?.message ?? null,
+        status: result.status,
+        stdout,
+        stderr,
+      })}`,
+    );
+  }
 }
 
 function isolatedExecutablePath(fakeCodexDir: string, inheritedPath: string | undefined): string {
@@ -336,6 +524,8 @@ function isolatedElectronEnv(input: {
     SYNARA_FAKE_CODEX_PROTOCOL_LOG_PATH: input.protocolLogPath,
     SYNARA_FAKE_CODEX_WORKSPACE_PATH: input.workspaceDir,
     SYNARA_HOME: input.homeDir,
+    SYNARA_LOG_PROVIDER_EVENTS: "1",
+    SYNARA_LOG_WS_EVENTS: "1",
     SYNARA_NO_BROWSER: "1",
     SYNARA_TELEMETRY_ENABLED: "0",
     VITEST: "1",
@@ -405,7 +595,16 @@ export class DesktopHarness {
       await FS.promises.writeFile(harness.protocolLogPath, "", "utf8");
       await assertWorkspaceAncestorsAreIsolated(harness.workspaceDir);
       await FS.promises.copyFile(NETWORK_GUARD_PATH, harness.networkGuardPath);
-      const fakeCodexPath = await createFakeCodexLauncher(harness.operationalDir);
+      preflightNodeNetworkGuard({
+        cwd: harness.workspaceDir,
+        networkGuardPath: harness.networkGuardPath,
+        networkLogPath: harness.networkLogPath,
+      });
+      const fakeCodexRuntimePath = await buildFakeCodexRuntime(harness.operationalDir);
+      const fakeCodexPath = await createFakeCodexLauncher(
+        harness.operationalDir,
+        fakeCodexRuntimePath,
+      );
       if (Path.resolve(fakeCodexPath) !== Path.resolve(harness.fakeCodexPath)) {
         throw new Error(`Unexpected fake Codex launcher path: ${fakeCodexPath}`);
       }
@@ -439,7 +638,6 @@ export class DesktopHarness {
     if (this.electronAppValue) throw new Error("The desktop application is already running.");
     this.launchCount += 1;
     const networkEventBaseline = (await this.readJsonLines(this.networkLogPath)).length;
-    const invocationBaseline = (await this.readJsonLines(this.invocationLogPath)).length;
     await FS.promises.appendFile(
       this.desktopLogPath,
       `\n[e2e] launch=${this.launchCount} at=${new Date().toISOString()}\n`,
@@ -458,6 +656,13 @@ export class DesktopHarness {
       desktopMainPath: DESKTOP_MAIN_PATH,
       networkGuardPath: this.networkGuardPath,
     });
+    // Prove the isolated launcher directly instead of depending on background health-refresh timing.
+    await preflightFakeCodexLauncher({
+      binaryPath: this.fakeCodexPath,
+      cwd: this.workspaceDir,
+      env: launchEnv,
+    });
+    const invocationBaseline = (await this.readJsonLines(this.invocationLogPath)).length;
     const codexPathCandidates = assertFakeCodexIsOnlyPathCandidate(
       launchEnv.PATH ?? "",
       this.fakeCodexPath,
@@ -562,73 +767,73 @@ export class DesktopHarness {
       await expect(page.getByRole("button", { name: "Settings", exact: true })).toBeVisible({
         timeout: 60_000,
       });
+      await expect(page.getByLabel("Loading projects")).toBeHidden({ timeout: 60_000 });
       await page.bringToFront();
       await expect.poll(() => page.evaluate(() => document.visibilityState)).toBe("visible");
+      await page.evaluate(() => window.dispatchEvent(new Event("focus")));
       await expect
         .poll(
           async () => {
-            await page.evaluate(() => window.dispatchEvent(new Event("focus")));
             const invocations = (await this.readJsonLines(this.invocationLogPath)).slice(
               invocationBaseline,
             );
-            const events = (await this.readJsonLines(this.networkLogPath)).slice(
+            const networkEvents = (await this.readJsonLines(this.networkLogPath)).slice(
               networkEventBaseline,
             );
-            const invocationArgs = invocations.flatMap((entry) =>
-              Array.isArray(entry.args) ? [entry.args] : [],
-            );
-            const guardedLauncherPids = new Set(
-              events.flatMap((entry) =>
-                entry.event === "guard-installed" &&
-                entry.role === "fake-launcher" &&
-                typeof entry.pid === "number"
-                  ? [entry.pid]
-                  : [],
-              ),
-            );
-            const guardedFakeArgs = new Set(
-              events.flatMap((entry) =>
+            const protocolEvents = await this.readJsonLines(this.protocolLogPath);
+            const guardedProcesses = new Set(
+              networkEvents.flatMap((entry) =>
                 entry.event === "guard-installed" &&
                 entry.role === "fake-codex" &&
+                typeof entry.pid === "number" &&
                 Array.isArray(entry.args)
-                  ? [JSON.stringify(entry.args)]
+                  ? [JSON.stringify([entry.pid, entry.args])]
                   : [],
               ),
             );
             const healthInvocations = invocations.filter(
               (entry) =>
+                typeof entry.pid === "number" &&
                 Array.isArray(entry.args) &&
                 (JSON.stringify(entry.args) === JSON.stringify(["--version"]) ||
                   JSON.stringify(entry.args) === JSON.stringify(["login", "status"])),
             );
+            const authenticatedPids = authenticatedAccountReadPids(protocolEvents);
+            const runtimeInvocations = invocations.filter(
+              (entry) => typeof entry.pid === "number" && Array.isArray(entry.args),
+            );
             return {
-              version: invocationArgs.some(
-                (entry) => JSON.stringify(entry) === JSON.stringify(["--version"]),
+              version: healthInvocations.some(
+                (entry) => JSON.stringify(entry.args) === JSON.stringify(["--version"]),
               ),
-              auth: invocationArgs.some(
-                (entry) => JSON.stringify(entry) === JSON.stringify(["login", "status"]),
-              ),
-              launchersGuarded:
-                healthInvocations.length >= 2 &&
-                healthInvocations.every(
-                  (entry) => typeof entry.pid === "number" && guardedLauncherPids.has(entry.pid),
+              auth:
+                healthInvocations.some(
+                  (entry) => JSON.stringify(entry.args) === JSON.stringify(["login", "status"]),
+                ) ||
+                runtimeInvocations.some(
+                  (entry) =>
+                    authenticatedPids.has(entry.pid as number) &&
+                    (entry.args as unknown[]).includes("app-server"),
                 ),
-              fixturesGuarded:
-                guardedFakeArgs.has(JSON.stringify(["--version"])) &&
-                guardedFakeArgs.has(JSON.stringify(["login", "status"])),
+              guarded:
+                runtimeInvocations.length >= 2 &&
+                runtimeInvocations.every((entry) =>
+                  guardedProcesses.has(JSON.stringify([entry.pid, entry.args])),
+                ),
             };
           },
           {
-            timeout: PROVIDER_DISCOVERY_PREFLIGHT_TIMEOUT_MS,
+            timeout: PROVIDER_HEALTH_READY_TIMEOUT_MS,
             intervals: [100, 250, 500, 1_000],
           },
         )
-        .toEqual({
-          version: true,
-          auth: true,
-          launchersGuarded: true,
-          fixturesGuarded: true,
-        });
+        .toEqual({ version: true, auth: true, guarded: true });
+      await page.evaluate(
+        () =>
+          new Promise<void>((resolve) =>
+            window.requestAnimationFrame(() => window.requestAnimationFrame(() => resolve())),
+          ),
+      );
     } catch (error) {
       try {
         await this.stop();
@@ -665,9 +870,25 @@ export class DesktopHarness {
     }
     const backendLogsPath = Path.join(this.homeDir, "userdata", "logs");
     const preservedBackendLogsPath = Path.join(this.runtimeDir, "backend-logs");
+    const stateDatabasePath = Path.join(this.homeDir, "userdata", "state.sqlite");
+    const preservedStateDatabasePath = Path.join(this.runtimeDir, "state.sqlite");
+    const stateDatabaseArtifacts = [
+      { source: stateDatabasePath, destination: preservedStateDatabasePath },
+      { source: `${stateDatabasePath}-wal`, destination: `${preservedStateDatabasePath}-wal` },
+      { source: `${stateDatabasePath}-shm`, destination: `${preservedStateDatabasePath}-shm` },
+    ] as const;
     try {
       if (FS.existsSync(backendLogsPath)) {
         await FS.promises.cp(backendLogsPath, preservedBackendLogsPath, { recursive: true });
+      }
+    } catch (error) {
+      errors.push(error);
+    }
+    try {
+      for (const artifact of stateDatabaseArtifacts) {
+        if (FS.existsSync(artifact.source)) {
+          await FS.promises.copyFile(artifact.source, artifact.destination);
+        }
       }
     } catch (error) {
       errors.push(error);
@@ -704,6 +925,21 @@ export class DesktopHarness {
         name: "provider-event-log",
         path: Path.join(preservedBackendLogsPath, "provider", "events.log"),
         contentType: "text/plain",
+      },
+      {
+        name: "state-database",
+        path: preservedStateDatabasePath,
+        contentType: "application/vnd.sqlite3",
+      },
+      {
+        name: "state-database-wal",
+        path: `${preservedStateDatabasePath}-wal`,
+        contentType: "application/octet-stream",
+      },
+      {
+        name: "state-database-shm",
+        path: `${preservedStateDatabasePath}-shm`,
+        contentType: "application/octet-stream",
       },
     ];
     for (const attachment of attachments) {
@@ -785,53 +1021,50 @@ export class DesktopHarness {
       }
       const protocolEvents = await this.readJsonLines(this.protocolLogPath);
       const invocationEvents = await this.readJsonLines(this.invocationLogPath);
-      const guardedLauncherPids = new Set(
-        networkEvents.flatMap((entry) =>
-          entry.event === "guard-installed" &&
-          entry.layer === "node" &&
-          entry.role === "fake-launcher" &&
-          typeof entry.pid === "number"
-            ? [entry.pid]
+      const invocationProcessKeys = new Set(
+        invocationEvents.flatMap((entry) =>
+          typeof entry.pid === "number" && Array.isArray(entry.args)
+            ? [JSON.stringify([entry.pid, entry.args])]
             : [],
         ),
       );
-      const unguardedLauncherPids = invocationEvents.flatMap((entry) =>
-        typeof entry.pid === "number" && !guardedLauncherPids.has(entry.pid) ? [entry.pid] : [],
+      const guardedFakeProcessKeys = new Set(
+        networkEvents.flatMap((entry) =>
+          entry.event === "guard-installed" &&
+          entry.layer === "node" &&
+          entry.role === "fake-codex" &&
+          typeof entry.pid === "number" &&
+          Array.isArray(entry.args)
+            ? [JSON.stringify([entry.pid, entry.args])]
+            : [],
+        ),
       );
-      if (unguardedLauncherPids.length > 0) {
+      const unguardedInvocationProcesses = [...invocationProcessKeys].filter(
+        (processKey) => !guardedFakeProcessKeys.has(processKey),
+      );
+      if (unguardedInvocationProcesses.length > 0) {
         errors.push(
           new Error(
-            `Fake Codex launcher invocation(s) lacked the Node network guard: ${unguardedLauncherPids.join(", ")}.`,
+            `Fake Codex process guard evidence is missing for invocation(s): ${unguardedInvocationProcesses.join(", ")}.`,
           ),
         );
       }
-      const invocationCountsByArgs = new Map<string, number>();
-      for (const entry of invocationEvents) {
-        if (!Array.isArray(entry.args)) continue;
-        const key = JSON.stringify(entry.args);
-        invocationCountsByArgs.set(key, (invocationCountsByArgs.get(key) ?? 0) + 1);
-      }
-      const guardedFakeCountsByArgs = new Map<string, number>();
-      for (const entry of networkEvents) {
-        if (
-          entry.event !== "guard-installed" ||
-          entry.layer !== "node" ||
-          entry.role !== "fake-codex" ||
-          !Array.isArray(entry.args)
-        ) {
-          continue;
-        }
-        const key = JSON.stringify(entry.args);
-        guardedFakeCountsByArgs.set(key, (guardedFakeCountsByArgs.get(key) ?? 0) + 1);
-      }
-      const unguardedInvocationArgs = [...invocationCountsByArgs.entries()].flatMap(
-        ([argsKey, count]) =>
-          (guardedFakeCountsByArgs.get(argsKey) ?? 0) < count ? [argsKey] : [],
-      );
-      if (unguardedInvocationArgs.length > 0) {
+      const nonNodeInvocationPids = invocationEvents.flatMap((entry) => {
+        const runtime =
+          entry.runtime && typeof entry.runtime === "object"
+            ? (entry.runtime as { bun?: unknown; executable?: unknown })
+            : null;
+        return typeof entry.pid === "number" &&
+          (runtime?.bun !== false ||
+            typeof runtime.executable !== "string" ||
+            !/^node(?:\.exe)?$/iu.test(Path.basename(runtime.executable)))
+          ? [entry.pid]
+          : [];
+      });
+      if (nonNodeInvocationPids.length > 0) {
         errors.push(
           new Error(
-            `Fake Codex process guard evidence is missing for invocation(s): ${unguardedInvocationArgs.join(", ")}.`,
+            `Fake Codex invocation(s) did not run in the guarded Node runtime: ${nonNodeInvocationPids.join(", ")}.`,
           ),
         );
       }
@@ -858,20 +1091,130 @@ export class DesktopHarness {
           ),
         );
       }
-      const appServerInvocationCount = invocationEvents.filter(
-        (entry) => Array.isArray(entry.args) && entry.args.includes("app-server"),
-      ).length;
-      const protocolProcessCount = protocolEvents.filter(
-        (entry) =>
-          entry.direction === "fixture" &&
-          entry.payload !== null &&
-          typeof entry.payload === "object" &&
-          (entry.payload as { event?: unknown }).event === "process-started",
-      ).length;
-      if (protocolProcessCount !== appServerInvocationCount) {
+      const appServerInvocationKeys = new Set(
+        invocationEvents.flatMap((entry) =>
+          typeof entry.pid === "number" &&
+          Array.isArray(entry.args) &&
+          entry.args.includes("app-server")
+            ? [JSON.stringify([entry.pid, entry.args])]
+            : [],
+        ),
+      );
+      const appServerProtocolKeys = new Set(
+        protocolEvents.flatMap((entry) => {
+          const payload =
+            entry.payload !== null && typeof entry.payload === "object"
+              ? (entry.payload as { event?: unknown; args?: unknown })
+              : null;
+          return entry.direction === "fixture" &&
+            payload?.event === "process-started" &&
+            typeof entry.pid === "number" &&
+            Array.isArray(payload.args)
+            ? [JSON.stringify([entry.pid, payload.args])]
+            : [];
+        }),
+      );
+      const missingAppServerProtocol = [...appServerInvocationKeys].filter(
+        (processKey) => !appServerProtocolKeys.has(processKey),
+      );
+      const orphanedAppServerProtocol = [...appServerProtocolKeys].filter(
+        (processKey) => !appServerInvocationKeys.has(processKey),
+      );
+      if (missingAppServerProtocol.length > 0 || orphanedAppServerProtocol.length > 0) {
         errors.push(
           new Error(
-            `Fake Codex app-server evidence mismatch: ${appServerInvocationCount} invocation(s), ${protocolProcessCount} protocol process start(s).`,
+            `Fake Codex app-server evidence mismatch: missing=${JSON.stringify(missingAppServerProtocol)}, orphaned=${JSON.stringify(orphanedAppServerProtocol)}.`,
+          ),
+        );
+      }
+      const turnStarted = protocolEvents.some(
+        (entry) =>
+          entry.direction === "in" &&
+          entry.payload !== null &&
+          typeof entry.payload === "object" &&
+          (entry.payload as { method?: unknown }).method === "turn/start",
+      );
+      const textGenerationInvocations = invocationEvents.filter(
+        (entry) => Array.isArray(entry.args) && entry.args[0] === "exec",
+      );
+      if (turnStarted && textGenerationInvocations.length === 0) {
+        errors.push(
+          new Error("A provider turn started without an observed title-generation exec."),
+        );
+      }
+      const malformedTextGenerationPids = textGenerationInvocations.flatMap((entry) => {
+        const args = entry.args as unknown[];
+        const schemaIndex = args.indexOf("--output-schema");
+        const outputIndex = args.indexOf("--output-last-message");
+        const valid =
+          schemaIndex >= 0 &&
+          typeof args[schemaIndex + 1] === "string" &&
+          outputIndex >= 0 &&
+          typeof args[outputIndex + 1] === "string";
+        return !valid && typeof entry.pid === "number" ? [entry.pid] : [];
+      });
+      if (malformedTextGenerationPids.length > 0) {
+        errors.push(
+          new Error(
+            `Fake Codex title-generation invocation(s) lacked required output arguments: ${malformedTextGenerationPids.join(", ")}.`,
+          ),
+        );
+      }
+      const approvalRequested = protocolEvents.some(
+        (entry) =>
+          entry.direction === "out" &&
+          entry.payload !== null &&
+          typeof entry.payload === "object" &&
+          (entry.payload as { method?: unknown }).method ===
+            "item/commandExecution/requestApproval",
+      );
+      const approvalChildPids = protocolEvents.flatMap((entry) => {
+        const payload =
+          entry.payload !== null && typeof entry.payload === "object"
+            ? (entry.payload as { event?: unknown; pid?: unknown })
+            : null;
+        return entry.direction === "fixture" &&
+          payload?.event === "approval-command-completed" &&
+          typeof payload.pid === "number"
+          ? [payload.pid]
+          : [];
+      });
+      const guardedApprovalChildPids = new Set(
+        networkEvents.flatMap((entry) =>
+          entry.event === "guard-installed" &&
+          entry.layer === "node" &&
+          entry.role === "approval-child" &&
+          typeof entry.pid === "number"
+            ? [entry.pid]
+            : [],
+        ),
+      );
+      const unguardedApprovalChildPids = approvalChildPids.filter(
+        (pid) => !guardedApprovalChildPids.has(pid),
+      );
+      if (approvalRequested && approvalChildPids.length === 0) {
+        errors.push(new Error("An approved command ran without child-process evidence."));
+      }
+      if (unguardedApprovalChildPids.length > 0) {
+        errors.push(
+          new Error(
+            `Approval command child process(es) lacked the Node network guard: ${unguardedApprovalChildPids.join(", ")}.`,
+          ),
+        );
+      }
+      const malformedProtocolEvents = protocolEvents.filter(
+        (entry) =>
+          entry.direction === "invalid-json" ||
+          (entry.direction === "fixture" &&
+            entry.payload !== null &&
+            typeof entry.payload === "object" &&
+            ((entry.payload as { event?: unknown }).event === "unexpected-notification" ||
+              (entry.payload as { event?: unknown }).event === "unexpected-response")),
+      );
+      if (malformedProtocolEvents.length > 0) {
+        errors.push(
+          new Error(
+            `Fake Codex observed ${malformedProtocolEvents.length} malformed or unexpected protocol message(s); inspect codex-protocol-log.`,
           ),
         );
       }

@@ -73,7 +73,14 @@ export function useProviderModelCatalog(input: {
   const claudeDynamicModelsQuery = useQuery(
     providerModelsQueryOptions({ provider: "claudeAgent" }),
   );
-  const codexDynamicModelsQuery = useQuery(providerModelsQueryOptions({ provider: "codex" }));
+  const codexDynamicModelsQuery = useQuery(
+    providerModelsQueryOptions({
+      provider: "codex",
+      binaryPath: settings.codexBinaryPath || null,
+      homePath: settings.codexHomePath || null,
+      cwd: discoveryCwd,
+    }),
+  );
   const commandCodeDynamicModelsQuery = useQuery(
     providerModelsQueryOptions({
       provider: "commandCode",

@@ -34,6 +34,14 @@ const asEventId = (value: string): EventId => EventId.makeUnsafe(value);
 const asItemId = (value: string): ProviderItemId => ProviderItemId.makeUnsafe(value);
 
 class FakeCodexManager extends CodexAppServerManager {
+  public listModelsImpl = vi.fn(
+    async (_input?: Parameters<CodexAppServerManager["listModels"]>[0]) => ({
+      models: [],
+      source: "codex-app-server",
+      cached: false,
+    }),
+  );
+
   public startSessionImpl = vi.fn(
     async (input: CodexAppServerStartSessionInput): Promise<ProviderSession> => {
       const now = new Date().toISOString();
@@ -153,6 +161,10 @@ class FakeCodexManager extends CodexAppServerManager {
   override async stopAll(): Promise<void> {
     this.stopAllImpl();
   }
+
+  override listModels(input?: Parameters<CodexAppServerManager["listModels"]>[0]) {
+    return this.listModelsImpl(input);
+  }
 }
 
 const providerSessionDirectoryTestLayer = Layer.succeed(ProviderSessionDirectory, {
@@ -226,6 +238,25 @@ validationLayer("CodexAdapterLive validation", (it) => {
         effort: "high",
         serviceTier: "fast",
         runtimeMode: "full-access",
+      });
+    }),
+  );
+  it.effect("forwards Codex model-discovery launch options", () =>
+    Effect.gen(function* () {
+      validationManager.listModelsImpl.mockClear();
+      const adapter = yield* CodexAdapter;
+
+      yield* adapter.listModels!({
+        provider: "codex",
+        binaryPath: "/configured/codex",
+        homePath: "/configured/codex-home",
+        cwd: "/repo",
+      });
+
+      assert.deepStrictEqual(validationManager.listModelsImpl.mock.calls[0]?.[0], {
+        binaryPath: "/configured/codex",
+        homePath: "/configured/codex-home",
+        cwd: "/repo",
       });
     }),
   );

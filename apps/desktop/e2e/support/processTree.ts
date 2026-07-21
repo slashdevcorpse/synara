@@ -16,12 +16,14 @@ export interface ProcessSnapshotRow {
   readonly parentPid: number;
   readonly identity: string | null;
   readonly commandFingerprint: string | null;
+  readonly imageName?: string | null;
 }
 
 export interface TrackedProcess {
   readonly pid: number;
   readonly identity: string;
   readonly commandFingerprint: string;
+  readonly imageName?: string;
 }
 
 export interface ProcessTreeDependencies {
@@ -116,6 +118,7 @@ function trackedProcessFromRow(row: ProcessSnapshotRow, context: string): Tracke
     pid: row.pid,
     identity: row.identity,
     commandFingerprint: row.commandFingerprint,
+    ...(row.imageName ? { imageName: row.imageName } : {}),
   };
 }
 
@@ -232,6 +235,13 @@ export function collectDescendants(
         );
         continue;
       }
+      const ancestryState = classifyProcessAncestry(parent, child);
+      if (ancestryState === "stale") {
+        // Windows and Linux can expose a reused parent PID in a point-in-time
+        // process snapshot. A child created before its alleged parent cannot
+        // belong to this tree, so exclude that edge without following it.
+        continue;
+      }
       let trackedChild: TrackedProcess;
       try {
         trackedChild = trackedProcessFromRow(child, "descendant");
@@ -239,13 +249,10 @@ export function collectDescendants(
         errors.push(error instanceof Error ? error : new Error(errorMessage(error)));
         continue;
       }
-      const ancestryState = classifyProcessAncestry(parent, child);
       if (ancestryState !== "valid") {
         errors.push(
           new Error(
-            ancestryState === "stale"
-              ? `Desktop process snapshot linked descendant pid ${child.pid} to a newer parent pid ${parent.pid}.`
-              : `Desktop process snapshot could not verify ancestry from pid ${parent.pid} to pid ${child.pid}.`,
+            `Desktop process snapshot could not verify ancestry from pid ${parent.pid} to pid ${child.pid}.`,
           ),
         );
         continue;
@@ -452,6 +459,7 @@ function readWindowsProcessSnapshot(requestedPids?: readonly number[]): ProcessS
           parentPid: entry.ParentProcessId,
           identity: creationDate ? `windows:${creationDate}` : null,
           commandFingerprint: commandIdentity ? fingerprint(commandIdentity) : null,
+          imageName: processName || null,
         },
       ];
     });
@@ -520,8 +528,9 @@ function readMatchingTrackedProcesses(
   context: string,
   dependencies: ProcessTreeDependencies,
 ): TrackedProcess[] {
+  if (trackedProcesses.length === 0) return [];
   try {
-    const requestedPids = trackedProcesses.length === 1 ? [trackedProcesses[0]!.pid] : undefined;
+    const requestedPids = [...new Set(trackedProcesses.map(({ pid }) => pid))];
     return matchingTrackedProcesses(
       trackedProcesses,
       dependencies.readProcessSnapshot(requestedPids),
@@ -542,15 +551,14 @@ function signalTrackedProcesses(
   errors: unknown[],
   context: string,
   dependencies: ProcessTreeDependencies,
-): void {
-  for (const trackedProcess of trackedProcesses) {
-    const matchingProcess = readMatchingTrackedProcesses(
-      [trackedProcess],
-      errors,
-      `${context} for pid ${trackedProcess.pid}`,
-      dependencies,
-    );
-    if (matchingProcess.length === 0) continue;
+): TrackedProcess[] {
+  const matchingProcesses = readMatchingTrackedProcesses(
+    trackedProcesses,
+    errors,
+    context,
+    dependencies,
+  );
+  for (const trackedProcess of matchingProcesses) {
     try {
       dependencies.signalProcess(trackedProcess.pid, signal);
     } catch (error) {
@@ -562,6 +570,7 @@ function signalTrackedProcesses(
       );
     }
   }
+  return matchingProcesses;
 }
 
 async function waitForTrackedProcessesExit(
@@ -622,12 +631,15 @@ async function terminateTrackedProcesses(
     rootProcess,
   ]);
   if (dependencies.platform === "win32") {
-    signalTrackedProcesses(
+    const signaledProcesses = signalTrackedProcesses(
       allTrackedProcesses,
       "SIGKILL",
       errors,
       "immediately before Windows forced termination",
       dependencies,
+    );
+    console.warn(
+      `[desktop-e2e] Windows forced cleanup targeted identity-verified processes: ${signaledProcesses.map(({ pid, imageName }) => `${pid}:${imageName ?? "unknown"}`).join(", ") || "none"}.`,
     );
   } else {
     signalTrackedProcesses(

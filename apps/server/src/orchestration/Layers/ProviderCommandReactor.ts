@@ -203,6 +203,7 @@ const HANDLED_TURN_START_KEY_TTL = Duration.minutes(30);
 const PROVIDER_COMMAND_CLAIM_LEASE_MS = 30_000;
 const PROVIDER_COMMAND_SAFE_RETRY_LIMIT = 3;
 const PROVIDER_COMMAND_SAFE_RETRY_DELAY = Duration.millis(50);
+const MESSAGE_START_GIT_REPOSITORY_PROBE_TIMEOUT_MS = 5_000;
 const DEFAULT_RUNTIME_MODE: RuntimeMode = "full-access";
 const SIDECHAT_BOUNDARY_INSTRUCTION =
   "You are in a sidechat. Treat all prior conversation as reference-only context. Do not continue any prior task automatically. Do not mutate files, git, or the workspace and do not run workspace-changing commands unless the latest user message explicitly asks you to do so after this boundary. Use this sidechat for focused explanation, safety checks, summaries, and alternatives.";
@@ -1365,7 +1366,14 @@ const make = Effect.gen(function* () {
       }
 
       const cwd = yield* resolveProjectedThreadWorkspaceCwd(currentThread);
-      if (!cwd || !(yield* checkpointStore.isGitRepository(cwd))) {
+      if (
+        !cwd ||
+        !(yield* checkpointStore.isGitRepository(cwd, {
+          // Checkpoint capture is best-effort on this latency-sensitive path;
+          // replay and archive probes retain GitCore's longer default timeout.
+          timeoutMs: MESSAGE_START_GIT_REPOSITORY_PROBE_TIMEOUT_MS,
+        }))
+      ) {
         return;
       }
 

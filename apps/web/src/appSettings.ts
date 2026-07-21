@@ -620,6 +620,8 @@ function hasOwn<Key extends keyof AppSettings>(patch: Partial<AppSettings>, key:
 
 function touchesProviderDiscoverySettings(patch: Partial<AppSettings>): boolean {
   return (
+    hasOwn(patch, "codexBinaryPath") ||
+    hasOwn(patch, "codexHomePath") ||
     hasOwn(patch, "commandCodeBinaryPath") ||
     hasOwn(patch, "kiloBinaryPath") ||
     hasOwn(patch, "kiloServerPassword") ||

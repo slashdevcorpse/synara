@@ -13,6 +13,10 @@ import {
 } from "./windowsProcessSnapshot";
 
 const PROCESS_TREE_SCAN_TIMEOUT_MS = 1_000;
+const POSIX_PROCESS_TREE_SIGNAL_TIMEOUT_MS = 2_000;
+// taskkill /T can take longer to report completion on loaded Windows hosts. Give it a wider
+// callback bound without allowing a stalled callback to hang teardown forever.
+const WINDOWS_PROCESS_TREE_SIGNAL_TIMEOUT_MS = 10_000;
 const PROCESS_TREE_SCAN_MAX_BUFFER_BYTES = 262_144;
 const PROCESS_COMMAND_SCAN_MAX_BUFFER_BYTES = 262_144;
 const POSIX_TREE_WALK_MAX_VISITED = 256;
@@ -27,10 +31,14 @@ export interface CapturedProcess {
   command: string;
 }
 
+export type ProcessTreeDescendantExitProof = "captured-identities" | "root-tree-signal";
+
 export interface CapturedProcessTree {
   descendants: CapturedProcess[];
   /** False when the platform process snapshot failed and descendant absence is unproven. */
   captureComplete?: boolean;
+  /** Identifies the evidence required to prove that no owned descendants remain. */
+  descendantExitProof: ProcessTreeDescendantExitProof;
 }
 
 export interface CapturedProcessTreeInspection {
@@ -40,6 +48,11 @@ export interface CapturedProcessTreeInspection {
 }
 
 export type TerminalKillSignal = "SIGTERM" | "SIGKILL";
+
+export interface ProcessTreeSignalResult {
+  /** True only after the root-tree signal operation completed successfully. */
+  readonly rootTreeSignalSucceeded: boolean;
+}
 
 export interface ProcessTreeKiller {
   capture(rootPid: number): MaybePromise<CapturedProcessTree>;
@@ -52,7 +65,7 @@ export interface ProcessTreeKiller {
     shouldSignalRootTree?: (() => boolean) | undefined;
     abortSignal?: AbortSignal | undefined;
     onError: (error: Error, context: { pid: number; source: "tree-kill" | "captured" }) => void;
-  }): MaybePromise<void>;
+  }): Promise<ProcessTreeSignalResult>;
 }
 
 export interface ProcessTreeKillerDependencies {
@@ -262,7 +275,11 @@ export function createProcessTreeKiller(
   return {
     capture: async (rootPid) => {
       if (!Number.isInteger(rootPid) || rootPid <= 0) {
-        return { descendants: [], captureComplete: false };
+        return {
+          descendants: [],
+          captureComplete: false,
+          descendantExitProof: "captured-identities",
+        };
       }
       if (deps.platform === "win32") {
         // Provider-scoped kill-on-close containment requires creating the provider suspended,
@@ -271,23 +288,39 @@ export function createProcessTreeKiller(
         try {
           const snapshot = await deps.captureWindowsSnapshot();
           if (snapshot.kind !== "ok") {
-            return { descendants: [], captureComplete: false };
+            return {
+              descendants: [],
+              captureComplete: false,
+              descendantExitProof: "captured-identities",
+            };
           }
           const capture = collectDescendantProcessResult(rootPid, snapshot.childrenByParentPid);
           return {
             descendants: capture.descendants,
             captureComplete: capture.complete,
+            descendantExitProof: "captured-identities",
           };
         } catch {
-          return { descendants: [], captureComplete: false };
+          return {
+            descendants: [],
+            captureComplete: false,
+            descendantExitProof: "captured-identities",
+          };
         }
       }
       const childrenByParentPid = deps.captureChildrenMap();
-      if (!childrenByParentPid) return { descendants: [], captureComplete: false };
+      if (!childrenByParentPid) {
+        return {
+          descendants: [],
+          captureComplete: false,
+          descendantExitProof: "captured-identities",
+        };
+      }
       const capture = collectDescendantProcessResult(rootPid, childrenByParentPid);
       return {
         descendants: capture.descendants,
         captureComplete: capture.complete,
+        descendantExitProof: "captured-identities",
       };
     },
     inspect: async (tree) => {
@@ -331,18 +364,65 @@ export function createProcessTreeKiller(
           onError(error, { pid: descendant.pid, source: "captured" });
         }
       }
-      if (includeRootTree) {
-        if (shouldSignalRootTree?.() === false) return;
-        throwIfSignalingAborted(abortSignal);
-        await new Promise<void>((resolve) => {
-          deps.signalTree(rootPid, signal, (err) => {
-            if (err) {
-              onError(err, { pid: rootPid, source: "tree-kill" });
-            }
-            resolve();
-          });
-        });
+      if (!includeRootTree) {
+        return { rootTreeSignalSucceeded: false };
       }
+      if (shouldSignalRootTree?.() === false) {
+        return { rootTreeSignalSucceeded: false };
+      }
+      throwIfSignalingAborted(abortSignal);
+
+      return new Promise<ProcessTreeSignalResult>((resolve, reject) => {
+        const signalTimeoutMs =
+          deps.platform === "win32"
+            ? WINDOWS_PROCESS_TREE_SIGNAL_TIMEOUT_MS
+            : POSIX_PROCESS_TREE_SIGNAL_TIMEOUT_MS;
+        let settled = false;
+        let timeout: ReturnType<typeof setTimeout> | undefined;
+        const cleanup = (): void => {
+          if (timeout) clearTimeout(timeout);
+          abortSignal?.removeEventListener("abort", onAbort);
+        };
+        const onAbort = (): void => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          resolve({ rootTreeSignalSucceeded: false });
+        };
+        const settle = (error?: Error | null): void => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          if (error) {
+            try {
+              onError(error, { pid: rootPid, source: "tree-kill" });
+            } catch (reportingError) {
+              reject(reportingError);
+              return;
+            }
+          }
+          resolve({ rootTreeSignalSucceeded: !error });
+        };
+        abortSignal?.addEventListener("abort", onAbort, { once: true });
+        if (abortSignal?.aborted) {
+          onAbort();
+          return;
+        }
+        timeout = setTimeout(() => {
+          settle(
+            new Error(
+              `Timed out after ${signalTimeoutMs}ms waiting for ${signal} process-tree signal for pid ${rootPid}.`,
+            ),
+          );
+        }, signalTimeoutMs);
+        timeout.unref?.();
+
+        try {
+          deps.signalTree(rootPid, signal, settle);
+        } catch (error) {
+          settle(error instanceof Error ? error : new Error(String(error)));
+        }
+      });
     },
   };
 }

@@ -19,6 +19,22 @@ describe("ProviderListModelsResult", () => {
     });
   });
 
+  it("accepts configured Codex model discovery requests", () => {
+    expect(
+      decodeProviderListModelsInput({
+        provider: "codex",
+        binaryPath: "C:\\tools\\codex.cmd",
+        homePath: "C:\\isolated\\codex-home",
+        cwd: "C:\\repo",
+      }),
+    ).toEqual({
+      provider: "codex",
+      binaryPath: "C:\\tools\\codex.cmd",
+      homePath: "C:\\isolated\\codex-home",
+      cwd: "C:\\repo",
+    });
+  });
+
   it("preserves optional runtime model descriptions", () => {
     const result = decodeProviderListModelsResult({
       models: [

@@ -16,7 +16,7 @@ import type {
 } from "@synara/contracts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { Effect, Layer } from "effect";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   deriveServerPaths,
@@ -221,5 +221,40 @@ describe("ProviderDiscoveryService.getComposerCapabilities", () => {
 
     expect(capabilities.supportsSkillDiscovery).toBe(true);
     expect(capabilities.supportsSkillMentions).toBe(true);
+  });
+});
+
+describe("ProviderDiscoveryService.listModels", () => {
+  it("fills missing Codex launch options from server-authoritative settings", async () => {
+    const listModels = vi.fn(() =>
+      Effect.succeed({ models: [], source: "codex-app-server", cached: false }),
+    );
+    const baseLayer = Layer.mergeAll(
+      makeConfigLayer(),
+      ServerSettingsService.layerTest({
+        providers: {
+          codex: {
+            binaryPath: "/configured/codex",
+            homePath: "/configured/codex-home",
+          },
+        },
+      }),
+      makeRegistryLayer({ listModels }),
+    ).pipe(Layer.provideMerge(NodeServices.layer));
+    const testLayer = makeProviderDiscoveryServiceLive().pipe(Layer.provideMerge(baseLayer));
+
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const discovery = yield* ProviderDiscoveryService;
+        return yield* discovery.listModels({ provider: "codex" });
+      }).pipe(Effect.provide(testLayer)) as unknown as Effect.Effect<unknown, never, never>,
+    );
+
+    expect(listModels).toHaveBeenCalledWith({
+      provider: "codex",
+      binaryPath: "/configured/codex",
+      homePath: "/configured/codex-home",
+      cwd,
+    });
   });
 });

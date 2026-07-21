@@ -25,6 +25,8 @@ function makeSettings(
 ): ProviderModelPrefetchSettings {
   return {
     defaultProvider: "codex",
+    codexBinaryPath: "",
+    codexHomePath: "",
     commandCodeBinaryPath: "",
     cursorBinaryPath: "",
     cursorApiEndpoint: "",
@@ -106,6 +108,8 @@ describe("resolveNewThreadModelPrefetchCwd", () => {
 describe("providerModelsPrefetchQueryOptions", () => {
   it("matches ChatView cache keys for cwd-scoped and binary-scoped providers", () => {
     const settings = makeSettings({
+      codexBinaryPath: "/bin/codex",
+      codexHomePath: "/home/codex",
       commandCodeBinaryPath: "/bin/commandcode",
       cursorBinaryPath: "/bin/agent",
       cursorApiEndpoint: "https://api.example",
@@ -174,9 +178,17 @@ describe("providerModelsPrefetchQueryOptions", () => {
     const codexOptions = providerModelsPrefetchQueryOptions({
       provider: "codex",
       settings,
+      cwd: "/tmp/project",
     });
     expect(codexOptions.queryKey).toEqual(
-      providerDiscoveryQueryKeys.models("codex", null, null, null, null),
+      providerDiscoveryQueryKeys.models(
+        "codex",
+        "/bin/codex",
+        null,
+        null,
+        "/tmp/project",
+        "/home/codex",
+      ),
     );
   });
 });

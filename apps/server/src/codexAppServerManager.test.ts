@@ -1846,6 +1846,201 @@ describe("CodexAppServerManager discovery", () => {
     });
   });
 
+  it("does not reuse a same-cwd session launched with a different Codex executable", async () => {
+    const manager = new CodexAppServerManager();
+    const activeContext = {
+      binaryPath: "/bin/codex-a",
+      homePath: "/home/codex-a",
+      session: {
+        provider: "codex",
+        status: "ready",
+        threadId: "thread_active",
+        runtimeMode: "full-access",
+        cwd: "/repo",
+      },
+      child: { killed: false },
+      stopping: false,
+    };
+    (
+      manager as unknown as {
+        sessions: Map<string, unknown>;
+      }
+    ).sessions.set("thread_active", activeContext);
+    const discoveryContext = { ...activeContext, discovery: true };
+    const getOrCreateDiscoverySession = vi
+      .spyOn(
+        manager as unknown as {
+          getOrCreateDiscoverySession: (
+            cwd: string,
+            binaryPath?: string,
+            homePath?: string,
+          ) => Promise<unknown>;
+        },
+        "getOrCreateDiscoverySession",
+      )
+      .mockResolvedValue(discoveryContext);
+
+    const resolved = await (
+      manager as unknown as {
+        resolveContextForDiscovery: (
+          threadId?: string,
+          cwd?: string,
+          binaryPath?: string,
+          homePath?: string,
+        ) => Promise<unknown>;
+      }
+    ).resolveContextForDiscovery(undefined, "/repo", "/bin/codex-b", "/home/codex-b");
+
+    expect(resolved).toBe(discoveryContext);
+    expect(getOrCreateDiscoverySession).toHaveBeenCalledWith(
+      "/repo",
+      "/bin/codex-b",
+      "/home/codex-b",
+    );
+  });
+
+  it("does not reuse a same-binary session from a different Codex home", async () => {
+    const manager = new CodexAppServerManager();
+    const activeContext = {
+      binaryPath: "/bin/codex",
+      homePath: "/home/custom-codex",
+      session: {
+        provider: "codex",
+        status: "ready",
+        threadId: "thread_active",
+        runtimeMode: "full-access",
+        cwd: "/repo",
+      },
+      child: { killed: false },
+      stopping: false,
+    };
+    (
+      manager as unknown as {
+        sessions: Map<string, unknown>;
+      }
+    ).sessions.set("thread_active", activeContext);
+    const discoveryContext = { ...activeContext, homePath: undefined, discovery: true };
+    const getOrCreateDiscoverySession = vi
+      .spyOn(
+        manager as unknown as {
+          getOrCreateDiscoverySession: (
+            cwd: string,
+            binaryPath?: string,
+            homePath?: string,
+          ) => Promise<unknown>;
+        },
+        "getOrCreateDiscoverySession",
+      )
+      .mockResolvedValue(discoveryContext);
+
+    const resolved = await (
+      manager as unknown as {
+        resolveContextForDiscovery: (
+          threadId?: string,
+          cwd?: string,
+          binaryPath?: string,
+          homePath?: string,
+        ) => Promise<unknown>;
+      }
+    ).resolveContextForDiscovery(undefined, "/repo", "/bin/codex", undefined);
+
+    expect(resolved).toBe(discoveryContext);
+    expect(getOrCreateDiscoverySession).toHaveBeenCalledWith("/repo", "/bin/codex", undefined);
+  });
+
+  it("removes a discovery session and idle timer by its composite key on exit", () => {
+    const manager = new CodexAppServerManager();
+    const child = Object.assign(new EventEmitter(), {
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+      stdin: new PassThrough(),
+      killed: false,
+    });
+    const discoveryKey = JSON.stringify({
+      cwd: "/repo",
+      binaryPath: "/bin/codex",
+      homePath: "/home/codex",
+    });
+    const context = {
+      binaryPath: "/bin/codex",
+      homePath: "/home/codex",
+      discoveryKey,
+      discovery: true,
+      session: {
+        provider: "codex",
+        status: "ready",
+        threadId: "__codex_discovery__:/repo",
+        runtimeMode: "full-access",
+        cwd: "/repo",
+      },
+      account: { type: "unknown", planType: null, sparkEnabled: true },
+      child,
+      stdoutFramer: new CodexJsonlFramer(),
+      stdinWriter: new CodexJsonlWriter(child.stdin),
+      pending: new Map(),
+      pendingApprovals: new Map(),
+      pendingUserInputs: new Map(),
+      collabReceiverTurns: new Map(),
+      collabReceiverParents: new Map(),
+      reviewTurnIds: new Set(),
+      nextRequestId: 1,
+      stopping: false,
+    };
+    const managerInternals = manager as unknown as {
+      attachProcessListeners: (value: unknown) => void;
+      discoverySessions: Map<string, unknown>;
+      discoverySessionIdleTimers: Map<string, ReturnType<typeof setTimeout>>;
+      updateSession: (...args: unknown[]) => void;
+      emitLifecycleEvent: (...args: unknown[]) => void;
+    };
+    vi.spyOn(managerInternals, "updateSession").mockImplementation(() => undefined);
+    vi.spyOn(managerInternals, "emitLifecycleEvent").mockImplementation(() => undefined);
+    managerInternals.discoverySessions.set(discoveryKey, context);
+    managerInternals.discoverySessionIdleTimers.set(
+      discoveryKey,
+      setTimeout(() => undefined, 60_000),
+    );
+    managerInternals.attachProcessListeners(context);
+
+    child.emit("exit", 1, null);
+
+    expect(managerInternals.discoverySessions.has(discoveryKey)).toBe(false);
+    expect(managerInternals.discoverySessionIdleTimers.has(discoveryKey)).toBe(false);
+  });
+
+  it("stops a failed discovery transport by its composite key", async () => {
+    const manager = new CodexAppServerManager();
+    const discoveryKey = JSON.stringify({
+      cwd: "/repo",
+      binaryPath: "/bin/codex",
+      homePath: null,
+    });
+    const managerInternals = manager as unknown as {
+      handleTransportFailure: (context: unknown, cause: unknown) => void;
+      stopDiscoverySession: (key: string) => Promise<void>;
+      updateSession: (...args: unknown[]) => void;
+      emitErrorEvent: (...args: unknown[]) => void;
+    };
+    vi.spyOn(managerInternals, "updateSession").mockImplementation(() => undefined);
+    vi.spyOn(managerInternals, "emitErrorEvent").mockImplementation(() => undefined);
+    const stopDiscoverySession = vi
+      .spyOn(managerInternals, "stopDiscoverySession")
+      .mockResolvedValue(undefined);
+
+    managerInternals.handleTransportFailure(
+      {
+        discovery: true,
+        discoveryKey,
+        stopping: false,
+        session: { threadId: "__codex_discovery__:/repo" },
+      },
+      new Error("transport failed"),
+    );
+    await Promise.resolve();
+
+    expect(stopDiscoverySession).toHaveBeenCalledWith(discoveryKey);
+  });
+
   it("retries skills/list with cwd when a runtime rejects cwds", async () => {
     const manager = new CodexAppServerManager();
     const context = {

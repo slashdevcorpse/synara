@@ -59,6 +59,36 @@ describe("isInitialModelDiscoveryPending", () => {
 });
 
 describe("providerModelsQueryOptions", () => {
+  it("keys and sends the complete configured Codex discovery identity", async () => {
+    const listModels = mockListModels(
+      vi.fn().mockResolvedValue({ models: [], source: "codex", cached: false }),
+    );
+    const options = providerModelsQueryOptions({
+      provider: "codex",
+      binaryPath: "/bin/codex",
+      homePath: "/home/codex",
+      cwd: "/repo",
+    });
+
+    expect(options.queryKey).toEqual([
+      "provider-discovery",
+      "models",
+      "codex",
+      "/bin/codex",
+      null,
+      null,
+      "/repo",
+      "/home/codex",
+    ]);
+    await new QueryClient().fetchQuery(options);
+    expect(listModels).toHaveBeenCalledWith({
+      provider: "codex",
+      binaryPath: "/bin/codex",
+      homePath: "/home/codex",
+      cwd: "/repo",
+    });
+  });
+
   it("fails fast for Cursor so a missing CLI settles instead of spinning (#103)", async () => {
     const listModels = mockListModels(
       vi.fn().mockRejectedValue(new Error("Cursor CLI is not installed or not on PATH")),

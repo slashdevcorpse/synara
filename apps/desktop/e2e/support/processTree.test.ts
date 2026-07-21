@@ -141,10 +141,15 @@ class FakeChildProcess extends EventEmitter {
   }
 }
 
-function fakeElectronApplication(child: FakeChildProcess): ElectronApplication {
+function fakeElectronApplication(
+  child: FakeChildProcess,
+  closeCalls?: string[],
+): ElectronApplication {
   return {
     process: () => child as unknown as ChildProcess,
-    close: vi.fn(async () => undefined),
+    close: vi.fn(async () => {
+      closeCalls?.push("close");
+    }),
   } as unknown as ElectronApplication;
 }
 
@@ -153,12 +158,14 @@ function windowsProcessRow(input: {
   parentPid: number;
   startedAt: string;
   commandFingerprint: string;
+  imageName?: string;
 }): ProcessSnapshotRow {
   return {
     pid: input.pid,
     parentPid: input.parentPid,
     identity: `windows:${input.startedAt}`,
     commandFingerprint: input.commandFingerprint,
+    ...(input.imageName ? { imageName: input.imageName } : {}),
   };
 }
 
@@ -204,12 +211,18 @@ describe("desktop process teardown orchestration", () => {
       commandFingerprint: "child-command",
     });
     let fullSnapshotCount = 0;
-    const signalProcess = vi.fn();
+    const signaledPids = new Set<number>();
+    const signalProcess = vi.fn((pid: number) => {
+      signaledPids.add(pid);
+    });
     const dependencies: ProcessTreeDependencies = {
       platform: "win32",
       readProcessSnapshot: vi.fn((requestedPids) => {
-        if (requestedPids?.[0] === descendant.pid) return [descendant];
-        if (requestedPids?.[0] === root.pid) return [root];
+        if (requestedPids) {
+          return [root, descendant].filter(
+            ({ pid }) => requestedPids.includes(pid) && !signaledPids.has(pid),
+          );
+        }
         fullSnapshotCount += 1;
         if (fullSnapshotCount === 1) return [root, descendant];
         if (fullSnapshotCount === 2) throw new Error("late snapshot unavailable");
@@ -349,12 +362,21 @@ describe("desktop process teardown orchestration", () => {
       parentPid: 999,
     };
     let fullSnapshotCount = 0;
-    const signalProcess = vi.fn();
+    const signaledPids = new Set<number>();
+    const signalProcess = vi.fn((pid: number) => {
+      signaledPids.add(pid);
+    });
     const dependencies: ProcessTreeDependencies = {
       platform: "win32",
       readProcessSnapshot: vi.fn((requestedPids) => {
-        if (requestedPids?.[0] === descendant.pid) return [reusedDescendant];
-        if (requestedPids?.[0] === root.pid) return [root];
+        if (requestedPids?.includes(descendant.pid)) {
+          return requestedPids.includes(root.pid) && !signaledPids.has(root.pid)
+            ? [reusedDescendant, root]
+            : [reusedDescendant];
+        }
+        if (requestedPids?.includes(root.pid)) {
+          return signaledPids.has(root.pid) ? [] : [root];
+        }
         fullSnapshotCount += 1;
         return fullSnapshotCount <= 3 ? [root, descendant] : [];
       }),
@@ -366,6 +388,71 @@ describe("desktop process teardown orchestration", () => {
     expect(signalProcess).toHaveBeenCalledTimes(1);
     expect(signalProcess).toHaveBeenCalledWith(root.pid, "SIGKILL");
     expect(signalProcess).not.toHaveBeenCalledWith(descendant.pid, expect.anything());
+  });
+
+  it("delegates graceful shutdown to the Playwright context exactly once", async () => {
+    const child = new FakeChildProcess(251);
+    const root = windowsProcessRow({
+      pid: child.pid,
+      parentPid: 1,
+      startedAt: "2026-07-20T20:00:00.0000000Z",
+      commandFingerprint: "root-command",
+    });
+    const closeCalls: string[] = [];
+    let fullSnapshotCount = 0;
+    const dependencies: ProcessTreeDependencies = {
+      platform: "win32",
+      readProcessSnapshot: vi.fn((requestedPids) => {
+        if (requestedPids) return [];
+        fullSnapshotCount += 1;
+        return fullSnapshotCount === 1 ? [root] : [];
+      }),
+      signalProcess: vi.fn(),
+    };
+
+    await closeElectronApplication(fakeElectronApplication(child, closeCalls), dependencies);
+
+    expect(closeCalls).toEqual(["close"]);
+  });
+
+  it("ignores stale parent-pid edges while preserving valid descendant branches", () => {
+    const root = windowsProcessRow({
+      pid: 271,
+      parentPid: 1,
+      startedAt: "2026-07-20T20:00:00.1000000Z",
+      commandFingerprint: "root-command",
+    });
+    const staleChild = windowsProcessRow({
+      pid: 272,
+      parentPid: root.pid,
+      startedAt: "2026-07-20T20:00:00.0000000Z",
+      commandFingerprint: "stale-child-command",
+    });
+    const staleGrandchild = windowsProcessRow({
+      pid: 273,
+      parentPid: staleChild.pid,
+      startedAt: "2026-07-20T20:00:00.2000000Z",
+      commandFingerprint: "stale-grandchild-command",
+    });
+    const validChild = windowsProcessRow({
+      pid: 274,
+      parentPid: root.pid,
+      startedAt: "2026-07-20T20:00:00.2000000Z",
+      commandFingerprint: "valid-child-command",
+      imageName: "git.exe",
+    });
+
+    const collected = collectDescendants(root.pid, [root, staleChild, staleGrandchild, validChild]);
+
+    expect(collected.processes).toEqual([
+      {
+        pid: validChild.pid,
+        identity: validChild.identity,
+        commandFingerprint: validChild.commandFingerprint,
+        imageName: "git.exe",
+      },
+    ]);
+    expect(collected.errors).toEqual([]);
   });
 
   it("preserves valid descendant branches when another branch lacks identity evidence", () => {

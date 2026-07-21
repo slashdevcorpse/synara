@@ -75,7 +75,18 @@ export const providerDiscoveryQueryKeys = {
     apiEndpoint: string | null,
     agentDir: string | null,
     cwd: string | null,
-  ) => ["provider-discovery", "models", provider, binaryPath, apiEndpoint, agentDir, cwd] as const,
+    homePath: string | null = null,
+  ) =>
+    [
+      "provider-discovery",
+      "models",
+      provider,
+      binaryPath,
+      apiEndpoint,
+      agentDir,
+      cwd,
+      homePath,
+    ] as const,
   agentsForProvider: (provider: ProviderKind) =>
     ["provider-discovery", "agents", provider] as const,
   agents: (provider: ProviderKind, binaryPath: string | null, cwd: string | null) =>
@@ -200,6 +211,7 @@ export function isInitialModelDiscoveryPending(query: {
 export function providerModelsQueryOptions(input: {
   provider: ProviderKind;
   binaryPath?: string | null;
+  homePath?: string | null;
   apiEndpoint?: string | null;
   agentDir?: string | null;
   cwd?: string | null;
@@ -212,12 +224,14 @@ export function providerModelsQueryOptions(input: {
       input.apiEndpoint ?? null,
       input.agentDir ?? null,
       input.cwd ?? null,
+      input.homePath ?? null,
     ),
     queryFn: async (): Promise<ProviderListModelsResult> => {
       const api = ensureNativeApi();
       return api.provider.listModels({
         provider: input.provider,
         ...(input.binaryPath ? { binaryPath: input.binaryPath } : {}),
+        ...(input.homePath ? { homePath: input.homePath } : {}),
         ...(input.apiEndpoint ? { apiEndpoint: input.apiEndpoint } : {}),
         ...(input.agentDir ? { agentDir: input.agentDir } : {}),
         ...(input.cwd ? { cwd: input.cwd } : {}),

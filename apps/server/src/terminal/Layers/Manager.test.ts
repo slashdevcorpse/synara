@@ -21,6 +21,7 @@ import { TerminalManagerRuntime, type TerminalSubprocessActivity } from "./Manag
 import type {
   CapturedProcessTree,
   ProcessTreeKiller,
+  ProcessTreeSignalResult,
   TerminalKillSignal,
 } from "../processTreeKiller";
 import type {
@@ -310,8 +311,14 @@ describe("TerminalManager", () => {
       args: [],
     };
     const inertProcessTreeKiller: ProcessTreeKiller = {
-      capture: () => ({ descendants: [], captureComplete: true }),
-      signal: () => undefined,
+      capture: () => ({
+        descendants: [],
+        captureComplete: true,
+        descendantExitProof: "captured-identities",
+      }),
+      signal: async ({ includeRootTree }) => ({
+        rootTreeSignalSucceeded: includeRootTree !== false,
+      }),
     };
     const commonOptions = {
       logsDir,
@@ -1398,8 +1405,12 @@ describe("TerminalManager", () => {
       let result = completeWindowsSnapshot([]);
       let collectorCalls = 0;
       const processTreeKiller: ProcessTreeKiller = {
-        capture: () => ({ descendants: [], captureComplete: true }),
-        signal: () => undefined,
+        capture: () => ({
+          descendants: [],
+          captureComplete: true,
+          descendantExitProof: "root-tree-signal",
+        }),
+        signal: async () => ({ rootTreeSignalSucceeded: false }),
       };
       const { manager } = makeManager(5, {
         processTreeKiller,
@@ -1548,8 +1559,12 @@ describe("TerminalManager", () => {
     let collectorSignal: AbortSignal | undefined;
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const processTreeKiller: ProcessTreeKiller = {
-      capture: () => ({ descendants: [], captureComplete: true }),
-      signal: () => undefined,
+      capture: () => ({
+        descendants: [],
+        captureComplete: true,
+        descendantExitProof: "root-tree-signal",
+      }),
+      signal: async () => ({ rootTreeSignalSucceeded: false }),
     };
     const { manager } = makeManager(5, {
       processTreeKiller,
@@ -1583,8 +1598,12 @@ describe("TerminalManager", () => {
     let collectorSignal: AbortSignal | undefined;
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const processTreeKiller: ProcessTreeKiller = {
-      capture: () => ({ descendants: [], captureComplete: true }),
-      signal: () => undefined,
+      capture: () => ({
+        descendants: [],
+        captureComplete: true,
+        descendantExitProof: "root-tree-signal",
+      }),
+      signal: async () => ({ rootTreeSignalSucceeded: false }),
     };
     const { manager } = makeManager(5, {
       processTreeKiller,
@@ -1617,8 +1636,12 @@ describe("TerminalManager", () => {
     let collectorSignal: AbortSignal | undefined;
     let collectorCalls = 0;
     const processTreeKiller: ProcessTreeKiller = {
-      capture: () => ({ descendants: [], captureComplete: true }),
-      signal: () => undefined,
+      capture: () => ({
+        descendants: [],
+        captureComplete: true,
+        descendantExitProof: "root-tree-signal",
+      }),
+      signal: async () => ({ rootTreeSignalSucceeded: false }),
     };
     const { manager } = makeManager(5, {
       processTreeKiller,
@@ -2023,8 +2046,9 @@ describe("TerminalManager", () => {
         captureStarted.push(rootPid);
         return pendingCapture;
       },
-      signal: ({ rootPid, signal, includeRootTree }) => {
+      signal: async ({ rootPid, signal, includeRootTree }) => {
         treeSignals.push({ rootPid, signal, includeRootTree });
+        return { rootTreeSignalSucceeded: includeRootTree !== false };
       },
     };
     const { manager, ptyAdapter } = makeManager(5, { processTreeKiller });
@@ -2054,10 +2078,18 @@ describe("TerminalManager", () => {
     sidecarProcess.emitExit({ exitCode: 0, signal: 15 });
     expect(sessions.size).toBe(2);
 
-    defaultCapture.resolve({ descendants: [], captureComplete: true });
+    defaultCapture.resolve({
+      descendants: [],
+      captureComplete: true,
+      descendantExitProof: "captured-identities",
+    });
     await Promise.resolve();
     expect(closeSettled).toBe(false);
-    sidecarCapture.resolve({ descendants: [], captureComplete: true });
+    sidecarCapture.resolve({
+      descendants: [],
+      captureComplete: true,
+      descendantExitProof: "captured-identities",
+    });
     await close;
 
     expect(treeSignals).toEqual([
@@ -2125,15 +2157,13 @@ describe("TerminalManager", () => {
   });
 
   it("waits for asynchronous process-tree capture before signaling terminal shutdown", async () => {
-    const capturedTree = deferred<{
-      descendants: Array<{ pid: number; command: string }>;
-      captureComplete: boolean;
-    }>();
+    const capturedTree = deferred<CapturedProcessTree>();
     const treeSignals: string[] = [];
     const processTreeKiller: ProcessTreeKiller = {
       capture: () => capturedTree.promise,
-      signal: ({ signal }) => {
+      signal: async ({ signal, includeRootTree }) => {
         treeSignals.push(signal);
+        return { rootTreeSignalSucceeded: includeRootTree !== false };
       },
     };
     const { manager, ptyAdapter } = makeManager(5, { processTreeKiller });
@@ -2147,7 +2177,11 @@ describe("TerminalManager", () => {
     expect(process.killSignals).toEqual([]);
     expect(treeSignals).toEqual([]);
 
-    capturedTree.resolve({ descendants: [], captureComplete: true });
+    capturedTree.resolve({
+      descendants: [],
+      captureComplete: true,
+      descendantExitProof: "captured-identities",
+    });
     await close;
 
     expect(treeSignals).toEqual(["SIGTERM"]);
@@ -2168,12 +2202,13 @@ describe("TerminalManager", () => {
         captureStarted.resolve();
         return capturedTree.promise;
       },
-      signal: ({ signal, includeRootTree, tree }) => {
+      signal: async ({ signal, includeRootTree, tree }) => {
         treeSignals.push({
           signal,
           includeRootTree,
           descendantPids: tree.descendants.map(({ pid }) => pid),
         });
+        return { rootTreeSignalSucceeded: includeRootTree !== false };
       },
     };
     const { manager, ptyAdapter } = makeManager(5, { processTreeKiller });
@@ -2188,6 +2223,7 @@ describe("TerminalManager", () => {
     capturedTree.resolve({
       descendants: [{ pid: 4242, command: "unrelated-reused-root-child" }],
       captureComplete: true,
+      descendantExitProof: "captured-identities",
     });
     await close;
 
@@ -2225,14 +2261,16 @@ describe("TerminalManager", () => {
     const processTreeKiller: ProcessTreeKiller = {
       capture: () => ({
         descendants: [{ pid: 4242, command: "tsdown --watch --clean" }],
+        descendantExitProof: "captured-identities",
       }),
-      signal: ({ rootPid, signal, tree, includeRootTree }) => {
+      signal: async ({ rootPid, signal, tree, includeRootTree }) => {
         treeSignals.push({
           rootPid,
           signal,
           descendantPids: tree.descendants.map((descendant) => descendant.pid),
           includeRootTree,
         });
+        return { rootTreeSignalSucceeded: includeRootTree === true };
       },
     };
     const { manager, ptyAdapter } = makeManager(5, {
@@ -2267,12 +2305,14 @@ describe("TerminalManager", () => {
       capture: () => ({
         descendants: [{ pid: 4242, command: "tsdown --watch --clean" }],
         captureComplete: true,
+        descendantExitProof: "captured-identities",
       }),
       signal: async ({ signal, shouldSignalRootTree }) => {
-        if (signal !== "SIGKILL") return;
+        if (signal !== "SIGKILL") return { rootTreeSignalSucceeded: false };
         forcedSignalStarted.resolve();
         await releaseForcedSignal.promise;
         rootSignalDecisions.push(shouldSignalRootTree?.() ?? true);
+        return { rootTreeSignalSucceeded: false };
       },
     };
     const { manager, ptyAdapter } = makeManager(5, {
@@ -2314,10 +2354,14 @@ describe("TerminalManager", () => {
       abortSignal: AbortSignal | undefined;
     }> = [];
     const processTreeKiller: ProcessTreeKiller = {
-      capture: () => ({ descendants: [], captureComplete: true }),
+      capture: () => ({
+        descendants: [],
+        captureComplete: true,
+        descendantExitProof: "captured-identities",
+      }),
       signal: ({ signal, abortSignal }) => {
         abortSignals.push({ signal, abortSignal });
-        return new Promise(() => undefined);
+        return new Promise<ProcessTreeSignalResult>(() => undefined);
       },
     };
     const { manager, ptyAdapter } = makeManager(5, {
@@ -2339,13 +2383,10 @@ describe("TerminalManager", () => {
   });
 
   it("returns an awaitable public disposal that waits for asynchronous process capture", async () => {
-    const capturedTree = deferred<{
-      descendants: Array<{ pid: number; command: string }>;
-      captureComplete: boolean;
-    }>();
+    const capturedTree = deferred<CapturedProcessTree>();
     const processTreeKiller: ProcessTreeKiller = {
       capture: () => capturedTree.promise,
-      signal: () => undefined,
+      signal: async () => ({ rootTreeSignalSucceeded: false }),
     };
     const { manager, ptyAdapter } = makeManager(5, { processTreeKiller });
     await manager.open(openInput());
@@ -2359,22 +2400,24 @@ describe("TerminalManager", () => {
     expect(disposal).toBeInstanceOf(Promise);
     expect(sessions.size).toBe(1);
     process.emitExit({ exitCode: 0, signal: 15 });
-    capturedTree.resolve({ descendants: [], captureComplete: true });
+    capturedTree.resolve({
+      descendants: [],
+      captureComplete: true,
+      descendantExitProof: "captured-identities",
+    });
     await disposal;
 
     expect(sessions.size).toBe(0);
   });
 
   it("keeps sessions addressable until asynchronous shutdown stops settle", async () => {
-    const capturedTree = deferred<{
-      descendants: Array<{ pid: number; command: string }>;
-      captureComplete: boolean;
-    }>();
+    const capturedTree = deferred<CapturedProcessTree>();
     const treeSignals: Array<{ signal: string; includeRootTree: boolean | undefined }> = [];
     const processTreeKiller: ProcessTreeKiller = {
       capture: () => capturedTree.promise,
-      signal: ({ signal, includeRootTree }) => {
+      signal: async ({ signal, includeRootTree }) => {
         treeSignals.push({ signal, includeRootTree });
+        return { rootTreeSignalSucceeded: includeRootTree !== false };
       },
     };
     const { manager, ptyAdapter } = makeManager(5, { processTreeKiller });
@@ -2390,7 +2433,11 @@ describe("TerminalManager", () => {
     process.emitExit({ exitCode: 0, signal: 15 });
     expect(sessions.size).toBe(1);
 
-    capturedTree.resolve({ descendants: [], captureComplete: true });
+    capturedTree.resolve({
+      descendants: [],
+      captureComplete: true,
+      descendantExitProof: "captured-identities",
+    });
     await shutdown;
 
     expect(treeSignals).toEqual([{ signal: "SIGTERM", includeRootTree: false }]);

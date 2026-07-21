@@ -245,6 +245,7 @@ export type ProviderReadPluginResult = typeof ProviderReadPluginResult.Type;
 export const ProviderListModelsInput = Schema.Struct({
   provider: ProviderDiscoveryKind,
   binaryPath: Schema.optional(TrimmedNonEmptyString),
+  homePath: Schema.optional(TrimmedNonEmptyString),
   apiEndpoint: Schema.optional(TrimmedNonEmptyString),
   agentDir: Schema.optional(TrimmedNonEmptyString),
   cwd: Schema.optional(TrimmedNonEmptyString),
