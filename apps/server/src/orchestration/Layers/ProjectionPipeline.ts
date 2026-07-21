@@ -1347,7 +1347,7 @@ const makeOrchestrationProjectionPipeline = Effect.gen(function* () {
             modelSelection,
             runtimeMode: event.payload.runtimeMode,
             interactionMode: event.payload.interactionMode,
-            envMode: event.payload.envMode,
+            envMode: event.payload.envMode ?? null,
             assistantDeliveryMode: event.payload.assistantDeliveryMode ?? null,
           });
           return;

@@ -105,6 +105,36 @@ export const ProjectionTurnById = Schema.Struct({
 });
 export type ProjectionTurnById = typeof ProjectionTurnById.Type;
 
+/** Canonical summary defaults for synthetic or legacy turns with no provider observations. */
+export const EMPTY_PROJECTION_TURN_SUMMARY_FIELDS = {
+  provider: null,
+  model: null,
+  reasoningEffort: null,
+  modelSelection: null,
+  runtimeMode: null,
+  interactionMode: null,
+  envMode: null,
+  assistantDeliveryMode: null,
+  tokenUsage: null,
+  toolCalls: [],
+  approvalRequestIds: [],
+  rejectedApprovalRequestIds: [],
+} as const satisfies Pick<
+  ProjectionTurnById,
+  | "provider"
+  | "model"
+  | "reasoningEffort"
+  | "modelSelection"
+  | "runtimeMode"
+  | "interactionMode"
+  | "envMode"
+  | "assistantDeliveryMode"
+  | "tokenUsage"
+  | "toolCalls"
+  | "approvalRequestIds"
+  | "rejectedApprovalRequestIds"
+>;
+
 export const ProjectionPendingTurnStart = Schema.Struct({
   threadId: ThreadId,
   messageId: MessageId,

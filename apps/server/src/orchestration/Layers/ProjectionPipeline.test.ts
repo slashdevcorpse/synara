@@ -5,6 +5,7 @@ import {
   CorrelationId,
   EventId,
   MessageId,
+  type OrchestrationThreadActivity,
   ProjectId,
   ThreadId,
   TurnId,
@@ -3742,7 +3743,7 @@ it.layer(
       const appendActivity = (input: {
         readonly kind: string;
         readonly tone: "info" | "tool" | "approval";
-        readonly payload: Record<string, unknown>;
+        readonly payload: OrchestrationThreadActivity["payload"];
       }) => {
         sequence += 1;
         const suffix = sequence.toString().padStart(2, "0");
