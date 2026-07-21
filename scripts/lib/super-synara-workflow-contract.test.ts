@@ -55,6 +55,15 @@ describe("Super Synara workflow contracts", () => {
         audit,
       ),
     ).toThrow("must filter the captured response with standalone jq arguments");
+    for (const [binding, replacement] of [
+      ['--arg tag "$TAG"', '--arg tag "$FORGED_TAG"'],
+      ['--arg source_commit "$SOURCE_COMMIT"', '--arg source_commit "$FORGED_COMMIT"'],
+      ['<<< "$releases_json"', '<<< "$FORGED_RELEASES_JSON"'],
+    ] as const) {
+      expect(() =>
+        verifySuperSynaraWorkflowText(main.replace(binding, replacement), audit),
+      ).toThrow("must filter the captured response with standalone jq arguments");
+    }
   });
 
   it("rejects removal of the reviewed allowlist gate", () => {
