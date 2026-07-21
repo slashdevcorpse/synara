@@ -109,8 +109,7 @@ function isUsableWindowsExecutable(path: string): boolean {
     const numberOfDataDirectories = image.readUInt32LE(
       optionalHeaderOffset + (optionalHeaderMagic === 0x010b ? 92 : 108),
     );
-    const isPowerOfTwo = (value: number): boolean =>
-      value > 0 && (value & (value - 1)) === 0;
+    const isPowerOfTwo = (value: number): boolean => value > 0 && (value & (value - 1)) === 0;
     if (
       addressOfEntryPoint === 0 ||
       !isPowerOfTwo(fileAlignment) ||

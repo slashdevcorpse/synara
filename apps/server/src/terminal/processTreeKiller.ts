@@ -320,8 +320,7 @@ export function createProcessTreeKiller(
   dependencies: Partial<ProcessTreeKillerDependencies> = {},
 ): ProcessTreeKiller {
   const deps: ProcessTreeKillerDependencies = {
-    captureProcessSnapshot:
-      dependencies.captureProcessSnapshot ?? captureProcessSnapshotSync,
+    captureProcessSnapshot: dependencies.captureProcessSnapshot ?? captureProcessSnapshotSync,
     captureProcessSnapshotAsync:
       dependencies.captureProcessSnapshotAsync ??
       (dependencies.captureProcessSnapshot === undefined

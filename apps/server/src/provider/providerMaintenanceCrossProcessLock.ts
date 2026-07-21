@@ -11,8 +11,7 @@ import {
 } from "../persistence/DatabaseLifecycleLock.ts";
 import { PRIVATE_DIRECTORY_MODE } from "../privatePathPermissions.ts";
 
-export const PROVIDER_MAINTENANCE_LOCK_DIRECTORY_NAME =
-  ".super-synara-provider-maintenance-locks";
+export const PROVIDER_MAINTENANCE_LOCK_DIRECTORY_NAME = ".super-synara-provider-maintenance-locks";
 
 export interface ProviderMaintenanceCrossProcessLock {
   readonly lockKey: string;
@@ -45,9 +44,7 @@ export function providerMaintenanceCrossProcessLockPath(
   return `${maintenanceLockTargetPath(lockKey, directoryPath)}.lifecycle-lock`;
 }
 
-export function providerMaintenanceCrossProcessLockDirectory(
-  canonicalInstallRoot: string,
-): string {
+export function providerMaintenanceCrossProcessLockDirectory(canonicalInstallRoot: string): string {
   if (!NodePath.isAbsolute(canonicalInstallRoot)) {
     throw new Error(`Provider maintenance install root must be absolute: ${canonicalInstallRoot}`);
   }

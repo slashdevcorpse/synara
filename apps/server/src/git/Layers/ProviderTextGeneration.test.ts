@@ -101,7 +101,9 @@ function makeProviderTextGenerationTestLayer(options?: ProviderTextGenerationLiv
   const cursor = createTextGenerationDouble("cursor");
   const kilo = createTextGenerationDouble("kilo");
   const opencode = createTextGenerationDouble("opencode");
-  const layer = (options ? makeProviderTextGenerationLive(options) : ProviderTextGenerationLive).pipe(
+  const layer = (
+    options ? makeProviderTextGenerationLive(options) : ProviderTextGenerationLive
+  ).pipe(
     Layer.provide(Layer.succeed(CodexTextGeneration, codex.service)),
     Layer.provide(Layer.succeed(CursorTextGeneration, cursor.service)),
     Layer.provide(Layer.succeed(KiloTextGeneration, kilo.service)),

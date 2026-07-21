@@ -86,9 +86,9 @@ describe("database lifecycle lock", () => {
 
     const successor = await Effect.runPromise(acquireDatabaseLifecycleLock(dbPath));
     await Effect.runPromise(releaseDatabaseLifecycleLock(first));
-    await expect(fs.readFile(path.join(successor.lockPath, "owner.json"), "utf8")).resolves.toContain(
-      successor.owner.token,
-    );
+    await expect(
+      fs.readFile(path.join(successor.lockPath, "owner.json"), "utf8"),
+    ).resolves.toContain(successor.owner.token);
     await Effect.runPromise(releaseDatabaseLifecycleLock(successor));
   });
 
@@ -113,9 +113,7 @@ describe("database lifecycle lock", () => {
     };
     const copyLock = () => ({ ...first, owner: { ...first.owner } });
 
-    const firstRelease = Effect.runPromise(
-      releaseDatabaseLifecycleLock(copyLock(), dependencies),
-    );
+    const firstRelease = Effect.runPromise(releaseDatabaseLifecycleLock(copyLock(), dependencies));
     await waitForFirstAttempt;
     const duplicateRelease = Effect.runPromise(
       releaseDatabaseLifecycleLock(copyLock(), dependencies),
@@ -130,9 +128,9 @@ describe("database lifecycle lock", () => {
     await expect(
       Effect.runPromise(releaseDatabaseLifecycleLock(copyLock())),
     ).rejects.toBeInstanceOf(DatabaseLifecycleLockedError);
-    await expect(fs.readFile(path.join(successor.lockPath, "owner.json"), "utf8")).resolves.toContain(
-      successor.owner.token,
-    );
+    await expect(
+      fs.readFile(path.join(successor.lockPath, "owner.json"), "utf8"),
+    ).resolves.toContain(successor.owner.token);
     await Effect.runPromise(releaseDatabaseLifecycleLock(successor));
   });
 

@@ -407,10 +407,7 @@ function releaseAuthorityKey(lock: DatabaseLifecycleLock): string {
   return JSON.stringify([lockPathIdentity, lock.owner.pid, lock.owner.token]);
 }
 
-function trackReleaseForHandle(
-  lock: DatabaseLifecycleLock,
-  attempt: Promise<void>,
-): Promise<void> {
+function trackReleaseForHandle(lock: DatabaseLifecycleLock, attempt: Promise<void>): Promise<void> {
   releasePromises.set(lock, attempt);
   void attempt.catch(() => {
     if (releasePromises.get(lock) === attempt) {

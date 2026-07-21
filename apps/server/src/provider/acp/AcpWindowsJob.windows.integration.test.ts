@@ -7,10 +7,7 @@ import { fileURLToPath } from "node:url";
 
 import { describe, expect, it } from "vitest";
 
-import {
-  ensureAcpWindowsJobExecutable,
-  prepareAcpWindowsJobLaunch,
-} from "./AcpWindowsJob.ts";
+import { ensureAcpWindowsJobExecutable, prepareAcpWindowsJobLaunch } from "./AcpWindowsJob.ts";
 import { headerOnlyPortableExecutableFixture } from "./AcpWindowsJobTestSupport.ts";
 
 const fixturePath = fileURLToPath(
@@ -189,10 +186,7 @@ describe.skipIf(process.platform !== "win32")("Windows ACP Job Object containmen
     launcher.stderr?.on("data", (chunk) => {
       output += chunk.toString();
     });
-    const exitPromise = once(launcher, "exit") as Promise<[
-      number | null,
-      NodeJS.Signals | null,
-    ]>;
+    const exitPromise = once(launcher, "exit") as Promise<[number | null, NodeJS.Signals | null]>;
 
     try {
       await waitFor(

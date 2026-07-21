@@ -218,9 +218,7 @@ const OpenCodeTextGenerationExistingServerConfigLayer = ServerConfig.layerTest(p
   prefix: "synara-opencode-text-generation-existing-server-test-",
 });
 
-const maintenanceOwnedResources = Effect.runSync(
-  makeProviderMaintenanceOwnedResourceCoordinator,
-);
+const maintenanceOwnedResources = Effect.runSync(makeProviderMaintenanceOwnedResourceCoordinator);
 const externalMaintenanceOwnedResources = Effect.runSync(
   makeProviderMaintenanceOwnedResourceCoordinator,
 );

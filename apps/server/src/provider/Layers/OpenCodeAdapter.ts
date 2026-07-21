@@ -1091,7 +1091,7 @@ const stopOpenCodeContext = Effect.fn("stopOpenCodeContext")(function* (
         if (shutdownState === "running") {
           yield* Ref.set(context.shutdownState, "stopping");
           yield* Ref.set(context.stopped, true);
-          yield* (input.onStopping ?? Effect.void);
+          yield* input.onStopping ?? Effect.void;
         }
 
         const abortCompleted = yield* Effect.raceFirst(
@@ -1112,7 +1112,7 @@ const stopOpenCodeContext = Effect.fn("stopOpenCodeContext")(function* (
           Effect.ensuring(Effect.sync(() => releaseOpenCodeGatewayLease(context))),
         );
         yield* Ref.set(context.shutdownState, "closed");
-        yield* (input.onClosed ?? Effect.void);
+        yield* input.onClosed ?? Effect.void;
         return true;
       }),
     ),
@@ -1162,8 +1162,7 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
           ? options.sessionAbortTimeoutMs
           : OPENCODE_SESSION_ABORT_TIMEOUT_MS;
       const waitForSessionAbortTimeout =
-        options?.waitForSessionAbortTimeout ??
-        ((timeoutMs: number) => Effect.sleep(timeoutMs));
+        options?.waitForSessionAbortTimeout ?? ((timeoutMs: number) => Effect.sleep(timeoutMs));
       const nativeEventLogger =
         options?.nativeEventLogger ??
         (options?.nativeEventLogPath !== undefined
@@ -1176,29 +1175,25 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
       const runtimeEvents = yield* Queue.unbounded<ProviderRuntimeEvent>();
       const sessions = new Map<ThreadId, OpenCodeSessionContext>();
 
-      const stopAndRemoveOpenCodeContext = Effect.fn("stopAndRemoveOpenCodeContext")(
-        function* (
-          context: OpenCodeSessionContext,
-          callbacks: {
-            readonly onStopping?: Effect.Effect<void>;
-            readonly onClosed?: Effect.Effect<void>;
-          } = {},
-        ) {
-          return yield* stopOpenCodeContext(context, {
-            abortTimeoutMs: sessionAbortTimeoutMs,
-            waitForAbortTimeout: waitForSessionAbortTimeout(sessionAbortTimeoutMs),
-            ...(callbacks.onStopping !== undefined
-              ? { onStopping: callbacks.onStopping }
-              : {}),
-            onClosed: Effect.gen(function* () {
-              yield* (callbacks.onClosed ?? Effect.void);
-              if (sessions.get(context.session.threadId) === context) {
-                sessions.delete(context.session.threadId);
-              }
-            }),
-          });
-        },
-      );
+      const stopAndRemoveOpenCodeContext = Effect.fn("stopAndRemoveOpenCodeContext")(function* (
+        context: OpenCodeSessionContext,
+        callbacks: {
+          readonly onStopping?: Effect.Effect<void>;
+          readonly onClosed?: Effect.Effect<void>;
+        } = {},
+      ) {
+        return yield* stopOpenCodeContext(context, {
+          abortTimeoutMs: sessionAbortTimeoutMs,
+          waitForAbortTimeout: waitForSessionAbortTimeout(sessionAbortTimeoutMs),
+          ...(callbacks.onStopping !== undefined ? { onStopping: callbacks.onStopping } : {}),
+          onClosed: Effect.gen(function* () {
+            yield* callbacks.onClosed ?? Effect.void;
+            if (sessions.get(context.session.threadId) === context) {
+              sessions.delete(context.session.threadId);
+            }
+          }),
+        });
+      });
 
       yield* Effect.addFinalizer(() =>
         Effect.gen(function* () {
@@ -1294,28 +1289,25 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
         message: string,
       ) {
         const turnId = context.activeTurnId;
-        yield* stopAndRemoveOpenCodeContext(
-          context,
-          {
-            onStopping: emit(context, {
-              ...buildEventBase({ threadId: context.session.threadId, turnId }),
-              type: "runtime.error",
-              payload: {
-                message,
-                class: "transport_error",
-              },
-            }).pipe(Effect.ignore),
-            onClosed: emit(context, {
-              ...buildEventBase({ threadId: context.session.threadId, turnId }),
-              type: "session.exited",
-              payload: {
-                reason: message,
-                recoverable: false,
-                exitKind: "error",
-              },
-            }).pipe(Effect.ignore),
-          },
-        );
+        yield* stopAndRemoveOpenCodeContext(context, {
+          onStopping: emit(context, {
+            ...buildEventBase({ threadId: context.session.threadId, turnId }),
+            type: "runtime.error",
+            payload: {
+              message,
+              class: "transport_error",
+            },
+          }).pipe(Effect.ignore),
+          onClosed: emit(context, {
+            ...buildEventBase({ threadId: context.session.threadId, turnId }),
+            type: "session.exited",
+            payload: {
+              reason: message,
+              recoverable: false,
+              exitKind: "error",
+            },
+          }).pipe(Effect.ignore),
+        });
       });
 
       const emitAssistantTextDelta = Effect.fn("emitAssistantTextDelta")(function* (
@@ -3577,14 +3569,14 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
           }
           yield* stopAndRemoveOpenCodeContext(context, {
             onClosed: emit(context, {
-                ...buildEventBase({ threadId }),
-                type: "session.exited",
-                payload: {
-                  reason: "Session stopped.",
-                  recoverable: false,
-                  exitKind: "graceful",
-                },
-              }),
+              ...buildEventBase({ threadId }),
+              type: "session.exited",
+              payload: {
+                reason: "Session stopped.",
+                recoverable: false,
+                exitKind: "graceful",
+              },
+            }),
           });
         },
       );

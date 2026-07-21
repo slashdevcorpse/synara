@@ -3,7 +3,18 @@
 // Layer: Provider runtime tests
 // Exports: Vitest suites for opencodeRuntime.ts
 
-import { Deferred, Duration, Effect, Exit, Fiber, Layer, Result, Scope, Sink, Stream } from "effect";
+import {
+  Deferred,
+  Duration,
+  Effect,
+  Exit,
+  Fiber,
+  Layer,
+  Result,
+  Scope,
+  Sink,
+  Stream,
+} from "effect";
 import { ChildProcessSpawner } from "effect/unstable/process";
 import { TestClock } from "effect/testing";
 import { pathToFileURL } from "node:url";
@@ -45,9 +56,7 @@ const completeTestProcessTreeKiller: ProcessTreeKiller = {
   signal: () => undefined,
 };
 
-function makeTestOpenCodeRuntimeLive(
-  options: Parameters<typeof makeOpenCodeRuntimeLive>[0] = {},
-) {
+function makeTestOpenCodeRuntimeLive(options: Parameters<typeof makeOpenCodeRuntimeLive>[0] = {}) {
   return makeOpenCodeRuntimeLive({
     processTreeKiller: completeTestProcessTreeKiller,
     netService: {
@@ -416,9 +425,7 @@ describe("OpenCodeRuntime local server pool", () => {
               capturedTree = input.capturedTree;
               markTeardownStarted?.();
               await teardownGate;
-              Effect.runSync(
-                Deferred.succeed(rootExit, ChildProcessSpawner.ExitCode(0)),
-              );
+              Effect.runSync(Deferred.succeed(rootExit, ChildProcessSpawner.ExitCode(0)));
               return { escalated: false, signalErrors: [] };
             },
           }).pipe(Layer.provide(spawnerLayer));
@@ -493,9 +500,7 @@ describe("OpenCodeRuntime local server pool", () => {
         state.killUrls.push(url);
         return { escalated: false, signalErrors: [] };
       },
-    }).pipe(
-      Layer.provide(mockPooledOpenCodeServerSpawnerLayer({ ...state, processUrls })),
-    );
+    }).pipe(Layer.provide(mockPooledOpenCodeServerSpawnerLayer({ ...state, processUrls })));
 
     const runtimeExit = await Effect.runPromise(
       Effect.exit(
@@ -534,10 +539,7 @@ describe("OpenCodeRuntime local server pool", () => {
             expect(fresh.url).toBe("http://127.0.0.1:59001");
             yield* Scope.close(freshScope, Exit.void);
             yield* closeLocalServerPoolsForCliSpec(runtime, OPENCODE_CLI_SPEC);
-            expect(state.killUrls).toEqual([
-              "http://127.0.0.1:59000",
-              "http://127.0.0.1:59001",
-            ]);
+            expect(state.killUrls).toEqual(["http://127.0.0.1:59000", "http://127.0.0.1:59001"]);
           }),
         ).pipe(Effect.provide(layer)),
       ),
@@ -680,9 +682,7 @@ describe("OpenCodeRuntime local server pool", () => {
           state.killUrls.push("http://127.0.0.1:59000");
           return { escalated: false, signalErrors: [] };
         },
-      }).pipe(
-        Layer.provide(mockPooledOpenCodeServerSpawnerLayer({ ...state, processUrls })),
-      ),
+      }).pipe(Layer.provide(mockPooledOpenCodeServerSpawnerLayer({ ...state, processUrls }))),
       TestClock.layer(),
     );
 
@@ -696,10 +696,9 @@ describe("OpenCodeRuntime local server pool", () => {
             .pipe(Effect.provideService(Scope.Scope, connectionScope));
           yield* Scope.close(connectionScope, Exit.void);
 
-          const closing = yield* closeLocalServerPoolsForCliSpec(
-            runtime,
-            OPENCODE_CLI_SPEC,
-          ).pipe(Effect.forkChild);
+          const closing = yield* closeLocalServerPoolsForCliSpec(runtime, OPENCODE_CLI_SPEC).pipe(
+            Effect.forkChild,
+          );
           yield* Effect.promise(() => teardownStarted);
           const closingWaitedForProof = closing.pollUnsafe() === undefined;
 
@@ -738,9 +737,7 @@ describe("OpenCodeRuntime local server pool", () => {
           state.killUrls.push(url);
           return { escalated: false, signalErrors: [] };
         },
-      }).pipe(
-        Layer.provide(mockPooledOpenCodeServerSpawnerLayer({ ...state, processUrls })),
-      ),
+      }).pipe(Layer.provide(mockPooledOpenCodeServerSpawnerLayer({ ...state, processUrls }))),
       TestClock.layer(),
     );
 
@@ -764,9 +761,7 @@ describe("OpenCodeRuntime local server pool", () => {
               expect(failedClose.failure).toBeInstanceOf(OpenCodeRuntimeError);
               expect(failedClose.failure.operation).toBe("closeLocalServerPoolsForCliSpec");
               expect(failedClose.failure.cause).toBeInstanceOf(OpenCodeRuntimeError);
-              expect((failedClose.failure.cause as OpenCodeRuntimeError).cause).toBe(
-                unprovenExit,
-              );
+              expect((failedClose.failure.cause as OpenCodeRuntimeError).cause).toBe(unprovenExit);
             }
             expect(state.killUrls).toEqual([]);
 
@@ -779,10 +774,7 @@ describe("OpenCodeRuntime local server pool", () => {
             yield* Scope.close(refusedReuseScope, Exit.void);
             expect(state.spawnUrls).toEqual(["http://127.0.0.1:59000"]);
 
-            yield* closeLocalServerPoolsForCliSpec(
-              runtime,
-              OPENCODE_CLI_SPEC,
-            );
+            yield* closeLocalServerPoolsForCliSpec(runtime, OPENCODE_CLI_SPEC);
             expect(teardownCalls).toBe(2);
             expect(state.killUrls).toEqual(["http://127.0.0.1:59000"]);
 
@@ -791,16 +783,10 @@ describe("OpenCodeRuntime local server pool", () => {
               .connectToOpenCodeServer({ binaryPath: "opencode" })
               .pipe(Effect.provideService(Scope.Scope, freshScope));
             expect(freshConnection.url).toBe("http://127.0.0.1:59001");
-            expect(state.spawnUrls).toEqual([
-              "http://127.0.0.1:59000",
-              "http://127.0.0.1:59001",
-            ]);
+            expect(state.spawnUrls).toEqual(["http://127.0.0.1:59000", "http://127.0.0.1:59001"]);
             yield* Scope.close(freshScope, Exit.void);
             yield* closeLocalServerPoolsForCliSpec(runtime, OPENCODE_CLI_SPEC);
-            expect(state.killUrls).toEqual([
-              "http://127.0.0.1:59000",
-              "http://127.0.0.1:59001",
-            ]);
+            expect(state.killUrls).toEqual(["http://127.0.0.1:59000", "http://127.0.0.1:59001"]);
           }),
         ).pipe(Effect.provide(layer)),
       ),
@@ -838,9 +824,7 @@ describe("OpenCodeRuntime local server pool", () => {
         state.killUrls.push(url);
         return { escalated: false, signalErrors: [] };
       },
-    }).pipe(
-      Layer.provide(mockPooledOpenCodeServerSpawnerLayer({ ...state, processUrls })),
-    );
+    }).pipe(Layer.provide(mockPooledOpenCodeServerSpawnerLayer({ ...state, processUrls })));
 
     const runtimeExit = await Effect.runPromise(
       Effect.exit(
@@ -874,16 +858,10 @@ describe("OpenCodeRuntime local server pool", () => {
               .connectToOpenCodeServer({ binaryPath: "opencode" })
               .pipe(Effect.provideService(Scope.Scope, freshScope));
             expect(fresh.url).toBe("http://127.0.0.1:59001");
-            expect(state.spawnUrls).toEqual([
-              "http://127.0.0.1:59000",
-              "http://127.0.0.1:59001",
-            ]);
+            expect(state.spawnUrls).toEqual(["http://127.0.0.1:59000", "http://127.0.0.1:59001"]);
             yield* Scope.close(freshScope, Exit.void);
             yield* closeLocalServerPoolsForCliSpec(runtime, OPENCODE_CLI_SPEC);
-            expect(state.killUrls).toEqual([
-              "http://127.0.0.1:59000",
-              "http://127.0.0.1:59001",
-            ]);
+            expect(state.killUrls).toEqual(["http://127.0.0.1:59000", "http://127.0.0.1:59001"]);
           }),
         ).pipe(Effect.provide(layer)),
       ),
@@ -953,11 +931,7 @@ describe("OpenCodeRuntime local server pool", () => {
           descendantAlive = false;
           return { escalated: false, signalErrors: [] };
         },
-      }).pipe(
-        Layer.provide(
-          mockPooledOpenCodeServerSpawnerLayer({ ...state, processUrls }),
-        ),
-      ),
+      }).pipe(Layer.provide(mockPooledOpenCodeServerSpawnerLayer({ ...state, processUrls }))),
       TestClock.layer(),
     );
 
@@ -997,10 +971,7 @@ describe("OpenCodeRuntime local server pool", () => {
             .connectToOpenCodeServer({ binaryPath: "opencode" })
             .pipe(Effect.provideService(Scope.Scope, freshScope));
           expect(fresh.url).toBe("http://127.0.0.1:59001");
-          expect(state.spawnUrls).toEqual([
-            "http://127.0.0.1:59000",
-            "http://127.0.0.1:59001",
-          ]);
+          expect(state.spawnUrls).toEqual(["http://127.0.0.1:59000", "http://127.0.0.1:59001"]);
           yield* Scope.close(freshScope, Exit.void);
           yield* closeLocalServerPoolsForCliSpec(runtime, OPENCODE_CLI_SPEC);
         }),
@@ -1035,10 +1006,7 @@ describe("OpenCodeRuntime local server pool", () => {
 
           yield* Scope.close(activeScope, Exit.void);
           yield* closeLocalServerPoolsForCliSpec(runtime, OPENCODE_CLI_SPEC);
-          expect(state.killUrls).toEqual([
-            "http://127.0.0.1:59000",
-            "http://127.0.0.1:59001",
-          ]);
+          expect(state.killUrls).toEqual(["http://127.0.0.1:59000", "http://127.0.0.1:59001"]);
         }),
       ).pipe(Effect.provide(openCodeRuntimePoolTestLayer(state))),
     );
@@ -1078,10 +1046,7 @@ describe("OpenCodeRuntime local server pool", () => {
           yield* Scope.close(kiloScope, Exit.void);
           yield* closeLocalServerPoolsForCliSpec(runtime, OPENCODE_CLI_SPEC);
 
-          expect(state.killUrls).toEqual([
-            "http://127.0.0.1:59000",
-            "http://127.0.0.1:59001",
-          ]);
+          expect(state.killUrls).toEqual(["http://127.0.0.1:59000", "http://127.0.0.1:59001"]);
 
           const reusedKiloScope = yield* Scope.make();
           const reusedKilo = yield* runtime

@@ -66,20 +66,19 @@ const disabledCapabilitiesForProvider = (
   supportsThreadImport: false,
 });
 
-const make = (options?: ProviderDiscoveryServiceLiveOptions) => Effect.gen(function* () {
-  const registry = yield* ProviderAdapterRegistry;
-  const serverConfig = yield* ServerConfig;
-  const serverSettings = yield* ServerSettingsService;
-  const maintenanceGate = options?.maintenanceGate ?? (yield* makeProviderMaintenanceGate);
-  const projectRootBoundary = options?.projectRootBoundary;
-  const withProviderDiscovery = <A, E, R>(input: {
-    readonly provider: ProviderListModelsInput["provider"];
-    readonly operation: string;
-    readonly run: Effect.Effect<A, E, R>;
-  }): Effect.Effect<A, E | ProviderValidationError, R> =>
-    maintenanceGate
-      .withOperation(input)
-      .pipe(
+const make = (options?: ProviderDiscoveryServiceLiveOptions) =>
+  Effect.gen(function* () {
+    const registry = yield* ProviderAdapterRegistry;
+    const serverConfig = yield* ServerConfig;
+    const serverSettings = yield* ServerSettingsService;
+    const maintenanceGate = options?.maintenanceGate ?? (yield* makeProviderMaintenanceGate);
+    const projectRootBoundary = options?.projectRootBoundary;
+    const withProviderDiscovery = <A, E, R>(input: {
+      readonly provider: ProviderListModelsInput["provider"];
+      readonly operation: string;
+      readonly run: Effect.Effect<A, E, R>;
+    }): Effect.Effect<A, E | ProviderValidationError, R> =>
+      maintenanceGate.withOperation(input).pipe(
         Effect.catchTag("ProviderMaintenanceBusyError", (error) =>
           Effect.fail(
             new ProviderValidationError({
@@ -91,43 +90,42 @@ const make = (options?: ProviderDiscoveryServiceLiveOptions) => Effect.gen(funct
         ),
       );
 
-  const getComposerCapabilities: ProviderDiscoveryServiceShape["getComposerCapabilities"] = (
-    input,
-  ) =>
-    Effect.gen(function* () {
-      const parsed = yield* decodeInputOrValidationError({
-        operation: "ProviderDiscoveryService.getComposerCapabilities",
-        schema: ProviderGetComposerCapabilitiesInput,
-        payload: input,
+    const getComposerCapabilities: ProviderDiscoveryServiceShape["getComposerCapabilities"] = (
+      input,
+    ) =>
+      Effect.gen(function* () {
+        const parsed = yield* decodeInputOrValidationError({
+          operation: "ProviderDiscoveryService.getComposerCapabilities",
+          schema: ProviderGetComposerCapabilitiesInput,
+          payload: input,
+        });
+        const adapter = yield* registry.getByProvider(parsed.provider);
+        const capabilities = adapter.getComposerCapabilities
+          ? yield* adapter.getComposerCapabilities()
+          : disabledCapabilitiesForProvider(parsed.provider);
+        // The unified Synara skills catalog backs skill discovery for every
+        // provider, including ones without native skill support.
+        return {
+          ...capabilities,
+          supportsSkillMentions: true,
+          supportsSkillDiscovery: true,
+        };
       });
-      const adapter = yield* registry.getByProvider(parsed.provider);
-      const capabilities = adapter.getComposerCapabilities
-        ? yield* adapter.getComposerCapabilities()
-        : disabledCapabilitiesForProvider(parsed.provider);
-      // The unified Synara skills catalog backs skill discovery for every
-      // provider, including ones without native skill support.
-      return {
-        ...capabilities,
-        supportsSkillMentions: true,
-        supportsSkillDiscovery: true,
-      };
-    });
 
-  const listSkills: ProviderDiscoveryServiceShape["listSkills"] = (input) =>
-    Effect.gen(function* () {
-      const parsed = yield* decodeInputOrValidationError({
-        operation: "ProviderDiscoveryService.listSkills",
-        schema: ProviderListSkillsInput,
-        payload: input,
-      });
-      const adapter = yield* registry.getByProvider(parsed.provider);
-      const nativeResult: ProviderListSkillsResult | null = adapter.listSkills
-        ? yield* withProviderDiscovery({
-            provider: parsed.provider,
-            operation: "ProviderDiscoveryService.listSkills",
-            run: adapter.listSkills(parsed),
-          })
-            .pipe(
+    const listSkills: ProviderDiscoveryServiceShape["listSkills"] = (input) =>
+      Effect.gen(function* () {
+        const parsed = yield* decodeInputOrValidationError({
+          operation: "ProviderDiscoveryService.listSkills",
+          schema: ProviderListSkillsInput,
+          payload: input,
+        });
+        const adapter = yield* registry.getByProvider(parsed.provider);
+        const nativeResult: ProviderListSkillsResult | null = adapter.listSkills
+          ? yield* withProviderDiscovery({
+              provider: parsed.provider,
+              operation: "ProviderDiscoveryService.listSkills",
+              run: adapter.listSkills(parsed),
+            }).pipe(
               Effect.catch((error) =>
                 Effect.logWarning(
                   "provider-native skill discovery failed; serving the Synara skills catalog only",
@@ -135,160 +133,160 @@ const make = (options?: ProviderDiscoveryServiceLiveOptions) => Effect.gen(funct
                 ).pipe(Effect.as(null)),
               ),
             )
-        : null;
-      const catalogSkills = yield* Effect.tryPromise(() =>
-        discoverSkillsCatalog({
-          cwd: parsed.cwd,
-          ...(projectRootBoundary ? { projectRootBoundary } : {}),
-          homeDir: serverConfig.homeDir,
-          synaraBaseDir: serverConfig.baseDir,
-          provider: parsed.provider,
-          ...(parsed.forceReload !== undefined ? { forceReload: parsed.forceReload } : {}),
-        }),
-      ).pipe(
-        Effect.catchCause((cause) =>
-          Effect.logWarning("synara skills catalog discovery failed", {
+          : null;
+        const catalogSkills = yield* Effect.tryPromise(() =>
+          discoverSkillsCatalog({
+            cwd: parsed.cwd,
+            ...(projectRootBoundary ? { projectRootBoundary } : {}),
+            homeDir: serverConfig.homeDir,
+            synaraBaseDir: serverConfig.baseDir,
             provider: parsed.provider,
-            cause,
-          }).pipe(Effect.as([] as ProviderSkillDescriptor[])),
-        ),
-      );
-      const merged = mergeSkillsIntoCatalog({
-        native: nativeResult?.skills ?? [],
-        catalog: catalogSkills,
-      });
-      const settings = yield* serverSettings.getSettings.pipe(
-        Effect.orElseSucceed(() => DEFAULT_SERVER_SETTINGS),
-      );
-      return {
-        skills: filterDisabledSkills(merged, settings.skills.disabled),
-        source: nativeResult?.source ? `${nativeResult.source}+synara.catalog` : "synara.catalog",
-        cached: nativeResult?.cached ?? false,
-      } satisfies ProviderListSkillsResult;
-    });
-
-  const listCommands: ProviderDiscoveryServiceShape["listCommands"] = (input) =>
-    Effect.gen(function* () {
-      const parsed = yield* decodeInputOrValidationError({
-        operation: "ProviderDiscoveryService.listCommands",
-        schema: ProviderListCommandsInput,
-        payload: input,
-      });
-      const adapter = yield* registry.getByProvider(parsed.provider);
-      if (!adapter.listCommands) {
-        return {
-          commands: [],
-          source: "unsupported",
-          cached: false,
-        };
-      }
-      return yield* withProviderDiscovery({
-        provider: parsed.provider,
-        operation: "ProviderDiscoveryService.listCommands",
-        run: adapter.listCommands(parsed),
-      });
-    });
-
-  const listPlugins: ProviderDiscoveryServiceShape["listPlugins"] = (input) =>
-    Effect.gen(function* () {
-      const parsed = yield* decodeInputOrValidationError({
-        operation: "ProviderDiscoveryService.listPlugins",
-        schema: ProviderListPluginsInput,
-        payload: input,
-      });
-      const adapter = yield* registry.getByProvider(parsed.provider);
-      if (!adapter.listPlugins) {
-        return {
-          marketplaces: [],
-          marketplaceLoadErrors: [],
-          remoteSyncError: null,
-          featuredPluginIds: [],
-          source: "unsupported",
-          cached: false,
-        };
-      }
-      return yield* withProviderDiscovery({
-        provider: parsed.provider,
-        operation: "ProviderDiscoveryService.listPlugins",
-        run: adapter.listPlugins(parsed),
-      });
-    });
-
-  const readPlugin: ProviderDiscoveryServiceShape["readPlugin"] = (input) =>
-    Effect.gen(function* () {
-      const parsed = yield* decodeInputOrValidationError({
-        operation: "ProviderDiscoveryService.readPlugin",
-        schema: ProviderReadPluginInput,
-        payload: input,
-      });
-      const adapter = yield* registry.getByProvider(parsed.provider);
-      if (!adapter.readPlugin) {
-        return yield* new ProviderValidationError({
-          operation: "ProviderDiscoveryService.readPlugin",
-          issue: `Plugin discovery is unavailable for provider '${parsed.provider}'.`,
+            ...(parsed.forceReload !== undefined ? { forceReload: parsed.forceReload } : {}),
+          }),
+        ).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("synara skills catalog discovery failed", {
+              provider: parsed.provider,
+              cause,
+            }).pipe(Effect.as([] as ProviderSkillDescriptor[])),
+          ),
+        );
+        const merged = mergeSkillsIntoCatalog({
+          native: nativeResult?.skills ?? [],
+          catalog: catalogSkills,
         });
-      }
-      return yield* withProviderDiscovery({
-        provider: parsed.provider,
-        operation: "ProviderDiscoveryService.readPlugin",
-        run: adapter.readPlugin(parsed),
-      });
-    });
-
-  const listModels: ProviderDiscoveryServiceShape["listModels"] = (input) =>
-    Effect.gen(function* () {
-      const parsed = yield* decodeInputOrValidationError({
-        operation: "ProviderDiscoveryService.listModels",
-        schema: ProviderListModelsInput,
-        payload: input,
-      });
-      const adapter = yield* registry.getByProvider(parsed.provider);
-      if (!adapter.listModels) {
+        const settings = yield* serverSettings.getSettings.pipe(
+          Effect.orElseSucceed(() => DEFAULT_SERVER_SETTINGS),
+        );
         return {
-          models: [],
-          source: "unsupported",
-          cached: false,
-        };
-      }
-      return yield* withProviderDiscovery({
-        provider: parsed.provider,
-        operation: "ProviderDiscoveryService.listModels",
-        run: adapter.listModels(parsed),
+          skills: filterDisabledSkills(merged, settings.skills.disabled),
+          source: nativeResult?.source ? `${nativeResult.source}+synara.catalog` : "synara.catalog",
+          cached: nativeResult?.cached ?? false,
+        } satisfies ProviderListSkillsResult;
       });
-    });
 
-  const listAgents: ProviderDiscoveryServiceShape["listAgents"] = (input) =>
-    Effect.gen(function* () {
-      const parsed = yield* decodeInputOrValidationError({
-        operation: "ProviderDiscoveryService.listAgents",
-        schema: ProviderListAgentsInput,
-        payload: input,
+    const listCommands: ProviderDiscoveryServiceShape["listCommands"] = (input) =>
+      Effect.gen(function* () {
+        const parsed = yield* decodeInputOrValidationError({
+          operation: "ProviderDiscoveryService.listCommands",
+          schema: ProviderListCommandsInput,
+          payload: input,
+        });
+        const adapter = yield* registry.getByProvider(parsed.provider);
+        if (!adapter.listCommands) {
+          return {
+            commands: [],
+            source: "unsupported",
+            cached: false,
+          };
+        }
+        return yield* withProviderDiscovery({
+          provider: parsed.provider,
+          operation: "ProviderDiscoveryService.listCommands",
+          run: adapter.listCommands(parsed),
+        });
       });
-      const adapter = yield* registry.getByProvider(parsed.provider);
-      if (!adapter.listAgents) {
-        return {
-          agents: [],
-          source: "unsupported",
-          cached: false,
-        };
-      }
-      return yield* withProviderDiscovery({
-        provider: parsed.provider,
-        operation: "ProviderDiscoveryService.listAgents",
-        run: adapter.listAgents(parsed),
-      });
-    });
 
-  return {
-    getComposerCapabilities,
-    listCommands,
-    listSkills,
-    listPlugins,
-    readPlugin,
-    listModels,
-    listAgents,
-  } satisfies ProviderDiscoveryServiceShape;
-});
+    const listPlugins: ProviderDiscoveryServiceShape["listPlugins"] = (input) =>
+      Effect.gen(function* () {
+        const parsed = yield* decodeInputOrValidationError({
+          operation: "ProviderDiscoveryService.listPlugins",
+          schema: ProviderListPluginsInput,
+          payload: input,
+        });
+        const adapter = yield* registry.getByProvider(parsed.provider);
+        if (!adapter.listPlugins) {
+          return {
+            marketplaces: [],
+            marketplaceLoadErrors: [],
+            remoteSyncError: null,
+            featuredPluginIds: [],
+            source: "unsupported",
+            cached: false,
+          };
+        }
+        return yield* withProviderDiscovery({
+          provider: parsed.provider,
+          operation: "ProviderDiscoveryService.listPlugins",
+          run: adapter.listPlugins(parsed),
+        });
+      });
+
+    const readPlugin: ProviderDiscoveryServiceShape["readPlugin"] = (input) =>
+      Effect.gen(function* () {
+        const parsed = yield* decodeInputOrValidationError({
+          operation: "ProviderDiscoveryService.readPlugin",
+          schema: ProviderReadPluginInput,
+          payload: input,
+        });
+        const adapter = yield* registry.getByProvider(parsed.provider);
+        if (!adapter.readPlugin) {
+          return yield* new ProviderValidationError({
+            operation: "ProviderDiscoveryService.readPlugin",
+            issue: `Plugin discovery is unavailable for provider '${parsed.provider}'.`,
+          });
+        }
+        return yield* withProviderDiscovery({
+          provider: parsed.provider,
+          operation: "ProviderDiscoveryService.readPlugin",
+          run: adapter.readPlugin(parsed),
+        });
+      });
+
+    const listModels: ProviderDiscoveryServiceShape["listModels"] = (input) =>
+      Effect.gen(function* () {
+        const parsed = yield* decodeInputOrValidationError({
+          operation: "ProviderDiscoveryService.listModels",
+          schema: ProviderListModelsInput,
+          payload: input,
+        });
+        const adapter = yield* registry.getByProvider(parsed.provider);
+        if (!adapter.listModels) {
+          return {
+            models: [],
+            source: "unsupported",
+            cached: false,
+          };
+        }
+        return yield* withProviderDiscovery({
+          provider: parsed.provider,
+          operation: "ProviderDiscoveryService.listModels",
+          run: adapter.listModels(parsed),
+        });
+      });
+
+    const listAgents: ProviderDiscoveryServiceShape["listAgents"] = (input) =>
+      Effect.gen(function* () {
+        const parsed = yield* decodeInputOrValidationError({
+          operation: "ProviderDiscoveryService.listAgents",
+          schema: ProviderListAgentsInput,
+          payload: input,
+        });
+        const adapter = yield* registry.getByProvider(parsed.provider);
+        if (!adapter.listAgents) {
+          return {
+            agents: [],
+            source: "unsupported",
+            cached: false,
+          };
+        }
+        return yield* withProviderDiscovery({
+          provider: parsed.provider,
+          operation: "ProviderDiscoveryService.listAgents",
+          run: adapter.listAgents(parsed),
+        });
+      });
+
+    return {
+      getComposerCapabilities,
+      listCommands,
+      listSkills,
+      listPlugins,
+      readPlugin,
+      listModels,
+      listAgents,
+    } satisfies ProviderDiscoveryServiceShape;
+  });
 
 export function makeProviderDiscoveryServiceLive(options?: ProviderDiscoveryServiceLiveOptions) {
   return Layer.effect(ProviderDiscoveryService, make(options));

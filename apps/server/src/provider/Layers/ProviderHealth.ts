@@ -1315,10 +1315,7 @@ export const makeCheckCommandCodeProviderStatus = (
       ["status", "--json"],
       executable,
       options?.teardownProcessTree,
-    ).pipe(
-      Effect.timeoutOption(COMMAND_CODE_HEALTH_TIMEOUT_MS),
-      Effect.result,
-    );
+    ).pipe(Effect.timeoutOption(COMMAND_CODE_HEALTH_TIMEOUT_MS), Effect.result);
     if (Result.isFailure(authProbe)) {
       return {
         provider: COMMAND_CODE_PROVIDER,
@@ -2477,9 +2474,9 @@ export function makeProviderHealthLive(options?: {
       );
 
       const statusesRef = yield* Ref.make<ProviderStatuses>(cachedStatuses);
-      const providerStatusCommitEpochsRef = yield* Ref.make<
-        ReadonlyMap<ProviderKind, number>
-      >(new Map());
+      const providerStatusCommitEpochsRef = yield* Ref.make<ReadonlyMap<ProviderKind, number>>(
+        new Map(),
+      );
       const updateStatesRef = yield* Ref.make<ReadonlyMap<ProviderKind, ServerProviderUpdateState>>(
         new Map(),
       );
@@ -2539,62 +2536,62 @@ export function makeProviderHealthLive(options?: {
       const resolveProviderMaintenanceCapabilitiesForSettings = Effect.fn(
         "resolveProviderMaintenanceCapabilitiesForSettings",
       )(function* (provider: ProviderKind, settings: ServerSettings) {
-          if (!isProviderEnabledForSettings(provider, settings)) {
-            return makeProviderMaintenanceCapabilities({
-              provider,
-              packageName: null,
-              latestVersionSource: null,
-              updateExecutable: null,
-              updateArgs: [],
-              updateLockKey: null,
-            });
-          }
-          if (provider === GROK_PROVIDER) {
-            return makeProviderMaintenanceCapabilities({
-              provider,
-              packageName: null,
-              latestVersionSource: null,
-              updateExecutable: null,
-              updateArgs: [],
-              updateLockKey: null,
-            });
-          }
-          const definition = PACKAGE_MANAGED_PROVIDER_UPDATES[provider];
-          if (!definition) {
-            return makeProviderMaintenanceCapabilities({
-              provider,
-              packageName: null,
-              updateExecutable: null,
-              updateArgs: [],
-              updateLockKey: null,
-            });
-          }
-          const commandEnv =
-            provider === CODEX_PROVIDER
-              ? yield* Effect.promise(() =>
-                  makeCodexProbeEnv(settings.providers.codex.homePath ?? undefined),
-                )
-              : providerCommandEnv(provider);
-          const configuredBinaryPath = getProviderBinaryPath(provider, settings);
-          const binaryPath =
-            provider === CODEX_PROVIDER
-              ? resolveCodexCliExecutable(configuredBinaryPath ?? "codex", { env: commandEnv })
-              : provider === COMMAND_CODE_PROVIDER
-                ? resolveCommandCodeCliExecutable(configuredBinaryPath ?? "commandcode", {
-                    env: commandEnv,
-                  })
-                : provider === CURSOR_PROVIDER
-                  ? resolveCursorAgentBinaryPath(configuredBinaryPath)
-                  : provider === DROID_PROVIDER
-                    ? process.platform === "win32"
-                      ? configuredBinaryPath ?? "droid"
-                      : resolveDroidCliBinaryPath(configuredBinaryPath ?? undefined)
-                    : configuredBinaryPath;
-          return yield* resolveProviderMaintenanceCapabilitiesEffect(definition, {
-            binaryPath,
-            env: commandEnv,
-            platform: process.platform,
-          }).pipe(Effect.provideService(FileSystem.FileSystem, fileSystem));
+        if (!isProviderEnabledForSettings(provider, settings)) {
+          return makeProviderMaintenanceCapabilities({
+            provider,
+            packageName: null,
+            latestVersionSource: null,
+            updateExecutable: null,
+            updateArgs: [],
+            updateLockKey: null,
+          });
+        }
+        if (provider === GROK_PROVIDER) {
+          return makeProviderMaintenanceCapabilities({
+            provider,
+            packageName: null,
+            latestVersionSource: null,
+            updateExecutable: null,
+            updateArgs: [],
+            updateLockKey: null,
+          });
+        }
+        const definition = PACKAGE_MANAGED_PROVIDER_UPDATES[provider];
+        if (!definition) {
+          return makeProviderMaintenanceCapabilities({
+            provider,
+            packageName: null,
+            updateExecutable: null,
+            updateArgs: [],
+            updateLockKey: null,
+          });
+        }
+        const commandEnv =
+          provider === CODEX_PROVIDER
+            ? yield* Effect.promise(() =>
+                makeCodexProbeEnv(settings.providers.codex.homePath ?? undefined),
+              )
+            : providerCommandEnv(provider);
+        const configuredBinaryPath = getProviderBinaryPath(provider, settings);
+        const binaryPath =
+          provider === CODEX_PROVIDER
+            ? resolveCodexCliExecutable(configuredBinaryPath ?? "codex", { env: commandEnv })
+            : provider === COMMAND_CODE_PROVIDER
+              ? resolveCommandCodeCliExecutable(configuredBinaryPath ?? "commandcode", {
+                  env: commandEnv,
+                })
+              : provider === CURSOR_PROVIDER
+                ? resolveCursorAgentBinaryPath(configuredBinaryPath)
+                : provider === DROID_PROVIDER
+                  ? process.platform === "win32"
+                    ? (configuredBinaryPath ?? "droid")
+                    : resolveDroidCliBinaryPath(configuredBinaryPath ?? undefined)
+                  : configuredBinaryPath;
+        return yield* resolveProviderMaintenanceCapabilitiesEffect(definition, {
+          binaryPath,
+          env: commandEnv,
+          platform: process.platform,
+        }).pipe(Effect.provideService(FileSystem.FileSystem, fileSystem));
       });
 
       const getProviderMaintenanceCapabilities = Effect.fn("getProviderMaintenanceCapabilities")(
@@ -2662,9 +2659,7 @@ export function makeProviderHealthLive(options?: {
         );
       });
 
-      const advanceProviderStatusCommitEpochs = (
-        providers: ReadonlyArray<ProviderKind>,
-      ) =>
+      const advanceProviderStatusCommitEpochs = (providers: ReadonlyArray<ProviderKind>) =>
         Ref.update(providerStatusCommitEpochsRef, (previous) => {
           const next = new Map(previous);
           for (const provider of providers) {
@@ -2777,7 +2772,9 @@ export function makeProviderHealthLive(options?: {
               })
               .pipe(
                 Effect.map(Option.some),
-                Effect.catchTag("ProviderMaintenanceBusyError", () => Effect.succeed(Option.none())),
+                Effect.catchTag("ProviderMaintenanceBusyError", () =>
+                  Effect.succeed(Option.none()),
+                ),
               )
           : Effect.succeed(Option.none());
 
@@ -2793,10 +2790,9 @@ export function makeProviderHealthLive(options?: {
                 settings.providers.codex.homePath,
               );
             case COMMAND_CODE_PROVIDER:
-              return makeCheckCommandCodeProviderStatus(
-                settings.providers.commandCode.binaryPath,
-                { teardownProcessTree },
-              );
+              return makeCheckCommandCodeProviderStatus(settings.providers.commandCode.binaryPath, {
+                teardownProcessTree,
+              });
             case CLAUDE_AGENT_PROVIDER:
               return makeCheckClaudeProviderStatus(
                 resolveClaudeSubscription,
@@ -2875,7 +2871,8 @@ export function makeProviderHealthLive(options?: {
                 return yield* projectStatusesForCurrentSettings(currentStatuses);
               }
               const previousRawStatuses = yield* Ref.get(statusesRef);
-              const previousStatuses = yield* projectStatusesForCurrentSettings(previousRawStatuses);
+              const previousStatuses =
+                yield* projectStatusesForCurrentSettings(previousRawStatuses);
               const currentStatusCommitEpochs = yield* Ref.get(providerStatusCommitEpochsRef);
               const freshLoadedStatuses = loadedStatuses.filter(
                 (status) =>
@@ -2992,9 +2989,7 @@ export function makeProviderHealthLive(options?: {
               ChildProcess.make(prepared.command, prepared.args, {
                 detached: OS.platform() !== "win32",
                 shell: prepared.shell,
-                ...(prepared.windowsVerbatimArguments
-                  ? { windowsVerbatimArguments: true }
-                  : {}),
+                ...(prepared.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
                 env: updateEnv,
               }),
             );
@@ -3008,8 +3003,7 @@ export function makeProviderHealthLive(options?: {
                       processSupervisor === null
                         ? teardownEffectProcessTree(child, teardownProcessTree)
                         : processSupervisor.teardown(),
-                    catch: (error) =>
-                      error instanceof Error ? error : new Error(String(error)),
+                    catch: (error) => (error instanceof Error ? error : new Error(String(error))),
                   }).pipe(
                     Effect.tapError((error) =>
                       Ref.set(input.teardownFailureRef, error).pipe(
@@ -3143,20 +3137,20 @@ export function makeProviderHealthLive(options?: {
             provider,
             reason: reason instanceof Error ? reason.message : String(reason),
           });
-        const readUpdateSettingsGeneration = Effect.fn(
-          "readProviderUpdateSettingsGeneration",
-        )(function* () {
-          const snapshot = yield* serverSettings.getSnapshot.pipe(Effect.mapError(toUpdateError));
-          const capabilities = yield* resolveProviderMaintenanceCapabilitiesForSettings(
-            provider,
-            snapshot.settings,
-          ).pipe(Effect.mapError(toUpdateError));
-          return {
-            revision: snapshot.revision,
-            settings: snapshot.settings,
-            capabilities,
-          } satisfies ProviderUpdateSettingsGeneration;
-        });
+        const readUpdateSettingsGeneration = Effect.fn("readProviderUpdateSettingsGeneration")(
+          function* () {
+            const snapshot = yield* serverSettings.getSnapshot.pipe(Effect.mapError(toUpdateError));
+            const capabilities = yield* resolveProviderMaintenanceCapabilitiesForSettings(
+              provider,
+              snapshot.settings,
+            ).pipe(Effect.mapError(toUpdateError));
+            return {
+              revision: snapshot.revision,
+              settings: snapshot.settings,
+              capabilities,
+            } satisfies ProviderUpdateSettingsGeneration;
+          },
+        );
         const initialGeneration = yield* readUpdateSettingsGeneration();
         const initialSettings = initialGeneration.settings;
         if (!isProviderEnabledForSettings(provider, initialSettings)) {
@@ -3205,9 +3199,7 @@ export function makeProviderHealthLive(options?: {
                   message: input.message,
                   output: input.output ?? null,
                 }),
-                ...(input.providerStatus !== undefined
-                  ? { status: input.providerStatus }
-                  : {}),
+                ...(input.providerStatus !== undefined ? { status: input.providerStatus } : {}),
               });
               yield* Ref.set(terminalStateWrittenRef, true);
               return providers;
@@ -3220,10 +3212,14 @@ export function makeProviderHealthLive(options?: {
           const lockedSettings = lockedGeneration.settings;
           const lockedCapabilities = lockedGeneration.capabilities;
           const lockedUpdate = lockedCapabilities.update;
-          if (!lockedUpdate || !updateEvidenceGenerationMatches(provider, initialGeneration, lockedGeneration)) {
+          if (
+            !lockedUpdate ||
+            !updateEvidenceGenerationMatches(provider, initialGeneration, lockedGeneration)
+          ) {
             const providers = yield* markTerminal({
               status: "failed",
-              message: "Provider settings or the resolved install target changed while the update was queued. Retry the update.",
+              message:
+                "Provider settings or the resolved install target changed while the update was queued. Retry the update.",
             });
             return { providers };
           }
@@ -3254,7 +3250,8 @@ export function makeProviderHealthLive(options?: {
           ) {
             const providers = yield* markTerminal({
               status: "failed",
-              message: "Provider settings or the resolved install target changed during pre-update verification. Retry the update.",
+              message:
+                "Provider settings or the resolved install target changed during pre-update verification. Retry the update.",
             });
             return { providers };
           }
@@ -3316,8 +3313,7 @@ export function makeProviderHealthLive(options?: {
                   yield* quiesceProviderRuntimesForUpdate({
                     provider,
                     providerService,
-                    stopIdleSessions:
-                      provider !== KILO_PROVIDER && provider !== OPENCODE_PROVIDER,
+                    stopIdleSessions: provider !== KILO_PROVIDER && provider !== OPENCODE_PROVIDER,
                   });
                 }
                 yield* maintenanceOwnedResources.drainProviderResources({ provider });
@@ -3326,11 +3322,7 @@ export function makeProviderHealthLive(options?: {
                 const commandUpdate = commandCapabilities.update;
                 if (
                   !commandUpdate ||
-                  !updateEvidenceGenerationMatches(
-                    provider,
-                    gatedGeneration,
-                    commandGeneration,
-                  )
+                  !updateEvidenceGenerationMatches(provider, gatedGeneration, commandGeneration)
                 ) {
                   return yield* new ServerProviderUpdateError({
                     provider,
@@ -3342,9 +3334,7 @@ export function makeProviderHealthLive(options?: {
                   provider,
                   command: commandUpdate.executable,
                   args: commandUpdate.args,
-                  ...(commandUpdate.pathPrepend
-                    ? { pathPrepend: commandUpdate.pathPrepend }
-                    : {}),
+                  ...(commandUpdate.pathPrepend ? { pathPrepend: commandUpdate.pathPrepend } : {}),
                   teardownFailureRef,
                 }).pipe(Effect.scoped);
               }),
@@ -3367,8 +3357,7 @@ export function makeProviderHealthLive(options?: {
             return { providers };
           }
           const result = commandResult.success;
-          const output =
-            [result.stderr, result.stdout].filter(Boolean).join("\n\n").trim() || null;
+          const output = [result.stderr, result.stdout].filter(Boolean).join("\n\n").trim() || null;
           if (result.exitCode !== 0) {
             const providers = yield* markTerminal({
               status: "failed",
@@ -3384,11 +3373,7 @@ export function makeProviderHealthLive(options?: {
           const postUpdate = postCapabilities.update;
           const targetChangedBeforePostProbe =
             !postUpdate ||
-            !updateDestinationGenerationMatches(
-              provider,
-              stableGeneration,
-              postProbeGeneration,
-            );
+            !updateDestinationGenerationMatches(provider, stableGeneration, postProbeGeneration);
           const afterStatus = yield* checkProviderStatusForSettings(postSettings, provider);
           const postStatus = yield* enrichProviderStatusWithVersionAdvisory(
             afterStatus,

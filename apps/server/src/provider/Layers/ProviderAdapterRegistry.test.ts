@@ -306,19 +306,17 @@ it.effect("gates direct adapter work while leaving maintenance controls availabl
       const results = yield* Effect.gen(function* () {
         const registry = yield* ProviderAdapterRegistry;
         const gated = yield* registry.getByProvider("codex");
-        const imported = yield* gated
-          .readExternalThread!({ externalThreadId: "native-thread" })
-          .pipe(Effect.result);
-        const transcribed = yield* gated
-          .transcribeVoice!({
-            provider: "codex",
-            cwd: "/repo",
-            mimeType: "audio/webm",
-            sampleRateHz: 48_000,
-            durationMs: 100,
-            audioBase64: "YQ==",
-          })
-          .pipe(Effect.result);
+        const imported = yield* gated.readExternalThread!({
+          externalThreadId: "native-thread",
+        }).pipe(Effect.result);
+        const transcribed = yield* gated.transcribeVoice!({
+          provider: "codex",
+          cwd: "/repo",
+          mimeType: "audio/webm",
+          sampleRateHz: 48_000,
+          durationMs: 100,
+          audioBase64: "YQ==",
+        }).pipe(Effect.result);
         yield* gated.stopAll();
         return { imported, transcribed };
       }).pipe(Effect.provide(registryLayer));

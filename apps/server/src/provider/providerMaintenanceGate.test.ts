@@ -201,9 +201,7 @@ describe("providerMaintenanceGate", () => {
             .withOperation({
               provider: "cursor",
               operation: "provider.discovery",
-              run: Deferred.succeed(operationStarted, undefined).pipe(
-                Effect.andThen(Effect.never),
-              ),
+              run: Deferred.succeed(operationStarted, undefined).pipe(Effect.andThen(Effect.never)),
             })
             .pipe(Effect.forkChild);
           yield* Deferred.await(operationStarted);
@@ -312,7 +310,11 @@ describe("providerMaintenanceGate", () => {
             while (!failureClassified) yield* Effect.yieldNow;
             while (!maintenanceDone) {
               const admission = yield* gate
-                .withOperation({ provider: "codex", operation: "concurrent.waiter", run: Effect.void })
+                .withOperation({
+                  provider: "codex",
+                  operation: "concurrent.waiter",
+                  run: Effect.void,
+                })
                 .pipe(Effect.result);
               if (Result.isSuccess(admission)) successfulAdmissions += 1;
               yield* Effect.yieldNow;

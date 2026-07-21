@@ -68,9 +68,7 @@ export function makeGitStatusBroadcasterLayerLive(
   options?: GitRuntimeLayerOptions,
   gitManagerLayer = makeGitManagerLayerLive(options),
 ) {
-  return GitStatusBroadcasterLive.pipe(
-    Layer.provide(Layer.mergeAll(GitCoreLive, gitManagerLayer)),
-  );
+  return GitStatusBroadcasterLive.pipe(Layer.provide(Layer.mergeAll(GitCoreLive, gitManagerLayer)));
 }
 
 export function makeGitLayerLive(
@@ -84,12 +82,7 @@ export function makeGitLayerLive(
   const gitManagerLayer = makeGitManagerLayerLive(options, textGenerationLayer);
   const gitStatusBroadcasterLayer = makeGitStatusBroadcasterLayerLive(options, gitManagerLayer);
 
-  return Layer.mergeAll(
-    GitCoreLive,
-    GitHubCliLive,
-    gitManagerLayer,
-    gitStatusBroadcasterLayer,
-  );
+  return Layer.mergeAll(GitCoreLive, GitHubCliLive, gitManagerLayer, gitStatusBroadcasterLayer);
 }
 
 export const TextGenerationLayerLive = makeTextGenerationLayerLive();

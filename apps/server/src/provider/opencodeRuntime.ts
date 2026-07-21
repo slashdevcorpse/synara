@@ -214,9 +214,7 @@ export interface OpenCodeRuntimeShape {
      * Called atomically after process-tree supervision is installed but before readiness is awaited.
      * Callers use this handoff to retain exact cleanup ownership if startup later fails.
      */
-    readonly onProcessOwned?: (
-      process: OpenCodeOwnedServerProcess,
-    ) => Effect.Effect<void, never>;
+    readonly onProcessOwned?: (process: OpenCodeOwnedServerProcess) => Effect.Effect<void, never>;
   }) => Effect.Effect<OpenCodeServerProcess, OpenCodeRuntimeError, Scope.Scope>;
   readonly connectToOpenCodeServer: (input: {
     readonly binaryPath: string;
@@ -1347,9 +1345,7 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
                         pooledServers.set(key, pooledServer);
                         yield* Ref.set(ownedServerRef, pooledServer);
                       }),
-                  }).pipe(
-                    Effect.provideService(Scope.Scope, serverScope),
-                  ),
+                  }).pipe(Effect.provideService(Scope.Scope, serverScope)),
                 ),
               );
               const pooledServer = yield* Ref.get(ownedServerRef);
@@ -1369,7 +1365,8 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
                 yield* Scope.close(serverScope, Exit.void).pipe(Effect.ignore);
                 return yield* new OpenCodeRuntimeError({
                   operation: "connectToOpenCodeServer",
-                  detail: "OpenCode server startup completed without transferring process ownership.",
+                  detail:
+                    "OpenCode server startup completed without transferring process ownership.",
                 });
               }
               pooledServer.server = startedExit.value;

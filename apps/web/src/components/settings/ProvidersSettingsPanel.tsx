@@ -877,9 +877,7 @@ export function ProvidersSettingsPanel({
             description: originalManualCommand
               ? `${resultMessage}\n\nCopy the command below to update manually in a terminal.`
               : resultMessage,
-            ...(originalManualCommand
-              ? { data: { copyText: originalManualCommand } }
-              : {}),
+            ...(originalManualCommand ? { data: { copyText: originalManualCommand } } : {}),
           });
         })
         .finally(async () => {

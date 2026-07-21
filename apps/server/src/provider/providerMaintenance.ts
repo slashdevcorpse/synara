@@ -15,13 +15,7 @@ const LATEST_VERSION_TIMEOUT_MS = 4_000;
 const PROVIDER_UPDATE_ACTION_MESSAGE = "Install the update now or review provider settings.";
 const WINDOWS_MANAGER_EXECUTABLE_EXTENSIONS = [".exe", ".cmd", ".bat", ""] as const;
 
-export type ProviderInstallSource =
-  | "npm"
-  | "bun"
-  | "pnpm"
-  | "homebrew"
-  | "native"
-  | "unknown";
+export type ProviderInstallSource = "npm" | "bun" | "pnpm" | "homebrew" | "native" | "unknown";
 
 export type ActionableProviderInstallSource = Exclude<ProviderInstallSource, "unknown">;
 
@@ -271,10 +265,7 @@ export function parseGenericCliVersion(output: string): string | null {
   return match?.[1] ? normalizeSemverVersion(match[1]) : null;
 }
 
-export function normalizeCommandPath(
-  commandPath: string,
-  platform: NodeJS.Platform,
-): string {
+export function normalizeCommandPath(commandPath: string, platform: NodeJS.Platform): string {
   const normalized = commandPath.replaceAll("\\", "/");
   return platform === "win32" ? normalized.toLowerCase() : normalized;
 }
@@ -690,11 +681,7 @@ function makeProviderMaintenanceForInstallSource(input: {
     !definition.nativeUpdate.excludedInstallSources?.includes(installSource)
   ) {
     return (
-      makeNativeProviderMaintenanceCapabilities(
-        definition,
-        installSource,
-        target,
-      ) ??
+      makeNativeProviderMaintenanceCapabilities(definition, installSource, target) ??
       makeManualOnlyProviderMaintenanceCapabilities({
         provider: definition.provider,
         packageName: definition.npmPackageName,
@@ -703,11 +690,7 @@ function makeProviderMaintenanceForInstallSource(input: {
   }
   if (installSource === "native") {
     return (
-      makeNativeProviderMaintenanceCapabilities(
-        definition,
-        installSource,
-        target,
-      ) ??
+      makeNativeProviderMaintenanceCapabilities(definition, installSource, target) ??
       makeManualOnlyProviderMaintenanceCapabilities({
         provider: definition.provider,
         packageName: definition.npmPackageName,
@@ -762,12 +745,10 @@ function pathContainsDirectory(
   platform: NodeJS.Platform,
 ): boolean {
   const normalized = normalizeCommandPath(commandPath, platform);
-  const normalizedDirectory = normalizeCommandPath(directory, platform).replace(
-    /^\/+|\/+$/g,
-    "",
-  );
+  const normalizedDirectory = normalizeCommandPath(directory, platform).replace(/^\/+|\/+$/g, "");
   return (
-    normalized.includes(`/${normalizedDirectory}/`) || normalized.endsWith(`/${normalizedDirectory}`)
+    normalized.includes(`/${normalizedDirectory}/`) ||
+    normalized.endsWith(`/${normalizedDirectory}`)
   );
 }
 
@@ -940,15 +921,10 @@ function windowsNpmShimLinksToPackageBin(input: {
   const expectedTarget = `node_modules/${packagePath}/${input.packageBinTarget}`.toLowerCase();
   const lines = input.shimContents
     .split(/\r?\n/u)
-    .map((rawLine) =>
-      rawLine.trim().replaceAll("\\", "/").replace(/\s+/gu, " ").toLowerCase(),
-    )
+    .map((rawLine) => rawLine.trim().replaceAll("\\", "/").replace(/\s+/gu, " ").toLowerCase())
     .filter(Boolean);
   const templates: ReadonlyArray<ReadonlyArray<string>> = [
-    [
-      "@echo off",
-      `"%~dp0/node.exe" "%~dp0/${expectedTarget}" %*`,
-    ],
+    ["@echo off", `"%~dp0/node.exe" "%~dp0/${expectedTarget}" %*`],
     [
       `@if exist "%~dp0/node.exe" (`,
       `"%~dp0/node.exe" "%~dp0/${expectedTarget}" %*`,
@@ -1010,7 +986,12 @@ function resolveWindowsNpmShimEvidence(
   }
   return {
     globalPrefix,
-    packageManifestPath: path.join(globalPrefix, "node_modules", ...packageSegments, "package.json"),
+    packageManifestPath: path.join(
+      globalPrefix,
+      "node_modules",
+      ...packageSegments,
+      "package.json",
+    ),
   };
 }
 
@@ -1086,10 +1067,7 @@ function derivePackageManifestPath(
   const marker = `/node_modules/${packagePath}`;
   const markerIndex = normalized.lastIndexOf(marker);
   const markerEnd = markerIndex + marker.length;
-  if (
-    markerIndex < 0 ||
-    (normalized.length > markerEnd && normalized[markerEnd] !== "/")
-  ) {
+  if (markerIndex < 0 || (normalized.length > markerEnd && normalized[markerEnd] !== "/")) {
     return null;
   }
   const packageDirectory = canonicalCommandPath.slice(0, markerEnd);
@@ -1167,10 +1145,10 @@ function managerMatchesInstallRoot(input: {
   const normalizedManager = /\.(?:exe|cmd|bat)$/u.test(normalizedManagerWithExtension)
     ? normalizedManagerWithExtension.replace(/\.(?:exe|cmd|bat)$/u, "")
     : normalizedManagerWithExtension;
-  const normalizedRoot = normalizeCommandPath(
-    input.canonicalInstallRoot,
-    input.platform,
-  ).replace(/\/$/u, "");
+  const normalizedRoot = normalizeCommandPath(input.canonicalInstallRoot, input.platform).replace(
+    /\/$/u,
+    "",
+  );
   if (input.installSource === "homebrew") {
     return normalizedManager === `${normalizedRoot}/bin/brew`;
   }
@@ -1184,10 +1162,7 @@ function managerMatchesInstallRoot(input: {
   }
   const globalMarker = "/global/";
   const globalIndex = normalizedRoot.lastIndexOf(globalMarker);
-  return (
-    globalIndex > 0 &&
-    normalizedManager === `${normalizedRoot.slice(0, globalIndex)}/pnpm`
-  );
+  return globalIndex > 0 && normalizedManager === `${normalizedRoot.slice(0, globalIndex)}/pnpm`;
 }
 
 function makeMaintenanceTarget(input: {
@@ -1321,10 +1296,7 @@ function managerExecutablePathCandidates(commandPath: string, platform: NodeJS.P
     : WINDOWS_MANAGER_EXECUTABLE_EXTENSIONS.map((extension) => `${commandPath}${extension}`);
 }
 
-function canonicalizeDirectory(
-  fileSystem: FileSystem.FileSystem,
-  directoryPath: string,
-) {
+function canonicalizeDirectory(fileSystem: FileSystem.FileSystem, directoryPath: string) {
   return Effect.gen(function* () {
     const stat = yield* fileSystem
       .stat(directoryPath)
@@ -1332,9 +1304,7 @@ function canonicalizeDirectory(
     if (stat?.type !== "Directory") {
       return null;
     }
-    return yield* fileSystem
-      .realPath(directoryPath)
-      .pipe(Effect.catch(() => Effect.succeed(null)));
+    return yield* fileSystem.realPath(directoryPath).pipe(Effect.catch(() => Effect.succeed(null)));
   });
 }
 
@@ -1358,16 +1328,12 @@ function managerCandidatePaths(input: {
         : rootPath.join(input.canonicalInstallRoot, "bin", "npm"),
     );
   } else if (input.installSource === "bun") {
-    roots.push(
-      rootPath.resolve(input.canonicalInstallRoot, "..", "..", "bin", "bun"),
-    );
+    roots.push(rootPath.resolve(input.canonicalInstallRoot, "..", "..", "bin", "bun"));
   } else if (input.installSource === "pnpm") {
     const normalizedRoot = normalizeCommandPath(input.canonicalInstallRoot, input.platform);
     const globalIndex = normalizedRoot.lastIndexOf("/global/");
     if (globalIndex > 0) {
-      roots.push(
-        rootPath.join(input.canonicalInstallRoot.slice(0, globalIndex), "pnpm"),
-      );
+      roots.push(rootPath.join(input.canonicalInstallRoot.slice(0, globalIndex), "pnpm"));
     }
   } else {
     roots.push(rootPath.join(input.canonicalInstallRoot, "bin", "brew"));
@@ -1434,9 +1400,7 @@ const resolveManagerExecutable = Effect.fn("resolveProviderMaintenanceManager")(
   return null;
 });
 
-const resolvePackageChannelEvidence = Effect.fn(
-  "resolveProviderPackageChannelEvidence",
-)(function* (
+const resolvePackageChannelEvidence = Effect.fn("resolveProviderPackageChannelEvidence")(function* (
   input: {
     readonly definition: PackageManagedProviderMaintenanceDefinition;
     readonly canonicalCommandPath: string;
@@ -1457,10 +1421,7 @@ const resolvePackageChannelEvidence = Effect.fn(
     return null;
   }
   const installedVersion = stablePackageVersion(input.definition, manifestContents);
-  const packageBinTarget = parseVerifiedNpmPackageBinTarget(
-    input.definition,
-    manifestContents,
-  );
+  const packageBinTarget = parseVerifiedNpmPackageBinTarget(input.definition, manifestContents);
   if (!installedVersion || !packageBinTarget) {
     return null;
   }
@@ -1532,10 +1493,7 @@ const resolveWindowsNpmShimDetails = Effect.fn("resolveWindowsNpmShimDetails")(f
   if (!packageManifestContents || !shimContents) {
     return null;
   }
-  const packageBinTarget = parseVerifiedNpmPackageBinTarget(
-    definition,
-    packageManifestContents,
-  );
+  const packageBinTarget = parseVerifiedNpmPackageBinTarget(definition, packageManifestContents);
   if (
     !packageBinTarget ||
     !windowsNpmShimLinksToPackageBin({ definition, packageBinTarget, shimContents })
@@ -1593,116 +1551,116 @@ export function resolvePackageManagedProviderMaintenance(
     : manualCapabilities(definition);
 }
 
-const resolveVerifiedCandidateMaintenance = Effect.fn(
-  "resolveVerifiedCandidateMaintenance",
-)(function* (
-  input: {
-    readonly definition: PackageManagedProviderMaintenanceDefinition;
-    readonly visibleCommandPath: string;
-    readonly canonicalCommandPath: string;
-    readonly packageManifestPath?: string | null;
-    readonly env: NodeJS.ProcessEnv;
-    readonly platform: NodeJS.Platform;
-    readonly preferredManagerExecutablePath?: string | null;
-  },
-  fileSystem: FileSystem.FileSystem,
-) {
-  const installSource = detectInstallSource(
-    input.definition,
-    input.visibleCommandPath,
-    input.canonicalCommandPath,
-    input.platform,
-  );
-  if (!isInstallSourceAllowed(input.definition, installSource)) {
-    return manualCapabilities(input.definition);
-  }
+const resolveVerifiedCandidateMaintenance = Effect.fn("resolveVerifiedCandidateMaintenance")(
+  function* (
+    input: {
+      readonly definition: PackageManagedProviderMaintenanceDefinition;
+      readonly visibleCommandPath: string;
+      readonly canonicalCommandPath: string;
+      readonly packageManifestPath?: string | null;
+      readonly env: NodeJS.ProcessEnv;
+      readonly platform: NodeJS.Platform;
+      readonly preferredManagerExecutablePath?: string | null;
+    },
+    fileSystem: FileSystem.FileSystem,
+  ) {
+    const installSource = detectInstallSource(
+      input.definition,
+      input.visibleCommandPath,
+      input.canonicalCommandPath,
+      input.platform,
+    );
+    if (!isInstallSourceAllowed(input.definition, installSource)) {
+      return manualCapabilities(input.definition);
+    }
 
-  if (installSource === "native") {
-    const installRoot =
-      input.definition.nativeUpdate?.resolveInstallRoot?.({
-        visibleCommandPath: input.visibleCommandPath,
-        canonicalCommandPath: input.canonicalCommandPath,
-        platform: input.platform,
-      }) ?? deriveCanonicalInstallRoot("native", input.canonicalCommandPath, input.platform);
+    if (installSource === "native") {
+      const installRoot =
+        input.definition.nativeUpdate?.resolveInstallRoot?.({
+          visibleCommandPath: input.visibleCommandPath,
+          canonicalCommandPath: input.canonicalCommandPath,
+          platform: input.platform,
+        }) ?? deriveCanonicalInstallRoot("native", input.canonicalCommandPath, input.platform);
+      if (!installRoot) {
+        return manualCapabilities(input.definition);
+      }
+      const canonicalInstallRoot = yield* canonicalizeDirectory(fileSystem, installRoot);
+      return canonicalInstallRoot
+        ? resolvePackageManagedProviderMaintenance(input.definition, {
+            binaryPath: input.visibleCommandPath,
+            realCommandPath: input.canonicalCommandPath,
+            platform: input.platform,
+            canonicalInstallRoot,
+            managerExecutablePath: input.visibleCommandPath,
+            realManagerExecutablePath: input.canonicalCommandPath,
+          })
+        : manualCapabilities(input.definition);
+    }
+
+    const installRoot = deriveCanonicalInstallRoot(
+      installSource,
+      input.canonicalCommandPath,
+      input.platform,
+    );
     if (!installRoot) {
       return manualCapabilities(input.definition);
     }
     const canonicalInstallRoot = yield* canonicalizeDirectory(fileSystem, installRoot);
-    return canonicalInstallRoot
-      ? resolvePackageManagedProviderMaintenance(input.definition, {
-          binaryPath: input.visibleCommandPath,
-          realCommandPath: input.canonicalCommandPath,
-          platform: input.platform,
-          canonicalInstallRoot,
-          managerExecutablePath: input.visibleCommandPath,
-          realManagerExecutablePath: input.canonicalCommandPath,
-        })
-      : manualCapabilities(input.definition);
-  }
-
-  const installRoot = deriveCanonicalInstallRoot(
-    installSource,
-    input.canonicalCommandPath,
-    input.platform,
-  );
-  if (!installRoot) {
-    return manualCapabilities(input.definition);
-  }
-  const canonicalInstallRoot = yield* canonicalizeDirectory(fileSystem, installRoot);
-  if (
-    !canonicalInstallRoot ||
-    normalizeCommandPath(canonicalInstallRoot, input.platform) !==
-      normalizeCommandPath(installRoot, input.platform)
-  ) {
-    return manualCapabilities(input.definition);
-  }
-  const manager = yield* resolveManagerExecutable(
-    {
-      installSource,
-      canonicalInstallRoot,
-      env: input.env,
-      platform: input.platform,
-      preferredManagerExecutablePath: input.preferredManagerExecutablePath,
-    },
-    fileSystem,
-  );
-  if (!manager) {
-    return manualCapabilities(input.definition);
-  }
-
-  let packageChannelEvidence: ProviderPackageChannelEvidence | null = null;
-  if (installSource === "npm" || installSource === "bun" || installSource === "pnpm") {
-    const packageManifestPath =
-      input.packageManifestPath ??
-      derivePackageManifestPath(input.definition, input.canonicalCommandPath, input.platform);
-    if (!packageManifestPath) {
+    if (
+      !canonicalInstallRoot ||
+      normalizeCommandPath(canonicalInstallRoot, input.platform) !==
+        normalizeCommandPath(installRoot, input.platform)
+    ) {
       return manualCapabilities(input.definition);
     }
-    packageChannelEvidence = yield* resolvePackageChannelEvidence(
+    const manager = yield* resolveManagerExecutable(
       {
-        definition: input.definition,
-        canonicalCommandPath: input.canonicalCommandPath,
+        installSource,
         canonicalInstallRoot,
-        packageManifestPath,
+        env: input.env,
         platform: input.platform,
+        preferredManagerExecutablePath: input.preferredManagerExecutablePath,
       },
       fileSystem,
     );
-    if (!packageChannelEvidence) {
+    if (!manager) {
       return manualCapabilities(input.definition);
     }
-  }
 
-  return resolvePackageManagedProviderMaintenance(input.definition, {
-    binaryPath: input.visibleCommandPath,
-    realCommandPath: input.canonicalCommandPath,
-    platform: input.platform,
-    canonicalInstallRoot,
-    managerExecutablePath: manager.visiblePath,
-    realManagerExecutablePath: manager.canonicalPath,
-    packageChannelEvidence,
-  });
-});
+    let packageChannelEvidence: ProviderPackageChannelEvidence | null = null;
+    if (installSource === "npm" || installSource === "bun" || installSource === "pnpm") {
+      const packageManifestPath =
+        input.packageManifestPath ??
+        derivePackageManifestPath(input.definition, input.canonicalCommandPath, input.platform);
+      if (!packageManifestPath) {
+        return manualCapabilities(input.definition);
+      }
+      packageChannelEvidence = yield* resolvePackageChannelEvidence(
+        {
+          definition: input.definition,
+          canonicalCommandPath: input.canonicalCommandPath,
+          canonicalInstallRoot,
+          packageManifestPath,
+          platform: input.platform,
+        },
+        fileSystem,
+      );
+      if (!packageChannelEvidence) {
+        return manualCapabilities(input.definition);
+      }
+    }
+
+    return resolvePackageManagedProviderMaintenance(input.definition, {
+      binaryPath: input.visibleCommandPath,
+      realCommandPath: input.canonicalCommandPath,
+      platform: input.platform,
+      canonicalInstallRoot,
+      managerExecutablePath: manager.visiblePath,
+      realManagerExecutablePath: manager.canonicalPath,
+      packageChannelEvidence,
+    });
+  },
+);
 
 export const resolveProviderMaintenanceCapabilitiesEffect = Effect.fn(
   "resolveProviderMaintenanceCapabilitiesEffect",
@@ -1731,9 +1689,7 @@ export const resolveProviderMaintenanceCapabilitiesEffect = Effect.fn(
         })()
       : hasPathSeparator(binaryPath)
         ? [binaryPath]
-        : pathEntries.map((entry) =>
-            commandPathImplementation(platform).join(entry, binaryPath),
-          );
+        : pathEntries.map((entry) => commandPathImplementation(platform).join(entry, binaryPath));
 
   for (const candidate of unresolvedCandidates) {
     const commandStat = yield* fileSystem
@@ -1755,11 +1711,7 @@ export const resolveProviderMaintenanceCapabilitiesEffect = Effect.fn(
       if (platform !== "win32") {
         return manualCapabilities(definition);
       }
-      const npmShim = yield* resolveWindowsNpmShimDetails(
-        definition,
-        candidate,
-        fileSystem,
-      );
+      const npmShim = yield* resolveWindowsNpmShimDetails(definition, candidate, fileSystem);
       if (!npmShim) {
         return manualCapabilities(definition);
       }

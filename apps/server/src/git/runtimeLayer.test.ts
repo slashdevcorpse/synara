@@ -3,13 +3,11 @@ import { Effect, Layer } from "effect";
 import { describe, expect, it } from "vitest";
 
 import { ServerConfig } from "../config";
-import {
-  TextGeneration,
-  type TextGenerationShape,
-} from "./Services/TextGeneration";
+import { TextGeneration, type TextGenerationShape } from "./Services/TextGeneration";
 import { makeGitLayerLive } from "./runtimeLayer";
 
-const unused = (operation: string) => Effect.die(`${operation} should not run during layer assembly`);
+const unused = (operation: string) =>
+  Effect.die(`${operation} should not run during layer assembly`);
 
 const textGenerationService: TextGenerationShape = {
   generateCommitMessage: () => unused("generateCommitMessage"),

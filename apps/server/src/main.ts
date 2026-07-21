@@ -356,9 +356,7 @@ export function makeServerStartupLogData(config: ServerConfigShape): Record<stri
 
 const makeServerProgram = (input: CliInput) => {
   const maintenanceGate = Effect.runSync(makeProviderMaintenanceGate);
-  const maintenanceOwnedResources = Effect.runSync(
-    makeProviderMaintenanceOwnedResourceCoordinator,
-  );
+  const maintenanceOwnedResources = Effect.runSync(makeProviderMaintenanceOwnedResourceCoordinator);
   return Effect.gen(function* () {
     const cliConfig = yield* CliConfig;
     const { start, stopSignal } = yield* Server;

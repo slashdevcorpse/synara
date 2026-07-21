@@ -26,9 +26,9 @@ async function makeLockDirectory(): Promise<string> {
 
 afterEach(async () => {
   await Promise.all(
-    tempDirectories.splice(0).map((directory) =>
-      NodeFs.rm(directory, { recursive: true, force: true }),
-    ),
+    tempDirectories
+      .splice(0)
+      .map((directory) => NodeFs.rm(directory, { recursive: true, force: true })),
   );
 });
 
@@ -112,9 +112,7 @@ describe("provider maintenance cross-process lock", () => {
     const installRoot = await makeLockDirectory();
     const directory = providerMaintenanceCrossProcessLockDirectory(installRoot);
 
-    expect(directory).toBe(
-      NodePath.join(installRoot, ".super-synara-provider-maintenance-locks"),
-    );
+    expect(directory).toBe(NodePath.join(installRoot, ".super-synara-provider-maintenance-locks"));
     const acquired = await Effect.runPromise(
       acquireProviderMaintenanceCrossProcessLock("npm-global:/stable-target", {
         canonicalInstallRoot: installRoot,

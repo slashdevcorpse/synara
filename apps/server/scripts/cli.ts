@@ -11,10 +11,7 @@ import {
   PUBLISH_ICON_OVERRIDES,
 } from "../../../scripts/lib/brand-assets.ts";
 import { resolveCatalogDependencies } from "../../../scripts/lib/resolve-catalog.ts";
-import {
-  assertPatchedEffectProcessSpawnerIsBundled,
-  bytesEqual,
-} from "./cliPublishContract.ts";
+import { assertPatchedEffectProcessSpawnerIsBundled, bytesEqual } from "./cliPublishContract.ts";
 import rootPackageJson from "../../../package.json" with { type: "json" };
 import serverPackageJson from "../package.json" with { type: "json" };
 
@@ -85,9 +82,7 @@ const makeNpmCommand = Effect.fn("makeNpmCommand")(function* (
   const fs = yield* FileSystem.FileSystem;
   const configuredNpmCli = process.env.npm_execpath?.trim();
   const npmCliCandidates = [
-    ...(configuredNpmCli && /\.(?:c?js|mjs)$/iu.test(configuredNpmCli)
-      ? [configuredNpmCli]
-      : []),
+    ...(configuredNpmCli && /\.(?:c?js|mjs)$/iu.test(configuredNpmCli) ? [configuredNpmCli] : []),
     path.join(path.dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js"),
   ];
   for (const npmCliPath of npmCliCandidates) {
@@ -116,12 +111,7 @@ const packStagedPackage = Effect.fn("packStagedPackage")(function* (input: {
     prefix: "synara-cli-pack-",
   });
   const packCommand = yield* makeNpmCommand(
-    [
-      "pack",
-      "--pack-destination",
-      packDirectory,
-      ...(input.verbose ? [] : ["--loglevel=error"]),
-    ],
+    ["pack", "--pack-destination", packDirectory, ...(input.verbose ? [] : ["--loglevel=error"])],
     { cwd: input.stagedPackageDir, verbose: input.verbose },
   );
   yield* runCommand(packCommand);
@@ -182,9 +172,9 @@ const verifyIsolatedPackageInstall = Effect.fn("verifyIsolatedPackageInstall")(f
     .filter((entry) => entry.endsWith(".mjs") || entry.endsWith(".cjs"))
     .sort();
   const installedRuntimeBundles = yield* Effect.forEach(installedRuntimeEntries, (entry) =>
-    fs.readFileString(path.join(installedDistDirectory, entry)).pipe(
-      Effect.map((source) => ({ path: entry, source })),
-    ),
+    fs
+      .readFileString(path.join(installedDistDirectory, entry))
+      .pipe(Effect.map((source) => ({ path: entry, source }))),
   );
   yield* Effect.try({
     try: () => assertPatchedEffectProcessSpawnerIsBundled(installedRuntimeBundles),
@@ -363,10 +353,7 @@ const publishCmd = Command.make(
             message: `Missing Windows ACP helper source: ${sourcePath}`,
           });
         }
-        const [source, built] = yield* Effect.all([
-          fs.readFile(sourcePath),
-          fs.readFile(distPath),
-        ]);
+        const [source, built] = yield* Effect.all([fs.readFile(sourcePath), fs.readFile(distPath)]);
         if (!bytesEqual(source, built)) {
           return yield* new CliError({
             message: `Stale Windows ACP helper in dist: ${helperFile}. Run the build subcommand again.`,
@@ -381,9 +368,9 @@ const publishCmd = Command.make(
         return yield* new CliError({ message: "No server runtime bundles were produced." });
       }
       const runtimeBundles = yield* Effect.forEach(runtimeBundleEntries, (entry) =>
-        fs.readFileString(path.join(serverDir, "dist", entry)).pipe(
-          Effect.map((source) => ({ path: entry, source })),
-        ),
+        fs
+          .readFileString(path.join(serverDir, "dist", entry))
+          .pipe(Effect.map((source) => ({ path: entry, source }))),
       );
       yield* Effect.try({
         try: () => assertPatchedEffectProcessSpawnerIsBundled(runtimeBundles),
@@ -418,8 +405,7 @@ const publishCmd = Command.make(
       for (const binTarget of Object.values(pkg.bin)) {
         if (typeof binTarget !== "string" || !binTarget.startsWith("dist/")) {
           return yield* new CliError({
-            message:
-              `CLI bin target must stay inside the staged dist directory: ${String(binTarget)}`,
+            message: `CLI bin target must stay inside the staged dist directory: ${String(binTarget)}`,
           });
         }
         const stagedBinPath = path.join(stagedPackageDir, binTarget);
@@ -461,14 +447,7 @@ const publishCmd = Command.make(
         verbose: config.verbose,
       });
 
-      const args = [
-        "publish",
-        tarballPath,
-        "--access",
-        config.access,
-        "--tag",
-        config.tag,
-      ];
+      const args = ["publish", tarballPath, "--access", config.access, "--tag", config.tag];
       if (config.provenance) args.push("--provenance");
       if (config.dryRun) args.push("--dry-run");
       if (!config.verbose) args.push("--loglevel=error");

@@ -5,19 +5,13 @@
 import type { ThreadId } from "@synara/contracts";
 import { Effect } from "effect";
 
-import {
-  type AcpSessionTeardownState,
-  awaitAcpSessionTeardown,
-} from "./AcpSessionTeardown.ts";
+import { type AcpSessionTeardownState, awaitAcpSessionTeardown } from "./AcpSessionTeardown.ts";
 
 export interface DroidSessionTeardownGate {
   readonly track: (threadId: ThreadId, teardown: AcpSessionTeardownState) => void;
   readonly isPending: (threadId: ThreadId) => boolean;
   readonly awaitPending: (threadId: ThreadId) => Effect.Effect<void>;
-  readonly release: (
-    threadId: ThreadId,
-    teardown: AcpSessionTeardownState,
-  ) => Effect.Effect<void>;
+  readonly release: (threadId: ThreadId, teardown: AcpSessionTeardownState) => Effect.Effect<void>;
 }
 
 export function makeDroidSessionTeardownGate(): DroidSessionTeardownGate {

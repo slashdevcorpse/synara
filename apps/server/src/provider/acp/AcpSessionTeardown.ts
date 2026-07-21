@@ -16,9 +16,7 @@ export const makeAcpSessionTeardownState = Effect.fn("makeAcpSessionTeardownStat
   } satisfies AcpSessionTeardownState;
 });
 
-export const awaitAcpSessionTeardown = (
-  state: AcpSessionTeardownState,
-): Effect.Effect<void> =>
+export const awaitAcpSessionTeardown = (state: AcpSessionTeardownState): Effect.Effect<void> =>
   Deferred.await(state.completion).pipe(
     Effect.flatMap((outcome) =>
       Exit.isFailure(outcome) ? Effect.failCause(outcome.cause) : Effect.void,

@@ -410,9 +410,7 @@ describe("windowsProcess", () => {
         ["/d", "/s", "/v:off", "/c", 'call "C:\\npm\\tool.cmd" "app-server"'],
         true,
       ),
-    ).toBe(
-      'C:\\Windows\\System32\\cmd.exe /d /s /v:off /c call "C:\\npm\\tool.cmd" "app-server"',
-    );
+    ).toBe('C:\\Windows\\System32\\cmd.exe /d /s /v:off /c call "C:\\npm\\tool.cmd" "app-server"');
   });
 
   it("preserves literal quotes in existing Codex config arguments", () => {

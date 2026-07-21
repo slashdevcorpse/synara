@@ -38,14 +38,10 @@ if (mode === "grandchild") {
     process.stderr.write("Launcher fixture requires the helper and two encoded launch values.\n");
     process.exit(64);
   }
-  const wrapper = spawn(
-    helperPath,
-    [encodedExecutable, encodedCommandLine, String(process.pid)],
-    {
-      stdio: ["pipe", "pipe", "pipe"],
-      windowsHide: true,
-    },
-  );
+  const wrapper = spawn(helperPath, [encodedExecutable, encodedCommandLine, String(process.pid)], {
+    stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true,
+  });
   process.stdout.write(`ACP_JOB_WRAPPER:${wrapper.pid}\n`);
   let observedGrandchild = false;
   const forward = (chunk, target) => {

@@ -24,12 +24,12 @@ describe("classifyCompletedProviderUpdate", () => {
       status: "succeeded",
       message: "Provider CLI update verified.",
     });
-    expect(
-      classifyCompletedProviderUpdate({ ...baseInput, targetChanged: true }),
-    ).toMatchObject({ status: "unverified" });
-    expect(
-      classifyCompletedProviderUpdate({ ...baseInput, beforeVersion: null }),
-    ).toMatchObject({ status: "unverified" });
+    expect(classifyCompletedProviderUpdate({ ...baseInput, targetChanged: true })).toMatchObject({
+      status: "unverified",
+    });
+    expect(classifyCompletedProviderUpdate({ ...baseInput, beforeVersion: null })).toMatchObject({
+      status: "unverified",
+    });
     expect(
       classifyCompletedProviderUpdate({
         ...baseInput,

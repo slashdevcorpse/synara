@@ -226,6 +226,7 @@ For Super Synara this means:
    ```
 
    Repeat the first two commands with the affected provider's executable name. If the configured path and package-manager prefix do not agree, use the owning manager manually or correct the configured path.
+
 6. If the locker cannot be identified safely, restart Windows and run the owning update command before reopening provider terminals. Do not delete the provider package directory by hand.
 
 ### Completed but the configured binary is unchanged

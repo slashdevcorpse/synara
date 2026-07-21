@@ -942,9 +942,7 @@ describe("OpenCodeAdapter runtime lifecycle", () => {
             sessionAbortTimeoutMs: abortTimeoutMs,
             waitForSessionAbortTimeout: () => {
               timeoutAttempts += 1;
-              return timeoutAttempts === 1
-                ? Effect.promise(() => timeoutGate)
-                : Effect.never;
+              return timeoutAttempts === 1 ? Effect.promise(() => timeoutGate) : Effect.never;
             },
           }).pipe(
             Layer.provideMerge(
@@ -959,7 +957,9 @@ describe("OpenCodeAdapter runtime lifecycle", () => {
     expect(Result.isFailure(result.firstStopResult)).toBe(true);
     if (Result.isFailure(result.firstStopResult)) {
       expect(result.firstStopResult.failure).toBeInstanceOf(ProviderAdapterRequestError);
-      expect(result.firstStopResult.failure.message).toContain("Session ownership remains retained");
+      expect(result.firstStopResult.failure.message).toContain(
+        "Session ownership remains retained",
+      );
     }
     expect(result.retainedSessions.map((session) => session.threadId)).toEqual([threadId]);
     expect(result.retainedRefs).toBe(1);

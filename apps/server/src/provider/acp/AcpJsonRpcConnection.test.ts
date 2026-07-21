@@ -722,10 +722,7 @@ describe("AcpSessionRuntime", () => {
         Effect.scoped,
       );
 
-      expect(readFileSync(exitLogPath, "utf8").trim().split("\n")).toEqual([
-        "stdin:end",
-        "exit:0",
-      ]);
+      expect(readFileSync(exitLogPath, "utf8").trim().split("\n")).toEqual(["stdin:end", "exit:0"]);
     }).pipe(
       Effect.provide(NodeServices.layer),
       Effect.ensuring(Effect.sync(() => rmSync(tempDir, { recursive: true, force: true }))),

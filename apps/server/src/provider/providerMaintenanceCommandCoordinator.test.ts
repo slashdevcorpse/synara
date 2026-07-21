@@ -33,8 +33,7 @@ async function makeLockDirectory(): Promise<string> {
 function makeCoordinator(directoryPath: string) {
   return makeProviderMaintenanceCommandCoordinator<CoordinatorTestError>({
     crossProcessLockDirectory: directoryPath,
-    makeAlreadyRunningError: (targetKey) =>
-      new CoordinatorTestError("already-running", targetKey),
+    makeAlreadyRunningError: (targetKey) => new CoordinatorTestError("already-running", targetKey),
     makeCrossProcessLockError: (targetKey, lockKey, cause) =>
       new CoordinatorTestError("cross-process", lockKey, targetKey, cause._tag),
   });
@@ -42,9 +41,9 @@ function makeCoordinator(directoryPath: string) {
 
 afterEach(async () => {
   await Promise.all(
-    tempDirectories.splice(0).map((directory) =>
-      NodeFs.rm(directory, { recursive: true, force: true }),
-    ),
+    tempDirectories
+      .splice(0)
+      .map((directory) => NodeFs.rm(directory, { recursive: true, force: true })),
   );
 });
 
@@ -61,9 +60,7 @@ describe("provider maintenance command coordinator", () => {
             targetKey: "codex",
             lockKey: "npm-global:/shared",
             canonicalInstallRoot: directoryPath,
-            run: Deferred.succeed(started, undefined).pipe(
-              Effect.andThen(Deferred.await(release)),
-            ),
+            run: Deferred.succeed(started, undefined).pipe(Effect.andThen(Deferred.await(release))),
           })
           .pipe(Effect.forkChild);
         yield* Deferred.await(started);
@@ -97,9 +94,7 @@ describe("provider maintenance command coordinator", () => {
             targetKey: "codex",
             lockKey: "npm-global:/shared",
             canonicalInstallRoot: directoryPath,
-            run: Deferred.succeed(started, undefined).pipe(
-              Effect.andThen(Deferred.await(release)),
-            ),
+            run: Deferred.succeed(started, undefined).pipe(Effect.andThen(Deferred.await(release))),
           })
           .pipe(Effect.forkChild);
         yield* Deferred.await(started);

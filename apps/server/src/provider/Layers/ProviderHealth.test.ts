@@ -126,12 +126,7 @@ function preparedProviderCommandMatches(input: {
     input.command.toLowerCase() === resolveWindowsComSpec(env).toLowerCase() &&
     input.options?.windowsVerbatimArguments === true &&
     JSON.stringify(input.actualArgs) ===
-      JSON.stringify(
-        buildWindowsBatchCommandArgs(
-          expectedExecutable,
-          input.expectedArgs,
-        ),
-      )
+      JSON.stringify(buildWindowsBatchCommandArgs(expectedExecutable, input.expectedArgs))
   );
 }
 
@@ -471,14 +466,11 @@ function withKiloUpdateFixture<A, E, R>(
   );
 }
 
-const providerServiceWithoutRuntimesLayer = Layer.succeed(
-  ProviderService,
-  {
-    listSessions: () => Effect.succeed([]),
-    stopRuntimeSession: () => Effect.void,
-    hasLiveRuntimeTasks: () => Effect.succeed(false),
-  } as unknown as ProviderServiceShape,
-);
+const providerServiceWithoutRuntimesLayer = Layer.succeed(ProviderService, {
+  listSessions: () => Effect.succeed([]),
+  stopRuntimeSession: () => Effect.void,
+  hasLiveRuntimeTasks: () => Effect.succeed(false),
+} as unknown as ProviderServiceShape);
 
 const disabledProviderHealthLayer = ProviderHealthLive.pipe(
   Layer.provideMerge(providerServiceWithoutRuntimesLayer),
@@ -684,8 +676,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
       const cases = [
         {
           provider: "codex" as const,
-          visible:
-            "C:\\Users\\Test\\AppData\\Local\\Programs\\OpenAI\\Codex\\bin\\codex.exe",
+          visible: "C:\\Users\\Test\\AppData\\Local\\Programs\\OpenAI\\Codex\\bin\\codex.exe",
           canonical:
             "C:\\Users\\Test\\AppData\\Local\\Programs\\OpenAI\\Codex\\releases\\0.144.6\\codex.exe",
           expected: "C:\\Users\\Test\\AppData\\Local\\Programs\\OpenAI\\Codex",
@@ -722,8 +713,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
         {
           provider: "cursor" as const,
           visible: "/Users/test/.local/bin/cursor-agent",
-          canonical:
-            "/Users/test/.local/share/cursor-agent/versions/2026.07/cursor-agent",
+          canonical: "/Users/test/.local/share/cursor-agent/versions/2026.07/cursor-agent",
           expected: "/Users/test/.local/share/cursor-agent",
           platform: "darwin" as const,
         },
@@ -771,23 +761,18 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
       assert.ok(capabilities.update);
       assert.strictEqual(capabilities.update.executable, binaryPath);
       assert.deepStrictEqual(capabilities.update.args, ["update"]);
-      assert.strictEqual(
-        capabilities.update.lockKey,
-        "antigravity-native:/Users/test/.local/bin",
-      );
+      assert.strictEqual(capabilities.update.lockKey, "antigravity-native:/Users/test/.local/bin");
       assert.strictEqual(capabilities.update.target.canonicalInstallRoot, "/Users/test/.local/bin");
     });
 
     it("updates the selected standalone Codex executable in place", () => {
       const definition = PACKAGE_MANAGED_PROVIDER_UPDATES.codex;
       assert.ok(definition);
-      const binaryPath =
-        "C:\\Users\\Test\\AppData\\Local\\Programs\\OpenAI\\Codex\\bin\\codex.exe";
+      const binaryPath = "C:\\Users\\Test\\AppData\\Local\\Programs\\OpenAI\\Codex\\bin\\codex.exe";
       const capabilities = resolvePackageManagedProviderMaintenance(definition, {
         binaryPath,
         realCommandPath: binaryPath,
-        canonicalInstallRoot:
-          "C:\\Users\\Test\\AppData\\Local\\Programs\\OpenAI\\Codex",
+        canonicalInstallRoot: "C:\\Users\\Test\\AppData\\Local\\Programs\\OpenAI\\Codex",
         managerExecutablePath: binaryPath,
         realManagerExecutablePath: binaryPath,
         platform: "win32",
@@ -812,8 +797,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
       const definition = PACKAGE_MANAGED_PROVIDER_UPDATES.cursor;
       assert.ok(definition);
       const visiblePath = "/Users/test/.local/bin/cursor-agent";
-      const canonicalPath =
-        "/Users/test/.local/share/cursor-agent/versions/2026.07/cursor-agent";
+      const canonicalPath = "/Users/test/.local/share/cursor-agent/versions/2026.07/cursor-agent";
       const standalone = resolvePackageManagedProviderMaintenance(definition, {
         platform: "darwin",
         binaryPath: visiblePath,
@@ -1027,63 +1011,66 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
 
     it.effect("commits the exact current preflight without a second full refresh", () =>
       withKiloUpdateFixture("7.4.10", (input) =>
-        withLatestNpmVersion("7.4.10", Effect.gen(function* () {
-          let healthProbeCount = 0;
-          let updateSpawnCount = 0;
-          const layer = makeProviderHealthLive({
-            providerUpdateTimeoutMs: 10_000,
-            processTreeKiller: syntheticProcessTreeKiller(201),
-          }).pipe(
-            Layer.provideMerge(providerServiceWithoutRuntimesLayer),
-            Layer.provideMerge(ServerSettingsService.layerTest(input.settings)),
-            Layer.provideMerge(ServerConfig.layerTest(process.cwd(), input.baseDir)),
-            Layer.provideMerge(
-              effectSpawnerLayer((args, command, env, options) => {
-                if (
-                  preparedProviderCommandMatches({
-                    fixture: input.fixture,
-                    executable: fixtureExecutablePath(input.fixture, "npm"),
-                    expectedArgs: [
-                      "install",
-                      "-g",
-                      "--prefix",
-                      input.npmPrefix,
-                      "@kilocode/cli@latest",
-                    ],
-                    command,
-                    actualArgs: args,
-                    env,
-                    options,
-                  })
-                ) {
-                  updateSpawnCount += 1;
-                  return Effect.succeed(mockHandle({ stdout: "unexpected update\n", stderr: "", code: 0 }));
-                }
-                healthProbeCount += 1;
-                return healthProbeCount === 1
-                  ? Effect.succeed(mockHandle({ stdout: "kilo 7.4.10\n", stderr: "", code: 0 }))
-                  : Effect.never;
-              }),
-            ),
-          );
-
-          const result = yield* Effect.gen(function* () {
-            const providerHealth = yield* ProviderHealth;
-            return yield* TestClock.withLive(
-              providerHealth.updateProvider({ provider: "kilo" }),
+        withLatestNpmVersion(
+          "7.4.10",
+          Effect.gen(function* () {
+            let healthProbeCount = 0;
+            let updateSpawnCount = 0;
+            const layer = makeProviderHealthLive({
+              providerUpdateTimeoutMs: 10_000,
+              processTreeKiller: syntheticProcessTreeKiller(201),
+            }).pipe(
+              Layer.provideMerge(providerServiceWithoutRuntimesLayer),
+              Layer.provideMerge(ServerSettingsService.layerTest(input.settings)),
+              Layer.provideMerge(ServerConfig.layerTest(process.cwd(), input.baseDir)),
+              Layer.provideMerge(
+                effectSpawnerLayer((args, command, env, options) => {
+                  if (
+                    preparedProviderCommandMatches({
+                      fixture: input.fixture,
+                      executable: fixtureExecutablePath(input.fixture, "npm"),
+                      expectedArgs: [
+                        "install",
+                        "-g",
+                        "--prefix",
+                        input.npmPrefix,
+                        "@kilocode/cli@latest",
+                      ],
+                      command,
+                      actualArgs: args,
+                      env,
+                      options,
+                    })
+                  ) {
+                    updateSpawnCount += 1;
+                    return Effect.succeed(
+                      mockHandle({ stdout: "unexpected update\n", stderr: "", code: 0 }),
+                    );
+                  }
+                  healthProbeCount += 1;
+                  return healthProbeCount === 1
+                    ? Effect.succeed(mockHandle({ stdout: "kilo 7.4.10\n", stderr: "", code: 0 }))
+                    : Effect.never;
+                }),
+              ),
             );
-          }).pipe(Effect.provide(layer));
-          const kilo = result.providers.find((status) => status.provider === "kilo");
-          const persisted = yield* readProviderStatusCache(input.cachePath);
 
-          assert.strictEqual(healthProbeCount, 1);
-          assert.strictEqual(updateSpawnCount, 0);
-          assert.strictEqual(kilo?.updateState?.status, "already_current");
-          assert.strictEqual(kilo?.version, "7.4.10");
-          assert.strictEqual(kilo?.versionAdvisory?.status, "current");
-          assert.strictEqual(persisted?.version, "7.4.10");
-          assert.strictEqual(persisted?.versionAdvisory?.status, "current");
-        })),
+            const result = yield* Effect.gen(function* () {
+              const providerHealth = yield* ProviderHealth;
+              return yield* TestClock.withLive(providerHealth.updateProvider({ provider: "kilo" }));
+            }).pipe(Effect.provide(layer));
+            const kilo = result.providers.find((status) => status.provider === "kilo");
+            const persisted = yield* readProviderStatusCache(input.cachePath);
+
+            assert.strictEqual(healthProbeCount, 1);
+            assert.strictEqual(updateSpawnCount, 0);
+            assert.strictEqual(kilo?.updateState?.status, "already_current");
+            assert.strictEqual(kilo?.version, "7.4.10");
+            assert.strictEqual(kilo?.versionAdvisory?.status, "current");
+            assert.strictEqual(persisted?.version, "7.4.10");
+            assert.strictEqual(persisted?.versionAdvisory?.status, "current");
+          }),
+        ),
       ),
     );
 
@@ -1157,174 +1144,177 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
       ),
     );
 
-    it.effect("marks a successful command unverified when settings drift during the post probe", () =>
-      withKiloUpdateFixture("7.4.10", (input) =>
-        Effect.gen(function* () {
-          const postFetchStarted = yield* Deferred.make<void>();
-          const releasePostFetch = yield* Deferred.make<void>();
-          let fetchCount = 0;
-          yield* Effect.acquireRelease(
-            Effect.sync(() => {
-              const previous = globalThis.fetch;
-              globalThis.fetch = (() => {
-                fetchCount += 1;
-                const response = new Response(JSON.stringify({ version: "7.4.11" }), {
-                  status: 200,
-                  headers: { "content-type": "application/json" },
-                });
-                return fetchCount === 1
-                  ? Promise.resolve(response)
-                  : Effect.runPromise(
-                      Deferred.succeed(postFetchStarted, undefined).pipe(
-                        Effect.andThen(Deferred.await(releasePostFetch)),
-                        Effect.as(response),
-                      ),
-                    );
-              }) as typeof fetch;
-              return previous;
-            }),
-            (previous) =>
+    it.effect(
+      "marks a successful command unverified when settings drift during the post probe",
+      () =>
+        withKiloUpdateFixture("7.4.10", (input) =>
+          Effect.gen(function* () {
+            const postFetchStarted = yield* Deferred.make<void>();
+            const releasePostFetch = yield* Deferred.make<void>();
+            let fetchCount = 0;
+            yield* Effect.acquireRelease(
               Effect.sync(() => {
-                globalThis.fetch = previous;
+                const previous = globalThis.fetch;
+                globalThis.fetch = (() => {
+                  fetchCount += 1;
+                  const response = new Response(JSON.stringify({ version: "7.4.11" }), {
+                    status: 200,
+                    headers: { "content-type": "application/json" },
+                  });
+                  return fetchCount === 1
+                    ? Promise.resolve(response)
+                    : Effect.runPromise(
+                        Deferred.succeed(postFetchStarted, undefined).pipe(
+                          Effect.andThen(Deferred.await(releasePostFetch)),
+                          Effect.as(response),
+                        ),
+                      );
+                }) as typeof fetch;
+                return previous;
               }),
-          );
-          let updaterCompleted = false;
-          let updateSpawnCount = 0;
-          const layer = makeProviderHealthLive({
-            processTreeKiller: syntheticProcessTreeKiller(203),
-          }).pipe(
-            Layer.provideMerge(providerServiceWithoutRuntimesLayer),
-            Layer.provideMerge(ServerSettingsService.layerTest(input.settings)),
-            Layer.provideMerge(ServerConfig.layerTest(process.cwd(), input.baseDir)),
-            Layer.provideMerge(
-              mockSpawnerLayer((args, command, env, options) => {
-                if (
-                  preparedProviderCommandMatches({
-                    fixture: input.fixture,
-                    executable: fixtureExecutablePath(input.fixture, "npm"),
-                    expectedArgs: [
-                      "install",
-                      "-g",
-                      "--prefix",
-                      input.npmPrefix,
-                      "@kilocode/cli@latest",
-                    ],
-                    command,
-                    actualArgs: args,
-                    env,
-                    options,
-                  })
-                ) {
-                  updateSpawnCount += 1;
-                  updaterCompleted = true;
-                  return { stdout: "updated\n", stderr: "", code: 0 };
-                }
-                return {
-                  stdout: updaterCompleted ? "kilo 7.4.11\n" : "kilo 7.4.10\n",
-                  stderr: "",
-                  code: 0,
-                };
-              }),
-            ),
-          );
+              (previous) =>
+                Effect.sync(() => {
+                  globalThis.fetch = previous;
+                }),
+            );
+            let updaterCompleted = false;
+            let updateSpawnCount = 0;
+            const layer = makeProviderHealthLive({
+              processTreeKiller: syntheticProcessTreeKiller(203),
+            }).pipe(
+              Layer.provideMerge(providerServiceWithoutRuntimesLayer),
+              Layer.provideMerge(ServerSettingsService.layerTest(input.settings)),
+              Layer.provideMerge(ServerConfig.layerTest(process.cwd(), input.baseDir)),
+              Layer.provideMerge(
+                mockSpawnerLayer((args, command, env, options) => {
+                  if (
+                    preparedProviderCommandMatches({
+                      fixture: input.fixture,
+                      executable: fixtureExecutablePath(input.fixture, "npm"),
+                      expectedArgs: [
+                        "install",
+                        "-g",
+                        "--prefix",
+                        input.npmPrefix,
+                        "@kilocode/cli@latest",
+                      ],
+                      command,
+                      actualArgs: args,
+                      env,
+                      options,
+                    })
+                  ) {
+                    updateSpawnCount += 1;
+                    updaterCompleted = true;
+                    return { stdout: "updated\n", stderr: "", code: 0 };
+                  }
+                  return {
+                    stdout: updaterCompleted ? "kilo 7.4.11\n" : "kilo 7.4.10\n",
+                    stderr: "",
+                    code: 0,
+                  };
+                }),
+              ),
+            );
 
-          const result = yield* Effect.gen(function* () {
-            const providerHealth = yield* ProviderHealth;
-            const settings = yield* ServerSettingsService;
-            const update = yield* providerHealth
-              .updateProvider({ provider: "kilo" })
-              .pipe(Effect.forkChild);
-            yield* Deferred.await(postFetchStarted);
-            yield* settings.updateSettings({
-              providers: { kilo: { serverUrl: "http://127.0.0.1:62002" } },
-            });
-            yield* Deferred.succeed(releasePostFetch, undefined);
-            return yield* Fiber.join(update);
-          }).pipe(Effect.provide(layer));
-          const kilo = result.providers.find((status) => status.provider === "kilo");
-          const persisted = yield* readProviderStatusCache(input.cachePath);
+            const result = yield* Effect.gen(function* () {
+              const providerHealth = yield* ProviderHealth;
+              const settings = yield* ServerSettingsService;
+              const update = yield* providerHealth
+                .updateProvider({ provider: "kilo" })
+                .pipe(Effect.forkChild);
+              yield* Deferred.await(postFetchStarted);
+              yield* settings.updateSettings({
+                providers: { kilo: { serverUrl: "http://127.0.0.1:62002" } },
+              });
+              yield* Deferred.succeed(releasePostFetch, undefined);
+              return yield* Fiber.join(update);
+            }).pipe(Effect.provide(layer));
+            const kilo = result.providers.find((status) => status.provider === "kilo");
+            const persisted = yield* readProviderStatusCache(input.cachePath);
 
-          assert.strictEqual(fetchCount, 2);
-          assert.strictEqual(updateSpawnCount, 1);
-          assert.strictEqual(kilo?.updateState?.status, "unverified");
-          assert.match(kilo?.updateState?.message ?? "", /target changed before verification/u);
-          assert.strictEqual(kilo?.version, "7.4.10");
-          assert.strictEqual(kilo?.versionAdvisory?.status, "behind_latest");
-          assert.strictEqual(persisted?.version, "7.4.10");
-          assert.strictEqual(persisted?.versionAdvisory?.status, "behind_latest");
-        }),
-      ),
+            assert.strictEqual(fetchCount, 2);
+            assert.strictEqual(updateSpawnCount, 1);
+            assert.strictEqual(kilo?.updateState?.status, "unverified");
+            assert.match(kilo?.updateState?.message ?? "", /target changed before verification/u);
+            assert.strictEqual(kilo?.version, "7.4.10");
+            assert.strictEqual(kilo?.versionAdvisory?.status, "behind_latest");
+            assert.strictEqual(persisted?.version, "7.4.10");
+            assert.strictEqual(persisted?.versionAdvisory?.status, "behind_latest");
+          }),
+        ),
     );
 
     it.effect("returns and persists the exact post-probe version and advisory", () =>
       withKiloUpdateFixture("7.4.10", (input) =>
-        withLatestNpmVersion("7.4.11", Effect.gen(function* () {
-          let updaterCompleted = false;
-          let healthProbeCount = 0;
-          let updateSpawnCount = 0;
-          const layer = makeProviderHealthLive({
-            providerUpdateTimeoutMs: 10_000,
-            processTreeKiller: syntheticProcessTreeKiller(204),
-          }).pipe(
-            Layer.provideMerge(providerServiceWithoutRuntimesLayer),
-            Layer.provideMerge(ServerSettingsService.layerTest(input.settings)),
-            Layer.provideMerge(ServerConfig.layerTest(process.cwd(), input.baseDir)),
-            Layer.provideMerge(
-              effectSpawnerLayer((args, command, env, options) => {
-                if (
-                  preparedProviderCommandMatches({
-                    fixture: input.fixture,
-                    executable: fixtureExecutablePath(input.fixture, "npm"),
-                    expectedArgs: [
-                      "install",
-                      "-g",
-                      "--prefix",
-                      input.npmPrefix,
-                      "@kilocode/cli@latest",
-                    ],
-                    command,
-                    actualArgs: args,
-                    env,
-                    options,
-                  })
-                ) {
-                  updateSpawnCount += 1;
-                  updaterCompleted = true;
-                  return Effect.succeed(mockHandle({ stdout: "updated\n", stderr: "", code: 0 }));
-                }
-                healthProbeCount += 1;
-                return healthProbeCount <= 2
-                  ? Effect.succeed(
-                      mockHandle({
-                        stdout: updaterCompleted ? "kilo 7.4.11\n" : "kilo 7.4.10\n",
-                        stderr: "",
-                        code: 0,
-                      }),
-                    )
-                  : Effect.never;
-              }),
-            ),
-          );
-
-          const result = yield* Effect.gen(function* () {
-            const providerHealth = yield* ProviderHealth;
-            return yield* TestClock.withLive(
-              providerHealth.updateProvider({ provider: "kilo" }),
+        withLatestNpmVersion(
+          "7.4.11",
+          Effect.gen(function* () {
+            let updaterCompleted = false;
+            let healthProbeCount = 0;
+            let updateSpawnCount = 0;
+            const layer = makeProviderHealthLive({
+              providerUpdateTimeoutMs: 10_000,
+              processTreeKiller: syntheticProcessTreeKiller(204),
+            }).pipe(
+              Layer.provideMerge(providerServiceWithoutRuntimesLayer),
+              Layer.provideMerge(ServerSettingsService.layerTest(input.settings)),
+              Layer.provideMerge(ServerConfig.layerTest(process.cwd(), input.baseDir)),
+              Layer.provideMerge(
+                effectSpawnerLayer((args, command, env, options) => {
+                  if (
+                    preparedProviderCommandMatches({
+                      fixture: input.fixture,
+                      executable: fixtureExecutablePath(input.fixture, "npm"),
+                      expectedArgs: [
+                        "install",
+                        "-g",
+                        "--prefix",
+                        input.npmPrefix,
+                        "@kilocode/cli@latest",
+                      ],
+                      command,
+                      actualArgs: args,
+                      env,
+                      options,
+                    })
+                  ) {
+                    updateSpawnCount += 1;
+                    updaterCompleted = true;
+                    return Effect.succeed(mockHandle({ stdout: "updated\n", stderr: "", code: 0 }));
+                  }
+                  healthProbeCount += 1;
+                  return healthProbeCount <= 2
+                    ? Effect.succeed(
+                        mockHandle({
+                          stdout: updaterCompleted ? "kilo 7.4.11\n" : "kilo 7.4.10\n",
+                          stderr: "",
+                          code: 0,
+                        }),
+                      )
+                    : Effect.never;
+                }),
+              ),
             );
-          }).pipe(Effect.provide(layer));
-          const kilo = result.providers.find((status) => status.provider === "kilo");
-          const persisted = yield* readProviderStatusCache(input.cachePath);
 
-          assert.strictEqual(healthProbeCount, 2);
-          assert.strictEqual(updateSpawnCount, 1);
-          assert.strictEqual(kilo?.updateState?.status, "succeeded");
-          assert.strictEqual(kilo?.version, "7.4.11");
-          assert.strictEqual(kilo?.versionAdvisory?.status, "current");
-          assert.strictEqual(kilo?.versionAdvisory?.currentVersion, "7.4.11");
-          assert.strictEqual(kilo?.versionAdvisory?.latestVersion, "7.4.11");
-          assert.strictEqual(persisted?.version, kilo?.version);
-          assert.deepStrictEqual(persisted?.versionAdvisory, kilo?.versionAdvisory);
-        })),
+            const result = yield* Effect.gen(function* () {
+              const providerHealth = yield* ProviderHealth;
+              return yield* TestClock.withLive(providerHealth.updateProvider({ provider: "kilo" }));
+            }).pipe(Effect.provide(layer));
+            const kilo = result.providers.find((status) => status.provider === "kilo");
+            const persisted = yield* readProviderStatusCache(input.cachePath);
+
+            assert.strictEqual(healthProbeCount, 2);
+            assert.strictEqual(updateSpawnCount, 1);
+            assert.strictEqual(kilo?.updateState?.status, "succeeded");
+            assert.strictEqual(kilo?.version, "7.4.11");
+            assert.strictEqual(kilo?.versionAdvisory?.status, "current");
+            assert.strictEqual(kilo?.versionAdvisory?.currentVersion, "7.4.11");
+            assert.strictEqual(kilo?.versionAdvisory?.latestVersion, "7.4.11");
+            assert.strictEqual(persisted?.version, kilo?.version);
+            assert.deepStrictEqual(persisted?.versionAdvisory, kilo?.versionAdvisory);
+          }),
+        ),
       ),
     );
 
@@ -1417,9 +1407,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
             return { update, refresh, current };
           }).pipe(Effect.provide(layer));
 
-          const updateKilo = result.update.providers.find(
-            (status) => status.provider === "kilo",
-          );
+          const updateKilo = result.update.providers.find((status) => status.provider === "kilo");
           const refreshKilo = result.refresh.find((status) => status.provider === "kilo");
           const currentKilo = result.current.find((status) => status.provider === "kilo");
           const persisted = yield* readProviderStatusCache(input.cachePath);
@@ -1534,7 +1522,10 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
 
               assert.strictEqual(updateSpawnCount, 1);
               assert.strictEqual(kilo?.updateState?.status, "failed");
-              assert.match(kilo?.updateState?.message ?? "", /configured provider binary is unavailable/u);
+              assert.match(
+                kilo?.updateState?.message ?? "",
+                /configured provider binary is unavailable/u,
+              );
             }),
           (previousFetch) =>
             Effect.sync(() => {
@@ -1546,316 +1537,18 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
 
     it.effect("stops a hung provider process and persists a failed update state", () =>
       withIsolatedProviderCommands(["npm"], (fixture) =>
-        withLatestNpmVersion("7.4.11", Effect.gen(function* () {
-          let killed = false;
-          const updaterSpawned = yield* Deferred.make<void>();
-          const fileSystem = yield* FileSystem.FileSystem;
-          const path = yield* Path.Path;
-          const baseDir = yield* fileSystem.makeTempDirectoryScoped({
-            prefix: "provider-update-timeout-",
-          });
-          const npmPrefix = path.join(baseDir, "nvm");
-          const kiloBinaryPath = path.join(
-            npmPrefix,
-            "lib",
-            "node_modules",
-            "@kilocode",
-            "cli",
-            "bin",
-            "kilo",
-          );
-          yield* writeLatestKiloPackageFixture({
-            fileSystem,
-            binaryPath: kiloBinaryPath,
-            version: "7.3.46",
-          });
-          yield* writeProviderStatusCache({
-            filePath: resolveProviderStatusCachePath({
-              stateDir: path.join(baseDir, "userdata"),
-              provider: "kilo",
-            }),
-            provider: {
-              provider: "kilo",
-              status: "ready",
-              available: true,
-              authStatus: "authenticated",
-              checkedAt: "2026-07-15T12:00:00.000Z",
-              message: "Kilo CLI is installed and authenticated.",
-              version: "7.3.46",
-            },
-          });
-          const settings = {
-            ...allProvidersDisabledServerSettings,
-            providers: {
-              ...allProvidersDisabledServerSettings.providers,
-              kilo: {
-                ...DEFAULT_SERVER_SETTINGS.providers.kilo,
-                enabled: true,
-                binaryPath: kiloBinaryPath,
-              },
-            },
-          } satisfies typeof DEFAULT_SERVER_SETTINGS;
-          const layer = makeProviderHealthLive({
-            providerUpdateTimeoutMs: 2_000,
-            processTreeKiller: syntheticProcessTreeKiller(2),
-            teardownProcessTree: () => {
-              killed = true;
-              return Promise.resolve({ escalated: false, signalErrors: [] });
-            },
-          }).pipe(
-            Layer.provideMerge(providerServiceWithoutRuntimesLayer),
-            Layer.provideMerge(ServerSettingsService.layerTest(settings)),
-            Layer.provideMerge(ServerConfig.layerTest(process.cwd(), baseDir)),
-            Layer.provideMerge(
-              hangingSpawnerLayer({
-                onKill: () => (killed = true),
-                onSpawn: Deferred.succeed(updaterSpawned, undefined),
-                shouldHang: (args, command, env, options) =>
-                  preparedProviderCommandMatches({
-                    fixture,
-                    executable: fixtureExecutablePath(fixture, "npm"),
-                    expectedArgs: [
-                      "install",
-                      "-g",
-                      "--prefix",
-                      npmPrefix,
-                      "@kilocode/cli@latest",
-                    ],
-                    command,
-                    actualArgs: args,
-                    env,
-                    options,
-                  }),
-              }),
-            ),
-          );
-
-          const result = yield* Effect.gen(function* () {
-            const providerHealth = yield* ProviderHealth;
-            const update = yield* providerHealth
-              .updateProvider({ provider: "kilo" })
-              .pipe(Effect.forkChild);
-            yield* Deferred.await(updaterSpawned);
-            yield* TestClock.adjust(2_000);
-            return yield* Fiber.join(update);
-          }).pipe(Effect.provide(layer));
-          const kilo = result.providers.find((provider) => provider.provider === "kilo");
-
-          assert.strictEqual(killed, true, kilo?.updateState?.message ?? "missing update state");
-          assert.strictEqual(kilo?.updateState?.status, "failed");
-          assert.strictEqual(
-            kilo?.updateState?.message,
-            "Update job timed out after 2 seconds. It was canceled, and any spawned updater process tree was stopped before provider access resumed.",
-          );
-        })),
-      ),
-    );
-
-    it.effect("refuses an update without spawning the updater when provider work is active", () =>
-      withLatestNpmVersion("7.4.11", Effect.gen(function* () {
-        const fileSystem = yield* FileSystem.FileSystem;
-        const baseDir = yield* fileSystem.makeTempDirectoryScoped({
-          prefix: "provider-update-active-runtime-",
-        });
-        const npmPrefix = NodePath.join(baseDir, "nvm");
-        const kiloBinaryPath = NodePath.join(
-          npmPrefix,
-          "lib",
-          "node_modules",
-          "@kilocode",
-          "cli",
-          "bin",
-          "kilo",
-        );
-        yield* writeLatestKiloPackageFixture({
-          fileSystem,
-          binaryPath: kiloBinaryPath,
-          version: "7.4.10",
-        });
-        const settings = {
-          ...allProvidersDisabledServerSettings,
-          providers: {
-            ...allProvidersDisabledServerSettings.providers,
-            kilo: {
-              ...DEFAULT_SERVER_SETTINGS.providers.kilo,
-              enabled: true,
-              binaryPath: kiloBinaryPath,
-            },
-          },
-        } satisfies typeof DEFAULT_SERVER_SETTINGS;
-        yield* writeProviderStatusCache({
-          filePath: resolveProviderStatusCachePath({
-            stateDir: NodePath.join(baseDir, "userdata"),
-            provider: "kilo",
-          }),
-          provider: {
-            provider: "kilo",
-            status: "ready",
-            available: true,
-            authStatus: "authenticated",
-            checkedAt: "2026-07-20T12:00:00.000Z",
-            message: "Kilo CLI is installed and authenticated.",
-            version: "7.4.10",
-          },
-        });
-        let updateSpawnCount = 0;
-        const activeSession = {
-          provider: "kilo" as const,
-          status: "running" as const,
-          runtimeMode: "full-access" as const,
-          threadId: "00000000-0000-4000-8000-000000000001" as never,
-          activeTurnId: "00000000-0000-4000-8000-000000000002" as never,
-          createdAt: "2026-07-20T12:00:00.000Z",
-          updatedAt: "2026-07-20T12:00:00.000Z",
-        };
-        const activeProviderServiceLayer = Layer.succeed(
-          ProviderService,
-          {
-            listSessions: () => Effect.succeed([activeSession]),
-            stopRuntimeSession: () => Effect.void,
-            hasLiveRuntimeTasks: () => Effect.succeed(false),
-          } as unknown as ProviderServiceShape,
-        );
-        const layer = ProviderHealthLive.pipe(
-          Layer.provideMerge(activeProviderServiceLayer),
-          Layer.provideMerge(ServerSettingsService.layerTest(settings)),
-          Layer.provideMerge(ServerConfig.layerTest(process.cwd(), baseDir)),
-          Layer.provideMerge(
-            mockSpawnerLayer((args) => {
-              if (args.includes("install") && args.includes("@kilocode/cli@latest")) {
-                updateSpawnCount += 1;
-              }
-              return { stdout: "kilo 7.4.10", stderr: "", code: 0 };
-            }),
-          ),
-        );
-
-        const result = yield* Effect.gen(function* () {
-          const providerHealth = yield* ProviderHealth;
-          return yield* providerHealth.updateProvider({ provider: "kilo" });
-        }).pipe(Effect.provide(layer));
-        const kilo = result.providers.find((provider) => provider.provider === "kilo");
-
-        assert.strictEqual(updateSpawnCount, 0);
-        assert.strictEqual(kilo?.updateState?.status, "failed");
-        assert.match(kilo?.updateState?.message ?? "", /process ownership cannot be proven safely/u);
-      })),
-    );
-
-    it.effect("latches provider access when runtime shutdown cannot prove process-tree exit", () =>
-      withLatestNpmVersion("7.4.11", Effect.gen(function* () {
-        const fileSystem = yield* FileSystem.FileSystem;
-        const baseDir = yield* fileSystem.makeTempDirectoryScoped({
-          prefix: "provider-update-unproven-runtime-exit-",
-        });
-        const npmPrefix = NodePath.join(baseDir, "nvm");
-        const kiloBinaryPath = NodePath.join(
-          npmPrefix,
-          "lib",
-          "node_modules",
-          "@kilocode",
-          "cli",
-          "bin",
-          "kilo",
-        );
-        yield* writeLatestKiloPackageFixture({
-          fileSystem,
-          binaryPath: kiloBinaryPath,
-          version: "7.4.10",
-        });
-        const settings = {
-          ...allProvidersDisabledServerSettings,
-          providers: {
-            ...allProvidersDisabledServerSettings.providers,
-            kilo: {
-              ...DEFAULT_SERVER_SETTINGS.providers.kilo,
-              enabled: true,
-              binaryPath: kiloBinaryPath,
-            },
-          },
-        } satisfies typeof DEFAULT_SERVER_SETTINGS;
-        yield* writeProviderStatusCache({
-          filePath: resolveProviderStatusCachePath({
-            stateDir: NodePath.join(baseDir, "userdata"),
-            provider: "kilo",
-          }),
-          provider: {
-            provider: "kilo",
-            status: "ready",
-            available: true,
-            authStatus: "authenticated",
-            checkedAt: "2026-07-20T12:00:00.000Z",
-            message: "Kilo CLI is installed and authenticated.",
-            version: "7.4.10",
-          },
-        });
-        const unprovenExit = new ProviderProcessExitUnprovenError({
-          rootPid: 59_000,
-          rootExited: false,
-          remainingDescendantPids: [59_001],
-          captureComplete: true,
-        });
-        const runtimeShutdownError = new Error("Local Kilo server shutdown failed.", {
-          cause: unprovenExit,
-        });
-        const providerServiceLayer = Layer.succeed(
-          ProviderService,
-          {
-            prepareForMaintenance: () => Effect.fail(runtimeShutdownError),
-            listSessions: () => Effect.succeed([]),
-            stopRuntimeSession: () => Effect.void,
-            hasLiveRuntimeTasks: () => Effect.succeed(false),
-          } as unknown as ProviderServiceShape,
-        );
-        const maintenanceGate = yield* makeProviderMaintenanceGate;
-        let updateSpawnCount = 0;
-        const layer = makeProviderHealthLive({ maintenanceGate }).pipe(
-          Layer.provideMerge(providerServiceLayer),
-          Layer.provideMerge(ServerSettingsService.layerTest(settings)),
-          Layer.provideMerge(ServerConfig.layerTest(process.cwd(), baseDir)),
-          Layer.provideMerge(
-            mockSpawnerLayer((args) => {
-              if (args.includes("install") && args.includes("@kilocode/cli@latest")) {
-                updateSpawnCount += 1;
-              }
-              return { stdout: "kilo 7.4.10", stderr: "", code: 0 };
-            }),
-          ),
-        );
-
-        const result = yield* Effect.gen(function* () {
-          const providerHealth = yield* ProviderHealth;
-          return yield* providerHealth.updateProvider({ provider: "kilo" });
-        }).pipe(Effect.provide(layer));
-        const kilo = result.providers.find((provider) => provider.provider === "kilo");
-        const blocked = yield* maintenanceGate
-          .withOperation({
-            provider: "kilo",
-            operation: "session.start",
-            run: Effect.void,
-          })
-          .pipe(Effect.flip);
-
-        assert.strictEqual(updateSpawnCount, 0);
-        assert.strictEqual(kilo?.updateState?.status, "failed");
-        assert.match(kilo?.updateState?.message ?? "", /Restart Synara/u);
-        assert.strictEqual(blocked.operation, "session.start");
-        assert.match(blocked.message, /Restart Synara before retrying/u);
-        assert.match(blocked.latchedReason ?? "", /descendants still running: 59001/u);
-      })),
-    );
-
-    it.effect(
-      "keeps maintenance closed until interrupted updater teardown proves exit or latches failure",
-      () =>
-        withIsolatedProviderCommands(["npm"], (fixture) =>
-          withLatestNpmVersion("7.4.11", Effect.gen(function* () {
+        withLatestNpmVersion(
+          "7.4.11",
+          Effect.gen(function* () {
+            let killed = false;
+            const updaterSpawned = yield* Deferred.make<void>();
             const fileSystem = yield* FileSystem.FileSystem;
+            const path = yield* Path.Path;
             const baseDir = yield* fileSystem.makeTempDirectoryScoped({
-              prefix: "provider-update-interrupted-spawn-",
+              prefix: "provider-update-timeout-",
             });
-            const npmPrefix = NodePath.join(baseDir, "nvm");
-            const kiloBinaryPath = NodePath.join(
+            const npmPrefix = path.join(baseDir, "nvm");
+            const kiloBinaryPath = path.join(
               npmPrefix,
               "lib",
               "node_modules",
@@ -1867,11 +1560,11 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
             yield* writeLatestKiloPackageFixture({
               fileSystem,
               binaryPath: kiloBinaryPath,
-              version: "7.4.10",
+              version: "7.3.46",
             });
             yield* writeProviderStatusCache({
               filePath: resolveProviderStatusCachePath({
-                stateDir: NodePath.join(baseDir, "userdata"),
+                stateDir: path.join(baseDir, "userdata"),
                 provider: "kilo",
               }),
               provider: {
@@ -1879,9 +1572,9 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
                 status: "ready",
                 available: true,
                 authStatus: "authenticated",
-                checkedAt: "2026-07-20T12:00:00.000Z",
+                checkedAt: "2026-07-15T12:00:00.000Z",
                 message: "Kilo CLI is installed and authenticated.",
-                version: "7.4.10",
+                version: "7.3.46",
               },
             });
             const settings = {
@@ -1895,152 +1588,452 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
                 },
               },
             } satisfies typeof DEFAULT_SERVER_SETTINGS;
-
-            const rootPid = 73;
-            const root = {
-              pid: rootPid,
-              command: "npm install @kilocode/cli@latest",
-              identity: `${rootPid}:owned-updater-root`,
-            };
-            // The mock has created its child before publishing spawnSucceeded, then holds the
-            // acquisition result so interruption targets the spawn-to-finalizer handoff exactly.
-            const spawnSucceeded = yield* Deferred.make<void>();
-            const releaseSpawnResult = yield* Deferred.make<void>();
-            const teardownStarted = yield* Deferred.make<void>();
-            const teardownProof =
-              yield* Deferred.make<void, ProviderProcessExitUnprovenError>();
-            const maintenanceGate = yield* makeProviderMaintenanceGate;
-            let captureCount = 0;
-            let teardownRootPid: number | undefined;
-            let teardownCapturedRootIdentity: string | undefined;
-            let concurrentOperationEntered = false;
-
-            const processTreeKiller: ProcessTreeKiller = {
-              capture: () => {
-                captureCount += 1;
-                return { root, descendants: [], captureComplete: true };
-              },
-              inspect: () => ({ verified: true, survivors: [] }),
-              signal: () => {},
-            };
-            const updaterHandle = ChildProcessSpawner.makeHandle({
-              pid: ChildProcessSpawner.ProcessId(rootPid),
-              exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(0)),
-              isRunning: Effect.succeed(false),
-              kill: () => Effect.void,
-              stdin: Sink.drain,
-              stdout: Stream.never,
-              stderr: Stream.never,
-              all: Stream.never,
-              getInputFd: () => Sink.drain,
-              getOutputFd: () => Stream.never,
-            });
-            const spawnerLayer = Layer.succeed(
-              ChildProcessSpawner.ChildProcessSpawner,
-              ChildProcessSpawner.make((command) => {
-                const cmd = command as unknown as {
-                  command: string;
-                  args: ReadonlyArray<string>;
-                  options?: {
-                    env?: NodeJS.ProcessEnv;
-                    windowsVerbatimArguments?: boolean;
-                  };
-                };
-                const isUpdater = preparedProviderCommandMatches({
-                  fixture,
-                  executable: fixtureExecutablePath(fixture, "npm"),
-                  expectedArgs: [
-                    "install",
-                    "-g",
-                    "--prefix",
-                    npmPrefix,
-                    "@kilocode/cli@latest",
-                  ],
-                  command: cmd.command,
-                  actualArgs: cmd.args,
-                  env: cmd.options?.env,
-                  options: cmd.options,
-                });
-                return isUpdater
-                  ? Deferred.succeed(spawnSucceeded, undefined).pipe(
-                      Effect.andThen(Deferred.await(releaseSpawnResult)),
-                      Effect.as(updaterHandle),
-                    )
-                  : Effect.succeed(mockHandle({ stdout: "", stderr: "", code: 0 }));
-              }),
-            );
             const layer = makeProviderHealthLive({
-              maintenanceGate,
-              processTreeKiller,
-              teardownProcessTree: (input) => {
-                teardownRootPid = input.rootPid;
-                teardownCapturedRootIdentity = input.capturedTree?.root?.identity;
-                return Effect.runPromise(
-                  Deferred.succeed(teardownStarted, undefined).pipe(
-                    Effect.andThen(Deferred.await(teardownProof)),
-                    Effect.as({ escalated: false, signalErrors: [] }),
-                  ),
-                );
+              providerUpdateTimeoutMs: 2_000,
+              processTreeKiller: syntheticProcessTreeKiller(2),
+              teardownProcessTree: () => {
+                killed = true;
+                return Promise.resolve({ escalated: false, signalErrors: [] });
               },
             }).pipe(
               Layer.provideMerge(providerServiceWithoutRuntimesLayer),
               Layer.provideMerge(ServerSettingsService.layerTest(settings)),
               Layer.provideMerge(ServerConfig.layerTest(process.cwd(), baseDir)),
-              Layer.provideMerge(spawnerLayer),
+              Layer.provideMerge(
+                hangingSpawnerLayer({
+                  onKill: () => (killed = true),
+                  onSpawn: Deferred.succeed(updaterSpawned, undefined),
+                  shouldHang: (args, command, env, options) =>
+                    preparedProviderCommandMatches({
+                      fixture,
+                      executable: fixtureExecutablePath(fixture, "npm"),
+                      expectedArgs: [
+                        "install",
+                        "-g",
+                        "--prefix",
+                        npmPrefix,
+                        "@kilocode/cli@latest",
+                      ],
+                      command,
+                      actualArgs: args,
+                      env,
+                      options,
+                    }),
+                }),
+              ),
             );
 
-            yield* Effect.gen(function* () {
+            const result = yield* Effect.gen(function* () {
               const providerHealth = yield* ProviderHealth;
               const update = yield* providerHealth
                 .updateProvider({ provider: "kilo" })
                 .pipe(Effect.forkChild);
-              yield* Deferred.await(spawnSucceeded);
+              yield* Deferred.await(updaterSpawned);
+              yield* TestClock.adjust(2_000);
+              return yield* Fiber.join(update);
+            }).pipe(Effect.provide(layer));
+            const kilo = result.providers.find((provider) => provider.provider === "kilo");
 
-              const interrupting = yield* Fiber.interrupt(update).pipe(Effect.forkChild);
-              yield* Deferred.succeed(releaseSpawnResult, undefined);
-              const boundaryOutcome = yield* Effect.race(
-                Deferred.await(teardownStarted).pipe(Effect.as("teardown-started" as const)),
-                Fiber.await(interrupting).pipe(Effect.as("interrupt-completed" as const)),
+            assert.strictEqual(killed, true, kilo?.updateState?.message ?? "missing update state");
+            assert.strictEqual(kilo?.updateState?.status, "failed");
+            assert.strictEqual(
+              kilo?.updateState?.message,
+              "Update job timed out after 2 seconds. It was canceled, and any spawned updater process tree was stopped before provider access resumed.",
+            );
+          }),
+        ),
+      ),
+    );
+
+    it.effect("refuses an update without spawning the updater when provider work is active", () =>
+      withLatestNpmVersion(
+        "7.4.11",
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystem.FileSystem;
+          const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+            prefix: "provider-update-active-runtime-",
+          });
+          const npmPrefix = NodePath.join(baseDir, "nvm");
+          const kiloBinaryPath = NodePath.join(
+            npmPrefix,
+            "lib",
+            "node_modules",
+            "@kilocode",
+            "cli",
+            "bin",
+            "kilo",
+          );
+          yield* writeLatestKiloPackageFixture({
+            fileSystem,
+            binaryPath: kiloBinaryPath,
+            version: "7.4.10",
+          });
+          const settings = {
+            ...allProvidersDisabledServerSettings,
+            providers: {
+              ...allProvidersDisabledServerSettings.providers,
+              kilo: {
+                ...DEFAULT_SERVER_SETTINGS.providers.kilo,
+                enabled: true,
+                binaryPath: kiloBinaryPath,
+              },
+            },
+          } satisfies typeof DEFAULT_SERVER_SETTINGS;
+          yield* writeProviderStatusCache({
+            filePath: resolveProviderStatusCachePath({
+              stateDir: NodePath.join(baseDir, "userdata"),
+              provider: "kilo",
+            }),
+            provider: {
+              provider: "kilo",
+              status: "ready",
+              available: true,
+              authStatus: "authenticated",
+              checkedAt: "2026-07-20T12:00:00.000Z",
+              message: "Kilo CLI is installed and authenticated.",
+              version: "7.4.10",
+            },
+          });
+          let updateSpawnCount = 0;
+          const activeSession = {
+            provider: "kilo" as const,
+            status: "running" as const,
+            runtimeMode: "full-access" as const,
+            threadId: "00000000-0000-4000-8000-000000000001" as never,
+            activeTurnId: "00000000-0000-4000-8000-000000000002" as never,
+            createdAt: "2026-07-20T12:00:00.000Z",
+            updatedAt: "2026-07-20T12:00:00.000Z",
+          };
+          const activeProviderServiceLayer = Layer.succeed(ProviderService, {
+            listSessions: () => Effect.succeed([activeSession]),
+            stopRuntimeSession: () => Effect.void,
+            hasLiveRuntimeTasks: () => Effect.succeed(false),
+          } as unknown as ProviderServiceShape);
+          const layer = ProviderHealthLive.pipe(
+            Layer.provideMerge(activeProviderServiceLayer),
+            Layer.provideMerge(ServerSettingsService.layerTest(settings)),
+            Layer.provideMerge(ServerConfig.layerTest(process.cwd(), baseDir)),
+            Layer.provideMerge(
+              mockSpawnerLayer((args) => {
+                if (args.includes("install") && args.includes("@kilocode/cli@latest")) {
+                  updateSpawnCount += 1;
+                }
+                return { stdout: "kilo 7.4.10", stderr: "", code: 0 };
+              }),
+            ),
+          );
+
+          const result = yield* Effect.gen(function* () {
+            const providerHealth = yield* ProviderHealth;
+            return yield* providerHealth.updateProvider({ provider: "kilo" });
+          }).pipe(Effect.provide(layer));
+          const kilo = result.providers.find((provider) => provider.provider === "kilo");
+
+          assert.strictEqual(updateSpawnCount, 0);
+          assert.strictEqual(kilo?.updateState?.status, "failed");
+          assert.match(
+            kilo?.updateState?.message ?? "",
+            /process ownership cannot be proven safely/u,
+          );
+        }),
+      ),
+    );
+
+    it.effect("latches provider access when runtime shutdown cannot prove process-tree exit", () =>
+      withLatestNpmVersion(
+        "7.4.11",
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystem.FileSystem;
+          const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+            prefix: "provider-update-unproven-runtime-exit-",
+          });
+          const npmPrefix = NodePath.join(baseDir, "nvm");
+          const kiloBinaryPath = NodePath.join(
+            npmPrefix,
+            "lib",
+            "node_modules",
+            "@kilocode",
+            "cli",
+            "bin",
+            "kilo",
+          );
+          yield* writeLatestKiloPackageFixture({
+            fileSystem,
+            binaryPath: kiloBinaryPath,
+            version: "7.4.10",
+          });
+          const settings = {
+            ...allProvidersDisabledServerSettings,
+            providers: {
+              ...allProvidersDisabledServerSettings.providers,
+              kilo: {
+                ...DEFAULT_SERVER_SETTINGS.providers.kilo,
+                enabled: true,
+                binaryPath: kiloBinaryPath,
+              },
+            },
+          } satisfies typeof DEFAULT_SERVER_SETTINGS;
+          yield* writeProviderStatusCache({
+            filePath: resolveProviderStatusCachePath({
+              stateDir: NodePath.join(baseDir, "userdata"),
+              provider: "kilo",
+            }),
+            provider: {
+              provider: "kilo",
+              status: "ready",
+              available: true,
+              authStatus: "authenticated",
+              checkedAt: "2026-07-20T12:00:00.000Z",
+              message: "Kilo CLI is installed and authenticated.",
+              version: "7.4.10",
+            },
+          });
+          const unprovenExit = new ProviderProcessExitUnprovenError({
+            rootPid: 59_000,
+            rootExited: false,
+            remainingDescendantPids: [59_001],
+            captureComplete: true,
+          });
+          const runtimeShutdownError = new Error("Local Kilo server shutdown failed.", {
+            cause: unprovenExit,
+          });
+          const providerServiceLayer = Layer.succeed(ProviderService, {
+            prepareForMaintenance: () => Effect.fail(runtimeShutdownError),
+            listSessions: () => Effect.succeed([]),
+            stopRuntimeSession: () => Effect.void,
+            hasLiveRuntimeTasks: () => Effect.succeed(false),
+          } as unknown as ProviderServiceShape);
+          const maintenanceGate = yield* makeProviderMaintenanceGate;
+          let updateSpawnCount = 0;
+          const layer = makeProviderHealthLive({ maintenanceGate }).pipe(
+            Layer.provideMerge(providerServiceLayer),
+            Layer.provideMerge(ServerSettingsService.layerTest(settings)),
+            Layer.provideMerge(ServerConfig.layerTest(process.cwd(), baseDir)),
+            Layer.provideMerge(
+              mockSpawnerLayer((args) => {
+                if (args.includes("install") && args.includes("@kilocode/cli@latest")) {
+                  updateSpawnCount += 1;
+                }
+                return { stdout: "kilo 7.4.10", stderr: "", code: 0 };
+              }),
+            ),
+          );
+
+          const result = yield* Effect.gen(function* () {
+            const providerHealth = yield* ProviderHealth;
+            return yield* providerHealth.updateProvider({ provider: "kilo" });
+          }).pipe(Effect.provide(layer));
+          const kilo = result.providers.find((provider) => provider.provider === "kilo");
+          const blocked = yield* maintenanceGate
+            .withOperation({
+              provider: "kilo",
+              operation: "session.start",
+              run: Effect.void,
+            })
+            .pipe(Effect.flip);
+
+          assert.strictEqual(updateSpawnCount, 0);
+          assert.strictEqual(kilo?.updateState?.status, "failed");
+          assert.match(kilo?.updateState?.message ?? "", /Restart Synara/u);
+          assert.strictEqual(blocked.operation, "session.start");
+          assert.match(blocked.message, /Restart Synara before retrying/u);
+          assert.match(blocked.latchedReason ?? "", /descendants still running: 59001/u);
+        }),
+      ),
+    );
+
+    it.effect(
+      "keeps maintenance closed until interrupted updater teardown proves exit or latches failure",
+      () =>
+        withIsolatedProviderCommands(["npm"], (fixture) =>
+          withLatestNpmVersion(
+            "7.4.11",
+            Effect.gen(function* () {
+              const fileSystem = yield* FileSystem.FileSystem;
+              const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+                prefix: "provider-update-interrupted-spawn-",
+              });
+              const npmPrefix = NodePath.join(baseDir, "nvm");
+              const kiloBinaryPath = NodePath.join(
+                npmPrefix,
+                "lib",
+                "node_modules",
+                "@kilocode",
+                "cli",
+                "bin",
+                "kilo",
+              );
+              yield* writeLatestKiloPackageFixture({
+                fileSystem,
+                binaryPath: kiloBinaryPath,
+                version: "7.4.10",
+              });
+              yield* writeProviderStatusCache({
+                filePath: resolveProviderStatusCachePath({
+                  stateDir: NodePath.join(baseDir, "userdata"),
+                  provider: "kilo",
+                }),
+                provider: {
+                  provider: "kilo",
+                  status: "ready",
+                  available: true,
+                  authStatus: "authenticated",
+                  checkedAt: "2026-07-20T12:00:00.000Z",
+                  message: "Kilo CLI is installed and authenticated.",
+                  version: "7.4.10",
+                },
+              });
+              const settings = {
+                ...allProvidersDisabledServerSettings,
+                providers: {
+                  ...allProvidersDisabledServerSettings.providers,
+                  kilo: {
+                    ...DEFAULT_SERVER_SETTINGS.providers.kilo,
+                    enabled: true,
+                    binaryPath: kiloBinaryPath,
+                  },
+                },
+              } satisfies typeof DEFAULT_SERVER_SETTINGS;
+
+              const rootPid = 73;
+              const root = {
+                pid: rootPid,
+                command: "npm install @kilocode/cli@latest",
+                identity: `${rootPid}:owned-updater-root`,
+              };
+              // The mock has created its child before publishing spawnSucceeded, then holds the
+              // acquisition result so interruption targets the spawn-to-finalizer handoff exactly.
+              const spawnSucceeded = yield* Deferred.make<void>();
+              const releaseSpawnResult = yield* Deferred.make<void>();
+              const teardownStarted = yield* Deferred.make<void>();
+              const teardownProof = yield* Deferred.make<void, ProviderProcessExitUnprovenError>();
+              const maintenanceGate = yield* makeProviderMaintenanceGate;
+              let captureCount = 0;
+              let teardownRootPid: number | undefined;
+              let teardownCapturedRootIdentity: string | undefined;
+              let concurrentOperationEntered = false;
+
+              const processTreeKiller: ProcessTreeKiller = {
+                capture: () => {
+                  captureCount += 1;
+                  return { root, descendants: [], captureComplete: true };
+                },
+                inspect: () => ({ verified: true, survivors: [] }),
+                signal: () => {},
+              };
+              const updaterHandle = ChildProcessSpawner.makeHandle({
+                pid: ChildProcessSpawner.ProcessId(rootPid),
+                exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(0)),
+                isRunning: Effect.succeed(false),
+                kill: () => Effect.void,
+                stdin: Sink.drain,
+                stdout: Stream.never,
+                stderr: Stream.never,
+                all: Stream.never,
+                getInputFd: () => Sink.drain,
+                getOutputFd: () => Stream.never,
+              });
+              const spawnerLayer = Layer.succeed(
+                ChildProcessSpawner.ChildProcessSpawner,
+                ChildProcessSpawner.make((command) => {
+                  const cmd = command as unknown as {
+                    command: string;
+                    args: ReadonlyArray<string>;
+                    options?: {
+                      env?: NodeJS.ProcessEnv;
+                      windowsVerbatimArguments?: boolean;
+                    };
+                  };
+                  const isUpdater = preparedProviderCommandMatches({
+                    fixture,
+                    executable: fixtureExecutablePath(fixture, "npm"),
+                    expectedArgs: ["install", "-g", "--prefix", npmPrefix, "@kilocode/cli@latest"],
+                    command: cmd.command,
+                    actualArgs: cmd.args,
+                    env: cmd.options?.env,
+                    options: cmd.options,
+                  });
+                  return isUpdater
+                    ? Deferred.succeed(spawnSucceeded, undefined).pipe(
+                        Effect.andThen(Deferred.await(releaseSpawnResult)),
+                        Effect.as(updaterHandle),
+                      )
+                    : Effect.succeed(mockHandle({ stdout: "", stderr: "", code: 0 }));
+                }),
+              );
+              const layer = makeProviderHealthLive({
+                maintenanceGate,
+                processTreeKiller,
+                teardownProcessTree: (input) => {
+                  teardownRootPid = input.rootPid;
+                  teardownCapturedRootIdentity = input.capturedTree?.root?.identity;
+                  return Effect.runPromise(
+                    Deferred.succeed(teardownStarted, undefined).pipe(
+                      Effect.andThen(Deferred.await(teardownProof)),
+                      Effect.as({ escalated: false, signalErrors: [] }),
+                    ),
+                  );
+                },
+              }).pipe(
+                Layer.provideMerge(providerServiceWithoutRuntimesLayer),
+                Layer.provideMerge(ServerSettingsService.layerTest(settings)),
+                Layer.provideMerge(ServerConfig.layerTest(process.cwd(), baseDir)),
+                Layer.provideMerge(spawnerLayer),
               );
 
-              assert.strictEqual(boundaryOutcome, "teardown-started");
-              assert.ok(captureCount > 0);
-              assert.strictEqual(teardownRootPid, rootPid);
-              assert.strictEqual(teardownCapturedRootIdentity, root.identity);
+              yield* Effect.gen(function* () {
+                const providerHealth = yield* ProviderHealth;
+                const update = yield* providerHealth
+                  .updateProvider({ provider: "kilo" })
+                  .pipe(Effect.forkChild);
+                yield* Deferred.await(spawnSucceeded);
 
-              const duringTeardown = yield* maintenanceGate
-                .withOperation({
-                  provider: "kilo",
-                  operation: "session.start",
-                  run: Effect.sync(() => {
-                    concurrentOperationEntered = true;
-                  }),
-                })
-                .pipe(Effect.flip);
-              assert.strictEqual(concurrentOperationEntered, false);
-              assert.match(duringTeardown.message, /CLI is being updated/u);
+                const interrupting = yield* Fiber.interrupt(update).pipe(Effect.forkChild);
+                yield* Deferred.succeed(releaseSpawnResult, undefined);
+                const boundaryOutcome = yield* Effect.race(
+                  Deferred.await(teardownStarted).pipe(Effect.as("teardown-started" as const)),
+                  Fiber.await(interrupting).pipe(Effect.as("interrupt-completed" as const)),
+                );
 
-              const unprovenExit = new ProviderProcessExitUnprovenError({
-                rootPid,
-                rootExited: true,
-                remainingDescendantPids: [74],
-                captureComplete: true,
-              });
-              yield* Deferred.fail(teardownProof, unprovenExit);
-              yield* Fiber.join(interrupting);
+                assert.strictEqual(boundaryOutcome, "teardown-started");
+                assert.ok(captureCount > 0);
+                assert.strictEqual(teardownRootPid, rootPid);
+                assert.strictEqual(teardownCapturedRootIdentity, root.identity);
 
-              const latched = yield* maintenanceGate
-                .withOperation({
-                  provider: "kilo",
-                  operation: "session.start",
-                  run: Effect.void,
-                })
-                .pipe(Effect.flip);
-              assert.strictEqual(latched.operation, "session.start");
-              assert.match(latched.message, /Restart Synara before retrying/u);
-              assert.match(latched.latchedReason ?? "", /descendants still running: 74/u);
-            }).pipe(Effect.provide(layer));
-          })),
+                const duringTeardown = yield* maintenanceGate
+                  .withOperation({
+                    provider: "kilo",
+                    operation: "session.start",
+                    run: Effect.sync(() => {
+                      concurrentOperationEntered = true;
+                    }),
+                  })
+                  .pipe(Effect.flip);
+                assert.strictEqual(concurrentOperationEntered, false);
+                assert.match(duringTeardown.message, /CLI is being updated/u);
+
+                const unprovenExit = new ProviderProcessExitUnprovenError({
+                  rootPid,
+                  rootExited: true,
+                  remainingDescendantPids: [74],
+                  captureComplete: true,
+                });
+                yield* Deferred.fail(teardownProof, unprovenExit);
+                yield* Fiber.join(interrupting);
+
+                const latched = yield* maintenanceGate
+                  .withOperation({
+                    provider: "kilo",
+                    operation: "session.start",
+                    run: Effect.void,
+                  })
+                  .pipe(Effect.flip);
+                assert.strictEqual(latched.operation, "session.start");
+                assert.match(latched.message, /Restart Synara before retrying/u);
+                assert.match(latched.latchedReason ?? "", /descendants still running: 74/u);
+              }).pipe(Effect.provide(layer));
+            }),
+          ),
         ),
     );
   });

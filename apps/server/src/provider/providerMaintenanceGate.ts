@@ -1,9 +1,7 @@
 import type { ProviderKind } from "@synara/contracts";
 import { Cause, Data, Deferred, Effect, Ref } from "effect";
 
-export class ProviderMaintenanceBusyError extends Data.TaggedError(
-  "ProviderMaintenanceBusyError",
-)<{
+export class ProviderMaintenanceBusyError extends Data.TaggedError("ProviderMaintenanceBusyError")<{
   readonly provider: ProviderKind;
   readonly operation: string;
   readonly latchedReason: string | null;
@@ -103,11 +101,7 @@ export const makeProviderMaintenanceGate = Effect.gen(function* () {
 
       const activeOperations = current.activeOperations - 1;
       const next = new Map(states);
-      if (
-        activeOperations === 0 &&
-        current.drain === null &&
-        current.latchedReason === null
-      ) {
+      if (activeOperations === 0 && current.drain === null && current.latchedReason === null) {
         next.delete(provider);
       } else {
         next.set(provider, { ...current, activeOperations });
@@ -143,10 +137,7 @@ export const makeProviderMaintenanceGate = Effect.gen(function* () {
       const activeOperations = current?.activeOperations ?? 0;
       const next = new Map(states);
       next.set(provider, { activeOperations, drain, latchedReason: null });
-      return [
-        { acquired: true as const, activeOperations, latchedReason: null },
-        next,
-      ] as const;
+      return [{ acquired: true as const, activeOperations, latchedReason: null }, next] as const;
     });
 
   const releaseMaintenance = (provider: ProviderKind, drain: Deferred.Deferred<void>) =>

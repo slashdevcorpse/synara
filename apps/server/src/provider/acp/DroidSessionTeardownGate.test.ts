@@ -3,10 +3,7 @@ import { Cause, Effect, Exit, Fiber } from "effect";
 import { describe, expect, it } from "vitest";
 
 import { makeDroidSessionTeardownGate } from "./DroidSessionTeardownGate.ts";
-import {
-  makeAcpSessionTeardownState,
-  runAcpSessionTeardown,
-} from "./AcpSessionTeardown.ts";
+import { makeAcpSessionTeardownState, runAcpSessionTeardown } from "./AcpSessionTeardown.ts";
 
 describe("DroidSessionTeardownGate", () => {
   it("blocks replacement work until the tracked teardown completes", async () => {

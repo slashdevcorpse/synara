@@ -48,9 +48,7 @@ function makeAcpAgentWrapper(dir: string, env: Record<string, string>): string {
   writeFileSync(
     agentPath,
     process.platform === "win32"
-      ? ["@echo off", `"${bunExecutableForCmd}" "%~dp0agent-launcher.ts" %*`, ""].join(
-          "\r\n",
-        )
+      ? ["@echo off", `"${bunExecutableForCmd}" "%~dp0agent-launcher.ts" %*`, ""].join("\r\n")
       : [
           "#!/bin/sh",
           `exec ${shellSingleQuote(process.execPath)} ${shellSingleQuote(launcherPath)} "$@"`,

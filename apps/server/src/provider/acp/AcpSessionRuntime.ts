@@ -1001,9 +1001,7 @@ const makeAcpSessionRuntime = (
                 ...(options.teardownProcessTree
                   ? { teardownProcessTree: options.teardownProcessTree }
                   : {}),
-                ...(process.platform === "win32"
-                  ? {}
-                  : { ownedProcessGroupId: Number(child.pid) }),
+                ...(process.platform === "win32" ? {} : { ownedProcessGroupId: Number(child.pid) }),
               }),
         );
         return { child, processOwnership };

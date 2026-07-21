@@ -116,8 +116,7 @@ interface OwnedOpenCodeTextGenerationServerResource {
   closed: boolean;
 }
 
-interface ReadyOpenCodeTextGenerationServerResource
-  extends OwnedOpenCodeTextGenerationServerResource {
+interface ReadyOpenCodeTextGenerationServerResource extends OwnedOpenCodeTextGenerationServerResource {
   server: OpenCodeServerProcess;
 }
 
@@ -179,8 +178,7 @@ const makeOpenCodeCompatibleTextGeneration = (config: OpenCodeCompatibleTextGene
     const serverConfig = yield* ServerConfig;
     const openCodeRuntime = yield* OpenCodeRuntime;
     const maintenanceOwnedResources =
-      config.maintenanceOwnedResources ??
-      (yield* makeProviderMaintenanceOwnedResourceCoordinator);
+      config.maintenanceOwnedResources ?? (yield* makeProviderMaintenanceOwnedResourceCoordinator);
     const idleFiberScope = yield* Effect.acquireRelease(Scope.make(), (scope) =>
       Scope.close(scope, Exit.void),
     );
@@ -320,29 +318,29 @@ const makeOpenCodeCompatibleTextGeneration = (config: OpenCodeCompatibleTextGene
         { cause },
       );
 
-    const watchReadyServerExit = Effect.fn("watchReadyOpenCodeTextGenerationServerExit")(
-      function* (resource: ReadyOpenCodeTextGenerationServerResource) {
-        yield* resource.server.exitCode.pipe(
-          Effect.flatMap(() =>
-            sharedServerMutex.withPermit(
-              Effect.gen(function* () {
-                if (resource.closed) {
-                  return;
-                }
-                if (sharedServerState.resource === resource) {
-                  yield* cancelIdleCloseFiber();
-                }
-                // A root exit does not prove descendants are gone. Keep the mutex until the exact
-                // owner proves process-tree exit and the shared cache is cleared or retained for retry.
-                yield* closeOwnedServerResource(resource);
-              }),
-            ),
+    const watchReadyServerExit = Effect.fn("watchReadyOpenCodeTextGenerationServerExit")(function* (
+      resource: ReadyOpenCodeTextGenerationServerResource,
+    ) {
+      yield* resource.server.exitCode.pipe(
+        Effect.flatMap(() =>
+          sharedServerMutex.withPermit(
+            Effect.gen(function* () {
+              if (resource.closed) {
+                return;
+              }
+              if (sharedServerState.resource === resource) {
+                yield* cancelIdleCloseFiber();
+              }
+              // A root exit does not prove descendants are gone. Keep the mutex until the exact
+              // owner proves process-tree exit and the shared cache is cleared or retained for retry.
+              yield* closeOwnedServerResource(resource);
+            }),
           ),
-          Effect.catch(reportBackgroundCloseFailure),
-          Effect.forkIn(idleFiberScope),
-        );
-      },
-    );
+        ),
+        Effect.catch(reportBackgroundCloseFailure),
+        Effect.forkIn(idleFiberScope),
+      );
+    });
 
     const scheduleIdleClose = Effect.fn("scheduleIdleClose")(function* (
       resource: OwnedOpenCodeTextGenerationServerResource,
@@ -352,10 +350,7 @@ const makeOpenCodeCompatibleTextGeneration = (config: OpenCodeCompatibleTextGene
         Effect.andThen(
           sharedServerMutex.withPermit(
             Effect.gen(function* () {
-              if (
-                sharedServerState.resource !== resource ||
-                sharedServerState.activeRequests > 0
-              ) {
+              if (sharedServerState.resource !== resource || sharedServerState.activeRequests > 0) {
                 return;
               }
               sharedServerState.idleCloseFiber = null;
@@ -384,9 +379,8 @@ const makeOpenCodeCompatibleTextGeneration = (config: OpenCodeCompatibleTextGene
             Effect.uninterruptibleMask((restore) =>
               Effect.gen(function* () {
                 const serverScope = yield* Scope.make();
-                const ownedResourceRef = yield* Ref.make<
-                  OwnedOpenCodeTextGenerationServerResource | null
-                >(null);
+                const ownedResourceRef =
+                  yield* Ref.make<OwnedOpenCodeTextGenerationServerResource | null>(null);
                 const startedExit = yield* Effect.exit(
                   restore(
                     openCodeRuntime
@@ -399,7 +393,9 @@ const makeOpenCodeCompatibleTextGeneration = (config: OpenCodeCompatibleTextGene
                             process,
                             serverScope,
                             operation: input.operation,
-                          }).pipe(Effect.flatMap((resource) => Ref.set(ownedResourceRef, resource))),
+                          }).pipe(
+                            Effect.flatMap((resource) => Ref.set(ownedResourceRef, resource)),
+                          ),
                       })
                       .pipe(
                         Effect.provideService(Scope.Scope, serverScope),
@@ -518,15 +514,17 @@ const makeOpenCodeCompatibleTextGeneration = (config: OpenCodeCompatibleTextGene
       );
 
     yield* Effect.addFinalizer(() =>
-      sharedServerMutex.withPermit(
-        Effect.gen(function* () {
-          yield* cancelIdleCloseFiber();
-          sharedServerState.activeRequests = 0;
-          for (const resource of Array.from(ownedServerResources)) {
-            yield* closeOwnedServerResource(resource);
-          }
-        }),
-      ).pipe(Effect.orDie),
+      sharedServerMutex
+        .withPermit(
+          Effect.gen(function* () {
+            yield* cancelIdleCloseFiber();
+            sharedServerState.activeRequests = 0;
+            for (const resource of Array.from(ownedServerResources)) {
+              yield* closeOwnedServerResource(resource);
+            }
+          }),
+        )
+        .pipe(Effect.orDie),
     );
 
     const runOpenCodeJson = Effect.fn("runOpenCodeJson")(function* <S extends Schema.Top>(input: {
