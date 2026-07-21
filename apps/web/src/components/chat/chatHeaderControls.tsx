@@ -191,6 +191,7 @@ export const DOCK_TAB_CLOSE_GLYPH_CLASS_NAME =
 export function SurfaceTabChip({
   icon,
   label,
+  selectLabel,
   active,
   title,
   leading,
@@ -203,6 +204,7 @@ export function SurfaceTabChip({
 }: {
   icon: ReactNode;
   label: ReactNode;
+  selectLabel?: string | undefined;
   active?: boolean | undefined;
   title?: string | undefined;
   leading?: ReactNode;
@@ -248,6 +250,7 @@ export function SurfaceTabChip({
           type="button"
           className={cn("flex min-w-0 items-center gap-1.5 text-left", labelClassName)}
           title={title}
+          aria-label={selectLabel}
           aria-pressed={active}
           onClick={(event) => {
             event.stopPropagation();

@@ -77,8 +77,55 @@ jobs:
       - name: Typecheck
         run: bun run typecheck
 
-      - name: Test
-        run: bun run test
+      - name: Test with coverage and JUnit
+        id: unit_tests
+        run: bun run test:ci
+
+      - name: Upload test results to Mergify CI Insights
+        id: mergify_ci
+        if: ${{ !cancelled() && (steps.unit_tests.outcome == 'success' || steps.unit_tests.outcome == 'failure') && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        uses: Mergifyio/gha-mergify-ci@8173bc3c1d337d3367454672d50cfdf6f0273396 # v23
+        with:
+          action: junit-process
+          token: ${{ secrets.MERGIFY_TOKEN }}
+          job_name: quality
+          report_path: >-
+            ./apps/desktop/test-report.junit.xml
+            ./apps/server/test-report.junit.xml
+            ./apps/web/test-report.junit.xml
+            ./packages/contracts/test-report.junit.xml
+            ./packages/shared/test-report.junit.xml
+            ./scripts/test-report.junit.xml
+          test_step_outcome: ${{ steps.unit_tests.outcome }}
+
+      - name: Verify Mergify test results upload
+        if: ${{ !cancelled() && (steps.unit_tests.outcome == 'success' || steps.unit_tests.outcome == 'failure') && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        env:
+          MERGIFY_UPLOAD_OUTCOME: ${{ steps.mergify_ci.outputs.test_results_upload }}
+        run: test "$MERGIFY_UPLOAD_OUTCOME" = "success"
+
+      - name: Upload coverage reports to Codecov
+        if: ${{ !cancelled() && (steps.unit_tests.outcome == 'success' || steps.unit_tests.outcome == 'failure') }}
+        uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5.5.5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./apps/desktop/coverage/lcov.info,./apps/server/coverage/lcov.info,./apps/web/coverage/lcov.info,./packages/contracts/coverage/lcov.info,./packages/shared/coverage/lcov.info,./scripts/coverage/lcov.info
+          disable_search: true
+          fail_ci_if_error: true
+          flags: unit
+          name: super-synara-unit-coverage
+
+      - name: Upload test results to Codecov
+        if: ${{ !cancelled() && (steps.unit_tests.outcome == 'success' || steps.unit_tests.outcome == 'failure') }}
+        uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5.5.5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./apps/desktop/test-report.junit.xml,./apps/server/test-report.junit.xml,./apps/web/test-report.junit.xml,./packages/contracts/test-report.junit.xml,./packages/shared/test-report.junit.xml,./scripts/test-report.junit.xml
+          disable_search: true
+          fail_ci_if_error: true
+          flags: unit
+          name: super-synara-unit-test-results
+          report_type: test_results
 
       - name: Install browser test runtime
         timeout-minutes: 15
@@ -128,6 +175,18 @@ jobs:
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
+
+      - name: Build Windows Job launcher (x64)
+        run: node apps/server/scripts/build-windows-job-launcher.mjs --arch x64
+
+      - name: Build Windows Job launcher (ARM64)
+        run: node apps/server/scripts/build-windows-job-launcher.mjs --arch arm64
+
+      - name: Run Windows Job containment regressions
+        run: >-
+          bun run --cwd apps/server test
+          src/provider/windowsProviderProcess.test.ts
+          src/provider/windowsProviderProcess.windows.test.ts
 
       - name: Verify Super Synara identity
         run: bun run brand:check

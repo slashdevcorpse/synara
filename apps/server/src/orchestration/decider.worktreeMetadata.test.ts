@@ -3,6 +3,7 @@ import {
   CommandId,
   DEFAULT_PROVIDER_INTERACTION_MODE,
   EventId,
+  MessageId,
   ProjectId,
   ThreadId,
 } from "@synara/contracts";
@@ -92,6 +93,36 @@ async function createWorktreeThreadReadModel(now: string) {
 }
 
 describe("decider worktree metadata", () => {
+  it("snapshots worktree environment mode onto turn requests", async () => {
+    const now = new Date().toISOString();
+    const readModel = await createWorktreeThreadReadModel(now);
+    const result = await Effect.runPromise(
+      decideOrchestrationCommand({
+        command: {
+          type: "thread.turn.start",
+          commandId: CommandId.makeUnsafe("cmd-turn-worktree-env"),
+          threadId: THREAD_ID,
+          message: {
+            messageId: MessageId.makeUnsafe("message-turn-worktree-env"),
+            role: "user",
+            text: "Inspect the worktree",
+            attachments: [],
+          },
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          createdAt: now,
+        },
+        readModel,
+      }),
+    );
+    const events = Array.isArray(result) ? result : [result];
+    const turnRequest = events.find((event) => event.type === "thread.turn-start-requested");
+    expect(turnRequest?.payload).toMatchObject({
+      envMode: "worktree",
+      modelSelection: { provider: "codex", model: "gpt-5-codex" },
+    });
+  });
+
   it("derives associated worktree metadata during thread.create when only branch and worktreePath are provided", async () => {
     const now = new Date().toISOString();
     const readModel = await createProjectReadModel(now);

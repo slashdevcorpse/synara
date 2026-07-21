@@ -17,20 +17,25 @@ import {
   MessageId,
   ProjectId,
   RuntimeItemId,
+  RuntimeRequestId,
   ThreadId,
   TurnId,
 } from "@synara/contracts";
 import { Effect, Exit, Layer, ManagedRuntime, PubSub, Scope, Stream } from "effect";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { OrchestrationEventStoreLive } from "../../persistence/Layers/OrchestrationEventStore.ts";
 import { OrchestrationCommandReceiptRepositoryLive } from "../../persistence/Layers/OrchestrationCommandReceipts.ts";
-import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite.ts";
+import {
+  makeSqlitePersistenceLive,
+  SqlitePersistenceMemory,
+} from "../../persistence/Layers/Sqlite.ts";
 import { ProviderRuntimeEventRepositoryLive } from "../../persistence/Layers/ProviderRuntimeEvents.ts";
 import {
   PROVIDER_RUNTIME_INGESTION_CONSUMER,
   ProviderRuntimeEventRepository,
 } from "../../persistence/Services/ProviderRuntimeEvents.ts";
+import { ProviderRequestAdmissionRepository } from "../../persistence/Services/ProviderRequestAdmissions.ts";
 import {
   ProviderService,
   type ProviderServiceShape,
@@ -75,6 +80,15 @@ function createProviderServiceHarness() {
   const runtimeSessions: ProviderSession[] = [];
 
   const unsupported = () => Effect.die(new Error("Unsupported provider call in test")) as never;
+  const respondToRequest = vi.fn<ProviderServiceShape["respondToRequest"]>(() => Effect.void);
+  const respondToUserInput = vi.fn<ProviderServiceShape["respondToUserInput"]>(() => Effect.void);
+  const stopSession = vi.fn<ProviderServiceShape["stopSession"]>(() => Effect.void);
+  const stopRuntimeSession = vi.fn<NonNullable<ProviderServiceShape["stopRuntimeSession"]>>(
+    () => Effect.void,
+  );
+  const hasLiveRuntimeTasks = vi.fn<NonNullable<ProviderServiceShape["hasLiveRuntimeTasks"]>>(() =>
+    Effect.succeed(false),
+  );
   const service: ProviderServiceShape = {
     startSession: () => unsupported(),
     sendTurn: () => unsupported(),
@@ -85,9 +99,11 @@ function createProviderServiceHarness() {
     stopTask: () => unsupported(),
     backgroundTask: () => unsupported(),
     steerSubagent: () => unsupported(),
-    respondToRequest: () => unsupported(),
-    respondToUserInput: () => unsupported(),
-    stopSession: () => unsupported(),
+    respondToRequest,
+    respondToUserInput,
+    stopSession,
+    stopRuntimeSession,
+    hasLiveRuntimeTasks,
     listSessions: () => Effect.succeed([...runtimeSessions]),
     getCapabilities: (provider) =>
       Effect.succeed({
@@ -148,6 +164,11 @@ function createProviderServiceHarness() {
     service,
     emit,
     setSession,
+    respondToRequest,
+    respondToUserInput,
+    stopSession,
+    stopRuntimeSession,
+    hasLiveRuntimeTasks,
   };
 }
 
@@ -180,6 +201,14 @@ type ProviderRuntimeTestProposedPlan = ProviderRuntimeTestThread["proposedPlans"
 type ProviderRuntimeTestActivity = ProviderRuntimeTestThread["activities"][number];
 type ProviderRuntimeTestCheckpoint = ProviderRuntimeTestThread["checkpoints"][number];
 
+async function waitForCondition(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error("Timed out waiting for condition");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
 async function waitForThreadActivities(
   engine: OrchestrationEngineShape,
   activityIds: readonly string[],
@@ -210,7 +239,10 @@ async function waitForThreadActivities(
 
 describe("ProviderRuntimeIngestion", () => {
   let runtime: ManagedRuntime.ManagedRuntime<
-    OrchestrationEngineService | ProviderRuntimeIngestionService | ProviderRuntimeEventRepository,
+    | OrchestrationEngineService
+    | ProviderRuntimeIngestionService
+    | ProviderRuntimeEventRepository
+    | ProviderRequestAdmissionRepository,
     unknown
   > | null = null;
   let scope: Scope.Closeable | null = null;
@@ -222,7 +254,7 @@ describe("ProviderRuntimeIngestion", () => {
     return dir;
   }
 
-  afterEach(async () => {
+  async function disposeHarnessRuntime(): Promise<void> {
     if (scope) {
       await Effect.runPromise(Scope.close(scope, Exit.void));
     }
@@ -231,14 +263,23 @@ describe("ProviderRuntimeIngestion", () => {
       await runtime.dispose();
     }
     runtime = null;
+  }
+
+  afterEach(async () => {
+    await disposeHarnessRuntime();
     for (const dir of tempDirs.splice(0)) {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  async function createHarness(options?: { readonly startIngestion?: boolean }) {
-    const workspaceRoot = makeTempDir("synara-provider-project-");
-    fs.mkdirSync(path.join(workspaceRoot, ".git"));
+  async function createHarness(options?: {
+    readonly startIngestion?: boolean;
+    readonly dbPath?: string;
+    readonly workspaceRoot?: string;
+    readonly createdAt?: string;
+  }) {
+    const workspaceRoot = options?.workspaceRoot ?? makeTempDir("synara-provider-project-");
+    fs.mkdirSync(path.join(workspaceRoot, ".git"), { recursive: true });
     const provider = createProviderServiceHarness();
     const orchestrationLayer = OrchestrationEngineLive.pipe(
       Layer.provide(OrchestrationProjectionPipelineLive),
@@ -246,13 +287,16 @@ describe("ProviderRuntimeIngestion", () => {
       Layer.provide(OrchestrationEventStoreLive),
       Layer.provide(OrchestrationCommandReceiptRepositoryLive),
     );
+    const persistenceLayer = options?.dbPath
+      ? makeSqlitePersistenceLive(options.dbPath).pipe(Layer.provide(NodeServices.layer))
+      : SqlitePersistenceMemory;
     const runtimeEventRepositoryLayer = ProviderRuntimeEventRepositoryLive.pipe(
-      Layer.provideMerge(SqlitePersistenceMemory),
+      Layer.provideMerge(persistenceLayer),
     );
     const layer = ProviderRuntimeIngestionLive.pipe(
       Layer.provideMerge(orchestrationLayer),
       Layer.provideMerge(OrchestrationProjectionSnapshotQueryLive),
-      Layer.provideMerge(SqlitePersistenceMemory),
+      Layer.provideMerge(persistenceLayer),
       Layer.provideMerge(runtimeEventRepositoryLayer),
       Layer.provideMerge(Layer.succeed(ProviderService, provider.service)),
       Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
@@ -263,6 +307,9 @@ describe("ProviderRuntimeIngestion", () => {
     const ingestion = await runtime.runPromise(Effect.service(ProviderRuntimeIngestionService));
     const runtimeEventRepository = await runtime.runPromise(
       Effect.service(ProviderRuntimeEventRepository),
+    );
+    const requestAdmissions = await runtime.runPromise(
+      Effect.service(ProviderRequestAdmissionRepository),
     );
     scope = await Effect.runPromise(Scope.make("sequential"));
     let ingestionStarted = false;
@@ -276,7 +323,7 @@ describe("ProviderRuntimeIngestion", () => {
     }
     const drain = () => Effect.runPromise(ingestion.drain);
 
-    const createdAt = new Date().toISOString();
+    const createdAt = options?.createdAt ?? new Date().toISOString();
     await Effect.runPromise(
       engine.dispatch({
         type: "project.create",
@@ -335,6 +382,52 @@ describe("ProviderRuntimeIngestion", () => {
       updatedAt: createdAt,
     });
 
+    const createAdditionalThread = async (threadIdValue: string) => {
+      const threadId = asThreadId(threadIdValue);
+      const timestamp = new Date().toISOString();
+      await Effect.runPromise(
+        engine.dispatch({
+          type: "thread.create",
+          commandId: CommandId.makeUnsafe(`cmd-${threadIdValue}-create`),
+          threadId,
+          projectId: asProjectId("project-1"),
+          title: threadIdValue,
+          modelSelection: { provider: "codex", model: "gpt-5-codex" },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "approval-required",
+          branch: null,
+          worktreePath: null,
+          createdAt: timestamp,
+        }),
+      );
+      await Effect.runPromise(
+        engine.dispatch({
+          type: "thread.session.set",
+          commandId: CommandId.makeUnsafe(`cmd-${threadIdValue}-session`),
+          threadId,
+          session: {
+            threadId,
+            status: "ready",
+            providerName: "codex",
+            runtimeMode: "approval-required",
+            activeTurnId: null,
+            updatedAt: timestamp,
+            lastError: null,
+          },
+          createdAt: timestamp,
+        }),
+      );
+      provider.setSession({
+        provider: "codex",
+        status: "ready",
+        runtimeMode: "approval-required",
+        threadId,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      });
+      return threadId;
+    };
+
     return {
       engine,
       emit: provider.emit,
@@ -342,6 +435,13 @@ describe("ProviderRuntimeIngestion", () => {
       drain,
       startIngestion,
       runtimeEventRepository,
+      requestAdmissions,
+      respondToRequest: provider.respondToRequest,
+      respondToUserInput: provider.respondToUserInput,
+      stopSession: provider.stopSession,
+      stopRuntimeSession: provider.stopRuntimeSession,
+      hasLiveRuntimeTasks: provider.hasLiveRuntimeTasks,
+      createAdditionalThread,
     };
   }
 
@@ -4683,6 +4783,453 @@ describe("ProviderRuntimeIngestion", () => {
     expect(resolvedPayload?.requestKind).toBe("command");
     expect(resolvedPayload?.requestType).toBe("command_execution_approval");
     expect(resolvedPayload?.lifecycleGeneration).toBe("approval-generation");
+  });
+
+  it("admits ten unresolved provider requests and declines the eleventh before visibility", async () => {
+    const harness = await createHarness();
+    const generation = "request-limit-generation";
+    for (let index = 1; index <= 10; index++) {
+      harness.emit({
+        type: "request.opened",
+        eventId: asEventId(`evt-request-limit-${index}`),
+        provider: "codex",
+        createdAt: new Date().toISOString(),
+        threadId: asThreadId("thread-1"),
+        lifecycleGeneration: generation,
+        requestId: ApprovalRequestId.makeUnsafe(`req-request-limit-${index}`),
+        payload: { requestType: "command_execution_approval", detail: `command ${index}` },
+      });
+    }
+
+    await waitForThread(
+      harness.engine,
+      (thread) =>
+        thread.activities.filter((activity) => activity.kind === "approval.requested").length ===
+        10,
+    );
+    harness.emit({
+      type: "request.opened",
+      eventId: asEventId("evt-request-limit-11"),
+      provider: "codex",
+      createdAt: new Date().toISOString(),
+      threadId: asThreadId("thread-1"),
+      lifecycleGeneration: generation,
+      requestId: ApprovalRequestId.makeUnsafe("req-request-limit-11"),
+      payload: { requestType: "command_execution_approval", detail: "command 11" },
+    });
+
+    await waitForCondition(() => harness.respondToRequest.mock.calls.length === 1);
+    expect(harness.respondToRequest.mock.calls[0]?.[0]).toEqual({
+      threadId: asThreadId("thread-1"),
+      requestId: ApprovalRequestId.makeUnsafe("req-request-limit-11"),
+      lifecycleGeneration: generation,
+      decision: "decline",
+    });
+    const readModel = await Effect.runPromise(harness.engine.getReadModel());
+    const activities = readModel.threads.find(
+      (thread) => thread.id === asThreadId("thread-1"),
+    )?.activities;
+    expect(activities?.some((activity) => activity.id === "evt-request-limit-11")).toBe(false);
+  });
+
+  it("aggregates unresolved request capacity across provider adapters", async () => {
+    const harness = await createHarness();
+    const providers = ["codex", "claudeAgent", "commandCode", "opencode", "kilo"] as const;
+    for (let index = 0; index < 10; index++) {
+      harness.emit({
+        type: "request.opened",
+        eventId: asEventId(`evt-cross-adapter-${index}`),
+        provider: providers[index % providers.length]!,
+        createdAt: new Date().toISOString(),
+        threadId: asThreadId("thread-1"),
+        lifecycleGeneration: "cross-adapter-generation",
+        requestId: ApprovalRequestId.makeUnsafe(`req-cross-adapter-${index}`),
+        payload: { requestType: "file_change_approval" },
+      });
+    }
+    await waitForThread(
+      harness.engine,
+      (thread) =>
+        thread.activities.filter((activity) => activity.kind === "approval.requested").length ===
+        10,
+    );
+
+    harness.emit({
+      type: "request.opened",
+      eventId: asEventId("evt-cross-adapter-overflow"),
+      provider: "antigravity",
+      createdAt: new Date().toISOString(),
+      threadId: asThreadId("thread-1"),
+      lifecycleGeneration: "cross-adapter-generation",
+      requestId: ApprovalRequestId.makeUnsafe("req-cross-adapter-overflow"),
+      payload: { requestType: "file_change_approval" },
+    });
+
+    await waitForCondition(() => harness.respondToRequest.mock.calls.length === 1);
+    expect(harness.respondToRequest.mock.calls[0]?.[0].requestId).toBe(
+      "req-cross-adapter-overflow",
+    );
+  });
+
+  it("suppresses duplicate request identities without consuming capacity twice", async () => {
+    const harness = await createHarness();
+    const emitDuplicate = (eventId: string) =>
+      harness.emit({
+        type: "request.opened",
+        eventId: asEventId(eventId),
+        provider: "codex",
+        createdAt: new Date().toISOString(),
+        threadId: asThreadId("thread-1"),
+        lifecycleGeneration: "duplicate-generation",
+        requestId: ApprovalRequestId.makeUnsafe("req-duplicate"),
+        payload: { requestType: "command_execution_approval" },
+      });
+    emitDuplicate("evt-duplicate-first");
+    await waitForThread(
+      harness.engine,
+      (thread) =>
+        thread.activities.filter((activity) => activity.kind === "approval.requested").length === 1,
+    );
+    emitDuplicate("evt-duplicate-second");
+    harness.emit({
+      type: "runtime.warning",
+      eventId: asEventId("evt-duplicate-fence"),
+      provider: "codex",
+      createdAt: new Date().toISOString(),
+      threadId: asThreadId("thread-1"),
+      payload: { message: "duplicate fence" },
+    });
+    const thread = await waitForThread(harness.engine, (entry) =>
+      entry.activities.some((activity) => activity.id === "evt-duplicate-fence"),
+    );
+    expect(
+      thread.activities.filter((activity) => activity.kind === "approval.requested"),
+    ).toHaveLength(1);
+    expect(harness.respondToRequest).not.toHaveBeenCalled();
+  });
+
+  it("frees request capacity only after the canonical resolution event", async () => {
+    const harness = await createHarness();
+    const generation = "resolution-capacity-generation";
+    for (let index = 0; index < 10; index++) {
+      harness.emit({
+        type: "request.opened",
+        eventId: asEventId(`evt-resolution-open-${index}`),
+        provider: "codex",
+        createdAt: new Date().toISOString(),
+        threadId: asThreadId("thread-1"),
+        lifecycleGeneration: generation,
+        requestId: ApprovalRequestId.makeUnsafe(`req-resolution-${index}`),
+        payload: { requestType: "command_execution_approval" },
+      });
+    }
+    await waitForThread(
+      harness.engine,
+      (thread) =>
+        thread.activities.filter((activity) => activity.kind === "approval.requested").length ===
+        10,
+    );
+    harness.emit({
+      type: "request.resolved",
+      eventId: asEventId("evt-resolution-resolved-0"),
+      provider: "codex",
+      createdAt: new Date().toISOString(),
+      threadId: asThreadId("thread-1"),
+      lifecycleGeneration: generation,
+      requestId: ApprovalRequestId.makeUnsafe("req-resolution-0"),
+      payload: { requestType: "command_execution_approval", decision: "accept" },
+    });
+    await waitForThread(harness.engine, (thread) =>
+      thread.activities.some((activity) => activity.id === "evt-resolution-resolved-0"),
+    );
+
+    harness.emit({
+      type: "request.opened",
+      eventId: asEventId("evt-resolution-replacement"),
+      provider: "codex",
+      createdAt: new Date().toISOString(),
+      threadId: asThreadId("thread-1"),
+      lifecycleGeneration: generation,
+      requestId: ApprovalRequestId.makeUnsafe("req-resolution-replacement"),
+      payload: { requestType: "command_execution_approval" },
+    });
+    await waitForThread(harness.engine, (thread) =>
+      thread.activities.some((activity) => activity.id === "evt-resolution-replacement"),
+    );
+    expect(harness.respondToRequest).not.toHaveBeenCalled();
+  });
+
+  it("preserves durable unresolved capacity across ingestion restart and reconnect", async () => {
+    const dbPath = path.join(makeTempDir("synara-provider-restart-"), "state.sqlite");
+    const workspaceRoot = makeTempDir("synara-provider-restart-project-");
+    const createdAt = "2026-07-20T16:00:00.000Z";
+    let harness = await createHarness({
+      startIngestion: false,
+      dbPath,
+      workspaceRoot,
+      createdAt,
+    });
+    const generation = "restart-generation";
+    for (let index = 0; index < 10; index++) {
+      const identity = {
+        threadId: asThreadId("thread-1"),
+        interactionKind: "approval" as const,
+        requestId: ApprovalRequestId.makeUnsafe(`req-restart-${index}`),
+        lifecycleGeneration: generation,
+      };
+      const eventId = asEventId(`evt-restart-${index}`);
+      expect(
+        await Effect.runPromise(
+          harness.requestAdmissions.admit({
+            ...identity,
+            providerSessionThreadId: asThreadId("thread-1"),
+            provider: "codex",
+            requestType: "command_execution_approval",
+            eventId,
+            createdAt: new Date().toISOString(),
+          }),
+        ),
+      ).toEqual({ _tag: "Accepted" });
+      await Effect.runPromise(
+        harness.requestAdmissions.markVisible({
+          ...identity,
+          eventId,
+          updatedAt: new Date().toISOString(),
+        }),
+      );
+    }
+
+    await disposeHarnessRuntime();
+    harness = await createHarness({
+      startIngestion: false,
+      dbPath,
+      workspaceRoot,
+      createdAt,
+    });
+    await harness.startIngestion();
+    await Effect.runPromise(
+      harness.runtimeEventRepository.append({
+        type: "request.opened",
+        eventId: asEventId("evt-restart-reconnected-overflow"),
+        provider: "codex",
+        createdAt: new Date().toISOString(),
+        threadId: asThreadId("thread-1"),
+        lifecycleGeneration: generation,
+        requestId: RuntimeRequestId.makeUnsafe("req-restart-reconnected-overflow"),
+        payload: { requestType: "command_execution_approval" },
+      }),
+    );
+    await harness.drain();
+    await waitForCondition(() => harness.respondToRequest.mock.calls.length === 1);
+    expect(harness.respondToRequest.mock.calls[0]?.[0].requestId).toBe(
+      "req-restart-reconnected-overflow",
+    );
+  });
+
+  it("stops the provider runtime when the deterministic overflow decline fails", async () => {
+    const harness = await createHarness();
+    for (let index = 0; index < 10; index++) {
+      harness.emit({
+        type: "request.opened",
+        eventId: asEventId(`evt-overflow-failure-open-${index}`),
+        provider: "codex",
+        createdAt: new Date().toISOString(),
+        threadId: asThreadId("thread-1"),
+        lifecycleGeneration: "overflow-failure-generation",
+        requestId: ApprovalRequestId.makeUnsafe(`req-overflow-failure-${index}`),
+        payload: { requestType: "command_execution_approval" },
+      });
+    }
+    await waitForThread(
+      harness.engine,
+      (thread) =>
+        thread.activities.filter((activity) => activity.kind === "approval.requested").length ===
+        10,
+    );
+    harness.respondToRequest.mockImplementationOnce(
+      () => Effect.fail(new Error("decline transport failed")) as never,
+    );
+    harness.emit({
+      type: "request.opened",
+      eventId: asEventId("evt-overflow-failure-11"),
+      provider: "codex",
+      createdAt: new Date().toISOString(),
+      threadId: asThreadId("thread-1"),
+      lifecycleGeneration: "overflow-failure-generation",
+      requestId: ApprovalRequestId.makeUnsafe("req-overflow-failure-11"),
+      payload: { requestType: "command_execution_approval" },
+    });
+
+    await waitForCondition(() => harness.stopRuntimeSession.mock.calls.length === 1);
+    expect(harness.stopRuntimeSession.mock.calls[0]?.[0]).toEqual({
+      threadId: asThreadId("thread-1"),
+    });
+    const readModel = await Effect.runPromise(harness.engine.getReadModel());
+    expect(
+      readModel.threads
+        .find((thread) => thread.id === asThreadId("thread-1"))
+        ?.activities.some((activity) => activity.id === "evt-overflow-failure-11"),
+    ).toBe(false);
+  });
+
+  it("retries overflow decline while preserving a runtime with live background tasks", async () => {
+    const harness = await createHarness();
+    harness.hasLiveRuntimeTasks.mockImplementation(() => Effect.succeed(true));
+    for (let index = 0; index < 10; index++) {
+      harness.emit({
+        type: "request.opened",
+        eventId: asEventId(`evt-overflow-live-task-open-${index}`),
+        provider: "claudeAgent",
+        createdAt: new Date().toISOString(),
+        threadId: asThreadId("thread-1"),
+        lifecycleGeneration: "overflow-live-task-generation",
+        requestId: ApprovalRequestId.makeUnsafe(`req-overflow-live-task-${index}`),
+        payload: { requestType: "command_execution_approval" },
+      });
+    }
+    await waitForThread(
+      harness.engine,
+      (thread) =>
+        thread.activities.filter((activity) => activity.kind === "approval.requested").length ===
+        10,
+    );
+    harness.respondToRequest.mockImplementationOnce(
+      () => Effect.fail(new Error("decline transport failed")) as never,
+    );
+    const overflowEvent = {
+      type: "request.opened" as const,
+      eventId: asEventId("evt-overflow-live-task-11"),
+      provider: "claudeAgent" as const,
+      createdAt: new Date().toISOString(),
+      threadId: asThreadId("thread-1"),
+      lifecycleGeneration: "overflow-live-task-generation",
+      requestId: ApprovalRequestId.makeUnsafe("req-overflow-live-task-11"),
+      payload: { requestType: "command_execution_approval" },
+    };
+    harness.emit(overflowEvent);
+    await waitForCondition(() => harness.respondToRequest.mock.calls.length === 1);
+    harness.emit({
+      type: "runtime.warning",
+      eventId: asEventId("evt-overflow-live-task-fence"),
+      provider: "claudeAgent",
+      createdAt: new Date().toISOString(),
+      threadId: asThreadId("thread-1"),
+      payload: { message: "overflow live task fence" },
+    });
+    await waitForThread(harness.engine, (thread) =>
+      thread.activities.some((activity) => activity.id === "evt-overflow-live-task-fence"),
+    );
+
+    expect(harness.hasLiveRuntimeTasks).toHaveBeenCalledWith({
+      threadId: asThreadId("thread-1"),
+    });
+    expect(harness.stopRuntimeSession).not.toHaveBeenCalled();
+    expect(harness.stopSession).not.toHaveBeenCalled();
+    expect(harness.respondToRequest).toHaveBeenCalledTimes(2);
+    expect(harness.respondToRequest.mock.calls.map(([request]) => request.requestId)).toEqual([
+      "req-overflow-live-task-11",
+      "req-overflow-live-task-11",
+    ]);
+    const readModel = await Effect.runPromise(harness.engine.getReadModel());
+    expect(
+      readModel.threads
+        .find((thread) => thread.id === asThreadId("thread-1"))
+        ?.activities.some((activity) => activity.id === "evt-overflow-live-task-11"),
+    ).toBe(false);
+  });
+
+  it("isolates unresolved request capacity per thread", async () => {
+    const harness = await createHarness();
+    const secondThreadId = await harness.createAdditionalThread("thread-2");
+    for (let index = 0; index < 10; index++) {
+      harness.emit({
+        type: "request.opened",
+        eventId: asEventId(`evt-thread-isolation-${index}`),
+        provider: "codex",
+        createdAt: new Date().toISOString(),
+        threadId: asThreadId("thread-1"),
+        lifecycleGeneration: "thread-isolation-generation-1",
+        requestId: ApprovalRequestId.makeUnsafe(`req-thread-isolation-${index}`),
+        payload: { requestType: "command_execution_approval" },
+      });
+    }
+    await waitForThread(
+      harness.engine,
+      (thread) =>
+        thread.activities.filter((activity) => activity.kind === "approval.requested").length ===
+        10,
+    );
+
+    harness.emit({
+      type: "request.opened",
+      eventId: asEventId("evt-thread-isolation-thread-2"),
+      provider: "codex",
+      createdAt: new Date().toISOString(),
+      threadId: secondThreadId,
+      lifecycleGeneration: "thread-isolation-generation-2",
+      requestId: ApprovalRequestId.makeUnsafe("req-thread-isolation-thread-2"),
+      payload: { requestType: "command_execution_approval" },
+    });
+    const secondThread = await waitForThread(
+      harness.engine,
+      (thread) =>
+        thread.activities.some((activity) => activity.id === "evt-thread-isolation-thread-2"),
+      2000,
+      secondThreadId,
+    );
+    expect(
+      secondThread.activities.filter((activity) => activity.kind === "approval.requested"),
+    ).toHaveLength(1);
+    expect(harness.respondToRequest).not.toHaveBeenCalled();
+  });
+
+  it("cancels unresolved requests only for the terminal provider generation", async () => {
+    const harness = await createHarness();
+    for (const generation of ["terminal-generation-a", "terminal-generation-b"] as const) {
+      harness.emit({
+        type: "request.opened",
+        eventId: asEventId(`evt-${generation}-open`),
+        provider: "codex",
+        createdAt: new Date().toISOString(),
+        threadId: asThreadId("thread-1"),
+        lifecycleGeneration: generation,
+        requestId: ApprovalRequestId.makeUnsafe(`req-${generation}`),
+        payload: { requestType: "command_execution_approval" },
+      });
+    }
+    await waitForThread(
+      harness.engine,
+      (thread) =>
+        thread.activities.filter((activity) => activity.kind === "approval.requested").length === 2,
+    );
+    harness.emit({
+      type: "session.exited",
+      eventId: asEventId("evt-terminal-generation-a-exit"),
+      provider: "codex",
+      createdAt: new Date().toISOString(),
+      threadId: asThreadId("thread-1"),
+      lifecycleGeneration: "terminal-generation-a",
+      payload: { exitKind: "graceful" },
+    });
+
+    const thread = await waitForThread(harness.engine, (entry) =>
+      entry.activities.some(
+        (activity) =>
+          activity.kind === "approval.resolved" &&
+          typeof activity.payload === "object" &&
+          activity.payload !== null &&
+          (activity.payload as Record<string, unknown>).requestId === "req-terminal-generation-a",
+      ),
+    );
+    expect(
+      thread.activities.some(
+        (activity) =>
+          activity.kind === "approval.resolved" &&
+          typeof activity.payload === "object" &&
+          activity.payload !== null &&
+          (activity.payload as Record<string, unknown>).requestId === "req-terminal-generation-b",
+      ),
+    ).toBe(false);
   });
 
   it("bounds large tool activity data while keeping command metadata", async () => {

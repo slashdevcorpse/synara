@@ -5,6 +5,7 @@ node_modules
 *.log
 *.tsbuildinfo
 apps/*/dist
+apps/server/native/windows-job-launcher/out/
 .astro
 packages/*/dist
 .env
@@ -26,6 +27,8 @@ apps/web/playwright-report
 output/playwright/
 apps/web/src/components/__screenshots__
 .vitest-*
+coverage/
+test-report.junit.xml
 __screenshots__/
 .tanstack
 /.pi/

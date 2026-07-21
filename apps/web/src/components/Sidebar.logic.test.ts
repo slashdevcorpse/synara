@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   archiveSelectedThreadEntries,
@@ -41,6 +41,10 @@ import {
   resolveSettingsBackTarget,
   resolveProjectStatusIndicator,
   resolveSidebarNewThreadEnvMode,
+  sidebarProjectActivityAccessibleLabel,
+  shouldAnnounceSidebarAgentActivity,
+  projectSidebarTransientTerminalActivity,
+  scheduleSidebarTransientTerminalDismiss,
   resolveThreadHoverCardWorkspaceLabel,
   resolveThreadRowClassName,
   resolveThreadStatusPill,
@@ -82,6 +86,168 @@ describe("buildMultiSelectThreadContextMenuItems", () => {
         archiveDisabled: false,
       })[1],
     ).toEqual({ id: "archive", label: "Archive (2)", disabled: false });
+  });
+});
+
+describe("sidebarProjectActivityAccessibleLabel", () => {
+  it("announces a dev-server-only project without adding visible copy", () => {
+    expect(
+      sidebarProjectActivityAccessibleLabel({
+        projectName: "Synara",
+        devServerRunning: true,
+        gitActionRunning: false,
+        collapsedStatusLabel: null,
+      }),
+    ).toBe("Dev server running for Synara");
+  });
+
+  it("combines collapsed thread, dev server, and Git status in a stable order", () => {
+    expect(
+      sidebarProjectActivityAccessibleLabel({
+        projectName: "Synara",
+        devServerRunning: true,
+        gitActionRunning: true,
+        collapsedStatusLabel: "Working",
+      }),
+    ).toBe(
+      "Project status: Working, Dev server running for Synara, Git operation running for Synara",
+    );
+  });
+});
+
+describe("sidebar transient terminal activity", () => {
+  afterEach(() => vi.useRealTimers());
+
+  it("observes live turns and projects completed, failed, and interrupted exactly once", () => {
+    const observed = new Map<string, string>();
+    const presented = new Map<string, string>();
+    const liveTurns = [
+      ["completed-thread", "completed-turn"],
+      ["failed-thread", "failed-turn"],
+      ["interrupted-thread", "interrupted-turn"],
+    ] as const;
+
+    expect(
+      projectSidebarTransientTerminalActivity({
+        activities: liveTurns.map(([threadId, turnKey], index) => ({
+          threadId,
+          phase: index === 0 ? "thinking" : index === 1 ? "streaming" : "tool-running",
+          turnKey,
+        })),
+        threads: liveTurns.map(([id, turnId]) => ({
+          id,
+          latestTurn: { turnId, state: "running", completedAt: null },
+        })),
+        observedLiveTurnByThreadId: observed,
+        presentedTerminalTurnByThreadId: presented,
+      }),
+    ).toEqual([]);
+
+    const terminalThreads = [
+      {
+        id: "completed-thread",
+        latestTurn: {
+          turnId: "completed-turn",
+          state: "completed" as const,
+          completedAt: "2026-07-21T12:00:01.000Z",
+        },
+      },
+      {
+        id: "failed-thread",
+        latestTurn: {
+          turnId: "failed-turn",
+          state: "error" as const,
+          completedAt: "2026-07-21T12:00:02.000Z",
+        },
+      },
+      {
+        id: "interrupted-thread",
+        latestTurn: {
+          turnId: "interrupted-turn",
+          state: "interrupted" as const,
+          completedAt: "2026-07-21T12:00:03.000Z",
+        },
+      },
+    ];
+    const terminalInput = {
+      activities: [],
+      threads: terminalThreads,
+      observedLiveTurnByThreadId: observed,
+      presentedTerminalTurnByThreadId: presented,
+    };
+
+    expect(projectSidebarTransientTerminalActivity(terminalInput)).toEqual([
+      {
+        threadId: "completed-thread",
+        phase: "completed",
+        turnKey: "completed-turn",
+        lastEventTimestamp: "2026-07-21T12:00:01.000Z",
+      },
+      {
+        threadId: "failed-thread",
+        phase: "failed",
+        turnKey: "failed-turn",
+        lastEventTimestamp: "2026-07-21T12:00:02.000Z",
+      },
+      {
+        threadId: "interrupted-thread",
+        phase: "interrupted",
+        turnKey: "interrupted-turn",
+        lastEventTimestamp: "2026-07-21T12:00:03.000Z",
+      },
+    ]);
+    expect(projectSidebarTransientTerminalActivity(terminalInput)).toEqual([]);
+  });
+
+  it("replaces stale turn keys and prunes deleted thread lifecycle state", () => {
+    const observed = new Map([
+      ["live-thread", "old-live-turn"],
+      ["deleted-thread", "deleted-turn"],
+    ]);
+    const presented = new Map([
+      ["live-thread", "old-terminal-turn"],
+      ["deleted-thread", "deleted-turn"],
+    ]);
+
+    expect(
+      projectSidebarTransientTerminalActivity({
+        activities: [
+          { threadId: "live-thread", phase: "thinking", turnKey: "new-live-turn" },
+          { threadId: "deleted-thread", phase: "thinking", turnKey: "deleted-new-turn" },
+        ],
+        threads: [
+          {
+            id: "live-thread",
+            latestTurn: { turnId: "new-live-turn", state: "running", completedAt: null },
+          },
+        ],
+        observedLiveTurnByThreadId: observed,
+        presentedTerminalTurnByThreadId: presented,
+      }),
+    ).toEqual([]);
+    expect(observed).toEqual(new Map([["live-thread", "new-live-turn"]]));
+    expect(presented).toEqual(new Map());
+  });
+
+  it("announces only phases represented by the activity glyph", () => {
+    expect(shouldAnnounceSidebarAgentActivity("thinking")).toBe(true);
+    expect(shouldAnnounceSidebarAgentActivity("completed")).toBe(true);
+    expect(shouldAnnounceSidebarAgentActivity("idle")).toBe(false);
+    expect(shouldAnnounceSidebarAgentActivity("stopped")).toBe(false);
+  });
+
+  it("dismisses a projected terminal phase after exactly three seconds", () => {
+    vi.useFakeTimers();
+    const dismiss = vi.fn();
+
+    scheduleSidebarTransientTerminalDismiss(
+      (callback, delayMs) => globalThis.setTimeout(callback, delayMs),
+      dismiss,
+    );
+    vi.advanceTimersByTime(2_999);
+    expect(dismiss).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(dismiss).toHaveBeenCalledOnce();
   });
 });
 
@@ -1066,7 +1232,7 @@ describe("resolveThreadStatusPill", () => {
         hasPendingApprovals: true,
         hasPendingUserInput: true,
       }),
-    ).toMatchObject({ label: "Pending Approval", pulse: false });
+    ).toMatchObject({ kind: "pending-approval", label: "Pending Approval", pulse: false });
   });
 
   it("shows awaiting input when plan mode is blocked on user answers", () => {
@@ -1076,7 +1242,7 @@ describe("resolveThreadStatusPill", () => {
         hasPendingApprovals: false,
         hasPendingUserInput: true,
       }),
-    ).toMatchObject({ label: "Awaiting Input", pulse: false });
+    ).toMatchObject({ kind: "awaiting-input", label: "Awaiting Input", pulse: false });
   });
 
   it("falls back to working when the thread is actively running without blockers", () => {
@@ -1246,44 +1412,53 @@ describe("resolveProjectStatusIndicator", () => {
     expect(
       resolveProjectStatusIndicator([
         {
+          kind: "completed",
           label: "Completed",
           colorClass: "text-emerald-600",
           dotClass: "bg-emerald-500",
           pulse: false,
         },
         {
+          kind: "pending-approval",
           label: "Pending Approval",
           colorClass: "text-amber-600",
           dotClass: "bg-amber-500",
           pulse: false,
         },
         {
+          kind: "working",
           label: "Working",
           colorClass: "text-sky-600",
           dotClass: "bg-sky-500",
           pulse: true,
         },
       ]),
-    ).toMatchObject({ label: "Pending Approval", dotClass: "bg-amber-500" });
+    ).toMatchObject({
+      kind: "pending-approval",
+      label: "Pending Approval",
+      dotClass: "bg-amber-500",
+    });
   });
 
   it("prefers plan-ready over completed when no stronger action is needed", () => {
     expect(
       resolveProjectStatusIndicator([
         {
+          kind: "completed",
           label: "Completed",
           colorClass: "text-emerald-600",
           dotClass: "bg-emerald-500",
           pulse: false,
         },
         {
+          kind: "plan-ready",
           label: "Plan Ready",
           colorClass: "text-violet-600",
           dotClass: "bg-violet-500",
           pulse: false,
         },
       ]),
-    ).toMatchObject({ label: "Plan Ready", dotClass: "bg-violet-500" });
+    ).toMatchObject({ kind: "plan-ready", label: "Plan Ready", dotClass: "bg-violet-500" });
   });
 });
 

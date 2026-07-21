@@ -40,7 +40,8 @@ import { resolveAndPersistPreferredEditor } from "../editorPreferences";
 import { useFeatureFlags } from "../featureFlags";
 import { useFocusedChatContext } from "../focusedChatContext";
 import { useFeedbackDialogStore } from "../feedbackDialogStore";
-import type { FeedbackThreadContext } from "../feedback";
+import { buildFeedbackThreadContext, type FeedbackThreadContext } from "../feedback";
+import { subscribeGitActionActivityProjection } from "../gitActionActivityStore";
 import { isTerminalFocused } from "../lib/terminalFocus";
 import {
   serverConfigQueryOptions,
@@ -65,6 +66,7 @@ import {
 } from "../wsNativeApi";
 import {
   addWsCompatibilityIssueListener,
+  addWsTransportStateListener,
   readLatestWsCompatibilityIssue,
 } from "../wsTransportEvents";
 import { providerQueryKeys } from "../lib/providerReactQuery";
@@ -222,6 +224,7 @@ function RootRouteView() {
       <ToastProvider position="top-center">
         <AnchoredToastProvider>
           <GitProgressToastPreviewDev />
+          <GitActionActivityCoordinator />
           <EventRouter />
           <ProviderStatusRefreshCoordinator />
           <GlobalShortcutsDialog />
@@ -286,6 +289,20 @@ function GitProgressToastPreviewDev() {
   const featureFlags = useFeatureFlags();
   const enabled = import.meta.env.DEV && featureFlags["pin-git-progress-toast-preview"];
   useGitProgressToastPreview(enabled);
+  return null;
+}
+
+function GitActionActivityCoordinator() {
+  useEffect(() => {
+    const api = readNativeApi();
+    if (!api) return;
+    return subscribeGitActionActivityProjection({
+      gitApi: api.git,
+      addTransportStateListener: addWsTransportStateListener,
+      onServerWelcome,
+    });
+  }, []);
+
   return null;
 }
 
@@ -635,21 +652,8 @@ function GlobalFeedbackDialog() {
   const isOpen = useFeedbackDialogStore((state) => state.isOpen);
   const requestedContext = useFeedbackDialogStore((state) => state.context);
   const setOpen = useFeedbackDialogStore((state) => state.setOpen);
-  const context: FeedbackThreadContext = requestedContext ?? {
-    provider: activeThread?.modelSelection.provider ?? null,
-    model: activeThread?.modelSelection.model ?? null,
-    projectKind: activeProject?.kind ?? null,
-    environmentMode: activeThread?.envMode ?? null,
-    runtimeMode: activeThread?.runtimeMode ?? null,
-    interactionMode: activeThread?.interactionMode ?? null,
-    sessionStatus: activeThread?.session?.status ?? null,
-    latestTurnState: activeThread?.latestTurn?.state ?? null,
-    messageCount: activeThread?.messages.length ?? 0,
-    activityCount: activeThread?.activities.length ?? 0,
-    hasPendingApproval: activeThread?.hasPendingApprovals === true,
-    hasPendingUserInput: activeThread?.hasPendingUserInput === true,
-    hasThreadError: Boolean(activeThread?.error),
-  };
+  const context: FeedbackThreadContext =
+    requestedContext ?? buildFeedbackThreadContext({ activeProject, activeThread });
 
   return <FeedbackDialog open={isOpen} context={context} onOpenChange={setOpen} />;
 }

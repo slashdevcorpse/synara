@@ -3,23 +3,18 @@
 // Purpose: Reads GitHub tag/release state and validates fail-closed publication transitions.
 // Layer: Release publication admission
 
-import { spawnSync } from "node:child_process";
-
 import {
   type GitHubReleaseState,
+  SuperSynaraGitHubStateVisibilityError,
   type SuperSynaraReleasePhase,
+  validateSuperSynaraGitHubPolicy,
   validateSuperSynaraGitHubState,
 } from "./lib/super-synara-release-state.ts";
-
-function runGh(args: ReadonlyArray<string>, allowNotFound = false): string {
-  const result = spawnSync("gh", [...args], { encoding: "utf8", shell: false });
-  if (result.status !== 0) {
-    const output = `${result.stderr || ""}${result.stdout || ""}`;
-    if (allowNotFound && /HTTP 404|Not Found/i.test(output)) return "";
-    throw new Error(`gh ${args.join(" ")} failed: ${output.trim()}`);
-  }
-  return result.stdout;
-}
+import { GH_CLI_BULK_TIMEOUT_MS, GhCliRequestError, runGh } from "./lib/gh-cli.ts";
+import {
+  parseSuperSynaraReleasePages,
+  parseSuperSynaraTagObject,
+} from "./lib/super-synara-github-payload.ts";
 
 function parseArgs(argv: ReadonlyArray<string>): Map<string, string> {
   const values = new Map<string, string>();
@@ -56,50 +51,84 @@ const required = (name: string): string => {
 };
 const phase = required("--phase") as SuperSynaraReleasePhase;
 if (
-  !["preflight", "reserve-tag", "before-draft", "after-draft", "before-publish"].includes(phase)
+  !["preflight", "before-draft", "after-draft", "before-publish", "after-publish"].includes(phase)
 ) {
   throw new Error(`Unsupported GitHub state phase: ${phase}.`);
 }
 const repository = required("--repository");
 const tag = required("--tag");
 const encodedTag = encodeURIComponent(tag);
-const refJson = runGh(["api", `repos/${repository}/git/ref/tags/${encodedTag}`], true);
-const refObject = refJson
-  ? (JSON.parse(refJson) as { object?: { sha?: string; type?: string } }).object
-  : undefined;
-const tagCommit = refObject?.sha ?? null;
-const tagObjectType = refObject?.type ?? null;
-const releasePages = JSON.parse(
-  runGh(["api", "--paginate", "--slurp", `repos/${repository}/releases?per_page=100`]),
-) as ReadonlyArray<
-  ReadonlyArray<{
-    id: number;
-    tag_name: string;
-    target_commitish: string;
-    draft: boolean;
-    prerelease: boolean;
-  }>
->;
-const releases: ReadonlyArray<GitHubReleaseState> = releasePages.flat().map((release) => ({
-  id: release.id,
-  tagName: release.tag_name,
-  targetCommitish: release.target_commitish,
-  draft: release.draft,
-  prerelease: release.prerelease,
-}));
-const draftIdInput = values.get("--current-run-draft-id");
-validateSuperSynaraGitHubState({
-  phase,
+const currentRunDraftId = Number(required("--current-run-draft-id"));
+const refName = required("--ref-name");
+const actor = required("--actor");
+const triggeringActor = required("--triggering-actor");
+const owner = required("--owner");
+const sourceCommit = required("--source-commit");
+const visibilityAttempts = 30;
+let lastTransientError: Error | undefined;
+
+validateSuperSynaraGitHubPolicy({
   repository,
-  refName: required("--ref-name"),
-  actor: required("--actor"),
-  triggeringActor: required("--triggering-actor"),
-  owner: required("--owner"),
+  refName,
+  actor,
+  triggeringActor,
+  owner,
   tag,
-  sourceCommit: required("--source-commit"),
-  tagCommit,
-  tagObjectType,
-  releases,
-  ...(draftIdInput ? { currentRunDraftId: Number(draftIdInput) } : {}),
+  sourceCommit,
+  currentRunDraftId,
 });
-console.log(`GitHub release state admitted for ${phase}.`);
+
+for (let attempt = 1; attempt <= visibilityAttempts; attempt += 1) {
+  let tagObject: { readonly sha: string; readonly type: string } | undefined;
+  let releases: ReadonlyArray<GitHubReleaseState>;
+  try {
+    const refJson = runGh(["api", `repos/${repository}/git/ref/tags/${encodedTag}`], {
+      allowNotFound: true,
+    });
+    tagObject = refJson ? parseSuperSynaraTagObject(JSON.parse(refJson)) : undefined;
+    const releasePages = JSON.parse(
+      runGh(["api", "--paginate", "--slurp", `repos/${repository}/releases?per_page=100`], {
+        timeoutMs: GH_CLI_BULK_TIMEOUT_MS,
+      }),
+    );
+    releases = parseSuperSynaraReleasePages(releasePages);
+  } catch (error) {
+    if (!(error instanceof GhCliRequestError) || !error.retryable) throw error;
+    lastTransientError = error;
+    if (attempt === visibilityAttempts) break;
+    console.error(
+      `Transient GitHub read failed for ${phase} (attempt ${attempt}/${visibilityAttempts}); retrying: ${error.message}`,
+    );
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1_000);
+    continue;
+  }
+
+  try {
+    validateSuperSynaraGitHubState({
+      phase,
+      repository,
+      refName,
+      actor,
+      triggeringActor,
+      owner,
+      tag,
+      sourceCommit,
+      tagCommit: tagObject?.sha ?? null,
+      tagObjectType: tagObject?.type ?? null,
+      releases,
+      currentRunDraftId,
+    });
+    console.log(`GitHub release state admitted for ${phase}.`);
+    process.exit(0);
+  } catch (error) {
+    if (!(error instanceof SuperSynaraGitHubStateVisibilityError)) throw error;
+    lastTransientError = error;
+    if (attempt === visibilityAttempts) break;
+    console.error(
+      `GitHub release state not yet visible for ${phase} (attempt ${attempt}/${visibilityAttempts}); retrying: ${error.message}`,
+    );
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1_000);
+  }
+}
+
+throw lastTransientError ?? new Error("GitHub release state verification exhausted unexpectedly.");

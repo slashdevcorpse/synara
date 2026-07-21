@@ -1,5 +1,5 @@
 // FILE: TerminalActivityIndicator.tsx
-// Purpose: Compact terminal lifecycle indicator for running, attention, and review states.
+// Purpose: Compact terminal lifecycle indicator for active and exited terminal states.
 // Layer: Terminal presentation primitive
 
 import type { TerminalVisualState } from "@synara/shared/terminalThreads";
@@ -17,10 +17,25 @@ export default function TerminalActivityIndicator({
   className,
   state = "running",
 }: TerminalActivityIndicatorProps) {
+  if (state === "stopped" || state === "failed") {
+    return (
+      <span
+        aria-hidden="true"
+        data-terminal-visual-state={state}
+        className={cn(
+          "inline-flex size-1.5 shrink-0 rounded-full",
+          state === "failed" ? "bg-destructive" : "border border-current opacity-50",
+          className,
+        )}
+      />
+    );
+  }
+
   if (state === "attention" || state === "review") {
     return (
       <span
         aria-hidden="true"
+        data-terminal-visual-state={state}
         className={cn(
           "inline-flex size-1.5 shrink-0 rounded-full",
           state === "attention"
@@ -35,6 +50,7 @@ export default function TerminalActivityIndicator({
   return (
     <span
       aria-hidden="true"
+      data-terminal-visual-state="running"
       className={cn(
         "inline-grid h-2.5 w-2.5 shrink-0 grid-cols-2 grid-rows-2 gap-px text-current",
         className,

@@ -9,6 +9,7 @@ import {
   type SynaraDesktopIdentity,
 } from "@synara/shared/desktopIdentity";
 import type { DesktopBuildArch } from "./desktop-build-options.ts";
+import launcherConfig from "../../apps/server/native/windows-job-launcher/launcher.config.json" with { type: "json" };
 
 export const MICROPHONE_USAGE_DESCRIPTION =
   "Synara needs microphone access so you can record voice notes and transcribe them into the chat composer.";
@@ -23,6 +24,10 @@ export const MAC_PRESIGNED_VENDOR_SIGN_IGNORE_PATTERNS = [
   String.raw`/Contents/Resources/app\.asar\.unpacked/node_modules/@anthropic-ai/claude-agent-sdk-darwin-(?:arm64|x64)/claude$`,
 ] as const;
 export const WINDOWS_INSTALLER_GUID = SYNARA_WINDOWS_INSTALLER_GUID;
+export const WINDOWS_JOB_LAUNCHER_EXECUTABLE = launcherConfig.executableName;
+export const WINDOWS_JOB_LAUNCHER_EXTRA_FILE_DESTINATION = `resources/synara-native/${WINDOWS_JOB_LAUNCHER_EXECUTABLE}`;
+const WINDOWS_UNIVERSAL_BUILD_ERROR =
+  "Windows desktop artifacts support x64 or arm64 builds, not universal builds.";
 const MAC_DMG_ICON_PATH = "icon.icns";
 export const NODE_PTY_ASAR_UNPACK_GLOBS = ["node_modules/node-pty/**"] as const;
 export const MAC_FOREIGN_NATIVE_EXCLUSIONS = [
@@ -41,6 +46,10 @@ export function resolveMacNativeExclusions(arch: DesktopBuildArch): ReadonlyArra
     `!node_modules/@earendil-works/pi-tui/native/darwin/prebuilds/darwin-${oppositeArch}/**`,
     `!node_modules/node-pty/prebuilds/darwin-${oppositeArch}/**`,
   ];
+}
+
+export function windowsJobLauncherStagePath(arch: DesktopBuildArch): string {
+  return `apps/server/dist/native/win32-${arch}/${WINDOWS_JOB_LAUNCHER_EXECUTABLE}`;
 }
 
 export interface DesktopPlatformBuildConfig {
@@ -73,6 +82,9 @@ export interface DesktopNativeBuildHostInput {
 }
 
 export function validateDesktopNativeBuildHost(input: DesktopNativeBuildHostInput): string | null {
+  if (input.platform === "win" && input.arch === "universal") {
+    return WINDOWS_UNIVERSAL_BUILD_ERROR;
+  }
   if (input.platform === "mac" && input.hostPlatform !== "darwin") {
     return [
       "macOS desktop artifacts include the native Swift AppSnap helper.",
@@ -96,6 +108,9 @@ export function validateDesktopNativeBuildHost(input: DesktopNativeBuildHostInpu
 export function createDesktopPlatformBuildConfig(
   input: CreateDesktopPlatformBuildConfigInput,
 ): DesktopPlatformBuildConfig {
+  if (input.platform === "win" && input.arch === "universal") {
+    throw new TypeError(WINDOWS_UNIVERSAL_BUILD_ERROR);
+  }
   const nativePackaging = { asarUnpack: [...NODE_PTY_ASAR_UNPACK_GLOBS] };
   const identity = input.identity ?? synaraDesktopIdentity("production");
   const licensedPackaging = {
@@ -163,6 +178,12 @@ export function createDesktopPlatformBuildConfig(
 
   return {
     ...licensedPackaging,
+    extraFiles: [
+      {
+        from: windowsJobLauncherStagePath(input.arch),
+        to: WINDOWS_JOB_LAUNCHER_EXTRA_FILE_DESTINATION,
+      },
+    ],
     // Keep the Windows product registration stable while the public app ID changes.
     // This lets NSIS updates replace the existing installation and own its uninstaller.
     nsis: {

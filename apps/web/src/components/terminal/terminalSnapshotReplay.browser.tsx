@@ -6,7 +6,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import type { NativeApi, TerminalEvent, TerminalSessionSnapshot } from "@synara/contracts";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   applyReplayOnce,
@@ -15,15 +15,21 @@ import {
   replaySnapshotAtDestinationGrid,
   replaySnapshotAtRecoveredGrid,
   shouldReplayColdSnapshot,
+  TERMINAL_WRITE_BATCH_SIZE_LIMIT,
 } from "./terminalSnapshotReplay";
 import {
   attachRuntimeToContainer,
   createRuntimeEntry,
   disposeRuntimeEntry,
 } from "./terminalRuntime";
+import { emitTerminalResnapshotRequired, emitWsTransportState } from "../../wsTransportEvents";
 
 const terminals: Terminal[] = [];
 const hosts: HTMLDivElement[] = [];
+const waitUntilTerminalEventStreamReady = async () => ({
+  type: "ready" as const,
+  generation: "generation-1",
+});
 
 interface TerminalHarness {
   fitAddon: FitAddon;
@@ -628,6 +634,1087 @@ describe("recovered terminal snapshot replay in real xterm", () => {
     },
   );
 
+  it("replaces terminal output from an authoritative overflow resnapshot without duplication", async () => {
+    const host = document.createElement("div");
+    host.style.cssText = "position:absolute;left:0;top:0;width:900px;height:320px;display:block;";
+    document.body.append(host);
+    hosts.push(host);
+
+    const before = "BEFORE-OVERFLOW";
+    const missed = "MISSED-BYTE-RANGE";
+    const after = "AFTER-OVERFLOW";
+    const liveAfter = `\r\n${after}`;
+    const authoritativeHistory = `${before}\r\n${missed}${liveAfter}`;
+    const acknowledgedBytes: number[] = [];
+    let openCalls = 0;
+    let snapshotCalls = 0;
+    let delayedMissedOutputTimer: number | undefined;
+    let terminalEventListener: ((event: TerminalEvent) => void) | undefined;
+    const nativeApi = {
+      terminal: {
+        waitUntilEventStreamReady: waitUntilTerminalEventStreamReady,
+        open: async () => {
+          openCalls += 1;
+          return legacySnapshot(`${before}\r\n`);
+        },
+        snapshot: async () => {
+          snapshotCalls += 1;
+          const emitTerminalEvent = terminalEventListener;
+          expect(emitTerminalEvent).toBeTypeOf("function");
+          if (!emitTerminalEvent) throw new Error("terminal event listener was not registered");
+          emitTerminalEvent({
+            type: "output",
+            threadId: "thread",
+            terminalId: "default",
+            createdAt: new Date(1).toISOString(),
+            generation: "generation-1",
+            sequence: 3,
+            data: liveAfter,
+            byteLength: new TextEncoder().encode(liveAfter).byteLength,
+          });
+          delayedMissedOutputTimer = window.setTimeout(() => {
+            emitTerminalEvent({
+              type: "output",
+              threadId: "thread",
+              terminalId: "default",
+              createdAt: new Date(1).toISOString(),
+              generation: "generation-1",
+              sequence: 2,
+              data: missed,
+              byteLength: new TextEncoder().encode(missed).byteLength,
+            });
+          }, 0);
+          return {
+            snapshot: legacySnapshot(`${before}\r\n${missed}`),
+            generation: "generation-1",
+            watermark: 2,
+          };
+        },
+        write: async () => undefined,
+        ackOutput: async (input: { bytes: number }) => {
+          acknowledgedBytes.push(input.bytes);
+        },
+        resize: async () => undefined,
+        clear: async () => undefined,
+        restart: async () => legacySnapshot(authoritativeHistory),
+        close: async () => undefined,
+        onEvent: (listener: (event: TerminalEvent) => void) => {
+          terminalEventListener = listener;
+          return () => {
+            if (terminalEventListener === listener) terminalEventListener = undefined;
+          };
+        },
+      },
+    } as unknown as NativeApi;
+    const previousNativeApi = window.nativeApi;
+    window.nativeApi = nativeApi;
+
+    const entry = createRuntimeEntry({
+      runtimeKey: "thread::default",
+      threadId: "thread",
+      terminalId: "default",
+      terminalLabel: "Terminal",
+      cwd: "C:\\project",
+      callbacks: {
+        onSessionExited: () => undefined,
+        onTerminalMetadataChange: () => undefined,
+        onTerminalActivityChange: () => undefined,
+      },
+    });
+
+    try {
+      attachRuntimeToContainer(entry, { autoFocus: false, isVisible: true }, host);
+      await waitForCondition(
+        () =>
+          entry.opened &&
+          entry.runtimeStatus === "ready" &&
+          bufferText(entry.terminal).includes(before),
+        "initial terminal history",
+      );
+
+      emitTerminalResnapshotRequired();
+      await waitForCondition(
+        () =>
+          openCalls === 1 &&
+          snapshotCalls === 1 &&
+          entry.runtimeStatus === "ready" &&
+          entry.pendingWriteBytes === 0 &&
+          bufferText(entry.terminal).includes(missed),
+        "authoritative terminal overflow resnapshot",
+      );
+
+      const text = bufferText(entry.terminal);
+      expect(text.split(before)).toHaveLength(2);
+      expect(text.split(missed)).toHaveLength(2);
+      expect(text.split(after)).toHaveLength(2);
+      expect(acknowledgedBytes).toContain(new TextEncoder().encode(liveAfter).byteLength);
+      expect(acknowledgedBytes).not.toContain(new TextEncoder().encode(missed).byteLength);
+    } finally {
+      if (delayedMissedOutputTimer !== undefined) {
+        window.clearTimeout(delayedMissedOutputTimer);
+      }
+      disposeRuntimeEntry(entry);
+      restoreWindowNativeApi(previousNativeApi);
+      document.getElementById("synara-terminal-parking")?.remove();
+    }
+  });
+
+  it.each([
+    ["initial open", "initial"],
+    ["delayed reconciliation", "reconciliation"],
+  ] as const)(
+    "keeps overflow recovery authoritative when a stale %s response resolves later",
+    async (_label, delayedResponse) => {
+      const host = document.createElement("div");
+      host.style.cssText = "position:absolute;left:0;top:0;width:900px;height:320px;display:block;";
+      document.body.append(host);
+      hosts.push(host);
+
+      const terminalId = `stale-${delayedResponse}`;
+      const authoritativeHistory = `AUTHORITATIVE-${delayedResponse}`;
+      const staleHistory = `STALE-${delayedResponse}`;
+      const liveAfterRecovery = `LIVE-AFTER-${delayedResponse}`;
+      const statusChanges: string[] = [];
+      let openCalls = 0;
+      let snapshotCalls = 0;
+      let terminalEventListener: ((event: TerminalEvent) => void) | undefined;
+      let resolveDelayedOpen!: (snapshot: TerminalSessionSnapshot) => void;
+      let delayedOpenResolved = false;
+      const delayedOpen = new Promise<TerminalSessionSnapshot>((resolve) => {
+        resolveDelayedOpen = resolve;
+      });
+      const settleDelayedOpen = (snapshot: TerminalSessionSnapshot) => {
+        if (delayedOpenResolved) return;
+        delayedOpenResolved = true;
+        resolveDelayedOpen(snapshot);
+      };
+      const nativeApi = {
+        terminal: {
+          waitUntilEventStreamReady: waitUntilTerminalEventStreamReady,
+          open: () => {
+            openCalls += 1;
+            if (delayedResponse === "initial" || openCalls > 1) return delayedOpen;
+            return Promise.resolve({ ...legacySnapshot(""), terminalId });
+          },
+          snapshot: async () => {
+            snapshotCalls += 1;
+            return {
+              snapshot: { ...legacySnapshot(authoritativeHistory), terminalId },
+              generation: "generation-1",
+              watermark: 1,
+            };
+          },
+          write: async () => undefined,
+          ackOutput: async () => undefined,
+          resize: async () => undefined,
+          clear: async () => undefined,
+          restart: async () => ({ ...legacySnapshot(""), terminalId }),
+          close: async () => undefined,
+          onEvent: (listener: (event: TerminalEvent) => void) => {
+            terminalEventListener = listener;
+            return () => {
+              if (terminalEventListener === listener) terminalEventListener = undefined;
+            };
+          },
+        },
+      } as unknown as NativeApi;
+      const previousNativeApi = window.nativeApi;
+      window.nativeApi = nativeApi;
+      const entry = createRuntimeEntry({
+        runtimeKey: `thread::${terminalId}`,
+        threadId: "thread",
+        terminalId,
+        terminalLabel: "Terminal",
+        cwd: "C:\\project",
+        callbacks: {
+          onSessionExited: () => undefined,
+          onTerminalMetadataChange: () => undefined,
+          onTerminalActivityChange: () => undefined,
+          onTerminalRuntimeStatusChange: (_terminalId, status) => {
+            statusChanges.push(status);
+          },
+        },
+      });
+
+      try {
+        attachRuntimeToContainer(entry, { autoFocus: false, isVisible: true }, host);
+        await waitForCondition(
+          () => openCalls === (delayedResponse === "initial" ? 1 : 2),
+          `${delayedResponse} open response pending`,
+        );
+
+        emitTerminalResnapshotRequired();
+        await waitForCondition(
+          () =>
+            snapshotCalls === 1 &&
+            !entry.needsAuthoritativeRecovery &&
+            !entry.authoritativeRecoveryInFlight &&
+            entry.runtimeStatus === "ready" &&
+            entry.pendingHistoryReplayPromise === null &&
+            bufferText(entry.terminal).includes(authoritativeHistory),
+          `${delayedResponse} authoritative overflow recovery`,
+        );
+        const authoritativeRequestId = entry.snapshotReconcileRequestId;
+        const authoritativeStatusCount = statusChanges.length;
+
+        settleDelayedOpen({ ...legacySnapshot(staleHistory), terminalId });
+        await new Promise((resolve) => window.setTimeout(resolve, 50));
+        await waitForCondition(
+          () => entry.pendingHistoryReplayPromise === null,
+          `${delayedResponse} stale response settlement`,
+        );
+
+        expect(entry.snapshotReconcileRequestId).toBe(authoritativeRequestId);
+        expect(entry.runtimeStatus).toBe("ready");
+        expect(statusChanges).toHaveLength(authoritativeStatusCount);
+        expect(bufferText(entry.terminal)).toContain(authoritativeHistory);
+        expect(bufferText(entry.terminal)).not.toContain(staleHistory);
+        expect(terminalEventListener).toBeTypeOf("function");
+        if (!terminalEventListener) throw new Error("terminal event listener was not registered");
+
+        terminalEventListener({
+          type: "output",
+          threadId: "thread",
+          terminalId,
+          createdAt: new Date().toISOString(),
+          generation: "generation-1",
+          sequence: 1,
+          data: "MUST-NOT-APPLY-DUPLICATE",
+          byteLength: 24,
+        });
+        terminalEventListener({
+          type: "output",
+          threadId: "thread",
+          terminalId,
+          createdAt: new Date().toISOString(),
+          generation: "generation-1",
+          sequence: 2,
+          data: liveAfterRecovery,
+          byteLength: new TextEncoder().encode(liveAfterRecovery).byteLength,
+        });
+        await waitForCondition(
+          () =>
+            entry.pendingWriteBytes === 0 && bufferText(entry.terminal).includes(liveAfterRecovery),
+          `${delayedResponse} post-recovery sequence`,
+        );
+
+        const finalText = bufferText(entry.terminal);
+        expect(entry.outputEventVersion).toBe(1);
+        expect(finalText).not.toContain("MUST-NOT-APPLY-DUPLICATE");
+        expect(finalText.split(authoritativeHistory)).toHaveLength(2);
+        expect(finalText.split(liveAfterRecovery)).toHaveLength(2);
+      } finally {
+        settleDelayedOpen({ ...legacySnapshot(""), terminalId });
+        disposeRuntimeEntry(entry);
+        restoreWindowNativeApi(previousNativeApi);
+        document.getElementById("synara-terminal-parking")?.remove();
+      }
+    },
+  );
+
+  it.each(["superseded", "disposed", "no longer open"] as const)(
+    "does not send a reconnect open after readiness resolves for a %s request",
+    async (interruption) => {
+      const host = document.createElement("div");
+      host.style.cssText = "position:absolute;left:0;top:0;width:900px;height:320px;display:block;";
+      document.body.append(host);
+      hosts.push(host);
+
+      const terminalId = `stale-readiness-${interruption.replaceAll(" ", "-")}`;
+      const openInputs: Array<{ cols: number; rows: number }> = [];
+      let readinessCalls = 0;
+      let snapshotCalls = 0;
+      let resolveReconnectReadiness!: (ready: { type: "ready"; generation: string }) => void;
+      let reconnectReadinessResolved = false;
+      const reconnectReadiness = new Promise<{ type: "ready"; generation: string }>((resolve) => {
+        resolveReconnectReadiness = resolve;
+      });
+      const settleReconnectReadiness = () => {
+        if (reconnectReadinessResolved) return;
+        reconnectReadinessResolved = true;
+        resolveReconnectReadiness({ type: "ready", generation: "generation-1" });
+      };
+      const nativeApi = {
+        terminal: {
+          waitUntilEventStreamReady: () => {
+            readinessCalls += 1;
+            return readinessCalls === 2
+              ? reconnectReadiness
+              : Promise.resolve({ type: "ready" as const, generation: "generation-1" });
+          },
+          open: async (input: { cols: number; rows: number }) => {
+            openInputs.push({ cols: input.cols, rows: input.rows });
+            return { ...legacySnapshot("INITIAL-SESSION"), terminalId };
+          },
+          snapshot: async () => {
+            snapshotCalls += 1;
+            return {
+              snapshot: { ...legacySnapshot("AUTHORITATIVE-SESSION"), terminalId },
+              generation: "generation-1",
+              watermark: 0,
+            };
+          },
+          write: async () => undefined,
+          ackOutput: async () => undefined,
+          resize: async () => undefined,
+          clear: async () => undefined,
+          restart: async () => ({ ...legacySnapshot(""), terminalId }),
+          close: async () => undefined,
+          onEvent: () => () => undefined,
+        },
+      } as unknown as NativeApi;
+      const previousNativeApi = window.nativeApi;
+      window.nativeApi = nativeApi;
+      const entry = createRuntimeEntry({
+        runtimeKey: `thread::${terminalId}`,
+        threadId: "thread",
+        terminalId,
+        terminalLabel: "Terminal",
+        cwd: "C:\\project",
+        callbacks: {
+          onSessionExited: () => undefined,
+          onTerminalMetadataChange: () => undefined,
+          onTerminalActivityChange: () => undefined,
+        },
+      });
+      let disposed = false;
+
+      try {
+        attachRuntimeToContainer(entry, { autoFocus: false, isVisible: true }, host);
+        await waitForCondition(
+          () => openInputs.length === 1 && entry.runtimeStatus === "ready",
+          `${interruption} initial open`,
+        );
+
+        emitWsTransportState("open");
+        await waitForCondition(() => readinessCalls === 2, `${interruption} reconnect readiness`);
+        const reconnectRequestId = entry.snapshotReconcileRequestId;
+
+        if (interruption === "superseded") {
+          emitTerminalResnapshotRequired();
+          await waitForCondition(
+            () => snapshotCalls === 1 && entry.snapshotReconcileRequestId !== reconnectRequestId,
+            "authoritative recovery superseding reconnect",
+          );
+        } else if (interruption === "disposed") {
+          disposeRuntimeEntry(entry);
+          disposed = true;
+        } else {
+          entry.opened = false;
+        }
+
+        settleReconnectReadiness();
+        await new Promise((resolve) => window.setTimeout(resolve, 25));
+
+        expect(openInputs).toHaveLength(1);
+        if (interruption === "superseded") {
+          await waitForCondition(
+            () =>
+              !entry.needsAuthoritativeRecovery &&
+              !entry.authoritativeRecoveryInFlight &&
+              entry.runtimeStatus === "ready",
+            "authoritative recovery completion",
+          );
+          expect(bufferText(entry.terminal)).toContain("AUTHORITATIVE-SESSION");
+        }
+      } finally {
+        settleReconnectReadiness();
+        if (!disposed) disposeRuntimeEntry(entry);
+        restoreWindowNativeApi(previousNativeApi);
+        document.getElementById("synara-terminal-parking")?.remove();
+      }
+    },
+  );
+
+  it("waits for stream registration before snapshotting output from the prior gap", async () => {
+    const host = document.createElement("div");
+    host.style.cssText = "position:absolute;left:0;top:0;width:900px;height:320px;display:block;";
+    document.body.append(host);
+    hosts.push(host);
+
+    const before = "BEFORE-REGISTRATION-GAP";
+    const gap = "\r\nOUTPUT-IN-REGISTRATION-GAP";
+    let readinessCalls = 0;
+    let resolveRecoveryReadiness: (ready: { type: "ready"; generation: string }) => void = () =>
+      undefined;
+    let snapshotCalls = 0;
+    let terminalEventListener: ((event: TerminalEvent) => void) | undefined;
+    const recoveryReadiness = new Promise<{ type: "ready"; generation: string }>((resolve) => {
+      resolveRecoveryReadiness = resolve;
+    });
+    const nativeApi = {
+      terminal: {
+        waitUntilEventStreamReady: () => {
+          readinessCalls += 1;
+          return readinessCalls === 1
+            ? Promise.resolve({ type: "ready" as const, generation: "generation-1" })
+            : recoveryReadiness;
+        },
+        open: async () => legacySnapshot(before),
+        snapshot: async () => {
+          snapshotCalls += 1;
+          return {
+            snapshot: legacySnapshot(`${before}${gap}`),
+            generation: "generation-1",
+            watermark: 1,
+          };
+        },
+        write: async () => undefined,
+        ackOutput: async () => undefined,
+        resize: async () => undefined,
+        clear: async () => undefined,
+        restart: async () => legacySnapshot(""),
+        close: async () => undefined,
+        onEvent: (listener: (event: TerminalEvent) => void) => {
+          terminalEventListener = listener;
+          return () => {
+            if (terminalEventListener === listener) terminalEventListener = undefined;
+          };
+        },
+      },
+    } as unknown as NativeApi;
+    const previousNativeApi = window.nativeApi;
+    window.nativeApi = nativeApi;
+    const entry = createRuntimeEntry({
+      runtimeKey: "thread::registration-gap",
+      threadId: "thread",
+      terminalId: "registration-gap",
+      terminalLabel: "Terminal",
+      cwd: "C:\\project",
+      callbacks: {
+        onSessionExited: () => undefined,
+        onTerminalMetadataChange: () => undefined,
+        onTerminalActivityChange: () => undefined,
+      },
+    });
+
+    try {
+      attachRuntimeToContainer(entry, { autoFocus: false, isVisible: true }, host);
+      await waitForCondition(
+        () => entry.runtimeStatus === "ready" && bufferText(entry.terminal).includes(before),
+        "registration-gap initial open",
+      );
+
+      emitTerminalResnapshotRequired();
+      await waitForCondition(() => readinessCalls === 2, "recovery registration barrier");
+      expect(snapshotCalls).toBe(0);
+      expect(terminalEventListener).toBeTypeOf("function");
+      if (!terminalEventListener) throw new Error("terminal event listener was not registered");
+      terminalEventListener({
+        type: "output",
+        threadId: "thread",
+        terminalId: "registration-gap",
+        createdAt: new Date().toISOString(),
+        generation: "generation-1",
+        sequence: 1,
+        data: gap,
+        byteLength: new TextEncoder().encode(gap).byteLength,
+      });
+      resolveRecoveryReadiness({ type: "ready", generation: "generation-1" });
+
+      await waitForCondition(
+        () =>
+          snapshotCalls === 1 &&
+          !entry.needsAuthoritativeRecovery &&
+          entry.runtimeStatus === "ready",
+        "registration-gap authoritative recovery",
+      );
+      expect(bufferText(entry.terminal).split("OUTPUT-IN-REGISTRATION-GAP")).toHaveLength(2);
+    } finally {
+      disposeRuntimeEntry(entry);
+      restoreWindowNativeApi(previousNativeApi);
+      document.getElementById("synara-terminal-parking")?.remove();
+    }
+  });
+
+  it("retries a transient quiet-terminal snapshot failure without wedging recovery", async () => {
+    const host = document.createElement("div");
+    host.style.cssText = "position:absolute;left:0;top:0;width:900px;height:320px;display:block;";
+    document.body.append(host);
+    hosts.push(host);
+
+    let snapshotCalls = 0;
+    const nativeApi = {
+      terminal: {
+        waitUntilEventStreamReady: async () => ({
+          type: "ready" as const,
+          generation: "generation-1",
+        }),
+        open: async () => legacySnapshot("QUIET-BEFORE-RECOVERY"),
+        snapshot: async () => {
+          snapshotCalls += 1;
+          if (snapshotCalls === 1) throw new Error("transient snapshot failure");
+          return {
+            snapshot: legacySnapshot("QUIET-AFTER-RECOVERY"),
+            generation: "generation-1",
+            watermark: 0,
+          };
+        },
+        write: async () => undefined,
+        ackOutput: async () => undefined,
+        resize: async () => undefined,
+        clear: async () => undefined,
+        restart: async () => legacySnapshot(""),
+        close: async () => undefined,
+        onEvent: () => () => undefined,
+      },
+    } as unknown as NativeApi;
+    const previousNativeApi = window.nativeApi;
+    window.nativeApi = nativeApi;
+    const entry = createRuntimeEntry({
+      runtimeKey: "thread::quiet-retry",
+      threadId: "thread",
+      terminalId: "quiet-retry",
+      terminalLabel: "Terminal",
+      cwd: "C:\\project",
+      callbacks: {
+        onSessionExited: () => undefined,
+        onTerminalMetadataChange: () => undefined,
+        onTerminalActivityChange: () => undefined,
+      },
+    });
+
+    try {
+      attachRuntimeToContainer(entry, { autoFocus: false, isVisible: true }, host);
+      await waitForCondition(() => entry.runtimeStatus === "ready", "quiet retry initial open");
+      emitTerminalResnapshotRequired();
+      await waitForCondition(
+        () =>
+          snapshotCalls === 2 &&
+          !entry.needsAuthoritativeRecovery &&
+          !entry.authoritativeRecoveryInFlight &&
+          entry.authoritativeRecoveryRetryTimer === null &&
+          entry.runtimeStatus === "ready",
+        "quiet terminal retry recovery",
+      );
+      expect(bufferText(entry.terminal)).toContain("QUIET-AFTER-RECOVERY");
+      expect(entry.authoritativeRecoveryAttempt).toBe(0);
+    } finally {
+      disposeRuntimeEntry(entry);
+      restoreWindowNativeApi(previousNativeApi);
+      document.getElementById("synara-terminal-parking")?.remove();
+    }
+  });
+
+  it("cancels a queued exit callback when recovery confirms a renewed running session", async () => {
+    const host = document.createElement("div");
+    host.style.cssText = "position:absolute;left:0;top:0;width:900px;height:320px;display:block;";
+    document.body.append(host);
+    hosts.push(host);
+
+    let terminalEventListener: ((event: TerminalEvent) => void) | undefined;
+    const onSessionExited = vi.fn();
+    const nativeApi = {
+      terminal: {
+        waitUntilEventStreamReady: async () => ({
+          type: "ready" as const,
+          generation: "generation-1",
+        }),
+        open: async () => legacySnapshot("BEFORE-RENEWAL"),
+        snapshot: async () => ({
+          snapshot: legacySnapshot("RENEWED-RUNNING-SESSION"),
+          generation: "generation-1",
+          watermark: 1,
+        }),
+        write: async () => undefined,
+        ackOutput: async () => undefined,
+        resize: async () => undefined,
+        clear: async () => undefined,
+        restart: async () => legacySnapshot(""),
+        close: async () => undefined,
+        onEvent: (listener: (event: TerminalEvent) => void) => {
+          terminalEventListener = listener;
+          return () => {
+            if (terminalEventListener === listener) terminalEventListener = undefined;
+          };
+        },
+      },
+    } as unknown as NativeApi;
+    const previousNativeApi = window.nativeApi;
+    window.nativeApi = nativeApi;
+    const entry = createRuntimeEntry({
+      runtimeKey: "thread::renewed-running",
+      threadId: "thread",
+      terminalId: "renewed-running",
+      terminalLabel: "Terminal",
+      cwd: "C:\\project",
+      callbacks: {
+        onSessionExited,
+        onTerminalMetadataChange: () => undefined,
+        onTerminalActivityChange: () => undefined,
+      },
+    });
+
+    try {
+      attachRuntimeToContainer(entry, { autoFocus: false, isVisible: true }, host);
+      await waitForCondition(() => entry.opened && entry.runtimeStatus === "ready", "renewal open");
+      terminalEventListener?.({
+        type: "exited",
+        threadId: "thread",
+        terminalId: "renewed-running",
+        createdAt: new Date().toISOString(),
+        generation: "generation-1",
+        sequence: 1,
+        exitCode: 1,
+        exitSignal: null,
+      });
+      expect(entry.hasHandledExit).toBe(true);
+
+      emitTerminalResnapshotRequired();
+      await waitForCondition(
+        () =>
+          !entry.needsAuthoritativeRecovery &&
+          !entry.authoritativeRecoveryInFlight &&
+          !entry.hasHandledExit &&
+          bufferText(entry.terminal).includes("RENEWED-RUNNING-SESSION"),
+        "renewed running recovery",
+      );
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      expect(onSessionExited).not.toHaveBeenCalled();
+      expect(entry.runtimeStatus).toBe("ready");
+    } finally {
+      disposeRuntimeEntry(entry);
+      restoreWindowNativeApi(previousNativeApi);
+      document.getElementById("synara-terminal-parking")?.remove();
+    }
+  });
+
+  it("unwinds interrupted recovery and resumes ACK delivery when open is interrupted", async () => {
+    const host = document.createElement("div");
+    host.style.cssText = "position:absolute;left:0;top:0;width:900px;height:320px;display:block;";
+    document.body.append(host);
+    hosts.push(host);
+
+    let snapshotCalls = 0;
+    let resolveRecoverySnapshot!: (value: {
+      snapshot: TerminalSessionSnapshot;
+      generation: string;
+      watermark: number;
+    }) => void;
+    const recoverySnapshot = new Promise<{
+      snapshot: TerminalSessionSnapshot;
+      generation: string;
+      watermark: number;
+    }>((resolve) => {
+      resolveRecoverySnapshot = resolve;
+    });
+    const acknowledgedBytes: number[] = [];
+    const nativeApi = {
+      terminal: {
+        waitUntilEventStreamReady: async () => ({
+          type: "ready" as const,
+          generation: "generation-1",
+        }),
+        open: async () => legacySnapshot(""),
+        snapshot: () => {
+          snapshotCalls += 1;
+          return recoverySnapshot;
+        },
+        write: async () => undefined,
+        ackOutput: async (input: { bytes: number }) => {
+          acknowledgedBytes.push(input.bytes);
+        },
+        resize: async () => undefined,
+        clear: async () => undefined,
+        restart: async () => legacySnapshot(""),
+        close: async () => undefined,
+        onEvent: () => () => undefined,
+      },
+    } as unknown as NativeApi;
+    const previousNativeApi = window.nativeApi;
+    window.nativeApi = nativeApi;
+    const entry = createRuntimeEntry({
+      runtimeKey: "thread::interrupted-recovery",
+      threadId: "thread",
+      terminalId: "interrupted-recovery",
+      terminalLabel: "Terminal",
+      cwd: "C:\\project",
+      callbacks: {
+        onSessionExited: () => undefined,
+        onTerminalMetadataChange: () => undefined,
+        onTerminalActivityChange: () => undefined,
+      },
+    });
+
+    try {
+      attachRuntimeToContainer(entry, { autoFocus: false, isVisible: true }, host);
+      await waitForCondition(
+        () => entry.opened && entry.runtimeStatus === "ready",
+        "interrupted recovery open",
+      );
+      emitTerminalResnapshotRequired();
+      await waitForCondition(
+        () => snapshotCalls === 1 && entry.authoritativeRecoveryInFlight,
+        "interrupted recovery snapshot",
+      );
+
+      entry.opened = false;
+      resolveRecoverySnapshot({
+        snapshot: legacySnapshot("IGNORED-AFTER-CLOSE"),
+        generation: "generation-1",
+        watermark: 0,
+      });
+      await waitForCondition(
+        () =>
+          !entry.authoritativeRecoveryInFlight &&
+          !entry.needsAuthoritativeRecovery &&
+          entry.authoritativeRecoveryRetryTimer === null &&
+          !entry.terminalEventRecovery.isRecovering(),
+        "interrupted recovery cleanup",
+      );
+
+      entry.terminalOutputAckQueue.enqueue(9);
+      await waitForCondition(() => acknowledgedBytes.includes(9), "resumed ACK delivery");
+      expect(entry.authoritativeRecoveryAttempt).toBe(0);
+      expect(bufferText(entry.terminal)).not.toContain("IGNORED-AFTER-CLOSE");
+    } finally {
+      disposeRuntimeEntry(entry);
+      restoreWindowNativeApi(previousNativeApi);
+      document.getElementById("synara-terminal-parking")?.remove();
+    }
+  });
+
+  it("preserves a buffered terminal error after authoritative recovery completes", async () => {
+    const host = document.createElement("div");
+    host.style.cssText = "position:absolute;left:0;top:0;width:900px;height:320px;display:block;";
+    document.body.append(host);
+    hosts.push(host);
+
+    let snapshotCalls = 0;
+    let terminalEventListener: ((event: TerminalEvent) => void) | undefined;
+    let resolveRecoverySnapshot!: (value: {
+      snapshot: TerminalSessionSnapshot;
+      generation: string;
+      watermark: number;
+    }) => void;
+    const recoverySnapshot = new Promise<{
+      snapshot: TerminalSessionSnapshot;
+      generation: string;
+      watermark: number;
+    }>((resolve) => {
+      resolveRecoverySnapshot = resolve;
+    });
+    const nativeApi = {
+      terminal: {
+        waitUntilEventStreamReady: waitUntilTerminalEventStreamReady,
+        open: async () => legacySnapshot("INITIAL"),
+        snapshot: () => {
+          snapshotCalls += 1;
+          return recoverySnapshot;
+        },
+        write: async () => undefined,
+        ackOutput: async () => undefined,
+        resize: async () => undefined,
+        clear: async () => undefined,
+        restart: async () => legacySnapshot(""),
+        close: async () => undefined,
+        onEvent: (listener: (event: TerminalEvent) => void) => {
+          terminalEventListener = listener;
+          return () => {
+            if (terminalEventListener === listener) terminalEventListener = undefined;
+          };
+        },
+      },
+    } as unknown as NativeApi;
+    const previousNativeApi = window.nativeApi;
+    window.nativeApi = nativeApi;
+    const entry = createRuntimeEntry({
+      runtimeKey: "thread::buffered-recovery-error",
+      threadId: "thread",
+      terminalId: "buffered-recovery-error",
+      terminalLabel: "Terminal",
+      cwd: "C:\\project",
+      callbacks: {
+        onSessionExited: () => undefined,
+        onTerminalMetadataChange: () => undefined,
+        onTerminalActivityChange: () => undefined,
+      },
+    });
+
+    try {
+      attachRuntimeToContainer(entry, { autoFocus: false, isVisible: true }, host);
+      await waitForCondition(
+        () => entry.opened && entry.runtimeStatus === "ready",
+        "buffered error initial open",
+      );
+      expect(terminalEventListener).toBeTypeOf("function");
+      if (!terminalEventListener) throw new Error("terminal event listener was not registered");
+
+      emitTerminalResnapshotRequired();
+      await waitForCondition(
+        () => snapshotCalls === 1 && entry.authoritativeRecoveryInFlight,
+        "buffered error recovery snapshot",
+      );
+      terminalEventListener({
+        type: "error",
+        threadId: "thread",
+        terminalId: "buffered-recovery-error",
+        createdAt: new Date().toISOString(),
+        generation: "generation-1",
+        sequence: 1,
+        message: "POST-SNAPSHOT-ERROR",
+      });
+      resolveRecoverySnapshot({
+        snapshot: legacySnapshot("AUTHORITATIVE"),
+        generation: "generation-1",
+        watermark: 0,
+      });
+
+      await waitForCondition(
+        () =>
+          !entry.authoritativeRecoveryInFlight &&
+          entry.runtimeStatus === "error" &&
+          bufferText(entry.terminal).includes("POST-SNAPSHOT-ERROR"),
+        "buffered recovery error",
+      );
+    } finally {
+      disposeRuntimeEntry(entry);
+      restoreWindowNativeApi(previousNativeApi);
+      document.getElementById("synara-terminal-parking")?.remove();
+    }
+  });
+
+  it("preserves a buffered terminal start over an older error recovery snapshot", async () => {
+    const host = document.createElement("div");
+    host.style.cssText = "position:absolute;left:0;top:0;width:900px;height:320px;display:block;";
+    document.body.append(host);
+    hosts.push(host);
+
+    let snapshotCalls = 0;
+    let terminalEventListener: ((event: TerminalEvent) => void) | undefined;
+    let resolveRecoverySnapshot!: (value: {
+      snapshot: TerminalSessionSnapshot;
+      generation: string;
+      watermark: number;
+    }) => void;
+    const recoverySnapshot = new Promise<{
+      snapshot: TerminalSessionSnapshot;
+      generation: string;
+      watermark: number;
+    }>((resolve) => {
+      resolveRecoverySnapshot = resolve;
+    });
+    const terminalId = "buffered-recovery-started";
+    const nativeApi = {
+      terminal: {
+        waitUntilEventStreamReady: waitUntilTerminalEventStreamReady,
+        open: async () => ({ ...legacySnapshot("INITIAL"), terminalId }),
+        snapshot: () => {
+          snapshotCalls += 1;
+          return recoverySnapshot;
+        },
+        write: async () => undefined,
+        ackOutput: async () => undefined,
+        resize: async () => undefined,
+        clear: async () => undefined,
+        restart: async () => ({ ...legacySnapshot(""), terminalId }),
+        close: async () => undefined,
+        onEvent: (listener: (event: TerminalEvent) => void) => {
+          terminalEventListener = listener;
+          return () => {
+            if (terminalEventListener === listener) terminalEventListener = undefined;
+          };
+        },
+      },
+    } as unknown as NativeApi;
+    const previousNativeApi = window.nativeApi;
+    window.nativeApi = nativeApi;
+    const entry = createRuntimeEntry({
+      runtimeKey: `thread::${terminalId}`,
+      threadId: "thread",
+      terminalId,
+      terminalLabel: "Terminal",
+      cwd: "C:\\project",
+      callbacks: {
+        onSessionExited: () => undefined,
+        onTerminalMetadataChange: () => undefined,
+        onTerminalActivityChange: () => undefined,
+      },
+    });
+
+    try {
+      attachRuntimeToContainer(entry, { autoFocus: false, isVisible: true }, host);
+      await waitForCondition(
+        () => entry.opened && entry.runtimeStatus === "ready",
+        "buffered start initial open",
+      );
+      expect(terminalEventListener).toBeTypeOf("function");
+      if (!terminalEventListener) throw new Error("terminal event listener was not registered");
+
+      emitTerminalResnapshotRequired();
+      await waitForCondition(
+        () => snapshotCalls === 1 && entry.authoritativeRecoveryInFlight,
+        "buffered start recovery snapshot",
+      );
+      terminalEventListener({
+        type: "started",
+        threadId: "thread",
+        terminalId,
+        createdAt: new Date().toISOString(),
+        generation: "generation-1",
+        sequence: 1,
+        snapshot: { ...legacySnapshot(""), terminalId },
+      });
+      resolveRecoverySnapshot({
+        snapshot: {
+          ...legacySnapshot("STALE-ERROR-SNAPSHOT"),
+          terminalId,
+          status: "error",
+          pid: null,
+        },
+        generation: "generation-1",
+        watermark: 0,
+      });
+
+      await waitForCondition(
+        () => !entry.authoritativeRecoveryInFlight && entry.runtimeStatus === "ready",
+        "buffered start remains authoritative",
+      );
+    } finally {
+      disposeRuntimeEntry(entry);
+      restoreWindowNativeApi(previousNativeApi);
+      document.getElementById("synara-terminal-parking")?.remove();
+    }
+  });
+
+  it("finalizes a dropped exited event from a non-starting recovery snapshot", async () => {
+    const host = document.createElement("div");
+    host.style.cssText = "position:absolute;left:0;top:0;width:900px;height:320px;display:block;";
+    document.body.append(host);
+    hosts.push(host);
+
+    let openCalls = 0;
+    let snapshotCalls = 0;
+    const onSessionExited = vi.fn();
+    const exitedSnapshot: TerminalSessionSnapshot = {
+      ...legacySnapshot("FINAL-BEFORE-EXIT"),
+      status: "exited",
+      pid: null,
+      exitCode: 23,
+    };
+    const nativeApi = {
+      terminal: {
+        waitUntilEventStreamReady: waitUntilTerminalEventStreamReady,
+        open: async () => {
+          openCalls += 1;
+          return legacySnapshot("");
+        },
+        snapshot: async () => {
+          snapshotCalls += 1;
+          return { snapshot: exitedSnapshot, generation: "generation-1", watermark: 1 };
+        },
+        write: async () => undefined,
+        ackOutput: async () => undefined,
+        resize: async () => undefined,
+        clear: async () => undefined,
+        restart: async () => legacySnapshot(""),
+        close: async () => undefined,
+        onEvent: () => () => undefined,
+      },
+    } as unknown as NativeApi;
+    const previousNativeApi = window.nativeApi;
+    window.nativeApi = nativeApi;
+    const entry = createRuntimeEntry({
+      runtimeKey: "thread::dropped-exit",
+      threadId: "thread",
+      terminalId: "dropped-exit",
+      terminalLabel: "Terminal",
+      cwd: "C:\\project",
+      callbacks: {
+        onSessionExited,
+        onTerminalMetadataChange: () => undefined,
+        onTerminalActivityChange: () => undefined,
+      },
+    });
+
+    try {
+      attachRuntimeToContainer(entry, { autoFocus: false, isVisible: true }, host);
+      await waitForCondition(() => entry.opened && entry.runtimeStatus === "ready", "exit open");
+      emitTerminalResnapshotRequired();
+      await waitForCondition(
+        () => onSessionExited.mock.calls.length === 1,
+        "dropped exit finalize",
+      );
+
+      expect(openCalls).toBe(1);
+      expect(snapshotCalls).toBe(1);
+      expect(bufferText(entry.terminal)).toContain("FINAL-BEFORE-EXIT");
+      expect(bufferText(entry.terminal)).toContain("Process exited (code 23)");
+    } finally {
+      disposeRuntimeEntry(entry);
+      restoreWindowNativeApi(previousNativeApi);
+      document.getElementById("synara-terminal-parking")?.remove();
+    }
+  });
+
+  it("uses the current reattach-only flag for delayed snapshot reconciliation", async () => {
+    const host = document.createElement("div");
+    host.style.cssText = "position:absolute;left:0;top:0;width:900px;height:320px;display:block;";
+    document.body.append(host);
+    hosts.push(host);
+
+    const terminalId = "delayed-reattach";
+    const openInputs: Array<Parameters<NativeApi["terminal"]["open"]>[0]> = [];
+    const nativeApi = {
+      terminal: {
+        waitUntilEventStreamReady: waitUntilTerminalEventStreamReady,
+        open: async (input: Parameters<NativeApi["terminal"]["open"]>[0]) => {
+          openInputs.push(input);
+          if (openInputs.length === 1) {
+            return { ...legacySnapshot(""), terminalId };
+          }
+          return {
+            ...legacySnapshot(""),
+            terminalId,
+            status: "exited" as const,
+            pid: null,
+            exitCode: 0,
+          };
+        },
+        write: async () => undefined,
+        ackOutput: async () => undefined,
+        resize: async () => undefined,
+        clear: async () => undefined,
+        restart: async () => ({ ...legacySnapshot(""), terminalId }),
+        close: async () => undefined,
+        onEvent: () => () => undefined,
+      },
+    } as unknown as NativeApi;
+    const previousNativeApi = window.nativeApi;
+    window.nativeApi = nativeApi;
+    let entry: ReturnType<typeof createRuntimeEntry>;
+    entry = createRuntimeEntry({
+      runtimeKey: `thread::${terminalId}`,
+      threadId: "thread",
+      terminalId,
+      terminalLabel: "Terminal",
+      cwd: "C:\\project",
+      callbacks: {
+        onSessionExited: () => undefined,
+        onTerminalMetadataChange: () => undefined,
+        onTerminalActivityChange: () => undefined,
+        onTerminalRecoveryResolved: () => {
+          queueMicrotask(() => {
+            entry.reattachOnly = true;
+          });
+        },
+      },
+    });
+
+    try {
+      attachRuntimeToContainer(entry, { autoFocus: false, isVisible: true }, host);
+      await waitForCondition(() => openInputs.length === 2, "delayed reattach-only reconcile");
+
+      expect(openInputs[0]?.reattachOnly).toBeUndefined();
+      expect(openInputs[1]?.reattachOnly).toBe(true);
+    } finally {
+      disposeRuntimeEntry(entry);
+      restoreWindowNativeApi(previousNativeApi);
+      document.getElementById("synara-terminal-parking")?.remove();
+    }
+  });
+
   it.each(["started", "restarted", "cleared"] as const)(
     "handles retained runtime output through a later %s event and resumes normal delivery",
     async (retryEventType) => {
@@ -642,6 +1729,7 @@ describe("recovered terminal snapshot replay in real xterm", () => {
       const initialSnapshot = dimensionedSnapshot(80, 24, "0".repeat(64), "");
       const nativeApi = {
         terminal: {
+          waitUntilEventStreamReady: waitUntilTerminalEventStreamReady,
           open: async () => initialSnapshot,
           write: async () => undefined,
           ackOutput: async (input: { bytes: number }) => {
@@ -730,6 +1818,8 @@ describe("recovered terminal snapshot replay in real xterm", () => {
                   threadId: "thread",
                   terminalId: "default",
                   createdAt: new Date(1).toISOString(),
+                  generation: "generation-1",
+                  sequence: 2,
                   data: "\r\nLIVE-BEFORE-UNSAFE",
                   byteLength: 20,
                 });
@@ -749,6 +1839,8 @@ describe("recovered terminal snapshot replay in real xterm", () => {
           threadId: "thread",
           terminalId: "default",
           createdAt: new Date(2).toISOString(),
+          generation: "generation-1",
+          sequence: 1,
           snapshot,
         });
         await waitForCondition(
@@ -763,6 +1855,8 @@ describe("recovered terminal snapshot replay in real xterm", () => {
           threadId: "thread",
           terminalId: "default",
           createdAt: new Date(3).toISOString(),
+          generation: "generation-1",
+          sequence: 3,
           data: "\r\nLIVE-AFTER-UNSAFE",
           byteLength: 19,
         });
@@ -776,6 +1870,8 @@ describe("recovered terminal snapshot replay in real xterm", () => {
             threadId: "thread",
             terminalId: "default",
             createdAt: new Date(4).toISOString(),
+            generation: "generation-1",
+            sequence: 4,
           });
           await waitForCondition(
             () =>
@@ -789,6 +1885,8 @@ describe("recovered terminal snapshot replay in real xterm", () => {
             threadId: "thread",
             terminalId: "default",
             createdAt: new Date(5).toISOString(),
+            generation: "generation-1",
+            sequence: 5,
             data: "LIVE-NORMAL-AFTER-CLEAR",
             byteLength: 23,
           });
@@ -817,6 +1915,8 @@ describe("recovered terminal snapshot replay in real xterm", () => {
           threadId: "thread",
           terminalId: "default",
           createdAt: new Date(4).toISOString(),
+          generation: "generation-1",
+          sequence: 4,
           snapshot: authoritativeSnapshot,
         });
         await waitForCondition(
@@ -832,6 +1932,8 @@ describe("recovered terminal snapshot replay in real xterm", () => {
           threadId: "thread",
           terminalId: "default",
           createdAt: new Date(5).toISOString(),
+          generation: "generation-1",
+          sequence: 5,
           data: "\r\nLIVE-NORMAL-AFTER-RETRY",
           byteLength: 25,
         });
@@ -929,6 +2031,7 @@ describe("recovered terminal snapshot replay in real xterm", () => {
       let terminalEventListener: ((event: TerminalEvent) => void) | undefined;
       const nativeApi = {
         terminal: {
+          waitUntilEventStreamReady: waitUntilTerminalEventStreamReady,
           open: () => {
             openCalls += 1;
             return openCalls === 1 ? initialOpen : Promise.resolve(firstSnapshot);
@@ -963,6 +2066,7 @@ describe("recovered terminal snapshot replay in real xterm", () => {
       });
       const originalWrite = entry.terminal.write.bind(entry.terminal);
       const writes: string[] = [];
+      let nextSequence = 0;
       entry.terminal.write = ((data: string | Uint8Array, callback?: () => void) => {
         if (typeof data === "string") writes.push(data);
         originalWrite(data, callback);
@@ -973,6 +2077,8 @@ describe("recovered terminal snapshot replay in real xterm", () => {
           threadId: "thread",
           terminalId: entry.terminalId,
           createdAt: new Date().toISOString(),
+          generation: "generation-1",
+          sequence: (nextSequence += 1),
           snapshot,
         });
 
@@ -1039,6 +2145,7 @@ describe("recovered terminal snapshot replay in real xterm", () => {
       const order: string[] = [];
       const nativeApi = {
         terminal: {
+          waitUntilEventStreamReady: waitUntilTerminalEventStreamReady,
           open: async () => legacySnapshot(""),
           write: async () => undefined,
           ackOutput: async () => undefined,
@@ -1126,6 +2233,8 @@ describe("recovered terminal snapshot replay in real xterm", () => {
           threadId: "thread",
           terminalId: entry.terminalId,
           createdAt: new Date().toISOString(),
+          generation: "generation-1",
+          sequence: 1,
           snapshot: recoverySnapshot,
         });
         await waitForCondition(
@@ -1173,6 +2282,7 @@ describe("recovered terminal snapshot replay in real xterm", () => {
     const acknowledgedBytes: number[] = [];
     const nativeApi = {
       terminal: {
+        waitUntilEventStreamReady: waitUntilTerminalEventStreamReady,
         open: async () => legacySnapshot(""),
         write: async () => undefined,
         ackOutput: async (input: { bytes: number }) => {
@@ -1210,6 +2320,33 @@ describe("recovered terminal snapshot replay in real xterm", () => {
         onTerminalActivityChange: () => undefined,
       },
     });
+    const originalWrite = entry.terminal.write.bind(entry.terminal);
+    const retainedOutputs = [
+      "\r\nLIVE-DURING-FINAL-BEGIN|",
+      "x".repeat(TERMINAL_WRITE_BATCH_SIZE_LIMIT),
+      "|🙂|LIVE-DURING-FINAL-END",
+    ];
+    const expectedRetainedOutput = retainedOutputs.join("");
+    const retainedWrites: string[] = [];
+    const encoder = new TextEncoder();
+    let captureRetainedWrites = false;
+    let firstRetainedWriteParsed = false;
+    let releaseFirstRetainedWriteCallback: (() => void) | undefined;
+    entry.terminal.write = ((data: string | Uint8Array, callback?: () => void) => {
+      if (captureRetainedWrites && typeof data === "string") {
+        const writeNumber = retainedWrites.push(data);
+        originalWrite(data, () => {
+          if (writeNumber === 1) {
+            firstRetainedWriteParsed = true;
+            releaseFirstRetainedWriteCallback = callback;
+            return;
+          }
+          callback?.();
+        });
+        return;
+      }
+      originalWrite(data, callback);
+    }) as Terminal["write"];
     const snapshot = dimensionedSnapshot(32, 8, "9".repeat(64), "RECOVERED-BEFORE-LIVE");
 
     try {
@@ -1233,32 +2370,60 @@ describe("recovered terminal snapshot replay in real xterm", () => {
         threadId: "thread",
         terminalId: entry.terminalId,
         createdAt: new Date().toISOString(),
+        generation: "generation-1",
+        sequence: 1,
         snapshot,
       });
       await waitForCondition(() => resizeInputs.length === 1, "final recovery backend resize");
-      terminalEventListener?.({
-        type: "output",
-        threadId: "thread",
-        terminalId: entry.terminalId,
-        createdAt: new Date().toISOString(),
-        data: "\r\nLIVE-DURING-FINAL",
-        byteLength: 20,
-      });
+      captureRetainedWrites = true;
+      for (const [index, data] of retainedOutputs.entries()) {
+        terminalEventListener?.({
+          type: "output",
+          threadId: "thread",
+          terminalId: entry.terminalId,
+          createdAt: new Date().toISOString(),
+          generation: "generation-1",
+          sequence: index + 2,
+          data,
+          byteLength: encoder.encode(data).byteLength,
+        });
+      }
       resolveResize?.();
 
       await waitForCondition(
-        () => entry.pendingHistoryReplayPromise === null && entry.pendingWriteBytes === 0,
-        "live output after final resize",
+        () => firstRetainedWriteParsed,
+        "xterm parser held after first retained write",
+      );
+      expect(entry.pendingHistoryReplayPromise).not.toBeNull();
+      expect(retainedWrites).toHaveLength(1);
+      releaseFirstRetainedWriteCallback?.();
+
+      await waitForCondition(
+        () =>
+          entry.pendingHistoryReplayPromise === null &&
+          acknowledgedBytes.reduce((total, bytes) => total + bytes, 0) ===
+            encoder.encode(expectedRetainedOutput).byteLength,
+        "batched live output after final resize",
+        10_000,
       );
       const text = bufferText(entry.terminal);
       expect(entry.backendOpenDimensions).toEqual(finalDimensions);
       expect({ cols: entry.terminal.cols, rows: entry.terminal.rows }).toEqual(finalDimensions);
       expect(entry.appliedHistoryRecordIdentity).toBeNull();
-      expect(text.split("LIVE-DURING-FINAL")).toHaveLength(2);
-      expect(text.indexOf("RECOVERED-BEFORE-LIVE")).toBeLessThan(text.indexOf("LIVE-DURING-FINAL"));
+      expect(retainedWrites.length).toBeGreaterThan(1);
+      expect(
+        retainedWrites.every(
+          (write) => encoder.encode(write).byteLength <= TERMINAL_WRITE_BATCH_SIZE_LIMIT,
+        ),
+      ).toBe(true);
+      expect(retainedWrites.join("")).toBe(expectedRetainedOutput);
+      expect(text.split("LIVE-DURING-FINAL-END")).toHaveLength(2);
       expect(resizeInputs).toEqual([finalDimensions]);
-      expect(acknowledgedBytes).toEqual([20]);
+      expect(acknowledgedBytes).toEqual(
+        retainedWrites.map((write) => encoder.encode(write).byteLength),
+      );
     } finally {
+      entry.terminal.write = originalWrite as Terminal["write"];
       disposeRuntimeEntry(entry);
       restoreWindowNativeApi(previousNativeApi);
       document.getElementById("synara-terminal-parking")?.remove();
@@ -1275,6 +2440,7 @@ describe("recovered terminal snapshot replay in real xterm", () => {
     const acknowledgedBytes: number[] = [];
     const nativeApi = {
       terminal: {
+        waitUntilEventStreamReady: waitUntilTerminalEventStreamReady,
         open: async () => legacySnapshot(""),
         write: async () => undefined,
         ackOutput: async (input: { bytes: number }) => {
@@ -1330,6 +2496,8 @@ describe("recovered terminal snapshot replay in real xterm", () => {
             threadId: "thread",
             terminalId: entry.terminalId,
             createdAt: new Date().toISOString(),
+            generation: "generation-1",
+            sequence: 2,
             data: "PRE-CLEAR",
             byteLength: 9,
           });
@@ -1338,12 +2506,16 @@ describe("recovered terminal snapshot replay in real xterm", () => {
             threadId: "thread",
             terminalId: entry.terminalId,
             createdAt: new Date().toISOString(),
+            generation: "generation-1",
+            sequence: 3,
           });
           terminalEventListener?.({
             type: "output",
             threadId: "thread",
             terminalId: entry.terminalId,
             createdAt: new Date().toISOString(),
+            generation: "generation-1",
+            sequence: 4,
             data: "POST-CLEAR",
             byteLength: 10,
           });
@@ -1356,6 +2528,8 @@ describe("recovered terminal snapshot replay in real xterm", () => {
         threadId: "thread",
         terminalId: entry.terminalId,
         createdAt: new Date().toISOString(),
+        generation: "generation-1",
+        sequence: 1,
         snapshot,
       });
       await waitForCondition(
@@ -1384,7 +2558,7 @@ describe("recovered terminal snapshot replay in real xterm", () => {
   });
 
   it.each(["clear", "dispose"] as const)(
-    "chunks the exact retained byte total when an unsafe replay is released by %s",
+    "bounds retained-output ACKs when an unsafe replay is released by %s",
     async (releaseMode) => {
       const host = document.createElement("div");
       host.style.cssText = "position:absolute;left:0;top:0;width:900px;height:320px;display:block;";
@@ -1395,6 +2569,7 @@ describe("recovered terminal snapshot replay in real xterm", () => {
       const acknowledgedBytes: number[] = [];
       const nativeApi = {
         terminal: {
+          waitUntilEventStreamReady: waitUntilTerminalEventStreamReady,
           open: async () => legacySnapshot(""),
           write: async () => undefined,
           ackOutput: async (input: { bytes: number }) => {
@@ -1456,6 +2631,8 @@ describe("recovered terminal snapshot replay in real xterm", () => {
           threadId: "thread",
           terminalId: entry.terminalId,
           createdAt: new Date().toISOString(),
+          generation: "generation-1",
+          sequence: 1,
           snapshot: dimensionedSnapshot(32, 8, "b".repeat(64), "UNSAFE-HISTORY"),
         });
         await waitForCondition(
@@ -1468,6 +2645,8 @@ describe("recovered terminal snapshot replay in real xterm", () => {
           threadId: "thread",
           terminalId: entry.terminalId,
           createdAt: new Date().toISOString(),
+          generation: "generation-1",
+          sequence: 2,
           data: "HELD-LARGE-OUTPUT",
           byteLength: retainedByteTotal,
         });
@@ -1479,6 +2658,8 @@ describe("recovered terminal snapshot replay in real xterm", () => {
             threadId: "thread",
             terminalId: entry.terminalId,
             createdAt: new Date().toISOString(),
+            generation: "generation-1",
+            sequence: 3,
           });
           await waitForCondition(() => entry.runtimeStatus === "ready", "unsafe replay clear");
         } else {
@@ -1486,10 +2667,16 @@ describe("recovered terminal snapshot replay in real xterm", () => {
           disposed = true;
         }
 
-        expect(acknowledgedBytes).toEqual([8_388_608, 8_388_608, 17]);
+        const expectedAcknowledgements =
+          releaseMode === "clear" ? [8_388_608, 8_388_608, 17] : [8_388_608];
+        await waitForCondition(
+          () => acknowledgedBytes.length === expectedAcknowledgements.length,
+          "serialized retained output ACKs",
+        );
+        expect(acknowledgedBytes).toEqual(expectedAcknowledgements);
         expect(acknowledgedBytes.every((bytes) => bytes <= 8_388_608)).toBe(true);
         expect(acknowledgedBytes.reduce((total, bytes) => total + bytes, 0)).toBe(
-          retainedByteTotal,
+          releaseMode === "clear" ? retainedByteTotal : 8_388_608,
         );
       } finally {
         entry.terminal.resize = originalResize as Terminal["resize"];

@@ -20,6 +20,10 @@ describe("runProjectCommandInTerminal", () => {
     const result = await runProjectCommandInTerminal({
       api: {
         terminal: {
+          waitUntilEventStreamReady: vi.fn().mockResolvedValue({
+            type: "ready",
+            generation: "generation-1",
+          }),
           open,
           write,
         },

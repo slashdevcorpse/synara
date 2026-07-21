@@ -6,6 +6,7 @@ import {
   type ContextMenuItem,
   MAX_PINNED_PROJECTS,
   type KeybindingCommand,
+  type OrchestrationLatestTurnState,
   type ProjectId,
   type PullRequestReviewRequestCountResult,
   type ThreadId,
@@ -30,6 +31,7 @@ import {
   SIDEBAR_THREAD_ROW_BASE_CLASS_NAME,
 } from "../sidebarRowStyles";
 import { isDuplicateProjectCreateError } from "../lib/projectCreateRecovery";
+import { isLiveAgentActivityPhase, type AgentActivityPhase } from "../lib/agentActivity";
 import {
   canSessionAnswerPendingRequests,
   hasLiveLatestTurn,
@@ -370,6 +372,13 @@ const THREAD_JUMP_COMMANDS = [
 ] as const satisfies readonly KeybindingCommand[];
 
 export interface ThreadStatusPill {
+  kind:
+    | "working"
+    | "connecting"
+    | "completed"
+    | "pending-approval"
+    | "awaiting-input"
+    | "plan-ready";
   label:
     | "Working"
     | "Connecting"
@@ -384,13 +393,13 @@ export interface ThreadStatusPill {
   dismissalKey?: string;
 }
 
-const THREAD_STATUS_PRIORITY: Record<ThreadStatusPill["label"], number> = {
-  "Pending Approval": 5,
-  "Awaiting Input": 4,
-  Working: 3,
-  Connecting: 3,
-  "Plan Ready": 2,
-  Completed: 1,
+const THREAD_STATUS_PRIORITY: Record<ThreadStatusPill["kind"], number> = {
+  "pending-approval": 5,
+  "awaiting-input": 4,
+  working: 3,
+  connecting: 3,
+  "plan-ready": 2,
+  completed: 1,
 };
 
 type ThreadStatusInput = Pick<
@@ -600,6 +609,7 @@ export function resolveThreadStatusPill(input: {
       return null;
     }
     return {
+      kind: "pending-approval",
       label: "Pending Approval",
       colorClass: "text-amber-600 dark:text-amber-300/90",
       dotClass: "bg-amber-500 dark:bg-amber-300/90",
@@ -615,6 +625,7 @@ export function resolveThreadStatusPill(input: {
       return null;
     }
     return {
+      kind: "awaiting-input",
       label: "Awaiting Input",
       colorClass: "text-indigo-600 dark:text-indigo-300/90",
       dotClass: "bg-indigo-500 dark:bg-indigo-300/90",
@@ -626,6 +637,7 @@ export function resolveThreadStatusPill(input: {
 
   if (thread.hasLiveTailWork) {
     return {
+      kind: "working",
       label: "Working",
       colorClass: "text-sky-600 dark:text-sky-300/80",
       dotClass: "bg-sky-500 dark:bg-sky-300/80",
@@ -639,6 +651,7 @@ export function resolveThreadStatusPill(input: {
     (thread.latestTurn === null || hasLiveLatestTurn(thread.latestTurn, thread.session))
   ) {
     return {
+      kind: "working",
       label: "Working",
       colorClass: "text-sky-600 dark:text-sky-300/80",
       dotClass: "bg-sky-500 dark:bg-sky-300/80",
@@ -649,6 +662,7 @@ export function resolveThreadStatusPill(input: {
 
   if (thread.session?.status === "connecting") {
     return {
+      kind: "connecting",
       label: "Connecting",
       colorClass: "text-sky-600 dark:text-sky-300/80",
       dotClass: "bg-sky-500 dark:bg-sky-300/80",
@@ -672,6 +686,7 @@ export function resolveThreadStatusPill(input: {
       return null;
     }
     return {
+      kind: "plan-ready",
       label: "Plan Ready",
       colorClass: "text-violet-600 dark:text-violet-300/90",
       dotClass: "bg-violet-500 dark:bg-violet-300/90",
@@ -687,6 +702,7 @@ export function resolveThreadStatusPill(input: {
       return null;
     }
     return {
+      kind: "completed",
       label: "Completed",
       colorClass: "text-emerald-600 dark:text-emerald-300/90",
       dotClass: "bg-emerald-500 dark:bg-emerald-300/90",
@@ -708,13 +724,107 @@ export function resolveProjectStatusIndicator(
     if (status === null) continue;
     if (
       highestPriorityStatus === null ||
-      THREAD_STATUS_PRIORITY[status.label] > THREAD_STATUS_PRIORITY[highestPriorityStatus.label]
+      THREAD_STATUS_PRIORITY[status.kind] > THREAD_STATUS_PRIORITY[highestPriorityStatus.kind]
     ) {
       highestPriorityStatus = status;
     }
   }
 
   return highestPriorityStatus;
+}
+
+export function sidebarProjectActivityAccessibleLabel(input: {
+  readonly projectName: string;
+  readonly devServerRunning: boolean;
+  readonly gitActionRunning: boolean;
+  readonly collapsedStatusLabel: string | null;
+}): string | undefined {
+  const labels = [
+    input.collapsedStatusLabel ? `Project status: ${input.collapsedStatusLabel}` : null,
+    input.devServerRunning ? `Dev server running for ${input.projectName}` : null,
+    input.gitActionRunning ? `Git operation running for ${input.projectName}` : null,
+  ].filter((label): label is string => label !== null);
+  return labels.length > 0 ? labels.join(", ") : undefined;
+}
+
+export const SIDEBAR_TRANSIENT_TERMINAL_DISMISS_MS = 3_000;
+
+export function shouldAnnounceSidebarAgentActivity(phase: AgentActivityPhase): boolean {
+  return phase !== "idle" && phase !== "stopped";
+}
+
+export interface SidebarTransientTerminalProjection<TThreadId extends string = ThreadId> {
+  readonly threadId: TThreadId;
+  readonly phase: Extract<AgentActivityPhase, "completed" | "failed" | "interrupted">;
+  readonly turnKey: string;
+  readonly lastEventTimestamp: string | null;
+}
+
+export function projectSidebarTransientTerminalActivity<TThreadId extends string>(input: {
+  readonly activities: ReadonlyArray<{
+    readonly threadId: TThreadId;
+    readonly phase: AgentActivityPhase;
+    readonly turnKey: string | null;
+  }>;
+  readonly threads: ReadonlyArray<{
+    readonly id: TThreadId;
+    readonly latestTurn: {
+      readonly turnId: string;
+      readonly state: OrchestrationLatestTurnState;
+      readonly completedAt: string | null;
+    } | null;
+  }>;
+  readonly observedLiveTurnByThreadId: Map<TThreadId, string>;
+  readonly presentedTerminalTurnByThreadId: Map<TThreadId, string>;
+}): SidebarTransientTerminalProjection<TThreadId>[] {
+  const currentThreadIds = new Set(input.threads.map((thread) => thread.id));
+  for (const threadId of input.observedLiveTurnByThreadId.keys()) {
+    if (!currentThreadIds.has(threadId)) input.observedLiveTurnByThreadId.delete(threadId);
+  }
+  for (const threadId of input.presentedTerminalTurnByThreadId.keys()) {
+    if (!currentThreadIds.has(threadId)) input.presentedTerminalTurnByThreadId.delete(threadId);
+  }
+
+  for (const activity of input.activities) {
+    if (!currentThreadIds.has(activity.threadId)) continue;
+    if (isLiveAgentActivityPhase(activity.phase) && activity.turnKey) {
+      if (input.observedLiveTurnByThreadId.get(activity.threadId) !== activity.turnKey) {
+        input.presentedTerminalTurnByThreadId.delete(activity.threadId);
+      }
+      input.observedLiveTurnByThreadId.set(activity.threadId, activity.turnKey);
+    }
+  }
+
+  const projections: SidebarTransientTerminalProjection<TThreadId>[] = [];
+  for (const thread of input.threads) {
+    const turn = thread.latestTurn;
+    if (!turn || turn.state === "running") continue;
+    const turnKey = String(turn.turnId);
+    if (input.observedLiveTurnByThreadId.get(thread.id) !== turnKey) continue;
+    if (input.presentedTerminalTurnByThreadId.get(thread.id) === turnKey) continue;
+
+    input.presentedTerminalTurnByThreadId.set(thread.id, turnKey);
+    input.observedLiveTurnByThreadId.delete(thread.id);
+    projections.push({
+      threadId: thread.id,
+      phase:
+        turn.state === "error"
+          ? "failed"
+          : turn.state === "interrupted"
+            ? "interrupted"
+            : "completed",
+      turnKey,
+      lastEventTimestamp: turn.completedAt,
+    });
+  }
+  return projections;
+}
+
+export function scheduleSidebarTransientTerminalDismiss<TTimer>(
+  schedule: (callback: () => void, delayMs: number) => TTimer,
+  onDismiss: () => void,
+): TTimer {
+  return schedule(onDismiss, SIDEBAR_TRANSIENT_TERMINAL_DISMISS_MS);
 }
 
 export function findWorkspaceRootMatch<T>(

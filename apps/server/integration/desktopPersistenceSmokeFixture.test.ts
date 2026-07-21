@@ -24,6 +24,7 @@ import {
   DESKTOP_PERSISTENCE_SMOKE_ARM_MARKER,
   DESKTOP_PERSISTENCE_SMOKE_THREAD_ID,
   assertDesktopPersistenceSmokeFixture,
+  formatDesktopPersistenceSmokeFixtureCause,
   seedDesktopPersistenceSmokeFixture,
 } from "./desktopPersistenceSmokeFixture.ts";
 
@@ -91,8 +92,13 @@ async function persistCrashRecoveryOutcome(
 
 describe("desktop persistence smoke fixture", () => {
   it("requires an explicit absolute caller-owned home", async () => {
-    await expect(seedDesktopPersistenceSmokeFixture("relative-home")).rejects.toThrow(
-      "--home-dir must be absolute",
+    const cause: unknown = await seedDesktopPersistenceSmokeFixture("relative-home").catch(
+      (failure: unknown) => failure,
+    );
+
+    expect(cause).toBeInstanceOf(Error);
+    expect(formatDesktopPersistenceSmokeFixtureCause(cause)).toBe(
+      "FixtureInputError: desktop persistence smoke fixture: --home-dir must be absolute; received 'relative-home'.",
     );
   });
 
@@ -105,8 +111,9 @@ describe("desktop persistence smoke fixture", () => {
       const armResult = runFixtureCli("arm", synaraHome);
       expect(armResult.status).toBe(1);
       expect(armResult.stderr).toContain(
-        "arm requires launch A to be running and holding the desktop database lifecycle lock",
+        "FixtureInputError: desktop persistence smoke fixture: arm requires launch A to be running and holding the desktop database lifecycle lock",
       );
+      expect(armResult.stderr).not.toContain("at failInput");
     } finally {
       FS.rmSync(synaraHome, { recursive: true, force: true });
     }

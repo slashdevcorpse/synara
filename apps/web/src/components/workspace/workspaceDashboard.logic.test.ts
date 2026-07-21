@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import type { ProjectId, ProviderKind, ThreadId } from "@synara/contracts";
 
 import type { Project, SidebarThreadSummary } from "~/types";
+import { IDLE_AGENT_ACTIVITY_STATE } from "~/lib/agentActivity";
 import {
   defaultCloneTarget,
   canDragWorkspaceCards,
@@ -10,6 +11,8 @@ import {
   deriveWorkspaceCards,
   filterAndSortWorkspaceCards,
   githubRepositoryFromUrl,
+  hasActiveGitActionForProject,
+  indexWorkspaceProcessSourcesByProject,
   orderWorkspaceCardsPinnedFirst,
   type WorkspaceRepositoryState,
   validateCloneInput,
@@ -17,6 +20,10 @@ import {
 
 const projectId = (value: string) => value as ProjectId;
 const threadId = (value: string) => value as ThreadId;
+
+function agentActivity(phase: "thinking" | "streaming" | "tool-running" | "connecting") {
+  return { ...IDLE_AGENT_ACTIVITY_STATE, phase };
+}
 
 function project(id: string, name: string, updatedAt = "2026-07-18T12:00:00.000Z"): Project {
   return {
@@ -80,6 +87,106 @@ const gitState = (
 });
 
 describe("workspace dashboard derivation", () => {
+  it("indexes process sources by project before deriving dashboard summaries", () => {
+    const oneMain = thread("one-main", "one");
+    const oneArchived = thread("one-archived", "one", {
+      archivedAt: "2026-07-20T12:00:00.000Z",
+    });
+    const twoMain = thread("two-main", "two");
+    const oneAgent = agentActivity("thinking");
+    const oneSubagent = agentActivity("tool-running");
+    const twoAgent = agentActivity("streaming");
+
+    const sources = indexWorkspaceProcessSourcesByProject({
+      agents: [
+        {
+          projectId: projectId("one"),
+          activityState: oneAgent,
+          isSubagent: false,
+        },
+        {
+          projectId: projectId("one"),
+          activityState: oneSubagent,
+          isSubagent: true,
+        },
+        {
+          projectId: projectId("two"),
+          activityState: twoAgent,
+          isSubagent: false,
+        },
+      ],
+      threads: [oneMain, oneArchived, twoMain],
+      terminalStateByThreadId: {
+        [oneMain.id]: { runningTerminalIds: ["one-a", "one-b"] },
+        [twoMain.id]: { runningTerminalIds: ["two-a"] },
+        [threadId("orphan")]: { runningTerminalIds: ["orphan-a"] },
+      },
+    });
+
+    expect(sources.get(projectId("one"))).toEqual({
+      agents: [
+        { state: oneAgent, isSubagent: false },
+        { state: oneSubagent, isSubagent: true },
+      ],
+      terminalProcessCount: 2,
+      threads: [oneMain, oneArchived],
+    });
+    expect(sources.get(projectId("two"))).toEqual({
+      agents: [{ state: twoAgent, isSubagent: false }],
+      terminalProcessCount: 1,
+      threads: [twoMain],
+    });
+    expect(sources.has(projectId("orphan"))).toBe(false);
+  });
+
+  it("matches active Git actions to project and live worktree paths", () => {
+    const target = project("one", "One");
+    const threads = [
+      thread("live", "one", {
+        worktreePath: "C:\\code\\one-worktree",
+        associatedWorktreePath: "C:\\code\\one-associated",
+      }),
+      thread("archived", "one", {
+        worktreePath: "C:\\code\\archived-worktree",
+        archivedAt: "2026-07-20T12:00:00.000Z",
+      }),
+      thread("other-project", "two", { worktreePath: "C:\\code\\other-worktree" }),
+    ];
+    const matches = (cwd: string) =>
+      hasActiveGitActionForProject({
+        project: target,
+        threads,
+        activeActionCwds: [cwd],
+        platform: "windows",
+      });
+
+    expect(matches("c:/CODE/One/")).toBe(true);
+    expect(matches("c:/code/ONE-WORKTREE")).toBe(true);
+    expect(matches("c:/code/one-associated/")).toBe(true);
+    expect(matches("C:\\code\\archived-worktree")).toBe(false);
+    expect(matches("C:\\code\\other-worktree")).toBe(false);
+  });
+
+  it("keeps POSIX Git action path matching case-sensitive", () => {
+    const target = { ...project("one", "One"), cwd: "/work/Repo" };
+    expect(
+      hasActiveGitActionForProject({
+        project: target,
+        threads: [],
+        activeActionCwds: ["/work/repo"],
+        platform: "posix",
+      }),
+    ).toBe(false);
+    expect(
+      hasActiveGitActionForProject({
+        project: target,
+        threads: [],
+        activeActionCwds: ["/work/Repo/"],
+        platform: "posix",
+      }),
+    ).toBe(true);
+  });
+
   it("uses an explicit loading repository state until status data arrives", () => {
     const cards = deriveWorkspaceCards({
       projects: [project("pending", "Pending")],
@@ -91,12 +198,13 @@ describe("workspace dashboard derivation", () => {
     expect(cards[0]?.repository).toEqual({ kind: "loading" });
   });
 
-  it("selects actionable activity before working and aggregates unique worktrees/providers", () => {
+  it("prefers approval over newer input and working activity", () => {
     const repositoryByProjectId = new Map([[projectId("one"), gitState(2)]]);
     const cards = deriveWorkspaceCards({
       projects: [project("one", "One")],
       repositoryByProjectId,
       worktreePathPlatform: "windows",
+      agentActivityByThreadId: new Map([[threadId("working"), agentActivity("thinking")]]),
       threads: [
         thread("working", "one", {
           hasLiveTailWork: true,
@@ -123,6 +231,17 @@ describe("workspace dashboard derivation", () => {
           associatedWorktreePath: "c:/code/one-wt",
           associatedWorktreeBranch: "feature",
           updatedAt: "2026-07-19T14:00:00.000Z",
+        }),
+        thread("input", "one", {
+          hasPendingUserInput: true,
+          session: {
+            provider: "codex",
+            status: "running",
+            createdAt: "2026-07-19T12:00:00.000Z",
+            updatedAt: "2026-07-19T15:00:00.000Z",
+            orchestrationStatus: "running",
+          },
+          updatedAt: "2026-07-19T15:00:00.000Z",
         }),
       ],
     });
@@ -193,6 +312,7 @@ describe("workspace dashboard derivation", () => {
       projects: [project("one", "One")],
       repositoryByProjectId: new Map([[projectId("one"), gitState(0)]]),
       worktreePathPlatform: "windows",
+      agentActivityByThreadId: new Map([[child.id, agentActivity("streaming")]]),
       threads: [
         child,
         thread("archived-child", "one", {
@@ -213,7 +333,7 @@ describe("workspace dashboard derivation", () => {
     expect(cards[0]?.recentThread).toBeNull();
     expect(cards[0]?.activity).toMatchObject({
       threadId: child.id,
-      label: "Working",
+      label: "Streaming",
       pulse: true,
     });
     expect(cards[0]?.providers).toEqual(["codex"]);
@@ -282,6 +402,7 @@ describe("workspace dashboard derivation", () => {
       projects: [project("a", "Zulu"), project("b", "Alpha")],
       repositoryByProjectId: repositories,
       worktreePathPlatform: "windows",
+      agentActivityByThreadId: new Map([[threadId("active"), agentActivity("thinking")]]),
       threads: [thread("active", "a", { hasLiveTailWork: true })],
     });
 

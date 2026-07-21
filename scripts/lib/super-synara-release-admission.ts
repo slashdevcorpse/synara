@@ -13,6 +13,7 @@ import {
 } from "node:fs";
 import { basename, join } from "node:path";
 
+import { assertFullCommitSha } from "./git-sha.ts";
 import type {
   ReleaseArtifactDigest,
   ReleaseArtifactProvenanceManifest,
@@ -89,12 +90,6 @@ function renderCanonicalChecksums(directory: string, fileNames: ReadonlyArray<st
   return `${bytewiseSort(fileNames)
     .map((fileName) => `${sha256File(join(directory, fileName))}  ${fileName}`)
     .join("\n")}\n`;
-}
-
-function assertFullSha(label: string, value: string): void {
-  if (!/^[0-9a-f]{40}$/i.test(value)) {
-    throw new Error(`${label} must be a full 40-character commit SHA.`);
-  }
 }
 
 export function superSynaraReleaseFileNames(version: string): SuperSynaraReleaseFileNames {
@@ -359,8 +354,8 @@ export function prepareSuperSynaraRelease(input: {
   const { coordinates } = input;
   assertReleaseScope(input.releaseScope);
   assertMacSignatureAllowlistScope(input);
-  assertFullSha("Source commit", coordinates.sourceCommit);
-  assertFullSha("Absorbed upstream SHA", coordinates.absorbedUpstreamSha);
+  assertFullCommitSha("Source commit", coordinates.sourceCommit);
+  assertFullCommitSha("Absorbed upstream SHA", coordinates.absorbedUpstreamSha);
   if (coordinates.tag !== `super-v${coordinates.version}`) {
     throw new Error(`Release tag must be super-v${coordinates.version}.`);
   }

@@ -13,6 +13,7 @@ import {
 import { resolveWorkspaceAgentInterruptTurnId } from "../../lib/workspaceAgentActivity";
 import { ensureNativeApi } from "../../nativeApi";
 import { useStore } from "../../store";
+import { useTerminalStateStore } from "../../terminalStateStore";
 import { getThreadFromState } from "../../threadDerivation";
 import type { Thread } from "../../types";
 import { newCommandId } from "../../lib/utils";
@@ -201,10 +202,20 @@ export async function stopAllWorkspaceAgents(
 
 export function WorkspaceAgentSection({
   onOpenThread,
+  onStartChat,
+  onStartTerminalWorkstream,
 }: {
   onOpenThread: (threadId: ThreadId) => void;
+  onStartChat?: () => void;
+  onStartTerminalWorkstream?: () => void;
 }) {
   const activity = useWorkspaceAgentActivity();
+  const terminalProcessCount = useTerminalStateStore((state) =>
+    Object.values(state.terminalStateByThreadId).reduce(
+      (count, terminalState) => count + terminalState.runningTerminalIds.length,
+      0,
+    ),
+  );
 
   const stopThread = useCallback((entry: AgentThreadEntry) => stopWorkspaceAgent(entry), []);
   const stopAll = useCallback((entries: AgentThreadEntry[]) => stopAllWorkspaceAgents(entries), []);
@@ -212,9 +223,12 @@ export function WorkspaceAgentSection({
   return (
     <WorkspaceAgentPanel
       activity={activity}
+      terminalProcessCount={terminalProcessCount}
       onOpenThread={onOpenThread}
       onStopThread={stopThread}
       onStopAll={stopAll}
+      {...(onStartChat !== undefined ? { onStartChat } : {})}
+      {...(onStartTerminalWorkstream !== undefined ? { onStartTerminalWorkstream } : {})}
     />
   );
 }

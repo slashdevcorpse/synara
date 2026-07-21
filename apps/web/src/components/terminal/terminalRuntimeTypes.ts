@@ -5,12 +5,20 @@
 import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon } from "@xterm/addon-search";
 import { WebglAddon } from "@xterm/addon-webgl";
+import type { TerminalSessionSnapshot, TerminalSessionStatus } from "@synara/contracts";
 import { type TerminalActivityState, type TerminalCliKind } from "@synara/shared/terminalThreads";
 import { Terminal, type IDisposable } from "@xterm/xterm";
 import type { TerminalLinkMatch } from "../../terminal-links";
+import type { TerminalEventRecovery } from "./terminalEventRecovery";
+import type { TerminalOutputAckQueue } from "./terminalOutputAckQueue";
+
+export type TerminalRecoveryResolution = Pick<
+  TerminalSessionSnapshot,
+  "status" | "exitCode" | "exitSignal"
+>;
 
 export interface TerminalRuntimeCallbacks {
-  onSessionExited: () => void;
+  onSessionExited: (exit: { exitCode: number | null; exitSignal: number | null }) => void;
   onTerminalMetadataChange: (
     terminalId: string,
     metadata: { cliKind: TerminalCliKind | null; label: string },
@@ -20,10 +28,26 @@ export interface TerminalRuntimeCallbacks {
     activity: { hasRunningSubprocess: boolean; agentState: TerminalActivityState | null },
   ) => void;
   onTerminalRuntimeStatusChange?: (terminalId: string, status: TerminalRuntimeStatus) => void;
+  onTerminalRecoveryResolved?: (terminalId: string, recovery: TerminalRecoveryResolution) => void;
 }
 
 export function buildTerminalRuntimeKey(threadId: string, terminalId: string): string {
   return `${threadId}::${terminalId}`;
+}
+
+export function isUnavailableTerminalRecovery(input: {
+  reattachOnly: boolean;
+  status: TerminalSessionStatus;
+}): boolean {
+  return input.reattachOnly && (input.status === "exited" || input.status === "error");
+}
+
+export function shouldScheduleTerminalSnapshotReconcile(input: {
+  reattachOnly: boolean;
+  unavailableRecovery: boolean;
+  outputUnchanged: boolean;
+}): boolean {
+  return !input.reattachOnly && !input.unavailableRecovery && input.outputUnchanged;
 }
 
 export interface TerminalRuntimeConfig {
@@ -35,6 +59,7 @@ export interface TerminalRuntimeConfig {
   cwd: string;
   runtimeEnv?: Record<string, string>;
   terminalRightClickToPaste?: boolean;
+  reattachOnly?: boolean;
   callbacks: TerminalRuntimeCallbacks;
 }
 
@@ -60,6 +85,7 @@ export interface TerminalRuntimeEntry {
   cwd: string;
   runtimeEnv?: Record<string, string>;
   terminalRightClickToPaste: boolean;
+  reattachOnly: boolean;
   callbacks: TerminalRuntimeCallbacks;
   wrapper: HTMLDivElement;
   container: HTMLDivElement | null;
@@ -94,6 +120,13 @@ export interface TerminalRuntimeEntry {
   linkMatchCache: Map<string, TerminalLinkMatch[]>;
   outputEventVersion: number;
   snapshotReconcileRequestId: number;
+  terminalEventRecovery: TerminalEventRecovery;
+  terminalOutputAckQueue: TerminalOutputAckQueue;
+  needsAuthoritativeRecovery: boolean;
+  authoritativeRecoveryInFlight: boolean;
+  authoritativeRecoveryRetryTimer: number | null;
+  authoritativeRecoveryAttempt: number;
+  authoritativeRecoveryRetryRequested: boolean;
   webglLoadFrame: number | null;
   themeRefreshFrame: number;
   themeObserver: MutationObserver | null;

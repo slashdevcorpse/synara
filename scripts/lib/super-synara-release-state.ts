@@ -2,17 +2,22 @@
 // Purpose: Validates owner, tag, draft, rerun, and publication state transitions.
 // Layer: Release publication admission
 
+import { assertFullCommitSha } from "./git-sha.ts";
+import { hasExactSuperSynaraReleaseIdentity } from "./super-synara-release-identity.ts";
+
 export type SuperSynaraReleasePhase =
   | "preflight"
-  | "reserve-tag"
   | "before-draft"
   | "after-draft"
-  | "before-publish";
+  | "before-publish"
+  | "after-publish";
 
 export interface GitHubReleaseState {
   readonly id: number;
   readonly tagName: string;
   readonly targetCommitish: string;
+  readonly name: string;
+  readonly body: string;
   readonly draft: boolean;
   readonly prerelease: boolean;
 }
@@ -32,30 +37,52 @@ export interface SuperSynaraGitHubStateInput {
   readonly currentRunDraftId?: number;
 }
 
-function assertFullSha(label: string, value: string): void {
-  if (!/^[0-9a-f]{40}$/i.test(value)) {
-    throw new Error(`${label} must be a full 40-character commit SHA.`);
-  }
+export type SuperSynaraGitHubPolicyInput = Pick<
+  SuperSynaraGitHubStateInput,
+  | "repository"
+  | "refName"
+  | "actor"
+  | "triggeringActor"
+  | "owner"
+  | "tag"
+  | "sourceCommit"
+  | "currentRunDraftId"
+>;
+
+export class SuperSynaraGitHubStateVisibilityError extends Error {
+  override readonly name = "SuperSynaraGitHubStateVisibilityError";
 }
 
-export function validateSuperSynaraGitHubState(input: SuperSynaraGitHubStateInput): void {
+export function validateSuperSynaraGitHubPolicy(input: SuperSynaraGitHubPolicyInput): void {
   if (input.repository !== "slashdevcorpse/synara" || input.refName !== "main") {
     throw new Error(
       "Super Synara publication is restricted to slashdevcorpse/synara protected main.",
     );
   }
-  if (input.actor !== input.owner || input.triggeringActor !== input.owner) {
-    throw new Error("Both github.actor and github.triggering_actor must be the repository owner.");
+  const ownerDispatch = input.actor === input.owner && input.triggeringActor === input.owner;
+  const automatedDispatch =
+    input.actor === "github-actions[bot]" && input.triggeringActor === "github-actions[bot]";
+  if (!ownerDispatch && !automatedDispatch) {
+    throw new Error(
+      "Super Synara publication must be dispatched by the repository owner or its exact GitHub Actions scheduler.",
+    );
   }
   if (!/^super-v\d+\.\d+\.\d+-super\.[1-9]\d*$/.test(input.tag)) {
     throw new Error(`Invalid immutable Super Synara tag: ${input.tag}.`);
   }
-  assertFullSha("Source commit", input.sourceCommit);
+  assertFullCommitSha("Source commit", input.sourceCommit);
+  if (!Number.isSafeInteger(input.currentRunDraftId) || input.currentRunDraftId! <= 0) {
+    throw new Error("Publication requires the exact current-run GitHub draft release ID.");
+  }
+}
+
+export function validateSuperSynaraGitHubState(input: SuperSynaraGitHubStateInput): void {
+  validateSuperSynaraGitHubPolicy(input);
   if (input.tagCommit !== null) {
     if (input.tagObjectType !== "commit") {
       throw new Error(`Reserved tag ${input.tag} must resolve directly to a commit object.`);
     }
-    assertFullSha("Tag commit", input.tagCommit);
+    assertFullCommitSha("Tag commit", input.tagCommit);
     if (input.tagCommit.toLowerCase() !== input.sourceCommit.toLowerCase()) {
       throw new Error(
         `Reserved tag ${input.tag} points to ${input.tagCommit}, not ${input.sourceCommit}.`,
@@ -67,39 +94,37 @@ export function validateSuperSynaraGitHubState(input: SuperSynaraGitHubStateInpu
   }
 
   const tagReleases = input.releases.filter((release) => release.tagName === input.tag);
-  const beforeDraft =
-    input.phase === "preflight" || input.phase === "reserve-tag" || input.phase === "before-draft";
-  if (beforeDraft) {
-    if (tagReleases.length > 0) {
-      const kinds = tagReleases.map((release) => (release.draft ? "draft" : "public")).join(", ");
-      throw new Error(`Tag ${input.tag} already has a ${kinds} release; fail closed.`);
-    }
-    if (input.phase === "before-draft" && input.tagCommit === null) {
-      throw new Error("Draft creation requires the reserved tag at the exact source commit.");
-    }
-    return;
+  if (input.phase === "after-publish" && input.tagCommit === null) {
+    throw new SuperSynaraGitHubStateVisibilityError(
+      "Published release requires the immutable tag at the exact source commit.",
+    );
   }
-
-  if (input.tagCommit === null) {
-    throw new Error("Publication requires the reserved tag at the exact source commit.");
+  if (tagReleases.length === 0) {
+    throw new SuperSynaraGitHubStateVisibilityError(
+      `Expected the current-run release for ${input.tag}, but it is not visible yet.`,
+    );
   }
-  if (!Number.isSafeInteger(input.currentRunDraftId) || input.currentRunDraftId! <= 0) {
-    throw new Error("Publication requires the exact current-run GitHub draft release ID.");
-  }
-  if (tagReleases.length !== 1) {
+  if (tagReleases.length > 1) {
     throw new Error(
-      `Expected exactly one current-run draft for ${input.tag}, found ${tagReleases.length}.`,
+      `Expected exactly one current-run release for ${input.tag}, found ${tagReleases.length}.`,
     );
   }
   const release = tagReleases[0]!;
-  if (
-    release.id !== input.currentRunDraftId ||
-    !release.draft ||
-    !release.prerelease ||
-    release.targetCommitish.toLowerCase() !== input.sourceCommit.toLowerCase()
-  ) {
+  const version = input.tag.replace(/^super-v/, "");
+  const expectedDraft = input.phase !== "after-publish";
+  if (release.id !== input.currentRunDraftId) {
     throw new Error(
-      "Existing draft is not the exact current-run prerelease for the source commit.",
+      `Release ${release.id} for ${input.tag} is not current-run draft ${input.currentRunDraftId}.`,
+    );
+  }
+  if (
+    release.draft !== expectedDraft ||
+    !release.prerelease ||
+    release.targetCommitish.toLowerCase() !== input.sourceCommit.toLowerCase() ||
+    !hasExactSuperSynaraReleaseIdentity(release, version)
+  ) {
+    throw new SuperSynaraGitHubStateVisibilityError(
+      `Existing release is not the exact owned Release Drafter ${expectedDraft ? "draft " : ""}prerelease for the source commit.`,
     );
   }
 }

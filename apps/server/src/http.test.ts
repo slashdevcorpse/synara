@@ -4,11 +4,12 @@ import os from "node:os";
 import path from "node:path";
 
 import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
+import { WEB_DOCUMENT_SECURITY_HEADERS } from "@synara/shared/webSecurity";
 import { Effect, Exit, Layer, Scope } from "effect";
 import { HttpRouter } from "effect/unstable/http";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { ServerAuth, type ServerAuthShape } from "./auth/Services/ServerAuth";
+import { AuthError, ServerAuth, type ServerAuthShape } from "./auth/Services/ServerAuth";
 import {
   resolveDefaultChatWorkspaceRoot,
   resolveDefaultStudioWorkspaceRoot,
@@ -94,16 +95,22 @@ const readiness: ServerReadiness = {
   }),
 };
 
-const serverAuth = {
-  authenticateHttpRequest: () =>
-    Effect.succeed({
-      sessionId: "11111111-1111-4111-8111-111111111111" as never,
-      subject: "test-owner",
-      method: "browser-session-cookie" as const,
-      role: "owner" as const,
-      credentialSource: "cookie" as const,
-    }),
-} as unknown as ServerAuthShape;
+const authenticatedSession = {
+  sessionId: "11111111-1111-4111-8111-111111111111" as never,
+  subject: "test-owner",
+  method: "browser-session-cookie" as const,
+  role: "owner" as const,
+  credentialSource: "cookie" as const,
+};
+
+function makeServerAuth(
+  authenticateHttpRequest: ServerAuthShape["authenticateHttpRequest"] = () =>
+    Effect.succeed(authenticatedSession),
+): ServerAuthShape {
+  return {
+    authenticateHttpRequest,
+  } as unknown as ServerAuthShape;
+}
 
 const projectFaviconResolver: ProjectFaviconResolverShape = {
   resolvePath: () => Effect.succeed(null),
@@ -120,6 +127,7 @@ async function withEffectServer(
   config: ServerConfigShape,
   route: TestedRoute,
   run: (origin: string) => Promise<void>,
+  auth: ServerAuthShape = makeServerAuth(),
 ): Promise<void> {
   const scope = await Effect.runPromise(Scope.make("sequential"));
   let nodeServer: http.Server | null = null;
@@ -153,7 +161,7 @@ async function withEffectServer(
           Effect.provide(
             Layer.mergeAll(
               Layer.succeed(ServerConfig, config),
-              Layer.succeed(ServerAuth, serverAuth),
+              Layer.succeed(ServerAuth, auth),
               Layer.succeed(ProjectFaviconResolver, projectFaviconResolver),
               NodeHttpServer.layerHttpServices,
             ),
@@ -191,18 +199,72 @@ describe("production Effect HTTP routes", () => {
         url: new URL("http://127.0.0.1/attachments/id?token=desktop-secret"),
       }),
     ).toBe(false);
+    expect(
+      isLegacyTokenAuthorized({
+        config: { ...loopback, allowUnauthenticatedLoopback: false },
+        url: new URL("http://127.0.0.1/attachments/id?token=desktop-secret"),
+      }),
+    ).toBe(false);
   });
 
-  it("serves readiness through the deployed health route", async () => {
-    await withEffectServer(makeConfig(), { kind: "health", readiness }, async (origin) => {
-      const response = await fetch(`${origin}/health`);
-      expect(response.status).toBe(200);
-      await expect(response.json()).resolves.toMatchObject({
-        status: "ok",
-        startupReady: false,
-        pushBusReady: true,
-      });
-    });
+  it("serves readiness without authentication for a private loopback deployment", async () => {
+    const authenticateHttpRequest = vi.fn(() =>
+      Effect.fail(new AuthError({ message: "Unauthorized", status: 401 })),
+    );
+    await withEffectServer(
+      makeConfig(),
+      { kind: "health", readiness },
+      async (origin) => {
+        const response = await fetch(`${origin}/health`);
+        expect(response.status).toBe(200);
+        await expect(response.json()).resolves.toMatchObject({
+          status: "ok",
+          startupReady: false,
+          pushBusReady: true,
+        });
+      },
+      makeServerAuth(authenticateHttpRequest),
+    );
+    expect(authenticateHttpRequest).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {
+      label: "a non-loopback bind",
+      config: { host: "0.0.0.0", allowInsecureRemote: true },
+    },
+    {
+      label: "a configured public URL",
+      config: { publicUrl: new URL("https://synara.example.test/") },
+    },
+  ])("requires authentication for $label", async ({ config }) => {
+    const authenticateHttpRequest = vi.fn((request) =>
+      request.headers.authorization === "Bearer valid-session"
+        ? Effect.succeed(authenticatedSession)
+        : Effect.fail(new AuthError({ message: "Unauthorized", status: 401 })),
+    );
+
+    await withEffectServer(
+      makeConfig(config),
+      { kind: "health", readiness },
+      async (origin) => {
+        const unauthorized = await fetch(`${origin}/health`);
+        expect(unauthorized.status).toBe(401);
+        await expect(unauthorized.json()).resolves.toEqual({ error: "Unauthorized" });
+
+        const authenticated = await fetch(`${origin}/health`, {
+          headers: { Authorization: "Bearer valid-session" },
+        });
+        expect(authenticated.status).toBe(200);
+        await expect(authenticated.json()).resolves.toMatchObject({
+          status: "ok",
+          startupReady: false,
+          pushBusReady: true,
+        });
+      },
+      makeServerAuth(authenticateHttpRequest),
+    );
+    expect(authenticateHttpRequest).toHaveBeenCalledTimes(2);
   });
 
   it("accepts and idempotently replays the dedicated desktop shutdown request", async () => {
@@ -322,15 +384,35 @@ describe("production Effect HTTP routes", () => {
     mkdirSync(path.join(staticDir, "assets"), { recursive: true });
     writeFileSync(path.join(staticDir, "index.html"), "<main>Synara shell</main>");
     writeFileSync(path.join(staticDir, "assets", "app.js"), "globalThis.synara = true;");
+    writeFileSync(path.join(staticDir, "assets", "document.xhtml"), "<main>XHTML shell</main>");
     await withEffectServer(makeConfig({ staticDir }), { kind: "static" }, async (origin) => {
       const asset = await fetch(`${origin}/assets/app.js`);
       expect(asset.status).toBe(200);
+      expect(asset.headers.get("content-security-policy")).toBeNull();
       await expect(asset.text()).resolves.toContain("globalThis.synara");
+
+      const xhtml = await fetch(`${origin}/assets/document.xhtml`);
+      expect(xhtml.status).toBe(200);
+      expect(xhtml.headers.get("content-type")).toContain("application/xhtml+xml");
+      expect(xhtml.headers.get("content-security-policy")).toBe(
+        WEB_DOCUMENT_SECURITY_HEADERS["Content-Security-Policy"],
+      );
+      expect(xhtml.headers.get("x-content-type-options")).toBe("nosniff");
 
       const fallback = await fetch(`${origin}/chat/thread-id`);
       expect(fallback.status).toBe(200);
       expect(fallback.headers.get("content-type")).toContain("text/html");
+      expect(fallback.headers.get("content-security-policy")).toBe(
+        WEB_DOCUMENT_SECURITY_HEADERS["Content-Security-Policy"],
+      );
+      expect(fallback.headers.get("x-content-type-options")).toBe("nosniff");
       await expect(fallback.text()).resolves.toContain("Synara shell");
+
+      const index = await fetch(`${origin}/index.html`);
+      expect(index.status).toBe(200);
+      expect(index.headers.get("content-security-policy")).toBe(
+        WEB_DOCUMENT_SECURITY_HEADERS["Content-Security-Policy"],
+      );
     });
   });
 

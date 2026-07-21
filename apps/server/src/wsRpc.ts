@@ -54,7 +54,7 @@ import {
   requireActiveProjectForDevServer,
 } from "./devServerManager";
 import { makeEditorAvailability, type EditorAvailabilitySnapshot } from "./editorAvailability";
-import { GitCore } from "./git/Services/GitCore";
+import { GitCore, type GitCoreShape } from "./git/Services/GitCore";
 import { GitManager } from "./git/Services/GitManager";
 import { GitHubCliError } from "./git/Errors";
 import { GitStatusBroadcaster } from "./git/Services/GitStatusBroadcaster";
@@ -67,7 +67,7 @@ import {
   recordGitHandoffResult,
 } from "./gitHandoffOperations";
 import { Keybindings } from "./keybindings";
-import { createLocalPreviewGrant } from "./localImageFiles";
+import { createLocalPreviewGrant, LocalPreviewGrantCapacityError } from "./localImageFiles";
 import { listLocalServers, stopLocalServer } from "./localServerMonitor";
 import {
   attachmentPrincipalForSession,
@@ -84,7 +84,10 @@ import {
 } from "./orchestration/shellSync";
 import { OrchestrationEngineService } from "./orchestration/Services/OrchestrationEngine";
 import { ProviderCommandReactor } from "./orchestration/Services/ProviderCommandReactor";
-import { ProjectionSnapshotQuery } from "./orchestration/Services/ProjectionSnapshotQuery";
+import {
+  ProjectionSnapshotQuery,
+  type ProjectionSnapshotQueryShape,
+} from "./orchestration/Services/ProjectionSnapshotQuery";
 import { shouldPublishThreadShellForEvent } from "./orchestration/threadShellEvents";
 import { ProviderDiscoveryService } from "./provider/Services/ProviderDiscoveryService";
 import { discoverSkillsCatalog, synaraSkillsDir } from "./provider/skillsCatalog";
@@ -101,11 +104,16 @@ import { ServerRuntimeStartup } from "./serverRuntimeStartup";
 import { ServerSettingsService } from "./serverSettings";
 import { isLoopbackHost } from "./startupAccess";
 import { TerminalManager } from "./terminal/Services/Manager";
+import { makeTerminalEventStream } from "./terminal/terminalEventStream";
 import { TerminalThreadTitleTracker } from "./terminal/terminalThreadTitleTracker";
 import { WorkspaceEntries } from "./workspace/Services/WorkspaceEntries";
 import { WorkspaceFileSystem } from "./workspace/Services/WorkspaceFileSystem";
 import { WorkspaceCloneJobs } from "./workspace/cloneRepository";
 import { makeWorkspaceCloneProjectCreator } from "./workspace/cloneProjectCreation";
+import {
+  logManagedWorktreeReconciliation,
+  reconcileManagedWorktrees,
+} from "./workspace/managedWorktree";
 import { WorkspaceGitStates } from "./workspace/workspaceGitStates";
 import { makeWsStreamAdmission } from "./wsStreamAdmission";
 import { makeWsRequestAdmission } from "./wsRequestAdmission";
@@ -122,6 +130,25 @@ import { resolveGitHubRepository } from "./pullRequests/repositoryResolution";
 
 const MAX_DIAGNOSTIC_CHILD_PROCESSES = 80;
 const MAX_DIAGNOSTIC_ARGS_CHARS = 500;
+
+export function listManagedWorktreesForRpc(input: {
+  readonly worktreesDir: string;
+  readonly git: Pick<GitCoreShape, "removeWorktree" | "statusDetails">;
+  readonly projectionSnapshotQuery: Pick<ProjectionSnapshotQueryShape, "getCommandReadModel">;
+}) {
+  return input.projectionSnapshotQuery.getCommandReadModel().pipe(
+    Effect.flatMap((snapshot) =>
+      reconcileManagedWorktrees({
+        worktreesDir: input.worktreesDir,
+        threads: snapshot.threads,
+        git: input.git,
+        pruneOrphans: false,
+      }),
+    ),
+    Effect.tap((result) => logManagedWorktreeReconciliation("list", result)),
+    Effect.map((result) => ({ worktrees: result.worktrees })),
+  );
+}
 
 class WsRequestAdmissionMiddleware extends RpcMiddleware.Service<WsRequestAdmissionMiddleware>()(
   "synara/WsRequestAdmissionMiddleware",
@@ -224,13 +251,19 @@ function readDescendantProcesses(rootPid: number): Promise<ProcessTableRow[]> {
 }
 
 function toWsRpcError(cause: unknown, fallbackMessage: string) {
-  return Schema.is(WsRpcError)(cause)
-    ? cause
-    : new WsRpcError({
-        message:
-          cause instanceof Error && cause.message.length > 0 ? cause.message : fallbackMessage,
-        cause,
-      });
+  if (Schema.is(WsRpcError)(cause)) return cause;
+  if (cause instanceof LocalPreviewGrantCapacityError) {
+    return new WsRpcError({
+      message: cause.message,
+      code: cause.code,
+      retryable: true,
+      retryAfterMs: cause.retryAfterMs,
+    });
+  }
+  return new WsRpcError({
+    message: cause instanceof Error && cause.message.length > 0 ? cause.message : fallbackMessage,
+    cause,
+  });
 }
 
 export function createLocalPreviewGrantRpcEffect(
@@ -597,6 +630,11 @@ const makeWsRpcHandlersLayer = () =>
       const loadServerConfig = loadServerConfigSnapshot.pipe(
         Effect.map((snapshot) => snapshot.config),
       );
+      const listManagedWorktrees = listManagedWorktreesForRpc({
+        worktreesDir: config.worktreesDir,
+        projectionSnapshotQuery: projectionReadModelQuery,
+        git,
+      });
 
       const refreshGitStatusAfter = <A, E, R>(cwd: string, effect: Effect.Effect<A, E, R>) =>
         effect.pipe(
@@ -881,9 +919,14 @@ const makeWsRpcHandlersLayer = () =>
           rpcEffect(workspaceEntries.searchLocal(input), "Failed to search local entries"),
         [WS_METHODS.projectsReadFile]: (input) =>
           rpcEffect(workspaceFileSystem.readFile(input), "Failed to read workspace file"),
-        [WS_METHODS.projectsCreateLocalFilePreviewGrant]: (input) =>
+        [WS_METHODS.projectsCreateLocalFilePreviewGrant]: (input, { clientId }) =>
           rpcEffect(
             Effect.gen(function* () {
+              const principal = yield* CurrentManagedAttachmentPrincipal;
+              const ownerKey =
+                principal.ownerKind === "session"
+                  ? `session:${principal.ownerId}`
+                  : `client:${clientId}`;
               const allowedWorkspaceRoots = new Set<string>();
               if (input.scope === "directory") {
                 // The renderer may name a cwd, but only durable server-known
@@ -903,6 +946,7 @@ const makeWsRpcHandlersLayer = () =>
               }
               return yield* createLocalPreviewGrantRpcEffect({
                 requestedPath: input.path,
+                ownerKey,
                 ...(input.cwd !== undefined ? { cwd: input.cwd } : {}),
                 ...(input.scope !== undefined ? { scope: input.scope } : {}),
                 ...(input.purpose !== undefined ? { purpose: input.purpose } : {}),
@@ -1192,6 +1236,8 @@ const makeWsRpcHandlersLayer = () =>
             ),
             "Failed to open terminal",
           ),
+        [WS_METHODS.terminalSnapshot]: (input) =>
+          rpcEffect(terminalManager.snapshot(input), "Failed to snapshot terminal"),
         [WS_METHODS.terminalWrite]: (input) =>
           rpcEffect(
             terminalManager.write(input).pipe(
@@ -1220,8 +1266,18 @@ const makeWsRpcHandlersLayer = () =>
           ),
         [WS_METHODS.terminalClose]: (input) =>
           rpcEffect(
-            resetTerminalTitleBuffer(input.threadId, input.terminalId ?? null).pipe(
-              Effect.andThen(terminalManager.close(input)),
+            terminalManager.close(input).pipe(
+              Effect.andThen(
+                Effect.sync(() => {
+                  if (input.terminalIds) {
+                    for (const terminalId of input.terminalIds) {
+                      terminalTitleTracker.reset(input.threadId, terminalId);
+                    }
+                  } else {
+                    terminalTitleTracker.reset(input.threadId, input.terminalId ?? null);
+                  }
+                }),
+              ),
             ),
             "Failed to close terminal",
           ),
@@ -1231,14 +1287,7 @@ const makeWsRpcHandlersLayer = () =>
           streamAdmission.guard(
             clientId,
             { key: "terminal.events" },
-            Stream.callback((queue) =>
-              Effect.gen(function* () {
-                const unsubscribe = yield* terminalManager.subscribe((event) => {
-                  Effect.runFork(Queue.offer(queue, event).pipe(Effect.asVoid));
-                });
-                yield* Effect.addFinalizer(() => Effect.sync(unsubscribe));
-              }),
-            ),
+            makeTerminalEventStream(terminalManager.subscribe, terminalManager.generation),
           ),
 
         [WS_METHODS.serverGetConfig]: () =>
@@ -1255,7 +1304,8 @@ const makeWsRpcHandlersLayer = () =>
             "Failed to refresh providers",
           ),
         [WS_METHODS.serverUpdateProvider]: (input) => providerHealth.updateProvider(input),
-        [WS_METHODS.serverListWorktrees]: () => Effect.succeed({ worktrees: [] }),
+        [WS_METHODS.serverListWorktrees]: () =>
+          rpcEffect(listManagedWorktrees, "Failed to list managed worktrees"),
         [WS_METHODS.serverListLocalServers]: () =>
           rpcEffect(
             Effect.promise(() => listLocalServers()),
@@ -1611,7 +1661,8 @@ function trustedWebSocketRequestUrl(
 }
 
 export function authenticateRpcWebSocketUpgrade(input: {
-  readonly config: Pick<ServerConfigShape, "authToken" | "host" | "publicUrl">;
+  readonly config: Pick<ServerConfigShape, "authToken" | "host" | "publicUrl"> &
+    Partial<Pick<ServerConfigShape, "allowUnauthenticatedLoopback">>;
   readonly legacyToken: string | null;
   readonly request: AuthRequest;
   readonly serverAuth: Pick<ServerAuthShape, "authenticateWebSocketUpgrade">;
@@ -1620,6 +1671,7 @@ export function authenticateRpcWebSocketUpgrade(input: {
     !requiresWebSocketAuthentication(input.config) ||
     (isLoopbackHost(input.config.host) &&
       !input.config.publicUrl &&
+      input.config.allowUnauthenticatedLoopback !== false &&
       input.legacyToken === input.config.authToken)
   ) {
     return Effect.succeed(null);
@@ -1709,7 +1761,7 @@ export function makeWebsocketRpcRouteLayer<R>(
   );
 }
 
-function makeWebsocketBootstrapRouteLayer<R>(
+export function makeWebsocketBootstrapRouteLayer<R>(
   bootstrapWebSocketHttpEffectSource: Effect.Effect<
     Effect.Effect<
       HttpServerResponse.HttpServerResponse,
@@ -1730,12 +1782,44 @@ function makeWebsocketBootstrapRouteLayer<R>(
         Effect.gen(function* () {
           const request = yield* HttpServerRequest.HttpServerRequest;
           const config = yield* ServerConfig;
+          const serverAuth = yield* ServerAuth;
+          const sessions = yield* SessionCredentialService;
           const url = trustedWebSocketRequestUrl(request, config);
           if (!url) {
             return HttpServerResponse.text("Forbidden", { status: 403 });
           }
-          return yield* bootstrapWebSocketHttpEffect;
-        }),
+          const authenticatedSession = yield* authenticateRpcWebSocketUpgrade({
+            config,
+            legacyToken: url.searchParams.get("token"),
+            request: makeEffectAuthRequest(request),
+            serverAuth,
+          });
+
+          if (!authenticatedSession) {
+            return yield* bootstrapWebSocketHttpEffect;
+          }
+
+          return yield* sessions.runAuthenticatedConnection(
+            authenticatedSession.sessionId,
+            bootstrapWebSocketHttpEffect,
+          );
+        }).pipe(
+          Effect.catchTags({
+            AuthError: (error) => Effect.succeed(authErrorResponse(error)),
+            SessionCapacityError: (error) =>
+              Effect.succeed(
+                HttpServerResponse.text(error.message, {
+                  status: 429,
+                  headers: {
+                    "Cache-Control": "no-store",
+                    "Retry-After": String(error.retryAfterSeconds),
+                  },
+                }),
+              ),
+            SessionCredentialError: (error) =>
+              Effect.succeed(HttpServerResponse.text(error.message, { status: 401 })),
+          }),
+        ),
       );
     }),
   );

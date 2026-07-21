@@ -7,6 +7,7 @@
 
 import type { ThreadId } from "@synara/contracts";
 import { pluralize } from "@synara/shared/text";
+import { useEffect, useRef } from "react";
 
 import {
   BackgroundTrayIcon,
@@ -20,6 +21,7 @@ import {
 import {
   subagentStatusDotClassName,
   subagentStatusTextToneClassName,
+  summarizeSettledSubagents,
 } from "~/lib/subagentPresentation";
 import { cn } from "~/lib/utils";
 import { Button } from "../ui/button";
@@ -65,6 +67,24 @@ export const ComposerSubagentStrip = function ComposerSubagentStrip({
     (item): item is ComposerSubagentStripItem => item.kind === "subagent",
   );
   const runningCount = subagentItems.filter((item) => item.isActive).length;
+  const settledSummary = summarizeSettledSubagents(subagentItems.map((item) => item.statusKind));
+  const settledEpisodeKey = settledSummary
+    ? subagentItems
+        .map((item) => item.key)
+        .toSorted()
+        .join("\u0000")
+    : null;
+  const autoCompactedEpisodeRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (settledEpisodeKey === null) {
+      autoCompactedEpisodeRef.current = null;
+      return;
+    }
+    if (autoCompactedEpisodeRef.current === settledEpisodeKey) return;
+    autoCompactedEpisodeRef.current = settledEpisodeKey;
+    onCompactChange(true);
+  }, [onCompactChange, settledEpisodeKey]);
 
   return (
     <ComposerStackedPanel
@@ -75,14 +95,21 @@ export const ComposerSubagentStrip = function ComposerSubagentStrip({
       <ComposerStackedPanelHeaderRow>
         <ComposerStackedPanelRowMain>
           {compact && runningCount > 0 ? (
-            <LoaderIcon className={cn(COMPOSER_STACKED_PANEL_ICON_CLASS_NAME, "animate-spin")} />
+            <LoaderIcon
+              className={cn(
+                COMPOSER_STACKED_PANEL_ICON_CLASS_NAME,
+                "animate-spin motion-reduce:animate-none",
+              )}
+            />
           ) : (
             <BotIcon className={COMPOSER_STACKED_PANEL_ICON_CLASS_NAME} />
           )}
           <ComposerStackedPanelRowLabel tone="meta">
-            {runningCount > 0
-              ? `${runningCount} of ${subagentItems.length} ${pluralize(subagentItems.length, "subagent")} running`
-              : `${subagentItems.length} ${pluralize(subagentItems.length, "subagent")}`}
+            {settledSummary
+              ? settledSummary.label
+              : runningCount > 0
+                ? `${runningCount} of ${subagentItems.length} ${pluralize(subagentItems.length, "subagent")} running`
+                : `${subagentItems.length} ${pluralize(subagentItems.length, "subagent")}`}
           </ComposerStackedPanelRowLabel>
         </ComposerStackedPanelRowMain>
         {onStopAll && runningCount > 1 ? (
@@ -104,6 +131,7 @@ export const ComposerSubagentStrip = function ComposerSubagentStrip({
           size="icon-xs"
           className={cn("shrink-0", COMPOSER_STACKED_PANEL_ICON_BUTTON_CLASS_NAME)}
           onClick={() => onCompactChange(!compact)}
+          aria-expanded={!compact}
           aria-label={compact ? "Expand subagent strip" : "Collapse subagent strip"}
           title={compact ? "Expand subagent strip" : "Collapse subagent strip"}
         >

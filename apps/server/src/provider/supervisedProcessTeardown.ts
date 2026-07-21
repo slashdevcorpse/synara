@@ -1,6 +1,9 @@
+import { performance } from "node:perf_hooks";
+
 import {
   defaultProcessTreeKiller,
   type CapturedProcess,
+  type CapturedProcessTreeInspection,
   type ProcessTreeKiller,
   type TerminalKillSignal,
 } from "../terminal/processTreeKiller";
@@ -75,12 +78,73 @@ export class ProviderProcessExitUnprovenError extends Error {
 
 const defaultDependencies: SupervisedProcessTeardownDependencies = {
   processTreeKiller: defaultProcessTreeKiller,
-  now: Date.now,
+  now: () => performance.now(),
   sleep: (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
 };
 
 function positiveDuration(value: number | undefined, fallback: number): number {
   return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+const INSPECTION_TIMED_OUT = Symbol("inspection-timed-out");
+const SIGNAL_TIMED_OUT = Symbol("signal-timed-out");
+
+function isPromiseLike<T>(value: T | PromiseLike<T> | undefined): value is PromiseLike<T> {
+  return value !== undefined && typeof (value as PromiseLike<T>).then === "function";
+}
+
+async function inspectBeforeDeadline(
+  inspection: PromiseLike<CapturedProcessTreeInspection>,
+  timeoutMs: number,
+): Promise<CapturedProcessTreeInspection | typeof INSPECTION_TIMED_OUT> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      Promise.resolve(inspection),
+      new Promise<typeof INSPECTION_TIMED_OUT>((resolve) => {
+        timer = setTimeout(() => resolve(INSPECTION_TIMED_OUT), timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+async function signalBeforeDeadline(
+  signal: PromiseLike<void>,
+  timeoutMs: number,
+  abortController: AbortController,
+): Promise<void | typeof SIGNAL_TIMED_OUT> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      Promise.resolve(signal),
+      new Promise<typeof SIGNAL_TIMED_OUT>((resolve) => {
+        timer = setTimeout(() => {
+          resolve(SIGNAL_TIMED_OUT);
+          abortController.abort();
+        }, timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+function signalFailure(
+  cause: unknown,
+  input: {
+    readonly rootPid: number;
+    readonly signal: TerminalKillSignal;
+  },
+): Error {
+  const detail = cause instanceof Error ? cause.message : String(cause);
+  return new Error(
+    `Provider process tree ${input.rootPid} ${input.signal} signaling failed: ${detail}`,
+    cause instanceof Error ? { cause } : undefined,
+  );
 }
 
 function waitForOwnedProcessExit(process: ProcessExitHandle): Promise<void> {
@@ -136,26 +200,68 @@ export async function teardownProviderProcessTree(
   }
 
   const deps = { ...defaultDependencies, ...dependencies };
-  const tree = deps.processTreeKiller.capture(input.rootPid);
   const signalErrors: Error[] = [];
   let rootExited = false;
+  let captureFinished = false;
+  let rootExitedBeforeCaptureFinished = false;
   void input.rootExited.then(
     () => {
       rootExited = true;
+      if (!captureFinished) {
+        rootExitedBeforeCaptureFinished = true;
+      }
     },
     () => {
       // A rejected watcher is not evidence that the owned process exited.
     },
   );
+  const capturedTree = await deps.processTreeKiller.capture(input.rootPid);
+  captureFinished = true;
+  // Flush a root-exit resolution queued in the same turn as capture completion.
+  await Promise.resolve();
+  const captureComplete =
+    capturedTree.captureComplete !== false && !rootExitedBeforeCaptureFinished;
+  // A capture that completed after the owned root exited may describe an
+  // unrelated process that reused the numeric root PID. None of its descendant
+  // identities are safe to signal, even though exit proof must still fail closed.
+  const tree = rootExitedBeforeCaptureFinished
+    ? { descendants: [], captureComplete: false }
+    : capturedTree;
 
-  const signal = (killSignal: TerminalKillSignal, includeRootTree: boolean): void => {
-    deps.processTreeKiller.signal({
-      rootPid: input.rootPid,
-      signal: killSignal,
-      tree,
-      includeRootTree,
-      onError: (error) => signalErrors.push(error),
-    });
+  const signal = async (
+    killSignal: TerminalKillSignal,
+    includeRootTree: boolean,
+    timeoutMs: number,
+  ): Promise<void> => {
+    let acceptsCallbackErrors = true;
+    const abortController = new AbortController();
+    try {
+      const signaling = Promise.resolve().then(() =>
+        deps.processTreeKiller.signal({
+          rootPid: input.rootPid,
+          signal: killSignal,
+          tree,
+          includeRootTree,
+          shouldSignalRootTree: () => !rootExited,
+          abortSignal: abortController.signal,
+          onError: (error) => {
+            if (acceptsCallbackErrors) signalErrors.push(error);
+          },
+        }),
+      );
+      const outcome = await signalBeforeDeadline(signaling, timeoutMs, abortController);
+      if (outcome === SIGNAL_TIMED_OUT) {
+        signalErrors.push(
+          new Error(
+            `Provider process tree ${input.rootPid} ${killSignal} signaling did not settle within ${timeoutMs}ms.`,
+          ),
+        );
+      }
+    } catch (cause) {
+      signalErrors.push(signalFailure(cause, { rootPid: input.rootPid, signal: killSignal }));
+    } finally {
+      acceptsCallbackErrors = false;
+    }
   };
 
   const waitForExitProof = async (timeoutMs: number) => {
@@ -164,11 +270,24 @@ export async function teardownProviderProcessTree(
     do {
       // Flush a root-exit resolution caused synchronously by a signal test double.
       await Promise.resolve();
-      const inspection = deps.processTreeKiller.inspect?.(tree);
+      const inspectionBudgetMs = deadline - deps.now();
+      if (inspectionBudgetMs <= 0) break;
+      let inspection: CapturedProcessTreeInspection | typeof INSPECTION_TIMED_OUT | undefined;
+      try {
+        const pendingInspection = deps.processTreeKiller.inspect?.(tree);
+        inspection = isPromiseLike(pendingInspection)
+          ? await inspectBeforeDeadline(pendingInspection, inspectionBudgetMs)
+          : pendingInspection;
+      } catch {
+        inspection = undefined;
+      }
+      if (inspection === INSPECTION_TIMED_OUT) {
+        return { proven: false as const, remainingDescendants: null };
+      }
       remainingDescendants = inspection?.verified === true ? inspection.survivors : null;
       if (
         rootExited &&
-        tree.captureComplete !== false &&
+        captureComplete &&
         remainingDescendants !== null &&
         remainingDescendants.length === 0
       ) {
@@ -181,18 +300,21 @@ export async function teardownProviderProcessTree(
     return { proven: false as const, remainingDescendants };
   };
 
-  signal("SIGTERM", true);
-  const graceful = await waitForExitProof(
-    positiveDuration(input.termGraceMs, DEFAULT_TERM_GRACE_MS),
-  );
+  // If the owned root exited while descendants were being captured, its numeric
+  // PID may already identify an unrelated process. The untrusted capture was
+  // discarded above; skip the root tree and keep the result unproven.
+  const termGraceMs = positiveDuration(input.termGraceMs, DEFAULT_TERM_GRACE_MS);
+  await signal("SIGTERM", !rootExited, termGraceMs);
+  const graceful = await waitForExitProof(termGraceMs);
   if (graceful.proven) {
     return { escalated: false, signalErrors };
   }
 
   // A root can exit while descendants ignore TERM and become reparented. Preserve the captured
   // identities and force only those descendants rather than re-signalling a potentially reused PID.
-  signal("SIGKILL", !rootExited);
-  const forced = await waitForExitProof(positiveDuration(input.forceExitMs, DEFAULT_FORCE_EXIT_MS));
+  const forceExitMs = positiveDuration(input.forceExitMs, DEFAULT_FORCE_EXIT_MS);
+  await signal("SIGKILL", !rootExited, forceExitMs);
+  const forced = await waitForExitProof(forceExitMs);
   if (forced.proven) {
     return { escalated: true, signalErrors };
   }
@@ -202,6 +324,6 @@ export async function teardownProviderProcessTree(
     rootExited,
     remainingDescendantPids:
       forced.remainingDescendants?.map((descendant) => descendant.pid) ?? null,
-    captureComplete: tree.captureComplete !== false,
+    captureComplete,
   });
 }

@@ -20,6 +20,7 @@ import {
 import {
   MIGRATION_BACKUP_RETENTION,
   MigrationRecoveryRequiredError,
+  MigrationWalCheckpointError,
   createMigrationBackup,
   migrationBackupDirectory,
   migrationRecoveryMarkerPath,
@@ -411,6 +412,7 @@ describe("migration backups", () => {
         expect(walStat.size).toBeGreaterThan(0);
 
         yield* runWithPreMigrationBackup(dbPath, Effect.void);
+        expect((yield* Effect.promise(() => fs.stat(`${dbPath}-wal`))).size).toBe(0);
       }),
     );
 
@@ -426,6 +428,115 @@ describe("migration backups", () => {
       });
     } finally {
       backup.close();
+    }
+  });
+
+  it("fails closed before VACUUM when a live reader prevents WAL truncation", async () => {
+    const dbPath = await makeDbPath();
+    let reader: DatabaseSync | undefined;
+
+    try {
+      await expect(
+        runWithDatabase(
+          dbPath,
+          Effect.gen(function* () {
+            const sql = yield* SqlClient.SqlClient;
+            yield* sql`PRAGMA journal_mode = WAL`;
+            yield* sql`PRAGMA wal_autocheckpoint = 0`;
+            yield* sql`PRAGMA busy_timeout = 1`;
+            yield* sql`CREATE TABLE checkpoint_busy_probe(value TEXT NOT NULL)`;
+            yield* sql`INSERT INTO checkpoint_busy_probe(value) VALUES ('reader-snapshot')`;
+            reader = new DatabaseSync(dbPath);
+            reader.exec("BEGIN");
+            reader.prepare("SELECT value FROM checkpoint_busy_probe").all();
+            yield* sql`INSERT INTO checkpoint_busy_probe(value) VALUES ('writer-after-reader')`;
+
+            yield* createMigrationBackup(dbPath, {
+              sourceVersion: "checkpoint-busy",
+              targetVersion: 1,
+            });
+          }),
+        ),
+      ).rejects.toBeInstanceOf(MigrationWalCheckpointError);
+    } finally {
+      reader?.exec("ROLLBACK");
+      reader?.close();
+    }
+
+    expect(await backupPaths(dbPath)).toEqual([]);
+  });
+
+  it("validates the migrated live database while the recovery marker is still durable", async () => {
+    const dbPath = await makeMigrationCandidate();
+    let migrationCompleted = false;
+    let validationObservedMarker = false;
+
+    await runWithDatabase(
+      dbPath,
+      runWithPreMigrationBackup(
+        dbPath,
+        Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          yield* sql`DELETE FROM marker_failure_probe`;
+          migrationCompleted = true;
+        }),
+        {
+          readLiveDatabaseIntegrity: async () => {
+            expect(migrationCompleted).toBe(true);
+            expect(
+              JSON.parse(await fs.readFile(migrationRecoveryMarkerPath(dbPath), "utf8")),
+            ).toMatchObject({ phase: "migration-in-progress" });
+            validationObservedMarker = true;
+            return [{ integrity_check: "ok" }];
+          },
+        },
+      ),
+    );
+
+    expect(validationObservedMarker).toBe(true);
+    await expect(fs.stat(migrationRecoveryMarkerPath(dbPath))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    const migrated = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+      expect(migrated.prepare("SELECT value FROM marker_failure_probe").all()).toEqual([]);
+    } finally {
+      migrated.close();
+    }
+  });
+
+  it.each([
+    ["a non-ok result", [{ integrity_check: "database disk image is malformed" }]],
+    ["more than one ok result", [{ integrity_check: "ok" }, { integrity_check: "ok" }]],
+  ])("fails closed and retains the marker for %s", async (_label, integrityRows) => {
+    const dbPath = await makeMigrationCandidate();
+
+    await expect(
+      runWithDatabase(
+        dbPath,
+        runWithPreMigrationBackup(
+          dbPath,
+          Effect.gen(function* () {
+            const sql = yield* SqlClient.SqlClient;
+            yield* sql`DELETE FROM marker_failure_probe`;
+          }),
+          { readLiveDatabaseIntegrity: async () => integrityRows },
+        ),
+      ),
+    ).rejects.toThrow("Migrated database failed SQLite integrity_check");
+
+    expect(
+      JSON.parse(await fs.readFile(migrationRecoveryMarkerPath(dbPath), "utf8")),
+    ).toMatchObject({ phase: "migration-in-progress" });
+    await expect(Effect.runPromise(requireNoPendingMigrationRecovery(dbPath))).rejects.toThrow(
+      MigrationRecoveryRequiredError,
+    );
+
+    const failedDatabase = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+      expect(failedDatabase.prepare("SELECT value FROM marker_failure_probe").all()).toEqual([]);
+    } finally {
+      failedDatabase.close();
     }
   });
 

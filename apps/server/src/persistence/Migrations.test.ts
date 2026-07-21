@@ -1,6 +1,7 @@
 import { assert, it } from "@effect/vitest";
-import { Effect, Layer } from "effect";
+import { Cause, Effect, Exit, Layer } from "effect";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
+import * as Migrator from "effect/unstable/sql/Migrator";
 
 import { migrationEntries, runMigrations } from "./Migrations.ts";
 import { MigrationSchemaTooNewError } from "./Errors.ts";
@@ -19,6 +20,45 @@ const projectionThreadsColumnNames = (sql: SqlClient.SqlClient) =>
   sql<{ readonly name: string }>`
     SELECT name FROM pragma_table_info('projection_threads')
   `.pipe(Effect.map((rows) => rows.map((row) => row.name)));
+
+const turnSummaryMigrationLayer = it.layer(Layer.mergeAll(NodeSqliteClient.layerMemory()));
+
+turnSummaryMigrationLayer("projection turn summary migration", (it) => {
+  it.effect("adds durable columns and resets only the turn projector for historical replay", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* runMigrations({ toMigrationInclusive: 74 });
+      yield* sql`
+        INSERT INTO projection_state (projector, last_applied_sequence, updated_at)
+        VALUES
+          ('projection.thread-turns', 42, '2026-07-20T10:00:00.000Z'),
+          ('projection.thread-activities', 42, '2026-07-20T10:00:00.000Z')
+      `;
+
+      const executed = yield* runMigrations();
+      assert.deepStrictEqual(
+        executed.map(([id]) => id),
+        [75],
+      );
+
+      const columns = yield* sql<{ readonly name: string }>`
+        SELECT name FROM pragma_table_info('projection_turns')
+      `;
+      const columnNames = new Set(columns.map((row) => row.name));
+      assert.isTrue(columnNames.has("model_selection_json"));
+      assert.isTrue(columnNames.has("token_usage_json"));
+      assert.isTrue(columnNames.has("tool_calls_json"));
+
+      const projectorRows = yield* sql<{ readonly projector: string }>`
+        SELECT projector
+        FROM projection_state
+        WHERE projector IN ('projection.thread-turns', 'projection.thread-activities')
+        ORDER BY projector ASC
+      `;
+      assert.deepStrictEqual(projectorRows, [{ projector: "projection.thread-activities" }]);
+    }),
+  );
+});
 
 layer("reconcileMigrationLineage", (it) => {
   // An imported database whose tracker high-water
@@ -151,6 +191,48 @@ layer("reconcileMigrationLineage", (it) => {
   );
 });
 
+const migrationBatchAtomicityLayer = it.layer(Layer.mergeAll(NodeSqliteClient.layerMemory()));
+
+migrationBatchAtomicityLayer("Effect migration batch atomicity", (it) => {
+  it.effect("rolls back every pending migration when a later migration fails", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const runMigrationBatch = Migrator.make({});
+      let finalMigrationRan = false;
+      const loader = Migrator.fromRecord({
+        "1_CreateFirstRollbackProbe": Effect.gen(function* () {
+          const migrationSql = yield* SqlClient.SqlClient;
+          yield* migrationSql`CREATE TABLE first_rollback_probe(value TEXT NOT NULL)`;
+          yield* migrationSql`INSERT INTO first_rollback_probe(value) VALUES ('must-roll-back')`;
+        }),
+        "2_FailAfterSecondRollbackProbe": Effect.gen(function* () {
+          const migrationSql = yield* SqlClient.SqlClient;
+          yield* migrationSql`CREATE TABLE second_rollback_probe(value TEXT NOT NULL)`;
+          return yield* Effect.fail(new Error("injected second migration failure"));
+        }),
+        "3_MustNotRun": Effect.sync(() => {
+          finalMigrationRan = true;
+        }),
+      });
+
+      const exit = yield* Effect.exit(runMigrationBatch({ loader }));
+      assert.isTrue(Exit.isFailure(exit));
+      if (Exit.isFailure(exit)) {
+        assert.match(Cause.pretty(exit.cause), /injected second migration failure/);
+      }
+      assert.isFalse(finalMigrationRan);
+
+      const probeTables = yield* sql<{ readonly name: string }>`
+        SELECT name FROM sqlite_master
+        WHERE type = 'table' AND name IN ('first_rollback_probe', 'second_rollback_probe')
+        ORDER BY name
+      `;
+      assert.deepStrictEqual(probeTables, []);
+      assert.deepStrictEqual(yield* trackerRows(sql), []);
+    }),
+  );
+});
+
 const providerDeliveryCutoverLayer = it.layer(Layer.mergeAll(NodeSqliteClient.layerMemory()));
 
 providerDeliveryCutoverLayer(
@@ -267,10 +349,12 @@ managedAttachmentsLegacyLayer("managed attachment migration after private migrat
         [71, "ProjectionThreadsGatewayProvenance"],
         [72, "AgentGatewayOperationRetention"],
         [73, "ProjectionProjectsArchivedAt"],
+        [74, "ProviderRequestAdmissions"],
+        [75, "ProjectionTurnSummaries"],
       ]);
 
       const tracker = yield* trackerRows(sql);
-      assert.deepStrictEqual(tracker.slice(-20), [
+      assert.deepStrictEqual(tracker.slice(-22), [
         { migration_id: 54, name: "DurableProviderCommandDelivery" },
         { migration_id: 55, name: "ManagedAttachments" },
         { migration_id: 56, name: "CommandReceiptFingerprints" },
@@ -291,6 +375,8 @@ managedAttachmentsLegacyLayer("managed attachment migration after private migrat
         { migration_id: 71, name: "ProjectionThreadsGatewayProvenance" },
         { migration_id: 72, name: "AgentGatewayOperationRetention" },
         { migration_id: 73, name: "ProjectionProjectsArchivedAt" },
+        { migration_id: 74, name: "ProviderRequestAdmissions" },
+        { migration_id: 75, name: "ProjectionTurnSummaries" },
       ]);
       const preserved = yield* sql<{ readonly count: number }>`
         SELECT COUNT(*) AS count FROM orchestration_consumer_state

@@ -7,7 +7,11 @@
 // are tab-strip affordances, not shadcn Buttons. See TerminalChrome.tsx for the
 // same rationale.
 
-import type { PointerEvent as ReactPointerEvent, ReactNode } from "react";
+import type {
+  DragEvent as ReactDragEvent,
+  PointerEvent as ReactPointerEvent,
+  ReactNode,
+} from "react";
 
 import type { ResolvedTerminalVisualIdentity } from "@synara/shared/terminalThreads";
 
@@ -30,8 +34,10 @@ import type {
   ThreadTerminalPresentationMode,
   ThreadTerminalSplitNode,
 } from "../../types";
+import { terminalVisualStateLabel } from "../../terminalVisualIdentity";
 import TerminalActivityIndicator from "./TerminalActivityIndicator";
 import TerminalIdentityIcon from "./TerminalIdentityIcon";
+import { readTerminalDragPayload, TERMINAL_DRAG_MIME } from "./terminalDragAndDrop";
 
 const MIN_TERMINAL_PANE_SIZE_PX = 180;
 
@@ -51,6 +57,14 @@ interface TerminalViewportPaneProps {
   onNewTerminalTab?: ((terminalId: string) => void) | undefined;
   onMoveTerminalToGroup?: ((terminalId: string) => void) | undefined;
   onCloseTerminal?: ((terminalId: string) => void) | undefined;
+  selectedTerminalIds?: ReadonlySet<string> | undefined;
+  onTerminalSelectionChange?:
+    | ((terminalId: string, modifiers: { shiftKey: boolean; toggleKey: boolean }) => void)
+    | undefined;
+  onTerminalDragStart?:
+    | ((event: ReactDragEvent<HTMLDivElement>, terminalId: string) => void)
+    | undefined;
+  onTerminalDrop?: ((terminalIds: readonly string[], targetTerminalId: string) => void) | undefined;
   presentationMode: ThreadTerminalPresentationMode;
   onTogglePresentationMode?: (() => void) | undefined;
   onTogglePanel?: (() => void) | undefined;
@@ -112,6 +126,10 @@ export default function TerminalViewportPane({
   onNewTerminalTab,
   onMoveTerminalToGroup,
   onCloseTerminal,
+  selectedTerminalIds,
+  onTerminalSelectionChange,
+  onTerminalDragStart,
+  onTerminalDrop,
   presentationMode,
   onTogglePresentationMode,
   onTogglePanel,
@@ -146,34 +164,99 @@ export default function TerminalViewportPane({
                 const visualIdentity = terminalVisualIdentityById.get(terminalId);
                 const isActiveTab = terminalId === activePaneTerminalId;
                 const tabTitle = visualIdentity?.title ?? "Terminal";
+                const visualState = visualIdentity?.state ?? "idle";
+                const tabStatusLabel =
+                  visualState === "idle" ? null : terminalVisualStateLabel(visualState);
                 const closeTabLabel = `Close ${visualIdentity?.title ?? "terminal"}`;
+                const isSelected = selectedTerminalIds?.has(terminalId) === true;
 
                 return (
-                  <SurfaceTabChip
+                  <div
                     key={terminalId}
-                    active={isActiveTab}
-                    className={cn(isActiveTab && !isFocusedPane && "opacity-70")}
-                    title={tabTitle}
-                    label={tabTitle}
-                    labelClassName="max-w-40"
-                    icon={
-                      <TerminalIdentityIcon
-                        className="size-3.5"
-                        iconKey={visualIdentity?.iconKey ?? "terminal"}
-                      />
-                    }
-                    leading={
-                      visualIdentity && visualIdentity.state !== "idle" ? (
-                        <TerminalActivityIndicator
-                          className="text-foreground/70"
-                          state={visualIdentity.state}
+                    data-terminal-tab-id={terminalId}
+                    data-terminal-state={visualState}
+                    data-selected={isSelected}
+                    draggable={onTerminalDragStart !== undefined}
+                    className={cn(
+                      "rounded-lg data-[selected=true]:ring-1 data-[selected=true]:ring-ring/60",
+                      onTerminalDragStart && "cursor-grab active:cursor-grabbing",
+                    )}
+                    onClickCapture={(event) => {
+                      const button = (event.target as HTMLElement).closest("button");
+                      if (button?.getAttribute("aria-label") === closeTabLabel) return;
+                      onTerminalSelectionChange?.(terminalId, {
+                        shiftKey: event.shiftKey,
+                        toggleKey: event.metaKey || event.ctrlKey,
+                      });
+                    }}
+                    onDragStart={(event) => onTerminalDragStart?.(event, terminalId)}
+                    onDragOver={(event) => {
+                      if (!Array.from(event.dataTransfer.types).includes(TERMINAL_DRAG_MIME))
+                        return;
+                      event.preventDefault();
+                      event.dataTransfer.dropEffect = "move";
+                    }}
+                    onDrop={(event) => {
+                      const payload = readTerminalDragPayload(event.dataTransfer);
+                      if (payload?.kind !== "terminals") return;
+                      event.preventDefault();
+                      event.stopPropagation();
+                      onTerminalDrop?.(payload.terminalIds, terminalId);
+                    }}
+                    onKeyDown={(event) => {
+                      if (
+                        event.altKey &&
+                        event.shiftKey &&
+                        !event.ctrlKey &&
+                        !event.metaKey &&
+                        event.key.toLowerCase() === "m"
+                      ) {
+                        const selectedIds = [...(selectedTerminalIds ?? [])].filter(
+                          (selectedId) => selectedId !== terminalId,
+                        );
+                        if (selectedIds.length === 0) return;
+                        event.preventDefault();
+                        event.stopPropagation();
+                        onTerminalDrop?.(selectedIds, terminalId);
+                      }
+                    }}
+                  >
+                    <SurfaceTabChip
+                      active={isActiveTab}
+                      className={cn(isActiveTab && !isFocusedPane && "opacity-70")}
+                      title={tabStatusLabel ? `${tabTitle}, ${tabStatusLabel}` : tabTitle}
+                      selectLabel={tabStatusLabel ? `${tabTitle}, ${tabStatusLabel}` : tabTitle}
+                      label={tabTitle}
+                      labelClassName="max-w-40"
+                      icon={
+                        <TerminalIdentityIcon
+                          className="size-3.5"
+                          iconKey={visualIdentity?.iconKey ?? "terminal"}
                         />
-                      ) : null
-                    }
-                    closeLabel={closeTabLabel}
-                    onSelect={() => onActiveTerminalChange(terminalId)}
-                    onClose={onCloseTerminal ? () => onCloseTerminal(terminalId) : undefined}
-                  />
+                      }
+                      leading={
+                        visualState !== "idle" ? (
+                          <TerminalActivityIndicator
+                            className="text-foreground/70"
+                            state={visualState}
+                          />
+                        ) : null
+                      }
+                      trailing={
+                        tabStatusLabel || isSelected ? (
+                          <>
+                            {tabStatusLabel ? (
+                              <span className="sr-only">, {tabStatusLabel}</span>
+                            ) : null}
+                            {isSelected ? <span className="sr-only">, Selected</span> : null}
+                          </>
+                        ) : null
+                      }
+                      closeLabel={closeTabLabel}
+                      onSelect={() => onActiveTerminalChange(terminalId)}
+                      onClose={onCloseTerminal ? () => onCloseTerminal(terminalId) : undefined}
+                    />
+                  </div>
                 );
               })}
 

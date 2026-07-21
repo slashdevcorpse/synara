@@ -9,6 +9,7 @@ export type WsTransportState = "connecting" | "open" | "closed" | "incompatible"
 
 export const SYNARA_WS_TRANSPORT_STATE_EVENT = "synara:ws-transport-state";
 export const SYNARA_WS_COMPATIBILITY_ISSUE_EVENT = "synara:ws-compatibility-issue";
+export const SYNARA_TERMINAL_RESNAPSHOT_REQUIRED_EVENT = "synara:terminal-resnapshot-required";
 
 let latestCompatibilityIssue: WsCompatibilityError | null = null;
 
@@ -18,6 +19,27 @@ export interface WsTransportStateEventDetail {
 
 export interface WsCompatibilityIssueEventDetail {
   issue: WsCompatibilityError | null;
+}
+
+export function emitTerminalResnapshotRequired(): void {
+  if (
+    typeof window === "undefined" ||
+    typeof window.dispatchEvent !== "function" ||
+    typeof CustomEvent === "undefined"
+  ) {
+    return;
+  }
+  window.dispatchEvent(new CustomEvent(SYNARA_TERMINAL_RESNAPSHOT_REQUIRED_EVENT));
+}
+
+export function addTerminalResnapshotRequiredListener(listener: () => void): () => void {
+  if (typeof window === "undefined" || typeof window.addEventListener !== "function") {
+    return () => undefined;
+  }
+  window.addEventListener(SYNARA_TERMINAL_RESNAPSHOT_REQUIRED_EVENT, listener);
+  return () => {
+    window.removeEventListener(SYNARA_TERMINAL_RESNAPSHOT_REQUIRED_EVENT, listener);
+  };
 }
 
 // Emits a browser-local event without leaking transport internals into UI code.

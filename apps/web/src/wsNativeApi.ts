@@ -40,6 +40,7 @@ import {
   type AutomationStreamEvent,
 } from "@synara/contracts";
 import { VOICE_TRANSCRIPTION_UPLOAD_ROUTE_PATH } from "@synara/shared/binaryTransfer";
+import { SYNARA_CSRF_HEADER_NAME, SYNARA_CSRF_HEADER_VALUE } from "@synara/shared/authSecurity";
 
 import { showConfirmDialogFallback } from "./confirmDialogFallback";
 import { showContextMenuFallback } from "./contextMenuFallback";
@@ -169,18 +170,25 @@ async function requestAuthJson<T>(
   options: {
     readonly method?: "GET" | "POST";
     readonly body?: unknown;
+    readonly csrf?: boolean;
   } = {},
 ): Promise<T> {
   const hasBody = options.body !== undefined;
-  const response = await fetch(path, {
+  const isMutation = options.method === "POST";
+  const response = await fetch(resolveWsHttpUrl(path), {
     method: options.method ?? "GET",
-    credentials: "same-origin",
-    ...(hasBody
+    credentials: "include",
+    ...(isMutation || hasBody
       ? {
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(options.body),
+          headers: {
+            ...(hasBody ? { "Content-Type": "application/json" } : {}),
+            ...(isMutation && options.csrf !== false
+              ? { [SYNARA_CSRF_HEADER_NAME]: SYNARA_CSRF_HEADER_VALUE }
+              : {}),
+          },
         }
       : {}),
+    ...(hasBody ? { body: JSON.stringify(options.body) } : {}),
   });
   const payload = (await response.json().catch(() => null)) as unknown;
   if (!response.ok) {
@@ -214,7 +222,12 @@ async function requestVoiceTranscriptionUpload(
   }
   const response = await fetch(
     resolveWsHttpUrl(`${VOICE_TRANSCRIPTION_UPLOAD_ROUTE_PATH}?${params.toString()}`),
-    { method: "POST", credentials: "include", body: bytes },
+    {
+      method: "POST",
+      credentials: "include",
+      headers: { [SYNARA_CSRF_HEADER_NAME]: SYNARA_CSRF_HEADER_VALUE },
+      body: bytes,
+    },
   );
   const payload = (await response.json().catch(() => null)) as
     | ServerVoiceTranscriptionResult
@@ -441,7 +454,9 @@ export function createWsNativeApi(): NativeApi {
       },
     },
     terminal: {
+      waitUntilEventStreamReady: () => transport.waitForTerminalEventStreamReady(),
       open: (input) => transport.request(WS_METHODS.terminalOpen, input),
+      snapshot: (input) => transport.request(WS_METHODS.terminalSnapshot, input),
       write: (input) => transport.request(WS_METHODS.terminalWrite, input),
       ackOutput: (input) => transport.request(WS_METHODS.terminalAckOutput, input),
       resize: (input) => transport.request(WS_METHODS.terminalResize, input),
@@ -574,11 +589,13 @@ export function createWsNativeApi(): NativeApi {
         requestAuthJson<AuthBootstrapResult>("/api/auth/bootstrap", {
           method: "POST",
           body: input,
+          csrf: false,
         }),
       bootstrapBearerAuth: (input: AuthBootstrapInput) =>
         requestAuthJson<AuthBearerBootstrapResult>("/api/auth/bootstrap/bearer", {
           method: "POST",
           body: input,
+          csrf: false,
         }),
       issueAuthWebSocketToken: () =>
         requestAuthJson<AuthWebSocketTokenResult>("/api/auth/ws-token", { method: "POST" }),

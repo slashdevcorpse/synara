@@ -36,7 +36,10 @@ import { AutomationRepositoryLive } from "../../persistence/Layers/AutomationRep
 import { ProjectionTurnRepositoryLive } from "../../persistence/Layers/ProjectionTurns.ts";
 import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite.ts";
 import { AutomationRepository } from "../../persistence/Services/AutomationRepository.ts";
-import { ProjectionTurnRepository } from "../../persistence/Services/ProjectionTurns.ts";
+import {
+  EMPTY_PROJECTION_TURN_SUMMARY_FIELDS,
+  ProjectionTurnRepository,
+} from "../../persistence/Services/ProjectionTurns.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { AutomationService, type AutomationServiceShape } from "../Services/AutomationService.ts";
 import { AutomationServiceLive } from "./AutomationService.ts";
@@ -234,6 +237,7 @@ function completeHeartbeatRun(input: {
       throw new Error("Expected heartbeat run to have a pending message id.");
     }
     yield* projectionTurns.upsertByTurnId({
+      ...EMPTY_PROJECTION_TURN_SUMMARY_FIELDS,
       threadId: input.threadId,
       turnId: input.turnId,
       pendingMessageId: messageId,
@@ -1408,6 +1412,7 @@ layer("AutomationService", (it) => {
 
       // The run's own turn is registered and running.
       yield* projectionTurns.upsertByTurnId({
+        ...EMPTY_PROJECTION_TURN_SUMMARY_FIELDS,
         threadId: targetThreadId,
         turnId: automationTurnId,
         pendingMessageId: run.messageId,
@@ -1672,6 +1677,7 @@ layer("AutomationService", (it) => {
       assert.strictEqual(queued.runs.find((entry) => entry.id === run.id)?.status, "running");
 
       yield* projectionTurns.upsertByTurnId({
+        ...EMPTY_PROJECTION_TURN_SUMMARY_FIELDS,
         threadId: targetThreadId,
         turnId: automationTurnId,
         pendingMessageId: run.messageId,
@@ -3214,6 +3220,7 @@ layer("AutomationService", (it) => {
 
       const projectionTurns = yield* ProjectionTurnRepository;
       yield* projectionTurns.upsertByTurnId({
+        ...EMPTY_PROJECTION_TURN_SUMMARY_FIELDS,
         threadId: targetThreadId,
         turnId: TurnId.makeUnsafe("turn-in-flight-complete"),
         pendingMessageId: activeRun.messageId,

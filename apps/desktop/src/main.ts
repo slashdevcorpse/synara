@@ -8,6 +8,7 @@ import * as Crypto from "node:crypto";
 import * as FS from "node:fs";
 import * as OS from "node:os";
 import * as Path from "node:path";
+import { pathToFileURL } from "node:url";
 // Electron-only builtin that sees app.asar as a real file instead of a virtual
 // directory — required to stat the archive itself for swap detection.
 import * as OriginalFS from "original-fs";
@@ -19,6 +20,7 @@ import {
   dialog,
   ipcMain,
   Menu,
+  net,
   Notification,
   nativeImage,
   nativeTheme,
@@ -58,6 +60,7 @@ import { renderPackagedDesktopIdentityProof } from "@synara/shared/desktopIdenti
 import { NetService } from "@synara/shared/Net";
 import { RotatingFileSink } from "@synara/shared/logging";
 import { ensureStaticSnapshot, findAsarArchivePath } from "@synara/shared/staticSnapshot";
+import windowsJobLauncherConfig from "../../server/native/windows-job-launcher/launcher.config.json" with { type: "json" };
 import { isBackendReadinessAborted, waitForHttpReady } from "./backendReadiness";
 import { resolveBackendNodeArgs } from "./backendNodeOptions";
 import {
@@ -87,10 +90,6 @@ import {
   restoreDesktopMigrationBackup,
 } from "./desktopMigrationRecovery";
 import { getSafeExternalUrl } from "./externalUrlPolicy";
-import {
-  hardenAttachedBrowserParams,
-  hardenAttachedBrowserWebPreferences,
-} from "./browserWebPreferences";
 import {
   LSREGISTER_PATH,
   parseLastLaunchVersion,
@@ -162,7 +161,9 @@ import {
 } from "./updateArtifactIdentity";
 import { buildGitHubReleasesPageUrl, resolveGitHubUpdateSource } from "./githubUpdateFeed";
 import { isArm64HostRunningIntelBuild, resolveDesktopRuntimeInfo } from "./runtimeArch";
-import { BROWSER_SESSION_PARTITION, DesktopBrowserManager } from "./browserManager";
+import { DesktopBrowserManager } from "./browserManager";
+import { installBrowserWebviewAttachmentSecurity } from "./browserSecurity";
+import { BROWSER_SESSION_PARTITION } from "./browserSessionPolicy";
 import { registerBrowserIpcHandlers, sendBrowserCopyLink, sendBrowserState } from "./browserIpc";
 import {
   BrowserUsePipeServer,
@@ -179,7 +180,10 @@ import {
   resolveDesktopUserDataPath,
 } from "./desktopUserDataProfile";
 import { isBrokenPipeError } from "./desktopProcessErrors";
-import { createDesktopStaticProtocolResolver } from "./desktopStaticProtocol";
+import {
+  createDesktopStaticProtocolHandler,
+  createDesktopStaticProtocolResolver,
+} from "./desktopStaticProtocol";
 import {
   resolveDesktopWindowReopenDecision,
   shouldOpenDesktopMainWindowAfterBackendLaunch,
@@ -1046,6 +1050,10 @@ function resolveBackendEntry(): string {
   return Path.join(resolveAppRoot(), "apps/server/dist/index.mjs");
 }
 
+function resolvePackagedWindowsJobLauncher(): string {
+  return Path.join(process.resourcesPath, "synara-native", windowsJobLauncherConfig.executableName);
+}
+
 function resolveBackendCwd(): string {
   if (!app.isPackaged) {
     return resolveAppRoot();
@@ -1277,10 +1285,14 @@ function registerDesktopProtocol(): void {
   }
 
   const resolveStaticRequest = createDesktopStaticProtocolResolver(staticRoot);
-
-  protocol.registerFileProtocol(DESKTOP_SCHEME, (request, callback) => {
-    callback(resolveStaticRequest(request.url));
-  });
+  protocol.handle(
+    DESKTOP_SCHEME,
+    createDesktopStaticProtocolHandler({
+      resolveRequest: resolveStaticRequest,
+      fetchFile: (filePath) => net.fetch(pathToFileURL(filePath).toString()),
+      fallbackUrl: `${DESKTOP_SCHEME}://app/`,
+    }),
+  );
 
   desktopProtocolRegistered = true;
 }
@@ -3077,6 +3089,9 @@ async function launchAdmittedBackendGeneration(
       env: {
         ...backendEnv(),
         ELECTRON_RUN_AS_NODE: "1",
+        ...(app.isPackaged && process.platform === "win32"
+          ? { SYNARA_WINDOWS_JOB_LAUNCHER_PATH: resolvePackagedWindowsJobLauncher() }
+          : {}),
       },
       stdio: captureBackendLogs ? ["ignore", "pipe", "pipe"] : "inherit",
     });
@@ -3804,6 +3819,7 @@ function createWindow(): BrowserWindow {
       backgroundThrottling: true,
     },
   });
+  installBrowserWebviewAttachmentSecurity(window.webContents);
   const windowStateController = createDesktopWindowStateController({
     source: window,
     initialState: savedWindowState,
@@ -3827,11 +3843,6 @@ function createWindow(): BrowserWindow {
   let revealSettleTimer: ReturnType<typeof setTimeout> | null = null;
   browserManager.setWindow(window);
   attachDesktopZoomFactorSync(window);
-
-  window.webContents.on("will-attach-webview", (_event, webPreferences, params) => {
-    hardenAttachedBrowserWebPreferences(webPreferences);
-    hardenAttachedBrowserParams(params);
-  });
 
   window.webContents.on("context-menu", (event, params) => {
     event.preventDefault();

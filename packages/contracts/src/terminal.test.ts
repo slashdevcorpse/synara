@@ -8,6 +8,7 @@ import {
   TerminalCloseInput,
   TerminalEvent,
   TerminalOpenInput,
+  TerminalRecoverySnapshot,
   TerminalResizeInput,
   TerminalSessionSnapshot,
   TerminalThreadInput,
@@ -99,6 +100,15 @@ describe("TerminalOpenInput", () => {
       SYNARA_PROJECT_ROOT: "/tmp/project",
       CUSTOM_FLAG: "1",
     });
+  });
+
+  it("accepts an explicit reattach-only recovery policy", () => {
+    const parsed = decodeSync(TerminalOpenInput, {
+      threadId: "thread-1",
+      cwd: "/tmp/project",
+      reattachOnly: true,
+    });
+    expect(parsed.reattachOnly).toBe(true);
   });
 
   it("rejects invalid env keys", () => {
@@ -193,6 +203,24 @@ describe("TerminalCloseInput", () => {
       }),
     ).toBe(true);
   });
+
+  it("accepts a non-empty atomic terminal batch and rejects ambiguous targets", () => {
+    expect(
+      decodes(TerminalCloseInput, {
+        threadId: "thread-1",
+        terminalIds: ["one", "two"],
+        deleteHistory: true,
+      }),
+    ).toBe(true);
+    expect(
+      decodes(TerminalCloseInput, {
+        threadId: "thread-1",
+        terminalId: "one",
+        terminalIds: ["two"],
+      }),
+    ).toBe(false);
+    expect(decodes(TerminalCloseInput, { threadId: "thread-1", terminalIds: [] })).toBe(false);
+  });
 });
 
 describe("TerminalSessionSnapshot", () => {
@@ -272,6 +300,8 @@ describe("TerminalEvent", () => {
         threadId: "thread-1",
         terminalId: DEFAULT_TERMINAL_ID,
         createdAt: new Date().toISOString(),
+        generation: "generation-1",
+        sequence: 1,
         data: "line\n",
       }),
     ).toBe(true);
@@ -284,6 +314,8 @@ describe("TerminalEvent", () => {
         threadId: "thread-1",
         terminalId: DEFAULT_TERMINAL_ID,
         createdAt: new Date().toISOString(),
+        generation: "generation-1",
+        sequence: 2,
         data: "line\n",
         byteLength: 5,
       }),
@@ -297,6 +329,8 @@ describe("TerminalEvent", () => {
         threadId: "thread-1",
         terminalId: DEFAULT_TERMINAL_ID,
         createdAt: new Date().toISOString(),
+        generation: "generation-1",
+        sequence: 3,
         exitCode: 0,
         exitSignal: null,
       }),
@@ -310,10 +344,66 @@ describe("TerminalEvent", () => {
         threadId: "thread-1",
         terminalId: DEFAULT_TERMINAL_ID,
         createdAt: new Date().toISOString(),
+        generation: "generation-1",
+        sequence: 4,
         hasRunningSubprocess: true,
         cliKind,
         agentState: "running",
       }),
     ).toBe(true);
+  });
+
+  it("rejects unsequenced revision-1 events", () => {
+    expect(
+      decodes(TerminalEvent, {
+        type: "output",
+        threadId: "thread-1",
+        terminalId: DEFAULT_TERMINAL_ID,
+        createdAt: new Date().toISOString(),
+        data: "line\n",
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("TerminalRecoverySnapshot", () => {
+  it("decodes an exited authoritative snapshot with its event watermark", () => {
+    expect(
+      decodes(TerminalRecoverySnapshot, {
+        snapshot: {
+          threadId: "thread-1",
+          terminalId: DEFAULT_TERMINAL_ID,
+          cwd: "/tmp/project",
+          status: "exited",
+          pid: null,
+          history: "complete\n",
+          exitCode: 0,
+          exitSignal: null,
+          updatedAt: new Date().toISOString(),
+        },
+        generation: "generation-1",
+        watermark: 9,
+      }),
+    ).toBe(true);
+  });
+
+  it("rejects a negative watermark", () => {
+    expect(
+      decodes(TerminalRecoverySnapshot, {
+        snapshot: {
+          threadId: "thread-1",
+          terminalId: DEFAULT_TERMINAL_ID,
+          cwd: "/tmp/project",
+          status: "running",
+          pid: 123,
+          history: "",
+          exitCode: null,
+          exitSignal: null,
+          updatedAt: new Date().toISOString(),
+        },
+        generation: "generation-1",
+        watermark: -1,
+      }),
+    ).toBe(false);
   });
 });

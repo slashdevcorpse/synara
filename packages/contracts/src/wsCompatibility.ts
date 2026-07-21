@@ -3,8 +3,12 @@ import { Schema } from "effect";
 import { NonNegativeInt } from "./baseSchemas";
 
 export const WS_PROTOCOL_EPOCH = 1;
-export const WS_PROTOCOL_MIN_REVISION = 1;
-export const WS_PROTOCOL_MAX_REVISION = 1;
+// Revision 3 adds terminal stream registration barriers and generation-scoped
+// sequence numbers on top of watermark-based recovery.
+// Keeping the supported range exact prevents either side from silently decoding
+// the incompatible revision-1 terminal stream shape.
+export const WS_PROTOCOL_MIN_REVISION = 3;
+export const WS_PROTOCOL_MAX_REVISION = 3;
 export const WS_BOOTSTRAP_METHOD = "bootstrap.negotiate";
 export const WS_BOOTSTRAP_PATH = "/ws/bootstrap";
 export const WS_FEATURE_PATH = "/ws";
@@ -27,6 +31,7 @@ export const WS_COMPATIBILITY_QUERY = {
 export const WS_SERVER_CAPABILITIES = [
   "orchestration.cursor-safe-streams",
   "rpc.typed-errors",
+  "terminal.sequenced-recovery",
 ] as const;
 
 export const WsCompatibilityAction = Schema.Literals(["reload", "update-client", "update-server"]);

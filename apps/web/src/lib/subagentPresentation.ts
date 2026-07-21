@@ -405,3 +405,44 @@ export function subagentStatusDotClassName(
       return "bg-muted-foreground/25";
   }
 }
+
+export interface SettledSubagentSummary {
+  readonly total: number;
+  readonly completed: number;
+  readonly failed: number;
+  readonly stopped: number;
+  readonly label: string;
+}
+
+export function summarizeSettledSubagents(
+  statuses: ReadonlyArray<SubagentStatusKind | null>,
+): SettledSubagentSummary | null {
+  if (
+    statuses.length === 0 ||
+    statuses.some((status) => status !== "completed" && status !== "failed" && status !== "stopped")
+  ) {
+    return null;
+  }
+
+  const completed = statuses.filter((status) => status === "completed").length;
+  const failed = statuses.filter((status) => status === "failed").length;
+  const stopped = statuses.length - completed - failed;
+  const noun = statuses.length === 1 ? "subagent" : "subagents";
+  const label =
+    completed === statuses.length
+      ? `${statuses.length} ${noun} completed`
+      : failed === statuses.length
+        ? `${statuses.length} ${noun} failed`
+        : stopped === statuses.length
+          ? `${statuses.length} ${noun} stopped`
+          : [
+              `${statuses.length} ${noun} settled`,
+              completed > 0 ? `${completed} completed` : null,
+              failed > 0 ? `${failed} failed` : null,
+              stopped > 0 ? `${stopped} stopped` : null,
+            ]
+              .filter((part): part is string => part !== null)
+              .join(" · ");
+
+  return { total: statuses.length, completed, failed, stopped, label };
+}

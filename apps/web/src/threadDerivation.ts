@@ -18,6 +18,7 @@ const EMPTY_MESSAGES: ChatMessage[] = [];
 const EMPTY_ACTIVITIES: Thread["activities"] = [];
 const EMPTY_PROPOSED_PLANS: ProposedPlan[] = [];
 const EMPTY_TURN_DIFF_SUMMARIES: TurnDiffSummary[] = [];
+const EMPTY_TURN_SUMMARIES: NonNullable<Thread["turns"]> = [];
 const EMPTY_MESSAGE_MAP: Record<MessageId, ChatMessage> = {};
 const EMPTY_ACTIVITY_MAP: Record<string, Thread["activities"][number]> = {};
 const EMPTY_PROPOSED_PLAN_MAP: Record<string, ProposedPlan> = {};
@@ -37,6 +38,7 @@ const threadCache = new WeakMap<
   {
     session: ThreadSession | null;
     turnState: ThreadTurnState | undefined;
+    turnSummaries: NonNullable<Thread["turns"]>;
     messages: Thread["messages"];
     activities: Thread["activities"];
     proposedPlans: Thread["proposedPlans"];
@@ -115,6 +117,7 @@ export function getThreadFromState(state: AppState, threadId: ThreadId): Thread 
 
   const session = state.threadSessionById?.[threadId] ?? EMPTY_THREAD_SESSION_MAP[threadId] ?? null;
   const turnState = state.threadTurnStateById?.[threadId] ?? EMPTY_THREAD_TURN_STATE_MAP[threadId];
+  const turnSummaries = state.turnSummariesByThreadId?.[threadId] ?? EMPTY_TURN_SUMMARIES;
   const messages = selectThreadMessages(state, threadId);
   const activities = selectThreadActivities(state, threadId);
   const proposedPlans = selectThreadProposedPlans(state, threadId);
@@ -125,6 +128,7 @@ export function getThreadFromState(state: AppState, threadId: ThreadId): Thread 
     cached &&
     cached.session === session &&
     cached.turnState === turnState &&
+    cached.turnSummaries === turnSummaries &&
     cached.messages === messages &&
     cached.activities === activities &&
     cached.proposedPlans === proposedPlans &&
@@ -137,6 +141,7 @@ export function getThreadFromState(state: AppState, threadId: ThreadId): Thread 
     ...shell,
     session,
     latestTurn: turnState?.latestTurn ?? null,
+    turns: turnSummaries,
     pendingSourceProposedPlan: turnState?.pendingSourceProposedPlan,
     messages,
     activities,
@@ -147,6 +152,7 @@ export function getThreadFromState(state: AppState, threadId: ThreadId): Thread 
   threadCache.set(shell, {
     session,
     turnState,
+    turnSummaries,
     messages,
     activities,
     proposedPlans,
