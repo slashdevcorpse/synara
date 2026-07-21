@@ -6,8 +6,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   DESKTOP_BACKEND_SHUTDOWN_PATH,
+  requireWindowsBackendExit,
+  runAfterDesktopShutdown,
+  shouldDeferDesktopWindowClose,
   startDesktopBackendShutdownRequest,
   stopWindowsBackendAndWait,
+  WindowsBackendShutdownTimeoutError,
   type BackendShutdownProcess,
   type DesktopBackendShutdownRequestOutcome,
   type PendingDesktopBackendShutdownRequest,
@@ -199,7 +203,7 @@ describe("stopWindowsBackendAndWait", () => {
     expect(child.killSignals).toEqual(["SIGTERM"]);
   });
 
-  it("cancels a hung request at the overall deadline and never forces twice", async () => {
+  it("cancels a hung request and releases the live child for a later retry", async () => {
     const child = makeTestBackendShutdownProcess();
     const pendingRequest = makePendingRequest();
     const forceTerminate = vi.fn((processHandle: BackendShutdownProcess) => {
@@ -228,17 +232,23 @@ describe("stopWindowsBackendAndWait", () => {
     expect(forceTerminate).toHaveBeenCalledOnce();
     expect(child.killSignals).toEqual(["SIGTERM"]);
 
-    const duplicateAfterDeadline = stopWindowsBackendAndWait({
+    const retryRequest = makePendingRequest();
+    const startRetryRequest = vi.fn(() => retryRequest);
+    const retry = stopWindowsBackendAndWait({
       child,
       backendHttpUrl: "http://127.0.0.1:3773",
       shutdownToken: "desktop-only-token",
       forceKillDelayMs: 8_000,
       timeoutMs: 10_000,
-      startRequest: () => makePendingRequest(),
+      startRequest: startRetryRequest,
       forceTerminate,
     });
-    expect(duplicateAfterDeadline).toBe(shutdown);
-    await expect(duplicateAfterDeadline).resolves.toEqual({ type: "timed-out", forced: true });
+
+    expect(retry).not.toBe(shutdown);
+    expect(startRetryRequest).toHaveBeenCalledOnce();
+    child.exit(0);
+    await expect(retry).resolves.toEqual({ type: "exited", forced: false });
+    expect(retryRequest.cancel).toHaveBeenCalledOnce();
     expect(forceTerminate).toHaveBeenCalledOnce();
   });
 
@@ -424,6 +434,97 @@ describe("stopWindowsBackendAndWait", () => {
         timeoutMs: 10_000,
       }),
     ).toThrow(RangeError);
+  });
+});
+
+describe("requireWindowsBackendExit", () => {
+  it("accepts proven exit and rejects a bounded timeout with force-attempt context", () => {
+    expect(() =>
+      requireWindowsBackendExit({ type: "already-exited", forced: false }),
+    ).not.toThrow();
+    expect(() => requireWindowsBackendExit({ type: "exited", forced: true })).not.toThrow();
+
+    try {
+      requireWindowsBackendExit({ type: "timed-out", forced: true });
+      throw new Error("Expected an unproven backend exit to be rejected");
+    } catch (error) {
+      expect(error).toBeInstanceOf(WindowsBackendShutdownTimeoutError);
+      expect(error).toMatchObject({ forced: true });
+    }
+  });
+});
+
+describe("runAfterDesktopShutdown", () => {
+  it("runs shutdown-only actions only after shutdown completes successfully", async () => {
+    const afterShutdown = vi.fn();
+
+    await expect(
+      runAfterDesktopShutdown(Promise.resolve("confirmed-exit"), afterShutdown),
+    ).resolves.toBeUndefined();
+    expect(afterShutdown).toHaveBeenCalledExactlyOnceWith("confirmed-exit");
+
+    const shutdownError = new Error("backend still running");
+    const afterFailedShutdown = vi.fn();
+    await expect(
+      runAfterDesktopShutdown(Promise.reject(shutdownError), afterFailedShutdown),
+    ).rejects.toBe(shutdownError);
+    expect(afterFailedShutdown).not.toHaveBeenCalled();
+  });
+});
+
+describe("shouldDeferDesktopWindowClose", () => {
+  it("keeps Windows windows alive until shutdown or updater handoff is proven", () => {
+    expect(
+      shouldDeferDesktopWindowClose({
+        platform: "win32",
+        shutdownComplete: false,
+        updaterHandoffActive: false,
+        keepRuntimeAliveAfterWindowClose: false,
+      }),
+    ).toBe(true);
+    expect(
+      shouldDeferDesktopWindowClose({
+        platform: "linux",
+        shutdownComplete: false,
+        updaterHandoffActive: false,
+        keepRuntimeAliveAfterWindowClose: false,
+      }),
+    ).toBe(false);
+    expect(
+      shouldDeferDesktopWindowClose({
+        platform: "win32",
+        shutdownComplete: false,
+        updaterHandoffActive: true,
+        keepRuntimeAliveAfterWindowClose: false,
+      }),
+    ).toBe(false);
+    expect(
+      shouldDeferDesktopWindowClose({
+        platform: "darwin",
+        shutdownComplete: false,
+        updaterHandoffActive: false,
+        keepRuntimeAliveAfterWindowClose: false,
+      }),
+    ).toBe(false);
+  });
+
+  it("preserves a warm Windows runtime while allowing completed quit teardown", () => {
+    expect(
+      shouldDeferDesktopWindowClose({
+        platform: "win32",
+        shutdownComplete: false,
+        updaterHandoffActive: false,
+        keepRuntimeAliveAfterWindowClose: true,
+      }),
+    ).toBe(false);
+    expect(
+      shouldDeferDesktopWindowClose({
+        platform: "win32",
+        shutdownComplete: true,
+        updaterHandoffActive: false,
+        keepRuntimeAliveAfterWindowClose: false,
+      }),
+    ).toBe(false);
   });
 });
 
