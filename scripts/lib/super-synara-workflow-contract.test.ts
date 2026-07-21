@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -41,6 +42,28 @@ const releasePlannerScript = readFileSync(
 describe("Super Synara workflow contracts", () => {
   it("admits the controller-called publication and manual audit workflows", () => {
     expect(() => verifySuperSynaraWorkflowContracts(repoRoot)).not.toThrow();
+  });
+
+  it("loads both release entrypoints with native Node TypeScript", () => {
+    for (const [script, expectedGuard] of [
+      [
+        "scripts/plan-super-synara-release-drafter.ts",
+        "Missing Release Drafter planner argument: --repository.",
+      ],
+      ["scripts/verify-super-synara-github-state.ts", "Missing GitHub state argument: --phase."],
+    ] as const) {
+      const result = spawnSync("node", [resolve(repoRoot, script)], {
+        cwd: repoRoot,
+        encoding: "utf8",
+        timeout: 10_000,
+      });
+      const output = `${result.stdout}\n${result.stderr}`;
+      expect(result.error).toBeUndefined();
+      expect(result.signal).toBeNull();
+      expect(result.status).not.toBe(0);
+      expect(output).not.toContain("ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX");
+      expect(output).toContain(expectedGuard);
+    }
   });
 
   it("requires bounded fail-closed GitHub release visibility polling", () => {
@@ -222,6 +245,39 @@ describe("Super Synara workflow contracts", () => {
         ),
       ),
     ).toThrow("super-v$RESOLVED_VERSION");
+  });
+
+  it("pins the repository Node runtime before release planning", () => {
+    const setupNode = [
+      "      - name: Setup Node",
+      "        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6",
+      "        with:",
+      "          node-version-file: package.json",
+      "",
+    ].join("\n");
+    expect(() =>
+      verifySuperSynaraReleaseDrafterText(
+        releaseDrafter.replace(setupNode, ""),
+        releaseDrafterConfig,
+      ),
+    ).toThrow("pin the repository Node runtime between checkout and planning");
+    expect(() =>
+      verifySuperSynaraReleaseDrafterText(
+        releaseDrafter.replace("node-version-file: package.json", "node-version: 22"),
+        releaseDrafterConfig,
+      ),
+    ).toThrow("pin the repository Node runtime between checkout and planning");
+    expect(() =>
+      verifySuperSynaraReleaseDrafterText(
+        releaseDrafter
+          .replace(setupNode, "")
+          .replace(
+            "      - name: Checkout exact main source",
+            `${setupNode}      - name: Checkout exact main source`,
+          ),
+        releaseDrafterConfig,
+      ),
+    ).toThrow("pin the repository Node runtime between checkout and planning");
   });
 
   it("rejects removal of the reviewed allowlist gate", () => {
