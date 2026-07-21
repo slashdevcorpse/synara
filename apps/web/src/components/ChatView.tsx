@@ -4579,7 +4579,7 @@ export default function ChatView({
   const animateNextAutoFollowScrollRef = useRef(false);
   const scrollToEnd = useCallback((animated = false) => {
     programmaticScrollUntilRef.current = performance.now() + 200;
-    legendListRef.current?.scrollToEnd?.({ animated });
+    return legendListRef.current?.scrollToEnd?.({ animated });
   }, []);
   const armTranscriptAutoFollow = useCallback((targetThreadId: ThreadId, animated = false) => {
     autoFollowThreadIdRef.current = targetThreadId;
@@ -4695,25 +4695,33 @@ export default function ChatView({
     if (!isAtEndRef.current && !shouldFollowPendingTurn) {
       return;
     }
+    let cancelled = false;
     let postAnimationSnapTimeoutId: number | null = null;
     // Re-apply the bottom stick only for real transcript messages; tool/work
     // rows can arrive quickly and should not churn scroll/layout work.
     const frameId = window.requestAnimationFrame(() => {
       const shouldAnimate = animateNextAutoFollowScrollRef.current;
       animateNextAutoFollowScrollRef.current = false;
-      scrollToEnd(shouldAnimate);
+      const scrollCompletion = scrollToEnd(shouldAnimate);
       if (shouldAnimate) {
-        // LegendList can finish measuring the optimistic row after the smooth
-        // scroll target is chosen. Snap once after the shared 220ms row motion
-        // settles, unless the user has cancelled auto-follow in the meantime.
-        postAnimationSnapTimeoutId = window.setTimeout(() => {
-          if (activeThread?.id !== undefined && autoFollowThreadIdRef.current === activeThread.id) {
-            scrollToEnd(false);
-          }
-        }, 260);
+        void (scrollCompletion ?? Promise.resolve()).then(() => {
+          if (cancelled) return;
+          // LegendList may defer the animated scroll while it measures the
+          // optimistic row. Wait for that scroll to finish before the final
+          // post-motion snap so the snap cannot cancel the queued animation.
+          postAnimationSnapTimeoutId = window.setTimeout(() => {
+            if (
+              activeThread?.id !== undefined &&
+              autoFollowThreadIdRef.current === activeThread.id
+            ) {
+              scrollToEnd(false);
+            }
+          }, 260);
+        });
       }
     });
     return () => {
+      cancelled = true;
       window.cancelAnimationFrame(frameId);
       if (postAnimationSnapTimeoutId !== null) {
         window.clearTimeout(postAnimationSnapTimeoutId);
