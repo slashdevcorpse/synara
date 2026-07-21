@@ -24,47 +24,6 @@ const FAKE_CODEX_SOURCE_PATH = Path.join(__dirname, "fixtures/fake-codex.ts");
 const NETWORK_GUARD_PATH = Path.join(__dirname, "fixtures/network-guard.cjs");
 type JsonRecord = Record<string, unknown>;
 
-function authenticatedAccountReadPids(events: readonly JsonRecord[]): ReadonlySet<number> {
-  const requests = new Set<string>();
-  for (const entry of events) {
-    const payload =
-      entry.payload !== null && typeof entry.payload === "object"
-        ? (entry.payload as JsonRecord)
-        : null;
-    if (
-      entry.direction === "in" &&
-      typeof entry.pid === "number" &&
-      payload?.method === "account/read" &&
-      (typeof payload.id === "number" || typeof payload.id === "string")
-    ) {
-      requests.add(JSON.stringify([entry.pid, payload.id]));
-    }
-  }
-
-  const authenticatedPids = new Set<number>();
-  for (const entry of events) {
-    const payload =
-      entry.payload !== null && typeof entry.payload === "object"
-        ? (entry.payload as JsonRecord)
-        : null;
-    const result =
-      payload?.result !== null && typeof payload?.result === "object"
-        ? (payload.result as JsonRecord)
-        : null;
-    if (
-      entry.direction === "out" &&
-      typeof entry.pid === "number" &&
-      (typeof payload?.id === "number" || typeof payload?.id === "string") &&
-      result?.account !== null &&
-      typeof result?.account === "object" &&
-      requests.has(JSON.stringify([entry.pid, payload.id]))
-    ) {
-      authenticatedPids.add(entry.pid);
-    }
-  }
-  return authenticatedPids;
-}
-
 function formatAggregateError(error: unknown): string {
   if (error instanceof AggregateError) {
     const nestedErrors = [...error.errors].map(formatAggregateError).join(" | ");
@@ -662,7 +621,6 @@ export class DesktopHarness {
       cwd: this.workspaceDir,
       env: launchEnv,
     });
-    const invocationBaseline = (await this.readJsonLines(this.invocationLogPath)).length;
     const codexPathCandidates = assertFakeCodexIsOnlyPathCandidate(
       launchEnv.PATH ?? "",
       this.fakeCodexPath,
@@ -768,19 +726,24 @@ export class DesktopHarness {
         timeout: 60_000,
       });
       await expect(page.getByLabel("Loading projects")).toBeHidden({ timeout: 60_000 });
+      const rendererRpcInvocationBaseline = (await this.readJsonLines(this.invocationLogPath))
+        .length;
       await page.bringToFront();
       await expect.poll(() => page.evaluate(() => document.visibilityState)).toBe("visible");
-      await page.evaluate(() => window.dispatchEvent(new Event("focus")));
       await expect
         .poll(
           async () => {
+            // The production focus hook refreshes provider status through the renderer's
+            // WsTransport. Re-dispatching focus also crosses its 15-second retry throttle if
+            // the first request raced startup, while the fresh CLI records prove the RPC
+            // reached the server before the harness yields to mutation tests.
+            await page.evaluate(() => window.dispatchEvent(new Event("focus")));
             const invocations = (await this.readJsonLines(this.invocationLogPath)).slice(
-              invocationBaseline,
+              rendererRpcInvocationBaseline,
             );
             const networkEvents = (await this.readJsonLines(this.networkLogPath)).slice(
               networkEventBaseline,
             );
-            const protocolEvents = await this.readJsonLines(this.protocolLogPath);
             const guardedProcesses = new Set(
               networkEvents.flatMap((entry) =>
                 entry.event === "guard-installed" &&
@@ -798,26 +761,16 @@ export class DesktopHarness {
                 (JSON.stringify(entry.args) === JSON.stringify(["--version"]) ||
                   JSON.stringify(entry.args) === JSON.stringify(["login", "status"])),
             );
-            const authenticatedPids = authenticatedAccountReadPids(protocolEvents);
-            const runtimeInvocations = invocations.filter(
-              (entry) => typeof entry.pid === "number" && Array.isArray(entry.args),
-            );
             return {
               version: healthInvocations.some(
                 (entry) => JSON.stringify(entry.args) === JSON.stringify(["--version"]),
               ),
-              auth:
-                healthInvocations.some(
-                  (entry) => JSON.stringify(entry.args) === JSON.stringify(["login", "status"]),
-                ) ||
-                runtimeInvocations.some(
-                  (entry) =>
-                    authenticatedPids.has(entry.pid as number) &&
-                    (entry.args as unknown[]).includes("app-server"),
-                ),
+              auth: healthInvocations.some(
+                (entry) => JSON.stringify(entry.args) === JSON.stringify(["login", "status"]),
+              ),
               guarded:
-                runtimeInvocations.length >= 2 &&
-                runtimeInvocations.every((entry) =>
+                healthInvocations.length >= 2 &&
+                healthInvocations.every((entry) =>
                   guardedProcesses.has(JSON.stringify([entry.pid, entry.args])),
                 ),
             };
