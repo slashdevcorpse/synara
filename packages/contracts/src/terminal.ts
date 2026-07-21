@@ -51,6 +51,9 @@ export const TerminalOpenInput = Schema.Struct({
   // sessions (e.g. dev servers) whose output no renderer consumes. Defaults to
   // true so interactive terminals stream as usual.
   streamOutput: Schema.optional(Schema.Boolean),
+  // Reattach to an already-running in-memory PTY, but never create or restart
+  // one when the identity only came from persisted renderer state.
+  reattachOnly: Schema.optional(Schema.Boolean),
 });
 export type TerminalOpenInput = Schema.Codec.Encoded<typeof TerminalOpenInput>;
 
@@ -88,8 +91,16 @@ export type TerminalRestartInput = Schema.Codec.Encoded<typeof TerminalRestartIn
 export const TerminalCloseInput = Schema.Struct({
   ...TerminalThreadInput.fields,
   terminalId: Schema.optional(TerminalIdSchema),
+  terminalIds: Schema.optional(
+    Schema.Array(TerminalIdSchema).check(Schema.isMinLength(1)),
+  ),
   deleteHistory: Schema.optional(Schema.Boolean),
-});
+}).check(
+  Schema.makeFilter(
+    (input) => input.terminalId === undefined || input.terminalIds === undefined,
+    { message: "terminalId and terminalIds cannot both be provided" },
+  ),
+);
 export type TerminalCloseInput = Schema.Codec.Encoded<typeof TerminalCloseInput>;
 
 export const TerminalSessionStatus = Schema.Literals(["starting", "running", "exited", "error"]);

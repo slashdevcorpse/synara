@@ -617,7 +617,7 @@ describe("workspace agent shell selection", () => {
     expect(liveTailChanged.threads[0]?.hasLiveTailWork).toBe(false);
   });
 
-  it("selects only the target, its parent, and its direct children", () => {
+  it("selects the target, its parent, and descendants through depth three", () => {
     const projectId = ProjectId.makeUnsafe("project-thread-scope");
     const parentId = ThreadId.makeUnsafe("thread-parent");
     const targetId = ThreadId.makeUnsafe("thread-target");
@@ -686,6 +686,7 @@ describe("workspace agent shell selection", () => {
       targetId,
       parentId,
       childId,
+      grandchildId,
     ]);
 
     summaryReadCount = 0;

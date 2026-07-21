@@ -102,6 +102,15 @@ describe("TerminalOpenInput", () => {
     });
   });
 
+  it("accepts an explicit reattach-only recovery policy", () => {
+    const parsed = decodeSync(TerminalOpenInput, {
+      threadId: "thread-1",
+      cwd: "/tmp/project",
+      reattachOnly: true,
+    });
+    expect(parsed.reattachOnly).toBe(true);
+  });
+
   it("rejects invalid env keys", () => {
     expect(
       decodes(TerminalOpenInput, {
@@ -193,6 +202,24 @@ describe("TerminalCloseInput", () => {
         deleteHistory: true,
       }),
     ).toBe(true);
+  });
+
+  it("accepts a non-empty atomic terminal batch and rejects ambiguous targets", () => {
+    expect(
+      decodes(TerminalCloseInput, {
+        threadId: "thread-1",
+        terminalIds: ["one", "two"],
+        deleteHistory: true,
+      }),
+    ).toBe(true);
+    expect(
+      decodes(TerminalCloseInput, {
+        threadId: "thread-1",
+        terminalId: "one",
+        terminalIds: ["two"],
+      }),
+    ).toBe(false);
+    expect(decodes(TerminalCloseInput, { threadId: "thread-1", terminalIds: [] })).toBe(false);
   });
 });
 

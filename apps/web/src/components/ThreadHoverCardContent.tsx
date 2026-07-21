@@ -10,14 +10,18 @@ import { PROVIDER_DISPLAY_NAMES, type ProviderKind } from "@synara/contracts";
 import type { MouseEvent, ReactNode } from "react";
 
 import { formatClockDuration } from "~/session-logic";
-import { agentStatusToSubagentStatusKind } from "~/lib/agentStatusPresentation";
-import { ArrowRightIcon, StopIcon, WorktreeIcon } from "~/lib/icons";
 import {
-  subagentStatusDotClassName,
-  subagentStatusTextToneClassName,
-} from "~/lib/subagentPresentation";
+  agentStatusPresentation,
+  agentStatusToSubagentStatusKind,
+} from "~/lib/agentStatusPresentation";
+import { ArrowRightIcon, StopIcon, WorktreeIcon } from "~/lib/icons";
+import { summarizeSettledSubagents } from "~/lib/subagentPresentation";
 import { cn } from "~/lib/utils";
-import { isLiveAgentStatus, type AgentStatus } from "~/lib/workspaceAgentActivity";
+import {
+  isLiveAgentStatus,
+  type AgentStatus,
+  type AgentThreadTreeNode,
+} from "~/lib/workspaceAgentActivity";
 import {
   PR_STATE_PRESENTATION_ICONS,
   resolvePrStatePresentation,
@@ -44,6 +48,7 @@ export type ThreadHoverCardContentProps = {
   permissionMode: ThreadHoverCardPermissionMode;
   subagentCount: number;
   subagentRunningCount: number;
+  subagentTree?: readonly AgentThreadTreeNode[];
   worktreeLabel: string | null;
   prTitle: string | null;
   prState: ThreadHoverCardPrState | null;
@@ -83,6 +88,8 @@ function formatStatusCopy(
       return durationLabel ? `completed · ${durationLabel} total` : "completed";
     case "failed":
       return "failed";
+    case "interrupted":
+      return "interrupted";
     case "stopped":
       return "stopped";
     case "queued":
@@ -146,6 +153,7 @@ export function ThreadHoverCardContent({
   permissionMode,
   subagentCount,
   subagentRunningCount,
+  subagentTree = [],
   worktreeLabel,
   prTitle,
   prState,
@@ -153,9 +161,13 @@ export function ThreadHoverCardContent({
   onInterrupt,
 }: ThreadHoverCardContentProps) {
   const providerName = PROVIDER_DISPLAY_NAMES[provider];
-  const statusKind = agentStatusToSubagentStatusKind(status);
+  const statusPresentation = agentStatusPresentation(status);
   const statusCopy = formatStatusCopy(status, duration, toolLabel);
-  const subagentCopy = formatSubagentCount(subagentCount, subagentRunningCount);
+  const settledSubagentSummary = summarizeSettledSubagents(
+    flattenSubagentStatuses(subagentTree).map(agentStatusToSubagentStatusKind),
+  );
+  const subagentCopy =
+    settledSubagentSummary?.label ?? formatSubagentCount(subagentCount, subagentRunningCount);
   const hasContext = worktreeLabel !== null || (prTitle !== null && prState !== null);
   const prPresentation = prState ? resolvePrStatePresentation(PR_INPUT_BY_STATE[prState]) : null;
   const PrIcon = prPresentation ? PR_STATE_PRESENTATION_ICONS[prPresentation.iconKind] : null;
@@ -183,6 +195,27 @@ export function ThreadHoverCardContent({
         </span>
       </div>
 
+      {subagentTree.length > 0 ? (
+        settledSubagentSummary ? (
+          <details className="mt-1 text-[10px] text-muted-foreground/68">
+            <summary className="cursor-pointer select-none rounded-sm outline-none focus-visible:ring-1 focus-visible:ring-ring">
+              {settledSubagentSummary.label} · details
+            </summary>
+            <ul className="mt-1 space-y-1" aria-label="Subagent activity details">
+              {subagentTree.map((node) => (
+                <SubagentActivityTreeRow key={node.entry.threadId} node={node} depth={0} />
+              ))}
+            </ul>
+          </details>
+        ) : (
+          <ul className="mt-1 space-y-1" aria-label="Subagent activity">
+            {subagentTree.map((node) => (
+              <SubagentActivityTreeRow key={node.entry.threadId} node={node} depth={0} />
+            ))}
+          </ul>
+        )
+      ) : null}
+
       {parentThreadTitle ? (
         <div className={cn(ROW_CLASS_NAME, "pl-5.5 text-muted-foreground/60")}>
           <span className="min-w-0 truncate" title={parentThreadTitle}>
@@ -196,12 +229,12 @@ export function ThreadHoverCardContent({
           aria-hidden
           className={cn(
             "size-1.5 shrink-0 rounded-full",
-            subagentStatusDotClassName(statusKind),
+            statusPresentation.dotClassName,
             isLiveAgentStatus(status) && "animate-pulse motion-reduce:animate-none",
           )}
         />
         <span
-          className={cn("min-w-0 truncate", subagentStatusTextToneClassName(statusKind))}
+          className={cn("min-w-0 truncate", statusPresentation.textClassName)}
           title={statusCopy}
         >
           {statusCopy}
@@ -264,5 +297,55 @@ export function ThreadHoverCardContent({
         </button>
       ) : null}
     </div>
+  );
+}
+
+function flattenSubagentStatuses(nodes: readonly AgentThreadTreeNode[]): AgentStatus[] {
+  return nodes.flatMap((node) => [node.entry.status, ...flattenSubagentStatuses(node.children)]);
+}
+
+function SubagentActivityTreeRow({
+  node,
+  depth,
+}: {
+  node: AgentThreadTreeNode;
+  depth: number;
+}) {
+  const { entry } = node;
+  const statusPresentation = agentStatusPresentation(entry.status);
+  const label = entry.subagentNickname ?? entry.threadTitle;
+  const role = entry.subagentRole ? ` · ${entry.subagentRole}` : "";
+  const tool = entry.latestTool?.state === "running" ? ` · ${entry.latestTool.name}` : "";
+  return (
+    <li>
+      <div
+        className="flex min-w-0 items-center gap-1.5 text-[10px] text-muted-foreground/68"
+        style={{ paddingLeft: Math.min(depth, 2) * 10 }}
+      >
+        <span
+          aria-hidden
+          className={cn(
+            "size-1.5 shrink-0 rounded-full",
+            statusPresentation.dotClassName,
+            isLiveAgentStatus(entry.status) && "animate-pulse motion-reduce:animate-none",
+          )}
+        />
+        <span className="min-w-0 flex-1 truncate" title={`${label}${role}${tool}`}>
+          {label}
+          {role}
+          {tool}
+        </span>
+        <span className={cn("shrink-0", statusPresentation.textClassName)}>
+          {statusPresentation.label}
+        </span>
+      </div>
+      {node.children.length > 0 ? (
+        <ul className="mt-1 space-y-1">
+          {node.children.map((child) => (
+            <SubagentActivityTreeRow key={child.entry.threadId} node={child} depth={depth + 1} />
+          ))}
+        </ul>
+      ) : null}
+    </li>
   );
 }

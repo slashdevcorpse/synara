@@ -85,6 +85,7 @@ import {
 } from "@synara/contracts";
 import { isGenericChatThreadTitle } from "@synara/shared/chatThreads";
 import { getDefaultModel } from "@synara/shared/model";
+import { isWindowsAbsolutePath } from "@synara/shared/path";
 import { pluralize } from "@synara/shared/text";
 import { resolveThreadWorkspaceCwd } from "@synara/shared/threadEnvironment";
 import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -147,6 +148,7 @@ import {
   prewarmStudioProject,
 } from "../lib/studioProjects";
 import { useComposerDraftStore } from "../composerDraftStore";
+import { useGitActionActivityStore } from "../gitActionActivityStore";
 import { useLatestProjectStore } from "../latestProjectStore";
 import { resolveThreadEnvironmentPresentation } from "../lib/threadEnvironment";
 import { dispatchThreadRename } from "../lib/threadRename";
@@ -162,12 +164,15 @@ import {
 import { shouldRenderTerminalWorkspace } from "./ChatView.logic";
 import { AgentActivityPulse } from "./chat/AgentActivityPulse";
 import type { AgentActivityState } from "./chat/agentActivityPulse.logic";
+import { IDLE_AGENT_ACTIVITY_STATE } from "../lib/agentActivity";
 import { CHAT_SURFACE_HEADER_HEIGHT_CLASS } from "./chat/chatHeaderControls";
 import { SidebarLeadingControls } from "./SidebarHeaderNavigationControls";
 import { SynaraLogo } from "./SynaraLogo";
 import { FolderClosed } from "./FolderClosed";
 import { ProjectSidebarIcon } from "./ProjectSidebarIcon";
 import { ThreadHoverCard } from "./ThreadHoverCard";
+import { hasActiveGitActionForProject } from "./workspace/workspaceDashboard.logic";
+import { agentStatusPresentation } from "../lib/agentStatusPresentation";
 import { ProjectHoverCardContent } from "./ProjectHoverCardContent";
 import {
   SIDEBAR_HOVER_CARD_POPUP_PROPS,
@@ -178,6 +183,7 @@ import { abbreviateHomePath, createProjectHoverCardAnchor } from "./sidebarHover
 import { PreviewCard, PreviewCardPopup, PreviewCardTrigger } from "./ui/preview-card";
 import { SidebarIconButton } from "./SidebarIconButton";
 import { SidebarLeadingIcon } from "./SidebarLeadingIcon";
+import { SidebarProjectGitActionIndicator } from "./SidebarProjectGitActionIndicator";
 import { SidebarMetaChipStack } from "./SidebarMetaChip";
 import { SidebarRowHoverActions } from "./SidebarRowHoverActions";
 import { SidebarSectionToolbar } from "./SidebarSectionToolbar";
@@ -288,6 +294,9 @@ import {
   resolveSettingsBackTarget,
   type SettingsBackTarget,
   resolveSidebarNewThreadEnvMode,
+  sidebarProjectActivityAccessibleLabel,
+  projectSidebarTransientTerminalActivity,
+  scheduleSidebarTransientTerminalDismiss,
   resolveThreadRowClassName,
   resolveThreadRowTrailingReserveClass,
   resolveThreadStatusPill,
@@ -331,6 +340,7 @@ import {
 } from "../sidebarRowStyles";
 import { SettingsSidebarNav } from "./SettingsSidebarNav";
 import { WorkspaceAgentSection } from "./workspace/WorkspaceAgentSection";
+import { useWorkspaceAgentActivity } from "../hooks/useWorkspaceAgentActivity";
 import { ComposerPickerMenuPopup } from "./chat/ComposerPickerMenuPopup";
 import { selectSplitView, useSplitViewStore } from "../splitViewStore";
 import { THREAD_DRAG_MIME } from "./chat-drop-overlay/ChatPaneDropOverlay";
@@ -547,7 +557,20 @@ const SIDEBAR_WORKING_ACTIVITY_STATE = {
 // check when completed, otherwise a colored status dot. Thread rows and project
 // headers use the same glyph so a collapsed project still advertises active
 // child chats.
-function SidebarStatusTrailingGlyph({ status }: { status: ThreadStatusPill }) {
+function SidebarStatusTrailingGlyph({
+  status,
+  activityState,
+}: {
+  status: ThreadStatusPill;
+  activityState?: AgentActivityState | null | undefined;
+}) {
+  if (
+    activityState &&
+    activityState.phase !== "idle" &&
+    activityState.phase !== "stopped"
+  ) {
+    return <AgentActivityPulse state={activityState} variant="dot" />;
+  }
   if (status.label === "Completed") {
     // Match the worktree/other trailing chips' optical size (15px) so the green
     // check reads as part of the same right-side icon cluster.
@@ -1225,6 +1248,29 @@ export default function Sidebar() {
     (store) => store.removeDeletedProjectFromClientState,
   );
   const terminalStateByThreadId = useTerminalStateStore((state) => state.terminalStateByThreadId);
+  const workspaceAgentActivity = useWorkspaceAgentActivity();
+  const agentActivityByThreadId = useMemo(
+    () =>
+      new Map(
+        workspaceAgentActivity.threads.map((entry) => [entry.threadId, entry.activityState] as const),
+      ),
+    [workspaceAgentActivity.threads],
+  );
+  const activeSubagentCountByParentId = useMemo(() => {
+    const counts = new Map<ThreadId, number>();
+    for (const entry of workspaceAgentActivity.threads) {
+      if (entry.activityState.subagentRunningCount === 0) continue;
+      counts.set(entry.threadId, entry.activityState.subagentRunningCount);
+    }
+    return counts;
+  }, [workspaceAgentActivity.threads]);
+  const activeGitActionIdsByCwd = useGitActionActivityStore(
+    (state) => state.activeActionIdsByCwd,
+  );
+  const activeGitActionCwds = useMemo(
+    () => [...activeGitActionIdsByCwd.keys()],
+    [activeGitActionIdsByCwd],
+  );
   const clearTerminalState = useTerminalStateStore((state) => state.clearTerminalState);
   const openChatThreadPage = useTerminalStateStore((state) => state.openChatThreadPage);
   const openTerminalThreadPage = useTerminalStateStore((state) => state.openTerminalThreadPage);
@@ -1486,6 +1532,62 @@ export default function Sidebar() {
   const selectSidebarTreeThreads = useMemo(() => createSidebarTreeThreadsSelector(), []);
   const sidebarThreads = useStore(selectSidebarThreads);
   const sidebarTreeThreads = useStore(selectSidebarTreeThreads);
+  const [transientTerminalActivityByThreadId, setTransientTerminalActivityByThreadId] = useState<
+    ReadonlyMap<ThreadId, AgentActivityState>
+  >(() => new Map());
+  const observedLiveTurnByThreadIdRef = useRef(new Map<ThreadId, string>());
+  const presentedTerminalTurnByThreadIdRef = useRef(new Map<ThreadId, string>());
+  const terminalActivityTimersRef = useRef(new Map<ThreadId, number>());
+  useEffect(() => {
+    const terminalProjections = projectSidebarTransientTerminalActivity({
+      activities: workspaceAgentActivity.threads.map((entry) => ({
+        threadId: entry.threadId,
+        phase: entry.activityState.phase,
+        turnKey: entry.activityState.turnKey,
+      })),
+      threads: sidebarThreads,
+      observedLiveTurnByThreadId: observedLiveTurnByThreadIdRef.current,
+      presentedTerminalTurnByThreadId: presentedTerminalTurnByThreadIdRef.current,
+    });
+    for (const projection of terminalProjections) {
+      setTransientTerminalActivityByThreadId((current) => {
+        const next = new Map(current);
+        next.set(projection.threadId, {
+          ...IDLE_AGENT_ACTIVITY_STATE,
+          phase: projection.phase,
+          turnKey: projection.turnKey,
+          lastEventTimestamp: projection.lastEventTimestamp,
+        });
+        return next;
+      });
+      const existingTimer = terminalActivityTimersRef.current.get(projection.threadId);
+      if (existingTimer !== undefined) window.clearTimeout(existingTimer);
+      terminalActivityTimersRef.current.set(
+        projection.threadId,
+        scheduleSidebarTransientTerminalDismiss(
+          (callback, delayMs) => window.setTimeout(callback, delayMs),
+          () => {
+            terminalActivityTimersRef.current.delete(projection.threadId);
+            setTransientTerminalActivityByThreadId((current) => {
+              if (!current.has(projection.threadId)) return current;
+              const next = new Map(current);
+              next.delete(projection.threadId);
+              return next;
+            });
+          },
+        ),
+      );
+    }
+  }, [sidebarThreads, workspaceAgentActivity.threads]);
+  useEffect(
+    () => () => {
+      for (const timer of terminalActivityTimersRef.current.values()) {
+        window.clearTimeout(timer);
+      }
+      terminalActivityTimersRef.current.clear();
+    },
+    [],
+  );
   const studioProjectIdSet = useMemo(
     () => collectStudioProjectIds(projects, { homeDir, chatWorkspaceRoot, studioWorkspaceRoot }),
     [chatWorkspaceRoot, homeDir, projects, studioWorkspaceRoot],
@@ -2470,6 +2572,24 @@ export default function Sidebar() {
     prefetchModelsForProjectNewThread,
     primaryNewThreadTarget,
     threadsHydrated,
+  ]);
+
+  const handlePrimaryNewTerminalWorkstream = useCallback(() => {
+    if (!primaryNewThreadTarget) {
+      handlePrimaryNewThread();
+      return;
+    }
+    void handleNewThread(primaryNewThreadTarget.projectId, {
+      entryPoint: "terminal",
+      envMode: resolveSidebarNewThreadEnvMode({
+        defaultEnvMode: appSettings.defaultThreadEnvMode,
+      }),
+    });
+  }, [
+    appSettings.defaultThreadEnvMode,
+    handleNewThread,
+    handlePrimaryNewThread,
+    primaryNewThreadTarget,
   ]);
 
   const handleImportThread = useCallback(
@@ -3979,11 +4099,17 @@ export default function Sidebar() {
     threadJumpLabelParts: readonly string[];
     rightMetaChips: ThreadMetaChip[];
     threadStatus: ReturnType<typeof resolveThreadStatusForSidebar>;
+    agentActivityState?: AgentActivityState | null | undefined;
     timestampToneClassName?: string;
     hoverActions: ReactNode;
   }) {
+    const activityLabel =
+      input.agentActivityState && input.agentActivityState.phase !== "idle"
+        ? `Agent status: ${agentStatusPresentation(input.agentActivityState.phase).label}`
+        : null;
     return (
       <div className="relative flex shrink-0 items-center justify-end gap-1">
+        {activityLabel ? <span className="sr-only">{activityLabel}</span> : null}
         {input.rightMetaChips.length > 0 ? (
           <div className={THREAD_ROW_META_CHIP_HOVER_FADE_CLASS_NAME}>
             <SidebarMetaChipStack chips={input.rightMetaChips} />
@@ -4006,7 +4132,10 @@ export default function Sidebar() {
               input.timestampToneClassName,
             )}
           >
-            <SidebarStatusTrailingGlyph status={input.threadStatus} />
+            <SidebarStatusTrailingGlyph
+              status={input.threadStatus}
+              activityState={input.agentActivityState}
+            />
           </span>
         ) : null}
         {input.hoverActions}
@@ -4215,6 +4344,9 @@ export default function Sidebar() {
               threadJumpLabelParts,
               rightMetaChips,
               threadStatus,
+              agentActivityState:
+                transientTerminalActivityByThreadId.get(thread.id) ??
+                agentActivityByThreadId.get(thread.id),
               timestampToneClassName: "text-muted-foreground/38",
               hoverActions: renderThreadHoverActions({
                 threadId: thread.id,
@@ -4274,6 +4406,7 @@ export default function Sidebar() {
         ? null
         : prStatus;
     const canToggleSubagents = childCount > 0;
+    const activeSubagentCount = activeSubagentCountByParentId.get(thread.id) ?? 0;
     const subagentIndentPx = Math.max(0, Math.min(depth - 1, 3) * 10);
     const showCompactMeta = !isSubagentThread;
     const threadJumpLabel = visibleThreadJumpLabelByThreadId.get(thread.id) ?? null;
@@ -4399,11 +4532,17 @@ export default function Sidebar() {
                   <button
                     type="button"
                     data-thread-selection-safe
-                    aria-label={`${isExpanded ? "Collapse" : "Expand"} ${childCountLabel}`}
-                    title={childCountLabel}
+                    aria-label={`${isExpanded ? "Collapse" : "Expand"} ${childCountLabel}${activeSubagentCount > 0 ? `, ${activeSubagentCount} active` : ""}`}
+                    title={
+                      activeSubagentCount > 0
+                        ? `${activeSubagentCount} active of ${childCount} ${pluralize(childCount, "subagent")}`
+                        : childCountLabel
+                    }
                     className={cn(
                       "inline-flex h-5 min-w-5 items-center justify-center gap-0.5 rounded-full border px-[5px] transition-colors",
                       toggleButtonClassName,
+                      activeSubagentCount > 0 &&
+                        "border-violet-400/35 text-violet-300",
                     )}
                     onClick={(event) => {
                       event.preventDefault();
@@ -4412,7 +4551,7 @@ export default function Sidebar() {
                     }}
                   >
                     <span className="text-[9px] font-medium leading-none tabular-nums">
-                      {childCount}
+                      {activeSubagentCount > 0 ? activeSubagentCount : childCount}
                     </span>
                     {isExpanded ? (
                       <SidebarGlyph icon={ChevronDownIcon} variant="chevron" />
@@ -4443,6 +4582,9 @@ export default function Sidebar() {
               threadJumpLabelParts,
               rightMetaChips: showCompactMeta ? rightMetaChips : [],
               threadStatus,
+              agentActivityState:
+                transientTerminalActivityByThreadId.get(thread.id) ??
+                agentActivityByThreadId.get(thread.id),
               timestampToneClassName: isSubagentThread
                 ? isHighlighted
                   ? "text-foreground/38 dark:text-foreground/46"
@@ -4487,6 +4629,12 @@ export default function Sidebar() {
     // A project reads as "running" when Synara tracks a run for it or when a
     // local server (possibly started outside Synara) is attributed by cwd.
     const isProjectRunning = projectRun !== null || projectRunServer !== null;
+    const gitActionRunning = hasActiveGitActionForProject({
+      project,
+      threads: Object.values(sidebarThreadSummaryById),
+      activeActionCwds: activeGitActionCwds,
+      platform: isWindowsAbsolutePath(project.cwd) ? "windows" : "posix",
+    });
     const collapsedProjectStatus = project.expanded ? null : projectStatus;
     // The "open dev server" affordance now lives in the project context menu, so
     // the hover toolbar always reserves space for the three thread actions. The
@@ -4559,20 +4707,27 @@ export default function Sidebar() {
               </div>
               {/* Closed folders surface child-chat status on the project row; open
                   folders leave that signal to their visible child thread rows. */}
-              {isProjectRunning || collapsedProjectStatus ? (
+              {isProjectRunning || gitActionRunning || collapsedProjectStatus ? (
                 <span
-                  aria-label={
-                    collapsedProjectStatus
-                      ? `Project status: ${collapsedProjectStatus.label}`
-                      : undefined
+                  aria-label={sidebarProjectActivityAccessibleLabel({
+                    projectName: project.name,
+                    devServerRunning: isProjectRunning,
+                    gitActionRunning,
+                    collapsedStatusLabel: collapsedProjectStatus?.label ?? null,
+                  })}
+                  title={
+                    collapsedProjectStatus?.label ??
+                    (gitActionRunning ? "Git operation running" : undefined)
                   }
-                  title={collapsedProjectStatus?.label}
                   className={cn(
                     "ml-auto flex min-w-[1.625rem] shrink-0 items-center justify-end gap-2 self-center",
                     sidebarHoverRevealHideClassName("project-header"),
                   )}
                 >
                   {isProjectRunning ? <ProjectRunIndicatorDot /> : null}
+                  {gitActionRunning ? (
+                    <SidebarProjectGitActionIndicator projectName={project.name} />
+                  ) : null}
                   {collapsedProjectStatus ? (
                     <SidebarStatusTrailingGlyph status={collapsedProjectStatus} />
                   ) : null}
@@ -5932,7 +6087,11 @@ export default function Sidebar() {
           </>
         )}
         {!isOnSettings ? (
-          <WorkspaceAgentSection onOpenThread={activateThreadFromSidebarIntent} />
+          <WorkspaceAgentSection
+            onOpenThread={activateThreadFromSidebarIntent}
+            onStartChat={handlePrimaryNewThread}
+            onStartTerminalWorkstream={handlePrimaryNewTerminalWorkstream}
+          />
         ) : null}
         {!isOnSettings && !isOnStudio && chatsSectionVisible ? (
           // sidebar-surface-enter: mounts on the Studio -> Projects switch, so it

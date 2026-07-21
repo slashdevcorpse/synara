@@ -6,6 +6,7 @@ import {
   type ContextMenuItem,
   MAX_PINNED_PROJECTS,
   type KeybindingCommand,
+  type OrchestrationLatestTurnState,
   type ProjectId,
   type PullRequestReviewRequestCountResult,
   type ThreadId,
@@ -30,6 +31,10 @@ import {
   SIDEBAR_THREAD_ROW_BASE_CLASS_NAME,
 } from "../sidebarRowStyles";
 import { isDuplicateProjectCreateError } from "../lib/projectCreateRecovery";
+import {
+  isLiveAgentActivityPhase,
+  type AgentActivityPhase,
+} from "../lib/agentActivity";
 import {
   canSessionAnswerPendingRequests,
   hasLiveLatestTurn,
@@ -715,6 +720,84 @@ export function resolveProjectStatusIndicator(
   }
 
   return highestPriorityStatus;
+}
+
+export function sidebarProjectActivityAccessibleLabel(input: {
+  readonly projectName: string;
+  readonly devServerRunning: boolean;
+  readonly gitActionRunning: boolean;
+  readonly collapsedStatusLabel: string | null;
+}): string | undefined {
+  const labels = [
+    input.collapsedStatusLabel ? `Project status: ${input.collapsedStatusLabel}` : null,
+    input.devServerRunning ? `Dev server running for ${input.projectName}` : null,
+    input.gitActionRunning ? `Git operation running for ${input.projectName}` : null,
+  ].filter((label): label is string => label !== null);
+  return labels.length > 0 ? labels.join(", ") : undefined;
+}
+
+export const SIDEBAR_TRANSIENT_TERMINAL_DISMISS_MS = 3_000;
+
+export interface SidebarTransientTerminalProjection<TThreadId extends string = ThreadId> {
+  readonly threadId: TThreadId;
+  readonly phase: Extract<AgentActivityPhase, "completed" | "failed" | "interrupted">;
+  readonly turnKey: string;
+  readonly lastEventTimestamp: string | null;
+}
+
+export function projectSidebarTransientTerminalActivity<TThreadId extends string>(input: {
+  readonly activities: ReadonlyArray<{
+    readonly threadId: TThreadId;
+    readonly phase: AgentActivityPhase;
+    readonly turnKey: string | null;
+  }>;
+  readonly threads: ReadonlyArray<{
+    readonly id: TThreadId;
+    readonly latestTurn: {
+      readonly turnId: string;
+      readonly state: OrchestrationLatestTurnState;
+      readonly completedAt: string | null;
+    } | null;
+  }>;
+  readonly observedLiveTurnByThreadId: Map<TThreadId, string>;
+  readonly presentedTerminalTurnByThreadId: Map<TThreadId, string>;
+}): SidebarTransientTerminalProjection<TThreadId>[] {
+  for (const activity of input.activities) {
+    if (isLiveAgentActivityPhase(activity.phase) && activity.turnKey) {
+      input.observedLiveTurnByThreadId.set(activity.threadId, activity.turnKey);
+    }
+  }
+
+  const projections: SidebarTransientTerminalProjection<TThreadId>[] = [];
+  for (const thread of input.threads) {
+    const turn = thread.latestTurn;
+    if (!turn || turn.state === "running") continue;
+    const turnKey = String(turn.turnId);
+    if (input.observedLiveTurnByThreadId.get(thread.id) !== turnKey) continue;
+    if (input.presentedTerminalTurnByThreadId.get(thread.id) === turnKey) continue;
+
+    input.presentedTerminalTurnByThreadId.set(thread.id, turnKey);
+    input.observedLiveTurnByThreadId.delete(thread.id);
+    projections.push({
+      threadId: thread.id,
+      phase:
+        turn.state === "error"
+          ? "failed"
+          : turn.state === "interrupted"
+            ? "interrupted"
+            : "completed",
+      turnKey,
+      lastEventTimestamp: turn.completedAt,
+    });
+  }
+  return projections;
+}
+
+export function scheduleSidebarTransientTerminalDismiss<TTimer>(
+  schedule: (callback: () => void, delayMs: number) => TTimer,
+  onDismiss: () => void,
+): TTimer {
+  return schedule(onDismiss, SIDEBAR_TRANSIENT_TERMINAL_DISMISS_MS);
 }
 
 export function findWorkspaceRootMatch<T>(

@@ -5,6 +5,7 @@
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 
+import { DISCLOSURE_DURATION_MS } from "../../lib/disclosureMotion";
 import {
   deriveAgentActivityState,
   IDLE_AGENT_ACTIVITY_STATE,
@@ -15,7 +16,7 @@ import {
 } from "./agentActivityPulse.logic";
 
 export const AGENT_ACTIVITY_MIN_PHASE_DWELL_MS = 100;
-export const AGENT_ACTIVITY_TERMINAL_DISPLAY_MS = 440;
+export const AGENT_ACTIVITY_TERMINAL_DISPLAY_MS = DISCLOSURE_DURATION_MS;
 
 interface ObservedLiveTurn {
   threadId: string;
@@ -38,8 +39,14 @@ function initialDisplayState(target: AgentActivityState): AgentActivityState {
 function activityStatesEqual(left: AgentActivityState, right: AgentActivityState): boolean {
   return (
     left.phase === right.phase &&
+    left.queueCount === right.queueCount &&
     left.toolCount === right.toolCount &&
     left.subagentCount === right.subagentCount &&
+    left.subagentRunningCount === right.subagentRunningCount &&
+    left.subagentStates === right.subagentStates &&
+    left.latestToolName === right.latestToolName &&
+    left.streamPreview === right.streamPreview &&
+    left.durationMs === right.durationMs &&
     left.lastEventTimestamp === right.lastEventTimestamp &&
     left.turnKey === right.turnKey
   );
@@ -62,6 +69,7 @@ export function useAgentActivityState(input: AgentActivityInput): AgentActivityP
       input.localDispatchPending,
       input.messages,
       input.session,
+      input.subagentStates,
       input.threadError,
       input.threadId,
     ],
@@ -219,7 +227,7 @@ export function useAgentActivityState(input: AgentActivityInput): AgentActivityP
     }
 
     // Preserve an already-presented one-shot terminal phase until its scheduled
-    // 440ms dismissal even if projection cleanup removes latestTurn first.
+    // shared 220ms dismissal even if projection cleanup removes latestTurn first.
     if (
       terminalFrameRef.current !== null &&
       (displayStateRef.current.phase === "completed" || displayStateRef.current.phase === "failed")

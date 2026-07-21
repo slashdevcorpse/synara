@@ -6,16 +6,25 @@
 import "@xterm/xterm/css/xterm.css";
 import { SearchAddon } from "@xterm/addon-search";
 import {
+  ChevronDownIcon,
   Plus,
+  RefreshCwIcon,
   SquareSplitHorizontal,
   SquareSplitVertical,
-  Trash2,
   TriangleAlertIcon,
 } from "~/lib/icons";
 import { type ThreadId } from "@synara/contracts";
 import { type TerminalActivityState, type TerminalCliKind } from "@synara/shared/terminalThreads";
 import { Terminal } from "@xterm/xterm";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  type DragEvent as ReactDragEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useAppSettings } from "~/appSettings";
 import { type TerminalContextSelection } from "~/lib/terminalContext";
 import { readNativeApi } from "~/nativeApi";
@@ -23,8 +32,27 @@ import {
   MAX_TERMINALS_PER_GROUP,
   type ThreadTerminalGroup,
   type ThreadTerminalPresentationMode,
+  type TerminalExitState,
 } from "../types";
+import {
+  selectThreadTerminalState,
+  type TerminalMoveTarget,
+  useTerminalStateStore,
+} from "../terminalStateStore";
 import { cn } from "~/lib/utils";
+import { Button } from "~/components/ui/button";
+import {
+  AlertDialog,
+  AlertDialogClose,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogPopup,
+  AlertDialogTitle,
+} from "~/components/ui/alert-dialog";
+import { ComposerPickerMenuPopup } from "~/components/chat/ComposerPickerMenuPopup";
+import { Menu, MenuItem, MenuSeparator, MenuTrigger } from "~/components/ui/menu";
+import { toastManager } from "~/components/ui/toast";
 import {
   type TerminalChromeActionItem,
   TerminalSidebar,
@@ -49,6 +77,25 @@ import TerminalViewportPane from "./terminal/TerminalViewportPane";
 import { useTerminalDrawerHeight } from "./terminal/useTerminalDrawerHeight";
 import { TerminalSearch } from "./TerminalSearch";
 import { TerminalScrollToBottom } from "./TerminalScrollToBottom";
+import {
+  closeTerminalSessionsStrict,
+  restartTerminalSession,
+  shouldAttachTerminalRuntime,
+  stopTerminalSessionPreservingHistory,
+  terminalExitStateFromProcessExit,
+  terminalExitStateFromRecovery,
+} from "./terminal/terminalSession";
+import {
+  closeTerminalGroupTransaction,
+  stopTerminalGroupForArchive,
+} from "./terminal/terminalGroupLifecycle";
+import { writeTerminalDragPayload } from "./terminal/terminalDragAndDrop";
+import {
+  pruneTerminalTabSelection,
+  type TerminalTabSelection,
+  updateTerminalTabSelection,
+} from "./terminal/terminalTabSelection";
+import { resolveTerminalWorkspaceShortcut } from "./terminal/terminalWorkspaceShortcuts";
 
 function serializeRuntimeEnv(runtimeEnv: Record<string, string> | undefined): string {
   if (!runtimeEnv) return "";
@@ -107,6 +154,42 @@ function TerminalRuntimeStatusOverlay({ status }: { status: TerminalRuntimeStatu
   );
 }
 
+export function TerminalEmptyState(props: {
+  archivedGroupId?: string | undefined;
+  onRestoreGroup: (groupId: string) => void;
+  onNewGroup: () => void;
+}) {
+  const hasArchivedGroup = props.archivedGroupId !== undefined;
+  return (
+    <div className="flex h-full min-h-40 flex-col items-center justify-center gap-3 px-6 text-center">
+      <div>
+        <p className="text-sm font-medium text-foreground">
+          {hasArchivedGroup ? "All terminal groups are archived" : "No terminal groups"}
+        </p>
+        <p className="mt-1 text-xs text-muted-foreground">
+          {hasArchivedGroup
+            ? "Restore a group with its layout intact, or create a new group."
+            : "Create a group to start a new terminal."}
+        </p>
+      </div>
+      <div className="flex items-center gap-2">
+        {props.archivedGroupId ? (
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => props.onRestoreGroup(props.archivedGroupId ?? "")}
+          >
+            <RefreshCwIcon />Restore last group
+          </Button>
+        ) : null}
+        <Button size="sm" variant="secondary" onClick={props.onNewGroup}>
+          <Plus />New group
+        </Button>
+      </div>
+    </div>
+  );
+}
+
 interface TerminalViewportProps {
   threadId: ThreadId;
   terminalId: string;
@@ -115,7 +198,18 @@ interface TerminalViewportProps {
   cwd: string;
   runtimeEnv?: Record<string, string>;
   terminalRightClickToPaste: boolean;
-  onSessionExited: () => void;
+  exitState?: TerminalExitState | undefined;
+  reattachOnly: boolean;
+  onRecoveryResolved: (
+    terminalId: string,
+    recovery: {
+      status: "starting" | "running" | "exited" | "error";
+      exitCode: number | null;
+      exitSignal: number | null;
+    },
+  ) => void;
+  onSessionExited: (exit: { exitCode: number | null; exitSignal: number | null }) => void;
+  onRestart: () => Promise<void>;
   onTerminalMetadataChange: (
     terminalId: string,
     metadata: { cliKind: TerminalCliKind | null; label: string },
@@ -139,6 +233,10 @@ function TerminalViewport({
   runtimeEnv,
   terminalRightClickToPaste,
   onSessionExited,
+  exitState,
+  reattachOnly,
+  onRecoveryResolved,
+  onRestart,
   onTerminalMetadataChange,
   onTerminalActivityChange,
   onAddTerminalContext,
@@ -159,6 +257,7 @@ function TerminalViewport({
   const [terminalInstance, setTerminalInstance] = useState<Terminal | null>(null);
   const [searchAddonInstance, setSearchAddonInstance] = useState<SearchAddon | null>(null);
   const [runtimeStatus, setRuntimeStatus] = useState<TerminalRuntimeStatus>("connecting");
+  const [restarting, setRestarting] = useState(false);
   const runtimeStatusMountedRef = useRef(false);
   // Manual memoization kept: this file does not compile under React Compiler (see compile-report).
   const trimmedCwd = useMemo(() => cwd.trim(), [cwd]);
@@ -181,6 +280,7 @@ function TerminalViewport({
       terminalCliKind,
       cwd,
       terminalRightClickToPaste,
+      reattachOnly,
       ...(runtimeEnvPayload ? { runtimeEnv: runtimeEnvPayload } : {}),
       callbacks: {
         onSessionExited,
@@ -191,15 +291,18 @@ function TerminalViewport({
             setRuntimeStatus(status);
           }
         },
+        onTerminalRecoveryResolved: onRecoveryResolved,
       },
     }),
     [
       cwd,
+      onRecoveryResolved,
       onSessionExited,
       onTerminalActivityChange,
       onTerminalMetadataChange,
       runtimeEnvPayload,
       runtimeKey,
+      reattachOnly,
       terminalCliKind,
       terminalId,
       terminalLabel,
@@ -211,6 +314,7 @@ function TerminalViewport({
     () => ({ autoFocus, isVisible }),
     [autoFocus, isVisible],
   );
+  const runtimeAttachEnabled = shouldAttachTerminalRuntime({ runtimeCwdReady, exitState });
   const runtimeConfigRef = useRef(runtimeConfig);
   const runtimeViewStateRef = useRef(runtimeViewState);
 
@@ -239,7 +343,7 @@ function TerminalViewport({
 
   useEffect(() => {
     const mount = containerRef.current;
-    if (!mount || !runtimeCwdReady) {
+    if (!mount || !runtimeAttachEnabled) {
       terminalRef.current = null;
       setTerminalInstance(null);
       setSearchAddonInstance(null);
@@ -268,22 +372,22 @@ function TerminalViewport({
       setTerminalInstance(null);
       setSearchAddonInstance(null);
     };
-  }, [runtimeCwdReady, runtimeKey]);
+  }, [runtimeAttachEnabled, runtimeKey]);
 
   useEffect(() => {
-    if (!runtimeCwdReady) return;
+    if (!runtimeAttachEnabled) return;
     terminalRuntimeRegistry.syncConfig(runtimeKey, runtimeConfig);
-  }, [runtimeConfig, runtimeCwdReady, runtimeKey]);
+  }, [runtimeAttachEnabled, runtimeConfig, runtimeKey]);
 
   useEffect(() => {
-    if (!runtimeCwdReady) return;
+    if (!runtimeAttachEnabled) return;
     terminalRuntimeRegistry.setViewState(runtimeKey, runtimeViewState);
-  }, [runtimeCwdReady, runtimeKey, runtimeViewState]);
+  }, [runtimeAttachEnabled, runtimeKey, runtimeViewState]);
 
   useEffect(() => {
-    if (!autoFocus || !runtimeCwdReady) return;
+    if (!autoFocus || !runtimeAttachEnabled) return;
     terminalRuntimeRegistry.focus(runtimeKey);
-  }, [autoFocus, focusRequestId, runtimeCwdReady, runtimeKey]);
+  }, [autoFocus, focusRequestId, runtimeAttachEnabled, runtimeKey]);
 
   useEffect(() => {
     const mount = containerRef.current;
@@ -445,6 +549,27 @@ function TerminalViewport({
           }}
         />
         <TerminalRuntimeStatusOverlay status={runtimeStatus} />
+        {exitState ? (
+          <div className="absolute inset-x-0 top-1 z-20 flex justify-center">
+            <div className={cn("flex items-center gap-2 rounded-md border px-2 py-1 text-xs shadow-sm backdrop-blur", exitState.kind === "failed" ? "border-destructive/40 bg-destructive/10 text-destructive" : "border-border/70 bg-background/90 text-muted-foreground")}>
+              <span>{exitState.kind === "failed" ? `Exited with code ${exitState.exitCode ?? "unknown"}` : "Terminal stopped"}</span>
+              <Button
+                size="xs"
+                variant="outline"
+                disabled={restarting}
+                onClick={() => {
+                  setRestarting(true);
+                  void onRestart()
+                    .catch(() => undefined)
+                    .finally(() => setRestarting(false));
+                }}
+              >
+                <RefreshCwIcon className={cn("size-3", restarting && "animate-spin")} />
+                Restart
+              </Button>
+            </div>
+          </div>
+        ) : null}
         <TerminalScrollToBottom terminal={terminalInstance} />
         <div ref={containerRef} className="h-full w-full" />
       </div>
@@ -473,6 +598,7 @@ interface ThreadTerminalDrawerProps {
   onSplitTerminalDown: () => void;
   onNewTerminal: () => void;
   onNewTerminalTab: (terminalId: string) => void;
+  onStartProjectScript?: (() => void) | undefined;
   onMoveTerminalToGroup: (terminalId: string) => void;
   splitShortcutLabel?: string | undefined;
   splitDownShortcutLabel?: string | undefined;
@@ -519,6 +645,7 @@ export default function ThreadTerminalDrawer({
   onSplitTerminalDown,
   onNewTerminal,
   onNewTerminalTab,
+  onStartProjectScript,
   onMoveTerminalToGroup,
   splitShortcutLabel,
   splitDownShortcutLabel,
@@ -538,6 +665,28 @@ export default function ThreadTerminalDrawer({
   isPanelOpen,
 }: ThreadTerminalDrawerProps) {
   const { settings } = useAppSettings();
+  const lifecycleState = useTerminalStateStore((state) =>
+    selectThreadTerminalState(state.terminalStateByThreadId, threadId),
+  );
+  const archiveTerminalGroup = useTerminalStateStore((state) => state.archiveTerminalGroup);
+  const restoreTerminalGroup = useTerminalStateStore((state) => state.restoreTerminalGroup);
+  const reorderTerminalGroup = useTerminalStateStore((state) => state.reorderTerminalGroup);
+  const moveTerminals = useTerminalStateStore((state) => state.moveTerminals);
+  const renameTerminalGroup = useTerminalStateStore((state) => state.renameTerminalGroup);
+  const setTerminalGroupRole = useTerminalStateStore((state) => state.setTerminalGroupRole);
+  const setShowArchivedTerminalGroups = useTerminalStateStore(
+    (state) => state.setShowArchivedTerminalGroups,
+  );
+  const setTerminalExitState = useTerminalStateStore((state) => state.setTerminalExitState);
+  const setTerminalLaunchMetadata = useTerminalStateStore(
+    (state) => state.setTerminalLaunchMetadata,
+  );
+  const [pendingArchiveGroupId, setPendingArchiveGroupId] = useState<string | null>(null);
+  const [pendingCloseGroupId, setPendingCloseGroupId] = useState<string | null>(null);
+  const [terminalTabSelection, setTerminalTabSelection] = useState<TerminalTabSelection>({
+    anchorId: null,
+    selectedIds: new Set(),
+  });
   const isWorkspaceMode = presentationMode === "workspace";
   const previousRuntimeKeysRef = useRef<Set<string>>(new Set());
   const { drawerHeight, handleResizePointerDown, handleResizePointerMove, handleResizePointerEnd } =
@@ -552,6 +701,7 @@ export default function ThreadTerminalDrawer({
     resolvedActiveTerminalId,
     resolvedActiveGroupId,
     resolvedTerminalGroups,
+    resolvedArchivedTerminalGroups,
     activeGroupLayout,
     hasTerminalSidebar,
     showGroupHeaders,
@@ -564,6 +714,7 @@ export default function ThreadTerminalDrawer({
         activeTerminalId,
         runningTerminalIds,
         terminalAttentionStatesById,
+        terminalExitStatesById: lifecycleState.terminalExitStatesById,
         terminalCliKindsById,
         terminalGroups,
         terminalIds,
@@ -575,6 +726,7 @@ export default function ThreadTerminalDrawer({
       activeTerminalId,
       runningTerminalIds,
       terminalAttentionStatesById,
+      lifecycleState.terminalExitStatesById,
       terminalCliKindsById,
       terminalGroups,
       terminalIds,
@@ -596,6 +748,390 @@ export default function ThreadTerminalDrawer({
     previousRuntimeKeysRef.current = nextRuntimeKeySet;
   }, [normalizedTerminalIds, threadId]);
 
+  useEffect(() => {
+    for (const terminalId of normalizedTerminalIds) {
+      const current = lifecycleState.terminalLaunchMetadataById[terminalId];
+      if (current?.cwd === cwd) continue;
+      setTerminalLaunchMetadata(threadId, terminalId, {
+        cwd,
+        ...(current?.reattachOnly === true ? { reattachOnly: true } : {}),
+      });
+    }
+  }, [
+    cwd,
+    lifecycleState.terminalLaunchMetadataById,
+    normalizedTerminalIds,
+    setTerminalLaunchMetadata,
+    threadId,
+  ]);
+
+  const addArchiveUndoToast = useCallback(
+    (groupId: string, groupName: string) => {
+      toastManager.add({
+        type: "info",
+        title: `${groupName} archived`,
+        description: "Its terminals and layout are preserved.",
+        data: { threadId },
+        actionProps: {
+          children: "Undo",
+          onClick: () => {
+            restoreTerminalGroup(threadId, groupId);
+            window.requestAnimationFrame(() => {
+              document
+                .querySelector<HTMLElement>(
+                  `[data-terminal-group-id="${CSS.escape(groupId)}"]`,
+                )
+                ?.focus();
+            });
+          },
+        },
+      });
+    },
+    [restoreTerminalGroup, threadId],
+  );
+
+  const activeGroupTerminalIds = useMemo(
+    () =>
+      resolvedTerminalGroups.find((group) => group.id === resolvedActiveGroupId)?.terminalIds ?? [],
+    [resolvedActiveGroupId, resolvedTerminalGroups],
+  );
+
+  // Selection is intentionally scoped to one visible drawer group. Switching
+  // threads/groups resets it; membership changes only prune removed terminals.
+  useEffect(() => {
+    setTerminalTabSelection({ anchorId: null, selectedIds: new Set() });
+  }, [resolvedActiveGroupId, threadId]);
+
+  useEffect(() => {
+    setTerminalTabSelection((selection) =>
+      pruneTerminalTabSelection(selection, activeGroupTerminalIds),
+    );
+  }, [activeGroupTerminalIds]);
+
+  const selectTerminalTab = useCallback(
+    (terminalId: string, modifiers: { shiftKey: boolean; toggleKey: boolean }) => {
+      setTerminalTabSelection((selection) =>
+        updateTerminalTabSelection({
+          orderedTerminalIds: activeGroupTerminalIds,
+          selection,
+          terminalId,
+          ...modifiers,
+        }),
+      );
+    },
+    [activeGroupTerminalIds],
+  );
+
+  const moveTerminalSelection = useCallback(
+    (
+      terminalIdsToMove: readonly string[],
+      target: TerminalMoveTarget,
+    ) => {
+      moveTerminals(threadId, terminalIdsToMove, target);
+      setTerminalTabSelection({ anchorId: null, selectedIds: new Set() });
+    },
+    [moveTerminals, threadId],
+  );
+
+  const startTerminalTabDrag = useCallback(
+    (event: ReactDragEvent<HTMLDivElement>, terminalId: string) => {
+      const terminalIdsToMove = terminalTabSelection.selectedIds.has(terminalId)
+        ? activeGroupTerminalIds.filter((id) => terminalTabSelection.selectedIds.has(id))
+        : [terminalId];
+      if (!terminalTabSelection.selectedIds.has(terminalId)) {
+        setTerminalTabSelection({ anchorId: terminalId, selectedIds: new Set([terminalId]) });
+      }
+      writeTerminalDragPayload(event.dataTransfer, {
+        kind: "terminals",
+        terminalIds: terminalIdsToMove,
+      });
+    },
+    [activeGroupTerminalIds, terminalTabSelection],
+  );
+
+  const requestArchiveGroup = useCallback(
+    (groupId: string) => {
+      const group = resolvedTerminalGroups.find((entry) => entry.id === groupId);
+      if (!group) return;
+      const hasRunningTerminal = group.terminalIds.some((terminalId) =>
+        runningTerminalIds.includes(terminalId),
+      );
+      if (hasRunningTerminal) {
+        setPendingArchiveGroupId(groupId);
+        return;
+      }
+      const groupIndex = resolvedTerminalGroups.findIndex((entry) => entry.id === groupId);
+      const nextFocusGroup =
+        resolvedTerminalGroups[groupIndex + 1] ?? resolvedTerminalGroups[groupIndex - 1] ?? null;
+      archiveTerminalGroup(threadId, groupId);
+      addArchiveUndoToast(groupId, group.name);
+      window.requestAnimationFrame(() => {
+        if (nextFocusGroup) {
+          document
+            .querySelector<HTMLElement>(
+              `[data-terminal-group-id="${CSS.escape(nextFocusGroup.id)}"]`,
+            )
+            ?.focus();
+        } else {
+          document.querySelector<HTMLElement>("[data-terminal-archived-toggle]")?.focus();
+        }
+      });
+    },
+    [addArchiveUndoToast, archiveTerminalGroup, resolvedTerminalGroups, runningTerminalIds, threadId],
+  );
+
+  const stopAndArchivePendingGroup = useCallback(async () => {
+    const group = resolvedTerminalGroups.find((entry) => entry.id === pendingArchiveGroupId);
+    if (!group) {
+      setPendingArchiveGroupId(null);
+      return;
+    }
+    const api = readNativeApi();
+    const runningIds = group.terminalIds.filter((terminalId) =>
+      runningTerminalIds.includes(terminalId),
+    );
+    const result = await stopTerminalGroupForArchive({
+      terminalIds: runningIds,
+      stopTerminal: (terminalId) =>
+        stopTerminalSessionPreservingHistory({ api, threadId, terminalId }),
+      markTerminalStopped: (terminalId) =>
+        setTerminalExitState(threadId, terminalId, {
+          kind: "stopped",
+          exitCode: null,
+          exitSignal: null,
+        }),
+      archiveGroup: () => archiveTerminalGroup(threadId, group.id),
+    });
+    if (!result.archived) {
+      toastManager.add({
+        type: "error",
+        title: "Could not stop every terminal",
+        description: `${result.failedTerminalIds.length} terminal${result.failedTerminalIds.length === 1 ? "" : "s"} remain visible and were not marked as stopped.`,
+        data: { threadId },
+      });
+      setPendingArchiveGroupId(null);
+      return;
+    }
+    addArchiveUndoToast(group.id, group.name);
+    const groupIndex = resolvedTerminalGroups.findIndex((entry) => entry.id === group.id);
+    const nextFocusGroup =
+      resolvedTerminalGroups[groupIndex + 1] ?? resolvedTerminalGroups[groupIndex - 1] ?? null;
+    window.requestAnimationFrame(() => {
+      if (nextFocusGroup) {
+        document
+          .querySelector<HTMLElement>(
+            `[data-terminal-group-id="${CSS.escape(nextFocusGroup.id)}"]`,
+          )
+          ?.focus();
+      } else {
+        document.querySelector<HTMLElement>("[data-terminal-archived-toggle]")?.focus();
+      }
+    });
+    setPendingArchiveGroupId(null);
+  }, [
+    addArchiveUndoToast,
+    archiveTerminalGroup,
+    pendingArchiveGroupId,
+    resolvedTerminalGroups,
+    runningTerminalIds,
+    setTerminalExitState,
+    threadId,
+  ]);
+
+  const closeTerminalGroupDestructively = useCallback(
+    async (groupId: string): Promise<boolean> => {
+      const group = [...resolvedTerminalGroups, ...resolvedArchivedTerminalGroups].find(
+        (entry) => entry.id === groupId,
+      );
+      if (!group) return false;
+      const api = readNativeApi();
+      const result = await closeTerminalGroupTransaction({
+        terminalIds: group.terminalIds,
+        closeTerminals: (terminalIds) =>
+          closeTerminalSessionsStrict({ api, threadId, terminalIds }),
+        disposeTerminal: (terminalId) =>
+          terminalRuntimeRegistry.disposeTerminal(threadId, terminalId),
+        removeGroup: () => onCloseTerminalGroup(groupId),
+      });
+      if (!result.closed) {
+        toastManager.add({
+          type: "error",
+          title: "Could not close terminal group",
+          description: `The group remains visible. Failed terminal IDs: ${result.failedTerminalIds.join(", ")}`,
+          data: { threadId },
+        });
+      }
+      return result.closed;
+    }, [onCloseTerminalGroup, resolvedArchivedTerminalGroups, resolvedTerminalGroups, threadId],
+  );
+
+  const restoreGroupAndFocus = useCallback(
+    (groupId: string) => {
+      restoreTerminalGroup(threadId, groupId);
+      window.requestAnimationFrame(() => {
+        document
+          .querySelector<HTMLElement>(`[data-terminal-group-id="${CSS.escape(groupId)}"]`)
+          ?.focus();
+      });
+    },
+    [restoreTerminalGroup, threadId],
+  );
+
+  const stopAllInGroup = useCallback(
+    async (groupId: string) => {
+      const group = resolvedTerminalGroups.find((entry) => entry.id === groupId);
+      if (!group) return;
+      const terminalIds = group.terminalIds.filter((terminalId) =>
+        runningTerminalIds.includes(terminalId),
+      );
+      const api = readNativeApi();
+      const results = await Promise.allSettled(
+        terminalIds.map((terminalId) =>
+          stopTerminalSessionPreservingHistory({ api, threadId, terminalId }),
+        ),
+      );
+      const failed: string[] = [];
+      results.forEach((result, index) => {
+        const terminalId = terminalIds[index];
+        if (!terminalId) return;
+        if (result.status === "fulfilled") {
+          setTerminalExitState(threadId, terminalId, {
+            kind: "stopped",
+            exitCode: null,
+            exitSignal: null,
+          });
+        } else {
+          failed.push(terminalId);
+        }
+      });
+      toastManager.add({
+        type: failed.length > 0 ? "error" : "success",
+        title:
+          failed.length > 0
+            ? `Could not stop ${failed.length} terminal${failed.length === 1 ? "" : "s"}`
+            : `Stopped ${terminalIds.length} terminal${terminalIds.length === 1 ? "" : "s"}`,
+        data: { threadId },
+      });
+    }, [resolvedTerminalGroups, runningTerminalIds, setTerminalExitState, threadId],
+  );
+
+  const restartTerminal = useCallback(
+    async (terminalId: string) => {
+      try {
+        const restarted = await restartTerminalSession({
+          api: readNativeApi(),
+          threadId,
+          terminalId,
+          cwd: lifecycleState.terminalLaunchMetadataById[terminalId]?.cwd ?? cwd,
+          ...(runtimeEnv ? { env: runtimeEnv } : {}),
+        });
+        if (restarted) {
+          setTerminalExitState(threadId, terminalId, null);
+          return;
+        }
+        toastManager.add({
+          type: "error",
+          title: "Could not restart terminal",
+          description: "The terminal restart API is unavailable. The stopped state was preserved.",
+          data: { threadId },
+        });
+      } catch (error) {
+        toastManager.add({
+          type: "error",
+          title: "Could not restart terminal",
+          description:
+            error instanceof Error
+              ? `${error.message}. The stopped state was preserved.`
+              : "The stopped state was preserved.",
+          data: { threadId },
+        });
+      }
+    }, [cwd, lifecycleState.terminalLaunchMetadataById, runtimeEnv, setTerminalExitState, threadId],
+  );
+
+  const handleTerminalWorkspaceKeyDown = useCallback(
+    (event: ReactKeyboardEvent<HTMLElement>) => {
+      const target = event.target as HTMLElement;
+      if (
+        event.nativeEvent.isComposing ||
+        target.isContentEditable ||
+        target.closest("input, textarea, select, [contenteditable='true']")
+      ) {
+        return;
+      }
+      const command = resolveTerminalWorkspaceShortcut({
+        key: event.key,
+        altKey: event.altKey,
+        shiftKey: event.shiftKey,
+        ctrlKey: event.ctrlKey,
+        metaKey: event.metaKey,
+      });
+      if (!command) return;
+
+      const activeGroupIndex = resolvedTerminalGroups.findIndex(
+        (group) => group.id === resolvedActiveGroupId,
+      );
+      let handled = false;
+
+      if (command === "archive-active-group" && resolvedActiveGroupId) {
+        requestArchiveGroup(resolvedActiveGroupId);
+        handled = true;
+      } else if (command === "restore-recent-group") {
+        const mostRecentlyArchived = resolvedArchivedTerminalGroups
+          .toSorted((left, right) => (right.archivedAt ?? 0) - (left.archivedAt ?? 0))[0];
+        if (mostRecentlyArchived) {
+          restoreGroupAndFocus(mostRecentlyArchived.id);
+          handled = true;
+        }
+      } else if (command === "toggle-archived-groups") {
+        setShowArchivedTerminalGroups(
+          threadId,
+          !lifecycleState.showArchivedTerminalGroups,
+        );
+        handled = true;
+      } else if (command === "move-group-left" && activeGroupIndex > 0) {
+        const group = resolvedTerminalGroups[activeGroupIndex];
+        if (group) reorderTerminalGroup(threadId, group.id, activeGroupIndex - 1);
+        handled = group !== undefined;
+      } else if (
+        command === "move-group-right" &&
+        activeGroupIndex >= 0 &&
+        activeGroupIndex < resolvedTerminalGroups.length - 1
+      ) {
+        const group = resolvedTerminalGroups[activeGroupIndex];
+        if (group) reorderTerminalGroup(threadId, group.id, activeGroupIndex + 1);
+        handled = group !== undefined;
+      } else if (command === "previous-group" || command === "next-group") {
+        if (resolvedTerminalGroups.length > 1 && activeGroupIndex >= 0) {
+          const direction = command === "next-group" ? 1 : -1;
+          const nextIndex =
+            (activeGroupIndex + direction + resolvedTerminalGroups.length) %
+            resolvedTerminalGroups.length;
+          const nextGroup = resolvedTerminalGroups[nextIndex];
+          if (nextGroup) onActiveTerminalChange(nextGroup.activeTerminalId);
+          handled = nextGroup !== undefined;
+        }
+      }
+
+      if (handled) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+    },
+    [
+      lifecycleState.showArchivedTerminalGroups,
+      onActiveTerminalChange,
+      reorderTerminalGroup,
+      requestArchiveGroup,
+      resolvedActiveGroupId,
+      resolvedArchivedTerminalGroups,
+      resolvedTerminalGroups,
+      restoreGroupAndFocus,
+      setShowArchivedTerminalGroups,
+      threadId,
+    ],
+  );
+
   const splitTerminalActionLabel = hasReachedSplitLimit
     ? `Split Terminal (max ${MAX_TERMINALS_PER_GROUP} per group)`
     : splitShortcutLabel
@@ -612,9 +1148,6 @@ export default function ThreadTerminalDrawer({
   const resolvedCloseShortcutLabel = isWorkspaceMode
     ? (workspaceCloseShortcutLabel ?? closeShortcutLabel)
     : closeShortcutLabel;
-  const closeTerminalActionLabel = resolvedCloseShortcutLabel
-    ? `Close Terminal (${resolvedCloseShortcutLabel})`
-    : "Close Terminal";
   const onSplitTerminalAction = useCallback(() => {
     if (hasReachedSplitLimit) return;
     onSplitTerminal();
@@ -627,40 +1160,59 @@ export default function ThreadTerminalDrawer({
     onNewTerminal();
   }, [onNewTerminal]);
 
-  const terminalChromeActions: TerminalChromeActionItem[] = [
-    {
-      label: splitTerminalActionLabel,
-      onClick: onSplitTerminalAction,
-      disabled: hasReachedSplitLimit,
-      children: <SquareSplitHorizontal className="size-3.25" />,
-    },
-    {
-      label: splitTerminalDownActionLabel,
-      onClick: onSplitTerminalDownAction,
-      disabled: hasReachedSplitLimit,
-      children: <SquareSplitVertical className="size-3.25" />,
-    },
-    {
-      label: newTerminalActionLabel,
-      onClick: onNewTerminalAction,
-      children: <Plus className="size-3.25" />,
-    },
-    {
-      label: closeTerminalActionLabel,
-      onClick: () => onCloseTerminal(resolvedActiveTerminalId),
-      children: <Trash2 className="size-3.25" />,
-    },
-  ];
-  const showTerminalGroupTabs = resolvedTerminalGroups.length > 1;
+  const terminalChromeActions: TerminalChromeActionItem[] = [];
+  const createTerminalMenu = (
+    <Menu>
+      <MenuTrigger
+        aria-label={newTerminalActionLabel}
+        render={<Button size="icon-xs" variant="chrome" />}
+      >
+        <Plus className="size-3.25" />
+        <ChevronDownIcon className="size-2.5" />
+      </MenuTrigger>
+      <ComposerPickerMenuPopup align="end" side="bottom" className="min-w-52">
+        <MenuItem disabled={hasReachedSplitLimit} onClick={onSplitTerminalAction}>
+          <SquareSplitHorizontal />
+          {splitTerminalActionLabel}
+        </MenuItem>
+        <MenuItem disabled={hasReachedSplitLimit} onClick={onSplitTerminalDownAction}>
+          <SquareSplitVertical />
+          {splitTerminalDownActionLabel}
+        </MenuItem>
+        <MenuSeparator />
+        <MenuItem onClick={onNewTerminalAction}>
+          <Plus />
+          New group
+        </MenuItem>
+        <MenuItem
+          disabled={resolvedActiveGroupId === null || hasReachedSplitLimit}
+          onClick={() => onNewTerminalTab(resolvedActiveTerminalId)}
+        >
+          <Plus />
+          New tab
+        </MenuItem>
+        <MenuItem disabled={!onStartProjectScript} onClick={() => onStartProjectScript?.()}>
+          Start project script
+        </MenuItem>
+      </ComposerPickerMenuPopup>
+    </Menu>
+  );
+  const showTerminalGroupTabs =
+    resolvedTerminalGroups.length > 0 || resolvedArchivedTerminalGroups.length > 0;
   const topTabBarActions = terminalChromeActions;
+  const pendingCloseGroup = [...resolvedTerminalGroups, ...resolvedArchivedTerminalGroups].find(
+    (group) => group.id === pendingCloseGroupId,
+  );
 
   return (
+    <>
     <aside
       className={cn(
         "thread-terminal-drawer relative flex w-full min-w-0 flex-col overflow-hidden bg-[var(--color-background-surface)]",
         isWorkspaceMode ? "h-full min-h-0" : "shrink-0 border-t border-border/70",
       )}
       style={isWorkspaceMode ? undefined : { height: `${drawerHeight}px` }}
+      onKeyDownCapture={handleTerminalWorkspaceKeyDown}
     >
       {!isWorkspaceMode ? (
         <div
@@ -675,26 +1227,60 @@ export default function ThreadTerminalDrawer({
       {showTerminalGroupTabs ? (
         <TerminalWorkspaceTabBar
           terminalGroups={resolvedTerminalGroups}
+          archivedTerminalGroups={resolvedArchivedTerminalGroups}
           activeGroupId={resolvedActiveGroupId}
+          showArchived={lifecycleState.showArchivedTerminalGroups}
+          runningTerminalIds={runningTerminalIds}
+          terminalAttentionStatesById={terminalAttentionStatesById}
+          terminalExitStatesById={lifecycleState.terminalExitStatesById}
           terminalVisualIdentityById={terminalVisualIdentityById}
           actions={topTabBarActions}
+          createMenu={createTerminalMenu}
           onActiveGroupChange={(groupId) => {
             const nextGroup = resolvedTerminalGroups.find((group) => group.id === groupId);
             if (!nextGroup) return;
             onActiveTerminalChange(nextGroup.activeTerminalId);
           }}
-          onCloseGroup={onCloseTerminalGroup}
+          onArchiveGroup={requestArchiveGroup}
+          onRestoreGroup={restoreGroupAndFocus}
+          onRenameGroup={(groupId, name) => renameTerminalGroup(threadId, groupId, name)}
+          onRoleChange={(groupId, role) => setTerminalGroupRole(threadId, groupId, role)}
+          onStopGroup={(groupId) => void stopAllInGroup(groupId)}
+          onReorderGroup={(groupId, toIndex) => reorderTerminalGroup(threadId, groupId, toIndex)}
+          selectedTerminalIds={activeGroupTerminalIds.filter((terminalId) =>
+            terminalTabSelection.selectedIds.has(terminalId),
+          )}
+          onMoveTerminalsToGroup={(terminalIdsToMove, groupId) =>
+            moveTerminalSelection(terminalIdsToMove, { kind: "group", groupId })
+          }
+          onMoveTerminalsToNewGroup={(terminalIdsToMove, toIndex) =>
+            moveTerminalSelection(terminalIdsToMove, { kind: "new-group", toIndex })
+          }
+          onShowArchivedChange={(show) => setShowArchivedTerminalGroups(threadId, show)}
+          onCloseGroup={setPendingCloseGroupId}
         />
       ) : null}
 
       <div className="min-h-0 w-full flex-1">
         <div
+          id={
+            resolvedActiveGroupId
+              ? `terminal-group-panel-${resolvedActiveGroupId}`
+              : undefined
+          }
+          role={resolvedActiveGroupId ? "tabpanel" : undefined}
+          aria-labelledby={
+            resolvedActiveGroupId
+              ? `terminal-group-tab-${resolvedActiveGroupId}`
+              : undefined
+          }
           className={cn(
             "flex h-full min-h-0",
             hasTerminalSidebar && !isWorkspaceMode ? "gap-1.5" : "",
           )}
         >
           <div className="min-w-0 flex-1 h-full">
+            {resolvedActiveGroupId && activeGroupLayout ? (
             <TerminalViewportPane
               groupId={resolvedActiveGroupId}
               layout={activeGroupLayout}
@@ -727,6 +1313,16 @@ export default function ThreadTerminalDrawer({
               }
               onMoveTerminalToGroup={isWorkspaceMode ? onMoveTerminalToGroup : undefined}
               onCloseTerminal={onCloseTerminal}
+              selectedTerminalIds={terminalTabSelection.selectedIds}
+              onTerminalSelectionChange={selectTerminalTab}
+              onTerminalDragStart={startTerminalTabDrag}
+              onTerminalDrop={(terminalIdsToMove, targetTerminalId) =>
+                moveTerminalSelection(terminalIdsToMove, {
+                  kind: "group",
+                  groupId: resolvedActiveGroupId,
+                  targetTerminalId,
+                })
+              }
               presentationMode={presentationMode}
               onTogglePresentationMode={onTogglePresentationMode}
               onTogglePanel={onTogglePanel}
@@ -741,7 +1337,30 @@ export default function ThreadTerminalDrawer({
                   cwd={cwd}
                   {...(runtimeEnv ? { runtimeEnv } : {})}
                   terminalRightClickToPaste={settings.terminalRightClickToPaste}
-                  onSessionExited={() => onCloseTerminal(terminalId)}
+                  exitState={lifecycleState.terminalExitStatesById[terminalId]}
+                  reattachOnly={
+                    lifecycleState.terminalLaunchMetadataById[terminalId]?.reattachOnly === true
+                  }
+                  onRecoveryResolved={(recoveredTerminalId, recovery) => {
+                    const launchMetadata =
+                      lifecycleState.terminalLaunchMetadataById[recoveredTerminalId];
+                    setTerminalLaunchMetadata(threadId, recoveredTerminalId, {
+                      cwd: launchMetadata?.cwd ?? cwd,
+                      reattachOnly: true,
+                    });
+                    const recoveredExitState = terminalExitStateFromRecovery(recovery);
+                    if (recoveredExitState) {
+                      setTerminalExitState(threadId, recoveredTerminalId, recoveredExitState);
+                    }
+                  }}
+                  onSessionExited={(exit) =>
+                    setTerminalExitState(
+                      threadId,
+                      terminalId,
+                      terminalExitStateFromProcessExit(exit),
+                    )
+                  }
+                  onRestart={() => restartTerminal(terminalId)}
                   onTerminalMetadataChange={onTerminalMetadataChange}
                   onTerminalActivityChange={onTerminalActivityChange}
                   onAddTerminalContext={onAddTerminalContext}
@@ -751,9 +1370,16 @@ export default function ThreadTerminalDrawer({
                 />
               )}
             />
+            ) : (
+              <TerminalEmptyState
+                archivedGroupId={resolvedArchivedTerminalGroups[0]?.id}
+                onRestoreGroup={restoreGroupAndFocus}
+                onNewGroup={onNewTerminalAction}
+              />
+            )}
           </div>
 
-          {hasTerminalSidebar && !isWorkspaceMode ? (
+          {hasTerminalSidebar && !isWorkspaceMode && resolvedActiveGroupId ? (
             <TerminalSidebar
               terminalIds={normalizedTerminalIds}
               terminalGroups={resolvedTerminalGroups}
@@ -770,5 +1396,57 @@ export default function ThreadTerminalDrawer({
         </div>
       </div>
     </aside>
+    <AlertDialog
+      open={pendingArchiveGroupId !== null}
+      onOpenChange={(open) => {
+        if (!open) setPendingArchiveGroupId(null);
+      }}
+    >
+      <AlertDialogPopup>
+        <AlertDialogHeader>
+          <AlertDialogTitle>Stop running terminals and archive?</AlertDialogTitle>
+          <AlertDialogDescription>
+            This group has running processes. Synara will stop them, preserve the terminal history and layout, and archive the group.
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogClose render={<Button variant="outline" />}>Cancel</AlertDialogClose>
+          <Button autoFocus variant="default" onClick={() => void stopAndArchivePendingGroup()}>
+            Stop and archive
+          </Button>
+        </AlertDialogFooter>
+      </AlertDialogPopup>
+    </AlertDialog>
+    <AlertDialog
+      open={pendingCloseGroup !== undefined}
+      onOpenChange={(open) => {
+        if (!open) setPendingCloseGroupId(null);
+      }}
+    >
+      <AlertDialogPopup>
+        <AlertDialogHeader>
+          <AlertDialogTitle>Close and remove {pendingCloseGroup?.name ?? "terminal group"}?</AlertDialogTitle>
+          <AlertDialogDescription>
+            This permanently removes the group, closes every terminal in it, and deletes their terminal history. Archive the group instead if you may need it later.
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogClose render={<Button variant="outline" />}>Cancel</AlertDialogClose>
+          <Button
+            autoFocus
+            variant="destructive"
+            onClick={() => {
+              if (!pendingCloseGroup) return;
+              void closeTerminalGroupDestructively(pendingCloseGroup.id).then((closed) => {
+                if (closed) setPendingCloseGroupId(null);
+              });
+            }}
+          >
+            Close and remove
+          </Button>
+        </AlertDialogFooter>
+      </AlertDialogPopup>
+    </AlertDialog>
+    </>
   );
 }

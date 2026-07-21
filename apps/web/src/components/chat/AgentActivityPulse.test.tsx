@@ -13,12 +13,18 @@ const AGENT_ACTIVITY_CSS = readFileSync(new URL("../../index.css", import.meta.u
 
 function activityState(
   phase: AgentActivityPhase,
-  counts: Partial<Pick<AgentActivityState, "toolCount" | "subagentCount">> = {},
-): Pick<AgentActivityState, "phase" | "toolCount" | "subagentCount"> {
+  counts: Partial<
+    Pick<AgentActivityState, "toolCount" | "subagentCount" | "subagentRunningCount">
+  > = {},
+): Pick<
+  AgentActivityState,
+  "phase" | "toolCount" | "subagentCount" | "subagentRunningCount"
+> {
   return {
     phase,
     toolCount: counts.toolCount ?? 0,
     subagentCount: counts.subagentCount ?? 0,
+    subagentRunningCount: counts.subagentRunningCount ?? counts.subagentCount ?? 0,
   };
 }
 
@@ -28,17 +34,19 @@ describe("AgentActivityPulse", () => {
       renderToStaticMarkup(<AgentActivityPulse variant="bar" state={activityState("idle")} />),
     ).toBe("");
     expect(renderToStaticMarkup(<AgentActivityPulse variant="dot" phase="idle" />)).toBe("");
+    expect(renderToStaticMarkup(<AgentActivityPulse variant="bar" phase="stopped" />)).toBe("");
   });
 
   it("renders every non-idle phase with stable phase and variant hooks", () => {
     const phases = [
+      "connecting",
       "thinking",
       "streaming",
       "tool-running",
       "interrupted",
       "completed",
       "failed",
-    ] as const satisfies ReadonlyArray<Exclude<AgentActivityPhase, "idle">>;
+    ] as const satisfies ReadonlyArray<Exclude<AgentActivityPhase, "idle" | "stopped">>;
 
     for (const phase of phases) {
       const markup = renderToStaticMarkup(
@@ -109,7 +117,7 @@ describe("AgentActivityPulse", () => {
     expect(decorative).toContain('aria-hidden="true"');
   });
 
-  it("renders a fixed twelve-segment tool cadence independent of activity counts", () => {
+  it("renders one primary segment plus one segment per running subagent", () => {
     const markup = renderToStaticMarkup(
       <AgentActivityPulse
         variant="bar"
@@ -117,11 +125,30 @@ describe("AgentActivityPulse", () => {
       />,
     );
 
-    expect(markup.match(/data-agent-activity-segment="true"/g)).toHaveLength(12);
+    expect(markup.match(/data-agent-activity-segment="true"/g)).toHaveLength(3);
     expect(markup).toContain('data-agent-activity-segment-index="0"');
-    expect(markup).toContain('data-agent-activity-segment-index="11"');
-    expect(markup).toContain("--agent-activity-segment-delay:-1100ms");
+    expect(markup).toContain('data-agent-activity-segment-index="2"');
+    expect(markup).toContain('data-agent-activity-segment-role="primary"');
+    expect(markup.match(/data-agent-activity-segment-role="subagent"/g)).toHaveLength(2);
+    expect(markup).not.toContain('data-agent-activity-segment-role="overflow"');
+    expect(markup).toContain("--agent-activity-segment-delay:-200ms");
     expect(markup).toContain("--agent-activity-segment-delay:0ms");
+  });
+
+  it("bounds large subagent groups behind one overflow segment", () => {
+    const markup = renderToStaticMarkup(
+      <AgentActivityPulse
+        variant="bar"
+        state={activityState("tool-running", {
+          subagentCount: 20,
+          subagentRunningCount: 20,
+        })}
+      />,
+    );
+
+    expect(markup.match(/data-agent-activity-segment="true"/g)).toHaveLength(8);
+    expect(markup.match(/data-agent-activity-segment-role="subagent"/g)).toHaveLength(6);
+    expect(markup.match(/data-agent-activity-segment-role="overflow"/g)).toHaveLength(1);
   });
 
   it("keys state-driven motion to new event timestamps and keeps shorthand motion stable", () => {
@@ -140,16 +167,32 @@ describe("AgentActivityPulse", () => {
     expect(shorthandMarkup).toContain('data-agent-activity-motion-identity="phase-only"');
   });
 
-  it("caps live motion at ten minutes and preserves one-shot terminal motion", () => {
-    expect(AGENT_ACTIVITY_CSS).toContain("animation: agent-activity-motion 1.5s ease-in-out 400;");
-    expect(AGENT_ACTIVITY_CSS).toMatch(
-      /data-agent-activity-phase="streaming"\] \.agent-activity__motion \{[\s\S]*?animation-iteration-count: 1000;/u,
+  it("keeps live motion running indefinitely and preserves one-shot terminal motion", () => {
+    expect(AGENT_ACTIVITY_CSS).toContain(
+      "animation: agent-activity-motion 1.5s ease-in-out infinite;",
     );
     expect(AGENT_ACTIVITY_CSS).toMatch(
-      /\.agent-activity__segment \{[\s\S]*?animation-delay: var\(--agent-activity-segment-delay\);[\s\S]*?animation-iteration-count: 500;/u,
+      /data-agent-activity-phase="streaming"\] \.agent-activity__motion \{[\s\S]*?animation-iteration-count: infinite;/u,
+    );
+    expect(AGENT_ACTIVITY_CSS).toMatch(
+      /\.agent-activity__segment \{[\s\S]*?animation-delay: var\(--agent-activity-segment-delay\);[\s\S]*?animation-iteration-count: infinite;/u,
     );
     expect(AGENT_ACTIVITY_CSS).toContain("animation-iteration-count: 1;");
     expect(AGENT_ACTIVITY_CSS).toContain("animation-fill-mode: forwards;");
+  });
+
+  it("assigns every visible lifecycle group an explicit semantic color", () => {
+    expect(AGENT_ACTIVITY_CSS).toContain(
+      '.agent-activity[data-agent-activity-phase="connecting"]',
+    );
+    expect(AGENT_ACTIVITY_CSS).toMatch(
+      /data-agent-activity-phase="thinking"\] \{[\s\S]*?--agent-activity-color: var\(--warning\);/u,
+    );
+    expect(AGENT_ACTIVITY_CSS).toMatch(
+      /data-agent-activity-phase="streaming"\],[\s\S]*?data-agent-activity-phase="tool-running"\] \{[\s\S]*?--agent-activity-color: var\(--primary\);/u,
+    );
+    expect(AGENT_ACTIVITY_CSS).toContain("--agent-activity-color: var(--success);");
+    expect(AGENT_ACTIVITY_CSS).toContain("--agent-activity-color: var(--destructive);");
   });
 
   it("removes terminal track backgrounds so the one-shot fill fully dissolves", () => {
@@ -176,6 +219,7 @@ describe("AgentActivityPulse", () => {
   });
 
   it.each([
+    ["connecting", "Agent is connecting"],
     ["thinking", "Agent is thinking"],
     ["streaming", "Agent is responding"],
     ["interrupted", "Agent was interrupted"],

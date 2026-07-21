@@ -297,6 +297,7 @@ import { type NewProjectScriptInput } from "./ProjectScriptsControl";
 import {
   commandForProjectScript,
   nextProjectScriptId,
+  primaryProjectScript,
   projectScriptRuntimeEnv,
   projectScriptIdFromCommand,
   setupProjectScript,
@@ -415,6 +416,7 @@ import {
 } from "~/hooks/useDesktopTopBarGutter";
 import { useNowMs } from "~/hooks/useNowMs";
 import { useThreadRecap } from "~/hooks/useThreadRecap";
+import { useWorkspaceAgentThreadActivity } from "~/hooks/useWorkspaceAgentActivity";
 import { useRepoDiffTotals } from "~/hooks/useRepoDiffTotals";
 import { useIsMobile } from "~/hooks/useMediaQuery";
 import {
@@ -2639,6 +2641,21 @@ export default function ChatView({
     ],
   );
   const isSendBusy = localDispatch !== null && !serverAcknowledgedLocalDispatch;
+  const workspaceThreadActivity = useWorkspaceAgentThreadActivity(threadId);
+  const childAgentActivityStates = useMemo(() => {
+    if (workspaceThreadActivity.subagentTree.length === 0) return undefined;
+    return new Map(
+      workspaceThreadActivity.subagentTree.map(({ entry }) => [
+        String(entry.threadId),
+        {
+          id: String(entry.threadId),
+          phase: entry.activityState.phase,
+          latestToolName: entry.activityState.latestToolName,
+          streamPreview: entry.activityState.streamPreview,
+        },
+      ]),
+    );
+  }, [workspaceThreadActivity.subagentTree]);
   const agentActivityState = useAgentActivityState({
     threadId: activeThread?.id ?? null,
     hasMessages: (activeThread?.messages.length ?? 0) > 0,
@@ -2650,6 +2667,7 @@ export default function ChatView({
     hasPendingApproval: activePendingApproval !== null,
     hasPendingUserInput: activePendingUserInput !== null,
     threadError: activeThread?.error ?? null,
+    subagentStates: childAgentActivityStates,
   });
   const activeWorktreeSetup = localDispatch?.worktreeSetup ?? null;
   const isPreparingWorktree = activeWorktreeSetup !== null;
@@ -4205,6 +4223,14 @@ export default function ChatView({
       terminalState.terminalIds,
     ],
   );
+  const primaryTerminalProjectScript = useMemo(
+    () => primaryProjectScript(activeProjectScripts ?? []),
+    [activeProjectScripts],
+  );
+  const startPrimaryTerminalProjectScript = useCallback(() => {
+    if (!primaryTerminalProjectScript) return;
+    void runProjectScript(primaryTerminalProjectScript);
+  }, [primaryTerminalProjectScript, runProjectScript]);
   const stopActiveThreadSession = useCallback(async () => {
     const api = readNativeApi();
     if (
@@ -10892,6 +10918,9 @@ export default function ChatView({
                 {...terminalDrawerProps}
                 presentationMode="workspace"
                 isVisible={terminalWorkspaceTerminalTabActive}
+                onStartProjectScript={
+                  primaryTerminalProjectScript ? startPrimaryTerminalProjectScript : undefined
+                }
                 onTogglePresentationMode={
                   terminalState.workspaceLayout === "both" ? collapseTerminalWorkspace : undefined
                 }
@@ -10940,6 +10969,9 @@ export default function ChatView({
             key={activeThread.id}
             {...terminalDrawerProps}
             presentationMode="drawer"
+            onStartProjectScript={
+              primaryTerminalProjectScript ? startPrimaryTerminalProjectScript : undefined
+            }
             onTogglePresentationMode={expandTerminalWorkspace}
           />
         );

@@ -12,7 +12,7 @@ import type { TerminalEventRecovery } from "./terminalEventRecovery";
 import type { TerminalOutputAckQueue } from "./terminalOutputAckQueue";
 
 export interface TerminalRuntimeCallbacks {
-  onSessionExited: () => void;
+  onSessionExited: (exit: { exitCode: number | null; exitSignal: number | null }) => void;
   onTerminalMetadataChange: (
     terminalId: string,
     metadata: { cliKind: TerminalCliKind | null; label: string },
@@ -22,10 +22,33 @@ export interface TerminalRuntimeCallbacks {
     activity: { hasRunningSubprocess: boolean; agentState: TerminalActivityState | null },
   ) => void;
   onTerminalRuntimeStatusChange?: (terminalId: string, status: TerminalRuntimeStatus) => void;
+  onTerminalRecoveryResolved?: (
+    terminalId: string,
+    recovery: {
+      status: "starting" | "running" | "exited" | "error";
+      exitCode: number | null;
+      exitSignal: number | null;
+    },
+  ) => void;
 }
 
 export function buildTerminalRuntimeKey(threadId: string, terminalId: string): string {
   return `${threadId}::${terminalId}`;
+}
+
+export function isUnavailableTerminalRecovery(input: {
+  reattachOnly: boolean;
+  status: "starting" | "running" | "exited" | "error";
+}): boolean {
+  return input.reattachOnly && (input.status === "exited" || input.status === "error");
+}
+
+export function shouldScheduleTerminalSnapshotReconcile(input: {
+  reattachOnly: boolean;
+  unavailableRecovery: boolean;
+  outputUnchanged: boolean;
+}): boolean {
+  return !input.reattachOnly && !input.unavailableRecovery && input.outputUnchanged;
 }
 
 export interface TerminalRuntimeConfig {
@@ -37,6 +60,7 @@ export interface TerminalRuntimeConfig {
   cwd: string;
   runtimeEnv?: Record<string, string>;
   terminalRightClickToPaste?: boolean;
+  reattachOnly?: boolean;
   callbacks: TerminalRuntimeCallbacks;
 }
 
@@ -62,6 +86,7 @@ export interface TerminalRuntimeEntry {
   cwd: string;
   runtimeEnv?: Record<string, string>;
   terminalRightClickToPaste: boolean;
+  reattachOnly: boolean;
   callbacks: TerminalRuntimeCallbacks;
   wrapper: HTMLDivElement;
   container: HTMLDivElement | null;

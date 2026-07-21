@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   archiveSelectedThreadEntries,
@@ -41,6 +41,9 @@ import {
   resolveSettingsBackTarget,
   resolveProjectStatusIndicator,
   resolveSidebarNewThreadEnvMode,
+  sidebarProjectActivityAccessibleLabel,
+  projectSidebarTransientTerminalActivity,
+  scheduleSidebarTransientTerminalDismiss,
   resolveThreadHoverCardWorkspaceLabel,
   resolveThreadRowClassName,
   resolveThreadStatusPill,
@@ -82,6 +85,131 @@ describe("buildMultiSelectThreadContextMenuItems", () => {
         archiveDisabled: false,
       })[1],
     ).toEqual({ id: "archive", label: "Archive (2)", disabled: false });
+  });
+});
+
+describe("sidebarProjectActivityAccessibleLabel", () => {
+  it("announces a dev-server-only project without adding visible copy", () => {
+    expect(
+      sidebarProjectActivityAccessibleLabel({
+        projectName: "Synara",
+        devServerRunning: true,
+        gitActionRunning: false,
+        collapsedStatusLabel: null,
+      }),
+    ).toBe("Dev server running for Synara");
+  });
+
+  it("combines collapsed thread, dev server, and Git status in a stable order", () => {
+    expect(
+      sidebarProjectActivityAccessibleLabel({
+        projectName: "Synara",
+        devServerRunning: true,
+        gitActionRunning: true,
+        collapsedStatusLabel: "Working",
+      }),
+    ).toBe(
+      "Project status: Working, Dev server running for Synara, Git operation running for Synara",
+    );
+  });
+});
+
+describe("sidebar transient terminal activity", () => {
+  afterEach(() => vi.useRealTimers());
+
+  it("observes live turns and projects completed, failed, and interrupted exactly once", () => {
+    const observed = new Map<string, string>();
+    const presented = new Map<string, string>();
+    const liveTurns = [
+      ["completed-thread", "completed-turn"],
+      ["failed-thread", "failed-turn"],
+      ["interrupted-thread", "interrupted-turn"],
+    ] as const;
+
+    expect(
+      projectSidebarTransientTerminalActivity({
+        activities: liveTurns.map(([threadId, turnKey], index) => ({
+          threadId,
+          phase: index === 0 ? "thinking" : index === 1 ? "streaming" : "tool-running",
+          turnKey,
+        })),
+        threads: liveTurns.map(([id, turnId]) => ({
+          id,
+          latestTurn: { turnId, state: "running", completedAt: null },
+        })),
+        observedLiveTurnByThreadId: observed,
+        presentedTerminalTurnByThreadId: presented,
+      }),
+    ).toEqual([]);
+
+    const terminalThreads = [
+      {
+        id: "completed-thread",
+        latestTurn: {
+          turnId: "completed-turn",
+          state: "completed" as const,
+          completedAt: "2026-07-21T12:00:01.000Z",
+        },
+      },
+      {
+        id: "failed-thread",
+        latestTurn: {
+          turnId: "failed-turn",
+          state: "error" as const,
+          completedAt: "2026-07-21T12:00:02.000Z",
+        },
+      },
+      {
+        id: "interrupted-thread",
+        latestTurn: {
+          turnId: "interrupted-turn",
+          state: "interrupted" as const,
+          completedAt: "2026-07-21T12:00:03.000Z",
+        },
+      },
+    ];
+    const terminalInput = {
+      activities: [],
+      threads: terminalThreads,
+      observedLiveTurnByThreadId: observed,
+      presentedTerminalTurnByThreadId: presented,
+    };
+
+    expect(projectSidebarTransientTerminalActivity(terminalInput)).toEqual([
+      {
+        threadId: "completed-thread",
+        phase: "completed",
+        turnKey: "completed-turn",
+        lastEventTimestamp: "2026-07-21T12:00:01.000Z",
+      },
+      {
+        threadId: "failed-thread",
+        phase: "failed",
+        turnKey: "failed-turn",
+        lastEventTimestamp: "2026-07-21T12:00:02.000Z",
+      },
+      {
+        threadId: "interrupted-thread",
+        phase: "interrupted",
+        turnKey: "interrupted-turn",
+        lastEventTimestamp: "2026-07-21T12:00:03.000Z",
+      },
+    ]);
+    expect(projectSidebarTransientTerminalActivity(terminalInput)).toEqual([]);
+  });
+
+  it("dismisses a projected terminal phase after exactly three seconds", () => {
+    vi.useFakeTimers();
+    const dismiss = vi.fn();
+
+    scheduleSidebarTransientTerminalDismiss(
+      (callback, delayMs) => globalThis.setTimeout(callback, delayMs),
+      dismiss,
+    );
+    vi.advanceTimersByTime(2_999);
+    expect(dismiss).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(dismiss).toHaveBeenCalledOnce();
   });
 });
 

@@ -8,6 +8,7 @@
 import { cn } from "~/lib/utils";
 
 /** Duration, curve, and reduced-motion behavior shared by every disclosure surface. */
+export const DISCLOSURE_DURATION_MS = 220;
 export const DISCLOSURE_TIMING_CLASS = "duration-220 ease-out motion-reduce:transition-none";
 
 /** Shell grid that animates height via grid-template-rows + fade. */

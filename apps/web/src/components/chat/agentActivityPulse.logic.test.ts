@@ -55,12 +55,12 @@ function toolActivity(
 }
 
 describe("deriveAgentActivityState", () => {
-  it("shows first-send thinking before the optimistic message is persisted", () => {
+  it("shows first-send connecting before the optimistic message is persisted", () => {
     expect(
       deriveAgentActivityState(
         baseInput({ hasMessages: false, messages: [], localDispatchPending: true }),
       ),
-    ).toMatchObject({ phase: "thinking", turnKey: "pending:thread-1" });
+    ).toMatchObject({ phase: "connecting", turnKey: "pending:thread-1" });
   });
 
   it("stays unmounted for user-blocked threads", () => {
@@ -68,7 +68,39 @@ describe("deriveAgentActivityState", () => {
     expect(deriveAgentActivityState(baseInput({ hasPendingUserInput: true })).phase).toBe("idle");
   });
 
-  it("shows thinking immediately for local dispatch and live turns without output", () => {
+  it("keeps a settled parent active from canonical child-thread state", () => {
+    expect(
+      deriveAgentActivityState(
+        baseInput({
+          session: {
+            ...baseInput().session!,
+            status: "ready",
+            orchestrationStatus: "ready",
+            activeTurnId: undefined,
+          },
+          latestTurn: {
+            ...baseInput().latestTurn!,
+            state: "completed",
+            completedAt: "2026-07-20T12:00:03.000Z",
+          },
+          hasPendingApproval: true,
+          subagentStates: new Map([
+            [
+              "child-thread",
+              {
+                id: "child-thread",
+                phase: "streaming",
+                latestToolName: null,
+                streamPreview: "child output",
+              },
+            ],
+          ]),
+        }),
+      ),
+    ).toMatchObject({ phase: "tool-running", subagentCount: 1, subagentRunningCount: 1 });
+  });
+
+  it("shows connecting immediately for local dispatch and thinking for live turns", () => {
     const pending = deriveAgentActivityState(
       baseInput({
         localDispatchPending: true,
@@ -77,7 +109,7 @@ describe("deriveAgentActivityState", () => {
         messages: [{ ...USER_MESSAGE, turnId: null }],
       }),
     );
-    expect(pending).toMatchObject({ phase: "thinking", turnKey: "pending:thread-1" });
+    expect(pending).toMatchObject({ phase: "connecting", turnKey: "pending:thread-1" });
     expect(deriveAgentActivityState(baseInput()).phase).toBe("thinking");
   });
 
@@ -98,7 +130,7 @@ describe("deriveAgentActivityState", () => {
 
       expect(
         deriveAgentActivityState(baseInput({ latestTurn, session, localDispatchPending: true })),
-      ).toMatchObject({ phase: "thinking", turnKey: "pending:thread-1" });
+      ).toMatchObject({ phase: "connecting", turnKey: "pending:thread-1" });
       expect(
         deriveAgentActivityState(
           baseInput({
@@ -106,7 +138,7 @@ describe("deriveAgentActivityState", () => {
             session: { ...session, status: "connecting", orchestrationStatus: "starting" },
           }),
         ),
-      ).toMatchObject({ phase: "thinking", turnKey: "pending:thread-1" });
+      ).toMatchObject({ phase: "connecting", turnKey: "pending:thread-1" });
     },
   );
 
@@ -122,7 +154,7 @@ describe("deriveAgentActivityState", () => {
     };
 
     expect(deriveAgentActivityState(baseInput({ latestTurn, session }))).toMatchObject({
-      phase: "thinking",
+      phase: "connecting",
       turnKey: "pending:thread-1",
     });
     expect(
@@ -321,7 +353,11 @@ describe("deriveAgentActivityState", () => {
         ],
       }),
     );
-    expect(state).toMatchObject({ phase: "tool-running", subagentCount: 1 });
+    expect(state).toMatchObject({
+      phase: "tool-running",
+      subagentCount: 2,
+      subagentRunningCount: 1,
+    });
   });
 
   it("retires subagents from nested canonical state snapshots", () => {
@@ -352,9 +388,10 @@ describe("deriveAgentActivityState", () => {
     expect(deriveAgentActivityState(baseInput({ activities: [started] }))).toMatchObject({
       phase: "tool-running",
       subagentCount: 1,
+      subagentRunningCount: 1,
     });
     expect(deriveAgentActivityState(baseInput({ activities: [started, completed] }))).toMatchObject(
-      { phase: "thinking", subagentCount: 0 },
+      { phase: "thinking", subagentCount: 1, subagentRunningCount: 0 },
     );
   });
 
@@ -388,9 +425,10 @@ describe("deriveAgentActivityState", () => {
       phase: "tool-running",
       toolCount: 0,
       subagentCount: 1,
+      subagentRunningCount: 1,
     });
     expect(deriveAgentActivityState(baseInput({ activities: [running, completed] }))).toMatchObject(
-      { phase: "thinking", toolCount: 0, subagentCount: 0 },
+      { phase: "thinking", toolCount: 0, subagentCount: 1, subagentRunningCount: 0 },
     );
   });
 
@@ -414,9 +452,42 @@ describe("deriveAgentActivityState", () => {
   });
 
   it.each([
-    ["completed", { latestTurn: { ...baseInput().latestTurn!, state: "completed" as const } }],
-    ["interrupted", { latestTurn: { ...baseInput().latestTurn!, state: "interrupted" as const } }],
-    ["failed", { latestTurn: { ...baseInput().latestTurn!, state: "error" as const } }],
+    [
+      "completed",
+      {
+        session: {
+          ...baseInput().session!,
+          status: "ready" as const,
+          orchestrationStatus: "ready" as const,
+          activeTurnId: undefined,
+        },
+        latestTurn: { ...baseInput().latestTurn!, state: "completed" as const },
+      },
+    ],
+    [
+      "interrupted",
+      {
+        session: {
+          ...baseInput().session!,
+          status: "ready" as const,
+          orchestrationStatus: "ready" as const,
+          activeTurnId: undefined,
+        },
+        latestTurn: { ...baseInput().latestTurn!, state: "interrupted" as const },
+      },
+    ],
+    [
+      "failed",
+      {
+        session: {
+          ...baseInput().session!,
+          status: "ready" as const,
+          orchestrationStatus: "ready" as const,
+          activeTurnId: undefined,
+        },
+        latestTurn: { ...baseInput().latestTurn!, state: "error" as const },
+      },
+    ],
     ["failed", { threadError: "Provider crashed" }],
   ] as const)("derives the %s terminal target", (phase, overrides) => {
     expect(deriveAgentActivityState(baseInput(overrides)).phase).toBe(phase);

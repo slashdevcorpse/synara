@@ -79,9 +79,10 @@ export function useChatTerminalController({
 
   const activeTerminalGroup =
     terminalState.terminalGroups.find(
-      (group) => group.id === terminalState.activeTerminalGroupId,
+      (group) => group.id === terminalState.activeTerminalGroupId && group.archivedAt == null,
     ) ??
     terminalState.terminalGroups.find((group) =>
+      group.archivedAt == null &&
       collectTerminalIdsFromLayout(group.layout).includes(terminalState.activeTerminalId),
     ) ??
     null;

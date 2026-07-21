@@ -777,6 +777,27 @@ describe("TerminalManager", () => {
     await manager.dispose();
   });
 
+  it("never creates or restarts a PTY for a reattach-only cold recovery", async () => {
+    const { manager, ptyAdapter } = makeManager();
+
+    const missingSnapshot = await manager.open(openInput({ reattachOnly: true }));
+    expect(missingSnapshot.status).toBe("exited");
+    expect(ptyAdapter.spawnInputs).toHaveLength(0);
+
+    await manager.restart(restartInput());
+    expect(ptyAdapter.spawnInputs).toHaveLength(1);
+    const runningSnapshot = await manager.open(openInput({ reattachOnly: true }));
+    expect(runningSnapshot.status).toBe("running");
+    expect(ptyAdapter.spawnInputs).toHaveLength(1);
+    ptyAdapter.processes[0]?.emitExit({ exitCode: 0, signal: 0 });
+
+    const exitedSnapshot = await manager.open(openInput({ reattachOnly: true }));
+    expect(exitedSnapshot.status).toBe("exited");
+    expect(ptyAdapter.spawnInputs).toHaveLength(1);
+
+    await manager.dispose();
+  });
+
   it("supports multiple terminals per thread with isolated sessions", async () => {
     const { manager, ptyAdapter } = makeManager();
     await manager.open(openInput({ terminalId: "default" }));
@@ -990,6 +1011,46 @@ describe("TerminalManager", () => {
     await manager.close({ threadId: "thread-1", deleteHistory: true });
     expect(fs.existsSync(terminalHistoryMetadataPath(historyPath))).toBe(false);
     expect(fs.existsSync(historyPath)).toBe(false);
+  });
+
+  it("preserves every session and history when an atomic batch-close preflight fails", async () => {
+    const { manager, ptyAdapter, logsDir } = makeManager();
+    await manager.open(openInput({ terminalId: "one" }));
+    await manager.open(openInput({ terminalId: "two" }));
+    ptyAdapter.processes[0]?.emitData("one history\n");
+    ptyAdapter.processes[1]?.emitData("two history\n");
+    const oneHistoryPath = multiTerminalHistoryLogPath(logsDir, "thread-1", "one");
+    const twoHistoryPath = multiTerminalHistoryLogPath(logsDir, "thread-1", "two");
+    await waitFor(() => fs.existsSync(oneHistoryPath) && fs.existsSync(twoHistoryPath));
+
+    const internals = manager as unknown as {
+      flushPersistQueue: (threadId: string, terminalId: string) => Promise<void>;
+      sessions: Map<string, unknown>;
+    };
+    const flushPersistQueue = internals.flushPersistQueue.bind(manager);
+    vi.spyOn(internals, "flushPersistQueue").mockImplementation(
+      async (threadId, terminalId) => {
+        if (terminalId === "two") throw new Error("preflight failed");
+        await flushPersistQueue(threadId, terminalId);
+      },
+    );
+
+    await expect(
+      manager.close({
+        threadId: "thread-1",
+        terminalIds: ["one", "two"],
+        deleteHistory: true,
+      }),
+    ).rejects.toThrow("preflight failed");
+
+    expect(internals.sessions.has("thread-1\u0000one")).toBe(true);
+    expect(internals.sessions.has("thread-1\u0000two")).toBe(true);
+    expect(ptyAdapter.processes[0]?.killed).toBe(false);
+    expect(ptyAdapter.processes[1]?.killed).toBe(false);
+    expect(fs.readFileSync(oneHistoryPath, "utf8")).toContain("one history");
+    expect(fs.readFileSync(twoHistoryPath, "utf8")).toContain("two history");
+
+    await manager.dispose();
   });
 
   it("keeps pty reads paused until renderer output ACKs drain", async () => {

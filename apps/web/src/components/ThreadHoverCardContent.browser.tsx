@@ -43,6 +43,8 @@ describe("ThreadHoverCardContent actions", () => {
       const interruptButton = page.getByRole("button", { name: "Interrupt" });
       await expect.element(openButton).toBeVisible();
       await expect.element(interruptButton).toBeVisible();
+      await expect.element(page.getByText("Active release agent")).toBeVisible();
+      expect(document.querySelector('[aria-label="Subagent activity"]')).toBeNull();
 
       const actionCard = document.querySelector<HTMLElement>(
         '[data-testid="thread-hover-action-card"]',

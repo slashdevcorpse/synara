@@ -216,10 +216,9 @@ export function deriveComposerSubagentStripItems(input: {
     return withParentRow(visibleItems, input.parentRow);
   }
 
-  // No subagents spawned by the live turn: keep the latest known set visible only
-  // while some subagent is still running or queued, then let the strip retire.
+  // No subagents spawned by the live turn: keep the latest known set available.
+  // The view compacts an all-completed set into a single durable summary so a
+  // finished delegation does not vanish without acknowledgement.
   const items = collectStripItems(entriesWithSubagents, backgroundedThreadIds, viewedThreadId);
-  return items.some((item) => item.statusKind === "running" || item.statusKind === "queued")
-    ? withParentRow(items, input.parentRow)
-    : [];
+  return withParentRow(items, input.parentRow);
 }

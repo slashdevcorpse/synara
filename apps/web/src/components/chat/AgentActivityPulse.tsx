@@ -14,6 +14,7 @@ import {
 } from "react";
 
 import {
+  DISCLOSURE_DURATION_MS,
   DISCLOSURE_INNER_CLASS,
   disclosureContentClassName,
   disclosureShellClassName,
@@ -22,22 +23,24 @@ import { cn } from "~/lib/utils";
 
 import type { AgentActivityPhase, AgentActivityState } from "./agentActivityPulse.logic";
 
-const TOOL_PATTERN_SEGMENT_COUNT = 12;
+const MAX_VISIBLE_SUBAGENT_SEGMENTS = 6;
 
 const PHASE_LABELS: Record<Exclude<AgentActivityPhase, "tool-running">, string> = {
   idle: "Agent is idle",
+  connecting: "Agent is connecting",
   thinking: "Agent is thinking",
   streaming: "Agent is responding",
   interrupted: "Agent was interrupted",
   completed: "Agent completed",
   failed: "Agent failed",
+  stopped: "Agent stopped",
 };
 
 export type AgentActivityVisualState = Pick<
   AgentActivityState,
   "phase" | "toolCount" | "subagentCount"
 > &
-  Partial<Pick<AgentActivityState, "lastEventTimestamp">> & {
+  Partial<Pick<AgentActivityState, "lastEventTimestamp" | "subagentRunningCount">> & {
     presentationThreadId?: string | null;
   };
 
@@ -54,8 +57,6 @@ export type AgentActivityBarPresenceAction =
   | { type: "sync"; state: AgentActivityRenderableState }
   | { type: "open" }
   | { type: "close-complete" };
-
-const AGENT_ACTIVITY_DISCLOSURE_DURATION_MS = 220;
 
 export function createInitialAgentActivityBarPresence(
   state: AgentActivityRenderableState,
@@ -97,7 +98,7 @@ export type AgentActivityPulseProps = AgentActivityPulseCommonProps &
       }
   );
 
-function activityLabel(state: AgentActivityVisualState): string {
+function activityLabel(state: AgentActivityRenderableState): string {
   if (state.phase !== "tool-running") {
     return PHASE_LABELS[state.phase];
   }
@@ -106,8 +107,11 @@ function activityLabel(state: AgentActivityVisualState): string {
   if (state.toolCount > 0) {
     parts.push(`${state.toolCount} ${state.toolCount === 1 ? "tool" : "tools"}`);
   }
-  if (state.subagentCount > 0) {
-    parts.push(`${state.subagentCount} ${state.subagentCount === 1 ? "subagent" : "subagents"}`);
+  const runningSubagentCount = state.subagentRunningCount ?? state.subagentCount;
+  if (runningSubagentCount > 0) {
+    parts.push(
+      `${runningSubagentCount} ${runningSubagentCount === 1 ? "subagent" : "subagents"}`,
+    );
   }
 
   return parts.length > 0 ? `Agent is running ${parts.join(" and ")}` : "Agent is running tools";
@@ -115,30 +119,55 @@ function activityLabel(state: AgentActivityVisualState): string {
 
 type AgentActivitySegmentStyle = CSSProperties & {
   "--agent-activity-segment-delay": string;
+  "--agent-activity-segment-count": number;
 };
 
-function ActivityVisual({ state }: { state: AgentActivityRenderableState }) {
+function ActivityVisual({
+  state,
+  mirrored = false,
+}: {
+  state: AgentActivityRenderableState;
+  mirrored?: boolean;
+}) {
   const phase = state.phase as Exclude<AgentActivityPhase, "idle">;
+  const runningSubagentCount = state.subagentRunningCount ?? state.subagentCount;
+  const visibleSubagentCount = Math.min(
+    runningSubagentCount,
+    MAX_VISIBLE_SUBAGENT_SEGMENTS,
+  );
+  const hasOverflow = runningSubagentCount > MAX_VISIBLE_SUBAGENT_SEGMENTS;
+  const segments = [
+    { key: "primary", role: "primary" },
+    ...Array.from({ length: visibleSubagentCount }, (_, index) => ({
+      key: `subagent:${index}`,
+      role: "subagent",
+    })),
+    ...(hasOverflow ? [{ key: "overflow", role: "overflow" }] : []),
+  ] as const;
 
   return (
     <span
       key={state.motionIdentity}
-      className="agent-activity__visual"
+      className={cn("agent-activity__visual", mirrored && "agent-activity__visual--mirror")}
       data-agent-activity-motion-identity={state.motionIdentity}
       aria-hidden="true"
     >
       {phase === "tool-running" ? (
-        <span className="agent-activity__segments">
-          {Array.from({ length: TOOL_PATTERN_SEGMENT_COUNT }, (_, index) => (
+        <span
+          className="agent-activity__segments"
+          style={{ "--agent-activity-segment-count": segments.length } as CSSProperties}
+        >
+          {segments.map((segment, index) => (
             <span
-              // The segments are a fixed cadence pattern, not a progress meter.
-              key={index}
+              key={segment.key}
               className="agent-activity__motion agent-activity__segment"
               data-agent-activity-segment="true"
+              data-agent-activity-segment-role={segment.role}
               data-agent-activity-segment-index={index}
               style={
                 {
-                  "--agent-activity-segment-delay": `${(index - (TOOL_PATTERN_SEGMENT_COUNT - 1)) * 100}ms`,
+                  "--agent-activity-segment-delay": `${(index - (segments.length - 1)) * 100}ms`,
+                  "--agent-activity-segment-count": segments.length,
                 } as AgentActivitySegmentStyle
               }
             />
@@ -168,16 +197,24 @@ function AgentActivityBar({
   className?: string;
   announce: boolean;
 }) {
-  const { phase, toolCount, subagentCount, lastEventTimestamp, motionIdentity } = state;
+  const {
+    phase,
+    toolCount,
+    subagentCount,
+    subagentRunningCount,
+    lastEventTimestamp,
+    motionIdentity,
+  } = state;
   const synchronizedState = useMemo<AgentActivityRenderableState>(
     () => ({
       phase,
       toolCount,
       subagentCount,
+      subagentRunningCount,
       motionIdentity,
       ...(lastEventTimestamp !== undefined ? { lastEventTimestamp } : {}),
     }),
-    [lastEventTimestamp, motionIdentity, phase, subagentCount, toolCount],
+    [lastEventTimestamp, motionIdentity, phase, subagentCount, subagentRunningCount, toolCount],
   );
   const [presence, dispatch] = useReducer(
     agentActivityBarPresenceReducer,
@@ -239,7 +276,7 @@ function AgentActivityBar({
     }
 
     dispatch({ type: "sync", state: synchronizedState });
-    const closeDeadline = performance.now() + AGENT_ACTIVITY_DISCLOSURE_DURATION_MS;
+    const closeDeadline = performance.now() + DISCLOSURE_DURATION_MS;
     const waitForDisclosureClose = (now: number) => {
       if (now < closeDeadline) {
         exitFrameRef.current = window.requestAnimationFrame(waitForDisclosureClose);
@@ -302,14 +339,19 @@ export function AgentActivityPulse(props: AgentActivityPulseProps) {
   const visualState: AgentActivityVisualState =
     props.state !== undefined
       ? props.state
-      : { phase: props.phase, toolCount: 0, subagentCount: 0 };
+      : { phase: props.phase, toolCount: 0, subagentCount: 0, subagentRunningCount: 0 };
   const state: AgentActivityRenderableState = {
     ...visualState,
+    subagentRunningCount: visualState.subagentRunningCount ?? visualState.subagentCount,
     motionIdentity:
       props.state !== undefined
         ? `${visualState.phase}:${visualState.lastEventTimestamp ?? "stable"}`
         : "phase-only",
   };
+
+  if (state.phase === "stopped") {
+    return null;
+  }
 
   if (props.variant === "bar") {
     return (
@@ -338,6 +380,7 @@ export function AgentActivityPulse(props: AgentActivityPulseProps) {
       aria-hidden="true"
     >
       <ActivityVisual state={state} />
+      {props.variant === "composer" ? <ActivityVisual state={state} mirrored /> : null}
     </span>
   );
 }

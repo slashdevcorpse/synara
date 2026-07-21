@@ -6,6 +6,13 @@
 import type { AutomationRun, ProjectId, ProviderKind, ThreadId } from "@synara/contracts";
 
 import { resolveThreadStatusPill, type ThreadStatusPill } from "~/components/Sidebar.logic";
+import {
+  deriveProjectProcessActivity,
+  isLiveAgentActivityPhase,
+  type AgentActivityState,
+  type ProjectProcessActivitySummary,
+} from "~/lib/agentActivity";
+import { agentStatusPresentation } from "~/lib/agentStatusPresentation";
 import type { Project, SidebarThreadSummary } from "~/types";
 
 export type WorkspaceFilter = "all" | "active" | "idle" | "dirty" | "unpushed" | "with-prs";
@@ -61,10 +68,7 @@ export type WorkspaceRepositoryState =
 
 export interface WorkspaceActivity {
   readonly threadId: ThreadId;
-  readonly label: Extract<
-    ThreadStatusPill["label"],
-    "Working" | "Connecting" | "Pending Approval" | "Awaiting Input"
-  >;
+  readonly label: string;
   readonly colorClass: string;
   readonly dotClass: string;
   readonly pulse: boolean;
@@ -103,6 +107,7 @@ export interface WorkspaceCardModel {
   readonly repository: WorkspaceRepositoryState;
   readonly recentThread: SidebarThreadSummary | null;
   readonly activity: WorkspaceActivity | null;
+  readonly processActivity: ProjectProcessActivitySummary;
   readonly worktrees: readonly WorkspaceWorktreeTarget[];
   readonly providers: readonly ProviderKind[];
   readonly automation: WorkspaceAutomationActivity | null;
@@ -146,12 +151,13 @@ function deriveAutomation(run: WorkspaceAutomationRun): WorkspaceAutomationActiv
   };
 }
 
-const ACTIVITY_PRIORITY: Record<WorkspaceActivity["label"], number> = {
-  "Pending Approval": 4,
-  "Awaiting Input": 3,
-  Working: 2,
-  Connecting: 1,
-};
+const AGENT_ACTIVITY_PRIORITY = {
+  "tool-running": 5,
+  streaming: 4,
+  thinking: 3,
+  connecting: 2,
+  queued: 1,
+} as const;
 
 function timestampMs(value: string | null | undefined): number {
   if (!value) return 0;
@@ -169,41 +175,56 @@ function threadTimestamp(thread: SidebarThreadSummary): string {
   );
 }
 
-function isDashboardActivity(
+function isDashboardInteraction(
   status: ThreadStatusPill | null,
-): status is ThreadStatusPill & { label: WorkspaceActivity["label"] } {
-  return (
-    status?.label === "Working" ||
-    status?.label === "Connecting" ||
-    status?.label === "Pending Approval" ||
-    status?.label === "Awaiting Input"
-  );
+): status is ThreadStatusPill & { label: "Pending Approval" | "Awaiting Input" } {
+  return status?.label === "Pending Approval" || status?.label === "Awaiting Input";
 }
 
-function deriveActivity(threads: readonly SidebarThreadSummary[]): WorkspaceActivity | null {
+function deriveActivity(
+  threads: readonly SidebarThreadSummary[],
+  agentActivityByThreadId: ReadonlyMap<ThreadId, AgentActivityState> | undefined,
+): WorkspaceActivity | null {
   const candidates = threads.flatMap((thread) => {
     const status = resolveThreadStatusPill({
       thread,
       hasPendingApprovals: thread.hasPendingApprovals,
       hasPendingUserInput: thread.hasPendingUserInput,
     });
-    if (!isDashboardActivity(status)) return [];
-    return [
-      {
+    if (isDashboardInteraction(status)) {
+      return [{
         threadId: thread.id,
         label: status.label,
         colorClass: status.colorClass,
         dotClass: status.dotClass,
         pulse: status.pulse,
+        priority: status.label === "Pending Approval" ? 7 : 6,
         updatedAtMs: timestampMs(threadTimestamp(thread)),
-      },
-    ];
+      }];
+    }
+
+    const activity = agentActivityByThreadId?.get(thread.id);
+    if (!activity) return [];
+    const agentStatus =
+      activity.queueCount > 0 && !isLiveAgentActivityPhase(activity.phase)
+        ? "queued"
+        : activity.phase;
+    if (agentStatus !== "queued" && !isLiveAgentActivityPhase(agentStatus)) return [];
+    const presentation = agentStatusPresentation(agentStatus);
+    return [{
+      threadId: thread.id,
+      label: presentation.label,
+      colorClass: presentation.textClassName,
+      dotClass: presentation.dotClassName,
+      pulse: isLiveAgentActivityPhase(activity.phase),
+      priority: AGENT_ACTIVITY_PRIORITY[agentStatus],
+      updatedAtMs: timestampMs(threadTimestamp(thread)),
+    }];
   });
 
   const selected = candidates.toSorted(
     (left, right) =>
-      ACTIVITY_PRIORITY[right.label] - ACTIVITY_PRIORITY[left.label] ||
-      right.updatedAtMs - left.updatedAtMs,
+      right.priority - left.priority || right.updatedAtMs - left.updatedAtMs,
   )[0];
   if (!selected) return null;
   return {
@@ -215,8 +236,34 @@ function deriveActivity(threads: readonly SidebarThreadSummary[]): WorkspaceActi
   };
 }
 
-function worktreePathKey(path: string, platform: WorkspacePathPlatform): string {
-  return platform === "windows" ? path.replaceAll("\\", "/").toLowerCase() : path;
+function workspacePathKey(path: string, platform: WorkspacePathPlatform): string {
+  let normalized = path.trim().replaceAll("\\", "/");
+  if (normalized.length > 1 && !/^[a-zA-Z]:\/$/u.test(normalized)) {
+    normalized = normalized.replace(/\/+$/u, "");
+  }
+  return platform === "windows" ? normalized.toLowerCase() : normalized;
+}
+
+export function hasActiveGitActionForProject(input: {
+  project: Pick<Project, "id" | "cwd">;
+  threads: readonly Pick<
+    SidebarThreadSummary,
+    "projectId" | "archivedAt" | "worktreePath" | "associatedWorktreePath"
+  >[];
+  activeActionCwds: Iterable<string>;
+  platform: WorkspacePathPlatform;
+}): boolean {
+  const projectPathKeys = new Set([workspacePathKey(input.project.cwd, input.platform)]);
+  for (const thread of input.threads) {
+    if (thread.projectId !== input.project.id || thread.archivedAt != null) continue;
+    for (const path of [thread.worktreePath, thread.associatedWorktreePath]) {
+      if (path?.trim()) projectPathKeys.add(workspacePathKey(path, input.platform));
+    }
+  }
+  for (const cwd of input.activeActionCwds) {
+    if (projectPathKeys.has(workspacePathKey(cwd, input.platform))) return true;
+  }
+  return false;
 }
 
 function deriveWorktrees(
@@ -227,7 +274,7 @@ function deriveWorktrees(
   for (const thread of threads) {
     const path = (thread.associatedWorktreePath ?? thread.worktreePath)?.trim();
     if (!path) continue;
-    const key = worktreePathKey(path, platform);
+    const key = workspacePathKey(path, platform);
     const candidate = {
       path,
       branch: thread.associatedWorktreeBranch ?? thread.branch,
@@ -250,6 +297,8 @@ export function deriveWorkspaceCards(input: {
   threads: readonly SidebarThreadSummary[];
   automationRuns?: readonly WorkspaceAutomationRun[];
   repositoryByProjectId: ReadonlyMap<ProjectId, WorkspaceRepositoryState>;
+  processActivityByProjectId?: ReadonlyMap<ProjectId, ProjectProcessActivitySummary>;
+  agentActivityByThreadId?: ReadonlyMap<ThreadId, AgentActivityState>;
   worktreePathPlatform: WorkspacePathPlatform;
 }): WorkspaceCardModel[] {
   const threadsByProject = new Map<ProjectId, SidebarThreadSummary[]>();
@@ -325,7 +374,10 @@ export function deriveWorkspaceCards(input: {
           kind: "loading" as const,
         },
         recentThread,
-        activity: deriveActivity(threads),
+        activity: deriveActivity(threads, input.agentActivityByThreadId),
+        processActivity:
+          input.processActivityByProjectId?.get(project.id) ??
+          deriveProjectProcessActivity({ agents: [], terminalProcessCount: 0 }),
         worktrees: deriveWorktrees(threads, input.worktreePathPlatform),
         providers,
         automation,
@@ -343,9 +395,17 @@ export function filterAndSortWorkspaceCards(
   const filtered = cards.filter((card) => {
     switch (filter) {
       case "active":
-        return card.activity !== null || card.automation?.isActive === true;
+        return (
+          card.activity !== null ||
+          card.processActivity.anyProcessRunning ||
+          card.automation?.isActive === true
+        );
       case "idle":
-        return card.activity === null && card.automation?.isActive !== true;
+        return (
+          card.activity === null &&
+          !card.processActivity.anyProcessRunning &&
+          card.automation?.isActive !== true
+        );
       case "dirty":
         return card.repository.kind === "git" && card.repository.dirtyFileCount > 0;
       case "unpushed":

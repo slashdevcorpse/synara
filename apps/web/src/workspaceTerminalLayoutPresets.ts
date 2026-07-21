@@ -7,6 +7,7 @@ import {
   type ThreadTerminalGroup,
   type ThreadTerminalLayoutNode,
 } from "./types";
+import { normalizeTerminalGroupMetadata } from "./lib/terminalGroups";
 
 export type WorkspaceLayoutPresetId =
   | "single"
@@ -168,7 +169,7 @@ function distributeTerminalIdsAcrossSlots(
   );
 }
 
-function buildPresetLayout(input: {
+export function buildWorkspacePresetLayout(input: {
   presetId: WorkspaceLayoutPresetId;
   terminalIds: readonly string[];
   activeTerminalId: string;
@@ -214,6 +215,8 @@ export function createWorkspaceTerminalGroupFromPreset(input: {
   presetId: WorkspaceLayoutPresetId | string;
   terminalIds: readonly string[];
   activeTerminalId?: string | null | undefined;
+  groupId?: string | undefined;
+  metadata?: Partial<ThreadTerminalGroup> | undefined;
 }): ThreadTerminalGroup {
   const normalizedPresetId = normalizePresetId(input.presetId);
   const normalizedTerminalIds = normalizeTerminalIds(input.terminalIds);
@@ -222,12 +225,13 @@ export function createWorkspaceTerminalGroupFromPreset(input: {
     : (normalizedTerminalIds[0] ?? DEFAULT_THREAD_TERMINAL_ID);
 
   return {
-    id: `workspace-group-${normalizedPresetId}`,
+    id: input.groupId?.trim() || `workspace-group-${normalizedPresetId}`,
     activeTerminalId: resolvedActiveTerminalId,
-    layout: buildPresetLayout({
+    layout: buildWorkspacePresetLayout({
       presetId: normalizedPresetId,
       terminalIds: normalizedTerminalIds,
       activeTerminalId: resolvedActiveTerminalId,
     }),
+    ...normalizeTerminalGroupMetadata(input.metadata),
   };
 }

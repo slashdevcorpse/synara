@@ -41,6 +41,7 @@ import { useFeatureFlags } from "../featureFlags";
 import { useFocusedChatContext } from "../focusedChatContext";
 import { useFeedbackDialogStore } from "../feedbackDialogStore";
 import type { FeedbackThreadContext } from "../feedback";
+import { subscribeGitActionActivityProjection } from "../gitActionActivityStore";
 import { isTerminalFocused } from "../lib/terminalFocus";
 import {
   serverConfigQueryOptions,
@@ -65,6 +66,7 @@ import {
 } from "../wsNativeApi";
 import {
   addWsCompatibilityIssueListener,
+  addWsTransportStateListener,
   readLatestWsCompatibilityIssue,
 } from "../wsTransportEvents";
 import { providerQueryKeys } from "../lib/providerReactQuery";
@@ -222,6 +224,7 @@ function RootRouteView() {
       <ToastProvider position="top-center">
         <AnchoredToastProvider>
           <GitProgressToastPreviewDev />
+          <GitActionActivityCoordinator />
           <EventRouter />
           <ProviderStatusRefreshCoordinator />
           <GlobalShortcutsDialog />
@@ -286,6 +289,20 @@ function GitProgressToastPreviewDev() {
   const featureFlags = useFeatureFlags();
   const enabled = import.meta.env.DEV && featureFlags["pin-git-progress-toast-preview"];
   useGitProgressToastPreview(enabled);
+  return null;
+}
+
+function GitActionActivityCoordinator() {
+  useEffect(() => {
+    const api = readNativeApi();
+    if (!api) return;
+    return subscribeGitActionActivityProjection({
+      gitApi: api.git,
+      addTransportStateListener: addWsTransportStateListener,
+      onServerWelcome,
+    });
+  }, []);
+
   return null;
 }
 
