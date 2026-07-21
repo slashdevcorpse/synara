@@ -60,9 +60,11 @@ describe("refreshEmptyRouteRestoreSnapshot", () => {
 
   it("continues to repair when shell and full snapshots only contain projects", async () => {
     const shell = shellSnapshot({ projects: [{ id: "project-1" }] });
-    const snapshot = readModel({ projects: [{ id: "project-1" }] });
+    const snapshot = readModel({
+      projects: [{ id: "project-1", archivedAt: null, deletedAt: null }],
+    });
     const repaired = readModel({
-      projects: [{ id: "project-1" }],
+      projects: [{ id: "project-1", archivedAt: null, deletedAt: null }],
       threads: [{ id: "thread-1", projectId: "project-1" }],
     });
     const { api, orchestration } = makeApi({ shell, snapshot, repaired });

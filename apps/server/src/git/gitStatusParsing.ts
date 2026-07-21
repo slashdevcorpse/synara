@@ -148,7 +148,7 @@ export function parseGitStatusPorcelain(stdout: string): ParsedGitStatusPorcelai
     if (record.startsWith("# branch.head ")) {
       const value = record.slice("# branch.head ".length).trim();
       isDetached = value === "(detached)";
-      branch = value.startsWith("(") ? null : value;
+      branch = isDetached ? null : value;
       continue;
     }
     if (record.startsWith("# branch.upstream ")) {

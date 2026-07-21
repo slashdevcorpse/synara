@@ -25,10 +25,14 @@ const mocks = vi.hoisted(() => ({
   listArchivedProjects: vi.fn(),
   listGitStates: vi.fn(),
   navigate: vi.fn(),
+  pinProject: vi.fn(() => true),
   projects: [] as Project[],
+  prunePinnedProjects: vi.fn(),
   reorderProjects: vi.fn(),
   syncServerShellSnapshot: vi.fn(),
   threads: [] as SidebarThreadSummary[],
+  threadsHydrated: true,
+  unpinProject: vi.fn(),
 }));
 
 vi.mock("@tanstack/react-router", async (importOriginal) => {
@@ -70,9 +74,9 @@ vi.mock("~/nativeApi", () => ({
 vi.mock("~/pinnedProjectsStore", () => {
   const state = {
     pinnedProjectIds: [] as ProjectId[],
-    pinProject: vi.fn(() => true),
-    unpinProject: vi.fn(),
-    prunePinnedProjects: vi.fn(),
+    pinProject: mocks.pinProject,
+    unpinProject: mocks.unpinProject,
+    prunePinnedProjects: mocks.prunePinnedProjects,
   };
   const usePinnedProjectsStore = Object.assign(
     (selector: (value: typeof state) => unknown) => selector(state),
@@ -87,12 +91,14 @@ vi.mock("~/store", () => ({
       projects: Project[];
       reorderProjects: typeof mocks.reorderProjects;
       syncServerShellSnapshot: typeof mocks.syncServerShellSnapshot;
+      threadsHydrated: boolean;
     }) => unknown,
   ) =>
     selector({
       projects: mocks.projects,
       reorderProjects: mocks.reorderProjects,
       syncServerShellSnapshot: mocks.syncServerShellSnapshot,
+      threadsHydrated: mocks.threadsHydrated,
     }),
 }));
 
@@ -224,11 +230,16 @@ beforeEach(() => {
   mocks.projects = [];
   mocks.gitItems = [];
   mocks.threads = [];
+  mocks.threadsHydrated = true;
   mocks.listGitStates.mockReset();
   mocks.listArchivedProjects.mockReset();
   mocks.confirm.mockReset();
   mocks.dispatchCommand.mockReset();
   mocks.automationList.mockReset();
+  mocks.pinProject.mockReset();
+  mocks.pinProject.mockReturnValue(true);
+  mocks.prunePinnedProjects.mockReset();
+  mocks.unpinProject.mockReset();
   mocks.automationList.mockResolvedValue({ definitions: [], runs: [] });
   mocks.listArchivedProjects.mockResolvedValue({ projects: [] });
   mocks.confirm.mockResolvedValue(true);
@@ -246,6 +257,46 @@ afterEach(async () => {
 });
 
 describe("WorkspaceDashboardRoute", () => {
+  it("does not prune persisted pins before the shell snapshot hydrates", async () => {
+    mocks.threadsHydrated = false;
+
+    await renderDashboard();
+
+    await expect.element(page.getByText("Build your workspace")).toBeVisible();
+    expect(mocks.prunePinnedProjects).not.toHaveBeenCalled();
+  });
+
+  it("does not prune persisted pins from a hydrated empty startup snapshot", async () => {
+    await renderDashboard();
+
+    await expect.element(page.getByText("Build your workspace")).toBeVisible();
+    expect(mocks.prunePinnedProjects).not.toHaveBeenCalled();
+  });
+
+  it("reconciles persisted pins after the shell snapshot hydrates", async () => {
+    const pinnedProject = {
+      ...project("pinned-project", "Pinned project"),
+      isPinned: true,
+    };
+    const unpinnedProject = project("unpinned-project", "Unpinned project");
+    mocks.projects = [pinnedProject, unpinnedProject];
+    mocks.gitItems = [
+      gitState({ projectId: pinnedProject.id, dirtyFileCount: 0 }),
+      gitState({ projectId: unpinnedProject.id, dirtyFileCount: 0 }),
+    ];
+
+    await renderDashboard();
+
+    await vi.waitFor(() => {
+      expect(mocks.prunePinnedProjects).toHaveBeenCalledWith([
+        pinnedProject.id,
+        unpinnedProject.id,
+      ]);
+      expect(mocks.pinProject).toHaveBeenCalledWith(pinnedProject.id);
+      expect(mocks.unpinProject).toHaveBeenCalledWith(unpinnedProject.id);
+    });
+  });
+
   it("renders project cards while the batched repository status request is still pending", async () => {
     const pendingProject = project("pending-status", "Pending status");
     let resolveGitStates: ((value: { items: WorkspaceGitStateItem[] }) => void) | undefined;

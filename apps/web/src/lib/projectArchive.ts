@@ -9,26 +9,29 @@ import { newCommandId } from "./utils";
 
 type ProjectCommandDispatcher = Pick<NativeApi["orchestration"], "dispatchCommand">;
 
-export function archiveProjectFromClient(
+function dispatchProjectArchiveCommand(
   api: ProjectCommandDispatcher,
   projectId: ProjectId,
+  type: "project.archive" | "project.unarchive",
 ): Promise<{ sequence: number }> {
   return api.dispatchCommand({
-    type: "project.archive",
+    type,
     commandId: newCommandId(),
     projectId,
     createdAt: new Date().toISOString(),
   });
 }
 
+export function archiveProjectFromClient(
+  api: ProjectCommandDispatcher,
+  projectId: ProjectId,
+): Promise<{ sequence: number }> {
+  return dispatchProjectArchiveCommand(api, projectId, "project.archive");
+}
+
 export function unarchiveProjectFromClient(
   api: ProjectCommandDispatcher,
   projectId: ProjectId,
 ): Promise<{ sequence: number }> {
-  return api.dispatchCommand({
-    type: "project.unarchive",
-    commandId: newCommandId(),
-    projectId,
-    createdAt: new Date().toISOString(),
-  });
+  return dispatchProjectArchiveCommand(api, projectId, "project.unarchive");
 }

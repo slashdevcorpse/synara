@@ -392,6 +392,8 @@ describe("clone validation", () => {
     expect(githubRepositoryFromUrl("https://github.com/acme/synara.git")).toBe("acme/synara");
     expect(githubRepositoryFromUrl("git@github.com:acme/synara.git")).toBe("acme/synara");
     expect(githubRepositoryFromUrl("ssh://git@github.com/acme/synara.git")).toBe("acme/synara");
+    expect(githubRepositoryFromUrl("ssh://git@github.com:22/acme/synara.git")).toBe("acme/synara");
+    expect(githubRepositoryFromUrl("ssh://git@github.com:2222/acme/synara.git")).toBeNull();
     expect(githubRepositoryFromUrl("https://token@github.com/acme/synara.git")).toBeNull();
     expect(githubRepositoryFromUrl("https://gitlab.com/acme/synara.git")).toBeNull();
   });

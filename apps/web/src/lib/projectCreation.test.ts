@@ -6,7 +6,10 @@
 import { type NativeApi, type OrchestrationShellSnapshot, type ProjectId } from "@synara/contracts";
 import { describe, expect, it, vi } from "vitest";
 
-import { createOrRecoverProjectFromPath } from "./projectCreation";
+import {
+  createOrRecoverProjectFromPath,
+  PROJECT_CREATE_EXISTING_SYNC_ERROR,
+} from "./projectCreation";
 
 const NOW_ISO = "2026-06-26T20:00:00.000Z";
 const WORKSPACE_ROOT = "/Users/tester/Developer/synara";
@@ -138,6 +141,37 @@ describe("createOrRecoverProjectFromPath", () => {
       created: false,
       restored: true,
     });
+  });
+
+  it("does not report a successful restore until the project appears in the read model", async () => {
+    const dispatchCommand = vi.fn(async (command: { type: string }) => {
+      if (command.type === "project.create") {
+        throw new Error(
+          "Orchestration command invariant failed (project.create): Project 'project-archived' is archived and reserves workspace root '/Users/tester/Developer/synara'. Restore project 'project-archived' instead of creating a new project.",
+        );
+      }
+      return { sequence: 3 };
+    });
+    const loadSnapshot = vi.fn(async () => makeSnapshot([]));
+
+    await expect(
+      createOrRecoverProjectFromPath({
+        api: makeApi(dispatchCommand),
+        workspaceRoot: WORKSPACE_ROOT,
+        loadSnapshot,
+        maxAttempts: 1,
+        delayMs: 0,
+      }),
+    ).rejects.toThrow(PROJECT_CREATE_EXISTING_SYNC_ERROR);
+
+    expect(dispatchCommand).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        type: "project.unarchive",
+        projectId: "project-archived",
+      }),
+    );
+    expect(loadSnapshot).toHaveBeenCalledOnce();
   });
 
   it("recovers the same id when another client wins the archived-project restore race", async () => {

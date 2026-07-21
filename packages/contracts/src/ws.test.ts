@@ -95,7 +95,7 @@ it.effect("accepts project script discovery requests", () =>
   }),
 );
 
-it.effect("accepts bounded workspace git-state requests and clone defaults", () =>
+it.effect("accepts workspace git-state requests and clone defaults", () =>
   Effect.gen(function* () {
     const list = yield* decode(WebSocketRequest, {
       id: "req-workspace-list",

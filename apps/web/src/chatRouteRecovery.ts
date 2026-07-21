@@ -10,6 +10,7 @@ import type {
 } from "@synara/contracts";
 
 import { EMPTY_ROUTE_RESTORE_FALLBACK_DELAY_MS } from "./chatRouteRestore";
+import { isActiveReadModelProject } from "./projectVisibility";
 import { useStore } from "./store";
 
 function shellSnapshotHasProjectsOrThreads(snapshot: OrchestrationShellSnapshot): boolean {
@@ -21,13 +22,7 @@ function shellSnapshotHasThreads(snapshot: OrchestrationShellSnapshot): boolean 
 }
 
 function getActiveReadModelProjectIds(snapshot: OrchestrationReadModel) {
-  return new Set(
-    snapshot.projects
-      .filter(
-        (project) => (project.deletedAt ?? null) === null && (project.archivedAt ?? null) === null,
-      )
-      .map((project) => project.id),
-  );
+  return new Set(snapshot.projects.filter(isActiveReadModelProject).map((project) => project.id));
 }
 
 function readModelHasProjectsOrThreads(snapshot: OrchestrationReadModel): boolean {

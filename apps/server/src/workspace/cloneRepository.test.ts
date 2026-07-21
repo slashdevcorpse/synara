@@ -154,6 +154,9 @@ describe("workspace clone validation", () => {
     expect(validateWorkspaceCloneUrl("ssh://git@github.com/example/repo.git")).toBe(
       "ssh://git@github.com/example/repo.git",
     );
+    expect(validateWorkspaceCloneUrl("ssh://git@github.com:22/example/repo.git")).toBe(
+      "ssh://git@github.com:22/example/repo.git",
+    );
     expect(validateWorkspaceCloneUrl("git@github.com:example/repo.git")).toBe(
       "git@github.com:example/repo.git",
     );
@@ -164,6 +167,7 @@ describe("workspace clone validation", () => {
       "../repo",
       "https://token@github.com/example/repo.git",
       "https://github.com/example/repo.git?token=secret",
+      "ssh://git@github.com:2222/example/repo.git",
       "--upload-pack=evil",
     ]) {
       expect(() => validateWorkspaceCloneUrl(invalid)).toThrow(/GitHub|supported|valid/);
@@ -361,6 +365,88 @@ describe("workspace clone progress", () => {
     });
     expect(cloneCalls).toBe(1);
     expect(projectCalls).toBe(2);
+  });
+
+  it("ends retry subscribers and restores retryability when background project creation stops", async () => {
+    const parent = await makeTempDir();
+    const targetPath = NodePath.join(parent, "repo");
+    const firstBackgroundScope = await Effect.runPromise(Scope.make("sequential"));
+    const secondBackgroundScope = await Effect.runPromise(Scope.make("sequential"));
+    let backgroundScope = firstBackgroundScope;
+    let projectCalls = 0;
+    const jobs = makeWorkspaceCloneJobs({
+      git: {
+        execute: () => Effect.succeed({ code: 0, stdout: "", stderr: "" }),
+      } as Pick<GitCoreShape, "execute">,
+      homeDir: parent,
+      createProject: () => {
+        projectCalls += 1;
+        if (projectCalls === 1) return Effect.fail(new Error("projection unavailable"));
+        if (projectCalls === 2) return Effect.never;
+        return Effect.succeed(ProjectId.makeUnsafe("project-after-interruption"));
+      },
+      startBackground: (effect) => effect.pipe(Effect.forkIn(backgroundScope), Effect.asVoid),
+    });
+    const cloneId = WorkspaceCloneId.makeUnsafe("clone-project-retry-interrupted");
+
+    try {
+      await Effect.runPromise(
+        Stream.runCollect(
+          jobs.cloneRepository({
+            cloneId,
+            url: "https://github.com/example/repo.git",
+            targetPath,
+            createProject: true,
+            createParentDirectories: true,
+          }),
+        ),
+      );
+      const originalFailure = jobs.getStatus(cloneId)?.result;
+      expect(originalFailure).toMatchObject({
+        clonedPath: targetPath,
+        failure: { stage: "project", code: "WORKSPACE_CLONE_PROJECT_CREATE_FAILED" },
+      });
+
+      const interruptedRetry = Effect.runPromise(
+        Stream.runCollect(jobs.retryProjectCreation(cloneId)),
+      );
+      await waitFor(
+        () =>
+          projectCalls === 2 &&
+          jobs.getStatus(cloneId)?.status === "running" &&
+          jobs.getStatus(cloneId)?.stage === "creating-project",
+      );
+      await Effect.runPromise(Scope.close(firstBackgroundScope, Exit.void));
+
+      const interruptedEvents = Array.from(await interruptedRetry);
+      expect(interruptedEvents.at(-1)).toMatchObject({
+        _tag: "clone_finished",
+        snapshot: { status: "failed", stage: "complete" },
+        result: originalFailure,
+      });
+      expect(jobs.getStatus(cloneId)).toMatchObject({
+        status: "failed",
+        stage: "complete",
+        result: originalFailure,
+      });
+
+      backgroundScope = secondBackgroundScope;
+      const retriedEvents = Array.from(
+        await Effect.runPromise(Stream.runCollect(jobs.retryProjectCreation(cloneId))),
+      );
+      expect(retriedEvents.at(-1)).toMatchObject({
+        _tag: "clone_finished",
+        result: {
+          clonedPath: targetPath,
+          projectId: "project-after-interruption",
+          failure: null,
+        },
+      });
+      expect(projectCalls).toBe(3);
+    } finally {
+      await Effect.runPromise(Scope.close(firstBackgroundScope, Exit.void));
+      await Effect.runPromise(Scope.close(secondBackgroundScope, Exit.void));
+    }
   });
 
   it("serializes clones targeting the same canonical path", async () => {

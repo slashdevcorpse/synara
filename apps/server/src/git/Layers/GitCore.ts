@@ -1346,7 +1346,7 @@ export const makeGitCore = (options?: {
           "status",
           "--porcelain=2",
           "--branch",
-          ...(workingTreeMode === "summary" ? ["--untracked-files=all"] : []),
+          ...(workingTreeMode === "summary" ? ["--untracked-files=normal"] : []),
           "-z",
         ]).pipe(Effect.catchIf(isMissingGitCwdError, () => Effect.succeed(null)));
         if (statusStdout === null) {
@@ -1355,8 +1355,20 @@ export const makeGitCore = (options?: {
 
         const parsedStatus = parseGitStatusPorcelain(statusStdout);
         const hasCommits = parsedStatus.hasCommits;
-        const isDetached = parsedStatus.isDetached;
-        const branch = parsedStatus.branch;
+        let isDetached = parsedStatus.isDetached;
+        let branch = parsedStatus.branch;
+        if (isDetached) {
+          const symbolicHead = yield* executeGit(
+            "GitCore.statusDetails.symbolicHead",
+            cwd,
+            ["symbolic-ref", "--quiet", "--short", "HEAD"],
+            { allowNonZeroExit: true, timeoutMs: 5_000 },
+          );
+          if (symbolicHead.code === 0) {
+            branch = symbolicHead.stdout.trim() || null;
+            isDetached = branch === null;
+          }
+        }
         const upstreamRef = parsedStatus.upstreamRef;
         let upstreamBranch: string | null = null;
         let aheadCount = parsedStatus.aheadCount;

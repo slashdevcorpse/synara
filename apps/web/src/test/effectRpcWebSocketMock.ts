@@ -12,6 +12,8 @@ import {
   type OrchestrationShellSnapshot,
 } from "@synara/contracts";
 
+import { isActiveReadModelProject } from "../projectVisibility";
+
 export interface EffectRpcWebSocketClient {
   readonly send: (data: string) => void;
   readonly url?: URL;
@@ -127,9 +129,7 @@ export function flattenEffectRpcRequestPayload(
 export function createShellSnapshotFromReadModel(
   snapshot: OrchestrationReadModel,
 ): OrchestrationShellSnapshot {
-  const activeProjects = snapshot.projects.filter(
-    (project) => project.deletedAt === null && (project.archivedAt ?? null) === null,
-  );
+  const activeProjects = snapshot.projects.filter(isActiveReadModelProject);
   const activeProjectIds = new Set(activeProjects.map((project) => project.id));
   return {
     snapshotSequence: snapshot.snapshotSequence,

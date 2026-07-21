@@ -125,6 +125,9 @@ export async function createOrRecoverProjectFromPath(input: {
         maxAttempts,
         delayMs,
       });
+      if (!restored.project || !restored.snapshot) {
+        throw new Error(PROJECT_CREATE_EXISTING_SYNC_ERROR, { cause: error });
+      }
       return {
         projectId: archivedProjectId,
         project: restored.project,

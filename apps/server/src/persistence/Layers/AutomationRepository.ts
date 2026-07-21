@@ -402,19 +402,12 @@ const makeAutomationRepository = Effect.gen(function* () {
         FROM automation_definitions definitions
         WHERE definitions.enabled = 1
           AND definitions.archived_at IS NULL
-          AND (
-            NOT EXISTS (
-              SELECT 1
-              FROM projection_projects projects
-              WHERE projects.project_id = definitions.project_id
-            )
-            OR EXISTS (
-              SELECT 1
-              FROM projection_projects projects
-              WHERE projects.project_id = definitions.project_id
-                AND projects.deleted_at IS NULL
-                AND projects.archived_at IS NULL
-            )
+          AND EXISTS (
+            SELECT 1
+            FROM projection_projects projects
+            WHERE projects.project_id = definitions.project_id
+              AND projects.deleted_at IS NULL
+              AND projects.archived_at IS NULL
           )
           AND definitions.next_run_at IS NOT NULL
           AND definitions.next_run_at <= ${now}
@@ -884,14 +877,28 @@ const makeAutomationRepository = Effect.gen(function* () {
           permission_snapshot_json AS "permissionSnapshot",
           created_at AS "createdAt",
           updated_at AS "updatedAt"
-        FROM automation_runs
-        WHERE status IN ('pending', 'claimed', 'running', 'waiting-for-approval')
+        FROM automation_runs runs
+        WHERE runs.status IN ('pending', 'claimed', 'running', 'waiting-for-approval')
+          AND (
+            NOT EXISTS (
+              SELECT 1
+              FROM projection_projects projects
+              WHERE projects.project_id = runs.project_id
+            )
+            OR EXISTS (
+              SELECT 1
+              FROM projection_projects projects
+              WHERE projects.project_id = runs.project_id
+                AND projects.deleted_at IS NULL
+                AND projects.archived_at IS NULL
+            )
+          )
           AND (
             ${afterCreatedAt ?? null} IS NULL
-            OR created_at > ${afterCreatedAt ?? null}
-            OR (created_at = ${afterCreatedAt ?? null} AND run_id > ${afterRunId ?? ""})
+            OR runs.created_at > ${afterCreatedAt ?? null}
+            OR (runs.created_at = ${afterCreatedAt ?? null} AND runs.run_id > ${afterRunId ?? ""})
           )
-        ORDER BY created_at ASC, run_id ASC
+        ORDER BY runs.created_at ASC, runs.run_id ASC
         LIMIT ${limit}
       `,
   });
@@ -926,6 +933,20 @@ const makeAutomationRepository = Effect.gen(function* () {
         FROM automation_runs runs
         INNER JOIN automation_pending_completion_evaluations pending
           ON pending.run_id = runs.run_id
+        WHERE (
+          NOT EXISTS (
+            SELECT 1
+            FROM projection_projects projects
+            WHERE projects.project_id = runs.project_id
+          )
+          OR EXISTS (
+            SELECT 1
+            FROM projection_projects projects
+            WHERE projects.project_id = runs.project_id
+              AND projects.deleted_at IS NULL
+              AND projects.archived_at IS NULL
+          )
+        )
         ORDER BY pending.finished_at ASC, pending.run_id ASC
         LIMIT ${limit}
       `,
@@ -1010,6 +1031,13 @@ const makeAutomationRepository = Effect.gen(function* () {
         WHERE definitions.enabled = 1
           AND definitions.archived_at IS NULL
           AND definitions.next_run_at IS NOT NULL
+          AND EXISTS (
+            SELECT 1
+            FROM projection_projects projects
+            WHERE projects.project_id = definitions.project_id
+              AND projects.deleted_at IS NULL
+              AND projects.archived_at IS NULL
+          )
           AND NOT (
             definitions.mode = 'heartbeat'
             AND definitions.target_thread_id IS NOT NULL

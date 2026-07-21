@@ -1641,26 +1641,37 @@ it.layer(TestLayer)("git integration", (it) => {
       }),
     );
 
-    it.effect("reports unborn and detached HEAD metadata", () =>
-      Effect.gen(function* () {
-        const unbornRoot = yield* makeTmpDir();
-        const core = yield* GitCore;
-        yield* core.initRepo({ cwd: unbornRoot });
+    it.effect(
+      "reports unborn and detached HEAD metadata without hiding a sentinel-named branch",
+      () =>
+        Effect.gen(function* () {
+          const unbornRoot = yield* makeTmpDir();
+          const core = yield* GitCore;
+          yield* core.initRepo({ cwd: unbornRoot });
 
-        const unborn = yield* core.statusDetails(unbornRoot);
-        expect(unborn.isRepo).toBe(true);
-        expect(unborn.hasCommits).toBe(false);
-        expect(unborn.isDetached).toBe(false);
+          const unborn = yield* core.statusDetails(unbornRoot);
+          expect(unborn.isRepo).toBe(true);
+          expect(unborn.hasCommits).toBe(false);
+          expect(unborn.isDetached).toBe(false);
 
-        const detachedRoot = yield* makeTmpDir();
-        yield* initRepoWithCommit(detachedRoot);
-        yield* git(detachedRoot, ["checkout", "--detach", "HEAD"]);
+          const detachedRoot = yield* makeTmpDir();
+          yield* initRepoWithCommit(detachedRoot);
+          yield* git(detachedRoot, ["checkout", "--detach", "HEAD"]);
 
-        const detached = yield* core.statusDetails(detachedRoot);
-        expect(detached.hasCommits).toBe(true);
-        expect(detached.isDetached).toBe(true);
-        expect(detached.branch).toBeNull();
-      }),
+          const detached = yield* core.statusDetails(detachedRoot);
+          expect(detached.hasCommits).toBe(true);
+          expect(detached.isDetached).toBe(true);
+          expect(detached.branch).toBeNull();
+
+          const sentinelBranchRoot = yield* makeTmpDir();
+          yield* initRepoWithCommit(sentinelBranchRoot);
+          yield* git(sentinelBranchRoot, ["checkout", "-b", "(detached)"]);
+
+          const sentinelBranch = yield* core.statusDetails(sentinelBranchRoot);
+          expect(sentinelBranch.hasCommits).toBe(true);
+          expect(sentinelBranch.isDetached).toBe(false);
+          expect(sentinelBranch.branch).toBe("(detached)");
+        }),
     );
 
     it.effect("bypasses the upstream refresh cache when status details are forced", () =>
@@ -1910,7 +1921,7 @@ it.layer(TestLayer)("git integration", (it) => {
       }),
     );
 
-    it.effect("summarizes dirty files without detailed stats or untracked content reads", () =>
+    it.effect("summarizes dirty entries with collapsed untracked directories", () =>
       Effect.gen(function* () {
         const tmp = yield* makeTmpDir();
         yield* initRepoWithCommit(tmp);
@@ -1920,7 +1931,8 @@ it.layer(TestLayer)("git integration", (it) => {
         yield* writeTextFile(path.join(tmp, "README.md"), "updated\n");
         yield* fileSystem.makeDirectory(path.join(tmp, "nested"));
         yield* writeTextFile(path.join(tmp, "nested", "first.txt"), "alpha\nbeta\n");
-        yield* writeTextFile(path.join(tmp, "nested", "second.txt"), "gamma\n");
+        yield* fileSystem.makeDirectory(path.join(tmp, "nested", "deep"));
+        yield* writeTextFile(path.join(tmp, "nested", "deep", "second.txt"), "gamma\n");
 
         const operations: Array<{ operation: string; args: ReadonlyArray<string> }> = [];
         const untrackedContentReads: string[] = [];
@@ -1939,9 +1951,9 @@ it.layer(TestLayer)("git integration", (it) => {
 
         const summary = yield* core.statusDetails(tmp, { workingTreeMode: "summary" });
         expect(summary.hasWorkingTreeChanges).toBe(true);
-        expect(summary.workingTree.files).toHaveLength(3);
+        expect(summary.workingTree.files).toHaveLength(2);
         expect(new Set(summary.workingTree.files.map((file) => file.path))).toEqual(
-          new Set(["README.md", "nested/first.txt", "nested/second.txt"]),
+          new Set(["README.md", "nested/"]),
         );
         expect(summary.workingTree.files.every((file) => file.insertions === 0)).toBe(true);
         expect(summary.workingTree.files.every((file) => file.deletions === 0)).toBe(true);
@@ -1950,7 +1962,10 @@ it.layer(TestLayer)("git integration", (it) => {
         expect(untrackedContentReads).toEqual([]);
         expect(
           operations.find((entry) => entry.operation === "GitCore.statusDetails.status")?.args,
-        ).toContain("--untracked-files=all");
+        ).toContain("--untracked-files=normal");
+        expect(
+          operations.find((entry) => entry.operation === "GitCore.statusDetails.status")?.args,
+        ).not.toContain("--untracked-files=all");
         expect(
           operations.some((entry) =>
             [

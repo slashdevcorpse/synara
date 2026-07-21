@@ -14,7 +14,7 @@ const decodeEvent = Schema.decodeUnknownEffect(OrchestrationEvent);
 const decodeProject = Schema.decodeUnknownEffect(OrchestrationProject);
 const decodeShellEvent = Schema.decodeUnknownEffect(OrchestrationShellStreamEvent);
 
-it.effect("round-trips project archive and unarchive commands/events", () =>
+it.effect("decodes project archive and unarchive commands/events", () =>
   Effect.gen(function* () {
     const archive = yield* decodeCommand({
       type: "project.archive",

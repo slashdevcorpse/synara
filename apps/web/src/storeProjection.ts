@@ -12,6 +12,7 @@ import {
 } from "@synara/contracts";
 import { deriveThreadSummaryMetadata } from "@synara/shared/threadSummary";
 
+import { isActiveReadModelProject } from "./projectVisibility";
 import { getThreadFromState, getThreadsFromState } from "./threadDerivation";
 import {
   capThreadActivities,
@@ -843,13 +844,13 @@ function syncServerThreadDetailWithOptions(
   );
 }
 
-function hasActiveProjectInClientState(state: AppState, projectId: Project["id"]): boolean {
-  return state.projects.some((project) => project.id === projectId);
+function mayAcceptThreadForProject(state: AppState, projectId: Project["id"]): boolean {
+  return !state.threadsHydrated || state.projects.some((project) => project.id === projectId);
 }
 
 export function syncServerThreadDetail(state: AppState, thread: ReadModelThread): AppState {
   if (
-    !hasActiveProjectInClientState(state, thread.projectId) ||
+    !mayAcceptThreadForProject(state, thread.projectId) ||
     state.deletedProjectIdsById?.[thread.projectId] === true ||
     state.deletedThreadIdsById?.[thread.id] === true
   ) {
@@ -860,7 +861,7 @@ export function syncServerThreadDetail(state: AppState, thread: ReadModelThread)
 
 export function syncServerThreadDetailHotPath(state: AppState, thread: ReadModelThread): AppState {
   if (
-    !hasActiveProjectInClientState(state, thread.projectId) ||
+    !mayAcceptThreadForProject(state, thread.projectId) ||
     state.deletedProjectIdsById?.[thread.projectId] === true ||
     state.deletedThreadIdsById?.[thread.id] === true
   ) {
@@ -877,7 +878,7 @@ export function applyShellEvent(state: AppState, event: OrchestrationShellStream
       return removeDeletedProjectFromClientState(state, event.projectId);
     case "thread-upserted": {
       if (
-        !hasActiveProjectInClientState(state, event.thread.projectId) ||
+        !mayAcceptThreadForProject(state, event.thread.projectId) ||
         state.deletedProjectIdsById?.[event.thread.projectId] === true ||
         state.deletedThreadIdsById?.[event.thread.id] === true
       ) {
@@ -904,10 +905,7 @@ export function syncServerReadModel(state: AppState, readModel: OrchestrationRea
   const deletedProjectIdsById = state.deletedProjectIdsById ?? {};
   const deletedThreadIdsById = state.deletedThreadIdsById ?? {};
   const activeProjects = readModel.projects.filter(
-    (project) =>
-      project.deletedAt === null &&
-      (project.archivedAt ?? null) === null &&
-      deletedProjectIdsById[project.id] !== true,
+    (project) => isActiveReadModelProject(project) && deletedProjectIdsById[project.id] !== true,
   );
   const activeProjectIds = new Set(activeProjects.map((project) => project.id));
   const projects = mapProjects(activeProjects, state.projects);

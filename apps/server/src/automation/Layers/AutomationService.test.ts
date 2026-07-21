@@ -19,6 +19,7 @@ import {
 } from "@synara/contracts";
 import { Duration, Effect, Layer, Option, Stream } from "effect";
 import { TestClock } from "effect/testing";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import {
   GitCore,
@@ -97,6 +98,9 @@ const knownProjectIds = new Set<ProjectId>([projectId]);
 const hiddenProjectIds = new Set<ProjectId>();
 
 function resetHarness() {
+  knownProjectIds.clear();
+  knownProjectIds.add(projectId);
+  hiddenProjectIds.clear();
   dispatchedCommands.length = 0;
   createdWorktrees.length = 0;
   removedWorktrees.length = 0;
@@ -514,11 +518,31 @@ const gitCore = {
     }),
 } as unknown as GitCoreShape;
 
+const automationServiceTestDatabaseLayer = Layer.effectDiscard(
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* sql`
+      INSERT INTO projection_projects (
+        project_id, kind, title, workspace_root,
+        default_model_selection_json, scripts_json, is_pinned,
+        created_at, updated_at, archived_at, deleted_at
+      ) VALUES (
+        ${project.id}, ${project.kind}, ${project.title}, ${project.workspaceRoot},
+        NULL, '[]', 0, ${project.createdAt}, ${project.updatedAt}, NULL, NULL
+      )
+      ON CONFLICT(project_id) DO UPDATE SET
+        archived_at = NULL,
+        deleted_at = NULL,
+        updated_at = excluded.updated_at
+    `;
+  }),
+).pipe(Layer.provideMerge(SqlitePersistenceMemory));
+
 const layer = it.layer(
   AutomationServiceLive.pipe(
     Layer.provideMerge(AutomationRepositoryLive),
     Layer.provideMerge(ProjectionTurnRepositoryLive),
-    Layer.provideMerge(SqlitePersistenceMemory),
+    Layer.provideMerge(automationServiceTestDatabaseLayer),
     Layer.provideMerge(Layer.succeed(OrchestrationEngineService, orchestrationEngine)),
     Layer.provideMerge(Layer.succeed(ProjectionSnapshotQuery, projectionSnapshotQuery)),
     Layer.provideMerge(Layer.succeed(TextGeneration, textGeneration)),
@@ -611,8 +635,6 @@ layer("AutomationService", (it) => {
       assert.strictEqual(listed.definitions.length, 1);
       assert.strictEqual(listed.runs.length, 0);
       assert.strictEqual(dispatchedCommands.length, 0);
-      hiddenProjectIds.delete(inactiveProjectId);
-      knownProjectIds.delete(inactiveProjectId);
     }),
   );
 

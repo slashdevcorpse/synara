@@ -144,6 +144,7 @@ export function WorkspaceDashboardRoute() {
   const queryClient = useQueryClient();
   const { handleNewThread } = useHandleNewThread();
   const projects = useStore((store) => store.projects);
+  const threadsHydrated = useStore((store) => store.threadsHydrated);
   const selectThreads = useMemo(() => createSidebarThreadSummariesSelector(), []);
   const threads = useStore(selectThreads);
   const reorderProjects = useStore((store) => store.reorderProjects);
@@ -200,12 +201,14 @@ export function WorkspaceDashboardRoute() {
   );
 
   useEffect(() => {
+    if (!threadsHydrated || projectRows.length === 0) return;
     const projectIdSet = new Set(projectRows.map((project) => project.id));
     usePinnedProjectsStore.getState().prunePinnedProjects([...projectIdSet]);
     for (const project of projectRows) {
       if (project.isPinned === true) pinProject(project.id);
+      else unpinProject(project.id);
     }
-  }, [pinProject, projectRows]);
+  }, [pinProject, projectRows, threadsHydrated, unpinProject]);
 
   useEffect(() => {
     const activeProjectIds = new Set(projectRows.map((project) => project.id));

@@ -407,11 +407,12 @@ export function githubRepositoryFromUrl(value: string): string | null {
     const url = new URL(trimmed);
     const isHttps = url.protocol === "https:" && !url.username;
     const isSsh = url.protocol === "ssh:" && url.username === "git";
+    const hasAllowedPort = !url.port || (isSsh && url.port === "22");
     if (
       (!isHttps && !isSsh) ||
       url.hostname.toLocaleLowerCase() !== "github.com" ||
       url.password ||
-      url.port ||
+      !hasAllowedPort ||
       url.search ||
       url.hash
     ) {

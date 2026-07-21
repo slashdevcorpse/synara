@@ -363,6 +363,50 @@ describe("store projection", () => {
     ]);
   });
 
+  it("accepts thread detail and shell events before the project snapshot hydrates", () => {
+    const projectId = ProjectId.makeUnsafe("project-before-hydration");
+    const threadId = ThreadId.makeUnsafe("thread-before-hydration");
+    const preHydrationState: AppState = {
+      projects: [],
+      sidebarThreadSummaryById: {},
+      threadsHydrated: false,
+    };
+    const detail = makeReadModelThread({ id: threadId, projectId });
+    const shellThread = makeShellSnapshot({
+      id: threadId,
+      projectId,
+      title: "Thread before hydration",
+      modelSelection: {
+        provider: "codex",
+        model: "gpt-5.3-codex",
+      },
+      runtimeMode: DEFAULT_RUNTIME_MODE,
+      interactionMode: DEFAULT_INTERACTION_MODE,
+      envMode: "local",
+      branch: null,
+      worktreePath: null,
+      forkSourceThreadId: null,
+      sidechatSourceThreadId: null,
+      latestTurn: null,
+      createdAt: "2026-02-27T00:00:00.000Z",
+      updatedAt: "2026-02-27T00:00:01.000Z",
+      handoff: null,
+      session: null,
+    }).threads[0]!;
+
+    const afterDetail = syncServerThreadDetail(preHydrationState, detail);
+    const afterHotPathDetail = syncServerThreadDetailHotPath(preHydrationState, detail);
+    const afterShellEvent = applyShellEvent(preHydrationState, {
+      kind: "thread-upserted",
+      sequence: 1,
+      thread: shellThread,
+    } satisfies OrchestrationShellStreamEvent);
+
+    expect(threadsOf(afterDetail).map((thread) => thread.id)).toEqual([threadId]);
+    expect(threadsOf(afterHotPathDetail).map((thread) => thread.id)).toEqual([threadId]);
+    expect(threadsOf(afterShellEvent).map((thread) => thread.id)).toEqual([threadId]);
+  });
+
   it("filters archived projects and their threads from full read-model repair snapshots", () => {
     const activeProjectId = ProjectId.makeUnsafe("project-active-repair");
     const archivedProjectId = ProjectId.makeUnsafe("project-archived-repair");

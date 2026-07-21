@@ -104,7 +104,9 @@ export function validateWorkspaceCloneUrl(input: string): string {
   }
   if (
     parsed.hostname.toLowerCase() !== "github.com" ||
-    parsed.port ||
+    (parsed.protocol === "ssh:"
+      ? parsed.port !== "" && parsed.port !== "22"
+      : parsed.port !== "") ||
     parsed.password ||
     parsed.search ||
     parsed.hash ||
@@ -751,16 +753,21 @@ export function makeWorkspaceCloneJobs(input: {
         yield* publish(cloneId, { _tag: "clone_finished", snapshot: terminal, result }, true);
       }).pipe(
         Effect.onInterrupt(() =>
-          Effect.sync(() => {
+          Effect.gen(function* () {
             const restored = current.result;
             if (restored) {
-              snapshot(cloneId, {
+              const terminal = snapshot(cloneId, {
                 status: "failed",
                 stage: "complete",
                 percent: 100,
                 message: restored.failure?.message ?? "Project creation retry cancelled.",
                 result: restored,
               });
+              yield* publish(
+                cloneId,
+                { _tag: "clone_finished", snapshot: terminal, result: restored },
+                true,
+              );
             }
           }),
         ),
