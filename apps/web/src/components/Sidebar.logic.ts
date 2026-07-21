@@ -307,10 +307,7 @@ function crossPlatformPathBasename(path: string | null | undefined): string | nu
 }
 
 export function resolveThreadHoverCardWorkspaceLabel(input: {
-  thread: Pick<
-    SidebarThreadSummary,
-    "associatedWorktreeBranch" | "associatedWorktreePath"
-  >;
+  thread: Pick<SidebarThreadSummary, "associatedWorktreeBranch" | "associatedWorktreePath">;
   project: Pick<Project, "folderName" | "name"> | null;
 }): string | null {
   return (

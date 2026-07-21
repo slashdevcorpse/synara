@@ -31,9 +31,7 @@ describe("disclosureMotion", () => {
   });
 
   it("keeps every disclosure path on the shared 220ms reduced-motion contract", () => {
-    expect(DISCLOSURE_TIMING_CLASS).toBe(
-      "duration-220 ease-out motion-reduce:transition-none",
-    );
+    expect(DISCLOSURE_TIMING_CLASS).toBe("duration-220 ease-out motion-reduce:transition-none");
 
     for (const className of [
       DISCLOSURE_SHELL_MOTION_CLASS,

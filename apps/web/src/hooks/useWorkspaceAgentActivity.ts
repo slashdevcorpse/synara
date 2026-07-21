@@ -695,9 +695,7 @@ export function useWorkspaceAgentActivity(
   }, [eventState, hasCurrentWork, initialActivity, nowMs, selectedProjectIds, shell]);
 }
 
-export function useWorkspaceAgentThreadActivity(
-  threadId: ThreadId,
-): WorkspaceAgentThreadActivity {
+export function useWorkspaceAgentThreadActivity(threadId: ThreadId): WorkspaceAgentThreadActivity {
   const selectThreadShell = useMemo(
     () => createWorkspaceAgentThreadShellSelector(threadId),
     [threadId],

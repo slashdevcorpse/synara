@@ -189,9 +189,7 @@ describe("ThreadHoverCardFrame", () => {
       await expect.element(page.getByText("tool: bun run test · 8m")).toBeVisible();
       await expect.element(page.getByText("plan · 2 of 3 subagents running")).toBeVisible();
       await expect.element(page.getByText("workspace: feature/thread-hover")).toBeVisible();
-      await expect
-        .element(page.getByText("#22: fix(release): preserve hover state"))
-        .toBeVisible();
+      await expect.element(page.getByText("#22: fix(release): preserve hover state")).toBeVisible();
       expect(document.body.textContent).toContain("Claude: ");
 
       await page.getByRole("button", { name: "Interrupt" }).click();
@@ -246,9 +244,7 @@ describe("ThreadHoverCardFrame", () => {
       await expect.element(page.getByTestId("dismiss-content")).toBeVisible();
       await expect.element(page.getByTestId("nested-pr-control")).toBeVisible();
       await page.getByTestId("dismiss-outside").hover();
-      const closingPopup = document.querySelector<HTMLElement>(
-        '[data-slot="preview-card-popup"]',
-      );
+      const closingPopup = document.querySelector<HTMLElement>('[data-slot="preview-card-popup"]');
       expect(closingPopup?.hasAttribute("data-ending-style")).toBe(true);
       expect(document.querySelector('[data-testid="dismiss-content"]')).not.toBeNull();
       await expect.element(page.getByTestId("dismiss-content")).not.toBeInTheDocument();

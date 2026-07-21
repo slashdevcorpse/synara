@@ -533,9 +533,7 @@ describe("deriveAgentStatus", () => {
     expect(deriveAgentStatus(shellThread(), toolState.threads[THREAD_ID])).toBe("tool-running");
     expect(deriveAgentStatus(starting, undefined)).toBe("connecting");
     expect(deriveAgentStatus(starting, queuedState.threads[THREAD_ID])).toBe("queued");
-    expect(
-      deriveAgentStatus(withoutLiveTurn(), queuedState.threads[THREAD_ID]),
-    ).toBe("queued");
+    expect(deriveAgentStatus(withoutLiveTurn(), queuedState.threads[THREAD_ID])).toBe("queued");
     expect(deriveAgentStatus(completed, undefined)).toBe("completed");
     expect(deriveAgentStatus(failed, undefined)).toBe("failed");
     expect(deriveAgentStatus(stopped, undefined)).toBe("stopped");
@@ -1075,9 +1073,9 @@ describe("workspace agent labels and timing", () => {
       nowMs: Date.parse(BASE_TIME) + 50_000,
     };
 
-    expect(deriveWorkspaceAgentThreadActivity({ ...baseInput, threads: [idle] }).entry).toMatchObject(
-      { status: "idle" },
-    );
+    expect(
+      deriveWorkspaceAgentThreadActivity({ ...baseInput, threads: [idle] }).entry,
+    ).toMatchObject({ status: "idle" });
     expect(
       deriveWorkspaceAgentThreadActivity({ ...baseInput, threads: [completed] }).entry,
     ).toMatchObject({ status: "completed", duration: 5_000 });

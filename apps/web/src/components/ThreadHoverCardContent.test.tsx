@@ -146,9 +146,9 @@ describe("ThreadHoverCardContent", () => {
 
   it("omits duration for active states when no duration is available", () => {
     expect(renderCard({ status: "thinking", duration: null })).toContain('title="thinking"');
-    expect(
-      renderCard({ status: "tool-running", duration: null, toolLabel: null }),
-    ).toContain('title="tool-running"');
+    expect(renderCard({ status: "tool-running", duration: null, toolLabel: null })).toContain(
+      'title="tool-running"',
+    );
     expect(renderCard({ status: "completed", duration: null })).toContain('title="completed"');
   });
 

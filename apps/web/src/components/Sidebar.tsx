@@ -174,10 +174,7 @@ import {
   SIDEBAR_HOVER_CARD_SURFACE_CLASS_NAME,
   SIDEBAR_HOVER_CARD_TRIGGER_PROPS,
 } from "./sidebarHoverCardStyles";
-import {
-  abbreviateHomePath,
-  createProjectHoverCardAnchor,
-} from "./sidebarHoverCardAnchors";
+import { abbreviateHomePath, createProjectHoverCardAnchor } from "./sidebarHoverCardAnchors";
 import { PreviewCard, PreviewCardPopup, PreviewCardTrigger } from "./ui/preview-card";
 import { SidebarIconButton } from "./SidebarIconButton";
 import { SidebarLeadingIcon } from "./SidebarLeadingIcon";

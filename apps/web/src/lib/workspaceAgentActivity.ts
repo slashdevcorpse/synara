@@ -872,7 +872,8 @@ export function deriveWorkspaceAgentThreadActivity(input: {
       ? null
       : (input.threads.find(
           (candidate) =>
-            candidate.threadId === thread.parentThreadId && candidate.projectId === thread.projectId,
+            candidate.threadId === thread.parentThreadId &&
+            candidate.projectId === thread.projectId,
         ) ?? null);
   const subagentThreads = input.threads.filter(
     (candidate) =>

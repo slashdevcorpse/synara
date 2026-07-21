@@ -22,10 +22,7 @@ import {
   SIDEBAR_HOVER_CARD_TRIGGER_PROPS,
 } from "./sidebarHoverCardStyles";
 import { createThreadHoverCardAnchor } from "./sidebarHoverCardAnchors";
-import {
-  ThreadHoverCardContent,
-  type ThreadHoverCardPrState,
-} from "./ThreadHoverCardContent";
+import { ThreadHoverCardContent, type ThreadHoverCardPrState } from "./ThreadHoverCardContent";
 import { PreviewCard, PreviewCardPopup, PreviewCardTrigger } from "./ui/preview-card";
 import { stopWorkspaceAgent } from "./workspace/WorkspaceAgentSection";
 
@@ -120,7 +117,8 @@ export function ThreadHoverCardActivityContent({
 }: ThreadHoverCardActivityContentProps) {
   const entry = activity.entry;
   const parentEntry = activity.parentEntry;
-  const provider = parentEntry?.providerKind ?? entry?.providerKind ?? thread.modelSelection.provider;
+  const provider =
+    parentEntry?.providerKind ?? entry?.providerKind ?? thread.modelSelection.provider;
   const modelLabel = resolveThreadHoverCardModelLabel(thread.modelSelection);
   const interruptible =
     entry !== null && entry.turnId !== null && isLiveAgentStatus(entry.status) ? entry : null;

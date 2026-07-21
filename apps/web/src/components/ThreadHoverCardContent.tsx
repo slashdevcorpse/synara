@@ -30,12 +30,7 @@ import {
 
 export type ThreadHoverCardPermissionMode = "full-access" | "approval-required" | "plan";
 
-export type ThreadHoverCardPrState =
-  | "open"
-  | "draft"
-  | "conflicting"
-  | "merged"
-  | "closed";
+export type ThreadHoverCardPrState = "open" | "draft" | "conflicting" | "merged" | "closed";
 
 export type ThreadHoverCardContentProps = {
   threadTitle: string;
@@ -194,16 +189,10 @@ export function ThreadHoverCardContent({
 
   return (
     <div
-      className={cn(
-        "flex w-full flex-col gap-0",
-        SIDEBAR_HOVER_CARD_CONTAINER_PADDING_CLASS_NAME,
-      )}
+      className={cn("flex w-full flex-col gap-0", SIDEBAR_HOVER_CARD_CONTAINER_PADDING_CLASS_NAME)}
     >
       <div className={ROW_CLASS_NAME}>
-        <span
-          className="min-w-0 flex-1 truncate font-medium text-foreground"
-          title={threadTitle}
-        >
+        <span className="min-w-0 flex-1 truncate font-medium text-foreground" title={threadTitle}>
           {threadTitle}
         </span>
         {timeLabel ? (
@@ -239,10 +228,7 @@ export function ThreadHoverCardContent({
           )}
         />
         <span
-          className={cn(
-            "min-w-0 truncate",
-            subagentStatusTextToneClassName(statusKind),
-          )}
+          className={cn("min-w-0 truncate", subagentStatusTextToneClassName(statusKind))}
           title={statusCopy}
         >
           {statusCopy}
@@ -269,10 +255,7 @@ export function ThreadHoverCardContent({
 
       {prTitle && prState && prPresentation && PrIcon ? (
         <div className={META_ROW_CLASS_NAME}>
-          <PrIcon
-            aria-hidden
-            className={cn("size-3.5 shrink-0", prPresentation.colorClass)}
-          />
+          <PrIcon aria-hidden className={cn("size-3.5 shrink-0", prPresentation.colorClass)} />
           <span className="sr-only">{prPresentation.label}: </span>
           <span className="min-w-0 truncate" title={prTitle}>
             {prTitle}
