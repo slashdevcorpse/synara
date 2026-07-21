@@ -74,7 +74,6 @@ import { CSS } from "@dnd-kit/utilities";
 import {
   type AutomationDefinition,
   type AutomationListResult,
-  MAX_PINNED_PROJECTS,
   type DesktopUpdateState,
   type OrchestrationShellSnapshot,
   PROVIDER_DISPLAY_NAMES,
@@ -279,7 +278,6 @@ import {
   getVisibleSidebarEntriesForPreview,
   groupSidebarThreadsByProjectId,
   partitionSidebarThreadsByProjectIds,
-  isLatestPinnedProjectMutation,
   pruneProjectThreadListPagingForCollapsedProjects,
   recoverExistingAddProjectTarget,
   resolvePullRequestReviewBadge,
@@ -298,7 +296,6 @@ import {
   type SidebarActionBadge,
   type SidebarView,
   shouldShowDebugFeatureFlagsMenu,
-  shouldPrunePinnedThreads,
   shouldClearThreadSelectionOnMouseDown,
   sortProjectsForSidebar,
   sortThreadsForSidebar,
@@ -344,8 +341,7 @@ import {
   useSidebarProjectRunController,
 } from "../hooks/useSidebarProjectRunController";
 import { useSidebarThreadActions } from "../hooks/useSidebarThreadActions";
-import { usePinnedProjectsStore } from "../pinnedProjectsStore";
-import { reconcileOptimisticPinState } from "../pinning.logic";
+import { useProjectPinController } from "../hooks/useProjectPinController";
 import { useThreadDetailPrewarm } from "../threadDetailPrewarm";
 import { retainThreadDetailSubscription } from "../threadDetailSubscriptionRetention";
 import { useWorkspaceStore, workspaceThreadId } from "../workspaceStore";
@@ -1235,10 +1231,6 @@ export default function Sidebar() {
   const clearProjectDraftThreads = useComposerDraftStore((store) => store.clearProjectDraftThreads);
   const draftThreadsByThreadId = useComposerDraftStore((store) => store.draftThreadsByThreadId);
   const temporaryThreadIds = useTemporaryThreadStore((store) => store.temporaryThreadIds);
-  const persistedPinnedProjectIds = usePinnedProjectsStore((store) => store.pinnedProjectIds);
-  const pinProjectLocally = usePinnedProjectsStore((store) => store.pinProject);
-  const unpinProject = usePinnedProjectsStore((store) => store.unpinProject);
-  const prunePinnedProjects = usePinnedProjectsStore((store) => store.prunePinnedProjects);
   const workspacePages = useWorkspaceStore((store) => store.workspacePages);
   const createWorkspace = useWorkspaceStore((store) => store.createWorkspace);
   const renameWorkspace = useWorkspaceStore((store) => store.renameWorkspace);
@@ -1247,6 +1239,18 @@ export default function Sidebar() {
   const homeDir = useWorkspaceStore((store) => store.homeDir);
   const chatWorkspaceRoot = useWorkspaceStore((store) => store.chatWorkspaceRoot);
   const studioWorkspaceRoot = useWorkspaceStore((store) => store.studioWorkspaceRoot);
+  const projectPinRows = useMemo(
+    () => projects.filter((project) => project.kind === "project"),
+    [projects],
+  );
+  const {
+    optimisticPinnedStateByProjectId,
+    pinnedProjectIds: persistedPinnedProjectIds,
+    toggleProjectPinned,
+  } = useProjectPinController({
+    projects: projectPinRows,
+    shouldReconcile: threadsHydrated,
+  });
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const pathname = useLocation({ select: (loc) => loc.pathname });
@@ -1458,15 +1462,10 @@ export default function Sidebar() {
   } | null>(null);
   const dragInProgressRef = useRef(false);
   const suppressProjectClickAfterDragRef = useRef(false);
-  const optimisticPinnedStateByProjectIdRef = useRef(new Map<ProjectId, boolean>());
-  const latestPinnedMutationVersionByProjectIdRef = useRef(new Map<ProjectId, number>());
   const [desktopUpdateState, setDesktopUpdateState] = useState<DesktopUpdateState | null>(null);
   const [renamingWorkspaceId, setRenamingWorkspaceId] = useState<string | null>(null);
   const [renamingWorkspaceTitle, setRenamingWorkspaceTitle] = useState("");
   const [installingDesktopUpdate, setInstallingDesktopUpdate] = useState(false);
-  const [optimisticPinnedStateByProjectId, setOptimisticPinnedStateByProjectId] = useState<
-    ReadonlyMap<ProjectId, boolean>
-  >(() => new Map());
   // Dedupes the manual-download fallback toast so a single failure surfaced by
   // both the click handler and the install-watchdog push only notifies once.
   const lastDesktopUpdateErrorToastSignatureRef = useRef<string | null>(null);
@@ -1705,145 +1704,6 @@ export default function Sidebar() {
   useEffect(() => {
     projectByIdRef.current = projectById;
   }, [projectById]);
-  const setOptimisticProjectPinned = useCallback((projectId: ProjectId, isPinned: boolean) => {
-    optimisticPinnedStateByProjectIdRef.current.set(projectId, isPinned);
-    setOptimisticPinnedStateByProjectId((current) => {
-      if (current.get(projectId) === isPinned) {
-        return current;
-      }
-      const next = new Map(current);
-      next.set(projectId, isPinned);
-      return next;
-    });
-  }, []);
-  const clearOptimisticProjectPinned = useCallback((projectId: ProjectId) => {
-    optimisticPinnedStateByProjectIdRef.current.delete(projectId);
-    setOptimisticPinnedStateByProjectId((current) => {
-      if (!current.has(projectId)) {
-        return current;
-      }
-      const next = new Map(current);
-      next.delete(projectId);
-      return next;
-    });
-  }, []);
-  const dispatchProjectPinnedState = useCallback(
-    async (projectId: ProjectId, isPinned: boolean) => {
-      const api = readNativeApi();
-      if (!api) return;
-      await api.orchestration.dispatchCommand({
-        type: "project.meta.update",
-        commandId: newCommandId(),
-        projectId,
-        isPinned,
-      });
-    },
-    [],
-  );
-  const setProjectPinned = useCallback(
-    async (projectId: ProjectId, isPinned: boolean) => {
-      const api = readNativeApi();
-      if (!api) return;
-      const project = projectByIdRef.current.get(projectId);
-      if (!project || project.kind !== "project") {
-        return;
-      }
-      const requestVersion =
-        (latestPinnedMutationVersionByProjectIdRef.current.get(projectId) ?? 0) + 1;
-      latestPinnedMutationVersionByProjectIdRef.current.set(projectId, requestVersion);
-
-      setOptimisticProjectPinned(projectId, isPinned);
-      if (isPinned) {
-        const accepted = pinProjectLocally(projectId);
-        if (!accepted) {
-          clearOptimisticProjectPinned(projectId);
-          toastManager.add({
-            type: "warning",
-            title: "Project pin limit reached",
-            description: `You can pin up to ${MAX_PINNED_PROJECTS} projects.`,
-          });
-          return;
-        }
-      } else {
-        unpinProject(projectId);
-      }
-
-      try {
-        await dispatchProjectPinnedState(projectId, isPinned);
-      } catch (error) {
-        if (
-          !isLatestPinnedProjectMutation({
-            projectId,
-            requestVersion,
-            latestMutationVersionByProjectId: latestPinnedMutationVersionByProjectIdRef.current,
-          })
-        ) {
-          return;
-        }
-
-        const confirmedPinned = projectByIdRef.current.get(projectId)?.isPinned === true;
-        if (confirmedPinned) {
-          pinProjectLocally(projectId);
-        } else {
-          unpinProject(projectId);
-        }
-        clearOptimisticProjectPinned(projectId);
-        throw error;
-      }
-    },
-    [
-      clearOptimisticProjectPinned,
-      dispatchProjectPinnedState,
-      pinProjectLocally,
-      setOptimisticProjectPinned,
-      unpinProject,
-    ],
-  );
-  const toggleProjectPinned = useCallback(
-    (projectId: ProjectId) => {
-      const optimisticPinned = optimisticPinnedStateByProjectIdRef.current.get(projectId);
-      const locallyPinned = usePinnedProjectsStore.getState().pinnedProjectIds.includes(projectId);
-      const serverPinned = projectByIdRef.current.get(projectId)?.isPinned === true;
-      const isPinned = optimisticPinned ?? (locallyPinned || serverPinned);
-      void setProjectPinned(projectId, !isPinned).catch((error) => {
-        console.error("Failed to update pinned project state", {
-          projectId,
-          error,
-        });
-        toastManager.add({
-          type: "error",
-          title: isPinned ? "Unable to unpin project" : "Unable to pin project",
-          description: error instanceof Error ? error.message : undefined,
-        });
-      });
-    },
-    [setProjectPinned],
-  );
-  useEffect(() => {
-    if (optimisticPinnedStateByProjectId.size === 0) {
-      return;
-    }
-
-    const serverPinnedStateByProjectId = new Map(
-      projects.map((project) => [project.id, project.isPinned === true] as const),
-    );
-    // Reconciliation drops optimistic entries the server has confirmed while syncing
-    // the mirror ref. Deferring the setState off render (async is allowed) leaves the
-    // derived pinned lists unchanged, since a confirmed entry is redundant either way.
-    const settle = window.setTimeout(() => {
-      setOptimisticPinnedStateByProjectId((current) => {
-        const reconciled = reconcileOptimisticPinState({
-          optimisticPinnedStateById: current,
-          serverPinnedStateById: serverPinnedStateByProjectId,
-        });
-        for (const projectId of reconciled.settledIds) {
-          optimisticPinnedStateByProjectIdRef.current.delete(projectId);
-        }
-        return reconciled.optimisticPinnedStateById;
-      });
-    }, 0);
-    return () => window.clearTimeout(settle);
-  }, [optimisticPinnedStateByProjectId, projects]);
   const workspaceRows = useMemo(
     () =>
       workspacePages.map((workspace) => {
@@ -3684,13 +3544,6 @@ export default function Sidebar() {
     }, 0);
     return () => window.clearTimeout(settle);
   }, [standardProjects]);
-
-  useEffect(() => {
-    if (!shouldPrunePinnedThreads({ threadsHydrated })) {
-      return;
-    }
-    prunePinnedProjects(standardProjectsBase.map((project) => project.id));
-  }, [prunePinnedProjects, standardProjectsBase, threadsHydrated]);
 
   useEffect(() => {
     const retainedThreadIds = new Set(sidebarThreads.map((thread) => thread.id));

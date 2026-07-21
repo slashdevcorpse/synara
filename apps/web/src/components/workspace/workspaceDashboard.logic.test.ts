@@ -464,9 +464,23 @@ describe("clone validation", () => {
     expect(githubRepositoryFromUrl("git@github.com:acme/synara.git")).toBe("acme/synara");
     expect(githubRepositoryFromUrl("ssh://git@github.com/acme/synara.git")).toBe("acme/synara");
     expect(githubRepositoryFromUrl("ssh://git@github.com:22/acme/synara.git")).toBe("acme/synara");
+    expect(githubRepositoryFromUrl("\nhttps://github.com/acme/synara.git\r")).toBe("acme/synara");
     expect(githubRepositoryFromUrl("ssh://git@github.com:2222/acme/synara.git")).toBeNull();
     expect(githubRepositoryFromUrl("https://token@github.com/acme/synara.git")).toBeNull();
     expect(githubRepositoryFromUrl("https://gitlab.com/acme/synara.git")).toBeNull();
+  });
+
+  it("rejects embedded whitespace and controls before URL normalization", () => {
+    for (const invalid of [
+      "https://github.com/acme/\tsynara.git",
+      "https://git\nhub.com/acme/synara.git",
+      "ht\rtps://github.com/acme/synara.git",
+      "https://github.com/acme/\u0000synara.git",
+      "git@github.com:acme/\tsynara.git",
+    ]) {
+      expect(githubRepositoryFromUrl(invalid)).toBeNull();
+      expect(validateCloneInput({ url: invalid, targetPath: "/tmp/synara" }).url).toMatch(/valid/);
+    }
   });
 
   it("requires an absolute destination and derives a platform-shaped default", () => {

@@ -482,7 +482,41 @@ describe("store projection", () => {
       remoteName: "Server Name",
       localName: "Local Name",
       cwd: "/tmp/shared-root",
+      serverSequence: 2,
     });
+  });
+
+  it("preserves the project pin value and sequence when a stale shell upsert arrives", () => {
+    const projectId = ProjectId.makeUnsafe("project-sequenced-pin");
+    const currentProject = makeProject({
+      id: projectId,
+      cwd: "/tmp/project-sequenced-pin",
+      isPinned: true,
+      serverSequence: 12,
+    });
+    const initialState: AppState = {
+      projects: [currentProject],
+      sidebarThreadSummaryById: {},
+      threadsHydrated: true,
+    };
+
+    const next = applyShellEvent(initialState, {
+      kind: "project-upserted",
+      sequence: 11,
+      project: {
+        id: projectId,
+        title: "Stale project",
+        workspaceRoot: "/tmp/project-sequenced-pin",
+        defaultModelSelection: null,
+        scripts: [],
+        isPinned: false,
+        createdAt: "2026-02-27T00:00:00.000Z",
+        updatedAt: "2026-02-27T00:01:00.000Z",
+      },
+    } satisfies OrchestrationShellStreamEvent);
+
+    expect(next.projects[0]).toBe(currentProject);
+    expect(next.projects[0]).toMatchObject({ isPinned: true, serverSequence: 12 });
   });
 
   it("drops descendant thread state when a shell project removal arrives", () => {

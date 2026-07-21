@@ -13,6 +13,7 @@ import {
 import { Effect, Layer, Option, Schema } from "effect";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import * as SqlSchema from "effect/unstable/sql/SqlSchema";
+import type { Fragment } from "effect/unstable/sql/Statement";
 
 import {
   toPersistenceDecodeCauseError,
@@ -145,6 +146,27 @@ function toRun(row: AutomationRunDbRow) {
 
 const makeAutomationRepository = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
+
+  const activeProjectProjection = (projectId: Fragment) => sql`
+    EXISTS (
+      SELECT 1
+      FROM projection_projects projects
+      WHERE projects.project_id = ${projectId}
+        AND projects.deleted_at IS NULL
+        AND projects.archived_at IS NULL
+    )
+  `;
+
+  const missingOrActiveProjectProjection = (projectId: Fragment) => sql`
+    (
+      NOT EXISTS (
+        SELECT 1
+        FROM projection_projects projects
+        WHERE projects.project_id = ${projectId}
+      )
+      OR ${activeProjectProjection(projectId)}
+    )
+  `;
 
   const insertDefinition = SqlSchema.void({
     Request: AutomationDefinitionDbRow,
@@ -341,20 +363,7 @@ const makeAutomationRepository = Effect.gen(function* () {
         FROM automation_definitions definitions
         WHERE (${projectId ?? null} IS NULL OR definitions.project_id = ${projectId ?? null})
           AND (${includeArchived ? 1 : 0} = 1 OR definitions.archived_at IS NULL)
-          AND (
-            NOT EXISTS (
-              SELECT 1
-              FROM projection_projects projects
-              WHERE projects.project_id = definitions.project_id
-            )
-            OR EXISTS (
-              SELECT 1
-              FROM projection_projects projects
-              WHERE projects.project_id = definitions.project_id
-                AND projects.deleted_at IS NULL
-                AND projects.archived_at IS NULL
-            )
-          )
+          AND ${missingOrActiveProjectProjection(sql`definitions.project_id`)}
         ORDER BY definitions.updated_at DESC, definitions.automation_id ASC
       `,
   });
@@ -402,13 +411,7 @@ const makeAutomationRepository = Effect.gen(function* () {
         FROM automation_definitions definitions
         WHERE definitions.enabled = 1
           AND definitions.archived_at IS NULL
-          AND EXISTS (
-            SELECT 1
-            FROM projection_projects projects
-            WHERE projects.project_id = definitions.project_id
-              AND projects.deleted_at IS NULL
-              AND projects.archived_at IS NULL
-          )
+          AND ${activeProjectProjection(sql`definitions.project_id`)}
           AND definitions.next_run_at IS NOT NULL
           AND definitions.next_run_at <= ${now}
           AND NOT (
@@ -499,20 +502,7 @@ const makeAutomationRepository = Effect.gen(function* () {
           ${run.permissionSnapshot},
           ${run.createdAt},
           ${run.updatedAt}
-        WHERE (
-          NOT EXISTS (
-            SELECT 1
-            FROM projection_projects
-            WHERE project_id = ${run.projectId}
-          )
-          OR EXISTS (
-            SELECT 1
-            FROM projection_projects
-            WHERE project_id = ${run.projectId}
-              AND deleted_at IS NULL
-              AND archived_at IS NULL
-          )
-        )
+        WHERE ${missingOrActiveProjectProjection(sql`${run.projectId}`)}
           AND (
             ${run.threadId} IS NULL
             OR NOT EXISTS (
@@ -534,18 +524,7 @@ const makeAutomationRepository = Effect.gen(function* () {
     execute: ({ projectId }) =>
       sql`
         SELECT ${projectId} AS "projectId"
-        WHERE NOT EXISTS (
-          SELECT 1
-          FROM projection_projects
-          WHERE project_id = ${projectId}
-        )
-          OR EXISTS (
-            SELECT 1
-            FROM projection_projects
-            WHERE project_id = ${projectId}
-              AND deleted_at IS NULL
-              AND archived_at IS NULL
-          )
+        WHERE ${missingOrActiveProjectProjection(sql`${projectId}`)}
       `,
   });
 
@@ -653,20 +632,7 @@ const makeAutomationRepository = Effect.gen(function* () {
           ON definitions.automation_id = runs.automation_id
         WHERE (${projectId ?? null} IS NULL OR runs.project_id = ${projectId ?? null})
           AND (${includeArchived ? 1 : 0} = 1 OR definitions.archived_at IS NULL)
-          AND (
-            NOT EXISTS (
-              SELECT 1
-              FROM projection_projects projects
-              WHERE projects.project_id = runs.project_id
-            )
-            OR EXISTS (
-              SELECT 1
-              FROM projection_projects projects
-              WHERE projects.project_id = runs.project_id
-                AND projects.deleted_at IS NULL
-                AND projects.archived_at IS NULL
-            )
-          )
+          AND ${missingOrActiveProjectProjection(sql`runs.project_id`)}
         ORDER BY runs.scheduled_for DESC, runs.run_id DESC
         LIMIT ${MAX_RUN_LIST_ROWS}
       `,
@@ -903,20 +869,7 @@ const makeAutomationRepository = Effect.gen(function* () {
           updated_at AS "updatedAt"
         FROM automation_runs runs
         WHERE runs.status IN ('pending', 'claimed', 'running', 'waiting-for-approval')
-          AND (
-            NOT EXISTS (
-              SELECT 1
-              FROM projection_projects projects
-              WHERE projects.project_id = runs.project_id
-            )
-            OR EXISTS (
-              SELECT 1
-              FROM projection_projects projects
-              WHERE projects.project_id = runs.project_id
-                AND projects.deleted_at IS NULL
-                AND projects.archived_at IS NULL
-            )
-          )
+          AND ${missingOrActiveProjectProjection(sql`runs.project_id`)}
           AND (
             ${afterCreatedAt ?? null} IS NULL
             OR runs.created_at > ${afterCreatedAt ?? null}
@@ -957,20 +910,7 @@ const makeAutomationRepository = Effect.gen(function* () {
         FROM automation_runs runs
         INNER JOIN automation_pending_completion_evaluations pending
           ON pending.run_id = runs.run_id
-        WHERE (
-          NOT EXISTS (
-            SELECT 1
-            FROM projection_projects projects
-            WHERE projects.project_id = runs.project_id
-          )
-          OR EXISTS (
-            SELECT 1
-            FROM projection_projects projects
-            WHERE projects.project_id = runs.project_id
-              AND projects.deleted_at IS NULL
-              AND projects.archived_at IS NULL
-          )
-        )
+        WHERE ${missingOrActiveProjectProjection(sql`runs.project_id`)}
         ORDER BY pending.finished_at ASC, pending.run_id ASC
         LIMIT ${limit}
       `,
@@ -1055,13 +995,7 @@ const makeAutomationRepository = Effect.gen(function* () {
         WHERE definitions.enabled = 1
           AND definitions.archived_at IS NULL
           AND definitions.next_run_at IS NOT NULL
-          AND EXISTS (
-            SELECT 1
-            FROM projection_projects projects
-            WHERE projects.project_id = definitions.project_id
-              AND projects.deleted_at IS NULL
-              AND projects.archived_at IS NULL
-          )
+          AND ${activeProjectProjection(sql`definitions.project_id`)}
           AND NOT (
             definitions.mode = 'heartbeat'
             AND definitions.target_thread_id IS NOT NULL
@@ -1276,7 +1210,7 @@ const makeAutomationRepository = Effect.gen(function* () {
     }).pipe(Effect.mapError(toPersistenceSqlError("AutomationRepository.list:query")));
   };
 
-  const createRun: AutomationRepositoryShape["createRun"] = (input) => {
+  const createRunInCurrentTransaction: AutomationRepositoryShape["createRun"] = (input) => {
     const run: AutomationRun = {
       id: input.id,
       automationId: input.automationId,
@@ -1365,12 +1299,21 @@ const makeAutomationRepository = Effect.gen(function* () {
     );
   };
 
+  const createRun: AutomationRepositoryShape["createRun"] = (input) =>
+    sql
+      .withTransaction(createRunInCurrentTransaction(input))
+      .pipe(
+        Effect.catchTag("SqlError", (error) =>
+          Effect.fail(toPersistenceSqlError("AutomationRepository.createRun:transaction")(error)),
+        ),
+      );
+
   const createRunAndIncrementDefinition: AutomationRepositoryShape["createRunAndIncrementDefinition"] =
     (input, scheduleAdvance) =>
       sql
         .withTransaction(
           Effect.gen(function* () {
-            const run = yield* createRun(input);
+            const run = yield* createRunInCurrentTransaction(input);
             const inserted = run.id === input.id;
             if (inserted) {
               const updated = yield* incrementIterationIfRunnableRow({

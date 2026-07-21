@@ -400,6 +400,7 @@ export function orderWorkspaceCardsPinnedFirst(
 
 export function githubRepositoryFromUrl(value: string): string | null {
   const trimmed = value.trim();
+  if (!trimmed || /[\u0000-\u001f\u007f\s]/.test(trimmed)) return null;
   const sshMatch = /^git@github\.com:([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+?)(?:\.git)?$/.exec(trimmed);
   if (sshMatch) return sshMatch[1] ?? null;
 

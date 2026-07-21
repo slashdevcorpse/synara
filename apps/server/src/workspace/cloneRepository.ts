@@ -273,17 +273,20 @@ export async function validateWorkspaceCloneTarget(input: {
   };
 }
 
-interface OwnedCloneDirectory {
-  readonly path: string;
-  readonly dev: number | bigint;
-  readonly ino: number | bigint;
+interface CloneTargetDirectoryFileSystem {
+  readonly mkdir: (path: string) => Promise<void>;
 }
 
-async function createOwnedCloneDirectory(
+const DEFAULT_CLONE_TARGET_DIRECTORY_FILE_SYSTEM: CloneTargetDirectoryFileSystem = {
+  mkdir: (path) => NodeFs.mkdir(path),
+};
+
+async function createCloneTargetDirectory(
   target: ValidatedWorkspaceCloneTarget,
-): Promise<OwnedCloneDirectory> {
+  fileSystem: CloneTargetDirectoryFileSystem,
+): Promise<string> {
   try {
-    await NodeFs.mkdir(target.targetPath);
+    await fileSystem.mkdir(target.targetPath);
   } catch (cause) {
     if ((cause as NodeJS.ErrnoException).code === "EEXIST") {
       throw new WorkspaceCloneValidationError(
@@ -293,23 +296,7 @@ async function createOwnedCloneDirectory(
     }
     throw cause;
   }
-  const stat = await NodeFs.lstat(target.targetPath);
-  return { path: target.targetPath, dev: stat.dev, ino: stat.ino };
-}
-
-export async function removeOwnedCloneDirectory(owned: OwnedCloneDirectory | null): Promise<void> {
-  if (!owned) return;
-  const stat = await NodeFs.lstat(owned.path).catch(() => null);
-  if (
-    !stat ||
-    stat.isSymbolicLink() ||
-    !stat.isDirectory() ||
-    stat.dev !== owned.dev ||
-    stat.ino !== owned.ino
-  ) {
-    return;
-  }
-  await NodeFs.rm(owned.path, { recursive: true, force: false });
+  return target.targetPath;
 }
 
 function redactError(cause: unknown, url: string): string {
@@ -345,6 +332,11 @@ export function makeWorkspaceCloneJobs(input: {
   readonly homeDir: string;
   readonly createProject?: WorkspaceProjectCreator;
   readonly startBackground?: (effect: Effect.Effect<void>) => Effect.Effect<void>;
+  readonly targetDirectoryFileSystem?: CloneTargetDirectoryFileSystem;
+  readonly beforeTerminalPublish?: (input: {
+    readonly cloneId: WorkspaceCloneId;
+    readonly result: WorkspaceCloneRepositoryResult;
+  }) => Effect.Effect<void>;
 }): WorkspaceCloneJobsShape {
   const jobs = new Map<WorkspaceCloneId, WorkspaceCloneJobSnapshot>();
   const activeTargets = new Map<string, WorkspaceCloneId>();
@@ -362,6 +354,9 @@ export function makeWorkspaceCloneJobs(input: {
       Effect.sync(() => {
         Effect.runFork(effect);
       }));
+  const targetDirectoryFileSystem =
+    input.targetDirectoryFileSystem ?? DEFAULT_CLONE_TARGET_DIRECTORY_FILE_SYSTEM;
+  const beforeTerminalPublish = input.beforeTerminalPublish ?? (() => Effect.void);
 
   const retain = (snapshot: WorkspaceCloneJobSnapshot) => {
     jobs.delete(snapshot.cloneId);
@@ -448,41 +443,63 @@ export function makeWorkspaceCloneJobs(input: {
         awaitEnd: Effect.promise(() => subscriberEnded),
       };
       let target: ValidatedWorkspaceCloneTarget | null = null;
-      let ownedDirectory: OwnedCloneDirectory | null = null;
+      let createdTargetPath: string | null = null;
       let clonedPath: string | null = null;
+      let projectCreationStarted = false;
+      let terminalOutcome: {
+        readonly result: WorkspaceCloneRepositoryResult;
+        readonly snapshot: WorkspaceCloneJobSnapshot;
+      } | null = null;
       let latestPercent = 0;
 
-      const finish = (result: WorkspaceCloneRepositoryResult) => {
-        const terminal = snapshot(request.cloneId, {
-          status: result.failure ? "failed" : "succeeded",
-          stage: "complete",
-          percent: result.failure?.stage === "clone" ? latestPercent : 100,
-          message: result.failure?.message ?? "Clone complete.",
-          result,
-        });
-        return publish(
-          request.cloneId,
-          { _tag: "clone_finished", snapshot: terminal, result },
-          true,
-        );
-      };
-      const cloneFailure = (code: string, cause: unknown, retryable: boolean) =>
-        Effect.tryPromise(() => removeOwnedCloneDirectory(ownedDirectory)).pipe(
-          Effect.ignore,
-          Effect.andThen(
-            finish({
+      const finish = (requestedResult: WorkspaceCloneRepositoryResult) =>
+        Effect.uninterruptible(
+          Effect.gen(function* () {
+            const outcome = yield* Effect.sync(() => {
+              if (terminalOutcome) return terminalOutcome;
+              const terminal = snapshot(request.cloneId, {
+                status: requestedResult.failure ? "failed" : "succeeded",
+                stage: "complete",
+                percent: requestedResult.failure?.stage === "clone" ? latestPercent : 100,
+                message: requestedResult.failure?.message ?? "Clone complete.",
+                result: requestedResult,
+              });
+              terminalOutcome = { result: requestedResult, snapshot: terminal };
+              return terminalOutcome;
+            });
+            yield* beforeTerminalPublish({
               cloneId: request.cloneId,
-              clonedPath: null,
-              projectId: null,
-              failure: {
-                stage: "clone",
-                code,
-                message: redactError(cause, request.url),
-                retryable,
-              },
-            }),
-          ),
+              result: outcome.result,
+            });
+            yield* publish(
+              request.cloneId,
+              { _tag: "clone_finished", snapshot: outcome.snapshot, result: outcome.result },
+              true,
+            );
+          }),
         );
+      const cloneFailure = (code: string, cause: unknown, retryable: boolean) => {
+        const retainedTargetPath = createdTargetPath;
+        const failureMessage = redactError(cause, request.url);
+        // Node has no portable descriptor-relative recursive delete. Any
+        // path-based cleanup after Git starts can race with replacement, so
+        // fail closed and leave the exact target entry untouched.
+        return finish({
+          cloneId: request.cloneId,
+          clonedPath: null,
+          projectId: null,
+          failure: {
+            stage: "clone",
+            code,
+            message: retainedTargetPath
+              ? `${failureMessage} Partial clone data may remain at ${retainedTargetPath}. ` +
+                "Synara did not remove it because safe automatic cleanup cannot be guaranteed. " +
+                "Inspect or remove that destination manually before retrying."
+              : failureMessage,
+            retryable: retainedTargetPath ? false : retryable,
+          },
+        });
+      };
 
       if (activeCloneIds.has(request.cloneId) || jobs.has(request.cloneId)) {
         return directTerminal(subscriber, request.cloneId, {
@@ -581,10 +598,18 @@ export function makeWorkspaceCloneJobs(input: {
             ),
           );
         }
-        ownedDirectory = yield* Effect.tryPromise({
-          try: () => createOwnedCloneDirectory(target!),
-          catch: (cause) => cause,
-        });
+        yield* Effect.uninterruptible(
+          Effect.tryPromise({
+            try: () => createCloneTargetDirectory(target!, targetDirectoryFileSystem),
+            catch: (cause) => cause,
+          }).pipe(
+            Effect.tap((path) =>
+              Effect.sync(() => {
+                createdTargetPath = path;
+              }),
+            ),
+          ),
+        );
 
         const started = snapshot(request.cloneId, {
           status: "running",
@@ -595,48 +620,59 @@ export function makeWorkspaceCloneJobs(input: {
         });
         yield* publish(request.cloneId, { _tag: "clone_started", snapshot: started });
 
-        yield* input.git.execute({
-          operation: "WorkspaceCloneJobs.cloneRepository",
-          cwd: target.parentPath,
-          args: [...gitConfigArgs, "clone", "--progress", "--", url, target.targetPath],
-          ...gitEnvironment,
-          stdin: "ignore",
-          timeoutMs: CLONE_TIMEOUT_MS,
-          maxOutputBytes: CLONE_MAX_OUTPUT_BYTES,
-          progress: {
-            onStderrLine: (line) => {
-              const parsed = parseGitCloneProgressFrame(line);
-              if (!parsed) return Effect.void;
-              latestPercent = Math.max(latestPercent, parsed.percent);
-              const progressSnapshot = snapshot(request.cloneId, {
-                status: "running",
-                stage: "cloning",
-                percent: latestPercent,
-                message: parsed.message,
-                result: null,
-              });
-              return publish(request.cloneId, {
-                _tag: "clone_progress",
-                snapshot: progressSnapshot,
-                phase: parsed.phase,
-                completed: parsed.completed,
-                total: parsed.total,
-              });
-            },
-          },
-        });
-        clonedPath = target.targetPath;
-        ownedDirectory = null;
+        const completedClonePath = target.targetPath;
+        const shouldCreateProject = yield* Effect.uninterruptibleMask((restore) =>
+          Effect.gen(function* () {
+            yield* restore(
+              input.git.execute({
+                operation: "WorkspaceCloneJobs.cloneRepository",
+                cwd: target!.parentPath,
+                args: [...gitConfigArgs, "clone", "--progress", "--", url, completedClonePath],
+                ...gitEnvironment,
+                stdin: "ignore",
+                timeoutMs: CLONE_TIMEOUT_MS,
+                maxOutputBytes: CLONE_MAX_OUTPUT_BYTES,
+                progress: {
+                  onStderrLine: (line) => {
+                    const parsed = parseGitCloneProgressFrame(line);
+                    if (!parsed) return Effect.void;
+                    latestPercent = Math.max(latestPercent, parsed.percent);
+                    const progressSnapshot = snapshot(request.cloneId, {
+                      status: "running",
+                      stage: "cloning",
+                      percent: latestPercent,
+                      message: parsed.message,
+                      result: null,
+                    });
+                    return publish(request.cloneId, {
+                      _tag: "clone_progress",
+                      snapshot: progressSnapshot,
+                      phase: parsed.phase,
+                      completed: parsed.completed,
+                      total: parsed.total,
+                    });
+                  },
+                },
+              }),
+            );
+            clonedPath = completedClonePath;
+            createdTargetPath = null;
 
-        if (!request.createProject) {
-          yield* finish({
-            cloneId: request.cloneId,
-            clonedPath,
-            projectId: null,
-            failure: null,
-          });
-          return;
-        }
+            if (!request.createProject) {
+              yield* finish({
+                cloneId: request.cloneId,
+                clonedPath: completedClonePath,
+                projectId: null,
+                failure: null,
+              });
+              return false;
+            }
+
+            projectCreationStarted = true;
+            return true;
+          }),
+        );
+        if (!shouldCreateProject) return;
 
         const projectSnapshot = snapshot(request.cloneId, {
           status: "running",
@@ -652,31 +688,37 @@ export function makeWorkspaceCloneJobs(input: {
           completed: null,
           total: null,
         });
-        const projectResult = yield* Effect.result(
-          createProject
-            ? createProject(clonedPath)
-            : Effect.fail(new Error("Workspace project creation is unavailable.")),
+        yield* Effect.uninterruptibleMask((restore) =>
+          Effect.gen(function* () {
+            const projectResult = yield* restore(
+              Effect.result(
+                createProject
+                  ? createProject(completedClonePath)
+                  : Effect.fail(new Error("Workspace project creation is unavailable.")),
+              ),
+            );
+            yield* finish(
+              projectResult._tag === "Failure"
+                ? {
+                    cloneId: request.cloneId,
+                    clonedPath: completedClonePath,
+                    projectId: null,
+                    failure: {
+                      stage: "project",
+                      code: "WORKSPACE_CLONE_PROJECT_CREATE_FAILED",
+                      message: describeError(projectResult.failure),
+                      retryable: true,
+                    },
+                  }
+                : {
+                    cloneId: request.cloneId,
+                    clonedPath: completedClonePath,
+                    projectId: projectResult.success,
+                    failure: null,
+                  },
+            );
+          }),
         );
-        if (projectResult._tag === "Failure") {
-          yield* finish({
-            cloneId: request.cloneId,
-            clonedPath,
-            projectId: null,
-            failure: {
-              stage: "project",
-              code: "WORKSPACE_CLONE_PROJECT_CREATE_FAILED",
-              message: describeError(projectResult.failure),
-              retryable: true,
-            },
-          });
-          return;
-        }
-        yield* finish({
-          cloneId: request.cloneId,
-          clonedPath,
-          projectId: projectResult.success,
-          failure: null,
-        });
       }).pipe(
         Effect.catch((cause) =>
           cloneFailure(
@@ -685,13 +727,28 @@ export function makeWorkspaceCloneJobs(input: {
             !(cause instanceof WorkspaceCloneValidationError),
           ),
         ),
-        Effect.onInterrupt(() =>
-          cloneFailure(
+        Effect.onInterrupt(() => {
+          if (terminalOutcome) return Effect.void;
+          const interruptedClonedPath = clonedPath;
+          if (projectCreationStarted && interruptedClonedPath) {
+            return finish({
+              cloneId: request.cloneId,
+              clonedPath: interruptedClonedPath,
+              projectId: null,
+              failure: {
+                stage: "project",
+                code: "WORKSPACE_CLONE_PROJECT_CREATE_CANCELLED",
+                message: "Project creation was cancelled because the server stopped.",
+                retryable: true,
+              },
+            });
+          }
+          return cloneFailure(
             "WORKSPACE_CLONE_CANCELLED",
             new Error("Clone cancelled because the server stopped."),
             true,
-          ),
-        ),
+          );
+        }),
         Effect.ensuring(
           Effect.sync(() => {
             activeCloneIds.delete(request.cloneId);
@@ -751,6 +808,33 @@ export function makeWorkspaceCloneJobs(input: {
       }
       activeProjectRetries.add(cloneId);
       addSubscriber(cloneId, subscriber);
+      let terminalOutcome: {
+        readonly result: WorkspaceCloneRepositoryResult;
+        readonly snapshot: WorkspaceCloneJobSnapshot;
+      } | null = null;
+      const finishRetry = (requestedResult: WorkspaceCloneRepositoryResult) =>
+        Effect.uninterruptible(
+          Effect.gen(function* () {
+            const outcome = yield* Effect.sync(() => {
+              if (terminalOutcome) return terminalOutcome;
+              const terminal = snapshot(cloneId, {
+                status: requestedResult.failure ? "failed" : "succeeded",
+                stage: "complete",
+                percent: 100,
+                message: requestedResult.failure?.message ?? "Project created.",
+                result: requestedResult,
+              });
+              terminalOutcome = { result: requestedResult, snapshot: terminal };
+              return terminalOutcome;
+            });
+            yield* beforeTerminalPublish({ cloneId, result: outcome.result });
+            yield* publish(
+              cloneId,
+              { _tag: "clone_finished", snapshot: outcome.snapshot, result: outcome.result },
+              true,
+            );
+          }),
+        );
 
       const program = Effect.gen(function* () {
         const progress = snapshot(cloneId, {
@@ -761,53 +845,38 @@ export function makeWorkspaceCloneJobs(input: {
           result: null,
         });
         yield* publish(cloneId, { _tag: "clone_started", snapshot: progress });
-        const created = yield* Effect.result(
-          createProject
-            ? createProject(clonedPath)
-            : Effect.fail(new Error("Workspace project creation is unavailable.")),
-        );
-        const result: WorkspaceCloneRepositoryResult =
-          created._tag === "Success"
-            ? { cloneId, clonedPath, projectId: created.success, failure: null }
-            : {
-                cloneId,
-                clonedPath,
-                projectId: null,
-                failure: {
-                  stage: "project",
-                  code: "WORKSPACE_CLONE_PROJECT_CREATE_FAILED",
-                  message: describeError(created.failure),
-                  retryable: true,
-                },
-              };
-        const terminal = snapshot(cloneId, {
-          status: result.failure ? "failed" : "succeeded",
-          stage: "complete",
-          percent: 100,
-          message: result.failure?.message ?? "Project created.",
-          result,
-        });
-        yield* publish(cloneId, { _tag: "clone_finished", snapshot: terminal, result }, true);
-      }).pipe(
-        Effect.onInterrupt(() =>
+        yield* Effect.uninterruptibleMask((restore) =>
           Effect.gen(function* () {
-            const restored = current.result;
-            if (restored) {
-              const terminal = snapshot(cloneId, {
-                status: "failed",
-                stage: "complete",
-                percent: 100,
-                message: restored.failure?.message ?? "Project creation retry cancelled.",
-                result: restored,
-              });
-              yield* publish(
-                cloneId,
-                { _tag: "clone_finished", snapshot: terminal, result: restored },
-                true,
-              );
-            }
+            const created = yield* restore(
+              Effect.result(
+                createProject
+                  ? createProject(clonedPath)
+                  : Effect.fail(new Error("Workspace project creation is unavailable.")),
+              ),
+            );
+            yield* finishRetry(
+              created._tag === "Success"
+                ? { cloneId, clonedPath, projectId: created.success, failure: null }
+                : {
+                    cloneId,
+                    clonedPath,
+                    projectId: null,
+                    failure: {
+                      stage: "project",
+                      code: "WORKSPACE_CLONE_PROJECT_CREATE_FAILED",
+                      message: describeError(created.failure),
+                      retryable: true,
+                    },
+                  },
+            );
           }),
-        ),
+        );
+      }).pipe(
+        Effect.onInterrupt(() => {
+          if (terminalOutcome) return Effect.void;
+          const restored = current.result;
+          return restored ? finishRetry(restored) : Effect.void;
+        }),
         Effect.ensuring(Effect.sync(() => activeProjectRetries.delete(cloneId))),
       );
       return Effect.uninterruptible(startBackground(program)).pipe(

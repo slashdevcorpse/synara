@@ -201,6 +201,67 @@ layer("AutomationRepository", (it) => {
     }),
   );
 
+  it.effect("rolls back a run when project admission changes after its insert", () =>
+    Effect.gen(function* () {
+      const repository = yield* AutomationRepository;
+      const sql = yield* SqlClient.SqlClient;
+      yield* runMigrations();
+      const projectId = ProjectId.makeUnsafe("project-run-admission-rollback");
+      const automationId = AutomationId.makeUnsafe("automation-run-admission-rollback");
+      const runId = AutomationRunId.makeUnsafe("run-admission-rollback");
+
+      yield* upsertActiveProjectProjection(projectId);
+      yield* repository.createDefinition({
+        id: automationId,
+        input: createInputForProject(projectId),
+        now: "2026-06-16T10:00:00.000Z",
+      });
+      yield* sql`
+        CREATE TRIGGER archive_project_after_automation_run_insert
+        AFTER INSERT ON automation_runs
+        BEGIN
+          UPDATE projection_projects
+          SET archived_at = '2026-06-16T10:01:00.000Z'
+          WHERE project_id = NEW.project_id;
+        END
+      `;
+
+      const error = yield* repository
+        .createRun({
+          id: runId,
+          automationId,
+          projectId,
+          threadId: null,
+          trigger: { type: "manual" },
+          scheduledFor: "2026-06-16T10:01:00.000Z",
+          permissionSnapshot,
+          now: "2026-06-16T10:01:00.000Z",
+        })
+        .pipe(
+          Effect.flip,
+          Effect.ensuring(
+            sql`DROP TRIGGER IF EXISTS archive_project_after_automation_run_insert`.pipe(
+              Effect.orDie,
+            ),
+          ),
+        );
+      const [runCount] = yield* sql<{ readonly count: number }>`
+        SELECT COUNT(*) AS "count"
+        FROM automation_runs
+        WHERE run_id = ${runId}
+      `;
+      const [project] = yield* sql<{ readonly archivedAt: string | null }>`
+        SELECT archived_at AS "archivedAt"
+        FROM projection_projects
+        WHERE project_id = ${projectId}
+      `;
+
+      assert.match(error.message, /AutomationRepository\.createRun:missingRow/);
+      assert.strictEqual(runCount?.count, 0);
+      assert.strictEqual(project?.archivedAt, null);
+    }),
+  );
+
   it.effect("rejects scheduled dedupe readback after the project is archived", () =>
     Effect.gen(function* () {
       const repository = yield* AutomationRepository;
@@ -316,17 +377,7 @@ layer("AutomationRepository", (it) => {
         const automationId = AutomationId.makeUnsafe("automation-project-visibility");
         const runId = AutomationRunId.makeUnsafe("run-project-visibility");
 
-        yield* sql`
-        INSERT INTO projection_projects (
-          project_id, kind, title, workspace_root,
-          default_model_selection_json, scripts_json, is_pinned,
-          created_at, updated_at, archived_at, deleted_at
-        ) VALUES (
-          ${projectId}, 'project', 'Automation visibility project',
-          '/tmp/project-automation-visibility', NULL, '[]', 0,
-          '2026-06-16T10:00:00.000Z', '2026-06-16T10:00:00.000Z', NULL, NULL
-        )
-      `;
+        yield* upsertActiveProjectProjection(projectId);
         yield* repository.createDefinition({
           id: automationId,
           input: createInputForProject(projectId),

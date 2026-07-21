@@ -765,7 +765,7 @@ export function syncServerShellSnapshot(
   const snapshotProjects = snapshot.projects.filter(
     (project) => deletedProjectIdsById[project.id] !== true,
   );
-  const projects = mapProjects(snapshotProjects, state.projects);
+  const projects = mapProjects(snapshotProjects, state.projects, snapshot.snapshotSequence);
   const nextThreadIds = new Set(snapshotThreads.map((thread) => thread.id));
 
   let normalizedState: AppState = {
@@ -873,7 +873,11 @@ export function syncServerThreadDetailHotPath(state: AppState, thread: ReadModel
 export function applyShellEvent(state: AppState, event: OrchestrationShellStreamEvent): AppState {
   switch (event.kind) {
     case "project-upserted":
-      return upsertProject(state, event.project, "id-or-cwd");
+      return upsertProject(
+        state,
+        { ...event.project, serverSequence: event.sequence },
+        "id-or-cwd",
+      );
     case "project-removed":
       return removeDeletedProjectFromClientState(state, event.projectId);
     case "thread-upserted": {
@@ -908,7 +912,7 @@ export function syncServerReadModel(state: AppState, readModel: OrchestrationRea
     (project) => isActiveReadModelProject(project) && deletedProjectIdsById[project.id] !== true,
   );
   const activeProjectIds = new Set(activeProjects.map((project) => project.id));
-  const projects = mapProjects(activeProjects, state.projects);
+  const projects = mapProjects(activeProjects, state.projects, readModel.snapshotSequence);
   const nextThreads = readModel.threads
     .filter(
       (thread) =>

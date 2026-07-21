@@ -26,15 +26,12 @@ const mocks = vi.hoisted(() => ({
   listArchivedProjects: vi.fn(),
   listGitStates: vi.fn(),
   navigate: vi.fn(),
-  pinProject: vi.fn(() => true),
   projects: [] as Project[],
-  prunePinnedProjects: vi.fn(),
   reorderProjects: vi.fn(),
   syncServerShellSnapshot: vi.fn(),
   threads: [] as SidebarThreadSummary[],
   threadsHydrated: true,
   toastAdd: vi.fn(),
-  unpinProject: vi.fn(),
 }));
 
 vi.mock("@tanstack/react-router", async (importOriginal) => {
@@ -76,21 +73,17 @@ vi.mock("~/nativeApi", () => ({
       listGitStates: mocks.listGitStates,
     },
   }),
+  readNativeApi: () => ({
+    automation: { list: mocks.automationList },
+    dialogs: { confirm: mocks.confirm },
+    git: { init: mocks.gitInit },
+    orchestration: { dispatchCommand: mocks.dispatchCommand },
+    workspace: {
+      listArchivedProjects: mocks.listArchivedProjects,
+      listGitStates: mocks.listGitStates,
+    },
+  }),
 }));
-
-vi.mock("~/pinnedProjectsStore", () => {
-  const state = {
-    pinnedProjectIds: [] as ProjectId[],
-    pinProject: mocks.pinProject,
-    unpinProject: mocks.unpinProject,
-    prunePinnedProjects: mocks.prunePinnedProjects,
-  };
-  const usePinnedProjectsStore = Object.assign(
-    (selector: (value: typeof state) => unknown) => selector(state),
-    { getState: () => state },
-  );
-  return { usePinnedProjectsStore };
-});
 
 vi.mock("~/store", () => ({
   useStore: (
@@ -119,10 +112,11 @@ vi.mock("~/workspaceStore", () => ({
 }));
 
 import { WorkspaceDashboardRoute } from "~/routes/_chat.workspace.index";
+import { usePinnedProjectsStore } from "~/pinnedProjectsStore";
 
 const refreshedAt = "2026-07-20T12:00:00.000Z";
 
-function project(id: string, name: string): Project {
+function project(id: string, name: string, serverSequence = 1): Project {
   return {
     id: id as ProjectId,
     kind: "project",
@@ -133,6 +127,7 @@ function project(id: string, name: string): Project {
     cwd: `C:\\code\\${id}`,
     defaultModelSelection: null,
     expanded: true,
+    serverSequence,
     createdAt: refreshedAt,
     updatedAt: refreshedAt,
     scripts: [],
@@ -230,20 +225,45 @@ function activeChildThread(projectId: ProjectId): SidebarThreadSummary {
   };
 }
 
+function dashboardView(queryClient: QueryClient) {
+  return (
+    <QueryClientProvider client={queryClient}>
+      <WorkspaceDashboardRoute />
+    </QueryClientProvider>
+  );
+}
+
 async function renderDashboard() {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
-  await render(
-    <QueryClientProvider client={queryClient}>
-      <WorkspaceDashboardRoute />
-    </QueryClientProvider>,
-  );
-  return queryClient;
+  const mounted = await render(dashboardView(queryClient));
+  return {
+    queryClient,
+    rerender: () => mounted.rerender(dashboardView(queryClient)),
+  };
+}
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, reject, resolve };
 }
 
 beforeEach(() => {
   sessionStorage.clear();
+  usePinnedProjectsStore.persist.clearStorage();
+  usePinnedProjectsStore.setState({
+    pinnedProjectIds: [],
+    optimisticPinnedStateByProjectId: new Map(),
+    latestPinnedMutationVersionByProjectId: new Map(),
+    projectPinLifecycleByProjectId: new Map(),
+    observedProjectPinStateByProjectId: new Map(),
+  });
   mocks.projects = [];
   mocks.gitItems = [];
   mocks.threads = [];
@@ -254,11 +274,7 @@ beforeEach(() => {
   mocks.dispatchCommand.mockReset();
   mocks.gitInit.mockReset();
   mocks.automationList.mockReset();
-  mocks.pinProject.mockReset();
-  mocks.pinProject.mockReturnValue(true);
-  mocks.prunePinnedProjects.mockReset();
   mocks.toastAdd.mockReset();
-  mocks.unpinProject.mockReset();
   mocks.automationList.mockResolvedValue({ definitions: [], runs: [] });
   mocks.listArchivedProjects.mockResolvedValue({ projects: [] });
   mocks.confirm.mockResolvedValue(true);
@@ -278,22 +294,30 @@ afterEach(async () => {
 
 describe("WorkspaceDashboardRoute", () => {
   it("does not prune persisted pins before the shell snapshot hydrates", async () => {
+    const persistedProject = project("persisted-project", "Persisted project");
     mocks.threadsHydrated = false;
+    mocks.projects = [persistedProject];
+    mocks.gitItems = [notGitState(persistedProject.id)];
+    usePinnedProjectsStore.setState({ pinnedProjectIds: [persistedProject.id] });
 
     await renderDashboard();
 
-    await expect.element(page.getByText("Build your workspace")).toBeVisible();
-    expect(mocks.prunePinnedProjects).not.toHaveBeenCalled();
+    await expect.element(page.getByText(persistedProject.name)).toBeVisible();
+    expect(usePinnedProjectsStore.getState().pinnedProjectIds).toEqual([persistedProject.id]);
+    expect(usePinnedProjectsStore.getState().optimisticPinnedStateByProjectId).toEqual(new Map());
   });
 
   it("does not prune persisted pins from a hydrated empty startup snapshot", async () => {
+    const persistedProjectId = "persisted-project" as ProjectId;
+    usePinnedProjectsStore.setState({ pinnedProjectIds: [persistedProjectId] });
+
     await renderDashboard();
 
     await expect.element(page.getByText("Build your workspace")).toBeVisible();
-    expect(mocks.prunePinnedProjects).not.toHaveBeenCalled();
+    expect(usePinnedProjectsStore.getState().pinnedProjectIds).toEqual([persistedProjectId]);
   });
 
-  it("reconciles persisted pins after the shell snapshot hydrates", async () => {
+  it("prunes missing persisted pins and appends server-only pins after hydration", async () => {
     const pinnedProject = {
       ...project("pinned-project", "Pinned project"),
       isPinned: true,
@@ -304,17 +328,396 @@ describe("WorkspaceDashboardRoute", () => {
       gitState({ projectId: pinnedProject.id, dirtyFileCount: 0 }),
       gitState({ projectId: unpinnedProject.id, dirtyFileCount: 0 }),
     ];
+    usePinnedProjectsStore.setState({
+      pinnedProjectIds: [unpinnedProject.id, "removed-project" as ProjectId],
+    });
 
     await renderDashboard();
 
     await vi.waitFor(() => {
-      expect(mocks.prunePinnedProjects).toHaveBeenCalledWith([
-        pinnedProject.id,
+      expect(usePinnedProjectsStore.getState().pinnedProjectIds).toEqual([
         unpinnedProject.id,
+        pinnedProject.id,
       ]);
-      expect(mocks.pinProject).toHaveBeenCalledWith(pinnedProject.id);
-      expect(mocks.unpinProject).toHaveBeenCalledWith(unpinnedProject.id);
     });
+  });
+
+  it("keeps an optimistic pin through an unrelated stale project update until settlement", async () => {
+    const pinTarget = project("pin-target", "Pin target");
+    const unrelatedProject = project("pin-unrelated", "Pin unrelated");
+    mocks.projects = [pinTarget, unrelatedProject];
+    mocks.gitItems = [
+      gitState({ projectId: pinTarget.id, dirtyFileCount: 0 }),
+      gitState({ projectId: unrelatedProject.id, dirtyFileCount: 0 }),
+    ];
+    const dispatch = deferred<{ sequence: number }>();
+    mocks.dispatchCommand.mockImplementationOnce(() => dispatch.promise);
+
+    const dashboard = await renderDashboard();
+    await expect.element(page.getByRole("button", { name: "Pin Pin target" })).toBeVisible();
+    await page.getByRole("button", { name: "Pin Pin target" }).click();
+
+    await vi.waitFor(() => {
+      expect(usePinnedProjectsStore.getState().pinnedProjectIds).toEqual([pinTarget.id]);
+      expect(usePinnedProjectsStore.getState().optimisticPinnedStateByProjectId).toEqual(
+        new Map([[pinTarget.id, true]]),
+      );
+    });
+
+    mocks.projects = [pinTarget, { ...unrelatedProject, updatedAt: "2026-07-20T12:05:00.000Z" }];
+    await dashboard.rerender();
+
+    await vi.waitFor(() => {
+      expect(usePinnedProjectsStore.getState().pinnedProjectIds).toEqual([pinTarget.id]);
+      expect(usePinnedProjectsStore.getState().optimisticPinnedStateByProjectId).toEqual(
+        new Map([[pinTarget.id, true]]),
+      );
+    });
+    await expect.element(page.getByRole("button", { name: "Unpin Pin target" })).toBeVisible();
+
+    mocks.projects = [{ ...pinTarget, isPinned: true, serverSequence: 2 }, unrelatedProject];
+    await dashboard.rerender();
+    await vi.waitFor(() => {
+      expect(usePinnedProjectsStore.getState().pinnedProjectIds).toEqual([pinTarget.id]);
+      expect(usePinnedProjectsStore.getState().optimisticPinnedStateByProjectId).toEqual(
+        new Map([[pinTarget.id, true]]),
+      );
+    });
+
+    dispatch.resolve({ sequence: 2 });
+    await dispatch.promise;
+    await vi.waitFor(() => {
+      expect(usePinnedProjectsStore.getState().optimisticPinnedStateByProjectId).toEqual(new Map());
+    });
+  });
+
+  it("adopts a newer pin observation before the deferred pin command rejects", async () => {
+    const target = project("observed-before-rejection", "Observed before rejection", 10);
+    mocks.projects = [target];
+    mocks.gitItems = [gitState({ projectId: target.id, dirtyFileCount: 0 })];
+    const dispatch = deferred<{ sequence: number }>();
+    mocks.dispatchCommand.mockImplementationOnce(() => dispatch.promise);
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const dashboard = await renderDashboard();
+    await page.getByRole("button", { name: "Pin Observed before rejection" }).click();
+    await expect
+      .element(page.getByRole("button", { name: "Unpin Observed before rejection" }))
+      .toBeVisible();
+
+    mocks.projects = [{ ...target, isPinned: true, serverSequence: 11 }];
+    await dashboard.rerender();
+    await vi.waitFor(() => {
+      expect(
+        usePinnedProjectsStore.getState().projectPinLifecycleByProjectId.get(target.id),
+      ).toEqual(
+        expect.objectContaining({
+          appliedPinned: true,
+          appliedSequence: 11,
+          inFlightRequestVersion: 1,
+          latestSettled: false,
+        }),
+      );
+      expect(usePinnedProjectsStore.getState().optimisticPinnedStateByProjectId).toEqual(
+        new Map([[target.id, true]]),
+      );
+    });
+
+    dispatch.reject(new Error("pin failed after observation"));
+    await dispatch.promise.catch(() => undefined);
+    await vi.waitFor(() => {
+      expect(usePinnedProjectsStore.getState().pinnedProjectIds).toEqual([target.id]);
+      expect(usePinnedProjectsStore.getState().optimisticPinnedStateByProjectId).toEqual(new Map());
+      expect(usePinnedProjectsStore.getState().projectPinLifecycleByProjectId).toEqual(new Map());
+    });
+    expect(mocks.toastAdd).not.toHaveBeenCalled();
+
+    mocks.projects = [{ ...target, isPinned: false, serverSequence: 10 }];
+    await dashboard.rerender();
+    await vi.waitFor(() => {
+      expect(usePinnedProjectsStore.getState().pinnedProjectIds).toEqual([target.id]);
+      expect(
+        usePinnedProjectsStore.getState().observedProjectPinStateByProjectId.get(target.id),
+      ).toEqual({ id: target.id, isPinned: true, serverSequence: 11 });
+    });
+    await expect
+      .element(page.getByRole("button", { name: "Unpin Observed before rejection" }))
+      .toBeVisible();
+    consoleError.mockRestore();
+  });
+
+  it("dispatches a queued unpin after a newer observation and deferred pin rejection", async () => {
+    const target = project("queued-unpin-after-rejection", "Queued unpin after rejection", 10);
+    mocks.projects = [target];
+    mocks.gitItems = [gitState({ projectId: target.id, dirtyFileCount: 0 })];
+    const firstDispatch = deferred<{ sequence: number }>();
+    const secondDispatch = deferred<{ sequence: number }>();
+    mocks.dispatchCommand
+      .mockImplementationOnce(() => firstDispatch.promise)
+      .mockImplementationOnce(() => secondDispatch.promise);
+
+    const dashboard = await renderDashboard();
+    await page.getByRole("button", { name: "Pin Queued unpin after rejection" }).click();
+    await expect
+      .element(page.getByRole("button", { name: "Unpin Queued unpin after rejection" }))
+      .toBeVisible();
+    await page.getByRole("button", { name: "Unpin Queued unpin after rejection" }).click();
+
+    mocks.projects = [{ ...target, isPinned: true, serverSequence: 11 }];
+    await dashboard.rerender();
+    await vi.waitFor(() => {
+      expect(
+        usePinnedProjectsStore.getState().projectPinLifecycleByProjectId.get(target.id),
+      ).toEqual(
+        expect.objectContaining({
+          appliedPinned: true,
+          appliedSequence: 11,
+          desiredPinned: false,
+          inFlightRequestVersion: 1,
+        }),
+      );
+    });
+
+    firstDispatch.reject(new Error("superseded pin failed"));
+    await firstDispatch.promise.catch(() => undefined);
+    await vi.waitFor(() => expect(mocks.dispatchCommand).toHaveBeenCalledTimes(2));
+    expect(mocks.dispatchCommand).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        projectId: target.id,
+        isPinned: false,
+      }),
+    );
+    expect(mocks.toastAdd).not.toHaveBeenCalled();
+    expect(usePinnedProjectsStore.getState().optimisticPinnedStateByProjectId).toEqual(
+      new Map([[target.id, false]]),
+    );
+
+    secondDispatch.resolve({ sequence: 12 });
+    await secondDispatch.promise;
+    mocks.projects = [{ ...target, isPinned: false, serverSequence: 12 }];
+    await dashboard.rerender();
+    await vi.waitFor(() => {
+      expect(usePinnedProjectsStore.getState().pinnedProjectIds).toEqual([]);
+      expect(usePinnedProjectsStore.getState().optimisticPinnedStateByProjectId).toEqual(new Map());
+      expect(usePinnedProjectsStore.getState().projectPinLifecycleByProjectId).toEqual(new Map());
+    });
+    await expect
+      .element(page.getByRole("button", { name: "Pin Queued unpin after rejection" }))
+      .toBeVisible();
+  });
+
+  it("keeps a newer conflicting observation when an older deferred pin succeeds", async () => {
+    const target = project("observation-before-success", "Observation before success", 10);
+    mocks.projects = [target];
+    mocks.gitItems = [gitState({ projectId: target.id, dirtyFileCount: 0 })];
+    const dispatch = deferred<{ sequence: number }>();
+    mocks.dispatchCommand.mockImplementationOnce(() => dispatch.promise);
+
+    const dashboard = await renderDashboard();
+    await page.getByRole("button", { name: "Pin Observation before success" }).click();
+    await expect
+      .element(page.getByRole("button", { name: "Unpin Observation before success" }))
+      .toBeVisible();
+
+    mocks.projects = [{ ...target, isPinned: false, serverSequence: 12 }];
+    await dashboard.rerender();
+    await vi.waitFor(() => {
+      expect(
+        usePinnedProjectsStore.getState().projectPinLifecycleByProjectId.get(target.id),
+      ).toEqual(
+        expect.objectContaining({
+          appliedPinned: false,
+          appliedSequence: 12,
+          desiredPinned: true,
+          inFlightRequestVersion: 1,
+        }),
+      );
+      expect(usePinnedProjectsStore.getState().optimisticPinnedStateByProjectId).toEqual(
+        new Map([[target.id, true]]),
+      );
+    });
+
+    dispatch.resolve({ sequence: 11 });
+    await dispatch.promise;
+    await vi.waitFor(() => {
+      expect(mocks.dispatchCommand).toHaveBeenCalledTimes(1);
+      expect(usePinnedProjectsStore.getState().pinnedProjectIds).toEqual([]);
+      expect(usePinnedProjectsStore.getState().optimisticPinnedStateByProjectId).toEqual(new Map());
+      expect(usePinnedProjectsStore.getState().projectPinLifecycleByProjectId).toEqual(new Map());
+      expect(
+        usePinnedProjectsStore.getState().observedProjectPinStateByProjectId.get(target.id),
+      ).toEqual({ id: target.id, isPinned: false, serverSequence: 12 });
+    });
+    expect(mocks.toastAdd).not.toHaveBeenCalled();
+    await expect
+      .element(page.getByRole("button", { name: "Pin Observation before success" }))
+      .toBeVisible();
+  });
+
+  it("keeps an optimistic unpin through an unrelated stale project update until settlement", async () => {
+    const unpinTarget = { ...project("unpin-target", "Unpin target"), isPinned: true };
+    const unrelatedProject = project("unpin-unrelated", "Unpin unrelated");
+    mocks.projects = [unpinTarget, unrelatedProject];
+    mocks.gitItems = [
+      gitState({ projectId: unpinTarget.id, dirtyFileCount: 0 }),
+      gitState({ projectId: unrelatedProject.id, dirtyFileCount: 0 }),
+    ];
+    const dispatch = deferred<{ sequence: number }>();
+    mocks.dispatchCommand.mockImplementationOnce(() => dispatch.promise);
+
+    const dashboard = await renderDashboard();
+    await expect.element(page.getByRole("button", { name: "Unpin Unpin target" })).toBeVisible();
+    await page.getByRole("button", { name: "Unpin Unpin target" }).click();
+
+    await vi.waitFor(() => {
+      expect(usePinnedProjectsStore.getState().pinnedProjectIds).toEqual([]);
+      expect(usePinnedProjectsStore.getState().optimisticPinnedStateByProjectId).toEqual(
+        new Map([[unpinTarget.id, false]]),
+      );
+    });
+
+    mocks.projects = [unpinTarget, { ...unrelatedProject, updatedAt: "2026-07-20T12:05:00.000Z" }];
+    await dashboard.rerender();
+
+    await vi.waitFor(() => {
+      expect(usePinnedProjectsStore.getState().pinnedProjectIds).toEqual([]);
+      expect(usePinnedProjectsStore.getState().optimisticPinnedStateByProjectId).toEqual(
+        new Map([[unpinTarget.id, false]]),
+      );
+    });
+    await expect.element(page.getByRole("button", { name: "Pin Unpin target" })).toBeVisible();
+
+    mocks.projects = [{ ...unpinTarget, isPinned: false, serverSequence: 3 }, unrelatedProject];
+    await dashboard.rerender();
+    await vi.waitFor(() => {
+      expect(usePinnedProjectsStore.getState().pinnedProjectIds).toEqual([]);
+      expect(usePinnedProjectsStore.getState().optimisticPinnedStateByProjectId).toEqual(
+        new Map([[unpinTarget.id, false]]),
+      );
+    });
+
+    dispatch.resolve({ sequence: 3 });
+    await dispatch.promise;
+    await vi.waitFor(() => {
+      expect(usePinnedProjectsStore.getState().optimisticPinnedStateByProjectId).toEqual(new Map());
+    });
+  });
+
+  it("keeps the latest rapid unpin through a stale match and delayed pin confirmation", async () => {
+    const target = project("rapid-unpin", "Rapid unpin", 10);
+    mocks.projects = [target];
+    mocks.gitItems = [gitState({ projectId: target.id, dirtyFileCount: 0 })];
+    const firstDispatch = deferred<{ sequence: number }>();
+    const secondDispatch = deferred<{ sequence: number }>();
+    mocks.dispatchCommand
+      .mockImplementationOnce(() => firstDispatch.promise)
+      .mockImplementationOnce(() => secondDispatch.promise);
+
+    const dashboard = await renderDashboard();
+    await page.getByRole("button", { name: "Pin Rapid unpin" }).click();
+    await expect.element(page.getByRole("button", { name: "Unpin Rapid unpin" })).toBeVisible();
+    await page.getByRole("button", { name: "Unpin Rapid unpin" }).click();
+
+    mocks.projects = [{ ...target, updatedAt: "2026-07-20T12:01:00.000Z" }];
+    await dashboard.rerender();
+    await vi.waitFor(() => {
+      expect(mocks.dispatchCommand).toHaveBeenCalledTimes(1);
+      expect(usePinnedProjectsStore.getState().pinnedProjectIds).toEqual([]);
+      expect(usePinnedProjectsStore.getState().optimisticPinnedStateByProjectId).toEqual(
+        new Map([[target.id, false]]),
+      );
+    });
+
+    firstDispatch.resolve({ sequence: 11 });
+    await vi.waitFor(() => expect(mocks.dispatchCommand).toHaveBeenCalledTimes(2));
+    mocks.projects = [{ ...target, isPinned: true, serverSequence: 11 }];
+    await dashboard.rerender();
+    await expect.element(page.getByRole("button", { name: "Pin Rapid unpin" })).toBeVisible();
+    expect(usePinnedProjectsStore.getState().optimisticPinnedStateByProjectId).toEqual(
+      new Map([[target.id, false]]),
+    );
+
+    secondDispatch.resolve({ sequence: 12 });
+    await secondDispatch.promise;
+    mocks.projects = [{ ...target, isPinned: false, serverSequence: 12 }];
+    await dashboard.rerender();
+    await vi.waitFor(() => {
+      expect(usePinnedProjectsStore.getState().optimisticPinnedStateByProjectId).toEqual(new Map());
+      expect(usePinnedProjectsStore.getState().pinnedProjectIds).toEqual([]);
+    });
+  });
+
+  it("rolls a failed rapid unpin back to the preceding successful pin", async () => {
+    const target = project("failed-rapid-unpin", "Failed rapid unpin", 20);
+    mocks.projects = [target];
+    mocks.gitItems = [gitState({ projectId: target.id, dirtyFileCount: 0 })];
+    const firstDispatch = deferred<{ sequence: number }>();
+    const secondDispatch = deferred<{ sequence: number }>();
+    mocks.dispatchCommand
+      .mockImplementationOnce(() => firstDispatch.promise)
+      .mockImplementationOnce(() => secondDispatch.promise);
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const dashboard = await renderDashboard();
+    await page.getByRole("button", { name: "Pin Failed rapid unpin" }).click();
+    await expect
+      .element(page.getByRole("button", { name: "Unpin Failed rapid unpin" }))
+      .toBeVisible();
+    await page.getByRole("button", { name: "Unpin Failed rapid unpin" }).click();
+
+    firstDispatch.resolve({ sequence: 21 });
+    await vi.waitFor(() => expect(mocks.dispatchCommand).toHaveBeenCalledTimes(2));
+    secondDispatch.reject(new Error("unpin failed"));
+    await secondDispatch.promise.catch(() => undefined);
+
+    await vi.waitFor(() => {
+      expect(usePinnedProjectsStore.getState().pinnedProjectIds).toEqual([target.id]);
+      expect(usePinnedProjectsStore.getState().optimisticPinnedStateByProjectId).toEqual(
+        new Map([[target.id, true]]),
+      );
+      expect(mocks.toastAdd).toHaveBeenCalledWith(
+        expect.objectContaining({ type: "error", title: "Unable to unpin project" }),
+      );
+    });
+    await expect
+      .element(page.getByRole("button", { name: "Unpin Failed rapid unpin" }))
+      .toBeVisible();
+
+    mocks.projects = [{ ...target, isPinned: true, serverSequence: 21 }];
+    await dashboard.rerender();
+    await vi.waitFor(() => {
+      expect(usePinnedProjectsStore.getState().optimisticPinnedStateByProjectId).toEqual(new Map());
+    });
+    consoleError.mockRestore();
+  });
+
+  it("coalesces pin then unpin then pin while the first command is pending", async () => {
+    const target = project("coalesced-pin", "Coalesced pin", 30);
+    mocks.projects = [target];
+    mocks.gitItems = [gitState({ projectId: target.id, dirtyFileCount: 0 })];
+    const dispatch = deferred<{ sequence: number }>();
+    mocks.dispatchCommand.mockImplementationOnce(() => dispatch.promise);
+
+    const dashboard = await renderDashboard();
+    await page.getByRole("button", { name: "Pin Coalesced pin" }).click();
+    await expect.element(page.getByRole("button", { name: "Unpin Coalesced pin" })).toBeVisible();
+    await page.getByRole("button", { name: "Unpin Coalesced pin" }).click();
+    await expect.element(page.getByRole("button", { name: "Pin Coalesced pin" })).toBeVisible();
+    await page.getByRole("button", { name: "Pin Coalesced pin" }).click();
+
+    expect(mocks.dispatchCommand).toHaveBeenCalledTimes(1);
+    dispatch.resolve({ sequence: 31 });
+    await dispatch.promise;
+    await vi.waitFor(() => expect(mocks.dispatchCommand).toHaveBeenCalledTimes(1));
+
+    mocks.projects = [{ ...target, isPinned: true, serverSequence: 31 }];
+    await dashboard.rerender();
+    await vi.waitFor(() => {
+      expect(usePinnedProjectsStore.getState().optimisticPinnedStateByProjectId).toEqual(new Map());
+      expect(usePinnedProjectsStore.getState().pinnedProjectIds).toEqual([target.id]);
+    });
+    await expect.element(page.getByRole("button", { name: "Unpin Coalesced pin" })).toBeVisible();
   });
 
   it("renders project cards while the batched repository status request is still pending", async () => {

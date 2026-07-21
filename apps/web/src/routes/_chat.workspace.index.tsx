@@ -2,7 +2,7 @@
 // Purpose: Synara-native project workspace dashboard at /workspace.
 // Layer: Route UI
 
-import { MAX_PINNED_PROJECTS, type ProjectId, type ThreadId } from "@synara/contracts";
+import { type ProjectId, type ThreadId } from "@synara/contracts";
 import { isWindowsAbsolutePath } from "@synara/shared/path";
 import {
   DndContext,
@@ -70,6 +70,7 @@ import {
   useDesktopTopBarWindowControlsGutterClassName,
 } from "~/hooks/useDesktopTopBarGutter";
 import { useHandleNewThread } from "~/hooks/useHandleNewThread";
+import { useProjectPinController } from "~/hooks/useProjectPinController";
 import { ArchiveIcon, FolderOpenIcon, GitBranchIcon, PlusIcon, RefreshCwIcon } from "~/lib/icons";
 import { archiveProjectFromClient } from "~/lib/projectArchive";
 import { cn, newCommandId } from "~/lib/utils";
@@ -81,7 +82,6 @@ import {
   workspaceGitStatesQueryOptions,
 } from "~/lib/workspaceReactQuery";
 import { ensureNativeApi } from "~/nativeApi";
-import { usePinnedProjectsStore } from "~/pinnedProjectsStore";
 import { automationQueryKey } from "~/routes/-automations.shared";
 import { createSidebarThreadSummariesSelector } from "~/storeSelectors";
 import { useStore } from "~/store";
@@ -154,9 +154,6 @@ export function WorkspaceDashboardRoute() {
   const reorderProjects = useStore((store) => store.reorderProjects);
   const syncServerShellSnapshot = useStore((store) => store.syncServerShellSnapshot);
   const homeDir = useWorkspaceStore((store) => store.homeDir);
-  const pinnedProjectIds = usePinnedProjectsStore((store) => store.pinnedProjectIds);
-  const pinProject = usePinnedProjectsStore((store) => store.pinProject);
-  const unpinProject = usePinnedProjectsStore((store) => store.unpinProject);
   const [filter, setFilter] = useState<WorkspaceFilter>("all");
   const [sort, setSort] = useState<WorkspaceSort>("recent");
   const [addOpen, setAddOpen] = useState(false);
@@ -175,6 +172,10 @@ export function WorkspaceDashboardRoute() {
     () => projects.filter((project) => project.kind === "project"),
     [projects],
   );
+  const { pinnedProjectIds, toggleProjectPinned } = useProjectPinController({
+    projects: projectRows,
+    shouldReconcile: threadsHydrated && projectRows.length > 0,
+  });
   const dashboardProjectRows = useMemo(
     () => projectRows.filter((project) => !pendingArchivedProjectIds.has(project.id)),
     [pendingArchivedProjectIds, projectRows],
@@ -203,16 +204,6 @@ export function WorkspaceDashboardRoute() {
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
   );
-
-  useEffect(() => {
-    if (!threadsHydrated || projectRows.length === 0) return;
-    const projectIdSet = new Set(projectRows.map((project) => project.id));
-    usePinnedProjectsStore.getState().prunePinnedProjects([...projectIdSet]);
-    for (const project of projectRows) {
-      if (project.isPinned === true) pinProject(project.id);
-      else unpinProject(project.id);
-    }
-  }, [pinProject, projectRows, threadsHydrated, unpinProject]);
 
   useEffect(() => {
     const activeProjectIds = new Set(projectRows.map((project) => project.id));
@@ -331,36 +322,6 @@ export function WorkspaceDashboardRoute() {
       });
     } finally {
       setInitializingProjectId(null);
-    }
-  };
-
-  const togglePin = async (card: WorkspaceCardModel) => {
-    const wasPinned = pinnedSet.has(card.project.id);
-    if (wasPinned) {
-      unpinProject(card.project.id);
-    } else if (!pinProject(card.project.id)) {
-      toastManager.add({
-        type: "warning",
-        title: "Project pin limit reached",
-        description: `You can pin up to ${MAX_PINNED_PROJECTS} projects.`,
-      });
-      return;
-    }
-    try {
-      await ensureNativeApi().orchestration.dispatchCommand({
-        type: "project.meta.update",
-        commandId: newCommandId(),
-        projectId: card.project.id,
-        isPinned: !wasPinned,
-      });
-    } catch (cause) {
-      if (wasPinned) pinProject(card.project.id);
-      else unpinProject(card.project.id);
-      toastManager.add({
-        type: "error",
-        title: wasPinned ? "Unable to unpin project" : "Unable to pin project",
-        description: cause instanceof Error ? cause.message : undefined,
-      });
     }
   };
 
@@ -586,7 +547,7 @@ export function WorkspaceDashboardRoute() {
                                 });
                               }}
                               onArchive={() => void archiveProject(card)}
-                              onTogglePin={() => void togglePin(card)}
+                              onTogglePin={() => toggleProjectPinned(card.project.id)}
                             />
                           )}
                         </SortableWorkspaceCard>

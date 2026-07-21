@@ -148,6 +148,203 @@ export function isLatestPinMutation<TId>(input: {
   return input.latestMutationVersionById.get(input.id) === input.requestVersion;
 }
 
+export interface PinMutationLifecycle {
+  readonly appliedPinned: boolean;
+  readonly appliedSequence: number | null;
+  readonly desiredPinned: boolean;
+  readonly latestRequestVersion: number;
+  readonly inFlightRequestVersion: number | null;
+  readonly inFlightPinned: boolean | null;
+  readonly latestSettled: boolean;
+  readonly settlementSequence: number | null;
+}
+
+export function observePinMutationLifecycle(input: {
+  readonly lifecycle: PinMutationLifecycle;
+  readonly serverPinned: boolean;
+  readonly serverSequence?: number | undefined;
+}): PinMutationLifecycle {
+  const observedSequence = input.serverSequence ?? null;
+  if (
+    input.lifecycle.appliedSequence !== null &&
+    (observedSequence === null || observedSequence < input.lifecycle.appliedSequence)
+  ) {
+    return input.lifecycle;
+  }
+  if (
+    input.lifecycle.appliedPinned === input.serverPinned &&
+    input.lifecycle.appliedSequence === observedSequence
+  ) {
+    return input.lifecycle;
+  }
+  if (input.lifecycle.inFlightRequestVersion !== null) {
+    return {
+      ...input.lifecycle,
+      appliedPinned: input.serverPinned,
+      appliedSequence: observedSequence,
+    };
+  }
+  if (input.lifecycle.latestSettled) {
+    return {
+      ...input.lifecycle,
+      appliedPinned: input.serverPinned,
+      appliedSequence: observedSequence,
+      desiredPinned: input.serverPinned,
+      settlementSequence: observedSequence,
+    };
+  }
+  const latestSettled = input.lifecycle.desiredPinned === input.serverPinned;
+  return {
+    ...input.lifecycle,
+    appliedPinned: input.serverPinned,
+    appliedSequence: observedSequence,
+    latestSettled,
+    settlementSequence: latestSettled ? observedSequence : null,
+  };
+}
+
+export function beginPinMutationLifecycle(input: {
+  readonly lifecycle: PinMutationLifecycle | undefined;
+  readonly requestVersion: number;
+  readonly desiredPinned: boolean;
+  readonly serverPinned: boolean;
+  readonly serverSequence?: number | undefined;
+}): PinMutationLifecycle {
+  const observedLifecycle = input.lifecycle
+    ? observePinMutationLifecycle({
+        lifecycle: input.lifecycle,
+        serverPinned: input.serverPinned,
+        serverSequence: input.serverSequence,
+      })
+    : undefined;
+  const appliedPinned = observedLifecycle?.appliedPinned ?? input.serverPinned;
+  const appliedSequence = observedLifecycle?.appliedSequence ?? input.serverSequence ?? null;
+  const inFlightRequestVersion = observedLifecycle?.inFlightRequestVersion ?? null;
+  const latestSettled = inFlightRequestVersion === null && input.desiredPinned === appliedPinned;
+  return {
+    appliedPinned,
+    appliedSequence,
+    desiredPinned: input.desiredPinned,
+    latestRequestVersion: input.requestVersion,
+    inFlightRequestVersion,
+    inFlightPinned: observedLifecycle?.inFlightPinned ?? null,
+    latestSettled,
+    settlementSequence: latestSettled ? appliedSequence : null,
+  };
+}
+
+export function startPinMutationLifecycle(lifecycle: PinMutationLifecycle): {
+  readonly lifecycle: PinMutationLifecycle;
+  readonly requestVersion: number;
+  readonly isPinned: boolean;
+} | null {
+  if (
+    lifecycle.inFlightRequestVersion !== null ||
+    lifecycle.desiredPinned === lifecycle.appliedPinned
+  ) {
+    return null;
+  }
+  return {
+    lifecycle: {
+      ...lifecycle,
+      inFlightRequestVersion: lifecycle.latestRequestVersion,
+      inFlightPinned: lifecycle.desiredPinned,
+      latestSettled: false,
+      settlementSequence: null,
+    },
+    requestVersion: lifecycle.latestRequestVersion,
+    isPinned: lifecycle.desiredPinned,
+  };
+}
+
+export function succeedPinMutationLifecycle(input: {
+  readonly lifecycle: PinMutationLifecycle;
+  readonly requestVersion: number;
+  readonly isPinned: boolean;
+  readonly resultSequence: number;
+}): PinMutationLifecycle | null {
+  if (input.lifecycle.inFlightRequestVersion !== input.requestVersion) {
+    return null;
+  }
+  if (input.lifecycle.inFlightPinned !== input.isPinned) {
+    return null;
+  }
+  const resultSupersedesAppliedState =
+    input.lifecycle.appliedSequence === null ||
+    input.resultSequence > input.lifecycle.appliedSequence;
+  const appliedPinned = resultSupersedesAppliedState
+    ? input.isPinned
+    : input.lifecycle.appliedPinned;
+  const appliedSequence = resultSupersedesAppliedState
+    ? input.resultSequence
+    : input.lifecycle.appliedSequence;
+  const observationSupersedesResult =
+    input.lifecycle.appliedSequence !== null &&
+    input.resultSequence <= input.lifecycle.appliedSequence;
+  const hasNewerRequest = input.lifecycle.latestRequestVersion > input.requestVersion;
+  const desiredPinned =
+    observationSupersedesResult && !hasNewerRequest ? appliedPinned : input.lifecycle.desiredPinned;
+  const latestSettled = desiredPinned === appliedPinned;
+  return {
+    ...input.lifecycle,
+    appliedPinned,
+    appliedSequence,
+    desiredPinned,
+    inFlightRequestVersion: null,
+    inFlightPinned: null,
+    latestSettled,
+    settlementSequence: latestSettled ? appliedSequence : null,
+  };
+}
+
+export function failPinMutationLifecycle(input: {
+  readonly lifecycle: PinMutationLifecycle;
+  readonly requestVersion: number;
+}): {
+  readonly lifecycle: PinMutationLifecycle;
+  readonly isLatestFailure: boolean;
+} | null {
+  if (input.lifecycle.inFlightRequestVersion !== input.requestVersion) {
+    return null;
+  }
+  const isLatestFailure = input.lifecycle.latestRequestVersion === input.requestVersion;
+  const desiredPinned = isLatestFailure
+    ? input.lifecycle.appliedPinned
+    : input.lifecycle.desiredPinned;
+  const latestSettled = desiredPinned === input.lifecycle.appliedPinned;
+  return {
+    lifecycle: {
+      ...input.lifecycle,
+      desiredPinned,
+      inFlightRequestVersion: null,
+      inFlightPinned: null,
+      latestSettled,
+      settlementSequence: latestSettled ? input.lifecycle.appliedSequence : null,
+    },
+    isLatestFailure,
+  };
+}
+
+export function canSettlePinMutationLifecycle(input: {
+  readonly lifecycle: PinMutationLifecycle;
+  readonly serverPinned: boolean;
+  readonly serverSequence?: number | undefined;
+}): boolean {
+  if (
+    input.lifecycle.inFlightRequestVersion !== null ||
+    !input.lifecycle.latestSettled ||
+    input.serverPinned !== input.lifecycle.desiredPinned
+  ) {
+    return false;
+  }
+  if (input.lifecycle.settlementSequence === null) {
+    return true;
+  }
+  return (
+    input.serverSequence !== undefined && input.serverSequence >= input.lifecycle.settlementSequence
+  );
+}
+
 // Drop optimistic entries once the server agrees or the item disappears. Entries whose
 // server value still disagrees remain pending so the optimistic UI does not flicker backward.
 export function reconcileOptimisticPinState<TId>(input: {

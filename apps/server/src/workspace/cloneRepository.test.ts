@@ -6,7 +6,7 @@ import * as EffectNodeFileSystem from "@effect/platform-node/NodeFileSystem";
 import * as EffectNodeChildProcessSpawner from "@effect/platform-node/NodeChildProcessSpawner";
 import * as EffectNodePath from "@effect/platform-node/NodePath";
 import { ProjectId, WorkspaceCloneId } from "@synara/contracts";
-import { Effect, Exit, Layer, Scope, Sink, Stream } from "effect";
+import { Deferred, Effect, Exit, Fiber, Layer, Scope, Sink, Stream } from "effect";
 import { ChildProcessSpawner } from "effect/unstable/process";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -39,6 +39,21 @@ async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<voi
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
   throw new Error("Timed out waiting for clone job state.");
+}
+
+async function closeScopeThenRelease(
+  scope: Scope.Closeable,
+  release: Deferred.Deferred<void>,
+): Promise<void> {
+  await Effect.runPromise(
+    Effect.gen(function* () {
+      const closeFiber = yield* Scope.close(scope, Exit.void).pipe(
+        Effect.forkChild({ startImmediately: true }),
+      );
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(closeFiber);
+    }),
+  );
 }
 
 interface CapturedGitCommand {
@@ -274,7 +289,7 @@ describe("workspace clone progress", () => {
     expect(resolving!.percent).toBeGreaterThan(receiving!.percent);
   });
 
-  it("uses argv clone execution and removes only a job-created failed target", async () => {
+  it("uses argv clone execution and retains a job-created failed target for safe cleanup", async () => {
     const parent = await makeTempDir();
     const targetPath = NodePath.join(parent, "repo");
     const calls: Array<{ cwd: string; args: ReadonlyArray<string>; env?: NodeJS.ProcessEnv }> = [];
@@ -340,9 +355,130 @@ describe("workspace clone progress", () => {
     ]);
     expect(events.at(-1)).toMatchObject({
       _tag: "clone_finished",
-      result: { clonedPath: null, failure: { stage: "clone" } },
+      result: {
+        clonedPath: null,
+        failure: {
+          stage: "clone",
+          retryable: false,
+          message: expect.stringContaining(
+            "Synara did not remove it because safe automatic cleanup cannot be guaranteed.",
+          ),
+        },
+      },
     });
-    await expect(NodeFs.stat(targetPath)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(NodeFs.stat(targetPath)).resolves.toBeDefined();
+    await expect(NodeFs.readdir(targetPath)).resolves.toEqual([]);
+  });
+
+  it("never mutates a target substituted after clone ownership was established", async () => {
+    const parent = await makeTempDir();
+    const targetPath = NodePath.join(parent, "repo");
+    const displacedOwnedPath = NodePath.join(parent, "owned-partial-clone");
+    const git = {
+      execute: withResolvedCloneUrl((input) =>
+        Effect.promise(async () => {
+          await NodeFs.writeFile(NodePath.join(targetPath, "partial.txt"), "owned partial clone");
+          await NodeFs.rename(targetPath, displacedOwnedPath);
+          await NodeFs.mkdir(targetPath);
+          await NodeFs.writeFile(NodePath.join(targetPath, "foreign.txt"), "must survive");
+        }).pipe(Effect.andThen(Effect.fail(cloneCommandError(input.cwd)))),
+      ),
+    } as Pick<GitCoreShape, "execute">;
+    const jobs = makeWorkspaceCloneJobs({ git, homeDir: parent });
+
+    const events = Array.from(
+      await Effect.runPromise(
+        Stream.runCollect(
+          jobs.cloneRepository({
+            cloneId: WorkspaceCloneId.makeUnsafe("clone-replaced-target"),
+            url: "https://github.com/example/repo.git",
+            targetPath,
+            createProject: false,
+            createParentDirectories: true,
+          }),
+        ),
+      ),
+    );
+
+    expect(events.at(-1)).toMatchObject({
+      result: {
+        clonedPath: null,
+        failure: {
+          stage: "clone",
+          retryable: false,
+          message: expect.stringContaining(
+            "Inspect or remove that destination manually before retrying.",
+          ),
+        },
+      },
+    });
+    await expect(NodeFs.readFile(NodePath.join(targetPath, "foreign.txt"), "utf8")).resolves.toBe(
+      "must survive",
+    );
+    await expect(
+      NodeFs.readFile(NodePath.join(displacedOwnedPath, "partial.txt"), "utf8"),
+    ).resolves.toBe("owned partial clone");
+  });
+
+  it("publishes retained-target guidance when shutdown overlaps mkdir completion", async () => {
+    const parent = await makeTempDir();
+    const targetPath = NodePath.join(parent, "mkdir-interrupted");
+    const mkdirCompleted = Deferred.makeUnsafe<void>();
+    const releaseMkdirResult = Deferred.makeUnsafe<void>();
+    const serverScope = await Effect.runPromise(Scope.make("sequential"));
+    let cloneCalls = 0;
+    const jobs = makeWorkspaceCloneJobs({
+      git: {
+        execute: withResolvedCloneUrl(() => {
+          cloneCalls += 1;
+          return Effect.succeed({ code: 0, stdout: "", stderr: "" });
+        }),
+      } as Pick<GitCoreShape, "execute">,
+      homeDir: parent,
+      targetDirectoryFileSystem: {
+        mkdir: async (path) => {
+          await NodeFs.mkdir(path);
+          await Effect.runPromise(Deferred.succeed(mkdirCompleted, undefined));
+          await Effect.runPromise(Deferred.await(releaseMkdirResult));
+        },
+      },
+      startBackground: (effect) => effect.pipe(Effect.forkIn(serverScope), Effect.asVoid),
+    });
+    const cloneId = WorkspaceCloneId.makeUnsafe("clone-mkdir-interrupted");
+
+    try {
+      const interruptedClone = Effect.runPromise(
+        Stream.runCollect(
+          jobs.cloneRepository({
+            cloneId,
+            url: "https://github.com/example/repo.git",
+            targetPath,
+            createProject: false,
+            createParentDirectories: true,
+          }),
+        ),
+      );
+      await Effect.runPromise(Deferred.await(mkdirCompleted));
+      await closeScopeThenRelease(serverScope, releaseMkdirResult);
+
+      const interruptedEvents = Array.from(await interruptedClone);
+      expect(interruptedEvents.at(-1)).toMatchObject({
+        _tag: "clone_finished",
+        result: {
+          clonedPath: null,
+          failure: {
+            stage: "clone",
+            code: "WORKSPACE_CLONE_CANCELLED",
+            retryable: false,
+            message: expect.stringContaining(`Partial clone data may remain at ${targetPath}.`),
+          },
+        },
+      });
+      expect(cloneCalls).toBe(0);
+      await expect(NodeFs.stat(targetPath)).resolves.toBeDefined();
+    } finally {
+      await Effect.runPromise(Scope.close(serverScope, Exit.void));
+    }
   });
 
   it("retains a successful clone when project creation fails and retries without cloning", async () => {
@@ -398,6 +534,273 @@ describe("workspace clone progress", () => {
     expect(retried.map((event) => event.snapshot.percent)).toEqual([100, 100]);
     expect(cloneCalls).toBe(1);
     expect(projectCalls).toBe(2);
+  });
+
+  it("retains a clone and permits project retry when initial project creation is interrupted", async () => {
+    const parent = await makeTempDir();
+    const targetPath = NodePath.join(parent, "repo");
+    const firstBackgroundScope = await Effect.runPromise(Scope.make("sequential"));
+    const secondBackgroundScope = await Effect.runPromise(Scope.make("sequential"));
+    let backgroundScope = firstBackgroundScope;
+    let cloneCalls = 0;
+    let projectCalls = 0;
+    const jobs = makeWorkspaceCloneJobs({
+      git: {
+        execute: withResolvedCloneUrl(() => {
+          cloneCalls += 1;
+          return Effect.succeed({ code: 0, stdout: "", stderr: "" });
+        }),
+      } as Pick<GitCoreShape, "execute">,
+      homeDir: parent,
+      createProject: () => {
+        projectCalls += 1;
+        return projectCalls === 1
+          ? Effect.never
+          : Effect.succeed(ProjectId.makeUnsafe("project-after-initial-interruption"));
+      },
+      startBackground: (effect) => effect.pipe(Effect.forkIn(backgroundScope), Effect.asVoid),
+    });
+    const cloneId = WorkspaceCloneId.makeUnsafe("clone-project-initial-interrupted");
+
+    try {
+      const interruptedClone = Effect.runPromise(
+        Stream.runCollect(
+          jobs.cloneRepository({
+            cloneId,
+            url: "https://github.com/example/repo.git",
+            targetPath,
+            createProject: true,
+            createParentDirectories: true,
+          }),
+        ),
+      );
+      await waitFor(
+        () =>
+          projectCalls === 1 &&
+          jobs.getStatus(cloneId)?.status === "running" &&
+          jobs.getStatus(cloneId)?.stage === "creating-project",
+      );
+      await Effect.runPromise(Scope.close(firstBackgroundScope, Exit.void));
+
+      const interruptedEvents = Array.from(await interruptedClone);
+      expect(interruptedEvents.at(-1)).toMatchObject({
+        _tag: "clone_finished",
+        snapshot: { status: "failed", stage: "complete" },
+        result: {
+          clonedPath: targetPath,
+          projectId: null,
+          failure: {
+            stage: "project",
+            code: "WORKSPACE_CLONE_PROJECT_CREATE_CANCELLED",
+            retryable: true,
+          },
+        },
+      });
+      await expect(NodeFs.stat(targetPath)).resolves.toBeDefined();
+
+      backgroundScope = secondBackgroundScope;
+      const retriedEvents = Array.from(
+        await Effect.runPromise(Stream.runCollect(jobs.retryProjectCreation(cloneId))),
+      );
+      expect(retriedEvents.at(-1)).toMatchObject({
+        _tag: "clone_finished",
+        result: {
+          clonedPath: targetPath,
+          projectId: "project-after-initial-interruption",
+          failure: null,
+        },
+      });
+      expect(cloneCalls).toBe(1);
+      expect(projectCalls).toBe(2);
+    } finally {
+      await Effect.runPromise(Scope.close(firstBackgroundScope, Exit.void));
+      await Effect.runPromise(Scope.close(secondBackgroundScope, Exit.void));
+    }
+  });
+
+  it("preserves selected terminal outcomes when shutdown overlaps publication", async () => {
+    const scenarios = [
+      {
+        name: "clone-only",
+        createProject: false,
+        projectEffect: Effect.succeed(ProjectId.makeUnsafe("unused-clone-only-project")),
+        expectedStatus: "succeeded",
+        projectId: null,
+        failure: null,
+      },
+      {
+        name: "with-project",
+        createProject: true,
+        projectEffect: Effect.succeed(ProjectId.makeUnsafe("project-terminal-publication")),
+        expectedStatus: "succeeded",
+        projectId: ProjectId.makeUnsafe("project-terminal-publication"),
+        failure: null,
+      },
+      {
+        name: "project-failure",
+        createProject: true,
+        projectEffect: Effect.fail(new Error("terminal project creation failed")),
+        expectedStatus: "failed",
+        projectId: null,
+        failure: {
+          stage: "project",
+          code: "WORKSPACE_CLONE_PROJECT_CREATE_FAILED",
+          message: "terminal project creation failed",
+          retryable: true,
+        },
+      },
+    ] as const;
+
+    for (const scenario of scenarios) {
+      const parent = await makeTempDir();
+      const targetPath = NodePath.join(parent, scenario.name);
+      const terminalPublishEntered = Deferred.makeUnsafe<void>();
+      const releaseTerminalPublish = Deferred.makeUnsafe<void>();
+      const serverScope = await Effect.runPromise(Scope.make("sequential"));
+      let terminalPublishCalls = 0;
+      const jobs = makeWorkspaceCloneJobs({
+        git: {
+          execute: withResolvedCloneUrl(() => Effect.succeed({ code: 0, stdout: "", stderr: "" })),
+        } as Pick<GitCoreShape, "execute">,
+        homeDir: parent,
+        createProject: () => scenario.projectEffect,
+        beforeTerminalPublish: () => {
+          terminalPublishCalls += 1;
+          if (terminalPublishCalls !== 1) return Effect.void;
+          return Deferred.succeed(terminalPublishEntered, undefined).pipe(
+            Effect.andThen(Deferred.await(releaseTerminalPublish)),
+          );
+        },
+        startBackground: (effect) => effect.pipe(Effect.forkIn(serverScope), Effect.asVoid),
+      });
+      const cloneId = WorkspaceCloneId.makeUnsafe(`clone-terminal-${scenario.name}`);
+
+      try {
+        const interruptedClone = Effect.runPromise(
+          Stream.runCollect(
+            jobs.cloneRepository({
+              cloneId,
+              url: "https://github.com/example/repo.git",
+              targetPath,
+              createProject: scenario.createProject,
+              createParentDirectories: true,
+            }),
+          ),
+        );
+        await Effect.runPromise(Deferred.await(terminalPublishEntered));
+        await closeScopeThenRelease(serverScope, releaseTerminalPublish);
+
+        const events = Array.from(await interruptedClone);
+        expect(events.at(-1)).toMatchObject({
+          _tag: "clone_finished",
+          snapshot: { status: scenario.expectedStatus, stage: "complete" },
+          result: {
+            clonedPath: targetPath,
+            projectId: scenario.projectId,
+            failure: scenario.failure,
+          },
+        });
+        expect(jobs.getStatus(cloneId)).toMatchObject({
+          status: scenario.expectedStatus,
+          result: {
+            clonedPath: targetPath,
+            projectId: scenario.projectId,
+            failure: scenario.failure,
+          },
+        });
+        expect(terminalPublishCalls).toBe(1);
+      } finally {
+        await Effect.runPromise(Scope.close(serverScope, Exit.void));
+      }
+    }
+  });
+
+  it("preserves retry success when shutdown overlaps terminal publication", async () => {
+    const parent = await makeTempDir();
+    const targetPath = NodePath.join(parent, "retry-terminal-publication");
+    const retryProjectId = ProjectId.makeUnsafe("project-retry-terminal-publication");
+    const retryPublishEntered = Deferred.makeUnsafe<void>();
+    const releaseRetryPublish = Deferred.makeUnsafe<void>();
+    const serverScope = await Effect.runPromise(Scope.make("sequential"));
+    let projectCalls = 0;
+    let retryPublishCalls = 0;
+    const jobs = makeWorkspaceCloneJobs({
+      git: {
+        execute: withResolvedCloneUrl(() => Effect.succeed({ code: 0, stdout: "", stderr: "" })),
+      } as Pick<GitCoreShape, "execute">,
+      homeDir: parent,
+      createProject: () => {
+        projectCalls += 1;
+        return projectCalls === 1
+          ? Effect.fail(new Error("initial project creation failed"))
+          : Effect.succeed(retryProjectId);
+      },
+      beforeTerminalPublish: ({ result }) => {
+        if (result.projectId !== retryProjectId) return Effect.void;
+        retryPublishCalls += 1;
+        if (retryPublishCalls !== 1) return Effect.void;
+        return Deferred.succeed(retryPublishEntered, undefined).pipe(
+          Effect.andThen(Deferred.await(releaseRetryPublish)),
+        );
+      },
+      startBackground: (effect) => effect.pipe(Effect.forkIn(serverScope), Effect.asVoid),
+    });
+    const cloneId = WorkspaceCloneId.makeUnsafe("clone-retry-terminal-publication");
+
+    try {
+      const initialEvents = Array.from(
+        await Effect.runPromise(
+          Stream.runCollect(
+            jobs.cloneRepository({
+              cloneId,
+              url: "https://github.com/example/repo.git",
+              targetPath,
+              createProject: true,
+              createParentDirectories: true,
+            }),
+          ),
+        ),
+      );
+      expect(initialEvents.at(-1)).toMatchObject({
+        result: {
+          clonedPath: targetPath,
+          projectId: null,
+          failure: {
+            stage: "project",
+            code: "WORKSPACE_CLONE_PROJECT_CREATE_FAILED",
+          },
+        },
+      });
+
+      const interruptedRetry = Effect.runPromise(
+        Stream.runCollect(jobs.retryProjectCreation(cloneId)),
+      );
+      await Effect.runPromise(Deferred.await(retryPublishEntered));
+      await closeScopeThenRelease(serverScope, releaseRetryPublish);
+
+      const retryEvents = Array.from(await interruptedRetry);
+      expect(retryEvents.at(-1)).toMatchObject({
+        _tag: "clone_finished",
+        snapshot: { status: "succeeded", stage: "complete" },
+        result: {
+          clonedPath: targetPath,
+          projectId: retryProjectId,
+          failure: null,
+        },
+      });
+      expect(jobs.getStatus(cloneId)).toMatchObject({
+        status: "succeeded",
+        result: {
+          clonedPath: targetPath,
+          projectId: retryProjectId,
+          failure: null,
+        },
+      });
+      expect(projectCalls).toBe(2);
+      expect(retryPublishCalls).toBe(1);
+    } finally {
+      await Effect.runPromise(Scope.close(serverScope, Exit.void));
+    }
   });
 
   it("ends retry subscribers and restores retryability when background project creation stops", async () => {
@@ -708,7 +1111,7 @@ describe("workspace clone progress", () => {
     });
   });
 
-  it("interrupts background git work and cleans its owned target on server-scope shutdown", async () => {
+  it("interrupts background git work and retains its target on server-scope shutdown", async () => {
     const parent = await makeTempDir();
     const targetPath = NodePath.join(parent, "shutdown-clone");
     const cloneId = WorkspaceCloneId.makeUnsafe("clone-server-shutdown");
@@ -743,10 +1146,18 @@ describe("workspace clone progress", () => {
       ),
     );
 
-    await expect(NodeFs.stat(targetPath)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(NodeFs.stat(targetPath)).resolves.toBeDefined();
     expect(jobs.getStatus(cloneId)).toMatchObject({
       status: "failed",
-      result: { failure: { code: "WORKSPACE_CLONE_CANCELLED" } },
+      result: {
+        failure: {
+          code: "WORKSPACE_CLONE_CANCELLED",
+          retryable: false,
+          message: expect.stringContaining(
+            "Inspect or remove that destination manually before retrying.",
+          ),
+        },
+      },
     });
   });
 
