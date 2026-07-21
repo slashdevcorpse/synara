@@ -136,6 +136,7 @@ function verifyPrereleaseSourceProvenanceSteps(jobs: UnknownRecord): void {
       matches.length !== 1 ||
       !isRecord(step) ||
       typeof step.run !== "string" ||
+      step.shell !== "bash" ||
       normalizeContinuedShellCommand(step.run) !== PRERELEASE_SOURCE_PROVENANCE_COMMAND ||
       step.if !== undefined ||
       (step["continue-on-error"] !== undefined && step["continue-on-error"] !== false)

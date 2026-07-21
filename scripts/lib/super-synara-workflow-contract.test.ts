@@ -123,6 +123,15 @@ describe("Super Synara workflow contracts", () => {
   it("keeps every source check tagless until atomic draft publication", () => {
     expect(() => verifySuperSynaraWorkflowText(main, audit)).not.toThrow();
 
+    const bypassedShell = main.replace(
+      "        name: Validate source provenance\n        shell: bash",
+      "        name: Validate source provenance\n        shell: bash -c 'true' {0}",
+    );
+    expect(bypassedShell).not.toBe(main);
+    expect(() => verifySuperSynaraWorkflowText(bypassedShell, audit)).toThrow(
+      "without requiring the immutable tag before atomic publication",
+    );
+
     for (const [startMarker, endMarker, command] of [
       ["\n  preflight:", "\n  windows_x64:", "github-unsigned-prerelease \\\n            false"],
       ["\n  windows_x64:", "\n  macos_arm64:", "github-unsigned-prerelease false"],
