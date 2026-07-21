@@ -986,6 +986,7 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
 
 const RELEASE_DRAFTER_ACTION =
   "release-drafter/release-drafter@eada3c96a64734dd381cfbda23511034e328ddb0";
+const SETUP_NODE_ACTION = "actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38";
 const RELEASE_DRAFTER_GATE_CONDITION = "steps.changes.outputs.should_release == 'true'";
 const RELEASE_DRAFTER_DISPATCH_CONDITION =
   "${{ github.event_name != 'push' && needs.draft.outputs.should_release == 'true' }}";
@@ -1056,6 +1057,10 @@ export function verifySuperSynaraReleaseDrafterText(
   if (!Array.isArray(draftSteps)) {
     throw new Error("Release Drafter scheduler must define draft steps.");
   }
+  const runtimeIndex = draftSteps.findIndex(
+    (step) => isRecord(step) && step.name === "Set up Node.js",
+  );
+  const plannerIndex = draftSteps.findIndex((step) => isRecord(step) && step.id === "plan");
   const gateIndex = draftSteps.findIndex((step) => isRecord(step) && step.id === "changes");
   const authorizationIndex = draftSteps.findIndex(
     (step) => isRecord(step) && step.name === "Authorize manual release controller before mutation",
@@ -1066,6 +1071,20 @@ export function verifySuperSynaraReleaseDrafterText(
   const actionIndex = draftSteps.findIndex(
     (step) => isRecord(step) && step.id === "release_drafter",
   );
+  const runtimeStep = draftSteps[runtimeIndex];
+  if (
+    runtimeIndex < 0 ||
+    plannerIndex < 0 ||
+    runtimeIndex >= plannerIndex ||
+    !isRecord(runtimeStep) ||
+    runtimeStep.uses !== SETUP_NODE_ACTION ||
+    !isRecord(runtimeStep.with) ||
+    runtimeStep.with["node-version-file"] !== "package.json"
+  ) {
+    throw new Error(
+      "Release Drafter scheduler must pin the repository Node runtime before executing TypeScript planners.",
+    );
+  }
   if (
     gateIndex < 0 ||
     authorizationIndex < 0 ||

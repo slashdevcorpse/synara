@@ -1,3 +1,5 @@
+import { spawnSync } from "node:child_process";
+
 import { describe, expect, it, vi } from "vitest";
 
 import {
@@ -15,6 +17,24 @@ const result = (overrides: Partial<GhSpawnResult> = {}): GhSpawnResult => ({
   stderr: "",
   stdout: "ok",
   ...overrides,
+});
+
+describe("Node runtime compatibility", () => {
+  it("loads the GitHub CLI helper with Node's strip-only TypeScript runtime", () => {
+    const moduleUrl = new URL("./gh-cli.ts", import.meta.url).href;
+    const imported = spawnSync(
+      "node",
+      ["--input-type=module", "--eval", "await import(process.argv[1])", moduleUrl],
+      {
+        encoding: "utf8",
+        shell: false,
+        timeout: 30_000,
+      },
+    );
+
+    expect(imported.error).toBeUndefined();
+    expect(imported.status, imported.stderr).toBe(0);
+  });
 });
 
 describe("runGh", () => {
