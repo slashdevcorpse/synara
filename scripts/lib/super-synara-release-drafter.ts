@@ -2,7 +2,15 @@
 // Purpose: Resolves the one owned next Super Synara draft without mutating GitHub state.
 // Layer: Release scheduling policy
 
-export const SUPER_SYNARA_RELEASE_DRAFTER_MARKER = "<!-- super-synara-release-drafter-owned -->";
+import { assertFullCommitSha } from "./git-sha.ts";
+import {
+  hasExactSuperSynaraReleaseIdentity,
+  hasSuperSynaraReleaseOwnership,
+  SUPER_SYNARA_RELEASE_DRAFTER_MARKER,
+  superSynaraReleaseTitle,
+} from "./super-synara-release-identity.ts";
+
+export { SUPER_SYNARA_RELEASE_DRAFTER_MARKER, superSynaraReleaseTitle };
 
 export interface SuperSynaraTagRef {
   readonly name: string;
@@ -32,15 +40,9 @@ interface ParsedSuperVersion {
   readonly iteration: number;
 }
 
-function assertCoreVersion(coreVersion: string): void {
+export function assertSuperSynaraCoreVersion(coreVersion: string): void {
   if (!/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(coreVersion)) {
     throw new Error(`Invalid Super Synara core version: ${coreVersion}.`);
-  }
-}
-
-function assertFullSha(label: string, value: string): void {
-  if (!/^[0-9a-f]{40}$/i.test(value)) {
-    throw new Error(`${label} must be a full 40-character commit SHA.`);
   }
 }
 
@@ -56,16 +58,8 @@ function parseTag(coreVersion: string, tag: string): ParsedSuperVersion | null {
   return { version: `${coreVersion}-super.${iteration}`, iteration };
 }
 
-export function superSynaraReleaseTitle(version: string): string {
-  return `Unofficial downstream Super Synara ${version} (unsigned prerelease)`;
-}
-
 function isOwnedDraft(release: SuperSynaraDraftRelease): boolean {
-  return (
-    release.draft &&
-    release.prerelease &&
-    release.body.includes(SUPER_SYNARA_RELEASE_DRAFTER_MARKER)
-  );
+  return release.draft && hasSuperSynaraReleaseOwnership(release);
 }
 
 export function resolveSuperSynaraDraftPlan(input: {
@@ -74,13 +68,13 @@ export function resolveSuperSynaraDraftPlan(input: {
   readonly tags: ReadonlyArray<SuperSynaraTagRef>;
   readonly releases: ReadonlyArray<SuperSynaraDraftRelease>;
 }): SuperSynaraDraftPlan {
-  assertCoreVersion(input.coreVersion);
-  assertFullSha("Source commit", input.sourceCommit);
+  assertSuperSynaraCoreVersion(input.coreVersion);
+  assertFullCommitSha("Source commit", input.sourceCommit);
 
   const matchingTags = input.tags.flatMap((tag) => {
     const parsed = parseTag(input.coreVersion, tag.name);
     if (!parsed) return [];
-    assertFullSha(`Tag ${tag.name} commit`, tag.commit);
+    assertFullCommitSha(`Tag ${tag.name} commit`, tag.commit);
     return [{ ...tag, ...parsed }];
   });
   if (matchingTags.length === 0) {
@@ -112,7 +106,7 @@ export function resolveSuperSynaraDraftPlan(input: {
     if (!Number.isSafeInteger(ownedDraft.id) || ownedDraft.id <= 0) {
       throw new Error("Owned Super Synara draft ID must be a positive safe integer.");
     }
-    if (ownedDraft.name !== superSynaraReleaseTitle(ownedDraft.version)) {
+    if (!hasExactSuperSynaraReleaseIdentity(ownedDraft, ownedDraft.version)) {
       throw new Error(`Owned Super Synara draft ${ownedDraft.id} has an unexpected title.`);
     }
     const sameTagReleases = matchingReleases.filter(

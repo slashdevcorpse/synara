@@ -3,17 +3,20 @@
 // Purpose: Resolves the exact owned draft/tag coordinates for Release Drafter.
 // Layer: Release scheduling entrypoint
 
-import { spawnSync } from "node:child_process";
 import { appendFileSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { runGh } from "./lib/gh-cli.ts";
 import { serializeReleaseGithubOutput } from "./lib/release-github-output.ts";
 import {
+  assertSuperSynaraCoreVersion,
   resolveSuperSynaraDraftPlan,
-  type SuperSynaraDraftRelease,
-  type SuperSynaraTagRef,
 } from "./lib/super-synara-release-drafter.ts";
+import {
+  parseSuperSynaraMatchingTagRefs,
+  parseSuperSynaraReleasePages,
+} from "./lib/super-synara-github-payload.ts";
 import { releasePackageFiles } from "./update-release-package-versions.ts";
 
 function parseArgs(argv: ReadonlyArray<string>): Map<string, string> {
@@ -34,14 +37,6 @@ function parseArgs(argv: ReadonlyArray<string>): Map<string, string> {
   return values;
 }
 
-function runGh(args: ReadonlyArray<string>): string {
-  const result = spawnSync("gh", [...args], { encoding: "utf8", shell: false });
-  if (result.status !== 0) {
-    throw new Error(`gh ${args.join(" ")} failed: ${(result.stderr || result.stdout).trim()}`);
-  }
-  return result.stdout;
-}
-
 const values = parseArgs(process.argv.slice(2));
 const required = (name: string): string => {
   const value = values.get(name);
@@ -60,6 +55,7 @@ const packageVersions = releasePackageFiles.map((relativePath) => {
   return { path: relativePath, version: manifest.version };
 });
 const coreVersion = packageVersions[0]!.version;
+assertSuperSynaraCoreVersion(coreVersion);
 for (const manifest of packageVersions) {
   if (manifest.version !== coreVersion) {
     throw new Error(
@@ -68,37 +64,16 @@ for (const manifest of packageVersions) {
   }
 }
 
-const tagPayload = JSON.parse(
-  runGh(["api", `repos/${repository}/git/matching-refs/tags/super-v${coreVersion}-super.`]),
-) as ReadonlyArray<{ ref: string; object: { sha: string; type: string } }>;
-const tags: ReadonlyArray<SuperSynaraTagRef> = tagPayload.map((tag) => {
-  if (tag.object.type !== "commit") {
-    throw new Error(`Super Synara tag ${tag.ref} must point directly to a commit.`);
-  }
-  return { name: tag.ref.replace(/^refs\/tags\//, ""), commit: tag.object.sha };
-});
-const releasePages = JSON.parse(
-  runGh(["api", "--paginate", "--slurp", `repos/${repository}/releases?per_page=100`]),
-) as ReadonlyArray<
-  ReadonlyArray<{
-    id: number;
-    tag_name: string;
-    target_commitish: string;
-    name: string | null;
-    body: string | null;
-    draft: boolean;
-    prerelease: boolean;
-  }>
->;
-const releases: ReadonlyArray<SuperSynaraDraftRelease> = releasePages.flat().map((release) => ({
-  id: release.id,
-  tagName: release.tag_name,
-  targetCommitish: release.target_commitish,
-  name: release.name ?? "",
-  body: release.body ?? "",
-  draft: release.draft,
-  prerelease: release.prerelease,
-}));
+const tags = parseSuperSynaraMatchingTagRefs(
+  JSON.parse(
+    runGh(["api", `repos/${repository}/git/matching-refs/tags/super-v${coreVersion}-super.`]),
+  ) as unknown,
+);
+const releases = parseSuperSynaraReleasePages(
+  JSON.parse(
+    runGh(["api", "--paginate", "--slurp", `repos/${repository}/releases?per_page=100`]),
+  ) as unknown,
+);
 const plan = resolveSuperSynaraDraftPlan({ coreVersion, sourceCommit, tags, releases });
 appendFileSync(
   githubOutput,

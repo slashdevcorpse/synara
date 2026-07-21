@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   parseWorkflowPolicy,
+  validateMergifyConfiguration,
   validateRepositoryWorkflowStates,
   validateVouchedConfiguration,
   validateWorkflowContracts,
@@ -60,7 +61,7 @@ const policy = (): WorkflowPolicy => ({
     {
       path: ".github/workflows/super-synara-prerelease.yml",
       requiredOnDefaultBranch: false,
-      triggers: ["workflow_dispatch"],
+      triggers: ["workflow_call"],
     },
     {
       path: ".github/workflows/super-synara-macos-signature-audit.yml",
@@ -304,10 +305,31 @@ jobs:
     steps:
       - uses: release-drafter/release-drafter@eada3c96a64734dd381cfbda23511034e328ddb0 # v7.6.0
   dispatch:
-    runs-on: ubuntu-24.04
+    uses: ./.github/workflows/super-synara-prerelease.yml
     permissions:
-      actions: write
-      contents: read
+      actions: read
+      contents: write
+`;
+
+const mergifyConfiguration = `merge_queue:
+  mode: serial
+merge_protections_settings:
+  auto_merge_conditions:
+    - label = ready-to-merge
+merge_protections:
+  - name: protected-main
+    if:
+      - base = main
+    success_conditions:
+      - -draft
+      - -conflict
+queue_rules:
+  - name: default
+    batch_size: 1
+    branch_protection_injection_mode: queue
+    merge_method: squash
+    queue_conditions:
+      - base = main
 `;
 
 function validFiles(): Map<string, string> {
@@ -324,6 +346,18 @@ function validFiles(): Map<string, string> {
 describe("workflow contracts", () => {
   it("accepts pinned, read-only PR CI and the narrowly scoped watcher", () => {
     expect(validateWorkflowContracts(validFiles(), policy())).toEqual([]);
+    expect(validateMergifyConfiguration(mergifyConfiguration)).toEqual([]);
+  });
+
+  it("locks Mergify to the protected-main queue ruleset", () => {
+    expect(
+      validateMergifyConfiguration(
+        mergifyConfiguration.replace(
+          "branch_protection_injection_mode: queue",
+          "branch_protection_injection_mode: none",
+        ),
+      ).join("\n"),
+    ).toContain("inject the strict protected-main ruleset");
   });
 
   it("rejects mutable action tags even in disabled workflows", () => {
@@ -623,7 +657,7 @@ describe("workflow contracts", () => {
     );
   });
 
-  it("limits release scheduling writes to draft contents and workflow dispatch", () => {
+  it("limits release scheduling writes to draft and called publication contents", () => {
     const excessiveDraftPermission = validFiles();
     excessiveDraftPermission.set(
       ".github/workflows/release-drafter.yml",
@@ -637,12 +671,12 @@ describe("workflow contracts", () => {
     excessiveDispatchPermission.set(
       ".github/workflows/release-drafter.yml",
       releaseDrafterWorkflow.replace(
-        "      actions: write\n      contents: read",
+        "      actions: read\n      contents: write",
         "      actions: write\n      contents: write",
       ),
     );
     expect(validateWorkflowContracts(excessiveDispatchPermission, policy()).join("\n")).toContain(
-      "unsupported contents: write at jobs.dispatch.permissions",
+      "unsupported actions: write at jobs.dispatch.permissions",
     );
   });
 

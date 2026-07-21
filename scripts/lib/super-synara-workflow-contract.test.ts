@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   verifySuperSynaraGithubStateScriptText,
+  verifySuperSynaraReleasePlannerScriptText,
   verifySuperSynaraReleaseDrafterText,
   verifySuperSynaraWorkflowContracts,
   verifySuperSynaraWorkflowText,
@@ -32,9 +33,13 @@ const githubStateScript = readFileSync(
   resolve(repoRoot, "scripts/verify-super-synara-github-state.ts"),
   "utf8",
 ).replaceAll("\r\n", "\n");
+const releasePlannerScript = readFileSync(
+  resolve(repoRoot, "scripts/plan-super-synara-release-drafter.ts"),
+  "utf8",
+).replaceAll("\r\n", "\n");
 
 describe("Super Synara workflow contracts", () => {
-  it("admits the manual fail-closed workflow pair", () => {
+  it("admits the controller-called publication and manual audit workflows", () => {
     expect(() => verifySuperSynaraWorkflowContracts(repoRoot)).not.toThrow();
   });
 
@@ -47,7 +52,7 @@ describe("Super Synara workflow contracts", () => {
           "const visibilityAttempts = 1;",
         ),
       ),
-    ).toThrow("retry visibility boundedly");
+    ).toThrow(/retry visibility boundedly|bounded polling delays/);
     expect(() =>
       verifySuperSynaraGithubStateScriptText(
         githubStateScript.replace(
@@ -55,7 +60,7 @@ describe("Super Synara workflow contracts", () => {
           "return;",
         ),
       ),
-    ).toThrow("retry visibility boundedly");
+    ).toThrow(/retry visibility boundedly|bounded polling delays/);
     expect(() =>
       verifySuperSynaraGithubStateScriptText(
         githubStateScript.replace("  try {\n    const refJson", "  const refJson"),
@@ -63,10 +68,24 @@ describe("Super Synara workflow contracts", () => {
     ).toThrow("retry visibility boundedly");
   });
 
-  it("rejects automatic triggers and mutable action tags", () => {
+  it("validates release versions before any GitHub API request", () => {
+    expect(() => verifySuperSynaraReleasePlannerScriptText(releasePlannerScript)).not.toThrow();
     expect(() =>
-      verifySuperSynaraWorkflowText(main.replace("workflow_dispatch:", "push:"), audit),
-    ).toThrow("manual-only");
+      verifySuperSynaraReleasePlannerScriptText(
+        releasePlannerScript.replace("assertSuperSynaraCoreVersion(coreVersion);", ""),
+      ),
+    ).toThrow("before constructing a GitHub API request");
+    expect(() =>
+      verifySuperSynaraReleasePlannerScriptText(
+        releasePlannerScript.replace("parseSuperSynaraReleasePages(", "trustReleasePages("),
+      ),
+    ).toThrow("decode release pages");
+  });
+
+  it("rejects direct publication triggers and mutable action tags", () => {
+    expect(() =>
+      verifySuperSynaraWorkflowText(main.replace("workflow_call:", "workflow_dispatch:"), audit),
+    ).toThrow("callable only by its protected-main controller");
     expect(() =>
       verifySuperSynaraWorkflowText(
         main.replace(
@@ -163,10 +182,13 @@ describe("Super Synara workflow contracts", () => {
     ).toThrow(/authorize the real owner|authorize and preserve the real triggering owner/);
     expect(() =>
       verifySuperSynaraReleaseDrafterText(
-        releaseDrafter.replace('-f "controller_actor=$CONTROLLER_ACTOR" \\\n', ""),
+        releaseDrafter.replace(
+          "uses: ./.github/workflows/super-synara-prerelease.yml",
+          "uses: attacker/release-workflow/.github/workflows/publish.yml@main",
+        ),
         releaseDrafterConfig,
       ),
-    ).toThrow("propagate verified controller provenance");
+    ).toThrow(/not pinned|local publisher/);
     expect(() =>
       verifySuperSynaraReleaseDrafterText(
         releaseDrafter.replace(
@@ -176,6 +198,21 @@ describe("Super Synara workflow contracts", () => {
         releaseDrafterConfig,
       ),
     ).toThrow("dispatch must be unreachable for pushes and no-change schedules");
+    expect(() =>
+      verifySuperSynaraReleaseDrafterText(
+        releaseDrafter.replace(
+          "release_scope: ${{ github.event_name == 'workflow_dispatch' && inputs.release_scope || 'windows-only' }}",
+          "release_scope: windows-and-macos",
+        ),
+        releaseDrafterConfig,
+      ),
+    ).toThrow("exact draft identity and least privilege");
+    expect(() =>
+      verifySuperSynaraReleaseDrafterText(
+        releaseDrafter.replace("    needs: draft", "    needs: unrelated"),
+        releaseDrafterConfig,
+      ),
+    ).toThrow("exact draft identity and least privilege");
     expect(() =>
       verifySuperSynaraReleaseDrafterText(
         releaseDrafter,
@@ -534,10 +571,13 @@ describe("Super Synara workflow contracts", () => {
     ).toThrow("explicit tag matches the version");
     expect(() =>
       verifySuperSynaraWorkflowText(
-        main.replace("group: super-synara-prerelease", "group: alternate-release"),
+        main.replace(
+          "permissions:\n  actions: read\n  contents: read",
+          "permissions:\n  actions: read\n  contents: read\n\nconcurrency:\n  group: alternate-release",
+        ),
         audit,
       ),
-    ).toThrow("plan-locked concurrency group");
+    ).toThrow("inherit controller serialization");
     expect(() =>
       verifySuperSynaraWorkflowText(
         main.replace("default: windows-only", "default: windows-and-macos"),

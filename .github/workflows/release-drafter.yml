@@ -178,62 +178,14 @@ jobs:
     name: Dispatch weekly exact-artifact prerelease
     if: ${{ github.event_name != 'push' && needs.draft.outputs.should_release == 'true' }}
     needs: draft
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    uses: ./.github/workflows/super-synara-prerelease.yml
     permissions:
-      actions: write
-      contents: read
-    steps:
-      - name: Checkout exact drafted source
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
-        with:
-          ref: ${{ needs.draft.outputs.source_sha }}
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Revalidate exact main and owned draft
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          SOURCE_SHA: ${{ needs.draft.outputs.source_sha }}
-          TAG: ${{ needs.draft.outputs.tag }}
-          DRAFT_ID: ${{ needs.draft.outputs.draft_id }}
-        run: |
-          set -euo pipefail
-          current_main_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)"
-          [[ "$current_main_sha" == "$SOURCE_SHA" ]]
-          node scripts/verify-super-synara-github-state.ts \
-            --phase preflight \
-            --repository "$GITHUB_REPOSITORY" \
-            --ref-name main \
-            --actor 'github-actions[bot]' \
-            --triggering-actor 'github-actions[bot]' \
-            --owner "$GITHUB_REPOSITORY_OWNER" \
-            --tag "$TAG" \
-            --source-commit "$SOURCE_SHA" \
-            --current-run-draft-id "$DRAFT_ID"
-
-      - name: Dispatch exact-artifact unsigned prerelease
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          SOURCE_SHA: ${{ needs.draft.outputs.source_sha }}
-          VERSION: ${{ needs.draft.outputs.version }}
-          TAG: ${{ needs.draft.outputs.tag }}
-          DRAFT_ID: ${{ needs.draft.outputs.draft_id }}
-          RELEASE_SCOPE: ${{ github.event_name == 'workflow_dispatch' && inputs.release_scope || 'windows-only' }}
-          CONTROLLER_ACTOR: ${{ github.run_attempt > 1 && github.triggering_actor || (github.event_name == 'workflow_dispatch' && github.actor || 'github-actions[bot]') }}
-          CONTROLLER_TRIGGERING_ACTOR: ${{ github.run_attempt > 1 && github.triggering_actor || (github.event_name == 'workflow_dispatch' && github.triggering_actor || 'github-actions[bot]') }}
-        run: |
-          set -euo pipefail
-          gh workflow run super-synara-prerelease.yml \
-            --repo "$GITHUB_REPOSITORY" \
-            --ref main \
-            -f "version=$VERSION" \
-            -f "tag=$TAG" \
-            -f "release_scope=$RELEASE_SCOPE" \
-            -f "expected_source_sha=$SOURCE_SHA" \
-            -f "release_draft_id=$DRAFT_ID" \
-            -f "controller_actor=$CONTROLLER_ACTOR" \
-            -f "controller_triggering_actor=$CONTROLLER_TRIGGERING_ACTOR" \
-            -f confirm_unsigned=true
+      actions: read
+      contents: write
+    with:
+      version: ${{ needs.draft.outputs.version }}
+      tag: ${{ needs.draft.outputs.tag }}
+      release_scope: ${{ github.event_name == 'workflow_dispatch' && inputs.release_scope || 'windows-only' }}
+      expected_source_sha: ${{ needs.draft.outputs.source_sha }}
+      release_draft_id: ${{ needs.draft.outputs.draft_id }}
+      confirm_unsigned: true

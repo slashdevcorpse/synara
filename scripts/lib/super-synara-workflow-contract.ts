@@ -118,6 +118,7 @@ function verifyReleaseScopeCase(preflightJob: UnknownRecord): void {
   }
   const expectedPrefix = [
     "set -euo pipefail",
+    '[[ "$CALLER_WORKFLOW_REF" == "$GITHUB_REPOSITORY/.github/workflows/release-drafter.yml@refs/heads/main" ]]',
     '[[ "$CONFIRMED" == "true" ]]',
     '[[ "$REF_PROTECTED" == "true" ]]',
     '[[ "$EXPECTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]',
@@ -125,15 +126,6 @@ function verifyReleaseScopeCase(preflightJob: UnknownRecord): void {
     '[[ "$RELEASE_DRAFT_ID" =~ ^[1-9][0-9]*$ ]]',
     'validation_actor="$EVENT_ACTOR"',
     'validation_triggering_actor="$EVENT_TRIGGERING_ACTOR"',
-    'if [[ "$EVENT_ACTOR" == "github-actions[bot]" ]]; then',
-    'if [[ "$EVENT_TRIGGERING_ACTOR" != "github-actions[bot]" ]]; then',
-    'validation_actor="$EVENT_TRIGGERING_ACTOR"',
-    'validation_triggering_actor="$EVENT_TRIGGERING_ACTOR"',
-    "else",
-    'validation_actor="$CONTROLLER_ACTOR"',
-    'validation_triggering_actor="$CONTROLLER_TRIGGERING_ACTOR"',
-    "fi",
-    "fi",
     '[[ -n "$validation_actor" ]]',
     '[[ -n "$validation_triggering_actor" ]]',
     '[[ "$VERSION" =~ ^[0-9]+\\.[0-9]+\\.[0-9]+-super\\.[1-9][0-9]*$ ]]',
@@ -470,6 +462,12 @@ function requirePinnedActions(workflow: string, label: string): void {
   const uses = [...workflow.matchAll(/^\s*uses:\s*(\S+)/gm)].map((match) => match[1]!);
   if (uses.length === 0) throw new Error(`${label} must use explicitly pinned actions.`);
   for (const action of uses) {
+    if (
+      label === "Release Drafter scheduler" &&
+      action === "./.github/workflows/super-synara-prerelease.yml"
+    ) {
+      continue;
+    }
     if (!/^[^@\s]+@[0-9a-f]{40}$/.test(action)) {
       throw new Error(`${label} action is not pinned to a full commit: ${action}.`);
     }
@@ -479,36 +477,44 @@ function requirePinnedActions(workflow: string, label: string): void {
 export function verifySuperSynaraWorkflowText(main: string, audit: string): void {
   main = main.replaceAll("\r\n", "\n");
   audit = audit.replaceAll("\r\n", "\n");
-  for (const [label, workflow] of [
-    ["Publication workflow", main],
-    ["Audit workflow", audit],
-  ] as const) {
-    requireText(workflow, "workflow_dispatch:", `${label} must be manual-only.`);
-    prohibitText(workflow, "\n  push:", `${label} must not have a push trigger.`);
-    prohibitText(workflow, "pull_request:", `${label} must not have a pull-request trigger.`);
-    requireText(workflow, "cancel-in-progress: false", `${label} must serialize reruns.`);
-    requirePinnedActions(workflow, label);
-    prohibitText(workflow, "secrets.", `${label} must not consume signing or publication secrets.`);
-    prohibitText(workflow, "id-token:", `${label} must not request identity-token permission.`);
+  const workflow = publicationWorkflow(main);
+  const triggers = workflow.on;
+  if (!isRecord(triggers) || JSON.stringify(Object.keys(triggers)) !== '["workflow_call"]') {
+    throw new Error("Publication workflow must be callable only by its protected-main controller.");
   }
-  requireText(main, "queue: max", "Publication workflow must preserve every serialized rerun.");
+  prohibitText(
+    main,
+    "\nconcurrency:",
+    "Called publication workflow must inherit controller serialization.",
+  );
+  requirePinnedActions(main, "Publication workflow");
+  prohibitText(main, "secrets.", "Publication workflow must not consume signing secrets.");
+  prohibitText(
+    main,
+    "id-token:",
+    "Publication workflow must not request identity-token permission.",
+  );
+
+  requireText(audit, "workflow_dispatch:", "Audit workflow must be manual-only.");
+  prohibitText(audit, "\n  push:", "Audit workflow must not have a push trigger.");
+  prohibitText(audit, "pull_request:", "Audit workflow must not have a pull-request trigger.");
+  requireText(audit, "cancel-in-progress: false", "Audit workflow must serialize reruns.");
+  requirePinnedActions(audit, "Audit workflow");
+  prohibitText(audit, "secrets.", "Audit workflow must not consume signing secrets.");
+  prohibitText(audit, "id-token:", "Audit workflow must not request identity-token permission.");
 
   for (const job of ["preflight", "windows_x64", "macos_arm64", "publish"]) {
     requireText(main, `\n  ${job}:`, `Publication workflow is missing the ${job} job.`);
   }
   const jobs = publicationJobs(main);
-  const workflow = publicationWorkflow(main);
-  const triggers = workflow.on;
-  const dispatch = isRecord(triggers) ? triggers.workflow_dispatch : undefined;
-  const inputs = isRecord(dispatch) ? dispatch.inputs : undefined;
+  const workflowCall = triggers.workflow_call;
+  const inputs = isRecord(workflowCall) ? workflowCall.inputs : undefined;
   const releaseScopeInput = isRecord(inputs) ? inputs.release_scope : undefined;
   if (
     !isRecord(releaseScopeInput) ||
-    releaseScopeInput.type !== "choice" ||
+    releaseScopeInput.type !== "string" ||
     releaseScopeInput.required !== true ||
-    releaseScopeInput.default !== WINDOWS_RELEASE_SCOPE ||
-    JSON.stringify(releaseScopeInput.options) !==
-      JSON.stringify([WINDOWS_RELEASE_SCOPE, MACOS_RELEASE_SCOPE])
+    releaseScopeInput.default !== WINDOWS_RELEASE_SCOPE
   ) {
     throw new Error("Publication release-scope contract must default to exact Windows x64.");
   }
@@ -619,8 +625,7 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
   for (const scopeNeedle of [
     "release_scope:",
     `default: ${WINDOWS_RELEASE_SCOPE}`,
-    `- ${WINDOWS_RELEASE_SCOPE}`,
-    `- ${MACOS_RELEASE_SCOPE}`,
+    "type: string",
   ]) {
     requireText(main, scopeNeedle, `Publication release-scope contract is missing ${scopeNeedle}.`);
   }
@@ -629,10 +634,15 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
     '[[ "$TAG" == "super-v$VERSION" ]]',
     "Publication must fail unless the explicit tag matches the version.",
   );
+  prohibitText(
+    main,
+    "controller_actor",
+    "Publication must not trust caller-supplied actor identity.",
+  );
   requireText(
     main,
-    "group: super-synara-prerelease",
-    "Publication must use the plan-locked concurrency group.",
+    '[[ "$CALLER_WORKFLOW_REF" == "$GITHUB_REPOSITORY/.github/workflows/release-drafter.yml@refs/heads/main" ]]',
+    "Publication must authenticate the exact protected-main controller workflow.",
   );
   requireText(
     main,
@@ -1031,7 +1041,10 @@ export function verifySuperSynaraReleaseDrafterText(
 
   const jobs = publicationJobs(scheduler);
   const draftJob = publicationJob(jobs, "draft");
-  const dispatchJob = publicationJob(jobs, "dispatch");
+  const dispatchJob = jobs.dispatch;
+  if (!isRecord(dispatchJob)) {
+    throw new Error("Release Drafter scheduler must define the reusable publication call.");
+  }
   const draftOutputs = draftJob.outputs;
   if (
     !isRecord(draftOutputs) ||
@@ -1118,21 +1131,6 @@ export function verifySuperSynaraReleaseDrafterText(
       "Release Drafter reruns must authorize and preserve the real triggering owner before mutation.",
     );
   }
-  requireText(
-    scheduler,
-    "github.run_attempt > 1 && github.triggering_actor",
-    "Release Drafter reruns must preserve the real triggering actor.",
-  );
-  for (const actorBinding of [
-    '-f "controller_actor=$CONTROLLER_ACTOR"',
-    '-f "controller_triggering_actor=$CONTROLLER_TRIGGERING_ACTOR"',
-  ]) {
-    requireText(
-      scheduler,
-      actorBinding,
-      "Release Drafter dispatch must propagate verified controller provenance.",
-    );
-  }
   if (
     actionStep.uses !== RELEASE_DRAFTER_ACTION ||
     actionStep.if !== RELEASE_DRAFTER_GATE_CONDITION ||
@@ -1162,16 +1160,27 @@ export function verifySuperSynaraReleaseDrafterText(
       "Release Drafter dispatch must be unreachable for pushes and no-change schedules.",
     );
   }
-  requireText(
-    scheduler,
-    '-f "expected_source_sha=$SOURCE_SHA"',
-    "Release Drafter dispatch must bind the exact protected-main SHA.",
-  );
-  requireText(
-    scheduler,
-    '-f "release_draft_id=$DRAFT_ID"',
-    "Release Drafter dispatch must bind the exact owned draft ID.",
-  );
+  const dispatchPermissions = dispatchJob.permissions;
+  const dispatchInputs = dispatchJob.with;
+  if (
+    dispatchJob.uses !== "./.github/workflows/super-synara-prerelease.yml" ||
+    dispatchJob.needs !== "draft" ||
+    !isRecord(dispatchPermissions) ||
+    dispatchPermissions.actions !== "read" ||
+    dispatchPermissions.contents !== "write" ||
+    !isRecord(dispatchInputs) ||
+    dispatchInputs.version !== "${{ needs.draft.outputs.version }}" ||
+    dispatchInputs.tag !== "${{ needs.draft.outputs.tag }}" ||
+    dispatchInputs.release_scope !==
+      "${{ github.event_name == 'workflow_dispatch' && inputs.release_scope || 'windows-only' }}" ||
+    dispatchInputs.expected_source_sha !== "${{ needs.draft.outputs.source_sha }}" ||
+    dispatchInputs.release_draft_id !== "${{ needs.draft.outputs.draft_id }}" ||
+    dispatchInputs.confirm_unsigned !== true
+  ) {
+    throw new Error(
+      "Release Drafter dispatch must call the local publisher with exact draft identity and least privilege.",
+    );
+  }
 
   for (const configNeedle of [
     'tag-template: "super-v$RESOLVED_VERSION"',
@@ -1195,15 +1204,15 @@ export function verifySuperSynaraGithubStateScriptText(script: string): void {
   script = script.replaceAll("\r\n", "\n");
   const orderedNeedles = [
     "const visibilityAttempts = 30;",
+    "validateSuperSynaraGitHubPolicy({",
     "for (let attempt = 1; attempt <= visibilityAttempts; attempt += 1)",
     "try {",
     "const refJson = runGh(",
-    "const releasePages = JSON.parse(",
+    "parseSuperSynaraTagObject(JSON.parse(refJson))",
+    "releases = parseSuperSynaraReleasePages(releasePages);",
     "validateSuperSynaraGitHubState({",
-    "} catch (error) {",
-    "if (attempt < visibilityAttempts)",
-    "Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1_000);",
-    "throw lastValidationError;",
+    "if (!(error instanceof SuperSynaraGitHubStateVisibilityError)) throw error;",
+    "throw lastTransientError",
   ];
   let previousIndex = -1;
   for (const needle of orderedNeedles) {
@@ -1217,8 +1226,46 @@ export function verifySuperSynaraGithubStateScriptText(script: string): void {
   }
   requireText(
     script,
-    'const releasePages = JSON.parse(\n      runGh(["api", "--paginate", "--slurp", `repos/${repository}/releases?per_page=100`]),',
+    'runGh(["api", "--paginate", "--slurp", `repos/${repository}/releases?per_page=100`])',
     "GitHub release-state visibility retries must re-read the complete release list.",
+  );
+  requireText(
+    script,
+    "if (!(error instanceof GhCliRequestError) || !error.retryable) throw error;",
+    "GitHub release-state verification must retry only classified transient GitHub reads.",
+  );
+  if (
+    script.split("Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1_000);").length -
+      1 !==
+    2
+  ) {
+    throw new Error("GitHub release-state verification must use bounded polling delays.");
+  }
+}
+
+export function verifySuperSynaraReleasePlannerScriptText(script: string): void {
+  script = script.replaceAll("\r\n", "\n");
+  const coreVersionIndex = script.indexOf("const coreVersion = packageVersions[0]!.version;");
+  const validationIndex = script.indexOf("assertSuperSynaraCoreVersion(coreVersion);");
+  const firstGitHubReadIndex = script.indexOf("runGh(");
+  if (
+    coreVersionIndex < 0 ||
+    validationIndex <= coreVersionIndex ||
+    firstGitHubReadIndex <= validationIndex
+  ) {
+    throw new Error(
+      "Release planner must validate the package core version before constructing a GitHub API request.",
+    );
+  }
+  requireText(
+    script,
+    "parseSuperSynaraMatchingTagRefs(",
+    "Release planner must decode matching tag refs at the GitHub boundary.",
+  );
+  requireText(
+    script,
+    "parseSuperSynaraReleasePages(",
+    "Release planner must decode release pages at the GitHub boundary.",
   );
 }
 
@@ -1236,5 +1283,8 @@ export function verifySuperSynaraWorkflowContracts(repoRoot: string): void {
   );
   verifySuperSynaraGithubStateScriptText(
     readFileSync(resolve(repoRoot, "scripts/verify-super-synara-github-state.ts"), "utf8"),
+  );
+  verifySuperSynaraReleasePlannerScriptText(
+    readFileSync(resolve(repoRoot, "scripts/plan-super-synara-release-drafter.ts"), "utf8"),
   );
 }

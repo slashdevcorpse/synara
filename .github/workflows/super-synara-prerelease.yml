@@ -1,14 +1,14 @@
 name: Publish Super Synara Unsigned Prerelease
 
 on:
-  workflow_dispatch:
+  workflow_call:
     inputs:
       version:
-        description: "Downstream version (for example 0.5.5-super.1)"
+        description: "Exact downstream prerelease version"
         required: true
         type: string
       tag:
-        description: "Exact immutable tag (for example super-v0.5.5-super.1)"
+        description: "Exact immutable prerelease tag"
         required: true
         type: string
       expected_source_sha:
@@ -19,37 +19,19 @@ on:
         description: "Exact owned Release Drafter draft ID"
         required: true
         type: string
-      controller_actor:
-        description: "Verified initiating actor from the release controller"
-        required: false
-        default: ""
-        type: string
-      controller_triggering_actor:
-        description: "Verified initiating rerun actor from the release controller"
-        required: false
-        default: ""
-        type: string
       release_scope:
         description: "Exact platform set to publish"
         required: true
         default: windows-only
-        type: choice
-        options:
-          - windows-only
-          - windows-and-macos
+        type: string
       confirm_unsigned:
-        description: "I understand this publishes unsigned installers with operating-system warnings"
+        description: "Explicit unsigned-publication confirmation"
         required: true
-        default: false
         type: boolean
 
 permissions:
+  actions: read
   contents: read
-
-concurrency:
-  group: super-synara-prerelease
-  queue: max
-  cancel-in-progress: false
 
 jobs:
   preflight:
@@ -114,12 +96,12 @@ jobs:
           EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
           WORKFLOW_SOURCE_SHA: ${{ github.sha }}
           RELEASE_DRAFT_ID: ${{ inputs.release_draft_id }}
-          CONTROLLER_ACTOR: ${{ inputs.controller_actor }}
-          CONTROLLER_TRIGGERING_ACTOR: ${{ inputs.controller_triggering_actor }}
           EVENT_ACTOR: ${{ github.actor }}
           EVENT_TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
         run: |
           set -euo pipefail
+          [[ "$CALLER_WORKFLOW_REF" == "$GITHUB_REPOSITORY/.github/workflows/release-drafter.yml@refs/heads/main" ]]
           [[ "$CONFIRMED" == "true" ]]
           [[ "$REF_PROTECTED" == "true" ]]
           [[ "$EXPECTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
@@ -127,15 +109,6 @@ jobs:
           [[ "$RELEASE_DRAFT_ID" =~ ^[1-9][0-9]*$ ]]
           validation_actor="$EVENT_ACTOR"
           validation_triggering_actor="$EVENT_TRIGGERING_ACTOR"
-          if [[ "$EVENT_ACTOR" == "github-actions[bot]" ]]; then
-            if [[ "$EVENT_TRIGGERING_ACTOR" != "github-actions[bot]" ]]; then
-              validation_actor="$EVENT_TRIGGERING_ACTOR"
-              validation_triggering_actor="$EVENT_TRIGGERING_ACTOR"
-            else
-              validation_actor="$CONTROLLER_ACTOR"
-              validation_triggering_actor="$CONTROLLER_TRIGGERING_ACTOR"
-            fi
-          fi
           [[ -n "$validation_actor" ]]
           [[ -n "$validation_triggering_actor" ]]
           [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+-super\.[1-9][0-9]*$ ]]

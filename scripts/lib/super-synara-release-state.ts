@@ -2,10 +2,8 @@
 // Purpose: Validates owner, tag, draft, rerun, and publication state transitions.
 // Layer: Release publication admission
 
-import {
-  SUPER_SYNARA_RELEASE_DRAFTER_MARKER,
-  superSynaraReleaseTitle,
-} from "./super-synara-release-drafter.ts";
+import { assertFullCommitSha } from "./git-sha.ts";
+import { hasExactSuperSynaraReleaseIdentity } from "./super-synara-release-identity.ts";
 
 export type SuperSynaraReleasePhase =
   | "preflight"
@@ -39,13 +37,23 @@ export interface SuperSynaraGitHubStateInput {
   readonly currentRunDraftId?: number;
 }
 
-function assertFullSha(label: string, value: string): void {
-  if (!/^[0-9a-f]{40}$/i.test(value)) {
-    throw new Error(`${label} must be a full 40-character commit SHA.`);
-  }
+export type SuperSynaraGitHubPolicyInput = Pick<
+  SuperSynaraGitHubStateInput,
+  | "repository"
+  | "refName"
+  | "actor"
+  | "triggeringActor"
+  | "owner"
+  | "tag"
+  | "sourceCommit"
+  | "currentRunDraftId"
+>;
+
+export class SuperSynaraGitHubStateVisibilityError extends Error {
+  override readonly name = "SuperSynaraGitHubStateVisibilityError";
 }
 
-export function validateSuperSynaraGitHubState(input: SuperSynaraGitHubStateInput): void {
+export function validateSuperSynaraGitHubPolicy(input: SuperSynaraGitHubPolicyInput): void {
   if (input.repository !== "slashdevcorpse/synara" || input.refName !== "main") {
     throw new Error(
       "Super Synara publication is restricted to slashdevcorpse/synara protected main.",
@@ -62,12 +70,19 @@ export function validateSuperSynaraGitHubState(input: SuperSynaraGitHubStateInpu
   if (!/^super-v\d+\.\d+\.\d+-super\.[1-9]\d*$/.test(input.tag)) {
     throw new Error(`Invalid immutable Super Synara tag: ${input.tag}.`);
   }
-  assertFullSha("Source commit", input.sourceCommit);
+  assertFullCommitSha("Source commit", input.sourceCommit);
+  if (!Number.isSafeInteger(input.currentRunDraftId) || input.currentRunDraftId! <= 0) {
+    throw new Error("Publication requires the exact current-run GitHub draft release ID.");
+  }
+}
+
+export function validateSuperSynaraGitHubState(input: SuperSynaraGitHubStateInput): void {
+  validateSuperSynaraGitHubPolicy(input);
   if (input.tagCommit !== null) {
     if (input.tagObjectType !== "commit") {
       throw new Error(`Reserved tag ${input.tag} must resolve directly to a commit object.`);
     }
-    assertFullSha("Tag commit", input.tagCommit);
+    assertFullCommitSha("Tag commit", input.tagCommit);
     if (input.tagCommit.toLowerCase() !== input.sourceCommit.toLowerCase()) {
       throw new Error(
         `Reserved tag ${input.tag} points to ${input.tagCommit}, not ${input.sourceCommit}.`,
@@ -80,28 +95,35 @@ export function validateSuperSynaraGitHubState(input: SuperSynaraGitHubStateInpu
 
   const tagReleases = input.releases.filter((release) => release.tagName === input.tag);
   if (input.phase === "after-publish" && input.tagCommit === null) {
-    throw new Error("Published release requires the immutable tag at the exact source commit.");
+    throw new SuperSynaraGitHubStateVisibilityError(
+      "Published release requires the immutable tag at the exact source commit.",
+    );
   }
-  if (!Number.isSafeInteger(input.currentRunDraftId) || input.currentRunDraftId! <= 0) {
-    throw new Error("Publication requires the exact current-run GitHub draft release ID.");
+  if (tagReleases.length === 0) {
+    throw new SuperSynaraGitHubStateVisibilityError(
+      `Expected the current-run release for ${input.tag}, but it is not visible yet.`,
+    );
   }
-  if (tagReleases.length !== 1) {
+  if (tagReleases.length > 1) {
     throw new Error(
-      `Expected exactly one current-run draft for ${input.tag}, found ${tagReleases.length}.`,
+      `Expected exactly one current-run release for ${input.tag}, found ${tagReleases.length}.`,
     );
   }
   const release = tagReleases[0]!;
   const version = input.tag.replace(/^super-v/, "");
   const expectedDraft = input.phase !== "after-publish";
+  if (release.id !== input.currentRunDraftId) {
+    throw new Error(
+      `Release ${release.id} for ${input.tag} is not current-run draft ${input.currentRunDraftId}.`,
+    );
+  }
   if (
-    release.id !== input.currentRunDraftId ||
     release.draft !== expectedDraft ||
     !release.prerelease ||
     release.targetCommitish.toLowerCase() !== input.sourceCommit.toLowerCase() ||
-    release.name !== superSynaraReleaseTitle(version) ||
-    !release.body.includes(SUPER_SYNARA_RELEASE_DRAFTER_MARKER)
+    !hasExactSuperSynaraReleaseIdentity(release, version)
   ) {
-    throw new Error(
+    throw new SuperSynaraGitHubStateVisibilityError(
       `Existing release is not the exact owned Release Drafter ${expectedDraft ? "draft " : ""}prerelease for the source commit.`,
     );
   }

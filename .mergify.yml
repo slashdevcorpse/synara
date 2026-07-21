@@ -16,6 +16,7 @@ merge_protections:
 queue_rules:
   - name: default
     batch_size: 1
+    # The active strict main ruleset is the single source of truth for required checks.
     branch_protection_injection_mode: queue
     merge_method: squash
     queue_conditions:

@@ -739,6 +739,12 @@ function validateActionPins(path: string, contents: string, errors: string[]): v
     const match = line.match(/^\s*(?:-\s+)?uses:\s*([^\s#]+)(?:\s+#\s*(.+))?\s*$/);
     if (!match) continue;
     const action = match[1]!;
+    if (
+      path === ".github/workflows/release-drafter.yml" &&
+      action === "./.github/workflows/super-synara-prerelease.yml"
+    ) {
+      continue;
+    }
     const separator = action.lastIndexOf("@");
     const ref = separator >= 0 ? action.slice(separator + 1) : "";
     if (!FULL_ACTION_SHA.test(ref)) {
@@ -754,7 +760,7 @@ function allowedWritePermission(path: string, location: string, scope: string): 
   if (path === ".github/workflows/release-drafter.yml") {
     return (
       (location === "jobs.draft.permissions" && scope === "contents") ||
-      (location === "jobs.dispatch.permissions" && scope === "actions")
+      (location === "jobs.dispatch.permissions" && scope === "contents")
     );
   }
   if (
@@ -951,6 +957,39 @@ export function validateVouchedConfiguration(contents: string): readonly string[
     .filter((line) => line.length > 0 && !line.startsWith("#"));
   if (entries.length === 1 && entries[0] === "github:slashdevcorpse") return [];
   return [".github/VOUCHED.td must contain exactly one trusted identity: github:slashdevcorpse."];
+}
+
+export function validateMergifyConfiguration(contents: string): readonly string[] {
+  let raw: unknown;
+  try {
+    raw = parseYaml(contents, { strict: true, uniqueKeys: true });
+  } catch (error) {
+    return [`.mergify.yml is not valid YAML: ${error instanceof Error ? error.message : error}`];
+  }
+  const expected = {
+    merge_queue: { mode: "serial" },
+    merge_protections_settings: { auto_merge_conditions: ["label = ready-to-merge"] },
+    merge_protections: [
+      {
+        name: "protected-main",
+        if: ["base = main"],
+        success_conditions: ["-draft", "-conflict"],
+      },
+    ],
+    queue_rules: [
+      {
+        name: "default",
+        batch_size: 1,
+        branch_protection_injection_mode: "queue",
+        merge_method: "squash",
+        queue_conditions: ["base = main"],
+      },
+    ],
+  };
+  if (JSON.stringify(raw) === JSON.stringify(expected)) return [];
+  return [
+    ".mergify.yml must preserve serial, label-gated squash merging and inject the strict protected-main ruleset into the queue.",
+  ];
 }
 
 export function validateRepositoryWorkflowStates(

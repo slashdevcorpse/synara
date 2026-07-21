@@ -52,7 +52,7 @@
     {
       "path": ".github/workflows/super-synara-prerelease.yml",
       "requiredOnDefaultBranch": false,
-      "triggers": ["workflow_dispatch"]
+      "triggers": ["workflow_call"]
     },
     {
       "path": ".github/workflows/super-synara-macos-signature-audit.yml",

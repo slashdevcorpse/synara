@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  SuperSynaraGitHubStateVisibilityError,
   type SuperSynaraGitHubStateInput,
+  validateSuperSynaraGitHubPolicy,
   validateSuperSynaraGitHubState,
 } from "./super-synara-release-state.ts";
 import {
@@ -41,6 +43,18 @@ function exactDraft() {
 }
 
 describe("Super Synara GitHub release state", () => {
+  it("rejects permanent policy defects before GitHub visibility polling", () => {
+    expect(() => validateSuperSynaraGitHubPolicy(state({ actor: "attacker" }))).toThrow(
+      "repository owner or its exact GitHub Actions scheduler",
+    );
+    expect(() => validateSuperSynaraGitHubPolicy(state({ sourceCommit: "short" }))).toThrow(
+      "full 40-character",
+    );
+    expect(() => validateSuperSynaraGitHubPolicy(state({ currentRunDraftId: 0 }))).toThrow(
+      "exact current-run GitHub draft release ID",
+    );
+  });
+
   it("allows an exact owned draft with no tag or an exact preexisting tag", () => {
     expect(() => validateSuperSynaraGitHubState(state())).not.toThrow();
     expect(() =>
@@ -104,7 +118,28 @@ describe("Super Synara GitHub release state", () => {
           currentRunDraftId: 43,
         }),
       ),
-    ).toThrow("not the exact owned Release Drafter");
+    ).toThrow("not current-run draft 43");
+  });
+
+  it("classifies only eventual GitHub state as retryable visibility failures", () => {
+    expect(() => validateSuperSynaraGitHubState(state({ releases: [] }))).toThrow(
+      SuperSynaraGitHubStateVisibilityError,
+    );
+    expect(() =>
+      validateSuperSynaraGitHubState(
+        state({ releases: [{ ...exactDraft(), targetCommitish: "b".repeat(40) }] }),
+      ),
+    ).toThrow(SuperSynaraGitHubStateVisibilityError);
+    let permanentFailure: unknown;
+    try {
+      validateSuperSynaraGitHubState(
+        state({ releases: [exactDraft(), { ...exactDraft(), id: 43 }] }),
+      );
+    } catch (error) {
+      permanentFailure = error;
+    }
+    expect(permanentFailure).toBeInstanceOf(Error);
+    expect(permanentFailure).not.toBeInstanceOf(SuperSynaraGitHubStateVisibilityError);
   });
 
   it("requires the exact published prerelease and tag after publication", () => {
