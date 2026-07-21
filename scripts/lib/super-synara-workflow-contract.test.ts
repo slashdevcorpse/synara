@@ -39,6 +39,33 @@ describe("Super Synara workflow contracts", () => {
     ).toThrow("not pinned to a full commit");
   });
 
+  it("requires a GitHub CLI-compatible owned draft lookup", () => {
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          'gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100"',
+          'gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" \\\n              --jq .',
+        ),
+        audit,
+      ),
+    ).toThrow("must not combine the incompatible gh api --slurp and --jq flags");
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace("            jq -er \\", "            jq -r \\"),
+        audit,
+      ),
+    ).toThrow("must filter the captured response with standalone jq arguments");
+    for (const [binding, replacement] of [
+      ['--arg tag "$TAG"', '--arg tag "$FORGED_TAG"'],
+      ['--arg source_commit "$SOURCE_COMMIT"', '--arg source_commit "$FORGED_COMMIT"'],
+      ['<<< "$releases_json"', '<<< "$FORGED_RELEASES_JSON"'],
+    ] as const) {
+      expect(() =>
+        verifySuperSynaraWorkflowText(main.replace(binding, replacement), audit),
+      ).toThrow("must filter the captured response with standalone jq arguments");
+    }
+  });
+
   it("rejects removal of the reviewed allowlist gate", () => {
     expect(() =>
       verifySuperSynaraWorkflowText(

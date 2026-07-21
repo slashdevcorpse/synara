@@ -832,9 +832,15 @@ jobs:
             --prerelease \
             --verify-tag \
             --latest=false
+          releases_json="$(
+            gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100"
+          )"
           draft_id="$(
-            gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
-              --jq "[.[][] | select(.tag_name == \"$TAG\" and .draft == true and .prerelease == true and .target_commitish == \"$SOURCE_COMMIT\")] | if length == 1 then .[0].id else error(\"expected one owned draft\") end"
+            jq -er \
+              --arg tag "$TAG" \
+              --arg source_commit "$SOURCE_COMMIT" \
+              '[.[][] | select(.tag_name == $tag and .draft == true and .prerelease == true and .target_commitish == $source_commit)] | if length == 1 then .[0].id else error("expected one owned draft") end' \
+              <<< "$releases_json"
           )"
           [[ "$draft_id" =~ ^[1-9][0-9]*$ ]]
           echo "id=$draft_id" >> "$GITHUB_OUTPUT"
