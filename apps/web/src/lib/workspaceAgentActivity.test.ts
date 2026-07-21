@@ -15,7 +15,9 @@ import {
   WORKSPACE_AGENT_EVENT_BUFFER_LIMIT,
   createInitialWorkspaceAgentEventState,
   deriveAgentDuration,
+  deriveAgentStatus,
   deriveWorkspaceAgentActivity,
+  deriveWorkspaceAgentThreadActivity,
   modelEffortLabel,
   reduceWorkspaceAgentEventState,
   type WorkspaceAgentShellProject,
@@ -486,6 +488,61 @@ describe("workspace agent event reducer", () => {
   });
 });
 
+describe("deriveAgentStatus", () => {
+  const withoutLiveTurn = (overrides: Partial<WorkspaceAgentShellThread> = {}) =>
+    shellThread({
+      session: { ...shellThread().session!, status: "ready", activeTurnId: null },
+      latestTurn: null,
+      hasLiveTailWork: false,
+      ...overrides,
+    });
+
+  it("derives every public agent status from shell and event state", () => {
+    const streamingState = reduce(assistantEvent({ sequence: 1 }));
+    const toolState = reduce(
+      assistantEvent({ sequence: 1 }),
+      toolEvent({ sequence: 2, kind: "tool.started", providerItemId: "tool-status" }),
+    );
+    const queuedState = reduce(queuedEvent(1));
+    const completed = withoutLiveTurn({
+      latestTurn: {
+        ...shellThread().latestTurn!,
+        state: "completed",
+        completedAt: new Date(Date.parse(BASE_TIME) + 5_000).toISOString(),
+      },
+    });
+    const failed = withoutLiveTurn({
+      session: {
+        ...shellThread().session!,
+        status: "error",
+        activeTurnId: null,
+        lastError: "failed",
+      },
+      latestTurn: { ...shellThread().latestTurn!, state: "error" },
+    });
+    const stopped = withoutLiveTurn({
+      session: { ...shellThread().session!, status: "stopped", activeTurnId: null },
+      latestTurn: { ...shellThread().latestTurn!, state: "interrupted" },
+    });
+    const starting = withoutLiveTurn({
+      session: { ...shellThread().session!, status: "starting", activeTurnId: null },
+    });
+
+    expect(deriveAgentStatus(shellThread(), undefined)).toBe("thinking");
+    expect(deriveAgentStatus(shellThread(), streamingState.threads[THREAD_ID])).toBe("streaming");
+    expect(deriveAgentStatus(shellThread(), toolState.threads[THREAD_ID])).toBe("tool-running");
+    expect(deriveAgentStatus(starting, undefined)).toBe("connecting");
+    expect(deriveAgentStatus(starting, queuedState.threads[THREAD_ID])).toBe("queued");
+    expect(
+      deriveAgentStatus(withoutLiveTurn(), queuedState.threads[THREAD_ID]),
+    ).toBe("queued");
+    expect(deriveAgentStatus(completed, undefined)).toBe("completed");
+    expect(deriveAgentStatus(failed, undefined)).toBe("failed");
+    expect(deriveAgentStatus(stopped, undefined)).toBe("stopped");
+    expect(deriveAgentStatus(withoutLiveTurn(), undefined)).toBe("idle");
+  });
+});
+
 describe("deriveWorkspaceAgentActivity", () => {
   it("uses failed and stopped terminal shell states before buffered activity", () => {
     const childId = ThreadId.makeUnsafe("live-child");
@@ -523,7 +580,7 @@ describe("deriveWorkspaceAgentActivity", () => {
     expect(derive({ state: reduce(queuedEvent(1)) }).threads[0]?.status).toBe("thinking");
   });
 
-  it("does not let a stale failed or interrupted turn mask a current queue", () => {
+  it("does not let stale terminal turns mask queued work or provider startup", () => {
     const readyAfterFailure = shellThread({
       session: { ...shellThread().session!, status: "ready", activeTurnId: null },
       latestTurn: { ...shellThread().latestTurn!, state: "error" },
@@ -538,7 +595,7 @@ describe("deriveWorkspaceAgentActivity", () => {
     expect(
       derive({ thread: readyAfterFailure, state: reduce(queuedEvent(1)) }).threads[0]?.status,
     ).toBe("queued");
-    expect(derive({ thread: startingAfterInterruption }).threads[0]?.status).toBe("queued");
+    expect(derive({ thread: startingAfterInterruption }).threads[0]?.status).toBe("connecting");
   });
 
   it("lets a newer surviving queue outrank terminal shell history", () => {
@@ -673,9 +730,9 @@ describe("deriveWorkspaceAgentActivity", () => {
       },
     });
 
-    expect(derive({ thread: starting }).threads[0]?.status).toBe("queued");
+    expect(derive({ thread: starting }).threads[0]?.status).toBe("connecting");
     expect(derive({ thread: startingActiveTurn }).threads[0]).toMatchObject({
-      status: "thinking",
+      status: "connecting",
       turnId: TURN_ID,
     });
     expect(derive({ thread: ready, state: reduce(queuedEvent(1)) }).threads[0]?.status).toBe(
@@ -928,6 +985,104 @@ describe("deriveWorkspaceAgentActivity", () => {
 });
 
 describe("workspace agent labels and timing", () => {
+  it("derives parent context and running counts from direct children only", () => {
+    const rootId = ThreadId.makeUnsafe("thread-hover-root");
+    const runningId = ThreadId.makeUnsafe("thread-hover-running");
+    const connectingId = ThreadId.makeUnsafe("thread-hover-connecting");
+    const completedId = ThreadId.makeUnsafe("thread-hover-completed");
+    const grandchildId = ThreadId.makeUnsafe("thread-hover-grandchild");
+    const archivedId = ThreadId.makeUnsafe("thread-hover-archived");
+    const root = shellThread({
+      threadId: rootId,
+      session: { ...shellThread().session!, status: "ready", activeTurnId: null },
+      latestTurn: null,
+      hasLiveTailWork: false,
+    });
+    const running = shellThread({ threadId: runningId, parentThreadId: rootId });
+    const connecting = shellThread({
+      threadId: connectingId,
+      parentThreadId: rootId,
+      session: { ...shellThread().session!, status: "starting", activeTurnId: null },
+      latestTurn: null,
+      hasLiveTailWork: false,
+    });
+    const completed = shellThread({
+      threadId: completedId,
+      parentThreadId: rootId,
+      session: { ...shellThread().session!, status: "ready", activeTurnId: null },
+      latestTurn: {
+        ...shellThread().latestTurn!,
+        state: "completed",
+        completedAt: new Date(Date.parse(BASE_TIME) + 5_000).toISOString(),
+      },
+      hasLiveTailWork: false,
+    });
+    const grandchild = shellThread({ threadId: grandchildId, parentThreadId: runningId });
+    const archived = shellThread({
+      threadId: archivedId,
+      parentThreadId: rootId,
+      archivedAt: BASE_TIME,
+    });
+    const threads = [root, running, connecting, completed, grandchild, archived];
+    const rootActivity = deriveWorkspaceAgentThreadActivity({
+      threadId: rootId,
+      projects: [project],
+      threads,
+      eventState: createInitialWorkspaceAgentEventState(),
+      nowMs: Date.parse(BASE_TIME) + 10_000,
+    });
+    const childActivity = deriveWorkspaceAgentThreadActivity({
+      threadId: runningId,
+      projects: [project],
+      threads,
+      eventState: createInitialWorkspaceAgentEventState(),
+      nowMs: Date.parse(BASE_TIME) + 10_000,
+    });
+
+    expect(rootActivity).toMatchObject({
+      entry: { threadId: rootId, status: "idle" },
+      parentEntry: null,
+      subagentCount: 3,
+      subagentRunningCount: 2,
+    });
+    expect(childActivity).toMatchObject({
+      entry: { threadId: runningId },
+      parentEntry: { threadId: rootId },
+      subagentCount: 1,
+      subagentRunningCount: 1,
+    });
+  });
+
+  it("keeps idle and terminal targets available to the per-thread activity hook", () => {
+    const idle = shellThread({
+      session: { ...shellThread().session!, status: "ready", activeTurnId: null },
+      latestTurn: null,
+      hasLiveTailWork: false,
+    });
+    const completed = shellThread({
+      session: { ...shellThread().session!, status: "ready", activeTurnId: null },
+      latestTurn: {
+        ...shellThread().latestTurn!,
+        state: "completed",
+        completedAt: new Date(Date.parse(BASE_TIME) + 5_000).toISOString(),
+      },
+      hasLiveTailWork: false,
+    });
+    const baseInput = {
+      threadId: THREAD_ID,
+      projects: [project],
+      eventState: createInitialWorkspaceAgentEventState(),
+      nowMs: Date.parse(BASE_TIME) + 50_000,
+    };
+
+    expect(deriveWorkspaceAgentThreadActivity({ ...baseInput, threads: [idle] }).entry).toMatchObject(
+      { status: "idle" },
+    );
+    expect(
+      deriveWorkspaceAgentThreadActivity({ ...baseInput, threads: [completed] }).entry,
+    ).toMatchObject({ status: "completed", duration: 5_000 });
+  });
+
   it.each<[ModelSelection, string | null]>([
     [{ provider: "codex", model: "gpt", options: { reasoningEffort: "high" } }, "high"],
     [{ provider: "claudeAgent", model: "claude", options: { effort: "medium" } }, "medium"],

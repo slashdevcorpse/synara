@@ -11,7 +11,6 @@ import {
   type ThreadId,
 } from "@synara/contracts";
 import { pluralize } from "@synara/shared/text";
-import { resolveThreadEnvironmentMode } from "@synara/shared/threadEnvironment";
 import { isWorkspaceRootWithin, workspaceRootsEqual } from "@synara/shared/threadWorkspace";
 import type { SidebarProjectSortOrder, SidebarThreadSortOrder } from "../appSettings";
 import { resolveRestorableThreadRoute, type LastThreadRoute } from "../chatRouteRestore";
@@ -37,7 +36,6 @@ import {
   hasActionableProposedPlan,
   isLatestTurnSettled,
 } from "../session-logic";
-import { formatWorktreePathForDisplay } from "../worktreeCleanup";
 
 export {
   extractDuplicateProjectCreateProjectId,
@@ -295,54 +293,32 @@ function nonEmptyDisplayValue(value: string | null | undefined): string | null {
   return trimmed && trimmed.length > 0 ? trimmed : null;
 }
 
-function differentDisplayValue(
-  value: string | null | undefined,
-  existing: string | null,
-): string | null {
-  const normalized = nonEmptyDisplayValue(value);
-  if (!normalized) {
+function crossPlatformPathBasename(path: string | null | undefined): string | null {
+  const normalizedPath = nonEmptyDisplayValue(path)?.replace(/[\\/]+$/, "");
+  if (!normalizedPath || /^[A-Za-z]:$/.test(normalizedPath)) {
     return null;
   }
-  return existing !== null && normalized === existing ? null : normalized;
+
+  const finalSeparatorIndex = Math.max(
+    normalizedPath.lastIndexOf("/"),
+    normalizedPath.lastIndexOf("\\"),
+  );
+  return nonEmptyDisplayValue(normalizedPath.slice(finalSeparatorIndex + 1));
 }
 
-export type SidebarThreadHoverMetadata = {
-  projectName: string | null;
-  projectCwd: string | null;
-  sourceProjectName: string | null;
-  branch: string | null;
-  worktreeName: string | null;
-};
-
-export function resolveThreadHoverCardMetadata(input: {
+export function resolveThreadHoverCardWorkspaceLabel(input: {
   thread: Pick<
     SidebarThreadSummary,
-    "envMode" | "branch" | "worktreePath" | "associatedWorktreePath" | "associatedWorktreeBranch"
+    "associatedWorktreeBranch" | "associatedWorktreePath"
   >;
-  project: Pick<Project, "name" | "folderName" | "cwd"> | null;
-}): SidebarThreadHoverMetadata {
-  const projectName =
-    nonEmptyDisplayValue(input.project?.name) ?? nonEmptyDisplayValue(input.project?.folderName);
-  const activeWorktreePath = nonEmptyDisplayValue(input.thread.worktreePath);
-  const isWorktree =
-    resolveThreadEnvironmentMode({
-      envMode: input.thread.envMode,
-      worktreePath: activeWorktreePath,
-    }) === "worktree";
-  const associatedWorktreePath = nonEmptyDisplayValue(input.thread.associatedWorktreePath);
-  const worktreePath = isWorktree ? (associatedWorktreePath ?? activeWorktreePath) : null;
-
-  return {
-    projectName,
-    projectCwd: input.project?.cwd ?? null,
-    sourceProjectName: isWorktree
-      ? differentDisplayValue(input.project?.folderName, projectName)
-      : null,
-    branch:
-      nonEmptyDisplayValue(input.thread.associatedWorktreeBranch) ??
-      nonEmptyDisplayValue(input.thread.branch),
-    worktreeName: worktreePath ? formatWorktreePathForDisplay(worktreePath) : null,
-  };
+  project: Pick<Project, "folderName" | "name"> | null;
+}): string | null {
+  return (
+    nonEmptyDisplayValue(input.thread.associatedWorktreeBranch) ??
+    crossPlatformPathBasename(input.thread.associatedWorktreePath) ??
+    nonEmptyDisplayValue(input.project?.folderName) ??
+    nonEmptyDisplayValue(input.project?.name)
+  );
 }
 
 export function isLoopbackHostname(hostname: string): boolean {

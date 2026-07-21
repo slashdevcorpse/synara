@@ -47,6 +47,7 @@ function summarize(entries: ReadonlyArray<AgentThreadEntry>): WorkspaceAgentSumm
     total: entries.length,
     running: entries.filter(
       (entry) =>
+        entry.status === "connecting" ||
         entry.status === "thinking" ||
         entry.status === "streaming" ||
         entry.status === "tool-running",

@@ -16,6 +16,7 @@ import {
   createWorkspaceAgentClock,
   createWorkspaceAgentEventPublisher,
   createWorkspaceAgentShellSelector,
+  createWorkspaceAgentThreadShellSelector,
   isLiveAgentStatus,
 } from "./useWorkspaceAgentActivity";
 import { createWorkspaceAgentEventStateAtSequence } from "../lib/workspaceAgentActivity";
@@ -536,6 +537,7 @@ describe("workspace agent shell selection", () => {
         model: "gpt-5.6-sol",
         options: { reasoningEffort: "high" },
       },
+      runtimeMode: "full-access",
       interactionMode: "default",
       branch: null,
       worktreePath: null,
@@ -597,6 +599,14 @@ describe("workspace agent shell selection", () => {
 
     expect(second).toBe(first);
 
+    const presentationOnlyChange = selector({
+      ...state,
+      sidebarThreadSummaryById: {
+        [THREAD_ID]: { ...churnedSummary, runtimeMode: "approval-required" },
+      },
+    });
+    expect(presentationOnlyChange).toBe(second);
+
     const liveTailChanged = selector({
       ...state,
       sidebarThreadSummaryById: {
@@ -605,6 +615,68 @@ describe("workspace agent shell selection", () => {
     });
     expect(liveTailChanged).not.toBe(second);
     expect(liveTailChanged.threads[0]?.hasLiveTailWork).toBe(false);
+  });
+
+  it("selects only the target, its parent, and its direct children", () => {
+    const projectId = ProjectId.makeUnsafe("project-thread-scope");
+    const parentId = ThreadId.makeUnsafe("thread-parent");
+    const targetId = ThreadId.makeUnsafe("thread-target");
+    const childId = ThreadId.makeUnsafe("thread-child");
+    const grandchildId = ThreadId.makeUnsafe("thread-grandchild");
+    const unrelatedId = ThreadId.makeUnsafe("thread-unrelated");
+    const base = {
+      id: targetId,
+      projectId,
+      title: "Target",
+      modelSelection: { provider: "codex", model: "gpt-5.6-sol" },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: null,
+      session: null,
+      createdAt: BASE_TIME,
+      archivedAt: null,
+      latestTurn: null,
+      latestUserMessageAt: null,
+      hasPendingApprovals: false,
+      hasPendingUserInput: false,
+      hasActionableProposedPlan: false,
+      hasLiveTailWork: false,
+    } satisfies SidebarThreadSummary;
+    const summaries: SidebarThreadSummary[] = [
+      { ...base, id: parentId, title: "Parent" },
+      { ...base, parentThreadId: parentId },
+      { ...base, id: childId, parentThreadId: targetId, title: "Child" },
+      { ...base, id: grandchildId, parentThreadId: childId, title: "Grandchild" },
+      { ...base, id: unrelatedId, title: "Unrelated" },
+    ];
+    const project = {
+      id: projectId,
+      kind: "project",
+      name: "Synara",
+      remoteName: "Synara",
+      folderName: "synara",
+      localName: null,
+      cwd: "C:\\src\\synara",
+      defaultModelSelection: null,
+      expanded: true,
+      scripts: [],
+    } satisfies Project;
+    const selector = createWorkspaceAgentThreadShellSelector(targetId);
+    const selected = selector({
+      projects: [project],
+      threadsHydrated: true,
+      threadIds: summaries.map((summary) => summary.id),
+      sidebarThreadSummaryById: Object.fromEntries(
+        summaries.map((summary) => [summary.id, summary]),
+      ),
+    } as AppState);
+
+    expect(selected.threads.map((thread) => thread.threadId)).toEqual([
+      targetId,
+      parentId,
+      childId,
+    ]);
   });
 });
 
@@ -627,7 +699,8 @@ describe("workspace agent clock", () => {
 });
 
 describe("isLiveAgentStatus", () => {
-  it("returns true only for interruptible active turns", () => {
+  it("returns true for visually live states while excluding queued and terminal states", () => {
+    expect(isLiveAgentStatus("connecting")).toBe(true);
     expect(isLiveAgentStatus("thinking")).toBe(true);
     expect(isLiveAgentStatus("streaming")).toBe(true);
     expect(isLiveAgentStatus("tool-running")).toBe(true);

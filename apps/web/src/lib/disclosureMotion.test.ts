@@ -6,9 +6,12 @@ import {
   disclosureShellClassName,
   DISCLOSURE_CHEVRON_MOTION_CLASS,
   DISCLOSURE_COLLAPSIBLE_PANEL_CLASS,
+  DISCLOSURE_CONTENT_MOTION_CLASS,
   DISCLOSURE_SHELL_MOTION_CLASS,
   DISCLOSURE_SHELL_CLOSED_CLASS,
   DISCLOSURE_SHELL_OPEN_CLASS,
+  DISCLOSURE_TIMING_CLASS,
+  DISCLOSURE_WIDTH_MOTION_CLASS,
 } from "./disclosureMotion";
 
 describe("disclosureMotion", () => {
@@ -28,14 +31,18 @@ describe("disclosureMotion", () => {
   });
 
   it("keeps every disclosure path on the shared 220ms reduced-motion contract", () => {
+    expect(DISCLOSURE_TIMING_CLASS).toBe(
+      "duration-220 ease-out motion-reduce:transition-none",
+    );
+
     for (const className of [
       DISCLOSURE_SHELL_MOTION_CLASS,
+      DISCLOSURE_CONTENT_MOTION_CLASS,
       DISCLOSURE_CHEVRON_MOTION_CLASS,
       DISCLOSURE_COLLAPSIBLE_PANEL_CLASS,
+      DISCLOSURE_WIDTH_MOTION_CLASS,
     ]) {
-      expect(className).toContain("duration-220");
-      expect(className).toContain("ease-out");
-      expect(className).toContain("motion-reduce:transition-none");
+      expect(className).toContain(DISCLOSURE_TIMING_CLASS);
     }
   });
 });

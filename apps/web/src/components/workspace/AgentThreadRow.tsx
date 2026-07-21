@@ -39,6 +39,7 @@ const STATUS_LABEL: Record<AgentStatus, string> = {
   thinking: "Thinking",
   streaming: "Streaming",
   "tool-running": "Tool running",
+  connecting: "Connecting",
   queued: "Queued",
   completed: "Completed",
   failed: "Failed",
@@ -50,6 +51,7 @@ function coarseStatus(status: AgentStatus): SubagentStatusKind {
     case "thinking":
     case "streaming":
     case "tool-running":
+    case "connecting":
       return "running";
     case "queued":
     case "completed":
