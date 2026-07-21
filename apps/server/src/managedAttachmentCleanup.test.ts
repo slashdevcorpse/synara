@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import type { Dir, Dirent } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -82,6 +83,25 @@ function makeRepository(job: ManagedAttachmentCleanupJob) {
       }),
   } as unknown as ManagedAttachmentRepositoryShape;
   return { repository, completed, retried };
+}
+
+function makeDeferredCleanupHarness() {
+  const pending = new Set<Promise<void>>();
+  return {
+    pending,
+    track: (completion: Promise<void>) => {
+      pending.add(completion);
+      void completion.then(
+        () => pending.delete(completion),
+        () => pending.delete(completion),
+      );
+    },
+    drain: async () => {
+      while (pending.size > 0) {
+        await Promise.allSettled([...pending]);
+      }
+    },
+  };
 }
 
 describe("managed attachment cleanup", () => {
@@ -249,6 +269,176 @@ describe("managed attachment cleanup", () => {
     } finally {
       releaseRead();
       vi.useRealTimers();
+      opendir.mockRestore();
+    }
+  });
+
+  it("bounds staging verification and consumes its late rejection", async () => {
+    const root = await fs.mkdtemp(
+      path.join(os.tmpdir(), "synara-managed-startup-verify-deadline-"),
+    );
+    temporaryRoots.push(root);
+    await fs.mkdir(path.join(root, ".staging"));
+    const lstat = vi.spyOn(fs, "lstat");
+    let releaseVerification!: () => void;
+    const verificationReleased = new Promise<void>((resolve) => {
+      releaseVerification = resolve;
+    });
+    let markVerificationStarted!: () => void;
+    const verificationStarted = new Promise<void>((resolve) => {
+      markVerificationStarted = resolve;
+    });
+    lstat.mockImplementationOnce((async () => {
+      markVerificationStarted();
+      await verificationReleased;
+      throw new Error("simulated late staging verification rejection");
+    }) as never);
+    vi.useFakeTimers();
+
+    try {
+      const sweep = sweepOrphanManagedAttachmentParts({
+        attachmentsDir: root,
+        timeBudgetMs: MANAGED_ATTACHMENT_STAGING_STARTUP_TIME_MS,
+        monotonicNow: () => 0,
+      });
+      await verificationStarted;
+      await vi.advanceTimersByTimeAsync(MANAGED_ATTACHMENT_STAGING_STARTUP_TIME_MS - 25);
+
+      await expect(sweep).resolves.toEqual({ inspected: 0, removed: 0, failures: 0 });
+      releaseVerification();
+      await Promise.resolve();
+    } finally {
+      releaseVerification();
+      vi.useRealTimers();
+      lstat.mockRestore();
+    }
+  });
+
+  it("owns and closes exactly once a directory that opens after the startup deadline", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "synara-managed-startup-open-deadline-"));
+    temporaryRoots.push(root);
+    const stagingDir = path.join(root, ".staging");
+    await fs.mkdir(stagingDir);
+    const realDirectory = await fs.opendir(stagingDir);
+    const closeDirectory = realDirectory.close.bind(realDirectory);
+    let closeCalls = 0;
+    vi.spyOn(realDirectory, "close").mockImplementation(async () => {
+      closeCalls += 1;
+      await closeDirectory();
+    });
+    let releaseOpen!: () => void;
+    const openReleased = new Promise<void>((resolve) => {
+      releaseOpen = resolve;
+    });
+    let markOpenStarted!: () => void;
+    const openStarted = new Promise<void>((resolve) => {
+      markOpenStarted = resolve;
+    });
+    const opendir = vi.spyOn(fs, "opendir").mockImplementationOnce((async () => {
+      markOpenStarted();
+      await openReleased;
+      return realDirectory;
+    }) as never);
+    const deferred = makeDeferredCleanupHarness();
+    vi.useFakeTimers();
+
+    try {
+      const sweep = sweepOrphanManagedAttachmentParts({
+        attachmentsDir: root,
+        timeBudgetMs: MANAGED_ATTACHMENT_STAGING_STARTUP_TIME_MS,
+        monotonicNow: () => 0,
+        onDeferredCleanup: deferred.track,
+      });
+      await openStarted;
+      await vi.advanceTimersByTimeAsync(MANAGED_ATTACHMENT_STAGING_STARTUP_TIME_MS - 25);
+
+      await expect(sweep).resolves.toEqual({ inspected: 0, removed: 0, failures: 0 });
+      expect(closeCalls).toBe(0);
+      expect(deferred.pending.size).toBeGreaterThan(0);
+      releaseOpen();
+      await deferred.drain();
+      expect(closeCalls).toBe(1);
+    } finally {
+      releaseOpen();
+      await deferred.drain();
+      await realDirectory.close().catch(() => undefined);
+      vi.useRealTimers();
+      opendir.mockRestore();
+    }
+  });
+
+  it("starts one tracked directory close when post-open verification times out", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "synara-managed-startup-post-open-"));
+    temporaryRoots.push(root);
+    const stagingDir = path.join(root, ".staging");
+    await fs.mkdir(stagingDir);
+    const stagingStat = await fs.lstat(stagingDir, { bigint: true });
+    const opendir = vi.spyOn(fs, "opendir");
+    const lstat = vi.spyOn(fs, "lstat");
+    lstat.mockResolvedValueOnce(stagingStat as never);
+    lstat.mockResolvedValueOnce(stagingStat as never);
+    let releaseVerification!: () => void;
+    const verificationReleased = new Promise<void>((resolve) => {
+      releaseVerification = resolve;
+    });
+    let markVerificationStarted!: () => void;
+    const verificationStarted = new Promise<void>((resolve) => {
+      markVerificationStarted = resolve;
+    });
+    let releaseClose!: () => void;
+    const closeReleased = new Promise<void>((resolve) => {
+      releaseClose = resolve;
+    });
+    let closeCalls = 0;
+    lstat.mockImplementationOnce((async () => {
+      const openResult = opendir.mock.results[0];
+      if (!openResult || openResult.type !== "return") {
+        throw new Error("expected the staging directory to be open");
+      }
+      const directory = await openResult.value;
+      const closeDirectory = directory.close.bind(directory);
+      vi.spyOn(directory, "close").mockImplementation(async () => {
+        closeCalls += 1;
+        await closeReleased;
+        await closeDirectory();
+      });
+      markVerificationStarted();
+      await verificationReleased;
+      return stagingStat;
+    }) as never);
+    const deferred = makeDeferredCleanupHarness();
+    vi.useFakeTimers();
+
+    try {
+      const sweep = sweepOrphanManagedAttachmentParts({
+        attachmentsDir: root,
+        timeBudgetMs: MANAGED_ATTACHMENT_STAGING_STARTUP_TIME_MS,
+        monotonicNow: () => 0,
+        onDeferredCleanup: deferred.track,
+      });
+      await verificationStarted;
+      await vi.advanceTimersByTimeAsync(MANAGED_ATTACHMENT_STAGING_STARTUP_TIME_MS - 25);
+
+      await expect(sweep).resolves.toEqual({ inspected: 0, removed: 0, failures: 0 });
+      expect(closeCalls).toBe(1);
+      expect(deferred.pending.size).toBeGreaterThan(0);
+      let drainSettled = false;
+      const drain = deferred.drain().then(() => {
+        drainSettled = true;
+      });
+      await Promise.resolve();
+      expect(drainSettled).toBe(false);
+      releaseClose();
+      await drain;
+      expect(drainSettled).toBe(true);
+      releaseVerification();
+      await Promise.resolve();
+    } finally {
+      releaseClose();
+      releaseVerification();
+      await deferred.drain();
+      vi.useRealTimers();
+      lstat.mockRestore();
       opendir.mockRestore();
     }
   });
@@ -738,6 +928,74 @@ describe("managed attachment cleanup", () => {
     );
   });
 
+  it("recomputes the stale cutoff for each run while reusing the same cursor and helper", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "synara-managed-staging-aging-"));
+    temporaryRoots.push(root);
+    const stagingDir = path.join(root, ".staging");
+    await fs.mkdir(stagingDir);
+    const prefixName = "att_v2_41414141414141414141414141414141.part";
+    const agingName = "att_v2_42424242424242424242424242424242.part";
+    const agingPart = path.join(stagingDir, agingName);
+    await fs.writeFile(path.join(stagingDir, prefixName), "fresh prefix");
+    await fs.writeFile(agingPart, "aging");
+    const firstNowMs = Date.now();
+    const agingDate = new Date(firstNowMs - MANAGED_ATTACHMENT_WRITING_LEASE_MS + 1_000);
+    await fs.utimes(agingPart, agingDate, agingDate);
+    const entries = [
+      { name: prefixName } as unknown as Dirent,
+      { name: agingName } as unknown as Dirent,
+    ];
+    let entryIndex = 0;
+    let cursorDirectory: unknown;
+    let helperStarts = 0;
+    const opendir = vi.spyOn(fs, "opendir");
+    const recovery = makeManagedAttachmentStagingRecovery();
+    const readDirectoryEntry = async (directory: Dir): Promise<Dirent | null> => {
+      if (cursorDirectory === undefined) cursorDirectory = directory;
+      else expect(directory).toBe(cursorDirectory);
+      return entries[entryIndex++] ?? null;
+    };
+
+    try {
+      const first = await Effect.runPromise(
+        recovery.run({
+          attachmentsDir: root,
+          nowMs: firstNowMs,
+          scanLimit: 1,
+          invocationScanLimit: 1,
+          monotonicNow: () => 0,
+          readDirectoryEntry,
+          beforePinnedSessionReady: async () => {
+            helperStarts += 1;
+          },
+        }),
+      );
+      await expect(fs.readFile(agingPart, "utf8")).resolves.toBe("aging");
+      const second = await Effect.runPromise(
+        recovery.run({
+          attachmentsDir: root,
+          nowMs: firstNowMs + 2_000,
+          scanLimit: 1,
+          invocationScanLimit: 1,
+          monotonicNow: () => 0,
+          readDirectoryEntry,
+          beforePinnedSessionReady: async () => {
+            helperStarts += 1;
+          },
+        }),
+      );
+
+      expect(first).toMatchObject({ inspected: 1, removed: 0, exhausted: false });
+      expect(second).toMatchObject({ inspected: 1, removed: 1, exhausted: false });
+      expect(opendir).toHaveBeenCalledTimes(1);
+      expect(helperStarts).toBe(1);
+      await expect(fs.stat(agingPart)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await Effect.runPromise(recovery.close);
+      opendir.mockRestore();
+    }
+  });
+
   it("stops at the invocation time budget and resumes the same generation", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "synara-managed-staging-deadline-"));
     temporaryRoots.push(root);
@@ -749,8 +1007,16 @@ describe("managed attachment cleanup", () => {
         "fresh",
       );
     }
-    const firstInvocationTimes = [0, 0, 100, 200, 200, 200, 250, 250];
-    let firstInvocationClockIndex = 0;
+    let firstEntryValidated = false;
+    const originalLstat = fs.lstat;
+    const lstat = vi.spyOn(fs, "lstat");
+    lstat.mockImplementation((async (target: string, options: { bigint: true }) => {
+      const result = await originalLstat(target, options);
+      if (target.endsWith(".part")) {
+        firstEntryValidated = true;
+      }
+      return result;
+    }) as never);
     const recovery = makeManagedAttachmentStagingRecovery();
     try {
       const first = await Effect.runPromise(
@@ -759,10 +1025,7 @@ describe("managed attachment cleanup", () => {
           scanLimit: 16,
           maxRemovals: 16,
           invocationTimeBudgetMs: 250,
-          monotonicNow: () =>
-            firstInvocationTimes[
-              Math.min(firstInvocationClockIndex++, firstInvocationTimes.length - 1)
-            ] ?? 250,
+          monotonicNow: () => (firstEntryValidated ? 250 : 0),
         }),
       );
       const second = await Effect.runPromise(
@@ -779,6 +1042,7 @@ describe("managed attachment cleanup", () => {
       expect(second).toMatchObject({ inspected: 3, passes: 1, exhausted: true });
     } finally {
       await Effect.runPromise(recovery.close);
+      lstat.mockRestore();
     }
   });
 
@@ -857,6 +1121,74 @@ describe("managed attachment cleanup", () => {
     } finally {
       releaseRead();
       await Effect.runPromise(recovery.close);
+      opendir.mockRestore();
+    }
+  });
+
+  it("keeps recovery close pending until a directory opened after its deadline is closed", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "synara-managed-recovery-open-deadline-"));
+    temporaryRoots.push(root);
+    const stagingDir = path.join(root, ".staging");
+    await fs.mkdir(stagingDir);
+    const realDirectory = await fs.opendir(stagingDir);
+    const closeDirectory = realDirectory.close.bind(realDirectory);
+    let closeCalls = 0;
+    vi.spyOn(realDirectory, "close").mockImplementation(async () => {
+      closeCalls += 1;
+      await closeDirectory();
+    });
+    let releaseOpen!: () => void;
+    const openReleased = new Promise<void>((resolve) => {
+      releaseOpen = resolve;
+    });
+    let markOpenStarted!: () => void;
+    const openStarted = new Promise<void>((resolve) => {
+      markOpenStarted = resolve;
+    });
+    const opendir = vi.spyOn(fs, "opendir").mockImplementationOnce((async () => {
+      markOpenStarted();
+      await openReleased;
+      return realDirectory;
+    }) as never);
+    const recovery = makeManagedAttachmentStagingRecovery();
+    vi.useFakeTimers();
+
+    try {
+      const running = Effect.runPromise(
+        recovery.run({
+          attachmentsDir: root,
+          invocationTimeBudgetMs: 250,
+          monotonicNow: () => 0,
+        }),
+      );
+      await openStarted;
+      await vi.advanceTimersByTimeAsync(225);
+      await expect(running).resolves.toEqual({
+        inspected: 0,
+        removed: 0,
+        failures: 0,
+        passes: 0,
+        exhausted: false,
+      });
+
+      let closeSettled = false;
+      const close = Effect.runPromise(recovery.close).then(() => {
+        closeSettled = true;
+      });
+      await Promise.resolve();
+      expect(closeSettled).toBe(false);
+      expect(closeCalls).toBe(0);
+      releaseOpen();
+      await close;
+      expect(closeSettled).toBe(true);
+      expect(closeCalls).toBe(1);
+      await fs.rm(root, { recursive: true });
+      await expect(fs.stat(root)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      releaseOpen();
+      await Effect.runPromise(recovery.close);
+      await realDirectory.close().catch(() => undefined);
+      vi.useRealTimers();
       opendir.mockRestore();
     }
   });
@@ -1097,7 +1429,7 @@ describe("managed attachment cleanup", () => {
     }
   });
 
-  it("enumerates recovery entries incrementally without calling readdir", async () => {
+  it("enumerates staging entries incrementally without calling readdir", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "synara-managed-staging-stream-"));
     temporaryRoots.push(root);
     const stagingDir = path.join(root, ".staging");
@@ -1110,21 +1442,17 @@ describe("managed attachment cleanup", () => {
     const readdir = vi.spyOn(fs, "readdir").mockRejectedValue(new Error("readdir is forbidden"));
 
     try {
-      const result = await Effect.runPromise(
-        runManagedAttachmentStagingRecovery({
-          attachmentsDir: root,
-          nowMs,
-          scanLimit: 1,
-          maxRemovals: 1,
-        }),
-      );
+      const result = await sweepOrphanManagedAttachmentParts({
+        attachmentsDir: root,
+        nowMs,
+        scanLimit: 1,
+        maxRemovals: 1,
+      });
 
       expect(result).toEqual({
         inspected: 1,
         removed: 1,
         failures: 0,
-        passes: 1,
-        exhausted: true,
       });
       expect(readdir).not.toHaveBeenCalled();
       await expect(fs.stat(stalePart)).rejects.toMatchObject({ code: "ENOENT" });
