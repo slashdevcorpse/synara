@@ -64,6 +64,7 @@ import { waitForTerminalFontReady } from "./terminalFontSettle";
 import { observeTerminalWriteParsed } from "./terminalPerformance";
 import {
   applyReplayOnce,
+  batchDeferredTerminalOutput,
   createRecoveredGridOutputBuffer,
   hasRecoveredGrid,
   makeAuthoritativeTerminalResnapshot,
@@ -74,12 +75,12 @@ import {
   shouldReplayColdSnapshot,
   snapshotHasReplayPayload,
   snapshotReplayIdentity,
+  TERMINAL_WRITE_BATCH_SIZE_LIMIT,
 } from "./terminalSnapshotReplay";
 
 const ENABLE_TERMINAL_WEBGL = true;
 const VISUAL_RESIZE_MIN_INTERVAL_MS = 64;
 const BACKEND_RESIZE_DEBOUNCE_MS = 120;
-const WRITE_BATCH_SIZE_LIMIT = 262_144;
 const WRITE_BATCH_MAX_LATENCY_MS = 50;
 const LINK_MATCH_CACHE_LIMIT = 512;
 const OPEN_SNAPSHOT_RECONCILE_DELAY_MS = 250;
@@ -226,17 +227,18 @@ function applyPendingRecoveredGridClear(entry: TerminalRuntimeEntry): boolean {
 
 async function writeRecoveredOutputAndWait(
   entry: TerminalRuntimeEntry,
-  outputs: ReadonlyArray<{ readonly data: string; readonly byteLength: number }>,
+  output: { readonly data: string; readonly byteLength: number },
 ): Promise<void> {
-  if (outputs.length === 0) return;
-  const data = outputs.map((output) => output.data).join("");
-  const byteLength = outputs.reduce((total, output) => total + output.byteLength, 0);
   const queuedAt = performance.now();
   await new Promise<void>((resolve, reject) => {
     try {
-      entry.terminal.write(data, () => {
-        acknowledgeParsedOutput(entry, byteLength);
-        observeTerminalWriteParsed({ runtimeKey: entry.runtimeKey, bytes: byteLength, queuedAt });
+      entry.terminal.write(output.data, () => {
+        acknowledgeParsedOutput(entry, output.byteLength);
+        observeTerminalWriteParsed({
+          runtimeKey: entry.runtimeKey,
+          bytes: output.byteLength,
+          queuedAt,
+        });
         resolve();
       });
     } catch (error) {
@@ -418,7 +420,9 @@ function replaySnapshot(
         if (releaseBufferedOutput && !entry.disposed) {
           if (applyPendingRecoveredGridClear(entry)) setRuntimeStatus(entry, "ready");
           while (outputBuffer.size() > 0) {
-            await writeRecoveredOutputAndWait(entry, outputBuffer.drain());
+            for (const output of batchDeferredTerminalOutput(outputBuffer.drain())) {
+              await writeRecoveredOutputAndWait(entry, output);
+            }
           }
         }
         if (
@@ -530,7 +534,7 @@ function scheduleWrite(entry: TerminalRuntimeEntry, data: string, byteLength: nu
   entry.pendingWriteLength += data.length;
   entry.pendingWriteBytes += byteLength;
 
-  if (entry.pendingWriteBytes >= WRITE_BATCH_SIZE_LIMIT) {
+  if (entry.pendingWriteBytes >= TERMINAL_WRITE_BATCH_SIZE_LIMIT) {
     flushPendingWrites(entry);
     return;
   }

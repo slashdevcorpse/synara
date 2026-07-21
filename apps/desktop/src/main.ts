@@ -60,7 +60,6 @@ import { renderPackagedDesktopIdentityProof } from "@synara/shared/desktopIdenti
 import { NetService } from "@synara/shared/Net";
 import { RotatingFileSink } from "@synara/shared/logging";
 import { ensureStaticSnapshot, findAsarArchivePath } from "@synara/shared/staticSnapshot";
-import { applyWebDocumentSecurityHeaders } from "@synara/shared/webSecurity";
 import windowsJobLauncherConfig from "../../server/native/windows-job-launcher/launcher.config.json" with { type: "json" };
 import { isBackendReadinessAborted, waitForHttpReady } from "./backendReadiness";
 import { resolveBackendNodeArgs } from "./backendNodeOptions";
@@ -162,7 +161,7 @@ import {
 import { buildGitHubReleasesPageUrl, resolveGitHubUpdateSource } from "./githubUpdateFeed";
 import { isArm64HostRunningIntelBuild, resolveDesktopRuntimeInfo } from "./runtimeArch";
 import { DesktopBrowserManager } from "./browserManager";
-import { ensureBrowserNavigationPolicy, secureBrowserWebviewAttachment } from "./browserSecurity";
+import { installBrowserWebviewAttachmentSecurity } from "./browserSecurity";
 import { BROWSER_SESSION_PARTITION } from "./browserSessionPolicy";
 import { registerBrowserIpcHandlers, sendBrowserCopyLink, sendBrowserState } from "./browserIpc";
 import {
@@ -180,7 +179,10 @@ import {
   resolveDesktopUserDataPath,
 } from "./desktopUserDataProfile";
 import { isBrokenPipeError } from "./desktopProcessErrors";
-import { createDesktopStaticProtocolResolver } from "./desktopStaticProtocol";
+import {
+  createDesktopStaticProtocolHandler,
+  createDesktopStaticProtocolResolver,
+} from "./desktopStaticProtocol";
 import {
   resolveDesktopWindowReopenDecision,
   shouldOpenDesktopMainWindowAfterBackendLaunch,
@@ -1301,27 +1303,14 @@ function registerDesktopProtocol(): void {
   }
 
   const resolveStaticRequest = createDesktopStaticProtocolResolver(staticRoot);
-
-  protocol.handle(DESKTOP_SCHEME, async (request) => {
-    try {
-      const resolution = resolveStaticRequest(request.url);
-      if ("error" in resolution) {
-        return applyWebDocumentSecurityHeaders(new Response(null, { status: 404 }));
-      }
-
-      return applyWebDocumentSecurityHeaders(
-        await net.fetch(pathToFileURL(resolution.path).toString()),
-      );
-    } catch {
-      const fallback = resolveStaticRequest(`${DESKTOP_SCHEME}://app/`);
-      if ("error" in fallback) {
-        return applyWebDocumentSecurityHeaders(new Response(null, { status: 404 }));
-      }
-      return applyWebDocumentSecurityHeaders(
-        await net.fetch(pathToFileURL(fallback.path).toString()),
-      );
-    }
-  });
+  protocol.handle(
+    DESKTOP_SCHEME,
+    createDesktopStaticProtocolHandler({
+      resolveRequest: resolveStaticRequest,
+      fetchFile: (filePath) => net.fetch(pathToFileURL(filePath).toString()),
+      fallbackUrl: `${DESKTOP_SCHEME}://app/`,
+    }),
+  );
 
   desktopProtocolRegistered = true;
 }
@@ -3848,15 +3837,7 @@ function createWindow(): BrowserWindow {
       backgroundThrottling: true,
     },
   });
-  window.webContents.on("will-attach-webview", (event, webPreferences, params) => {
-    const decision = secureBrowserWebviewAttachment(webPreferences, params);
-    if (!decision.allowed) {
-      event.preventDefault();
-    }
-  });
-  window.webContents.on("did-attach-webview", (_event, guestWebContents) => {
-    ensureBrowserNavigationPolicy(guestWebContents);
-  });
+  installBrowserWebviewAttachmentSecurity(window.webContents);
   const windowStateController = createDesktopWindowStateController({
     source: window,
     initialState: savedWindowState,

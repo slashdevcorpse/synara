@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   applyReplayOnce,
+  batchDeferredTerminalOutput,
   createRecoveredGridOutputBuffer,
   RecoveredGridFinalizationError,
   type ReplayIdentityState,
@@ -12,6 +13,7 @@ import {
   makeAuthoritativeTerminalResnapshot,
   shouldReplayColdSnapshot,
   snapshotReplayIdentity,
+  TERMINAL_WRITE_BATCH_SIZE_LIMIT,
 } from "./terminalSnapshotReplay";
 
 function dimensionedSnapshot(
@@ -47,6 +49,38 @@ function legacySnapshot(): TerminalSessionSnapshot {
     updatedAt: new Date(0).toISOString(),
   };
 }
+
+describe("batchDeferredTerminalOutput", () => {
+  it("bounds UTF-8 writes while preserving retained text, order, and ACK bytes", () => {
+    const encoder = new TextEncoder();
+    const first = `${"a".repeat(TERMINAL_WRITE_BATCH_SIZE_LIMIT - 2)}é`;
+    const second = `🙂${"b".repeat(17)}`;
+    const outputs = [first, second].map((data) => ({
+      data,
+      byteLength: encoder.encode(data).byteLength,
+    }));
+
+    const batches = [...batchDeferredTerminalOutput(outputs)];
+
+    expect(batches).toHaveLength(2);
+    expect(
+      batches.every(
+        ({ data }) => encoder.encode(data).byteLength <= TERMINAL_WRITE_BATCH_SIZE_LIMIT,
+      ),
+    ).toBe(true);
+    expect(batches.map(({ data }) => data).join("")).toBe(`${first}${second}`);
+    expect(batches.reduce((total, output) => total + output.byteLength, 0)).toBe(
+      outputs.reduce((total, output) => total + output.byteLength, 0),
+    );
+  });
+
+  it("does not ACK mismatched event metadata until its final payload slice", () => {
+    expect([...batchDeferredTerminalOutput([{ data: "abcdef", byteLength: 42 }], 4)]).toEqual([
+      { data: "abcd", byteLength: 0 },
+      { data: "ef", byteLength: 42 },
+    ]);
+  });
+});
 
 describe("replaySnapshotAtRecoveredGrid", () => {
   it.each([

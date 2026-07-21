@@ -5,6 +5,7 @@ import type { BrowserWindow, WebContents } from "electron";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { DesktopBrowserManager } from "./browserManager";
+import { ensureAttachedBrowserWebContentsSecurity } from "./browserSecurity";
 
 vi.mock("electron", () => ({
   app: {
@@ -44,13 +45,37 @@ class FakeWebContents extends EventEmitter {
 
   setUserAgent = vi.fn();
 
+  constructor(private readonly url = "https://app.example.test/") {
+    super();
+  }
+
   setWindowOpenHandler(handler: WindowOpenHandler): void {
     this.windowOpenHandler = handler;
+  }
+
+  getURL(): string {
+    return this.url;
   }
 }
 
 class FakePopupWindow extends EventEmitter {
-  readonly webContents = new FakeWebContents();
+  readonly webContents: FakeWebContents;
+  readonly setMenuBarVisibility = vi.fn();
+  private destroyed = false;
+
+  constructor(url = "https://accounts.example.test/oauth/authorize") {
+    super();
+    this.webContents = new FakeWebContents(url);
+  }
+
+  isDestroyed(): boolean {
+    return this.destroyed;
+  }
+
+  destroy(): void {
+    this.destroyed = true;
+    this.emit("closed");
+  }
 }
 
 interface BrowserManagerCharacterizationAccess {
@@ -120,6 +145,18 @@ describe("DesktopBrowserManager repeated workflow characterization", () => {
     const tabContents = new FakeWebContents();
     const popup = new FakePopupWindow();
     const access = asCharacterizationAccess(manager);
+    expect(ensureAttachedBrowserWebContentsSecurity(tabContents as unknown as WebContents)).toBe(
+      true,
+    );
+    const attachmentHandler = tabContents.windowOpenHandler;
+    expect(
+      attachmentHandler?.({
+        url: "https://auth.example",
+        frameName: "auth",
+        features: "width=480,height=640",
+        disposition: "new-window",
+      }),
+    ).toEqual({ action: "deny" });
     access.configureRuntimeWebContents({
       key: `thread-1:${tabId}`,
       threadId: THREAD_ID,
@@ -129,6 +166,14 @@ describe("DesktopBrowserManager repeated workflow characterization", () => {
       ownsWebContents: false,
       listenerDisposers: [],
     });
+    expect(tabContents.windowOpenHandler).not.toBe(attachmentHandler);
+    const runtimeHandler = tabContents.windowOpenHandler;
+    expect(ensureAttachedBrowserWebContentsSecurity(tabContents as unknown as WebContents)).toBe(
+      false,
+    );
+    expect(tabContents.windowOpenHandler).toBe(runtimeHandler);
+    expect(tabContents.listenerCount("will-navigate")).toBe(1);
+    expect(tabContents.listenerCount("will-redirect")).toBe(1);
     access.configureOAuthPopupRuntime({
       threadId: THREAD_ID,
       tabId,
@@ -175,5 +220,53 @@ describe("DesktopBrowserManager repeated workflow characterization", () => {
       ).toEqual({ action: "deny" });
       expect(manager.getState({ threadId: THREAD_ID }).tabs).toHaveLength(beforeSchemeDenial);
     }
+
+    const preventNavigation = vi.fn();
+    tabContents.emit("will-navigate", {
+      url: "file:///sensitive",
+      preventDefault: preventNavigation,
+    });
+    expect(preventNavigation).toHaveBeenCalledOnce();
+  });
+
+  it("derives nested popup navigation guards through the runtime window chain", () => {
+    const manager = new DesktopBrowserManager();
+    const initial = manager.open({ threadId: THREAD_ID });
+    const tabId = initial.activeTabId;
+    expect(tabId).not.toBeNull();
+    if (!tabId) return;
+
+    const tabContents = new FakeWebContents();
+    asCharacterizationAccess(manager).configureRuntimeWebContents({
+      key: `thread-1:${tabId}`,
+      threadId: THREAD_ID,
+      tabId,
+      webContents: tabContents as unknown as WebContents,
+      view: null,
+      ownsWebContents: false,
+      listenerDisposers: [],
+    });
+    const popup = new FakePopupWindow();
+    tabContents.emit("did-create-window", popup, {
+      url: "https://accounts.example.test/oauth/authorize",
+    });
+    const nested = new FakePopupWindow("about:blank");
+    popup.webContents.emit("did-create-window", nested, { url: "about:blank" });
+
+    expect(popup.setMenuBarVisibility).toHaveBeenCalledWith(false);
+    expect(nested.setMenuBarVisibility).toHaveBeenCalledWith(false);
+    const preventBoundNavigation = vi.fn();
+    nested.webContents.emit("will-navigate", {
+      url: "https://accounts.example.test/oauth/consent",
+      preventDefault: preventBoundNavigation,
+    });
+    expect(preventBoundNavigation).not.toHaveBeenCalled();
+    const preventUnboundNavigation = vi.fn();
+    nested.webContents.emit("will-navigate", {
+      url: "https://attacker.example/phish",
+      preventDefault: preventUnboundNavigation,
+    });
+    expect(preventUnboundNavigation).toHaveBeenCalledOnce();
+    expect(nested.isDestroyed()).toBe(true);
   });
 });

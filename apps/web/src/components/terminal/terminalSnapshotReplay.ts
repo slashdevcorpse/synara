@@ -27,6 +27,111 @@ export interface DeferredTerminalOutput {
   byteLength: number;
 }
 
+export const TERMINAL_WRITE_BATCH_SIZE_LIMIT = 262_144;
+
+function utf8CodePointByteLength(codePoint: number): number {
+  if (codePoint <= 0x7f) return 1;
+  if (codePoint <= 0x7ff) return 2;
+  if (codePoint <= 0xffff) return 3;
+  return 4;
+}
+
+function terminalOutputByteLength(data: string): number {
+  let bytes = 0;
+  for (let index = 0; index < data.length; ) {
+    const codePoint = data.codePointAt(index);
+    if (codePoint === undefined) break;
+    bytes += utf8CodePointByteLength(codePoint);
+    index += codePoint > 0xffff ? 2 : 1;
+  }
+  return bytes;
+}
+
+function terminalOutputSlice(
+  data: string,
+  start: number,
+  maxBytes: number,
+): { end: number; byteLength: number } {
+  let bytes = 0;
+  let end = start;
+  while (end < data.length) {
+    const codePoint = data.codePointAt(end);
+    if (codePoint === undefined) break;
+    const codePointBytes = utf8CodePointByteLength(codePoint);
+    if (bytes + codePointBytes > maxBytes) break;
+    bytes += codePointBytes;
+    end += codePoint > 0xffff ? 2 : 1;
+  }
+  return { end, byteLength: bytes };
+}
+
+/**
+ * Coalesce retained terminal output without issuing an unbounded xterm write.
+ * Reported ACK bytes stay attached to their event's final slice when they do
+ * not match the encoded payload, so malformed metadata cannot acknowledge an
+ * event before all of its text has parsed.
+ */
+export function* batchDeferredTerminalOutput(
+  outputs: ReadonlyArray<DeferredTerminalOutput>,
+  maxBytes = TERMINAL_WRITE_BATCH_SIZE_LIMIT,
+): Generator<DeferredTerminalOutput> {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 4) {
+    throw new RangeError("Terminal write batches must allow one UTF-8 code point");
+  }
+
+  let parts: string[] = [];
+  let dataBytes = 0;
+  let acknowledgedBytes = 0;
+
+  const takeBatch = (): DeferredTerminalOutput => {
+    const batch = { data: parts.join(""), byteLength: acknowledgedBytes };
+    parts = [];
+    dataBytes = 0;
+    acknowledgedBytes = 0;
+    return batch;
+  };
+
+  for (const output of outputs) {
+    const outputDataBytes = terminalOutputByteLength(output.data);
+    if (outputDataBytes === 0) {
+      acknowledgedBytes += output.byteLength;
+      continue;
+    }
+
+    let offset = 0;
+    let consumedDataBytes = 0;
+    while (offset < output.data.length) {
+      if (dataBytes === maxBytes) yield takeBatch();
+      const availableBytes = maxBytes - dataBytes;
+      const { end, byteLength: sliceBytes } = terminalOutputSlice(
+        output.data,
+        offset,
+        availableBytes,
+      );
+      if (end === offset) {
+        yield takeBatch();
+        continue;
+      }
+
+      const slice = output.data.slice(offset, end);
+      consumedDataBytes += sliceBytes;
+      parts.push(slice);
+      dataBytes += sliceBytes;
+      offset = end;
+
+      if (output.byteLength === outputDataBytes) {
+        acknowledgedBytes += sliceBytes;
+      } else if (consumedDataBytes === outputDataBytes) {
+        acknowledgedBytes += output.byteLength;
+      }
+
+      if (dataBytes === maxBytes) yield takeBatch();
+    }
+  }
+
+  if (parts.length > 0 || acknowledgedBytes > 0) yield takeBatch();
+}
+
 export interface RecoveredGridOutputBuffer {
   enqueue(output: DeferredTerminalOutput): void;
   drain(): DeferredTerminalOutput[];

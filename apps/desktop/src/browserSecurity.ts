@@ -116,6 +116,8 @@ export function enforceBrowserNavigationPolicy(
 }
 
 const guardedBrowserWebContents = new WeakSet<WebContents>();
+const attachmentSecuredBrowserWebContents = new WeakSet<WebContents>();
+const securedBrowserWebviewHosts = new WeakSet<WebContents>();
 
 /**
  * Install the normal-tab scheme policy once for the full lifetime of a guest.
@@ -138,6 +140,20 @@ export function ensureBrowserNavigationPolicy(webContents: WebContents): boolean
       enforceBrowserNavigationPolicy(event);
     },
   );
+  return true;
+}
+
+/**
+ * Close the interval between Electron attaching a guest and the browser runtime
+ * adopting it. Runtime configuration replaces this deny-all handler with the
+ * normal popup/tab policy once the guest has an owning terminal tab.
+ */
+export function ensureAttachedBrowserWebContentsSecurity(webContents: WebContents): boolean {
+  if (attachmentSecuredBrowserWebContents.has(webContents)) return false;
+
+  ensureBrowserNavigationPolicy(webContents);
+  webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  attachmentSecuredBrowserWebContents.add(webContents);
   return true;
 }
 
@@ -195,4 +211,21 @@ export function secureBrowserWebviewAttachment(
   webPreferences.allowRunningInsecureContent = false;
   webPreferences.webviewTag = false;
   return { allowed: true };
+}
+
+/** Install the browser webview policy on a desktop window exactly once. */
+export function installBrowserWebviewAttachmentSecurity(webContents: WebContents): boolean {
+  if (securedBrowserWebviewHosts.has(webContents)) return false;
+
+  webContents.on("will-attach-webview", (event, webPreferences, params) => {
+    const decision = secureBrowserWebviewAttachment(webPreferences, params);
+    if (!decision.allowed) {
+      event.preventDefault();
+    }
+  });
+  webContents.on("did-attach-webview", (_event, guestWebContents) => {
+    ensureAttachedBrowserWebContentsSecurity(guestWebContents);
+  });
+  securedBrowserWebviewHosts.add(webContents);
+  return true;
 }

@@ -176,7 +176,7 @@ describe("managed attachment cleanup", () => {
               return await Promise.race([
                 drain.then(() => true),
                 new Promise<false>((resolve) => {
-                  timeout = setTimeout(() => resolve(false), 250);
+                  timeout = setTimeout(() => resolve(false), 750);
                 }),
               ]);
             } finally {
@@ -252,6 +252,110 @@ describe("managed attachment cleanup", () => {
 
     expect(result).toEqual({ inspected: 0, removed: 0, failures: 1 });
     await expect(fs.readFile(outsidePart, "utf8")).resolves.toBe("outside");
+  });
+
+  it("closes the direct-sweep directory when helper readiness fails", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "synara-managed-ready-failure-"));
+    temporaryRoots.push(root);
+    await fs.mkdir(path.join(root, ".staging"));
+    const opendir = vi.spyOn(fs, "opendir");
+    let closeCalls = 0;
+    let releaseReady!: () => void;
+    const readyReleased = new Promise<void>((resolve) => {
+      releaseReady = resolve;
+    });
+    let markReadyReached!: () => void;
+    const readyReached = new Promise<void>((resolve) => {
+      markReadyReached = resolve;
+    });
+
+    try {
+      const pending = sweepOrphanManagedAttachmentParts({
+        attachmentsDir: root,
+        beforePinnedSessionReady: async () => {
+          const openResult = opendir.mock.results[0];
+          if (!openResult || openResult.type !== "return") {
+            throw new Error("expected the staging directory to be open");
+          }
+          const directory = await openResult.value;
+          const closeDirectory = directory.close.bind(directory);
+          vi.spyOn(directory, "close").mockImplementation(async () => {
+            closeCalls += 1;
+            await closeDirectory();
+          });
+          markReadyReached();
+          await readyReleased;
+          throw new Error("simulated helper ready failure");
+        },
+      });
+      const observed = pending.then(
+        () => null,
+        (cause: unknown) => cause,
+      );
+      await readyReached;
+      releaseReady();
+
+      await expect(observed).resolves.toMatchObject({
+        message: "simulated helper ready failure",
+      });
+      expect(closeCalls).toBe(1);
+    } finally {
+      opendir.mockRestore();
+    }
+  });
+
+  it("closes the recovery directory when helper readiness fails", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "synara-managed-recovery-ready-failure-"));
+    temporaryRoots.push(root);
+    await fs.mkdir(path.join(root, ".staging"));
+    const opendir = vi.spyOn(fs, "opendir");
+    const recovery = makeManagedAttachmentStagingRecovery();
+    let closeCalls = 0;
+    let releaseReady!: () => void;
+    const readyReleased = new Promise<void>((resolve) => {
+      releaseReady = resolve;
+    });
+    let markReadyReached!: () => void;
+    const readyReached = new Promise<void>((resolve) => {
+      markReadyReached = resolve;
+    });
+
+    try {
+      const pending = Effect.runPromise(
+        recovery.run({
+          attachmentsDir: root,
+          beforePinnedSessionReady: async () => {
+            const openResult = opendir.mock.results[0];
+            if (!openResult || openResult.type !== "return") {
+              throw new Error("expected the staging directory to be open");
+            }
+            const directory = await openResult.value;
+            const closeDirectory = directory.close.bind(directory);
+            vi.spyOn(directory, "close").mockImplementation(async () => {
+              closeCalls += 1;
+              await closeDirectory();
+            });
+            markReadyReached();
+            await readyReleased;
+            throw new Error("simulated recovery helper ready failure");
+          },
+        }),
+      );
+      const observed = pending.then(
+        () => null,
+        (cause: unknown) => cause,
+      );
+      await readyReached;
+      releaseReady();
+
+      await expect(observed).resolves.toMatchObject({
+        message: "simulated recovery helper ready failure",
+      });
+      expect(closeCalls).toBe(1);
+    } finally {
+      await Effect.runPromise(recovery.close);
+      opendir.mockRestore();
+    }
   });
 
   it.skipIf(process.platform === "win32")(
@@ -451,7 +555,8 @@ describe("managed attachment cleanup", () => {
         "fresh",
       );
     }
-    let clock = 0;
+    const firstInvocationTimes = [0, 0, 100, 200, 250, 250];
+    let firstInvocationClockIndex = 0;
     const recovery = makeManagedAttachmentStagingRecovery();
     try {
       const first = await Effect.runPromise(
@@ -459,8 +564,11 @@ describe("managed attachment cleanup", () => {
           attachmentsDir: root,
           scanLimit: 16,
           maxRemovals: 16,
-          invocationTimeBudgetMs: 3,
-          monotonicNow: () => clock++,
+          invocationTimeBudgetMs: 250,
+          monotonicNow: () =>
+            firstInvocationTimes[
+              Math.min(firstInvocationClockIndex++, firstInvocationTimes.length - 1)
+            ] ?? 250,
         }),
       );
       const second = await Effect.runPromise(
@@ -468,8 +576,8 @@ describe("managed attachment cleanup", () => {
           attachmentsDir: root,
           scanLimit: 16,
           maxRemovals: 16,
-          invocationTimeBudgetMs: 100,
-          monotonicNow: () => clock++,
+          invocationTimeBudgetMs: 250,
+          monotonicNow: () => 0,
         }),
       );
 
@@ -477,6 +585,129 @@ describe("managed attachment cleanup", () => {
       expect(second).toMatchObject({ inspected: 3, passes: 1, exhausted: true });
     } finally {
       await Effect.runPromise(recovery.close);
+    }
+  });
+
+  it("bounds helper startup by the recovery deadline and discards its directory", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "synara-managed-staging-ready-deadline-"));
+    temporaryRoots.push(root);
+    const stagingDir = path.join(root, ".staging");
+    await fs.mkdir(stagingDir);
+    await fs.writeFile(
+      path.join(stagingDir, "att_v2_91919191919191919191919191919191.part"),
+      "fresh",
+    );
+    const opendir = vi.spyOn(fs, "opendir");
+    const recovery = makeManagedAttachmentStagingRecovery();
+    let clock = 0;
+    let closeCalls = 0;
+
+    try {
+      const expired = await Effect.runPromise(
+        recovery.run({
+          attachmentsDir: root,
+          invocationTimeBudgetMs: 250,
+          monotonicNow: () => clock,
+          beforePinnedSessionReady: async () => {
+            const openResult = opendir.mock.results[0];
+            if (!openResult || openResult.type !== "return") {
+              throw new Error("expected the staging directory to be open");
+            }
+            const directory = await openResult.value;
+            const closeDirectory = directory.close.bind(directory);
+            vi.spyOn(directory, "close").mockImplementation(async () => {
+              closeCalls += 1;
+              await closeDirectory();
+            });
+            clock = 250;
+          },
+        }),
+      );
+
+      expect(expired).toEqual({
+        inspected: 0,
+        removed: 0,
+        failures: 0,
+        passes: 0,
+        exhausted: false,
+      });
+      expect(closeCalls).toBe(1);
+
+      clock = 0;
+      const resumed = await Effect.runPromise(
+        recovery.run({
+          attachmentsDir: root,
+          invocationTimeBudgetMs: 250,
+          monotonicNow: () => clock,
+        }),
+      );
+      expect(resumed).toMatchObject({ inspected: 1, failures: 0, exhausted: true });
+      expect(opendir).toHaveBeenCalledTimes(2);
+    } finally {
+      await Effect.runPromise(recovery.close);
+      opendir.mockRestore();
+    }
+  });
+
+  it("bounds each helper request by the recovery deadline and recreates the cursor", async () => {
+    const root = await fs.mkdtemp(
+      path.join(os.tmpdir(), "synara-managed-staging-request-deadline-"),
+    );
+    temporaryRoots.push(root);
+    const stagingDir = path.join(root, ".staging");
+    const stalePart = path.join(stagingDir, "att_v2_92929292929292929292929292929292.part");
+    await fs.mkdir(stagingDir);
+    await fs.writeFile(stalePart, "stale");
+    const nowMs = Date.now();
+    const staleDate = new Date(nowMs - MANAGED_ATTACHMENT_WRITING_LEASE_MS - 1_000);
+    await fs.utimes(stalePart, staleDate, staleDate);
+    const opendir = vi.spyOn(fs, "opendir");
+    const recovery = makeManagedAttachmentStagingRecovery();
+    let clock = 0;
+    let forceCloseWaitMs: number | null = null;
+
+    try {
+      const expired = await Effect.runPromise(
+        recovery.run({
+          attachmentsDir: root,
+          nowMs,
+          invocationTimeBudgetMs: 250,
+          monotonicNow: () => clock,
+          beforePinnedSessionRequest: async () => {
+            clock = 250;
+          },
+          waitForPinnedSessionForceClose: async (timeoutMs) => {
+            forceCloseWaitMs = timeoutMs;
+            await new Promise<void>((resolve) => setTimeout(resolve, timeoutMs));
+          },
+        }),
+      );
+
+      expect(expired).toEqual({
+        inspected: 1,
+        removed: 0,
+        failures: 0,
+        passes: 1,
+        exhausted: false,
+      });
+      expect(forceCloseWaitMs).toBe(25);
+      await expect(fs.readFile(stalePart, "utf8")).resolves.toBe("stale");
+
+      clock = 0;
+      const resumed = await Effect.runPromise(
+        recovery.run({
+          attachmentsDir: root,
+          nowMs,
+          invocationTimeBudgetMs: 250,
+          monotonicNow: () => clock,
+        }),
+      );
+      expect(resumed).toMatchObject({ inspected: 1, removed: 1, failures: 0, exhausted: true });
+      expect(opendir).toHaveBeenCalledTimes(2);
+      await expect(fs.stat(stalePart)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await Effect.runPromise(recovery.close);
+      opendir.mockRestore();
     }
   });
 

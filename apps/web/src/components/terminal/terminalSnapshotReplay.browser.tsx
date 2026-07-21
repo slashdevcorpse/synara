@@ -15,6 +15,7 @@ import {
   replaySnapshotAtDestinationGrid,
   replaySnapshotAtRecoveredGrid,
   shouldReplayColdSnapshot,
+  TERMINAL_WRITE_BATCH_SIZE_LIMIT,
 } from "./terminalSnapshotReplay";
 import {
   attachRuntimeToContainer,
@@ -2139,13 +2140,27 @@ describe("recovered terminal snapshot replay in real xterm", () => {
       },
     });
     const originalWrite = entry.terminal.write.bind(entry.terminal);
-    let liveOutputParsed = false;
-    let releaseLiveOutputCallback: (() => void) | undefined;
+    const retainedOutputs = [
+      "\r\nLIVE-DURING-FINAL-BEGIN|",
+      "x".repeat(TERMINAL_WRITE_BATCH_SIZE_LIMIT),
+      "|🙂|LIVE-DURING-FINAL-END",
+    ];
+    const expectedRetainedOutput = retainedOutputs.join("");
+    const retainedWrites: string[] = [];
+    const encoder = new TextEncoder();
+    let captureRetainedWrites = false;
+    let firstRetainedWriteParsed = false;
+    let releaseFirstRetainedWriteCallback: (() => void) | undefined;
     entry.terminal.write = ((data: string | Uint8Array, callback?: () => void) => {
-      if (typeof data === "string" && data.includes("LIVE-DURING-FINAL")) {
+      if (captureRetainedWrites && typeof data === "string") {
+        const writeNumber = retainedWrites.push(data);
         originalWrite(data, () => {
-          liveOutputParsed = true;
-          releaseLiveOutputCallback = callback;
+          if (writeNumber === 1) {
+            firstRetainedWriteParsed = true;
+            releaseFirstRetainedWriteCallback = callback;
+            return;
+          }
+          callback?.();
         });
         return;
       }
@@ -2179,34 +2194,53 @@ describe("recovered terminal snapshot replay in real xterm", () => {
         snapshot,
       });
       await waitForCondition(() => resizeInputs.length === 1, "final recovery backend resize");
-      terminalEventListener?.({
-        type: "output",
-        threadId: "thread",
-        terminalId: entry.terminalId,
-        createdAt: new Date().toISOString(),
-        generation: "generation-1",
-        sequence: 2,
-        data: "\r\nLIVE-DURING-FINAL",
-        byteLength: 20,
-      });
+      captureRetainedWrites = true;
+      for (const [index, data] of retainedOutputs.entries()) {
+        terminalEventListener?.({
+          type: "output",
+          threadId: "thread",
+          terminalId: entry.terminalId,
+          createdAt: new Date().toISOString(),
+          generation: "generation-1",
+          sequence: index + 2,
+          data,
+          byteLength: encoder.encode(data).byteLength,
+        });
+      }
       resolveResize?.();
 
-      await waitForCondition(() => liveOutputParsed, "xterm parser held after live output");
+      await waitForCondition(
+        () => firstRetainedWriteParsed,
+        "xterm parser held after first retained write",
+      );
       expect(entry.pendingHistoryReplayPromise).not.toBeNull();
-      releaseLiveOutputCallback?.();
+      expect(retainedWrites).toHaveLength(1);
+      releaseFirstRetainedWriteCallback?.();
 
       await waitForCondition(
-        () => entry.pendingHistoryReplayPromise === null && entry.pendingWriteBytes === 0,
-        "live output after final resize",
+        () =>
+          entry.pendingHistoryReplayPromise === null &&
+          acknowledgedBytes.reduce((total, bytes) => total + bytes, 0) ===
+            encoder.encode(expectedRetainedOutput).byteLength,
+        "batched live output after final resize",
+        10_000,
       );
       const text = bufferText(entry.terminal);
       expect(entry.backendOpenDimensions).toEqual(finalDimensions);
       expect({ cols: entry.terminal.cols, rows: entry.terminal.rows }).toEqual(finalDimensions);
       expect(entry.appliedHistoryRecordIdentity).toBeNull();
-      expect(text.split("LIVE-DURING-FINAL")).toHaveLength(2);
-      expect(text.indexOf("RECOVERED-BEFORE-LIVE")).toBeLessThan(text.indexOf("LIVE-DURING-FINAL"));
+      expect(retainedWrites.length).toBeGreaterThan(1);
+      expect(
+        retainedWrites.every(
+          (write) => encoder.encode(write).byteLength <= TERMINAL_WRITE_BATCH_SIZE_LIMIT,
+        ),
+      ).toBe(true);
+      expect(retainedWrites.join("")).toBe(expectedRetainedOutput);
+      expect(text.split("LIVE-DURING-FINAL-END")).toHaveLength(2);
       expect(resizeInputs).toEqual([finalDimensions]);
-      expect(acknowledgedBytes).toEqual([20]);
+      expect(acknowledgedBytes).toEqual(
+        retainedWrites.map((write) => encoder.encode(write).byteLength),
+      );
     } finally {
       entry.terminal.write = originalWrite as Terminal["write"];
       disposeRuntimeEntry(entry);

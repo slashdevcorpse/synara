@@ -5,14 +5,23 @@
 import { existsSync } from "node:fs";
 import * as Path from "node:path";
 
+import { applyWebDocumentSecurityHeaders } from "@synara/shared/webSecurity";
+
 export type DesktopStaticProtocolResponse = { path: string } | { error: -6 };
+export type DesktopStaticProtocolResolver = (requestUrl: string) => DesktopStaticProtocolResponse;
+
+export interface DesktopStaticProtocolHandlerOptions {
+  readonly resolveRequest: DesktopStaticProtocolResolver;
+  readonly fetchFile: (filePath: string) => Promise<Response>;
+  readonly fallbackUrl: string;
+}
 
 type PathExists = (path: string) => boolean;
 
 export function createDesktopStaticProtocolResolver(
   staticRoot: string,
   pathExists: PathExists = existsSync,
-): (requestUrl: string) => DesktopStaticProtocolResponse {
+): DesktopStaticProtocolResolver {
   const staticRootResolved = Path.resolve(staticRoot);
   const staticRootPrefix = `${staticRootResolved}${Path.sep}`;
   const fallbackIndex = Path.join(staticRootResolved, "index.html");
@@ -46,6 +55,28 @@ export function createDesktopStaticProtocolResolver(
       return { path: resolvedCandidate };
     } catch {
       return { path: fallbackIndex };
+    }
+  };
+}
+
+export function createDesktopStaticProtocolHandler(
+  options: DesktopStaticProtocolHandlerOptions,
+): (request: { readonly url: string }) => Promise<Response> {
+  const secureNotFoundResponse = () =>
+    applyWebDocumentSecurityHeaders(new Response(null, { status: 404 }));
+  const resolveResponse = async (requestUrl: string): Promise<Response> => {
+    const resolution = options.resolveRequest(requestUrl);
+    if ("error" in resolution) {
+      return secureNotFoundResponse();
+    }
+    return applyWebDocumentSecurityHeaders(await options.fetchFile(resolution.path));
+  };
+
+  return async (request) => {
+    try {
+      return await resolveResponse(request.url);
+    } catch {
+      return resolveResponse(options.fallbackUrl);
     }
   };
 }

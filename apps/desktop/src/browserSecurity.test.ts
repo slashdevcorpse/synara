@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { EventEmitter } from "node:events";
 
 import { describe, expect, it, vi } from "vitest";
 
@@ -6,11 +6,25 @@ import {
   createBrowserPopupNavigationPolicy,
   enforceBrowserNavigationPolicy,
   enforceBrowserPopupNavigationPolicy,
+  ensureAttachedBrowserWebContentsSecurity,
   ensureBrowserNavigationPolicy,
+  installBrowserWebviewAttachmentSecurity,
   isAllowedBrowserNavigationUrl,
   secureBrowserWebviewAttachment,
 } from "./browserSecurity";
 import { BROWSER_SESSION_PARTITION } from "./browserSessionPolicy";
+
+type TestWindowOpenHandler = (details: { readonly url: string }) => {
+  readonly action: "allow" | "deny";
+};
+
+class FakeBrowserWebContents extends EventEmitter {
+  windowOpenHandler: TestWindowOpenHandler | null = null;
+
+  setWindowOpenHandler(handler: TestWindowOpenHandler): void {
+    this.windowOpenHandler = handler;
+  }
+}
 
 describe("desktop browser security policy", () => {
   it.each([
@@ -65,6 +79,48 @@ describe("desktop browser security policy", () => {
       listeners.get(eventName)?.({ url: "file:///sensitive", preventDefault });
       expect(preventDefault).toHaveBeenCalledOnce();
     }
+  });
+
+  it("denies guest popups immediately when a browser webview attaches", () => {
+    const host = new EventEmitter();
+    const guest = new FakeBrowserWebContents();
+    const preventAttachment = vi.fn();
+    const webPreferences = { partition: "persist:other" };
+    const params = { partition: "persist:other", src: "https://example.test/" };
+
+    expect(installBrowserWebviewAttachmentSecurity(host as unknown as Electron.WebContents)).toBe(
+      true,
+    );
+    expect(installBrowserWebviewAttachmentSecurity(host as unknown as Electron.WebContents)).toBe(
+      false,
+    );
+    host.emit("will-attach-webview", { preventDefault: preventAttachment }, webPreferences, params);
+    expect(preventAttachment).toHaveBeenCalledOnce();
+
+    const preventApprovedAttachment = vi.fn();
+    const approvedPreferences = { partition: BROWSER_SESSION_PARTITION, nodeIntegration: true };
+    host.emit(
+      "will-attach-webview",
+      { preventDefault: preventApprovedAttachment },
+      approvedPreferences,
+      { partition: BROWSER_SESSION_PARTITION, src: "https://example.test/" },
+    );
+    expect(preventApprovedAttachment).not.toHaveBeenCalled();
+    expect(approvedPreferences.nodeIntegration).toBe(false);
+
+    host.emit("did-attach-webview", {}, guest);
+    expect(guest.windowOpenHandler?.({ url: "https://attacker.example/popup" })).toEqual({
+      action: "deny",
+    });
+
+    const preventNavigation = vi.fn();
+    guest.emit("will-navigate", { url: "file:///sensitive", preventDefault: preventNavigation });
+    expect(preventNavigation).toHaveBeenCalledOnce();
+    const originalHandler = guest.windowOpenHandler;
+    expect(ensureAttachedBrowserWebContentsSecurity(guest as unknown as Electron.WebContents)).toBe(
+      false,
+    );
+    expect(guest.windowOpenHandler).toBe(originalHandler);
   });
 
   it.each(["file:///sensitive", "data:text/html,unsafe", "synara-oauth://callback"])(
@@ -207,28 +263,5 @@ describe("desktop browser security policy", () => {
         { partition: BROWSER_SESSION_PARTITION, src: "file:///sensitive" },
       ),
     ).toEqual({ allowed: false, reason: "source" });
-  });
-
-  it("wires the policy into packaged responses, webview attachment, and nested popups", () => {
-    const mainSource = readFileSync(new URL("./main.ts", import.meta.url), "utf8");
-    const browserManagerSource = readFileSync(
-      new URL("./browserManager.ts", import.meta.url),
-      "utf8",
-    );
-
-    expect(mainSource).toContain("protocol.handle(DESKTOP_SCHEME");
-    expect(mainSource).toContain("applyWebDocumentSecurityHeaders(");
-    expect(mainSource).toContain('window.webContents.on("will-attach-webview"');
-    expect(mainSource).toContain("secureBrowserWebviewAttachment(webPreferences, params)");
-    expect(mainSource).toContain('window.webContents.on("did-attach-webview"');
-    expect(mainSource).toContain("ensureBrowserNavigationPolicy(guestWebContents)");
-    const runtimeSecuritySource = browserManagerSource.slice(
-      browserManagerSource.indexOf("private configureRuntimeWebContents"),
-      browserManagerSource.indexOf("private syncRuntimeState"),
-    );
-    expect(runtimeSecuritySource).toContain("ensureBrowserNavigationPolicy(webContents)");
-    expect(browserManagerSource).toContain("this.registerOAuthPopupWindow(nested");
-    expect(browserManagerSource).toContain("runtime.navigationPolicy.deriveNested(details.url)");
-    expect(browserManagerSource).toContain("createBrowserPopupNavigationPolicy({");
   });
 });
