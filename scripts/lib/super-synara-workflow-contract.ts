@@ -58,6 +58,10 @@ function normalizeShellCommand(command: string): string {
   return command.replace(/\s+/g, " ").trim();
 }
 
+function normalizeContinuedShellCommand(command: string): string {
+  return normalizeShellCommand(command.replace(/\\\r?\n/g, " "));
+}
+
 function executableShellLines(command: string): readonly string[] {
   return command
     .split(/\r?\n/)
@@ -108,6 +112,39 @@ function publicationJob(jobs: UnknownRecord, jobName: string): UnknownRecord {
     throw new Error(`Publication workflow must define the ${jobName} job with steps.`);
   }
   return job;
+}
+
+const PRERELEASE_SOURCE_PROVENANCE_COMMAND =
+  'node scripts/verify-release-source-provenance.ts "$VERSION" "$TAG" true "$SOURCE_COMMIT" branch main github-unsigned-prerelease false';
+
+function verifyPrereleaseSourceProvenanceSteps(jobs: UnknownRecord): void {
+  for (const [jobName, stepName] of [
+    ["preflight", "Validate source provenance"],
+    ["windows_x64", "Revalidate protected-main source provenance"],
+    ["macos_arm64", "Revalidate protected-main source provenance"],
+  ] as const) {
+    const job = publicationJob(jobs, jobName);
+    const steps = job.steps;
+    if (!Array.isArray(steps)) {
+      throw new Error(`Publication workflow must define the ${jobName} job with steps.`);
+    }
+    const matches = steps.filter(
+      (step) => isRecord(step) && step.name === stepName && typeof step.run === "string",
+    );
+    const step = matches[0];
+    if (
+      matches.length !== 1 ||
+      !isRecord(step) ||
+      typeof step.run !== "string" ||
+      normalizeContinuedShellCommand(step.run) !== PRERELEASE_SOURCE_PROVENANCE_COMMAND ||
+      step.if !== undefined ||
+      (step["continue-on-error"] !== undefined && step["continue-on-error"] !== false)
+    ) {
+      throw new Error(
+        "Publication source checks must revalidate the exact protected-main source without requiring the immutable tag before atomic publication.",
+      );
+    }
+  }
 }
 
 function verifyReleaseScopeCase(preflightJob: UnknownRecord): void {
@@ -708,6 +745,7 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
   verifyRootTestOwnership(jobs);
   verifyDraftAdmissionJob(jobs);
   verifyPublicationJobDependencies(jobs);
+  verifyPrereleaseSourceProvenanceSteps(jobs);
   verifyPreflightSourceCleanliness(jobs);
   const preflightJob = publicationJob(jobs, "preflight");
   verifyPreflightRouteTreeIsolation(preflightJob);

@@ -120,6 +120,36 @@ describe("Super Synara workflow contracts", () => {
     ).toThrow("not pinned to a full commit");
   });
 
+  it("keeps every source check tagless until atomic draft publication", () => {
+    expect(() => verifySuperSynaraWorkflowText(main, audit)).not.toThrow();
+
+    for (const [startMarker, endMarker, command] of [
+      [
+        "\n  preflight:",
+        "\n  windows_x64:",
+        "github-unsigned-prerelease \\\n            false",
+      ],
+      [
+        "\n  windows_x64:",
+        "\n  macos_arm64:",
+        "github-unsigned-prerelease false",
+      ],
+      ["\n  macos_arm64:", "\n  publish:", "github-unsigned-prerelease false"],
+    ] as const) {
+      const start = main.indexOf(startMarker);
+      const end = main.indexOf(endMarker, start + startMarker.length);
+      expect(start).toBeGreaterThanOrEqual(0);
+      expect(end).toBeGreaterThan(start);
+      const block = main.slice(start, end);
+      const mutatedBlock = block.replace(command, command.replace("false", "true"));
+      expect(mutatedBlock).not.toBe(block);
+      const mutation = main.slice(0, start) + mutatedBlock + main.slice(end);
+      expect(() => verifySuperSynaraWorkflowText(mutation, audit)).toThrow(
+        "without requiring the immutable tag before atomic publication",
+      );
+    }
+  });
+
   it("adopts only the exact planned Release Drafter draft", () => {
     for (const [binding, replacement] of [
       [
@@ -469,8 +499,8 @@ describe("Super Synara workflow contracts", () => {
     );
 
     const alternatePhaseInReadOnlyWindows = main.replace(
-      "      - name: Revalidate tagged source",
-      "      - name: Reintroduced native-lane release-state validation\n        shell: bash\n        run: node scripts/verify-super-synara-github-state.ts --phase before-draft\n\n      - name: Revalidate tagged source",
+      "      - name: Revalidate protected-main source provenance",
+      "      - name: Reintroduced native-lane release-state validation\n        shell: bash\n        run: node scripts/verify-super-synara-github-state.ts --phase before-draft\n\n      - name: Revalidate protected-main source provenance",
     );
     expect(alternatePhaseInReadOnlyWindows).not.toBe(main);
     expect(() => verifySuperSynaraWorkflowText(alternatePhaseInReadOnlyWindows, audit)).toThrow(
