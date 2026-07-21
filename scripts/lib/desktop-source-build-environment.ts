@@ -22,8 +22,10 @@ export function createDesktopSourceBuildEnvironment(
   if (input.exactProvenanceRequested && !input.generatedRouteTreePath) {
     throw new Error("Exact-provenance builds require a generated route-tree redirect path.");
   }
+  const baseEnvironment = { ...input.baseEnvironment };
+  delete baseEnvironment.SYNARA_GENERATED_ROUTE_TREE;
   return {
-    ...input.baseEnvironment,
+    ...baseEnvironment,
     SYNARA_DESKTOP_FLAVOR: input.flavor,
     SYNARA_DESKTOP_DISABLE_UPDATES: input.disableUpdates ? "1" : "0",
     ...(input.exactProvenanceRequested

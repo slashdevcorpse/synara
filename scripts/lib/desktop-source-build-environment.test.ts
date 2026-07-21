@@ -44,19 +44,20 @@ describe("desktop source build environment", () => {
     });
   });
 
-  it("preserves caller route-tree output outside exact-provenance builds", () => {
-    expect(
-      createDesktopSourceBuildEnvironment({
-        baseEnvironment: { SYNARA_GENERATED_ROUTE_TREE: "inherited" },
-        flavor: "production",
-        disableUpdates: false,
-        exactProvenanceRequested: false,
-      }),
-    ).toMatchObject({
+  it("removes inherited route-tree redirects outside exact-provenance builds", () => {
+    const environment = createDesktopSourceBuildEnvironment({
+      baseEnvironment: { SYNARA_GENERATED_ROUTE_TREE: "inherited", PRESERVED: "yes" },
+      flavor: "production",
+      disableUpdates: false,
+      exactProvenanceRequested: false,
+    });
+
+    expect(environment).toMatchObject({
+      PRESERVED: "yes",
       SYNARA_DESKTOP_FLAVOR: "production",
       SYNARA_DESKTOP_DISABLE_UPDATES: "0",
-      SYNARA_GENERATED_ROUTE_TREE: "inherited",
     });
+    expect(environment).not.toHaveProperty("SYNARA_GENERATED_ROUTE_TREE");
   });
 
   it("fails closed when an exact build has no redirect", () => {
