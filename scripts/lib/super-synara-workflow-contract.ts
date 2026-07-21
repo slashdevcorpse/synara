@@ -540,6 +540,40 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
   if (!Array.isArray(publishSteps)) {
     throw new Error("Publication workflow must define publish steps.");
   }
+  const draftStep = publishSteps.find(
+    (step) => isRecord(step) && step.name === "Create owned draft prerelease",
+  );
+  if (!isRecord(draftStep) || typeof draftStep.run !== "string") {
+    throw new Error("Publication workflow must define the owned draft creation step.");
+  }
+  const draftCommands = continuedShellCommands(draftStep.run, "gh api");
+  if (draftCommands.some((command) => command.includes("--slurp") && command.includes("--jq"))) {
+    throw new Error(
+      "Publication draft lookup must not combine the incompatible gh api --slurp and --jq flags.",
+    );
+  }
+  const releaseQueryCommands = draftCommands.filter((command) =>
+    command.includes('"repos/$GITHUB_REPOSITORY/releases?per_page=100"'),
+  );
+  if (
+    releaseQueryCommands.length !== 1 ||
+    !releaseQueryCommands[0]!.includes("gh api --paginate --slurp")
+  ) {
+    throw new Error(
+      "Publication draft lookup must capture the complete paginated release response.",
+    );
+  }
+  const draftFilterCommands = continuedShellCommands(draftStep.run, "jq -er");
+  if (
+    draftFilterCommands.length !== 1 ||
+    !draftFilterCommands[0]!.includes('--arg tag "$TAG"') ||
+    !draftFilterCommands[0]!.includes('--arg source_commit "$SOURCE_COMMIT"') ||
+    !draftFilterCommands[0]!.includes('<<< "$releases_json"')
+  ) {
+    throw new Error(
+      "Publication draft lookup must filter the captured response with standalone jq arguments.",
+    );
+  }
   const macosDownloadStep = publishSteps.find(
     (step) => isRecord(step) && step.name === "Download macOS lane",
   );
