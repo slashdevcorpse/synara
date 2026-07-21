@@ -149,6 +149,12 @@ describe("Super Synara workflow contracts", () => {
     ).toThrow("authorize the real owner before any draft mutation");
     expect(() =>
       verifySuperSynaraReleaseDrafterText(
+        releaseDrafter.replace('[[ "$TRIGGERING_ACTOR" == "$OWNER" ]]', "true"),
+        releaseDrafterConfig,
+      ),
+    ).toThrow(/authorize the real owner|authorize and preserve the real triggering owner/);
+    expect(() =>
+      verifySuperSynaraReleaseDrafterText(
         releaseDrafter.replace('-f "controller_actor=$CONTROLLER_ACTOR" \\\n', ""),
         releaseDrafterConfig,
       ),

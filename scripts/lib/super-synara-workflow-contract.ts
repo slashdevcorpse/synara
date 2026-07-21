@@ -126,8 +126,13 @@ function verifyReleaseScopeCase(preflightJob: UnknownRecord): void {
     'validation_actor="$EVENT_ACTOR"',
     'validation_triggering_actor="$EVENT_TRIGGERING_ACTOR"',
     'if [[ "$EVENT_ACTOR" == "github-actions[bot]" ]]; then',
+    'if [[ "$EVENT_TRIGGERING_ACTOR" != "github-actions[bot]" ]]; then',
+    'validation_actor="$EVENT_TRIGGERING_ACTOR"',
+    'validation_triggering_actor="$EVENT_TRIGGERING_ACTOR"',
+    "else",
     'validation_actor="$CONTROLLER_ACTOR"',
     'validation_triggering_actor="$CONTROLLER_TRIGGERING_ACTOR"',
+    "fi",
     "fi",
     '[[ -n "$validation_actor" ]]',
     '[[ -n "$validation_triggering_actor" ]]',
@@ -1034,15 +1039,20 @@ export function verifySuperSynaraReleaseDrafterText(
   const authorizationIndex = draftSteps.findIndex(
     (step) => isRecord(step) && step.name === "Authorize manual release controller before mutation",
   );
+  const rerunAuthorizationIndex = draftSteps.findIndex(
+    (step) => isRecord(step) && step.name === "Authorize workflow rerun before mutation",
+  );
   const actionIndex = draftSteps.findIndex(
     (step) => isRecord(step) && step.id === "release_drafter",
   );
   if (
     gateIndex < 0 ||
     authorizationIndex < 0 ||
+    rerunAuthorizationIndex < 0 ||
     actionIndex < 0 ||
     gateIndex >= authorizationIndex ||
-    authorizationIndex >= actionIndex
+    authorizationIndex >= rerunAuthorizationIndex ||
+    rerunAuthorizationIndex >= actionIndex
   ) {
     throw new Error(
       "Release Drafter scheduler must prove new commits and authorize manual actors before Release Drafter can mutate a draft.",
@@ -1088,10 +1098,22 @@ export function verifySuperSynaraReleaseDrafterText(
       "Release Drafter manual dispatch must authorize the real owner before any draft mutation.",
     );
   }
+  const rerunAuthorizationStep = draftSteps[rerunAuthorizationIndex];
+  if (
+    !isRecord(rerunAuthorizationStep) ||
+    rerunAuthorizationStep.if !== "github.run_attempt > 1" ||
+    typeof rerunAuthorizationStep.run !== "string" ||
+    JSON.stringify(executableShellLines(rerunAuthorizationStep.run)) !==
+      JSON.stringify(["set -euo pipefail", '[[ "$TRIGGERING_ACTOR" == "$OWNER" ]]'])
+  ) {
+    throw new Error(
+      "Release Drafter reruns must authorize and preserve the real triggering owner before mutation.",
+    );
+  }
   requireText(
     scheduler,
-    "github.event_name == 'workflow_dispatch' && github.actor || 'github-actions[bot]'",
-    "Release Drafter manual dispatch must preserve the initiating actor.",
+    "github.run_attempt > 1 && github.triggering_actor",
+    "Release Drafter reruns must preserve the real triggering actor.",
   );
   for (const actorBinding of [
     '-f "controller_actor=$CONTROLLER_ACTOR"',

@@ -128,8 +128,13 @@ jobs:
           validation_actor="$EVENT_ACTOR"
           validation_triggering_actor="$EVENT_TRIGGERING_ACTOR"
           if [[ "$EVENT_ACTOR" == "github-actions[bot]" ]]; then
-            validation_actor="$CONTROLLER_ACTOR"
-            validation_triggering_actor="$CONTROLLER_TRIGGERING_ACTOR"
+            if [[ "$EVENT_TRIGGERING_ACTOR" != "github-actions[bot]" ]]; then
+              validation_actor="$EVENT_TRIGGERING_ACTOR"
+              validation_triggering_actor="$EVENT_TRIGGERING_ACTOR"
+            else
+              validation_actor="$CONTROLLER_ACTOR"
+              validation_triggering_actor="$CONTROLLER_TRIGGERING_ACTOR"
+            fi
           fi
           [[ -n "$validation_actor" ]]
           [[ -n "$validation_triggering_actor" ]]

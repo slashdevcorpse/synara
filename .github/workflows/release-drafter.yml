@@ -110,6 +110,16 @@ jobs:
           [[ "$ACTOR" == "$OWNER" ]]
           [[ "$TRIGGERING_ACTOR" == "$OWNER" ]]
 
+      - name: Authorize workflow rerun before mutation
+        if: github.run_attempt > 1
+        shell: bash
+        env:
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          [[ "$TRIGGERING_ACTOR" == "$OWNER" ]]
+
       - id: release_drafter
         name: Release Drafter
         if: steps.changes.outputs.should_release == 'true'
@@ -134,8 +144,8 @@ jobs:
           TAG: ${{ steps.plan.outputs.tag }}
           EXISTING_DRAFT_ID: ${{ steps.plan.outputs.existing_draft_id }}
           DRAFT_ID: ${{ steps.release_drafter.outputs.id }}
-          VALIDATION_ACTOR: ${{ github.event_name == 'workflow_dispatch' && github.actor || 'github-actions[bot]' }}
-          VALIDATION_TRIGGERING_ACTOR: ${{ github.event_name == 'workflow_dispatch' && github.triggering_actor || 'github-actions[bot]' }}
+          VALIDATION_ACTOR: ${{ github.run_attempt > 1 && github.triggering_actor || (github.event_name == 'workflow_dispatch' && github.actor || 'github-actions[bot]') }}
+          VALIDATION_TRIGGERING_ACTOR: ${{ github.run_attempt > 1 && github.triggering_actor || (github.event_name == 'workflow_dispatch' && github.triggering_actor || 'github-actions[bot]') }}
         run: |
           set -euo pipefail
           [[ "$DRAFT_ID" =~ ^[1-9][0-9]*$ ]]
@@ -212,8 +222,8 @@ jobs:
           TAG: ${{ needs.draft.outputs.tag }}
           DRAFT_ID: ${{ needs.draft.outputs.draft_id }}
           RELEASE_SCOPE: ${{ github.event_name == 'workflow_dispatch' && inputs.release_scope || 'windows-only' }}
-          CONTROLLER_ACTOR: ${{ github.event_name == 'workflow_dispatch' && github.actor || 'github-actions[bot]' }}
-          CONTROLLER_TRIGGERING_ACTOR: ${{ github.event_name == 'workflow_dispatch' && github.triggering_actor || 'github-actions[bot]' }}
+          CONTROLLER_ACTOR: ${{ github.run_attempt > 1 && github.triggering_actor || (github.event_name == 'workflow_dispatch' && github.actor || 'github-actions[bot]') }}
+          CONTROLLER_TRIGGERING_ACTOR: ${{ github.run_attempt > 1 && github.triggering_actor || (github.event_name == 'workflow_dispatch' && github.triggering_actor || 'github-actions[bot]') }}
         run: |
           set -euo pipefail
           gh workflow run super-synara-prerelease.yml \
