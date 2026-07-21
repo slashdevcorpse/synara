@@ -73,34 +73,34 @@ const visibilityAttempts = 30;
 let lastValidationError: unknown;
 
 for (let attempt = 1; attempt <= visibilityAttempts; attempt += 1) {
-  const refJson = runGh(["api", `repos/${repository}/git/ref/tags/${encodedTag}`], true);
-  const refObject = refJson
-    ? (JSON.parse(refJson) as { object?: { sha?: string; type?: string } }).object
-    : undefined;
-  const releasePages = JSON.parse(
-    runGh(["api", "--paginate", "--slurp", `repos/${repository}/releases?per_page=100`]),
-  ) as ReadonlyArray<
-    ReadonlyArray<{
-      id: number;
-      tag_name: string;
-      target_commitish: string;
-      name: string | null;
-      body: string | null;
-      draft: boolean;
-      prerelease: boolean;
-    }>
-  >;
-  const releases: ReadonlyArray<GitHubReleaseState> = releasePages.flat().map((release) => ({
-    id: release.id,
-    tagName: release.tag_name,
-    targetCommitish: release.target_commitish,
-    name: release.name ?? "",
-    body: release.body ?? "",
-    draft: release.draft,
-    prerelease: release.prerelease,
-  }));
-
   try {
+    const refJson = runGh(["api", `repos/${repository}/git/ref/tags/${encodedTag}`], true);
+    const refObject = refJson
+      ? (JSON.parse(refJson) as { object?: { sha?: string; type?: string } }).object
+      : undefined;
+    const releasePages = JSON.parse(
+      runGh(["api", "--paginate", "--slurp", `repos/${repository}/releases?per_page=100`]),
+    ) as ReadonlyArray<
+      ReadonlyArray<{
+        id: number;
+        tag_name: string;
+        target_commitish: string;
+        name: string | null;
+        body: string | null;
+        draft: boolean;
+        prerelease: boolean;
+      }>
+    >;
+    const releases: ReadonlyArray<GitHubReleaseState> = releasePages.flat().map((release) => ({
+      id: release.id,
+      tagName: release.tag_name,
+      targetCommitish: release.target_commitish,
+      name: release.name ?? "",
+      body: release.body ?? "",
+      draft: release.draft,
+      prerelease: release.prerelease,
+    }));
+
     validateSuperSynaraGitHubState({
       phase,
       repository,

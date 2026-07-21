@@ -56,6 +56,11 @@ describe("Super Synara workflow contracts", () => {
         ),
       ),
     ).toThrow("retry visibility boundedly");
+    expect(() =>
+      verifySuperSynaraGithubStateScriptText(
+        githubStateScript.replace("  try {\n    const refJson", "  const refJson"),
+      ),
+    ).toThrow("retry visibility boundedly");
   });
 
   it("rejects automatic triggers and mutable action tags", () => {

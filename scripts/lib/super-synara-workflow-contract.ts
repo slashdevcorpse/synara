@@ -1196,6 +1196,9 @@ export function verifySuperSynaraGithubStateScriptText(script: string): void {
   const orderedNeedles = [
     "const visibilityAttempts = 30;",
     "for (let attempt = 1; attempt <= visibilityAttempts; attempt += 1)",
+    "try {",
+    "const refJson = runGh(",
+    "const releasePages = JSON.parse(",
     "validateSuperSynaraGitHubState({",
     "} catch (error) {",
     "if (attempt < visibilityAttempts)",
@@ -1214,7 +1217,7 @@ export function verifySuperSynaraGithubStateScriptText(script: string): void {
   }
   requireText(
     script,
-    'const releasePages = JSON.parse(\n    runGh(["api", "--paginate", "--slurp", `repos/${repository}/releases?per_page=100`]),',
+    'const releasePages = JSON.parse(\n      runGh(["api", "--paginate", "--slurp", `repos/${repository}/releases?per_page=100`]),',
     "GitHub release-state visibility retries must re-read the complete release list.",
   );
 }

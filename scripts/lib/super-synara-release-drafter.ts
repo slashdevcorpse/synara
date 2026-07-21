@@ -127,7 +127,7 @@ export function resolveSuperSynaraDraftPlan(input: {
         `Owned draft ${ownedDraft.id} unexpectedly has immutable tag ${ownedDraft.tagName}; draft publication must create the tag atomically.`,
       );
     }
-    if (!reservedTag && ownedDraft.iteration <= latestTag.iteration) {
+    if (ownedDraft.iteration <= latestTag.iteration) {
       throw new Error(`Owned draft ${ownedDraft.id} does not advance ${latestTag.name}.`);
     }
     return {

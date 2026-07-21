@@ -46,13 +46,13 @@ const CI_WINDOWS_REQUIRED_COMMANDS = [
 ] as const;
 const CI_WINDOWS_POST_BUILD_COMMAND = "bun run --cwd apps/desktop smoke-test";
 const CI_ROOT_TEST_COMMAND = "bun run test:ci";
-const CI_CODECV_ACTION = "codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac";
-const CI_CODECV_UPLOAD_CONDITION =
+const CI_CODECOV_ACTION = "codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac";
+const CI_CODECOV_UPLOAD_CONDITION =
   "${{ !cancelled() && (steps.unit_tests.outcome == 'success' || steps.unit_tests.outcome == 'failure') }}";
-const CI_CODECV_TOKEN = "${{ secrets.CODECOV_TOKEN }}";
-const CI_CODECV_COVERAGE_FILES =
+const CI_CODECOV_TOKEN = "${{ secrets.CODECOV_TOKEN }}";
+const CI_CODECOV_COVERAGE_FILES =
   "./apps/desktop/coverage/lcov.info,./apps/server/coverage/lcov.info,./apps/web/coverage/lcov.info,./packages/contracts/coverage/lcov.info,./packages/shared/coverage/lcov.info,./scripts/coverage/lcov.info";
-const CI_CODECV_TEST_RESULT_FILES =
+const CI_CODECOV_TEST_RESULT_FILES =
   "./apps/desktop/test-report.junit.xml,./apps/server/test-report.junit.xml,./apps/web/test-report.junit.xml,./packages/contracts/test-report.junit.xml,./packages/shared/test-report.junit.xml,./scripts/test-report.junit.xml";
 const CI_MERGIFY_ACTION = "Mergifyio/gha-mergify-ci@8173bc3c1d337d3367454672d50cfdf6f0273396";
 const CI_MERGIFY_UPLOAD_CONDITION =
@@ -382,12 +382,12 @@ function validateCodecovUploads(
 
   const expectedUploads = [
     {
-      files: CI_CODECV_COVERAGE_FILES,
+      files: CI_CODECOV_COVERAGE_FILES,
       name: "Upload coverage reports to Codecov",
       reportType: undefined,
     },
     {
-      files: CI_CODECV_TEST_RESULT_FILES,
+      files: CI_CODECOV_TEST_RESULT_FILES,
       name: "Upload test results to Codecov",
       reportType: "test_results",
     },
@@ -414,10 +414,10 @@ function validateCodecovUploads(
     if (unitTestStepIndex < 0 || uploadIndex <= unitTestStepIndex) {
       errors.push(`${workflowPath} ${expected.name} must run after ${CI_ROOT_TEST_COMMAND}.`);
     }
-    if (step.uses !== CI_CODECV_ACTION) {
+    if (step.uses !== CI_CODECOV_ACTION) {
       errors.push(`${workflowPath} ${expected.name} must use the pinned Codecov Action v5.5.5.`);
     }
-    if (step.if !== CI_CODECV_UPLOAD_CONDITION) {
+    if (step.if !== CI_CODECOV_UPLOAD_CONDITION) {
       errors.push(
         `${workflowPath} ${expected.name} must run for completed successful or failed unit tests.`,
       );
@@ -426,7 +426,7 @@ function validateCodecovUploads(
       errors.push(`${workflowPath} ${expected.name} must define Codecov inputs.`);
       continue;
     }
-    if (step.with.token !== CI_CODECV_TOKEN) {
+    if (step.with.token !== CI_CODECOV_TOKEN) {
       errors.push(`${workflowPath} ${expected.name} must use secrets.CODECOV_TOKEN.`);
     }
     if (step.with.files !== expected.files || !booleanActionInput(step.with.disable_search)) {
