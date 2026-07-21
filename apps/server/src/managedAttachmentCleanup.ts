@@ -1494,12 +1494,16 @@ const unlinkIfPresent = (filePath: string) =>
 
 const unlinkManagedStagingIfPresent = (filePath: string) =>
   Effect.tryPromise({
-    try: () =>
-      withManagedAttachmentStagingPathLock(filePath, async () => {
+    try: async () => {
+      const attempt = await tryWithManagedAttachmentStagingPathLock(filePath, async () => {
         await fs.unlink(filePath).catch((cause) => {
           if (!isMissingFileError(cause)) throw cause;
         });
-      }),
+      });
+      if (!attempt.acquired) {
+        throw new Error("Managed attachment staging path is busy; cleanup will retry.");
+      }
+    },
     catch: (cause) => cause,
   });
 

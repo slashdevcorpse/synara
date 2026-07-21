@@ -1629,6 +1629,187 @@ describe("managed attachment cleanup", () => {
     expect(state.retried).toEqual([]);
   });
 
+  it("retries busy staging paths without starving later cleanup jobs", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "synara-managed-cleanup-busy-"));
+    temporaryRoots.push(root);
+    const stagingDir = path.join(root, ".staging");
+    await fs.mkdir(stagingDir, { recursive: true });
+
+    const makeJob = async (index: number): Promise<ManagedAttachmentCleanupJob> => {
+      const attachmentId = `att_v2_${index.toString(16).padStart(32, "0")}`;
+      const relativePath = `objects/${index.toString(16).padStart(2, "0")}/${attachmentId}.bin`;
+      const finalPath = path.join(root, relativePath);
+      const stagingPath = path.join(stagingDir, `${attachmentId}.part`);
+      await fs.mkdir(path.dirname(finalPath), { recursive: true });
+      await Promise.all([
+        fs.writeFile(finalPath, `final-${index}`),
+        fs.writeFile(stagingPath, `partial-${index}`),
+      ]);
+      return {
+        attachmentId,
+        relativePath,
+        reason: "test-cleanup",
+        attemptCount: 0,
+        nextAttemptAt: new Date(0).toISOString(),
+        leaseOwner: null,
+        leaseExpiresAt: null,
+        lastError: null,
+        createdAt: new Date(0).toISOString(),
+        updatedAt: new Date(0).toISOString(),
+      };
+    };
+
+    const jobs = await Promise.all(Array.from({ length: 6 }, (_, index) => makeJob(index + 1)));
+    const busyJobs = jobs.slice(0, 5);
+    const removableJob = jobs[5]!;
+    const releases: Array<() => void> = [];
+    const enteredWriters: string[] = [];
+    const exitedWriters: string[] = [];
+    const writers = busyJobs.map((job) => {
+      let release!: () => void;
+      const released = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      releases.push(release);
+      return withManagedAttachmentStagingPathLock(
+        path.join(stagingDir, `${job.attachmentId}.part`),
+        async () => {
+          enteredWriters.push(job.attachmentId);
+          await released;
+          exitedWriters.push(job.attachmentId);
+        },
+      );
+    });
+
+    const completed: string[] = [];
+    const retried: Array<{ readonly attachmentId: string; readonly error: string }> = [];
+    let leaseCount = 0;
+    let markRemovableCompleted!: () => void;
+    const removableCompleted = new Promise<void>((resolve) => {
+      markRemovableCompleted = resolve;
+    });
+    const repository = {
+      markExpiredForCleanup: () => Effect.succeed([]),
+      leaseCleanup: () => Effect.sync(() => (leaseCount++ === 0 ? jobs : busyJobs)),
+      compactDeleted: () => Effect.succeed([]),
+      completeCleanup: ({
+        attachmentId,
+      }: Parameters<ManagedAttachmentRepositoryShape["completeCleanup"]>[0]) =>
+        Effect.sync(() => {
+          completed.push(attachmentId);
+          if (attachmentId === removableJob.attachmentId) markRemovableCompleted();
+          return true;
+        }),
+      retryCleanup: ({
+        attachmentId,
+        error,
+      }: Parameters<ManagedAttachmentRepositoryShape["retryCleanup"]>[0]) =>
+        Effect.sync(() => {
+          retried.push({ attachmentId, error });
+          return true;
+        }),
+    } as unknown as ManagedAttachmentRepositoryShape;
+    const runBatch = () =>
+      Effect.runPromise(
+        runManagedAttachmentCleanupBatch.pipe(
+          Effect.provide(
+            Layer.mergeAll(
+              Layer.succeed(ManagedAttachmentRepository, repository),
+              Layer.succeed(ServerConfig, { attachmentsDir: root } as ServerConfigShape),
+            ),
+          ),
+        ),
+      );
+
+    let firstBatch: Promise<number> | undefined;
+    let starvationTimer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      // All five locks are registered synchronously; their callbacks start on the next microtask.
+      firstBatch = runBatch();
+      await expect(
+        Promise.race([
+          removableCompleted,
+          new Promise<never>((_, reject) => {
+            starvationTimer = setTimeout(
+              () => reject(new Error("later cleanup job was starved")),
+              2_000,
+            );
+          }),
+        ]),
+      ).resolves.toBeUndefined();
+      clearTimeout(starvationTimer);
+      starvationTimer = undefined;
+      await expect(firstBatch).resolves.toBe(6);
+
+      expect(enteredWriters.sort()).toEqual(
+        busyJobs.map(({ attachmentId }) => attachmentId).sort(),
+      );
+      expect(exitedWriters).toEqual([]);
+      expect(completed).toEqual([removableJob.attachmentId]);
+      expect(retried.map(({ attachmentId }) => attachmentId).sort()).toEqual(
+        busyJobs.map(({ attachmentId }) => attachmentId).sort(),
+      );
+      expect(retried).toHaveLength(5);
+      expect(retried.every(({ error }) => error.includes("staging path is busy"))).toBe(true);
+      await Promise.all(
+        busyJobs.flatMap((job, index) => [
+          expect(
+            fs.readFile(path.join(stagingDir, `${job.attachmentId}.part`), "utf8"),
+          ).resolves.toBe(`partial-${index + 1}`),
+          expect(fs.readFile(path.join(root, job.relativePath), "utf8")).resolves.toBe(
+            `final-${index + 1}`,
+          ),
+        ]),
+      );
+      await expect(
+        fs.stat(path.join(stagingDir, `${removableJob.attachmentId}.part`)),
+      ).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      if (starvationTimer) clearTimeout(starvationTimer);
+      releases.forEach((release) => release());
+      await Promise.all([...writers, ...(firstBatch ? [firstBatch] : [])]);
+    }
+
+    expect(exitedWriters.sort()).toEqual(busyJobs.map(({ attachmentId }) => attachmentId).sort());
+    await expect(runBatch()).resolves.toBe(5);
+    expect(completed.sort()).toEqual(jobs.map(({ attachmentId }) => attachmentId).sort());
+    expect(retried).toHaveLength(5);
+    await Promise.all(
+      busyJobs.flatMap((job) => [
+        expect(fs.stat(path.join(stagingDir, `${job.attachmentId}.part`))).rejects.toMatchObject({
+          code: "ENOENT",
+        }),
+        expect(fs.stat(path.join(root, job.relativePath))).rejects.toMatchObject({
+          code: "ENOENT",
+        }),
+      ]),
+    );
+  });
+
+  it("completes cleanup when staging and final files are already missing", async () => {
+    const fixture = await makeFixture();
+    await Promise.all([fs.unlink(fixture.finalPath), fs.unlink(fixture.stagingPath)]);
+    const state = makeRepository(fixture.job);
+
+    await expect(
+      Effect.runPromise(
+        runManagedAttachmentCleanupBatch.pipe(
+          Effect.provide(
+            Layer.mergeAll(
+              Layer.succeed(ManagedAttachmentRepository, state.repository),
+              Layer.succeed(ServerConfig, {
+                attachmentsDir: fixture.root,
+              } as ServerConfigShape),
+            ),
+          ),
+        ),
+      ),
+    ).resolves.toBe(1);
+
+    expect(state.completed).toEqual([fixture.job.attachmentId]);
+    expect(state.retried).toEqual([]);
+  });
+
   it("keeps a durable retry when physical deletion fails", async () => {
     const fixture = await makeFixture({ finalPathIsDirectory: true });
     const state = makeRepository(fixture.job);
