@@ -7,6 +7,8 @@ import { CheckpointRef, MessageId, ThreadId, TurnId } from "@synara/contracts";
 import { renderToStaticMarkup } from "react-dom/server";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import { formatShortTimestamp } from "../../timestampFormat";
+import type { FeedbackThreadContext } from "~/feedback";
+import type { TurnReasoningSummary } from "./turnReasoning";
 import { COLLAPSED_USER_MESSAGE_MAX_CHARS } from "./userMessageCollapse";
 
 const TOOLTIP_TRIGGER_MARKER = 'data-base-ui-tooltip-trigger=""';
@@ -74,7 +76,223 @@ beforeAll(() => {
   });
 });
 
+const TURN_REASONING_FEEDBACK_CONTEXT: FeedbackThreadContext = {
+  provider: "codex",
+  model: "gpt-5.6-sol",
+  projectKind: "project",
+  environmentMode: "local",
+  runtimeMode: "full-access",
+  interactionMode: "default",
+  sessionStatus: "ready",
+  latestTurnState: "completed",
+  messageCount: 4,
+  activityCount: 12,
+  hasPendingApproval: false,
+  hasPendingUserInput: false,
+  hasThreadError: false,
+};
+
+function turnReasoningSummary(input: {
+  assistantMessageId: MessageId;
+  turnNumber: number;
+  isLatestCompleted: boolean;
+}): TurnReasoningSummary {
+  return {
+    turnNumber: input.turnNumber,
+    turnIds: [TurnId.makeUnsafe(`turn-${input.turnNumber}`)],
+    terminalAssistantMessageId: input.assistantMessageId,
+    status: "completed",
+    isLatestCompleted: input.isLatestCompleted,
+    startedAt: `2026-03-17T19:12:2${input.turnNumber}.000Z`,
+    completedAt: `2026-03-17T19:12:3${input.turnNumber}.000Z`,
+    durationMs: 4_200,
+    provider: "codex",
+    model: "gpt-5.6-sol",
+    reasoningEffort: "high",
+    assistantDeliveryMode: "streaming",
+    contextUsedTokens: 34_000,
+    contextWindowTokens: 128_000,
+    inputTokens: 31_000,
+    cachedInputTokens: 12_000,
+    outputTokens: 3_000,
+    reasoningOutputTokens: 1_200,
+    totalTokens: 34_000,
+    tokenUsageProvider: "codex",
+    toolCallCount: 3,
+    distinctToolCount: 2,
+    toolNameCounts: [
+      { name: "Read", count: 2 },
+      { name: "Search", count: 1 },
+    ],
+    distinctToolNames: ["Read", "Search"],
+    toolNameOverflowCount: 0,
+    approvalCount: 1,
+    rejectionCount: 0,
+    filesChangedCount: 2,
+    runtimeMode: "full-access",
+    interactionMode: "default",
+    envMode: "local",
+  };
+}
+
 describe("MessagesTimeline", () => {
+  it("opens the latest turn summary and leaves older summaries collapsed", async () => {
+    const { MessagesTimeline } = await import("./MessagesTimeline");
+    const firstAssistantId = MessageId.makeUnsafe("assistant-summary-first");
+    const latestAssistantId = MessageId.makeUnsafe("assistant-summary-latest");
+    const firstSummary = turnReasoningSummary({
+      assistantMessageId: firstAssistantId,
+      turnNumber: 1,
+      isLatestCompleted: false,
+    });
+    const latestSummary = turnReasoningSummary({
+      assistantMessageId: latestAssistantId,
+      turnNumber: 2,
+      isLatestCompleted: true,
+    });
+    const markup = renderToStaticMarkup(
+      <MessagesTimeline
+        hasMessages
+        isWorking={false}
+        activeTurnInProgress={false}
+        activeTurnStartedAt={null}
+        timelineEntries={[
+          {
+            id: "entry-user-summary-first",
+            kind: "message",
+            createdAt: "2026-03-17T19:12:20.000Z",
+            message: {
+              id: MessageId.makeUnsafe("user-summary-first"),
+              role: "user",
+              text: "First request",
+              createdAt: "2026-03-17T19:12:20.000Z",
+              streaming: false,
+            },
+          },
+          {
+            id: "entry-assistant-summary-first",
+            kind: "message",
+            createdAt: "2026-03-17T19:12:21.000Z",
+            message: {
+              id: firstAssistantId,
+              role: "assistant",
+              text: "First response",
+              createdAt: "2026-03-17T19:12:21.000Z",
+              completedAt: "2026-03-17T19:12:31.000Z",
+              streaming: false,
+            },
+          },
+          {
+            id: "entry-user-summary-latest",
+            kind: "message",
+            createdAt: "2026-03-17T19:12:32.000Z",
+            message: {
+              id: MessageId.makeUnsafe("user-summary-latest"),
+              role: "user",
+              text: "Second request",
+              createdAt: "2026-03-17T19:12:32.000Z",
+              streaming: false,
+            },
+          },
+          {
+            id: "entry-assistant-summary-latest",
+            kind: "message",
+            createdAt: "2026-03-17T19:12:33.000Z",
+            message: {
+              id: latestAssistantId,
+              role: "assistant",
+              text: "Second response",
+              createdAt: "2026-03-17T19:12:33.000Z",
+              completedAt: "2026-03-17T19:12:34.000Z",
+              streaming: false,
+            },
+          },
+        ]}
+        turnDiffSummaryByAssistantMessageId={new Map()}
+        turnReasoningSummaryByAssistantMessageId={
+          new Map([
+            [firstAssistantId, firstSummary],
+            [latestAssistantId, latestSummary],
+          ])
+        }
+        feedbackContext={TURN_REASONING_FEEDBACK_CONTEXT}
+        revertTurnCountByUserMessageId={new Map()}
+        onRevertUserMessage={() => {}}
+        onOpenTurnDiff={() => {}}
+        isRevertingCheckpoint={false}
+        onImageExpand={() => {}}
+        markdownCwd={undefined}
+        resolvedTheme="light"
+        timestampFormat="locale"
+        workspaceRoot={undefined}
+      />,
+    );
+
+    expect((markup.match(/data-timeline-row-kind="turn-reasoning-summary"/gu) ?? []).length).toBe(
+      2,
+    );
+    expect((markup.match(/data-expanded="false"/gu) ?? []).length).toBe(1);
+    expect((markup.match(/data-expanded="true"/gu) ?? []).length).toBe(1);
+    expect(markup.indexOf("First response")).toBeLessThan(
+      markup.indexOf('data-expanded="false"'),
+    );
+    expect(markup.indexOf("Second response")).toBeLessThan(markup.indexOf('data-expanded="true"'));
+  });
+
+  it("renders the turn summary card in the standard transcript frame", async () => {
+    const { MessagesTimeline } = await import("./MessagesTimeline");
+    const assistantMessageId = MessageId.makeUnsafe("assistant-summary-row");
+    const summary = turnReasoningSummary({
+      assistantMessageId,
+      turnNumber: 1,
+      isLatestCompleted: true,
+    });
+    const markup = renderToStaticMarkup(
+      <MessagesTimeline
+        hasMessages
+        isWorking={false}
+        activeTurnInProgress={false}
+        activeTurnStartedAt={null}
+        timelineEntries={[
+          {
+            id: "entry-assistant-summary-row",
+            kind: "message",
+            createdAt: "2026-03-17T19:12:21.000Z",
+            message: {
+              id: assistantMessageId,
+              role: "assistant",
+              text: "Summary response",
+              createdAt: "2026-03-17T19:12:21.000Z",
+              completedAt: "2026-03-17T19:12:31.000Z",
+              streaming: false,
+            },
+          },
+        ]}
+        turnDiffSummaryByAssistantMessageId={new Map()}
+        turnReasoningSummaryByAssistantMessageId={new Map([[assistantMessageId, summary]])}
+        feedbackContext={TURN_REASONING_FEEDBACK_CONTEXT}
+        revertTurnCountByUserMessageId={new Map()}
+        onRevertUserMessage={() => {}}
+        onOpenTurnDiff={() => {}}
+        isRevertingCheckpoint={false}
+        onImageExpand={() => {}}
+        markdownCwd={undefined}
+        resolvedTheme="light"
+        timestampFormat="locale"
+        workspaceRoot={undefined}
+      />,
+    );
+
+    expect(markup).toContain('data-timeline-row-kind="turn-reasoning-summary"');
+    expect(markup).toContain("mx-auto w-full min-w-0 max-w-[46rem]");
+    expect(markup).toContain("Summary response");
+    expect(markup).toContain("Turn 1");
+    expect(markup).toContain("gpt-5.6-sol");
+    expect(markup).toContain("Read ×2");
+    expect(markup).toContain("Copy summary");
+    expect(markup).toContain("Feedback");
+  });
+
   it("keeps small transcripts on the simple non-virtualized path", async () => {
     const { MessagesTimeline } = await import("./MessagesTimeline");
     const markup = renderToStaticMarkup(

@@ -88,6 +88,88 @@ describe("store projection", () => {
     ]);
   });
 
+  it("projects durable turn summaries with stable identity and evicts them with thread detail", () => {
+    const threadId = ThreadId.makeUnsafe("thread-1");
+    const turn = {
+      turnId: TurnId.makeUnsafe("turn-summary-1"),
+      state: "completed" as const,
+      requestedAt: "2026-02-27T00:00:00.000Z",
+      startedAt: "2026-02-27T00:00:01.000Z",
+      completedAt: "2026-02-27T00:00:03.000Z",
+      assistantMessageId: MessageId.makeUnsafe("assistant-summary-1"),
+      provider: "codex" as const,
+      model: "gpt-5.3-codex",
+      reasoningEffort: "high",
+      modelSelection: { provider: "codex" as const, model: "gpt-5.3-codex" },
+      runtimeMode: "full-access" as const,
+      interactionMode: "default" as const,
+      envMode: "local" as const,
+      assistantDeliveryMode: "streaming" as const,
+      tokenUsage: {
+        provider: "codex" as const,
+        inputTokens: 1_000,
+        cachedInputTokens: 100,
+        outputTokens: 200,
+        reasoningOutputTokens: 50,
+        totalTokens: 1_250,
+        contextUsedTokens: 34_000,
+        contextWindowTokens: 128_000,
+        updatedAt: "2026-02-27T00:00:03.000Z",
+      },
+      toolCallCount: 2,
+      toolNames: ["Read", "Read"],
+      toolNameCounts: [{ name: "Read", count: 2 }],
+      approvalCount: 1,
+      rejectionCount: 0,
+    };
+    const first = syncServerThreadDetail(
+      makeState(makeThread({ id: threadId })),
+      makeReadModelThread({ id: threadId, turns: [turn] }),
+    );
+    const firstTurns = getThreadFromState(first, threadId)?.turns;
+
+    expect(firstTurns).toEqual([turn]);
+    expect(first.turnSummariesByThreadId?.[threadId]).toBe(firstTurns);
+
+    const second = syncServerThreadDetail(
+      first,
+      makeReadModelThread({ id: threadId, turns: [{ ...turn }] }),
+    );
+    expect(getThreadFromState(second, threadId)?.turns).toBe(firstTurns);
+
+    const shellSnapshot = makeShellSnapshot({
+      id: threadId,
+      projectId: ProjectId.makeUnsafe("project-1"),
+      title: "Thread shell refresh",
+      modelSelection: { provider: "codex", model: "gpt-5.3-codex" },
+      runtimeMode: DEFAULT_RUNTIME_MODE,
+      interactionMode: DEFAULT_INTERACTION_MODE,
+      envMode: "local",
+      branch: null,
+      worktreePath: null,
+      forkSourceThreadId: null,
+      sidechatSourceThreadId: null,
+      latestTurn: null,
+      createdAt: "2026-02-27T00:00:00.000Z",
+      updatedAt: "2026-02-27T00:01:00.000Z",
+      handoff: null,
+      session: null,
+    });
+    const afterShellSnapshot = syncServerShellSnapshot(second, shellSnapshot);
+    expect(getThreadFromState(afterShellSnapshot, threadId)?.turns).toBe(firstTurns);
+
+    const afterShellUpsert = applyShellEvent(afterShellSnapshot, {
+      kind: "thread-upserted",
+      sequence: 3,
+      thread: { ...shellSnapshot.threads[0]!, title: "Thread shell upsert" },
+    } satisfies OrchestrationShellStreamEvent);
+    expect(getThreadFromState(afterShellUpsert, threadId)?.turns).toBe(firstTurns);
+
+    const evicted = evictThreadDetailFromClientState(afterShellUpsert, threadId);
+    expect(evicted.turnSummariesByThreadId?.[threadId]).toBeUndefined();
+    expect(getThreadFromState(evicted, threadId)?.turns).toEqual([]);
+  });
+
   it("resets createBranchFlowCompleted when the branch context changes", () => {
     const next = syncServerReadModel(
       makeState(

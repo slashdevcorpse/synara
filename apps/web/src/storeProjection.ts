@@ -46,6 +46,7 @@ import {
   EMPTY_THREAD_SESSION_BY_ID,
   EMPTY_THREAD_SHELL_BY_ID,
   EMPTY_THREAD_TURN_STATE_BY_ID,
+  EMPTY_TURN_SUMMARIES_BY_THREAD,
   EMPTY_TURN_DIFF_BY_THREAD,
   EMPTY_TURN_DIFF_IDS_BY_THREAD,
   type AppState,
@@ -416,6 +417,16 @@ function writeThreadState(state: AppState, nextThread: Thread, previousThread?: 
     };
   }
 
+  if (previousThread?.turns !== nextThread.turns) {
+    nextState = {
+      ...nextState,
+      turnSummariesByThreadId: {
+        ...(nextState.turnSummariesByThreadId ?? EMPTY_TURN_SUMMARIES_BY_THREAD),
+        [nextThread.id]: nextThread.turns ?? [],
+      },
+    };
+  }
+
   if (previousThread?.messages !== nextThread.messages) {
     const nextMessageSlice = buildMessageSlice(nextThread);
     nextState = {
@@ -486,6 +497,8 @@ function removeThreadState(state: AppState, threadId: ThreadId): AppState {
     state.threadSessionById ?? EMPTY_THREAD_SESSION_BY_ID;
   const { [threadId]: _removedTurnState, ...threadTurnStateById } =
     state.threadTurnStateById ?? EMPTY_THREAD_TURN_STATE_BY_ID;
+  const { [threadId]: _removedTurnSummaries, ...turnSummariesByThreadId } =
+    state.turnSummariesByThreadId ?? EMPTY_TURN_SUMMARIES_BY_THREAD;
   const { [threadId]: _removedMessageIds, ...messageIdsByThreadId } =
     state.messageIdsByThreadId ?? EMPTY_MESSAGE_IDS_BY_THREAD;
   const { [threadId]: _removedMessages, ...messageByThreadId } =
@@ -519,6 +532,7 @@ function removeThreadState(state: AppState, threadId: ThreadId): AppState {
     threadShellById,
     threadSessionById,
     threadTurnStateById,
+    turnSummariesByThreadId,
     messageIdsByThreadId,
     messageByThreadId,
     activityIdsByThreadId,
@@ -541,6 +555,7 @@ export function evictThreadDetailFromClientState(state: AppState, threadId: Thre
     state.proposedPlanByThreadId,
     state.turnDiffIdsByThreadId,
     state.turnDiffSummaryByThreadId,
+    state.turnSummariesByThreadId,
   ];
   const hasNormalizedDetail = detailRecords.some(
     (record) => record !== undefined && Object.hasOwn(record, threadId),
@@ -565,6 +580,8 @@ export function evictThreadDetailFromClientState(state: AppState, threadId: Thre
     state.turnDiffIdsByThreadId ?? EMPTY_TURN_DIFF_IDS_BY_THREAD;
   const { [threadId]: _removedDiffs, ...turnDiffSummaryByThreadId } =
     state.turnDiffSummaryByThreadId ?? EMPTY_TURN_DIFF_BY_THREAD;
+  const { [threadId]: _removedTurnSummaries, ...turnSummariesByThreadId } =
+    state.turnSummariesByThreadId ?? EMPTY_TURN_SUMMARIES_BY_THREAD;
 
   return {
     ...state,
@@ -576,6 +593,7 @@ export function evictThreadDetailFromClientState(state: AppState, threadId: Thre
     proposedPlanByThreadId,
     turnDiffIdsByThreadId,
     turnDiffSummaryByThreadId,
+    turnSummariesByThreadId,
   };
 }
 
@@ -774,6 +792,10 @@ export function syncServerShellSnapshot(
     threadShellById: {},
     threadSessionById: {},
     threadTurnStateById: {},
+    turnSummariesByThreadId: retainThreadScopedRecord(
+      state.turnSummariesByThreadId,
+      nextThreadIds,
+    ),
     messageIdsByThreadId: retainThreadScopedRecord(state.messageIdsByThreadId, nextThreadIds),
     messageByThreadId: retainThreadScopedRecord(state.messageByThreadId, nextThreadIds),
     activityIdsByThreadId: retainThreadScopedRecord(state.activityIdsByThreadId, nextThreadIds),
@@ -932,6 +954,10 @@ export function syncServerReadModel(state: AppState, readModel: OrchestrationRea
     threadShellById: retainThreadScopedRecord(state.threadShellById, nextThreadIds),
     threadSessionById: retainThreadScopedRecord(state.threadSessionById, nextThreadIds),
     threadTurnStateById: retainThreadScopedRecord(state.threadTurnStateById, nextThreadIds),
+    turnSummariesByThreadId: retainThreadScopedRecord(
+      state.turnSummariesByThreadId,
+      nextThreadIds,
+    ),
     messageIdsByThreadId: retainThreadScopedRecord(state.messageIdsByThreadId, nextThreadIds),
     messageByThreadId: retainThreadScopedRecord(state.messageByThreadId, nextThreadIds),
     activityIdsByThreadId: retainThreadScopedRecord(state.activityIdsByThreadId, nextThreadIds),
@@ -970,6 +996,7 @@ export function syncServerReadModel(state: AppState, readModel: OrchestrationRea
     normalizedState.threadShellById === state.threadShellById &&
     normalizedState.threadSessionById === state.threadSessionById &&
     normalizedState.threadTurnStateById === state.threadTurnStateById &&
+    normalizedState.turnSummariesByThreadId === state.turnSummariesByThreadId &&
     normalizedState.messageIdsByThreadId === state.messageIdsByThreadId &&
     normalizedState.messageByThreadId === state.messageByThreadId &&
     normalizedState.activityIdsByThreadId === state.activityIdsByThreadId &&

@@ -316,6 +316,7 @@ function createSnapshotForTargetUser(options: {
         deletedAt: null,
         handoff: null,
         messages,
+        turns: [],
         activities: [],
         proposedPlans: [],
         checkpoints: [],
@@ -2356,10 +2357,28 @@ describe("ChatView timeline estimator parity (full app)", () => {
         timeout: 4_000,
         interval: 16,
       });
+      const activeSummaryTriggerSelector = '[aria-label$="Turn 22 execution summary"]';
+      expect(document.querySelector(activeSummaryTriggerSelector)).toBeNull();
 
       scrollToCalls.length = 0;
       syncActiveThread((thread) => ({
         ...thread,
+        latestTurn: {
+          turnId: activeTurnId,
+          state: "completed",
+          requestedAt: isoAt(1_202),
+          startedAt: isoAt(1_203),
+          completedAt: isoAt(1_207),
+          assistantMessageId: liveAssistantMessage.id,
+        },
+        session: thread.session
+          ? {
+              ...thread.session,
+              status: "ready",
+              activeTurnId: null,
+              updatedAt: isoAt(1_207),
+            }
+          : null,
         messages: thread.messages.map((message) =>
           message.id === liveAssistantMessage.id
             ? {
@@ -2370,12 +2389,168 @@ describe("ChatView timeline estimator parity (full app)", () => {
               }
             : message,
         ),
+        checkpoints: [
+          ...thread.checkpoints,
+          {
+            turnId: activeTurnId,
+            checkpointTurnCount: 23,
+            checkpointRef: CheckpointRef.makeUnsafe("checkpoint-auto-follow-summary"),
+            status: "ready",
+            files: [
+              {
+                path: "apps/web/src/components/ChatView.tsx",
+                kind: "modified",
+                additions: 12,
+                deletions: 2,
+              },
+              {
+                path: "apps/web/src/components/ChatView.browser.tsx",
+                kind: "modified",
+                additions: 48,
+                deletions: 0,
+              },
+            ],
+            assistantMessageId: liveAssistantMessage.id,
+            completedAt: isoAt(1_207),
+          },
+        ],
         updatedAt: isoAt(1_207),
       }));
       await vi.waitFor(() => expect(scrollToCalls.length).toBeGreaterThan(0), {
         timeout: 4_000,
         interval: 16,
       });
+      const assistantRow = await waitForElement(
+        () =>
+          document.querySelector<HTMLElement>(
+            `[data-message-id="${liveAssistantMessage.id}"]`,
+          ),
+        "Unable to find the settled assistant row.",
+      );
+      await vi.waitFor(() => expect(assistantRow.textContent).toContain("Edited 2 files"), {
+        timeout: 4_000,
+        interval: 16,
+      });
+
+      // Completion is a real message transition and is allowed to auto-follow.
+      // Drain its list-owned retry window before isolating the durable summary update.
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 300));
+      await waitForLayout();
+      scrollToCalls.length = 0;
+
+      const durableTurn = {
+        turnId: activeTurnId,
+        state: "completed" as const,
+        requestedAt: isoAt(1_202),
+        startedAt: isoAt(1_203),
+        completedAt: isoAt(1_207),
+        assistantMessageId: liveAssistantMessage.id,
+        provider: "codex" as const,
+        model: "gpt-5.6-sol",
+        reasoningEffort: "high",
+        modelSelection: {
+          provider: "codex" as const,
+          model: "gpt-5.6-sol",
+          options: { reasoningEffort: "high" },
+        },
+        runtimeMode: "full-access" as const,
+        interactionMode: "default" as const,
+        envMode: "local" as const,
+        assistantDeliveryMode: "streaming" as const,
+        tokenUsage: {
+          provider: "codex" as const,
+          inputTokens: 24_000,
+          cachedInputTokens: 8_000,
+          outputTokens: 2_000,
+          reasoningOutputTokens: 1_000,
+          totalTokens: 26_000,
+          contextUsedTokens: 80_000,
+          contextWindowTokens: 200_000,
+          updatedAt: isoAt(1_207),
+        },
+        toolCallCount: 3,
+        toolNames: ["Read", "Read", "Search"],
+        toolNameCounts: [
+          { name: "Read", count: 2 },
+          { name: "Search", count: 1 },
+        ],
+        approvalCount: 1,
+        rejectionCount: 0,
+      };
+      syncActiveThread((thread) => ({
+        ...thread,
+        turns: [durableTurn],
+        updatedAt: isoAt(1_208),
+      }));
+
+      const summaryTrigger = await waitForElement(
+        () => document.querySelector<HTMLButtonElement>(activeSummaryTriggerSelector),
+        "Durable completed-turn data did not render a summary card.",
+      );
+      const summaryCard = summaryTrigger.closest<HTMLElement>(
+        "[data-turn-reasoning-summary-card]",
+      );
+      expect(summaryCard, "Summary trigger was not contained by its card.").not.toBeNull();
+      if (!summaryCard) throw new Error("Summary trigger was not contained by its card.");
+      await vi.waitFor(
+        () => {
+          expect(summaryCard.textContent).toContain("Turn 22 — completed");
+          expect(summaryCard.textContent).toContain("gpt-5.6-sol");
+          expect(summaryCard.textContent).toContain("200K tokens · 80K used");
+          expect(summaryCard.textContent).toContain("high · streaming");
+          expect(summaryCard.textContent).toContain("3 tools invoked · 2 distinct tools");
+          expect(summaryCard.textContent).toContain("Read ×2");
+          expect(summaryCard.textContent).toContain("1 approval · 0 rejections");
+          expect(summaryCard.textContent).toContain("success · 2 files changed");
+          expect(summaryCard.textContent).toContain("full-access · local workspace");
+        },
+        { timeout: 4_000, interval: 16 },
+      );
+      const committedAssistantRow = await waitForElement(
+        () =>
+          document.querySelector<HTMLElement>(
+            `[data-message-id="${liveAssistantMessage.id}"]`,
+          ),
+        "Settled assistant row was replaced without a committed successor.",
+      );
+      const summaryTimelineRow = summaryCard.closest<HTMLElement>(
+        '[data-timeline-row-kind="turn-reasoning-summary"]',
+      );
+      expect(summaryTimelineRow, "Summary card was not rendered in its timeline row.").not.toBeNull();
+      if (!summaryTimelineRow) throw new Error("Summary card was not rendered in its timeline row.");
+      expect(committedAssistantRow.textContent).toContain("Edited 2 files");
+      expect(summaryTimelineRow.getBoundingClientRect().top).toBeGreaterThanOrEqual(
+        committedAssistantRow.getBoundingClientRect().bottom - 1,
+      );
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 300));
+      await waitForLayout();
+      expect(scrollToCalls).toHaveLength(0);
+
+      syncActiveThread((thread) => ({
+        ...thread,
+        turns: [
+          {
+            ...durableTurn,
+            tokenUsage: {
+              ...durableTurn.tokenUsage,
+              contextUsedTokens: 81_000,
+              updatedAt: isoAt(1_209),
+            },
+            toolCallCount: 4,
+            toolNames: [...durableTurn.toolNames, "Edit"],
+            toolNameCounts: [...durableTurn.toolNameCounts, { name: "Edit", count: 1 }],
+          },
+        ],
+        updatedAt: isoAt(1_209),
+      }));
+      await vi.waitFor(() => expect(summaryCard.textContent).toContain("4 tools invoked"), {
+        timeout: 4_000,
+        interval: 16,
+      });
+      expect(summaryCard.textContent).toContain("81K used");
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 300));
+      await waitForLayout();
+      expect(scrollToCalls).toHaveLength(0);
     } finally {
       if (patchedScrollContainer && originalScrollTo) {
         patchedScrollContainer.scrollTo = originalScrollTo;

@@ -14,6 +14,7 @@ import {
 } from "./MessagesTimeline.logic";
 import type { TimelineEntry } from "../../session-logic";
 import type { TurnDiffSummary, WorktreeSetupSnapshot } from "../../types";
+import type { TurnReasoningSummary } from "./turnReasoning";
 
 function makeSummary(
   overrides: Omit<Partial<TurnDiffSummary>, "turnId"> & { turnId: string },
@@ -29,6 +30,49 @@ function makeSummary(
     assistantMessageId: null,
     ...rest,
   } as TurnDiffSummary;
+}
+
+function makeTurnReasoningSummary(
+  assistantMessageId: string,
+  overrides: Partial<TurnReasoningSummary> = {},
+): TurnReasoningSummary {
+  return {
+    turnNumber: 1,
+    turnIds: [TurnId.makeUnsafe("turn-1")],
+    terminalAssistantMessageId: MessageId.makeUnsafe(assistantMessageId),
+    status: "completed",
+    isLatestCompleted: true,
+    startedAt: "2026-07-21T10:00:00.000Z",
+    completedAt: "2026-07-21T10:00:05.000Z",
+    durationMs: 5_000,
+    provider: "codex",
+    model: "gpt-5.6-sol",
+    reasoningEffort: "high",
+    assistantDeliveryMode: "streaming",
+    contextUsedTokens: 40_000,
+    contextWindowTokens: 200_000,
+    inputTokens: 20_000,
+    cachedInputTokens: 5_000,
+    outputTokens: 2_000,
+    reasoningOutputTokens: 1_000,
+    totalTokens: 22_000,
+    tokenUsageProvider: "codex",
+    toolCallCount: 3,
+    distinctToolCount: 2,
+    toolNameCounts: [
+      { name: "Read", count: 2 },
+      { name: "Search", count: 1 },
+    ],
+    distinctToolNames: ["Read", "Search"],
+    toolNameOverflowCount: 0,
+    approvalCount: 1,
+    rejectionCount: 0,
+    filesChangedCount: 2,
+    runtimeMode: "full-access",
+    interactionMode: "default",
+    envMode: "worktree",
+    ...overrides,
+  };
 }
 
 describe("computeMessageDurationStart", () => {
@@ -388,6 +432,147 @@ describe("computeStableMessagesTimelineRows", () => {
 
     expect(second).not.toBe(first);
     expect(second.result[0]).toBe(enrichedRows[0]);
+  });
+
+  it("compares every turn reasoning summary field used by the transcript row", () => {
+    const baseSummary = makeTurnReasoningSummary("assistant-summary");
+    const makeRow = (
+      summary: TurnReasoningSummary,
+      overrides: Partial<Extract<MessagesTimelineRow, { kind: "turn-reasoning-summary" }>> = {},
+    ): Extract<MessagesTimelineRow, { kind: "turn-reasoning-summary" }> => ({
+      kind: "turn-reasoning-summary",
+      id: "turn-summary:assistant-summary",
+      createdAt: "2026-07-21T10:00:05.000Z",
+      summary,
+      isLatestCompleted: summary.isLatestCompleted,
+      ...overrides,
+    });
+    const first = computeStableMessagesTimelineRows([makeRow(baseSummary)], emptyStableRows());
+    const unchanged = computeStableMessagesTimelineRows(
+      [makeRow({ ...baseSummary, turnIds: [...baseSummary.turnIds], toolNameCounts: baseSummary.toolNameCounts.map((entry) => ({ ...entry })), distinctToolNames: [...baseSummary.distinctToolNames] })],
+      first,
+    );
+    expect(unchanged).toBe(first);
+
+    const mutations: Array<{
+      name: string;
+      mutate: (summary: TurnReasoningSummary) => TurnReasoningSummary;
+    }> = [
+      { name: "turnNumber", mutate: (summary) => ({ ...summary, turnNumber: 2 }) },
+      {
+        name: "turnIds",
+        mutate: (summary) => ({ ...summary, turnIds: [TurnId.makeUnsafe("turn-2")] }),
+      },
+      {
+        name: "terminalAssistantMessageId",
+        mutate: (summary) => ({
+          ...summary,
+          terminalAssistantMessageId: MessageId.makeUnsafe("assistant-other"),
+        }),
+      },
+      { name: "status", mutate: (summary) => ({ ...summary, status: "failed" }) },
+      {
+        name: "summary latest",
+        mutate: (summary) => ({ ...summary, isLatestCompleted: false }),
+      },
+      { name: "startedAt", mutate: (summary) => ({ ...summary, startedAt: null }) },
+      { name: "completedAt", mutate: (summary) => ({ ...summary, completedAt: null }) },
+      { name: "durationMs", mutate: (summary) => ({ ...summary, durationMs: 6_000 }) },
+      { name: "provider", mutate: (summary) => ({ ...summary, provider: "claudeAgent" }) },
+      { name: "model", mutate: (summary) => ({ ...summary, model: "opus-4.8" }) },
+      {
+        name: "reasoningEffort",
+        mutate: (summary) => ({ ...summary, reasoningEffort: "medium" }),
+      },
+      {
+        name: "assistantDeliveryMode",
+        mutate: (summary) => ({ ...summary, assistantDeliveryMode: "buffered" }),
+      },
+      {
+        name: "contextUsedTokens",
+        mutate: (summary) => ({ ...summary, contextUsedTokens: 41_000 }),
+      },
+      {
+        name: "contextWindowTokens",
+        mutate: (summary) => ({ ...summary, contextWindowTokens: 128_000 }),
+      },
+      { name: "inputTokens", mutate: (summary) => ({ ...summary, inputTokens: 20_001 }) },
+      {
+        name: "cachedInputTokens",
+        mutate: (summary) => ({ ...summary, cachedInputTokens: 5_001 }),
+      },
+      { name: "outputTokens", mutate: (summary) => ({ ...summary, outputTokens: 2_001 }) },
+      {
+        name: "reasoningOutputTokens",
+        mutate: (summary) => ({ ...summary, reasoningOutputTokens: 1_001 }),
+      },
+      { name: "totalTokens", mutate: (summary) => ({ ...summary, totalTokens: 22_001 }) },
+      {
+        name: "tokenUsageProvider",
+        mutate: (summary) => ({ ...summary, tokenUsageProvider: "claudeAgent" }),
+      },
+      { name: "toolCallCount", mutate: (summary) => ({ ...summary, toolCallCount: 4 }) },
+      {
+        name: "distinctToolCount",
+        mutate: (summary) => ({ ...summary, distinctToolCount: 3 }),
+      },
+      {
+        name: "toolNameCounts name",
+        mutate: (summary) => ({
+          ...summary,
+          toolNameCounts: [{ name: "Inspect", count: 2 }, ...summary.toolNameCounts.slice(1)],
+        }),
+      },
+      {
+        name: "toolNameCounts count",
+        mutate: (summary) => ({
+          ...summary,
+          toolNameCounts: [{ name: "Read", count: 3 }, ...summary.toolNameCounts.slice(1)],
+        }),
+      },
+      {
+        name: "distinctToolNames",
+        mutate: (summary) => ({ ...summary, distinctToolNames: ["Inspect", "Search"] }),
+      },
+      {
+        name: "toolNameOverflowCount",
+        mutate: (summary) => ({ ...summary, toolNameOverflowCount: 1 }),
+      },
+      { name: "approvalCount", mutate: (summary) => ({ ...summary, approvalCount: 2 }) },
+      { name: "rejectionCount", mutate: (summary) => ({ ...summary, rejectionCount: 1 }) },
+      {
+        name: "filesChangedCount",
+        mutate: (summary) => ({ ...summary, filesChangedCount: 3 }),
+      },
+      {
+        name: "runtimeMode",
+        mutate: (summary) => ({ ...summary, runtimeMode: "approval-required" }),
+      },
+      {
+        name: "interactionMode",
+        mutate: (summary) => ({ ...summary, interactionMode: "plan" }),
+      },
+      { name: "envMode", mutate: (summary) => ({ ...summary, envMode: "local" }) },
+    ];
+
+    for (const mutation of mutations) {
+      const changed = computeStableMessagesTimelineRows(
+        [makeRow(mutation.mutate(baseSummary))],
+        first,
+      );
+      expect(changed.result[0], mutation.name).not.toBe(first.result[0]);
+    }
+
+    const createdAtChanged = computeStableMessagesTimelineRows(
+      [makeRow(baseSummary, { createdAt: "2026-07-21T10:00:06.000Z" })],
+      first,
+    );
+    expect(createdAtChanged.result[0]).not.toBe(first.result[0]);
+    const latestChanged = computeStableMessagesTimelineRows(
+      [makeRow(baseSummary, { isLatestCompleted: false })],
+      first,
+    );
+    expect(latestChanged.result[0]).not.toBe(first.result[0]);
   });
 });
 
@@ -861,6 +1046,140 @@ describe("deriveMessagesTimelineRows", () => {
 
   const collapsedSignature = (row: MessageTimelineRow): string[] =>
     (row.collapsedTurnItems ?? []).map((item) => `${item.kind}:${String(item.id)}`);
+
+  it("inserts one latest summary immediately after the settled response tail", () => {
+    const summary = makeTurnReasoningSummary("a2", {
+      turnIds: [TurnId.makeUnsafe("t1"), TurnId.makeUnsafe("t2")],
+    });
+    const rows = deriveMessagesTimelineRows({
+      ...baseInput,
+      turnReasoningSummaryByAssistantMessageId: new Map([
+        [MessageId.makeUnsafe("a2"), summary],
+      ]),
+      timelineEntries: [
+        userEntry("u1", "2026-07-21T10:00:00.000Z"),
+        assistantEntry("a1", "2026-07-21T10:00:01.000Z", {
+          turnId: "t1",
+          text: "First provider mini-turn",
+          completedAt: "2026-07-21T10:00:02.000Z",
+        }),
+        assistantEntry("a2", "2026-07-21T10:00:04.000Z", {
+          turnId: "t2",
+          text: "Final response",
+          completedAt: "2026-07-21T10:00:05.000Z",
+        }),
+      ],
+    });
+
+    expect(
+      rows.map((row) =>
+        row.kind === "message" ? `message:${String(row.message.id)}` : `${row.kind}:${row.id}`,
+      ),
+    ).toEqual([
+      "message:u1",
+      "message:a2",
+      "turn-reasoning-summary:turn-summary:a2",
+    ]);
+    const summaryRow = rows[2];
+    expect(summaryRow).toMatchObject({
+      kind: "turn-reasoning-summary",
+      id: "turn-summary:a2",
+      createdAt: "2026-07-21T10:00:05.000Z",
+      isLatestCompleted: true,
+      summary,
+    });
+  });
+
+  it("keeps summary rows ordered after each response and preserves latest state", () => {
+    const firstSummary = makeTurnReasoningSummary("a1", {
+      turnNumber: 1,
+      isLatestCompleted: false,
+    });
+    const latestSummary = makeTurnReasoningSummary("a2", {
+      turnNumber: 2,
+      turnIds: [TurnId.makeUnsafe("t2")],
+    });
+    const rows = deriveMessagesTimelineRows({
+      ...baseInput,
+      turnReasoningSummaryByAssistantMessageId: new Map([
+        [MessageId.makeUnsafe("a1"), firstSummary],
+        [MessageId.makeUnsafe("a2"), latestSummary],
+      ]),
+      timelineEntries: [
+        userEntry("u1", "2026-07-21T10:00:00.000Z"),
+        assistantEntry("a1", "2026-07-21T10:00:01.000Z", {
+          turnId: "t1",
+          completedAt: "2026-07-21T10:00:02.000Z",
+        }),
+        userEntry("u2", "2026-07-21T10:01:00.000Z"),
+        assistantEntry("a2", "2026-07-21T10:01:01.000Z", {
+          turnId: "t2",
+          completedAt: "2026-07-21T10:01:02.000Z",
+        }),
+      ],
+    });
+
+    const ordered = rows.map((row) =>
+      row.kind === "message"
+        ? `message:${String(row.message.id)}`
+        : row.kind === "turn-reasoning-summary"
+          ? `summary:${row.id}:${String(row.isLatestCompleted)}`
+          : row.kind,
+    );
+    expect(ordered).toEqual([
+      "message:u1",
+      "message:a1",
+      "summary:turn-summary:a1:false",
+      "message:u2",
+      "message:a2",
+      "summary:turn-summary:a2:true",
+    ]);
+  });
+
+  it("suppresses the active tail summary during explicit and missing-turn-id grace", () => {
+    const summary = makeTurnReasoningSummary("a1");
+    const timelineEntries = [
+      userEntry("u1", "2026-07-21T10:00:00.000Z"),
+      assistantEntry("a1", "2026-07-21T10:00:01.000Z", {
+        turnId: "t1",
+        completedAt: "2026-07-21T10:00:02.000Z",
+      }),
+    ];
+    const summaryMap = new Map([[MessageId.makeUnsafe("a1"), summary]]);
+
+    for (const activeTurnId of [TurnId.makeUnsafe("t1"), undefined]) {
+      const rows = deriveMessagesTimelineRows({
+        ...baseInput,
+        isWorking: true,
+        activeTurnInProgress: true,
+        ...(activeTurnId ? { activeTurnId } : {}),
+        timelineEntries,
+        turnReasoningSummaryByAssistantMessageId: summaryMap,
+      });
+      expect(rows.some((row) => row.kind === "turn-reasoning-summary")).toBe(false);
+    }
+  });
+
+  it("never inserts a summary for streaming assistant output", () => {
+    const rows = deriveMessagesTimelineRows({
+      ...baseInput,
+      isWorking: true,
+      activeTurnInProgress: true,
+      activeTurnId: TurnId.makeUnsafe("t1"),
+      turnReasoningSummaryByAssistantMessageId: new Map([
+        [MessageId.makeUnsafe("a1"), makeTurnReasoningSummary("a1")],
+      ]),
+      timelineEntries: [
+        userEntry("u1", "2026-07-21T10:00:00.000Z"),
+        assistantEntry("a1", "2026-07-21T10:00:01.000Z", {
+          turnId: "t1",
+          streaming: true,
+        }),
+      ],
+    });
+
+    expect(rows.some((row) => row.kind === "turn-reasoning-summary")).toBe(false);
+  });
 
   it("folds a settled turn's narration and work into one collapsed group on the terminal message", () => {
     const rows = deriveMessagesTimelineRows({

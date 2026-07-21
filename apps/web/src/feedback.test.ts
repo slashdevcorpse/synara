@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  buildFeedbackThreadContext,
   buildFeedbackSubmission,
   FEEDBACK_CATEGORIES,
   formatFeedbackSummary,
@@ -22,6 +23,43 @@ const CONTEXT: FeedbackThreadContext = {
   hasPendingUserInput: true,
   hasThreadError: true,
 };
+
+describe("buildFeedbackThreadContext", () => {
+  it("normalizes active project and thread state for shared feedback entry points", () => {
+    expect(
+      buildFeedbackThreadContext({
+        activeProject: { kind: "project" },
+        activeThread: {
+          modelSelection: { provider: "codex", model: "gpt-5.6-sol" },
+          envMode: "worktree",
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          session: { status: "ready" },
+          latestTurn: { state: "completed" },
+          messages: [{}, {}],
+          activities: [{}],
+          hasPendingApprovals: true,
+          hasPendingUserInput: false,
+          error: null,
+        },
+      }),
+    ).toEqual({
+      provider: "codex",
+      model: "gpt-5.6-sol",
+      projectKind: "project",
+      environmentMode: "worktree",
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      sessionStatus: "ready",
+      latestTurnState: "completed",
+      messageCount: 2,
+      activityCount: 1,
+      hasPendingApproval: true,
+      hasPendingUserInput: false,
+      hasThreadError: false,
+    });
+  });
+});
 
 const DIAGNOSTICS: FeedbackDiagnostics = {
   ...CONTEXT,

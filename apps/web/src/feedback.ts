@@ -38,6 +38,50 @@ export interface FeedbackThreadContext {
   hasThreadError: boolean;
 }
 
+interface FeedbackProjectContextSource {
+  readonly kind: string;
+}
+
+interface FeedbackThreadContextSource {
+  readonly modelSelection: {
+    readonly provider: string;
+    readonly model: string;
+  };
+  readonly envMode: string;
+  readonly runtimeMode: string;
+  readonly interactionMode: string;
+  readonly session: { readonly status: string } | null;
+  readonly latestTurn: { readonly state: string } | null;
+  readonly messages: ReadonlyArray<unknown>;
+  readonly activities: ReadonlyArray<unknown>;
+  readonly hasPendingApprovals?: boolean | undefined;
+  readonly hasPendingUserInput?: boolean | undefined;
+  readonly error: unknown;
+}
+
+/** Builds the privacy-safe active-thread diagnostics shared by every feedback entry point. */
+export function buildFeedbackThreadContext(input: {
+  readonly activeProject: FeedbackProjectContextSource | null | undefined;
+  readonly activeThread: FeedbackThreadContextSource | null | undefined;
+}): FeedbackThreadContext {
+  const { activeProject, activeThread } = input;
+  return {
+    provider: activeThread?.modelSelection.provider ?? null,
+    model: activeThread?.modelSelection.model ?? null,
+    projectKind: activeProject?.kind ?? null,
+    environmentMode: activeThread?.envMode ?? null,
+    runtimeMode: activeThread?.runtimeMode ?? null,
+    interactionMode: activeThread?.interactionMode ?? null,
+    sessionStatus: activeThread?.session?.status ?? null,
+    latestTurnState: activeThread?.latestTurn?.state ?? null,
+    messageCount: activeThread?.messages.length ?? 0,
+    activityCount: activeThread?.activities.length ?? 0,
+    hasPendingApproval: activeThread?.hasPendingApprovals === true,
+    hasPendingUserInput: activeThread?.hasPendingUserInput === true,
+    hasThreadError: Boolean(activeThread?.error),
+  };
+}
+
 export type FeedbackDiagnostics = FeedbackThreadContext & {
   appVersion: string;
   submittedAt: string;

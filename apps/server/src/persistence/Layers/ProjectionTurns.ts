@@ -1,4 +1,10 @@
-import { OrchestrationCheckpointFile, ThreadId, TurnId } from "@synara/contracts";
+import {
+  ModelSelection,
+  OrchestrationCheckpointFile,
+  OrchestrationTurnTokenUsage,
+  ThreadId,
+  TurnId,
+} from "@synara/contracts";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import * as SqlSchema from "effect/unstable/sql/SqlSchema";
 import { Effect, Layer, Option, Schema, Struct } from "effect";
@@ -13,6 +19,7 @@ import {
   ProjectionPendingTurnStart,
   ProjectionTurn,
   ProjectionTurnById,
+  ProjectionTurnToolCall,
   ProjectionTurnState,
   ProjectionTurnRepository,
   type ProjectionTurnRepositoryShape,
@@ -21,12 +28,28 @@ import {
 const ProjectionTurnDbRowSchema = ProjectionTurn.mapFields(
   Struct.assign({
     checkpointFiles: Schema.fromJsonString(Schema.Array(OrchestrationCheckpointFile)),
+    modelSelection: Schema.NullOr(Schema.fromJsonString(ModelSelection)),
+    tokenUsage: Schema.NullOr(Schema.fromJsonString(OrchestrationTurnTokenUsage)),
+    toolCalls: Schema.fromJsonString(Schema.Array(ProjectionTurnToolCall)),
+    approvalRequestIds: Schema.fromJsonString(Schema.Array(Schema.String)),
+    rejectedApprovalRequestIds: Schema.fromJsonString(Schema.Array(Schema.String)),
   }),
 );
 
 const ProjectionTurnByIdDbRowSchema = ProjectionTurnById.mapFields(
   Struct.assign({
     checkpointFiles: Schema.fromJsonString(Schema.Array(OrchestrationCheckpointFile)),
+    modelSelection: Schema.NullOr(Schema.fromJsonString(ModelSelection)),
+    tokenUsage: Schema.NullOr(Schema.fromJsonString(OrchestrationTurnTokenUsage)),
+    toolCalls: Schema.fromJsonString(Schema.Array(ProjectionTurnToolCall)),
+    approvalRequestIds: Schema.fromJsonString(Schema.Array(Schema.String)),
+    rejectedApprovalRequestIds: Schema.fromJsonString(Schema.Array(Schema.String)),
+  }),
+);
+
+const ProjectionPendingTurnStartDbRowSchema = ProjectionPendingTurnStart.mapFields(
+  Struct.assign({
+    modelSelection: Schema.NullOr(Schema.fromJsonString(ModelSelection)),
   }),
 );
 
@@ -57,7 +80,19 @@ const makeProjectionTurnRepository = Effect.gen(function* () {
           checkpoint_turn_count,
           checkpoint_ref,
           checkpoint_status,
-          checkpoint_files_json
+          checkpoint_files_json,
+          provider,
+          model,
+          reasoning_effort,
+          model_selection_json,
+          runtime_mode,
+          interaction_mode,
+          env_mode,
+          assistant_delivery_mode,
+          token_usage_json,
+          tool_calls_json,
+          approval_request_ids_json,
+          rejected_approval_request_ids_json
         )
         VALUES (
           ${row.threadId},
@@ -73,7 +108,19 @@ const makeProjectionTurnRepository = Effect.gen(function* () {
           ${row.checkpointTurnCount},
           ${row.checkpointRef},
           ${row.checkpointStatus},
-          ${row.checkpointFiles}
+          ${row.checkpointFiles},
+          ${row.provider},
+          ${row.model},
+          ${row.reasoningEffort},
+          ${row.modelSelection},
+          ${row.runtimeMode},
+          ${row.interactionMode},
+          ${row.envMode},
+          ${row.assistantDeliveryMode},
+          ${row.tokenUsage},
+          ${row.toolCalls},
+          ${row.approvalRequestIds},
+          ${row.rejectedApprovalRequestIds}
         )
         ON CONFLICT (thread_id, turn_id)
         DO UPDATE SET
@@ -88,7 +135,19 @@ const makeProjectionTurnRepository = Effect.gen(function* () {
           checkpoint_turn_count = excluded.checkpoint_turn_count,
           checkpoint_ref = excluded.checkpoint_ref,
           checkpoint_status = excluded.checkpoint_status,
-          checkpoint_files_json = excluded.checkpoint_files_json
+          checkpoint_files_json = excluded.checkpoint_files_json,
+          provider = excluded.provider,
+          model = excluded.model,
+          reasoning_effort = excluded.reasoning_effort,
+          model_selection_json = excluded.model_selection_json,
+          runtime_mode = excluded.runtime_mode,
+          interaction_mode = excluded.interaction_mode,
+          env_mode = excluded.env_mode,
+          assistant_delivery_mode = excluded.assistant_delivery_mode,
+          token_usage_json = excluded.token_usage_json,
+          tool_calls_json = excluded.tool_calls_json,
+          approval_request_ids_json = excluded.approval_request_ids_json,
+          rejected_approval_request_ids_json = excluded.rejected_approval_request_ids_json
       `,
   });
 
@@ -105,7 +164,7 @@ const makeProjectionTurnRepository = Effect.gen(function* () {
   });
 
   const insertPendingProjectionTurn = SqlSchema.void({
-    Request: ProjectionPendingTurnStart,
+    Request: ProjectionPendingTurnStartDbRowSchema,
     execute: (row) =>
       sql`
         INSERT INTO projection_turns (
@@ -122,7 +181,16 @@ const makeProjectionTurnRepository = Effect.gen(function* () {
           checkpoint_turn_count,
           checkpoint_ref,
           checkpoint_status,
-          checkpoint_files_json
+          checkpoint_files_json,
+          provider,
+          model,
+          reasoning_effort,
+          model_selection_json,
+          runtime_mode,
+          interaction_mode,
+          env_mode,
+          assistant_delivery_mode,
+          token_usage_json
         )
         VALUES (
           ${row.threadId},
@@ -138,14 +206,23 @@ const makeProjectionTurnRepository = Effect.gen(function* () {
           NULL,
           NULL,
           NULL,
-          '[]'
+          '[]',
+          ${row.provider},
+          ${row.model},
+          NULL,
+          ${row.modelSelection},
+          ${row.runtimeMode},
+          ${row.interactionMode},
+          ${row.envMode},
+          ${row.assistantDeliveryMode},
+          NULL
         )
       `,
   });
 
   const getPendingProjectionTurn = SqlSchema.findOneOption({
     Request: GetProjectionPendingTurnStartInput,
-    Result: ProjectionPendingTurnStart,
+    Result: ProjectionPendingTurnStartDbRowSchema,
     execute: ({ threadId }) =>
       sql`
         SELECT
@@ -153,7 +230,14 @@ const makeProjectionTurnRepository = Effect.gen(function* () {
           pending_message_id AS "messageId",
           source_proposed_plan_thread_id AS "sourceProposedPlanThreadId",
           source_proposed_plan_id AS "sourceProposedPlanId",
-          requested_at AS "requestedAt"
+          requested_at AS "requestedAt",
+          provider,
+          model,
+          model_selection_json AS "modelSelection",
+          runtime_mode AS "runtimeMode",
+          interaction_mode AS "interactionMode",
+          env_mode AS "envMode",
+          assistant_delivery_mode AS "assistantDeliveryMode"
         FROM projection_turns
         WHERE thread_id = ${threadId}
           AND turn_id IS NULL
@@ -184,7 +268,19 @@ const makeProjectionTurnRepository = Effect.gen(function* () {
           checkpoint_turn_count AS "checkpointTurnCount",
           checkpoint_ref AS "checkpointRef",
           checkpoint_status AS "checkpointStatus",
-          checkpoint_files_json AS "checkpointFiles"
+          checkpoint_files_json AS "checkpointFiles",
+          provider,
+          model,
+          reasoning_effort AS "reasoningEffort",
+          model_selection_json AS "modelSelection",
+          runtime_mode AS "runtimeMode",
+          interaction_mode AS "interactionMode",
+          env_mode AS "envMode",
+          assistant_delivery_mode AS "assistantDeliveryMode",
+          token_usage_json AS "tokenUsage",
+          tool_calls_json AS "toolCalls",
+          approval_request_ids_json AS "approvalRequestIds",
+          rejected_approval_request_ids_json AS "rejectedApprovalRequestIds"
         FROM projection_turns
         WHERE thread_id = ${threadId}
         ORDER BY
@@ -217,7 +313,19 @@ const makeProjectionTurnRepository = Effect.gen(function* () {
           checkpoint_turn_count AS "checkpointTurnCount",
           checkpoint_ref AS "checkpointRef",
           checkpoint_status AS "checkpointStatus",
-          checkpoint_files_json AS "checkpointFiles"
+          checkpoint_files_json AS "checkpointFiles",
+          provider,
+          model,
+          reasoning_effort AS "reasoningEffort",
+          model_selection_json AS "modelSelection",
+          runtime_mode AS "runtimeMode",
+          interaction_mode AS "interactionMode",
+          env_mode AS "envMode",
+          assistant_delivery_mode AS "assistantDeliveryMode",
+          token_usage_json AS "tokenUsage",
+          tool_calls_json AS "toolCalls",
+          approval_request_ids_json AS "approvalRequestIds",
+          rejected_approval_request_ids_json AS "rejectedApprovalRequestIds"
         FROM projection_turns
         WHERE thread_id = ${threadId}
           AND turn_id = ${turnId}
@@ -244,7 +352,19 @@ const makeProjectionTurnRepository = Effect.gen(function* () {
           checkpoint_turn_count AS "checkpointTurnCount",
           checkpoint_ref AS "checkpointRef",
           checkpoint_status AS "checkpointStatus",
-          checkpoint_files_json AS "checkpointFiles"
+          checkpoint_files_json AS "checkpointFiles",
+          provider,
+          model,
+          reasoning_effort AS "reasoningEffort",
+          model_selection_json AS "modelSelection",
+          runtime_mode AS "runtimeMode",
+          interaction_mode AS "interactionMode",
+          env_mode AS "envMode",
+          assistant_delivery_mode AS "assistantDeliveryMode",
+          token_usage_json AS "tokenUsage",
+          tool_calls_json AS "toolCalls",
+          approval_request_ids_json AS "approvalRequestIds",
+          rejected_approval_request_ids_json AS "rejectedApprovalRequestIds"
         FROM projection_turns
         WHERE thread_id IN ${sql.in([...new Set(input.map((entry) => entry.threadId))])}
           AND turn_id IN ${sql.in([...new Set(input.map((entry) => entry.turnId))])}

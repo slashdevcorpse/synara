@@ -202,6 +202,7 @@ import {
   extendReplacementRangeForTrailingSpace,
 } from "../composerTriggerInsertion";
 import { createProjectSelector, createThreadSelector } from "../storeSelectors";
+import { buildFeedbackThreadContext } from "../feedback";
 import { retainThreadDetailSubscription } from "../threadDetailSubscriptionRetention";
 import {
   canOfferForkSlashCommand,
@@ -435,6 +436,7 @@ import {
 import { ChatTranscriptPane } from "./chat/ChatTranscriptPane";
 import type { MessagesTimelineController } from "./chat/MessagesTimeline";
 import { buildTurnDiffSummaryByAssistantMessageId } from "./chat/MessagesTimeline.logic";
+import { buildTurnReasoningSummaryByAssistantMessageId } from "./chat/turnReasoning";
 import { deriveAgentActivityTimelineState } from "./chat/agentActivity.logic";
 import { AgentActivityPulse } from "./chat/AgentActivityPulse";
 import { useAgentActivityState } from "./chat/useAgentActivityState";
@@ -3144,6 +3146,21 @@ export default function ChatView({
       messages: messagesForDiffAnchoring,
     });
   }, [inferredCheckpointTurnCountByTurnId, turnDiffSummaries, timelineMessages]);
+  const turnReasoningSummaryByAssistantMessageId = useMemo(
+    () =>
+      buildTurnReasoningSummaryByAssistantMessageId({
+        messages: timelineMessages,
+        timelineEntries,
+        activities: threadActivities,
+        turnDiffSummaries,
+        turns: activeThread?.turns ?? [],
+      }),
+    [activeThread?.turns, threadActivities, timelineEntries, timelineMessages, turnDiffSummaries],
+  );
+  const turnReasoningFeedbackContext = useMemo(
+    () => buildFeedbackThreadContext({ activeProject, activeThread }),
+    [activeProject, activeThread],
+  );
   const revertTurnCountByUserMessageId = useMemo(() => {
     const byUserMessageId = new Map<MessageId, number>();
     for (let index = 0; index < timelineEntries.length; index += 1) {
@@ -10806,6 +10823,10 @@ export default function ChatView({
                     crossTaskOrigin={crossTaskOrigin}
                     timelineEntries={timelineEntries}
                     turnDiffSummaryByAssistantMessageId={turnDiffSummaryByAssistantMessageId}
+                    turnReasoningSummaryByAssistantMessageId={
+                      turnReasoningSummaryByAssistantMessageId
+                    }
+                    feedbackContext={turnReasoningFeedbackContext}
                     onOpenTurnDiff={onOpenTurnDiff}
                     onOpenThread={onNavigateToThread}
                     onOpenAutomation={onOpenAutomation}

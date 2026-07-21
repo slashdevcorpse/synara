@@ -569,6 +569,62 @@ export const OrchestrationLatestTurn = Schema.Struct({
 });
 export type OrchestrationLatestTurn = typeof OrchestrationLatestTurn.Type;
 
+export const OrchestrationTurnSummaryState = Schema.Literals([
+  "running",
+  "interrupted",
+  "completed",
+  "error",
+]);
+export type OrchestrationTurnSummaryState = typeof OrchestrationTurnSummaryState.Type;
+
+/**
+ * Provider-attributed token data for one concrete turn. Exact generation fields
+ * remain nullable because several providers only report context occupancy.
+ */
+export const OrchestrationTurnTokenUsage = Schema.Struct({
+  provider: ProviderKind,
+  inputTokens: Schema.NullOr(NonNegativeInt),
+  cachedInputTokens: Schema.NullOr(NonNegativeInt),
+  outputTokens: Schema.NullOr(NonNegativeInt),
+  reasoningOutputTokens: Schema.NullOr(NonNegativeInt),
+  totalTokens: Schema.NullOr(NonNegativeInt),
+  contextUsedTokens: Schema.NullOr(NonNegativeInt),
+  contextWindowTokens: Schema.NullOr(PositiveInt),
+  updatedAt: IsoDateTime,
+});
+export type OrchestrationTurnTokenUsage = typeof OrchestrationTurnTokenUsage.Type;
+
+export const OrchestrationTurnToolNameCount = Schema.Struct({
+  name: TrimmedNonEmptyString,
+  count: PositiveInt,
+});
+export type OrchestrationTurnToolNameCount = typeof OrchestrationTurnToolNameCount.Type;
+
+/** Durable historical state for one provider turn. */
+export const OrchestrationTurnSummary = Schema.Struct({
+  turnId: TurnId,
+  state: OrchestrationTurnSummaryState,
+  requestedAt: IsoDateTime,
+  startedAt: Schema.NullOr(IsoDateTime),
+  completedAt: Schema.NullOr(IsoDateTime),
+  assistantMessageId: Schema.NullOr(MessageId),
+  provider: Schema.NullOr(ProviderKind),
+  model: Schema.NullOr(TrimmedNonEmptyString),
+  reasoningEffort: Schema.NullOr(TrimmedNonEmptyString),
+  modelSelection: Schema.NullOr(ModelSelection),
+  runtimeMode: Schema.NullOr(RuntimeMode),
+  interactionMode: Schema.NullOr(ProviderInteractionMode),
+  envMode: Schema.NullOr(ThreadEnvironmentMode),
+  assistantDeliveryMode: Schema.NullOr(AssistantDeliveryMode),
+  tokenUsage: Schema.NullOr(OrchestrationTurnTokenUsage),
+  toolCallCount: NonNegativeInt,
+  toolNames: Schema.Array(TrimmedNonEmptyString),
+  toolNameCounts: Schema.Array(OrchestrationTurnToolNameCount),
+  approvalCount: NonNegativeInt,
+  rejectionCount: NonNegativeInt,
+});
+export type OrchestrationTurnSummary = typeof OrchestrationTurnSummary.Type;
+
 export const OrchestrationThreadPullRequest = Schema.Struct({
   number: PositiveInt,
   title: TrimmedNonEmptyString,
@@ -731,6 +787,9 @@ export const OrchestrationThread = Schema.Struct({
     Schema.withDecodingDefault(() => null),
   ),
   latestTurn: Schema.NullOr(OrchestrationLatestTurn),
+  turns: Schema.optional(Schema.Array(OrchestrationTurnSummary)).pipe(
+    Schema.withDecodingDefault(() => []),
+  ),
   latestUserMessageAt: Schema.optional(Schema.NullOr(IsoDateTime)),
   hasPendingApprovals: Schema.optional(Schema.Boolean),
   hasPendingUserInput: Schema.optional(Schema.Boolean),
@@ -1776,6 +1835,9 @@ export const ThreadTurnStartRequestedPayload = Schema.Struct({
   runtimeMode: RuntimeMode.pipe(Schema.withDecodingDefault(() => DEFAULT_RUNTIME_MODE)),
   interactionMode: ProviderInteractionMode.pipe(
     Schema.withDecodingDefault(() => DEFAULT_PROVIDER_INTERACTION_MODE),
+  ),
+  envMode: Schema.optional(Schema.NullOr(ThreadEnvironmentMode)).pipe(
+    Schema.withDecodingDefault(() => null),
   ),
   sourceProposedPlan: Schema.optional(SourceProposedPlanReference),
   createdAt: IsoDateTime,

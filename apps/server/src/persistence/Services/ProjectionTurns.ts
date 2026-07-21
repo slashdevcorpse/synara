@@ -7,13 +7,20 @@
  * @module ProjectionTurnRepository
  */
 import {
+  AssistantDeliveryMode,
   CheckpointRef,
   IsoDateTime,
   MessageId,
+  ModelSelection,
   NonNegativeInt,
   OrchestrationProposedPlanId,
   OrchestrationCheckpointFile,
   OrchestrationCheckpointStatus,
+  OrchestrationTurnTokenUsage,
+  ProviderInteractionMode,
+  ProviderKind,
+  RuntimeMode,
+  ThreadEnvironmentMode,
   ThreadId,
   TurnId,
 } from "@synara/contracts";
@@ -31,6 +38,13 @@ export const ProjectionTurnState = Schema.Literals([
 ]);
 export type ProjectionTurnState = typeof ProjectionTurnState.Type;
 
+export const ProjectionTurnToolCall = Schema.Struct({
+  id: Schema.String,
+  name: Schema.NullOr(Schema.String),
+  completed: Schema.optional(Schema.Boolean).pipe(Schema.withDecodingDefault(() => false)),
+});
+export type ProjectionTurnToolCall = typeof ProjectionTurnToolCall.Type;
+
 export const ProjectionTurn = Schema.Struct({
   threadId: ThreadId,
   turnId: Schema.NullOr(TurnId),
@@ -46,6 +60,18 @@ export const ProjectionTurn = Schema.Struct({
   checkpointRef: Schema.NullOr(CheckpointRef),
   checkpointStatus: Schema.NullOr(OrchestrationCheckpointStatus),
   checkpointFiles: Schema.Array(OrchestrationCheckpointFile),
+  provider: Schema.NullOr(ProviderKind),
+  model: Schema.NullOr(Schema.String),
+  reasoningEffort: Schema.NullOr(Schema.String),
+  modelSelection: Schema.NullOr(ModelSelection),
+  runtimeMode: Schema.NullOr(RuntimeMode),
+  interactionMode: Schema.NullOr(ProviderInteractionMode),
+  envMode: Schema.NullOr(ThreadEnvironmentMode),
+  assistantDeliveryMode: Schema.NullOr(AssistantDeliveryMode),
+  tokenUsage: Schema.NullOr(OrchestrationTurnTokenUsage),
+  toolCalls: Schema.Array(ProjectionTurnToolCall),
+  approvalRequestIds: Schema.Array(Schema.String),
+  rejectedApprovalRequestIds: Schema.Array(Schema.String),
 });
 export type ProjectionTurn = typeof ProjectionTurn.Type;
 
@@ -64,6 +90,18 @@ export const ProjectionTurnById = Schema.Struct({
   checkpointRef: Schema.NullOr(CheckpointRef),
   checkpointStatus: Schema.NullOr(OrchestrationCheckpointStatus),
   checkpointFiles: Schema.Array(OrchestrationCheckpointFile),
+  provider: Schema.NullOr(ProviderKind),
+  model: Schema.NullOr(Schema.String),
+  reasoningEffort: Schema.NullOr(Schema.String),
+  modelSelection: Schema.NullOr(ModelSelection),
+  runtimeMode: Schema.NullOr(RuntimeMode),
+  interactionMode: Schema.NullOr(ProviderInteractionMode),
+  envMode: Schema.NullOr(ThreadEnvironmentMode),
+  assistantDeliveryMode: Schema.NullOr(AssistantDeliveryMode),
+  tokenUsage: Schema.NullOr(OrchestrationTurnTokenUsage),
+  toolCalls: Schema.Array(ProjectionTurnToolCall),
+  approvalRequestIds: Schema.Array(Schema.String),
+  rejectedApprovalRequestIds: Schema.Array(Schema.String),
 });
 export type ProjectionTurnById = typeof ProjectionTurnById.Type;
 
@@ -73,6 +111,13 @@ export const ProjectionPendingTurnStart = Schema.Struct({
   sourceProposedPlanThreadId: Schema.NullOr(ThreadId),
   sourceProposedPlanId: Schema.NullOr(OrchestrationProposedPlanId),
   requestedAt: IsoDateTime,
+  provider: Schema.NullOr(ProviderKind),
+  model: Schema.NullOr(Schema.String),
+  modelSelection: Schema.NullOr(ModelSelection),
+  runtimeMode: Schema.NullOr(RuntimeMode),
+  interactionMode: Schema.NullOr(ProviderInteractionMode),
+  envMode: Schema.NullOr(ThreadEnvironmentMode),
+  assistantDeliveryMode: Schema.NullOr(AssistantDeliveryMode),
 });
 export type ProjectionPendingTurnStart = typeof ProjectionPendingTurnStart.Type;
 
