@@ -2,7 +2,11 @@ import { ProjectId, ThreadId } from "@synara/contracts";
 import { describe, expect, it } from "vitest";
 
 import { DEFAULT_INTERACTION_MODE, DEFAULT_RUNTIME_MODE, type Thread } from "./types";
-import { formatWorktreePathForDisplay, getOrphanedWorktreePathForThread } from "./worktreeCleanup";
+import {
+  formatWorktreePathForDisplay,
+  getOrphanedWorktreePathForThread,
+  worktreePathBasename,
+} from "./worktreeCleanup";
 
 function makeThread(overrides: Partial<Thread> = {}): Thread {
   return {
@@ -109,5 +113,28 @@ describe("formatWorktreePathForDisplay", () => {
   it("ignores trailing slashes", () => {
     const result = formatWorktreePathForDisplay("/tmp/custom-worktrees/my-worktree/");
     expect(result).toBe("my-worktree");
+  });
+
+  it("preserves its existing blank and root-path fallbacks", () => {
+    expect(formatWorktreePathForDisplay("  ")).toBe("  ");
+    expect(formatWorktreePathForDisplay("/")).toBe("/");
+    expect(formatWorktreePathForDisplay("\\")).toBe("\\");
+    expect(formatWorktreePathForDisplay("C:\\")).toBe("C:");
+  });
+});
+
+describe("worktreePathBasename", () => {
+  it.each<[string | null | undefined, string | null]>([
+    ["/tmp/worktrees/feature-a", "feature-a"],
+    ["C:\\src\\worktrees\\feature-b", "feature-b"],
+    ["C:\\src/worktrees\\feature-c/", "feature-c"],
+    [null, null],
+    [undefined, null],
+    ["  ", null],
+    ["/", null],
+    ["\\", null],
+    ["C:\\", null],
+  ])("resolves %s to %s", (path, expected) => {
+    expect(worktreePathBasename(path)).toBe(expected);
   });
 });

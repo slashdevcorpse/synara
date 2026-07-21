@@ -1,24 +1,28 @@
 // FILE: useWorkspaceAgentActivity.ts
 // Purpose: Bridge stable shell state and the global orchestration stream into workspace agent rows.
 // Layer: React data hook
-// Exports: useWorkspaceAgentActivity, public activity types, live-status predicate, and test seams
+// Exports: workspace-wide and per-thread activity hooks, public activity types,
+// live-status predicate, and test seams
 
 import type {
   NativeApi,
   OrchestrationEvent,
   OrchestrationShellStreamItem,
   ProjectId,
+  ThreadId,
 } from "@synara/contracts";
 import { useMemo, useSyncExternalStore } from "react";
 
 import { readNativeApi } from "../nativeApi";
 import { type AppState, useStore } from "../store";
-import type { SidebarThreadSummary } from "../types";
+import type { Project, SidebarThreadSummary } from "../types";
 import { addWsTransportStateListener, type WsTransportState } from "../wsTransportEvents";
 import {
   createInitialWorkspaceAgentEventState,
   createWorkspaceAgentEventStateAtSequence,
+  deriveWorkspaceAgentThreadActivity,
   deriveWorkspaceAgentActivity,
+  isLiveAgentStatus,
   reduceWorkspaceAgentEventState,
   WORKSPACE_AGENT_EVENT_BUFFER_LIMIT,
   type AgentProjectGroup,
@@ -32,7 +36,10 @@ import {
   type WorkspaceAgentShellSession,
   type WorkspaceAgentShellThread,
   type WorkspaceAgentSummary,
+  type WorkspaceAgentThreadActivity,
 } from "../lib/workspaceAgentActivity";
+
+export { isLiveAgentStatus };
 
 export type {
   AgentProjectGroup,
@@ -42,16 +49,13 @@ export type {
   AgentToolActivity,
   WorkspaceAgentActivity,
   WorkspaceAgentSummary,
+  WorkspaceAgentThreadActivity,
 };
 
 const ASSISTANT_PUBLICATION_INTERVAL_MS = 500;
 const CLOCK_INTERVAL_MS = 500;
 const RECOVERY_RETRY_MIN_MS = 250;
 const RECOVERY_RETRY_MAX_MS = 5_000;
-
-export function isLiveAgentStatus(status: AgentStatus): boolean {
-  return status === "thinking" || status === "streaming" || status === "tool-running";
-}
 
 export interface WorkspaceAgentEventPublisher {
   subscribe(listener: () => void): () => void;
@@ -418,6 +422,33 @@ function shellSession(summary: SidebarThreadSummary): WorkspaceAgentShellSession
   };
 }
 
+function shellProject(project: Project): WorkspaceAgentShellProject {
+  return {
+    projectId: project.id,
+    projectTitle: project.localName ?? project.name,
+    projectCwd: project.cwd,
+  };
+}
+
+function shellThread(summary: SidebarThreadSummary): WorkspaceAgentShellThread {
+  return {
+    threadId: summary.id,
+    projectId: summary.projectId,
+    threadTitle: summary.title,
+    parentThreadId: summary.parentThreadId ?? null,
+    subagentAgentId: summary.subagentAgentId ?? null,
+    subagentNickname: summary.subagentNickname ?? null,
+    subagentRole: summary.subagentRole ?? null,
+    modelSelection: summary.modelSelection,
+    session: shellSession(summary),
+    latestTurn: summary.latestTurn,
+    hasLiveTailWork: summary.hasLiveTailWork,
+    associatedWorktreeBranch: summary.associatedWorktreeBranch ?? null,
+    createdAt: summary.createdAt,
+    archivedAt: summary.archivedAt ?? null,
+  };
+}
+
 function equalJson(left: unknown, right: unknown): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
 }
@@ -501,33 +532,59 @@ export function createWorkspaceAgentShellSelector(): (
     previousThreadIds = state.threadIds;
     previousSummaryById = state.sidebarThreadSummaryById;
     const next: WorkspaceAgentShellSnapshot = {
-      projects: state.projects.map((project) => ({
-        projectId: project.id,
-        projectTitle: project.localName ?? project.name,
-        projectCwd: project.cwd,
-      })),
+      projects: state.projects.map(shellProject),
       threads: (state.threadIds ?? []).flatMap((threadId) => {
         const summary = state.sidebarThreadSummaryById[threadId];
         if (!summary) return [];
-        return [
-          {
-            threadId: summary.id,
-            projectId: summary.projectId,
-            threadTitle: summary.title,
-            parentThreadId: summary.parentThreadId ?? null,
-            subagentAgentId: summary.subagentAgentId ?? null,
-            subagentNickname: summary.subagentNickname ?? null,
-            subagentRole: summary.subagentRole ?? null,
-            modelSelection: summary.modelSelection,
-            session: shellSession(summary),
-            latestTurn: summary.latestTurn,
-            hasLiveTailWork: summary.hasLiveTailWork,
-            associatedWorktreeBranch: summary.associatedWorktreeBranch ?? null,
-            createdAt: summary.createdAt,
-            archivedAt: summary.archivedAt ?? null,
-          },
-        ];
+        return [shellThread(summary)];
       }),
+    };
+    if (equalShellSnapshot(previous, next)) return previous;
+    previous = next;
+    return next;
+  };
+}
+
+export function createWorkspaceAgentThreadShellSelector(
+  threadId: ThreadId,
+): (state: AppState) => WorkspaceAgentShellSnapshot {
+  let previous: WorkspaceAgentShellSnapshot = { projects: [], threads: [] };
+  let previousProjects: AppState["projects"] | undefined;
+  let previousThreadIds: AppState["threadIds"];
+  let previousSummaryById: AppState["sidebarThreadSummaryById"] | undefined;
+  return (state) => {
+    if (
+      state.projects === previousProjects &&
+      state.threadIds === previousThreadIds &&
+      state.sidebarThreadSummaryById === previousSummaryById
+    ) {
+      return previous;
+    }
+    previousProjects = state.projects;
+    previousThreadIds = state.threadIds;
+    previousSummaryById = state.sidebarThreadSummaryById;
+
+    const target = state.sidebarThreadSummaryById[threadId];
+    if (!target) {
+      if (previous.projects.length === 0 && previous.threads.length === 0) return previous;
+      previous = { projects: [], threads: [] };
+      return previous;
+    }
+
+    const relatedThreadIds = new Set<ThreadId>([target.id]);
+    if (target.parentThreadId) relatedThreadIds.add(target.parentThreadId);
+    for (const candidateId of state.threadIds ?? []) {
+      const candidate = state.sidebarThreadSummaryById[candidateId];
+      if (candidate?.parentThreadId === target.id) relatedThreadIds.add(candidate.id);
+    }
+    const summaries = [...relatedThreadIds].flatMap((relatedThreadId) => {
+      const summary = state.sidebarThreadSummaryById[relatedThreadId];
+      return summary ? [summary] : [];
+    });
+    const projectIds = new Set(summaries.map((summary) => summary.projectId));
+    const next: WorkspaceAgentShellSnapshot = {
+      projects: state.projects.filter((project) => projectIds.has(project.id)).map(shellProject),
+      threads: summaries.map(shellThread),
     };
     if (equalShellSnapshot(previous, next)) return previous;
     previous = next;
@@ -650,4 +707,46 @@ export function useWorkspaceAgentActivity(
       ...(selectedProjectIds ? { projectIds: selectedProjectIds } : {}),
     });
   }, [eventState, hasCurrentWork, initialActivity, nowMs, selectedProjectIds, shell]);
+}
+
+export function useWorkspaceAgentThreadActivity(threadId: ThreadId): WorkspaceAgentThreadActivity {
+  const selectThreadShell = useMemo(
+    () => createWorkspaceAgentThreadShellSelector(threadId),
+    [threadId],
+  );
+  const shell = useStore(selectThreadShell);
+  const eventState = useSyncExternalStore(
+    subscribePublisher,
+    publisher.getSnapshot,
+    getServerEventSnapshot,
+  );
+  const initialActivity = useMemo(
+    () =>
+      deriveWorkspaceAgentThreadActivity({
+        threadId,
+        ...shell,
+        eventState,
+        nowMs: getClockSnapshot(),
+      }),
+    [eventState, shell, threadId],
+  );
+  const hasTimedActivity =
+    initialActivity.entry?.status === "thinking" ||
+    initialActivity.entry?.status === "streaming" ||
+    initialActivity.entry?.status === "tool-running";
+  const nowMs = useSyncExternalStore(
+    hasTimedActivity ? subscribeClock : subscribeDisabledClock,
+    hasTimedActivity ? getClockSnapshot : getDisabledClockSnapshot,
+    getDisabledClockSnapshot,
+  );
+
+  return useMemo(() => {
+    if (!hasTimedActivity) return initialActivity;
+    return deriveWorkspaceAgentThreadActivity({
+      threadId,
+      ...shell,
+      eventState,
+      nowMs,
+    });
+  }, [eventState, hasTimedActivity, initialActivity, nowMs, shell, threadId]);
 }

@@ -1,67 +1,172 @@
 // FILE: ThreadHoverCardContent.tsx
-// Purpose: Rich hover-card body shown when hovering a sidebar thread/chat row —
-//          the title with a relative time on the header line, then project,
-//          source folder, git branch, and worktree identity rows when available.
+// Purpose: Pure rich-content view for a sidebar thread hover card: thread/model
+//          identity, live agent state, permissions, workspace/PR context, and actions.
 // Layer: Sidebar UI component
-// Exports: ThreadHoverCardContent
-// Why: Shared by both the pinned and the nested thread-row tooltips so the two
-//      surfaces cannot drift apart.
+// Exports: ThreadHoverCardContent, its props, and its public presentation unions.
+// Why: Pinned and nested thread rows share one presentation while their connected
+//      wrappers retain ownership of store reads, navigation, and interruption.
 
-import type { ReactNode } from "react";
+import { PROVIDER_DISPLAY_NAMES, type ProviderKind } from "@synara/contracts";
+import type { MouseEvent, ReactNode } from "react";
 
-import { GitBranchIcon, WorktreeIcon } from "~/lib/icons";
-import { FolderClosed } from "./FolderClosed";
-import { ProjectSidebarIcon } from "./ProjectSidebarIcon";
+import { formatClockDuration } from "~/session-logic";
+import { agentStatusToSubagentStatusKind } from "~/lib/agentStatusPresentation";
+import { ArrowRightIcon, StopIcon, WorktreeIcon } from "~/lib/icons";
+import {
+  subagentStatusDotClassName,
+  subagentStatusTextToneClassName,
+} from "~/lib/subagentPresentation";
+import { cn } from "~/lib/utils";
+import { isLiveAgentStatus, type AgentStatus } from "~/lib/workspaceAgentActivity";
+import {
+  PR_STATE_PRESENTATION_ICONS,
+  resolvePrStatePresentation,
+} from "./pullRequest/pullRequestStatePresentation";
+import { ProviderIcon } from "./ProviderIcon";
 import {
   SIDEBAR_HOVER_CARD_CONTAINER_PADDING_CLASS_NAME,
   SIDEBAR_HOVER_CARD_ROW_CLASS_NAME,
 } from "./sidebarHoverCardStyles";
 
+export type ThreadHoverCardPermissionMode = "full-access" | "approval-required" | "plan";
+
+export type ThreadHoverCardPrState = "open" | "draft" | "conflicting" | "merged" | "closed";
+
 export type ThreadHoverCardContentProps = {
-  title: string;
-  /** Pre-formatted relative time (e.g. "2h"); omitted when unavailable. */
+  threadTitle: string;
   timeLabel: string | null;
-  projectName: string | null;
-  /** Project cwd, used to render the matching folder/favicon glyph. */
-  projectCwd: string | null;
-  /** Underlying project folder/repo name, shown for worktree-backed chats. */
-  sourceProjectName: string | null;
-  branch: string | null;
-  /** Last path segment of the associated worktree path. */
-  worktreeName: string | null;
+  provider: ProviderKind;
+  modelLabel: string;
+  parentThreadTitle: string | null;
+  status: AgentStatus;
+  duration: number | null;
+  toolLabel: string | null;
+  permissionMode: ThreadHoverCardPermissionMode;
+  subagentCount: number;
+  subagentRunningCount: number;
+  worktreeLabel: string | null;
+  prTitle: string | null;
+  prState: ThreadHoverCardPrState | null;
+  onOpenThread: () => void;
+  onInterrupt: (() => void) | null;
 };
 
-const META_ROW_CLASS_NAME = `${SIDEBAR_HOVER_CARD_ROW_CLASS_NAME} text-foreground/80`;
-const META_ICON_CLASS_NAME = "size-3.5 shrink-0 text-muted-foreground/75";
+const ROW_CLASS_NAME = SIDEBAR_HOVER_CARD_ROW_CLASS_NAME;
+const META_ROW_CLASS_NAME = cn(ROW_CLASS_NAME, "text-foreground/80");
+const META_ICON_CLASS_NAME = "size-3.5 shrink-0 text-muted-foreground";
+const DIVIDER_CLASS_NAME = "-mx-0.5 my-0.5 h-px bg-[color:var(--color-border)]";
 
-function MetaRow({ icon, children }: { icon: ReactNode; children: string }) {
+const PR_INPUT_BY_STATE = {
+  open: { state: "open" },
+  draft: { state: "open", isDraft: true },
+  conflicting: { state: "open", mergeability: "conflicting" },
+  merged: { state: "merged" },
+  closed: { state: "closed" },
+} as const;
+
+function formatStatusCopy(
+  status: AgentStatus,
+  duration: number | null,
+  toolLabel: string | null,
+): string {
+  const durationLabel = duration === null ? null : formatClockDuration(duration);
+  switch (status) {
+    case "thinking":
+      return durationLabel ? `thinking · ${durationLabel}` : "thinking";
+    case "streaming":
+      return durationLabel ? `streaming · ${durationLabel}` : "streaming";
+    case "tool-running": {
+      const toolCopy = toolLabel ? `tool: ${toolLabel}` : "tool-running";
+      return durationLabel ? `${toolCopy} · ${durationLabel}` : toolCopy;
+    }
+    case "completed":
+      return durationLabel ? `completed · ${durationLabel} total` : "completed";
+    case "failed":
+      return "failed";
+    case "stopped":
+      return "stopped";
+    case "queued":
+      return "queued";
+    case "connecting":
+      return "connecting";
+    case "idle":
+      return "idle";
+  }
+}
+
+function formatSubagentCount(count: number, runningCount: number): string | null {
+  const safeCount = Math.max(0, Math.floor(count));
+  if (safeCount === 0) return null;
+
+  const safeRunningCount = Math.min(safeCount, Math.max(0, Math.floor(runningCount)));
+  const noun = safeCount === 1 ? "subagent" : "subagents";
+  return safeRunningCount > 0
+    ? `${safeRunningCount} of ${safeCount} ${noun} running`
+    : `${safeCount} ${noun}`;
+}
+
+function invokeAction(event: MouseEvent<HTMLButtonElement>, callback: () => void) {
+  event.preventDefault();
+  event.stopPropagation();
+  callback();
+}
+
+function Divider() {
+  return <div className={DIVIDER_CLASS_NAME} aria-hidden />;
+}
+
+function TruncatedRow({
+  icon,
+  children,
+  title,
+}: {
+  icon: ReactNode;
+  children: ReactNode;
+  title: string;
+}) {
   return (
-    <span className={META_ROW_CLASS_NAME}>
+    <div className={META_ROW_CLASS_NAME}>
       {icon}
-      <span className="min-w-0 truncate">{children}</span>
-    </span>
+      <span className="min-w-0 truncate" title={title}>
+        {children}
+      </span>
+    </div>
   );
 }
 
 export function ThreadHoverCardContent({
-  title,
+  threadTitle,
   timeLabel,
-  projectName,
-  projectCwd,
-  sourceProjectName,
-  branch,
-  worktreeName,
+  provider,
+  modelLabel,
+  parentThreadTitle,
+  status,
+  duration,
+  toolLabel,
+  permissionMode,
+  subagentCount,
+  subagentRunningCount,
+  worktreeLabel,
+  prTitle,
+  prState,
+  onOpenThread,
+  onInterrupt,
 }: ThreadHoverCardContentProps) {
-  const hasMeta =
-    Boolean(projectName) || Boolean(sourceProjectName) || Boolean(branch) || Boolean(worktreeName);
+  const providerName = PROVIDER_DISPLAY_NAMES[provider];
+  const statusKind = agentStatusToSubagentStatusKind(status);
+  const statusCopy = formatStatusCopy(status, duration, toolLabel);
+  const subagentCopy = formatSubagentCount(subagentCount, subagentRunningCount);
+  const hasContext = worktreeLabel !== null || (prTitle !== null && prState !== null);
+  const prPresentation = prState ? resolvePrStatePresentation(PR_INPUT_BY_STATE[prState]) : null;
+  const PrIcon = prPresentation ? PR_STATE_PRESENTATION_ICONS[prPresentation.iconKind] : null;
 
   return (
     <div
-      className={`flex w-full flex-col gap-0 ${SIDEBAR_HOVER_CARD_CONTAINER_PADDING_CLASS_NAME}`}
+      className={cn("flex w-full flex-col gap-0", SIDEBAR_HOVER_CARD_CONTAINER_PADDING_CLASS_NAME)}
     >
-      <div className={SIDEBAR_HOVER_CARD_ROW_CLASS_NAME}>
-        <span className="min-w-0 flex-1 whitespace-normal font-medium leading-tight text-foreground">
-          {title}
+      <div className={ROW_CLASS_NAME}>
+        <span className="min-w-0 flex-1 truncate font-medium text-foreground" title={threadTitle}>
+          {threadTitle}
         </span>
         {timeLabel ? (
           <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground/55">
@@ -69,43 +174,94 @@ export function ThreadHoverCardContent({
           </span>
         ) : null}
       </div>
-      {hasMeta ? (
-        <div className="flex flex-col gap-0">
-          {projectName ? (
-            <MetaRow
-              icon={
-                projectCwd ? (
-                  <span className="relative inline-flex size-3.5 shrink-0 items-center justify-center text-muted-foreground/75">
-                    <ProjectSidebarIcon
-                      cwd={projectCwd}
-                      expanded={false}
-                      glyphClassName="size-3.5"
-                    />
-                  </span>
-                ) : (
-                  <FolderClosed className={META_ICON_CLASS_NAME} aria-hidden />
-                )
-              }
-            >
-              {projectName}
-            </MetaRow>
-          ) : null}
-          {sourceProjectName ? (
-            <MetaRow icon={<FolderClosed className={META_ICON_CLASS_NAME} aria-hidden />}>
-              {sourceProjectName}
-            </MetaRow>
-          ) : null}
-          {branch ? (
-            <MetaRow icon={<GitBranchIcon className={META_ICON_CLASS_NAME} aria-hidden />}>
-              {branch}
-            </MetaRow>
-          ) : null}
-          {worktreeName ? (
-            <MetaRow icon={<WorktreeIcon className={META_ICON_CLASS_NAME} aria-hidden />}>
-              {worktreeName}
-            </MetaRow>
-          ) : null}
+
+      <div className={META_ROW_CLASS_NAME}>
+        <ProviderIcon provider={provider} className="size-4 shrink-0" />
+        <span className="sr-only">{providerName}: </span>
+        <span className="min-w-0 truncate" title={modelLabel}>
+          {modelLabel}
+        </span>
+      </div>
+
+      {parentThreadTitle ? (
+        <div className={cn(ROW_CLASS_NAME, "pl-5.5 text-muted-foreground/60")}>
+          <span className="min-w-0 truncate" title={parentThreadTitle}>
+            subagent of {parentThreadTitle}
+          </span>
         </div>
+      ) : null}
+
+      <div className={META_ROW_CLASS_NAME}>
+        <span
+          aria-hidden
+          className={cn(
+            "size-1.5 shrink-0 rounded-full",
+            subagentStatusDotClassName(statusKind),
+            isLiveAgentStatus(status) && "animate-pulse motion-reduce:animate-none",
+          )}
+        />
+        <span
+          className={cn("min-w-0 truncate", subagentStatusTextToneClassName(statusKind))}
+          title={statusCopy}
+        >
+          {statusCopy}
+        </span>
+      </div>
+
+      <div className={META_ROW_CLASS_NAME}>
+        <span className="min-w-0 truncate">
+          {permissionMode}
+          {subagentCopy ? ` · ${subagentCopy}` : ""}
+        </span>
+      </div>
+
+      {hasContext ? <Divider /> : null}
+
+      {worktreeLabel ? (
+        <TruncatedRow
+          icon={<WorktreeIcon className={META_ICON_CLASS_NAME} aria-hidden />}
+          title={`workspace: ${worktreeLabel}`}
+        >
+          workspace: {worktreeLabel}
+        </TruncatedRow>
+      ) : null}
+
+      {prTitle && prState && prPresentation && PrIcon ? (
+        <div className={META_ROW_CLASS_NAME}>
+          <PrIcon aria-hidden className={cn("size-3.5 shrink-0", prPresentation.colorClass)} />
+          <span className="sr-only">{prPresentation.label}: </span>
+          <span className="min-w-0 truncate" title={prTitle}>
+            {prTitle}
+          </span>
+        </div>
+      ) : null}
+
+      <Divider />
+
+      <button
+        type="button"
+        onClick={(event) => invokeAction(event, onOpenThread)}
+        className={cn(
+          ROW_CLASS_NAME,
+          "cursor-pointer text-left text-foreground/80 transition-colors hover:bg-[var(--color-background-button-secondary-hover)] hover:text-foreground",
+        )}
+      >
+        <span className="min-w-0 truncate">Open thread</span>
+        <ArrowRightIcon className="ml-auto size-3.5 shrink-0 text-muted-foreground" aria-hidden />
+      </button>
+
+      {onInterrupt ? (
+        <button
+          type="button"
+          onClick={(event) => invokeAction(event, onInterrupt)}
+          className={cn(
+            ROW_CLASS_NAME,
+            "cursor-pointer text-left text-destructive transition-colors hover:bg-destructive/8",
+          )}
+        >
+          <StopIcon className="size-3.5 shrink-0" aria-hidden />
+          <span className="min-w-0 truncate">Interrupt</span>
+        </button>
       ) : null}
     </div>
   );

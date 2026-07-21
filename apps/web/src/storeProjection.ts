@@ -217,6 +217,7 @@ function sidebarThreadSummariesEqual(
     left.projectId === right.projectId &&
     left.title === right.title &&
     left.modelSelection === right.modelSelection &&
+    left.runtimeMode === right.runtimeMode &&
     left.interactionMode === right.interactionMode &&
     left.envMode === right.envMode &&
     left.branch === right.branch &&
@@ -257,6 +258,7 @@ function buildSidebarThreadSummary(
     projectId: thread.projectId,
     title: thread.title,
     modelSelection: thread.modelSelection,
+    runtimeMode: thread.runtimeMode,
     interactionMode: thread.interactionMode,
     envMode: thread.envMode,
     branch: thread.branch,

@@ -16,6 +16,7 @@ import {
 } from "./WorkspaceAgentPanel.testFixtures";
 const INTERRUPT_ACTION_CASES = [
   ["idle", false],
+  ["connecting", true],
   ["thinking", true],
   ["streaming", true],
   ["tool-running", true],
