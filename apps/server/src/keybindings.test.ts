@@ -103,6 +103,30 @@ it.layer(NodeServices.layer)("keybindings", (it) => {
     }),
   );
 
+  it.effect("registers the best-effort workspace dashboard default", () =>
+    Effect.sync(() => {
+      const workspaceDashboard = DEFAULT_KEYBINDINGS.find(
+        (rule) => rule.command === "workspace.openDashboard",
+      );
+
+      assert.deepEqual(workspaceDashboard, {
+        key: "mod+shift+w",
+        command: "workspace.openDashboard",
+      });
+      assert.deepEqual(workspaceDashboard && compileResolvedKeybindingRule(workspaceDashboard), {
+        command: "workspace.openDashboard",
+        shortcut: {
+          key: "w",
+          metaKey: false,
+          ctrlKey: false,
+          shiftKey: true,
+          altKey: false,
+          modKey: true,
+        },
+      });
+    }),
+  );
+
   it.effect("encodes resolved plus-key shortcuts", () =>
     Effect.gen(function* () {
       const encoded = yield* Schema.encodeEffect(ResolvedKeybindingFromConfig)({

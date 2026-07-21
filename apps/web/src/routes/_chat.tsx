@@ -333,6 +333,14 @@ function ChatRouteGlobalShortcuts() {
 
       if (!command) return;
 
+      if (command === "workspace.openDashboard") {
+        event.preventDefault();
+        event.stopPropagation();
+        if (event.repeat) return;
+        void navigate({ to: "/workspace" });
+        return;
+      }
+
       if (command === "view.recent.next" || command === "view.recent.previous") {
         event.preventDefault();
         event.stopPropagation();
@@ -441,6 +449,7 @@ function ChatRouteGlobalShortcuts() {
     handleNewThread,
     keybindings,
     latestUsableProjectId,
+    navigate,
     openOrAdvanceRecentSwitcher,
     platform,
     providerStatuses,

@@ -3,7 +3,10 @@ import { Layer } from "effect";
 import { OrchestrationCommandReceiptRepositoryLive } from "../persistence/Layers/OrchestrationCommandReceipts";
 import { OrchestrationEventStoreLive } from "../persistence/Layers/OrchestrationEventStore";
 import { ManagedAttachmentRepositoryLive } from "../persistence/Layers/ManagedAttachments";
-import { OrchestrationEngineLive } from "./Layers/OrchestrationEngine";
+import {
+  OrchestrationEngineLive,
+  OrchestrationEngineWithDevServerLifecycleLive,
+} from "./Layers/OrchestrationEngine";
 import { OrchestrationProjectionPipelineLive } from "./Layers/ProjectionPipeline";
 import { OrchestrationProjectionSnapshotQueryLive } from "./Layers/ProjectionSnapshotQuery";
 
@@ -27,4 +30,12 @@ export const OrchestrationInfrastructureLayerLive = Layer.mergeAll(
 export const OrchestrationLayerLive = Layer.mergeAll(
   OrchestrationInfrastructureLayerLive,
   OrchestrationEngineLive.pipe(Layer.provide(OrchestrationInfrastructureLayerLive)),
+);
+
+/** Server runtime composition that enforces archive/dev-server lifecycle exclusion. */
+export const OrchestrationLayerWithDevServerLifecycleLive = Layer.mergeAll(
+  OrchestrationInfrastructureLayerLive,
+  OrchestrationEngineWithDevServerLifecycleLive.pipe(
+    Layer.provide(OrchestrationInfrastructureLayerLive),
+  ),
 );

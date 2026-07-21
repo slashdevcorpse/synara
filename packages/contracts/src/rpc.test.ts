@@ -10,6 +10,7 @@ import {
   WsRpcGroup,
 } from "./rpc";
 import { ORCHESTRATION_WS_METHODS } from "./orchestration";
+import { WS_METHODS } from "./ws";
 
 describe("WS RPC contracts", () => {
   it("exports the additive Effect RPC group", () => {
@@ -20,6 +21,13 @@ describe("WS RPC contracts", () => {
       WsFeatureRpcGroup.requests.has(ORCHESTRATION_WS_METHODS.listProviderDeliveryBlockers),
     ).toBe(true);
     expect(WsFeatureRpcGroup.requests.has(ORCHESTRATION_WS_METHODS.reconcileProviderDelivery)).toBe(
+      true,
+    );
+    expect(WsFeatureRpcGroup.requests.has(WS_METHODS.workspaceListGitStates)).toBe(true);
+    expect(WsFeatureRpcGroup.requests.has(WS_METHODS.workspaceListArchivedProjects)).toBe(true);
+    expect(WsFeatureRpcGroup.requests.has(WS_METHODS.workspaceCloneRepository)).toBe(true);
+    expect(WsFeatureRpcGroup.requests.has(WS_METHODS.workspaceGetCloneStatus)).toBe(true);
+    expect(WsFeatureRpcGroup.requests.has(WS_METHODS.workspaceRetryCloneProjectCreation)).toBe(
       true,
     );
   });

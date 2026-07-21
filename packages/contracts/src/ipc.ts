@@ -107,6 +107,17 @@ import type {
   ProjectWriteFileResult,
 } from "./project";
 import type { FilesystemBrowseInput, FilesystemBrowseResult } from "./filesystem";
+import type {
+  WorkspaceCloneProgressEvent,
+  WorkspaceCloneRepositoryInput,
+  WorkspaceCloneRepositoryResult,
+  WorkspaceGetCloneStatusInput,
+  WorkspaceGetCloneStatusResult,
+  WorkspaceListArchivedProjectsResult,
+  WorkspaceListGitStatesInput,
+  WorkspaceListGitStatesResult,
+  WorkspaceRetryCloneProjectCreationInput,
+} from "./workspace";
 import type { StudioListThreadOutputsInput, StudioListThreadOutputsResult } from "./studio";
 import type {
   ServerConfig,
@@ -559,6 +570,18 @@ export interface NativeApi {
     openInEditor: (cwd: string, editor: EditorId) => Promise<void>;
     openExternal: (url: string) => Promise<void>;
     showInFolder: (path: string) => Promise<void>;
+  };
+  workspace: {
+    listArchivedProjects: () => Promise<WorkspaceListArchivedProjectsResult>;
+    listGitStates: (input: WorkspaceListGitStatesInput) => Promise<WorkspaceListGitStatesResult>;
+    cloneRepository: (
+      input: WorkspaceCloneRepositoryInput,
+    ) => Promise<WorkspaceCloneRepositoryResult>;
+    getCloneStatus: (input: WorkspaceGetCloneStatusInput) => Promise<WorkspaceGetCloneStatusResult>;
+    retryCloneProjectCreation: (
+      input: WorkspaceRetryCloneProjectCreationInput,
+    ) => Promise<WorkspaceCloneRepositoryResult>;
+    onCloneProgress: (callback: (event: WorkspaceCloneProgressEvent) => void) => () => void;
   };
   git: {
     // Existing branch/worktree API

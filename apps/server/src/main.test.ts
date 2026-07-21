@@ -744,6 +744,7 @@ it.layer(testLayer)("server CLI command", (it) => {
           getCounts,
           getSnapshotSequence: () => Effect.succeed({ snapshotSequence: 0 }),
           getShellSnapshot: () => Effect.die("unused"),
+          listArchivedProjects: () => Effect.die("unused"),
           getActiveProjectByWorkspaceRoot: () => Effect.die("unused"),
           getProjectShellById: () => Effect.die("unused"),
           getFirstActiveThreadIdByProjectId: () => Effect.die("unused"),

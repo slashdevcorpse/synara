@@ -35,7 +35,11 @@ export interface ExecuteGitInput {
   readonly operation: string;
   readonly cwd: string;
   readonly args: ReadonlyArray<string>;
+  /** Environment keys to remove from the inherited process environment before applying `env`. */
+  readonly unsetEnv?: ReadonlyArray<string>;
   readonly env?: NodeJS.ProcessEnv;
+  /** Configure the child process standard input. Defaults to the existing piped behavior. */
+  readonly stdin?: "pipe" | "ignore";
   readonly allowNonZeroExit?: boolean;
   readonly timeoutMs?: number;
   readonly maxOutputBytes?: number;
@@ -52,7 +56,25 @@ export interface GitStatusDetails extends Omit<GitStatusResult, "pr"> {
   isRepo: boolean;
   hasOriginRemote: boolean;
   isDefaultBranch: boolean;
+  hasCommits: boolean;
+  isDetached: boolean;
   upstreamRef: string | null;
+  upstreamRefreshStatus: "not-configured" | "skipped" | "succeeded" | "failed";
+}
+
+export interface GitStatusDetailsOptions {
+  /**
+   * Refresh the configured upstream before reading ahead/behind metadata. Defaults to true.
+   * Callers which only need prompt local status can opt out without contacting the remote.
+   */
+  readonly refreshUpstream?: boolean;
+  /** Bypass the short upstream-fetch cache before reading ahead/behind metadata. */
+  readonly forceUpstreamRefresh?: boolean;
+  /**
+   * `summary` returns exact dirty file paths with zero line totals and skips
+   * detailed numstat and untracked-file content reads. Defaults to `detailed`.
+   */
+  readonly workingTreeMode?: "detailed" | "summary";
 }
 
 export interface GitPreparedCommitContext {
@@ -187,7 +209,10 @@ export interface GitCoreShape {
   /**
    * Read detailed working tree / branch status for a repository.
    */
-  readonly statusDetails: (cwd: string) => Effect.Effect<GitStatusDetails, GitCommandError>;
+  readonly statusDetails: (
+    cwd: string,
+    options?: GitStatusDetailsOptions,
+  ) => Effect.Effect<GitStatusDetails, GitCommandError>;
 
   /**
    * Read a unified patch for the current working tree, including untracked files.

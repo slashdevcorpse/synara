@@ -159,12 +159,20 @@ describe("desktopProjectRecovery", () => {
     expect(hasLiveThreadsWithMissingProjects(snapshot)).toBe(true);
   });
 
-  it("returns true when a live thread references a deleted project row", () => {
+  it("ignores preserved threads whose known parent project is deleted", () => {
     const snapshot = makeSnapshot({
       projects: [makeProject({ deletedAt: "2026-04-20T09:00:00.000Z" })],
     });
 
-    expect(hasLiveThreadsWithMissingProjects(snapshot)).toBe(true);
+    expect(hasLiveThreadsWithMissingProjects(snapshot)).toBe(false);
+  });
+
+  it("ignores preserved threads whose known parent project is archived", () => {
+    const snapshot = makeSnapshot({
+      projects: [makeProject({ archivedAt: "2026-04-20T09:00:00.000Z" })],
+    });
+
+    expect(hasLiveThreadsWithMissingProjects(snapshot)).toBe(false);
   });
 
   it("ignores deleted threads when deciding whether repair is needed", () => {

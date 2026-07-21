@@ -19,6 +19,7 @@ const project: OrchestrationProject = {
   isPinned: false,
   createdAt: now,
   updatedAt: now,
+  archivedAt: null,
   deletedAt: null,
 };
 

@@ -70,6 +70,9 @@ export const DEFAULT_KEYBINDINGS: ReadonlyArray<KeybindingRule> = [
   { key: "mod+k", command: "sidebar.search" },
   { key: "mod+shift+o", command: "sidebar.addProject", when: "!terminalFocus" },
   { key: "mod+i", command: "sidebar.importThread", when: "!terminalFocus" },
+  // Best effort in a normal browser tab: browsers may reserve the close-window chord.
+  // Whenever Synara receives it, this remains global across chat and terminal focus.
+  { key: "mod+shift+w", command: "workspace.openDashboard" },
   { key: "mod+j", command: "terminal.toggle" },
   { key: "mod+d", command: "terminal.split", when: "terminalFocus" },
   { key: "mod+shift+arrowright", command: "terminal.splitRight", when: "terminalFocus" },

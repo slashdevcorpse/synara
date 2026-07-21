@@ -19,6 +19,7 @@ import {
 } from "@synara/contracts";
 import { Duration, Effect, Layer, Option, Stream } from "effect";
 import { TestClock } from "effect/testing";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import {
   GitCore,
@@ -55,6 +56,7 @@ const project: OrchestrationProjectShell = {
   isPinned: false,
   createdAt: now,
   updatedAt: now,
+  archivedAt: null,
 };
 
 const dispatchedCommands: OrchestrationCommand[] = [];
@@ -92,8 +94,13 @@ let failDispatchType: OrchestrationCommand["type"] | null = null;
 let dispatchHook:
   | ((command: OrchestrationCommand) => Effect.Effect<void, OrchestrationCommandInternalError>)
   | null = null;
+const knownProjectIds = new Set<ProjectId>([projectId]);
+const hiddenProjectIds = new Set<ProjectId>();
 
 function resetHarness() {
+  knownProjectIds.clear();
+  knownProjectIds.add(projectId);
+  hiddenProjectIds.clear();
   dispatchedCommands.length = 0;
   createdWorktrees.length = 0;
   removedWorktrees.length = 0;
@@ -420,7 +427,19 @@ const projectionSnapshotQuery = {
       updatedAt: now,
     }),
   getActiveProjectByWorkspaceRoot: () => Effect.succeed(Option.some(project as never)),
-  getProjectShellById: () => Effect.succeed(Option.some(project)),
+  getProjectShellById: (candidateProjectId: ProjectId) =>
+    Effect.succeed(
+      !knownProjectIds.has(candidateProjectId) || hiddenProjectIds.has(candidateProjectId)
+        ? Option.none()
+        : Option.some({
+            ...project,
+            id: candidateProjectId,
+            workspaceRoot:
+              candidateProjectId === project.id
+                ? project.workspaceRoot
+                : `/tmp/${candidateProjectId}`,
+          }),
+    ),
   getFirstActiveThreadIdByProjectId: () => Effect.succeed(Option.none()),
   getThreadCheckpointContext: () => Effect.succeed(Option.none()),
   getFullThreadDiffContext: () => Effect.succeed(Option.none()),
@@ -499,11 +518,31 @@ const gitCore = {
     }),
 } as unknown as GitCoreShape;
 
+const automationServiceTestDatabaseLayer = Layer.effectDiscard(
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* sql`
+      INSERT INTO projection_projects (
+        project_id, kind, title, workspace_root,
+        default_model_selection_json, scripts_json, is_pinned,
+        created_at, updated_at, archived_at, deleted_at
+      ) VALUES (
+        ${project.id}, ${project.kind}, ${project.title}, ${project.workspaceRoot},
+        NULL, '[]', 0, ${project.createdAt}, ${project.updatedAt}, NULL, NULL
+      )
+      ON CONFLICT(project_id) DO UPDATE SET
+        archived_at = NULL,
+        deleted_at = NULL,
+        updated_at = excluded.updated_at
+    `;
+  }),
+).pipe(Layer.provideMerge(SqlitePersistenceMemory));
+
 const layer = it.layer(
   AutomationServiceLive.pipe(
     Layer.provideMerge(AutomationRepositoryLive),
     Layer.provideMerge(ProjectionTurnRepositoryLive),
-    Layer.provideMerge(SqlitePersistenceMemory),
+    Layer.provideMerge(automationServiceTestDatabaseLayer),
     Layer.provideMerge(Layer.succeed(OrchestrationEngineService, orchestrationEngine)),
     Layer.provideMerge(Layer.succeed(ProjectionSnapshotQuery, projectionSnapshotQuery)),
     Layer.provideMerge(Layer.succeed(TextGeneration, textGeneration)),
@@ -574,6 +613,28 @@ layer("AutomationService", (it) => {
       assert.strictEqual(result.run.messageId, turnStart.message.messageId);
       assert.strictEqual(result.run.threadCreateCommandId, threadCreate.commandId);
       assert.strictEqual(result.run.turnStartCommandId, turnStart.commandId);
+    }),
+  );
+
+  it.effect("rejects a manual run before persisting work when its project is not active", () =>
+    Effect.gen(function* () {
+      resetHarness();
+      const service = yield* AutomationService;
+      const inactiveProjectId = ProjectId.makeUnsafe("automation-project-inactive-manual");
+      knownProjectIds.add(inactiveProjectId);
+      const created = yield* service.create({
+        ...createInput("local"),
+        projectId: inactiveProjectId,
+      });
+      hiddenProjectIds.add(inactiveProjectId);
+
+      const error = yield* service.runNow({ automationId: created.id }).pipe(Effect.flip);
+      const listed = yield* service.list({ projectId: inactiveProjectId });
+
+      assert.match(error.message, /Automation project was not found/);
+      assert.strictEqual(listed.definitions.length, 1);
+      assert.strictEqual(listed.runs.length, 0);
+      assert.strictEqual(dispatchedCommands.length, 0);
     }),
   );
 

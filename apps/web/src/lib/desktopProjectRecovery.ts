@@ -7,14 +7,10 @@ import type { OrchestrationReadModel, OrchestrationShellSnapshot } from "@synara
 type ProjectRecoverySnapshot = OrchestrationReadModel | OrchestrationShellSnapshot;
 
 export function hasLiveThreadsWithMissingProjects(snapshot: ProjectRecoverySnapshot): boolean {
-  const liveProjectIds = new Set(
-    snapshot.projects
-      .filter((project) => !("deletedAt" in project) || project.deletedAt === null)
-      .map((project) => project.id),
-  );
+  const knownProjectIds = new Set(snapshot.projects.map((project) => project.id));
 
   return snapshot.threads.some((thread) => {
     const isLiveThread = !("deletedAt" in thread) || thread.deletedAt === null;
-    return isLiveThread && !liveProjectIds.has(thread.projectId);
+    return isLiveThread && !knownProjectIds.has(thread.projectId);
   });
 }

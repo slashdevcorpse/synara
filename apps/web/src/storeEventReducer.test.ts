@@ -209,6 +209,7 @@ describe("store event reducer", () => {
       remoteName: "Live Project",
       folderName: "live-project",
       cwd: "/tmp/live-project",
+      serverSequence: 1,
       createdAt: "2026-02-27T00:00:00.000Z",
       updatedAt: "2026-02-27T00:00:00.000Z",
     });
@@ -263,6 +264,7 @@ describe("store event reducer", () => {
       localName: "Local Name",
       cwd: "/tmp/renamed-project",
       defaultModelSelection: null,
+      serverSequence: 1,
       updatedAt: "2026-02-27T00:05:00.000Z",
       scripts: [
         {

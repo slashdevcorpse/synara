@@ -48,7 +48,7 @@ export function PullRequestChecksRing({
   checks,
   className,
 }: {
-  checks: ReadonlyArray<PullRequestCheck>;
+  checks: ReadonlyArray<Pick<PullRequestCheck, "status">>;
   className?: string;
 }) {
   const counts = new Map<RingBucket, number>();

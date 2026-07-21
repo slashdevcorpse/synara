@@ -177,6 +177,17 @@ import {
 } from "./stats";
 import { WS_METHODS } from "./ws";
 import {
+  WorkspaceCloneProgressEvent,
+  WorkspaceCloneRepositoryInput,
+  WorkspaceGetCloneStatusInput,
+  WorkspaceGetCloneStatusResult,
+  WorkspaceListArchivedProjectsInput,
+  WorkspaceListArchivedProjectsResult,
+  WorkspaceListGitStatesInput,
+  WorkspaceListGitStatesResult,
+  WorkspaceRetryCloneProjectCreationInput,
+} from "./workspace";
+import {
   WS_BOOTSTRAP_METHOD,
   WsBootstrapNegotiateInput,
   WsBootstrapNegotiateResult,
@@ -190,6 +201,44 @@ export class WsRpcError extends Schema.TaggedErrorClass<WsRpcError>()("WsRpcErro
   retryable: Schema.optional(Schema.Boolean),
   retryAfterMs: Schema.optional(Schema.Number),
 }) {}
+
+export const WsWorkspaceListArchivedProjectsRpc = Rpc.make(
+  WS_METHODS.workspaceListArchivedProjects,
+  {
+    payload: WorkspaceListArchivedProjectsInput,
+    success: WorkspaceListArchivedProjectsResult,
+    error: WsRpcError,
+  },
+);
+
+export const WsWorkspaceListGitStatesRpc = Rpc.make(WS_METHODS.workspaceListGitStates, {
+  payload: WorkspaceListGitStatesInput,
+  success: WorkspaceListGitStatesResult,
+  error: WsRpcError,
+});
+
+export const WsWorkspaceCloneRepositoryRpc = Rpc.make(WS_METHODS.workspaceCloneRepository, {
+  payload: WorkspaceCloneRepositoryInput,
+  success: WorkspaceCloneProgressEvent,
+  error: WsRpcError,
+  stream: true,
+});
+
+export const WsWorkspaceGetCloneStatusRpc = Rpc.make(WS_METHODS.workspaceGetCloneStatus, {
+  payload: WorkspaceGetCloneStatusInput,
+  success: WorkspaceGetCloneStatusResult,
+  error: WsRpcError,
+});
+
+export const WsWorkspaceRetryCloneProjectCreationRpc = Rpc.make(
+  WS_METHODS.workspaceRetryCloneProjectCreation,
+  {
+    payload: WorkspaceRetryCloneProjectCreationInput,
+    success: WorkspaceCloneProgressEvent,
+    error: WsRpcError,
+    stream: true,
+  },
+);
 
 export const WsBootstrapNegotiateRpc = Rpc.make(WS_BOOTSTRAP_METHOD, {
   payload: WsBootstrapNegotiateInput,
@@ -905,6 +954,11 @@ export const WsSubscribeAutomationEventsRpc = Rpc.make(WS_METHODS.subscribeAutom
 export const WsBootstrapRpcGroup = RpcGroup.make(WsBootstrapNegotiateRpc);
 
 export const WsFeatureRpcGroup = RpcGroup.make(
+  WsWorkspaceListArchivedProjectsRpc,
+  WsWorkspaceListGitStatesRpc,
+  WsWorkspaceCloneRepositoryRpc,
+  WsWorkspaceGetCloneStatusRpc,
+  WsWorkspaceRetryCloneProjectCreationRpc,
   WsOrchestrationDispatchCommandRpc,
   WsOrchestrationImportThreadRpc,
   WsOrchestrationGetSnapshotRpc,

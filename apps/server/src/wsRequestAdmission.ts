@@ -25,6 +25,7 @@ const CONTROL_METHODS = new Set<string>([
 ]);
 
 const EXPENSIVE_READ_METHODS = new Set<string>([
+  WS_METHODS.workspaceListGitStates,
   ORCHESTRATION_WS_METHODS.getSnapshot,
   ORCHESTRATION_WS_METHODS.repairState,
   ORCHESTRATION_WS_METHODS.getTurnDiff,
