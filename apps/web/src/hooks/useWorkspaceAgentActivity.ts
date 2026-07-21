@@ -573,9 +573,16 @@ export function createWorkspaceAgentThreadShellSelector(
 
     const relatedThreadIds = new Set<ThreadId>([target.id]);
     if (target.parentThreadId) relatedThreadIds.add(target.parentThreadId);
-    for (const candidateId of state.threadIds ?? []) {
-      const candidate = state.sidebarThreadSummaryById[candidateId];
-      if (candidate?.parentThreadId === target.id) relatedThreadIds.add(candidate.id);
+    const pendingParents: ThreadId[] = [target.id];
+    for (let depth = 0; depth < 3 && pendingParents.length > 0; depth += 1) {
+      const currentParents = new Set(pendingParents.splice(0));
+      for (const candidateId of state.threadIds ?? []) {
+        const candidate = state.sidebarThreadSummaryById[candidateId];
+        if (!candidate?.parentThreadId || !currentParents.has(candidate.parentThreadId)) continue;
+        if (relatedThreadIds.has(candidate.id)) continue;
+        relatedThreadIds.add(candidate.id);
+        pendingParents.push(candidate.id);
+      }
     }
     const summaries = [...relatedThreadIds].flatMap((relatedThreadId) => {
       const summary = state.sidebarThreadSummaryById[relatedThreadId];

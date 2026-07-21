@@ -2,6 +2,7 @@ import "../index.css";
 
 import {
   EventId,
+  type GitActionProgressEvent,
   MessageId,
   ORCHESTRATION_WS_METHODS,
   ProjectId,
@@ -22,6 +23,8 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { render } from "vitest-browser-react";
 
 import { useComposerDraftStore } from "../composerDraftStore";
+import { useGitActionActivityStore } from "../gitActionActivityStore";
+import { readNativeApi } from "../nativeApi";
 import { getRouter } from "../router";
 // Preload the split route before individual test clocks start on a cold browser run.
 import "../routes/_chat.$threadId?tsr-split=component";
@@ -55,6 +58,8 @@ let shellStreamRequestId: string | null = null;
 let shellStreamClient: EffectRpcWebSocketClient | null = null;
 let lifecycleStreamRequestId: string | null = null;
 let lifecycleStreamClient: EffectRpcWebSocketClient | null = null;
+let gitActionStreamRequestId: string | null = null;
+let gitActionStreamClient: EffectRpcWebSocketClient | null = null;
 const threadStreamRequestIdByThreadId = new Map<ThreadId, string>();
 const threadStreamClientByThreadId = new Map<ThreadId, EffectRpcWebSocketClient>();
 let delayNextThreadSnapshot = false;
@@ -250,6 +255,11 @@ const worker = setupWorker(
         });
         return;
       }
+      if (method === WS_METHODS.gitRunStackedAction) {
+        gitActionStreamRequestId = request.id;
+        gitActionStreamClient = client;
+        return;
+      }
       if (
         method === WS_METHODS.subscribeServerProviderStatuses ||
         method === WS_METHODS.subscribeServerSettings ||
@@ -296,7 +306,7 @@ const worker = setupWorker(
 async function mountApp(options?: {
   routeThreadId?: ThreadId;
   waitForThreadId?: ThreadId | null;
-}): Promise<{ cleanup: () => Promise<void> }> {
+}): Promise<{ cleanup: () => Promise<void>; router: ReturnType<typeof getRouter> }> {
   const host = createFullscreenTestHost();
 
   const routeThreadId = options?.routeThreadId ?? THREAD_ID;
@@ -332,6 +342,7 @@ async function mountApp(options?: {
   let cleanedUp = false;
 
   return {
+    router,
     cleanup: async () => {
       if (cleanedUp) return;
       cleanedUp = true;
@@ -386,6 +397,13 @@ function sendShellEventPush(event: OrchestrationShellStreamEvent) {
   sendEffectRpcChunk(shellStreamClient, shellStreamRequestId, event);
 }
 
+function sendGitActionProgress(event: GitActionProgressEvent) {
+  if (!gitActionStreamRequestId || !gitActionStreamClient) {
+    throw new Error("Git action stream is not connected");
+  }
+  sendEffectRpcChunk(gitActionStreamClient, gitActionStreamRequestId, event);
+}
+
 describe("EventRouter scoped orchestration sync", () => {
   beforeAll(async () => {
     fixture = buildFixture();
@@ -409,6 +427,8 @@ describe("EventRouter scoped orchestration sync", () => {
     shellStreamClient = null;
     lifecycleStreamRequestId = null;
     lifecycleStreamClient = null;
+    gitActionStreamRequestId = null;
+    gitActionStreamClient = null;
     threadStreamRequestIdByThreadId.clear();
     threadStreamClientByThreadId.clear();
     delayNextThreadSnapshot = false;
@@ -447,6 +467,7 @@ describe("EventRouter scoped orchestration sync", () => {
         },
       ],
     });
+    useGitActionActivityStore.setState({ activeActionIdsByCwd: new Map() });
     subscribeShellRequestCount = 0;
     subscribeThreadRequestCountById.clear();
     subscribeThreadRequests = [];
@@ -1251,6 +1272,54 @@ describe("EventRouter scoped orchestration sync", () => {
       await new Promise((resolve) => window.setTimeout(resolve, 120));
 
       expect(subscribeShellRequestCount).toBe(initialSubscribeShellCount);
+    } finally {
+      await mounted.cleanup();
+    }
+  });
+
+  it("keeps Git action projection subscribed after navigating to workspace", async () => {
+    const mounted = await mountApp();
+    const api = readNativeApi();
+    if (!api) throw new Error("Native API is unavailable");
+    const actionId = "action-route-transition";
+    const cwd = "/repo/project";
+    void api.git.runStackedAction({ actionId, cwd, action: "push" }).catch(() => undefined);
+
+    try {
+      await vi.waitFor(() => {
+        expect(gitActionStreamRequestId).not.toBeNull();
+        expect(gitActionStreamClient).not.toBeNull();
+      });
+
+      sendGitActionProgress({
+        kind: "action_started",
+        actionId,
+        cwd,
+        action: "push",
+        phases: ["push"],
+      });
+      await vi.waitFor(() => {
+        expect(useGitActionActivityStore.getState().activeActionIdsByCwd.get(cwd)).toEqual(
+          new Set([actionId]),
+        );
+      });
+
+      await mounted.router.navigate({ to: "/workspace" });
+      expect(mounted.router.state.location.pathname).toBe("/workspace");
+
+      sendGitActionProgress({
+        kind: "action_failed",
+        actionId,
+        cwd,
+        action: "push",
+        phase: "push",
+        message: "Push failed",
+      });
+      await vi.waitFor(() => {
+        expect(useGitActionActivityStore.getState().activeActionIdsByCwd.has(cwd)).toBe(false);
+      });
+
+      sendEffectRpcExit(gitActionStreamClient!, gitActionStreamRequestId!, undefined);
     } finally {
       await mounted.cleanup();
     }

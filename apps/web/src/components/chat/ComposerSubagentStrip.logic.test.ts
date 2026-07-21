@@ -143,7 +143,7 @@ describe("deriveComposerSubagentStripItems", () => {
     expect(items[0]?.modelLabel).toBeDefined();
   });
 
-  it("keeps the latest prior set visible only while a subagent still works", () => {
+  it("keeps the latest prior set visible after every subagent settles", () => {
     const entries = (status: string) => [
       workEntry({
         id: "entry-1",
@@ -163,12 +163,14 @@ describe("deriveComposerSubagentStripItems", () => {
     );
     expect(stillRunning.map((item) => item.primaryLabel)).toEqual(["Ada", "Blue"]);
 
-    expect(
+    const completed = subagentRows(
       deriveComposerSubagentStripItems({
         workEntries: entries("completed"),
         liveTurnId: null,
       }),
-    ).toEqual([]);
+    );
+    expect(completed.map((item) => item.primaryLabel)).toEqual(["Ada", "Blue"]);
+    expect(completed.every((item) => item.statusKind === "completed")).toBe(true);
   });
 
   it("appends the worker-tier effort to the model label", () => {
@@ -376,7 +378,7 @@ describe("deriveComposerSubagentStripItems", () => {
     expect(fromMainView.every((row) => row.kind === "subagent")).toBe(true);
   });
 
-  it("keeps parent-derived rows while the viewed subagent still runs, then retires fully", () => {
+  it("keeps parent-derived rows after the viewed subagent settles", () => {
     const entries = (viewedStatus: string) => [
       workEntry({
         id: "entry-1",
@@ -398,16 +400,14 @@ describe("deriveComposerSubagentStripItems", () => {
     });
     expect(stillRunning.map((row) => row.kind)).toEqual(["parent", "subagent", "subagent"]);
 
-    // Everything finished and the parent turn settled: the strip retires whole,
-    // parent row included.
-    expect(
-      deriveComposerSubagentStripItems({
-        workEntries: entries("completed"),
-        liveTurnId: null,
-        viewedThreadId: ThreadId.makeUnsafe("sub-2"),
-        parentRow,
-      }),
-    ).toEqual([]);
+    const completed = deriveComposerSubagentStripItems({
+      workEntries: entries("completed"),
+      liveTurnId: null,
+      viewedThreadId: ThreadId.makeUnsafe("sub-2"),
+      parentRow,
+    });
+    expect(completed.map((row) => row.kind)).toEqual(["parent", "subagent", "subagent"]);
+    expect(subagentRows(completed).every((item) => item.statusKind === "completed")).toBe(true);
   });
 
   describe("settled subagent status", () => {

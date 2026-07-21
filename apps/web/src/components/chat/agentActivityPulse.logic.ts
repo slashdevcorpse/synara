@@ -14,24 +14,19 @@ import {
   decodeSubagentReceiverThreadIds,
 } from "@synara/shared/subagents";
 
+import {
+  deriveAgentActivityState as deriveSharedAgentActivityState,
+  IDLE_AGENT_ACTIVITY_STATE,
+  isLiveAgentActivityPhase,
+  isTerminalAgentActivityPhase,
+  type AgentActivityPhase,
+  type AgentActivityState,
+  type AgentSubagentActivityState,
+} from "../../lib/agentActivity";
 import type { ChatMessage, ThreadSession } from "../../types";
 
-export type AgentActivityPhase =
-  | "idle"
-  | "thinking"
-  | "streaming"
-  | "tool-running"
-  | "interrupted"
-  | "completed"
-  | "failed";
-
-export interface AgentActivityState {
-  phase: AgentActivityPhase;
-  toolCount: number;
-  subagentCount: number;
-  lastEventTimestamp: string | null;
-  turnKey: string | null;
-}
+export { IDLE_AGENT_ACTIVITY_STATE, isLiveAgentActivityPhase, isTerminalAgentActivityPhase };
+export type { AgentActivityPhase, AgentActivityState };
 
 type AgentActivityLike = Pick<
   OrchestrationThreadActivity,
@@ -58,29 +53,10 @@ export interface AgentActivityInput {
   hasPendingApproval: boolean;
   hasPendingUserInput: boolean;
   threadError: string | null;
-}
-
-export const IDLE_AGENT_ACTIVITY_STATE: AgentActivityState = Object.freeze({
-  phase: "idle",
-  toolCount: 0,
-  subagentCount: 0,
-  lastEventTimestamp: null,
-  turnKey: null,
-});
-
-export function isLiveAgentActivityPhase(phase: AgentActivityPhase): boolean {
-  return phase === "thinking" || phase === "streaming" || phase === "tool-running";
-}
-
-export function isTerminalAgentActivityPhase(phase: AgentActivityPhase): boolean {
-  return phase === "interrupted" || phase === "completed" || phase === "failed";
+  subagentStates?: ReadonlyMap<string, AgentSubagentActivityState>;
 }
 
 export function deriveAgentActivityState(input: AgentActivityInput): AgentActivityState {
-  if (!input.threadId) {
-    return IDLE_AGENT_ACTIVITY_STATE;
-  }
-
   const sessionIsStarting = input.session?.orchestrationStatus === "starting";
   const sessionIsAwaitingTurnProjection =
     (input.session?.orchestrationStatus === "running" || input.session?.status === "running") &&
@@ -90,11 +66,6 @@ export function deriveAgentActivityState(input: AgentActivityInput): AgentActivi
     input.localDispatchPending || sessionIsStarting || sessionIsAwaitingTurnProjection;
   const activeTurnId = resolveActiveTurnId(input.session, input.latestTurn);
   const projectedTurnId = activeTurnId ?? input.latestTurn?.turnId ?? null;
-  const turnKey = beginningLifecycle
-    ? `pending:${input.threadId}`
-    : projectedTurnId
-      ? String(projectedTurnId)
-      : null;
   const relevantActivities = orderActivities(
     filterTurnActivities(input.activities, projectedTurnId),
   );
@@ -108,73 +79,53 @@ export function deriveAgentActivityState(input: AgentActivityInput): AgentActivi
     ...relevantMessages.map((message) => message.completedAt ?? message.createdAt),
   ]);
 
-  // A local dispatch or provider-starting state begins a new lifecycle while
-  // latestTurn can still describe the previous completed/interrupted turn.
-  if (!beginningLifecycle) {
-    const terminalPhase = resolveTerminalPhase(input, relevantActivities, activeTurnId);
-    if (terminalPhase) {
-      return {
-        phase: terminalPhase,
-        toolCount: 0,
-        subagentCount: 0,
-        lastEventTimestamp,
-        turnKey,
-      };
-    }
-  }
-
-  // Approval and user-input requests are user-blocked states, not live provider
-  // output. Keep the pulse idle without discarding the lifecycle's turn key.
-  if (input.hasPendingApproval || input.hasPendingUserInput) {
-    return {
-      ...IDLE_AGENT_ACTIVITY_STATE,
-      lastEventTimestamp,
-      turnKey,
-    };
-  }
-
-  const live = beginningLifecycle || isAuthoritativelyLive(input, activeTurnId);
-  // hasMessages only suppresses genuinely empty, idle projections. An optimistic
-  // first send is represented by localDispatchPending before its message is persisted.
-  if (!live || (!input.hasMessages && !beginningLifecycle && activeTurnId === null)) {
-    return {
-      ...IDLE_AGENT_ACTIVITY_STATE,
-      lastEventTimestamp,
-      turnKey,
-    };
-  }
-
-  const { activeToolCount, activeSubagentCount } =
-    activeTurnId === null
-      ? { activeToolCount: 0, activeSubagentCount: 0 }
-      : deriveActiveLifecycleCounts(relevantActivities);
-  if (activeToolCount > 0 || activeSubagentCount > 0) {
-    return {
-      phase: "tool-running",
-      toolCount: activeToolCount,
-      subagentCount: activeSubagentCount,
-      lastEventTimestamp,
-      turnKey,
-    };
-  }
-
-  if (hasStreamingAssistantMessage(relevantMessages, activeTurnId, input.latestTurn)) {
-    return {
-      phase: "streaming",
-      toolCount: 0,
-      subagentCount: activeSubagentCount,
-      lastEventTimestamp,
-      turnKey,
-    };
-  }
-
-  return {
-    phase: "thinking",
-    toolCount: 0,
-    subagentCount: activeSubagentCount,
+  const {
+    activeToolCount,
+    latestToolName,
+    subagentStates: eventSubagentStates,
+  } = activeTurnId === null
+    ? {
+        activeToolCount: 0,
+        latestToolName: null,
+        subagentStates: new Map<string, AgentSubagentActivityState>(),
+      }
+    : deriveActiveLifecycleCounts(relevantActivities);
+  const subagentStates = input.subagentStates ?? eventSubagentStates;
+  const latestStreamingMessage = [...relevantMessages]
+    .reverse()
+    .find(
+      (message) =>
+        message.role === "assistant" && message.streaming && message.turnId === activeTurnId,
+    );
+  return deriveSharedAgentActivityState({
+    threadId: input.threadId,
+    hasMessages: input.hasMessages,
+    localDispatchPending: input.localDispatchPending,
+    session: input.session
+      ? {
+          status: input.session.orchestrationStatus,
+          activeTurnId: input.session.activeTurnId ?? null,
+          updatedAt: input.session.updatedAt,
+        }
+      : null,
+    latestTurn: input.latestTurn,
+    hasLiveTailWork: isAuthoritativelyLive(input, activeTurnId),
+    hasPendingInteraction: input.hasPendingApproval || input.hasPendingUserInput,
+    threadError: input.threadError,
+    activeToolCount,
+    latestToolName,
+    hasStreamingAssistantMessage: hasStreamingAssistantMessage(
+      relevantMessages,
+      activeTurnId,
+      input.latestTurn,
+    ),
+    streamPreview: latestStreamingMessage?.text ?? null,
+    subagentStates,
+    activityTerminalPhase: beginningLifecycle
+      ? null
+      : resolveTerminalPhase(input, relevantActivities, activeTurnId),
     lastEventTimestamp,
-    turnKey,
-  };
+  });
 }
 
 function resolveActiveTurnId(
@@ -316,9 +267,11 @@ function orderActivities(activities: ReadonlyArray<AgentActivityLike>): AgentAct
 
 function deriveActiveLifecycleCounts(activities: ReadonlyArray<AgentActivityLike>): {
   activeToolCount: number;
-  activeSubagentCount: number;
+  latestToolName: string | null;
+  subagentStates: ReadonlyMap<string, AgentSubagentActivityState>;
 } {
   const openToolCounts = new Map<string, number>();
+  const openToolNames = new Map<string, string>();
   const subagentActivityById = new Map<string, boolean>();
 
   for (const activity of activities) {
@@ -332,14 +285,22 @@ function deriveActiveLifecycleCounts(activities: ReadonlyArray<AgentActivityLike
     if (terminal) {
       if (openCount <= 1) {
         openToolCounts.delete(lifecycleKey);
+        openToolNames.delete(lifecycleKey);
       } else {
         openToolCounts.set(lifecycleKey, openCount - 1);
       }
     } else if (activity.kind === "tool.started") {
       openToolCounts.set(lifecycleKey, openCount + 1);
+      openToolNames.set(lifecycleKey, toolLifecycleName(activity));
     } else if (openCount === 0) {
       // Some providers project an update as the first observable lifecycle edge.
       openToolCounts.set(lifecycleKey, 1);
+      openToolNames.set(lifecycleKey, toolLifecycleName(activity));
+    } else {
+      // Map#set preserves an existing key's insertion position. Refresh the key
+      // so the last value remains the most recent active lifecycle edge.
+      openToolNames.delete(lifecycleKey);
+      openToolNames.set(lifecycleKey, toolLifecycleName(activity));
     }
 
     applySubagentActivity(activity, subagentActivityById, terminal);
@@ -349,11 +310,37 @@ function deriveActiveLifecycleCounts(activities: ReadonlyArray<AgentActivityLike
   for (const count of openToolCounts.values()) {
     activeToolCount += count;
   }
-  let activeSubagentCount = 0;
-  for (const active of subagentActivityById.values()) {
-    if (active) activeSubagentCount += 1;
+  const subagentStates = new Map<string, AgentSubagentActivityState>();
+  for (const [id, active] of subagentActivityById) {
+    subagentStates.set(id, {
+      id,
+      phase: active ? "thinking" : "completed",
+      latestToolName: null,
+      streamPreview: null,
+    });
   }
-  return { activeToolCount, activeSubagentCount };
+  return {
+    activeToolCount,
+    latestToolName: [...openToolNames.values()].at(-1) ?? null,
+    subagentStates,
+  };
+}
+
+function toolLifecycleName(activity: AgentActivityLike): string {
+  const payload = asRecord(activity.payload);
+  const data = asRecord(payload?.data);
+  const item = asRecord(data?.item) ?? asRecord(payload?.item);
+  return (
+    firstString(
+      payload?.title,
+      payload?.toolName,
+      payload?.toolTitle,
+      data?.toolName,
+      data?.title,
+      item?.name,
+      item?.toolName,
+    ) ?? activity.summary
+  );
 }
 
 function isToolLifecycleActivity(activity: AgentActivityLike): boolean {

@@ -5,6 +5,7 @@ import {
   CorrelationId,
   EventId,
   MessageId,
+  type OrchestrationThreadActivity,
   ProjectId,
   ThreadId,
   TurnId,
@@ -277,6 +278,7 @@ it.layer(BaseTestLayer)("OrchestrationProjectionPipeline", (it) => {
           },
           runtimeMode: "approval-required",
           interactionMode: "default",
+          envMode: "local",
           createdAt: turnRequestedAt,
         },
       });
@@ -306,6 +308,36 @@ it.layer(BaseTestLayer)("OrchestrationProjectionPipeline", (it) => {
       assert.equal(rows[0]!.runtimeMode, "approval-required");
       assert.equal(rows[0]!.interactionMode, "default");
       assert.equal(rows[0]!.updatedAt, turnRequestedAt);
+
+      const pendingTurns = yield* sql<{
+        readonly provider: string | null;
+        readonly model: string | null;
+        readonly modelSelectionJson: string | null;
+        readonly runtimeMode: string | null;
+        readonly interactionMode: string | null;
+        readonly envMode: string | null;
+      }>`
+        SELECT
+          provider,
+          model,
+          model_selection_json AS "modelSelectionJson",
+          runtime_mode AS "runtimeMode",
+          interaction_mode AS "interactionMode",
+          env_mode AS "envMode"
+        FROM projection_turns
+        WHERE thread_id = 'thread-turn-settings'
+          AND turn_id IS NULL
+      `;
+      assert.deepEqual(pendingTurns, [
+        {
+          provider: "pi",
+          model: "openai/gpt-5.5",
+          modelSelectionJson: JSON.stringify({ provider: "pi", model: "openai/gpt-5.5" }),
+          runtimeMode: "approval-required",
+          interactionMode: "default",
+          envMode: "local",
+        },
+      ]);
     }),
   );
 });
@@ -3522,6 +3554,7 @@ engineLayer("OrchestrationProjectionPipeline via engine dispatch", (it) => {
         { projector: "projection.hot" },
         { projector: "projection.thread-activities" },
         { projector: "projection.thread-shell-summaries" },
+        { projector: "projection.thread-turns" },
       ]);
     }),
   );
@@ -3669,6 +3702,360 @@ it.layer(
         {
           state: "completed",
           completedAt: turnFinishedAt,
+        },
+      ]);
+    }),
+  );
+
+  it.effect("durably deduplicates per-turn tools, approvals, rejections, and token usage", () =>
+    Effect.gen(function* () {
+      const eventStore = yield* OrchestrationEventStore;
+      const projectionPipeline = yield* OrchestrationProjectionPipeline;
+      const sql = yield* SqlClient.SqlClient;
+      const threadId = ThreadId.makeUnsafe("thread-turn-summary-aggregates");
+      const turnId = TurnId.makeUnsafe("turn-summary-aggregates");
+      let sequence = 0;
+
+      yield* eventStore.append({
+        type: "thread.session-set",
+        eventId: EventId.makeUnsafe("evt-summary-session"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: "2026-07-20T10:00:00.000Z",
+        commandId: CommandId.makeUnsafe("cmd-summary-session"),
+        causationEventId: null,
+        correlationId: CorrelationId.makeUnsafe("cmd-summary-session"),
+        metadata: {},
+        payload: {
+          threadId,
+          session: {
+            threadId,
+            status: "running",
+            providerName: "codex",
+            runtimeMode: "full-access",
+            activeTurnId: turnId,
+            lastError: null,
+            updatedAt: "2026-07-20T10:00:00.000Z",
+          },
+        },
+      });
+
+      const appendActivity = (input: {
+        readonly kind: string;
+        readonly tone: "info" | "tool" | "approval";
+        readonly payload: OrchestrationThreadActivity["payload"];
+      }) => {
+        sequence += 1;
+        const suffix = sequence.toString().padStart(2, "0");
+        const createdAt = `2026-07-20T10:00:${suffix}.000Z`;
+        return eventStore.append({
+          type: "thread.activity-appended",
+          eventId: EventId.makeUnsafe(`evt-summary-${suffix}`),
+          aggregateKind: "thread",
+          aggregateId: threadId,
+          occurredAt: createdAt,
+          commandId: CommandId.makeUnsafe(`cmd-summary-${suffix}`),
+          causationEventId: null,
+          correlationId: CorrelationId.makeUnsafe(`cmd-summary-${suffix}`),
+          metadata: {},
+          payload: {
+            threadId,
+            activity: {
+              id: EventId.makeUnsafe(`activity-summary-${suffix}`),
+              tone: input.tone,
+              kind: input.kind,
+              summary: input.kind,
+              payload: input.payload,
+              turnId,
+              createdAt,
+            },
+          },
+        });
+      };
+
+      yield* appendActivity({
+        kind: "turn.started",
+        tone: "info",
+        payload: { provider: "codex", model: "gpt-5.5", effort: "high" },
+      });
+      for (const kind of ["tool.started", "tool.updated", "tool.completed"] as const) {
+        yield* appendActivity({
+          kind,
+          tone: "tool",
+          payload: { providerItemId: "read-1", title: "Read" },
+        });
+      }
+      yield* appendActivity({
+        kind: "tool.started",
+        tone: "tool",
+        payload: { data: { toolCallId: "read-2", item: { name: "Read" } } },
+      });
+      for (const kind of ["tool.started", "tool.updated", "tool.completed"] as const) {
+        yield* appendActivity({ kind, tone: "tool", payload: { title: "Shell" } });
+      }
+      yield* appendActivity({
+        kind: "tool.completed",
+        tone: "tool",
+        payload: { title: "Glob" },
+      });
+      yield* appendActivity({
+        kind: "tool.completed",
+        tone: "tool",
+        payload: { title: "Glob" },
+      });
+      yield* appendActivity({
+        kind: "approval.requested",
+        tone: "approval",
+        payload: { requestId: "approval-1" },
+      });
+      yield* appendActivity({
+        kind: "approval.requested",
+        tone: "approval",
+        payload: { requestId: "approval-1" },
+      });
+      yield* appendActivity({
+        kind: "approval.resolved",
+        tone: "approval",
+        payload: { requestId: "approval-1", decision: "decline" },
+      });
+      yield* appendActivity({
+        kind: "approval.requested",
+        tone: "approval",
+        payload: { requestId: "approval-2" },
+      });
+      yield* appendActivity({
+        kind: "context-window.updated",
+        tone: "info",
+        payload: {
+          provider: "codex",
+          usedTokens: 160,
+          maxTokens: 200_000,
+          lastInputTokens: 120,
+          lastCachedInputTokens: 20,
+          lastOutputTokens: 30,
+          lastReasoningOutputTokens: 10,
+          lastUsedTokens: 160,
+        },
+      });
+      yield* appendActivity({
+        kind: "turn.completed",
+        tone: "info",
+        payload: { provider: "codex", state: "completed" },
+      });
+
+      yield* projectionPipeline.bootstrap;
+
+      const rows = yield* sql<{
+        readonly state: string;
+        readonly provider: string | null;
+        readonly model: string | null;
+        readonly reasoningEffort: string | null;
+        readonly tokenUsageJson: string | null;
+        readonly toolCallsJson: string;
+        readonly approvalRequestIdsJson: string;
+        readonly rejectedApprovalRequestIdsJson: string;
+      }>`
+        SELECT
+          state,
+          provider,
+          model,
+          reasoning_effort AS "reasoningEffort",
+          token_usage_json AS "tokenUsageJson",
+          tool_calls_json AS "toolCallsJson",
+          approval_request_ids_json AS "approvalRequestIdsJson",
+          rejected_approval_request_ids_json AS "rejectedApprovalRequestIdsJson"
+        FROM projection_turns
+        WHERE thread_id = ${threadId}
+          AND turn_id = ${turnId}
+      `;
+      assert.equal(rows.length, 1);
+      assert.equal(rows[0]?.state, "completed");
+      assert.equal(rows[0]?.provider, "codex");
+      assert.equal(rows[0]?.model, "gpt-5.5");
+      assert.equal(rows[0]?.reasoningEffort, "high");
+      assert.deepEqual(JSON.parse(rows[0]?.toolCallsJson ?? "[]"), [
+        { id: "read-1", name: "Read", completed: true },
+        { id: "read-2", name: "Read", completed: false },
+        { id: "activity:activity-summary-06", name: "Shell", completed: true },
+        { id: "activity:activity-summary-09", name: "Glob", completed: true },
+        { id: "activity:activity-summary-10", name: "Glob", completed: true },
+      ]);
+      assert.deepEqual(JSON.parse(rows[0]?.approvalRequestIdsJson ?? "[]"), [
+        "approval-1",
+        "approval-2",
+      ]);
+      assert.deepEqual(JSON.parse(rows[0]?.rejectedApprovalRequestIdsJson ?? "[]"), ["approval-1"]);
+      assert.deepEqual(JSON.parse(rows[0]?.tokenUsageJson ?? "null"), {
+        provider: "codex",
+        inputTokens: 120,
+        cachedInputTokens: 20,
+        outputTokens: 30,
+        reasoningOutputTokens: 10,
+        totalTokens: 160,
+        contextUsedTokens: 160,
+        contextWindowTokens: 200_000,
+        updatedAt: "2026-07-20T10:00:15.000Z",
+      });
+    }),
+  );
+
+  it.effect("rejects invalid context-window token values", () =>
+    Effect.gen(function* () {
+      const eventStore = yield* OrchestrationEventStore;
+      const projectionPipeline = yield* OrchestrationProjectionPipeline;
+      const sql = yield* SqlClient.SqlClient;
+      const threadId = ThreadId.makeUnsafe("thread-invalid-context-window-maxima");
+      const invalidCases = [
+        {
+          suffix: "zero-window",
+          createdAt: "2026-07-20T11:00:01.000Z",
+          payload: { provider: "codex", usedTokens: 42, maxTokens: 0 },
+          expectedContextUsedTokens: 42,
+          expectedContextWindowTokens: null,
+        },
+        {
+          suffix: "fractional-window",
+          createdAt: "2026-07-20T11:00:02.000Z",
+          payload: { provider: "codex", usedTokens: 42, maxTokens: 200_000.5 },
+          expectedContextUsedTokens: 42,
+          expectedContextWindowTokens: null,
+        },
+        {
+          suffix: "non-number-window",
+          createdAt: "2026-07-20T11:00:03.000Z",
+          payload: { provider: "codex", usedTokens: 42, maxTokens: "200000" },
+          expectedContextUsedTokens: 42,
+          expectedContextWindowTokens: null,
+        },
+        {
+          suffix: "fractional-counts",
+          createdAt: "2026-07-20T11:00:04.000Z",
+          payload: {
+            provider: "codex",
+            usedTokens: 42.5,
+            maxTokens: 200_000,
+            lastInputTokens: 12.5,
+            lastCachedInputTokens: 3.5,
+            lastOutputTokens: 7.5,
+            lastReasoningOutputTokens: 2.5,
+            lastUsedTokens: 26.5,
+          },
+          expectedContextUsedTokens: null,
+          expectedContextWindowTokens: 200_000,
+        },
+      ] as const;
+
+      for (const input of invalidCases) {
+        const turnId = TurnId.makeUnsafe(`turn-invalid-context-window-${input.suffix}`);
+        yield* eventStore.append({
+          type: "thread.activity-appended",
+          eventId: EventId.makeUnsafe(`evt-invalid-context-window-${input.suffix}`),
+          aggregateKind: "thread",
+          aggregateId: threadId,
+          occurredAt: input.createdAt,
+          commandId: CommandId.makeUnsafe(`cmd-invalid-context-window-${input.suffix}`),
+          causationEventId: null,
+          correlationId: CorrelationId.makeUnsafe(`cmd-invalid-context-window-${input.suffix}`),
+          metadata: {},
+          payload: {
+            threadId,
+            activity: {
+              id: EventId.makeUnsafe(`activity-invalid-context-window-${input.suffix}`),
+              tone: "info",
+              kind: "context-window.updated",
+              summary: "context window updated",
+              payload: input.payload,
+              turnId,
+              createdAt: input.createdAt,
+            },
+          },
+        });
+      }
+
+      yield* projectionPipeline.bootstrap;
+
+      const rows = yield* sql<{
+        readonly turnId: string;
+        readonly tokenUsageJson: string | null;
+      }>`
+        SELECT
+          turn_id AS "turnId",
+          token_usage_json AS "tokenUsageJson"
+        FROM projection_turns
+        WHERE thread_id = ${threadId}
+      `;
+      const rowsByTurnId = new Map(rows.map((row) => [row.turnId, row]));
+      for (const input of invalidCases) {
+        const row = rowsByTurnId.get(`turn-invalid-context-window-${input.suffix}`);
+        assert.isDefined(row);
+        assert.deepEqual(JSON.parse(row.tokenUsageJson ?? "null"), {
+          provider: "codex",
+          inputTokens: null,
+          cachedInputTokens: null,
+          outputTokens: null,
+          reasoningOutputTokens: null,
+          totalTokens: null,
+          contextUsedTokens: input.expectedContextUsedTokens,
+          contextWindowTokens: input.expectedContextWindowTokens,
+          updatedAt: input.createdAt,
+        });
+      }
+    }),
+  );
+
+  it.effect("completes a Claude turn without model usage", () =>
+    Effect.gen(function* () {
+      const eventStore = yield* OrchestrationEventStore;
+      const projectionPipeline = yield* OrchestrationProjectionPipeline;
+      const sql = yield* SqlClient.SqlClient;
+      const threadId = ThreadId.makeUnsafe("thread-claude-completed-without-model-usage");
+      const turnId = TurnId.makeUnsafe("turn-claude-completed-without-model-usage");
+      const completedAt = "2026-07-20T11:30:00.000Z";
+
+      yield* eventStore.append({
+        type: "thread.activity-appended",
+        eventId: EventId.makeUnsafe("evt-claude-completed-without-model-usage"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: completedAt,
+        commandId: CommandId.makeUnsafe("cmd-claude-completed-without-model-usage"),
+        causationEventId: null,
+        correlationId: CorrelationId.makeUnsafe("cmd-claude-completed-without-model-usage"),
+        metadata: {},
+        payload: {
+          threadId,
+          activity: {
+            id: EventId.makeUnsafe("activity-claude-completed-without-model-usage"),
+            tone: "info",
+            kind: "turn.completed",
+            summary: "turn completed",
+            payload: { provider: "claudeAgent", state: "completed" },
+            turnId,
+            createdAt: completedAt,
+          },
+        },
+      });
+
+      yield* projectionPipeline.bootstrap;
+
+      const rows = yield* sql<{
+        readonly state: string;
+        readonly provider: string | null;
+        readonly tokenUsageJson: string | null;
+      }>`
+        SELECT
+          state,
+          provider,
+          token_usage_json AS "tokenUsageJson"
+        FROM projection_turns
+        WHERE thread_id = ${threadId}
+          AND turn_id = ${turnId}
+      `;
+      assert.deepEqual(rows, [
+        {
+          state: "completed",
+          provider: "claudeAgent",
+          tokenUsageJson: null,
         },
       ]);
     }),

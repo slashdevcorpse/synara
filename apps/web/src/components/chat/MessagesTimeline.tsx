@@ -10,6 +10,7 @@ import {
   type ThreadMarker,
   type TurnId,
 } from "@synara/contracts";
+import type { FeedbackThreadContext } from "~/feedback";
 import { resolveLatestTailUserMessageEditTarget } from "@synara/shared/conversationEdit";
 import { pluralize } from "@synara/shared/text";
 import { LegendList, type LegendListRef } from "@legendapp/list/react";
@@ -72,6 +73,8 @@ import { InlineAgentChip } from "./InlineAgentChip";
 import { MessageActionButton, MESSAGE_ACTION_ICON_CLASS_NAME } from "./MessageActionButton";
 import { MessageCopyButton } from "./MessageCopyButton";
 import { AssistantSelectionsSummaryChip } from "./AssistantSelectionsSummaryChip";
+import { TurnReasoningSummaryCard } from "./TurnReasoningSummaryCard";
+import type { TurnReasoningSummary } from "./turnReasoning";
 import { FileAttachmentChip } from "./FileAttachmentChip";
 import { FileCommentsSummaryChip } from "./FileCommentsSummaryChip";
 import { UserMessagePastedTextCard } from "./PastedTextChip";
@@ -169,6 +172,25 @@ const ACTIVE_MARKER_CLASS_NAME = "thread-marker-active";
 const EMPTY_MESSAGE_MARKERS: readonly ThreadMarker[] = [];
 const EMPTY_THREAD_MARKERS_BY_MESSAGE_ID = new Map<MessageId, readonly ThreadMarker[]>();
 const EMPTY_MESSAGE_ID_SET: ReadonlySet<MessageId> = new Set();
+const EMPTY_TURN_REASONING_SUMMARY_BY_ASSISTANT_MESSAGE_ID: ReadonlyMap<
+  MessageId,
+  TurnReasoningSummary
+> = new Map();
+const EMPTY_FEEDBACK_THREAD_CONTEXT: FeedbackThreadContext = {
+  provider: null,
+  model: null,
+  projectKind: null,
+  environmentMode: null,
+  runtimeMode: null,
+  interactionMode: null,
+  sessionStatus: null,
+  latestTurnState: null,
+  messageCount: 0,
+  activityCount: 0,
+  hasPendingApproval: false,
+  hasPendingUserInput: false,
+  hasThreadError: false,
+};
 
 /**
  * Imperative handle the transcript exposes so the Environment panel's pinned-message
@@ -349,6 +371,8 @@ interface MessagesTimelineProps {
   crossTaskOrigin?: CrossTaskOrigin | null;
   timelineEntries: ReturnType<typeof deriveTimelineEntries>;
   turnDiffSummaryByAssistantMessageId: Map<MessageId, TurnDiffSummary>;
+  turnReasoningSummaryByAssistantMessageId?: ReadonlyMap<MessageId, TurnReasoningSummary>;
+  feedbackContext?: FeedbackThreadContext;
   nowIso?: string;
   expandedWorkGroups?: Record<string, boolean>;
   onToggleWorkGroup?: (groupId: string) => void;
@@ -409,6 +433,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   crossTaskOrigin = null,
   timelineEntries,
   turnDiffSummaryByAssistantMessageId,
+  turnReasoningSummaryByAssistantMessageId = EMPTY_TURN_REASONING_SUMMARY_BY_ASSISTANT_MESSAGE_ID,
+  feedbackContext = EMPTY_FEEDBACK_THREAD_CONTEXT,
   nowIso,
   expandedWorkGroups,
   onToggleWorkGroup,
@@ -502,6 +528,14 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   const [expandedUserMessagesById, setExpandedUserMessagesById] = useState<Record<string, boolean>>(
     {},
   );
+  const [turnReasoningExpansionOverrides, setTurnReasoningExpansionOverrides] = useState<
+    Record<string, boolean>
+  >({});
+  const setTurnReasoningSummaryExpanded = useCallback((rowId: string, expanded: boolean) => {
+    setTurnReasoningExpansionOverrides((current) =>
+      current[rowId] === expanded ? current : { ...current, [rowId]: expanded },
+    );
+  }, []);
   const [editingUserMessageId, setEditingUserMessageId] = useState<MessageId | null>(null);
   const [submittingEditedUserMessageId, setSubmittingEditedUserMessageId] =
     useState<MessageId | null>(null);
@@ -543,6 +577,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
         activeTurnId,
         activeTurnStartedAt,
         turnDiffSummaryByAssistantMessageId,
+        turnReasoningSummaryByAssistantMessageId,
         revertTurnCountByUserMessageId,
       }),
     [
@@ -553,6 +588,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       activeTurnId,
       activeTurnStartedAt,
       turnDiffSummaryByAssistantMessageId,
+      turnReasoningSummaryByAssistantMessageId,
       revertTurnCountByUserMessageId,
     ],
   );
@@ -577,12 +613,14 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       expandedFileListByTurnId,
       expandedUserMessagesById,
       expandedWorkGroupsState,
+      feedbackContext,
       firstUserMessageId,
       highlightedMessageId,
       pinnedMessageIds,
       settledTurnCollapseTransitions,
       submittingEditedUserMessageId,
       threadMarkersByMessageId,
+      turnReasoningExpansionOverrides,
     }),
     [
       crossTaskOrigin,
@@ -593,12 +631,14 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       expandedFileListByTurnId,
       expandedUserMessagesById,
       expandedWorkGroupsState,
+      feedbackContext,
       firstUserMessageId,
       highlightedMessageId,
       pinnedMessageIds,
       settledTurnCollapseTransitions,
       submittingEditedUserMessageId,
       threadMarkersByMessageId,
+      turnReasoningExpansionOverrides,
     ],
   );
   // Latest rows kept in a ref so the imperative scroll controller can look up a message's
@@ -724,7 +764,13 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   const tailContentRowId = useMemo(() => {
     for (let index = rows.length - 1; index >= 0; index -= 1) {
       const row = rows[index]!;
-      if (row.kind !== "working" && row.kind !== "worktree-setup") return row.id;
+      if (
+        row.kind !== "working" &&
+        row.kind !== "worktree-setup" &&
+        row.kind !== "turn-reasoning-summary"
+      ) {
+        return row.id;
+      }
     }
     return null;
   }, [rows]);
@@ -1755,6 +1801,17 @@ export const MessagesTimeline = memo(function MessagesTimeline({
             cwd={markdownCwd}
             workspaceRoot={workspaceRoot}
             chatTypographyStyle={chatTypographyStyle}
+          />
+        </div>
+      )}
+
+      {row.kind === "turn-reasoning-summary" && (
+        <div className="min-w-0 py-0.5">
+          <TurnReasoningSummaryCard
+            summary={row.summary}
+            expanded={turnReasoningExpansionOverrides[row.id] ?? row.isLatestCompleted}
+            onExpandedChange={(expanded) => setTurnReasoningSummaryExpanded(row.id, expanded)}
+            feedbackContext={feedbackContext}
           />
         </div>
       )}

@@ -14,6 +14,7 @@ import type {
   WorkspaceAgentThreadActivity,
 } from "../hooks/useWorkspaceAgentActivity";
 import type { SidebarThreadSummary } from "../types";
+import { IDLE_AGENT_ACTIVITY_STATE } from "../lib/agentActivity";
 import { ThreadHoverCardActivityContent, ThreadHoverCardFrame } from "./ThreadHoverCard";
 import { SidebarMenuSubButton, SidebarMenuSubItem } from "./ui/sidebar";
 
@@ -36,6 +37,7 @@ const ACTIVE_ENTRY: AgentThreadEntry = {
   effortLabel: null,
   providerKind: "opencode",
   status: "tool-running",
+  activityState: { ...IDLE_AGENT_ACTIVITY_STATE, phase: "tool-running" },
   duration: 480_000,
   latestTool: { name: "bun run test", state: "running" },
   streamPreview: null,
@@ -56,6 +58,7 @@ const PARENT_ENTRY: AgentThreadEntry = {
   modelLabel: "Claude Opus 4.8",
   providerKind: "claudeAgent",
   status: "completed",
+  activityState: { ...IDLE_AGENT_ACTIVITY_STATE, phase: "completed" },
   latestTool: null,
   turnId: null,
 };
@@ -88,6 +91,7 @@ const ACTIVITY: WorkspaceAgentThreadActivity = {
   parentEntry: PARENT_ENTRY,
   subagentCount: 3,
   subagentRunningCount: 2,
+  subagentTree: [],
 };
 
 describe("ThreadHoverCardFrame", () => {

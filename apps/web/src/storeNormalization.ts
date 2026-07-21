@@ -1216,6 +1216,11 @@ export function normalizeThreadFromReadModel(
   const messages = normalizeChatMessages(incoming.messages, previous?.messages);
   const proposedPlans = normalizeProposedPlans(incoming.proposedPlans, previous?.proposedPlans);
   const latestTurn = normalizeLatestTurn(incoming.latestTurn, previous?.latestTurn);
+  const incomingTurns = incoming.turns ?? [];
+  const turns =
+    previous?.turns && deepEqualJson(previous.turns, incomingTurns)
+      ? previous.turns
+      : [...incomingTurns];
   const handoff =
     previous?.handoff && incoming.handoff && deepEqualJson(previous.handoff, incoming.handoff)
       ? previous.handoff
@@ -1307,6 +1312,7 @@ export function normalizeThreadFromReadModel(
     previous.updatedAt === incoming.updatedAt &&
     (previous.isPinned ?? false) === (incoming.isPinned ?? false) &&
     previous.latestTurn === latestTurn &&
+    previous.turns === turns &&
     previous.pendingSourceProposedPlan === pendingSourceProposedPlan &&
     previous.lastVisitedAt === lastVisitedAt &&
     (previous.parentThreadId ?? null) === (incoming.parentThreadId ?? null) &&
@@ -1357,6 +1363,7 @@ export function normalizeThreadFromReadModel(
     updatedAt: incoming.updatedAt,
     isPinned: incoming.isPinned ?? false,
     latestTurn,
+    turns,
     ...(pendingSourceProposedPlan ? { pendingSourceProposedPlan } : {}),
     lastVisitedAt,
     parentThreadId: incoming.parentThreadId ?? null,

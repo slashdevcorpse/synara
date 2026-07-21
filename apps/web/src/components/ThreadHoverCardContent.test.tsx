@@ -6,6 +6,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 
 import type { AgentStatus } from "~/lib/workspaceAgentActivity";
+import { makeWorkspaceAgentEntry } from "./workspace/WorkspaceAgentPanel.testFixtures";
 import {
   ThreadHoverCardContent,
   type ThreadHoverCardContentProps,
@@ -25,6 +26,7 @@ const BASE_PROPS: ThreadHoverCardContentProps = {
   permissionMode: "full-access",
   subagentCount: 0,
   subagentRunningCount: 0,
+  subagentTree: [],
   worktreeLabel: null,
   prTitle: null,
   prState: null,
@@ -47,6 +49,16 @@ describe("ThreadHoverCardContent", () => {
     expect(markup).toContain('title="Fix authentication refresh"');
     expect(markup).toContain('title="gpt-5.6-sol"');
     expect(markup).toContain('aria-hidden="true"');
+  });
+
+  it("preserves aggregate-only legacy props when no subagent tree is supplied", () => {
+    const { subagentTree: _subagentTree, ...legacyProps } = BASE_PROPS;
+    const markup = renderToStaticMarkup(
+      <ThreadHoverCardContent {...legacyProps} subagentCount={2} subagentRunningCount={1} />,
+    );
+
+    expect(markup).toContain("1 of 2 subagents running");
+    expect(markup).not.toContain('aria-label="Subagent activity"');
   });
 
   it("omits the relative time when it is unavailable", () => {
@@ -73,7 +85,7 @@ describe("ThreadHoverCardContent", () => {
       duration: 720_000,
       toolLabel: null,
       copy: "thinking · 12m",
-      dotClass: "bg-sky-300/95",
+      dotClass: "bg-warning",
       pulses: true,
     },
     {
@@ -81,7 +93,7 @@ describe("ThreadHoverCardContent", () => {
       duration: 180_000,
       toolLabel: null,
       copy: "streaming · 3m",
-      dotClass: "bg-sky-300/95",
+      dotClass: "bg-primary",
       pulses: true,
     },
     {
@@ -89,7 +101,7 @@ describe("ThreadHoverCardContent", () => {
       duration: 480_000,
       toolLabel: "bun run test",
       copy: "tool: bun run test · 8m",
-      dotClass: "bg-sky-300/95",
+      dotClass: "bg-primary",
       pulses: true,
     },
     {
@@ -97,21 +109,21 @@ describe("ThreadHoverCardContent", () => {
       duration: 300_000,
       toolLabel: null,
       copy: "completed · 5m total",
-      dotClass: "bg-emerald-300/80",
+      dotClass: "bg-success",
     },
     {
       status: "failed",
       duration: 300_000,
       toolLabel: null,
       copy: "failed",
-      dotClass: "bg-rose-300/90",
+      dotClass: "bg-destructive",
     },
     {
       status: "stopped",
       duration: 300_000,
       toolLabel: null,
       copy: "stopped",
-      dotClass: "bg-amber-300/85",
+      dotClass: "bg-warning",
     },
     {
       status: "queued",
@@ -125,8 +137,15 @@ describe("ThreadHoverCardContent", () => {
       duration: 300_000,
       toolLabel: null,
       copy: "connecting",
-      dotClass: "bg-sky-300/95",
+      dotClass: "bg-info",
       pulses: true,
+    },
+    {
+      status: "interrupted",
+      duration: 300_000,
+      toolLabel: null,
+      copy: "interrupted",
+      dotClass: "bg-warning",
     },
   ])("renders exact $status status copy and shared dot treatment", (testCase) => {
     const markup = renderCard({
@@ -181,6 +200,42 @@ describe("ThreadHoverCardContent", () => {
     expect(markup).toContain("subagent of Release coordinator");
     expect(markup).toContain('title="Release coordinator"');
     expect(markup).toContain("text-muted-foreground/60");
+  });
+
+  it.each([
+    {
+      statuses: ["completed", "completed"] as const,
+      summary: "2 subagents completed",
+    },
+    { statuses: ["failed", "failed"] as const, summary: "2 subagents failed" },
+    {
+      statuses: ["completed", "failed"] as const,
+      summary: "2 subagents settled · 1 completed · 1 failed",
+    },
+  ])("compacts $summary while retaining subagent details", ({ statuses, summary }) => {
+    const subagentTree = statuses.map((status, index) => ({
+      entry: makeWorkspaceAgentEntry({
+        threadId: `hover-child-${index}` as never,
+        threadTitle: `Child ${index + 1}`,
+        status,
+        activityState: { ...makeWorkspaceAgentEntry().activityState, phase: status },
+      }),
+      children: [],
+    }));
+    const markup = renderCard({
+      subagentCount: subagentTree.length,
+      subagentRunningCount: 0,
+      subagentTree,
+    });
+
+    expect(markup).not.toContain(`<details`);
+    expect(markup).toContain(`aria-expanded="false"`);
+    expect(markup).toContain(`aria-controls=`);
+    expect(markup).toContain(`${summary} · details`);
+    expect(markup).toContain("Subagent activity details");
+    expect(markup).toContain(`aria-hidden="true"`);
+    expect(markup).toContain("Child 1");
+    expect(markup).toContain("Child 2");
   });
 
   it("renders and truncates workspace context only when supplied", () => {

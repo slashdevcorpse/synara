@@ -5,12 +5,14 @@
 
 import {
   DEFAULT_THREAD_TERMINAL_ID,
+  type NormalizedThreadTerminalGroup,
   type ThreadTerminalGroup,
   type ThreadTerminalLayoutNode,
   type ThreadTerminalSplitDirection,
   type ThreadTerminalSplitNode,
   type ThreadTerminalSplitPosition,
 } from "./types";
+import { normalizeTerminalGroupMetadata } from "./lib/terminalGroups";
 
 type RawTerminalGroup = Partial<ThreadTerminalGroup> & {
   terminalIds?: string[] | undefined;
@@ -210,7 +212,7 @@ export function layoutContainsTerminalId(
 export function normalizeTerminalPaneGroup(
   group: RawTerminalGroup,
   validTerminalIds: string[],
-): ThreadTerminalGroup | null {
+): NormalizedThreadTerminalGroup | null {
   const validTerminalIdSet = new Set(validTerminalIds);
   const legacyTerminalIds = [
     ...new Set((group.terminalIds ?? []).map((id) => id.trim()).filter(Boolean)),
@@ -228,6 +230,7 @@ export function normalizeTerminalPaneGroup(
     id: group.id?.trim() || `group-${activeTerminalId}`,
     activeTerminalId,
     layout: sanitizedLayout,
+    ...normalizeTerminalGroupMetadata(group),
   };
 }
 
@@ -558,10 +561,15 @@ export function resizeTerminalGroupLayout(
   return result.didResize ? { ...group, layout: result.node } : group;
 }
 
-export function createTerminalGroup(groupId: string, terminalId: string): ThreadTerminalGroup {
+export function createTerminalGroup(
+  groupId: string,
+  terminalId: string,
+  metadata: Partial<ThreadTerminalGroup> = {},
+): NormalizedThreadTerminalGroup {
   return {
     id: groupId,
     activeTerminalId: terminalId,
     layout: createTerminalLeaf(terminalId),
+    ...normalizeTerminalGroupMetadata(metadata),
   };
 }
