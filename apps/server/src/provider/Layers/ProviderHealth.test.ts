@@ -47,6 +47,7 @@ import {
   parseClaudeAuthStatusFromOutput,
   parseCommandCodeStatusJson,
   PACKAGE_MANAGED_PROVIDER_UPDATES,
+  packageManagedProviderUpdateDefinitions,
   providerStatusesEqual,
   ProviderHealthLive,
   projectProviderStatusesForSettings,
@@ -103,6 +104,12 @@ interface ProviderCommandFixture {
   readonly commandDirectory: string;
 }
 
+interface TestProcessCommandOptions {
+  readonly env?: NodeJS.ProcessEnv;
+  readonly windowsVerbatimArguments?: boolean;
+  readonly synaraExternallySupervised?: boolean;
+}
+
 function fixtureExecutablePath(fixture: ProviderCommandFixture, command: string): string {
   return NodePath.join(
     fixture.commandDirectory,
@@ -117,7 +124,7 @@ function preparedProviderCommandMatches(input: {
   readonly command: string;
   readonly actualArgs: ReadonlyArray<string>;
   readonly env?: NodeJS.ProcessEnv | undefined;
-  readonly options?: { readonly windowsVerbatimArguments?: boolean } | undefined;
+  readonly options?: TestProcessCommandOptions | undefined;
 }): boolean {
   if (process.platform !== "win32") {
     return (
@@ -265,12 +272,7 @@ function mockSpawnerLayer(
     args: ReadonlyArray<string>,
     command: string,
     env: NodeJS.ProcessEnv | undefined,
-    options:
-      | {
-          readonly env?: NodeJS.ProcessEnv;
-          readonly windowsVerbatimArguments?: boolean;
-        }
-      | undefined,
+    options: TestProcessCommandOptions | undefined,
   ) => {
     stdout: string;
     stderr: string;
@@ -283,10 +285,7 @@ function mockSpawnerLayer(
       const cmd = command as unknown as {
         command: string;
         args: ReadonlyArray<string>;
-        options?: {
-          env?: NodeJS.ProcessEnv;
-          windowsVerbatimArguments?: boolean;
-        };
+        options?: TestProcessCommandOptions;
       };
       return Effect.succeed(
         mockHandle(handler(cmd.args, cmd.command, cmd.options?.env, cmd.options)),
@@ -300,12 +299,7 @@ function effectSpawnerLayer(
     args: ReadonlyArray<string>,
     command: string,
     env: NodeJS.ProcessEnv | undefined,
-    options:
-      | {
-          readonly env?: NodeJS.ProcessEnv;
-          readonly windowsVerbatimArguments?: boolean;
-        }
-      | undefined,
+    options: TestProcessCommandOptions | undefined,
   ) => Effect.Effect<ReturnType<typeof mockHandle>>,
 ) {
   return Layer.succeed(
@@ -314,10 +308,7 @@ function effectSpawnerLayer(
       const cmd = command as unknown as {
         command: string;
         args: ReadonlyArray<string>;
-        options?: {
-          env?: NodeJS.ProcessEnv;
-          windowsVerbatimArguments?: boolean;
-        };
+        options?: TestProcessCommandOptions;
       };
       return handler(cmd.args, cmd.command, cmd.options?.env, cmd.options);
     }),
@@ -347,7 +338,7 @@ function hangingSpawnerLayer(input: {
     args: ReadonlyArray<string>,
     command: string,
     env: NodeJS.ProcessEnv | undefined,
-    options: { readonly windowsVerbatimArguments?: boolean } | undefined,
+    options: TestProcessCommandOptions | undefined,
   ) => boolean;
 }) {
   const handle = ChildProcessSpawner.makeHandle({
@@ -368,10 +359,7 @@ function hangingSpawnerLayer(input: {
       const cmd = command as unknown as {
         command: string;
         args: ReadonlyArray<string>;
-        options?: {
-          env?: NodeJS.ProcessEnv;
-          windowsVerbatimArguments?: boolean;
-        };
+        options?: TestProcessCommandOptions;
       };
       return input.shouldHang(cmd.args, cmd.command, cmd.options?.env, cmd.options)
         ? (input.onSpawn ?? Effect.void).pipe(Effect.as(handle))
@@ -832,36 +820,43 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
       assert.strictEqual(editor.update, null);
     });
 
-    it("updates an exact Droid npm install through its owning manager", () => {
-      const definition = PACKAGE_MANAGED_PROVIDER_UPDATES.droid;
-      assert.ok(definition);
+    it("updates either exact Factory Droid npm identity through its owning manager", () => {
+      const definitions = packageManagedProviderUpdateDefinitions("droid");
+      assert.deepStrictEqual(
+        definitions.map((definition) => definition.npmPackageName),
+        ["droid", "@factory/cli"],
+      );
       const installRoot = "/Users/test/.npm";
       const binaryPath = `${installRoot}/bin/droid`;
-      const canonicalPath = `${installRoot}/lib/node_modules/droid/bin/droid`;
-      const capabilities = resolvePackageManagedProviderMaintenance(definition, {
-        platform: "darwin",
-        binaryPath,
-        realCommandPath: canonicalPath,
-        canonicalInstallRoot: installRoot,
-        managerExecutablePath: "/usr/local/bin/npm",
-        realManagerExecutablePath: "/usr/local/bin/npm",
-        packageChannelEvidence: latestPackageChannel(
-          "0.175.1",
-          `${installRoot}/lib/node_modules/droid/package.json`,
-        ),
-      });
+      for (const definition of definitions) {
+        const packageName = definition.npmPackageName;
+        assert.ok(packageName);
+        const canonicalPath = `${installRoot}/lib/node_modules/${packageName}/bin/droid`;
+        const capabilities = resolvePackageManagedProviderMaintenance(definition, {
+          platform: "darwin",
+          binaryPath,
+          realCommandPath: canonicalPath,
+          canonicalInstallRoot: installRoot,
+          managerExecutablePath: "/usr/local/bin/npm",
+          realManagerExecutablePath: "/usr/local/bin/npm",
+          packageChannelEvidence: latestPackageChannel(
+            "0.175.1",
+            `${installRoot}/lib/node_modules/${packageName}/package.json`,
+          ),
+        });
 
-      assert.strictEqual(capabilities.packageName, "droid");
-      assert.ok(capabilities.update);
-      assert.strictEqual(capabilities.update.executable, "/usr/local/bin/npm");
-      assert.deepStrictEqual(capabilities.update.args, [
-        "install",
-        "-g",
-        "--prefix",
-        installRoot,
-        "droid@latest",
-      ]);
-      assert.strictEqual(capabilities.update.lockKey, "npm-global:/Users/test/.npm");
+        assert.strictEqual(capabilities.packageName, packageName);
+        assert.ok(capabilities.update);
+        assert.strictEqual(capabilities.update.executable, "/usr/local/bin/npm");
+        assert.deepStrictEqual(capabilities.update.args, [
+          "install",
+          "-g",
+          "--prefix",
+          installRoot,
+          `${packageName}@latest`,
+        ]);
+        assert.strictEqual(capabilities.update.lockKey, "npm-global:/Users/test/.npm");
+      }
     });
 
     it("updates npm-managed Kilo through its matching package manager and PATH", () => {
@@ -1264,9 +1259,60 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
             let updaterCompleted = false;
             let healthProbeCount = 0;
             let updateSpawnCount = 0;
+            let updaterExternallySupervised = false;
+            let updaterOutputConsumed = false;
+            let releaseInitialCapture!: () => void;
+            let markInitialCaptureStarted!: () => void;
+            const initialCaptureStarted = new Promise<void>((resolve) => {
+              markInitialCaptureStarted = resolve;
+            });
+            const updaterRoot = {
+              pid: 1,
+              command: "provider-updater-fixture",
+              identity: "1:provider-updater-fixture",
+            };
+            const capturedUpdaterTree = {
+              root: updaterRoot,
+              descendants: [],
+              captureComplete: true,
+            };
+            const initialCapture = new Promise<typeof capturedUpdaterTree>((resolve) => {
+              releaseInitialCapture = () => resolve(capturedUpdaterTree);
+            });
+            let captureCount = 0;
+            const processTreeKiller: ProcessTreeKiller = {
+              capture: () => capturedUpdaterTree,
+              captureAsync: () => {
+                captureCount += 1;
+                if (captureCount === 1) {
+                  markInitialCaptureStarted();
+                  return initialCapture;
+                }
+                return Promise.resolve(capturedUpdaterTree);
+              },
+              inspect: () => ({ verified: true, survivors: [] }),
+              signal: () => {},
+            };
+            const updaterHandle = ChildProcessSpawner.makeHandle({
+              pid: ChildProcessSpawner.ProcessId(updaterRoot.pid),
+              exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(0)),
+              isRunning: Effect.succeed(false),
+              kill: () => Effect.void,
+              stdin: Sink.drain,
+              stdout: Stream.fromEffect(
+                Effect.sync(() => {
+                  updaterOutputConsumed = true;
+                  return encoder.encode("updated\n");
+                }),
+              ),
+              stderr: Stream.empty,
+              all: Stream.empty,
+              getInputFd: () => Sink.drain,
+              getOutputFd: () => Stream.empty,
+            });
             const layer = makeProviderHealthLive({
               providerUpdateTimeoutMs: 10_000,
-              processTreeKiller: syntheticProcessTreeKiller(204),
+              processTreeKiller,
             }).pipe(
               Layer.provideMerge(providerServiceWithoutRuntimesLayer),
               Layer.provideMerge(ServerSettingsService.layerTest(input.settings)),
@@ -1291,8 +1337,9 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
                     })
                   ) {
                     updateSpawnCount += 1;
+                    updaterExternallySupervised = options?.synaraExternallySupervised === true;
                     updaterCompleted = true;
-                    return Effect.succeed(mockHandle({ stdout: "updated\n", stderr: "", code: 0 }));
+                    return Effect.succeed(updaterHandle);
                   }
                   healthProbeCount += 1;
                   return healthProbeCount <= 2
@@ -1310,13 +1357,29 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
 
             const result = yield* Effect.gen(function* () {
               const providerHealth = yield* ProviderHealth;
-              return yield* TestClock.withLive(providerHealth.updateProvider({ provider: "kilo" }));
+              return yield* TestClock.withLive(
+                Effect.gen(function* () {
+                  const update = yield* providerHealth
+                    .updateProvider({ provider: "kilo" })
+                    .pipe(Effect.forkChild);
+                  yield* Effect.promise(() => initialCaptureStarted);
+                  yield* Effect.promise(
+                    () => new Promise<void>((resolve) => setImmediate(resolve)),
+                  );
+                  const outputConsumedBeforeCapture = updaterOutputConsumed;
+                  releaseInitialCapture();
+                  const updateResult = yield* Fiber.join(update);
+                  return { updateResult, outputConsumedBeforeCapture };
+                }),
+              );
             }).pipe(Effect.provide(layer));
-            const kilo = result.providers.find((status) => status.provider === "kilo");
+            const kilo = result.updateResult.providers.find((status) => status.provider === "kilo");
             const persisted = yield* readProviderStatusCache(input.cachePath);
 
             assert.strictEqual(healthProbeCount, 2);
             assert.strictEqual(updateSpawnCount, 1);
+            assert.strictEqual(updaterExternallySupervised, true);
+            assert.strictEqual(result.outputConsumedBeforeCapture, false);
             assert.strictEqual(kilo?.updateState?.status, "succeeded");
             assert.strictEqual(kilo?.version, "7.4.11");
             assert.strictEqual(kilo?.versionAdvisory?.status, "current");
@@ -1324,6 +1387,89 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
             assert.strictEqual(kilo?.versionAdvisory?.latestVersion, "7.4.11");
             assert.strictEqual(persisted?.version, kilo?.version);
             assert.deepStrictEqual(persisted?.versionAdvisory, kilo?.versionAdvisory);
+          }),
+        ),
+      ),
+    );
+
+    it.effect("fails closed when the updater exits before its initial ownership capture", () =>
+      withKiloUpdateFixture("7.4.10", (input) =>
+        withLatestNpmVersion(
+          "7.4.11",
+          Effect.gen(function* () {
+            let updateSpawnCount = 0;
+            let updaterExternallySupervised = false;
+            let fallbackTeardownCalls = 0;
+            let promotedSupervisorTeardownCalls = 0;
+            const processTreeKiller: ProcessTreeKiller = {
+              capture: () => ({ descendants: [], captureComplete: true }),
+              captureAsync: async () => ({ descendants: [], captureComplete: true }),
+              inspect: () => ({ verified: true, survivors: [] }),
+              signal: () => {},
+            };
+            const layer = makeProviderHealthLive({
+              providerUpdateTimeoutMs: 10_000,
+              processTreeKiller,
+              teardownProcessTree: (teardown) => {
+                if (teardown.capturedTree === undefined) {
+                  fallbackTeardownCalls += 1;
+                  assert.strictEqual(
+                    teardown.ownedProcessGroupId,
+                    process.platform === "win32" ? undefined : teardown.rootPid,
+                  );
+                } else {
+                  promotedSupervisorTeardownCalls += 1;
+                }
+                return Promise.resolve({ escalated: false, signalErrors: [] });
+              },
+            }).pipe(
+              Layer.provideMerge(providerServiceWithoutRuntimesLayer),
+              Layer.provideMerge(ServerSettingsService.layerTest(input.settings)),
+              Layer.provideMerge(ServerConfig.layerTest(process.cwd(), input.baseDir)),
+              Layer.provideMerge(
+                effectSpawnerLayer((args, command, env, options) => {
+                  if (
+                    preparedProviderCommandMatches({
+                      fixture: input.fixture,
+                      executable: fixtureExecutablePath(input.fixture, "npm"),
+                      expectedArgs: [
+                        "install",
+                        "-g",
+                        "--prefix",
+                        input.npmPrefix,
+                        "@kilocode/cli@latest",
+                      ],
+                      command,
+                      actualArgs: args,
+                      env,
+                      options,
+                    })
+                  ) {
+                    updateSpawnCount += 1;
+                    updaterExternallySupervised = options?.synaraExternallySupervised === true;
+                    return Effect.succeed(mockHandle({ stdout: "updated\n", stderr: "", code: 0 }));
+                  }
+                  return Effect.succeed(
+                    mockHandle({ stdout: "kilo 7.4.10\n", stderr: "", code: 0 }),
+                  );
+                }),
+              ),
+            );
+
+            const result = yield* Effect.gen(function* () {
+              const providerHealth = yield* ProviderHealth;
+              return yield* TestClock.withLive(providerHealth.updateProvider({ provider: "kilo" }));
+            }).pipe(Effect.provide(layer));
+            const kilo = result.providers.find((status) => status.provider === "kilo");
+
+            assert.strictEqual(updateSpawnCount, 1);
+            assert.strictEqual(updaterExternallySupervised, true);
+            assert.strictEqual(fallbackTeardownCalls, 1);
+            assert.strictEqual(promotedSupervisorTeardownCalls, 0);
+            assert.strictEqual(kilo?.updateState?.status, "failed");
+            assert.match(kilo?.updateState?.message ?? "", /did not prove exit/u);
+            assert.match(kilo?.updateState?.message ?? "", /Restart Synara/u);
+            assert.strictEqual(kilo?.version, "7.4.10");
           }),
         ),
       ),

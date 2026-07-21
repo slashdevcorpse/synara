@@ -515,6 +515,75 @@ describe("official ACP SDK client against the official SDK mock agent", () => {
   });
 });
 
+describe("official ACP SDK fixture stdio shutdown", () => {
+  test("flushes a delayed final response after the client half-closes stdin", async () => {
+    const logPath = createFixtureLog();
+    const child = spawn(process.execPath, [fixturePath], {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        VITEST: "true",
+        SYNARA_ACP_CONFORMANCE_LOG_PATH: logPath,
+      },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
+    child.stdout.on("data", (chunk: Buffer) => stdoutChunks.push(chunk));
+    child.stderr.on("data", (chunk: Buffer) => stderrChunks.push(chunk));
+    const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+      (resolve) => {
+        child.once("exit", (code, signal) => resolve({ code, signal }));
+      },
+    );
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+
+    try {
+      child.stdin.end(
+        `${JSON.stringify({
+          jsonrpc: "2.0",
+          id: "delayed-eof-1",
+          method: "conformance/delayed-eof-response",
+          params: { value: "flush-before-exit" },
+        })}\n`,
+      );
+      const exit = await Promise.race([
+        exited,
+        new Promise<never>((_resolve, reject) => {
+          timeout = setTimeout(
+            () => reject(new Error("Timed out waiting for the ACP conformance fixture to exit")),
+            5_000,
+          );
+        }),
+      ]);
+
+      expect(exit).toEqual({ code: 0, signal: null });
+      expect(readFixtureLog(logPath)).toContainEqual({
+        type: "conformance/delayed-eof-response",
+        payload: { value: "flush-before-exit" },
+      });
+      expect(
+        Buffer.concat(stdoutChunks)
+          .toString("utf8")
+          .split("\n")
+          .filter(Boolean)
+          .map((line) => JSON.parse(line) as Record<string, unknown>),
+      ).toEqual([
+        {
+          jsonrpc: "2.0",
+          id: "delayed-eof-1",
+          result: { echoed: "flush-before-exit", complete: true },
+        },
+      ]);
+      expect(Buffer.concat(stderrChunks).toString("utf8")).toBe("");
+    } finally {
+      if (timeout !== undefined) clearTimeout(timeout);
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      await exited;
+    }
+  });
+});
+
 describe("official ACP SDK byte-stream characterization", () => {
   test("decodes JSON lines split inside UTF-8 code points and across partial lines", async () => {
     const encoder = new TextEncoder();

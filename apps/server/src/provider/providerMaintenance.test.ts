@@ -4,6 +4,7 @@ import {
   type WindowsSafeProcessInput,
 } from "@synara/shared/windowsProcess";
 import { describe, it, assert } from "@effect/vitest";
+import * as NodeFs from "node:fs/promises";
 import * as NodePath from "node:path";
 import { Effect, FileSystem, Fiber } from "effect";
 
@@ -219,6 +220,9 @@ const yieldToConcurrentRequests = Effect.gen(function* () {
   }
 });
 
+const win = it.runIf(process.platform === "win32");
+const posix = it.skipIf(process.platform === "win32");
+
 describe("providerMaintenance", () => {
   it("parses generic CLI versions", () => {
     assert.strictEqual(parseGenericCliVersion("codex-cli 0.130.0\n"), "0.130.0");
@@ -352,6 +356,7 @@ describe("providerMaintenance", () => {
   it("treats omitted or provider-disallowed install sources as manual-only", () => {
     const { allowedInstallSources: _allowedInstallSources, ...manualDefinition } = CODEX_DEFINITION;
     const npmOptions = {
+      platform: "darwin",
       binaryPath: "/Users/test/.npm-global/bin/codex",
       realCommandPath: "/Users/test/.npm-global/lib/node_modules/@openai/codex/bin/codex",
       canonicalInstallRoot: "/Users/test/.npm-global",
@@ -373,6 +378,7 @@ describe("providerMaintenance", () => {
     );
     assert.strictEqual(
       resolvePackageManagedProviderMaintenance(npmOnlyDefinition, {
+        platform: "darwin",
         binaryPath: "/opt/homebrew/bin/codex",
         realCommandPath: "/opt/homebrew/Caskroom/codex/0.130.0/codex",
         canonicalInstallRoot: "/opt/homebrew",
@@ -385,10 +391,12 @@ describe("providerMaintenance", () => {
 
   it("rejects project-local and mismatched npm package paths", () => {
     const projectLocal = resolvePackageManagedProviderMaintenance(CODEX_DEFINITION, {
+      platform: "darwin",
       binaryPath: "codex",
       realCommandPath: "/repo/node_modules/.bin/codex",
     });
     const mismatchedPackage = resolvePackageManagedProviderMaintenance(CODEX_DEFINITION, {
+      platform: "darwin",
       binaryPath: "codex",
       realCommandPath: "/Users/test/.npm-global/lib/node_modules/not-codex/bin/codex",
     });
@@ -399,6 +407,7 @@ describe("providerMaintenance", () => {
 
   it("requires exact resolved package identity for Bun and pnpm globals", () => {
     const bunManaged = resolvePackageManagedProviderMaintenance(CODEX_DEFINITION, {
+      platform: "darwin",
       binaryPath: "/Users/test/.bun/bin/codex",
       realCommandPath: "/Users/test/.bun/install/global/node_modules/@openai/codex/bin/codex.js",
       canonicalInstallRoot: "/Users/test/.bun/install/global",
@@ -410,10 +419,12 @@ describe("providerMaintenance", () => {
       ),
     });
     const unresolvedPnpmLauncher = resolvePackageManagedProviderMaintenance(OPENCODE_DEFINITION, {
+      platform: "darwin",
       binaryPath: "opencode",
       realCommandPath: "/Users/test/.local/share/pnpm/opencode",
     });
     const mismatchedPnpmPackage = resolvePackageManagedProviderMaintenance(OPENCODE_DEFINITION, {
+      platform: "darwin",
       binaryPath: "opencode",
       realCommandPath:
         "/Users/test/.local/share/pnpm/global/5/.pnpm/not-opencode@1.0.0/node_modules/not-opencode/bin/opencode",
@@ -425,7 +436,7 @@ describe("providerMaintenance", () => {
       "/Users/test/.bun/bin/bun i -g @openai/codex@latest",
     );
     assert.strictEqual(bunManaged.update.executable, "/Users/test/.bun/bin/bun");
-    assert.strictEqual(bunManaged.update.lockKey, "bun-global:/users/test/.bun/install/global");
+    assert.strictEqual(bunManaged.update.lockKey, "bun-global:/Users/test/.bun/install/global");
     assert.strictEqual(bunManaged.update.pathPrepend, "/Users/test/.bun/bin");
     assert.strictEqual(unresolvedPnpmLauncher.update, null);
     assert.strictEqual(mismatchedPnpmPackage.update, null);
@@ -433,6 +444,7 @@ describe("providerMaintenance", () => {
 
   it("quotes update command arguments containing spaces", () => {
     const capabilities = resolvePackageManagedProviderMaintenance(CODEX_DEFINITION, {
+      platform: "win32",
       binaryPath: "C:\\Users\\Test User\\AppData\\Roaming\\npm\\codex.cmd",
       realCommandPath:
         "C:\\Users\\Test User\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\bin\\codex.js",
@@ -451,7 +463,7 @@ describe("providerMaintenance", () => {
     );
   });
 
-  it("verifies manifest identity, bin mapping, and linkage for a Windows npm shim", async () => {
+  win("verifies manifest identity, bin mapping, and linkage for a Windows npm shim", async () => {
     const result = await Effect.runPromise(
       Effect.gen(function* () {
         const fileSystem = yield* FileSystem.FileSystem;
@@ -459,6 +471,7 @@ describe("providerMaintenance", () => {
           prefix: "synara-provider-maintenance-npm-shim-",
         });
         const npmPrefix = NodePath.join(tempDirectory, "npm");
+        const windowsEnv = { PATH: npmPrefix, PATHEXT: ".COM;.EXE;.BAT;.CMD" };
         const shimPath = NodePath.join(npmPrefix, "codex.cmd");
         const npmManagerPath = NodePath.join(npmPrefix, "npm.cmd");
         const packageManifestPath = NodePath.join(
@@ -481,7 +494,7 @@ describe("providerMaintenance", () => {
           CODEX_DEFINITION,
           {
             binaryPath: shimPath,
-            env: { PATH: npmPrefix },
+            env: windowsEnv,
             platform: "win32",
           },
         );
@@ -498,7 +511,7 @@ describe("providerMaintenance", () => {
           CODEX_DEFINITION,
           {
             binaryPath: shimPath,
-            env: { PATH: npmPrefix },
+            env: windowsEnv,
             platform: "win32",
           },
         );
@@ -506,7 +519,7 @@ describe("providerMaintenance", () => {
           CODEX_DEFINITION,
           {
             binaryPath: "codex",
-            env: { PATH: npmPrefix },
+            env: windowsEnv,
             platform: "win32",
           },
           { resolveWindowsCommandPath: resolveWindowsCommandFromCandidates([shimPath]) },
@@ -517,7 +530,7 @@ describe("providerMaintenance", () => {
         );
         const customChannelCapabilities = yield* resolveProviderMaintenanceCapabilitiesEffect(
           CODEX_DEFINITION,
-          { binaryPath: shimPath, env: { PATH: npmPrefix }, platform: "win32" },
+          { binaryPath: shimPath, env: windowsEnv, platform: "win32" },
         );
         yield* fileSystem.writeFileString(
           packageManifestPath,
@@ -525,7 +538,7 @@ describe("providerMaintenance", () => {
         );
         const prereleaseCapabilities = yield* resolveProviderMaintenanceCapabilitiesEffect(
           CODEX_DEFINITION,
-          { binaryPath: shimPath, env: { PATH: npmPrefix }, platform: "win32" },
+          { binaryPath: shimPath, env: windowsEnv, platform: "win32" },
         );
         yield* fileSystem.writeFileString(
           packageManifestPath,
@@ -533,7 +546,7 @@ describe("providerMaintenance", () => {
         );
         const unprovenChannelCapabilities = yield* resolveProviderMaintenanceCapabilitiesEffect(
           CODEX_DEFINITION,
-          { binaryPath: shimPath, env: { PATH: npmPrefix }, platform: "win32" },
+          { binaryPath: shimPath, env: windowsEnv, platform: "win32" },
         );
         return {
           customChannelCapabilities,
@@ -559,19 +572,25 @@ describe("providerMaintenance", () => {
       : result.npmPrefix;
     for (const capabilities of [result.explicitCapabilities, result.pathCapabilities]) {
       assert.ok(capabilities.update);
-      const renderedManager = /\s/u.test(result.npmManagerPath)
-        ? `"${result.npmManagerPath}"`
-        : result.npmManagerPath;
+      const renderedManager = /\s/u.test(capabilities.update.executable)
+        ? `"${capabilities.update.executable}"`
+        : capabilities.update.executable;
       assert.strictEqual(
         capabilities.update.command,
         `${renderedManager} install -g --prefix ${renderedPrefix} @openai/codex@latest`,
       );
-      assert.strictEqual(capabilities.update.executable, result.npmManagerPath);
+      assert.strictEqual(
+        NodePath.win32.extname(capabilities.update.executable).toLowerCase(),
+        ".cmd",
+      );
       assert.strictEqual(
         capabilities.update.lockKey,
         `npm-global:${normalizeCommandPath(result.npmPrefix, "win32")}`,
       );
-      assert.strictEqual(capabilities.update.pathPrepend, result.npmPrefix);
+      assert.strictEqual(
+        normalizeCommandPath(capabilities.update.pathPrepend, "win32"),
+        normalizeCommandPath(NodePath.win32.dirname(capabilities.update.executable), "win32"),
+      );
       assert.strictEqual(capabilities.update.target.visibleCommandPath, result.shimPath);
       assert.strictEqual(
         normalizeCommandPath(capabilities.update.target.canonicalCommandPath, "win32"),
@@ -581,7 +600,96 @@ describe("providerMaintenance", () => {
     }
   });
 
-  it("rejects bogus Windows npm manifests and shims", async () => {
+  win(
+    "keeps Windows manager discovery inside the canonical requested directory across alias spellings",
+    async () => {
+      const result = await Effect.runPromise(
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystem.FileSystem;
+          const tempDirectory = yield* fileSystem.makeTempDirectoryScoped({
+            prefix: "synara-provider-maintenance-manager-directory-",
+          });
+          const npmPrefix = NodePath.join(tempDirectory, "npm");
+          const shimPath = NodePath.join(npmPrefix, "codex.cmd");
+          const packageManifestPath = NodePath.join(
+            npmPrefix,
+            "node_modules",
+            "@openai",
+            "codex",
+            "package.json",
+          );
+          const packageBinPath = NodePath.join(
+            NodePath.dirname(packageManifestPath),
+            ...CODEX_PACKAGE_BIN_TARGET.split("/"),
+          );
+          yield* fileSystem.makeDirectory(NodePath.dirname(packageBinPath), { recursive: true });
+          yield* fileSystem.writeFileString(packageManifestPath, codexPackageManifest());
+          yield* fileSystem.writeFileString(packageBinPath, "console.log('codex fixture');\n");
+          yield* fileSystem.writeFileString(
+            shimPath,
+            windowsNpmCmdShim("@openai/codex", CODEX_PACKAGE_BIN_TARGET),
+          );
+
+          const allowedManagerDirectory = NodePath.join(tempDirectory, "allowed-manager");
+          const escapedManagerDirectory = NodePath.join(tempDirectory, "escaped-manager");
+          const escapedManagerPath = NodePath.join(escapedManagerDirectory, "npm.cmd");
+          yield* fileSystem.makeDirectory(allowedManagerDirectory, { recursive: true });
+          yield* fileSystem.makeDirectory(escapedManagerDirectory, { recursive: true });
+          yield* fileSystem.writeFileString(escapedManagerPath, "@echo off\r\n");
+
+          const resolveWithManagerCandidates = (managerPath: string, managerDirectory: string) =>
+            resolveProviderMaintenanceCapabilitiesEffect(
+              CODEX_DEFINITION,
+              {
+                binaryPath: "codex",
+                env: {
+                  PATH: managerDirectory,
+                  PATHEXT: ".CMD;.EXE",
+                },
+                platform: "win32",
+              },
+              {
+                resolveWindowsCommandPath: resolveWindowsCommandFromCandidates([shimPath]),
+                resolveWindowsCommandCandidates: (_command, input = {}) =>
+                  normalizeCommandPath(input.env?.PATH ?? "", "win32") ===
+                  normalizeCommandPath(managerDirectory, "win32")
+                    ? [managerPath]
+                    : [],
+              },
+            );
+
+          const escaped = yield* resolveWithManagerCandidates(
+            escapedManagerPath,
+            allowedManagerDirectory,
+          );
+
+          const longManagerDirectory = NodePath.join(tempDirectory, "Program Files", "nodejs");
+          const aliasManagerDirectory = NodePath.join(tempDirectory, "NODEJS~1");
+          const longManagerPath = NodePath.join(longManagerDirectory, "npm.cmd");
+          yield* fileSystem.makeDirectory(longManagerDirectory, { recursive: true });
+          yield* fileSystem.writeFileString(longManagerPath, "@echo off\r\n");
+          yield* Effect.promise(() =>
+            NodeFs.symlink(longManagerDirectory, aliasManagerDirectory, "junction"),
+          );
+          const aliased = yield* resolveWithManagerCandidates(
+            longManagerPath,
+            aliasManagerDirectory,
+          );
+
+          return { aliased, escaped, longManagerPath };
+        }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+      );
+
+      assert.strictEqual(result.escaped.update, null);
+      assert.ok(result.aliased.update);
+      assert.strictEqual(
+        normalizeCommandPath(result.aliased.update.executable, "win32"),
+        normalizeCommandPath(result.longManagerPath, "win32"),
+      );
+    },
+  );
+
+  win("rejects bogus Windows npm manifests and shims", async () => {
     const result = await Effect.runPromise(
       Effect.gen(function* () {
         const fileSystem = yield* FileSystem.FileSystem;
@@ -667,7 +775,7 @@ describe("providerMaintenance", () => {
     assert.strictEqual(result.extraExecutableBranch.update, null);
   });
 
-  it("recognizes Command Code aliases and follows PATHEXT selection for Droid", async () => {
+  win("recognizes Command Code aliases and follows PATHEXT selection for Droid", async () => {
     const result = await Effect.runPromise(
       Effect.gen(function* () {
         const fileSystem = yield* FileSystem.FileSystem;
@@ -676,8 +784,10 @@ describe("providerMaintenance", () => {
         });
         const npmPrefix = NodePath.join(tempDirectory, "npm");
         const npmManagerPath = NodePath.join(npmPrefix, "npm.cmd");
+        const npmManagerExePath = NodePath.join(npmPrefix, "npm.exe");
         yield* fileSystem.makeDirectory(npmPrefix, { recursive: true });
         yield* fileSystem.writeFileString(npmManagerPath, "@echo off\r\n");
+        yield* fileSystem.writeFileString(npmManagerExePath, "unverified colliding executable\n");
 
         const commandCodeManifestPath = NodePath.join(
           npmPrefix,
@@ -797,13 +907,19 @@ describe("providerMaintenance", () => {
     );
 
     assert.ok(result.commandCode.update);
-    assert.strictEqual(result.commandCode.update.executable, result.npmManagerPath);
+    assert.strictEqual(
+      NodePath.win32.extname(result.commandCode.update.executable).toLowerCase(),
+      ".cmd",
+    );
     assert.strictEqual(
       normalizeCommandPath(result.commandCode.update.target.visibleCommandPath, "win32"),
       normalizeCommandPath(result.commandCodeShimPath, "win32"),
     );
     assert.ok(result.droid.update);
-    assert.strictEqual(result.droid.update.executable, result.npmManagerPath);
+    assert.strictEqual(
+      NodePath.win32.extname(result.droid.update.executable).toLowerCase(),
+      ".cmd",
+    );
     assert.strictEqual(
       normalizeCommandPath(result.droid.update.target.visibleCommandPath, "win32"),
       normalizeCommandPath(result.droidShimPath, "win32"),
@@ -844,6 +960,7 @@ describe("providerMaintenance", () => {
     const canonicalCommandPath =
       "C:\\Users\\Test\\AppData\\Local\\Programs\\OpenAI\\Codex\\releases\\0.130.0\\codex.exe";
     const capabilities = resolvePackageManagedProviderMaintenance(CODEX_DEFINITION, {
+      platform: "win32",
       binaryPath: visibleCommandPath,
       realCommandPath: canonicalCommandPath,
       canonicalInstallRoot: "C:\\Users\\Test\\AppData\\Local\\Programs\\OpenAI\\Codex",
@@ -858,6 +975,7 @@ describe("providerMaintenance", () => {
     const updatedCanonicalCommandPath =
       "C:\\Users\\Test\\AppData\\Local\\Programs\\OpenAI\\Codex\\releases\\0.131.0\\codex.exe";
     const updatedCapabilities = resolvePackageManagedProviderMaintenance(CODEX_DEFINITION, {
+      platform: "win32",
       binaryPath: visibleCommandPath,
       realCommandPath: updatedCanonicalCommandPath,
       canonicalInstallRoot: "C:\\Users\\Test\\AppData\\Local\\Programs\\OpenAI\\Codex",
@@ -878,7 +996,7 @@ describe("providerMaintenance", () => {
     );
   });
 
-  it("does not fall back to a different npm install when native Codex is selected", async () => {
+  win("does not fall back to a different npm install when native Codex is selected", async () => {
     const result = await Effect.runPromise(
       Effect.gen(function* () {
         const fileSystem = yield* FileSystem.FileSystem;
@@ -964,10 +1082,12 @@ describe("providerMaintenance", () => {
 
   it("does not classify an arbitrary Homebrew bin path as package ownership", () => {
     const capabilities = resolvePackageManagedProviderMaintenance(CODEX_DEFINITION, {
+      platform: "darwin",
       binaryPath: "/opt/homebrew/bin/codex",
       realCommandPath: "/opt/homebrew/bin/codex",
     });
     const wrongCask = resolvePackageManagedProviderMaintenance(CODEX_DEFINITION, {
+      platform: "darwin",
       binaryPath: "/opt/homebrew/bin/codex",
       realCommandPath: "/opt/homebrew/Caskroom/not-codex/0.130.0/codex",
     });
@@ -976,7 +1096,7 @@ describe("providerMaintenance", () => {
     assert.strictEqual(wrongCask.update, null);
   });
 
-  it("keeps absent and unverified bare commands manual-only", async () => {
+  posix("keeps absent and unverified bare commands manual-only", async () => {
     const result = await Effect.runPromise(
       Effect.gen(function* () {
         const fileSystem = yield* FileSystem.FileSystem;
@@ -1004,6 +1124,7 @@ describe("providerMaintenance", () => {
   it("allows an always-native updater only for a positively matched native path", () => {
     const binaryPath = "/Users/test/.opencode/bin/opencode";
     const capabilities = resolvePackageManagedProviderMaintenance(OPENCODE_DEFINITION, {
+      platform: "darwin",
       binaryPath,
       realCommandPath: binaryPath,
       canonicalInstallRoot: "/Users/test/.opencode/bin",
@@ -1015,12 +1136,13 @@ describe("providerMaintenance", () => {
     assert.strictEqual(capabilities.update.command, `${binaryPath} upgrade`);
     assert.strictEqual(capabilities.update.executable, binaryPath);
     assert.deepStrictEqual(capabilities.update.args, ["upgrade"]);
-    assert.strictEqual(capabilities.update.lockKey, "opencode-native:/users/test/.opencode/bin");
+    assert.strictEqual(capabilities.update.lockKey, "opencode-native:/Users/test/.opencode/bin");
     assert.strictEqual(capabilities.update.pathPrepend, "/Users/test/.opencode/bin");
   });
 
   it("resolves Homebrew cask update commands", () => {
     const capabilities = resolvePackageManagedProviderMaintenance(CODEX_DEFINITION, {
+      platform: "darwin",
       binaryPath: "/opt/homebrew/bin/codex",
       realCommandPath: "/opt/homebrew/Caskroom/codex/0.130.0/codex",
       canonicalInstallRoot: "/opt/homebrew",
@@ -1038,6 +1160,7 @@ describe("providerMaintenance", () => {
 
   it("uses the owning package manager for a detected pnpm install", () => {
     const capabilities = resolvePackageManagedProviderMaintenance(OPENCODE_DEFINITION, {
+      platform: "darwin",
       binaryPath: "/Users/test/.local/share/pnpm/opencode",
       realCommandPath:
         "/Users/test/.local/share/pnpm/global/5/.pnpm/opencode-ai@1.14.46/node_modules/opencode-ai/bin/opencode",
@@ -1059,13 +1182,14 @@ describe("providerMaintenance", () => {
     assert.deepStrictEqual(capabilities.update.args, ["add", "-g", "opencode-ai@latest"]);
     assert.strictEqual(
       capabilities.update.lockKey,
-      "pnpm-global:/users/test/.local/share/pnpm/global/5",
+      "pnpm-global:/Users/test/.local/share/pnpm/global/5",
     );
     assert.deepStrictEqual(capabilities.latestVersionSource, {
       kind: "npm",
       name: "opencode-ai",
     });
     const updatedCapabilities = resolvePackageManagedProviderMaintenance(OPENCODE_DEFINITION, {
+      platform: "darwin",
       binaryPath: "/Users/test/.local/share/pnpm/opencode",
       realCommandPath:
         "/Users/test/.local/share/pnpm/global/5/.pnpm/opencode-ai@1.14.47/node_modules/opencode-ai/bin/opencode",
@@ -1093,6 +1217,7 @@ describe("providerMaintenance", () => {
 
   it("uses Homebrew updates and same-channel latest metadata for tapped OpenCode installs", () => {
     const capabilities = resolvePackageManagedProviderMaintenance(OPENCODE_DEFINITION, {
+      platform: "darwin",
       binaryPath: "/opt/homebrew/bin/opencode",
       realCommandPath: "/opt/homebrew/Cellar/opencode/1.14.46/bin/opencode",
       canonicalInstallRoot: "/opt/homebrew",

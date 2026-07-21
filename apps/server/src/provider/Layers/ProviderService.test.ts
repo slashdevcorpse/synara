@@ -9,6 +9,8 @@ import path from "node:path";
 
 import type {
   ProviderApprovalDecision,
+  ProviderForkThreadInput,
+  ProviderForkThreadResult,
   ProviderRuntimeEvent,
   ProviderSendTurnInput,
   ProviderSession,
@@ -64,7 +66,11 @@ import {
   SqlitePersistenceMemory,
 } from "../../persistence/Layers/Sqlite.ts";
 import { AnalyticsService } from "../../telemetry/Services/AnalyticsService.ts";
-import { makeProviderMaintenanceGate } from "../providerMaintenanceGate.ts";
+import {
+  makeProviderMaintenanceGate,
+  ProviderMaintenanceBusyError,
+  type ProviderMaintenanceGate,
+} from "../providerMaintenanceGate.ts";
 
 const asRequestId = (value: string): ApprovalRequestId => ApprovalRequestId.makeUnsafe(value);
 const asEventId = (value: string): EventId => EventId.makeUnsafe(value);
@@ -183,6 +189,37 @@ function makeFakeCodexAdapter(
     ): Effect.Effect<void, ProviderAdapterError> => Effect.void,
   );
 
+  const forkThread = vi.fn(
+    (
+      input: ProviderForkThreadInput,
+    ): Effect.Effect<ProviderForkThreadResult, ProviderAdapterError> => {
+      const source = sessions.get(input.sourceThreadId);
+      if (!source) {
+        return Effect.fail(
+          new ProviderAdapterSessionNotFoundError({
+            provider,
+            threadId: input.sourceThreadId,
+          }),
+        );
+      }
+
+      return Effect.sync(() => {
+        const now = new Date().toISOString();
+        const resumeCursor = { opaque: `fork-${String(input.threadId)}` };
+        sessions.set(input.threadId, {
+          ...source,
+          threadId: input.threadId,
+          runtimeMode: input.runtimeMode,
+          resumeCursor,
+          cwd: input.cwd ?? input.sourceCwd ?? source.cwd,
+          createdAt: now,
+          updatedAt: now,
+        });
+        return { threadId: input.threadId, resumeCursor };
+      });
+    },
+  );
+
   const respondToRequest = vi.fn(
     (
       _threadId: ThreadId,
@@ -260,6 +297,7 @@ function makeFakeCodexAdapter(
         : {}),
     },
     startSession,
+    forkThread,
     sendTurn,
     steerTurn,
     startReview,
@@ -305,6 +343,7 @@ function makeFakeCodexAdapter(
     waitForRuntimeSubscribers,
     updateSession,
     startSession,
+    forkThread,
     sendTurn,
     steerTurn,
     startReview,
@@ -1313,6 +1352,112 @@ routing.layer("ProviderServiceLive routing", (it) => {
       assert.equal(claudeSessions.filter((session) => session.threadId === threadId).length, 1);
 
       yield* provider.stopSession({ threadId });
+    }),
+  );
+
+  it.effect("keeps the previous runtime intact until both provider switch admissions succeed", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService;
+      const directory = yield* ProviderSessionDirectory;
+
+      for (const blockedProvider of ["codex", "claudeAgent"] as const) {
+        const threadId = asThreadId(`thread-switch-admission-${blockedProvider}`);
+        yield* provider.startSession(threadId, {
+          provider: "codex",
+          threadId,
+          cwd: "/tmp/provider-switch-admission",
+          runtimeMode: "full-access",
+        });
+        const bindingBefore = Option.getOrUndefined(yield* directory.getBinding(threadId));
+        const codexStopCount = routing.codex.stopSession.mock.calls.length;
+        const claudeStartCount = routing.claude.startSession.mock.calls.length;
+        const maintenanceEntered = yield* Deferred.make<void>();
+        const releaseMaintenance = yield* Deferred.make<void>();
+        const maintenance = yield* routingMaintenanceGate
+          .withExclusiveMaintenance({
+            provider: blockedProvider,
+            run: Deferred.succeed(maintenanceEntered, undefined).pipe(
+              Effect.andThen(Deferred.await(releaseMaintenance)),
+            ),
+          })
+          .pipe(Effect.forkChild);
+        yield* Deferred.await(maintenanceEntered);
+
+        const switched = yield* provider
+          .startSession(threadId, {
+            provider: "claudeAgent",
+            threadId,
+            cwd: "/tmp/provider-switch-admission",
+            runtimeMode: "full-access",
+          })
+          .pipe(Effect.result);
+
+        assert.equal(Result.isFailure(switched), true);
+        if (Result.isFailure(switched)) {
+          assert.ok(switched.failure instanceof ProviderValidationError);
+          assert.ok(switched.failure.cause instanceof ProviderMaintenanceBusyError);
+          assert.equal(switched.failure.cause.provider, blockedProvider);
+        }
+        assert.equal(routing.codex.stopSession.mock.calls.length, codexStopCount);
+        assert.equal(routing.claude.startSession.mock.calls.length, claudeStartCount);
+        assert.deepEqual(
+          Option.getOrUndefined(yield* directory.getBinding(threadId)),
+          bindingBefore,
+        );
+        assert.equal(yield* routing.codex.hasSession(threadId), true);
+        assert.equal(yield* routing.claude.hasSession(threadId), false);
+
+        yield* Deferred.succeed(releaseMaintenance, undefined);
+        yield* Fiber.join(maintenance);
+        yield* provider.stopSession({ threadId });
+      }
+    }),
+  );
+
+  it.effect("surfaces maintenance refusal instead of treating native fork as unavailable", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService;
+      const directory = yield* ProviderSessionDirectory;
+      const sourceThreadId = asThreadId("thread-fork-maintenance-source");
+      const targetThreadId = asThreadId("thread-fork-maintenance-target");
+      yield* provider.startSession(sourceThreadId, {
+        provider: "codex",
+        threadId: sourceThreadId,
+        runtimeMode: "full-access",
+      });
+      const maintenanceEntered = yield* Deferred.make<void>();
+      const releaseMaintenance = yield* Deferred.make<void>();
+      const maintenance = yield* routingMaintenanceGate
+        .withExclusiveMaintenance({
+          provider: "codex",
+          run: Deferred.succeed(maintenanceEntered, undefined).pipe(
+            Effect.andThen(Deferred.await(releaseMaintenance)),
+          ),
+        })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(maintenanceEntered);
+      assert.equal(typeof provider.forkThread, "function");
+      if (!provider.forkThread) assert.fail("Expected native fork support");
+
+      const forked = yield* provider
+        .forkThread({
+          sourceThreadId,
+          threadId: targetThreadId,
+          runtimeMode: "full-access",
+        })
+        .pipe(Effect.result);
+
+      assert.equal(Result.isFailure(forked), true);
+      if (Result.isFailure(forked)) {
+        assert.ok(forked.failure instanceof ProviderValidationError);
+        assert.ok(forked.failure.cause instanceof ProviderMaintenanceBusyError);
+      }
+      assert.equal(Option.isNone(yield* directory.getBinding(targetThreadId)), true);
+      assert.equal(yield* routing.codex.hasSession(targetThreadId), false);
+
+      yield* Deferred.succeed(releaseMaintenance, undefined);
+      yield* Fiber.join(maintenance);
+      yield* provider.stopSession({ threadId: sourceThreadId });
     }),
   );
 
@@ -3099,6 +3244,161 @@ piInteractionRouting.layer("ProviderServiceLive Pi interaction generation", (it)
 });
 
 const idleCleanup = makeProviderServiceLayer({ runtimeIdleStopMs: 100 });
+const idleMaintenanceGate = Effect.runSync(makeProviderMaintenanceGate);
+const maintenanceGatedIdleCleanup = makeProviderServiceLayer({
+  maintenanceGate: idleMaintenanceGate,
+  runtimeIdleStopMs: 50,
+});
+const latchedIdleMaintenanceGateBase = Effect.runSync(makeProviderMaintenanceGate);
+let latchedIdleStopAdmissionAttempts = 0;
+const latchedIdleMaintenanceGate = {
+  ...latchedIdleMaintenanceGateBase,
+  withOperation: (input) =>
+    Effect.sync(() => {
+      if (input.operation === "ProviderService.stopRuntimeSessionIfIdle") {
+        latchedIdleStopAdmissionAttempts += 1;
+      }
+    }).pipe(Effect.andThen(latchedIdleMaintenanceGateBase.withOperation(input))),
+} satisfies ProviderMaintenanceGate;
+const latchedIdleCleanup = makeProviderServiceLayer({
+  maintenanceGate: latchedIdleMaintenanceGate,
+  runtimeIdleStopMs: 50,
+});
+maintenanceGatedIdleCleanup.layer("ProviderServiceLive maintenance-gated idle cleanup", (it) => {
+  it.effect("retries automatic idle cleanup after transient CLI maintenance", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService;
+      const directory = yield* ProviderSessionDirectory;
+      const threadId = asThreadId("thread-idle-maintenance-retry");
+      yield* provider.startSession(threadId, {
+        provider: "codex",
+        threadId,
+        runtimeMode: "full-access",
+      });
+      yield* maintenanceGatedIdleCleanup.codex.waitForRuntimeSubscribers();
+      maintenanceGatedIdleCleanup.codex.stopSession.mockClear();
+
+      const maintenanceEntered = yield* Deferred.make<void>();
+      const releaseMaintenance = yield* Deferred.make<void>();
+      const maintenance = yield* idleMaintenanceGate
+        .withExclusiveMaintenance({
+          provider: "codex",
+          run: Deferred.succeed(maintenanceEntered, undefined).pipe(
+            Effect.andThen(Deferred.await(releaseMaintenance)),
+          ),
+        })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(maintenanceEntered);
+
+      maintenanceGatedIdleCleanup.codex.emit({
+        type: "turn.completed",
+        eventId: asEventId("runtime-idle-maintenance-retry-complete"),
+        provider: "codex",
+        createdAt: "2026-07-21T00:00:00.000Z",
+        threadId,
+        payload: { state: "completed" },
+      });
+      yield* waitUntilEffect(
+        () =>
+          directory.getBinding(threadId).pipe(
+            Effect.map((binding) => {
+              const current = Option.getOrUndefined(binding);
+              return (
+                asRuntimePayloadRecord(current?.runtimePayload).lastRuntimeEvent ===
+                "turn.completed"
+              );
+            }),
+          ),
+        500,
+        10,
+        "maintenance-gated terminal event persistence",
+      );
+      yield* sleep(150);
+      assert.equal(yield* maintenanceGatedIdleCleanup.codex.hasSession(threadId), true);
+      assert.equal(
+        asRuntimePayloadRecord(
+          Option.getOrUndefined(yield* directory.getBinding(threadId))?.runtimePayload,
+        ).lastRuntimeEvent,
+        "turn.completed",
+      );
+
+      yield* Deferred.succeed(releaseMaintenance, undefined);
+      yield* Fiber.join(maintenance);
+      yield* waitUntilEffect(
+        () =>
+          maintenanceGatedIdleCleanup.codex.hasSession(threadId).pipe(Effect.map((live) => !live)),
+        500,
+        10,
+        "automatic idle cleanup retry",
+      );
+      yield* waitUntilEffect(
+        () =>
+          directory
+            .getBinding(threadId)
+            .pipe(Effect.map((binding) => Option.getOrUndefined(binding)?.status === "stopped")),
+        500,
+        10,
+        "automatic idle cleanup retry persistence",
+      );
+    }),
+  );
+});
+latchedIdleCleanup.layer("ProviderServiceLive latched-maintenance idle cleanup", (it) => {
+  it.effect("does not loop automatic idle cleanup after latched CLI maintenance", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService;
+      const directory = yield* ProviderSessionDirectory;
+      const threadId = asThreadId("thread-idle-maintenance-latched");
+      yield* provider.startSession(threadId, {
+        provider: "codex",
+        threadId,
+        runtimeMode: "full-access",
+      });
+      yield* latchedIdleCleanup.codex.waitForRuntimeSubscribers();
+      latchedIdleCleanup.codex.stopSession.mockClear();
+      latchedIdleStopAdmissionAttempts = 0;
+      yield* latchedIdleMaintenanceGate.latchProvider({
+        provider: "codex",
+        reason: "test updater exit remains unproven",
+      });
+
+      latchedIdleCleanup.codex.emit({
+        type: "turn.completed",
+        eventId: asEventId("runtime-idle-maintenance-latched-complete"),
+        provider: "codex",
+        createdAt: "2026-07-21T00:00:00.000Z",
+        threadId,
+        payload: { state: "completed" },
+      });
+      yield* waitUntilEffect(
+        () =>
+          directory
+            .getBinding(threadId)
+            .pipe(
+              Effect.map(
+                (binding) =>
+                  asRuntimePayloadRecord(Option.getOrUndefined(binding)?.runtimePayload)
+                    .lastRuntimeEvent === "turn.completed",
+              ),
+            ),
+        500,
+        10,
+        "latched-maintenance terminal event persistence",
+      );
+      yield* waitUntil(
+        () => latchedIdleStopAdmissionAttempts === 1,
+        500,
+        10,
+        "latched idle cleanup admission",
+      );
+      yield* sleep(175);
+
+      assert.equal(latchedIdleStopAdmissionAttempts, 1);
+      assert.equal(latchedIdleCleanup.codex.stopSession.mock.calls.length, 0);
+      assert.equal(yield* latchedIdleCleanup.codex.hasSession(threadId), true);
+    }),
+  );
+});
 idleCleanup.layer("ProviderServiceLive idle cleanup", (it) => {
   it.effect("does not schedule idle cleanup for a stale terminal event", () =>
     Effect.gen(function* () {

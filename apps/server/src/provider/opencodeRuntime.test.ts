@@ -268,7 +268,7 @@ describe("OpenCodeRuntime startup diagnostics", () => {
         }),
       ).pipe(
         Effect.provide(
-          makeOpenCodeRuntimeLive({
+          makeTestOpenCodeRuntimeLive({
             teardownProcessTree: async () => ({ escalated: false, signalErrors: [] }),
           }).pipe(
             Layer.provide(
@@ -285,6 +285,44 @@ describe("OpenCodeRuntime startup diagnostics", () => {
     );
 
     expect(result.url).toBe("http://127.0.0.1:59000");
+  });
+
+  it("marks the child as externally supervised before transferring process ownership", async () => {
+    let externallySupervised: boolean | undefined;
+    const spawnerLayer = Layer.succeed(
+      ChildProcessSpawner.ChildProcessSpawner,
+      ChildProcessSpawner.make((command) => {
+        const options = (
+          command as unknown as {
+            readonly options?: { readonly synaraExternallySupervised?: boolean };
+          }
+        ).options;
+        externallySupervised = options?.synaraExternallySupervised;
+        return Effect.succeed(
+          mockOpenCodeServerHandle({
+            stdout: "opencode server listening on http://127.0.0.1:59000\n",
+            stderr: "",
+          }),
+        );
+      }),
+    );
+
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const runtime = yield* OpenCodeRuntime;
+          yield* runtime.startOpenCodeServerProcess({ binaryPath: "opencode" });
+        }),
+      ).pipe(
+        Effect.provide(
+          makeTestOpenCodeRuntimeLive({
+            teardownProcessTree: async () => ({ escalated: false, signalErrors: [] }),
+          }).pipe(Layer.provide(spawnerLayer)),
+        ),
+      ),
+    );
+
+    expect(externallySupervised).toBe(true);
   });
 
   it("includes command and partial process output when server startup times out", async () => {
@@ -487,10 +525,21 @@ describe("OpenCodeRuntime local server pool", () => {
       captureComplete: false,
     });
     let teardownCalls = 0;
+    let fallbackTeardownCalls = 0;
+    let promotedSupervisorTeardownCalls = 0;
     const layer = makeTestOpenCodeRuntimeLive({
       processTreeKiller,
-      teardownProcessTree: async ({ rootPid }) => {
+      teardownProcessTree: async (teardown) => {
         teardownCalls += 1;
+        if (teardown.capturedTree === undefined) {
+          fallbackTeardownCalls += 1;
+          expect(teardown.ownedProcessGroupId).toBe(
+            process.platform === "win32" ? undefined : teardown.rootPid,
+          );
+        } else {
+          promotedSupervisorTeardownCalls += 1;
+        }
+        const { rootPid } = teardown;
         const url = processUrls.get(rootPid);
         if (url === undefined) {
           throw new Error(`Missing test URL for process ${rootPid}.`);
@@ -520,6 +569,9 @@ describe("OpenCodeRuntime local server pool", () => {
             expect(state.spawnUrls).toEqual(["http://127.0.0.1:59000"]);
             expect(state.killUrls).toEqual([]);
             expect(teardownCalls).toBe(1);
+            expect(fallbackTeardownCalls).toBe(1);
+            expect(promotedSupervisorTeardownCalls).toBe(0);
+            expect(captureCalls).toBe(1);
 
             const refusedScope = yield* Scope.make();
             const refused = yield* runtime
@@ -531,6 +583,8 @@ describe("OpenCodeRuntime local server pool", () => {
 
             yield* closeLocalServerPoolsForCliSpec(runtime, OPENCODE_CLI_SPEC);
             expect(teardownCalls).toBe(2);
+            expect(fallbackTeardownCalls).toBe(2);
+            expect(promotedSupervisorTeardownCalls).toBe(0);
             expect(state.killUrls).toEqual(["http://127.0.0.1:59000"]);
 
             const freshScope = yield* Scope.make();
@@ -540,6 +594,8 @@ describe("OpenCodeRuntime local server pool", () => {
             expect(fresh.url).toBe("http://127.0.0.1:59001");
             yield* Scope.close(freshScope, Exit.void);
             yield* closeLocalServerPoolsForCliSpec(runtime, OPENCODE_CLI_SPEC);
+            expect(fallbackTeardownCalls).toBe(2);
+            expect(promotedSupervisorTeardownCalls).toBe(1);
             expect(state.killUrls).toEqual(["http://127.0.0.1:59000", "http://127.0.0.1:59001"]);
           }),
         ).pipe(Effect.provide(layer)),

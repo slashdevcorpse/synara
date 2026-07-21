@@ -10,11 +10,11 @@ index ff15212..b3655b0 100644
 +            shell: cmd.options.shell,
 +            windowsVerbatimArguments: cmd.options.windowsVerbatimArguments
            }), Effect.fnUntraced(function* ([childProcess, exitSignal]) {
-             const exited = yield* Deferred.isDone(exitSignal);
-             const killWithTimeout = withTimeout(childProcess, cmd, cmd.options);
 +            if (cmd.options.synaraExternallySupervised === true) {
 +              return yield* Effect.void;
 +            }
+             const exited = yield* Deferred.isDone(exitSignal);
+             const killWithTimeout = withTimeout(childProcess, cmd, cmd.options);
              if (exited) {
                // Process already exited, check if children need cleanup
                const [code] = yield* Deferred.await(exitSignal);
@@ -59,8 +59,6 @@ index dc53baf..8aba0ea 100644
 +            ).windowsVerbatimArguments
            }),
            Effect.fnUntraced(function*([childProcess, exitSignal]) {
-             const exited = yield* Deferred.isDone(exitSignal)
-             const killWithTimeout = withTimeout(childProcess, cmd, cmd.options)
 +            if (
 +              (
 +                cmd.options as ChildProcess.CommandOptions & {
@@ -70,6 +68,8 @@ index dc53baf..8aba0ea 100644
 +            ) {
 +              return yield* Effect.void
 +            }
+             const exited = yield* Deferred.isDone(exitSignal)
+             const killWithTimeout = withTimeout(childProcess, cmd, cmd.options)
              if (exited) {
                // Process already exited, check if children need cleanup
                const [code] = yield* Deferred.await(exitSignal)

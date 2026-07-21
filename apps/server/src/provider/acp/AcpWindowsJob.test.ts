@@ -1,4 +1,5 @@
-import { mkdtemp, rm, unlink, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdtemp, readFile, rm, truncate, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as Path from "node:path";
 
@@ -11,6 +12,8 @@ import {
 
 import { buildAcpWindowsJobLaunch, ensureAcpWindowsJobExecutable } from "./AcpWindowsJob.ts";
 import { headerOnlyPortableExecutableFixture } from "./AcpWindowsJobTestSupport.ts";
+
+const ACP_WINDOWS_JOB_EXECUTABLE_MAX_BYTES = 8 * 1024 * 1024;
 
 function validPortableExecutableFixture(): Buffer {
   const image = Buffer.alloc(0x400);
@@ -213,6 +216,79 @@ describe("buildAcpWindowsJobLaunch", () => {
       await unlink(executablePath);
       expect(await prepare()).toBe(executablePath);
       expect(compileCalls).toBe(2);
+    } finally {
+      if (executablePath !== undefined) await rm(executablePath, { force: true });
+      await rm(fixtureDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("recompiles when a valid cached executable is replaced with different bytes", async () => {
+    const fixtureDirectory = await mkdtemp(Path.join(tmpdir(), "synara-acp-job-attestation-"));
+    const compilerPath = Path.join(fixtureDirectory, "acp-windows-job.ps1");
+    const nativeSourcePath = Path.join(fixtureDirectory, "acp-windows-job-native.cs");
+    const compilerSource = Buffer.from(`compiler fixture ${fixtureDirectory}`, "utf8");
+    const nativeSource = Buffer.from(`native fixture ${fixtureDirectory}`, "utf8");
+    await writeFile(compilerPath, compilerSource);
+    await writeFile(nativeSourcePath, nativeSource);
+    const expectedExecutable = validPortableExecutableFixture();
+    let compileCalls = 0;
+    let executablePath: string | undefined;
+
+    try {
+      const prepare = () =>
+        ensureAcpWindowsJobExecutable({
+          env: { SystemRoot: "C:\\Windows" },
+          assets: { compilerPath, nativeSourcePath },
+          compile: async ({ compilerHash, outputPath, sourceHash }) => {
+            compileCalls += 1;
+            expect(compilerHash).toBe(createHash("sha256").update(compilerSource).digest("hex"));
+            expect(sourceHash).toBe(createHash("sha256").update(nativeSource).digest("hex"));
+            await writeFile(outputPath, expectedExecutable);
+          },
+        });
+
+      executablePath = await prepare();
+      const unrelatedExecutable = Buffer.from(expectedExecutable);
+      unrelatedExecutable[0x201] = 0x90;
+      await writeFile(executablePath, unrelatedExecutable);
+
+      expect(await prepare()).toBe(executablePath);
+      expect(compileCalls).toBe(2);
+      expect(await readFile(executablePath)).toEqual(expectedExecutable);
+    } finally {
+      if (executablePath !== undefined) await rm(executablePath, { force: true });
+      await rm(fixtureDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects an oversized cached executable without reading it into memory", async () => {
+    const fixtureDirectory = await mkdtemp(Path.join(tmpdir(), "synara-acp-job-bounded-"));
+    const compilerPath = Path.join(fixtureDirectory, "acp-windows-job.ps1");
+    const nativeSourcePath = Path.join(fixtureDirectory, "acp-windows-job-native.cs");
+    await writeFile(compilerPath, `compiler fixture ${fixtureDirectory}`);
+    await writeFile(nativeSourcePath, `native fixture ${fixtureDirectory}`);
+    let compileCalls = 0;
+    let executablePath: string | undefined;
+
+    try {
+      const prepare = () =>
+        ensureAcpWindowsJobExecutable({
+          env: { SystemRoot: "C:\\Windows" },
+          assets: { compilerPath, nativeSourcePath },
+          compile: async ({ outputPath }) => {
+            compileCalls += 1;
+            await writeFile(outputPath, validPortableExecutableFixture());
+          },
+        });
+
+      executablePath = await prepare();
+      await truncate(executablePath, ACP_WINDOWS_JOB_EXECUTABLE_MAX_BYTES + 1);
+
+      expect(await prepare()).toBe(executablePath);
+      expect(compileCalls).toBe(2);
+      expect((await readFile(executablePath)).byteLength).toBeLessThanOrEqual(
+        ACP_WINDOWS_JOB_EXECUTABLE_MAX_BYTES,
+      );
     } finally {
       if (executablePath !== undefined) await rm(executablePath, { force: true });
       await rm(fixtureDirectory, { recursive: true, force: true });

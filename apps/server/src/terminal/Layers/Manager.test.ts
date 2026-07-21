@@ -18,7 +18,7 @@ import {
   type PtySpawnInput,
 } from "../Services/PTY";
 import { TerminalManagerRuntime, type TerminalSubprocessActivity } from "./Manager";
-import type { ProcessTreeKiller } from "../processTreeKiller";
+import type { ProcessTreeKiller, TerminalKillSignal } from "../processTreeKiller";
 import type {
   WindowsProcessSnapshotCollector,
   WindowsProcessSnapshotResult,
@@ -1712,6 +1712,135 @@ describe("TerminalManager", () => {
     manager.dispose();
   });
 
+  it("captures and signals terminal ownership asynchronously without blocking the event loop", async () => {
+    let releaseCapture: (() => void) | undefined;
+    const captureGate = new Promise<void>((resolve) => {
+      releaseCapture = resolve;
+    });
+    let synchronousCalls = 0;
+    let captureOptions: { readonly processGroupId?: number } | undefined;
+    const signals: TerminalKillSignal[] = [];
+    const processTreeKiller: ProcessTreeKiller = {
+      capture: () => {
+        synchronousCalls += 1;
+        throw new Error("synchronous capture must not run");
+      },
+      captureAsync: async (rootPid, options) => {
+        captureOptions = options;
+        await captureGate;
+        return {
+          root: {
+            pid: rootPid,
+            command: "terminal root",
+            identity: `${rootPid}:root-start`,
+          },
+          descendants: [],
+          captureComplete: true,
+        };
+      },
+      signal: () => {
+        synchronousCalls += 1;
+        throw new Error("synchronous signal must not run");
+      },
+      signalAsync: async ({ signal }) => {
+        signals.push(signal);
+      },
+    };
+    const { manager, ptyAdapter } = makeManager(5, {
+      processKillGraceMs: 100,
+      processTreeKiller,
+      subprocessPlatform: "win32",
+    });
+    await manager.open(openInput());
+    const process = ptyAdapter.processes[0];
+    expect(process).toBeDefined();
+    if (!process) return;
+
+    await manager.close({ threadId: "thread-1" });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(synchronousCalls).toBe(0);
+    expect(signals).toEqual([]);
+
+    releaseCapture?.();
+    await waitFor(() => signals.includes("SIGTERM"));
+    expect(synchronousCalls).toBe(0);
+    expect(captureOptions).toBeUndefined();
+    process.emitExit({ exitCode: 0, signal: 15 });
+    manager.dispose();
+  });
+
+  it("retains POSIX group descendants when the root exits during asynchronous capture", async () => {
+    let releaseCapture: (() => void) | undefined;
+    const captureGate = new Promise<void>((resolve) => {
+      releaseCapture = resolve;
+    });
+    let markCaptureStarted: (() => void) | undefined;
+    const captureStarted = new Promise<void>((resolve) => {
+      markCaptureStarted = resolve;
+    });
+    let captureOptions: { readonly processGroupId?: number } | undefined;
+    const treeSignals: Array<{
+      readonly signal: TerminalKillSignal;
+      readonly descendantPids: ReadonlyArray<number>;
+      readonly includeRootTree: boolean | undefined;
+    }> = [];
+    const processTreeKiller: ProcessTreeKiller = {
+      capture: () => {
+        throw new Error("synchronous capture must not run");
+      },
+      captureAsync: async (_rootPid, options) => {
+        captureOptions = options;
+        markCaptureStarted?.();
+        await captureGate;
+        return {
+          descendants: [
+            {
+              pid: 4_242,
+              command: "provider cli worker",
+              identity: "4242:worker-start",
+              groupId: options?.processGroupId,
+            },
+          ],
+          captureComplete: true,
+        };
+      },
+      signal: () => {
+        throw new Error("synchronous signal must not run");
+      },
+      signalAsync: async ({ signal, tree, includeRootTree }) => {
+        treeSignals.push({
+          signal,
+          descendantPids: tree.descendants.map((descendant) => descendant.pid),
+          includeRootTree,
+        });
+      },
+    };
+    const { manager, ptyAdapter } = makeManager(5, {
+      processKillGraceMs: 10,
+      processTreeKiller,
+      subprocessPlatform: "linux",
+    });
+    await manager.open(openInput());
+    const process = ptyAdapter.processes[0];
+    expect(process).toBeDefined();
+    if (!process) return;
+
+    await manager.close({ threadId: "thread-1" });
+    await captureStarted;
+    process.emitExit({ exitCode: 0, signal: 15 });
+    releaseCapture?.();
+    await waitFor(() => treeSignals.some((entry) => entry.signal === "SIGKILL"));
+
+    expect(captureOptions).toEqual({ processGroupId: process.pid });
+    expect(treeSignals).toContainEqual({
+      signal: "SIGKILL",
+      descendantPids: [4_242],
+      includeRootTree: false,
+    });
+    expect(process.killSignals).toEqual([]);
+    manager.dispose();
+  });
+
   it("cancels SIGKILL escalation when the process exits after SIGTERM", async () => {
     const { manager, ptyAdapter } = makeManager(5, { processKillGraceMs: 30 });
     await manager.open(openInput());
@@ -1784,6 +1913,59 @@ describe("TerminalManager", () => {
 
     expect(process.killSignals[0]).toBe("SIGTERM");
     expect(process.killSignals).toContain("SIGKILL");
+  });
+
+  it("shutdown disposal awaits asynchronous force-kill validation", async () => {
+    let releaseForceKill: (() => void) | undefined;
+    const forceKillGate = new Promise<void>((resolve) => {
+      releaseForceKill = resolve;
+    });
+    let markForceKillStarted: (() => void) | undefined;
+    const forceKillStarted = new Promise<void>((resolve) => {
+      markForceKillStarted = resolve;
+    });
+    const signals: TerminalKillSignal[] = [];
+    const processTreeKiller: ProcessTreeKiller = {
+      capture: () => {
+        throw new Error("synchronous capture must not run");
+      },
+      captureAsync: async (rootPid) => ({
+        root: {
+          pid: rootPid,
+          command: "terminal root",
+          identity: `${rootPid}:root-start`,
+        },
+        descendants: [],
+        captureComplete: true,
+      }),
+      signal: () => {
+        throw new Error("synchronous signal must not run");
+      },
+      signalAsync: async ({ signal }) => {
+        signals.push(signal);
+        if (signal === "SIGKILL") {
+          markForceKillStarted?.();
+          await forceKillGate;
+        }
+      },
+    };
+    const { manager } = makeManager(5, {
+      processKillGraceMs: 5,
+      processTreeKiller,
+    });
+    await manager.open(openInput());
+
+    let shutdownSettled = false;
+    const shutdown = manager.disposeForShutdown().then(() => {
+      shutdownSettled = true;
+    });
+    await forceKillStarted;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(shutdownSettled).toBe(false);
+
+    releaseForceKill?.();
+    await shutdown;
+    expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
   });
 
   it("evicts oldest inactive terminal sessions when retention limit is exceeded", async () => {

@@ -958,21 +958,26 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
 
         const supervised = yield* Effect.uninterruptible(
           Effect.gen(function* () {
+            const childCommandOptions: ChildProcess.CommandOptions & {
+              readonly synaraExternallySupervised: true;
+            } = {
+              env: buildOpenCodeServerProcessEnv({
+                cliSpec,
+                ...(input.experimentalWebSockets !== undefined
+                  ? { experimentalWebSockets: input.experimentalWebSockets }
+                  : {}),
+              }),
+              ...(input.cwd ? { cwd: input.cwd } : {}),
+              detached: platform !== "win32",
+              killSignal: "SIGKILL",
+              forceKillAfter: "1500 millis",
+              // Synara registers the exact-tree fallback below in this same uninterruptible
+              // acquisition. Disable Effect's PID/process-group scope finalizer so it cannot run a
+              // second, identity-unaware teardown after the exact owner succeeds or fails closed.
+              synaraExternallySupervised: true,
+            };
             const child = yield* spawner
-              .spawn(
-                ChildProcess.make(input.binaryPath, args, {
-                  env: buildOpenCodeServerProcessEnv({
-                    cliSpec,
-                    ...(input.experimentalWebSockets !== undefined
-                      ? { experimentalWebSockets: input.experimentalWebSockets }
-                      : {}),
-                  }),
-                  ...(input.cwd ? { cwd: input.cwd } : {}),
-                  detached: platform !== "win32",
-                  killSignal: "SIGKILL",
-                  forceKillAfter: "1500 millis",
-                }),
-              )
+              .spawn(ChildProcess.make(input.binaryPath, args, childCommandOptions))
               .pipe(
                 Effect.provideService(Scope.Scope, runtimeScope),
                 Effect.mapError(
@@ -999,6 +1004,11 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
                         ? teardownEffectProcessTree(
                             child,
                             options?.teardownProcessTree ?? teardownProviderProcessTree,
+                            {
+                              ...(platform === "win32"
+                                ? {}
+                                : { ownedProcessGroupId: Number(child.pid) }),
+                            },
                           )
                         : processSupervisor.teardown(),
                     catch: (cause) =>
@@ -1039,9 +1049,6 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
                   }),
               }),
             );
-            if (Exit.isSuccess(supervisorExit)) {
-              processSupervisor = supervisorExit.value;
-            }
             const owner = {
               exitCode: child.exitCode.pipe(
                 Effect.map(Number),
@@ -1055,6 +1062,21 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
             if (Exit.isFailure(supervisorExit)) {
               return yield* Effect.failCause(supervisorExit.cause);
             }
+            const initialCaptureExit = yield* Effect.exit(
+              Effect.tryPromise({
+                try: () => supervisorExit.value.waitForInitialCapture(),
+                catch: (cause) =>
+                  new OpenCodeRuntimeError({
+                    operation: "startOpenCodeServerProcess",
+                    detail: `Failed to install ${cliSpec.displayName} server process-tree supervision: ${openCodeRuntimeErrorDetail(cause)}`,
+                    cause,
+                  }),
+              }),
+            );
+            if (Exit.isFailure(initialCaptureExit)) {
+              return yield* Effect.failCause(initialCaptureExit.cause);
+            }
+            processSupervisor = supervisorExit.value;
             return { child, owner };
           }),
         );
@@ -1227,7 +1249,7 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
         const cause = Cause.squash(closeExit.cause);
         const error = new OpenCodeRuntimeError({
           operation: "closeLocalServerPoolsForCliSpec",
-          detail: `Failed to prove local server process-tree exit: ${openCodeRuntimeErrorDetail(cause)}`,
+          detail: `Failed to close local server scope after proving process-tree exit: ${openCodeRuntimeErrorDetail(cause)}`,
           cause,
         });
         pooledServer.closeFailure = error;

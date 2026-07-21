@@ -60,6 +60,50 @@ describe("teardownProviderProcessTree", () => {
     ).resolves.toEqual({ escalated: false, signalErrors: [] });
   });
 
+  it("retains a detached POSIX group when the root exits before fallback capture", async () => {
+    const groupDescendant: CapturedProcess = {
+      pid: 94,
+      command: "provider-worker",
+      identity: "94:worker-start",
+      groupId: 93,
+    };
+    let descendantRunning = true;
+    let captureOptions: { readonly processGroupId?: number } | undefined;
+    const signalledTrees: CapturedProcessTree[] = [];
+    const processTreeKiller: ProcessTreeKiller = {
+      capture: () => ({ descendants: [], captureComplete: true }),
+      captureAsync: async (_rootPid, options) => {
+        captureOptions = options;
+        return options?.processGroupId === 93
+          ? { descendants: [groupDescendant], captureComplete: true }
+          : { descendants: [], captureComplete: true };
+      },
+      inspect: (tree) => ({
+        verified: true,
+        survivors: descendantRunning ? tree.descendants : [],
+      }),
+      signal: ({ tree }) => {
+        signalledTrees.push(tree);
+        descendantRunning = false;
+      },
+    };
+    const clock = deterministicClock();
+
+    await expect(
+      teardownEffectProcessTree(
+        {
+          pid: 93,
+          exitCode: Effect.succeed(0),
+          isRunning: Effect.succeed(false),
+        },
+        (input) => teardownProviderProcessTree(input, { processTreeKiller, ...clock }),
+        { ownedProcessGroupId: 93 },
+      ),
+    ).resolves.toEqual({ escalated: false, signalErrors: [] });
+    expect(captureOptions).toEqual({ processGroupId: 93 });
+    expect(signalledTrees).toEqual([{ descendants: [groupDescendant], captureComplete: true }]);
+  });
+
   it("escalates ignored TERM and returns only after root and descendants prove exit", async () => {
     const tree: CapturedProcessTree = {
       descendants: [{ pid: 102, command: "provider-worker" }],
@@ -238,6 +282,91 @@ describe("teardownProviderProcessTree", () => {
       remainingDescendantPids: [302],
     });
   });
+
+  it("does not signal an already-exited root through a deeply wrapped exit promise", async () => {
+    const signals: Array<{ signal: TerminalKillSignal; includeRootTree: boolean | undefined }> = [];
+    let wrappedExit: Promise<void> = Promise.resolve();
+    for (let depth = 0; depth < 25; depth += 1) {
+      wrappedExit = wrappedExit.then(() => undefined);
+    }
+
+    await expect(
+      teardownProviderProcessTree(
+        {
+          rootPid: 351,
+          rootExited: wrappedExit,
+          capturedTree: {
+            root: {
+              pid: 351,
+              command: "provider wrapper",
+              identity: "351:root-start",
+            },
+            descendants: [],
+            captureComplete: true,
+          },
+          termGraceMs: 5,
+          forceExitMs: 5,
+        },
+        {
+          processTreeKiller: {
+            capture: () => {
+              throw new Error("pre-captured teardown must not recapture synchronously");
+            },
+            inspect: () => ({ verified: true, survivors: [] }),
+            signal: ({ signal, includeRootTree }) => {
+              signals.push({ signal, includeRootTree });
+            },
+          },
+          ...deterministicClock(),
+        },
+      ),
+    ).resolves.toEqual({ escalated: false, signalErrors: [] });
+    expect(signals).toEqual([{ signal: "SIGTERM", includeRootTree: false }]);
+  });
+
+  it("uses asynchronous capture and signaling without invoking synchronous process-table paths", async () => {
+    let resolveRootExit: (() => void) | undefined;
+    const rootExited = new Promise<void>((resolve) => {
+      resolveRootExit = resolve;
+    });
+    const signals: TerminalKillSignal[] = [];
+    let synchronousCalls = 0;
+
+    await expect(
+      teardownProviderProcessTree(
+        { rootPid: 401, rootExited, termGraceMs: 5, forceExitMs: 5 },
+        {
+          processTreeKiller: {
+            capture: () => {
+              synchronousCalls += 1;
+              throw new Error("synchronous capture must not run");
+            },
+            captureAsync: async () => ({
+              root: {
+                pid: 401,
+                command: "provider root",
+                identity: "401:root-start",
+              },
+              descendants: [],
+              captureComplete: true,
+            }),
+            inspect: () => ({ verified: true, survivors: [] }),
+            signal: () => {
+              synchronousCalls += 1;
+              throw new Error("synchronous signal must not run");
+            },
+            signalAsync: async ({ signal }) => {
+              signals.push(signal);
+              resolveRootExit?.();
+            },
+          },
+          ...deterministicClock(),
+        },
+      ),
+    ).resolves.toEqual({ escalated: false, signalErrors: [] });
+    expect(synchronousCalls).toBe(0);
+    expect(signals).toEqual(["SIGTERM"]);
+  });
 });
 
 describe("superviseEffectProcessTree", () => {
@@ -275,6 +404,11 @@ describe("superviseEffectProcessTree", () => {
         descendants: childAlive ? [child] : [],
         captureComplete: true,
       }),
+      captureAsync: async () => ({
+        ...(rootAlive ? { root } : {}),
+        descendants: childAlive ? [child] : [],
+        captureComplete: true,
+      }),
       inspect: (tree) => ({
         verified: true,
         survivors: childAlive ? tree.descendants.filter(({ pid }) => pid === child.pid) : [],
@@ -288,6 +422,7 @@ describe("superviseEffectProcessTree", () => {
       proofTimeoutMs: 5,
     });
 
+    await supervisor.waitForInitialCapture();
     rootAlive = false;
     owned.exit();
     const failure = await supervisor.proveExit().catch((error: unknown) => error);
@@ -330,19 +465,107 @@ describe("superviseEffectProcessTree", () => {
       sleep: () => startupCaptureDelay,
     });
 
+    await supervisor.waitForInitialCapture();
+    expect(asynchronousCaptures).toBe(1);
     releaseStartupCapture?.();
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
-    expect(asynchronousCaptures).toBe(1);
+    expect(asynchronousCaptures).toBe(2);
 
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
-    expect(asynchronousCaptures).toBe(1);
+    expect(asynchronousCaptures).toBe(2);
     owned.exit();
     await expect(supervisor.proveExit()).resolves.toEqual({
       escalated: false,
       signalErrors: [],
     });
-    expect(asynchronousCaptures).toBe(2);
+    expect(asynchronousCaptures).toBe(3);
+  });
+
+  it("starts ownership capture asynchronously and makes teardown await its completion", async () => {
+    const owned = controllableEffectProcess(575);
+    const root: CapturedProcess = {
+      pid: 575,
+      command: "provider session",
+      identity: "575:root-start",
+    };
+    let releaseCapture: (() => void) | undefined;
+    const captureGate = new Promise<void>((resolve) => {
+      releaseCapture = resolve;
+    });
+    let synchronousCaptures = 0;
+    let teardownCalls = 0;
+    const supervisor = superviseEffectProcessTree(owned.process, {
+      processTreeKiller: {
+        capture: () => {
+          synchronousCaptures += 1;
+          throw new Error("synchronous capture must not run");
+        },
+        captureAsync: async () => {
+          await captureGate;
+          return { root, descendants: [], captureComplete: true };
+        },
+        inspect: () => ({ verified: true, survivors: [] }),
+        signal: () => undefined,
+      },
+      teardownProcessTree: async () => {
+        teardownCalls += 1;
+        return { escalated: false, signalErrors: [] };
+      },
+      platform: "win32",
+      capturePollMs: 60_000,
+    });
+
+    const teardown = supervisor.teardown();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(synchronousCaptures).toBe(0);
+    expect(teardownCalls).toBe(0);
+
+    releaseCapture?.();
+    await expect(teardown).resolves.toEqual({ escalated: false, signalErrors: [] });
+    expect(teardownCalls).toBe(1);
+  });
+
+  it("retains incomplete ownership after an initial asynchronous capture failure", async () => {
+    const owned = controllableEffectProcess(576);
+    const initialFailure = new Error("initial snapshot failed");
+    let captureCalls = 0;
+    let teardownTree: CapturedProcessTree | undefined;
+    const supervisor = superviseEffectProcessTree(owned.process, {
+      processTreeKiller: {
+        capture: () => {
+          throw new Error("synchronous capture must not run");
+        },
+        captureAsync: async () => {
+          captureCalls += 1;
+          if (captureCalls === 1) throw initialFailure;
+          return {
+            root: {
+              pid: 576,
+              command: "provider session",
+              identity: "576:root-start",
+            },
+            descendants: [],
+            captureComplete: true,
+          };
+        },
+        inspect: () => ({ verified: true, survivors: [] }),
+        signal: () => undefined,
+      },
+      teardownProcessTree: async (input) => {
+        teardownTree = input.capturedTree;
+        return { escalated: false, signalErrors: [] };
+      },
+      platform: "win32",
+      capturePollMs: 60_000,
+    });
+
+    await expect(supervisor.waitForInitialCapture()).rejects.toBe(initialFailure);
+    await expect(supervisor.teardown()).resolves.toEqual({
+      escalated: false,
+      signalErrors: [],
+    });
+    expect(teardownTree).toMatchObject({ captureComplete: false });
   });
 
   it("uses the injected process-tree killer for default teardown signalling", async () => {
@@ -393,6 +616,11 @@ describe("superviseEffectProcessTree", () => {
         descendants: childAlive ? [child] : [],
         captureComplete: true,
       }),
+      captureAsync: async () => ({
+        ...(rootAlive ? { root } : {}),
+        descendants: childAlive ? [child] : [],
+        captureComplete: true,
+      }),
       inspect: (tree) => ({
         verified: true,
         survivors: childAlive ? tree.descendants.filter(({ pid }) => pid === child.pid) : [],
@@ -406,6 +634,7 @@ describe("superviseEffectProcessTree", () => {
       proofTimeoutMs: 5,
     });
 
+    await supervisor.waitForInitialCapture();
     rootAlive = false;
     childAlive = false;
     owned.exit();
@@ -432,6 +661,7 @@ describe("superviseEffectProcessTree", () => {
       {
         processTreeKiller: {
           capture: () => ({ ...(rootAlive ? { root } : {}), descendants: [] }),
+          captureAsync: async () => ({ ...(rootAlive ? { root } : {}), descendants: [] }),
           inspect: () => ({ verified: true, survivors: [] }),
           signal: () => undefined,
         },
@@ -441,6 +671,7 @@ describe("superviseEffectProcessTree", () => {
       },
     );
 
+    await supervisor.waitForInitialCapture();
     rootAlive = false;
     await expect(supervisor.proveExit()).resolves.toEqual({
       escalated: false,

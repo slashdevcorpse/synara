@@ -122,4 +122,26 @@ describe("provider maintenance cross-process lock", () => {
     expect(NodePath.dirname(acquired.lockPath)).toBe(canonicalDirectory);
     await Effect.runPromise(releaseProviderMaintenanceCrossProcessLock(acquired));
   });
+
+  it.skipIf(process.platform === "win32")(
+    "rejects a symlinked lock root without changing the target permissions",
+    async () => {
+      const parent = await makeLockDirectory();
+      const target = NodePath.join(parent, "unrelated-target");
+      const symlink = NodePath.join(parent, "lock-root-link");
+      await NodeFs.mkdir(target, { mode: 0o755 });
+      await NodeFs.chmod(target, 0o755);
+      await NodeFs.symlink(target, symlink, "dir");
+
+      await expect(
+        Effect.runPromise(
+          acquireProviderMaintenanceCrossProcessLock("npm-global:/symlink", {
+            canonicalInstallRoot: parent,
+            directoryPath: symlink,
+          }),
+        ),
+      ).rejects.toBeInstanceOf(ProviderMaintenanceCrossProcessLockError);
+      expect((await NodeFs.stat(target)).mode & 0o777).toBe(0o755);
+    },
+  );
 });

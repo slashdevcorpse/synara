@@ -4,12 +4,121 @@
 import { appendFileSync } from "node:fs";
 import { Readable, Writable } from "node:stream";
 
-import { PROTOCOL_VERSION, agent, methods, ndJsonStream } from "@agentclientprotocol/sdk";
+import {
+  PROTOCOL_VERSION,
+  agent,
+  methods,
+  ndJsonStream,
+  type AnyMessage,
+  type JsonRpcId,
+  type Stream,
+} from "@agentclientprotocol/sdk";
 import { z } from "zod";
 
 const sessionId = "official-sdk-session-1";
 const logPath = process.env.SYNARA_ACP_CONFORMANCE_LOG_PATH;
 const malformedPrefix = process.env.SYNARA_ACP_CONFORMANCE_MALFORMED_PREFIX === "1";
+const EOF_DRAIN_TIMEOUT_MS = 5_000;
+
+function messageIdKey(id: JsonRpcId): string {
+  return `${typeof id}:${String(id)}`;
+}
+
+function withEofResponseDrain(stream: Stream): Stream {
+  const pendingRequestIds = new Set<string>();
+  const drainWaiters = new Set<() => void>();
+  let pendingWrites = 0;
+
+  const isDrained = (): boolean => pendingRequestIds.size === 0 && pendingWrites === 0;
+  const resolveDrainWaiters = (): void => {
+    if (!isDrained()) return;
+    for (const resolve of drainWaiters) resolve();
+    drainWaiters.clear();
+  };
+  const waitForDrain = async (): Promise<void> => {
+    if (isDrained()) return;
+    let resolveDrain!: () => void;
+    const drained = new Promise<void>((resolve) => {
+      resolveDrain = resolve;
+      drainWaiters.add(resolve);
+    });
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        drained,
+        new Promise<never>((_resolve, reject) => {
+          timeout = setTimeout(
+            () =>
+              reject(
+                new Error(
+                  `Timed out draining ACP fixture responses for ${String(pendingRequestIds.size)} request(s)`,
+                ),
+              ),
+            EOF_DRAIN_TIMEOUT_MS,
+          );
+        }),
+      ]);
+    } finally {
+      drainWaiters.delete(resolveDrain);
+      if (timeout !== undefined) clearTimeout(timeout);
+    }
+  };
+
+  const readable = stream.readable.pipeThrough(
+    new TransformStream<AnyMessage, AnyMessage>({
+      transform(message, controller) {
+        if ("method" in message && "id" in message) {
+          pendingRequestIds.add(messageIdKey(message.id));
+        }
+        controller.enqueue(message);
+      },
+      async flush() {
+        try {
+          await waitForDrain();
+        } catch (error) {
+          process.exitCode = 1;
+          console.error(error);
+          throw error;
+        }
+      },
+    }),
+  );
+  const writable = new WritableStream<AnyMessage>({
+    async write(message) {
+      pendingWrites += 1;
+      const writer = stream.writable.getWriter();
+      try {
+        await writer.write(message);
+        if (!("method" in message) && "id" in message) {
+          // SDK-generated error responses carry the same id, so failed handlers drain here too.
+          pendingRequestIds.delete(messageIdKey(message.id));
+        }
+      } finally {
+        writer.releaseLock();
+        pendingWrites -= 1;
+        resolveDrainWaiters();
+      }
+    },
+    async close() {
+      const writer = stream.writable.getWriter();
+      try {
+        await writer.close();
+      } finally {
+        writer.releaseLock();
+      }
+    },
+    async abort(reason) {
+      const writer = stream.writable.getWriter();
+      try {
+        await writer.abort(reason);
+      } finally {
+        writer.releaseLock();
+      }
+    },
+  });
+
+  return { readable, writable };
+}
 
 function log(type: string, payload: unknown): void {
   if (logPath) {
@@ -21,7 +130,6 @@ let finishCancelledPrompt: (() => void) | undefined;
 
 process.once("SIGTERM", () => process.exit(0));
 process.once("SIGINT", () => process.exit(0));
-process.stdin.once("end", () => process.exit(0));
 
 if (malformedPrefix) {
   process.stdout.write("{not-json}\n");
@@ -107,6 +215,11 @@ const app = agent({ name: "synara-official-sdk-conformance-agent" })
       },
     };
   })
+  .onRequest("conformance/delayed-eof-response", z.object({ value: z.string() }), async (ctx) => {
+    log("conformance/delayed-eof-response", ctx.params);
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    return { echoed: ctx.params.value, complete: true };
+  })
   .onNotification("conformance/notice", z.unknown(), (ctx) => {
     log("conformance/notice", ctx.params);
   })
@@ -131,6 +244,6 @@ const app = agent({ name: "synara-official-sdk-conformance-agent" })
 
 const output = Writable.toWeb(process.stdout);
 const input = Readable.toWeb(process.stdin) as ReadableStream<Uint8Array>;
-const connection = app.connect(ndJsonStream(output, input));
+const connection = app.connect(withEofResponseDrain(ndJsonStream(output, input)));
 
-void connection.closed.then(() => process.exit(0));
+void connection.closed.then(() => process.exit(process.exitCode ?? 0));

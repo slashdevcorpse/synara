@@ -5,7 +5,10 @@ import type {
   ServerProviderStatus,
   ServerProviderVersionAdvisory,
 } from "@synara/contracts";
-import { resolveWindowsCommandPath as resolveRuntimeWindowsCommandPath } from "@synara/shared/windowsProcess";
+import {
+  resolveWindowsCommandCandidates as resolveRuntimeWindowsCommandCandidates,
+  resolveWindowsCommandPath as resolveRuntimeWindowsCommandPath,
+} from "@synara/shared/windowsProcess";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -13,7 +16,6 @@ import * as FileSystem from "effect/FileSystem";
 const LATEST_VERSION_CACHE_TTL_MS = 60 * 60 * 1_000;
 const LATEST_VERSION_TIMEOUT_MS = 4_000;
 const PROVIDER_UPDATE_ACTION_MESSAGE = "Install the update now or review provider settings.";
-const WINDOWS_MANAGER_EXECUTABLE_EXTENSIONS = [".exe", ".cmd", ".bat", ""] as const;
 
 export type ProviderInstallSource = "npm" | "bun" | "pnpm" | "homebrew" | "native" | "unknown";
 
@@ -96,6 +98,7 @@ export interface ProviderMaintenanceCapabilityResolutionOptions {
 }
 
 interface ProviderMaintenanceCapabilityResolutionDependencies {
+  readonly resolveWindowsCommandCandidates?: typeof resolveRuntimeWindowsCommandCandidates;
   readonly resolveWindowsCommandPath?: typeof resolveRuntimeWindowsCommandPath;
 }
 
@@ -757,12 +760,13 @@ function managerInstallRoot(
   platform: NodeJS.Platform,
 ): string | null {
   const normalized = normalizeCommandPath(commandPath, platform);
-  const markers =
+  const markers = (
     source === "bun"
       ? ["/.bun/install/global/node_modules/"]
       : source === "pnpm"
         ? ["/.pnpm/"]
-        : ["/cellar/", "/caskroom/"];
+        : ["/Cellar/", "/Caskroom/"]
+  ).map((marker) => normalizeCommandPath(marker, platform));
   const marker = markers.find((candidate) => normalized.includes(candidate));
   if (!marker) {
     return null;
@@ -852,7 +856,7 @@ function isHomebrewCommandPath(
   if (!packageToken || !packageKind) {
     return false;
   }
-  const installDirectory = packageKind === "cask" ? "caskroom" : "cellar";
+  const installDirectory = packageKind === "cask" ? "Caskroom" : "Cellar";
   return pathContainsDirectory(commandPath, `${installDirectory}/${packageToken}`, platform);
 }
 
@@ -1285,17 +1289,47 @@ function manualCapabilities(
   });
 }
 
-function managerExecutablePathCandidates(commandPath: string, platform: NodeJS.Platform): string[] {
-  if (platform !== "win32") {
-    return [commandPath];
-  }
+function managerExecutablePathCandidates(
+  commandPath: string,
+  platform: NodeJS.Platform,
+  env: NodeJS.ProcessEnv,
+  resolveWindowsCommandCandidates: typeof resolveRuntimeWindowsCommandCandidates,
+): ReadonlyArray<{
+  readonly visiblePath: string;
+  readonly requestedDirectory: string;
+}> {
   const path = commandPathImplementation(platform);
-  return path.extname(commandPath)
-    ? [commandPath]
-    : WINDOWS_MANAGER_EXECUTABLE_EXTENSIONS.map((extension) => `${commandPath}${extension}`);
+  const requestedDirectory = path.dirname(commandPath);
+  if (platform !== "win32") {
+    return [{ visiblePath: commandPath, requestedDirectory }];
+  }
+  if (path.extname(commandPath)) {
+    return [{ visiblePath: commandPath, requestedDirectory }];
+  }
+
+  const absoluteCommandPath = path.isAbsolute(commandPath);
+  const discoveryCommand = absoluteCommandPath ? path.basename(commandPath) : commandPath;
+  const discoveryEnv = absoluteCommandPath
+    ? {
+        ...Object.fromEntries(
+          Object.entries(env).filter(([name]) => name.toUpperCase() !== "PATH"),
+        ),
+        PATH: path.dirname(commandPath),
+      }
+    : env;
+  const candidates = resolveWindowsCommandCandidates(discoveryCommand, {
+    env: discoveryEnv,
+    platform,
+  });
+  return candidates
+    .filter((candidate) => {
+      const extension = path.extname(candidate).toLowerCase();
+      return [".com", ".exe", ".bat", ".cmd"].includes(extension);
+    })
+    .map((visiblePath) => ({ visiblePath, requestedDirectory }));
 }
 
-function canonicalizeDirectory(fileSystem: FileSystem.FileSystem, directoryPath: string) {
+function inspectCanonicalDirectory(fileSystem: FileSystem.FileSystem, directoryPath: string) {
   return Effect.gen(function* () {
     const stat = yield* fileSystem
       .stat(directoryPath)
@@ -1303,8 +1337,37 @@ function canonicalizeDirectory(fileSystem: FileSystem.FileSystem, directoryPath:
     if (stat?.type !== "Directory") {
       return null;
     }
-    return yield* fileSystem.realPath(directoryPath).pipe(Effect.catch(() => Effect.succeed(null)));
+    const canonicalPath = yield* fileSystem
+      .realPath(directoryPath)
+      .pipe(Effect.catch(() => Effect.succeed(null)));
+    return canonicalPath
+      ? {
+          canonicalPath,
+          device: stat.dev,
+          inode: stat.ino,
+        }
+      : null;
   });
+}
+
+function canonicalizeDirectory(fileSystem: FileSystem.FileSystem, directoryPath: string) {
+  return inspectCanonicalDirectory(fileSystem, directoryPath).pipe(
+    Effect.map((identity) => identity?.canonicalPath ?? null),
+  );
+}
+
+function canonicalDirectoriesMatch(
+  left: NonNullable<Effect.Success<ReturnType<typeof inspectCanonicalDirectory>>>,
+  right: NonNullable<Effect.Success<ReturnType<typeof inspectCanonicalDirectory>>>,
+  platform: NodeJS.Platform,
+): boolean {
+  if (left.inode !== undefined && right.inode !== undefined) {
+    return left.device === right.device && left.inode === right.inode;
+  }
+  return (
+    normalizeCommandPath(left.canonicalPath, platform) ===
+    normalizeCommandPath(right.canonicalPath, platform)
+  );
 }
 
 function managerCandidatePaths(input: {
@@ -1313,7 +1376,11 @@ function managerCandidatePaths(input: {
   readonly env: NodeJS.ProcessEnv;
   readonly platform: NodeJS.Platform;
   readonly preferredManagerExecutablePath?: string | null;
-}): ReadonlyArray<string> {
+  readonly resolveWindowsCommandCandidates: typeof resolveRuntimeWindowsCommandCandidates;
+}): ReadonlyArray<{
+  readonly visiblePath: string;
+  readonly requestedDirectory: string;
+}> {
   const managerName = input.installSource === "homebrew" ? "brew" : input.installSource;
   const rootPath = commandPathImplementation(input.platform);
   const roots: string[] = [];
@@ -1347,11 +1414,16 @@ function managerCandidatePaths(input: {
   }
 
   const candidates = roots.flatMap((candidate) =>
-    managerExecutablePathCandidates(candidate, input.platform),
+    managerExecutablePathCandidates(
+      candidate,
+      input.platform,
+      input.env,
+      input.resolveWindowsCommandCandidates,
+    ),
   );
   const seen = new Set<string>();
   return candidates.filter((candidate) => {
-    const normalized = normalizeCommandPath(candidate, input.platform);
+    const normalized = `${normalizeCommandPath(candidate.visiblePath, input.platform)}\0${normalizeCommandPath(candidate.requestedDirectory, input.platform)}`;
     if (seen.has(normalized)) {
       return false;
     }
@@ -1367,34 +1439,70 @@ const resolveManagerExecutable = Effect.fn("resolveProviderMaintenanceManager")(
     readonly env: NodeJS.ProcessEnv;
     readonly platform: NodeJS.Platform;
     readonly preferredManagerExecutablePath?: string | null;
+    readonly resolveWindowsCommandCandidates: typeof resolveRuntimeWindowsCommandCandidates;
   },
   fileSystem: FileSystem.FileSystem,
 ) {
   for (const candidate of managerCandidatePaths(input)) {
     const path = commandPathImplementation(input.platform);
-    if (!path.isAbsolute(candidate)) {
+    if (!path.isAbsolute(candidate.visiblePath)) {
       continue;
     }
-    const stat = yield* fileSystem.stat(candidate).pipe(Effect.catch(() => Effect.succeed(null)));
+    const stat = yield* fileSystem
+      .stat(candidate.visiblePath)
+      .pipe(Effect.catch(() => Effect.succeed(null)));
     if (stat?.type !== "File") {
       continue;
     }
     if (
       !managerMatchesInstallRoot({
         installSource: input.installSource,
-        managerExecutablePath: candidate,
+        managerExecutablePath: candidate.visiblePath,
         canonicalInstallRoot: input.canonicalInstallRoot,
         platform: input.platform,
       })
     ) {
       continue;
     }
-    const canonicalPath = yield* fileSystem
-      .realPath(candidate)
-      .pipe(Effect.catch(() => Effect.succeed(null)));
-    if (canonicalPath) {
-      return { visiblePath: candidate, canonicalPath };
+    let canonicalRequestedDirectory: Effect.Success<ReturnType<typeof inspectCanonicalDirectory>> =
+      null;
+    if (input.platform === "win32") {
+      const [requestedDirectory, visibleDirectory] = yield* Effect.all([
+        inspectCanonicalDirectory(fileSystem, candidate.requestedDirectory),
+        inspectCanonicalDirectory(fileSystem, path.dirname(candidate.visiblePath)),
+      ]);
+      if (
+        !requestedDirectory ||
+        !visibleDirectory ||
+        !canonicalDirectoriesMatch(requestedDirectory, visibleDirectory, input.platform)
+      ) {
+        continue;
+      }
+      canonicalRequestedDirectory = requestedDirectory;
     }
+    const canonicalPath = yield* fileSystem
+      .realPath(candidate.visiblePath)
+      .pipe(Effect.catch(() => Effect.succeed(null)));
+    if (!canonicalPath) {
+      continue;
+    }
+    if (canonicalRequestedDirectory !== null) {
+      const canonicalPathDirectory = yield* inspectCanonicalDirectory(
+        fileSystem,
+        path.dirname(canonicalPath),
+      );
+      if (
+        !canonicalPathDirectory ||
+        !canonicalDirectoriesMatch(
+          canonicalRequestedDirectory,
+          canonicalPathDirectory,
+          input.platform,
+        )
+      ) {
+        continue;
+      }
+    }
+    return { visiblePath: candidate.visiblePath, canonicalPath };
   }
   return null;
 });
@@ -1560,6 +1668,7 @@ const resolveVerifiedCandidateMaintenance = Effect.fn("resolveVerifiedCandidateM
       readonly env: NodeJS.ProcessEnv;
       readonly platform: NodeJS.Platform;
       readonly preferredManagerExecutablePath?: string | null;
+      readonly resolveWindowsCommandCandidates: typeof resolveRuntimeWindowsCommandCandidates;
     },
     fileSystem: FileSystem.FileSystem,
   ) {
@@ -1618,6 +1727,7 @@ const resolveVerifiedCandidateMaintenance = Effect.fn("resolveVerifiedCandidateM
         canonicalInstallRoot,
         env: input.env,
         platform: input.platform,
+        resolveWindowsCommandCandidates: input.resolveWindowsCommandCandidates,
         ...(input.preferredManagerExecutablePath !== undefined
           ? { preferredManagerExecutablePath: input.preferredManagerExecutablePath }
           : {}),
@@ -1728,6 +1838,8 @@ export const resolveProviderMaintenanceCapabilitiesEffect = Effect.fn(
         packageManifestPath,
         env,
         platform,
+        resolveWindowsCommandCandidates:
+          dependencies?.resolveWindowsCommandCandidates ?? resolveRuntimeWindowsCommandCandidates,
         ...(options?.managerExecutablePath !== undefined
           ? { preferredManagerExecutablePath: options.managerExecutablePath }
           : {}),

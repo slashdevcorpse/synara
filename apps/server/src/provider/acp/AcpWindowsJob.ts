@@ -4,7 +4,8 @@
 
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { constants as fsConstants, rmdirSync, rmSync } from "node:fs";
+import * as NodeFs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as Path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -19,6 +20,8 @@ import {
 const WINDOWS_CREATE_PROCESS_COMMAND_LINE_MAX_WITHOUT_NULL = 32_766;
 const ACP_WINDOWS_JOB_COMPILER_TIMEOUT_MS = 60_000;
 const ACP_WINDOWS_JOB_COMPILER_OUTPUT_MAX_BYTES = 256 * 1024;
+const ACP_WINDOWS_JOB_ASSET_MAX_BYTES = 2 * 1024 * 1024;
+const ACP_WINDOWS_JOB_EXECUTABLE_MAX_BYTES = 8 * 1024 * 1024;
 const WINDOWS_PE_MINIMUM_IMAGE_BYTES = 1_024;
 const WINDOWS_PE_SECTION_HEADER_BYTES = 40;
 const WINDOWS_PE32_OPTIONAL_HEADER_BYTES = 0xe0;
@@ -42,11 +45,27 @@ export interface AcpWindowsJobAssets {
 export type AcpWindowsJobCompiler = (input: {
   readonly powershell: string;
   readonly compilerPath: string;
+  readonly compilerHash: string;
   readonly sourceHash: string;
   readonly outputPath: string;
 }) => Promise<void>;
 
-function defaultAcpWindowsJobAssets(): AcpWindowsJobAssets {
+interface PreparedAcpWindowsJobExecutable {
+  readonly outputPath: string;
+  readonly sha256: string;
+}
+
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await NodeFs.access(path);
+    return true;
+  } catch (cause) {
+    if ((cause as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw cause;
+  }
+}
+
+async function defaultAcpWindowsJobAssets(): Promise<AcpWindowsJobAssets> {
   const directories = [
     // Bundled CLI/desktop layout: the build copies both helpers beside dist/index.mjs.
     fileURLToPath(new URL("./", import.meta.url)),
@@ -56,23 +75,67 @@ function defaultAcpWindowsJobAssets(): AcpWindowsJobAssets {
   for (const directory of directories) {
     const compilerPath = Path.join(directory, "acp-windows-job.ps1");
     const nativeSourcePath = Path.join(directory, "acp-windows-job-native.cs");
-    if (existsSync(compilerPath) && existsSync(nativeSourcePath)) {
+    const [hasCompiler, hasNativeSource] = await Promise.all([
+      pathExists(compilerPath),
+      pathExists(nativeSourcePath),
+    ]);
+    if (hasCompiler && hasNativeSource) {
       return { compilerPath, nativeSourcePath };
     }
   }
   throw new Error(`Windows ACP Job Object assets are missing (checked ${directories.join(", ")}).`);
 }
 
-function isUsableWindowsExecutable(path: string): boolean {
+async function readBoundedRegularFile(
+  path: string,
+  maximumBytes: number,
+  minimumBytes = 1,
+): Promise<Buffer> {
+  const flags =
+    process.platform === "win32"
+      ? fsConstants.O_RDONLY
+      : fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW;
+  const handle = await NodeFs.open(path, flags);
   try {
-    if (!statSync(path).isFile()) return false;
-    const image = readFileSync(path);
+    const before = await handle.stat();
     if (
-      image.length < WINDOWS_PE_MINIMUM_IMAGE_BYTES ||
-      image.subarray(0, 2).toString("ascii") !== "MZ"
+      !before.isFile() ||
+      !Number.isSafeInteger(before.size) ||
+      before.size < minimumBytes ||
+      before.size > maximumBytes
     ) {
-      return false;
+      throw new Error(
+        `File size is outside the allowed ${minimumBytes}-${maximumBytes} byte range.`,
+      );
     }
+
+    const bytes = Buffer.alloc(before.size);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const { bytesRead } = await handle.read(bytes, offset, bytes.length - offset, offset);
+      if (bytesRead === 0) throw new Error("File ended while it was being read.");
+      offset += bytesRead;
+    }
+    const overflow = Buffer.allocUnsafe(1);
+    const overflowRead = await handle.read(overflow, 0, 1, bytes.length);
+    const after = await handle.stat();
+    if (
+      overflowRead.bytesRead !== 0 ||
+      after.size !== before.size ||
+      after.dev !== before.dev ||
+      after.ino !== before.ino
+    ) {
+      throw new Error("File identity or size changed while it was being read.");
+    }
+    return bytes;
+  } finally {
+    await handle.close();
+  }
+}
+
+function isUsableWindowsExecutableImage(image: Buffer): boolean {
+  try {
+    if (image.subarray(0, 2).toString("ascii") !== "MZ") return false;
     const peOffset = image.readUInt32LE(0x3c);
     if (peOffset < 64 || peOffset > image.length - 24) return false;
     if (image.readUInt32LE(peOffset) !== 0x0000_4550) return false;
@@ -173,6 +236,25 @@ function isUsableWindowsExecutable(path: string): boolean {
   }
 }
 
+async function attestWindowsExecutable(
+  path: string,
+): Promise<PreparedAcpWindowsJobExecutable | null> {
+  try {
+    const image = await readBoundedRegularFile(
+      path,
+      ACP_WINDOWS_JOB_EXECUTABLE_MAX_BYTES,
+      WINDOWS_PE_MINIMUM_IMAGE_BYTES,
+    );
+    if (!isUsableWindowsExecutableImage(image)) return null;
+    return {
+      outputPath: path,
+      sha256: createHash("sha256").update(image).digest("hex"),
+    };
+  } catch {
+    return null;
+  }
+}
+
 const defaultCompiler: AcpWindowsJobCompiler = (input) =>
   new Promise<void>((resolve, reject) => {
     execFile(
@@ -187,6 +269,8 @@ const defaultCompiler: AcpWindowsJobCompiler = (input) =>
         input.compilerPath,
         "-ExpectedSourceHash",
         input.sourceHash,
+        "-ExpectedCompilerHash",
+        input.compilerHash,
         "-OutputPath",
         input.outputPath,
       ],
@@ -207,27 +291,121 @@ const defaultCompiler: AcpWindowsJobCompiler = (input) =>
     );
   });
 
-const helperPreparations = new Map<string, Promise<string>>();
+interface AcpWindowsJobHelperState {
+  readonly outputPath: string;
+  prepared?: PreparedAcpWindowsJobExecutable;
+  preparing?: Promise<PreparedAcpWindowsJobExecutable>;
+}
 
-export function ensureAcpWindowsJobExecutable(input: {
+const helperStates = new Map<string, AcpWindowsJobHelperState>();
+const helperOutputPaths = new Set<string>();
+let helperRootPreparation: Promise<string> | undefined;
+let helperRootPath: string | undefined;
+let helperRootCleanupRegistered = false;
+
+async function prepareHelperRoot(): Promise<string> {
+  const temporaryRoot = await NodeFs.realpath(tmpdir());
+  const created = await NodeFs.mkdtemp(Path.join(temporaryRoot, "synara-acp-job-"));
+  if (process.platform !== "win32") await NodeFs.chmod(created, 0o700);
+  const stat = await NodeFs.lstat(created);
+  const canonical = await NodeFs.realpath(created);
+  if (
+    !stat.isDirectory() ||
+    stat.isSymbolicLink() ||
+    Path.dirname(canonical) !== temporaryRoot ||
+    !Path.basename(canonical).startsWith("synara-acp-job-")
+  ) {
+    throw new Error("Windows ACP Job Object helper root is not a private temporary directory.");
+  }
+  helperRootPath = canonical;
+  if (!helperRootCleanupRegistered) {
+    helperRootCleanupRegistered = true;
+    process.once("exit", () => {
+      const root = helperRootPath;
+      if (root === undefined) return;
+      for (const outputPath of helperOutputPaths) {
+        if (Path.dirname(outputPath) !== root) continue;
+        try {
+          rmSync(outputPath, { force: true });
+        } catch {
+          // Best-effort cleanup during process exit.
+        }
+      }
+      try {
+        rmdirSync(root);
+      } catch {
+        // Best-effort cleanup during process exit.
+      }
+    });
+  }
+  return canonical;
+}
+
+function getHelperRoot(): Promise<string> {
+  helperRootPreparation ??= prepareHelperRoot();
+  return helperRootPreparation;
+}
+
+async function prepareWindowsJobExecutable(input: {
+  readonly state: AcpWindowsJobHelperState;
+  readonly compiler: AcpWindowsJobCompiler;
+  readonly powershell: string;
+  readonly compilerPath: string;
+  readonly compilerHash: string;
+  readonly sourceHash: string;
+}): Promise<PreparedAcpWindowsJobExecutable> {
+  const previous = input.state.prepared;
+  if (previous !== undefined) {
+    const current = await attestWindowsExecutable(previous.outputPath);
+    if (current?.sha256 === previous.sha256) return previous;
+  }
+
+  await NodeFs.rm(input.state.outputPath, { force: true });
+  await input.compiler({
+    powershell: input.powershell,
+    compilerPath: input.compilerPath,
+    compilerHash: input.compilerHash,
+    sourceHash: input.sourceHash,
+    outputPath: input.state.outputPath,
+  });
+  const prepared = await attestWindowsExecutable(input.state.outputPath);
+  if (prepared === null) {
+    await NodeFs.rm(input.state.outputPath, { force: true });
+    throw new Error("Windows ACP Job Object compiler did not produce a valid executable.");
+  }
+  return prepared;
+}
+
+export async function ensureAcpWindowsJobExecutable(input: {
   readonly env: NodeJS.ProcessEnv;
   readonly assets?: AcpWindowsJobAssets;
   readonly compile?: AcpWindowsJobCompiler;
 }): Promise<string> {
-  const assets = input.assets ?? defaultAcpWindowsJobAssets();
-  const source = readFileSync(assets.nativeSourcePath);
-  const compilerSource = readFileSync(assets.compilerPath);
+  const assets = input.assets ?? (await defaultAcpWindowsJobAssets());
+  const [source, compilerSource] = await Promise.all([
+    readBoundedRegularFile(assets.nativeSourcePath, ACP_WINDOWS_JOB_ASSET_MAX_BYTES),
+    readBoundedRegularFile(assets.compilerPath, ACP_WINDOWS_JOB_ASSET_MAX_BYTES),
+  ]);
   const sourceHash = createHash("sha256").update(source).digest("hex");
+  const compilerHash = createHash("sha256").update(compilerSource).digest("hex");
   const cacheHash = createHash("sha256")
     .update(source)
     .update("\0")
     .update(compilerSource)
     .digest("hex");
-  const outputPath = Path.join(tmpdir(), `synara-acp-job-${cacheHash}.exe`);
-  if (isUsableWindowsExecutable(outputPath)) return Promise.resolve(outputPath);
+  let state = helperStates.get(cacheHash);
+  if (state === undefined) {
+    const helperRoot = await getHelperRoot();
+    state = helperStates.get(cacheHash);
+    if (state === undefined) {
+      const outputPath = Path.join(helperRoot, `synara-acp-job-${cacheHash}.exe`);
+      state = { outputPath };
+      helperStates.set(cacheHash, state);
+      helperOutputPaths.add(outputPath);
+    }
+  }
+  if (state.preparing !== undefined) return (await state.preparing).outputPath;
 
-  const existing = helperPreparations.get(outputPath);
-  if (existing !== undefined) return existing;
   const powershell = Path.win32.join(
     resolveWindowsSystemRoot(input.env),
     "System32",
@@ -235,27 +413,25 @@ export function ensureAcpWindowsJobExecutable(input: {
     "v1.0",
     "powershell.exe",
   );
-  const prepare = (input.compile ?? defaultCompiler)({
+  const prepare = prepareWindowsJobExecutable({
+    state,
+    compiler: input.compile ?? defaultCompiler,
     powershell,
     compilerPath: assets.compilerPath,
+    compilerHash,
     sourceHash,
-    outputPath,
-  }).then(() => {
-    if (!isUsableWindowsExecutable(outputPath)) {
-      throw new Error("Windows ACP Job Object compiler did not produce a valid executable.");
-    }
-    return outputPath;
   });
-  helperPreparations.set(outputPath, prepare);
-  void prepare.then(
-    () => {
-      if (helperPreparations.get(outputPath) === prepare) helperPreparations.delete(outputPath);
-    },
-    () => {
-      if (helperPreparations.get(outputPath) === prepare) helperPreparations.delete(outputPath);
-    },
-  );
-  return prepare;
+  state.preparing = prepare;
+  try {
+    const prepared = await prepare;
+    state.prepared = prepared;
+    return prepared.outputPath;
+  } catch (cause) {
+    if (helperStates.get(cacheHash) === state) helperStates.delete(cacheHash);
+    throw cause;
+  } finally {
+    if (state.preparing === prepare) state.preparing = undefined;
+  }
 }
 
 export function buildAcpWindowsJobLaunch(input: {

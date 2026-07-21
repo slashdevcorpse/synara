@@ -338,6 +338,12 @@ function superviseWindowsAcpJobProcess(
           terminateExact();
         }
         await awaitWrapperExit();
+        const stillRunning = await Effect.runPromise(child.isRunning);
+        if (stillRunning) {
+          throw new Error(
+            `Windows ACP Job Object wrapper ${Number(child.pid)} still reports running.`,
+          );
+        }
         return { escalated: running, signalErrors: [] };
       })();
       teardownPromise = attempt;
@@ -350,6 +356,7 @@ function superviseWindowsAcpJobProcess(
 
   return {
     rootPid: Number(child.pid),
+    waitForInitialCapture: () => Promise.resolve(),
     captureNow: () => Promise.resolve(),
     proveExit,
     teardown,
@@ -367,10 +374,11 @@ export const awaitAcpChildExit = (child: AcpOwnedChildProcess): Effect.Effect<vo
 export const teardownAcpChildProcess = (
   child: AcpOwnedChildProcess,
   teardownProcessTree: typeof teardownProviderProcessTree = teardownProviderProcessTree,
+  options: { readonly ownedProcessGroupId?: number } = {},
 ): Effect.Effect<SupervisedProcessTeardownResult> =>
   Effect.suspend(() => {
     return Effect.tryPromise({
-      try: () => teardownEffectProcessTree(child, teardownProcessTree),
+      try: () => teardownEffectProcessTree(child, teardownProcessTree, options),
       catch: (error) => (error instanceof Error ? error : new Error(String(error))),
     }).pipe(Effect.orDie);
   });
@@ -383,6 +391,30 @@ export interface AcpProcessOwnership {
   readonly setCloseTransport: (closeTransport: Effect.Effect<void, unknown>) => void;
 }
 
+export const installAndAwaitAcpProcessSupervisor = (
+  processOwnership: AcpProcessOwnership,
+  factory: () => EffectProcessTreeSupervisor,
+  command: string,
+): Effect.Effect<EffectProcessTreeSupervisor, EffectAcpErrors.AcpSpawnError> =>
+  Effect.try({
+    try: factory,
+    catch: (cause) => new EffectAcpErrors.AcpSpawnError({ command, cause }),
+  }).pipe(
+    Effect.flatMap((supervisor) =>
+      Effect.tryPromise({
+        try: supervisor.waitForInitialCapture,
+        catch: (cause) => new EffectAcpErrors.AcpSpawnError({ command, cause }),
+      }).pipe(
+        Effect.flatMap(() =>
+          Effect.try({
+            try: () => processOwnership.installSupervisor(() => supervisor),
+            catch: (cause) => new EffectAcpErrors.AcpSpawnError({ command, cause }),
+          }),
+        ),
+      ),
+    ),
+  );
+
 /**
  * Acquires teardown ownership before any fallible process inspection or ACP SDK setup. Until the
  * stronger identity-capturing supervisor installs, scope closure uses the exact spawned handle's
@@ -394,6 +426,7 @@ export const registerAcpProcessOwnership = (
   options: {
     readonly teardownProcessTree?: typeof teardownProviderProcessTree;
     readonly gracefulShutdownTimeout?: Duration.Input;
+    readonly ownedProcessGroupId?: number;
   } = {},
 ): Effect.Effect<AcpProcessOwnership> =>
   Effect.gen(function* () {
@@ -405,7 +438,11 @@ export const registerAcpProcessOwnership = (
       Effect.suspend(() => {
         const supervisor = processSupervisor;
         if (supervisor === null) {
-          return teardownAcpChildProcess(child, options.teardownProcessTree);
+          return teardownAcpChildProcess(child, options.teardownProcessTree, {
+            ...(options.ownedProcessGroupId === undefined
+              ? {}
+              : { ownedProcessGroupId: options.ownedProcessGroupId }),
+          });
         }
 
         return Effect.gen(function* () {
@@ -985,22 +1022,28 @@ const makeAcpSessionRuntime = (
           ...(options.gracefulShutdownTimeout
             ? { gracefulShutdownTimeout: options.gracefulShutdownTimeout }
             : {}),
+          ...(process.platform === "win32" ? {} : { ownedProcessGroupId: Number(child.pid) }),
         });
         // Install the stable owner before leaving the same uninterruptible acquisition. The
         // already-registered fallback remains authoritative if initial capture or hook validation
         // throws, but cancellation can never land between spawn and the stronger owner handoff.
-        processOwnership.installSupervisor(() =>
-          process.platform === "win32" && options.processTreeKiller === undefined
-            ? superviseWindowsAcpJobProcess(child)
-            : superviseEffectProcessTree(child, {
-                ...(options.processTreeKiller
-                  ? { processTreeKiller: options.processTreeKiller }
-                  : {}),
-                ...(options.teardownProcessTree
-                  ? { teardownProcessTree: options.teardownProcessTree }
-                  : {}),
-                ...(process.platform === "win32" ? {} : { ownedProcessGroupId: Number(child.pid) }),
-              }),
+        yield* installAndAwaitAcpProcessSupervisor(
+          processOwnership,
+          () =>
+            process.platform === "win32" && options.processTreeKiller === undefined
+              ? superviseWindowsAcpJobProcess(child)
+              : superviseEffectProcessTree(child, {
+                  ...(options.processTreeKiller
+                    ? { processTreeKiller: options.processTreeKiller }
+                    : {}),
+                  ...(options.teardownProcessTree
+                    ? { teardownProcessTree: options.teardownProcessTree }
+                    : {}),
+                  ...(process.platform === "win32"
+                    ? {}
+                    : { ownedProcessGroupId: Number(child.pid) }),
+                }),
+          options.spawn.command,
         );
         return { child, processOwnership };
       }),

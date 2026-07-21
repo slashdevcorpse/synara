@@ -24,6 +24,7 @@ import {
 } from "@synara/contracts";
 import { prepareWindowsSafeProcess } from "@synara/shared/windowsProcess";
 import {
+  Cause,
   DateTime,
   Deferred,
   Effect,
@@ -141,6 +142,25 @@ const CURSOR_TURN_IDLE_TIMEOUT_MS = resolveAcpTurnIdleTimeoutMs({
   envVar: "SYNARA_CURSOR_TURN_IDLE_TIMEOUT_MS",
   defaultMs: 600_000,
 });
+
+/** Attempts every Cursor session stop and re-raises the first failure only after all were tried. */
+export function stopCursorSessionsBestEffort<Session, Error, Requirements>(
+  sessions: Iterable<Session>,
+  stopSession: (session: Session) => Effect.Effect<void, Error, Requirements>,
+): Effect.Effect<void, Error, Requirements> {
+  return Effect.gen(function* () {
+    let firstFailure: Cause.Cause<Error> | undefined;
+    for (const session of Array.from(sessions)) {
+      const exit = yield* Effect.exit(stopSession(session));
+      if (Exit.isFailure(exit) && firstFailure === undefined) {
+        firstFailure = exit.cause;
+      }
+    }
+    if (firstFailure !== undefined) {
+      return yield* Effect.failCause(firstFailure);
+    }
+  });
+}
 const CURSOR_TURN_WATCHDOG_INTERVAL_MS = 15_000;
 const ACP_PLAN_MODE_ALIASES = ["plan", "architect"];
 const ACP_IMPLEMENT_MODE_ALIASES = ["code", "agent", "default", "chat", "implement"];
@@ -1558,12 +1578,12 @@ export function makeCursorAdapter(
     };
 
     const stopAll: CursorAdapterShape["stopAll"] = () =>
-      Effect.forEach(sessions.values(), stopSessionInternal, { discard: true });
+      stopCursorSessionsBestEffort(sessions.values(), stopSessionInternal);
 
     yield* Effect.addFinalizer(() =>
-      Effect.forEach(sessions.values(), stopSessionInternal, { discard: true }).pipe(
-        Effect.tap(() => PubSub.shutdown(runtimeEventPubSub)),
-        Effect.tap(() => managedNativeEventLogger?.close() ?? Effect.void),
+      stopAll().pipe(
+        Effect.ensuring(PubSub.shutdown(runtimeEventPubSub)),
+        Effect.ensuring(managedNativeEventLogger?.close() ?? Effect.void),
       ),
     );
 

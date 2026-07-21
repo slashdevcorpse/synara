@@ -1,5 +1,5 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { Layer } from "effect";
+import { Effect, Layer } from "effect";
 
 import { AgentGatewayLive } from "./agentGateway/Layers/AgentGateway";
 import { AgentGatewayOperationRepositoryLive } from "./agentGateway/Layers/AgentGatewayOperationRepository";
@@ -44,8 +44,14 @@ import { OrchestrationEventDeliveryRepositoryLive } from "./persistence/Layers/O
 import { ManagedAttachmentCleanupLive } from "./managedAttachmentCleanup";
 import { PullRequestServiceLive } from "./pullRequests/Layers/PullRequestService";
 import { makeProviderHealthLive } from "./provider/Layers/ProviderHealth";
-import type { ProviderMaintenanceGate } from "./provider/providerMaintenanceGate";
-import type { ProviderMaintenanceOwnedResourceCoordinator } from "./provider/providerMaintenanceOwnedResources";
+import {
+  makeProviderMaintenanceGate,
+  type ProviderMaintenanceGate,
+} from "./provider/providerMaintenanceGate";
+import {
+  makeProviderMaintenanceOwnedResourceCoordinator,
+  type ProviderMaintenanceOwnedResourceCoordinator,
+} from "./provider/providerMaintenanceOwnedResources";
 import { makeServerProviderLayer } from "./provider/runtimeLayer";
 
 export { makeServerProviderLayer } from "./provider/runtimeLayer";
@@ -57,23 +63,27 @@ interface ServerRuntimeServicesLayerOptions {
   readonly providerLayer?: ReturnType<typeof makeServerProviderLayer>;
 }
 
+function resolveMaintenanceCoordination(options: {
+  readonly maintenanceGate?: ProviderMaintenanceGate;
+  readonly maintenanceOwnedResources?: ProviderMaintenanceOwnedResourceCoordinator;
+}) {
+  return {
+    maintenanceGate: options.maintenanceGate ?? Effect.runSync(makeProviderMaintenanceGate),
+    maintenanceOwnedResources:
+      options.maintenanceOwnedResources ??
+      Effect.runSync(makeProviderMaintenanceOwnedResourceCoordinator),
+  } as const;
+}
+
 export function makeServerRuntimeServicesLayer(options: ServerRuntimeServicesLayerOptions = {}) {
   const agentGatewayCredentialsLayer =
     options.agentGatewayCredentialsLayer ?? AgentGatewayCredentialsWithSecretsLive;
-  const maintenanceOptions =
-    options.maintenanceGate || options.maintenanceOwnedResources
-      ? {
-          ...(options.maintenanceGate ? { maintenanceGate: options.maintenanceGate } : {}),
-          ...(options.maintenanceOwnedResources
-            ? { maintenanceOwnedResources: options.maintenanceOwnedResources }
-            : {}),
-        }
-      : undefined;
+  const maintenanceOptions = resolveMaintenanceCoordination(options);
   const providerLayer =
     options.providerLayer ??
     makeServerProviderLayer({
       agentGatewayCredentialsLayer,
-      ...(options.maintenanceGate ? { maintenanceGate: options.maintenanceGate } : {}),
+      maintenanceGate: maintenanceOptions.maintenanceGate,
     });
   const providerHealthLayer = makeProviderHealthLive(maintenanceOptions).pipe(
     Layer.provideMerge(ServerSettingsLive),
@@ -233,18 +243,16 @@ export function makeServerApplicationLayers(
   } = {},
 ) {
   const agentGatewayCredentialsLayer = AgentGatewayCredentialsWithSecretsLive;
+  const maintenanceOptions = resolveMaintenanceCoordination(options);
   const providerLayer = makeServerProviderLayer({
     agentGatewayCredentialsLayer,
-    ...(options.maintenanceGate ? { maintenanceGate: options.maintenanceGate } : {}),
+    maintenanceGate: maintenanceOptions.maintenanceGate,
   });
   return {
     runtimeServicesLayer: makeServerRuntimeServicesLayer({
       agentGatewayCredentialsLayer,
       providerLayer,
-      ...(options.maintenanceGate ? { maintenanceGate: options.maintenanceGate } : {}),
-      ...(options.maintenanceOwnedResources
-        ? { maintenanceOwnedResources: options.maintenanceOwnedResources }
-        : {}),
+      ...maintenanceOptions,
     }),
     providerLayer,
   } as const;

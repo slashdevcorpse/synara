@@ -432,6 +432,26 @@ export const PACKAGE_MANAGED_PROVIDER_UPDATES: Partial<
   },
 };
 
+const LEGACY_FACTORY_DROID_NPM_UPDATE: PackageManagedProviderMaintenanceDefinition = {
+  provider: DROID_PROVIDER,
+  binaryName: "droid",
+  allowedBinaryNames: ["droid"],
+  npmPackageName: "@factory/cli",
+  allowedInstallSources: ["npm"],
+  homebrew: null,
+  nativeUpdate: null,
+};
+
+export function packageManagedProviderUpdateDefinitions(
+  provider: ProviderKind,
+): ReadonlyArray<PackageManagedProviderMaintenanceDefinition> {
+  const primary = PACKAGE_MANAGED_PROVIDER_UPDATES[provider];
+  if (!primary) {
+    return [];
+  }
+  return provider === DROID_PROVIDER ? [primary, LEGACY_FACTORY_DROID_NPM_UPDATE] : [primary];
+}
+
 // ── Pure helpers ────────────────────────────────────────────────────
 //
 // Generic CLI-output parsing lives in ../providerCliOutput; Claude auth-status
@@ -2557,8 +2577,8 @@ export function makeProviderHealthLive(options?: {
             updateLockKey: null,
           });
         }
-        const definition = PACKAGE_MANAGED_PROVIDER_UPDATES[provider];
-        if (!definition) {
+        const definitions = packageManagedProviderUpdateDefinitions(provider);
+        if (definitions.length === 0) {
           return makeProviderMaintenanceCapabilities({
             provider,
             packageName: null,
@@ -2588,11 +2608,38 @@ export function makeProviderHealthLive(options?: {
                     ? (configuredBinaryPath ?? "droid")
                     : resolveDroidCliBinaryPath(configuredBinaryPath ?? undefined)
                   : configuredBinaryPath;
-        return yield* resolveProviderMaintenanceCapabilitiesEffect(definition, {
-          binaryPath,
-          env: commandEnv,
-          platform: process.platform,
-        }).pipe(Effect.provideService(FileSystem.FileSystem, fileSystem));
+        const [primaryDefinition, ...alternateDefinitions] = definitions;
+        if (!primaryDefinition) {
+          return makeProviderMaintenanceCapabilities({
+            provider,
+            packageName: null,
+            updateExecutable: null,
+            updateArgs: [],
+            updateLockKey: null,
+          });
+        }
+        const primaryCapabilities = yield* resolveProviderMaintenanceCapabilitiesEffect(
+          primaryDefinition,
+          {
+            binaryPath,
+            env: commandEnv,
+            platform: process.platform,
+          },
+        ).pipe(Effect.provideService(FileSystem.FileSystem, fileSystem));
+        if (primaryCapabilities.update !== null) {
+          return primaryCapabilities;
+        }
+        for (const definition of alternateDefinitions) {
+          const capabilities = yield* resolveProviderMaintenanceCapabilitiesEffect(definition, {
+            binaryPath,
+            env: commandEnv,
+            platform: process.platform,
+          }).pipe(Effect.provideService(FileSystem.FileSystem, fileSystem));
+          if (capabilities.update !== null) {
+            return capabilities;
+          }
+        }
+        return primaryCapabilities;
       });
 
       const getProviderMaintenanceCapabilities = Effect.fn("getProviderMaintenanceCapabilities")(
@@ -2986,13 +3033,20 @@ export function makeProviderHealthLive(options?: {
         const prepared = prepareWindowsSafeProcess(input.command, input.args, { env: updateEnv });
         const supervised = yield* Effect.uninterruptible(
           Effect.gen(function* () {
+            const childCommandOptions: ChildProcess.CommandOptions & {
+              readonly synaraExternallySupervised: true;
+            } = {
+              detached: OS.platform() !== "win32",
+              shell: prepared.shell,
+              ...(prepared.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
+              env: updateEnv,
+              // Synara installs the exact-identity supervisor below in this same uninterruptible
+              // acquisition. Disable Effect's PID/process-group finalizer so it cannot race that
+              // owner or bypass its fail-closed process-instance validation.
+              synaraExternallySupervised: true,
+            };
             const child = yield* spawner.spawn(
-              ChildProcess.make(prepared.command, prepared.args, {
-                detached: OS.platform() !== "win32",
-                shell: prepared.shell,
-                ...(prepared.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
-                env: updateEnv,
-              }),
+              ChildProcess.make(prepared.command, prepared.args, childCommandOptions),
             );
             let processSupervisor: ReturnType<typeof superviseEffectProcessTree> | null = null;
             let completed = false;
@@ -3002,7 +3056,11 @@ export function makeProviderHealthLive(options?: {
                 : Effect.tryPromise({
                     try: () =>
                       processSupervisor === null
-                        ? teardownEffectProcessTree(child, teardownProcessTree)
+                        ? teardownEffectProcessTree(child, teardownProcessTree, {
+                            ...(OS.platform() === "win32"
+                              ? {}
+                              : { ownedProcessGroupId: Number(child.pid) }),
+                          })
                         : processSupervisor.teardown(),
                     catch: (error) => (error instanceof Error ? error : new Error(String(error))),
                   }).pipe(
@@ -3026,6 +3084,10 @@ export function makeProviderHealthLive(options?: {
               teardownProcessTree,
               platform: OS.platform(),
               ...(OS.platform() === "win32" ? {} : { ownedProcessGroupId: Number(child.pid) }),
+            });
+            yield* Effect.tryPromise({
+              try: () => supervisor.waitForInitialCapture(),
+              catch: (error) => (error instanceof Error ? error : new Error(String(error))),
             });
             processSupervisor = supervisor;
             return {

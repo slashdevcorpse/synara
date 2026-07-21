@@ -29,7 +29,12 @@ export function beginAcpSessionTeardown(
 ): boolean {
   if (state.started) return false;
   state.started = true;
-  onStart();
+  try {
+    onStart();
+  } catch (cause) {
+    state.started = false;
+    throw cause;
+  }
   return true;
 }
 
@@ -58,9 +63,14 @@ export const runAcpSessionTeardown = (input: {
   readonly teardown: Effect.Effect<void>;
 }): Effect.Effect<void> =>
   Effect.uninterruptible(
-    Effect.suspend(() =>
-      beginAcpSessionTeardown(input.state, input.onStart)
-        ? completeAcpSessionTeardown(input.state, input.teardown)
-        : awaitAcpSessionTeardown(input.state),
-    ),
+    Effect.suspend(() => {
+      try {
+        return beginAcpSessionTeardown(input.state, input.onStart)
+          ? completeAcpSessionTeardown(input.state, input.teardown)
+          : awaitAcpSessionTeardown(input.state);
+      } catch (cause) {
+        input.state.started = true;
+        return completeAcpSessionTeardown(input.state, Effect.die(cause));
+      }
+    }),
   );

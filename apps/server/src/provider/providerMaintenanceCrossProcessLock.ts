@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { constants as fsConstants } from "node:fs";
 import * as NodeFs from "node:fs/promises";
 import * as NodePath from "node:path";
 
@@ -53,14 +54,39 @@ export function providerMaintenanceCrossProcessLockDirectory(canonicalInstallRoo
 
 async function prepareLockDirectory(directoryPath: string): Promise<string> {
   await NodeFs.mkdir(directoryPath, { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
-  const stat = await NodeFs.lstat(directoryPath);
-  if (!stat.isDirectory() || stat.isSymbolicLink()) {
-    throw new Error(`Lock root is not a real directory: ${directoryPath}`);
+  if (process.platform === "win32") {
+    const stat = await NodeFs.lstat(directoryPath);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) {
+      throw new Error(`Lock root is not a real directory: ${directoryPath}`);
+    }
+    return NodeFs.realpath(directoryPath);
   }
-  if (process.platform !== "win32") {
-    await NodeFs.chmod(directoryPath, PRIVATE_DIRECTORY_MODE);
+
+  const handle = await NodeFs.open(
+    directoryPath,
+    fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
+  );
+  try {
+    const openedStat = await handle.stat();
+    if (!openedStat.isDirectory()) {
+      throw new Error(`Lock root is not a real directory: ${directoryPath}`);
+    }
+    await handle.chmod(PRIVATE_DIRECTORY_MODE);
+
+    const canonicalDirectory = await NodeFs.realpath(directoryPath);
+    const canonicalStat = await NodeFs.lstat(canonicalDirectory);
+    if (
+      !canonicalStat.isDirectory() ||
+      canonicalStat.isSymbolicLink() ||
+      canonicalStat.dev !== openedStat.dev ||
+      canonicalStat.ino !== openedStat.ino
+    ) {
+      throw new Error(`Lock root identity changed while it was prepared: ${directoryPath}`);
+    }
+    return canonicalDirectory;
+  } finally {
+    await handle.close();
   }
-  return NodeFs.realpath(directoryPath);
 }
 
 function errorDetail(cause: unknown): string {

@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { createHash } from "node:crypto";
 import { once } from "node:events";
 import { copyFile, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -19,6 +20,10 @@ const compilerPath = fileURLToPath(
 const nativeSourcePath = fileURLToPath(
   new URL("../../../scripts/acp-windows-job-native.cs", import.meta.url),
 );
+
+function sha256(bytes: Uint8Array): string {
+  return createHash("sha256").update(bytes).digest("hex");
+}
 
 function processIsRunning(pid: number): boolean {
   try {
@@ -95,6 +100,127 @@ describe.skipIf(process.platform !== "win32")("Windows ACP Job Object containmen
       expect(repaired.subarray(0, 2).toString("ascii")).toBe("MZ");
       expect(repaired.readUInt32LE(peOffset)).toBe(0x0000_4550);
     } finally {
+      if (executablePath !== undefined) await rm(executablePath, { force: true });
+      await rm(fixtureDirectory, { recursive: true, force: true });
+    }
+  }, 25_000);
+
+  it("replaces an unrelated valid PE instead of trusting its image shape", async () => {
+    const fixtureDirectory = await mkdtemp(Path.join(tmpdir(), "synara-acp-job-valid-repair-"));
+    const fixtureCompilerPath = Path.join(fixtureDirectory, "acp-windows-job.ps1");
+    const fixtureSourcePath = Path.join(fixtureDirectory, "acp-windows-job-native.cs");
+    await copyFile(compilerPath, fixtureCompilerPath);
+    const source = await readFile(nativeSourcePath, "utf8");
+    await writeFile(fixtureSourcePath, `${source}\n// Valid PE repair: ${fixtureDirectory}\n`);
+    let executablePath: string | undefined;
+
+    try {
+      const prepare = () =>
+        ensureAcpWindowsJobExecutable({
+          env: process.env,
+          assets: {
+            compilerPath: fixtureCompilerPath,
+            nativeSourcePath: fixtureSourcePath,
+          },
+        });
+      executablePath = await prepare();
+      const unrelatedPath = Path.join(process.env.SystemRoot!, "System32", "cmd.exe");
+      await copyFile(unrelatedPath, executablePath);
+      const unrelatedHash = sha256(await readFile(executablePath));
+
+      expect(await prepare()).toBe(executablePath);
+      expect(sha256(await readFile(executablePath))).not.toBe(unrelatedHash);
+    } finally {
+      if (executablePath !== undefined) await rm(executablePath, { force: true });
+      await rm(fixtureDirectory, { recursive: true, force: true });
+    }
+  }, 25_000);
+
+  it("recovers when the named compiler mutex is abandoned", async () => {
+    const fixtureDirectory = await mkdtemp(Path.join(tmpdir(), "synara-acp-job-abandoned-"));
+    const fixtureCompilerPath = Path.join(fixtureDirectory, "acp-windows-job.ps1");
+    const fixtureSourcePath = Path.join(fixtureDirectory, "acp-windows-job-native.cs");
+    const compilerSource = await readFile(compilerPath);
+    const nativeSource = await readFile(nativeSourcePath);
+    await writeFile(
+      fixtureCompilerPath,
+      Buffer.concat([
+        compilerSource,
+        Buffer.from(`\n# Abandoned mutex fixture: ${fixtureDirectory}\n`, "utf8"),
+      ]),
+    );
+    await writeFile(
+      fixtureSourcePath,
+      Buffer.concat([
+        nativeSource,
+        Buffer.from(`\n// Abandoned mutex fixture: ${fixtureDirectory}\n`, "utf8"),
+      ]),
+    );
+    const mutexName = `Local\\SynaraAcpJobCompile-${sha256(
+      await readFile(fixtureSourcePath),
+    )}-${sha256(await readFile(fixtureCompilerPath))}`;
+    const powershell = Path.join(
+      process.env.SystemRoot!,
+      "System32",
+      "WindowsPowerShell",
+      "v1.0",
+      "powershell.exe",
+    );
+    const keeper = spawn(
+      powershell,
+      [
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        `$mutex = [Threading.Mutex]::new($false, '${mutexName}'); ` +
+          "[Console]::Out.WriteLine('READY'); [Console]::Out.Flush(); " +
+          "Start-Sleep -Seconds 30",
+      ],
+      { stdio: ["ignore", "pipe", "pipe"], windowsHide: true },
+    );
+    let keeperOutput = "";
+    keeper.stdout?.on("data", (chunk) => {
+      keeperOutput += chunk.toString();
+    });
+    keeper.stderr?.on("data", (chunk) => {
+      keeperOutput += chunk.toString();
+    });
+    const keeperClose = once(keeper, "close");
+    let executablePath: string | undefined;
+
+    try {
+      await waitFor(() => keeperOutput.includes("READY"), "the mutex keeper to start");
+      const owner = spawn(
+        powershell,
+        [
+          "-NoLogo",
+          "-NoProfile",
+          "-NonInteractive",
+          "-Command",
+          `$mutex = [Threading.Mutex]::OpenExisting('${mutexName}'); ` +
+            "[void]$mutex.WaitOne(); [Environment]::Exit(0)",
+        ],
+        { stdio: "ignore", windowsHide: true },
+      );
+      const [ownerCode, ownerSignal] = await waitForPromise(
+        once(owner, "close") as Promise<[number | null, NodeJS.Signals | null]>,
+        "the abandoning mutex owner to exit",
+      );
+      expect(ownerSignal).toBeNull();
+      expect(ownerCode).toBe(0);
+
+      executablePath = await ensureAcpWindowsJobExecutable({
+        env: process.env,
+        assets: {
+          compilerPath: fixtureCompilerPath,
+          nativeSourcePath: fixtureSourcePath,
+        },
+      });
+      expect((await readFile(executablePath)).subarray(0, 2).toString("ascii")).toBe("MZ");
+    } finally {
+      if (keeper.exitCode === null && keeper.signalCode === null) keeper.kill();
+      await waitForPromise(keeperClose, "the mutex keeper to close", 5_000).catch(() => undefined);
       if (executablePath !== undefined) await rm(executablePath, { force: true });
       await rm(fixtureDirectory, { recursive: true, force: true });
     }

@@ -22,6 +22,8 @@ export interface CapturedProcess {
   command: string;
   /** Stable process-instance identity, normally derived from the process creation time. */
   identity?: string;
+  /** Precision of the creation-time component used by `identity`. */
+  identityPrecision?: "exact" | "seconds";
   /** POSIX process group; absent on Windows. */
   groupId?: number;
 }
@@ -60,6 +62,13 @@ export interface ProcessTreeKiller {
     includeRootTree?: boolean | undefined;
     onError: (error: Error, context: { pid: number; source: "tree-kill" | "captured" }) => void;
   }): void;
+  signalAsync?(input: {
+    rootPid: number;
+    signal: TerminalKillSignal;
+    tree: CapturedProcessTree;
+    includeRootTree?: boolean | undefined;
+    onError: (error: Error, context: { pid: number; source: "tree-kill" | "captured" }) => void;
+  }): Promise<void>;
 }
 
 export interface ProcessTreeKillerDependencies {
@@ -131,6 +140,7 @@ export function parsePosixProcessSnapshot(psOutput: string): ProcessSnapshotMap 
       groupId,
       command,
       identity: `${pid}:${startedAt}`,
+      identityPrecision: "seconds",
     });
   }
   return snapshot;
@@ -158,7 +168,9 @@ export function parseWindowsProcessSnapshot(json: string): ProcessSnapshotMap | 
         pid,
         parentPid,
         command: command.trim(),
-        ...(startedAt.length > 0 ? { identity: `${pid}:${startedAt}` } : {}),
+        ...(startedAt.length > 0
+          ? { identity: `${pid}:${startedAt}`, identityPrecision: "exact" as const }
+          : {}),
       });
     }
     return snapshot;
@@ -277,6 +289,20 @@ function readCurrentProcesses(pids: readonly number[]): ProcessSnapshotMap | nul
   return selected;
 }
 
+function selectCurrentProcesses(
+  pids: readonly number[],
+  snapshot: ProcessSnapshotMap | null,
+): ProcessSnapshotMap | null {
+  if (snapshot === null) return null;
+  const selected: ProcessSnapshotMap = new Map();
+  for (const pid of new Set(pids)) {
+    if (!Number.isInteger(pid) || pid <= 0) continue;
+    const process = snapshot.get(pid);
+    if (process !== undefined) selected.set(pid, process);
+  }
+  return selected;
+}
+
 function signalPid(pid: number, signal: TerminalKillSignal): Error | null {
   try {
     globalThis.process.kill(pid, signal);
@@ -290,19 +316,37 @@ function signalPid(pid: number, signal: TerminalKillSignal): Error | null {
   }
 }
 
+function matchingCapturedProcessInstance(
+  process: CapturedProcess,
+  currentProcesses: ProcessSnapshotMap | null,
+): CapturedProcessSnapshot | undefined {
+  // A command or bare PID is not a process-instance identity. A legitimate exec can change the
+  // command while retaining the PID, creation identity, and process group.
+  if (process.identity === undefined) return undefined;
+  const current = currentProcesses?.get(process.pid);
+  if (current === undefined || current.identity !== process.identity) return undefined;
+  // POSIX `ps lstart` is only second-granular. Retain the isolated process group as an additional,
+  // independently checked provenance field so same-second PID reuse fails closed.
+  if (process.identityPrecision === "seconds" || current.identityPrecision === "seconds") {
+    if (
+      process.groupId === undefined ||
+      current.groupId === undefined ||
+      current.groupId !== process.groupId
+    ) {
+      return undefined;
+    }
+  }
+  return current;
+}
+
 function shouldSignalCapturedProcess(
   process: CapturedProcess,
-  signal: TerminalKillSignal,
+  _signal: TerminalKillSignal,
   currentProcesses: ProcessSnapshotMap | null,
 ): boolean {
-  if (signal !== "SIGKILL" && process.identity === undefined) {
-    return true;
-  }
-  const current = currentProcesses?.get(process.pid);
-  if (current === undefined) return false;
-  return process.identity !== undefined
-    ? current.identity === process.identity
-    : current.command === process.command;
+  // Signaling remains stricter than liveness inspection: refuse a changed command even when the
+  // stable process identity still matches.
+  return matchingCapturedProcessInstance(process, currentProcesses)?.command === process.command;
 }
 
 function capturedProcessesForSignal(
@@ -391,9 +435,54 @@ export function createProcessTreeKiller(
     return {
       verified: true,
       survivors: tree.descendants.filter((descendant) =>
-        shouldSignalCapturedProcess(descendant, "SIGKILL", currentProcesses),
+        Boolean(matchingCapturedProcessInstance(descendant, currentProcesses)),
       ),
     };
+  };
+
+  type SignalInput = Parameters<ProcessTreeKiller["signal"]>[0];
+
+  const validationPidsForSignal = ({
+    rootPid,
+    signal,
+    tree,
+    includeRootTree = true,
+  }: SignalInput): number[] => [
+    ...tree.descendants
+      .filter((descendant) => signal === "SIGKILL" || descendant.identity !== undefined)
+      .map((descendant) => descendant.pid),
+    ...(includeRootTree && tree.root?.identity !== undefined ? [rootPid] : []),
+  ];
+
+  const signalCapturedProcessesFromSnapshot = (
+    { signal, tree, includeRootTree = true, onError }: SignalInput,
+    currentProcesses: ProcessSnapshotMap | null,
+  ): boolean => {
+    const capturedProcesses = capturedProcessesForSignal(
+      tree.descendants,
+      signal,
+      currentProcesses,
+    );
+    for (const descendant of capturedProcesses.toReversed()) {
+      const error = deps.signalPid(descendant.pid, signal);
+      if (error) {
+        onError(error, { pid: descendant.pid, source: "captured" });
+      }
+    }
+    const shouldSignalRootTree =
+      includeRootTree &&
+      tree.root?.identity !== undefined &&
+      shouldSignalCapturedProcess(tree.root, signal, currentProcesses);
+    return shouldSignalRootTree;
+  };
+
+  const signalRootTree = (input: SignalInput, onComplete: () => void): void => {
+    deps.signalTree(input.rootPid, input.signal, (error) => {
+      if (error) {
+        input.onError(error, { pid: input.rootPid, source: "tree-kill" });
+      }
+      onComplete();
+    });
   };
 
   return {
@@ -410,38 +499,22 @@ export function createProcessTreeKiller(
       tree.descendants.length === 0
         ? { verified: true, survivors: [] }
         : inspectFromSnapshot(tree, await deps.captureProcessSnapshotAsync()),
-    signal: ({ rootPid, signal, tree, includeRootTree = true, onError }) => {
-      // Signal captured descendants directly as well as through tree-kill. If
-      // the PTY root exits, those children may be reparented before escalation.
-      const validationPids = [
-        ...tree.descendants
-          .filter((descendant) => signal === "SIGKILL" || descendant.identity !== undefined)
-          .map((descendant) => descendant.pid),
-        ...(includeRootTree && tree.root?.identity !== undefined ? [rootPid] : []),
-      ];
+    signal: (input) => {
+      const validationPids = validationPidsForSignal(input);
       const currentProcesses =
         validationPids.length > 0 ? deps.readCurrentProcesses(validationPids) : null;
-      const capturedProcesses = capturedProcessesForSignal(
-        tree.descendants,
-        signal,
-        currentProcesses,
-      );
-      for (const descendant of capturedProcesses.toReversed()) {
-        const error = deps.signalPid(descendant.pid, signal);
-        if (error) {
-          onError(error, { pid: descendant.pid, source: "captured" });
-        }
+      if (signalCapturedProcessesFromSnapshot(input, currentProcesses)) {
+        signalRootTree(input, () => undefined);
       }
-      const shouldSignalRootTree =
-        includeRootTree &&
-        tree.root?.identity !== undefined &&
-        shouldSignalCapturedProcess(tree.root, signal, currentProcesses);
-      if (shouldSignalRootTree) {
-        deps.signalTree(rootPid, signal, (err) => {
-          if (err) {
-            onError(err, { pid: rootPid, source: "tree-kill" });
-          }
-        });
+    },
+    signalAsync: async (input) => {
+      const validationPids = validationPidsForSignal(input);
+      const currentProcesses =
+        validationPids.length === 0
+          ? null
+          : selectCurrentProcesses(validationPids, await deps.captureProcessSnapshotAsync());
+      if (signalCapturedProcessesFromSnapshot(input, currentProcesses)) {
+        await new Promise<void>((resolve) => signalRootTree(input, resolve));
       }
     },
   };
