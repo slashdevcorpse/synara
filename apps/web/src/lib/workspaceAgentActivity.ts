@@ -16,15 +16,9 @@ import type {
 
 import { formatSubagentModelLabel } from "./subagentPresentation";
 
-export type AgentStatus =
-  | "idle"
-  | "thinking"
-  | "streaming"
-  | "tool-running"
-  | "queued"
-  | "completed"
-  | "failed"
-  | "stopped";
+export type LiveAgentStatus = "thinking" | "streaming" | "tool-running" | "connecting";
+
+export type AgentStatus = "idle" | LiveAgentStatus | "queued" | "completed" | "failed" | "stopped";
 
 export interface AgentToolActivity {
   name: string;
@@ -79,6 +73,13 @@ export interface WorkspaceAgentActivity {
   threads: AgentThreadEntry[];
   groups: AgentProjectGroup[];
   summary: WorkspaceAgentSummary;
+}
+
+export interface WorkspaceAgentThreadActivity {
+  entry: AgentThreadEntry | null;
+  parentEntry: AgentThreadEntry | null;
+  subagentCount: number;
+  subagentRunningCount: number;
 }
 
 export interface WorkspaceAgentShellProject {
@@ -623,7 +624,7 @@ export function deriveAgentDuration(input: {
   const turnStart =
     timestamp(input.latestTurn?.startedAt) || timestamp(input.latestTurn?.requestedAt);
   const start =
-    input.status === "queued"
+    input.status === "queued" || input.status === "connecting"
       ? timestamp(input.queuedAt) || timestamp(input.sessionUpdatedAt) || turnStart
       : turnStart || timestamp(input.queuedAt) || timestamp(input.sessionUpdatedAt);
   if (start === 0) return 0;
@@ -635,8 +636,13 @@ export function deriveAgentDuration(input: {
   return Math.max(0, end - start);
 }
 
-function isStrictLiveStatus(status: AgentStatus): boolean {
-  return status === "thinking" || status === "streaming" || status === "tool-running";
+export function isLiveAgentStatus(status: AgentStatus): status is LiveAgentStatus {
+  return (
+    status === "connecting" ||
+    status === "thinking" ||
+    status === "streaming" ||
+    status === "tool-running"
+  );
 }
 
 function newestBySequence<T extends { sequence: number }>(values: readonly T[]): T | null {
@@ -656,7 +662,7 @@ function oldestQueuedAt(state: WorkspaceAgentThreadEventState | undefined): stri
   return oldest?.createdAt ?? null;
 }
 
-function deriveStatus(
+export function deriveAgentStatus(
   thread: WorkspaceAgentShellThread,
   eventState: WorkspaceAgentThreadEventState | undefined,
 ): AgentStatus {
@@ -666,6 +672,9 @@ function deriveStatus(
   if (session?.status === "error" && !hasQueuedMessages) return "failed";
   if ((session?.status === "interrupted" || session?.status === "stopped") && !hasQueuedMessages) {
     return "stopped";
+  }
+  if (session?.status === "starting") {
+    return hasQueuedMessages ? "queued" : "connecting";
   }
   const turnId = liveTurnId(thread);
   if (turnId !== null) {
@@ -681,7 +690,7 @@ function deriveStatus(
     }
     return "thinking";
   }
-  if (hasQueuedMessages || session?.status === "starting") return "queued";
+  if (hasQueuedMessages) return "queued";
   if (thread.hasLiveTailWork && (turn === null || turn.state === "running")) return "thinking";
   if (turn?.state === "error") return "failed";
   if (turn?.state === "interrupted") return "stopped";
@@ -747,14 +756,14 @@ export function resolveWorkspaceAgentInterruptTurnId(
     : null;
 }
 
-function createEntry(input: {
+export function deriveAgentThreadEntry(input: {
   thread: WorkspaceAgentShellThread;
   project: WorkspaceAgentShellProject;
   eventState: WorkspaceAgentThreadEventState | undefined;
   nowMs: number;
 }): AgentThreadEntry {
   const { thread, project, eventState } = input;
-  const status = deriveStatus(thread, eventState);
+  const status = deriveAgentStatus(thread, eventState);
   const activeTurnId = liveTurnId(thread);
   const interruptTurnId = resolveWorkspaceAgentInterruptTurnId(thread);
   const turnId =
@@ -823,15 +832,70 @@ function createEntry(input: {
   };
 }
 
+export function deriveWorkspaceAgentThreadActivity(input: {
+  threadId: ThreadId;
+  projects: readonly WorkspaceAgentShellProject[];
+  threads: readonly WorkspaceAgentShellThread[];
+  eventState: WorkspaceAgentEventState;
+  nowMs: number;
+}): WorkspaceAgentThreadActivity {
+  const thread = input.threads.find((candidate) => candidate.threadId === input.threadId);
+  if (!thread) {
+    return {
+      entry: null,
+      parentEntry: null,
+      subagentCount: 0,
+      subagentRunningCount: 0,
+    };
+  }
+
+  const projectById = new Map(input.projects.map((project) => [project.projectId, project]));
+  const deriveEntry = (candidate: WorkspaceAgentShellThread): AgentThreadEntry | null => {
+    const project = projectById.get(candidate.projectId);
+    if (!project) return null;
+    return deriveAgentThreadEntry({
+      thread: candidate,
+      project,
+      eventState: input.eventState.threads[candidate.threadId],
+      nowMs: input.nowMs,
+    });
+  };
+  const parentThread =
+    thread.parentThreadId === null
+      ? null
+      : (input.threads.find(
+          (candidate) =>
+            candidate.threadId === thread.parentThreadId &&
+            candidate.projectId === thread.projectId,
+        ) ?? null);
+  const subagentThreads = input.threads.filter(
+    (candidate) =>
+      candidate.archivedAt === null &&
+      candidate.projectId === thread.projectId &&
+      candidate.parentThreadId === thread.threadId,
+  );
+  const subagentEntries = subagentThreads
+    .map(deriveEntry)
+    .filter((entry): entry is AgentThreadEntry => entry !== null);
+
+  return {
+    entry: deriveEntry(thread),
+    parentEntry: parentThread ? deriveEntry(parentThread) : null,
+    subagentCount: subagentThreads.length,
+    subagentRunningCount: subagentEntries.filter((entry) => isLiveAgentStatus(entry.status)).length,
+  };
+}
+
 const STATUS_ORDER: Record<AgentStatus, number> = {
   "tool-running": 0,
   streaming: 1,
   thinking: 2,
-  queued: 3,
-  failed: 4,
-  stopped: 5,
-  completed: 6,
-  idle: 7,
+  connecting: 3,
+  queued: 4,
+  failed: 5,
+  stopped: 6,
+  completed: 7,
+  idle: 8,
 };
 
 function compareEntries(left: AgentThreadEntry, right: AgentThreadEntry): number {
@@ -848,7 +912,7 @@ function summarize(entries: readonly AgentThreadEntry[]): WorkspaceAgentSummary 
   return entries.reduce<WorkspaceAgentSummary>(
     (summary, entry) => {
       summary.total += 1;
-      if (isStrictLiveStatus(entry.status)) summary.running += 1;
+      if (isLiveAgentStatus(entry.status)) summary.running += 1;
       if (entry.status === "queued") summary.queued += 1;
       if (entry.status === "completed") summary.completed += 1;
       if (entry.status === "failed") summary.failed += 1;
@@ -943,7 +1007,7 @@ export function deriveWorkspaceAgentActivity(input: {
   );
   const shellThreadById = new Map(visibleShellThreads.map((thread) => [thread.threadId, thread]));
   const allEntries = visibleShellThreads.map((thread) =>
-    createEntry({
+    deriveAgentThreadEntry({
       thread,
       project: projectById.get(thread.projectId)!,
       eventState: input.eventState.threads[thread.threadId],
@@ -951,20 +1015,20 @@ export function deriveWorkspaceAgentActivity(input: {
     }),
   );
   const hasCurrentWork = allEntries.some(
-    (entry) => isStrictLiveStatus(entry.status) || entry.status === "queued",
+    (entry) => isLiveAgentStatus(entry.status) || entry.status === "queued",
   );
   if (!hasCurrentWork) return EMPTY_ACTIVITY;
 
   const parents = effectiveParents(allEntries);
   const liveRoots = new Set(
     allEntries
-      .filter((entry) => isStrictLiveStatus(entry.status) || entry.status === "queued")
+      .filter((entry) => isLiveAgentStatus(entry.status) || entry.status === "queued")
       .map((entry) => familyRoot(entry.threadId, parents)),
   );
   const requiredAncestors = new Set<ThreadId>();
   const activeBoundaryByRoot = new Map<ThreadId, number>();
   for (const entry of allEntries) {
-    if (!isStrictLiveStatus(entry.status) && entry.status !== "queued") continue;
+    if (!isLiveAgentStatus(entry.status) && entry.status !== "queued") continue;
     let current: ThreadId | null = entry.threadId;
     while (current !== null) {
       requiredAncestors.add(current);

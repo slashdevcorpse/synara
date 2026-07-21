@@ -42,7 +42,7 @@ import {
   resolveSettingsBackTarget,
   resolveProjectStatusIndicator,
   resolveSidebarNewThreadEnvMode,
-  resolveThreadHoverCardMetadata,
+  resolveThreadHoverCardWorkspaceLabel,
   resolveThreadRowClassName,
   resolveThreadStatusPill,
   runArchiveFallbackNavigation,
@@ -444,51 +444,93 @@ describe("debug feature flags menu visibility", () => {
   });
 });
 
-describe("resolveThreadHoverCardMetadata", () => {
-  it("includes source project and worktree names for worktree-backed chats", () => {
-    const metadata = resolveThreadHoverCardMetadata({
-      thread: makeSidebarThreadSummary({
-        envMode: "worktree",
-        branch: "codex/synara-mobile",
-        worktreePath: "/Users/me/.codex/worktrees/1234/Remodex",
-        associatedWorktreePath: "/Users/me/.codex/worktrees/1234/Remodex",
-        associatedWorktreeBranch: "codex/synara-mobile",
+describe("resolveThreadHoverCardWorkspaceLabel", () => {
+  it("prefers the associated worktree branch over every other label source", () => {
+    expect(
+      resolveThreadHoverCardWorkspaceLabel({
+        thread: {
+          associatedWorktreeBranch: "  feature/thread-hover-card  ",
+          associatedWorktreePath: "/repo/.worktrees/path-fallback/",
+        },
+        project: {
+          folderName: "folder-fallback",
+          name: "project-fallback",
+        },
       }),
-      project: {
-        name: "synara-mobile",
-        folderName: "Remodex",
-        cwd: "/Users/me/Developer/Remodex",
-      },
-    });
-
-    expect(metadata).toEqual({
-      projectName: "synara-mobile",
-      projectCwd: "/Users/me/Developer/Remodex",
-      sourceProjectName: "Remodex",
-      branch: "codex/synara-mobile",
-      worktreeName: "Remodex",
-    });
+    ).toBe("feature/thread-hover-card");
   });
 
-  it("keeps local chats compact", () => {
-    const metadata = resolveThreadHoverCardMetadata({
-      thread: makeSidebarThreadSummary({
-        branch: "main",
+  it.each([
+    ["POSIX", "/repo/.worktrees/thread-hover-card/", "thread-hover-card"],
+    ["Windows", "C:\\repo\\.worktrees\\thread-hover-card\\", "thread-hover-card"],
+    ["mixed separators", "C:\\repo/.worktrees\\thread-hover-card", "thread-hover-card"],
+  ])("uses the basename of a %s associated worktree path", (_kind, path, expected) => {
+    expect(
+      resolveThreadHoverCardWorkspaceLabel({
+        thread: {
+          associatedWorktreeBranch: null,
+          associatedWorktreePath: path,
+        },
+        project: {
+          folderName: "folder-fallback",
+          name: "project-fallback",
+        },
       }),
-      project: {
-        name: "synara",
-        folderName: "synara",
-        cwd: "/Users/me/Developer/synara",
-      },
-    });
+    ).toBe(expected);
+  });
 
-    expect(metadata).toEqual({
-      projectName: "synara",
-      projectCwd: "/Users/me/Developer/synara",
-      sourceProjectName: null,
-      branch: "main",
-      worktreeName: null,
-    });
+  it("uses the project folder name when associated worktree values are blank", () => {
+    expect(
+      resolveThreadHoverCardWorkspaceLabel({
+        thread: {
+          associatedWorktreeBranch: "  ",
+          associatedWorktreePath: "  ",
+        },
+        project: {
+          folderName: "  source-folder  ",
+          name: "project-fallback",
+        },
+      }),
+    ).toBe("source-folder");
+  });
+
+  it("falls back from a blank project folder name to the project display name", () => {
+    expect(
+      resolveThreadHoverCardWorkspaceLabel({
+        thread: {
+          associatedWorktreeBranch: null,
+          associatedWorktreePath: null,
+        },
+        project: {
+          folderName: "  ",
+          name: "  Synara  ",
+        },
+      }),
+    ).toBe("Synara");
+  });
+
+  it("returns null when every workspace label source is absent or blank", () => {
+    expect(
+      resolveThreadHoverCardWorkspaceLabel({
+        thread: {
+          associatedWorktreeBranch: " ",
+          associatedWorktreePath: "/",
+        },
+        project: {
+          folderName: " ",
+          name: " ",
+        },
+      }),
+    ).toBeNull();
+    expect(
+      resolveThreadHoverCardWorkspaceLabel({
+        thread: {
+          associatedWorktreeBranch: null,
+          associatedWorktreePath: null,
+        },
+        project: null,
+      }),
+    ).toBeNull();
   });
 });
 
@@ -1779,6 +1821,7 @@ function makeSidebarThreadSummary(
       provider: "codex",
       model: "gpt-5.4",
     },
+    runtimeMode: "full-access",
     interactionMode: DEFAULT_INTERACTION_MODE,
     branch: null,
     worktreePath: null,
