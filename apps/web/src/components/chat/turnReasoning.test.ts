@@ -360,6 +360,39 @@ describe("buildTurnReasoningSummaryByAssistantMessageId", () => {
     });
   });
 
+  it("derives the durable tool total when only per-name counts are available", () => {
+    const assistant = message({
+      id: "a1",
+      role: "assistant",
+      turnId: "t1",
+      createdAt: "2026-07-21T10:00:01.000Z",
+      completedAt: "2026-07-21T10:00:02.000Z",
+    });
+    const { toolCallCount: _toolCallCount, ...turnWithoutTotal } = durableTurn("t1", {
+      assistantMessageId: assistant.id,
+      toolNameCounts: [
+        { name: "Read", count: 2 },
+        { name: "Bash", count: 1 },
+      ],
+    });
+
+    const summary = buildTurnReasoningSummaryByAssistantMessageId({
+      messages: [
+        message({ id: "u1", role: "user", createdAt: "2026-07-21T10:00:00.000Z" }),
+        assistant,
+      ],
+      turns: [turnWithoutTotal],
+    }).get(assistant.id);
+
+    expect(summary).toMatchObject({
+      toolCallCount: 3,
+      toolNameCounts: [
+        { name: "Read", count: 2 },
+        { name: "Bash", count: 1 },
+      ],
+    });
+  });
+
   it("falls back to already-collapsed timeline work when raw activities are unavailable", () => {
     const user = message({
       id: "u1",

@@ -419,9 +419,10 @@ function toProjectedLatestTurn(row: ProjectionLatestTurnDbRow): OrchestrationLat
 function toProjectedTurn(
   row: ProjectionTurnDbRow & { readonly turnId: TurnId },
 ): OrchestrationTurnSummary {
-  const toolNames = row.toolCalls.flatMap((toolCall) =>
-    toolCall.name === null ? [] : [toolCall.name],
-  );
+  const toolNames = row.toolCalls.flatMap((toolCall) => {
+    const name = toolCall.name?.trim();
+    return name === undefined || name.length === 0 ? [] : [name];
+  });
   const toolNameCountMap = new Map<string, { readonly name: string; readonly count: number }>();
   for (const name of toolNames) {
     const normalizedName = name.trim().toLowerCase();

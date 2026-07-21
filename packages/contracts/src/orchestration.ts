@@ -550,13 +550,15 @@ export const OrchestrationThreadActivity = Schema.Struct({
 });
 export type OrchestrationThreadActivity = typeof OrchestrationThreadActivity.Type;
 
-const OrchestrationLatestTurnState = Schema.Literals([
+export const OrchestrationTurnState = Schema.Literals([
   "running",
   "interrupted",
   "completed",
   "error",
 ]);
-export type OrchestrationLatestTurnState = typeof OrchestrationLatestTurnState.Type;
+export type OrchestrationTurnState = typeof OrchestrationTurnState.Type;
+export const OrchestrationLatestTurnState = OrchestrationTurnState;
+export type OrchestrationLatestTurnState = OrchestrationTurnState;
 
 export const OrchestrationLatestTurn = Schema.Struct({
   turnId: TurnId,
@@ -569,13 +571,8 @@ export const OrchestrationLatestTurn = Schema.Struct({
 });
 export type OrchestrationLatestTurn = typeof OrchestrationLatestTurn.Type;
 
-export const OrchestrationTurnSummaryState = Schema.Literals([
-  "running",
-  "interrupted",
-  "completed",
-  "error",
-]);
-export type OrchestrationTurnSummaryState = typeof OrchestrationTurnSummaryState.Type;
+export const OrchestrationTurnSummaryState = OrchestrationTurnState;
+export type OrchestrationTurnSummaryState = OrchestrationTurnState;
 
 /**
  * Provider-attributed token data for one concrete turn. Exact generation fields

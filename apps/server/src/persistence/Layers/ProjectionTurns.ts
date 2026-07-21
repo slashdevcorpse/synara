@@ -25,26 +25,21 @@ import {
   type ProjectionTurnRepositoryShape,
 } from "../Services/ProjectionTurns.ts";
 
+const projectionTurnDbFieldOverrides = {
+  checkpointFiles: Schema.fromJsonString(Schema.Array(OrchestrationCheckpointFile)),
+  modelSelection: Schema.NullOr(Schema.fromJsonString(ModelSelection)),
+  tokenUsage: Schema.NullOr(Schema.fromJsonString(OrchestrationTurnTokenUsage)),
+  toolCalls: Schema.fromJsonString(Schema.Array(ProjectionTurnToolCall)),
+  approvalRequestIds: Schema.fromJsonString(Schema.Array(Schema.String)),
+  rejectedApprovalRequestIds: Schema.fromJsonString(Schema.Array(Schema.String)),
+};
+
 const ProjectionTurnDbRowSchema = ProjectionTurn.mapFields(
-  Struct.assign({
-    checkpointFiles: Schema.fromJsonString(Schema.Array(OrchestrationCheckpointFile)),
-    modelSelection: Schema.NullOr(Schema.fromJsonString(ModelSelection)),
-    tokenUsage: Schema.NullOr(Schema.fromJsonString(OrchestrationTurnTokenUsage)),
-    toolCalls: Schema.fromJsonString(Schema.Array(ProjectionTurnToolCall)),
-    approvalRequestIds: Schema.fromJsonString(Schema.Array(Schema.String)),
-    rejectedApprovalRequestIds: Schema.fromJsonString(Schema.Array(Schema.String)),
-  }),
+  Struct.assign(projectionTurnDbFieldOverrides),
 );
 
 const ProjectionTurnByIdDbRowSchema = ProjectionTurnById.mapFields(
-  Struct.assign({
-    checkpointFiles: Schema.fromJsonString(Schema.Array(OrchestrationCheckpointFile)),
-    modelSelection: Schema.NullOr(Schema.fromJsonString(ModelSelection)),
-    tokenUsage: Schema.NullOr(Schema.fromJsonString(OrchestrationTurnTokenUsage)),
-    toolCalls: Schema.fromJsonString(Schema.Array(ProjectionTurnToolCall)),
-    approvalRequestIds: Schema.fromJsonString(Schema.Array(Schema.String)),
-    rejectedApprovalRequestIds: Schema.fromJsonString(Schema.Array(Schema.String)),
-  }),
+  Struct.assign(projectionTurnDbFieldOverrides),
 );
 
 const ProjectionPendingTurnStartDbRowSchema = ProjectionPendingTurnStart.mapFields(

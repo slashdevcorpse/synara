@@ -539,7 +539,11 @@ function deriveTools(
     ? mergeToolNameCounts(turns.map((turn) => turn.toolNameCounts ?? []))
     : countToolNames(turns.flatMap((turn) => turn.toolNames ?? []));
   if (durableCount !== null || durableNameCounts.length > 0) {
-    return { count: durableCount ?? 0, nameCounts: durableNameCounts };
+    return {
+      count:
+        durableCount ?? durableNameCounts.reduce((total, toolCount) => total + toolCount.count, 0),
+      nameCounts: durableNameCounts,
+    };
   }
   const activityTools = deriveActivityTools(activities);
   return activityTools.count > 0 ? activityTools : deriveTimelineTools(segment, timelineEntries);

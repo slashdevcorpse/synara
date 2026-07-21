@@ -268,7 +268,7 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
             'worktree',
             'streaming',
             '{"provider":"codex","inputTokens":120,"cachedInputTokens":20,"outputTokens":30,"reasoningOutputTokens":10,"totalTokens":160,"contextUsedTokens":160,"contextWindowTokens":200000,"updatedAt":"2026-02-24T00:00:08.000Z"}',
-            '[{"id":"read-1","name":"Read"},{"id":"read-2","name":"read"},{"id":"bash-1","name":"Bash"}]',
+            '[{"id":"read-1","name":"Read"},{"id":"read-2","name":"read"},{"id":"bash-1","name":"Bash"},{"id":"blank-1","name":"   "},{"id":"unnamed-1","name":null}]',
             '["approval-1","approval-2"]',
             '["approval-2"]'
           ),
@@ -449,7 +449,7 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
                 contextWindowTokens: 200_000,
                 updatedAt: "2026-02-24T00:00:08.000Z",
               },
-              toolCallCount: 3,
+              toolCallCount: 5,
               toolNames: ["Read", "read", "Bash"],
               toolNameCounts: [
                 { name: "Read", count: 2 },
