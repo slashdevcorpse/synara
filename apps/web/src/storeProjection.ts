@@ -942,9 +942,10 @@ export function syncServerReadModel(state: AppState, readModel: OrchestrationRea
     )
     .map((thread) => {
       const existing = getThreadFromState(state, thread.id);
+      const existingTurns = existing?.turns ?? [];
       const recoveryThread =
-        existing?.turns.length && (thread.turns?.length ?? 0) === 0
-          ? { ...thread, turns: existing.turns }
+        existingTurns.length > 0 && (thread.turns?.length ?? 0) === 0
+          ? { ...thread, turns: existingTurns }
           : thread;
       return normalizeThreadFromReadModel(recoveryThread, existing);
     });
