@@ -8,6 +8,7 @@ import {
   type BackendRestartGeneration,
   type BackendRestartRequest,
 } from "./backendRestartController";
+import { runAfterDesktopShutdown } from "./backendShutdown";
 
 const desktopMainSource = readFileSync(new URL("./main.ts", import.meta.url), "utf8").replaceAll(
   "\r\n",
@@ -335,12 +336,21 @@ describe("BackendRestartController", () => {
 
   it.each(["Windows timed-out shutdown", "POSIX exit deadline"])(
     "retains ownership after %s and records exactly one failure only on later exit",
-    (shutdownDisposition) => {
+    async (shutdownDisposition) => {
       const generation = admit("readiness probe");
+      const shutdownError = new Error(shutdownDisposition);
+      let completedShutdowns = 0;
+
+      await expect(
+        runAfterDesktopShutdown(Promise.reject(shutdownError), () => {
+          completedShutdowns += 1;
+          controller.dispose();
+        }),
+      ).rejects.toBe(shutdownError);
 
       // An unconfirmed shutdown disposition must not be translated into a
       // controller failure: the still-owned generation remains the admission lock.
-      vi.advanceTimersByTime(10_000);
+      expect(completedShutdowns).toBe(0);
       expect(controller.getSnapshot()).toMatchObject({
         activeGenerationId: generation.id,
         activeGenerationPhase: "starting",
@@ -608,8 +618,23 @@ describe("desktop backend restart integration", () => {
       "async function shutdownDesktopRuntime(",
       "function requestGracefulAppQuit(",
     );
+    expect(shutdown.indexOf("stopBackendAndWaitForExit()")).toBeLessThan(
+      shutdown.indexOf("if (!disposition.exitConfirmed)"),
+    );
+    expect(shutdown.indexOf("if (!disposition.exitConfirmed)")).toBeLessThan(
+      shutdown.indexOf("backendRestartController.dispose()"),
+    );
+    expect(shutdown.indexOf("browserManager.dispose()")).toBeLessThan(
+      shutdown.indexOf("backendRestartController.dispose()"),
+    );
     expect(shutdown.indexOf("backendRestartController.dispose()")).toBeLessThan(
-      shutdown.indexOf("stopBackendAndWaitForExit()"),
+      shutdown.indexOf("desktopShutdownComplete = true"),
+    );
+    expect(shutdown.indexOf("browserManager.dispose()")).toBeLessThan(
+      shutdown.indexOf("if (shutdownDisposition === null"),
+    );
+    expect(shutdown.indexOf("if (shutdownDisposition === null")).toBeLessThan(
+      shutdown.indexOf("backendRestartController.dispose()"),
     );
     expect(shutdown.indexOf("cancelBackendGenerationReadinessWait()")).toBeLessThan(
       shutdown.indexOf("stopBackendAndWaitForExit()"),

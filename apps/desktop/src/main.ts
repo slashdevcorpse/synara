@@ -3434,7 +3434,6 @@ async function shutdownDesktopRuntime(reason: string): Promise<void> {
   }
 
   isQuitting = true;
-  backendRestartController.dispose();
   cancelBackendGenerationReadinessWait();
   writeDesktopLogHeader(`${reason} shutdown start`);
   let shutdownDisposition: BackendStopDisposition | null = null;
@@ -3462,6 +3461,7 @@ async function shutdownDesktopRuntime(reason: string): Promise<void> {
     if (shutdownDisposition === null || !shutdownDisposition.exitConfirmed) {
       throw new Error("Desktop backend exit proof was lost during shutdown cleanup.");
     }
+    backendRestartController.dispose();
     desktopShutdownComplete = true;
     writeDesktopLogHeader(
       `${reason} shutdown complete disposition=${shutdownDisposition.type} forced=${shutdownDisposition.forced}`,
