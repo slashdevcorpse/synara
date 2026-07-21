@@ -677,6 +677,38 @@ describe("workflow contracts", () => {
     expect(validateWorkflowContracts(excessiveDispatchPermission, policy()).join("\n")).toContain(
       "unsupported actions: write at jobs.dispatch.permissions",
     );
+
+    const publication = validFiles();
+    publication.set(
+      ".github/workflows/super-synara-prerelease.yml",
+      `name: Super Synara prerelease
+on:
+  workflow_call:
+permissions:
+  contents: read
+jobs:
+  draft_admission:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+  publish:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+`,
+    );
+    expect(validateWorkflowContracts(publication, policy())).toEqual([]);
+
+    const excessivePreflightPermission = new Map(publication);
+    excessivePreflightPermission.set(
+      ".github/workflows/super-synara-prerelease.yml",
+      publication
+        .get(".github/workflows/super-synara-prerelease.yml")!
+        .replace("  draft_admission:", "  preflight:"),
+    );
+    expect(validateWorkflowContracts(excessivePreflightPermission, policy()).join("\n")).toContain(
+      "unsupported contents: write at jobs.preflight.permissions",
+    );
   });
 
   it("requires native CI gates to fail closed before the build", () => {

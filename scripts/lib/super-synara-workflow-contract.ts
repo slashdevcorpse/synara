@@ -30,7 +30,9 @@ const PREFLIGHT_ROUTE_TREE_SETUP_COMMAND = [
 ].join("\n");
 const MACOS_JOB_CONDITION = "${{ needs.preflight.outputs.include_macos == 'true' }}";
 const PUBLISH_JOB_CONDITION =
-  "${{ always() && needs.preflight.result == 'success' && needs.windows_x64.result == 'success' && ((needs.preflight.outputs.include_macos == 'true' && needs.macos_arm64.result == 'success') || (needs.preflight.outputs.include_macos == 'false' && needs.macos_arm64.result == 'skipped')) }}";
+  "${{ always() && needs.draft_admission.result == 'success' && needs.preflight.result == 'success' && needs.windows_x64.result == 'success' && ((needs.preflight.outputs.include_macos == 'true' && needs.macos_arm64.result == 'success') || (needs.preflight.outputs.include_macos == 'false' && needs.macos_arm64.result == 'skipped')) }}";
+const CHECKOUT_ACTION = "actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10";
+const SETUP_NODE_ACTION = "actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38";
 
 function isRecord(value: unknown): value is UnknownRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -365,6 +367,105 @@ function verifyPreflightRouteTreeIsolation(preflightJob: UnknownRecord): void {
   }
 }
 
+function verifyDraftAdmissionJob(jobs: UnknownRecord): void {
+  const job = publicationJob(jobs, "draft_admission");
+  const permissions = job.permissions;
+  if (
+    job["runs-on"] !== "ubuntu-24.04" ||
+    job["timeout-minutes"] !== 5 ||
+    job.if !== undefined ||
+    job.needs !== undefined ||
+    (job["continue-on-error"] !== undefined && job["continue-on-error"] !== false) ||
+    !isRecord(permissions) ||
+    JSON.stringify(permissions) !== JSON.stringify({ contents: "write" })
+  ) {
+    throw new Error(
+      "Publication draft admission must be an unconditional, minimal, write-scoped Ubuntu job.",
+    );
+  }
+
+  const steps = job.steps;
+  if (!Array.isArray(steps) || steps.length !== 4 || steps.some((step) => !isRecord(step))) {
+    throw new Error("Publication draft admission must contain exactly four minimal steps.");
+  }
+  const [authorization, checkout, setupNode, validation] = steps as ReadonlyArray<UnknownRecord>;
+  if (
+    authorization!.name !== "Authorize exact protected-main draft admission" ||
+    typeof authorization!.run !== "string" ||
+    checkout!.name !== "Checkout exact admitted source" ||
+    checkout!.uses !== CHECKOUT_ACTION ||
+    setupNode!.name !== "Setup Node" ||
+    setupNode!.uses !== SETUP_NODE_ACTION ||
+    validation!.name !== "Validate exact owned draft visibility" ||
+    typeof validation!.run !== "string"
+  ) {
+    throw new Error("Publication draft admission must retain its four exact bounded steps.");
+  }
+  for (const needle of [
+    '[[ "$CALLER_WORKFLOW_REF" == "$GITHUB_REPOSITORY/.github/workflows/release-drafter.yml@refs/heads/main" ]]',
+    '[[ "$REF_PROTECTED" == "true" ]]',
+    '[[ "$EXPECTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]',
+    '[[ "$WORKFLOW_SOURCE_SHA" == "$EXPECTED_SOURCE_SHA" ]]',
+    '[[ "$ACTOR" == "$OWNER" ]]',
+    '[[ "$TRIGGERING_ACTOR" == "$OWNER" ]]',
+    '[[ "$TAG" == "super-v$VERSION" ]]',
+    '[[ "$DRAFT_ID" =~ ^[1-9][0-9]*$ ]]',
+  ]) {
+    requireText(
+      authorization!.run,
+      needle,
+      "Publication draft admission must authenticate the exact protected-main owner controller before checkout.",
+    );
+  }
+  const checkoutWith = checkout!.with;
+  if (
+    !isRecord(checkoutWith) ||
+    checkoutWith.ref !== "${{ inputs.expected_source_sha }}" ||
+    checkoutWith["fetch-depth"] !== 1 ||
+    checkoutWith["persist-credentials"] !== false
+  ) {
+    throw new Error("Publication draft admission must checkout only the authenticated source SHA.");
+  }
+  const setupNodeWith = setupNode!.with;
+  if (!isRecord(setupNodeWith) || setupNodeWith["node-version-file"] !== "package.json") {
+    throw new Error("Publication draft admission must pin the repository Node runtime.");
+  }
+  const validationEnvironment = validation!.env;
+  if (
+    !isRecord(validationEnvironment) ||
+    validationEnvironment.GH_TOKEN !== "${{ github.token }}"
+  ) {
+    throw new Error("Publication draft admission must scope its token to exact draft validation.");
+  }
+  for (const needle of [
+    "node scripts/verify-super-synara-github-state.ts",
+    "--phase preflight",
+    '--source-commit "$SOURCE_COMMIT"',
+    '--current-run-draft-id "$DRAFT_ID"',
+  ]) {
+    requireText(
+      validation!.run,
+      needle,
+      "Publication draft admission must validate the exact owned draft before native builds.",
+    );
+  }
+}
+
+function verifyPublicationJobDependencies(jobs: UnknownRecord): void {
+  for (const [jobName, expected] of [
+    ["windows_x64", ["draft_admission", "preflight"]],
+    ["macos_arm64", ["draft_admission", "preflight"]],
+    ["publish", ["draft_admission", "preflight", "windows_x64", "macos_arm64"]],
+  ] as const) {
+    const job = publicationJob(jobs, jobName);
+    if (JSON.stringify(job.needs) !== JSON.stringify(expected)) {
+      throw new Error(
+        `Publication workflow ${jobName} must depend on exact draft admission and its required predecessors.`,
+      );
+    }
+  }
+}
+
 function verifyNativeJobCommands(
   job: UnknownRecord,
   jobName: string,
@@ -503,7 +604,7 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
   prohibitText(audit, "secrets.", "Audit workflow must not consume signing secrets.");
   prohibitText(audit, "id-token:", "Audit workflow must not request identity-token permission.");
 
-  for (const job of ["preflight", "windows_x64", "macos_arm64", "publish"]) {
+  for (const job of ["draft_admission", "preflight", "windows_x64", "macos_arm64", "publish"]) {
     requireText(main, `\n  ${job}:`, `Publication workflow is missing the ${job} job.`);
   }
   const jobs = publicationJobs(main);
@@ -519,6 +620,8 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
     throw new Error("Publication release-scope contract must default to exact Windows x64.");
   }
   verifyRootTestOwnership(jobs);
+  verifyDraftAdmissionJob(jobs);
+  verifyPublicationJobDependencies(jobs);
   verifyPreflightSourceCleanliness(jobs);
   const preflightJob = publicationJob(jobs, "preflight");
   verifyPreflightRouteTreeIsolation(preflightJob);
@@ -986,7 +1089,6 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
 
 const RELEASE_DRAFTER_ACTION =
   "release-drafter/release-drafter@eada3c96a64734dd381cfbda23511034e328ddb0";
-const SETUP_NODE_ACTION = "actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38";
 const RELEASE_DRAFTER_GATE_CONDITION = "steps.changes.outputs.should_release == 'true'";
 const RELEASE_DRAFTER_DISPATCH_CONDITION =
   "${{ github.event_name != 'push' && needs.draft.outputs.should_release == 'true' }}";

@@ -33,6 +33,71 @@ permissions:
   contents: read
 
 jobs:
+  draft_admission:
+    name: Admit exact owned release draft
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Authorize exact protected-main draft admission
+        shell: bash
+        env:
+          ACTOR: ${{ github.actor }}
+          CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
+          DRAFT_ID: ${{ inputs.release_draft_id }}
+          EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+          OWNER: ${{ github.repository_owner }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          TAG: ${{ inputs.tag }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          VERSION: ${{ inputs.version }}
+          WORKFLOW_SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$CALLER_WORKFLOW_REF" == "$GITHUB_REPOSITORY/.github/workflows/release-drafter.yml@refs/heads/main" ]]
+          [[ "$REF_PROTECTED" == "true" ]]
+          [[ "$EXPECTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$WORKFLOW_SOURCE_SHA" == "$EXPECTED_SOURCE_SHA" ]]
+          [[ "$ACTOR" == "$OWNER" ]]
+          [[ "$TRIGGERING_ACTOR" == "$OWNER" ]]
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+-super\.[1-9][0-9]*$ ]]
+          [[ "$TAG" == "super-v$VERSION" ]]
+          [[ "$DRAFT_ID" =~ ^[1-9][0-9]*$ ]]
+
+      - name: Checkout exact admitted source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ inputs.expected_source_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: package.json
+
+      - name: Validate exact owned draft visibility
+        shell: bash
+        env:
+          DRAFT_ID: ${{ inputs.release_draft_id }}
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_COMMIT: ${{ inputs.expected_source_sha }}
+          TAG: ${{ inputs.tag }}
+          VALIDATION_ACTOR: ${{ github.actor }}
+          VALIDATION_TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+        run: |
+          node scripts/verify-super-synara-github-state.ts \
+            --phase preflight \
+            --repository "$GITHUB_REPOSITORY" \
+            --ref-name "$GITHUB_REF_NAME" \
+            --actor "$VALIDATION_ACTOR" \
+            --triggering-actor "$VALIDATION_TRIGGERING_ACTOR" \
+            --owner "$GITHUB_REPOSITORY_OWNER" \
+            --tag "$TAG" \
+            --source-commit "$SOURCE_COMMIT" \
+            --current-run-draft-id "$DRAFT_ID"
+
   preflight:
     name: Validate immutable source and release policy
     runs-on: ubuntu-24.04
@@ -198,26 +263,6 @@ jobs:
             github-unsigned-prerelease \
             false
 
-      - name: Validate GitHub tag and release state
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.meta.outputs.tag }}
-          DRAFT_ID: ${{ steps.meta.outputs.release_draft_id }}
-          VALIDATION_ACTOR: ${{ steps.meta.outputs.validation_actor }}
-          VALIDATION_TRIGGERING_ACTOR: ${{ steps.meta.outputs.validation_triggering_actor }}
-        run: |
-          node scripts/verify-super-synara-github-state.ts \
-            --phase preflight \
-            --repository "$GITHUB_REPOSITORY" \
-            --ref-name "$GITHUB_REF_NAME" \
-            --actor "$VALIDATION_ACTOR" \
-            --triggering-actor "$VALIDATION_TRIGGERING_ACTOR" \
-            --owner "$GITHUB_REPOSITORY_OWNER" \
-            --tag "$TAG" \
-            --source-commit "$GITHUB_SHA" \
-            --current-run-draft-id "$DRAFT_ID"
-
       - name: Verify Super Synara identity
         run: bun run brand:check
 
@@ -247,7 +292,7 @@ jobs:
 
   windows_x64:
     name: Build unsigned Windows x64 installer
-    needs: preflight
+    needs: [draft_admission, preflight]
     runs-on: windows-2022
     timeout-minutes: 45
     steps:
@@ -522,7 +567,7 @@ jobs:
 
   macos_arm64:
     name: Build unsigned macOS arm64 disk image
-    needs: preflight
+    needs: [draft_admission, preflight]
     if: ${{ needs.preflight.outputs.include_macos == 'true' }}
     runs-on: macos-15
     timeout-minutes: 45
@@ -689,9 +734,10 @@ jobs:
 
   publish:
     name: Admit and publish exact unsigned prerelease
-    needs: [preflight, windows_x64, macos_arm64]
+    needs: [draft_admission, preflight, windows_x64, macos_arm64]
     if: >-
       ${{ always() &&
+          needs.draft_admission.result == 'success' &&
           needs.preflight.result == 'success' &&
           needs.windows_x64.result == 'success' &&
           ((needs.preflight.outputs.include_macos == 'true' && needs.macos_arm64.result == 'success') ||

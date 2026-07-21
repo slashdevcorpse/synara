@@ -236,6 +236,33 @@ describe("Super Synara workflow contracts", () => {
     ).toThrow("pin the repository Node runtime");
   });
 
+  it("isolates draft visibility in an authenticated minimal write-scoped job", () => {
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          "  draft_admission:\n    name: Admit exact owned release draft\n    runs-on: ubuntu-24.04\n    timeout-minutes: 5\n    permissions:\n      contents: write",
+          "  draft_admission:\n    name: Admit exact owned release draft\n    runs-on: ubuntu-24.04\n    timeout-minutes: 5\n    permissions:\n      contents: read",
+        ),
+        audit,
+      ),
+    ).toThrow("minimal, write-scoped Ubuntu job");
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          '[[ "$WORKFLOW_SOURCE_SHA" == "$EXPECTED_SOURCE_SHA" ]]',
+          '[[ "$WORKFLOW_SOURCE_SHA" != "$EXPECTED_SOURCE_SHA" ]]',
+        ),
+        audit,
+      ),
+    ).toThrow("authenticate the exact protected-main owner controller before checkout");
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace("    needs: [draft_admission, preflight]", "    needs: preflight"),
+        audit,
+      ),
+    ).toThrow("must depend on exact draft admission");
+  });
+
   it("rejects removal of the reviewed allowlist gate", () => {
     expect(() =>
       verifySuperSynaraWorkflowText(
@@ -580,7 +607,7 @@ describe("Super Synara workflow contracts", () => {
         main.replace('[[ "$TAG" == "super-v$VERSION" ]]', "true"),
         audit,
       ),
-    ).toThrow("explicit tag matches the version");
+    ).toThrow("authenticate the exact protected-main owner controller before checkout");
     expect(() =>
       verifySuperSynaraWorkflowText(
         main.replace(
@@ -754,7 +781,7 @@ describe("Super Synara workflow contracts", () => {
         main.replace('[[ "$REF_PROTECTED" == "true" ]]', "true"),
         audit,
       ),
-    ).toThrow("dispatch ref is protected");
+    ).toThrow("authenticate the exact protected-main owner controller before checkout");
     expect(() =>
       verifySuperSynaraWorkflowText(
         main,
@@ -766,7 +793,7 @@ describe("Super Synara workflow contracts", () => {
         main.replace('[[ "$WORKFLOW_SOURCE_SHA" == "$EXPECTED_SOURCE_SHA" ]]', "true"),
         audit,
       ),
-    ).toThrow("complete scope metadata data flow");
+    ).toThrow("authenticate the exact protected-main owner controller before checkout");
     expect(() =>
       verifySuperSynaraWorkflowText(
         main.replace('[[ "$RELEASE_DRAFT_ID" =~ ^[1-9][0-9]*$ ]]', "true"),
