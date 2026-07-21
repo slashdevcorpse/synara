@@ -28,25 +28,31 @@ describe("desktop source build environment", () => {
   });
 
   it("redirects route-tree generation for exact-provenance builds", () => {
-    expect(
-      createDesktopSourceBuildEnvironment({
-        baseEnvironment: { SYNARA_GENERATED_ROUTE_TREE: "inherited", PRESERVED: "yes" },
-        flavor: "super",
-        disableUpdates: true,
-        exactProvenanceRequested: true,
-        generatedRouteTreePath: "C:\\release-stage\\routeTree.gen.ts",
-      }),
-    ).toMatchObject({
+    const environment = createDesktopSourceBuildEnvironment({
+      baseEnvironment: { synara_generated_route_tree: "inherited", PRESERVED: "yes" },
+      flavor: "super",
+      disableUpdates: true,
+      exactProvenanceRequested: true,
+      generatedRouteTreePath: "C:\\release-stage\\routeTree.gen.ts",
+    });
+
+    expect(environment).toMatchObject({
       PRESERVED: "yes",
       SYNARA_DESKTOP_FLAVOR: "super",
       SYNARA_DESKTOP_DISABLE_UPDATES: "1",
       SYNARA_GENERATED_ROUTE_TREE: "C:\\release-stage\\routeTree.gen.ts",
     });
+    expect(environment).not.toHaveProperty("synara_generated_route_tree");
   });
 
   it("removes inherited route-tree redirects outside exact-provenance builds", () => {
     const environment = createDesktopSourceBuildEnvironment({
-      baseEnvironment: { SYNARA_GENERATED_ROUTE_TREE: "inherited", PRESERVED: "yes" },
+      baseEnvironment: {
+        SYNARA_GENERATED_ROUTE_TREE: "inherited-uppercase",
+        Synara_Generated_Route_Tree: "inherited-mixed-case",
+        synara_generated_route_tree: "inherited-lowercase",
+        PRESERVED: "yes",
+      },
       flavor: "production",
       disableUpdates: false,
       exactProvenanceRequested: false,
@@ -57,7 +63,9 @@ describe("desktop source build environment", () => {
       SYNARA_DESKTOP_FLAVOR: "production",
       SYNARA_DESKTOP_DISABLE_UPDATES: "0",
     });
-    expect(environment).not.toHaveProperty("SYNARA_GENERATED_ROUTE_TREE");
+    expect(
+      Object.keys(environment).filter((key) => key.toUpperCase() === "SYNARA_GENERATED_ROUTE_TREE"),
+    ).toEqual([]);
   });
 
   it("fails closed when an exact build has no redirect", () => {
