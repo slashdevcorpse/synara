@@ -59,10 +59,24 @@ describe("Super Synara workflow contracts", () => {
       ['--arg tag "$TAG"', '--arg tag "$FORGED_TAG"'],
       ['--arg source_commit "$SOURCE_COMMIT"', '--arg source_commit "$FORGED_COMMIT"'],
       ['<<< "$releases_json"', '<<< "$FORGED_RELEASES_JSON"'],
+      ['elif length == 0 then empty else error("multiple owned drafts") end', "else empty end"],
     ] as const) {
       expect(() =>
         verifySuperSynaraWorkflowText(main.replace(binding, replacement), audit),
       ).toThrow("must filter the captured response with standalone jq arguments");
+    }
+  });
+
+  it("requires bounded fail-closed draft visibility polling", () => {
+    for (const [required, weakened] of [
+      ["for attempt in {1..30}; do", "for attempt in {1..1}; do"],
+      ['if [[ "$query_status" -ne 4 ]]; then', "if false; then"],
+      ['exit "$query_status"', "true"],
+      ["sleep 1", "true"],
+    ] as const) {
+      expect(() => verifySuperSynaraWorkflowText(main.replace(required, weakened), audit)).toThrow(
+        "must poll boundedly for GitHub release-list visibility",
+      );
     }
   });
 

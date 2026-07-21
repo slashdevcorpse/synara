@@ -568,10 +568,37 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
     draftFilterCommands.length !== 1 ||
     !draftFilterCommands[0]!.includes('--arg tag "$TAG"') ||
     !draftFilterCommands[0]!.includes('--arg source_commit "$SOURCE_COMMIT"') ||
-    !draftFilterCommands[0]!.includes('<<< "$releases_json"')
+    !draftFilterCommands[0]!.includes('<<< "$releases_json"') ||
+    !draftFilterCommands[0]!.includes(
+      'elif length == 0 then empty else error("multiple owned drafts") end',
+    )
   ) {
     throw new Error(
       "Publication draft lookup must filter the captured response with standalone jq arguments.",
+    );
+  }
+  const draftCreateIndex = draftStep.run.indexOf('gh release create "$TAG"');
+  const draftRetryIndex = draftStep.run.indexOf("for attempt in {1..30}; do");
+  const draftQueryIndex = draftStep.run.indexOf("gh api --paginate --slurp", draftRetryIndex);
+  const draftFilterIndex = draftStep.run.indexOf("jq -er", draftQueryIndex);
+  const draftRetryEndIndex = draftStep.run.indexOf("\ndone\n", draftFilterIndex);
+  const draftIdCheckIndex = draftStep.run.indexOf(
+    '[[ "$draft_id" =~ ^[1-9][0-9]*$ ]]',
+    draftRetryEndIndex,
+  );
+  if (
+    draftCreateIndex < 0 ||
+    draftRetryIndex <= draftCreateIndex ||
+    draftQueryIndex <= draftRetryIndex ||
+    draftFilterIndex <= draftQueryIndex ||
+    draftRetryEndIndex <= draftFilterIndex ||
+    draftIdCheckIndex <= draftRetryEndIndex ||
+    !draftStep.run.includes('if [[ "$query_status" -ne 4 ]]; then') ||
+    !draftStep.run.includes('exit "$query_status"') ||
+    !draftStep.run.includes("sleep 1")
+  ) {
+    throw new Error(
+      "Publication draft lookup must poll boundedly for GitHub release-list visibility and fail closed on query errors.",
     );
   }
   const macosDownloadStep = publishSteps.find(
