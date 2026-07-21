@@ -162,7 +162,8 @@ import {
 import { buildGitHubReleasesPageUrl, resolveGitHubUpdateSource } from "./githubUpdateFeed";
 import { isArm64HostRunningIntelBuild, resolveDesktopRuntimeInfo } from "./runtimeArch";
 import { DesktopBrowserManager } from "./browserManager";
-import { BROWSER_SESSION_PARTITION, secureBrowserWebviewAttachment } from "./browserSecurity";
+import { secureBrowserWebviewAttachment } from "./browserSecurity";
+import { BROWSER_SESSION_PARTITION } from "./browserSessionPolicy";
 import { registerBrowserIpcHandlers, sendBrowserCopyLink, sendBrowserState } from "./browserIpc";
 import {
   BrowserUsePipeServer,

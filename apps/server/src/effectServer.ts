@@ -131,6 +131,24 @@ export function reconcileManagedWorktreesBeforeHttpListen(input: {
   );
 }
 
+export function recoverGitHandoffsThenReconcileManagedWorktreesBeforeHttpListen<
+  RecoveryValue,
+  RecoveryError,
+  RecoveryRequirements,
+  ReconciliationValue,
+  ReconciliationError,
+  ReconciliationRequirements,
+>(
+  recoverGitHandoffs: Effect.Effect<RecoveryValue, RecoveryError, RecoveryRequirements>,
+  reconcileWorktrees: Effect.Effect<
+    ReconciliationValue,
+    ReconciliationError,
+    ReconciliationRequirements
+  >,
+) {
+  return recoverGitHandoffs.pipe(Effect.andThen(reconcileWorktrees));
+}
+
 export const createEffectServer = Effect.fn(function* (
   shutdownController: ServerShutdownController,
 ) {
@@ -172,13 +190,20 @@ export const createEffectServer = Effect.fn(function* (
   yield* readiness.markPushBusReady;
   yield* readiness.markKeybindingsReady;
 
-  yield* reconcileManagedWorktreesBeforeHttpListen({
-    worktreesDir: config.worktreesDir,
-    projectionSnapshotQuery,
-    git,
-  }).pipe(
-    Effect.mapError(
-      (cause) => new ServerLifecycleError({ operation: "loadManagedWorktreeLinks", cause }),
+  yield* recoverGitHandoffsThenReconcileManagedWorktreesBeforeHttpListen(
+    recoverGitHandoffOperations((command) => orchestrationEngine.dispatch(command)).pipe(
+      Effect.mapError(
+        (cause) => new ServerLifecycleError({ operation: "recoverGitHandoffOperations", cause }),
+      ),
+    ),
+    reconcileManagedWorktreesBeforeHttpListen({
+      worktreesDir: config.worktreesDir,
+      projectionSnapshotQuery,
+      git,
+    }).pipe(
+      Effect.mapError(
+        (cause) => new ServerLifecycleError({ operation: "loadManagedWorktreeLinks", cause }),
+      ),
     ),
   );
 
@@ -249,11 +274,6 @@ export const createEffectServer = Effect.fn(function* (
   // died, so they can never complete on their own) before clients can observe
   // the stale "Working" state.
   yield* reconcileRestartStuckTurns;
-  yield* recoverGitHandoffOperations((command) => orchestrationEngine.dispatch(command)).pipe(
-    Effect.mapError(
-      (cause) => new ServerLifecycleError({ operation: "recoverGitHandoffOperations", cause }),
-    ),
-  );
   yield* runtimeStartup.markCommandReady;
 
   yield* lifecycleEvents.publish({

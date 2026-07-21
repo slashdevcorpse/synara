@@ -58,6 +58,7 @@ import {
 } from "./serverShutdown";
 import { resolveFavicon, tryParseHost } from "./siteFaviconCache";
 import {
+  DESKTOP_APP_CORS_ORIGINS,
   isTrustedAppOrigin,
   normalizeCorsOrigin,
   shouldRejectAuthMutationOrigin,
@@ -341,13 +342,32 @@ function encodeCookie(input: {
   readonly name: string;
   readonly value: string;
   readonly expiresAt: DateTime.DateTime;
+  readonly sameSite: "None" | "Strict";
   readonly secure: boolean;
 }) {
-  return `${encodeURIComponent(input.name)}=${encodeURIComponent(input.value)}; Expires=${DateTime.toDate(input.expiresAt).toUTCString()}; HttpOnly; Path=/; SameSite=Strict${input.secure ? "; Secure" : ""}`;
+  return `${encodeURIComponent(input.name)}=${encodeURIComponent(input.value)}; Expires=${DateTime.toDate(input.expiresAt).toUTCString()}; HttpOnly; Path=/; SameSite=${input.sameSite}${input.secure ? "; Secure" : ""}`;
 }
 
-function encodeExpiredCookie(input: { readonly name: string; readonly secure: boolean }) {
-  return `${encodeURIComponent(input.name)}=; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Max-Age=0; HttpOnly; Path=/; SameSite=Strict${input.secure ? "; Secure" : ""}`;
+function encodeExpiredCookie(input: {
+  readonly name: string;
+  readonly sameSite: "None" | "Strict";
+  readonly secure: boolean;
+}) {
+  return `${encodeURIComponent(input.name)}=; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Max-Age=0; HttpOnly; Path=/; SameSite=${input.sameSite}${input.secure ? "; Secure" : ""}`;
+}
+
+function resolveSessionCookieAttributes(input: {
+  readonly rawOrigin: string | ReadonlyArray<string> | undefined;
+  readonly config: ServerConfigShape;
+}): { readonly sameSite: "None" | "Strict"; readonly secure: boolean } {
+  const origin = normalizeCorsOrigin(input.rawOrigin);
+  const isDesktopCrossSiteRequest = origin !== null && DESKTOP_APP_CORS_ORIGINS.has(origin);
+  return {
+    sameSite: isDesktopCrossSiteRequest ? "None" : "Strict",
+    // SameSite=None is rejected without Secure. Chromium treats loopback as a
+    // trustworthy cookie origin, including the desktop backend's 127.0.0.1 URL.
+    secure: isDesktopCrossSiteRequest || input.config.publicUrl !== undefined,
+  };
 }
 
 function isBodyCapacityError(cause: unknown): boolean {
@@ -443,6 +463,10 @@ export const authEffectRouteLayer = HttpRouter.add(
     if (request.method === "OPTIONS") {
       return HttpServerResponse.empty({ status: 204, headers: corsHeaders });
     }
+    const sessionCookieAttributes = resolveSessionCookieAttributes({
+      rawOrigin: request.headers.origin,
+      config,
+    });
     return yield* Effect.gen(function* () {
       const authRequest = makeEffectAuthRequest(request);
 
@@ -467,7 +491,7 @@ export const authEffectRouteLayer = HttpRouter.add(
               name: sessions.cookieName,
               value: result.sessionToken,
               expiresAt: result.response.expiresAt,
-              secure: config.publicUrl !== undefined,
+              ...sessionCookieAttributes,
             }),
           },
         });
@@ -522,7 +546,7 @@ export const authEffectRouteLayer = HttpRouter.add(
             headers: {
               "Set-Cookie": encodeExpiredCookie({
                 name: sessions.cookieName,
-                secure: config.publicUrl !== undefined,
+                ...sessionCookieAttributes,
               }),
             },
           },

@@ -49,6 +49,8 @@ export interface ProcessTreeKiller {
     signal: TerminalKillSignal;
     tree: CapturedProcessTree;
     includeRootTree?: boolean | undefined;
+    shouldSignalRootTree?: (() => boolean) | undefined;
+    abortSignal?: AbortSignal | undefined;
     onError: (error: Error, context: { pid: number; source: "tree-kill" | "captured" }) => void;
   }): MaybePromise<void>;
 }
@@ -195,15 +197,28 @@ function shouldSignalCapturedProcess(
   return currentCommands?.get(process.pid) === process.command;
 }
 
+function throwIfSignalingAborted(signal: AbortSignal | undefined): void {
+  if (!signal?.aborted) return;
+  if (signal.reason instanceof Error) {
+    throw signal.reason;
+  }
+  const error = new Error("Process tree signaling was aborted.");
+  error.name = "AbortError";
+  throw error;
+}
+
 async function capturedProcessesForSignal(
   descendants: readonly CapturedProcess[],
   signal: TerminalKillSignal,
   readCommands: (pids: readonly number[]) => MaybePromise<ProcessCommandMap | null>,
+  abortSignal?: AbortSignal,
 ): Promise<CapturedProcess[]> {
+  throwIfSignalingAborted(abortSignal);
   const currentCommands =
     signal === "SIGKILL"
       ? await readCommands(descendants.map((descendant) => descendant.pid))
       : null;
+  throwIfSignalingAborted(abortSignal);
   return descendants.filter((descendant) =>
     shouldSignalCapturedProcess(descendant, signal, currentCommands),
   );
@@ -225,14 +240,21 @@ export function createProcessTreeKiller(
 
   const readCommandsForPlatform = async (
     pids: readonly number[],
+    abortSignal?: AbortSignal,
   ): Promise<ProcessCommandMap | null> => {
+    throwIfSignalingAborted(abortSignal);
     if (deps.platform !== "win32") {
-      return deps.readCurrentCommands(pids);
+      const commands = await deps.readCurrentCommands(pids);
+      throwIfSignalingAborted(abortSignal);
+      return commands;
     }
     if (pids.length === 0) return new Map();
     try {
-      return processCommandMapFromWindowsSnapshot(await deps.captureWindowsSnapshot());
+      const snapshot = await deps.captureWindowsSnapshot(abortSignal);
+      throwIfSignalingAborted(abortSignal);
+      return processCommandMapFromWindowsSnapshot(snapshot);
     } catch {
+      throwIfSignalingAborted(abortSignal);
       return null;
     }
   };
@@ -285,21 +307,33 @@ export function createProcessTreeKiller(
         ),
       };
     },
-    signal: async ({ rootPid, signal, tree, includeRootTree = true, onError }) => {
+    signal: async ({
+      rootPid,
+      signal,
+      tree,
+      includeRootTree = true,
+      shouldSignalRootTree,
+      abortSignal,
+      onError,
+    }) => {
       // Signal captured descendants directly as well as through tree-kill. If
       // the PTY root exits, those children may be reparented before escalation.
       const capturedProcesses = await capturedProcessesForSignal(
         tree.descendants,
         signal,
-        readCommandsForPlatform,
+        (pids) => readCommandsForPlatform(pids, abortSignal),
+        abortSignal,
       );
       for (const descendant of capturedProcesses.toReversed()) {
+        throwIfSignalingAborted(abortSignal);
         const error = deps.signalPid(descendant.pid, signal);
         if (error) {
           onError(error, { pid: descendant.pid, source: "captured" });
         }
       }
       if (includeRootTree) {
+        if (shouldSignalRootTree?.() === false) return;
+        throwIfSignalingAborted(abortSignal);
         await new Promise<void>((resolve) => {
           deps.signalTree(rootPid, signal, (err) => {
             if (err) {

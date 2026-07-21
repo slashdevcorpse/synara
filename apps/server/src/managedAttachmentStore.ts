@@ -64,6 +64,14 @@ export async function withManagedAttachmentStagingPathLock<T>(
 ): Promise<T> {
   const key = managedAttachmentStagingLockKey(stagingPath);
   const previous = managedAttachmentStagingPathLockTails.get(key) ?? Promise.resolve();
+  return runWithManagedAttachmentStagingPathLock(key, previous, operation);
+}
+
+async function runWithManagedAttachmentStagingPathLock<T>(
+  key: string,
+  previous: Promise<void>,
+  operation: () => Promise<T>,
+): Promise<T> {
   let release!: () => void;
   const completion = new Promise<void>((resolve) => {
     release = resolve;
@@ -79,6 +87,20 @@ export async function withManagedAttachmentStagingPathLock<T>(
       managedAttachmentStagingPathLockTails.delete(key);
     }
   }
+}
+
+export async function tryWithManagedAttachmentStagingPathLock<T>(
+  stagingPath: string,
+  operation: () => Promise<T>,
+): Promise<{ readonly acquired: false } | { readonly acquired: true; readonly value: T }> {
+  const key = managedAttachmentStagingLockKey(stagingPath);
+  if (managedAttachmentStagingPathLockTails.has(key)) {
+    return { acquired: false };
+  }
+  return {
+    acquired: true,
+    value: await runWithManagedAttachmentStagingPathLock(key, Promise.resolve(), operation),
+  };
 }
 
 export type BinaryChatAttachment = ChatImageAttachment | ChatFileAttachment;

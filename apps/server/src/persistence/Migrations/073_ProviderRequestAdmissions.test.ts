@@ -53,6 +53,30 @@ layer("073_ProviderRequestAdmissions", (it) => {
           '2026-07-20T12:00:01.000Z'
         )
       `;
+      yield* sql`
+        INSERT INTO projection_thread_activities (
+          activity_id, thread_id, tone, kind, summary, payload_json, created_at
+        ) VALUES
+        (
+          'activity-upgrade-pending-missing-generation', ${threadId}, 'approval',
+          'approval.requested', 'Approval requested with no generation',
+          ${JSON.stringify({
+            requestId: "request-upgrade-pending",
+            requestType: "wrong_missing_generation",
+          })},
+          '2026-07-20T12:00:04.000Z'
+        ),
+        (
+          'activity-upgrade-pending-wrong-generation', ${threadId}, 'approval',
+          'approval.requested', 'Approval requested with another generation',
+          ${JSON.stringify({
+            requestId: "request-upgrade-pending",
+            requestType: "wrong_other_generation",
+            lifecycleGeneration: "generation-other",
+          })},
+          '2026-07-20T12:00:05.000Z'
+        )
+      `;
 
       for (const row of [
         ["approval", "request-upgrade-pending", "pending"],
@@ -109,6 +133,39 @@ layer("073_ProviderRequestAdmissions", (it) => {
         )
         `;
       }
+      yield* sql`
+        INSERT INTO projection_thread_activities (
+          activity_id, thread_id, tone, kind, summary, payload_json, created_at
+        ) VALUES
+        (
+          'activity-generation-absent-match', ${parentThreadId}, 'approval',
+          'approval.requested', 'Approval requested without a generation',
+          ${JSON.stringify({
+            requestId: "request-generation-absent",
+            requestType: "absent_generation_match",
+          })},
+          '2026-07-20T13:00:01.000Z'
+        ),
+        (
+          'activity-generation-absent-wrong', ${parentThreadId}, 'approval',
+          'approval.requested', 'Approval requested with a generation',
+          ${JSON.stringify({
+            requestId: "request-generation-absent",
+            requestType: "wrong_present_generation",
+            lifecycleGeneration: "generation-present",
+          })},
+          '2026-07-20T13:00:02.000Z'
+        )
+      `;
+      yield* sql`
+        INSERT INTO projection_pending_interactions (
+          interaction_kind, request_id, thread_id, lifecycle_generation,
+          status, response_requested_at, created_at
+        ) VALUES (
+          'approval', 'request-generation-absent', ${parentThreadId}, NULL,
+          'pending', NULL, '2026-07-20T13:00:03.000Z'
+        )
+      `;
       for (const [requestId, syntheticChildThreadId] of [
         ["request-synthetic-child", childThreadId],
         ["request-wildcard-child", wildcardChildThreadId],
@@ -168,6 +225,24 @@ layer("073_ProviderRequestAdmissions", (it) => {
         requestType: "command_execution_approval",
         openedEventId: "activity-upgrade-pending",
       });
+
+      const absentGenerationHydrated = yield* sql<{
+        readonly requestType: string | null;
+        readonly openedEventId: string;
+      }>`
+        SELECT
+          request_type AS "requestType",
+          opened_event_id AS "openedEventId"
+        FROM provider_request_admissions
+        WHERE thread_id = ${parentThreadId}
+          AND request_id = 'request-generation-absent'
+      `;
+      assert.deepStrictEqual(absentGenerationHydrated, [
+        {
+          requestType: "absent_generation_match",
+          openedEventId: "activity-generation-absent-match",
+        },
+      ]);
 
       const freshResults = [];
       for (let index = 0; index < 7; index++) {

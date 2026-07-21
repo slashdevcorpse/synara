@@ -72,8 +72,10 @@ export default Effect.gen(function* () {
           END
           AND json_extract(activity.payload_json, '$.requestId') = pending.request_id
           AND (
-            pending.lifecycle_generation IS NULL
-            OR json_extract(activity.payload_json, '$.lifecycleGeneration') IS NULL
+            (
+              pending.lifecycle_generation IS NULL
+              AND json_extract(activity.payload_json, '$.lifecycleGeneration') IS NULL
+            )
             OR json_extract(activity.payload_json, '$.lifecycleGeneration') =
               pending.lifecycle_generation
           )
@@ -93,8 +95,10 @@ export default Effect.gen(function* () {
             END
             AND json_extract(activity.payload_json, '$.requestId') = pending.request_id
             AND (
-              pending.lifecycle_generation IS NULL
-              OR json_extract(activity.payload_json, '$.lifecycleGeneration') IS NULL
+              (
+                pending.lifecycle_generation IS NULL
+                AND json_extract(activity.payload_json, '$.lifecycleGeneration') IS NULL
+              )
               OR json_extract(activity.payload_json, '$.lifecycleGeneration') =
                 pending.lifecycle_generation
             )

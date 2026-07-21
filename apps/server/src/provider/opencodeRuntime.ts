@@ -871,6 +871,7 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
         const child = yield* spawner.spawn(
           ChildProcess.make(prepared.command, prepared.args, {
             shell: prepared.shell,
+            ...(prepared.windowsHide ? { windowsHide: true } : {}),
             ...(prepared.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
             ...(input.cwd ? { cwd: input.cwd } : {}),
             env: childEnv,
@@ -950,6 +951,7 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
               env: childEnv,
               ...(input.cwd ? { cwd: input.cwd } : {}),
               shell: prepared.shell,
+              ...(prepared.windowsHide ? { windowsHide: true } : {}),
               ...(prepared.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
               detached: false,
               killSignal: "SIGKILL",

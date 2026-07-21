@@ -3,13 +3,13 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 
 import {
-  BROWSER_SESSION_PARTITION,
   createBrowserPopupNavigationPolicy,
   enforceBrowserNavigationPolicy,
   enforceBrowserPopupNavigationPolicy,
   isAllowedBrowserNavigationUrl,
   secureBrowserWebviewAttachment,
 } from "./browserSecurity";
+import { BROWSER_SESSION_PARTITION } from "./browserSessionPolicy";
 
 describe("desktop browser security policy", () => {
   it.each([

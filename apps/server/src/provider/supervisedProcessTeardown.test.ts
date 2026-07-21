@@ -6,6 +6,7 @@ import type {
   ProcessTreeKiller,
   TerminalKillSignal,
 } from "../terminal/processTreeKiller";
+import { createProcessTreeKiller } from "../terminal/processTreeKiller";
 import {
   ProviderProcessExitUnprovenError,
   teardownProviderProcessTree,
@@ -158,6 +159,147 @@ describe("teardownProviderProcessTree", () => {
       await expect(teardown).resolves.toEqual({ escalated: true, signalErrors: [] });
       expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
       expect(inspectCalls).toBe(2);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("bounds a hanging callback-based TERM signal and still escalates to exit proof", async () => {
+    vi.useFakeTimers();
+    try {
+      const termSignalStarted = Promise.withResolvers<void>();
+      const signals: TerminalKillSignal[] = [];
+      let resolveRootExit!: () => void;
+      const rootExited = new Promise<void>((resolve) => {
+        resolveRootExit = resolve;
+      });
+      const processTreeKiller = createProcessTreeKiller({
+        platform: "linux",
+        captureChildrenMap: () => new Map(),
+        signalTree: (_rootPid, signal, callback) => {
+          signals.push(signal);
+          if (signal === "SIGTERM") {
+            termSignalStarted.resolve();
+            return;
+          }
+          resolveRootExit();
+          callback(null);
+        },
+      });
+      const teardown = teardownProviderProcessTree(
+        { rootPid: 271, rootExited, termGraceMs: 5, forceExitMs: 5, pollMs: 5 },
+        { processTreeKiller, ...deterministicClock() },
+      );
+
+      await termSignalStarted.promise;
+      await vi.advanceTimersByTimeAsync(5);
+
+      const result = await teardown;
+      expect(result.escalated).toBe(true);
+      expect(result.signalErrors).toHaveLength(1);
+      expect(result.signalErrors[0]?.message).toContain(
+        "SIGTERM signaling did not settle within 5ms",
+      );
+      expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("aborts timed-out Windows identity preparation before any late forced signal", async () => {
+    vi.useFakeTimers();
+    try {
+      const forcePreparationStarted = Promise.withResolvers<void>();
+      const releaseForcePreparation = Promise.withResolvers<void>();
+      const signaledPids: Array<{ pid: number; signal: TerminalKillSignal }> = [];
+      const treeSignals: Array<{ rootPid: number; signal: TerminalKillSignal }> = [];
+      const snapshot = {
+        kind: "ok" as const,
+        processCount: 2,
+        childrenByParentPid: new Map([
+          [1, [{ pid: 301, command: "provider-root.exe" }]],
+          [301, [{ pid: 302, command: "provider-worker.exe" }]],
+        ]),
+      };
+      let forcePreparationSignal: AbortSignal | undefined;
+      let forcedSignaling: Promise<void> | undefined;
+      let snapshotCalls = 0;
+      const windowsProcessTreeKiller = createProcessTreeKiller({
+        platform: "win32",
+        captureWindowsSnapshot: async (signal) => {
+          snapshotCalls += 1;
+          if (snapshotCalls === 3) {
+            forcePreparationSignal = signal;
+            forcePreparationStarted.resolve();
+            await releaseForcePreparation.promise;
+            return snapshot;
+          }
+          if (snapshotCalls > 3) {
+            return { kind: "unknown", reason: "capture_failed" };
+          }
+          return snapshot;
+        },
+        signalPid: (pid, signal) => {
+          signaledPids.push({ pid, signal });
+          return null;
+        },
+        signalTree: (rootPid, signal, callback) => {
+          treeSignals.push({ rootPid, signal });
+          callback(null);
+        },
+      });
+      const phaseAbortSignals = new Map<TerminalKillSignal, AbortSignal | undefined>();
+      const processTreeKiller: ProcessTreeKiller = {
+        capture: windowsProcessTreeKiller.capture,
+        inspect: (tree) => {
+          if (!windowsProcessTreeKiller.inspect) {
+            throw new Error("Expected the concrete process-tree killer to support inspection.");
+          }
+          return windowsProcessTreeKiller.inspect(tree);
+        },
+        signal: (input) => {
+          phaseAbortSignals.set(input.signal, input.abortSignal);
+          const signaling = Promise.resolve(windowsProcessTreeKiller.signal(input));
+          if (input.signal === "SIGKILL") {
+            forcedSignaling = signaling;
+          }
+          return signaling;
+        },
+      };
+      const teardown = teardownProviderProcessTree(
+        {
+          rootPid: 301,
+          rootExited: new Promise(() => undefined),
+          termGraceMs: 5,
+          forceExitMs: 5,
+          pollMs: 5,
+        },
+        { processTreeKiller, ...deterministicClock() },
+      ).catch((error: unknown) => error);
+
+      await forcePreparationStarted.promise;
+      await vi.advanceTimersByTimeAsync(5);
+      const failure = await teardown;
+
+      expect(failure).toBeInstanceOf(ProviderProcessExitUnprovenError);
+      expect(forcePreparationSignal?.aborted).toBe(true);
+      expect(phaseAbortSignals.get("SIGTERM")?.aborted).toBe(false);
+      expect(phaseAbortSignals.get("SIGKILL")).toBe(forcePreparationSignal);
+      expect(phaseAbortSignals.get("SIGTERM")).not.toBe(forcePreparationSignal);
+      expect(signaledPids).toEqual([{ pid: 302, signal: "SIGTERM" }]);
+      expect(treeSignals).toEqual([{ rootPid: 301, signal: "SIGTERM" }]);
+
+      if (!forcedSignaling) {
+        throw new Error("Expected forced signaling to start before its preparation deadline.");
+      }
+      const forcedSignalingFailure = forcedSignaling.catch((error: unknown) => error);
+      releaseForcePreparation.resolve();
+      await expect(forcedSignalingFailure).resolves.toMatchObject({ name: "AbortError" });
+
+      expect(signaledPids).toEqual([{ pid: 302, signal: "SIGTERM" }]);
+      expect(treeSignals).toEqual([{ rootPid: 301, signal: "SIGTERM" }]);
       expect(vi.getTimerCount()).toBe(0);
     } finally {
       vi.useRealTimers();
@@ -333,18 +475,29 @@ describe("teardownProviderProcessTree", () => {
     const rootExited = new Promise<void>((resolve) => {
       resolveRootExit = resolve;
     });
-    const signals: Array<{ signal: TerminalKillSignal; includeRootTree: boolean | undefined }> = [];
+    const signals: Array<{
+      signal: TerminalKillSignal;
+      includeRootTree: boolean | undefined;
+      descendantPids: number[];
+    }> = [];
     const processTreeKiller: ProcessTreeKiller = {
       capture: async () => {
         captureStarted.resolve();
         await new Promise<void>((resolve) => {
           releaseCapture = resolve;
         });
-        return { descendants: [], captureComplete: true };
+        return {
+          descendants: [{ pid: 502, command: "unrelated-reused-root-child" }],
+          captureComplete: true,
+        };
       },
       inspect: () => ({ verified: true, survivors: [] }),
-      signal: ({ signal, includeRootTree }) => {
-        signals.push({ signal, includeRootTree });
+      signal: ({ signal, includeRootTree, tree }) => {
+        signals.push({
+          signal,
+          includeRootTree,
+          descendantPids: tree.descendants.map(({ pid }) => pid),
+        });
       },
     };
 
@@ -366,8 +519,8 @@ describe("teardownProviderProcessTree", () => {
       captureComplete: false,
     });
     expect(signals).toEqual([
-      { signal: "SIGTERM", includeRootTree: false },
-      { signal: "SIGKILL", includeRootTree: false },
+      { signal: "SIGTERM", includeRootTree: false, descendantPids: [] },
+      { signal: "SIGKILL", includeRootTree: false, descendantPids: [] },
     ]);
   });
 });

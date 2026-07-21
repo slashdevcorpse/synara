@@ -5,6 +5,7 @@ import type { GitCoreShape } from "./git/Services/GitCore.ts";
 import type { ProjectionSnapshotQueryShape } from "./orchestration/Services/ProjectionSnapshotQuery.ts";
 import {
   closeServerRuntimePipeline,
+  recoverGitHandoffsThenReconcileManagedWorktreesBeforeHttpListen,
   reconcileManagedWorktreesBeforeHttpListen,
 } from "./effectServer.ts";
 
@@ -66,6 +67,38 @@ describe("server runtime pipeline shutdown", () => {
 });
 
 describe("server runtime pipeline startup", () => {
+  it("replays durable Git handoff metadata before loading the orphan-pruning snapshot", async () => {
+    const order: string[] = [];
+    let handoffMetadataRecovered = false;
+
+    await Effect.runPromise(
+      recoverGitHandoffsThenReconcileManagedWorktreesBeforeHttpListen(
+        Effect.sync(() => {
+          handoffMetadataRecovered = true;
+          order.push("git-handoff-metadata-recovered");
+        }),
+        reconcileManagedWorktreesBeforeHttpListen({
+          worktreesDir: `missing-managed-worktrees-${crypto.randomUUID()}`,
+          projectionSnapshotQuery: {
+            getCommandReadModel: () =>
+              Effect.sync(() => {
+                expect(handoffMetadataRecovered).toBe(true);
+                order.push("post-recovery-projection-loaded");
+                return { threads: [] } as never;
+              }),
+          } as Pick<ProjectionSnapshotQueryShape, "getCommandReadModel">,
+          git: {} as Pick<GitCoreShape, "removeWorktree" | "statusDetails">,
+        }).pipe(Effect.tap(() => Effect.sync(() => order.push("worktrees-reconciled")))),
+      ),
+    );
+
+    expect(order).toEqual([
+      "git-handoff-metadata-recovered",
+      "post-recovery-projection-loaded",
+      "worktrees-reconciled",
+    ]);
+  });
+
   it("completes managed worktree reconciliation before HTTP listen can begin", async () => {
     const order: string[] = [];
 

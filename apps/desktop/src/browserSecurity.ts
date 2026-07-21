@@ -2,7 +2,8 @@
 // Purpose: Defines testable navigation and webview-attachment policy for the desktop browser.
 // Layer: Desktop main-process security policy
 
-export const BROWSER_SESSION_PARTITION = "persist:synara-browser";
+import { BROWSER_SESSION_PARTITION } from "./browserSessionPolicy";
+
 const ABOUT_BLANK_URL = "about:blank";
 
 function isAboutBlankUrl(rawUrl: string): boolean {

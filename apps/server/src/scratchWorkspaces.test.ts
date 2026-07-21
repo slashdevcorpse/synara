@@ -3,7 +3,16 @@
 //          temp root even when thread ids contain path-like characters.
 // Layer: Server filesystem utility tests
 
-import { mkdirSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  mkdirSync,
+  renameSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -52,6 +61,74 @@ describe("ensureIsolatedScratchWorkspace", () => {
       expect(workspace).not.toContain(`${path.sep}..${path.sep}`);
     } finally {
       rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "repairs pre-existing scratch root and workspace permissions to owner-only",
+    async () => {
+      const parentDir = await mkdtemp(path.join(tmpdir(), "synara-scratch-permissions-"));
+      const rootDir = path.join(parentDir, "managed");
+      const threadId = ThreadId.makeUnsafe("existing-permissions-thread");
+      const workspaceDir = path.join(rootDir, scratchWorkspaceSegment(threadId));
+      try {
+        mkdirSync(workspaceDir, { recursive: true, mode: 0o755 });
+        chmodSync(rootDir, 0o755);
+        chmodSync(workspaceDir, 0o755);
+
+        expect(ensureIsolatedScratchWorkspace(threadId, { rootDir })).toBe(workspaceDir);
+        expect(statSync(rootDir).mode & 0o777).toBe(0o700);
+        expect(statSync(workspaceDir).mode & 0o777).toBe(0o700);
+      } finally {
+        rmSync(parentDir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("rejects a predictable scratch root that is already a symbolic link", async () => {
+    const parentDir = await mkdtemp(path.join(tmpdir(), "synara-scratch-create-root-"));
+    const outsideDir = await mkdtemp(path.join(tmpdir(), "synara-scratch-create-outside-"));
+    const rootDir = path.join(parentDir, "managed");
+    const threadId = ThreadId.makeUnsafe("hostile-root-thread");
+    const escapedWorkspace = path.join(outsideDir, scratchWorkspaceSegment(threadId));
+    try {
+      if (process.platform !== "win32") chmodSync(outsideDir, 0o755);
+      symlinkSync(outsideDir, rootDir, process.platform === "win32" ? "junction" : "dir");
+
+      expect(() => ensureIsolatedScratchWorkspace(threadId, { rootDir })).toThrow(
+        "Scratch workspace root is not a managed directory.",
+      );
+      expect(() => writeFileSync(path.join(escapedWorkspace, "escaped.txt"), "unsafe")).toThrow();
+      if (process.platform !== "win32") expect(statSync(outsideDir).mode & 0o777).toBe(0o755);
+    } finally {
+      rmSync(parentDir, { recursive: true, force: true });
+      rmSync(outsideDir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a predictable per-thread workspace that is already a symbolic link", async () => {
+    const parentDir = await mkdtemp(path.join(tmpdir(), "synara-scratch-create-workspace-"));
+    const outsideDir = await mkdtemp(
+      path.join(tmpdir(), "synara-scratch-create-workspace-outside-"),
+    );
+    const rootDir = path.join(parentDir, "managed");
+    const threadId = ThreadId.makeUnsafe("hostile-workspace-thread");
+    const workspaceDir = path.join(rootDir, scratchWorkspaceSegment(threadId));
+    const outsideProof = path.join(outsideDir, "proof.txt");
+    try {
+      mkdirSync(rootDir);
+      if (process.platform !== "win32") chmodSync(outsideDir, 0o755);
+      writeFileSync(outsideProof, "outside");
+      symlinkSync(outsideDir, workspaceDir, process.platform === "win32" ? "junction" : "dir");
+
+      expect(() => ensureIsolatedScratchWorkspace(threadId, { rootDir })).toThrow(
+        "Scratch workspace target is not a managed directory.",
+      );
+      expect(() => writeFileSync(outsideProof, "still outside")).not.toThrow();
+      if (process.platform !== "win32") expect(statSync(outsideDir).mode & 0o777).toBe(0o755);
+    } finally {
+      rmSync(parentDir, { recursive: true, force: true });
+      rmSync(outsideDir, { recursive: true, force: true });
     }
   });
 });

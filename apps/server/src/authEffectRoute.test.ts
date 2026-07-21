@@ -318,6 +318,10 @@ describe("authEffectRouteLayer", () => {
       expect(bootstrapResponse.status).toBe(200);
       expect(bootstrapResponse.headers.get("access-control-allow-origin")).toBe(origin);
       expect(bootstrapResponse.headers.get("access-control-allow-credentials")).toBe("true");
+      const bootstrapCookie = bootstrapResponse.headers.get("set-cookie") ?? "";
+      expect(bootstrapCookie).toContain("SameSite=None");
+      expect(bootstrapCookie).toContain("Secure");
+      expect(bootstrapCookie).not.toContain("SameSite=Strict");
 
       const sessionResponse = await fetch(`${serverOrigin}/api/auth/session`, {
         headers: { Origin: origin },
@@ -325,7 +329,18 @@ describe("authEffectRouteLayer", () => {
       expect(sessionResponse.status).toBe(200);
       expect(sessionResponse.headers.get("access-control-allow-origin")).toBe(origin);
       expect(sessionResponse.headers.get("access-control-allow-credentials")).toBe("true");
-      expect(sideEffects.count).toBe(1);
+
+      const logoutResponse = await fetch(
+        `${serverOrigin}/api/auth/logout`,
+        mutationRequest({ origin, credential: "cookie" }),
+      );
+      expect(logoutResponse.status).toBe(200);
+      const expiredCookie = logoutResponse.headers.get("set-cookie") ?? "";
+      expect(expiredCookie).toContain("Max-Age=0");
+      expect(expiredCookie).toContain("SameSite=None");
+      expect(expiredCookie).toContain("Secure");
+      expect(expiredCookie).not.toContain("SameSite=Strict");
+      expect(sideEffects.count).toBe(2);
     });
   });
 

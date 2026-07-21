@@ -188,6 +188,53 @@ describe("processTreeKiller", () => {
     expect(signaledPids).toEqual([101]);
   });
 
+  it("rechecks root ownership after delayed Windows identity preparation", async () => {
+    const identityPreparationStarted = Promise.withResolvers<void>();
+    const releaseIdentityPreparation = Promise.withResolvers<void>();
+    const signaledPids: number[] = [];
+    const treeSignals: number[] = [];
+    let rootOwned = true;
+    const killer = createProcessTreeKiller({
+      platform: "win32",
+      captureWindowsSnapshot: async () => {
+        identityPreparationStarted.resolve();
+        await releaseIdentityPreparation.promise;
+        return {
+          kind: "ok",
+          processCount: 1,
+          childrenByParentPid: new Map([[100, [{ pid: 101, command: "provider.exe" }]]]),
+        };
+      },
+      signalPid: (pid) => {
+        signaledPids.push(pid);
+        return null;
+      },
+      signalTree: (rootPid, _signal, callback) => {
+        treeSignals.push(rootPid);
+        callback(null);
+      },
+    });
+    const signaling = killer.signal({
+      rootPid: 100,
+      signal: "SIGKILL",
+      includeRootTree: true,
+      shouldSignalRootTree: () => rootOwned,
+      tree: {
+        descendants: [{ pid: 101, command: "provider.exe" }],
+        captureComplete: true,
+      },
+      onError: () => undefined,
+    });
+
+    await identityPreparationStarted.promise;
+    rootOwned = false;
+    releaseIdentityPreparation.resolve();
+    await signaling;
+
+    expect(signaledPids).toEqual([101]);
+    expect(treeSignals).toEqual([]);
+  });
+
   it("validates captured child commands before delayed SIGKILL", async () => {
     const signaledPids: Array<{ pid: number; signal: TerminalKillSignal }> = [];
     const treeSignals: Array<{ rootPid: number; signal: TerminalKillSignal }> = [];

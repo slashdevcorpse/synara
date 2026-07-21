@@ -7,7 +7,18 @@
 // Exports: ensureIsolatedScratchWorkspace
 
 import { createHash } from "node:crypto";
-import { mkdirSync, type BigIntStats, utimesSync } from "node:fs";
+import {
+  closeSync,
+  constants as fsConstants,
+  fchmodSync,
+  fstatSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  realpathSync,
+  type BigIntStats,
+  utimesSync,
+} from "node:fs";
 import fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -16,6 +27,7 @@ import { ThreadId } from "@synara/contracts";
 import { SCRATCH_WORKSPACES_DIRNAME } from "@synara/shared/threadWorkspace";
 
 import { runProcess } from "./processRunner";
+import { PRIVATE_DIRECTORY_MODE, supportsPosixPermissions } from "./privatePathPermissions";
 
 export const SCRATCH_WORKSPACE_MAX_IDLE_MS = 24 * 60 * 60 * 1_000;
 const SCRATCH_WORKSPACE_SEGMENT_PATTERN = /^[A-Za-z0-9_-][A-Za-z0-9._-]*-[0-9a-f]{12}$/u;
@@ -102,9 +114,122 @@ export function resolveIsolatedScratchWorkspace(threadId: ThreadId): string {
   return path.join(resolveScratchWorkspacesRoot(), scratchWorkspaceSegment(threadId));
 }
 
-export function ensureIsolatedScratchWorkspace(threadId: ThreadId): string {
-  const workspaceDir = resolveIsolatedScratchWorkspace(threadId);
-  mkdirSync(workspaceDir, { recursive: true });
+function repairManagedScratchDirectoryPermissions(
+  directoryPath: string,
+  expectedIdentity: BigIntStats,
+  label: "root" | "target",
+): void {
+  if (!supportsPosixPermissions()) return;
+
+  let descriptor: number;
+  try {
+    descriptor = openSync(
+      directoryPath,
+      fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
+    );
+  } catch (cause) {
+    throw new Error(`Scratch workspace ${label} changed before permission repair.`, { cause });
+  }
+  try {
+    const openedIdentity = fstatSync(descriptor, { bigint: true });
+    if (
+      !openedIdentity.isDirectory() ||
+      !isSameBigIntPathIdentity(expectedIdentity, openedIdentity)
+    ) {
+      throw new Error(`Scratch workspace ${label} changed before permission repair.`);
+    }
+    fchmodSync(descriptor, PRIVATE_DIRECTORY_MODE);
+  } finally {
+    closeSync(descriptor);
+  }
+
+  const repairedIdentity = lstatSync(directoryPath, { bigint: true });
+  if (
+    repairedIdentity.isSymbolicLink() ||
+    !repairedIdentity.isDirectory() ||
+    !isSameBigIntPathIdentity(expectedIdentity, repairedIdentity)
+  ) {
+    throw new Error(`Scratch workspace ${label} changed during permission repair.`);
+  }
+}
+
+function ensureManagedScratchDirectory(
+  directoryPath: string,
+  label: "root" | "target",
+): { readonly identity: BigIntStats; readonly realPath: string } {
+  try {
+    mkdirSync(directoryPath, { mode: PRIVATE_DIRECTORY_MODE });
+  } catch (cause) {
+    if (!isExistingPathError(cause)) throw cause;
+  }
+
+  const identity = lstatSync(directoryPath, { bigint: true });
+  if (identity.isSymbolicLink() || !identity.isDirectory()) {
+    throw new Error(`Scratch workspace ${label} is not a managed directory.`);
+  }
+  const realPath = realpathSync(directoryPath);
+  const verifiedIdentity = lstatSync(directoryPath, { bigint: true });
+  if (
+    verifiedIdentity.isSymbolicLink() ||
+    !verifiedIdentity.isDirectory() ||
+    !isSameBigIntPathIdentity(identity, verifiedIdentity)
+  ) {
+    throw new Error(`Scratch workspace ${label} changed during creation.`);
+  }
+  repairManagedScratchDirectoryPermissions(directoryPath, verifiedIdentity, label);
+  return { identity, realPath };
+}
+
+export function ensureIsolatedScratchWorkspace(
+  threadId: ThreadId,
+  options: { readonly rootDir?: string } = {},
+): string {
+  const configuredRoot = path.resolve(options.rootDir ?? resolveScratchWorkspacesRoot());
+  const realParent = realpathSync(path.dirname(configuredRoot));
+  const root = ensureManagedScratchDirectory(configuredRoot, "root");
+  const rootRelativeToParent = path.relative(realParent, root.realPath);
+  if (
+    rootRelativeToParent === "" ||
+    rootRelativeToParent.startsWith("..") ||
+    path.isAbsolute(rootRelativeToParent) ||
+    rootRelativeToParent.includes(path.sep)
+  ) {
+    throw new Error("Scratch workspace root escaped its configured parent.");
+  }
+
+  const workspaceDir = path.join(root.realPath, scratchWorkspaceSegment(threadId));
+  if (!isPathInside(workspaceDir, root.realPath)) {
+    throw new Error("Scratch workspace creation target escaped its managed root.");
+  }
+  const workspace = ensureManagedScratchDirectory(workspaceDir, "target");
+  const workspaceRelativeToRoot = path.relative(root.realPath, workspace.realPath);
+  if (
+    workspaceRelativeToRoot === "" ||
+    workspaceRelativeToRoot.startsWith("..") ||
+    path.isAbsolute(workspaceRelativeToRoot) ||
+    workspaceRelativeToRoot.includes(path.sep)
+  ) {
+    throw new Error("Scratch workspace creation target escaped its managed root.");
+  }
+
+  const finalRootIdentity = lstatSync(configuredRoot, { bigint: true });
+  const finalWorkspaceIdentity = lstatSync(workspaceDir, { bigint: true });
+  if (
+    finalRootIdentity.isSymbolicLink() ||
+    !finalRootIdentity.isDirectory() ||
+    !isSameBigIntPathIdentity(root.identity, finalRootIdentity)
+  ) {
+    throw new Error("Scratch workspace root changed during workspace creation.");
+  }
+  if (
+    finalWorkspaceIdentity.isSymbolicLink() ||
+    !finalWorkspaceIdentity.isDirectory() ||
+    !isSameBigIntPathIdentity(workspace.identity, finalWorkspaceIdentity) ||
+    path.resolve(realpathSync(workspaceDir)) !== path.resolve(workspace.realPath)
+  ) {
+    throw new Error("Scratch workspace changed during creation.");
+  }
+
   const now = new Date();
   utimesSync(workspaceDir, now, now);
   return workspaceDir;
@@ -121,6 +246,15 @@ function isMissingPathError(cause: unknown): boolean {
     cause !== null &&
     "code" in cause &&
     (cause as { readonly code?: unknown }).code === "ENOENT"
+  );
+}
+
+function isExistingPathError(cause: unknown): boolean {
+  return (
+    typeof cause === "object" &&
+    cause !== null &&
+    "code" in cause &&
+    (cause as { readonly code?: unknown }).code === "EEXIST"
   );
 }
 

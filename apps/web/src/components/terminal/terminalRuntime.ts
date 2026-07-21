@@ -1257,16 +1257,29 @@ function runAuthoritativeRecoveryAttempt(entry: TerminalRuntimeEntry): void {
         handleTerminalExit(entry, recovery.snapshot.exitCode, recovery.snapshot.exitSignal);
       }
       entry.terminalOutputAckQueue.resumeAfterRebase();
+      let bufferedLifecycleEventApplied = false;
       entry.terminalEventRecovery.finish(
-        (event) => applyTerminalEvent(entry, event),
+        (event) => {
+          if (
+            event.type === "started" ||
+            event.type === "restarted" ||
+            event.type === "error" ||
+            event.type === "exited"
+          ) {
+            bufferedLifecycleEventApplied = true;
+          }
+          applyTerminalEvent(entry, event);
+        },
         () => undefined,
       );
       flushPendingWrites(entry, () => {
         if (entry.disposed || entry.snapshotReconcileRequestId !== requestId) return;
-        if (recovery.snapshot.status === "error" && !entry.hasHandledExit) {
-          setRuntimeStatus(entry, "error");
-        } else if (!entry.hasHandledExit) {
-          setRuntimeStatus(entry, "ready");
+        if (!entry.hasHandledExit && !bufferedLifecycleEventApplied) {
+          if (recovery.snapshot.status === "error") {
+            setRuntimeStatus(entry, "error");
+          } else if (entry.runtimeStatus !== "error") {
+            setRuntimeStatus(entry, "ready");
+          }
         }
       });
     };

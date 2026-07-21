@@ -9,7 +9,30 @@ describe("WsRequestAdmission", () => {
     expect(classifyWsRequest(ORCHESTRATION_WS_METHODS.getShellSnapshot)).toBe("standard");
     expect(classifyWsRequest(ORCHESTRATION_WS_METHODS.getTurnDiff)).toBe("expensive-read");
     expect(classifyWsRequest(ORCHESTRATION_WS_METHODS.repairState)).toBe("expensive-read");
+    expect(classifyWsRequest(WS_METHODS.terminalSnapshot)).toBe("expensive-read");
+    expect(classifyWsRequest(WS_METHODS.serverListWorktrees)).toBe("expensive-read");
     expect(classifyWsRequest(WS_METHODS.terminalAckOutput)).toBe("control");
+  });
+
+  it("bounds terminal snapshots and worktree scans in the shared expensive-read lane", async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const admission = yield* makeWsRequestAdmission;
+        const terminalSnapshot = yield* admission.acquire(1, WS_METHODS.terminalSnapshot);
+        const worktreeScan = yield* admission.acquire(1, WS_METHODS.serverListWorktrees);
+        const rejected = yield* admission.acquire(1, WS_METHODS.terminalSnapshot).pipe(Effect.exit);
+
+        expect(terminalSnapshot.requestClass).toBe("expensive-read");
+        expect(worktreeScan.requestClass).toBe("expensive-read");
+        expect(rejected._tag).toBe("Failure");
+        if (rejected._tag === "Failure") {
+          expect(String(rejected.cause)).toContain("RPC_EXPENSIVE_READ_CAPACITY_EXCEEDED");
+        }
+
+        yield* admission.release(terminalSnapshot);
+        yield* admission.release(worktreeScan);
+      }),
+    );
   });
 
   it("reserves independent capacity for control traffic during an expensive-read flood", async () => {

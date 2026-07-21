@@ -87,6 +87,7 @@ function positiveDuration(value: number | undefined, fallback: number): number {
 }
 
 const INSPECTION_TIMED_OUT = Symbol("inspection-timed-out");
+const SIGNAL_TIMED_OUT = Symbol("signal-timed-out");
 
 function isPromiseLike<T>(value: T | PromiseLike<T> | undefined): value is PromiseLike<T> {
   return value !== undefined && typeof (value as PromiseLike<T>).then === "function";
@@ -108,6 +109,42 @@ async function inspectBeforeDeadline(
   } finally {
     if (timer !== undefined) clearTimeout(timer);
   }
+}
+
+async function signalBeforeDeadline(
+  signal: PromiseLike<void>,
+  timeoutMs: number,
+  abortController: AbortController,
+): Promise<void | typeof SIGNAL_TIMED_OUT> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      Promise.resolve(signal),
+      new Promise<typeof SIGNAL_TIMED_OUT>((resolve) => {
+        timer = setTimeout(() => {
+          resolve(SIGNAL_TIMED_OUT);
+          abortController.abort();
+        }, timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+function signalFailure(
+  cause: unknown,
+  input: {
+    readonly rootPid: number;
+    readonly signal: TerminalKillSignal;
+  },
+): Error {
+  const detail = cause instanceof Error ? cause.message : String(cause);
+  return new Error(
+    `Provider process tree ${input.rootPid} ${input.signal} signaling failed: ${detail}`,
+    cause instanceof Error ? { cause } : undefined,
+  );
 }
 
 function waitForOwnedProcessExit(process: ProcessExitHandle): Promise<void> {
@@ -178,23 +215,53 @@ export async function teardownProviderProcessTree(
       // A rejected watcher is not evidence that the owned process exited.
     },
   );
-  const tree = await deps.processTreeKiller.capture(input.rootPid);
+  const capturedTree = await deps.processTreeKiller.capture(input.rootPid);
   captureFinished = true;
   // Flush a root-exit resolution queued in the same turn as capture completion.
   await Promise.resolve();
-  const captureComplete = tree.captureComplete !== false && !rootExitedBeforeCaptureFinished;
+  const captureComplete =
+    capturedTree.captureComplete !== false && !rootExitedBeforeCaptureFinished;
+  // A capture that completed after the owned root exited may describe an
+  // unrelated process that reused the numeric root PID. None of its descendant
+  // identities are safe to signal, even though exit proof must still fail closed.
+  const tree = rootExitedBeforeCaptureFinished
+    ? { descendants: [], captureComplete: false }
+    : capturedTree;
 
   const signal = async (
     killSignal: TerminalKillSignal,
     includeRootTree: boolean,
+    timeoutMs: number,
   ): Promise<void> => {
-    await deps.processTreeKiller.signal({
-      rootPid: input.rootPid,
-      signal: killSignal,
-      tree,
-      includeRootTree,
-      onError: (error) => signalErrors.push(error),
-    });
+    let acceptsCallbackErrors = true;
+    const abortController = new AbortController();
+    try {
+      const signaling = Promise.resolve().then(() =>
+        deps.processTreeKiller.signal({
+          rootPid: input.rootPid,
+          signal: killSignal,
+          tree,
+          includeRootTree,
+          shouldSignalRootTree: () => !rootExited,
+          abortSignal: abortController.signal,
+          onError: (error) => {
+            if (acceptsCallbackErrors) signalErrors.push(error);
+          },
+        }),
+      );
+      const outcome = await signalBeforeDeadline(signaling, timeoutMs, abortController);
+      if (outcome === SIGNAL_TIMED_OUT) {
+        signalErrors.push(
+          new Error(
+            `Provider process tree ${input.rootPid} ${killSignal} signaling did not settle within ${timeoutMs}ms.`,
+          ),
+        );
+      }
+    } catch (cause) {
+      signalErrors.push(signalFailure(cause, { rootPid: input.rootPid, signal: killSignal }));
+    } finally {
+      acceptsCallbackErrors = false;
+    }
   };
 
   const waitForExitProof = async (timeoutMs: number) => {
@@ -234,20 +301,20 @@ export async function teardownProviderProcessTree(
   };
 
   // If the owned root exited while descendants were being captured, its numeric
-  // PID may already identify an unrelated process. Signal only captured identities
-  // and keep the result unproven because reparenting may have hidden descendants.
-  await signal("SIGTERM", !rootExited);
-  const graceful = await waitForExitProof(
-    positiveDuration(input.termGraceMs, DEFAULT_TERM_GRACE_MS),
-  );
+  // PID may already identify an unrelated process. The untrusted capture was
+  // discarded above; skip the root tree and keep the result unproven.
+  const termGraceMs = positiveDuration(input.termGraceMs, DEFAULT_TERM_GRACE_MS);
+  await signal("SIGTERM", !rootExited, termGraceMs);
+  const graceful = await waitForExitProof(termGraceMs);
   if (graceful.proven) {
     return { escalated: false, signalErrors };
   }
 
   // A root can exit while descendants ignore TERM and become reparented. Preserve the captured
   // identities and force only those descendants rather than re-signalling a potentially reused PID.
-  await signal("SIGKILL", !rootExited);
-  const forced = await waitForExitProof(positiveDuration(input.forceExitMs, DEFAULT_FORCE_EXIT_MS));
+  const forceExitMs = positiveDuration(input.forceExitMs, DEFAULT_FORCE_EXIT_MS);
+  await signal("SIGKILL", !rootExited, forceExitMs);
+  const forced = await waitForExitProof(forceExitMs);
   if (forced.proven) {
     return { escalated: true, signalErrors };
   }
