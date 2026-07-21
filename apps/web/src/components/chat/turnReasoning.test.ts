@@ -4,6 +4,7 @@ import type { TimelineEntry } from "../../workLog";
 import type { ChatMessage, TurnDiffSummary } from "../../types";
 import {
   buildTurnReasoningSummaryByAssistantMessageId,
+  formatTurnReasoningDuration,
   formatTurnReasoningSummaryForClipboard,
   type TurnReasoningDurableTurn,
   type TurnReasoningSummary,
@@ -89,6 +90,218 @@ function diff(turnId: string, paths: string[]): TurnDiffSummary {
 }
 
 describe("buildTurnReasoningSummaryByAssistantMessageId", () => {
+  it("keeps system annotations between a user prompt and its assistant response", () => {
+    const assistant = message({
+      id: "a1",
+      role: "assistant",
+      createdAt: "2026-07-21T10:00:03.000Z",
+      completedAt: "2026-07-21T10:00:05.000Z",
+    });
+
+    const summary = buildTurnReasoningSummaryByAssistantMessageId({
+      messages: [
+        message({ id: "u1", role: "user", createdAt: "2026-07-21T10:00:00.000Z" }),
+        message({ id: "s1", role: "system", createdAt: "2026-07-21T10:00:01.000Z" }),
+        assistant,
+      ],
+    }).get(assistant.id);
+
+    expect(summary).toMatchObject({
+      turnNumber: 1,
+      startedAt: "2026-07-21T10:00:00.000Z",
+      completedAt: "2026-07-21T10:00:05.000Z",
+      durationMs: 5_000,
+    });
+  });
+
+  it("time-indexes unmatched provider mini-turn activities once when assistant turn IDs are partial", () => {
+    const assistant = message({
+      id: "a1",
+      role: "assistant",
+      turnId: "visible-turn",
+      createdAt: "2026-07-21T10:00:03.000Z",
+      completedAt: "2026-07-21T10:00:08.000Z",
+    });
+    const activities = [
+      activity({
+        id: "visible-tool",
+        kind: "tool.completed",
+        turnId: "visible-turn",
+        createdAt: "2026-07-21T10:00:04.000Z",
+        summary: "Read",
+      }),
+      activity({
+        id: "hidden-tool",
+        kind: "tool.completed",
+        turnId: "hidden-mini-turn",
+        createdAt: "2026-07-21T10:00:05.000Z",
+        summary: "Search",
+      }),
+      activity({
+        id: "hidden-approval",
+        kind: "approval.requested",
+        turnId: "hidden-mini-turn",
+        createdAt: "2026-07-21T10:00:06.000Z",
+        payload: { requestId: "hidden-request" },
+      }),
+      activity({
+        id: "outside-tool",
+        kind: "tool.completed",
+        turnId: "outside-turn",
+        createdAt: "2026-07-21T10:00:09.000Z",
+        summary: "Edit",
+      }),
+    ];
+
+    const summary = buildTurnReasoningSummaryByAssistantMessageId({
+      messages: [
+        message({ id: "u1", role: "user", createdAt: "2026-07-21T10:00:00.000Z" }),
+        assistant,
+      ],
+      turns: [
+        durableTurn("visible-turn", {
+          assistantMessageId: assistant.id,
+          toolCallCount: 1,
+          toolNames: ["Read"],
+          toolNameCounts: [{ name: "Read", count: 1 }],
+          approvalCount: 0,
+          rejectionCount: 0,
+        }),
+      ],
+      activities,
+    }).get(assistant.id);
+
+    expect(summary).toMatchObject({
+      toolCallCount: 2,
+      distinctToolCount: 2,
+      toolNameCounts: [
+        { name: "Read", count: 1 },
+        { name: "Search", count: 1 },
+      ],
+      approvalCount: 1,
+    });
+  });
+
+  it("fills missing durable tool names from exact activities without changing the durable total", () => {
+    const assistant = message({
+      id: "a1",
+      role: "assistant",
+      turnId: "visible-turn",
+      createdAt: "2026-07-21T10:00:02.000Z",
+      completedAt: "2026-07-21T10:00:08.000Z",
+    });
+    const summary = buildTurnReasoningSummaryByAssistantMessageId({
+      messages: [
+        message({ id: "u1", role: "user", createdAt: "2026-07-21T10:00:00.000Z" }),
+        assistant,
+      ],
+      turns: [
+        durableTurn("visible-turn", {
+          assistantMessageId: assistant.id,
+          toolCallCount: 1,
+          toolNames: [],
+          toolNameCounts: [],
+        }),
+      ],
+      activities: [
+        activity({
+          id: "visible-tool",
+          kind: "tool.completed",
+          turnId: "visible-turn",
+          createdAt: "2026-07-21T10:00:04.000Z",
+          summary: "Read",
+        }),
+        activity({
+          id: "hidden-tool",
+          kind: "tool.completed",
+          turnId: "hidden-mini-turn",
+          createdAt: "2026-07-21T10:00:06.000Z",
+          summary: "Search",
+        }),
+      ],
+    }).get(assistant.id);
+
+    expect(summary).toMatchObject({
+      toolCallCount: 2,
+      distinctToolCount: 2,
+      toolNameCounts: [
+        { name: "Read", count: 1 },
+        { name: "Search", count: 1 },
+      ],
+    });
+  });
+
+  it("assigns overlapping and adjacent window fallbacks once while exact turn IDs keep precedence", () => {
+    const firstAssistant = message({
+      id: "a1",
+      role: "assistant",
+      turnId: "first-visible-turn",
+      createdAt: "2026-07-21T10:00:02.000Z",
+      completedAt: "2026-07-21T10:00:10.000Z",
+    });
+    const secondAssistant = message({
+      id: "a2",
+      role: "assistant",
+      turnId: "second-visible-turn",
+      createdAt: "2026-07-21T10:00:11.000Z",
+      completedAt: "2026-07-21T10:00:18.000Z",
+    });
+    const thirdAssistant = message({
+      id: "a3",
+      role: "assistant",
+      turnId: "third-visible-turn",
+      createdAt: "2026-07-21T10:00:20.000Z",
+      completedAt: "2026-07-21T10:00:28.000Z",
+    });
+
+    const result = buildTurnReasoningSummaryByAssistantMessageId({
+      messages: [
+        message({ id: "u1", role: "user", createdAt: "2026-07-21T10:00:00.000Z" }),
+        firstAssistant,
+        message({ id: "u2", role: "user", createdAt: "2026-07-21T10:00:08.000Z" }),
+        secondAssistant,
+        message({ id: "u3", role: "user", createdAt: "2026-07-21T10:00:18.000Z" }),
+        thirdAssistant,
+      ],
+      activities: [
+        activity({
+          id: "first-exact",
+          kind: "tool.completed",
+          turnId: "first-visible-turn",
+          createdAt: "2026-07-21T10:00:09.000Z",
+          summary: "Read",
+        }),
+        activity({
+          id: "overlap-fallback",
+          kind: "tool.completed",
+          turnId: "overlap-mini-turn",
+          createdAt: "2026-07-21T10:00:09.000Z",
+          summary: "Search",
+        }),
+        activity({
+          id: "adjacent-fallback",
+          kind: "tool.completed",
+          turnId: "adjacent-mini-turn",
+          createdAt: "2026-07-21T10:00:18.000Z",
+          summary: "Edit",
+        }),
+      ],
+    });
+
+    expect(result.get(firstAssistant.id)).toMatchObject({
+      toolCallCount: 1,
+      distinctToolNames: ["Read"],
+    });
+    expect(result.get(secondAssistant.id)).toMatchObject({
+      toolCallCount: 1,
+      distinctToolNames: ["Search"],
+    });
+    expect(result.get(thirdAssistant.id)).toMatchObject({
+      toolCallCount: 1,
+      distinctToolNames: ["Edit"],
+    });
+  });
+
   it("aggregates provider mini-turns into one auditable user-visible response", () => {
     const messages = [
       message({ id: "u1", role: "user", createdAt: "2026-07-21T10:00:00.000Z" }),
@@ -702,6 +915,38 @@ describe("buildTurnReasoningSummaryByAssistantMessageId", () => {
     });
     expect(trackedTurns.indexedReads()).toBeLessThanOrEqual(turns.length * 3);
     expect(trackedActivities.indexedReads()).toBeLessThanOrEqual(activities.length * 3);
+  });
+});
+
+describe("formatTurnReasoningDuration", () => {
+  it.each([
+    [null, "—", "—"],
+    [Number.NaN, "—", "—"],
+    [-1, "—", "—"],
+    [0, "0.0s", "0ms"],
+    [499.6, "0.5s", "500ms"],
+    [999.6, "1.0s", "1000ms"],
+  ] as const)(
+    "handles invalid and subsecond duration %s",
+    (durationMs, preciseExpected, compactExpected) => {
+      expect(formatTurnReasoningDuration(durationMs)).toBe(preciseExpected);
+      expect(formatTurnReasoningDuration(durationMs, "compact")).toBe(compactExpected);
+    },
+  );
+
+  it.each([
+    [59_949, "59.9s"],
+    [59_950, "1m"],
+    [119_600, "2m"],
+    [120_600, "2m 1s"],
+  ])("carries rounded seconds at minute boundaries for %dms", (durationMs, expected) => {
+    expect(formatTurnReasoningDuration(durationMs)).toBe(expected);
+    expect(formatTurnReasoningDuration(durationMs)).not.toMatch(/(?:^| )60s$/u);
+  });
+
+  it("uses the same carry behavior for compact card durations", () => {
+    expect(formatTurnReasoningDuration(59_600, "compact")).toBe("1m");
+    expect(formatTurnReasoningDuration(119_600, "compact")).toBe("2m");
   });
 });
 

@@ -150,6 +150,17 @@ describe("TurnReasoningSummaryCard", () => {
   });
 
   it.each([
+    [59_600, "1m"],
+    [119_600, "2m"],
+    [120_600, "2m 1s"],
+  ])("carries rounded seconds into minutes for %dms", (durationMs, expected) => {
+    const html = renderCard({ ...SUMMARY, durationMs }, false);
+
+    expect(html).toContain(expected);
+    expect(html).not.toMatch(/(?:0m|\d+m) 60s/u);
+  });
+
+  it.each([
     ["failed", "text-rose-700", "bg-rose-600"],
     ["interrupted", "text-amber-700", "bg-amber-600"],
   ] as const)("uses semantic styles for %s turns", (status, textClassName, dotClassName) => {

@@ -137,6 +137,18 @@ describe("store projection", () => {
     );
     expect(getThreadFromState(second, threadId)?.turns).toBe(firstTurns);
 
+    const afterFullRecovery = syncServerReadModel(
+      second,
+      makeReadModel(makeReadModelThread({ id: threadId, turns: [] })),
+    );
+    expect(getThreadFromState(afterFullRecovery, threadId)?.turns).toBe(firstTurns);
+
+    const afterAuthoritativeDetailClear = syncServerThreadDetail(
+      afterFullRecovery,
+      makeReadModelThread({ id: threadId, turns: [] }),
+    );
+    expect(getThreadFromState(afterAuthoritativeDetailClear, threadId)?.turns).toEqual([]);
+
     const shellSnapshot = makeShellSnapshot({
       id: threadId,
       projectId: ProjectId.makeUnsafe("project-1"),

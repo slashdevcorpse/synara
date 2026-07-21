@@ -594,22 +594,6 @@ function collectProjectedLatestTurns(rows: ReadonlyArray<ProjectionLatestTurnDbR
   return { byThread, updatedAt };
 }
 
-function collectProjectedTurns(rows: ReadonlyArray<ProjectionTurnDbRow>): {
-  readonly byThread: Map<string, Array<OrchestrationTurnSummary>>;
-  readonly updatedAt: string | null;
-} {
-  const byThread = new Map<string, Array<OrchestrationTurnSummary>>();
-  let updatedAt: string | null = null;
-  for (const row of rows) {
-    if (row.turnId === null) continue;
-    updatedAt = maxIso(updatedAt, row.requestedAt);
-    updatedAt = maxOptionalIso(updatedAt, row.startedAt);
-    updatedAt = maxOptionalIso(updatedAt, row.completedAt);
-    pushGrouped(byThread, row.threadId, toProjectedTurn({ ...row, turnId: row.turnId }));
-  }
-  return { byThread, updatedAt };
-}
-
 function collectProjectedSessions(rows: ReadonlyArray<ProjectionThreadSessionDbRow>): {
   readonly byThread: Map<string, OrchestrationSession>;
   readonly updatedAt: string | null;
@@ -1124,56 +1108,26 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
     execute: () =>
       sql`
         SELECT
-          thread_id AS "threadId",
-          turn_id AS "turnId",
-          state,
-          requested_at AS "requestedAt",
-          started_at AS "startedAt",
-          completed_at AS "completedAt",
-          assistant_message_id AS "assistantMessageId",
-          source_proposed_plan_thread_id AS "sourceProposedPlanThreadId",
-          source_proposed_plan_id AS "sourceProposedPlanId"
-        FROM projection_turns
-        WHERE turn_id IS NOT NULL
-        ORDER BY thread_id ASC, requested_at DESC, turn_id DESC
-      `,
-  });
-
-  const listTurnRows = SqlSchema.findAll({
-    Request: Schema.Void,
-    Result: ProjectionTurnDbRowSchema,
-    execute: () =>
-      sql`
-        SELECT
-          thread_id AS "threadId",
-          turn_id AS "turnId",
-          pending_message_id AS "pendingMessageId",
-          source_proposed_plan_thread_id AS "sourceProposedPlanThreadId",
-          source_proposed_plan_id AS "sourceProposedPlanId",
-          assistant_message_id AS "assistantMessageId",
-          state,
-          requested_at AS "requestedAt",
-          started_at AS "startedAt",
-          completed_at AS "completedAt",
-          checkpoint_turn_count AS "checkpointTurnCount",
-          checkpoint_ref AS "checkpointRef",
-          checkpoint_status AS "checkpointStatus",
-          checkpoint_files_json AS "checkpointFiles",
-          provider,
-          model,
-          reasoning_effort AS "reasoningEffort",
-          model_selection_json AS "modelSelection",
-          runtime_mode AS "runtimeMode",
-          interaction_mode AS "interactionMode",
-          env_mode AS "envMode",
-          assistant_delivery_mode AS "assistantDeliveryMode",
-          token_usage_json AS "tokenUsage",
-          tool_calls_json AS "toolCalls",
-          approval_request_ids_json AS "approvalRequestIds",
-          rejected_approval_request_ids_json AS "rejectedApprovalRequestIds"
-        FROM projection_turns
-        WHERE turn_id IS NOT NULL
-        ORDER BY thread_id ASC, requested_at ASC, turn_id ASC
+          turns.thread_id AS "threadId",
+          turns.turn_id AS "turnId",
+          turns.state,
+          turns.requested_at AS "requestedAt",
+          turns.started_at AS "startedAt",
+          turns.completed_at AS "completedAt",
+          turns.assistant_message_id AS "assistantMessageId",
+          turns.source_proposed_plan_thread_id AS "sourceProposedPlanThreadId",
+          turns.source_proposed_plan_id AS "sourceProposedPlanId"
+        FROM projection_threads AS threads
+        INNER JOIN projection_turns AS turns
+          ON turns.row_id = (
+            SELECT candidate.row_id
+            FROM projection_turns AS candidate
+            WHERE candidate.thread_id = threads.thread_id
+              AND candidate.turn_id IS NOT NULL
+            ORDER BY candidate.requested_at DESC, candidate.turn_id DESC
+            LIMIT 1
+          )
+        ORDER BY turns.thread_id ASC
       `,
   });
 
@@ -1855,7 +1809,6 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
             sessionRows,
             checkpointRows,
             latestTurnRows,
-            turnRows,
             stateRows,
           ] = yield* Effect.all([
             listProjectRows(undefined).pipe(
@@ -1942,14 +1895,6 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
                 ),
               ),
             ),
-            listTurnRows(undefined).pipe(
-              Effect.mapError(
-                toPersistenceSqlOrDecodeError(
-                  "ProjectionSnapshotQuery.getSnapshot:listTurns:query",
-                  "ProjectionSnapshotQuery.getSnapshot:listTurns:decodeRows",
-                ),
-              ),
-            ),
             listProjectionStateRows(undefined).pipe(
               Effect.mapError(
                 toPersistenceSqlOrDecodeError(
@@ -1966,7 +1911,6 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           const pendingInteractions = collectPendingInteractions(pendingInteractionRows);
           const checkpoints = collectProjectedCheckpoints(checkpointRows);
           const latestTurns = collectProjectedLatestTurns(latestTurnRows);
-          const turns = collectProjectedTurns(turnRows);
           const sessions = collectProjectedSessions(sessionRows);
 
           let updatedAt = collectBaseUpdatedAt({ projectRows, threadRows, stateRows });
@@ -1976,7 +1920,6 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           updatedAt = maxOptionalIso(updatedAt, pendingInteractions.updatedAt);
           updatedAt = maxOptionalIso(updatedAt, checkpoints.updatedAt);
           updatedAt = maxOptionalIso(updatedAt, latestTurns.updatedAt);
-          updatedAt = maxOptionalIso(updatedAt, turns.updatedAt);
           updatedAt = maxOptionalIso(updatedAt, sessions.updatedAt);
 
           const projects: ReadonlyArray<OrchestrationProject> = projectRows.map(toProjectedProject);
@@ -1985,7 +1928,9 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
             toProjectedThread({
               threadRow: row,
               latestTurn: latestTurns.byThread.get(row.threadId) ?? null,
-              turns: turns.byThread.get(row.threadId) ?? [],
+              // Durable turn summaries are detail-owned. Loading them here would
+              // duplicate every thread's complete history in the recovery snapshot.
+              turns: [],
               messages: messages.byThread.get(row.threadId) ?? [],
               proposedPlans: proposedPlans.byThread.get(row.threadId) ?? [],
               activities: activities.byThread.get(row.threadId) ?? [],

@@ -14,7 +14,11 @@ import { ProviderIcon } from "../ProviderIcon";
 import { Collapsible, CollapsiblePanel, CollapsibleTrigger } from "../ui/collapsible";
 import { DisclosureChevron } from "../ui/DisclosureChevron";
 import { APP_TOOLTIP_SURFACE_CLASS_NAME } from "./composerPickerStyles";
-import { formatTurnReasoningSummaryForClipboard, type TurnReasoningSummary } from "./turnReasoning";
+import {
+  formatTurnReasoningDuration,
+  formatTurnReasoningSummaryForClipboard,
+  type TurnReasoningSummary,
+} from "./turnReasoning";
 
 const UNSUPPORTED_VALUE = "—";
 
@@ -48,24 +52,6 @@ export interface TurnReasoningSummaryCardProps {
   onExpandedChange: (expanded: boolean) => void;
   feedbackContext: FeedbackThreadContext;
   className?: string;
-}
-
-function formatDuration(durationMs: number | null): string {
-  if (durationMs === null || !Number.isFinite(durationMs) || durationMs < 0) {
-    return UNSUPPORTED_VALUE;
-  }
-  if (durationMs < 1_000) {
-    return `${Math.round(durationMs)}ms`;
-  }
-  if (durationMs < 10_000) {
-    return `${(durationMs / 1_000).toFixed(1).replace(/\.0$/u, "")}s`;
-  }
-  if (durationMs < 60_000) {
-    return `${Math.round(durationMs / 1_000)}s`;
-  }
-  const minutes = Math.floor(durationMs / 60_000);
-  const seconds = Math.round((durationMs % 60_000) / 1_000);
-  return seconds === 0 ? `${minutes}m` : `${minutes}m ${seconds}s`;
 }
 
 function formatTokenCount(value: number | null): string {
@@ -149,7 +135,7 @@ export function TurnReasoningSummaryCard({
   const { copyToClipboard, isCopied } = useCopyToClipboard();
   const openFeedbackDialog = useFeedbackDialogStore((state) => state.openDialog);
   const status = STATUS_STYLES[summary.status];
-  const duration = formatDuration(summary.durationMs);
+  const duration = formatTurnReasoningDuration(summary.durationMs, "compact");
   const collapsedAccess = formatCollapsedAccess(summary);
   const expandedAccess = formatExpandedAccess(summary);
   const filesChanged = pluralizedCount(summary.filesChangedCount, "file changed", "files changed");

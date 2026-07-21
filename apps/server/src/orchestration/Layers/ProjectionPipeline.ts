@@ -44,6 +44,7 @@ import {
 } from "../../persistence/Services/ProjectionThreadProposedPlans.ts";
 import { ProjectionThreadSessionRepository } from "../../persistence/Services/ProjectionThreadSessions.ts";
 import {
+  EMPTY_PROJECTION_TURN_SUMMARY_FIELDS,
   type ProjectionTurn,
   ProjectionTurnRepository,
 } from "../../persistence/Services/ProjectionTurns.ts";
@@ -137,9 +138,14 @@ function payloadNonEmptyString(payload: unknown, key: string): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
 }
 
-function payloadNonNegativeNumber(payload: unknown, key: string): number | null {
+function payloadNonNegativeInteger(payload: unknown, key: string): number | null {
   const value = payloadRecord(payload)?.[key];
-  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function payloadPositiveInteger(payload: unknown, key: string): number | null {
+  const value = payloadRecord(payload)?.[key];
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : null;
 }
 
 function payloadProviderKind(payload: unknown): ProviderKind | null {
@@ -172,28 +178,31 @@ function contextWindowTurnTokenUsage(
   return {
     provider,
     inputTokens: exact
-      ? payloadNonNegativeNumber(activity.payload, last ? "lastInputTokens" : "inputTokens")
+      ? payloadNonNegativeInteger(activity.payload, last ? "lastInputTokens" : "inputTokens")
       : null,
     cachedInputTokens: exact
-      ? payloadNonNegativeNumber(
+      ? payloadNonNegativeInteger(
           activity.payload,
           last ? "lastCachedInputTokens" : "cachedInputTokens",
         )
       : null,
     outputTokens: exact
-      ? payloadNonNegativeNumber(activity.payload, last ? "lastOutputTokens" : "outputTokens")
+      ? payloadNonNegativeInteger(activity.payload, last ? "lastOutputTokens" : "outputTokens")
       : null,
     reasoningOutputTokens: exact
-      ? payloadNonNegativeNumber(
+      ? payloadNonNegativeInteger(
           activity.payload,
           last ? "lastReasoningOutputTokens" : "reasoningOutputTokens",
         )
       : null,
     totalTokens: exact
-      ? payloadNonNegativeNumber(activity.payload, last ? "lastUsedTokens" : "totalProcessedTokens")
+      ? payloadNonNegativeInteger(
+          activity.payload,
+          last ? "lastUsedTokens" : "totalProcessedTokens",
+        )
       : null,
-    contextUsedTokens: payloadNonNegativeNumber(activity.payload, "usedTokens"),
-    contextWindowTokens: payloadNonNegativeNumber(activity.payload, "maxTokens"),
+    contextUsedTokens: payloadNonNegativeInteger(activity.payload, "usedTokens"),
+    contextWindowTokens: payloadPositiveInteger(activity.payload, "maxTokens"),
     updatedAt: activity.createdAt,
   };
 }
@@ -210,9 +219,9 @@ function completedTurnTokenUsage(
   let totalTokens = 0;
   let hasUsage = false;
   for (const usage of Object.values(modelUsage)) {
-    const input = payloadNonNegativeNumber(usage, "inputTokens");
-    const output = payloadNonNegativeNumber(usage, "outputTokens");
-    const total = payloadNonNegativeNumber(usage, "totalTokens");
+    const input = payloadNonNegativeInteger(usage, "inputTokens");
+    const output = payloadNonNegativeInteger(usage, "outputTokens");
+    const total = payloadNonNegativeInteger(usage, "totalTokens");
     if (input === null && output === null && total === null) continue;
     hasUsage = true;
     inputTokens += input ?? 0;
@@ -341,21 +350,6 @@ function toolName(activity: OrchestrationThreadActivity): string | null {
     payloadNonEmptyString(activity.payload, "itemType")
   );
 }
-
-const EMPTY_TURN_SUMMARY_METADATA = {
-  provider: null,
-  model: null,
-  reasoningEffort: null,
-  modelSelection: null,
-  runtimeMode: null,
-  interactionMode: null,
-  envMode: null,
-  assistantDeliveryMode: null,
-  tokenUsage: null,
-  toolCalls: [],
-  approvalRequestIds: [],
-  rejectedApprovalRequestIds: [],
-} as const;
 
 function extractActivityRequestId(payload: unknown): ApprovalRequestId | null {
   const requestId = payloadRecord(payload)?.requestId;
@@ -1557,7 +1551,7 @@ const makeOrchestrationProjectionPipeline = Effect.gen(function* () {
             checkpointRef: null,
             checkpointStatus: null,
             checkpointFiles: [],
-            ...EMPTY_TURN_SUMMARY_METADATA,
+            ...EMPTY_PROJECTION_TURN_SUMMARY_FIELDS,
           });
           return;
         }
@@ -1639,7 +1633,7 @@ const makeOrchestrationProjectionPipeline = Effect.gen(function* () {
             checkpointRef: event.payload.checkpointRef,
             checkpointStatus: event.payload.status,
             checkpointFiles: event.payload.files,
-            ...EMPTY_TURN_SUMMARY_METADATA,
+            ...EMPTY_PROJECTION_TURN_SUMMARY_FIELDS,
           });
           return;
         }

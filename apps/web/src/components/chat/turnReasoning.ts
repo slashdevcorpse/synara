@@ -243,8 +243,9 @@ function deriveResponseSegments(messages: ReadonlyArray<ChatMessage>): ResponseS
       assistants.push(message);
       continue;
     }
-    flush();
-    userMessage = null;
+    // System messages are transcript annotations, not response boundaries. In
+    // particular, provider notices can arrive after the prompt but before the
+    // first assistant message and must not detach that response from its user.
   }
   flush();
   return segments;
@@ -325,84 +326,100 @@ interface TimestampedActivity {
   readonly order: number;
 }
 
-function activityTimestampBoundary(
-  activities: ReadonlyArray<TimestampedActivity>,
-  target: number,
-  includeEqual: boolean,
-): number {
-  let lower = 0;
-  let upper = activities.length;
-  while (lower < upper) {
-    const middle = lower + Math.floor((upper - lower) / 2);
-    const createdAt = activities[middle]?.createdAt ?? Number.POSITIVE_INFINITY;
-    if (createdAt < target || (includeEqual && createdAt === target)) {
-      lower = middle + 1;
-    } else {
-      upper = middle;
-    }
-  }
-  return lower;
+interface SegmentActivityWindow {
+  readonly segmentIndex: number;
+  readonly start: number;
+  readonly end: number;
+}
+
+interface SegmentActivities {
+  readonly all: OrchestrationThreadActivity[];
+  /** Time-window matches whose turn ID was unknown to every response. */
+  readonly unmatched: OrchestrationThreadActivity[];
 }
 
 function indexActivitiesBySegment(
   segments: ReadonlyArray<ResponseSegment>,
+  durableTurnsBySegment: ReadonlyArray<ReadonlyArray<TurnReasoningDurableTurn>>,
   activities: ReadonlyArray<OrchestrationThreadActivity>,
-): OrchestrationThreadActivity[][] {
+): SegmentActivities[] {
   if (segments.length === 0) return [];
   const segmentIndexesByTurnId = new Map<TurnId, number[]>();
-  const timeWindowSegmentIndexes: number[] = [];
   for (const [segmentIndex, segment] of segments.entries()) {
-    if (segment.turnIds.length === 0) {
-      timeWindowSegmentIndexes.push(segmentIndex);
-      continue;
-    }
-    for (const turnId of segment.turnIds) {
+    const knownTurnIds = new Set([
+      ...segment.turnIds,
+      ...(durableTurnsBySegment[segmentIndex] ?? []).map((turn) => turn.turnId),
+    ]);
+    for (const turnId of knownTurnIds) {
       appendSegmentIndex(segmentIndexesByTurnId, turnId, segmentIndex);
     }
   }
 
-  const activitiesBySegment: OrchestrationThreadActivity[][] = Array.from(
-    { length: segments.length },
-    () => [],
-  );
-  const timestampedActivities: TimestampedActivity[] = [];
-  const needsTimeWindowIndex = timeWindowSegmentIndexes.length > 0;
+  const activitiesBySegment: SegmentActivities[] = Array.from({ length: segments.length }, () => ({
+    all: [],
+    unmatched: [],
+  }));
+  const unmatchedActivities: TimestampedActivity[] = [];
   const orderedActivities = activities.toSorted(compareActivities);
   for (const [order, activity] of orderedActivities.entries()) {
-    if (activity.turnId !== null) {
-      for (const segmentIndex of segmentIndexesByTurnId.get(activity.turnId) ?? []) {
-        activitiesBySegment[segmentIndex]?.push(activity);
+    const matchingSegmentIndexes =
+      activity.turnId === null ? [] : (segmentIndexesByTurnId.get(activity.turnId) ?? []);
+    if (matchingSegmentIndexes.length > 0) {
+      for (const segmentIndex of matchingSegmentIndexes) {
+        activitiesBySegment[segmentIndex]?.all.push(activity);
       }
+      continue;
     }
-    if (needsTimeWindowIndex) {
-      const createdAt = timestamp(activity.createdAt);
-      if (createdAt !== null) timestampedActivities.push({ activity, createdAt, order });
-    }
+    const createdAt = timestamp(activity.createdAt);
+    if (createdAt !== null) unmatchedActivities.push({ activity, createdAt, order });
   }
-  timestampedActivities.sort(
+
+  // Assistant messages can expose only some provider mini-turn IDs. Assign
+  // activities for unknown IDs by response time window instead of dropping
+  // them. The active-window sweep is linear after sorting and selects only one
+  // segment, so exact matches are never replayed and overlapping windows cannot
+  // double-count an unmatched activity.
+  const windows: SegmentActivityWindow[] = segments
+    .map((segment, segmentIndex) => ({
+      segmentIndex,
+      start:
+        timestamp(segment.userMessage?.createdAt ?? segment.assistantMessages[0]?.createdAt) ??
+        Number.NEGATIVE_INFINITY,
+      end:
+        timestamp(
+          segment.terminalAssistantMessage.completedAt ??
+            segment.terminalAssistantMessage.createdAt,
+        ) ?? Number.POSITIVE_INFINITY,
+    }))
+    .sort((left, right) => left.start - right.start || left.segmentIndex - right.segmentIndex);
+  unmatchedActivities.sort(
     (left, right) => left.createdAt - right.createdAt || left.order - right.order,
   );
-
-  for (const segmentIndex of timeWindowSegmentIndexes) {
-    const segment = segments[segmentIndex];
-    if (!segment) continue;
-    const start = timestamp(
-      segment.userMessage?.createdAt ?? segment.assistantMessages[0]?.createdAt,
-    );
-    const end = timestamp(
-      segment.terminalAssistantMessage.completedAt ?? segment.terminalAssistantMessage.createdAt,
-    );
-    const firstMatch =
-      start === null ? 0 : activityTimestampBoundary(timestampedActivities, start, false);
-    const afterLastMatch =
-      end === null
-        ? timestampedActivities.length
-        : activityTimestampBoundary(timestampedActivities, end, true);
-    const matchingActivities = timestampedActivities.slice(firstMatch, afterLastMatch);
-    matchingActivities.sort((left, right) => left.order - right.order);
-    for (const match of matchingActivities) {
-      activitiesBySegment[segmentIndex]?.push(match.activity);
+  const activeWindows: SegmentActivityWindow[] = [];
+  let nextWindowIndex = 0;
+  for (const match of unmatchedActivities) {
+    while ((windows[nextWindowIndex]?.start ?? Number.POSITIVE_INFINITY) <= match.createdAt) {
+      const window = windows[nextWindowIndex];
+      if (window) activeWindows.push(window);
+      nextWindowIndex += 1;
     }
+    while (
+      activeWindows.length > 0 &&
+      (activeWindows.at(-1)?.end ?? Number.NEGATIVE_INFINITY) < match.createdAt
+    ) {
+      activeWindows.pop();
+    }
+    const window = activeWindows.at(-1);
+    if (window && match.createdAt <= window.end) {
+      const segmentActivities = activitiesBySegment[window.segmentIndex];
+      segmentActivities?.all.push(match.activity);
+      segmentActivities?.unmatched.push(match.activity);
+    }
+  }
+
+  for (const segmentActivities of activitiesBySegment) {
+    segmentActivities.all.sort(compareActivities);
+    segmentActivities.unmatched.sort(compareActivities);
   }
 
   return activitiesBySegment;
@@ -532,6 +549,7 @@ function deriveTools(
   segment: ResponseSegment,
   turns: ReadonlyArray<TurnReasoningDurableTurn>,
   activities: ReadonlyArray<OrchestrationThreadActivity>,
+  unmatchedActivities: ReadonlyArray<OrchestrationThreadActivity>,
   timelineEntries: ReadonlyArray<TimelineEntry>,
 ): ToolAggregate {
   const durableCount = sumKnown(turns.map((turn) => turn.toolCallCount));
@@ -539,10 +557,16 @@ function deriveTools(
     ? mergeToolNameCounts(turns.map((turn) => turn.toolNameCounts ?? []))
     : countToolNames(turns.flatMap((turn) => turn.toolNames ?? []));
   if (durableCount !== null || durableNameCounts.length > 0) {
+    const unmatchedTools = deriveActivityTools(unmatchedActivities);
     return {
       count:
-        durableCount ?? durableNameCounts.reduce((total, toolCount) => total + toolCount.count, 0),
-      nameCounts: durableNameCounts,
+        (durableCount ??
+          durableNameCounts.reduce((total, toolCount) => total + toolCount.count, 0)) +
+        unmatchedTools.count,
+      nameCounts:
+        durableNameCounts.length > 0
+          ? mergeToolNameCounts([durableNameCounts, unmatchedTools.nameCounts])
+          : deriveActivityTools(activities).nameCounts,
     };
   }
   const activityTools = deriveActivityTools(activities);
@@ -577,11 +601,21 @@ function deriveActivityApprovals(
 function deriveApprovals(
   turns: ReadonlyArray<TurnReasoningDurableTurn>,
   activities: ReadonlyArray<OrchestrationThreadActivity>,
+  unmatchedActivities: ReadonlyArray<OrchestrationThreadActivity>,
 ): ApprovalAggregate {
   const activityAggregate = deriveActivityApprovals(activities);
+  const unmatchedAggregate = deriveActivityApprovals(unmatchedActivities);
+  const durableApprovals = sumKnown(turns.map((turn) => turn.approvalCount));
+  const durableRejections = sumKnown(turns.map((turn) => turn.rejectionCount));
   return {
-    approvals: sumKnown(turns.map((turn) => turn.approvalCount)) ?? activityAggregate.approvals,
-    rejections: sumKnown(turns.map((turn) => turn.rejectionCount)) ?? activityAggregate.rejections,
+    approvals:
+      durableApprovals === null
+        ? activityAggregate.approvals
+        : durableApprovals + unmatchedAggregate.approvals,
+    rejections:
+      durableRejections === null
+        ? activityAggregate.rejections
+        : durableRejections + unmatchedAggregate.rejections,
   };
 }
 
@@ -648,9 +682,16 @@ function buildSegmentSummary(
   input: BuildTurnReasoningSummaryInput,
   durableTurns: ReadonlyArray<TurnReasoningDurableTurn>,
   activities: ReadonlyArray<OrchestrationThreadActivity>,
+  unmatchedActivities: ReadonlyArray<OrchestrationThreadActivity>,
 ): TurnReasoningSummary {
-  const tools = deriveTools(segment, durableTurns, activities, input.timelineEntries ?? []);
-  const approvals = deriveApprovals(durableTurns, activities);
+  const tools = deriveTools(
+    segment,
+    durableTurns,
+    activities,
+    unmatchedActivities,
+    input.timelineEntries ?? [],
+  );
+  const approvals = deriveApprovals(durableTurns, activities, unmatchedActivities);
   const startedAt =
     earliest(durableTurns.map((turn) => turn.startedAt)) ?? segment.userMessage?.createdAt ?? null;
   const completedAt =
@@ -727,13 +768,18 @@ export function buildTurnReasoningSummaryByAssistantMessageId(
 ): Map<MessageId, TurnReasoningSummary> {
   const segments = deriveResponseSegments(input.messages);
   const durableTurnsBySegment = indexDurableTurnsBySegment(segments, input.turns ?? []);
-  const activitiesBySegment = indexActivitiesBySegment(segments, input.activities ?? []);
+  const activitiesBySegment = indexActivitiesBySegment(
+    segments,
+    durableTurnsBySegment,
+    input.activities ?? [],
+  );
   const summaries = segments.map((segment, index) =>
     buildSegmentSummary(
       segment,
       input,
       durableTurnsBySegment[index] ?? [],
-      activitiesBySegment[index] ?? [],
+      activitiesBySegment[index]?.all ?? [],
+      activitiesBySegment[index]?.unmatched ?? [],
     ),
   );
   const latestIndex = summaries.length - 1;
@@ -751,11 +797,23 @@ function formatNullableNumber(value: number | null): string {
   return value === null ? "—" : numberFormatter.format(value);
 }
 
-function formatDuration(durationMs: number | null): string {
-  if (durationMs === null) return "—";
-  if (durationMs < 60_000) return `${(durationMs / 1_000).toFixed(1)}s`;
-  const minutes = Math.floor(durationMs / 60_000);
-  const seconds = Math.round((durationMs % 60_000) / 1_000);
+export function formatTurnReasoningDuration(
+  durationMs: number | null,
+  style: "compact" | "precise" = "precise",
+): string {
+  if (durationMs === null || !Number.isFinite(durationMs) || durationMs < 0) return "—";
+  if (style === "compact" && durationMs < 1_000) return `${Math.round(durationMs)}ms`;
+  if (style === "compact" && durationMs < 10_000) {
+    return `${(durationMs / 1_000).toFixed(1).replace(/\.0$/u, "")}s`;
+  }
+  if (style === "precise" && durationMs < 60_000) {
+    const seconds = Math.round(durationMs / 100) / 10;
+    if (seconds < 60) return `${seconds.toFixed(1)}s`;
+  }
+  const totalSeconds = Math.round(durationMs / 1_000);
+  if (totalSeconds < 60) return `${totalSeconds}s`;
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
   return seconds > 0 ? `${minutes}m ${seconds}s` : `${minutes}m`;
 }
 
@@ -770,7 +828,7 @@ export function formatTurnReasoningSummaryForClipboard(summary: TurnReasoningSum
     .join(", ");
   const overflow = summary.toolNameOverflowCount > 0 ? `, +${summary.toolNameOverflowCount}` : "";
   const lines = [
-    `Turn #${summary.turnNumber} · ${statusLabel(summary.status)} · ${formatDuration(summary.durationMs)}`,
+    `Turn #${summary.turnNumber} · ${statusLabel(summary.status)} · ${formatTurnReasoningDuration(summary.durationMs)}`,
     `Model: ${summary.provider ?? "—"} · ${summary.model ?? "—"}`,
     `Context: ${formatNullableNumber(summary.contextUsedTokens)} / ${formatNullableNumber(summary.contextWindowTokens)} used`,
     `Tokens: input ${formatNullableNumber(summary.inputTokens)} · output ${formatNullableNumber(summary.outputTokens)} · cached ${formatNullableNumber(summary.cachedInputTokens)} · total ${formatNullableNumber(summary.totalTokens)}`,

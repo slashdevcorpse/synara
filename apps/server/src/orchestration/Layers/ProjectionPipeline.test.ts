@@ -3899,6 +3899,168 @@ it.layer(
     }),
   );
 
+  it.effect("rejects invalid context-window token values", () =>
+    Effect.gen(function* () {
+      const eventStore = yield* OrchestrationEventStore;
+      const projectionPipeline = yield* OrchestrationProjectionPipeline;
+      const sql = yield* SqlClient.SqlClient;
+      const threadId = ThreadId.makeUnsafe("thread-invalid-context-window-maxima");
+      const invalidCases = [
+        {
+          suffix: "zero-window",
+          createdAt: "2026-07-20T11:00:01.000Z",
+          payload: { provider: "codex", usedTokens: 42, maxTokens: 0 },
+          expectedContextUsedTokens: 42,
+          expectedContextWindowTokens: null,
+        },
+        {
+          suffix: "fractional-window",
+          createdAt: "2026-07-20T11:00:02.000Z",
+          payload: { provider: "codex", usedTokens: 42, maxTokens: 200_000.5 },
+          expectedContextUsedTokens: 42,
+          expectedContextWindowTokens: null,
+        },
+        {
+          suffix: "non-number-window",
+          createdAt: "2026-07-20T11:00:03.000Z",
+          payload: { provider: "codex", usedTokens: 42, maxTokens: "200000" },
+          expectedContextUsedTokens: 42,
+          expectedContextWindowTokens: null,
+        },
+        {
+          suffix: "fractional-counts",
+          createdAt: "2026-07-20T11:00:04.000Z",
+          payload: {
+            provider: "codex",
+            usedTokens: 42.5,
+            maxTokens: 200_000,
+            lastInputTokens: 12.5,
+            lastCachedInputTokens: 3.5,
+            lastOutputTokens: 7.5,
+            lastReasoningOutputTokens: 2.5,
+            lastUsedTokens: 26.5,
+          },
+          expectedContextUsedTokens: null,
+          expectedContextWindowTokens: 200_000,
+        },
+      ] as const;
+
+      for (const input of invalidCases) {
+        const turnId = TurnId.makeUnsafe(`turn-invalid-context-window-${input.suffix}`);
+        yield* eventStore.append({
+          type: "thread.activity-appended",
+          eventId: EventId.makeUnsafe(`evt-invalid-context-window-${input.suffix}`),
+          aggregateKind: "thread",
+          aggregateId: threadId,
+          occurredAt: input.createdAt,
+          commandId: CommandId.makeUnsafe(`cmd-invalid-context-window-${input.suffix}`),
+          causationEventId: null,
+          correlationId: CorrelationId.makeUnsafe(`cmd-invalid-context-window-${input.suffix}`),
+          metadata: {},
+          payload: {
+            threadId,
+            activity: {
+              id: EventId.makeUnsafe(`activity-invalid-context-window-${input.suffix}`),
+              tone: "info",
+              kind: "context-window.updated",
+              summary: "context window updated",
+              payload: input.payload,
+              turnId,
+              createdAt: input.createdAt,
+            },
+          },
+        });
+      }
+
+      yield* projectionPipeline.bootstrap;
+
+      const rows = yield* sql<{
+        readonly turnId: string;
+        readonly tokenUsageJson: string | null;
+      }>`
+        SELECT
+          turn_id AS "turnId",
+          token_usage_json AS "tokenUsageJson"
+        FROM projection_turns
+        WHERE thread_id = ${threadId}
+      `;
+      const rowsByTurnId = new Map(rows.map((row) => [row.turnId, row]));
+      for (const input of invalidCases) {
+        const row = rowsByTurnId.get(`turn-invalid-context-window-${input.suffix}`);
+        assert.isDefined(row);
+        assert.deepEqual(JSON.parse(row.tokenUsageJson ?? "null"), {
+          provider: "codex",
+          inputTokens: null,
+          cachedInputTokens: null,
+          outputTokens: null,
+          reasoningOutputTokens: null,
+          totalTokens: null,
+          contextUsedTokens: input.expectedContextUsedTokens,
+          contextWindowTokens: input.expectedContextWindowTokens,
+          updatedAt: input.createdAt,
+        });
+      }
+    }),
+  );
+
+  it.effect("completes a Claude turn without model usage", () =>
+    Effect.gen(function* () {
+      const eventStore = yield* OrchestrationEventStore;
+      const projectionPipeline = yield* OrchestrationProjectionPipeline;
+      const sql = yield* SqlClient.SqlClient;
+      const threadId = ThreadId.makeUnsafe("thread-claude-completed-without-model-usage");
+      const turnId = TurnId.makeUnsafe("turn-claude-completed-without-model-usage");
+      const completedAt = "2026-07-20T11:30:00.000Z";
+
+      yield* eventStore.append({
+        type: "thread.activity-appended",
+        eventId: EventId.makeUnsafe("evt-claude-completed-without-model-usage"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: completedAt,
+        commandId: CommandId.makeUnsafe("cmd-claude-completed-without-model-usage"),
+        causationEventId: null,
+        correlationId: CorrelationId.makeUnsafe("cmd-claude-completed-without-model-usage"),
+        metadata: {},
+        payload: {
+          threadId,
+          activity: {
+            id: EventId.makeUnsafe("activity-claude-completed-without-model-usage"),
+            tone: "info",
+            kind: "turn.completed",
+            summary: "turn completed",
+            payload: { provider: "claudeAgent", state: "completed" },
+            turnId,
+            createdAt: completedAt,
+          },
+        },
+      });
+
+      yield* projectionPipeline.bootstrap;
+
+      const rows = yield* sql<{
+        readonly state: string;
+        readonly provider: string | null;
+        readonly tokenUsageJson: string | null;
+      }>`
+        SELECT
+          state,
+          provider,
+          token_usage_json AS "tokenUsageJson"
+        FROM projection_turns
+        WHERE thread_id = ${threadId}
+          AND turn_id = ${turnId}
+      `;
+      assert.deepEqual(rows, [
+        {
+          state: "completed",
+          provider: "claudeAgent",
+          tokenUsageJson: null,
+        },
+      ]);
+    }),
+  );
+
   it.effect("projects steer dispatch mode onto the triggering user message", () =>
     Effect.gen(function* () {
       const eventStore = yield* OrchestrationEventStore;
