@@ -27,7 +27,7 @@ turnSummaryMigrationLayer("projection turn summary migration", (it) => {
   it.effect("adds durable columns and resets only the turn projector for historical replay", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
-      yield* runMigrations({ toMigrationInclusive: 73 });
+      yield* runMigrations({ toMigrationInclusive: 74 });
       yield* sql`
         INSERT INTO projection_state (projector, last_applied_sequence, updated_at)
         VALUES
@@ -38,7 +38,7 @@ turnSummaryMigrationLayer("projection turn summary migration", (it) => {
       const executed = yield* runMigrations();
       assert.deepStrictEqual(
         executed.map(([id]) => id),
-        [74],
+        [75],
       );
 
       const columns = yield* sql<{ readonly name: string }>`
