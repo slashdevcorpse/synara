@@ -300,6 +300,46 @@ describe("scratch workspace cleanup", () => {
     }
   });
 
+  it("does not recursively delete a workspace replacement swapped in after quarantine", async () => {
+    const rootDir = await mkdtemp(path.join(tmpdir(), "synara-scratch-quarantine-swap-"));
+    const candidate = path.join(
+      rootDir,
+      scratchWorkspaceSegment(ThreadId.makeUnsafe("quarantine-swap-thread")),
+    );
+    let originalQuarantine = "";
+    let replacementQuarantine = "";
+    mkdirSync(candidate);
+    writeFileSync(path.join(candidate, "proof.txt"), "original");
+    const nowMs = Date.now();
+    const staleDate = new Date(nowMs - 48 * 60 * 60 * 1_000);
+    utimesSync(candidate, staleDate, staleDate);
+
+    try {
+      const result = await sweepStaleScratchWorkspaces({
+        activeThreadIds: new Set(),
+        rootDir,
+        nowMs,
+        beforeRecursiveDelete: async (quarantinePath) => {
+          replacementQuarantine = quarantinePath;
+          originalQuarantine = `${quarantinePath}.original`;
+          renameSync(quarantinePath, originalQuarantine);
+          mkdirSync(quarantinePath);
+          writeFileSync(path.join(quarantinePath, "replacement.txt"), "replacement");
+        },
+      });
+
+      expect(result).toMatchObject({ removed: 0, preservedUnsafe: 1 });
+      expect(() =>
+        writeFileSync(path.join(originalQuarantine, "still-original.txt"), "safe"),
+      ).not.toThrow();
+      expect(() =>
+        writeFileSync(path.join(replacementQuarantine, "still-replacement.txt"), "safe"),
+      ).not.toThrow();
+    } finally {
+      rmSync(rootDir, { recursive: true, force: true });
+    }
+  });
+
   it("recovers a stale scratch quarantine left by an interrupted pinned deletion", async () => {
     const rootDir = await mkdtemp(path.join(tmpdir(), "synara-scratch-quarantine-"));
     const segment = scratchWorkspaceSegment(ThreadId.makeUnsafe("quarantined-thread"));
@@ -322,6 +362,44 @@ describe("scratch workspace cleanup", () => {
 
       expect(result).toMatchObject({ removed: 1, preservedUnsafe: 0 });
       expect(() => writeFileSync(path.join(quarantine, "gone.txt"), "gone")).toThrow();
+    } finally {
+      rmSync(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not recursively delete a quarantine-recovery replacement after validation", async () => {
+    const rootDir = await mkdtemp(path.join(tmpdir(), "synara-scratch-recovery-swap-"));
+    const segment = scratchWorkspaceSegment(ThreadId.makeUnsafe("recovery-swap-thread"));
+    const quarantine = path.join(
+      rootDir,
+      `.synara-scratch-${segment}.deleting-123e4567-e89b-42d3-a456-426614174000`,
+    );
+    const originalQuarantine = `${quarantine}.original`;
+    mkdirSync(quarantine);
+    writeFileSync(path.join(quarantine, "proof.txt"), "original");
+    const nowMs = Date.now();
+    const staleDate = new Date(nowMs - 48 * 60 * 60 * 1_000);
+    utimesSync(quarantine, staleDate, staleDate);
+
+    try {
+      const result = await sweepStaleScratchWorkspaces({
+        activeThreadIds: new Set(),
+        rootDir,
+        nowMs,
+        beforeRecursiveDelete: async () => {
+          renameSync(quarantine, originalQuarantine);
+          mkdirSync(quarantine);
+          writeFileSync(path.join(quarantine, "replacement.txt"), "replacement");
+        },
+      });
+
+      expect(result).toMatchObject({ removed: 0, preservedUnsafe: 1 });
+      expect(() =>
+        writeFileSync(path.join(originalQuarantine, "still-original.txt"), "safe"),
+      ).not.toThrow();
+      expect(() =>
+        writeFileSync(path.join(quarantine, "still-replacement.txt"), "safe"),
+      ).not.toThrow();
     } finally {
       rmSync(rootDir, { recursive: true, force: true });
     }
@@ -381,6 +459,22 @@ describe("scratch workspace cleanup", () => {
       expect(() => writeFileSync(path.join(workspace, "gone.txt"), "gone")).toThrow();
     } finally {
       rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it("deletes a scratch segment that starts with a Node option prefix", async () => {
+    const rootDir = await mkdtemp(path.join(tmpdir(), "synara-scratch-option-name-"));
+    const threadId = ThreadId.makeUnsafe("--inspect-scratch");
+    const workspace = ensureIsolatedScratchWorkspace(threadId, { rootDir });
+    try {
+      expect(path.basename(workspace).startsWith("--")).toBe(true);
+      writeFileSync(path.join(workspace, "proof.txt"), "delete me");
+
+      await removeIsolatedScratchWorkspace(threadId, { rootDir });
+
+      expect(() => writeFileSync(path.join(workspace, "gone.txt"), "gone")).toThrow();
+    } finally {
+      rmSync(rootDir, { recursive: true, force: true });
     }
   });
 

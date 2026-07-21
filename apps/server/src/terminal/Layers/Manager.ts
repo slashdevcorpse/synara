@@ -818,6 +818,12 @@ interface KillEscalationHandle {
 export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> {
   readonly generation = randomUUID();
   private readonly sessions = new Map<string, TerminalSessionState>();
+  /**
+   * Event clocks for sessions removed only by inactive-retention policy. A
+   * renderer can reopen that terminal within this manager generation, so its
+   * next event must continue past the last event the renderer may have applied.
+   */
+  private readonly evictedSessionSequenceWatermarks = new Map<string, number>();
   private readonly logsDir: string;
   private managedWrapperBinDir: string | null;
   private managedWrapperZshDir: string | null;
@@ -986,9 +992,10 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
           lastInputAt: null,
           lastOutputAt: null,
           lastOutputSignature: null,
-          eventSequence: 0,
+          eventSequence: this.evictedSessionSequenceWatermarks.get(sessionKey) ?? 0,
         };
         this.sessions.set(sessionKey, session);
+        this.evictedSessionSequenceWatermarks.delete(sessionKey);
         this.evictInactiveSessionsIfNeeded();
         await this.startSession(session, { ...input, cols, rows }, "started");
         return this.snapshot(session);
@@ -1233,9 +1240,10 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
           lastOutputSignature: null,
           lastInputAt: null,
           lastOutputAt: null,
-          eventSequence: 0,
+          eventSequence: this.evictedSessionSequenceWatermarks.get(sessionKey) ?? 0,
         } satisfies TerminalSessionState;
         this.sessions.set(sessionKey, session);
+        this.evictedSessionSequenceWatermarks.delete(sessionKey);
         this.evictInactiveSessionsIfNeeded();
       } else {
         await this.stopProcess(session);
@@ -1279,6 +1287,7 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
       for (const session of threadSessions) {
         this.sessions.delete(toSessionKey(session.threadId, session.terminalId));
       }
+      this.clearEvictedSessionSequenceWatermarks(input.threadId);
       await Promise.all(
         threadSessions.map((session) =>
           this.flushPersistQueue(session.threadId, session.terminalId),
@@ -1318,8 +1327,9 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
     this.stopSubprocessPolling();
     const sessions = [...this.sessions.values()];
     const processStops: Promise<void>[] = [];
-    // Drain every session while all event clocks remain addressable. A later
-    // stop can enforce inactive-session retention and evict a different entry.
+    // Drain every session while all event clocks remain addressable. Controlled
+    // stops never enforce inactive retention; the directory is cleared only
+    // after every process stop settles.
     for (const session of sessions) {
       this.flushOutputBuffer(session);
     }
@@ -1338,6 +1348,7 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
     this.persistQueues.clear();
     await Promise.all(processStops);
     this.sessions.clear();
+    this.evictedSessionSequenceWatermarks.clear();
     if (!options.keepEscalationTimers) {
       this.clearAllKillEscalationTimers();
       await Promise.allSettled([...this.pendingKillEscalations]);
@@ -1839,7 +1850,6 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
       session.threadId,
       session.terminalId,
     );
-    this.evictInactiveSessionsIfNeeded();
     this.updateSubprocessPollingState();
     return processStop;
   }
@@ -2040,6 +2050,7 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
     for (const session of inactiveSessions.slice(0, toEvict)) {
       const key = toSessionKey(session.threadId, session.terminalId);
       this.flushOutputBuffer(session);
+      this.evictedSessionSequenceWatermarks.set(key, session.eventSequence);
       this.sessions.delete(key);
       this.clearPersistTimer(session.threadId, session.terminalId);
       this.pendingPersistHistory.delete(key);
@@ -2510,6 +2521,7 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
       await this.stopProcess(session);
       this.sessions.delete(key);
     }
+    this.evictedSessionSequenceWatermarks.delete(key);
     this.updateSubprocessPollingState();
     await this.flushPersistQueue(threadId, terminalId);
     if (deleteHistory) {
@@ -2519,6 +2531,15 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
 
   private sessionsForThread(threadId: string): TerminalSessionState[] {
     return [...this.sessions.values()].filter((session) => session.threadId === threadId);
+  }
+
+  private clearEvictedSessionSequenceWatermarks(threadId: string): void {
+    const prefix = `${threadId}\u0000`;
+    for (const key of this.evictedSessionSequenceWatermarks.keys()) {
+      if (key.startsWith(prefix)) {
+        this.evictedSessionSequenceWatermarks.delete(key);
+      }
+    }
   }
 
   private async deleteAllHistoryForThread(threadId: string): Promise<void> {

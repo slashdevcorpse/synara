@@ -1110,6 +1110,96 @@ describe("TerminalManager", () => {
     await manager.dispose();
   });
 
+  it("keeps zero-retention restart registered with a monotonic event clock", async () => {
+    const { manager, ptyAdapter } = makeManager(5, {
+      maxRetainedInactiveSessions: 0,
+      shellPlatform: "win32",
+    });
+    const events: TerminalEvent[] = [];
+    manager.on("event", (event) => events.push(event));
+    await manager.open(openInput());
+
+    const snapshot = await manager.restart(restartInput());
+    const recovery = await manager.recoverySnapshot({ threadId: "thread-1" });
+
+    expect(snapshot.status).toBe("running");
+    expect(ptyAdapter.spawnInputs).toHaveLength(2);
+    expect(events.map((event) => [event.type, event.sequence])).toEqual([
+      ["started", 1],
+      ["restarted", 2],
+    ]);
+    expect(recovery.watermark).toBe(2);
+    await manager.dispose();
+  });
+
+  it("sequences a zero-retention restart failure before evicting the session", async () => {
+    const { manager, ptyAdapter } = makeManager(5, {
+      maxRetainedInactiveSessions: 0,
+      shellPlatform: "win32",
+    });
+    const events: TerminalEvent[] = [];
+    manager.on("event", (event) => events.push(event));
+    await manager.open(openInput());
+    ptyAdapter.spawnFailures.push(Object.assign(new Error("missing"), { code: "ENOENT" }));
+
+    const snapshot = await manager.restart(restartInput());
+
+    expect(snapshot.status).toBe("error");
+    expect(events.map((event) => [event.type, event.sequence])).toEqual([
+      ["started", 1],
+      ["error", 2],
+    ]);
+    expect((manager as unknown as { sessions: Map<string, unknown> }).sessions.size).toBe(0);
+    await manager.dispose();
+  });
+
+  it("continues the event clock when zero-retention reopens an exited terminal", async () => {
+    const { manager, ptyAdapter } = makeManager(5, {
+      maxRetainedInactiveSessions: 0,
+      shellPlatform: "win32",
+    });
+    const events: TerminalEvent[] = [];
+    manager.on("event", (event) => events.push(event));
+    await manager.open(openInput());
+    ptyAdapter.processes[0]?.emitExit({ exitCode: 0, signal: 0 });
+
+    const snapshot = await manager.open(openInput());
+    const recovery = await manager.recoverySnapshot({ threadId: "thread-1" });
+
+    expect(snapshot.status).toBe("running");
+    expect(ptyAdapter.spawnInputs).toHaveLength(2);
+    expect(events.map((event) => [event.type, event.sequence])).toEqual([
+      ["started", 1],
+      ["exited", 2],
+      ["started", 3],
+    ]);
+    expect(recovery.watermark).toBe(3);
+    await manager.dispose();
+  });
+
+  it("continues the event clock through a zero-retention reopen failure", async () => {
+    const { manager, ptyAdapter } = makeManager(5, {
+      maxRetainedInactiveSessions: 0,
+      shellPlatform: "win32",
+    });
+    const events: TerminalEvent[] = [];
+    manager.on("event", (event) => events.push(event));
+    await manager.open(openInput());
+    ptyAdapter.processes[0]?.emitExit({ exitCode: 0, signal: 0 });
+    ptyAdapter.spawnFailures.push(Object.assign(new Error("missing"), { code: "ENOENT" }));
+
+    const snapshot = await manager.open(openInput());
+
+    expect(snapshot.status).toBe("error");
+    expect(events.map((event) => [event.type, event.sequence])).toEqual([
+      ["started", 1],
+      ["exited", 2],
+      ["error", 3],
+    ]);
+    expect((manager as unknown as { sessions: Map<string, unknown> }).sessions.size).toBe(0);
+    await manager.dispose();
+  });
+
   it("emits exited event and reopens with clean transcript after exit", async () => {
     const { manager, ptyAdapter, logsDir } = makeManager();
     const events: TerminalEvent[] = [];

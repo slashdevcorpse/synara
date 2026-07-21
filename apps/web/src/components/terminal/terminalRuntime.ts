@@ -1721,14 +1721,17 @@ function openTerminal(entry: TerminalRuntimeEntry): void {
   entry.lastSentResize = null;
   entry.opened = true;
   setRuntimeStatus(entry, "connecting");
+  const requestId = ++entry.snapshotReconcileRequestId;
+  const isCurrentOpenRequest = () =>
+    !entry.disposed && entry.opened && entry.snapshotReconcileRequestId === requestId;
   const outputEventVersionAtOpen = entry.outputEventVersion;
   const openInput = buildOpenInput(entry);
   entry.backendOpenDimensions = { cols: openInput.cols, rows: openInput.rows };
 
   void waitForTerminalEventStreamReady(api)
-    .then(() => api.terminal.open(openInput))
+    .then(() => (isCurrentOpenRequest() ? api.terminal.open(openInput) : null))
     .then((snapshot) => {
-      if (entry.disposed) return;
+      if (!snapshot || !isCurrentOpenRequest()) return;
       const retainedOutput = hasRetainedRecoveredOutput(entry);
       if (
         shouldReplayColdSnapshot(
@@ -1738,23 +1741,24 @@ function openTerminal(entry: TerminalRuntimeEntry): void {
           retainedOutput,
         )
       ) {
-        replaySnapshot(entry, snapshot, () => setRuntimeStatus(entry, "ready"));
+        replaySnapshot(entry, snapshot, () => {
+          if (isCurrentOpenRequest()) setRuntimeStatus(entry, "ready");
+        });
       } else if (entry.outputEventVersion === outputEventVersionAtOpen) {
         setRuntimeStatus(entry, "ready");
         window.setTimeout(() => {
           if (
-            entry.disposed ||
-            !entry.opened ||
+            !isCurrentOpenRequest() ||
             (entry.outputEventVersion !== outputEventVersionAtOpen &&
               !hasRetainedRecoveredOutput(entry))
           ) {
             return;
           }
           void waitForTerminalEventStreamReady(api)
-            .then(() => api.terminal.open(openInput))
+            .then(() => (isCurrentOpenRequest() ? api.terminal.open(openInput) : null))
             .then((nextSnapshot) => {
+              if (!nextSnapshot || !isCurrentOpenRequest()) return;
               const retainedOutput = hasRetainedRecoveredOutput(entry);
-              if (entry.disposed) return;
               if (
                 !shouldReplayColdSnapshot(
                   nextSnapshot,
@@ -1765,7 +1769,9 @@ function openTerminal(entry: TerminalRuntimeEntry): void {
               ) {
                 return;
               }
-              replaySnapshot(entry, nextSnapshot, () => setRuntimeStatus(entry, "ready"));
+              replaySnapshot(entry, nextSnapshot, () => {
+                if (isCurrentOpenRequest()) setRuntimeStatus(entry, "ready");
+              });
             })
             .catch(() => {
               // Best-effort recovery only; the original open already succeeded.
@@ -1779,7 +1785,7 @@ function openTerminal(entry: TerminalRuntimeEntry): void {
       }
     })
     .catch((error) => {
-      if (entry.disposed) return;
+      if (!isCurrentOpenRequest()) return;
       entry.opened = false;
       setRuntimeStatus(entry, "error");
       writeSystemMessage(entry.terminal, describeErrorMessage(error, "Failed to open terminal"));

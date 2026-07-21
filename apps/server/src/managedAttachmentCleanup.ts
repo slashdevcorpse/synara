@@ -1,8 +1,10 @@
+import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import type { BigIntStats, Dir } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
+import { createInterface } from "node:readline";
 
 import { Effect, Layer, Semaphore, ServiceMap } from "effect";
 
@@ -47,6 +49,96 @@ const MANAGED_ATTACHMENT_STAGING_RECOVERY_INVOCATION_SCAN_LIMIT =
   MANAGED_ATTACHMENT_STAGING_SWEEP_SCAN_LIMIT * 4;
 const MANAGED_ATTACHMENT_STAGING_RECOVERY_INVOCATION_PASS_LIMIT = 4;
 const MANAGED_ATTACHMENT_STAGING_RECOVERY_INVOCATION_TIME_MS = 250;
+const PINNED_STAGING_DELETE_TIMEOUT_MS = 5_000;
+const PINNED_STAGING_DELETE_SCRIPT = String.raw`
+const fs = require("node:fs");
+const path = require("node:path");
+const { randomUUID } = require("node:crypto");
+const readline = require("node:readline");
+const [stagingDev, stagingIno] = process.argv.slice(1);
+const PART_PATTERN = /^att_v2_[0-9a-f]{32}\.part$/u;
+const QUARANTINE_PATTERN = /^(att_v2_[0-9a-f]{32}\.part)\.cleanup-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+const sameIdentity = (stat, dev, ino) => String(stat.dev) === dev && String(stat.ino) === ino;
+const respond = (value) => process.stdout.write(JSON.stringify(value) + "\n");
+const stagingIsCurrent = () => {
+  try {
+    const stagingStat = fs.lstatSync(".", { bigint: true });
+    return stagingStat.isDirectory() && !stagingStat.isSymbolicLink() && sameIdentity(stagingStat, stagingDev, stagingIno);
+  } catch {
+    return false;
+  }
+};
+const processRequest = (request) => {
+  const { operation, entryName, candidateDev, candidateIno, staleBeforeMs } = request || {};
+  if (!stagingIsCurrent()) return { _tag: "DirectoryUnsafe" };
+  if (!entryName || path.basename(entryName) !== entryName || entryName === "." || entryName === "..") {
+    return { _tag: "CandidateUnsafe" };
+  }
+  const isPart = PART_PATTERN.test(entryName);
+  const isQuarantine = QUARANTINE_PATTERN.test(entryName);
+  if (
+    (operation === "quarantine" && !isPart) ||
+    (operation === "unlink-quarantine" && !isQuarantine) ||
+    (operation === "cleanup" && !isPart && !isQuarantine)
+  ) {
+    return { _tag: "CandidateUnsafe" };
+  }
+  let candidateStat;
+  try {
+    candidateStat = fs.lstatSync(entryName, { bigint: true });
+  } catch (cause) {
+    if (cause && cause.code === "ENOENT") return { _tag: "Missing" };
+    throw cause;
+  }
+  if (
+    !candidateStat.isFile() ||
+    candidateStat.isSymbolicLink() ||
+    !sameIdentity(candidateStat, candidateDev, candidateIno) ||
+    Number(candidateStat.mtimeMs) >= Number(staleBeforeMs)
+  ) {
+    return { _tag: "CandidateUnsafe" };
+  }
+  if (operation === "unlink-quarantine" || (operation === "cleanup" && isQuarantine)) {
+    fs.unlinkSync(entryName);
+    return { _tag: "Removed" };
+  }
+  const quarantineName = entryName + ".cleanup-" + randomUUID();
+  fs.renameSync(entryName, quarantineName);
+  const quarantinedStat = fs.lstatSync(quarantineName, { bigint: true });
+  if (
+    !quarantinedStat.isFile() ||
+    quarantinedStat.isSymbolicLink() ||
+    !sameIdentity(quarantinedStat, candidateDev, candidateIno) ||
+    Number(quarantinedStat.mtimeMs) >= Number(staleBeforeMs)
+  ) {
+    try { fs.renameSync(quarantineName, entryName); } catch {}
+    return { _tag: "CandidateUnsafe" };
+  }
+  if (operation === "quarantine") {
+    return { _tag: "Quarantined", quarantineName };
+  }
+  try {
+    fs.unlinkSync(quarantineName);
+  } catch (cause) {
+    try { fs.renameSync(quarantineName, entryName); } catch {}
+    throw cause;
+  }
+  return { _tag: "Removed" };
+};
+if (!stagingIsCurrent()) {
+  respond({ _tag: "DirectoryUnsafe" });
+  process.exit(0);
+}
+respond({ _tag: "Ready" });
+const lines = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+lines.on("line", (line) => {
+  try {
+    respond(processRequest(JSON.parse(line)));
+  } catch (cause) {
+    respond({ _tag: "Failed", detail: String(cause && (cause.code || cause.message) || cause).slice(0, 2048) });
+  }
+});
+`;
 
 export interface ManagedAttachmentStagingSweepResult {
   readonly inspected: number;
@@ -67,20 +159,22 @@ export interface ManagedAttachmentStagingSweepInput {
   readonly beforeQuarantine?: (candidatePath: string) => Promise<void>;
   /** Test seam for a crash after quarantine but before unlink. */
   readonly afterQuarantine?: (candidatePath: string, quarantinePath: string) => Promise<void>;
+  /** Test seam for a staging-directory swap after final candidate validation. */
+  readonly beforePinnedDelete?: (stagingDir: string, candidatePath: string) => Promise<void>;
 }
 
 type VerifiedStagingDirectory =
   | { readonly _tag: "Missing" }
   | { readonly _tag: "Unsafe" }
-  | { readonly _tag: "Verified"; readonly realPath: string };
+  | { readonly _tag: "Verified"; readonly realPath: string; readonly identity: BigIntStats };
 
 async function resolveVerifiedStagingDirectory(
   attachmentsDir: string,
 ): Promise<VerifiedStagingDirectory> {
   const stagingDir = path.join(attachmentsDir, ".staging");
-  let stagingStat: Awaited<ReturnType<typeof fs.lstat>>;
+  let stagingStat: BigIntStats;
   try {
-    stagingStat = await fs.lstat(stagingDir);
+    stagingStat = await fs.lstat(stagingDir, { bigint: true });
   } catch (cause) {
     if (isMissingFileError(cause)) return { _tag: "Missing" };
     throw cause;
@@ -96,9 +190,53 @@ async function resolveVerifiedStagingDirectory(
     if (isMissingFileError(cause)) return { _tag: "Missing" };
     throw cause;
   }
-  return realStagingDir === null
-    ? { _tag: "Unsafe" }
-    : { _tag: "Verified", realPath: realStagingDir };
+  if (realStagingDir === null) return { _tag: "Unsafe" };
+  const verifiedStat = await fs.lstat(realStagingDir, { bigint: true }).catch((cause) => {
+    if (isMissingFileError(cause)) return null;
+    throw cause;
+  });
+  if (
+    !verifiedStat ||
+    !verifiedStat.isDirectory() ||
+    verifiedStat.isSymbolicLink() ||
+    !isSameFileIdentity(stagingStat, verifiedStat)
+  ) {
+    return { _tag: "Unsafe" };
+  }
+  return { _tag: "Verified", realPath: realStagingDir, identity: verifiedStat };
+}
+
+type OpenedStagingDirectory =
+  | { readonly _tag: "Missing" }
+  | { readonly _tag: "Unsafe" }
+  | { readonly _tag: "Opened"; readonly directory: Dir };
+
+async function openVerifiedStagingDirectory(
+  staging: Extract<VerifiedStagingDirectory, { readonly _tag: "Verified" }>,
+): Promise<OpenedStagingDirectory> {
+  let directory: Dir;
+  try {
+    directory = await fs.opendir(staging.realPath);
+  } catch (cause) {
+    if (isMissingFileError(cause)) return { _tag: "Missing" };
+    throw cause;
+  }
+  try {
+    const current = await fs.lstat(staging.realPath, { bigint: true });
+    if (
+      !current.isDirectory() ||
+      current.isSymbolicLink() ||
+      !isSameFileIdentity(staging.identity, current)
+    ) {
+      await directory.close();
+      return { _tag: "Unsafe" };
+    }
+    return { _tag: "Opened", directory };
+  } catch (cause) {
+    await directory.close().catch(() => undefined);
+    if (isMissingFileError(cause)) return { _tag: "Missing" };
+    throw cause;
+  }
 }
 
 function stagingEntryPartName(entryName: string): string | null {
@@ -110,9 +248,195 @@ function isSameFileIdentity(left: BigIntStats, right: BigIntStats): boolean {
   return left.dev === right.dev && left.ino === right.ino;
 }
 
+type PinnedStagingDeleteResult =
+  | { readonly _tag: "Removed" }
+  | { readonly _tag: "Quarantined"; readonly quarantineName: string }
+  | { readonly _tag: "Missing" }
+  | { readonly _tag: "DirectoryUnsafe" }
+  | { readonly _tag: "CandidateUnsafe" };
+
+interface PinnedStagingDeleteSession {
+  readonly run: (input: {
+    readonly operation: "cleanup" | "quarantine" | "unlink-quarantine";
+    readonly entryName: string;
+    readonly candidateIdentity: BigIntStats;
+    readonly staleBeforeMs: number;
+  }) => Promise<PinnedStagingDeleteResult>;
+  readonly close: () => Promise<void>;
+}
+
+type PinnedStagingDeleteSessionResult =
+  | { readonly _tag: "Opened"; readonly session: PinnedStagingDeleteSession }
+  | { readonly _tag: "DirectoryUnsafe" };
+
+function parsePinnedStagingResponse(line: string): PinnedStagingDeleteResult | { _tag: "Ready" } {
+  const response = JSON.parse(line) as {
+    readonly _tag?: unknown;
+    readonly quarantineName?: unknown;
+    readonly detail?: unknown;
+  };
+  switch (response._tag) {
+    case "Ready":
+    case "Removed":
+    case "Missing":
+    case "DirectoryUnsafe":
+    case "CandidateUnsafe":
+      return { _tag: response._tag };
+    case "Quarantined":
+      if (
+        typeof response.quarantineName !== "string" ||
+        path.basename(response.quarantineName) !== response.quarantineName ||
+        !MANAGED_ATTACHMENT_STAGING_QUARANTINE_PATTERN.test(response.quarantineName)
+      ) {
+        throw new Error("Pinned staging deletion returned an invalid quarantine name.");
+      }
+      return { _tag: "Quarantined", quarantineName: response.quarantineName };
+    case "Failed":
+      throw new Error(
+        `Pinned staging deletion failed.${typeof response.detail === "string" ? ` ${response.detail}` : ""}`,
+      );
+    default:
+      throw new Error("Pinned staging deletion returned an invalid response.");
+  }
+}
+
+async function createPinnedStagingDeleteSession(input: {
+  readonly realStagingDir: string;
+  readonly stagingIdentity: BigIntStats;
+}): Promise<PinnedStagingDeleteSessionResult> {
+  const child = spawn(
+    process.execPath,
+    [
+      "--eval",
+      PINNED_STAGING_DELETE_SCRIPT,
+      "--",
+      input.stagingIdentity.dev.toString(10),
+      input.stagingIdentity.ino.toString(10),
+    ],
+    {
+      cwd: input.realStagingDir,
+      stdio: "pipe",
+      windowsHide: true,
+    },
+  );
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  let stderr = "";
+  let spawnError: Error | null = null;
+  child.stderr.on("data", (chunk: string) => {
+    if (stderr.length < 4_096) stderr += chunk.slice(0, 4_096 - stderr.length);
+  });
+  child.on("error", (cause) => {
+    spawnError = cause;
+  });
+  child.stdin.on("error", (cause) => {
+    spawnError ??= cause;
+  });
+  const lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
+  const iterator = lines[Symbol.asyncIterator]();
+
+  const readResponse = async (): Promise<PinnedStagingDeleteResult | { _tag: "Ready" }> => {
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const next = await Promise.race([
+        iterator.next(),
+        new Promise<never>((_resolve, reject) => {
+          timeout = setTimeout(() => {
+            child.kill("SIGKILL");
+            reject(new Error("Pinned staging deletion timed out."));
+          }, PINNED_STAGING_DELETE_TIMEOUT_MS);
+        }),
+      ]);
+      if (next.done) {
+        throw new Error(
+          `Pinned staging deletion exited without a response.${spawnError ? ` ${spawnError.message}` : stderr.trim() ? ` ${stderr.trim()}` : ""}`,
+        );
+      }
+      return parsePinnedStagingResponse(next.value);
+    } finally {
+      if (timeout) clearTimeout(timeout);
+    }
+  };
+
+  const ready = await readResponse();
+  if (ready._tag === "DirectoryUnsafe") {
+    child.stdin.end();
+    lines.close();
+    return { _tag: "DirectoryUnsafe" };
+  }
+  if (ready._tag !== "Ready") {
+    child.kill("SIGKILL");
+    lines.close();
+    throw new Error("Pinned staging deletion did not become ready.");
+  }
+
+  let closed = false;
+  const session: PinnedStagingDeleteSession = {
+    run: async (request) => {
+      if (closed || child.stdin.destroyed) {
+        throw new Error("Pinned staging deletion session is closed.");
+      }
+      child.stdin.write(
+        `${JSON.stringify({
+          operation: request.operation,
+          entryName: request.entryName,
+          candidateDev: request.candidateIdentity.dev.toString(10),
+          candidateIno: request.candidateIdentity.ino.toString(10),
+          staleBeforeMs: request.staleBeforeMs,
+        })}\n`,
+      );
+      const response = await readResponse();
+      if (response._tag === "Ready") {
+        throw new Error("Pinned staging deletion returned an unexpected ready response.");
+      }
+      return response;
+    },
+    close: async () => {
+      if (closed) return;
+      closed = true;
+      child.stdin.end();
+      if (child.exitCode === null && child.signalCode === null) {
+        await new Promise<void>((resolve) => {
+          let timeout: ReturnType<typeof setTimeout> | undefined;
+          let finished = false;
+          const finish = () => {
+            if (finished) return;
+            finished = true;
+            if (timeout) clearTimeout(timeout);
+            child.removeListener("exit", finish);
+            resolve();
+          };
+          child.once("exit", finish);
+          if (child.exitCode !== null || child.signalCode !== null) {
+            finish();
+            return;
+          }
+          timeout = setTimeout(() => {
+            child.kill("SIGKILL");
+            finish();
+          }, PINNED_STAGING_DELETE_TIMEOUT_MS);
+        });
+      }
+      lines.close();
+    },
+  };
+  return { _tag: "Opened", session };
+}
+
+async function runPinnedStagingDelete(input: {
+  readonly session: PinnedStagingDeleteSession;
+  readonly operation: "cleanup" | "quarantine" | "unlink-quarantine";
+  readonly entryName: string;
+  readonly candidateIdentity: BigIntStats;
+  readonly staleBeforeMs: number;
+}): Promise<PinnedStagingDeleteResult> {
+  return input.session.run(input);
+}
+
 async function processManagedAttachmentStagingEntry(input: {
   readonly sweep: ManagedAttachmentStagingSweepInput;
   readonly realStagingDir: string;
+  readonly pinnedDeleteSession: PinnedStagingDeleteSession;
   readonly entryName: string;
   readonly staleBeforeMs: number;
 }): Promise<{ readonly removed: number; readonly failures: number }> {
@@ -150,14 +474,11 @@ async function processManagedAttachmentStagingEntry(input: {
         return;
       }
 
-      if (input.entryName !== partName) {
-        await fs.unlink(realCandidate);
-        removed += 1;
-        return;
+      let preQuarantineStat = finalStat;
+      if (input.entryName === partName) {
+        await input.sweep.beforeQuarantine?.(realCandidate);
+        preQuarantineStat = await fs.lstat(realCandidate, { bigint: true });
       }
-
-      await input.sweep.beforeQuarantine?.(realCandidate);
-      const preQuarantineStat = await fs.lstat(realCandidate, { bigint: true });
       if (
         !preQuarantineStat.isFile() ||
         preQuarantineStat.isSymbolicLink() ||
@@ -166,28 +487,41 @@ async function processManagedAttachmentStagingEntry(input: {
       ) {
         return;
       }
+      await input.sweep.beforePinnedDelete?.(input.realStagingDir, realCandidate);
 
-      const quarantinePath = `${realCandidate}.cleanup-${randomUUID()}`;
-      await fs.rename(realCandidate, quarantinePath);
-      const quarantinedStat = await fs.lstat(quarantinePath, { bigint: true });
-      if (
-        !quarantinedStat.isFile() ||
-        quarantinedStat.isSymbolicLink() ||
-        !isSameFileIdentity(preQuarantineStat, quarantinedStat) ||
-        Number(quarantinedStat.mtimeMs) >= input.staleBeforeMs
-      ) {
-        await fs.rename(quarantinePath, realCandidate).catch(() => undefined);
+      if (input.entryName !== partName || input.sweep.afterQuarantine === undefined) {
+        const deletion = await runPinnedStagingDelete({
+          session: input.pinnedDeleteSession,
+          operation: "cleanup",
+          entryName: input.entryName,
+          candidateIdentity: preQuarantineStat,
+          staleBeforeMs: input.staleBeforeMs,
+        });
+        if (deletion._tag === "Removed") removed += 1;
+        else if (deletion._tag === "DirectoryUnsafe") failures += 1;
         return;
       }
 
-      await input.sweep.afterQuarantine?.(realCandidate, quarantinePath);
-      try {
-        await fs.unlink(quarantinePath);
-        removed += 1;
-      } catch (cause) {
-        await fs.rename(quarantinePath, realCandidate).catch(() => undefined);
-        throw cause;
-      }
+      const quarantine = await runPinnedStagingDelete({
+        session: input.pinnedDeleteSession,
+        operation: "quarantine",
+        entryName: input.entryName,
+        candidateIdentity: preQuarantineStat,
+        staleBeforeMs: input.staleBeforeMs,
+      });
+      if (quarantine._tag === "DirectoryUnsafe") failures += 1;
+      if (quarantine._tag !== "Quarantined") return;
+      const quarantinePath = path.join(input.realStagingDir, quarantine.quarantineName);
+      await input.sweep.afterQuarantine(realCandidate, quarantinePath);
+      const deletion = await runPinnedStagingDelete({
+        session: input.pinnedDeleteSession,
+        operation: "unlink-quarantine",
+        entryName: quarantine.quarantineName,
+        candidateIdentity: preQuarantineStat,
+        staleBeforeMs: input.staleBeforeMs,
+      });
+      if (deletion._tag === "Removed") removed += 1;
+      else if (deletion._tag === "DirectoryUnsafe") failures += 1;
     };
     if (input.sweep.skipLocked) {
       const attempt = await tryWithManagedAttachmentStagingPathLock(partPath, processEntry);
@@ -229,7 +563,18 @@ export async function sweepOrphanManagedAttachmentParts(
   let removed = 0;
   let failures = 0;
   if (scanLimit === 0 || maxRemovals === 0) return emptyResult;
-  const directory = await fs.opendir(verifiedStagingDir.realPath);
+  const opened = await openVerifiedStagingDirectory(verifiedStagingDir);
+  if (opened._tag === "Missing") return emptyResult;
+  if (opened._tag === "Unsafe") return { inspected: 0, removed: 0, failures: 1 };
+  const directory = opened.directory;
+  const pinned = await createPinnedStagingDeleteSession({
+    realStagingDir: verifiedStagingDir.realPath,
+    stagingIdentity: verifiedStagingDir.identity,
+  });
+  if (pinned._tag === "DirectoryUnsafe") {
+    await directory.close();
+    return { inspected: 0, removed: 0, failures: 1 };
+  }
   try {
     while (inspected < scanLimit && removed < maxRemovals) {
       const entry = await directory.read();
@@ -238,6 +583,7 @@ export async function sweepOrphanManagedAttachmentParts(
       const result = await processManagedAttachmentStagingEntry({
         sweep: input,
         realStagingDir: verifiedStagingDir.realPath,
+        pinnedDeleteSession: pinned.session,
         entryName: entry.name,
         staleBeforeMs,
       });
@@ -245,7 +591,7 @@ export async function sweepOrphanManagedAttachmentParts(
       failures += result.failures;
     }
   } finally {
-    await directory.close();
+    await Promise.all([directory.close(), pinned.session.close()]);
   }
 
   return { inspected, removed, failures };
@@ -269,6 +615,7 @@ interface ManagedAttachmentStagingRecoveryCursor {
   readonly realStagingDir: string;
   readonly directoryIdentity: BigIntStats;
   readonly directory: Dir;
+  readonly pinnedDeleteSession: PinnedStagingDeleteSession;
   readonly staleBeforeMs: number;
 }
 
@@ -287,7 +634,7 @@ function boundedPositiveInteger(value: number | undefined, fallback: number): nu
 async function closeStagingRecoveryCursor(
   cursor: ManagedAttachmentStagingRecoveryCursor,
 ): Promise<void> {
-  await cursor.directory.close();
+  await Promise.all([cursor.directory.close(), cursor.pinnedDeleteSession.close()]);
 }
 
 async function stagingRecoveryCursorIsCurrent(
@@ -387,15 +734,27 @@ export function makeManagedAttachmentStagingRecovery(): ManagedAttachmentStaging
           }
 
           if (!cursor) {
-            const directoryIdentity = await fs.lstat(verifiedStagingDir.realPath, { bigint: true });
-            if (!directoryIdentity.isDirectory() || directoryIdentity.isSymbolicLink()) {
+            const opened = await openVerifiedStagingDirectory(verifiedStagingDir);
+            if (opened._tag === "Missing") {
+              return { inspected, removed, failures, passes, exhausted: true };
+            }
+            if (opened._tag === "Unsafe") {
+              return { inspected, removed, failures: 1, passes, exhausted: true };
+            }
+            const pinned = await createPinnedStagingDeleteSession({
+              realStagingDir: verifiedStagingDir.realPath,
+              stagingIdentity: verifiedStagingDir.identity,
+            });
+            if (pinned._tag === "DirectoryUnsafe") {
+              await opened.directory.close();
               return { inspected, removed, failures: 1, passes, exhausted: true };
             }
             cursor = {
               attachmentsDir,
               realStagingDir: verifiedStagingDir.realPath,
-              directoryIdentity,
-              directory: await fs.opendir(verifiedStagingDir.realPath),
+              directoryIdentity: verifiedStagingDir.identity,
+              directory: opened.directory,
+              pinnedDeleteSession: pinned.session,
               staleBeforeMs: (input.nowMs ?? Date.now()) - MANAGED_ATTACHMENT_WRITING_LEASE_MS,
             };
           }
@@ -426,6 +785,7 @@ export function makeManagedAttachmentStagingRecovery(): ManagedAttachmentStaging
               const result = await processManagedAttachmentStagingEntry({
                 sweep: { ...input, skipLocked: true },
                 realStagingDir: activeCursor.realStagingDir,
+                pinnedDeleteSession: activeCursor.pinnedDeleteSession,
                 entryName: entry.name,
                 staleBeforeMs: activeCursor.staleBeforeMs,
               });

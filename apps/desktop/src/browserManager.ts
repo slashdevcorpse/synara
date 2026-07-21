@@ -40,7 +40,7 @@ import {
 } from "@synara/shared/browserSession";
 import {
   createBrowserPopupNavigationPolicy,
-  enforceBrowserNavigationPolicy,
+  ensureBrowserNavigationPolicy,
   enforceBrowserPopupNavigationPolicy,
   isAllowedBrowserNavigationUrl,
   type BrowserPopupNavigationPolicy,
@@ -1494,19 +1494,7 @@ export class DesktopBrowserManager {
     // Belt-and-suspenders alongside the session-level UA: also covers an adopted renderer
     // <webview> for any navigation after it attaches.
     this.sessionPolicy.applyUserAgent(webContents);
-
-    const willNavigate = (event: Electron.Event<Electron.WebContentsWillNavigateEventParams>) => {
-      enforceBrowserNavigationPolicy(event);
-    };
-    const willRedirect = (event: Electron.Event<Electron.WebContentsWillRedirectEventParams>) => {
-      enforceBrowserNavigationPolicy(event);
-    };
-    webContents.on("will-navigate", willNavigate);
-    webContents.on("will-redirect", willRedirect);
-    runtime.listenerDisposers.push(() => {
-      webContents.removeListener("will-navigate", willNavigate);
-      webContents.removeListener("will-redirect", willRedirect);
-    });
+    ensureBrowserNavigationPolicy(webContents);
 
     this.configureWindowOpenHandling(webContents, runtime, runtime.listenerDisposers);
 

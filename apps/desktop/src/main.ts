@@ -162,7 +162,7 @@ import {
 import { buildGitHubReleasesPageUrl, resolveGitHubUpdateSource } from "./githubUpdateFeed";
 import { isArm64HostRunningIntelBuild, resolveDesktopRuntimeInfo } from "./runtimeArch";
 import { DesktopBrowserManager } from "./browserManager";
-import { secureBrowserWebviewAttachment } from "./browserSecurity";
+import { ensureBrowserNavigationPolicy, secureBrowserWebviewAttachment } from "./browserSecurity";
 import { BROWSER_SESSION_PARTITION } from "./browserSessionPolicy";
 import { registerBrowserIpcHandlers, sendBrowserCopyLink, sendBrowserState } from "./browserIpc";
 import {
@@ -3853,6 +3853,9 @@ function createWindow(): BrowserWindow {
     if (!decision.allowed) {
       event.preventDefault();
     }
+  });
+  window.webContents.on("did-attach-webview", (_event, guestWebContents) => {
+    ensureBrowserNavigationPolicy(guestWebContents);
   });
   const windowStateController = createDesktopWindowStateController({
     source: window,

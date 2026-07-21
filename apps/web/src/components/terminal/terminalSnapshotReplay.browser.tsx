@@ -758,6 +758,159 @@ describe("recovered terminal snapshot replay in real xterm", () => {
     }
   });
 
+  it.each([
+    ["initial open", "initial"],
+    ["delayed reconciliation", "reconciliation"],
+  ] as const)(
+    "keeps overflow recovery authoritative when a stale %s response resolves later",
+    async (_label, delayedResponse) => {
+      const host = document.createElement("div");
+      host.style.cssText = "position:absolute;left:0;top:0;width:900px;height:320px;display:block;";
+      document.body.append(host);
+      hosts.push(host);
+
+      const terminalId = `stale-${delayedResponse}`;
+      const authoritativeHistory = `AUTHORITATIVE-${delayedResponse}`;
+      const staleHistory = `STALE-${delayedResponse}`;
+      const liveAfterRecovery = `LIVE-AFTER-${delayedResponse}`;
+      const statusChanges: string[] = [];
+      let openCalls = 0;
+      let snapshotCalls = 0;
+      let terminalEventListener: ((event: TerminalEvent) => void) | undefined;
+      let resolveDelayedOpen!: (snapshot: TerminalSessionSnapshot) => void;
+      let delayedOpenResolved = false;
+      const delayedOpen = new Promise<TerminalSessionSnapshot>((resolve) => {
+        resolveDelayedOpen = resolve;
+      });
+      const settleDelayedOpen = (snapshot: TerminalSessionSnapshot) => {
+        if (delayedOpenResolved) return;
+        delayedOpenResolved = true;
+        resolveDelayedOpen(snapshot);
+      };
+      const nativeApi = {
+        terminal: {
+          waitUntilEventStreamReady: waitUntilTerminalEventStreamReady,
+          open: () => {
+            openCalls += 1;
+            if (delayedResponse === "initial" || openCalls > 1) return delayedOpen;
+            return Promise.resolve({ ...legacySnapshot(""), terminalId });
+          },
+          snapshot: async () => {
+            snapshotCalls += 1;
+            return {
+              snapshot: { ...legacySnapshot(authoritativeHistory), terminalId },
+              generation: "generation-1",
+              watermark: 1,
+            };
+          },
+          write: async () => undefined,
+          ackOutput: async () => undefined,
+          resize: async () => undefined,
+          clear: async () => undefined,
+          restart: async () => ({ ...legacySnapshot(""), terminalId }),
+          close: async () => undefined,
+          onEvent: (listener: (event: TerminalEvent) => void) => {
+            terminalEventListener = listener;
+            return () => {
+              if (terminalEventListener === listener) terminalEventListener = undefined;
+            };
+          },
+        },
+      } as unknown as NativeApi;
+      const previousNativeApi = window.nativeApi;
+      window.nativeApi = nativeApi;
+      const entry = createRuntimeEntry({
+        runtimeKey: `thread::${terminalId}`,
+        threadId: "thread",
+        terminalId,
+        terminalLabel: "Terminal",
+        cwd: "C:\\project",
+        callbacks: {
+          onSessionExited: () => undefined,
+          onTerminalMetadataChange: () => undefined,
+          onTerminalActivityChange: () => undefined,
+          onTerminalRuntimeStatusChange: (_terminalId, status) => {
+            statusChanges.push(status);
+          },
+        },
+      });
+
+      try {
+        attachRuntimeToContainer(entry, { autoFocus: false, isVisible: true }, host);
+        await waitForCondition(
+          () => openCalls === (delayedResponse === "initial" ? 1 : 2),
+          `${delayedResponse} open response pending`,
+        );
+
+        emitTerminalResnapshotRequired();
+        await waitForCondition(
+          () =>
+            snapshotCalls === 1 &&
+            !entry.needsAuthoritativeRecovery &&
+            !entry.authoritativeRecoveryInFlight &&
+            entry.runtimeStatus === "ready" &&
+            entry.pendingHistoryReplayPromise === null &&
+            bufferText(entry.terminal).includes(authoritativeHistory),
+          `${delayedResponse} authoritative overflow recovery`,
+        );
+        const authoritativeRequestId = entry.snapshotReconcileRequestId;
+        const authoritativeStatusCount = statusChanges.length;
+
+        settleDelayedOpen({ ...legacySnapshot(staleHistory), terminalId });
+        await new Promise((resolve) => window.setTimeout(resolve, 50));
+        await waitForCondition(
+          () => entry.pendingHistoryReplayPromise === null,
+          `${delayedResponse} stale response settlement`,
+        );
+
+        expect(entry.snapshotReconcileRequestId).toBe(authoritativeRequestId);
+        expect(entry.runtimeStatus).toBe("ready");
+        expect(statusChanges).toHaveLength(authoritativeStatusCount);
+        expect(bufferText(entry.terminal)).toContain(authoritativeHistory);
+        expect(bufferText(entry.terminal)).not.toContain(staleHistory);
+        expect(terminalEventListener).toBeTypeOf("function");
+        if (!terminalEventListener) throw new Error("terminal event listener was not registered");
+
+        terminalEventListener({
+          type: "output",
+          threadId: "thread",
+          terminalId,
+          createdAt: new Date().toISOString(),
+          generation: "generation-1",
+          sequence: 1,
+          data: "MUST-NOT-APPLY-DUPLICATE",
+          byteLength: 24,
+        });
+        terminalEventListener({
+          type: "output",
+          threadId: "thread",
+          terminalId,
+          createdAt: new Date().toISOString(),
+          generation: "generation-1",
+          sequence: 2,
+          data: liveAfterRecovery,
+          byteLength: new TextEncoder().encode(liveAfterRecovery).byteLength,
+        });
+        await waitForCondition(
+          () =>
+            entry.pendingWriteBytes === 0 && bufferText(entry.terminal).includes(liveAfterRecovery),
+          `${delayedResponse} post-recovery sequence`,
+        );
+
+        const finalText = bufferText(entry.terminal);
+        expect(entry.outputEventVersion).toBe(1);
+        expect(finalText).not.toContain("MUST-NOT-APPLY-DUPLICATE");
+        expect(finalText.split(authoritativeHistory)).toHaveLength(2);
+        expect(finalText.split(liveAfterRecovery)).toHaveLength(2);
+      } finally {
+        settleDelayedOpen({ ...legacySnapshot(""), terminalId });
+        disposeRuntimeEntry(entry);
+        restoreWindowNativeApi(previousNativeApi);
+        document.getElementById("synara-terminal-parking")?.remove();
+      }
+    },
+  );
+
   it("waits for stream registration before snapshotting output from the prior gap", async () => {
     const host = document.createElement("div");
     host.style.cssText = "position:absolute;left:0;top:0;width:900px;height:320px;display:block;";

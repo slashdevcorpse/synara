@@ -71,8 +71,12 @@ try {
   if (!candidateStat.isDirectory() || candidateStat.isSymbolicLink() || !sameIdentity(candidateStat, candidateDev, candidateIno)) {
     fail(CANDIDATE_UNSAFE, "candidate identity mismatch");
   }
+  if (candidateKind === "finalize") {
+    fs.rmdirSync(candidateName);
+    process.exit(0);
+  }
   if (candidateKind === "quarantine") {
-    fs.rmSync(candidateName, { recursive: true, force: true, maxRetries: 2, retryDelay: 25 });
+    process.stdout.write(candidateName);
     process.exit(0);
   }
   quarantineName = ".synara-scratch-" + candidateName + ".deleting-" + randomUUID();
@@ -82,7 +86,7 @@ try {
     try { fs.renameSync(quarantineName, candidateName); } catch {}
     fail(CANDIDATE_UNSAFE, "quarantined candidate identity mismatch");
   }
-  fs.rmSync(quarantineName, { recursive: true, force: true, maxRetries: 2, retryDelay: 25 });
+  process.stdout.write(quarantineName);
   process.exit(0);
 } catch (cause) {
   if (quarantineName) {
@@ -92,6 +96,29 @@ try {
       }
     } catch {}
   }
+  fail(FAILED, cause && (cause.code || cause.message) || cause);
+}
+`;
+const PINNED_CONTENT_DELETE_SCRIPT = String.raw`
+const fs = require("node:fs");
+const [candidateDev, candidateIno] = process.argv.slice(1);
+const CANDIDATE_UNSAFE = 74;
+const FAILED = 75;
+const sameIdentity = (stat, dev, ino) => String(stat.dev) === dev && String(stat.ino) === ino;
+const fail = (code, detail) => {
+  if (detail) process.stderr.write(String(detail).slice(0, 2048));
+  process.exit(code);
+};
+try {
+  const candidateStat = fs.lstatSync(".", { bigint: true });
+  if (!candidateStat.isDirectory() || candidateStat.isSymbolicLink() || !sameIdentity(candidateStat, candidateDev, candidateIno)) {
+    fail(CANDIDATE_UNSAFE, "pinned candidate identity mismatch");
+  }
+  for (const entryName of fs.readdirSync(".")) {
+    fs.rmSync(entryName, { recursive: true, force: true, maxRetries: 2, retryDelay: 25 });
+  }
+  process.exit(0);
+} catch (cause) {
   fail(FAILED, cause && (cause.code || cause.message) || cause);
 }
 `;
@@ -298,15 +325,17 @@ async function removePinnedScratchDirectory(input: {
   readonly candidateName: string;
   readonly candidateIdentity: BigIntStats;
   readonly kind: "workspace" | "quarantine";
+  readonly beforeRecursiveDelete?: (candidatePath: string) => Promise<void>;
 }): Promise<PinnedDeleteResult> {
   if (path.basename(input.candidateName) !== input.candidateName) {
     throw new Error("Scratch workspace deletion target is not a basename.");
   }
-  const result = await runProcess(
+  const prepareResult = await runProcess(
     process.execPath,
     [
       "--eval",
       PINNED_DELETE_SCRIPT,
+      "--",
       input.candidateName,
       input.kind,
       input.rootIdentity.dev.toString(10),
@@ -322,12 +351,12 @@ async function removePinnedScratchDirectory(input: {
       outputMode: "truncate",
     },
   );
-  if (result.timedOut) {
+  if (prepareResult.timedOut) {
     throw new Error("Pinned scratch workspace deletion timed out.");
   }
-  switch (result.code) {
+  switch (prepareResult.code) {
     case 0:
-      return "removed";
+      break;
     case PINNED_DELETE_MISSING_EXIT:
       return "missing";
     case PINNED_DELETE_ROOT_UNSAFE_EXIT:
@@ -336,9 +365,92 @@ async function removePinnedScratchDirectory(input: {
       return "candidate-unsafe";
     case PINNED_DELETE_FAILED_EXIT:
     default: {
-      const detail = result.stderr.trim().slice(0, 2_048);
+      const detail = prepareResult.stderr.trim().slice(0, 2_048);
       throw new Error(
-        `Pinned scratch workspace deletion failed (code=${result.code ?? "null"}).${detail ? ` ${detail}` : ""}`,
+        `Pinned scratch workspace deletion failed (code=${prepareResult.code ?? "null"}).${detail ? ` ${detail}` : ""}`,
+      );
+    }
+  }
+
+  const pinnedCandidateName = prepareResult.stdout.trim();
+  if (
+    !pinnedCandidateName ||
+    path.basename(pinnedCandidateName) !== pinnedCandidateName ||
+    pinnedCandidateName === "." ||
+    pinnedCandidateName === ".."
+  ) {
+    throw new Error("Pinned scratch workspace deletion returned an invalid quarantine name.");
+  }
+  const pinnedCandidatePath = path.join(input.realRoot, pinnedCandidateName);
+  await input.beforeRecursiveDelete?.(pinnedCandidatePath);
+
+  const contentResult = await runProcess(
+    process.execPath,
+    [
+      "--eval",
+      PINNED_CONTENT_DELETE_SCRIPT,
+      "--",
+      input.candidateIdentity.dev.toString(10),
+      input.candidateIdentity.ino.toString(10),
+    ],
+    {
+      cwd: pinnedCandidatePath,
+      timeoutMs: PINNED_DELETE_TIMEOUT_MS,
+      allowNonZeroExit: true,
+      maxBufferBytes: 4_096,
+      outputMode: "truncate",
+    },
+  );
+  if (contentResult.timedOut) {
+    throw new Error("Pinned scratch workspace content deletion timed out.");
+  }
+  if (contentResult.code === PINNED_DELETE_CANDIDATE_UNSAFE_EXIT) {
+    return "candidate-unsafe";
+  }
+  if (contentResult.code !== 0) {
+    const detail = contentResult.stderr.trim().slice(0, 2_048);
+    throw new Error(
+      `Pinned scratch workspace content deletion failed (code=${contentResult.code ?? "null"}).${detail ? ` ${detail}` : ""}`,
+    );
+  }
+
+  const finalizeResult = await runProcess(
+    process.execPath,
+    [
+      "--eval",
+      PINNED_DELETE_SCRIPT,
+      "--",
+      pinnedCandidateName,
+      "finalize",
+      input.rootIdentity.dev.toString(10),
+      input.rootIdentity.ino.toString(10),
+      input.candidateIdentity.dev.toString(10),
+      input.candidateIdentity.ino.toString(10),
+    ],
+    {
+      cwd: input.realRoot,
+      timeoutMs: PINNED_DELETE_TIMEOUT_MS,
+      allowNonZeroExit: true,
+      maxBufferBytes: 4_096,
+      outputMode: "truncate",
+    },
+  );
+  if (finalizeResult.timedOut) {
+    throw new Error("Pinned scratch workspace finalization timed out.");
+  }
+  switch (finalizeResult.code) {
+    case 0:
+      return "removed";
+    case PINNED_DELETE_ROOT_UNSAFE_EXIT:
+      return "root-unsafe";
+    case PINNED_DELETE_MISSING_EXIT:
+    case PINNED_DELETE_CANDIDATE_UNSAFE_EXIT:
+      return "candidate-unsafe";
+    case PINNED_DELETE_FAILED_EXIT:
+    default: {
+      const detail = finalizeResult.stderr.trim().slice(0, 2_048);
+      throw new Error(
+        `Pinned scratch workspace finalization failed (code=${finalizeResult.code ?? "null"}).${detail ? ` ${detail}` : ""}`,
       );
     }
   }
@@ -350,6 +462,8 @@ export async function removeIsolatedScratchWorkspace(
     readonly rootDir?: string;
     /** Test seam for a replacement after parent validation but before child pinning. */
     readonly beforePinnedDelete?: (candidatePath: string) => Promise<void>;
+    /** Test seam for a replacement after quarantine but before recursive deletion. */
+    readonly beforeRecursiveDelete?: (candidatePath: string) => Promise<void>;
   } = {},
 ): Promise<void> {
   const workspaceRoot = options.rootDir ?? resolveScratchWorkspacesRoot();
@@ -408,6 +522,9 @@ export async function removeIsolatedScratchWorkspace(
     candidateName: path.basename(workspaceDir),
     candidateIdentity: finalWorkspaceIdentity,
     kind: "workspace",
+    ...(options.beforeRecursiveDelete
+      ? { beforeRecursiveDelete: options.beforeRecursiveDelete }
+      : {}),
   });
   if (deletion === "root-unsafe") {
     throw new Error("Scratch workspace root changed before pinned deletion.");
@@ -433,6 +550,8 @@ export async function sweepStaleScratchWorkspaces(input: {
   readonly beforeFinalDelete?: (candidatePath: string) => Promise<void>;
   /** Test seam for a replacement after parent validation but before child pinning. */
   readonly beforePinnedDelete?: (candidatePath: string) => Promise<void>;
+  /** Test seam for a replacement after quarantine but before recursive deletion. */
+  readonly beforeRecursiveDelete?: (candidatePath: string) => Promise<void>;
 }): Promise<ScratchWorkspaceSweepResult> {
   const rootDir = input.rootDir ?? resolveScratchWorkspacesRoot();
   const nowMs = input.nowMs ?? Date.now();
@@ -525,6 +644,9 @@ export async function sweepStaleScratchWorkspaces(input: {
       candidateName: entry.name,
       candidateIdentity: finalCandidateIdentity,
       kind: candidateKind,
+      ...(input.beforeRecursiveDelete
+        ? { beforeRecursiveDelete: input.beforeRecursiveDelete }
+        : {}),
     });
     if (deletion === "removed") {
       result.removed += 1;

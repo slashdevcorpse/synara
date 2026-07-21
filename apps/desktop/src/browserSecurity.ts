@@ -2,6 +2,8 @@
 // Purpose: Defines testable navigation and webview-attachment policy for the desktop browser.
 // Layer: Desktop main-process security policy
 
+import type { WebContents } from "electron";
+
 import { BROWSER_SESSION_PARTITION } from "./browserSessionPolicy";
 
 const ABOUT_BLANK_URL = "about:blank";
@@ -111,6 +113,32 @@ export function enforceBrowserNavigationPolicy(
   event.preventDefault();
   onBlocked?.(event.url);
   return false;
+}
+
+const guardedBrowserWebContents = new WeakSet<WebContents>();
+
+/**
+ * Install the normal-tab scheme policy once for the full lifetime of a guest.
+ * Keeping the listeners until WebContents destruction closes the interval
+ * between Electron attachment and the renderer's later browser IPC handshake.
+ */
+export function ensureBrowserNavigationPolicy(webContents: WebContents): boolean {
+  if (guardedBrowserWebContents.has(webContents)) return false;
+  guardedBrowserWebContents.add(webContents);
+
+  webContents.on(
+    "will-navigate",
+    (event: Electron.Event<Electron.WebContentsWillNavigateEventParams>) => {
+      enforceBrowserNavigationPolicy(event);
+    },
+  );
+  webContents.on(
+    "will-redirect",
+    (event: Electron.Event<Electron.WebContentsWillRedirectEventParams>) => {
+      enforceBrowserNavigationPolicy(event);
+    },
+  );
+  return true;
 }
 
 export function enforceBrowserPopupNavigationPolicy(

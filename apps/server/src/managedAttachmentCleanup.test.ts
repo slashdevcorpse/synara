@@ -254,6 +254,50 @@ describe("managed attachment cleanup", () => {
     await expect(fs.readFile(outsidePart, "utf8")).resolves.toBe("outside");
   });
 
+  it.skipIf(process.platform === "win32")(
+    "keeps deletion on the opened staging directory when its pathname is swapped",
+    async () => {
+      const root = await fs.mkdtemp(path.join(os.tmpdir(), "synara-managed-staging-swap-"));
+      temporaryRoots.push(root);
+      const outside = await fs.mkdtemp(
+        path.join(os.tmpdir(), "synara-managed-staging-swap-outside-"),
+      );
+      temporaryRoots.push(outside);
+      const stagingDir = path.join(root, ".staging");
+      const originalStagingDir = path.join(root, ".staging.original");
+      const partName = "att_v2_45454545454545454545454545454545.part";
+      const originalPart = path.join(stagingDir, partName);
+      const outsidePart = path.join(outside, partName);
+      await fs.mkdir(stagingDir);
+      await Promise.all([
+        fs.writeFile(originalPart, "original"),
+        fs.writeFile(outsidePart, "outside"),
+      ]);
+      const nowMs = Date.now();
+      const staleDate = new Date(nowMs - MANAGED_ATTACHMENT_WRITING_LEASE_MS - 1_000);
+      await Promise.all([
+        fs.utimes(originalPart, staleDate, staleDate),
+        fs.utimes(outsidePart, staleDate, staleDate),
+      ]);
+
+      const result = await sweepOrphanManagedAttachmentParts({
+        attachmentsDir: root,
+        nowMs,
+        beforePinnedDelete: async () => {
+          await fs.rename(stagingDir, originalStagingDir);
+          await fs.symlink(outside, stagingDir, process.platform === "win32" ? "junction" : "dir");
+        },
+      });
+
+      expect(result).toMatchObject({ removed: 1, failures: 0 });
+      await expect(fs.stat(path.join(originalStagingDir, partName))).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+      await expect(fs.realpath(stagingDir)).resolves.toBe(await fs.realpath(outside));
+      await expect(fs.readFile(outsidePart, "utf8")).resolves.toBe("outside");
+    },
+  );
+
   it("preserves an exact-name part replaced between the two stale-file validations", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "synara-managed-staging-race-"));
     temporaryRoots.push(root);
