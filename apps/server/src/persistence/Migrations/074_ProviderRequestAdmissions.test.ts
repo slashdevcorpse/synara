@@ -197,7 +197,7 @@ layer("074_ProviderRequestAdmissions", (it) => {
         `;
       }
 
-      const executed = yield* runMigrations();
+      const executed = yield* runMigrations({ toMigrationInclusive: 74 });
       assert.deepStrictEqual(executed, [
         [70, "AgentGatewayOperations"],
         [71, "ProjectionThreadsGatewayProvenance"],
@@ -205,7 +205,7 @@ layer("074_ProviderRequestAdmissions", (it) => {
         [73, "ProjectionProjectsArchivedAt"],
         [74, "ProviderRequestAdmissions"],
       ]);
-      assert.deepStrictEqual(yield* runMigrations(), []);
+      assert.deepStrictEqual(yield* runMigrations({ toMigrationInclusive: 74 }), []);
 
       const hydrated = yield* sql<{
         readonly requestId: string;

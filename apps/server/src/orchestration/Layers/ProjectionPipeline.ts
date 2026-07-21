@@ -1,4 +1,12 @@
-import { ApprovalRequestId, CommandId, type OrchestrationEvent } from "@synara/contracts";
+import {
+  ApprovalRequestId,
+  CommandId,
+  type ModelSelection,
+  type OrchestrationEvent,
+  type OrchestrationThreadActivity,
+  type OrchestrationTurnTokenUsage,
+  type ProviderKind,
+} from "@synara/contracts";
 import {
   addPinnedMessage,
   removePinnedMessage,
@@ -36,6 +44,7 @@ import {
 } from "../../persistence/Services/ProjectionThreadProposedPlans.ts";
 import { ProjectionThreadSessionRepository } from "../../persistence/Services/ProjectionThreadSessions.ts";
 import {
+  EMPTY_PROJECTION_TURN_SUMMARY_FIELDS,
   type ProjectionTurn,
   ProjectionTurnRepository,
 } from "../../persistence/Services/ProjectionTurns.ts";
@@ -129,6 +138,219 @@ function payloadNonEmptyString(payload: unknown, key: string): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
 }
 
+function payloadNonNegativeInteger(payload: unknown, key: string): number | null {
+  const value = payloadRecord(payload)?.[key];
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function payloadPositiveInteger(payload: unknown, key: string): number | null {
+  const value = payloadRecord(payload)?.[key];
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+
+function payloadProviderKind(payload: unknown): ProviderKind | null {
+  const provider = payloadNonEmptyString(payload, "provider");
+  switch (provider) {
+    case "codex":
+    case "commandCode":
+    case "claudeAgent":
+    case "cursor":
+    case "antigravity":
+    case "grok":
+    case "droid":
+    case "kilo":
+    case "opencode":
+    case "pi":
+      return provider;
+    default:
+      return null;
+  }
+}
+
+function contextWindowTurnTokenUsage(
+  activity: OrchestrationThreadActivity,
+): OrchestrationTurnTokenUsage | null {
+  if (activity.kind !== "context-window.updated") return null;
+  const provider = payloadProviderKind(activity.payload);
+  if (provider === null) return null;
+  const exact = provider === "codex" || provider === "opencode" || provider === "kilo";
+  const last = provider === "codex";
+  return {
+    provider,
+    inputTokens: exact
+      ? payloadNonNegativeInteger(activity.payload, last ? "lastInputTokens" : "inputTokens")
+      : null,
+    cachedInputTokens: exact
+      ? payloadNonNegativeInteger(
+          activity.payload,
+          last ? "lastCachedInputTokens" : "cachedInputTokens",
+        )
+      : null,
+    outputTokens: exact
+      ? payloadNonNegativeInteger(activity.payload, last ? "lastOutputTokens" : "outputTokens")
+      : null,
+    reasoningOutputTokens: exact
+      ? payloadNonNegativeInteger(
+          activity.payload,
+          last ? "lastReasoningOutputTokens" : "reasoningOutputTokens",
+        )
+      : null,
+    totalTokens: exact
+      ? payloadNonNegativeInteger(
+          activity.payload,
+          last ? "lastUsedTokens" : "totalProcessedTokens",
+        )
+      : null,
+    contextUsedTokens: payloadNonNegativeInteger(activity.payload, "usedTokens"),
+    contextWindowTokens: payloadPositiveInteger(activity.payload, "maxTokens"),
+    updatedAt: activity.createdAt,
+  };
+}
+
+function completedTurnTokenUsage(
+  activity: OrchestrationThreadActivity,
+): OrchestrationTurnTokenUsage | null {
+  if (activity.kind !== "turn.completed") return null;
+  const provider = payloadProviderKind(activity.payload);
+  const modelUsage = payloadRecord(payloadRecord(activity.payload)?.modelUsage);
+  if (provider !== "claudeAgent" || modelUsage === undefined) return null;
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let totalTokens = 0;
+  let hasUsage = false;
+  for (const usage of Object.values(modelUsage)) {
+    const input = payloadNonNegativeInteger(usage, "inputTokens");
+    const output = payloadNonNegativeInteger(usage, "outputTokens");
+    const total = payloadNonNegativeInteger(usage, "totalTokens");
+    if (input === null && output === null && total === null) continue;
+    hasUsage = true;
+    inputTokens += input ?? 0;
+    outputTokens += output ?? 0;
+    totalTokens += total ?? (input ?? 0) + (output ?? 0);
+  }
+  return hasUsage
+    ? {
+        provider,
+        inputTokens,
+        cachedInputTokens: null,
+        outputTokens,
+        reasoningOutputTokens: null,
+        totalTokens,
+        contextUsedTokens: null,
+        contextWindowTokens: null,
+        updatedAt: activity.createdAt,
+      }
+    : null;
+}
+
+function mergeTurnTokenUsage(
+  existing: OrchestrationTurnTokenUsage | null,
+  incoming: OrchestrationTurnTokenUsage | null,
+): OrchestrationTurnTokenUsage | null {
+  if (incoming === null) return existing;
+  if (existing === null || existing.provider !== incoming.provider) return incoming;
+  if (incoming.updatedAt < existing.updatedAt) return existing;
+  return {
+    provider: incoming.provider,
+    inputTokens: incoming.inputTokens ?? existing.inputTokens,
+    cachedInputTokens: incoming.cachedInputTokens ?? existing.cachedInputTokens,
+    outputTokens: incoming.outputTokens ?? existing.outputTokens,
+    reasoningOutputTokens: incoming.reasoningOutputTokens ?? existing.reasoningOutputTokens,
+    totalTokens: incoming.totalTokens ?? existing.totalTokens,
+    contextUsedTokens: incoming.contextUsedTokens ?? existing.contextUsedTokens,
+    contextWindowTokens: incoming.contextWindowTokens ?? existing.contextWindowTokens,
+    updatedAt: incoming.updatedAt,
+  };
+}
+
+function addUnique(values: ReadonlyArray<string>, value: string | null): ReadonlyArray<string> {
+  return value === null || values.includes(value) ? values : [...values, value];
+}
+
+function toolIdentity(activity: OrchestrationThreadActivity): string | null {
+  if (!activity.kind.startsWith("tool.")) return null;
+  const payload = payloadRecord(activity.payload);
+  const data = payloadRecord(payload?.data);
+  const item = payloadRecord(payload?.item);
+  const dataItem = payloadRecord(data?.item);
+  return (
+    payloadNonEmptyString(activity.payload, "providerItemId") ??
+    payloadNonEmptyString(activity.payload, "toolUseId") ??
+    payloadNonEmptyString(activity.payload, "toolCallId") ??
+    payloadNonEmptyString(activity.payload, "callId") ??
+    payloadNonEmptyString(activity.payload, "callID") ??
+    payloadNonEmptyString(data, "toolUseId") ??
+    payloadNonEmptyString(data, "toolCallId") ??
+    payloadNonEmptyString(data, "callId") ??
+    payloadNonEmptyString(data, "callID") ??
+    payloadNonEmptyString(item, "id") ??
+    payloadNonEmptyString(dataItem, "id")
+  );
+}
+
+function upsertToolCall(
+  toolCalls: ProjectionTurn["toolCalls"],
+  activity: OrchestrationThreadActivity,
+): ProjectionTurn["toolCalls"] {
+  if (!activity.kind.startsWith("tool.")) return toolCalls;
+  const id = toolIdentity(activity);
+  const name = toolName(activity);
+  if (id === null) {
+    const normalizedName = name?.trim().toLowerCase() ?? null;
+    const openFallbackIndex = toolCalls.findLastIndex(
+      (toolCall) =>
+        toolCall.id.startsWith("activity:") &&
+        !toolCall.completed &&
+        normalizedName !== null &&
+        toolCall.name?.trim().toLowerCase() === normalizedName,
+    );
+    if (openFallbackIndex >= 0) {
+      if (activity.kind !== "tool.completed") return toolCalls;
+      return toolCalls.map((toolCall, currentIndex) =>
+        currentIndex === openFallbackIndex ? { ...toolCall, completed: true } : toolCall,
+      );
+    }
+    if (activity.kind === "tool.updated") return toolCalls;
+    return [
+      ...toolCalls,
+      {
+        id: `activity:${activity.id}`,
+        name,
+        completed: activity.kind === "tool.completed",
+      },
+    ];
+  }
+  const index = toolCalls.findIndex((toolCall) => toolCall.id === id);
+  if (index < 0) return [...toolCalls, { id, name, completed: activity.kind === "tool.completed" }];
+  return toolCalls.map((toolCall, currentIndex) =>
+    currentIndex === index
+      ? {
+          ...toolCall,
+          name: toolCall.name ?? name,
+          completed: toolCall.completed || activity.kind === "tool.completed",
+        }
+      : toolCall,
+  );
+}
+
+function toolName(activity: OrchestrationThreadActivity): string | null {
+  if (!activity.kind.startsWith("tool.")) return null;
+  const payload = payloadRecord(activity.payload);
+  const data = payloadRecord(payload?.data);
+  const item = payloadRecord(data?.item);
+  const itemInput = payloadRecord(item?.input);
+  return (
+    payloadNonEmptyString(activity.payload, "toolName") ??
+    payloadNonEmptyString(data, "toolName") ??
+    payloadNonEmptyString(data, "tool") ??
+    payloadNonEmptyString(item, "toolName") ??
+    payloadNonEmptyString(item, "name") ??
+    payloadNonEmptyString(itemInput, "toolName") ??
+    payloadNonEmptyString(activity.payload, "title") ??
+    payloadNonEmptyString(activity.payload, "itemType")
+  );
+}
+
 function extractActivityRequestId(payload: unknown): ApprovalRequestId | null {
   const requestId = payloadRecord(payload)?.requestId;
   return typeof requestId === "string" ? ApprovalRequestId.makeUnsafe(requestId) : null;
@@ -175,9 +397,24 @@ const THREAD_TURN_PROJECTION_EVENT_TYPES = new Set<OrchestrationEvent["type"]>([
   "thread.conversation-rolled-back",
 ]);
 
+const TURN_SUMMARY_ACTIVITY_KINDS = new Set([
+  "context-window.updated",
+  "model.rerouted",
+  "turn.started",
+  "turn.completed",
+  "turn.aborted",
+  "tool.started",
+  "tool.updated",
+  "tool.completed",
+  "approval.requested",
+  "approval.resolved",
+]);
+
 function shouldApplyThreadTurnsProjection(event: OrchestrationEvent): boolean {
   return (
     THREAD_TURN_PROJECTION_EVENT_TYPES.has(event.type) ||
+    (event.type === "thread.activity-appended" &&
+      TURN_SUMMARY_ACTIVITY_KINDS.has(event.payload.activity.kind)) ||
     (event.type === "thread.message-sent" &&
       event.payload.role === "assistant" &&
       event.payload.turnId !== null)
@@ -1084,12 +1321,28 @@ const makeOrchestrationProjectionPipeline = Effect.gen(function* () {
     Effect.gen(function* () {
       switch (event.type) {
         case "thread.turn-start-requested": {
+          const thread = yield* projectionThreadRepository.getById({
+            threadId: event.payload.threadId,
+          });
+          const modelSelection: ModelSelection | null =
+            event.payload.modelSelection ??
+            Option.match(thread, {
+              onNone: () => null,
+              onSome: (row) => row.modelSelection,
+            });
           yield* projectionTurnRepository.replacePendingTurnStart({
             threadId: event.payload.threadId,
             messageId: event.payload.messageId,
             sourceProposedPlanThreadId: event.payload.sourceProposedPlan?.threadId ?? null,
             sourceProposedPlanId: event.payload.sourceProposedPlan?.planId ?? null,
             requestedAt: event.payload.createdAt,
+            provider: modelSelection?.provider ?? null,
+            model: modelSelection?.model ?? null,
+            modelSelection,
+            runtimeMode: event.payload.runtimeMode,
+            interactionMode: event.payload.interactionMode,
+            envMode: event.payload.envMode ?? null,
+            assistantDeliveryMode: event.payload.assistantDeliveryMode ?? null,
           });
           return;
         }
@@ -1169,6 +1422,29 @@ const makeOrchestrationProjectionPipeline = Effect.gen(function* () {
                 (Option.isSome(pendingTurnStart)
                   ? pendingTurnStart.value.sourceProposedPlanId
                   : null),
+              provider:
+                existingTurn.value.provider ??
+                (Option.isSome(pendingTurnStart) ? pendingTurnStart.value.provider : null),
+              model:
+                existingTurn.value.model ??
+                (Option.isSome(pendingTurnStart) ? pendingTurnStart.value.model : null),
+              modelSelection:
+                existingTurn.value.modelSelection ??
+                (Option.isSome(pendingTurnStart) ? pendingTurnStart.value.modelSelection : null),
+              runtimeMode:
+                existingTurn.value.runtimeMode ??
+                (Option.isSome(pendingTurnStart) ? pendingTurnStart.value.runtimeMode : null),
+              interactionMode:
+                existingTurn.value.interactionMode ??
+                (Option.isSome(pendingTurnStart) ? pendingTurnStart.value.interactionMode : null),
+              envMode:
+                existingTurn.value.envMode ??
+                (Option.isSome(pendingTurnStart) ? pendingTurnStart.value.envMode : null),
+              assistantDeliveryMode:
+                existingTurn.value.assistantDeliveryMode ??
+                (Option.isSome(pendingTurnStart)
+                  ? pendingTurnStart.value.assistantDeliveryMode
+                  : null),
               startedAt:
                 existingTurn.value.startedAt ?? event.payload.session.updatedAt ?? event.occurredAt,
               requestedAt:
@@ -1202,6 +1478,26 @@ const makeOrchestrationProjectionPipeline = Effect.gen(function* () {
               checkpointRef: null,
               checkpointStatus: null,
               checkpointFiles: [],
+              provider: Option.isSome(pendingTurnStart) ? pendingTurnStart.value.provider : null,
+              model: Option.isSome(pendingTurnStart) ? pendingTurnStart.value.model : null,
+              reasoningEffort: null,
+              modelSelection: Option.isSome(pendingTurnStart)
+                ? pendingTurnStart.value.modelSelection
+                : null,
+              runtimeMode: Option.isSome(pendingTurnStart)
+                ? pendingTurnStart.value.runtimeMode
+                : null,
+              interactionMode: Option.isSome(pendingTurnStart)
+                ? pendingTurnStart.value.interactionMode
+                : null,
+              envMode: Option.isSome(pendingTurnStart) ? pendingTurnStart.value.envMode : null,
+              assistantDeliveryMode: Option.isSome(pendingTurnStart)
+                ? pendingTurnStart.value.assistantDeliveryMode
+                : null,
+              tokenUsage: null,
+              toolCalls: [],
+              approvalRequestIds: [],
+              rejectedApprovalRequestIds: [],
             });
           }
 
@@ -1255,6 +1551,7 @@ const makeOrchestrationProjectionPipeline = Effect.gen(function* () {
             checkpointRef: null,
             checkpointStatus: null,
             checkpointFiles: [],
+            ...EMPTY_PROJECTION_TURN_SUMMARY_FIELDS,
           });
           return;
         }
@@ -1336,6 +1633,88 @@ const makeOrchestrationProjectionPipeline = Effect.gen(function* () {
             checkpointRef: event.payload.checkpointRef,
             checkpointStatus: event.payload.status,
             checkpointFiles: event.payload.files,
+            ...EMPTY_PROJECTION_TURN_SUMMARY_FIELDS,
+          });
+          return;
+        }
+
+        case "thread.activity-appended": {
+          const activity = event.payload.activity;
+          if (activity.turnId === null || !TURN_SUMMARY_ACTIVITY_KINDS.has(activity.kind)) return;
+          const existing = yield* projectionTurnRepository.getByTurnId({
+            threadId: event.payload.threadId,
+            turnId: activity.turnId,
+          });
+          const previous = Option.getOrUndefined(existing);
+          const completedState = payloadNonEmptyString(activity.payload, "state");
+          const nextState =
+            activity.kind === "turn.aborted"
+              ? ("interrupted" as const)
+              : activity.kind === "turn.completed"
+                ? completedState === "failed"
+                  ? ("error" as const)
+                  : completedState === "interrupted" || completedState === "cancelled"
+                    ? ("interrupted" as const)
+                    : ("completed" as const)
+                : (previous?.state ?? ("running" as const));
+          const approvalRequestId =
+            activity.kind === "approval.requested" || activity.kind === "approval.resolved"
+              ? (extractActivityRequestId(activity.payload) ?? event.metadata.requestId ?? null)
+              : null;
+          const decision = payloadNonEmptyString(activity.payload, "decision");
+          const rejectedApprovalRequestId =
+            activity.kind === "approval.resolved" &&
+            (decision === "decline" || decision === "cancel")
+              ? approvalRequestId
+              : null;
+          const tokenUsage = mergeTurnTokenUsage(
+            previous?.tokenUsage ?? null,
+            contextWindowTurnTokenUsage(activity) ?? completedTurnTokenUsage(activity),
+          );
+          yield* projectionTurnRepository.upsertByTurnId({
+            turnId: activity.turnId,
+            threadId: event.payload.threadId,
+            pendingMessageId: previous?.pendingMessageId ?? null,
+            sourceProposedPlanThreadId: previous?.sourceProposedPlanThreadId ?? null,
+            sourceProposedPlanId: previous?.sourceProposedPlanId ?? null,
+            assistantMessageId: previous?.assistantMessageId ?? null,
+            state: nextState,
+            requestedAt: previous?.requestedAt ?? activity.createdAt,
+            startedAt:
+              previous?.startedAt ?? (activity.kind === "turn.started" ? activity.createdAt : null),
+            completedAt:
+              activity.kind === "turn.completed" || activity.kind === "turn.aborted"
+                ? activity.createdAt
+                : (previous?.completedAt ?? null),
+            checkpointTurnCount: previous?.checkpointTurnCount ?? null,
+            checkpointRef: previous?.checkpointRef ?? null,
+            checkpointStatus: previous?.checkpointStatus ?? null,
+            checkpointFiles: previous?.checkpointFiles ?? [],
+            provider: payloadProviderKind(activity.payload) ?? previous?.provider ?? null,
+            model:
+              activity.kind === "model.rerouted"
+                ? (payloadNonEmptyString(activity.payload, "toModel") ?? previous?.model ?? null)
+                : activity.kind === "turn.started"
+                  ? (payloadNonEmptyString(activity.payload, "model") ?? previous?.model ?? null)
+                  : (previous?.model ?? null),
+            reasoningEffort:
+              activity.kind === "turn.started"
+                ? (payloadNonEmptyString(activity.payload, "effort") ??
+                  previous?.reasoningEffort ??
+                  null)
+                : (previous?.reasoningEffort ?? null),
+            modelSelection: previous?.modelSelection ?? null,
+            runtimeMode: previous?.runtimeMode ?? null,
+            interactionMode: previous?.interactionMode ?? null,
+            envMode: previous?.envMode ?? null,
+            assistantDeliveryMode: previous?.assistantDeliveryMode ?? null,
+            tokenUsage,
+            toolCalls: upsertToolCall(previous?.toolCalls ?? [], activity),
+            approvalRequestIds: addUnique(previous?.approvalRequestIds ?? [], approvalRequestId),
+            rejectedApprovalRequestIds: addUnique(
+              previous?.rejectedApprovalRequestIds ?? [],
+              rejectedApprovalRequestId,
+            ),
           });
           return;
         }
@@ -1374,6 +1753,13 @@ const makeOrchestrationProjectionPipeline = Effect.gen(function* () {
                     sourceProposedPlanThreadId: turn.sourceProposedPlanThreadId,
                     sourceProposedPlanId: turn.sourceProposedPlanId,
                     requestedAt: turn.requestedAt,
+                    provider: turn.provider,
+                    model: turn.model,
+                    modelSelection: turn.modelSelection,
+                    runtimeMode: turn.runtimeMode,
+                    interactionMode: turn.interactionMode,
+                    envMode: turn.envMode,
+                    assistantDeliveryMode: turn.assistantDeliveryMode,
                   })
               : projectionTurnRepository.upsertByTurnId({
                   ...turn,

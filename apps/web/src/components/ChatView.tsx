@@ -202,6 +202,7 @@ import {
   extendReplacementRangeForTrailingSpace,
 } from "../composerTriggerInsertion";
 import { createProjectSelector, createThreadSelector } from "../storeSelectors";
+import { buildFeedbackThreadContext } from "../feedback";
 import { retainThreadDetailSubscription } from "../threadDetailSubscriptionRetention";
 import {
   canOfferForkSlashCommand,
@@ -435,6 +436,7 @@ import {
 import { ChatTranscriptPane } from "./chat/ChatTranscriptPane";
 import type { MessagesTimelineController } from "./chat/MessagesTimeline";
 import { buildTurnDiffSummaryByAssistantMessageId } from "./chat/MessagesTimeline.logic";
+import { buildTurnReasoningSummaryByAssistantMessageId } from "./chat/turnReasoning";
 import { deriveAgentActivityTimelineState } from "./chat/agentActivity.logic";
 import { AgentActivityPulse } from "./chat/AgentActivityPulse";
 import { useAgentActivityState } from "./chat/useAgentActivityState";
@@ -3144,6 +3146,21 @@ export default function ChatView({
       messages: messagesForDiffAnchoring,
     });
   }, [inferredCheckpointTurnCountByTurnId, turnDiffSummaries, timelineMessages]);
+  const turnReasoningSummaryByAssistantMessageId = useMemo(
+    () =>
+      buildTurnReasoningSummaryByAssistantMessageId({
+        messages: timelineMessages,
+        timelineEntries,
+        activities: threadActivities,
+        turnDiffSummaries,
+        turns: activeThread?.turns ?? [],
+      }),
+    [activeThread?.turns, threadActivities, timelineEntries, timelineMessages, turnDiffSummaries],
+  );
+  const turnReasoningFeedbackContext = useMemo(
+    () => buildFeedbackThreadContext({ activeProject, activeThread }),
+    [activeProject, activeThread],
+  );
   const revertTurnCountByUserMessageId = useMemo(() => {
     const byUserMessageId = new Map<MessageId, number>();
     for (let index = 0; index < timelineEntries.length; index += 1) {
@@ -4562,7 +4579,7 @@ export default function ChatView({
   const animateNextAutoFollowScrollRef = useRef(false);
   const scrollToEnd = useCallback((animated = false) => {
     programmaticScrollUntilRef.current = performance.now() + 200;
-    legendListRef.current?.scrollToEnd?.({ animated });
+    return legendListRef.current?.scrollToEnd?.({ animated });
   }, []);
   const armTranscriptAutoFollow = useCallback((targetThreadId: ThreadId, animated = false) => {
     autoFollowThreadIdRef.current = targetThreadId;
@@ -4678,15 +4695,37 @@ export default function ChatView({
     if (!isAtEndRef.current && !shouldFollowPendingTurn) {
       return;
     }
+    let cancelled = false;
+    let postAnimationSnapTimeoutId: number | null = null;
     // Re-apply the bottom stick only for real transcript messages; tool/work
     // rows can arrive quickly and should not churn scroll/layout work.
     const frameId = window.requestAnimationFrame(() => {
       const shouldAnimate = animateNextAutoFollowScrollRef.current;
       animateNextAutoFollowScrollRef.current = false;
-      scrollToEnd(shouldAnimate);
+      const scrollCompletion = scrollToEnd(shouldAnimate);
+      if (shouldAnimate) {
+        void (scrollCompletion ?? Promise.resolve()).then(() => {
+          if (cancelled) return;
+          // LegendList may defer the animated scroll while it measures the
+          // optimistic row. Wait for that scroll to finish before the final
+          // post-motion snap so the snap cannot cancel the queued animation.
+          postAnimationSnapTimeoutId = window.setTimeout(() => {
+            if (
+              activeThread?.id !== undefined &&
+              autoFollowThreadIdRef.current === activeThread.id
+            ) {
+              scrollToEnd(false);
+            }
+          }, 260);
+        });
+      }
     });
     return () => {
+      cancelled = true;
       window.cancelAnimationFrame(frameId);
+      if (postAnimationSnapTimeoutId !== null) {
+        window.clearTimeout(postAnimationSnapTimeoutId);
+      }
     };
   }, [activeThread?.id, scrollToEnd, transcriptAutoFollowSignal]);
   const {
@@ -10806,6 +10845,10 @@ export default function ChatView({
                     crossTaskOrigin={crossTaskOrigin}
                     timelineEntries={timelineEntries}
                     turnDiffSummaryByAssistantMessageId={turnDiffSummaryByAssistantMessageId}
+                    turnReasoningSummaryByAssistantMessageId={
+                      turnReasoningSummaryByAssistantMessageId
+                    }
+                    feedbackContext={turnReasoningFeedbackContext}
                     onOpenTurnDiff={onOpenTurnDiff}
                     onOpenThread={onNavigateToThread}
                     onOpenAutomation={onOpenAutomation}

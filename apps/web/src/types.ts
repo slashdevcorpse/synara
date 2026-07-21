@@ -15,6 +15,7 @@ import type {
   ThreadMarker,
   OrchestrationSessionStatus,
   OrchestrationThreadActivity,
+  OrchestrationTurnSummary,
   ThreadHandoff,
   ProjectScript as ContractProjectScript,
   ThreadId,
@@ -278,6 +279,7 @@ export interface Thread extends ThreadWorkspaceState {
   threadMarkers?: ThreadMarker[];
   notes?: string;
   latestTurn: OrchestrationLatestTurn | null;
+  turns?: OrchestrationTurnSummary[];
   pendingSourceProposedPlan?: OrchestrationLatestTurn["sourceProposedPlan"];
   lastVisitedAt?: string | undefined;
   parentThreadId?: ThreadId | null;

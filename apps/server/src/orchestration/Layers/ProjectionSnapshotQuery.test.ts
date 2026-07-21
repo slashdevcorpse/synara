@@ -229,7 +229,19 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
           checkpoint_turn_count,
           checkpoint_ref,
           checkpoint_status,
-          checkpoint_files_json
+          checkpoint_files_json,
+          provider,
+          model,
+          reasoning_effort,
+          model_selection_json,
+          runtime_mode,
+          interaction_mode,
+          env_mode,
+          assistant_delivery_mode,
+          token_usage_json,
+          tool_calls_json,
+          approval_request_ids_json,
+          rejected_approval_request_ids_json
         )
         VALUES
           (
@@ -246,7 +258,19 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
             1,
             'checkpoint-1',
             'ready',
-            '[{"path":"README.md","kind":"modified","additions":2,"deletions":1}]'
+            '[{"path":"README.md","kind":"modified","additions":2,"deletions":1}]',
+            'codex',
+            'gpt-5-codex',
+            'high',
+            '{"provider":"codex","model":"gpt-5-codex","options":{"reasoningEffort":"high"}}',
+            'full-access',
+            'default',
+            'worktree',
+            'streaming',
+            '{"provider":"codex","inputTokens":120,"cachedInputTokens":20,"outputTokens":30,"reasoningOutputTokens":10,"totalTokens":160,"contextUsedTokens":160,"contextWindowTokens":200000,"updatedAt":"2026-02-24T00:00:08.000Z"}',
+            '[{"id":"read-1","name":"Read"},{"id":"read-2","name":"read"},{"id":"bash-1","name":"Bash"},{"id":"blank-1","name":"   "},{"id":"unnamed-1","name":null}]',
+            '["approval-1","approval-2"]',
+            '["approval-2"]'
           ),
           (
             'thread-1',
@@ -262,6 +286,18 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
             2,
             'provider-diff:placeholder',
             'missing',
+            '[]',
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            '[]',
+            '[]',
             '[]'
           )
       `;
@@ -360,6 +396,7 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
               planId: "plan-1",
             },
           },
+          turns: [],
           createdAt: "2026-02-24T00:00:02.000Z",
           updatedAt: "2026-02-24T00:00:03.000Z",
           archivedAt: null,
@@ -460,7 +497,225 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
           },
         },
       ]);
+
+      const detail = yield* snapshotQuery.getThreadDetailById(asThreadId("thread-1"));
+      assert.equal(detail._tag, "Some");
+      if (detail._tag === "Some") {
+        const turns = detail.value.turns ?? [];
+        assert.deepEqual(
+          turns.map((turn) => turn.turnId),
+          [asTurnId("turn-placeholder"), asTurnId("turn-1")],
+        );
+        assert.deepEqual(turns.at(-1)?.tokenUsage, {
+          provider: "codex",
+          inputTokens: 120,
+          cachedInputTokens: 20,
+          outputTokens: 30,
+          reasoningOutputTokens: 10,
+          totalTokens: 160,
+          contextUsedTokens: 160,
+          contextWindowTokens: 200_000,
+          updatedAt: "2026-02-24T00:00:08.000Z",
+        });
+      }
     }),
+  );
+
+  it.effect(
+    "keeps full snapshots turn-light and hydrates complete turns by indexed thread detail",
+    () =>
+      Effect.gen(function* () {
+        const snapshotQuery = yield* ProjectionSnapshotQuery;
+        const sql = yield* SqlClient.SqlClient;
+
+        yield* sql`DELETE FROM projection_projects`;
+        yield* sql`DELETE FROM projection_threads`;
+        yield* sql`DELETE FROM projection_thread_messages`;
+        yield* sql`DELETE FROM projection_thread_proposed_plans`;
+        yield* sql`DELETE FROM projection_thread_activities`;
+        yield* sql`DELETE FROM projection_thread_sessions`;
+        yield* sql`DELETE FROM projection_turns`;
+        yield* sql`DELETE FROM projection_state`;
+
+        yield* sql`
+        INSERT INTO projection_projects (
+          project_id,
+          title,
+          workspace_root,
+          default_model_selection_json,
+          scripts_json,
+          created_at,
+          updated_at,
+          deleted_at
+        )
+        VALUES (
+          'project-scoped-turns',
+          'Scoped turns',
+          '/tmp/scoped-turns',
+          '{"provider":"codex","model":"gpt-5-codex"}',
+          '[]',
+          '2026-07-21T00:00:00.000Z',
+          '2026-07-21T00:00:00.000Z',
+          NULL
+        )
+      `;
+
+        yield* sql`
+        INSERT INTO projection_threads (
+          thread_id,
+          project_id,
+          title,
+          model_selection_json,
+          runtime_mode,
+          interaction_mode,
+          env_mode,
+          branch,
+          worktree_path,
+          latest_turn_id,
+          handoff_json,
+          created_at,
+          updated_at,
+          archived_at,
+          deleted_at
+        )
+        VALUES
+          (
+            'thread-scoped-target',
+            'project-scoped-turns',
+            'Target',
+            '{"provider":"codex","model":"gpt-5-codex"}',
+            'full-access',
+            'default',
+            'local',
+            NULL,
+            NULL,
+            'turn-target-2',
+            NULL,
+            '2026-07-21T00:00:01.000Z',
+            '2026-07-21T00:00:01.000Z',
+            NULL,
+            NULL
+          ),
+          (
+            'thread-scoped-unrelated',
+            'project-scoped-turns',
+            'Unrelated',
+            '{"provider":"codex","model":"gpt-5-codex"}',
+            'full-access',
+            'default',
+            'local',
+            NULL,
+            NULL,
+            'turn-unrelated',
+            NULL,
+            '2026-07-21T00:00:02.000Z',
+            '2026-07-21T00:00:02.000Z',
+            NULL,
+            NULL
+          )
+      `;
+
+        yield* sql`
+        INSERT INTO projection_turns (
+          thread_id,
+          turn_id,
+          state,
+          requested_at,
+          started_at,
+          completed_at,
+          checkpoint_files_json,
+          tool_calls_json
+        )
+        VALUES
+          (
+            'thread-scoped-target',
+            'turn-target-2',
+            'completed',
+            '2026-07-21T00:00:04.000Z',
+            '2026-07-21T00:00:04.000Z',
+            '2026-07-21T00:00:05.000Z',
+            '[]',
+            '[{"id":"write-1","name":"write_file"}]'
+          ),
+          (
+            'thread-scoped-target',
+            'turn-target-1',
+            'completed',
+            '2026-07-21T00:00:03.000Z',
+            '2026-07-21T00:00:03.000Z',
+            '2026-07-21T00:00:03.500Z',
+            '[]',
+            '[{"id":"read-1","name":"read_file"}]'
+          ),
+          (
+            'thread-scoped-unrelated',
+            'turn-unrelated',
+            'completed',
+            '2026-07-21T00:00:06.000Z',
+            '2026-07-21T00:00:06.000Z',
+            '2026-07-21T00:00:07.000Z',
+            '[]',
+            'not-json'
+          )
+      `;
+
+        const snapshot = yield* snapshotQuery.getSnapshot();
+        assert.deepEqual(
+          snapshot.threads.map((thread) => [thread.id, thread.turns]),
+          [
+            [asThreadId("thread-scoped-target"), []],
+            [asThreadId("thread-scoped-unrelated"), []],
+          ],
+        );
+
+        const detail = yield* snapshotQuery.getThreadDetailById(asThreadId("thread-scoped-target"));
+        assert.equal(detail._tag, "Some");
+        if (detail._tag === "Some") {
+          assert.deepEqual(
+            (detail.value.turns ?? []).map((turn) => [turn.turnId, turn.toolNames]),
+            [
+              [asTurnId("turn-target-1"), ["read_file"]],
+              [asTurnId("turn-target-2"), ["write_file"]],
+            ],
+          );
+        }
+
+        const queryPlan = yield* sql<{ readonly detail: string }>`
+        EXPLAIN QUERY PLAN
+        SELECT turn_id
+        FROM projection_turns
+        WHERE thread_id = 'thread-scoped-target'
+          AND turn_id IS NOT NULL
+        ORDER BY requested_at ASC, turn_id ASC
+      `;
+        assert.ok(
+          queryPlan.some((row) => row.detail.includes("idx_projection_turns_thread_requested")),
+        );
+
+        const latestTurnQueryPlan = yield* sql<{ readonly detail: string }>`
+          EXPLAIN QUERY PLAN
+          SELECT turns.thread_id, turns.turn_id
+          FROM projection_threads AS threads
+          INNER JOIN projection_turns AS turns
+            ON turns.row_id = (
+              SELECT candidate.row_id
+              FROM projection_turns AS candidate
+              WHERE candidate.thread_id = threads.thread_id
+                AND candidate.turn_id IS NOT NULL
+              ORDER BY candidate.requested_at DESC, candidate.turn_id DESC
+              LIMIT 1
+            )
+          ORDER BY turns.thread_id ASC
+        `;
+        assert.ok(
+          latestTurnQueryPlan.some((row) =>
+            row.detail.includes("idx_projection_turns_thread_requested"),
+          ),
+        );
+        assert.ok(
+          latestTurnQueryPlan.every((row) => !row.detail.startsWith("SCAN projection_turns")),
+        );
+      }),
   );
 
   it.effect("limits hydrated thread activities to the latest activity window", () =>

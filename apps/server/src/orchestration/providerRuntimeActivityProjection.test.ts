@@ -325,6 +325,7 @@ describe("provider runtime activity projection", () => {
     expect(turn).toMatchObject({
       kind: "turn.completed",
       payload: {
+        provider: "claudeAgent",
         state: "completed",
         modelUsage: {
           "claude-fable-5": { inputTokens: 960, outputTokens: 40, totalTokens: 1_000 },
@@ -334,5 +335,37 @@ describe("provider runtime activity projection", () => {
     expect(
       Object.keys((turn?.payload as { modelUsage?: Record<string, unknown> }).modelUsage ?? {}),
     ).toEqual(["claude-fable-5"]);
+  });
+
+  it("projects provider-attributed turn lifecycle metadata", () => {
+    const [started] = projectProviderRuntimeActivities(
+      runtimeEvent({
+        type: "turn.started",
+        eventId: "turn-started",
+        provider: "codex",
+        turnId: TURN_ID,
+        payload: { model: "gpt-5.5", effort: "high" },
+      }),
+    );
+    expect(started).toMatchObject({
+      kind: "turn.started",
+      turnId: TURN_ID,
+      payload: { provider: "codex", model: "gpt-5.5", effort: "high" },
+    });
+
+    const [aborted] = projectProviderRuntimeActivities(
+      runtimeEvent({
+        type: "turn.aborted",
+        eventId: "turn-aborted",
+        provider: "cursor",
+        turnId: TURN_ID,
+        payload: { reason: "user requested" },
+      }),
+    );
+    expect(aborted).toMatchObject({
+      kind: "turn.aborted",
+      turnId: TURN_ID,
+      payload: { provider: "cursor", reason: "user requested" },
+    });
   });
 });

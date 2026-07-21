@@ -60,6 +60,7 @@ export function createAllThreadsSelector(): (state: AppState) => readonly Thread
   let previousThreadShellById = {} as AppState["threadShellById"];
   let previousThreadSessionById = {} as AppState["threadSessionById"];
   let previousThreadTurnStateById = {} as AppState["threadTurnStateById"];
+  let previousTurnSummariesByThreadId = {} as AppState["turnSummariesByThreadId"];
   let previousMessageIdsByThreadId = {} as AppState["messageIdsByThreadId"];
   let previousMessageByThreadId = {} as AppState["messageByThreadId"];
   let previousActivityIdsByThreadId = {} as AppState["activityIdsByThreadId"];
@@ -76,6 +77,7 @@ export function createAllThreadsSelector(): (state: AppState) => readonly Thread
       previousThreadShellById === state.threadShellById &&
       previousThreadSessionById === state.threadSessionById &&
       previousThreadTurnStateById === state.threadTurnStateById &&
+      previousTurnSummariesByThreadId === state.turnSummariesByThreadId &&
       previousMessageIdsByThreadId === state.messageIdsByThreadId &&
       previousMessageByThreadId === state.messageByThreadId &&
       previousActivityIdsByThreadId === state.activityIdsByThreadId &&
@@ -92,6 +94,7 @@ export function createAllThreadsSelector(): (state: AppState) => readonly Thread
     previousThreadShellById = state.threadShellById;
     previousThreadSessionById = state.threadSessionById;
     previousThreadTurnStateById = state.threadTurnStateById;
+    previousTurnSummariesByThreadId = state.turnSummariesByThreadId;
     previousMessageIdsByThreadId = state.messageIdsByThreadId;
     previousMessageByThreadId = state.messageByThreadId;
     previousActivityIdsByThreadId = state.activityIdsByThreadId;

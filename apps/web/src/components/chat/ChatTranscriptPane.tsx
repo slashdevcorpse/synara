@@ -89,6 +89,10 @@ interface ChatTranscriptPaneProps {
   timelineEntries: ComponentProps<typeof MessagesTimeline>["timelineEntries"];
   timestampFormat: TimestampFormat;
   turnDiffSummaryByAssistantMessageId: Map<MessageId, TurnDiffSummary>;
+  turnReasoningSummaryByAssistantMessageId?: ComponentProps<
+    typeof MessagesTimeline
+  >["turnReasoningSummaryByAssistantMessageId"];
+  feedbackContext?: ComponentProps<typeof MessagesTimeline>["feedbackContext"];
   workspaceRoot: string | undefined;
   worktreeSetup: WorktreeSetupSnapshot | null;
 }
@@ -148,6 +152,8 @@ export function ChatTranscriptPane({
   timelineEntries,
   timestampFormat,
   turnDiffSummaryByAssistantMessageId,
+  turnReasoningSummaryByAssistantMessageId,
+  feedbackContext,
   workspaceRoot,
   worktreeSetup,
 }: ChatTranscriptPaneProps) {
@@ -217,6 +223,10 @@ export function ChatTranscriptPane({
             {...(crossTaskOrigin ? { crossTaskOrigin } : {})}
             timelineEntries={timelineEntries}
             turnDiffSummaryByAssistantMessageId={turnDiffSummaryByAssistantMessageId}
+            {...(turnReasoningSummaryByAssistantMessageId
+              ? { turnReasoningSummaryByAssistantMessageId }
+              : {})}
+            {...(feedbackContext ? { feedbackContext } : {})}
             onOpenTurnDiff={onOpenTurnDiff}
             onOpenThread={onOpenThread}
             {...(onOpenAutomation ? { onOpenAutomation } : {})}

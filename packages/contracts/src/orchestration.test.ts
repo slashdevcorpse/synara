@@ -19,6 +19,7 @@ import {
   OrchestrationSession,
   OrchestrationSubscribeShellInput,
   OrchestrationThreadPullRequest,
+  OrchestrationTurnSummary,
   PROVIDER_SEND_TURN_MAX_ATTACHMENTS,
   PROVIDER_SEND_TURN_MAX_INPUT_CHARS,
   ProviderStartOptions,
@@ -54,6 +55,7 @@ const decodeOrchestrationCommand = Schema.decodeUnknownEffect(OrchestrationComma
 const decodeOrchestrationEvent = Schema.decodeUnknownEffect(OrchestrationEvent);
 const decodeThreadPullRequest = Schema.decodeUnknownEffect(OrchestrationThreadPullRequest);
 const decodeSubscribeShellInput = Schema.decodeUnknownEffect(OrchestrationSubscribeShellInput);
+const decodeTurnSummary = Schema.decodeUnknownEffect(OrchestrationTurnSummary);
 
 it.effect("accepts an optional shell resume cursor, including fallback cursors", () =>
   Effect.gen(function* () {
@@ -178,6 +180,52 @@ it.effect("preserves thread activity payloads through the RPC JSON codec", () =>
         },
       },
     });
+    assert.deepStrictEqual(decoded.threads[0]?.turns, []);
+  }),
+);
+
+it.effect("decodes provider-attributed durable turn summaries", () =>
+  Effect.gen(function* () {
+    const summary = yield* decodeTurnSummary({
+      turnId: "turn-1",
+      state: "completed",
+      requestedAt: "2026-07-20T10:00:00.000Z",
+      startedAt: "2026-07-20T10:00:01.000Z",
+      completedAt: "2026-07-20T10:00:03.000Z",
+      assistantMessageId: "message-1",
+      provider: "codex",
+      model: "gpt-5.5",
+      reasoningEffort: "high",
+      modelSelection: {
+        provider: "codex",
+        model: "gpt-5.5",
+        options: { reasoningEffort: "high" },
+      },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      envMode: "worktree",
+      assistantDeliveryMode: "streaming",
+      tokenUsage: {
+        provider: "codex",
+        inputTokens: 100,
+        cachedInputTokens: 20,
+        outputTokens: 30,
+        reasoningOutputTokens: 10,
+        totalTokens: 140,
+        contextUsedTokens: 140,
+        contextWindowTokens: 200_000,
+        updatedAt: "2026-07-20T10:00:03.000Z",
+      },
+      toolCallCount: 2,
+      toolNames: ["Read", "Read"],
+      toolNameCounts: [{ name: "Read", count: 2 }],
+      approvalCount: 1,
+      rejectionCount: 1,
+    });
+
+    assert.equal(summary.provider, "codex");
+    assert.deepStrictEqual(summary.toolNameCounts, [{ name: "Read", count: 2 }]);
+    assert.equal(summary.tokenUsage?.totalTokens, 140);
   }),
 );
 
@@ -887,6 +935,7 @@ it.effect(
       assert.strictEqual(parsed.modelSelection, undefined);
       assert.strictEqual(parsed.runtimeMode, DEFAULT_RUNTIME_MODE);
       assert.strictEqual(parsed.interactionMode, DEFAULT_PROVIDER_INTERACTION_MODE);
+      assert.strictEqual(parsed.envMode, null);
       assert.strictEqual(parsed.dispatchMode, "queue");
       assert.strictEqual(parsed.sourceProposedPlan, undefined);
     }),
