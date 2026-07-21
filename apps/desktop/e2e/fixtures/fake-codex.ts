@@ -20,14 +20,15 @@ interface PendingApproval {
 const args = process.argv.slice(2);
 const protocolLogPath = process.env.SYNARA_FAKE_CODEX_PROTOCOL_LOG_PATH;
 const invocationLogPath = process.env.SYNARA_FAKE_CODEX_INVOCATION_LOG_PATH;
-const networkGuardPath = process.env.SYNARA_FAKE_CODEX_NETWORK_GUARD_PATH;
+const configuredNetworkGuardPath = process.env.SYNARA_FAKE_CODEX_NETWORK_GUARD_PATH;
 const controlledWorkspacePath = process.env.SYNARA_FAKE_CODEX_WORKSPACE_PATH;
 if (!invocationLogPath) {
   throw new Error("Fake Codex requires SYNARA_FAKE_CODEX_INVOCATION_LOG_PATH.");
 }
-if (!networkGuardPath) {
+if (!configuredNetworkGuardPath) {
   throw new Error("Fake Codex requires SYNARA_FAKE_CODEX_NETWORK_GUARD_PATH.");
 }
+const networkGuardPath = configuredNetworkGuardPath;
 FS.mkdirSync(Path.dirname(invocationLogPath), { recursive: true });
 FS.appendFileSync(
   invocationLogPath,
