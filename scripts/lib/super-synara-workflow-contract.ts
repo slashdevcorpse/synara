@@ -495,20 +495,23 @@ function verifyDraftAdmissionJob(jobs: UnknownRecord): void {
     );
   }
 
-  const preflightValidators: Array<{ readonly jobName: string; readonly step: UnknownRecord }> = [];
+  const validatorInvocations: Array<{
+    readonly command: string;
+    readonly jobName: string;
+    readonly step: UnknownRecord;
+  }> = [];
   for (const [jobName, candidateJob] of Object.entries(jobs)) {
     if (!isRecord(candidateJob) || !Array.isArray(candidateJob.steps)) continue;
     for (const candidateStep of candidateJob.steps) {
       if (!isRecord(candidateStep) || typeof candidateStep.run !== "string") continue;
-      const lines = executableShellLines(candidateStep.run);
-      if (
-        lines.some((line) => line.startsWith("node scripts/verify-super-synara-github-state.ts")) &&
-        lines.some((line) => line.startsWith("--phase preflight"))
-      ) {
-        preflightValidators.push({ jobName, step: candidateStep });
-      }
+      const command = executableShellLines(candidateStep.run).join(" ");
+      if (!command.includes("verify-super-synara-github-state.ts")) continue;
+      validatorInvocations.push({ command, jobName, step: candidateStep });
     }
   }
+  const preflightValidators = validatorInvocations.filter(({ command }) =>
+    /(?:^|\s)--phase(?:\s+|=)["']?preflight["']?(?=\s|$)/.test(command),
+  );
   if (
     preflightValidators.length !== 1 ||
     preflightValidators[0]!.jobName !== "draft_admission" ||
@@ -516,6 +519,11 @@ function verifyDraftAdmissionJob(jobs: UnknownRecord): void {
   ) {
     throw new Error(
       "Publication preflight-phase draft validation must run exactly once in draft admission.",
+    );
+  }
+  if (validatorInvocations.some(({ jobName }) => jobName === "preflight")) {
+    throw new Error(
+      "Publication read-only preflight must not invoke the GitHub release-state validator.",
     );
   }
 }

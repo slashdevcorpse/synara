@@ -384,6 +384,26 @@ describe("Super Synara workflow contracts", () => {
     expect(() => verifySuperSynaraWorkflowText(duplicatedReadOnlyValidation, audit)).toThrow(
       "preflight-phase draft validation must run exactly once in draft admission",
     );
+
+    for (const phaseArgument of ["--phase preflight", "--phase=preflight"]) {
+      const duplicatedOneLineValidation = main.replace(
+        "      - name: Verify Super Synara identity",
+        `      - name: Reintroduced one-line draft validation\n        run: node scripts/verify-super-synara-github-state.ts ${phaseArgument}\n\n      - name: Verify Super Synara identity`,
+      );
+      expect(duplicatedOneLineValidation).not.toBe(main);
+      expect(() => verifySuperSynaraWorkflowText(duplicatedOneLineValidation, audit)).toThrow(
+        "preflight-phase draft validation must run exactly once in draft admission",
+      );
+    }
+
+    const alternatePhaseInReadOnlyPreflight = main.replace(
+      "      - name: Verify Super Synara identity",
+      "      - name: Reintroduced alternate release-state validation\n        run: node scripts/verify-super-synara-github-state.ts --phase before-draft\n\n      - name: Verify Super Synara identity",
+    );
+    expect(alternatePhaseInReadOnlyPreflight).not.toBe(main);
+    expect(() => verifySuperSynaraWorkflowText(alternatePhaseInReadOnlyPreflight, audit)).toThrow(
+      "read-only preflight must not invoke the GitHub release-state validator",
+    );
   });
 
   it("rejects removal of the reviewed allowlist gate", () => {
