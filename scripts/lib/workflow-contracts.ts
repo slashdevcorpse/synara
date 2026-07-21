@@ -783,7 +783,7 @@ function allowedWritePermission(path: string, location: string, scope: string): 
   }
   return (
     path === ".github/workflows/super-synara-prerelease.yml" &&
-    (location === "jobs.reserve_tag.permissions" || location === "jobs.publish.permissions") &&
+    (location === "jobs.draft_admission.permissions" || location === "jobs.publish.permissions") &&
     scope === "contents"
   );
 }
