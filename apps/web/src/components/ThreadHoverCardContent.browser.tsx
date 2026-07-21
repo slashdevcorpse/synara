@@ -61,7 +61,7 @@ describe("ThreadHoverCardContent actions", () => {
       expect(onInterrupt).not.toHaveBeenCalled();
       expect(onParentClick).not.toHaveBeenCalled();
 
-      const interruptResult = interruptElement.dispatchEvent(
+      const interruptResult = interruptElement!.dispatchEvent(
         new MouseEvent("click", { bubbles: true, cancelable: true }),
       );
       expect(interruptResult).toBe(false);
