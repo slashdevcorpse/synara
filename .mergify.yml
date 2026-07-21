@@ -1,5 +1,6 @@
 merge_queue:
   mode: serial
+  max_parallel_checks: 1
 
 merge_protections_settings:
   auto_merge_conditions:
@@ -20,4 +21,6 @@ queue_rules:
     branch_protection_injection_mode: queue
     merge_method: squash
     queue_conditions:
+      - base = main
+    merge_conditions:
       - base = main

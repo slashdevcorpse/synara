@@ -313,6 +313,7 @@ jobs:
 
 const mergifyConfiguration = `merge_queue:
   mode: serial
+  max_parallel_checks: 1
 merge_protections_settings:
   auto_merge_conditions:
     - label = ready-to-merge
@@ -329,6 +330,8 @@ queue_rules:
     branch_protection_injection_mode: queue
     merge_method: squash
     queue_conditions:
+      - base = main
+    merge_conditions:
       - base = main
 `;
 
@@ -358,6 +361,21 @@ describe("workflow contracts", () => {
         ),
       ).join("\n"),
     ).toContain("inject the strict protected-main ruleset");
+
+    expect(
+      validateMergifyConfiguration(
+        mergifyConfiguration.replace("max_parallel_checks: 1", "max_parallel_checks: 2"),
+      ).join("\n"),
+    ).toContain("strict-ruleset-compatible in-place checks");
+
+    expect(
+      validateMergifyConfiguration(
+        mergifyConfiguration.replace(
+          "merge_conditions:\n      - base = main",
+          "merge_conditions:\n      - check-success = impossible",
+        ),
+      ).join("\n"),
+    ).toContain("strict-ruleset-compatible in-place checks");
   });
 
   it("rejects mutable action tags even in disabled workflows", () => {

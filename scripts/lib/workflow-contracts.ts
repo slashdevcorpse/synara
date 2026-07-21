@@ -971,7 +971,7 @@ export function validateMergifyConfiguration(contents: string): readonly string[
     return [`.mergify.yml is not valid YAML: ${error instanceof Error ? error.message : error}`];
   }
   const expected = {
-    merge_queue: { mode: "serial" },
+    merge_queue: { mode: "serial", max_parallel_checks: 1 },
     merge_protections_settings: { auto_merge_conditions: ["label = ready-to-merge"] },
     merge_protections: [
       {
@@ -987,12 +987,13 @@ export function validateMergifyConfiguration(contents: string): readonly string[
         branch_protection_injection_mode: "queue",
         merge_method: "squash",
         queue_conditions: ["base = main"],
+        merge_conditions: ["base = main"],
       },
     ],
   };
   if (JSON.stringify(raw) === JSON.stringify(expected)) return [];
   return [
-    ".mergify.yml must preserve serial, label-gated squash merging and inject the strict protected-main ruleset into the queue.",
+    ".mergify.yml must preserve serial, label-gated squash merging, use strict-ruleset-compatible in-place checks, and inject the strict protected-main ruleset into the queue.",
   ];
 }
 
