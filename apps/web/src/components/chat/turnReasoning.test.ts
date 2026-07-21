@@ -280,7 +280,7 @@ describe("buildTurnReasoningSummaryByAssistantMessageId", () => {
       message({
         id: "a3",
         role: "assistant",
-        turnId: "t3",
+        turnId: "third-turn",
         createdAt: "2026-07-21T10:02:01.000Z",
         streaming: true,
       }),
