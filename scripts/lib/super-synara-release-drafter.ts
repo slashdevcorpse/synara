@@ -3,6 +3,7 @@
 // Layer: Release scheduling policy
 
 import { assertFullCommitSha } from "./git-sha.ts";
+import type { SuperSynaraDraftRelease, SuperSynaraTagRef } from "./super-synara-github-payload.ts";
 import {
   hasExactSuperSynaraReleaseIdentity,
   hasSuperSynaraReleaseOwnership,
@@ -11,21 +12,7 @@ import {
 } from "./super-synara-release-identity.ts";
 
 export { SUPER_SYNARA_RELEASE_DRAFTER_MARKER, superSynaraReleaseTitle };
-
-export interface SuperSynaraTagRef {
-  readonly name: string;
-  readonly commit: string;
-}
-
-export interface SuperSynaraDraftRelease {
-  readonly id: number;
-  readonly tagName: string;
-  readonly targetCommitish: string;
-  readonly name: string;
-  readonly body: string;
-  readonly draft: boolean;
-  readonly prerelease: boolean;
-}
+export type { SuperSynaraDraftRelease, SuperSynaraTagRef } from "./super-synara-github-payload.ts";
 
 export interface SuperSynaraDraftPlan {
   readonly version: string;

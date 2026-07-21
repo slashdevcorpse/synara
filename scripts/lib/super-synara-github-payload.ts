@@ -3,7 +3,21 @@
 // Layer: GitHub release boundary
 
 import { assertFullCommitSha } from "./git-sha.ts";
-import type { SuperSynaraDraftRelease, SuperSynaraTagRef } from "./super-synara-release-drafter.ts";
+
+export interface SuperSynaraTagRef {
+  readonly name: string;
+  readonly commit: string;
+}
+
+export interface SuperSynaraDraftRelease {
+  readonly id: number;
+  readonly tagName: string;
+  readonly targetCommitish: string;
+  readonly name: string;
+  readonly body: string;
+  readonly draft: boolean;
+  readonly prerelease: boolean;
+}
 
 type UnknownRecord = Record<string, unknown>;
 

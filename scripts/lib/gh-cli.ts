@@ -14,8 +14,10 @@ export interface GhSpawnResult {
 export type GhSpawn = (
   command: string,
   args: ReadonlyArray<string>,
-  options: { readonly encoding: "utf8"; readonly shell: false },
+  options: { readonly encoding: "utf8"; readonly shell: false; readonly timeout: number },
 ) => GhSpawnResult;
+
+export const GH_CLI_TIMEOUT_MS = 30_000;
 
 const defaultSpawn: GhSpawn = (command, args, options) =>
   spawnSync(command, [...args], options) as GhSpawnResult;
@@ -54,8 +56,18 @@ export function runGh(
   options: { readonly allowNotFound?: boolean } = {},
   spawn: GhSpawn = defaultSpawn,
 ): string {
-  const result = spawn("gh", args, { encoding: "utf8", shell: false });
+  const result = spawn("gh", args, {
+    encoding: "utf8",
+    shell: false,
+    timeout: GH_CLI_TIMEOUT_MS,
+  });
   if (result.error) {
+    if ("code" in result.error && result.error.code === "ETIMEDOUT") {
+      throw new GhCliRequestError(
+        `gh ${args.join(" ")} timed out after ${GH_CLI_TIMEOUT_MS}ms: ${result.error.message}`,
+        true,
+      );
+    }
     throw new GhCliStartError(`gh could not start: ${result.error.message}`);
   }
   if (result.status !== 0) {

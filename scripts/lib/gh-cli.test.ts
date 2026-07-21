@@ -1,6 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { GhCliRequestError, GhCliStartError, type GhSpawnResult, runGh } from "./gh-cli.ts";
+import {
+  GH_CLI_TIMEOUT_MS,
+  GhCliRequestError,
+  GhCliStartError,
+  type GhSpawnResult,
+  runGh,
+} from "./gh-cli.ts";
 
 const result = (overrides: Partial<GhSpawnResult> = {}): GhSpawnResult => ({
   status: 0,
@@ -36,6 +42,26 @@ describe("runGh", () => {
         vi.fn(() => result({ error, status: null })),
       ),
     ).toThrow("gh could not start: spawn gh ENOENT");
+  });
+
+  it("bounds GitHub CLI calls and keeps timeout failures retryable", () => {
+    const error = Object.assign(new Error("spawnSync gh ETIMEDOUT"), { code: "ETIMEDOUT" });
+    const spawn = vi.fn(() => result({ error, status: null }));
+    try {
+      runGh(["api", "rate_limit"], {}, spawn);
+      throw new Error("Expected runGh to throw.");
+    } catch (caught) {
+      expect(caught).toBeInstanceOf(GhCliRequestError);
+      expect((caught as GhCliRequestError).retryable).toBe(true);
+      expect((caught as Error).message).toContain(
+        `gh api rate_limit timed out after ${GH_CLI_TIMEOUT_MS}ms`,
+      );
+    }
+    expect(spawn).toHaveBeenCalledWith("gh", ["api", "rate_limit"], {
+      encoding: "utf8",
+      shell: false,
+      timeout: GH_CLI_TIMEOUT_MS,
+    });
   });
 
   for (const [stderr, retryable] of [
