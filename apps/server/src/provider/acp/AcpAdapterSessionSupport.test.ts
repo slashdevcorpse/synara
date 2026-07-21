@@ -1,3 +1,5 @@
+import * as nodePath from "node:path";
+
 import { ThreadId, TurnId, type ProviderSession } from "@synara/contracts";
 import { describe, expect, it } from "vitest";
 
@@ -168,7 +170,7 @@ describe("ACP adapter session support", () => {
         serverCwd: "/server",
         homeDir: "/home/test",
       }),
-    ).toBe("/explicit");
+    ).toBe(nodePath.resolve("/explicit"));
     expect(
       resolveAcpSessionCwd({
         inputCwd: undefined,
@@ -176,13 +178,13 @@ describe("ACP adapter session support", () => {
         serverCwd: "/server",
         homeDir: "/home/test",
       }),
-    ).toBe("/session");
+    ).toBe(nodePath.resolve("/session"));
     expect(
       resolveAcpSessionCwd({
         inputCwd: undefined,
         serverCwd: "/server",
         homeDir: "/home/test",
       }),
-    ).toBe("/server");
+    ).toBe(nodePath.resolve("/server"));
   });
 });
