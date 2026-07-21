@@ -19,6 +19,7 @@ import {
   createDesktopPlatformBuildConfig,
   MAC_APPSNAP_HELPER_STAGE_PATH,
   validateDesktopNativeBuildHost,
+  windowsJobLauncherStagePath,
 } from "./lib/desktop-platform-build-config.ts";
 import {
   createDesktopIdentityBuildConfig,
@@ -1029,6 +1030,15 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
   yield* fs.copy(distDirs.desktopResources, stageResourcesDir);
   yield* fs.copy(distDirs.serverDist, path.join(stageAppDir, "apps/server/dist"));
   yield* fs.copyFile(path.join(repoRoot, "LICENSE"), path.join(stageAppDir, "LICENSE"));
+
+  if (options.platform === "win") {
+    const launcherPath = path.join(stageAppDir, windowsJobLauncherStagePath(options.arch));
+    if (!(yield* fs.exists(launcherPath))) {
+      return yield* new BuildScriptError({
+        message: `Missing Windows Job launcher at ${launcherPath}. Build the ${options.arch} native launcher before packaging the desktop app.`,
+      });
+    }
+  }
 
   yield* assertPlatformBuildResources(
     options.platform,

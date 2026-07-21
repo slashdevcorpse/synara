@@ -187,6 +187,9 @@ ${codecovTestResultsUploadStep}
     runs-on: windows-2022
     steps:
       - run: bun run brand:check
+      - run: node apps/server/scripts/build-windows-job-launcher.mjs --arch x64
+      - run: node apps/server/scripts/build-windows-job-launcher.mjs --arch arm64
+      - run: bun run --cwd apps/server test src/provider/windowsProviderProcess.test.ts src/provider/windowsProviderProcess.windows.test.ts
       - run: bun run --cwd packages/shared test src/desktopIdentity.test.ts src/desktopIdentityProof.test.ts src/windowsCertificate.test.ts
       - run: bun run --cwd apps/desktop test src/backendShutdown.test.ts src/backendShutdown.windows.integration.test.ts
       - run: bun run --cwd packages/shared test src/windowsProcess.test.ts
@@ -374,6 +377,18 @@ describe("workflow contracts", () => {
     );
     expect(validateWorkflowContracts(missingWindowsGate, policy()).join("\n")).toContain(
       "windows_x64 must run exact native gate command",
+    );
+
+    const missingArm64LauncherBuild = validFiles();
+    missingArm64LauncherBuild.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace(
+        "node apps/server/scripts/build-windows-job-launcher.mjs --arch arm64",
+        "node apps/server/scripts/build-windows-job-launcher.mjs --arch x64",
+      ),
+    );
+    expect(validateWorkflowContracts(missingArm64LauncherBuild, policy()).join("\n")).toContain(
+      "windows_x64 must run exact native gate command: node apps/server/scripts/build-windows-job-launcher.mjs --arch arm64",
     );
 
     const broadWindowsSuite = validFiles();

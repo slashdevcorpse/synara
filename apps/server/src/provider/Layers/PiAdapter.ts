@@ -74,6 +74,7 @@ import {
   teardownChildProcessTree,
   teardownProviderProcessTree,
 } from "../supervisedProcessTeardown.ts";
+import { prepareWindowsProviderProcess } from "../windowsProviderProcess.ts";
 
 const PROVIDER = "pi" as const;
 const DEFAULT_PI_THINKING_LEVEL: ThinkingLevel = "medium";
@@ -165,20 +166,24 @@ export function makePiBashProcessSupervisor(
       }
       const shell = options.getShellConfig(configuredShellPath);
       const commandFromStdin = shell.commandTransport === "stdin";
-      const child = spawnProcess(
-        shell.shell,
-        commandFromStdin ? shell.args : [...shell.args, command],
-        {
-          cwd,
-          detached: process.platform !== "win32",
-          env: buildProviderChildEnvironment({
-            provider: "pi",
-            baseEnv: execution.env ?? process.env,
-          }),
-          stdio: [commandFromStdin ? "pipe" : "ignore", "pipe", "pipe"],
-          windowsHide: true,
-        },
-      );
+      const childEnv = buildProviderChildEnvironment({
+        provider: "pi",
+        baseEnv: execution.env ?? process.env,
+      });
+      const shellArgs = commandFromStdin ? shell.args : [...shell.args, command];
+      const prepared = prepareWindowsProviderProcess(shell.shell, shellArgs, {
+        cwd,
+        env: childEnv,
+      });
+      const child = spawnProcess(prepared.command, prepared.args, {
+        cwd,
+        detached: process.platform !== "win32",
+        env: childEnv,
+        shell: prepared.shell,
+        ...(prepared.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
+        stdio: [commandFromStdin ? "pipe" : "ignore", "pipe", "pipe"],
+        windowsHide: true,
+      });
       const active: PiActiveProcess = {
         child,
         teardown: undefined,

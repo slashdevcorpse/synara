@@ -29,6 +29,7 @@ import {
   CODEX_PLAN_MODE_DEVELOPER_INSTRUCTIONS,
   CodexAppServerManager,
   classifyCodexStderrLine,
+  formatCodexCliVersionCheckFailure,
   isRecoverableThreadResumeError,
   normalizeCodexModelSlug,
   readCodexAccountSnapshot,
@@ -48,6 +49,42 @@ const approvalRequiredTurnOverrides = {
   approvalPolicy: "untrusted",
   sandboxPolicy: { type: "readOnly" },
 } as const;
+
+describe("Codex CLI version check failures", () => {
+  it("maps Windows launcher target failures to the friendly executable error", () => {
+    expect(
+      formatCodexCliVersionCheckFailure({
+        binaryPath: "C:\\tools\\codex.exe",
+        status: 241,
+        stdout: "",
+        stderr:
+          "[synara-windows-job-launcher] stage=target win32_error=2 detail=target is not a regular executable file",
+      }),
+    ).toBe("Codex CLI (C:\\tools\\codex.exe) is not installed or not executable.");
+  });
+
+  it.each([
+    {
+      name: "another launcher stage",
+      status: 241,
+      stderr: "[synara-windows-job-launcher] stage=job win32_error=5",
+    },
+    {
+      name: "another nonzero target failure",
+      status: 7,
+      stderr: "stage=target provider rejected version probe",
+    },
+  ])("preserves diagnostics for $name", ({ status, stderr }) => {
+    expect(
+      formatCodexCliVersionCheckFailure({
+        binaryPath: "codex",
+        status,
+        stdout: "ignored stdout",
+        stderr,
+      }),
+    ).toBe(`Codex CLI version check failed. ${stderr}`);
+  });
+});
 
 describe("Codex Synara harness policy", () => {
   it("keeps the same host policy exactly once in default and plan instructions", () => {

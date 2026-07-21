@@ -37,6 +37,12 @@ import {
   isBlankBrowserTabUrl,
   resolveCopyableBrowserTabUrl,
 } from "@synara/shared/browserSession";
+import {
+  adoptAttachedBrowserWebContentsSecurity,
+  createBrowserPopupNavigationPolicy,
+  enforceBrowserPopupNavigationPolicy,
+  type BrowserPopupNavigationPolicy,
+} from "./browserSecurity";
 import { BROWSER_SESSION_PARTITION, BrowserSessionPolicy } from "./browserSessionPolicy";
 import {
   isAllowedBrowserNavigation,
@@ -77,11 +83,13 @@ interface LiveTabRuntime {
 interface OAuthPopupContext {
   threadId: ThreadId;
   tabId: string;
+  navigationPolicy: BrowserPopupNavigationPolicy | null;
   localFilePath: string | null;
   localPreviewCapability: LocalPreviewCapability | null;
 }
 
-interface OAuthPopupRuntime extends OAuthPopupContext {
+interface OAuthPopupRuntime extends Omit<OAuthPopupContext, "navigationPolicy"> {
+  navigationPolicy: BrowserPopupNavigationPolicy;
   window: BrowserWindow;
   listenerDisposers: Array<() => void>;
 }
@@ -439,6 +447,7 @@ export class DesktopBrowserManager {
     return {
       threadId,
       tabId,
+      navigationPolicy: null,
       localFilePath: tab.localFilePath ?? null,
       localPreviewCapability: localPreviewCapabilityForTab(tab),
     };
@@ -458,8 +467,12 @@ export class DesktopBrowserManager {
     onDisallowedNavigation: () => void,
     listenerDisposers: Array<() => void>,
   ): void {
-    const preventDisallowedNavigation = (event: Electron.Event, url: string) => {
-      if (!isAllowed(url)) {
+    const preventDisallowedNavigation = (
+      event:
+        | Electron.Event<Electron.WebContentsWillNavigateEventParams>
+        | Electron.Event<Electron.WebContentsWillRedirectEventParams>,
+    ) => {
+      if (!isAllowed(event.url)) {
         event.preventDefault();
       }
     };
@@ -493,16 +506,51 @@ export class DesktopBrowserManager {
     webContents: WebContents,
     context: OAuthPopupContext,
     listenerDisposers: Array<() => void>,
-    isUrlAllowed: (url: string) => boolean = (url) =>
-      this.isPopupPageNavigationAllowed(context, url),
-    resolveContext: () => OAuthPopupContext | null = () => context,
+    options: {
+      readonly closeOnBlockedNavigation?: () => void;
+      readonly isUrlAllowed?: (url: string) => boolean;
+      readonly resolveContext?: () => OAuthPopupContext | null;
+    } = {},
   ): void {
+    const isUrlAllowed =
+      options.isUrlAllowed ?? ((url: string) => this.isPopupPageNavigationAllowed(context, url));
+    const resolveContext = options.resolveContext ?? (() => context);
+
+    const popupNavigationPolicy = context.navigationPolicy;
+    if (popupNavigationPolicy) {
+      const willNavigate = (event: Electron.Event<Electron.WebContentsWillNavigateEventParams>) => {
+        enforceBrowserPopupNavigationPolicy(
+          popupNavigationPolicy,
+          event,
+          options.closeOnBlockedNavigation,
+        );
+      };
+      const willRedirect = (event: Electron.Event<Electron.WebContentsWillRedirectEventParams>) => {
+        enforceBrowserPopupNavigationPolicy(
+          popupNavigationPolicy,
+          event,
+          options.closeOnBlockedNavigation,
+        );
+      };
+      webContents.on("will-navigate", willNavigate);
+      webContents.on("will-redirect", willRedirect);
+      listenerDisposers.push(() => {
+        webContents.removeListener("will-navigate", willNavigate);
+        webContents.removeListener("will-redirect", willRedirect);
+      });
+    }
+
     // Auth providers can chain web popups (provider -> consent). Page-controlled custom
     // schemes and destinations outside a local preview capability are denied here.
     webContents.setWindowOpenHandler((details) => {
       const { url } = details;
       const activeContext = resolveContext();
-      if (!activeContext || !isUrlAllowed(url)) {
+      if (
+        !activeContext ||
+        !isUrlAllowed(url) ||
+        (activeContext.navigationPolicy !== null &&
+          !activeContext.navigationPolicy.allowsNestedOpen(url))
+      ) {
         return { action: "deny" };
       }
 
@@ -536,13 +584,30 @@ export class DesktopBrowserManager {
       return { action: "deny" };
     });
 
-    const didCreateWindow = (childWindow: BrowserWindow) => {
+    const didCreateWindow = (
+      childWindow: BrowserWindow,
+      details: Electron.DidCreateWindowDetails,
+    ) => {
       const activeContext = resolveContext();
-      if (!activeContext) {
-        childWindow.destroy();
+      if (!activeContext || !isUrlAllowed(details.url)) {
+        if (!childWindow.isDestroyed()) childWindow.destroy();
         return;
       }
-      this.registerOAuthPopupWindow(childWindow, activeContext);
+      const navigationPolicy = activeContext.navigationPolicy
+        ? activeContext.navigationPolicy.deriveNested(details.url)
+        : createBrowserPopupNavigationPolicy({
+            openerUrl: webContents.getURL(),
+            initialUrl: details.url,
+            allowAboutBlankOriginBinding: true,
+          });
+      if (!navigationPolicy) {
+        if (!childWindow.isDestroyed()) childWindow.destroy();
+        return;
+      }
+      this.registerOAuthPopupWindow(childWindow, {
+        ...activeContext,
+        navigationPolicy,
+      });
     };
     webContents.on("did-create-window", didCreateWindow);
     listenerDisposers.push(() => {
@@ -550,7 +615,10 @@ export class DesktopBrowserManager {
     });
   }
 
-  private registerOAuthPopupWindow(popup: BrowserWindow, context: OAuthPopupContext): void {
+  private registerOAuthPopupWindow(
+    popup: BrowserWindow,
+    context: OAuthPopupContext & { navigationPolicy: BrowserPopupNavigationPolicy },
+  ): void {
     if (this.popupRuntimes.has(popup)) {
       return;
     }
@@ -594,7 +662,11 @@ export class DesktopBrowserManager {
       webContents.removeListener("before-input-event", closeOnInput);
     });
 
-    this.configureWindowOpenHandling(webContents, runtime, runtime.listenerDisposers);
+    this.configureWindowOpenHandling(webContents, runtime, runtime.listenerDisposers, {
+      closeOnBlockedNavigation: () => {
+        this.closePopupRuntime(runtime);
+      },
+    });
 
     popup.once("closed", () => {
       this.removePopupRuntime(runtime);
@@ -1867,28 +1939,32 @@ export class DesktopBrowserManager {
     // Belt-and-suspenders alongside the session-level UA: also covers an adopted renderer
     // <webview> for any navigation after it attaches.
     this.sessionPolicy.applyUserAgent(webContents);
-    this.registerPageNavigationGuards(
-      webContents,
-      (url) => url === ABOUT_BLANK_URL || this.isRuntimePageNavigationAllowed(runtime, url),
-      () => {
-        webContents.stop();
-        void this.loadTab(threadId, tabId, { force: true, runtime });
-      },
-      runtime.listenerDisposers,
-    );
-
-    const windowOpenContext = this.popupContextForTab(threadId, tabId);
-    if (windowOpenContext) {
-      this.configureWindowOpenHandling(
+    adoptAttachedBrowserWebContentsSecurity(webContents, () => {
+      this.registerPageNavigationGuards(
         webContents,
-        windowOpenContext,
+        (url) => url === ABOUT_BLANK_URL || this.isRuntimePageNavigationAllowed(runtime, url),
+        () => {
+          webContents.stop();
+          void this.loadTab(threadId, tabId, { force: true, runtime });
+        },
         runtime.listenerDisposers,
-        (url) => this.isRuntimePageNavigationAllowed(runtime, url),
-        () => this.popupContextForTab(threadId, tabId),
       );
-    } else {
-      webContents.setWindowOpenHandler(() => ({ action: "deny" }));
-    }
+
+      const windowOpenContext = this.popupContextForTab(threadId, tabId);
+      if (windowOpenContext) {
+        this.configureWindowOpenHandling(
+          webContents,
+          windowOpenContext,
+          runtime.listenerDisposers,
+          {
+            isUrlAllowed: (url) => this.isRuntimePageNavigationAllowed(runtime, url),
+            resolveContext: () => this.popupContextForTab(threadId, tabId),
+          },
+        );
+      } else {
+        webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+      }
+    });
 
     // The native page owns keyboard focus while browsing, so the renderer never sees the
     // copy-link chord. Intercept it here, copy the live URL, and let the shell toast.

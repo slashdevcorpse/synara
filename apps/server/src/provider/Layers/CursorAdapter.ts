@@ -22,7 +22,7 @@ import {
   type ThreadId,
   TurnId,
 } from "@synara/contracts";
-import { prepareWindowsSafeProcess } from "@synara/shared/windowsProcess";
+import type { WindowsSafeProcessCommand } from "@synara/shared/windowsProcess";
 import {
   DateTime,
   Deferred,
@@ -54,6 +54,7 @@ import {
 import { ServerConfig, type ServerConfigShape } from "../../config.ts";
 import { appendFileAttachmentsPromptBlock } from "../attachmentProjection.ts";
 import { loadProviderPromptImageBlocks } from "../promptAttachments.ts";
+import { prepareWindowsProviderProcess } from "../windowsProviderProcess.ts";
 import {
   ProviderAdapterProcessError,
   ProviderAdapterRequestError,
@@ -158,6 +159,18 @@ const collectStreamAsString = <E>(stream: Stream.Stream<Uint8Array, E>): Effect.
     () => "",
     (acc, chunk) => acc + new TextDecoder().decode(chunk),
   );
+
+export function makeCursorModelListChildProcess(
+  prepared: WindowsSafeProcessCommand,
+  env: NodeJS.ProcessEnv,
+): ChildProcess.StandardCommand {
+  return ChildProcess.make(prepared.command, prepared.args, {
+    shell: prepared.shell,
+    ...(prepared.windowsHide ? { windowsHide: true } : {}),
+    ...(prepared.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
+    env,
+  });
+}
 
 export interface CursorAdapterLiveOptions {
   readonly nativeEventLogPath?: string;
@@ -1403,15 +1416,11 @@ export function makeCursorAdapter(
           ...(effectiveApiEndpoint ? { apiEndpoint: effectiveApiEndpoint } : {}),
         });
         const env = buildCursorAgentHeadlessEnv();
-        const prepared = prepareWindowsSafeProcess(command.command, command.args, {
+        const prepared = prepareWindowsProviderProcess(command.command, command.args, {
           env,
         });
         const child = yield* childProcessSpawner.spawn(
-          ChildProcess.make(prepared.command, prepared.args, {
-            shell: prepared.shell,
-            ...(prepared.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
-            env,
-          }),
+          makeCursorModelListChildProcess(prepared, env),
         );
         const [stdout, stderr, exitCode] = yield* Effect.all(
           [

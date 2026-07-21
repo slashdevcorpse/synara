@@ -35,7 +35,6 @@ import {
 import { resolveCodexCliExecutable } from "@synara/shared/codexCliExecutable";
 import { getModelSelectionBooleanOptionValue, normalizeModelSlug } from "@synara/shared/model";
 import { decodeSubagentReceiverThreadIds } from "@synara/shared/subagents";
-import { prepareResolvedWindowsSafeProcess } from "@synara/shared/windowsProcess";
 import { Effect, ServiceMap } from "effect";
 
 import {
@@ -55,6 +54,7 @@ import {
   teardownChildProcessTree,
   teardownProviderProcessTree,
 } from "./provider/supervisedProcessTeardown.ts";
+import { prepareResolvedWindowsProviderProcess } from "./provider/windowsProviderProcess.ts";
 import { ensureIsolatedScratchWorkspace } from "./scratchWorkspaces.ts";
 import { createLogger } from "./logger";
 import { transcribeVoiceWithChatGptSession } from "./voiceTranscription.ts";
@@ -611,7 +611,7 @@ function spawnCodexAppServer(input: {
   readonly cwd: string;
   readonly env: NodeJS.ProcessEnv;
 }): ChildProcessWithoutNullStreams {
-  const prepared = prepareResolvedWindowsSafeProcess(
+  const prepared = prepareResolvedWindowsProviderProcess(
     input.binaryPath,
     buildCodexAppServerArgs(input.env),
     {
@@ -3210,12 +3210,26 @@ function readCodexProviderOptions(input: CodexAppServerStartSessionInput): {
   };
 }
 
+export function formatCodexCliVersionCheckFailure(input: {
+  readonly binaryPath: string;
+  readonly status: number | null;
+  readonly stdout: string;
+  readonly stderr: string;
+}): string {
+  if (input.status === 241 && /(?:^|\s)stage=target(?:\s|$)/iu.test(input.stderr)) {
+    return `Codex CLI (${input.binaryPath}) is not installed or not executable.`;
+  }
+  const detail =
+    input.stderr.trim() || input.stdout.trim() || `Command exited with code ${input.status}.`;
+  return `Codex CLI version check failed. ${detail}`;
+}
+
 async function assertSupportedCodexCliVersion(input: {
   readonly binaryPath: string;
   readonly cwd: string;
   readonly env: NodeJS.ProcessEnv;
 }): Promise<void> {
-  const prepared = prepareResolvedWindowsSafeProcess(input.binaryPath, ["--version"], {
+  const prepared = prepareResolvedWindowsProviderProcess(input.binaryPath, ["--version"], {
     cwd: input.cwd,
     env: input.env,
   });
@@ -3248,8 +3262,14 @@ async function assertSupportedCodexCliVersion(input: {
   const stdout = result.stdout ?? "";
   const stderr = result.stderr ?? "";
   if (result.status !== 0) {
-    const detail = stderr.trim() || stdout.trim() || `Command exited with code ${result.status}.`;
-    throw new Error(`Codex CLI version check failed. ${detail}`);
+    throw new Error(
+      formatCodexCliVersionCheckFailure({
+        binaryPath: input.binaryPath,
+        status: result.status,
+        stdout,
+        stderr,
+      }),
+    );
   }
 
   const parsedVersion = parseCodexCliVersion(`${stdout}\n${stderr}`);

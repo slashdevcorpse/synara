@@ -4,6 +4,7 @@ import { Cause, Effect, Layer, Stream } from "effect";
 
 import { ProfileStatsArchive } from "../../profileStatsArchive";
 import { ProviderService } from "../../provider/Services/ProviderService";
+import { removeIsolatedScratchWorkspace } from "../../scratchWorkspaces";
 import { TerminalManager } from "../../terminal/Services/Manager";
 import { THREAD_RETENTION_COMMAND_ID_PREFIX } from "../../threadRetention";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine";
@@ -98,6 +99,9 @@ const make = Effect.gen(function* () {
   const stopProviderSession = Effect.fn(function* (
     threadId: ThreadDeletedEvent["payload"]["threadId"],
   ) {
+    if (providerService.retireThreadLifecycle !== undefined) {
+      yield* providerService.retireThreadLifecycle({ threadId });
+    }
     return yield* providerService.stopSession({ threadId }).pipe(
       Effect.as(true),
       Effect.catchCause((cause) => {
@@ -182,6 +186,17 @@ const make = Effect.gen(function* () {
       });
       return;
     }
+    yield* Effect.tryPromise({
+      try: () => removeIsolatedScratchWorkspace(threadId),
+      catch: (cause) => cause,
+    }).pipe(
+      Effect.catch((cause) =>
+        Effect.logWarning("thread deletion cleanup could not remove scratch workspace", {
+          threadId,
+          cause: String(cause),
+        }),
+      ),
+    );
     yield* purgeThreadData(event);
   });
 

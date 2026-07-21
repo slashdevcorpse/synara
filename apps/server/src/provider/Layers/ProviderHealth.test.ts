@@ -1,4 +1,5 @@
-import { realpathSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import * as NodeOs from "node:os";
 import * as NodePath from "node:path";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -10,7 +11,7 @@ import { Effect, Fiber, FileSystem, Layer, Path, Sink, Stream } from "effect";
 import { TestClock } from "effect/testing";
 import * as PlatformError from "effect/PlatformError";
 import { ChildProcessSpawner } from "effect/unstable/process";
-import { vi } from "vitest";
+import { afterAll, beforeAll, vi } from "vitest";
 
 import { SYNARA_CODEX_HOME_OVERLAY_DIR } from "../../codexHomePaths";
 import { ServerConfig } from "../../config";
@@ -50,10 +51,57 @@ import {
   stabilizeProviderStatusesAgainstTransientTimeouts,
 } from "./ProviderHealth";
 import { resolvePackageManagedProviderMaintenance } from "../providerMaintenance";
+import {
+  WINDOWS_JOB_LAUNCHER_ENV,
+  WINDOWS_JOB_LAUNCHER_EXECUTABLE,
+  WINDOWS_JOB_LAUNCHER_PROTOCOL_VERSION,
+} from "../windowsProviderProcess.ts";
 
 // ── Test helpers ────────────────────────────────────────────────────
 
 const encoder = new TextEncoder();
+const originalProviderHealthTestPath = process.env.PATH;
+let providerHealthTestCommandDirectory: string | undefined;
+
+function configuredTestBinary(name: string): string {
+  return process.platform === "win32" ? `C:\\custom\\bin\\${name}` : `/custom/bin/${name}`;
+}
+
+beforeAll(() => {
+  if (process.platform !== "win32") return;
+  providerHealthTestCommandDirectory = mkdtempSync(
+    NodePath.join(NodeOs.tmpdir(), "synara-provider-health-commands-"),
+  );
+  for (const command of [
+    "codex",
+    "claude",
+    "grok",
+    "opencode",
+    "kilo",
+    "pi",
+    "agy",
+    "droid",
+    "cursor-agent",
+    "commandcode",
+    "missing-commandcode",
+  ]) {
+    writeFileSync(NodePath.join(providerHealthTestCommandDirectory, `${command}.exe`), "");
+  }
+  process.env.PATH = [providerHealthTestCommandDirectory, originalProviderHealthTestPath]
+    .filter((entry): entry is string => Boolean(entry))
+    .join(";");
+});
+
+afterAll(() => {
+  if (originalProviderHealthTestPath === undefined) {
+    delete process.env.PATH;
+  } else {
+    process.env.PATH = originalProviderHealthTestPath;
+  }
+  if (providerHealthTestCommandDirectory) {
+    rmSync(providerHealthTestCommandDirectory, { recursive: true, force: true });
+  }
+});
 
 interface ProviderCommandFixture {
   readonly commandDirectory: string;
@@ -180,6 +228,44 @@ function mockHandle(result: { stdout: string; stderr: string; code: number }) {
   });
 }
 
+type PreparedMockCommand = {
+  readonly command: string;
+  readonly args: ReadonlyArray<string>;
+  readonly options?: {
+    readonly env?: NodeJS.ProcessEnv;
+    readonly windowsVerbatimArguments?: boolean;
+  };
+};
+
+function unwrapContainedProviderCommand(cmd: PreparedMockCommand): PreparedMockCommand {
+  const launcherPrefix = ["--protocol", WINDOWS_JOB_LAUNCHER_PROTOCOL_VERSION, "--argument-mode"];
+  const isContained =
+    process.platform === "win32" &&
+    NodePath.basename(cmd.command).toLowerCase() === WINDOWS_JOB_LAUNCHER_EXECUTABLE &&
+    launcherPrefix.every((value, index) => cmd.args[index] === value) &&
+    cmd.args[4] === "--" &&
+    typeof cmd.args[5] === "string";
+  if (!isContained) return cmd;
+
+  const target = cmd.args[5]!;
+  const normalizedTestDirectory = providerHealthTestCommandDirectory?.toLowerCase();
+  const targetDirectory = NodePath.dirname(target).toLowerCase();
+  const isGlobalMockCommand = targetDirectory.includes("synara-provider-health-commands-");
+  const unwrappedTarget =
+    isGlobalMockCommand || (normalizedTestDirectory && targetDirectory === normalizedTestDirectory)
+      ? NodePath.basename(target, NodePath.extname(target))
+      : target.startsWith("\\") && !target.startsWith("\\\\")
+        ? target.replaceAll("\\", "/")
+        : target;
+  const options =
+    cmd.args[3] === "verbatim" ? { ...cmd.options, windowsVerbatimArguments: true } : cmd.options;
+  return {
+    command: unwrappedTarget,
+    args: cmd.args.slice(6),
+    ...(options ? { options } : {}),
+  };
+}
+
 function mockSpawnerLayer(
   handler: (
     args: ReadonlyArray<string>,
@@ -208,8 +294,9 @@ function mockSpawnerLayer(
           windowsVerbatimArguments?: boolean;
         };
       };
+      const unwrapped = unwrapContainedProviderCommand(cmd);
       return Effect.succeed(
-        mockHandle(handler(cmd.args, cmd.command, cmd.options?.env, cmd.options)),
+        mockHandle(handler(unwrapped.args, unwrapped.command, cmd.options?.env, unwrapped.options)),
       );
     }),
   );
@@ -263,7 +350,13 @@ function hangingSpawnerLayer(input: {
           windowsVerbatimArguments?: boolean;
         };
       };
-      return input.shouldHang(cmd.args, cmd.command, cmd.options?.env, cmd.options)
+      const unwrapped = unwrapContainedProviderCommand(cmd);
+      return input.shouldHang(
+        unwrapped.args,
+        unwrapped.command,
+        cmd.options?.env,
+        unwrapped.options,
+      )
         ? Effect.succeed(handle)
         : Effect.succeed(mockHandle({ stdout: "", stderr: "", code: 0 }));
     }),
@@ -1056,12 +1149,12 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
     it.effect("uses configured codex binary for version and auth probes", () =>
       Effect.gen(function* () {
         yield* withTempCodexHome();
-        const status = yield* makeCheckCodexProviderStatus("  /custom/bin/codex  ");
+        const status = yield* makeCheckCodexProviderStatus(`  ${configuredTestBinary("codex")}  `);
         assert.strictEqual(status.status, "ready");
       }).pipe(
         Effect.provide(
           mockSpawnerLayer((args, command) => {
-            assert.strictEqual(command, "/custom/bin/codex");
+            assert.strictEqual(command, configuredTestBinary("codex"));
             const joined = args.join(" ");
             if (joined === "--version") return { stdout: "codex 1.0.0\n", stderr: "", code: 0 };
             if (joined === "login status") return { stdout: "Logged in\n", stderr: "", code: 0 };
@@ -1074,7 +1167,26 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
     it.effect("propagates verbatim Windows arguments through the Effect command", () => {
       const platform = vi.spyOn(process, "platform", "get").mockReturnValue("win32");
       return Effect.gen(function* () {
-        yield* withTempCodexHome();
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const { tmpDir } = yield* withTempCodexHome();
+        const launcherPath = path.join(tmpDir, WINDOWS_JOB_LAUNCHER_EXECUTABLE);
+        yield* fileSystem.writeFileString(launcherPath, "");
+        yield* Effect.acquireRelease(
+          Effect.sync(() => {
+            const previous = process.env[WINDOWS_JOB_LAUNCHER_ENV];
+            process.env[WINDOWS_JOB_LAUNCHER_ENV] = launcherPath;
+            return previous;
+          }),
+          (previous) =>
+            Effect.sync(() => {
+              if (previous === undefined) {
+                delete process.env[WINDOWS_JOB_LAUNCHER_ENV];
+              } else {
+                process.env[WINDOWS_JOB_LAUNCHER_ENV] = previous;
+              }
+            }),
+        );
         const status = yield* makeCheckCodexProviderStatus("C:\\tools(x86)\\codex.cmd");
         assert.strictEqual(status.status, "ready");
       }).pipe(
@@ -1509,12 +1621,15 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
 
     it.effect("uses configured claude binary for version and auth probes", () =>
       Effect.gen(function* () {
-        const status = yield* makeCheckClaudeProviderStatus(undefined, "/custom/bin/claude");
+        const status = yield* makeCheckClaudeProviderStatus(
+          undefined,
+          configuredTestBinary("claude"),
+        );
         assert.strictEqual(status.status, "ready");
       }).pipe(
         Effect.provide(
           mockSpawnerLayer((args, command) => {
-            assert.strictEqual(command, "/custom/bin/claude");
+            assert.strictEqual(command, configuredTestBinary("claude"));
             const joined = args.join(" ");
             if (joined === "--version") return { stdout: "1.0.0\n", stderr: "", code: 0 };
             if (joined === "auth status")
@@ -1987,12 +2102,12 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
 
     it.effect("uses configured opencode binary for version probe", () =>
       Effect.gen(function* () {
-        const status = yield* makeCheckOpenCodeProviderStatus("/custom/bin/opencode");
+        const status = yield* makeCheckOpenCodeProviderStatus(configuredTestBinary("opencode"));
         assert.strictEqual(status.status, "ready");
       }).pipe(
         Effect.provide(
           mockSpawnerLayer((args, command) => {
-            assert.strictEqual(command, "/custom/bin/opencode");
+            assert.strictEqual(command, configuredTestBinary("opencode"));
             const joined = args.join(" ");
             if (joined === "--version") return { stdout: "opencode 1.3.17\n", stderr: "", code: 0 };
             throw new Error(`Unexpected args: ${joined}`);
@@ -2019,12 +2134,12 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
   describe("checkKiloProviderStatus", () => {
     it.effect("uses configured Kilo binary for version probe", () =>
       Effect.gen(function* () {
-        const status = yield* makeCheckKiloProviderStatus("/custom/bin/kilo");
+        const status = yield* makeCheckKiloProviderStatus(configuredTestBinary("kilo"));
         assert.strictEqual(status.status, "ready");
       }).pipe(
         Effect.provide(
           mockSpawnerLayer((args, command) => {
-            assert.strictEqual(command, "/custom/bin/kilo");
+            assert.strictEqual(command, configuredTestBinary("kilo"));
             const joined = args.join(" ");
             if (joined === "--version") return { stdout: "kilo 7.2.52\n", stderr: "", code: 0 };
             throw new Error(`Unexpected args: ${joined}`);
@@ -2068,7 +2183,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
 
     it.effect("uses configured Pi binary and agent dir without SDK registry reads", () =>
       Effect.gen(function* () {
-        const status = yield* checkPiProviderStatus("/tmp/pi-agent", "/custom/bin/pi");
+        const status = yield* checkPiProviderStatus("/tmp/pi-agent", configuredTestBinary("pi"));
         assert.strictEqual(status.status, "ready");
         assert.strictEqual(
           status.message,
@@ -2077,7 +2192,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
       }).pipe(
         Effect.provide(
           mockSpawnerLayer((args, command) => {
-            assert.strictEqual(command, "/custom/bin/pi");
+            assert.strictEqual(command, configuredTestBinary("pi"));
             const joined = args.join(" ");
             if (joined === "--version") return { stdout: "pi 0.74.0\n", stderr: "", code: 0 };
             throw new Error(`Unexpected args: ${joined}`);
@@ -2172,12 +2287,12 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
 
     it.effect("uses the configured Antigravity binary", () =>
       Effect.gen(function* () {
-        const status = yield* checkAntigravityProviderStatus("/custom/bin/agy");
+        const status = yield* checkAntigravityProviderStatus(configuredTestBinary("agy"));
         assert.strictEqual(status.status, "ready");
       }).pipe(
         Effect.provide(
           mockSpawnerLayer((args, command) => {
-            assert.strictEqual(command, "/custom/bin/agy");
+            assert.strictEqual(command, configuredTestBinary("agy"));
             return args.join(" ") === "--version"
               ? { stdout: "1.1.2\n", stderr: "", code: 0 }
               : { stdout: "GPT-OSS 120B (Medium)\n", stderr: "", code: 0 };
@@ -2262,12 +2377,12 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
 
     it.effect("uses configured Grok binary for version probe", () =>
       Effect.gen(function* () {
-        const status = yield* makeCheckGrokProviderStatus("/custom/bin/grok");
+        const status = yield* makeCheckGrokProviderStatus(configuredTestBinary("grok"));
         assert.strictEqual(status.status, "ready");
       }).pipe(
         Effect.provide(
           mockSpawnerLayer((args, command) => {
-            assert.strictEqual(command, "/custom/bin/grok");
+            assert.strictEqual(command, configuredTestBinary("grok"));
             const joined = args.join(" ");
             if (joined === "--version") return { stdout: "grok 0.1.0\n", stderr: "", code: 0 };
             throw new Error(`Unexpected args: ${joined}`);
@@ -2346,12 +2461,12 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
 
     it.effect("uses configured Cursor Agent binary for version probe", () =>
       Effect.gen(function* () {
-        const status = yield* makeCheckCursorProviderStatus("/custom/bin/agent");
+        const status = yield* makeCheckCursorProviderStatus(configuredTestBinary("agent"));
         assert.strictEqual(status.status, "ready");
       }).pipe(
         Effect.provide(
           mockSpawnerLayer((args, command) => {
-            assert.strictEqual(command, "/custom/bin/agent");
+            assert.strictEqual(command, configuredTestBinary("agent"));
             const joined = args.join(" ");
             if (joined === "--version") {
               return { stdout: "agent 2026.04.27\n", stderr: "", code: 0 };
@@ -2386,12 +2501,12 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
                 }
               }),
           );
-          const status = yield* makeCheckCursorProviderStatus("/custom/bin/cursor");
+          const status = yield* makeCheckCursorProviderStatus(configuredTestBinary("cursor"));
           assert.strictEqual(status.status, "ready");
         }).pipe(
           Effect.provide(
             mockSpawnerLayer((args, command) => {
-              assert.strictEqual(command, "/custom/bin/cursor");
+              assert.strictEqual(command, configuredTestBinary("cursor"));
               const joined = args.join(" ");
               if (joined === "agent --version") {
                 return { stdout: "cursor 2026.04.27\n", stderr: "", code: 0 };
@@ -2551,8 +2666,9 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
                 command: string;
                 args: ReadonlyArray<string>;
               };
-              assert.strictEqual(cmd.command, "cursor-agent");
-              const joined = cmd.args.join(" ");
+              const unwrapped = unwrapContainedProviderCommand(cmd);
+              assert.strictEqual(unwrapped.command, "cursor-agent");
+              const joined = unwrapped.args.join(" ");
               if (joined === "--version") {
                 return Effect.succeed(
                   mockHandle({ stdout: "agent 2026.04.27\n", stderr: "", code: 0 }),

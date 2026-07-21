@@ -75,4 +75,34 @@ describe("WebSocket compatibility bootstrap", () => {
       action: "update-server",
     });
   });
+
+  it("rejects both mixed-version directions across the sequenced-terminal boundary", async () => {
+    const oldClient = await Effect.runPromise(
+      negotiateWsCompatibility({
+        protocolEpoch: WS_PROTOCOL_EPOCH,
+        minRevision: 1,
+        maxRevision: 1,
+        clientBuild: "revision-1-client",
+        requiredCapabilities: [],
+      }).pipe(Effect.flip),
+    );
+    expect(oldClient).toMatchObject({
+      code: "WS_PROTOCOL_INCOMPATIBLE",
+      action: "update-client",
+    });
+
+    const futureClient = await Effect.runPromise(
+      negotiateWsCompatibility({
+        protocolEpoch: WS_PROTOCOL_EPOCH,
+        minRevision: WS_PROTOCOL_MAX_REVISION + 1,
+        maxRevision: WS_PROTOCOL_MAX_REVISION + 1,
+        clientBuild: "future-client",
+        requiredCapabilities: [],
+      }).pipe(Effect.flip),
+    );
+    expect(futureClient).toMatchObject({
+      code: "WS_PROTOCOL_INCOMPATIBLE",
+      action: "update-server",
+    });
+  });
 });

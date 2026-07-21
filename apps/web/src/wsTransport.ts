@@ -16,6 +16,7 @@ import {
   WS_PROTOCOL_MIN_REVISION,
   WS_SERVER_CAPABILITIES,
   WS_METHODS,
+  TERMINAL_RESNAPSHOT_REQUIRED_CODE,
   WsBootstrapRpcGroup,
   WsCompatibilityError,
   WsFeatureRpcGroup,
@@ -33,6 +34,8 @@ import {
   type ServerProviderStatusesUpdatedPayload,
   type ServerSettingsUpdatedPayload,
   type TerminalEvent,
+  type TerminalEventStreamItem,
+  type TerminalEventStreamReady,
   type WorkspaceCloneProgressEvent,
   type WorkspaceCloneRepositoryResult,
   type WsPush,
@@ -45,7 +48,7 @@ import { RpcClient, RpcSerialization } from "effect/unstable/rpc";
 import * as Socket from "effect/unstable/socket/Socket";
 
 import { APP_VERSION } from "./branding";
-import type { WsTransportState } from "./wsTransportEvents";
+import { emitTerminalResnapshotRequired, type WsTransportState } from "./wsTransportEvents";
 
 type PushListener<C extends WsPushChannel> = (message: WsPushMessage<C>) => void;
 
@@ -249,6 +252,7 @@ const STREAM_ADMISSION_ERROR_CODES = new Set([
   "WS_NEGOTIATION_REQUIRED",
   "WS_PROTOCOL_INCOMPATIBLE",
   "WS_CAPABILITIES_INCOMPATIBLE",
+  TERMINAL_RESNAPSHOT_REQUIRED_CODE,
 ]);
 const TERMINAL_COMPATIBILITY_ERROR_CODES = new Set([
   "WS_NEGOTIATION_REQUIRED",
@@ -279,6 +283,38 @@ export function shouldReconnectAfterStreamFailure(cause: Cause.Cause<unknown>): 
     const code = "code" in error ? error.code : undefined;
     return typeof code === "string" && STREAM_ADMISSION_ERROR_CODES.has(code);
   });
+}
+
+export function isTerminalResnapshotRequiredFailure(cause: Cause.Cause<unknown>): boolean {
+  return cause.reasons.some((reason) => {
+    if (!Cause.isFailReason(reason)) return false;
+    const error = reason.error;
+    return (
+      typeof error === "object" &&
+      error !== null &&
+      "code" in error &&
+      error.code === TERMINAL_RESNAPSHOT_REQUIRED_CODE
+    );
+  });
+}
+
+export function handleTerminalResnapshotRequiredFailure(
+  cause: Cause.Cause<unknown>,
+  restartStream: () => void | Promise<void>,
+  notifyRuntimes: () => void = emitTerminalResnapshotRequired,
+): boolean {
+  if (!isTerminalResnapshotRequiredFailure(cause)) return false;
+
+  // Reattach the stream before asking terminal runtimes for authoritative
+  // snapshots, so bytes emitted after terminal.open returns have a live sink.
+  let restarted: void | Promise<void>;
+  try {
+    restarted = restartStream();
+  } catch {
+    return true;
+  }
+  void Promise.resolve(restarted).then(notifyRuntimes, () => undefined);
+  return true;
 }
 
 function omitNullUserInputAnswers(input: unknown): unknown {
@@ -372,6 +408,15 @@ export class WsTransport {
   private reconnectFailures = 0;
   private readonly streamCleanups = new Map<string, () => void>();
   private readonly streamSettled = new Map<string, Promise<void>>();
+  private terminalEventStreamReady: {
+    readonly promise: Promise<TerminalEventStreamReady>;
+    readonly resolve: (ready: TerminalEventStreamReady) => void;
+    readonly reject: (error: unknown) => void;
+  } | null = null;
+  // Terminal readiness is a transport-lifetime contract: once a runtime can
+  // open or snapshot a terminal, its event stream must survive temporary gaps
+  // in ordinary push listeners until the transport itself is disposed.
+  private terminalEventStreamRequired = false;
   private shellSubscription: ShellSubscriptionResumeState | null = null;
   private readonly threadSubscriptions = new Map<string, unknown>();
   private compatibility: WsBootstrapNegotiateResult | null = null;
@@ -485,7 +530,7 @@ export class WsTransport {
     if (!channelListeners) {
       channelListeners = new Set<(message: WsPush) => void>();
       this.listeners.set(channel, channelListeners);
-      this.startChannelStream(channel);
+      void this.startChannelStream(channel);
     }
 
     const wrappedListener = (message: WsPush) => listener(message as WsPushMessage<C>);
@@ -503,6 +548,16 @@ export class WsTransport {
         this.stopChannelStream(channel);
       }
     };
+  }
+
+  waitForTerminalEventStreamReady(): Promise<TerminalEventStreamReady> {
+    if (this.disposed) return Promise.reject(new Error("Transport disposed"));
+    this.terminalEventStreamRequired = true;
+    const ready = this.ensureTerminalEventStreamReady();
+    if (!this.streamCleanups.has("terminal.events")) {
+      void this.startChannelStream(WS_CHANNELS.terminalEvent);
+    }
+    return ready.promise;
   }
 
   getLatestPush<C extends WsPushChannel>(channel: C): WsPushMessage<C> | null {
@@ -546,6 +601,8 @@ export class WsTransport {
   async dispose(): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
+    this.terminalEventStreamRequired = false;
+    this.invalidateTerminalEventStreamReady(new Error("Transport disposed"));
     this.setState("disposed");
     for (const cleanup of this.streamCleanups.values()) cleanup();
     this.streamCleanups.clear();
@@ -650,6 +707,7 @@ export class WsTransport {
 
     const oldRuntime = this.runtime;
     const oldClientScope = this.clientScope;
+    this.invalidateTerminalEventStreamReady(new Error("Terminal event stream reconnecting"));
     for (const cleanup of this.streamCleanups.values()) cleanup();
     this.streamCleanups.clear();
 
@@ -708,7 +766,10 @@ export class WsTransport {
     const client = await session.clientPromise;
     this.reconnectFailures = 0;
     for (const channel of this.listeners.keys()) {
-      this.startChannelStream(channel as WsPushChannel);
+      void this.startChannelStream(channel as WsPushChannel);
+    }
+    if (this.terminalEventStreamRequired && !this.listeners.has(WS_CHANNELS.terminalEvent)) {
+      void this.startChannelStream(WS_CHANNELS.terminalEvent);
     }
     if (this.shellSubscription !== null) {
       this.startShellStream(client);
@@ -738,13 +799,15 @@ export class WsTransport {
     }
   }
 
-  private startChannelStream(channel: WsPushChannel): void {
-    void this.getClient()
+  private startChannelStream(channel: WsPushChannel): Promise<void> {
+    return this.getClient()
       .then((client) => {
+        if (this.disposed || !this.shouldKeepChannelStream(channel)) return;
         const restartChannel = () => {
-          if (this.listeners.has(channel)) {
-            this.startChannelStream(channel);
+          if (this.shouldKeepChannelStream(channel)) {
+            return this.startChannelStream(channel);
           }
+          return Promise.resolve();
         };
 
         if (isServerLifecyclePushChannel(channel)) {
@@ -779,13 +842,29 @@ export class WsTransport {
             restartChannel,
           );
         } else if (channel === WS_CHANNELS.terminalEvent) {
+          const ready = this.ensureTerminalEventStreamReady();
           this.startStream(
             client,
             "terminal.events",
             client[WS_METHODS.subscribeTerminalEvents]({}),
-            (event: TerminalEvent) => this.emit(WS_CHANNELS.terminalEvent, event),
+            (item: TerminalEventStreamItem) => {
+              if (item.type === "ready") {
+                ready.resolve(item);
+                return;
+              }
+              this.emit(WS_CHANNELS.terminalEvent, item);
+            },
             restartChannel,
+            (cause) => handleTerminalResnapshotRequiredFailure(cause, restartChannel),
+            () => {
+              if (this.terminalEventStreamReady === ready) {
+                this.invalidateTerminalEventStreamReady(
+                  new Error("Terminal event stream ended before recovery completed"),
+                );
+              }
+            },
           );
+          return ready.promise.then(() => undefined);
         } else if (channel === WS_CHANNELS.projectDevServerEvent) {
           this.startStream(
             client,
@@ -813,13 +892,19 @@ export class WsTransport {
         }
       })
       .catch((error) => {
+        if (channel === WS_CHANNELS.terminalEvent && isTerminalCompatibilityFailure(error)) {
+          this.invalidateTerminalEventStreamReady(error);
+          return;
+        }
         if (
           !this.disposed &&
-          this.listeners.has(channel) &&
+          this.shouldKeepChannelStream(channel) &&
           !isTerminalCompatibilityFailure(error)
         ) {
           console.warn("WebSocket RPC channel failed to start", error);
-          window.setTimeout(() => this.startChannelStream(channel), 500);
+          return new Promise<void>((resolve) => window.setTimeout(resolve, 500)).then(() =>
+            this.startChannelStream(channel),
+          );
         }
       });
   }
@@ -831,8 +916,11 @@ export class WsTransport {
     else if (channel === WS_CHANNELS.serverProviderStatusesUpdated)
       this.stopStream("server.providers");
     else if (channel === WS_CHANNELS.serverSettingsUpdated) this.stopStream("server.settings");
-    else if (channel === WS_CHANNELS.terminalEvent) this.stopStream("terminal.events");
-    else if (channel === WS_CHANNELS.projectDevServerEvent) this.stopStream("project.devServers");
+    else if (channel === WS_CHANNELS.terminalEvent) {
+      if (this.shouldKeepChannelStream(channel)) return;
+      this.invalidateTerminalEventStreamReady(new Error("Terminal event stream stopped"));
+      this.stopStream("terminal.events");
+    } else if (channel === WS_CHANNELS.projectDevServerEvent) this.stopStream("project.devServers");
     else if (channel === WS_CHANNELS.automationEvent) this.stopStream("automation.events");
     else if (channel === ORCHESTRATION_WS_CHANNELS.domainEvent)
       this.stopStream("orchestration.domain");
@@ -840,6 +928,13 @@ export class WsTransport {
 
   private shouldKeepLifecycleStream(): boolean {
     return shouldKeepServerLifecycleStream(new Set(this.listeners.keys()));
+  }
+
+  private shouldKeepChannelStream(channel: WsPushChannel): boolean {
+    return (
+      this.listeners.has(channel) ||
+      (channel === WS_CHANNELS.terminalEvent && this.terminalEventStreamRequired)
+    );
   }
 
   private startLifecycleStream(client: RpcClientInstance): void {
@@ -924,7 +1019,9 @@ export class WsTransport {
     key: string,
     stream: unknown,
     listener: (event: T) => void,
-    restart?: (() => void) | undefined,
+    restart?: (() => void | Promise<void>) | undefined,
+    handleFailure?: ((cause: Cause.Cause<unknown>) => boolean) | undefined,
+    onExit?: (() => void) | undefined,
   ): void {
     if (this.streamCleanups.has(key)) return;
     const runnableStream = stream as Stream.Stream<T, WsTransportRpcError, never>;
@@ -944,7 +1041,11 @@ export class WsTransport {
           if (!wasReplacedOrStopped) {
             this.streamCleanups.delete(key);
           }
+          onExit?.();
           if (wasReplacedOrStopped || this.disposed) {
+            return;
+          }
+          if (Exit.isFailure(exit) && handleFailure?.(exit.cause)) {
             return;
           }
           if (restart && Exit.isFailure(exit) && shouldReconnectAfterStreamFailure(exit.cause)) {
@@ -981,6 +1082,25 @@ export class WsTransport {
     this.streamCleanups.delete(key);
     cleanup();
     return settled;
+  }
+
+  private ensureTerminalEventStreamReady() {
+    if (this.terminalEventStreamReady) return this.terminalEventStreamReady;
+    let resolve!: (ready: TerminalEventStreamReady) => void;
+    let reject!: (error: unknown) => void;
+    const promise = new Promise<TerminalEventStreamReady>((resolveReady, rejectReady) => {
+      resolve = resolveReady;
+      reject = rejectReady;
+    });
+    void promise.catch(() => undefined);
+    this.terminalEventStreamReady = { promise, resolve, reject };
+    return this.terminalEventStreamReady;
+  }
+
+  private invalidateTerminalEventStreamReady(error: unknown): void {
+    const ready = this.terminalEventStreamReady;
+    this.terminalEventStreamReady = null;
+    ready?.reject(error);
   }
 
   private async runGitActionStream(

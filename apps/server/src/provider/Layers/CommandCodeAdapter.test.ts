@@ -9,7 +9,7 @@ import { it, assert, describe, vi } from "@effect/vitest";
 import { Effect, Fiber, Layer, Stream } from "effect";
 
 import { ServerConfig } from "../../config.ts";
-import { ProviderAdapterValidationError } from "../Errors.ts";
+import { ProviderAdapterProcessError, ProviderAdapterValidationError } from "../Errors.ts";
 import { CommandCodeAdapter } from "../Services/CommandCodeAdapter.ts";
 import {
   buildCommandCodeTurnArgs,
@@ -21,6 +21,8 @@ import {
 
 type SpawnProcess = NonNullable<CommandCodeAdapterLiveOptions["spawnProcess"]>;
 type SpawnProcessMock = ReturnType<typeof vi.fn<SpawnProcess>>;
+type PrepareProcess = NonNullable<CommandCodeAdapterLiveOptions["prepareProcess"]>;
+type PrepareProcessMock = ReturnType<typeof vi.fn<PrepareProcess>>;
 
 interface MockChild {
   readonly child: ChildProcess;
@@ -64,6 +66,7 @@ function makeMockChild(): MockChild {
 function adapterLayer(input: {
   readonly child: MockChild;
   readonly spawnProcess?: SpawnProcessMock;
+  readonly prepareProcess?: PrepareProcessMock;
   readonly teardownProcessTree?: (child: ChildProcess) => Promise<unknown>;
   readonly resolveExecutable?: (command: string) => string;
 }) {
@@ -72,6 +75,7 @@ function adapterLayer(input: {
     spawnProcess,
     layer: makeCommandCodeAdapterLive({
       spawnProcess,
+      prepareProcess: input.prepareProcess ?? prepareWindowsSafeProcess,
       teardownProcessTree:
         input.teardownProcessTree ??
         (async () => {
@@ -195,6 +199,9 @@ it.effect("spawns only on send, uses Windows-safe argv, resumes, and projects fi
       const resumedMock = makeMockChild();
       const children = [mock, resumedMock];
       const spawnProcess = vi.fn<SpawnProcess>(() => children.shift()!.child);
+      const prepareProcess = vi.fn<PrepareProcess>((command, args, options) =>
+        prepareWindowsSafeProcess(command, args, options),
+      );
       const teardownProcessTree = async (child: ChildProcess) => {
         if (child === mock.child && mock.child.exitCode === null) mock.close(130);
         if (child === resumedMock.child && resumedMock.child.exitCode === null) {
@@ -204,6 +211,7 @@ it.effect("spawns only on send, uses Windows-safe argv, resumes, and projects fi
       const { layer } = adapterLayer({
         child: mock,
         spawnProcess,
+        prepareProcess,
         teardownProcessTree,
       });
       const threadId = ThreadId.makeUnsafe("command-code-thread");
@@ -219,6 +227,7 @@ it.effect("spawns only on send, uses Windows-safe argv, resumes, and projects fi
         mock.stdin.on("data", (chunk) => (stdin += chunk.toString()));
         const turn = yield* adapter.sendTurn({ threadId, input: "hello" });
         assert.strictEqual(spawnProcess.mock.calls.length, 1);
+        assert.strictEqual(prepareProcess.mock.calls.length, 1);
         assert.strictEqual(stdin, "hello");
         const [command, args, options] = spawnProcess.mock.calls[0]!;
         assert.strictEqual(options.shell, false);
@@ -267,6 +276,7 @@ it.effect("spawns only on send, uses Windows-safe argv, resumes, and projects fi
         resumedMock.stdin.on("data", (chunk) => (resumedStdin += chunk.toString()));
         yield* adapter.sendTurn({ threadId, input: "follow-up prompt" });
         assert.strictEqual(spawnProcess.mock.calls.length, 2);
+        assert.strictEqual(prepareProcess.mock.calls.length, 2);
         assert.strictEqual(resumedStdin, "follow-up prompt");
         const resumedArgs = spawnProcess.mock.calls[1]![1] as ReadonlyArray<string>;
         const resumedArgv =
@@ -276,6 +286,60 @@ it.effect("spawns only on send, uses Windows-safe argv, resumes, and projects fi
         resumedMock.close(0);
       });
       yield* program.pipe(Effect.provide(layer));
+    }),
+  ),
+);
+
+it.effect("treats the prepared process command as authoritative for turn launches", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const mock = makeMockChild();
+      const prepareProcess = vi.fn<PrepareProcess>((command, args) => ({
+        command: "C:\\tools\\synara-windows-job-launcher.exe",
+        args: ["--contained", command, ...args],
+        shell: false,
+        windowsHide: true,
+      }));
+      const { layer, spawnProcess } = adapterLayer({ child: mock, prepareProcess });
+      const threadId = ThreadId.makeUnsafe("command-code-contained-turn");
+
+      yield* Effect.gen(function* () {
+        const adapter = yield* CommandCodeAdapter;
+        yield* adapter.startSession(startInput(threadId));
+        yield* adapter.sendTurn({ threadId, input: "contained prompt" });
+        const [command, args, options] = spawnProcess.mock.calls[0]!;
+        assert.strictEqual(command, "C:\\tools\\synara-windows-job-launcher.exe");
+        assert.strictEqual(args[0], "--contained");
+        assert.strictEqual(args[1], "C:\\tools\\commandcode.cmd");
+        assert.strictEqual(options.shell, false);
+        assert.strictEqual(options.windowsHide, true);
+        mock.close(0);
+      }).pipe(Effect.provide(layer));
+    }),
+  ),
+);
+
+it.effect("maps synchronous process preparation failures to ProviderAdapterProcessError", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const mock = makeMockChild();
+      const prepareProcess = vi.fn<PrepareProcess>(() => {
+        throw new Error("containment helper is unavailable");
+      });
+      const { layer, spawnProcess } = adapterLayer({ child: mock, prepareProcess });
+      const threadId = ThreadId.makeUnsafe("command-code-prepare-failure");
+
+      yield* Effect.gen(function* () {
+        const adapter = yield* CommandCodeAdapter;
+        yield* adapter.startSession(startInput(threadId));
+        const failure = yield* adapter
+          .sendTurn({ threadId, input: "must stay contained" })
+          .pipe(Effect.flip);
+        assert.ok(failure instanceof ProviderAdapterProcessError);
+        assert.strictEqual(failure.threadId, threadId);
+        assert.match(failure.detail, /containment helper is unavailable/u);
+        assert.strictEqual(spawnProcess.mock.calls.length, 0);
+      }).pipe(Effect.provide(layer));
     }),
   ),
 );
@@ -342,7 +406,13 @@ it.effect("discovers models through the mocked CLI without a vendor call", () =>
   Effect.scoped(
     Effect.gen(function* () {
       const mock = makeMockChild();
-      const { layer, spawnProcess } = adapterLayer({ child: mock });
+      const prepareProcess = vi.fn<PrepareProcess>((command, args) => ({
+        command: "C:\\tools\\synara-windows-job-launcher.exe",
+        args: ["--contained", command, ...args],
+        shell: false,
+        windowsHide: true,
+      }));
+      const { layer, spawnProcess } = adapterLayer({ child: mock, prepareProcess });
       const result = yield* Effect.gen(function* () {
         const adapter = yield* CommandCodeAdapter;
         const fiber = yield* adapter.listModels!({
@@ -359,6 +429,16 @@ it.effect("discovers models through the mocked CLI without a vendor call", () =>
         ["gpt-5.6-sol"],
       );
       assert.strictEqual(result.source, "command-code.cli");
+      assert.strictEqual(prepareProcess.mock.calls.length, 1);
+      assert.deepStrictEqual(prepareProcess.mock.calls[0]?.[1], ["--list-models"]);
+      assert.strictEqual(
+        spawnProcess.mock.calls[0]?.[0],
+        "C:\\tools\\synara-windows-job-launcher.exe",
+      );
+      assert.deepStrictEqual(spawnProcess.mock.calls[0]?.[1].slice(0, 2), [
+        "--contained",
+        "C:\\tools\\commandcode.cmd",
+      ]);
       assert.match(
         (spawnProcess.mock.calls[0]?.[1] as ReadonlyArray<string>).join(" "),
         /--list-models/u,

@@ -19,12 +19,25 @@ import {
   findProjectDevServerForLocalServer,
   requireActiveProjectForDevServer,
 } from "./devServerManager";
-import { TerminalManager, type TerminalManagerShape } from "./terminal/Services/Manager";
+import {
+  TerminalError,
+  TerminalManager,
+  type TerminalManagerShape,
+} from "./terminal/Services/Manager";
 
 function makeTerminalManager(): TerminalManagerShape {
-  const snapshot = (input: { readonly threadId: string; readonly cwd: string }) => ({
+  const generation = "dev-server-manager-test-generation";
+  const sessionKey = (input: {
+    readonly threadId: string;
+    readonly terminalId?: string | undefined;
+  }) => `${input.threadId}\0${input.terminalId ?? DEFAULT_TERMINAL_ID}`;
+  const makeSnapshot = (input: {
+    readonly threadId: string;
+    readonly terminalId?: string | undefined;
+    readonly cwd: string;
+  }) => ({
     threadId: input.threadId,
-    terminalId: DEFAULT_TERMINAL_ID,
+    terminalId: input.terminalId ?? DEFAULT_TERMINAL_ID,
     cwd: input.cwd,
     status: "running" as const,
     pid: 4242,
@@ -33,14 +46,37 @@ function makeTerminalManager(): TerminalManagerShape {
     exitSignal: null,
     updatedAt: "2026-07-20T12:00:00.000Z",
   });
+  const sessions = new Map<string, ReturnType<typeof makeSnapshot>>();
+  const open = (input: Parameters<TerminalManagerShape["open"]>[0]) =>
+    Effect.sync(() => {
+      const snapshot = makeSnapshot(input);
+      sessions.set(sessionKey(input), snapshot);
+      return snapshot;
+    });
   return {
-    open: (input) => Effect.succeed(snapshot(input)),
+    generation,
+    open,
+    snapshot: (input) => {
+      const snapshot = sessions.get(sessionKey(input));
+      return snapshot
+        ? Effect.succeed({ snapshot, generation, watermark: 0 })
+        : Effect.fail(new TerminalError({ message: "Terminal session not found" }));
+    },
     write: () => Effect.void,
     ackOutput: () => Effect.void,
     resize: () => Effect.void,
     clear: () => Effect.void,
-    restart: (input) => Effect.succeed(snapshot(input)),
-    close: () => Effect.void,
+    restart: open,
+    close: (input) =>
+      Effect.sync(() => {
+        if (input.terminalId) {
+          sessions.delete(sessionKey(input));
+          return;
+        }
+        for (const [key, snapshot] of sessions) {
+          if (snapshot.threadId === input.threadId) sessions.delete(key);
+        }
+      }),
     subscribe: () => Effect.succeed(() => undefined),
     dispose: Effect.void,
   };

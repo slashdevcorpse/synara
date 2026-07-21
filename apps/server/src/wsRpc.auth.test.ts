@@ -107,6 +107,64 @@ it.effect("preserves the legacy query token for loopback desktop sessions", () =
   }),
 );
 
+it.effect("requires a real session when loopback authentication is hardened", () =>
+  Effect.gen(function* () {
+    const authenticatedSession = {
+      sessionId: "hardened-loopback-session" as never,
+      subject: "owner-bootstrap",
+      method: "browser-session-cookie" as const,
+      role: "owner" as const,
+    };
+    const authenticateWebSocketUpgrade = vi.fn(() => Effect.succeed(authenticatedSession));
+
+    const session = yield* authenticateRpcWebSocketUpgrade({
+      config: {
+        host: "127.0.0.1",
+        authToken: "desktop-secret",
+        publicUrl: undefined,
+        allowUnauthenticatedLoopback: false,
+      },
+      legacyToken: "desktop-secret",
+      request: {
+        headers: {},
+        cookies: { synara_session: "paired-session-credential" },
+        url: new URL("http://127.0.0.1:3773/ws?token=desktop-secret"),
+      },
+      serverAuth: { authenticateWebSocketUpgrade },
+    });
+
+    assert.equal(session, authenticatedSession);
+    assert.equal(authenticateWebSocketUpgrade.mock.calls.length, 1);
+  }),
+);
+
+it.effect("keeps explicit unauthenticated loopback compatibility without a configured token", () =>
+  Effect.gen(function* () {
+    const authenticateWebSocketUpgrade = vi.fn(() =>
+      Effect.fail(new AuthError({ message: "Unexpected authentication call.", status: 500 })),
+    );
+
+    const session = yield* authenticateRpcWebSocketUpgrade({
+      config: {
+        host: "127.0.0.1",
+        authToken: undefined,
+        publicUrl: undefined,
+        allowUnauthenticatedLoopback: true,
+      },
+      legacyToken: null,
+      request: {
+        headers: {},
+        cookies: {},
+        url: new URL("http://127.0.0.1:3773/ws"),
+      },
+      serverAuth: { authenticateWebSocketUpgrade },
+    });
+
+    assert.equal(session, null);
+    assert.equal(authenticateWebSocketUpgrade.mock.calls.length, 0);
+  }),
+);
+
 it.effect(
   "disables the legacy loopback query token when an HTTPS public origin is configured",
   () =>
