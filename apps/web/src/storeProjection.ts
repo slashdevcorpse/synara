@@ -12,6 +12,7 @@ import {
 } from "@synara/contracts";
 import { deriveThreadSummaryMetadata } from "@synara/shared/threadSummary";
 
+import { isActiveReadModelProject } from "./projectVisibility";
 import { getThreadFromState, getThreadsFromState } from "./threadDerivation";
 import {
   capThreadActivities,
@@ -764,7 +765,7 @@ export function syncServerShellSnapshot(
   const snapshotProjects = snapshot.projects.filter(
     (project) => deletedProjectIdsById[project.id] !== true,
   );
-  const projects = mapProjects(snapshotProjects, state.projects);
+  const projects = mapProjects(snapshotProjects, state.projects, snapshot.snapshotSequence);
   const nextThreadIds = new Set(snapshotThreads.map((thread) => thread.id));
 
   let normalizedState: AppState = {
@@ -843,8 +844,13 @@ function syncServerThreadDetailWithOptions(
   );
 }
 
+function mayAcceptThreadForProject(state: AppState, projectId: Project["id"]): boolean {
+  return !state.threadsHydrated || state.projects.some((project) => project.id === projectId);
+}
+
 export function syncServerThreadDetail(state: AppState, thread: ReadModelThread): AppState {
   if (
+    !mayAcceptThreadForProject(state, thread.projectId) ||
     state.deletedProjectIdsById?.[thread.projectId] === true ||
     state.deletedThreadIdsById?.[thread.id] === true
   ) {
@@ -855,6 +861,7 @@ export function syncServerThreadDetail(state: AppState, thread: ReadModelThread)
 
 export function syncServerThreadDetailHotPath(state: AppState, thread: ReadModelThread): AppState {
   if (
+    !mayAcceptThreadForProject(state, thread.projectId) ||
     state.deletedProjectIdsById?.[thread.projectId] === true ||
     state.deletedThreadIdsById?.[thread.id] === true
   ) {
@@ -866,11 +873,16 @@ export function syncServerThreadDetailHotPath(state: AppState, thread: ReadModel
 export function applyShellEvent(state: AppState, event: OrchestrationShellStreamEvent): AppState {
   switch (event.kind) {
     case "project-upserted":
-      return upsertProject(state, event.project, "id-or-cwd");
+      return upsertProject(
+        state,
+        { ...event.project, serverSequence: event.sequence },
+        "id-or-cwd",
+      );
     case "project-removed":
       return removeDeletedProjectFromClientState(state, event.projectId);
     case "thread-upserted": {
       if (
+        !mayAcceptThreadForProject(state, event.thread.projectId) ||
         state.deletedProjectIdsById?.[event.thread.projectId] === true ||
         state.deletedThreadIdsById?.[event.thread.id] === true
       ) {
@@ -885,6 +897,9 @@ export function applyShellEvent(state: AppState, event: OrchestrationShellStream
     case "thread-removed":
       // Shell removals can be retryable draft rollbacks; explicit delete reconciliation owns tombstones.
       return removeThreadState(state, event.threadId);
+    case "snapshot-invalidated":
+      // EventRouter owns the cursor-safe resnapshot. Never interpret visibility changes as deletion.
+      return state;
   }
 }
 
@@ -893,16 +908,16 @@ export function syncServerReadModel(state: AppState, readModel: OrchestrationRea
   rememberProjectLocalNames(state.projects);
   const deletedProjectIdsById = state.deletedProjectIdsById ?? {};
   const deletedThreadIdsById = state.deletedThreadIdsById ?? {};
-  const projects = mapProjects(
-    readModel.projects.filter(
-      (project) => project.deletedAt === null && deletedProjectIdsById[project.id] !== true,
-    ),
-    state.projects,
+  const activeProjects = readModel.projects.filter(
+    (project) => isActiveReadModelProject(project) && deletedProjectIdsById[project.id] !== true,
   );
+  const activeProjectIds = new Set(activeProjects.map((project) => project.id));
+  const projects = mapProjects(activeProjects, state.projects, readModel.snapshotSequence);
   const nextThreads = readModel.threads
     .filter(
       (thread) =>
         thread.deletedAt === null &&
+        activeProjectIds.has(thread.projectId) &&
         deletedProjectIdsById[thread.projectId] !== true &&
         deletedThreadIdsById[thread.id] !== true,
     )

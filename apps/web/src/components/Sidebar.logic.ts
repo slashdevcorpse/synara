@@ -1046,18 +1046,6 @@ export function isLatestPinnedThreadMutation<T>(input: {
   });
 }
 
-export function isLatestPinnedProjectMutation<T>(input: {
-  readonly projectId: T;
-  readonly requestVersion: number;
-  readonly latestMutationVersionByProjectId: ReadonlyMap<T, number>;
-}): boolean {
-  return isLatestPinMutation({
-    id: input.projectId,
-    requestVersion: input.requestVersion,
-    latestMutationVersionById: input.latestMutationVersionByProjectId,
-  });
-}
-
 export function derivePinnedProjectIdsForSidebar<
   T extends Pick<Project, "id" | "isPinned">,
 >(input: {

@@ -1,8 +1,9 @@
 // FILE: Sidebar.tsx
 // Purpose: Renders the project/thread sidebar, including row status, sorting, and thread actions.
-// Exports: Sidebar
+// Exports: Sidebar, workspace route classification helpers
 
 import {
+  AppsIcon,
   ArchiveIcon,
   CheckCircle2Icon,
   ChevronDownIcon,
@@ -73,7 +74,6 @@ import { CSS } from "@dnd-kit/utilities";
 import {
   type AutomationDefinition,
   type AutomationListResult,
-  MAX_PINNED_PROJECTS,
   type DesktopUpdateState,
   type OrchestrationShellSnapshot,
   PROVIDER_DISPLAY_NAMES,
@@ -278,7 +278,6 @@ import {
   getVisibleSidebarEntriesForPreview,
   groupSidebarThreadsByProjectId,
   partitionSidebarThreadsByProjectIds,
-  isLatestPinnedProjectMutation,
   pruneProjectThreadListPagingForCollapsedProjects,
   recoverExistingAddProjectTarget,
   resolvePullRequestReviewBadge,
@@ -297,7 +296,6 @@ import {
   type SidebarActionBadge,
   type SidebarView,
   shouldShowDebugFeatureFlagsMenu,
-  shouldPrunePinnedThreads,
   shouldClearThreadSelectionOnMouseDown,
   sortProjectsForSidebar,
   sortThreadsForSidebar,
@@ -343,8 +341,7 @@ import {
   useSidebarProjectRunController,
 } from "../hooks/useSidebarProjectRunController";
 import { useSidebarThreadActions } from "../hooks/useSidebarThreadActions";
-import { usePinnedProjectsStore } from "../pinnedProjectsStore";
-import { reconcileOptimisticPinState } from "../pinning.logic";
+import { useProjectPinController } from "../hooks/useProjectPinController";
 import { useThreadDetailPrewarm } from "../threadDetailPrewarm";
 import { retainThreadDetailSubscription } from "../threadDetailSubscriptionRetention";
 import { useWorkspaceStore, workspaceThreadId } from "../workspaceStore";
@@ -360,6 +357,27 @@ import {
   createOrRecoverProjectFromPath,
   PROJECT_CREATE_EXISTING_SYNC_ERROR,
 } from "../lib/projectCreation";
+
+export const WORKSPACE_DASHBOARD_PATH = "/workspace" as const;
+
+export function resolveSidebarWorkspaceRoute(pathname: string): {
+  isDashboard: boolean;
+  isTerminalWorkspace: boolean;
+} {
+  const isDashboard =
+    pathname === WORKSPACE_DASHBOARD_PATH || pathname === `${WORKSPACE_DASHBOARD_PATH}/`;
+  return {
+    isDashboard,
+    isTerminalWorkspace: !isDashboard && pathname.startsWith(`${WORKSPACE_DASHBOARD_PATH}/`),
+  };
+}
+
+export function shouldRedirectHiddenTerminalWorkspaceRoute(
+  pathname: string,
+  workspaceSectionVisible: boolean,
+): boolean {
+  return !workspaceSectionVisible && resolveSidebarWorkspaceRoute(pathname).isTerminalWorkspace;
+}
 
 const EMPTY_KEYBINDINGS: ResolvedKeybindingsConfig = [];
 const THREAD_PREVIEW_LIMIT = 5;
@@ -1213,10 +1231,6 @@ export default function Sidebar() {
   const clearProjectDraftThreads = useComposerDraftStore((store) => store.clearProjectDraftThreads);
   const draftThreadsByThreadId = useComposerDraftStore((store) => store.draftThreadsByThreadId);
   const temporaryThreadIds = useTemporaryThreadStore((store) => store.temporaryThreadIds);
-  const persistedPinnedProjectIds = usePinnedProjectsStore((store) => store.pinnedProjectIds);
-  const pinProjectLocally = usePinnedProjectsStore((store) => store.pinProject);
-  const unpinProject = usePinnedProjectsStore((store) => store.unpinProject);
-  const prunePinnedProjects = usePinnedProjectsStore((store) => store.prunePinnedProjects);
   const workspacePages = useWorkspaceStore((store) => store.workspacePages);
   const createWorkspace = useWorkspaceStore((store) => store.createWorkspace);
   const renameWorkspace = useWorkspaceStore((store) => store.renameWorkspace);
@@ -1225,13 +1239,27 @@ export default function Sidebar() {
   const homeDir = useWorkspaceStore((store) => store.homeDir);
   const chatWorkspaceRoot = useWorkspaceStore((store) => store.chatWorkspaceRoot);
   const studioWorkspaceRoot = useWorkspaceStore((store) => store.studioWorkspaceRoot);
+  const projectPinRows = useMemo(
+    () => projects.filter((project) => project.kind === "project"),
+    [projects],
+  );
+  const {
+    optimisticPinnedStateByProjectId,
+    pinnedProjectIds: persistedPinnedProjectIds,
+    toggleProjectPinned,
+  } = useProjectPinController({
+    projects: projectPinRows,
+    shouldReconcile: threadsHydrated,
+  });
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const pathname = useLocation({ select: (loc) => loc.pathname });
   const isOnSettings = useLocation({
     select: (loc) => loc.pathname === "/settings",
   });
-  const isOnWorkspace = pathname.startsWith("/workspace");
+  const workspaceRoute = resolveSidebarWorkspaceRoute(pathname);
+  const isOnWorkspaceDashboard = workspaceRoute.isDashboard;
+  const isOnTerminalWorkspace = workspaceRoute.isTerminalWorkspace;
   const isOnStudioRoute = pathname.startsWith("/studio");
   const isOnKanban = pathname.startsWith("/kanban");
   const isOnAutomations = pathname.startsWith("/automations");
@@ -1284,8 +1312,9 @@ export default function Sidebar() {
     [automationListQuery.data],
   );
   const { settings: appSettings, updateSettings } = useAppSettings();
-  // Threads is always available; Studio, Workspace, and the standalone Chats footer
-  // can be hidden independently from Settings.
+  // Projects is always available; Studio, terminal Workspace, and the standalone Chats
+  // footer can be hidden independently from Settings. The workspace dashboard remains an
+  // always-visible Projects action regardless of the terminal Workspace preference.
   const chatsSectionVisible = appSettings.showChatsSection;
   const studioSectionVisible = appSettings.showStudioSection;
   const workspaceSectionVisible = appSettings.showWorkspaceSection;
@@ -1433,15 +1462,10 @@ export default function Sidebar() {
   } | null>(null);
   const dragInProgressRef = useRef(false);
   const suppressProjectClickAfterDragRef = useRef(false);
-  const optimisticPinnedStateByProjectIdRef = useRef(new Map<ProjectId, boolean>());
-  const latestPinnedMutationVersionByProjectIdRef = useRef(new Map<ProjectId, number>());
   const [desktopUpdateState, setDesktopUpdateState] = useState<DesktopUpdateState | null>(null);
   const [renamingWorkspaceId, setRenamingWorkspaceId] = useState<string | null>(null);
   const [renamingWorkspaceTitle, setRenamingWorkspaceTitle] = useState("");
   const [installingDesktopUpdate, setInstallingDesktopUpdate] = useState(false);
-  const [optimisticPinnedStateByProjectId, setOptimisticPinnedStateByProjectId] = useState<
-    ReadonlyMap<ProjectId, boolean>
-  >(() => new Map());
   // Dedupes the manual-download fallback toast so a single failure surfaced by
   // both the click handler and the install-watchdog push only notifies once.
   const lastDesktopUpdateErrorToastSignatureRef = useRef<string | null>(null);
@@ -1680,145 +1704,6 @@ export default function Sidebar() {
   useEffect(() => {
     projectByIdRef.current = projectById;
   }, [projectById]);
-  const setOptimisticProjectPinned = useCallback((projectId: ProjectId, isPinned: boolean) => {
-    optimisticPinnedStateByProjectIdRef.current.set(projectId, isPinned);
-    setOptimisticPinnedStateByProjectId((current) => {
-      if (current.get(projectId) === isPinned) {
-        return current;
-      }
-      const next = new Map(current);
-      next.set(projectId, isPinned);
-      return next;
-    });
-  }, []);
-  const clearOptimisticProjectPinned = useCallback((projectId: ProjectId) => {
-    optimisticPinnedStateByProjectIdRef.current.delete(projectId);
-    setOptimisticPinnedStateByProjectId((current) => {
-      if (!current.has(projectId)) {
-        return current;
-      }
-      const next = new Map(current);
-      next.delete(projectId);
-      return next;
-    });
-  }, []);
-  const dispatchProjectPinnedState = useCallback(
-    async (projectId: ProjectId, isPinned: boolean) => {
-      const api = readNativeApi();
-      if (!api) return;
-      await api.orchestration.dispatchCommand({
-        type: "project.meta.update",
-        commandId: newCommandId(),
-        projectId,
-        isPinned,
-      });
-    },
-    [],
-  );
-  const setProjectPinned = useCallback(
-    async (projectId: ProjectId, isPinned: boolean) => {
-      const api = readNativeApi();
-      if (!api) return;
-      const project = projectByIdRef.current.get(projectId);
-      if (!project || project.kind !== "project") {
-        return;
-      }
-      const requestVersion =
-        (latestPinnedMutationVersionByProjectIdRef.current.get(projectId) ?? 0) + 1;
-      latestPinnedMutationVersionByProjectIdRef.current.set(projectId, requestVersion);
-
-      setOptimisticProjectPinned(projectId, isPinned);
-      if (isPinned) {
-        const accepted = pinProjectLocally(projectId);
-        if (!accepted) {
-          clearOptimisticProjectPinned(projectId);
-          toastManager.add({
-            type: "warning",
-            title: "Project pin limit reached",
-            description: `You can pin up to ${MAX_PINNED_PROJECTS} projects.`,
-          });
-          return;
-        }
-      } else {
-        unpinProject(projectId);
-      }
-
-      try {
-        await dispatchProjectPinnedState(projectId, isPinned);
-      } catch (error) {
-        if (
-          !isLatestPinnedProjectMutation({
-            projectId,
-            requestVersion,
-            latestMutationVersionByProjectId: latestPinnedMutationVersionByProjectIdRef.current,
-          })
-        ) {
-          return;
-        }
-
-        const confirmedPinned = projectByIdRef.current.get(projectId)?.isPinned === true;
-        if (confirmedPinned) {
-          pinProjectLocally(projectId);
-        } else {
-          unpinProject(projectId);
-        }
-        clearOptimisticProjectPinned(projectId);
-        throw error;
-      }
-    },
-    [
-      clearOptimisticProjectPinned,
-      dispatchProjectPinnedState,
-      pinProjectLocally,
-      setOptimisticProjectPinned,
-      unpinProject,
-    ],
-  );
-  const toggleProjectPinned = useCallback(
-    (projectId: ProjectId) => {
-      const optimisticPinned = optimisticPinnedStateByProjectIdRef.current.get(projectId);
-      const locallyPinned = usePinnedProjectsStore.getState().pinnedProjectIds.includes(projectId);
-      const serverPinned = projectByIdRef.current.get(projectId)?.isPinned === true;
-      const isPinned = optimisticPinned ?? (locallyPinned || serverPinned);
-      void setProjectPinned(projectId, !isPinned).catch((error) => {
-        console.error("Failed to update pinned project state", {
-          projectId,
-          error,
-        });
-        toastManager.add({
-          type: "error",
-          title: isPinned ? "Unable to unpin project" : "Unable to pin project",
-          description: error instanceof Error ? error.message : undefined,
-        });
-      });
-    },
-    [setProjectPinned],
-  );
-  useEffect(() => {
-    if (optimisticPinnedStateByProjectId.size === 0) {
-      return;
-    }
-
-    const serverPinnedStateByProjectId = new Map(
-      projects.map((project) => [project.id, project.isPinned === true] as const),
-    );
-    // Reconciliation drops optimistic entries the server has confirmed while syncing
-    // the mirror ref. Deferring the setState off render (async is allowed) leaves the
-    // derived pinned lists unchanged, since a confirmed entry is redundant either way.
-    const settle = window.setTimeout(() => {
-      setOptimisticPinnedStateByProjectId((current) => {
-        const reconciled = reconcileOptimisticPinState({
-          optimisticPinnedStateById: current,
-          serverPinnedStateById: serverPinnedStateByProjectId,
-        });
-        for (const projectId of reconciled.settledIds) {
-          optimisticPinnedStateByProjectIdRef.current.delete(projectId);
-        }
-        return reconciled.optimisticPinnedStateById;
-      });
-    }, 0);
-    return () => window.clearTimeout(settle);
-  }, [optimisticPinnedStateByProjectId, projects]);
   const workspaceRows = useMemo(
     () =>
       workspacePages.map((workspace) => {
@@ -2235,14 +2120,14 @@ export default function Sidebar() {
       handleSidebarViewChange("threads");
       return;
     }
-    if (isOnWorkspace && !workspaceSectionVisible) {
+    if (shouldRedirectHiddenTerminalWorkspaceRoute(pathname, workspaceSectionVisible)) {
       handleSidebarViewChange("threads");
     }
   }, [
     handleSidebarViewChange,
     isOnSettings,
     isOnStudio,
-    isOnWorkspace,
+    pathname,
     studioSectionVisible,
     workspaceSectionVisible,
   ]);
@@ -3661,13 +3546,6 @@ export default function Sidebar() {
   }, [standardProjects]);
 
   useEffect(() => {
-    if (!shouldPrunePinnedThreads({ threadsHydrated })) {
-      return;
-    }
-    prunePinnedProjects(standardProjectsBase.map((project) => project.id));
-  }, [prunePinnedProjects, standardProjectsBase, threadsHydrated]);
-
-  useEffect(() => {
     const retainedThreadIds = new Set(sidebarThreads.map((thread) => thread.id));
     const settle = window.setTimeout(() => {
       setDismissedThreadStatusKeyByThreadId((current) => {
@@ -3700,7 +3578,7 @@ export default function Sidebar() {
   ]);
 
   useEffect(() => {
-    if (isOnWorkspace || isOnSettings || routeThreadId === null) {
+    if (isOnTerminalWorkspace || isOnSettings || routeThreadId === null) {
       return;
     }
 
@@ -3720,7 +3598,7 @@ export default function Sidebar() {
       });
     }, 0);
     return () => window.clearTimeout(settle);
-  }, [isOnSettings, isOnWorkspace, routeSearch.splitViewId, routeThreadId]);
+  }, [isOnSettings, isOnTerminalWorkspace, routeSearch.splitViewId, routeThreadId]);
 
   useEffect(() => {
     if (!activeSidebarThreadId) {
@@ -5223,6 +5101,10 @@ export default function Sidebar() {
   const addProjectShortcutLabel =
     shortcutLabelForCommand(keybindings, "sidebar.addProject") ??
     (isMacPlatform(navigator.platform) ? "⇧⌘O" : "Ctrl+Shift+O");
+  const workspaceDashboardShortcutLabel = shortcutLabelForCommand(
+    keybindings,
+    "workspace.openDashboard",
+  );
   const usageSettingsShortcutLabel = shortcutLabelForCommand(keybindings, "settings.usage");
   const searchPaletteProjects: SidebarSearchProject[] = projects.map((project) => ({
     id: project.id,
@@ -5606,7 +5488,7 @@ export default function Sidebar() {
                 "threads",
                 ...(workspaceSectionVisible ? (["workspace"] as const) : []),
               ]}
-              activeView={isOnStudio ? "studio" : isOnWorkspace ? "workspace" : "threads"}
+              activeView={isOnStudio ? "studio" : isOnTerminalWorkspace ? "workspace" : "threads"}
               onSelectView={handleSidebarViewChange}
               onPrewarmView={prewarmSidebarViewTarget}
             />
@@ -5615,13 +5497,13 @@ export default function Sidebar() {
                 instead of a hard cut. The picker above stays outside the key so
                 its thumb can glide across the switch. */}
             <div
-              key={isOnWorkspace ? "workspace" : isOnStudio ? "studio" : "threads"}
+              key={isOnTerminalWorkspace ? "workspace" : isOnStudio ? "studio" : "threads"}
               className="sidebar-surface-enter"
             >
               {/* Primary sidebar actions stay limited to features we currently ship. */}
               <SidebarGroup className="px-1.5 pt-1 pb-1.5">
                 <SidebarMenu className="gap-0.5">
-                  {isOnWorkspace ? (
+                  {isOnTerminalWorkspace ? (
                     <SidebarPrimaryAction
                       icon={TerminalIcon}
                       label="New workspace"
@@ -5663,6 +5545,15 @@ export default function Sidebar() {
                         shortcutLabel={searchShortcutLabel}
                       />
                       <SidebarPrimaryAction
+                        icon={AppsIcon}
+                        label="Workspace"
+                        active={isOnWorkspaceDashboard}
+                        onClick={() => {
+                          void navigate({ to: WORKSPACE_DASHBOARD_PATH });
+                        }}
+                        shortcutLabel={workspaceDashboardShortcutLabel}
+                      />
+                      <SidebarPrimaryAction
                         icon={KanbanIcon}
                         label="Kanban"
                         active={isOnKanban}
@@ -5696,7 +5587,7 @@ export default function Sidebar() {
                 </SidebarMenu>
               </SidebarGroup>
 
-              {isOnWorkspace ? (
+              {isOnTerminalWorkspace ? (
                 <SidebarGroup className="px-1.5 pt-1 pb-1.5">
                   <div className="my-2 h-px w-full bg-border" />
                   <div className="mb-1.5 flex items-center px-2">

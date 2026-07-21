@@ -23,8 +23,10 @@ import { toProjectorDecodeError, type OrchestrationProjectorDecodeError } from "
 import {
   MessageSentPayloadSchema,
   ProjectCreatedPayload,
+  ProjectArchivedPayload,
   ProjectDeletedPayload,
   ProjectMetaUpdatedPayload,
+  ProjectUnarchivedPayload,
   ThreadArchivedPayload,
   ThreadActivityAppendedPayload,
   ThreadCreatedPayload,
@@ -310,6 +312,7 @@ export function projectEvent(
             isPinned: payload.isPinned ?? false,
             createdAt: payload.createdAt,
             updatedAt: payload.updatedAt,
+            archivedAt: null,
             deletedAt: null,
           };
 
@@ -359,6 +362,38 @@ export function projectEvent(
                   ...project,
                   deletedAt: payload.deletedAt,
                   updatedAt: payload.deletedAt,
+                }
+              : project,
+          ),
+        })),
+      );
+
+    case "project.archived":
+      return decodeForEvent(ProjectArchivedPayload, event.payload, event.type, "payload").pipe(
+        Effect.map((payload) => ({
+          ...nextBase,
+          projects: nextBase.projects.map((project) =>
+            project.id === payload.projectId
+              ? {
+                  ...project,
+                  archivedAt: payload.archivedAt,
+                  updatedAt: payload.archivedAt,
+                }
+              : project,
+          ),
+        })),
+      );
+
+    case "project.unarchived":
+      return decodeForEvent(ProjectUnarchivedPayload, event.payload, event.type, "payload").pipe(
+        Effect.map((payload) => ({
+          ...nextBase,
+          projects: nextBase.projects.map((project) =>
+            project.id === payload.projectId
+              ? {
+                  ...project,
+                  archivedAt: null,
+                  updatedAt: payload.unarchivedAt,
                 }
               : project,
           ),

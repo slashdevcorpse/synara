@@ -60,10 +60,12 @@ describe("refreshEmptyRouteRestoreSnapshot", () => {
 
   it("continues to repair when shell and full snapshots only contain projects", async () => {
     const shell = shellSnapshot({ projects: [{ id: "project-1" }] });
-    const snapshot = readModel({ projects: [{ id: "project-1" }] });
+    const snapshot = readModel({
+      projects: [{ id: "project-1", archivedAt: null, deletedAt: null }],
+    });
     const repaired = readModel({
-      projects: [{ id: "project-1" }],
-      threads: [{ id: "thread-1" }],
+      projects: [{ id: "project-1", archivedAt: null, deletedAt: null }],
+      threads: [{ id: "thread-1", projectId: "project-1" }],
     });
     const { api, orchestration } = makeApi({ shell, snapshot, repaired });
 
@@ -93,6 +95,36 @@ describe("refreshEmptyRouteRestoreSnapshot", () => {
     expect(orchestration.getSnapshot).not.toHaveBeenCalled();
     expect(orchestration.repairState).not.toHaveBeenCalled();
     expect(storeMocks.syncServerShellSnapshot).toHaveBeenCalledWith(shell);
+    expect(storeMocks.syncServerReadModel).not.toHaveBeenCalled();
+  });
+
+  it("does not treat preserved threads under archived projects as a successful restore", async () => {
+    const archivedHistory = readModel({
+      projects: [
+        {
+          id: "project-archived",
+          archivedAt: "2026-07-20T10:00:00.000Z",
+          deletedAt: null,
+        },
+      ],
+      threads: [
+        {
+          id: "thread-archived",
+          projectId: "project-archived",
+          deletedAt: null,
+        },
+      ],
+    });
+    const { api, orchestration } = makeApi({
+      shell: shellSnapshot({}),
+      snapshot: archivedHistory,
+      repaired: archivedHistory,
+    });
+
+    await expect(refreshEmptyRouteRestoreSnapshot(api)).resolves.toBe(false);
+
+    expect(orchestration.getSnapshot).toHaveBeenCalledTimes(1);
+    expect(orchestration.repairState).toHaveBeenCalledTimes(1);
     expect(storeMocks.syncServerReadModel).not.toHaveBeenCalled();
   });
 });

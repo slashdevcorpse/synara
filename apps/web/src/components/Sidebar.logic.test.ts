@@ -23,7 +23,6 @@ import {
   getSidebarThreadIdsToPrewarm,
   getRenderedThreadsForSidebarProject,
   groupSidebarThreadsByProjectId,
-  isLatestPinnedProjectMutation,
   getUnpinnedThreadsForSidebar,
   getVisibleSidebarThreadIds,
   getVisibleThreadsForProject,
@@ -992,11 +991,9 @@ describe("pin helpers", () => {
     ).toEqual([projects[2], projects[0], projects[1]]);
   });
 
-  it("rejects stale pin mutation versions so old failures cannot roll back newer clicks", () => {
+  it("rejects stale thread pin mutation versions so old failures cannot roll back newer clicks", () => {
     const threadId = "thread-1" as ThreadId;
     const latestMutationVersionByThreadId = new Map<ThreadId, number>([[threadId, 2]]);
-    const projectId = "project-1" as ProjectId;
-    const latestMutationVersionByProjectId = new Map<ProjectId, number>([[projectId, 2]]);
 
     expect(
       isLatestPinnedThreadMutation({
@@ -1010,20 +1007,6 @@ describe("pin helpers", () => {
         threadId,
         requestVersion: 2,
         latestMutationVersionByThreadId,
-      }),
-    ).toBe(true);
-    expect(
-      isLatestPinnedProjectMutation({
-        projectId,
-        requestVersion: 1,
-        latestMutationVersionByProjectId,
-      }),
-    ).toBe(false);
-    expect(
-      isLatestPinnedProjectMutation({
-        projectId,
-        requestVersion: 2,
-        latestMutationVersionByProjectId,
       }),
     ).toBe(true);
   });

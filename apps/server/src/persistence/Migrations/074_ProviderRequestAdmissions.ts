@@ -105,7 +105,7 @@ export default Effect.gen(function* () {
           ORDER BY activity.created_at DESC, activity.activity_id DESC
           LIMIT 1
         ),
-        'migration73:' || pending.interaction_kind || ':' || pending.request_id
+        'migration74:' || pending.interaction_kind || ':' || pending.request_id
       ),
       NULL,
       pending.created_at,

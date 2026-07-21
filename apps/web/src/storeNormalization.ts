@@ -45,7 +45,9 @@ export type ProjectNormalizationInput = Pick<
   | "isPinned"
   | "createdAt"
   | "updatedAt"
->;
+> & {
+  readonly serverSequence?: number | undefined;
+};
 
 export const MAX_THREAD_MESSAGES = 2_000;
 const MAX_THREAD_ACTIVITIES = 500;
@@ -305,6 +307,12 @@ export function normalizeProject(
   incoming: ProjectNormalizationInput,
   previous: Project | undefined,
 ): Project {
+  if (
+    previous?.serverSequence !== undefined &&
+    (incoming.serverSequence === undefined || incoming.serverSequence < previous.serverSequence)
+  ) {
+    return previous;
+  }
   const rememberedUiState = getRememberedProjectUiState();
   const workspaceRootKey = projectCwdKey(incoming.workspaceRoot);
   const folderName = basenameOfPath(incoming.workspaceRoot) ?? incoming.title;
@@ -315,6 +323,7 @@ export function normalizeProject(
       ? null
       : normalizeModelSelection(incoming.defaultModelSelection, previous?.defaultModelSelection);
   const scripts = normalizeProjectScripts(incoming.scripts, previous?.scripts);
+  const serverSequence = incoming.serverSequence ?? previous?.serverSequence;
   const expanded =
     previous?.expanded ??
     (rememberedUiState.expandedProjectCount > 0
@@ -333,6 +342,7 @@ export function normalizeProject(
     previous.defaultModelSelection === defaultModelSelection &&
     previous.expanded === expanded &&
     (previous.isPinned ?? false) === (incoming.isPinned ?? false) &&
+    previous.serverSequence === serverSequence &&
     previous.createdAt === incoming.createdAt &&
     previous.updatedAt === incoming.updatedAt &&
     previous.scripts === scripts
@@ -351,6 +361,7 @@ export function normalizeProject(
     defaultModelSelection,
     expanded,
     isPinned: incoming.isPinned ?? false,
+    ...(serverSequence === undefined ? {} : { serverSequence }),
     createdAt: incoming.createdAt,
     updatedAt: incoming.updatedAt,
     scripts,
@@ -1498,6 +1509,7 @@ export function normalizeThreadShellSnapshot(
 export function mapProjects(
   incoming: ReadonlyArray<ProjectNormalizationInput>,
   previous: Project[],
+  serverSequence?: number,
 ): Project[] {
   const rememberedUiState = getRememberedProjectUiState();
   const previousById = new Map(previous.map((project) => [project.id, project] as const));
@@ -1514,7 +1526,10 @@ export function mapProjects(
     .map((project) => {
       const existing =
         previousById.get(project.id) ?? previousByCwd.get(projectCwdKey(project.workspaceRoot));
-      return normalizeProject(project, existing);
+      return normalizeProject(
+        serverSequence === undefined ? project : { ...project, serverSequence },
+        existing,
+      );
     })
     .map((project, incomingIndex) => {
       const previousIndex =

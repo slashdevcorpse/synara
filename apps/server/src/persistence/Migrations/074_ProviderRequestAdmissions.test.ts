@@ -14,7 +14,7 @@ const layer = it.layer(
   ),
 );
 
-layer("073_ProviderRequestAdmissions", (it) => {
+layer("074_ProviderRequestAdmissions", (it) => {
   it.effect("hydrates unresolved v69 interactions and counts them against the hard cap", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
@@ -187,7 +187,8 @@ layer("073_ProviderRequestAdmissions", (it) => {
         [70, "AgentGatewayOperations"],
         [71, "ProjectionThreadsGatewayProvenance"],
         [72, "AgentGatewayOperationRetention"],
-        [73, "ProviderRequestAdmissions"],
+        [73, "ProjectionProjectsArchivedAt"],
+        [74, "ProviderRequestAdmissions"],
       ]);
 
       const hydrated = yield* sql<{

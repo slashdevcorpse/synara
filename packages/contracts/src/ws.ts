@@ -111,6 +111,14 @@ import {
 } from "./providerDiscovery";
 import { ProviderCompactThreadInput } from "./provider";
 import {
+  WorkspaceCloneProgressEvent,
+  WorkspaceCloneRepositoryInput,
+  WorkspaceGetCloneStatusInput,
+  WorkspaceListArchivedProjectsInput,
+  WorkspaceListGitStatesInput,
+  WorkspaceRetryCloneProjectCreationInput,
+} from "./workspace";
+import {
   PullRequestActionInput,
   PullRequestCommentInput,
   PullRequestDetailInput,
@@ -122,6 +130,13 @@ import {
 // ── WebSocket RPC Method Names ───────────────────────────────────────
 
 export const WS_METHODS = {
+  // Workspace dashboard methods
+  workspaceListArchivedProjects: "workspace.listArchivedProjects",
+  workspaceListGitStates: "workspace.listGitStates",
+  workspaceCloneRepository: "workspace.cloneRepository",
+  workspaceGetCloneStatus: "workspace.getCloneStatus",
+  workspaceRetryCloneProjectCreation: "workspace.retryCloneProjectCreation",
+
   // Project registry methods
   projectsDiscoverScripts: "projects.discoverScripts",
   projectsListDirectories: "projects.listDirectories",
@@ -244,6 +259,7 @@ export const WS_METHODS = {
 export const WS_CHANNELS = {
   automationEvent: "automation.event",
   gitActionProgress: "git.actionProgress",
+  workspaceCloneProgress: "workspace.cloneProgress",
   terminalEvent: "terminal.event",
   projectDevServerEvent: "project.devServerEvent",
   serverWelcome: "server.welcome",
@@ -266,6 +282,16 @@ const tagRequestBody = <const Tag extends string, const Fields extends Schema.St
   );
 
 const WebSocketRequestBody = Schema.Union([
+  // Workspace dashboard
+  tagRequestBody(WS_METHODS.workspaceListArchivedProjects, WorkspaceListArchivedProjectsInput),
+  tagRequestBody(WS_METHODS.workspaceListGitStates, WorkspaceListGitStatesInput),
+  tagRequestBody(WS_METHODS.workspaceCloneRepository, WorkspaceCloneRepositoryInput),
+  tagRequestBody(WS_METHODS.workspaceGetCloneStatus, WorkspaceGetCloneStatusInput),
+  tagRequestBody(
+    WS_METHODS.workspaceRetryCloneProjectCreation,
+    WorkspaceRetryCloneProjectCreationInput,
+  ),
+
   // Orchestration methods
   tagRequestBody(
     ORCHESTRATION_WS_METHODS.dispatchCommand,
@@ -434,6 +460,7 @@ export interface WsPushPayloadByChannel {
   readonly [WS_CHANNELS.serverSettingsUpdated]: typeof ServerSettingsUpdatedPayload.Type;
   readonly [WS_CHANNELS.automationEvent]: typeof AutomationStreamEvent.Type;
   readonly [WS_CHANNELS.gitActionProgress]: typeof GitActionProgressEvent.Type;
+  readonly [WS_CHANNELS.workspaceCloneProgress]: typeof WorkspaceCloneProgressEvent.Type;
   readonly [WS_CHANNELS.terminalEvent]: typeof TerminalEvent.Type;
   readonly [WS_CHANNELS.projectDevServerEvent]: typeof ProjectDevServerEvent.Type;
   readonly [ORCHESTRATION_WS_CHANNELS.domainEvent]: OrchestrationEvent;
@@ -480,6 +507,10 @@ export const WsPushGitActionProgress = makeWsPushSchema(
   WS_CHANNELS.gitActionProgress,
   GitActionProgressEvent,
 );
+export const WsPushWorkspaceCloneProgress = makeWsPushSchema(
+  WS_CHANNELS.workspaceCloneProgress,
+  WorkspaceCloneProgressEvent,
+);
 export const WsPushTerminalEvent = makeWsPushSchema(WS_CHANNELS.terminalEvent, TerminalEvent);
 export const WsPushProjectDevServerEvent = makeWsPushSchema(
   WS_CHANNELS.projectDevServerEvent,
@@ -500,6 +531,7 @@ export const WsPushOrchestrationThreadEvent = makeWsPushSchema(
 
 export const WsPushChannelSchema = Schema.Literals([
   WS_CHANNELS.gitActionProgress,
+  WS_CHANNELS.workspaceCloneProgress,
   WS_CHANNELS.serverWelcome,
   WS_CHANNELS.serverMaintenanceUpdated,
   WS_CHANNELS.serverConfigUpdated,
@@ -522,6 +554,7 @@ export const WsPush = Schema.Union([
   WsPushServerSettingsUpdated,
   WsPushAutomationEvent,
   WsPushGitActionProgress,
+  WsPushWorkspaceCloneProgress,
   WsPushTerminalEvent,
   WsPushProjectDevServerEvent,
   WsPushOrchestrationDomainEvent,

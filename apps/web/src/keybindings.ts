@@ -89,6 +89,12 @@ export const DEFAULT_SHORTCUT_FALLBACKS: ResolvedKeybindingsConfig = [
     shortcut: commandShortcut("i"),
     whenAst: whenNotTerminalFocus,
   },
+  // Best effort in a normal browser tab because browsers may reserve the close-window
+  // chord. Installed apps receive it, and the registered command remains user-rebindable.
+  {
+    command: "workspace.openDashboard",
+    shortcut: commandShortcut("w", { shiftKey: true }),
+  },
   {
     command: "chat.new",
     shortcut: commandShortcut("n"),

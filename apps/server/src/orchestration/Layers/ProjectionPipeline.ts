@@ -144,6 +144,8 @@ function extractApprovalFailureSettlementStatus(
 const PROJECT_EVENT_TYPES = new Set<OrchestrationEvent["type"]>([
   "project.created",
   "project.meta-updated",
+  "project.archived",
+  "project.unarchived",
   "project.deleted",
 ]);
 
@@ -475,6 +477,8 @@ const makeOrchestrationProjectionPipeline = Effect.gen(function* () {
   const applyProjectsProjection: ProjectorDefinition["apply"] = (event, _attachmentSideEffects) =>
     event.type === "project.created" ||
     event.type === "project.meta-updated" ||
+    event.type === "project.archived" ||
+    event.type === "project.unarchived" ||
     event.type === "project.deleted"
       ? applyProjectMetadataProjection({
           event,

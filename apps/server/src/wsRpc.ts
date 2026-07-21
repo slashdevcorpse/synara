@@ -24,6 +24,7 @@ import {
   type ServerLifecycleStreamEvent,
 } from "@synara/contracts";
 import { clamp } from "effect/Number";
+import { getDefaultModel } from "@synara/shared/model";
 import { Effect, FileSystem, Layer, Option, Path, Queue, Schema, Scope, Stream } from "effect";
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/unstable/http";
 import { RpcMiddleware, RpcSchema, RpcSerialization, RpcServer } from "effect/unstable/rpc";
@@ -47,7 +48,11 @@ import {
   ensureStudioWorkspaceInstructionsFiles,
   STUDIO_WORKSPACE_SUBDIRECTORIES,
 } from "./studioWorkspaceScaffold";
-import { DevServerManager, findProjectDevServerForLocalServer } from "./devServerManager";
+import {
+  DevServerManager,
+  findProjectDevServerForLocalServer,
+  requireActiveProjectForDevServer,
+} from "./devServerManager";
 import { makeEditorAvailability, type EditorAvailabilitySnapshot } from "./editorAvailability";
 import { GitCore, type GitCoreShape } from "./git/Services/GitCore";
 import { GitManager } from "./git/Services/GitManager";
@@ -103,12 +108,16 @@ import { makeTerminalEventStream } from "./terminal/terminalEventStream";
 import { TerminalThreadTitleTracker } from "./terminal/terminalThreadTitleTracker";
 import { WorkspaceEntries } from "./workspace/Services/WorkspaceEntries";
 import { WorkspaceFileSystem } from "./workspace/Services/WorkspaceFileSystem";
+import { WorkspaceCloneJobs } from "./workspace/cloneRepository";
+import { makeWorkspaceCloneProjectCreator } from "./workspace/cloneProjectCreation";
 import {
   logManagedWorktreeReconciliation,
   reconcileManagedWorktrees,
 } from "./workspace/managedWorktree";
+import { WorkspaceGitStates } from "./workspace/workspaceGitStates";
 import { makeWsStreamAdmission } from "./wsStreamAdmission";
 import { makeWsRequestAdmission } from "./wsRequestAdmission";
+import { isProjectVisibilityEvent } from "./wsShellVisibility";
 import { negotiateWsCompatibility, validateWsFeatureCompatibility } from "./wsCompatibility";
 import {
   requiresWebSocketAuthentication,
@@ -326,6 +335,7 @@ function isShellRelevantEvent(event: OrchestrationEvent): boolean {
   return (
     event.type === "project.created" ||
     event.type === "project.meta-updated" ||
+    isProjectVisibilityEvent(event) ||
     event.type === "project.deleted" ||
     event.type === "thread.deleted" ||
     (event.aggregateKind === "thread" && shouldPublishThreadShellForEvent(event))
@@ -388,6 +398,8 @@ const makeWsRpcHandlersLayer = () =>
       const textGeneration = yield* TextGeneration;
       const workspaceEntries = yield* WorkspaceEntries;
       const workspaceFileSystem = yield* WorkspaceFileSystem;
+      const workspaceGitStates = yield* WorkspaceGitStates;
+      const workspaceCloneJobs = yield* WorkspaceCloneJobs;
       const streamAdmission = yield* makeWsStreamAdmission;
       const editorAvailability = yield* makeEditorAvailability();
 
@@ -528,6 +540,15 @@ const makeWsRpcHandlersLayer = () =>
           );
         });
 
+      const createOrRecoverClonedProject = makeWorkspaceCloneProjectCreator({
+        basename: (workspaceRoot) => path.basename(workspaceRoot),
+        defaultCodexModel: getDefaultModel("codex"),
+        dispatchCommand: dispatchOrchestrationCommand,
+        normalizeDispatchCommand,
+        platform: process.platform,
+        projectionSnapshotQuery: projectionReadModelQuery,
+      });
+
       // Terminal-first threads are created with the generic "New terminal" placeholder.
       // The tracker buffers per-terminal input and, once a meaningful command is submitted,
       // surfaces a safe title used to auto-rename the thread on its first command.
@@ -631,6 +652,39 @@ const makeWsRpcHandlersLayer = () =>
         effect.pipe(Effect.mapError((cause) => toWsRpcError(cause, fallbackMessage)));
 
       return AdmittedWsFeatureRpcGroup.of({
+        [WS_METHODS.workspaceListArchivedProjects]: () =>
+          rpcEffect(
+            projectionReadModelQuery
+              .listArchivedProjects()
+              .pipe(Effect.map((projects) => ({ projects }))),
+            "Failed to load archived projects",
+          ),
+        [WS_METHODS.workspaceListGitStates]: (input) =>
+          rpcEffect(workspaceGitStates.list(input), "Failed to load workspace git states"),
+        [WS_METHODS.workspaceCloneRepository]: (input, { clientId }) =>
+          streamAdmission.guard(
+            clientId,
+            { key: `workspace.clone:${input.cloneId}` },
+            bufferLiveUiStream(
+              workspaceCloneJobs.cloneRepository(input, createOrRecoverClonedProject),
+              {
+                label: "workspace.clone",
+              },
+            ),
+          ),
+        [WS_METHODS.workspaceGetCloneStatus]: (input) =>
+          Effect.succeed({ job: workspaceCloneJobs.getStatus(input.cloneId) }),
+        [WS_METHODS.workspaceRetryCloneProjectCreation]: (input, { clientId }) =>
+          streamAdmission.guard(
+            clientId,
+            { key: `workspace.clone-project:${input.cloneId}` },
+            bufferLiveUiStream(
+              workspaceCloneJobs.retryProjectCreation(input.cloneId, createOrRecoverClonedProject),
+              {
+                label: "workspace.clone-project",
+              },
+            ),
+          ),
         [ORCHESTRATION_WS_METHODS.dispatchCommand]: (command) =>
           rpcEffect(
             Effect.gen(function* () {
@@ -906,7 +960,15 @@ const makeWsRpcHandlersLayer = () =>
         [WS_METHODS.projectsWriteFile]: (input) =>
           rpcEffect(workspaceFileSystem.writeFile(input), "Failed to write workspace file"),
         [WS_METHODS.projectsRunDevServer]: (input) =>
-          rpcEffect(devServerManager.run(input), "Failed to start dev server"),
+          rpcEffect(
+            projectionReadModelQuery.getProjectShellById(input.projectId).pipe(
+              Effect.flatMap((project) =>
+                requireActiveProjectForDevServer({ projectId: input.projectId, project }),
+              ),
+              Effect.andThen(devServerManager.run(input)),
+            ),
+            "Failed to start dev server",
+          ),
         [WS_METHODS.projectsStopDevServer]: (input) =>
           rpcEffect(devServerManager.stop(input), "Failed to stop dev server"),
         [WS_METHODS.projectsListDevServers]: () =>

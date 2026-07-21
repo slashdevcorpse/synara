@@ -399,6 +399,9 @@ export const OrchestrationProject = Schema.Struct({
   isPinned: Schema.optional(Schema.Boolean).pipe(Schema.withDecodingDefault(() => false)),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
+  archivedAt: Schema.optional(Schema.NullOr(IsoDateTime)).pipe(
+    Schema.withDecodingDefault(() => null),
+  ),
   deletedAt: Schema.NullOr(IsoDateTime),
 });
 export type OrchestrationProject = typeof OrchestrationProject.Type;
@@ -413,8 +416,28 @@ export const OrchestrationProjectShell = Schema.Struct({
   isPinned: Schema.optional(Schema.Boolean).pipe(Schema.withDecodingDefault(() => false)),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
+  archivedAt: Schema.optional(Schema.NullOr(IsoDateTime)).pipe(
+    Schema.withDecodingDefault(() => null),
+  ),
 });
 export type OrchestrationProjectShell = typeof OrchestrationProjectShell.Type;
+
+export const OrchestrationArchivedProjectSummary = Schema.Struct({
+  id: ProjectId,
+  kind: ProjectKind,
+  title: TrimmedNonEmptyString,
+  workspaceRoot: TrimmedNonEmptyString,
+  archivedAt: IsoDateTime,
+  threadCount: NonNegativeInt,
+  latestThread: Schema.NullOr(
+    Schema.Struct({
+      id: ThreadId,
+      title: TrimmedNonEmptyString,
+      updatedAt: IsoDateTime,
+    }),
+  ),
+});
+export type OrchestrationArchivedProjectSummary = typeof OrchestrationArchivedProjectSummary.Type;
 
 export const OrchestrationMessageRole = Schema.Literals(["user", "assistant", "system"]);
 export type OrchestrationMessageRole = typeof OrchestrationMessageRole.Type;
@@ -840,6 +863,11 @@ export const OrchestrationShellStreamEvent = Schema.Union([
     sequence: NonNegativeInt,
     threadId: ThreadId,
   }),
+  Schema.Struct({
+    kind: Schema.Literal("snapshot-invalidated"),
+    sequence: NonNegativeInt,
+    reason: Schema.Literal("project-visibility-changed"),
+  }),
 ]);
 export type OrchestrationShellStreamEvent = typeof OrchestrationShellStreamEvent.Type;
 
@@ -886,6 +914,20 @@ const ProjectDeleteCommand = Schema.Struct({
   type: Schema.Literal("project.delete"),
   commandId: CommandId,
   projectId: ProjectId,
+});
+
+export const ProjectArchiveCommand = Schema.Struct({
+  type: Schema.Literal("project.archive"),
+  commandId: CommandId,
+  projectId: ProjectId,
+  createdAt: IsoDateTime,
+});
+
+export const ProjectUnarchiveCommand = Schema.Struct({
+  type: Schema.Literal("project.unarchive"),
+  commandId: CommandId,
+  projectId: ProjectId,
+  createdAt: IsoDateTime,
 });
 
 const ThreadCreateCommand = Schema.Struct({
@@ -1290,6 +1332,8 @@ const DispatchableClientOrchestrationCommand = Schema.Union([
   ProjectCreateCommand,
   ProjectMetaUpdateCommand,
   ProjectDeleteCommand,
+  ProjectArchiveCommand,
+  ProjectUnarchiveCommand,
   ThreadCreateCommand,
   ThreadHandoffCreateCommand,
   ThreadForkCreateCommand,
@@ -1325,6 +1369,8 @@ export const ClientOrchestrationCommand = Schema.Union([
   ProjectCreateCommand,
   ProjectMetaUpdateCommand,
   ProjectDeleteCommand,
+  ProjectArchiveCommand,
+  ProjectUnarchiveCommand,
   ThreadCreateCommand,
   ThreadHandoffCreateCommand,
   ThreadForkCreateCommand,
@@ -1456,6 +1502,8 @@ export type OrchestrationCommand = typeof OrchestrationCommand.Type;
 export const OrchestrationEventType = Schema.Literals([
   "project.created",
   "project.meta-updated",
+  "project.archived",
+  "project.unarchived",
   "project.deleted",
   "thread.created",
   "thread.deleted",
@@ -1524,6 +1572,16 @@ export const ProjectMetaUpdatedPayload = Schema.Struct({
 export const ProjectDeletedPayload = Schema.Struct({
   projectId: ProjectId,
   deletedAt: IsoDateTime,
+});
+
+export const ProjectArchivedPayload = Schema.Struct({
+  projectId: ProjectId,
+  archivedAt: IsoDateTime,
+});
+
+export const ProjectUnarchivedPayload = Schema.Struct({
+  projectId: ProjectId,
+  unarchivedAt: IsoDateTime,
 });
 
 export const ThreadCreatedPayload = Schema.Struct({
@@ -1865,6 +1923,16 @@ export const OrchestrationEvent = Schema.Union([
     ...EventBaseFields,
     type: Schema.Literal("project.meta-updated"),
     payload: ProjectMetaUpdatedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("project.archived"),
+    payload: ProjectArchivedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("project.unarchived"),
+    payload: ProjectUnarchivedPayload,
   }),
   Schema.Struct({
     ...EventBaseFields,

@@ -36,6 +36,8 @@ import {
   type TerminalEvent,
   type TerminalEventStreamItem,
   type TerminalEventStreamReady,
+  type WorkspaceCloneProgressEvent,
+  type WorkspaceCloneRepositoryResult,
   type WsPush,
   type WsPushChannel,
   type WsPushMessage,
@@ -67,6 +69,12 @@ export class WsTransportRequestInterruptedError extends Data.TaggedError(
   readonly method: string;
   readonly timeoutMs?: number;
   readonly cause?: unknown;
+}> {}
+
+export class WorkspaceCloneStreamIncompleteError extends Data.TaggedError(
+  "WorkspaceCloneStreamIncompleteError",
+)<{
+  readonly message: string;
 }> {}
 
 export interface WsRequestOptions {
@@ -354,6 +362,31 @@ export function projectServerConfigUpdatedPayload(
   return event.type === "configUpdated" ? event.payload : null;
 }
 
+export function consumeWorkspaceCloneProgressStream<E>(
+  stream: Stream.Stream<WorkspaceCloneProgressEvent, E>,
+  onEvent: (event: WorkspaceCloneProgressEvent) => void,
+): Effect.Effect<WorkspaceCloneRepositoryResult, E | WorkspaceCloneStreamIncompleteError> {
+  let terminalResult: WorkspaceCloneRepositoryResult | null = null;
+  return Stream.runForEach(stream, (event) =>
+    Effect.sync(() => {
+      onEvent(event);
+      if (event._tag === "clone_finished") {
+        terminalResult = event.result;
+      }
+    }),
+  ).pipe(
+    Effect.flatMap(() =>
+      terminalResult
+        ? Effect.succeed(terminalResult)
+        : Effect.fail(
+            new WorkspaceCloneStreamIncompleteError({
+              message: "Workspace clone stream completed without a final result.",
+            }),
+          ),
+    ),
+  );
+}
+
 export class WsTransport {
   private readonly explicitUrl: string | null;
   private readonly listeners = new Map<string, Set<(message: WsPush) => void>>();
@@ -408,6 +441,12 @@ export class WsTransport {
 
       if (method === WS_METHODS.gitRunStackedAction) {
         return (await this.runGitActionStream(client, params, abortScope.signal)) as T;
+      }
+      if (
+        method === WS_METHODS.workspaceCloneRepository ||
+        method === WS_METHODS.workspaceRetryCloneProjectCreation
+      ) {
+        return (await this.runWorkspaceCloneStream(client, method, params, abortScope.signal)) as T;
       }
 
       if (method === ORCHESTRATION_WS_METHODS.subscribeShell) {
@@ -1065,5 +1104,25 @@ export class WsTransport {
     );
     if (!result) throw new Error("Git action stream completed without a final result.");
     return result;
+  }
+
+  private async runWorkspaceCloneStream(
+    client: RpcClientInstance,
+    method:
+      | typeof WS_METHODS.workspaceCloneRepository
+      | typeof WS_METHODS.workspaceRetryCloneProjectCreation,
+    params: unknown,
+    signal?: AbortSignal,
+  ): Promise<WorkspaceCloneRepositoryResult> {
+    const stream =
+      method === WS_METHODS.workspaceCloneRepository
+        ? client[WS_METHODS.workspaceCloneRepository](params as never)
+        : client[WS_METHODS.workspaceRetryCloneProjectCreation](params as never);
+    return this.getClientRuntime(client).runPromise(
+      consumeWorkspaceCloneProgressStream(stream, (event) =>
+        this.emit(WS_CHANNELS.workspaceCloneProgress, event),
+      ),
+      signal ? { signal } : undefined,
+    );
   }
 }

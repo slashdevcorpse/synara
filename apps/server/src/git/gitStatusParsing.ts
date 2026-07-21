@@ -11,6 +11,8 @@ type GitWorkingTreeStatSummary = {
 };
 
 interface ParsedGitStatusPorcelain {
+  readonly hasCommits: boolean;
+  readonly isDetached: boolean;
   readonly branch: string | null;
   readonly upstreamRef: string | null;
   readonly aheadCount: number;
@@ -126,6 +128,8 @@ function parsePorcelainV2Records(stdout: string): Array<{ record: string; path: 
 }
 
 export function parseGitStatusPorcelain(stdout: string): ParsedGitStatusPorcelain {
+  let hasCommits = true;
+  let isDetached = false;
   let branch: string | null = null;
   let upstreamRef: string | null = null;
   let aheadCount = 0;
@@ -137,9 +141,14 @@ export function parseGitStatusPorcelain(stdout: string): ParsedGitStatusPorcelai
   const untrackedFilesWithoutNumstat = new Set<string>();
 
   for (const { record, path } of parsePorcelainV2Records(stdout)) {
+    if (record.startsWith("# branch.oid ")) {
+      hasCommits = record.slice("# branch.oid ".length).trim() !== "(initial)";
+      continue;
+    }
     if (record.startsWith("# branch.head ")) {
       const value = record.slice("# branch.head ".length).trim();
-      branch = value.startsWith("(") ? null : value;
+      isDetached = value === "(detached)";
+      branch = isDetached ? null : value;
       continue;
     }
     if (record.startsWith("# branch.upstream ")) {
@@ -176,6 +185,8 @@ export function parseGitStatusPorcelain(stdout: string): ParsedGitStatusPorcelai
   }
 
   return {
+    hasCommits,
+    isDetached,
     branch,
     upstreamRef,
     aheadCount,

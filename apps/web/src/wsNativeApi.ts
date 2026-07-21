@@ -28,6 +28,7 @@ import {
   type ServerSettingsUpdatedPayload,
   type ServerVoiceTranscriptionResult,
   type TerminalEvent,
+  type WorkspaceCloneProgressEvent,
   ORCHESTRATION_WS_CHANNELS,
   ORCHESTRATION_WS_METHODS,
   type ContextMenuItem,
@@ -98,6 +99,7 @@ const serverProviderStatusesUpdatedListeners =
 const serverMaintenanceUpdatedListeners = createListenerRegistry<ServerLifecycleStreamEvent>();
 const serverSettingsUpdatedListeners = createListenerRegistry<ServerSettingsUpdatedPayload>();
 const gitActionProgressListeners = createListenerRegistry<GitActionProgressEvent>();
+const workspaceCloneProgressListeners = createListenerRegistry<WorkspaceCloneProgressEvent>();
 
 function omitNullUserInputAnswers(
   command: Parameters<NativeApi["orchestration"]["dispatchCommand"]>[0],
@@ -131,6 +133,7 @@ function clearWsNativeApiListeners(): void {
   serverMaintenanceUpdatedListeners.clear();
   serverSettingsUpdatedListeners.clear();
   gitActionProgressListeners.clear();
+  workspaceCloneProgressListeners.clear();
   terminalEventListeners.clear();
   projectDevServerEventListeners.clear();
   automationEventListeners.clear();
@@ -406,6 +409,9 @@ export function createWsNativeApi(): NativeApi {
   transport.subscribe(WS_CHANNELS.gitActionProgress, (message) => {
     gitActionProgressListeners.emit(message.data);
   });
+  transport.subscribe(WS_CHANNELS.workspaceCloneProgress, (message) => {
+    workspaceCloneProgressListeners.emit(message.data);
+  });
   transport.subscribe(WS_CHANNELS.terminalEvent, (message) => {
     terminalEventListeners.emit(message.data);
   });
@@ -503,6 +509,19 @@ export function createWsNativeApi(): NativeApi {
         }
         // No-op in browser - this is a desktop-only feature
       },
+    },
+    workspace: {
+      listArchivedProjects: () => transport.request(WS_METHODS.workspaceListArchivedProjects, {}),
+      listGitStates: (input) =>
+        transport.request(WS_METHODS.workspaceListGitStates, input, { timeoutMs: null }),
+      cloneRepository: (input) =>
+        transport.request(WS_METHODS.workspaceCloneRepository, input, { timeoutMs: null }),
+      getCloneStatus: (input) => transport.request(WS_METHODS.workspaceGetCloneStatus, input),
+      retryCloneProjectCreation: (input) =>
+        transport.request(WS_METHODS.workspaceRetryCloneProjectCreation, input, {
+          timeoutMs: null,
+        }),
+      onCloneProgress: workspaceCloneProgressListeners.subscribe,
     },
     git: {
       githubRepository: (input) => transport.request(WS_METHODS.gitGithubRepository, input),
