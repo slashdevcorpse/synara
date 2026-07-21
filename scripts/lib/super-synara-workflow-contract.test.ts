@@ -132,10 +132,37 @@ describe("Super Synara workflow contracts", () => {
       "without requiring the immutable tag before atomic publication",
     );
 
-    for (const [startMarker, endMarker, command] of [
-      ["\n  preflight:", "\n  windows_x64:", "github-unsigned-prerelease \\\n            false"],
-      ["\n  windows_x64:", "\n  macos_arm64:", "github-unsigned-prerelease false"],
-      ["\n  macos_arm64:", "\n  publish:", "github-unsigned-prerelease false"],
+    for (const [startMarker, endMarker, command, environmentBindings] of [
+      [
+        "\n  preflight:",
+        "\n  windows_x64:",
+        "github-unsigned-prerelease \\\n            false",
+        [
+          "VERSION: ${{ steps.meta.outputs.version }}",
+          "TAG: ${{ steps.meta.outputs.tag }}",
+          "SOURCE_COMMIT: ${{ inputs.expected_source_sha }}",
+        ],
+      ],
+      [
+        "\n  windows_x64:",
+        "\n  macos_arm64:",
+        "github-unsigned-prerelease false",
+        [
+          "VERSION: ${{ needs.preflight.outputs.version }}",
+          "TAG: ${{ needs.preflight.outputs.tag }}",
+          "SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}",
+        ],
+      ],
+      [
+        "\n  macos_arm64:",
+        "\n  publish:",
+        "github-unsigned-prerelease false",
+        [
+          "VERSION: ${{ needs.preflight.outputs.version }}",
+          "TAG: ${{ needs.preflight.outputs.tag }}",
+          "SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}",
+        ],
+      ],
     ] as const) {
       const start = main.indexOf(startMarker);
       const end = main.indexOf(endMarker, start + startMarker.length);
@@ -148,6 +175,20 @@ describe("Super Synara workflow contracts", () => {
       expect(() => verifySuperSynaraWorkflowText(mutation, audit)).toThrow(
         "without requiring the immutable tag before atomic publication",
       );
+
+      for (const environmentBinding of environmentBindings) {
+        const separator = environmentBinding.indexOf(":");
+        expect(separator).toBeGreaterThan(0);
+        const forgedEnvironmentBlock = block.replace(
+          environmentBinding,
+          `${environmentBinding.slice(0, separator)}: attacker`,
+        );
+        expect(forgedEnvironmentBlock).not.toBe(block);
+        const forgedEnvironment = main.slice(0, start) + forgedEnvironmentBlock + main.slice(end);
+        expect(() => verifySuperSynaraWorkflowText(forgedEnvironment, audit)).toThrow(
+          "without requiring the immutable tag before atomic publication",
+        );
+      }
     }
   });
 

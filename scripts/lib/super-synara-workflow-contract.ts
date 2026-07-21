@@ -106,28 +106,52 @@ function publicationJobs(workflowText: string): UnknownRecord {
   return workflow.jobs;
 }
 
-function publicationJob(jobs: UnknownRecord, jobName: string): UnknownRecord {
+function publicationJob(
+  jobs: UnknownRecord,
+  jobName: string,
+): UnknownRecord & { steps: unknown[] } {
   const job = jobs[jobName];
   if (!isRecord(job) || !Array.isArray(job.steps)) {
     throw new Error(`Publication workflow must define the ${jobName} job with steps.`);
   }
-  return job;
+  return job as UnknownRecord & { steps: unknown[] };
 }
 
 const PRERELEASE_SOURCE_PROVENANCE_COMMAND =
   'node scripts/verify-release-source-provenance.ts "$VERSION" "$TAG" true "$SOURCE_COMMIT" branch main github-unsigned-prerelease false';
 
 function verifyPrereleaseSourceProvenanceSteps(jobs: UnknownRecord): void {
-  for (const [jobName, stepName] of [
-    ["preflight", "Validate source provenance"],
-    ["windows_x64", "Revalidate protected-main source provenance"],
-    ["macos_arm64", "Revalidate protected-main source provenance"],
+  for (const [jobName, stepName, expectedEnvironment] of [
+    [
+      "preflight",
+      "Validate source provenance",
+      {
+        VERSION: "${{ steps.meta.outputs.version }}",
+        TAG: "${{ steps.meta.outputs.tag }}",
+        SOURCE_COMMIT: "${{ inputs.expected_source_sha }}",
+      },
+    ],
+    [
+      "windows_x64",
+      "Revalidate protected-main source provenance",
+      {
+        VERSION: "${{ needs.preflight.outputs.version }}",
+        TAG: "${{ needs.preflight.outputs.tag }}",
+        SOURCE_COMMIT: "${{ needs.preflight.outputs.source_commit }}",
+      },
+    ],
+    [
+      "macos_arm64",
+      "Revalidate protected-main source provenance",
+      {
+        VERSION: "${{ needs.preflight.outputs.version }}",
+        TAG: "${{ needs.preflight.outputs.tag }}",
+        SOURCE_COMMIT: "${{ needs.preflight.outputs.source_commit }}",
+      },
+    ],
   ] as const) {
     const job = publicationJob(jobs, jobName);
     const steps = job.steps;
-    if (!Array.isArray(steps)) {
-      throw new Error(`Publication workflow must define the ${jobName} job with steps.`);
-    }
     const matches = steps.filter(
       (step) => isRecord(step) && step.name === stepName && typeof step.run === "string",
     );
@@ -137,6 +161,7 @@ function verifyPrereleaseSourceProvenanceSteps(jobs: UnknownRecord): void {
       !isRecord(step) ||
       typeof step.run !== "string" ||
       step.shell !== "bash" ||
+      !hasExactEntries(step.env, expectedEnvironment) ||
       normalizeContinuedShellCommand(step.run) !== PRERELEASE_SOURCE_PROVENANCE_COMMAND ||
       step.if !== undefined ||
       (step["continue-on-error"] !== undefined && step["continue-on-error"] !== false)
