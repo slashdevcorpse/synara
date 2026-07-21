@@ -4695,15 +4695,29 @@ export default function ChatView({
     if (!isAtEndRef.current && !shouldFollowPendingTurn) {
       return;
     }
+    let postAnimationSnapTimeoutId: number | null = null;
     // Re-apply the bottom stick only for real transcript messages; tool/work
     // rows can arrive quickly and should not churn scroll/layout work.
     const frameId = window.requestAnimationFrame(() => {
       const shouldAnimate = animateNextAutoFollowScrollRef.current;
       animateNextAutoFollowScrollRef.current = false;
       scrollToEnd(shouldAnimate);
+      if (shouldAnimate) {
+        // LegendList can finish measuring the optimistic row after the smooth
+        // scroll target is chosen. Snap once after the shared 220ms row motion
+        // settles, unless the user has cancelled auto-follow in the meantime.
+        postAnimationSnapTimeoutId = window.setTimeout(() => {
+          if (activeThread?.id !== undefined && autoFollowThreadIdRef.current === activeThread.id) {
+            scrollToEnd(false);
+          }
+        }, 260);
+      }
     });
     return () => {
       window.cancelAnimationFrame(frameId);
+      if (postAnimationSnapTimeoutId !== null) {
+        window.clearTimeout(postAnimationSnapTimeoutId);
+      }
     };
   }, [activeThread?.id, scrollToEnd, transcriptAutoFollowSignal]);
   const {
