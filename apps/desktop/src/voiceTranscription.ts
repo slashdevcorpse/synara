@@ -21,6 +21,7 @@ import {
   decodeOutboundText,
   type OutboundHttpResponse,
 } from "@synara/shared/outboundHttp";
+import { splitLines } from "@synara/shared/text";
 import { prepareResolvedWindowsSafeProcess } from "@synara/shared/windowsProcess";
 import { SERVER_TRANSCRIBE_VOICE_CHANNEL } from "./ipcChannels";
 
@@ -134,7 +135,7 @@ async function resolveDesktopVoiceAuth(
     });
     child.stdout.on("data", (chunk) => {
       stdoutBuffer += chunk.toString();
-      const lines = stdoutBuffer.split(/\n/);
+      const lines = splitLines(stdoutBuffer);
       stdoutBuffer = lines.pop() ?? "";
       for (const line of lines) {
         let message: Record<string, unknown>;

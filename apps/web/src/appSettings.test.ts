@@ -17,11 +17,13 @@ import {
   getAppModelOptions,
   getCustomBinaryPathForProvider,
   getDefaultNativeFontSmoothing,
+  getDefaultTerminalRightClickToPaste,
   getCustomModelOptionsByProvider,
   getCustomModelsByProvider,
   getCustomModelsForProvider,
   getDefaultCustomModelsForProvider,
   getGitTextGenerationModelOptions,
+  isGitTextGenerationSettingsDirty,
   getProviderStartOptions,
   MODEL_PROVIDER_SETTINGS,
   normalizeChatFontSizePx,
@@ -194,6 +196,20 @@ describe("getGitTextGenerationModelOptions", () => {
       provider: "opencode",
       isCustom: true,
     });
+  });
+});
+
+describe("isGitTextGenerationSettingsDirty", () => {
+  it("compares the normalized provider and model defaults", () => {
+    const defaults = AppSettingsSchema.makeUnsafe({});
+
+    expect(isGitTextGenerationSettingsDirty(defaults, defaults)).toBe(false);
+    expect(
+      isGitTextGenerationSettingsDirty(
+        { ...defaults, textGenerationProvider: "opencode", textGenerationModel: "custom/model" },
+        defaults,
+      ),
+    ).toBe(true);
   });
 });
 
@@ -392,6 +408,24 @@ describe("sidebar sort defaults", () => {
 });
 
 describe("normalizeStoredAppSettings", () => {
+  it("defaults terminal right-click paste by platform", () => {
+    expect(getDefaultTerminalRightClickToPaste("Win32")).toBe(true);
+    expect(getDefaultTerminalRightClickToPaste("Win64")).toBe(true);
+    expect(getDefaultTerminalRightClickToPaste("MacIntel")).toBe(false);
+    expect(getDefaultTerminalRightClickToPaste("Linux x86_64")).toBe(false);
+  });
+
+  it("preserves explicitly stored terminal right-click paste preferences", () => {
+    const decode = Schema.decodeSync(Schema.fromJsonString(AppSettingsSchema));
+
+    expect(
+      decode(JSON.stringify({ terminalRightClickToPaste: false })).terminalRightClickToPaste,
+    ).toBe(false);
+    expect(
+      decode(JSON.stringify({ terminalRightClickToPaste: true })).terminalRightClickToPaste,
+    ).toBe(true);
+  });
+
   it("defaults native font smoothing by platform", () => {
     expect(getDefaultNativeFontSmoothing("MacIntel")).toBe(true);
     expect(getDefaultNativeFontSmoothing("Win32")).toBe(false);
@@ -909,6 +943,7 @@ describe("AppSettingsSchema", () => {
       defaultThreadEnvMode: "local",
       confirmThreadDelete: false,
       confirmTerminalTabClose: true,
+      terminalRightClickToPaste: getDefaultTerminalRightClickToPaste(),
       enableAppSnap: false,
       appSnapPlaySound: true,
       enableAssistantStreaming: true,

@@ -1,5 +1,6 @@
 import { Effect, Layer } from "effect";
 
+import { AgentGatewayCredentialsWithSecretsLive } from "../agentGateway/Layers/AgentGatewayCredentials";
 import { ServerConfig } from "../config";
 import {
   makeProviderServerPasswordResolver,
@@ -25,9 +26,12 @@ import { ProviderSessionRuntimeRepositoryLive } from "../persistence/Layers/Prov
 import { ProviderRuntimeEventRepositoryLive } from "../persistence/Layers/ProviderRuntimeEvents";
 import type { ProviderMaintenanceGate } from "./providerMaintenanceGate";
 
-export function makeServerProviderLayer(options?: {
-  readonly maintenanceGate?: ProviderMaintenanceGate;
-}) {
+export function makeServerProviderLayer(
+  options: {
+    readonly agentGatewayCredentialsLayer?: typeof AgentGatewayCredentialsWithSecretsLive;
+    readonly maintenanceGate?: ProviderMaintenanceGate;
+  } = {},
+) {
   return Effect.gen(function* () {
     const credentials = yield* ProviderCredentials;
     const resolveProviderServerPassword = makeProviderServerPasswordResolver(credentials);
@@ -45,41 +49,51 @@ export function makeServerProviderLayer(options?: {
     const providerSessionDirectoryLayer = ProviderSessionDirectoryLive.pipe(
       Layer.provide(ProviderSessionRuntimeRepositoryLive),
     );
+    // Gives gateway-capable sessions their thread-scoped synara_* credentials.
+    // OpenCode/Kilo isolate managed servers before installing MCP; Pi projects
+    // the same MCP catalog/dispatcher through its native custom-tool API.
+    const agentGatewayCredentialsLayer =
+      options.agentGatewayCredentialsLayer ?? AgentGatewayCredentialsWithSecretsLive;
     const codexAdapterLayer = makeCodexAdapterLive(
       nativeEventLogger ? { nativeEventLogger } : undefined,
     );
     const commandCodeAdapterLayer = makeCommandCodeAdapterLive(
       nativeEventLogger ? { nativeEventLogger } : undefined,
+    ).pipe(Layer.provide(agentGatewayCredentialsLayer));
+    const gatewayCodexAdapterLayer = codexAdapterLayer.pipe(
+      Layer.provide(agentGatewayCredentialsLayer),
     );
     const claudeAdapterLayer = makeClaudeAdapterLive(
       nativeEventLogger ? { nativeEventLogger } : undefined,
-    );
+    ).pipe(Layer.provide(agentGatewayCredentialsLayer));
     const openCodeAdapterLayer = makeOpenCodeAdapterLive({
       ...(nativeEventLogger ? { nativeEventLogger } : {}),
       resolveServerPassword: resolveProviderServerPassword,
-    });
+    }).pipe(Layer.provide(agentGatewayCredentialsLayer));
     const kiloAdapterLayer = makeKiloAdapterLive({
       ...(nativeEventLogger ? { nativeEventLogger } : {}),
       resolveServerPassword: resolveProviderServerPassword,
-    });
+    }).pipe(Layer.provide(agentGatewayCredentialsLayer));
     const antigravityAdapterLayer = makeAntigravityAdapterLive();
     const grokAdapterLayer = makeGrokAdapterLive(
       {},
       nativeEventLogger ? { nativeEventLogger } : undefined,
-    );
+    ).pipe(Layer.provide(agentGatewayCredentialsLayer));
     const droidAdapterLayer = makeDroidAdapterLive(
       {},
       nativeEventLogger ? { nativeEventLogger } : undefined,
-    );
+    ).pipe(Layer.provide(agentGatewayCredentialsLayer));
     const cursorAdapterLayer = makeCursorAdapterLive(
       {},
       nativeEventLogger ? { nativeEventLogger } : undefined,
-    );
-    const piAdapterLayer = makePiAdapterLive(nativeEventLogger ? { nativeEventLogger } : undefined);
+    ).pipe(Layer.provide(agentGatewayCredentialsLayer));
+    const piAdapterLayer = makePiAdapterLive(
+      nativeEventLogger ? { nativeEventLogger } : undefined,
+    ).pipe(Layer.provide(agentGatewayCredentialsLayer));
     const adapterRegistryLayer = makeProviderAdapterRegistryLive({
       ...(options?.maintenanceGate ? { maintenanceGate: options.maintenanceGate } : {}),
     }).pipe(
-      Layer.provide(codexAdapterLayer),
+      Layer.provide(gatewayCodexAdapterLayer),
       Layer.provide(commandCodeAdapterLayer),
       Layer.provide(claudeAdapterLayer),
       Layer.provide(cursorAdapterLayer),

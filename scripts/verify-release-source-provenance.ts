@@ -7,6 +7,7 @@ import { appendFileSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { serializeReleaseGithubOutput } from "./lib/release-github-output.ts";
 import { releasePackageFiles } from "./update-release-package-versions.ts";
 import { resolveReleaseLockfileSha256 } from "./lib/release-lockfile-provenance.ts";
 import { validateReleaseSourcePolicy } from "./lib/release-source-provenance-policy.ts";
@@ -129,12 +130,7 @@ const output = {
 };
 const githubOutput = process.env.GITHUB_OUTPUT;
 if (githubOutput) {
-  appendFileSync(
-    githubOutput,
-    `${Object.entries(output)
-      .map(([key, value]) => `${key}=${value}`)
-      .join("\n")}\n`,
-  );
+  appendFileSync(githubOutput, serializeReleaseGithubOutput(output));
 } else {
   console.log(JSON.stringify(output, null, 2));
 }

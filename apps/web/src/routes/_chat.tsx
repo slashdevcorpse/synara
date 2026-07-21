@@ -12,6 +12,7 @@ import ShortcutsDialog from "../components/ShortcutsDialog";
 import { RecentViewSwitcher } from "../components/RecentViewSwitcher";
 import { shouldRenderTerminalWorkspace } from "../components/ChatView.logic";
 import ThreadSidebar from "../components/Sidebar";
+import { useThreadSidebarWidth } from "../components/useThreadSidebarWidth";
 import { isElectron } from "../env";
 import { useHandleNewChat } from "../hooks/useHandleNewChat";
 import { useHandleNewStudioChat } from "../hooks/useHandleNewStudioChat";
@@ -46,23 +47,9 @@ import {
   SidebarRail,
   useSidebar,
 } from "~/components/ui/sidebar";
-import type { SidebarResizableOptions } from "~/components/ui/sidebar";
 import { cn } from "~/lib/utils";
 
 const EMPTY_KEYBINDINGS: ResolvedKeybindingsConfig = [];
-const THREAD_SIDEBAR_WIDTH_STORAGE_KEY = "chat_thread_sidebar_width";
-const THREAD_SIDEBAR_MIN_WIDTH = 13 * 16;
-const THREAD_MAIN_CONTENT_MIN_WIDTH = 40 * 16;
-
-// Single source of truth for the thread sidebar resize behavior. Shared by <Sidebar>
-// and the detached content-seam <SidebarRail> (via SidebarInstanceProvider) so the
-// drag handle keeps working even though the rail lives outside <Sidebar> (above the card).
-const THREAD_SIDEBAR_RESIZABLE: SidebarResizableOptions = {
-  minWidth: THREAD_SIDEBAR_MIN_WIDTH,
-  shouldAcceptWidth: ({ nextWidth, wrapper }) =>
-    wrapper.clientWidth - nextWidth >= THREAD_MAIN_CONTENT_MIN_WIDTH,
-  storageKey: THREAD_SIDEBAR_WIDTH_STORAGE_KEY,
-};
 const MAINTENANCE_EVENT_STALE_MS = 5 * 60 * 1000;
 
 type MaintenanceToastId = ReturnType<typeof toastManager.add>;
@@ -523,6 +510,8 @@ function ChatRouteLayout() {
     select: (location) => (location.search as { view?: unknown }).view === "editor",
   });
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const { providerStyle: threadSidebarProviderStyle, resizable: threadSidebarResizable } =
+    useThreadSidebarWidth();
   const resolvedSidebarOpen = isEditorView ? false : sidebarOpen;
 
   // The thread sidebar always lives on the left; the right dock is a separate surface.
@@ -536,7 +525,7 @@ function ChatRouteLayout() {
       gapClassName={cn(SIDEBAR_GAP_CLASS, SIDEBAR_OFFCANVAS_MOTION_CLASS)}
       innerClassName={SIDEBAR_INNER_CLASS}
       transparentSurface
-      resizable={THREAD_SIDEBAR_RESIZABLE}
+      resizable={threadSidebarResizable}
     >
       <ThreadSidebar />
     </Sidebar>
@@ -551,7 +540,7 @@ function ChatRouteLayout() {
   const mainContentShell = (
     <div className="chat-content-card-backing relative flex h-svh min-h-0 min-w-0 flex-1">
       {isEditorView ? null : (
-        <SidebarInstanceProvider side="left" resizable={THREAD_SIDEBAR_RESIZABLE}>
+        <SidebarInstanceProvider side="left" resizable={threadSidebarResizable}>
           <SidebarRail placement="content-seam" />
         </SidebarInstanceProvider>
       )}
@@ -566,6 +555,7 @@ function ChatRouteLayout() {
       onOpenChange={setSidebarOpen}
       className="bg-[var(--app-shell-background)]"
       data-sidebar-side="left"
+      style={threadSidebarProviderStyle}
     >
       <ThreadRetentionMaintenanceToast />
       <ChatRouteGlobalShortcuts />

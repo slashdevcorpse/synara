@@ -32,11 +32,10 @@ import { fixPath, resolveBaseDir } from "./os-jank";
 import { Open } from "./open";
 import { ServerAuth } from "./auth/Services/ServerAuth";
 import * as SqlitePersistence from "./persistence/Layers/Sqlite";
-import { makeServerProviderLayer, makeServerRuntimeServicesLayer } from "./serverLayers";
+import { makeServerApplicationLayers } from "./serverLayers";
 import { startServerMemoryDiagnostics } from "./memoryDiagnostics";
 import { startClaudeCredentialKeepalive } from "./provider/claudeCredentialKeepalive";
 import { ProjectionSnapshotQuery } from "./orchestration/Services/ProjectionSnapshotQuery";
-import { makeProviderHealthLive } from "./provider/Layers/ProviderHealth";
 import { ProviderSessionReaperLive } from "./provider/Layers/ProviderSessionReaper";
 import {
   makeProviderMaintenanceGate,
@@ -299,20 +298,10 @@ const LayerLive = (
   maintenanceGate: ProviderMaintenanceGate,
   maintenanceOwnedResources: ProviderMaintenanceOwnedResourceCoordinator,
 ) => {
-  const runtimeServicesLayer = makeServerRuntimeServicesLayer({
+  const { runtimeServicesLayer, providerLayer } = makeServerApplicationLayers({
     maintenanceGate,
     maintenanceOwnedResources,
   });
-  const providerLayer = makeServerProviderLayer({ maintenanceGate });
-  const providerHealthLayer = makeProviderHealthLive({
-    maintenanceGate,
-    maintenanceOwnedResources,
-  }).pipe(
-    // Provider health reads persisted provider settings while constructing its
-    // cache, so build it with the same runtime services layer exposed to Server.
-    Layer.provideMerge(runtimeServicesLayer),
-    Layer.provideMerge(providerLayer),
-  );
   const providerSessionReaperLayer = ProviderSessionReaperLive.pipe(
     // The reaper coordinates orchestration state with live provider sessions,
     // so it belongs at the top level where both layers are available.
@@ -323,7 +312,6 @@ const LayerLive = (
   return Layer.empty.pipe(
     Layer.provideMerge(runtimeServicesLayer),
     Layer.provideMerge(providerLayer),
-    Layer.provideMerge(providerHealthLayer),
     Layer.provideMerge(providerSessionReaperLayer),
     Layer.provideMerge(SqlitePersistence.layerConfig),
     Layer.provideMerge(ServerLoggerLive),

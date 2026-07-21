@@ -3,10 +3,10 @@
 // Layer: Provider runtime tests
 // Exports: Vitest suites for opencodeRuntime.ts
 
-import { pathToFileURL } from "node:url";
 import { Deferred, Duration, Effect, Exit, Fiber, Layer, Result, Scope, Sink, Stream } from "effect";
 import { ChildProcessSpawner } from "effect/unstable/process";
 import { TestClock } from "effect/testing";
+import { pathToFileURL } from "node:url";
 import type { ChatAttachment } from "@synara/contracts";
 import { describe, expect, it } from "vitest";
 
@@ -50,6 +50,12 @@ function makeTestOpenCodeRuntimeLive(
 ) {
   return makeOpenCodeRuntimeLive({
     processTreeKiller: completeTestProcessTreeKiller,
+    netService: {
+      canListenOnHost: () => Effect.succeed(true),
+      isPortAvailableOnLoopback: () => Effect.succeed(true),
+      reserveLoopbackPort: () => Effect.succeed(59_000),
+      findAvailablePort: () => Effect.succeed(59_000),
+    },
     ...options,
   });
 }
@@ -163,6 +169,7 @@ function closeLocalServerPoolsForCliSpec(
 
 describe("toOpenCodeFileParts", () => {
   it("materializes image attachments as SDK file parts", () => {
+    const attachmentPath = "/tmp/synara-attachments/screenshot.png";
     const attachment = {
       type: "image",
       id: "thread-attachment-image",
@@ -174,14 +181,14 @@ describe("toOpenCodeFileParts", () => {
     expect(
       toOpenCodeFileParts({
         attachments: [attachment],
-        resolveAttachmentPath: () => "/tmp/synara-attachments/screenshot.png",
+        resolveAttachmentPath: () => attachmentPath,
       }),
     ).toEqual([
       {
         type: "file",
         mime: "image/png",
         filename: "screenshot.png",
-        url: pathToFileURL("/tmp/synara-attachments/screenshot.png").href,
+        url: pathToFileURL(attachmentPath).href,
       },
     ]);
   });
@@ -242,6 +249,34 @@ describe("buildOpenCodeServerProcessEnv", () => {
 });
 
 describe("OpenCodeRuntime startup diagnostics", () => {
+  it("detects the ready server URL in CRLF process output", async () => {
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const runtime = yield* OpenCodeRuntime;
+          return yield* runtime.startOpenCodeServerProcess({ binaryPath: "/custom/bin/opencode" });
+        }),
+      ).pipe(
+        Effect.provide(
+          makeOpenCodeRuntimeLive({
+            teardownProcessTree: async () => ({ escalated: false, signalErrors: [] }),
+          }).pipe(
+            Layer.provide(
+              mockOpenCodeServerSpawnerLayer({
+                stdout:
+                  "booting custom OpenCode wrapper\r\n" +
+                  "opencode server listening on http://127.0.0.1:59000\r\n",
+                stderr: "",
+              }),
+            ),
+          ),
+        ),
+      ),
+    );
+
+    expect(result.url).toBe("http://127.0.0.1:59000");
+  });
+
   it("includes command and partial process output when server startup times out", async () => {
     const error = await Effect.runPromise(
       Effect.scoped(
@@ -1103,6 +1138,42 @@ describe("OpenCodeRuntime local server pool", () => {
           expect(third.url).toBe("http://127.0.0.1:59001");
           expect(state.spawnUrls).toEqual(["http://127.0.0.1:59000", "http://127.0.0.1:59001"]);
           yield* Scope.close(thirdScope, Exit.void);
+        }),
+      ).pipe(Effect.provide(openCodeRuntimePoolTestLayer(state))),
+    );
+  });
+
+  it("isolates same-cwd owners and closes private servers immediately on release", async () => {
+    const state = { spawnUrls: [] as Array<string>, killUrls: [] as Array<string> };
+
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const runtime = yield* OpenCodeRuntime;
+          const firstScope = yield* Scope.make();
+          const secondScope = yield* Scope.make();
+          const first = yield* runtime
+            .connectToOpenCodeServer({
+              binaryPath: "opencode",
+              cwd: "/repo",
+              poolIsolationKey: "synara-thread-a",
+            })
+            .pipe(Effect.provideService(Scope.Scope, firstScope));
+          const second = yield* runtime
+            .connectToOpenCodeServer({
+              binaryPath: "opencode",
+              cwd: "/repo",
+              poolIsolationKey: "synara-thread-b",
+            })
+            .pipe(Effect.provideService(Scope.Scope, secondScope));
+
+          expect(first.url).not.toBe(second.url);
+          expect(state.spawnUrls).toEqual(["http://127.0.0.1:59000", "http://127.0.0.1:59001"]);
+
+          yield* Scope.close(firstScope, Exit.void);
+          expect(state.killUrls).toEqual(["http://127.0.0.1:59000"]);
+          yield* Scope.close(secondScope, Exit.void);
+          expect(state.killUrls).toEqual(["http://127.0.0.1:59000", "http://127.0.0.1:59001"]);
         }),
       ).pipe(Effect.provide(openCodeRuntimePoolTestLayer(state))),
     );

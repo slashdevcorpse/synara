@@ -17,6 +17,7 @@ import {
   ProjectMetaUpdatedPayload,
   OrchestrationProposedPlan,
   OrchestrationSession,
+  OrchestrationSubscribeShellInput,
   OrchestrationThreadPullRequest,
   PROVIDER_SEND_TURN_MAX_ATTACHMENTS,
   PROVIDER_SEND_TURN_MAX_INPUT_CHARS,
@@ -52,6 +53,19 @@ const decodeClientOrchestrationCommand = Schema.decodeUnknownEffect(ClientOrches
 const decodeOrchestrationCommand = Schema.decodeUnknownEffect(OrchestrationCommand);
 const decodeOrchestrationEvent = Schema.decodeUnknownEffect(OrchestrationEvent);
 const decodeThreadPullRequest = Schema.decodeUnknownEffect(OrchestrationThreadPullRequest);
+const decodeSubscribeShellInput = Schema.decodeUnknownEffect(OrchestrationSubscribeShellInput);
+
+it.effect("accepts an optional shell resume cursor, including fallback cursors", () =>
+  Effect.gen(function* () {
+    assert.deepStrictEqual(yield* decodeSubscribeShellInput({}), {});
+    assert.deepStrictEqual(yield* decodeSubscribeShellInput({ afterSequence: 42 }), {
+      afterSequence: 42,
+    });
+    assert.deepStrictEqual(yield* decodeSubscribeShellInput({ afterSequence: -1 }), {
+      afterSequence: -1,
+    });
+  }),
+);
 
 it.effect("decodes last-known PRs persisted before draft/mergeability/diff fields existed", () =>
   Effect.gen(function* () {
@@ -589,6 +603,31 @@ it.effect("strips client-sent dispatchOrigin from thread.turn.start commands", (
       },
       dispatchMode: "queue",
       dispatchOrigin: "automation",
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      createdAt: "2026-01-01T00:00:00.000Z",
+    });
+    assert.strictEqual(command.type, "thread.turn.start");
+    assert.strictEqual("dispatchOrigin" in command, false);
+  }),
+);
+
+it.effect("strips client-sent agent dispatchOrigin from thread.turn.start commands", () =>
+  Effect.gen(function* () {
+    // The "agent" origin is reserved for turns dispatched through the Synara
+    // agent gateway; WS clients must not be able to spoof it either.
+    const command = yield* decodeClientOrchestrationCommand({
+      type: "thread.turn.start",
+      commandId: "cmd-turn-start-agent-origin",
+      threadId: "thread-1",
+      message: {
+        messageId: "message-1",
+        role: "user",
+        text: "hello",
+        attachments: [],
+      },
+      dispatchMode: "queue",
+      dispatchOrigin: "agent",
       runtimeMode: "full-access",
       interactionMode: "default",
       createdAt: "2026-01-01T00:00:00.000Z",

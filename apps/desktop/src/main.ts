@@ -172,9 +172,18 @@ import {
   resolveDesktopUserDataPath,
 } from "./desktopUserDataProfile";
 import { isBrokenPipeError } from "./desktopProcessErrors";
+import { createDesktopStaticProtocolResolver } from "./desktopStaticProtocol";
 import {
+  createDesktopWindowMaximizeIntentGuard,
+  createDesktopWindowStateController,
+  createLinuxDesktopWindowBoundsIntentFallback,
+  DEFAULT_DESKTOP_WINDOW_SIZE,
+  desktopPlatformSupportsManualWindowBoundsEvents,
+  MINIMUM_DESKTOP_WINDOW_SIZE,
   readDesktopWindowState,
-  resolveVisibleWindowBounds,
+  resolveRestorableDesktopWindowBounds,
+  type DesktopWindowBounds,
+  type DesktopWindowStateController,
   writeDesktopWindowState,
 } from "./windowState";
 import {
@@ -272,6 +281,8 @@ const browserPerfLoggingEnabled = process.env.SYNARA_BROWSER_PERF === "1";
 type DesktopUpdateErrorContext = DesktopUpdateState["errorContext"];
 
 let mainWindow: BrowserWindow | null = null;
+let mainWindowStateController: DesktopWindowStateController | null = null;
+const windowStateControllerByWindow = new WeakMap<BrowserWindow, DesktopWindowStateController>();
 let backendProcess: ChildProcess.ChildProcess | null = null;
 let backendPort = 0;
 let backendAuthToken = "";
@@ -1219,38 +1230,6 @@ function computeServedStaticRoot(): ServedStaticRoot | null {
   return { dir: snapshot.dir, snapshotted: true };
 }
 
-function resolveDesktopStaticPath(staticRoot: string, requestUrl: string): string {
-  const url = new URL(requestUrl);
-  const rawPath = decodeURIComponent(url.pathname);
-  const normalizedPath = Path.posix.normalize(rawPath).replace(/^\/+/, "");
-  if (normalizedPath.includes("..")) {
-    return Path.join(staticRoot, "index.html");
-  }
-
-  const requestedPath = normalizedPath.length > 0 ? normalizedPath : "index.html";
-  const resolvedPath = Path.join(staticRoot, requestedPath);
-
-  if (Path.extname(resolvedPath)) {
-    return resolvedPath;
-  }
-
-  const nestedIndex = Path.join(resolvedPath, "index.html");
-  if (FS.existsSync(nestedIndex)) {
-    return nestedIndex;
-  }
-
-  return Path.join(staticRoot, "index.html");
-}
-
-function isStaticAssetRequest(requestUrl: string): boolean {
-  try {
-    const url = new URL(requestUrl);
-    return Path.extname(url.pathname).length > 0;
-  } catch {
-    return false;
-  }
-}
-
 function handleFatalStartupError(stage: string, error: unknown): void {
   const message = formatErrorMessage(error);
   const detail =
@@ -1292,31 +1271,10 @@ function registerDesktopProtocol(): void {
     );
   }
 
-  const staticRootResolved = Path.resolve(staticRoot);
-  const staticRootPrefix = `${staticRootResolved}${Path.sep}`;
-  const fallbackIndex = Path.join(staticRootResolved, "index.html");
+  const resolveStaticRequest = createDesktopStaticProtocolResolver(staticRoot);
 
   protocol.registerFileProtocol(DESKTOP_SCHEME, (request, callback) => {
-    try {
-      const candidate = resolveDesktopStaticPath(staticRootResolved, request.url);
-      const resolvedCandidate = Path.resolve(candidate);
-      const isInRoot =
-        resolvedCandidate === fallbackIndex || resolvedCandidate.startsWith(staticRootPrefix);
-      const isAssetRequest = isStaticAssetRequest(request.url);
-
-      if (!isInRoot || !FS.existsSync(resolvedCandidate)) {
-        if (isAssetRequest) {
-          callback({ error: -6 });
-          return;
-        }
-        callback({ path: fallbackIndex });
-        return;
-      }
-
-      callback({ path: resolvedCandidate });
-    } catch {
-      callback({ path: fallbackIndex });
-    }
+    callback(resolveStaticRequest(request.url));
   });
 
   desktopProtocolRegistered = true;
@@ -3140,7 +3098,7 @@ async function settleBackendGenerationAfterReadinessFailure(
   );
 }
 
-function stopBackend(): void {
+function takeBackendProcessForShutdown(): ChildProcess.ChildProcess | null {
   cancelBackendReadinessWait();
   cancelBackendGenerationReadinessWait();
   backendListeningDetector = null;
@@ -3153,6 +3111,11 @@ function stopBackend(): void {
 
   const child = backendProcess;
   backendProcess = null;
+  return child;
+}
+
+function stopBackend(): void {
+  const child = takeBackendProcessForShutdown();
   if (!child) return;
 
   if (child.exitCode === null && child.signalCode === null) {
@@ -3562,6 +3525,9 @@ function registerIpcHandlers(): void {
     if (!window) {
       return { isMaximized: false, isFullscreen: false };
     }
+    // Renderer caption controls are explicit user actions. Arm before invoking
+    // Electron so either a synchronous or asynchronous native event is safe.
+    windowStateControllerByWindow.get(window)?.noteUserBoundsChange();
     if (window.isMaximized()) {
       window.unmaximize();
     } else {
@@ -3702,25 +3668,22 @@ function getTitleBarOptions(): BrowserWindowConstructorOptions {
 
 function createWindow(): BrowserWindow {
   const savedWindowState = readDesktopWindowState(DESKTOP_WINDOW_STATE_PATH);
-  const primaryDisplay = screen.getPrimaryDisplay();
+  let connectedDisplayWorkAreas: DesktopWindowBounds[] = [];
+  try {
+    connectedDisplayWorkAreas = screen.getAllDisplays().map((display) => display.workArea);
+  } catch (error) {
+    console.warn(`[desktop] Failed to inspect connected displays: ${formatErrorMessage(error)}`);
+  }
   const restoredBounds = savedWindowState
-    ? resolveVisibleWindowBounds({
+    ? resolveRestorableDesktopWindowBounds({
         savedBounds: savedWindowState.bounds,
-        displayWorkAreas: [
-          primaryDisplay.workArea,
-          ...screen
-            .getAllDisplays()
-            .filter((display) => display.id !== primaryDisplay.id)
-            .map((display) => display.workArea),
-        ],
-        minimumWidth: 840,
-        minimumHeight: 620,
+        displayWorkAreas: connectedDisplayWorkAreas,
       })
-    : { width: 1100, height: 780 };
+    : null;
   const window = new BrowserWindow({
-    ...restoredBounds,
-    minWidth: 840,
-    minHeight: 620,
+    ...(restoredBounds ?? DEFAULT_DESKTOP_WINDOW_SIZE),
+    minWidth: MINIMUM_DESKTOP_WINDOW_SIZE.width,
+    minHeight: MINIMUM_DESKTOP_WINDOW_SIZE.height,
     show: false,
     autoHideMenuBar: true,
     ...getIconOption(),
@@ -3737,6 +3700,27 @@ function createWindow(): BrowserWindow {
       backgroundThrottling: true,
     },
   });
+  const windowStateController = createDesktopWindowStateController({
+    source: window,
+    initialState: savedWindowState,
+    initialBoundsRestored: restoredBounds !== null,
+    persist: (state) => writeDesktopWindowState(DESKTOP_WINDOW_STATE_PATH, state),
+    onPersistError: (error) => {
+      console.warn(`[desktop] Failed to persist window state: ${formatErrorMessage(error)}`);
+    },
+  });
+  const maximizeIntentGuard = createDesktopWindowMaximizeIntentGuard();
+  const linuxBoundsIntentFallback =
+    process.platform === "linux"
+      ? createLinuxDesktopWindowBoundsIntentFallback({
+          onUserBoundsChange: windowStateController.noteUserBoundsChange,
+        })
+      : null;
+  mainWindowStateController?.dispose();
+  mainWindowStateController = windowStateController;
+  windowStateControllerByWindow.set(window, windowStateController);
+  let nativeBoundsIntentEligible = false;
+  let revealSettleTimer: ReturnType<typeof setTimeout> | null = null;
   browserManager.setWindow(window);
   attachDesktopZoomFactorSync(window);
 
@@ -3797,27 +3781,70 @@ function createWindow(): BrowserWindow {
     // by subsequent closes. Normal bounds are restored before maximizing so the
     // native restore control returns to the user's last windowed size.
     if (!savedWindowState || savedWindowState.isMaximized) {
+      maximizeIntentGuard.noteProgrammaticStartupMaximize();
       window.maximize();
     }
     window.show();
     emitDesktopWindowState(window);
+    // Native maximize/resize events can arrive during reveal. Keep native event
+    // inference gated until that turn settles; explicit manual/IPC intent is
+    // still allowed to arm the controller directly.
+    revealSettleTimer = setTimeout(() => {
+      revealSettleTimer = null;
+      nativeBoundsIntentEligible = true;
+      windowStateController.completeInitialReveal();
+      linuxBoundsIntentFallback?.completeInitialReveal();
+    }, 0);
   });
 
-  window.on("maximize", () => emitDesktopWindowState(window));
-  window.on("unmaximize", () => emitDesktopWindowState(window));
+  // Electron guarantees these pre-events are manual-only on macOS/Windows;
+  // programmatic startup placement does not emit them.
+  if (desktopPlatformSupportsManualWindowBoundsEvents(process.platform)) {
+    window.on("will-move", windowStateController.noteUserBoundsChange);
+    window.on("will-resize", windowStateController.noteUserBoundsChange);
+  }
+
+  const noteLinuxBoundsChange = (kind: "move" | "resize") => {
+    if (
+      linuxBoundsIntentFallback === null ||
+      window.isDestroyed() ||
+      window.isFullScreen() ||
+      window.isMaximized() ||
+      window.isMinimized()
+    ) {
+      return;
+    }
+    try {
+      linuxBoundsIntentFallback.noteBoundsChange(kind, window.getBounds());
+    } catch {
+      // A closing native window can reject state reads; persistence remains disarmed.
+    }
+  };
+  window.on("move", () => {
+    noteLinuxBoundsChange("move");
+    windowStateController.schedulePersist();
+  });
+  window.on("resize", () => {
+    noteLinuxBoundsChange("resize");
+    windowStateController.schedulePersist();
+  });
+  window.on("maximize", () => {
+    if (maximizeIntentGuard.consumeMaximizeEventAsUserIntent() && nativeBoundsIntentEligible) {
+      windowStateController.noteUserBoundsChange();
+    }
+    emitDesktopWindowState(window);
+    windowStateController.schedulePersist();
+  });
+  window.on("unmaximize", () => {
+    if (maximizeIntentGuard.consumeUnmaximizeEventAsUserIntent() && nativeBoundsIntentEligible) {
+      windowStateController.noteUserBoundsChange();
+    }
+    emitDesktopWindowState(window);
+    windowStateController.schedulePersist();
+  });
   window.on("enter-full-screen", () => emitDesktopWindowState(window));
   window.on("leave-full-screen", () => emitDesktopWindowState(window));
-  window.on("close", () => {
-    try {
-      writeDesktopWindowState(DESKTOP_WINDOW_STATE_PATH, {
-        version: 1,
-        bounds: window.getNormalBounds(),
-        isMaximized: window.isMaximized(),
-      });
-    } catch (error) {
-      console.warn(`[desktop] Failed to persist window state: ${formatErrorMessage(error)}`);
-    }
-  });
+  window.on("close", windowStateController.flush);
 
   if (isDevelopment) {
     void window.loadURL(process.env.VITE_DEV_SERVER_URL as string);
@@ -3827,6 +3854,16 @@ function createWindow(): BrowserWindow {
   }
 
   window.on("closed", () => {
+    if (revealSettleTimer !== null) {
+      clearTimeout(revealSettleTimer);
+      revealSettleTimer = null;
+    }
+    linuxBoundsIntentFallback?.dispose();
+    windowStateController.dispose();
+    windowStateControllerByWindow.delete(window);
+    if (mainWindowStateController === windowStateController) {
+      mainWindowStateController = null;
+    }
     if (mainWindow === window) {
       mainWindow = null;
     }
@@ -3947,6 +3984,7 @@ async function bootstrap(): Promise<void> {
 
 app.on("before-quit", (event) => {
   writeDesktopLogHeader("before-quit received");
+  mainWindowStateController?.flush();
   if (desktopShutdownComplete) {
     return;
   }

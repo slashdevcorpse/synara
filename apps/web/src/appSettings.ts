@@ -90,6 +90,12 @@ export function getDefaultNativeFontSmoothing(platform = globalThis.navigator?.p
   return /mac|iphone|ipad|ipod/i.test(platform);
 }
 
+export function getDefaultTerminalRightClickToPaste(
+  platform = globalThis.navigator?.platform ?? "",
+) {
+  return /^win/i.test(platform);
+}
+
 type CustomModelSettingsKey =
   | "customCodexModels"
   | "customCommandCodeModels"
@@ -195,6 +201,7 @@ export const AppSettingsSchema = Schema.Struct({
   confirmThreadDelete: Schema.Boolean.pipe(withDefaults(() => true)),
   confirmThreadArchive: Schema.Boolean.pipe(withDefaults(() => false)),
   confirmTerminalTabClose: Schema.Boolean.pipe(withDefaults(() => true)),
+  terminalRightClickToPaste: Schema.Boolean.pipe(withDefaults(getDefaultTerminalRightClickToPaste)),
   diffWordWrap: Schema.Boolean.pipe(withDefaults(() => false)),
   // Local-only UI preferences for hiding sidebar surfaces a user doesn't want.
   // `showChatsSection` controls the standalone "Chats" list in the sidebar footer
@@ -272,6 +279,26 @@ export const AppSettingsSchema = Schema.Struct({
   ).pipe(withDefaults(() => [])),
 });
 export type AppSettings = typeof AppSettingsSchema.Type;
+
+/** The settings values and mutation used by a mounted settings panel.
+ * The route owns the subscription so extracted workflow panels do not create
+ * duplicate local-storage/server-settings subscriptions. */
+export type AppSettingsBinding = {
+  readonly settings: AppSettings;
+  readonly defaults: AppSettings;
+  readonly updateSettings: (patch: Partial<AppSettings>) => void;
+};
+
+export function isGitTextGenerationSettingsDirty(
+  settings: AppSettings,
+  defaults: AppSettings,
+): boolean {
+  return (
+    (settings.textGenerationProvider ?? "codex") !== (defaults.textGenerationProvider ?? "codex") ||
+    (settings.textGenerationModel ?? DEFAULT_GIT_TEXT_GENERATION_MODEL) !==
+      (defaults.textGenerationModel ?? DEFAULT_GIT_TEXT_GENERATION_MODEL)
+  );
+}
 
 type Mutable<T> = { -readonly [Key in keyof T]: T[Key] };
 type MutableServerSettingsPatch = Mutable<ServerSettingsPatch>;
