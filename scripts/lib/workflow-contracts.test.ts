@@ -82,6 +82,8 @@ const windowsPersistenceHome = "${{ runner.temp }}\\super-synara-persistence-win
 const windowsStartupHome = "${{ runner.temp }}\\super-synara-ci-home";
 const macosPersistenceHome = "${{ runner.temp }}/super-synara-persistence-macos-home";
 const macosStartupHome = "${{ runner.temp }}/super-synara-ci-home";
+const linuxPlaywrightCachePath = "~/.cache/ms-playwright";
+const windowsPlaywrightCachePath = "~\\AppData\\Local\\ms-playwright";
 const nativeDesktopBuildStep = [
   "      - name: Build desktop pipeline",
   "        env:",
@@ -1188,6 +1190,66 @@ jobs:
       ),
     );
     expect(missingBaseline).toContain("must publish the linux quarantine summary");
+  });
+
+  it("keeps Playwright browser caches outside the checkout at OS-default paths", () => {
+    const checkoutCachePath = "${{ github.workspace }}/.playwright-browsers";
+    const workflowOverride = errorsFor(
+      ciWorkflow.replace(
+        "jobs:\n",
+        `env:
+  PLAYWRIGHT_BROWSERS_PATH: ${checkoutCachePath}
+jobs:
+`,
+      ),
+    );
+    expect(workflowOverride).toContain(
+      "must use Playwright's OS-default browser paths without a workflow-level PLAYWRIGHT_BROWSERS_PATH override",
+    );
+
+    expect(
+      errorsFor(
+        ciWorkflow.replace(
+          `          path: ${linuxPlaywrightCachePath}`,
+          `          path: ${checkoutCachePath}`,
+        ),
+      ),
+    ).toContain(`quality_linux must cache Playwright browsers at ${linuxPlaywrightCachePath}`);
+    expect(
+      errorsFor(
+        ciWorkflow.replace(
+          `          path: ${windowsPlaywrightCachePath}`,
+          `          path: ${checkoutCachePath}`,
+        ),
+      ),
+    ).toContain(`browser_windows must cache Playwright browsers at ${windowsPlaywrightCachePath}`);
+
+    const jobOverride = errorsFor(
+      ciWorkflow.replace(
+        "    timeout-minutes: 60\n    steps:",
+        `    timeout-minutes: 60
+    env:
+      PLAYWRIGHT_BROWSERS_PATH: ${checkoutCachePath}
+    steps:`,
+      ),
+    );
+    expect(jobOverride).toContain(
+      "quality_linux must use Playwright's OS-default browser path without PLAYWRIGHT_BROWSERS_PATH overrides",
+    );
+
+    const stepOverride = errorsFor(
+      ciWorkflow.replace(
+        "      - name: Browser test (stable)\n        timeout-minutes: 20\n        run: bun run --cwd apps/web test:browser:stable",
+        `      - name: Browser test (stable)
+        timeout-minutes: 20
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${checkoutCachePath}
+        run: bun run --cwd apps/web test:browser:stable`,
+      ),
+    );
+    expect(stepOverride).toContain(
+      "quality_linux must use Playwright's OS-default browser path without PLAYWRIGHT_BROWSERS_PATH overrides",
+    );
   });
 
   it("keeps the required quality context as an exact fail-closed aggregate", () => {

@@ -35,9 +35,15 @@ const EXPECTED_DISABLED_PATHS = new Set([
   ".github/workflows/release.yml",
 ]);
 const MATRIX_RUNNER_EXPRESSION = "${{ matrix.runner }}";
+const CACHE_ACTION = "actions/cache@caa296126883cff596d87d8935842f9db880ef25";
 const UPLOAD_ARTIFACT_ACTION = "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a";
 const DOWNLOAD_ARTIFACT_ACTION =
   "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c";
+const PLAYWRIGHT_BROWSER_CACHE_PATHS = {
+  quality_linux: "~/.cache/ms-playwright",
+  browser_windows: "~\\AppData\\Local\\ms-playwright",
+} as const;
+type PlaywrightCacheJobName = keyof typeof PLAYWRIGHT_BROWSER_CACHE_PATHS;
 const FULL_UNIT_COMMAND = "bun turbo test";
 const WINDOWS_JOB_LAUNCHER_X64_COMMAND =
   "node apps/server/scripts/build-windows-job-launcher.mjs --arch x64";
@@ -647,6 +653,40 @@ function validateArtifactAction(
     errors.push(`${workflowPath} ${jobName} artifact ${expected.name} must fail closed.`);
   }
   return index;
+}
+
+function validatePlaywrightBrowserCache(
+  workflowPath: string,
+  jobName: PlaywrightCacheJobName,
+  job: UnknownRecord,
+  errors: string[],
+): void {
+  const hasJobOverride = isRecord(job.env) && job.env.PLAYWRIGHT_BROWSERS_PATH !== undefined;
+  const hasStepOverride =
+    Array.isArray(job.steps) &&
+    job.steps.some(
+      (step) =>
+        isRecord(step) && isRecord(step.env) && step.env.PLAYWRIGHT_BROWSERS_PATH !== undefined,
+    );
+  if (hasJobOverride || hasStepOverride) {
+    errors.push(
+      `${workflowPath} ${jobName} must use Playwright's OS-default browser path without PLAYWRIGHT_BROWSERS_PATH overrides.`,
+    );
+  }
+
+  const expectedPath = PLAYWRIGHT_BROWSER_CACHE_PATHS[jobName];
+  const cacheSteps = Array.isArray(job.steps)
+    ? job.steps.filter((step) => isRecord(step) && step.name === "Cache Playwright browsers")
+    : [];
+  const cacheStep = cacheSteps.length === 1 ? cacheSteps[0] : null;
+  if (
+    !isRecord(cacheStep) ||
+    cacheStep.uses !== CACHE_ACTION ||
+    !isRecord(cacheStep.with) ||
+    cacheStep.with.path !== expectedPath
+  ) {
+    errors.push(`${workflowPath} ${jobName} must cache Playwright browsers at ${expectedPath}.`);
+  }
 }
 
 function validateIndependentWindowsQualityJob(
@@ -1269,6 +1309,11 @@ function allowedWritePermission(path: string, location: string, scope: string): 
 
 function validateCiArchitecture(workflow: UnknownRecord, errors: string[]): void {
   const workflowPath = ".github/workflows/ci.yml";
+  if (isRecord(workflow.env) && workflow.env.PLAYWRIGHT_BROWSERS_PATH !== undefined) {
+    errors.push(
+      `${workflowPath} must use Playwright's OS-default browser paths without a workflow-level PLAYWRIGHT_BROWSERS_PATH override.`,
+    );
+  }
   if (!isRecord(workflow.jobs)) {
     errors.push(`${workflowPath} must define jobs.`);
     return;
@@ -1297,6 +1342,7 @@ function validateCiArchitecture(workflow: UnknownRecord, errors: string[]): void
         );
       }
     }
+    validatePlaywrightBrowserCache(workflowPath, "quality_linux", qualityJob, errors);
     validateQuarantineCommands(workflowPath, "quality_linux", steps, "linux", errors);
     const uploadIndex = validateArtifactAction(
       workflowPath,
@@ -1416,6 +1462,7 @@ function validateCiArchitecture(workflow: UnknownRecord, errors: string[]): void
       "bun run --cwd apps/web test:browser:stable",
       errors,
     );
+    validatePlaywrightBrowserCache(workflowPath, "browser_windows", browserJob, errors);
     validateQuarantineCommands(workflowPath, "browser_windows", steps, "windows", errors);
   }
 
