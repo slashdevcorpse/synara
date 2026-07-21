@@ -4,6 +4,7 @@
 // Exports: Vitest suites for opencodeRuntime.ts
 
 import {
+  Cause,
   Deferred,
   Duration,
   Effect,
@@ -792,6 +793,72 @@ describe("OpenCodeRuntime local server pool", () => {
       ),
     );
     expect(Exit.isSuccess(runtimeExit)).toBe(true);
+  });
+
+  it("attempts every idle pool before failing runtime shutdown on unproven exit", async () => {
+    const state = { spawnUrls: [] as Array<string>, killUrls: [] as Array<string> };
+    const processUrls = new Map<number, string>();
+    const attemptedUrls: string[] = [];
+    const unprovenExit = new ProviderProcessExitUnprovenError({
+      rootPid: 59_000,
+      rootExited: false,
+      remainingDescendantPids: [59_099],
+      captureComplete: true,
+    });
+    const layer = makeTestOpenCodeRuntimeLive({
+      teardownProcessTree: async ({ rootPid }) => {
+        const url = processUrls.get(rootPid);
+        if (url === undefined) {
+          throw new Error(`Missing test URL for process ${rootPid}.`);
+        }
+        attemptedUrls.push(url);
+        if (rootPid === 59_000) {
+          throw unprovenExit;
+        }
+        state.killUrls.push(url);
+        return { escalated: false, signalErrors: [] };
+      },
+    }).pipe(Layer.provide(mockPooledOpenCodeServerSpawnerLayer({ ...state, processUrls })));
+
+    const runtimeExit = await Effect.runPromise(
+      Effect.exit(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const runtime = yield* OpenCodeRuntime;
+            const firstScope = yield* Scope.make();
+            const secondScope = yield* Scope.make();
+
+            yield* runtime
+              .connectToOpenCodeServer({ binaryPath: "opencode", cwd: "/repo/first" })
+              .pipe(Effect.provideService(Scope.Scope, firstScope));
+            yield* runtime
+              .connectToOpenCodeServer({ binaryPath: "opencode", cwd: "/repo/second" })
+              .pipe(Effect.provideService(Scope.Scope, secondScope));
+
+            yield* Scope.close(firstScope, Exit.void);
+            yield* Scope.close(secondScope, Exit.void);
+          }),
+        ).pipe(Effect.provide(layer)),
+      ),
+    );
+
+    expect(state.spawnUrls).toEqual(["http://127.0.0.1:59000", "http://127.0.0.1:59001"]);
+    expect(attemptedUrls).toEqual(["http://127.0.0.1:59000", "http://127.0.0.1:59001"]);
+    expect(state.killUrls).toEqual(["http://127.0.0.1:59001"]);
+    expect(Exit.isFailure(runtimeExit)).toBe(true);
+    if (Exit.isFailure(runtimeExit)) {
+      const shutdownFailure = Cause.squash(runtimeExit.cause);
+      expect(shutdownFailure).toBeInstanceOf(AggregateError);
+      if (shutdownFailure instanceof AggregateError) {
+        expect(shutdownFailure.message).toBe(
+          "OpenCode runtime shutdown failed to prove process-tree exit for 1 pooled server.",
+        );
+        expect(shutdownFailure.errors).toHaveLength(1);
+        expect(shutdownFailure.errors[0]).toMatchObject({
+          operation: "closeLocalServerPoolsForCliSpec",
+        });
+      }
+    }
   });
 
   it("retains a failed readiness owner until target cleanup retries exact exit proof", async () => {

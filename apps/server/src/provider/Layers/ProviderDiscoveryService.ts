@@ -28,7 +28,6 @@ import {
 } from "../skillsCatalog.ts";
 import {
   makeProviderMaintenanceGate,
-  ProviderMaintenanceBusyError,
   type ProviderMaintenanceGate,
 } from "../providerMaintenanceGate.ts";
 
@@ -79,20 +78,23 @@ const make = (options?: ProviderDiscoveryServiceLiveOptions) =>
       readonly operation: string;
       readonly run: Effect.Effect<A, E, R>;
     }): Effect.Effect<A, E | ProviderValidationError, R> =>
-      maintenanceGate.withOperation(input).pipe(
-        Effect.catchTag("ProviderMaintenanceBusyError", (error) => {
-          if (!(error instanceof ProviderMaintenanceBusyError)) {
-            return Effect.fail(error);
-          }
-          return Effect.fail(
-            new ProviderValidationError({
-              operation: input.operation,
-              issue: error.message,
-              cause: error,
-            }),
-          );
-        }),
-      );
+      maintenanceGate
+        .withOperation({
+          provider: input.provider,
+          operation: input.operation,
+          run: Effect.result(input.run),
+        })
+        .pipe(
+          Effect.mapError(
+            (error) =>
+              new ProviderValidationError({
+                operation: input.operation,
+                issue: error.message,
+                cause: error,
+              }),
+          ),
+          Effect.flatMap((result) => Effect.fromResult(result)),
+        );
 
     const getComposerCapabilities: ProviderDiscoveryServiceShape["getComposerCapabilities"] = (
       input,

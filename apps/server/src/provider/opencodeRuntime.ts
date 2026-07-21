@@ -1252,11 +1252,41 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
 
     const closePooledServerTotal = (
       pooledServer: PooledOpenCodeServer,
-      phase: "idle-timeout" | "process-exit" | "runtime-shutdown",
+      phase: "idle-timeout" | "process-exit",
     ) =>
       closePooledServer(pooledServer).pipe(
         Effect.catch((error) => reportPooledServerCloseFailure(phase, error)),
       );
+
+    const closePooledServersForRuntimeShutdown = pooledServerMutex.withPermit(
+      Effect.gen(function* () {
+        const failures: OpenCodeRuntimeError[] = [];
+        for (const pooledServer of Array.from(pooledServers.values())) {
+          const closeExit = yield* Effect.exit(closePooledServer(pooledServer));
+          if (Exit.isSuccess(closeExit)) {
+            continue;
+          }
+
+          const cause = Cause.squash(closeExit.cause);
+          const error = ensureRuntimeError(
+            "closeLocalServerPoolsForCliSpec",
+            `Failed to prove local server process-tree exit during runtime shutdown: ${openCodeRuntimeErrorDetail(cause)}`,
+            cause,
+          );
+          failures.push(error);
+          yield* reportPooledServerCloseFailure("runtime-shutdown", error);
+        }
+
+        if (failures.length > 0) {
+          return yield* Effect.die(
+            new AggregateError(
+              failures,
+              `OpenCode runtime shutdown failed to prove process-tree exit for ${String(failures.length)} pooled server${failures.length === 1 ? "" : "s"}.`,
+            ),
+          );
+        }
+      }),
+    );
 
     const schedulePooledServerIdleClose = Effect.fn("schedulePooledServerIdleClose")(function* (
       pooledServer: PooledOpenCodeServer,
@@ -1441,15 +1471,7 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
         }),
       );
 
-    yield* Effect.addFinalizer(() =>
-      pooledServerMutex.withPermit(
-        Effect.gen(function* () {
-          for (const pooledServer of Array.from(pooledServers.values())) {
-            yield* closePooledServerTotal(pooledServer, "runtime-shutdown");
-          }
-        }),
-      ),
-    );
+    yield* Effect.addFinalizer(() => closePooledServersForRuntimeShutdown);
 
     const connectToOpenCodeServer: OpenCodeRuntimeShape["connectToOpenCodeServer"] = (input) => {
       const serverUrl = input.serverUrl?.trim();

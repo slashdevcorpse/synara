@@ -65,7 +65,6 @@ import { makeProviderLifecycleCoordinator } from "../providerLifecycleCoordinato
 import { carryProviderAttachmentPaths } from "../providerAttachmentPaths.ts";
 import {
   makeProviderMaintenanceGate,
-  ProviderMaintenanceBusyError,
   type ProviderMaintenanceGate,
 } from "../providerMaintenanceGate.ts";
 
@@ -311,14 +310,16 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
       readonly operation: string;
       readonly run: Effect.Effect<A, E, R>;
     }): Effect.Effect<A, E | ProviderValidationError, R> =>
-      maintenanceGate.withOperation(input).pipe(
-        Effect.catchTag("ProviderMaintenanceBusyError", (error) => {
-          if (!(error instanceof ProviderMaintenanceBusyError)) {
-            return Effect.fail(error);
-          }
-          return Effect.fail(toValidationError(input.operation, error.message, error));
-        }),
-      );
+      maintenanceGate
+        .withOperation({
+          provider: input.provider,
+          operation: input.operation,
+          run: Effect.result(input.run),
+        })
+        .pipe(
+          Effect.mapError((error) => toValidationError(input.operation, error.message, error)),
+          Effect.flatMap((result) => Effect.fromResult(result)),
+        );
     const lifecycle = makeProviderLifecycleCoordinator();
     const persistedBindings = yield* directory.listBindings();
     for (const binding of persistedBindings) {
