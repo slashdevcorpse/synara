@@ -629,7 +629,7 @@ function parseCliOptions(argv: ReadonlyArray<string>): FixtureCliOptions {
   return { mode: argv[0], synaraHome: argv[2]! };
 }
 
-function formatCause(cause: unknown): string {
+export function formatDesktopPersistenceSmokeFixtureCause(cause: unknown): string {
   if (cause instanceof FixtureInputError) {
     return `${cause.name}: ${cause.message}`;
   }
@@ -659,7 +659,9 @@ if (import.meta.main) {
   try {
     await runCli(process.argv.slice(2));
   } catch (cause) {
-    process.stderr.write(`${FIXTURE_PREFIX}: failed\n${formatCause(cause)}\n`);
+    process.stderr.write(
+      `${FIXTURE_PREFIX}: failed\n${formatDesktopPersistenceSmokeFixtureCause(cause)}\n`,
+    );
     process.exitCode = 1;
   }
 }
