@@ -5,7 +5,8 @@
  * state to render tabs/toolbars and survive thread switches predictably.
  */
 
-import type { ThreadBrowserState, ThreadId } from "@synara/contracts";
+import type { BrowserTabState, ThreadBrowserState, ThreadId } from "@synara/contracts";
+import { LOCAL_PREVIEW_ROUTE_PREFIX } from "@synara/shared/localPreviewFiles";
 import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
 import { isPlainObject, sanitizeStringKeyedRecord } from "./persistedRecord";
@@ -36,6 +37,27 @@ interface BrowserStateStore {
 function normalizeHistoryUrl(url: string): string {
   const trimmed = url.trim();
   return trimmed === "about:blank" ? "" : trimmed;
+}
+
+function isLocalPreviewCapabilityUrl(url: string): boolean {
+  try {
+    return new URL(url).pathname.startsWith(`${LOCAL_PREVIEW_ROUTE_PREFIX}/`);
+  } catch {
+    return url.startsWith(`${LOCAL_PREVIEW_ROUTE_PREFIX}/`);
+  }
+}
+
+export function browserHistoryEntryFromTab(
+  tab: Pick<BrowserTabState, "id" | "title" | "url" | "lastCommittedUrl" | "localFilePath">,
+): BrowserHistoryEntry | null {
+  if (tab.localFilePath) {
+    return null;
+  }
+  const url = tab.lastCommittedUrl ?? tab.url;
+  if (isLocalPreviewCapabilityUrl(url)) {
+    return null;
+  }
+  return { url, title: tab.title, tabId: tab.id };
 }
 
 function upsertRecentHistoryEntry(
@@ -88,6 +110,9 @@ function sanitizeBrowserHistoryEntry(rawEntry: unknown): BrowserHistoryEntry | n
   }
   const { url, title, tabId } = rawEntry;
   if (typeof url !== "string" || typeof title !== "string" || typeof tabId !== "string") {
+    return null;
+  }
+  if (isLocalPreviewCapabilityUrl(url)) {
     return null;
   }
   return { url, title, tabId };
@@ -154,15 +179,10 @@ export const useBrowserStateStore = create<BrowserStateStore>()(
             : state.tabs;
           const previousHistory =
             current.recentHistoryByThreadId[state.threadId] ?? EMPTY_BROWSER_HISTORY;
-          const nextHistory = orderedTabs.reduce(
-            (entries, tab) =>
-              upsertRecentHistoryEntry(entries, {
-                url: tab.lastCommittedUrl ?? tab.url,
-                title: tab.title,
-                tabId: tab.id,
-              }),
-            previousHistory,
-          );
+          const nextHistory = orderedTabs.reduce((entries, tab) => {
+            const nextEntry = browserHistoryEntryFromTab(tab);
+            return nextEntry ? upsertRecentHistoryEntry(entries, nextEntry) : entries;
+          }, previousHistory);
           const historyChanged = !sameBrowserHistoryEntries(previousHistory, nextHistory);
 
           return {

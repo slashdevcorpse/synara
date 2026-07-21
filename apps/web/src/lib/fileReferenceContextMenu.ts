@@ -17,6 +17,8 @@ export async function showFileReferenceContextMenu(input: {
   selection?: Omit<ChatFileReference, "path"> | null;
   onReferenceInChat: ((reference: ChatFileReference) => void) | undefined;
   onAskWhyInChat?: ((reference: ChatFileReference) => void) | undefined;
+  /** HTML-only action supplied by callers that can mint a browser capability. */
+  onOpenInBrowser?: (() => void) | undefined;
 }): Promise<void> {
   const api = readNativeApi();
   if (!api) {
@@ -50,6 +52,9 @@ export async function showFileReferenceContextMenu(input: {
             },
           ]
         : []),
+      ...(input.onOpenInBrowser
+        ? [{ id: "open-in-browser" as const, label: "Open in browser" }]
+        : []),
       { id: "copy-path" as const, label: "Copy path" },
     ],
     input.position,
@@ -60,6 +65,10 @@ export async function showFileReferenceContextMenu(input: {
   }
   if (clicked === "ask-why-in-chat") {
     input.onAskWhyInChat?.(reference);
+    return;
+  }
+  if (clicked === "open-in-browser") {
+    input.onOpenInBrowser?.();
     return;
   }
   if (clicked === "copy-path") {

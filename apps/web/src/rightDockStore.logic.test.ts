@@ -8,6 +8,7 @@ import {
   openPaneInState,
   sanitizeRightDockStateByThreadId,
   sanitizeRightDockThreadState,
+  stripTransientRightDockBrowserRequests,
   updatePaneInState,
 } from "./rightDockStore.logic";
 
@@ -256,6 +257,85 @@ describe("file panes", () => {
     });
     expect(state.panes[0]?.kind).toBe("file");
     expect(state.panes[0]?.filePath).toBe("src/page.tsx");
+  });
+});
+
+describe("browser navigation requests", () => {
+  const firstRequest = {
+    id: "request-1",
+    url: "https://example.com/first",
+    localFilePath: null,
+  };
+
+  it("stores a request when opening the browser and replaces it on singleton reuse", () => {
+    const opened = openPaneInState(createDefaultRightDockState(), {
+      paneId: "browser-1",
+      kind: "browser",
+      browserRequest: firstRequest,
+    });
+    const secondRequest = {
+      id: "request-2",
+      url: "http://127.0.0.1:58090/api/local-preview/token/docs/demo.html",
+      localFilePath: "C:\\workspace\\docs\\demo.html",
+    };
+    const reopened = openPaneInState(opened, {
+      paneId: "browser-2",
+      kind: "browser",
+      browserRequest: secondRequest,
+    });
+
+    expect(reopened.panes).toHaveLength(1);
+    expect(reopened.panes[0]?.browserRequest).toEqual(secondRequest);
+  });
+
+  it("preserves the current request on a bare browser reopen and clears it by identity", () => {
+    const opened = openPaneInState(createDefaultRightDockState(), {
+      paneId: "browser-1",
+      kind: "browser",
+      browserRequest: firstRequest,
+    });
+    const reopened = openPaneInState(opened, { paneId: "browser-2", kind: "browser" });
+    expect(reopened.panes[0]?.browserRequest).toBe(firstRequest);
+
+    const cleared = updatePaneInState(reopened, "browser-1", { browserRequest: null });
+    expect(cleared.panes[0]?.browserRequest).toBeNull();
+  });
+
+  it("drops a persisted request so capability URLs never rehydrate", () => {
+    const sanitized = sanitizeRightDockThreadState({
+      open: true,
+      activePaneId: "browser-1",
+      panes: [
+        {
+          id: "browser-1",
+          kind: "browser",
+          browserRequest: {
+            id: "persisted-secret",
+            url: "http://127.0.0.1:58090/api/local-preview/secret/docs/demo.html",
+            localFilePath: "C:\\workspace\\docs\\demo.html",
+          },
+        },
+      ],
+    });
+
+    expect(sanitized.panes[0]?.browserRequest).toBeNull();
+  });
+
+  it("removes capability requests from the persistence snapshot without mutating runtime state", () => {
+    const runtime = openPaneInState(createDefaultRightDockState(), {
+      paneId: "browser-1",
+      kind: "browser",
+      browserRequest: {
+        id: "request-secret",
+        url: "http://127.0.0.1:58090/api/local-preview/secret/docs/demo.html",
+        localFilePath: "C:\\workspace\\docs\\demo.html",
+      },
+    });
+
+    const persisted = stripTransientRightDockBrowserRequests({ thread: runtime });
+    expect(runtime.panes[0]?.browserRequest?.id).toBe("request-secret");
+    expect(persisted.thread?.panes[0]?.browserRequest).toBeNull();
+    expect(JSON.stringify(persisted)).not.toContain("secret");
   });
 });
 

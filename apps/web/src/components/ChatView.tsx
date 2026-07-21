@@ -3690,6 +3690,10 @@ export default function ChatView({
   }, [browserOpen, navigate, onToggleBrowserPanel, threadId]);
   const openBrowserUrl = useCallback(
     (url: string) => {
+      if (onOpenBrowserUrl) {
+        onOpenBrowserUrl(url);
+        return;
+      }
       const api = readNativeApi();
       void api?.browser.open({ threadId, initialUrl: url }).catch((error) => {
         toastManager.add({
@@ -3699,10 +3703,6 @@ export default function ChatView({
             error instanceof Error ? error.message : "The in-app browser could not open GitHub.",
         });
       });
-      if (onOpenBrowserUrl) {
-        onOpenBrowserUrl(url);
-        return;
-      }
       void navigate({
         to: "/$threadId",
         params: { threadId },

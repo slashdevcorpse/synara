@@ -11,6 +11,7 @@ const PROJECT_SEARCH_ENTRIES_MAX_LIMIT = 200;
 const PROJECT_SEARCH_LOCAL_ENTRIES_MAX_LIMIT = 100;
 const PROJECT_FILE_PATH_MAX_LENGTH = 512;
 const PROJECT_READ_FILE_PATH_MAX_LENGTH = 2048;
+const PROJECT_LOCAL_PREVIEW_URL_PATH_MAX_LENGTH = 8192;
 const PROJECT_READ_FILE_MAX_BYTES = 1_000_000;
 const PROJECT_DIRECTORY_LIST_MAX_DEPTH = 32;
 const PROJECT_SCRIPT_DISCOVERY_MAX_DEPTH = 3;
@@ -153,8 +154,19 @@ export const ProjectReadFileResult = Schema.Struct({
 });
 export type ProjectReadFileResult = typeof ProjectReadFileResult.Type;
 
+export const ProjectLocalPreviewGrantScope = Schema.Literals(["file", "directory"]);
+export type ProjectLocalPreviewGrantScope = typeof ProjectLocalPreviewGrantScope.Type;
+
+export const ProjectLocalPreviewGrantPurpose = Schema.Literals(["preview", "browser"]);
+export type ProjectLocalPreviewGrantPurpose = typeof ProjectLocalPreviewGrantPurpose.Type;
+
 export const ProjectCreateLocalFilePreviewGrantInput = Schema.Struct({
   path: TrimmedNonEmptyString.check(Schema.isMaxLength(PROJECT_READ_FILE_PATH_MAX_LENGTH)),
+  cwd: Schema.optional(
+    TrimmedNonEmptyString.check(Schema.isMaxLength(PROJECT_READ_FILE_PATH_MAX_LENGTH)),
+  ),
+  scope: Schema.optional(ProjectLocalPreviewGrantScope),
+  purpose: Schema.optional(ProjectLocalPreviewGrantPurpose),
 });
 export type ProjectCreateLocalFilePreviewGrantInput =
   typeof ProjectCreateLocalFilePreviewGrantInput.Type;
@@ -162,6 +174,9 @@ export type ProjectCreateLocalFilePreviewGrantInput =
 export const ProjectCreateLocalFilePreviewGrantResult = Schema.Struct({
   grant: TrimmedNonEmptyString,
   expiresAt: TrimmedNonEmptyString,
+  urlPath: Schema.optional(
+    TrimmedNonEmptyString.check(Schema.isMaxLength(PROJECT_LOCAL_PREVIEW_URL_PATH_MAX_LENGTH)),
+  ),
 });
 export type ProjectCreateLocalFilePreviewGrantResult =
   typeof ProjectCreateLocalFilePreviewGrantResult.Type;

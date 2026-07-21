@@ -1,6 +1,6 @@
 // FILE: splitViewStore.test.ts
 // Purpose: Verify tree-aware split view state operations: drop creation, perpendicular subdivision,
-// pane focus/ratio mutations, deleted-thread collapse semantics, and v1 -> v2 persisted-state migration.
+// pane focus/ratio mutations, deleted-thread collapse semantics, and persisted-state migration.
 
 import { ProjectId, ThreadId, TurnId } from "@synara/contracts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -117,7 +117,232 @@ describe("splitViewStore", () => {
     const persisted = globalThis.localStorage.getItem("synara:split-view-state:v1");
     expect(persisted).not.toBeNull();
     expect(globalThis.localStorage.getItem("synara:split-view-state:v2")).toBeNull();
-    expect(JSON.parse(persisted ?? "{}")).toMatchObject({ version: 2 });
+    expect(JSON.parse(persisted ?? "{}")).toMatchObject({ version: 3 });
+  });
+
+  it("finishes hydration when the persisted storage key is absent", async () => {
+    vi.resetModules();
+    globalThis.localStorage = createMemoryStorage();
+    const { useSplitViewStore: freshSplitViewStore } = await import("./splitViewStore");
+
+    await vi.waitFor(() => {
+      expect(freshSplitViewStore.getState().hasHydrated).toBe(true);
+    });
+    expect(freshSplitViewStore.persist.hasHydrated()).toBe(true);
+    expect(freshSplitViewStore.getState().splitViewsById).toEqual({});
+    expect(freshSplitViewStore.getState().splitViewIdBySourceThreadId).toEqual({});
+  });
+
+  it.each([
+    ["missing root", undefined],
+    [
+      "missing split child",
+      {
+        kind: "split",
+        id: "root-corrupt",
+        direction: "horizontal",
+        ratio: 0.5,
+        first: {
+          kind: "leaf",
+          id: "leaf-valid",
+          threadId: THREAD_A,
+          panel: {
+            panel: null,
+            diffTurnId: null,
+            diffFilePath: null,
+            hasOpenedPanel: false,
+            lastOpenPanel: "browser",
+          },
+        },
+      },
+    ],
+    [
+      "source thread absent from its leaves",
+      {
+        kind: "leaf",
+        id: "leaf-valid",
+        threadId: THREAD_B,
+        panel: {
+          panel: null,
+          diffTurnId: null,
+          diffFilePath: null,
+          hasOpenedPanel: false,
+          lastOpenPanel: "browser",
+        },
+      },
+    ],
+    [
+      "empty thread id",
+      {
+        kind: "split",
+        id: "root-corrupt",
+        direction: "horizontal",
+        ratio: 0.5,
+        first: {
+          kind: "leaf",
+          id: "leaf-valid",
+          threadId: THREAD_A,
+          panel: {
+            panel: null,
+            diffTurnId: null,
+            diffFilePath: null,
+            hasOpenedPanel: false,
+            lastOpenPanel: "browser",
+          },
+        },
+        second: {
+          kind: "leaf",
+          id: "leaf-empty-thread",
+          threadId: "",
+          panel: {
+            panel: null,
+            diffTurnId: null,
+            diffFilePath: null,
+            hasOpenedPanel: false,
+            lastOpenPanel: "browser",
+          },
+        },
+      },
+    ],
+    [
+      "duplicate non-empty thread id",
+      {
+        kind: "split",
+        id: "root-corrupt",
+        direction: "horizontal",
+        ratio: 0.5,
+        first: {
+          kind: "leaf",
+          id: "leaf-valid",
+          threadId: THREAD_A,
+          panel: {
+            panel: null,
+            diffTurnId: null,
+            diffFilePath: null,
+            hasOpenedPanel: false,
+            lastOpenPanel: "browser",
+          },
+        },
+        second: {
+          kind: "leaf",
+          id: "leaf-duplicate-thread",
+          threadId: THREAD_A,
+          panel: {
+            panel: null,
+            diffTurnId: null,
+            diffFilePath: null,
+            hasOpenedPanel: false,
+            lastOpenPanel: "browser",
+          },
+        },
+      },
+    ],
+  ])("discards a v2 split view with a %s without aborting hydration", async (_label, root) => {
+    vi.resetModules();
+    globalThis.localStorage = createMemoryStorage();
+    globalThis.localStorage.setItem(
+      "synara:split-view-state:v1",
+      JSON.stringify({
+        state: {
+          splitViewsById: {
+            "split-corrupt": {
+              id: "split-corrupt",
+              sourceThreadId: THREAD_A,
+              ownerProjectId: PROJECT_ID,
+              root,
+              focusedPaneId: "leaf-valid",
+              createdAt: "2026-04-01T00:00:00.000Z",
+              updatedAt: "2026-04-01T00:00:00.000Z",
+            },
+          },
+          splitViewIdBySourceThreadId: { [THREAD_A]: "split-corrupt" },
+        },
+        version: 2,
+      }),
+    );
+
+    const { useSplitViewStore: freshSplitViewStore } = await import("./splitViewStore");
+
+    await vi.waitFor(() => expect(freshSplitViewStore.getState().hasHydrated).toBe(true));
+    expect(freshSplitViewStore.getState().splitViewsById).toEqual({});
+    expect(freshSplitViewStore.getState().splitViewIdBySourceThreadId).toEqual({});
+  });
+
+  it("keeps one-shot browser capability requests out of persisted split state", async () => {
+    vi.resetModules();
+    globalThis.localStorage = createMemoryStorage();
+    const { useSplitViewStore: freshSplitViewStore } = await import("./splitViewStore");
+    const splitViewId = freshSplitViewStore.getState().createFromThread({
+      sourceThreadId: THREAD_A,
+      ownerProjectId: PROJECT_ID,
+    });
+    const splitView = freshSplitViewStore.getState().splitViewsById[splitViewId];
+    expect(splitView).toBeDefined();
+    if (!splitView) return;
+    const paneId = findLeafIdForThread(splitView, THREAD_A);
+
+    freshSplitViewStore.getState().setPanePanelState(splitViewId, paneId, {
+      panel: "browser",
+      hasOpenedPanel: true,
+      browserRequest: {
+        id: "request-1",
+        url: "http://127.0.0.1:58090/api/local-preview/secret-token/docs/demo.html",
+        localFilePath: "C:\\workspace\\docs\\demo.html",
+      },
+    });
+
+    const runtimeLeaf = collectLeaves(
+      freshSplitViewStore.getState().splitViewsById[splitViewId]!.root,
+    ).find((leaf) => leaf.id === paneId);
+    expect(runtimeLeaf?.panel.browserRequest?.id).toBe("request-1");
+    const persisted = globalThis.localStorage.getItem("synara:split-view-state:v1") ?? "";
+    expect(persisted).not.toContain("secret-token");
+    expect(persisted).not.toContain("request-1");
+  });
+
+  it("strips a capability request injected into a current-version persisted leaf", async () => {
+    vi.resetModules();
+    globalThis.localStorage = createMemoryStorage();
+    const { useSplitViewStore: writerStore } = await import("./splitViewStore");
+    const splitViewId = writerStore.getState().createFromThread({
+      sourceThreadId: THREAD_A,
+      ownerProjectId: PROJECT_ID,
+    });
+    const storageKey = "synara:split-view-state:v1";
+    const payload = JSON.parse(globalThis.localStorage.getItem(storageKey) ?? "{}") as {
+      state: { splitViewsById: Record<string, { root: SplitNode }> };
+    };
+    const root = payload.state.splitViewsById[splitViewId]?.root;
+    expect(root).toBeDefined();
+    if (!root || root.first.kind !== "leaf") return;
+    root.first.panel.browserRequest = {
+      id: "injected-request",
+      url: "http://127.0.0.1:58090/api/local-preview/injected/docs/demo.html",
+      localFilePath: "C:\\workspace\\docs\\demo.html",
+    };
+    payload.state.splitViewsById["split-corrupt"] = {
+      root: undefined as never,
+    };
+    Object.assign(payload.state, {
+      splitViewIdBySourceThreadId: {
+        [THREAD_A]: splitViewId,
+        [THREAD_B]: "split-corrupt",
+      },
+    });
+    globalThis.localStorage.setItem(storageKey, JSON.stringify(payload));
+
+    vi.resetModules();
+    const { useSplitViewStore: readerStore } = await import("./splitViewStore");
+    const hydrated = readerStore.getState().splitViewsById[splitViewId];
+    expect(hydrated).toBeDefined();
+    if (!hydrated) return;
+    expect(collectLeaves(hydrated.root).every((leaf) => leaf.panel.browserRequest === null)).toBe(
+      true,
+    );
+    expect(readerStore.getState().splitViewsById["split-corrupt"]).toBeUndefined();
+    expect(readerStore.getState().splitViewIdBySourceThreadId).toEqual({
+      [THREAD_A]: splitViewId,
+    });
   });
 
   it("replaces an existing source split when creating a drop split for the same source", () => {
@@ -195,6 +420,10 @@ describe("splitViewStore", () => {
     expect(migrated.root.kind).toBe("split");
     expect(resolveFreshThreadIds(migrated).toSorted()).toEqual([THREAD_A, THREAD_B].toSorted());
     expect(resolveFreshFocusedThreadId(migrated)).toBe(THREAD_B);
+    for (const leaf of collectLeaves(migrated.root)) {
+      expect(leaf.panel.filePath).toBeNull();
+      expect(leaf.panel.browserRequest).toBeNull();
+    }
   });
 
   it("subdivides a target leaf perpendicular to its parent on dropThreadOnPane", () => {

@@ -18,6 +18,7 @@ import {
   sanitizeRightDockStateByThreadId,
   setActivePaneInState,
   setDockOpenInState,
+  stripTransientRightDockBrowserRequests,
   toggleSingletonPaneInState,
   updatePaneInState,
 } from "./rightDockStore.logic";
@@ -46,6 +47,7 @@ interface RightDockStore {
         | "diffTurnId"
         | "diffFilePath"
         | "filePath"
+        | "browserRequest"
         | "threadId"
         | "pullRequestProjectId"
         | "pullRequestRepository"
@@ -117,6 +119,11 @@ export const useRightDockStore = create<RightDockStore>()(
     {
       name: RIGHT_DOCK_STORAGE_KEY,
       storage: createJSONStorage(() => localStorage),
+      // Browser requests may contain short-lived capability URLs. They only
+      // need to survive component mount races, never an application restart.
+      partialize: (state) => ({
+        dockStateByThreadId: stripTransientRightDockBrowserRequests(state.dockStateByThreadId),
+      }),
       // Validate persisted panes on rehydrate so a stale/unknown pane kind from
       // an older app version can never crash the dock during render.
       merge: (persisted, current) => ({

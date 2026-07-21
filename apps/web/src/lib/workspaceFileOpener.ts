@@ -9,19 +9,24 @@
 //          resolveDockFileOpenTarget,
 //          openWorkspaceFileReference, prefetchWorkspaceFile
 
-import { isSupportedLocalPreviewFilePath } from "@synara/shared/localPreviewFiles";
-import {
-  isLocalAbsolutePath,
-  isWorkspaceRelativePathSafe,
-  workspaceRelativePathOf,
-} from "@synara/shared/path";
+import { isWorkspaceRelativePathSafe } from "@synara/shared/path";
 import { isScratchWorkspacePath } from "@synara/shared/threadWorkspace";
 import type { QueryClient } from "@tanstack/react-query";
 import { createContext, useContext } from "react";
 
 import { openInPreferredEditor } from "../editorPreferences";
 import { readNativeApi } from "../nativeApi";
-import { projectReadFileQueryOptions } from "./projectReactQuery";
+import {
+  localFilePreviewKindForPath,
+  parseLocalFileReference,
+  resolveActiveWorkspaceFilePath,
+  resolveLocalFileOpenIntent,
+} from "./localFileOpenIntent";
+import { buildLocalPreviewCapabilityUrl } from "./localImageUrls";
+import {
+  projectLocalHtmlPreviewGrantQueryOptions,
+  projectReadFileQueryOptions,
+} from "./projectReactQuery";
 
 export interface WorkspaceFileOpener {
   /**
@@ -40,9 +45,6 @@ export function useWorkspaceFileOpener(): WorkspaceFileOpener | null {
   return useContext(WorkspaceFileOpenerContext);
 }
 
-// Trailing `:line` / `:line:col` suffix carried by resolved markdown file links.
-// The in-app viewer previews whole files, so the position is dropped.
-const FILE_POSITION_SUFFIX_PATTERN = /:\d+(?::\d+)?$/;
 const SYNARA_PUBLIC_ASSET_PATH_PREFIXES = [
   "/central-icons-reversed/",
   "/central-icons-fill/",
@@ -70,8 +72,9 @@ function resolveSynaraPublicAssetOpenTarget(path: string, workspaceRoot: string 
 export function resolveWorkspaceFileOpenTarget(
   rawPath: string,
   workspaceRoot: string | null,
+  referenceRoot?: string | null,
 ): string | null {
-  const withoutPosition = rawPath.trim().replace(FILE_POSITION_SUFFIX_PATTERN, "");
+  const withoutPosition = parseLocalFileReference(rawPath)?.path ?? "";
   if (withoutPosition.length === 0) {
     return null;
   }
@@ -81,9 +84,13 @@ export function resolveWorkspaceFileOpenTarget(
   if (!workspaceRoot) {
     return null;
   }
-  const workspaceRelativePath = workspaceRelativePathOf(withoutPosition, workspaceRoot);
-  if (workspaceRelativePath) {
-    return workspaceRelativePath;
+  const resolution = resolveActiveWorkspaceFilePath({
+    rawPath,
+    runtimeRoot: workspaceRoot,
+    referenceRoot,
+  });
+  if (resolution.kind === "workspace") {
+    return resolution.path;
   }
   // CentralIcon assets are linked in chat as Vite root URLs
   // (`/central-icons-...`) but the file viewer needs the repo path.
@@ -91,43 +98,82 @@ export function resolveWorkspaceFileOpenTarget(
 }
 
 /**
- * Out-of-workspace fallback for surfaces that can preview binary files: a
+ * Out-of-workspace fallback for trusted per-thread scratch files: a
  * session that starts before its chat workspace exists runs in a scratch
  * directory under the OS temp dir, and the agent references those files by
- * absolute path. Images and PDFs stream through the allowlisted local-image
- * route (which also serves the scratch root), so they can still open in-app.
- * Anything else returns null — the text file-read RPC only accepts
- * workspace-relative paths, so those references fall back to the external
- * editor.
+ * absolute path. Dedicated binary routes and short-lived grants keep supported
+ * scratch previews in-app without admitting arbitrary absolute paths.
  */
 export function resolveScratchPreviewFileOpenTarget(rawPath: string): string | null {
-  const withoutPosition = rawPath.trim().replace(FILE_POSITION_SUFFIX_PATTERN, "");
-  if (!isScratchWorkspacePath(withoutPosition)) {
-    return null;
-  }
-  return isSupportedLocalPreviewFilePath(withoutPosition) ? withoutPosition : null;
+  const resolution = resolveActiveWorkspaceFilePath({ rawPath, runtimeRoot: null });
+  return resolution.kind === "scratch" ? resolution.path : null;
 }
 
-// Right-dock file panes can show workspace files plus absolute local paths.
-// Relative paths still require a workspace; absolute paths are read as-is.
+// Right-dock file panes accept active-workspace files and trusted scratch files.
+// Other absolute paths fail closed and fall back to the external editor.
 export function resolveDockFileOpenTarget(
   rawPath: string,
   workspaceRoot: string | null,
+  referenceRoot?: string | null,
 ): string | null {
-  const withoutPosition = rawPath.trim().replace(FILE_POSITION_SUFFIX_PATTERN, "");
-  if (withoutPosition.length === 0) {
-    return null;
-  }
   const workspaceTarget = workspaceRoot
-    ? resolveWorkspaceFileOpenTarget(rawPath, workspaceRoot)
+    ? resolveWorkspaceFileOpenTarget(rawPath, workspaceRoot, referenceRoot)
     : null;
   if (workspaceTarget) {
     return workspaceTarget;
   }
-  if (isLocalAbsolutePath(withoutPosition)) {
-    return withoutPosition;
+  const intent = resolveLocalFileOpenIntent({
+    rawPath,
+    runtimeRoot: workspaceRoot,
+    referenceRoot,
+    allowOutsideWorkspaceFilePreview: true,
+  });
+  return intent.kind === "failure" || intent.kind === "external-editor" ? null : intent.path;
+}
+
+export interface WorkspaceHtmlBrowserOpenRequest {
+  readonly url: string;
+  readonly localFilePath: string;
+}
+
+export type WorkspaceHtmlBrowserOpenHandler = (request: WorkspaceHtmlBrowserOpenRequest) => void;
+
+/** Mint a fresh browser-purpose capability immediately before navigation. */
+export async function createWorkspaceHtmlBrowserOpenRequest(input: {
+  readonly queryClient: QueryClient;
+  readonly filePath: string;
+  readonly workspaceRoot: string | null;
+  readonly referenceRoot?: string | null | undefined;
+}): Promise<WorkspaceHtmlBrowserOpenRequest> {
+  const intent = resolveLocalFileOpenIntent({
+    rawPath: input.filePath,
+    runtimeRoot: input.workspaceRoot,
+    referenceRoot: input.referenceRoot,
+    action: "browser",
+  });
+  if (intent.kind !== "browser-html") {
+    throw new Error(
+      intent.kind === "failure" && intent.reason === "outside-workspace"
+        ? "HTML file is outside the active workspace."
+        : "Only HTML files can open in the browser.",
+    );
   }
-  return resolveScratchPreviewFileOpenTarget(rawPath);
+  const grant = await input.queryClient.fetchQuery(
+    projectLocalHtmlPreviewGrantQueryOptions({
+      path: intent.path,
+      cwd: isScratchWorkspacePath(intent.path) ? null : input.workspaceRoot,
+      purpose: "browser",
+      // Browser launches always receive a newly minted short-lived capability.
+      staleTime: 0,
+    }),
+  );
+  if (!grant.urlPath) {
+    throw new Error("The server did not return an HTML browser capability URL.");
+  }
+  return {
+    url: buildLocalPreviewCapabilityUrl(grant.urlPath),
+    localFilePath: intent.absolutePath,
+  };
 }
 
 /**
@@ -159,9 +205,10 @@ export function prefetchWorkspaceFile(
   workspaceRoot: string,
   relativePath: string,
 ): void {
-  // Images and PDFs stream through the local-image HTTP route, so there is no
-  // text read to warm and no syntax highlighter to load.
-  if (isSupportedLocalPreviewFilePath(relativePath)) {
+  // Dedicated binary previews do not need a text read/highlighter warm-up;
+  // known unsupported binaries should not be read speculatively either.
+  const previewKind = localFilePreviewKindForPath(relativePath);
+  if (previewKind === "image" || previewKind === "pdf" || previewKind === "unsupported-binary") {
     return;
   }
   // Bare filenames (no directory) usually do not exist at the workspace root and

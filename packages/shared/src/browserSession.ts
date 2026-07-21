@@ -40,27 +40,150 @@ function looksLikeUrlInput(value: string): boolean {
   );
 }
 
-// Normalizes typed browser text into a navigable URL or search target.
-export function normalizeBrowserUrlInput(input: string | undefined): string {
+export type BrowserLocalInputRejectionReason =
+  | "malformed-file-url"
+  | "malformed-windows-path"
+  | "network-file-url"
+  | "network-path"
+  | "nul-byte";
+
+export type BrowserInputClassification =
+  | {
+      readonly kind: "web-url";
+      readonly url: string;
+    }
+  | {
+      readonly kind: "search";
+      readonly query: string;
+      readonly url: string;
+    }
+  | {
+      readonly kind: "local-file";
+      readonly path: string;
+      readonly source: "file-url" | "path";
+    }
+  | {
+      readonly kind: "rejected-local";
+      readonly input: string;
+      readonly reason: BrowserLocalInputRejectionReason;
+    };
+
+const WINDOWS_ABSOLUTE_PATH_PATTERN = /^[A-Za-z]:[\\/]/;
+const WINDOWS_DRIVE_PREFIX_PATTERN = /^[A-Za-z]:/;
+const NETWORK_PATH_PREFIX_PATTERN = /^[\\/]{2}/;
+
+function rejectedLocalInput(
+  input: string,
+  reason: BrowserLocalInputRejectionReason,
+): BrowserInputClassification {
+  return { kind: "rejected-local", input, reason };
+}
+
+function classifyFileUrlInput(input: string): BrowserInputClassification {
+  const rawPath = input.slice(input.indexOf(":") + 1);
+  if (!rawPath.startsWith("/") && !WINDOWS_ABSOLUTE_PATH_PATTERN.test(rawPath)) {
+    return rejectedLocalInput(input, "malformed-file-url");
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(input);
+  } catch {
+    return rejectedLocalInput(input, "malformed-file-url");
+  }
+
+  if (parsed.protocol.toLowerCase() !== "file:") {
+    return rejectedLocalInput(input, "malformed-file-url");
+  }
+  const hostname = parsed.hostname.toLowerCase();
+  if (hostname.length > 0 && hostname !== "localhost") {
+    return rejectedLocalInput(input, "network-file-url");
+  }
+
+  let decodedPath: string;
+  try {
+    decodedPath = decodeURIComponent(parsed.pathname);
+  } catch {
+    return rejectedLocalInput(input, "malformed-file-url");
+  }
+  if (decodedPath.includes("\0")) {
+    return rejectedLocalInput(input, "nul-byte");
+  }
+
+  const pathAfterLeadingSlash = decodedPath.startsWith("/") ? decodedPath.slice(1) : decodedPath;
+  if (
+    decodedPath.startsWith("//") ||
+    decodedPath.startsWith("\\") ||
+    pathAfterLeadingSlash.startsWith("\\")
+  ) {
+    return rejectedLocalInput(input, "network-file-url");
+  }
+
+  // WHATWG file URLs represent a Windows drive path as `/C:/...`.
+  const path = /^\/[A-Za-z]:[\\/]/.test(decodedPath) ? decodedPath.slice(1) : decodedPath;
+  if (path.length === 0) {
+    return rejectedLocalInput(input, "malformed-file-url");
+  }
+  if (WINDOWS_DRIVE_PREFIX_PATTERN.test(path) && !WINDOWS_ABSOLUTE_PATH_PATTERN.test(path)) {
+    return rejectedLocalInput(input, "malformed-windows-path");
+  }
+  if (!path.startsWith("/") && !WINDOWS_ABSOLUTE_PATH_PATTERN.test(path)) {
+    return rejectedLocalInput(input, "malformed-file-url");
+  }
+  return { kind: "local-file", path, source: "file-url" };
+}
+
+/**
+ * Classifies browser-bar input without authorizing or navigating to local files.
+ * Local candidates stay structurally distinct so callers can request a scoped
+ * preview capability instead of accidentally turning a filesystem path into a
+ * search or a guessed HTTPS URL.
+ */
+export function classifyBrowserInput(input: string | undefined): BrowserInputClassification {
   const trimmed = input?.trim() ?? "";
   if (trimmed.length === 0) {
-    return BROWSER_BLANK_URL;
+    return { kind: "web-url", url: BROWSER_BLANK_URL };
+  }
+  if (trimmed.includes("\0")) {
+    return rejectedLocalInput(trimmed, "nul-byte");
+  }
+  if (trimmed.toLowerCase().startsWith("file:")) {
+    return classifyFileUrlInput(trimmed);
+  }
+  if (NETWORK_PATH_PREFIX_PATTERN.test(trimmed)) {
+    return rejectedLocalInput(trimmed, "network-path");
+  }
+  if (trimmed.startsWith("\\")) {
+    return rejectedLocalInput(trimmed, "malformed-windows-path");
+  }
+  if (WINDOWS_ABSOLUTE_PATH_PATTERN.test(trimmed)) {
+    return { kind: "local-file", path: trimmed, source: "path" };
+  }
+  if (WINDOWS_DRIVE_PREFIX_PATTERN.test(trimmed)) {
+    return rejectedLocalInput(trimmed, "malformed-windows-path");
+  }
+  if (trimmed.startsWith("/")) {
+    return { kind: "local-file", path: trimmed, source: "path" };
   }
 
   try {
     const withScheme = new URL(trimmed);
     if (withScheme.protocol === "http:" || withScheme.protocol === "https:") {
-      return withScheme.toString();
+      return { kind: "web-url", url: withScheme.toString() };
     }
     if (withScheme.protocol === "about:") {
-      return withScheme.toString();
+      return { kind: "web-url", url: withScheme.toString() };
     }
   } catch {
     // Fall through to browser-style heuristics below.
   }
 
   if (trimmed.includes(" ")) {
-    return `${BROWSER_SEARCH_URL_PREFIX}${encodeURIComponent(trimmed)}`;
+    return {
+      kind: "search",
+      query: trimmed,
+      url: `${BROWSER_SEARCH_URL_PREFIX}${encodeURIComponent(trimmed)}`,
+    };
   }
 
   if (looksLikeUrlInput(trimmed)) {
@@ -71,18 +194,57 @@ export function normalizeBrowserUrlInput(input: string | undefined): string {
       trimmed.startsWith("[::1]");
     const scheme = prefersHttp ? "http" : "https";
     try {
-      return new URL(`${scheme}://${trimmed}`).toString();
+      return { kind: "web-url", url: new URL(`${scheme}://${trimmed}`).toString() };
     } catch {
-      return `${BROWSER_SEARCH_URL_PREFIX}${encodeURIComponent(trimmed)}`;
+      return {
+        kind: "search",
+        query: trimmed,
+        url: `${BROWSER_SEARCH_URL_PREFIX}${encodeURIComponent(trimmed)}`,
+      };
     }
   }
 
-  return `${BROWSER_SEARCH_URL_PREFIX}${encodeURIComponent(trimmed)}`;
+  return {
+    kind: "search",
+    query: trimmed,
+    url: `${BROWSER_SEARCH_URL_PREFIX}${encodeURIComponent(trimmed)}`,
+  };
+}
+
+export class BrowserLocalInputError extends Error {
+  readonly classification: Extract<
+    BrowserInputClassification,
+    { kind: "local-file" | "rejected-local" }
+  >;
+
+  constructor(
+    classification: Extract<BrowserInputClassification, { kind: "local-file" | "rejected-local" }>,
+  ) {
+    super(
+      classification.kind === "local-file"
+        ? "Local files require an authorized preview capability."
+        : "This local file input is not supported.",
+    );
+    this.name = "BrowserLocalInputError";
+    this.classification = classification;
+  }
+}
+
+// Normalizes ordinary typed browser text into a navigable URL or search target.
+// Local inputs deliberately throw so no caller can pass a raw filesystem path
+// through Electron's generic URL navigation path.
+export function normalizeBrowserUrlInput(input: string | undefined): string {
+  const classification = classifyBrowserInput(input);
+  if (classification.kind === "local-file" || classification.kind === "rejected-local") {
+    throw new BrowserLocalInputError(classification);
+  }
+  return classification.url;
 }
 
 export interface BrowserTabUrlLike {
   readonly url?: string | null;
   readonly lastCommittedUrl?: string | null;
+  readonly localFilePath?: string | null;
 }
 
 // Picks the URL worth copying/sharing, preferring the live page and ignoring blank placeholders.
@@ -90,6 +252,9 @@ export function resolveCopyableBrowserTabUrl(
   tab: BrowserTabUrlLike | null | undefined,
   liveUrl?: string | null,
 ): string | null {
+  if (tab?.localFilePath) {
+    return null;
+  }
   const live = liveUrl?.trim() ?? "";
   if (live.length > 0 && live !== BROWSER_BLANK_URL) {
     return live;

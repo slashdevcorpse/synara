@@ -50,7 +50,15 @@ function parseFileUrlHref(
     if (rawPath.length === 0) return null;
 
     // Browser URL parser encodes "C:/foo" as "/C:/foo" for file URLs.
-    const normalizedPath = /^\/[A-Za-z]:[\\/]/.test(rawPath) ? rawPath.slice(1) : rawPath;
+    const driveFromHostname =
+      /^[A-Za-z]$/.test(parsed.hostname) && /^file:\/\/[A-Za-z]:[\\/]/i.test(href);
+    const normalizedPath = driveFromHostname
+      ? `${parsed.hostname.toUpperCase()}:${rawPath}`
+      : parsed.hostname && parsed.hostname.toLowerCase() !== "localhost"
+        ? `\\\\${parsed.hostname}${rawPath.replaceAll("/", "\\")}`
+        : /^\/[A-Za-z]:[\\/]/.test(rawPath)
+          ? rawPath.slice(1)
+          : rawPath;
 
     return {
       path: options?.decodePath === false ? normalizedPath : safeDecode(normalizedPath),

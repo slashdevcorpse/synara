@@ -35,10 +35,18 @@ import {
   BROWSER_BLANK_URL as ABOUT_BLANK_URL,
   classifyBrowserWindowOpen,
   isBlankBrowserTabUrl,
-  normalizeBrowserUrlInput as normalizeUrlInput,
   resolveCopyableBrowserTabUrl,
 } from "@synara/shared/browserSession";
 import { BROWSER_SESSION_PARTITION, BrowserSessionPolicy } from "./browserSessionPolicy";
+import {
+  isAllowedBrowserNavigation,
+  isLocalPreviewRouteUrl,
+  parseLocalPreviewCapabilityUrl,
+  resolveManagedBrowserNavigation,
+  type LocalPreviewCapability,
+  type ManagedBrowserNavigationTarget,
+} from "./browserNavigationPolicy";
+import localPreviewRuntimeGuard from "./localPreviewRuntimeGuard.json";
 
 export { BROWSER_SESSION_PARTITION } from "./browserSessionPolicy";
 const BROWSER_INACTIVE_TAB_SUSPEND_DELAY_MS = 1_500;
@@ -46,6 +54,10 @@ const BROWSER_INACTIVE_TAB_SUSPEND_DELAY_PRESSURED_MS = 400;
 const BROWSER_MAX_WARM_INACTIVE_RUNTIMES_PER_THREAD = 1;
 const BROWSER_THREAD_SUSPEND_DELAY_MS = 30_000;
 const BROWSER_ERROR_ABORTED = -3;
+const LOCAL_PREVIEW_GUARD_ERROR =
+  "The local preview security guard could not start. Refresh to try again.";
+const LOCAL_PREVIEW_GUARD_VERIFICATION_EXPRESSION =
+  "['RTCPeerConnection','webkitRTCPeerConnection','RTCDataChannel'].map((name) => typeof globalThis[name])";
 
 type BrowserStateListener = (state: ThreadBrowserState) => void;
 type BrowserCopyLinkListener = (event: BrowserCopyLinkEvent) => void;
@@ -58,11 +70,15 @@ interface LiveTabRuntime {
   view: WebContentsView | null;
   ownsWebContents: boolean;
   listenerDisposers: Array<() => void>;
+  localPreviewGuardReady?: Promise<void>;
+  localPreviewGuardInstalled?: boolean;
 }
 
 interface OAuthPopupContext {
   threadId: ThreadId;
   tabId: string;
+  localFilePath: string | null;
+  localPreviewCapability: LocalPreviewCapability | null;
 }
 
 interface OAuthPopupRuntime extends OAuthPopupContext {
@@ -111,11 +127,21 @@ export interface BrowserUseCdpEvent {
   params?: unknown;
 }
 
-function createBrowserTab(url = ABOUT_BLANK_URL): BrowserTabState {
+const BLANK_BROWSER_NAVIGATION: ManagedBrowserNavigationTarget = {
+  localFilePath: null,
+  localPreviewCapability: null,
+  url: ABOUT_BLANK_URL,
+};
+
+function createBrowserTab(
+  navigation: ManagedBrowserNavigationTarget = BLANK_BROWSER_NAVIGATION,
+): BrowserTabState {
   return {
     id: Crypto.randomUUID(),
-    url,
-    title: defaultTitleForUrl(url),
+    localFilePath: navigation.localFilePath,
+    securityEpoch: 0,
+    url: navigation.url,
+    title: defaultTitleForUrl(navigation.url, navigation.localFilePath),
     status: SUSPENDED_TAB_STATUS,
     isLoading: false,
     canGoBack: false,
@@ -144,7 +170,15 @@ function cloneThreadState(state: ThreadBrowserState): ThreadBrowserState {
   };
 }
 
-function defaultTitleForUrl(url: string): string {
+function localFileName(localFilePath: string): string {
+  const normalized = localFilePath.replace(/\\/g, "/").replace(/\/+$/, "");
+  return normalized.slice(normalized.lastIndexOf("/") + 1) || localFilePath;
+}
+
+function defaultTitleForUrl(url: string, localFilePath: string | null = null): string {
+  if (localFilePath) {
+    return localFileName(localFilePath);
+  }
   if (url === ABOUT_BLANK_URL) {
     return "New tab";
   }
@@ -165,6 +199,84 @@ function screenshotFileNameForUrl(url: string): string {
     return `${normalizedHost || fallback}-${Date.now()}.png`;
   } catch {
     return `${fallback}-${Date.now()}.png`;
+  }
+}
+
+function localPreviewCapabilityForTab(tab: BrowserTabState): LocalPreviewCapability | null {
+  if (!tab.localFilePath) {
+    return null;
+  }
+  return parseLocalPreviewCapabilityUrl(tab.url);
+}
+
+function isScopedPageNavigationAllowed(
+  localFilePath: string | null,
+  localPreviewCapability: LocalPreviewCapability | null,
+  url: string,
+): boolean {
+  if (localFilePath && !localPreviewCapability) {
+    return false;
+  }
+  return isAllowedBrowserNavigation({ url, localPreviewCapability });
+}
+
+function isPageNavigationAllowed(tab: BrowserTabState, url: string): boolean {
+  return isScopedPageNavigationAllowed(
+    tab.localFilePath ?? null,
+    localPreviewCapabilityForTab(tab),
+    url,
+  );
+}
+
+function localPreviewCapabilityIdentity(
+  localFilePath: string | null | undefined,
+  localPreviewCapability: LocalPreviewCapability | null,
+): string | null {
+  if (!localFilePath) {
+    return null;
+  }
+  return localPreviewCapability
+    ? `${localPreviewCapability.origin}${localPreviewCapability.pathPrefix}`
+    : "invalid-local-preview";
+}
+
+function shouldClearNavigationHistory(
+  tab: BrowserTabState,
+  navigation: ManagedBrowserNavigationTarget,
+): boolean {
+  return (
+    localPreviewCapabilityIdentity(tab.localFilePath, localPreviewCapabilityForTab(tab)) !==
+    localPreviewCapabilityIdentity(navigation.localFilePath, navigation.localPreviewCapability)
+  );
+}
+
+function browserHistoryTargetUrl(webContents: WebContents, offset: -1 | 1): string | null {
+  const history = webContents.navigationHistory;
+  if (!history?.canGoToOffset(offset)) {
+    return null;
+  }
+  try {
+    return history.getEntryAtIndex(history.getActiveIndex() + offset)?.url ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function canNavigateBrowserHistory(
+  webContents: WebContents,
+  tab: BrowserTabState,
+  offset: -1 | 1,
+): boolean {
+  const targetUrl = browserHistoryTargetUrl(webContents, offset);
+  return targetUrl !== null && isPageNavigationAllowed(tab, targetUrl);
+}
+
+function clearBrowserNavigationHistory(webContents: WebContents): void {
+  try {
+    webContents.navigationHistory?.clear();
+  } catch {
+    // An adopted or tearing-down webContents can reject history access. The
+    // destination checks remain the fallback boundary in that case.
   }
 }
 
@@ -303,20 +415,94 @@ export class DesktopBrowserManager {
     };
   }
 
+  private tabForNavigationContext(
+    context: Pick<OAuthPopupContext, "threadId" | "tabId">,
+  ): BrowserTabState | null {
+    const state = this.states.get(context.threadId);
+    return state ? this.getTab(state, context.tabId) : null;
+  }
+
+  private isRuntimePageNavigationAllowed(context: LiveTabRuntime, url: string): boolean {
+    const tab = this.tabForNavigationContext(context);
+    return (
+      tab !== null &&
+      (!tab.localFilePath || context.localPreviewGuardInstalled === true) &&
+      isPageNavigationAllowed(tab, url)
+    );
+  }
+
+  private popupContextForTab(threadId: ThreadId, tabId: string): OAuthPopupContext | null {
+    const tab = this.tabForNavigationContext({ threadId, tabId });
+    if (!tab) {
+      return null;
+    }
+    return {
+      threadId,
+      tabId,
+      localFilePath: tab.localFilePath ?? null,
+      localPreviewCapability: localPreviewCapabilityForTab(tab),
+    };
+  }
+
+  private isPopupPageNavigationAllowed(context: OAuthPopupContext, url: string): boolean {
+    return isScopedPageNavigationAllowed(
+      context.localFilePath,
+      context.localPreviewCapability,
+      url,
+    );
+  }
+
+  private registerPageNavigationGuards(
+    webContents: WebContents,
+    isAllowed: (url: string) => boolean,
+    onDisallowedNavigation: () => void,
+    listenerDisposers: Array<() => void>,
+  ): void {
+    const preventDisallowedNavigation = (event: Electron.Event, url: string) => {
+      if (!isAllowed(url)) {
+        event.preventDefault();
+      }
+    };
+    const recoverDisallowedNavigation = (_event: Electron.Event, url: string) => {
+      if (!isAllowed(url)) {
+        onDisallowedNavigation();
+      }
+    };
+    const recoverDisallowedInPageNavigation = (
+      _event: Electron.Event,
+      url: string,
+      isMainFrame: boolean,
+    ) => {
+      if (isMainFrame && !isAllowed(url)) {
+        onDisallowedNavigation();
+      }
+    };
+    webContents.on("will-navigate", preventDisallowedNavigation);
+    webContents.on("will-redirect", preventDisallowedNavigation);
+    webContents.on("did-navigate", recoverDisallowedNavigation);
+    webContents.on("did-navigate-in-page", recoverDisallowedInPageNavigation);
+    listenerDisposers.push(() => {
+      webContents.removeListener("will-navigate", preventDisallowedNavigation);
+      webContents.removeListener("will-redirect", preventDisallowedNavigation);
+      webContents.removeListener("did-navigate", recoverDisallowedNavigation);
+      webContents.removeListener("did-navigate-in-page", recoverDisallowedInPageNavigation);
+    });
+  }
+
   private configureWindowOpenHandling(
     webContents: WebContents,
     context: OAuthPopupContext,
     listenerDisposers: Array<() => void>,
+    isUrlAllowed: (url: string) => boolean = (url) =>
+      this.isPopupPageNavigationAllowed(context, url),
+    resolveContext: () => OAuthPopupContext | null = () => context,
   ): void {
-    const { threadId, tabId } = context;
-
     // Auth providers can chain web popups (provider -> consent). Page-controlled custom
-    // schemes are denied here: browser content must never launch an OS handler implicitly.
+    // schemes and destinations outside a local preview capability are denied here.
     webContents.setWindowOpenHandler((details) => {
       const { url } = details;
-      const isWebUrl =
-        url.startsWith("http://") || url.startsWith("https://") || url === ABOUT_BLANK_URL;
-      if (!isWebUrl) {
+      const activeContext = resolveContext();
+      if (!activeContext || !isUrlAllowed(url)) {
         return { action: "deny" };
       }
 
@@ -338,19 +524,25 @@ export class DesktopBrowserManager {
       }
 
       this.newTab({
-        threadId,
+        threadId: activeContext.threadId,
         url,
+        ...(activeContext.localFilePath ? { localFilePath: activeContext.localFilePath } : {}),
         activate: true,
       });
-      const bounds = this.getVisibleBoundsForThread(threadId);
-      if (this.activeThreadId === threadId && bounds) {
-        this.attachActiveTab(threadId, bounds);
+      const bounds = this.getVisibleBoundsForThread(activeContext.threadId);
+      if (this.activeThreadId === activeContext.threadId && bounds) {
+        this.attachActiveTab(activeContext.threadId, bounds);
       }
       return { action: "deny" };
     });
 
     const didCreateWindow = (childWindow: BrowserWindow) => {
-      this.registerOAuthPopupWindow(childWindow, { threadId, tabId });
+      const activeContext = resolveContext();
+      if (!activeContext) {
+        childWindow.destroy();
+        return;
+      }
+      this.registerOAuthPopupWindow(childWindow, activeContext);
     };
     webContents.on("did-create-window", didCreateWindow);
     listenerDisposers.push(() => {
@@ -377,6 +569,12 @@ export class DesktopBrowserManager {
     const { window: popup } = runtime;
     const { webContents } = popup;
     this.sessionPolicy.applyUserAgent(webContents);
+    this.registerPageNavigationGuards(
+      webContents,
+      (url) => this.isPopupPageNavigationAllowed(runtime, url),
+      () => this.closePopupRuntime(runtime),
+      runtime.listenerDisposers,
+    );
     const closeOnInput = (event: Electron.Event, input: Electron.Input) => {
       if (input.type !== "keyDown") {
         return;
@@ -534,16 +732,30 @@ export class DesktopBrowserManager {
   }
 
   open(input: BrowserOpenInput): ThreadBrowserState {
-    const state = this.ensureWorkspace(input.threadId, input.initialUrl);
+    const requestedNavigation =
+      input.initialUrl !== undefined || input.localFilePath != null
+        ? resolveManagedBrowserNavigation({
+            url: input.initialUrl,
+            ...(input.localFilePath !== undefined ? { localFilePath: input.localFilePath } : {}),
+          })
+        : null;
+    const state = this.ensureWorkspace(input.threadId, requestedNavigation);
     const didChange = !state.open;
     state.open = true;
-    const nextInitialUrl = input.initialUrl ? normalizeUrlInput(input.initialUrl) : null;
-    const activeTab = nextInitialUrl ? this.getActiveTab(state) : null;
-    if (nextInitialUrl && activeTab && activeTab.url !== nextInitialUrl) {
+    const activeTab = requestedNavigation ? this.getActiveTab(state) : null;
+    if (
+      requestedNavigation &&
+      activeTab &&
+      (activeTab.url !== requestedNavigation.url ||
+        activeTab.localFilePath !== requestedNavigation.localFilePath)
+    ) {
       return this.navigate({
         threadId: input.threadId,
         tabId: activeTab.id,
-        url: nextInitialUrl,
+        url: requestedNavigation.url,
+        ...(requestedNavigation.localFilePath
+          ? { localFilePath: requestedNavigation.localFilePath }
+          : {}),
       });
     }
 
@@ -680,24 +892,42 @@ export class DesktopBrowserManager {
 
   // Adopts the renderer-owned <webview> so the visible page and browser-use tools
   // share one WebContents instead of racing a hidden native WebContentsView.
-  attachWebview(input: BrowserAttachWebviewInput): ThreadBrowserState {
+  async attachWebview(input: BrowserAttachWebviewInput): Promise<ThreadBrowserState> {
     const state = this.ensureWorkspace(input.threadId);
     const tab = this.resolveTab(state, input.tabId);
     const webContents = electronWebContents.fromId(input.webContentsId);
     if (!webContents || webContents.isDestroyed()) {
       throw new Error("The visible browser webview is not available.");
     }
+    if (webContents.getType() !== "webview") {
+      throw new Error("Only an attached browser webview can become the visible browser surface.");
+    }
 
     const key = buildRuntimeKey(input.threadId, tab.id);
     const existingRendererRuntime = this.findRendererRuntimeByWebContentsId(webContents.id);
     if (existingRendererRuntime && existingRendererRuntime.key !== key) {
-      this.destroyRuntime(existingRendererRuntime.threadId, existingRendererRuntime.tabId);
+      this.destroyRuntimeForSecurityTransition(
+        existingRendererRuntime.threadId,
+        existingRendererRuntime.tabId,
+      );
+      throw new Error("A browser webview cannot be reassigned between tabs.");
     }
 
     const existing = this.runtimes.get(key);
+    let createdRuntime = false;
     if (existing?.webContents.id !== webContents.id) {
       if (existing) {
-        this.destroyRuntime(input.threadId, tab.id);
+        this.destroyRuntimeForSecurityTransition(input.threadId, tab.id);
+      }
+
+      // will-attach-webview also overwrites renderer input with about:blank.
+      // Stop first to cancel a renderer-triggered navigation that has not yet
+      // committed, then reject any document that was already allowed to run.
+      webContents.stop();
+      const initialUrl = webContents.getURL();
+      if (initialUrl.length > 0 && initialUrl !== ABOUT_BLANK_URL) {
+        this.closeUnmanagedRendererWebContents(webContents);
+        throw new Error("A browser webview must be inert before it is attached.");
       }
       const runtime: LiveTabRuntime = {
         key,
@@ -710,17 +940,45 @@ export class DesktopBrowserManager {
       };
       this.configureRuntimeWebContents(runtime);
       this.runtimes.set(key, runtime);
+      this.prepareLocalPreviewRuntimeGuard(runtime, tab);
+      createdRuntime = true;
     }
 
     const bounds = this.getVisibleBoundsForThread(input.threadId);
     const runtime = this.runtimes.get(key);
+    if (runtime) {
+      this.prepareLocalPreviewRuntimeGuard(runtime, tab);
+    }
+    const adoptedUrl = runtime?.webContents.getURL() ?? "";
+    let loadedManagedUrl = false;
+    if (runtime?.localPreviewGuardReady) {
+      try {
+        await runtime.localPreviewGuardReady;
+      } catch {
+        this.failClosedLocalPreviewRuntime(runtime, LOCAL_PREVIEW_GUARD_ERROR);
+        throw new Error(LOCAL_PREVIEW_GUARD_ERROR);
+      }
+    }
+    if (
+      runtime &&
+      ((createdRuntime && tab.url !== ABOUT_BLANK_URL) ||
+        !adoptedUrl ||
+        !isPageNavigationAllowed(tab, adoptedUrl))
+    ) {
+      runtime.webContents.stop();
+      await this.loadTab(input.threadId, tab.id, { force: true, runtime });
+      loadedManagedUrl = true;
+    }
     if (runtime && bounds) {
       this.attachRuntime(runtime, bounds);
     }
 
-    const didChange = tab.status !== LIVE_TAB_STATUS || tab.lastError !== null;
+    const didChange =
+      tab.status !== LIVE_TAB_STATUS || (!loadedManagedUrl && tab.lastError !== null);
     tab.status = LIVE_TAB_STATUS;
-    tab.lastError = null;
+    if (!loadedManagedUrl) {
+      tab.lastError = null;
+    }
     syncThreadLastError(state);
     if (didChange) {
       this.markThreadStateChanged(input.threadId);
@@ -755,9 +1013,22 @@ export class DesktopBrowserManager {
   navigate(input: BrowserNavigateInput): ThreadBrowserState {
     const state = this.ensureWorkspace(input.threadId);
     const tab = this.resolveTab(state, input.tabId);
-    const nextUrl = normalizeUrlInput(input.url);
-    tab.url = nextUrl;
-    tab.title = defaultTitleForUrl(nextUrl);
+    const navigation = resolveManagedBrowserNavigation({
+      url: input.url,
+      ...(input.localFilePath !== undefined ? { localFilePath: input.localFilePath } : {}),
+    });
+    const clearHistory = shouldClearNavigationHistory(tab, navigation);
+    let waitForRendererRemount = false;
+    if (clearHistory) {
+      this.closePopupWindowsForTab(input.threadId, tab.id);
+      waitForRendererRemount =
+        this.destroyRuntimeForSecurityTransition(input.threadId, tab.id) === "renderer";
+      tab.securityEpoch = (tab.securityEpoch ?? 0) + 1;
+    }
+    tab.localFilePath = navigation.localFilePath;
+    tab.url = navigation.url;
+    tab.title = defaultTitleForUrl(navigation.url, navigation.localFilePath);
+    tab.faviconUrl = null;
     tab.lastCommittedUrl = null;
     tab.lastError = null;
     syncThreadLastError(state);
@@ -769,8 +1040,8 @@ export class DesktopBrowserManager {
       if (state.activeTabId === tab.id && bounds) {
         this.attachRuntime(runtime, bounds);
       }
-      void this.loadTab(input.threadId, tab.id, { force: true, runtime });
-    } else if (this.activeThreadId === input.threadId) {
+      void this.loadTab(input.threadId, tab.id, { clearHistory, force: true, runtime });
+    } else if (this.activeThreadId === input.threadId && !waitForRendererRemount) {
       // Load the target tab directly so we don't clobber its pending URL with a
       // thread-wide runtime sync from the old live page state.
       const nextRuntime = this.ensureLiveRuntime(input.threadId, tab.id);
@@ -779,7 +1050,11 @@ export class DesktopBrowserManager {
       if (state.activeTabId === tab.id && bounds) {
         this.attachRuntime(nextRuntime, bounds);
       }
-      void this.loadTab(input.threadId, tab.id, { force: true, runtime: nextRuntime });
+      void this.loadTab(input.threadId, tab.id, {
+        clearHistory,
+        force: true,
+        runtime: nextRuntime,
+      });
     }
 
     this.emitState(input.threadId);
@@ -791,8 +1066,11 @@ export class DesktopBrowserManager {
     const tab = this.resolveTab(state, input.tabId);
     const runtime = this.runtimes.get(buildRuntimeKey(input.threadId, tab.id));
     if (runtime) {
-      runtime.webContents.reload();
-    } else if (this.activeThreadId === input.threadId) {
+      const currentUrl = runtime.webContents.getURL() || tab.url;
+      if (isPageNavigationAllowed(tab, currentUrl)) {
+        runtime.webContents.reload();
+      }
+    } else if (this.activeThreadId === input.threadId && !tab.localFilePath) {
       this.resumeThread(input.threadId);
       void this.loadTab(input.threadId, tab.id, { force: true });
     }
@@ -800,24 +1078,32 @@ export class DesktopBrowserManager {
   }
 
   goBack(input: BrowserTabInput): ThreadBrowserState {
+    const state = this.ensureWorkspace(input.threadId);
+    const tab = this.resolveTab(state, input.tabId);
     const runtime = this.runtimes.get(buildRuntimeKey(input.threadId, input.tabId));
-    if (runtime && canWebContentsGoBack(runtime.webContents)) {
-      runtime.webContents.goBack();
+    if (runtime && canNavigateBrowserHistory(runtime.webContents, tab, -1)) {
+      runtime.webContents.navigationHistory.goBack();
     }
     return this.getState({ threadId: input.threadId });
   }
 
   goForward(input: BrowserTabInput): ThreadBrowserState {
+    const state = this.ensureWorkspace(input.threadId);
+    const tab = this.resolveTab(state, input.tabId);
     const runtime = this.runtimes.get(buildRuntimeKey(input.threadId, input.tabId));
-    if (runtime && canWebContentsGoForward(runtime.webContents)) {
-      runtime.webContents.goForward();
+    if (runtime && canNavigateBrowserHistory(runtime.webContents, tab, 1)) {
+      runtime.webContents.navigationHistory.goForward();
     }
     return this.getState({ threadId: input.threadId });
   }
 
   newTab(input: BrowserNewTabInput): ThreadBrowserState {
     const state = this.ensureWorkspace(input.threadId);
-    const tab = createBrowserTab(normalizeUrlInput(input.url));
+    const navigation = resolveManagedBrowserNavigation({
+      url: input.url,
+      ...(input.localFilePath !== undefined ? { localFilePath: input.localFilePath } : {}),
+    });
+    const tab = createBrowserTab(navigation);
     state.tabs = [...state.tabs, tab];
     if (input.activate !== false || !state.activeTabId) {
       state.activeTabId = tab.id;
@@ -900,6 +1186,9 @@ export class DesktopBrowserManager {
     const tab = this.resolveTab(state, input.tabId);
     this.activateTab(input.threadId, state, tab);
 
+    if (tab.localFilePath) {
+      throw new Error("DevTools are unavailable for local previews.");
+    }
     this.resumeThread(input.threadId);
     const runtime = this.ensureLiveRuntime(input.threadId, tab.id);
     const bounds = this.getVisibleBoundsForThread(input.threadId);
@@ -921,9 +1210,15 @@ export class DesktopBrowserManager {
 
     this.resumeThread(input.threadId);
     const wasSuspended = tab.status === SUSPENDED_TAB_STATUS;
+    if (wasSuspended && tab.localFilePath) {
+      throw new Error("Refresh this local preview before capturing it.");
+    }
     const runtime = this.ensureLiveRuntime(input.threadId, tab.id);
     const webContents = runtime.webContents;
-    const expectedUrl = normalizeUrlInput(tab.lastCommittedUrl ?? tab.url);
+    const expectedUrl = resolveManagedBrowserNavigation({
+      url: tab.lastCommittedUrl ?? tab.url,
+      ...(tab.localFilePath ? { localFilePath: tab.localFilePath } : {}),
+    }).url;
     const currentUrl = webContents.getURL();
     const bounds = this.getVisibleBoundsForThread(input.threadId);
     if (bounds) {
@@ -984,6 +1279,7 @@ export class DesktopBrowserManager {
   async executeCdp(input: BrowserExecuteCdpInput): Promise<unknown> {
     const state = this.ensureWorkspace(input.threadId);
     const tab = this.resolveTab(state, input.tabId);
+    this.assertBrowserAutomationAllowed(tab);
     this.activateTab(input.threadId, state, tab);
 
     this.resumeThread(input.threadId);
@@ -1018,6 +1314,7 @@ export class DesktopBrowserManager {
   async attachBrowserUseTab(input: BrowserTabInput): Promise<void> {
     const state = this.ensureWorkspace(input.threadId);
     const tab = this.resolveTab(state, input.tabId);
+    this.assertBrowserAutomationAllowed(tab);
     this.activateTab(input.threadId, state, tab);
 
     this.resumeThread(input.threadId);
@@ -1042,6 +1339,9 @@ export class DesktopBrowserManager {
     input: BrowserTabInput,
     listener: (event: BrowserUseCdpEvent) => void,
   ): () => void {
+    const state = this.ensureWorkspace(input.threadId);
+    const tab = this.resolveTab(state, input.tabId);
+    this.assertBrowserAutomationAllowed(tab);
     const runtime = this.runtimes.get(buildRuntimeKey(input.threadId, input.tabId));
     if (!runtime) {
       return () => {};
@@ -1058,6 +1358,16 @@ export class DesktopBrowserManager {
     return () => {
       runtime.webContents.debugger.removeListener("message", handleMessage);
     };
+  }
+
+  private assertBrowserAutomationAllowed(tab: BrowserTabState): void {
+    if (
+      tab.localFilePath ||
+      isLocalPreviewRouteUrl(tab.url) ||
+      (tab.lastCommittedUrl ? isLocalPreviewRouteUrl(tab.lastCommittedUrl) : false)
+    ) {
+      throw new Error("Browser automation is unavailable for local previews.");
+    }
   }
 
   private activateThread(threadId: ThreadId, bounds: BrowserPanelBounds): void {
@@ -1130,6 +1440,9 @@ export class DesktopBrowserManager {
         continue;
       }
       const wasSuspended = tab.status === SUSPENDED_TAB_STATUS;
+      if (wasSuspended && tab.localFilePath) {
+        continue;
+      }
       const runtime = this.ensureLiveRuntime(threadId, tab.id);
       if (wasSuspended) {
         void this.loadTab(threadId, tab.id, { force: true, runtime });
@@ -1289,6 +1602,9 @@ export class DesktopBrowserManager {
 
     this.suspendInactiveTabs(threadId, activeTab.id);
     const wasSuspended = activeTab.status === SUSPENDED_TAB_STATUS;
+    if (wasSuspended && activeTab.localFilePath && options.forceLoad !== true) {
+      return;
+    }
     const runtime = this.ensureLiveRuntime(threadId, activeTab.id);
     this.attachRuntime(runtime, bounds);
     if (options.forceLoad || wasSuspended) {
@@ -1417,6 +1733,7 @@ export class DesktopBrowserManager {
   }
 
   private createLiveRuntime(threadId: ThreadId, tabId: string): LiveTabRuntime {
+    const tab = this.getTab(this.ensureWorkspace(threadId), tabId);
     const view = new WebContentsView({
       webPreferences: {
         partition: BROWSER_SESSION_PARTITION,
@@ -1434,8 +1751,114 @@ export class DesktopBrowserManager {
       ownsWebContents: true,
       listenerDisposers: [],
     };
+    const initialBlankReady = tab?.localFilePath
+      ? view.webContents.loadURL(ABOUT_BLANK_URL)
+      : undefined;
     this.configureRuntimeWebContents(runtime);
+    if (tab) {
+      this.prepareLocalPreviewRuntimeGuard(runtime, tab, initialBlankReady);
+    }
     return runtime;
+  }
+
+  private prepareLocalPreviewRuntimeGuard(
+    runtime: LiveTabRuntime,
+    tab: BrowserTabState,
+    initialBlankReady?: Promise<void>,
+  ): void {
+    if (!tab.localFilePath || runtime.localPreviewGuardReady) {
+      return;
+    }
+
+    runtime.localPreviewGuardInstalled = false;
+    runtime.localPreviewGuardReady = (async () => {
+      if (initialBlankReady) {
+        await initialBlankReady;
+      }
+      const { webContents } = runtime;
+      if (webContents.isDestroyed()) {
+        throw new Error("The local preview web contents closed before security setup.");
+      }
+
+      const runtimeDebugger = webContents.debugger;
+      if (runtimeDebugger.isAttached()) {
+        throw new Error("A debugger was already attached to the local preview.");
+      }
+      runtimeDebugger.attach("1.3");
+      const handleDebuggerDetach = (_event: Electron.Event, reason: string) => {
+        runtime.localPreviewGuardInstalled = false;
+        if (this.runtimes.get(runtime.key) !== runtime) {
+          return;
+        }
+        this.failClosedLocalPreviewRuntime(
+          runtime,
+          `The local preview security guard stopped (${reason || "unknown reason"}). Refresh to try again.`,
+        );
+      };
+      runtimeDebugger.on("detach", handleDebuggerDetach);
+      runtime.listenerDisposers.push(() => {
+        runtimeDebugger.removeListener("detach", handleDebuggerDetach);
+      });
+      await runtimeDebugger.sendCommand("Page.enable");
+      const registration = (await runtimeDebugger.sendCommand(
+        "Page.addScriptToEvaluateOnNewDocument",
+        {
+          source: localPreviewRuntimeGuard.source,
+          runImmediately: true,
+        },
+      )) as { identifier?: unknown };
+      if (typeof registration.identifier !== "string" || registration.identifier.length === 0) {
+        throw new Error("Chromium did not register the local preview security guard.");
+      }
+
+      const verification = (await runtimeDebugger.sendCommand("Runtime.evaluate", {
+        expression: LOCAL_PREVIEW_GUARD_VERIFICATION_EXPRESSION,
+        returnByValue: true,
+      })) as { result?: { value?: unknown } };
+      const values = verification.result?.value;
+      if (
+        !Array.isArray(values) ||
+        values.length !== 3 ||
+        values.some((value) => value !== "undefined")
+      ) {
+        throw new Error("Chromium did not activate the local preview security guard.");
+      }
+      runtime.localPreviewGuardInstalled = true;
+    })();
+  }
+
+  private failClosedLocalPreviewRuntime(runtime: LiveTabRuntime, message: string): void {
+    if (this.runtimes.get(runtime.key) !== runtime) {
+      return;
+    }
+
+    runtime.localPreviewGuardInstalled = false;
+    const { threadId, tabId, webContents } = runtime;
+    try {
+      webContents.stop();
+    } catch {
+      // Continue with forced teardown.
+    }
+    this.destroyRuntime(threadId, tabId);
+    if (!webContents.isDestroyed()) {
+      try {
+        webContents.close({ waitForBeforeUnload: false });
+      } catch {
+        // The manager references and listeners are already gone.
+      }
+    }
+
+    const state = this.states.get(threadId);
+    const tab = state ? this.getTab(state, tabId) : null;
+    if (!state || !tab) {
+      return;
+    }
+    tab.status = SUSPENDED_TAB_STATUS;
+    tab.isLoading = false;
+    tab.lastError = message;
+    syncThreadLastError(state);
+    this.markThreadStateChanged(threadId);
+    this.emitState(threadId);
   }
 
   private configureRuntimeWebContents(runtime: LiveTabRuntime): void {
@@ -1444,8 +1867,28 @@ export class DesktopBrowserManager {
     // Belt-and-suspenders alongside the session-level UA: also covers an adopted renderer
     // <webview> for any navigation after it attaches.
     this.sessionPolicy.applyUserAgent(webContents);
+    this.registerPageNavigationGuards(
+      webContents,
+      (url) => url === ABOUT_BLANK_URL || this.isRuntimePageNavigationAllowed(runtime, url),
+      () => {
+        webContents.stop();
+        void this.loadTab(threadId, tabId, { force: true, runtime });
+      },
+      runtime.listenerDisposers,
+    );
 
-    this.configureWindowOpenHandling(webContents, runtime, runtime.listenerDisposers);
+    const windowOpenContext = this.popupContextForTab(threadId, tabId);
+    if (windowOpenContext) {
+      this.configureWindowOpenHandling(
+        webContents,
+        windowOpenContext,
+        runtime.listenerDisposers,
+        (url) => this.isRuntimePageNavigationAllowed(runtime, url),
+        () => this.popupContextForTab(threadId, tabId),
+      );
+    } else {
+      webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+    }
 
     // The native page owns keyboard focus while browsing, so the renderer never sees the
     // copy-link chord. Intercept it here, copy the live URL, and let the shell toast.
@@ -1484,7 +1927,14 @@ export class DesktopBrowserManager {
     });
 
     const pageFaviconUpdated = (_event: Electron.Event, faviconUrls: string[]) => {
-      this.queueRuntimeStateSync(threadId, tabId, faviconUrls);
+      const tab = this.tabForNavigationContext({ threadId, tabId });
+      const currentUrl = webContents.getURL();
+      const canUsePageFavicon =
+        tab !== null &&
+        !tab.localFilePath &&
+        currentUrl.length > 0 &&
+        isPageNavigationAllowed(tab, currentUrl);
+      this.queueRuntimeStateSync(threadId, tabId, canUsePageFavicon ? faviconUrls : []);
     };
     webContents.on("page-favicon-updated", pageFaviconUpdated);
     runtime.listenerDisposers.push(() => {
@@ -1540,8 +1990,8 @@ export class DesktopBrowserManager {
         return;
       }
 
-      tab.url = validatedURL || tab.url;
-      tab.title = defaultTitleForUrl(tab.url);
+      tab.url = validatedURL && isPageNavigationAllowed(tab, validatedURL) ? validatedURL : tab.url;
+      tab.title = defaultTitleForUrl(tab.url, tab.localFilePath ?? null);
       tab.isLoading = false;
       tab.lastError = mapBrowserLoadError(errorCode);
       syncThreadLastError(state);
@@ -1579,7 +2029,7 @@ export class DesktopBrowserManager {
   private async loadTab(
     threadId: ThreadId,
     tabId: string,
-    options: { force?: boolean; runtime?: LiveTabRuntime } = {},
+    options: { clearHistory?: boolean; force?: boolean; runtime?: LiveTabRuntime } = {},
   ): Promise<void> {
     const state = this.ensureWorkspace(threadId);
     const tab = this.getTab(state, tabId);
@@ -1589,9 +2039,29 @@ export class DesktopBrowserManager {
 
     const runtime = options.runtime ?? this.ensureLiveRuntime(threadId, tabId);
     const webContents = runtime.webContents;
-    const nextUrl = normalizeUrlInput(
-      options.force === true ? tab.url : (tab.lastCommittedUrl ?? tab.url),
-    );
+    if (tab.localFilePath) {
+      this.prepareLocalPreviewRuntimeGuard(runtime, tab);
+      try {
+        await runtime.localPreviewGuardReady;
+      } catch {
+        if (this.runtimes.get(runtime.key) === runtime && tab.localFilePath) {
+          this.failClosedLocalPreviewRuntime(runtime, LOCAL_PREVIEW_GUARD_ERROR);
+        }
+        return;
+      }
+      if (
+        this.runtimes.get(runtime.key) !== runtime ||
+        webContents.isDestroyed() ||
+        !tab.localFilePath
+      ) {
+        return;
+      }
+    }
+    const navigation = resolveManagedBrowserNavigation({
+      url: options.force === true ? tab.url : (tab.lastCommittedUrl ?? tab.url),
+      ...(tab.localFilePath ? { localFilePath: tab.localFilePath } : {}),
+    });
+    const nextUrl = navigation.url;
     const currentUrl = webContents.getURL();
     const shouldLoad = options.force === true || currentUrl !== nextUrl || currentUrl.length === 0;
 
@@ -1600,6 +2070,11 @@ export class DesktopBrowserManager {
       return;
     }
 
+    if (options.clearHistory) {
+      webContents.stop();
+      clearBrowserNavigationHistory(webContents);
+    }
+    tab.localFilePath = navigation.localFilePath;
     tab.url = nextUrl;
     tab.status = "live";
     tab.isLoading = true;
@@ -1610,6 +2085,9 @@ export class DesktopBrowserManager {
 
     try {
       await webContents.loadURL(nextUrl);
+      if (options.clearHistory) {
+        clearBrowserNavigationHistory(webContents);
+      }
       this.queueRuntimeStateSync(threadId, tabId);
     } catch (error) {
       if (isAbortedNavigationError(error)) {
@@ -1708,6 +2186,7 @@ export class DesktopBrowserManager {
 
     this.runtimes.delete(key);
     const webContents = runtime.webContents;
+    runtime.localPreviewGuardInstalled = false;
     for (const disposeListener of runtime.listenerDisposers.splice(0)) {
       disposeListener();
     }
@@ -1810,11 +2289,14 @@ export class DesktopBrowserManager {
     return BROWSER_INACTIVE_TAB_SUSPEND_DELAY_MS;
   }
 
-  private ensureWorkspace(threadId: ThreadId, initialUrl?: string): ThreadBrowserState {
+  private ensureWorkspace(
+    threadId: ThreadId,
+    initialNavigation?: ManagedBrowserNavigationTarget | null,
+  ): ThreadBrowserState {
     this.sessionPolicy.ensureConfigured();
     const state = this.getOrCreateState(threadId);
     if (state.tabs.length === 0) {
-      const initialTab = createBrowserTab(normalizeUrlInput(initialUrl));
+      const initialTab = createBrowserTab(initialNavigation ?? BLANK_BROWSER_NAVIGATION);
       state.tabs = [initialTab];
       state.activeTabId = initialTab.id;
     }
@@ -1872,9 +2354,74 @@ export class DesktopBrowserManager {
   ): string | null {
     const state = this.states.get(threadId);
     const tab = state ? this.getTab(state, tabId) : null;
-    const liveUrl =
+    if (!tab) {
+      return null;
+    }
+    const storedUrl = tab.lastCommittedUrl ?? tab.url;
+    if (!isPageNavigationAllowed(tab, storedUrl)) {
+      return null;
+    }
+    const runtimeUrl =
       runtime && !runtime.webContents.isDestroyed() ? runtime.webContents.getURL() : null;
+    const liveUrl = runtimeUrl && isPageNavigationAllowed(tab, runtimeUrl) ? runtimeUrl : null;
     return resolveCopyableBrowserTabUrl(tab, liveUrl);
+  }
+
+  private destroyRuntimeForSecurityTransition(
+    threadId: ThreadId,
+    tabId: string,
+  ): "native" | "renderer" | null {
+    const runtime = this.runtimes.get(buildRuntimeKey(threadId, tabId));
+    if (!runtime) {
+      return null;
+    }
+
+    // Lock and close the old document synchronously before mutating the tab's
+    // desired security identity. This prevents its timers/unload handlers from
+    // being evaluated using the destination page's broader navigation policy.
+    const { webContents } = runtime;
+    if (!webContents.isDestroyed()) {
+      try {
+        webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+      } catch {
+        // A renderer that is already exiting is still torn down below.
+      }
+      try {
+        webContents.stop();
+      } catch {
+        // Continue with forced close.
+      }
+      try {
+        webContents.close({ waitForBeforeUnload: false });
+      } catch {
+        // destroyRuntime still removes every listener and manager reference.
+      }
+    }
+
+    const ownership = runtime.ownsWebContents ? "native" : "renderer";
+    this.destroyRuntime(threadId, tabId);
+    return ownership;
+  }
+
+  private closeUnmanagedRendererWebContents(webContents: WebContents): void {
+    if (webContents.isDestroyed()) {
+      return;
+    }
+    try {
+      webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+    } catch {
+      // The untrusted guest is still stopped and closed below.
+    }
+    try {
+      webContents.stop();
+    } catch {
+      // Continue with forced close.
+    }
+    try {
+      webContents.close({ waitForBeforeUnload: false });
+    } catch {
+      // No manager references or listeners were installed for this guest.
+    }
   }
 
   private copyTabLink(threadId: ThreadId, tabId: string): void {
@@ -1942,7 +2489,9 @@ function syncTabStateFromRuntime(
   faviconUrls?: string[],
 ): boolean {
   const currentUrl = webContents.getURL();
-  const nextUrl = currentUrl || tab.url;
+  const acceptedCurrentUrl =
+    currentUrl && isPageNavigationAllowed(tab, currentUrl) ? currentUrl : "";
+  const nextUrl = acceptedCurrentUrl || tab.url;
   const nextTitle = webContents.getTitle();
   let didChange = false;
   didChange =
@@ -1953,8 +2502,11 @@ function syncTabStateFromRuntime(
     setIfChanged(tab.url, nextUrl, (value) => {
       tab.url = value;
     }) || didChange;
-  const resolvedTitle =
-    !nextTitle || nextTitle === ABOUT_BLANK_URL ? defaultTitleForUrl(nextUrl) : nextTitle;
+  const resolvedTitle = tab.localFilePath
+    ? defaultTitleForUrl(nextUrl, tab.localFilePath)
+    : !nextTitle || nextTitle === ABOUT_BLANK_URL
+      ? defaultTitleForUrl(nextUrl)
+      : nextTitle;
   didChange =
     setIfChanged(tab.title, resolvedTitle, (value) => {
       tab.title = value;
@@ -1964,18 +2516,23 @@ function syncTabStateFromRuntime(
       tab.isLoading = value;
     }) || didChange;
   didChange =
-    setIfChanged(tab.canGoBack, canWebContentsGoBack(webContents), (value) => {
+    setIfChanged(tab.canGoBack, canNavigateBrowserHistory(webContents, tab, -1), (value) => {
       tab.canGoBack = value;
     }) || didChange;
   didChange =
-    setIfChanged(tab.canGoForward, canWebContentsGoForward(webContents), (value) => {
+    setIfChanged(tab.canGoForward, canNavigateBrowserHistory(webContents, tab, 1), (value) => {
       tab.canGoForward = value;
     }) || didChange;
   didChange =
-    setIfChanged(tab.lastCommittedUrl, currentUrl || tab.lastCommittedUrl, (value) => {
+    setIfChanged(tab.lastCommittedUrl, acceptedCurrentUrl || tab.lastCommittedUrl, (value) => {
       tab.lastCommittedUrl = value;
     }) || didChange;
-  if (faviconUrls) {
+  if (tab.localFilePath) {
+    didChange =
+      setIfChanged(tab.faviconUrl, null, (value) => {
+        tab.faviconUrl = value;
+      }) || didChange;
+  } else if (faviconUrls) {
     didChange =
       setIfChanged(tab.faviconUrl, faviconUrls[0] ?? tab.faviconUrl, (value) => {
         tab.faviconUrl = value;
@@ -1987,14 +2544,6 @@ function syncTabStateFromRuntime(
   }
   didChange = syncThreadLastError(state) || didChange;
   return didChange;
-}
-
-function canWebContentsGoBack(webContents: WebContents): boolean {
-  return webContents.navigationHistory?.canGoBack() ?? webContents.canGoBack();
-}
-
-function canWebContentsGoForward(webContents: WebContents): boolean {
-  return webContents.navigationHistory?.canGoForward() ?? webContents.canGoForward();
 }
 
 function syncThreadLastError(state: ThreadBrowserState): boolean {

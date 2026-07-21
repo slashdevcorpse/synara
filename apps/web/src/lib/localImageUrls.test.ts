@@ -1,6 +1,11 @@
 import { afterEach, describe, expect, it } from "vitest";
 
-import { buildLocalImageUrl, isLocalImageMarkdownSrc, localImageFileName } from "./localImageUrls";
+import {
+  buildLocalImageUrl,
+  buildLocalPreviewCapabilityUrl,
+  isLocalImageMarkdownSrc,
+  localImageFileName,
+} from "./localImageUrls";
 
 describe("local image URL helpers", () => {
   afterEach(() => {
@@ -66,6 +71,37 @@ describe("local image URL helpers", () => {
     expect(parsed.searchParams.get("cwd")).toBe("/Users/me/project");
     expect(parsed.searchParams.get("download")).toBe("1");
     expect(parsed.searchParams.get("token")).toBe("secret-token-123");
+  });
+
+  it("resolves capability URLs without forwarding the startup token", () => {
+    (globalThis as unknown as { window: object }).window = {
+      desktopBridge: { getWsUrl: () => "ws://127.0.0.1:51204/?token=startup-secret" },
+      location: { origin: "app://synara/" },
+    };
+
+    const parsed = new URL(
+      buildLocalPreviewCapabilityUrl("/api/local-preview/grant-id/demo%20file.html"),
+    );
+    expect(parsed.origin).toBe("http://127.0.0.1:51204");
+    expect(parsed.pathname).toBe("/api/local-preview/grant-id/demo%20file.html");
+    expect(parsed.searchParams.has("token")).toBe(false);
+  });
+
+  it("rejects off-origin and path-traversing capability values", () => {
+    (globalThis as unknown as { window: object }).window = {
+      desktopBridge: { getWsUrl: () => "ws://127.0.0.1:51204/?token=startup-secret" },
+      location: { origin: "app://synara/" },
+    };
+
+    expect(() =>
+      buildLocalPreviewCapabilityUrl("https://attacker.invalid/api/local-preview/grant/demo.html"),
+    ).toThrow("Invalid local preview capability path.");
+    expect(() =>
+      buildLocalPreviewCapabilityUrl("//attacker.invalid/api/local-preview/grant/demo.html"),
+    ).toThrow("Invalid local preview capability path.");
+    expect(() =>
+      buildLocalPreviewCapabilityUrl("/api/local-preview/grant/../../outside.html"),
+    ).toThrow("Invalid local preview capability path.");
   });
 
   it("derives display file names", () => {
