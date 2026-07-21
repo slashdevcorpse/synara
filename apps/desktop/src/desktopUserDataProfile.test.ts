@@ -4,6 +4,7 @@ import * as Path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
+  DESKTOP_PERSISTENCE_SMOKE_USER_DATA_ENV,
   repairBrowserProfileFromBridgeManifest,
   resolveDesktopBackendHomePath,
   resolveDesktopAppDataBase,
@@ -40,6 +41,28 @@ describe("desktopUserDataProfile", () => {
     expect(resolveDesktopUserDataPath({ appDataBase, userDataDirectoryName: "super-synara" })).toBe(
       Path.join(appDataBase, "super-synara"),
     );
+  });
+
+  it("uses an explicit absolute persistence-smoke profile instead of canonical userData", () => {
+    const persistenceSmokeUserDataPath = Path.resolve("/isolated/synara-home/electron-user-data");
+
+    expect(
+      resolveDesktopUserDataPath({
+        appDataBase: "/Users/tester/Library/Application Support",
+        userDataDirectoryName: "super-synara",
+        persistenceSmokeUserDataPath,
+      }),
+    ).toBe(persistenceSmokeUserDataPath);
+  });
+
+  it("rejects a relative persistence-smoke profile override", () => {
+    expect(() =>
+      resolveDesktopUserDataPath({
+        appDataBase: "/Users/tester/Library/Application Support",
+        userDataDirectoryName: "super-synara",
+        persistenceSmokeUserDataPath: "relative/electron-user-data",
+      }),
+    ).toThrow(`${DESKTOP_PERSISTENCE_SMOKE_USER_DATA_ENV} must be an absolute path`);
   });
 
   it("defaults Super Synara to its isolated backend home", () => {
