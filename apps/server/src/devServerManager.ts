@@ -23,9 +23,9 @@ import {
   type ServerLocalServerProcess,
 } from "@synara/contracts";
 import { localServerMatchesRun } from "@synara/shared/localServers";
-import { Effect, Layer, PubSub, Ref, ServiceMap, Stream } from "effect";
+import { Effect, Layer, Option, PubSub, Ref, Semaphore, ServiceMap, Stream } from "effect";
 
-import { TerminalManager, type TerminalError } from "./terminal/Services/Manager";
+import { TerminalError, TerminalManager } from "./terminal/Services/Manager";
 
 // Dev servers reuse the terminal infrastructure under a reserved synthetic
 // thread namespace so their PTYs never collide with real chat-thread terminals.
@@ -56,6 +56,27 @@ export function findProjectDevServerForLocalServer(input: {
   return null;
 }
 
+export type ProjectArchiveReservation =
+  | { readonly status: "acquired"; readonly reservationId: string }
+  | { readonly status: "already-reserved" }
+  | { readonly status: "dev-server-active" };
+
+/** Reject stale/direct starts when the durable active-project projection is absent. */
+export function requireActiveProjectForDevServer<A>(input: {
+  readonly projectId: ProjectId;
+  readonly project: Option.Option<A>;
+}): Effect.Effect<A, TerminalError> {
+  return Option.match(input.project, {
+    onNone: () =>
+      Effect.fail(
+        new TerminalError({
+          message: `Project '${input.projectId}' is unavailable or archived. Restore it before starting a dev server.`,
+        }),
+      ),
+    onSome: Effect.succeed,
+  });
+}
+
 export interface DevServerManagerShape {
   /** Start (or restart) the dev server for a project and return its descriptor. */
   readonly run: (
@@ -65,6 +86,20 @@ export interface DevServerManagerShape {
   readonly stop: (input: ProjectStopDevServerInput) => Effect.Effect<ProjectStopDevServerResult>;
   /** Snapshot of all currently tracked dev servers. */
   readonly list: Effect.Effect<ProjectListDevServersResult>;
+  /**
+   * Atomically reserve a project for archival against dev-server starts.
+   * A successful reservation remains in force until archive rollback or restore.
+   */
+  readonly reserveProjectArchive: (
+    projectId: ProjectId,
+  ) => Effect.Effect<ProjectArchiveReservation>;
+  /** Cancel only the archive reservation owned by this failed archive attempt. */
+  readonly cancelProjectArchiveReservation: (input: {
+    readonly projectId: ProjectId;
+    readonly reservationId: string;
+  }) => Effect.Effect<void>;
+  /** Release any retained archive reservation after the project is restored. */
+  readonly releaseProjectArchive: (projectId: ProjectId) => Effect.Effect<void>;
   /** Live stream of dev-server lifecycle events (excludes the initial snapshot). */
   readonly stream: Stream.Stream<ProjectDevServerEvent>;
 }
@@ -82,6 +117,8 @@ export const DevServerManagerLive = Layer.effect(
       PubSub.shutdown,
     );
     const registry = yield* Ref.make<Record<ProjectId, ProjectDevServer>>({});
+    const archiveReservations = yield* Ref.make<Record<ProjectId, string>>({});
+    const lifecycleLock = yield* Semaphore.make(1);
 
     const publish = (event: ProjectDevServerEvent) => PubSub.publish(pubsub, event);
 
@@ -115,80 +152,136 @@ export const DevServerManagerLive = Layer.effect(
     yield* Effect.addFinalizer(() => Effect.sync(unsubscribe));
 
     const run: DevServerManagerShape["run"] = (input) =>
-      Effect.gen(function* () {
-        const threadId = devServerThreadId(input.projectId);
+      lifecycleLock.withPermits(1)(
+        Effect.gen(function* () {
+          if ((yield* Ref.get(archiveReservations))[input.projectId]) {
+            return yield* new TerminalError({
+              message: `Project '${input.projectId}' is archived or being archived. Restore it before starting a dev server.`,
+            });
+          }
 
-        // If a dev server is already tracked for this project, tear its PTY down
-        // first so the command always lands in a fresh shell. A deliberate close
-        // emits no exit event, so the reaper stays quiet during the swap.
-        const existing = (yield* Ref.get(registry))[input.projectId];
-        if (existing) {
-          yield* terminalManager
-            .close({ threadId, deleteHistory: true })
-            .pipe(Effect.catch(() => Effect.void));
-        }
+          const threadId = devServerThreadId(input.projectId);
 
-        const snapshot = yield* terminalManager.open({
-          threadId,
-          terminalId: DEFAULT_TERMINAL_ID,
-          cwd: input.cwd,
-          cols: DEV_SERVER_TERMINAL_COLS,
-          rows: DEV_SERVER_TERMINAL_ROWS,
-          // Dev servers are headless: drain + retain history, but never broadcast
-          // their continuous output to clients that have no terminal UI for them.
-          streamOutput: false,
-          ...(input.env ? { env: input.env } : {}),
-        });
+          // If a dev server is already tracked for this project, tear its PTY down
+          // first so the command always lands in a fresh shell. A deliberate close
+          // emits no exit event, so the reaper stays quiet during the swap.
+          const existing = (yield* Ref.get(registry))[input.projectId];
+          if (existing) {
+            yield* terminalManager
+              .close({ threadId, deleteHistory: true })
+              .pipe(Effect.catch(() => Effect.void));
+          }
 
-        yield* terminalManager.write({
-          threadId,
-          terminalId: DEFAULT_TERMINAL_ID,
-          data: `${input.command}\r`,
-        });
+          const snapshot = yield* terminalManager.open({
+            threadId,
+            terminalId: DEFAULT_TERMINAL_ID,
+            cwd: input.cwd,
+            cols: DEV_SERVER_TERMINAL_COLS,
+            rows: DEV_SERVER_TERMINAL_ROWS,
+            // Dev servers are headless: drain + retain history, but never broadcast
+            // their continuous output to clients that have no terminal UI for them.
+            streamOutput: false,
+            ...(input.env ? { env: input.env } : {}),
+          });
 
-        const server: ProjectDevServer = {
-          projectId: input.projectId,
-          command: input.command,
-          cwd: input.cwd,
-          pid: snapshot.pid,
-          startedAt: new Date().toISOString(),
-          status: "running",
-        };
-        yield* Ref.update(registry, (current) => ({ ...current, [input.projectId]: server }));
-        yield* publish({ type: "upserted", server });
-        return { server };
-      });
+          yield* terminalManager.write({
+            threadId,
+            terminalId: DEFAULT_TERMINAL_ID,
+            data: `${input.command}\r`,
+          });
+
+          const server: ProjectDevServer = {
+            projectId: input.projectId,
+            command: input.command,
+            cwd: input.cwd,
+            pid: snapshot.pid,
+            startedAt: new Date().toISOString(),
+            status: "running",
+          };
+          yield* Ref.update(registry, (current) => ({ ...current, [input.projectId]: server }));
+          yield* publish({ type: "upserted", server });
+          return { server };
+        }),
+      );
 
     const stop: DevServerManagerShape["stop"] = (input) =>
-      Effect.gen(function* () {
-        // Remove from the registry *before* closing so the PTY teardown cannot be
-        // mistaken for a crash by the reaper.
-        const removed = yield* Ref.modify(registry, (current) => {
-          if (!current[input.projectId]) {
-            return [false, current] as const;
+      lifecycleLock.withPermits(1)(
+        Effect.gen(function* () {
+          // Remove from the registry *before* closing so the PTY teardown cannot be
+          // mistaken for a crash by the reaper.
+          const removed = yield* Ref.modify(registry, (current) => {
+            if (!current[input.projectId]) {
+              return [false, current] as const;
+            }
+            const next = { ...current };
+            delete next[input.projectId];
+            return [true, next] as const;
+          });
+          if (!removed) {
+            return { stopped: false };
           }
-          const next = { ...current };
-          delete next[input.projectId];
-          return [true, next] as const;
-        });
-        if (!removed) {
-          return { stopped: false };
-        }
-        yield* publish({ type: "removed", projectId: input.projectId, reason: "stopped" });
-        yield* terminalManager
-          .close({ threadId: devServerThreadId(input.projectId), deleteHistory: true })
-          .pipe(Effect.catch(() => Effect.void));
-        return { stopped: true };
-      });
+          yield* publish({ type: "removed", projectId: input.projectId, reason: "stopped" });
+          yield* terminalManager
+            .close({ threadId: devServerThreadId(input.projectId), deleteHistory: true })
+            .pipe(Effect.catch(() => Effect.void));
+          return { stopped: true };
+        }),
+      );
 
     const list: DevServerManagerShape["list"] = Ref.get(registry).pipe(
       Effect.map((current) => ({ servers: Object.values(current) })),
     );
 
+    const reserveProjectArchive: DevServerManagerShape["reserveProjectArchive"] = (projectId) =>
+      lifecycleLock.withPermits(1)(
+        Effect.gen(function* () {
+          if ((yield* Ref.get(registry))[projectId]) {
+            return { status: "dev-server-active" } as const;
+          }
+          if ((yield* Ref.get(archiveReservations))[projectId]) {
+            return { status: "already-reserved" } as const;
+          }
+          const reservationId = crypto.randomUUID();
+          yield* Ref.update(archiveReservations, (current) => ({
+            ...current,
+            [projectId]: reservationId,
+          }));
+          return { status: "acquired", reservationId } as const;
+        }),
+      );
+
+    const cancelProjectArchiveReservation: DevServerManagerShape["cancelProjectArchiveReservation"] =
+      (input) =>
+        lifecycleLock.withPermits(1)(
+          Ref.update(archiveReservations, (current) => {
+            if (current[input.projectId] !== input.reservationId) {
+              return current;
+            }
+            const next = { ...current };
+            delete next[input.projectId];
+            return next;
+          }),
+        );
+
+    const releaseProjectArchive: DevServerManagerShape["releaseProjectArchive"] = (projectId) =>
+      lifecycleLock.withPermits(1)(
+        Ref.update(archiveReservations, (current) => {
+          if (!current[projectId]) {
+            return current;
+          }
+          const next = { ...current };
+          delete next[projectId];
+          return next;
+        }),
+      );
+
     return {
       run,
       stop,
       list,
+      reserveProjectArchive,
+      cancelProjectArchiveReservation,
+      releaseProjectArchive,
       get stream() {
         return Stream.fromPubSub(pubsub);
       },

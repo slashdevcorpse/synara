@@ -20,6 +20,7 @@ import {
   type WsPushMessage,
   WS_CHANNELS,
   WS_METHODS,
+  WorkspaceCloneId,
   type WsPush,
   type ServerProviderStatus,
 } from "@synara/contracts";
@@ -729,6 +730,121 @@ describe("wsNativeApi", () => {
     expect(requestMock).toHaveBeenCalledWith(
       WS_METHODS.gitRunStackedAction,
       { actionId: "action-1", cwd: "/repo", action: "commit" },
+      { timeoutMs: null },
+    );
+  });
+
+  it("uses no client timeout for workspace clone streams and fans out progress", async () => {
+    const cloneId = WorkspaceCloneId.makeUnsafe("clone-native-api");
+    const result = {
+      cloneId,
+      clonedPath: "C:\\work\\repo",
+      projectId: null,
+      failure: null,
+    };
+    requestMock.mockResolvedValue(result);
+    const { createWsNativeApi } = await import("./wsNativeApi");
+    const api = createWsNativeApi();
+    const listener = vi.fn();
+    const unsubscribe = api.workspace.onCloneProgress(listener);
+
+    await expect(
+      api.workspace.cloneRepository({
+        cloneId,
+        url: "https://github.com/example/repo.git",
+        targetPath: "C:\\work\\repo",
+        createProject: true,
+        createParentDirectories: true,
+      }),
+    ).resolves.toEqual(result);
+    expect(requestMock).toHaveBeenCalledWith(
+      WS_METHODS.workspaceCloneRepository,
+      {
+        cloneId,
+        url: "https://github.com/example/repo.git",
+        targetPath: "C:\\work\\repo",
+        createProject: true,
+        createParentDirectories: true,
+      },
+      { timeoutMs: null },
+    );
+
+    const progress = {
+      _tag: "clone_progress" as const,
+      snapshot: {
+        cloneId,
+        status: "running" as const,
+        stage: "cloning" as const,
+        percent: 42,
+        message: "Receiving objects: 31%",
+        result: null,
+        updatedAt: "2026-07-20T12:00:00.000Z",
+      },
+      phase: "Receiving objects",
+      completed: 31,
+      total: 100,
+    };
+    emitPush(WS_CHANNELS.workspaceCloneProgress, progress);
+    expect(listener).toHaveBeenCalledWith(progress);
+
+    unsubscribe();
+    emitPush(WS_CHANNELS.workspaceCloneProgress, progress);
+    expect(listener).toHaveBeenCalledTimes(1);
+  });
+
+  it("forwards archived-project summary requests without mutation inputs", async () => {
+    const result = {
+      projects: [
+        {
+          id: ProjectId.makeUnsafe("project-archived"),
+          kind: "project" as const,
+          title: "Archived project",
+          workspaceRoot: "C:\\work\\archived",
+          archivedAt: "2026-07-20T12:00:00.000Z",
+          threadCount: 0,
+          latestThread: null,
+        },
+      ],
+    };
+    requestMock.mockResolvedValue(result);
+    const { createWsNativeApi } = await import("./wsNativeApi");
+    const api = createWsNativeApi();
+
+    await expect(api.workspace.listArchivedProjects()).resolves.toEqual(result);
+    expect(requestMock).toHaveBeenCalledWith(WS_METHODS.workspaceListArchivedProjects, {});
+  });
+
+  it("uses no client timeout for bounded workspace status batches", async () => {
+    const projectIds = [ProjectId.makeUnsafe("project-status")];
+    requestMock.mockResolvedValue({ items: [] });
+    const { createWsNativeApi } = await import("./wsNativeApi");
+    const api = createWsNativeApi();
+
+    await api.workspace.listGitStates({ projectIds, forceRefresh: true });
+
+    expect(requestMock).toHaveBeenCalledWith(
+      WS_METHODS.workspaceListGitStates,
+      { projectIds, forceRefresh: true },
+      { timeoutMs: null },
+    );
+  });
+
+  it("uses no client timeout when retrying cloned-project creation", async () => {
+    const cloneId = WorkspaceCloneId.makeUnsafe("clone-retry-native-api");
+    requestMock.mockResolvedValue({
+      cloneId,
+      clonedPath: "C:\\work\\repo",
+      projectId: ProjectId.makeUnsafe("project-1"),
+      failure: null,
+    });
+    const { createWsNativeApi } = await import("./wsNativeApi");
+    const api = createWsNativeApi();
+
+    await api.workspace.retryCloneProjectCreation({ cloneId });
+
+    expect(requestMock).toHaveBeenCalledWith(
+      WS_METHODS.workspaceRetryCloneProjectCreation,
+      { cloneId },
       { timeoutMs: null },
     );
   });

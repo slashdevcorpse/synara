@@ -85,6 +85,78 @@ describe("Super Synara workflow contracts", () => {
         audit,
       ),
     ).toThrow("source cleanliness");
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          "\n      - name: Verify preflight preserved source\n        run: node scripts/verify-release-worktree-clean.ts",
+          "",
+        ),
+        audit,
+      ),
+    ).toThrow(
+      "preflight must verify source cleanliness after install and after all preflight execution",
+    );
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          "\n  reserve_tag:",
+          "\n      - name: Mutate source after final check\n        run: echo dirty >> package.json\n\n  reserve_tag:",
+        ),
+        audit,
+      ),
+    ).toThrow("source-cleanliness checks must be ordered and fail closed");
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          "      - name: Install dependencies\n        run: bun install --frozen-lockfile",
+          "      - name: Install dependencies\n        continue-on-error: true\n        run: bun install --frozen-lockfile",
+        ),
+        audit,
+      ),
+    ).toThrow(
+      "install, release smoke, and source-cleanliness checks must be ordered and fail closed",
+    );
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          "      - name: Run release contract smoke tests\n        run: bun run release:smoke",
+          "      - name: Run release contract smoke tests\n        if: false\n        run: bun run release:smoke",
+        ),
+        audit,
+      ),
+    ).toThrow(
+      "install, release smoke, and source-cleanliness checks must be ordered and fail closed",
+    );
+  });
+
+  it("requires preflight route generation outside tracked source", () => {
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          '\n      - name: Isolate generated route tree\n        shell: bash\n        run: |\n          set -euo pipefail\n          printf \'SYNARA_GENERATED_ROUTE_TREE=%s\\n\' "$RUNNER_TEMP/super-synara-preflight-route-tree/routeTree.gen.ts" >> "$GITHUB_ENV"\n',
+          "",
+        ),
+        audit,
+      ),
+    ).toThrow("preflight must redirect route generation outside tracked source");
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          "$RUNNER_TEMP/super-synara-preflight-route-tree/routeTree.gen.ts",
+          "apps/web/src/routeTree.gen.ts",
+        ),
+        audit,
+      ),
+    ).toThrow("preflight must redirect route generation outside tracked source");
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          "      - name: Run stable browser tests\n        run: bun run --cwd apps/web test:browser:stable",
+          "      - name: Run stable browser tests\n        env:\n          SYNARA_GENERATED_ROUTE_TREE: apps/web/src/routeTree.gen.ts\n        run: bun run --cwd apps/web test:browser:stable",
+        ),
+        audit,
+      ),
+    ).toThrow("preflight steps must not override the isolated route-tree path");
   });
 
   it("requires exact native prerelease gates and rejects broad native suites", () => {

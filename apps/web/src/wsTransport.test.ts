@@ -3,7 +3,7 @@
 // Layer: Web transport tests
 // Depends on: the global WebSocket constructor shim and desktop bridge URL contract.
 
-import { Cause } from "effect";
+import { Cause, Effect, Stream } from "effect";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   WS_CHANNELS,
@@ -13,6 +13,7 @@ import {
   WS_PROTOCOL_MIN_REVISION,
   ProjectId,
   type OrchestrationShellStreamItem,
+  WorkspaceCloneId,
   WsCompatibilityError,
 } from "@synara/contracts";
 
@@ -27,6 +28,7 @@ import {
   retainShellSubscription,
   shellReconnectInput,
   shouldReconnectAfterStreamFailure,
+  consumeWorkspaceCloneProgressStream,
   WsTransport,
 } from "./wsTransport";
 import {
@@ -132,6 +134,72 @@ describe("WsTransport", () => {
     } as OrchestrationShellStreamItem);
 
     expect(shellReconnectInput(state)).toEqual({ afterSequence: 20 });
+  });
+
+  it("emits every workspace clone event and extracts the terminal result", async () => {
+    const cloneId = WorkspaceCloneId.makeUnsafe("clone-transport");
+    const started = {
+      _tag: "clone_started" as const,
+      snapshot: {
+        cloneId,
+        status: "running" as const,
+        stage: "cloning" as const,
+        percent: 0,
+        message: "Cloning repository…",
+        result: null,
+        updatedAt: "2026-07-20T12:00:00.000Z",
+      },
+    };
+    const result = {
+      cloneId,
+      clonedPath: "C:\\work\\repo",
+      projectId: null,
+      failure: null,
+    };
+    const finished = {
+      _tag: "clone_finished" as const,
+      snapshot: {
+        ...started.snapshot,
+        status: "succeeded" as const,
+        stage: "complete" as const,
+        percent: 100,
+        result,
+      },
+      result,
+    };
+    const seen: string[] = [];
+
+    await expect(
+      Effect.runPromise(
+        consumeWorkspaceCloneProgressStream(Stream.fromIterable([started, finished]), (event) =>
+          seen.push(event._tag),
+        ),
+      ),
+    ).resolves.toEqual(result);
+    expect(seen).toEqual(["clone_started", "clone_finished"]);
+  });
+
+  it("rejects a workspace clone stream that ends without a terminal result", async () => {
+    const cloneId = WorkspaceCloneId.makeUnsafe("clone-incomplete");
+    const started = {
+      _tag: "clone_started" as const,
+      snapshot: {
+        cloneId,
+        status: "running" as const,
+        stage: "cloning" as const,
+        percent: 0,
+        message: "Cloning repository…",
+        result: null,
+        updatedAt: "2026-07-20T12:00:00.000Z",
+      },
+    };
+
+    await expect(
+      Effect.runPromise(consumeWorkspaceCloneProgressStream(Stream.make(started), () => undefined)),
+    ).rejects.toMatchObject({
+      _tag: "WorkspaceCloneStreamIncompleteError",
+      message: "Workspace clone stream completed without a final result.",
+    });
   });
 
   it("does not reconnect the socket for typed stream-admission failures", () => {

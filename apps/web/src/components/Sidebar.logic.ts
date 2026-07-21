@@ -11,11 +11,11 @@ import {
   type ThreadId,
 } from "@synara/contracts";
 import { pluralize } from "@synara/shared/text";
-import { resolveThreadEnvironmentMode } from "@synara/shared/threadEnvironment";
 import { isWorkspaceRootWithin, workspaceRootsEqual } from "@synara/shared/threadWorkspace";
 import type { SidebarProjectSortOrder, SidebarThreadSortOrder } from "../appSettings";
 import { resolveRestorableThreadRoute, type LastThreadRoute } from "../chatRouteRestore";
 import type { ChatMessage, Project, SidebarThreadSummary, Thread } from "../types";
+import { worktreePathBasename } from "../worktreeCleanup";
 import { cn } from "../lib/utils";
 import {
   derivePinnedIds,
@@ -37,7 +37,6 @@ import {
   hasActionableProposedPlan,
   isLatestTurnSettled,
 } from "../session-logic";
-import { formatWorktreePathForDisplay } from "../worktreeCleanup";
 
 export {
   extractDuplicateProjectCreateProjectId,
@@ -295,54 +294,16 @@ function nonEmptyDisplayValue(value: string | null | undefined): string | null {
   return trimmed && trimmed.length > 0 ? trimmed : null;
 }
 
-function differentDisplayValue(
-  value: string | null | undefined,
-  existing: string | null,
-): string | null {
-  const normalized = nonEmptyDisplayValue(value);
-  if (!normalized) {
-    return null;
-  }
-  return existing !== null && normalized === existing ? null : normalized;
-}
-
-export type SidebarThreadHoverMetadata = {
-  projectName: string | null;
-  projectCwd: string | null;
-  sourceProjectName: string | null;
-  branch: string | null;
-  worktreeName: string | null;
-};
-
-export function resolveThreadHoverCardMetadata(input: {
-  thread: Pick<
-    SidebarThreadSummary,
-    "envMode" | "branch" | "worktreePath" | "associatedWorktreePath" | "associatedWorktreeBranch"
-  >;
-  project: Pick<Project, "name" | "folderName" | "cwd"> | null;
-}): SidebarThreadHoverMetadata {
-  const projectName =
-    nonEmptyDisplayValue(input.project?.name) ?? nonEmptyDisplayValue(input.project?.folderName);
-  const activeWorktreePath = nonEmptyDisplayValue(input.thread.worktreePath);
-  const isWorktree =
-    resolveThreadEnvironmentMode({
-      envMode: input.thread.envMode,
-      worktreePath: activeWorktreePath,
-    }) === "worktree";
-  const associatedWorktreePath = nonEmptyDisplayValue(input.thread.associatedWorktreePath);
-  const worktreePath = isWorktree ? (associatedWorktreePath ?? activeWorktreePath) : null;
-
-  return {
-    projectName,
-    projectCwd: input.project?.cwd ?? null,
-    sourceProjectName: isWorktree
-      ? differentDisplayValue(input.project?.folderName, projectName)
-      : null,
-    branch:
-      nonEmptyDisplayValue(input.thread.associatedWorktreeBranch) ??
-      nonEmptyDisplayValue(input.thread.branch),
-    worktreeName: worktreePath ? formatWorktreePathForDisplay(worktreePath) : null,
-  };
+export function resolveThreadHoverCardWorkspaceLabel(input: {
+  thread: Pick<SidebarThreadSummary, "associatedWorktreeBranch" | "associatedWorktreePath">;
+  project: Pick<Project, "folderName" | "name"> | null;
+}): string | null {
+  return (
+    nonEmptyDisplayValue(input.thread.associatedWorktreeBranch) ??
+    worktreePathBasename(input.thread.associatedWorktreePath) ??
+    nonEmptyDisplayValue(input.project?.folderName) ??
+    nonEmptyDisplayValue(input.project?.name)
+  );
 }
 
 export function isLoopbackHostname(hostname: string): boolean {
@@ -1082,18 +1043,6 @@ export function isLatestPinnedThreadMutation<T>(input: {
     id: input.threadId,
     requestVersion: input.requestVersion,
     latestMutationVersionById: input.latestMutationVersionByThreadId,
-  });
-}
-
-export function isLatestPinnedProjectMutation<T>(input: {
-  readonly projectId: T;
-  readonly requestVersion: number;
-  readonly latestMutationVersionByProjectId: ReadonlyMap<T, number>;
-}): boolean {
-  return isLatestPinMutation({
-    id: input.projectId,
-    requestVersion: input.requestVersion,
-    latestMutationVersionById: input.latestMutationVersionByProjectId,
   });
 }
 

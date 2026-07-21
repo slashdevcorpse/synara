@@ -207,6 +207,7 @@ function makeThread(id: ThreadId, overrides: Partial<SidebarThreadSummary> = {})
     projectId: PROJECT_ID,
     title: String(id),
     modelSelection: { provider: "codex", model: "gpt-5.6" },
+    runtimeMode: "full-access",
     interactionMode: "default",
     branch: null,
     worktreePath: null,

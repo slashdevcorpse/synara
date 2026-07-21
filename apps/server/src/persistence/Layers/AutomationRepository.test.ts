@@ -11,6 +11,7 @@ import {
   type AutomationCreateInput,
 } from "@synara/contracts";
 import { Effect, Layer, Option } from "effect";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { runMigrations } from "../Migrations.ts";
 import { AutomationRepositoryLive } from "./AutomationRepository.ts";
@@ -47,6 +48,25 @@ const permissionSnapshot = {
   allowedCapabilities: ["send-turn", "create-worktree"],
   createdAt: "2026-06-16T10:00:00.000Z",
 } as const;
+
+const upsertActiveProjectProjection = (projectId: ProjectId, now = "2026-06-16T10:00:00.000Z") =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* sql`
+      INSERT INTO projection_projects (
+        project_id, kind, title, workspace_root,
+        default_model_selection_json, scripts_json, is_pinned,
+        created_at, updated_at, archived_at, deleted_at
+      ) VALUES (
+        ${projectId}, 'project', ${`Project ${projectId}`}, ${`/tmp/${projectId}`},
+        NULL, '[]', 0, ${now}, ${now}, NULL, NULL
+      )
+      ON CONFLICT(project_id) DO UPDATE SET
+        archived_at = NULL,
+        deleted_at = NULL,
+        updated_at = excluded.updated_at
+    `;
+  });
 
 layer("AutomationRepository", (it) => {
   it.effect("creates and lists automation definitions with approval-required defaults", () =>
@@ -102,6 +122,7 @@ layer("AutomationRepository", (it) => {
     Effect.gen(function* () {
       const repository = yield* AutomationRepository;
       yield* runMigrations();
+      yield* upsertActiveProjectProjection(ProjectId.makeUnsafe("project-2"));
 
       yield* repository.createDefinition({
         id: AutomationId.makeUnsafe("automation-2"),
@@ -132,6 +153,421 @@ layer("AutomationRepository", (it) => {
       assert.strictEqual(second.id, first.id);
       assert.isTrue(Option.isSome(yield* repository.getRunById({ id: first.id })));
     }),
+  );
+
+  it.effect("atomically refuses a new run after its project projection is archived", () =>
+    Effect.gen(function* () {
+      const repository = yield* AutomationRepository;
+      const sql = yield* SqlClient.SqlClient;
+      yield* runMigrations();
+      const archivedProjectId = ProjectId.makeUnsafe("project-archived-run-gate");
+      const automationId = AutomationId.makeUnsafe("automation-archived-run-gate");
+
+      yield* sql`
+        INSERT INTO projection_projects (
+          project_id, kind, title, workspace_root,
+          default_model_selection_json, scripts_json, is_pinned,
+          created_at, updated_at, archived_at, deleted_at
+        ) VALUES (
+          ${archivedProjectId}, 'project', 'Archived automation project',
+          '/tmp/project-archived-run-gate', NULL, '[]', 0,
+          '2026-06-16T10:00:00.000Z', '2026-06-16T10:00:00.000Z',
+          '2026-06-16T10:01:00.000Z', NULL
+        )
+      `;
+      yield* repository.createDefinition({
+        id: automationId,
+        input: createInputForProject(archivedProjectId),
+        now: "2026-06-16T10:00:00.000Z",
+      });
+
+      const error = yield* repository
+        .createRun({
+          id: AutomationRunId.makeUnsafe("run-archived-project-gate"),
+          automationId,
+          projectId: archivedProjectId,
+          threadId: null,
+          trigger: { type: "manual" },
+          scheduledFor: "2026-06-16T10:02:00.000Z",
+          permissionSnapshot,
+          now: "2026-06-16T10:02:00.000Z",
+        })
+        .pipe(Effect.flip);
+      const listed = yield* repository.list({ projectId: archivedProjectId });
+
+      assert.match(error.message, /AutomationRepository\.createRun:missingRow/);
+      assert.strictEqual(listed.definitions.length, 0);
+      assert.strictEqual(listed.runs.length, 0);
+    }),
+  );
+
+  it.effect("rolls back a run when project admission changes after its insert", () =>
+    Effect.gen(function* () {
+      const repository = yield* AutomationRepository;
+      const sql = yield* SqlClient.SqlClient;
+      yield* runMigrations();
+      const projectId = ProjectId.makeUnsafe("project-run-admission-rollback");
+      const automationId = AutomationId.makeUnsafe("automation-run-admission-rollback");
+      const runId = AutomationRunId.makeUnsafe("run-admission-rollback");
+
+      yield* upsertActiveProjectProjection(projectId);
+      yield* repository.createDefinition({
+        id: automationId,
+        input: createInputForProject(projectId),
+        now: "2026-06-16T10:00:00.000Z",
+      });
+      yield* sql`
+        CREATE TRIGGER archive_project_after_automation_run_insert
+        AFTER INSERT ON automation_runs
+        BEGIN
+          UPDATE projection_projects
+          SET archived_at = '2026-06-16T10:01:00.000Z'
+          WHERE project_id = NEW.project_id;
+        END
+      `;
+
+      const error = yield* repository
+        .createRun({
+          id: runId,
+          automationId,
+          projectId,
+          threadId: null,
+          trigger: { type: "manual" },
+          scheduledFor: "2026-06-16T10:01:00.000Z",
+          permissionSnapshot,
+          now: "2026-06-16T10:01:00.000Z",
+        })
+        .pipe(
+          Effect.flip,
+          Effect.ensuring(
+            sql`DROP TRIGGER IF EXISTS archive_project_after_automation_run_insert`.pipe(
+              Effect.orDie,
+            ),
+          ),
+        );
+      const [runCount] = yield* sql<{ readonly count: number }>`
+        SELECT COUNT(*) AS "count"
+        FROM automation_runs
+        WHERE run_id = ${runId}
+      `;
+      const [project] = yield* sql<{ readonly archivedAt: string | null }>`
+        SELECT archived_at AS "archivedAt"
+        FROM projection_projects
+        WHERE project_id = ${projectId}
+      `;
+
+      assert.match(error.message, /AutomationRepository\.createRun:missingRow/);
+      assert.strictEqual(runCount?.count, 0);
+      assert.strictEqual(project?.archivedAt, null);
+    }),
+  );
+
+  it.effect("rejects scheduled dedupe readback after the project is archived", () =>
+    Effect.gen(function* () {
+      const repository = yield* AutomationRepository;
+      const sql = yield* SqlClient.SqlClient;
+      yield* runMigrations();
+      const projectId = ProjectId.makeUnsafe("project-archived-run-dedupe");
+      const automationId = AutomationId.makeUnsafe("automation-archived-run-dedupe");
+      const existingRunId = AutomationRunId.makeUnsafe("run-archived-run-dedupe-existing");
+      const rejectedRunId = AutomationRunId.makeUnsafe("run-archived-run-dedupe-rejected");
+      const scheduledFor = "2026-06-16T10:05:00.000Z";
+
+      yield* upsertActiveProjectProjection(projectId);
+      yield* repository.createDefinition({
+        id: automationId,
+        input: createInputForProject(projectId),
+        now: "2026-06-16T10:00:00.000Z",
+      });
+      yield* repository.createRun({
+        id: existingRunId,
+        automationId,
+        projectId,
+        threadId: null,
+        trigger: { type: "scheduled" },
+        scheduledFor,
+        permissionSnapshot,
+        now: "2026-06-16T10:00:00.000Z",
+      });
+      yield* sql`
+        UPDATE projection_projects
+        SET archived_at = '2026-06-16T10:01:00.000Z'
+        WHERE project_id = ${projectId}
+      `;
+
+      const error = yield* repository
+        .createRun({
+          id: rejectedRunId,
+          automationId,
+          projectId,
+          threadId: null,
+          trigger: { type: "scheduled" },
+          scheduledFor,
+          permissionSnapshot,
+          now: "2026-06-16T10:02:00.000Z",
+        })
+        .pipe(Effect.flip);
+
+      assert.match(error.message, /AutomationRepository\.createRun:missingRow/);
+      assert.isTrue(Option.isSome(yield* repository.getRunById({ id: existingRunId })));
+      assert.isTrue(Option.isNone(yield* repository.getRunById({ id: rejectedRunId })));
+    }),
+  );
+
+  it.effect("rejects active-thread readback after the project is deleted", () =>
+    Effect.gen(function* () {
+      const repository = yield* AutomationRepository;
+      const sql = yield* SqlClient.SqlClient;
+      yield* runMigrations();
+      const projectId = ProjectId.makeUnsafe("project-deleted-run-thread");
+      const automationId = AutomationId.makeUnsafe("automation-deleted-run-thread");
+      const threadId = ThreadId.makeUnsafe("thread-deleted-run-thread");
+      const existingRunId = AutomationRunId.makeUnsafe("run-deleted-run-thread-existing");
+      const rejectedRunId = AutomationRunId.makeUnsafe("run-deleted-run-thread-rejected");
+
+      yield* upsertActiveProjectProjection(projectId);
+      yield* repository.createDefinition({
+        id: automationId,
+        input: createInputForProject(projectId),
+        now: "2026-06-16T10:00:00.000Z",
+      });
+      yield* repository.createRun({
+        id: existingRunId,
+        automationId,
+        projectId,
+        threadId,
+        trigger: { type: "manual" },
+        scheduledFor: "2026-06-16T10:01:00.000Z",
+        permissionSnapshot,
+        now: "2026-06-16T10:01:00.000Z",
+      });
+      yield* sql`
+        UPDATE projection_projects
+        SET deleted_at = '2026-06-16T10:02:00.000Z'
+        WHERE project_id = ${projectId}
+      `;
+
+      const error = yield* repository
+        .createRun({
+          id: rejectedRunId,
+          automationId,
+          projectId,
+          threadId,
+          trigger: { type: "manual" },
+          scheduledFor: "2026-06-16T10:03:00.000Z",
+          permissionSnapshot,
+          now: "2026-06-16T10:03:00.000Z",
+        })
+        .pipe(Effect.flip);
+
+      assert.match(error.message, /AutomationRepository\.createRun:missingRow/);
+      assert.isTrue(Option.isSome(yield* repository.getRunById({ id: existingRunId })));
+      assert.isTrue(Option.isNone(yield* repository.getRunById({ id: rejectedRunId })));
+    }),
+  );
+
+  it.effect(
+    "hides archived-project automations without deleting them and restores visibility",
+    () =>
+      Effect.gen(function* () {
+        const repository = yield* AutomationRepository;
+        const sql = yield* SqlClient.SqlClient;
+        yield* runMigrations();
+        const projectId = ProjectId.makeUnsafe("project-automation-visibility");
+        const automationId = AutomationId.makeUnsafe("automation-project-visibility");
+        const runId = AutomationRunId.makeUnsafe("run-project-visibility");
+
+        yield* upsertActiveProjectProjection(projectId);
+        yield* repository.createDefinition({
+          id: automationId,
+          input: createInputForProject(projectId),
+          now: "2026-06-16T10:00:00.000Z",
+        });
+        yield* repository.createRun({
+          id: runId,
+          automationId,
+          projectId,
+          threadId: null,
+          trigger: { type: "manual" },
+          scheduledFor: "2026-06-16T10:01:00.000Z",
+          permissionSnapshot,
+          now: "2026-06-16T10:01:00.000Z",
+        });
+        yield* repository.markRunSucceeded({
+          id: runId,
+          turnId: null,
+          result: null,
+          finishedAt: "2026-06-16T10:02:00.000Z",
+        });
+
+        const beforeArchive = yield* repository.list({ projectId });
+        assert.deepStrictEqual(
+          beforeArchive.definitions.map((definition) => definition.id),
+          [automationId],
+        );
+        assert.deepStrictEqual(
+          beforeArchive.runs.map((run) => run.id),
+          [runId],
+        );
+
+        yield* sql`
+        UPDATE projection_projects
+        SET archived_at = '2026-06-16T10:03:00.000Z',
+            updated_at = '2026-06-16T10:03:00.000Z'
+        WHERE project_id = ${projectId}
+      `;
+        const whileArchived = yield* repository.list({ projectId, includeArchived: true });
+        assert.strictEqual(whileArchived.definitions.length, 0);
+        assert.strictEqual(whileArchived.runs.length, 0);
+        assert.isTrue(Option.isSome(yield* repository.getDefinitionById({ id: automationId })));
+        assert.isTrue(Option.isSome(yield* repository.getRunById({ id: runId })));
+
+        yield* sql`
+        UPDATE projection_projects
+        SET archived_at = NULL,
+            updated_at = '2026-06-16T10:04:00.000Z'
+        WHERE project_id = ${projectId}
+      `;
+        const afterRestore = yield* repository.list({ projectId });
+        assert.deepStrictEqual(
+          afterRestore.definitions.map((definition) => definition.id),
+          [automationId],
+        );
+        assert.deepStrictEqual(
+          afterRestore.runs.map((run) => run.id),
+          [runId],
+        );
+      }),
+  );
+
+  it.effect(
+    "pauses background run scans for archived or deleted projects and restores them later",
+    () =>
+      Effect.gen(function* () {
+        const repository = yield* AutomationRepository;
+        const sql = yield* SqlClient.SqlClient;
+        yield* runMigrations();
+        const projectedProjectId = ProjectId.makeUnsafe("project-background-visibility");
+        const missingProjectId = ProjectId.makeUnsafe("project-background-missing");
+        yield* upsertActiveProjectProjection(projectedProjectId, "1999-01-01T00:00:00.000Z");
+
+        const seedBackgroundRows = (projectId: ProjectId, suffix: string) =>
+          Effect.gen(function* () {
+            const automationId = AutomationId.makeUnsafe(`automation-background-${suffix}`);
+            const pendingRunId = AutomationRunId.makeUnsafe(`run-background-pending-${suffix}`);
+            const completionRunId = AutomationRunId.makeUnsafe(
+              `run-background-completion-${suffix}`,
+            );
+            const completionThreadId = ThreadId.makeUnsafe(
+              `thread-background-completion-${suffix}`,
+            );
+            yield* repository.createDefinition({
+              id: automationId,
+              input: {
+                ...createInputForProject(projectId),
+                mode: "heartbeat",
+                targetThreadId: completionThreadId,
+                completionPolicy: {
+                  type: "ai-evaluated",
+                  stopWhen: "the work is complete",
+                  confidenceThreshold: DEFAULT_AUTOMATION_STOP_CONFIDENCE_THRESHOLD,
+                },
+              },
+              now: "1999-01-01T00:00:00.000Z",
+            });
+            yield* repository.createRun({
+              id: pendingRunId,
+              automationId,
+              projectId,
+              threadId: ThreadId.makeUnsafe(`thread-background-pending-${suffix}`),
+              trigger: { type: "manual" },
+              scheduledFor: "1999-01-01T00:01:00.000Z",
+              permissionSnapshot,
+              now: "1999-01-01T00:01:00.000Z",
+            });
+            yield* repository.createRun({
+              id: completionRunId,
+              automationId,
+              projectId,
+              threadId: completionThreadId,
+              trigger: { type: "manual" },
+              scheduledFor: "1999-01-01T00:02:00.000Z",
+              permissionSnapshot,
+              now: "1999-01-01T00:02:00.000Z",
+            });
+            yield* repository.markRunSucceeded({
+              id: completionRunId,
+              turnId: null,
+              result: {
+                outcome: "unknown",
+                summary: null,
+                unread: true,
+                archivedAt: null,
+              },
+              finishedAt: "1999-01-01T00:03:00.000Z",
+            });
+            return { automationId, pendingRunId, completionRunId };
+          });
+
+        const projectedRows = yield* seedBackgroundRows(projectedProjectId, "projected");
+        const missingRows = yield* seedBackgroundRows(missingProjectId, "missing");
+        const scan = () =>
+          Effect.all({
+            recoverable: repository.listRecoverableRuns({ limit: 200 }),
+            completion: repository.listRunsNeedingCompletionEvaluation({ limit: 200 }),
+          });
+        const contains = <A extends { readonly id: AutomationRunId }>(
+          rows: ReadonlyArray<A>,
+          id: AutomationRunId,
+        ) => rows.some((row) => row.id === id);
+
+        const active = yield* scan();
+        assert.isTrue(contains(active.recoverable, projectedRows.pendingRunId));
+        assert.isTrue(contains(active.completion, projectedRows.completionRunId));
+        assert.isTrue(contains(active.recoverable, missingRows.pendingRunId));
+        assert.isTrue(contains(active.completion, missingRows.completionRunId));
+
+        yield* sql`
+          UPDATE projection_projects
+          SET archived_at = '1999-01-01T00:04:00.000Z',
+              updated_at = '1999-01-01T00:04:00.000Z'
+          WHERE project_id = ${projectedProjectId}
+        `;
+        const archived = yield* scan();
+        assert.isFalse(contains(archived.recoverable, projectedRows.pendingRunId));
+        assert.isFalse(contains(archived.completion, projectedRows.completionRunId));
+        assert.isTrue(contains(archived.recoverable, missingRows.pendingRunId));
+        assert.isTrue(contains(archived.completion, missingRows.completionRunId));
+
+        yield* sql`
+          UPDATE projection_projects
+          SET archived_at = NULL,
+              deleted_at = '1999-01-01T00:05:00.000Z',
+              updated_at = '1999-01-01T00:05:00.000Z'
+          WHERE project_id = ${projectedProjectId}
+        `;
+        const deleted = yield* scan();
+        assert.isFalse(contains(deleted.recoverable, projectedRows.pendingRunId));
+        assert.isFalse(contains(deleted.completion, projectedRows.completionRunId));
+
+        yield* upsertActiveProjectProjection(projectedProjectId, "1999-01-01T00:06:00.000Z");
+        const restored = yield* scan();
+        assert.isTrue(contains(restored.recoverable, projectedRows.pendingRunId));
+        assert.isTrue(contains(restored.completion, projectedRows.completionRunId));
+
+        yield* Effect.all(
+          [projectedRows.pendingRunId, missingRows.pendingRunId].map((runId) =>
+            repository.cancelRun({ runId, now: "1999-01-01T00:07:00.000Z" }),
+          ),
+          { discard: true },
+        );
+        yield* Effect.all(
+          [projectedRows.automationId, missingRows.automationId].map((id) =>
+            repository.archiveDefinition({ id, archivedAt: "1999-01-01T00:07:00.000Z" }),
+          ),
+          { discard: true },
+        );
+      }),
   );
 
   it.effect("marks a run started with thread and command references", () =>
@@ -179,6 +615,7 @@ layer("AutomationRepository", (it) => {
     Effect.gen(function* () {
       const repository = yield* AutomationRepository;
       yield* runMigrations();
+      yield* upsertActiveProjectProjection(ProjectId.makeUnsafe("project-4"));
 
       yield* repository.createDefinition({
         id: AutomationId.makeUnsafe("automation-4-due"),
@@ -211,6 +648,115 @@ layer("AutomationRepository", (it) => {
       assert.deepStrictEqual(
         due.map((definition) => definition.id),
         [AutomationId.makeUnsafe("automation-4-due")],
+      );
+    }),
+  );
+
+  it.effect("schedules definitions only while their project projection is active", () =>
+    Effect.gen(function* () {
+      const repository = yield* AutomationRepository;
+      const sql = yield* SqlClient.SqlClient;
+      yield* runMigrations();
+      const missingProjectId = ProjectId.makeUnsafe("project-scheduler-missing");
+      const archivedProjectId = ProjectId.makeUnsafe("project-scheduler-archived");
+      const activeProjectId = ProjectId.makeUnsafe("project-scheduler-active");
+      const missingAutomationId = AutomationId.makeUnsafe("automation-scheduler-missing");
+      const archivedAutomationId = AutomationId.makeUnsafe("automation-scheduler-archived");
+      const activeAutomationId = AutomationId.makeUnsafe("automation-scheduler-active");
+      yield* upsertActiveProjectProjection(archivedProjectId, "1990-01-01T00:00:00.000Z");
+      yield* upsertActiveProjectProjection(activeProjectId, "1990-01-01T00:00:00.000Z");
+
+      const createScheduledDefinition = (
+        projectId: ProjectId,
+        automationId: AutomationId,
+        nextRunAt: string,
+      ) =>
+        Effect.gen(function* () {
+          yield* repository.createDefinition({
+            id: automationId,
+            input: {
+              ...createInputForProject(projectId),
+              schedule: { type: "interval", everySeconds: 300 },
+            },
+            now: "1990-01-01T00:00:00.000Z",
+          });
+          yield* repository.setDefinitionNextRunAt({
+            id: automationId,
+            nextRunAt,
+            updatedAt: "1990-01-01T00:00:00.000Z",
+          });
+        });
+
+      yield* createScheduledDefinition(
+        missingProjectId,
+        missingAutomationId,
+        "1990-01-01T00:01:00.000Z",
+      );
+      yield* createScheduledDefinition(
+        archivedProjectId,
+        archivedAutomationId,
+        "1990-01-01T00:02:00.000Z",
+      );
+      yield* createScheduledDefinition(
+        activeProjectId,
+        activeAutomationId,
+        "1990-01-01T00:03:00.000Z",
+      );
+      yield* sql`
+        UPDATE projection_projects
+        SET archived_at = '1990-01-01T00:04:00.000Z',
+            updated_at = '1990-01-01T00:04:00.000Z'
+        WHERE project_id = ${archivedProjectId}
+      `;
+
+      const relevantIds = new Set([missingAutomationId, archivedAutomationId, activeAutomationId]);
+      const dueWhileHidden = yield* repository.listDueDefinitions({
+        now: "1990-01-01T00:10:00.000Z",
+        limit: 100,
+      });
+      assert.deepStrictEqual(
+        dueWhileHidden.filter((definition) => relevantIds.has(definition.id)).map(({ id }) => id),
+        [activeAutomationId],
+      );
+      assert.strictEqual(
+        yield* repository.getEarliestNextRunAt({ now: "1990-01-01T00:10:00.000Z" }),
+        "1990-01-01T00:03:00.000Z",
+      );
+
+      yield* upsertActiveProjectProjection(archivedProjectId, "1990-01-01T00:05:00.000Z");
+      const dueAfterRestore = yield* repository.listDueDefinitions({
+        now: "1990-01-01T00:10:00.000Z",
+        limit: 100,
+      });
+      assert.deepStrictEqual(
+        dueAfterRestore.filter((definition) => relevantIds.has(definition.id)).map(({ id }) => id),
+        [archivedAutomationId, activeAutomationId],
+      );
+      assert.strictEqual(
+        yield* repository.getEarliestNextRunAt({ now: "1990-01-01T00:10:00.000Z" }),
+        "1990-01-01T00:02:00.000Z",
+      );
+
+      yield* upsertActiveProjectProjection(missingProjectId, "1990-01-01T00:06:00.000Z");
+      const dueAfterProjectionAppears = yield* repository.listDueDefinitions({
+        now: "1990-01-01T00:10:00.000Z",
+        limit: 100,
+      });
+      assert.deepStrictEqual(
+        dueAfterProjectionAppears
+          .filter((definition) => relevantIds.has(definition.id))
+          .map(({ id }) => id),
+        [missingAutomationId, archivedAutomationId, activeAutomationId],
+      );
+      assert.strictEqual(
+        yield* repository.getEarliestNextRunAt({ now: "1990-01-01T00:10:00.000Z" }),
+        "1990-01-01T00:01:00.000Z",
+      );
+      yield* Effect.all(
+        [missingAutomationId, archivedAutomationId, activeAutomationId].map((id) =>
+          repository.archiveDefinition({ id, archivedAt: "1990-01-01T00:11:00.000Z" }),
+        ),
+        { discard: true },
       );
     }),
   );
@@ -996,6 +1542,10 @@ layer("AutomationRepository", (it) => {
     Effect.gen(function* () {
       const repository = yield* AutomationRepository;
       yield* runMigrations();
+      yield* upsertActiveProjectProjection(
+        ProjectId.makeUnsafe("project-earliest"),
+        "2030-01-01T10:00:00.000Z",
+      );
 
       yield* repository.createDefinition({
         id: AutomationId.makeUnsafe("automation-earliest-overdue"),
@@ -1049,13 +1599,15 @@ layer("AutomationRepository", (it) => {
       const repository = yield* AutomationRepository;
       yield* runMigrations();
       const automationId = AutomationId.makeUnsafe("automation-earliest-pending-stop");
+      const projectId = ProjectId.makeUnsafe("project-earliest-pending-stop");
       const threadId = ThreadId.makeUnsafe("thread-earliest-pending-stop");
       const runId = AutomationRunId.makeUnsafe("run-earliest-pending-stop");
+      yield* upsertActiveProjectProjection(projectId, "2020-01-01T10:00:00.000Z");
 
       yield* repository.createDefinition({
         id: automationId,
         input: {
-          ...createInputForProject("project-earliest-pending-stop"),
+          ...createInputForProject(projectId),
           schedule: { type: "interval", everySeconds: 300 },
           mode: "heartbeat",
           targetThreadId: threadId,
@@ -1075,7 +1627,7 @@ layer("AutomationRepository", (it) => {
       yield* repository.createRun({
         id: runId,
         automationId,
-        projectId: ProjectId.makeUnsafe("project-earliest-pending-stop"),
+        projectId,
         threadId,
         messageId: MessageId.makeUnsafe("message-earliest-pending-stop"),
         threadCreateCommandId: null,
@@ -1141,15 +1693,17 @@ layer("AutomationRepository", (it) => {
       const createBlockedHeartbeat = (suffix: string, nextRunAt: string) =>
         Effect.gen(function* () {
           const automationId = AutomationId.makeUnsafe(`automation-due-pending-${suffix}`);
+          const projectId = ProjectId.makeUnsafe(`project-due-pending-${suffix}`);
           const threadId = ThreadId.makeUnsafe(`thread-due-pending-${suffix}`);
           const runId = AutomationRunId.makeUnsafe(`run-due-pending-${suffix}`);
           const messageId = MessageId.makeUnsafe(`message-due-pending-${suffix}`);
           const turnStartCommandId = CommandId.makeUnsafe(`command-due-pending-${suffix}`);
+          yield* upsertActiveProjectProjection(projectId, "2019-06-16T10:00:00.000Z");
 
           yield* repository.createDefinition({
             id: automationId,
             input: {
-              ...createInputForProject(`project-due-pending-${suffix}`),
+              ...createInputForProject(projectId),
               schedule: { type: "interval", everySeconds: 300 },
               mode: "heartbeat",
               targetThreadId: threadId,
@@ -1169,7 +1723,7 @@ layer("AutomationRepository", (it) => {
           yield* repository.createRun({
             id: runId,
             automationId,
-            projectId: ProjectId.makeUnsafe(`project-due-pending-${suffix}`),
+            projectId,
             threadId,
             messageId,
             threadCreateCommandId: null,
@@ -1202,6 +1756,10 @@ layer("AutomationRepository", (it) => {
 
       yield* createBlockedHeartbeat("a", "2019-06-16T10:00:10.000Z");
       yield* createBlockedHeartbeat("b", "2019-06-16T10:00:20.000Z");
+      yield* upsertActiveProjectProjection(
+        ProjectId.makeUnsafe("project-due-ready"),
+        "2019-06-16T10:00:00.000Z",
+      );
       yield* repository.createDefinition({
         id: AutomationId.makeUnsafe("automation-due-ready"),
         input: {

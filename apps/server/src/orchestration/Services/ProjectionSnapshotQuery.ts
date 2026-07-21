@@ -8,6 +8,7 @@
  */
 import type {
   OrchestrationCheckpointSummary,
+  OrchestrationArchivedProjectSummary,
   OrchestrationProject,
   OrchestrationProjectShell,
   OrchestrationReadModel,
@@ -112,6 +113,12 @@ export interface ProjectionSnapshotQueryShape {
    */
   readonly getShellSnapshot: () => Effect.Effect<
     OrchestrationShellSnapshot,
+    ProjectionRepositoryError
+  >;
+
+  /** List archived regular projects without hydrating preserved chat bodies. */
+  readonly listArchivedProjects: () => Effect.Effect<
+    ReadonlyArray<OrchestrationArchivedProjectSummary>,
     ProjectionRepositoryError
   >;
 

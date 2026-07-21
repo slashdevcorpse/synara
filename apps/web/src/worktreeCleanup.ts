@@ -32,14 +32,32 @@ export function getOrphanedWorktreePathForThread(
   return isShared ? null : targetWorktreePath;
 }
 
+function normalizeWorktreePathForDisplay(worktreePath: string): string {
+  return worktreePath.replace(/\\/g, "/").replace(/\/+$/, "");
+}
+
+export function worktreePathBasename(worktreePath: string | null | undefined): string | null {
+  const trimmed = worktreePath?.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  const normalized = normalizeWorktreePathForDisplay(trimmed);
+  if (!normalized || /^[A-Za-z]:$/.test(normalized)) {
+    return null;
+  }
+
+  const parts = normalized.split("/");
+  const lastPart = parts[parts.length - 1]?.trim() ?? "";
+  return lastPart.length > 0 ? lastPart : null;
+}
+
 export function formatWorktreePathForDisplay(worktreePath: string): string {
   const trimmed = worktreePath.trim();
   if (!trimmed) {
     return worktreePath;
   }
 
-  const normalized = trimmed.replace(/\\/g, "/").replace(/\/+$/, "");
-  const parts = normalized.split("/");
-  const lastPart = parts[parts.length - 1]?.trim() ?? "";
-  return lastPart.length > 0 ? lastPart : trimmed;
+  const normalized = normalizeWorktreePathForDisplay(trimmed);
+  return worktreePathBasename(trimmed) ?? (normalized || trimmed);
 }

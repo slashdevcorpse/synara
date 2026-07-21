@@ -24,6 +24,10 @@ const PRERELEASE_MACOS_REQUIRED_COMMANDS = [
 ] as const;
 const WINDOWS_RELEASE_SCOPE = "windows-only";
 const MACOS_RELEASE_SCOPE = "windows-and-macos";
+const PREFLIGHT_ROUTE_TREE_SETUP_COMMAND = [
+  "set -euo pipefail",
+  `printf 'SYNARA_GENERATED_ROUTE_TREE=%s\\n' "$RUNNER_TEMP/super-synara-preflight-route-tree/routeTree.gen.ts" >> "$GITHUB_ENV"`,
+].join("\n");
 const MACOS_JOB_CONDITION = "${{ needs.preflight.outputs.include_macos == 'true' }}";
 const PUBLISH_JOB_CONDITION =
   "${{ always() && needs.preflight.result == 'success' && needs.reserve_tag.result == 'success' && needs.windows_x64.result == 'success' && ((needs.preflight.outputs.include_macos == 'true' && needs.macos_arm64.result == 'success') || (needs.preflight.outputs.include_macos == 'false' && needs.macos_arm64.result == 'skipped')) }}";
@@ -241,6 +245,115 @@ function verifyRootTestOwnership(jobs: UnknownRecord): void {
   }
 }
 
+function verifyPreflightSourceCleanliness(jobs: UnknownRecord): void {
+  const preflightJob = publicationJob(jobs, "preflight");
+  const preflightSteps = preflightJob.steps;
+  if (!Array.isArray(preflightSteps)) {
+    throw new Error("Publication workflow must define the preflight job with steps.");
+  }
+  const steps = nativeJobRunSteps(jobs, "preflight");
+  const installSteps = steps.filter((step) => step.command === "bun install --frozen-lockfile");
+  const releaseSmokeSteps = steps.filter((step) => step.command === "bun run release:smoke");
+  const cleanlinessSteps = steps.filter(
+    (step) => step.command === "node scripts/verify-release-worktree-clean.ts",
+  );
+  if (
+    installSteps.length !== 1 ||
+    releaseSmokeSteps.length !== 1 ||
+    cleanlinessSteps.length !== 2
+  ) {
+    throw new Error(
+      "Publication workflow preflight must verify source cleanliness after install and after all preflight execution.",
+    );
+  }
+  const [installStep] = installSteps;
+  const [releaseSmokeStep] = releaseSmokeSteps;
+  const [afterInstall, afterExecution] = cleanlinessSteps;
+  if (
+    !installStep ||
+    !releaseSmokeStep ||
+    !afterInstall ||
+    !afterExecution ||
+    afterInstall.index <= installStep.index ||
+    afterInstall.index >= releaseSmokeStep.index ||
+    afterExecution.index <= releaseSmokeStep.index ||
+    afterExecution.index !== preflightSteps.length - 1 ||
+    [installStep, releaseSmokeStep, ...cleanlinessSteps].some(
+      (step) =>
+        step.condition !== undefined ||
+        (step.continueOnError !== undefined && step.continueOnError !== false),
+    )
+  ) {
+    throw new Error(
+      "Publication workflow preflight install, release smoke, and source-cleanliness checks must be ordered and fail closed.",
+    );
+  }
+}
+
+function verifyPreflightRouteTreeIsolation(preflightJob: UnknownRecord): void {
+  const environment = preflightJob.env;
+  if (
+    isRecord(environment) &&
+    Object.keys(environment).some((key) => key.toUpperCase() === "SYNARA_GENERATED_ROUTE_TREE")
+  ) {
+    throw new Error(
+      "Publication workflow preflight must set the isolated route-tree path at runner execution time.",
+    );
+  }
+  const steps = preflightJob.steps as ReadonlyArray<unknown>;
+  const setupSteps = steps
+    .map((step, index) => ({ index, step }))
+    .filter(({ step }) => isRecord(step) && step.name === "Isolate generated route tree");
+  if (setupSteps.length !== 1) {
+    throw new Error(
+      "Publication workflow preflight must redirect route generation outside tracked source.",
+    );
+  }
+  const [setupEntry] = setupSteps;
+  const setupStep = setupEntry!.step;
+  if (
+    !isRecord(setupStep) ||
+    setupStep.shell !== "bash" ||
+    typeof setupStep.run !== "string" ||
+    normalizeShellCommand(setupStep.run) !==
+      normalizeShellCommand(PREFLIGHT_ROUTE_TREE_SETUP_COMMAND) ||
+    setupStep.if !== undefined ||
+    (setupStep["continue-on-error"] !== undefined && setupStep["continue-on-error"] !== false)
+  ) {
+    throw new Error(
+      "Publication workflow preflight must redirect route generation outside tracked source.",
+    );
+  }
+  const installIndex = steps.findIndex(
+    (step) => isRecord(step) && step.run === "bun install --frozen-lockfile",
+  );
+  if (installIndex < 0 || setupEntry!.index >= installIndex) {
+    throw new Error(
+      "Publication workflow preflight must establish route-tree isolation before dependency install.",
+    );
+  }
+  for (const [index, step] of steps.entries()) {
+    if (!isRecord(step)) continue;
+    if (
+      isRecord(step.env) &&
+      Object.keys(step.env).some((key) => key.toUpperCase() === "SYNARA_GENERATED_ROUTE_TREE")
+    ) {
+      throw new Error(
+        "Publication workflow preflight steps must not override the isolated route-tree path.",
+      );
+    }
+    if (
+      index !== setupEntry!.index &&
+      typeof step.run === "string" &&
+      step.run.includes("SYNARA_GENERATED_ROUTE_TREE")
+    ) {
+      throw new Error(
+        "Publication workflow preflight steps must not override the isolated route-tree path.",
+      );
+    }
+  }
+}
+
 function verifyNativeJobCommands(
   job: UnknownRecord,
   jobName: string,
@@ -380,7 +493,9 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
     throw new Error("Publication release-scope contract must default to exact Windows x64.");
   }
   verifyRootTestOwnership(jobs);
+  verifyPreflightSourceCleanliness(jobs);
   const preflightJob = publicationJob(jobs, "preflight");
+  verifyPreflightRouteTreeIsolation(preflightJob);
   if (preflightJob["runs-on"] !== "ubuntu-24.04") {
     throw new Error("Publication workflow preflight must run on ubuntu-24.04.");
   }
@@ -612,7 +727,7 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
   prohibitText(main, "--desktop-flavor", "Publication must not use the superseded flavor flag.");
   const mainCleanlinessChecks =
     main.match(/node scripts\/verify-release-worktree-clean\.ts/g)?.length ?? 0;
-  if (mainCleanlinessChecks < 7) {
+  if (mainCleanlinessChecks < 8) {
     throw new Error(
       "Publication must prove source cleanliness after installs, builds, and staging.",
     );

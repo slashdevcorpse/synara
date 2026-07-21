@@ -7,12 +7,15 @@ import { type NativeApi, type OrchestrationShellSnapshot, type ProjectId } from 
 import { getDefaultModel } from "@synara/shared/model";
 
 import {
+  extractArchivedProjectCreateProjectId,
   extractDuplicateProjectCreateProjectId,
+  isArchivedProjectCreateError,
   isDuplicateProjectCreateError,
   waitForRecoverableProjectForDuplicateCreate,
   waitForRecoverableProjectInReadModel,
 } from "./projectCreateRecovery";
 import { newCommandId, newProjectId } from "./utils";
+import { unarchiveProjectFromClient } from "./projectArchive";
 
 const DEFAULT_PROJECT_CREATE_RECOVERY_MAX_ATTEMPTS = 6;
 const DEFAULT_PROJECT_CREATE_RECOVERY_DELAY_MS = 50;
@@ -39,6 +42,7 @@ export async function createOrRecoverProjectFromPath(input: {
   project: OrchestrationShellSnapshot["projects"][number] | null;
   snapshot: OrchestrationShellSnapshot | null;
   created: boolean;
+  restored: boolean;
 }> {
   const workspaceRoot = input.workspaceRoot.trim();
   if (!workspaceRoot) {
@@ -78,10 +82,60 @@ export async function createOrRecoverProjectFromPath(input: {
       project,
       snapshot,
       created: true,
+      restored: false,
     };
   } catch (error) {
     const description =
       error instanceof Error ? error.message : "An error occurred while adding the project.";
+    if (isArchivedProjectCreateError(description)) {
+      const archivedProjectId = extractArchivedProjectCreateProjectId(
+        description,
+      ) as ProjectId | null;
+      if (!archivedProjectId) {
+        throw error instanceof Error ? error : new Error(description);
+      }
+
+      try {
+        await unarchiveProjectFromClient(input.api.orchestration, archivedProjectId);
+      } catch (restoreError) {
+        // Another client may have restored the project after our create was rejected.
+        // Recover that active row if it has appeared; otherwise preserve the real
+        // unarchive failure (pending cleanup, pin cap, etc.) for an actionable UI error.
+        const raced = await waitForRecoverableProjectInReadModel({
+          projectId: archivedProjectId,
+          loadSnapshot: input.loadSnapshot,
+          maxAttempts,
+          delayMs,
+        });
+        if (raced.project && raced.snapshot) {
+          return {
+            projectId: archivedProjectId,
+            project: raced.project,
+            snapshot: raced.snapshot,
+            created: false,
+            restored: false,
+          };
+        }
+        throw restoreError;
+      }
+
+      const restored = await waitForRecoverableProjectInReadModel({
+        projectId: archivedProjectId,
+        loadSnapshot: input.loadSnapshot,
+        maxAttempts,
+        delayMs,
+      });
+      if (!restored.project || !restored.snapshot) {
+        throw new Error(PROJECT_CREATE_EXISTING_SYNC_ERROR, { cause: error });
+      }
+      return {
+        projectId: archivedProjectId,
+        project: restored.project,
+        snapshot: restored.snapshot,
+        created: false,
+        restored: true,
+      };
+    }
     if (!isDuplicateProjectCreateError(description)) {
       throw error instanceof Error ? error : new Error(description);
     }
@@ -99,6 +153,7 @@ export async function createOrRecoverProjectFromPath(input: {
         project,
         snapshot,
         created: false,
+        restored: false,
       };
     }
 
@@ -109,6 +164,7 @@ export async function createOrRecoverProjectFromPath(input: {
         project: null,
         snapshot,
         created: false,
+        restored: false,
       };
     }
 

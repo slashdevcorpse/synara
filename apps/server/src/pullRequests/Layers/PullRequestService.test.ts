@@ -30,6 +30,7 @@ function makeProject(id: string, title: string, workspaceRoot: string): Orchestr
     isPinned: false,
     createdAt: now,
     updatedAt: now,
+    archivedAt: null,
     deletedAt: null,
   };
 }
@@ -106,6 +107,85 @@ function makeDependencies(input: {
 }
 
 describe("PullRequestService", () => {
+  it("excludes archived projects from list, refresh, count, and project operations", async () => {
+    const archivedProject = {
+      ...makeProject("project-archived", "Archived", "/tmp/archived"),
+      archivedAt: now,
+    } satisfies OrchestrationProject;
+    const base = createGitHubCliWithFakeGh().service;
+    let repositoryResolutions = 0;
+    let remoteReads = 0;
+    const github: GitHubCliShape = {
+      ...base,
+      listRepositoryPullRequests: () =>
+        Effect.sync(() => {
+          remoteReads += 1;
+          return makeBatch([makeItem(1)]);
+        }),
+      listReviewRequestedPullRequestNumbers: () =>
+        Effect.sync(() => {
+          remoteReads += 1;
+          return [1];
+        }),
+    };
+
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const baseDependencies = makeDependencies({
+            projects: [archivedProject],
+            repositories: new Map([[archivedProject.id, "acme/archived"]]),
+            github,
+          });
+          const service = yield* makePullRequestService({
+            ...baseDependencies,
+            resolveRepositories: (project) =>
+              Effect.sync(() => {
+                repositoryResolutions += 1;
+                return {
+                  repositories: [
+                    {
+                      nameWithOwner: "acme/archived",
+                      url: "https://github.com/acme/archived",
+                    },
+                  ],
+                  authoritative: true,
+                };
+              }),
+          });
+          const list = yield* service.list({
+            projectId: archivedProject.id,
+            state: "open",
+            involvement: "authored",
+            forceRefresh: true,
+          });
+          const count = yield* service.reviewRequestCount({ projectId: archivedProject.id });
+          const operation = yield* service
+            .setPinned({
+              projectId: archivedProject.id,
+              repository: "acme/archived",
+              number: 1,
+              isPinned: false,
+            })
+            .pipe(Effect.exit);
+          return { list, count, operation };
+        }),
+      ),
+    );
+
+    expect(result.list).toEqual({
+      viewer: null,
+      entries: [],
+      errors: [],
+      repositoryBatches: [],
+    });
+    expect(result.count).toEqual({ count: 0, incomplete: false });
+    expect(result.operation._tag).toBe("Failure");
+    expect(String(result.operation)).toContain("Project not found");
+    expect(repositoryResolutions).toBe(0);
+    expect(remoteReads).toBe(0);
+  });
+
   it("returns one repository-level row for projects sharing a repository", async () => {
     const projectA = makeProject("project-list-a", "List A", "/tmp/list-a");
     const projectB = makeProject("project-list-b", "feature-1", "/tmp/list-b");

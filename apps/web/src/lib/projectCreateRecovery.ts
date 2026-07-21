@@ -3,6 +3,7 @@
 // Exports: duplicate-create error guards plus snapshot matching for import recovery.
 
 import type { OrchestrationReadModel } from "@synara/contracts";
+import { PROJECT_ARCHIVED_WORKSPACE_ROOT_INVARIANT_MARKER } from "@synara/shared/errorMessages";
 import { workspaceRootsEqual } from "@synara/shared/threadWorkspace";
 
 const DUPLICATE_PROJECT_CREATE_ERROR_PREFIX =
@@ -135,6 +136,23 @@ export function extractDuplicateProjectCreateProjectId(message: string): string 
 
   const duplicateMarkerIndex = message.indexOf("' already uses workspace root '");
   return message.slice(DUPLICATE_PROJECT_CREATE_ERROR_PREFIX.length, duplicateMarkerIndex) || null;
+}
+
+export function isArchivedProjectCreateError(message: string): boolean {
+  if (!message.startsWith(DUPLICATE_PROJECT_CREATE_ERROR_PREFIX)) {
+    return false;
+  }
+  const archivedMarker = `' ${PROJECT_ARCHIVED_WORKSPACE_ROOT_INVARIANT_MARKER} '`;
+  return message.indexOf(archivedMarker) > DUPLICATE_PROJECT_CREATE_ERROR_PREFIX.length;
+}
+
+export function extractArchivedProjectCreateProjectId(message: string): string | null {
+  if (!isArchivedProjectCreateError(message)) {
+    return null;
+  }
+  const archivedMarker = `' ${PROJECT_ARCHIVED_WORKSPACE_ROOT_INVARIANT_MARKER} '`;
+  const archivedMarkerIndex = message.indexOf(archivedMarker);
+  return message.slice(DUPLICATE_PROJECT_CREATE_ERROR_PREFIX.length, archivedMarkerIndex) || null;
 }
 
 export function findRecoverableProject<T extends DuplicateProjectCreateRecoveryCandidate>(

@@ -175,6 +175,7 @@ export interface Project {
   defaultModelSelection: ModelSelection | null;
   expanded: boolean;
   isPinned?: boolean;
+  serverSequence?: number | undefined;
   createdAt?: string | undefined;
   updatedAt?: string | undefined;
   scripts: ProjectScript[];
@@ -289,6 +290,7 @@ export interface SidebarThreadSummary {
   projectId: ProjectId;
   title: string;
   modelSelection: ModelSelection;
+  runtimeMode: RuntimeMode;
   interactionMode: ProviderInteractionMode;
   envMode?: ThreadEnvironmentMode | undefined;
   branch: string | null;

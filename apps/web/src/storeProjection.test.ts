@@ -9,6 +9,7 @@ import {
   ThreadMarkerId,
   TurnId,
   type OrchestrationReadModel,
+  type OrchestrationShellSnapshot,
   type OrchestrationShellStreamEvent,
   type ThreadMarker,
 } from "@synara/contracts";
@@ -21,6 +22,7 @@ import {
   removeDeletedThreadFromClientState,
   syncServerShellSnapshot,
   syncServerReadModel,
+  syncServerThreadDetail,
   syncServerThreadDetailHotPath,
 } from "./storeProjection";
 import type { AppState } from "./storeState";
@@ -145,6 +147,34 @@ describe("store projection", () => {
     });
   });
 
+  it("projects runtime mode and invalidates summary identity when it changes", () => {
+    const readModel = makeReadModel(
+      makeReadModelThread({
+        runtimeMode: "full-access",
+        updatedAt: "2026-02-27T00:00:00.000Z",
+      }),
+    );
+    const hydrated = syncServerReadModel(makeState(makeThread()), readModel);
+    const initialSummary = hydrated.sidebarThreadSummaryById["thread-1"];
+    const unchanged = syncServerReadModel(hydrated, readModel);
+    const changed = syncServerReadModel(hydrated, {
+      ...readModel,
+      snapshotSequence: readModel.snapshotSequence + 1,
+      updatedAt: "2026-02-27T00:01:00.000Z",
+      threads: [
+        makeReadModelThread({
+          runtimeMode: "approval-required",
+          updatedAt: "2026-02-27T00:01:00.000Z",
+        }),
+      ],
+    });
+
+    expect(initialSummary?.runtimeMode).toBe("full-access");
+    expect(unchanged.sidebarThreadSummaryById["thread-1"]).toBe(initialSummary);
+    expect(changed.sidebarThreadSummaryById["thread-1"]).not.toBe(initialSummary);
+    expect(changed.sidebarThreadSummaryById["thread-1"]?.runtimeMode).toBe("approval-required");
+  });
+
   it("falls back to local derivation when server summary metadata is absent", () => {
     const next = syncServerReadModel(
       makeState(makeThread()),
@@ -219,6 +249,203 @@ describe("store projection", () => {
     expect(threadsOf(afterStaleReadModel)).toEqual([]);
   });
 
+  it("removes archived project visibility without tombstones and restores the same ids", () => {
+    const projectId = ProjectId.makeUnsafe("project-archive-cycle");
+    const threadId = ThreadId.makeUnsafe("thread-archive-cycle");
+    const shellThread = {
+      id: threadId,
+      projectId,
+      title: "Preserved thread",
+      modelSelection: {
+        provider: "codex" as const,
+        model: "gpt-5.3-codex",
+      },
+      runtimeMode: DEFAULT_RUNTIME_MODE,
+      interactionMode: DEFAULT_INTERACTION_MODE,
+      envMode: "local" as const,
+      branch: null,
+      worktreePath: null,
+      forkSourceThreadId: null,
+      sidechatSourceThreadId: null,
+      latestTurn: null,
+      createdAt: "2026-02-27T00:00:00.000Z",
+      updatedAt: "2026-02-27T00:00:30.000Z",
+      handoff: null,
+      session: null,
+    } satisfies OrchestrationShellSnapshot["threads"][number];
+    const visibleSnapshot = {
+      snapshotSequence: 1,
+      updatedAt: "2026-02-27T00:01:00.000Z",
+      projects: [
+        {
+          id: projectId,
+          title: "Archive cycle",
+          workspaceRoot: "/tmp/archive-cycle",
+          defaultModelSelection: null,
+          scripts: [],
+          createdAt: "2026-02-27T00:00:00.000Z",
+          updatedAt: "2026-02-27T00:00:30.000Z",
+        },
+      ],
+      threads: [shellThread],
+    } satisfies OrchestrationShellSnapshot;
+    const initialState = syncServerShellSnapshot(
+      {
+        projects: [],
+        sidebarThreadSummaryById: {},
+        threadsHydrated: false,
+      },
+      visibleSnapshot,
+    );
+
+    const invalidationState = applyShellEvent(initialState, {
+      kind: "snapshot-invalidated",
+      sequence: 2,
+      reason: "project-visibility-changed",
+    } satisfies OrchestrationShellStreamEvent);
+    const archivedState = syncServerShellSnapshot(invalidationState, {
+      snapshotSequence: 2,
+      updatedAt: "2026-02-27T00:02:00.000Z",
+      projects: [],
+      threads: [],
+    });
+    const afterLateHotDetail = syncServerThreadDetailHotPath(
+      archivedState,
+      makeReadModelThread({
+        id: threadId,
+        projectId,
+        title: "Late detail after archive",
+      }),
+    );
+    const afterLateDetail = syncServerThreadDetail(
+      afterLateHotDetail,
+      makeReadModelThread({
+        id: threadId,
+        projectId,
+        title: "Late direct detail after archive",
+      }),
+    );
+    const afterLateShell = applyShellEvent(afterLateDetail, {
+      kind: "thread-upserted",
+      sequence: 3,
+      thread: {
+        ...shellThread,
+        title: "Late shell after archive",
+      },
+    } satisfies OrchestrationShellStreamEvent);
+    const restoredState = syncServerShellSnapshot(afterLateShell, {
+      ...visibleSnapshot,
+      snapshotSequence: 4,
+      updatedAt: "2026-02-27T00:04:00.000Z",
+    });
+    const restoredDetailState = syncServerThreadDetail(
+      restoredState,
+      makeReadModelThread({
+        id: threadId,
+        projectId,
+        title: "Restored preserved thread",
+      }),
+    );
+
+    expect(invalidationState).toBe(initialState);
+    expect(archivedState.projects).toEqual([]);
+    expect(threadsOf(archivedState)).toEqual([]);
+    expect(afterLateHotDetail.projects).toEqual([]);
+    expect(threadsOf(afterLateHotDetail)).toEqual([]);
+    expect(threadsOf(afterLateDetail)).toEqual([]);
+    expect(threadsOf(afterLateShell)).toEqual([]);
+    expect(archivedState.deletedProjectIdsById?.[projectId]).toBeUndefined();
+    expect(archivedState.deletedThreadIdsById?.[threadId]).toBeUndefined();
+    expect(restoredState.projects.map((project) => project.id)).toEqual([projectId]);
+    expect(threadsOf(restoredState).map((thread) => thread.id)).toEqual([threadId]);
+    expect(threadsOf(restoredDetailState)).toEqual([
+      expect.objectContaining({ id: threadId, title: "Restored preserved thread" }),
+    ]);
+  });
+
+  it("accepts thread detail and shell events before the project snapshot hydrates", () => {
+    const projectId = ProjectId.makeUnsafe("project-before-hydration");
+    const threadId = ThreadId.makeUnsafe("thread-before-hydration");
+    const preHydrationState: AppState = {
+      projects: [],
+      sidebarThreadSummaryById: {},
+      threadsHydrated: false,
+    };
+    const detail = makeReadModelThread({ id: threadId, projectId });
+    const shellThread = makeShellSnapshot({
+      id: threadId,
+      projectId,
+      title: "Thread before hydration",
+      modelSelection: {
+        provider: "codex",
+        model: "gpt-5.3-codex",
+      },
+      runtimeMode: DEFAULT_RUNTIME_MODE,
+      interactionMode: DEFAULT_INTERACTION_MODE,
+      envMode: "local",
+      branch: null,
+      worktreePath: null,
+      forkSourceThreadId: null,
+      sidechatSourceThreadId: null,
+      latestTurn: null,
+      createdAt: "2026-02-27T00:00:00.000Z",
+      updatedAt: "2026-02-27T00:00:01.000Z",
+      handoff: null,
+      session: null,
+    }).threads[0]!;
+
+    const afterDetail = syncServerThreadDetail(preHydrationState, detail);
+    const afterHotPathDetail = syncServerThreadDetailHotPath(preHydrationState, detail);
+    const afterShellEvent = applyShellEvent(preHydrationState, {
+      kind: "thread-upserted",
+      sequence: 1,
+      thread: shellThread,
+    } satisfies OrchestrationShellStreamEvent);
+
+    expect(threadsOf(afterDetail).map((thread) => thread.id)).toEqual([threadId]);
+    expect(threadsOf(afterHotPathDetail).map((thread) => thread.id)).toEqual([threadId]);
+    expect(threadsOf(afterShellEvent).map((thread) => thread.id)).toEqual([threadId]);
+  });
+
+  it("filters archived projects and their threads from full read-model repair snapshots", () => {
+    const activeProjectId = ProjectId.makeUnsafe("project-active-repair");
+    const archivedProjectId = ProjectId.makeUnsafe("project-archived-repair");
+    const activeThreadId = ThreadId.makeUnsafe("thread-active-repair");
+    const archivedThreadId = ThreadId.makeUnsafe("thread-archived-repair");
+    const next = syncServerReadModel(
+      {
+        projects: [],
+        sidebarThreadSummaryById: {},
+        threadsHydrated: false,
+      },
+      {
+        snapshotSequence: 4,
+        updatedAt: "2026-02-27T00:04:00.000Z",
+        projects: [
+          makeReadModelProject({
+            id: activeProjectId,
+            workspaceRoot: "/tmp/active-repair",
+            archivedAt: null,
+          }),
+          makeReadModelProject({
+            id: archivedProjectId,
+            workspaceRoot: "/tmp/archived-repair",
+            archivedAt: "2026-02-27T00:03:00.000Z",
+          }),
+        ],
+        threads: [
+          makeReadModelThread({ id: activeThreadId, projectId: activeProjectId }),
+          makeReadModelThread({ id: archivedThreadId, projectId: archivedProjectId }),
+        ],
+      },
+    );
+
+    expect(next.projects.map((project) => project.id)).toEqual([activeProjectId]);
+    expect(threadsOf(next).map((thread) => thread.id)).toEqual([activeThreadId]);
+    expect(next.deletedProjectIdsById?.[archivedProjectId]).toBeUndefined();
+    expect(next.deletedThreadIdsById?.[archivedThreadId]).toBeUndefined();
+  });
+
   it("reuses the existing project slot for shell upserts that keep the same workspace root", () => {
     const initialState: AppState = {
       projects: [
@@ -255,7 +482,41 @@ describe("store projection", () => {
       remoteName: "Server Name",
       localName: "Local Name",
       cwd: "/tmp/shared-root",
+      serverSequence: 2,
     });
+  });
+
+  it("preserves the project pin value and sequence when a stale shell upsert arrives", () => {
+    const projectId = ProjectId.makeUnsafe("project-sequenced-pin");
+    const currentProject = makeProject({
+      id: projectId,
+      cwd: "/tmp/project-sequenced-pin",
+      isPinned: true,
+      serverSequence: 12,
+    });
+    const initialState: AppState = {
+      projects: [currentProject],
+      sidebarThreadSummaryById: {},
+      threadsHydrated: true,
+    };
+
+    const next = applyShellEvent(initialState, {
+      kind: "project-upserted",
+      sequence: 11,
+      project: {
+        id: projectId,
+        title: "Stale project",
+        workspaceRoot: "/tmp/project-sequenced-pin",
+        defaultModelSelection: null,
+        scripts: [],
+        isPinned: false,
+        createdAt: "2026-02-27T00:00:00.000Z",
+        updatedAt: "2026-02-27T00:01:00.000Z",
+      },
+    } satisfies OrchestrationShellStreamEvent);
+
+    expect(next.projects[0]).toBe(currentProject);
+    expect(next.projects[0]).toMatchObject({ isPinned: true, serverSequence: 12 });
   });
 
   it("drops descendant thread state when a shell project removal arrives", () => {

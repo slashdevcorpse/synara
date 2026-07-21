@@ -18,11 +18,13 @@ import {
   Ref,
   Schema,
   Semaphore,
+  ServiceMap,
   Scope,
   Stream,
 } from "effect";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
+import { DevServerManager, type ProjectArchiveReservation } from "../../devServerManager.ts";
 import { toPersistenceSqlError, type PersistenceSqlError } from "../../persistence/Errors.ts";
 import { OrchestrationEventStore } from "../../persistence/Services/OrchestrationEventStore.ts";
 import {
@@ -30,6 +32,8 @@ import {
   type OrchestrationCommandReceipt,
 } from "../../persistence/Services/OrchestrationCommandReceipts.ts";
 import { ManagedAttachmentRepository } from "../../persistence/Services/ManagedAttachments.ts";
+import { PROVIDER_COMMAND_REACTOR_CONSUMER } from "../../persistence/Services/OrchestrationEventDeliveries.ts";
+import { PROVIDER_RUNTIME_INGESTION_CONSUMER } from "../../persistence/Services/ProviderRuntimeEvents.ts";
 import { ManagedAttachmentRepositoryLive } from "../../persistence/Layers/ManagedAttachments.ts";
 import {
   LOCAL_LOOPBACK_ATTACHMENT_PRINCIPAL,
@@ -96,6 +100,41 @@ type CommittedCommandResult = {
   readonly nextCommandReadModel: OrchestrationReadModel;
 };
 
+interface ProjectArchiveLifecycle {
+  readonly reserveProjectArchive: (
+    projectId: ProjectId,
+  ) => Effect.Effect<ProjectArchiveReservation>;
+  readonly cancelProjectArchiveReservation: (input: {
+    readonly projectId: ProjectId;
+    readonly reservationId: string;
+  }) => Effect.Effect<void>;
+  readonly releaseProjectArchive: (projectId: ProjectId) => Effect.Effect<void>;
+}
+
+const unmanagedProjectArchiveLifecycle: ProjectArchiveLifecycle = {
+  reserveProjectArchive: () =>
+    Effect.succeed({ status: "acquired", reservationId: "unmanaged" } as const),
+  cancelProjectArchiveReservation: () => Effect.void,
+  releaseProjectArchive: () => Effect.void,
+};
+
+class ProjectArchiveLifecycleService extends ServiceMap.Service<
+  ProjectArchiveLifecycleService,
+  ProjectArchiveLifecycle
+>()("synara/orchestration/ProjectArchiveLifecycle") {}
+
+const UnmanagedProjectArchiveLifecycleLive = Layer.succeed(
+  ProjectArchiveLifecycleService,
+  unmanagedProjectArchiveLifecycle,
+);
+
+const DevServerProjectArchiveLifecycleLive = Layer.effect(
+  ProjectArchiveLifecycleService,
+  Effect.gen(function* () {
+    return yield* DevServerManager;
+  }),
+);
+
 function commandToAggregateRef(command: OrchestrationCommand): {
   readonly aggregateKind: "project" | "thread";
   readonly aggregateId: ProjectId | ThreadId;
@@ -103,6 +142,8 @@ function commandToAggregateRef(command: OrchestrationCommand): {
   switch (command.type) {
     case "project.create":
     case "project.meta.update":
+    case "project.archive":
+    case "project.unarchive":
     case "project.delete":
       return {
         aggregateKind: "project",
@@ -122,11 +163,14 @@ function isProjectMetadataEvent(
   return (
     event.type === "project.created" ||
     event.type === "project.meta-updated" ||
+    event.type === "project.archived" ||
+    event.type === "project.unarchived" ||
     event.type === "project.deleted"
   );
 }
 
 const makeOrchestrationEngine = Effect.gen(function* () {
+  const projectArchiveLifecycle = yield* ProjectArchiveLifecycleService;
   const sql = yield* SqlClient.SqlClient;
   const eventStore = yield* OrchestrationEventStore;
   const commandReceiptRepository = yield* OrchestrationCommandReceiptRepository;
@@ -437,6 +481,139 @@ const makeOrchestrationEngine = Effect.gen(function* () {
     }
   };
 
+  const findPendingArchiveWorkThreadIds = (
+    command: Extract<OrchestrationCommand, { type: "project.archive" | "project.unarchive" }>,
+  ): Effect.Effect<ReadonlySet<string>, OrchestrationDispatchError> =>
+    sql<{ readonly threadId: string }>`
+      SELECT DISTINCT threads.thread_id AS "threadId"
+      FROM projection_threads AS threads
+      WHERE threads.project_id = ${command.projectId}
+        AND threads.deleted_at IS NULL
+        AND (
+          EXISTS (
+            SELECT 1
+            FROM queued_turn_promotions AS queued
+            WHERE queued.thread_id = threads.thread_id
+              AND queued.state IN ('queued', 'promoting')
+          )
+          OR EXISTS (
+            SELECT 1
+            FROM provider_runtime_events AS runtime_events
+            WHERE runtime_events.thread_id = threads.thread_id
+              AND runtime_events.sequence > COALESCE(
+                (
+                  SELECT last_acked_sequence
+                  FROM provider_runtime_event_consumers
+                  WHERE consumer_name = ${PROVIDER_RUNTIME_INGESTION_CONSUMER}
+                ),
+                0
+              )
+          )
+          OR EXISTS (
+            SELECT 1
+            FROM orchestration_events AS events
+            LEFT JOIN orchestration_event_deliveries AS deliveries
+              ON deliveries.consumer_name = ${PROVIDER_COMMAND_REACTOR_CONSUMER}
+              AND deliveries.event_sequence = events.sequence
+            LEFT JOIN queued_turn_promotions AS queued_event
+              ON queued_event.queued_event_sequence = events.sequence
+            WHERE events.aggregate_kind = 'thread'
+              AND events.stream_id = threads.thread_id
+              AND (
+                (
+                  events.event_type = 'thread.turn-queued'
+                  AND (
+                    queued_event.state IN ('queued', 'promoting')
+                    OR (
+                      queued_event.state IS NULL
+                      AND events.sequence > COALESCE(
+                        (
+                          SELECT last_acked_sequence
+                          FROM orchestration_consumer_state
+                          WHERE consumer_name = ${PROVIDER_COMMAND_REACTOR_CONSUMER}
+                        ),
+                        0
+                      )
+                    )
+                  )
+                )
+                OR (
+                  events.event_type IN (
+                    'thread.meta-updated',
+                    'thread.runtime-mode-set',
+                    'thread.turn-start-requested',
+                    'thread.message-edit-resend-requested',
+                    'thread.conversation-rollback-requested',
+                    'thread.session-stop-requested'
+                  )
+                  AND (
+                    deliveries.state <> 'succeeded'
+                    OR (
+                      deliveries.state IS NULL
+                      AND events.sequence > COALESCE(
+                        (
+                          SELECT last_acked_sequence
+                          FROM orchestration_consumer_state
+                          WHERE consumer_name = ${PROVIDER_COMMAND_REACTOR_CONSUMER}
+                        ),
+                        0
+                      )
+                    )
+                  )
+                )
+              )
+          )
+        )
+    `.pipe(
+      Effect.map((rows) => new Set(rows.map((row) => row.threadId))),
+      Effect.mapError(
+        (error) =>
+          new OrchestrationCommandInternalError({
+            commandId: command.commandId,
+            commandType: command.type,
+            detail: `Failed to verify project archive quiescence: ${error.message}`,
+          }),
+      ),
+    );
+
+  const hasPendingArchiveAutomationWork = (
+    command: Extract<OrchestrationCommand, { type: "project.archive" }>,
+  ): Effect.Effect<boolean, OrchestrationDispatchError> =>
+    sql<{ readonly hasWork: number }>`
+      SELECT 1 AS "hasWork"
+      WHERE EXISTS (
+        SELECT 1
+        FROM automation_definitions
+        WHERE project_id = ${command.projectId}
+          AND enabled = 1
+          AND archived_at IS NULL
+      )
+      OR EXISTS (
+        SELECT 1
+        FROM automation_runs
+        WHERE project_id = ${command.projectId}
+          AND status IN ('pending', 'claimed', 'running', 'waiting-for-approval')
+      )
+      OR EXISTS (
+        SELECT 1
+        FROM automation_pending_completion_evaluations AS pending
+        INNER JOIN automation_runs AS runs
+          ON runs.run_id = pending.run_id
+        WHERE runs.project_id = ${command.projectId}
+      )
+      LIMIT 1
+    `.pipe(
+      Effect.map((rows) => rows.length > 0),
+      Effect.mapError(
+        (error) =>
+          new OrchestrationCommandInternalError({
+            commandId: command.commandId,
+            commandType: command.type,
+            detail: `Failed to verify project automation quiescence: ${error.message}`,
+          }),
+      ),
+    );
+
   // Rebuild only the project projection rows and snapshot cursors.
   // Existing thread/chat projection rows stay in place so older installs do not
   // lose history that is no longer fully represented in orchestration_events.
@@ -540,6 +717,16 @@ const makeOrchestrationEngine = Effect.gen(function* () {
       }
     });
 
+    let archiveReservationId: string | null = null;
+    const releaseFailedArchiveReservation = Effect.suspend(() =>
+      archiveReservationId === null || envelope.command.type !== "project.archive"
+        ? Effect.void
+        : projectArchiveLifecycle.cancelProjectArchiveReservation({
+            projectId: envelope.command.projectId,
+            reservationId: archiveReservationId,
+          }),
+    );
+
     const runCommand = Effect.gen(function* () {
       const shouldSkip = yield* Ref.modify(envelope.executionState, (state) => {
         if (state === "abandoned") {
@@ -568,6 +755,9 @@ const makeOrchestrationEngine = Effect.gen(function* () {
         }
         if (existingReceipt.value.status === "accepted") {
           yield* validateAcceptedAttachmentRetry(envelope.command, envelope.attachmentPrincipal);
+          if (envelope.command.type === "project.unarchive") {
+            yield* projectArchiveLifecycle.releaseProjectArchive(envelope.command.projectId);
+          }
           yield* Deferred.succeed(envelope.result, {
             sequence: existingReceipt.value.resultSequence,
           });
@@ -639,17 +829,42 @@ const makeOrchestrationEngine = Effect.gen(function* () {
         };
       }
 
+      let archiveHasActiveProjectDevServer = false;
+      if (command.type === "project.archive") {
+        const reservation = yield* projectArchiveLifecycle.reserveProjectArchive(command.projectId);
+        if (reservation.status === "acquired") {
+          archiveReservationId = reservation.reservationId;
+        } else if (reservation.status === "dev-server-active") {
+          archiveHasActiveProjectDevServer = true;
+        }
+      }
+
       const deciderReadModel = yield* buildDeciderReadModel(command);
-      const eventBase = yield* decideOrchestrationCommand({
-        command,
-        readModel: deciderReadModel,
-      });
-      const eventBases = Array.isArray(eventBase) ? eventBase : [eventBase];
       const transactionalCommitEffect: Effect.Effect<
         CommittedCommandResult,
         OrchestrationDispatchError,
         never
       > = Effect.gen(function* () {
+        const pendingArchiveWorkThreadIds =
+          command.type === "project.archive" || command.type === "project.unarchive"
+            ? yield* findPendingArchiveWorkThreadIds(command)
+            : undefined;
+        const archiveHasAutomationWork =
+          command.type === "project.archive"
+            ? yield* hasPendingArchiveAutomationWork(command)
+            : undefined;
+        const eventBase = yield* decideOrchestrationCommand({
+          command,
+          readModel: deciderReadModel,
+          ...(pendingArchiveWorkThreadIds !== undefined ? { pendingArchiveWorkThreadIds } : {}),
+          ...(archiveHasAutomationWork !== undefined
+            ? { hasPendingArchiveAutomationWork: archiveHasAutomationWork }
+            : {}),
+          ...(command.type === "project.archive"
+            ? { hasActiveProjectDevServer: archiveHasActiveProjectDevServer }
+            : {}),
+        });
+        const eventBases = Array.isArray(eventBase) ? eventBase : [eventBase];
         const committedEvents: OrchestrationEvent[] = [];
         let nextCommandReadModel = commandReadModel;
 
@@ -749,15 +964,31 @@ const makeOrchestrationEngine = Effect.gen(function* () {
         }),
       );
 
-      const committedCommand = yield* sql
-        .withTransaction(transactionalCommitEffect)
-        .pipe(
-          Effect.catchTag("SqlError", (sqlError) =>
-            Effect.fail(
-              toPersistenceSqlError("OrchestrationEngine.processEnvelope:transaction")(sqlError),
+      const committedCommand = yield* Effect.uninterruptibleMask((restore) =>
+        restore(
+          sql
+            .withTransaction(transactionalCommitEffect)
+            .pipe(
+              Effect.catchTag("SqlError", (sqlError) =>
+                Effect.fail(
+                  toPersistenceSqlError("OrchestrationEngine.processEnvelope:transaction")(
+                    sqlError,
+                  ),
+                ),
+              ),
             ),
-          ),
-        );
+        ).pipe(
+          Effect.tap(() => {
+            if (command.type === "project.archive") {
+              archiveReservationId = null;
+              return Effect.void;
+            }
+            return command.type === "project.unarchive"
+              ? projectArchiveLifecycle.releaseProjectArchive(command.projectId)
+              : Effect.void;
+          }),
+        ),
+      );
 
       commandReadModel = committedCommand.nextCommandReadModel;
       yield* Effect.forEach(
@@ -912,6 +1143,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           );
         });
       }),
+      Effect.ensuring(releaseFailedArchiveReservation),
     );
 
     return maintenanceLock.withPermits(1)(runCommand);
@@ -1268,4 +1500,16 @@ const makeOrchestrationEngine = Effect.gen(function* () {
 export const OrchestrationEngineLive = Layer.effect(
   OrchestrationEngineService,
   makeOrchestrationEngine,
-).pipe(Layer.provideMerge(ManagedAttachmentRepositoryLive));
+).pipe(
+  Layer.provide(UnmanagedProjectArchiveLifecycleLive),
+  Layer.provideMerge(ManagedAttachmentRepositoryLive),
+);
+
+/** Production engine variant that serializes project archival with dev-server lifecycle. */
+export const OrchestrationEngineWithDevServerLifecycleLive = Layer.effect(
+  OrchestrationEngineService,
+  makeOrchestrationEngine,
+).pipe(
+  Layer.provide(DevServerProjectArchiveLifecycleLive),
+  Layer.provideMerge(ManagedAttachmentRepositoryLive),
+);
