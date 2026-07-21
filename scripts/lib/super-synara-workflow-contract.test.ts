@@ -129,6 +129,27 @@ describe("Super Synara workflow contracts", () => {
     );
   });
 
+  it("requires preflight route generation outside tracked source", () => {
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          "    env:\n      SYNARA_GENERATED_ROUTE_TREE: ${{ runner.temp }}/super-synara-preflight-route-tree/routeTree.gen.ts\n",
+          "",
+        ),
+        audit,
+      ),
+    ).toThrow("preflight must redirect route generation outside tracked source");
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          "      - name: Run stable browser tests\n        run: bun run --cwd apps/web test:browser:stable",
+          "      - name: Run stable browser tests\n        env:\n          SYNARA_GENERATED_ROUTE_TREE: apps/web/src/routeTree.gen.ts\n        run: bun run --cwd apps/web test:browser:stable",
+        ),
+        audit,
+      ),
+    ).toThrow("preflight steps must not override the isolated route-tree path");
+  });
+
   it("requires exact native prerelease gates and rejects broad native suites", () => {
     expect(() =>
       verifySuperSynaraWorkflowText(

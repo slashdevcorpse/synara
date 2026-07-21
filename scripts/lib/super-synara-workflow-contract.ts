@@ -24,6 +24,8 @@ const PRERELEASE_MACOS_REQUIRED_COMMANDS = [
 ] as const;
 const WINDOWS_RELEASE_SCOPE = "windows-only";
 const MACOS_RELEASE_SCOPE = "windows-and-macos";
+const PREFLIGHT_GENERATED_ROUTE_TREE =
+  "${{ runner.temp }}/super-synara-preflight-route-tree/routeTree.gen.ts";
 const MACOS_JOB_CONDITION = "${{ needs.preflight.outputs.include_macos == 'true' }}";
 const PUBLISH_JOB_CONDITION =
   "${{ always() && needs.preflight.result == 'success' && needs.reserve_tag.result == 'success' && needs.windows_x64.result == 'success' && ((needs.preflight.outputs.include_macos == 'true' && needs.macos_arm64.result == 'success') || (needs.preflight.outputs.include_macos == 'false' && needs.macos_arm64.result == 'skipped')) }}";
@@ -286,6 +288,30 @@ function verifyPreflightSourceCleanliness(jobs: UnknownRecord): void {
   }
 }
 
+function verifyPreflightRouteTreeIsolation(preflightJob: UnknownRecord): void {
+  const environment = preflightJob.env;
+  if (
+    !isRecord(environment) ||
+    environment.SYNARA_GENERATED_ROUTE_TREE !== PREFLIGHT_GENERATED_ROUTE_TREE
+  ) {
+    throw new Error(
+      "Publication workflow preflight must redirect route generation outside tracked source.",
+    );
+  }
+  const steps = preflightJob.steps;
+  if (!Array.isArray(steps)) {
+    throw new Error("Publication workflow must define preflight steps.");
+  }
+  for (const step of steps) {
+    if (!isRecord(step) || !isRecord(step.env)) continue;
+    if (Object.keys(step.env).some((key) => key.toUpperCase() === "SYNARA_GENERATED_ROUTE_TREE")) {
+      throw new Error(
+        "Publication workflow preflight steps must not override the isolated route-tree path.",
+      );
+    }
+  }
+}
+
 function verifyNativeJobCommands(
   job: UnknownRecord,
   jobName: string,
@@ -427,6 +453,7 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
   verifyRootTestOwnership(jobs);
   verifyPreflightSourceCleanliness(jobs);
   const preflightJob = publicationJob(jobs, "preflight");
+  verifyPreflightRouteTreeIsolation(preflightJob);
   if (preflightJob["runs-on"] !== "ubuntu-24.04") {
     throw new Error("Publication workflow preflight must run on ubuntu-24.04.");
   }

@@ -37,6 +37,8 @@ jobs:
     name: Validate immutable source and release policy
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    env:
+      SYNARA_GENERATED_ROUTE_TREE: ${{ runner.temp }}/super-synara-preflight-route-tree/routeTree.gen.ts
     outputs:
       version: ${{ steps.meta.outputs.version }}
       tag: ${{ steps.meta.outputs.tag }}
