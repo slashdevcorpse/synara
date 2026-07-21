@@ -261,6 +261,24 @@ describe("Super Synara workflow contracts", () => {
         audit,
       ),
     ).toThrow("must depend on exact draft admission");
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          "  macos_arm64:\n    name: Build unsigned macOS arm64 disk image\n    needs: [draft_admission, preflight]",
+          "  macos_arm64:\n    name: Build unsigned macOS arm64 disk image\n    needs: preflight",
+        ),
+        audit,
+      ),
+    ).toThrow("macos_arm64 must depend on exact draft admission");
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          "  publish:\n    name: Admit and publish exact unsigned prerelease\n    needs: [draft_admission, preflight, windows_x64, macos_arm64]",
+          "  publish:\n    name: Admit and publish exact unsigned prerelease\n    needs: [preflight, windows_x64, macos_arm64]",
+        ),
+        audit,
+      ),
+    ).toThrow("publish must depend on exact draft admission");
   });
 
   it("locks draft admission authorization as an exact fail-closed boundary", () => {
@@ -308,6 +326,10 @@ describe("Super Synara workflow contracts", () => {
       main.replace(
         '          [[ "$ACTOR" == "$OWNER" ]]',
         '          [[ "$ACTOR" == "$OWNER" ]] || true',
+      ),
+      main.replace(
+        '          [[ "$VERSION" =~ ^[0-9]+\\.[0-9]+\\.[0-9]+-super\\.[1-9][0-9]*$ ]]\n',
+        "",
       ),
     ];
     for (const mutation of unsafeAuthorizationMutations) {
