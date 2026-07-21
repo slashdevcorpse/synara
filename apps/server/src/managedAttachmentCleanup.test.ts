@@ -1565,6 +1565,73 @@ describe("managed attachment cleanup", () => {
     }
   });
 
+  it("does not queue a deadline-bounded sweep behind a writer when skipLocked is omitted", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "synara-managed-staging-deadline-lock-"));
+    temporaryRoots.push(root);
+    const stagingDir = path.join(root, ".staging");
+    const partPath = path.join(stagingDir, "att_v2_77777777777777777777777777777777.part");
+    await fs.mkdir(stagingDir, { recursive: true });
+    await fs.writeFile(partPath, "active upload bytes");
+    const nowMs = Date.now();
+    const staleDate = new Date(nowMs - MANAGED_ATTACHMENT_WRITING_LEASE_MS - 1_000);
+    await fs.utimes(partPath, staleDate, staleDate);
+
+    let releaseWriter!: () => void;
+    const writerReleased = new Promise<void>((resolve) => {
+      releaseWriter = resolve;
+    });
+    let markWriterAcquired!: () => void;
+    const writerAcquired = new Promise<void>((resolve) => {
+      markWriterAcquired = resolve;
+    });
+    const writer = withManagedAttachmentStagingPathLock(partPath, async () => {
+      markWriterAcquired();
+      await writerReleased;
+    });
+    await writerAcquired;
+
+    let clock = 0;
+    let cleanupEntered = false;
+    const sweep = sweepOrphanManagedAttachmentParts({
+      attachmentsDir: root,
+      nowMs,
+      scanLimit: 1,
+      maxRemovals: 1,
+      timeBudgetMs: MANAGED_ATTACHMENT_STAGING_STARTUP_TIME_MS,
+      monotonicNow: () => clock,
+      readDirectoryEntry: async (directory) => {
+        const entry = await directory.read();
+        clock = 50;
+        return entry;
+      },
+      beforeFinalStat: async () => {
+        cleanupEntered = true;
+      },
+    });
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+
+    try {
+      const result = await Promise.race([
+        sweep,
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(
+            () => reject(new Error("deadline-bounded staging sweep waited for the writer lock")),
+            2_000,
+          );
+        }),
+      ]);
+
+      expect(result).toEqual({ inspected: 1, removed: 0, failures: 0 });
+      expect(clock).toBeLessThan(MANAGED_ATTACHMENT_STAGING_STARTUP_TIME_MS);
+      expect(cleanupEntered).toBe(false);
+      await expect(fs.readFile(partPath, "utf8")).resolves.toBe("active upload bytes");
+    } finally {
+      if (timeout) clearTimeout(timeout);
+      releaseWriter();
+      await Promise.allSettled([writer, sweep]);
+    }
+  });
+
   it("serializes stale-part quarantine with the managed upload writer lock", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "synara-managed-staging-lock-"));
     temporaryRoots.push(root);

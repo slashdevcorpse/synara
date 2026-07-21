@@ -921,7 +921,9 @@ async function processManagedAttachmentStagingEntry(input: {
       if (deletion._tag === "Removed") removed += 1;
       else if (deletion._tag === "DirectoryUnsafe") failures += 1;
     };
-    if (input.sweep.skipLocked) {
+    // Path-lock acquisition is not cancellable, so a deadline-bounded sweep
+    // must never queue behind an active writer even when skipLocked is omitted.
+    if (input.sweep.skipLocked || input.remainingTimeoutMs !== undefined) {
       const attempt = await tryWithManagedAttachmentStagingPathLock(partPath, processEntry);
       if (!attempt.acquired) return { removed: 0, failures: 0 };
     } else {
