@@ -35,11 +35,20 @@ describe("useAgentActivityScrollPause", () => {
         "[data-testid='transcript-scroll']",
       );
       const scope = screen.container.querySelector<HTMLElement>("[data-testid='activity-scope']");
-      const motions = Array.from(
-        screen.container.querySelectorAll<HTMLElement>(".agent-activity__motion"),
+      const barMotions = Array.from(
+        screen.container.querySelectorAll<HTMLElement>(
+          '[data-agent-activity-variant="bar"] .agent-activity__motion',
+        ),
       );
+      const composerMotions = Array.from(
+        screen.container.querySelectorAll<HTMLElement>(
+          '[data-agent-activity-variant="composer"] .agent-activity__motion',
+        ),
+      );
+      const motions = [...barMotions, ...composerMotions];
       expect(scroll).not.toBeNull();
-      expect(motions).toHaveLength(2);
+      expect(barMotions.length).toBeGreaterThan(0);
+      expect(composerMotions.length).toBeGreaterThan(0);
 
       if (scroll) {
         scroll.scrollTop = 40;
@@ -47,17 +56,15 @@ describe("useAgentActivityScrollPause", () => {
       }
 
       expect(scope?.dataset.agentActivityScrollPaused).toBe("true");
-      expect(motions.map((motion) => getComputedStyle(motion).animationPlayState)).toEqual([
-        "paused",
-        "paused",
-      ]);
+      expect(
+        motions.every((motion) => getComputedStyle(motion).animationPlayState === "paused"),
+      ).toBe(true);
       await vi.waitFor(
         () => {
           expect(scope?.dataset.agentActivityScrollPaused).toBeUndefined();
-          expect(motions.map((motion) => getComputedStyle(motion).animationPlayState)).toEqual([
-            "running",
-            "running",
-          ]);
+          expect(
+            motions.every((motion) => getComputedStyle(motion).animationPlayState === "running"),
+          ).toBe(true);
         },
         { timeout: 1_000 },
       );

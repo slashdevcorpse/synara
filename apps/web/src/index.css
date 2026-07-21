@@ -2937,7 +2937,7 @@ diffs-container {
     currentColor 58%,
     transparent 100%
   );
-  animation: agent-activity-motion 1.5s ease-in-out 400;
+  animation: agent-activity-motion 1.5s ease-in-out infinite;
   animation-fill-mode: forwards;
   will-change: transform, opacity;
 }
@@ -2971,6 +2971,20 @@ diffs-container {
   background: color-mix(in srgb, currentColor 18%, transparent);
 }
 
+@media (prefers-reduced-motion: reduce) {
+  .terminal-running-indicator__dot {
+    animation: none;
+    opacity: 0.92;
+    transform: none;
+    will-change: auto;
+  }
+}
+
+.agent-activity--composer .agent-activity__visual--mirror {
+  right: 0;
+  left: auto;
+}
+
 .agent-activity--composer .agent-activity__motion {
   width: 100%;
   height: 46%;
@@ -2984,6 +2998,7 @@ diffs-container {
 }
 
 .agent-activity.agent-activity--composer[data-agent-activity-phase="thinking"],
+.agent-activity.agent-activity--composer[data-agent-activity-phase="connecting"],
 .agent-activity.agent-activity--composer[data-agent-activity-phase="streaming"],
 .agent-activity.agent-activity--composer[data-agent-activity-phase="tool-running"] {
   --agent-activity-x-start: 0;
@@ -3010,6 +3025,19 @@ diffs-container {
   border-radius: inherit;
 }
 
+.agent-activity[data-agent-activity-phase="connecting"] {
+  --agent-activity-color: var(--info);
+}
+
+.agent-activity[data-agent-activity-phase="thinking"] {
+  --agent-activity-color: var(--warning);
+}
+
+.agent-activity[data-agent-activity-phase="streaming"],
+.agent-activity[data-agent-activity-phase="tool-running"] {
+  --agent-activity-color: var(--primary);
+}
+
 .agent-activity[data-agent-activity-phase="streaming"] {
   --agent-activity-x-start: -105%;
   --agent-activity-x-middle: 8%;
@@ -3024,7 +3052,7 @@ diffs-container {
 
 .agent-activity[data-agent-activity-phase="streaming"] .agent-activity__motion {
   animation-duration: 0.6s;
-  animation-iteration-count: 1000;
+  animation-iteration-count: infinite;
 }
 
 .agent-activity[data-agent-activity-phase="tool-running"] {
@@ -3045,7 +3073,7 @@ diffs-container {
   left: 0;
   display: grid;
   width: 100%;
-  grid-template-columns: repeat(12, minmax(0, 1fr));
+  grid-template-columns: repeat(var(--agent-activity-segment-count), minmax(0, 1fr));
   gap: 2px;
 }
 
@@ -3059,18 +3087,27 @@ diffs-container {
   background: currentColor;
   animation-duration: 1.2s;
   animation-delay: var(--agent-activity-segment-delay);
-  animation-iteration-count: 500;
+  animation-iteration-count: infinite;
   animation-timing-function: ease-in-out;
+}
+
+.agent-activity__segment[data-agent-activity-segment-role="subagent"] {
+  color: var(--color-violet-400, #a78bfa);
+}
+
+.agent-activity__segment[data-agent-activity-segment-role="overflow"] {
+  color: color-mix(in srgb, var(--color-violet-400, #a78bfa) 70%, currentColor);
 }
 
 .agent-activity--composer .agent-activity__segments {
   width: 100%;
   height: 100%;
   grid-template-columns: minmax(0, 1fr);
-  grid-template-rows: repeat(12, minmax(0, 1fr));
+  grid-template-rows: repeat(var(--agent-activity-segment-count), minmax(0, 1fr));
 }
 
-.agent-activity[data-agent-activity-phase="interrupted"] {
+.agent-activity[data-agent-activity-phase="interrupted"],
+.agent-activity[data-agent-activity-phase="stopped"] {
   --agent-activity-color: var(--warning);
 }
 
@@ -3131,7 +3168,7 @@ diffs-container {
   inset: 0;
   width: 100%;
   height: 100%;
-  animation-duration: 0.44s;
+  animation-duration: 0.22s;
   animation-iteration-count: 1;
   animation-timing-function: ease-out;
   animation-fill-mode: forwards;

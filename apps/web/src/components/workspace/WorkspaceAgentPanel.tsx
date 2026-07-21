@@ -30,9 +30,12 @@ import { AgentThreadRow } from "./AgentThreadRow";
 
 export interface WorkspaceAgentPanelProps {
   activity: WorkspaceAgentActivity;
+  terminalProcessCount?: number;
   onOpenThread: (threadId: ThreadId) => void;
   onStopThread: (entry: AgentThreadEntry) => Promise<WorkspaceAgentStopResult>;
   onStopAll: (entries: AgentThreadEntry[]) => Promise<WorkspaceAgentStopAllResult>;
+  onStartChat?: () => void;
+  onStartTerminalWorkstream?: () => void;
 }
 
 const INTERRUPT_PENDING_RELEASE_MS = 15_000;
@@ -271,9 +274,12 @@ function AgentProjectSection({
 
 export function WorkspaceAgentPanel({
   activity,
+  terminalProcessCount = 0,
   onOpenThread,
   onStopThread,
   onStopAll,
+  onStartChat,
+  onStartTerminalWorkstream,
 }: WorkspaceAgentPanelProps) {
   const regionId = useId();
   const aggregateSummaryId = useId();
@@ -396,11 +402,22 @@ export function WorkspaceAgentPanel({
     (total, group) => total + countTreeNodes(group.nodes),
     0,
   );
-  const aggregateLabel = aggregateSummaryLabel(
+  const baseAggregateLabel = aggregateSummaryLabel(
     activity.summary,
     latestLiveEntry,
     visibleThreadCount,
   );
+  const mainAgentCount = activity.threads.filter((entry) => !entry.isSubagent).length;
+  const subagentCount = activity.threads.filter((entry) => entry.isSubagent).length;
+  const subagentRunningCount = activity.threads.filter(
+    (entry) => entry.isSubagent && isLiveAgentStatus(entry.status),
+  ).length;
+  const aggregateLabel = [
+    baseAggregateLabel,
+    `${mainAgentCount} ${mainAgentCount === 1 ? "agent" : "agents"}`,
+    `${subagentCount} ${subagentCount === 1 ? "subagent" : "subagents"} (${subagentRunningCount} running)`,
+    `${terminalProcessCount} terminal ${terminalProcessCount === 1 ? "process" : "processes"}`,
+  ].join(" · ");
 
   const stoppableEntries = interruptibleEntries.filter(
     (entry) => !pendingInterrupts.has(interruptPendingKey(entry)),
@@ -552,8 +569,27 @@ export function WorkspaceAgentPanel({
                 />
               ))
             ) : (
-              <div className="px-2 py-2 text-[11px] text-muted-foreground/48">
-                No recent agent activity
+              <div className="space-y-2 px-2 py-2 text-[11px] text-muted-foreground/58">
+                <p>No active agents.</p>
+                {onStartChat || onStartTerminalWorkstream ? (
+                  <div className="flex flex-wrap gap-1.5">
+                    {onStartChat ? (
+                      <Button type="button" variant="ghost" size="xs" onClick={onStartChat}>
+                        Start a chat
+                      </Button>
+                    ) : null}
+                    {onStartTerminalWorkstream ? (
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="xs"
+                        onClick={onStartTerminalWorkstream}
+                      >
+                        New terminal workstream
+                      </Button>
+                    ) : null}
+                  </div>
+                ) : null}
               </div>
             )}
           </div>

@@ -10,6 +10,8 @@ import {
   type TerminalVisualState,
 } from "@synara/shared/terminalThreads";
 
+import type { TerminalExitState } from "./types";
+
 export interface RepresentativeTerminalVisualIdentity {
   terminalId: string;
   identity: ResolvedTerminalVisualIdentity;
@@ -19,18 +21,40 @@ function terminalVisualStatePriority(state: TerminalVisualState): number {
   switch (state) {
     case "attention":
       return 4;
+    case "review":
+      return 4;
+    case "failed":
+      return 5;
     case "running":
       return 3;
-    case "review":
+    case "stopped":
       return 2;
     case "idle":
       return 1;
   }
 }
 
+export function terminalVisualStateLabel(state: TerminalVisualState): string {
+  switch (state) {
+    case "attention":
+      return "Needs attention";
+    case "review":
+      return "Review requested";
+    case "running":
+      return "Running";
+    case "failed":
+      return "Failed";
+    case "stopped":
+      return "Stopped";
+    case "idle":
+      return "Idle";
+  }
+}
+
 export function resolveTerminalVisualState(input: {
   runningTerminalIds: readonly string[];
   terminalAttentionStatesById: Record<string, "attention" | "review">;
+  terminalExitStatesById?: Record<string, TerminalExitState> | undefined;
   terminalId: string;
 }): TerminalVisualState {
   const runningTerminalIdSet = new Set(
@@ -39,6 +63,7 @@ export function resolveTerminalVisualState(input: {
   return resolveTerminalVisualStateFromSet({
     runningTerminalIdSet,
     terminalAttentionStatesById: input.terminalAttentionStatesById,
+    terminalExitStatesById: input.terminalExitStatesById ?? {},
     terminalId: input.terminalId,
   });
 }
@@ -46,17 +71,22 @@ export function resolveTerminalVisualState(input: {
 function resolveTerminalVisualStateFromSet(input: {
   runningTerminalIdSet: ReadonlySet<string>;
   terminalAttentionStatesById: Record<string, "attention" | "review">;
+  terminalExitStatesById: Record<string, TerminalExitState>;
   terminalId: string;
 }): TerminalVisualState {
+  const exitState = input.terminalExitStatesById[input.terminalId];
+  if (exitState) {
+    return exitState.kind;
+  }
   const attentionState = input.terminalAttentionStatesById[input.terminalId] ?? null;
   if (attentionState === "attention") {
     return "attention";
   }
-  if (input.runningTerminalIdSet.has(input.terminalId)) {
-    return "running";
-  }
   if (attentionState === "review") {
     return "review";
+  }
+  if (input.runningTerminalIdSet.has(input.terminalId)) {
+    return "running";
   }
   return "idle";
 }
@@ -64,6 +94,7 @@ function resolveTerminalVisualStateFromSet(input: {
 export function resolveTerminalVisualIdentityMap(input: {
   runningTerminalIds: readonly string[];
   terminalAttentionStatesById: Record<string, "attention" | "review">;
+  terminalExitStatesById?: Record<string, TerminalExitState> | undefined;
   terminalCliKindsById: Record<string, TerminalCliKind>;
   terminalIds: readonly string[];
   terminalLabelsById: Record<string, string>;
@@ -82,6 +113,7 @@ export function resolveTerminalVisualIdentityMap(input: {
         state: resolveTerminalVisualStateFromSet({
           runningTerminalIdSet,
           terminalAttentionStatesById: input.terminalAttentionStatesById,
+          terminalExitStatesById: input.terminalExitStatesById ?? {},
           terminalId,
         }),
         title: input.terminalTitleOverridesById[terminalId] ?? input.terminalLabelsById[terminalId],

@@ -320,14 +320,20 @@ export function WorkspaceProjectCard({
                   className={cn(
                     "size-1.5 shrink-0 rounded-full",
                     card.activity.dotClass,
-                    card.activity.pulse && "animate-pulse",
+                    card.activity.pulse && "animate-pulse motion-reduce:animate-none",
                   )}
                 />
                 {card.activity.label}
               </button>
             ) : (
-              <span className="text-muted-foreground">Idle</span>
+              <span className="text-muted-foreground">No active agents</span>
             )}
+            <span
+              data-testid="workspace-project-process-summary"
+              className="mt-1 block text-[10px] text-muted-foreground/55"
+            >
+              {`${card.processActivity.agentCount} ${card.processActivity.agentCount === 1 ? "agent" : "agents"} · ${card.processActivity.subagentCount} ${card.processActivity.subagentCount === 1 ? "subagent" : "subagents"} (${card.processActivity.subagentRunningCount} running) · ${card.processActivity.terminalProcessCount} terminal ${card.processActivity.terminalProcessCount === 1 ? "process" : "processes"}${card.processActivity.devServerRunning ? " · dev server running" : ""}${card.processActivity.gitActionRunning ? " · Git operation running" : ""}`}
+            </span>
           </div>
           <div className="pointer-events-auto flex min-w-0 justify-start sm:justify-end">
             {card.worktrees.length === 1 && card.worktrees[0] ? (
@@ -375,7 +381,7 @@ export function WorkspaceProjectCard({
               className={cn(
                 "size-1.5 shrink-0 rounded-full",
                 card.automation.isActive ? "bg-sky-500" : "bg-muted-foreground/50",
-                card.automation.isActive && "animate-pulse",
+                card.automation.isActive && "animate-pulse motion-reduce:animate-none",
               )}
             />
             <span className="truncate">{card.automation.label}</span>

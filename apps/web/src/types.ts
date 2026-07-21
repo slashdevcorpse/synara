@@ -47,6 +47,30 @@ export type ProjectScript = ContractProjectScript;
 
 export type ThreadTerminalSplitDirection = "horizontal" | "vertical";
 export type ThreadTerminalSplitPosition = "top" | "right" | "bottom" | "left";
+export type TerminalGroupRole =
+  | "app"
+  | "verify"
+  | "observe"
+  | "agent"
+  | "data"
+  | "infrastructure"
+  | "custom";
+export type TerminalGroupIcon =
+  | "app-window"
+  | "check-circle"
+  | "activity"
+  | "bot"
+  | "database"
+  | "server"
+  | "terminal";
+export type TerminalGroupAccent =
+  | "blue"
+  | "green"
+  | "amber"
+  | "violet"
+  | "cyan"
+  | "orange"
+  | "neutral";
 
 export interface ThreadTerminalLeafNode {
   type: "terminal";
@@ -69,6 +93,39 @@ export interface ThreadTerminalGroup {
   id: string;
   activeTerminalId: string;
   layout: ThreadTerminalLayoutNode;
+  /** Optional only at the raw persistence boundary; normalization always fills these fields. */
+  name?: string;
+  role?: TerminalGroupRole;
+  icon?: TerminalGroupIcon;
+  accent?: TerminalGroupAccent;
+  archivedAt?: number | null;
+  originalIndex?: number | null;
+  createdAt?: number;
+  updatedAt?: number;
+  userNamed?: boolean;
+}
+
+export interface NormalizedThreadTerminalGroup extends ThreadTerminalGroup {
+  name: string;
+  role: TerminalGroupRole;
+  icon: TerminalGroupIcon;
+  accent: TerminalGroupAccent;
+  archivedAt: number | null;
+  originalIndex: number | null;
+  createdAt: number;
+  updatedAt: number;
+  userNamed: boolean;
+}
+
+export interface TerminalLaunchMetadata {
+  cwd: string | null;
+  reattachOnly?: true | undefined;
+}
+
+export interface TerminalExitState {
+  kind: "stopped" | "failed";
+  exitCode: number | null;
+  exitSignal: string | null;
 }
 
 export interface ChatImageAttachment {

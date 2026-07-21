@@ -197,9 +197,9 @@ describe("AgentActivityPulse lifecycle", () => {
       await screen.rerender(
         <ActivityHarness value={{ ...completedInput, localDispatchPending: true }} />,
       );
-      expect(currentPhase(screen.container)).toBe("thinking");
+      expect(currentPhase(screen.container)).toBe("connecting");
       await new Promise<void>((resolve) => window.setTimeout(resolve, 500));
-      expect(currentPhase(screen.container)).toBe("thinking");
+      expect(currentPhase(screen.container)).toBe("connecting");
     } finally {
       await screen.unmount();
     }

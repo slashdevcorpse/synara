@@ -55,6 +55,10 @@ import {
 import { terminalEventDispatcher } from "./terminalEventDispatcher";
 import { TerminalEventRecovery } from "./terminalEventRecovery";
 import { TerminalOutputAckQueue } from "./terminalOutputAckQueue";
+import {
+  isUnavailableTerminalRecovery,
+  shouldScheduleTerminalSnapshotReconcile,
+} from "./terminalRuntimeTypes";
 import type {
   TerminalRuntimeConfig,
   TerminalRuntimeEntry,
@@ -278,8 +282,24 @@ function buildOpenInput(entry: TerminalRuntimeEntry) {
     cwd: entry.cwd,
     cols: entry.terminal.cols,
     rows: entry.terminal.rows,
+    ...(entry.reattachOnly ? { reattachOnly: true } : {}),
     ...(entry.runtimeEnv ? { env: entry.runtimeEnv } : {}),
   };
+}
+
+function resolveTerminalRecoverySnapshot(
+  entry: TerminalRuntimeEntry,
+  snapshot: TerminalSessionSnapshot,
+): boolean {
+  entry.callbacks.onTerminalRecoveryResolved?.(entry.terminalId, {
+    status: snapshot.status,
+    exitCode: snapshot.exitCode,
+    exitSignal: snapshot.exitSignal,
+  });
+  return isUnavailableTerminalRecovery({
+    reattachOnly: entry.reattachOnly,
+    status: snapshot.status,
+  });
 }
 
 function replaySnapshot(
@@ -1007,7 +1027,7 @@ function handleTerminalExit(
   entry.hasHandledExit = true;
   window.setTimeout(() => {
     if (entry.hasHandledExit) {
-      entry.callbacks.onSessionExited();
+      entry.callbacks.onSessionExited({ exitCode, exitSignal });
     }
   }, 0);
 }
@@ -1334,18 +1354,29 @@ function reconcileTerminalSnapshot(
     .then((snapshot) => {
       if (!snapshot || !isCurrentReconnectRequest()) return;
 
+      const unavailableRecovery = resolveTerminalRecoverySnapshot(entry, snapshot);
+
       const retainedOutput = hasRetainedRecoveredOutput(entry);
       if (entry.outputEventVersion !== outputEventVersionAtRequest && !retainedOutput) {
         return;
       }
 
       if (snapshotHasReplayPayload(snapshot) || retainedOutput) {
-        replaySnapshot(entry, snapshot, () => {
-          if (isCurrentReconnectRequest()) setRuntimeStatus(entry, "ready");
-        });
+        replaySnapshot(
+          entry,
+          snapshot,
+          unavailableRecovery
+            ? undefined
+            : () => {
+                if (isCurrentReconnectRequest()) {
+                  setRuntimeStatus(entry, "ready");
+                }
+              },
+        );
         return;
       }
 
+      if (unavailableRecovery) return;
       setRuntimeStatus(entry, "ready");
     })
     .catch((error) => {
@@ -1374,6 +1405,7 @@ export function syncRuntimeConfig(
     entry.runtimeEnv = config.runtimeEnv;
   }
   entry.terminalRightClickToPaste = config.terminalRightClickToPaste ?? false;
+  entry.reattachOnly = config.reattachOnly === true;
   entry.callbacks = config.callbacks;
 }
 
@@ -1437,6 +1469,7 @@ export function createRuntimeEntry(config: TerminalRuntimeConfig): TerminalRunti
     terminalCliKind: config.terminalCliKind ?? null,
     cwd: config.cwd,
     terminalRightClickToPaste: config.terminalRightClickToPaste ?? false,
+    reattachOnly: config.reattachOnly === true,
     callbacks: config.callbacks,
     wrapper,
     container: null,
@@ -1730,6 +1763,7 @@ function openTerminal(entry: TerminalRuntimeEntry): void {
     .then(() => (isCurrentOpenRequest() ? api.terminal.open(openInput) : null))
     .then((snapshot) => {
       if (!snapshot || !isCurrentOpenRequest()) return;
+      const unavailableRecovery = resolveTerminalRecoverySnapshot(entry, snapshot);
       const retainedOutput = hasRetainedRecoveredOutput(entry);
       if (
         shouldReplayColdSnapshot(
@@ -1739,10 +1773,22 @@ function openTerminal(entry: TerminalRuntimeEntry): void {
           retainedOutput,
         )
       ) {
-        replaySnapshot(entry, snapshot, () => {
-          if (isCurrentOpenRequest()) setRuntimeStatus(entry, "ready");
-        });
-      } else if (entry.outputEventVersion === outputEventVersionAtOpen) {
+        replaySnapshot(
+          entry,
+          snapshot,
+          unavailableRecovery
+            ? undefined
+            : () => {
+                if (isCurrentOpenRequest()) setRuntimeStatus(entry, "ready");
+              },
+        );
+      } else if (
+        shouldScheduleTerminalSnapshotReconcile({
+          reattachOnly: entry.reattachOnly,
+          unavailableRecovery,
+          outputUnchanged: entry.outputEventVersion === outputEventVersionAtOpen,
+        })
+      ) {
         setRuntimeStatus(entry, "ready");
         window.setTimeout(() => {
           if (
@@ -1753,10 +1799,11 @@ function openTerminal(entry: TerminalRuntimeEntry): void {
             return;
           }
           void waitForTerminalEventStreamReady(api)
-            .then(() => (isCurrentOpenRequest() ? api.terminal.open(openInput) : null))
+            .then(() => (isCurrentOpenRequest() ? api.terminal.open(buildOpenInput(entry)) : null))
             .then((nextSnapshot) => {
               if (!nextSnapshot || !isCurrentOpenRequest()) return;
               const retainedOutput = hasRetainedRecoveredOutput(entry);
+              resolveTerminalRecoverySnapshot(entry, nextSnapshot);
               if (
                 !shouldReplayColdSnapshot(
                   nextSnapshot,
@@ -1775,7 +1822,7 @@ function openTerminal(entry: TerminalRuntimeEntry): void {
               // Best-effort recovery only; the original open already succeeded.
             });
         }, OPEN_SNAPSHOT_RECONCILE_DELAY_MS);
-      }
+      } else if (!unavailableRecovery) setRuntimeStatus(entry, "ready");
       if (entry.viewState.autoFocus) {
         window.requestAnimationFrame(() => {
           entry.terminal.focus();

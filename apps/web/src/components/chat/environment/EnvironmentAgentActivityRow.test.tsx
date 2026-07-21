@@ -1,11 +1,12 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 
-import type { AgentActivityState } from "../agentActivityPulse.logic";
+import { IDLE_AGENT_ACTIVITY_STATE, type AgentActivityState } from "../agentActivityPulse.logic";
 import { EnvironmentAgentActivityRow } from "./EnvironmentAgentActivityRow";
 
 function state(phase: AgentActivityState["phase"]): AgentActivityState {
   return {
+    ...IDLE_AGENT_ACTIVITY_STATE,
     phase,
     toolCount: phase === "tool-running" ? 2 : 0,
     subagentCount: 0,

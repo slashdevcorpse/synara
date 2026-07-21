@@ -1648,6 +1648,73 @@ describe("recovered terminal snapshot replay in real xterm", () => {
     }
   });
 
+  it("uses the current reattach-only flag for delayed snapshot reconciliation", async () => {
+    const host = document.createElement("div");
+    host.style.cssText = "position:absolute;left:0;top:0;width:900px;height:320px;display:block;";
+    document.body.append(host);
+    hosts.push(host);
+
+    const terminalId = "delayed-reattach";
+    const openInputs: Array<Parameters<NativeApi["terminal"]["open"]>[0]> = [];
+    const nativeApi = {
+      terminal: {
+        waitUntilEventStreamReady: waitUntilTerminalEventStreamReady,
+        open: async (input: Parameters<NativeApi["terminal"]["open"]>[0]) => {
+          openInputs.push(input);
+          if (openInputs.length === 1) {
+            return { ...legacySnapshot(""), terminalId };
+          }
+          return {
+            ...legacySnapshot(""),
+            terminalId,
+            status: "exited" as const,
+            pid: null,
+            exitCode: 0,
+          };
+        },
+        write: async () => undefined,
+        ackOutput: async () => undefined,
+        resize: async () => undefined,
+        clear: async () => undefined,
+        restart: async () => ({ ...legacySnapshot(""), terminalId }),
+        close: async () => undefined,
+        onEvent: () => () => undefined,
+      },
+    } as unknown as NativeApi;
+    const previousNativeApi = window.nativeApi;
+    window.nativeApi = nativeApi;
+    let entry: ReturnType<typeof createRuntimeEntry>;
+    entry = createRuntimeEntry({
+      runtimeKey: `thread::${terminalId}`,
+      threadId: "thread",
+      terminalId,
+      terminalLabel: "Terminal",
+      cwd: "C:\\project",
+      callbacks: {
+        onSessionExited: () => undefined,
+        onTerminalMetadataChange: () => undefined,
+        onTerminalActivityChange: () => undefined,
+        onTerminalRecoveryResolved: () => {
+          queueMicrotask(() => {
+            entry.reattachOnly = true;
+          });
+        },
+      },
+    });
+
+    try {
+      attachRuntimeToContainer(entry, { autoFocus: false, isVisible: true }, host);
+      await waitForCondition(() => openInputs.length === 2, "delayed reattach-only reconcile");
+
+      expect(openInputs[0]?.reattachOnly).toBeUndefined();
+      expect(openInputs[1]?.reattachOnly).toBe(true);
+    } finally {
+      disposeRuntimeEntry(entry);
+      restoreWindowNativeApi(previousNativeApi);
+      document.getElementById("synara-terminal-parking")?.remove();
+    }
+  });
+
   it.each(["started", "restarted", "cleared"] as const)(
     "handles retained runtime output through a later %s event and resumes normal delivery",
     async (retryEventType) => {

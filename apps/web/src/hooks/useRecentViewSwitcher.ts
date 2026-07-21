@@ -104,6 +104,7 @@ export function useRecentViewSwitcher(input: UseRecentViewSwitcherInput) {
         const terminalVisualIdentityById = resolveTerminalVisualIdentityMap({
           runningTerminalIds: terminalState.runningTerminalIds,
           terminalAttentionStatesById: terminalState.terminalAttentionStatesById,
+          terminalExitStatesById: terminalState.terminalExitStatesById,
           terminalCliKindsById: terminalState.terminalCliKindsById,
           terminalIds: terminalState.terminalIds,
           terminalLabelsById: terminalState.terminalLabelsById,

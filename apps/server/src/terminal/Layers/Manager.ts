@@ -955,7 +955,7 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
           threadId: input.threadId,
           terminalId: input.terminalId,
           cwd: input.cwd,
-          status: "starting",
+          status: input.reattachOnly ? "exited" : "starting",
           pid: null,
           history: TerminalHistoryBuffer.fromString(recovered.history, this.historyLimits()),
           recoveredCols: recovered.recoveredCols ?? null,
@@ -997,6 +997,9 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
         this.sessions.set(sessionKey, session);
         this.evictedSessionSequenceWatermarks.delete(sessionKey);
         this.evictInactiveSessionsIfNeeded();
+        if (input.reattachOnly) {
+          return this.snapshot(session);
+        }
         await this.startSession(session, { ...input, cols, rows }, "started");
         return this.snapshot(session);
       }
@@ -1005,6 +1008,10 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
       // when explicitly provided, otherwise keep the session's current mode.
       if (input.streamOutput !== undefined) {
         existing.streamOutput = input.streamOutput;
+      }
+      if (input.reattachOnly && !existing.process) {
+        this.flushOutputBuffer(existing);
+        return this.snapshot(existing);
       }
       const nextRuntimeEnv = normalizedRuntimeEnv(input.env);
       const currentRuntimeEnv = existing.runtimeEnv;
@@ -1276,6 +1283,44 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
   async close(raw: TerminalCloseInput): Promise<void> {
     const input = decodeTerminalCloseInput(raw);
     await this.runWithThreadLock(input.threadId, async () => {
+      if (input.terminalIds) {
+        const terminalIds = [...new Set(input.terminalIds)];
+        // Complete every potentially-failing persistence flush before mutating
+        // any live session or deleting any history. Process shutdown follows
+        // main's awaited tree-containment path; only after every stop settles do
+        // we remove sessions and their sequence watermarks as one group commit.
+        await Promise.all(
+          terminalIds.map((terminalId) => this.flushPersistQueue(input.threadId, terminalId)),
+        );
+        const sessions = terminalIds.flatMap((terminalId) => {
+          const session = this.sessions.get(toSessionKey(input.threadId, terminalId));
+          return session ? [session] : [];
+        });
+        await Promise.all(sessions.map((session) => this.stopProcess(session)));
+        // stopProcess flushes any trailing PTY output into the debounced
+        // persistence queue. Settle every drain before deciding whether group
+        // cleanup can commit; retaining stopped sessions on failure keeps the
+        // unacknowledged close retryable without deleting their history.
+        const trailingFlushes = await Promise.allSettled(
+          terminalIds.map((terminalId) => this.flushPersistQueue(input.threadId, terminalId)),
+        );
+        const failedTrailingFlush = trailingFlushes.find(
+          (result): result is PromiseRejectedResult => result.status === "rejected",
+        );
+        if (failedTrailingFlush) throw failedTrailingFlush.reason;
+        for (const terminalId of terminalIds) {
+          const key = toSessionKey(input.threadId, terminalId);
+          this.sessions.delete(key);
+          this.evictedSessionSequenceWatermarks.delete(key);
+        }
+        if (input.deleteHistory) {
+          await Promise.all(
+            terminalIds.map((terminalId) => this.deleteHistory(input.threadId, terminalId)),
+          );
+        }
+        this.updateSubprocessPollingState();
+        return;
+      }
       if (input.terminalId) {
         await this.closeSession(input.threadId, input.terminalId, input.deleteHistory === true);
         return;

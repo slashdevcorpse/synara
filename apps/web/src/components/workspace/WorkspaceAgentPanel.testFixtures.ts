@@ -5,6 +5,7 @@
 import { ProjectId, ThreadId, TurnId } from "@synara/contracts";
 
 import { isLiveAgentStatus } from "../../lib/workspaceAgentActivity";
+import { IDLE_AGENT_ACTIVITY_STATE } from "../../lib/agentActivity";
 import type {
   AgentThreadEntry,
   AgentThreadTreeNode,
@@ -32,6 +33,7 @@ export function makeWorkspaceAgentEntry(
     effortLabel: "high",
     providerKind: "codex",
     status: "thinking",
+    activityState: { ...IDLE_AGENT_ACTIVITY_STATE, phase: "thinking" },
     duration: 61_500,
     latestTool: null,
     streamPreview: null,

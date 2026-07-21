@@ -103,4 +103,49 @@ describe("terminal visual identity", () => {
       }),
     ).toBe("attention");
   });
+
+  it("keeps review attention ahead of running", () => {
+    expect(
+      resolveTerminalVisualState({
+        runningTerminalIds: ["terminal-1"],
+        terminalAttentionStatesById: { "terminal-1": "review" },
+        terminalId: "terminal-1",
+      }),
+    ).toBe("review");
+  });
+
+  it("uses durable stopped and failed state ahead of stale activity", () => {
+    expect(
+      resolveTerminalVisualState({
+        runningTerminalIds: ["terminal-1"],
+        terminalAttentionStatesById: { "terminal-1": "attention" },
+        terminalExitStatesById: {
+          "terminal-1": { kind: "failed", exitCode: null, exitSignal: "9" },
+        },
+        terminalId: "terminal-1",
+      }),
+    ).toBe("failed");
+
+    const identities = resolveTerminalVisualIdentityMap({
+      terminalIds: ["stopped", "failed"],
+      runningTerminalIds: [],
+      terminalAttentionStatesById: {},
+      terminalExitStatesById: {
+        stopped: { kind: "stopped", exitCode: 0, exitSignal: null },
+        failed: { kind: "failed", exitCode: 1, exitSignal: null },
+      },
+      terminalCliKindsById: {},
+      terminalLabelsById: { stopped: "Stopped shell", failed: "Failed build" },
+      terminalTitleOverridesById: {},
+    });
+    expect(identities.get("stopped")?.state).toBe("stopped");
+    expect(identities.get("failed")?.state).toBe("failed");
+    expect(
+      selectRepresentativeTerminalVisualIdentity({
+        activeTerminalId: "stopped",
+        terminalIds: ["stopped", "failed"],
+        terminalVisualIdentityById: identities,
+      })?.terminalId,
+    ).toBe("failed");
+  });
 });

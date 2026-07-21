@@ -2892,6 +2892,73 @@ describe("ChatView timeline estimator parity (full app)", () => {
     }
   });
 
+  it("starts the primary project script from the terminal create menu", async () => {
+    useComposerDraftStore.setState({
+      draftThreadsByThreadId: {
+        [THREAD_ID]: {
+          projectId: PROJECT_ID,
+          createdAt: NOW_ISO,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          entryPoint: "chat",
+          branch: null,
+          worktreePath: null,
+          envMode: "local",
+        },
+      },
+      projectDraftThreadIdByProjectId: { [PROJECT_ID]: THREAD_ID },
+    });
+    const mounted = await mountChatView({
+      viewport: { ...DEFAULT_VIEWPORT, width: 1_400 },
+      snapshot: withProjectScripts(createDraftOnlySnapshot(), [
+        {
+          id: "dev",
+          name: "Dev",
+          command: "bun run dev",
+          icon: "play",
+          runOnWorktreeCreate: false,
+        },
+      ]),
+    });
+
+    try {
+      useTerminalStateStore.getState().setTerminalOpen(THREAD_ID, true);
+      const createMenu = await waitForElement(
+        () =>
+          Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find((button) =>
+            button.getAttribute("aria-label")?.startsWith("New Terminal"),
+          ) ?? null,
+        "Unable to find the terminal create menu.",
+      );
+      createMenu.click();
+      const startScript = await waitForElement(
+        () =>
+          Array.from(document.querySelectorAll<HTMLElement>('[data-slot="menu-item"]')).find(
+            (item) => item.textContent?.trim() === "Start project script",
+          ) ?? null,
+        "Unable to find the primary project script action.",
+      );
+      startScript.click();
+
+      await vi.waitFor(
+        () => {
+          const writeRequest = wsRequests.find(
+            (request) =>
+              request._tag === WS_METHODS.terminalWrite && request.data === "bun run dev\r",
+          );
+          expect(writeRequest).toMatchObject({
+            _tag: WS_METHODS.terminalWrite,
+            threadId: THREAD_ID,
+            data: "bun run dev\r",
+          });
+        },
+        { timeout: 8_000, interval: 16 },
+      );
+    } finally {
+      await mounted.cleanup();
+    }
+  });
+
   it("runs project scripts from worktree draft threads at the worktree cwd", async () => {
     useComposerDraftStore.setState({
       draftThreadsByThreadId: {

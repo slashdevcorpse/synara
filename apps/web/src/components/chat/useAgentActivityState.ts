@@ -5,6 +5,7 @@
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 
+import { DISCLOSURE_DURATION_MS } from "../../lib/disclosureMotion";
 import {
   deriveAgentActivityState,
   IDLE_AGENT_ACTIVITY_STATE,
@@ -15,7 +16,7 @@ import {
 } from "./agentActivityPulse.logic";
 
 export const AGENT_ACTIVITY_MIN_PHASE_DWELL_MS = 100;
-export const AGENT_ACTIVITY_TERMINAL_DISPLAY_MS = 440;
+export const AGENT_ACTIVITY_TERMINAL_DISPLAY_MS = DISCLOSURE_DURATION_MS;
 
 interface ObservedLiveTurn {
   threadId: string;
@@ -35,11 +36,38 @@ function initialDisplayState(target: AgentActivityState): AgentActivityState {
   return isTerminalAgentActivityPhase(target.phase) ? IDLE_AGENT_ACTIVITY_STATE : target;
 }
 
-function activityStatesEqual(left: AgentActivityState, right: AgentActivityState): boolean {
+function subagentStatesEqual(
+  left: AgentActivityState["subagentStates"],
+  right: AgentActivityState["subagentStates"],
+): boolean {
+  if (left === right) return true;
+  if (left.size !== right.size) return false;
+  for (const [id, leftState] of left) {
+    const rightState = right.get(id);
+    if (
+      !rightState ||
+      leftState.id !== rightState.id ||
+      leftState.phase !== rightState.phase ||
+      leftState.latestToolName !== rightState.latestToolName ||
+      leftState.streamPreview !== rightState.streamPreview
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+export function activityStatesEqual(left: AgentActivityState, right: AgentActivityState): boolean {
   return (
     left.phase === right.phase &&
+    left.queueCount === right.queueCount &&
     left.toolCount === right.toolCount &&
     left.subagentCount === right.subagentCount &&
+    left.subagentRunningCount === right.subagentRunningCount &&
+    subagentStatesEqual(left.subagentStates, right.subagentStates) &&
+    left.latestToolName === right.latestToolName &&
+    left.streamPreview === right.streamPreview &&
+    left.durationMs === right.durationMs &&
     left.lastEventTimestamp === right.lastEventTimestamp &&
     left.turnKey === right.turnKey
   );
@@ -62,6 +90,7 @@ export function useAgentActivityState(input: AgentActivityInput): AgentActivityP
       input.localDispatchPending,
       input.messages,
       input.session,
+      input.subagentStates,
       input.threadError,
       input.threadId,
     ],
@@ -219,7 +248,7 @@ export function useAgentActivityState(input: AgentActivityInput): AgentActivityP
     }
 
     // Preserve an already-presented one-shot terminal phase until its scheduled
-    // 440ms dismissal even if projection cleanup removes latestTurn first.
+    // shared 220ms dismissal even if projection cleanup removes latestTurn first.
     if (
       terminalFrameRef.current !== null &&
       (displayStateRef.current.phase === "completed" || displayStateRef.current.phase === "failed")

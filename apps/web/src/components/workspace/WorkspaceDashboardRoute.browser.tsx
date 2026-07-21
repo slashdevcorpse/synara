@@ -67,7 +67,18 @@ vi.mock("~/nativeApi", () => ({
     automation: { list: mocks.automationList },
     dialogs: { confirm: mocks.confirm },
     git: { init: mocks.gitInit },
-    orchestration: { dispatchCommand: mocks.dispatchCommand },
+    orchestration: {
+      dispatchCommand: mocks.dispatchCommand,
+      getShellSnapshot: async () => ({
+        snapshotSequence: 0,
+        projects: [],
+        threads: [],
+        updatedAt: "2026-07-20T12:00:00.000Z",
+      }),
+      onDomainEvent: () => () => undefined,
+      onShellEvent: () => () => undefined,
+      replayEvents: async () => [],
+    },
     workspace: {
       listArchivedProjects: mocks.listArchivedProjects,
       listGitStates: mocks.listGitStates,
@@ -77,7 +88,18 @@ vi.mock("~/nativeApi", () => ({
     automation: { list: mocks.automationList },
     dialogs: { confirm: mocks.confirm },
     git: { init: mocks.gitInit },
-    orchestration: { dispatchCommand: mocks.dispatchCommand },
+    orchestration: {
+      dispatchCommand: mocks.dispatchCommand,
+      getShellSnapshot: async () => ({
+        snapshotSequence: 0,
+        projects: [],
+        threads: [],
+        updatedAt: "2026-07-20T12:00:00.000Z",
+      }),
+      onDomainEvent: () => () => undefined,
+      onShellEvent: () => () => undefined,
+      replayEvents: async () => [],
+    },
     workspace: {
       listArchivedProjects: mocks.listArchivedProjects,
       listGitStates: mocks.listGitStates,
@@ -90,14 +112,20 @@ vi.mock("~/store", () => ({
     selector: (state: {
       projects: Project[];
       reorderProjects: typeof mocks.reorderProjects;
+      sidebarThreadSummaryById: Record<string, SidebarThreadSummary>;
       syncServerShellSnapshot: typeof mocks.syncServerShellSnapshot;
+      threadIds: ThreadId[];
       threadsHydrated: boolean;
     }) => unknown,
   ) =>
     selector({
       projects: mocks.projects,
       reorderProjects: mocks.reorderProjects,
+      sidebarThreadSummaryById: Object.fromEntries(
+        mocks.threads.map((thread) => [thread.id, thread]),
+      ),
       syncServerShellSnapshot: mocks.syncServerShellSnapshot,
+      threadIds: mocks.threads.map((thread) => thread.id),
       threadsHydrated: mocks.threadsHydrated,
     }),
 }));
@@ -112,6 +140,7 @@ vi.mock("~/workspaceStore", () => ({
 }));
 
 import { WorkspaceDashboardRoute } from "~/routes/_chat.workspace.index";
+import { useGitActionActivityStore } from "~/gitActionActivityStore";
 import { usePinnedProjectsStore } from "~/pinnedProjectsStore";
 
 const refreshedAt = "2026-07-20T12:00:00.000Z";
@@ -265,6 +294,7 @@ beforeEach(() => {
     projectPinLifecycleByProjectId: new Map(),
     observedProjectPinStateByProjectId: new Map(),
   });
+  useGitActionActivityStore.setState({ activeActionIdsByCwd: new Map() });
   mocks.projects = [];
   mocks.gitItems = [];
   mocks.threads = [];
@@ -808,11 +838,66 @@ describe("WorkspaceDashboardRoute", () => {
     mocks.threads = [activeChildThread(activeProject.id)];
     await renderDashboard();
 
-    await expect.element(page.getByRole("button", { name: "Working" })).toBeVisible();
+    await expect.element(page.getByRole("button", { name: "Connecting" })).toBeVisible();
+    await expect
+      .element(page.getByTestId("workspace-project-process-summary"))
+      .toHaveTextContent("0 agents · 1 subagent (1 running)");
     await expect.element(page.getByText("No recent chats")).toBeVisible();
     expect(
       document.querySelector('[aria-label="Active providers"] [title="Codex"]'),
     ).not.toBeNull();
+  });
+
+  it("treats a Git action in a live project worktree as active dashboard work", async () => {
+    const activeProject = project("git-action-project", "Git action project");
+    const idleProject = project("idle-project", "Idle project");
+    mocks.projects = [activeProject, idleProject];
+    mocks.gitItems = [
+      gitState({ projectId: activeProject.id, dirtyFileCount: 0 }),
+      gitState({ projectId: idleProject.id, dirtyFileCount: 0 }),
+    ];
+    const { subagentAgentId: _subagentAgentId, ...idleWorktreeThread } = activeChildThread(
+      activeProject.id,
+    );
+    mocks.threads = [
+      {
+        ...idleWorktreeThread,
+        id: "git-action-worktree" as ThreadId,
+        title: "Git action worktree",
+        parentThreadId: null,
+        worktreePath: "C:\\code\\git-action-worktree",
+        associatedWorktreePath: "C:\\code\\git-action-worktree",
+        session: null,
+        hasLiveTailWork: false,
+      },
+    ];
+    useGitActionActivityStore.getState().applyProgressEvent({
+      kind: "action_started",
+      actionId: "dashboard-action",
+      cwd: "c:/CODE/git-action-worktree/",
+      action: "push",
+      phases: ["push"],
+    });
+
+    await renderDashboard();
+    await page.getByRole("button", { name: "Active", exact: true }).click();
+
+    await vi.waitFor(() => {
+      expect(document.querySelector('[aria-label="Open Git action project"]')).not.toBeNull();
+      expect(document.querySelector('[aria-label="Open Idle project"]')).toBeNull();
+    });
+
+    useGitActionActivityStore.getState().applyProgressEvent({
+      kind: "action_failed",
+      actionId: "dashboard-action",
+      cwd: "c:/CODE/git-action-worktree/",
+      action: "push",
+      phase: "push",
+      message: "Push failed",
+    });
+    await vi.waitFor(() => {
+      expect(document.querySelector('[aria-label="Open Git action project"]')).toBeNull();
+    });
   });
 
   it("refreshes only the selected project from a card action", async () => {
