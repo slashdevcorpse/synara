@@ -977,7 +977,7 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
           flavor: options.flavor,
           disableUpdates: options.disableUpdates,
           exactProvenanceRequested,
-          generatedRouteTreePath,
+          ...(generatedRouteTreePath ? { generatedRouteTreePath } : {}),
         }),
         ...commandOutputOptions(options.verbose),
         // Windows needs shell mode to resolve .cmd shims (e.g. bun.cmd).
@@ -986,7 +986,9 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
     );
     yield* generatedRouteTreeRoot
       ? sourceBuild.pipe(
-          Effect.ensuring(fs.remove(generatedRouteTreeRoot, { force: true, recursive: true })),
+          Effect.ensuring(
+            fs.remove(generatedRouteTreeRoot, { force: true, recursive: true }).pipe(Effect.orDie),
+          ),
         )
       : sourceBuild;
   }
