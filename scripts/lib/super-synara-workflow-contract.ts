@@ -38,6 +38,22 @@ function isRecord(value: unknown): value is UnknownRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function hasExactKeys(value: UnknownRecord, expectedKeys: readonly string[]): boolean {
+  const actualKeys = Object.keys(value);
+  return (
+    actualKeys.length === expectedKeys.length &&
+    expectedKeys.every((key) => Object.hasOwn(value, key))
+  );
+}
+
+function hasExactEntries(
+  value: unknown,
+  expected: Readonly<UnknownRecord>,
+): value is UnknownRecord {
+  if (!isRecord(value) || !hasExactKeys(value, Object.keys(expected))) return false;
+  return Object.entries(expected).every(([key, expectedValue]) => value[key] === expectedValue);
+}
+
 function normalizeShellCommand(command: string): string {
   return command.replace(/\s+/g, " ").trim();
 }
@@ -371,13 +387,11 @@ function verifyDraftAdmissionJob(jobs: UnknownRecord): void {
   const job = publicationJob(jobs, "draft_admission");
   const permissions = job.permissions;
   if (
+    !hasExactKeys(job, ["name", "runs-on", "timeout-minutes", "permissions", "steps"]) ||
+    job.name !== "Admit exact owned release draft" ||
     job["runs-on"] !== "ubuntu-24.04" ||
     job["timeout-minutes"] !== 5 ||
-    job.if !== undefined ||
-    job.needs !== undefined ||
-    (job["continue-on-error"] !== undefined && job["continue-on-error"] !== false) ||
-    !isRecord(permissions) ||
-    JSON.stringify(permissions) !== JSON.stringify({ contents: "write" })
+    !hasExactEntries(permissions, { contents: "write" })
   ) {
     throw new Error(
       "Publication draft admission must be an unconditional, minimal, write-scoped Ubuntu job.",
@@ -390,63 +404,118 @@ function verifyDraftAdmissionJob(jobs: UnknownRecord): void {
   }
   const [authorization, checkout, setupNode, validation] = steps as ReadonlyArray<UnknownRecord>;
   if (
+    !hasExactKeys(authorization!, ["name", "shell", "env", "run"]) ||
     authorization!.name !== "Authorize exact protected-main draft admission" ||
+    authorization!.shell !== "bash" ||
     typeof authorization!.run !== "string" ||
+    !hasExactKeys(checkout!, ["name", "uses", "with"]) ||
     checkout!.name !== "Checkout exact admitted source" ||
     checkout!.uses !== CHECKOUT_ACTION ||
+    !hasExactKeys(setupNode!, ["name", "uses", "with"]) ||
     setupNode!.name !== "Setup Node" ||
     setupNode!.uses !== SETUP_NODE_ACTION ||
+    !hasExactKeys(validation!, ["name", "shell", "env", "run"]) ||
     validation!.name !== "Validate exact owned draft visibility" ||
+    validation!.shell !== "bash" ||
     typeof validation!.run !== "string"
   ) {
     throw new Error("Publication draft admission must retain its four exact bounded steps.");
   }
-  for (const needle of [
-    '[[ "$CALLER_WORKFLOW_REF" == "$GITHUB_REPOSITORY/.github/workflows/release-drafter.yml@refs/heads/main" ]]',
-    '[[ "$REF_PROTECTED" == "true" ]]',
-    '[[ "$EXPECTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]',
-    '[[ "$WORKFLOW_SOURCE_SHA" == "$EXPECTED_SOURCE_SHA" ]]',
-    '[[ "$ACTOR" == "$OWNER" ]]',
-    '[[ "$TRIGGERING_ACTOR" == "$OWNER" ]]',
-    '[[ "$TAG" == "super-v$VERSION" ]]',
-    '[[ "$DRAFT_ID" =~ ^[1-9][0-9]*$ ]]',
-  ]) {
-    requireText(
-      authorization!.run,
-      needle,
+
+  if (
+    !hasExactEntries(authorization!.env, {
+      ACTOR: "${{ github.actor }}",
+      CALLER_WORKFLOW_REF: "${{ github.workflow_ref }}",
+      DRAFT_ID: "${{ inputs.release_draft_id }}",
+      EXPECTED_SOURCE_SHA: "${{ inputs.expected_source_sha }}",
+      OWNER: "${{ github.repository_owner }}",
+      REF_PROTECTED: "${{ github.ref_protected }}",
+      TAG: "${{ inputs.tag }}",
+      TRIGGERING_ACTOR: "${{ github.triggering_actor }}",
+      VERSION: "${{ inputs.version }}",
+      WORKFLOW_SOURCE_SHA: "${{ github.sha }}",
+    }) ||
+    JSON.stringify(executableShellLines(authorization!.run as string)) !==
+      JSON.stringify([
+        "set -euo pipefail",
+        '[[ "$CALLER_WORKFLOW_REF" == "$GITHUB_REPOSITORY/.github/workflows/release-drafter.yml@refs/heads/main" ]]',
+        '[[ "$REF_PROTECTED" == "true" ]]',
+        '[[ "$EXPECTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]',
+        '[[ "$WORKFLOW_SOURCE_SHA" == "$EXPECTED_SOURCE_SHA" ]]',
+        '[[ "$ACTOR" == "$OWNER" ]]',
+        '[[ "$TRIGGERING_ACTOR" == "$OWNER" ]]',
+        '[[ "$VERSION" =~ ^[0-9]+\\.[0-9]+\\.[0-9]+-super\\.[1-9][0-9]*$ ]]',
+        '[[ "$TAG" == "super-v$VERSION" ]]',
+        '[[ "$DRAFT_ID" =~ ^[1-9][0-9]*$ ]]',
+      ])
+  ) {
+    throw new Error(
       "Publication draft admission must authenticate the exact protected-main owner controller before checkout.",
     );
   }
+
   const checkoutWith = checkout!.with;
   if (
-    !isRecord(checkoutWith) ||
-    checkoutWith.ref !== "${{ inputs.expected_source_sha }}" ||
-    checkoutWith["fetch-depth"] !== 1 ||
-    checkoutWith["persist-credentials"] !== false
+    !hasExactEntries(checkoutWith, {
+      ref: "${{ inputs.expected_source_sha }}",
+      "fetch-depth": 1,
+      "persist-credentials": false,
+    })
   ) {
     throw new Error("Publication draft admission must checkout only the authenticated source SHA.");
   }
-  const setupNodeWith = setupNode!.with;
-  if (!isRecord(setupNodeWith) || setupNodeWith["node-version-file"] !== "package.json") {
+  if (!hasExactEntries(setupNode!.with, { "node-version-file": "package.json" })) {
     throw new Error("Publication draft admission must pin the repository Node runtime.");
   }
-  const validationEnvironment = validation!.env;
   if (
-    !isRecord(validationEnvironment) ||
-    validationEnvironment.GH_TOKEN !== "${{ github.token }}"
+    !hasExactEntries(validation!.env, {
+      DRAFT_ID: "${{ inputs.release_draft_id }}",
+      GH_TOKEN: "${{ github.token }}",
+      SOURCE_COMMIT: "${{ inputs.expected_source_sha }}",
+      TAG: "${{ inputs.tag }}",
+      VALIDATION_ACTOR: "${{ github.actor }}",
+      VALIDATION_TRIGGERING_ACTOR: "${{ github.triggering_actor }}",
+    }) ||
+    JSON.stringify(executableShellLines(validation!.run as string)) !==
+      JSON.stringify([
+        "node scripts/verify-super-synara-github-state.ts \\",
+        "--phase preflight \\",
+        '--repository "$GITHUB_REPOSITORY" \\',
+        '--ref-name "$GITHUB_REF_NAME" \\',
+        '--actor "$VALIDATION_ACTOR" \\',
+        '--triggering-actor "$VALIDATION_TRIGGERING_ACTOR" \\',
+        '--owner "$GITHUB_REPOSITORY_OWNER" \\',
+        '--tag "$TAG" \\',
+        '--source-commit "$SOURCE_COMMIT" \\',
+        '--current-run-draft-id "$DRAFT_ID"',
+      ])
   ) {
-    throw new Error("Publication draft admission must scope its token to exact draft validation.");
-  }
-  for (const needle of [
-    "node scripts/verify-super-synara-github-state.ts",
-    "--phase preflight",
-    '--source-commit "$SOURCE_COMMIT"',
-    '--current-run-draft-id "$DRAFT_ID"',
-  ]) {
-    requireText(
-      validation!.run,
-      needle,
+    throw new Error(
       "Publication draft admission must validate the exact owned draft before native builds.",
+    );
+  }
+
+  const preflightValidators: Array<{ readonly jobName: string; readonly step: UnknownRecord }> = [];
+  for (const [jobName, candidateJob] of Object.entries(jobs)) {
+    if (!isRecord(candidateJob) || !Array.isArray(candidateJob.steps)) continue;
+    for (const candidateStep of candidateJob.steps) {
+      if (!isRecord(candidateStep) || typeof candidateStep.run !== "string") continue;
+      const lines = executableShellLines(candidateStep.run);
+      if (
+        lines.some((line) => line.startsWith("node scripts/verify-super-synara-github-state.ts")) &&
+        lines.some((line) => line.startsWith("--phase preflight"))
+      ) {
+        preflightValidators.push({ jobName, step: candidateStep });
+      }
+    }
+  }
+  if (
+    preflightValidators.length !== 1 ||
+    preflightValidators[0]!.jobName !== "draft_admission" ||
+    preflightValidators[0]!.step !== validation
+  ) {
+    throw new Error(
+      "Publication preflight-phase draft validation must run exactly once in draft admission.",
     );
   }
 }

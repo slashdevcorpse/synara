@@ -263,6 +263,107 @@ describe("Super Synara workflow contracts", () => {
     ).toThrow("must depend on exact draft admission");
   });
 
+  it("locks draft admission authorization as an exact fail-closed boundary", () => {
+    const authorizationHeader =
+      "      - name: Authorize exact protected-main draft admission\n        shell: bash\n        env:";
+    const unsafeAuthorizationMutations = [
+      main.replace(
+        authorizationHeader,
+        authorizationHeader.replace("shell: bash", "shell: bash {0}"),
+      ),
+      main.replace(
+        authorizationHeader,
+        authorizationHeader.replace(
+          "        shell: bash",
+          "        if: false\n        shell: bash",
+        ),
+      ),
+      main.replace(
+        authorizationHeader,
+        authorizationHeader.replace(
+          "        shell: bash",
+          "        continue-on-error: true\n        shell: bash",
+        ),
+      ),
+      main.replace(
+        "          ACTOR: ${{ github.actor }}\n          CALLER_WORKFLOW_REF:",
+        "          ACTOR: ${{ github.repository_owner }}\n          CALLER_WORKFLOW_REF:",
+      ),
+      main.replace(
+        "          CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}",
+        "          CALLER_WORKFLOW_REF: ${{ github.repository }}/.github/workflows/release-drafter.yml@refs/heads/main",
+      ),
+      main.replace(
+        "          EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}",
+        "          EXPECTED_SOURCE_SHA: ${{ github.sha }}",
+      ),
+      main.replace(
+        "          TRIGGERING_ACTOR: ${{ github.triggering_actor }}\n          VERSION:",
+        "          TRIGGERING_ACTOR: ${{ github.repository_owner }}\n          VERSION:",
+      ),
+      main.replace(
+        '          set -euo pipefail\n          [[ "$CALLER_WORKFLOW_REF"',
+        '          [[ "$CALLER_WORKFLOW_REF"',
+      ),
+      main.replace(
+        '          [[ "$ACTOR" == "$OWNER" ]]',
+        '          [[ "$ACTOR" == "$OWNER" ]] || true',
+      ),
+    ];
+    for (const mutation of unsafeAuthorizationMutations) {
+      expect(mutation).not.toBe(main);
+      expect(() => verifySuperSynaraWorkflowText(mutation, audit)).toThrow(
+        /four exact bounded steps|authenticate the exact protected-main owner controller/,
+      );
+    }
+  });
+
+  it("locks exact draft validation to its one fail-closed write-scoped step", () => {
+    const validationHeader =
+      "      - name: Validate exact owned draft visibility\n        shell: bash\n        env:";
+    const unsafeValidationMutations = [
+      main.replace(validationHeader, validationHeader.replace("shell: bash", "shell: bash {0}")),
+      main.replace(
+        validationHeader,
+        validationHeader.replace("        shell: bash", "        if: false\n        shell: bash"),
+      ),
+      main.replace(
+        validationHeader,
+        validationHeader.replace(
+          "        shell: bash",
+          "        continue-on-error: true\n        shell: bash",
+        ),
+      ),
+      main.replace(
+        "      - name: Validate exact owned draft visibility\n        shell: bash\n        env:\n          DRAFT_ID: ${{ inputs.release_draft_id }}",
+        "      - name: Validate exact owned draft visibility\n        shell: bash\n        env:\n          DRAFT_ID: ${{ inputs.tag }}",
+      ),
+      main.replace(
+        "          TAG: ${{ inputs.tag }}\n          VALIDATION_ACTOR: ${{ github.actor }}\n          VALIDATION_TRIGGERING_ACTOR: ${{ github.triggering_actor }}",
+        "          TAG: ${{ inputs.tag }}\n          VALIDATION_ACTOR: ${{ github.repository_owner }}\n          VALIDATION_TRIGGERING_ACTOR: ${{ github.repository_owner }}",
+      ),
+      main.replace(
+        '            --current-run-draft-id "$DRAFT_ID"',
+        '            --current-run-draft-id "$DRAFT_ID" || true',
+      ),
+    ];
+    for (const mutation of unsafeValidationMutations) {
+      expect(mutation).not.toBe(main);
+      expect(() => verifySuperSynaraWorkflowText(mutation, audit)).toThrow(
+        /four exact bounded steps|validate the exact owned draft/,
+      );
+    }
+
+    const duplicatedReadOnlyValidation = main.replace(
+      "      - name: Verify Super Synara identity",
+      "      - name: Reintroduced read-only draft validation\n        shell: bash\n        run: |\n          node scripts/verify-super-synara-github-state.ts \\\n            --phase preflight\n\n      - name: Verify Super Synara identity",
+    );
+    expect(duplicatedReadOnlyValidation).not.toBe(main);
+    expect(() => verifySuperSynaraWorkflowText(duplicatedReadOnlyValidation, audit)).toThrow(
+      "preflight-phase draft validation must run exactly once in draft admission",
+    );
+  });
+
   it("rejects removal of the reviewed allowlist gate", () => {
     expect(() =>
       verifySuperSynaraWorkflowText(
