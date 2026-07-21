@@ -105,8 +105,9 @@ describe("desktop persistence smoke fixture", () => {
       const armResult = runFixtureCli("arm", synaraHome);
       expect(armResult.status).toBe(1);
       expect(armResult.stderr).toContain(
-        "arm requires launch A to be running and holding the desktop database lifecycle lock",
+        "FixtureInputError: desktop persistence smoke fixture: arm requires launch A to be running and holding the desktop database lifecycle lock",
       );
+      expect(armResult.stderr).not.toContain("at failInput");
     } finally {
       FS.rmSync(synaraHome, { recursive: true, force: true });
     }
