@@ -42,7 +42,10 @@ describe("Super Synara workflow contracts", () => {
     expect(() => verifySuperSynaraGithubStateScriptText(githubStateScript)).not.toThrow();
     expect(() =>
       verifySuperSynaraGithubStateScriptText(
-        githubStateScript.replace("const visibilityAttempts = 30;", "const visibilityAttempts = 1;"),
+        githubStateScript.replace(
+          "const visibilityAttempts = 30;",
+          "const visibilityAttempts = 1;",
+        ),
       ),
     ).toThrow("retry visibility boundedly");
     expect(() =>

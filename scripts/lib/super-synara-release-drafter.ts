@@ -2,8 +2,7 @@
 // Purpose: Resolves the one owned next Super Synara draft without mutating GitHub state.
 // Layer: Release scheduling policy
 
-export const SUPER_SYNARA_RELEASE_DRAFTER_MARKER =
-  "<!-- super-synara-release-drafter-owned -->";
+export const SUPER_SYNARA_RELEASE_DRAFTER_MARKER = "<!-- super-synara-release-drafter-owned -->";
 
 export interface SuperSynaraTagRef {
   readonly name: string;

@@ -46,8 +46,7 @@ const CI_WINDOWS_REQUIRED_COMMANDS = [
 ] as const;
 const CI_WINDOWS_POST_BUILD_COMMAND = "bun run --cwd apps/desktop smoke-test";
 const CI_ROOT_TEST_COMMAND = "bun run test:ci";
-const CI_CODECV_ACTION =
-  "codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac";
+const CI_CODECV_ACTION = "codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac";
 const CI_CODECV_UPLOAD_CONDITION =
   "${{ !cancelled() && (steps.unit_tests.outcome == 'success' || steps.unit_tests.outcome == 'failure') }}";
 const CI_CODECV_TOKEN = "${{ secrets.CODECOV_TOKEN }}";
@@ -55,8 +54,7 @@ const CI_CODECV_COVERAGE_FILES =
   "./apps/desktop/coverage/lcov.info,./apps/server/coverage/lcov.info,./apps/web/coverage/lcov.info,./packages/contracts/coverage/lcov.info,./packages/shared/coverage/lcov.info,./scripts/coverage/lcov.info";
 const CI_CODECV_TEST_RESULT_FILES =
   "./apps/desktop/test-report.junit.xml,./apps/server/test-report.junit.xml,./apps/web/test-report.junit.xml,./packages/contracts/test-report.junit.xml,./packages/shared/test-report.junit.xml,./scripts/test-report.junit.xml";
-const CI_MERGIFY_ACTION =
-  "Mergifyio/gha-mergify-ci@8173bc3c1d337d3367454672d50cfdf6f0273396";
+const CI_MERGIFY_ACTION = "Mergifyio/gha-mergify-ci@8173bc3c1d337d3367454672d50cfdf6f0273396";
 const CI_MERGIFY_UPLOAD_CONDITION =
   "${{ !cancelled() && (steps.unit_tests.outcome == 'success' || steps.unit_tests.outcome == 'failure') && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) }}";
 const CI_MERGIFY_REPORT_FILES =
@@ -574,7 +572,9 @@ function validateCodeqlWorkflow(workflow: UnknownRecord, errors: string[]): void
       init[0]!.with.languages !== lane.language ||
       init[0]!.with["build-mode"] !== lane.buildMode
     ) {
-      errors.push(`${path} ${lane.displayName} must initialize the expected language and build mode.`);
+      errors.push(
+        `${path} ${lane.displayName} must initialize the expected language and build mode.`,
+      );
     }
     if (
       analyze.length !== 1 ||

@@ -69,10 +69,7 @@ for (const manifest of packageVersions) {
 }
 
 const tagPayload = JSON.parse(
-  runGh([
-    "api",
-    `repos/${repository}/git/matching-refs/tags/super-v${coreVersion}-super.`,
-  ]),
+  runGh(["api", `repos/${repository}/git/matching-refs/tags/super-v${coreVersion}-super.`]),
 ) as ReadonlyArray<{ ref: string; object: { sha: string; type: string } }>;
 const tags: ReadonlyArray<SuperSynaraTagRef> = tagPayload.map((tag) => {
   if (tag.object.type !== "commit") {

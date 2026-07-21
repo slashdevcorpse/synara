@@ -9,13 +9,11 @@ import {
 } from "./workflow-contracts";
 
 const pinnedCheckout = "actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6";
-const pinnedCodecov =
-  "codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5.5.5";
+const pinnedCodecov = "codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5.5.5";
 const codecovCondition =
   "${{ !cancelled() && (steps.unit_tests.outcome == 'success' || steps.unit_tests.outcome == 'failure') }}";
 const codecovToken = "${{ secrets.CODECOV_TOKEN }}";
-const pinnedMergify =
-  "Mergifyio/gha-mergify-ci@8173bc3c1d337d3367454672d50cfdf6f0273396 # v23";
+const pinnedMergify = "Mergifyio/gha-mergify-ci@8173bc3c1d337d3367454672d50cfdf6f0273396 # v23";
 const mergifyCondition =
   "${{ !cancelled() && (steps.unit_tests.outcome == 'success' || steps.unit_tests.outcome == 'failure') && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) }}";
 const disabledPaths = [
@@ -496,10 +494,7 @@ describe("workflow contracts", () => {
 
   it("requires fork-safe, fail-closed Mergify JUnit ingestion", () => {
     const missingUpload = validFiles();
-    missingUpload.set(
-      ".github/workflows/ci.yml",
-      ciWorkflow.replace(`${mergifyUploadStep}\n`, ""),
-    );
+    missingUpload.set(".github/workflows/ci.yml", ciWorkflow.replace(`${mergifyUploadStep}\n`, ""));
     expect(validateWorkflowContracts(missingUpload, policy()).join("\n")).toContain(
       "must define exactly one Upload test results to Mergify CI Insights step",
     );
@@ -574,7 +569,10 @@ describe("workflow contracts", () => {
     const wrongCategory = validFiles();
     wrongCategory.set(
       ".github/workflows/codeql.yml",
-      codeqlWorkflow.replace("category: /language:swift", "category: /language:javascript-typescript"),
+      codeqlWorkflow.replace(
+        "category: /language:swift",
+        "category: /language:javascript-typescript",
+      ),
     );
     expect(validateWorkflowContracts(wrongCategory, policy()).join("\n")).toContain(
       "codeql-swift must publish the fixed analysis category",

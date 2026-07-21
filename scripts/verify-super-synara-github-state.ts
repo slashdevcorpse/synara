@@ -55,13 +55,9 @@ const required = (name: string): string => {
   return value;
 };
 const phase = required("--phase") as SuperSynaraReleasePhase;
-if (![
-  "preflight",
-  "before-draft",
-  "after-draft",
-  "before-publish",
-  "after-publish",
-].includes(phase)) {
+if (
+  !["preflight", "before-draft", "after-draft", "before-publish", "after-publish"].includes(phase)
+) {
   throw new Error(`Unsupported GitHub state phase: ${phase}.`);
 }
 const repository = required("--repository");

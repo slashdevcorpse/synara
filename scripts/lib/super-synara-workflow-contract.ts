@@ -882,7 +882,11 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
   ]) {
     requireText(main, asset, `Publication contract is missing ${asset}.`);
   }
-  prohibitText(main, "gh release create", "Publication must never create an arbitrary release draft.");
+  prohibitText(
+    main,
+    "gh release create",
+    "Publication must never create an arbitrary release draft.",
+  );
   requireText(
     main,
     "Adopt exact owned Release Drafter draft",
@@ -1003,7 +1007,11 @@ export function verifySuperSynaraReleaseDrafterText(
       "Release Drafter scheduler must run on protected main pushes, one weekly cron, and manual dispatch only.",
     );
   }
-  prohibitText(scheduler, "pull_request:", "Release Drafter scheduler must not run on pull requests.");
+  prohibitText(
+    scheduler,
+    "pull_request:",
+    "Release Drafter scheduler must not run on pull requests.",
+  );
   requireText(
     scheduler,
     "group: super-synara-prerelease\n  queue: max\n  cancel-in-progress: false",
@@ -1206,7 +1214,7 @@ export function verifySuperSynaraGithubStateScriptText(script: string): void {
   }
   requireText(
     script,
-    "const releasePages = JSON.parse(\n    runGh([\"api\", \"--paginate\", \"--slurp\", `repos/${repository}/releases?per_page=100`]),",
+    'const releasePages = JSON.parse(\n    runGh(["api", "--paginate", "--slurp", `repos/${repository}/releases?per_page=100`]),',
     "GitHub release-state visibility retries must re-read the complete release list.",
   );
 }
