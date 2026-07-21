@@ -10,7 +10,10 @@ import { test, expect, type DesktopHarness } from "./desktop.fixture";
 const PROJECT_NAME = "workspace";
 const APPROVAL_MARKER_FILENAME = "e2e-approval-command-output.txt";
 
-async function addAndSelectProject(desktop: DesktopHarness): Promise<void> {
+async function addAndSelectProject(
+  desktop: DesktopHarness,
+  options: { readonly requireProvider?: boolean } = {},
+): Promise<void> {
   const { page, workspaceDir } = desktop;
   const projectsSectionLabel = page.getByText("Projects", { exact: true }).last();
   await expect(projectsSectionLabel).toBeVisible({ timeout: 60_000 });
@@ -27,6 +30,10 @@ async function addAndSelectProject(desktop: DesktopHarness): Promise<void> {
   await expect(page.getByText(PROJECT_NAME, { exact: true }).first()).toBeVisible();
   await expect(page.getByTestId("composer-editor")).toBeVisible({ timeout: 30_000 });
   await expect.poll(() => new URL(page.url()).pathname).not.toBe("/");
+
+  if (options.requireProvider === false) {
+    return;
+  }
 
   // A selectable Codex entry proves the focus refresh reached the UI cache with
   // an available, non-unauthenticated status after the real CLI health probes.
@@ -235,7 +242,7 @@ test("interrupts an active provider turn", async ({ desktop }) => {
 });
 
 test("runs a real terminal and renders echoed output", async ({ desktop }) => {
-  await addAndSelectProject(desktop);
+  await addAndSelectProject(desktop, { requireProvider: false });
 
   await desktop.page.getByRole("button", { name: "workspace", exact: true }).hover();
   const createTerminal = desktop.page.getByRole("button", {
@@ -268,7 +275,7 @@ test("opens a workspace file in source and rendered preview modes", async ({ des
     "# E2E Preview Heading\n\nE2E_SOURCE_AND_PREVIEW_OK\n",
     "utf8",
   );
-  await addAndSelectProject(desktop);
+  await addAndSelectProject(desktop, { requireProvider: false });
 
   await desktop.page.getByRole("button", { name: "Toggle environment panel" }).click();
   await desktop.page.getByRole("button", { name: "Editor view", exact: true }).click();
@@ -284,7 +291,9 @@ test("opens a workspace file in source and rendered preview modes", async ({ des
   await expect(desktop.page.locator(".editor-file-viewer")).toContainText("# E2E Preview Heading", {
     timeout: 30_000,
   });
-  await markdownView.getByRole("radio", { name: "Preview" }).click();
+  await markdownView
+    .getByTitle("Rendered preview — browse and toggle task lists", { exact: true })
+    .click();
   await expect(markdownView.getByRole("radio", { name: "Preview" })).toBeChecked();
   await expect(
     desktop.page.getByRole("heading", { name: "E2E Preview Heading", exact: true }),
@@ -297,10 +306,13 @@ test("opens a workspace file in source and rendered preview modes", async ({ des
 test("loads a localhost page in the real desktop browser pane", async ({ desktop }) => {
   const localPage = await startLocalPageServer();
   try {
-    await addAndSelectProject(desktop);
+    await addAndSelectProject(desktop, { requireProvider: false });
     await desktop.page.keyboard.press("Control+Shift+B");
     const addressInput = desktop.page.getByPlaceholder("Search or enter a URL");
     await expect(addressInput).toBeVisible({ timeout: 30_000 });
+    await expect(desktop.page.getByRole("button", { name: "New tab", exact: true })).toBeVisible({
+      timeout: 30_000,
+    });
     await addressInput.fill(localPage.origin);
     await addressInput.press("Enter");
     await expect(addressInput).toHaveValue(

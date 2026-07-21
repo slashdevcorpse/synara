@@ -755,7 +755,7 @@ export class DesktopBrowserManager {
     }
     this.tabSuspendTimers.clear();
     this.detachAttachedRuntime();
-    this.destroyAllRuntimes();
+    this.destroyAllRuntimes({ closeRendererOwned: true });
     this.closeAllPopupWindows();
     this.pendingRuntimeSyncs.clear();
     this.runtimeLastActiveAtByKey.clear();
@@ -2161,11 +2161,20 @@ export class DesktopBrowserManager {
 
     try {
       await webContents.loadURL(nextUrl);
+      if (this.runtimes.get(runtime.key) !== runtime || webContents.isDestroyed()) {
+        return;
+      }
       if (options.clearHistory) {
         clearBrowserNavigationHistory(webContents);
       }
       this.queueRuntimeStateSync(threadId, tabId);
     } catch (error) {
+      // A renderer webview can replace the temporary native runtime while its
+      // load is still settling. That stale promise must not overwrite the new
+      // runtime's loading or error state.
+      if (this.runtimes.get(runtime.key) !== runtime || webContents.isDestroyed()) {
+        return;
+      }
       if (isAbortedNavigationError(error)) {
         this.queueRuntimeStateSync(threadId, tabId);
         return;
@@ -2240,13 +2249,17 @@ export class DesktopBrowserManager {
     }
   }
 
-  private destroyAllRuntimes(): void {
+  private destroyAllRuntimes(options: { closeRendererOwned?: boolean } = {}): void {
     for (const runtime of this.runtimes.values()) {
-      this.destroyRuntime(runtime.threadId, runtime.tabId);
+      this.destroyRuntime(runtime.threadId, runtime.tabId, options);
     }
   }
 
-  private destroyRuntime(threadId: ThreadId, tabId: string): void {
+  private destroyRuntime(
+    threadId: ThreadId,
+    tabId: string,
+    options: { closeRendererOwned?: boolean } = {},
+  ): void {
     const key = buildRuntimeKey(threadId, tabId);
     this.clearTabSuspendTimer(threadId, tabId);
     this.pendingRuntimeSyncs.delete(key);
@@ -2276,6 +2289,11 @@ export class DesktopBrowserManager {
       }
       if (runtime.ownsWebContents) {
         webContents.close({ waitForBeforeUnload: false });
+      } else if (options.closeRendererOwned === true) {
+        // Renderer-owned guests normally outlive a manager detach. Once full
+        // disposal removes our listeners and references, close them through
+        // the race-tolerant renderer path so they cannot keep Electron alive.
+        this.closeUnmanagedRendererWebContents(webContents);
       }
     }
   }
@@ -2565,8 +2583,20 @@ function syncTabStateFromRuntime(
   faviconUrls?: string[],
 ): boolean {
   const currentUrl = webContents.getURL();
+  const runtimeIsLoading = webContents.isLoading();
+  // An adopted renderer guest starts at about:blank. Keep the manager-owned
+  // destination authoritative until that guest commits the requested page;
+  // otherwise the transient blank state can make React remove the webview and
+  // abort the navigation that is still in flight.
+  const isInertGuestLoadingManagedTarget =
+    runtimeIsLoading &&
+    tab.isLoading &&
+    currentUrl === ABOUT_BLANK_URL &&
+    tab.url !== ABOUT_BLANK_URL;
   const acceptedCurrentUrl =
-    currentUrl && isPageNavigationAllowed(tab, currentUrl) ? currentUrl : "";
+    !isInertGuestLoadingManagedTarget && currentUrl && isPageNavigationAllowed(tab, currentUrl)
+      ? currentUrl
+      : "";
   const nextUrl = acceptedCurrentUrl || tab.url;
   const nextTitle = webContents.getTitle();
   let didChange = false;
@@ -2588,7 +2618,7 @@ function syncTabStateFromRuntime(
       tab.title = value;
     }) || didChange;
   didChange =
-    setIfChanged(tab.isLoading, webContents.isLoading(), (value) => {
+    setIfChanged(tab.isLoading, runtimeIsLoading, (value) => {
       tab.isLoading = value;
     }) || didChange;
   didChange =
