@@ -1173,7 +1173,7 @@ describe("desktop smoke process lifecycle", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("classifies only the known unsupported-termination taskkill race for PID proof", () => {
+  it("classifies only known taskkill teardown races for PID proof", () => {
     const output = [
       "SUCCESS: The process with PID 5001 (child process of PID 4312) has been terminated.",
       "ERROR: The process with PID 5002 (child process of PID 4312) could not be terminated.",
@@ -1195,6 +1195,29 @@ describe("desktop smoke process lifecycle", () => {
     ).toEqual({
       ok: false,
       diagnostic: expect.stringContaining("Access is denied"),
+    });
+  });
+
+  it("routes mixed already-exited and unsupported taskkill races through PID proof", () => {
+    const output = [
+      "ERROR: The process with PID 6116 (child process of PID 4520) could not be terminated.",
+      "Reason: There is no running instance of the task.",
+      "ERROR: The process with PID 6508 (child process of PID 4520) could not be terminated.",
+      "Reason: The operation attempted is not supported.",
+      "ERROR: The process with PID 4520 (child process of PID 7612) could not be terminated.",
+      "Reason: There is no running instance of the task.",
+      "SUCCESS: The process with PID 7548 (child process of PID 7612) has been terminated.",
+      "SUCCESS: The process with PID 1948 (child process of PID 6816) has been terminated.",
+      "SUCCESS: The process with PID 5940 (child process of PID 6816) has been terminated.",
+      "SUCCESS: The process with PID 7612 (child process of PID 6816) has been terminated.",
+      "SUCCESS: The process with PID 2984 (child process of PID 6816) has been terminated.",
+      "SUCCESS: The process with PID 6816 (child process of PID 2240) has been terminated.",
+    ].join("\r\n");
+
+    expect(classifyWindowsTaskkillClose({ code: 128, signal: null, output })).toEqual({
+      ok: false,
+      diagnostic: expect.stringContaining("code=128"),
+      verificationPids: [6116, 6508, 4520, 7548, 1948, 5940, 7612, 2984, 6816],
     });
   });
 
@@ -1225,7 +1248,7 @@ describe("desktop smoke process lifecycle", () => {
     ).not.toHaveProperty("verificationPids");
   });
 
-  it("accepts the unsupported-termination race only after every reported PID is gone", async () => {
+  it("accepts a verifiable nonzero taskkill result only after every reported PID is gone", async () => {
     const child = new FakeSmokeProcess();
     const killWindowsTree = vi.fn(async () => {
       child.exitAndClose(null, "SIGKILL");
@@ -1250,6 +1273,105 @@ describe("desktop smoke process lifecycle", () => {
     expect(isWindowsProcessAlive).toHaveBeenCalledWith(child.pid);
     expect(isWindowsProcessAlive).toHaveBeenCalledWith(5001);
     expect(isWindowsProcessAlive).toHaveBeenCalledWith(5002);
+  });
+
+  it("fails closed while a reported Windows PID remains live or is reused", async () => {
+    const child = new FakeSmokeProcess();
+    const killWindowsTree = vi.fn(async () => {
+      child.exitAndClose(null, "SIGKILL");
+      return {
+        ok: false,
+        diagnostic: "taskkill encountered an already-terminating process",
+        verificationPids: [6508],
+      };
+    });
+    const isWindowsProcessAlive = vi.fn((pid) => pid === 6508);
+
+    const resultPromise = forceStopDesktopSmokeProcessTree({
+      child,
+      description: "launch A",
+      platform: "win32",
+      timeoutMs: 250,
+      killWindowsTree,
+      isWindowsProcessAlive,
+    });
+    const resultExpectation = expect(resultPromise).rejects.toThrow(
+      "launch A forced process-tree teardown was not confirmed",
+    );
+    await vi.advanceTimersByTimeAsync(250);
+
+    await resultExpectation;
+    expect(isWindowsProcessAlive).toHaveBeenCalledWith(child.pid);
+    expect(isWindowsProcessAlive).toHaveBeenCalledWith(6508);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("treats Windows EPERM probes as live until ESRCH proves PID absence", async () => {
+    const child = new FakeSmokeProcess();
+    const killWindowsTree = vi.fn(async () => {
+      child.exitAndClose(null, "SIGKILL");
+      return {
+        ok: false,
+        diagnostic: "taskkill encountered an already-terminating process",
+        verificationPids: [6508],
+      };
+    });
+    let protectedProbeCount = 0;
+    const processKill = vi.spyOn(process, "kill").mockImplementation((pid, signal) => {
+      expect(signal).toBe(0);
+      let code = "ESRCH";
+      if (pid === 6508) {
+        protectedProbeCount += 1;
+        if (protectedProbeCount === 1) code = "EPERM";
+      }
+      throw Object.assign(new Error(`kill ${code}`), { code });
+    });
+
+    try {
+      const resultPromise = forceStopDesktopSmokeProcessTree({
+        child,
+        description: "launch A",
+        platform: "win32",
+        timeoutMs: 250,
+        killWindowsTree,
+      });
+
+      await vi.advanceTimersByTimeAsync(DESKTOP_PERSISTENCE_SMOKE_TREE_POLL_MS);
+
+      await expect(resultPromise).resolves.toEqual({
+        mode: "force",
+        platform: "win32",
+        pid: child.pid,
+      });
+      expect(protectedProbeCount).toBe(2);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      processKill.mockRestore();
+    }
+  });
+
+  it("rejects a verifiable taskkill race without independent root-exit proof", async () => {
+    const child = new FakeSmokeProcess();
+    const waitForExit = vi.fn(async () => false);
+    const waitForTreeGone = vi.fn(async () => true);
+
+    await expect(
+      forceStopDesktopSmokeProcessTree({
+        child,
+        description: "launch A",
+        platform: "win32",
+        timeoutMs: 250,
+        killWindowsTree: async () => ({
+          ok: false,
+          diagnostic: "taskkill encountered an already-terminating process",
+          verificationPids: [6508],
+        }),
+        waitForExit,
+        waitForTreeGone,
+      }),
+    ).rejects.toThrow("launch A Windows process-tree exit confirmation timed out after 250ms");
+    expect(waitForExit).toHaveBeenCalledExactlyOnceWith(child, 250);
+    expect(waitForTreeGone).toHaveBeenCalledOnce();
   });
 
   it("fails closed when Windows taskkill does not confirm the full tree", async () => {

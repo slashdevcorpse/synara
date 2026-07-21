@@ -189,29 +189,34 @@ function windowsTaskkillVerificationPids(output) {
   return [...pids];
 }
 
-function isUnsupportedWindowsTaskkillRace(output) {
+const WINDOWS_TASKKILL_VERIFIABLE_RACE_REASONS = new Set([
+  "Reason: The operation attempted is not supported.",
+  "Reason: There is no running instance of the task.",
+]);
+
+function isVerifiableWindowsTaskkillRace(output) {
   const lines = output
     .replaceAll("\r", "")
     .split("\n")
     .map((line) => line.trim())
     .filter((line) => line.length > 0);
-  let unsupportedTerminationCount = 0;
-  let unsupportedReasonCount = 0;
+  let terminationErrorCount = 0;
+  let verifiableReasonCount = 0;
 
   for (const line of lines) {
     if (line.startsWith("SUCCESS:")) continue;
     if (/^ERROR: The process with PID \d+\b.* could not be terminated\.$/u.test(line)) {
-      unsupportedTerminationCount += 1;
+      terminationErrorCount += 1;
       continue;
     }
-    if (line === "Reason: The operation attempted is not supported.") {
-      unsupportedReasonCount += 1;
+    if (WINDOWS_TASKKILL_VERIFIABLE_RACE_REASONS.has(line)) {
+      verifiableReasonCount += 1;
       continue;
     }
     return false;
   }
 
-  return unsupportedTerminationCount > 0 && unsupportedTerminationCount === unsupportedReasonCount;
+  return terminationErrorCount > 0 && terminationErrorCount === verifiableReasonCount;
 }
 
 export function classifyWindowsTaskkillClose({ code, signal, output }) {
@@ -222,7 +227,7 @@ export function classifyWindowsTaskkillClose({ code, signal, output }) {
     signal,
   )})${output.trim().length === 0 ? "." : `: ${output.trim()}`}`;
   const verificationPids = windowsTaskkillVerificationPids(output);
-  if (verificationPids.length > 0 && isUnsupportedWindowsTaskkillRace(output)) {
+  if (verificationPids.length > 0 && isVerifiableWindowsTaskkillRace(output)) {
     return { ok: false, diagnostic, verificationPids };
   }
   return { ok: false, diagnostic };
