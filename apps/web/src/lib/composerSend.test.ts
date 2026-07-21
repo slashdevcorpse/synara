@@ -1,4 +1,5 @@
 import { PROVIDER_SEND_TURN_MAX_ATTACHMENTS } from "@synara/contracts";
+import { SYNARA_CSRF_HEADER_NAME, SYNARA_CSRF_HEADER_VALUE } from "@synara/shared/authSecurity";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type {
@@ -147,7 +148,13 @@ describe("composerSend attachment builders", () => {
 
     expect(fetchMock).toHaveBeenCalledWith(
       expect.stringContaining("/api/attachments/upload?"),
-      expect.objectContaining({ method: "POST", body: imageFile }),
+      expect.objectContaining({
+        method: "POST",
+        body: imageFile,
+        headers: expect.objectContaining({
+          [SYNARA_CSRF_HEADER_NAME]: SYNARA_CSRF_HEADER_VALUE,
+        }),
+      }),
     );
     expect(attachments).toEqual([
       expect.objectContaining({ id: "thread-1-11111111-1111-4111-8111-111111111111" }),
@@ -210,6 +217,9 @@ describe("composerSend attachment builders", () => {
       expect.objectContaining({
         method: "POST",
         credentials: "include",
+        headers: expect.objectContaining({
+          [SYNARA_CSRF_HEADER_NAME]: SYNARA_CSRF_HEADER_VALUE,
+        }),
         body: JSON.stringify({ attachmentId: firstId }),
       }),
     ]);

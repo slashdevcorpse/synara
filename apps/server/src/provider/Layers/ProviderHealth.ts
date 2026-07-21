@@ -24,10 +24,11 @@ import { resolveCommandCodeCliExecutable } from "@synara/shared/commandCodeCliEx
 import { parseCodexConfigModelProvider } from "@synara/shared/codexConfig";
 import { decodeJsonResult } from "@synara/shared/schemaJson";
 import {
-  prepareResolvedWindowsSafeProcess,
-  prepareWindowsSafeProcess,
-} from "@synara/shared/windowsProcess";
-import { query as claudeQuery, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+  query as claudeQuery,
+  type SDKUserMessage,
+  type SpawnOptions as ClaudeSpawnOptions,
+  type SpawnedProcess as ClaudeSpawnedProcess,
+} from "@anthropic-ai/claude-agent-sdk";
 import {
   Array,
   Cache,
@@ -100,7 +101,13 @@ import { makeProviderMaintenanceCommandCoordinator } from "../providerMaintenanc
 import {
   makeProviderMaintenanceOwnedResourceCoordinator,
   type ProviderMaintenanceOwnedResourceCoordinator,
+  type ProviderMaintenanceOwnedResourceRegistration,
 } from "../providerMaintenanceOwnedResources";
+import {
+  isWindowsJobPreparedCommand,
+  prepareResolvedWindowsProviderProcess,
+  prepareWindowsProviderProcess,
+} from "../windowsProviderProcess.ts";
 import {
   enrichProviderStatusWithVersionAdvisory,
   compareSemverVersions,
@@ -118,16 +125,29 @@ import { buildCodexProcessEnv } from "../../codexProcessEnv.ts";
 import type { ProcessTreeKiller } from "../../terminal/processTreeKiller.ts";
 import {
   makeProviderMaintenanceGate,
+  ProviderMaintenanceBusyError,
   type ProviderMaintenanceGate,
 } from "../providerMaintenanceGate.ts";
 import { quiesceProviderRuntimesForUpdate } from "../providerUpdateQuiescence.ts";
 import { classifyCompletedProviderUpdate } from "../providerUpdateOutcome.ts";
 import {
+  findProviderProcessExitUnprovenError,
   ProviderProcessExitUnprovenError,
-  superviseEffectProcessTree,
-  teardownEffectProcessTree,
+  teardownChildProcessTree,
   teardownProviderProcessTree,
 } from "../supervisedProcessTeardown.ts";
+import {
+  containedClaudeSdkProcessDidNotSpawn,
+  spawnContainedClaudeSdkProcess,
+} from "../containedClaudeSdkProcess.ts";
+import {
+  installPreparedEffectProcessSupervisor,
+  supervisePreparedEffectProcess,
+  supervisePreparedNodeProcess,
+  type SupervisePreparedEffectProcessOptions,
+  WindowsJobProcessExitUnprovenError,
+  windowsJobNodeProcessSupervisor,
+} from "../windowsJobProcessSupervisor.ts";
 
 export { parseClaudeAuthStatusFromOutput } from "../claudeAuthStatus";
 export type { CommandResult } from "../providerCliOutput";
@@ -209,20 +229,34 @@ function isKiloNativeCommandPath(commandPath: string, platform: NodeJS.Platform)
   );
 }
 
-function findUnprovenProcessExit(
-  error: unknown,
-  seen: Set<object> = new Set(),
-): ProviderProcessExitUnprovenError | null {
-  if (error instanceof ProviderProcessExitUnprovenError) {
-    return error;
+class ProviderHealthProcessExitUnprovenError extends ProviderProcessExitUnprovenError {
+  override readonly cause: unknown;
+
+  constructor(rootPid: number, cause: unknown) {
+    super({
+      rootPid,
+      rootExited: false,
+      remainingDescendantPids: null,
+      captureComplete: false,
+    });
+    const detail = cause instanceof Error ? cause.message : String(cause);
+    this.name = "ProviderHealthProcessExitUnprovenError";
+    this.message = `Provider health process ${rootPid} did not prove complete exit. ${detail}`;
+    this.cause = cause;
   }
-  if (!error || typeof error !== "object" || seen.has(error)) {
-    return null;
-  }
-  seen.add(error);
-  return "cause" in error
-    ? findUnprovenProcessExit((error as { readonly cause?: unknown }).cause, seen)
-    : null;
+}
+
+function normalizeProviderHealthExitFailure(
+  cause: unknown,
+  rootPid: number,
+  exactWindowsOwner: boolean,
+): ProviderProcessExitUnprovenError {
+  return (
+    findProviderProcessExitUnprovenError(cause) ??
+    (exactWindowsOwner
+      ? new WindowsJobProcessExitUnprovenError(rootPid, cause)
+      : new ProviderHealthProcessExitUnprovenError(rootPid, cause))
+  );
 }
 
 const isAntigravityNativeCommandPath = makeCommandPathSuffixMatcher([
@@ -636,10 +670,107 @@ function waitForAbortSignal(signal: AbortSignal): Promise<void> {
   });
 }
 
-const probeClaudeSubscription = () => {
+export const probeClaudeSubscription = (processOptions: ProviderHealthProcessOptions = {}) => {
   const abort = new AbortController();
+  type ClaudeProbeProcessOwner = {
+    readonly sequence: number;
+    readonly process: import("node:child_process").ChildProcess;
+    readonly prepared?: ReturnType<typeof prepareWindowsProviderProcess>;
+    readonly exactWindowsOwner: boolean;
+    registrationPromise?: Promise<ProviderMaintenanceOwnedResourceRegistration>;
+    supervisionFailure?: Error;
+  };
+  const platform = processOptions.platform ?? globalThis.process.platform;
+  const owners: ClaudeProbeProcessOwner[] = [];
+  let nextOwnerSequence = 1;
+  let recordedSupervisionFailure: Error | undefined;
+  let rejectSupervisionFailure!: (cause: Error) => void;
+  const supervisionFailure = new Promise<never>((_resolve, reject) => {
+    rejectSupervisionFailure = reject;
+  });
+  void supervisionFailure.catch(() => undefined);
+  const recordSupervisionFailure = (cause: unknown): void => {
+    if (recordedSupervisionFailure) return;
+    const error = cause instanceof Error ? cause : new Error(String(cause), { cause });
+    recordedSupervisionFailure = error;
+    for (const owner of owners) owner.supervisionFailure ??= error;
+    try {
+      if (!abort.signal.aborted) abort.abort();
+    } catch {
+      // The failure promise below still forces scoped cleanup even if an abort listener defects.
+    }
+    rejectSupervisionFailure(error);
+  };
+  const reportUnprovenExit = (error: ProviderProcessExitUnprovenError) =>
+    processOptions.onUnprovenExit?.({ provider: CLAUDE_AGENT_PROVIDER, error }) ?? Effect.void;
+  const closeOwner = (owner: (typeof owners)[number]) => {
+    if (containedClaudeSdkProcessDidNotSpawn(owner.process)) return Effect.void;
+    const rootPid = Number(owner.process.pid);
+    const emergencyTeardown = (ownershipFailure: unknown) =>
+      Effect.tryPromise({
+        try: () =>
+          teardownChildProcessTree(
+            owner.process,
+            processOptions.teardownProcessTree ?? teardownProviderProcessTree,
+          ),
+        catch: (teardownFailure) =>
+          normalizeProviderHealthExitFailure(
+            new AggregateError(
+              [ownershipFailure, teardownFailure],
+              "Contained Claude process had no exact supervisor and emergency teardown failed.",
+            ),
+            rootPid,
+            owner.exactWindowsOwner,
+          ),
+      }).pipe(Effect.asVoid);
+    let supervisor = windowsJobNodeProcessSupervisor(owner.process);
+    if (!supervisor && owner.prepared) {
+      try {
+        supervisor = supervisePreparedNodeProcess(owner.prepared, owner.process, {
+          platform,
+          ...(platform === "win32" ? {} : { ownedProcessGroupId: rootPid }),
+        });
+      } catch (cause) {
+        return emergencyTeardown(cause);
+      }
+    }
+    if (!supervisor) {
+      return emergencyTeardown(
+        new Error("Contained Claude process has no retained shared supervisor."),
+      );
+    }
+    return Effect.tryPromise({
+      try: supervisor.teardown,
+      catch: (cause) => normalizeProviderHealthExitFailure(cause, rootPid, owner.exactWindowsOwner),
+    }).pipe(Effect.asVoid);
+  };
+  const recordOwner = (input: {
+    readonly process: import("node:child_process").ChildProcess;
+    readonly prepared?: ReturnType<typeof prepareWindowsProviderProcess>;
+  }) => {
+    const exactWindowsOwner = platform === "win32";
+    const owner: ClaudeProbeProcessOwner = {
+      sequence: nextOwnerSequence,
+      process: input.process,
+      ...(input.prepared ? { prepared: input.prepared } : {}),
+      exactWindowsOwner,
+      ...(recordedSupervisionFailure ? { supervisionFailure: recordedSupervisionFailure } : {}),
+    };
+    nextOwnerSequence += 1;
+    owners.push(owner);
+    if (processOptions.maintenanceOwnedResources) {
+      owner.registrationPromise = Effect.runPromise(
+        processOptions.maintenanceOwnedResources.register({
+          provider: CLAUDE_AGENT_PROVIDER,
+          resourceId: `provider-health-subscription-probe:${String(owner.sequence)}`,
+          close: () => closeOwner(owner).pipe(Effect.tapError(reportUnprovenExit)),
+        }),
+      );
+    }
+    return owner;
+  };
   return Effect.tryPromise(async () => {
-    const q = claudeQuery({
+    const q = (processOptions.queryClaude ?? claudeQuery)({
       // oxlint-disable-next-line require-yield
       prompt: (async function* (): AsyncGenerator<SDKUserMessage> {
         await waitForAbortSignal(abort.signal);
@@ -650,15 +781,77 @@ const probeClaudeSubscription = () => {
         settingSources: ["user", "project", "local"],
         allowedTools: [],
         stderr: () => {},
+        spawnClaudeCodeProcess: (options: ClaudeSpawnOptions) => {
+          let spawnedOwner: ClaudeProbeProcessOwner | undefined;
+          const process = (
+            processOptions.spawnContainedClaudeProcess ?? spawnContainedClaudeSdkProcess
+          )(options, {
+            platform,
+            ...(processOptions.prepareProcess
+              ? { prepareProcess: processOptions.prepareProcess }
+              : {}),
+            onSpawnedProcess: ({ prepared, process }) => {
+              spawnedOwner = recordOwner({ prepared, process });
+            },
+            onSupervisionError: recordSupervisionFailure,
+          }) as unknown as ClaudeSpawnedProcess & import("node:child_process").ChildProcess;
+          const owner =
+            spawnedOwner ??
+            owners.find((candidate) => candidate.process === process) ??
+            recordOwner({ process });
+          if (recordedSupervisionFailure) {
+            owner.supervisionFailure ??= recordedSupervisionFailure;
+          }
+          const supervisor = windowsJobNodeProcessSupervisor(process);
+          const rootPid = Number(process.pid);
+          const missingSupervisorError =
+            !supervisor && Number.isInteger(rootPid) && rootPid > 0
+              ? normalizeProviderHealthExitFailure(
+                  new Error("Contained Claude process has no retained shared supervisor."),
+                  rootPid,
+                  owner.exactWindowsOwner,
+                )
+              : undefined;
+          if (missingSupervisorError) throw missingSupervisorError;
+          return process as unknown as ClaudeSpawnedProcess;
+        },
       },
     });
-    const init = await q.initializationResult();
+    const init = await Promise.race([q.initializationResult(), supervisionFailure]);
     return { subscriptionType: init.account?.subscriptionType };
   }).pipe(
     Effect.ensuring(
-      Effect.sync(() => {
+      Effect.tryPromise(async () => {
         if (!abort.signal.aborted) abort.abort();
-      }),
+        const failures: unknown[] = [];
+        for (const owner of owners) {
+          let registration: ProviderMaintenanceOwnedResourceRegistration | undefined;
+          try {
+            registration = await owner.registrationPromise;
+          } catch (cause) {
+            failures.push(cause);
+          }
+          try {
+            await Effect.runPromise(closeOwner(owner));
+            if (registration) await Effect.runPromise(registration.unregister);
+          } catch (cause) {
+            const error = normalizeProviderHealthExitFailure(
+              cause,
+              Number(owner.process.pid),
+              owner.exactWindowsOwner,
+            );
+            failures.push(error);
+            await Effect.runPromise(reportUnprovenExit(error));
+          }
+        }
+        if (failures.length === 1) throw failures[0];
+        if (failures.length > 1) {
+          throw new AggregateError(
+            failures,
+            "Contained Claude health processes did not all close.",
+          );
+        }
+      }).pipe(Effect.ignore),
     ),
     Effect.timeoutOption(CAPABILITIES_PROBE_TIMEOUT_MS),
     Effect.result,
@@ -824,37 +1017,155 @@ const collectStreamAsString = <E>(stream: Stream.Stream<Uint8Array, E>): Effect.
     (acc, chunk) => acc + new TextDecoder().decode(chunk),
   );
 
+export interface ProviderHealthProcessOptions {
+  readonly platform?: NodeJS.Platform;
+  readonly prepareProcess?: typeof prepareWindowsProviderProcess;
+  readonly prepareResolvedProcess?: typeof prepareResolvedWindowsProviderProcess;
+  readonly superviseProcess?: typeof supervisePreparedEffectProcess;
+  readonly processTreeKiller?: ProcessTreeKiller;
+  readonly teardownProcessTree?: typeof teardownProviderProcessTree;
+  readonly windowsJobSupervisorOptions?: Pick<
+    SupervisePreparedEffectProcessOptions,
+    "requestStop" | "verifyExit" | "windowsExitTimeoutMs"
+  >;
+  readonly maintenanceOwnedResources?: ProviderMaintenanceOwnedResourceCoordinator;
+  readonly onUnprovenExit?: (input: {
+    readonly provider: ProviderKind;
+    readonly error: ProviderProcessExitUnprovenError;
+  }) => Effect.Effect<void>;
+  readonly spawnContainedClaudeProcess?: typeof spawnContainedClaudeSdkProcess;
+  readonly queryClaude?: typeof claudeQuery;
+}
+
 const runProviderCommand = (
+  provider: ProviderKind,
   executable: string,
   args: ReadonlyArray<string>,
   env: NodeJS.ProcessEnv,
   executableAlreadyResolved = false,
   teardownProcessTree: typeof teardownProviderProcessTree = teardownProviderProcessTree,
+  processOptions: ProviderHealthProcessOptions = {},
 ) =>
   Effect.gen(function* () {
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+    const platform = processOptions.platform ?? process.platform;
     const prepared = executableAlreadyResolved
-      ? prepareResolvedWindowsSafeProcess(executable, args, { env })
-      : prepareWindowsSafeProcess(executable, args, { env });
+      ? (processOptions.prepareResolvedProcess ?? prepareResolvedWindowsProviderProcess)(
+          executable,
+          args,
+          { env, platform },
+        )
+      : (processOptions.prepareProcess ?? prepareWindowsProviderProcess)(executable, args, {
+          env,
+          platform,
+        });
+    const exactWindowsOwner = isWindowsJobPreparedCommand(prepared);
     const command = ChildProcess.make(prepared.command, prepared.args, {
       shell: prepared.shell,
+      ...(prepared.windowsHide ? { windowsHide: true } : {}),
       ...(prepared.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
       env,
       // Health probes are non-interactive. Leaving stdin as a pipe can keep CLIs
       // such as Antigravity waiting even after a read-only subcommand has finished.
       stdin: "ignore",
+      detached: platform !== "win32",
+      // Effect's child finalizer remains the provisional owner until the exact prepared-command
+      // supervisor and its later (LIFO) finalizer are installed below.
     });
 
-    const child = yield* spawner.spawn(command);
-    let completed = false;
-    yield* Effect.addFinalizer(() =>
-      completed
-        ? Effect.void
-        : Effect.tryPromise({
-            try: () => teardownEffectProcessTree(child, teardownProcessTree),
-            catch: (error) => (error instanceof Error ? error : new Error(String(error))),
-          }).pipe(Effect.asVoid, Effect.ignore),
+    const owned = yield* Effect.uninterruptible(
+      Effect.gen(function* () {
+        const child = yield* spawner.spawn(command);
+        let unprovenExitReported = false;
+        const reportUnprovenExit = (cause: unknown, rootPid = Number(child.pid)) => {
+          const error = normalizeProviderHealthExitFailure(cause, rootPid, exactWindowsOwner);
+          return Effect.uninterruptible(
+            Effect.suspend(() => {
+              if (unprovenExitReported) return Effect.void;
+              unprovenExitReported = true;
+              return processOptions.onUnprovenExit?.({ provider, error }) ?? Effect.void;
+            }),
+          );
+        };
+        const rootPid = Number(child.pid);
+        const installation = yield* Effect.try({
+          try: () =>
+            installPreparedEffectProcessSupervisor(
+              prepared,
+              child,
+              {
+                ...processOptions.windowsJobSupervisorOptions,
+                platform,
+                ...(processOptions.processTreeKiller
+                  ? { processTreeKiller: processOptions.processTreeKiller }
+                  : {}),
+                teardownProcessTree: processOptions.teardownProcessTree ?? teardownProcessTree,
+                ...(platform === "win32" ? {} : { ownedProcessGroupId: rootPid }),
+              },
+              processOptions.superviseProcess,
+            ),
+          catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause))),
+        });
+        const supervisor = installation.supervisor;
+        let completed = false;
+        let registration: ProviderMaintenanceOwnedResourceRegistration | undefined;
+        const teardownOwner = Effect.tryPromise({
+          try: supervisor.teardown,
+          catch: (error) => normalizeProviderHealthExitFailure(error, rootPid, exactWindowsOwner),
+        });
+        // Register the exact owner before any fallible maintenance publication. On scope unwind it
+        // runs before Effect's provisional process finalizer, preserving exact proof as the normal
+        // path while still covering default-constructor and registration failures.
+        yield* Effect.addFinalizer(() =>
+          completed
+            ? Effect.void
+            : teardownOwner.pipe(
+                Effect.andThen(registration?.unregister ?? Effect.void),
+                Effect.tapError(reportUnprovenExit),
+                Effect.asVoid,
+                Effect.ignore,
+              ),
+        );
+        registration = processOptions.maintenanceOwnedResources
+          ? yield* processOptions.maintenanceOwnedResources.register({
+              provider,
+              resourceId: `provider-health-probe:${String(supervisor.rootPid)}`,
+              close: () => teardownOwner.pipe(Effect.tapError(reportUnprovenExit), Effect.asVoid),
+            })
+          : undefined;
+        if (installation._tag === "Recovered") {
+          const recoveryResult = yield* teardownOwner.pipe(
+            Effect.tapError(reportUnprovenExit),
+            Effect.result,
+          );
+          if (Result.isFailure(recoveryResult)) {
+            // The durable registry now owns the failed fallback. Do not immediately retry the
+            // same retained owner again from this scope's finalizer.
+            if (registration) completed = true;
+            return yield* Effect.fail(recoveryResult.failure);
+          }
+          if (registration) yield* registration.unregister;
+          completed = true;
+          const requestedFailure = installation.requestedSupervisorFailure;
+          return yield* Effect.fail(
+            requestedFailure instanceof Error
+              ? requestedFailure
+              : new Error(String(requestedFailure)),
+          );
+        }
+        return {
+          child,
+          supervisor,
+          reportUnprovenExit,
+          markCompleted: Effect.uninterruptible(
+            (registration?.unregister ?? Effect.void).pipe(
+              Effect.andThen(Effect.sync(() => void (completed = true))),
+            ),
+          ),
+        };
+      }),
     );
+    const { child, supervisor } = owned;
 
     const [stdout, stderr, exitCode] = yield* Effect.all(
       [
@@ -864,7 +1175,12 @@ const runProviderCommand = (
       ],
       { concurrency: "unbounded" },
     );
-    completed = true;
+    yield* Effect.tryPromise({
+      try: supervisor.proveExit,
+      catch: (error) =>
+        normalizeProviderHealthExitFailure(error, supervisor.rootPid, exactWindowsOwner),
+    }).pipe(Effect.tapError(owned.reportUnprovenExit));
+    yield* owned.markCompleted;
 
     return { stdout, stderr, code: exitCode } satisfies CommandResult;
   }).pipe(Effect.scoped);
@@ -873,8 +1189,17 @@ const runCodexCommand = (
   args: ReadonlyArray<string>,
   executable = "codex",
   env: NodeJS.ProcessEnv = providerCommandEnv(CODEX_PROVIDER),
+  processOptions: ProviderHealthProcessOptions = {},
 ) =>
-  runProviderCommand(executable, args, env, true).pipe(
+  runProviderCommand(
+    CODEX_PROVIDER,
+    executable,
+    args,
+    env,
+    true,
+    teardownProviderProcessTree,
+    processOptions,
+  ).pipe(
     Effect.flatMap((result) =>
       isWindowsShellCommandMissingResult({ code: result.code, stderr: result.stderr })
         ? Effect.fail(new Error(`spawn ${executable} ENOENT`))
@@ -886,13 +1211,16 @@ const runCommandCodeCommand = (
   args: ReadonlyArray<string>,
   executable = "commandcode",
   teardownProcessTree: typeof teardownProviderProcessTree = teardownProviderProcessTree,
+  processOptions: ProviderHealthProcessOptions = {},
 ) =>
   runProviderCommand(
+    COMMAND_CODE_PROVIDER,
     executable,
     args,
     providerCommandEnv(COMMAND_CODE_PROVIDER),
     true,
     teardownProcessTree,
+    processOptions,
   ).pipe(
     Effect.flatMap((result) =>
       isWindowsShellCommandMissingResult({ code: result.code, stderr: result.stderr })
@@ -905,8 +1233,17 @@ const runClaudeCommand = (
   args: ReadonlyArray<string>,
   executable = "claude",
   env: NodeJS.ProcessEnv = buildClaudeProcessEnv(),
+  processOptions: ProviderHealthProcessOptions = {},
 ) =>
-  runProviderCommand(executable, args, env).pipe(
+  runProviderCommand(
+    CLAUDE_AGENT_PROVIDER,
+    executable,
+    args,
+    env,
+    false,
+    teardownProviderProcessTree,
+    processOptions,
+  ).pipe(
     Effect.flatMap((result) =>
       isWindowsShellCommandMissingResult({ code: result.code, stderr: result.stderr })
         ? Effect.fail(new Error(`spawn ${executable} ENOENT`))
@@ -914,8 +1251,20 @@ const runClaudeCommand = (
     ),
   );
 
-const runGrokCommand = (args: ReadonlyArray<string>, executable = "grok") =>
-  runProviderCommand(executable, args, providerCommandEnv(GROK_PROVIDER)).pipe(
+const runGrokCommand = (
+  args: ReadonlyArray<string>,
+  executable = "grok",
+  processOptions: ProviderHealthProcessOptions = {},
+) =>
+  runProviderCommand(
+    GROK_PROVIDER,
+    executable,
+    args,
+    providerCommandEnv(GROK_PROVIDER),
+    false,
+    teardownProviderProcessTree,
+    processOptions,
+  ).pipe(
     Effect.flatMap((result) =>
       isWindowsShellCommandMissingResult({ code: result.code, stderr: result.stderr })
         ? Effect.fail(new Error(`spawn ${executable} ENOENT`))
@@ -923,8 +1272,20 @@ const runGrokCommand = (args: ReadonlyArray<string>, executable = "grok") =>
     ),
   );
 
-const runOpenCodeCommand = (args: ReadonlyArray<string>, executable = "opencode") =>
-  runProviderCommand(executable, args, providerCommandEnv(OPENCODE_PROVIDER)).pipe(
+const runOpenCodeCommand = (
+  args: ReadonlyArray<string>,
+  executable = "opencode",
+  processOptions: ProviderHealthProcessOptions = {},
+) =>
+  runProviderCommand(
+    OPENCODE_PROVIDER,
+    executable,
+    args,
+    providerCommandEnv(OPENCODE_PROVIDER),
+    false,
+    teardownProviderProcessTree,
+    processOptions,
+  ).pipe(
     Effect.flatMap((result) =>
       isWindowsShellCommandMissingResult({ code: result.code, stderr: result.stderr })
         ? Effect.fail(new Error(`spawn ${executable} ENOENT`))
@@ -932,8 +1293,20 @@ const runOpenCodeCommand = (args: ReadonlyArray<string>, executable = "opencode"
     ),
   );
 
-const runKiloCommand = (args: ReadonlyArray<string>, executable = "kilo") =>
-  runProviderCommand(executable, args, providerCommandEnv(KILO_PROVIDER)).pipe(
+const runKiloCommand = (
+  args: ReadonlyArray<string>,
+  executable = "kilo",
+  processOptions: ProviderHealthProcessOptions = {},
+) =>
+  runProviderCommand(
+    KILO_PROVIDER,
+    executable,
+    args,
+    providerCommandEnv(KILO_PROVIDER),
+    false,
+    teardownProviderProcessTree,
+    processOptions,
+  ).pipe(
     Effect.flatMap((result) =>
       isWindowsShellCommandMissingResult({ code: result.code, stderr: result.stderr })
         ? Effect.fail(new Error(`spawn ${executable} ENOENT`))
@@ -944,9 +1317,18 @@ const runKiloCommand = (args: ReadonlyArray<string>, executable = "kilo") =>
 const runCursorCommand = (
   args: ReadonlyArray<string>,
   executable = DEFAULT_CURSOR_AGENT_BINARY,
+  processOptions: ProviderHealthProcessOptions = {},
 ) => {
   const command = buildCursorAgentCommand(executable, args);
-  return runProviderCommand(command.command, command.args, buildCursorAgentHeadlessEnv()).pipe(
+  return runProviderCommand(
+    CURSOR_PROVIDER,
+    command.command,
+    command.args,
+    buildCursorAgentHeadlessEnv(),
+    false,
+    teardownProviderProcessTree,
+    processOptions,
+  ).pipe(
     Effect.flatMap((result) =>
       isWindowsShellCommandMissingResult({ code: result.code, stderr: result.stderr })
         ? Effect.fail(new Error(`spawn ${command.command} ENOENT`))
@@ -1027,8 +1409,20 @@ function cursorModelsOutputHasNoModels(output: string): boolean {
   return output.toLowerCase().includes("no models available");
 }
 
-const runPiCommand = (args: ReadonlyArray<string>, executable = "pi") =>
-  runProviderCommand(executable, args, providerCommandEnv(PI_PROVIDER)).pipe(
+const runPiCommand = (
+  args: ReadonlyArray<string>,
+  executable = "pi",
+  processOptions: ProviderHealthProcessOptions = {},
+) =>
+  runProviderCommand(
+    PI_PROVIDER,
+    executable,
+    args,
+    providerCommandEnv(PI_PROVIDER),
+    false,
+    teardownProviderProcessTree,
+    processOptions,
+  ).pipe(
     Effect.flatMap((result) =>
       isWindowsShellCommandMissingResult({ code: result.code, stderr: result.stderr })
         ? Effect.fail(new Error(`spawn ${executable} ENOENT`))
@@ -1036,8 +1430,20 @@ const runPiCommand = (args: ReadonlyArray<string>, executable = "pi") =>
     ),
   );
 
-const runAntigravityCommand = (args: ReadonlyArray<string>, executable = "agy") =>
-  runProviderCommand(executable, args, providerCommandEnv(ANTIGRAVITY_PROVIDER)).pipe(
+const runAntigravityCommand = (
+  args: ReadonlyArray<string>,
+  executable = "agy",
+  processOptions: ProviderHealthProcessOptions = {},
+) =>
+  runProviderCommand(
+    ANTIGRAVITY_PROVIDER,
+    executable,
+    args,
+    providerCommandEnv(ANTIGRAVITY_PROVIDER),
+    false,
+    teardownProviderProcessTree,
+    processOptions,
+  ).pipe(
     Effect.flatMap((result) =>
       isWindowsShellCommandMissingResult({ code: result.code, stderr: result.stderr })
         ? Effect.fail(new Error(`spawn ${executable} ENOENT`))
@@ -1080,6 +1486,7 @@ const hasCustomModelProviderForEnv = (env: NodeJS.ProcessEnv) =>
 export const makeCheckCodexProviderStatus = (
   binaryPath?: string,
   homePath?: string,
+  processOptions: ProviderHealthProcessOptions = {},
 ): Effect.Effect<
   ServerProviderStatus,
   never,
@@ -1093,7 +1500,7 @@ export const makeCheckCodexProviderStatus = (
 
     // Probe 1: `codex --version` — is the CLI reachable?
     const versionProbe = yield* probeProviderCliVersion(
-      runCodexCommand(["--version"], executable, probeEnv),
+      runCodexCommand(["--version"], executable, probeEnv, processOptions),
       DEFAULT_TIMEOUT_MS,
     );
 
@@ -1169,10 +1576,12 @@ export const makeCheckCodexProviderStatus = (
       } satisfies ServerProviderStatus;
     }
 
-    const authProbe = yield* runCodexCommand(["login", "status"], executable, probeEnv).pipe(
-      Effect.timeoutOption(DEFAULT_TIMEOUT_MS),
-      Effect.result,
-    );
+    const authProbe = yield* runCodexCommand(
+      ["login", "status"],
+      executable,
+      probeEnv,
+      processOptions,
+    ).pipe(Effect.timeoutOption(DEFAULT_TIMEOUT_MS), Effect.result);
 
     if (Result.isFailure(authProbe)) {
       const error = authProbe.failure;
@@ -1279,7 +1688,9 @@ export function parseCommandCodeStatusJson(stdout: string): CommandCodeStatusJso
 
 export const makeCheckCommandCodeProviderStatus = (
   binaryPath?: string,
-  options?: { readonly teardownProcessTree?: typeof teardownProviderProcessTree },
+  options?: ProviderHealthProcessOptions & {
+    readonly teardownProcessTree?: typeof teardownProviderProcessTree;
+  },
 ): Effect.Effect<ServerProviderStatus, never, ChildProcessSpawner.ChildProcessSpawner> =>
   Effect.gen(function* () {
     const checkedAt = new Date().toISOString();
@@ -1287,7 +1698,7 @@ export const makeCheckCommandCodeProviderStatus = (
     const configured = nonEmptyTrimmed(binaryPath) ?? "commandcode";
     const executable = resolveCommandCodeCliExecutable(configured, { env });
     const versionProbe = yield* probeProviderCliVersion(
-      runCommandCodeCommand(["--version"], executable, options?.teardownProcessTree),
+      runCommandCodeCommand(["--version"], executable, options?.teardownProcessTree, options),
       COMMAND_CODE_HEALTH_TIMEOUT_MS,
     );
 
@@ -1336,6 +1747,7 @@ export const makeCheckCommandCodeProviderStatus = (
       ["status", "--json"],
       executable,
       options?.teardownProcessTree,
+      options,
     ).pipe(Effect.timeoutOption(COMMAND_CODE_HEALTH_TIMEOUT_MS), Effect.result);
     if (Result.isFailure(authProbe)) {
       return {
@@ -1405,7 +1817,7 @@ export const makeCheckClaudeProviderStatus = (
   resolveSubscriptionType?: Effect.Effect<string | undefined>,
   binaryPath?: string,
   homeDir?: string,
-  options?: { readonly falseNegativeRetryDelayMs?: number },
+  options?: ProviderHealthProcessOptions & { readonly falseNegativeRetryDelayMs?: number },
 ): Effect.Effect<ServerProviderStatus, never, ChildProcessSpawner.ChildProcessSpawner> =>
   Effect.gen(function* () {
     const checkedAt = new Date().toISOString();
@@ -1416,7 +1828,7 @@ export const makeCheckClaudeProviderStatus = (
 
     // Probe 1: `claude --version` — is the CLI reachable?
     const versionProbe = yield* probeProviderCliVersion(
-      runClaudeCommand(["--version"], executable, claudeEnv),
+      runClaudeCommand(["--version"], executable, claudeEnv, options),
       CLAUDE_HEALTH_TIMEOUT_MS,
     );
 
@@ -1471,7 +1883,7 @@ export const makeCheckClaudeProviderStatus = (
     const runAuthStatusProbe = Effect.acquireUseRelease(
       Effect.promise(() => acquireClaudeAuthStatusLock()),
       () =>
-        runClaudeCommand(["auth", "status"], executable, claudeEnv).pipe(
+        runClaudeCommand(["auth", "status"], executable, claudeEnv, options).pipe(
           Effect.timeoutOption(CLAUDE_HEALTH_TIMEOUT_MS),
         ),
       (release) => Effect.sync(release),
@@ -1587,13 +1999,14 @@ export const checkClaudeProviderStatus = makeCheckClaudeProviderStatus();
 
 export const makeCheckGrokProviderStatus = (
   binaryPath?: string,
+  processOptions: ProviderHealthProcessOptions = {},
 ): Effect.Effect<ServerProviderStatus, never, ChildProcessSpawner.ChildProcessSpawner> =>
   Effect.gen(function* () {
     const checkedAt = new Date().toISOString();
     const executable = nonEmptyTrimmed(binaryPath) ?? "grok";
 
     const versionProbe = yield* probeProviderCliVersion(
-      runGrokCommand(["--version"], executable),
+      runGrokCommand(["--version"], executable, processOptions),
       DEFAULT_TIMEOUT_MS,
     );
 
@@ -1661,18 +2074,31 @@ export const checkGrokProviderStatus = makeCheckGrokProviderStatus();
 
 // ── Droid health check ─────────────────────────────────────────────
 
-const runDroidCommand = (args: ReadonlyArray<string>, executable = "droid") =>
-  runProviderCommand(executable, args, providerCommandEnv(DROID_PROVIDER));
+const runDroidCommand = (
+  args: ReadonlyArray<string>,
+  executable = "droid",
+  processOptions: ProviderHealthProcessOptions = {},
+) =>
+  runProviderCommand(
+    DROID_PROVIDER,
+    executable,
+    args,
+    providerCommandEnv(DROID_PROVIDER),
+    false,
+    teardownProviderProcessTree,
+    processOptions,
+  );
 
 export const makeCheckDroidProviderStatus = (
   binaryPath?: string,
+  processOptions: ProviderHealthProcessOptions = {},
 ): Effect.Effect<ServerProviderStatus, never, ChildProcessSpawner.ChildProcessSpawner> =>
   Effect.gen(function* () {
     const checkedAt = new Date().toISOString();
     const executable = resolveDroidCliBinaryPath(nonEmptyTrimmed(binaryPath) ?? undefined);
 
     const versionProbe = yield* probeProviderCliVersion(
-      runDroidCommand(["--version"], executable),
+      runDroidCommand(["--version"], executable, processOptions),
       DEFAULT_TIMEOUT_MS,
     );
 
@@ -1742,13 +2168,14 @@ export const checkDroidProviderStatus = makeCheckDroidProviderStatus();
 
 export const makeCheckOpenCodeProviderStatus = (
   binaryPath?: string,
+  processOptions: ProviderHealthProcessOptions = {},
 ): Effect.Effect<ServerProviderStatus, never, ChildProcessSpawner.ChildProcessSpawner> =>
   Effect.gen(function* () {
     const checkedAt = new Date().toISOString();
     const executable = nonEmptyTrimmed(binaryPath) ?? "opencode";
 
     const versionProbe = yield* probeProviderCliVersion(
-      runOpenCodeCommand(["--version"], executable),
+      runOpenCodeCommand(["--version"], executable, processOptions),
       OPENCODE_HEALTH_TIMEOUT_MS,
     );
 
@@ -1813,13 +2240,14 @@ export const checkOpenCodeProviderStatus = makeCheckOpenCodeProviderStatus();
 
 export const makeCheckKiloProviderStatus = (
   binaryPath?: string,
+  processOptions: ProviderHealthProcessOptions = {},
 ): Effect.Effect<ServerProviderStatus, never, ChildProcessSpawner.ChildProcessSpawner> =>
   Effect.gen(function* () {
     const checkedAt = new Date().toISOString();
     const executable = nonEmptyTrimmed(binaryPath) ?? "kilo";
 
     const versionProbe = yield* probeProviderCliVersion(
-      runKiloCommand(["--version"], executable),
+      runKiloCommand(["--version"], executable, processOptions),
       DEFAULT_TIMEOUT_MS,
     );
 
@@ -1884,13 +2312,14 @@ export const checkKiloProviderStatus = makeCheckKiloProviderStatus();
 export const checkPiProviderStatus = (
   agentDir?: string,
   binaryPath?: string,
+  processOptions: ProviderHealthProcessOptions = {},
 ): Effect.Effect<ServerProviderStatus, never, ChildProcessSpawner.ChildProcessSpawner> =>
   Effect.gen(function* () {
     const checkedAt = new Date().toISOString();
     const executable = nonEmptyTrimmed(binaryPath) ?? "pi";
 
     const versionProbe = yield* probeProviderCliVersion(
-      runPiCommand(["--version"], executable),
+      runPiCommand(["--version"], executable, processOptions),
       DEFAULT_TIMEOUT_MS,
     );
 
@@ -1958,12 +2387,13 @@ export const checkPiProviderStatus = (
 
 export const checkAntigravityProviderStatus = (
   binaryPath?: string,
+  processOptions: ProviderHealthProcessOptions = {},
 ): Effect.Effect<ServerProviderStatus, never, ChildProcessSpawner.ChildProcessSpawner> =>
   Effect.gen(function* () {
     const checkedAt = new Date().toISOString();
     const executable = nonEmptyTrimmed(binaryPath) ?? "agy";
     const versionProbe = yield* probeProviderCliVersion(
-      runAntigravityCommand(["--version"], executable),
+      runAntigravityCommand(["--version"], executable, processOptions),
       DEFAULT_TIMEOUT_MS,
     );
     if (versionProbe.outcome === "missing" || versionProbe.outcome === "failure") {
@@ -2016,7 +2446,7 @@ export const checkAntigravityProviderStatus = (
         message: `Antigravity CLI ${parsedVersion} is too old for Synara. Upgrade to ${MINIMUM_ANTIGRAVITY_CLI_VERSION} or newer.`,
       } satisfies ServerProviderStatus;
     }
-    const models = yield* runAntigravityCommand(["models"], executable).pipe(
+    const models = yield* runAntigravityCommand(["models"], executable, processOptions).pipe(
       Effect.timeoutOption(CLAUDE_HEALTH_TIMEOUT_MS),
       Effect.result,
     );
@@ -2051,13 +2481,14 @@ export const checkAntigravityProviderStatus = (
 
 export const makeCheckCursorProviderStatus = (
   binaryPath?: string,
+  processOptions: ProviderHealthProcessOptions = {},
 ): Effect.Effect<ServerProviderStatus, never, ChildProcessSpawner.ChildProcessSpawner> =>
   Effect.gen(function* () {
     const checkedAt = new Date().toISOString();
     const executable = resolveCursorAgentBinaryPath(nonEmptyTrimmed(binaryPath));
 
     const versionProbe = yield* probeProviderCliVersion(
-      runCursorCommand(["--version"], executable),
+      runCursorCommand(["--version"], executable, processOptions),
       DEFAULT_TIMEOUT_MS,
     );
 
@@ -2105,7 +2536,7 @@ export const makeCheckCursorProviderStatus = (
     const version = versionProbe.result;
     const parsedVersion = parseGenericCliVersion(`${version.stdout}\n${version.stderr}`);
 
-    const authProbe = yield* runCursorCommand(["status"], executable).pipe(
+    const authProbe = yield* runCursorCommand(["status"], executable, processOptions).pipe(
       Effect.timeoutOption(DEFAULT_TIMEOUT_MS),
       Effect.result,
     );
@@ -2152,7 +2583,7 @@ export const makeCheckCursorProviderStatus = (
       } satisfies ServerProviderStatus;
     }
 
-    const modelsProbe = yield* runCursorCommand(["models"], executable).pipe(
+    const modelsProbe = yield* runCursorCommand(["models"], executable, processOptions).pipe(
       Effect.timeoutOption(DEFAULT_TIMEOUT_MS),
       Effect.result,
     );
@@ -2434,14 +2865,29 @@ export function projectProviderStatusesForSettings(
 
 // ── Layer ───────────────────────────────────────────────────────────
 
-export function makeProviderHealthLive(options?: {
-  readonly providerUpdateTimeoutMs?: number;
-  readonly maintenanceGate?: ProviderMaintenanceGate;
-  readonly maintenanceOwnedResources?: ProviderMaintenanceOwnedResourceCoordinator;
-  readonly processTreeKiller?: ProcessTreeKiller;
-  readonly teardownProcessTree?: typeof teardownProviderProcessTree;
-}) {
+export function makeProviderHealthLive(
+  options?: ProviderHealthProcessOptions & {
+    readonly providerUpdateTimeoutMs?: number;
+    readonly maintenanceGate?: ProviderMaintenanceGate;
+  },
+) {
   const providerUpdateTimeoutMs = options?.providerUpdateTimeoutMs ?? PROVIDER_UPDATE_TIMEOUT_MS;
+  const platform = options?.platform ?? process.platform;
+  const baseProviderProcessOptions: ProviderHealthProcessOptions = {
+    platform,
+    ...(options?.prepareProcess ? { prepareProcess: options.prepareProcess } : {}),
+    ...(options?.prepareResolvedProcess
+      ? { prepareResolvedProcess: options.prepareResolvedProcess }
+      : {}),
+    ...(options?.superviseProcess ? { superviseProcess: options.superviseProcess } : {}),
+    ...(options?.windowsJobSupervisorOptions
+      ? { windowsJobSupervisorOptions: options.windowsJobSupervisorOptions }
+      : {}),
+    ...(options?.spawnContainedClaudeProcess
+      ? { spawnContainedClaudeProcess: options.spawnContainedClaudeProcess }
+      : {}),
+    ...(options?.queryClaude ? { queryClaude: options.queryClaude } : {}),
+  };
   return Layer.effect(
     ProviderHealth,
     Effect.gen(function* () {
@@ -2455,6 +2901,28 @@ export function makeProviderHealthLive(options?: {
       const maintenanceOwnedResources =
         options?.maintenanceOwnedResources ??
         (yield* makeProviderMaintenanceOwnedResourceCoordinator);
+      const unprovenHealthProbeExitsRef = yield* Ref.make<
+        ReadonlyMap<ProviderKind, ProviderProcessExitUnprovenError>
+      >(new Map());
+      const onUnprovenExit: NonNullable<ProviderHealthProcessOptions["onUnprovenExit"]> = (input) =>
+        Ref.update(unprovenHealthProbeExitsRef, (previous) => {
+          const next = new Map(previous);
+          if (!next.has(input.provider)) next.set(input.provider, input.error);
+          return next;
+        }).pipe(
+          Effect.andThen(
+            maintenanceGate.latchProvider({
+              provider: input.provider,
+              reason: input.error.message,
+            }),
+          ),
+          Effect.andThen(options?.onUnprovenExit?.(input) ?? Effect.void),
+        );
+      const providerProcessOptions: ProviderHealthProcessOptions = {
+        ...baseProviderProcessOptions,
+        maintenanceOwnedResources,
+        onUnprovenExit,
+      };
       const teardownProcessTree = options?.teardownProcessTree ?? teardownProviderProcessTree;
       const changesPubSub = yield* Effect.acquireRelease(
         PubSub.unbounded<ReadonlyArray<ServerProviderStatus>>(),
@@ -2523,7 +2991,7 @@ export function makeProviderHealthLive(options?: {
       const claudeSubscriptionCache = yield* Cache.make({
         capacity: 1,
         timeToLive: Duration.minutes(5),
-        lookup: (_: "claude") => probeClaudeSubscription(),
+        lookup: (_: "claude") => probeClaudeSubscription(providerProcessOptions),
       });
       const resolveClaudeSubscription = Cache.get(claudeSubscriptionCache, "claude").pipe(
         Effect.map((probe) => probe?.subscriptionType),
@@ -2604,7 +3072,7 @@ export function makeProviderHealthLive(options?: {
               : provider === CURSOR_PROVIDER
                 ? resolveCursorAgentBinaryPath(configuredBinaryPath)
                 : provider === DROID_PROVIDER
-                  ? process.platform === "win32"
+                  ? platform === "win32"
                     ? (configuredBinaryPath ?? "droid")
                     : resolveDroidCliBinaryPath(configuredBinaryPath ?? undefined)
                   : configuredBinaryPath;
@@ -2623,7 +3091,7 @@ export function makeProviderHealthLive(options?: {
           {
             binaryPath,
             env: commandEnv,
-            platform: process.platform,
+            platform,
           },
         ).pipe(Effect.provideService(FileSystem.FileSystem, fileSystem));
         if (primaryCapabilities.update !== null) {
@@ -2633,7 +3101,7 @@ export function makeProviderHealthLive(options?: {
           const capabilities = yield* resolveProviderMaintenanceCapabilitiesEffect(definition, {
             binaryPath,
             env: commandEnv,
-            platform: process.platform,
+            platform,
           }).pipe(Effect.provideService(FileSystem.FileSystem, fileSystem));
           if (capabilities.update !== null) {
             return capabilities;
@@ -2806,11 +3274,11 @@ export function makeProviderHealthLive(options?: {
         });
       });
 
-      const checkProviderWhenEnabled = <R>(
+      const checkProviderWhenEnabled = <E, R>(
         settings: ServerSettings,
         provider: ProviderKind,
-        check: Effect.Effect<ServerProviderStatus, never, R>,
-      ): Effect.Effect<Option.Option<ServerProviderStatus>, never, R> =>
+        check: Effect.Effect<ServerProviderStatus, E, R>,
+      ): Effect.Effect<Option.Option<ServerProviderStatus>, E, R> =>
         isProviderEnabledForSettings(provider, settings)
           ? maintenanceGate
               .withOperation({
@@ -2829,47 +3297,80 @@ export function makeProviderHealthLive(options?: {
       const checkProviderStatusForSettings = (
         settings: ServerSettings,
         provider: ProviderKind,
-      ): Effect.Effect<ServerProviderStatus> => {
+      ): Effect.Effect<ServerProviderStatus, ProviderProcessExitUnprovenError> => {
         const check = (() => {
           switch (provider) {
             case CODEX_PROVIDER:
               return makeCheckCodexProviderStatus(
                 settings.providers.codex.binaryPath,
                 settings.providers.codex.homePath,
+                providerProcessOptions,
               );
             case COMMAND_CODE_PROVIDER:
               return makeCheckCommandCodeProviderStatus(settings.providers.commandCode.binaryPath, {
                 teardownProcessTree,
+                ...providerProcessOptions,
               });
             case CLAUDE_AGENT_PROVIDER:
               return makeCheckClaudeProviderStatus(
                 resolveClaudeSubscription,
                 settings.providers.claudeAgent.binaryPath,
                 serverConfig.homeDir,
+                providerProcessOptions,
               );
             case CURSOR_PROVIDER:
-              return makeCheckCursorProviderStatus(settings.providers.cursor.binaryPath);
+              return makeCheckCursorProviderStatus(
+                settings.providers.cursor.binaryPath,
+                providerProcessOptions,
+              );
             case ANTIGRAVITY_PROVIDER:
-              return checkAntigravityProviderStatus(settings.providers.antigravity.binaryPath);
+              return checkAntigravityProviderStatus(
+                settings.providers.antigravity.binaryPath,
+                providerProcessOptions,
+              );
             case GROK_PROVIDER:
-              return makeCheckGrokProviderStatus(settings.providers.grok.binaryPath);
+              return makeCheckGrokProviderStatus(
+                settings.providers.grok.binaryPath,
+                providerProcessOptions,
+              );
             case DROID_PROVIDER:
-              return makeCheckDroidProviderStatus(settings.providers.droid.binaryPath);
+              return makeCheckDroidProviderStatus(
+                settings.providers.droid.binaryPath,
+                providerProcessOptions,
+              );
             case KILO_PROVIDER:
-              return makeCheckKiloProviderStatus(settings.providers.kilo.binaryPath);
+              return makeCheckKiloProviderStatus(
+                settings.providers.kilo.binaryPath,
+                providerProcessOptions,
+              );
             case OPENCODE_PROVIDER:
-              return makeCheckOpenCodeProviderStatus(settings.providers.opencode.binaryPath);
+              return makeCheckOpenCodeProviderStatus(
+                settings.providers.opencode.binaryPath,
+                providerProcessOptions,
+              );
             case PI_PROVIDER:
               return checkPiProviderStatus(
                 settings.providers.pi.agentDir,
                 settings.providers.pi.binaryPath,
+                providerProcessOptions,
               );
           }
         })();
-        return check.pipe(
-          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
-          Effect.provideService(FileSystem.FileSystem, fileSystem),
-          Effect.provideService(Path.Path, path),
+        const assertNoUnprovenExit = Ref.get(unprovenHealthProbeExitsRef).pipe(
+          Effect.flatMap((failures) => {
+            const failure = failures.get(provider);
+            return failure ? Effect.fail(failure) : Effect.void;
+          }),
+        );
+        return assertNoUnprovenExit.pipe(
+          Effect.andThen(
+            check.pipe(
+              Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+              Effect.provideService(FileSystem.FileSystem, fileSystem),
+              Effect.provideService(Path.Path, path),
+            ),
+          ),
+          Effect.flatMap((status) => assertNoUnprovenExit.pipe(Effect.as(status))),
         );
       };
 
@@ -3027,75 +3528,121 @@ export function makeProviderHealthLive(options?: {
               ...baseEnv,
               PATH: [input.pathPrepend, baseEnv.PATH]
                 .filter((entry): entry is string => Boolean(entry))
-                .join(OS.platform() === "win32" ? ";" : ":"),
+                .join(platform === "win32" ? ";" : ":"),
             }
           : baseEnv;
-        const prepared = prepareWindowsSafeProcess(input.command, input.args, { env: updateEnv });
+        const prepared = (providerProcessOptions.prepareProcess ?? prepareWindowsProviderProcess)(
+          input.command,
+          input.args,
+          {
+            env: updateEnv,
+            platform,
+          },
+        );
         const supervised = yield* Effect.uninterruptible(
           Effect.gen(function* () {
-            const childCommandOptions: ChildProcess.CommandOptions & {
-              readonly synaraExternallySupervised: true;
-            } = {
-              detached: OS.platform() !== "win32",
+            const childCommandOptions: ChildProcess.CommandOptions = {
+              detached: platform !== "win32",
               shell: prepared.shell,
+              ...(prepared.windowsHide ? { windowsHide: true } : {}),
               ...(prepared.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
               env: updateEnv,
-              // Synara installs the exact-identity supervisor below in this same uninterruptible
-              // acquisition. Disable Effect's PID/process-group finalizer so it cannot race that
-              // owner or bypass its fail-closed process-instance validation.
-              synaraExternallySupervised: true,
+              // Keep Effect's child finalizer as provisional ownership until the exact supervisor
+              // and its later (LIFO) finalizer are installed below.
             };
             const child = yield* spawner.spawn(
               ChildProcess.make(prepared.command, prepared.args, childCommandOptions),
             );
-            let processSupervisor: ReturnType<typeof superviseEffectProcessTree> | null = null;
+            const rootPid = Number(child.pid);
+            const exactWindowsOwner = isWindowsJobPreparedCommand(prepared);
+            const reportUnprovenExit = (cause: unknown) => {
+              const error = normalizeProviderHealthExitFailure(cause, rootPid, exactWindowsOwner);
+              return Ref.set(input.teardownFailureRef, error).pipe(
+                Effect.andThen(
+                  maintenanceGate.latchProvider({
+                    provider: input.provider,
+                    reason: error.message,
+                  }),
+                ),
+              );
+            };
+            const installation = yield* Effect.try({
+              try: () =>
+                installPreparedEffectProcessSupervisor(
+                  prepared,
+                  child,
+                  {
+                    ...providerProcessOptions.windowsJobSupervisorOptions,
+                    ...(options?.processTreeKiller
+                      ? { processTreeKiller: options.processTreeKiller }
+                      : {}),
+                    teardownProcessTree,
+                    platform,
+                    ...(platform === "win32" ? {} : { ownedProcessGroupId: rootPid }),
+                  },
+                  providerProcessOptions.superviseProcess,
+                ),
+              catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause))),
+            });
+            const processSupervisor = installation.supervisor;
             let completed = false;
+            let registration: ProviderMaintenanceOwnedResourceRegistration | undefined;
+            const teardownOwner = Effect.tryPromise({
+              try: processSupervisor.teardown,
+              catch: (error) =>
+                normalizeProviderHealthExitFailure(error, rootPid, exactWindowsOwner),
+            });
+            // Exact teardown must be registered before maintenance publication can fail. Effect's
+            // provisional finalizer remains underneath it and therefore runs second on unwind.
             yield* Effect.addFinalizer(() =>
               completed
                 ? Effect.void
-                : Effect.tryPromise({
-                    try: () =>
-                      processSupervisor === null
-                        ? teardownEffectProcessTree(child, teardownProcessTree, {
-                            ...(OS.platform() === "win32"
-                              ? {}
-                              : { ownedProcessGroupId: Number(child.pid) }),
-                          })
-                        : processSupervisor.teardown(),
-                    catch: (error) => (error instanceof Error ? error : new Error(String(error))),
-                  }).pipe(
-                    Effect.tapError((error) =>
-                      Ref.set(input.teardownFailureRef, error).pipe(
-                        Effect.andThen(
-                          maintenanceGate.latchProvider({
-                            provider: input.provider,
-                            reason: error.message,
-                          }),
-                        ),
-                      ),
-                    ),
+                : teardownOwner.pipe(
+                    Effect.andThen(registration?.unregister ?? Effect.void),
+                    Effect.tapError(reportUnprovenExit),
                     Effect.ignore,
                   ),
             );
-            const supervisor = superviseEffectProcessTree(child, {
-              ...(options?.processTreeKiller
-                ? { processTreeKiller: options.processTreeKiller }
-                : {}),
-              teardownProcessTree,
-              platform: OS.platform(),
-              ...(OS.platform() === "win32" ? {} : { ownedProcessGroupId: Number(child.pid) }),
+            registration = yield* maintenanceOwnedResources.register({
+              provider: input.provider,
+              resourceId: `provider-update:${String(rootPid)}`,
+              close: () => teardownOwner.pipe(Effect.tapError(reportUnprovenExit), Effect.asVoid),
             });
+            if (installation._tag === "Recovered") {
+              const recoveryResult = yield* teardownOwner.pipe(
+                Effect.tapError(reportUnprovenExit),
+                Effect.result,
+              );
+              if (Result.isFailure(recoveryResult)) {
+                // The maintenance registry retains this exact fallback for an explicit retry.
+                completed = true;
+                return yield* Effect.fail(recoveryResult.failure);
+              }
+              yield* registration.unregister;
+              completed = true;
+              const requestedFailure = installation.requestedSupervisorFailure;
+              return yield* Effect.fail(
+                requestedFailure instanceof Error
+                  ? requestedFailure
+                  : new Error(String(requestedFailure)),
+              );
+            }
             yield* Effect.tryPromise({
-              try: () => supervisor.waitForInitialCapture(),
+              try: processSupervisor.waitForInitialCapture,
               catch: (error) => (error instanceof Error ? error : new Error(String(error))),
             });
-            processSupervisor = supervisor;
             return {
               child,
-              processSupervisor: supervisor,
-              markCompleted: () => {
-                completed = true;
-              },
+              processSupervisor,
+              markCompleted: Effect.uninterruptible(
+                registration.unregister.pipe(
+                  Effect.andThen(
+                    Effect.sync(() => {
+                      completed = true;
+                    }),
+                  ),
+                ),
+              ),
             };
           }),
         );
@@ -3118,7 +3665,7 @@ export function makeProviderHealthLive(options?: {
           try: () => processSupervisor.proveExit(),
           catch: (error) => (error instanceof Error ? error : new Error(String(error))),
         });
-        supervised.markCompleted();
+        yield* supervised.markCompleted;
         return {
           stdout: stdout.text,
           stderr: stderr.text,
@@ -3270,6 +3817,30 @@ export function makeProviderHealthLive(options?: {
           );
         });
 
+        const runUpdateHealthProbe = (
+          settings: ServerSettings,
+          phase: "pre-update" | "post-update",
+        ) =>
+          maintenanceGate
+            .withOperation({
+              provider,
+              operation: `ProviderHealth.update.${phase}`,
+              run: checkProviderStatusForSettings(settings, provider),
+            })
+            .pipe(
+              Effect.catch((cause) => {
+                const reason =
+                  cause instanceof ProviderMaintenanceBusyError
+                    ? cause.message
+                    : `${phase === "pre-update" ? "Pre-update" : "Post-update"} provider health could not prove process exit. Restart Synara before using '${provider}' again. ${cause.message}`;
+                const error = new ServerProviderUpdateError({ provider, reason });
+                Object.defineProperty(error, "cause", { value: cause, enumerable: false });
+                return markTerminal({ status: "failed", message: reason }).pipe(
+                  Effect.andThen(Effect.fail(error)),
+                );
+              }),
+            );
+
         const run = Effect.gen(function* () {
           const lockedGeneration = yield* readUpdateSettingsGeneration();
           const lockedSettings = lockedGeneration.settings;
@@ -3302,7 +3873,7 @@ export function makeProviderHealthLive(options?: {
             }),
           );
 
-          const beforeStatus = yield* checkProviderStatusForSettings(lockedSettings, provider);
+          const beforeStatus = yield* runUpdateHealthProbe(lockedSettings, "pre-update");
           const beforeVersion = beforeStatus.version ?? null;
           const stableGeneration = yield* readUpdateSettingsGeneration();
           const stableCapabilities = stableGeneration.capabilities;
@@ -3353,7 +3924,7 @@ export function makeProviderHealthLive(options?: {
             .withExclusiveMaintenance({
               provider,
               latchReasonOnFailure: (cause) =>
-                findUnprovenProcessExit(Cause.squash(cause))?.message ?? null,
+                findProviderProcessExitUnprovenError(Cause.squash(cause))?.message ?? null,
               run: Effect.gen(function* () {
                 const gatedGeneration = yield* readUpdateSettingsGeneration();
                 const gatedCapabilities = gatedGeneration.capabilities;
@@ -3404,7 +3975,7 @@ export function makeProviderHealthLive(options?: {
             })
             .pipe(Effect.result);
           if (Result.isFailure(commandResult)) {
-            const unprovenExit = findUnprovenProcessExit(commandResult.failure);
+            const unprovenExit = findProviderProcessExitUnprovenError(commandResult.failure);
             if (unprovenExit) {
               yield* maintenanceGate.latchProvider({
                 provider,
@@ -3437,7 +4008,7 @@ export function makeProviderHealthLive(options?: {
           const targetChangedBeforePostProbe =
             !postUpdate ||
             !updateDestinationGenerationMatches(provider, stableGeneration, postProbeGeneration);
-          const afterStatus = yield* checkProviderStatusForSettings(postSettings, provider);
+          const afterStatus = yield* runUpdateHealthProbe(postSettings, "post-update");
           const postStatus = yield* enrichProviderStatusWithVersionAdvisory(
             afterStatus,
             postCapabilities,

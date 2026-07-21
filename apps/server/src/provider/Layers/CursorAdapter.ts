@@ -22,7 +22,7 @@ import {
   type ThreadId,
   TurnId,
 } from "@synara/contracts";
-import { prepareWindowsSafeProcess } from "@synara/shared/windowsProcess";
+import type { WindowsSafeProcessCommand } from "@synara/shared/windowsProcess";
 import {
   Cause,
   DateTime,
@@ -55,6 +55,20 @@ import {
 import { ServerConfig, type ServerConfigShape } from "../../config.ts";
 import { appendFileAttachmentsPromptBlock } from "../attachmentProjection.ts";
 import { loadProviderPromptImageBlocks } from "../promptAttachments.ts";
+import {
+  isWindowsJobPreparedCommand,
+  prepareWindowsProviderProcess,
+} from "../windowsProviderProcess.ts";
+import {
+  installPreparedEffectProcessSupervisor,
+  supervisePreparedEffectProcess,
+} from "../windowsJobProcessSupervisor.ts";
+import { findProviderProcessExitUnprovenError } from "../supervisedProcessTeardown.ts";
+import {
+  makeProviderMaintenanceOwnedResourceCoordinator,
+  type ProviderMaintenanceOwnedResourceCoordinator,
+} from "../providerMaintenanceOwnedResources.ts";
+import { makeProviderProcessOwnerTracker } from "../providerProcessOwnerTracker.ts";
 import {
   ProviderAdapterProcessError,
   ProviderAdapterRequestError,
@@ -184,10 +198,26 @@ const collectStreamAsString = <E>(stream: Stream.Stream<Uint8Array, E>): Effect.
     (acc, chunk) => acc + new TextDecoder().decode(chunk),
   );
 
+export function makeCursorModelListChildProcess(
+  prepared: WindowsSafeProcessCommand,
+  env: NodeJS.ProcessEnv,
+): ChildProcess.StandardCommand {
+  return ChildProcess.make(prepared.command, prepared.args, {
+    shell: prepared.shell,
+    ...(prepared.windowsHide ? { windowsHide: true } : {}),
+    ...(prepared.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
+    env,
+    ...(isWindowsJobPreparedCommand(prepared) ? { synaraExternallySupervised: true } : {}),
+  } as ChildProcess.CommandOptions & { readonly synaraExternallySupervised?: true });
+}
+
 export interface CursorAdapterLiveOptions {
   readonly nativeEventLogPath?: string;
   readonly nativeEventLogger?: EventNdjsonLogger;
   readonly closeSessionScope?: (scope: Scope.Closeable) => Effect.Effect<void>;
+  readonly maintenanceOwnedResources?: ProviderMaintenanceOwnedResourceCoordinator;
+  readonly prepareProcess?: typeof prepareWindowsProviderProcess;
+  readonly superviseProcess?: typeof supervisePreparedEffectProcess;
 }
 
 interface PendingApproval {
@@ -385,6 +415,14 @@ export function makeCursorAdapter(
     const fileSystem = yield* FileSystem.FileSystem;
     const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
     const serverConfig = yield* Effect.service(ServerConfig);
+    const maintenanceOwnedResources =
+      options?.maintenanceOwnedResources ??
+      (yield* makeProviderMaintenanceOwnedResourceCoordinator);
+    const modelProcessOwners = makeProviderProcessOwnerTracker({
+      provider: PROVIDER,
+      resourcePrefix: "cursor-model-discovery",
+      maintenanceOwnedResources,
+    });
     // Optional so adapter tests can run without the gateway layer; when
     // present, every session gets the synara_* MCP tools.
     const agentGatewayCredentials = Option.getOrUndefined(
@@ -1446,16 +1484,47 @@ export function makeCursorAdapter(
           ...(effectiveApiEndpoint ? { apiEndpoint: effectiveApiEndpoint } : {}),
         });
         const env = buildCursorAgentHeadlessEnv();
-        const prepared = prepareWindowsSafeProcess(command.command, command.args, {
-          env,
-        });
-        const child = yield* childProcessSpawner.spawn(
-          ChildProcess.make(prepared.command, prepared.args, {
-            shell: prepared.shell,
-            ...(prepared.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
-            env,
+        const prepared = (options?.prepareProcess ?? prepareWindowsProviderProcess)(
+          command.command,
+          command.args,
+          { env },
+        );
+        const owned = yield* Effect.uninterruptible(
+          Effect.gen(function* () {
+            const child = yield* childProcessSpawner.spawn(
+              makeCursorModelListChildProcess(prepared, env),
+            );
+            const installation = isWindowsJobPreparedCommand(prepared)
+              ? installPreparedEffectProcessSupervisor(
+                  prepared,
+                  child,
+                  { platform: "win32" },
+                  options?.superviseProcess,
+                )
+              : undefined;
+            const owner = installation
+              ? yield* modelProcessOwners.register(installation.supervisor)
+              : undefined;
+            if (owner) {
+              yield* Effect.addFinalizer(() =>
+                modelProcessOwners.teardown(owner).pipe(Effect.orDie),
+              );
+            }
+            if (installation?._tag === "Recovered") {
+              return yield* new ProviderAdapterRequestError({
+                provider: PROVIDER,
+                method: "model/list",
+                detail: "Failed to install Cursor model discovery process-tree supervision.",
+                cause: installation.requestedSupervisorFailure,
+              });
+            }
+            return {
+              child,
+              owner,
+            };
           }),
         );
+        const { child, owner } = owned;
         const [stdout, stderr, exitCode] = yield* Effect.all(
           [
             collectStreamAsString(child.stdout),
@@ -1464,6 +1533,9 @@ export function makeCursorAdapter(
           ],
           { concurrency: "unbounded" },
         );
+        if (owner) {
+          yield* modelProcessOwners.proveExit(owner);
+        }
         if (exitCode !== 0) {
           return yield* new ProviderAdapterRequestError({
             provider: PROVIDER,
@@ -1549,18 +1621,21 @@ export function makeCursorAdapter(
         })),
         // The flat CLI list expands transport variants that ACP already represents
         // as per-model controls. Use it only when the richer ACP catalog is unavailable.
-        Effect.catch(() =>
-          runCursorModelListCommand.pipe(
-            Effect.map(
-              (cliModels) =>
-                ({
-                  models: cliModels,
-                  source: "cursor.cli",
-                  cached: false,
-                }) satisfies ProviderListModelsResult,
-            ),
-          ),
-        ),
+        Effect.catch((error) => {
+          const unprovenExit = findProviderProcessExitUnprovenError(error);
+          return unprovenExit === null
+            ? runCursorModelListCommand.pipe(
+                Effect.map(
+                  (cliModels) =>
+                    ({
+                      models: cliModels,
+                      source: "cursor.cli",
+                      cached: false,
+                    }) satisfies ProviderListModelsResult,
+                ),
+              )
+            : Effect.fail(unprovenExit);
+        }),
       );
 
       return discovery.pipe(
@@ -1578,7 +1653,14 @@ export function makeCursorAdapter(
     };
 
     const stopAll: CursorAdapterShape["stopAll"] = () =>
-      stopCursorSessionsBestEffort(sessions.values(), stopSessionInternal);
+      Effect.gen(function* () {
+        const sessionExit = yield* Effect.exit(
+          stopCursorSessionsBestEffort(sessions.values(), stopSessionInternal),
+        );
+        const ownerExit = yield* Effect.exit(modelProcessOwners.drain);
+        if (Exit.isFailure(sessionExit)) return yield* Effect.failCause(sessionExit.cause);
+        if (Exit.isFailure(ownerExit)) return yield* Effect.failCause(ownerExit.cause);
+      });
 
     yield* Effect.addFinalizer(() =>
       stopAll().pipe(

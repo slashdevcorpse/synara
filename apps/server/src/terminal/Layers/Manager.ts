@@ -3,6 +3,7 @@
 // Layer: Terminal infrastructure
 // Depends on: PTY adapters, process-tree cleanup helpers, shared terminal contracts, and server config.
 import { EventEmitter } from "node:events";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -14,8 +15,10 @@ import {
   TerminalOpenInput,
   TerminalResizeInput,
   TerminalRestartInput,
+  TerminalSessionInput,
   TerminalWriteInput,
   type TerminalEvent,
+  type TerminalRecoverySnapshot,
   type TerminalSessionSnapshot,
 } from "@synara/contracts";
 import { describeErrorMessage } from "@synara/shared/errorMessages";
@@ -167,6 +170,7 @@ const MANAGED_TERMINAL_WRAPPER_DIRNAME = "_managed-bin";
 const MANAGED_TERMINAL_ZSH_DIRNAME = "_managed-zsh";
 
 const decodeTerminalOpenInput = Schema.decodeUnknownSync(TerminalOpenInput);
+const decodeTerminalSessionInput = Schema.decodeUnknownSync(TerminalSessionInput);
 const decodeTerminalRestartInput = Schema.decodeUnknownSync(TerminalRestartInput);
 const decodeTerminalWriteInput = Schema.decodeUnknownSync(TerminalWriteInput);
 const decodeTerminalAckOutputInput = Schema.decodeUnknownSync(TerminalAckOutputInput);
@@ -758,6 +762,10 @@ interface TerminalManagerEvents {
   event: [event: TerminalEvent];
 }
 
+type UnsequencedTerminalEvent<T extends TerminalEvent = TerminalEvent> = T extends TerminalEvent
+  ? Omit<T, "sequence">
+  : never;
+
 interface TerminalManagerCommonOptions {
   logsDir?: string;
   historyLineLimit?: number;
@@ -808,7 +816,14 @@ interface KillEscalationHandle {
 }
 
 export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> {
+  readonly generation = randomUUID();
   private readonly sessions = new Map<string, TerminalSessionState>();
+  /**
+   * Event clocks for sessions removed only by inactive-retention policy. A
+   * renderer can reopen that terminal within this manager generation, so its
+   * next event must continue past the last event the renderer may have applied.
+   */
+  private readonly evictedSessionSequenceWatermarks = new Map<string, number>();
   private readonly logsDir: string;
   private managedWrapperBinDir: string | null;
   private managedWrapperZshDir: string | null;
@@ -848,8 +863,7 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
   /** Delay of the currently scheduled poll, so activity can pull it forward. */
   private currentSubprocessPollDelayMs = 0;
   private readonly killEscalationTimers = new Map<PtyProcess, KillEscalationHandle>();
-  private readonly pendingKillSetups = new Set<Promise<void>>();
-  private readonly pendingKillSignals = new Set<Promise<void>>();
+  private readonly pendingKillEscalations = new Set<Promise<void>>();
   private readonly logger = createLogger("terminal");
 
   constructor(options: TerminalManagerOptions) {
@@ -978,8 +992,10 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
           lastInputAt: null,
           lastOutputAt: null,
           lastOutputSignature: null,
+          eventSequence: this.evictedSessionSequenceWatermarks.get(sessionKey) ?? 0,
         };
         this.sessions.set(sessionKey, session);
+        this.evictedSessionSequenceWatermarks.delete(sessionKey);
         this.evictInactiveSessionsIfNeeded();
         await this.startSession(session, { ...input, cols, rows }, "started");
         return this.snapshot(session);
@@ -1010,7 +1026,7 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
           });
         }
       } else if (existing.cwd !== input.cwd || runtimeEnvChanged) {
-        this.stopProcess(existing);
+        await this.stopProcess(existing);
         existing.cwd = input.cwd;
         existing.runtimeEnv = nextRuntimeEnv;
         resetSessionHistory(existing);
@@ -1062,6 +1078,25 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
       // the latest history and an up-to-date mode-replay preamble.
       this.flushOutputBuffer(existing);
       return this.snapshot(existing);
+    });
+  }
+
+  async recoverySnapshot(raw: TerminalSessionInput): Promise<TerminalRecoverySnapshot> {
+    const input = decodeTerminalSessionInput(raw);
+    return this.runWithThreadLock(input.threadId, async () => {
+      const session = this.requireSession(input.threadId, input.terminalId);
+
+      // A failed stream can strand bytes in the previous renderer's ACK window.
+      // Reset delivery flow control, but never create, start, stop, resize, or
+      // otherwise alter the terminal process from this recovery operation.
+      this.flushOutputBuffer(session);
+      this.resetOutputAckTracking(session);
+
+      return {
+        snapshot: this.snapshot(session),
+        generation: this.generation,
+        watermark: session.eventSequence,
+      };
     });
   }
 
@@ -1147,6 +1182,7 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
         threadId: input.threadId,
         terminalId: input.terminalId,
         createdAt: new Date().toISOString(),
+        generation: this.generation,
       });
     });
   }
@@ -1204,11 +1240,13 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
           lastOutputSignature: null,
           lastInputAt: null,
           lastOutputAt: null,
+          eventSequence: this.evictedSessionSequenceWatermarks.get(sessionKey) ?? 0,
         } satisfies TerminalSessionState;
         this.sessions.set(sessionKey, session);
+        this.evictedSessionSequenceWatermarks.delete(sessionKey);
         this.evictInactiveSessionsIfNeeded();
       } else {
-        this.stopProcess(session);
+        await this.stopProcess(session);
         session.cwd = input.cwd;
         session.runtimeEnv = normalizedRuntimeEnv(input.env);
       }
@@ -1244,10 +1282,12 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
       }
 
       const threadSessions = this.sessionsForThread(input.threadId);
+      const processStops = threadSessions.map((session) => this.stopProcess(session));
+      await Promise.all(processStops);
       for (const session of threadSessions) {
-        this.stopProcess(session);
         this.sessions.delete(toSessionKey(session.threadId, session.terminalId));
       }
+      this.clearEvictedSessionSequenceWatermarks(input.threadId);
       await Promise.all(
         threadSessions.map((session) =>
           this.flushPersistQueue(session.threadId, session.terminalId),
@@ -1261,45 +1301,59 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
     });
   }
 
-  dispose(): void {
-    this.disposeInternal({ keepEscalationTimers: true });
-    const pendingSetups = [...this.pendingKillSetups];
-    void Promise.allSettled(pendingSetups).then(() => this.clearAllKillEscalationTimers());
+  async dispose(): Promise<void> {
+    try {
+      await this.disposeInternal({ keepEscalationTimers: false });
+    } catch (error: unknown) {
+      this.logger.warn("terminal manager disposal failed", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    }
   }
 
   async disposeForShutdown(): Promise<void> {
-    this.disposeInternal({ keepEscalationTimers: true });
-    await Promise.allSettled([...this.pendingKillSetups]);
-    const pendingEscalations = this.killEscalationTimers.size;
+    const pendingEscalations = await this.disposeInternal({ keepEscalationTimers: true });
     if (pendingEscalations > 0) {
       await new Promise((resolve) =>
-        setTimeout(resolve, this.processKillGraceMs + SHUTDOWN_ESCALATION_SETTLE_MS),
+        setTimeout(resolve, this.processKillGraceMs * 2 + SHUTDOWN_ESCALATION_SETTLE_MS),
       );
     }
-    await Promise.allSettled([...this.pendingKillSignals]);
     this.clearAllKillEscalationTimers();
+    await Promise.allSettled([...this.pendingKillEscalations]);
   }
 
-  private disposeInternal(options: { keepEscalationTimers: boolean }): number {
+  private async disposeInternal(options: { keepEscalationTimers: boolean }): Promise<number> {
     this.stopSubprocessPolling();
     const sessions = [...this.sessions.values()];
-    this.sessions.clear();
+    const processStops: Promise<void>[] = [];
+    // Drain every session while all event clocks remain addressable. Controlled
+    // stops never enforce inactive retention; the directory is cleared only
+    // after every process stop settles.
     for (const session of sessions) {
-      // Flush any remaining batched output before tearing down.
       this.flushOutputBuffer(session);
-      this.stopProcess(session);
+    }
+    for (const session of sessions) {
+      // stopProcess synchronously detaches the session's PTY callbacks, while
+      // process-tree capture and the escalation-only exit listener can continue
+      // asynchronously until the returned promise settles.
+      processStops.push(this.stopProcess(session));
     }
     for (const timer of this.persistTimers.values()) {
       clearTimeout(timer);
     }
     this.persistTimers.clear();
-    if (!options.keepEscalationTimers) {
-      this.clearAllKillEscalationTimers();
-    }
     this.pendingPersistHistory.clear();
     this.threadLocks.clear();
     this.persistQueues.clear();
-    return this.killEscalationTimers.size;
+    await Promise.all(processStops);
+    this.sessions.clear();
+    this.evictedSessionSequenceWatermarks.clear();
+    if (!options.keepEscalationTimers) {
+      this.clearAllKillEscalationTimers();
+      await Promise.allSettled([...this.pendingKillEscalations]);
+    }
+    return this.killEscalationTimers.size + this.pendingKillEscalations.size;
   }
 
   private clearAllKillEscalationTimers(): void {
@@ -1315,7 +1369,7 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
     input: TerminalStartInput,
     eventType: "started" | "restarted",
   ): Promise<void> {
-    this.stopProcess(session);
+    await this.stopProcess(session);
 
     session.status = "starting";
     session.cwd = input.cwd;
@@ -1444,6 +1498,7 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
         threadId: session.threadId,
         terminalId: session.terminalId,
         createdAt: new Date().toISOString(),
+        generation: this.generation,
         snapshot: this.snapshot(session),
       });
       if (session.detectedCliKind) {
@@ -1451,7 +1506,7 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
       }
     } catch (error) {
       if (ptyProcess) {
-        this.killProcessWithEscalation(ptyProcess, session.threadId, session.terminalId);
+        await this.killProcessWithEscalation(ptyProcess, session.threadId, session.terminalId);
       }
       session.status = "error";
       session.pid = null;
@@ -1463,7 +1518,6 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
       session.managedAgentState = null;
       session.managedAgentObserved = false;
       session.updatedAt = new Date().toISOString();
-      this.evictInactiveSessionsIfNeeded();
       this.updateSubprocessPollingState();
       const message = describeErrorMessage(error, "Terminal start failed");
       this.emitEvent({
@@ -1471,8 +1525,10 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
         threadId: session.threadId,
         terminalId: session.terminalId,
         createdAt: new Date().toISOString(),
+        generation: this.generation,
         message,
       });
+      this.evictInactiveSessionsIfNeeded();
       this.logger.error("failed to start terminal", {
         threadId: session.threadId,
         terminalId: session.terminalId,
@@ -1591,6 +1647,7 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
         threadId: session.threadId,
         terminalId: session.terminalId,
         createdAt: new Date().toISOString(),
+        generation: this.generation,
         data,
         byteLength,
       });
@@ -1758,6 +1815,7 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
       threadId: session.threadId,
       terminalId: session.terminalId,
       createdAt: new Date().toISOString(),
+      generation: this.generation,
       exitCode: session.exitCode,
       exitSignal: session.exitSignal,
     });
@@ -1765,11 +1823,11 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
     this.updateSubprocessPollingState();
   }
 
-  private stopProcess(session: TerminalSessionState): void {
+  private stopProcess(session: TerminalSessionState): Promise<void> {
     // Drain any remaining batched output before killing.
     this.flushOutputBuffer(session);
     const process = session.process;
-    if (!process) return;
+    if (!process) return Promise.resolve();
     this.cleanupProcessHandles(session);
     session.process = null;
     session.pid = null;
@@ -1787,9 +1845,13 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
     session.status = "exited";
     session.pendingHistoryControlSequence = "";
     session.updatedAt = new Date().toISOString();
-    this.killProcessWithEscalation(process, session.threadId, session.terminalId);
-    this.evictInactiveSessionsIfNeeded();
+    const processStop = this.killProcessWithEscalation(
+      process,
+      session.threadId,
+      session.terminalId,
+    );
     this.updateSubprocessPollingState();
+    return processStop;
   }
 
   private cleanupProcessHandles(session: TerminalSessionState): void {
@@ -1812,32 +1874,66 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
     this.killEscalationTimers.delete(process);
   }
 
-  private killProcessWithEscalation(
-    ptyProcess: PtyProcess,
-    threadId: string,
-    terminalId: string,
-  ): void {
-    this.clearKillEscalationTimer(ptyProcess);
-    const setup = this.setupProcessKillEscalation(ptyProcess, threadId, terminalId);
-    this.pendingKillSetups.add(setup);
-    void setup
-      .catch((error: unknown) => {
-        this.logger.warn("process-tree kill setup failed", {
-          threadId,
-          terminalId,
-          pid: ptyProcess.pid,
-          error: error instanceof Error ? error.message : String(error),
-        });
-      })
-      .finally(() => this.pendingKillSetups.delete(setup));
-  }
-
-  private async setupProcessKillEscalation(
+  private async killProcessWithEscalation(
     ptyProcess: PtyProcess,
     threadId: string,
     terminalId: string,
   ): Promise<void> {
+    this.clearKillEscalationTimer(ptyProcess);
     const pid = ptyProcess.pid;
+    const captureOptions =
+      this.subprocessPlatform === "win32" ? undefined : { processGroupId: pid };
+    let captureFinished = false;
+    let rootExitedBeforeCaptureFinished = false;
+    const handle: KillEscalationHandle = {
+      timer: null,
+      unsubscribeExit: null,
+      // Retain the listener until asynchronous ownership capture establishes whether descendants
+      // remain. This prevents root exit from cancelling an in-flight capture prematurely.
+      retainAfterRootExit: true,
+      rootExited: false,
+    };
+    handle.unsubscribeExit = ptyProcess.onExit(() => {
+      handle.rootExited = true;
+      if (!captureFinished) {
+        rootExitedBeforeCaptureFinished = true;
+      }
+      this.clearKillEscalationTimer(ptyProcess, { force: false });
+    });
+    this.killEscalationTimers.set(ptyProcess, handle);
+
+    let capturedTree: CapturedProcessTree;
+    try {
+      capturedTree = this.processTreeKiller.captureAsync
+        ? await this.processTreeKiller.captureAsync(pid, captureOptions)
+        : await Promise.resolve().then(() => this.processTreeKiller.capture(pid, captureOptions));
+    } catch (error) {
+      capturedTree = { descendants: [], captureComplete: false };
+      this.logger.warn("process-tree ownership capture failed", {
+        threadId,
+        terminalId,
+        pid,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+    captureFinished = true;
+    // Let an exit notification already queued in the next task run before any root signal.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    if (this.killEscalationTimers.get(ptyProcess) !== handle) return;
+
+    // POSIX PTYs own an isolated process group, so a group snapshot remains attributable after the
+    // leader exits. Windows has no equivalent proof here, so discard descendants captured late.
+    const preserveLateCapture = captureOptions?.processGroupId === pid;
+    const tree =
+      rootExitedBeforeCaptureFinished && !preserveLateCapture
+        ? { descendants: [], captureComplete: false }
+        : capturedTree;
+    handle.retainAfterRootExit = tree.descendants.length > 0 || tree.captureComplete === false;
+    if (handle.rootExited && !handle.retainAfterRootExit) {
+      this.clearKillEscalationTimer(ptyProcess);
+      return;
+    }
+
     const signalProcess = (signal: TerminalKillSignal) => {
       try {
         ptyProcess.kill(signal);
@@ -1855,43 +1951,6 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
         });
       }
     };
-    const handle: KillEscalationHandle = {
-      timer: null,
-      unsubscribeExit: null,
-      // Conservatively retain an exit observation until asynchronous ownership capture finishes.
-      retainAfterRootExit: true,
-      rootExited: false,
-    };
-    handle.unsubscribeExit = ptyProcess.onExit(() => {
-      handle.rootExited = true;
-      this.clearKillEscalationTimer(ptyProcess, { force: false });
-    });
-    this.killEscalationTimers.set(ptyProcess, handle);
-
-    let tree: CapturedProcessTree;
-    try {
-      const captureOptions =
-        this.subprocessPlatform === "win32" ? undefined : { processGroupId: pid };
-      tree = this.processTreeKiller.captureAsync
-        ? await this.processTreeKiller.captureAsync(pid, captureOptions)
-        : await Promise.resolve().then(() => this.processTreeKiller.capture(pid, captureOptions));
-    } catch (error) {
-      tree = { descendants: [], captureComplete: false };
-      this.logger.warn("process-tree ownership capture failed", {
-        threadId,
-        terminalId,
-        pid,
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
-    if (this.killEscalationTimers.get(ptyProcess) !== handle) return;
-
-    handle.retainAfterRootExit = tree.descendants.length > 0;
-    if (handle.rootExited && !handle.retainAfterRootExit) {
-      this.clearKillEscalationTimer(ptyProcess);
-      return;
-    }
-
     const signalTree = async (
       signal: TerminalKillSignal,
       options: { includeRootTree?: boolean } = {},
@@ -1901,6 +1960,8 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
         signal,
         tree,
         includeRootTree: options.includeRootTree,
+        shouldSignalRootTree: () => !handle.rootExited,
+        abortSignal: undefined,
         onError: (error, context) => {
           this.logger.warn(
             context.source === "tree-kill"
@@ -1916,19 +1977,44 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
           );
         },
       };
+      const abortController = new AbortController();
+      let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
       try {
-        if (this.processTreeKiller.signalAsync !== undefined) {
-          await this.processTreeKiller.signalAsync(input);
-        } else {
-          this.processTreeKiller.signal(input);
+        const signalingInput = { ...input, abortSignal: abortController.signal };
+        const signaling = Promise.resolve().then(() =>
+          this.processTreeKiller.signalAsync !== undefined
+            ? this.processTreeKiller.signalAsync(signalingInput)
+            : this.processTreeKiller.signal(signalingInput),
+        );
+        const outcome = await Promise.race([
+          signaling.then(() => "settled" as const),
+          new Promise<"timed-out">((resolve) => {
+            deadlineTimer = setTimeout(() => {
+              abortController.abort();
+              resolve("timed-out");
+            }, this.processKillGraceMs);
+            deadlineTimer.unref?.();
+          }),
+        ]);
+        if (outcome === "timed-out") {
+          this.logger.warn("process tree signal timed out", {
+            threadId,
+            terminalId,
+            pid,
+            signal,
+            timeoutMs: this.processKillGraceMs,
+          });
         }
       } catch (error) {
-        this.logger.warn(`process-tree ${signal} validation failed`, {
+        this.logger.warn("process tree signal failed", {
           threadId,
           terminalId,
           pid,
+          signal,
           error: error instanceof Error ? error.message : String(error),
         });
+      } finally {
+        if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
       }
     };
 
@@ -1937,6 +2023,11 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
     // Also signal the PTY handle directly for adapter compatibility and test doubles.
     if (!handle.rootExited) signalProcess("SIGTERM");
 
+    if (handle.rootExited && tree.descendants.length === 0) {
+      this.clearKillEscalationTimer(ptyProcess);
+      return;
+    }
+
     const timer = setTimeout(() => {
       if (this.killEscalationTimers.get(ptyProcess) !== handle) return;
       handle.timer = null;
@@ -1944,9 +2035,9 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
         // Once the root exit is observed, only the captured descendants are safe to signal.
         if (!handle.rootExited) signalProcess("SIGKILL");
       });
-      this.pendingKillSignals.add(forceKill);
+      this.pendingKillEscalations.add(forceKill);
       void forceKill.finally(() => {
-        this.pendingKillSignals.delete(forceKill);
+        this.pendingKillEscalations.delete(forceKill);
         if (this.killEscalationTimers.get(ptyProcess) === handle) {
           handle.unsubscribeExit?.();
           this.killEscalationTimers.delete(ptyProcess);
@@ -1959,7 +2050,7 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
 
   private evictInactiveSessionsIfNeeded(): void {
     const inactiveSessions = [...this.sessions.values()].filter(
-      (session) => session.status !== "running",
+      (session) => session.status === "exited" || session.status === "error",
     );
     if (inactiveSessions.length <= this.maxRetainedInactiveSessions) {
       return;
@@ -1975,6 +2066,7 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
     for (const session of inactiveSessions.slice(0, toEvict)) {
       const key = toSessionKey(session.threadId, session.terminalId);
       this.flushOutputBuffer(session);
+      this.evictedSessionSequenceWatermarks.set(key, session.eventSequence);
       this.sessions.delete(key);
       this.clearPersistTimer(session.threadId, session.terminalId);
       this.pendingPersistHistory.delete(key);
@@ -2442,9 +2534,10 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
     const key = toSessionKey(threadId, terminalId);
     const session = this.sessions.get(key);
     if (session) {
-      this.stopProcess(session);
+      await this.stopProcess(session);
       this.sessions.delete(key);
     }
+    this.evictedSessionSequenceWatermarks.delete(key);
     this.updateSubprocessPollingState();
     await this.flushPersistQueue(threadId, terminalId);
     if (deleteHistory) {
@@ -2454,6 +2547,15 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
 
   private sessionsForThread(threadId: string): TerminalSessionState[] {
     return [...this.sessions.values()].filter((session) => session.threadId === threadId);
+  }
+
+  private clearEvictedSessionSequenceWatermarks(threadId: string): void {
+    const prefix = `${threadId}\u0000`;
+    for (const key of this.evictedSessionSequenceWatermarks.keys()) {
+      if (key.startsWith(prefix)) {
+        this.evictedSessionSequenceWatermarks.delete(key);
+      }
+    }
   }
 
   private async deleteAllHistoryForThread(threadId: string): Promise<void> {
@@ -2528,14 +2630,21 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
       threadId: session.threadId,
       terminalId: session.terminalId,
       createdAt: new Date().toISOString(),
+      generation: this.generation,
       hasRunningSubprocess: session.hasRunningSubprocess,
       cliKind: session.detectedCliKind,
       agentState: deriveActivityAgentState(session),
     });
   }
 
-  private emitEvent(event: TerminalEvent): void {
-    this.emit("event", event);
+  private emitEvent(event: UnsequencedTerminalEvent): void {
+    const session = this.requireSession(event.threadId, event.terminalId);
+    session.eventSequence += 1;
+    this.emit("event", {
+      ...event,
+      generation: this.generation,
+      sequence: session.eventSequence,
+    } as TerminalEvent);
   }
 
   private historyPath(threadId: string, terminalId: string): string {
@@ -2581,10 +2690,16 @@ export const TerminalManagerLive = Layer.effect(
     );
 
     return {
+      generation: runtime.generation,
       open: (input) =>
         Effect.tryPromise({
           try: () => runtime.open(input),
           catch: (cause) => terminalErrorFromCause("Failed to open terminal", cause),
+        }),
+      snapshot: (input) =>
+        Effect.tryPromise({
+          try: () => runtime.recoverySnapshot(input),
+          catch: (cause) => terminalErrorFromCause("Failed to snapshot terminal", cause),
         }),
       write: (input) =>
         Effect.tryPromise({

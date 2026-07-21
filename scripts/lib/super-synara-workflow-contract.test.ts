@@ -59,11 +59,56 @@ describe("Super Synara workflow contracts", () => {
       ['--arg tag "$TAG"', '--arg tag "$FORGED_TAG"'],
       ['--arg source_commit "$SOURCE_COMMIT"', '--arg source_commit "$FORGED_COMMIT"'],
       ['<<< "$releases_json"', '<<< "$FORGED_RELEASES_JSON"'],
+      ['elif length == 0 then empty else error("multiple owned drafts") end', "else empty end"],
     ] as const) {
       expect(() =>
         verifySuperSynaraWorkflowText(main.replace(binding, replacement), audit),
       ).toThrow("must filter the captured response with standalone jq arguments");
     }
+  });
+
+  it("requires bounded fail-closed draft visibility polling", () => {
+    for (const [required, weakened] of [
+      ["for attempt in {1..30}; do", "for attempt in {1..1}; do"],
+      ['if [[ "$query_status" -ne 4 ]]; then', "if false; then"],
+      ['exit "$query_status"', "true"],
+      ["sleep 1", "true"],
+    ] as const) {
+      expect(() => verifySuperSynaraWorkflowText(main.replace(required, weakened), audit)).toThrow(
+        "must poll boundedly for GitHub release-list visibility",
+      );
+    }
+
+    const retryFailureBlock = [
+      "            else",
+      "              query_status=$?",
+      '              if [[ "$query_status" -ne 4 ]]; then',
+      '                exit "$query_status"',
+      "              fi",
+      "            fi",
+    ].join("\n");
+    const unreachableFailureBlock = [
+      "              break",
+      "              query_status=$?",
+      '              if [[ "$query_status" -ne 4 ]]; then',
+      '                exit "$query_status"',
+      "              fi",
+      "            else",
+      "              true",
+      "            fi",
+    ].join("\n");
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(retryFailureBlock, unreachableFailureBlock),
+        audit,
+      ),
+    ).toThrow("must poll boundedly for GitHub release-list visibility");
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace("            sleep 1\n          done", "          done\n          sleep 1"),
+        audit,
+      ),
+    ).toThrow("must poll boundedly for GitHub release-list visibility");
   });
 
   it("rejects removal of the reviewed allowlist gate", () => {
@@ -187,6 +232,26 @@ describe("Super Synara workflow contracts", () => {
   });
 
   it("requires exact native prerelease gates and rejects broad native suites", () => {
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          "node apps/server/scripts/build-windows-job-launcher.mjs --arch x64",
+          "node apps/server/scripts/build-windows-job-launcher.mjs --arch arm64",
+        ),
+        audit,
+      ),
+    ).toThrow("windows_x64 must run exact native gate command");
+
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          "src/provider/windowsProviderProcess.test.ts\n          src/provider/windowsProviderProcess.windows.test.ts",
+          "src/provider/windowsProviderProcess.test.ts\n          src/provider/forgedWindowsContainment.test.ts",
+        ),
+        audit,
+      ),
+    ).toThrow("windows_x64 must run exact native gate command");
+
     expect(() =>
       verifySuperSynaraWorkflowText(
         main.replace(

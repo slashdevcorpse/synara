@@ -785,7 +785,3 @@ export function assertPatchedEffectProcessSpawnerIsBundled(
     assertPatchedEntryBundle(bundle);
   }
 }
-
-export function bytesEqual(left: Uint8Array, right: Uint8Array): boolean {
-  return Buffer.from(left).equals(Buffer.from(right));
-}

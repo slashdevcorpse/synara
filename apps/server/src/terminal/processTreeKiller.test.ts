@@ -2,6 +2,9 @@
 // Purpose: Verifies PTY process-tree capture and safe descendant signaling.
 // Layer: Terminal infrastructure tests
 // Depends on: Vitest and injectable processTreeKiller dependencies.
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+
 import { describe, expect, it } from "vitest";
 
 import {
@@ -129,7 +132,7 @@ describe("processTreeKiller", () => {
     );
   });
 
-  it("validates captured children without signalling an uncaptured root", () => {
+  it("validates captured children without signalling an uncaptured root", async () => {
     const signaledPids: Array<{ pid: number; signal: TerminalKillSignal }> = [];
     const treeSignals: Array<{ rootPid: number; signal: TerminalKillSignal }> = [];
     const commandReadCalls: number[][] = [];
@@ -173,7 +176,7 @@ describe("processTreeKiller", () => {
       },
     });
 
-    killer.signal({
+    await killer.signal({
       rootPid: 100,
       signal: "SIGKILL",
       tree,
@@ -337,7 +340,7 @@ describe("processTreeKiller", () => {
     expect(treeSignals).toEqual([]);
   });
 
-  it("validates captured child identity and command before initial SIGTERM", () => {
+  it("validates captured child identity and command before initial SIGTERM", async () => {
     const signaledPids: number[] = [];
     const killer = createProcessTreeKiller({
       readCurrentProcesses: () =>
@@ -368,7 +371,7 @@ describe("processTreeKiller", () => {
       signalTree: (_rootPid, _signal, callback) => callback(null),
     });
 
-    killer.signal({
+    await killer.signal({
       rootPid: 100,
       signal: "SIGTERM",
       tree: {
@@ -383,7 +386,62 @@ describe("processTreeKiller", () => {
     expect(signaledPids).toEqual([103, 102]);
   });
 
-  it("can skip root tree signaling while still signaling captured children", () => {
+  it("waits for root tree signaling while preserving callback error reporting", async () => {
+    const treeKillError = new Error("tree kill failed");
+    const errors: Array<{
+      error: Error;
+      context: { pid: number; source: "tree-kill" | "captured" };
+    }> = [];
+    let completeSignalTree: ((error?: Error | null) => void) | undefined;
+    const killer = createProcessTreeKiller({
+      captureProcessSnapshotAsync: async () =>
+        new Map([
+          [
+            100,
+            {
+              pid: 100,
+              parentPid: 1,
+              command: "terminal root",
+              identity: "100:owned-start",
+            },
+          ],
+        ]),
+      signalTree: (_rootPid, _signal, callback) => {
+        completeSignalTree = callback;
+      },
+    });
+
+    let settled = false;
+    const signaling = Promise.resolve(
+      killer.signalAsync?.({
+        rootPid: 100,
+        signal: "SIGTERM",
+        tree: {
+          root: { pid: 100, command: "terminal root", identity: "100:owned-start" },
+          descendants: [],
+        },
+        onError: (error, context) => errors.push({ error, context }),
+      }),
+    ).then(() => {
+      settled = true;
+    });
+
+    await Promise.resolve();
+    expect(completeSignalTree).toBeTypeOf("function");
+    expect(settled).toBe(false);
+    completeSignalTree?.(treeKillError);
+    await signaling;
+
+    expect(settled).toBe(true);
+    expect(errors).toEqual([
+      {
+        error: treeKillError,
+        context: { pid: 100, source: "tree-kill" },
+      },
+    ]);
+  });
+
+  it("can skip root tree signaling while still signaling captured children", async () => {
     const signaledPids: number[] = [];
     const treeSignals: number[] = [];
     const killer = createProcessTreeKiller({
@@ -409,7 +467,7 @@ describe("processTreeKiller", () => {
       },
     });
 
-    killer.signal({
+    await killer.signal({
       rootPid: 100,
       signal: "SIGKILL",
       includeRootTree: false,
@@ -623,3 +681,31 @@ describe("processTreeKiller", () => {
     });
   });
 });
+it.runIf(process.platform === "win32")(
+  "captures a native Windows child as a descendant of this process",
+  async () => {
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    await once(child, "spawn");
+
+    try {
+      const tree = await createProcessTreeKiller().capture(process.pid);
+
+      if (tree.captureComplete) {
+        expect(tree.descendants.some((descendant) => descendant.pid === child.pid)).toBe(true);
+      } else {
+        // A busy shared test runner can legitimately exceed the bounded walk.
+        // In that case the important contract is that capture fails closed.
+        expect(tree.descendants).toHaveLength(256);
+      }
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill("SIGKILL");
+        await once(child, "exit");
+      }
+    }
+  },
+  10_000,
+);

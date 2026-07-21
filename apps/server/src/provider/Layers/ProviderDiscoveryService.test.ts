@@ -15,7 +15,7 @@ import type {
   ProviderListSkillsResult,
 } from "@synara/contracts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { Effect, Layer } from "effect";
+import { Deferred, Effect, Fiber, Layer, Result } from "effect";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
@@ -31,7 +31,16 @@ import { ProviderAdapterRequestError } from "../Errors.ts";
 import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
 import { ProviderAdapterRegistry } from "../Services/ProviderAdapterRegistry.ts";
 import { ProviderDiscoveryService } from "../Services/ProviderDiscoveryService.ts";
+import {
+  makeProviderMaintenanceGate,
+  ProviderMaintenanceBusyError,
+  ProviderMaintenanceLatchedError,
+} from "../providerMaintenanceGate.ts";
 import { clearSkillsCatalogCacheForTests } from "../skillsCatalog.ts";
+import {
+  findProviderProcessExitUnprovenError,
+  ProviderProcessExitUnprovenError,
+} from "../supervisedProcessTeardown.ts";
 import { makeProviderDiscoveryServiceLive } from "./ProviderDiscoveryService.ts";
 
 let root: string;
@@ -66,6 +75,7 @@ const makeConfigLayer = () =>
         devUrl: undefined,
         publicUrl: undefined,
         allowInsecureRemote: false,
+        allowUnauthenticatedLoopback: true,
         noBrowser: true,
         authToken: undefined,
         autoBootstrapProjectFromCwd: false,
@@ -179,6 +189,150 @@ describe("ProviderDiscoveryService.listSkills", () => {
     });
 
     expect(result.skills.map((skill) => skill.name)).toEqual(["portable"]);
+  });
+
+  it("fails closed instead of serving catalog-only skills when native exit is unproven", async () => {
+    await writeSkill(path.join(baseDir, "skills", "portable"), "portable");
+    const processFailure = new ProviderProcessExitUnprovenError({
+      rootPid: 42_201,
+      rootExited: true,
+      remainingDescendantPids: [42_202],
+      captureComplete: true,
+    });
+    const adapterFailure = new ProviderAdapterRequestError({
+      provider: "codex",
+      method: "skills/list",
+      detail: "native skill discovery exit could not be proven",
+      cause: new AggregateError([new Error("ordinary native failure"), processFailure]),
+    });
+
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const maintenanceGate = yield* makeProviderMaintenanceGate;
+          const baseLayer = Layer.mergeAll(
+            makeConfigLayer(),
+            ServerSettingsService.layerTest(),
+            makeRegistryLayer({ listSkills: () => Effect.fail(adapterFailure) }),
+          ).pipe(Layer.provideMerge(NodeServices.layer));
+          const testLayer = makeProviderDiscoveryServiceLive({
+            projectRootBoundary: root,
+            maintenanceGate,
+          }).pipe(Layer.provideMerge(baseLayer));
+          const result = yield* Effect.gen(function* () {
+            const discovery = yield* ProviderDiscoveryService;
+            return yield* discovery.listSkills({ provider: "codex", cwd });
+          }).pipe(Effect.provide(testLayer), Effect.result);
+
+          expect(Result.isFailure(result)).toBe(true);
+          if (Result.isFailure(result)) {
+            expect(result.failure).toBe(adapterFailure);
+            expect(findProviderProcessExitUnprovenError(result.failure)).toBe(processFailure);
+          }
+
+          let maintenanceRuns = 0;
+          const maintenance = yield* maintenanceGate
+            .withExclusiveMaintenance({
+              provider: "codex",
+              run: Effect.sync(() => {
+                maintenanceRuns += 1;
+              }),
+            })
+            .pipe(Effect.result);
+          expect(Result.isFailure(maintenance)).toBe(true);
+          if (Result.isFailure(maintenance)) {
+            expect(maintenance.failure).toBeInstanceOf(ProviderMaintenanceLatchedError);
+          }
+          expect(maintenanceRuns).toBe(0);
+        }),
+      ),
+    );
+  });
+});
+
+describe("ProviderDiscoveryService maintenance ownership", () => {
+  it("latches an ungated adapter failure before queued maintenance can run", async () => {
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const maintenanceGate = yield* makeProviderMaintenanceGate;
+          const operationStarted = yield* Deferred.make<void>();
+          const releaseOperation = yield* Deferred.make<void>();
+          const processFailure = new ProviderProcessExitUnprovenError({
+            rootPid: 42_203,
+            rootExited: false,
+            remainingDescendantPids: null,
+            captureComplete: false,
+          });
+          const adapterFailure = new ProviderAdapterRequestError({
+            provider: "codex",
+            method: "model/list",
+            detail: "native model discovery exit could not be proven",
+            cause: new Error("wrapped model discovery failure", {
+              cause: new AggregateError([new Error("ordinary model failure"), processFailure]),
+            }),
+          });
+          const listModels = () =>
+            Deferred.succeed(operationStarted, undefined).pipe(
+              Effect.andThen(Deferred.await(releaseOperation)),
+              Effect.andThen(Effect.fail(adapterFailure)),
+            );
+          const baseLayer = Layer.mergeAll(
+            makeConfigLayer(),
+            ServerSettingsService.layerTest(),
+            makeRegistryLayer({ listModels }),
+          ).pipe(Layer.provideMerge(NodeServices.layer));
+          const testLayer = makeProviderDiscoveryServiceLive({
+            projectRootBoundary: root,
+            maintenanceGate,
+          }).pipe(Layer.provideMerge(baseLayer));
+          const operation = yield* Effect.gen(function* () {
+            const discovery = yield* ProviderDiscoveryService;
+            return yield* discovery.listModels({ provider: "codex", cwd });
+          }).pipe(Effect.provide(testLayer), Effect.result, Effect.forkChild);
+          yield* Deferred.await(operationStarted);
+
+          let maintenanceRuns = 0;
+          const maintenance = yield* maintenanceGate
+            .withExclusiveMaintenance({
+              provider: "codex",
+              run: Effect.sync(() => {
+                maintenanceRuns += 1;
+              }),
+            })
+            .pipe(Effect.result, Effect.forkChild);
+          let maintenanceRefusal: ProviderMaintenanceBusyError | undefined;
+          for (let attempt = 0; attempt < 100; attempt += 1) {
+            const probe = yield* maintenanceGate
+              .withOperation({ provider: "codex", operation: "test.probe", run: Effect.void })
+              .pipe(Effect.result);
+            if (Result.isFailure(probe)) {
+              maintenanceRefusal = probe.failure;
+              break;
+            }
+            yield* Effect.yieldNow;
+          }
+          expect(maintenanceRefusal).toBeInstanceOf(ProviderMaintenanceBusyError);
+
+          yield* Deferred.succeed(releaseOperation, undefined);
+          const operationResult = yield* Fiber.join(operation);
+          expect(Result.isFailure(operationResult)).toBe(true);
+          if (Result.isFailure(operationResult)) {
+            expect(operationResult.failure).toBe(adapterFailure);
+            expect(findProviderProcessExitUnprovenError(operationResult.failure)).toBe(
+              processFailure,
+            );
+          }
+
+          const maintenanceResult = yield* Fiber.join(maintenance);
+          expect(Result.isFailure(maintenanceResult)).toBe(true);
+          if (Result.isFailure(maintenanceResult)) {
+            expect(maintenanceResult.failure).toBeInstanceOf(ProviderMaintenanceLatchedError);
+          }
+          expect(maintenanceRuns).toBe(0);
+        }),
+      ),
+    );
   });
 });
 

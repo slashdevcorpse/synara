@@ -86,6 +86,7 @@ interface CliInput {
   readonly devUrl: Option.Option<URL>;
   readonly publicUrl: Option.Option<URL>;
   readonly allowInsecureRemote: BooleanFlagInput;
+  readonly allowUnauthenticatedLoopback: BooleanFlagInput;
   readonly noBrowser: BooleanFlagInput;
   readonly authToken: Option.Option<string>;
   readonly autoBootstrapProjectFromCwd: BooleanFlagInput;
@@ -152,6 +153,9 @@ const CliEnvConfig = Config.all({
   devUrl: Config.url("VITE_DEV_SERVER_URL").pipe(Config.option, Config.map(Option.getOrUndefined)),
   publicUrl: Config.url("SYNARA_PUBLIC_URL").pipe(Config.option, Config.map(Option.getOrUndefined)),
   allowInsecureRemote: optionalBooleanEnvironmentConfig("SYNARA_ALLOW_INSECURE_REMOTE"),
+  allowUnauthenticatedLoopback: optionalBooleanEnvironmentConfig(
+    "SYNARA_ALLOW_UNAUTHENTICATED_LOOPBACK",
+  ),
   noBrowser: optionalBooleanEnvironmentConfig("SYNARA_NO_BROWSER"),
   authToken: Config.string("SYNARA_AUTH_TOKEN").pipe(
     Config.option,
@@ -214,6 +218,11 @@ const ServerConfigLive = (input: CliInput) =>
         input.allowInsecureRemote,
         env.allowInsecureRemote,
         false,
+      );
+      const allowUnauthenticatedLoopback = resolveBooleanConfig(
+        input.allowUnauthenticatedLoopback,
+        env.allowUnauthenticatedLoopback,
+        true,
       );
       const configuredHome = Option.getOrUndefined(input.synaraHome) ?? env.synaraHome;
       const baseDir = yield* resolveBaseDir(configuredHome);
@@ -281,6 +290,7 @@ const ServerConfigLive = (input: CliInput) =>
         devUrl,
         publicUrl,
         allowInsecureRemote,
+        allowUnauthenticatedLoopback,
         noBrowser,
         authToken,
         desktopShutdownToken,
@@ -511,6 +521,12 @@ const allowInsecureRemoteFlag = optionalBooleanFlag("allow-insecure-remote", {
   description:
     "Explicitly allow unencrypted authenticated remote access on a trusted LAN (equivalent to SYNARA_ALLOW_INSECURE_REMOTE).",
 });
+const allowUnauthenticatedLoopbackFlag = optionalBooleanFlag("allow-unauthenticated-loopback", {
+  description:
+    "Preserve unauthenticated local desktop/file/WebSocket access (equivalent to SYNARA_ALLOW_UNAUTHENTICATED_LOOPBACK).",
+  negativeName: "require-loopback-auth",
+  negativeDescription: "Require an authenticated session even on loopback.",
+});
 const noBrowserFlag = optionalBooleanFlag("no-browser", {
   description: "Disable automatic browser opening.",
   negativeName: "browser",
@@ -542,6 +558,7 @@ export const synaraCli = Command.make("synara", {
   devUrl: devUrlFlag,
   publicUrl: publicUrlFlag,
   allowInsecureRemote: allowInsecureRemoteFlag,
+  allowUnauthenticatedLoopback: allowUnauthenticatedLoopbackFlag,
   noBrowser: noBrowserFlag,
   authToken: authTokenFlag,
   autoBootstrapProjectFromCwd: autoBootstrapProjectFromCwdFlag,

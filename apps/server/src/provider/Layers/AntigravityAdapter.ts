@@ -16,7 +16,7 @@ import {
   TurnId,
 } from "@synara/contracts";
 import { prepareWindowsSafeProcess } from "@synara/shared/windowsProcess";
-import { Effect, Layer, Queue, Stream } from "effect";
+import { Cause, Effect, Exit, Layer, Queue, Stream } from "effect";
 
 import { ServerConfig } from "../../config.ts";
 import { buildProviderChildEnvironment } from "../../providerChildEnvironment.ts";
@@ -31,9 +31,36 @@ import {
 } from "../Services/AntigravityAdapter.ts";
 import type { ProviderThreadSnapshot } from "../Services/ProviderAdapter.ts";
 import { appendFileAttachmentsPromptBlock } from "../attachmentProjection.ts";
-import { teardownChildProcessTree } from "../supervisedProcessTeardown.ts";
+import {
+  findProviderProcessExitUnprovenError,
+  teardownChildProcessTree,
+} from "../supervisedProcessTeardown.ts";
+import {
+  makeProviderMaintenanceOwnedResourceCoordinator,
+  type ProviderMaintenanceOwnedResourceCoordinator,
+} from "../providerMaintenanceOwnedResources.ts";
+import {
+  makeProviderProcessOwnerTracker,
+  type ProviderProcessOwnerTracker,
+  type TrackedProviderProcessOwner,
+} from "../providerProcessOwnerTracker.ts";
+import { containPreparedWindowsProviderProcess } from "../windowsProviderProcess.ts";
+import {
+  installPreparedNodeProcessSupervisor,
+  type NodeProviderProcessSupervisor,
+  observeNodeProviderProcessSpawn,
+  supervisePreparedNodeProcess,
+  teardownNodeProviderProcess,
+  windowsJobNodeProcessSupervisor,
+} from "../windowsJobProcessSupervisor.ts";
 
 const PROVIDER = "antigravity" as const;
+const antigravityProcessSupervisors = new WeakMap<ChildProcess, NodeProviderProcessSupervisor>();
+const antigravityProcessOwnershipReady = new WeakMap<ChildProcess, Promise<void>>();
+const antigravityProcessOwners = new WeakMap<
+  ChildProcess,
+  { readonly owner: TrackedProviderProcessOwner; readonly tracker: ProviderProcessOwnerTracker }
+>();
 const DEFAULT_MODEL = "Gemini 3.5 Flash";
 const PRINT_TIMEOUT = "30m";
 const POLL_INTERVAL_MS = 75;
@@ -53,7 +80,12 @@ type TeardownProcessTree = (child: ChildProcess) => Promise<unknown>;
 export interface AntigravityProcessDependencies {
   readonly spawnProcess?: SpawnProcess;
   readonly prepareProcess?: typeof prepareWindowsSafeProcess;
+  readonly containProcess?: typeof containPreparedWindowsProviderProcess;
   readonly teardownProcessTree?: TeardownProcessTree;
+  readonly superviseProcess?: typeof supervisePreparedNodeProcess;
+  readonly platform?: NodeJS.Platform;
+  readonly maintenanceOwnedResources?: ProviderMaintenanceOwnedResourceCoordinator;
+  readonly processOwnerTracker?: ProviderProcessOwnerTracker;
 }
 
 export interface AntigravityProcessOutput {
@@ -275,22 +307,104 @@ function spawnAntigravityProcess(
     readonly dependencies?: AntigravityProcessDependencies;
   },
 ): ChildProcess {
-  const prepared = (options.dependencies?.prepareProcess ?? prepareWindowsSafeProcess)(
-    command,
-    args,
-    {
-      cwd: options.cwd,
-      env: options.env,
-    },
+  const prepareInput = {
+    cwd: options.cwd,
+    env: options.env,
+  };
+  const prepared = (options.dependencies?.containProcess ?? containPreparedWindowsProviderProcess)(
+    (options.dependencies?.prepareProcess ?? prepareWindowsSafeProcess)(
+      command,
+      args,
+      prepareInput,
+    ),
+    prepareInput,
   );
-  return (options.dependencies?.spawnProcess ?? spawn)(prepared.command, prepared.args, {
+  const platform = options.dependencies?.platform ?? process.platform;
+  const child = (options.dependencies?.spawnProcess ?? spawn)(prepared.command, prepared.args, {
     ...(options.cwd ? { cwd: options.cwd } : {}),
     env: options.env,
+    detached: platform !== "win32",
     shell: prepared.shell,
     ...(prepared.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
   });
+  const spawnOutcome = observeNodeProviderProcessSpawn(child);
+  const install = (): void => {
+    let supervisor: NodeProviderProcessSupervisor | undefined;
+    try {
+      const installation = installPreparedNodeProcessSupervisor(
+        prepared,
+        child,
+        {
+          platform,
+          ...(platform === "win32" ? {} : { ownedProcessGroupId: Number(child.pid) }),
+        },
+        options.dependencies?.superviseProcess,
+      );
+      supervisor = installation.supervisor;
+      antigravityProcessSupervisors.set(child, supervisor);
+      if (options.dependencies?.processOwnerTracker) {
+        antigravityProcessOwners.set(child, {
+          owner: Effect.runSync(options.dependencies.processOwnerTracker.register(supervisor)),
+          tracker: options.dependencies.processOwnerTracker,
+        });
+      }
+      if (installation._tag === "Recovered") {
+        throw installation.requestedSupervisorFailure;
+      }
+    } catch (cause) {
+      const tracker = options.dependencies?.processOwnerTracker;
+      const retainedOwner = supervisor && tracker ? tracker.findOwner(supervisor) : undefined;
+      if (retainedOwner && tracker) {
+        antigravityProcessOwners.set(child, { owner: retainedOwner, tracker });
+      }
+      child.once("error", () => undefined);
+      throw cause;
+    }
+  };
+  const rootPid = Number(child.pid);
+  let ownershipReady: Promise<void>;
+  if (Number.isInteger(rootPid) && rootPid > 0) {
+    try {
+      install();
+      ownershipReady = Promise.resolve();
+    } catch (cause) {
+      ownershipReady = Promise.reject(cause);
+    }
+  } else {
+    ownershipReady = spawnOutcome.then((outcome) => {
+      if (outcome._tag !== "Spawned") throw outcome.cause;
+      install();
+    });
+  }
+  antigravityProcessOwnershipReady.set(child, ownershipReady);
+  void ownershipReady.catch(() => undefined);
+  return child;
+}
+
+function antigravityProcessSupervisor(
+  child: ChildProcess,
+): NodeProviderProcessSupervisor | undefined {
+  return antigravityProcessSupervisors.get(child) ?? windowsJobNodeProcessSupervisor(child);
+}
+
+function teardownAntigravityProcess(
+  child: ChildProcess,
+  fallback: () => Promise<unknown>,
+): Promise<unknown> {
+  const tracked = antigravityProcessOwners.get(child);
+  if (tracked) return Effect.runPromise(tracked.tracker.teardown(tracked.owner));
+  return (
+    antigravityProcessSupervisors.get(child)?.teardown() ??
+    teardownNodeProviderProcess(child, fallback)
+  );
+}
+
+function proveAntigravityProcessExit(child: ChildProcess): Promise<unknown> {
+  const tracked = antigravityProcessOwners.get(child);
+  if (tracked) return Effect.runPromise(tracked.tracker.proveExit(tracked.owner));
+  return antigravityProcessSupervisor(child)?.proveExit() ?? Promise.resolve();
 }
 
 export async function runAntigravityHelperProcess(
@@ -308,8 +422,34 @@ export async function runAntigravityHelperProcess(
     env,
     ...(options.dependencies ? { dependencies: options.dependencies } : {}),
   });
+  let teardown: Promise<unknown> | undefined;
+  const beginTeardown = (): Promise<unknown> => {
+    if (!teardown) {
+      const attempt = Promise.resolve()
+        .then(() => antigravityProcessOwnershipReady.get(child))
+        .catch(() => undefined)
+        .then(() =>
+          teardownAntigravityProcess(child, () =>
+            (options.dependencies?.teardownProcessTree ?? teardownChildProcessTree)(child),
+          ),
+        );
+      teardown = attempt;
+      void attempt.catch(() => {
+        if (teardown === attempt) teardown = undefined;
+      });
+    }
+    return teardown;
+  };
   if (!child.stdout || !child.stderr) {
-    throw new Error("Antigravity helper process did not expose piped output streams.");
+    const streamError = new Error(
+      "Antigravity helper process did not expose piped output streams.",
+    );
+    try {
+      await beginTeardown();
+    } catch (teardownError) {
+      throw new AggregateError([streamError, teardownError], streamError.message);
+    }
+    throw streamError;
   }
   const stdout = child.stdout;
   const stderr = child.stderr;
@@ -317,7 +457,6 @@ export async function runAntigravityHelperProcess(
   return await new Promise((resolve, reject) => {
     const output = makeBoundedProcessOutput();
     let claimed = false;
-    let teardown: Promise<unknown> | undefined;
     const timeoutMs = options.timeoutMs ?? MODEL_DISCOVERY_TIMEOUT_MS;
     const onStdout = (chunk: unknown) => output.append("stdout", chunk);
     const onStderr = (chunk: unknown) => output.append("stderr", chunk);
@@ -334,34 +473,29 @@ export async function runAntigravityHelperProcess(
       cleanup();
       return true;
     };
-    const beginTeardown = (): Promise<unknown> => {
-      if (!teardown) {
-        try {
-          teardown = Promise.resolve(
-            (options.dependencies?.teardownProcessTree ?? teardownChildProcessTree)(child),
-          );
-        } catch (cause) {
-          teardown = Promise.reject(cause);
-        }
-      }
-      return teardown;
-    };
     const onError = (cause: Error) => {
-      if (claim()) reject(cause);
+      if (!claim()) return;
+      void beginTeardown().then(
+        () => reject(cause),
+        (teardownError) => reject(new AggregateError([cause, teardownError], cause.message)),
+      );
     };
     const onClose = (code: number | null) => {
-      if (claim()) resolve({ ...output.snapshot(), code: code ?? 1 });
+      if (!claim()) return;
+      void proveAntigravityProcessExit(child).then(
+        () => resolve({ ...output.snapshot(), code: code ?? 1 }),
+        reject,
+      );
     };
     const timer = setTimeout(() => {
       if (!claim()) return;
+      const timeoutError = new Error(
+        `Antigravity helper timed out after ${timeoutMs}ms: ${command} ${args.join(" ")}`,
+      );
       void beginTeardown().then(
-        () =>
-          reject(
-            new Error(
-              `Antigravity helper timed out after ${timeoutMs}ms: ${command} ${args.join(" ")}`,
-            ),
-          ),
-        reject,
+        () => reject(timeoutError),
+        (teardownError) =>
+          reject(new AggregateError([timeoutError, teardownError], timeoutError.message)),
       );
     }, timeoutMs);
 
@@ -369,6 +503,9 @@ export async function runAntigravityHelperProcess(
     stderr.on("data", onStderr);
     child.once("error", onError);
     child.once("close", onClose);
+    void antigravityProcessOwnershipReady
+      .get(child)
+      ?.catch((cause) => onError(cause instanceof Error ? cause : new Error(String(cause))));
   });
 }
 
@@ -386,6 +523,14 @@ export function startAntigravityTurnProcess(input: {
     ...(input.dependencies ? { dependencies: input.dependencies } : {}),
   });
   if (!child.stdout || !child.stderr) {
+    void Promise.resolve(antigravityProcessOwnershipReady.get(child))
+      .catch(() => undefined)
+      .then(() =>
+        teardownAntigravityProcess(child, () =>
+          (input.dependencies?.teardownProcessTree ?? teardownChildProcessTree)(child),
+        ),
+      )
+      .catch(() => undefined);
     throw new Error("Antigravity turn process did not expose piped output streams.");
   }
 
@@ -393,6 +538,7 @@ export function startAntigravityTurnProcess(input: {
   let teardown: Promise<unknown> | undefined;
   let teardownRequested = false;
   let finalizationStarted = false;
+  let finalizedResult: AntigravityTurnProcessResult | undefined;
   let resolveFinalization!: (result: AntigravityTurnProcessResult) => void;
   let rejectFinalization!: (cause: unknown) => void;
   const finalization = new Promise<AntigravityTurnProcessResult>((resolve, reject) => {
@@ -412,13 +558,18 @@ export function startAntigravityTurnProcess(input: {
   const beginTeardown = (): Promise<unknown> => {
     teardownRequested = true;
     if (!teardown) {
-      try {
-        teardown = Promise.resolve(
-          (input.dependencies?.teardownProcessTree ?? teardownChildProcessTree)(child),
+      const attempt = Promise.resolve()
+        .then(() => antigravityProcessOwnershipReady.get(child))
+        .catch(() => undefined)
+        .then(() =>
+          teardownAntigravityProcess(child, () =>
+            (input.dependencies?.teardownProcessTree ?? teardownChildProcessTree)(child),
+          ),
         );
-      } catch (cause) {
-        teardown = Promise.reject(cause);
-      }
+      teardown = attempt;
+      void attempt.catch(() => {
+        if (teardown === attempt) teardown = undefined;
+      });
     }
     return teardown;
   };
@@ -434,10 +585,18 @@ export function startAntigravityTurnProcess(input: {
     void (async () => {
       let teardownError = terminal.teardownError;
       const abnormalExit = terminal.signal !== null || (terminal.code ?? 1) !== 0;
-      const mustAwaitTeardown = teardownRequested || (!terminal.spawnError && abnormalExit);
+      const mustAwaitTeardown =
+        teardownRequested || terminal.spawnError !== undefined || abnormalExit;
       if (mustAwaitTeardown && !teardownError) {
         try {
           await beginTeardown();
+        } catch (cause) {
+          teardownError = cause;
+        }
+      }
+      if (!terminal.spawnError && !mustAwaitTeardown && !teardownError) {
+        try {
+          await proveAntigravityProcessExit(child);
         } catch (cause) {
           teardownError = cause;
         }
@@ -450,16 +609,22 @@ export function startAntigravityTurnProcess(input: {
         ...(teardownError ? { teardownError } : {}),
         teardownRequested,
       };
+      finalizedResult = result;
+      const lifecycleFailure =
+        teardownError && terminal.spawnError
+          ? new AggregateError(
+              [terminal.spawnError, teardownError],
+              messageFromCause(terminal.spawnError, "Antigravity process failed."),
+            )
+          : (teardownError ?? terminal.spawnError);
       try {
         await input.onFinalize(result);
       } catch (cause) {
-        rejectFinalization(teardownError ?? cause);
+        rejectFinalization(lifecycleFailure ?? cause);
         return;
       }
-      if (teardownError) {
-        rejectFinalization(teardownError);
-      } else if (terminal.spawnError) {
-        rejectFinalization(terminal.spawnError);
+      if (lifecycleFailure) {
+        rejectFinalization(lifecycleFailure);
       } else {
         resolveFinalization(result);
       }
@@ -472,7 +637,18 @@ export function startAntigravityTurnProcess(input: {
     beginFinalization({ code, signal });
   };
   const teardownAndFinalize = async (): Promise<AntigravityTurnProcessResult> => {
-    if (finalizationStarted) return await finalization;
+    if (finalizationStarted) {
+      try {
+        return await finalization;
+      } catch (cause) {
+        if (!teardownRequested && findProviderProcessExitUnprovenError(cause) === null) {
+          throw cause;
+        }
+        await beginTeardown();
+        if (finalizedResult === undefined) throw cause;
+        return finalizedResult;
+      }
+    }
     try {
       await beginTeardown();
     } catch (cause) {
@@ -489,6 +665,9 @@ export function startAntigravityTurnProcess(input: {
   child.stderr.on("data", onStderr);
   child.once("error", onError);
   child.once("close", onClose);
+  void antigravityProcessOwnershipReady
+    .get(child)
+    ?.catch((cause) => onError(cause instanceof Error ? cause : new Error(String(cause))));
 
   return { child, finalization, teardownAndFinalize };
 }
@@ -714,6 +893,18 @@ const makeAntigravityAdapter = Effect.fn(function* (options: AntigravityAdapterL
   const events = yield* Queue.unbounded<ProviderRuntimeEvent>();
   const sessions = new Map<ThreadId, AntigravitySessionContext>();
   const defaultEffortByModel = new Map(Object.entries(DEFAULT_EFFORT_BY_MODEL));
+  const maintenanceOwnedResources =
+    options.maintenanceOwnedResources ?? (yield* makeProviderMaintenanceOwnedResourceCoordinator);
+  const processOwnerTracker = makeProviderProcessOwnerTracker({
+    provider: PROVIDER,
+    resourcePrefix: "antigravity-process",
+    maintenanceOwnedResources,
+  });
+  const processDependencies: AntigravityProcessDependencies = {
+    ...options,
+    maintenanceOwnedResources,
+    processOwnerTracker,
+  };
 
   const offer = (event: ProviderRuntimeEvent) => {
     Effect.runPromise(Queue.offer(events, event)).catch(() => undefined);
@@ -768,7 +959,18 @@ const makeAntigravityAdapter = Effect.fn(function* (options: AntigravityAdapterL
           detail: messageFromCause(cause, "Failed to stop the Antigravity process tree."),
           cause,
         }),
-    }).pipe(Effect.asVoid);
+    }).pipe(
+      Effect.tap(() =>
+        Effect.sync(() => {
+          if (context.activeLifecycle !== lifecycle) return;
+          delete context.activeLifecycle;
+          delete context.activeTurnId;
+          delete context.activePrompt;
+          delete context.eventFile;
+        }),
+      ),
+      Effect.asVoid,
+    );
   };
 
   const currentTurn = (context: AntigravitySessionContext): StoredTurn | undefined =>
@@ -994,7 +1196,7 @@ const makeAntigravityAdapter = Effect.fn(function* (options: AntigravityAdapterL
         try: () =>
           options.installCapturePlugin
             ? options.installCapturePlugin(binaryPath)
-            : ensureCapturePlugin(binaryPath, options),
+            : ensureCapturePlugin(binaryPath, processDependencies),
         catch: (cause) =>
           new ProviderAdapterRequestError({
             provider: PROVIDER,
@@ -1178,7 +1380,7 @@ const makeAntigravityAdapter = Effect.fn(function* (options: AntigravityAdapterL
           args,
           cwd,
           env,
-          dependencies: options,
+          dependencies: processDependencies,
           onFinalize: async (result) => {
             if (pollTimer) clearInterval(pollTimer);
             if (sessions.get(input.threadId) !== context || context.activeLifecycle !== lifecycle) {
@@ -1236,10 +1438,12 @@ const makeAntigravityAdapter = Effect.fn(function* (options: AntigravityAdapterL
                 }),
               } satisfies ProviderRuntimeEvent);
             }
-            delete context.activeLifecycle;
-            delete context.activeTurnId;
-            delete context.activePrompt;
-            delete context.eventFile;
+            if (findProviderProcessExitUnprovenError(lifecycleCause) === null) {
+              delete context.activeLifecycle;
+              delete context.activeTurnId;
+              delete context.activePrompt;
+              delete context.eventFile;
+            }
             const {
               activeTurnId: _activeTurnId,
               lastError: _lastError,
@@ -1380,7 +1584,7 @@ const makeAntigravityAdapter = Effect.fn(function* (options: AntigravityAdapterL
           {
             ...(input.cwd ? { cwd: input.cwd } : {}),
             timeoutMs: MODEL_DISCOVERY_TIMEOUT_MS,
-            dependencies: options,
+            dependencies: processDependencies,
           },
         );
         if (result.code !== 0) throw new Error(result.stderr || "agy models failed");
@@ -1406,10 +1610,23 @@ const makeAntigravityAdapter = Effect.fn(function* (options: AntigravityAdapterL
     });
 
   const stopAll = () =>
-    Effect.forEach([...sessions.keys()], (threadId) => stopSession(threadId), {
-      concurrency: "unbounded",
-      discard: true,
-    }).pipe(Effect.asVoid);
+    Effect.gen(function* () {
+      const activeOwners = [...sessions.values()].flatMap((context) => {
+        const child = context.activeLifecycle?.child;
+        const owner = child ? antigravityProcessOwners.get(child)?.owner : undefined;
+        return owner ? [owner] : [];
+      });
+      const sessionExits = yield* Effect.forEach(
+        [...sessions.keys()],
+        (threadId) => stopSession(threadId).pipe(Effect.exit),
+        { concurrency: "unbounded" },
+      );
+      const ownerExit = yield* Effect.exit(processOwnerTracker.drainExcluding(activeOwners));
+      for (const sessionExit of sessionExits) {
+        if (Exit.isFailure(sessionExit)) return yield* Effect.failCause(sessionExit.cause);
+      }
+      if (Exit.isFailure(ownerExit)) return yield* Effect.failCause(ownerExit.cause);
+    });
 
   yield* Effect.addFinalizer(() =>
     stopAll().pipe(Effect.ignore, Effect.andThen(Queue.shutdown(events))),

@@ -4,18 +4,47 @@
 // Depends on: GrokAdapter helper exports and shared contract ids.
 
 import { TurnId } from "@synara/contracts";
-import { describe, expect, it } from "vitest";
+import * as NodeServices from "@effect/platform-node/NodeServices";
+import { Cause, Effect, Exit, Sink, Stream } from "effect";
+import { ChildProcessSpawner } from "effect/unstable/process";
+import { describe, expect, it, vi } from "vitest";
 import { SYNARA_HARNESS_POLICY_MARKER } from "../../agentGateway/harnessPolicy.ts";
+
+import { ServerConfig } from "../../config.ts";
+import { prepareWindowsProviderProcess } from "../windowsProviderProcess.ts";
+import {
+  findProviderProcessExitUnprovenError,
+  ProviderProcessExitUnprovenError,
+} from "../supervisedProcessTeardown.ts";
 
 import {
   isGrokContextCompactionToolCall,
   isRenderableGrokAssistantDelta,
+  makeGrokModelListChildProcess,
+  makeGrokAdapter,
   mergeGrokModelDescriptors,
   parseXaiLanguageModelDescriptors,
   scopeGrokRuntimeItemIdForTurn,
   scopeGrokToolCallStateForTurn,
   takeGrokSynaraHarnessPolicyTextPart,
 } from "./GrokAdapter.ts";
+
+const encoder = new TextEncoder();
+
+function modelListHandle(pid: number) {
+  return ChildProcessSpawner.makeHandle({
+    pid: ChildProcessSpawner.ProcessId(pid),
+    exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(0)),
+    isRunning: Effect.succeed(false),
+    kill: () => Effect.void,
+    stdin: Sink.drain,
+    stdout: Stream.make(encoder.encode("")),
+    stderr: Stream.empty,
+    all: Stream.empty,
+    getInputFd: () => Sink.drain,
+    getOutputFd: () => Stream.empty,
+  });
+}
 
 describe("Grok Synara harness policy", () => {
   it("delivers private scoped host context once", () => {
@@ -28,6 +57,125 @@ describe("Grok Synara harness policy", () => {
 });
 
 describe("GrokAdapter runtime event scoping", () => {
+  it("forwards prepared Windows model-list spawn options", () => {
+    const env = { SYNARA_TEST: "grok-model-list" };
+    const command = makeGrokModelListChildProcess(
+      {
+        command: "C:\\tools\\synara-windows-job-launcher.exe",
+        args: ["--", "C:\\tools\\grok.exe", "models"],
+        shell: false,
+        windowsHide: true,
+        windowsVerbatimArguments: true,
+      },
+      env,
+    );
+
+    expect(command.options).toMatchObject({
+      env,
+      shell: false,
+      windowsHide: true,
+      windowsVerbatimArguments: true,
+    });
+  });
+
+  it("does not continue to xAI fallback after CLI process exit remains unproven", async () => {
+    const processFailure = new ProviderProcessExitUnprovenError({
+      rootPid: 6_301,
+      rootExited: false,
+      remainingDescendantPids: null,
+      captureComplete: false,
+    });
+    let spawnCount = 0;
+    const spawner = ChildProcessSpawner.make(() => {
+      spawnCount += 1;
+      return Effect.fail(
+        new Error("Grok CLI teardown failed", {
+          cause: new AggregateError([new Error("command failed"), processFailure]),
+        }) as never,
+      );
+    });
+
+    const failure = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const adapter = yield* makeGrokAdapter({ binaryPath: "C:\\tools\\grok.exe" });
+          return yield* adapter.listModels!({
+            provider: "grok",
+            binaryPath: "C:\\tools\\grok.exe",
+          }).pipe(Effect.flip);
+        }),
+      ).pipe(
+        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+        Effect.provide(ServerConfig.layerTest(process.cwd(), { prefix: "grok-adapter-test-" })),
+        Effect.provide(NodeServices.layer),
+      ),
+    );
+
+    expect(findProviderProcessExitUnprovenError(failure)).toBe(processFailure);
+    expect(spawnCount).toBe(1);
+  });
+
+  it("retains a failed CLI model owner until a later stopAll retry", async () => {
+    const processFailure = new ProviderProcessExitUnprovenError({
+      rootPid: 6_303,
+      rootExited: true,
+      remainingDescendantPids: [6_304],
+      captureComplete: true,
+    });
+    const teardown = vi
+      .fn<() => Promise<{ escalated: boolean; signalErrors: never[] }>>()
+      .mockRejectedValueOnce(processFailure)
+      .mockResolvedValue({ escalated: false, signalErrors: [] });
+    const spawner = ChildProcessSpawner.make(() => Effect.succeed(modelListHandle(6_303)));
+
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const adapter = yield* makeGrokAdapter(
+            { binaryPath: "C:\\tools\\grok.exe" },
+            {
+              prepareProcess: (command, args, input) =>
+                prepareWindowsProviderProcess(command, args, {
+                  ...input,
+                  platform: "win32",
+                  arch: "x64",
+                  controlDirectory: "C:\\Temp",
+                  launcherPath: "C:\\synara\\synara-windows-job-launcher.exe",
+                  fileExists: () => true,
+                }),
+              superviseProcess: (_prepared, child) => ({
+                rootPid: Number(child.pid),
+                waitForInitialCapture: async () => undefined,
+                captureNow: async () => undefined,
+                proveExit: async () => {
+                  throw processFailure;
+                },
+                teardown,
+              }),
+            },
+          );
+          const listing = yield* Effect.exit(
+            adapter.listModels!({ provider: "grok", binaryPath: "C:\\tools\\grok.exe" }),
+          );
+          expect(Exit.isFailure(listing)).toBe(true);
+          if (Exit.isFailure(listing)) {
+            expect(findProviderProcessExitUnprovenError(Cause.squash(listing.cause))).toBe(
+              processFailure,
+            );
+          }
+          expect(teardown).toHaveBeenCalledTimes(1);
+
+          yield* adapter.stopAll();
+          expect(teardown).toHaveBeenCalledTimes(2);
+        }),
+      ).pipe(
+        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+        Effect.provide(ServerConfig.layerTest(process.cwd(), { prefix: "grok-adapter-test-" })),
+        Effect.provide(NodeServices.layer),
+      ),
+    );
+  });
+
   it("makes reused ACP assistant segment ids unique per DP turn", () => {
     const providerItemId = "assistant:grok-session:segment:5";
 

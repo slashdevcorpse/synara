@@ -1,4 +1,6 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import type { ChildProcess } from "node:child_process";
+import { EventEmitter } from "node:events";
 import os from "node:os";
 import path from "node:path";
 
@@ -19,7 +21,7 @@ import {
   ThreadId,
 } from "@synara/contracts";
 import { assert, describe, it } from "@effect/vitest";
-import { Effect, Exit, Fiber, Layer, Random, Stream } from "effect";
+import { Cause, Deferred, Effect, Exit, Fiber, Layer, Random, Stream } from "effect";
 
 import { attachmentRelativePath } from "../../attachmentStore.ts";
 import { SYNARA_HARNESS_POLICY_MARKER } from "../../agentGateway/harnessPolicy.ts";
@@ -29,6 +31,10 @@ import {
 } from "../../agentGateway/Services/AgentGatewayCredentials.ts";
 import { ServerConfig } from "../../config.ts";
 import { ProviderAdapterRequestError, ProviderAdapterValidationError } from "../Errors.ts";
+import {
+  makeProviderMaintenanceOwnedResourceCoordinator,
+  type ProviderMaintenanceOwnedResourceCoordinator,
+} from "../providerMaintenanceOwnedResources.ts";
 import { ClaudeAdapter } from "../Services/ClaudeAdapter.ts";
 import {
   buildEmbeddedClaudeSystemPromptAppend,
@@ -298,6 +304,14 @@ function makeGatewayCredentialsHarness() {
     stdioProxy: { command: "node", args: ["/state/proxy.mjs"] },
   } satisfies AgentGatewayCredentialsShape;
   return { credentials, revokedTokens };
+}
+
+function makeOwnedClaudeProcess(pid: number): ClaudeOwnedProcess {
+  return {
+    pid,
+    exitCode: 0,
+    signalCode: null,
+  } as unknown as ClaudeOwnedProcess;
 }
 
 function makeDeterministicRandomService(seed = 0x1234_5678): {
@@ -3797,6 +3811,575 @@ await agent("Draft the spec", { label: "delta-agent", phase: "Two" });
       proveExit?.();
       yield* Fiber.join(stopping);
       assert.equal((yield* adapter.listSessions()).length, 0);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(layer),
+    );
+  });
+
+  it.effect("retains a spawned createQuery failure until maintenance proves exit", () =>
+    Effect.gen(function* () {
+      const coordinator = yield* makeProviderMaintenanceOwnedResourceCoordinator;
+      const gateway = makeGatewayCredentialsHarness();
+      const setupFailure = new Error("createQuery failed after spawning Claude");
+      const proofFailure = new Error("first createQuery cleanup proof failed");
+      const successfulQuery = new FakeClaudeQuery();
+      let createCalls = 0;
+      let spawnCalls = 0;
+      let teardownCalls = 0;
+      const layer = makeClaudeAdapterLive({
+        maintenanceOwnedResources: coordinator,
+        spawnClaudeCodeProcess: () => makeOwnedClaudeProcess(74_100 + ++spawnCalls),
+        teardownProcessTree: async () => {
+          teardownCalls += 1;
+          if (teardownCalls === 1) throw proofFailure;
+          return { escalated: false, signalErrors: [] };
+        },
+        createQuery: (input) => {
+          createCalls += 1;
+          input.options.spawnClaudeCodeProcess?.({
+            command: "claude",
+            args: [],
+            env: {},
+            signal: new AbortController().signal,
+          });
+          if (createCalls === 1) throw setupFailure;
+          return successfulQuery;
+        },
+      }).pipe(
+        Layer.provideMerge(ServerConfig.layerTest("/tmp/claude-adapter-test", "/tmp")),
+        Layer.provideMerge(NodeServices.layer),
+        Layer.provideMerge(Layer.succeed(AgentGatewayCredentials, gateway.credentials)),
+      );
+
+      yield* Effect.gen(function* () {
+        const adapter = yield* ClaudeAdapter;
+        const firstFailure = yield* adapter
+          .startSession({
+            threadId: THREAD_ID,
+            provider: "claudeAgent",
+            runtimeMode: "full-access",
+          })
+          .pipe(Effect.flip);
+
+        assert.match(firstFailure.message, /createQuery failed after spawning Claude/u);
+        assert.equal((yield* adapter.listSessions()).length, 0);
+        assert.deepEqual(gateway.revokedTokens, []);
+        assert.equal(spawnCalls, 1);
+        assert.equal(teardownCalls, 1);
+
+        const blocked = yield* adapter
+          .startSession({
+            threadId: THREAD_ID,
+            provider: "claudeAgent",
+            runtimeMode: "full-access",
+          })
+          .pipe(Effect.flip);
+        assert.match(blocked.message, /cleanup of the previous owned process remains unproven/u);
+        assert.equal(createCalls, 1);
+        assert.equal(spawnCalls, 1);
+        assert.deepEqual(gateway.revokedTokens, []);
+
+        yield* coordinator.drainProviderResources({ provider: "claudeAgent" });
+        assert.equal(teardownCalls, 2);
+        assert.deepEqual(gateway.revokedTokens, ["gateway-token-1"]);
+        yield* coordinator.drainProviderResources({ provider: "claudeAgent" });
+        assert.equal(teardownCalls, 2);
+
+        yield* adapter.startSession({
+          threadId: THREAD_ID,
+          provider: "claudeAgent",
+          runtimeMode: "full-access",
+        });
+        assert.equal(createCalls, 2);
+        assert.equal(spawnCalls, 2);
+        yield* adapter.stopAll();
+        assert.equal(teardownCalls, 3);
+        assert.deepEqual(gateway.revokedTokens, ["gateway-token-1", "gateway-token-2"]);
+      }).pipe(Effect.provide(layer));
+    }).pipe(Effect.provideService(Random.Random, makeDeterministicRandomService())),
+  );
+
+  it.effect(
+    "blocks maintenance drain across registration and synchronous process publication",
+    () =>
+      Effect.gen(function* () {
+        const sharedCoordinator = yield* makeProviderMaintenanceOwnedResourceCoordinator;
+        const registrationInserted = yield* Deferred.make<void>();
+        const allowRegistrationReturn = yield* Deferred.make<void>();
+        const drainEntered = yield* Deferred.make<void>();
+        const drainCompleted = yield* Deferred.make<void>();
+        const coordinator = {
+          register: (input) =>
+            sharedCoordinator
+              .register({
+                ...input,
+                close: () =>
+                  Deferred.succeed(drainEntered, undefined).pipe(Effect.andThen(input.close())),
+              })
+              .pipe(
+                Effect.tap(() => Deferred.succeed(registrationInserted, undefined)),
+                Effect.tap(() => Deferred.await(allowRegistrationReturn)),
+              ),
+          drainProviderResources: sharedCoordinator.drainProviderResources,
+        } satisfies ProviderMaintenanceOwnedResourceCoordinator;
+        const gateway = makeGatewayCredentialsHarness();
+        const setupFailure = new Error("createQuery failed after registration barrier");
+        let createCalls = 0;
+        let spawnCalls = 0;
+        let teardownCalls = 0;
+        const layer = makeClaudeAdapterLive({
+          maintenanceOwnedResources: coordinator,
+          spawnClaudeCodeProcess: () => makeOwnedClaudeProcess(74_150 + ++spawnCalls),
+          teardownProcessTree: async () => {
+            teardownCalls += 1;
+            return { escalated: false, signalErrors: [] };
+          },
+          createQuery: (input) => {
+            createCalls += 1;
+            input.options.spawnClaudeCodeProcess?.({
+              command: "claude",
+              args: [],
+              env: {},
+              signal: new AbortController().signal,
+            });
+            throw setupFailure;
+          },
+        }).pipe(
+          Layer.provideMerge(ServerConfig.layerTest("/tmp/claude-adapter-test", "/tmp")),
+          Layer.provideMerge(NodeServices.layer),
+          Layer.provideMerge(Layer.succeed(AgentGatewayCredentials, gateway.credentials)),
+        );
+
+        yield* Effect.gen(function* () {
+          const adapter = yield* ClaudeAdapter;
+          const startFiber = yield* Effect.exit(
+            adapter.startSession({
+              threadId: THREAD_ID,
+              provider: "claudeAgent",
+              runtimeMode: "full-access",
+            }),
+          ).pipe(Effect.forkChild);
+
+          yield* Deferred.await(registrationInserted);
+          const drainFiber = yield* coordinator
+            .drainProviderResources({ provider: "claudeAgent" })
+            .pipe(
+              Effect.tap(() => Deferred.succeed(drainCompleted, undefined)),
+              Effect.forkChild,
+            );
+          yield* Deferred.await(drainEntered);
+
+          assert.equal(yield* Deferred.isDone(drainCompleted), false);
+          assert.equal(createCalls, 0);
+          assert.equal(spawnCalls, 0);
+          assert.equal(teardownCalls, 0);
+          assert.deepEqual(gateway.revokedTokens, []);
+
+          yield* Deferred.succeed(allowRegistrationReturn, undefined);
+          const startExit = yield* Fiber.join(startFiber);
+          yield* Fiber.join(drainFiber);
+
+          assert.ok(Exit.isFailure(startExit));
+          if (Exit.isFailure(startExit)) {
+            assert.match(
+              Cause.pretty(startExit.cause),
+              /createQuery failed after registration barrier/u,
+            );
+          }
+          assert.equal(createCalls, 1);
+          assert.equal(spawnCalls, 1);
+          assert.equal(teardownCalls, 1);
+          assert.deepEqual(gateway.revokedTokens, ["gateway-token-1"]);
+
+          yield* coordinator.drainProviderResources({ provider: "claudeAgent" });
+          assert.equal(teardownCalls, 1);
+          assert.deepEqual(gateway.revokedTokens, ["gateway-token-1"]);
+        }).pipe(Effect.provide(layer));
+      }).pipe(Effect.provideService(Random.Random, makeDeterministicRandomService())),
+  );
+
+  it.effect("preserves pre-context setup failure while stopAll retries retained proof", () => {
+    const gateway = makeGatewayCredentialsHarness();
+    const query = new FakeClaudeQuery();
+    const setupFailure = new Error("supportedModels failed before session context install");
+    const proofFailure = new Error("first pre-context cleanup proof failed");
+    (query as { supportedModels: () => Promise<[]> }).supportedModels = () => {
+      throw setupFailure;
+    };
+    let teardownCalls = 0;
+    const layer = makeClaudeAdapterLive({
+      spawnClaudeCodeProcess: () => makeOwnedClaudeProcess(74_201),
+      teardownProcessTree: async () => {
+        teardownCalls += 1;
+        if (teardownCalls === 1) throw proofFailure;
+        return { escalated: false, signalErrors: [] };
+      },
+      createQuery: (input) => {
+        input.options.spawnClaudeCodeProcess?.({
+          command: "claude",
+          args: [],
+          env: {},
+          signal: new AbortController().signal,
+        });
+        return query;
+      },
+    }).pipe(
+      Layer.provideMerge(ServerConfig.layerTest("/tmp/claude-adapter-test", "/tmp")),
+      Layer.provideMerge(NodeServices.layer),
+      Layer.provideMerge(Layer.succeed(AgentGatewayCredentials, gateway.credentials)),
+    );
+
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const startExit = yield* Effect.exit(
+        adapter.startSession({
+          threadId: THREAD_ID,
+          provider: "claudeAgent",
+          runtimeMode: "full-access",
+        }),
+      );
+
+      assert.ok(Exit.isFailure(startExit));
+      if (Exit.isFailure(startExit)) {
+        const primaryCause = Cause.pretty(startExit.cause);
+        assert.match(primaryCause, /supportedModels failed before session context install/u);
+        assert.notInclude(primaryCause, "first pre-context cleanup proof failed");
+      }
+      assert.equal(query.closeCalls, 1);
+      assert.equal((yield* adapter.listSessions()).length, 0);
+      assert.equal(teardownCalls, 1);
+      assert.deepEqual(gateway.revokedTokens, []);
+
+      yield* adapter.stopAll();
+      assert.equal(teardownCalls, 2);
+      assert.deepEqual(gateway.revokedTokens, ["gateway-token-1"]);
+      yield* adapter.stopAll();
+      assert.equal(teardownCalls, 2);
+      assert.deepEqual(gateway.revokedTokens, ["gateway-token-1"]);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(layer),
+    );
+  });
+
+  it.effect("retains temporary command ownership when close and first proof fail", () =>
+    Effect.gen(function* () {
+      const coordinator = yield* makeProviderMaintenanceOwnedResourceCoordinator;
+      const firstQuery = new FakeClaudeQuery();
+      const secondQuery = new FakeClaudeQuery();
+      const closeFailure = new Error("temporary Claude query close failed");
+      const proofFailure = new Error("temporary Claude process proof failed");
+      (firstQuery as { close: () => void }).close = () => {
+        firstQuery.closeCalls += 1;
+        throw closeFailure;
+      };
+      let createCalls = 0;
+      let spawnCalls = 0;
+      let teardownCalls = 0;
+      const layer = makeClaudeAdapterLive({
+        maintenanceOwnedResources: coordinator,
+        spawnClaudeCodeProcess: () => makeOwnedClaudeProcess(74_300 + ++spawnCalls),
+        teardownProcessTree: async () => {
+          teardownCalls += 1;
+          if (teardownCalls === 1) throw proofFailure;
+          return { escalated: false, signalErrors: [] };
+        },
+        createQuery: (input) => {
+          createCalls += 1;
+          input.options.spawnClaudeCodeProcess?.({
+            command: "claude",
+            args: [],
+            env: {},
+            signal: new AbortController().signal,
+          });
+          return createCalls === 1 ? firstQuery : secondQuery;
+        },
+      }).pipe(
+        Layer.provideMerge(ServerConfig.layerTest("/tmp/claude-adapter-test", "/tmp")),
+        Layer.provideMerge(NodeServices.layer),
+      );
+
+      yield* Effect.gen(function* () {
+        const adapter = yield* ClaudeAdapter;
+        const failure = yield* adapter.listCommands!({
+          provider: "claudeAgent",
+          cwd: "/tmp",
+          forceReload: true,
+        }).pipe(Effect.flip);
+
+        assert.match(
+          failure.message,
+          /Claude command discovery close and process-tree cleanup both failed/u,
+        );
+        assert.equal(firstQuery.closeCalls, 1);
+        assert.equal(createCalls, 1);
+        assert.equal(spawnCalls, 1);
+        assert.equal(teardownCalls, 1);
+
+        const blocked = yield* adapter.listCommands!({
+          provider: "claudeAgent",
+          cwd: "/tmp",
+          forceReload: true,
+        }).pipe(Effect.flip);
+        assert.match(
+          blocked.message,
+          /Cannot start Claude command discovery while cleanup of the previous owned process remains unproven/u,
+        );
+        assert.equal(createCalls, 1);
+        assert.equal(spawnCalls, 1);
+        assert.equal(teardownCalls, 1);
+
+        yield* coordinator.drainProviderResources({ provider: "claudeAgent" });
+        assert.equal(teardownCalls, 2);
+        yield* coordinator.drainProviderResources({ provider: "claudeAgent" });
+
+        const commands = yield* adapter.listCommands!({
+          provider: "claudeAgent",
+          cwd: "/tmp",
+          forceReload: true,
+        });
+        assert.deepEqual(commands.commands, []);
+        assert.equal(createCalls, 2);
+        assert.equal(spawnCalls, 2);
+        assert.equal(secondQuery.closeCalls, 1);
+        assert.equal(teardownCalls, 3);
+
+        yield* adapter.stopAll();
+        assert.equal(teardownCalls, 3);
+      }).pipe(Effect.provide(layer));
+    }).pipe(Effect.provideService(Random.Random, makeDeterministicRandomService())),
+  );
+
+  it.effect("keeps a coordinator registration defect locally drainable", () =>
+    Effect.gen(function* () {
+      const sharedCoordinator = yield* makeProviderMaintenanceOwnedResourceCoordinator;
+      const gateway = makeGatewayCredentialsHarness();
+      const registrationFailure = new Error("Claude owner registration failed");
+      let registrationCalls = 0;
+      const coordinator = {
+        register: (input) => {
+          registrationCalls += 1;
+          return registrationCalls === 1
+            ? Effect.die(registrationFailure)
+            : sharedCoordinator.register(input);
+        },
+        drainProviderResources: sharedCoordinator.drainProviderResources,
+      } satisfies ProviderMaintenanceOwnedResourceCoordinator;
+      const query = new FakeClaudeQuery();
+      let createCalls = 0;
+      let spawnCalls = 0;
+      const layer = makeClaudeAdapterLive({
+        maintenanceOwnedResources: coordinator,
+        spawnClaudeCodeProcess: () => makeOwnedClaudeProcess(74_400 + ++spawnCalls),
+        teardownProcessTree: async () => ({ escalated: false, signalErrors: [] }),
+        createQuery: (input) => {
+          createCalls += 1;
+          input.options.spawnClaudeCodeProcess?.({
+            command: "claude",
+            args: [],
+            env: {},
+            signal: new AbortController().signal,
+          });
+          return query;
+        },
+      }).pipe(
+        Layer.provideMerge(ServerConfig.layerTest("/tmp/claude-adapter-test", "/tmp")),
+        Layer.provideMerge(NodeServices.layer),
+        Layer.provideMerge(Layer.succeed(AgentGatewayCredentials, gateway.credentials)),
+      );
+
+      yield* Effect.gen(function* () {
+        const adapter = yield* ClaudeAdapter;
+        const firstExit = yield* Effect.exit(
+          adapter.startSession({
+            threadId: THREAD_ID,
+            provider: "claudeAgent",
+            runtimeMode: "full-access",
+          }),
+        );
+        assert.ok(Exit.isFailure(firstExit));
+        if (Exit.isFailure(firstExit)) {
+          assert.match(Cause.pretty(firstExit.cause), /Claude owner registration failed/u);
+        }
+        assert.equal(createCalls, 0);
+        assert.equal(spawnCalls, 0);
+        assert.deepEqual(gateway.revokedTokens, []);
+
+        const blocked = yield* adapter
+          .startSession({
+            threadId: THREAD_ID,
+            provider: "claudeAgent",
+            runtimeMode: "full-access",
+          })
+          .pipe(Effect.flip);
+        assert.match(blocked.message, /cleanup of the previous owned process remains unproven/u);
+        assert.equal(registrationCalls, 1);
+        assert.equal(createCalls, 0);
+
+        yield* adapter.stopAll();
+        assert.deepEqual(gateway.revokedTokens, ["gateway-token-1"]);
+        yield* adapter.startSession({
+          threadId: THREAD_ID,
+          provider: "claudeAgent",
+          runtimeMode: "full-access",
+        });
+        assert.equal(registrationCalls, 2);
+        assert.equal(createCalls, 1);
+        assert.equal(spawnCalls, 1);
+        yield* adapter.stopAll();
+        assert.deepEqual(gateway.revokedTokens, ["gateway-token-1", "gateway-token-2"]);
+      }).pipe(Effect.provide(layer));
+    }).pipe(Effect.provideService(Random.Random, makeDeterministicRandomService())),
+  );
+
+  it.effect("surfaces late contained-process supervision failure without an error listener", () => {
+    const query = new FakeClaudeQuery();
+    const supervisionFailure = new Error("late Claude supervisor construction failed");
+    let triggerSupervisionFailure: (() => void) | undefined;
+    let releaseTeardown: (() => void) | undefined;
+    let markTeardownStarted: (() => void) | undefined;
+    const teardownStarted = new Promise<void>((resolve) => {
+      markTeardownStarted = resolve;
+    });
+    const teardownGate = new Promise<void>((resolve) => {
+      releaseTeardown = resolve;
+    });
+    let teardownCalls = 0;
+    const child = Object.assign(new EventEmitter(), {
+      pid: 9071,
+      exitCode: null,
+      signalCode: null,
+      kill: () => true,
+    }) as unknown as ChildProcess;
+    const layer = makeClaudeAdapterLive({
+      spawnContainedClaudeProcess: (_options, dependencies) => {
+        dependencies.onSpawnedProcess?.({
+          prepared: { command: "claude", args: [], shell: false },
+          process: child,
+          platform: "linux",
+        });
+        triggerSupervisionFailure = () => {
+          void dependencies.onSupervisionError?.(supervisionFailure);
+        };
+        return child;
+      },
+      teardownProcessTree: async () => {
+        teardownCalls += 1;
+        markTeardownStarted?.();
+        await teardownGate;
+        return { escalated: false, signalErrors: [] };
+      },
+      createQuery: (input) => {
+        input.options.spawnClaudeCodeProcess?.({
+          command: "claude",
+          args: [],
+          env: {},
+          signal: new AbortController().signal,
+        });
+        return query;
+      },
+    }).pipe(
+      Layer.provideMerge(ServerConfig.layerTest("/tmp/claude-adapter-test", "/tmp")),
+      Layer.provideMerge(NodeServices.layer),
+    );
+
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const runtimeEvents: ProviderRuntimeEvent[] = [];
+      const runtimeEventsFiber = Effect.runFork(
+        Stream.runForEach(adapter.streamEvents, (event) =>
+          Effect.sync(() => runtimeEvents.push(event)),
+        ),
+      );
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: "claudeAgent",
+        runtimeMode: "full-access",
+      });
+
+      triggerSupervisionFailure?.();
+      yield* Effect.promise(() => teardownStarted);
+      assert.equal(child.listenerCount("error"), 0);
+      assert.equal(teardownCalls, 1);
+
+      releaseTeardown?.();
+      for (let attempt = 0; attempt < 10; attempt += 1) yield* Effect.yieldNow;
+      assert.equal(
+        runtimeEvents.some(
+          (event) =>
+            event.type === "runtime.error" &&
+            event.payload.message.includes("late Claude supervisor construction failed"),
+        ),
+        true,
+      );
+      assert.equal((yield* adapter.listSessions()).length, 1);
+
+      yield* adapter.stopSession(THREAD_ID);
+      assert.equal((yield* adapter.listSessions()).length, 0);
+      assert.equal(teardownCalls, 1);
+      runtimeEventsFiber.interruptUnsafe();
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(layer),
+    );
+  });
+
+  it.effect("fails command discovery when deferred process supervision fails", () => {
+    const query = new FakeClaudeQuery();
+    Object.defineProperty(query, "supportedCommands", {
+      value: () => new Promise<never>(() => undefined),
+    });
+    const supervisionFailure = new Error("command discovery supervision failed");
+    let teardownCalls = 0;
+    const child = Object.assign(new EventEmitter(), {
+      pid: 9072,
+      exitCode: null,
+      signalCode: null,
+      kill: () => true,
+    }) as unknown as ChildProcess;
+    const layer = makeClaudeAdapterLive({
+      spawnContainedClaudeProcess: (_options, dependencies) => {
+        dependencies.onSpawnedProcess?.({
+          prepared: { command: "claude", args: [], shell: false },
+          process: child,
+          platform: "linux",
+        });
+        queueMicrotask(() => {
+          void dependencies.onSupervisionError?.(supervisionFailure);
+        });
+        return child;
+      },
+      teardownProcessTree: async () => {
+        teardownCalls += 1;
+        return { escalated: false, signalErrors: [] };
+      },
+      createQuery: (input) => {
+        input.options.spawnClaudeCodeProcess?.({
+          command: "claude",
+          args: [],
+          env: {},
+          signal: new AbortController().signal,
+        });
+        return query;
+      },
+    }).pipe(
+      Layer.provideMerge(ServerConfig.layerTest("/tmp/claude-adapter-test", "/tmp")),
+      Layer.provideMerge(NodeServices.layer),
+    );
+
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const failure = yield* adapter.listCommands!({
+        provider: "claudeAgent",
+        cwd: "/tmp",
+        forceReload: true,
+      }).pipe(Effect.flip);
+
+      assert.match(failure.message, /command discovery supervision failed/u);
+      assert.equal(teardownCalls, 1);
+      assert.equal(child.listenerCount("error"), 0);
+      assert.ok(query.closeCalls >= 1);
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(layer),

@@ -25,7 +25,15 @@ import {
   type ProviderAdapterError,
 } from "../Errors.ts";
 import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
-import { makeProviderMaintenanceGate } from "../providerMaintenanceGate.ts";
+import {
+  makeProviderMaintenanceGate,
+  ProviderMaintenanceBusyError,
+  ProviderMaintenanceLatchedError,
+} from "../providerMaintenanceGate.ts";
+import {
+  findProviderProcessExitUnprovenError,
+  ProviderProcessExitUnprovenError,
+} from "../supervisedProcessTeardown.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 
 const fakeCodexAdapter: CodexAdapterShape = {
@@ -334,6 +342,97 @@ it.effect("gates direct adapter work while leaving maintenance controls availabl
 
       yield* Deferred.succeed(releaseMaintenance, undefined);
       yield* Fiber.join(maintenance);
+    }),
+  ),
+);
+
+it.effect("latches a proxied adapter exit-proof failure before queued maintenance can run", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const maintenanceGate = yield* makeProviderMaintenanceGate;
+      const operationStarted = yield* Deferred.make<void>();
+      const releaseOperation = yield* Deferred.make<void>();
+      const processFailure = new ProviderProcessExitUnprovenError({
+        rootPid: 42_101,
+        rootExited: true,
+        remainingDescendantPids: [42_102],
+        captureComplete: true,
+      });
+      const adapterFailure = new ProviderAdapterRequestError({
+        provider: "codex",
+        method: "model/list",
+        detail: "model discovery failed",
+        cause: new Error("wrapped model discovery failure", {
+          cause: new AggregateError([new Error("ordinary failure"), processFailure]),
+        }),
+      });
+      const listModels = vi.fn(() =>
+        Deferred.succeed(operationStarted, undefined).pipe(
+          Effect.andThen(Deferred.await(releaseOperation)),
+          Effect.andThen(Effect.fail(adapterFailure)),
+        ),
+      );
+      const adapter = {
+        ...fakeCodexAdapter,
+        listModels,
+      } as ProviderAdapterShape<ProviderAdapterError>;
+      const registryLayer = makeProviderAdapterRegistryLive({
+        adapters: [adapter],
+        maintenanceGate,
+      });
+      const operation = yield* Effect.gen(function* () {
+        const registry = yield* ProviderAdapterRegistry;
+        const gated = yield* registry.getByProvider("codex");
+        return yield* gated.listModels!({ provider: "codex" });
+      }).pipe(Effect.provide(registryLayer), Effect.result, Effect.forkChild);
+      yield* Deferred.await(operationStarted);
+
+      let maintenanceRuns = 0;
+      const maintenance = yield* maintenanceGate
+        .withExclusiveMaintenance({
+          provider: "codex",
+          run: Effect.sync(() => {
+            maintenanceRuns += 1;
+          }),
+        })
+        .pipe(Effect.result, Effect.forkChild);
+      let maintenanceRefusal: ProviderMaintenanceBusyError | undefined;
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        const probe = yield* maintenanceGate
+          .withOperation({ provider: "codex", operation: "test.probe", run: Effect.void })
+          .pipe(Effect.result);
+        if (Result.isFailure(probe)) {
+          maintenanceRefusal = probe.failure;
+          break;
+        }
+        yield* Effect.yieldNow;
+      }
+      assert.equal(maintenanceRefusal instanceof ProviderMaintenanceBusyError, true);
+
+      yield* Deferred.succeed(releaseOperation, undefined);
+      const operationResult = yield* Fiber.join(operation);
+      assert.equal(Result.isFailure(operationResult), true);
+      if (Result.isFailure(operationResult)) {
+        assert.equal(operationResult.failure, adapterFailure);
+        assert.equal(findProviderProcessExitUnprovenError(operationResult.failure), processFailure);
+      }
+
+      const maintenanceResult = yield* Fiber.join(maintenance);
+      assert.equal(Result.isFailure(maintenanceResult), true);
+      if (Result.isFailure(maintenanceResult)) {
+        assert.equal(maintenanceResult.failure instanceof ProviderMaintenanceLatchedError, true);
+      }
+      assert.equal(maintenanceRuns, 0);
+      assert.equal(listModels.mock.calls.length, 1);
+
+      const futureOperation = yield* maintenanceGate
+        .withOperation({ provider: "codex", operation: "future.operation", run: Effect.void })
+        .pipe(Effect.result);
+      assert.equal(Result.isFailure(futureOperation), true);
+      if (Result.isFailure(futureOperation)) {
+        assert.equal(futureOperation.failure instanceof ProviderMaintenanceBusyError, true);
+        assert.equal(futureOperation.failure.latchedReason, processFailure.message);
+      }
     }),
   ),
 );

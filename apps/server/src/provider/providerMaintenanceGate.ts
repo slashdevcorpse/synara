@@ -1,6 +1,8 @@
 import type { ProviderKind } from "@synara/contracts";
 import { Cause, Data, Deferred, Effect, Ref } from "effect";
 
+import { findProviderProcessExitUnprovenError } from "./supervisedProcessTeardown.ts";
+
 export class ProviderMaintenanceBusyError extends Data.TaggedError("ProviderMaintenanceBusyError")<{
   readonly provider: ProviderKind;
   readonly operation: string;
@@ -8,7 +10,7 @@ export class ProviderMaintenanceBusyError extends Data.TaggedError("ProviderMain
 }> {
   override get message(): string {
     if (this.latchedReason !== null) {
-      return `Provider '${this.provider}' remains unavailable because updater process exit could not be proven. Restart Synara before retrying '${this.operation}'. ${this.latchedReason}`;
+      return `Provider '${this.provider}' remains unavailable because provider process exit could not be proven. Restart Synara before retrying '${this.operation}'. ${this.latchedReason}`;
     }
     return `Provider '${this.provider}' is unavailable while its CLI is being updated (${this.operation}).`;
   }
@@ -204,7 +206,15 @@ export const makeProviderMaintenanceGate = Effect.gen(function* () {
           });
         }
 
-        return yield* restore(input.run).pipe(Effect.ensuring(releaseOperation(input.provider)));
+        return yield* restore(input.run).pipe(
+          Effect.onError((cause) => {
+            const unprovenExit = findProviderProcessExitUnprovenError(Cause.squash(cause));
+            return unprovenExit === null
+              ? Effect.void
+              : latchProvider({ provider: input.provider, reason: unprovenExit.message });
+          }),
+          Effect.ensuring(releaseOperation(input.provider)),
+        );
       }),
     );
 
@@ -227,18 +237,34 @@ export const makeProviderMaintenanceGate = Effect.gen(function* () {
           yield* Deferred.succeed(drain, undefined);
         }
 
-        const run = restore(Deferred.await(drain).pipe(Effect.andThen(input.run)));
-        const latchBeforeRelease =
-          input.latchReasonOnFailure === undefined
-            ? run
-            : run.pipe(
-                Effect.onError((cause) => {
-                  const reason = input.latchReasonOnFailure?.(cause) ?? null;
-                  return reason === null
-                    ? Effect.void
-                    : latchProvider({ provider: input.provider, reason });
-                }),
-              );
+        const assertNotLatchedAfterDrain = Ref.get(statesRef).pipe(
+          Effect.flatMap((states) => {
+            const current = states.get(input.provider);
+            return current?.drain === drain && current.latchedReason !== null
+              ? Effect.fail(
+                  new ProviderMaintenanceLatchedError({
+                    provider: input.provider,
+                    reason: current.latchedReason,
+                  }),
+                )
+              : Effect.void;
+          }),
+        );
+        const run = restore(
+          Deferred.await(drain).pipe(
+            Effect.andThen(assertNotLatchedAfterDrain),
+            Effect.andThen(input.run),
+          ),
+        );
+        const latchBeforeRelease = run.pipe(
+          Effect.onError((cause) => {
+            const unprovenExit = findProviderProcessExitUnprovenError(Cause.squash(cause));
+            const reason = unprovenExit?.message ?? input.latchReasonOnFailure?.(cause) ?? null;
+            return reason === null
+              ? Effect.void
+              : latchProvider({ provider: input.provider, reason });
+          }),
+        );
         return yield* latchBeforeRelease.pipe(
           Effect.ensuring(releaseMaintenance(input.provider, drain)),
         );

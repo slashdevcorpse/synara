@@ -1,0 +1,5 @@
+{
+  "architectures": ["x64", "arm64"],
+  "executableName": "synara-windows-job-launcher.exe",
+  "protocolVersion": "2"
+}

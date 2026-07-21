@@ -57,6 +57,9 @@ describe("server runtime layer assembly", () => {
     expect(maintenanceOptions?.maintenanceGate).toBeDefined();
     expect(maintenanceOptions?.maintenanceOwnedResources).toBeDefined();
     expect(providerOptions?.maintenanceGate).toBe(maintenanceOptions?.maintenanceGate);
+    expect(providerOptions?.maintenanceOwnedResources).toBe(
+      maintenanceOptions?.maintenanceOwnedResources,
+    );
     expect(providerHealthOptions).toBe(maintenanceOptions);
     expect(gitOptions).toBe(maintenanceOptions);
     expect(gitRuntimeLayerMocks.makeGitLayerLive.mock.calls[0]?.[1]).toEqual({
@@ -87,6 +90,9 @@ describe("server runtime layer assembly", () => {
     expect(maintenanceOptions?.maintenanceGate).toBeDefined();
     expect(maintenanceOptions?.maintenanceOwnedResources).toBeDefined();
     expect(providerOptions?.maintenanceGate).toBe(maintenanceOptions?.maintenanceGate);
+    expect(providerOptions?.maintenanceOwnedResources).toBe(
+      maintenanceOptions?.maintenanceOwnedResources,
+    );
     expect(providerHealthOptions).toBe(maintenanceOptions);
     expect(gitOptions).toBe(maintenanceOptions);
     expect(gitRuntimeLayerMocks.makeGitLayerLive.mock.calls[0]?.[1]).toEqual({
@@ -115,6 +121,7 @@ describe("server runtime layer assembly", () => {
     expect(maintenanceOptions?.maintenanceGate).toBe(maintenanceGate);
     expect(maintenanceOptions?.maintenanceOwnedResources).toBe(maintenanceOwnedResources);
     expect(providerOptions?.maintenanceGate).toBe(maintenanceGate);
+    expect(providerOptions?.maintenanceOwnedResources).toBe(maintenanceOwnedResources);
     expect(providerHealthOptions).toBe(maintenanceOptions);
     expect(gitOptions).toBe(maintenanceOptions);
   });

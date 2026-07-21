@@ -30,6 +30,7 @@ import {
   makeProviderMaintenanceGate,
   type ProviderMaintenanceGate,
 } from "../providerMaintenanceGate.ts";
+import { findProviderProcessExitUnprovenError } from "../supervisedProcessTeardown.ts";
 
 export interface ProviderDiscoveryServiceLiveOptions {
   readonly maintenanceGate?: ProviderMaintenanceGate;
@@ -82,18 +83,18 @@ const make = (options?: ProviderDiscoveryServiceLiveOptions) =>
         .withOperation({
           provider: input.provider,
           operation: input.operation,
-          run: Effect.result(input.run),
+          run: input.run,
         })
         .pipe(
-          Effect.mapError(
-            (error) =>
+          Effect.catchTag("ProviderMaintenanceBusyError", (error) =>
+            Effect.fail(
               new ProviderValidationError({
                 operation: input.operation,
                 issue: error.message,
                 cause: error,
               }),
+            ),
           ),
-          Effect.flatMap((result) => Effect.fromResult(result)),
         );
 
     const getComposerCapabilities: ProviderDiscoveryServiceShape["getComposerCapabilities"] = (
@@ -132,12 +133,15 @@ const make = (options?: ProviderDiscoveryServiceLiveOptions) =>
               operation: "ProviderDiscoveryService.listSkills",
               run: adapter.listSkills(parsed),
             }).pipe(
-              Effect.catch((error) =>
-                Effect.logWarning(
+              Effect.catch((error) => {
+                if (findProviderProcessExitUnprovenError(error) !== null) {
+                  return Effect.fail(error);
+                }
+                return Effect.logWarning(
                   "provider-native skill discovery failed; serving the Synara skills catalog only",
                   { provider: parsed.provider, error },
-                ).pipe(Effect.as(null)),
-              ),
+                ).pipe(Effect.as(null));
+              }),
             )
           : null;
         const catalogSkills = yield* Effect.tryPromise(() =>

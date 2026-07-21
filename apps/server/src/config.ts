@@ -103,6 +103,8 @@ export interface ServerConfigShape extends ServerDerivedPaths {
   readonly devUrl: URL | undefined;
   readonly publicUrl: URL | undefined;
   readonly allowInsecureRemote: boolean;
+  /** Preserve the legacy unauthenticated local-app path unless explicitly hardened. */
+  readonly allowUnauthenticatedLoopback: boolean;
   readonly noBrowser: boolean;
   readonly authToken: string | undefined;
   readonly desktopShutdownToken?: string | undefined;
@@ -267,6 +269,7 @@ export class ServerConfig extends ServiceMap.Service<ServerConfig, ServerConfigS
           devUrl,
           publicUrl: undefined,
           allowInsecureRemote: false,
+          allowUnauthenticatedLoopback: true,
           noBrowser: false,
         } satisfies ServerConfigShape;
       }),

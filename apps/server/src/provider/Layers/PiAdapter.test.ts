@@ -12,7 +12,11 @@ import path from "node:path";
 
 import { AuthStorage, ModelRegistry } from "@earendil-works/pi-coding-agent";
 import type { Api, Model } from "@earendil-works/pi-ai";
-import { describe, expect, it } from "vitest";
+import { Effect } from "effect";
+import { describe, expect, it, vi } from "vitest";
+import type { ProviderMaintenanceOwnedResourceCoordinator } from "../providerMaintenanceOwnedResources.ts";
+import { prepareWindowsProviderProcess } from "../windowsProviderProcess.ts";
+import { supervisePreparedNodeProcess } from "../windowsJobProcessSupervisor.ts";
 import {
   getPiDiscoverableModels,
   getPiSupportedThinkingOptions,
@@ -155,7 +159,21 @@ describe("Pi Bash process supervision", () => {
     });
     const supervisor = makePiBashProcessSupervisor({
       getShellConfig: () => ({ shell: "/bin/sh", args: ["-c"] }),
+      platform: "linux",
       spawnProcess: () => child,
+      superviseProcess: (_prepared, process, options) => ({
+        rootPid: Number(process.pid),
+        requestTermination: () => true,
+        proveExit: async () => ({ escalated: false, signalErrors: [] }),
+        teardown: () => {
+          const rootExited = new Promise<void>((resolve) => process.once("exit", () => resolve()));
+          return options.teardownProcessTree!({
+            rootPid: Number(process.pid),
+            rootExited,
+            ownedProcessGroupId: Number(process.pid),
+          });
+        },
+      }),
       teardownProcessTree: async (input) => {
         observeTeardown();
         await exitProof;
@@ -188,6 +206,227 @@ describe("Pi Bash process supervision", () => {
     proveExit();
     await expect(command).rejects.toThrow("aborted");
     expect(settled).toBe(true);
+  });
+
+  it("uses cooperative exact Job supervision for a branded Windows command", async () => {
+    const rawKill = vi.fn(() => true);
+    const child = Object.assign(new EventEmitter(), {
+      pid: 64_202,
+      exitCode: null as number | null,
+      signalCode: null as NodeJS.Signals | null,
+      stdin: new PassThrough(),
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+      killed: false,
+      kill: rawKill,
+    }) as unknown as ChildProcess;
+    const requestStop = vi.fn(async () => {
+      (child as ChildProcess & { exitCode: number | null }).exitCode = 143;
+      child.emit("exit", 143, null);
+    });
+    const verifyExit = vi.fn(async () => undefined);
+    const supervisor = makePiBashProcessSupervisor({
+      getShellConfig: () => ({ shell: "C:\\tools\\bash.exe", args: ["-c"] }),
+      platform: "win32",
+      prepareProcess: (command, args, input) =>
+        prepareWindowsProviderProcess(command, args, {
+          ...input,
+          platform: "win32",
+          arch: "x64",
+          controlDirectory: "C:\\Temp",
+          launcherPath: "C:\\synara\\synara-windows-job-launcher.exe",
+          fileExists: () => true,
+        }),
+      superviseProcess: (prepared, process, options) =>
+        supervisePreparedNodeProcess(prepared, process, {
+          ...options,
+          requestStop,
+          verifyExit,
+        }),
+      spawnProcess: () => child,
+    });
+    const abortController = new AbortController();
+    const command = supervisor.operations.exec("sleep 10", "C:\\workspace", {
+      signal: abortController.signal,
+      onData: () => undefined,
+    });
+
+    abortController.abort();
+    await expect(command).rejects.toThrow("aborted");
+    expect(requestStop).toHaveBeenCalledOnce();
+    expect(verifyExit).toHaveBeenCalledOnce();
+    expect(rawKill).not.toHaveBeenCalled();
+  });
+
+  it("retains a naturally exited Windows Job owner until drain proof can be retried", async () => {
+    const rawKill = vi.fn(() => true);
+    const child = Object.assign(new EventEmitter(), {
+      pid: 64_203,
+      exitCode: null as number | null,
+      signalCode: null as NodeJS.Signals | null,
+      stdin: new PassThrough(),
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+      killed: false,
+      kill: rawKill,
+    }) as unknown as ChildProcess;
+    const requestStop = vi.fn(async () => undefined);
+    const verifyExit = vi
+      .fn<() => Promise<void>>()
+      .mockRejectedValueOnce(new Error("initial drain proof unavailable"))
+      .mockRejectedValueOnce(new Error("retry drain proof unavailable"))
+      .mockResolvedValue(undefined);
+    const supervisor = makePiBashProcessSupervisor({
+      getShellConfig: () => ({ shell: "C:\\tools\\bash.exe", args: ["-c"] }),
+      platform: "win32",
+      prepareProcess: (command, args, input) =>
+        prepareWindowsProviderProcess(command, args, {
+          ...input,
+          platform: "win32",
+          arch: "x64",
+          controlDirectory: "C:\\Temp",
+          launcherPath: "C:\\synara\\synara-windows-job-launcher.exe",
+          fileExists: () => true,
+        }),
+      superviseProcess: (prepared, process, options) =>
+        supervisePreparedNodeProcess(prepared, process, {
+          ...options,
+          requestStop,
+          verifyExit,
+        }),
+      spawnProcess: () => child,
+    });
+    const command = supervisor.operations.exec("exit 0", "C:\\workspace", {
+      onData: () => undefined,
+    });
+
+    (child as ChildProcess & { exitCode: number | null }).exitCode = 0;
+    child.emit("exit", 0, null);
+
+    await expect(command).rejects.toThrow("initial drain proof unavailable");
+    await expect(supervisor.teardownAll()).rejects.toThrow(
+      "Failed to prove all Pi subprocess trees exited.",
+    );
+    await expect(supervisor.teardownAll()).resolves.toBeUndefined();
+    await expect(supervisor.teardownAll()).resolves.toBeUndefined();
+    expect(verifyExit).toHaveBeenCalledTimes(3);
+    expect(requestStop).not.toHaveBeenCalled();
+    expect(rawKill).not.toHaveBeenCalled();
+  });
+
+  it("rejects an aborted command when teardown proof fails without waiting for exit", async () => {
+    const child = Object.assign(new EventEmitter(), {
+      pid: 64_204,
+      exitCode: null as number | null,
+      signalCode: null as NodeJS.Signals | null,
+      stdin: new PassThrough(),
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+    }) as unknown as ChildProcess;
+    const teardown = vi
+      .fn<() => Promise<{ escalated: boolean; signalErrors: never[] }>>()
+      .mockRejectedValueOnce(new Error("abort teardown proof failed"))
+      .mockResolvedValue({ escalated: false, signalErrors: [] });
+    const processSupervisor = makePiBashProcessSupervisor({
+      getShellConfig: () => ({ shell: "/bin/sh", args: ["-c"] }),
+      platform: "linux",
+      spawnProcess: () => child,
+      superviseProcess: (_prepared, process) => ({
+        rootPid: Number(process.pid),
+        requestTermination: () => true,
+        proveExit: async () => ({ escalated: false, signalErrors: [] }),
+        teardown,
+      }),
+    });
+    const abortController = new AbortController();
+    const command = processSupervisor.operations.exec("sleep forever", "/tmp", {
+      signal: abortController.signal,
+      onData: () => undefined,
+    });
+
+    abortController.abort();
+    await expect(
+      Promise.race([
+        command,
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error("command remained pending")), 250),
+        ),
+      ]),
+    ).rejects.toThrow("abort teardown proof failed");
+    expect(teardown).toHaveBeenCalledTimes(1);
+
+    await expect(processSupervisor.teardownAll()).resolves.toBeUndefined();
+    expect(teardown).toHaveBeenCalledTimes(2);
+  });
+
+  it("surfaces a PID-less later spawn error without constructing a fake owner", async () => {
+    const child = Object.assign(new EventEmitter(), {
+      pid: undefined,
+      exitCode: null as number | null,
+      signalCode: null as NodeJS.Signals | null,
+      stdin: new PassThrough(),
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+    }) as unknown as ChildProcess;
+    const superviseProcess = vi.fn(() => {
+      throw new Error("must not install a PID-less supervisor");
+    });
+    const processSupervisor = makePiBashProcessSupervisor({
+      getShellConfig: () => ({ shell: "/bin/sh", args: ["-c"] }),
+      platform: "linux",
+      spawnProcess: () => child,
+      superviseProcess,
+    });
+    const command = processSupervisor.operations.exec("echo never-started", "/tmp", {
+      onData: () => undefined,
+    });
+    const spawnFailure = new Error("spawn failed after returning the child handle");
+
+    child.emit("error", spawnFailure);
+    child.emit("close", null, null);
+
+    await expect(command).rejects.toBe(spawnFailure);
+    expect(superviseProcess).not.toHaveBeenCalled();
+    await expect(processSupervisor.teardownAll()).resolves.toBeUndefined();
+  });
+
+  it("drains an owner retained before coordinator registration failed", async () => {
+    const child = Object.assign(new EventEmitter(), {
+      pid: 64_205,
+      exitCode: null as number | null,
+      signalCode: null as NodeJS.Signals | null,
+      stdin: new PassThrough(),
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+    }) as unknown as ChildProcess;
+    const teardown = vi.fn(async () => ({ escalated: false, signalErrors: [] }));
+    const maintenanceOwnedResources = {
+      register: () => Effect.die(new Error("Pi owner registration failed")),
+      drainProviderResources: () => Effect.void,
+    } as unknown as ProviderMaintenanceOwnedResourceCoordinator;
+    const processSupervisor = makePiBashProcessSupervisor({
+      getShellConfig: () => ({ shell: "/bin/sh", args: ["-c"] }),
+      platform: "linux",
+      spawnProcess: () => child,
+      maintenanceOwnedResources,
+      superviseProcess: (_prepared, process) => ({
+        rootPid: Number(process.pid),
+        requestTermination: () => true,
+        proveExit: async () => ({ escalated: false, signalErrors: [] }),
+        teardown,
+      }),
+    });
+
+    await expect(
+      processSupervisor.operations.exec("echo retained", "/tmp", {
+        onData: () => undefined,
+      }),
+    ).rejects.toThrow("Pi owner registration failed");
+    expect(teardown).not.toHaveBeenCalled();
+
+    await expect(processSupervisor.teardownAll()).resolves.toBeUndefined();
+    await expect(processSupervisor.teardownAll()).resolves.toBeUndefined();
+    expect(teardown).toHaveBeenCalledTimes(1);
   });
 });
 

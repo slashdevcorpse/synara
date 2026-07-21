@@ -27,11 +27,11 @@ import {
   type ProviderSession,
 } from "@synara/contracts";
 import { resolveCommandCodeCliExecutable } from "@synara/shared/commandCodeCliExecutable";
-import { prepareWindowsSafeProcess } from "@synara/shared/windowsProcess";
-import { Effect, Layer, Queue, Stream } from "effect";
+import { Cause, Effect, Exit, Layer, Queue, Stream } from "effect";
 
 import { ServerConfig } from "../../config.ts";
 import { buildProviderChildEnvironment } from "../../providerChildEnvironment.ts";
+import { prepareWindowsProviderProcess } from "../windowsProviderProcess.ts";
 import { appendFileAttachmentsPromptBlock } from "../attachmentProjection.ts";
 import {
   ProviderAdapterProcessError,
@@ -40,7 +40,25 @@ import {
   ProviderAdapterValidationError,
 } from "../Errors.ts";
 import { buildInlineSkillInstructions } from "../skillPromptInjection.ts";
-import { teardownChildProcessTree } from "../supervisedProcessTeardown.ts";
+import {
+  findProviderProcessExitUnprovenError,
+  teardownChildProcessTree,
+} from "../supervisedProcessTeardown.ts";
+import {
+  makeProviderMaintenanceOwnedResourceCoordinator,
+  type ProviderMaintenanceOwnedResourceCoordinator,
+} from "../providerMaintenanceOwnedResources.ts";
+import {
+  makeProviderProcessOwnerTracker,
+  type TrackedProviderProcessOwner,
+} from "../providerProcessOwnerTracker.ts";
+import {
+  installPreparedNodeProcessSupervisor,
+  type NodeProviderProcessSupervisor,
+  observeNodeProviderProcessSpawn,
+  supervisePreparedNodeProcess,
+  windowsJobNodeProcessSupervisor,
+} from "../windowsJobProcessSupervisor.ts";
 import {
   CommandCodeAdapter,
   type CommandCodeAdapterShape,
@@ -73,9 +91,13 @@ type ResolveExecutable = (
 
 export interface CommandCodeAdapterLiveOptions {
   readonly spawnProcess?: SpawnProcess;
+  readonly prepareProcess?: typeof prepareWindowsProviderProcess;
   readonly teardownProcessTree?: TeardownProcessTree;
   readonly resolveExecutable?: ResolveExecutable;
   readonly nativeEventLogger?: EventNdjsonLogger;
+  readonly platform?: NodeJS.Platform;
+  readonly superviseProcess?: typeof supervisePreparedNodeProcess;
+  readonly maintenanceOwnedResources?: ProviderMaintenanceOwnedResourceCoordinator;
 }
 
 interface CommandCodeTurn {
@@ -98,6 +120,8 @@ interface ActiveCommandCodeTurn {
   interrupted: boolean;
   settled: boolean;
   failure?: Error;
+  settlementOwnedByTeardown: boolean;
+  teardownPromise?: Promise<unknown>;
 }
 
 interface CommandCodeSessionContext {
@@ -249,11 +273,100 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
     const runtimeEventQueue = yield* Queue.unbounded<ProviderRuntimeEvent>();
     const sessions = new Map<ThreadId, CommandCodeSessionContext>();
     const spawnProcess = options?.spawnProcess ?? spawn;
+    const prepareProcess = options?.prepareProcess ?? prepareWindowsProviderProcess;
     const teardown = options?.teardownProcessTree;
     const resolveExecutable = options?.resolveExecutable ?? resolveAndValidateExecutable;
+    const processSupervisors = new WeakMap<ChildProcess, NodeProviderProcessSupervisor>();
+    const processOwners = new WeakMap<ChildProcess, TrackedProviderProcessOwner>();
+    const maintenanceOwnedResources =
+      options?.maintenanceOwnedResources ??
+      (yield* makeProviderMaintenanceOwnedResourceCoordinator);
+    const processOwnerTracker = makeProviderProcessOwnerTracker({
+      provider: PROVIDER,
+      resourcePrefix: "command-code-process",
+      maintenanceOwnedResources,
+    });
 
-    const teardownProcess = (child: ChildProcess): Promise<unknown> =>
-      teardown ? teardown(child) : teardownChildProcessTree(child);
+    const superviseProcess = (
+      prepared: ReturnType<typeof prepareWindowsProviderProcess>,
+      child: ChildProcess,
+    ): Promise<void> | undefined => {
+      const spawnOutcome = observeNodeProviderProcessSpawn(child);
+      const install = (): void => {
+        try {
+          const installation = installPreparedNodeProcessSupervisor(
+            prepared,
+            child,
+            {
+              platform: options?.platform ?? globalThis.process.platform,
+              ...((options?.platform ?? globalThis.process.platform) === "win32"
+                ? {}
+                : { ownedProcessGroupId: Number(child.pid) }),
+            },
+            options?.superviseProcess,
+          );
+          const supervisor = installation.supervisor;
+          processSupervisors.set(child, supervisor);
+          processOwners.set(child, Effect.runSync(processOwnerTracker.register(supervisor)));
+          if (installation._tag === "Recovered") {
+            throw installation.requestedSupervisorFailure;
+          }
+        } catch (cause) {
+          child.once("error", () => undefined);
+          throw cause;
+        }
+      };
+      const rootPid = Number(child.pid);
+      if (Number.isInteger(rootPid) && rootPid > 0) {
+        install();
+        return undefined;
+      }
+      return spawnOutcome.then((outcome) => {
+        if (outcome._tag !== "Spawned") throw outcome.cause;
+        install();
+      });
+    };
+
+    const teardownProcess = (child: ChildProcess): Promise<unknown> => {
+      const owner = processOwners.get(child);
+      return owner
+        ? Effect.runPromise(processOwnerTracker.teardown(owner))
+        : (processSupervisors.get(child)?.teardown() ??
+            (teardown ? teardown(child) : teardownChildProcessTree(child)));
+    };
+
+    const proveProcessExit = (child: ChildProcess): Promise<unknown> => {
+      const owner = processOwners.get(child);
+      if (owner) return Effect.runPromise(processOwnerTracker.proveExit(owner));
+      const supervisor = processSupervisors.get(child) ?? windowsJobNodeProcessSupervisor(child);
+      return supervisor ? supervisor.proveExit() : Promise.resolve();
+    };
+
+    const beginTurnTeardown = (active: ActiveCommandCodeTurn): Promise<unknown> => {
+      if (active.teardownPromise === undefined) {
+        const attempt = Promise.resolve().then(() => teardownProcess(active.child));
+        active.teardownPromise = attempt;
+        void attempt.catch(() => {
+          if (active.teardownPromise === attempt) delete active.teardownPromise;
+        });
+      }
+      return active.teardownPromise;
+    };
+
+    const teardownTurn = (active: ActiveCommandCodeTurn, method: string) =>
+      Effect.tryPromise({
+        try: () => beginTurnTeardown(active),
+        catch: (cause) =>
+          new ProviderAdapterRequestError({
+            provider: PROVIDER,
+            method,
+            detail:
+              cause instanceof Error
+                ? cause.message
+                : "Failed to prove Command Code process-tree exit.",
+            cause,
+          }),
+      }).pipe(Effect.asVoid);
 
     const offerEvent = (event: ProviderRuntimeEvent): void => {
       Effect.runFork(Queue.offer(runtimeEventQueue, event));
@@ -327,11 +440,21 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
       active: ActiveCommandCodeTurn,
       error: Error,
     ): void => {
-      if (active.settled || active.failure) return;
+      if (active.settled || active.settlementOwnedByTeardown) return;
       active.failure = error;
-      void teardownProcess(active.child)
-        .catch(() => undefined)
-        .then(() => finishTurn(context, active, null, null, error));
+      active.settlementOwnedByTeardown = true;
+      void beginTurnTeardown(active).then(
+        () => {
+          active.settlementOwnedByTeardown = false;
+          finishTurn(context, active, null, null, error);
+        },
+        (teardownError) => {
+          const aggregate = new AggregateError([error, teardownError], error.message);
+          active.failure = aggregate;
+          active.settlementOwnedByTeardown = false;
+          finishTurn(context, active, null, null, aggregate);
+        },
+      );
     };
 
     const emitAssistantChunk = (
@@ -426,7 +549,12 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
       if (turn && active.output) {
         turn.items.push({ type: "assistant_message", text: active.output });
       }
-      if (context.active === active) delete context.active;
+      if (
+        context.active === active &&
+        findProviderProcessExitUnprovenError(failure ?? processError) === null
+      ) {
+        delete context.active;
+      }
       context.session = snapshotSession(context);
     };
 
@@ -574,17 +702,20 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
           runtimeMode: context.session.runtimeMode,
           plan: input.interactionMode === "plan",
         });
-        const prepared = prepareWindowsSafeProcess(executable, args, { cwd, env });
-        const child = yield* Effect.try({
-          try: () =>
-            spawnProcess(prepared.command, prepared.args, {
+        const spawned = yield* Effect.try({
+          try: () => {
+            const prepared = prepareProcess(executable, args, { cwd, env });
+            const child = spawnProcess(prepared.command, prepared.args, {
               cwd,
+              detached: (options?.platform ?? globalThis.process.platform) !== "win32",
               env,
               stdio: ["pipe", "pipe", "pipe"],
               shell: prepared.shell,
               windowsHide: prepared.windowsHide,
               windowsVerbatimArguments: prepared.windowsVerbatimArguments,
-            }),
+            });
+            return { child, ownershipReady: superviseProcess(prepared, child) };
+          },
           catch: (cause) =>
             new ProviderAdapterProcessError({
               provider: PROVIDER,
@@ -593,6 +724,22 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
               cause,
             }),
         });
+        if (spawned.ownershipReady !== undefined) {
+          yield* Effect.tryPromise({
+            try: () => spawned.ownershipReady!,
+            catch: (cause) =>
+              new ProviderAdapterProcessError({
+                provider: PROVIDER,
+                threadId: input.threadId,
+                detail:
+                  cause instanceof Error
+                    ? cause.message
+                    : "Failed to establish Command Code process ownership.",
+                cause,
+              }),
+          });
+        }
+        const child = spawned.child;
         const turnId = TurnId.makeUnsafe(randomUUID());
         const active: ActiveCommandCodeTurn = {
           turnId,
@@ -608,6 +755,7 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
           output: "",
           interrupted: false,
           settled: false,
+          settlementOwnedByTeardown: false,
         };
         context.active = active;
         context.turns.push({ id: turnId, items: [] });
@@ -660,7 +808,18 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
         child.once("close", (code, signal) => {
           emitAssistantChunk(context, active, active.stdoutDecoder.end());
           consumeStderr(context, active, active.stderrDecoder.end());
-          finishTurn(context, active, code, signal);
+          if (active.settlementOwnedByTeardown) return;
+          void proveProcessExit(child)
+            .then(() => finishTurn(context, active, code, signal))
+            .catch((cause) =>
+              finishTurn(
+                context,
+                active,
+                code,
+                signal,
+                cause instanceof Error ? cause : new Error(String(cause)),
+              ),
+            );
         });
         child.stdin?.once("error", (cause) =>
           terminateTurnWithError(
@@ -686,19 +845,19 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
         const active = context.active;
         if (!active || (turnId && active.turnId !== turnId)) return;
         active.interrupted = true;
-        yield* Effect.promise(() => teardownProcess(active.child));
+        yield* teardownTurn(active, "turn/interrupt");
       });
 
     const stopSession: CommandCodeAdapterShape["stopSession"] = (threadId) =>
       Effect.gen(function* () {
         const context = yield* requireSession(threadId);
         context.stopped = true;
-        sessions.delete(threadId);
         const active = context.active;
         if (active) {
           active.interrupted = true;
-          yield* Effect.promise(() => teardownProcess(active.child));
+          yield* teardownTurn(active, "session/stop");
         }
+        sessions.delete(threadId);
         offerEvent({
           ...eventBase(context),
           type: "thread.state.changed",
@@ -740,20 +899,23 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
             const env = buildProviderChildEnvironment({ provider: PROVIDER });
             const configured = input.binaryPath?.trim() || DEFAULT_BINARY;
             const executable = resolveExecutable(configured, { cwd, env });
-            const prepared = prepareWindowsSafeProcess(executable, ["--list-models"], { cwd, env });
+            const prepared = prepareProcess(executable, ["--list-models"], { cwd, env });
             const child = spawnProcess(prepared.command, prepared.args, {
               cwd,
+              detached: (options?.platform ?? globalThis.process.platform) !== "win32",
               env,
               stdio: ["ignore", "pipe", "pipe"],
               shell: prepared.shell,
               windowsHide: prepared.windowsHide,
               windowsVerbatimArguments: prepared.windowsVerbatimArguments,
             });
+            const ownershipReady = superviseProcess(prepared, child);
             let stdout = "";
             let stderr = "";
             let stdoutBytes = 0;
             let stderrBytes = 0;
             let settled = false;
+            let settlementOwnedByTeardown = false;
             const stdoutDecoder = new StringDecoder("utf8");
             const stderrDecoder = new StringDecoder("utf8");
             const finish = (error?: Error, result?: ProviderListModelsResult): void => {
@@ -764,56 +926,78 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
               else if (result) resolve(result);
             };
             const terminate = (error: Error): void => {
-              if (settled) return;
-              void teardownProcess(child)
-                .catch(() => undefined)
-                .then(() => finish(error));
+              if (settled || settlementOwnedByTeardown) return;
+              settlementOwnedByTeardown = true;
+              void Promise.resolve()
+                .then(() => teardownProcess(child))
+                .then(
+                  () => finish(error),
+                  (teardownError) =>
+                    finish(new AggregateError([error, teardownError], error.message)),
+                );
             };
-            const timeout = setTimeout(
-              () => terminate(new Error("Command Code model discovery timed out.")),
-              MODEL_LIST_TIMEOUT_MS,
-            );
-            child.stdout?.on("data", (chunk: Buffer | string) => {
-              stdoutBytes += chunkByteLength(chunk);
-              if (stdoutBytes > MAX_MODEL_LIST_BYTES) {
-                terminate(
-                  new Error(
-                    `Command Code model discovery stdout exceeded ${MAX_MODEL_LIST_BYTES} bytes.`,
-                  ),
-                );
-                return;
-              }
-              stdout += decodeChunk(stdoutDecoder, chunk);
-            });
-            child.stderr?.on("data", (chunk: Buffer | string) => {
-              stderrBytes += chunkByteLength(chunk);
-              if (stderrBytes > MAX_MODEL_LIST_BYTES) {
-                terminate(
-                  new Error(
-                    `Command Code model discovery stderr exceeded ${MAX_MODEL_LIST_BYTES} bytes.`,
-                  ),
-                );
-                return;
-              }
-              stderr += decodeChunk(stderrDecoder, chunk);
-            });
-            child.once("error", (cause) =>
-              terminate(cause instanceof Error ? cause : new Error(String(cause))),
-            );
-            child.once("close", (code) => {
-              stdout += stdoutDecoder.end();
-              stderr += stderrDecoder.end();
-              if (code !== 0) {
-                finish(new Error(processErrorMessage(stderr, code)));
-                return;
-              }
-              const models = parseCommandCodeModelList(stdout);
-              if (models.length === 0) {
-                finish(new Error("Command Code model discovery returned no models."));
-                return;
-              }
-              finish(undefined, { models, source: "command-code.cli", cached: false });
-            });
+            let timeout: ReturnType<typeof setTimeout> | undefined;
+            const startCollection = (): void => {
+              timeout = setTimeout(
+                () => terminate(new Error("Command Code model discovery timed out.")),
+                MODEL_LIST_TIMEOUT_MS,
+              );
+              child.stdout?.on("data", (chunk: Buffer | string) => {
+                stdoutBytes += chunkByteLength(chunk);
+                if (stdoutBytes > MAX_MODEL_LIST_BYTES) {
+                  terminate(
+                    new Error(
+                      `Command Code model discovery stdout exceeded ${MAX_MODEL_LIST_BYTES} bytes.`,
+                    ),
+                  );
+                  return;
+                }
+                stdout += decodeChunk(stdoutDecoder, chunk);
+              });
+              child.stderr?.on("data", (chunk: Buffer | string) => {
+                stderrBytes += chunkByteLength(chunk);
+                if (stderrBytes > MAX_MODEL_LIST_BYTES) {
+                  terminate(
+                    new Error(
+                      `Command Code model discovery stderr exceeded ${MAX_MODEL_LIST_BYTES} bytes.`,
+                    ),
+                  );
+                  return;
+                }
+                stderr += decodeChunk(stderrDecoder, chunk);
+              });
+              child.once("error", (cause) =>
+                terminate(cause instanceof Error ? cause : new Error(String(cause))),
+              );
+              child.once("close", (code) => {
+                stdout += stdoutDecoder.end();
+                stderr += stderrDecoder.end();
+                if (settlementOwnedByTeardown) return;
+                void proveProcessExit(child)
+                  .then(() => {
+                    if (code !== 0) {
+                      finish(new Error(processErrorMessage(stderr, code)));
+                      return;
+                    }
+                    const models = parseCommandCodeModelList(stdout);
+                    if (models.length === 0) {
+                      finish(new Error("Command Code model discovery returned no models."));
+                      return;
+                    }
+                    finish(undefined, { models, source: "command-code.cli", cached: false });
+                  })
+                  .catch((cause) =>
+                    finish(cause instanceof Error ? cause : new Error(String(cause))),
+                  );
+              });
+            };
+            if (ownershipReady === undefined) {
+              startCollection();
+            } else {
+              void ownershipReady.then(startCollection, (cause) =>
+                finish(cause instanceof Error ? cause : new Error(String(cause))),
+              );
+            }
           }),
         catch: (cause) =>
           new ProviderAdapterRequestError({
@@ -825,11 +1009,29 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
       });
 
     const stopAll: CommandCodeAdapterShape["stopAll"] = () =>
-      Effect.forEach(
-        Array.from(sessions.keys()),
-        (threadId) => stopSession(threadId).pipe(Effect.catch(() => Effect.void)),
-        { discard: true },
-      );
+      Effect.gen(function* () {
+        const activeOwners = Array.from(sessions.values()).flatMap((context) => {
+          const owner = context.active ? processOwners.get(context.active.child) : undefined;
+          return owner ? [owner] : [];
+        });
+        const results = yield* Effect.forEach(Array.from(sessions.keys()), (threadId) =>
+          stopSession(threadId).pipe(Effect.exit),
+        );
+        const ownedProcessExit = yield* Effect.exit(
+          processOwnerTracker.drainExcluding(activeOwners),
+        );
+        for (const result of results) {
+          if (
+            Exit.isFailure(result) &&
+            findProviderProcessExitUnprovenError(Cause.squash(result.cause)) !== null
+          ) {
+            return yield* Effect.failCause(result.cause);
+          }
+        }
+        if (Exit.isFailure(ownedProcessExit)) {
+          return yield* Effect.failCause(ownedProcessExit.cause);
+        }
+      });
 
     yield* Effect.addFinalizer(() =>
       stopAll().pipe(

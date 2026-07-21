@@ -79,14 +79,14 @@ OpenAI's source-backed `codex update` dispatcher recognizes npm, Bun, pnpm, Home
 
 ### Claude Code
 
-- **Vendor-supported channels:** Anthropic's native installer, npm package `@anthropic-ai/claude-code`, Homebrew cask, and WinGet package `Anthropic.ClaudeCode` ([Claude Code advanced setup](https://code.claude.com/docs/en/setup)).
+- **Vendor-supported channels:** Anthropic's recommended native installer, stable Homebrew cask `claude-code`, latest Homebrew cask `claude-code@latest`, WinGet package `Anthropic.ClaudeCode`, and the documented apt, dnf, and apk packages. The npm package `@anthropic-ai/claude-code` remains available but is deprecated in favor of the native installer ([Claude Code installation](https://code.claude.com/docs/en/installation), [official Claude Code repository](https://github.com/anthropics/claude-code#installation)).
 - **Implemented in this build:**
   - recognized native install: the resolved `claude update`;
-  - npm: `npm install -g @anthropic-ai/claude-code@latest`, pinned to the detected prefix;
-  - Homebrew: `brew upgrade --cask claude-code`.
+  - deprecated npm installs: `npm install -g @anthropic-ai/claude-code@latest`, pinned to the detected prefix;
+  - the stable Homebrew cask: `brew upgrade --cask claude-code`.
 - **Version probe:** `claude --version`; `claude doctor` is the vendor's installation diagnostic.
-- **Vendor-supported but manual-only/planned:** WinGet, conflicting installations, unidentified wrappers, and custom layouts. This build does not yet detect or update `Anthropic.ClaudeCode` as a WinGet-owned target. An operator who verifies that exact package may run `winget upgrade --id Anthropic.ClaudeCode --exact` manually; Microsoft documents `--id` and `--exact` as package disambiguation options ([WinGet upgrade](https://learn.microsoft.com/en-us/windows/package-manager/winget/upgrade)). Anthropic recommends `where.exe claude` to find conflicting Windows installs ([installation troubleshooting](https://code.claude.com/docs/en/troubleshoot-install)).
-- **Windows notes:** Anthropic explicitly warns that a WinGet update can fail while Claude is running because Windows locks the executable. Native background updates take effect on the next launch. Anthropic also specifically recommends `npm install -g ...@latest` rather than generic `npm update -g`.
+- **Vendor-supported but manual-only/planned:** WinGet, apt, dnf, apk, the `claude-code@latest` Homebrew cask, conflicting installations, unidentified wrappers, and custom layouts. The two Homebrew casks are distinct channels: `claude-code` tracks stable, while `claude-code@latest` tracks latest. This build positively matches and updates only the stable cask; it must not silently move either cask to the other channel. This build also does not yet detect or update `Anthropic.ClaudeCode` as a WinGet-owned target. An operator who verifies that exact package may run `winget upgrade --id Anthropic.ClaudeCode --exact` manually; Microsoft documents `--id` and `--exact` as package disambiguation options ([WinGet upgrade](https://learn.microsoft.com/en-us/windows/package-manager/winget/upgrade)). Anthropic recommends `where.exe claude` to find conflicting Windows installs ([installation troubleshooting](https://code.claude.com/docs/en/troubleshoot-install)).
+- **Windows notes:** Anthropic explicitly warns that a WinGet update can fail while Claude is running because Windows locks the executable. Native background updates take effect on the next launch. For a deprecated npm installation that has not yet migrated, Anthropic's current troubleshooting guidance uses `npm install -g @anthropic-ai/claude-code@latest` rather than a generic global npm update ([plugin troubleshooting](https://code.claude.com/docs/en/discover-plugins#plugin-command-not-recognized)).
 
 ### Cursor Agent
 
@@ -200,6 +200,14 @@ For locally spawned OpenCode-compatible servers, Super Synara may stop only idle
 
 Windows commonly denies deletion or replacement while an executable is open. The Windows file API specifies that a handle opened without delete sharing blocks later delete access until the handle closes, producing a sharing violation ([Microsoft `CreateFile` documentation](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilea)). Microsoft provides Restart Manager so installers can identify applications using files and coordinate a user-approved shutdown and restart ([About Restart Manager](https://learn.microsoft.com/en-us/windows/win32/rstmgr/about-restart-manager), [secondary-installer workflow](https://learn.microsoft.com/en-us/windows/win32/rstmgr/using-restart-manager-with-a-secondary-installer)).
 
+Every native-Windows provider command routed through Super Synara's contained launch path runs behind the architecture-matched `synara-windows-job-launcher.exe`. The launcher creates the provider suspended, assigns it to a kill-on-close Job Object, and resumes it only after assignment succeeds. Normal shutdown is cooperative: the server writes a unique per-launch stop request, and the launcher terminates the Job itself. The retained wrapper handle remains an emergency containment fallback, but killing that wrapper directly permanently invalidates the file-release proof and the update stays failed.
+
+The launcher publishes completion only after it has captured exact handles for current Job members, verified their Job membership, terminated surviving processes, observed `ActiveProcesses == 0`, waited the captured handles to signal, released the retained process and Job handles, removed the stop request, and atomically written the exact `drained\n` acknowledgement. The server then requires both wrapper exit and that acknowledgement before it lets CLI maintenance proceed, and removes the acknowledgement after validation. It never substitutes CIM discovery, `taskkill`, or a numeric-PID signal for this proof. Microsoft documents that `TerminateJobObject` terminates every associated process and that `ActiveProcesses` is decremented only after a terminated process exits and its process references are released ([Microsoft Job Objects](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects), [`TerminateJobObject`](https://learn.microsoft.com/en-us/windows/win32/api/jobapi2/nf-jobapi2-terminatejobobject), [`JOBOBJECT_BASIC_ACCOUNTING_INFORMATION`](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_basic_accounting_information)). This prevents a reused PID from being mistaken for an owned process and prevents an owned descendant that still maps a CLI executable from satisfying the updater's release gate.
+
+The acknowledgement proves only the Super Synara-owned Job is drained. Antivirus, an installer, another terminal, an editor, or any other external process can still acquire the file afterward. A resulting sharing violation remains external lock evidence and is reported rather than bypassed or resolved by killing an unowned process.
+
+Source checkouts must build the launcher for the host architecture with `node apps/server/scripts/build-windows-job-launcher.mjs --arch x64` or `--arch arm64`. Published CLI validation requires both architectures, while a packaged desktop carries its selected architecture. A missing, malformed, or wrong-architecture launcher is a fail-closed startup error, never permission to use uncontained PID-based cleanup.
+
 For Super Synara this means:
 
 - `EBUSY`, `EPERM`, `ERROR_SHARING_VIOLATION`, “file is in use,” and failed rename/unlink errors are lock evidence, not reasons to delete more aggressively.
@@ -209,6 +217,12 @@ For Super Synara this means:
 - Prefer a vendor's documented side-by-side or deferred updater when one exists, such as the current Codex standalone installer.
 
 ## Troubleshooting
+
+### Windows containment helper is unavailable
+
+1. In a source checkout, install the matching Visual Studio 2022 C++ build tools and run the architecture-specific build command above.
+2. For an installed CLI or desktop release, repair or reinstall the same trusted release so its packaged launcher is restored. Do not copy an unrelated executable into the expected path.
+3. Do not bypass containment to make a provider start. Report the checked launcher paths and architecture from the error, then resolve the packaging or installation problem before retrying.
 
 ### `EBUSY`, `EPERM`, or a sharing violation
 

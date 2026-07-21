@@ -1,4 +1,7 @@
-import { realpathSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { EventEmitter } from "node:events";
+import type { ChildProcess } from "node:child_process";
+import * as NodeOs from "node:os";
 import * as NodePath from "node:path";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -6,11 +9,11 @@ import type { ServerProviderStatus } from "@synara/contracts";
 import { DEFAULT_SERVER_SETTINGS, ServerProviderUpdateError } from "@synara/contracts";
 import { buildWindowsBatchCommandArgs, resolveWindowsComSpec } from "@synara/shared/windowsProcess";
 import { describe, it, assert } from "@effect/vitest";
-import { Deferred, Effect, Fiber, FileSystem, Layer, Path, Sink, Stream } from "effect";
+import { Deferred, Effect, Fiber, FileSystem, Layer, Path, Result, Sink, Stream } from "effect";
 import { TestClock } from "effect/testing";
 import * as PlatformError from "effect/PlatformError";
 import { ChildProcessSpawner } from "effect/unstable/process";
-import { vi } from "vitest";
+import { afterAll, beforeAll, vi } from "vitest";
 
 import { SYNARA_CODEX_HOME_OVERLAY_DIR } from "../../codexHomePaths";
 import { ServerConfig } from "../../config";
@@ -24,41 +27,178 @@ import {
   writeProviderStatusCache,
 } from "../providerStatusCache";
 import { makeProviderMaintenanceGate } from "../providerMaintenanceGate.ts";
-import { ProviderProcessExitUnprovenError } from "../supervisedProcessTeardown.ts";
+import { makeProviderMaintenanceOwnedResourceCoordinator } from "../providerMaintenanceOwnedResources.ts";
 import {
-  checkClaudeProviderStatus,
-  checkAntigravityProviderStatus,
-  checkCodexProviderStatus,
-  checkCursorProviderStatus,
-  checkGrokProviderStatus,
-  checkOpenCodeProviderStatus,
-  checkPiProviderStatus,
+  ProviderProcessExitUnprovenError,
+  superviseEffectProcessTree,
+  teardownProviderProcessTree,
+} from "../supervisedProcessTeardown.ts";
+import {
   hasCustomModelProvider,
+  checkAntigravityProviderStatus as productionCheckAntigravityProviderStatus,
+  checkPiProviderStatus as productionCheckPiProviderStatus,
   makeDisabledProviderStatus,
-  makeCheckClaudeProviderStatus,
-  makeCheckCommandCodeProviderStatus,
-  makeCheckCodexProviderStatus,
-  makeCheckCursorProviderStatus,
-  makeCheckGrokProviderStatus,
-  makeCheckKiloProviderStatus,
-  makeCheckOpenCodeProviderStatus,
-  makeProviderHealthLive,
+  makeCheckClaudeProviderStatus as makeProductionCheckClaudeProviderStatus,
+  makeCheckCommandCodeProviderStatus as makeProductionCheckCommandCodeProviderStatus,
+  makeCheckCodexProviderStatus as makeProductionCheckCodexProviderStatus,
+  makeCheckCursorProviderStatus as makeProductionCheckCursorProviderStatus,
+  makeCheckGrokProviderStatus as makeProductionCheckGrokProviderStatus,
+  makeCheckKiloProviderStatus as makeProductionCheckKiloProviderStatus,
+  makeCheckOpenCodeProviderStatus as makeProductionCheckOpenCodeProviderStatus,
+  makeProviderHealthLive as makeProductionProviderHealthLive,
   parseAuthStatusFromOutput,
   parseClaudeAuthStatusFromOutput,
   parseCommandCodeStatusJson,
   PACKAGE_MANAGED_PROVIDER_UPDATES,
   packageManagedProviderUpdateDefinitions,
+  probeClaudeSubscription,
   providerStatusesEqual,
-  ProviderHealthLive,
+  type ProviderHealthProcessOptions,
   projectProviderStatusesForSettings,
   readCodexConfigModelProvider,
   stabilizeProviderStatusesAgainstTransientTimeouts,
 } from "./ProviderHealth";
 import { resolvePackageManagedProviderMaintenance } from "../providerMaintenance";
+import {
+  isWindowsJobPreparedCommand,
+  prepareWindowsProviderProcess,
+  WINDOWS_JOB_LAUNCHER_ENV,
+  WINDOWS_JOB_LAUNCHER_EXECUTABLE,
+  WINDOWS_JOB_LAUNCHER_PROTOCOL_VERSION,
+} from "../windowsProviderProcess.ts";
+import {
+  supervisePreparedEffectProcess,
+  supervisePreparedNodeProcess,
+} from "../windowsJobProcessSupervisor.ts";
+
+const TEST_PROVIDER_PROCESS_OPTIONS = {
+  platform: "linux",
+  superviseProcess: (_prepared, child) => ({
+    rootPid: Number(child.pid),
+    waitForInitialCapture: () => Promise.resolve(),
+    captureNow: () => Promise.resolve(),
+    proveExit: () => Promise.resolve({ escalated: false, signalErrors: [] }),
+    teardown: () => Promise.resolve({ escalated: false, signalErrors: [] }),
+  }),
+} as const satisfies ProviderHealthProcessOptions;
+
+const TEST_REAL_PROVIDER_PROCESS_OPTIONS = {
+  platform: "win32",
+  superviseProcess: (_prepared, child, options) =>
+    options.processTreeKiller
+      ? superviseEffectProcessTree(child, {
+          platform: "win32",
+          processTreeKiller: options.processTreeKiller,
+          ...(options.teardownProcessTree
+            ? { teardownProcessTree: options.teardownProcessTree }
+            : {}),
+        })
+      : TEST_PROVIDER_PROCESS_OPTIONS.superviseProcess(_prepared, child),
+} as const satisfies ProviderHealthProcessOptions;
+
+const TEST_PROVIDER_LAYER_PROCESS_OPTIONS = {
+  platform: process.platform,
+  superviseProcess: TEST_PROVIDER_PROCESS_OPTIONS.superviseProcess,
+} as const satisfies ProviderHealthProcessOptions;
+
+const makeCheckCodexProviderStatus = (binaryPath?: string, homePath?: string) =>
+  makeProductionCheckCodexProviderStatus(binaryPath, homePath, TEST_PROVIDER_PROCESS_OPTIONS);
+const checkCodexProviderStatus = makeCheckCodexProviderStatus();
+
+const makeCheckCommandCodeProviderStatus = (
+  binaryPath?: string,
+  options?: Parameters<typeof makeProductionCheckCommandCodeProviderStatus>[1],
+) =>
+  makeProductionCheckCommandCodeProviderStatus(binaryPath, {
+    ...TEST_PROVIDER_PROCESS_OPTIONS,
+    ...options,
+  });
+
+const makeCheckClaudeProviderStatus = (
+  resolveSubscriptionType?: Parameters<typeof makeProductionCheckClaudeProviderStatus>[0],
+  binaryPath?: string,
+  homeDir?: string,
+  options?: Parameters<typeof makeProductionCheckClaudeProviderStatus>[3],
+) =>
+  makeProductionCheckClaudeProviderStatus(resolveSubscriptionType, binaryPath, homeDir, {
+    ...options,
+    ...TEST_PROVIDER_PROCESS_OPTIONS,
+  });
+const checkClaudeProviderStatus = makeCheckClaudeProviderStatus();
+
+const makeCheckGrokProviderStatus = (binaryPath?: string) =>
+  makeProductionCheckGrokProviderStatus(binaryPath, TEST_PROVIDER_PROCESS_OPTIONS);
+const checkGrokProviderStatus = makeCheckGrokProviderStatus();
+
+const makeCheckOpenCodeProviderStatus = (binaryPath?: string) =>
+  makeProductionCheckOpenCodeProviderStatus(binaryPath, TEST_PROVIDER_PROCESS_OPTIONS);
+const checkOpenCodeProviderStatus = makeCheckOpenCodeProviderStatus();
+
+const makeCheckKiloProviderStatus = (binaryPath?: string) =>
+  makeProductionCheckKiloProviderStatus(binaryPath, TEST_PROVIDER_PROCESS_OPTIONS);
+
+const makeCheckCursorProviderStatus = (binaryPath?: string) =>
+  makeProductionCheckCursorProviderStatus(binaryPath, TEST_PROVIDER_PROCESS_OPTIONS);
+const checkCursorProviderStatus = makeCheckCursorProviderStatus();
+
+const checkPiProviderStatus = (agentDir?: string, binaryPath?: string) =>
+  productionCheckPiProviderStatus(agentDir, binaryPath, TEST_PROVIDER_PROCESS_OPTIONS);
+
+const checkAntigravityProviderStatus = (binaryPath?: string) =>
+  productionCheckAntigravityProviderStatus(binaryPath, TEST_PROVIDER_PROCESS_OPTIONS);
+
+const makeProviderHealthLive = (options?: Parameters<typeof makeProductionProviderHealthLive>[0]) =>
+  makeProductionProviderHealthLive({
+    ...TEST_PROVIDER_LAYER_PROCESS_OPTIONS,
+    ...options,
+  });
+const ProviderHealthLive = makeProviderHealthLive();
 
 // ── Test helpers ────────────────────────────────────────────────────
 
 const encoder = new TextEncoder();
+const originalProviderHealthTestPath = process.env.PATH;
+let providerHealthTestCommandDirectory: string | undefined;
+
+function configuredTestBinary(name: string): string {
+  return process.platform === "win32" ? `C:\\custom\\bin\\${name}` : `/custom/bin/${name}`;
+}
+
+beforeAll(() => {
+  if (process.platform !== "win32") return;
+  providerHealthTestCommandDirectory = mkdtempSync(
+    NodePath.join(NodeOs.tmpdir(), "synara-provider-health-commands-"),
+  );
+  for (const command of [
+    "codex",
+    "claude",
+    "grok",
+    "opencode",
+    "kilo",
+    "pi",
+    "agy",
+    "droid",
+    "cursor-agent",
+    "commandcode",
+    "missing-commandcode",
+  ]) {
+    writeFileSync(NodePath.join(providerHealthTestCommandDirectory, `${command}.exe`), "");
+  }
+  process.env.PATH = [providerHealthTestCommandDirectory, originalProviderHealthTestPath]
+    .filter((entry): entry is string => Boolean(entry))
+    .join(";");
+});
+
+afterAll(() => {
+  if (originalProviderHealthTestPath === undefined) {
+    delete process.env.PATH;
+  } else {
+    process.env.PATH = originalProviderHealthTestPath;
+  }
+  if (providerHealthTestCommandDirectory) {
+    rmSync(providerHealthTestCommandDirectory, { recursive: true, force: true });
+  }
+});
 
 function makeFetchMock(
   implementation: (...args: Parameters<typeof fetch>) => ReturnType<typeof fetch>,
@@ -126,12 +266,13 @@ function preparedProviderCommandMatches(input: {
   readonly env?: NodeJS.ProcessEnv | undefined;
   readonly options?: TestProcessCommandOptions | undefined;
 }): boolean {
-  if (process.platform !== "win32") {
-    return (
-      input.command === input.executable &&
-      JSON.stringify(input.actualArgs) === JSON.stringify(input.expectedArgs)
-    );
-  }
+  const argsMatch = JSON.stringify(input.actualArgs) === JSON.stringify(input.expectedArgs);
+  const directCommandMatches =
+    process.platform === "win32"
+      ? input.command.toLowerCase() === input.executable.toLowerCase()
+      : input.command === input.executable;
+  if (directCommandMatches && argsMatch) return true;
+  if (process.platform !== "win32") return false;
 
   const env = input.env ?? process.env;
   const expectedExecutable = NodePath.win32.isAbsolute(input.executable)
@@ -240,18 +381,21 @@ function withLatestNpmVersion<A, E, R>(
 }
 
 function mockHandle(result: { stdout: string; stderr: string; code: number }) {
-  return ChildProcessSpawner.makeHandle({
-    pid: ChildProcessSpawner.ProcessId(1),
-    exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(result.code)),
-    isRunning: Effect.succeed(false),
-    kill: () => Effect.void,
-    stdin: Sink.drain,
-    stdout: Stream.make(encoder.encode(result.stdout)),
-    stderr: Stream.make(encoder.encode(result.stderr)),
-    all: Stream.empty,
-    getInputFd: () => Sink.drain,
-    getOutputFd: () => Stream.empty,
-  });
+  return Object.assign(
+    ChildProcessSpawner.makeHandle({
+      pid: ChildProcessSpawner.ProcessId(1),
+      exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(result.code)),
+      isRunning: Effect.succeed(false),
+      kill: () => Effect.void,
+      stdin: Sink.drain,
+      stdout: Stream.make(encoder.encode(result.stdout)),
+      stderr: Stream.make(encoder.encode(result.stderr)),
+      all: Stream.empty,
+      getInputFd: () => Sink.drain,
+      getOutputFd: () => Stream.empty,
+    }),
+    { synaraTerminateExact: () => false },
+  );
 }
 
 function syntheticProcessTreeKiller(rootPid: number): ProcessTreeKiller {
@@ -264,6 +408,43 @@ function syntheticProcessTreeKiller(rootPid: number): ProcessTreeKiller {
     capture: () => ({ root, descendants: [], captureComplete: true }),
     inspect: () => ({ verified: true, survivors: [] }),
     signal: () => {},
+  };
+}
+
+type PreparedMockCommand = {
+  readonly command: string;
+  readonly args: ReadonlyArray<string>;
+  readonly options?: TestProcessCommandOptions;
+};
+
+function unwrapContainedProviderCommand(cmd: PreparedMockCommand): PreparedMockCommand {
+  const launcherPrefix = ["--protocol", WINDOWS_JOB_LAUNCHER_PROTOCOL_VERSION, "--argument-mode"];
+  const isContained =
+    process.platform === "win32" &&
+    NodePath.basename(cmd.command).toLowerCase() === WINDOWS_JOB_LAUNCHER_EXECUTABLE &&
+    launcherPrefix.every((value, index) => cmd.args[index] === value) &&
+    cmd.args[4] === "--control-file" &&
+    typeof cmd.args[5] === "string" &&
+    cmd.args[6] === "--" &&
+    typeof cmd.args[7] === "string";
+  if (!isContained) return cmd;
+
+  const target = cmd.args[7]!;
+  const normalizedTestDirectory = providerHealthTestCommandDirectory?.toLowerCase();
+  const targetDirectory = NodePath.dirname(target).toLowerCase();
+  const isGlobalMockCommand = targetDirectory.includes("synara-provider-health-commands-");
+  const unwrappedTarget =
+    isGlobalMockCommand || (normalizedTestDirectory && targetDirectory === normalizedTestDirectory)
+      ? NodePath.basename(target, NodePath.extname(target))
+      : target.startsWith("\\") && !target.startsWith("\\\\")
+        ? target.replaceAll("\\", "/")
+        : target;
+  const options =
+    cmd.args[3] === "verbatim" ? { ...cmd.options, windowsVerbatimArguments: true } : cmd.options;
+  return {
+    command: unwrappedTarget,
+    args: cmd.args.slice(8),
+    ...(options ? { options } : {}),
   };
 }
 
@@ -287,8 +468,11 @@ function mockSpawnerLayer(
         args: ReadonlyArray<string>;
         options?: TestProcessCommandOptions;
       };
+      const unwrapped = unwrapContainedProviderCommand(cmd);
       return Effect.succeed(
-        mockHandle(handler(cmd.args, cmd.command, cmd.options?.env, cmd.options)),
+        mockHandle(
+          handler(unwrapped.args, unwrapped.command, unwrapped.options?.env, unwrapped.options),
+        ),
       );
     }),
   );
@@ -310,7 +494,34 @@ function effectSpawnerLayer(
         args: ReadonlyArray<string>;
         options?: TestProcessCommandOptions;
       };
-      return handler(cmd.args, cmd.command, cmd.options?.env, cmd.options);
+      const unwrapped = unwrapContainedProviderCommand(cmd);
+      return handler(unwrapped.args, unwrapped.command, unwrapped.options?.env, unwrapped.options);
+    }),
+  );
+}
+
+function provisionalOwnerSpawnerLayer(
+  handler: (
+    args: ReadonlyArray<string>,
+    command: string,
+    env: NodeJS.ProcessEnv | undefined,
+    options: TestProcessCommandOptions | undefined,
+  ) => Effect.Effect<ReturnType<typeof mockHandle>>,
+) {
+  return Layer.succeed(
+    ChildProcessSpawner.ChildProcessSpawner,
+    ChildProcessSpawner.make((command) => {
+      const cmd = command as unknown as {
+        command: string;
+        args: ReadonlyArray<string>;
+        options?: TestProcessCommandOptions;
+      };
+      const unwrapped = unwrapContainedProviderCommand(cmd);
+      return Effect.acquireRelease(
+        handler(unwrapped.args, unwrapped.command, unwrapped.options?.env, unwrapped.options),
+        (handle) =>
+          unwrapped.options?.synaraExternallySupervised === true ? Effect.void : handle.kill(),
+      );
     }),
   );
 }
@@ -361,7 +572,13 @@ function hangingSpawnerLayer(input: {
         args: ReadonlyArray<string>;
         options?: TestProcessCommandOptions;
       };
-      return input.shouldHang(cmd.args, cmd.command, cmd.options?.env, cmd.options)
+      const unwrapped = unwrapContainedProviderCommand(cmd);
+      return input.shouldHang(
+        unwrapped.args,
+        unwrapped.command,
+        unwrapped.options?.env,
+        unwrapped.options,
+      )
         ? (input.onSpawn ?? Effect.void).pipe(Effect.as(handle))
         : Effect.succeed(mockHandle({ stdout: "", stderr: "", code: 0 }));
     }),
@@ -647,6 +864,14 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
             killed = true;
             return Promise.resolve({ escalated: false, signalErrors: [] });
           },
+          superviseProcess: (_prepared, child, options) =>
+            superviseEffectProcessTree(child, {
+              platform: "linux",
+              ownedProcessGroupId: Number(child.pid),
+              ...(options.teardownProcessTree
+                ? { teardownProcessTree: options.teardownProcessTree }
+                : {}),
+            }),
         }).pipe(
           Effect.provide(
             hangingSpawnerLayer({
@@ -668,7 +893,1131 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
     );
   });
 
+  describe("health process ownership", () => {
+    it.effect("does not install supervision when Effect spawn acquisition fails", () => {
+      let supervisorInstallations = 0;
+      return makeProductionCheckKiloProviderStatus("ignored", {
+        platform: "linux",
+        prepareProcess: () => ({
+          command: "Z:\\synara-missing-provider-health-command.exe",
+          args: [],
+          shell: false,
+        }),
+        superviseProcess: (prepared, child) => {
+          supervisorInstallations += 1;
+          return TEST_PROVIDER_PROCESS_OPTIONS.superviseProcess(prepared, child);
+        },
+      }).pipe(
+        Effect.tap((status) =>
+          Effect.sync(() => {
+            assert.strictEqual(status.status, "error");
+            assert.strictEqual(status.available, false);
+            assert.strictEqual(supervisorInstallations, 0);
+          }),
+        ),
+      );
+    });
+
+    it.effect("keeps Effect cleanup when the default health supervisor constructor fails", () =>
+      Effect.gen(function* () {
+        const processExit = yield* Deferred.make<ChildProcessSpawner.ExitCode>();
+        const lifecycle: string[] = [];
+        let running = true;
+        const handle = ChildProcessSpawner.makeHandle({
+          pid: ChildProcessSpawner.ProcessId(84),
+          exitCode: Deferred.await(processExit),
+          isRunning: Effect.sync(() => running),
+          kill: () =>
+            Effect.sync(() => {
+              lifecycle.push("provisional");
+              running = false;
+              Deferred.doneUnsafe(processExit, Effect.succeed(ChildProcessSpawner.ExitCode(0)));
+            }),
+          stdin: Sink.drain,
+          stdout: Stream.never,
+          stderr: Stream.never,
+          all: Stream.never,
+          getInputFd: () => Sink.drain,
+          getOutputFd: () => Stream.never,
+        });
+
+        const status = yield* makeProductionCheckKiloProviderStatus("kilo", {
+          platform: "win32",
+          prepareProcess: (command, args) => ({ command, args, shell: false }),
+        }).pipe(
+          Effect.provide(
+            provisionalOwnerSpawnerLayer((_args, _command, _env, options) => {
+              lifecycle.push(
+                options?.synaraExternallySupervised === true ? "external" : "provisional-owned",
+              );
+              return Effect.succeed(handle);
+            }),
+          ),
+        );
+
+        assert.strictEqual(status.status, "error");
+        assert.match(status.message ?? "", /without Job-prepared command provenance/u);
+        assert.deepStrictEqual(lifecycle, ["provisional-owned", "provisional"]);
+      }),
+    );
+
+    it.effect("runs exact health cleanup before provisional cleanup when registration fails", () =>
+      Effect.gen(function* () {
+        const processExit = yield* Deferred.make<ChildProcessSpawner.ExitCode>();
+        const registrationFailure = new Error("health owner registration failed");
+        const lifecycle: string[] = [];
+        let running = true;
+        const handle = ChildProcessSpawner.makeHandle({
+          pid: ChildProcessSpawner.ProcessId(85),
+          exitCode: Deferred.await(processExit),
+          isRunning: Effect.sync(() => running),
+          kill: () =>
+            Effect.sync(() => {
+              lifecycle.push("provisional");
+              running = false;
+              Deferred.doneUnsafe(processExit, Effect.succeed(ChildProcessSpawner.ExitCode(0)));
+            }),
+          stdin: Sink.drain,
+          stdout: Stream.never,
+          stderr: Stream.never,
+          all: Stream.never,
+          getInputFd: () => Sink.drain,
+          getOutputFd: () => Stream.never,
+        });
+        const maintenanceOwnedResources = {
+          register: () =>
+            Effect.sync(() => lifecycle.push("register")).pipe(
+              Effect.andThen(Effect.fail(registrationFailure)),
+            ),
+          drainProviderResources: () => Effect.void,
+        } as unknown as ProviderMaintenanceOwnedResourceCoordinator;
+
+        const status = yield* makeProductionCheckKiloProviderStatus("kilo", {
+          platform: "linux",
+          maintenanceOwnedResources,
+          superviseProcess: (_prepared, child) => ({
+            rootPid: Number(child.pid),
+            waitForInitialCapture: async () => undefined,
+            captureNow: async () => undefined,
+            proveExit: async () => ({ escalated: false, signalErrors: [] }),
+            teardown: async () => {
+              lifecycle.push("exact");
+              return { escalated: false, signalErrors: [] };
+            },
+          }),
+        }).pipe(Effect.provide(provisionalOwnerSpawnerLayer(() => Effect.succeed(handle))));
+
+        assert.strictEqual(status.status, "error");
+        assert.match(status.message ?? "", /health owner registration failed/u);
+        assert.deepStrictEqual(lifecycle, ["register", "exact", "provisional"]);
+      }),
+    );
+
+    it.effect("passes the spawned PID as the owned POSIX process group", () => {
+      const supervised: Array<{ readonly pid: number; readonly groupId: number | undefined }> = [];
+      return makeProductionCheckKiloProviderStatus("kilo", {
+        platform: "linux",
+        superviseProcess: (prepared, child, options) => {
+          supervised.push({
+            pid: Number(child.pid),
+            groupId: options.ownedProcessGroupId,
+          });
+          return TEST_PROVIDER_PROCESS_OPTIONS.superviseProcess(prepared, child);
+        },
+      }).pipe(
+        Effect.provide(mockSpawnerLayer(() => ({ stdout: "kilo 7.4.10\n", stderr: "", code: 0 }))),
+        Effect.tap(() =>
+          Effect.sync(() => {
+            assert.ok(supervised.length > 0);
+            assert.deepStrictEqual(
+              supervised,
+              supervised.map(({ pid }) => ({ pid, groupId: pid })),
+            );
+          }),
+        ),
+      );
+    });
+
+    it.effect("unregisters a health owner when constructor recovery proves exit", () =>
+      Effect.gen(function* () {
+        const coordinator = yield* makeProviderMaintenanceOwnedResourceCoordinator;
+        const constructorError = new Error("health supervisor construction failed");
+        const teardown = vi.fn(async () => ({ escalated: false, signalErrors: [] }));
+        let constructionAttempts = 0;
+
+        const status = yield* makeProductionCheckKiloProviderStatus("kilo", {
+          platform: "linux",
+          maintenanceOwnedResources: coordinator,
+          processTreeKiller: syntheticProcessTreeKiller(1),
+          teardownProcessTree: teardown,
+          superviseProcess: () => {
+            constructionAttempts += 1;
+            throw constructorError;
+          },
+        }).pipe(
+          Effect.provide(
+            mockSpawnerLayer(() => ({ stdout: "kilo 7.4.10\n", stderr: "", code: 0 })),
+          ),
+        );
+
+        assert.strictEqual(status.status, "error");
+        assert.match(status.message ?? "", /health supervisor construction failed/u);
+        assert.strictEqual(constructionAttempts, 1);
+        assert.strictEqual(teardown.mock.calls.length, 1);
+
+        yield* coordinator.drainProviderResources({ provider: "kilo" });
+        assert.strictEqual(teardown.mock.calls.length, 1);
+      }),
+    );
+
+    it.effect("installs an exit observer during synchronous health construction recovery", () =>
+      Effect.gen(function* () {
+        const coordinator = yield* makeProviderMaintenanceOwnedResourceCoordinator;
+        const constructorError = new Error("health supervisor construction failed");
+        const rootPid = 83;
+        const root = {
+          pid: rootPid,
+          command: "kilo --version",
+          identity: `${rootPid}:health-construction-recovery`,
+        };
+        const processExit = yield* Deferred.make<ChildProcessSpawner.ExitCode>();
+        let running = true;
+        let constructionAttempts = 0;
+        let rootExitObserved = false;
+        const teardown = vi.fn(async (input: Parameters<typeof teardownProviderProcessTree>[0]) => {
+          running = false;
+          Deferred.doneUnsafe(processExit, Effect.succeed(ChildProcessSpawner.ExitCode(0)));
+          await input.rootExited;
+          rootExitObserved = true;
+          return { escalated: false, signalErrors: [] };
+        });
+        const processTreeKiller: ProcessTreeKiller = {
+          capture: () => ({ root, descendants: [], captureComplete: true }),
+          inspect: () => ({ verified: true, survivors: [] }),
+          signal: () => {},
+        };
+        const handle = ChildProcessSpawner.makeHandle({
+          pid: ChildProcessSpawner.ProcessId(rootPid),
+          exitCode: Deferred.await(processExit),
+          isRunning: Effect.sync(() => running),
+          kill: () => Effect.void,
+          stdin: Sink.drain,
+          stdout: Stream.empty,
+          stderr: Stream.empty,
+          all: Stream.empty,
+          getInputFd: () => Sink.drain,
+          getOutputFd: () => Stream.empty,
+        });
+
+        const status = yield* makeProductionCheckKiloProviderStatus("kilo", {
+          platform: "linux",
+          maintenanceOwnedResources: coordinator,
+          processTreeKiller,
+          teardownProcessTree: teardown,
+          superviseProcess: () => {
+            constructionAttempts += 1;
+            throw constructorError;
+          },
+        }).pipe(
+          Effect.provide(
+            Layer.succeed(
+              ChildProcessSpawner.ChildProcessSpawner,
+              ChildProcessSpawner.make(() => Effect.succeed(handle)),
+            ),
+          ),
+        );
+
+        assert.strictEqual(status.status, "error");
+        assert.match(status.message ?? "", /health supervisor construction failed/u);
+        assert.strictEqual(constructionAttempts, 1);
+        assert.strictEqual(teardown.mock.calls.length, 1);
+        assert.strictEqual(rootExitObserved, true);
+
+        yield* coordinator.drainProviderResources({ provider: "kilo" });
+        assert.strictEqual(teardown.mock.calls.length, 1);
+      }),
+    );
+
+    it.effect("retains a failed health construction recovery on the same supervisor", () =>
+      Effect.gen(function* () {
+        const coordinator = yield* makeProviderMaintenanceOwnedResourceCoordinator;
+        const constructorError = new Error("health supervisor construction failed");
+        const unprovenExit = new ProviderProcessExitUnprovenError({
+          rootPid: 1,
+          rootExited: true,
+          remainingDescendantPids: [2],
+          captureComplete: true,
+        });
+        const reported: ProviderProcessExitUnprovenError[] = [];
+        const teardown = vi.fn(async () => {
+          if (teardown.mock.calls.length === 1) throw unprovenExit;
+          return { escalated: false, signalErrors: [] };
+        });
+        let constructionAttempts = 0;
+
+        const status = yield* makeProductionCheckKiloProviderStatus("kilo", {
+          platform: "linux",
+          maintenanceOwnedResources: coordinator,
+          processTreeKiller: syntheticProcessTreeKiller(1),
+          teardownProcessTree: teardown,
+          onUnprovenExit: ({ error }) =>
+            Effect.sync(() => {
+              reported.push(error);
+            }),
+          superviseProcess: () => {
+            constructionAttempts += 1;
+            throw constructorError;
+          },
+        }).pipe(
+          Effect.provide(
+            mockSpawnerLayer(() => ({ stdout: "kilo 7.4.10\n", stderr: "", code: 0 })),
+          ),
+        );
+
+        assert.strictEqual(status.status, "error");
+        assert.strictEqual(constructionAttempts, 1);
+        assert.strictEqual(teardown.mock.calls.length, 1);
+        assert.deepStrictEqual(reported, [unprovenExit]);
+
+        yield* coordinator.drainProviderResources({ provider: "kilo" });
+        assert.strictEqual(constructionAttempts, 1);
+        assert.strictEqual(teardown.mock.calls.length, 2);
+      }),
+    );
+
+    it.effect("emergency-tears down a provisional Claude owner when exact construction fails", () =>
+      Effect.gen(function* () {
+        const coordinator = yield* makeProviderMaintenanceOwnedResourceCoordinator;
+        const emergencyTeardown = vi.fn(async () => ({
+          escalated: false,
+          signalErrors: [],
+        }));
+        const child = Object.assign(new EventEmitter(), {
+          pid: 706,
+          exitCode: null as number | null,
+          signalCode: null as NodeJS.Signals | null,
+          kill: vi.fn(() => true),
+        }) as unknown as ChildProcess;
+        const spawnFailure = new Error("contained supervisor construction failed");
+        const spawnContainedClaudeProcess: NonNullable<
+          ProviderHealthProcessOptions["spawnContainedClaudeProcess"]
+        > = (options, dependencies = {}) => {
+          dependencies.onSpawnedProcess?.({
+            prepared: { command: options.command, args: options.args, shell: false },
+            process: child,
+            platform: "win32",
+          });
+          throw spawnFailure;
+        };
+        const queryClaude = ((input) => {
+          input.options?.spawnClaudeCodeProcess?.({
+            command: "claude",
+            args: ["--probe"],
+            cwd: process.cwd(),
+            env: {},
+            signal: new AbortController().signal,
+          });
+          throw new Error("expected the contained spawn to fail");
+        }) as NonNullable<ProviderHealthProcessOptions["queryClaude"]>;
+
+        const result = yield* probeClaudeSubscription({
+          platform: "win32",
+          maintenanceOwnedResources: coordinator,
+          spawnContainedClaudeProcess,
+          queryClaude,
+          teardownProcessTree: emergencyTeardown,
+        });
+
+        assert.strictEqual(result, undefined);
+        assert.strictEqual(emergencyTeardown.mock.calls.length, 1);
+        yield* coordinator.drainProviderResources({ provider: "claudeAgent" });
+        assert.strictEqual(emergencyTeardown.mock.calls.length, 1);
+      }),
+    );
+
+    it.effect("finalizes two immutable Claude owners and retains only the failed one", () =>
+      Effect.gen(function* () {
+        const coordinator = yield* makeProviderMaintenanceOwnedResourceCoordinator;
+        const maintenanceGate = yield* makeProviderMaintenanceGate;
+        const attempts = new Map<number, number>();
+        const reported: ProviderProcessExitUnprovenError[] = [];
+        let spawned = 0;
+        let secondOwnerStillFails = true;
+
+        const spawnContainedClaudeProcess: NonNullable<
+          ProviderHealthProcessOptions["spawnContainedClaudeProcess"]
+        > = (options, dependencies = {}) => {
+          const pid = 701 + spawned;
+          spawned += 1;
+          const events = new EventEmitter();
+          const child = Object.assign(events, {
+            pid,
+            exitCode: null as number | null,
+            signalCode: null as NodeJS.Signals | null,
+            kill: vi.fn(() => true),
+          }) as unknown as ChildProcess;
+          const prepared = {
+            command: options.command,
+            args: options.args,
+            shell: false as const,
+          };
+          dependencies.onSpawnedProcess?.({ prepared, process: child, platform: "linux" });
+          supervisePreparedNodeProcess(prepared, child, {
+            platform: "linux",
+            teardownProcessTree: async () => {
+              const nextAttempt = (attempts.get(pid) ?? 0) + 1;
+              attempts.set(pid, nextAttempt);
+              if (pid === 702 && secondOwnerStillFails) {
+                throw new ProviderProcessExitUnprovenError({
+                  rootPid: pid,
+                  rootExited: true,
+                  remainingDescendantPids: [703],
+                  captureComplete: true,
+                });
+              }
+              return { escalated: false, signalErrors: [] };
+            },
+          });
+          return child;
+        };
+        const queryClaude = ((input) => {
+          const spawn = input.options?.spawnClaudeCodeProcess;
+          if (!spawn) throw new Error("Claude process spawner was not installed.");
+          for (const index of [0, 1]) {
+            spawn({
+              command: "claude",
+              args: [`--probe-${index}`],
+              cwd: process.cwd(),
+              env: {},
+              signal: new AbortController().signal,
+            });
+          }
+          return {
+            initializationResult: async () => ({ account: { subscriptionType: "max" } }),
+          } as ReturnType<NonNullable<ProviderHealthProcessOptions["queryClaude"]>>;
+        }) as NonNullable<ProviderHealthProcessOptions["queryClaude"]>;
+
+        const result = yield* probeClaudeSubscription({
+          platform: "linux",
+          maintenanceOwnedResources: coordinator,
+          spawnContainedClaudeProcess,
+          queryClaude,
+          onUnprovenExit: ({ error }) =>
+            Effect.sync(() => {
+              reported.push(error);
+            }).pipe(
+              Effect.andThen(
+                maintenanceGate.latchProvider({ provider: "claudeAgent", reason: error.message }),
+              ),
+            ),
+        });
+        const blocked = yield* maintenanceGate
+          .withOperation({
+            provider: "claudeAgent",
+            operation: "session.start",
+            run: Effect.void,
+          })
+          .pipe(Effect.flip);
+
+        assert.strictEqual(result?.subscriptionType, "max");
+        assert.strictEqual(spawned, 2);
+        assert.deepStrictEqual(
+          [...attempts.entries()],
+          [
+            [701, 1],
+            [702, 1],
+          ],
+        );
+        assert.strictEqual(reported.length, 1);
+        assert.match(reported[0]?.message ?? "", /descendants still running: 703/u);
+        assert.match(blocked.latchedReason ?? "", /descendants still running: 703/u);
+
+        secondOwnerStillFails = false;
+        yield* coordinator.drainProviderResources({ provider: "claudeAgent" });
+        assert.deepStrictEqual(
+          [...attempts.entries()],
+          [
+            [701, 1],
+            [702, 2],
+          ],
+        );
+      }),
+    );
+
+    it.effect("latches a branded health failure before releasing a queued updater", () =>
+      Effect.gen(function* () {
+        const coordinator = yield* makeProviderMaintenanceOwnedResourceCoordinator;
+        const maintenanceGate = yield* makeProviderMaintenanceGate;
+        const proveExitStarted = yield* Deferred.make<void>();
+        const releaseProveExit = yield* Deferred.make<void>();
+        const teardown = vi.fn(async () => {
+          if (teardown.mock.calls.length === 1) {
+            throw new Error("Invalid provider health teardown acknowledgement");
+          }
+          return { escalated: false, signalErrors: [] };
+        });
+        const reported: ProviderProcessExitUnprovenError[] = [];
+        let supervisorConstructions = 0;
+        let updaterSpawnCount = 0;
+
+        const health = yield* maintenanceGate
+          .withOperation({
+            provider: "kilo",
+            operation: "ProviderHealth.refresh",
+            run: makeProductionCheckKiloProviderStatus("kilo", {
+              platform: "linux",
+              maintenanceOwnedResources: coordinator,
+              superviseProcess: (prepared, child) => {
+                supervisorConstructions += 1;
+                return {
+                  ...TEST_PROVIDER_PROCESS_OPTIONS.superviseProcess(prepared, child),
+                  proveExit: async () => {
+                    await Effect.runPromise(
+                      Deferred.succeed(proveExitStarted, undefined).pipe(
+                        Effect.andThen(Deferred.await(releaseProveExit)),
+                      ),
+                    );
+                    throw new Error("Invalid provider health exit acknowledgement");
+                  },
+                  teardown,
+                };
+              },
+              onUnprovenExit: ({ error }) =>
+                Effect.sync(() => {
+                  reported.push(error);
+                }).pipe(
+                  Effect.andThen(
+                    maintenanceGate.latchProvider({ provider: "kilo", reason: error.message }),
+                  ),
+                ),
+            }).pipe(
+              Effect.provide(
+                mockSpawnerLayer(() => ({
+                  stdout: "kilo 7.4.10\n",
+                  stderr: "",
+                  code: 0,
+                })),
+              ),
+            ),
+          })
+          .pipe(Effect.forkChild);
+        yield* Deferred.await(proveExitStarted);
+
+        const updater = yield* maintenanceGate
+          .withExclusiveMaintenance({
+            provider: "kilo",
+            run: Effect.sync(() => {
+              updaterSpawnCount += 1;
+            }),
+          })
+          .pipe(Effect.forkChild);
+        let queuedBusy = false;
+        for (let attempt = 0; attempt < 100 && !queuedBusy; attempt += 1) {
+          const admission = yield* maintenanceGate
+            .withOperation({
+              provider: "kilo",
+              operation: "queue-observer",
+              run: Effect.void,
+            })
+            .pipe(Effect.result);
+          queuedBusy = Result.isFailure(admission) && admission.failure.latchedReason === null;
+          if (!queuedBusy) yield* Effect.yieldNow;
+        }
+        assert.strictEqual(queuedBusy, true);
+
+        yield* Deferred.succeed(releaseProveExit, undefined);
+        yield* Fiber.join(health);
+        const updaterFailure = yield* Fiber.join(updater).pipe(Effect.flip);
+
+        assert.strictEqual(updaterSpawnCount, 0);
+        assert.match(updaterFailure.message, /process exit could not be proven/u);
+        assert.strictEqual(supervisorConstructions, 1);
+        assert.strictEqual(teardown.mock.calls.length, 1);
+        assert.strictEqual(reported.length, 1);
+        assert.ok(reported[0] instanceof ProviderProcessExitUnprovenError);
+        assert.match(reported[0]?.message ?? "", /did not prove complete exit/u);
+
+        yield* coordinator.drainProviderResources({ provider: "kilo" });
+        assert.strictEqual(supervisorConstructions, 1);
+        assert.strictEqual(teardown.mock.calls.length, 2);
+      }),
+    );
+  });
+
   describe("provider update commands", () => {
+    it.effect("keeps Effect cleanup when the default updater supervisor constructor fails", () =>
+      withKiloUpdateFixture("7.4.10", (input) =>
+        withLatestNpmVersion(
+          "7.4.11",
+          Effect.gen(function* () {
+            const lifecycle: string[] = [];
+            const expectedUpdateArgs = [
+              "install",
+              "-g",
+              "--prefix",
+              input.npmPrefix,
+              "@kilocode/cli@latest",
+            ] as const;
+            const isUpdateCommand = (args: ReadonlyArray<string>) =>
+              args.length === expectedUpdateArgs.length &&
+              expectedUpdateArgs.every((expected, index) => args[index] === expected);
+            let updatePrepareHits = 0;
+            const updateHandle = ChildProcessSpawner.makeHandle({
+              pid: ChildProcessSpawner.ProcessId(86),
+              exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(0)),
+              isRunning: Effect.succeed(false),
+              kill: () =>
+                Effect.sync(() => {
+                  lifecycle.push("provisional");
+                }),
+              stdin: Sink.drain,
+              stdout: Stream.make(encoder.encode("updated\n")),
+              stderr: Stream.empty,
+              all: Stream.empty,
+              getInputFd: () => Sink.drain,
+              getOutputFd: () => Stream.empty,
+            });
+            const layer = makeProductionProviderHealthLive({
+              platform: "win32",
+              processTreeKiller: syntheticProcessTreeKiller(1),
+              windowsJobSupervisorOptions: {
+                requestStop: () => Promise.resolve(),
+                verifyExit: () => Promise.resolve(),
+              },
+              prepareProcess: (command, args, options) => {
+                if (isUpdateCommand(args)) {
+                  updatePrepareHits += 1;
+                  return { command, args, shell: false };
+                }
+                return prepareWindowsProviderProcess(command, args, {
+                  ...options,
+                  platform: "win32",
+                  launcherPath: "C:\\Synara\\synara-windows-job-launcher.exe",
+                  fileExists: () => true,
+                  controlDirectory: input.baseDir,
+                });
+              },
+            }).pipe(
+              Layer.provideMerge(providerServiceWithoutRuntimesLayer),
+              Layer.provideMerge(ServerSettingsService.layerTest(input.settings)),
+              Layer.provideMerge(ServerConfig.layerTest(process.cwd(), input.baseDir)),
+              Layer.provideMerge(
+                provisionalOwnerSpawnerLayer((args, _command, _env, options) => {
+                  if (isUpdateCommand(args)) {
+                    lifecycle.push(
+                      options?.synaraExternallySupervised === true
+                        ? "external"
+                        : "provisional-owned",
+                    );
+                    return Effect.succeed(updateHandle);
+                  }
+                  return Effect.succeed(
+                    mockHandle({ stdout: "kilo 7.4.10\n", stderr: "", code: 0 }),
+                  );
+                }),
+              ),
+            );
+
+            const result = yield* Effect.gen(function* () {
+              const providerHealth = yield* ProviderHealth;
+              return yield* providerHealth.updateProvider({ provider: "kilo" });
+            }).pipe(Effect.provide(layer));
+            const kilo = result.providers.find((status) => status.provider === "kilo");
+
+            assert.strictEqual(updatePrepareHits, 1);
+            assert.strictEqual(kilo?.updateState?.status, "failed");
+            assert.match(
+              kilo?.updateState?.message ?? "",
+              /without Job-prepared command provenance/u,
+            );
+            assert.deepStrictEqual(lifecycle, ["provisional-owned", "provisional"]);
+          }),
+        ),
+      ),
+    );
+
+    it.effect("runs exact updater cleanup before provisional cleanup when registration fails", () =>
+      withKiloUpdateFixture("7.4.10", (input) =>
+        withLatestNpmVersion(
+          "7.4.11",
+          Effect.gen(function* () {
+            const coordinator = yield* makeProviderMaintenanceOwnedResourceCoordinator;
+            const processExit = yield* Deferred.make<ChildProcessSpawner.ExitCode>();
+            const registrationFailure = new Error("updater owner registration failed");
+            const lifecycle: string[] = [];
+            let running = true;
+            const updateHandle = ChildProcessSpawner.makeHandle({
+              pid: ChildProcessSpawner.ProcessId(87),
+              exitCode: Deferred.await(processExit),
+              isRunning: Effect.sync(() => running),
+              kill: () =>
+                Effect.sync(() => {
+                  lifecycle.push("provisional");
+                  running = false;
+                  Deferred.doneUnsafe(processExit, Effect.succeed(ChildProcessSpawner.ExitCode(0)));
+                }),
+              stdin: Sink.drain,
+              stdout: Stream.never,
+              stderr: Stream.never,
+              all: Stream.never,
+              getInputFd: () => Sink.drain,
+              getOutputFd: () => Stream.never,
+            });
+            const maintenanceOwnedResources = {
+              register: (resource) =>
+                resource.resourceId.startsWith("provider-update:")
+                  ? Effect.sync(() => lifecycle.push("register")).pipe(
+                      Effect.andThen(Effect.fail(registrationFailure)),
+                    )
+                  : coordinator.register(resource),
+              drainProviderResources: coordinator.drainProviderResources,
+            } as ProviderMaintenanceOwnedResourceCoordinator;
+            const layer = makeProviderHealthLive({
+              maintenanceOwnedResources,
+              superviseProcess: (prepared, child) =>
+                prepared.args.some((arg) => arg.includes("@kilocode/cli@latest"))
+                  ? {
+                      rootPid: Number(child.pid),
+                      waitForInitialCapture: async () => undefined,
+                      captureNow: async () => undefined,
+                      proveExit: async () => ({ escalated: false, signalErrors: [] }),
+                      teardown: async () => {
+                        lifecycle.push("exact");
+                        return { escalated: false, signalErrors: [] };
+                      },
+                    }
+                  : TEST_PROVIDER_PROCESS_OPTIONS.superviseProcess(prepared, child),
+            }).pipe(
+              Layer.provideMerge(providerServiceWithoutRuntimesLayer),
+              Layer.provideMerge(ServerSettingsService.layerTest(input.settings)),
+              Layer.provideMerge(ServerConfig.layerTest(process.cwd(), input.baseDir)),
+              Layer.provideMerge(
+                provisionalOwnerSpawnerLayer((args) =>
+                  args.some((arg) => arg.includes("@kilocode/cli@latest"))
+                    ? Effect.succeed(updateHandle)
+                    : Effect.succeed(mockHandle({ stdout: "kilo 7.4.10\n", stderr: "", code: 0 })),
+                ),
+              ),
+            );
+
+            const result = yield* Effect.gen(function* () {
+              const providerHealth = yield* ProviderHealth;
+              return yield* providerHealth.updateProvider({ provider: "kilo" });
+            }).pipe(Effect.provide(layer));
+            const kilo = result.providers.find((status) => status.provider === "kilo");
+
+            assert.strictEqual(kilo?.updateState?.status, "failed");
+            assert.match(kilo?.updateState?.message ?? "", /updater owner registration failed/u);
+            assert.deepStrictEqual(lifecycle, ["register", "exact", "provisional"]);
+          }),
+        ),
+      ),
+    );
+
+    it.effect("unregisters an updater owner when constructor recovery proves exit", () =>
+      withKiloUpdateFixture("7.4.10", (input) =>
+        withLatestNpmVersion(
+          "7.4.11",
+          Effect.gen(function* () {
+            const coordinator = yield* makeProviderMaintenanceOwnedResourceCoordinator;
+            const constructorError = new Error("updater supervisor construction failed");
+            const teardown = vi.fn(async () => ({ escalated: false, signalErrors: [] }));
+            let constructionAttempts = 0;
+            let updateSpawnCount = 0;
+
+            const layer = makeProviderHealthLive({
+              maintenanceOwnedResources: coordinator,
+              windowsJobSupervisorOptions: {
+                requestStop: () => Promise.resolve(),
+                verifyExit: async () => {
+                  await teardown();
+                },
+              },
+              superviseProcess: (prepared, child) => {
+                if (!prepared.args.some((arg) => arg.includes("@kilocode/cli@latest"))) {
+                  return TEST_PROVIDER_PROCESS_OPTIONS.superviseProcess(prepared, child);
+                }
+                constructionAttempts += 1;
+                throw constructorError;
+              },
+            }).pipe(
+              Layer.provideMerge(providerServiceWithoutRuntimesLayer),
+              Layer.provideMerge(ServerSettingsService.layerTest(input.settings)),
+              Layer.provideMerge(ServerConfig.layerTest(process.cwd(), input.baseDir)),
+              Layer.provideMerge(
+                mockSpawnerLayer((args, command, env, options) => {
+                  if (
+                    preparedProviderCommandMatches({
+                      fixture: input.fixture,
+                      executable: fixtureExecutablePath(input.fixture, "npm"),
+                      expectedArgs: [
+                        "install",
+                        "-g",
+                        "--prefix",
+                        input.npmPrefix,
+                        "@kilocode/cli@latest",
+                      ],
+                      command,
+                      actualArgs: args,
+                      env,
+                      options,
+                    })
+                  ) {
+                    updateSpawnCount += 1;
+                    return { stdout: "updated\n", stderr: "", code: 0 };
+                  }
+                  return { stdout: "kilo 7.4.10\n", stderr: "", code: 0 };
+                }),
+              ),
+            );
+
+            const result = yield* Effect.gen(function* () {
+              const providerHealth = yield* ProviderHealth;
+              return yield* providerHealth.updateProvider({ provider: "kilo" });
+            }).pipe(Effect.provide(layer));
+            const kilo = result.providers.find((status) => status.provider === "kilo");
+
+            assert.strictEqual(updateSpawnCount, 1);
+            assert.strictEqual(kilo?.updateState?.status, "failed");
+            assert.match(
+              kilo?.updateState?.message ?? "",
+              /updater supervisor construction failed/u,
+            );
+            assert.strictEqual(constructionAttempts, 1);
+            assert.strictEqual(teardown.mock.calls.length, 1);
+
+            yield* coordinator.drainProviderResources({ provider: "kilo" });
+            assert.strictEqual(teardown.mock.calls.length, 1);
+          }),
+        ),
+      ),
+    );
+
+    it.effect("retains an unproven updater construction recovery on the same supervisor", () =>
+      withKiloUpdateFixture("7.4.10", (input) =>
+        withLatestNpmVersion(
+          "7.4.11",
+          Effect.gen(function* () {
+            const coordinator = yield* makeProviderMaintenanceOwnedResourceCoordinator;
+            const maintenanceGate = yield* makeProviderMaintenanceGate;
+            const constructorError = new Error("updater supervisor construction failed");
+            const unprovenExit = new ProviderProcessExitUnprovenError({
+              rootPid: 1,
+              rootExited: true,
+              remainingDescendantPids: [2],
+              captureComplete: true,
+            });
+            const teardown = vi.fn(async () => {
+              if (teardown.mock.calls.length === 1) throw unprovenExit;
+              return { escalated: false, signalErrors: [] };
+            });
+            let constructionAttempts = 0;
+            let updateSpawnCount = 0;
+
+            const layer = makeProviderHealthLive({
+              maintenanceGate,
+              maintenanceOwnedResources: coordinator,
+              windowsJobSupervisorOptions: {
+                requestStop: () => Promise.resolve(),
+                verifyExit: async () => {
+                  await teardown();
+                },
+              },
+              superviseProcess: (prepared, child) => {
+                if (!prepared.args.some((arg) => arg.includes("@kilocode/cli@latest"))) {
+                  return TEST_PROVIDER_PROCESS_OPTIONS.superviseProcess(prepared, child);
+                }
+                constructionAttempts += 1;
+                throw constructorError;
+              },
+            }).pipe(
+              Layer.provideMerge(providerServiceWithoutRuntimesLayer),
+              Layer.provideMerge(ServerSettingsService.layerTest(input.settings)),
+              Layer.provideMerge(ServerConfig.layerTest(process.cwd(), input.baseDir)),
+              Layer.provideMerge(
+                mockSpawnerLayer((args, command, env, options) => {
+                  if (
+                    preparedProviderCommandMatches({
+                      fixture: input.fixture,
+                      executable: fixtureExecutablePath(input.fixture, "npm"),
+                      expectedArgs: [
+                        "install",
+                        "-g",
+                        "--prefix",
+                        input.npmPrefix,
+                        "@kilocode/cli@latest",
+                      ],
+                      command,
+                      actualArgs: args,
+                      env,
+                      options,
+                    })
+                  ) {
+                    updateSpawnCount += 1;
+                    return { stdout: "updated\n", stderr: "", code: 0 };
+                  }
+                  return { stdout: "kilo 7.4.10\n", stderr: "", code: 0 };
+                }),
+              ),
+            );
+
+            const result = yield* Effect.gen(function* () {
+              const providerHealth = yield* ProviderHealth;
+              return yield* providerHealth.updateProvider({ provider: "kilo" });
+            }).pipe(Effect.provide(layer));
+            const kilo = result.providers.find((status) => status.provider === "kilo");
+            const blocked = yield* maintenanceGate
+              .withOperation({
+                provider: "kilo",
+                operation: "session.start",
+                run: Effect.void,
+              })
+              .pipe(Effect.flip);
+
+            assert.strictEqual(updateSpawnCount, 1);
+            assert.strictEqual(kilo?.updateState?.status, "failed");
+            assert.match(kilo?.updateState?.message ?? "", /Restart Synara/u);
+            assert.match(blocked.latchedReason ?? "", /descendants still running: 2/u);
+            assert.strictEqual(constructionAttempts, 1);
+            assert.strictEqual(teardown.mock.calls.length, 1);
+
+            yield* coordinator.drainProviderResources({ provider: "kilo" });
+            assert.strictEqual(constructionAttempts, 1);
+            assert.strictEqual(teardown.mock.calls.length, 2);
+          }),
+        ),
+      ),
+    );
+
+    it.effect(
+      "fails terminally without spawning when the pre-update probe is already latched",
+      () =>
+        withKiloUpdateFixture("7.4.10", (input) =>
+          withLatestNpmVersion(
+            "7.4.11",
+            Effect.gen(function* () {
+              const maintenanceGate = yield* makeProviderMaintenanceGate;
+              yield* maintenanceGate.latchProvider({
+                provider: "kilo",
+                reason: "prior process exit remains unproven",
+              });
+              let spawnCount = 0;
+              const layer = makeProviderHealthLive({ maintenanceGate }).pipe(
+                Layer.provideMerge(providerServiceWithoutRuntimesLayer),
+                Layer.provideMerge(ServerSettingsService.layerTest(input.settings)),
+                Layer.provideMerge(ServerConfig.layerTest(process.cwd(), input.baseDir)),
+                Layer.provideMerge(
+                  mockSpawnerLayer(() => {
+                    spawnCount += 1;
+                    return { stdout: "unexpected spawn\n", stderr: "", code: 0 };
+                  }),
+                ),
+              );
+
+              const observed = yield* Effect.gen(function* () {
+                const providerHealth = yield* ProviderHealth;
+                const error = yield* providerHealth
+                  .updateProvider({ provider: "kilo" })
+                  .pipe(Effect.flip);
+                const providers = yield* providerHealth.getStatuses;
+                return { error, providers };
+              }).pipe(Effect.provide(layer));
+              const kilo = observed.providers.find((status) => status.provider === "kilo");
+
+              assert.ok(observed.error instanceof ServerProviderUpdateError);
+              assert.match(observed.error.message, /prior process exit remains unproven/u);
+              assert.strictEqual(spawnCount, 0);
+              assert.strictEqual(kilo?.updateState?.status, "failed");
+              assert.match(
+                kilo?.updateState?.message ?? "",
+                /prior process exit remains unproven/u,
+              );
+            }),
+          ),
+        ),
+    );
+
+    it.effect(
+      "fails terminally without spawning a post-update probe after exit proof latches",
+      () =>
+        withKiloUpdateFixture("7.4.10", (input) =>
+          withLatestNpmVersion(
+            "7.4.11",
+            Effect.gen(function* () {
+              const maintenanceGate = yield* makeProviderMaintenanceGate;
+              let healthSpawnCount = 0;
+              let updateSpawnCount = 0;
+              const layer = makeProviderHealthLive({
+                maintenanceGate,
+                superviseProcess: (prepared, child) => {
+                  if (!prepared.args.some((arg) => arg.includes("@kilocode/cli@latest"))) {
+                    return TEST_PROVIDER_PROCESS_OPTIONS.superviseProcess(prepared, child);
+                  }
+                  return {
+                    ...TEST_PROVIDER_PROCESS_OPTIONS.superviseProcess(prepared, child),
+                    proveExit: async () => {
+                      await Effect.runPromise(
+                        maintenanceGate.latchProvider({
+                          provider: "kilo",
+                          reason: "updater exit proof requires restart",
+                        }),
+                      );
+                      return { escalated: false, signalErrors: [] };
+                    },
+                  };
+                },
+              }).pipe(
+                Layer.provideMerge(providerServiceWithoutRuntimesLayer),
+                Layer.provideMerge(ServerSettingsService.layerTest(input.settings)),
+                Layer.provideMerge(ServerConfig.layerTest(process.cwd(), input.baseDir)),
+                Layer.provideMerge(
+                  mockSpawnerLayer((args, command, env, options) => {
+                    if (
+                      preparedProviderCommandMatches({
+                        fixture: input.fixture,
+                        executable: fixtureExecutablePath(input.fixture, "npm"),
+                        expectedArgs: [
+                          "install",
+                          "-g",
+                          "--prefix",
+                          input.npmPrefix,
+                          "@kilocode/cli@latest",
+                        ],
+                        command,
+                        actualArgs: args,
+                        env,
+                        options,
+                      })
+                    ) {
+                      updateSpawnCount += 1;
+                      return { stdout: "updated\n", stderr: "", code: 0 };
+                    }
+                    healthSpawnCount += 1;
+                    return { stdout: "kilo 7.4.10\n", stderr: "", code: 0 };
+                  }),
+                ),
+              );
+
+              const observed = yield* Effect.gen(function* () {
+                const providerHealth = yield* ProviderHealth;
+                const error = yield* providerHealth
+                  .updateProvider({ provider: "kilo" })
+                  .pipe(Effect.flip);
+                const providers = yield* providerHealth.getStatuses;
+                return { error, providers };
+              }).pipe(Effect.provide(layer));
+              const kilo = observed.providers.find((status) => status.provider === "kilo");
+
+              assert.ok(observed.error instanceof ServerProviderUpdateError);
+              assert.match(observed.error.message, /updater exit proof requires restart/u);
+              assert.strictEqual(updateSpawnCount, 1);
+              assert.strictEqual(healthSpawnCount, 1);
+              assert.strictEqual(kilo?.updateState?.status, "failed");
+              assert.match(
+                kilo?.updateState?.message ?? "",
+                /updater exit proof requires restart/u,
+              );
+            }),
+          ),
+        ),
+    );
+
+    it.effect("latches an unproven health proveExit even when teardown later succeeds", () =>
+      withKiloUpdateFixture("7.4.10", (input) =>
+        withLatestNpmVersion(
+          "7.4.11",
+          Effect.gen(function* () {
+            const maintenanceGate = yield* makeProviderMaintenanceGate;
+            const unprovenExit = new ProviderProcessExitUnprovenError({
+              rootPid: 1,
+              rootExited: true,
+              remainingDescendantPids: [2],
+              captureComplete: true,
+            });
+            const teardown = vi.fn(async () => ({ escalated: false, signalErrors: [] }));
+            let healthSpawnCount = 0;
+            let updateSpawnCount = 0;
+            const layer = makeProviderHealthLive({
+              maintenanceGate,
+              superviseProcess: (prepared, child) => {
+                if (prepared.args.some((arg) => arg.includes("@kilocode/cli@latest"))) {
+                  return TEST_PROVIDER_PROCESS_OPTIONS.superviseProcess(prepared, child);
+                }
+                return {
+                  ...TEST_PROVIDER_PROCESS_OPTIONS.superviseProcess(prepared, child),
+                  proveExit: async () => {
+                    throw new AggregateError(
+                      [new Error("ordinary sibling failure"), unprovenExit],
+                      "wrapped health proof failure",
+                    );
+                  },
+                  teardown,
+                };
+              },
+            }).pipe(
+              Layer.provideMerge(providerServiceWithoutRuntimesLayer),
+              Layer.provideMerge(ServerSettingsService.layerTest(input.settings)),
+              Layer.provideMerge(ServerConfig.layerTest(process.cwd(), input.baseDir)),
+              Layer.provideMerge(
+                mockSpawnerLayer((args, command, env, options) => {
+                  if (
+                    preparedProviderCommandMatches({
+                      fixture: input.fixture,
+                      executable: fixtureExecutablePath(input.fixture, "npm"),
+                      expectedArgs: [
+                        "install",
+                        "-g",
+                        "--prefix",
+                        input.npmPrefix,
+                        "@kilocode/cli@latest",
+                      ],
+                      command,
+                      actualArgs: args,
+                      env,
+                      options,
+                    })
+                  ) {
+                    updateSpawnCount += 1;
+                    return { stdout: "updated\n", stderr: "", code: 0 };
+                  }
+                  healthSpawnCount += 1;
+                  return { stdout: "kilo 7.4.10\n", stderr: "", code: 0 };
+                }),
+              ),
+            );
+
+            const observed = yield* Effect.gen(function* () {
+              const providerHealth = yield* ProviderHealth;
+              const update = yield* providerHealth
+                .updateProvider({ provider: "kilo" })
+                .pipe(Effect.result);
+              const providers = yield* providerHealth.getStatuses;
+              return { update, providers };
+            }).pipe(Effect.provide(layer));
+            const kilo = observed.providers.find((status) => status.provider === "kilo");
+            const blocked = yield* maintenanceGate
+              .withOperation({
+                provider: "kilo",
+                operation: "session.start",
+                run: Effect.void,
+              })
+              .pipe(Effect.flip);
+
+            assert.ok(Result.isFailure(observed.update));
+            if (Result.isFailure(observed.update)) {
+              assert.ok(observed.update.failure instanceof ServerProviderUpdateError);
+              assert.match(observed.update.failure.message, /did not prove exit/u);
+            }
+            assert.strictEqual(healthSpawnCount, 1);
+            assert.strictEqual(updateSpawnCount, 0);
+            assert.strictEqual(teardown.mock.calls.length, 1);
+            assert.match(blocked.latchedReason ?? "", /descendants still running: 2/u);
+            assert.strictEqual(kilo?.updateState?.status, "failed");
+          }),
+        ),
+      ),
+    );
+
     it("derives stable native install roots instead of version or bin directories", () => {
       const cases = [
         {
@@ -1261,6 +2610,9 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
             let updateSpawnCount = 0;
             let updaterExternallySupervised = false;
             let updaterOutputConsumed = false;
+            let updaterRunning = true;
+            const updaterExit = yield* Deferred.make<ChildProcessSpawner.ExitCode>();
+            const initialLivenessChecked = yield* Deferred.make<void>();
             let releaseInitialCapture!: () => void;
             let markInitialCaptureStarted!: () => void;
             const initialCaptureStarted = new Promise<void>((resolve) => {
@@ -1295,8 +2647,11 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
             };
             const updaterHandle = ChildProcessSpawner.makeHandle({
               pid: ChildProcessSpawner.ProcessId(updaterRoot.pid),
-              exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(0)),
-              isRunning: Effect.succeed(false),
+              exitCode: Deferred.await(updaterExit),
+              isRunning: Effect.sync(() => {
+                Deferred.doneUnsafe(initialLivenessChecked, Effect.void);
+                return updaterRunning;
+              }),
               kill: () => Effect.void,
               stdin: Sink.drain,
               stdout: Stream.fromEffect(
@@ -1311,6 +2666,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
               getOutputFd: () => Stream.empty,
             });
             const layer = makeProviderHealthLive({
+              ...TEST_REAL_PROVIDER_PROCESS_OPTIONS,
               providerUpdateTimeoutMs: 10_000,
               processTreeKiller,
             }).pipe(
@@ -1368,6 +2724,12 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
                   );
                   const outputConsumedBeforeCapture = updaterOutputConsumed;
                   releaseInitialCapture();
+                  yield* Deferred.await(initialLivenessChecked);
+                  yield* Effect.promise(
+                    () => new Promise<void>((resolve) => setImmediate(resolve)),
+                  );
+                  updaterRunning = false;
+                  yield* Deferred.succeed(updaterExit, ChildProcessSpawner.ExitCode(0));
                   const updateResult = yield* Fiber.join(update);
                   return { updateResult, outputConsumedBeforeCapture };
                 }),
@@ -1376,11 +2738,15 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
             const kilo = result.updateResult.providers.find((status) => status.provider === "kilo");
             const persisted = yield* readProviderStatusCache(input.cachePath);
 
+            assert.strictEqual(
+              kilo?.updateState?.status,
+              "succeeded",
+              kilo?.updateState?.message ?? "missing update state",
+            );
             assert.strictEqual(healthProbeCount, 2);
             assert.strictEqual(updateSpawnCount, 1);
-            assert.strictEqual(updaterExternallySupervised, true);
+            assert.strictEqual(updaterExternallySupervised, false);
             assert.strictEqual(result.outputConsumedBeforeCapture, false);
-            assert.strictEqual(kilo?.updateState?.status, "succeeded");
             assert.strictEqual(kilo?.version, "7.4.11");
             assert.strictEqual(kilo?.versionAdvisory?.status, "current");
             assert.strictEqual(kilo?.versionAdvisory?.currentVersion, "7.4.11");
@@ -1408,6 +2774,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
               signal: () => {},
             };
             const layer = makeProviderHealthLive({
+              ...TEST_REAL_PROVIDER_PROCESS_OPTIONS,
               providerUpdateTimeoutMs: 10_000,
               processTreeKiller,
               teardownProcessTree: (teardown) => {
@@ -1463,9 +2830,9 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
             const kilo = result.providers.find((status) => status.provider === "kilo");
 
             assert.strictEqual(updateSpawnCount, 1);
-            assert.strictEqual(updaterExternallySupervised, true);
-            assert.strictEqual(fallbackTeardownCalls, 1);
-            assert.strictEqual(promotedSupervisorTeardownCalls, 0);
+            assert.strictEqual(updaterExternallySupervised, false);
+            assert.strictEqual(fallbackTeardownCalls, 0);
+            assert.strictEqual(promotedSupervisorTeardownCalls, 1);
             assert.strictEqual(kilo?.updateState?.status, "failed");
             assert.match(kilo?.updateState?.message ?? "", /did not prove exit/u);
             assert.match(kilo?.updateState?.message ?? "", /Restart Synara/u);
@@ -1747,6 +3114,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
               },
             } satisfies typeof DEFAULT_SERVER_SETTINGS;
             const layer = makeProviderHealthLive({
+              ...TEST_REAL_PROVIDER_PROCESS_OPTIONS,
               providerUpdateTimeoutMs: 2_000,
               processTreeKiller: syntheticProcessTreeKiller(2),
               teardownProcessTree: () => {
@@ -1804,199 +3172,203 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
     );
 
     it.effect("refuses an update without spawning the updater when provider work is active", () =>
-      withLatestNpmVersion(
-        "7.4.11",
-        Effect.gen(function* () {
-          const fileSystem = yield* FileSystem.FileSystem;
-          const baseDir = yield* fileSystem.makeTempDirectoryScoped({
-            prefix: "provider-update-active-runtime-",
-          });
-          const npmPrefix = NodePath.join(baseDir, "nvm");
-          const kiloBinaryPath = NodePath.join(
-            npmPrefix,
-            "lib",
-            "node_modules",
-            "@kilocode",
-            "cli",
-            "bin",
-            "kilo",
-          );
-          yield* writeLatestKiloPackageFixture({
-            fileSystem,
-            binaryPath: kiloBinaryPath,
-            version: "7.4.10",
-          });
-          const settings = {
-            ...allProvidersDisabledServerSettings,
-            providers: {
-              ...allProvidersDisabledServerSettings.providers,
-              kilo: {
-                ...DEFAULT_SERVER_SETTINGS.providers.kilo,
-                enabled: true,
-                binaryPath: kiloBinaryPath,
-              },
-            },
-          } satisfies typeof DEFAULT_SERVER_SETTINGS;
-          yield* writeProviderStatusCache({
-            filePath: resolveProviderStatusCachePath({
-              stateDir: NodePath.join(baseDir, "userdata"),
-              provider: "kilo",
-            }),
-            provider: {
-              provider: "kilo",
-              status: "ready",
-              available: true,
-              authStatus: "authenticated",
-              checkedAt: "2026-07-20T12:00:00.000Z",
-              message: "Kilo CLI is installed and authenticated.",
+      withIsolatedProviderCommands(["npm"], () =>
+        withLatestNpmVersion(
+          "7.4.11",
+          Effect.gen(function* () {
+            const fileSystem = yield* FileSystem.FileSystem;
+            const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+              prefix: "provider-update-active-runtime-",
+            });
+            const npmPrefix = NodePath.join(baseDir, "nvm");
+            const kiloBinaryPath = NodePath.join(
+              npmPrefix,
+              "lib",
+              "node_modules",
+              "@kilocode",
+              "cli",
+              "bin",
+              "kilo",
+            );
+            yield* writeLatestKiloPackageFixture({
+              fileSystem,
+              binaryPath: kiloBinaryPath,
               version: "7.4.10",
-            },
-          });
-          let updateSpawnCount = 0;
-          const activeSession = {
-            provider: "kilo" as const,
-            status: "running" as const,
-            runtimeMode: "full-access" as const,
-            threadId: "00000000-0000-4000-8000-000000000001" as never,
-            activeTurnId: "00000000-0000-4000-8000-000000000002" as never,
-            createdAt: "2026-07-20T12:00:00.000Z",
-            updatedAt: "2026-07-20T12:00:00.000Z",
-          };
-          const activeProviderServiceLayer = Layer.succeed(ProviderService, {
-            listSessions: () => Effect.succeed([activeSession]),
-            stopRuntimeSession: () => Effect.void,
-            hasLiveRuntimeTasks: () => Effect.succeed(false),
-          } as unknown as ProviderServiceShape);
-          const layer = ProviderHealthLive.pipe(
-            Layer.provideMerge(activeProviderServiceLayer),
-            Layer.provideMerge(ServerSettingsService.layerTest(settings)),
-            Layer.provideMerge(ServerConfig.layerTest(process.cwd(), baseDir)),
-            Layer.provideMerge(
-              mockSpawnerLayer((args) => {
-                if (args.includes("install") && args.includes("@kilocode/cli@latest")) {
-                  updateSpawnCount += 1;
-                }
-                return { stdout: "kilo 7.4.10", stderr: "", code: 0 };
+            });
+            const settings = {
+              ...allProvidersDisabledServerSettings,
+              providers: {
+                ...allProvidersDisabledServerSettings.providers,
+                kilo: {
+                  ...DEFAULT_SERVER_SETTINGS.providers.kilo,
+                  enabled: true,
+                  binaryPath: kiloBinaryPath,
+                },
+              },
+            } satisfies typeof DEFAULT_SERVER_SETTINGS;
+            yield* writeProviderStatusCache({
+              filePath: resolveProviderStatusCachePath({
+                stateDir: NodePath.join(baseDir, "userdata"),
+                provider: "kilo",
               }),
-            ),
-          );
+              provider: {
+                provider: "kilo",
+                status: "ready",
+                available: true,
+                authStatus: "authenticated",
+                checkedAt: "2026-07-20T12:00:00.000Z",
+                message: "Kilo CLI is installed and authenticated.",
+                version: "7.4.10",
+              },
+            });
+            let updateSpawnCount = 0;
+            const activeSession = {
+              provider: "kilo" as const,
+              status: "running" as const,
+              runtimeMode: "full-access" as const,
+              threadId: "00000000-0000-4000-8000-000000000001" as never,
+              activeTurnId: "00000000-0000-4000-8000-000000000002" as never,
+              createdAt: "2026-07-20T12:00:00.000Z",
+              updatedAt: "2026-07-20T12:00:00.000Z",
+            };
+            const activeProviderServiceLayer = Layer.succeed(ProviderService, {
+              listSessions: () => Effect.succeed([activeSession]),
+              stopRuntimeSession: () => Effect.void,
+              hasLiveRuntimeTasks: () => Effect.succeed(false),
+            } as unknown as ProviderServiceShape);
+            const layer = ProviderHealthLive.pipe(
+              Layer.provideMerge(activeProviderServiceLayer),
+              Layer.provideMerge(ServerSettingsService.layerTest(settings)),
+              Layer.provideMerge(ServerConfig.layerTest(process.cwd(), baseDir)),
+              Layer.provideMerge(
+                mockSpawnerLayer((args) => {
+                  if (args.includes("install") && args.includes("@kilocode/cli@latest")) {
+                    updateSpawnCount += 1;
+                  }
+                  return { stdout: "kilo 7.4.10", stderr: "", code: 0 };
+                }),
+              ),
+            );
 
-          const result = yield* Effect.gen(function* () {
-            const providerHealth = yield* ProviderHealth;
-            return yield* providerHealth.updateProvider({ provider: "kilo" });
-          }).pipe(Effect.provide(layer));
-          const kilo = result.providers.find((provider) => provider.provider === "kilo");
+            const result = yield* Effect.gen(function* () {
+              const providerHealth = yield* ProviderHealth;
+              return yield* providerHealth.updateProvider({ provider: "kilo" });
+            }).pipe(Effect.provide(layer));
+            const kilo = result.providers.find((provider) => provider.provider === "kilo");
 
-          assert.strictEqual(updateSpawnCount, 0);
-          assert.strictEqual(kilo?.updateState?.status, "failed");
-          assert.match(
-            kilo?.updateState?.message ?? "",
-            /process ownership cannot be proven safely/u,
-          );
-        }),
+            assert.strictEqual(updateSpawnCount, 0);
+            assert.strictEqual(kilo?.updateState?.status, "failed");
+            assert.match(
+              kilo?.updateState?.message ?? "",
+              /process ownership cannot be proven safely/u,
+            );
+          }),
+        ),
       ),
     );
 
     it.effect("latches provider access when runtime shutdown cannot prove process-tree exit", () =>
-      withLatestNpmVersion(
-        "7.4.11",
-        Effect.gen(function* () {
-          const fileSystem = yield* FileSystem.FileSystem;
-          const baseDir = yield* fileSystem.makeTempDirectoryScoped({
-            prefix: "provider-update-unproven-runtime-exit-",
-          });
-          const npmPrefix = NodePath.join(baseDir, "nvm");
-          const kiloBinaryPath = NodePath.join(
-            npmPrefix,
-            "lib",
-            "node_modules",
-            "@kilocode",
-            "cli",
-            "bin",
-            "kilo",
-          );
-          yield* writeLatestKiloPackageFixture({
-            fileSystem,
-            binaryPath: kiloBinaryPath,
-            version: "7.4.10",
-          });
-          const settings = {
-            ...allProvidersDisabledServerSettings,
-            providers: {
-              ...allProvidersDisabledServerSettings.providers,
-              kilo: {
-                ...DEFAULT_SERVER_SETTINGS.providers.kilo,
-                enabled: true,
-                binaryPath: kiloBinaryPath,
-              },
-            },
-          } satisfies typeof DEFAULT_SERVER_SETTINGS;
-          yield* writeProviderStatusCache({
-            filePath: resolveProviderStatusCachePath({
-              stateDir: NodePath.join(baseDir, "userdata"),
-              provider: "kilo",
-            }),
-            provider: {
-              provider: "kilo",
-              status: "ready",
-              available: true,
-              authStatus: "authenticated",
-              checkedAt: "2026-07-20T12:00:00.000Z",
-              message: "Kilo CLI is installed and authenticated.",
+      withIsolatedProviderCommands(["npm"], () =>
+        withLatestNpmVersion(
+          "7.4.11",
+          Effect.gen(function* () {
+            const fileSystem = yield* FileSystem.FileSystem;
+            const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+              prefix: "provider-update-unproven-runtime-exit-",
+            });
+            const npmPrefix = NodePath.join(baseDir, "nvm");
+            const kiloBinaryPath = NodePath.join(
+              npmPrefix,
+              "lib",
+              "node_modules",
+              "@kilocode",
+              "cli",
+              "bin",
+              "kilo",
+            );
+            yield* writeLatestKiloPackageFixture({
+              fileSystem,
+              binaryPath: kiloBinaryPath,
               version: "7.4.10",
-            },
-          });
-          const unprovenExit = new ProviderProcessExitUnprovenError({
-            rootPid: 59_000,
-            rootExited: false,
-            remainingDescendantPids: [59_001],
-            captureComplete: true,
-          });
-          const runtimeShutdownError = new Error("Local Kilo server shutdown failed.", {
-            cause: unprovenExit,
-          });
-          const providerServiceLayer = Layer.succeed(ProviderService, {
-            prepareForMaintenance: () => Effect.fail(runtimeShutdownError),
-            listSessions: () => Effect.succeed([]),
-            stopRuntimeSession: () => Effect.void,
-            hasLiveRuntimeTasks: () => Effect.succeed(false),
-          } as unknown as ProviderServiceShape);
-          const maintenanceGate = yield* makeProviderMaintenanceGate;
-          let updateSpawnCount = 0;
-          const layer = makeProviderHealthLive({ maintenanceGate }).pipe(
-            Layer.provideMerge(providerServiceLayer),
-            Layer.provideMerge(ServerSettingsService.layerTest(settings)),
-            Layer.provideMerge(ServerConfig.layerTest(process.cwd(), baseDir)),
-            Layer.provideMerge(
-              mockSpawnerLayer((args) => {
-                if (args.includes("install") && args.includes("@kilocode/cli@latest")) {
-                  updateSpawnCount += 1;
-                }
-                return { stdout: "kilo 7.4.10", stderr: "", code: 0 };
+            });
+            const settings = {
+              ...allProvidersDisabledServerSettings,
+              providers: {
+                ...allProvidersDisabledServerSettings.providers,
+                kilo: {
+                  ...DEFAULT_SERVER_SETTINGS.providers.kilo,
+                  enabled: true,
+                  binaryPath: kiloBinaryPath,
+                },
+              },
+            } satisfies typeof DEFAULT_SERVER_SETTINGS;
+            yield* writeProviderStatusCache({
+              filePath: resolveProviderStatusCachePath({
+                stateDir: NodePath.join(baseDir, "userdata"),
+                provider: "kilo",
               }),
-            ),
-          );
+              provider: {
+                provider: "kilo",
+                status: "ready",
+                available: true,
+                authStatus: "authenticated",
+                checkedAt: "2026-07-20T12:00:00.000Z",
+                message: "Kilo CLI is installed and authenticated.",
+                version: "7.4.10",
+              },
+            });
+            const unprovenExit = new ProviderProcessExitUnprovenError({
+              rootPid: 59_000,
+              rootExited: false,
+              remainingDescendantPids: [59_001],
+              captureComplete: true,
+            });
+            const runtimeShutdownError = new Error("Local Kilo server shutdown failed.", {
+              cause: unprovenExit,
+            });
+            const providerServiceLayer = Layer.succeed(ProviderService, {
+              prepareForMaintenance: () => Effect.fail(runtimeShutdownError),
+              listSessions: () => Effect.succeed([]),
+              stopRuntimeSession: () => Effect.void,
+              hasLiveRuntimeTasks: () => Effect.succeed(false),
+            } as unknown as ProviderServiceShape);
+            const maintenanceGate = yield* makeProviderMaintenanceGate;
+            let updateSpawnCount = 0;
+            const layer = makeProviderHealthLive({ maintenanceGate }).pipe(
+              Layer.provideMerge(providerServiceLayer),
+              Layer.provideMerge(ServerSettingsService.layerTest(settings)),
+              Layer.provideMerge(ServerConfig.layerTest(process.cwd(), baseDir)),
+              Layer.provideMerge(
+                mockSpawnerLayer((args) => {
+                  if (args.includes("install") && args.includes("@kilocode/cli@latest")) {
+                    updateSpawnCount += 1;
+                  }
+                  return { stdout: "kilo 7.4.10", stderr: "", code: 0 };
+                }),
+              ),
+            );
 
-          const result = yield* Effect.gen(function* () {
-            const providerHealth = yield* ProviderHealth;
-            return yield* providerHealth.updateProvider({ provider: "kilo" });
-          }).pipe(Effect.provide(layer));
-          const kilo = result.providers.find((provider) => provider.provider === "kilo");
-          const blocked = yield* maintenanceGate
-            .withOperation({
-              provider: "kilo",
-              operation: "session.start",
-              run: Effect.void,
-            })
-            .pipe(Effect.flip);
+            const result = yield* Effect.gen(function* () {
+              const providerHealth = yield* ProviderHealth;
+              return yield* providerHealth.updateProvider({ provider: "kilo" });
+            }).pipe(Effect.provide(layer));
+            const kilo = result.providers.find((provider) => provider.provider === "kilo");
+            const blocked = yield* maintenanceGate
+              .withOperation({
+                provider: "kilo",
+                operation: "session.start",
+                run: Effect.void,
+              })
+              .pipe(Effect.flip);
 
-          assert.strictEqual(updateSpawnCount, 0);
-          assert.strictEqual(kilo?.updateState?.status, "failed");
-          assert.match(kilo?.updateState?.message ?? "", /Restart Synara/u);
-          assert.strictEqual(blocked.operation, "session.start");
-          assert.match(blocked.message, /Restart Synara before retrying/u);
-          assert.match(blocked.latchedReason ?? "", /descendants still running: 59001/u);
-        }),
+            assert.strictEqual(updateSpawnCount, 0);
+            assert.strictEqual(kilo?.updateState?.status, "failed");
+            assert.match(kilo?.updateState?.message ?? "", /Restart Synara/u);
+            assert.strictEqual(blocked.operation, "session.start");
+            assert.match(blocked.message, /Restart Synara before retrying/u);
+            assert.match(blocked.latchedReason ?? "", /descendants still running: 59001/u);
+          }),
+        ),
       ),
     );
 
@@ -2063,13 +3435,25 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
               // acquisition result so interruption targets the spawn-to-finalizer handoff exactly.
               const spawnSucceeded = yield* Deferred.make<void>();
               const releaseSpawnResult = yield* Deferred.make<void>();
-              const teardownStarted = yield* Deferred.make<void>();
-              const teardownProof = yield* Deferred.make<void, ProviderProcessExitUnprovenError>();
+              let markTeardownStarted!: () => void;
+              const teardownStarted = new Promise<void>((resolve) => {
+                markTeardownStarted = resolve;
+              });
+              let rejectTeardownProof!: (error: ProviderProcessExitUnprovenError) => void;
+              const teardownProof = new Promise<never>((_resolve, reject) => {
+                rejectTeardownProof = reject;
+              });
+              const updaterExit = yield* Deferred.make<ChildProcessSpawner.ExitCode>();
               const maintenanceGate = yield* makeProviderMaintenanceGate;
+              const maintenanceOwnedResources =
+                yield* makeProviderMaintenanceOwnedResourceCoordinator;
+              let updaterRunning = true;
               let captureCount = 0;
+              let teardownAttempts = 0;
               let teardownRootPid: number | undefined;
               let teardownCapturedRootIdentity: string | undefined;
               let concurrentOperationEntered = false;
+              const spawnedCommands: string[] = [];
 
               const processTreeKiller: ProcessTreeKiller = {
                 capture: () => {
@@ -2081,8 +3465,8 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
               };
               const updaterHandle = ChildProcessSpawner.makeHandle({
                 pid: ChildProcessSpawner.ProcessId(rootPid),
-                exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(0)),
-                isRunning: Effect.succeed(false),
+                exitCode: Deferred.await(updaterExit),
+                isRunning: Effect.sync(() => updaterRunning),
                 kill: () => Effect.void,
                 stdin: Sink.drain,
                 stdout: Stream.never,
@@ -2102,35 +3486,38 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
                       windowsVerbatimArguments?: boolean;
                     };
                   };
+                  const unwrapped = unwrapContainedProviderCommand(cmd);
+                  spawnedCommands.push(`${cmd.command} ${cmd.args.join(" ")}`);
                   const isUpdater = preparedProviderCommandMatches({
                     fixture,
                     executable: fixtureExecutablePath(fixture, "npm"),
                     expectedArgs: ["install", "-g", "--prefix", npmPrefix, "@kilocode/cli@latest"],
-                    command: cmd.command,
-                    actualArgs: cmd.args,
-                    env: cmd.options?.env,
-                    options: cmd.options,
+                    command: unwrapped.command,
+                    actualArgs: unwrapped.args,
+                    env: unwrapped.options?.env,
+                    options: unwrapped.options,
                   });
                   return isUpdater
                     ? Deferred.succeed(spawnSucceeded, undefined).pipe(
                         Effect.andThen(Deferred.await(releaseSpawnResult)),
                         Effect.as(updaterHandle),
                       )
-                    : Effect.succeed(mockHandle({ stdout: "", stderr: "", code: 0 }));
+                    : Effect.succeed(mockHandle({ stdout: "kilo 7.4.10\n", stderr: "", code: 0 }));
                 }),
               );
               const layer = makeProviderHealthLive({
+                ...TEST_REAL_PROVIDER_PROCESS_OPTIONS,
                 maintenanceGate,
+                maintenanceOwnedResources,
                 processTreeKiller,
                 teardownProcessTree: (input) => {
+                  teardownAttempts += 1;
                   teardownRootPid = input.rootPid;
                   teardownCapturedRootIdentity = input.capturedTree?.root?.identity;
-                  return Effect.runPromise(
-                    Deferred.succeed(teardownStarted, undefined).pipe(
-                      Effect.andThen(Deferred.await(teardownProof)),
-                      Effect.as({ escalated: false, signalErrors: [] }),
-                    ),
-                  );
+                  markTeardownStarted();
+                  return teardownAttempts === 1
+                    ? teardownProof
+                    : Promise.resolve({ escalated: false, signalErrors: [] });
                 },
               }).pipe(
                 Layer.provideMerge(providerServiceWithoutRuntimesLayer),
@@ -2144,16 +3531,38 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
                 const update = yield* providerHealth
                   .updateProvider({ provider: "kilo" })
                   .pipe(Effect.forkChild);
-                yield* Deferred.await(spawnSucceeded);
+                const spawnOutcome = yield* Effect.race(
+                  Effect.race(
+                    Deferred.await(spawnSucceeded).pipe(Effect.as("spawned" as const)),
+                    Fiber.await(update).pipe(Effect.as("update-exited" as const)),
+                  ),
+                  Effect.promise(
+                    () =>
+                      new Promise<"spawn-timeout">((resolve) =>
+                        setTimeout(() => resolve("spawn-timeout"), 5_000),
+                      ),
+                  ),
+                );
+                assert.strictEqual(
+                  spawnOutcome,
+                  "spawned",
+                  `Spawn boundary failed after: ${spawnedCommands.join(" | ")}`,
+                );
 
                 const interrupting = yield* Fiber.interrupt(update).pipe(Effect.forkChild);
                 yield* Deferred.succeed(releaseSpawnResult, undefined);
                 const boundaryOutcome = yield* Effect.race(
-                  Deferred.await(teardownStarted).pipe(Effect.as("teardown-started" as const)),
+                  Effect.promise(() => teardownStarted).pipe(
+                    Effect.as("teardown-started" as const),
+                  ),
                   Fiber.await(interrupting).pipe(Effect.as("interrupt-completed" as const)),
                 );
 
-                assert.strictEqual(boundaryOutcome, "teardown-started");
+                assert.strictEqual(
+                  boundaryOutcome,
+                  "teardown-started",
+                  `captureCount=${captureCount}; teardownRootPid=${String(teardownRootPid)}`,
+                );
                 assert.ok(captureCount > 0);
                 assert.strictEqual(teardownRootPid, rootPid);
                 assert.strictEqual(teardownCapturedRootIdentity, root.identity);
@@ -2176,7 +3585,9 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
                   remainingDescendantPids: [74],
                   captureComplete: true,
                 });
-                yield* Deferred.fail(teardownProof, unprovenExit);
+                updaterRunning = false;
+                yield* Deferred.succeed(updaterExit, ChildProcessSpawner.ExitCode(0));
+                rejectTeardownProof(unprovenExit);
                 yield* Fiber.join(interrupting);
 
                 const latched = yield* maintenanceGate
@@ -2189,6 +3600,13 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
                 assert.strictEqual(latched.operation, "session.start");
                 assert.match(latched.message, /Restart Synara before retrying/u);
                 assert.match(latched.latchedReason ?? "", /descendants still running: 74/u);
+
+                yield* maintenanceOwnedResources.drainProviderResources({ provider: "kilo" });
+                assert.strictEqual(teardownAttempts, 2);
+                assert.strictEqual(teardownRootPid, rootPid);
+                assert.strictEqual(teardownCapturedRootIdentity, root.identity);
+                yield* maintenanceOwnedResources.drainProviderResources({ provider: "kilo" });
+                assert.strictEqual(teardownAttempts, 2);
               }).pipe(Effect.provide(layer));
             }),
           ),
@@ -2618,12 +4036,12 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
     it.effect("uses configured codex binary for version and auth probes", () =>
       Effect.gen(function* () {
         yield* withTempCodexHome();
-        const status = yield* makeCheckCodexProviderStatus("  /custom/bin/codex  ");
+        const status = yield* makeCheckCodexProviderStatus(`  ${configuredTestBinary("codex")}  `);
         assert.strictEqual(status.status, "ready");
       }).pipe(
         Effect.provide(
           mockSpawnerLayer((args, command) => {
-            assert.strictEqual(command, "/custom/bin/codex");
+            assert.strictEqual(command, configuredTestBinary("codex"));
             const joined = args.join(" ");
             if (joined === "--version") return { stdout: "codex 1.0.0\n", stderr: "", code: 0 };
             if (joined === "login status") return { stdout: "Logged in\n", stderr: "", code: 0 };
@@ -2636,8 +4054,31 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
     it.effect("propagates verbatim Windows arguments through the Effect command", () => {
       const platform = vi.spyOn(process, "platform", "get").mockReturnValue("win32");
       return Effect.gen(function* () {
-        yield* withTempCodexHome();
-        const status = yield* makeCheckCodexProviderStatus("C:\\tools(x86)\\codex.cmd");
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const { tmpDir } = yield* withTempCodexHome();
+        const launcherPath = path.join(tmpDir, WINDOWS_JOB_LAUNCHER_EXECUTABLE);
+        yield* fileSystem.writeFileString(launcherPath, "");
+        yield* Effect.acquireRelease(
+          Effect.sync(() => {
+            const previous = process.env[WINDOWS_JOB_LAUNCHER_ENV];
+            process.env[WINDOWS_JOB_LAUNCHER_ENV] = launcherPath;
+            return previous;
+          }),
+          (previous) =>
+            Effect.sync(() => {
+              if (previous === undefined) {
+                delete process.env[WINDOWS_JOB_LAUNCHER_ENV];
+              } else {
+                process.env[WINDOWS_JOB_LAUNCHER_ENV] = previous;
+              }
+            }),
+        );
+        const status = yield* makeProductionCheckCodexProviderStatus(
+          "C:\\tools(x86)\\codex.cmd",
+          undefined,
+          TEST_PROVIDER_LAYER_PROCESS_OPTIONS,
+        );
         assert.strictEqual(status.status, "ready");
       }).pipe(
         Effect.provide(
@@ -3071,12 +4512,15 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
 
     it.effect("uses configured claude binary for version and auth probes", () =>
       Effect.gen(function* () {
-        const status = yield* makeCheckClaudeProviderStatus(undefined, "/custom/bin/claude");
+        const status = yield* makeCheckClaudeProviderStatus(
+          undefined,
+          configuredTestBinary("claude"),
+        );
         assert.strictEqual(status.status, "ready");
       }).pipe(
         Effect.provide(
           mockSpawnerLayer((args, command) => {
-            assert.strictEqual(command, "/custom/bin/claude");
+            assert.strictEqual(command, configuredTestBinary("claude"));
             const joined = args.join(" ");
             if (joined === "--version") return { stdout: "1.0.0\n", stderr: "", code: 0 };
             if (joined === "auth status")
@@ -3549,12 +4993,12 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
 
     it.effect("uses configured opencode binary for version probe", () =>
       Effect.gen(function* () {
-        const status = yield* makeCheckOpenCodeProviderStatus("/custom/bin/opencode");
+        const status = yield* makeCheckOpenCodeProviderStatus(configuredTestBinary("opencode"));
         assert.strictEqual(status.status, "ready");
       }).pipe(
         Effect.provide(
           mockSpawnerLayer((args, command) => {
-            assert.strictEqual(command, "/custom/bin/opencode");
+            assert.strictEqual(command, configuredTestBinary("opencode"));
             const joined = args.join(" ");
             if (joined === "--version") return { stdout: "opencode 1.3.17\n", stderr: "", code: 0 };
             throw new Error(`Unexpected args: ${joined}`);
@@ -3581,12 +5025,12 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
   describe("checkKiloProviderStatus", () => {
     it.effect("uses configured Kilo binary for version probe", () =>
       Effect.gen(function* () {
-        const status = yield* makeCheckKiloProviderStatus("/custom/bin/kilo");
+        const status = yield* makeCheckKiloProviderStatus(configuredTestBinary("kilo"));
         assert.strictEqual(status.status, "ready");
       }).pipe(
         Effect.provide(
           mockSpawnerLayer((args, command) => {
-            assert.strictEqual(command, "/custom/bin/kilo");
+            assert.strictEqual(command, configuredTestBinary("kilo"));
             const joined = args.join(" ");
             if (joined === "--version") return { stdout: "kilo 7.2.52\n", stderr: "", code: 0 };
             throw new Error(`Unexpected args: ${joined}`);
@@ -3630,7 +5074,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
 
     it.effect("uses configured Pi binary and agent dir without SDK registry reads", () =>
       Effect.gen(function* () {
-        const status = yield* checkPiProviderStatus("/tmp/pi-agent", "/custom/bin/pi");
+        const status = yield* checkPiProviderStatus("/tmp/pi-agent", configuredTestBinary("pi"));
         assert.strictEqual(status.status, "ready");
         assert.strictEqual(
           status.message,
@@ -3639,7 +5083,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
       }).pipe(
         Effect.provide(
           mockSpawnerLayer((args, command) => {
-            assert.strictEqual(command, "/custom/bin/pi");
+            assert.strictEqual(command, configuredTestBinary("pi"));
             const joined = args.join(" ");
             if (joined === "--version") return { stdout: "pi 0.74.0\n", stderr: "", code: 0 };
             throw new Error(`Unexpected args: ${joined}`);
@@ -3734,12 +5178,12 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
 
     it.effect("uses the configured Antigravity binary", () =>
       Effect.gen(function* () {
-        const status = yield* checkAntigravityProviderStatus("/custom/bin/agy");
+        const status = yield* checkAntigravityProviderStatus(configuredTestBinary("agy"));
         assert.strictEqual(status.status, "ready");
       }).pipe(
         Effect.provide(
           mockSpawnerLayer((args, command) => {
-            assert.strictEqual(command, "/custom/bin/agy");
+            assert.strictEqual(command, configuredTestBinary("agy"));
             return args.join(" ") === "--version"
               ? { stdout: "1.1.2\n", stderr: "", code: 0 }
               : { stdout: "GPT-OSS 120B (Medium)\n", stderr: "", code: 0 };
@@ -3824,12 +5268,12 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
 
     it.effect("uses configured Grok binary for version probe", () =>
       Effect.gen(function* () {
-        const status = yield* makeCheckGrokProviderStatus("/custom/bin/grok");
+        const status = yield* makeCheckGrokProviderStatus(configuredTestBinary("grok"));
         assert.strictEqual(status.status, "ready");
       }).pipe(
         Effect.provide(
           mockSpawnerLayer((args, command) => {
-            assert.strictEqual(command, "/custom/bin/grok");
+            assert.strictEqual(command, configuredTestBinary("grok"));
             const joined = args.join(" ");
             if (joined === "--version") return { stdout: "grok 0.1.0\n", stderr: "", code: 0 };
             throw new Error(`Unexpected args: ${joined}`);
@@ -3908,12 +5352,12 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
 
     it.effect("uses configured Cursor Agent binary for version probe", () =>
       Effect.gen(function* () {
-        const status = yield* makeCheckCursorProviderStatus("/custom/bin/agent");
+        const status = yield* makeCheckCursorProviderStatus(configuredTestBinary("agent"));
         assert.strictEqual(status.status, "ready");
       }).pipe(
         Effect.provide(
           mockSpawnerLayer((args, command) => {
-            assert.strictEqual(command, "/custom/bin/agent");
+            assert.strictEqual(command, configuredTestBinary("agent"));
             const joined = args.join(" ");
             if (joined === "--version") {
               return { stdout: "agent 2026.04.27\n", stderr: "", code: 0 };
@@ -3948,12 +5392,12 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
                 }
               }),
           );
-          const status = yield* makeCheckCursorProviderStatus("/custom/bin/cursor");
+          const status = yield* makeCheckCursorProviderStatus(configuredTestBinary("cursor"));
           assert.strictEqual(status.status, "ready");
         }).pipe(
           Effect.provide(
             mockSpawnerLayer((args, command) => {
-              assert.strictEqual(command, "/custom/bin/cursor");
+              assert.strictEqual(command, configuredTestBinary("cursor"));
               const joined = args.join(" ");
               if (joined === "agent --version") {
                 return { stdout: "cursor 2026.04.27\n", stderr: "", code: 0 };
@@ -4113,8 +5557,9 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
                 command: string;
                 args: ReadonlyArray<string>;
               };
-              assert.strictEqual(cmd.command, "cursor-agent");
-              const joined = cmd.args.join(" ");
+              const unwrapped = unwrapContainedProviderCommand(cmd);
+              assert.strictEqual(unwrapped.command, "cursor-agent");
+              const joined = unwrapped.args.join(" ");
               if (joined === "--version") {
                 return Effect.succeed(
                   mockHandle({ stdout: "agent 2026.04.27\n", stderr: "", code: 0 }),

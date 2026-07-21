@@ -8,6 +8,17 @@ import {
   ProviderMaintenanceBusyError,
   ProviderMaintenanceLatchedError,
 } from "./providerMaintenanceGate.ts";
+import { ProviderProcessExitUnprovenError } from "./supervisedProcessTeardown.ts";
+import { ProviderMaintenanceOwnedResourceCloseError } from "./providerMaintenanceOwnedResources.ts";
+
+function unprovenExit(rootPid: number): ProviderProcessExitUnprovenError {
+  return new ProviderProcessExitUnprovenError({
+    rootPid,
+    rootExited: false,
+    remainingDescendantPids: null,
+    captureComplete: false,
+  });
+}
 
 function awaitBusyRejection(
   gate: ProviderMaintenanceGate,
@@ -218,6 +229,30 @@ describe("providerMaintenanceGate", () => {
     );
   });
 
+  it("releases an operation admission after an ordinary failure", async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const gate = yield* makeProviderMaintenanceGate;
+        const failure = new Error("ordinary provider failure");
+        const result = yield* gate
+          .withOperation({
+            provider: "cursor",
+            operation: "provider.discovery",
+            run: Effect.fail(failure),
+          })
+          .pipe(Effect.result);
+
+        expect(Result.isFailure(result)).toBe(true);
+        expect(
+          yield* gate.withExclusiveMaintenance({
+            provider: "cursor",
+            run: Effect.succeed("released"),
+          }),
+        ).toBe("released");
+      }),
+    );
+  });
+
   it("releases maintenance admission after interruption", async () => {
     await Effect.runPromise(
       Effect.scoped(
@@ -347,6 +382,187 @@ describe("providerMaintenanceGate", () => {
           }
         }),
       ),
+    );
+  });
+
+  it("refuses queued maintenance when the draining operation latches before release", async () => {
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const gate = yield* makeProviderMaintenanceGate;
+          const operationStarted = yield* Deferred.make<void>();
+          const releaseOperation = yield* Deferred.make<void>();
+          let maintenanceRuns = 0;
+
+          const operation = yield* gate
+            .withOperation({
+              provider: "opencode",
+              operation: "provider.health",
+              run: Deferred.succeed(operationStarted, undefined).pipe(
+                Effect.andThen(Deferred.await(releaseOperation)),
+              ),
+            })
+            .pipe(Effect.forkChild);
+          yield* Deferred.await(operationStarted);
+
+          const maintenance = yield* gate
+            .withExclusiveMaintenance({
+              provider: "opencode",
+              run: Effect.sync(() => maintenanceRuns++),
+            })
+            .pipe(Effect.result, Effect.forkChild);
+          yield* awaitBusyRejection(gate, "opencode");
+
+          yield* gate.latchProvider({
+            provider: "opencode",
+            reason: "Windows Job drain acknowledgement is unavailable",
+          });
+          yield* Deferred.succeed(releaseOperation, undefined);
+          yield* Fiber.join(operation);
+          const result = yield* Fiber.join(maintenance);
+
+          expect(maintenanceRuns).toBe(0);
+          expect(Result.isFailure(result)).toBe(true);
+          if (Result.isFailure(result)) {
+            expect(result.failure).toBeInstanceOf(ProviderMaintenanceLatchedError);
+            expect(result.failure.message).toContain("drain acknowledgement is unavailable");
+          }
+        }),
+      ),
+    );
+  });
+
+  it("automatically latches a wrapped unproven operation failure before queued maintenance runs", async () => {
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const gate = yield* makeProviderMaintenanceGate;
+          const operationStarted = yield* Deferred.make<void>();
+          const releaseOperation = yield* Deferred.make<void>();
+          const processFailure = unprovenExit(4_201);
+          const wrappedFailure = new Error("adapter discovery failed", {
+            cause: new AggregateError(
+              [
+                new Error("inventory failed"),
+                new Error("finalizer failed", { cause: processFailure }),
+              ],
+              "discovery aggregate",
+            ),
+          });
+          let maintenanceRuns = 0;
+
+          const operation = yield* gate
+            .withOperation({
+              provider: "opencode",
+              operation: "provider.discovery",
+              run: Deferred.succeed(operationStarted, undefined).pipe(
+                Effect.andThen(Deferred.await(releaseOperation)),
+                Effect.andThen(Effect.fail(wrappedFailure)),
+              ),
+            })
+            .pipe(Effect.result, Effect.forkChild);
+          yield* Deferred.await(operationStarted);
+
+          const maintenance = yield* gate
+            .withExclusiveMaintenance({
+              provider: "opencode",
+              run: Effect.sync(() => maintenanceRuns++),
+            })
+            .pipe(Effect.result, Effect.forkChild);
+          yield* awaitBusyRejection(gate, "opencode");
+          yield* Deferred.succeed(releaseOperation, undefined);
+
+          const operationResult = yield* Fiber.join(operation);
+          const maintenanceResult = yield* Fiber.join(maintenance);
+          expect(Result.isFailure(operationResult)).toBe(true);
+          expect(maintenanceRuns).toBe(0);
+          expect(Result.isFailure(maintenanceResult)).toBe(true);
+          if (Result.isFailure(maintenanceResult)) {
+            expect(maintenanceResult.failure).toBeInstanceOf(ProviderMaintenanceLatchedError);
+            expect(maintenanceResult.failure.message).toContain(processFailure.message);
+          }
+        }),
+      ),
+    );
+  });
+
+  it("automatically latches an unproven defect and blocks future operations", async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const gate = yield* makeProviderMaintenanceGate;
+        const processFailure = unprovenExit(4_202);
+
+        yield* gate
+          .withOperation({
+            provider: "codex",
+            operation: "provider.discovery",
+            run: Effect.die(new AggregateError([new Error("ordinary"), processFailure])),
+          })
+          .pipe(Effect.exit);
+
+        const blocked = yield* gate
+          .withOperation({ provider: "codex", operation: "session.start", run: Effect.void })
+          .pipe(Effect.result);
+        expect(Result.isFailure(blocked)).toBe(true);
+        if (Result.isFailure(blocked)) {
+          expect(blocked.failure).toBeInstanceOf(ProviderMaintenanceBusyError);
+          expect(blocked.failure.message).toContain(processFailure.message);
+        }
+      }),
+    );
+  });
+
+  it("automatically latches an unproven exclusive-maintenance failure", async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const gate = yield* makeProviderMaintenanceGate;
+        const processFailure = unprovenExit(4_203);
+        yield* gate
+          .withExclusiveMaintenance({
+            provider: "codex",
+            run: Effect.fail(new AggregateError([new Error("update failed"), processFailure])),
+          })
+          .pipe(Effect.result);
+
+        const blocked = yield* gate
+          .withOperation({ provider: "codex", operation: "session.start", run: Effect.void })
+          .pipe(Effect.result);
+        expect(Result.isFailure(blocked)).toBe(true);
+        if (Result.isFailure(blocked)) {
+          expect(blocked.failure.message).toContain(processFailure.message);
+        }
+      }),
+    );
+  });
+
+  it("finds a later unproven owned-resource close failure before releasing maintenance", async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const gate = yield* makeProviderMaintenanceGate;
+        const ordinaryFailure = new Error("first close failed ordinarily");
+        const processFailure = unprovenExit(4_204);
+        const closeFailure = new ProviderMaintenanceOwnedResourceCloseError({
+          provider: "codex",
+          resourceId: "first-resource",
+          cause: ordinaryFailure,
+          failures: [
+            { resourceId: "first-resource", cause: ordinaryFailure },
+            { resourceId: "second-resource", cause: processFailure },
+          ],
+        });
+
+        yield* gate
+          .withExclusiveMaintenance({ provider: "codex", run: Effect.fail(closeFailure) })
+          .pipe(Effect.result);
+
+        const blocked = yield* gate
+          .withOperation({ provider: "codex", operation: "session.start", run: Effect.void })
+          .pipe(Effect.result);
+        expect(Result.isFailure(blocked)).toBe(true);
+        if (Result.isFailure(blocked)) {
+          expect(blocked.failure.message).toContain(processFailure.message);
+        }
+      }),
     );
   });
 });

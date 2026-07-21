@@ -55,8 +55,8 @@ import {
   OPENCODE_CLI_SPEC,
   type OpenCodeRuntimeShape,
   OpenCodeRuntime,
-  OpenCodeRuntimeLive,
   OpenCodeRuntimeError,
+  makeOpenCodeRuntimeLive,
   openCodeQuestionId,
   openCodeRuntimeErrorDetail,
   parseOpenCodeModelSlug,
@@ -66,7 +66,9 @@ import {
   toOpenCodeQuestionAnswers,
   type OpenCodeServerConnection,
 } from "../opencodeRuntime.ts";
+import type { ProviderMaintenanceOwnedResourceCoordinator } from "../providerMaintenanceOwnedResources.ts";
 import { appendFileAttachmentsPromptBlock } from "../attachmentProjection.ts";
+import { findProviderProcessExitUnprovenError } from "../supervisedProcessTeardown.ts";
 import { extractProposedPlanMarkdown, withProviderPlanModePrompt } from "../planMode.ts";
 import { makeRuntimeTaskListItem, nonEmptyRuntimeTaskListPayload } from "../runtimeTaskList.ts";
 import {
@@ -211,6 +213,7 @@ export interface OpenCodeAdapterLiveOptions {
   readonly nativeEventLogPath?: string;
   readonly nativeEventLogger?: EventNdjsonLogger;
   readonly runtime?: OpenCodeRuntimeShape;
+  readonly maintenanceOwnedResources?: ProviderMaintenanceOwnedResourceCoordinator;
   readonly adapterConfig?: OpenCodeCompatibleAdapterConfig;
   readonly promptAcceptedActivityTimeoutMs?: number;
   readonly promptAcceptedRecoveryDelaysMs?: ReadonlyArray<number>;
@@ -3920,10 +3923,12 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
             })
             .pipe(
               Effect.catch((error) =>
-                Effect.logDebug(`${adapterConfig.displayName} CLI model discovery failed`, {
-                  binaryPath,
-                  detail: openCodeRuntimeErrorDetail(error),
-                }).pipe(Effect.as([] as ReadonlyArray<OpenCodeCliModelDescriptor>)),
+                findProviderProcessExitUnprovenError(error) === null
+                  ? Effect.logDebug(`${adapterConfig.displayName} CLI model discovery failed`, {
+                      binaryPath,
+                      detail: openCodeRuntimeErrorDetail(error),
+                    }).pipe(Effect.as([] as ReadonlyArray<OpenCodeCliModelDescriptor>))
+                  : Effect.fail(toAdapterRequestError(error)),
               ),
             );
           const inventoryEffect = withDiscoveryInventory(
@@ -3978,6 +3983,16 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
             };
           }
 
+          const inventoryFailure = Cause.squash(inventoryExit.cause);
+          if (findProviderProcessExitUnprovenError(inventoryFailure) !== null) {
+            return yield* new ProviderAdapterRequestError({
+              provider,
+              method: "listModels",
+              detail: openCodeRuntimeErrorDetail(inventoryFailure),
+              cause: inventoryFailure,
+            });
+          }
+
           // Keep OpenCode's authoritative CLI list usable even if the local server
           // cannot start; otherwise the web picker falls back to one static model.
           if (cliModels.length > 0) {
@@ -4003,7 +4018,6 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
             };
           }
 
-          const inventoryFailure = Cause.squash(inventoryExit.cause);
           return yield* new ProviderAdapterRequestError({
             provider,
             method: "listModels",
@@ -4123,7 +4137,13 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
     }),
   ).pipe(
     Layer.provide(
-      options?.runtime ? Layer.succeed(OpenCodeRuntime, options.runtime) : OpenCodeRuntimeLive,
+      options?.runtime
+        ? Layer.succeed(OpenCodeRuntime, options.runtime)
+        : makeOpenCodeRuntimeLive(
+            options?.maintenanceOwnedResources
+              ? { maintenanceOwnedResources: options.maintenanceOwnedResources }
+              : undefined,
+          ),
     ),
     Layer.provide(NodeServices.layer),
   );

@@ -5,7 +5,6 @@
 
 import { randomUUID } from "node:crypto";
 import * as OfficialAcp from "@agentclientprotocol/sdk";
-import { prepareWindowsSafeProcess } from "@synara/shared/windowsProcess";
 import {
   Cause,
   Deferred,
@@ -30,13 +29,13 @@ import { buildProviderChildEnvironment } from "../../providerChildEnvironment.ts
 import {
   teardownEffectProcessTree,
   teardownProviderProcessTree,
-  superviseEffectProcessTree,
   type EffectProcessExitHandle,
   type EffectProcessTreeSupervisor,
   type SupervisedProcessTeardownResult,
 } from "../supervisedProcessTeardown.ts";
 import type { ProcessTreeKiller } from "../../terminal/processTreeKiller.ts";
-import { prepareAcpWindowsJobLaunch } from "./AcpWindowsJob.ts";
+import { supervisePreparedEffectProcess } from "../windowsJobProcessSupervisor.ts";
+import { prepareWindowsProviderProcess } from "../windowsProviderProcess.ts";
 import {
   collectSessionConfigOptionValues,
   extractModelConfigId,
@@ -52,7 +51,6 @@ import {
 const CONFIG_OPTION_UPDATE_TIMEOUT = "5 seconds";
 const ACP_INCOMING_CHUNK_QUEUE_CAPACITY = 64;
 const ACP_TRANSPORT_CLOSE_GRACE = "1 second";
-const ACP_WINDOWS_JOB_TERMINATION_TIMEOUT_MS = 5_000;
 export const ACP_MAX_INCOMING_FRAME_BYTES = 8 * 1024 * 1024;
 
 export interface AcpProtocolLogEvent {
@@ -284,85 +282,6 @@ interface EnsureActiveAssistantSegmentResult {
 
 type AcpOwnedChildProcess = EffectProcessExitHandle;
 
-function superviseWindowsAcpJobProcess(
-  child: ChildProcessSpawner.ChildProcessHandle,
-): EffectProcessTreeSupervisor {
-  const ownedChild = child as ChildProcessSpawner.ChildProcessHandle & {
-    readonly synaraTerminateExact?: (() => boolean) | undefined;
-  };
-  const terminateExact = ownedChild.synaraTerminateExact;
-  if (typeof terminateExact !== "function") {
-    throw new Error("Windows ACP Job Object wrapper is missing exact-handle termination support.");
-  }
-
-  const awaitWrapperExit = async (): Promise<void> => {
-    let timeout: ReturnType<typeof setTimeout> | undefined;
-    try {
-      await Promise.race([
-        Effect.runPromise(awaitAcpChildExit(child)),
-        new Promise<never>((_resolve, reject) => {
-          timeout = setTimeout(
-            () =>
-              reject(
-                new Error(
-                  `Timed out waiting for Windows ACP Job Object wrapper ${Number(child.pid)} to exit.`,
-                ),
-              ),
-            ACP_WINDOWS_JOB_TERMINATION_TIMEOUT_MS,
-          );
-        }),
-      ]);
-    } finally {
-      if (timeout !== undefined) clearTimeout(timeout);
-    }
-  };
-
-  const proveExit = async (): Promise<SupervisedProcessTeardownResult> => {
-    await awaitWrapperExit();
-    const running = await Effect.runPromise(child.isRunning);
-    if (running) {
-      throw new Error(`Windows ACP Job Object wrapper ${Number(child.pid)} still reports running.`);
-    }
-    return { escalated: false, signalErrors: [] };
-  };
-
-  let teardownPromise: Promise<SupervisedProcessTeardownResult> | null = null;
-  const teardown = (): Promise<SupervisedProcessTeardownResult> => {
-    if (teardownPromise === null) {
-      const attempt = (async () => {
-        const running = await Effect.runPromise(child.isRunning);
-        if (running) {
-          // Use Node's retained native process handle rather than Effect's PID-based taskkill path.
-          // Terminating the exact wrapper closes its non-inheritable Job handle, and Windows then
-          // terminates every process that inherited the Job before provider code could start.
-          terminateExact();
-        }
-        await awaitWrapperExit();
-        const stillRunning = await Effect.runPromise(child.isRunning);
-        if (stillRunning) {
-          throw new Error(
-            `Windows ACP Job Object wrapper ${Number(child.pid)} still reports running.`,
-          );
-        }
-        return { escalated: running, signalErrors: [] };
-      })();
-      teardownPromise = attempt;
-      void attempt.catch(() => {
-        if (teardownPromise === attempt) teardownPromise = null;
-      });
-    }
-    return teardownPromise;
-  };
-
-  return {
-    rootPid: Number(child.pid),
-    waitForInitialCapture: () => Promise.resolve(),
-    captureNow: () => Promise.resolve(),
-    proveExit,
-    teardown,
-  };
-}
-
 export const awaitAcpChildExit = (child: AcpOwnedChildProcess): Effect.Effect<void> =>
   child.exitCode.pipe(Effect.exit, Effect.asVoid);
 
@@ -389,6 +308,12 @@ export interface AcpProcessOwnership {
     factory: () => EffectProcessTreeSupervisor,
   ) => EffectProcessTreeSupervisor;
   readonly setCloseTransport: (closeTransport: Effect.Effect<void, unknown>) => void;
+}
+
+export interface AcpProcessOwnershipOptions {
+  readonly teardownProcessTree?: typeof teardownProviderProcessTree;
+  readonly gracefulShutdownTimeout?: Duration.Input;
+  readonly ownedProcessGroupId?: number;
 }
 
 export const installAndAwaitAcpProcessSupervisor = (
@@ -423,11 +348,7 @@ export const installAndAwaitAcpProcessSupervisor = (
 export const registerAcpProcessOwnership = (
   child: AcpOwnedChildProcess,
   runtimeScope: Scope.Scope,
-  options: {
-    readonly teardownProcessTree?: typeof teardownProviderProcessTree;
-    readonly gracefulShutdownTimeout?: Duration.Input;
-    readonly ownedProcessGroupId?: number;
-  } = {},
+  options: AcpProcessOwnershipOptions = {},
 ): Effect.Effect<AcpProcessOwnership> =>
   Effect.gen(function* () {
     let processSupervisor: EffectProcessTreeSupervisor | null = null;
@@ -485,6 +406,23 @@ export const registerAcpProcessOwnership = (
         closeTransport = effect;
       },
     };
+  });
+
+/**
+ * Registers the exact spawned handle's fallback before invoking any fallible supervisor factory,
+ * then promotes the identity-capturing supervisor only after its initial capture succeeds.
+ */
+export const registerAndInstallAcpProcessSupervisor = (
+  child: AcpOwnedChildProcess,
+  runtimeScope: Scope.Scope,
+  factory: () => EffectProcessTreeSupervisor,
+  command: string,
+  options: AcpProcessOwnershipOptions = {},
+): Effect.Effect<AcpProcessOwnership, EffectAcpErrors.AcpSpawnError> =>
+  Effect.gen(function* () {
+    const processOwnership = yield* registerAcpProcessOwnership(child, runtimeScope, options);
+    yield* installAndAwaitAcpProcessSupervisor(processOwnership, factory, command);
+    return processOwnership;
   });
 
 function officialSdkError(error: unknown): EffectAcpErrors.AcpError {
@@ -969,23 +907,10 @@ const makeAcpSessionRuntime = (
       provider: "acp",
       baseEnv: options.spawn.env ? { ...options.spawn.env } : process.env,
     });
-    const prepared = prepareWindowsSafeProcess(options.spawn.command, options.spawn.args, {
+    const prepared = prepareWindowsProviderProcess(options.spawn.command, options.spawn.args, {
       cwd: options.spawn.cwd,
       env,
     });
-    const launch =
-      process.platform === "win32"
-        ? yield* Effect.tryPromise({
-            try: () =>
-              prepareAcpWindowsJobLaunch({
-                provider: prepared,
-                env,
-                cwd: options.spawn.cwd ?? process.cwd(),
-              }),
-            catch: (cause) =>
-              new EffectAcpErrors.AcpSpawnError({ command: options.spawn.command, cause }),
-          })
-        : prepared;
     const childCommandOptions: ChildProcess.CommandOptions & {
       readonly synaraExternallySupervised: true;
       readonly windowsVerbatimArguments?: boolean | undefined;
@@ -993,7 +918,8 @@ const makeAcpSessionRuntime = (
       ...(options.spawn.cwd ? { cwd: options.spawn.cwd } : {}),
       env,
       shell: prepared.shell,
-      ...(launch.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
+      ...(prepared.windowsHide ? { windowsHide: true } : {}),
+      ...(prepared.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
       // The downstream Effect patch recognizes this flag and disables its PID-based scope
       // finalizer. The identity-capturing Synara supervisor below is the sole teardown owner.
       synaraExternallySupervised: true,
@@ -1001,7 +927,7 @@ const makeAcpSessionRuntime = (
     const { child, processOwnership } = yield* Effect.uninterruptible(
       Effect.gen(function* () {
         const child = yield* spawner
-          .spawn(ChildProcess.make(launch.command, launch.args, childCommandOptions))
+          .spawn(ChildProcess.make(prepared.command, prepared.args, childCommandOptions))
           .pipe(
             Effect.provideService(Scope.Scope, runtimeScope),
             Effect.mapError(
@@ -1015,35 +941,32 @@ const makeAcpSessionRuntime = (
         // Keep spawn and fallback-finalizer registration in one uninterruptible acquisition. A
         // pending cancellation cannot land after Effect's disabled release and before Synara owns
         // the exact returned handle.
-        const processOwnership = yield* registerAcpProcessOwnership(child, runtimeScope, {
-          ...(options.teardownProcessTree
-            ? { teardownProcessTree: options.teardownProcessTree }
-            : {}),
-          ...(options.gracefulShutdownTimeout
-            ? { gracefulShutdownTimeout: options.gracefulShutdownTimeout }
-            : {}),
-          ...(process.platform === "win32" ? {} : { ownedProcessGroupId: Number(child.pid) }),
-        });
-        // Install the stable owner before leaving the same uninterruptible acquisition. The
-        // already-registered fallback remains authoritative if initial capture or hook validation
-        // throws, but cancellation can never land between spawn and the stronger owner handoff.
-        yield* installAndAwaitAcpProcessSupervisor(
-          processOwnership,
+        // Register the exact-handle fallback before invoking the fallible identity supervisor
+        // factory. Cancellation cannot land between spawn, fallback ownership, and handoff.
+        const processOwnership = yield* registerAndInstallAcpProcessSupervisor(
+          child,
+          runtimeScope,
           () =>
-            process.platform === "win32" && options.processTreeKiller === undefined
-              ? superviseWindowsAcpJobProcess(child)
-              : superviseEffectProcessTree(child, {
-                  ...(options.processTreeKiller
-                    ? { processTreeKiller: options.processTreeKiller }
-                    : {}),
-                  ...(options.teardownProcessTree
-                    ? { teardownProcessTree: options.teardownProcessTree }
-                    : {}),
-                  ...(process.platform === "win32"
-                    ? {}
-                    : { ownedProcessGroupId: Number(child.pid) }),
-                }),
+            supervisePreparedEffectProcess(prepared, child, {
+              platform: process.platform,
+              ...(options.processTreeKiller
+                ? { processTreeKiller: options.processTreeKiller }
+                : {}),
+              ...(options.teardownProcessTree
+                ? { teardownProcessTree: options.teardownProcessTree }
+                : {}),
+              ...(process.platform === "win32" ? {} : { ownedProcessGroupId: Number(child.pid) }),
+            }),
           options.spawn.command,
+          {
+            ...(options.teardownProcessTree
+              ? { teardownProcessTree: options.teardownProcessTree }
+              : {}),
+            ...(options.gracefulShutdownTimeout
+              ? { gracefulShutdownTimeout: options.gracefulShutdownTimeout }
+              : {}),
+            ...(process.platform === "win32" ? {} : { ownedProcessGroupId: Number(child.pid) }),
+          },
         );
         return { child, processOwnership };
       }),

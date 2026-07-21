@@ -10,12 +10,14 @@ import treeKill from "tree-kill";
 // push a complete process-table snapshot beyond one MiB. These bounds still fail closed while
 // leaving enough headroom for a real snapshot instead of timing out in normal operation.
 const PROCESS_TREE_SCAN_TIMEOUT_MS = 5_000;
-const PROCESS_TREE_SCAN_MAX_BUFFER_BYTES = 4 * 1_024 * 1_024;
+const PROCESS_TREE_SCAN_MAX_BUFFER_BYTES = 8 * 1_024 * 1_024;
 const POSIX_TREE_WALK_MAX_VISITED = 256;
 
-export type ProcessChildrenMap = Map<number, Array<CapturedProcess>>;
+export type ProcessChildrenMap = Map<number, CapturedProcess[]>;
 export type ProcessCommandMap = Map<number, string>;
 export type ProcessSnapshotMap = Map<number, CapturedProcessSnapshot>;
+
+type MaybePromise<T> = T | Promise<T>;
 
 export interface CapturedProcess {
   pid: number;
@@ -48,32 +50,39 @@ export interface CapturedProcessTreeInspection {
 export type TerminalKillSignal = "SIGTERM" | "SIGKILL";
 
 export interface ProcessTreeKiller {
-  capture(rootPid: number, options?: { readonly processGroupId?: number }): CapturedProcessTree;
+  capture(
+    rootPid: number,
+    options?: { readonly processGroupId?: number },
+  ): MaybePromise<CapturedProcessTree>;
   captureAsync?(
     rootPid: number,
     options?: { readonly processGroupId?: number },
   ): Promise<CapturedProcessTree>;
-  inspect?(tree: CapturedProcessTree): CapturedProcessTreeInspection;
+  inspect?(tree: CapturedProcessTree): MaybePromise<CapturedProcessTreeInspection>;
   inspectAsync?(tree: CapturedProcessTree): Promise<CapturedProcessTreeInspection>;
   signal(input: {
     rootPid: number;
     signal: TerminalKillSignal;
     tree: CapturedProcessTree;
     includeRootTree?: boolean | undefined;
+    shouldSignalRootTree?: (() => boolean) | undefined;
+    abortSignal?: AbortSignal | undefined;
     onError: (error: Error, context: { pid: number; source: "tree-kill" | "captured" }) => void;
-  }): void;
+  }): MaybePromise<void>;
   signalAsync?(input: {
     rootPid: number;
     signal: TerminalKillSignal;
     tree: CapturedProcessTree;
     includeRootTree?: boolean | undefined;
+    shouldSignalRootTree?: (() => boolean) | undefined;
+    abortSignal?: AbortSignal | undefined;
     onError: (error: Error, context: { pid: number; source: "tree-kill" | "captured" }) => void;
   }): Promise<void>;
 }
 
 export interface ProcessTreeKillerDependencies {
   captureProcessSnapshot: () => ProcessSnapshotMap | null;
-  captureProcessSnapshotAsync: () => Promise<ProcessSnapshotMap | null>;
+  captureProcessSnapshotAsync: (signal?: AbortSignal) => Promise<ProcessSnapshotMap | null>;
   readCurrentProcesses: (pids: readonly number[]) => ProcessSnapshotMap | null;
   signalPid: (pid: number, signal: TerminalKillSignal) => Error | null;
   signalTree: (
@@ -84,7 +93,7 @@ export interface ProcessTreeKillerDependencies {
 }
 
 export function parseProcessChildrenMap(psOutput: string): ProcessChildrenMap {
-  const childrenByParentPid: ProcessChildrenMap = new Map();
+  const childrenByParentPid = new Map<number, CapturedProcess[]>();
   for (const line of psOutput.split(/\r?\n/g)) {
     const [pidRaw, ppidRaw, ...commandParts] = line.trim().split(/\s+/g);
     const pid = Number(pidRaw);
@@ -257,7 +266,7 @@ function captureProcessSnapshotSync(): ProcessSnapshotMap | null {
   }
 }
 
-function captureProcessSnapshotAsync(): Promise<ProcessSnapshotMap | null> {
+function captureProcessSnapshotAsync(signal?: AbortSignal): Promise<ProcessSnapshotMap | null> {
   const snapshot = processSnapshotCommand();
   return new Promise((resolve) => {
     execFile(
@@ -266,6 +275,7 @@ function captureProcessSnapshotAsync(): Promise<ProcessSnapshotMap | null> {
       {
         encoding: "utf8",
         maxBuffer: PROCESS_TREE_SCAN_MAX_BUFFER_BYTES,
+        signal,
         timeout: PROCESS_TREE_SCAN_TIMEOUT_MS,
         windowsHide: true,
       },
@@ -349,14 +359,28 @@ function shouldSignalCapturedProcess(
   return matchingCapturedProcessInstance(process, currentProcesses)?.command === process.command;
 }
 
+function throwIfSignalingAborted(signal: AbortSignal | undefined): void {
+  if (!signal?.aborted) return;
+  if (signal.reason instanceof Error) {
+    throw signal.reason;
+  }
+  const error = new Error("Process tree signaling was aborted.");
+  error.name = "AbortError";
+  throw error;
+}
+
 function capturedProcessesForSignal(
   descendants: readonly CapturedProcess[],
   signal: TerminalKillSignal,
   currentProcesses: ProcessSnapshotMap | null,
+  abortSignal?: AbortSignal,
 ): CapturedProcess[] {
-  return descendants.filter((descendant) =>
+  throwIfSignalingAborted(abortSignal);
+  const captured = descendants.filter((descendant) =>
     shouldSignalCapturedProcess(descendant, signal, currentProcesses),
   );
+  throwIfSignalingAborted(abortSignal);
+  return captured;
 }
 
 // Creates an injectable killer so tests can exercise PID-reuse safeguards safely.
@@ -369,7 +393,12 @@ export function createProcessTreeKiller(
       dependencies.captureProcessSnapshotAsync ??
       (dependencies.captureProcessSnapshot === undefined
         ? captureProcessSnapshotAsync
-        : async () => dependencies.captureProcessSnapshot?.() ?? null),
+        : async (signal) => {
+            throwIfSignalingAborted(signal);
+            const snapshot = dependencies.captureProcessSnapshot?.() ?? null;
+            throwIfSignalingAborted(signal);
+            return snapshot;
+          }),
     readCurrentProcesses: dependencies.readCurrentProcesses ?? readCurrentProcesses,
     signalPid: dependencies.signalPid ?? signalPid,
     signalTree: dependencies.signalTree ?? treeKill,
@@ -444,26 +473,28 @@ export function createProcessTreeKiller(
 
   const validationPidsForSignal = ({
     rootPid,
-    signal,
     tree,
     includeRootTree = true,
   }: SignalInput): number[] => [
     ...tree.descendants
-      .filter((descendant) => signal === "SIGKILL" || descendant.identity !== undefined)
+      .filter((descendant) => descendant.identity !== undefined)
       .map((descendant) => descendant.pid),
     ...(includeRootTree && tree.root?.identity !== undefined ? [rootPid] : []),
   ];
 
   const signalCapturedProcessesFromSnapshot = (
-    { signal, tree, includeRootTree = true, onError }: SignalInput,
+    input: SignalInput,
     currentProcesses: ProcessSnapshotMap | null,
   ): boolean => {
+    const { signal, tree, includeRootTree = true, onError, abortSignal } = input;
     const capturedProcesses = capturedProcessesForSignal(
       tree.descendants,
       signal,
       currentProcesses,
+      abortSignal,
     );
     for (const descendant of capturedProcesses.toReversed()) {
+      throwIfSignalingAborted(abortSignal);
       const error = deps.signalPid(descendant.pid, signal);
       if (error) {
         onError(error, { pid: descendant.pid, source: "captured" });
@@ -472,11 +503,17 @@ export function createProcessTreeKiller(
     const shouldSignalRootTree =
       includeRootTree &&
       tree.root?.identity !== undefined &&
-      shouldSignalCapturedProcess(tree.root, signal, currentProcesses);
+      shouldSignalCapturedProcess(tree.root, signal, currentProcesses) &&
+      input.shouldSignalRootTree?.() !== false;
     return shouldSignalRootTree;
   };
 
   const signalRootTree = (input: SignalInput, onComplete: () => void): void => {
+    throwIfSignalingAborted(input.abortSignal);
+    if (input.shouldSignalRootTree?.() === false) {
+      onComplete();
+      return;
+    }
     deps.signalTree(input.rootPid, input.signal, (error) => {
       if (error) {
         input.onError(error, { pid: input.rootPid, source: "tree-kill" });
@@ -500,6 +537,7 @@ export function createProcessTreeKiller(
         ? { verified: true, survivors: [] }
         : inspectFromSnapshot(tree, await deps.captureProcessSnapshotAsync()),
     signal: (input) => {
+      throwIfSignalingAborted(input.abortSignal);
       const validationPids = validationPidsForSignal(input);
       const currentProcesses =
         validationPids.length > 0 ? deps.readCurrentProcesses(validationPids) : null;
@@ -508,11 +546,16 @@ export function createProcessTreeKiller(
       }
     },
     signalAsync: async (input) => {
+      throwIfSignalingAborted(input.abortSignal);
       const validationPids = validationPidsForSignal(input);
       const currentProcesses =
         validationPids.length === 0
           ? null
-          : selectCurrentProcesses(validationPids, await deps.captureProcessSnapshotAsync());
+          : selectCurrentProcesses(
+              validationPids,
+              await deps.captureProcessSnapshotAsync(input.abortSignal),
+            );
+      throwIfSignalingAborted(input.abortSignal);
       if (signalCapturedProcessesFromSnapshot(input, currentProcesses)) {
         await new Promise<void>((resolve) => signalRootTree(input, resolve));
       }

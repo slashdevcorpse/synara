@@ -22,8 +22,8 @@ import {
   type ThreadId,
   TurnId,
 } from "@synara/contracts";
-import { prepareWindowsSafeProcess } from "@synara/shared/windowsProcess";
 import { decodeOutboundJson, decodeOutboundText, outboundHttp } from "@synara/shared/outboundHttp";
+import type { WindowsSafeProcessCommand } from "@synara/shared/windowsProcess";
 import {
   Cause,
   DateTime,
@@ -57,6 +57,20 @@ import { ServerConfig, type ServerConfigShape } from "../../config.ts";
 import { buildProviderChildEnvironment } from "../../providerChildEnvironment.ts";
 import { appendFileAttachmentsPromptBlock } from "../attachmentProjection.ts";
 import { loadProviderPromptImageBlocks } from "../promptAttachments.ts";
+import {
+  isWindowsJobPreparedCommand,
+  prepareWindowsProviderProcess,
+} from "../windowsProviderProcess.ts";
+import {
+  installPreparedEffectProcessSupervisor,
+  supervisePreparedEffectProcess,
+} from "../windowsJobProcessSupervisor.ts";
+import { findProviderProcessExitUnprovenError } from "../supervisedProcessTeardown.ts";
+import {
+  makeProviderMaintenanceOwnedResourceCoordinator,
+  type ProviderMaintenanceOwnedResourceCoordinator,
+} from "../providerMaintenanceOwnedResources.ts";
+import { makeProviderProcessOwnerTracker } from "../providerProcessOwnerTracker.ts";
 import {
   ProviderAdapterRequestError,
   ProviderAdapterSessionNotFoundError,
@@ -221,10 +235,26 @@ function mapGrokModelDiscoveryError(cause: unknown): ProviderAdapterRequestError
   });
 }
 
+export function makeGrokModelListChildProcess(
+  prepared: WindowsSafeProcessCommand,
+  env: NodeJS.ProcessEnv,
+): ChildProcess.StandardCommand {
+  return ChildProcess.make(prepared.command, prepared.args, {
+    shell: prepared.shell,
+    ...(prepared.windowsHide ? { windowsHide: true } : {}),
+    ...(prepared.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
+    env,
+    ...(isWindowsJobPreparedCommand(prepared) ? { synaraExternallySupervised: true } : {}),
+  } as ChildProcess.CommandOptions & { readonly synaraExternallySupervised?: true });
+}
+
 export interface GrokAdapterLiveOptions {
   readonly nativeEventLogPath?: string;
   readonly nativeEventLogger?: EventNdjsonLogger;
   readonly closeSessionScope?: (scope: Scope.Closeable) => Effect.Effect<void>;
+  readonly maintenanceOwnedResources?: ProviderMaintenanceOwnedResourceCoordinator;
+  readonly prepareProcess?: typeof prepareWindowsProviderProcess;
+  readonly superviseProcess?: typeof supervisePreparedEffectProcess;
 }
 
 interface PendingApproval {
@@ -596,6 +626,14 @@ export function makeGrokAdapter(
     const fileSystem = yield* FileSystem.FileSystem;
     const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
     const serverConfig = yield* Effect.service(ServerConfig);
+    const maintenanceOwnedResources =
+      options?.maintenanceOwnedResources ??
+      (yield* makeProviderMaintenanceOwnedResourceCoordinator);
+    const modelProcessOwners = makeProviderProcessOwnerTracker({
+      provider: PROVIDER,
+      resourcePrefix: "grok-model-discovery",
+      maintenanceOwnedResources,
+    });
     // Optional so adapter tests can run without the gateway layer; when
     // present, every session gets the synara_* MCP tools.
     const agentGatewayCredentials = Option.getOrUndefined(
@@ -2176,14 +2214,47 @@ export function makeGrokAdapter(
         let apiError: ProviderAdapterRequestError | undefined;
         const cliModels = yield* Effect.gen(function* () {
           const childEnv = buildProviderChildEnvironment({ provider: "grok" });
-          const prepared = prepareWindowsSafeProcess(binaryPath, ["models"], { env: childEnv });
-          const child = yield* childProcessSpawner.spawn(
-            ChildProcess.make(prepared.command, prepared.args, {
-              shell: prepared.shell,
-              ...(prepared.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
-              env: childEnv,
+          const prepared = (options?.prepareProcess ?? prepareWindowsProviderProcess)(
+            binaryPath,
+            ["models"],
+            { env: childEnv },
+          );
+          const owned = yield* Effect.uninterruptible(
+            Effect.gen(function* () {
+              const child = yield* childProcessSpawner.spawn(
+                makeGrokModelListChildProcess(prepared, childEnv),
+              );
+              const installation = isWindowsJobPreparedCommand(prepared)
+                ? installPreparedEffectProcessSupervisor(
+                    prepared,
+                    child,
+                    { platform: "win32" },
+                    options?.superviseProcess,
+                  )
+                : undefined;
+              const owner = installation
+                ? yield* modelProcessOwners.register(installation.supervisor)
+                : undefined;
+              if (owner) {
+                yield* Effect.addFinalizer(() =>
+                  modelProcessOwners.teardown(owner).pipe(Effect.orDie),
+                );
+              }
+              if (installation?._tag === "Recovered") {
+                return yield* new ProviderAdapterRequestError({
+                  provider: PROVIDER,
+                  method: "model/list",
+                  detail: "Failed to install Grok model discovery process-tree supervision.",
+                  cause: installation.requestedSupervisorFailure,
+                });
+              }
+              return {
+                child,
+                owner,
+              };
             }),
           );
+          const { child, owner } = owned;
           const [stdout, stderr, exitCode] = yield* Effect.all(
             [
               collectStreamAsString(child.stdout),
@@ -2192,6 +2263,9 @@ export function makeGrokAdapter(
             ],
             { concurrency: "unbounded" },
           );
+          if (owner) {
+            yield* modelProcessOwners.proveExit(owner);
+          }
           if (exitCode !== 0) {
             return yield* new ProviderAdapterRequestError({
               provider: PROVIDER,
@@ -2203,12 +2277,15 @@ export function makeGrokAdapter(
           }
           return parseGrokCliModelList(stdout);
         }).pipe(
-          Effect.catch((error) =>
-            Effect.sync(() => {
-              cliError = error;
-              return [];
-            }),
-          ),
+          Effect.catch((error) => {
+            const unprovenExit = findProviderProcessExitUnprovenError(error);
+            return unprovenExit === null
+              ? Effect.sync(() => {
+                  cliError = error;
+                  return [];
+                })
+              : Effect.fail(unprovenExit);
+          }),
         );
         const apiKey = getGrokApiKeyEnv();
         const apiModels = apiKey
@@ -2261,10 +2338,17 @@ export function makeGrokAdapter(
     };
 
     const stopAll: GrokAdapterShape["stopAll"] = () =>
-      Effect.forEach(Array.from(sessions.values()), stopSessionInternal, { discard: true });
+      Effect.gen(function* () {
+        const sessionExit = yield* Effect.exit(
+          Effect.forEach(Array.from(sessions.values()), stopSessionInternal, { discard: true }),
+        );
+        const ownerExit = yield* Effect.exit(modelProcessOwners.drain);
+        if (Exit.isFailure(sessionExit)) return yield* Effect.failCause(sessionExit.cause);
+        if (Exit.isFailure(ownerExit)) return yield* Effect.failCause(ownerExit.cause);
+      });
 
     yield* Effect.addFinalizer(() =>
-      Effect.forEach(Array.from(sessions.values()), stopSessionInternal, { discard: true }).pipe(
+      stopAll().pipe(
         Effect.tap(() => PubSub.shutdown(runtimeEventPubSub)),
         Effect.tap(() => managedNativeEventLogger?.close() ?? Effect.void),
       ),

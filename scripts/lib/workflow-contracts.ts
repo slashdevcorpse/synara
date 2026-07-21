@@ -36,15 +36,19 @@ const EXPECTED_DISABLED_PATHS = new Set([
 ]);
 const CI_WINDOWS_REQUIRED_COMMANDS = [
   "bun run brand:check",
+  "node apps/server/scripts/build-windows-job-launcher.mjs --arch x64",
+  "node apps/server/scripts/build-windows-job-launcher.mjs --arch arm64",
+  "bun run --cwd apps/server test src/provider/windowsProviderProcess.test.ts src/provider/windowsProviderProcess.windows.test.ts",
   "bun run --cwd packages/shared test src/desktopIdentity.test.ts src/desktopIdentityProof.test.ts src/windowsCertificate.test.ts",
   "bun run --cwd apps/desktop test src/backendShutdown.test.ts src/backendShutdown.windows.integration.test.ts",
   "bun run --cwd packages/shared test src/windowsProcess.test.ts",
-  "bun run --cwd apps/server test src/windowsProcessEffect.test.ts src/codexAppServerManager.test.ts src/provider/Layers/ProviderHealth.test.ts src/provider/acp/AcpWindowsJob.windows.integration.test.ts src/provider/acp/AcpJsonRpcConnection.test.ts src/persistence/MigrationBackup.test.ts src/restoreMigrationBackup.test.ts",
+  "bun run --cwd apps/server test src/windowsProcessEffect.test.ts src/codexAppServerManager.test.ts src/provider/Layers/ProviderHealth.test.ts src/provider/acp/AcpJsonRpcConnection.test.ts src/persistence/MigrationBackup.test.ts src/restoreMigrationBackup.test.ts",
   "bun run --cwd apps/desktop test src/desktopMigrationRecovery.test.ts src/desktopStorageMigration.test.ts src/windowState.test.ts src/updateState.test.ts",
   "bun run --cwd scripts test check-brand-identity.test.ts verify-packaged-desktop-startup.test.ts lib/desktop-artifact-policy.test.ts lib/windows-authenticode.test.ts lib/windows-installer-qualification.test.ts lib/release-artifact-provenance.test.ts lib/super-synara-release-admission.test.ts lib/super-synara-workflow-contract.test.ts",
   "node scripts/verify-workflow-contracts.ts",
 ] as const;
 const CI_WINDOWS_POST_BUILD_COMMAND = "bun run --cwd apps/desktop smoke-test";
+const CI_WINDOWS_PACKAGED_CLI_COMMAND = "node apps/server/scripts/cli.ts publish --dry-run";
 const CI_MACOS_REQUIRED_COMMANDS = [
   'test "$(uname -m)" = arm64',
   "bun run brand:check",
@@ -209,6 +213,35 @@ function validateNativeJobCommands(
   }
   if (steps.some((step) => invokesRootTest(step.rawCommand))) {
     errors.push(`${workflowPath} ${jobName} must not run the monorepo-wide bun run test suite.`);
+  }
+}
+
+function validatePostBuildGate(
+  workflowPath: string,
+  jobName: string,
+  steps: readonly WorkflowRunStep[],
+  command: string,
+  errors: string[],
+): void {
+  const matches = steps.filter((step) => step.command === command);
+  if (matches.length !== 1) {
+    errors.push(`${workflowPath} ${jobName} must run exact post-build gate command: ${command}.`);
+    return;
+  }
+
+  const [step] = matches;
+  if (
+    step!.condition !== undefined ||
+    (step!.continueOnError !== undefined && step!.continueOnError !== false)
+  ) {
+    errors.push(
+      `${workflowPath} ${jobName} post-build gate must be unconditional and fail closed: ${command}.`,
+    );
+  }
+
+  const buildStep = steps.find((candidate) => candidate.command === CI_DESKTOP_BUILD_COMMAND);
+  if (buildStep && step!.index <= buildStep.index) {
+    errors.push(`${workflowPath} ${jobName} post-build gate must run after the desktop build: ${command}.`);
   }
 }
 
@@ -525,6 +558,13 @@ function validateCiArchitecture(workflow: UnknownRecord, errors: string[]): void
       CI_WINDOWS_REQUIRED_COMMANDS,
       errors,
       CI_WINDOWS_POST_BUILD_COMMAND,
+    );
+    validatePostBuildGate(
+      workflowPath,
+      "windows_x64",
+      windowsSteps,
+      CI_WINDOWS_PACKAGED_CLI_COMMAND,
+      errors,
     );
     validateNativePersistenceSmoke(workflowPath, "windows_x64", windowsSteps, errors);
   }

@@ -40,15 +40,23 @@ import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 
 import { NetService, type NetServiceShape } from "@synara/shared/Net";
 import { splitLines } from "@synara/shared/text";
-import { prepareWindowsSafeProcess } from "@synara/shared/windowsProcess";
 import { buildProviderChildEnvironment } from "../providerChildEnvironment.ts";
 import type { ProcessTreeKiller } from "../terminal/processTreeKiller.ts";
 import {
-  superviseEffectProcessTree,
-  teardownEffectProcessTree,
+  findProviderProcessExitUnprovenError,
   teardownProviderProcessTree,
 } from "./supervisedProcessTeardown.ts";
 import { isWindowsShellCommandMissingResult } from "../shell-command-detection.ts";
+import {
+  makeProviderMaintenanceOwnedResourceCoordinator,
+  type ProviderMaintenanceOwnedResourceCoordinator,
+} from "./providerMaintenanceOwnedResources.ts";
+import { makeProviderProcessOwnerTracker } from "./providerProcessOwnerTracker.ts";
+import {
+  installPreparedEffectProcessSupervisor,
+  supervisePreparedEffectProcess,
+} from "./windowsJobProcessSupervisor.ts";
+import { prepareWindowsProviderProcess } from "./windowsProviderProcess.ts";
 
 const DEFAULT_OPENCODE_SERVER_TIMEOUT_MS = 20_000;
 const DEFAULT_HOSTNAME = "127.0.0.1";
@@ -869,9 +877,13 @@ const collectStreamAsString = <E>(stream: Stream.Stream<Uint8Array, E>): Effect.
   );
 
 export interface OpenCodeRuntimeLiveOptions {
+  readonly platform?: NodeJS.Platform;
+  readonly prepareProcess?: typeof prepareWindowsProviderProcess;
+  readonly superviseProcess?: typeof supervisePreparedEffectProcess;
   readonly teardownProcessTree?: typeof teardownProviderProcessTree;
   readonly processTreeKiller?: ProcessTreeKiller;
   readonly netService?: NetServiceShape;
+  readonly maintenanceOwnedResources?: ProviderMaintenanceOwnedResourceCoordinator;
 }
 
 const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
@@ -883,24 +895,101 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
     );
     const pooledServerMutex = yield* Semaphore.make(1);
     const pooledServers = new Map<string, PooledOpenCodeServer>();
+    const maintenanceOwnedResources =
+      options?.maintenanceOwnedResources ??
+      (yield* makeProviderMaintenanceOwnedResourceCoordinator);
+    const oneShotOwnerTrackers = {
+      opencode: makeProviderProcessOwnerTracker({
+        provider: "opencode",
+        resourcePrefix: "opencode-runtime-command",
+        maintenanceOwnedResources,
+      }),
+      kilo: makeProviderProcessOwnerTracker({
+        provider: "kilo",
+        resourcePrefix: "kilo-runtime-command",
+        maintenanceOwnedResources,
+      }),
+    } as const;
+    const oneShotOwnerTrackerFor = (cliSpec: OpenCodeCompatibleCliSpec) =>
+      openCodeCompatibleCliSpecKey(cliSpec) === openCodeCompatibleCliSpecKey(KILO_CLI_SPEC)
+        ? oneShotOwnerTrackers.kilo
+        : oneShotOwnerTrackers.opencode;
 
     const runOpenCodeCommand: OpenCodeRuntimeShape["runOpenCodeCommand"] = (input) =>
       Effect.gen(function* () {
         const childEnv = buildOpenCodeServerProcessEnv({
           ...(input.cliSpec ? { cliSpec: input.cliSpec } : {}),
         });
-        const prepared = prepareWindowsSafeProcess(input.binaryPath, input.args, {
-          cwd: input.cwd,
-          env: childEnv,
-        });
-        const child = yield* spawner.spawn(
-          ChildProcess.make(prepared.command, prepared.args, {
-            shell: prepared.shell,
-            ...(prepared.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
-            ...(input.cwd ? { cwd: input.cwd } : {}),
+        const prepared = (options?.prepareProcess ?? prepareWindowsProviderProcess)(
+          input.binaryPath,
+          input.args,
+          {
+            cwd: input.cwd,
             env: childEnv,
+          },
+        );
+        const platform = options?.platform ?? globalThis.process.platform;
+        const cliSpec = input.cliSpec ?? OPENCODE_CLI_SPEC;
+        const oneShotOwnerTracker = oneShotOwnerTrackerFor(cliSpec);
+        const owned = yield* Effect.uninterruptible(
+          Effect.gen(function* () {
+            const child = yield* spawner.spawn(
+              ChildProcess.make(prepared.command, prepared.args, {
+                shell: prepared.shell,
+                ...(prepared.windowsHide ? { windowsHide: true } : {}),
+                ...(prepared.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
+                ...(input.cwd ? { cwd: input.cwd } : {}),
+                env: childEnv,
+                detached: platform !== "win32",
+                synaraExternallySupervised: true,
+              } as ChildProcess.CommandOptions & { readonly synaraExternallySupervised: true }),
+            );
+            const supervisorInstallation = yield* Effect.try({
+              try: () =>
+                installPreparedEffectProcessSupervisor(
+                  prepared,
+                  child,
+                  {
+                    platform,
+                    ...(options?.processTreeKiller
+                      ? { processTreeKiller: options.processTreeKiller }
+                      : {}),
+                    teardownProcessTree:
+                      options?.teardownProcessTree ?? teardownProviderProcessTree,
+                    ...(platform === "win32" ? {} : { ownedProcessGroupId: Number(child.pid) }),
+                  },
+                  options?.superviseProcess,
+                ),
+              catch: (cause) =>
+                ensureRuntimeError(
+                  "runOpenCodeCommand",
+                  `Failed to install ${cliSpec.displayName} command process-tree supervision: ${openCodeRuntimeErrorDetail(cause)}`,
+                  cause,
+                ),
+            });
+            const supervisor = supervisorInstallation.supervisor;
+            const owner = yield* oneShotOwnerTracker.register(supervisor);
+            yield* Effect.addFinalizer(() =>
+              oneShotOwnerTracker.teardown(owner).pipe(Effect.orDie),
+            );
+            if (supervisorInstallation._tag === "Recovered") {
+              return yield* ensureRuntimeError(
+                "runOpenCodeCommand",
+                `Failed to install ${cliSpec.displayName} command process-tree supervision: ${openCodeRuntimeErrorDetail(supervisorInstallation.requestedSupervisorFailure)}`,
+                supervisorInstallation.requestedSupervisorFailure,
+              );
+            }
+            yield* Effect.tryPromise({
+              try: supervisor.waitForInitialCapture,
+              catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause))),
+            });
+            return {
+              child,
+              owner,
+            };
           }),
         );
+        const { child, owner } = owned;
         const [stdout, stderr, code] = yield* Effect.all(
           [
             collectStreamAsString(child.stdout),
@@ -910,6 +999,7 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
           { concurrency: "unbounded" },
         );
         const exitCode = Number(code);
+        yield* oneShotOwnerTracker.proveExit(owner);
         if (isWindowsShellCommandMissingResult({ code: exitCode, stderr })) {
           return yield* new OpenCodeRuntimeError({
             operation: "runOpenCodeCommand",
@@ -938,7 +1028,7 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
       Effect.gen(function* () {
         const runtimeScope = yield* Scope.Scope;
         const cliSpec = input.cliSpec ?? OPENCODE_CLI_SPEC;
-        const platform = globalThis.process.platform;
+        const platform = options?.platform ?? globalThis.process.platform;
 
         const hostname = input.hostname ?? DEFAULT_HOSTNAME;
         const port =
@@ -955,19 +1045,31 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
           ));
         const timeoutMs = input.timeoutMs ?? DEFAULT_OPENCODE_SERVER_TIMEOUT_MS;
         const args = ["serve", "--hostname", hostname, "--port", String(port)];
+        const childEnv = buildOpenCodeServerProcessEnv({
+          cliSpec,
+          ...(input.experimentalWebSockets !== undefined
+            ? { experimentalWebSockets: input.experimentalWebSockets }
+            : {}),
+        });
+        const prepared = (options?.prepareProcess ?? prepareWindowsProviderProcess)(
+          input.binaryPath,
+          args,
+          {
+            cwd: input.cwd,
+            env: childEnv,
+          },
+        );
 
         const supervised = yield* Effect.uninterruptible(
           Effect.gen(function* () {
             const childCommandOptions: ChildProcess.CommandOptions & {
               readonly synaraExternallySupervised: true;
             } = {
-              env: buildOpenCodeServerProcessEnv({
-                cliSpec,
-                ...(input.experimentalWebSockets !== undefined
-                  ? { experimentalWebSockets: input.experimentalWebSockets }
-                  : {}),
-              }),
+              env: childEnv,
               ...(input.cwd ? { cwd: input.cwd } : {}),
+              shell: prepared.shell,
+              ...(prepared.windowsHide ? { windowsHide: true } : {}),
+              ...(prepared.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
               detached: platform !== "win32",
               killSignal: "SIGKILL",
               forceKillAfter: "1500 millis",
@@ -977,7 +1079,7 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
               synaraExternallySupervised: true,
             };
             const child = yield* spawner
-              .spawn(ChildProcess.make(input.binaryPath, args, childCommandOptions))
+              .spawn(ChildProcess.make(prepared.command, prepared.args, childCommandOptions))
               .pipe(
                 Effect.provideService(Scope.Scope, runtimeScope),
                 Effect.mapError(
@@ -991,7 +1093,30 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
               );
             const stopMutex = yield* Semaphore.make(1);
             let processTreeExitProven = false;
-            let processSupervisor: ReturnType<typeof superviseEffectProcessTree> | null = null;
+            const supervisorInstallation = yield* Effect.try({
+              try: () =>
+                installPreparedEffectProcessSupervisor(
+                  prepared,
+                  child,
+                  {
+                    ...(options?.processTreeKiller
+                      ? { processTreeKiller: options.processTreeKiller }
+                      : {}),
+                    teardownProcessTree:
+                      options?.teardownProcessTree ?? teardownProviderProcessTree,
+                    platform,
+                    ...(platform === "win32" ? {} : { ownedProcessGroupId: Number(child.pid) }),
+                  },
+                  options?.superviseProcess,
+                ),
+              catch: (cause) =>
+                new OpenCodeRuntimeError({
+                  operation: "startOpenCodeServerProcess",
+                  detail: `Failed to install ${cliSpec.displayName} server process-tree supervision: ${openCodeRuntimeErrorDetail(cause)}`,
+                  cause,
+                }),
+            });
+            const processSupervisor = supervisorInstallation.supervisor;
             const stop = stopMutex.withPermit(
               Effect.uninterruptible(
                 Effect.suspend(() => {
@@ -999,18 +1124,7 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
                     return Effect.void;
                   }
                   return Effect.tryPromise({
-                    try: () =>
-                      processSupervisor === null
-                        ? teardownEffectProcessTree(
-                            child,
-                            options?.teardownProcessTree ?? teardownProviderProcessTree,
-                            {
-                              ...(platform === "win32"
-                                ? {}
-                                : { ownedProcessGroupId: Number(child.pid) }),
-                            },
-                          )
-                        : processSupervisor.teardown(),
+                    try: processSupervisor.teardown,
                     catch: (cause) =>
                       new OpenCodeRuntimeError({
                         operation: "stopOpenCodeServerProcess",
@@ -1029,26 +1143,6 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
               ),
             );
             yield* Scope.addFinalizer(runtimeScope, stop.pipe(Effect.orDie));
-            const supervisorExit = yield* Effect.exit(
-              Effect.try({
-                try: () =>
-                  superviseEffectProcessTree(child, {
-                    ...(options?.processTreeKiller
-                      ? { processTreeKiller: options.processTreeKiller }
-                      : {}),
-                    teardownProcessTree:
-                      options?.teardownProcessTree ?? teardownProviderProcessTree,
-                    platform,
-                    ...(platform === "win32" ? {} : { ownedProcessGroupId: Number(child.pid) }),
-                  }),
-                catch: (cause) =>
-                  new OpenCodeRuntimeError({
-                    operation: "startOpenCodeServerProcess",
-                    detail: `Failed to install ${cliSpec.displayName} server process-tree supervision: ${openCodeRuntimeErrorDetail(cause)}`,
-                    cause,
-                  }),
-              }),
-            );
             const owner = {
               exitCode: child.exitCode.pipe(
                 Effect.map(Number),
@@ -1059,12 +1153,16 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
             if (input.onProcessOwned !== undefined) {
               yield* input.onProcessOwned(owner);
             }
-            if (Exit.isFailure(supervisorExit)) {
-              return yield* Effect.failCause(supervisorExit.cause);
+            if (supervisorInstallation._tag === "Recovered") {
+              return yield* new OpenCodeRuntimeError({
+                operation: "startOpenCodeServerProcess",
+                detail: `Failed to install ${cliSpec.displayName} server process-tree supervision: ${openCodeRuntimeErrorDetail(supervisorInstallation.requestedSupervisorFailure)}`,
+                cause: supervisorInstallation.requestedSupervisorFailure,
+              });
             }
             const initialCaptureExit = yield* Effect.exit(
               Effect.tryPromise({
-                try: () => supervisorExit.value.waitForInitialCapture(),
+                try: processSupervisor.waitForInitialCapture,
                 catch: (cause) =>
                   new OpenCodeRuntimeError({
                     operation: "startOpenCodeServerProcess",
@@ -1076,7 +1174,6 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
             if (Exit.isFailure(initialCaptureExit)) {
               return yield* Effect.failCause(initialCaptureExit.cause);
             }
-            processSupervisor = supervisorExit.value;
             return { child, owner };
           }),
         );
@@ -1487,12 +1584,29 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
             });
           }
 
+          yield* oneShotOwnerTrackerFor(input.cliSpec).drain.pipe(
+            Effect.mapError((cause) =>
+              ensureRuntimeError(
+                "closeLocalServerPoolsForCliSpec",
+                `Failed to prove ${input.cliSpec.displayName} command process-tree exit: ${openCodeRuntimeErrorDetail(cause)}`,
+                cause,
+              ),
+            ),
+          );
+
           for (const pooledServer of matchingServers) {
             yield* closePooledServer(pooledServer);
           }
         }),
       );
 
+    yield* Effect.addFinalizer(() =>
+      Effect.forEach(
+        [oneShotOwnerTrackers.opencode, oneShotOwnerTrackers.kilo],
+        (tracker) => tracker.drain,
+        { discard: true },
+      ).pipe(Effect.orDie),
+    );
     yield* Effect.addFinalizer(() => closePooledServersForRuntimeShutdown);
 
     const connectToOpenCodeServer: OpenCodeRuntimeShape["connectToOpenCodeServer"] = (input) => {
@@ -1657,6 +1771,9 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
         args: ["models", "--verbose"],
       }).pipe(
         Effect.catch((error) => {
+          if (findProviderProcessExitUnprovenError(error) !== null) {
+            return Effect.fail(error);
+          }
           if (!OpenCodeRuntimeError.is(error)) {
             return Effect.fail(error);
           }

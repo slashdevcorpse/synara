@@ -6,6 +6,7 @@
 import { EventEmitter } from "node:events";
 
 import type { BrowserTabState, ThreadBrowserState, ThreadId } from "@synara/contracts";
+import type { WebContents } from "electron";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const electronMocks = vi.hoisted(() => ({
@@ -45,6 +46,10 @@ vi.mock("electron", () => ({
 }));
 
 import { DesktopBrowserManager } from "./browserManager";
+import {
+  createBrowserPopupNavigationPolicy,
+  ensureAttachedBrowserWebContentsSecurity,
+} from "./browserSecurity";
 
 const THREAD_ID = "thread-local-preview" as ThreadId;
 const FIRST_PREVIEW_URL = "http://127.0.0.1:58090/api/local-preview/first_token/index.html";
@@ -116,8 +121,11 @@ class FakeWebContents extends EventEmitter {
   readonly loadURL = vi.fn(async () => undefined);
   readonly openDevTools = vi.fn();
   readonly setUserAgent = vi.fn();
+  windowOpenHandler: ((details: FakeWindowOpenDetails) => FakeWindowOpenResult) | null = null;
   readonly setWindowOpenHandler = vi.fn(
-    (_handler: (details: FakeWindowOpenDetails) => FakeWindowOpenResult) => undefined,
+    (handler: (details: FakeWindowOpenDetails) => FakeWindowOpenResult) => {
+      this.windowOpenHandler = handler;
+    },
   );
 
   constructor(
@@ -151,12 +159,23 @@ class FakeWebContents extends EventEmitter {
 }
 
 class FakeOAuthPopupWindow extends EventEmitter {
-  readonly webContents = new FakeWebContents();
-  readonly destroy = vi.fn();
+  readonly webContents: FakeWebContents;
+  readonly setMenuBarVisibility = vi.fn();
+  private destroyed = false;
+
+  constructor(url = "https://accounts.example.test/oauth/authorize") {
+    super();
+    this.webContents = new FakeWebContents(url);
+  }
 
   isDestroyed(): boolean {
-    return false;
+    return this.destroyed;
   }
+
+  readonly destroy = vi.fn(() => {
+    this.destroyed = true;
+    this.emit("closed");
+  });
 }
 
 interface BrowserManagerInternals {
@@ -196,6 +215,7 @@ interface BrowserManagerInternals {
   configureOAuthPopupRuntime: (runtime: {
     threadId: ThreadId;
     tabId: string;
+    navigationPolicy: ReturnType<typeof createBrowserPopupNavigationPolicy>;
     localFilePath: string | null;
     localPreviewCapability: null;
     window: FakeOAuthPopupWindow;
@@ -289,6 +309,26 @@ describe("DesktopBrowserManager local-preview lifecycle", () => {
     const tabContents = new FakeWebContents();
     const popup = new FakeOAuthPopupWindow();
     const access = managerInternals(manager);
+    expect(ensureAttachedBrowserWebContentsSecurity(tabContents as unknown as WebContents)).toBe(
+      true,
+    );
+    const attachmentHandler = tabContents.windowOpenHandler;
+    expect(
+      attachmentHandler?.({
+        url: "https://auth.example",
+        frameName: "auth",
+        features: "width=480,height=640",
+        disposition: "new-window",
+      }),
+    ).toEqual({ action: "deny" });
+    for (const eventName of ["will-navigate", "will-redirect"]) {
+      const preventNavigation = vi.fn();
+      tabContents.emit(eventName, {
+        url: "https://attacker.example/pre-adoption",
+        preventDefault: preventNavigation,
+      });
+      expect(preventNavigation).toHaveBeenCalledOnce();
+    }
     access.configureRuntimeWebContents({
       key: `${THREAD_ID}:${tabId}`,
       threadId: THREAD_ID,
@@ -298,9 +338,28 @@ describe("DesktopBrowserManager local-preview lifecycle", () => {
       ownsWebContents: false,
       listenerDisposers: [],
     });
+    expect(tabContents.windowOpenHandler).not.toBe(attachmentHandler);
+    const runtimeHandler = tabContents.windowOpenHandler;
+    expect(ensureAttachedBrowserWebContentsSecurity(tabContents as unknown as WebContents)).toBe(
+      false,
+    );
+    expect(tabContents.windowOpenHandler).toBe(runtimeHandler);
+    expect(tabContents.listenerCount("will-navigate")).toBe(1);
+    expect(tabContents.listenerCount("will-redirect")).toBe(1);
+
+    const preventManagedNavigation = vi.fn();
+    tabContents.emit("will-navigate", {
+      url: "https://managed.example/after-adoption",
+      preventDefault: preventManagedNavigation,
+    });
+    expect(preventManagedNavigation).not.toHaveBeenCalled();
     access.configureOAuthPopupRuntime({
       threadId: THREAD_ID,
       tabId,
+      navigationPolicy: createBrowserPopupNavigationPolicy({
+        initialUrl: popup.webContents.getURL(),
+        inheritedOrigins: ["https://auth.example", "https://docs.example"],
+      }),
       localFilePath: null,
       localPreviewCapability: null,
       window: popup,
@@ -349,6 +408,54 @@ describe("DesktopBrowserManager local-preview lifecycle", () => {
       ).toEqual({ action: "deny" });
       expect(manager.getState({ threadId: THREAD_ID }).tabs).toHaveLength(beforeSchemeDenial);
     }
+
+    const preventNavigation = vi.fn();
+    tabContents.emit("will-navigate", {
+      url: "file:///sensitive",
+      preventDefault: preventNavigation,
+    });
+    expect(preventNavigation).toHaveBeenCalledOnce();
+  });
+
+  it("derives nested popup navigation guards through the runtime window chain", () => {
+    const manager = new DesktopBrowserManager();
+    const initial = manager.open({ threadId: THREAD_ID });
+    const tabId = initial.activeTabId;
+    expect(tabId).not.toBeNull();
+    if (!tabId) return;
+
+    const tabContents = new FakeWebContents();
+    managerInternals(manager).configureRuntimeWebContents({
+      key: `${THREAD_ID}:${tabId}`,
+      threadId: THREAD_ID,
+      tabId,
+      webContents: tabContents,
+      view: null,
+      ownsWebContents: false,
+      listenerDisposers: [],
+    });
+    const popup = new FakeOAuthPopupWindow();
+    tabContents.emit("did-create-window", popup, {
+      url: "https://accounts.example.test/oauth/authorize",
+    });
+    const nested = new FakeOAuthPopupWindow("about:blank");
+    popup.webContents.emit("did-create-window", nested, { url: "about:blank" });
+
+    expect(popup.setMenuBarVisibility).toHaveBeenCalledWith(false);
+    expect(nested.setMenuBarVisibility).toHaveBeenCalledWith(false);
+    const preventBoundNavigation = vi.fn();
+    nested.webContents.emit("will-navigate", {
+      url: "https://accounts.example.test/oauth/consent",
+      preventDefault: preventBoundNavigation,
+    });
+    expect(preventBoundNavigation).not.toHaveBeenCalled();
+    const preventUnboundNavigation = vi.fn();
+    nested.webContents.emit("will-navigate", {
+      url: "https://attacker.example/phish",
+      preventDefault: preventUnboundNavigation,
+    });
+    expect(preventUnboundNavigation).toHaveBeenCalledOnce();
+    expect(nested.isDestroyed()).toBe(true);
   });
 
   it("closes capability-scoped popups when a tab changes security identity", () => {
@@ -672,14 +779,14 @@ describe("DesktopBrowserManager local-preview lifecycle", () => {
     managerInternals(manager).configureRuntimeWebContents(runtime);
 
     managerInternals(manager).prepareLocalPreviewRuntimeGuard(runtime, tab);
-    const blockedBeforeGuard = { preventDefault: vi.fn() };
-    webContents.emit("will-navigate", blockedBeforeGuard, FIRST_PREVIEW_URL);
+    const blockedBeforeGuard = { url: FIRST_PREVIEW_URL, preventDefault: vi.fn() };
+    webContents.emit("will-navigate", blockedBeforeGuard);
     expect(blockedBeforeGuard.preventDefault).toHaveBeenCalledOnce();
     expect(runtime.localPreviewGuardInstalled).toBe(false);
     await runtime.localPreviewGuardReady;
 
-    const allowedAfterGuard = { preventDefault: vi.fn() };
-    webContents.emit("will-navigate", allowedAfterGuard, FIRST_PREVIEW_URL);
+    const allowedAfterGuard = { url: FIRST_PREVIEW_URL, preventDefault: vi.fn() };
+    webContents.emit("will-navigate", allowedAfterGuard);
     expect(allowedAfterGuard.preventDefault).not.toHaveBeenCalled();
     expect(runtime.localPreviewGuardInstalled).toBe(true);
 
@@ -808,17 +915,29 @@ describe("DesktopBrowserManager local-preview lifecycle", () => {
       recover,
       listenerDisposers,
     );
-    const willNavigateEvent = { preventDefault: vi.fn() };
-    const willRedirectEvent = { preventDefault: vi.fn() };
+    const allowedWillNavigateEvent = { url: FIRST_PREVIEW_URL, preventDefault: vi.fn() };
+    const allowedWillRedirectEvent = { url: FIRST_PREVIEW_URL, preventDefault: vi.fn() };
+    const blockedWillNavigateEvent = {
+      url: "https://example.com/outside",
+      preventDefault: vi.fn(),
+    };
+    const blockedWillRedirectEvent = {
+      url: "file:///C:/outside.html",
+      preventDefault: vi.fn(),
+    };
 
-    webContents.emit("will-navigate", willNavigateEvent, "https://example.com/outside");
-    webContents.emit("will-redirect", willRedirectEvent, "file:///C:/outside.html");
+    webContents.emit("will-navigate", allowedWillNavigateEvent);
+    webContents.emit("will-redirect", allowedWillRedirectEvent);
+    webContents.emit("will-navigate", blockedWillNavigateEvent);
+    webContents.emit("will-redirect", blockedWillRedirectEvent);
     webContents.emit("did-navigate", {}, "https://example.com/outside");
     webContents.emit("did-navigate-in-page", {}, "https://example.com/outside#hash", true);
     webContents.emit("did-navigate-in-page", {}, "https://example.com/frame", false);
 
-    expect(willNavigateEvent.preventDefault).toHaveBeenCalledOnce();
-    expect(willRedirectEvent.preventDefault).toHaveBeenCalledOnce();
+    expect(allowedWillNavigateEvent.preventDefault).not.toHaveBeenCalled();
+    expect(allowedWillRedirectEvent.preventDefault).not.toHaveBeenCalled();
+    expect(blockedWillNavigateEvent.preventDefault).toHaveBeenCalledOnce();
+    expect(blockedWillRedirectEvent.preventDefault).toHaveBeenCalledOnce();
     expect(recover).toHaveBeenCalledTimes(2);
     listenerDisposers[0]?.();
     expect(webContents.listenerCount("will-navigate")).toBe(0);

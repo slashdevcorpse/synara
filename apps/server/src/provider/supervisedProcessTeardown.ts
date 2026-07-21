@@ -1,7 +1,10 @@
+import { performance } from "node:perf_hooks";
+
 import {
   defaultProcessTreeKiller,
   type CapturedProcess,
   type CapturedProcessTree,
+  type CapturedProcessTreeInspection,
   type ProcessTreeKiller,
   type TerminalKillSignal,
 } from "../terminal/processTreeKiller";
@@ -11,6 +14,9 @@ const DEFAULT_TERM_GRACE_MS = 1_500;
 const DEFAULT_FORCE_EXIT_MS = 1_500;
 const DEFAULT_POLL_MS = 25;
 const DEFAULT_CAPTURE_POLL_MS = 100;
+// Keep the real task-boundary primitive even when Vitest installs fake timers after module load.
+// Root-exit proof needs a task turn (not a fixed microtask count) to drain deeply wrapped promises.
+const scheduleNextTask = setImmediate;
 
 export interface SupervisedProcessTeardownInput {
   readonly rootPid: number;
@@ -108,14 +114,124 @@ export class ProviderProcessExitUnprovenError extends Error {
   }
 }
 
+/**
+ * Finds an unproven provider-process exit through the error wrappers used by
+ * adapters, finalizers, and concurrent teardown aggregation.
+ */
+export function findProviderProcessExitUnprovenError(
+  error: unknown,
+): ProviderProcessExitUnprovenError | null {
+  const seen = new Set<object>();
+
+  const visit = (candidate: unknown): ProviderProcessExitUnprovenError | null => {
+    if (candidate instanceof ProviderProcessExitUnprovenError) {
+      return candidate;
+    }
+    if (candidate === null || typeof candidate !== "object" || seen.has(candidate)) {
+      return null;
+    }
+    seen.add(candidate);
+
+    if (candidate instanceof AggregateError) {
+      for (const nested of candidate.errors) {
+        const match = visit(nested);
+        if (match !== null) return match;
+      }
+    }
+
+    try {
+      if ("failures" in candidate) {
+        const failures = (candidate as { readonly failures?: unknown }).failures;
+        if (Array.isArray(failures)) {
+          for (const failure of failures) {
+            const match = visit(failure);
+            if (match !== null) return match;
+          }
+        }
+      }
+    } catch {
+      // Continue with the conventional cause link when a custom failures getter is unusable.
+    }
+
+    try {
+      return "cause" in candidate ? visit((candidate as { readonly cause?: unknown }).cause) : null;
+    } catch {
+      return null;
+    }
+  };
+
+  return visit(error);
+}
+
 const defaultDependencies: SupervisedProcessTeardownDependencies = {
   processTreeKiller: defaultProcessTreeKiller,
-  now: Date.now,
+  now: () => performance.now(),
   sleep: (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
 };
 
 function positiveDuration(value: number | undefined, fallback: number): number {
   return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+const INSPECTION_TIMED_OUT = Symbol("inspection-timed-out");
+const SIGNAL_TIMED_OUT = Symbol("signal-timed-out");
+
+function isPromiseLike<T>(value: T | PromiseLike<T> | undefined): value is PromiseLike<T> {
+  return value !== undefined && typeof (value as PromiseLike<T>).then === "function";
+}
+
+async function inspectBeforeDeadline(
+  inspection: PromiseLike<CapturedProcessTreeInspection>,
+  timeoutMs: number,
+): Promise<CapturedProcessTreeInspection | typeof INSPECTION_TIMED_OUT> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      Promise.resolve(inspection),
+      new Promise<typeof INSPECTION_TIMED_OUT>((resolve) => {
+        timer = setTimeout(() => resolve(INSPECTION_TIMED_OUT), timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+async function signalBeforeDeadline(
+  signal: PromiseLike<void>,
+  timeoutMs: number,
+  abortController: AbortController,
+): Promise<void | typeof SIGNAL_TIMED_OUT> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      Promise.resolve(signal),
+      new Promise<typeof SIGNAL_TIMED_OUT>((resolve) => {
+        timer = setTimeout(() => {
+          resolve(SIGNAL_TIMED_OUT);
+          abortController.abort();
+        }, timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+function signalFailure(
+  cause: unknown,
+  input: {
+    readonly rootPid: number;
+    readonly signal: TerminalKillSignal;
+  },
+): Error {
+  const detail = cause instanceof Error ? cause.message : String(cause);
+  return new Error(
+    `Provider process tree ${input.rootPid} ${input.signal} signaling failed: ${detail}`,
+    cause instanceof Error ? { cause } : undefined,
+  );
 }
 
 function waitForOwnedProcessExit(process: ProcessExitHandle): Promise<void> {
@@ -197,7 +313,9 @@ export function superviseEffectProcessTree(
     ((input: SupervisedProcessTeardownInput) =>
       teardownProviderProcessTree(input, { processTreeKiller }));
   const platform = options.platform ?? globalThis.process.platform;
-  const now = options.now ?? Date.now;
+  const hasStableOwnedProcessGroup =
+    platform !== "win32" && options.ownedProcessGroupId !== undefined;
+  const now = options.now ?? defaultDependencies.now;
   const sleep = options.sleep ?? defaultDependencies.sleep;
   const capturePollMs = positiveDuration(options.capturePollMs, DEFAULT_CAPTURE_POLL_MS);
   const proofTimeoutMs = positiveDuration(options.proofTimeoutMs, DEFAULT_TERM_GRACE_MS);
@@ -222,19 +340,75 @@ export function superviseEffectProcessTree(
       ? { processGroupId: options.ownedProcessGroupId }
       : undefined;
   const captureOwnedTreeAsync = (): Promise<CapturedProcessTree> =>
-    processTreeKiller.captureAsync?.(rootPid, captureOptions) ??
-    Promise.resolve().then(() => processTreeKiller.capture(rootPid, captureOptions));
+    Promise.resolve().then(
+      () =>
+        processTreeKiller.captureAsync?.(rootPid, captureOptions) ??
+        processTreeKiller.capture(rootPid, captureOptions),
+    );
 
-  const mergeCapture = (tree: CapturedProcessTree, requireLiveRoot: boolean): void => {
+  const mergeCapture = (
+    tree: CapturedProcessTree,
+    requireLiveRoot: boolean,
+    ownedRootCanAuthorizeCapture: boolean,
+  ): void => {
     if (tree.captureComplete === false || (requireLiveRoot && tree.root === undefined)) {
       captureComplete = false;
     }
+    const capturedRootMatchesOwned =
+      tree.root !== undefined &&
+      tree.root.identity !== undefined &&
+      root?.identity !== undefined &&
+      capturedProcessKey(root) === capturedProcessKey(tree.root);
+    const hasNewDescendant = tree.descendants.some(
+      (descendant) =>
+        descendant.identity === undefined || !descendants.has(capturedProcessKey(descendant)),
+    );
+    const hasStableRootMismatch =
+      tree.root !== undefined &&
+      tree.root.identity !== undefined &&
+      root?.identity !== undefined &&
+      !capturedRootMatchesOwned;
+    if (hasStableRootMismatch) {
+      // The PID was reused while supervision still owned the original process. Descendants from
+      // the mismatched snapshot belong to that new root and must be discarded with it.
+      captureComplete = false;
+      return;
+    }
+    const lacksStableRootOwnership =
+      tree.root === undefined ? hasNewDescendant : tree.root.identity === undefined;
+    const introducesOwnershipWithoutLiveRoot =
+      !ownedRootCanAuthorizeCapture &&
+      ((tree.root !== undefined && !capturedRootMatchesOwned) || hasNewDescendant);
+    const hasKnownOwnedIdentity =
+      capturedRootMatchesOwned ||
+      tree.descendants.some(
+        (descendant) =>
+          descendant.identity !== undefined && descendants.has(capturedProcessKey(descendant)),
+      );
+    const stableGroupContinuityMissing =
+      hasStableOwnedProcessGroup &&
+      !ownedRootCanAuthorizeCapture &&
+      hasNewDescendant &&
+      !hasKnownOwnedIdentity;
+    if (
+      stableGroupContinuityMissing ||
+      (!hasStableOwnedProcessGroup &&
+        (introducesOwnershipWithoutLiveRoot || lacksStableRootOwnership))
+    ) {
+      // Without an isolated POSIX group, descendants are owned only through the exact root
+      // instance. Even with a group, a rootless post-exit snapshot must retain a previously owned
+      // identity; otherwise an emptied and subsequently reused numeric PID/PGID could be adopted.
+      captureComplete = false;
+      return;
+    }
+    if (!hasStableOwnedProcessGroup && tree.root === undefined) {
+      // A rootless Windows snapshot cannot expand or rewrite the retained ownership set. Known
+      // identities remain owned from an earlier rooted capture; unknown ones failed closed above.
+      return;
+    }
     if (tree.root !== undefined) {
-      if (root === undefined) {
+      if (root === undefined && tree.root.identity !== undefined) {
         root = tree.root;
-      } else if (capturedProcessKey(root) !== capturedProcessKey(tree.root)) {
-        // The PID was reused while supervision still owned the original process.
-        captureComplete = false;
       }
       if (tree.root.identity === undefined) captureComplete = false;
     }
@@ -244,13 +418,98 @@ export function superviseEffectProcessTree(
     }
   };
 
+  const pendingInitialCapture = captureOwnedTreeAsync();
+  type RootOutcome =
+    | { readonly _tag: "Exited" }
+    | { readonly _tag: "WatcherFailed"; readonly error: unknown };
+  type RootRunningProof =
+    | { readonly _tag: "Running" }
+    | { readonly _tag: "Stopped" }
+    | { readonly _tag: "Unavailable"; readonly error: unknown };
+  const rawRootOutcome: Promise<RootOutcome> = Effect.runPromise(
+    process.exitCode.pipe(Effect.asVoid),
+  ).then(
+    () => ({ _tag: "Exited" as const }),
+    (error: unknown) => ({ _tag: "WatcherFailed" as const, error }),
+  );
+  let rootLivenessUnproven = false;
+  const runningProofUnavailable = Symbol("running-proof-unavailable");
+  const proveRootRunningBeforeDeadline = async (): Promise<RootRunningProof> => {
+    if (process.isRunning === undefined) {
+      return {
+        _tag: "Unavailable",
+        error: new Error(`Provider process ${rootPid} has no running-state proof.`),
+      };
+    }
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const abortController = new AbortController();
+    try {
+      const running = await Promise.race([
+        Effect.runPromise(process.isRunning, { signal: abortController.signal }).then(
+          (value) =>
+            value === true ? ({ _tag: "Running" } as const) : ({ _tag: "Stopped" } as const),
+          (error: unknown) => ({ _tag: "Unavailable" as const, error }),
+        ),
+        new Promise<typeof runningProofUnavailable>((resolve) => {
+          timer = setTimeout(() => {
+            abortController.abort();
+            resolve(runningProofUnavailable);
+          }, proofTimeoutMs);
+          timer.unref?.();
+        }),
+      ]);
+      return running === runningProofUnavailable
+        ? {
+            _tag: "Unavailable",
+            error: new Error(
+              `Provider process ${rootPid} running-state proof did not settle within ${proofTimeoutMs}ms.`,
+            ),
+          }
+        : running;
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+      abortController.abort();
+    }
+  };
+  const rootOutcome: Promise<RootOutcome> = rawRootOutcome.then(async (outcome) => {
+    if (outcome._tag === "Exited") return outcome;
+    const runningProof = await proveRootRunningBeforeDeadline();
+    if (runningProof._tag === "Running") return outcome;
+    if (runningProof._tag === "Stopped") return { _tag: "Exited" };
+    rootLivenessUnproven = true;
+    return { _tag: "WatcherFailed", error: runningProof.error };
+  });
+  void rootOutcome.then((outcome) => {
+    rootSettled = outcome._tag === "Exited";
+  });
+  const rawRootOutcomePending = Symbol("raw-root-outcome-pending");
+  const ownedRootCanAuthorizeCapture = async (): Promise<boolean> => {
+    if (rootSettled || rootLivenessUnproven) return false;
+    const rawOutcome = await Promise.race([
+      rawRootOutcome,
+      new Promise<typeof rawRootOutcomePending>((resolve) => {
+        scheduleNextTask(() => resolve(rawRootOutcomePending));
+      }),
+    ]);
+    if (
+      (rawOutcome !== rawRootOutcomePending && rawOutcome._tag === "Exited") ||
+      process.isRunning === undefined
+    ) {
+      return false;
+    }
+    const runningProof = await proveRootRunningBeforeDeadline();
+    if (runningProof._tag === "Unavailable") rootLivenessUnproven = true;
+    return runningProof._tag === "Running";
+  };
+
   let initialCaptureFailure: unknown;
   let initialCaptureSucceeded = false;
   // Start the ownership boundary immediately without blocking the server event loop. Every proof
   // and teardown operation below awaits this promise before observing or signaling the tree.
-  const initialCapture = captureOwnedTreeAsync().then(
-    (tree) => {
-      mergeCapture(tree, true);
+  const initialCapture = pendingInitialCapture.then(
+    async (tree) => {
+      mergeCapture(tree, true, await ownedRootCanAuthorizeCapture());
       initialCaptureSucceeded =
         tree.root !== undefined && tree.captureComplete !== false && captureComplete;
     },
@@ -272,20 +531,13 @@ export function superviseEffectProcessTree(
     });
   };
 
-  const rootOutcome = awaitEffectProcessExit(process).then(
-    () => ({ _tag: "Exited" as const }),
-    (error: unknown) => ({ _tag: "WatcherFailed" as const, error }),
-  );
-  void rootOutcome.then(() => {
-    rootSettled = true;
-  });
-
   const captureNow = async (): Promise<void> => {
     await initialCapture;
     try {
       // Windows retains parent PIDs after root exit, while POSIX callers provide the isolated
       // process group. Captures stay additive so a vanished wrapper never erases prior identities.
-      mergeCapture(await captureOwnedTreeAsync(), false);
+      const tree = await captureOwnedTreeAsync();
+      mergeCapture(tree, false, await ownedRootCanAuthorizeCapture());
     } catch {
       captureComplete = false;
     }
@@ -293,7 +545,7 @@ export function superviseEffectProcessTree(
 
   const monitor = (async () => {
     await Promise.race([rootOutcome, sleep(capturePollMs), monitorStop]);
-    if (!monitorStopped && !rootSettled) {
+    if (!monitorStopped && !rootSettled && !rootLivenessUnproven) {
       // One delayed refresh catches the usual package-manager/batch-wrapper handoff without
       // launching a whole-system Windows CIM query continuously for every live provider session.
       await captureNow();
@@ -322,9 +574,20 @@ export function superviseEffectProcessTree(
     const deadline = now() + proofTimeoutMs;
     let remaining: ReadonlyArray<CapturedProcess> | null = null;
     do {
-      const inspection = processTreeKiller.inspectAsync
-        ? await processTreeKiller.inspectAsync(tree)
-        : processTreeKiller.inspect?.(tree);
+      const inspectionBudgetMs = deadline - now();
+      if (inspectionBudgetMs <= 0) break;
+      let inspection: CapturedProcessTreeInspection | typeof INSPECTION_TIMED_OUT | undefined;
+      try {
+        const pendingInspection = processTreeKiller.inspectAsync
+          ? processTreeKiller.inspectAsync(tree)
+          : processTreeKiller.inspect?.(tree);
+        inspection = isPromiseLike(pendingInspection)
+          ? await inspectBeforeDeadline(pendingInspection, inspectionBudgetMs)
+          : pendingInspection;
+      } catch {
+        inspection = undefined;
+      }
+      if (inspection === INSPECTION_TIMED_OUT) return null;
       remaining = inspection?.verified === true ? inspection.survivors : null;
       if (tree.captureComplete !== false && remaining !== null && remaining.length === 0) {
         return remaining;
@@ -340,20 +603,23 @@ export function superviseEffectProcessTree(
     await initialCapture;
     const outcome = await rootOutcome;
     await stopMonitor();
+    if (outcome._tag === "WatcherFailed") {
+      throw new ProviderProcessExitUnprovenError({
+        rootPid,
+        rootExited: false,
+        remainingDescendantPids: null,
+        captureComplete: false,
+      });
+    }
     await captureNow();
     const tree = capturedTree();
     const remaining = await inspectUntil(tree);
-    if (
-      outcome._tag === "Exited" &&
-      tree.captureComplete !== false &&
-      remaining !== null &&
-      remaining.length === 0
-    ) {
+    if (tree.captureComplete !== false && remaining !== null && remaining.length === 0) {
       return { escalated: false, signalErrors: [] };
     }
     throw new ProviderProcessExitUnprovenError({
       rootPid,
-      rootExited: outcome._tag === "Exited",
+      rootExited: true,
       remainingDescendantPids: remaining?.map((descendant) => descendant.pid) ?? null,
       captureComplete: tree.captureComplete !== false,
     });
@@ -377,6 +643,9 @@ export function superviseEffectProcessTree(
             await captureNow();
             return capturedTree();
           },
+          ...(options.ownedProcessGroupId === undefined
+            ? {}
+            : { ownedProcessGroupId: options.ownedProcessGroupId }),
         });
       })();
       teardownPromise = attempt;
@@ -418,48 +687,85 @@ export async function teardownProviderProcessTree(
   }
 
   const deps = { ...defaultDependencies, ...dependencies };
+  const signalErrors: Error[] = [];
   const captureOptions =
     input.ownedProcessGroupId === undefined
       ? undefined
       : { processGroupId: input.ownedProcessGroupId };
-  let tree =
+  let rootExited = false;
+  let captureFinished = input.capturedTree !== undefined;
+  let rootExitedBeforeCaptureFinished = false;
+  const rootExitObservation = input.rootExited.then(
+    () => {
+      rootExited = true;
+      if (!captureFinished) rootExitedBeforeCaptureFinished = true;
+      return true;
+    },
+    () => false,
+  );
+  const capturedTree =
     input.capturedTree ??
     (deps.processTreeKiller.captureAsync
       ? await deps.processTreeKiller.captureAsync(input.rootPid, captureOptions)
       : await Promise.resolve().then(() =>
           deps.processTreeKiller.capture(input.rootPid, captureOptions),
         ));
-  const signalErrors: Error[] = [];
-  const rootExitObservation = input.rootExited.then(
-    () => true,
-    () => false,
-  );
-  // A resolved wrapper promise can require multiple microtasks before its own observers run. Race
-  // against the next task instead of assuming a fixed wrapper depth; every already-queued promise
-  // reaction settles before `setImmediate`, while a genuinely live root remains signalable.
-  let rootExited = await Promise.race([
+  captureFinished = true;
+  // Flush a root-exit resolution queued in the same turn as capture completion. Then allow every
+  // already-queued wrapper reaction to settle before deciding whether the numeric root is safe.
+  await Promise.resolve();
+  rootExited = await Promise.race([
     rootExitObservation,
-    new Promise<false>((resolve) => setImmediate(() => resolve(false))),
+    new Promise<boolean>((resolve) => scheduleNextTask(() => resolve(rootExited))),
   ]);
   void rootExitObservation.then((exited) => {
     if (exited) rootExited = true;
   });
+  // A capture that starts without a caller-supplied ownership snapshot and finishes after root exit
+  // cannot prove continuity. Even an explicitly selected numeric POSIX group could have emptied and
+  // been reused before the snapshot completed.
+  const capturedAfterUnsafeRootExit =
+    input.capturedTree === undefined && rootExitedBeforeCaptureFinished;
+  let tree: CapturedProcessTree = capturedAfterUnsafeRootExit
+    ? { descendants: [], captureComplete: false }
+    : capturedTree;
 
   const signal = async (
     killSignal: TerminalKillSignal,
     includeRootTree: boolean,
+    timeoutMs: number,
   ): Promise<void> => {
-    const signalInput: Parameters<ProcessTreeKiller["signal"]>[0] = {
-      rootPid: input.rootPid,
-      signal: killSignal,
-      tree,
-      includeRootTree,
-      onError: (error) => signalErrors.push(error),
-    };
-    if (deps.processTreeKiller.signalAsync !== undefined) {
-      await deps.processTreeKiller.signalAsync(signalInput);
-    } else {
-      deps.processTreeKiller.signal(signalInput);
+    let acceptsCallbackErrors = true;
+    const abortController = new AbortController();
+    try {
+      const signalInput: Parameters<ProcessTreeKiller["signal"]>[0] = {
+        rootPid: input.rootPid,
+        signal: killSignal,
+        tree,
+        includeRootTree,
+        shouldSignalRootTree: () => !rootExited,
+        abortSignal: abortController.signal,
+        onError: (error) => {
+          if (acceptsCallbackErrors) signalErrors.push(error);
+        },
+      };
+      const signaling = Promise.resolve().then(() =>
+        deps.processTreeKiller.signalAsync !== undefined
+          ? deps.processTreeKiller.signalAsync(signalInput)
+          : deps.processTreeKiller.signal(signalInput),
+      );
+      const outcome = await signalBeforeDeadline(signaling, timeoutMs, abortController);
+      if (outcome === SIGNAL_TIMED_OUT) {
+        signalErrors.push(
+          new Error(
+            `Provider process tree ${input.rootPid} ${killSignal} signaling did not settle within ${timeoutMs}ms.`,
+          ),
+        );
+      }
+    } catch (cause) {
+      signalErrors.push(signalFailure(cause, { rootPid: input.rootPid, signal: killSignal }));
+    } finally {
+      acceptsCallbackErrors = false;
     }
   };
 
@@ -485,9 +791,22 @@ export async function teardownProviderProcessTree(
         // owned-root settlement prevents a frozen pre-signal tree from proving a false success.
         await refreshCapturedTree();
       }
-      const inspection = deps.processTreeKiller.inspectAsync
-        ? await deps.processTreeKiller.inspectAsync(tree)
-        : deps.processTreeKiller.inspect?.(tree);
+      const inspectionBudgetMs = deadline - deps.now();
+      if (inspectionBudgetMs <= 0) break;
+      let inspection: CapturedProcessTreeInspection | typeof INSPECTION_TIMED_OUT | undefined;
+      try {
+        const pendingInspection = deps.processTreeKiller.inspectAsync
+          ? deps.processTreeKiller.inspectAsync(tree)
+          : deps.processTreeKiller.inspect?.(tree);
+        inspection = isPromiseLike(pendingInspection)
+          ? await inspectBeforeDeadline(pendingInspection, inspectionBudgetMs)
+          : pendingInspection;
+      } catch {
+        inspection = undefined;
+      }
+      if (inspection === INSPECTION_TIMED_OUT) {
+        return { proven: false as const, remainingDescendants: null };
+      }
       remainingDescendants = inspection?.verified === true ? inspection.survivors : null;
       if (
         rootExited &&
@@ -504,10 +823,12 @@ export async function teardownProviderProcessTree(
     return { proven: false as const, remainingDescendants };
   };
 
-  await signal("SIGTERM", !rootExited);
-  const graceful = await waitForExitProof(
-    positiveDuration(input.termGraceMs, DEFAULT_TERM_GRACE_MS),
-  );
+  // If the owned root exited while descendants were being captured, its numeric
+  // PID may already identify an unrelated process. The untrusted capture was
+  // discarded above; skip the root tree and keep the result unproven.
+  const termGraceMs = positiveDuration(input.termGraceMs, DEFAULT_TERM_GRACE_MS);
+  await signal("SIGTERM", !rootExited, termGraceMs);
+  const graceful = await waitForExitProof(termGraceMs);
   if (graceful.proven) {
     return { escalated: false, signalErrors };
   }
@@ -515,8 +836,9 @@ export async function teardownProviderProcessTree(
   // A root can exit while descendants ignore TERM and become reparented. Preserve the captured
   // identities and force only those descendants rather than re-signalling a potentially reused PID.
   await refreshCapturedTree();
-  await signal("SIGKILL", !rootExited);
-  const forced = await waitForExitProof(positiveDuration(input.forceExitMs, DEFAULT_FORCE_EXIT_MS));
+  const forceExitMs = positiveDuration(input.forceExitMs, DEFAULT_FORCE_EXIT_MS);
+  await signal("SIGKILL", !rootExited, forceExitMs);
+  const forced = await waitForExitProof(forceExitMs);
   if (forced.proven) {
     return { escalated: true, signalErrors };
   }

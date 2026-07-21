@@ -42,6 +42,7 @@ import { ProjectPullRequestPinsLive } from "./persistence/Layers/ProjectPullRequ
 import { ProjectionTurnRepositoryLive } from "./persistence/Layers/ProjectionTurns";
 import { OrchestrationEventDeliveryRepositoryLive } from "./persistence/Layers/OrchestrationEventDeliveries";
 import { ManagedAttachmentCleanupLive } from "./managedAttachmentCleanup";
+import { ScratchWorkspaceCleanupLive } from "./scratchWorkspaceCleanup";
 import { PullRequestServiceLive } from "./pullRequests/Layers/PullRequestService";
 import { makeProviderHealthLive } from "./provider/Layers/ProviderHealth";
 import {
@@ -84,6 +85,7 @@ export function makeServerRuntimeServicesLayer(options: ServerRuntimeServicesLay
     makeServerProviderLayer({
       agentGatewayCredentialsLayer,
       maintenanceGate: maintenanceOptions.maintenanceGate,
+      maintenanceOwnedResources: maintenanceOptions.maintenanceOwnedResources,
     });
   const providerHealthLayer = makeProviderHealthLive(maintenanceOptions).pipe(
     Layer.provideMerge(ServerSettingsLive),
@@ -111,6 +113,9 @@ export function makeServerRuntimeServicesLayer(options: ServerRuntimeServicesLay
     RuntimeReceiptBusLive,
   );
   const managedAttachmentCleanupLayer = ManagedAttachmentCleanupLive.pipe(
+    Layer.provideMerge(runtimeServicesLayer),
+  );
+  const scratchWorkspaceCleanupLayer = ScratchWorkspaceCleanupLive.pipe(
     Layer.provideMerge(runtimeServicesLayer),
   );
   const runtimeIngestionLayer = ProviderRuntimeIngestionLive.pipe(
@@ -207,6 +212,7 @@ export function makeServerRuntimeServicesLayer(options: ServerRuntimeServicesLay
     automationSchedulerLayer,
     automationRunReactorLayer,
     managedAttachmentCleanupLayer,
+    scratchWorkspaceCleanupLayer,
     AutomationRepositoryLive,
     AgentGatewayOperationRepositoryLive,
     providerHealthLayer,
@@ -247,6 +253,7 @@ export function makeServerApplicationLayers(
   const providerLayer = makeServerProviderLayer({
     agentGatewayCredentialsLayer,
     maintenanceGate: maintenanceOptions.maintenanceGate,
+    maintenanceOwnedResources: maintenanceOptions.maintenanceOwnedResources,
   });
   return {
     runtimeServicesLayer: makeServerRuntimeServicesLayer({

@@ -6,6 +6,10 @@ import { describe, it, expect, vi } from "vitest";
 
 import { ServerConfig } from "../../config.ts";
 import { ProviderAdapterRequestError } from "../Errors.ts";
+import {
+  findProviderProcessExitUnprovenError,
+  ProviderProcessExitUnprovenError,
+} from "../supervisedProcessTeardown.ts";
 import { SYNARA_HARNESS_POLICY_MARKER } from "../../agentGateway/harnessPolicy.ts";
 import {
   AgentGatewayCredentials,
@@ -622,6 +626,91 @@ describe("OpenCodeAdapter runtime lifecycle", () => {
     expect(runtime.connectCalls[0]).toMatchObject({ cwd: "/repo/server-startup-fails" });
     expect(runtime.cliModelCalls).toHaveLength(1);
     expect(runtime.cliModelCalls[0]).toMatchObject({ cwd: "/repo/server-startup-fails" });
+  });
+
+  it("does not replace an unproven CLI exit with successful server inventory", async () => {
+    const processFailure = new ProviderProcessExitUnprovenError({
+      rootPid: 6_101,
+      rootExited: false,
+      remainingDescendantPids: null,
+      captureComplete: false,
+    });
+    const runtime = createMockOpenCodeRuntime({
+      cliModelsError: new OpenCodeRuntimeError({
+        operation: "listOpenCodeCliModels",
+        detail: "CLI cleanup failed",
+        cause: new AggregateError([new Error("command failed"), processFailure]),
+      }),
+      inventory: {
+        providerList: { connected: [], default: {}, all: [] },
+        agents: [],
+        consoleState: null,
+      },
+    });
+
+    const failure = await Effect.runPromise(
+      Effect.gen(function* () {
+        const adapter = yield* OpenCodeAdapter;
+        return yield* adapter.listModels!({ provider: "opencode", cwd: "/repo" }).pipe(Effect.flip);
+      }).pipe(
+        Effect.provide(
+          makeOpenCodeAdapterLive({ runtime: runtime.runtime }).pipe(
+            Layer.provideMerge(
+              ServerConfig.layerTest(process.cwd(), { prefix: "opencode-adapter-test-" }),
+            ),
+            Layer.provideMerge(NodeServices.layer),
+          ),
+        ),
+      ),
+    );
+
+    expect(failure).toBeInstanceOf(ProviderAdapterRequestError);
+    expect(findProviderProcessExitUnprovenError(failure)).toBe(processFailure);
+  });
+
+  it("does not replace an unproven inventory exit with successful CLI models", async () => {
+    const processFailure = new ProviderProcessExitUnprovenError({
+      rootPid: 6_102,
+      rootExited: true,
+      remainingDescendantPids: [6_103],
+      captureComplete: true,
+    });
+    const runtime = createMockOpenCodeRuntime({
+      cliModels: [
+        {
+          slug: "opencode/safe-fallback",
+          providerID: "opencode",
+          modelID: "safe-fallback",
+          name: "Safe Fallback",
+          variants: [],
+          supportedReasoningEfforts: [],
+        },
+      ],
+      connectError: new OpenCodeRuntimeError({
+        operation: "connectToOpenCodeServer",
+        detail: "inventory cleanup failed",
+        cause: new AggregateError([new Error("startup failed"), processFailure]),
+      }),
+    });
+
+    const failure = await Effect.runPromise(
+      Effect.gen(function* () {
+        const adapter = yield* OpenCodeAdapter;
+        return yield* adapter.listModels!({ provider: "opencode", cwd: "/repo" }).pipe(Effect.flip);
+      }).pipe(
+        Effect.provide(
+          makeOpenCodeAdapterLive({ runtime: runtime.runtime }).pipe(
+            Layer.provideMerge(
+              ServerConfig.layerTest(process.cwd(), { prefix: "opencode-adapter-test-" }),
+            ),
+            Layer.provideMerge(NodeServices.layer),
+          ),
+        ),
+      ),
+    );
+
+    expect(failure).toBeInstanceOf(ProviderAdapterRequestError);
+    expect(findProviderProcessExitUnprovenError(failure)).toBe(processFailure);
   });
 
   it("lists OpenCode agents from the active discovery cwd", async () => {

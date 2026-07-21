@@ -25,11 +25,29 @@ import { ProviderSessionDirectoryLive } from "./Layers/ProviderSessionDirectory"
 import { ProviderSessionRuntimeRepositoryLive } from "../persistence/Layers/ProviderSessionRuntime";
 import { ProviderRuntimeEventRepositoryLive } from "../persistence/Layers/ProviderRuntimeEvents";
 import type { ProviderMaintenanceGate } from "./providerMaintenanceGate";
+import type { ProviderMaintenanceOwnedResourceCoordinator } from "./providerMaintenanceOwnedResources";
+
+export function makeProviderAdapterMaintenanceOptions(
+  maintenanceOwnedResources?: ProviderMaintenanceOwnedResourceCoordinator,
+) {
+  const shared = maintenanceOwnedResources ? { maintenanceOwnedResources } : {};
+  return {
+    claude: shared,
+    commandCode: shared,
+    openCode: shared,
+    kilo: shared,
+    antigravity: shared,
+    grok: shared,
+    cursor: shared,
+    pi: shared,
+  } as const;
+}
 
 export function makeServerProviderLayer(
   options: {
     readonly agentGatewayCredentialsLayer?: typeof AgentGatewayCredentialsWithSecretsLive;
     readonly maintenanceGate?: ProviderMaintenanceGate;
+    readonly maintenanceOwnedResources?: ProviderMaintenanceOwnedResourceCoordinator;
   } = {},
 ) {
   return Effect.gen(function* () {
@@ -54,30 +72,39 @@ export function makeServerProviderLayer(
     // the same MCP catalog/dispatcher through its native custom-tool API.
     const agentGatewayCredentialsLayer =
       options.agentGatewayCredentialsLayer ?? AgentGatewayCredentialsWithSecretsLive;
+    const adapterMaintenanceOptions = makeProviderAdapterMaintenanceOptions(
+      options.maintenanceOwnedResources,
+    );
     const codexAdapterLayer = makeCodexAdapterLive(
       nativeEventLogger ? { nativeEventLogger } : undefined,
     );
-    const commandCodeAdapterLayer = makeCommandCodeAdapterLive(
-      nativeEventLogger ? { nativeEventLogger } : undefined,
-    ).pipe(Layer.provide(agentGatewayCredentialsLayer));
+    const commandCodeAdapterLayer = makeCommandCodeAdapterLive({
+      ...(nativeEventLogger ? { nativeEventLogger } : {}),
+      ...adapterMaintenanceOptions.commandCode,
+    }).pipe(Layer.provide(agentGatewayCredentialsLayer));
     const gatewayCodexAdapterLayer = codexAdapterLayer.pipe(
       Layer.provide(agentGatewayCredentialsLayer),
     );
-    const claudeAdapterLayer = makeClaudeAdapterLive(
-      nativeEventLogger ? { nativeEventLogger } : undefined,
-    ).pipe(Layer.provide(agentGatewayCredentialsLayer));
+    const claudeAdapterLayer = makeClaudeAdapterLive({
+      ...(nativeEventLogger ? { nativeEventLogger } : {}),
+      ...adapterMaintenanceOptions.claude,
+    }).pipe(Layer.provide(agentGatewayCredentialsLayer));
     const openCodeAdapterLayer = makeOpenCodeAdapterLive({
       ...(nativeEventLogger ? { nativeEventLogger } : {}),
+      ...adapterMaintenanceOptions.openCode,
       resolveServerPassword: resolveProviderServerPassword,
     }).pipe(Layer.provide(agentGatewayCredentialsLayer));
     const kiloAdapterLayer = makeKiloAdapterLive({
       ...(nativeEventLogger ? { nativeEventLogger } : {}),
+      ...adapterMaintenanceOptions.kilo,
       resolveServerPassword: resolveProviderServerPassword,
     }).pipe(Layer.provide(agentGatewayCredentialsLayer));
-    const antigravityAdapterLayer = makeAntigravityAdapterLive();
+    const antigravityAdapterLayer = makeAntigravityAdapterLive(
+      adapterMaintenanceOptions.antigravity,
+    );
     const grokAdapterLayer = makeGrokAdapterLive(
       {},
-      nativeEventLogger ? { nativeEventLogger } : undefined,
+      { ...(nativeEventLogger ? { nativeEventLogger } : {}), ...adapterMaintenanceOptions.grok },
     ).pipe(Layer.provide(agentGatewayCredentialsLayer));
     const droidAdapterLayer = makeDroidAdapterLive(
       {},
@@ -85,11 +112,12 @@ export function makeServerProviderLayer(
     ).pipe(Layer.provide(agentGatewayCredentialsLayer));
     const cursorAdapterLayer = makeCursorAdapterLive(
       {},
-      nativeEventLogger ? { nativeEventLogger } : undefined,
+      { ...(nativeEventLogger ? { nativeEventLogger } : {}), ...adapterMaintenanceOptions.cursor },
     ).pipe(Layer.provide(agentGatewayCredentialsLayer));
-    const piAdapterLayer = makePiAdapterLive(
-      nativeEventLogger ? { nativeEventLogger } : undefined,
-    ).pipe(Layer.provide(agentGatewayCredentialsLayer));
+    const piAdapterLayer = makePiAdapterLive({
+      ...(nativeEventLogger ? { nativeEventLogger } : {}),
+      ...adapterMaintenanceOptions.pi,
+    }).pipe(Layer.provide(agentGatewayCredentialsLayer));
     const adapterRegistryLayer = makeProviderAdapterRegistryLive({
       ...(options?.maintenanceGate ? { maintenanceGate: options.maintenanceGate } : {}),
     }).pipe(

@@ -2,6 +2,8 @@ import { Option, Schema, SchemaIssue } from "effect";
 import { ProcessEnvRecord, TrimmedNonEmptyString } from "./baseSchemas";
 
 export const DEFAULT_TERMINAL_ID = "default";
+export const TERMINAL_RESNAPSHOT_REQUIRED_CODE = "TERMINAL_RESNAPSHOT_REQUIRED";
+const TerminalEventGenerationSchema = Schema.String.check(Schema.isNonEmpty());
 
 const TrimmedNonEmptyStringSchema = TrimmedNonEmptyString;
 
@@ -32,7 +34,7 @@ export const TerminalThreadInput = Schema.Struct({
 });
 export type TerminalThreadInput = Schema.Codec.Encoded<typeof TerminalThreadInput>;
 
-const TerminalSessionInput = Schema.Struct({
+export const TerminalSessionInput = Schema.Struct({
   ...TerminalThreadInput.fields,
   terminalId: TerminalIdWithDefaultSchema,
 });
@@ -131,10 +133,19 @@ export const TerminalSessionSnapshot = Schema.Struct({
 );
 export type TerminalSessionSnapshot = typeof TerminalSessionSnapshot.Type;
 
+export const TerminalRecoverySnapshot = Schema.Struct({
+  snapshot: TerminalSessionSnapshot,
+  generation: TerminalEventGenerationSchema,
+  watermark: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+});
+export type TerminalRecoverySnapshot = typeof TerminalRecoverySnapshot.Type;
+
 const TerminalEventBaseSchema = Schema.Struct({
   threadId: Schema.String.check(Schema.isNonEmpty()),
   terminalId: Schema.String.check(Schema.isNonEmpty()),
   createdAt: Schema.String,
+  generation: TerminalEventGenerationSchema,
+  sequence: Schema.Int.check(Schema.isGreaterThan(0)),
 });
 
 const TerminalStartedEvent = Schema.Struct({
@@ -204,3 +215,12 @@ export const TerminalEvent = Schema.Union([
   TerminalActivityEvent,
 ]);
 export type TerminalEvent = typeof TerminalEvent.Type;
+
+export const TerminalEventStreamReady = Schema.Struct({
+  type: Schema.Literal("ready"),
+  generation: TerminalEventGenerationSchema,
+});
+export type TerminalEventStreamReady = typeof TerminalEventStreamReady.Type;
+
+export const TerminalEventStreamItem = Schema.Union([TerminalEventStreamReady, TerminalEvent]);
+export type TerminalEventStreamItem = typeof TerminalEventStreamItem.Type;

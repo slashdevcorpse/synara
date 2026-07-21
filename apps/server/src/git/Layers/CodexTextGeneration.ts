@@ -8,9 +8,19 @@ import { sanitizeGeneratedThreadTitle } from "@synara/shared/chatThreads";
 import { resolveCodexCliExecutable } from "@synara/shared/codexCliExecutable";
 import { resolveCodexHome } from "@synara/shared/codexConfig";
 import { sanitizeBranchFragment, sanitizeFeatureBranchName } from "@synara/shared/git";
-import { prepareResolvedWindowsSafeProcess } from "@synara/shared/windowsProcess";
+import type { WindowsSafeProcessCommand } from "@synara/shared/windowsProcess";
 
 import { resolveProviderAttachmentPath } from "../../provider/providerAttachmentPaths.ts";
+import {
+  isWindowsJobPreparedCommand,
+  prepareResolvedWindowsProviderProcess,
+} from "../../provider/windowsProviderProcess.ts";
+import {
+  installPreparedEffectProcessSupervisor,
+  supervisePreparedEffectProcess,
+  type SupervisePreparedEffectProcessOptions,
+  type WindowsJobEffectProcessHandle,
+} from "../../provider/windowsJobProcessSupervisor.ts";
 import { buildCodexProcessEnv } from "../../codexProcessEnv.ts";
 import { ServerConfig } from "../../config.ts";
 import { TextGenerationError } from "../Errors.ts";
@@ -82,6 +92,67 @@ function normalizeCodexError(
     cause: error,
   });
 }
+
+export interface CodexTextGenerationProcessOwnershipOptions {
+  readonly supervisorOptions?: SupervisePreparedEffectProcessOptions;
+  readonly superviseProcess?: typeof supervisePreparedEffectProcess;
+}
+
+/**
+ * Promotes Effect's spawn-scope owner to the exact prepared-command owner. The caller deliberately
+ * keeps Effect's finalizer installed as a provisional fallback; this exact finalizer is registered
+ * later and therefore runs first (LIFO) on interruption or startup failure.
+ */
+export const installCodexTextGenerationProcessOwnership = (
+  prepared: WindowsSafeProcessCommand,
+  child: WindowsJobEffectProcessHandle,
+  binaryPath: string,
+  operation: TextGenerationOperation,
+  options: CodexTextGenerationProcessOwnershipOptions = {},
+) =>
+  Effect.gen(function* () {
+    const installation = yield* Effect.try({
+      try: () =>
+        installPreparedEffectProcessSupervisor(
+          prepared,
+          child,
+          options.supervisorOptions,
+          options.superviseProcess,
+        ),
+      catch: (cause) =>
+        normalizeCodexError(
+          binaryPath,
+          operation,
+          cause,
+          "Failed to install Codex CLI process supervision",
+        ),
+    });
+    const supervisor = installation.supervisor;
+    let completed = false;
+    yield* Effect.addFinalizer(() =>
+      completed
+        ? Effect.void
+        : Effect.tryPromise({
+            try: supervisor.teardown,
+            catch: (cause) =>
+              normalizeCodexError(binaryPath, operation, cause, "Failed to stop Codex CLI process"),
+          }).pipe(Effect.orDie),
+    );
+    if (installation._tag === "Recovered") {
+      return yield* normalizeCodexError(
+        binaryPath,
+        operation,
+        installation.requestedSupervisorFailure,
+        "Failed to install Codex CLI process supervision",
+      );
+    }
+    return {
+      supervisor,
+      markCompleted: () => {
+        completed = true;
+      },
+    };
+  });
 
 function sanitizeCodexConfigForTextGeneration(content: string): string {
   const lines = content.split(/\r?\n/g);
@@ -326,29 +397,50 @@ const makeCodexTextGeneration = Effect.gen(function* () {
           "-",
         ];
         const executable = resolveCodexCliExecutable(codexBinaryPath, { cwd, env });
-        const prepared = prepareResolvedWindowsSafeProcess(executable, args, { cwd, env });
+        const prepared = prepareResolvedWindowsProviderProcess(executable, args, { cwd, env });
         const command = ChildProcess.make(prepared.command, prepared.args, {
           cwd,
           env,
           shell: prepared.shell,
+          ...(prepared.windowsHide ? { windowsHide: true } : {}),
           ...(prepared.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
           stdin: {
             stream: Stream.make(new TextEncoder().encode(prompt)),
           },
+          // Keep Effect's child finalizer as the provisional owner until the exact Job supervisor
+          // is constructed and its later (LIFO) finalizer is registered below.
         });
 
-        const child = yield* commandSpawner
-          .spawn(command)
-          .pipe(
-            Effect.mapError((cause) =>
-              normalizeCodexError(
-                codexBinaryPath,
-                operation,
-                cause,
-                "Failed to spawn Codex CLI process",
-              ),
-            ),
-          );
+        const owned = yield* Effect.uninterruptible(
+          Effect.gen(function* () {
+            const child = yield* commandSpawner
+              .spawn(command)
+              .pipe(
+                Effect.mapError((cause) =>
+                  normalizeCodexError(
+                    codexBinaryPath,
+                    operation,
+                    cause,
+                    "Failed to spawn Codex CLI process",
+                  ),
+                ),
+              );
+            const processOwnership = isWindowsJobPreparedCommand(prepared)
+              ? yield* installCodexTextGenerationProcessOwnership(
+                  prepared,
+                  child,
+                  codexBinaryPath,
+                  operation,
+                )
+              : undefined;
+            return {
+              child,
+              supervisor: processOwnership?.supervisor,
+              markCompleted: processOwnership?.markCompleted ?? (() => undefined),
+            };
+          }),
+        );
+        const { child, supervisor } = owned;
 
         const [stdout, stderr, exitCode] = yield* Effect.all(
           [
@@ -368,6 +460,20 @@ const makeCodexTextGeneration = Effect.gen(function* () {
           ],
           { concurrency: "unbounded" },
         );
+
+        if (supervisor) {
+          yield* Effect.tryPromise({
+            try: supervisor.proveExit,
+            catch: (cause) =>
+              normalizeCodexError(
+                codexBinaryPath,
+                operation,
+                cause,
+                "Failed to prove Codex CLI process exit",
+              ),
+          });
+        }
+        owned.markCompleted();
 
         if (exitCode !== 0) {
           const stderrDetail = stderr.trim();

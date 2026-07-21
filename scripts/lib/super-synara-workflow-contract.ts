@@ -11,6 +11,8 @@ type UnknownRecord = Record<string, unknown>;
 
 const PRERELEASE_WINDOWS_REQUIRED_COMMANDS = [
   "bun run brand:check",
+  "node apps/server/scripts/build-windows-job-launcher.mjs --arch x64",
+  "bun run --cwd apps/server test src/provider/windowsProviderProcess.test.ts src/provider/windowsProviderProcess.windows.test.ts",
   "bun run --cwd packages/shared test src/desktopIdentity.test.ts src/desktopIdentityProof.test.ts src/windowsCertificate.test.ts",
   "bun run --cwd apps/desktop test src/backendShutdown.test.ts src/backendShutdown.windows.integration.test.ts",
   "bun run --cwd scripts test check-brand-identity.test.ts verify-packaged-desktop-startup.test.ts lib/desktop-artifact-policy.test.ts lib/windows-authenticode.test.ts lib/windows-installer-qualification.test.ts lib/release-artifact-provenance.test.ts lib/super-synara-release-admission.test.ts lib/super-synara-workflow-contract.test.ts",
@@ -568,10 +570,60 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
     draftFilterCommands.length !== 1 ||
     !draftFilterCommands[0]!.includes('--arg tag "$TAG"') ||
     !draftFilterCommands[0]!.includes('--arg source_commit "$SOURCE_COMMIT"') ||
-    !draftFilterCommands[0]!.includes('<<< "$releases_json"')
+    !draftFilterCommands[0]!.includes('<<< "$releases_json"') ||
+    !draftFilterCommands[0]!.includes(
+      'elif length == 0 then empty else error("multiple owned drafts") end',
+    )
   ) {
     throw new Error(
       "Publication draft lookup must filter the captured response with standalone jq arguments.",
+    );
+  }
+  const draftCreateIndex = draftStep.run.indexOf('gh release create "$TAG"');
+  const draftRetryIndex = draftStep.run.indexOf("for attempt in {1..30}; do");
+  const draftQueryIndex = draftStep.run.indexOf("gh api --paginate --slurp", draftRetryIndex);
+  const draftFilterIndex = draftStep.run.indexOf("jq -er", draftQueryIndex);
+  const draftRetryEndIndex = draftStep.run.indexOf("\ndone\n", draftFilterIndex);
+  const draftRetryBody = draftStep.run.slice(draftRetryIndex, draftRetryEndIndex);
+  const draftQueryStatusIndex = draftRetryBody.indexOf("query_status=$?");
+  const draftQueryFailureIndex = draftRetryBody.indexOf(
+    'if [[ "$query_status" -ne 4 ]]; then',
+    draftQueryStatusIndex,
+  );
+  const draftQueryExitIndex = draftRetryBody.indexOf(
+    'exit "$query_status"',
+    draftQueryFailureIndex,
+  );
+  const draftRetrySleepIndex = draftRetryBody.indexOf("sleep 1", draftQueryExitIndex);
+  const draftFailClosedRetrySequence = [
+    "  else",
+    "    query_status=$?",
+    '    if [[ "$query_status" -ne 4 ]]; then',
+    '      exit "$query_status"',
+    "    fi",
+    "  fi",
+    '  echo "Draft not yet visible (attempt $attempt/30); retrying." >&2',
+    "  sleep 1",
+  ].join("\n");
+  const draftIdCheckIndex = draftStep.run.indexOf(
+    '[[ "$draft_id" =~ ^[1-9][0-9]*$ ]]',
+    draftRetryEndIndex,
+  );
+  if (
+    draftCreateIndex < 0 ||
+    draftRetryIndex <= draftCreateIndex ||
+    draftQueryIndex <= draftRetryIndex ||
+    draftFilterIndex <= draftQueryIndex ||
+    draftRetryEndIndex <= draftFilterIndex ||
+    draftIdCheckIndex <= draftRetryEndIndex ||
+    draftQueryStatusIndex < 0 ||
+    draftQueryFailureIndex <= draftQueryStatusIndex ||
+    draftQueryExitIndex <= draftQueryFailureIndex ||
+    draftRetrySleepIndex <= draftQueryExitIndex ||
+    !draftRetryBody.includes(draftFailClosedRetrySequence)
+  ) {
+    throw new Error(
+      "Publication draft lookup must poll boundedly for GitHub release-list visibility and fail closed on query errors.",
     );
   }
   const macosDownloadStep = publishSteps.find(
