@@ -510,7 +510,7 @@ function verifyDraftAdmissionJob(jobs: UnknownRecord): void {
     }
   }
   const preflightValidators = validatorInvocations.filter(({ command }) =>
-    /(?:^|\s)--phase(?:\s+|=)["']?preflight["']?(?=\s|$)/.test(command),
+    /(?:^|\s)--phase(?:\s+\\?\s*|=)["']?preflight["']?(?=\s|[;&|)]|$)/.test(command),
   );
   if (
     preflightValidators.length !== 1 ||
@@ -524,6 +524,15 @@ function verifyDraftAdmissionJob(jobs: UnknownRecord): void {
   if (validatorInvocations.some(({ jobName }) => jobName === "preflight")) {
     throw new Error(
       "Publication read-only preflight must not invoke the GitHub release-state validator.",
+    );
+  }
+  if (
+    validatorInvocations.some(
+      ({ jobName }) => jobName !== "draft_admission" && jobName !== "publish",
+    )
+  ) {
+    throw new Error(
+      "Publication release-state validation must remain in the write-scoped admission or publish job.",
     );
   }
 }

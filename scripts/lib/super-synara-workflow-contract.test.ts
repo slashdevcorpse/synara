@@ -404,6 +404,30 @@ describe("Super Synara workflow contracts", () => {
     expect(() => verifySuperSynaraWorkflowText(alternatePhaseInReadOnlyPreflight, audit)).toThrow(
       "read-only preflight must not invoke the GitHub release-state validator",
     );
+
+    const alternatePhaseInReadOnlyWindows = main.replace(
+      "      - name: Revalidate tagged source",
+      "      - name: Reintroduced native-lane release-state validation\n        shell: bash\n        run: node scripts/verify-super-synara-github-state.ts --phase before-draft\n\n      - name: Revalidate tagged source",
+    );
+    expect(alternatePhaseInReadOnlyWindows).not.toBe(main);
+    expect(() => verifySuperSynaraWorkflowText(alternatePhaseInReadOnlyWindows, audit)).toThrow(
+      "release-state validation must remain in the write-scoped admission or publish job",
+    );
+
+    const publishCheckout = "      - name: Checkout exact source";
+    for (const command of [
+      "node scripts/verify-super-synara-github-state.ts --phase preflight; true",
+      "node scripts/verify-super-synara-github-state.ts \\\n            --phase \\\n            preflight",
+    ]) {
+      const escapedPublicationValidation = main.replace(
+        publishCheckout,
+        `      - name: Reintroduced escaped preflight validation\n        shell: bash\n        run: |\n          ${command}\n\n${publishCheckout}`,
+      );
+      expect(escapedPublicationValidation).not.toBe(main);
+      expect(() => verifySuperSynaraWorkflowText(escapedPublicationValidation, audit)).toThrow(
+        "preflight-phase draft validation must run exactly once in draft admission",
+      );
+    }
   });
 
   it("rejects removal of the reviewed allowlist gate", () => {
