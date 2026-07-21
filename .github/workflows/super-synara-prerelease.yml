@@ -832,16 +832,28 @@ jobs:
             --prerelease \
             --verify-tag \
             --latest=false
-          releases_json="$(
-            gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100"
-          )"
-          draft_id="$(
-            jq -er \
-              --arg tag "$TAG" \
-              --arg source_commit "$SOURCE_COMMIT" \
-              '[.[][] | select(.tag_name == $tag and .draft == true and .prerelease == true and .target_commitish == $source_commit)] | if length == 1 then .[0].id else error("expected one owned draft") end' \
-              <<< "$releases_json"
-          )"
+          draft_id=""
+          for attempt in {1..30}; do
+            releases_json="$(
+              gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100"
+            )"
+            if draft_id="$(
+              jq -er \
+                --arg tag "$TAG" \
+                --arg source_commit "$SOURCE_COMMIT" \
+                '[.[][] | select(.tag_name == $tag and .draft == true and .prerelease == true and .target_commitish == $source_commit)] | if length == 1 then .[0].id elif length == 0 then empty else error("multiple owned drafts") end' \
+                <<< "$releases_json"
+            )"; then
+              break
+            else
+              query_status=$?
+              if [[ "$query_status" -ne 4 ]]; then
+                exit "$query_status"
+              fi
+            fi
+            echo "Draft not yet visible (attempt $attempt/30); retrying." >&2
+            sleep 1
+          done
           [[ "$draft_id" =~ ^[1-9][0-9]*$ ]]
           echo "id=$draft_id" >> "$GITHUB_OUTPUT"
 
