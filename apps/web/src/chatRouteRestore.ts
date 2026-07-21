@@ -12,6 +12,25 @@ export type EmptyRouteRestoreRecoveryState = "idle" | "pending" | "done";
 
 export const EMPTY_ROUTE_RESTORE_FALLBACK_DELAY_MS = 1_800;
 
+export function collectNonStudioThreadIds<TProjectId extends string>(input: {
+  readonly threadIds: readonly string[];
+  readonly threadSummaryById: Readonly<
+    Record<string, { readonly projectId: TProjectId } | undefined>
+  >;
+  readonly studioProjectIds: ReadonlySet<TProjectId>;
+}): Set<string> {
+  const nonStudioThreadIds = new Set<string>();
+  for (const threadId of input.threadIds) {
+    // Fail closed: summaries are built from the same snapshot as threadIds, so an unclassifiable
+    // thread should not keep home out of Workspace or restore into the wrong segment.
+    const summary = input.threadSummaryById[threadId];
+    if (summary !== undefined && !input.studioProjectIds.has(summary.projectId)) {
+      nonStudioThreadIds.add(threadId);
+    }
+  }
+  return nonStudioThreadIds;
+}
+
 export function shouldOpenWorkspaceDashboardOnEmptyHome(input: {
   readonly availableThreadCount: number;
   readonly draftThreadCount: number;

@@ -11,6 +11,7 @@ import {
 } from "../components/RestoreOrCreateChatRoute";
 import { readSidebarUiState } from "../components/Sidebar.uiState";
 import {
+  collectNonStudioThreadIds,
   resolveRestorableThreadRoute,
   shouldOpenWorkspaceDashboardOnEmptyHome,
 } from "../chatRouteRestore";
@@ -39,8 +40,13 @@ function ChatIndexRouteView() {
     chatWorkspaceRoot,
     studioWorkspaceRoot,
   });
+  const nonStudioThreadIds = collectNonStudioThreadIds({
+    threadIds,
+    threadSummaryById: sidebarThreadSummaryById,
+    studioProjectIds,
+  });
   // Fresh unsent chats have a route id but no persisted sidebar summary yet, so the thread-id
-  // filter above never matches them — mirrors the /studio landing's draft handling (and
+  // filter never matches them — mirrors the /studio landing's draft handling (and
   // Sidebar's segment-scoped draft sets) so a cold start on "/" can restore an unsent home draft
   // instead of always minting a new one. Only plain, still-unsent chat drafts qualify: a
   // non-"chat" entry point isn't a home-chat draft, and `promotedTo` means the draft already
@@ -59,7 +65,7 @@ function ChatIndexRouteView() {
   const createFreshChat = async () => {
     if (
       shouldOpenWorkspaceDashboardOnEmptyHome({
-        availableThreadCount: threadIds.length,
+        availableThreadCount: nonStudioThreadIds.size,
         draftThreadCount: nonStudioDraftThreadIds.size,
         lastThreadRoute: readSidebarUiState().lastThreadRoute,
       })
@@ -70,16 +76,7 @@ function ChatIndexRouteView() {
     return handleNewChat({ fresh: true });
   };
   const resolveRestoreRoute: RestoreRouteResolver = ({ availableSplitViewIds }) => {
-    const availableThreadIds = new Set<string>(
-      threadIds.filter((threadId) => {
-        // Fail closed: a thread we can't classify is not restorable from "/". Summaries are
-        // built from the same snapshot as threadIds, so this only ever excludes a thread if
-        // that invariant breaks — and then a fresh draft beats restoring into the wrong
-        // segment.
-        const summary = sidebarThreadSummaryById[threadId];
-        return summary !== undefined && !studioProjectIds.has(summary.projectId);
-      }),
-    );
+    const availableThreadIds = new Set(nonStudioThreadIds);
     for (const draftThreadId of nonStudioDraftThreadIds) {
       availableThreadIds.add(draftThreadId);
     }
