@@ -39,6 +39,27 @@ const releasePlannerScript = readFileSync(
   "utf8",
 ).replaceAll("\r\n", "\n");
 
+function replaceExactWorkflowJobText(
+  workflow: string,
+  jobName: "windows_x64" | "macos_arm64",
+  search: string,
+  replacement: string,
+): string {
+  const jobMarker = `\n  ${jobName}:\n`;
+  const jobStart = workflow.indexOf(jobMarker);
+  if (jobStart < 0) throw new Error(`Missing workflow job: ${jobName}.`);
+
+  const afterMarker = jobStart + jobMarker.length;
+  const nextJobOffset = workflow.slice(afterMarker).search(/\n  [a-z][a-z0-9_]*:\n/);
+  const jobEnd = nextJobOffset < 0 ? workflow.length : afterMarker + nextJobOffset;
+  const jobText = workflow.slice(jobStart, jobEnd);
+  if (jobText.split(search).length !== 2) {
+    throw new Error(`Expected one ${jobName} occurrence of ${search}.`);
+  }
+
+  return `${workflow.slice(0, jobStart)}${jobText.replace(search, replacement)}${workflow.slice(jobEnd)}`;
+}
+
 describe("Super Synara workflow contracts", () => {
   it("admits the controller-called publication and manual audit workflows", () => {
     expect(() => verifySuperSynaraWorkflowContracts(repoRoot)).not.toThrow();
@@ -494,30 +515,25 @@ describe("Super Synara workflow contracts", () => {
   });
 
   it("validates native builds against the admitted draft source without reserving its tag", () => {
-    expect(() =>
-      verifySuperSynaraWorkflowText(
-        main.replace("github-unsigned-prerelease false", "github-unsigned-prerelease true"),
-        audit,
-      ),
-    ).toThrow("without requiring a pre-publication tag");
-    expect(() =>
-      verifySuperSynaraWorkflowText(
-        main.replace(
+    for (const jobName of ["windows_x64", "macos_arm64"] as const) {
+      for (const [search, replacement] of [
+        ["github-unsigned-prerelease false", "github-unsigned-prerelease true"],
+        [
           "      - name: Checkout exact planned source",
           "      - name: Checkout exact tagged source",
-        ),
-        audit,
-      ),
-    ).toThrow("without requiring a pre-publication tag");
-    expect(() =>
-      verifySuperSynaraWorkflowText(
-        main.replace(
+        ],
+        [
           "            github-unsigned-prerelease false",
           "            github-unsigned-prerelease false || true",
-        ),
-        audit,
-      ),
-    ).toThrow("without requiring a pre-publication tag");
+        ],
+      ] as const) {
+        const mutation = replaceExactWorkflowJobText(main, jobName, search, replacement);
+        expect(mutation).not.toBe(main);
+        expect(() => verifySuperSynaraWorkflowText(mutation, audit)).toThrow(
+          "without requiring a pre-publication tag",
+        );
+      }
+    }
   });
 
   it("rejects removal of the reviewed allowlist gate", () => {

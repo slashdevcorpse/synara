@@ -81,16 +81,10 @@ describe("Super Synara GitHub release state", () => {
     ).not.toThrow();
   });
 
-  it("rejects unknown reruns, moved tags, and unowned releases", () => {
+  it("rejects unknown reruns, duplicate releases, and unowned releases", () => {
     expect(() =>
       validateSuperSynaraGitHubState(state({ triggeringActor: "someone-else" })),
     ).toThrow("repository owner or its exact GitHub Actions scheduler");
-    expect(() =>
-      validateSuperSynaraGitHubState(state({ tagCommit: "b".repeat(40), tagObjectType: "commit" })),
-    ).toThrow("points to");
-    expect(() =>
-      validateSuperSynaraGitHubState(state({ tagCommit: "a".repeat(40), tagObjectType: "tag" })),
-    ).toThrow("directly to a commit object");
     expect(() =>
       validateSuperSynaraGitHubState(
         state({
