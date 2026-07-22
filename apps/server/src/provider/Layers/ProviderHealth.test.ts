@@ -124,8 +124,8 @@ const makeCheckClaudeProviderStatus = (
   options?: Parameters<typeof makeProductionCheckClaudeProviderStatus>[3],
 ) =>
   makeProductionCheckClaudeProviderStatus(resolveSubscriptionType, binaryPath, homeDir, {
-    ...options,
     ...TEST_PROVIDER_PROCESS_OPTIONS,
+    ...options,
   });
 const checkClaudeProviderStatus = makeCheckClaudeProviderStatus();
 
