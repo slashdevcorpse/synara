@@ -153,6 +153,13 @@ function fakeElectronApplication(
   } as unknown as ElectronApplication;
 }
 
+function hangingElectronApplication(child: FakeChildProcess): ElectronApplication {
+  return {
+    process: () => child as unknown as ChildProcess,
+    close: vi.fn(() => new Promise<never>(() => undefined)),
+  } as unknown as ElectronApplication;
+}
+
 function windowsProcessRow(input: {
   pid: number;
   parentPid: number;
@@ -170,6 +177,86 @@ function windowsProcessRow(input: {
 }
 
 describe("desktop process teardown orchestration", () => {
+  it("recovers a graceful-close timeout only after verified cleanup removes every process", async () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const child = new FakeChildProcess(91);
+      const root = windowsProcessRow({
+        pid: child.pid,
+        parentPid: 1,
+        startedAt: "2026-07-20T20:00:00.0000000Z",
+        commandFingerprint: "root-command",
+      });
+      let terminated = false;
+      const dependencies: ProcessTreeDependencies = {
+        platform: "win32",
+        readProcessSnapshot: vi.fn(() => (terminated ? [] : [root])),
+        signalProcess: vi.fn(() => {
+          terminated = true;
+        }),
+      };
+
+      const result = closeElectronApplication(hangingElectronApplication(child), dependencies);
+      await vi.runAllTimersAsync();
+
+      await expect(result).resolves.toBeUndefined();
+      expect(dependencies.signalProcess).toHaveBeenCalledWith(root.pid, "SIGKILL");
+      expect(child.kill).not.toHaveBeenCalled();
+      expect(warn).toHaveBeenCalledWith(
+        "[desktop-e2e] Graceful Electron close timed out after 30000ms; identity-verified forced cleanup completed without survivors.",
+      );
+    } finally {
+      warn.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("retains the graceful-close timeout when verified cleanup fails", async () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const child = new FakeChildProcess(96);
+      const root = windowsProcessRow({
+        pid: child.pid,
+        parentPid: 1,
+        startedAt: "2026-07-20T20:00:00.0000000Z",
+        commandFingerprint: "root-command",
+      });
+      const dependencies: ProcessTreeDependencies = {
+        platform: "win32",
+        readProcessSnapshot: vi.fn(() => [root]),
+        signalProcess: vi.fn(() => {
+          throw new Error("signal denied");
+        }),
+      };
+
+      const result = closeElectronApplication(hangingElectronApplication(child), dependencies).then(
+        () => null,
+        (error: unknown) => error,
+      );
+      await vi.runAllTimersAsync();
+
+      const error = await result;
+      expect(error).toBeInstanceOf(AggregateError);
+      const collectMessages = (causes: readonly unknown[]): string[] =>
+        causes.flatMap((cause) =>
+          cause instanceof AggregateError
+            ? [cause.message, ...collectMessages(cause.errors)]
+            : [cause instanceof Error ? cause.message : String(cause)],
+        );
+      const messages = collectMessages((error as AggregateError).errors);
+      expect(messages).toContain("Timed out while closing the Electron application.");
+      expect(messages.some((message) => message.includes("signal denied"))).toBe(true);
+      expect(warn).not.toHaveBeenCalledWith(
+        expect.stringContaining("identity-verified forced cleanup completed"),
+      );
+    } finally {
+      warn.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
   it("does not signal the child handle when later identity snapshots fail", async () => {
     const child = new FakeChildProcess(101);
     const root = windowsProcessRow({

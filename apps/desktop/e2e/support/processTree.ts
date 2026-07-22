@@ -745,6 +745,7 @@ export async function closeElectronApplication(
   }
   const cleanProcessExit = observeCleanProcessExit(electronProcess);
   let timeout: NodeJS.Timeout | undefined;
+  let gracefulCloseTimeoutError: Error | null = null;
   let playwrightCloseRejected = false;
   let playwrightCloseError: unknown;
   const playwrightClose = electronApp.close().catch((error: unknown) => {
@@ -760,15 +761,18 @@ export async function closeElectronApplication(
       playwrightClose,
       cleanProcessExit.promise,
       new Promise<never>((_resolve, reject) => {
-        timeout = setTimeout(
-          () => reject(new Error("Timed out while closing the Electron application.")),
-          GRACEFUL_CLOSE_TIMEOUT_MS,
-        );
+        const timeoutError = new Error("Timed out while closing the Electron application.");
+        timeout = setTimeout(() => {
+          gracefulCloseTimeoutError = timeoutError;
+          reject(timeoutError);
+        }, GRACEFUL_CLOSE_TIMEOUT_MS);
         timeout.unref();
       }),
     ]);
   } catch (error) {
-    errors.push(error);
+    if (error !== gracefulCloseTimeoutError) {
+      errors.push(error);
+    }
   } finally {
     if (timeout) clearTimeout(timeout);
     cleanProcessExit.dispose();
@@ -785,6 +789,15 @@ export async function closeElectronApplication(
       await forceTerminateChildHandle(electronProcess, rootProcess, dependencies);
     } catch (error) {
       errors.push(error);
+    }
+  }
+  if (gracefulCloseTimeoutError) {
+    if (errors.length === 0 && rootProcess) {
+      console.warn(
+        `[desktop-e2e] Graceful Electron close timed out after ${GRACEFUL_CLOSE_TIMEOUT_MS}ms; identity-verified forced cleanup completed without survivors.`,
+      );
+    } else {
+      errors.unshift(gracefulCloseTimeoutError);
     }
   }
   if (playwrightCloseRejected && errors.length > 0) {
