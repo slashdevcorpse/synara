@@ -9,6 +9,8 @@ import {
   canonicalizeRegistryQueryOutput,
   createSilentInstallerCommand,
   createWindowsRegistrationTargets,
+  NSIS_INSTALL_TIMEOUT_MS,
+  NSIS_UNINSTALL_TIMEOUT_MS,
   parseRegistryQueryOutput,
   parseWindowsExecutableCommandLine,
   qualifySuperSynaraWindowsInstaller,
@@ -242,6 +244,8 @@ describe("Windows installer qualification primitives", () => {
     expect(command.command).toBe("C:\\artifacts\\Super Synara.exe");
     expect(command.args).toEqual(["/S", "/D=C:\\isolated root\\Super Synara"]);
     expect(command.env?.PATH).toBe("C:\\Windows");
+    expect(command.phase).toBe("install");
+    expect(command.timeoutMs).toBe(NSIS_INSTALL_TIMEOUT_MS);
   });
 
   it("does not wait on output handles inherited by a successful installer descendant", () => {
@@ -273,6 +277,7 @@ describe("Windows installer qualification primitives", () => {
             SYNARA_QUALIFICATION_DESCENDANT_PID_PATH: childPidPath,
           },
           timeoutMs: 5_000,
+          phase: "install",
           label: "installer descendant fixture",
         }),
       ).not.toThrow();
@@ -291,24 +296,55 @@ describe("Windows installer qualification primitives", () => {
     if (cleanupError !== undefined) throw cleanupError;
   });
 
+  it("reports bounded native command phase, completion, and elapsed diagnostics", () => {
+    const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    try {
+      runNativeWindowsCommand({
+        command: process.execPath,
+        args: ["-e", "process.exit(0)"],
+        timeoutMs: 5_000,
+        phase: "install",
+        label: "diagnostic installer fixture",
+      });
+      expect(info.mock.calls).toEqual([
+        [
+          '[windows-installer-qualification] phase=install status=started label="diagnostic installer fixture" timeoutMs=5000',
+        ],
+        [
+          expect.stringMatching(
+            /^\[windows-installer-qualification\] phase=install status=completed label="diagnostic installer fixture" exit=0 elapsedMs=\d+ timeoutMs=5000$/,
+          ),
+        ],
+      ]);
+    } finally {
+      info.mockRestore();
+    }
+  });
+
   it("fails closed when a native installer command times out or exits unsuccessfully", () => {
     expect(() =>
       runNativeWindowsCommand({
         command: process.execPath,
         args: ["-e", "setTimeout(() => {}, 2000)"],
         timeoutMs: 100,
+        phase: "install",
         label: "timed-out installer fixture",
       }),
-    ).toThrow("timed-out installer fixture could not complete");
+    ).toThrow(
+      /timed-out installer fixture could not complete \(phase=install, elapsedMs=\d+, timeoutMs=100\):/,
+    );
 
     expect(() =>
       runNativeWindowsCommand({
         command: process.execPath,
         args: ["-e", "process.exit(7)"],
         timeoutMs: 5_000,
+        phase: "uninstall",
         label: "failed installer fixture",
       }),
-    ).toThrow("failed installer fixture failed with exit 7");
+    ).toThrow(
+      /failed installer fixture failed with exit 7 \(phase=uninstall, elapsedMs=\d+, timeoutMs=5000\)\./,
+    );
   });
 
   it("parses typed registry values and quoted uninstall commands", () => {
@@ -438,6 +474,13 @@ describe("Super Synara Windows installer qualification", () => {
       "silent installer Super-Synara-0.5.5-super.2-windows-x64-unsigned.exe",
       "silent Super Synara uninstaller",
       "silent Synara uninstaller",
+    ]);
+    expect(runtime.commands.map(({ phase, timeoutMs }) => ({ phase, timeoutMs }))).toEqual([
+      { phase: "install", timeoutMs: NSIS_INSTALL_TIMEOUT_MS },
+      { phase: "install", timeoutMs: NSIS_INSTALL_TIMEOUT_MS },
+      { phase: "install", timeoutMs: NSIS_INSTALL_TIMEOUT_MS },
+      { phase: "uninstall", timeoutMs: NSIS_UNINSTALL_TIMEOUT_MS },
+      { phase: "uninstall", timeoutMs: NSIS_UNINSTALL_TIMEOUT_MS },
     ]);
   });
 
