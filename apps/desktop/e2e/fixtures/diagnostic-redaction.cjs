@@ -1,5 +1,5 @@
 // FILE: diagnostic-redaction.cjs
-// Purpose: Removes URL credentials and query values before desktop E2E diagnostics are persisted.
+// Purpose: Redacts operational desktop E2E logs before their isolated, short-lived persistence.
 
 "use strict";
 
@@ -8,7 +8,7 @@ const Path = require("node:path");
 
 const URL_IN_TEXT_PATTERN = /\b(?:https?|wss?|super-synara):\/\/[^\s"'<>]+/giu;
 const SENSITIVE_QUERY_VALUE_PATTERN =
-  /([?&](?:access_token|api_key|auth_token|authorization|token)=)[^&#\s"'<>]*/giu;
+  /([?&](?:access_token|api_key|api_token|auth_token|authorization|client_secret|code|csrf_token|id_token|refresh_token|session|state|token)=)[^&#\s"'<>]*/giu;
 
 function redactSensitiveQueryValues(value) {
   return value.replace(SENSITIVE_QUERY_VALUE_PATTERN, "$1[REDACTED]");

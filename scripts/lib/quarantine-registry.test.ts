@@ -1,14 +1,18 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
+import { spawnSync } from "node:child_process";
 
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
+  createQuarantineInventoryEnvironment,
   formatQuarantineSummary,
+  parseVitestQuarantineInventory,
   QUARANTINE_PLATFORMS,
   quarantineTestNamePattern,
   quarantineSuitesForPlatform,
+  validateQuarantineCaseInventory,
   validateQuarantineRegistry,
 } from "./quarantine-registry";
 
@@ -48,6 +52,32 @@ afterEach(() => {
 });
 
 describe("quarantine registry", () => {
+  it("isolates route generation and removes inherited case variants", () => {
+    const generatedRouteTreePath = resolve(tmpdir(), "quarantine-route-tree", "routeTree.gen.ts");
+    const environment = createQuarantineInventoryEnvironment(
+      {
+        PATH: "inherited-path",
+        SYNARA_GENERATED_ROUTE_TREE: "stale-exact-path",
+        synara_generated_route_tree: "stale-lowercase-path",
+        Synara_Generated_Route_Tree: "stale-mixed-case-path",
+      },
+      generatedRouteTreePath,
+    );
+
+    expect(environment).toMatchObject({
+      PATH: "inherited-path",
+      CI: "true",
+      FORCE_COLOR: "0",
+      NO_COLOR: "1",
+      SYNARA_GENERATED_ROUTE_TREE: generatedRouteTreePath,
+    });
+    expect(environment.synara_generated_route_tree).toBeUndefined();
+    expect(environment.Synara_Generated_Route_Tree).toBeUndefined();
+    expect(() =>
+      createQuarantineInventoryEnvironment({}, "relative/routeTree.gen.ts"),
+    ).toThrow("absolute generated route-tree path");
+  });
+
   it("accepts a deterministic registry whose marker exists in the declared source", () => {
     const { root, source } = fixture();
     const result = validateQuarantineRegistry(source, {
@@ -59,6 +89,183 @@ describe("quarantine registry", () => {
     expect(result.registry?.entries).toHaveLength(1);
     expect(quarantineSuitesForPlatform(result.registry!, "windows")).toEqual(["browser-geometry"]);
     expect(QUARANTINE_PLATFORMS).toEqual(["linux", "windows"]);
+  });
+
+  it("requires the declared case count to equal Vitest-collected leaf tests", () => {
+    const { root, source } = fixture();
+    const registry = validateQuarantineRegistry(source, {
+      repositoryRoot: root,
+      today: "2026-07-20",
+    }).registry!;
+    const entry = registry.entries[0]!;
+    const inventory = Array.from({ length: 11 }, (_, index) => ({
+      path: entry.path,
+      fullName: `suite ${entry.marker} case ${index + 1}`,
+    }));
+
+    expect(validateQuarantineCaseInventory(registry, inventory)).toEqual([]);
+    expect(
+      validateQuarantineCaseInventory(registry, [
+        ...inventory,
+        { path: entry.path, fullName: `suite ${entry.marker} case 12` },
+      ]),
+    ).toContain(
+      "Quarantine entry `web-geometry` declares 11 case(s), but Vitest collected 12.",
+    );
+    expect(validateQuarantineCaseInventory(registry, [])).toContain(
+      "Quarantine entry `web-geometry` declares 11 case(s), but Vitest collected 0.",
+    );
+  });
+
+  it("counts marked describe and it.each expansions by collected leaf name", () => {
+    const { root, source } = fixture();
+    const parsed = validateQuarantineRegistry(source, {
+      repositoryRoot: root,
+      today: "2026-07-20",
+    }).registry!;
+    const entry = parsed.entries[0]!;
+    const registry = {
+      ...parsed,
+      entries: [{ ...entry, platform: ["windows"] as const, cases: 3 }],
+    };
+    const inventory = [
+      { path: entry.path, fullName: `${entry.marker} marked suite > child one` },
+      { path: entry.path, fullName: `${entry.marker} marked suite > child two` },
+      { path: entry.path, fullName: `suite > ${entry.marker} row three` },
+    ];
+
+    expect(validateQuarantineCaseInventory(registry, inventory)).toEqual([]);
+  });
+
+  it("rejects collected markers from the wrong file or without a registry entry", () => {
+    const { root, source } = fixture();
+    const registry = validateQuarantineRegistry(source, {
+      repositoryRoot: root,
+      today: "2026-07-20",
+    }).registry!;
+    const entry = registry.entries[0]!;
+    const errors = validateQuarantineCaseInventory(registry, [
+      { path: "apps/web/src/wrong.browser.tsx", fullName: `suite ${entry.marker} child` },
+      {
+        path: entry.path,
+        fullName: `suite ${quarantineMarker("unregistered-collected")} child`,
+      },
+    ]);
+
+    expect(errors).toEqual(
+      expect.arrayContaining([
+        `Quarantine marker ${entry.marker} was collected in apps/web/src/wrong.browser.tsx, not ${entry.path}.`,
+        `Unregistered quarantine marker ${quarantineMarker("unregistered-collected")} collected in ${entry.path}.`,
+        "Quarantine entry `web-geometry` declares 11 case(s), but Vitest collected 0.",
+      ]),
+    );
+  });
+
+  it("fails closed for malformed, unsuccessful, and timed-out Vitest inventory output", () => {
+    const { root } = fixture();
+    expect(() =>
+      parseVitestQuarantineInventory(
+        { status: 0, stdout: "not json", stderr: "" },
+        { repositoryRoot: root },
+      ),
+    ).toThrow("did not return valid JSON");
+    expect(() =>
+      parseVitestQuarantineInventory(
+        { status: 1, stdout: "", stderr: "collection failed" },
+        { repositoryRoot: root },
+      ),
+    ).toThrow("exited with status 1");
+    expect(() =>
+      parseVitestQuarantineInventory(
+        {
+          error: Object.assign(new Error("timed out"), { code: "ETIMEDOUT" }),
+          status: null,
+          stdout: "",
+          stderr: "",
+        },
+        { repositoryRoot: root },
+      ),
+    ).toThrow("collection timed out");
+  });
+
+  it("parses Vitest's complete JSON array after Vite optimizer logs", () => {
+    const { root } = fixture();
+    const file = resolve(root, "apps/web/src/example.browser.tsx");
+    const stdout = [
+      "3:50:13 p.m. [vite] (client) Re-optimizing dependencies because vite config has changed",
+      "3:50:16 p.m. [vite] (client) [optimizer] bundling dependencies...",
+      JSON.stringify([{ name: `${quarantineMarker("web-geometry")} case`, file }], null, 2),
+      "",
+    ].join("\n");
+
+    expect(
+      parseVitestQuarantineInventory(
+        { status: 0, stdout, stderr: "a non-fatal Vite warning" },
+        { repositoryRoot: root },
+      ),
+    ).toEqual([
+      {
+        path: "apps/web/src/example.browser.tsx",
+        fullName: `${quarantineMarker("web-geometry")} case`,
+      },
+    ]);
+    expect(() =>
+      parseVitestQuarantineInventory(
+        { status: 0, stdout: `${stdout}unexpected trailing output`, stderr: "" },
+        { repositoryRoot: root },
+      ),
+    ).toThrow("did not return valid JSON");
+  });
+
+  it("uses pinned Vitest collection to expand each row into a separate case", () => {
+    const root = mkdtempSync(resolve(tmpdir(), "synara-quarantine-inventory-"));
+    roots.push(root);
+    const marker = quarantineMarker("expanded-rows");
+    const testPath = resolve(root, "expanded.test.ts");
+    writeFileSync(
+      testPath,
+      `it.each(["one", "two", "three"])(${JSON.stringify(`${marker} row %s`)}, () => {});`,
+    );
+    const vitestCli = resolve(__dirname, "../../node_modules/vitest/vitest.mjs");
+    const result = spawnSync(
+      process.execPath,
+      [vitestCli, "list", testPath, "--root", root, "--globals", "--json"],
+      {
+        cwd: root,
+        encoding: "utf8",
+        env: { ...process.env, CI: "true", FORCE_COLOR: "0", NO_COLOR: "1" },
+        timeout: 30_000,
+        windowsHide: true,
+      },
+    );
+    const inventory = parseVitestQuarantineInventory(
+      {
+        ...(result.error ? { error: result.error } : {}),
+        status: result.status,
+        stdout: result.stdout ?? "",
+        stderr: result.stderr ?? "",
+      },
+      { repositoryRoot: root },
+    );
+    const registry = {
+      schemaVersion: 1 as const,
+      entries: [
+        {
+          id: "expanded-rows",
+          path: "expanded.test.ts",
+          marker,
+          suite: "browser-geometry" as const,
+          platform: ["linux", "windows"] as const,
+          reason: "Expanded rows verify collected inventory counts.",
+          owner: "web/test-infrastructure",
+          lastFlaked: "2026-07-01",
+          cases: 3,
+        },
+      ],
+    };
+
+    expect(inventory).toHaveLength(3);
+    expect(validateQuarantineCaseInventory(registry, inventory)).toEqual([]);
   });
 
   it("rejects future dates, unsupported platforms, and markers that do not match the id", () => {
@@ -170,6 +377,27 @@ describe("quarantine registry", () => {
     );
   });
 
+  it("rejects registered files reached through a repository-escaping symlink", () => {
+    const { root, source } = fixture();
+    const outsideRoot = mkdtempSync(resolve(tmpdir(), "synara-quarantine-outside-"));
+    roots.push(outsideRoot);
+    writeFileSync(
+      resolve(outsideRoot, "escaped.browser.tsx"),
+      `it(${JSON.stringify(`${quarantineMarker("web-geometry")} escaped`)}, () => {});`,
+    );
+    const linkedDirectory = resolve(root, "apps/web/escaped");
+    symlinkSync(outsideRoot, linkedDirectory, process.platform === "win32" ? "junction" : "dir");
+    const linkedSource = source.replace(
+      "apps/web/src/example.browser.tsx",
+      "apps/web/escaped/escaped.browser.tsx",
+    );
+
+    expect(
+      validateQuarantineRegistry(linkedSource, { repositoryRoot: root, today: "2026-07-20" })
+        .errors,
+    ).toContain("Quarantine entry `web-geometry` escapes the repository root.");
+  });
+
   it("derives platform-scoped stable and quarantine selectors for every registered marker", () => {
     const { root, source } = fixture();
     writeFileSync(
@@ -206,6 +434,26 @@ describe("quarantine registry", () => {
     expect(windowsStable.test(`suite ${quarantineMarker("web-windows-only")}`)).toBe(false);
     expect(windowsQuarantine.test(`suite ${quarantineMarker("web-geometry")}`)).toBe(true);
     expect(windowsQuarantine.test(`suite ${quarantineMarker("web-windows-only")}`)).toBe(true);
+    expect(linuxStable.test("suite title\nwithout a quarantine marker")).toBe(true);
+    expect(linuxStable.test(`suite title\n${quarantineMarker("web-geometry")}`)).toBe(false);
+  });
+
+  it("rejects conflicting repeated platform flags", () => {
+    const result = spawnSync(
+      process.execPath,
+      [
+        resolve(__dirname, "../quarantine-registry.ts"),
+        "validate",
+        "--platform",
+        "linux",
+        "--platform",
+        "windows",
+      ],
+      { encoding: "utf8" },
+    );
+
+    expect(result.status).not.toBe(0);
+    expect(`${result.stdout}${result.stderr}`).toContain("Usage:");
   });
 
   it("rejects an unregistered quarantine marker discovered in another test source", () => {

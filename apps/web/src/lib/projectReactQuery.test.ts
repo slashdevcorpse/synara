@@ -2,11 +2,61 @@ import { describe, expect, it } from "vitest";
 
 import {
   isLocalPreviewGrantUsable,
+  isProjectReadFileCapacityError,
   LOCAL_PREVIEW_GRANT_MAX_REFETCH_INTERVAL_MS,
   localPreviewGrantRefetchIntervalMs,
   projectLocalHtmlPreviewGrantQueryOptions,
   projectLocalPreviewGrantQueryOptions,
+  projectReadFileQueryOptions,
 } from "./projectReactQuery";
+
+describe("project file-read query options", () => {
+  const capacityError = Object.assign(new Error("capacity exceeded"), {
+    code: "RPC_EXPENSIVE_READ_CAPACITY_EXCEEDED",
+    retryable: true,
+  });
+
+  it("recognizes direct and wrapped retryable capacity errors", () => {
+    expect(isProjectReadFileCapacityError(capacityError)).toBe(true);
+    expect(isProjectReadFileCapacityError(new Error("wrapped", { cause: capacityError }))).toBe(
+      true,
+    );
+    expect(
+      isProjectReadFileCapacityError({
+        code: "RPC_EXPENSIVE_READ_CAPACITY_EXCEEDED",
+        retryable: false,
+      }),
+    ).toBe(false);
+  });
+
+  it("retries transient capacity errors longer than generic failures", () => {
+    const options = projectReadFileQueryOptions({ cwd: "C:/workspace", relativePath: "README.md" });
+    const retry = options.retry;
+    expect(typeof retry).toBe("function");
+    if (typeof retry !== "function") {
+      throw new Error("Expected retry to be a function.");
+    }
+
+    expect(retry(11, capacityError)).toBe(true);
+    expect(retry(12, capacityError)).toBe(false);
+    expect(retry(2, new Error("disk failure"))).toBe(true);
+    expect(retry(3, new Error("disk failure"))).toBe(false);
+  });
+
+  it("uses bounded backoff for transient capacity errors", () => {
+    const options = projectReadFileQueryOptions({ cwd: "C:/workspace", relativePath: "README.md" });
+    const retryDelay = options.retryDelay;
+    expect(typeof retryDelay).toBe("function");
+    if (typeof retryDelay !== "function") {
+      throw new Error("Expected retryDelay to be a function.");
+    }
+
+    expect(retryDelay(0, capacityError)).toBe(250);
+    expect(retryDelay(8, capacityError)).toBe(2_000);
+    expect(retryDelay(0, new Error("disk failure"))).toBe(1_000);
+    expect(retryDelay(8, new Error("disk failure"))).toBe(30_000);
+  });
+});
 
 describe("local preview grant query options", () => {
   it("refreshes active preview grants before the server-side token expires", () => {

@@ -792,13 +792,7 @@ export async function closeElectronApplication(
     }
   }
   if (gracefulCloseTimeoutError) {
-    if (errors.length === 0 && rootProcess) {
-      console.warn(
-        `[desktop-e2e] Graceful Electron close timed out after ${GRACEFUL_CLOSE_TIMEOUT_MS}ms; identity-verified forced cleanup completed without survivors.`,
-      );
-    } else {
-      errors.unshift(gracefulCloseTimeoutError);
-    }
+    errors.unshift(gracefulCloseTimeoutError);
   }
   if (playwrightCloseRejected && errors.length > 0) {
     errors.push(playwrightCloseError);

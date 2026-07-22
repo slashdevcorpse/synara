@@ -140,7 +140,7 @@ describe("projectCreateRecovery", () => {
     expect(recovered?.id).toBe("project-123");
   });
 
-  it("ignores deleted and non-project rows during recovery", () => {
+  it("ignores archived, deleted, and non-project rows during recovery", () => {
     const recovered = findRecoverableProjectForDuplicateCreate({
       message:
         "Orchestration command invariant failed (project.create): Project 'project-123' already uses workspace root '/Users/tester/Code/one'.",
@@ -156,6 +156,13 @@ describe("projectCreateRecovery", () => {
           kind: "project",
           workspaceRoot: "/Users/tester/Code/one",
           deletedAt: "2026-04-18T10:00:00.000Z",
+        },
+        {
+          id: "project-archived",
+          kind: "project",
+          workspaceRoot: "/Users/tester/Code/one",
+          deletedAt: null,
+          archivedAt: "2026-04-18T10:00:00.000Z",
         },
       ],
       workspaceRoot: "/Users/tester/Code/one",

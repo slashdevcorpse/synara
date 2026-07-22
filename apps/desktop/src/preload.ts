@@ -16,7 +16,6 @@ function getDesktopWsUrl(): string | null {
 
 contextBridge.exposeInMainWorld("desktopBridge", {
   getWsUrl: getDesktopWsUrl,
-  isE2eHarness: process.env.SYNARA_E2E_DESKTOP_MAIN_PATH !== undefined,
   // Absolute path for OS-dropped File objects (folders with spaces/parens, etc.).
   getPathForFile: (file: File) => {
     try {

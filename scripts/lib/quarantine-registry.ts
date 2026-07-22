@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
 
 import { parse as parseYaml } from "yaml";
@@ -30,9 +30,41 @@ export interface QuarantineValidationResult {
   readonly errors: readonly string[];
 }
 
+export interface QuarantineTestInventoryItem {
+  readonly path: string;
+  readonly fullName: string;
+}
+
+export interface VitestInventoryProcessResult {
+  readonly error?: NodeJS.ErrnoException | undefined;
+  readonly status: number | null;
+  readonly stdout: string;
+  readonly stderr: string;
+}
+
 export interface QuarantineSummaryBaseline {
   readonly ref: string;
   readonly registry: QuarantineRegistry;
+}
+
+export function createQuarantineInventoryEnvironment(
+  baseEnvironment: NodeJS.ProcessEnv,
+  generatedRouteTreePath: string,
+): NodeJS.ProcessEnv {
+  if (!isAbsolute(generatedRouteTreePath)) {
+    throw new Error("Quarantine inventory requires an absolute generated route-tree path.");
+  }
+  const environment = { ...baseEnvironment };
+  for (const key of Object.keys(environment)) {
+    if (key.toUpperCase() === "SYNARA_GENERATED_ROUTE_TREE") delete environment[key];
+  }
+  return {
+    ...environment,
+    CI: "true",
+    FORCE_COLOR: "0",
+    NO_COLOR: "1",
+    SYNARA_GENERATED_ROUTE_TREE: generatedRouteTreePath,
+  };
 }
 
 const ENTRY_KEYS = new Set([
@@ -97,8 +129,12 @@ function sourceFiles(directory: string): readonly string[] {
   return files;
 }
 
+function markersInText(value: string): readonly string[] {
+  return [...value.matchAll(MARKER_PATTERN)].map((match) => match[0]);
+}
+
 function readMarkers(path: string): readonly string[] {
-  return [...readFileSync(path, "utf8").matchAll(MARKER_PATTERN)].map((match) => match[0]);
+  return markersInText(readFileSync(path, "utf8"));
 }
 
 export function validateQuarantineRegistry(
@@ -225,6 +261,7 @@ export function validateQuarantineRegistry(
   }
 
   if (options.validateSources !== false) {
+    const canonicalRepositoryRoot = realpathSync(repositoryRoot);
     const registeredMarkers = new Map(entries.map((entry) => [entry.marker, entry] as const));
     for (const entry of entries) {
       const absolutePath = resolve(repositoryRoot, entry.path);
@@ -232,6 +269,8 @@ export function validateQuarantineRegistry(
         errors.push(`Quarantine entry \`${entry.id}\` escapes the repository root.`);
       } else if (!existsSync(absolutePath)) {
         errors.push(`Quarantine entry \`${entry.id}\` path does not exist: ${entry.path}.`);
+      } else if (!isWithinRepository(canonicalRepositoryRoot, realpathSync(absolutePath))) {
+        errors.push(`Quarantine entry \`${entry.id}\` escapes the repository root.`);
       } else if (!statSync(absolutePath).isFile()) {
         errors.push(`Quarantine entry \`${entry.id}\` path is not a file: ${entry.path}.`);
       } else if (!readFileSync(absolutePath, "utf8").includes(entry.marker)) {
@@ -259,6 +298,107 @@ export function validateQuarantineRegistry(
     registry: errors.length === 0 ? { schemaVersion: 1, entries } : null,
     errors,
   };
+}
+
+export function validateQuarantineCaseInventory(
+  registry: QuarantineRegistry,
+  inventory: readonly QuarantineTestInventoryItem[],
+): readonly string[] {
+  const errors: string[] = [];
+  const entriesByMarker = new Map(registry.entries.map((entry) => [entry.marker, entry] as const));
+  const collectedCases = new Map(registry.entries.map((entry) => [entry.id, 0] as const));
+
+  for (const item of inventory) {
+    const markers = [...new Set(markersInText(item.fullName))];
+    for (const marker of markers) {
+      const entry = entriesByMarker.get(marker);
+      if (!entry) {
+        errors.push(`Unregistered quarantine marker ${marker} collected in ${item.path}.`);
+        continue;
+      }
+      if (entry.path !== item.path) {
+        errors.push(
+          `Quarantine marker ${marker} was collected in ${item.path}, not ${entry.path}.`,
+        );
+        continue;
+      }
+      collectedCases.set(entry.id, (collectedCases.get(entry.id) ?? 0) + 1);
+    }
+  }
+
+  for (const entry of registry.entries) {
+    const collected = collectedCases.get(entry.id) ?? 0;
+    if (collected !== entry.cases) {
+      errors.push(
+        `Quarantine entry \`${entry.id}\` declares ${entry.cases} case(s), but Vitest collected ${collected}.`,
+      );
+    }
+  }
+
+  return errors;
+}
+
+export function parseVitestQuarantineInventory(
+  result: VitestInventoryProcessResult,
+  options: { readonly repositoryRoot: string },
+): readonly QuarantineTestInventoryItem[] {
+  if (result.error) {
+    if (result.error.code === "ETIMEDOUT") {
+      throw new Error("Vitest quarantine inventory collection timed out.", { cause: result.error });
+    }
+    throw new Error("Vitest quarantine inventory collection failed to start.", {
+      cause: result.error,
+    });
+  }
+  if (result.status !== 0) {
+    const detail = result.stderr.trim() || result.stdout.trim() || "No process output.";
+    throw new Error(
+      `Vitest quarantine inventory collection exited with status ${String(result.status)}: ${detail}`,
+    );
+  }
+
+  let document: unknown;
+  try {
+    document = JSON.parse(result.stdout);
+  } catch (directParseError) {
+    const candidateStarts = [...result.stdout.matchAll(/\r?\n(?=\[)/g)].map(
+      (match) => match.index + match[0].length,
+    );
+    for (const start of candidateStarts.reverse()) {
+      try {
+        const candidate = JSON.parse(result.stdout.slice(start).trim());
+        if (Array.isArray(candidate)) {
+          document = candidate;
+          break;
+        }
+      } catch {
+        // Keep searching for Vitest's complete JSON-array suffix after Vite startup logs.
+      }
+    }
+    if (document === undefined) {
+      throw new Error("Vitest quarantine inventory did not return valid JSON.", {
+        cause: directParseError,
+      });
+    }
+  }
+  if (!Array.isArray(document)) {
+    throw new Error("Vitest quarantine inventory JSON must be an array.");
+  }
+
+  const repositoryRoot = resolve(options.repositoryRoot);
+  return document.map((value, index) => {
+    if (!isRecord(value) || typeof value.name !== "string" || typeof value.file !== "string") {
+      throw new Error(`Vitest quarantine inventory item ${index + 1} is invalid.`);
+    }
+    const absolutePath = resolve(value.file);
+    if (!isWithinRepository(repositoryRoot, absolutePath)) {
+      throw new Error(`Vitest quarantine inventory item ${index + 1} escapes the repository root.`);
+    }
+    return {
+      path: relative(repositoryRoot, absolutePath).replaceAll("\\", "/"),
+      fullName: value.name,
+    };
+  });
 }
 
 export function quarantineSuitesForPlatform(
@@ -297,9 +437,11 @@ export function quarantineTestNamePattern(
   mode: "stable" | "quarantine",
 ): RegExp {
   const markers = quarantineMarkersForPlatform(registry, platform).map(escapeRegExp);
-  if (markers.length === 0) return mode === "stable" ? /.*/ : /$a/;
+  if (markers.length === 0) return mode === "stable" ? /.*/su : /$a/su;
   const markerPattern = `(?:${markers.join("|")})`;
-  return mode === "stable" ? new RegExp(`^(?!.*${markerPattern}).*$`) : new RegExp(markerPattern);
+  return mode === "stable"
+    ? new RegExp(`^(?!.*${markerPattern}).*$`, "su")
+    : new RegExp(markerPattern, "su");
 }
 
 export function formatQuarantineSummary(

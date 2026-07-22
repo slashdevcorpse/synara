@@ -16,13 +16,11 @@ export default defineConfig({
   },
   globalSetup: Path.join(__dirname, "global-setup.ts"),
   outputDir: Path.resolve(__dirname, "../test-results"),
-  reporter: [
-    ["line"],
-    ["html", { outputFolder: Path.resolve(__dirname, "../playwright-report"), open: "never" }],
-  ],
+  preserveOutput: "never",
+  reporter: [["line"]],
   use: {
-    trace: "retain-on-failure",
-    screenshot: "only-on-failure",
+    trace: "off",
+    screenshot: "off",
     video: "off",
   },
 });

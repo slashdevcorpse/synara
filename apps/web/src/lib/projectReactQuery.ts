@@ -59,6 +59,7 @@ const DEFAULT_DISCOVER_SCRIPTS_STALE_TIME = 30_000;
 const DEFAULT_SEARCH_LOCAL_ENTRIES_LIMIT = 50;
 const DEFAULT_SEARCH_LOCAL_ENTRIES_STALE_TIME = 10_000;
 const DEFAULT_READ_FILE_STALE_TIME = 5_000;
+const PROJECT_READ_FILE_CAPACITY_RETRY_LIMIT = 12;
 const LOCAL_PREVIEW_GRANT_REFRESH_SAFETY_MS = 15_000;
 const LOCAL_PREVIEW_GRANT_MIN_REFETCH_INTERVAL_MS = 1_000;
 export const LOCAL_PREVIEW_GRANT_MAX_REFETCH_INTERVAL_MS = 30_000;
@@ -74,6 +75,23 @@ const EMPTY_SEARCH_LOCAL_ENTRIES_RESULT: ProjectSearchLocalEntriesResult = {
   truncated: false,
 };
 const ABSOLUTE_LOCAL_READ_CWD = "/";
+
+export function isProjectReadFileCapacityError(error: unknown): boolean {
+  const seen = new Set<object>();
+  let current: unknown = error;
+  while (typeof current === "object" && current !== null && !seen.has(current)) {
+    seen.add(current);
+    const candidate = current as { code?: unknown; retryable?: unknown; cause?: unknown };
+    if (
+      candidate.code === "RPC_EXPENSIVE_READ_CAPACITY_EXCEEDED" &&
+      candidate.retryable === true
+    ) {
+      return true;
+    }
+    current = candidate.cause;
+  }
+  return false;
+}
 
 export function isLocalPreviewGrantUsable(
   grant: Pick<ProjectCreateLocalFilePreviewGrantResult, "expiresAt"> | null | undefined,
@@ -161,6 +179,16 @@ export function projectReadFileQueryOptions(input: {
     },
     enabled: (input.enabled ?? true) && effectiveCwd !== null && input.relativePath !== null,
     staleTime: input.staleTime ?? DEFAULT_READ_FILE_STALE_TIME,
+    retry: (failureCount, error) => {
+      const retryLimit = isProjectReadFileCapacityError(error)
+        ? PROJECT_READ_FILE_CAPACITY_RETRY_LIMIT
+        : 3;
+      return failureCount < retryLimit;
+    },
+    retryDelay: (attempt, error) =>
+      isProjectReadFileCapacityError(error)
+        ? Math.min(2_000, 250 * 2 ** attempt)
+        : Math.min(30_000, 1_000 * 2 ** attempt),
   });
 }
 

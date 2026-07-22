@@ -4,11 +4,29 @@
 "use strict";
 
 const Net = require("node:net");
+const FS = require("node:fs");
+const Path = require("node:path");
 const { appendRedactedJsonLine } = require("./diagnostic-redaction.cjs");
+const { isLoopbackHost, normalizeHost } = require("./loopback.cjs");
 
 const INSTALL_KEY = Symbol.for("synara.e2e.networkGuard.installed");
+
+function fakeCodexSidecarNetworkLogPath() {
+  const runtimePath = process.argv[1];
+  if (!runtimePath || !/fake-codex-runtime\.mjs$/iu.test(runtimePath)) return undefined;
+  try {
+    const configPath = Path.join(Path.dirname(runtimePath), "fake-codex-config.json");
+    const config = JSON.parse(FS.readFileSync(configPath, "utf8"));
+    return typeof config.networkLogPath === "string" ? config.networkLogPath : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 const networkLogPath =
-  process.env.SYNARA_FAKE_CODEX_NETWORK_LOG_PATH ?? process.env.SYNARA_E2E_NETWORK_LOG_PATH;
+  process.env.SYNARA_FAKE_CODEX_NETWORK_LOG_PATH ??
+  process.env.SYNARA_E2E_NETWORK_LOG_PATH ??
+  fakeCodexSidecarNetworkLogPath();
 
 function networkRole() {
   if (process.env.SYNARA_E2E_NETWORK_ROLE === "approval-child") return "approval-child";
@@ -33,24 +51,6 @@ function recordNetworkEvent(event) {
     role: networkRole(),
     ...event,
   });
-}
-
-function normalizeHost(host) {
-  return String(host ?? "localhost")
-    .trim()
-    .replace(/^\[|\]$/gu, "")
-    .replace(/\.$/u, "")
-    .toLowerCase();
-}
-
-function isLoopbackHost(host) {
-  const normalized = normalizeHost(host);
-  if (normalized === "localhost") return true;
-  if (Net.isIP(normalized) === 4) return Number(normalized.split(".", 1)[0]) === 127;
-  if (Net.isIP(normalized) !== 6) return false;
-  if (normalized === "::1" || normalized === "0:0:0:0:0:0:0:1") return true;
-  const mappedIpv4 = normalized.startsWith("::ffff:") ? normalized.slice("::ffff:".length) : "";
-  return Net.isIP(mappedIpv4) === 4 && Number(mappedIpv4.split(".", 1)[0]) === 127;
 }
 
 function connectionDestination(args) {

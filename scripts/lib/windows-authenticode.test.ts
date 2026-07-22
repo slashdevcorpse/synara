@@ -91,6 +91,7 @@ describe("Windows unsigned Authenticode inspection", () => {
         "Authenticode status is Valid, not NotSigned.",
       );
     },
+    60_000,
   );
 
   for (const status of ["Valid", "UnknownError", "HashMismatch", "NotTrusted"]) {

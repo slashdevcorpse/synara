@@ -46,12 +46,22 @@ const DESKTOP_E2E_BUILD_ARTIFACT_PATHS = [
   "packages/effect-acp/dist/**",
 ] as const;
 const DESKTOP_E2E_DIAGNOSTIC_PATHS = [
-  "apps/desktop/test-results/**",
-  "apps/desktop/playwright-report/**",
+  "apps/desktop/failure-diagnostics/**/failure-summary.json",
 ] as const;
+const UNSAFE_DESKTOP_E2E_DIAGNOSTIC_PATH_PATTERN =
+  /(?:^|\/)(?:playwright-report|test-results)(?:\/|$)|(?:^|\/)(?:backend-logs|protocol\.jsonl|[^/]*\.sqlite(?:-(?:shm|wal))?)(?:\/|$)/u;
 const DESKTOP_E2E_JOB_TIMEOUT_MINUTES = 30;
 const DESKTOP_E2E_INSTALL_COMMAND = "bun install --frozen-lockfile";
 const DESKTOP_E2E_CONFIG = {
+  linux: {
+    artifactName: "desktop-build-linux",
+    diagnosticName: "desktop-e2e-linux-diagnostics",
+    jobName: "e2e_linux",
+    producerJobName: "quality_linux",
+    runner: "ubuntu-24.04",
+    systemDependenciesCommand: "bun run --cwd apps/web playwright install-deps chromium",
+    testCommand: "xvfb-run -a bun run test:e2e",
+  },
   windows: {
     artifactName: "desktop-build-windows",
     diagnosticName: "desktop-e2e-windows-diagnostics",
@@ -80,6 +90,10 @@ const QUARANTINE_RUN_COMMANDS = {
   linux: "node scripts/quarantine-registry.ts run --platform linux",
   windows: "node scripts/quarantine-registry.ts run --platform windows",
 } as const;
+const QUARANTINE_INVENTORY_COMMANDS = {
+  linux: "node scripts/quarantine-registry.ts inventory --platform linux",
+  windows: "node scripts/quarantine-registry.ts inventory --platform windows",
+} as const;
 const ALLOWED_NONBLOCKING_CI_COMMANDS: ReadonlySet<string> = new Set(
   Object.values(QUARANTINE_RUN_COMMANDS),
 );
@@ -105,7 +119,7 @@ const CI_WINDOWS_POST_BUILD_COMMAND = "bun run --cwd apps/desktop smoke-test";
 const CI_WINDOWS_PACKAGED_CLI_COMMAND = "node apps/server/scripts/cli.ts publish --dry-run";
 const CI_ROOT_TEST_COMMAND = "bun run test:ci";
 const CI_ROOT_TEST_CONDITION = "matrix.platform == 'linux'";
-const FULL_UNIT_CONDITION = "matrix.platform == 'windows'";
+const FULL_UNIT_CONDITION = "matrix.platform != 'linux'";
 const CI_CODECOV_ACTION = "codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac";
 const CI_CODECOV_UPLOAD_CONDITION =
   "${{ matrix.platform == 'linux' && !cancelled() && (steps.unit_tests.outcome == 'success' || steps.unit_tests.outcome == 'failure') }}";
@@ -147,6 +161,7 @@ type CiNativeJobName = keyof typeof CI_DESKTOP_PERSISTENCE_SMOKE_HOMES;
 const UNIT_MATRIX = [
   { platform: "linux", runner: "ubuntu-24.04", turbo_concurrency: "50%" },
   { platform: "windows", runner: "windows-2022", turbo_concurrency: "1" },
+  { platform: "macos", runner: "macos-15", turbo_concurrency: "50%" },
 ] as const;
 const UNIT_JOB_TIMEOUT_MINUTES = 40;
 const UNIT_STEP_TIMEOUT_MINUTES = 30;
@@ -166,6 +181,7 @@ const QUALITY_AGGREGATE_NEEDS = [
   "quality_windows",
   "unit",
   "browser_windows",
+  "e2e_linux",
   "e2e_windows",
   "macos_arm64",
 ] as const;
@@ -174,6 +190,7 @@ test "\${{ needs.quality_linux.result }}" = success
 test "\${{ needs.quality_windows.result }}" = success
 test "\${{ needs.unit.result }}" = success
 test "\${{ needs.browser_windows.result }}" = success
+test "\${{ needs.e2e_linux.result }}" = success
 test "\${{ needs.e2e_windows.result }}" = success
 test "\${{ needs.macos_arm64.result }}" = success
 `;
@@ -216,6 +233,21 @@ function executableShellLines(command: string): readonly string[] {
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter((line) => line.length > 0 && !line.startsWith("#"));
+}
+
+function invokesWorkspaceBuild(line: string): boolean {
+  const tokenBoundary = String.raw`(?=$|[\s"'&|;()<>])`;
+  const tokenPrefix = String.raw`(?:^|[\s"'&|;()<>])`;
+  const invokesBun = new RegExp(`${tokenPrefix}bun(?:\\.exe)?${tokenBoundary}`, "iu").test(line);
+  const namesBuildScript = new RegExp(
+    `${tokenPrefix}build(?::desktop)?${tokenBoundary}`,
+    "iu",
+  ).test(line);
+  const invokesTurboBuild = new RegExp(
+    `${tokenPrefix}turbo\\s+(?:run\\s+)?build${tokenBoundary}`,
+    "iu",
+  ).test(line);
+  return (invokesBun && namesBuildScript) || invokesTurboBuild;
 }
 
 function invokesRootTest(command: string): boolean {
@@ -561,25 +593,27 @@ function validateUnitMatrix(jobs: UnknownRecord, workflowPath: string, errors: s
     validateUnitTestConcurrency(workflowPath, linuxTestStep, errors);
   }
 
-  const windowsTestSteps = unitSteps.filter((step) => step.command === FULL_UNIT_COMMAND);
-  if (windowsTestSteps.length !== 1) {
-    errors.push(`${workflowPath} unit must run exactly one Windows ${FULL_UNIT_COMMAND} command.`);
+  const nonLinuxTestSteps = unitSteps.filter((step) => step.command === FULL_UNIT_COMMAND);
+  if (nonLinuxTestSteps.length !== 1) {
+    errors.push(
+      `${workflowPath} unit must run exactly one non-Linux ${FULL_UNIT_COMMAND} command.`,
+    );
   } else {
-    const windowsTestStep = windowsTestSteps[0]!;
+    const nonLinuxTestStep = nonLinuxTestSteps[0]!;
     if (
-      windowsTestStep.condition !== FULL_UNIT_CONDITION ||
-      (windowsTestStep.continueOnError !== undefined && windowsTestStep.continueOnError !== false)
+      nonLinuxTestStep.condition !== FULL_UNIT_CONDITION ||
+      (nonLinuxTestStep.continueOnError !== undefined && nonLinuxTestStep.continueOnError !== false)
     ) {
       errors.push(
-        `${workflowPath} unit ${FULL_UNIT_COMMAND} command must run only for matrix.platform == 'windows' and fail closed.`,
+        `${workflowPath} unit ${FULL_UNIT_COMMAND} command must run only when matrix.platform != 'linux' and fail closed.`,
       );
     }
-    if (windowsTestStep.timeoutMinutes !== UNIT_STEP_TIMEOUT_MINUTES) {
+    if (nonLinuxTestStep.timeoutMinutes !== UNIT_STEP_TIMEOUT_MINUTES) {
       errors.push(
         `${workflowPath} unit ${FULL_UNIT_COMMAND} timeout must be ${UNIT_STEP_TIMEOUT_MINUTES} minutes.`,
       );
     }
-    validateUnitTestConcurrency(workflowPath, windowsTestStep, errors);
+    validateUnitTestConcurrency(workflowPath, nonLinuxTestStep, errors);
   }
 
   const windowsSetupSteps = unitSteps.filter((step) => step.command === UNIT_WINDOWS_SETUP_COMMAND);
@@ -597,7 +631,7 @@ function validateUnitMatrix(jobs: UnknownRecord, workflowPath: string, errors: s
         `${workflowPath} unit Windows launcher setup must run only for matrix.platform == 'windows' and fail closed.`,
       );
     }
-    if (windowsTestSteps.length === 1 && setupStep.index >= windowsTestSteps[0]!.index) {
+    if (nonLinuxTestSteps.length === 1 && setupStep.index >= nonLinuxTestSteps[0]!.index) {
       errors.push(
         `${workflowPath} unit Windows launcher setup must run before ${FULL_UNIT_COMMAND}.`,
       );
@@ -804,6 +838,17 @@ function actionSteps(job: UnknownRecord, action: string): readonly UnknownRecord
   return job.steps.filter(
     (step): step is UnknownRecord =>
       isRecord(step) && typeof step.uses === "string" && step.uses === action,
+  );
+}
+
+function actionStepsWithPrefix(job: UnknownRecord, actionPrefix: string): readonly UnknownRecord[] {
+  if (!Array.isArray(job.steps)) return [];
+  const normalizedPrefix = actionPrefix.toLowerCase();
+  return job.steps.filter(
+    (step): step is UnknownRecord =>
+      isRecord(step) &&
+      typeof step.uses === "string" &&
+      step.uses.toLowerCase().startsWith(normalizedPrefix),
   );
 }
 
@@ -1277,11 +1322,7 @@ function validateDesktopE2eConsumer(
   );
   if (
     runSteps.some((step) =>
-      executableShellLines(step.rawCommand).some((line) =>
-        /(?:^|[\s"'&|;()<>])(?:bun\s+run\s+build:desktop|turbo\s+(?:run\s+)?build)(?=$|[\s"'&|;()<>])/u.test(
-          line,
-        ),
-      ),
+      executableShellLines(step.rawCommand).some((line) => invokesWorkspaceBuild(line)),
     )
   ) {
     errors.push(
@@ -1319,13 +1360,25 @@ function validateDesktopE2eConsumer(
     }
   }
 
-  const diagnostics = actionSteps(job, UPLOAD_ARTIFACT_ACTION);
-  if (diagnostics.length !== 1) {
+  const diagnostics = actionStepsWithPrefix(job, "actions/upload-artifact@");
+  if (diagnostics.length !== 1 || diagnostics[0]?.uses !== UPLOAD_ARTIFACT_ACTION) {
     errors.push(
       `${workflowPath} ${config.jobName} must define exactly one pinned failure diagnostics upload.`,
     );
   } else {
     const diagnostic = diagnostics[0]!;
+    const diagnosticPaths = isRecord(diagnostic.with)
+      ? multilineStringEntries(diagnostic.with.path)
+      : null;
+    if (
+      diagnosticPaths?.some((diagnosticPath) =>
+        UNSAFE_DESKTOP_E2E_DIAGNOSTIC_PATH_PATTERN.test(diagnosticPath),
+      )
+    ) {
+      errors.push(
+        `${workflowPath} ${config.jobName} diagnostics must not expose raw Playwright, protocol, backend, or SQLite artifacts.`,
+      );
+    }
     if (
       diagnostic.if !== "failure()" ||
       (diagnostic["continue-on-error"] !== undefined &&
@@ -1501,6 +1554,13 @@ function validateCiArchitecture(workflow: UnknownRecord, errors: string[]): void
         BROWSER_INSTALL_COMMANDS.quality_linux,
         errors,
       );
+      const quarantineInventory = exactBlockingCommand(
+        workflowPath,
+        "quality_linux",
+        qualityLinuxSteps,
+        QUARANTINE_INVENTORY_COMMANDS.linux,
+        errors,
+      );
       const stableBrowser = exactBlockingCommand(
         workflowPath,
         "quality_linux",
@@ -1518,6 +1578,24 @@ function validateCiArchitecture(workflow: UnknownRecord, errors: string[]): void
       if (browserInstall && stableBrowser && browserInstall.index >= stableBrowser.index) {
         errors.push(
           `${workflowPath} quality_linux must install Playwright before stable browser tests.`,
+        );
+      }
+      if (
+        browserInstall &&
+        quarantineInventory &&
+        browserInstall.index >= quarantineInventory.index
+      ) {
+        errors.push(
+          `${workflowPath} quality_linux must install Playwright before quarantine inventory collection.`,
+        );
+      }
+      if (
+        quarantineInventory &&
+        stableBrowser &&
+        quarantineInventory.index >= stableBrowser.index
+      ) {
+        errors.push(
+          `${workflowPath} quality_linux must verify quarantine inventory before stable browser tests.`,
         );
       }
       validateQuarantineCommands(workflowPath, "quality_linux", qualityLinuxSteps, "linux", errors);
@@ -1567,6 +1645,13 @@ function validateCiArchitecture(workflow: UnknownRecord, errors: string[]): void
         BROWSER_INSTALL_COMMANDS.browser_windows,
         errors,
       );
+      const quarantineInventory = exactBlockingCommand(
+        workflowPath,
+        "browser_windows",
+        browserWindowsSteps,
+        QUARANTINE_INVENTORY_COMMANDS.windows,
+        errors,
+      );
       const stableBrowser = exactBlockingCommand(
         workflowPath,
         "browser_windows",
@@ -1593,6 +1678,24 @@ function validateCiArchitecture(workflow: UnknownRecord, errors: string[]): void
       if (browserInstall && stableBrowser && browserInstall.index >= stableBrowser.index) {
         errors.push(
           `${workflowPath} browser_windows must install Playwright before stable browser tests.`,
+        );
+      }
+      if (
+        browserInstall &&
+        quarantineInventory &&
+        browserInstall.index >= quarantineInventory.index
+      ) {
+        errors.push(
+          `${workflowPath} browser_windows must install Playwright before quarantine inventory collection.`,
+        );
+      }
+      if (
+        quarantineInventory &&
+        stableBrowser &&
+        quarantineInventory.index >= stableBrowser.index
+      ) {
+        errors.push(
+          `${workflowPath} browser_windows must verify quarantine inventory before stable browser tests.`,
         );
       }
       validateQuarantineCommands(

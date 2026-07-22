@@ -177,7 +177,7 @@ function windowsProcessRow(input: {
 }
 
 describe("desktop process teardown orchestration", () => {
-  it("recovers a graceful-close timeout only after verified cleanup removes every process", async () => {
+  it("reports a graceful-close timeout after verified cleanup removes every process", async () => {
     vi.useFakeTimers();
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     try {
@@ -198,13 +198,16 @@ describe("desktop process teardown orchestration", () => {
       };
 
       const result = closeElectronApplication(hangingElectronApplication(child), dependencies);
+      const rejection = expect(result).rejects.toThrow(
+        "Timed out while closing the Electron application.",
+      );
       await vi.runAllTimersAsync();
 
-      await expect(result).resolves.toBeUndefined();
+      await rejection;
       expect(dependencies.signalProcess).toHaveBeenCalledWith(root.pid, "SIGKILL");
       expect(child.kill).not.toHaveBeenCalled();
-      expect(warn).toHaveBeenCalledWith(
-        "[desktop-e2e] Graceful Electron close timed out after 30000ms; identity-verified forced cleanup completed without survivors.",
+      expect(warn).not.toHaveBeenCalledWith(
+        expect.stringContaining("identity-verified forced cleanup completed"),
       );
     } finally {
       warn.mockRestore();

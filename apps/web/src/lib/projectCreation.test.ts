@@ -84,6 +84,131 @@ describe("createOrRecoverProjectFromPath", () => {
     });
   });
 
+  it("recovers the intended project when the command commits before its response fails", async () => {
+    let committedProjectId: ProjectId | null = null;
+    const transportFailure = { _tag: "RpcClientError", reason: { _tag: "SocketCloseError" } };
+    const dispatchCommand = vi.fn(async (command: { projectId?: ProjectId }) => {
+      committedProjectId = command.projectId ?? null;
+      throw transportFailure;
+    });
+    const loadSnapshot = vi.fn(async () =>
+      makeSnapshot(committedProjectId ? [makeProject(committedProjectId)] : []),
+    );
+
+    const result = await createOrRecoverProjectFromPath({
+      api: makeApi(dispatchCommand),
+      workspaceRoot: WORKSPACE_ROOT,
+      loadSnapshot,
+      maxAttempts: 1,
+      delayMs: 0,
+    });
+
+    expect(dispatchCommand).toHaveBeenCalledOnce();
+    expect(loadSnapshot).toHaveBeenCalledOnce();
+    expect(result).toMatchObject({
+      projectId: committedProjectId,
+      project: expect.objectContaining({ id: committedProjectId }),
+      created: true,
+      restored: false,
+    });
+  });
+
+  it("polls for a delayed intended project after an unclassified command failure", async () => {
+    let committedProjectId: ProjectId | null = null;
+    let snapshotAttempts = 0;
+    const dispatchFailure = new Error("WebSocket response closed before it was observed.");
+    const dispatchCommand = vi.fn(async (command: { projectId?: ProjectId }) => {
+      committedProjectId = command.projectId ?? null;
+      throw dispatchFailure;
+    });
+    const loadSnapshot = vi.fn(async () => {
+      snapshotAttempts += 1;
+      return makeSnapshot(
+        snapshotAttempts >= 2 && committedProjectId ? [makeProject(committedProjectId)] : [],
+      );
+    });
+
+    const result = await createOrRecoverProjectFromPath({
+      api: makeApi(dispatchCommand),
+      workspaceRoot: WORKSPACE_ROOT,
+      loadSnapshot,
+      maxAttempts: 2,
+      delayMs: 0,
+    });
+
+    expect(dispatchCommand).toHaveBeenCalledOnce();
+    expect(loadSnapshot).toHaveBeenCalledTimes(2);
+    expect(result).toMatchObject({
+      projectId: committedProjectId,
+      project: expect.objectContaining({ id: committedProjectId }),
+      created: true,
+      restored: false,
+    });
+  });
+
+  it("does not recover another project that only shares the intended workspace root", async () => {
+    const dispatchFailure = new Error("WebSocket response closed before it was observed.");
+    const dispatchCommand = vi.fn(async () => {
+      throw dispatchFailure;
+    });
+    const loadSnapshot = vi.fn(async () => makeSnapshot([makeProject("project-other")]));
+
+    await expect(
+      createOrRecoverProjectFromPath({
+        api: makeApi(dispatchCommand),
+        workspaceRoot: WORKSPACE_ROOT,
+        loadSnapshot,
+        maxAttempts: 1,
+        delayMs: 0,
+      }),
+    ).rejects.toBe(dispatchFailure);
+
+    expect(dispatchCommand).toHaveBeenCalledOnce();
+    expect(loadSnapshot).toHaveBeenCalledOnce();
+  });
+
+  it("preserves a post-dispatch snapshot failure without reclassifying the command", async () => {
+    const snapshotFailure = new Error("Snapshot read failed.");
+    const dispatchCommand = vi.fn(async () => ({ sequence: 2 }));
+    const loadSnapshot = vi.fn(async () => {
+      throw snapshotFailure;
+    });
+
+    await expect(
+      createOrRecoverProjectFromPath({
+        api: makeApi(dispatchCommand),
+        workspaceRoot: WORKSPACE_ROOT,
+        loadSnapshot,
+        maxAttempts: 2,
+        delayMs: 0,
+      }),
+    ).rejects.toBe(snapshotFailure);
+
+    expect(dispatchCommand).toHaveBeenCalledOnce();
+    expect(loadSnapshot).toHaveBeenCalledOnce();
+  });
+
+  it("preserves an unclassified create failure when the intended project did not commit", async () => {
+    const dispatchFailure = new Error("Project creation was rejected.");
+    const dispatchCommand = vi.fn(async () => {
+      throw dispatchFailure;
+    });
+    const loadSnapshot = vi.fn(async () => makeSnapshot([]));
+
+    await expect(
+      createOrRecoverProjectFromPath({
+        api: makeApi(dispatchCommand),
+        workspaceRoot: WORKSPACE_ROOT,
+        loadSnapshot,
+        maxAttempts: 1,
+        delayMs: 0,
+      }),
+    ).rejects.toBe(dispatchFailure);
+
+    expect(dispatchCommand).toHaveBeenCalledOnce();
+    expect(loadSnapshot).toHaveBeenCalledOnce();
+  });
+
   it("recovers the existing project when project.create reports a duplicate workspace root", async () => {
     const existingProject = makeProject("project-existing");
     const dispatchCommand = vi.fn(async () => {

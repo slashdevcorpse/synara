@@ -3,10 +3,15 @@
 
 import * as FS from "node:fs";
 import * as Path from "node:path";
+import {
+  clearFailureDiagnosticsRoot,
+  desktopFailureDiagnosticsRoot,
+} from "./support/failureDiagnostics";
 
 const REPO_ROOT = Path.resolve(__dirname, "../../..");
 
-export default function globalSetup(): void {
+export default async function globalSetup(): Promise<void> {
+  await clearFailureDiagnosticsRoot(REPO_ROOT, desktopFailureDiagnosticsRoot(REPO_ROOT));
   const requiredArtifacts = [
     "apps/desktop/dist-electron/main.js",
     "apps/desktop/dist-electron/preload.js",

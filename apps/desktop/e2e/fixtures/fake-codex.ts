@@ -17,18 +17,41 @@ interface PendingApproval {
   readonly command: string;
 }
 
+interface FakeCodexConfig {
+  readonly invocationLogPath: string;
+  readonly networkGuardPath: string;
+  readonly networkLogPath: string;
+  readonly protocolLogPath: string;
+  readonly workspacePath: string;
+}
+
+function loadFixtureConfig(): FakeCodexConfig {
+  const runtimePath = process.argv[1];
+  if (!runtimePath) {
+    throw new Error("Fake Codex could not resolve its runtime path.");
+  }
+  const configPath = Path.join(Path.dirname(runtimePath), "fake-codex-config.json");
+  const parsed = JSON.parse(FS.readFileSync(configPath, "utf8")) as Partial<FakeCodexConfig>;
+  for (const key of [
+    "invocationLogPath",
+    "networkGuardPath",
+    "networkLogPath",
+    "protocolLogPath",
+    "workspacePath",
+  ] as const) {
+    if (typeof parsed[key] !== "string" || parsed[key].length === 0) {
+      throw new Error(`Fake Codex config is missing ${key}.`);
+    }
+  }
+  return parsed as FakeCodexConfig;
+}
+
 const args = process.argv.slice(2);
-const protocolLogPath = process.env.SYNARA_FAKE_CODEX_PROTOCOL_LOG_PATH;
-const invocationLogPath = process.env.SYNARA_FAKE_CODEX_INVOCATION_LOG_PATH;
-const configuredNetworkGuardPath = process.env.SYNARA_FAKE_CODEX_NETWORK_GUARD_PATH;
-const controlledWorkspacePath = process.env.SYNARA_FAKE_CODEX_WORKSPACE_PATH;
-if (!invocationLogPath) {
-  throw new Error("Fake Codex requires SYNARA_FAKE_CODEX_INVOCATION_LOG_PATH.");
-}
-if (!configuredNetworkGuardPath) {
-  throw new Error("Fake Codex requires SYNARA_FAKE_CODEX_NETWORK_GUARD_PATH.");
-}
-const networkGuardPath = configuredNetworkGuardPath;
+const fixtureConfig = loadFixtureConfig();
+const protocolLogPath = fixtureConfig.protocolLogPath;
+const invocationLogPath = fixtureConfig.invocationLogPath;
+const networkGuardPath = fixtureConfig.networkGuardPath;
+const controlledWorkspacePath = fixtureConfig.workspacePath;
 FS.mkdirSync(Path.dirname(invocationLogPath), { recursive: true });
 FS.appendFileSync(
   invocationLogPath,
@@ -270,6 +293,7 @@ function finishApproval(requestId: string, result: unknown): void {
             env: {
               ...process.env,
               SYNARA_E2E_NETWORK_ROLE: "approval-child",
+              SYNARA_FAKE_CODEX_NETWORK_LOG_PATH: fixtureConfig.networkLogPath,
             },
             windowsHide: true,
           },

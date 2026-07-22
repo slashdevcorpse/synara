@@ -454,8 +454,6 @@ export interface SynaraStorageSnapshot {
 
 export interface DesktopBridge {
   getWsUrl: () => string | null;
-  /** Test-only sentinel; enables the renderer's narrow desktop E2E readiness probe. */
-  readonly isE2eHarness?: boolean;
   /**
    * Absolute filesystem path for a File from drag/drop or file inputs.
    * Electron only (`webUtils.getPathForFile`). Returns null when unavailable.

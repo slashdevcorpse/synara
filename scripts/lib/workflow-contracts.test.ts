@@ -137,9 +137,9 @@ const ciRootTestStep = [
   "          TURBO_CONCURRENCY: ${{ matrix.turbo_concurrency }}",
   "        run: bun run test:ci",
 ].join("\n");
-const windowsUnitTestStep = [
-  "      - name: Run Windows unit suite",
-  "        if: matrix.platform == 'windows'",
+const nonLinuxUnitTestStep = [
+  "      - name: Run cross-platform unit suite",
+  "        if: matrix.platform != 'linux'",
   "        timeout-minutes: 30",
   "        env:",
   "          TURBO_CONCURRENCY: ${{ matrix.turbo_concurrency }}",
@@ -208,6 +208,7 @@ jobs:
           path: ${linuxPlaywrightCachePath}
       - run: node scripts/quarantine-registry.ts validate
       - run: bun run --cwd apps/web test:browser:install
+      - run: node scripts/quarantine-registry.ts inventory --platform linux
       - name: Browser test (stable)
         run: bun run --cwd apps/web test:browser:stable
       - name: Browser test (registered Linux quarantine)
@@ -217,6 +218,18 @@ jobs:
         if: always()
         run: node scripts/quarantine-registry.ts summary --platform linux --baseline-ref ${quarantineBaselineRef} --github-step-summary
       - run: bun run build:desktop
+      - name: Upload Linux desktop E2E build
+        uses: ${pinnedUploadArtifact}
+        with:
+          name: desktop-build-linux
+          path: |
+            apps/desktop/dist-electron/**
+            apps/server/dist/**
+            apps/web/dist/**
+            packages/contracts/dist/**
+            packages/effect-acp/dist/**
+          if-no-files-found: error
+          retention-days: 1
   quality_windows:
     runs-on: windows-2022
     timeout-minutes: 45
@@ -242,12 +255,15 @@ jobs:
           - platform: windows
             runner: windows-2022
             turbo_concurrency: "1"
+          - platform: macos
+            runner: macos-15
+            turbo_concurrency: "50%"
     steps:
       - uses: ${pinnedCheckout}
       - if: matrix.platform == 'windows'
         run: node apps/server/scripts/build-windows-job-launcher.mjs --arch x64
 ${ciRootTestStep}
-${windowsUnitTestStep}
+${nonLinuxUnitTestStep}
 ${mergifyUploadStep}
 ${mergifyVerificationStep}
 ${codecovCoverageUploadStep}
@@ -263,6 +279,7 @@ ${codecovTestResultsUploadStep}
       - run: bun install --frozen-lockfile
       - run: node scripts/quarantine-registry.ts validate
       - run: bun run --cwd apps/web playwright install chromium
+      - run: node scripts/quarantine-registry.ts inventory --platform windows
       - name: Browser test (stable)
         run: bun run --cwd apps/web test:browser:stable
       - name: Browser test (registered Windows quarantine)
@@ -301,6 +318,26 @@ ${windowsStartupSmokeStep}
             packages/effect-acp/dist/**
           if-no-files-found: error
           retention-days: 1
+  e2e_linux:
+    name: e2e_linux
+    needs: quality_linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - run: bun install --frozen-lockfile
+      - uses: ${pinnedDownloadArtifact}
+        with:
+          name: desktop-build-linux
+          path: .
+      - run: bun run --cwd apps/web playwright install-deps chromium
+      - run: xvfb-run -a bun run test:e2e
+      - if: failure()
+        uses: ${pinnedUploadArtifact}
+        with:
+          name: desktop-e2e-linux-diagnostics
+          path: apps/desktop/failure-diagnostics/**/failure-summary.json
+          if-no-files-found: ignore
+          retention-days: 7
   e2e_windows:
     name: e2e_windows
     needs: windows_x64
@@ -317,9 +354,7 @@ ${windowsStartupSmokeStep}
         uses: ${pinnedUploadArtifact}
         with:
           name: desktop-e2e-windows-diagnostics
-          path: |
-            apps/desktop/test-results/**
-            apps/desktop/playwright-report/**
+          path: apps/desktop/failure-diagnostics/**/failure-summary.json
           if-no-files-found: ignore
           retention-days: 7
   macos_arm64:
@@ -339,6 +374,7 @@ ${macosStartupSmokeStep}
       - quality_windows
       - unit
       - browser_windows
+      - e2e_linux
       - e2e_windows
       - macos_arm64
     runs-on: ubuntu-24.04
@@ -349,6 +385,7 @@ ${macosStartupSmokeStep}
           test "\${{ needs.quality_windows.result }}" = success
           test "\${{ needs.unit.result }}" = success
           test "\${{ needs.browser_windows.result }}" = success
+          test "\${{ needs.e2e_linux.result }}" = success
           test "\${{ needs.e2e_windows.result }}" = success
           test "\${{ needs.macos_arm64.result }}" = success
   release_smoke:
@@ -531,6 +568,33 @@ describe("workflow contracts", () => {
     );
     expect(ciErrors(chainedQuarantine)).toContain(
       "may use continue-on-error only for registered quarantine runs",
+    );
+
+    expect(
+      ciErrors(
+        ciWorkflow.replace(
+          "      - run: node scripts/quarantine-registry.ts inventory --platform linux\n",
+          "",
+        ),
+      ),
+    ).toContain(
+      "quality_linux must run exact browser gate command: node scripts/quarantine-registry.ts inventory --platform linux.",
+    );
+
+    const nonblockingInventory = ciWorkflow.replace(
+      "      - run: node scripts/quarantine-registry.ts inventory --platform windows",
+      "      - continue-on-error: true\n        run: node scripts/quarantine-registry.ts inventory --platform windows",
+    );
+    expect(ciErrors(nonblockingInventory)).toContain(
+      "browser_windows browser gate must be unconditional and fail closed: node scripts/quarantine-registry.ts inventory --platform windows.",
+    );
+
+    const inventoryBeforeInstall = ciWorkflow.replace(
+      "      - run: bun run --cwd apps/web test:browser:install\n      - run: node scripts/quarantine-registry.ts inventory --platform linux",
+      "      - run: node scripts/quarantine-registry.ts inventory --platform linux\n      - run: bun run --cwd apps/web test:browser:install",
+    );
+    expect(ciErrors(inventoryBeforeInstall)).toContain(
+      "quality_linux must install Playwright before quarantine inventory collection.",
     );
   });
 
@@ -829,7 +893,7 @@ describe("workflow contracts", () => {
       ),
     );
     expect(validateWorkflowContracts(filteredWindows, policy()).join("\n")).toContain(
-      "unit must run exactly one Windows bun turbo test command",
+      "unit must run exactly one non-Linux bun turbo test command",
     );
 
     const misplacedWindowsSetup = validFiles();
@@ -841,8 +905,8 @@ describe("workflow contracts", () => {
           "",
         )
         .replace(
-          `${windowsUnitTestStep}\n`,
-          `${windowsUnitTestStep}\n      - if: matrix.platform == 'windows'\n        run: node apps/server/scripts/build-windows-job-launcher.mjs --arch x64\n`,
+          `${nonLinuxUnitTestStep}\n`,
+          `${nonLinuxUnitTestStep}\n      - if: matrix.platform == 'windows'\n        run: node apps/server/scripts/build-windows-job-launcher.mjs --arch x64\n`,
         ),
     );
     expect(validateWorkflowContracts(misplacedWindowsSetup, policy()).join("\n")).toContain(
@@ -900,9 +964,18 @@ describe("workflow contracts", () => {
     const missingE2eAggregate = validFiles();
     missingE2eAggregate.set(
       ".github/workflows/ci.yml",
-      ciWorkflow.replace("      - e2e_windows\n", ""),
+      ciWorkflow.replace("      - e2e_linux\n", ""),
     );
     expect(validateWorkflowContracts(missingE2eAggregate, policy()).join("\n")).toContain(
+      "quality aggregate must depend on the exact merge-blocking quality job set",
+    );
+
+    const missingWindowsE2eAggregate = validFiles();
+    missingWindowsE2eAggregate.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace("      - e2e_windows\n", ""),
+    );
+    expect(validateWorkflowContracts(missingWindowsE2eAggregate, policy()).join("\n")).toContain(
       "quality aggregate must depend on the exact merge-blocking quality job set",
     );
 
@@ -928,7 +1001,7 @@ describe("workflow contracts", () => {
     );
   });
 
-  it("locks the Windows packaged desktop E2E artifact pipeline", () => {
+  it("locks the cross-platform packaged desktop E2E artifact pipeline", () => {
     expect(
       ciErrors(
         ciWorkflow.replace(
@@ -937,19 +1010,28 @@ describe("workflow contracts", () => {
         ),
       ),
     ).toContain(
-      "windows_x64 must upload exact desktop-build-windows paths with one-day fail-closed retention",
+      "quality_linux must upload exact desktop-build-linux paths with one-day fail-closed retention",
     );
 
     expect(
       ciErrors(
         ciWorkflow.replace(
-          "          name: desktop-build-windows\n          path: .",
-          "          name: desktop-build-windows\n          path: artifacts",
+          "          name: desktop-build-linux\n          path: .",
+          "          name: desktop-build-linux\n          path: artifacts",
         ),
       ),
     ).toContain(
-      "e2e_windows must download desktop-build-windows at the repository root and fail closed",
+      "e2e_linux must download desktop-build-linux at the repository root and fail closed",
     );
+
+    expect(
+      ciErrors(
+        ciWorkflow.replace(
+          "    needs: quality_linux\n    runs-on: ubuntu-24.04",
+          "    needs: [quality_linux, unit]\n    runs-on: ubuntu-24.04",
+        ),
+      ),
+    ).toContain("e2e_linux must need only its same-platform producer quality_linux");
 
     expect(
       ciErrors(
@@ -959,6 +1041,12 @@ describe("workflow contracts", () => {
         ),
       ),
     ).toContain("e2e_windows must need only its same-platform producer windows_x64");
+
+    expect(
+      ciErrors(ciWorkflow.replace("xvfb-run -a bun run test:e2e", "bun run test:e2e")),
+    ).toContain(
+      "e2e_linux must run exact packaged desktop E2E command: xvfb-run -a bun run test:e2e",
+    );
 
     expect(
       ciErrors(
@@ -972,17 +1060,101 @@ describe("workflow contracts", () => {
     const alwaysUpload = ciWorkflow.replaceAll("      - if: failure()", "      - if: always()");
     const alwaysUploadErrors = ciErrors(alwaysUpload);
     expect(alwaysUploadErrors).toContain(
+      "e2e_linux diagnostics must upload exact failure-only paths with seven-day retention",
+    );
+    expect(alwaysUploadErrors).toContain(
       "e2e_windows diagnostics must upload exact failure-only paths with seven-day retention",
     );
 
     expect(
       ciErrors(
         ciWorkflow.replace(
+          "      - run: xvfb-run -a bun run test:e2e",
+          "      - run: bun run build:desktop\n      - run: xvfb-run -a bun run test:e2e",
+        ),
+      ),
+    ).toContain("e2e_linux must consume prebuilt artifacts without builds");
+
+    for (const buildCommand of [
+      "bun.exe run build",
+      "BUN.EXE run build",
+      "Bun run build",
+      "bun run --silent build",
+    ]) {
+      expect(
+        ciErrors(
+          ciWorkflow.replace(
+            "      - run: bun run test:e2e",
+            `      - run: ${buildCommand}\n      - run: bun run test:e2e`,
+          ),
+        ),
+      ).toContain("e2e_windows must consume prebuilt artifacts without builds");
+    }
+
+    expect(
+      ciErrors(
+        ciWorkflow.replace(
           "      - run: bun run test:e2e",
-          "      - run: bun run build:desktop\n      - run: bun run test:e2e",
+          "      - run: bun run build\n      - run: bun run test:e2e",
         ),
       ),
     ).toContain("e2e_windows must consume prebuilt artifacts without builds");
+
+    expect(
+      ciErrors(
+        ciWorkflow.replace(
+          "      - if: failure()\n        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7",
+          "      - uses: actions/upload-artifact@1111111111111111111111111111111111111111\n      - if: failure()\n        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7",
+        ),
+      ),
+    ).toContain("e2e_linux must define exactly one pinned failure diagnostics upload");
+
+    expect(
+      ciErrors(
+        ciWorkflow.replace(
+          "      - if: failure()\n        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7",
+          "      - uses: Actions/upload-artifact@1111111111111111111111111111111111111111\n      - if: failure()\n        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7",
+        ),
+      ),
+    ).toContain("e2e_linux must define exactly one pinned failure diagnostics upload");
+
+    for (const unsafeDiagnosticPath of [
+      "apps/desktop/test-results/**",
+      "apps/desktop/playwright-report/**",
+      "apps/desktop/test-results/**/runtime/protocol.jsonl",
+      "apps/desktop/test-results/**/runtime/backend-logs/**",
+      "apps/desktop/test-results/**/runtime/state.sqlite",
+    ]) {
+      const unsafeDiagnosticErrors = ciErrors(
+        ciWorkflow.replaceAll(
+          "          path: apps/desktop/failure-diagnostics/**/failure-summary.json",
+          `          path: ${unsafeDiagnosticPath}`,
+        ),
+      );
+      expect(unsafeDiagnosticErrors).toContain(
+        "e2e_linux diagnostics must upload exact failure-only paths with seven-day retention",
+      );
+      expect(unsafeDiagnosticErrors).toContain(
+        "e2e_windows diagnostics must upload exact failure-only paths with seven-day retention",
+      );
+      expect(unsafeDiagnosticErrors).toContain(
+        "e2e_linux diagnostics must not expose raw Playwright, protocol, backend, or SQLite artifacts",
+      );
+      expect(unsafeDiagnosticErrors).toContain(
+        "e2e_windows diagnostics must not expose raw Playwright, protocol, backend, or SQLite artifacts",
+      );
+    }
+
+    expect(
+      ciErrors(
+        ciWorkflow.replaceAll(
+          "          path: apps/desktop/failure-diagnostics/**/failure-summary.json",
+          "          path: |\n            apps/desktop/failure-diagnostics/**/failure-summary.json\n            apps/desktop/test-results/**",
+        ),
+      ),
+    ).toContain(
+      "e2e_linux diagnostics must upload exact failure-only paths with seven-day retention",
+    );
   });
 
   it("requires fail-closed Codecov coverage and test-result uploads", () => {

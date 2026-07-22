@@ -1,11 +1,15 @@
-import { appendFileSync, readFileSync } from "node:fs";
+import { appendFileSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 
 import {
+  createQuarantineInventoryEnvironment,
   formatQuarantineSummary,
+  parseVitestQuarantineInventory,
   QUARANTINE_PLATFORMS,
   quarantineSuitesForPlatform,
+  validateQuarantineCaseInventory,
   validateQuarantineRegistry,
   type QuarantinePlatform,
   type QuarantineRegistry,
@@ -13,18 +17,24 @@ import {
 
 function usage(): never {
   throw new Error(
-    "Usage: node scripts/quarantine-registry.ts <validate|run|summary> [--platform <linux|windows>] [--baseline-ref <commit-sha>] [--github-step-summary]",
+    "Usage: node scripts/quarantine-registry.ts <validate|inventory|run|summary> [--platform <linux|windows>] [--baseline-ref <commit-sha>] [--github-step-summary]",
   );
 }
 
 function parseArgs(args: readonly string[]): {
-  readonly command: "validate" | "run" | "summary";
+  readonly command: "validate" | "inventory" | "run" | "summary";
   readonly platform?: QuarantinePlatform;
   readonly baselineRef?: string;
   readonly githubStepSummary: boolean;
 } {
   const command = args[0];
-  if (command !== "validate" && command !== "run" && command !== "summary") usage();
+  if (
+    command !== "validate" &&
+    command !== "inventory" &&
+    command !== "run" &&
+    command !== "summary"
+  )
+    usage();
   let platform: QuarantinePlatform | undefined;
   let baselineRef: string | undefined;
   let githubStepSummary = false;
@@ -32,7 +42,8 @@ function parseArgs(args: readonly string[]): {
     const arg = args[index];
     if (arg === "--platform") {
       const value = args[index + 1];
-      if (!QUARANTINE_PLATFORMS.includes(value as QuarantinePlatform)) usage();
+      if (platform !== undefined || !QUARANTINE_PLATFORMS.includes(value as QuarantinePlatform))
+        usage();
       platform = value as QuarantinePlatform;
       index += 1;
     } else if (arg === "--baseline-ref") {
@@ -46,7 +57,7 @@ function parseArgs(args: readonly string[]): {
       usage();
     }
   }
-  if (command === "run" && !platform) usage();
+  if ((command === "inventory" || command === "run") && !platform) usage();
   if (command !== "summary" && githubStepSummary) usage();
   if (command !== "summary" && baselineRef) usage();
   return {
@@ -132,6 +143,67 @@ function runSuite(
   if (result.status !== 0) process.exitCode = result.status ?? 1;
 }
 
+function runtimeQuarantinePlatform(): QuarantinePlatform | null {
+  if (process.platform === "linux") return "linux";
+  if (process.platform === "win32") return "windows";
+  return null;
+}
+
+function collectQuarantineInventory(
+  repositoryRoot: string,
+  platform: QuarantinePlatform,
+  registry: QuarantineRegistry,
+) {
+  const runtimePlatform = runtimeQuarantinePlatform();
+  if (runtimePlatform !== platform) {
+    throw new Error(
+      `Quarantine inventory requested ${platform}, but this runner is ${runtimePlatform ?? process.platform}.`,
+    );
+  }
+  const webRoot = resolve(repositoryRoot, "apps/web");
+  const vitestCli = resolve(repositoryRoot, "node_modules/vitest/vitest.mjs");
+  const registeredPaths = [
+    ...new Set(registry.entries.map((entry) => resolve(repositoryRoot, entry.path))),
+  ];
+  if (registeredPaths.length === 0) return [];
+  const temporaryDirectory = mkdtempSync(resolve(tmpdir(), "synara-quarantine-inventory-"));
+  try {
+    const result = spawnSync(
+      process.execPath,
+      [
+        vitestCli,
+        "list",
+        ...registeredPaths,
+        "--config",
+        "vitest.browser.config.ts",
+        "--json",
+      ],
+      {
+        cwd: webRoot,
+        encoding: "utf8",
+        env: createQuarantineInventoryEnvironment(
+          process.env,
+          resolve(temporaryDirectory, "routeTree.gen.ts"),
+        ),
+        maxBuffer: 64 * 1024 * 1024,
+        timeout: 120_000,
+        windowsHide: true,
+      },
+    );
+    return parseVitestQuarantineInventory(
+      {
+        ...(result.error ? { error: result.error } : {}),
+        status: result.status,
+        stdout: result.stdout ?? "",
+        stderr: result.stderr ?? "",
+      },
+      { repositoryRoot },
+    );
+  } finally {
+    rmSync(temporaryDirectory, { recursive: true, force: true });
+  }
+}
+
 function main(): void {
   const args = parseArgs(process.argv.slice(2));
   const repositoryRoot = process.cwd();
@@ -139,6 +211,17 @@ function main(): void {
   if (args.command === "validate") {
     console.log(
       `Quarantine registry validation passed for ${registry.entries.length} registered group(s).`,
+    );
+    return;
+  }
+  if (args.command === "inventory") {
+    const inventory = collectQuarantineInventory(repositoryRoot, args.platform!, registry);
+    const errors = validateQuarantineCaseInventory(registry, inventory);
+    if (errors.length > 0) {
+      throw new Error(`Quarantine case inventory validation failed:\n- ${errors.join("\n- ")}`);
+    }
+    console.log(
+      `Quarantine case inventory validation passed for ${registry.entries.length} registered group(s) on ${args.platform}.`,
     );
     return;
   }

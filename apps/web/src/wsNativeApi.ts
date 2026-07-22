@@ -50,84 +50,7 @@ import { emitWsCompatibilityIssue, emitWsTransportState } from "./wsTransportEve
 import { resolveWsHttpUrl } from "./lib/wsHttpUrl";
 
 let instance: { api: NativeApi; transport: WsTransport } | null = null;
-
-// A failed feature stream waits 500 ms before reconnecting. Require a slightly longer unchanged
-// open-session interval so the E2E fixture cannot certify a socket whose deferred failure handler
-// has not run yet. Keep the E2E-only probe alive through a cold hosted Windows provider launch;
-// production RPC retry behavior remains unchanged.
-const E2E_READINESS_RETRY_WINDOW_MS = 30_000;
-const E2E_READINESS_RETRY_DELAY_MS = 250;
-const E2E_READINESS_STABILITY_DELAY_MS = 600;
-
-function clearE2eRendererHarness(): void {
-  if (typeof window !== "undefined") {
-    delete window.__synaraE2e;
-  }
-}
-
-function installE2eRendererHarness(api: NativeApi, transport: WsTransport): void {
-  clearE2eRendererHarness();
-  if (typeof window === "undefined" || window.desktopBridge?.isE2eHarness !== true) return;
-
-  window.__synaraE2e = {
-    probeReadiness: async () => {
-      let lastError: unknown;
-      const retryDeadline = Date.now() + E2E_READINESS_RETRY_WINDOW_MS;
-      while (true) {
-        try {
-          const session = transport.getSessionSnapshot();
-          const assertSameOpenSession = (): void => {
-            const current = transport.getSessionSnapshot();
-            if (current.state !== "open" || current.generation !== session.generation) {
-              throw new Error(
-                "Desktop E2E renderer transport session changed during readiness probe.",
-              );
-            }
-          };
-          const requestOnSameSession = async <T>(request: () => Promise<T>): Promise<T> => {
-            assertSameOpenSession();
-            const result = await request();
-            assertSameOpenSession();
-            return result;
-          };
-
-          // The desktop fixture invokes this only after the root UI has committed its initial
-          // shell snapshot. Re-reading around the explicit provider refresh proves the current
-          // feature session can serve both orchestration and provider RPCs. The generation guards
-          // keep every request on that same feature session without changing production retries.
-          await requestOnSameSession(() => api.orchestration.getShellSnapshot());
-          const refreshed = await requestOnSameSession(() => api.server.refreshProviders());
-          await requestOnSameSession(() => api.orchestration.getShellSnapshot());
-          const includesCodex = refreshed.providers.some(
-            (provider) => provider.provider === "codex",
-          );
-          if (!includesCodex) {
-            throw new Error("Desktop E2E provider refresh omitted the enabled Codex provider.");
-          }
-
-          await new Promise<void>((resolve) =>
-            setTimeout(resolve, E2E_READINESS_STABILITY_DELAY_MS),
-          );
-          const snapshot = await requestOnSameSession(() => api.orchestration.getShellSnapshot());
-          return {
-            snapshotSequence: snapshot.snapshotSequence,
-            providers: refreshed.providers,
-          };
-        } catch (error) {
-          lastError = error instanceof Error ? error : new Error(String(error));
-        }
-        const remainingRetryMs = retryDeadline - Date.now();
-        if (remainingRetryMs <= 0) break;
-        await new Promise<void>((resolve) =>
-          setTimeout(resolve, Math.min(E2E_READINESS_RETRY_DELAY_MS, remainingRetryMs)),
-        );
-      }
-      throw lastError instanceof Error
-        ? lastError
-        : new Error("Desktop E2E renderer readiness probe failed.");
-    },
-  };
-}
+const RETRY_ON_SESSION_INTERRUPTION = { retryOnSessionInterruption: true } as const;
 
 function createListenerRegistry<T>() {
   const listeners = new Set<(payload: T) => void>();
@@ -706,7 +629,12 @@ export function createWsNativeApi(): NativeApi {
         await transport.dispose();
         return result;
       },
-      refreshProviders: () => transport.request(WS_METHODS.serverRefreshProviders),
+      refreshProviders: () =>
+        transport.request(
+          WS_METHODS.serverRefreshProviders,
+          undefined,
+          RETRY_ON_SESSION_INTERRUPTION,
+        ),
       // Provider updates run up to 2 minutes server-side; callers wrap this in
       // withProviderUpdateTimeout, which owns the client-side watchdog.
       updateProvider: (input) =>
@@ -754,14 +682,23 @@ export function createWsNativeApi(): NativeApi {
       listModels: (input) => transport.request(WS_METHODS.providerListModels, input),
       listAgents: (input) => transport.request(WS_METHODS.providerListAgents, input),
     },
-    orchestration: {
-      getSnapshot: () => transport.request(ORCHESTRATION_WS_METHODS.getSnapshot),
-      getShellSnapshot: () => transport.request(ORCHESTRATION_WS_METHODS.getShellSnapshot),
-      dispatchCommand: (command) => {
-        return transport.request(ORCHESTRATION_WS_METHODS.dispatchCommand, {
-          command: omitNullUserInputAnswers(command),
-        });
-      },
+      orchestration: {
+        getSnapshot: () => transport.request(ORCHESTRATION_WS_METHODS.getSnapshot),
+        getShellSnapshot: () =>
+          transport.request(
+            ORCHESTRATION_WS_METHODS.getShellSnapshot,
+            undefined,
+            RETRY_ON_SESSION_INTERRUPTION,
+          ),
+        dispatchCommand: (command) => {
+          return transport.request(
+            ORCHESTRATION_WS_METHODS.dispatchCommand,
+            {
+              command: omitNullUserInputAnswers(command),
+            },
+            RETRY_ON_SESSION_INTERRUPTION,
+          );
+        },
       importThread: (input) => transport.request(ORCHESTRATION_WS_METHODS.importThread, input),
       repairState: () => transport.request(ORCHESTRATION_WS_METHODS.repairState),
       getTurnDiff: (input) => transport.request(ORCHESTRATION_WS_METHODS.getTurnDiff, input),
@@ -993,7 +930,6 @@ export function createWsNativeApi(): NativeApi {
   };
 
   instance = { api, transport };
-  installE2eRendererHarness(api, transport);
   return api;
 }
 
@@ -1004,7 +940,6 @@ export async function resetWsNativeApiForTest(): Promise<void> {
   instance = null;
   clearWsNativeApiListeners();
   fallbackBrowserStates.clear();
-  clearE2eRendererHarness();
   await transport?.dispose();
 }
 
@@ -1013,6 +948,5 @@ if (import.meta.hot) {
     void instance?.transport.dispose();
     instance = null;
     clearWsNativeApiListeners();
-    clearE2eRendererHarness();
   });
 }

@@ -14,6 +14,12 @@ import {
   type Page,
   type TestInfo,
 } from "@playwright/test";
+import {
+  clearFailureDiagnosticsAttempt,
+  createDesktopE2eFailureSummary,
+  desktopFailureDiagnosticsRoot,
+  writeDesktopE2eFailureSummary,
+} from "./support/failureDiagnostics";
 import { closeElectronApplication } from "./support/processTree";
 
 const requireFromFixture = createRequire(__filename);
@@ -22,14 +28,28 @@ const DESKTOP_MAIN_PATH = Path.join(REPO_ROOT, "apps/desktop/dist-electron/main.
 const ELECTRON_BOOTSTRAP_PATH = Path.join(__dirname, "fixtures/electron-bootstrap.cjs");
 const DIAGNOSTIC_REDACTION_PATH = Path.join(__dirname, "fixtures/diagnostic-redaction.cjs");
 const FAKE_CODEX_SOURCE_PATH = Path.join(__dirname, "fixtures/fake-codex.ts");
+const LOOPBACK_HELPER_PATH = Path.join(__dirname, "fixtures/loopback.cjs");
 const NETWORK_GUARD_PATH = Path.join(__dirname, "fixtures/network-guard.cjs");
+const FAILURE_DIAGNOSTICS_ROOT = desktopFailureDiagnosticsRoot(REPO_ROOT);
 const { redactDiagnosticText } = requireFromFixture(DIAGNOSTIC_REDACTION_PATH) as {
   readonly redactDiagnosticText: (value: unknown) => string;
 };
-type JsonRecord = Record<string, unknown>;
-interface RendererReadinessResult {
-  readonly snapshotSequence: number;
-  readonly providers: ReadonlyArray<JsonRecord>;
+export type JsonRecord = Record<string, unknown>;
+const MALFORMED_JSON_LINE_FIELD = "fixtureMalformedJsonLine";
+
+export function parseDiagnosticJsonLines(raw: string): readonly JsonRecord[] {
+  const lines = raw.split(/\r?\n/u);
+  return lines.flatMap((line, index): readonly JsonRecord[] => {
+    if (line.length === 0) return [];
+    try {
+      const parsed: unknown = JSON.parse(line);
+      return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+        ? [parsed as JsonRecord]
+        : [{ [MALFORMED_JSON_LINE_FIELD]: true, lineNumber: index + 1 }];
+    } catch {
+      return [{ [MALFORMED_JSON_LINE_FIELD]: true, lineNumber: index + 1 }];
+    }
+  });
 }
 
 function formatAggregateError(error: unknown): string {
@@ -39,6 +59,11 @@ function formatAggregateError(error: unknown): string {
   }
   if (error instanceof Error) return error.stack ?? `${error.name}: ${error.message}`;
   return String(error);
+}
+
+function failureDiagnosticAttemptName(testInfo: TestInfo): string {
+  const safeTestId = testInfo.testId.replace(/[^A-Za-z0-9_.-]+/gu, "-").slice(0, 120);
+  return `${safeTestId || "unknown-test"}-worker-${testInfo.workerIndex}-retry-${testInfo.retry}`;
 }
 
 const PROVIDER_ENV_PREFIXES = [
@@ -67,6 +92,7 @@ const EXPLICIT_ENV_KEYS_TO_REMOVE = new Set([
   "NPM_CONFIG_USERCONFIG",
   "SSH_ASKPASS",
   "SSH_AUTH_SOCK",
+  "VITEST",
 ]);
 const CHROMIUM_NETWORK_GUARD_ARGS = [
   "--disable-background-networking",
@@ -433,7 +459,7 @@ async function seedServerSettings(
   );
 }
 
-function isolatedElectronEnv(input: {
+export function isolatedElectronEnv(input: {
   readonly desktopMainPath: string;
   readonly fakeCodexPath: string;
   readonly homeDir: string;
@@ -495,17 +521,11 @@ function isolatedElectronEnv(input: {
     SYNARA_E2E_NETWORK_LOG_PATH: input.networkLogPath,
     SYNARA_E2E_NETWORK_GUARD_PATH: input.networkGuardPath,
     SYNARA_E2E_WORKSPACE_PATH: input.workspaceDir,
-    SYNARA_FAKE_CODEX_INVOCATION_LOG_PATH: input.invocationLogPath,
-    SYNARA_FAKE_CODEX_NETWORK_LOG_PATH: input.networkLogPath,
-    SYNARA_FAKE_CODEX_NETWORK_GUARD_PATH: input.networkGuardPath,
-    SYNARA_FAKE_CODEX_PROTOCOL_LOG_PATH: input.protocolLogPath,
-    SYNARA_FAKE_CODEX_WORKSPACE_PATH: input.workspaceDir,
     SYNARA_HOME: input.homeDir,
     SYNARA_LOG_PROVIDER_EVENTS: "1",
     SYNARA_LOG_WS_EVENTS: "1",
     SYNARA_NO_BROWSER: "1",
     SYNARA_TELEMETRY_ENABLED: "0",
-    VITEST: "1",
     all_proxy: "http://127.0.0.1:9",
     http_proxy: "http://127.0.0.1:9",
     https_proxy: "http://127.0.0.1:9",
@@ -522,6 +542,7 @@ export class DesktopHarness {
   readonly operationalBase: string;
   readonly operationalDir: string;
   readonly runtimeDir: string;
+  readonly failureDiagnosticsDir: string;
   readonly homeDir: string;
   readonly profileDir: string;
   readonly workspaceDir: string;
@@ -543,7 +564,11 @@ export class DesktopHarness {
   ) {
     this.operationalBase = operationalBase;
     this.operationalDir = operationalDir;
-    this.runtimeDir = testInfo.outputPath("runtime");
+    this.runtimeDir = Path.join(this.operationalDir, "runtime");
+    this.failureDiagnosticsDir = Path.join(
+      FAILURE_DIAGNOSTICS_ROOT,
+      failureDiagnosticAttemptName(testInfo),
+    );
     this.homeDir = Path.join(this.operationalDir, "home");
     this.profileDir = Path.join(this.operationalDir, "profile");
     this.workspaceDir = Path.join(this.operationalDir, "workspace");
@@ -565,6 +590,7 @@ export class DesktopHarness {
     const operationalDir = await FS.promises.mkdtemp(Path.join(operationalBase, "synara-e2e-"));
     const harness = new DesktopHarness(testInfo, operationalBase, operationalDir);
     try {
+      await clearFailureDiagnosticsAttempt(REPO_ROOT, harness.failureDiagnosticsDir);
       await FS.promises.mkdir(harness.runtimeDir, { recursive: true });
       await FS.promises.mkdir(harness.workspaceDir, { recursive: true });
       await FS.promises.mkdir(harness.profileDir, { recursive: true });
@@ -575,6 +601,10 @@ export class DesktopHarness {
         DIAGNOSTIC_REDACTION_PATH,
         Path.join(harness.operationalDir, "diagnostic-redaction.cjs"),
       );
+      await FS.promises.copyFile(
+        LOOPBACK_HELPER_PATH,
+        Path.join(harness.operationalDir, "loopback.cjs"),
+      );
       await FS.promises.copyFile(NETWORK_GUARD_PATH, harness.networkGuardPath);
       preflightNodeNetworkGuard({
         cwd: harness.workspaceDir,
@@ -582,6 +612,17 @@ export class DesktopHarness {
         networkLogPath: harness.networkLogPath,
       });
       const fakeCodexRuntimePath = await buildFakeCodexRuntime(harness.operationalDir);
+      await FS.promises.writeFile(
+        Path.join(harness.operationalDir, "fake-codex-config.json"),
+        `${JSON.stringify({
+          invocationLogPath: harness.invocationLogPath,
+          networkGuardPath: harness.networkGuardPath,
+          networkLogPath: harness.networkLogPath,
+          protocolLogPath: harness.protocolLogPath,
+          workspacePath: harness.workspaceDir,
+        })}\n`,
+        { encoding: "utf8", mode: 0o600 },
+      );
       const fakeCodexPath = await createFakeCodexLauncher(
         harness.operationalDir,
         fakeCodexRuntimePath,
@@ -594,7 +635,7 @@ export class DesktopHarness {
       return harness;
     } catch (error) {
       try {
-        await harness.finish();
+        await harness.finish(true);
       } catch (cleanupError) {
         throw new AggregateError(
           [error, cleanupError],
@@ -649,17 +690,9 @@ export class DesktopHarness {
     );
     await FS.promises.appendFile(
       this.desktopLogPath,
-      [
-        `[e2e] fake-codex=${this.fakeCodexPath}`,
-        `[e2e] codex-path-candidates=${JSON.stringify(codexPathCandidates)}`,
-        `[e2e] isolated-path=${launchEnv.PATH ?? ""}`,
-        "",
-      ].join("\n"),
+      `[e2e] isolated-codex-candidate-count=${codexPathCandidates.length}\n`,
       "utf8",
     );
-    // Exclude the direct launcher preflight while retaining every provider probe from this
-    // Electron launch, including a startup refresh that begins before renderer readiness.
-    const rendererRpcInvocationBaseline = (await this.readJsonLines(this.invocationLogPath)).length;
     const electronApp = await _electron.launch({
       executablePath: electronPath,
       args: [...CHROMIUM_NETWORK_GUARD_ARGS, ELECTRON_BOOTSTRAP_PATH],
@@ -750,70 +783,31 @@ export class DesktopHarness {
       await expect(page.getByRole("button", { name: "Settings", exact: true })).toBeVisible({
         timeout: 60_000,
       });
+      await expect
+        .poll(
+          async () =>
+            (await this.readJsonLines(this.networkLogPath))
+              .slice(networkEventBaseline)
+              .some((entry) => {
+                if (
+                  entry.event !== "request-completed" ||
+                  entry.layer !== "chromium" ||
+                  entry.statusCode !== 101 ||
+                  typeof entry.url !== "string"
+                ) {
+                  return false;
+                }
+                try {
+                  return new URL(entry.url).pathname === "/ws";
+                } catch {
+                  return false;
+                }
+              }),
+          { timeout: 30_000 },
+        )
+        .toBe(true);
       await expect(page.getByLabel("Loading projects")).toBeHidden({ timeout: 60_000 });
       await expect.poll(() => page.evaluate(() => document.visibilityState)).toBe("visible");
-      const rendererReadiness = await page.evaluate(async () => {
-        const harness = (
-          window as typeof window & {
-            __synaraE2e?: { probeReadiness: () => Promise<RendererReadinessResult> };
-          }
-        ).__synaraE2e;
-        if (!harness) {
-          throw new Error("Desktop E2E renderer readiness probe is unavailable.");
-        }
-        return harness.probeReadiness();
-      });
-      expect(rendererReadiness.snapshotSequence).toBeGreaterThanOrEqual(0);
-      const codexReadiness = rendererReadiness.providers.find(
-        (provider) => provider.provider === "codex",
-      );
-      if (!codexReadiness) {
-        throw new Error(
-          `Desktop E2E renderer readiness omitted Codex: ${JSON.stringify(rendererReadiness.providers)}`,
-        );
-      }
-      expect(codexReadiness).toMatchObject({
-        status: "ready",
-        available: true,
-        authStatus: "authenticated",
-      });
-
-      const invocations = (await this.readJsonLines(this.invocationLogPath)).slice(
-        rendererRpcInvocationBaseline,
-      );
-      const networkEvents = (await this.readJsonLines(this.networkLogPath)).slice(
-        networkEventBaseline,
-      );
-      const guardedProcesses = new Set(
-        networkEvents.flatMap((entry) =>
-          entry.event === "guard-installed" &&
-          entry.role === "fake-codex" &&
-          typeof entry.pid === "number" &&
-          Array.isArray(entry.args)
-            ? [JSON.stringify([entry.pid, entry.args])]
-            : [],
-        ),
-      );
-      const healthInvocations = invocations.filter(
-        (entry) =>
-          typeof entry.pid === "number" &&
-          Array.isArray(entry.args) &&
-          (JSON.stringify(entry.args) === JSON.stringify(["--version"]) ||
-            JSON.stringify(entry.args) === JSON.stringify(["login", "status"])),
-      );
-      expect({
-        version: healthInvocations.some(
-          (entry) => JSON.stringify(entry.args) === JSON.stringify(["--version"]),
-        ),
-        auth: healthInvocations.some(
-          (entry) => JSON.stringify(entry.args) === JSON.stringify(["login", "status"]),
-        ),
-        guarded:
-          healthInvocations.length >= 2 &&
-          healthInvocations.every((entry) =>
-            guardedProcesses.has(JSON.stringify([entry.pid, entry.args])),
-          ),
-      }).toEqual({ version: true, auth: true, guarded: true });
     } catch (error) {
       try {
         await this.stop();
@@ -839,7 +833,7 @@ export class DesktopHarness {
     if (electronApp) await closeElectronApplication(electronApp);
   }
 
-  async finish(): Promise<void> {
+  async finish(forceDiagnostics = false): Promise<void> {
     if (this.finished) return;
     this.finished = true;
     const errors: unknown[] = [];
@@ -847,87 +841,6 @@ export class DesktopHarness {
       await this.stop();
     } catch (error) {
       errors.push(error);
-    }
-    const backendLogsPath = Path.join(this.homeDir, "userdata", "logs");
-    const preservedBackendLogsPath = Path.join(this.runtimeDir, "backend-logs");
-    const stateDatabasePath = Path.join(this.homeDir, "userdata", "state.sqlite");
-    const preservedStateDatabasePath = Path.join(this.runtimeDir, "state.sqlite");
-    const stateDatabaseArtifacts = [
-      { source: stateDatabasePath, destination: preservedStateDatabasePath },
-      { source: `${stateDatabasePath}-wal`, destination: `${preservedStateDatabasePath}-wal` },
-      { source: `${stateDatabasePath}-shm`, destination: `${preservedStateDatabasePath}-shm` },
-    ] as const;
-    try {
-      if (FS.existsSync(backendLogsPath)) {
-        await FS.promises.cp(backendLogsPath, preservedBackendLogsPath, { recursive: true });
-      }
-    } catch (error) {
-      errors.push(error);
-    }
-    try {
-      for (const artifact of stateDatabaseArtifacts) {
-        if (FS.existsSync(artifact.source)) {
-          await FS.promises.copyFile(artifact.source, artifact.destination);
-        }
-      }
-    } catch (error) {
-      errors.push(error);
-    }
-    try {
-      await this.removeOperationalRoot();
-    } catch (error) {
-      errors.push(error);
-    }
-    const attachments = [
-      { name: "desktop-log", path: this.desktopLogPath, contentType: "text/plain" },
-      {
-        name: "codex-invocation-log",
-        path: this.invocationLogPath,
-        contentType: "application/x-ndjson",
-      },
-      {
-        name: "codex-protocol-log",
-        path: this.protocolLogPath,
-        contentType: "application/x-ndjson",
-      },
-      { name: "network-log", path: this.networkLogPath, contentType: "application/x-ndjson" },
-      {
-        name: "server-log",
-        path: Path.join(preservedBackendLogsPath, "server.log"),
-        contentType: "text/plain",
-      },
-      {
-        name: "desktop-main-log",
-        path: Path.join(preservedBackendLogsPath, "desktop-main.log"),
-        contentType: "text/plain",
-      },
-      {
-        name: "provider-event-log",
-        path: Path.join(preservedBackendLogsPath, "provider", "events.log"),
-        contentType: "text/plain",
-      },
-      {
-        name: "state-database",
-        path: preservedStateDatabasePath,
-        contentType: "application/vnd.sqlite3",
-      },
-      {
-        name: "state-database-wal",
-        path: `${preservedStateDatabasePath}-wal`,
-        contentType: "application/octet-stream",
-      },
-      {
-        name: "state-database-shm",
-        path: `${preservedStateDatabasePath}-shm`,
-        contentType: "application/octet-stream",
-      },
-    ];
-    for (const attachment of attachments) {
-      try {
-        if (FS.existsSync(attachment.path)) await this.testInfo.attach(attachment.name, attachment);
-      } catch (error) {
-        errors.push(error);
-      }
     }
     try {
       const networkEvents = await this.readJsonLines(this.networkLogPath);
@@ -1001,6 +914,18 @@ export class DesktopHarness {
       }
       const protocolEvents = await this.readJsonLines(this.protocolLogPath);
       const invocationEvents = await this.readJsonLines(this.invocationLogPath);
+      const malformedDiagnosticLineCount = [
+        ...networkEvents,
+        ...protocolEvents,
+        ...invocationEvents,
+      ].filter((entry) => entry[MALFORMED_JSON_LINE_FIELD] === true).length;
+      if (malformedDiagnosticLineCount > 0) {
+        errors.push(
+          new Error(
+            `Desktop E2E observed ${malformedDiagnosticLineCount} complete malformed diagnostic JSON line(s).`,
+          ),
+        );
+      }
       const invocationProcessKeys = new Set(
         invocationEvents.flatMap((entry) =>
           typeof entry.pid === "number" && Array.isArray(entry.args)
@@ -1219,6 +1144,32 @@ export class DesktopHarness {
     } catch (error) {
       errors.push(error);
     }
+    let diagnosticsPreserved = false;
+    if (
+      forceDiagnostics ||
+      this.testInfo.status !== this.testInfo.expectedStatus ||
+      errors.length > 0
+    ) {
+      try {
+        await this.preserveFailureDiagnostics(errors, forceDiagnostics);
+        diagnosticsPreserved = true;
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    try {
+      await this.removeOperationalRoot();
+    } catch (error) {
+      errors.push(error);
+      if (!diagnosticsPreserved) {
+        try {
+          await this.preserveFailureDiagnostics(errors, forceDiagnostics);
+          diagnosticsPreserved = true;
+        } catch (diagnosticError) {
+          errors.push(diagnosticError);
+        }
+      }
+    }
     if (errors.length > 0) {
       const errorSummary = errors
         .map((error, index) => `[${index + 1}] ${formatAggregateError(error)}`)
@@ -1228,6 +1179,24 @@ export class DesktopHarness {
         `Desktop E2E teardown or isolation validation failed:\n${errorSummary}`,
       );
     }
+  }
+
+  private async preserveFailureDiagnostics(
+    errors: readonly unknown[],
+    forced: boolean,
+  ): Promise<void> {
+    const attemptName = Path.basename(this.failureDiagnosticsDir);
+    const summary = createDesktopE2eFailureSummary({
+      status: this.testInfo.status,
+      expectedStatus: this.testInfo.expectedStatus,
+      forced,
+      validationErrorCount: errors.length,
+    });
+    const summaryPath = await writeDesktopE2eFailureSummary(REPO_ROOT, attemptName, summary);
+    await this.testInfo.attach("failure-summary", {
+      path: summaryPath,
+      contentType: "application/json",
+    });
   }
 
   private async removeOperationalRoot(): Promise<void> {
@@ -1253,10 +1222,7 @@ export class DesktopHarness {
   private async readJsonLines(filePath: string): Promise<readonly JsonRecord[]> {
     if (!FS.existsSync(filePath)) return [];
     const raw = await FS.promises.readFile(filePath, "utf8");
-    return raw
-      .split(/\r?\n/u)
-      .filter(Boolean)
-      .map((line) => JSON.parse(line) as JsonRecord);
+    return parseDiagnosticJsonLines(raw);
   }
 
   async readProtocolLog(): Promise<readonly JsonRecord[]> {

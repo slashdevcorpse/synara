@@ -235,6 +235,22 @@ interface BrowserManagerInternals {
     },
     tab: BrowserTabState,
   ) => void;
+  loadTab: (
+    threadId: ThreadId,
+    tabId: string,
+    options: {
+      force: boolean;
+      runtime: {
+        key: string;
+        threadId: ThreadId;
+        tabId: string;
+        webContents: FakeWebContents;
+        view: null;
+        ownsWebContents: boolean;
+        listenerDisposers: Array<() => void>;
+      };
+    },
+  ) => Promise<void>;
   pendingRuntimeSyncs: Map<string, { threadId: ThreadId; tabId: string; faviconUrls?: string[] }>;
   runtimes: Map<string, FakeRuntime>;
   states: Map<ThreadId, ThreadBrowserState>;
@@ -831,6 +847,146 @@ describe("DesktopBrowserManager local-preview lifecycle", () => {
     expect(webContents.stop).toHaveBeenCalled();
     expect(webContents.debugger.attach).toHaveBeenCalledWith("1.3");
     expect(webContents.loadURL).toHaveBeenCalledWith(FIRST_PREVIEW_URL);
+  });
+
+  it("keeps the managed target while an adopted inert webview starts loading it", async () => {
+    const manager = new DesktopBrowserManager();
+    const targetUrl = "http://127.0.0.1:54321/";
+    const tab = manager.open({ threadId: THREAD_ID, initialUrl: targetUrl }).tabs[0]!;
+    const webContents = new FakeWebContents();
+    vi.spyOn(webContents, "isLoading").mockReturnValue(true);
+    webContents.loadURL.mockImplementation(async () => {
+      webContents.emit("did-start-loading");
+      await Promise.resolve();
+    });
+    electronMocks.webContentsFromId.mockReturnValue(webContents);
+
+    await manager.attachWebview({
+      threadId: THREAD_ID,
+      tabId: tab.id,
+      webContentsId: webContents.id,
+    });
+
+    expect(webContents.loadURL).toHaveBeenCalledWith(targetUrl);
+    expect(manager.getState({ threadId: THREAD_ID }).tabs[0]).toMatchObject({
+      url: targetUrl,
+      lastCommittedUrl: null,
+      isLoading: true,
+    });
+  });
+
+  it("closes adopted renderer webviews during manager disposal", async () => {
+    const manager = new DesktopBrowserManager();
+    const tab = manager.open({ threadId: THREAD_ID }).tabs[0]!;
+    const webContents = new FakeWebContents();
+    electronMocks.webContentsFromId.mockReturnValue(webContents);
+
+    await manager.attachWebview({
+      threadId: THREAD_ID,
+      tabId: tab.id,
+      webContentsId: webContents.id,
+    });
+    manager.dispose();
+
+    expect(webContents.close).toHaveBeenCalledWith({ waitForBeforeUnload: false });
+    expect(managerInternals(manager).runtimes.size).toBe(0);
+  });
+
+  it("continues disposing renderer webviews when one close races with destruction", async () => {
+    const manager = new DesktopBrowserManager();
+    const secondThreadId = "thread-dispose-race" as ThreadId;
+    const firstTab = manager.open({ threadId: THREAD_ID }).tabs[0]!;
+    const secondTab = manager.open({ threadId: secondThreadId }).tabs[0]!;
+    const firstWebContents = new FakeWebContents();
+    const secondWebContents = new FakeWebContents();
+    firstWebContents.close.mockImplementation(() => {
+      throw new Error("Object has been destroyed");
+    });
+    electronMocks.webContentsFromId
+      .mockReturnValueOnce(firstWebContents)
+      .mockReturnValueOnce(secondWebContents);
+
+    await manager.attachWebview({
+      threadId: THREAD_ID,
+      tabId: firstTab.id,
+      webContentsId: firstWebContents.id,
+    });
+    await manager.attachWebview({
+      threadId: secondThreadId,
+      tabId: secondTab.id,
+      webContentsId: secondWebContents.id,
+    });
+
+    expect(() => manager.dispose()).not.toThrow();
+    expect(firstWebContents.close).toHaveBeenCalledWith({ waitForBeforeUnload: false });
+    expect(secondWebContents.close).toHaveBeenCalledWith({ waitForBeforeUnload: false });
+    expect(managerInternals(manager).runtimes.size).toBe(0);
+    expect(managerInternals(manager).states.size).toBe(0);
+  });
+
+  it("leaves renderer webviews open during a normal detach", async () => {
+    const manager = new DesktopBrowserManager();
+    const tab = manager.open({ threadId: THREAD_ID }).tabs[0]!;
+    const webContents = new FakeWebContents();
+    electronMocks.webContentsFromId.mockReturnValue(webContents);
+
+    await manager.attachWebview({
+      threadId: THREAD_ID,
+      tabId: tab.id,
+      webContentsId: webContents.id,
+    });
+    manager.detachWebview({
+      threadId: THREAD_ID,
+      tabId: tab.id,
+      webContentsId: webContents.id,
+    });
+
+    expect(webContents.close).not.toHaveBeenCalled();
+    expect(managerInternals(manager).runtimes.size).toBe(0);
+  });
+
+  it("ignores a replaced runtime load failure while the adopted webview takes over", async () => {
+    const manager = new DesktopBrowserManager();
+    const targetUrl = "http://127.0.0.1:54321/";
+    const tab = manager.open({ threadId: THREAD_ID, initialUrl: targetUrl }).tabs[0]!;
+    let rejectStaleLoad: ((error: Error) => void) | undefined;
+    const staleLoad = new Promise<void>((_resolve, reject) => {
+      rejectStaleLoad = reject;
+    });
+    const staleWebContents = new FakeWebContents();
+    staleWebContents.loadURL.mockReturnValue(staleLoad);
+    const staleRuntime = {
+      key: `${THREAD_ID}:${tab.id}`,
+      threadId: THREAD_ID,
+      tabId: tab.id,
+      webContents: staleWebContents,
+      view: null,
+      ownsWebContents: true,
+      listenerDisposers: [],
+    };
+    const internals = managerInternals(manager);
+    internals.runtimes.set(staleRuntime.key, staleRuntime);
+
+    const pendingLoad = internals.loadTab(THREAD_ID, tab.id, {
+      force: true,
+      runtime: staleRuntime,
+    });
+    await Promise.resolve();
+
+    const adoptedRuntime = {
+      ...staleRuntime,
+      webContents: new FakeWebContents(),
+      ownsWebContents: false,
+    };
+    internals.runtimes.set(staleRuntime.key, adoptedRuntime);
+    rejectStaleLoad?.(new Error("Object has been destroyed"));
+    await pendingLoad;
+
+    expect(manager.getState({ threadId: THREAD_ID }).tabs[0]).toMatchObject({
+      url: targetUrl,
+      isLoading: true,
+      lastError: null,
+    });
   });
 
   it("closes a renderer webview whose document committed before first adoption", async () => {

@@ -6,6 +6,7 @@
 import { Cause, Effect, Stream } from "effect";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  ORCHESTRATION_WS_METHODS,
   WS_CHANNELS,
   WS_COMPATIBILITY_QUERY,
   WS_PROTOCOL_EPOCH,
@@ -33,6 +34,7 @@ import {
   retainShellSubscription,
   shellReconnectInput,
   shouldReconnectAfterStreamFailure,
+  shouldRecoverUnaryRequest,
   consumeWorkspaceCloneProgressStream,
   WsTransport,
 } from "./wsTransport";
@@ -111,6 +113,30 @@ afterEach(() => {
   vi.unstubAllEnvs();
   vi.restoreAllMocks();
 });
+
+function stubUnaryTransport(
+  initialClient: unknown,
+  reconnectedClient: unknown = initialClient,
+): {
+  readonly transport: WsTransport;
+  readonly getClient: ReturnType<typeof vi.fn>;
+  readonly reconnect: ReturnType<typeof vi.fn>;
+} {
+  const transport = new WsTransport("ws://localhost:3020");
+  const getClient = vi.fn().mockResolvedValue(initialClient);
+  const reconnect = vi.fn().mockResolvedValue(reconnectedClient);
+  const internals = transport as unknown as {
+    getClient: () => Promise<unknown>;
+    getClientRuntime: (client: unknown) => unknown;
+    reconnect: () => Promise<unknown>;
+    state: "open";
+  };
+  internals.getClient = getClient;
+  internals.getClientRuntime = () => ({ runPromiseExit: Effect.runPromiseExit });
+  internals.reconnect = reconnect;
+  internals.state = "open";
+  return { transport, getClient, reconnect };
+}
 
 describe("WsTransport", () => {
   it("retains the shell input and resumes after the last delivered sequence", () => {
@@ -556,6 +582,344 @@ describe("WsTransport", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("replays an interrupted dispatch with the exact normalized command", async () => {
+    const command = {
+      type: "thread.user-input.respond",
+      commandId: "command-1",
+      threadId: "thread-1",
+      requestId: "request-1",
+      answers: { Language: null, Runtime: "Bun" },
+      createdAt: "2026-07-21T00:00:00.000Z",
+    };
+    const firstDispatch = vi.fn((_input: unknown) => Effect.interrupt);
+    const secondDispatch = vi.fn((_input: unknown) => Effect.succeed({ sequence: 4 }));
+    const firstClient = { [ORCHESTRATION_WS_METHODS.dispatchCommand]: firstDispatch };
+    const secondClient = { [ORCHESTRATION_WS_METHODS.dispatchCommand]: secondDispatch };
+    const { transport, reconnect } = stubUnaryTransport(firstClient, secondClient);
+
+    try {
+      await expect(
+        transport.request(
+          ORCHESTRATION_WS_METHODS.dispatchCommand,
+          { command },
+          { retryOnSessionInterruption: true },
+        ),
+      ).resolves.toEqual({ sequence: 4 });
+      expect(reconnect).toHaveBeenCalledTimes(1);
+      const firstInput = firstDispatch.mock.calls[0]?.[0];
+      const secondInput = secondDispatch.mock.calls[0]?.[0];
+      expect(firstInput).not.toBe(command);
+      expect(firstInput).toEqual({
+        ...command,
+        answers: { Runtime: "Bun" },
+      });
+      expect(secondInput).toBe(firstInput);
+    } finally {
+      await transport.dispose();
+    }
+  });
+
+  it("stops after one replay when the replacement session is also interrupted", async () => {
+    const firstDispatch = vi.fn(() => Effect.interrupt);
+    const secondDispatch = vi.fn(() => Effect.interrupt);
+    const firstClient = { [ORCHESTRATION_WS_METHODS.dispatchCommand]: firstDispatch };
+    const secondClient = { [ORCHESTRATION_WS_METHODS.dispatchCommand]: secondDispatch };
+    const { transport, reconnect } = stubUnaryTransport(firstClient, secondClient);
+
+    try {
+      await expect(
+        transport.request(
+          ORCHESTRATION_WS_METHODS.dispatchCommand,
+          { command: { type: "project.archive", commandId: "command-2" } },
+          { retryOnSessionInterruption: true },
+        ),
+      ).rejects.toBeInstanceOf(Error);
+      expect(reconnect).toHaveBeenCalledTimes(1);
+      expect(firstDispatch).toHaveBeenCalledTimes(1);
+      expect(secondDispatch).toHaveBeenCalledTimes(1);
+    } finally {
+      await transport.dispose();
+    }
+  });
+
+  it("shares reconnect across concurrent callers while preserving independent deadlines", async () => {
+    vi.useFakeTimers();
+    const firstDispatch = vi.fn(() => Effect.interrupt);
+    const secondDispatch = vi.fn((command: { readonly commandId?: string }) =>
+      Effect.succeed({ sequence: command.commandId === "command-long" ? 12 : 11 }),
+    );
+    const firstClient = { [ORCHESTRATION_WS_METHODS.dispatchCommand]: firstDispatch };
+    const secondClient = { [ORCHESTRATION_WS_METHODS.dispatchCommand]: secondDispatch };
+    const transport = new WsTransport("ws://localhost:3020");
+    let resolveReconnect!: (client: unknown) => void;
+    const reconnectGate = new Promise<unknown>((resolve) => {
+      resolveReconnect = resolve;
+    });
+    let resolveSharedWaiter!: () => void;
+    const sharedWaiter = new Promise<void>((resolve) => {
+      resolveSharedWaiter = resolve;
+    });
+    const internals = transport as unknown as {
+      getClient: () => Promise<unknown>;
+      getClientRuntime: (client: unknown) => unknown;
+      reconnect: () => Promise<unknown>;
+      reconnectPromise: Promise<unknown> | null;
+      sessionVersion: number;
+      state: "connecting" | "open";
+    };
+    internals.getClient = vi.fn(() => {
+      if (internals.reconnectPromise) {
+        resolveSharedWaiter();
+        return internals.reconnectPromise;
+      }
+      return Promise.resolve(firstClient);
+    });
+    internals.getClientRuntime = () => ({ runPromiseExit: Effect.runPromiseExit });
+    const reconnect = vi.fn(() => {
+      if (internals.reconnectPromise) return internals.reconnectPromise;
+      internals.state = "connecting";
+      const pending = reconnectGate
+        .then((client) => {
+          internals.sessionVersion += 1;
+          internals.state = "open";
+          return client;
+        })
+        .finally(() => {
+          internals.reconnectPromise = null;
+        });
+      internals.reconnectPromise = pending;
+      return pending;
+    });
+    internals.reconnect = reconnect;
+    internals.reconnectPromise = null;
+    internals.state = "open";
+
+    try {
+      const shortRequest = transport.request(
+        ORCHESTRATION_WS_METHODS.dispatchCommand,
+        { command: { type: "project.archive", commandId: "command-short" } },
+        { timeoutMs: 30, retryOnSessionInterruption: true },
+      );
+      const shortOutcome = shortRequest.catch((error: unknown) => error);
+      let longSettled = false;
+      const longRequest = transport.request(
+        ORCHESTRATION_WS_METHODS.dispatchCommand,
+        { command: { type: "project.archive", commandId: "command-long" } },
+        { timeoutMs: 300, retryOnSessionInterruption: true },
+      );
+      void longRequest.then(
+        () => {
+          longSettled = true;
+        },
+        () => {
+          longSettled = true;
+        },
+      );
+
+      await sharedWaiter;
+      expect(firstDispatch).toHaveBeenCalledTimes(2);
+      expect(reconnect).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(30);
+      await expect(shortOutcome).resolves.toMatchObject({
+        _tag: "WsTransportRequestInterruptedError",
+        code: "WS_REQUEST_TIMEOUT",
+      });
+      expect(longSettled).toBe(false);
+
+      resolveReconnect(secondClient);
+      await vi.advanceTimersByTimeAsync(0);
+      await expect(longRequest).resolves.toEqual({ sequence: 12 });
+      expect(secondDispatch).toHaveBeenCalledTimes(1);
+      expect(reconnect).toHaveBeenCalledTimes(1);
+    } finally {
+      await transport.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  it("recovers an opted-in read request but not an ordinary interrupted request", async () => {
+    const firstShellSnapshot = vi.fn(() => Effect.interrupt);
+    const secondShellSnapshot = vi.fn(() => Effect.succeed({ snapshotSequence: 5 }));
+    const firstClient = { [ORCHESTRATION_WS_METHODS.getShellSnapshot]: firstShellSnapshot };
+    const secondClient = { [ORCHESTRATION_WS_METHODS.getShellSnapshot]: secondShellSnapshot };
+    const recovered = stubUnaryTransport(firstClient, secondClient);
+
+    try {
+      await expect(
+        recovered.transport.request(ORCHESTRATION_WS_METHODS.getShellSnapshot, undefined, {
+          retryOnSessionInterruption: true,
+        }),
+      ).resolves.toEqual({ snapshotSequence: 5 });
+      expect(recovered.reconnect).toHaveBeenCalledTimes(1);
+    } finally {
+      await recovered.transport.dispose();
+    }
+
+    const notRecovered = stubUnaryTransport(firstClient, secondClient);
+    try {
+      await expect(
+        notRecovered.transport.request(ORCHESTRATION_WS_METHODS.getShellSnapshot),
+      ).rejects.toBeInstanceOf(Error);
+      expect(notRecovered.reconnect).not.toHaveBeenCalled();
+      expect(secondShellSnapshot).toHaveBeenCalledTimes(1);
+    } finally {
+      await notRecovered.transport.dispose();
+    }
+  });
+
+  it("does not retry typed unary failures", async () => {
+    const failure = new Error("domain rejection");
+    const dispatch = vi.fn(() => Effect.fail(failure));
+    const client = { [ORCHESTRATION_WS_METHODS.dispatchCommand]: dispatch };
+    const { transport, reconnect } = stubUnaryTransport(client);
+
+    try {
+      await expect(
+        transport.request(
+          ORCHESTRATION_WS_METHODS.dispatchCommand,
+          { command: { type: "project.archive", commandId: "command-3" } },
+          { retryOnSessionInterruption: true },
+        ),
+      ).rejects.toBe(failure);
+      expect(dispatch).toHaveBeenCalledTimes(1);
+      expect(reconnect).not.toHaveBeenCalled();
+    } finally {
+      await transport.dispose();
+    }
+  });
+
+  it("shares the outer deadline across both dispatch attempts", async () => {
+    vi.useFakeTimers();
+    const firstDispatch = vi.fn(() => Effect.sleep(10).pipe(Effect.andThen(Effect.interrupt)));
+    const secondDispatch = vi.fn(() => Effect.never);
+    const firstClient = { [ORCHESTRATION_WS_METHODS.dispatchCommand]: firstDispatch };
+    const secondClient = { [ORCHESTRATION_WS_METHODS.dispatchCommand]: secondDispatch };
+    const { transport, reconnect } = stubUnaryTransport(firstClient, secondClient);
+
+    try {
+      const pending = transport.request(
+        ORCHESTRATION_WS_METHODS.dispatchCommand,
+        { command: { type: "project.archive", commandId: "command-4" } },
+        { timeoutMs: 60, retryOnSessionInterruption: true },
+      );
+      let settled = false;
+      void pending.then(
+        () => {
+          settled = true;
+        },
+        () => {
+          settled = true;
+        },
+      );
+
+      await vi.advanceTimersByTimeAsync(0);
+      expect(firstDispatch).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(9);
+      expect(secondDispatch).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(reconnect).toHaveBeenCalledTimes(1);
+      expect(secondDispatch).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(49);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(pending).rejects.toMatchObject({
+        _tag: "WsTransportRequestInterruptedError",
+        code: "WS_REQUEST_TIMEOUT",
+      });
+      expect(settled).toBe(true);
+      expect(firstDispatch).toHaveBeenCalledTimes(1);
+      expect(secondDispatch).toHaveBeenCalledTimes(1);
+    } finally {
+      await transport.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not replay a dispatch cancelled by its caller", async () => {
+    const dispatch = vi.fn(() => Effect.never);
+    const client = { [ORCHESTRATION_WS_METHODS.dispatchCommand]: dispatch };
+    const { transport, reconnect } = stubUnaryTransport(client);
+    const controller = new AbortController();
+
+    try {
+      const pending = transport.request(
+        ORCHESTRATION_WS_METHODS.dispatchCommand,
+        { command: { type: "project.archive", commandId: "command-5" } },
+        {
+          timeoutMs: null,
+          signal: controller.signal,
+          retryOnSessionInterruption: true,
+        },
+      );
+      await vi.waitFor(() => expect(dispatch).toHaveBeenCalledTimes(1));
+      controller.abort(new Error("cancelled by test"));
+
+      await expect(pending).rejects.toMatchObject({
+        _tag: "WsTransportRequestInterruptedError",
+        code: "WS_REQUEST_ABORTED",
+      });
+      expect(dispatch).toHaveBeenCalledTimes(1);
+      expect(reconnect).not.toHaveBeenCalled();
+    } finally {
+      await transport.dispose();
+    }
+  });
+
+  it("restricts session recovery to explicitly safe unary methods", async () => {
+    const transport = new WsTransport("ws://localhost:3020");
+    try {
+      await expect(
+        transport.request(WS_METHODS.serverUpdateProvider, {}, {
+          retryOnSessionInterruption: true,
+        }),
+      ).rejects.toThrow("WebSocket RPC session recovery is not permitted");
+    } finally {
+      await transport.dispose();
+    }
+  });
+
+  it("classifies only interruptions and socket failures for unary session recovery", () => {
+    const socketFailure = Cause.fail({
+      _tag: "RpcClientError",
+      reason: { _tag: "SocketCloseError", code: 1006 },
+    });
+    expect(shouldRecoverUnaryRequest(Cause.interrupt(1))).toBe(true);
+    expect(shouldRecoverUnaryRequest(Cause.fail(new Error("domain rejection")))).toBe(false);
+    expect(
+      shouldRecoverUnaryRequest(Cause.fail(new Error("All fibers interrupted without error"))),
+    ).toBe(false);
+    expect(shouldRecoverUnaryRequest(socketFailure)).toBe(true);
+    expect(
+      shouldRecoverUnaryRequest(
+        Cause.die({
+          _tag: "SocketError",
+          reason: { _tag: "SocketWriteError", cause: new Error("closed") },
+        }),
+      ),
+    ).toBe(true);
+    expect(
+      shouldRecoverUnaryRequest(
+        Cause.fail({
+          _tag: "RpcClientError",
+          reason: { _tag: "RpcClientDefect", message: "decode failed" },
+        }),
+      ),
+    ).toBe(false);
+    expect(
+      shouldRecoverUnaryRequest(
+        Cause.fail({ _tag: "SocketWriteError", cause: new Error("unwrapped") }),
+      ),
+    ).toBe(false);
+    expect(
+      shouldRecoverUnaryRequest(Cause.combine(socketFailure, Cause.fail(new Error("domain")))),
+    ).toBe(false);
+    expect(
+      shouldRecoverUnaryRequest(Cause.combine(socketFailure, Cause.die(new Error("defect")))),
+    ).toBe(false);
   });
 
   it("keeps the shared lifecycle stream while either lifecycle channel is active", () => {

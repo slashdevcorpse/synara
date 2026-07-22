@@ -19,15 +19,35 @@ async function addAndSelectProject(
   await expect(projectsSectionLabel).toBeVisible({ timeout: 60_000 });
   await projectsSectionLabel.hover();
   const addProjectButton = page.getByRole("button", { name: "Add project", exact: true }).first();
+  const projectPathInput = page.getByRole("textbox", { name: "Project path" });
+  const projectEntry = page.getByText(PROJECT_NAME, { exact: true }).first();
   await expect(addProjectButton).toBeVisible({ timeout: 60_000 });
   await addProjectButton.click({ trial: true });
   await addProjectButton.click();
   await page.getByRole("button", { name: "Type path", exact: true }).click();
-  const projectPathInput = page.getByRole("textbox", { name: "Project path" });
   await projectPathInput.fill(workspaceDir);
   await projectPathInput.press("Enter");
-
-  await expect(page.getByText(PROJECT_NAME, { exact: true }).first()).toBeVisible();
+  const invalidProjectPathInput = page.locator(
+    'input[aria-label="Project path"][aria-invalid="true"]',
+  );
+  const projectSubmission = await Promise.race([
+    projectEntry.waitFor({ state: "visible", timeout: 60_000 }).then(() => ({
+      state: "created" as const,
+      error: null,
+    })),
+    invalidProjectPathInput.waitFor({ state: "attached", timeout: 60_000 }).then(async () => ({
+      state: "failed" as const,
+      error:
+        (await invalidProjectPathInput
+          .locator(
+            "xpath=ancestor::div[contains(concat(' ', normalize-space(@class), ' '), ' mb-2.5 ')][1]//p[1]",
+          )
+          .textContent()) ?? "Project creation failed without an error message.",
+    })),
+  ]);
+  if (projectSubmission.state === "failed") {
+    throw new Error(`Desktop project creation failed: ${projectSubmission.error}`);
+  }
   await expect(page.getByTestId("composer-editor")).toBeVisible({ timeout: 30_000 });
   await expect.poll(() => new URL(page.url()).pathname).not.toBe("/");
 
@@ -35,6 +55,7 @@ async function addAndSelectProject(
     return;
   }
 
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
   // A selectable Codex entry proves the focus refresh reached the UI cache with
   // an available, non-unauthenticated status after the real CLI health probes.
   const modelPicker = page.getByRole("button", { name: "GPT-5.5", exact: true });
@@ -56,25 +77,12 @@ async function sendPrompt(desktop: DesktopHarness, prompt: string): Promise<void
   await expect(sendButton).toBeEnabled({ timeout: 30_000 });
   const protocolBaseline = (await desktop.readProtocolLog()).length;
   await sendButton.click();
-  try {
-    await expect(editor).toBeEmpty({ timeout: 3_000 });
-  } catch {
-    // A lost thread.create response can leave its durable server receipt behind while the
-    // composer restores the draft. Retry only that explicit, user-retryable state; the
-    // current promotion helper recovers the duplicate create before starting one turn.
-    await expect(editor).toHaveText(prompt);
-    await expect(sendButton).toBeEnabled();
-    const turnStartsSinceClick = requestMethods(
-      (await desktop.readProtocolLog()).slice(protocolBaseline),
-    ).filter((method) => method === "turn/start");
-    if (turnStartsSinceClick.length !== 0) {
-      throw new Error(
-        "Refusing to retry a restored desktop E2E draft after the provider accepted turn/start.",
-      );
-    }
-    await sendButton.click();
-    await expect(editor).toBeEmpty({ timeout: 10_000 });
-  }
+  await expect
+    .poll(
+      async () => requestMethods((await desktop.readProtocolLog()).slice(protocolBaseline)),
+      { timeout: 30_000 },
+    )
+    .toContain("turn/start");
 }
 
 async function expectAssistantText(page: Page, text: string): Promise<void> {
@@ -82,17 +90,10 @@ async function expectAssistantText(page: Page, text: string): Promise<void> {
 }
 
 async function ensureDisclosureExpanded(trigger: Locator): Promise<void> {
-  await expect
-    .poll(
-      async () => {
-        if ((await trigger.getAttribute("aria-expanded")) !== "true") {
-          await trigger.click();
-        }
-        return trigger.getAttribute("aria-expanded");
-      },
-      { timeout: 30_000 },
-    )
-    .toBe("true");
+  if ((await trigger.getAttribute("aria-expanded")) !== "true") {
+    await trigger.click();
+  }
+  await expect(trigger).toHaveAttribute("aria-expanded", "true", { timeout: 30_000 });
   await expect(trigger).toHaveAttribute("aria-expanded", "true");
 }
 
@@ -225,6 +226,8 @@ test("creates and selects a project, then sends and renders an assistant respons
   await codexProvider.hover();
   await expect(e2eModel).toBeChecked();
   await desktop.page.keyboard.press("Escape");
+  await desktop.page.keyboard.press("Escape");
+  await expect(selectedModelPicker).toHaveAttribute("aria-expanded", "false");
   const protocolBaseline = (await desktop.readProtocolLog()).length;
   await sendPrompt(desktop, "E2E_BASIC_SEND");
   await expect
@@ -323,15 +326,8 @@ test("runs a real terminal and renders echoed output", async ({ desktop }) => {
   await findInput.fill("E2E_TERMINAL_OUTPUT_THAT_DOES_NOT_EXIST");
   await expect(noResults).toBeVisible({ timeout: 30_000 });
   await findInput.fill("E2E_TERMINAL_42");
-  await expect
-    .poll(
-      async () => {
-        await findInput.press("Enter");
-        return noResults.isVisible();
-      },
-      { timeout: 30_000 },
-    )
-    .toBe(false);
+  await findInput.press("Enter");
+  await expect(noResults).toBeHidden({ timeout: 30_000 });
 });
 
 test("opens a workspace file in source and rendered preview modes", async ({ desktop }) => {
@@ -371,12 +367,14 @@ test("opens a workspace file in source and rendered preview modes", async ({ des
 
 test("loads a localhost page in the real desktop browser pane", async ({ desktop }) => {
   const localPage = await startLocalPageServer();
+  let journeyError: unknown;
   try {
-    await addAndSelectProject(desktop, { requireProvider: false });
+    await addAndSelectProject(desktop);
     await desktop.page.keyboard.press("Control+Shift+B");
     const addressInput = desktop.page.getByPlaceholder("Search or enter a URL");
     await expect(addressInput).toBeVisible({ timeout: 30_000 });
-    await expect(desktop.page.getByRole("button", { name: "New tab", exact: true })).toBeVisible({
+    const newTabButton = desktop.page.getByRole("button", { name: "New tab", exact: true });
+    await expect(newTabButton).toBeVisible({
       timeout: 30_000,
     });
     await expect(desktop.page.getByText("No local servers", { exact: true })).toBeVisible({
@@ -387,7 +385,9 @@ test("loads a localhost page in the real desktop browser pane", async ({ desktop
     await expect(addressInput).toHaveValue(
       new RegExp(`^${localPage.origin.replaceAll(".", "\\.")}`),
     );
+
     await addressInput.press("Enter");
+
     try {
       await expect
         .poll(
@@ -426,9 +426,24 @@ test("loads a localhost page in the real desktop browser pane", async ({ desktop
       localPage.origin,
     );
     expect(browserText).toContain("E2E_LOCAL_BROWSER_OK");
-  } finally {
-    await localPage.close();
+    expect(localPage.requests()).toContainEqual(
+      expect.objectContaining({ method: "GET", url: "/" }),
+    );
+  } catch (error) {
+    journeyError = error;
   }
+
+  const cleanupErrors: unknown[] = [];
+  try {
+    await localPage.close();
+  } catch (error) {
+    cleanupErrors.push(error);
+  }
+  const failures = [...(journeyError === undefined ? [] : [journeyError]), ...cleanupErrors];
+  if (failures.length > 1) {
+    throw new AggregateError(failures, "Browser journey or cleanup failed.");
+  }
+  if (failures.length === 1) throw failures[0];
 });
 
 test("persists conversation state and resumes the provider after desktop restart", async ({
