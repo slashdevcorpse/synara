@@ -393,19 +393,24 @@ describe("Antigravity CLI integration helpers", () => {
 
   it("runs the capture script for Synara-managed sessions", async () => {
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), "synara-antigravity-hook-test-"));
-    const scriptPath = path.join(directory, "capture.cjs");
-    const eventPath = path.join(directory, "events.ndjson");
+    const literalPercentDirectory = path.join(directory, "%SYNARA_CAPTURE_LITERAL%");
+    const scriptPath = path.join(literalPercentDirectory, "capture.cjs");
+    const eventPath = path.join(literalPercentDirectory, "events.ndjson");
     try {
+      await fs.mkdir(literalPercentDirectory);
       await fs.writeFile(scriptPath, hookScriptSource(), { mode: 0o700 });
       const command = buildAntigravityCaptureCommand(process.execPath, scriptPath, "pre-tool");
       const payload = JSON.stringify({ tool: "shell" });
       const result = runCaptureCommand(command, payload, {
+        SYNARA_CAPTURE_LITERAL: "must-not-expand",
         SYNARA_ANTIGRAVITY_EVENTS: eventPath,
         SYNARA_ANTIGRAVITY_HOOK_DECISION: "allow",
+        SYNARA_ANTIGRAVITY_CAPTURE_EXECUTABLE: process.execPath,
+        SYNARA_ANTIGRAVITY_CAPTURE_SCRIPT: scriptPath,
       });
 
       expect(result.error).toBeUndefined();
-      expect(result.status).toBe(0);
+      expect(result.status, result.stderr).toBe(0);
       expect(result.stdout.trim()).toBe('{"decision":"allow"}');
       expect(await fs.readFile(eventPath, "utf8")).toBe(`pre-tool\t${payload}\n`);
     } finally {
@@ -432,7 +437,7 @@ describe("Antigravity CLI integration helpers", () => {
         "win32",
       ),
     ).toBe(
-      String.raw`if not defined SYNARA_ANTIGRAVITY_EVENTS (more >nul 2>nul & echo {}) else (set "ELECTRON_RUN_AS_NODE=1" && "C:\Program Files\Synara\Synara.exe" "C:\Users\test\.gemini\capture.cjs" "pre-tool")`,
+      String.raw`if not defined SYNARA_ANTIGRAVITY_EVENTS (more >nul 2>nul & echo {}) else (set "ELECTRON_RUN_AS_NODE=1" && "%SYNARA_ANTIGRAVITY_CAPTURE_EXECUTABLE%" "%SYNARA_ANTIGRAVITY_CAPTURE_SCRIPT%" "pre-tool")`,
     );
   });
 
