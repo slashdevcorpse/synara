@@ -118,7 +118,7 @@ describe("spawnContainedClaudeSdkProcess", () => {
       args: ["--help"],
       shell: false as const,
     }));
-    const spawnProcess = vi.fn(() => child);
+    const spawnProcess = vi.fn<ClaudeNodeProcessSpawner>(() => child);
     const options = {
       command: "/usr/local/bin/claude",
       args: ["--help"],
