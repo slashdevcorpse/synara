@@ -13,6 +13,7 @@ import {
 } from "./verify-packaged-desktop-startup.ts";
 import {
   qualifySuperSynaraWindowsInstaller,
+  runNativeWindowsCommand,
   type WindowsExecutableIdentity,
   type WindowsInstallerQualificationOptions,
   type WindowsInstallerQualificationRuntime,
@@ -84,23 +85,6 @@ export function parseWindowsInstallerQualificationArgs(argv: ReadonlyArray<strin
   };
 }
 
-function runCommand(spec: Parameters<WindowsInstallerQualificationRuntime["runCommand"]>[0]): void {
-  const result = spawnSync(spec.command, [...spec.args], {
-    env: spec.env,
-    encoding: "utf8",
-    shell: false,
-    windowsHide: true,
-    timeout: spec.timeoutMs,
-    maxBuffer: 8 * 1024 * 1024,
-  });
-  if (result.error) throw new Error(`${spec.label} could not complete: ${result.error.message}`);
-  if (result.status !== 0) {
-    throw new Error(
-      `${spec.label} failed with exit ${result.status ?? "unknown"}: ${result.stderr.trim() || result.stdout.trim()}`,
-    );
-  }
-}
-
 function readRegistry(target: WindowsRegistryTarget): string | null {
   const result = spawnSync(
     "reg.exe",
@@ -158,7 +142,7 @@ export function createNativeWindowsInstallerQualificationRuntime(): WindowsInsta
       typeof process.env.RUNNER_TEMP === "string" &&
       process.env.RUNNER_TEMP.length > 0,
     readRegistry,
-    runCommand,
+    runCommand: runNativeWindowsCommand,
     readExecutableIdentity,
     inspectUnsignedAuthenticode: inspectUnsignedWindowsExecutable,
     launchStartupAndKeepRunning: launchPackagedDesktopAndWaitForStartup,
