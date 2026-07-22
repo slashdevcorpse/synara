@@ -36,6 +36,30 @@ const PUBLISH_JOB_CONDITION =
 const CHECKOUT_ACTION = "actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10";
 const SETUP_NODE_ACTION = "actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38";
 const UPLOAD_ARTIFACT_ACTION = "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a";
+const WINDOWS_INSTALLER_QUALIFICATION_ENVIRONMENT = {
+  VERSION: "${{ needs.preflight.outputs.version }}",
+  PREVIOUS_FOUND: "${{ steps.previous_release.outputs.found }}",
+  PREVIOUS_INSTALLER: "${{ steps.previous_installer.outputs.path }}",
+  UPSTREAM_INSTALLER: "${{ steps.upstream_installer.outputs.path }}",
+} as const;
+const WINDOWS_INSTALLER_QUALIFICATION_COMMAND = [
+  '$ErrorActionPreference = "Stop"',
+  '$currentInstaller = Join-Path "release-publish" "Super-Synara-$env:VERSION-windows-x64-unsigned.exe"',
+  "$qualificationArgs = @(",
+  '  "scripts/qualify-super-synara-windows-installer.ts",',
+  '  "--installer", $currentInstaller,',
+  '  "--upstream-installer", $env:UPSTREAM_INSTALLER,',
+  '  "--version", $env:VERSION,',
+  '  "--report", (Join-Path $env:RUNNER_TEMP "windows-installer-qualification.json")',
+  ")",
+  'if ($env:PREVIOUS_FOUND -eq "true") {',
+  "  if ([string]::IsNullOrWhiteSpace($env:PREVIOUS_INSTALLER)) {",
+  '    throw "Previous release selection succeeded without a downloaded installer."',
+  "  }",
+  '  $qualificationArgs += @("--previous-installer", $env:PREVIOUS_INSTALLER)',
+  "}",
+  "node @qualificationArgs",
+].join("\n");
 const PLANNED_SOURCE_PROOF_COMMAND = [
   "node scripts/verify-release-source-provenance.ts \\",
   '"$VERSION" "$TAG" true "$SOURCE_COMMIT" branch main \\',
@@ -68,6 +92,10 @@ function normalizeShellCommand(command: string): string {
 
 function normalizeContinuedShellCommand(command: string): string {
   return normalizeShellCommand(command.replace(/\\\r?\n/g, " "));
+}
+
+function normalizeMultilineCommand(command: string): string {
+  return command.replace(/\r\n/g, "\n").trimEnd();
 }
 
 function executableShellLines(command: string): readonly string[] {
@@ -1071,9 +1099,7 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
     isRecord(step) ? [{ index, step }] : [],
   );
   const windowsQualificationSteps = indexedWindowsSteps.filter(
-    ({ step }) =>
-      typeof step.run === "string" &&
-      step.run.includes("scripts/qualify-super-synara-windows-installer.ts"),
+    ({ step }) => step.id === "windows_installer_qualification",
   );
   const windowsQualificationStep = windowsQualificationSteps[0];
   if (
@@ -1083,10 +1109,17 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
     windowsQualificationStep.step.id !== "windows_installer_qualification" ||
     windowsQualificationStep.step.name !==
       "Qualify concurrent Windows side-by-side runtime, upgrade, and uninstall" ||
-    windowsQualificationStep.step.shell !== "pwsh"
+    windowsQualificationStep.step.shell !== "pwsh" ||
+    !hasExactEntries(
+      windowsQualificationStep.step.env,
+      WINDOWS_INSTALLER_QUALIFICATION_ENVIRONMENT,
+    ) ||
+    typeof windowsQualificationStep.step.run !== "string" ||
+    normalizeMultilineCommand(windowsQualificationStep.step.run) !==
+      WINDOWS_INSTALLER_QUALIFICATION_COMMAND
   ) {
     throw new Error(
-      "The same Windows step that runs native installer qualification must own its stable diagnostic id and name.",
+      "The same Windows step that runs native installer qualification must own its stable diagnostic id, exact environment, and executable PowerShell command.",
     );
   }
   const windowsDiagnosticCandidateSteps = indexedWindowsSteps.filter(

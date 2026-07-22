@@ -1148,6 +1148,23 @@ describe("Super Synara workflow contracts", () => {
 
     expect(() =>
       verifySuperSynaraWorkflowText(
+        main.replace("          node @qualificationArgs", "          # node @qualificationArgs"),
+        audit,
+      ),
+    ).toThrow("executable PowerShell command");
+
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          '            "--installer", $currentInstaller,',
+          '            "--installer", "release-publish/forged.exe",',
+        ),
+        audit,
+      ),
+    ).toThrow("executable PowerShell command");
+
+    expect(() =>
+      verifySuperSynaraWorkflowText(
         main.replace(
           "      - id: windows_installer_qualification\n        name: Qualify concurrent Windows side-by-side runtime, upgrade, and uninstall\n        shell: pwsh",
           "      - id: windows_installer_qualification\n        name: Qualification diagnostic anchor\n        shell: pwsh\n        run: echo dummy\n\n      - name: Qualify concurrent Windows side-by-side runtime, upgrade, and uninstall\n        shell: pwsh",
