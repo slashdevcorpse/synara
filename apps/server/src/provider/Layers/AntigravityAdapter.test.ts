@@ -1,4 +1,4 @@
-import type { ChildProcess, SpawnOptions } from "node:child_process";
+import { spawnSync, type ChildProcess, type SpawnOptions } from "node:child_process";
 import crypto from "node:crypto";
 import { EventEmitter } from "node:events";
 import fs from "node:fs/promises";
@@ -30,8 +30,9 @@ import {
   type AntigravityAdapterLiveOptions,
   type AntigravityProcessDependencies,
   type AntigravityTurnProcessResult,
-  buildAntigravityHookConfig,
   antigravityPromptCommandLineIssue,
+  buildAntigravityCaptureCommand,
+  buildAntigravityHookConfig,
   hookScriptSource,
   makeAntigravityAdapterLive,
   makeAntigravityRuntimeEventBase,
@@ -57,6 +58,18 @@ function deferred<T = void>(): Deferred<T> {
     reject = rejectPromise;
   });
   return { promise, resolve, reject };
+}
+
+function runCaptureCommand(command: string, input: string, env: NodeJS.ProcessEnv) {
+  const shell = process.platform === "win32" ? (process.env.ComSpec ?? "cmd.exe") : "/bin/sh";
+  const args = process.platform === "win32" ? ["/d", "/s", "/c", command] : ["-c", command];
+  return spawnSync(shell, args, {
+    env: { ...process.env, ...env },
+    input,
+    encoding: "utf8",
+    timeout: 1_000,
+    windowsVerbatimArguments: process.platform === "win32",
+  });
 }
 
 async function waitFor(predicate: () => boolean, timeoutMs = 1_000): Promise<void> {
@@ -361,15 +374,66 @@ describe("Antigravity CLI integration helpers", () => {
     });
   });
 
-  it("keeps the globally installed hook neutral outside Synara sessions", async () => {
-    const result = await runAntigravityHelperProcess(
-      process.execPath,
-      ["-e", hookScriptSource(), "pre-tool"],
-      { timeoutMs: 1_000 },
+  it("keeps the globally installed hook neutral outside Synara sessions", () => {
+    const command = buildAntigravityCaptureCommand(
+      "__synara_gui_must_not_launch__",
+      "__capture_script_must_not_run__",
+      "pre-tool",
+    );
+    const result = runCaptureCommand(
+      command,
+      JSON.stringify({ payload: "x".repeat(2 * 1024 * 1024) }),
+      { SYNARA_ANTIGRAVITY_EVENTS: "" },
     );
 
-    expect(result.code).toBe(0);
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(0);
     expect(result.stdout.trim()).toBe("{}");
+  });
+
+  it("runs the capture script for Synara-managed sessions", async () => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "synara-antigravity-hook-test-"));
+    const scriptPath = path.join(directory, "capture.cjs");
+    const eventPath = path.join(directory, "events.ndjson");
+    try {
+      await fs.writeFile(scriptPath, hookScriptSource(), { mode: 0o700 });
+      const command = buildAntigravityCaptureCommand(process.execPath, scriptPath, "pre-tool");
+      const payload = JSON.stringify({ tool: "shell" });
+      const result = runCaptureCommand(command, payload, {
+        SYNARA_ANTIGRAVITY_EVENTS: eventPath,
+        SYNARA_ANTIGRAVITY_HOOK_DECISION: "allow",
+      });
+
+      expect(result.error).toBeUndefined();
+      expect(result.status).toBe(0);
+      expect(result.stdout.trim()).toBe('{"decision":"allow"}');
+      expect(await fs.readFile(eventPath, "utf8")).toBe(`pre-tool\t${payload}\n`);
+    } finally {
+      await fs.rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("runs packaged Electron as Node only for Synara-managed sessions", () => {
+    expect(
+      buildAntigravityCaptureCommand(
+        "/Applications/Synara.app/Contents/MacOS/Synara",
+        "/tmp/synara-capture/capture.cjs",
+        "pre-tool",
+        "darwin",
+      ),
+    ).toBe(
+      `if [ -z "\${SYNARA_ANTIGRAVITY_EVENTS:-}" ]; then cat >/dev/null 2>&1 || :; printf '%s\\n' '{}'; else ELECTRON_RUN_AS_NODE=1 '/Applications/Synara.app/Contents/MacOS/Synara' '/tmp/synara-capture/capture.cjs' 'pre-tool'; fi`,
+    );
+    expect(
+      buildAntigravityCaptureCommand(
+        String.raw`C:\Program Files\Synara\Synara.exe`,
+        String.raw`C:\Users\test\.gemini\capture.cjs`,
+        "pre-tool",
+        "win32",
+      ),
+    ).toBe(
+      String.raw`if not defined SYNARA_ANTIGRAVITY_EVENTS (more >nul 2>nul & echo {}) else (set "ELECTRON_RUN_AS_NODE=1" && "C:\Program Files\Synara\Synara.exe" "C:\Users\test\.gemini\capture.cjs" "pre-tool")`,
+    );
   });
 
   it("guards Windows command-line limits before spawning the CLI", () => {
