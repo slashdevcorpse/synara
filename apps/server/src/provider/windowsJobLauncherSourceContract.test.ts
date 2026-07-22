@@ -6,7 +6,7 @@ import { describe, expect, it } from "vitest";
 const launcherSource = readFileSync(
   fileURLToPath(new URL("../../native/windows-job-launcher/launcher.cpp", import.meta.url)),
   "utf8",
-);
+).replace(/\r\n/g, "\n");
 
 describe("Windows Job launcher source contract", () => {
   it("only advertises inherited standard handles when the complete set is valid", () => {
