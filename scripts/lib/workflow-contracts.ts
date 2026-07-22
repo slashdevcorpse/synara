@@ -34,6 +34,20 @@ const EXPECTED_DISABLED_PATHS = new Set([
   ".github/workflows/pr-vouch.yml",
   ".github/workflows/release.yml",
 ]);
+const CACHE_ACTION = "actions/cache@caa296126883cff596d87d8935842f9db880ef25";
+const PLAYWRIGHT_BROWSER_CACHE_PATHS = {
+  quality: "~/.cache/ms-playwright",
+  browser_windows: "~\\AppData\\Local\\ms-playwright",
+} as const;
+type PlaywrightCacheJobName = keyof typeof PLAYWRIGHT_BROWSER_CACHE_PATHS;
+const QUARANTINE_BASELINE_REF =
+  '"${{ github.event.pull_request.base.sha || github.event.before }}"';
+const QUARANTINE_VALIDATE_COMMAND = "node scripts/quarantine-registry.ts validate";
+const BROWSER_INSTALL_COMMANDS = {
+  quality: "bun run --cwd apps/web test:browser:install",
+  browser_windows: "bun run --cwd apps/web playwright install chromium",
+} as const;
+const BROWSER_STABLE_COMMAND = "bun run --cwd apps/web test:browser:stable";
 const CI_WINDOWS_REQUIRED_COMMANDS = [
   "bun run brand:check",
   "node apps/server/scripts/build-windows-job-launcher.mjs --arch x64",
@@ -160,6 +174,30 @@ function jobRunSteps(
       };
     })
     .filter((step): step is WorkflowRunStep => step !== null);
+}
+
+function exactBlockingCommand(
+  workflowPath: string,
+  jobName: string,
+  steps: readonly WorkflowRunStep[],
+  command: string,
+  errors: string[],
+): WorkflowRunStep | null {
+  const matches = steps.filter((step) => step.command === command);
+  if (matches.length !== 1) {
+    errors.push(`${workflowPath} ${jobName} must run exact browser gate command: ${command}.`);
+    return null;
+  }
+  const step = matches[0]!;
+  if (
+    step.condition !== undefined ||
+    (step.continueOnError !== undefined && step.continueOnError !== false)
+  ) {
+    errors.push(
+      `${workflowPath} ${jobName} browser gate must be unconditional and fail closed: ${command}.`,
+    );
+  }
+  return step;
 }
 
 function validateNativeJobCommands(
@@ -820,13 +858,89 @@ function allowedWritePermission(path: string, location: string, scope: string): 
   );
 }
 
+function validatePlaywrightBrowserCache(
+  workflowPath: string,
+  jobName: PlaywrightCacheJobName,
+  job: UnknownRecord,
+  errors: string[],
+): void {
+  const expectedPath = PLAYWRIGHT_BROWSER_CACHE_PATHS[jobName];
+  const namedCacheSteps = Array.isArray(job.steps)
+    ? job.steps.filter(
+        (step): step is UnknownRecord =>
+          isRecord(step) && step.name === "Cache Playwright browsers",
+      )
+    : [];
+  if (namedCacheSteps.length !== 1) {
+    errors.push(`${workflowPath} ${jobName} must define exactly one Playwright browser cache.`);
+  } else {
+    const cache = namedCacheSteps[0]!;
+    if (
+      cache.uses !== CACHE_ACTION ||
+      !isRecord(cache.with) ||
+      cache.with.path !== expectedPath ||
+      cache.if !== undefined ||
+      (cache["continue-on-error"] !== undefined && cache["continue-on-error"] !== false)
+    ) {
+      errors.push(
+        `${workflowPath} ${jobName} must cache Playwright browsers at ${expectedPath} with the pinned cache action.`,
+      );
+    }
+  }
+
+  const hasPathOverride =
+    (isRecord(job.env) && job.env.PLAYWRIGHT_BROWSERS_PATH !== undefined) ||
+    (Array.isArray(job.steps) &&
+      job.steps.some(
+        (step) =>
+          isRecord(step) && isRecord(step.env) && step.env.PLAYWRIGHT_BROWSERS_PATH !== undefined,
+      ));
+  if (hasPathOverride) {
+    errors.push(
+      `${workflowPath} ${jobName} must use Playwright's OS-default browser path without PLAYWRIGHT_BROWSERS_PATH overrides.`,
+    );
+  }
+}
+
+function validateQuarantineCommands(
+  workflowPath: string,
+  jobName: string,
+  steps: readonly WorkflowRunStep[],
+  platform: "linux" | "windows",
+  errors: string[],
+): void {
+  const runCommand = `node scripts/quarantine-registry.ts run --platform ${platform}`;
+  const runs = steps.filter((step) => step.command === runCommand);
+  if (runs.length !== 1 || runs[0]!.condition !== undefined || runs[0]!.continueOnError !== true) {
+    errors.push(
+      `${workflowPath} ${jobName} must run the registered ${platform} quarantine as the sole nonblocking test step.`,
+    );
+  }
+
+  const summaryCommand = `node scripts/quarantine-registry.ts summary --platform ${platform} --baseline-ref ${QUARANTINE_BASELINE_REF} --github-step-summary`;
+  const summaries = steps.filter((step) => step.command === summaryCommand);
+  if (
+    summaries.length !== 1 ||
+    summaries[0]!.condition !== "always()" ||
+    (summaries[0]!.continueOnError !== undefined && summaries[0]!.continueOnError !== false)
+  ) {
+    errors.push(`${workflowPath} ${jobName} must publish the ${platform} quarantine summary.`);
+  }
+}
+
 function validateCiArchitecture(workflow: UnknownRecord, errors: string[]): void {
   const workflowPath = ".github/workflows/ci.yml";
+  if (isRecord(workflow.env) && workflow.env.PLAYWRIGHT_BROWSERS_PATH !== undefined) {
+    errors.push(
+      `${workflowPath} must use Playwright's OS-default browser paths without a workflow-level PLAYWRIGHT_BROWSERS_PATH override.`,
+    );
+  }
   if (!isRecord(workflow.jobs)) {
     errors.push(`${workflowPath} must define jobs.`);
     return;
   }
   validateRootTestOwnership(workflow.jobs, "quality", workflowPath, errors);
+  const qualitySteps = jobRunSteps(workflow.jobs, "quality", workflowPath, errors);
   const windowsSteps = jobRunSteps(workflow.jobs, "windows_x64", workflowPath, errors);
   const macosSteps = jobRunSteps(workflow.jobs, "macos_arm64", workflowPath, errors);
   const windowsJob = workflow.jobs.windows_x64;
@@ -845,6 +959,121 @@ function validateCiArchitecture(workflow: UnknownRecord, errors: string[]): void
   if (isRecord(qualityJob)) {
     validateMergifyUpload(qualityJob, workflowPath, errors);
     validateCodecovUploads(qualityJob, workflowPath, errors);
+    if (qualitySteps) {
+      const quarantineValidation = exactBlockingCommand(
+        workflowPath,
+        "quality",
+        qualitySteps,
+        QUARANTINE_VALIDATE_COMMAND,
+        errors,
+      );
+      const browserInstall = exactBlockingCommand(
+        workflowPath,
+        "quality",
+        qualitySteps,
+        BROWSER_INSTALL_COMMANDS.quality,
+        errors,
+      );
+      const stableBrowser = exactBlockingCommand(
+        workflowPath,
+        "quality",
+        qualitySteps,
+        BROWSER_STABLE_COMMAND,
+        errors,
+      );
+      if (
+        quarantineValidation &&
+        browserInstall &&
+        quarantineValidation.index >= browserInstall.index
+      ) {
+        errors.push(`${workflowPath} quality must validate quarantine before browser setup.`);
+      }
+      if (browserInstall && stableBrowser && browserInstall.index >= stableBrowser.index) {
+        errors.push(`${workflowPath} quality must install Playwright before stable browser tests.`);
+      }
+      validateQuarantineCommands(workflowPath, "quality", qualitySteps, "linux", errors);
+    }
+    validatePlaywrightBrowserCache(workflowPath, "quality", qualityJob, errors);
+  }
+
+  const browserWindowsJob = workflow.jobs.browser_windows;
+  const browserWindowsSteps = jobRunSteps(workflow.jobs, "browser_windows", workflowPath, errors);
+  if (!isRecord(browserWindowsJob)) {
+    errors.push(`${workflowPath} must define the browser_windows job.`);
+  } else {
+    if (browserWindowsJob["runs-on"] !== "windows-2022") {
+      errors.push(`${workflowPath} browser_windows must run on windows-2022.`);
+    }
+    if (
+      browserWindowsJob.if !== undefined ||
+      browserWindowsJob.needs !== undefined ||
+      browserWindowsJob["timeout-minutes"] !== 40 ||
+      (browserWindowsJob["continue-on-error"] !== undefined &&
+        browserWindowsJob["continue-on-error"] !== false)
+    ) {
+      errors.push(
+        `${workflowPath} browser_windows must be an independent, bounded, fail-closed job.`,
+      );
+    }
+    validatePlaywrightBrowserCache(workflowPath, "browser_windows", browserWindowsJob, errors);
+    if (browserWindowsSteps) {
+      const installDependencies = exactBlockingCommand(
+        workflowPath,
+        "browser_windows",
+        browserWindowsSteps,
+        "bun install --frozen-lockfile",
+        errors,
+      );
+      const quarantineValidation = exactBlockingCommand(
+        workflowPath,
+        "browser_windows",
+        browserWindowsSteps,
+        QUARANTINE_VALIDATE_COMMAND,
+        errors,
+      );
+      const browserInstall = exactBlockingCommand(
+        workflowPath,
+        "browser_windows",
+        browserWindowsSteps,
+        BROWSER_INSTALL_COMMANDS.browser_windows,
+        errors,
+      );
+      const stableBrowser = exactBlockingCommand(
+        workflowPath,
+        "browser_windows",
+        browserWindowsSteps,
+        BROWSER_STABLE_COMMAND,
+        errors,
+      );
+      if (
+        installDependencies &&
+        quarantineValidation &&
+        installDependencies.index >= quarantineValidation.index
+      ) {
+        errors.push(`${workflowPath} browser_windows must install dependencies before validation.`);
+      }
+      if (
+        quarantineValidation &&
+        browserInstall &&
+        quarantineValidation.index >= browserInstall.index
+      ) {
+        errors.push(
+          `${workflowPath} browser_windows must validate quarantine before browser setup.`,
+        );
+      }
+      if (browserInstall && stableBrowser && browserInstall.index >= stableBrowser.index) {
+        errors.push(
+          `${workflowPath} browser_windows must install Playwright before stable browser tests.`,
+        );
+      }
+      validateQuarantineCommands(
+        workflowPath,
+        "browser_windows",
+        browserWindowsSteps,
+        "windows",
+        errors,
+      );
+    }
   }
   if (isRecord(windowsJob) && windowsJob["runs-on"] !== "windows-2022") {
     errors.push(`${workflowPath} windows_x64 must run on windows-2022.`);
@@ -861,12 +1090,13 @@ function validateCiArchitecture(workflow: UnknownRecord, errors: string[]): void
       errors.push(`${workflowPath} ${jobName} job must be unconditional and fail closed.`);
     }
   }
-  if (!isRecord(macosJob)) return;
-  if (macosJob["runs-on"] !== "macos-15") {
-    errors.push(`${workflowPath} macos_arm64 must run on macos-15.`);
-  }
-  if (!macosSteps?.some((step) => step.command === 'test "$(uname -m)" = arm64')) {
-    errors.push(`${workflowPath} macos_arm64 must fail closed with test "$(uname -m)" = arm64.`);
+  if (isRecord(macosJob)) {
+    if (macosJob["runs-on"] !== "macos-15") {
+      errors.push(`${workflowPath} macos_arm64 must run on macos-15.`);
+    }
+    if (!macosSteps?.some((step) => step.command === 'test "$(uname -m)" = arm64')) {
+      errors.push(`${workflowPath} macos_arm64 must fail closed with test "$(uname -m)" = arm64.`);
+    }
   }
   if (windowsSteps) {
     validateNativeJobCommands(
@@ -895,6 +1125,22 @@ function validateCiArchitecture(workflow: UnknownRecord, errors: string[]): void
       errors,
     );
     validateNativePersistenceSmoke(workflowPath, "macos_arm64", macosSteps, errors);
+  }
+
+  for (const [jobName, job] of Object.entries(workflow.jobs)) {
+    if (!isRecord(job) || !Array.isArray(job.steps)) continue;
+    for (const step of job.steps) {
+      if (!isRecord(step) || step["continue-on-error"] === undefined) continue;
+      const allowed =
+        step["continue-on-error"] === true &&
+        typeof step.run === "string" &&
+        normalizeShellCommand(step.run).startsWith("node scripts/quarantine-registry.ts run ");
+      if (!allowed && step["continue-on-error"] !== false) {
+        errors.push(
+          `${workflowPath} ${jobName} may use continue-on-error only for registered quarantine runs.`,
+        );
+      }
+    }
   }
 }
 
