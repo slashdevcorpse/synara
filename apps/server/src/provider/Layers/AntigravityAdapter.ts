@@ -68,6 +68,8 @@ const MODEL_DISCOVERY_TIMEOUT_MS = 15_000;
 const PLUGIN_INSTALL_TIMEOUT_MS = 30_000;
 export const ANTIGRAVITY_PROCESS_OUTPUT_MAX_BYTES = 128 * 1024;
 const WINDOWS_PROMPT_MAX_CHARS = 24_000;
+const ANTIGRAVITY_CAPTURE_EXECUTABLE_ENV = "SYNARA_ANTIGRAVITY_CAPTURE_EXECUTABLE";
+const ANTIGRAVITY_CAPTURE_SCRIPT_ENV = "SYNARA_ANTIGRAVITY_CAPTURE_SCRIPT";
 
 type SpawnProcess = (
   command: string,
@@ -195,9 +197,40 @@ function transcriptPathForConversation(conversationId: string): string {
   );
 }
 
-function shellQuote(value: string): string {
-  if (process.platform === "win32") return `"${value.replaceAll('"', '\\"')}"`;
+function shellQuote(value: string, platform: NodeJS.Platform = process.platform): string {
+  if (platform === "win32") return `"${value.replaceAll('"', '\\"')}"`;
   return `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
+export function buildAntigravityCaptureCommand(
+  executablePath: string,
+  scriptPath: string,
+  event: string,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  if (platform === "win32") {
+    // cmd.exe expands these references once, preserving any literal %NAME% segments in the
+    // environment-provided path values instead of recursively treating them as variables.
+    const invocation = [
+      `"%${ANTIGRAVITY_CAPTURE_EXECUTABLE_ENV}%"`,
+      `"%${ANTIGRAVITY_CAPTURE_SCRIPT_ENV}%"`,
+      shellQuote(event, platform),
+    ].join(" ");
+    return `if not defined SYNARA_ANTIGRAVITY_EVENTS (more >nul 2>nul & echo {}) else (set "ELECTRON_RUN_AS_NODE=1" && ${invocation})`;
+  }
+  const invocation = `${shellQuote(executablePath, platform)} ${shellQuote(scriptPath, platform)} ${shellQuote(event, platform)}`;
+  return `if [ -z "\${SYNARA_ANTIGRAVITY_EVENTS:-}" ]; then cat >/dev/null 2>&1 || :; printf '%s\\n' '{}'; else ELECTRON_RUN_AS_NODE=1 ${invocation}; fi`;
+}
+
+function antigravityCaptureScriptPath(): string {
+  return path.join(
+    os.homedir(),
+    ".gemini",
+    "antigravity-cli",
+    "plugins",
+    "synara-capture",
+    "capture.cjs",
+  );
 }
 
 export function hookScriptSource(): string {
@@ -704,14 +737,8 @@ async function ensureCapturePlugin(
   binaryPath: string,
   dependencies?: AntigravityProcessDependencies,
 ): Promise<void> {
-  const pluginDir = path.join(
-    os.homedir(),
-    ".gemini",
-    "antigravity-cli",
-    "plugins",
-    "synara-capture",
-  );
-  const scriptPath = path.join(pluginDir, "capture.cjs");
+  const scriptPath = antigravityCaptureScriptPath();
+  const pluginDir = path.dirname(scriptPath);
   await fs.mkdir(pluginDir, { recursive: true });
   await fs.writeFile(
     path.join(pluginDir, "plugin.json"),
@@ -727,7 +754,7 @@ async function ensureCapturePlugin(
   );
   await fs.writeFile(scriptPath, hookScriptSource(), { mode: 0o700 });
   const command = (event: string) =>
-    `${shellQuote(process.execPath)} ${shellQuote(scriptPath)} ${shellQuote(event)}`;
+    buildAntigravityCaptureCommand(process.execPath, scriptPath, event);
   await fs.writeFile(
     path.join(pluginDir, "hooks.json"),
     `${JSON.stringify(buildAntigravityHookConfig(command), null, 2)}\n`,
@@ -1366,10 +1393,17 @@ const makeAntigravityAdapter = Effect.fn(function* (options: AntigravityAdapterL
       const cwd = context.session.cwd ?? serverConfig.cwd;
       const env = buildProviderChildEnvironment({
         provider: PROVIDER,
-        inheritedSynaraKeys: ["SYNARA_ANTIGRAVITY_EVENTS", "SYNARA_ANTIGRAVITY_HOOK_DECISION"],
+        inheritedSynaraKeys: [
+          "SYNARA_ANTIGRAVITY_EVENTS",
+          "SYNARA_ANTIGRAVITY_HOOK_DECISION",
+          ANTIGRAVITY_CAPTURE_EXECUTABLE_ENV,
+          ANTIGRAVITY_CAPTURE_SCRIPT_ENV,
+        ],
         overrides: {
           SYNARA_ANTIGRAVITY_EVENTS: eventFile,
           SYNARA_ANTIGRAVITY_HOOK_DECISION: "allow",
+          [ANTIGRAVITY_CAPTURE_EXECUTABLE_ENV]: process.execPath,
+          [ANTIGRAVITY_CAPTURE_SCRIPT_ENV]: antigravityCaptureScriptPath(),
         },
       });
       let pollTimer: ReturnType<typeof setInterval> | undefined;
