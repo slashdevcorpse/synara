@@ -1024,7 +1024,7 @@ processExitRouting.layer("ProviderServiceLive process-exit maintenance latch", (
         .pipe(Effect.result);
       assert.equal(Result.isFailure(failedOperation), true);
       if (Result.isFailure(failedOperation)) {
-        assert.equal(failedOperation.failure, unprovenExit);
+        assert.equal(failedOperation.failure as unknown, unprovenExit);
       }
 
       let refusedRunExecuted = false;
