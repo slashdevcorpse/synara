@@ -1078,6 +1078,41 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
       "Windows provenance must consume native qualification before the exact lane is uploaded.",
     );
   }
+  const windowsDiagnosticCandidateIndex = main.indexOf(
+    "Retain exact Windows candidate for failed qualification diagnosis",
+  );
+  if (
+    windowsDiagnosticCandidateIndex <= installerQualificationIndex ||
+    windowsDiagnosticCandidateIndex >= windowsProvenanceIndex
+  ) {
+    throw new Error(
+      "The Windows diagnostic candidate upload must run after native qualification and before provenance generation.",
+    );
+  }
+  const windowsDiagnosticCandidateEnd = main.indexOf(
+    "\n      - name:",
+    windowsDiagnosticCandidateIndex + 1,
+  );
+  const windowsDiagnosticCandidateBlock = main.slice(
+    windowsDiagnosticCandidateIndex,
+    windowsDiagnosticCandidateEnd,
+  );
+  requireText(
+    windowsDiagnosticCandidateBlock,
+    "if: ${{ failure() }}",
+    "The Windows diagnostic candidate upload must run only after a failed qualification path.",
+  );
+  for (const candidateNeedle of [
+    "super-synara-windows-x64-candidate-${{ github.run_attempt }}",
+    "retention-days: 1",
+    "compression-level: 0",
+  ]) {
+    requireText(
+      windowsDiagnosticCandidateBlock,
+      candidateNeedle,
+      `The Windows diagnostic candidate upload is missing ${candidateNeedle}.`,
+    );
+  }
   const windowsUploadBlock = main.slice(
     windowsUploadIndex,
     main.indexOf("\n  macos_arm64:", windowsUploadIndex),

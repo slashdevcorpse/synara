@@ -1140,6 +1140,33 @@ describe("Super Synara workflow contracts", () => {
     );
   });
 
+  it("requires the diagnostic Windows candidate only after failed qualification", () => {
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace("        if: ${{ failure() }}", "        if: ${{ success() }}"),
+        audit,
+      ),
+    ).toThrow("must run only after a failed qualification path");
+
+    const qualificationStep = main.indexOf(
+      "      - name: Qualify concurrent Windows side-by-side runtime, upgrade, and uninstall",
+    );
+    const candidateStep = main.indexOf(
+      "      - name: Retain exact Windows candidate for failed qualification diagnosis",
+    );
+    const candidateEnd = main.indexOf("\n      - name:", candidateStep + 1);
+    const candidateBlock = main.slice(candidateStep, candidateEnd);
+    const reordered =
+      main.slice(0, qualificationStep) +
+      candidateBlock +
+      "\n" +
+      main.slice(qualificationStep, candidateStep) +
+      main.slice(candidateEnd);
+    expect(() => verifySuperSynaraWorkflowText(reordered, audit)).toThrow(
+      "must run after native qualification",
+    );
+  });
+
   it("rejects unprotected dispatches and weakened exact-source ownership", () => {
     expect(() =>
       verifySuperSynaraWorkflowText(
