@@ -17,6 +17,7 @@ import {
   type UserInputQuestion,
 } from "@synara/contracts";
 import { Cause, Deferred, Effect, Exit, Layer, Option, Queue, Ref, Scope, Stream } from "effect";
+import * as Semaphore from "effect/Semaphore";
 import type {
   AssistantMessage,
   OpencodeClient,
@@ -54,8 +55,8 @@ import {
   OPENCODE_CLI_SPEC,
   type OpenCodeRuntimeShape,
   OpenCodeRuntime,
-  OpenCodeRuntimeLive,
   OpenCodeRuntimeError,
+  makeOpenCodeRuntimeLive,
   openCodeQuestionId,
   openCodeRuntimeErrorDetail,
   parseOpenCodeModelSlug,
@@ -65,7 +66,9 @@ import {
   toOpenCodeQuestionAnswers,
   type OpenCodeServerConnection,
 } from "../opencodeRuntime.ts";
+import type { ProviderMaintenanceOwnedResourceCoordinator } from "../providerMaintenanceOwnedResources.ts";
 import { appendFileAttachmentsPromptBlock } from "../attachmentProjection.ts";
+import { findProviderProcessExitUnprovenError } from "../supervisedProcessTeardown.ts";
 import { extractProposedPlanMarkdown, withProviderPlanModePrompt } from "../planMode.ts";
 import { makeRuntimeTaskListItem, nonEmptyRuntimeTaskListPayload } from "../runtimeTaskList.ts";
 import {
@@ -128,6 +131,7 @@ const KILO_ADAPTER_CONFIG: OpenCodeCompatibleAdapterConfig = {
 };
 
 const OPENCODE_PROMPT_ACCEPTED_ACTIVITY_TIMEOUT_MS = 60_000;
+const OPENCODE_SESSION_ABORT_TIMEOUT_MS = 5_000;
 const OPENCODE_PROMPT_ACCEPTED_RECOVERY_DELAYS_MS = [2_000, 5_000, 10_000, 20_000] as const;
 const OPENCODE_PROMPT_SUBMISSION_INLINE_WAIT_MS = 500;
 
@@ -142,6 +146,8 @@ interface OpenCodeTurnSnapshot {
   readonly id: TurnId;
   readonly items: Array<unknown>;
 }
+
+type OpenCodeSessionShutdownState = "running" | "stopping" | "closed";
 
 interface OpenCodeSessionContext {
   harnessPolicyDelivered?: boolean;
@@ -181,6 +187,8 @@ interface OpenCodeSessionContext {
   activeAgent: string | undefined;
   activeVariant: string | undefined;
   readonly stopped: Ref.Ref<boolean>;
+  readonly shutdownState: Ref.Ref<OpenCodeSessionShutdownState>;
+  readonly shutdownMutex: Semaphore.Semaphore;
   readonly sessionScope: Scope.Closeable;
 }
 
@@ -205,10 +213,13 @@ export interface OpenCodeAdapterLiveOptions {
   readonly nativeEventLogPath?: string;
   readonly nativeEventLogger?: EventNdjsonLogger;
   readonly runtime?: OpenCodeRuntimeShape;
+  readonly maintenanceOwnedResources?: ProviderMaintenanceOwnedResourceCoordinator;
   readonly adapterConfig?: OpenCodeCompatibleAdapterConfig;
   readonly promptAcceptedActivityTimeoutMs?: number;
   readonly promptAcceptedRecoveryDelaysMs?: ReadonlyArray<number>;
   readonly promptSubmissionInlineWaitMs?: number;
+  readonly sessionAbortTimeoutMs?: number;
+  readonly waitForSessionAbortTimeout?: (timeoutMs: number) => Effect.Effect<void>;
   readonly beforeSessionInstall?: Effect.Effect<void>;
   readonly resolveServerPassword?: (
     provider: OpenCodeCompatibleProvider,
@@ -1065,17 +1076,49 @@ function buildOpenCodeThreadSnapshot(input: {
 
 const stopOpenCodeContext = Effect.fn("stopOpenCodeContext")(function* (
   context: OpenCodeSessionContext,
+  input: {
+    readonly abortTimeoutMs: number;
+    readonly waitForAbortTimeout: Effect.Effect<void>;
+    readonly onStopping?: Effect.Effect<void>;
+    readonly onClosed?: Effect.Effect<void>;
+  },
 ) {
-  if (yield* Ref.getAndSet(context.stopped, true)) {
-    return;
-  }
+  return yield* context.shutdownMutex.withPermit(
+    Effect.uninterruptibleMask(() =>
+      Effect.gen(function* () {
+        const shutdownState = yield* Ref.get(context.shutdownState);
+        if (shutdownState === "closed") {
+          return false;
+        }
 
-  yield* runOpenCodeSdk("session.abort", () =>
-    context.client.session.abort({ sessionID: context.openCodeSessionId }),
-  ).pipe(Effect.ignore({ log: true }));
+        if (shutdownState === "running") {
+          yield* Ref.set(context.shutdownState, "stopping");
+          yield* Ref.set(context.stopped, true);
+          yield* input.onStopping ?? Effect.void;
+        }
 
-  yield* Scope.close(context.sessionScope, Exit.void).pipe(
-    Effect.ensuring(Effect.sync(() => releaseOpenCodeGatewayLease(context))),
+        const abortCompleted = yield* Effect.raceFirst(
+          runOpenCodeSdk("session.abort", () =>
+            context.client.session.abort({ sessionID: context.openCodeSessionId }),
+          ).pipe(Effect.ignore({ log: true }), Effect.as(true)),
+          input.waitForAbortTimeout.pipe(Effect.as(false)),
+        ).pipe(Effect.interruptible);
+        if (!abortCompleted) {
+          return yield* new ProviderAdapterRequestError({
+            provider: context.session.provider,
+            method: "session.abort",
+            detail: `Timed out after ${input.abortTimeoutMs}ms while aborting the provider session. Session ownership remains retained for retry.`,
+          });
+        }
+
+        yield* Scope.close(context.sessionScope, Exit.void).pipe(
+          Effect.ensuring(Effect.sync(() => releaseOpenCodeGatewayLease(context))),
+        );
+        yield* Ref.set(context.shutdownState, "closed");
+        yield* input.onClosed ?? Effect.void;
+        return true;
+      }),
+    ),
   );
 });
 
@@ -1115,6 +1158,14 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
         ) ?? OPENCODE_PROMPT_ACCEPTED_RECOVERY_DELAYS_MS;
       const promptSubmissionInlineWaitMs =
         options?.promptSubmissionInlineWaitMs ?? OPENCODE_PROMPT_SUBMISSION_INLINE_WAIT_MS;
+      const sessionAbortTimeoutMs =
+        options?.sessionAbortTimeoutMs !== undefined &&
+        Number.isFinite(options.sessionAbortTimeoutMs) &&
+        options.sessionAbortTimeoutMs > 0
+          ? options.sessionAbortTimeoutMs
+          : OPENCODE_SESSION_ABORT_TIMEOUT_MS;
+      const waitForSessionAbortTimeout =
+        options?.waitForSessionAbortTimeout ?? ((timeoutMs: number) => Effect.sleep(timeoutMs));
       const nativeEventLogger =
         options?.nativeEventLogger ??
         (options?.nativeEventLogPath !== undefined
@@ -1127,13 +1178,32 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
       const runtimeEvents = yield* Queue.unbounded<ProviderRuntimeEvent>();
       const sessions = new Map<ThreadId, OpenCodeSessionContext>();
 
+      const stopAndRemoveOpenCodeContext = Effect.fn("stopAndRemoveOpenCodeContext")(function* (
+        context: OpenCodeSessionContext,
+        callbacks: {
+          readonly onStopping?: Effect.Effect<void>;
+          readonly onClosed?: Effect.Effect<void>;
+        } = {},
+      ) {
+        return yield* stopOpenCodeContext(context, {
+          abortTimeoutMs: sessionAbortTimeoutMs,
+          waitForAbortTimeout: waitForSessionAbortTimeout(sessionAbortTimeoutMs),
+          ...(callbacks.onStopping !== undefined ? { onStopping: callbacks.onStopping } : {}),
+          onClosed: Effect.gen(function* () {
+            yield* callbacks.onClosed ?? Effect.void;
+            if (sessions.get(context.session.threadId) === context) {
+              sessions.delete(context.session.threadId);
+            }
+          }),
+        });
+      });
+
       yield* Effect.addFinalizer(() =>
         Effect.gen(function* () {
           const contexts = [...sessions.values()];
-          sessions.clear();
           yield* Effect.forEach(
             contexts,
-            (context) => Effect.ignoreCause(stopOpenCodeContext(context)),
+            (context) => Effect.ignoreCause(stopAndRemoveOpenCodeContext(context)),
             { concurrency: "unbounded", discard: true },
           );
           if (managedNativeEventLogger !== undefined) {
@@ -1221,36 +1291,26 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
         context: OpenCodeSessionContext,
         message: string,
       ) {
-        if (yield* Ref.getAndSet(context.stopped, true)) {
-          return;
-        }
         const turnId = context.activeTurnId;
-        sessions.delete(context.session.threadId);
-        yield* emit(context, {
-          ...buildEventBase({ threadId: context.session.threadId, turnId }),
-          type: "runtime.error",
-          payload: {
-            message,
-            class: "transport_error",
-          },
-        }).pipe(Effect.ignore);
-        yield* emit(context, {
-          ...buildEventBase({ threadId: context.session.threadId, turnId }),
-          type: "session.exited",
-          payload: {
-            reason: message,
-            recoverable: false,
-            exitKind: "error",
-          },
-        }).pipe(Effect.ignore);
-        yield* runOpenCodeSdk("session.abort", () =>
-          context.client.session.abort({
-            sessionID: context.openCodeSessionId,
-          }),
-        ).pipe(Effect.ignore({ log: true }));
-        yield* Scope.close(context.sessionScope, Exit.void).pipe(
-          Effect.ensuring(Effect.sync(() => releaseOpenCodeGatewayLease(context))),
-        );
+        yield* stopAndRemoveOpenCodeContext(context, {
+          onStopping: emit(context, {
+            ...buildEventBase({ threadId: context.session.threadId, turnId }),
+            type: "runtime.error",
+            payload: {
+              message,
+              class: "transport_error",
+            },
+          }).pipe(Effect.ignore),
+          onClosed: emit(context, {
+            ...buildEventBase({ threadId: context.session.threadId, turnId }),
+            type: "session.exited",
+            payload: {
+              reason: message,
+              recoverable: false,
+              exitKind: "error",
+            },
+          }).pipe(Effect.ignore),
+        });
       });
 
       const emitAssistantTextDelta = Effect.fn("emitAssistantTextDelta")(function* (
@@ -3011,8 +3071,7 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
               : undefined;
           const existing = sessions.get(input.threadId);
           if (existing) {
-            yield* stopOpenCodeContext(existing);
-            sessions.delete(input.threadId);
+            yield* stopAndRemoveOpenCodeContext(existing);
           }
 
           const resumedSessionId = extractResumeSessionId(input.resumeCursor);
@@ -3236,6 +3295,8 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
                   activeAgent: undefined,
                   activeVariant: undefined,
                   stopped: yield* Ref.make(false),
+                  shutdownState: yield* Ref.make<OpenCodeSessionShutdownState>("running"),
+                  shutdownMutex: yield* Semaphore.make(1),
                   sessionScope: started.sessionScope,
                 };
                 sessions.set(input.threadId, context);
@@ -3502,17 +3563,23 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
 
       const stopSession: OpenCodeAdapterShape["stopSession"] = Effect.fn("stopSession")(
         function* (threadId) {
-          const context = ensureAdapterSessionContext(threadId);
-          yield* stopOpenCodeContext(context);
-          sessions.delete(threadId);
-          yield* emit(context, {
-            ...buildEventBase({ threadId }),
-            type: "session.exited",
-            payload: {
-              reason: "Session stopped.",
-              recoverable: false,
-              exitKind: "graceful",
-            },
+          const context = sessions.get(threadId);
+          if (!context) {
+            return yield* new ProviderAdapterSessionNotFoundError({
+              provider,
+              threadId,
+            });
+          }
+          yield* stopAndRemoveOpenCodeContext(context, {
+            onClosed: emit(context, {
+              ...buildEventBase({ threadId }),
+              type: "session.exited",
+              payload: {
+                reason: "Session stopped.",
+                recoverable: false,
+                exitKind: "graceful",
+              },
+            }),
           });
         },
       );
@@ -3856,10 +3923,12 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
             })
             .pipe(
               Effect.catch((error) =>
-                Effect.logDebug(`${adapterConfig.displayName} CLI model discovery failed`, {
-                  binaryPath,
-                  detail: openCodeRuntimeErrorDetail(error),
-                }).pipe(Effect.as([] as ReadonlyArray<OpenCodeCliModelDescriptor>)),
+                findProviderProcessExitUnprovenError(error) === null
+                  ? Effect.logDebug(`${adapterConfig.displayName} CLI model discovery failed`, {
+                      binaryPath,
+                      detail: openCodeRuntimeErrorDetail(error),
+                    }).pipe(Effect.as([] as ReadonlyArray<OpenCodeCliModelDescriptor>))
+                  : Effect.fail(toAdapterRequestError(error)),
               ),
             );
           const inventoryEffect = withDiscoveryInventory(
@@ -3914,6 +3983,16 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
             };
           }
 
+          const inventoryFailure = Cause.squash(inventoryExit.cause);
+          if (findProviderProcessExitUnprovenError(inventoryFailure) !== null) {
+            return yield* new ProviderAdapterRequestError({
+              provider,
+              method: "listModels",
+              detail: openCodeRuntimeErrorDetail(inventoryFailure),
+              cause: inventoryFailure,
+            });
+          }
+
           // Keep OpenCode's authoritative CLI list usable even if the local server
           // cannot start; otherwise the web picker falls back to one static model.
           if (cliModels.length > 0) {
@@ -3939,7 +4018,6 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
             };
           }
 
-          const inventoryFailure = Cause.squash(inventoryExit.cause);
           return yield* new ProviderAdapterRequestError({
             provider,
             method: "listModels",
@@ -4015,12 +4093,16 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
       const stopAll: OpenCodeAdapterShape["stopAll"] = () =>
         Effect.gen(function* () {
           const contexts = [...sessions.values()];
-          sessions.clear();
           yield* Effect.forEach(
             contexts,
-            (context) => Effect.ignoreCause(stopOpenCodeContext(context)),
+            (context) => Effect.ignoreCause(stopAndRemoveOpenCodeContext(context)),
             { concurrency: "unbounded", discard: true },
           );
+          if (openCodeRuntime.closeLocalServerPoolsForCliSpec !== undefined) {
+            yield* openCodeRuntime
+              .closeLocalServerPoolsForCliSpec({ cliSpec: adapterConfig.cliSpec })
+              .pipe(Effect.mapError(toAdapterRequestError));
+          }
         });
 
       return {
@@ -4055,7 +4137,13 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
     }),
   ).pipe(
     Layer.provide(
-      options?.runtime ? Layer.succeed(OpenCodeRuntime, options.runtime) : OpenCodeRuntimeLive,
+      options?.runtime
+        ? Layer.succeed(OpenCodeRuntime, options.runtime)
+        : makeOpenCodeRuntimeLive(
+            options?.maintenanceOwnedResources
+              ? { maintenanceOwnedResources: options.maintenanceOwnedResources }
+              : undefined,
+          ),
     ),
     Layer.provide(NodeServices.layer),
   );

@@ -54,7 +54,21 @@ import {
 import { ServerConfig, type ServerConfigShape } from "../../config.ts";
 import { appendFileAttachmentsPromptBlock } from "../attachmentProjection.ts";
 import { loadProviderPromptImageBlocks } from "../promptAttachments.ts";
-import { prepareWindowsProviderProcess } from "../windowsProviderProcess.ts";
+import {
+  isWindowsJobPreparedCommand,
+  prepareWindowsProviderProcess,
+} from "../windowsProviderProcess.ts";
+import {
+  installPreparedEffectProcessSupervisor,
+  supervisePreparedEffectProcess,
+} from "../windowsJobProcessSupervisor.ts";
+import { findProviderProcessExitUnprovenError } from "../supervisedProcessTeardown.ts";
+import {
+  makeProviderMaintenanceOwnedResourceCoordinator,
+  type ProviderMaintenanceOwnedResourceCoordinator,
+} from "../providerMaintenanceOwnedResources.ts";
+import { makeProviderProcessOwnerTracker } from "../providerProcessOwnerTracker.ts";
+import { stopSessionsBestEffort } from "../stopSessionsBestEffort.ts";
 import {
   ProviderAdapterProcessError,
   ProviderAdapterRequestError,
@@ -77,6 +91,11 @@ import {
   settleAcpPendingUserInputsAsEmptyAnswers,
 } from "../acp/AcpAdapterSessionSupport.ts";
 import { type AcpSessionRuntimeShape } from "../acp/AcpSessionRuntime.ts";
+import {
+  type AcpSessionTeardownState,
+  makeAcpSessionTeardownState,
+  runAcpSessionTeardown,
+} from "../acp/AcpSessionTeardown.ts";
 import {
   makeAcpAssistantItemEvent,
   makeAcpContentDeltaEvent,
@@ -120,6 +139,8 @@ import { discoverCursorSkills } from "../cursorSkillsDiscovery.ts";
 
 const PROVIDER = "cursor" as const;
 
+export { stopSessionsBestEffort as stopCursorSessionsBestEffort } from "../stopSessionsBestEffort.ts";
+
 export const takeCursorSynaraHarnessPolicyTextPart = (
   state: SynaraHarnessPolicyDeliveryState,
   scopedGatewayConnectionAvailable: boolean,
@@ -137,6 +158,7 @@ const CURSOR_TURN_IDLE_TIMEOUT_MS = resolveAcpTurnIdleTimeoutMs({
   envVar: "SYNARA_CURSOR_TURN_IDLE_TIMEOUT_MS",
   defaultMs: 600_000,
 });
+
 const CURSOR_TURN_WATCHDOG_INTERVAL_MS = 15_000;
 const ACP_PLAN_MODE_ALIASES = ["plan", "architect"];
 const ACP_IMPLEMENT_MODE_ALIASES = ["code", "agent", "default", "chat", "implement"];
@@ -169,12 +191,17 @@ export function makeCursorModelListChildProcess(
     ...(prepared.windowsHide ? { windowsHide: true } : {}),
     ...(prepared.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
     env,
-  });
+    ...(isWindowsJobPreparedCommand(prepared) ? { synaraExternallySupervised: true } : {}),
+  } as ChildProcess.CommandOptions & { readonly synaraExternallySupervised?: true });
 }
 
 export interface CursorAdapterLiveOptions {
   readonly nativeEventLogPath?: string;
   readonly nativeEventLogger?: EventNdjsonLogger;
+  readonly closeSessionScope?: (scope: Scope.Closeable) => Effect.Effect<void>;
+  readonly maintenanceOwnedResources?: ProviderMaintenanceOwnedResourceCoordinator;
+  readonly prepareProcess?: typeof prepareWindowsProviderProcess;
+  readonly superviseProcess?: typeof supervisePreparedEffectProcess;
 }
 
 interface PendingApproval {
@@ -209,6 +236,7 @@ interface CursorSessionContext {
   // idle-progress watchdog that force-fails a silently hung turn.
   lastTurnActivityAt: number | undefined;
   latestSessionCostUsd: number | undefined;
+  readonly teardown: AcpSessionTeardownState;
   stopped: boolean;
 }
 
@@ -366,9 +394,19 @@ export function makeCursorAdapter(
   options?: CursorAdapterLiveOptions,
 ) {
   return Effect.gen(function* () {
+    const closeSessionScope =
+      options?.closeSessionScope ?? ((scope: Scope.Closeable) => Scope.close(scope, Exit.void));
     const fileSystem = yield* FileSystem.FileSystem;
     const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
     const serverConfig = yield* Effect.service(ServerConfig);
+    const maintenanceOwnedResources =
+      options?.maintenanceOwnedResources ??
+      (yield* makeProviderMaintenanceOwnedResourceCoordinator);
+    const modelProcessOwners = makeProviderProcessOwnerTracker({
+      provider: PROVIDER,
+      resourcePrefix: "cursor-model-discovery",
+      maintenanceOwnedResources,
+    });
     // Optional so adapter tests can run without the gateway layer; when
     // present, every session gets the synara_* MCP tools.
     const agentGatewayCredentials = Option.getOrUndefined(
@@ -545,24 +583,30 @@ export function makeCursorAdapter(
     };
 
     const stopSessionInternal = (ctx: CursorSessionContext) =>
-      Effect.gen(function* () {
-        if (ctx.stopped) return;
-        ctx.stopped = true;
-        ctx.gatewaySessionLease?.release();
-        yield* settleAcpPendingApprovalsAsCancelled(ctx.pendingApprovals);
-        yield* settleAcpPendingUserInputsAsEmptyAnswers(ctx.pendingUserInputs);
-        if (ctx.notificationFiber) {
-          yield* Fiber.interrupt(ctx.notificationFiber);
-        }
-        yield* Effect.ignore(Scope.close(ctx.scope, Exit.void));
-        sessions.delete(ctx.threadId);
-        yield* offerRuntimeEvent(ctx.lifecycleGeneration, {
-          type: "session.exited",
-          ...(yield* makeEventStamp()),
-          provider: PROVIDER,
-          threadId: ctx.threadId,
-          payload: { exitKind: "graceful" },
-        });
+      runAcpSessionTeardown({
+        state: ctx.teardown,
+        onStart: () => {
+          ctx.stopped = true;
+          ctx.gatewaySessionLease?.release();
+        },
+        teardown: Effect.gen(function* () {
+          yield* settleAcpPendingApprovalsAsCancelled(ctx.pendingApprovals);
+          yield* settleAcpPendingUserInputsAsEmptyAnswers(ctx.pendingUserInputs);
+          if (ctx.notificationFiber) {
+            yield* Fiber.interrupt(ctx.notificationFiber);
+          }
+          yield* closeSessionScope(ctx.scope);
+          if (sessions.get(ctx.threadId) === ctx) {
+            sessions.delete(ctx.threadId);
+          }
+          yield* offerRuntimeEvent(ctx.lifecycleGeneration, {
+            type: "session.exited",
+            ...(yield* makeEventStamp()),
+            provider: PROVIDER,
+            threadId: ctx.threadId,
+            payload: { exitKind: "graceful" },
+          });
+        }),
       });
 
     const startSession: CursorAdapterShape["startSession"] = (input) =>
@@ -588,7 +632,7 @@ export function makeCursorAdapter(
           const cursorModelSelection =
             input.modelSelection?.provider === PROVIDER ? input.modelSelection : undefined;
           const existing = sessions.get(input.threadId);
-          if (existing && !existing.stopped) {
+          if (existing) {
             yield* stopSessionInternal(existing);
           }
 
@@ -878,6 +922,7 @@ export function makeCursorAdapter(
             updatedAt: now,
           };
 
+          const teardown = yield* makeAcpSessionTeardownState();
           ctx = {
             threadId: input.threadId,
             ...(gatewaySessionLease ? { gatewaySessionLease } : {}),
@@ -900,6 +945,7 @@ export function makeCursorAdapter(
             activePromptFiber: undefined,
             lastTurnActivityAt: undefined,
             latestSessionCostUsd: undefined,
+            teardown,
             stopped: false,
           };
 
@@ -1354,7 +1400,13 @@ export function makeCursorAdapter(
       withThreadLock(
         threadId,
         Effect.gen(function* () {
-          const ctx = yield* requireSession(threadId);
+          const ctx = sessions.get(threadId);
+          if (ctx === undefined) {
+            return yield* new ProviderAdapterSessionNotFoundError({
+              provider: PROVIDER,
+              threadId,
+            });
+          }
           yield* stopSessionInternal(ctx);
         }),
       );
@@ -1416,12 +1468,47 @@ export function makeCursorAdapter(
           ...(effectiveApiEndpoint ? { apiEndpoint: effectiveApiEndpoint } : {}),
         });
         const env = buildCursorAgentHeadlessEnv();
-        const prepared = prepareWindowsProviderProcess(command.command, command.args, {
-          env,
-        });
-        const child = yield* childProcessSpawner.spawn(
-          makeCursorModelListChildProcess(prepared, env),
+        const prepared = (options?.prepareProcess ?? prepareWindowsProviderProcess)(
+          command.command,
+          command.args,
+          { env },
         );
+        const owned = yield* Effect.uninterruptible(
+          Effect.gen(function* () {
+            const child = yield* childProcessSpawner.spawn(
+              makeCursorModelListChildProcess(prepared, env),
+            );
+            const installation = isWindowsJobPreparedCommand(prepared)
+              ? installPreparedEffectProcessSupervisor(
+                  prepared,
+                  child,
+                  { platform: "win32" },
+                  options?.superviseProcess,
+                )
+              : undefined;
+            const owner = installation
+              ? yield* modelProcessOwners.register(installation.supervisor)
+              : undefined;
+            if (owner) {
+              yield* Effect.addFinalizer(() =>
+                modelProcessOwners.teardown(owner).pipe(Effect.orDie),
+              );
+            }
+            if (installation?._tag === "Recovered") {
+              return yield* new ProviderAdapterRequestError({
+                provider: PROVIDER,
+                method: "model/list",
+                detail: "Failed to install Cursor model discovery process-tree supervision.",
+                cause: installation.requestedSupervisorFailure,
+              });
+            }
+            return {
+              child,
+              owner,
+            };
+          }),
+        );
+        const { child, owner } = owned;
         const [stdout, stderr, exitCode] = yield* Effect.all(
           [
             collectStreamAsString(child.stdout),
@@ -1430,6 +1517,9 @@ export function makeCursorAdapter(
           ],
           { concurrency: "unbounded" },
         );
+        if (owner) {
+          yield* modelProcessOwners.proveExit(owner);
+        }
         if (exitCode !== 0) {
           return yield* new ProviderAdapterRequestError({
             provider: PROVIDER,
@@ -1515,18 +1605,21 @@ export function makeCursorAdapter(
         })),
         // The flat CLI list expands transport variants that ACP already represents
         // as per-model controls. Use it only when the richer ACP catalog is unavailable.
-        Effect.catch(() =>
-          runCursorModelListCommand.pipe(
-            Effect.map(
-              (cliModels) =>
-                ({
-                  models: cliModels,
-                  source: "cursor.cli",
-                  cached: false,
-                }) satisfies ProviderListModelsResult,
-            ),
-          ),
-        ),
+        Effect.catch((error) => {
+          const unprovenExit = findProviderProcessExitUnprovenError(error);
+          return unprovenExit === null
+            ? runCursorModelListCommand.pipe(
+                Effect.map(
+                  (cliModels) =>
+                    ({
+                      models: cliModels,
+                      source: "cursor.cli",
+                      cached: false,
+                    }) satisfies ProviderListModelsResult,
+                ),
+              )
+            : Effect.fail(unprovenExit);
+        }),
       );
 
       return discovery.pipe(
@@ -1544,12 +1637,35 @@ export function makeCursorAdapter(
     };
 
     const stopAll: CursorAdapterShape["stopAll"] = () =>
-      Effect.forEach(sessions.values(), stopSessionInternal, { discard: true });
+      Effect.gen(function* () {
+        const sessionExit = yield* Effect.exit(
+          stopSessionsBestEffort(sessions.values(), stopSessionInternal),
+        );
+        const ownerExit = yield* Effect.exit(
+          modelProcessOwners.drain.pipe(
+            Effect.mapError(
+              (cause) =>
+                new ProviderAdapterRequestError({
+                  provider: PROVIDER,
+                  method: "stopAll",
+                  detail:
+                    cause instanceof Error
+                      ? cause.message
+                      : "Failed to prove all Cursor process trees exited.",
+                  cause,
+                }),
+            ),
+          ),
+        );
+        if (Exit.isFailure(sessionExit)) return yield* Effect.failCause(sessionExit.cause);
+        if (Exit.isFailure(ownerExit)) return yield* Effect.failCause(ownerExit.cause);
+      });
 
     yield* Effect.addFinalizer(() =>
-      Effect.forEach(sessions.values(), stopSessionInternal, { discard: true }).pipe(
-        Effect.tap(() => PubSub.shutdown(runtimeEventPubSub)),
-        Effect.tap(() => managedNativeEventLogger?.close() ?? Effect.void),
+      stopAll().pipe(
+        Effect.ignore,
+        Effect.ensuring(PubSub.shutdown(runtimeEventPubSub)),
+        Effect.ensuring(managedNativeEventLogger?.close() ?? Effect.void),
       ),
     );
 

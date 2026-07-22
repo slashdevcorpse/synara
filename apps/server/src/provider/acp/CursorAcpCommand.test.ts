@@ -7,6 +7,7 @@
  *
  * @module CursorAcpCommand.test
  */
+import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -14,6 +15,10 @@ import {
   buildCursorAgentHeadlessEnv,
   resolveCursorAgentBinaryPath,
 } from "./CursorAcpCommand.ts";
+
+const executableExtension = process.platform === "win32" ? ".exe" : "";
+const executablePath = (directory: string, command: string): string =>
+  path.join(directory, `${command}${executableExtension}`);
 
 describe("resolveCursorAgentBinaryPath", () => {
   it("defaults to cursor-agent when no binary is configured", () => {
@@ -46,10 +51,11 @@ describe("buildCursorAgentCommand", () => {
   });
 
   it("normalizes Cursor editor launchers before appending agent args", () => {
+    const toolsDir = path.resolve("tools");
     expect(
       buildCursorAgentCommand("cursor", ["acp"], {
-        env: { PATH: "/tools" },
-        pathExists: (path) => path === "/tools/cursor-agent",
+        env: { PATH: toolsDir },
+        pathExists: (candidate) => candidate === executablePath(toolsDir, "cursor-agent"),
       }),
     ).toEqual({
       command: "cursor-agent",
@@ -91,10 +97,13 @@ describe("buildCursorAgentCommand", () => {
   });
 
   it("does not use adjacent generic agent commands for bare cursor launchers", () => {
+    const toolsDir = path.resolve("tools");
     expect(
       buildCursorAgentCommand("cursor", ["acp"], {
-        env: { PATH: "/tools" },
-        pathExists: (path) => path === "/tools/cursor" || path === "/tools/agent",
+        env: { PATH: toolsDir },
+        pathExists: (candidate) =>
+          candidate === executablePath(toolsDir, "cursor") ||
+          candidate === executablePath(toolsDir, "agent"),
       }),
     ).toEqual({
       command: "cursor",
@@ -103,10 +112,11 @@ describe("buildCursorAgentCommand", () => {
   });
 
   it("falls back through Cursor editor launchers when no agent command can be resolved", () => {
+    const toolsDir = path.resolve("tools");
     expect(
       buildCursorAgentCommand("cursor", ["acp"], {
-        env: { PATH: "/tools" },
-        pathExists: (path) => path === "/tools/cursor",
+        env: { PATH: toolsDir },
+        pathExists: (candidate) => candidate === executablePath(toolsDir, "cursor"),
       }),
     ).toEqual({
       command: "cursor",
@@ -115,10 +125,11 @@ describe("buildCursorAgentCommand", () => {
   });
 
   it("falls back to PATH cursor-agent before inventing an agent sibling", () => {
+    const toolsDir = path.resolve("tools");
     expect(
       buildCursorAgentCommand("/missing/bin/cursor", ["acp"], {
-        env: { PATH: "/tools" },
-        pathExists: (path) => path === "/tools/cursor-agent",
+        env: { PATH: toolsDir },
+        pathExists: (candidate) => candidate === executablePath(toolsDir, "cursor-agent"),
       }),
     ).toEqual({
       command: "cursor-agent",
@@ -127,10 +138,13 @@ describe("buildCursorAgentCommand", () => {
   });
 
   it("prefers PATH cursor-agent over sibling legacy agent commands", () => {
+    const toolsDir = path.resolve("tools");
     expect(
       buildCursorAgentCommand("/usr/local/bin/cursor", ["acp"], {
-        env: { PATH: "/tools" },
-        pathExists: (path) => path === "/usr/local/bin/agent" || path === "/tools/cursor-agent",
+        env: { PATH: toolsDir },
+        pathExists: (candidate) =>
+          candidate === "/usr/local/bin/agent" ||
+          candidate === executablePath(toolsDir, "cursor-agent"),
       }),
     ).toEqual({
       command: "cursor-agent",
@@ -139,13 +153,24 @@ describe("buildCursorAgentCommand", () => {
   });
 
   it("uses bundled sibling agent commands for Cursor-owned editor paths", () => {
-    const cursorPath = "/Applications/Cursor.app/Contents/Resources/app/bin/cursor";
-    const agentPath = "/Applications/Cursor.app/Contents/Resources/app/bin/agent";
-    const cursorSymlinkPath = "/usr/local/bin/cursor";
+    const root = path.parse(process.cwd()).root;
+    const cursorBinDir = path.join(
+      root,
+      "Applications",
+      "Cursor.app",
+      "Contents",
+      "Resources",
+      "app",
+      "bin",
+    );
+    const cursorPath = executablePath(cursorBinDir, "cursor");
+    const agentPath = executablePath(cursorBinDir, "agent");
+    const cursorSymlinkDir = path.join(root, "usr", "local", "bin");
+    const cursorSymlinkPath = executablePath(cursorSymlinkDir, "cursor");
     expect(
       buildCursorAgentCommand("cursor", ["acp"], {
-        env: { PATH: "/Applications/Cursor.app/Contents/Resources/app/bin" },
-        pathExists: (path) => path === cursorPath || path === agentPath,
+        env: { PATH: cursorBinDir },
+        pathExists: (candidate) => candidate === cursorPath || candidate === agentPath,
       }),
     ).toEqual({
       command: agentPath,
@@ -154,9 +179,9 @@ describe("buildCursorAgentCommand", () => {
 
     expect(
       buildCursorAgentCommand("cursor", ["models"], {
-        env: { PATH: "/usr/local/bin" },
-        pathExists: (path) => path === cursorSymlinkPath || path === agentPath,
-        realpath: (path) => (path === cursorSymlinkPath ? cursorPath : path),
+        env: { PATH: cursorSymlinkDir },
+        pathExists: (candidate) => candidate === cursorSymlinkPath || candidate === agentPath,
+        realpath: (candidate) => (candidate === cursorSymlinkPath ? cursorPath : candidate),
       }),
     ).toEqual({
       command: agentPath,

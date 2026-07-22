@@ -41,11 +41,21 @@ import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 import { NetService, type NetServiceShape } from "@synara/shared/Net";
 import { splitLines } from "@synara/shared/text";
 import { buildProviderChildEnvironment } from "../providerChildEnvironment.ts";
+import type { ProcessTreeKiller } from "../terminal/processTreeKiller.ts";
 import {
-  teardownEffectProcessTree,
+  findProviderProcessExitUnprovenError,
   teardownProviderProcessTree,
 } from "./supervisedProcessTeardown.ts";
 import { isWindowsShellCommandMissingResult } from "../shell-command-detection.ts";
+import {
+  makeProviderMaintenanceOwnedResourceCoordinator,
+  type ProviderMaintenanceOwnedResourceCoordinator,
+} from "./providerMaintenanceOwnedResources.ts";
+import { makeProviderProcessOwnerTracker } from "./providerProcessOwnerTracker.ts";
+import {
+  installPreparedEffectProcessSupervisor,
+  supervisePreparedEffectProcess,
+} from "./windowsJobProcessSupervisor.ts";
 import { prepareWindowsProviderProcess } from "./windowsProviderProcess.ts";
 
 const DEFAULT_OPENCODE_SERVER_TIMEOUT_MS = 20_000;
@@ -85,9 +95,17 @@ export const KILO_CLI_SPEC: OpenCodeCompatibleCliSpec = {
   serverAuthUsername: "kilo",
 };
 
-export interface OpenCodeServerProcess {
-  readonly url: string;
+export interface OpenCodeOwnedServerProcess {
   readonly exitCode: Effect.Effect<number, never>;
+  /**
+   * Proves the complete owned process tree exited. Calls are serialized, a failed proof remains
+   * retryable, and calls after the first proven exit are idempotent.
+   */
+  readonly stop: Effect.Effect<void, OpenCodeRuntimeError>;
+}
+
+export interface OpenCodeServerProcess extends OpenCodeOwnedServerProcess {
+  readonly url: string;
 }
 
 export interface OpenCodeServerConnection {
@@ -98,10 +116,13 @@ export interface OpenCodeServerConnection {
 
 interface PooledOpenCodeServer {
   readonly key: string;
-  readonly server: OpenCodeServerProcess;
+  readonly cliSpecKey: string;
+  readonly owner: OpenCodeOwnedServerProcess;
+  server: OpenCodeServerProcess | null;
   readonly scope: Scope.Closeable;
   readonly closeOnRelease: boolean;
   refCount: number;
+  closeFailure: OpenCodeRuntimeError | null;
   idleCloseFiber: Fiber.Fiber<void, never> | null;
   exitWatchFiber: Fiber.Fiber<void, never> | null;
 }
@@ -197,6 +218,11 @@ export interface OpenCodeRuntimeShape {
     readonly hostname?: string;
     readonly timeoutMs?: number;
     readonly experimentalWebSockets?: boolean;
+    /**
+     * Called atomically after process-tree supervision is installed but before readiness is awaited.
+     * Callers use this handoff to retain exact cleanup ownership if startup later fails.
+     */
+    readonly onProcessOwned?: (process: OpenCodeOwnedServerProcess) => Effect.Effect<void, never>;
   }) => Effect.Effect<OpenCodeServerProcess, OpenCodeRuntimeError, Scope.Scope>;
   readonly connectToOpenCodeServer: (input: {
     readonly binaryPath: string;
@@ -214,6 +240,13 @@ export interface OpenCodeRuntimeShape {
      */
     readonly poolIsolationKey?: string;
   }) => Effect.Effect<OpenCodeServerConnection, OpenCodeRuntimeError, Scope.Scope>;
+  /**
+   * Live runtimes implement this pool control API. It remains optional so runtime test doubles
+   * that never create local pooled processes do not need a meaningless teardown implementation.
+   */
+  readonly closeLocalServerPoolsForCliSpec?: (input: {
+    readonly cliSpec: OpenCodeCompatibleCliSpec;
+  }) => Effect.Effect<void, OpenCodeRuntimeError>;
   readonly runOpenCodeCommand: (input: {
     readonly binaryPath: string;
     readonly cliSpec?: OpenCodeCompatibleCliSpec;
@@ -304,6 +337,17 @@ function formatOpenCodeServerStartupDetail(input: {
   ].join("\n\n");
 }
 
+function openCodeCompatibleCliSpecKey(cliSpec: OpenCodeCompatibleCliSpec): string {
+  return JSON.stringify({
+    defaultBinaryPath: cliSpec.defaultBinaryPath,
+    displayName: cliSpec.displayName,
+    serverReadyPrefix: cliSpec.serverReadyPrefix,
+    configContentEnvVar: cliSpec.configContentEnvVar,
+    dataDirectoryName: cliSpec.dataDirectoryName,
+    serverAuthUsername: cliSpec.serverAuthUsername,
+  });
+}
+
 function pooledOpenCodeServerKey(input: {
   readonly binaryPath: string;
   readonly cliSpec?: OpenCodeCompatibleCliSpec;
@@ -321,14 +365,7 @@ function pooledOpenCodeServerKey(input: {
     port: input.port ?? null,
     experimentalWebSockets: input.experimentalWebSockets === true,
     poolIsolationKey: input.poolIsolationKey ?? null,
-    cliSpec: {
-      defaultBinaryPath: cliSpec.defaultBinaryPath,
-      displayName: cliSpec.displayName,
-      serverReadyPrefix: cliSpec.serverReadyPrefix,
-      configContentEnvVar: cliSpec.configContentEnvVar,
-      dataDirectoryName: cliSpec.dataDirectoryName,
-      serverAuthUsername: cliSpec.serverAuthUsername,
-    },
+    cliSpec: openCodeCompatibleCliSpecKey(cliSpec),
   });
 }
 
@@ -840,9 +877,13 @@ const collectStreamAsString = <E>(stream: Stream.Stream<Uint8Array, E>): Effect.
   );
 
 export interface OpenCodeRuntimeLiveOptions {
+  readonly platform?: NodeJS.Platform;
   readonly prepareProcess?: typeof prepareWindowsProviderProcess;
+  readonly superviseProcess?: typeof supervisePreparedEffectProcess;
   readonly teardownProcessTree?: typeof teardownProviderProcessTree;
+  readonly processTreeKiller?: ProcessTreeKiller;
   readonly netService?: NetServiceShape;
+  readonly maintenanceOwnedResources?: ProviderMaintenanceOwnedResourceCoordinator;
 }
 
 const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
@@ -854,6 +895,25 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
     );
     const pooledServerMutex = yield* Semaphore.make(1);
     const pooledServers = new Map<string, PooledOpenCodeServer>();
+    const maintenanceOwnedResources =
+      options?.maintenanceOwnedResources ??
+      (yield* makeProviderMaintenanceOwnedResourceCoordinator);
+    const oneShotOwnerTrackers = {
+      opencode: makeProviderProcessOwnerTracker({
+        provider: "opencode",
+        resourcePrefix: "opencode-runtime-command",
+        maintenanceOwnedResources,
+      }),
+      kilo: makeProviderProcessOwnerTracker({
+        provider: "kilo",
+        resourcePrefix: "kilo-runtime-command",
+        maintenanceOwnedResources,
+      }),
+    } as const;
+    const oneShotOwnerTrackerFor = (cliSpec: OpenCodeCompatibleCliSpec) =>
+      openCodeCompatibleCliSpecKey(cliSpec) === openCodeCompatibleCliSpecKey(KILO_CLI_SPEC)
+        ? oneShotOwnerTrackers.kilo
+        : oneShotOwnerTrackers.opencode;
 
     const runOpenCodeCommand: OpenCodeRuntimeShape["runOpenCodeCommand"] = (input) =>
       Effect.gen(function* () {
@@ -868,15 +928,68 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
             env: childEnv,
           },
         );
-        const child = yield* spawner.spawn(
-          ChildProcess.make(prepared.command, prepared.args, {
-            shell: prepared.shell,
-            ...(prepared.windowsHide ? { windowsHide: true } : {}),
-            ...(prepared.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
-            ...(input.cwd ? { cwd: input.cwd } : {}),
-            env: childEnv,
+        const platform = options?.platform ?? globalThis.process.platform;
+        const cliSpec = input.cliSpec ?? OPENCODE_CLI_SPEC;
+        const oneShotOwnerTracker = oneShotOwnerTrackerFor(cliSpec);
+        const owned = yield* Effect.uninterruptible(
+          Effect.gen(function* () {
+            const child = yield* spawner.spawn(
+              ChildProcess.make(prepared.command, prepared.args, {
+                shell: prepared.shell,
+                ...(prepared.windowsHide ? { windowsHide: true } : {}),
+                ...(prepared.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
+                ...(input.cwd ? { cwd: input.cwd } : {}),
+                env: childEnv,
+                detached: platform !== "win32",
+                synaraExternallySupervised: true,
+              } as ChildProcess.CommandOptions & { readonly synaraExternallySupervised: true }),
+            );
+            const supervisorInstallation = yield* Effect.try({
+              try: () =>
+                installPreparedEffectProcessSupervisor(
+                  prepared,
+                  child,
+                  {
+                    platform,
+                    ...(options?.processTreeKiller
+                      ? { processTreeKiller: options.processTreeKiller }
+                      : {}),
+                    teardownProcessTree:
+                      options?.teardownProcessTree ?? teardownProviderProcessTree,
+                    ...(platform === "win32" ? {} : { ownedProcessGroupId: Number(child.pid) }),
+                  },
+                  options?.superviseProcess,
+                ),
+              catch: (cause) =>
+                ensureRuntimeError(
+                  "runOpenCodeCommand",
+                  `Failed to install ${cliSpec.displayName} command process-tree supervision: ${openCodeRuntimeErrorDetail(cause)}`,
+                  cause,
+                ),
+            });
+            const supervisor = supervisorInstallation.supervisor;
+            const owner = yield* oneShotOwnerTracker.register(supervisor);
+            yield* Effect.addFinalizer(() =>
+              oneShotOwnerTracker.teardown(owner).pipe(Effect.orDie),
+            );
+            if (supervisorInstallation._tag === "Recovered") {
+              return yield* ensureRuntimeError(
+                "runOpenCodeCommand",
+                `Failed to install ${cliSpec.displayName} command process-tree supervision: ${openCodeRuntimeErrorDetail(supervisorInstallation.requestedSupervisorFailure)}`,
+                supervisorInstallation.requestedSupervisorFailure,
+              );
+            }
+            yield* Effect.tryPromise({
+              try: supervisor.waitForInitialCapture,
+              catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause))),
+            });
+            return {
+              child,
+              owner,
+            };
           }),
         );
+        const { child, owner } = owned;
         const [stdout, stderr, code] = yield* Effect.all(
           [
             collectStreamAsString(child.stdout),
@@ -886,6 +999,7 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
           { concurrency: "unbounded" },
         );
         const exitCode = Number(code);
+        yield* oneShotOwnerTracker.proveExit(owner);
         if (isWindowsShellCommandMissingResult({ code: exitCode, stderr })) {
           return yield* new OpenCodeRuntimeError({
             operation: "runOpenCodeCommand",
@@ -914,6 +1028,7 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
       Effect.gen(function* () {
         const runtimeScope = yield* Scope.Scope;
         const cliSpec = input.cliSpec ?? OPENCODE_CLI_SPEC;
+        const platform = options?.platform ?? globalThis.process.platform;
 
         const hostname = input.hostname ?? DEFAULT_HOSTNAME;
         const port =
@@ -945,46 +1060,124 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
           },
         );
 
-        const child = yield* spawner
-          .spawn(
-            ChildProcess.make(prepared.command, prepared.args, {
+        const supervised = yield* Effect.uninterruptible(
+          Effect.gen(function* () {
+            const childCommandOptions: ChildProcess.CommandOptions & {
+              readonly synaraExternallySupervised: true;
+            } = {
               env: childEnv,
               ...(input.cwd ? { cwd: input.cwd } : {}),
               shell: prepared.shell,
               ...(prepared.windowsHide ? { windowsHide: true } : {}),
               ...(prepared.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
-              detached: false,
+              detached: platform !== "win32",
               killSignal: "SIGKILL",
               forceKillAfter: "1500 millis",
-            }),
-          )
-          .pipe(
-            Effect.provideService(Scope.Scope, runtimeScope),
-            Effect.mapError(
-              (cause) =>
+              // Synara registers the exact-tree fallback below in this same uninterruptible
+              // acquisition. Disable Effect's PID/process-group scope finalizer so it cannot run a
+              // second, identity-unaware teardown after the exact owner succeeds or fails closed.
+              synaraExternallySupervised: true,
+            };
+            const child = yield* spawner
+              .spawn(ChildProcess.make(prepared.command, prepared.args, childCommandOptions))
+              .pipe(
+                Effect.provideService(Scope.Scope, runtimeScope),
+                Effect.mapError(
+                  (cause) =>
+                    new OpenCodeRuntimeError({
+                      operation: "startOpenCodeServerProcess",
+                      detail: `Failed to spawn OpenCode server process: ${openCodeRuntimeErrorDetail(cause)}`,
+                      cause,
+                    }),
+                ),
+              );
+            const stopMutex = yield* Semaphore.make(1);
+            let processTreeExitProven = false;
+            const supervisorInstallation = yield* Effect.try({
+              try: () =>
+                installPreparedEffectProcessSupervisor(
+                  prepared,
+                  child,
+                  {
+                    ...(options?.processTreeKiller
+                      ? { processTreeKiller: options.processTreeKiller }
+                      : {}),
+                    teardownProcessTree:
+                      options?.teardownProcessTree ?? teardownProviderProcessTree,
+                    platform,
+                    ...(platform === "win32" ? {} : { ownedProcessGroupId: Number(child.pid) }),
+                  },
+                  options?.superviseProcess,
+                ),
+              catch: (cause) =>
                 new OpenCodeRuntimeError({
                   operation: "startOpenCodeServerProcess",
-                  detail: `Failed to spawn OpenCode server process: ${openCodeRuntimeErrorDetail(cause)}`,
+                  detail: `Failed to install ${cliSpec.displayName} server process-tree supervision: ${openCodeRuntimeErrorDetail(cause)}`,
                   cause,
                 }),
-            ),
-          );
-        yield* Scope.addFinalizer(
-          runtimeScope,
-          Effect.tryPromise({
-            try: () =>
-              teardownEffectProcessTree(
-                child,
-                options?.teardownProcessTree ?? teardownProviderProcessTree,
+            });
+            const processSupervisor = supervisorInstallation.supervisor;
+            const stop = stopMutex.withPermit(
+              Effect.uninterruptible(
+                Effect.suspend(() => {
+                  if (processTreeExitProven) {
+                    return Effect.void;
+                  }
+                  return Effect.tryPromise({
+                    try: processSupervisor.teardown,
+                    catch: (cause) =>
+                      new OpenCodeRuntimeError({
+                        operation: "stopOpenCodeServerProcess",
+                        detail: `Failed to prove ${cliSpec.displayName} server process-tree exit: ${openCodeRuntimeErrorDetail(cause)}`,
+                        cause,
+                      }),
+                  }).pipe(
+                    Effect.tap(() =>
+                      Effect.sync(() => {
+                        processTreeExitProven = true;
+                      }),
+                    ),
+                    Effect.asVoid,
+                  );
+                }),
               ),
-            catch: (cause) =>
-              new OpenCodeRuntimeError({
-                operation: "stopOpenCodeServerProcess",
-                detail: `Failed to prove ${cliSpec.displayName} server process-tree exit: ${openCodeRuntimeErrorDetail(cause)}`,
-                cause,
+            );
+            yield* Scope.addFinalizer(runtimeScope, stop.pipe(Effect.orDie));
+            const owner = {
+              exitCode: child.exitCode.pipe(
+                Effect.map(Number),
+                Effect.orElseSucceed(() => 0),
+              ),
+              stop,
+            } satisfies OpenCodeOwnedServerProcess;
+            if (input.onProcessOwned !== undefined) {
+              yield* input.onProcessOwned(owner);
+            }
+            if (supervisorInstallation._tag === "Recovered") {
+              return yield* new OpenCodeRuntimeError({
+                operation: "startOpenCodeServerProcess",
+                detail: `Failed to install ${cliSpec.displayName} server process-tree supervision: ${openCodeRuntimeErrorDetail(supervisorInstallation.requestedSupervisorFailure)}`,
+                cause: supervisorInstallation.requestedSupervisorFailure,
+              });
+            }
+            const initialCaptureExit = yield* Effect.exit(
+              Effect.tryPromise({
+                try: processSupervisor.waitForInitialCapture,
+                catch: (cause) =>
+                  new OpenCodeRuntimeError({
+                    operation: "startOpenCodeServerProcess",
+                    detail: `Failed to install ${cliSpec.displayName} server process-tree supervision: ${openCodeRuntimeErrorDetail(cause)}`,
+                    cause,
+                  }),
               }),
-          }).pipe(Effect.asVoid, Effect.orDie),
+            );
+            if (Exit.isFailure(initialCaptureExit)) {
+              return yield* Effect.failCause(initialCaptureExit.cause);
+            }
+            return { child, owner };
+          }),
         );
+        const { child, owner } = supervised;
 
         const stdoutRef = yield* Ref.make("");
         const stderrRef = yield* Ref.make("");
@@ -1101,10 +1294,7 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
 
         return {
           url: readyOption.value,
-          exitCode: child.exitCode.pipe(
-            Effect.map(Number),
-            Effect.orElseSucceed(() => 0),
-          ),
+          ...owner,
         } satisfies OpenCodeServerProcess;
       });
 
@@ -1126,7 +1316,7 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
       yield* cancelPooledServerIdleClose(pooledServer);
     });
 
-    const closePooledServer = Effect.fn("closePooledServer")(function* (
+    const closePooledServerEffect = Effect.fn("closePooledServer")(function* (
       pooledServer: PooledOpenCodeServer,
     ) {
       // Keep the pool entry authoritative while scope finalization proves the server tree exited.
@@ -1139,9 +1329,83 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
         yield* Fiber.interrupt(exitWatchFiber).pipe(Effect.ignore);
       }
 
-      yield* Scope.close(pooledServer.scope, Exit.void);
+      const stopExit = yield* Effect.exit(pooledServer.owner.stop);
+      if (Exit.isFailure(stopExit)) {
+        const cause = Cause.squash(stopExit.cause);
+        const error = new OpenCodeRuntimeError({
+          operation: "closeLocalServerPoolsForCliSpec",
+          detail: `Failed to prove local server process-tree exit: ${openCodeRuntimeErrorDetail(cause)}`,
+          cause,
+        });
+        pooledServer.closeFailure = error;
+        return yield* error;
+      }
+
+      const closeExit = yield* Effect.exit(Scope.close(pooledServer.scope, Exit.void));
+      if (Exit.isFailure(closeExit)) {
+        const cause = Cause.squash(closeExit.cause);
+        const error = new OpenCodeRuntimeError({
+          operation: "closeLocalServerPoolsForCliSpec",
+          detail: `Failed to close local server scope after proving process-tree exit: ${openCodeRuntimeErrorDetail(cause)}`,
+          cause,
+        });
+        pooledServer.closeFailure = error;
+        return yield* error;
+      }
+      pooledServer.closeFailure = null;
       yield* detachPooledServer(pooledServer);
     });
+
+    const closePooledServer = (pooledServer: PooledOpenCodeServer) =>
+      closePooledServerEffect(pooledServer).pipe(Effect.uninterruptible);
+
+    const reportPooledServerCloseFailure = (
+      phase: "connection-release" | "idle-timeout" | "process-exit" | "runtime-shutdown",
+      error: OpenCodeRuntimeError,
+    ) =>
+      Effect.logError("OpenCode pooled server cleanup failed", {
+        phase,
+        operation: error.operation,
+        reason: error.detail,
+      });
+
+    const closePooledServerTotal = (
+      pooledServer: PooledOpenCodeServer,
+      phase: "idle-timeout" | "process-exit",
+    ) =>
+      closePooledServer(pooledServer).pipe(
+        Effect.catch((error) => reportPooledServerCloseFailure(phase, error)),
+      );
+
+    const closePooledServersForRuntimeShutdown = pooledServerMutex.withPermit(
+      Effect.gen(function* () {
+        const failures: OpenCodeRuntimeError[] = [];
+        for (const pooledServer of Array.from(pooledServers.values())) {
+          const closeExit = yield* Effect.exit(closePooledServer(pooledServer));
+          if (Exit.isSuccess(closeExit)) {
+            continue;
+          }
+
+          const cause = Cause.squash(closeExit.cause);
+          const error = ensureRuntimeError(
+            "closeLocalServerPoolsForCliSpec",
+            `Failed to prove local server process-tree exit during runtime shutdown: ${openCodeRuntimeErrorDetail(cause)}`,
+            cause,
+          );
+          failures.push(error);
+          yield* reportPooledServerCloseFailure("runtime-shutdown", error);
+        }
+
+        if (failures.length > 0) {
+          return yield* Effect.die(
+            new AggregateError(
+              failures,
+              `OpenCode runtime shutdown failed to prove process-tree exit for ${String(failures.length)} pooled server${failures.length === 1 ? "" : "s"}.`,
+            ),
+          );
+        }
+      }),
+    );
 
     const schedulePooledServerIdleClose = Effect.fn("schedulePooledServerIdleClose")(function* (
       pooledServer: PooledOpenCodeServer,
@@ -1158,7 +1422,7 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
                 return;
               }
               pooledServer.idleCloseFiber = null;
-              yield* closePooledServer(pooledServer);
+              yield* closePooledServerTotal(pooledServer, "idle-timeout");
             }),
           ),
         ),
@@ -1170,7 +1434,11 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
     const watchPooledServerExit = Effect.fn("watchPooledServerExit")(function* (
       pooledServer: PooledOpenCodeServer,
     ) {
-      const exitWatchFiber = yield* pooledServer.server.exitCode.pipe(
+      const server = pooledServer.server;
+      if (server === null) {
+        return;
+      }
+      const exitWatchFiber = yield* server.exitCode.pipe(
         Effect.flatMap(() =>
           pooledServerMutex.withPermit(
             Effect.gen(function* () {
@@ -1178,12 +1446,10 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
                 return;
               }
               pooledServer.exitWatchFiber = null;
-              yield* Scope.close(pooledServer.scope, Exit.void);
-              yield* detachPooledServer(pooledServer);
+              yield* closePooledServerTotal(pooledServer, "process-exit");
             }),
           ),
         ),
-        Effect.ignore,
         Effect.forkIn(pooledServerScope),
       );
       pooledServer.exitWatchFiber = exitWatchFiber;
@@ -1202,8 +1468,18 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
       pooledServerMutex.withPermit(
         Effect.gen(function* () {
           const key = pooledOpenCodeServerKey(input);
+          const cliSpecKey = openCodeCompatibleCliSpecKey(input.cliSpec ?? OPENCODE_CLI_SPEC);
           const existing = pooledServers.get(key);
           if (existing) {
+            if (existing.closeFailure !== null) {
+              return yield* existing.closeFailure;
+            }
+            if (existing.server === null) {
+              return yield* new OpenCodeRuntimeError({
+                operation: "connectToOpenCodeServer",
+                detail: `${(input.cliSpec ?? OPENCODE_CLI_SPEC).displayName} local server startup failed and its process-tree exit remains unproven.`,
+              });
+            }
             yield* cancelPooledServerIdleClose(existing);
             existing.refCount += 1;
             return existing;
@@ -1213,29 +1489,54 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
           return yield* Effect.uninterruptibleMask((restore) =>
             Effect.gen(function* () {
               const serverScope = yield* Scope.make();
+              const ownedServerRef = yield* Ref.make<PooledOpenCodeServer | null>(null);
               const startedExit = yield* Effect.exit(
                 restore(
-                  startOpenCodeServerProcess(input).pipe(
-                    Effect.provideService(Scope.Scope, serverScope),
-                  ),
+                  startOpenCodeServerProcess({
+                    ...input,
+                    onProcessOwned: (owner) =>
+                      Effect.gen(function* () {
+                        const pooledServer: PooledOpenCodeServer = {
+                          key,
+                          cliSpecKey,
+                          owner,
+                          server: null,
+                          scope: serverScope,
+                          closeOnRelease: input.poolIsolationKey !== undefined,
+                          refCount: 0,
+                          closeFailure: null,
+                          idleCloseFiber: null,
+                          exitWatchFiber: null,
+                        };
+                        pooledServers.set(key, pooledServer);
+                        yield* Ref.set(ownedServerRef, pooledServer);
+                      }),
+                  }).pipe(Effect.provideService(Scope.Scope, serverScope)),
                 ),
               );
+              const pooledServer = yield* Ref.get(ownedServerRef);
 
               if (Exit.isFailure(startedExit)) {
-                yield* Scope.close(serverScope, Exit.void).pipe(Effect.ignore);
+                if (pooledServer === null) {
+                  yield* Scope.close(serverScope, Exit.void).pipe(Effect.ignore);
+                } else {
+                  // A startup failure is still an owned process. Try exact cleanup once, but keep
+                  // the zero-reference pool record authoritative when exit proof is rejected.
+                  yield* closePooledServer(pooledServer).pipe(Effect.ignore);
+                }
                 return yield* Effect.failCause(startedExit.cause);
               }
 
-              const pooledServer: PooledOpenCodeServer = {
-                key,
-                server: startedExit.value,
-                scope: serverScope,
-                closeOnRelease: input.poolIsolationKey !== undefined,
-                refCount: 1,
-                idleCloseFiber: null,
-                exitWatchFiber: null,
-              };
-              pooledServers.set(key, pooledServer);
+              if (pooledServer === null) {
+                yield* Scope.close(serverScope, Exit.void).pipe(Effect.ignore);
+                return yield* new OpenCodeRuntimeError({
+                  operation: "connectToOpenCodeServer",
+                  detail:
+                    "OpenCode server startup completed without transferring process ownership.",
+                });
+              }
+              pooledServer.server = startedExit.value;
+              pooledServer.refCount = 1;
               yield* watchPooledServerExit(pooledServer);
               return pooledServer;
             }),
@@ -1260,15 +1561,53 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
         }),
       );
 
-    yield* Effect.addFinalizer(() =>
+    const closeLocalServerPoolsForCliSpec: NonNullable<
+      OpenCodeRuntimeShape["closeLocalServerPoolsForCliSpec"]
+    > = (input) =>
       pooledServerMutex.withPermit(
         Effect.gen(function* () {
-          for (const pooledServer of Array.from(pooledServers.values())) {
+          const cliSpecKey = openCodeCompatibleCliSpecKey(input.cliSpec);
+          const matchingServers = Array.from(pooledServers.values()).filter(
+            (pooledServer) => pooledServer.cliSpecKey === cliSpecKey,
+          );
+          const activeReferenceCount = matchingServers.reduce(
+            (total, pooledServer) => total + pooledServer.refCount,
+            0,
+          );
+
+          // Refuse the whole target operation before mutating any matching pool. This keeps
+          // maintenance deterministic when one target pool is idle and another is still active.
+          if (activeReferenceCount > 0) {
+            return yield* new OpenCodeRuntimeError({
+              operation: "closeLocalServerPoolsForCliSpec",
+              detail: `Cannot close ${input.cliSpec.displayName} local server pools while ${activeReferenceCount} active connection reference${activeReferenceCount === 1 ? "" : "s"} remain.`,
+            });
+          }
+
+          yield* oneShotOwnerTrackerFor(input.cliSpec).drain.pipe(
+            Effect.mapError((cause) =>
+              ensureRuntimeError(
+                "closeLocalServerPoolsForCliSpec",
+                `Failed to prove ${input.cliSpec.displayName} command process-tree exit: ${openCodeRuntimeErrorDetail(cause)}`,
+                cause,
+              ),
+            ),
+          );
+
+          for (const pooledServer of matchingServers) {
             yield* closePooledServer(pooledServer);
           }
         }),
-      ),
+      );
+
+    yield* Effect.addFinalizer(() =>
+      Effect.forEach(
+        [oneShotOwnerTrackers.opencode, oneShotOwnerTrackers.kilo],
+        (tracker) => tracker.drain,
+        { discard: true },
+      ).pipe(Effect.orDie),
     );
+    yield* Effect.addFinalizer(() => closePooledServersForRuntimeShutdown);
 
     const connectToOpenCodeServer: OpenCodeRuntimeShape["connectToOpenCodeServer"] = (input) => {
       const serverUrl = input.serverUrl?.trim();
@@ -1296,10 +1635,22 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
             ? { poolIsolationKey: input.poolIsolationKey }
             : {}),
         });
-        yield* Scope.addFinalizer(callerScope, releasePooledServer(pooledServer));
+        const server = pooledServer.server;
+        if (server === null) {
+          return yield* new OpenCodeRuntimeError({
+            operation: "connectToOpenCodeServer",
+            detail: `${(input.cliSpec ?? OPENCODE_CLI_SPEC).displayName} local server is unavailable because startup cleanup remains incomplete.`,
+          });
+        }
+        yield* Scope.addFinalizer(
+          callerScope,
+          releasePooledServer(pooledServer).pipe(
+            Effect.catch((error) => reportPooledServerCloseFailure("connection-release", error)),
+          ),
+        );
         return {
-          url: pooledServer.server.url,
-          exitCode: pooledServer.server.exitCode,
+          url: server.url,
+          exitCode: server.exitCode,
           external: false,
         };
       });
@@ -1420,6 +1771,9 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
         args: ["models", "--verbose"],
       }).pipe(
         Effect.catch((error) => {
+          if (findProviderProcessExitUnprovenError(error) !== null) {
+            return Effect.fail(error);
+          }
           if (!OpenCodeRuntimeError.is(error)) {
             return Effect.fail(error);
           }
@@ -1479,6 +1833,7 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
     return {
       startOpenCodeServerProcess,
       connectToOpenCodeServer,
+      closeLocalServerPoolsForCliSpec,
       runOpenCodeCommand,
       createOpenCodeSdkClient,
       loadOpenCodeInventory,

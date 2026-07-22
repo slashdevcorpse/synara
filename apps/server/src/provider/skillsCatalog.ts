@@ -98,12 +98,29 @@ function readBooleanField(
 
 // ── Filesystem walking ───────────────────────────────────────────────
 
-export function ancestorsFromDeepest(cwd: string): string[] {
+export function ancestorsFromDeepest(cwd: string, boundary?: string): string[] {
   const resolved = nodePath.resolve(cwd);
+  const resolvedBoundary = boundary ? nodePath.resolve(boundary) : undefined;
+  if (resolvedBoundary) {
+    const relativeToBoundary = nodePath.relative(resolvedBoundary, resolved);
+    if (
+      nodePath.isAbsolute(relativeToBoundary) ||
+      relativeToBoundary === ".." ||
+      relativeToBoundary.startsWith(`..${nodePath.sep}`)
+    ) {
+      throw new RangeError(
+        `Project root boundary ${resolvedBoundary} must contain cwd ${resolved}`,
+      );
+    }
+  }
+
   const ancestors: string[] = [];
   let current = resolved;
   while (true) {
     ancestors.push(current);
+    if (resolvedBoundary && nodePath.relative(resolvedBoundary, current) === "") {
+      return ancestors;
+    }
     const parent = nodePath.dirname(current);
     if (parent === current) {
       return ancestors;
@@ -303,6 +320,8 @@ export async function collectSkillsFromRoots(
 export interface SkillsCatalogDiscoveryInput {
   /** Optional workspace cwd; when present, project-level skill folders are included. */
   readonly cwd?: string | null;
+  /** Inclusive ceiling for project-root ancestor scans; omitted in normal runtime discovery. */
+  readonly projectRootBoundary?: string;
   readonly homeDir: string;
   /** Synara base dir (usually `~/.synara`); skills live in `{base}/skills`. */
   readonly synaraBaseDir: string;
@@ -499,7 +518,7 @@ function rootsForOrderedOrigins(
   const projectRoots: SkillRoot[] = [];
   const cwd = input.cwd?.trim();
   if (cwd) {
-    for (const ancestor of ancestorsFromDeepest(cwd)) {
+    for (const ancestor of ancestorsFromDeepest(cwd, input.projectRootBoundary)) {
       const seenRootNames = new Set<string>();
       for (const origin of orderedOrigins) {
         for (const rootName of projectRootNamesForOrigin(origin)) {
@@ -544,6 +563,7 @@ export async function discoverSkillsCatalog(
 ): Promise<ProviderSkillDescriptor[]> {
   const cacheKey = [
     input.cwd?.trim() ?? "",
+    input.projectRootBoundary ? nodePath.resolve(input.projectRootBoundary) : "",
     input.provider ?? "",
     input.homeDir,
     input.synaraBaseDir,

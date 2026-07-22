@@ -1,11 +1,16 @@
 import { readFileSync } from "node:fs";
+import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
+
+const require = createRequire(import.meta.url);
 
 const packageManifest = JSON.parse(
   readFileSync(new URL("../../package.json", import.meta.url), "utf8"),
 ) as {
   readonly devDependencies?: Readonly<Record<string, string>>;
   readonly overrides?: Readonly<Record<string, string>>;
+  readonly patchedDependencies?: Readonly<Record<string, string>>;
 };
 const serverPackageManifest = JSON.parse(
   readFileSync(new URL("../../apps/server/package.json", import.meta.url), "utf8"),
@@ -23,6 +28,23 @@ const marketingPackageManifest = JSON.parse(
   readonly dependencies?: Readonly<Record<string, string>>;
 };
 const lockfile = readFileSync(new URL("../../bun.lock", import.meta.url), "utf8");
+const effectProcessPatchPath = "patches/@effect%2Fplatform-node-shared@8881a9b.patch";
+const effectProcessPatch = readFileSync(
+  new URL("../../patches/@effect%252Fplatform-node-shared@8881a9b.patch", import.meta.url),
+  "utf8",
+);
+const platformNodeRequire = createRequire(require.resolve("@effect/platform-node/package.json"));
+const effectProcessPackageRoot = dirname(
+  platformNodeRequire.resolve("@effect/platform-node-shared/package.json"),
+);
+const effectProcessSource = readFileSync(
+  join(effectProcessPackageRoot, "src/NodeChildProcessSpawner.ts"),
+  "utf8",
+);
+const effectProcessRuntime = readFileSync(
+  join(effectProcessPackageRoot, "dist/NodeChildProcessSpawner.js"),
+  "utf8",
+);
 
 const securityPins = {
   "@babel/core": "7.29.7",
@@ -90,5 +112,35 @@ describe("dependency security pins", () => {
     ]) {
       expect(lockfile).not.toContain(`[${JSON.stringify(resolution)}`);
     }
+  });
+
+  it("keeps Effect child processes on Synara's identity-owned teardown path", () => {
+    expect(packageManifest.patchedDependencies).toMatchObject({
+      "@effect/platform-node-shared@https://pkg.pr.new/Effect-TS/effect-smol/@effect/platform-node-shared@8881a9b606d84a6f5eb6615279138322984f5368":
+        effectProcessPatchPath,
+    });
+    expect(effectProcessPatch).toContain("synaraExternallySupervised");
+    expect(effectProcessPatch).toContain("synaraCloseStdin");
+    expect(effectProcessPatch).toContain("synaraTerminateExact");
+    expect(effectProcessPatch).not.toContain("-              if (code !== 0");
+    expect(effectProcessPatch).not.toContain(
+      "-                return yield* Effect.ignore(killWithTimeout(killProcessGroup))",
+    );
+  });
+
+  it("keeps the patched Effect TypeScript source on a typed handle extension", () => {
+    const handleInitializer = effectProcessSource.match(
+      /const handle = makeHandle\(\{([\s\S]*?)\n\s*\}\)\n\s*return Object\.assign/,
+    );
+
+    expect(effectProcessSource).toContain("const handle = makeHandle({");
+    expect(effectProcessSource).toContain("return Object.assign(handle, {");
+    expect(effectProcessSource).toContain("synaraCloseStdin");
+    expect(effectProcessSource).toContain("synaraTerminateExact: () => childProcess.kill()");
+    expect(effectProcessSource).toContain("if (code !== 0 && Predicate.isNotNull(code))");
+    expect(handleInitializer?.[1]).not.toContain("synaraCloseStdin");
+    expect(effectProcessRuntime).toContain("synaraExternallySupervised");
+    expect(effectProcessRuntime).toContain("synaraCloseStdin");
+    expect(effectProcessRuntime).toContain("synaraTerminateExact: () => childProcess.kill()");
   });
 });

@@ -1,8 +1,8 @@
 diff --git a/dist/NodeChildProcessSpawner.js b/dist/NodeChildProcessSpawner.js
-index ff15212e4..e7cf12c4d 100644
+index 7e51c003..d26fd1a9 100644
 --- a/dist/NodeChildProcessSpawner.js
 +++ b/dist/NodeChildProcessSpawner.js
-@@ -314,7 +314,9 @@ const make = /*#__PURE__*/Effect.gen(function* () {
+@@ -314,8 +314,13 @@ const make = /*#__PURE__*/Effect.gen(function* () {
              env,
              stdio,
              detached: cmd.options.detached ?? process.platform !== "win32",
@@ -11,13 +11,41 @@ index ff15212e4..e7cf12c4d 100644
 +            windowsHide: cmd.options.windowsHide,
 +            windowsVerbatimArguments: cmd.options.windowsVerbatimArguments
            }), Effect.fnUntraced(function* ([childProcess, exitSignal]) {
++            if (cmd.options.synaraExternallySupervised === true) {
++              return yield* Effect.void;
++            }
              const exited = yield* Deferred.isDone(exitSignal);
              const killWithTimeout = withTimeout(childProcess, cmd, cmd.options);
+             if (exited) {
+@@ -356,7 +361,7 @@ const make = /*#__PURE__*/Effect.gen(function* () {
+             const killWithTimeout = withTimeout(childProcess, cmd, options);
+             return killWithTimeout((command, childProcess, signal) => Effect.catch(killProcessGroup(command, childProcess, signal), () => killProcess(command, childProcess, signal))).pipe(Effect.andThen(Deferred.await(exitSignal)), Effect.asVoid);
+           };
+-          return makeHandle({
++          const handle = makeHandle({
+             pid,
+             exitCode,
+             isRunning,
+@@ -368,6 +373,14 @@ const make = /*#__PURE__*/Effect.gen(function* () {
+             getInputFd,
+             getOutputFd
+           });
++          return Object.assign(handle, {
++            synaraTerminateExact: () => childProcess.kill(),
++            synaraCloseStdin: () => {
++              if (childProcess.stdin !== null && !childProcess.stdin.destroyed) {
++                childProcess.stdin.end();
++              }
++            }
++          });
+         }
+       case "PipedCommand":
+         {
 diff --git a/src/NodeChildProcessSpawner.ts b/src/NodeChildProcessSpawner.ts
-index dc53bafb7..fe867fbfc 100644
+index dc53bafb..be26b5d4 100644
 --- a/src/NodeChildProcessSpawner.ts
 +++ b/src/NodeChildProcessSpawner.ts
-@@ -430,7 +430,17 @@ const make = Effect.gen(function*() {
+@@ -430,9 +430,28 @@ const make = Effect.gen(function*() {
              env,
              stdio,
              detached: cmd.options.detached ?? process.platform !== "win32",
@@ -35,4 +63,39 @@ index dc53bafb7..fe867fbfc 100644
 +            ).windowsVerbatimArguments
            }),
            Effect.fnUntraced(function*([childProcess, exitSignal]) {
++            if (
++              (
++                cmd.options as ChildProcess.CommandOptions & {
++                  readonly synaraExternallySupervised?: boolean | undefined
++                }
++              ).synaraExternallySupervised === true
++            ) {
++              return yield* Effect.void
++            }
              const exited = yield* Deferred.isDone(exitSignal)
+             const killWithTimeout = withTimeout(childProcess, cmd, cmd.options)
+             if (exited) {
+@@ -485,7 +504,7 @@ const make = Effect.gen(function*() {
+           )
+         }
+
+-        return makeHandle({
++        const handle = makeHandle({
+           pid,
+           exitCode,
+           isRunning,
+@@ -497,6 +516,14 @@ const make = Effect.gen(function*() {
+           getInputFd,
+           getOutputFd
+         })
++        return Object.assign(handle, {
++          synaraTerminateExact: () => childProcess.kill(),
++          synaraCloseStdin: () => {
++            if (childProcess.stdin !== null && !childProcess.stdin.destroyed) {
++              childProcess.stdin.end()
++            }
++          }
++        })
+       }
+       case "PipedCommand": {
+         const { commands, pipeOptions } = flattenCommand(cmd)

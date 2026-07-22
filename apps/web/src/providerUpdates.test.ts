@@ -7,9 +7,13 @@ import type { ProviderKind, ServerProviderStatus, ServerSettings } from "@synara
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  getProviderUpdatePresentation,
   getVisibleProviderUpdateStatuses,
   isProviderUpdateActive,
+  isProviderUpdateIncomplete,
   providerUpdateNotificationKey,
+  providerUpdateIncompleteMessage,
+  resolveProviderUpdateManualCommand,
   shouldOfferProviderUpdateAction,
   shouldShowProviderUpdateStatus,
   withProviderUpdateTimeout,
@@ -218,6 +222,276 @@ describe("isProviderUpdateActive", () => {
     expect(isProviderUpdateActive(providerStatus("codex", { updateState: succeededState }))).toBe(
       false,
     );
+  });
+});
+
+describe("provider update terminal outcomes", () => {
+  const terminalState = (
+    status: NonNullable<ServerProviderStatus["updateState"]>["status"],
+    message: string | null = `${status} message`,
+  ): NonNullable<ServerProviderStatus["updateState"]> => ({
+    status,
+    startedAt: "2026-06-10T10:00:00.000Z",
+    finishedAt: "2026-06-10T10:01:00.000Z",
+    message,
+    output: "raw updater output",
+  });
+
+  it.each(["failed", "still_outdated", "unchanged", "unverified"] as const)(
+    "treats %s as incomplete",
+    (status) => {
+      expect(
+        isProviderUpdateIncomplete(providerStatus("codex", { updateState: terminalState(status) })),
+      ).toBe(true);
+    },
+  );
+
+  it.each(["already_current", "succeeded"] as const)(
+    "does not treat %s as incomplete",
+    (status) => {
+      expect(
+        isProviderUpdateIncomplete(providerStatus("codex", { updateState: terminalState(status) })),
+      ).toBe(false);
+    },
+  );
+
+  it("prefers the semantic result message over raw updater output", () => {
+    const provider = providerStatus("codex", {
+      updateState: terminalState("unverified", "Same-target version proof was unavailable."),
+    });
+    expect(providerUpdateIncompleteMessage(provider)).toBe(
+      "Same-target version proof was unavailable.",
+    );
+  });
+
+  it("keeps failed updater output alongside the semantic failure message", () => {
+    const provider = providerStatus("codex", {
+      updateState: {
+        ...terminalState("failed", "Update command exited with code 1."),
+        output: "npm error EACCES: permission denied",
+      },
+    });
+
+    expect(providerUpdateIncompleteMessage(provider)).toBe(
+      "Update command exited with code 1.\n\nnpm error EACCES: permission denied",
+    );
+  });
+
+  it.each(["already_current", "succeeded"] as const)(
+    "lets a later release supersede a stale %s result",
+    (status) => {
+      const provider = providerStatus("codex", {
+        version: "1.1.0",
+        versionAdvisory: {
+          ...providerStatus("codex").versionAdvisory!,
+          currentVersion: "1.1.0",
+          latestVersion: "1.2.0",
+          checkedAt: "2026-06-10T10:02:00.000Z",
+          message: "A newer release is available.",
+        },
+        updateState: terminalState(status),
+      });
+
+      expect(getProviderUpdatePresentation(provider)).toEqual({
+        kind: "behind_latest",
+        label: "v1.1.0 -> v1.2.0",
+        message: "A newer release is available.",
+        manualCommand: "npm install -g provider@latest",
+        isVerifiedSuccess: false,
+        severity: "warning",
+      });
+    },
+  );
+
+  it.each(["already_current", "succeeded"] as const)(
+    "keeps a newer %s result ahead of the advisory used to verify it",
+    (status) => {
+      const provider = providerStatus("codex", {
+        updateState: terminalState(status),
+      });
+
+      expect(getProviderUpdatePresentation(provider)).toMatchObject({
+        kind: status,
+        isVerifiedSuccess: true,
+      });
+    },
+  );
+
+  it("keeps active work ahead of a later advisory", () => {
+    const provider = providerStatus("codex", {
+      versionAdvisory: {
+        ...providerStatus("codex").versionAdvisory!,
+        checkedAt: "2026-06-10T10:02:00.000Z",
+      },
+      updateState: {
+        ...terminalState("running", "Updating provider."),
+        finishedAt: null,
+      },
+    });
+
+    expect(getProviderUpdatePresentation(provider)).toEqual({
+      kind: "running",
+      label: "Updating",
+      message: "Updating provider.",
+      manualCommand: "npm install -g provider@latest",
+      isVerifiedSuccess: false,
+      severity: "warning",
+    });
+  });
+
+  it.each(["queued", "running"] as const)(
+    "keeps %s work ahead of a newer current advisory",
+    (status) => {
+      const provider = providerStatus("codex", {
+        version: "1.1.0",
+        versionAdvisory: {
+          status: "current",
+          currentVersion: "1.1.0",
+          latestVersion: "1.1.0",
+          updateCommand: "npm install -g provider@latest",
+          canUpdate: true,
+          checkedAt: "2026-06-10T10:02:00.000Z",
+          message: null,
+        },
+        updateState: {
+          ...terminalState(status, status === "queued" ? "Update queued." : "Updating provider."),
+          finishedAt: null,
+        },
+      });
+
+      expect(getProviderUpdatePresentation(provider)).toMatchObject({
+        kind: status,
+        isVerifiedSuccess: false,
+        severity: "warning",
+      });
+    },
+  );
+
+  it("keeps an incomplete semantic result ahead of a later advisory", () => {
+    const provider = providerStatus("codex", {
+      versionAdvisory: {
+        ...providerStatus("codex").versionAdvisory!,
+        checkedAt: "2026-06-10T10:02:00.000Z",
+      },
+      updateState: terminalState(
+        "unverified",
+        "Update completed, but same-target version proof was unavailable.",
+      ),
+    });
+
+    expect(getProviderUpdatePresentation(provider)).toEqual({
+      kind: "unverified",
+      label: "Update unverified",
+      message: "Update completed, but same-target version proof was unavailable.",
+      manualCommand: "npm install -g provider@latest",
+      isVerifiedSuccess: false,
+      severity: "warning",
+    });
+  });
+
+  it.each(["failed", "still_outdated", "unchanged", "unverified"] as const)(
+    "lets a newer current advisory supersede stale %s presentation",
+    (status) => {
+      const provider = providerStatus("codex", {
+        version: "1.1.0",
+        versionAdvisory: {
+          status: "current",
+          currentVersion: "1.1.0",
+          latestVersion: "1.1.0",
+          updateCommand: "npm install -g provider@latest",
+          canUpdate: true,
+          checkedAt: "2026-06-10T10:02:00.000Z",
+          message: null,
+        },
+        updateState: terminalState(status),
+      });
+
+      expect(getProviderUpdatePresentation(provider)).toEqual({
+        kind: "current",
+        label: "Current v1.1.0",
+        message: null,
+        manualCommand: "npm install -g provider@latest",
+        isVerifiedSuccess: false,
+        severity: "warning",
+      });
+    },
+  );
+
+  it("labels a known version as installed when latest-version metadata is unknown", () => {
+    const provider = providerStatus("antigravity", {
+      version: "1.1.2",
+      versionAdvisory: {
+        status: "unknown",
+        currentVersion: "1.1.2",
+        latestVersion: null,
+        updateCommand: "agy update",
+        canUpdate: true,
+        checkedAt: "2026-07-15T14:00:00.000Z",
+        message: null,
+      },
+    });
+
+    expect(getProviderUpdatePresentation(provider)).toEqual({
+      kind: "unknown",
+      label: "Installed v1.1.2",
+      message: null,
+      manualCommand: "agy update",
+      isVerifiedSuccess: false,
+      severity: "warning",
+    });
+  });
+
+  it("classifies provider-update result severity for both update call sites", () => {
+    expect(getProviderUpdatePresentation(undefined).severity).toBe("error");
+    expect(
+      getProviderUpdatePresentation(
+        providerStatus("codex", { updateState: terminalState("failed") }),
+      ),
+    ).toMatchObject({
+      manualCommand: "npm install -g provider@latest",
+      severity: "error",
+    });
+
+    for (const status of ["still_outdated", "unchanged", "unverified"] as const) {
+      expect(
+        getProviderUpdatePresentation(
+          providerStatus("codex", { updateState: terminalState(status) }),
+        ).severity,
+      ).toBe("warning");
+    }
+    expect(getProviderUpdatePresentation(providerStatus("codex")).severity).toBe("warning");
+
+    for (const status of ["already_current", "succeeded"] as const) {
+      expect(
+        getProviderUpdatePresentation(
+          providerStatus("codex", { updateState: terminalState(status) }),
+        ).severity,
+      ).toBe("success");
+    }
+  });
+
+  it("falls back to the original provider command when refreshed evidence is missing", () => {
+    expect(resolveProviderUpdateManualCommand(undefined, providerStatus("codex"))).toBe(
+      "npm install -g provider@latest",
+    );
+  });
+
+  it("rejects contradictory single and bulk success decisions from the same result", () => {
+    const contradictoryResult = providerStatus("codex", {
+      versionAdvisory: {
+        ...providerStatus("codex").versionAdvisory!,
+        checkedAt: "2026-06-10T10:02:00.000Z",
+      },
+      updateState: terminalState("succeeded"),
+    });
+
+    const singleResult = getProviderUpdatePresentation(contradictoryResult);
+    const bulkResult = getProviderUpdatePresentation(contradictoryResult);
+
+    expect(singleResult.isVerifiedSuccess).toBe(false);
+    expect(bulkResult.isVerifiedSuccess).toBe(false);
+    expect(singleResult.kind).toBe("behind_latest");
+    expect(bulkResult.kind).toBe("behind_latest");
   });
 });
 

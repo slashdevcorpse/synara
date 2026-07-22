@@ -5,7 +5,7 @@
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
-import { Duration, Effect, Fiber, Layer } from "effect";
+import { Deferred, Duration, Effect, Fiber, Layer } from "effect";
 import { TestClock } from "effect/testing";
 import { beforeEach, expect } from "vitest";
 
@@ -15,10 +15,14 @@ import {
   OpenCodeRuntimeError,
   type OpenCodeRuntimeShape,
 } from "../../provider/opencodeRuntime.ts";
-import { OpenCodeTextGeneration } from "../Services/TextGeneration.ts";
 import {
+  makeProviderMaintenanceOwnedResourceCoordinator,
+  ProviderMaintenanceOwnedResourceCloseError,
+} from "../../provider/providerMaintenanceOwnedResources.ts";
+import { KiloTextGeneration, OpenCodeTextGeneration } from "../Services/TextGeneration.ts";
+import {
+  makeKiloTextGenerationServiceLive,
   makeOpenCodeTextGenerationServiceLive,
-  OpenCodeTextGenerationServiceLive,
 } from "./OpenCodeTextGeneration.ts";
 
 const runtimeMock = {
@@ -30,6 +34,14 @@ const runtimeMock = {
     promptInputs: [] as Array<Record<string, unknown>>,
     authHeaders: [] as Array<string | null>,
     closeCalls: [] as string[],
+    stopAttempts: [] as string[],
+    stopFailuresRemaining: 0,
+    startupFailuresRemaining: 0,
+    serverExits: [] as Array<Deferred.Deferred<number>>,
+    stopControls: [] as Array<{
+      readonly started: Deferred.Deferred<void>;
+      readonly allow: Deferred.Deferred<void>;
+    }>,
     promptStartedResolvers: [] as Array<() => void>,
     promptWaits: [] as Array<Promise<void>>,
     promptResult: undefined as
@@ -44,6 +56,11 @@ const runtimeMock = {
     this.state.promptInputs.length = 0;
     this.state.authHeaders.length = 0;
     this.state.closeCalls.length = 0;
+    this.state.stopAttempts.length = 0;
+    this.state.stopFailuresRemaining = 0;
+    this.state.startupFailuresRemaining = 0;
+    this.state.serverExits.length = 0;
+    this.state.stopControls.length = 0;
     this.state.promptStartedResolvers.length = 0;
     this.state.promptWaits.length = 0;
     this.state.promptResult = undefined;
@@ -51,23 +68,69 @@ const runtimeMock = {
 };
 
 const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
-  startOpenCodeServerProcess: ({ binaryPath, cwd }) =>
+  startOpenCodeServerProcess: ({ binaryPath, cwd, onProcessOwned }) =>
     Effect.gen(function* () {
       const index = runtimeMock.state.startCalls.length + 1;
       const url = `http://127.0.0.1:${4_300 + index}`;
       runtimeMock.state.startCalls.push(binaryPath);
       runtimeMock.state.startCwds.push(cwd);
+      const serverExit = yield* Deferred.make<number>();
+      runtimeMock.state.serverExits.push(serverExit);
+      let stopped = false;
+      const stop = Effect.suspend(() => {
+        if (stopped) {
+          return Effect.void;
+        }
+        runtimeMock.state.stopAttempts.push(url);
+        const stopControl = runtimeMock.state.stopControls.shift();
+        const awaitStopControl =
+          stopControl === undefined
+            ? Effect.void
+            : Deferred.succeed(stopControl.started, undefined).pipe(
+                Effect.andThen(Deferred.await(stopControl.allow)),
+              );
+        return awaitStopControl.pipe(
+          Effect.andThen(
+            Effect.suspend(() => {
+              if (runtimeMock.state.stopFailuresRemaining > 0) {
+                runtimeMock.state.stopFailuresRemaining -= 1;
+                return Effect.fail(
+                  new OpenCodeRuntimeError({
+                    operation: "stopOpenCodeServerProcess",
+                    detail: "Process-tree exit remains unproven.",
+                    cause: new Error("unproven test process"),
+                  }),
+                );
+              }
+              stopped = true;
+              runtimeMock.state.closeCalls.push(url);
+              return Effect.void;
+            }),
+          ),
+        );
+      });
 
-      // Mirror the production scoped cleanup so we can assert idle shutdown behavior.
-      yield* Effect.addFinalizer(() =>
-        Effect.sync(() => {
-          runtimeMock.state.closeCalls.push(url);
-        }),
-      );
+      const ownedProcess = {
+        exitCode: Deferred.await(serverExit),
+        stop,
+      };
+
+      // Mirror the production scoped cleanup and pre-readiness ownership handoff.
+      yield* Effect.addFinalizer(() => stop.pipe(Effect.orDie));
+      if (onProcessOwned !== undefined) {
+        yield* onProcessOwned(ownedProcess);
+      }
+      if (runtimeMock.state.startupFailuresRemaining > 0) {
+        runtimeMock.state.startupFailuresRemaining -= 1;
+        return yield* new OpenCodeRuntimeError({
+          operation: "startOpenCodeServerProcess",
+          detail: "Test server failed before readiness completed.",
+        });
+      }
 
       return {
         url,
-        exitCode: Effect.never,
+        ...ownedProcess,
       };
     }),
   connectToOpenCodeServer: ({ serverUrl }) =>
@@ -155,9 +218,17 @@ const OpenCodeTextGenerationExistingServerConfigLayer = ServerConfig.layerTest(p
   prefix: "synara-opencode-text-generation-existing-server-test-",
 });
 
+const maintenanceOwnedResources = Effect.runSync(makeProviderMaintenanceOwnedResourceCoordinator);
+const externalMaintenanceOwnedResources = Effect.runSync(
+  makeProviderMaintenanceOwnedResourceCoordinator,
+);
+const kiloMaintenanceOwnedResources = Effect.runSync(
+  makeProviderMaintenanceOwnedResourceCoordinator,
+);
+
 const OpenCodeTextGenerationTestLayer = Layer.mergeAll(
   NodeServices.layer,
-  OpenCodeTextGenerationServiceLive.pipe(
+  makeOpenCodeTextGenerationServiceLive(undefined, { maintenanceOwnedResources }).pipe(
     Layer.provide(OpenCodeTextGenerationServerConfigLayer),
     Layer.provide(Layer.succeed(OpenCodeRuntime, OpenCodeRuntimeTestDouble)),
     Layer.provide(NodeServices.layer),
@@ -166,8 +237,21 @@ const OpenCodeTextGenerationTestLayer = Layer.mergeAll(
 
 const OpenCodeTextGenerationExistingServerTestLayer = Layer.mergeAll(
   NodeServices.layer,
-  makeOpenCodeTextGenerationServiceLive(() => Effect.succeed("secret-password")).pipe(
+  makeOpenCodeTextGenerationServiceLive(() => Effect.succeed("secret-password"), {
+    maintenanceOwnedResources: externalMaintenanceOwnedResources,
+  }).pipe(
     Layer.provide(OpenCodeTextGenerationExistingServerConfigLayer),
+    Layer.provide(Layer.succeed(OpenCodeRuntime, OpenCodeRuntimeTestDouble)),
+    Layer.provide(NodeServices.layer),
+  ),
+);
+
+const KiloTextGenerationTestLayer = Layer.mergeAll(
+  NodeServices.layer,
+  makeKiloTextGenerationServiceLive(undefined, {
+    maintenanceOwnedResources: kiloMaintenanceOwnedResources,
+  }).pipe(
+    Layer.provide(OpenCodeTextGenerationServerConfigLayer),
     Layer.provide(Layer.succeed(OpenCodeRuntime, OpenCodeRuntimeTestDouble)),
     Layer.provide(NodeServices.layer),
   ),
@@ -185,6 +269,281 @@ const advanceIdleClock = Effect.gen(function* () {
 });
 
 it.layer(OpenCodeTextGenerationTestLayer)("OpenCodeTextGenerationServiceLive", (it) => {
+  it.effect("drains a completed request's warm server for provider maintenance", () =>
+    Effect.gen(function* () {
+      const textGeneration = yield* OpenCodeTextGeneration;
+
+      yield* textGeneration.generateCommitMessage({
+        cwd: process.cwd(),
+        branch: "feature/opencode-maintenance",
+        stagedSummary: "M README.md",
+        stagedPatch: "diff --git a/README.md b/README.md",
+        modelSelection: DEFAULT_TEST_MODEL_SELECTION,
+      });
+      expect(runtimeMock.state.closeCalls).toEqual([]);
+
+      yield* maintenanceOwnedResources.drainProviderResources({ provider: "opencode" });
+      expect(runtimeMock.state.closeCalls).toEqual(["http://127.0.0.1:4301"]);
+      expect(runtimeMock.state.stopAttempts).toEqual(["http://127.0.0.1:4301"]);
+    }),
+  );
+
+  it.effect("finishes exact resource cleanup before honoring drain interruption", () =>
+    Effect.gen(function* () {
+      const stopStarted = yield* Deferred.make<void>();
+      const allowStop = yield* Deferred.make<void>();
+      runtimeMock.state.stopControls.push({ started: stopStarted, allow: allowStop });
+      const textGeneration = yield* OpenCodeTextGeneration;
+
+      yield* textGeneration.generateCommitMessage({
+        cwd: process.cwd(),
+        branch: "feature/opencode-interrupted-maintenance",
+        stagedSummary: "M README.md",
+        stagedPatch: "diff --git a/README.md b/README.md",
+        modelSelection: DEFAULT_TEST_MODEL_SELECTION,
+      });
+
+      const draining = yield* maintenanceOwnedResources
+        .drainProviderResources({ provider: "opencode" })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(stopStarted);
+      const interrupting = yield* Fiber.interrupt(draining).pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+      const interruptionWaitedForCleanup = interrupting.pollUnsafe() === undefined;
+
+      yield* Deferred.succeed(allowStop, undefined);
+      yield* Fiber.join(interrupting);
+
+      expect(interruptionWaitedForCleanup).toBe(true);
+      expect(runtimeMock.state.closeCalls).toEqual(["http://127.0.0.1:4301"]);
+
+      yield* textGeneration.generateCommitMessage({
+        cwd: process.cwd(),
+        branch: "feature/opencode-interrupted-maintenance",
+        stagedSummary: "M README.md",
+        stagedPatch: "diff --git a/README.md b/README.md",
+        modelSelection: DEFAULT_TEST_MODEL_SELECTION,
+      });
+
+      expect(runtimeMock.state.startCalls).toEqual(["opencode", "opencode"]);
+      expect(runtimeMock.state.promptUrls).toEqual([
+        "http://127.0.0.1:4301",
+        "http://127.0.0.1:4302",
+      ]);
+      yield* maintenanceOwnedResources.drainProviderResources({ provider: "opencode" });
+    }),
+  );
+
+  it.effect("retains and retries a warm server whose exit proof initially fails", () =>
+    Effect.gen(function* () {
+      runtimeMock.state.stopFailuresRemaining = 1;
+      const textGeneration = yield* OpenCodeTextGeneration;
+
+      yield* textGeneration.generateCommitMessage({
+        cwd: process.cwd(),
+        branch: "feature/opencode-maintenance-retry",
+        stagedSummary: "M README.md",
+        stagedPatch: "diff --git a/README.md b/README.md",
+        modelSelection: DEFAULT_TEST_MODEL_SELECTION,
+      });
+
+      const first = yield* maintenanceOwnedResources
+        .drainProviderResources({ provider: "opencode" })
+        .pipe(Effect.flip);
+      expect(first).toBeInstanceOf(ProviderMaintenanceOwnedResourceCloseError);
+      expect(runtimeMock.state.closeCalls).toEqual([]);
+      expect(runtimeMock.state.stopAttempts).toEqual(["http://127.0.0.1:4301"]);
+
+      yield* maintenanceOwnedResources.drainProviderResources({ provider: "opencode" });
+      yield* maintenanceOwnedResources.drainProviderResources({ provider: "opencode" });
+      expect(runtimeMock.state.closeCalls).toEqual(["http://127.0.0.1:4301"]);
+      expect(runtimeMock.state.stopAttempts).toEqual([
+        "http://127.0.0.1:4301",
+        "http://127.0.0.1:4301",
+      ]);
+    }),
+  );
+
+  it.effect("retains a failed startup until maintenance retries exact exit proof", () =>
+    Effect.gen(function* () {
+      runtimeMock.state.startupFailuresRemaining = 1;
+      runtimeMock.state.stopFailuresRemaining = 1;
+      const textGeneration = yield* OpenCodeTextGeneration;
+
+      const startupError = yield* textGeneration
+        .generateCommitMessage({
+          cwd: process.cwd(),
+          branch: "feature/opencode-startup-cleanup-retry",
+          stagedSummary: "M README.md",
+          stagedPatch: "diff --git a/README.md b/README.md",
+          modelSelection: DEFAULT_TEST_MODEL_SELECTION,
+        })
+        .pipe(Effect.flip);
+
+      expect(startupError).toBeInstanceOf(Error);
+      expect(runtimeMock.state.startCalls).toEqual(["opencode"]);
+      expect(runtimeMock.state.promptUrls).toEqual([]);
+      expect(runtimeMock.state.stopAttempts).toEqual(["http://127.0.0.1:4301"]);
+      expect(runtimeMock.state.closeCalls).toEqual([]);
+
+      yield* maintenanceOwnedResources.drainProviderResources({ provider: "opencode" });
+      yield* maintenanceOwnedResources.drainProviderResources({ provider: "opencode" });
+      expect(runtimeMock.state.stopAttempts).toEqual([
+        "http://127.0.0.1:4301",
+        "http://127.0.0.1:4301",
+      ]);
+      expect(runtimeMock.state.closeCalls).toEqual(["http://127.0.0.1:4301"]);
+
+      yield* textGeneration.generateCommitMessage({
+        cwd: process.cwd(),
+        branch: "feature/opencode-startup-cleanup-retry",
+        stagedSummary: "M README.md",
+        stagedPatch: "diff --git a/README.md b/README.md",
+        modelSelection: DEFAULT_TEST_MODEL_SELECTION,
+      });
+      expect(runtimeMock.state.startCalls).toEqual(["opencode", "opencode"]);
+      expect(runtimeMock.state.promptUrls).toEqual(["http://127.0.0.1:4302"]);
+
+      yield* maintenanceOwnedResources.drainProviderResources({ provider: "opencode" });
+    }),
+  );
+
+  it.effect("does not reuse a warm server after an idle shutdown proof failure", () =>
+    Effect.gen(function* () {
+      runtimeMock.state.stopFailuresRemaining = 1;
+      const textGeneration = yield* OpenCodeTextGeneration;
+
+      yield* textGeneration.generateCommitMessage({
+        cwd: process.cwd(),
+        branch: "feature/opencode-failed-idle-close",
+        stagedSummary: "M README.md",
+        stagedPatch: "diff --git a/README.md b/README.md",
+        modelSelection: DEFAULT_TEST_MODEL_SELECTION,
+      });
+      yield* advanceIdleClock;
+
+      expect(runtimeMock.state.stopAttempts).toEqual(["http://127.0.0.1:4301"]);
+      expect(runtimeMock.state.closeCalls).toEqual([]);
+
+      yield* textGeneration.generateCommitMessage({
+        cwd: process.cwd(),
+        branch: "feature/opencode-failed-idle-close",
+        stagedSummary: "M README.md",
+        stagedPatch: "diff --git a/README.md b/README.md",
+        modelSelection: DEFAULT_TEST_MODEL_SELECTION,
+      });
+
+      expect(runtimeMock.state.startCalls).toEqual(["opencode", "opencode"]);
+      expect(runtimeMock.state.stopAttempts).toEqual([
+        "http://127.0.0.1:4301",
+        "http://127.0.0.1:4301",
+      ]);
+      expect(runtimeMock.state.promptUrls).toEqual([
+        "http://127.0.0.1:4301",
+        "http://127.0.0.1:4302",
+      ]);
+      yield* maintenanceOwnedResources.drainProviderResources({ provider: "opencode" });
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+
+  it.effect("proves an unexpected warm-server exit before starting its replacement", () =>
+    Effect.gen(function* () {
+      const stopStarted = yield* Deferred.make<void>();
+      const allowStop = yield* Deferred.make<void>();
+      runtimeMock.state.stopControls.push({ started: stopStarted, allow: allowStop });
+      const textGeneration = yield* OpenCodeTextGeneration;
+
+      yield* textGeneration.generateCommitMessage({
+        cwd: process.cwd(),
+        branch: "feature/opencode-unexpected-exit",
+        stagedSummary: "M README.md",
+        stagedPatch: "diff --git a/README.md b/README.md",
+        modelSelection: DEFAULT_TEST_MODEL_SELECTION,
+      });
+
+      const firstServerExit = runtimeMock.state.serverExits[0];
+      if (firstServerExit === undefined) {
+        throw new Error("Expected the first managed text-generation server exit control.");
+      }
+      yield* Deferred.succeed(firstServerExit, 17);
+      yield* Deferred.await(stopStarted);
+
+      const replacement = yield* textGeneration
+        .generateCommitMessage({
+          cwd: process.cwd(),
+          branch: "feature/opencode-unexpected-exit",
+          stagedSummary: "M README.md",
+          stagedPatch: "diff --git a/README.md b/README.md",
+          modelSelection: DEFAULT_TEST_MODEL_SELECTION,
+        })
+        .pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+      expect(runtimeMock.state.startCalls).toEqual(["opencode"]);
+      expect(runtimeMock.state.promptUrls).toEqual(["http://127.0.0.1:4301"]);
+
+      yield* Deferred.succeed(allowStop, undefined);
+      yield* Fiber.join(replacement);
+
+      expect(runtimeMock.state.stopAttempts).toEqual(["http://127.0.0.1:4301"]);
+      expect(runtimeMock.state.closeCalls).toEqual(["http://127.0.0.1:4301"]);
+      expect(runtimeMock.state.startCalls).toEqual(["opencode", "opencode"]);
+      expect(runtimeMock.state.promptUrls).toEqual([
+        "http://127.0.0.1:4301",
+        "http://127.0.0.1:4302",
+      ]);
+      yield* maintenanceOwnedResources.drainProviderResources({ provider: "opencode" });
+    }),
+  );
+
+  it.effect("retains an unexpectedly exited server until a stop-proof retry succeeds", () =>
+    Effect.gen(function* () {
+      runtimeMock.state.stopFailuresRemaining = 1;
+      const stopStarted = yield* Deferred.make<void>();
+      const allowStop = yield* Deferred.make<void>();
+      runtimeMock.state.stopControls.push({ started: stopStarted, allow: allowStop });
+      const textGeneration = yield* OpenCodeTextGeneration;
+
+      yield* textGeneration.generateCommitMessage({
+        cwd: process.cwd(),
+        branch: "feature/opencode-unexpected-exit-retry",
+        stagedSummary: "M README.md",
+        stagedPatch: "diff --git a/README.md b/README.md",
+        modelSelection: DEFAULT_TEST_MODEL_SELECTION,
+      });
+
+      const firstServerExit = runtimeMock.state.serverExits[0];
+      if (firstServerExit === undefined) {
+        throw new Error("Expected the first managed text-generation server exit control.");
+      }
+      yield* Deferred.succeed(firstServerExit, 17);
+      yield* Deferred.await(stopStarted);
+
+      const replacement = yield* textGeneration
+        .generateCommitMessage({
+          cwd: process.cwd(),
+          branch: "feature/opencode-unexpected-exit-retry",
+          stagedSummary: "M README.md",
+          stagedPatch: "diff --git a/README.md b/README.md",
+          modelSelection: DEFAULT_TEST_MODEL_SELECTION,
+        })
+        .pipe(Effect.forkChild);
+      yield* Deferred.succeed(allowStop, undefined);
+      yield* Fiber.join(replacement);
+
+      expect(runtimeMock.state.stopAttempts).toEqual([
+        "http://127.0.0.1:4301",
+        "http://127.0.0.1:4301",
+      ]);
+      expect(runtimeMock.state.closeCalls).toEqual(["http://127.0.0.1:4301"]);
+      expect(runtimeMock.state.startCalls).toEqual(["opencode", "opencode"]);
+      expect(runtimeMock.state.promptUrls).toEqual([
+        "http://127.0.0.1:4301",
+        "http://127.0.0.1:4302",
+      ]);
+      yield* maintenanceOwnedResources.drainProviderResources({ provider: "opencode" });
+    }),
+  );
+
   it.effect("reuses a warm server across back-to-back requests and closes it after idling", () =>
     Effect.gen(function* () {
       const textGeneration = yield* OpenCodeTextGeneration;
@@ -532,8 +891,37 @@ it.layer(OpenCodeTextGenerationExistingServerTestLayer)(
 
         yield* advanceIdleClock;
 
+        yield* externalMaintenanceOwnedResources.drainProviderResources({
+          provider: "opencode",
+        });
+
         expect(runtimeMock.state.closeCalls).toEqual([]);
+        expect(runtimeMock.state.stopAttempts).toEqual([]);
       }).pipe(Effect.provide(TestClock.layer())),
     );
   },
 );
+
+it.layer(KiloTextGenerationTestLayer)("KiloTextGenerationServiceLive", (it) => {
+  it.effect("registers its warm server with the Kilo maintenance target", () =>
+    Effect.gen(function* () {
+      const textGeneration = yield* KiloTextGeneration;
+
+      yield* textGeneration.generateCommitMessage({
+        cwd: process.cwd(),
+        branch: "feature/kilo-maintenance",
+        stagedSummary: "M README.md",
+        stagedPatch: "diff --git a/README.md b/README.md",
+        modelSelection: {
+          provider: "kilo",
+          model: "openai/gpt-5",
+        },
+      });
+
+      yield* kiloMaintenanceOwnedResources.drainProviderResources({ provider: "kilo" });
+
+      expect(runtimeMock.state.startCalls).toEqual(["kilo"]);
+      expect(runtimeMock.state.closeCalls).toEqual(["http://127.0.0.1:4301"]);
+    }),
+  );
+});

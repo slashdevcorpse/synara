@@ -2,7 +2,9 @@
 // Purpose: Routes Windows provider-only child launches through the atomic Job Object helper.
 // Layer: Server provider process supervision
 
+import { randomUUID } from "node:crypto";
 import { existsSync, statSync } from "node:fs";
+import * as OS from "node:os";
 import * as Path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -15,6 +17,14 @@ import {
   type WindowsSafeProcessInput,
 } from "@synara/shared/windowsProcess";
 
+const WINDOWS_JOB_PREPARED_COMMAND = Symbol("synara.windowsJobPreparedCommand");
+const WINDOWS_JOB_CONTROL_FILE = Symbol("synara.windowsJobControlFile");
+
+export interface WindowsJobPreparedCommand extends WindowsSafeProcessCommand {
+  readonly [WINDOWS_JOB_PREPARED_COMMAND]: true;
+  readonly [WINDOWS_JOB_CONTROL_FILE]: string;
+}
+
 export const WINDOWS_JOB_LAUNCHER_ENV = "SYNARA_WINDOWS_JOB_LAUNCHER_PATH";
 export const WINDOWS_JOB_LAUNCHER_EXECUTABLE = launcherConfig.executableName;
 export const WINDOWS_JOB_LAUNCHER_PROTOCOL_VERSION = launcherConfig.protocolVersion;
@@ -23,6 +33,36 @@ export interface WindowsProviderProcessInput extends WindowsSafeProcessInput {
   readonly arch?: NodeJS.Architecture | undefined;
   readonly launcherPath?: string | undefined;
   readonly fileExists?: ((path: string) => boolean) | undefined;
+  readonly controlDirectory?: string | undefined;
+}
+
+export function isWindowsJobPreparedCommand(
+  command: WindowsSafeProcessCommand,
+): command is WindowsJobPreparedCommand {
+  return (command as Partial<WindowsJobPreparedCommand>)[WINDOWS_JOB_PREPARED_COMMAND] === true;
+}
+
+export function windowsJobControlFilePath(command: WindowsJobPreparedCommand): string {
+  return command[WINDOWS_JOB_CONTROL_FILE];
+}
+
+function markWindowsJobPreparedCommand(
+  command: WindowsSafeProcessCommand,
+  controlFilePath: string,
+): WindowsJobPreparedCommand {
+  Object.defineProperty(command, WINDOWS_JOB_PREPARED_COMMAND, {
+    configurable: false,
+    enumerable: false,
+    value: true,
+    writable: false,
+  });
+  Object.defineProperty(command, WINDOWS_JOB_CONTROL_FILE, {
+    configurable: false,
+    enumerable: false,
+    value: controlFilePath,
+    writable: false,
+  });
+  return command as WindowsJobPreparedCommand;
 }
 
 function defaultFileExists(path: string): boolean {
@@ -133,20 +173,30 @@ export function containPreparedWindowsProviderProcess(
   const launcherPath = resolveWindowsJobLauncherPath(input);
   const target = resolveAbsolutePreparedCommand(prepared.command, input.cwd);
   const argumentMode = prepared.windowsVerbatimArguments ? "verbatim" : "argv";
-  return {
-    command: launcherPath,
-    args: [
-      "--protocol",
-      WINDOWS_JOB_LAUNCHER_PROTOCOL_VERSION,
-      "--argument-mode",
-      argumentMode,
-      "--",
-      target,
-      ...prepared.args,
-    ],
-    shell: false,
-    windowsHide: true,
-  };
+  const controlDirectory = input.controlDirectory ?? OS.tmpdir();
+  const controlFilePath = Path.win32.join(
+    controlDirectory,
+    `synara-job-control-${process.pid}-${randomUUID()}.signal`,
+  );
+  return markWindowsJobPreparedCommand(
+    {
+      command: launcherPath,
+      args: [
+        "--protocol",
+        WINDOWS_JOB_LAUNCHER_PROTOCOL_VERSION,
+        "--argument-mode",
+        argumentMode,
+        "--control-file",
+        controlFilePath,
+        "--",
+        target,
+        ...prepared.args,
+      ],
+      shell: false,
+      windowsHide: true,
+    },
+    controlFilePath,
+  );
 }
 
 export function prepareWindowsProviderProcess(

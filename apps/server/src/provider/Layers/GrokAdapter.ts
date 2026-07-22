@@ -57,7 +57,21 @@ import { ServerConfig, type ServerConfigShape } from "../../config.ts";
 import { buildProviderChildEnvironment } from "../../providerChildEnvironment.ts";
 import { appendFileAttachmentsPromptBlock } from "../attachmentProjection.ts";
 import { loadProviderPromptImageBlocks } from "../promptAttachments.ts";
-import { prepareWindowsProviderProcess } from "../windowsProviderProcess.ts";
+import {
+  isWindowsJobPreparedCommand,
+  prepareWindowsProviderProcess,
+} from "../windowsProviderProcess.ts";
+import {
+  installPreparedEffectProcessSupervisor,
+  supervisePreparedEffectProcess,
+} from "../windowsJobProcessSupervisor.ts";
+import { findProviderProcessExitUnprovenError } from "../supervisedProcessTeardown.ts";
+import {
+  makeProviderMaintenanceOwnedResourceCoordinator,
+  type ProviderMaintenanceOwnedResourceCoordinator,
+} from "../providerMaintenanceOwnedResources.ts";
+import { makeProviderProcessOwnerTracker } from "../providerProcessOwnerTracker.ts";
+import { stopSessionsBestEffort } from "../stopSessionsBestEffort.ts";
 import {
   ProviderAdapterRequestError,
   ProviderAdapterSessionNotFoundError,
@@ -85,6 +99,11 @@ import {
   withAcpPlanModePrompt,
 } from "../acp/AcpAdapterSessionSupport.ts";
 import { type AcpSessionRuntimeShape } from "../acp/AcpSessionRuntime.ts";
+import {
+  type AcpSessionTeardownState,
+  makeAcpSessionTeardownState,
+  runAcpSessionTeardown,
+} from "../acp/AcpSessionTeardown.ts";
 import {
   makeAcpAssistantItemEvent,
   makeAcpContentDeltaEvent,
@@ -226,12 +245,17 @@ export function makeGrokModelListChildProcess(
     ...(prepared.windowsHide ? { windowsHide: true } : {}),
     ...(prepared.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
     env,
-  });
+    ...(isWindowsJobPreparedCommand(prepared) ? { synaraExternallySupervised: true } : {}),
+  } as ChildProcess.CommandOptions & { readonly synaraExternallySupervised?: true });
 }
 
 export interface GrokAdapterLiveOptions {
   readonly nativeEventLogPath?: string;
   readonly nativeEventLogger?: EventNdjsonLogger;
+  readonly closeSessionScope?: (scope: Scope.Closeable) => Effect.Effect<void>;
+  readonly maintenanceOwnedResources?: ProviderMaintenanceOwnedResourceCoordinator;
+  readonly prepareProcess?: typeof prepareWindowsProviderProcess;
+  readonly superviseProcess?: typeof supervisePreparedEffectProcess;
 }
 
 interface PendingApproval {
@@ -308,6 +332,7 @@ interface GrokSessionContext {
   // ordering then guarantees it cannot cancel the new turn.
   compactionCancelFiber: Fiber.Fiber<void> | undefined;
   latestSessionCostUsd: number | undefined;
+  readonly teardown: AcpSessionTeardownState;
   stopped: boolean;
 }
 
@@ -597,9 +622,19 @@ export function makeGrokAdapter(
   options?: GrokAdapterLiveOptions,
 ) {
   return Effect.gen(function* () {
+    const closeSessionScope =
+      options?.closeSessionScope ?? ((scope: Scope.Closeable) => Scope.close(scope, Exit.void));
     const fileSystem = yield* FileSystem.FileSystem;
     const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
     const serverConfig = yield* Effect.service(ServerConfig);
+    const maintenanceOwnedResources =
+      options?.maintenanceOwnedResources ??
+      (yield* makeProviderMaintenanceOwnedResourceCoordinator);
+    const modelProcessOwners = makeProviderProcessOwnerTracker({
+      provider: PROVIDER,
+      resourcePrefix: "grok-model-discovery",
+      maintenanceOwnedResources,
+    });
     // Optional so adapter tests can run without the gateway layer; when
     // present, every session gets the synara_* MCP tools.
     const agentGatewayCredentials = Option.getOrUndefined(
@@ -692,33 +727,39 @@ export function makeGrokAdapter(
     };
 
     const stopSessionInternal = (ctx: GrokSessionContext) =>
-      Effect.gen(function* () {
-        if (ctx.stopped) return;
-        ctx.stopped = true;
-        ctx.gatewaySessionLease?.release();
-        yield* settleAcpPendingApprovalsAsCancelled(ctx.pendingApprovals);
-        yield* settleAcpPendingUserInputsAsEmptyAnswers(ctx.pendingUserInputs);
-        if (ctx.sessionConfigReady !== undefined) {
-          yield* Deferred.succeed(ctx.sessionConfigReady, undefined);
-          ctx.sessionConfigReady = undefined;
-        }
-        if (ctx.resumeReplayReady !== undefined) {
-          yield* Deferred.succeed(ctx.resumeReplayReady, undefined);
-          ctx.resumeReplayReady = undefined;
-          ctx.resumeReplayLastSuppressedAt = undefined;
-        }
-        if (ctx.notificationFiber) {
-          yield* Fiber.interrupt(ctx.notificationFiber);
-        }
-        yield* Effect.ignore(Scope.close(ctx.scope, Exit.void));
-        sessions.delete(ctx.threadId);
-        yield* offerRuntimeEvent(ctx.lifecycleGeneration, {
-          type: "session.exited",
-          ...(yield* makeEventStamp()),
-          provider: PROVIDER,
-          threadId: ctx.threadId,
-          payload: { exitKind: "graceful" },
-        });
+      runAcpSessionTeardown({
+        state: ctx.teardown,
+        onStart: () => {
+          ctx.stopped = true;
+          ctx.gatewaySessionLease?.release();
+        },
+        teardown: Effect.gen(function* () {
+          yield* settleAcpPendingApprovalsAsCancelled(ctx.pendingApprovals);
+          yield* settleAcpPendingUserInputsAsEmptyAnswers(ctx.pendingUserInputs);
+          if (ctx.sessionConfigReady !== undefined) {
+            yield* Deferred.succeed(ctx.sessionConfigReady, undefined);
+            ctx.sessionConfigReady = undefined;
+          }
+          if (ctx.resumeReplayReady !== undefined) {
+            yield* Deferred.succeed(ctx.resumeReplayReady, undefined);
+            ctx.resumeReplayReady = undefined;
+            ctx.resumeReplayLastSuppressedAt = undefined;
+          }
+          if (ctx.notificationFiber) {
+            yield* Fiber.interrupt(ctx.notificationFiber);
+          }
+          yield* closeSessionScope(ctx.scope);
+          if (sessions.get(ctx.threadId) === ctx) {
+            sessions.delete(ctx.threadId);
+          }
+          yield* offerRuntimeEvent(ctx.lifecycleGeneration, {
+            type: "session.exited",
+            ...(yield* makeEventStamp()),
+            provider: PROVIDER,
+            threadId: ctx.threadId,
+            payload: { exitKind: "graceful" },
+          });
+        }),
       });
 
     const noteSuppressedGrokRuntimeEvent = (
@@ -926,7 +967,7 @@ export function makeGrokAdapter(
           const grokModelSelection =
             input.modelSelection?.provider === PROVIDER ? input.modelSelection : undefined;
           const existing = sessions.get(input.threadId);
-          if (existing && !existing.stopped) {
+          if (existing) {
             yield* stopSessionInternal(existing);
           }
 
@@ -1136,6 +1177,7 @@ export function makeGrokAdapter(
             updatedAt: now,
           };
 
+          const teardown = yield* makeAcpSessionTeardownState();
           ctx = {
             threadId: input.threadId,
             ...(gatewaySessionLease ? { gatewaySessionLease } : {}),
@@ -1169,6 +1211,7 @@ export function makeGrokAdapter(
             compactionQuietUntil: undefined,
             compactionCancelFiber: undefined,
             latestSessionCostUsd: undefined,
+            teardown,
             stopped: false,
           };
 
@@ -1916,7 +1959,13 @@ export function makeGrokAdapter(
       withThreadLock(
         threadId,
         Effect.gen(function* () {
-          const ctx = yield* requireSession(threadId);
+          const ctx = sessions.get(threadId);
+          if (ctx === undefined) {
+            return yield* new ProviderAdapterSessionNotFoundError({
+              provider: PROVIDER,
+              threadId,
+            });
+          }
           yield* stopSessionInternal(ctx);
         }),
       );
@@ -2166,12 +2215,47 @@ export function makeGrokAdapter(
         let apiError: ProviderAdapterRequestError | undefined;
         const cliModels = yield* Effect.gen(function* () {
           const childEnv = buildProviderChildEnvironment({ provider: "grok" });
-          const prepared = prepareWindowsProviderProcess(binaryPath, ["models"], {
-            env: childEnv,
-          });
-          const child = yield* childProcessSpawner.spawn(
-            makeGrokModelListChildProcess(prepared, childEnv),
+          const prepared = (options?.prepareProcess ?? prepareWindowsProviderProcess)(
+            binaryPath,
+            ["models"],
+            { env: childEnv },
           );
+          const owned = yield* Effect.uninterruptible(
+            Effect.gen(function* () {
+              const child = yield* childProcessSpawner.spawn(
+                makeGrokModelListChildProcess(prepared, childEnv),
+              );
+              const installation = isWindowsJobPreparedCommand(prepared)
+                ? installPreparedEffectProcessSupervisor(
+                    prepared,
+                    child,
+                    { platform: "win32" },
+                    options?.superviseProcess,
+                  )
+                : undefined;
+              const owner = installation
+                ? yield* modelProcessOwners.register(installation.supervisor)
+                : undefined;
+              if (owner) {
+                yield* Effect.addFinalizer(() =>
+                  modelProcessOwners.teardown(owner).pipe(Effect.orDie),
+                );
+              }
+              if (installation?._tag === "Recovered") {
+                return yield* new ProviderAdapterRequestError({
+                  provider: PROVIDER,
+                  method: "model/list",
+                  detail: "Failed to install Grok model discovery process-tree supervision.",
+                  cause: installation.requestedSupervisorFailure,
+                });
+              }
+              return {
+                child,
+                owner,
+              };
+            }),
+          );
+          const { child, owner } = owned;
           const [stdout, stderr, exitCode] = yield* Effect.all(
             [
               collectStreamAsString(child.stdout),
@@ -2180,6 +2264,9 @@ export function makeGrokAdapter(
             ],
             { concurrency: "unbounded" },
           );
+          if (owner) {
+            yield* modelProcessOwners.proveExit(owner);
+          }
           if (exitCode !== 0) {
             return yield* new ProviderAdapterRequestError({
               provider: PROVIDER,
@@ -2191,12 +2278,15 @@ export function makeGrokAdapter(
           }
           return parseGrokCliModelList(stdout);
         }).pipe(
-          Effect.catch((error) =>
-            Effect.sync(() => {
-              cliError = error;
-              return [];
-            }),
-          ),
+          Effect.catch((error) => {
+            const unprovenExit = findProviderProcessExitUnprovenError(error);
+            return unprovenExit === null
+              ? Effect.sync(() => {
+                  cliError = error;
+                  return [];
+                })
+              : Effect.fail(unprovenExit);
+          }),
         );
         const apiKey = getGrokApiKeyEnv();
         const apiModels = apiKey
@@ -2249,12 +2339,35 @@ export function makeGrokAdapter(
     };
 
     const stopAll: GrokAdapterShape["stopAll"] = () =>
-      Effect.forEach(Array.from(sessions.values()), stopSessionInternal, { discard: true });
+      Effect.gen(function* () {
+        const sessionExit = yield* Effect.exit(
+          stopSessionsBestEffort(sessions.values(), stopSessionInternal),
+        );
+        const ownerExit = yield* Effect.exit(
+          modelProcessOwners.drain.pipe(
+            Effect.mapError(
+              (cause) =>
+                new ProviderAdapterRequestError({
+                  provider: PROVIDER,
+                  method: "stopAll",
+                  detail:
+                    cause instanceof Error
+                      ? cause.message
+                      : "Failed to prove all Grok process trees exited.",
+                  cause,
+                }),
+            ),
+          ),
+        );
+        if (Exit.isFailure(sessionExit)) return yield* Effect.failCause(sessionExit.cause);
+        if (Exit.isFailure(ownerExit)) return yield* Effect.failCause(ownerExit.cause);
+      });
 
     yield* Effect.addFinalizer(() =>
-      Effect.forEach(Array.from(sessions.values()), stopSessionInternal, { discard: true }).pipe(
-        Effect.tap(() => PubSub.shutdown(runtimeEventPubSub)),
-        Effect.tap(() => managedNativeEventLogger?.close() ?? Effect.void),
+      stopAll().pipe(
+        Effect.ignore,
+        Effect.ensuring(PubSub.shutdown(runtimeEventPubSub)),
+        Effect.ensuring(managedNativeEventLogger?.close() ?? Effect.void),
       ),
     );
 

@@ -13,6 +13,7 @@ import type { ProviderSkillDescriptor } from "@synara/contracts";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
+  ancestorsFromDeepest,
   clearSkillsCatalogCacheForTests,
   discoverSkillsCatalog,
   filterDisabledSkills,
@@ -65,6 +66,22 @@ disable-model-invocation: true
       description: "Review recent code changes",
       "disable-model-invocation": true,
     });
+  });
+});
+
+describe("ancestorsFromDeepest", () => {
+  it("includes an explicit boundary and rejects a boundary outside cwd ancestry", () => {
+    const boundary = path.join(root, "repo");
+    const cwd = path.join(boundary, "packages", "web");
+
+    expect(ancestorsFromDeepest(cwd, boundary)).toEqual([
+      path.resolve(cwd),
+      path.resolve(boundary, "packages"),
+      path.resolve(boundary),
+    ]);
+    expect(() => ancestorsFromDeepest(cwd, path.join(root, "other"))).toThrow(
+      `Project root boundary ${path.resolve(root, "other")} must contain cwd ${path.resolve(cwd)}`,
+    );
   });
 });
 
@@ -245,6 +262,28 @@ description: Direct Pi markdown skill
 
     const skills = await discoverSkillsCatalog({ cwd, homeDir, synaraBaseDir });
     expect(skills.find((skill) => skill.name === "repo-skill")?.scope).toBe("project");
+  });
+
+  it("keeps bounded and unbounded project scans in separate cache entries", async () => {
+    const boundary = path.join(root, "repo");
+    const cwd = path.join(boundary, "packages", "web");
+    await mkdir(cwd, { recursive: true });
+    await writeSkill(
+      path.join(root, ".cursor", "skills", "outside-boundary"),
+      "outside-boundary",
+      "Outside boundary",
+    );
+
+    const bounded = await discoverSkillsCatalog({
+      cwd,
+      projectRootBoundary: boundary,
+      homeDir,
+      synaraBaseDir,
+    });
+    expect(bounded.map((skill) => skill.name)).not.toContain("outside-boundary");
+
+    const unbounded = await discoverSkillsCatalog({ cwd, homeDir, synaraBaseDir });
+    expect(unbounded.map((skill) => skill.name)).toContain("outside-boundary");
   });
 
   it("keeps home origins when the cwd lives under the home dir", async () => {

@@ -225,8 +225,12 @@ jobs:
           src/windowsProcessEffect.test.ts
           src/codexAppServerManager.test.ts
           src/provider/Layers/ProviderHealth.test.ts
+          src/provider/acp/AcpJsonRpcConnection.test.ts
           src/persistence/MigrationBackup.test.ts
           src/restoreMigrationBackup.test.ts
+
+      - name: Run Windows CLI maintenance regressions
+        run: bun run --cwd apps/server test src/provider/providerMaintenance.test.ts
 
       - name: Run Windows Codex overlay ownership regressions
         run: bun run --cwd apps/server test src/codexProcessEnv.test.ts
@@ -265,6 +269,9 @@ jobs:
           SYNARA_DESKTOP_DISABLE_UPDATES: "1"
           SYNARA_DESKTOP_FLAVOR: super
         run: bun run build:desktop
+
+      - name: Verify isolated packaged CLI runtime
+        run: node apps/server/scripts/cli.ts publish --dry-run
 
       - name: Verify two-launch desktop persistence
         timeout-minutes: 5

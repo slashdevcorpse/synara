@@ -56,6 +56,11 @@ process.once("SIGINT", () => {
   process.exit(0);
 });
 
+process.stdin.once("end", () => {
+  logExit("stdin:end");
+  process.exit(0);
+});
+
 process.once("exit", (code) => {
   logExit(`exit:${code}`);
 });

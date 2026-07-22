@@ -1,13 +1,15 @@
 // FILE: launcher.cpp
 // Purpose: Starts one Windows provider tree inside an atomic kill-on-close Job Object.
 // Layer: Server native process supervision helper
-// Protocol: synara-windows-job-launcher --protocol 1 --argument-mode argv|verbatim -- <target> [args...]
+// Protocol: synara-windows-job-launcher --protocol 2 --argument-mode argv|verbatim
+//           --control-file <absolute-path> -- <target> [args...]
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cwchar>
@@ -25,6 +27,13 @@ constexpr DWORD kCreateProcessExitCode = 244;
 constexpr DWORD kAssignProcessExitCode = 245;
 constexpr DWORD kResumeProcessExitCode = 246;
 constexpr DWORD kWaitProcessExitCode = 247;
+constexpr DWORD kDrainJobExitCode = 248;
+constexpr DWORD kControlExitCode = 249;
+constexpr DWORD kControlledStopExitCode = 143;
+constexpr DWORD kControlPollMilliseconds = 10;
+constexpr ULONGLONG kJobDrainTimeoutMilliseconds = 5'000;
+constexpr std::size_t kMaxTrackedJobProcesses = 1'024;
+constexpr char kDrainAcknowledgement[] = "drained\n";
 
 class OwnedHandle final {
  public:
@@ -191,17 +200,20 @@ enum class ArgumentMode { kArgv, kVerbatim };
 
 struct LaunchRequest {
   ArgumentMode argument_mode;
+  std::wstring control_file;
   std::wstring target;
   std::vector<std::wstring> arguments;
 };
 
 [[nodiscard]] LaunchRequest ParseRequest(int argc, wchar_t* argv[]) {
-  if (argc < 7 || std::wstring_view(argv[1]) != L"--protocol" ||
-      std::wstring_view(argv[2]) != L"1" ||
+  if (argc < 9 || std::wstring_view(argv[1]) != L"--protocol" ||
+      std::wstring_view(argv[2]) != L"2" ||
       std::wstring_view(argv[3]) != L"--argument-mode" ||
-      std::wstring_view(argv[5]) != L"--") {
+      std::wstring_view(argv[5]) != L"--control-file" ||
+      std::wstring_view(argv[7]) != L"--") {
     ExitUsage(
-        L"expected --protocol 1 --argument-mode argv|verbatim -- <target> [args...]");
+        L"expected --protocol 2 --argument-mode argv|verbatim --control-file "
+        L"<absolute-path> -- <target> [args...]");
   }
 
   const std::wstring_view mode_value(argv[4]);
@@ -214,7 +226,12 @@ struct LaunchRequest {
     ExitUsage(L"argument mode must be argv or verbatim");
   }
 
-  std::wstring target(argv[6]);
+  std::wstring control_file(argv[6]);
+  if (!IsAbsoluteWindowsPath(control_file)) {
+    ExitUsage(L"control file must be an absolute Windows path");
+  }
+
+  std::wstring target(argv[8]);
   if (!IsAbsoluteWindowsPath(target)) {
     ExitWithFailure(kTargetExitCode, L"target", ERROR_BAD_PATHNAME,
                     L"target must be an absolute Windows path");
@@ -230,15 +247,170 @@ struct LaunchRequest {
   }
 
   std::vector<std::wstring> arguments;
-  arguments.reserve(static_cast<std::size_t>(argc - 7));
-  for (int index = 7; index < argc; ++index) {
+  arguments.reserve(static_cast<std::size_t>(argc - 9));
+  for (int index = 9; index < argc; ++index) {
     if (argument_mode == ArgumentMode::kVerbatim &&
         ContainsLineBreak(argv[index])) {
       ExitUsage(L"verbatim arguments cannot contain line breaks");
     }
     arguments.emplace_back(argv[index]);
   }
-  return {argument_mode, std::move(target), std::move(arguments)};
+  return {argument_mode, std::move(control_file), std::move(target),
+          std::move(arguments)};
+}
+
+[[nodiscard]] bool ControlStopRequested(const std::wstring& control_file) {
+  const DWORD attributes = GetFileAttributesW(control_file.c_str());
+  if (attributes != INVALID_FILE_ATTRIBUTES) {
+    return (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+  }
+  const DWORD error = GetLastError();
+  if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) {
+    return false;
+  }
+  ExitWithFailure(kControlExitCode, L"read-control", error);
+}
+
+struct TrackedProcess final {
+  DWORD process_id;
+  OwnedHandle handle;
+};
+
+void CaptureActiveJobProcesses(HANDLE job,
+                               std::vector<TrackedProcess>& tracked_processes) {
+  // Two DWORD counters occupy the first ULONG_PTR on 64-bit Windows. Keep one extra slot for
+  // 32-bit layout even though the published launcher architectures are currently 64-bit.
+  std::array<ULONG_PTR, kMaxTrackedJobProcesses + 2> storage{};
+  auto* process_list =
+      reinterpret_cast<JOBOBJECT_BASIC_PROCESS_ID_LIST*>(storage.data());
+  if (!QueryInformationJobObject(
+          job, JobObjectBasicProcessIdList, process_list,
+          static_cast<DWORD>(storage.size() * sizeof(storage[0])), nullptr)) {
+    ExitWithFailure(kDrainJobExitCode, L"query-job-processes", GetLastError());
+  }
+  if (process_list->NumberOfAssignedProcesses >
+      process_list->NumberOfProcessIdsInList) {
+    ExitWithFailure(kDrainJobExitCode, L"query-job-processes",
+                    ERROR_INSUFFICIENT_BUFFER);
+  }
+
+  for (DWORD index = 0; index < process_list->NumberOfProcessIdsInList;
+       ++index) {
+    const ULONG_PTR raw_process_id = process_list->ProcessIdList[index];
+    const DWORD process_id = static_cast<DWORD>(raw_process_id);
+    bool already_tracked = false;
+    for (const TrackedProcess& tracked : tracked_processes) {
+      if (tracked.process_id == process_id) {
+        already_tracked = true;
+        break;
+      }
+    }
+    if (already_tracked) {
+      continue;
+    }
+
+    OwnedHandle process_handle(OpenProcess(
+        SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, process_id));
+    if (!process_handle) {
+      const DWORD error = GetLastError();
+      if (error == ERROR_INVALID_PARAMETER) {
+        continue;
+      }
+      ExitWithFailure(kDrainJobExitCode, L"open-job-process", error);
+    }
+    BOOL belongs_to_job = FALSE;
+    if (!IsProcessInJob(process_handle.get(), job, &belongs_to_job)) {
+      ExitWithFailure(kDrainJobExitCode, L"verify-job-process", GetLastError());
+    }
+    if (belongs_to_job) {
+      tracked_processes.push_back(
+          TrackedProcess{process_id, std::move(process_handle)});
+    }
+  }
+}
+
+void WaitForEmptyJob(HANDLE job,
+                     std::vector<TrackedProcess>& tracked_processes) {
+  const ULONGLONG deadline = GetTickCount64() + kJobDrainTimeoutMilliseconds;
+  for (;;) {
+    CaptureActiveJobProcesses(job, tracked_processes);
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting{};
+    if (!QueryInformationJobObject(job, JobObjectBasicAccountingInformation,
+                                   &accounting, sizeof(accounting), nullptr)) {
+      ExitWithFailure(kDrainJobExitCode, L"query-job-drain", GetLastError());
+    }
+    if (accounting.ActiveProcesses == 0) {
+      break;
+    }
+    if (GetTickCount64() >= deadline) {
+      ExitWithFailure(kDrainJobExitCode, L"wait-job-drain", WAIT_TIMEOUT);
+    }
+    Sleep(1);
+  }
+
+  for (const TrackedProcess& tracked : tracked_processes) {
+    const ULONGLONG now = GetTickCount64();
+    const DWORD remaining =
+        now >= deadline ? 0 : static_cast<DWORD>(deadline - now);
+    const DWORD wait_result = WaitForSingleObject(tracked.handle.get(), remaining);
+    if (wait_result != WAIT_OBJECT_0) {
+      const DWORD error =
+          wait_result == WAIT_FAILED ? GetLastError() : WAIT_TIMEOUT;
+      ExitWithFailure(kDrainJobExitCode, L"wait-job-process", error);
+    }
+  }
+  tracked_processes.clear();
+}
+
+void RemoveControlFileIfPresent(const std::wstring& control_file) {
+  if (DeleteFileW(control_file.c_str())) {
+    return;
+  }
+  const DWORD error = GetLastError();
+  if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND) {
+    ExitWithFailure(kControlExitCode, L"remove-control", error);
+  }
+}
+
+void WriteDrainAcknowledgement(const std::wstring& control_file) {
+  const std::wstring acknowledgement_file = control_file + L".drained";
+  const std::wstring temporary_file = acknowledgement_file + L".tmp";
+  HANDLE acknowledgement =
+      CreateFileW(temporary_file.c_str(), GENERIC_WRITE, 0, nullptr,
+                  CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (acknowledgement == INVALID_HANDLE_VALUE) {
+    ExitWithFailure(kControlExitCode, L"create-drain-acknowledgement",
+                    GetLastError());
+  }
+
+  DWORD bytes_written = 0;
+  const BOOL wrote = WriteFile(
+      acknowledgement, kDrainAcknowledgement,
+      static_cast<DWORD>(sizeof(kDrainAcknowledgement) - 1), &bytes_written,
+      nullptr);
+  if (!wrote || bytes_written != sizeof(kDrainAcknowledgement) - 1) {
+    const DWORD error = wrote ? ERROR_WRITE_FAULT : GetLastError();
+    CloseHandle(acknowledgement);
+    DeleteFileW(temporary_file.c_str());
+    ExitWithFailure(kControlExitCode, L"write-drain-acknowledgement", error);
+  }
+  if (!FlushFileBuffers(acknowledgement)) {
+    const DWORD error = GetLastError();
+    CloseHandle(acknowledgement);
+    DeleteFileW(temporary_file.c_str());
+    ExitWithFailure(kControlExitCode, L"flush-drain-acknowledgement", error);
+  }
+  if (!CloseHandle(acknowledgement)) {
+    const DWORD error = GetLastError();
+    DeleteFileW(temporary_file.c_str());
+    ExitWithFailure(kControlExitCode, L"close-drain-acknowledgement", error);
+  }
+  if (!MoveFileExW(temporary_file.c_str(), acknowledgement_file.c_str(),
+                   MOVEFILE_WRITE_THROUGH)) {
+    const DWORD error = GetLastError();
+    DeleteFileW(temporary_file.c_str());
+    ExitWithFailure(kControlExitCode, L"publish-drain-acknowledgement", error);
+  }
 }
 
 [[nodiscard]] std::wstring BuildCommandLine(const LaunchRequest& request) {
@@ -359,35 +531,65 @@ int wmain(int argc, wchar_t* argv[]) {
   if (!AssignProcessToJobObject(job.get(), process.get())) {
     const DWORD error = GetLastError();
     TerminateProcess(process.get(), kAssignProcessExitCode);
-    WaitForSingleObject(process.get(), INFINITE);
+    WaitForSingleObject(process.get(),
+                        static_cast<DWORD>(kJobDrainTimeoutMilliseconds));
     ExitWithFailure(kAssignProcessExitCode, L"assign-process", error);
   }
 
   if (ResumeThread(primary_thread.get()) == static_cast<DWORD>(-1)) {
     const DWORD error = GetLastError();
     TerminateJobObject(job.get(), kResumeProcessExitCode);
-    WaitForSingleObject(process.get(), INFINITE);
+    std::vector<TrackedProcess> tracked_processes;
+    WaitForEmptyJob(job.get(), tracked_processes);
     ExitWithFailure(kResumeProcessExitCode, L"resume-process", error);
   }
   primary_thread.reset();
 
-  const DWORD wait_result = WaitForSingleObject(process.get(), INFINITE);
-  if (wait_result != WAIT_OBJECT_0) {
+  bool controlled_stop = false;
+  std::vector<TrackedProcess> tracked_processes;
+  for (;;) {
+    const DWORD wait_result =
+        WaitForSingleObject(process.get(), kControlPollMilliseconds);
+    if (wait_result == WAIT_OBJECT_0) {
+      break;
+    }
+    if (wait_result == WAIT_TIMEOUT) {
+      if (ControlStopRequested(request.control_file)) {
+        controlled_stop = true;
+        CaptureActiveJobProcesses(job.get(), tracked_processes);
+        if (!TerminateJobObject(job.get(), kControlledStopExitCode)) {
+          ExitWithFailure(kControlExitCode, L"terminate-job", GetLastError());
+        }
+        break;
+      }
+      continue;
+    }
     const DWORD error = wait_result == WAIT_FAILED ? GetLastError() : ERROR_GEN_FAILURE;
     TerminateJobObject(job.get(), kWaitProcessExitCode);
     ExitWithFailure(kWaitProcessExitCode, L"wait-process", error);
   }
 
-  DWORD child_exit_code = 0;
-  if (!GetExitCodeProcess(process.get(), &child_exit_code)) {
+  DWORD child_exit_code = controlled_stop ? kControlledStopExitCode : 0;
+  if (!controlled_stop && !GetExitCodeProcess(process.get(), &child_exit_code)) {
     const DWORD error = GetLastError();
     TerminateJobObject(job.get(), kWaitProcessExitCode);
     ExitWithFailure(kWaitProcessExitCode, L"query-exit-code", error);
   }
 
+  // Terminate any descendants that outlived the provider root, then hold the wrapper open until
+  // Windows reports no active Job members. The acknowledgement is published only after every
+  // fallible cleanup operation, so wrapper exit alone can never be mistaken for drain proof.
+  if (!controlled_stop) {
+    CaptureActiveJobProcesses(job.get(), tracked_processes);
+    if (!TerminateJobObject(job.get(), child_exit_code)) {
+      ExitWithFailure(kDrainJobExitCode, L"terminate-surviving-job-processes",
+                      GetLastError());
+    }
+  }
+  WaitForEmptyJob(job.get(), tracked_processes);
   process.reset();
-  // This is the provider lifetime boundary. Closing the launcher's sole Job
-  // handle synchronously initiates termination of any surviving descendants.
   job.reset();
+  RemoveControlFileIfPresent(request.control_file);
+  WriteDrainAcknowledgement(request.control_file);
   ExitProcess(child_exit_code);
 }

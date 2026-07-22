@@ -1,13 +1,16 @@
 import { describe, expect, it } from "vitest";
 
-import { Deferred, Effect, Exit, Scope } from "effect";
+import { Cause, Deferred, Effect, Exit, Scope } from "effect";
 import type * as EffectAcpSchema from "effect-acp/schema";
 
 import {
   assistantItemId,
   awaitAcpChildExit,
   decodeSetSessionConfigOptionResponse,
+  installAndAwaitAcpProcessSupervisor,
   makeAcpIncomingFrameGuard,
+  registerAndInstallAcpProcessSupervisor,
+  registerAcpProcessOwnership,
   sessionConfigOptionsFromSetup,
   teardownAcpChildProcess,
 } from "./AcpSessionRuntime.ts";
@@ -71,6 +74,244 @@ describe("teardownAcpChildProcess", () => {
     Deferred.doneUnsafe(processExited, Effect.succeed(0));
     await closing;
     expect(scopeClosed).toBe(true);
+  });
+});
+
+describe("registerAcpProcessOwnership", () => {
+  it("owns fallback teardown before a supervisor installation can fail", async () => {
+    const processExited = Deferred.makeUnsafe<number>();
+    const child = { pid: 4_243, exitCode: Deferred.await(processExited) };
+    const scope = await Effect.runPromise(Scope.make("sequential"));
+    let fallbackTeardowns = 0;
+    const ownership = await Effect.runPromise(
+      registerAcpProcessOwnership(child, scope, {
+        ownedProcessGroupId: child.pid,
+        teardownProcessTree: async ({ rootPid, ownedProcessGroupId }) => {
+          fallbackTeardowns += 1;
+          expect(rootPid).toBe(child.pid);
+          expect(ownedProcessGroupId).toBe(child.pid);
+          return { escalated: false, signalErrors: [] };
+        },
+      }),
+    );
+
+    expect(() =>
+      ownership.installSupervisor(() => {
+        throw new Error("initial ownership capture failed");
+      }),
+    ).toThrow("initial ownership capture failed");
+
+    await Effect.runPromise(Scope.close(scope, Exit.void));
+    expect(fallbackTeardowns).toBe(1);
+  });
+
+  it("retains spawned-child fallback cleanup when supervisor construction throws", async () => {
+    const processExited = Deferred.makeUnsafe<number>();
+    const child = { pid: 4_248, exitCode: Deferred.await(processExited) };
+    const scope = await Effect.runPromise(Scope.make("sequential"));
+    const constructorFailure = new Error("supervisor constructor failed after spawn");
+    let constructorCalls = 0;
+    let fallbackTeardowns = 0;
+
+    const exit = await Effect.runPromise(
+      Effect.exit(
+        registerAndInstallAcpProcessSupervisor(
+          child,
+          scope,
+          () => {
+            constructorCalls += 1;
+            throw constructorFailure;
+          },
+          "test-agent",
+          {
+            ownedProcessGroupId: child.pid,
+            teardownProcessTree: async ({ rootPid, ownedProcessGroupId }) => {
+              fallbackTeardowns += 1;
+              expect(rootPid).toBe(child.pid);
+              expect(ownedProcessGroupId).toBe(child.pid);
+              return { escalated: false, signalErrors: [] };
+            },
+          },
+        ),
+      ),
+    );
+
+    expect(Exit.isFailure(exit)).toBe(true);
+    if (Exit.isFailure(exit)) {
+      expect(Cause.squash(exit.cause)).toMatchObject({
+        _tag: "AcpSpawnError",
+        command: "test-agent",
+        cause: constructorFailure,
+      });
+    }
+    expect(constructorCalls).toBe(1);
+    expect(fallbackTeardowns).toBe(0);
+
+    await Effect.runPromise(Scope.close(scope, Exit.void));
+    expect(fallbackTeardowns).toBe(1);
+  });
+
+  it("refreshes ownership before closing the cooperative transport", async () => {
+    const processExited = Deferred.makeUnsafe<number>();
+    const child = { pid: 4_244, exitCode: Deferred.await(processExited) };
+    const scope = await Effect.runPromise(Scope.make("sequential"));
+    const sequence: string[] = [];
+    const ownership = await Effect.runPromise(registerAcpProcessOwnership(child, scope));
+    ownership.installSupervisor(() => ({
+      rootPid: child.pid,
+      waitForInitialCapture: async () => undefined,
+      captureNow: async () => {
+        sequence.push("capture");
+      },
+      proveExit: async () => {
+        sequence.push("prove");
+        return { escalated: false, signalErrors: [] };
+      },
+      teardown: async () => {
+        sequence.push("teardown");
+        return { escalated: false, signalErrors: [] };
+      },
+    }));
+    ownership.setCloseTransport(
+      Effect.sync(() => {
+        sequence.push("close");
+        Deferred.doneUnsafe(processExited, Effect.succeed(0));
+      }),
+    );
+
+    await Effect.runPromise(Scope.close(scope, Exit.void));
+    expect(sequence).toEqual(["capture", "close", "prove"]);
+  });
+});
+
+describe("installAndAwaitAcpProcessSupervisor", () => {
+  it("keeps fallback ownership while initial capture is pending or fails", async () => {
+    const initialCaptureFailure = new Error("initial process ownership capture failed");
+    let rejectInitialCapture!: (error: Error) => void;
+    const initialCapture = new Promise<void>((_resolve, reject) => {
+      rejectInitialCapture = reject;
+    });
+    const supervisor = {
+      rootPid: 4_245,
+      waitForInitialCapture: () => initialCapture,
+      captureNow: async () => undefined,
+      proveExit: async () => ({ escalated: false, signalErrors: [] }),
+      teardown: async () => ({ escalated: false, signalErrors: [] }),
+    };
+    let installed = false;
+    let settled = false;
+    const acquisition = Effect.runPromise(
+      Effect.exit(
+        installAndAwaitAcpProcessSupervisor(
+          {
+            installSupervisor: (factory) => {
+              installed = true;
+              return factory();
+            },
+            setCloseTransport: () => undefined,
+          },
+          () => supervisor,
+          "test-agent",
+        ),
+      ),
+    ).then((exit) => {
+      settled = true;
+      return exit;
+    });
+
+    await Promise.resolve();
+    expect(installed).toBe(false);
+    expect(settled).toBe(false);
+
+    rejectInitialCapture(initialCaptureFailure);
+    const exit = await acquisition;
+    expect(Exit.isFailure(exit)).toBe(true);
+    if (Exit.isFailure(exit)) {
+      expect(Cause.squash(exit.cause)).toMatchObject({
+        _tag: "AcpSpawnError",
+        command: "test-agent",
+        cause: initialCaptureFailure,
+      });
+    }
+    expect(installed).toBe(false);
+  });
+
+  it("promotes the supervisor only after initial capture succeeds", async () => {
+    let resolveInitialCapture!: () => void;
+    const initialCapture = new Promise<void>((resolve) => {
+      resolveInitialCapture = resolve;
+    });
+    const supervisor = {
+      rootPid: 4_246,
+      waitForInitialCapture: () => initialCapture,
+      captureNow: async () => undefined,
+      proveExit: async () => ({ escalated: false, signalErrors: [] }),
+      teardown: async () => ({ escalated: false, signalErrors: [] }),
+    };
+    let installed = false;
+    const acquisition = Effect.runPromise(
+      installAndAwaitAcpProcessSupervisor(
+        {
+          installSupervisor: (factory) => {
+            installed = true;
+            return factory();
+          },
+          setCloseTransport: () => undefined,
+        },
+        () => supervisor,
+        "test-agent",
+      ),
+    );
+
+    await Promise.resolve();
+    expect(installed).toBe(false);
+    resolveInitialCapture();
+    await expect(acquisition).resolves.toBe(supervisor);
+    expect(installed).toBe(true);
+  });
+
+  it("uses exact-handle fallback teardown when initial capture fails", async () => {
+    const processExited = Deferred.makeUnsafe<number>();
+    const child = { pid: 4_247, exitCode: Deferred.await(processExited) };
+    const scope = await Effect.runPromise(Scope.make("sequential"));
+    let fallbackTeardowns = 0;
+    let supervisorTeardowns = 0;
+    const initialCaptureFailure = new Error("initial process ownership capture failed");
+    const ownership = await Effect.runPromise(
+      registerAcpProcessOwnership(child, scope, {
+        teardownProcessTree: async ({ rootPid }) => {
+          fallbackTeardowns += 1;
+          expect(rootPid).toBe(child.pid);
+          return { escalated: false, signalErrors: [] };
+        },
+      }),
+    );
+
+    const exit = await Effect.runPromise(
+      Effect.exit(
+        installAndAwaitAcpProcessSupervisor(
+          ownership,
+          () => ({
+            rootPid: child.pid,
+            waitForInitialCapture: async () => {
+              throw initialCaptureFailure;
+            },
+            captureNow: async () => undefined,
+            proveExit: async () => ({ escalated: false, signalErrors: [] }),
+            teardown: async () => {
+              supervisorTeardowns += 1;
+              return { escalated: false, signalErrors: [] };
+            },
+          }),
+          "test-agent",
+        ),
+      ),
+    );
+    expect(Exit.isFailure(exit)).toBe(true);
+
+    await Effect.runPromise(Scope.close(scope, Exit.void));
+    expect(fallbackTeardowns).toBe(1);
+    expect(supervisorTeardowns).toBe(0);
   });
 });
 

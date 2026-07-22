@@ -76,6 +76,224 @@ export function isProviderUpdateActive(provider: ServerProviderStatus): boolean 
   return provider.updateState?.status === "queued" || provider.updateState?.status === "running";
 }
 
+const INCOMPLETE_PROVIDER_UPDATE_STATES: ReadonlySet<
+  NonNullable<ServerProviderStatus["updateState"]>["status"]
+> = new Set(["failed", "still_outdated", "unchanged", "unverified"]);
+
+export function isProviderUpdateIncomplete(provider: ServerProviderStatus): boolean {
+  const status = provider.updateState?.status;
+  return status !== undefined && INCOMPLETE_PROVIDER_UPDATE_STATES.has(status);
+}
+
+export function providerUpdateIncompleteMessage(
+  provider: ServerProviderStatus | undefined,
+): string | null {
+  if (!provider || !isProviderUpdateIncomplete(provider)) {
+    return null;
+  }
+  const state = provider.updateState;
+  const message = state?.message?.trim() || null;
+  const output = state?.output?.trim() || null;
+  if (state?.status === "failed" && output) {
+    return message && message !== output ? `${message}\n\n${output}` : output;
+  }
+  return message || output || "The provider update could not be verified.";
+}
+
+export type ProviderUpdatePresentationKind =
+  | NonNullable<ServerProviderStatus["updateState"]>["status"]
+  | "behind_latest"
+  | "current"
+  | "unknown";
+
+export interface ProviderUpdatePresentation {
+  readonly kind: ProviderUpdatePresentationKind;
+  readonly label: string | null;
+  readonly message: string | null;
+  readonly manualCommand: string | null;
+  readonly isVerifiedSuccess: boolean;
+  readonly severity: "error" | "success" | "warning";
+}
+
+export function resolveProviderUpdateManualCommand(
+  ...providers: ReadonlyArray<ServerProviderStatus | undefined>
+): string | null {
+  for (const provider of providers) {
+    const command = provider?.versionAdvisory?.updateCommand?.trim();
+    if (command) {
+      return command;
+    }
+  }
+  return null;
+}
+
+function formatProviderVersion(value: string | null | undefined): string | null {
+  const trimmed = value?.trim();
+  if (!trimmed) {
+    return null;
+  }
+  return trimmed.startsWith("v") ? trimmed : `v${trimmed}`;
+}
+
+function behindLatestLabel(provider: ServerProviderStatus): string {
+  const advisory = provider.versionAdvisory;
+  const currentVersion = formatProviderVersion(advisory?.currentVersion);
+  const latestVersion = formatProviderVersion(advisory?.latestVersion);
+  if (currentVersion && latestVersion) {
+    return `${currentVersion} -> ${latestVersion}`;
+  }
+  if (latestVersion) {
+    return `Latest ${latestVersion}`;
+  }
+  return "Update available";
+}
+
+function parseIsoTimestamp(value: string | null | undefined): number | null {
+  if (!value) {
+    return null;
+  }
+  const timestamp = Date.parse(value);
+  return Number.isNaN(timestamp) ? null : timestamp;
+}
+
+function hasNewerVersionAdvisory(
+  provider: ServerProviderStatus,
+  status: "behind_latest" | "current",
+): boolean {
+  if (provider.versionAdvisory?.status !== status) {
+    return false;
+  }
+  const advisoryCheckedAt = parseIsoTimestamp(provider.versionAdvisory.checkedAt);
+  if (advisoryCheckedAt === null) {
+    return false;
+  }
+  const updateFinishedAt = parseIsoTimestamp(provider.updateState?.finishedAt);
+  return updateFinishedAt === null || advisoryCheckedAt > updateFinishedAt;
+}
+
+/**
+ * Resolves the provider-update state once for settings labels and update toasts.
+ * Active work stays authoritative. A later verified-current advisory can clear
+ * a stale incomplete result, while a later release can supersede a completed
+ * success without erasing meaningful incomplete failure semantics.
+ */
+export function getProviderUpdatePresentation(
+  provider: ServerProviderStatus | undefined,
+): ProviderUpdatePresentation {
+  if (!provider) {
+    return {
+      kind: "unknown",
+      label: null,
+      message: "The server returned without a verified terminal update result.",
+      manualCommand: null,
+      isVerifiedSuccess: false,
+      severity: "error",
+    };
+  }
+
+  const state = provider.updateState;
+  const manualCommand = resolveProviderUpdateManualCommand(provider);
+  if (state?.status === "queued") {
+    return {
+      kind: "queued",
+      label: "Update queued",
+      message: state.message,
+      manualCommand,
+      isVerifiedSuccess: false,
+      severity: "warning",
+    };
+  }
+  if (state?.status === "running") {
+    return {
+      kind: "running",
+      label: "Updating",
+      message: state.message,
+      manualCommand,
+      isVerifiedSuccess: false,
+      severity: "warning",
+    };
+  }
+  const currentVersion = formatProviderVersion(provider.version);
+  if (
+    state &&
+    INCOMPLETE_PROVIDER_UPDATE_STATES.has(state.status) &&
+    hasNewerVersionAdvisory(provider, "current")
+  ) {
+    return {
+      kind: "current",
+      label: currentVersion ? `Current ${currentVersion}` : null,
+      message: provider.versionAdvisory?.message ?? null,
+      manualCommand,
+      isVerifiedSuccess: false,
+      severity: "warning",
+    };
+  }
+  if (state && INCOMPLETE_PROVIDER_UPDATE_STATES.has(state.status)) {
+    const labels = {
+      failed: "Update failed",
+      still_outdated: "Still outdated",
+      unchanged: "No version change",
+      unverified: "Update unverified",
+    } as const;
+    const kind = state.status as keyof typeof labels;
+    return {
+      kind,
+      label: labels[kind],
+      message: providerUpdateIncompleteMessage(provider),
+      manualCommand,
+      isVerifiedSuccess: false,
+      severity: kind === "failed" ? "error" : "warning",
+    };
+  }
+
+  const completedSuccessfully =
+    state?.status === "succeeded" || state?.status === "already_current";
+  if (
+    provider.versionAdvisory?.status === "behind_latest" &&
+    (!completedSuccessfully || hasNewerVersionAdvisory(provider, "behind_latest"))
+  ) {
+    return {
+      kind: "behind_latest",
+      label: behindLatestLabel(provider),
+      message: provider.versionAdvisory.message ?? "A newer provider version is available.",
+      manualCommand,
+      isVerifiedSuccess: false,
+      severity: "warning",
+    };
+  }
+
+  if (state?.status === "succeeded") {
+    return {
+      kind: "succeeded",
+      label: "Updated",
+      message: state.message,
+      manualCommand,
+      isVerifiedSuccess: true,
+      severity: "success",
+    };
+  }
+  if (state?.status === "already_current") {
+    return {
+      kind: "already_current",
+      label: "Already current",
+      message: state.message,
+      manualCommand,
+      isVerifiedSuccess: true,
+      severity: "success",
+    };
+  }
+
+  const isCurrent = provider.versionAdvisory?.status === "current";
+  return {
+    kind: isCurrent ? "current" : (state?.status ?? "unknown"),
+    label: currentVersion ? `${isCurrent ? "Current" : "Installed"} ${currentVersion}` : null,
+    message: state?.message ?? provider.versionAdvisory?.message ?? null,
+    manualCommand,
+    isVerifiedSuccess: false,
+    severity: "warning",
+  };
+}
+
 export function shouldOfferProviderUpdateAction(provider: ServerProviderStatus): boolean {
   const advisory = provider.versionAdvisory;
   return (

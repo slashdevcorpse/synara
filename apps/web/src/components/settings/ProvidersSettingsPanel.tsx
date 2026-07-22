@@ -41,8 +41,10 @@ import { cn } from "~/lib/utils";
 import { ensureNativeApi } from "~/nativeApi";
 import { sameProviderOrder } from "~/providerOrdering";
 import {
+  getProviderUpdatePresentation,
   getVisibleProviderUpdateStatuses,
   isProviderUpdateActive,
+  resolveProviderUpdateManualCommand,
   shouldOfferProviderUpdateAction,
   shouldShowProviderUpdateStatus,
   withProviderUpdateTimeout,
@@ -534,29 +536,6 @@ function formatProviderVersion(value: string | null | undefined): string | null 
   return trimmed.startsWith("v") ? trimmed : `v${trimmed}`;
 }
 
-function providerUpdateStatusLabel(provider: ServerProviderStatus): string | null {
-  const state = provider.updateState?.status;
-  if (state === "queued") return "Update queued";
-  if (state === "running") return "Updating";
-  if (state === "succeeded") return "Updated";
-  if (state === "failed") return "Update failed";
-  if (state === "unchanged") return "Still outdated";
-  const advisory = provider.versionAdvisory;
-  if (advisory?.status === "behind_latest" && advisory.latestVersion) {
-    const currentVersion = formatProviderVersion(advisory.currentVersion);
-    const latestVersion = formatProviderVersion(advisory.latestVersion);
-    return currentVersion ? `${currentVersion} -> ${latestVersion}` : `Latest ${latestVersion}`;
-  }
-  const currentVersion = formatProviderVersion(provider.version);
-  return currentVersion ? `Current ${currentVersion}` : null;
-}
-
-function providerUpdateFailureMessage(provider: ServerProviderStatus | undefined): string | null {
-  const state = provider?.updateState;
-  if (!state || (state.status !== "failed" && state.status !== "unchanged")) return null;
-  return state.output?.trim() || state.message || "The provider update did not complete.";
-}
-
 function ProviderUpdateAction(props: {
   providerStatus: ServerProviderStatus;
   active: boolean;
@@ -673,11 +652,11 @@ function ProviderToolRow(props: {
   const providerUpdateLabel = props.providerStatus
     ? !props.settings.enableProviderUpdateChecks
       ? currentProviderVersion
-        ? `Current ${currentProviderVersion}`
+        ? `Installed ${currentProviderVersion}`
         : null
       : providerUpdateSuppressed
         ? null
-        : providerUpdateStatusLabel(props.providerStatus)
+        : getProviderUpdatePresentation(props.providerStatus).label
     : null;
   const updateActive = Boolean(
     (props.providerStatus && isProviderUpdateActive(props.providerStatus)) ||
@@ -847,6 +826,8 @@ export function ProvidersSettingsPanel({
   const runProviderUpdate = useCallback(
     async (provider: ProviderKind) => {
       if (updatingProviders.has(provider)) return;
+      const originalProvider = providerStatusByProvider.get(provider);
+      const originalManualCommand = resolveProviderUpdateManualCommand(originalProvider);
       setUpdatingProviders((current) => new Set(current).add(provider));
       await withProviderUpdateTimeout({
         provider,
@@ -854,30 +835,49 @@ export function ProvidersSettingsPanel({
       })
         .then((result) => {
           const refreshedProvider = result.providers.find((status) => status.provider === provider);
-          const failureMessage = providerUpdateFailureMessage(refreshedProvider);
-          if (failureMessage) {
-            const manualCommand = refreshedProvider?.versionAdvisory?.updateCommand?.trim();
+          const presentation = getProviderUpdatePresentation(refreshedProvider);
+          if (presentation.severity !== "success") {
+            const commandFailed = presentation.severity === "error";
+            const manualCommand = resolveProviderUpdateManualCommand(
+              refreshedProvider,
+              originalProvider,
+            );
+            const resultMessage =
+              presentation.message ??
+              "The server returned without a verified terminal update result.";
             toastManager.add({
-              type: "error",
-              title: `Could not update ${PROVIDER_DISPLAY_NAMES[provider]}`,
+              type: presentation.severity,
+              title: commandFailed
+                ? `Could not update ${PROVIDER_DISPLAY_NAMES[provider]}`
+                : `${PROVIDER_DISPLAY_NAMES[provider]} update needs attention`,
               description: manualCommand
-                ? `${failureMessage}\n\nCopy the command below to update manually in a terminal.`
-                : failureMessage,
+                ? `${resultMessage}\n\nCopy the command below to update manually in a terminal.`
+                : resultMessage,
               ...(manualCommand ? { data: { copyText: manualCommand } } : {}),
             });
             return;
           }
+          const alreadyCurrent = presentation.kind === "already_current";
           toastManager.add({
             type: "success",
-            title: `${PROVIDER_DISPLAY_NAMES[provider]} update finished`,
-            description: "New sessions will use the refreshed provider.",
+            title: alreadyCurrent
+              ? `${PROVIDER_DISPLAY_NAMES[provider]} is already current`
+              : `${PROVIDER_DISPLAY_NAMES[provider]} update finished`,
+            description: alreadyCurrent
+              ? "Synara refreshed the CLI status; no replacement was needed."
+              : "Synara refreshed the CLI status. Any idle runtime stopped for the update will resume when next used.",
           });
         })
         .catch((error: unknown) => {
+          const resultMessage =
+            error instanceof Error ? error.message : "The provider update failed.";
           toastManager.add({
             type: "error",
             title: `Could not update ${PROVIDER_DISPLAY_NAMES[provider]}`,
-            description: error instanceof Error ? error.message : "The provider update failed.",
+            description: originalManualCommand
+              ? `${resultMessage}\n\nCopy the command below to update manually in a terminal.`
+              : resultMessage,
+            ...(originalManualCommand ? { data: { copyText: originalManualCommand } } : {}),
           });
         })
         .finally(async () => {
@@ -891,7 +891,7 @@ export function ProvidersSettingsPanel({
           });
         });
     },
-    [queryClient, updatingProviders],
+    [providerStatusByProvider, queryClient, updatingProviders],
   );
 
   if (!active) return null;
@@ -949,7 +949,7 @@ export function ProvidersSettingsPanel({
                   const updateActive =
                     isProviderUpdateActive(providerStatus) ||
                     updatingProviders.has(providerStatus.provider);
-                  const updateLabel = providerUpdateStatusLabel(providerStatus);
+                  const updateLabel = getProviderUpdatePresentation(providerStatus).label;
                   return (
                     <SettingsListRow
                       key={providerStatus.provider}

@@ -1,24 +1,34 @@
 import { ThreadId } from "@synara/contracts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import type { Agent, OpencodeClient, Part, Provider } from "@opencode-ai/sdk/v2";
-import { Deferred, Effect, Exit, Fiber, Layer, Scope, Stream } from "effect";
+import type { Agent, Model, OpencodeClient, Part, Provider } from "@opencode-ai/sdk/v2";
+import { Deferred, Effect, Exit, Fiber, Layer, Result, Scope, Stream } from "effect";
 import { describe, it, expect, vi } from "vitest";
 
 import { ServerConfig } from "../../config.ts";
+import { ProviderAdapterRequestError } from "../Errors.ts";
+import {
+  findProviderProcessExitUnprovenError,
+  ProviderProcessExitUnprovenError,
+} from "../supervisedProcessTeardown.ts";
 import { SYNARA_HARNESS_POLICY_MARKER } from "../../agentGateway/harnessPolicy.ts";
 import {
   AgentGatewayCredentials,
   type AgentGatewayCredentialsShape,
 } from "../../agentGateway/Services/AgentGatewayCredentials.ts";
 import {
+  KILO_CLI_SPEC,
+  type OpenCodeCompatibleCliSpec,
   type OpenCodeCliModelDescriptor,
   OpenCodeRuntimeError,
   type OpenCodeInventory,
   type OpenCodeRuntimeShape,
+  OPENCODE_CLI_SPEC,
 } from "../opencodeRuntime.ts";
-import { OpenCodeAdapter } from "../Services/OpenCodeAdapter.ts";
 import { KiloAdapter } from "../Services/KiloAdapter.ts";
+import { OpenCodeAdapter } from "../Services/OpenCodeAdapter.ts";
 import {
+  flattenOpenCodeCliModels,
+  flattenOpenCodeModels,
   makeOpenCodeAdapterLive,
   makeKiloAdapterLive,
   normalizeOpenCodeTokenUsage,
@@ -39,6 +49,8 @@ function createMockOpenCodeRuntime(options?: {
     data?: ReadonlyArray<{ name: string; description?: string }>;
   }>;
   readonly commandLists?: ReadonlyArray<ReadonlyArray<{ name: string; description?: string }>>;
+  readonly abort?: (input: { sessionID: string }) => Promise<unknown>;
+  readonly trackManagedConnectionRefs?: boolean;
   readonly messages?: () => Promise<{
     data: Array<{ info: Record<string, unknown>; parts: Part[] }>;
   }>;
@@ -53,11 +65,14 @@ function createMockOpenCodeRuntime(options?: {
   const abortCalls: Array<{ sessionID: string }> = [];
   const cliModelCalls: Array<Parameters<OpenCodeRuntimeShape["listOpenCodeCliModels"]>[0]> = [];
   const connectCalls: Array<Parameters<OpenCodeRuntimeShape["connectToOpenCodeServer"]>[0]> = [];
+  const closePoolCalls: Array<OpenCodeCompatibleCliSpec> = [];
   const createCalls: Array<Record<string, unknown>> = [];
   const updateCalls: Array<Record<string, unknown>> = [];
   const forkCalls: Array<{ sessionID: string }> = [];
   const permissionReplyCalls: Array<Record<string, unknown>> = [];
   const promptCalls: Array<Record<string, unknown>> = [];
+  const lifecycleEvents: Array<string> = [];
+  let activeManagedConnectionRefs = 0;
   const mcpAddCalls: Array<Record<string, unknown>> = [];
   const emptySubscription = {
     async *[Symbol.asyncIterator]() {
@@ -94,6 +109,10 @@ function createMockOpenCodeRuntime(options?: {
       },
       abort: async (input: { sessionID: string }) => {
         abortCalls.push(input);
+        lifecycleEvents.push("session.abort");
+        if (options?.abort) {
+          return options.abort(input);
+        }
         return { data: null };
       },
       messages: options?.messages ?? (async () => ({ data: [] })),
@@ -158,6 +177,15 @@ function createMockOpenCodeRuntime(options?: {
         if (options?.connectError) {
           return yield* options.connectError;
         }
+        if (options?.trackManagedConnectionRefs && !input.serverUrl) {
+          activeManagedConnectionRefs += 1;
+          yield* Effect.addFinalizer(() =>
+            Effect.sync(() => {
+              activeManagedConnectionRefs -= 1;
+              lifecycleEvents.push("connection.release");
+            }),
+          );
+        }
         if (options?.scopeCloseDefect) {
           const scope = yield* Scope.Scope;
           yield* Scope.addFinalizer(scope, Effect.die(new Error("scope close defect")));
@@ -172,6 +200,17 @@ function createMockOpenCodeRuntime(options?: {
           exitCode: options?.serverExit ?? null,
           external: Boolean(input.serverUrl),
         };
+      }),
+    closeLocalServerPoolsForCliSpec: ({ cliSpec }) =>
+      Effect.gen(function* () {
+        if (options?.trackManagedConnectionRefs && activeManagedConnectionRefs > 0) {
+          return yield* new OpenCodeRuntimeError({
+            operation: "closeLocalServerPoolsForCliSpec",
+            detail: `Cannot close local server pools while ${activeManagedConnectionRefs} active connection references remain.`,
+          });
+        }
+        closePoolCalls.push(cliSpec);
+        lifecycleEvents.push("pool.close");
       }),
     runOpenCodeCommand: () => unexpectedOperation("runOpenCodeCommand"),
     createOpenCodeSdkClient,
@@ -198,6 +237,7 @@ function createMockOpenCodeRuntime(options?: {
 
   return {
     abortCalls,
+    closePoolCalls,
     cliModelCalls,
     connectCalls,
     createCalls,
@@ -205,6 +245,8 @@ function createMockOpenCodeRuntime(options?: {
     forkCalls,
     permissionReplyCalls,
     promptCalls,
+    lifecycleEvents,
+    getActiveManagedConnectionRefCount: () => activeManagedConnectionRefs,
     mcpAddCalls,
     runtime,
   };
@@ -586,6 +628,91 @@ describe("OpenCodeAdapter runtime lifecycle", () => {
     expect(runtime.cliModelCalls[0]).toMatchObject({ cwd: "/repo/server-startup-fails" });
   });
 
+  it("does not replace an unproven CLI exit with successful server inventory", async () => {
+    const processFailure = new ProviderProcessExitUnprovenError({
+      rootPid: 6_101,
+      rootExited: false,
+      remainingDescendantPids: null,
+      captureComplete: false,
+    });
+    const runtime = createMockOpenCodeRuntime({
+      cliModelsError: new OpenCodeRuntimeError({
+        operation: "listOpenCodeCliModels",
+        detail: "CLI cleanup failed",
+        cause: new AggregateError([new Error("command failed"), processFailure]),
+      }),
+      inventory: {
+        providerList: { connected: [], default: {}, all: [] },
+        agents: [],
+        consoleState: null,
+      },
+    });
+
+    const failure = await Effect.runPromise(
+      Effect.gen(function* () {
+        const adapter = yield* OpenCodeAdapter;
+        return yield* adapter.listModels!({ provider: "opencode", cwd: "/repo" }).pipe(Effect.flip);
+      }).pipe(
+        Effect.provide(
+          makeOpenCodeAdapterLive({ runtime: runtime.runtime }).pipe(
+            Layer.provideMerge(
+              ServerConfig.layerTest(process.cwd(), { prefix: "opencode-adapter-test-" }),
+            ),
+            Layer.provideMerge(NodeServices.layer),
+          ),
+        ),
+      ),
+    );
+
+    expect(failure).toBeInstanceOf(ProviderAdapterRequestError);
+    expect(findProviderProcessExitUnprovenError(failure)).toBe(processFailure);
+  });
+
+  it("does not replace an unproven inventory exit with successful CLI models", async () => {
+    const processFailure = new ProviderProcessExitUnprovenError({
+      rootPid: 6_102,
+      rootExited: true,
+      remainingDescendantPids: [6_103],
+      captureComplete: true,
+    });
+    const runtime = createMockOpenCodeRuntime({
+      cliModels: [
+        {
+          slug: "opencode/safe-fallback",
+          providerID: "opencode",
+          modelID: "safe-fallback",
+          name: "Safe Fallback",
+          variants: [],
+          supportedReasoningEfforts: [],
+        },
+      ],
+      connectError: new OpenCodeRuntimeError({
+        operation: "connectToOpenCodeServer",
+        detail: "inventory cleanup failed",
+        cause: new AggregateError([new Error("startup failed"), processFailure]),
+      }),
+    });
+
+    const failure = await Effect.runPromise(
+      Effect.gen(function* () {
+        const adapter = yield* OpenCodeAdapter;
+        return yield* adapter.listModels!({ provider: "opencode", cwd: "/repo" }).pipe(Effect.flip);
+      }).pipe(
+        Effect.provide(
+          makeOpenCodeAdapterLive({ runtime: runtime.runtime }).pipe(
+            Layer.provideMerge(
+              ServerConfig.layerTest(process.cwd(), { prefix: "opencode-adapter-test-" }),
+            ),
+            Layer.provideMerge(NodeServices.layer),
+          ),
+        ),
+      ),
+    );
+
+    expect(failure).toBeInstanceOf(ProviderAdapterRequestError);
+    expect(findProviderProcessExitUnprovenError(failure)).toBe(processFailure);
+  });
+
   it("lists OpenCode agents from the active discovery cwd", async () => {
     const runtime = createMockOpenCodeRuntime({
       inventory: {
@@ -715,6 +842,253 @@ describe("OpenCodeAdapter runtime lifecycle", () => {
 
     expect(runtime.connectCalls).toHaveLength(1);
     expect(runtime.connectCalls[0]).toMatchObject({ cwd });
+  });
+
+  it("closes session scopes before evicting the target CLI pool in stopAll", async () => {
+    const runtime = createMockOpenCodeRuntime();
+
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const adapter = yield* OpenCodeAdapter;
+        yield* adapter.startSession({
+          provider: "opencode",
+          threadId: asThreadId("thread-stop-all-pool"),
+          runtimeMode: "full-access",
+        });
+        yield* adapter.stopAll();
+      }).pipe(
+        Effect.provide(
+          makeOpenCodeAdapterLive({ runtime: runtime.runtime }).pipe(
+            Layer.provideMerge(
+              ServerConfig.layerTest(process.cwd(), { prefix: "opencode-adapter-test-" }),
+            ),
+            Layer.provideMerge(NodeServices.layer),
+          ),
+        ),
+      ),
+    );
+
+    expect(runtime.abortCalls).toEqual([{ sessionID: "opencode-session-1" }]);
+    expect(runtime.closePoolCalls).toEqual([OPENCODE_CLI_SPEC]);
+    expect(runtime.lifecycleEvents).toEqual(["session.abort", "pool.close"]);
+  });
+
+  it("retains an interrupted stop for a sequential retry and emits one exit after closure", async () => {
+    let markAbortStarted: (() => void) | undefined;
+    const abortStarted = new Promise<void>((resolve) => {
+      markAbortStarted = resolve;
+    });
+    let allowAbort: (() => void) | undefined;
+    const abortGate = new Promise<void>((resolve) => {
+      allowAbort = resolve;
+    });
+    let abortAttempts = 0;
+    const runtime = createMockOpenCodeRuntime({
+      trackManagedConnectionRefs: true,
+      abort: async () => {
+        abortAttempts += 1;
+        if (abortAttempts === 1) {
+          markAbortStarted?.();
+          await abortGate;
+        }
+        return { data: null };
+      },
+    });
+    const threadId = asThreadId("thread-interrupted-stop");
+
+    const result = await Effect.runPromise(
+      Effect.gen(function* () {
+        const adapter = yield* OpenCodeAdapter;
+        yield* adapter.startSession({
+          provider: "opencode",
+          threadId,
+          runtimeMode: "full-access",
+        });
+
+        const firstStop = yield* adapter.stopSession(threadId).pipe(Effect.forkChild);
+        yield* Effect.promise(() => abortStarted);
+        yield* Fiber.interrupt(firstStop);
+        const retainedSessions = yield* adapter.listSessions();
+        const retainedRefs = runtime.getActiveManagedConnectionRefCount();
+        const startupEvents = Array.from(
+          yield* Stream.runCollect(Stream.take(adapter.streamEvents, 2)),
+        );
+        allowAbort?.();
+        yield* adapter.stopSession(threadId);
+        const remainingSessions = yield* adapter.listSessions();
+        const exitEvents = Array.from(
+          yield* Stream.runCollect(Stream.take(adapter.streamEvents, 1)),
+        );
+        const activeRefsBeforePoolClose = runtime.getActiveManagedConnectionRefCount();
+        yield* adapter.stopAll();
+
+        return {
+          retainedSessions,
+          retainedRefs,
+          startupEvents,
+          remainingSessions,
+          exitEvents,
+          activeRefsBeforePoolClose,
+        };
+      }).pipe(
+        Effect.provide(
+          makeOpenCodeAdapterLive({ runtime: runtime.runtime }).pipe(
+            Layer.provideMerge(
+              ServerConfig.layerTest(process.cwd(), { prefix: "opencode-adapter-test-" }),
+            ),
+            Layer.provideMerge(NodeServices.layer),
+          ),
+        ),
+      ),
+    );
+
+    expect(result.retainedSessions.map((session) => session.threadId)).toEqual([threadId]);
+    expect(result.retainedRefs).toBe(1);
+    expect(result.startupEvents.some((event) => event.type === "session.exited")).toBe(false);
+    expect(result.remainingSessions).toEqual([]);
+    expect(result.exitEvents.filter((event) => event.type === "session.exited")).toHaveLength(1);
+    expect(result.activeRefsBeforePoolClose).toBe(0);
+    expect(runtime.abortCalls).toEqual([
+      { sessionID: "opencode-session-1" },
+      { sessionID: "opencode-session-1" },
+    ]);
+    expect(runtime.closePoolCalls).toEqual([OPENCODE_CLI_SPEC]);
+    expect(runtime.lifecycleEvents).toEqual([
+      "session.abort",
+      "session.abort",
+      "connection.release",
+      "pool.close",
+    ]);
+  });
+
+  it("times out a hung abort, retains ownership, and closes exactly once after retry", async () => {
+    let markAbortStarted: (() => void) | undefined;
+    const abortStarted = new Promise<void>((resolve) => {
+      markAbortStarted = resolve;
+    });
+    let abortAttempts = 0;
+    const runtime = createMockOpenCodeRuntime({
+      trackManagedConnectionRefs: true,
+      abort: async () => {
+        abortAttempts += 1;
+        if (abortAttempts === 1) {
+          markAbortStarted?.();
+          await new Promise<void>(() => undefined);
+        }
+        return { data: null };
+      },
+    });
+    const threadId = asThreadId("thread-abort-timeout");
+    const abortTimeoutMs = 100;
+    let releaseTimeout: (() => void) | undefined;
+    const timeoutGate = new Promise<void>((resolve) => {
+      releaseTimeout = resolve;
+    });
+    let timeoutAttempts = 0;
+
+    const result = await Effect.runPromise(
+      Effect.gen(function* () {
+        const adapter = yield* OpenCodeAdapter;
+        yield* adapter.startSession({
+          provider: "opencode",
+          threadId,
+          runtimeMode: "full-access",
+        });
+
+        const firstStop = yield* adapter
+          .stopSession(threadId)
+          .pipe(Effect.result, Effect.forkChild);
+        yield* Effect.promise(() => abortStarted);
+        releaseTimeout?.();
+        const firstStopResult = yield* Fiber.join(firstStop);
+        const retainedSessions = yield* adapter.listSessions();
+        const retainedRefs = runtime.getActiveManagedConnectionRefCount();
+        const startupEvents = Array.from(
+          yield* Stream.runCollect(Stream.take(adapter.streamEvents, 2)),
+        );
+
+        yield* adapter.stopSession(threadId);
+        const remainingSessions = yield* adapter.listSessions();
+        const exitEvents = Array.from(
+          yield* Stream.runCollect(Stream.take(adapter.streamEvents, 1)),
+        );
+        const activeRefsBeforePoolClose = runtime.getActiveManagedConnectionRefCount();
+        yield* adapter.stopAll();
+
+        return {
+          firstStopResult,
+          retainedSessions,
+          retainedRefs,
+          startupEvents,
+          remainingSessions,
+          exitEvents,
+          activeRefsBeforePoolClose,
+        };
+      }).pipe(
+        Effect.provide(
+          makeOpenCodeAdapterLive({
+            runtime: runtime.runtime,
+            sessionAbortTimeoutMs: abortTimeoutMs,
+            waitForSessionAbortTimeout: () => {
+              timeoutAttempts += 1;
+              return timeoutAttempts === 1 ? Effect.promise(() => timeoutGate) : Effect.never;
+            },
+          }).pipe(
+            Layer.provideMerge(
+              ServerConfig.layerTest(process.cwd(), { prefix: "opencode-adapter-test-" }),
+            ),
+            Layer.provideMerge(NodeServices.layer),
+          ),
+        ),
+      ),
+    );
+
+    expect(Result.isFailure(result.firstStopResult)).toBe(true);
+    if (Result.isFailure(result.firstStopResult)) {
+      expect(result.firstStopResult.failure).toBeInstanceOf(ProviderAdapterRequestError);
+      expect(result.firstStopResult.failure.message).toContain(
+        "Session ownership remains retained",
+      );
+    }
+    expect(result.retainedSessions.map((session) => session.threadId)).toEqual([threadId]);
+    expect(result.retainedRefs).toBe(1);
+    expect(result.startupEvents.some((event) => event.type === "session.exited")).toBe(false);
+    expect(result.remainingSessions).toEqual([]);
+    expect(result.exitEvents.filter((event) => event.type === "session.exited")).toHaveLength(1);
+    expect(result.activeRefsBeforePoolClose).toBe(0);
+    expect(runtime.abortCalls).toEqual([
+      { sessionID: "opencode-session-1" },
+      { sessionID: "opencode-session-1" },
+    ]);
+    expect(runtime.closePoolCalls).toEqual([OPENCODE_CLI_SPEC]);
+    expect(runtime.lifecycleEvents).toEqual([
+      "session.abort",
+      "session.abort",
+      "connection.release",
+      "pool.close",
+    ]);
+  });
+
+  it("evicts only the Kilo CLI-spec pools from Kilo stopAll", async () => {
+    const runtime = createMockOpenCodeRuntime();
+
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const adapter = yield* KiloAdapter;
+        yield* adapter.stopAll();
+      }).pipe(
+        Effect.provide(
+          makeKiloAdapterLive({ runtime: runtime.runtime }).pipe(
+            Layer.provideMerge(
+              ServerConfig.layerTest(process.cwd(), { prefix: "kilo-adapter-test-" }),
+            ),
+            Layer.provideMerge(NodeServices.layer),
+          ),
+        ),
+      ),
+    );
+
+    expect(runtime.closePoolCalls).toEqual([KILO_CLI_SPEC]);
   });
 
   it("isolates same-cwd managed sessions, injects distinct gateway tokens, and revokes them", async () => {
@@ -1061,7 +1435,6 @@ describe("OpenCodeAdapter runtime lifecycle", () => {
     expect(gateway.ownerByToken.size).toBe(0);
     expect(gateway.revoked).toEqual(["gateway-token-1"]);
   });
-
   it("uses the persisted resume cursor cwd when resuming OpenCode sessions", async () => {
     const runtime = createMockOpenCodeRuntime();
 

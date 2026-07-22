@@ -145,6 +145,16 @@ export interface ProviderServiceShape {
   }) => Effect.Effect<void, ProviderServiceError>;
 
   /**
+   * Atomically validate and stop every resumable runtime for one provider
+   * before exclusive CLI maintenance. Providers whose process ownership is
+   * ambiguous can require an empty session set instead of stopping sessions.
+   */
+  readonly prepareForMaintenance?: (input: {
+    readonly provider: ProviderKind;
+    readonly stopIdleSessions: boolean;
+  }) => Effect.Effect<ReadonlyArray<ThreadId>, ProviderServiceError>;
+
+  /**
    * Stop an adapter runtime only when the provider service can atomically prove
    * that no foreground dispatch or provider-native background task owns it.
    * A busy or inconsistent runtime is preserved as a successful no-op.

@@ -1,4 +1,4 @@
-import type { ChildProcess, SpawnOptions } from "node:child_process";
+import { spawnSync, type ChildProcess, type SpawnOptions } from "node:child_process";
 import crypto from "node:crypto";
 import { EventEmitter } from "node:events";
 import fs from "node:fs/promises";
@@ -13,14 +13,26 @@ import { Effect, Layer } from "effect";
 import { describe, expect, it, vi } from "vitest";
 
 import { ServerConfig } from "../../config";
+import type { ProviderMaintenanceOwnedResourceCoordinator } from "../providerMaintenanceOwnedResources";
+import { makeProviderProcessOwnerTracker } from "../providerProcessOwnerTracker.ts";
 import { AntigravityAdapter, type AntigravityAdapterShape } from "../Services/AntigravityAdapter";
+import { containPreparedWindowsProviderProcess } from "../windowsProviderProcess.ts";
+import {
+  supervisePreparedNodeProcess,
+  windowsJobNodeProcessSupervisor,
+} from "../windowsJobProcessSupervisor.ts";
+import {
+  findProviderProcessExitUnprovenError,
+  ProviderProcessExitUnprovenError,
+} from "../supervisedProcessTeardown.ts";
 import {
   ANTIGRAVITY_PROCESS_OUTPUT_MAX_BYTES,
   type AntigravityAdapterLiveOptions,
   type AntigravityProcessDependencies,
   type AntigravityTurnProcessResult,
-  buildAntigravityHookConfig,
   antigravityPromptCommandLineIssue,
+  buildAntigravityCaptureCommand,
+  buildAntigravityHookConfig,
   hookScriptSource,
   makeAntigravityAdapterLive,
   makeAntigravityRuntimeEventBase,
@@ -46,6 +58,18 @@ function deferred<T = void>(): Deferred<T> {
     reject = rejectPromise;
   });
   return { promise, resolve, reject };
+}
+
+function runCaptureCommand(command: string, input: string, env: NodeJS.ProcessEnv) {
+  const shell = process.platform === "win32" ? (process.env.ComSpec ?? "cmd.exe") : "/bin/sh";
+  const args = process.platform === "win32" ? ["/d", "/s", "/c", command] : ["-c", command];
+  return spawnSync(shell, args, {
+    env: { ...process.env, ...env },
+    input,
+    encoding: "utf8",
+    timeout: 10_000,
+    windowsVerbatimArguments: process.platform === "win32",
+  });
 }
 
 async function waitFor(predicate: () => boolean, timeoutMs = 1_000): Promise<void> {
@@ -112,13 +136,58 @@ function fakeProcessDependencies(
   fake: FakeChild,
   overrides: Partial<AntigravityProcessDependencies> = {},
 ): AntigravityProcessDependencies {
+  const teardownProcessTree = overrides.teardownProcessTree ?? (async () => undefined);
   return {
+    platform: "linux",
     prepareProcess: (command, args) => ({ command, args: [...args], shell: false }),
     containProcess: (prepared) => prepared,
     spawnProcess: (_command: string, _args: ReadonlyArray<string>, _options: SpawnOptions) =>
       fake.child,
-    teardownProcessTree: async () => undefined,
+    teardownProcessTree,
+    superviseProcess: (_prepared, child) => ({
+      rootPid: Number(child.pid),
+      proveExit: async () => ({ escalated: false, signalErrors: [] }),
+      teardown: async () => {
+        await teardownProcessTree(child);
+        return { escalated: false, signalErrors: [] };
+      },
+      requestTermination: (signal) => child.kill(signal),
+    }),
     ...overrides,
+  };
+}
+
+function exactWindowsJobDependencies(
+  fake: FakeChild,
+  teardownProcessTree: AntigravityProcessDependencies["teardownProcessTree"],
+  options: {
+    readonly requestStop?: () => Promise<void>;
+    readonly verifyExit?: () => Promise<void>;
+  } = {},
+): AntigravityProcessDependencies {
+  return {
+    platform: "win32",
+    prepareProcess: (command, args) => ({ command, args: [...args], shell: false }),
+    containProcess: (prepared, input) =>
+      containPreparedWindowsProviderProcess(prepared, {
+        ...input,
+        platform: "win32",
+        arch: "x64",
+        launcherPath: "C:\\synara\\synara-windows-job-launcher.exe",
+        fileExists: () => true,
+      }),
+    spawnProcess: () => fake.child,
+    superviseProcess: (prepared, child, supervisorOptions) =>
+      supervisePreparedNodeProcess(prepared, child, {
+        ...supervisorOptions,
+        requestStop:
+          options.requestStop ??
+          (async () => {
+            fake.emitClose(143);
+          }),
+        verifyExit: options.verifyExit ?? (async () => undefined),
+      }),
+    ...(teardownProcessTree ? { teardownProcessTree } : {}),
   };
 }
 
@@ -145,6 +214,7 @@ async function runWithAdapter<T>(
 async function startFakeAdapterTurn(input: {
   readonly fake: FakeChild;
   readonly teardownProcessTree: NonNullable<AntigravityProcessDependencies["teardownProcessTree"]>;
+  readonly spawnProcess?: NonNullable<AntigravityProcessDependencies["spawnProcess"]>;
   readonly beforeTurnFinalization?: AntigravityAdapterLiveOptions["beforeTurnFinalization"];
   readonly use: (adapter: AntigravityAdapterShape, threadId: ThreadId) => Promise<void>;
 }): Promise<void> {
@@ -153,6 +223,7 @@ async function startFakeAdapterTurn(input: {
     {
       ...fakeProcessDependencies(input.fake, {
         teardownProcessTree: input.teardownProcessTree,
+        ...(input.spawnProcess ? { spawnProcess: input.spawnProcess } : {}),
       }),
       installCapturePlugin: async () => undefined,
       ...(input.beforeTurnFinalization
@@ -305,15 +376,71 @@ describe("Antigravity CLI integration helpers", () => {
     });
   });
 
-  it("keeps the globally installed hook neutral outside Synara sessions", async () => {
-    const result = await runAntigravityHelperProcess(
-      process.execPath,
-      ["-e", hookScriptSource(), "pre-tool"],
-      { timeoutMs: 1_000 },
+  it("keeps the globally installed hook neutral outside Synara sessions", () => {
+    const command = buildAntigravityCaptureCommand(
+      "__synara_gui_must_not_launch__",
+      "__capture_script_must_not_run__",
+      "pre-tool",
+    );
+    const result = runCaptureCommand(
+      command,
+      JSON.stringify({ payload: "x".repeat(2 * 1024 * 1024) }),
+      { SYNARA_ANTIGRAVITY_EVENTS: "" },
     );
 
-    expect(result.code).toBe(0);
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(0);
     expect(result.stdout.trim()).toBe("{}");
+  });
+
+  it("runs the capture script for Synara-managed sessions", async () => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "synara-antigravity-hook-test-"));
+    const literalPercentDirectory = path.join(directory, "%SYNARA_CAPTURE_LITERAL%");
+    const scriptPath = path.join(literalPercentDirectory, "capture.cjs");
+    const eventPath = path.join(literalPercentDirectory, "events.ndjson");
+    try {
+      await fs.mkdir(literalPercentDirectory);
+      await fs.writeFile(scriptPath, hookScriptSource(), { mode: 0o700 });
+      const command = buildAntigravityCaptureCommand(process.execPath, scriptPath, "pre-tool");
+      const payload = JSON.stringify({ tool: "shell" });
+      const result = runCaptureCommand(command, payload, {
+        SYNARA_CAPTURE_LITERAL: "must-not-expand",
+        SYNARA_ANTIGRAVITY_EVENTS: eventPath,
+        SYNARA_ANTIGRAVITY_HOOK_DECISION: "allow",
+        SYNARA_ANTIGRAVITY_CAPTURE_EXECUTABLE: process.execPath,
+        SYNARA_ANTIGRAVITY_CAPTURE_SCRIPT: scriptPath,
+      });
+
+      expect(result.error).toBeUndefined();
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout.trim()).toBe('{"decision":"allow"}');
+      expect(await fs.readFile(eventPath, "utf8")).toBe(`pre-tool\t${payload}\n`);
+    } finally {
+      await fs.rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("runs packaged Electron as Node only for Synara-managed sessions", () => {
+    expect(
+      buildAntigravityCaptureCommand(
+        "/Applications/Synara.app/Contents/MacOS/Synara",
+        "/tmp/synara-capture/capture.cjs",
+        "pre-tool",
+        "darwin",
+      ),
+    ).toBe(
+      `if [ -z "\${SYNARA_ANTIGRAVITY_EVENTS:-}" ]; then cat >/dev/null 2>&1 || :; printf '%s\\n' '{}'; else ELECTRON_RUN_AS_NODE=1 '/Applications/Synara.app/Contents/MacOS/Synara' '/tmp/synara-capture/capture.cjs' 'pre-tool'; fi`,
+    );
+    expect(
+      buildAntigravityCaptureCommand(
+        String.raw`C:\Program Files\Synara\Synara.exe`,
+        String.raw`C:\Users\test\.gemini\capture.cjs`,
+        "pre-tool",
+        "win32",
+      ),
+    ).toBe(
+      String.raw`if not defined SYNARA_ANTIGRAVITY_EVENTS (more >nul 2>nul & echo {}) else (set "ELECTRON_RUN_AS_NODE=1" && "%SYNARA_ANTIGRAVITY_CAPTURE_EXECUTABLE%" "%SYNARA_ANTIGRAVITY_CAPTURE_SCRIPT%" "pre-tool")`,
+    );
   });
 
   it("guards Windows command-line limits before spawning the CLI", () => {
@@ -548,6 +675,8 @@ describe("Antigravity process spawning and output ownership", () => {
     const helperPromise = runAntigravityHelperProcess("helper.exe", ["one"], {
       cwd: "C:\\helper cwd",
       dependencies: {
+        ...fakeProcessDependencies(helperFake),
+        platform: "linux",
         prepareProcess: helperPrepare,
         containProcess: (prepared) => prepared,
         spawnProcess: (_command, _args, options) => {
@@ -577,6 +706,8 @@ describe("Antigravity process spawning and output ownership", () => {
       cwd: "C:\\turn cwd",
       env: turnEnv,
       dependencies: {
+        ...fakeProcessDependencies(turnFake),
+        platform: "linux",
         prepareProcess: (command, args, input) => {
           expect(input).toEqual({ cwd: "C:\\turn cwd", env: turnEnv });
           return {
@@ -702,6 +833,67 @@ describe("Antigravity process spawning and output ownership", () => {
     expect(fake.stderr.listenerCount("data")).toBe(0);
   });
 
+  it("routes a Job-contained helper timeout through cooperative Job control", async () => {
+    const fake = makeFakeChild(42_010);
+    const numericTeardown = vi.fn(async () => undefined);
+    const exactKill = vi.fn(() => true);
+    fake.child.kill = exactKill;
+
+    const helper = runAntigravityHelperProcess("C:\\tools\\antigravity.exe", [], {
+      timeoutMs: 10,
+      dependencies: exactWindowsJobDependencies(fake, numericTeardown),
+    });
+
+    await expect(helper).rejects.toThrow("timed out after 10ms");
+    expect(exactKill).not.toHaveBeenCalled();
+    expect(numericTeardown).not.toHaveBeenCalled();
+  });
+
+  it("routes a Job-contained turn stop through cooperative Job control", async () => {
+    const fake = makeFakeChild(42_011);
+    const numericTeardown = vi.fn(async () => undefined);
+    const exactKill = vi.fn(() => true);
+    fake.child.kill = exactKill;
+    const lifecycle = startAntigravityTurnProcess({
+      command: "C:\\tools\\antigravity.exe",
+      args: [],
+      env: process.env,
+      dependencies: exactWindowsJobDependencies(fake, numericTeardown),
+      onFinalize: async () => undefined,
+    });
+
+    await expect(lifecycle.teardownAndFinalize()).resolves.toMatchObject({
+      teardownRequested: true,
+    });
+    expect(exactKill).not.toHaveBeenCalled();
+    expect(numericTeardown).not.toHaveBeenCalled();
+  });
+
+  it("fails closed and poisons proof after accepted emergency Job termination", async () => {
+    const fake = makeFakeChild(42_012);
+    const numericTeardown = vi.fn(async () => undefined);
+    const exactKill = vi.fn(() => {
+      fake.emitClose(null, "SIGKILL");
+      return true;
+    });
+    fake.child.kill = exactKill;
+    const helper = runAntigravityHelperProcess("C:\\tools\\antigravity.exe", [], {
+      timeoutMs: 10,
+      dependencies: exactWindowsJobDependencies(fake, numericTeardown, {
+        requestStop: async () => {
+          throw new Error("control request failed");
+        },
+      }),
+    });
+
+    await expect(helper).rejects.toThrow("timed out after 10ms");
+    await expect(windowsJobNodeProcessSupervisor(fake.child)?.proveExit()).rejects.toThrow(
+      "permanently unavailable",
+    );
+    expect(exactKill).toHaveBeenCalledOnce();
+    expect(numericTeardown).not.toHaveBeenCalled();
+  });
+
   it("settles helper spawn error and early close once without timers or listeners leaking", async () => {
     const spawnErrorFake = makeFakeChild(42_003);
     const spawnErrorTeardown = vi.fn(async () => undefined);
@@ -726,7 +918,7 @@ describe("Antigravity process spawning and output ownership", () => {
     await expect(closeResult).resolves.toMatchObject({ code: 0 });
     await new Promise((resolve) => setTimeout(resolve, 30));
 
-    expect(spawnErrorTeardown).not.toHaveBeenCalled();
+    expect(spawnErrorTeardown).toHaveBeenCalledOnce();
     expect(closeTeardown).not.toHaveBeenCalled();
     for (const fake of [spawnErrorFake, closeFake]) {
       expect(fake.child.listenerCount("error")).toBe(0);
@@ -753,7 +945,7 @@ describe("Antigravity process spawning and output ownership", () => {
     fake.emitClose(1);
     await expect(lifecycle.finalization).rejects.toBe(failure);
     expect(onFinalize).toHaveBeenCalledOnce();
-    expect(teardownProcessTree).not.toHaveBeenCalled();
+    expect(teardownProcessTree).toHaveBeenCalledOnce();
     expect(fake.child.listenerCount("error")).toBe(0);
     expect(fake.child.listenerCount("close")).toBe(0);
     expect(fake.stdout.listenerCount("data")).toBe(0);
@@ -787,10 +979,15 @@ describe("Antigravity process spawning and output ownership", () => {
     await expectPending(teardownAndFinalize);
     expect(onFinalize).not.toHaveBeenCalled();
 
-    const finalizationAssertion = expect(lifecycle.finalization).rejects.toBe(teardownFailure);
-    const teardownAssertion = expect(teardownAndFinalize).rejects.toBe(teardownFailure);
     teardown.reject(teardownFailure);
-    await Promise.all([finalizationAssertion, teardownAssertion]);
+    const [finalizationFailure, teardownResultFailure] = await Promise.all([
+      lifecycle.finalization.catch((cause: unknown) => cause),
+      teardownAndFinalize.catch((cause: unknown) => cause),
+    ]);
+    for (const failure of [finalizationFailure, teardownResultFailure]) {
+      expect(failure).toBeInstanceOf(AggregateError);
+      expect((failure as AggregateError).errors).toEqual([spawnFailure, teardownFailure]);
+    }
 
     expect(onFinalize).toHaveBeenCalledOnce();
     expect(finalized).toMatchObject({
@@ -803,6 +1000,32 @@ describe("Antigravity process spawning and output ownership", () => {
     expect(fake.child.listenerCount("close")).toBe(0);
     expect(fake.stdout.listenerCount("data")).toBe(0);
     expect(fake.stderr.listenerCount("data")).toBe(0);
+  });
+
+  it("tears down a spawned helper with missing pipes and retains teardown proof failure", async () => {
+    const fake = makeFakeChild(42_007);
+    Object.assign(fake.child, { stdout: null });
+    const processFailure = new ProviderProcessExitUnprovenError({
+      rootPid: 42_007,
+      rootExited: false,
+      remainingDescendantPids: null,
+      captureComplete: false,
+    });
+    const teardownProcessTree = vi.fn(async () => {
+      throw processFailure;
+    });
+
+    const failure = await runAntigravityHelperProcess("fake-helper", [], {
+      dependencies: fakeProcessDependencies(fake, { teardownProcessTree }),
+    }).catch((cause: unknown) => cause);
+
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect(findProviderProcessExitUnprovenError(failure)).toBe(processFailure);
+    expect((failure as AggregateError).errors[0]).toMatchObject({
+      message: "Antigravity helper process did not expose piped output streams.",
+    });
+    expect((failure as AggregateError).errors[1]).toBe(processFailure);
+    expect(teardownProcessTree).toHaveBeenCalledOnce();
   });
 
   it("makes late lifecycle callers await an already observed normal close", async () => {
@@ -831,6 +1054,27 @@ describe("Antigravity process spawning and output ownership", () => {
     ]);
     expect(lateResult).toEqual(terminalResult);
     expect(onFinalize).toHaveBeenCalledOnce();
+  });
+
+  it("does not retry teardown for an unrelated finalization failure", async () => {
+    const fake = makeFakeChild(42_025);
+    const finalizationFailure = new Error("finalization hook failed");
+    const teardownProcessTree = vi.fn(async () => undefined);
+    const lifecycle = startAntigravityTurnProcess({
+      command: "fake-turn",
+      args: [],
+      env: process.env,
+      dependencies: fakeProcessDependencies(fake, { teardownProcessTree }),
+      onFinalize: async () => {
+        throw finalizationFailure;
+      },
+    });
+
+    fake.emitClose(0);
+
+    await expect(lifecycle.finalization).rejects.toBe(finalizationFailure);
+    await expect(lifecycle.teardownAndFinalize()).rejects.toBe(finalizationFailure);
+    expect(teardownProcessTree).not.toHaveBeenCalled();
   });
 
   it("rejects abnormal turn exit when descendant survival cannot be disproven", async () => {
@@ -867,6 +1111,44 @@ describe("Antigravity process spawning and output ownership", () => {
 });
 
 describe("Antigravity active turn lifecycle", () => {
+  it("wires exact managed capture paths without enabling Electron mode on the provider", async () => {
+    const fake = makeFakeChild();
+    let spawnedEnv: NodeJS.ProcessEnv | undefined;
+    const spawnProcess = vi.fn(
+      (_command: string, _args: ReadonlyArray<string>, options: SpawnOptions) => {
+        spawnedEnv = options.env;
+        return fake.child;
+      },
+    );
+    const teardownProcessTree = vi.fn(async () => {
+      fake.emitClose(null, "SIGTERM");
+    });
+
+    await startFakeAdapterTurn({
+      fake,
+      spawnProcess,
+      teardownProcessTree,
+      use: async (adapter, threadId) => {
+        expect(spawnedEnv).toMatchObject({
+          SYNARA_ANTIGRAVITY_CAPTURE_EXECUTABLE: process.execPath,
+          SYNARA_ANTIGRAVITY_CAPTURE_SCRIPT: path.join(
+            os.homedir(),
+            ".gemini",
+            "antigravity-cli",
+            "plugins",
+            "synara-capture",
+            "capture.cjs",
+          ),
+        });
+        expect(spawnedEnv?.ELECTRON_RUN_AS_NODE).toBeUndefined();
+        await Effect.runPromise(adapter.stopSession(threadId));
+      },
+    });
+
+    expect(spawnProcess).toHaveBeenCalledOnce();
+    expect(teardownProcessTree).toHaveBeenCalledOnce();
+  });
+
   it("keeps interrupt pending through shared teardown and full finalization", async () => {
     const fake = makeFakeChild();
     const teardown = deferred<void>();
@@ -993,5 +1275,149 @@ describe("Antigravity active turn lifecycle", () => {
         expect(teardownProcessTree).toHaveBeenCalledOnce();
       },
     });
+  });
+
+  it("retains an unproven turn owner until a later teardown retry proves exit", async () => {
+    const fake = makeFakeChild();
+    const processFailure = new ProviderProcessExitUnprovenError({
+      rootPid: 42_000,
+      rootExited: true,
+      remainingDescendantPids: [42_001],
+      captureComplete: true,
+    });
+    let teardownCalls = 0;
+    const teardownProcessTree = vi.fn(async () => {
+      teardownCalls += 1;
+      if (teardownCalls === 1) throw processFailure;
+    });
+
+    await startFakeAdapterTurn({
+      fake,
+      teardownProcessTree,
+      use: async (adapter, threadId) => {
+        const firstFailure = await Effect.runPromise(
+          adapter.interruptTurn(threadId).pipe(Effect.flip),
+        );
+        expect(findProviderProcessExitUnprovenError(firstFailure)).toBe(processFailure);
+        const retained = await Effect.runPromise(adapter.listSessions());
+        expect(retained[0]).toMatchObject({ status: "error" });
+        await expect(
+          Effect.runPromise(adapter.sendTurn({ threadId, input: "must remain blocked" })),
+        ).rejects.toThrow("An Antigravity turn is already active for this thread.");
+
+        await expect(Effect.runPromise(adapter.interruptTurn(threadId))).resolves.toBeUndefined();
+        const released = await Effect.runPromise(adapter.listSessions());
+        expect(released[0]).not.toHaveProperty("activeTurnId");
+        expect(teardownProcessTree).toHaveBeenCalledTimes(2);
+      },
+    });
+  });
+
+  it("attempts a failed active owner only once per stopAll call", async () => {
+    const fake = makeFakeChild();
+    const processFailure = new ProviderProcessExitUnprovenError({
+      rootPid: 42_020,
+      rootExited: true,
+      remainingDescendantPids: [42_021],
+      captureComplete: true,
+    });
+    const teardownProcessTree = vi
+      .fn<() => Promise<void>>()
+      .mockRejectedValueOnce(processFailure)
+      .mockResolvedValue(undefined);
+
+    await startFakeAdapterTurn({
+      fake,
+      teardownProcessTree,
+      use: async (adapter) => {
+        await expect(Effect.runPromise(adapter.stopAll())).rejects.toThrow();
+        expect(teardownProcessTree).toHaveBeenCalledTimes(1);
+
+        await expect(Effect.runPromise(adapter.stopAll())).resolves.toBeUndefined();
+        expect(teardownProcessTree).toHaveBeenCalledTimes(2);
+      },
+    });
+  });
+
+  it("retries a rejected helper teardown through a later adapter drain", async () => {
+    const fake = makeFakeChild(42_022);
+    const processFailure = new ProviderProcessExitUnprovenError({
+      rootPid: 42_022,
+      rootExited: true,
+      remainingDescendantPids: [42_023],
+      captureComplete: true,
+    });
+    const teardownProcessTree = vi
+      .fn<() => Promise<void>>()
+      .mockRejectedValueOnce(processFailure)
+      .mockResolvedValue(undefined);
+
+    await runWithAdapter(
+      {
+        ...fakeProcessDependencies(fake, { teardownProcessTree }),
+        installCapturePlugin: async () => undefined,
+      },
+      async (adapter) => {
+        const listing = Effect.runPromise(
+          adapter.listModels!({ provider: "antigravity", binaryPath: "fake-antigravity" }),
+        );
+        fake.emitError(new Error("model helper transport failed"));
+
+        await expect(listing).rejects.toThrow("model helper transport failed");
+        expect(teardownProcessTree).toHaveBeenCalledTimes(1);
+
+        await expect(Effect.runPromise(adapter.stopAll())).resolves.toBeUndefined();
+        expect(teardownProcessTree).toHaveBeenCalledTimes(2);
+      },
+    );
+  });
+
+  it("publishes a coordinator-registration orphan before retrying its teardown", async () => {
+    const fake = makeFakeChild(42_024);
+    const registrationFailure = new Error("Antigravity owner registration failed");
+    const initialTeardownFailure = new Error("initial orphan teardown failed");
+    const teardownProcessTree = vi
+      .fn<() => Promise<void>>()
+      .mockRejectedValueOnce(initialTeardownFailure)
+      .mockResolvedValue(undefined);
+    const maintenanceOwnedResources = {
+      register: () => Effect.die(registrationFailure),
+      drainProviderResources: () => Effect.void,
+    } as unknown as ProviderMaintenanceOwnedResourceCoordinator;
+    const processOwnerTracker = makeProviderProcessOwnerTracker({
+      provider: "antigravity",
+      resourcePrefix: "antigravity-orphan-test",
+      maintenanceOwnedResources,
+    });
+    const finalizedResults: AntigravityTurnProcessResult[] = [];
+    const lifecycle = startAntigravityTurnProcess({
+      command: "fake-antigravity",
+      args: [],
+      env: process.env,
+      dependencies: fakeProcessDependencies(fake, {
+        teardownProcessTree,
+        processOwnerTracker,
+      }),
+      onFinalize: async (result) => {
+        finalizedResults.push(result);
+      },
+    });
+
+    const initialFailure = await lifecycle.finalization.catch((cause: unknown) => cause);
+    expect(initialFailure).toBeInstanceOf(AggregateError);
+    expect((initialFailure as AggregateError).errors).toEqual([
+      registrationFailure,
+      initialTeardownFailure,
+    ]);
+    expect(teardownProcessTree).toHaveBeenCalledOnce();
+
+    await expect(lifecycle.teardownAndFinalize()).resolves.toMatchObject({
+      spawnError: registrationFailure,
+      teardownError: initialTeardownFailure,
+      teardownRequested: true,
+    });
+    expect(finalizedResults).toHaveLength(1);
+    await expect(Effect.runPromise(processOwnerTracker.drain)).resolves.toBeUndefined();
+    expect(teardownProcessTree).toHaveBeenCalledTimes(2);
   });
 });

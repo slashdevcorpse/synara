@@ -69,8 +69,8 @@ import {
   type TerminalHistoryRecord,
 } from "../terminalHistoryRecord";
 import {
-  defaultProcessTreeKiller,
   type CapturedProcessTree,
+  defaultProcessTreeKiller,
   type ProcessChildrenMap,
   type ProcessTreeKiller,
   type TerminalKillSignal,
@@ -809,7 +809,7 @@ type TerminalShellConfiguration =
     };
 
 interface KillEscalationHandle {
-  timer: ReturnType<typeof setTimeout>;
+  timer: ReturnType<typeof setTimeout> | null;
   unsubscribeExit: (() => void) | null;
   retainAfterRootExit: boolean;
   rootExited: boolean;
@@ -1403,7 +1403,7 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
 
   private clearAllKillEscalationTimers(): void {
     for (const handle of this.killEscalationTimers.values()) {
-      clearTimeout(handle.timer);
+      if (handle.timer !== null) clearTimeout(handle.timer);
       handle.unsubscribeExit?.();
     }
     this.killEscalationTimers.clear();
@@ -1914,7 +1914,7 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
     const handle = this.killEscalationTimers.get(process);
     if (!handle) return;
     if (!options.force && handle.retainAfterRootExit) return;
-    clearTimeout(handle.timer);
+    if (handle.timer !== null) clearTimeout(handle.timer);
     handle.unsubscribeExit?.();
     this.killEscalationTimers.delete(process);
   }
@@ -1926,27 +1926,35 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
   ): Promise<void> {
     this.clearKillEscalationTimer(ptyProcess);
     const pid = ptyProcess.pid;
-    let rootExited = false;
+    const captureOptions =
+      this.subprocessPlatform === "win32" ? undefined : { processGroupId: pid };
     let captureFinished = false;
     let rootExitedBeforeCaptureFinished = false;
-    let retainAfterRootExit = true;
-    const unsubscribeExit = ptyProcess.onExit(() => {
-      rootExited = true;
+    const handle: KillEscalationHandle = {
+      timer: null,
+      unsubscribeExit: null,
+      // Retain the listener until asynchronous ownership capture establishes whether descendants
+      // remain. This prevents root exit from cancelling an in-flight capture prematurely.
+      retainAfterRootExit: true,
+      rootExited: false,
+    };
+    handle.unsubscribeExit = ptyProcess.onExit(() => {
+      handle.rootExited = true;
       if (!captureFinished) {
         rootExitedBeforeCaptureFinished = true;
       }
-      const handle = this.killEscalationTimers.get(ptyProcess);
-      if (handle) {
-        handle.rootExited = true;
-        this.clearKillEscalationTimer(ptyProcess, { force: false });
-      }
+      this.clearKillEscalationTimer(ptyProcess, { force: false });
     });
+    this.killEscalationTimers.set(ptyProcess, handle);
+
     let capturedTree: CapturedProcessTree;
     try {
-      capturedTree = await this.processTreeKiller.capture(pid);
+      capturedTree = this.processTreeKiller.captureAsync
+        ? await this.processTreeKiller.captureAsync(pid, captureOptions)
+        : await Promise.resolve().then(() => this.processTreeKiller.capture(pid, captureOptions));
     } catch (error) {
       capturedTree = { descendants: [], captureComplete: false };
-      this.logger.warn("process tree capture failed", {
+      this.logger.warn("process-tree ownership capture failed", {
         threadId,
         terminalId,
         pid,
@@ -1954,12 +1962,23 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
       });
     }
     captureFinished = true;
-    // Flush an exit callback queued in the same turn as capture completion.
-    await Promise.resolve();
-    const tree = rootExitedBeforeCaptureFinished
-      ? { descendants: [], captureComplete: false }
-      : capturedTree;
-    retainAfterRootExit = tree.descendants.length > 0 || tree.captureComplete === false;
+    // Let an exit notification already queued in the next task run before any root signal.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    if (this.killEscalationTimers.get(ptyProcess) !== handle) return;
+
+    // POSIX PTYs own an isolated process group, so a group snapshot remains attributable after the
+    // leader exits. Windows has no equivalent proof here, so discard descendants captured late.
+    const preserveLateCapture = captureOptions?.processGroupId === pid;
+    const tree =
+      rootExitedBeforeCaptureFinished && !preserveLateCapture
+        ? { descendants: [], captureComplete: false }
+        : capturedTree;
+    handle.retainAfterRootExit = tree.descendants.length > 0 || tree.captureComplete === false;
+    if (handle.rootExited && !handle.retainAfterRootExit) {
+      this.clearKillEscalationTimer(ptyProcess);
+      return;
+    }
+
     const signalProcess = (signal: TerminalKillSignal) => {
       try {
         ptyProcess.kill(signal);
@@ -1981,39 +2000,43 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
       signal: TerminalKillSignal,
       options: { includeRootTree?: boolean } = {},
     ): Promise<void> => {
+      const input: Parameters<ProcessTreeKiller["signal"]>[0] = {
+        rootPid: pid,
+        signal,
+        tree,
+        includeRootTree: options.includeRootTree,
+        shouldSignalRootTree: () => !handle.rootExited,
+        abortSignal: undefined,
+        onError: (error, context) => {
+          this.logger.warn(
+            context.source === "tree-kill"
+              ? `tree-kill ${signal} failed`
+              : `captured process ${signal} failed`,
+            {
+              threadId,
+              terminalId,
+              pid: context.pid,
+              rootPid: pid,
+              error: error.message,
+            },
+          );
+        },
+      };
       const abortController = new AbortController();
       let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
       try {
-        const signaling = Promise.resolve(
-          this.processTreeKiller.signal({
-            rootPid: pid,
-            signal,
-            tree,
-            includeRootTree: options.includeRootTree,
-            shouldSignalRootTree: () => !rootExited,
-            abortSignal: abortController.signal,
-            onError: (error, context) => {
-              this.logger.warn(
-                context.source === "tree-kill"
-                  ? `tree-kill ${signal} failed`
-                  : `captured process ${signal} failed`,
-                {
-                  threadId,
-                  terminalId,
-                  pid: context.pid,
-                  rootPid: pid,
-                  error: error.message,
-                },
-              );
-            },
-          }),
+        const signalingInput = { ...input, abortSignal: abortController.signal };
+        const signaling = Promise.resolve().then(() =>
+          this.processTreeKiller.signalAsync !== undefined
+            ? this.processTreeKiller.signalAsync(signalingInput)
+            : this.processTreeKiller.signal(signalingInput),
         );
         const outcome = await Promise.race([
           signaling.then(() => "settled" as const),
           new Promise<"timed-out">((resolve) => {
             deadlineTimer = setTimeout(() => {
-              resolve("timed-out");
               abortController.abort();
+              resolve("timed-out");
             }, this.processKillGraceMs);
             deadlineTimer.unref?.();
           }),
@@ -2040,41 +2063,34 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
       }
     };
 
-    await signalTree("SIGTERM", { includeRootTree: !rootExited });
+    await signalTree("SIGTERM", { includeRootTree: !handle.rootExited });
+    if (this.killEscalationTimers.get(ptyProcess) !== handle) return;
     // Also signal the PTY handle directly for adapter compatibility and test doubles.
-    if (!rootExited) {
-      signalProcess("SIGTERM");
-    }
+    if (!handle.rootExited) signalProcess("SIGTERM");
 
-    if (rootExited && tree.descendants.length === 0) {
-      unsubscribeExit();
+    if (handle.rootExited && tree.descendants.length === 0) {
+      this.clearKillEscalationTimer(ptyProcess);
       return;
     }
 
     const timer = setTimeout(() => {
-      const handle = this.killEscalationTimers.get(ptyProcess);
-      this.killEscalationTimers.delete(ptyProcess);
-      const escalation = signalTree("SIGKILL", { includeRootTree: !rootExited })
-        .then(() => {
-          // Once the root exit is observed, only the captured descendants are safe to signal.
-          if (!rootExited) {
-            signalProcess("SIGKILL");
-          }
-        })
-        .finally(() => handle?.unsubscribeExit?.());
-      this.pendingKillEscalations.add(escalation);
-      void escalation.then(
-        () => this.pendingKillEscalations.delete(escalation),
-        () => this.pendingKillEscalations.delete(escalation),
-      );
+      if (this.killEscalationTimers.get(ptyProcess) !== handle) return;
+      handle.timer = null;
+      const forceKill = signalTree("SIGKILL", { includeRootTree: !handle.rootExited }).then(() => {
+        // Once the root exit is observed, only the captured descendants are safe to signal.
+        if (!handle.rootExited) signalProcess("SIGKILL");
+      });
+      this.pendingKillEscalations.add(forceKill);
+      void forceKill.finally(() => {
+        this.pendingKillEscalations.delete(forceKill);
+        if (this.killEscalationTimers.get(ptyProcess) === handle) {
+          handle.unsubscribeExit?.();
+          this.killEscalationTimers.delete(ptyProcess);
+        }
+      });
     }, this.processKillGraceMs);
     timer.unref?.();
-    this.killEscalationTimers.set(ptyProcess, {
-      timer,
-      unsubscribeExit,
-      retainAfterRootExit,
-      rootExited,
-    });
+    handle.timer = timer;
   }
 
   private evictInactiveSessionsIfNeeded(): void {
