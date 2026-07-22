@@ -308,7 +308,7 @@ export function validateQuarantineCaseInventory(
 ): readonly string[] {
   const errors: string[] = [];
   const entriesByMarker = new Map(registry.entries.map((entry) => [entry.marker, entry] as const));
-  const collectedCases = new Map(registry.entries.map((entry) => [entry.id, 0] as const));
+  const collectedCases = new Map<string, number>(registry.entries.map((entry) => [entry.id, 0]));
 
   for (const item of inventory) {
     const markers = [...new Set(markersInText(item.fullName))];
