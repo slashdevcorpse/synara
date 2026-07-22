@@ -55,8 +55,9 @@ describe("Super Synara GitHub release state", () => {
     );
   });
 
-  it("allows an exact owned draft with no tag or an exact preexisting tag", () => {
+  it("allows an exact owned draft before publication with or without a preexisting tag", () => {
     expect(() => validateSuperSynaraGitHubState(state())).not.toThrow();
+    expect(() => validateSuperSynaraGitHubState(state({ phase: "before-publish" }))).not.toThrow();
     expect(() =>
       validateSuperSynaraGitHubState(
         state({ phase: "before-publish", tagCommit: "a".repeat(40), tagObjectType: "commit" }),

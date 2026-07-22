@@ -319,7 +319,7 @@ jobs:
       - name: Verify dependency install preserved source
         run: node scripts/verify-release-worktree-clean.ts
 
-      - name: Revalidate tagged source
+      - name: Revalidate protected-main source provenance
         shell: bash
         env:
           VERSION: ${{ needs.preflight.outputs.version }}
@@ -328,7 +328,7 @@ jobs:
         run: |
           node scripts/verify-release-source-provenance.ts \
             "$VERSION" "$TAG" true "$SOURCE_COMMIT" branch main \
-            github-unsigned-prerelease true
+            github-unsigned-prerelease false
 
       - name: Verify Super Synara identity
         run: bun run brand:check
@@ -595,7 +595,7 @@ jobs:
       - name: Verify dependency install preserved source
         run: node scripts/verify-release-worktree-clean.ts
 
-      - name: Revalidate tagged source
+      - name: Revalidate protected-main source provenance
         shell: bash
         env:
           VERSION: ${{ needs.preflight.outputs.version }}
@@ -604,7 +604,7 @@ jobs:
         run: |
           node scripts/verify-release-source-provenance.ts \
             "$VERSION" "$TAG" true "$SOURCE_COMMIT" branch main \
-            github-unsigned-prerelease true
+            github-unsigned-prerelease false
 
       - name: Verify Super Synara identity
         run: bun run brand:check
