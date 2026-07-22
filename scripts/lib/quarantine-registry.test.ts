@@ -1,6 +1,6 @@
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { resolve } from "node:path";
+import { relative, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 
 import { afterEach, describe, expect, it } from "vitest";
@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   collectQuarantineInventoryBatches,
   createQuarantineInventoryEnvironment,
+  createQuarantineInventoryTemporaryDirectory,
   formatQuarantineSummary,
   parseVitestBrowserFiles,
   parseVitestQuarantineInventory,
@@ -78,6 +79,15 @@ describe("quarantine registry", () => {
     expect(environment.Synara_Generated_Route_Tree).toBeUndefined();
     expect(() => createQuarantineInventoryEnvironment({}, "relative/routeTree.gen.ts")).toThrow(
       "absolute generated route-tree path",
+    );
+  });
+
+  it("keeps generated route-tree staging on the repository filesystem", () => {
+    const { root } = fixture();
+    const temporaryDirectory = createQuarantineInventoryTemporaryDirectory(root);
+
+    expect(relative(root, temporaryDirectory).replaceAll("\\", "/")).toMatch(
+      /^apps\/web\/\.tanstack\/quarantine-inventory-/,
     );
   });
 

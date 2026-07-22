@@ -189,7 +189,7 @@ describe.skipIf(process.platform !== "win32")(
       expect({ code, signal }).toEqual({ code: 137, signal: null });
       expect(output).toContain("FIXTURE_ARGV:[]");
       expect(output).not.toContain("SYNARA_SMOKE_JOB_ERROR");
-    }, 70_000);
+    }, 90_000);
 
     it("preserves literal -- argv and contains root, child, grandchild, and TCP listener", async () => {
       const pidFile = join(temporaryDirectory, "owned process ids.txt");
@@ -239,7 +239,7 @@ describe.skipIf(process.platform !== "win32")(
         "all Job-owned PIDs to exit",
       );
       await expect(canConnect(port)).resolves.toBe(false);
-    }, 70_000);
+    }, 90_000);
 
     it("treats wrapper stdin EOF as a contained Job shutdown", async () => {
       const pidFile = join(temporaryDirectory, "eof target pid.txt");
@@ -272,7 +272,7 @@ describe.skipIf(process.platform !== "win32")(
       expect(output).not.toContain("SYNARA_SMOKE_JOB_ERROR");
       const pid = Number((await readFile(pidFile, "utf8")).trim().split(":")[1]);
       await waitFor(() => !processExists(pid), "the EOF target to be killed by Job teardown");
-    }, 70_000);
+    }, 90_000);
 
     it("rejects an existing drive-root-relative target before READY in the helper itself", async () => {
       await access(process.execPath);

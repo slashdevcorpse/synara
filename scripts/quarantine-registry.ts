@@ -1,11 +1,11 @@
-import { appendFileSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { appendFileSync, readFileSync, rmSync } from "node:fs";
 import { resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 
 import {
   collectQuarantineInventoryBatches,
   createQuarantineInventoryEnvironment,
+  createQuarantineInventoryTemporaryDirectory,
   formatQuarantineSummary,
   parseVitestBrowserFiles,
   parseVitestQuarantineInventory,
@@ -192,7 +192,7 @@ function collectQuarantineInventory(
   }
   const webRoot = resolve(repositoryRoot, "apps/web");
   const vitestCli = resolve(repositoryRoot, "node_modules/vitest/vitest.mjs");
-  const temporaryDirectory = mkdtempSync(resolve(tmpdir(), "synara-quarantine-inventory-"));
+  const temporaryDirectory = createQuarantineInventoryTemporaryDirectory(repositoryRoot);
   try {
     const environment = createQuarantineInventoryEnvironment(
       process.env,

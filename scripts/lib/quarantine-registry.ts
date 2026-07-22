@@ -1,4 +1,12 @@
-import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  statSync,
+} from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
 
 import { parse as parseYaml } from "yaml";
@@ -67,6 +75,12 @@ export function createQuarantineInventoryEnvironment(
     NO_COLOR: "1",
     SYNARA_GENERATED_ROUTE_TREE: generatedRouteTreePath,
   };
+}
+
+export function createQuarantineInventoryTemporaryDirectory(repositoryRoot: string): string {
+  const stagingRoot = resolve(repositoryRoot, "apps", "web", ".tanstack");
+  mkdirSync(stagingRoot, { recursive: true });
+  return mkdtempSync(resolve(stagingRoot, "quarantine-inventory-"));
 }
 
 const ENTRY_KEYS = new Set([
