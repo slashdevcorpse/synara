@@ -51,6 +51,56 @@ import { resolveWsHttpUrl } from "./lib/wsHttpUrl";
 
 let instance: { api: NativeApi; transport: WsTransport } | null = null;
 
+function clearE2eRendererHarness(): void {
+  if (typeof window !== "undefined") {
+    delete window.__synaraE2e;
+  }
+}
+
+function installE2eRendererHarness(api: NativeApi, transport: WsTransport): void {
+  clearE2eRendererHarness();
+  if (typeof window === "undefined" || window.desktopBridge?.isE2eHarness !== true) return;
+
+  window.__synaraE2e = {
+    probeReadiness: async () => {
+      let lastError: unknown;
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        try {
+          // The desktop fixture invokes this only after the root UI has committed its initial
+          // shell snapshot. Re-reading around the explicit provider refresh proves the current
+          // feature session can serve both orchestration and provider RPCs without changing any
+          // production retry behavior.
+          await api.orchestration.getShellSnapshot();
+          const refreshed = await api.server.refreshProviders();
+          const snapshot = await api.orchestration.getShellSnapshot();
+          const includesCodex = refreshed.providers.some(
+            (provider) => provider.provider === "codex",
+          );
+          if (transport.getState() === "open" && includesCodex) {
+            return {
+              snapshotSequence: snapshot.snapshotSequence,
+              providers: refreshed.providers,
+            };
+          }
+          lastError = includesCodex
+            ? new Error(
+                "Desktop E2E renderer transport left the open state during readiness probe.",
+              )
+            : new Error("Desktop E2E provider refresh omitted the enabled Codex provider.");
+        } catch (error) {
+          lastError = error instanceof Error ? error : new Error(String(error));
+        }
+        if (attempt < 4) {
+          await new Promise<void>((resolve) => setTimeout(resolve, 100));
+        }
+      }
+      throw lastError instanceof Error
+        ? lastError
+        : new Error("Desktop E2E renderer readiness probe failed.");
+    },
+  };
+}
+
 function createListenerRegistry<T>() {
   const listeners = new Set<(payload: T) => void>();
   return {
@@ -915,6 +965,7 @@ export function createWsNativeApi(): NativeApi {
   };
 
   instance = { api, transport };
+  installE2eRendererHarness(api, transport);
   return api;
 }
 
@@ -925,6 +976,7 @@ export async function resetWsNativeApiForTest(): Promise<void> {
   instance = null;
   clearWsNativeApiListeners();
   fallbackBrowserStates.clear();
+  clearE2eRendererHarness();
   await transport?.dispose();
 }
 
@@ -933,5 +985,6 @@ if (import.meta.hot) {
     void instance?.transport.dispose();
     instance = null;
     clearWsNativeApiListeners();
+    clearE2eRendererHarness();
   });
 }
