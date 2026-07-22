@@ -1621,7 +1621,22 @@ const makeAntigravityAdapter = Effect.fn(function* (options: AntigravityAdapterL
         (threadId) => stopSession(threadId).pipe(Effect.exit),
         { concurrency: "unbounded" },
       );
-      const ownerExit = yield* Effect.exit(processOwnerTracker.drainExcluding(activeOwners));
+      const ownerExit = yield* Effect.exit(
+        processOwnerTracker.drainExcluding(activeOwners).pipe(
+          Effect.mapError(
+            (cause) =>
+              new ProviderAdapterRequestError({
+                provider: PROVIDER,
+                method: "stopAll",
+                detail: messageFromCause(
+                  cause,
+                  "Failed to prove all Antigravity process trees exited.",
+                ),
+                cause,
+              }),
+          ),
+        ),
+      );
       for (const sessionExit of sessionExits) {
         if (Exit.isFailure(sessionExit)) return yield* Effect.failCause(sessionExit.cause);
       }

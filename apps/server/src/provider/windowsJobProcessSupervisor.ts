@@ -114,9 +114,9 @@ export type NodeProviderProcessSpawnOutcome =
 export interface SupervisePreparedEffectProcessOptions extends WindowsJobStopRequestOptions {
   readonly platform?: NodeJS.Platform;
   readonly processTreeKiller?: ProcessTreeKiller;
-  readonly teardownProcessTree?: Parameters<
-    typeof superviseEffectProcessTree
-  >[1]["teardownProcessTree"];
+  readonly teardownProcessTree?: NonNullable<
+    Parameters<typeof superviseEffectProcessTree>[1]
+  >["teardownProcessTree"];
   readonly ownedProcessGroupId?: number;
   readonly windowsExitTimeoutMs?: number;
 }

@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import type {
   CapturedProcess,
+  CapturedProcessSnapshot,
   CapturedProcessTree,
   ProcessTreeKiller,
   TerminalKillSignal,
@@ -450,7 +451,7 @@ describe("teardownProviderProcessTree", () => {
           identityPrecision: "exact" as const,
         },
       } as const;
-      const snapshotMap = new Map([
+      const snapshotMap = new Map<number, CapturedProcessSnapshot>([
         [snapshot.root.pid, snapshot.root],
         [snapshot.child.pid, snapshot.child],
       ]);

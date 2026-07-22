@@ -131,7 +131,7 @@ describe("spawnContainedClaudeSdkProcess", () => {
     expect(() =>
       spawnContainedClaudeSdkProcess(options, {
         platform: "linux",
-        prepareProcess: (command, args) => ({ command, args, shell: false }),
+        prepareProcess: (command, args) => ({ command, args: [...args], shell: false }),
         spawnProcess: () => {
           calls.push("spawn");
           return child;
@@ -149,12 +149,13 @@ describe("spawnContainedClaudeSdkProcess", () => {
   });
 
   it("observes a PID-less spawn before installing supervision", async () => {
-    const child = Object.assign(new EventEmitter(), {
+    const mutableChild = Object.assign(new EventEmitter(), {
       pid: undefined as number | undefined,
       exitCode: null,
       signalCode: null,
       kill: vi.fn(() => true),
-    }) as unknown as ChildProcess;
+    });
+    const child = mutableChild as unknown as ChildProcess;
     const superviseProcess = vi.fn(() => ({
       rootPid: 404,
       proveExit: vi.fn(),
@@ -172,7 +173,7 @@ describe("spawnContainedClaudeSdkProcess", () => {
         } satisfies ClaudeSpawnOptions,
         {
           platform: "linux",
-          prepareProcess: (command, args) => ({ command, args, shell: false }),
+          prepareProcess: (command, args) => ({ command, args: [...args], shell: false }),
           spawnProcess: () => child,
           superviseProcess,
         },
@@ -180,7 +181,7 @@ describe("spawnContainedClaudeSdkProcess", () => {
     ).toBe(child);
     expect(superviseProcess).not.toHaveBeenCalled();
 
-    child.pid = 404;
+    mutableChild.pid = 404;
     child.emit("spawn");
     await Promise.resolve();
 
@@ -188,12 +189,13 @@ describe("spawnContainedClaudeSdkProcess", () => {
   });
 
   it("surfaces deferred supervision failure without requiring a process error listener", async () => {
-    const child = Object.assign(new EventEmitter(), {
+    const mutableChild = Object.assign(new EventEmitter(), {
       pid: undefined as number | undefined,
       exitCode: null,
       signalCode: null,
       kill: vi.fn(() => true),
-    }) as unknown as ChildProcess;
+    });
+    const child = mutableChild as unknown as ChildProcess;
     const requestedFailure = new Error("deferred supervisor construction failed");
     const onSupervisionError = vi.fn();
 
@@ -206,7 +208,7 @@ describe("spawnContainedClaudeSdkProcess", () => {
       } satisfies ClaudeSpawnOptions,
       {
         platform: "linux",
-        prepareProcess: (command, args) => ({ command, args, shell: false }),
+        prepareProcess: (command, args) => ({ command, args: [...args], shell: false }),
         spawnProcess: () => child,
         superviseProcess: () => {
           throw requestedFailure;
@@ -215,7 +217,7 @@ describe("spawnContainedClaudeSdkProcess", () => {
       },
     );
 
-    child.pid = 405;
+    mutableChild.pid = 405;
     child.emit("spawn");
     await Promise.resolve();
     await Promise.resolve();
@@ -233,12 +235,13 @@ describe("spawnContainedClaudeSdkProcess", () => {
       },
       () => Promise.reject(new Error("callback rejected")),
     ]) {
-      const child = Object.assign(new EventEmitter(), {
+      const mutableChild = Object.assign(new EventEmitter(), {
         pid: undefined as number | undefined,
         exitCode: null,
         signalCode: null,
         kill: vi.fn(() => true),
-      }) as unknown as ChildProcess;
+      });
+      const child = mutableChild as unknown as ChildProcess;
       const supervisionFailure = new Error("original deferred supervision failure");
 
       spawnContainedClaudeSdkProcess(
@@ -250,7 +253,7 @@ describe("spawnContainedClaudeSdkProcess", () => {
         } satisfies ClaudeSpawnOptions,
         {
           platform: "linux",
-          prepareProcess: (command, args) => ({ command, args, shell: false }),
+          prepareProcess: (command, args) => ({ command, args: [...args], shell: false }),
           spawnProcess: () => child,
           superviseProcess: () => {
             throw supervisionFailure;
@@ -259,7 +262,7 @@ describe("spawnContainedClaudeSdkProcess", () => {
         },
       );
 
-      child.pid = 406;
+      mutableChild.pid = 406;
       child.emit("spawn");
       await Promise.resolve();
       await Promise.resolve();
@@ -288,7 +291,7 @@ describe("spawnContainedClaudeSdkProcess", () => {
       } satisfies ClaudeSpawnOptions,
       {
         platform: "linux",
-        prepareProcess: (command, args) => ({ command, args, shell: false }),
+        prepareProcess: (command, args) => ({ command, args: [...args], shell: false }),
         spawnProcess: () => child,
         superviseProcess,
       },

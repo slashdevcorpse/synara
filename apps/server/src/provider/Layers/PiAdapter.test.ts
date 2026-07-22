@@ -161,19 +161,27 @@ describe("Pi Bash process supervision", () => {
       getShellConfig: () => ({ shell: "/bin/sh", args: ["-c"] }),
       platform: "linux",
       spawnProcess: () => child,
-      superviseProcess: (_prepared, process, options) => ({
-        rootPid: Number(process.pid),
-        requestTermination: () => true,
-        proveExit: async () => ({ escalated: false, signalErrors: [] }),
-        teardown: () => {
-          const rootExited = new Promise<void>((resolve) => process.once("exit", () => resolve()));
-          return options.teardownProcessTree!({
-            rootPid: Number(process.pid),
-            rootExited,
-            ownedProcessGroupId: Number(process.pid),
-          });
-        },
-      }),
+      superviseProcess: (_prepared, process, options) => {
+        const teardownProcessTree = options?.teardownProcessTree;
+        if (teardownProcessTree === undefined) {
+          throw new Error("Expected Pi Bash process-tree teardown dependency.");
+        }
+        return {
+          rootPid: Number(process.pid),
+          requestTermination: () => true,
+          proveExit: async () => ({ escalated: false, signalErrors: [] }),
+          teardown: () => {
+            const rootExited = new Promise<void>((resolve) =>
+              process.once("exit", () => resolve()),
+            );
+            return teardownProcessTree({
+              rootPid: Number(process.pid),
+              rootExited,
+              ownedProcessGroupId: Number(process.pid),
+            });
+          },
+        };
+      },
       teardownProcessTree: async (input) => {
         observeTeardown();
         await exitProof;

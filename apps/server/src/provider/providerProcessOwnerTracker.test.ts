@@ -111,14 +111,14 @@ describe("provider process owner tracker", () => {
       await teardownGate;
     });
     const tracker = makeProviderProcessOwnerTracker({
-      provider: "command-code",
+      provider: "commandCode",
       resourcePrefix: "test-process",
       maintenanceOwnedResources: coordinator,
     });
     await Effect.runPromise(tracker.register(makeSupervisor({ rootPid: 4401, teardown })));
 
     const maintenance = Effect.runPromise(
-      coordinator.drainProviderResources({ provider: "command-code" }),
+      coordinator.drainProviderResources({ provider: "commandCode" }),
     );
     await teardownStarted;
     const adapterDrain = Effect.runPromise(tracker.drain);

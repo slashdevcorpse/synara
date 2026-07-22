@@ -2285,7 +2285,7 @@ describe("TerminalManager", () => {
               pid: 4_242,
               command: "provider cli worker",
               identity: "4242:worker-start",
-              groupId: options?.processGroupId,
+              ...(options?.processGroupId === undefined ? {} : { groupId: options.processGroupId }),
             },
           ],
           captureComplete: true,

@@ -1018,7 +1018,20 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
           stopSession(threadId).pipe(Effect.exit),
         );
         const ownedProcessExit = yield* Effect.exit(
-          processOwnerTracker.drainExcluding(activeOwners),
+          processOwnerTracker.drainExcluding(activeOwners).pipe(
+            Effect.mapError(
+              (cause) =>
+                new ProviderAdapterRequestError({
+                  provider: PROVIDER,
+                  method: "stopAll",
+                  detail:
+                    cause instanceof Error
+                      ? cause.message
+                      : "Failed to prove all Command Code process trees exited.",
+                  cause,
+                }),
+            ),
+          ),
         );
         for (const result of results) {
           if (

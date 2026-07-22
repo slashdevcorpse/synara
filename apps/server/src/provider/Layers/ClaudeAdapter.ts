@@ -6,6 +6,8 @@
  *
  * @module ClaudeAdapterLive
  */
+import type { ChildProcess } from "node:child_process";
+
 import {
   type AgentInfo,
   type CanUseTool,
@@ -407,6 +409,7 @@ interface ClaudeProcessOwner {
   readonly closeMutex: Semaphore.Semaphore;
   lifecycle: ClaudeProcessOwnerLifecycle;
   process?: ClaudeOwnedProcess;
+  nodeProcess?: ChildProcess;
   supervisionFailure?: Error;
   teardownProcess?: ClaudeOwnedProcess;
   teardownPromise?: Promise<void>;
@@ -1540,6 +1543,7 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
     const publishClaudeProcessOwner = (
       owner: ClaudeProcessOwner,
       process: ClaudeOwnedProcess,
+      nodeProcess?: ChildProcess,
     ): void => {
       if (
         !processOwners.has(owner) ||
@@ -1554,22 +1558,38 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
         delete owner.teardownPromise;
       }
       owner.process = process;
+      if (nodeProcess === undefined) {
+        delete owner.nodeProcess;
+      } else {
+        owner.nodeProcess = nodeProcess;
+      }
     };
 
     const beginClaudeProcessTeardown = (owner: ClaudeProcessOwner): Promise<void> => {
       const process = owner.process;
       if (!process) return Promise.resolve();
-      if (containedClaudeSdkProcessDidNotSpawn(process)) {
-        if (owner.process === process) delete owner.process;
+      const nodeProcess = owner.nodeProcess;
+      if (nodeProcess !== undefined && containedClaudeSdkProcessDidNotSpawn(nodeProcess)) {
+        if (owner.process === process) {
+          delete owner.process;
+          delete owner.nodeProcess;
+        }
         return Promise.resolve();
       }
       if (owner.teardownProcess === process && owner.teardownPromise) {
         return owner.teardownPromise;
       }
-      const teardownPromise = teardownNodeProviderProcess(process, () =>
-        teardownChildProcessTree(process, teardownProcessTree),
+      const teardownPromise = (
+        nodeProcess === undefined
+          ? teardownChildProcessTree(process, teardownProcessTree)
+          : teardownNodeProviderProcess(nodeProcess, () =>
+              teardownChildProcessTree(nodeProcess, teardownProcessTree),
+            )
       ).then(() => {
-        if (owner.process === process) delete owner.process;
+        if (owner.process === process) {
+          delete owner.process;
+          delete owner.nodeProcess;
+        }
       });
       owner.teardownProcess = process;
       owner.teardownPromise = teardownPromise;
@@ -1703,7 +1723,7 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
             // startup error path can then tear down the exact retained shared supervisor or its
             // generic child-process fallback.
             onSpawnedProcess: ({ process }) => {
-              publishClaudeProcessOwner(owner, process as ClaudeOwnedProcess);
+              publishClaudeProcessOwner(owner, process as ClaudeOwnedProcess, process);
             },
             onSupervisionError: (cause) => {
               if (owner.supervisionFailure) return;

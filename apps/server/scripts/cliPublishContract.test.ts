@@ -58,6 +58,30 @@ describe("assertPatchedEffectProcessSpawnerIsBundled", () => {
     ).not.toThrow();
   });
 
+  it("accepts the unbound makeHandle import call emitted by the CommonJS bundle", () => {
+    const commonJsEntry = structurallyPatchedEntry.replace(
+      "makeHandle({})",
+      "(0, effect_unstable_process_ChildProcessSpawner.makeHandle)({})",
+    );
+    expect(() =>
+      assertPatchedEffectProcessSpawnerIsBundled(
+        entryBundles(structurallyPatchedEntry, commonJsEntry),
+      ),
+    ).not.toThrow();
+  });
+
+  it("rejects noncanonical comma expressions around the CommonJS makeHandle import", () => {
+    const counterfeitCommonJsEntry = structurallyPatchedEntry.replace(
+      "makeHandle({})",
+      "(1, effect_unstable_process_ChildProcessSpawner.makeHandle)({})",
+    );
+    expect(() =>
+      assertPatchedEffectProcessSpawnerIsBundled(
+        entryBundles(structurallyPatchedEntry, counterfeitCommonJsEntry),
+      ),
+    ).toThrow("does not structurally contain");
+  });
+
   it("rejects comment-only and string-only patch marker text", () => {
     const markerText = `
       if (cmd.options.synaraExternallySupervised === true) return yield* Effect.void;

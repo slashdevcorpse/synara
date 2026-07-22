@@ -2342,15 +2342,31 @@ export function makeGrokAdapter(
         const sessionExit = yield* Effect.exit(
           Effect.forEach(Array.from(sessions.values()), stopSessionInternal, { discard: true }),
         );
-        const ownerExit = yield* Effect.exit(modelProcessOwners.drain);
+        const ownerExit = yield* Effect.exit(
+          modelProcessOwners.drain.pipe(
+            Effect.mapError(
+              (cause) =>
+                new ProviderAdapterRequestError({
+                  provider: PROVIDER,
+                  method: "stopAll",
+                  detail:
+                    cause instanceof Error
+                      ? cause.message
+                      : "Failed to prove all Grok process trees exited.",
+                  cause,
+                }),
+            ),
+          ),
+        );
         if (Exit.isFailure(sessionExit)) return yield* Effect.failCause(sessionExit.cause);
         if (Exit.isFailure(ownerExit)) return yield* Effect.failCause(ownerExit.cause);
       });
 
     yield* Effect.addFinalizer(() =>
       stopAll().pipe(
-        Effect.tap(() => PubSub.shutdown(runtimeEventPubSub)),
-        Effect.tap(() => managedNativeEventLogger?.close() ?? Effect.void),
+        Effect.ignore,
+        Effect.ensuring(PubSub.shutdown(runtimeEventPubSub)),
+        Effect.ensuring(managedNativeEventLogger?.close() ?? Effect.void),
       ),
     );
 

@@ -40,6 +40,18 @@ function objectLiteralPropertyNameText(property: ts.ObjectLiteralElementLike): s
   return "name" in property ? propertyNameText(property.name) : undefined;
 }
 
+function isConcreteFunctionLikeDeclaration(node: ts.Node): node is ts.FunctionLikeDeclaration {
+  return (
+    ts.isFunctionDeclaration(node) ||
+    ts.isMethodDeclaration(node) ||
+    ts.isGetAccessorDeclaration(node) ||
+    ts.isSetAccessorDeclaration(node) ||
+    ts.isConstructorDeclaration(node) ||
+    ts.isFunctionExpression(node) ||
+    ts.isArrowFunction(node)
+  );
+}
+
 function staticBooleanValue(expression: ts.Expression): boolean | undefined {
   if (ts.isParenthesizedExpression(expression)) {
     return staticBooleanValue(expression.expression);
@@ -116,10 +128,13 @@ function isNodeReachableWithin(
         return false;
       }
     } else if (
-      (ts.isWhileStatement(parent) || ts.isForStatement(parent)) &&
-      candidate === parent.statement &&
-      parent.expression !== undefined &&
-      staticBooleanValue(parent.expression) === false
+      (ts.isWhileStatement(parent) &&
+        candidate === parent.statement &&
+        staticBooleanValue(parent.expression) === false) ||
+      (ts.isForStatement(parent) &&
+        candidate === parent.statement &&
+        parent.condition !== undefined &&
+        staticBooleanValue(parent.condition) === false)
     ) {
       return false;
     }
@@ -213,7 +228,7 @@ function acquireReleaseFinalizerProof(
   let candidate: ts.Node | undefined = node.parent;
   let finalizer: ts.FunctionLikeDeclaration | undefined;
   while (candidate !== undefined && candidate !== acquireRelease) {
-    if (ts.isFunctionLike(candidate)) {
+    if (isConcreteFunctionLikeDeclaration(candidate)) {
       if (finalizer !== undefined) return undefined;
       finalizer = candidate;
     }
@@ -386,24 +401,26 @@ function isStdinCloseProperty(property: ts.ObjectLiteralElementLike): boolean {
     return false;
   }
 
+  const body = property.initializer.body;
+
   let closesNativeStdin = false;
   const visit = (node: ts.Node): void => {
     if (
       ts.isCallExpression(node) &&
       node.arguments.length === 0 &&
       expressionHasPath(node.expression, ["childProcess", "stdin", "end"]) &&
-      isNodeReachableWithin(node, property.initializer.body)
+      isNodeReachableWithin(node, body)
     ) {
       closesNativeStdin = true;
       return;
     }
     ts.forEachChild(node, visit);
   };
-  visit(property.initializer.body);
+  visit(body);
   return (
     closesNativeStdin &&
-    bindingCountWithin(property.initializer.body, "childProcess") === 0 &&
-    bindingIsNeverReassigned(property.initializer.body, "childProcess")
+    bindingCountWithin(body, "childProcess") === 0 &&
+    bindingIsNeverReassigned(body, "childProcess")
   );
 }
 
@@ -431,6 +448,27 @@ function bindingCountWithin(root: ts.Node, identifier: string): number {
   };
   visit(root);
   return count;
+}
+
+function isBundledMakeHandleCallee(expression: ts.LeftHandSideExpression): boolean {
+  if (ts.isIdentifier(expression)) return expression.text === "makeHandle";
+  if (!ts.isParenthesizedExpression(expression)) return false;
+
+  // Rolldown lowers a named CommonJS import call to `(0, namespace.makeHandle)(...)` so the
+  // imported function is invoked without binding `namespace` as `this`. Accept only that exact
+  // sequence shape; arbitrary comma expressions and direct property calls remain untrusted.
+  const sequence = expression.expression;
+  if (
+    !ts.isBinaryExpression(sequence) ||
+    sequence.operatorToken.kind !== ts.SyntaxKind.CommaToken ||
+    !ts.isNumericLiteral(sequence.left) ||
+    sequence.left.text !== "0" ||
+    !ts.isPropertyAccessExpression(sequence.right)
+  ) {
+    return false;
+  }
+  const calleePath = expressionPath(sequence.right);
+  return calleePath !== undefined && calleePath.length >= 2 && calleePath.at(-1) === "makeHandle";
 }
 
 function directHandleDeclaration(
@@ -462,8 +500,7 @@ function directHandleDeclaration(
     (declaration.parent.flags & ts.NodeFlags.Const) === 0 ||
     declaration.initializer === undefined ||
     !ts.isCallExpression(declaration.initializer) ||
-    !ts.isIdentifier(declaration.initializer.expression) ||
-    declaration.initializer.expression.text !== "makeHandle"
+    !isBundledMakeHandleCallee(declaration.initializer.expression)
   ) {
     return undefined;
   }

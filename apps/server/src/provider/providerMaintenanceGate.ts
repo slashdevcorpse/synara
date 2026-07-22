@@ -79,8 +79,10 @@ export function withProviderMaintenanceOperation<A, E, R, EBusy>(input: {
       run: input.run,
     })
     .pipe(
-      Effect.catchTag("ProviderMaintenanceBusyError", (error) =>
-        Effect.fail(input.mapBusyError(error)),
+      Effect.catchIf(
+        (error): error is ProviderMaintenanceBusyError =>
+          error instanceof ProviderMaintenanceBusyError,
+        (error) => Effect.fail(input.mapBusyError(error)),
       ),
     );
 }
@@ -275,13 +277,7 @@ export const makeProviderMaintenanceGate = Effect.gen(function* () {
               : Effect.void;
           }),
         );
-        const run = restore(
-          Deferred.await(drain).pipe(
-            Effect.andThen(assertNotLatchedAfterDrain),
-            Effect.andThen(input.run),
-          ),
-        );
-        const latchBeforeRelease = run.pipe(
+        const runMaintenance = input.run.pipe(
           Effect.onError((cause) => {
             const unprovenExit = findProviderProcessExitUnprovenError(Cause.squash(cause));
             const reason = unprovenExit?.message ?? input.latchReasonOnFailure?.(cause) ?? null;
@@ -290,9 +286,13 @@ export const makeProviderMaintenanceGate = Effect.gen(function* () {
               : latchProvider({ provider: input.provider, reason });
           }),
         );
-        return yield* latchBeforeRelease.pipe(
-          Effect.ensuring(releaseMaintenance(input.provider, drain)),
+        const run = restore(
+          Deferred.await(drain).pipe(
+            Effect.andThen(assertNotLatchedAfterDrain),
+            Effect.andThen(runMaintenance),
+          ),
         );
+        return yield* run.pipe(Effect.ensuring(releaseMaintenance(input.provider, drain)));
       }),
     );
 

@@ -4254,13 +4254,14 @@ await agent("Draft the spec", { label: "delta-agent", phase: "Two" });
     }) as unknown as ChildProcess;
     const layer = makeClaudeAdapterLive({
       spawnContainedClaudeProcess: (_options, dependencies) => {
-        dependencies.onSpawnedProcess?.({
+        const { onSpawnedProcess, onSupervisionError } = dependencies ?? {};
+        onSpawnedProcess?.({
           prepared: { command: "claude", args: [], shell: false },
           process: child,
           platform: "linux",
         });
         triggerSupervisionFailure = () => {
-          void dependencies.onSupervisionError?.(supervisionFailure);
+          void onSupervisionError?.(supervisionFailure);
         };
         return child;
       },
@@ -4340,13 +4341,14 @@ await agent("Draft the spec", { label: "delta-agent", phase: "Two" });
     }) as unknown as ChildProcess;
     const layer = makeClaudeAdapterLive({
       spawnContainedClaudeProcess: (_options, dependencies) => {
-        dependencies.onSpawnedProcess?.({
+        const { onSpawnedProcess, onSupervisionError } = dependencies ?? {};
+        onSpawnedProcess?.({
           prepared: { command: "claude", args: [], shell: false },
           process: child,
           platform: "linux",
         });
         queueMicrotask(() => {
-          void dependencies.onSupervisionError?.(supervisionFailure);
+          void onSupervisionError?.(supervisionFailure);
         });
         return child;
       },

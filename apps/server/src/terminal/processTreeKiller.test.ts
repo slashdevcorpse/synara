@@ -189,13 +189,13 @@ describe("processTreeKiller", () => {
   });
 
   it("reports an exec-replaced POSIX process instance as a live survivor", () => {
-    const captured: CapturedProcess = {
+    const captured = {
       pid: 103,
       groupId: 100,
       command: "node updater-wrapper.js",
       identity: "103:Mon Jul 20 12:34:56 2026",
       identityPrecision: "seconds",
-    };
+    } satisfies CapturedProcess;
     const killer = createProcessTreeKiller({
       readCurrentProcesses: () =>
         new Map([
@@ -221,13 +221,13 @@ describe("processTreeKiller", () => {
 
   it("refuses to signal an exec-replaced command for the same POSIX process instance", () => {
     const signaledPids: number[] = [];
-    const captured: CapturedProcess = {
+    const captured = {
       pid: 103,
       groupId: 100,
       command: "node updater-wrapper.js",
       identity: "103:Mon Jul 20 12:34:56 2026",
       identityPrecision: "seconds",
-    };
+    } satisfies CapturedProcess;
     const killer = createProcessTreeKiller({
       readCurrentProcesses: () =>
         new Map([

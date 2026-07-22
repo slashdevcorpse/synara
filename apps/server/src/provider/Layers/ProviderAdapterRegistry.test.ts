@@ -379,7 +379,7 @@ it.effect("latches a proxied adapter exit-proof failure before queued maintenanc
       const registryLayer = makeProviderAdapterRegistryLive({
         adapters: [adapter],
         maintenanceGate,
-      });
+      }).pipe(Layer.provide(providerAdapterServices));
       const operation = yield* Effect.gen(function* () {
         const registry = yield* ProviderAdapterRegistry;
         const gated = yield* registry.getByProvider("codex");

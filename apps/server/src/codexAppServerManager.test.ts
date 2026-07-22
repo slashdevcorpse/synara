@@ -554,7 +554,7 @@ describe("Codex app-server teardown", () => {
   }
 
   type RetainedTeardownProcessTree = NonNullable<
-    Parameters<typeof supervisePreparedNodeProcess>[2]["teardownProcessTree"]
+    NonNullable<Parameters<typeof supervisePreparedNodeProcess>[2]>["teardownProcessTree"]
   >;
 
   const createSpontaneousExitHarness = (input: {
@@ -816,8 +816,8 @@ describe("Codex app-server teardown", () => {
     expect(context.session).toMatchObject({
       status: "error",
       activeTurnId: undefined,
+      lastError: expect.stringContaining("injected process-tree proof failure"),
     });
-    expect(context.session.lastError).toContain("injected process-tree proof failure");
     expect(eventMethods).not.toContain("session/exited");
     expect(eventMethods).not.toContain("session/closed");
     expect((context as typeof context & { stopPromise?: Promise<void> }).stopPromise).toBe(

@@ -587,6 +587,7 @@ describe("providerMaintenance", () => {
         capabilities.update.lockKey,
         `npm-global:${normalizeCommandPath(result.npmPrefix, "win32")}`,
       );
+      assert.ok(capabilities.update.pathPrepend);
       assert.strictEqual(
         normalizeCommandPath(capabilities.update.pathPrepend, "win32"),
         normalizeCommandPath(NodePath.win32.dirname(capabilities.update.executable), "win32"),

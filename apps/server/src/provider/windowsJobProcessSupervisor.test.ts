@@ -19,15 +19,19 @@ import {
   superviseWindowsJobEffectProcess,
   superviseWindowsJobNodeProcess,
   teardownNodeProviderProcess,
+  type SupervisePreparedEffectProcessOptions,
+  type WindowsJobEffectProcessHandle,
   WindowsJobProcessExitUnprovenError,
 } from "./windowsJobProcessSupervisor.ts";
 import {
   containPreparedWindowsProviderProcess,
+  isWindowsJobPreparedCommand,
+  type WindowsJobPreparedCommand,
   windowsJobControlFilePath,
 } from "./windowsProviderProcess.ts";
 
-function jobPreparedCommand(controlDirectory = "C:\\Temp"): WindowsSafeProcessCommand {
-  return containPreparedWindowsProviderProcess(
+function jobPreparedCommand(controlDirectory = "C:\\Temp"): WindowsJobPreparedCommand {
+  const prepared = containPreparedWindowsProviderProcess(
     { command: "C:\\tools\\provider.exe", args: [], shell: false, windowsHide: true },
     {
       platform: "win32",
@@ -38,20 +42,26 @@ function jobPreparedCommand(controlDirectory = "C:\\Temp"): WindowsSafeProcessCo
       fileExists: () => true,
     },
   );
+  if (!isWindowsJobPreparedCommand(prepared)) {
+    throw new Error("Expected the Windows fixture command to be Job-prepared.");
+  }
+  return prepared;
 }
 
 function posixPreparedCommand(): WindowsSafeProcessCommand {
   return { command: "/usr/local/bin/provider", args: [], shell: false };
 }
 
-function nodeChild(pid: number): ChildProcess {
+type MutableChildProcess = ChildProcess & { exitCode: number | null };
+
+function nodeChild(pid: number): MutableChildProcess {
   const events = new EventEmitter();
   return Object.assign(events, {
     pid,
     exitCode: null as number | null,
     signalCode: null as NodeJS.Signals | null,
     kill: vi.fn(() => true),
-  }) as unknown as ChildProcess;
+  }) as unknown as MutableChildProcess;
 }
 
 describe("Windows Job exact-handle supervision", () => {
@@ -141,9 +151,9 @@ describe("Windows Job exact-handle supervision", () => {
     };
     const requestedSupervisor = vi.fn(
       (
-        receivedPrepared: typeof prepared,
-        receivedProcess: typeof process,
-        receivedOptions: typeof options,
+        receivedPrepared: WindowsSafeProcessCommand,
+        receivedProcess: WindowsJobEffectProcessHandle,
+        receivedOptions?: SupervisePreparedEffectProcessOptions,
       ) => {
         expect(receivedPrepared).toBe(prepared);
         expect(receivedProcess).toBe(process);
@@ -183,9 +193,9 @@ describe("Windows Job exact-handle supervision", () => {
     const options = { platform: "win32" as const, verifyExit };
     const requestedSupervisor = vi.fn(
       (
-        receivedPrepared: typeof prepared,
+        receivedPrepared: WindowsSafeProcessCommand,
         receivedProcess: ChildProcess,
-        receivedOptions: typeof options,
+        receivedOptions?: SupervisePreparedEffectProcessOptions,
       ) => {
         expect(receivedPrepared).toBe(prepared);
         expect(receivedProcess).toBe(child);
@@ -218,7 +228,7 @@ describe("Windows Job exact-handle supervision", () => {
       exitCode: null as number | null,
       signalCode: null as NodeJS.Signals | null,
       kill: vi.fn(() => false),
-    }) as unknown as ChildProcess;
+    }) as unknown as MutableChildProcess;
     const spawnOutcome = observeNodeProviderProcessSpawn(child);
     const requestedSupervisorFailure = new Error("injected Node supervisor failed");
     let installationFailure: unknown;
@@ -269,7 +279,7 @@ describe("Windows Job exact-handle supervision", () => {
       exitCode: null as number | null,
       signalCode: null as NodeJS.Signals | null,
       kill: vi.fn(() => false),
-    }) as unknown as ChildProcess;
+    }) as unknown as MutableChildProcess;
     const spawnOutcome = observeNodeProviderProcessSpawn(child);
     const spawnFailure = new Error("spawn event did not establish a process identity");
 
@@ -368,7 +378,7 @@ describe("Windows Job exact-handle supervision", () => {
       signalCode: null as NodeJS.Signals | null,
       kill: rawKill,
       killed: false,
-    }) as unknown as ChildProcess;
+    }) as unknown as MutableChildProcess;
     const supervisor = superviseWindowsJobNodeProcess(jobPreparedCommand(), child, {
       requestStop,
       verifyExit,
@@ -395,7 +405,7 @@ describe("Windows Job exact-handle supervision", () => {
       signalCode: null as NodeJS.Signals | null,
       kill: rawKill,
       killed: false,
-    }) as unknown as ChildProcess;
+    }) as unknown as MutableChildProcess;
     superviseWindowsJobNodeProcess(jobPreparedCommand(), child, { requestStop });
 
     expect(child.kill(0)).toBe(true);
@@ -447,7 +457,7 @@ describe("Windows Job exact-handle supervision", () => {
       exitCode: null as number | null,
       signalCode: null as NodeJS.Signals | null,
       kill: rawKill,
-    }) as unknown as ChildProcess;
+    }) as unknown as MutableChildProcess;
     const supervisor = superviseWindowsJobNodeProcess(jobPreparedCommand(), child, {
       requestStop,
       verifyExit,
@@ -481,7 +491,7 @@ describe("Windows Job exact-handle supervision", () => {
           events.emit("exit", 143, null);
           return true;
         },
-      }) as unknown as ChildProcess;
+      }) as unknown as MutableChildProcess;
       const supervisor = superviseWindowsJobNodeProcess(prepared, child, {
         requestStop: async () => {
           throw new Error("control failure");
@@ -521,7 +531,7 @@ describe("Windows Job exact-handle supervision", () => {
         exitCode: null as number | null,
         signalCode: null as NodeJS.Signals | null,
         kill: rawKill,
-      }) as unknown as ChildProcess;
+      }) as unknown as MutableChildProcess;
       const supervisor = superviseWindowsJobNodeProcess(jobPreparedCommand(), child, {
         requestStop,
         verifyExit,
@@ -723,7 +733,9 @@ describe("Windows Job exact-handle supervision", () => {
     const capture = vi.fn(() => ({ root, descendants: [], captureComplete: true }));
     let teardownInput:
       | Parameters<
-          NonNullable<Parameters<typeof supervisePreparedNodeProcess>[2]["teardownProcessTree"]>
+          NonNullable<
+            NonNullable<Parameters<typeof supervisePreparedNodeProcess>[2]>["teardownProcessTree"]
+          >
         >[0]
       | undefined;
     const supervisor = supervisePreparedNodeProcess(posixPreparedCommand(), child, {
@@ -736,7 +748,7 @@ describe("Windows Job exact-handle supervision", () => {
       },
       teardownProcessTree: async (input) => {
         teardownInput = input;
-        (child as ChildProcess & { exitCode: number | null }).exitCode = 0;
+        child.exitCode = 0;
         child.emit("exit", 0, null);
         await input.rootExited;
         return { escalated: false, signalErrors: [] };
@@ -756,14 +768,16 @@ describe("Windows Job exact-handle supervision", () => {
     const fallback = vi.fn(async () => ({ fallback: true }));
     let teardownInput:
       | Parameters<
-          NonNullable<Parameters<typeof supervisePreparedNodeProcess>[2]["teardownProcessTree"]>
+          NonNullable<
+            NonNullable<Parameters<typeof supervisePreparedNodeProcess>[2]>["teardownProcessTree"]
+          >
         >[0]
       | undefined;
     supervisePreparedNodeProcess(posixPreparedCommand(), child, {
       platform: "linux",
       teardownProcessTree: async (input) => {
         teardownInput = input;
-        (child as ChildProcess & { exitCode: number | null }).exitCode = 0;
+        child.exitCode = 0;
         child.emit("exit", 0, null);
         await input.rootExited;
         return { escalated: false, signalErrors: [] };

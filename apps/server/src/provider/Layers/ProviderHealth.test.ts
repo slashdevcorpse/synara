@@ -27,7 +27,10 @@ import {
   writeProviderStatusCache,
 } from "../providerStatusCache";
 import { makeProviderMaintenanceGate } from "../providerMaintenanceGate.ts";
-import { makeProviderMaintenanceOwnedResourceCoordinator } from "../providerMaintenanceOwnedResources.ts";
+import {
+  makeProviderMaintenanceOwnedResourceCoordinator,
+  type ProviderMaintenanceOwnedResourceCoordinator,
+} from "../providerMaintenanceOwnedResources.ts";
 import {
   ProviderProcessExitUnprovenError,
   superviseEffectProcessTree,
@@ -84,7 +87,7 @@ const TEST_PROVIDER_PROCESS_OPTIONS = {
 
 const TEST_REAL_PROVIDER_PROCESS_OPTIONS = {
   platform: "win32",
-  superviseProcess: (_prepared, child, options) =>
+  superviseProcess: (_prepared, child, options = {}) =>
     options.processTreeKiller
       ? superviseEffectProcessTree(child, {
           platform: "win32",
@@ -484,7 +487,7 @@ function effectSpawnerLayer(
     command: string,
     env: NodeJS.ProcessEnv | undefined,
     options: TestProcessCommandOptions | undefined,
-  ) => Effect.Effect<ReturnType<typeof mockHandle>>,
+  ) => Effect.Effect<ChildProcessSpawner.ChildProcessHandle>,
 ) {
   return Layer.succeed(
     ChildProcessSpawner.ChildProcessSpawner,
@@ -506,7 +509,7 @@ function provisionalOwnerSpawnerLayer(
     command: string,
     env: NodeJS.ProcessEnv | undefined,
     options: TestProcessCommandOptions | undefined,
-  ) => Effect.Effect<ReturnType<typeof mockHandle>>,
+  ) => Effect.Effect<ChildProcessSpawner.ChildProcessHandle>,
 ) {
   return Layer.succeed(
     ChildProcessSpawner.ChildProcessSpawner,
@@ -520,7 +523,9 @@ function provisionalOwnerSpawnerLayer(
       return Effect.acquireRelease(
         handler(unwrapped.args, unwrapped.command, unwrapped.options?.env, unwrapped.options),
         (handle) =>
-          unwrapped.options?.synaraExternallySupervised === true ? Effect.void : handle.kill(),
+          unwrapped.options?.synaraExternallySupervised === true
+            ? Effect.void
+            : handle.kill().pipe(Effect.orDie),
       );
     }),
   );
@@ -864,7 +869,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
             killed = true;
             return Promise.resolve({ escalated: false, signalErrors: [] });
           },
-          superviseProcess: (_prepared, child, options) =>
+          superviseProcess: (_prepared, child, options = {}) =>
             superviseEffectProcessTree(child, {
               platform: "linux",
               ownedProcessGroupId: Number(child.pid),
@@ -943,7 +948,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
 
         const status = yield* makeProductionCheckKiloProviderStatus("kilo", {
           platform: "win32",
-          prepareProcess: (command, args) => ({ command, args, shell: false }),
+          prepareProcess: (command, args) => ({ command, args: [...args], shell: false }),
         }).pipe(
           Effect.provide(
             provisionalOwnerSpawnerLayer((_args, _command, _env, options) => {
@@ -1017,7 +1022,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
       const supervised: Array<{ readonly pid: number; readonly groupId: number | undefined }> = [];
       return makeProductionCheckKiloProviderStatus("kilo", {
         platform: "linux",
-        superviseProcess: (prepared, child, options) => {
+        superviseProcess: (prepared, child, options = {}) => {
           supervised.push({
             pid: Number(child.pid),
             groupId: options.ownedProcessGroupId,
@@ -1487,7 +1492,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
               prepareProcess: (command, args, options) => {
                 if (isUpdateCommand(args)) {
                   updatePrepareHits += 1;
-                  return { command, args, shell: false };
+                  return { command, args: [...args], shell: false };
                 }
                 return prepareWindowsProviderProcess(command, args, {
                   ...options,
@@ -1564,7 +1569,9 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
               getOutputFd: () => Stream.never,
             });
             const maintenanceOwnedResources = {
-              register: (resource) =>
+              register: (
+                resource: Parameters<ProviderMaintenanceOwnedResourceCoordinator["register"]>[0],
+              ) =>
                 resource.resourceId.startsWith("provider-update:")
                   ? Effect.sync(() => lifecycle.push("register")).pipe(
                       Effect.andThen(Effect.fail(registrationFailure)),

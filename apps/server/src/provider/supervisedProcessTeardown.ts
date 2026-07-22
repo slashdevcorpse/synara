@@ -703,13 +703,15 @@ export async function teardownProviderProcessTree(
     },
     () => false,
   );
-  const capturedTree =
-    input.capturedTree ??
-    (deps.processTreeKiller.captureAsync
-      ? await deps.processTreeKiller.captureAsync(input.rootPid, captureOptions)
-      : await Promise.resolve().then(() =>
-          deps.processTreeKiller.capture(input.rootPid, captureOptions),
-        ));
+  let capturedTree = input.capturedTree;
+  if (capturedTree === undefined) {
+    capturedTree =
+      deps.processTreeKiller.captureAsync === undefined
+        ? await Promise.resolve().then(() =>
+            deps.processTreeKiller.capture(input.rootPid, captureOptions),
+          )
+        : await deps.processTreeKiller.captureAsync(input.rootPid, captureOptions);
+  }
   captureFinished = true;
   // Flush a root-exit resolution queued in the same turn as capture completion. Then allow every
   // already-queued wrapper reaction to settle before deciding whether the numeric root is safe.
@@ -723,12 +725,14 @@ export async function teardownProviderProcessTree(
   });
   // A capture that starts without a caller-supplied ownership snapshot and finishes after root exit
   // cannot prove continuity. Even an explicitly selected numeric POSIX group could have emptied and
-  // been reused before the snapshot completed.
+  // been reused before the snapshot completed. An invalid capture implementation that returns no
+  // tree is likewise incomplete and must never become successful exit proof.
   const capturedAfterUnsafeRootExit =
     input.capturedTree === undefined && rootExitedBeforeCaptureFinished;
-  let tree: CapturedProcessTree = capturedAfterUnsafeRootExit
-    ? { descendants: [], captureComplete: false }
-    : capturedTree;
+  let tree: CapturedProcessTree =
+    capturedAfterUnsafeRootExit || capturedTree === undefined
+      ? { descendants: [], captureComplete: false }
+      : capturedTree;
 
   const signal = async (
     killSignal: TerminalKillSignal,
