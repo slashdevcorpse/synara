@@ -86,15 +86,18 @@ const TEST_PROVIDER_PROCESS_OPTIONS = {
 } as const satisfies ProviderHealthProcessOptions;
 
 const TEST_REAL_PROVIDER_PROCESS_OPTIONS = {
-  platform: "win32",
+  platform: process.platform,
   superviseProcess: (_prepared, child, options = {}) =>
     options.processTreeKiller
       ? superviseEffectProcessTree(child, {
-          platform: "win32",
+          platform: options.platform ?? process.platform,
           processTreeKiller: options.processTreeKiller,
           ...(options.teardownProcessTree
             ? { teardownProcessTree: options.teardownProcessTree }
             : {}),
+          ...(options.ownedProcessGroupId === undefined
+            ? {}
+            : { ownedProcessGroupId: options.ownedProcessGroupId }),
         })
       : TEST_PROVIDER_PROCESS_OPTIONS.superviseProcess(_prepared, child),
 } as const satisfies ProviderHealthProcessOptions;
@@ -1450,95 +1453,97 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
   });
 
   describe("provider update commands", () => {
-    it.effect("keeps Effect cleanup when the default updater supervisor constructor fails", () =>
-      withKiloUpdateFixture("7.4.10", (input) =>
-        withLatestNpmVersion(
-          "7.4.11",
-          Effect.gen(function* () {
-            const lifecycle: string[] = [];
-            const expectedUpdateArgs = [
-              "install",
-              "-g",
-              "--prefix",
-              input.npmPrefix,
-              "@kilocode/cli@latest",
-            ] as const;
-            const isUpdateCommand = (args: ReadonlyArray<string>) =>
-              args.length === expectedUpdateArgs.length &&
-              expectedUpdateArgs.every((expected, index) => args[index] === expected);
-            let updatePrepareHits = 0;
-            const updateHandle = ChildProcessSpawner.makeHandle({
-              pid: ChildProcessSpawner.ProcessId(86),
-              exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(0)),
-              isRunning: Effect.succeed(false),
-              kill: () =>
-                Effect.sync(() => {
-                  lifecycle.push("provisional");
-                }),
-              stdin: Sink.drain,
-              stdout: Stream.make(encoder.encode("updated\n")),
-              stderr: Stream.empty,
-              all: Stream.empty,
-              getInputFd: () => Sink.drain,
-              getOutputFd: () => Stream.empty,
-            });
-            const layer = makeProductionProviderHealthLive({
-              platform: "win32",
-              processTreeKiller: syntheticProcessTreeKiller(1),
-              windowsJobSupervisorOptions: {
-                requestStop: () => Promise.resolve(),
-                verifyExit: () => Promise.resolve(),
-              },
-              prepareProcess: (command, args, options) => {
-                if (isUpdateCommand(args)) {
-                  updatePrepareHits += 1;
-                  return { command, args: [...args], shell: false };
-                }
-                return prepareWindowsProviderProcess(command, args, {
-                  ...options,
-                  platform: "win32",
-                  launcherPath: "C:\\Synara\\synara-windows-job-launcher.exe",
-                  fileExists: () => true,
-                  controlDirectory: input.baseDir,
-                });
-              },
-            }).pipe(
-              Layer.provideMerge(providerServiceWithoutRuntimesLayer),
-              Layer.provideMerge(ServerSettingsService.layerTest(input.settings)),
-              Layer.provideMerge(ServerConfig.layerTest(process.cwd(), input.baseDir)),
-              Layer.provideMerge(
-                provisionalOwnerSpawnerLayer((args, _command, _env, options) => {
+    it.effect.skipIf(process.platform !== "win32")(
+      "keeps Effect cleanup when the default updater supervisor constructor fails",
+      () =>
+        withKiloUpdateFixture("7.4.10", (input) =>
+          withLatestNpmVersion(
+            "7.4.11",
+            Effect.gen(function* () {
+              const lifecycle: string[] = [];
+              const expectedUpdateArgs = [
+                "install",
+                "-g",
+                "--prefix",
+                input.npmPrefix,
+                "@kilocode/cli@latest",
+              ] as const;
+              const isUpdateCommand = (args: ReadonlyArray<string>) =>
+                args.length === expectedUpdateArgs.length &&
+                expectedUpdateArgs.every((expected, index) => args[index] === expected);
+              let updatePrepareHits = 0;
+              const updateHandle = ChildProcessSpawner.makeHandle({
+                pid: ChildProcessSpawner.ProcessId(86),
+                exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(0)),
+                isRunning: Effect.succeed(false),
+                kill: () =>
+                  Effect.sync(() => {
+                    lifecycle.push("provisional");
+                  }),
+                stdin: Sink.drain,
+                stdout: Stream.make(encoder.encode("updated\n")),
+                stderr: Stream.empty,
+                all: Stream.empty,
+                getInputFd: () => Sink.drain,
+                getOutputFd: () => Stream.empty,
+              });
+              const layer = makeProductionProviderHealthLive({
+                platform: "win32",
+                processTreeKiller: syntheticProcessTreeKiller(1),
+                windowsJobSupervisorOptions: {
+                  requestStop: () => Promise.resolve(),
+                  verifyExit: () => Promise.resolve(),
+                },
+                prepareProcess: (command, args, options) => {
                   if (isUpdateCommand(args)) {
-                    lifecycle.push(
-                      options?.synaraExternallySupervised === true
-                        ? "external"
-                        : "provisional-owned",
-                    );
-                    return Effect.succeed(updateHandle);
+                    updatePrepareHits += 1;
+                    return { command, args: [...args], shell: false };
                   }
-                  return Effect.succeed(
-                    mockHandle({ stdout: "kilo 7.4.10\n", stderr: "", code: 0 }),
-                  );
-                }),
-              ),
-            );
+                  return prepareWindowsProviderProcess(command, args, {
+                    ...options,
+                    platform: "win32",
+                    launcherPath: "C:\\Synara\\synara-windows-job-launcher.exe",
+                    fileExists: () => true,
+                    controlDirectory: input.baseDir,
+                  });
+                },
+              }).pipe(
+                Layer.provideMerge(providerServiceWithoutRuntimesLayer),
+                Layer.provideMerge(ServerSettingsService.layerTest(input.settings)),
+                Layer.provideMerge(ServerConfig.layerTest(process.cwd(), input.baseDir)),
+                Layer.provideMerge(
+                  provisionalOwnerSpawnerLayer((args, _command, _env, options) => {
+                    if (isUpdateCommand(args)) {
+                      lifecycle.push(
+                        options?.synaraExternallySupervised === true
+                          ? "external"
+                          : "provisional-owned",
+                      );
+                      return Effect.succeed(updateHandle);
+                    }
+                    return Effect.succeed(
+                      mockHandle({ stdout: "kilo 7.4.10\n", stderr: "", code: 0 }),
+                    );
+                  }),
+                ),
+              );
 
-            const result = yield* Effect.gen(function* () {
-              const providerHealth = yield* ProviderHealth;
-              return yield* providerHealth.updateProvider({ provider: "kilo" });
-            }).pipe(Effect.provide(layer));
-            const kilo = result.providers.find((status) => status.provider === "kilo");
+              const result = yield* Effect.gen(function* () {
+                const providerHealth = yield* ProviderHealth;
+                return yield* providerHealth.updateProvider({ provider: "kilo" });
+              }).pipe(Effect.provide(layer));
+              const kilo = result.providers.find((status) => status.provider === "kilo");
 
-            assert.strictEqual(updatePrepareHits, 1);
-            assert.strictEqual(kilo?.updateState?.status, "failed");
-            assert.match(
-              kilo?.updateState?.message ?? "",
-              /without Job-prepared command provenance/u,
-            );
-            assert.deepStrictEqual(lifecycle, ["provisional-owned", "provisional"]);
-          }),
+              assert.strictEqual(updatePrepareHits, 1);
+              assert.strictEqual(kilo?.updateState?.status, "failed");
+              assert.match(
+                kilo?.updateState?.message ?? "",
+                /without Job-prepared command provenance/u,
+              );
+              assert.deepStrictEqual(lifecycle, ["provisional-owned", "provisional"]);
+            }),
+          ),
         ),
-      ),
     );
 
     it.effect("runs exact updater cleanup before provisional cleanup when registration fails", () =>
@@ -1634,6 +1639,8 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
 
             const layer = makeProviderHealthLive({
               maintenanceOwnedResources: coordinator,
+              processTreeKiller: syntheticProcessTreeKiller(1),
+              teardownProcessTree: () => teardown(),
               windowsJobSupervisorOptions: {
                 requestStop: () => Promise.resolve(),
                 verifyExit: async () => {
@@ -1724,6 +1731,8 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
             const layer = makeProviderHealthLive({
               maintenanceGate,
               maintenanceOwnedResources: coordinator,
+              processTreeKiller: syntheticProcessTreeKiller(1),
+              teardownProcessTree: () => teardown(),
               windowsJobSupervisorOptions: {
                 requestStop: () => Promise.resolve(),
                 verifyExit: async () => {
@@ -4084,7 +4093,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
         const status = yield* makeProductionCheckCodexProviderStatus(
           "C:\\tools(x86)\\codex.cmd",
           undefined,
-          TEST_PROVIDER_LAYER_PROCESS_OPTIONS,
+          { ...TEST_PROVIDER_LAYER_PROCESS_OPTIONS, platform: "win32" },
         );
         assert.strictEqual(status.status, "ready");
       }).pipe(
