@@ -42,6 +42,10 @@ import type { WindowsUnsignedAuthenticodeEvidence } from "./windows-authenticode
 export type WindowsRegistryHive = "HKCU" | "HKLM";
 export type WindowsRegistryView = "32" | "64";
 export type WindowsRegistrationKind = "install" | "uninstall";
+export type WindowsInstallerCommandPhase = "install" | "uninstall";
+
+export const NSIS_INSTALL_TIMEOUT_MS = 600_000;
+export const NSIS_UNINSTALL_TIMEOUT_MS = 180_000;
 
 export interface WindowsRegistryTarget {
   readonly id: string;
@@ -67,10 +71,15 @@ export interface WindowsCommandSpec {
   readonly args: ReadonlyArray<string>;
   readonly env?: NodeJS.ProcessEnv;
   readonly timeoutMs: number;
+  readonly phase: WindowsInstallerCommandPhase;
   readonly label: string;
 }
 
 export function runNativeWindowsCommand(spec: WindowsCommandSpec): void {
+  const startedAt = Date.now();
+  console.info(
+    `[windows-installer-qualification] phase=${spec.phase} status=started label=${JSON.stringify(spec.label)} timeoutMs=${spec.timeoutMs}`,
+  );
   const result = spawnSync(spec.command, [...spec.args], {
     env: spec.env,
     shell: false,
@@ -81,10 +90,20 @@ export function runNativeWindowsCommand(spec: WindowsCommandSpec): void {
     // spawnSync waiting until timeout even though the installer returned status 0.
     stdio: "ignore",
   });
-  if (result.error) throw new Error(`${spec.label} could not complete: ${result.error.message}`);
-  if (result.status !== 0) {
-    throw new Error(`${spec.label} failed with exit ${result.status ?? "unknown"}.`);
+  const elapsedMs = Math.max(0, Date.now() - startedAt);
+  if (result.error) {
+    throw new Error(
+      `${spec.label} could not complete (phase=${spec.phase}, elapsedMs=${elapsedMs}, timeoutMs=${spec.timeoutMs}): ${result.error.message}`,
+    );
   }
+  if (result.status !== 0) {
+    throw new Error(
+      `${spec.label} failed with exit ${result.status ?? "unknown"} (phase=${spec.phase}, elapsedMs=${elapsedMs}, timeoutMs=${spec.timeoutMs}).`,
+    );
+  }
+  console.info(
+    `[windows-installer-qualification] phase=${spec.phase} status=completed label=${JSON.stringify(spec.label)} exit=0 elapsedMs=${elapsedMs} timeoutMs=${spec.timeoutMs}`,
+  );
 }
 
 export interface WindowsExecutableIdentity {
@@ -340,7 +359,8 @@ export function createSilentInstallerCommand(
     command: resolveQualificationPath(installerPath),
     args: ["/S", `/D=${resolveQualificationPath(installDirectory)}`],
     env,
-    timeoutMs: 180_000,
+    timeoutMs: NSIS_INSTALL_TIMEOUT_MS,
+    phase: "install",
     label: `silent installer ${basename(installerPath)}`,
   };
 }
@@ -435,7 +455,8 @@ function validateRegistration(
       command: parsed.command,
       args: parsed.args,
       env: paths.environment,
-      timeoutMs: 180_000,
+      timeoutMs: NSIS_UNINSTALL_TIMEOUT_MS,
+      phase: "uninstall",
       label: `silent ${identity.displayName} uninstaller`,
     },
   };
@@ -669,7 +690,8 @@ async function cleanupAttemptedInstallation(
         command: paths.uninstallerPath,
         args: ["/currentuser", "/S"],
         env: paths.environment,
-        timeoutMs: 180_000,
+        timeoutMs: NSIS_UNINSTALL_TIMEOUT_MS,
+        phase: "uninstall",
         label: `owned partial-install ${identity.displayName} uninstaller`,
       };
     }
