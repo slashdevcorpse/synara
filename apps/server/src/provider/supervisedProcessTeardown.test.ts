@@ -1,4 +1,9 @@
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { describe, expect, it, vi } from "vitest";
+import { Effect } from "effect";
 
 import {
   createProcessTreeKiller,
@@ -11,9 +16,13 @@ import {
 import {
   ProviderProcessExitUnprovenError,
   teardownChildProcessTree,
+  teardownEffectProcessTree,
   teardownProviderProcessTree,
 } from "./supervisedProcessTeardown";
-import { markWindowsProviderProcessSpawn } from "./windowsProviderProcess.ts";
+import {
+  markWindowsProviderProcessSpawn,
+  windowsProviderProcessExitProofError,
+} from "./windowsProviderProcess.ts";
 
 function deterministicClock() {
   let now = 0;
@@ -22,6 +31,7 @@ function deterministicClock() {
     sleep: async (milliseconds: number) => {
       now += milliseconds;
     },
+    yieldToEventLoop: async () => undefined,
   };
 }
 
@@ -258,13 +268,13 @@ describe("teardownProviderProcessTree", () => {
         platform: "win32",
         captureWindowsSnapshot: async (signal) => {
           snapshotCalls += 1;
-          if (snapshotCalls === 3) {
+          if (snapshotCalls === 4) {
             forcePreparationSignal = signal;
             forcePreparationStarted.resolve();
             await releaseForcePreparation.promise;
             return snapshot;
           }
-          if (snapshotCalls > 3) {
+          if (snapshotCalls > 4) {
             return { kind: "unknown", reason: "capture_failed" };
           }
           return snapshot;
@@ -546,17 +556,203 @@ describe("teardownProviderProcessTree", () => {
     });
   });
 
-  it("uses root-tree signaling instead of PID capture for an explicitly marked launcher", async () => {
+  it("accepts an already-exited exact marked launcher without reusing its PID", async () => {
     let captureCalls = 0;
     let signalCalls = 0;
+    const receiptDirectory = mkdtempSync(join(tmpdir(), "synara-job-receipt-"));
+    const completionReceipt = {
+      path: join(receiptDirectory, "job-empty.receipt"),
+      token: "node-job-empty-proof",
+    };
+    writeFileSync(completionReceipt.path, `${completionReceipt.token}\n451\n`, "utf8");
+    const markedChild = {
+      pid: 451,
+      exitCode: 0,
+      signalCode: null,
+      once: vi.fn(),
+      removeListener: vi.fn(),
+    };
+    markWindowsProviderProcessSpawn(
+      markedChild,
+      {
+        command: "C:\\Synara\\synara-windows-job-launcher.exe",
+        args: [],
+        shell: false,
+        containment: "windows-job-object",
+        completionReceipt,
+      },
+      true,
+    );
+
+    try {
+      await expect(
+        teardownChildProcessTree(markedChild, (input) =>
+          teardownProviderProcessTree(input, {
+            processTreeKiller: {
+              capture: () => {
+                captureCalls += 1;
+                throw new Error("capture must not run for an exited marked launcher");
+              },
+              signal: async () => {
+                signalCalls += 1;
+                throw new Error("signal must not run for an exited marked launcher");
+              },
+            },
+          }),
+        ),
+      ).resolves.toEqual({ escalated: false, signalErrors: [] });
+      expect(captureCalls).toBe(0);
+      expect(signalCalls).toBe(0);
+      expect(markedChild.once).not.toHaveBeenCalled();
+    } finally {
+      rmSync(receiptDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("shares cached Job-empty proof across concurrent teardown owners", async () => {
+    const receiptDirectory = mkdtempSync(join(tmpdir(), "synara-job-receipt-"));
+    const completionReceipt = {
+      path: join(receiptDirectory, "job-empty.receipt"),
+      token: "shared-job-empty-proof",
+    };
+    writeFileSync(completionReceipt.path, `${completionReceipt.token}\n453\n`, "utf8");
+    const markedChild = {
+      pid: 453,
+      exitCode: 0,
+      signalCode: null,
+      once: vi.fn(),
+      removeListener: vi.fn(),
+    };
+    markWindowsProviderProcessSpawn(
+      markedChild,
+      {
+        command: "C:\\Synara\\synara-windows-job-launcher.exe",
+        args: [],
+        shell: false,
+        containment: "windows-job-object",
+        completionReceipt,
+      },
+      true,
+    );
+
+    try {
+      await expect(
+        Promise.all([teardownChildProcessTree(markedChild), teardownChildProcessTree(markedChild)]),
+      ).resolves.toEqual([
+        { escalated: false, signalErrors: [] },
+        { escalated: false, signalErrors: [] },
+      ]);
+    } finally {
+      rmSync(receiptDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("records structural child exit before consuming its PID-bound Job-empty receipt", async () => {
+    const receiptDirectory = mkdtempSync(join(tmpdir(), "synara-effect-job-receipt-"));
+    const completionReceipt = {
+      path: join(receiptDirectory, "job-empty.receipt"),
+      token: "effect-job-empty-proof",
+    };
+    const childExit = deferred<number>();
+    const markedChild = {
+      pid: 454,
+      exitCode: Effect.promise(() => childExit.promise),
+    };
+    markWindowsProviderProcessSpawn(
+      markedChild,
+      {
+        command: "C:\\Synara\\synara-windows-job-launcher.exe",
+        args: [],
+        shell: false,
+        containment: "windows-job-object",
+        completionReceipt,
+      },
+      true,
+    );
+    writeFileSync(completionReceipt.path, `${completionReceipt.token}\n454\n`, "utf8");
+
+    try {
+      expect(windowsProviderProcessExitProofError(markedChild)).toBeInstanceOf(Error);
+      await expect(
+        teardownEffectProcessTree(markedChild, async (input) => {
+          expect(input.descendantExitProof).toBe("windows-job-empty-on-exit");
+          childExit.resolve(0);
+          expect(await input.rootExitProof).toBe(true);
+          return { escalated: false, signalErrors: [] };
+        }),
+      ).resolves.toEqual({ escalated: false, signalErrors: [] });
+      expect(windowsProviderProcessExitProofError(markedChild)).toBeUndefined();
+    } finally {
+      rmSync(receiptDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed when a marked launcher exits without its Job-empty receipt", async () => {
+    let captureCalls = 0;
+    let signalCalls = 0;
+    const externallyExitedChild = {
+      pid: 452,
+      exitCode: 1,
+      signalCode: null,
+      once: vi.fn(),
+      removeListener: vi.fn(),
+    };
+    markWindowsProviderProcessSpawn(
+      externallyExitedChild,
+      {
+        command: "C:\\Synara\\synara-windows-job-launcher.exe",
+        args: [],
+        shell: false,
+        containment: "windows-job-object",
+      },
+      true,
+    );
+
+    const failure = await teardownChildProcessTree(externallyExitedChild, (input) =>
+      teardownProviderProcessTree(input, {
+        processTreeKiller: {
+          capture: () => {
+            captureCalls += 1;
+            throw new Error("capture must not run for an exited marked launcher");
+          },
+          signal: async () => {
+            signalCalls += 1;
+            throw new Error("signal must not run for an exited marked launcher");
+          },
+        },
+      }),
+    ).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(ProviderProcessExitUnprovenError);
+    expect(failure).toMatchObject({
+      rootPid: 452,
+      rootExited: true,
+      descendantExitProof: "not-captured",
+      rootTreeSignalSucceeded: false,
+    });
+    expect(captureCalls).toBe(0);
+    expect(signalCalls).toBe(0);
+  });
+
+  it("uses cooperative named-Job termination and receipt proof for a marked launcher", async () => {
+    let captureCalls = 0;
+    let signalCalls = 0;
+    let terminationRequests = 0;
     const rootExit = deferred<void>();
+    const rootExitProof = deferred<boolean>();
 
     await expect(
       teardownProviderProcessTree(
         {
           rootPid: 451,
           rootExited: rootExit.promise,
-          descendantExitProof: "root-tree-signal",
+          descendantExitProof: "windows-job-empty-on-exit",
+          rootExitProof: rootExitProof.promise,
+          requestWindowsJobTermination: async () => {
+            terminationRequests += 1;
+            rootExitProof.resolve(true);
+            rootExit.resolve(undefined);
+          },
           termGraceMs: 5,
           forceExitMs: 5,
         },
@@ -569,7 +765,6 @@ describe("teardownProviderProcessTree", () => {
             inspect: () => ({ verified: true, survivors: [] }),
             signal: async ({ includeRootTree }) => {
               signalCalls += 1;
-              rootExit.resolve(undefined);
               return { rootTreeSignalSucceeded: includeRootTree === true };
             },
           },
@@ -578,19 +773,36 @@ describe("teardownProviderProcessTree", () => {
       ),
     ).resolves.toEqual({ escalated: false, signalErrors: [] });
     expect(captureCalls).toBe(0);
-    expect(signalCalls).toBe(1);
+    expect(terminationRequests).toBe(1);
+    expect(signalCalls).toBe(0);
   });
 
-  it("waits beyond the exit grace for delayed root-tree signal proof", async () => {
-    let signalCalls = 0;
+  it("stops waiting on a pending Job controller when the owner receipt arrives first", async () => {
     const rootExit = deferred<void>();
+    const rootExitProof = deferred<boolean>();
+    let controllerAborted = false;
 
     await expect(
       teardownProviderProcessTree(
         {
-          rootPid: 452,
+          rootPid: 455,
           rootExited: rootExit.promise,
-          descendantExitProof: "root-tree-signal",
+          descendantExitProof: "windows-job-empty-on-exit",
+          rootExitProof: rootExitProof.promise,
+          requestWindowsJobTermination: (abortSignal) => {
+            rootExitProof.resolve(true);
+            rootExit.resolve(undefined);
+            return new Promise<void>((_resolve, reject) => {
+              abortSignal.addEventListener(
+                "abort",
+                () => {
+                  controllerAborted = true;
+                  reject(new Error("controller aborted after owner proof"));
+                },
+                { once: true },
+              );
+            });
+          },
           termGraceMs: 5,
           forceExitMs: 5,
         },
@@ -599,6 +811,117 @@ describe("teardownProviderProcessTree", () => {
             capture: () => {
               throw new Error("capture must not run for a marked Windows launcher");
             },
+            inspect: () => ({ verified: true, survivors: [] }),
+            signal: async () => ({ rootTreeSignalSucceeded: false }),
+          },
+          ...deterministicClock(),
+        },
+      ),
+    ).resolves.toEqual({ escalated: false, signalErrors: [] });
+    expect(controllerAborted).toBe(true);
+  });
+
+  it("grants a fresh Job-empty proof window after a slow controller succeeds", async () => {
+    const rootExit = deferred<void>();
+    const rootExitProof = deferred<boolean>();
+    let now = 0;
+    let ownerExited = false;
+
+    await expect(
+      teardownProviderProcessTree(
+        {
+          rootPid: 456,
+          rootExited: rootExit.promise,
+          descendantExitProof: "windows-job-empty-on-exit",
+          rootExitProof: rootExitProof.promise,
+          requestWindowsJobTermination: async () => {
+            now += 30_000;
+          },
+          termGraceMs: 5,
+          forceExitMs: 5,
+          pollMs: 10_000,
+        },
+        {
+          processTreeKiller: {
+            capture: () => {
+              throw new Error("capture must not run for a marked Windows launcher");
+            },
+            inspect: () => ({ verified: true, survivors: [] }),
+            signal: async () => ({ rootTreeSignalSucceeded: false }),
+          },
+          now: () => now,
+          sleep: async (milliseconds) => {
+            now += milliseconds;
+            if (!ownerExited && now >= 60_000) {
+              ownerExited = true;
+              rootExitProof.resolve(true);
+              rootExit.resolve(undefined);
+            }
+          },
+        },
+      ),
+    ).resolves.toEqual({ escalated: false, signalErrors: [] });
+    expect(now).toBeGreaterThanOrEqual(60_000);
+  });
+
+  it("does not treat external root-tree signal completion as marked Job-empty proof", async () => {
+    let signalCalls = 0;
+    const rootExit = deferred<void>();
+
+    const failure = await teardownProviderProcessTree(
+      {
+        rootPid: 452,
+        rootExited: rootExit.promise,
+        descendantExitProof: "windows-job-empty-on-exit",
+        rootExitProof: Promise.resolve(false),
+        termGraceMs: 5,
+        forceExitMs: 5,
+      },
+      {
+        processTreeKiller: {
+          capture: () => {
+            throw new Error("capture must not run for a marked Windows launcher");
+          },
+          inspect: () => ({ verified: true, survivors: [] }),
+          signal: async ({ includeRootTree }) => {
+            signalCalls += 1;
+            rootExit.resolve(undefined);
+            return { rootTreeSignalSucceeded: includeRootTree === true };
+          },
+        },
+        ...deterministicClock(),
+      },
+    ).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(ProviderProcessExitUnprovenError);
+    expect(failure).toMatchObject({
+      rootPid: 452,
+      rootExited: true,
+      remainingDescendantPids: [],
+      rootTreeSignalSucceeded: true,
+    });
+    expect(signalCalls).toBe(2);
+  });
+
+  it("waits beyond the exit grace for delayed uncontained root-tree signal proof", async () => {
+    let signalCalls = 0;
+    const rootExit = deferred<void>();
+
+    await expect(
+      teardownProviderProcessTree(
+        {
+          rootPid: 454,
+          rootExited: rootExit.promise,
+          termGraceMs: 5,
+          forceExitMs: 5,
+        },
+        {
+          processTreeKiller: {
+            capture: () => ({
+              descendants: [],
+              captureComplete: true,
+              descendantExitProof: "root-tree-signal" as const,
+            }),
             inspect: () => ({ verified: true, survivors: [] }),
             signal: ({ signal }) => {
               signalCalls += 1;
@@ -620,7 +943,7 @@ describe("teardownProviderProcessTree", () => {
     expect(signalCalls).toBe(1);
   });
 
-  it("propagates root-tree signal proof only for the exact marked child handle", async () => {
+  it("propagates Job proof and cooperative termination only for the exact marked child", async () => {
     const markedChild = {
       pid: 461,
       exitCode: null,
@@ -636,6 +959,12 @@ describe("teardownProviderProcessTree", () => {
         args: [],
         shell: false,
         containment: "windows-job-object",
+        completionReceipt: {
+          path: "C:\\Synara\\pending-job-empty.receipt",
+          token: "pending-job-empty-proof",
+        },
+        windowsJobName: "synara-pending-job-proof",
+        windowsTerminationEventName: "synara-pending-job-termination",
       },
       true,
     );
@@ -647,7 +976,9 @@ describe("teardownProviderProcessTree", () => {
     expect(teardown).toHaveBeenCalledOnce();
     expect(teardown.mock.calls[0]?.[0]).toMatchObject({
       rootPid: 461,
-      descendantExitProof: "root-tree-signal",
+      descendantExitProof: "windows-job-empty-on-exit",
+      rootExitProof: expect.any(Promise),
+      requestWindowsJobTermination: expect.any(Function),
     });
   });
 
@@ -692,6 +1023,46 @@ describe("teardownProviderProcessTree", () => {
     expect(failure).toBeInstanceOf(ProviderProcessExitUnprovenError);
     expect(failure).toMatchObject({
       rootPid: 501,
+      rootExited: true,
+      remainingDescendantPids: null,
+      captureComplete: false,
+      descendantExitProof: "not-captured",
+      rootTreeSignalSucceeded: false,
+    });
+    expect(signalCalls).toBe(0);
+  });
+
+  it("does not signal when the root exit callback is queued after synchronous capture", async () => {
+    const rootExit = deferred<void>();
+    let signalCalls = 0;
+    const processTreeKiller: ProcessTreeKiller = {
+      capture: () => {
+        setImmediate(() => rootExit.resolve(undefined));
+        return {
+          descendants: [{ pid: 504, command: "unrelated-reused-root-child" }],
+          captureComplete: true,
+          descendantExitProof: "captured-identities",
+        };
+      },
+      inspect: () => ({ verified: true, survivors: [] }),
+      signal: async () => {
+        signalCalls += 1;
+        return { rootTreeSignalSucceeded: false };
+      },
+    };
+
+    const failure = await teardownProviderProcessTree(
+      { rootPid: 503, rootExited: rootExit.promise, termGraceMs: 5, forceExitMs: 5, pollMs: 5 },
+      {
+        processTreeKiller,
+        ...deterministicClock(),
+        yieldToEventLoop: () => new Promise((resolve) => setImmediate(resolve)),
+      },
+    ).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(ProviderProcessExitUnprovenError);
+    expect(failure).toMatchObject({
+      rootPid: 503,
       rootExited: true,
       remainingDescendantPids: null,
       captureComplete: false,

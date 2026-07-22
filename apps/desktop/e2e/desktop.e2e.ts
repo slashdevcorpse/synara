@@ -313,11 +313,14 @@ test("loads a localhost page in the real desktop browser pane", async ({ desktop
     await expect(desktop.page.getByRole("button", { name: "New tab", exact: true })).toBeVisible({
       timeout: 30_000,
     });
+    await expect(desktop.page.getByText("No local servers", { exact: true })).toBeVisible({
+      timeout: 30_000,
+    });
     await addressInput.fill(localPage.origin);
-    await addressInput.press("Enter");
     await expect(addressInput).toHaveValue(
       new RegExp(`^${localPage.origin.replaceAll(".", "\\.")}`),
     );
+    await addressInput.press("Enter");
     await expect
       .poll(
         async () =>

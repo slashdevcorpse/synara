@@ -59,6 +59,7 @@ import { appendFileAttachmentsPromptBlock } from "../attachmentProjection.ts";
 import { loadProviderPromptImageBlocks } from "../promptAttachments.ts";
 import { prepareWindowsProviderProcess } from "../windowsProviderProcess.ts";
 import {
+  ProviderAdapterProcessError,
   ProviderAdapterRequestError,
   ProviderAdapterSessionNotFoundError,
   ProviderAdapterValidationError,
@@ -107,6 +108,16 @@ import {
   makeGrokAcpRuntime,
   type GrokAcpRuntimeSettings,
 } from "../acp/GrokAcpSupport.ts";
+import {
+  type AcpStartupCleanupOwner,
+  cleanupAllAcpOwners,
+  closeAcpSessionAfterProcessTeardown,
+  failAcpStartupCauseAfterCleanup,
+  makeAcpSessionTeardownGate,
+  makeAcpStartupCleanupOwner,
+  retryRetainedAcpStartupOwner,
+  stopExistingAcpSessionOwner,
+} from "../acp/DroidSessionTeardownGate.ts";
 import { GrokAdapter, type GrokAdapterShape } from "../Services/GrokAdapter.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
 
@@ -308,6 +319,7 @@ interface GrokSessionContext {
   // ordering then guarantees it cannot cancel the new turn.
   compactionCancelFiber: Fiber.Fiber<void> | undefined;
   latestSessionCostUsd: number | undefined;
+  readonly teardownComplete: Deferred.Deferred<void>;
   stopped: boolean;
 }
 
@@ -614,6 +626,8 @@ export function makeGrokAdapter(
       options?.nativeEventLogger === undefined ? nativeEventLogger : undefined;
 
     const sessions = new Map<ThreadId, GrokSessionContext>();
+    const startupCleanupOwners = new Map<ThreadId, AcpStartupCleanupOwner>();
+    const sessionTeardownGate = makeAcpSessionTeardownGate<ProviderAdapterProcessError>();
     const withThreadLock = yield* makeAcpThreadLock();
     const runtimeEventPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent>();
 
@@ -692,34 +706,52 @@ export function makeGrokAdapter(
     };
 
     const stopSessionInternal = (ctx: GrokSessionContext) =>
-      Effect.gen(function* () {
-        if (ctx.stopped) return;
-        ctx.stopped = true;
-        ctx.gatewaySessionLease?.release();
-        yield* settleAcpPendingApprovalsAsCancelled(ctx.pendingApprovals);
-        yield* settleAcpPendingUserInputsAsEmptyAnswers(ctx.pendingUserInputs);
-        if (ctx.sessionConfigReady !== undefined) {
-          yield* Deferred.succeed(ctx.sessionConfigReady, undefined);
-          ctx.sessionConfigReady = undefined;
-        }
-        if (ctx.resumeReplayReady !== undefined) {
-          yield* Deferred.succeed(ctx.resumeReplayReady, undefined);
-          ctx.resumeReplayReady = undefined;
-          ctx.resumeReplayLastSuppressedAt = undefined;
-        }
-        if (ctx.notificationFiber) {
-          yield* Fiber.interrupt(ctx.notificationFiber);
-        }
-        yield* Effect.ignore(Scope.close(ctx.scope, Exit.void));
-        sessions.delete(ctx.threadId);
-        yield* offerRuntimeEvent(ctx.lifecycleGeneration, {
-          type: "session.exited",
-          ...(yield* makeEventStamp()),
-          provider: PROVIDER,
-          threadId: ctx.threadId,
-          payload: { exitKind: "graceful" },
-        });
-      });
+      Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function* () {
+          if (!ctx.stopped) {
+            ctx.stopped = true;
+            ctx.gatewaySessionLease?.release();
+            const closeSession = closeAcpSessionAfterProcessTeardown({
+              provider: PROVIDER,
+              providerLabel: "Grok",
+              threadId: ctx.threadId,
+              processTeardown: ctx.acp.teardown,
+              scope: ctx.scope,
+            });
+            const teardown = Effect.gen(function* () {
+              yield* settleAcpPendingApprovalsAsCancelled(ctx.pendingApprovals);
+              yield* settleAcpPendingUserInputsAsEmptyAnswers(ctx.pendingUserInputs);
+              if (ctx.sessionConfigReady !== undefined) {
+                yield* Deferred.succeed(ctx.sessionConfigReady, undefined);
+                ctx.sessionConfigReady = undefined;
+              }
+              if (ctx.resumeReplayReady !== undefined) {
+                yield* Deferred.succeed(ctx.resumeReplayReady, undefined);
+                ctx.resumeReplayReady = undefined;
+                ctx.resumeReplayLastSuppressedAt = undefined;
+              }
+              if (ctx.notificationFiber) {
+                yield* Fiber.interrupt(ctx.notificationFiber);
+                ctx.notificationFiber = undefined;
+              }
+              yield* closeSession;
+              yield* offerRuntimeEvent(ctx.lifecycleGeneration, {
+                type: "session.exited",
+                ...(yield* makeEventStamp()),
+                provider: PROVIDER,
+                threadId: ctx.threadId,
+                payload: { exitKind: "graceful" },
+              });
+              if (sessions.get(ctx.threadId) === ctx) {
+                sessions.delete(ctx.threadId);
+              }
+            });
+            sessionTeardownGate.track(ctx.threadId, ctx.teardownComplete, teardown);
+          }
+
+          yield* restore(sessionTeardownGate.run(ctx.threadId, ctx.teardownComplete));
+        }),
+      );
 
     const noteSuppressedGrokRuntimeEvent = (
       ctx: GrokSessionContext,
@@ -903,8 +935,37 @@ export function makeGrokAdapter(
         yield* Deferred.succeed(ready, undefined);
       });
 
-    const startSession: GrokAdapterShape["startSession"] = (input) =>
-      withThreadLock(
+    const startSession: GrokAdapterShape["startSession"] = (input) => {
+      let startupOwnerForFailure: AcpStartupCleanupOwner | undefined;
+      let gatewayLeaseForFailure: AgentGatewaySessionLease | undefined;
+      let startupCleanupHandled = false;
+      let sessionOwnerTransferred = false;
+      const cleanupFailedStartup = <E>(startupCause: Cause.Cause<E>) => {
+        if (
+          startupOwnerForFailure === undefined ||
+          startupCleanupHandled ||
+          sessionOwnerTransferred
+        ) {
+          return Effect.failCause(startupCause);
+        }
+        startupCleanupHandled = true;
+        return failAcpStartupCauseAfterCleanup({
+          provider: PROVIDER,
+          providerLabel: "Grok",
+          threadId: input.threadId,
+          startupCause,
+          owner: startupOwnerForFailure,
+          retainedOwners: startupCleanupOwners,
+        }).pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              gatewayLeaseForFailure?.release();
+            }),
+          ),
+        );
+      };
+
+      return withThreadLock(
         input.threadId,
         Effect.gen(function* () {
           if (input.provider !== undefined && input.provider !== PROVIDER) {
@@ -925,10 +986,8 @@ export function makeGrokAdapter(
 
           const grokModelSelection =
             input.modelSelection?.provider === PROVIDER ? input.modelSelection : undefined;
-          const existing = sessions.get(input.threadId);
-          if (existing && !existing.stopped) {
-            yield* stopSessionInternal(existing);
-          }
+          yield* retryRetainedAcpStartupOwner(startupCleanupOwners, input.threadId);
+          yield* stopExistingAcpSessionOwner(sessions, input.threadId, stopSessionInternal);
 
           const pendingApprovals = new Map<ApprovalRequestId, PendingApproval>();
           const pendingUserInputs = new Map<ApprovalRequestId, PendingUserInput>();
@@ -939,8 +998,38 @@ export function makeGrokAdapter(
             input.threadId,
             PROVIDER,
           );
+          const startupOwner = makeAcpStartupCleanupOwner({
+            provider: PROVIDER,
+            providerLabel: "Grok",
+            threadId: input.threadId,
+            scope: sessionScope,
+          });
+          startupOwnerForFailure = startupOwner;
+          gatewayLeaseForFailure = gatewaySessionLease;
+          const protectStartup = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+            effect.pipe(
+              Effect.catchCause((startupCause) => {
+                startupCleanupHandled = true;
+                return failAcpStartupCauseAfterCleanup({
+                  provider: PROVIDER,
+                  providerLabel: "Grok",
+                  threadId: input.threadId,
+                  startupCause,
+                  owner: startupOwner,
+                  retainedOwners: startupCleanupOwners,
+                }).pipe(
+                  Effect.ensuring(
+                    Effect.sync(() => {
+                      gatewaySessionLease?.release();
+                    }),
+                  ),
+                );
+              }),
+            );
           yield* Effect.addFinalizer(() =>
-            sessionScopeTransferred ? Effect.void : Scope.close(sessionScope, Exit.void),
+            sessionScopeTransferred || startupCleanupHandled
+              ? Effect.void
+              : Scope.close(sessionScope, Exit.void),
           );
           yield* Effect.addFinalizer(() =>
             sessionScopeTransferred || !gatewaySessionLease
@@ -991,135 +1080,143 @@ export function makeGrokAdapter(
             binaryPath: effectiveGrokSettings.binaryPath ?? "grok",
           });
 
-          const acp = yield* makeGrokAcpRuntime({
-            grokSettings: effectiveGrokSettings,
-            childProcessSpawner,
-            cwd,
-            ...(resumeSessionId ? { resumeSessionId } : {}),
-            clientInfo: { name: "Synara", version: "0.0.0" },
-            ...(agentGatewayCredentials
-              ? {
-                  buildMcpServers: (initializeResult) =>
-                    buildAcpSynaraMcpServers({
-                      connection: gatewaySessionLease!.connection,
-                      initializeResult,
-                      stdioProxy: agentGatewayCredentials.stdioProxy,
-                    }),
-                }
-              : {}),
-            ...acpRuntimeLoggers,
-          }).pipe(
-            Effect.provideService(Scope.Scope, sessionScope),
-            Effect.mapError((cause) =>
-              mapAcpToAdapterError(PROVIDER, input.threadId, "session/start", cause),
+          const acp = yield* protectStartup(
+            makeGrokAcpRuntime({
+              grokSettings: effectiveGrokSettings,
+              childProcessSpawner,
+              cwd,
+              ...(resumeSessionId ? { resumeSessionId } : {}),
+              clientInfo: { name: "Synara", version: "0.0.0" },
+              captureProcessTeardown: startupOwner.captureProcessTeardown,
+              ...(agentGatewayCredentials
+                ? {
+                    buildMcpServers: (initializeResult) =>
+                      buildAcpSynaraMcpServers({
+                        connection: gatewaySessionLease!.connection,
+                        initializeResult,
+                        stdioProxy: agentGatewayCredentials.stdioProxy,
+                      }),
+                  }
+                : {}),
+              ...acpRuntimeLoggers,
+            }).pipe(
+              Effect.provideService(Scope.Scope, sessionScope),
+              Effect.mapError((cause) =>
+                mapAcpToAdapterError(PROVIDER, input.threadId, "session/start", cause),
+              ),
             ),
           );
 
-          const started = yield* Effect.gen(function* () {
-            yield* acp.handleRequestPermission((params) =>
-              Effect.gen(function* () {
-                yield* logNative(input.threadId, "session/request_permission", params);
-                if (input.runtimeMode === "full-access") {
-                  const autoApprovedOptionId = selectAcpFullAccessPermissionOptionId(
-                    params.options,
-                  );
-                  if (autoApprovedOptionId !== undefined) {
-                    if (isGrokAcpDebugEnabled()) {
-                      yield* Effect.logInfo("grok.acp.permission_auto_approved", {
-                        threadId: input.threadId,
-                        turnId: ctx?.activeTurnId,
-                        optionId: autoApprovedOptionId,
-                        options: params.options.map((option) => ({
-                          kind: option.kind,
-                          optionId: option.optionId,
-                        })),
-                        toolKind: params.toolCall.kind,
-                        toolTitle: params.toolCall.title,
-                      });
+          const started = yield* protectStartup(
+            Effect.gen(function* () {
+              yield* acp.handleRequestPermission((params) =>
+                Effect.gen(function* () {
+                  yield* logNative(input.threadId, "session/request_permission", params);
+                  if (input.runtimeMode === "full-access") {
+                    const autoApprovedOptionId = selectAcpFullAccessPermissionOptionId(
+                      params.options,
+                    );
+                    if (autoApprovedOptionId !== undefined) {
+                      if (isGrokAcpDebugEnabled()) {
+                        yield* Effect.logInfo("grok.acp.permission_auto_approved", {
+                          threadId: input.threadId,
+                          turnId: ctx?.activeTurnId,
+                          optionId: autoApprovedOptionId,
+                          options: params.options.map((option) => ({
+                            kind: option.kind,
+                            optionId: option.optionId,
+                          })),
+                          toolKind: params.toolCall.kind,
+                          toolTitle: params.toolCall.title,
+                        });
+                      }
+                      return {
+                        outcome: {
+                          outcome: "selected" as const,
+                          optionId: autoApprovedOptionId,
+                        },
+                      };
                     }
-                    return {
-                      outcome: {
-                        outcome: "selected" as const,
-                        optionId: autoApprovedOptionId,
-                      },
-                    };
+                    yield* Effect.logWarning("grok.acp.permission_auto_approve_unavailable", {
+                      threadId: input.threadId,
+                      turnId: ctx?.activeTurnId,
+                      options: params.options.map((option) => ({
+                        kind: option.kind,
+                        optionId: option.optionId,
+                      })),
+                      toolKind: params.toolCall.kind,
+                      toolTitle: params.toolCall.title,
+                    });
                   }
-                  yield* Effect.logWarning("grok.acp.permission_auto_approve_unavailable", {
-                    threadId: input.threadId,
-                    turnId: ctx?.activeTurnId,
-                    options: params.options.map((option) => ({
-                      kind: option.kind,
-                      optionId: option.optionId,
-                    })),
-                    toolKind: params.toolCall.kind,
-                    toolTitle: params.toolCall.title,
-                  });
-                }
-                const permissionRequest = parsePermissionRequest(params);
-                const requestId = ApprovalRequestId.makeUnsafe(crypto.randomUUID());
-                const runtimeRequestId = RuntimeRequestId.makeUnsafe(requestId);
-                const decision = yield* Deferred.make<ProviderApprovalDecision>();
-                pendingApprovals.set(requestId, { decision, kind: permissionRequest.kind });
-                yield* offerRuntimeEvent(
-                  input.lifecycleGeneration,
-                  makeAcpRequestOpenedEvent({
-                    stamp: yield* makeEventStamp(),
-                    provider: PROVIDER,
-                    threadId: input.threadId,
-                    turnId: ctx?.activeTurnId,
-                    requestId: runtimeRequestId,
-                    permissionRequest,
-                    detail: permissionRequest.detail ?? JSON.stringify(params).slice(0, 2000),
-                    args: params,
-                    source: "acp.jsonrpc",
-                    method: "session/request_permission",
-                    rawPayload: params,
-                  }),
-                );
-                const resolved = yield* Deferred.await(decision);
-                pendingApprovals.delete(requestId);
-                yield* offerRuntimeEvent(
-                  input.lifecycleGeneration,
-                  makeAcpRequestResolvedEvent({
-                    stamp: yield* makeEventStamp(),
-                    provider: PROVIDER,
-                    threadId: input.threadId,
-                    turnId: ctx?.activeTurnId,
-                    requestId: runtimeRequestId,
-                    permissionRequest,
-                    decision: resolved,
-                  }),
-                );
-                return {
-                  outcome:
-                    resolved === "cancel"
-                      ? ({ outcome: "cancelled" } as const)
-                      : (() => {
-                          const selectedOptionId = selectAcpPermissionOptionId(
-                            resolved,
-                            params.options,
-                          );
-                          return selectedOptionId === undefined
-                            ? ({ outcome: "cancelled" } as const)
-                            : ({
-                                outcome: "selected" as const,
-                                optionId: selectedOptionId,
-                              } as const);
-                        })(),
-                };
-              }),
-            );
-            return yield* acp.start();
-          }).pipe(
-            Effect.mapError((error) =>
-              mapAcpToAdapterError(PROVIDER, input.threadId, "session/start", error),
+                  const permissionRequest = parsePermissionRequest(params);
+                  const requestId = ApprovalRequestId.makeUnsafe(crypto.randomUUID());
+                  const runtimeRequestId = RuntimeRequestId.makeUnsafe(requestId);
+                  const decision = yield* Deferred.make<ProviderApprovalDecision>();
+                  pendingApprovals.set(requestId, { decision, kind: permissionRequest.kind });
+                  yield* offerRuntimeEvent(
+                    input.lifecycleGeneration,
+                    makeAcpRequestOpenedEvent({
+                      stamp: yield* makeEventStamp(),
+                      provider: PROVIDER,
+                      threadId: input.threadId,
+                      turnId: ctx?.activeTurnId,
+                      requestId: runtimeRequestId,
+                      permissionRequest,
+                      detail: permissionRequest.detail ?? JSON.stringify(params).slice(0, 2000),
+                      args: params,
+                      source: "acp.jsonrpc",
+                      method: "session/request_permission",
+                      rawPayload: params,
+                    }),
+                  );
+                  const resolved = yield* Deferred.await(decision);
+                  pendingApprovals.delete(requestId);
+                  yield* offerRuntimeEvent(
+                    input.lifecycleGeneration,
+                    makeAcpRequestResolvedEvent({
+                      stamp: yield* makeEventStamp(),
+                      provider: PROVIDER,
+                      threadId: input.threadId,
+                      turnId: ctx?.activeTurnId,
+                      requestId: runtimeRequestId,
+                      permissionRequest,
+                      decision: resolved,
+                    }),
+                  );
+                  return {
+                    outcome:
+                      resolved === "cancel"
+                        ? ({ outcome: "cancelled" } as const)
+                        : (() => {
+                            const selectedOptionId = selectAcpPermissionOptionId(
+                              resolved,
+                              params.options,
+                            );
+                            return selectedOptionId === undefined
+                              ? ({ outcome: "cancelled" } as const)
+                              : ({
+                                  outcome: "selected" as const,
+                                  optionId: selectedOptionId,
+                                } as const);
+                          })(),
+                  };
+                }),
+              );
+              return yield* acp.start();
+            }).pipe(
+              Effect.mapError((error) =>
+                mapAcpToAdapterError(PROVIDER, input.threadId, "session/start", error),
+              ),
             ),
           );
-          yield* startAgentGatewaySessionLeaseExitWatcher(gatewaySessionLease, acp.awaitExit);
+          yield* protectStartup(
+            startAgentGatewaySessionLeaseExitWatcher(gatewaySessionLease, acp.awaitExit),
+          );
 
           const resumeReplayReady =
             resumeSessionId !== undefined ? yield* Deferred.make<void>() : undefined;
           const sessionConfigReady = yield* Deferred.make<void>();
+          const teardownComplete = yield* Deferred.make<void>();
           const now = yield* nowIso;
           const session: ProviderSession = {
             provider: PROVIDER,
@@ -1169,6 +1266,7 @@ export function makeGrokAdapter(
             compactionQuietUntil: undefined,
             compactionCancelFiber: undefined,
             latestSessionCostUsd: undefined,
+            teardownComplete,
             stopped: false,
           };
 
@@ -1411,6 +1509,7 @@ export function makeGrokAdapter(
           ctx.notificationFiber = notificationFiber;
           sessions.set(input.threadId, ctx);
           sessionScopeTransferred = true;
+          sessionOwnerTransferred = true;
 
           // Config RPCs run after the consumer fork so replay emitted while they are
           // in flight keeps draining. The session is already registered and the
@@ -1471,8 +1570,9 @@ export function makeGrokAdapter(
           );
 
           return session;
-        }).pipe(Effect.scoped),
+        }).pipe(Effect.catchCause(cleanupFailedStartup), Effect.scoped),
       );
+    };
 
     // Idle-progress watchdog escape hatch: force-fail a turn whose grok child
     // is alive but has gone completely silent. Mirrors the prompt-fiber
@@ -1916,13 +2016,23 @@ export function makeGrokAdapter(
       withThreadLock(
         threadId,
         Effect.gen(function* () {
-          const ctx = yield* requireSession(threadId);
+          const ctx = sessions.get(threadId);
+          if (ctx === undefined) {
+            return yield* new ProviderAdapterSessionNotFoundError({
+              provider: PROVIDER,
+              threadId,
+            });
+          }
           yield* stopSessionInternal(ctx);
         }),
       );
 
     const listSessions: GrokAdapterShape["listSessions"] = () =>
-      Effect.sync(() => Array.from(sessions.values(), (ctx) => ({ ...ctx.session })));
+      Effect.sync(() =>
+        Array.from(sessions.values())
+          .filter((ctx) => !ctx.stopped)
+          .map((ctx) => ({ ...ctx.session })),
+      );
 
     const hasSession: GrokAdapterShape["hasSession"] = (threadId) =>
       Effect.sync(() => {
@@ -2249,12 +2359,29 @@ export function makeGrokAdapter(
     };
 
     const stopAll: GrokAdapterShape["stopAll"] = () =>
-      Effect.forEach(Array.from(sessions.values()), stopSessionInternal, { discard: true });
+      cleanupAllAcpOwners({
+        provider: PROVIDER,
+        providerLabel: "Grok",
+        owners: [
+          ...Array.from(sessions.values(), (ctx) => ({
+            threadId: ctx.threadId,
+            cleanup: stopSessionInternal(ctx),
+          })),
+          ...Array.from(startupCleanupOwners.keys(), (threadId) => ({
+            threadId,
+            cleanup: retryRetainedAcpStartupOwner(startupCleanupOwners, threadId),
+          })),
+        ],
+      });
 
     yield* Effect.addFinalizer(() =>
-      Effect.forEach(Array.from(sessions.values()), stopSessionInternal, { discard: true }).pipe(
-        Effect.tap(() => PubSub.shutdown(runtimeEventPubSub)),
-        Effect.tap(() => managedNativeEventLogger?.close() ?? Effect.void),
+      stopAll().pipe(
+        Effect.orDie,
+        Effect.ensuring(
+          PubSub.shutdown(runtimeEventPubSub).pipe(
+            Effect.andThen(managedNativeEventLogger?.close() ?? Effect.void),
+          ),
+        ),
       ),
     );
 

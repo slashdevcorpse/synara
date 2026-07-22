@@ -9,7 +9,11 @@ import { it, assert, describe, vi } from "@effect/vitest";
 import { Effect, Fiber, Layer, Stream } from "effect";
 
 import { ServerConfig } from "../../config.ts";
-import { ProviderAdapterProcessError, ProviderAdapterValidationError } from "../Errors.ts";
+import {
+  ProviderAdapterProcessError,
+  ProviderAdapterRequestError,
+  ProviderAdapterValidationError,
+} from "../Errors.ts";
 import { CommandCodeAdapter } from "../Services/CommandCodeAdapter.ts";
 import {
   buildCommandCodeTurnArgs,
@@ -30,6 +34,7 @@ interface MockChild {
   readonly stdout: PassThrough;
   readonly stderr: PassThrough;
   error(cause: Error): void;
+  exit(code: number | null, signal?: NodeJS.Signals | null): void;
   close(code: number | null, signal?: NodeJS.Signals | null): void;
 }
 
@@ -55,6 +60,10 @@ function makeMockChild(): MockChild {
     stderr,
     error(cause) {
       emitter.emit("error", cause);
+    },
+    exit(code, signal = null) {
+      Object.assign(emitter, { exitCode: code, signalCode: signal });
+      emitter.emit("exit", code, signal);
     },
     close(code, signal = null) {
       Object.assign(emitter, { exitCode: code, signalCode: signal });
@@ -490,6 +499,235 @@ it.effect("stopSession tears down an active process tree and removes the session
         assert.strictEqual(yield* adapter.hasSession(threadId), false);
       }).pipe(Effect.provide(layer));
       assert.strictEqual(teardown.mock.calls.length, 1);
+    }),
+  ),
+);
+
+it.effect("releases a PID-less turn spawn failure without creating an unproven owner", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const mock = makeMockChild();
+      Object.assign(mock.child, { pid: undefined });
+      const teardown = vi.fn(async () => undefined);
+      const { layer } = adapterLayer({ child: mock, teardownProcessTree: teardown });
+      const threadId = ThreadId.makeUnsafe("command-code-pidless-turn");
+
+      yield* Effect.gen(function* () {
+        const adapter = yield* CommandCodeAdapter;
+        yield* adapter.startSession(startInput(threadId));
+        yield* adapter.sendTurn({ threadId, input: "cannot spawn" });
+        mock.error(new Error("spawn ENOENT"));
+        const sessions = yield* adapter.listSessions();
+        assert.strictEqual(sessions[0]?.status, "ready");
+        assert.strictEqual(sessions[0]?.activeTurnId, undefined);
+        assert.strictEqual(sessions[0]?.lastError, undefined);
+        assert.strictEqual(teardown.mock.calls.length, 0);
+      }).pipe(Effect.provide(layer));
+    }),
+  ),
+);
+
+it.effect("retains the active owner when close precedes a rejected cleanup proof", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const mock = makeMockChild();
+      let rejectCleanup!: (cause: Error) => void;
+      let teardownCalls = 0;
+      const teardown = vi.fn(() => {
+        teardownCalls += 1;
+        if (teardownCalls > 1) return Promise.resolve();
+        return new Promise<void>((_resolve, reject) => {
+          rejectCleanup = reject;
+        });
+      });
+      const { layer, spawnProcess } = adapterLayer({
+        child: mock,
+        teardownProcessTree: teardown,
+      });
+      const threadId = ThreadId.makeUnsafe("command-code-close-before-proof");
+
+      yield* Effect.gen(function* () {
+        const adapter = yield* CommandCodeAdapter;
+        yield* adapter.startSession(startInput(threadId));
+        const turn = yield* adapter.sendTurn({ threadId, input: "long task" });
+        const interrupt = yield* adapter
+          .interruptTurn(threadId, turn.turnId)
+          .pipe(Effect.forkChild);
+        yield* Effect.yieldNow;
+        assert.strictEqual(teardown.mock.calls.length, 1);
+
+        mock.close(130);
+        assert.strictEqual(interrupt.pollUnsafe(), undefined);
+        rejectCleanup(new Error("close raced ahead of failed descendant proof"));
+        const failure = yield* Fiber.join(interrupt).pipe(Effect.flip);
+        assert.ok(failure instanceof ProviderAdapterProcessError);
+
+        const sessions = yield* adapter.listSessions();
+        assert.strictEqual(sessions[0]?.status, "error");
+        assert.match(sessions[0]?.lastError ?? "", /failed descendant proof/u);
+        const blocked = yield* adapter
+          .sendTurn({ threadId, input: "must not overlap" })
+          .pipe(Effect.flip);
+        assert.ok(blocked instanceof ProviderAdapterValidationError);
+        assert.strictEqual(spawnProcess.mock.calls.length, 1);
+
+        yield* adapter.stopSession(threadId);
+        assert.strictEqual(yield* adapter.hasSession(threadId), false);
+        assert.strictEqual(teardown.mock.calls.length, 2);
+      }).pipe(Effect.provide(layer));
+    }),
+  ),
+);
+
+it.effect("waits for close-driven finalization after cleanup observes exit first", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const mock = makeMockChild();
+      const teardown = vi.fn(async () => mock.exit(130));
+      const { layer } = adapterLayer({ child: mock, teardownProcessTree: teardown });
+      const threadId = ThreadId.makeUnsafe("command-code-exit-before-close");
+
+      yield* Effect.gen(function* () {
+        const adapter = yield* CommandCodeAdapter;
+        yield* adapter.startSession(startInput(threadId));
+        const turn = yield* adapter.sendTurn({ threadId, input: "long task" });
+        const interrupt = yield* adapter
+          .interruptTurn(threadId, turn.turnId)
+          .pipe(Effect.forkChild);
+        yield* Effect.yieldNow;
+        assert.strictEqual(teardown.mock.calls.length, 1);
+        assert.strictEqual(interrupt.pollUnsafe(), undefined);
+
+        mock.close(130);
+        yield* Fiber.join(interrupt);
+        const sessions = yield* adapter.listSessions();
+        assert.strictEqual(sessions[0]?.status, "ready");
+        assert.strictEqual(sessions[0]?.activeTurnId, undefined);
+      }).pipe(Effect.provide(layer));
+    }),
+  ),
+);
+
+it.effect(
+  "retains a failed turn owner and blocks replacement until cleanup retry proves exit",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const mock = makeMockChild();
+        let teardownCalls = 0;
+        const teardown = vi.fn(async () => {
+          teardownCalls += 1;
+          if (teardownCalls <= 2) throw new Error(`cleanup proof failed ${teardownCalls}`);
+          mock.close(130);
+        });
+        const { layer, spawnProcess } = adapterLayer({
+          child: mock,
+          teardownProcessTree: teardown,
+        });
+        const threadId = ThreadId.makeUnsafe("command-code-unproven-owner");
+
+        yield* Effect.gen(function* () {
+          const adapter = yield* CommandCodeAdapter;
+          yield* adapter.startSession(startInput(threadId));
+          yield* adapter.sendTurn({ threadId, input: "first child" });
+          mock.error(new Error("command stream failed"));
+          yield* Effect.promise(() => new Promise<void>((resolve) => setImmediate(resolve)));
+
+          const blockedTurn = yield* adapter
+            .sendTurn({ threadId, input: "must not overlap" })
+            .pipe(Effect.flip);
+          assert.ok(blockedTurn instanceof ProviderAdapterValidationError);
+          assert.match(blockedTurn.message, /process tree is still unproven/u);
+          assert.strictEqual(spawnProcess.mock.calls.length, 1);
+
+          const blockedRestart = yield* adapter
+            .startSession(startInput(threadId))
+            .pipe(Effect.flip);
+          assert.ok(blockedRestart instanceof ProviderAdapterProcessError);
+          assert.strictEqual(yield* adapter.hasSession(threadId), true);
+          assert.strictEqual(spawnProcess.mock.calls.length, 1);
+
+          yield* adapter.stopSession(threadId);
+          assert.strictEqual(yield* adapter.hasSession(threadId), false);
+          assert.strictEqual(teardown.mock.calls.length, 3);
+        }).pipe(Effect.provide(layer));
+      }),
+    ),
+);
+
+it.effect(
+  "serializes model discovery and blocks replacement until retained cleanup is proven",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const first = makeMockChild();
+        const spawnProcess = vi.fn<SpawnProcess>(() => first.child);
+        let teardownCalls = 0;
+        const teardown = vi.fn(async () => {
+          teardownCalls += 1;
+          if (teardownCalls <= 2) throw new Error(`model cleanup proof failed ${teardownCalls}`);
+        });
+        const { layer } = adapterLayer({
+          child: first,
+          spawnProcess,
+          teardownProcessTree: teardown,
+        });
+
+        yield* Effect.gen(function* () {
+          const adapter = yield* CommandCodeAdapter;
+          const firstLookup = yield* adapter.listModels!({
+            provider: "commandCode",
+            cwd: process.cwd(),
+          }).pipe(Effect.forkChild);
+          yield* Effect.yieldNow;
+          const replacementLookup = yield* adapter.listModels!({
+            provider: "commandCode",
+            cwd: process.cwd(),
+          }).pipe(Effect.forkChild);
+          yield* Effect.yieldNow;
+          assert.strictEqual(replacementLookup.pollUnsafe(), undefined);
+          assert.strictEqual(spawnProcess.mock.calls.length, 1);
+
+          first.error(new Error("model discovery stream failed"));
+          const firstFailure = yield* Fiber.join(firstLookup).pipe(Effect.flip);
+          assert.ok(firstFailure instanceof ProviderAdapterRequestError);
+          assert.match(firstFailure.message, /cleanup could not be proven/u);
+
+          const replacementFailure = yield* Fiber.join(replacementLookup).pipe(Effect.flip);
+          assert.ok(replacementFailure instanceof ProviderAdapterRequestError);
+          assert.match(replacementFailure.message, /cleanup could not be proven/u);
+          assert.strictEqual(spawnProcess.mock.calls.length, 1);
+          assert.strictEqual(teardown.mock.calls.length, 2);
+
+          yield* adapter.stopAll();
+          assert.strictEqual(teardown.mock.calls.length, 3);
+        }).pipe(Effect.provide(layer));
+      }),
+    ),
+);
+
+it.effect("releases a PID-less model-discovery spawn failure without retaining cleanup", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const mock = makeMockChild();
+      Object.assign(mock.child, { pid: undefined });
+      const teardown = vi.fn(async () => undefined);
+      const { layer } = adapterLayer({ child: mock, teardownProcessTree: teardown });
+
+      yield* Effect.gen(function* () {
+        const adapter = yield* CommandCodeAdapter;
+        const lookup = yield* adapter.listModels!({
+          provider: "commandCode",
+          cwd: process.cwd(),
+        }).pipe(Effect.forkChild);
+        yield* Effect.yieldNow;
+        mock.error(new Error("model discovery ENOENT"));
+        const failure = yield* Fiber.join(lookup).pipe(Effect.flip);
+        assert.ok(failure instanceof ProviderAdapterRequestError);
+        assert.match(failure.message, /ENOENT/u);
+        assert.strictEqual(teardown.mock.calls.length, 0);
+        yield* adapter.stopAll();
+      }).pipe(Effect.provide(layer));
     }),
   ),
 );

@@ -1,12 +1,23 @@
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { describe, expect, it } from "vitest";
 
 import {
+  consumeWindowsJobEmptyExitProof,
   containPreparedWindowsProviderProcess,
   isWindowsJobContainedProviderProcess,
   markWindowsProviderProcessSpawn,
+  prepareWindowsJobTerminationCommand,
   prepareResolvedWindowsProviderProcess,
+  recordWindowsProviderProcessExit,
   resolveWindowsJobLauncherPath,
   WINDOWS_JOB_LAUNCHER_EXECUTABLE,
+  WINDOWS_JOB_LAUNCHER_PROTOCOL_VERSION,
+  windowsProviderProcessExitProofError,
 } from "./windowsProviderProcess.ts";
 
 const launcher = `C:\\Synara\\native\\${WINDOWS_JOB_LAUNCHER_EXECUTABLE}`;
@@ -22,7 +33,7 @@ describe("Windows provider process containment", () => {
     ).toBe(prepared);
   });
 
-  it("wraps a resolved executable in the versioned argv protocol", () => {
+  it("wraps a one-shot executable in the versioned argv protocol without a receipt", () => {
     expect(
       prepareResolvedWindowsProviderProcess(
         "C:\\Program Files\\Codex\\codex.exe",
@@ -38,7 +49,7 @@ describe("Windows provider process containment", () => {
       command: launcher,
       args: [
         "--protocol",
-        "1",
+        WINDOWS_JOB_LAUNCHER_PROTOCOL_VERSION,
         "--argument-mode",
         "argv",
         "--",
@@ -50,6 +61,84 @@ describe("Windows provider process containment", () => {
       shell: false,
       windowsHide: true,
       containment: "windows-job-object",
+    });
+  });
+
+  it("adds an exact nonce receipt only for a supervised launch", () => {
+    const completionReceipt = {
+      path: "C:\\Temp\\synara-job-proof.receipt",
+      token: "supervised-job-proof",
+    };
+    const windowsJobName = "synara-job-proof-test";
+    const prepared = prepareResolvedWindowsProviderProcess(
+      "C:\\Program Files\\Codex\\codex.exe",
+      ["app-server"],
+      {
+        platform: "win32",
+        arch: "x64",
+        launcherPath: launcher,
+        fileExists: () => true,
+        completionReceipt,
+        windowsJobName,
+      },
+    );
+    expect(prepared.windowsTerminationEventName).toMatch(
+      /^synara-windows-job-termination-[0-9a-f-]+$/u,
+    );
+
+    expect(prepared).toEqual({
+      command: launcher,
+      args: [
+        "--protocol",
+        WINDOWS_JOB_LAUNCHER_PROTOCOL_VERSION,
+        "--argument-mode",
+        "argv",
+        "--job-name",
+        windowsJobName,
+        "--termination-event",
+        prepared.windowsTerminationEventName,
+        "--completion-receipt",
+        completionReceipt.path,
+        "--receipt-token",
+        completionReceipt.token,
+        "--",
+        "C:\\Program Files\\Codex\\codex.exe",
+        "app-server",
+      ],
+      shell: false,
+      windowsHide: true,
+      containment: "windows-job-object",
+      completionReceipt,
+      windowsJobName,
+      windowsTerminationEventName: prepared.windowsTerminationEventName,
+    });
+  });
+
+  it("retains only the exact owner-event signal command for supervised termination", () => {
+    const process = { pid: 4321 };
+    markWindowsProviderProcessSpawn(
+      process,
+      {
+        command: launcher,
+        args: [],
+        shell: false,
+        containment: "windows-job-object",
+        windowsJobName: "diagnostic-job-name-is-not-a-capability",
+        windowsTerminationEventName: "synara-owner-termination-test",
+      },
+      true,
+    );
+
+    expect(prepareWindowsJobTerminationCommand(process)).toEqual({
+      command: launcher,
+      args: [
+        "--protocol",
+        WINDOWS_JOB_LAUNCHER_PROTOCOL_VERSION,
+        "--signal-termination-event",
+        "synara-owner-termination-test",
+        "--launcher-pid",
+        "4321",
+      ],
     });
   });
 
@@ -81,6 +170,166 @@ describe("Windows provider process containment", () => {
     expect(isWindowsJobContainedProviderProcess(ordinaryChild)).toBe(false);
   });
 
+  it("does not accept any preplanted receipt for an arbitrary object", () => {
+    const receiptDirectory = mkdtempSync(join(tmpdir(), "synara-job-proof-"));
+    const completionReceipt = {
+      path: join(receiptDirectory, "job-empty.receipt"),
+      token: "exact-job-empty-token",
+    };
+    const child = {};
+    writeFileSync(completionReceipt.path, `${completionReceipt.token}\n1234\n`, "utf8");
+    markWindowsProviderProcessSpawn(
+      child,
+      {
+        command: launcher,
+        args: [],
+        shell: false,
+        containment: "windows-job-object",
+        completionReceipt,
+      },
+      true,
+    );
+
+    try {
+      expect(consumeWindowsJobEmptyExitProof(child)).toBe(false);
+      expect(existsSync(completionReceipt.path)).toBe(true);
+      expect(windowsProviderProcessExitProofError(child)?.message).toContain(
+        "without proving that its Job reached zero active processes",
+      );
+    } finally {
+      rmSync(receiptDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("requires explicit exit observation before a structural handle can prove its pid-bound receipt", () => {
+    const receiptDirectory = mkdtempSync(join(tmpdir(), "synara-job-proof-"));
+    const completionReceipt = {
+      path: join(receiptDirectory, "effect-handle.receipt"),
+      token: "effect-handle-exact-exit-proof",
+    };
+    const child = { pid: 4321 };
+    writeFileSync(completionReceipt.path, `${completionReceipt.token}\n${child.pid}\n`, "utf8");
+    markWindowsProviderProcessSpawn(
+      child,
+      {
+        command: launcher,
+        args: [],
+        shell: false,
+        containment: "windows-job-object",
+        completionReceipt,
+      },
+      true,
+    );
+
+    try {
+      expect(consumeWindowsJobEmptyExitProof(child)).toBe(false);
+      expect(existsSync(completionReceipt.path)).toBe(true);
+      expect(recordWindowsProviderProcessExit(child)).toBe(true);
+      expect(existsSync(completionReceipt.path)).toBe(false);
+      expect(consumeWindowsJobEmptyExitProof(child)).toBe(true);
+    } finally {
+      rmSync(receiptDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a token-only receipt after the exact launcher handle exits", async () => {
+    const receiptDirectory = mkdtempSync(join(tmpdir(), "synara-job-proof-"));
+    const completionReceipt = {
+      path: join(receiptDirectory, "token-only.receipt"),
+      token: "token-alone-is-not-instance-proof",
+    };
+    const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 100)"], {
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    writeFileSync(completionReceipt.path, `${completionReceipt.token}\n`, "utf8");
+    markWindowsProviderProcessSpawn(
+      child,
+      {
+        command: launcher,
+        args: [],
+        shell: false,
+        containment: "windows-job-object",
+        completionReceipt,
+      },
+      true,
+    );
+
+    try {
+      if (child.exitCode === null && child.signalCode === null) await once(child, "exit");
+      expect(existsSync(completionReceipt.path)).toBe(false);
+      expect(consumeWindowsJobEmptyExitProof(child)).toBe(false);
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill();
+      rmSync(receiptDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("removes and caches a real Node child's receipt as soon as the child exits", async () => {
+    const receiptDirectory = mkdtempSync(join(tmpdir(), "synara-job-proof-"));
+    const completionReceipt = {
+      path: join(receiptDirectory, "job-empty.receipt"),
+      token: "natural-node-exit-proof",
+    };
+    const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 100)"], {
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    if (child.pid === undefined) throw new Error("expected spawned child pid");
+    writeFileSync(completionReceipt.path, `${completionReceipt.token}\n${child.pid}\n`, "utf8");
+    markWindowsProviderProcessSpawn(
+      child,
+      {
+        command: launcher,
+        args: [],
+        shell: false,
+        containment: "windows-job-object",
+        completionReceipt,
+      },
+      true,
+    );
+
+    try {
+      if (child.exitCode === null && child.signalCode === null) await once(child, "exit");
+      expect(existsSync(completionReceipt.path)).toBe(false);
+      expect(consumeWindowsJobEmptyExitProof(child)).toBe(true);
+      expect(consumeWindowsJobEmptyExitProof(child)).toBe(true);
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill();
+      rmSync(receiptDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("returns a stable fail-closed error for a contained exit without a receipt", () => {
+    const receiptDirectory = mkdtempSync(join(tmpdir(), "synara-job-proof-"));
+    const child = {};
+    markWindowsProviderProcessSpawn(
+      child,
+      {
+        command: launcher,
+        args: [],
+        shell: false,
+        containment: "windows-job-object",
+        completionReceipt: {
+          path: join(receiptDirectory, "missing.receipt"),
+          token: "missing-job-proof",
+        },
+      },
+      true,
+    );
+
+    try {
+      expect(windowsProviderProcessExitProofError(child)?.message).toContain(
+        "without proving that its Job reached zero active processes",
+      );
+      expect(windowsProviderProcessExitProofError(child)?.message).toContain(
+        "without proving that its Job reached zero active processes",
+      );
+    } finally {
+      rmSync(receiptDirectory, { recursive: true, force: true });
+    }
+  });
+
   it("preserves the existing cmd.exe verbatim argument mode", () => {
     expect(
       containPreparedWindowsProviderProcess(
@@ -100,7 +349,7 @@ describe("Windows provider process containment", () => {
       ).args,
     ).toEqual([
       "--protocol",
-      "1",
+      WINDOWS_JOB_LAUNCHER_PROTOCOL_VERSION,
       "--argument-mode",
       "verbatim",
       "--",

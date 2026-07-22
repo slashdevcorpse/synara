@@ -28,7 +28,11 @@ import {
   type AgentGatewayCredentialsShape,
 } from "../../agentGateway/Services/AgentGatewayCredentials.ts";
 import { ServerConfig } from "../../config.ts";
-import { ProviderAdapterRequestError, ProviderAdapterValidationError } from "../Errors.ts";
+import {
+  ProviderAdapterProcessError,
+  ProviderAdapterRequestError,
+  ProviderAdapterValidationError,
+} from "../Errors.ts";
 import { ClaudeAdapter } from "../Services/ClaudeAdapter.ts";
 import {
   buildEmbeddedClaudeSystemPromptAppend,
@@ -3752,6 +3756,7 @@ await agent("Draft the spec", { label: "delta-agent", phase: "Two" });
       proveExit = resolve;
     });
     let teardownCalls = 0;
+    let promptEnded = false;
     const ownedProcess = {
       pid: 73_311,
       exitCode: 0,
@@ -3765,6 +3770,12 @@ await agent("Draft the spec", { label: "delta-agent", phase: "Two" });
         return { escalated: false, signalErrors: [] };
       },
       createQuery: (input) => {
+        void (async () => {
+          for await (const _message of input.prompt) {
+            // Keep consuming until stop closes input after process-tree proof.
+          }
+          promptEnded = true;
+        })();
         input.options.spawnClaudeCodeProcess?.({
           command: "claude",
           args: [],
@@ -3790,13 +3801,307 @@ await agent("Draft the spec", { label: "delta-agent", phase: "Two" });
       yield* Effect.yieldNow;
       yield* Effect.yieldNow;
 
-      assert.equal(query.closeCalls, 1);
+      assert.equal(query.closeCalls, 0);
       assert.equal(teardownCalls, 1);
+      assert.equal(promptEnded, false);
       assert.equal((yield* adapter.listSessions()).length, 1);
 
       proveExit?.();
       yield* Fiber.join(stopping);
+      yield* Effect.yieldNow;
+      assert.equal(query.closeCalls, 1);
+      assert.equal(promptEnded, true);
       assert.equal((yield* adapter.listSessions()).length, 0);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(layer),
+    );
+  });
+
+  it.effect(
+    "retains failed command-discovery ownership and serializes replacement behind cleanup proof",
+    () => {
+      const queries: Array<FakeClaudeQuery> = [];
+      let spawnCalls = 0;
+      let teardownCalls = 0;
+      let proveRetry: (() => void) | undefined;
+      const retryProof = new Promise<void>((resolve) => {
+        proveRetry = resolve;
+      });
+      const layer = makeClaudeAdapterLive({
+        createQuery: (input) => {
+          const query = new FakeClaudeQuery();
+          const queryIndex = queries.length;
+          (query as { supportedCommands: () => Promise<Array<never>> }).supportedCommands =
+            queryIndex === 0
+              ? async () => {
+                  throw new Error("command discovery failed");
+                }
+              : async () => [];
+          queries.push(query);
+          input.options.spawnClaudeCodeProcess?.({
+            command: "claude",
+            args: [],
+            env: {},
+          });
+          return query;
+        },
+        spawnClaudeCodeProcess: () => {
+          spawnCalls += 1;
+          return {
+            pid: 74_000 + spawnCalls,
+            exitCode: 0,
+            signalCode: null,
+          } as unknown as ClaudeOwnedProcess;
+        },
+        teardownProcessTree: async () => {
+          teardownCalls += 1;
+          if (teardownCalls === 1) {
+            throw new Error("command cleanup proof failed");
+          }
+          if (teardownCalls === 2) {
+            await retryProof;
+          }
+          return { escalated: false, signalErrors: [] };
+        },
+      }).pipe(
+        Layer.provideMerge(ServerConfig.layerTest("/tmp/claude-adapter-test", "/tmp")),
+        Layer.provideMerge(NodeServices.layer),
+      );
+
+      return Effect.gen(function* () {
+        const adapter = yield* ClaudeAdapter;
+        const listCommands = adapter.listCommands;
+        if (!listCommands) return assert.fail("Expected Claude command discovery support.");
+        const input = {
+          provider: "claudeAgent" as const,
+          cwd: "/tmp/claude-command-discovery",
+          forceReload: true,
+        };
+
+        const initial = yield* listCommands(input).pipe(Effect.result);
+        assert.equal(initial._tag, "Failure");
+        if (initial._tag === "Failure") {
+          assert.instanceOf(initial.failure, ProviderAdapterProcessError);
+          assert.instanceOf(initial.failure.cause, AggregateError);
+          const causes = (initial.failure.cause as AggregateError).errors;
+          assert.match(String(causes[0]), /command discovery failed/);
+          assert.match(String(causes[1]), /command cleanup proof failed/);
+        }
+        assert.equal(spawnCalls, 1);
+        assert.equal(teardownCalls, 1);
+        assert.equal(queries[0]?.closeCalls, 0);
+
+        const replacementA = yield* listCommands(input).pipe(Effect.forkChild);
+        const replacementB = yield* listCommands(input).pipe(Effect.forkChild);
+        yield* Effect.yieldNow;
+        yield* Effect.yieldNow;
+        assert.equal(teardownCalls, 2);
+        assert.equal(spawnCalls, 1);
+        assert.equal(queries.length, 1);
+
+        proveRetry?.();
+        const [firstResult, secondResult] = yield* Effect.all([
+          Fiber.join(replacementA),
+          Fiber.join(replacementB),
+        ]);
+        assert.deepEqual(firstResult, secondResult);
+        assert.equal(spawnCalls, 2);
+        assert.equal(teardownCalls, 3);
+        assert.equal(queries[0]?.closeCalls, 1);
+        assert.equal(queries[1]?.closeCalls, 1);
+      }).pipe(
+        Effect.provideService(Random.Random, makeDeterministicRandomService()),
+        Effect.provide(layer),
+      );
+    },
+  );
+
+  it.effect("cancels pre-owner discovery across stopAll without clearing a later discovery", () => {
+    const queries: Array<FakeClaudeQuery> = [];
+    let spawnCalls = 0;
+    let teardownCalls = 0;
+    const retryStarted = Promise.withResolvers<void>();
+    const releaseRetry = Promise.withResolvers<void>();
+    const freshDiscoveryStarted = Promise.withResolvers<void>();
+    const releaseFreshDiscovery = Promise.withResolvers<void>();
+    const layer = makeClaudeAdapterLive({
+      createQuery: (input) => {
+        const query = new FakeClaudeQuery();
+        const queryIndex = queries.length;
+        (query as { supportedCommands: () => Promise<Array<never>> }).supportedCommands =
+          queryIndex === 0
+            ? async () => {
+                throw new Error("initial command discovery failed");
+              }
+            : async () => {
+                freshDiscoveryStarted.resolve();
+                await releaseFreshDiscovery.promise;
+                return [];
+              };
+        queries.push(query);
+        input.options.spawnClaudeCodeProcess?.({
+          command: "claude",
+          args: [],
+          env: {},
+        });
+        return query;
+      },
+      spawnClaudeCodeProcess: () => {
+        spawnCalls += 1;
+        return {
+          pid: 74_100 + spawnCalls,
+          exitCode: 0,
+          signalCode: null,
+        } as unknown as ClaudeOwnedProcess;
+      },
+      teardownProcessTree: async () => {
+        teardownCalls += 1;
+        if (teardownCalls === 1) {
+          throw new Error("initial command cleanup proof failed");
+        }
+        if (teardownCalls === 2) {
+          retryStarted.resolve();
+          await releaseRetry.promise;
+        }
+        return { escalated: false, signalErrors: [] };
+      },
+    }).pipe(
+      Layer.provideMerge(ServerConfig.layerTest("/tmp/claude-adapter-test", "/tmp")),
+      Layer.provideMerge(NodeServices.layer),
+    );
+
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const listCommands = adapter.listCommands;
+      if (!listCommands) return assert.fail("Expected Claude command discovery support.");
+      const input = {
+        provider: "claudeAgent" as const,
+        cwd: "/tmp/claude-command-discovery-epoch",
+        forceReload: true,
+      };
+
+      yield* listCommands(input).pipe(Effect.ignore);
+      assert.equal(spawnCalls, 1);
+      assert.equal(teardownCalls, 1);
+
+      const staleDiscovery = yield* listCommands(input).pipe(Effect.result, Effect.forkChild);
+      yield* Effect.promise(() => retryStarted.promise);
+
+      const stopping = yield* adapter.stopAll().pipe(Effect.result, Effect.forkChild);
+      yield* Effect.yieldNow;
+      yield* Effect.yieldNow;
+
+      const freshDiscovery = yield* listCommands(input).pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+      releaseRetry.resolve();
+      yield* Effect.promise(() => freshDiscoveryStarted.promise);
+
+      const staleResult = yield* Fiber.join(staleDiscovery);
+      assert.equal(staleResult._tag, "Failure");
+      if (staleResult._tag === "Failure") {
+        assert.match(staleResult.failure.message, /canceled by provider shutdown/);
+      }
+      assert.equal((yield* Fiber.join(stopping))._tag, "Success");
+
+      const deduplicatedFreshDiscovery = yield* listCommands(input).pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+      yield* Effect.yieldNow;
+      assert.equal(spawnCalls, 2);
+      assert.equal(queries.length, 2);
+
+      releaseFreshDiscovery.resolve();
+      const [firstFreshResult, secondFreshResult] = yield* Effect.all([
+        Fiber.join(freshDiscovery),
+        Fiber.join(deduplicatedFreshDiscovery),
+      ]);
+      assert.deepEqual(firstFreshResult, secondFreshResult);
+      assert.equal(teardownCalls, 3);
+      assert.equal(queries[0]?.closeCalls, 1);
+      assert.equal(queries[1]?.closeCalls, 1);
+    }).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          releaseRetry.resolve();
+          releaseFreshDiscovery.resolve();
+        }),
+      ),
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(layer),
+    );
+  });
+
+  it.effect("stopAll attempts session cleanup when command-discovery cleanup fails", () => {
+    const queries: Array<FakeClaudeQuery> = [];
+    const teardownPids: Array<number> = [];
+    let spawnCalls = 0;
+    let discoveryCleanupCalls = 0;
+    const layer = makeClaudeAdapterLive({
+      createQuery: (input) => {
+        const query = new FakeClaudeQuery();
+        if (queries.length === 0) {
+          (query as { supportedCommands: () => Promise<Array<never>> }).supportedCommands =
+            async () => {
+              throw new Error("command discovery failed");
+            };
+        }
+        queries.push(query);
+        input.options.spawnClaudeCodeProcess?.({
+          command: "claude",
+          args: [],
+          env: {},
+          signal: new AbortController().signal,
+        });
+        return query;
+      },
+      spawnClaudeCodeProcess: () => {
+        spawnCalls += 1;
+        return {
+          pid: 76_100 + spawnCalls,
+          exitCode: 0,
+          signalCode: null,
+        } as unknown as ClaudeOwnedProcess;
+      },
+      teardownProcessTree: async ({ rootPid }) => {
+        teardownPids.push(rootPid);
+        if (rootPid === 76_101) {
+          discoveryCleanupCalls += 1;
+          if (discoveryCleanupCalls < 3) {
+            throw new Error(`discovery cleanup failed ${String(discoveryCleanupCalls)}`);
+          }
+        }
+        return { escalated: false, signalErrors: [] };
+      },
+    }).pipe(
+      Layer.provideMerge(ServerConfig.layerTest("/tmp/claude-adapter-test", "/tmp")),
+      Layer.provideMerge(NodeServices.layer),
+    );
+
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const listCommands = adapter.listCommands;
+      if (!listCommands) return assert.fail("Expected Claude command discovery support.");
+      yield* listCommands({
+        provider: "claudeAgent",
+        cwd: "/tmp/claude-command-discovery",
+        forceReload: true,
+      }).pipe(Effect.ignore);
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: "claudeAgent",
+        runtimeMode: "full-access",
+      });
+
+      const stopped = yield* adapter.stopAll().pipe(Effect.result);
+      assert.equal(stopped._tag, "Failure");
+      if (stopped._tag === "Failure") {
+        assert.instanceOf(stopped.failure, ProviderAdapterProcessError);
+        assert.instanceOf(stopped.failure.cause, AggregateError);
+      }
+      assert.deepEqual(teardownPids.slice(0, 3), [76_101, 76_101, 76_102]);
+      assert.equal(queries[0]?.closeCalls, 0);
+      assert.equal(queries[1]?.closeCalls, 1);
+      assert.equal(yield* adapter.hasSession(THREAD_ID), false);
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(layer),
@@ -6732,6 +7037,102 @@ await agent("Draft the spec", { label: "delta-agent", phase: "Two" });
       Effect.provide(layer),
     );
   });
+
+  it.effect(
+    "retains a failed pre-install process owner and gates concurrent replacement starts",
+    () => {
+      const queries: Array<FakeClaudeQuery> = [];
+      let createCalls = 0;
+      let spawnCalls = 0;
+      let teardownCalls = 0;
+      let proveRetry: (() => void) | undefined;
+      const retryProof = new Promise<void>((resolve) => {
+        proveRetry = resolve;
+      });
+      const layer = makeClaudeAdapterLive({
+        createQuery: (input) => {
+          createCalls += 1;
+          input.options.spawnClaudeCodeProcess?.({
+            command: "claude",
+            args: [],
+            env: {},
+            signal: new AbortController().signal,
+          });
+          if (createCalls === 1) {
+            throw new Error("startup failed after spawning");
+          }
+          const query = new FakeClaudeQuery();
+          queries.push(query);
+          return query;
+        },
+        spawnClaudeCodeProcess: () => {
+          spawnCalls += 1;
+          return {
+            pid: 76_000 + spawnCalls,
+            exitCode: 0,
+            signalCode: null,
+          } as unknown as ClaudeOwnedProcess;
+        },
+        teardownProcessTree: async () => {
+          teardownCalls += 1;
+          if (teardownCalls === 1) {
+            throw new Error("pre-install cleanup proof failed");
+          }
+          if (teardownCalls === 2) {
+            await retryProof;
+          }
+          return { escalated: false, signalErrors: [] };
+        },
+      }).pipe(
+        Layer.provideMerge(ServerConfig.layerTest("/tmp/claude-adapter-test", "/tmp")),
+        Layer.provideMerge(NodeServices.layer),
+      );
+
+      return Effect.gen(function* () {
+        const adapter = yield* ClaudeAdapter;
+        const input = {
+          threadId: THREAD_ID,
+          provider: "claudeAgent" as const,
+          runtimeMode: "full-access" as const,
+        };
+
+        const initial = yield* adapter.startSession(input).pipe(Effect.result);
+        assert.equal(initial._tag, "Failure");
+        if (initial._tag === "Failure") {
+          assert.instanceOf(initial.failure, ProviderAdapterProcessError);
+          assert.instanceOf(initial.failure.cause, AggregateError);
+          const causes = (initial.failure.cause as AggregateError).errors;
+          assert.match(String(causes[0]), /startup failed after spawning/);
+          assert.match(String(causes[1]), /pre-install cleanup proof failed/);
+        }
+        assert.equal(spawnCalls, 1);
+        assert.equal(teardownCalls, 1);
+
+        const replacementA = yield* adapter.startSession(input).pipe(Effect.forkChild);
+        yield* Effect.yieldNow;
+        yield* Effect.yieldNow;
+        assert.equal(teardownCalls, 2);
+        const replacementB = yield* adapter.startSession(input).pipe(Effect.forkChild);
+        yield* Effect.yieldNow;
+        yield* Effect.yieldNow;
+        assert.equal(spawnCalls, 1);
+        assert.equal(replacementA.pollUnsafe(), undefined);
+        assert.equal(replacementB.pollUnsafe(), undefined);
+
+        proveRetry?.();
+        yield* Fiber.join(replacementA);
+        yield* Fiber.join(replacementB);
+        assert.equal(spawnCalls, 3);
+        assert.equal(teardownCalls, 3);
+        assert.equal(queries[0]?.closeCalls, 1);
+        assert.equal(queries[1]?.closeCalls, 0);
+        assert.equal((yield* adapter.listSessions()).length, 1);
+      }).pipe(
+        Effect.provideService(Random.Random, makeDeterministicRandomService()),
+        Effect.provide(layer),
+      );
+    },
+  );
 
   it.effect("warns once when the per-request prompt nears the context window", () => {
     const harness = makeHarness();

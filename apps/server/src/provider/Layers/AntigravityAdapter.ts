@@ -16,7 +16,7 @@ import {
   TurnId,
 } from "@synara/contracts";
 import { prepareWindowsSafeProcess } from "@synara/shared/windowsProcess";
-import { Effect, Layer, Queue, Stream } from "effect";
+import { Effect, Layer, Queue, Result, Stream } from "effect";
 
 import { ServerConfig } from "../../config.ts";
 import { buildProviderChildEnvironment } from "../../providerChildEnvironment.ts";
@@ -35,6 +35,7 @@ import { teardownChildProcessTree } from "../supervisedProcessTeardown.ts";
 import {
   containPreparedWindowsProviderProcess,
   markWindowsProviderProcessSpawn,
+  windowsProviderProcessExitProofError,
 } from "../windowsProviderProcess.ts";
 
 const PROVIDER = "antigravity" as const;
@@ -79,6 +80,7 @@ export interface AntigravityTurnProcessResult extends AntigravityProcessOutput {
 export interface AntigravityTurnProcessLifecycle {
   readonly child: ChildProcess;
   readonly finalization: Promise<AntigravityTurnProcessResult>;
+  readonly retryTeardown: () => Promise<unknown>;
   readonly teardownAndFinalize: () => Promise<AntigravityTurnProcessResult>;
 }
 
@@ -120,6 +122,7 @@ type AntigravitySessionContext = {
   readonly turns: StoredTurn[];
   activeTurnId?: TurnId | undefined;
   activeLifecycle?: AntigravityTurnProcessLifecycle | undefined;
+  cleanupUnproven?: Error | undefined;
   activePrompt?: string | undefined;
   eventFile?: string | undefined;
   transcriptPath?: string | undefined;
@@ -138,6 +141,61 @@ type AntigravitySessionContext = {
 
 function messageFromCause(cause: unknown, fallback: string): string {
   return cause instanceof Error && cause.message.trim() ? cause.message : fallback;
+}
+
+function errorFromCause(cause: unknown, fallback: string): Error {
+  return cause instanceof Error ? cause : new Error(messageFromCause(cause, fallback));
+}
+
+type FailedAntigravityHelperCleanup = {
+  readonly child: ChildProcess;
+  readonly error: Error;
+  readonly retry: () => Promise<unknown>;
+};
+
+let failedAntigravityHelperCleanup: FailedAntigravityHelperCleanup | undefined;
+let antigravityHelperProcessLocked = false;
+const antigravityHelperProcessWaiters: Array<() => void> = [];
+
+type AntigravityHelperProcessOptions = {
+  readonly cwd?: string;
+  readonly timeoutMs?: number;
+  readonly dependencies?: AntigravityProcessDependencies;
+};
+
+async function retryFailedAntigravityHelperCleanup(): Promise<void> {
+  const priorCleanup = failedAntigravityHelperCleanup;
+  if (!priorCleanup) return;
+  try {
+    await priorCleanup.retry();
+  } catch (cause) {
+    const retryError = errorFromCause(
+      cause,
+      "The previous Antigravity helper process tree still could not be proven exited.",
+    );
+    throw new AggregateError(
+      [priorCleanup.error, retryError],
+      `The previous Antigravity helper process tree is still unproven: ${retryError.message}`,
+    );
+  }
+  if (failedAntigravityHelperCleanup === priorCleanup) {
+    failedAntigravityHelperCleanup = undefined;
+  }
+}
+
+async function withAntigravityHelperLock<T>(operation: () => Promise<T>): Promise<T> {
+  if (antigravityHelperProcessLocked) {
+    await new Promise<void>((resolve) => antigravityHelperProcessWaiters.push(resolve));
+  } else {
+    antigravityHelperProcessLocked = true;
+  }
+  try {
+    return await operation();
+  } finally {
+    const next = antigravityHelperProcessWaiters.shift();
+    if (next) next();
+    else antigravityHelperProcessLocked = false;
+  }
 }
 
 function trim(value: string | null | undefined): string | undefined {
@@ -283,6 +341,7 @@ function spawnAntigravityProcess(
   const prepareInput = {
     cwd: options.cwd,
     env: options.env,
+    completionReceipt: "create" as const,
   };
   const prepared = (options.dependencies?.containProcess ?? containPreparedWindowsProviderProcess)(
     (options.dependencies?.prepareProcess ?? prepareWindowsSafeProcess)(
@@ -306,15 +365,13 @@ function spawnAntigravityProcess(
   );
 }
 
-export async function runAntigravityHelperProcess(
+async function runAntigravityHelperProcessExclusive(
   command: string,
   args: string[],
-  options: {
-    cwd?: string;
-    timeoutMs?: number;
-    dependencies?: AntigravityProcessDependencies;
-  } = {},
+  options: AntigravityHelperProcessOptions,
 ): Promise<AntigravityProcessOutput & { code: number }> {
+  if (failedAntigravityHelperCleanup) await retryFailedAntigravityHelperCleanup();
+
   const env = buildProviderChildEnvironment({ provider: PROVIDER });
   const child = spawnAntigravityProcess(command, args, {
     ...(options.cwd ? { cwd: options.cwd } : {}),
@@ -356,14 +413,48 @@ export async function runAntigravityHelperProcess(
         } catch (cause) {
           teardown = Promise.reject(cause);
         }
+        const attempt = teardown;
+        void attempt.catch(() => {
+          if (teardown === attempt) teardown = undefined;
+        });
       }
       return teardown;
     };
+    const retainFailedCleanup = (cause: unknown): Error => {
+      const error = errorFromCause(
+        cause,
+        "The Antigravity helper process tree could not be proven exited.",
+      );
+      failedAntigravityHelperCleanup = { child, error, retry: beginTeardown };
+      return error;
+    };
     const onError = (cause: Error) => {
-      if (claim()) reject(cause);
+      if (!claim()) return;
+      if (child.pid === undefined) {
+        reject(cause);
+        return;
+      }
+      void beginTeardown().then(
+        () => reject(cause),
+        (teardownCause) => {
+          const teardownError = retainFailedCleanup(teardownCause);
+          reject(new AggregateError([cause, teardownError], cause.message));
+        },
+      );
     };
     const onClose = (code: number | null) => {
-      if (claim()) resolve({ ...output.snapshot(), code: code ?? 1 });
+      if (!claim()) return;
+      const processExitProofError = windowsProviderProcessExitProofError(child);
+      if (processExitProofError) {
+        failedAntigravityHelperCleanup = {
+          child,
+          error: processExitProofError,
+          retry: beginTeardown,
+        };
+        reject(processExitProofError);
+      } else {
+        resolve({ ...output.snapshot(), code: code ?? 1 });
+      }
     };
     const timer = setTimeout(() => {
       if (!claim()) return;
@@ -372,8 +463,10 @@ export async function runAntigravityHelperProcess(
       );
       void beginTeardown().then(
         () => reject(timeoutError),
-        (teardownError) =>
-          reject(new AggregateError([timeoutError, teardownError], timeoutError.message)),
+        (teardownCause) => {
+          const teardownError = retainFailedCleanup(teardownCause);
+          reject(new AggregateError([timeoutError, teardownError], timeoutError.message));
+        },
       );
     }, timeoutMs);
 
@@ -382,6 +475,16 @@ export async function runAntigravityHelperProcess(
     child.once("error", onError);
     child.once("close", onClose);
   });
+}
+
+export async function runAntigravityHelperProcess(
+  command: string,
+  args: string[],
+  options: AntigravityHelperProcessOptions = {},
+): Promise<AntigravityProcessOutput & { code: number }> {
+  return await withAntigravityHelperLock(() =>
+    runAntigravityHelperProcessExclusive(command, args, options),
+  );
 }
 
 export function startAntigravityTurnProcess(input: {
@@ -431,6 +534,10 @@ export function startAntigravityTurnProcess(input: {
       } catch (cause) {
         teardown = Promise.reject(cause);
       }
+      const attempt = teardown;
+      void attempt.catch(() => {
+        if (teardown === attempt) teardown = undefined;
+      });
     }
     return teardown;
   };
@@ -446,13 +553,19 @@ export function startAntigravityTurnProcess(input: {
     void (async () => {
       let teardownError = terminal.teardownError;
       const abnormalExit = terminal.signal !== null || (terminal.code ?? 1) !== 0;
-      const mustAwaitTeardown = teardownRequested || (!terminal.spawnError && abnormalExit);
+      const mustAwaitTeardown =
+        teardownRequested ||
+        (!terminal.spawnError && abnormalExit) ||
+        (terminal.spawnError !== undefined && child.pid !== undefined);
       if (mustAwaitTeardown && !teardownError) {
         try {
           await beginTeardown();
         } catch (cause) {
           teardownError = cause;
         }
+      }
+      if (!mustAwaitTeardown && !terminal.spawnError && !teardownError) {
+        teardownError = windowsProviderProcessExitProofError(child);
       }
       const result: AntigravityTurnProcessResult = {
         ...output.snapshot(),
@@ -502,7 +615,7 @@ export function startAntigravityTurnProcess(input: {
   child.once("error", onError);
   child.once("close", onClose);
 
-  return { child, finalization, teardownAndFinalize };
+  return { child, finalization, retryTeardown: beginTeardown, teardownAndFinalize };
 }
 
 export async function readCompleteAntigravityLines(
@@ -772,7 +885,8 @@ const makeAntigravityAdapter = Effect.fn(function* (options: AntigravityAdapterL
     const lifecycle = context.activeLifecycle;
     if (!lifecycle) return Effect.void;
     return Effect.tryPromise({
-      try: () => lifecycle.teardownAndFinalize(),
+      try: () =>
+        context.cleanupUnproven ? lifecycle.retryTeardown() : lifecycle.teardownAndFinalize(),
       catch: (cause) =>
         new ProviderAdapterRequestError({
           provider: PROVIDER,
@@ -780,7 +894,26 @@ const makeAntigravityAdapter = Effect.fn(function* (options: AntigravityAdapterL
           detail: messageFromCause(cause, "Failed to stop the Antigravity process tree."),
           cause,
         }),
-    }).pipe(Effect.asVoid);
+    }).pipe(
+      Effect.tap(() =>
+        Effect.sync(() => {
+          if (context.activeLifecycle !== lifecycle) return;
+          delete context.cleanupUnproven;
+          delete context.activeLifecycle;
+          const {
+            activeTurnId: _activeTurnId,
+            lastError: _lastError,
+            ...inactiveSession
+          } = context.session;
+          context.session = {
+            ...inactiveSession,
+            status: "ready",
+            updatedAt: new Date().toISOString(),
+          };
+        }),
+      ),
+      Effect.asVoid,
+    );
   };
 
   const currentTurn = (context: AntigravitySessionContext): StoredTurn | undefined =>
@@ -1081,7 +1214,9 @@ const makeAntigravityAdapter = Effect.fn(function* (options: AntigravityAdapterL
         return yield* new ProviderAdapterValidationError({
           provider: PROVIDER,
           operation: "turn/start",
-          issue: "An Antigravity turn is already active for this thread.",
+          issue: context.cleanupUnproven
+            ? `The previous Antigravity process tree is still unproven: ${context.cleanupUnproven.message}`
+            : "An Antigravity turn is already active for this thread.",
         });
       }
       const prompt = appendFileAttachmentsPromptBlock({
@@ -1248,7 +1383,15 @@ const makeAntigravityAdapter = Effect.fn(function* (options: AntigravityAdapterL
                 }),
               } satisfies ProviderRuntimeEvent);
             }
-            delete context.activeLifecycle;
+            if (result.teardownError) {
+              context.cleanupUnproven = errorFromCause(
+                result.teardownError,
+                "Failed to prove the Antigravity process tree exited.",
+              );
+            } else {
+              delete context.cleanupUnproven;
+              delete context.activeLifecycle;
+            }
             delete context.activeTurnId;
             delete context.activePrompt;
             delete context.eventFile;
@@ -1417,14 +1560,43 @@ const makeAntigravityAdapter = Effect.fn(function* (options: AntigravityAdapterL
         }),
     });
 
+  const cleanupHelperProcess = Effect.tryPromise({
+    try: () => withAntigravityHelperLock(retryFailedAntigravityHelperCleanup),
+    catch: (cause) =>
+      new ProviderAdapterRequestError({
+        provider: PROVIDER,
+        method: "helper/cleanup",
+        detail: messageFromCause(
+          cause,
+          "Failed to prove the Antigravity helper process tree exited.",
+        ),
+        cause,
+      }),
+  });
+
   const stopAll = () =>
-    Effect.forEach([...sessions.keys()], (threadId) => stopSession(threadId), {
-      concurrency: "unbounded",
-      discard: true,
-    }).pipe(Effect.asVoid);
+    Effect.gen(function* () {
+      const sessionResults = yield* Effect.forEach(
+        [...sessions.keys()],
+        (threadId) => stopSession(threadId).pipe(Effect.result),
+        { concurrency: "unbounded" },
+      );
+      const helperResult = yield* cleanupHelperProcess.pipe(Effect.result);
+      const failures = [...sessionResults, helperResult]
+        .filter(Result.isFailure)
+        .map((result) => result.failure);
+      if (failures.length > 0) {
+        return yield* new ProviderAdapterRequestError({
+          provider: PROVIDER,
+          method: "session/stop-all",
+          detail: `Failed to prove cleanup for ${failures.length} Antigravity owner${failures.length === 1 ? "" : "s"}.`,
+          cause: new AggregateError(failures, "Antigravity stop-all cleanup failed."),
+        });
+      }
+    });
 
   yield* Effect.addFinalizer(() =>
-    stopAll().pipe(Effect.ignore, Effect.andThen(Queue.shutdown(events))),
+    stopAll().pipe(Effect.orDie, Effect.ensuring(Queue.shutdown(events))),
   );
 
   return {

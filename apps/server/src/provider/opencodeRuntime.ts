@@ -46,9 +46,12 @@ import {
   teardownProviderProcessTree,
 } from "./supervisedProcessTeardown.ts";
 import { isWindowsShellCommandMissingResult } from "../shell-command-detection.ts";
+import { teardownPosixProcessGroup as teardownOwnedPosixProcessGroup } from "./posixProcessGroup.ts";
 import {
+  isWindowsJobContainedProviderProcess,
   markWindowsProviderProcessSpawn,
   prepareWindowsProviderProcess,
+  recordWindowsProviderProcessExit,
 } from "./windowsProviderProcess.ts";
 
 const DEFAULT_OPENCODE_SERVER_TIMEOUT_MS = 20_000;
@@ -103,10 +106,31 @@ interface PooledOpenCodeServer {
   readonly key: string;
   readonly server: OpenCodeServerProcess;
   readonly scope: Scope.Closeable;
+  readonly owner: OpenCodeProcessOwner;
   readonly closeOnRelease: boolean;
+  exited: boolean;
   refCount: number;
   idleCloseFiber: Fiber.Fiber<void, never> | null;
   exitWatchFiber: Fiber.Fiber<void, never> | null;
+}
+
+interface OpenCodeProcessOwner {
+  readonly scope: Scope.Scope;
+  readonly cleanup: () => Effect.Effect<void, OpenCodeRuntimeError>;
+}
+
+interface RetainedOpenCodeStartupCleanup {
+  readonly scope: Scope.Closeable;
+  readonly owner: OpenCodeProcessOwner;
+  readonly startupFailure: unknown;
+  cleanupFailure: unknown;
+}
+
+interface RetainedOpenCodeCommandCleanup {
+  readonly scope: Scope.Closeable;
+  readonly owner: OpenCodeProcessOwner;
+  readonly operationFailure?: unknown;
+  cleanupFailure: unknown;
 }
 
 const OPENCODE_RUNTIME_ERROR_TAG = "OpenCodeRuntimeError";
@@ -845,8 +869,13 @@ const collectStreamAsString = <E>(stream: Stream.Stream<Uint8Array, E>): Effect.
 export interface OpenCodeRuntimeLiveOptions {
   readonly prepareProcess?: typeof prepareWindowsProviderProcess;
   readonly teardownProcessTree?: typeof teardownProviderProcessTree;
+  readonly teardownPosixProcessGroup?: (processGroupId: number) => Promise<void>;
+  readonly platform?: NodeJS.Platform;
   readonly netService?: NetServiceShape;
 }
+
+const teardownOpenCodePosixProcessGroup = (processGroupId: number): Promise<void> =>
+  teardownOwnedPosixProcessGroup(processGroupId, { displayName: "OpenCode" });
 
 const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
   Effect.gen(function* () {
@@ -856,182 +885,392 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
       Scope.close(scope, Exit.void),
     );
     const pooledServerMutex = yield* Semaphore.make(1);
+    const oneShotCommandMutex = yield* Semaphore.make(1);
     const pooledServers = new Map<string, PooledOpenCodeServer>();
+    const serverProcessOwners = new Map<Scope.Scope, OpenCodeProcessOwner>();
+    let retainedPooledStartupCleanup: RetainedOpenCodeStartupCleanup | null = null;
+    let retainedCommandCleanup: RetainedOpenCodeCommandCleanup | null = null;
+    const runtimePlatform = options?.platform ?? process.platform;
+
+    const makeProcessOwner = (input: {
+      readonly scope: Scope.Scope;
+      readonly child: { readonly pid: number; readonly exitCode: Effect.Effect<unknown, unknown> };
+      readonly displayName: string;
+      readonly cleanupOperation: string;
+      readonly onCleanupSuccess?: () => void;
+    }): OpenCodeProcessOwner => {
+      let cleanupPromise: Promise<unknown> | undefined;
+      return {
+        scope: input.scope,
+        cleanup: () =>
+          Effect.tryPromise({
+            try: () => {
+              if (!cleanupPromise) {
+                const cleanup =
+                  runtimePlatform !== "win32" &&
+                  !isWindowsJobContainedProviderProcess(input.child) &&
+                  (options?.teardownPosixProcessGroup !== undefined ||
+                    options?.teardownProcessTree === undefined)
+                    ? (options?.teardownPosixProcessGroup ?? teardownOpenCodePosixProcessGroup)(
+                        Number(input.child.pid),
+                      )
+                    : teardownEffectProcessTree(
+                        input.child,
+                        options?.teardownProcessTree ?? teardownProviderProcessTree,
+                      );
+                cleanupPromise = cleanup;
+                void cleanup.catch(() => {
+                  if (cleanupPromise === cleanup) cleanupPromise = undefined;
+                });
+              }
+              return cleanupPromise;
+            },
+            catch: (cause) =>
+              new OpenCodeRuntimeError({
+                operation: input.cleanupOperation,
+                detail: `Failed to prove ${input.displayName} process-tree exit: ${openCodeRuntimeErrorDetail(cause)}`,
+                cause,
+              }),
+          }).pipe(
+            Effect.tap(() => Effect.sync(() => input.onCleanupSuccess?.())),
+            Effect.asVoid,
+          ),
+      };
+    };
+
+    const retryRetainedCommandCleanup = Effect.fn("retryRetainedCommandCleanup")(function* () {
+      const retained = retainedCommandCleanup;
+      if (!retained) return;
+      const retryExit = yield* Effect.exit(retained.owner.cleanup());
+      if (Exit.isFailure(retryExit)) {
+        const retryFailure = Cause.squash(retryExit.cause);
+        const priorFailures: Array<unknown> = [];
+        if (retained.operationFailure !== undefined) {
+          priorFailures.push(retained.operationFailure);
+        }
+        priorFailures.push(retained.cleanupFailure);
+        const aggregate = new AggregateError(
+          [...priorFailures, retryFailure],
+          "OpenCode command cleanup remains unproven after retry.",
+        );
+        retained.cleanupFailure = aggregate;
+        return yield* new OpenCodeRuntimeError({
+          operation: "runOpenCodeCommand",
+          detail: aggregate.message,
+          cause: aggregate,
+        });
+      }
+      if (retainedCommandCleanup === retained) retainedCommandCleanup = null;
+    });
 
     const runOpenCodeCommand: OpenCodeRuntimeShape["runOpenCodeCommand"] = (input) =>
-      Effect.gen(function* () {
-        const childEnv = buildOpenCodeServerProcessEnv({
-          ...(input.cliSpec ? { cliSpec: input.cliSpec } : {}),
-        });
-        const prepared = (options?.prepareProcess ?? prepareWindowsProviderProcess)(
-          input.binaryPath,
-          input.args,
-          {
-            cwd: input.cwd,
-            env: childEnv,
-          },
-        );
-        const child = yield* spawner.spawn(
-          ChildProcess.make(prepared.command, prepared.args, {
-            shell: prepared.shell,
-            ...(prepared.windowsHide ? { windowsHide: true } : {}),
-            ...(prepared.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
-            ...(input.cwd ? { cwd: input.cwd } : {}),
-            env: childEnv,
-          }),
-        );
-        const [stdout, stderr, code] = yield* Effect.all(
-          [
-            collectStreamAsString(child.stdout),
-            collectStreamAsString(child.stderr),
-            child.exitCode,
-          ],
-          { concurrency: "unbounded" },
-        );
-        const exitCode = Number(code);
-        if (isWindowsShellCommandMissingResult({ code: exitCode, stderr })) {
-          return yield* new OpenCodeRuntimeError({
-            operation: "runOpenCodeCommand",
-            detail: `spawn ${input.binaryPath} ENOENT`,
-          });
-        }
-        return {
-          stdout,
-          stderr,
-          code: exitCode,
-        } satisfies OpenCodeCommandResult;
-      }).pipe(
-        Effect.scoped,
-        Effect.mapError((cause) =>
-          ensureRuntimeError(
-            "runOpenCodeCommand",
-            `Failed to execute '${input.binaryPath} ${input.args.join(" ")}': ${openCodeRuntimeErrorDetail(cause)}`,
-            cause,
+      oneShotCommandMutex
+        .withPermit(
+          Effect.uninterruptibleMask((restore) =>
+            Effect.gen(function* () {
+              yield* retryRetainedCommandCleanup();
+              const commandScope = yield* Scope.make();
+              let owner: OpenCodeProcessOwner | undefined;
+              const operationExit = yield* Effect.exit(
+                Effect.gen(function* () {
+                  const childEnv = buildOpenCodeServerProcessEnv({
+                    ...(input.cliSpec ? { cliSpec: input.cliSpec } : {}),
+                  });
+                  const prepared = (options?.prepareProcess ?? prepareWindowsProviderProcess)(
+                    input.binaryPath,
+                    input.args,
+                    {
+                      cwd: input.cwd,
+                      env: childEnv,
+                      completionReceipt: "create",
+                    },
+                  );
+                  const spawnedChild = yield* spawner.spawn(
+                    ChildProcess.make(prepared.command, prepared.args, {
+                      shell: prepared.shell,
+                      ...(prepared.windowsHide ? { windowsHide: true } : {}),
+                      ...(prepared.windowsVerbatimArguments
+                        ? { windowsVerbatimArguments: true }
+                        : {}),
+                      ...(input.cwd ? { cwd: input.cwd } : {}),
+                      env: childEnv,
+                      detached: runtimePlatform !== "win32",
+                    }),
+                  );
+                  const child = markWindowsProviderProcessSpawn(spawnedChild, prepared, true);
+                  owner = makeProcessOwner({
+                    scope: commandScope,
+                    child,
+                    displayName: `${input.cliSpec?.displayName ?? OPENCODE_CLI_SPEC.displayName} command`,
+                    cleanupOperation: "runOpenCodeCommand",
+                  });
+                  yield* Scope.addFinalizer(commandScope, owner.cleanup().pipe(Effect.orDie));
+
+                  return yield* restore(
+                    Effect.gen(function* () {
+                      const observedExitCode = child.exitCode.pipe(
+                        Effect.tap(() =>
+                          Effect.sync(() => {
+                            recordWindowsProviderProcessExit(child);
+                          }),
+                        ),
+                      );
+                      const [stdout, stderr, code] = yield* Effect.all(
+                        [
+                          collectStreamAsString(child.stdout),
+                          collectStreamAsString(child.stderr),
+                          observedExitCode,
+                        ],
+                        { concurrency: "unbounded" },
+                      );
+                      const exitCode = Number(code);
+                      if (isWindowsShellCommandMissingResult({ code: exitCode, stderr })) {
+                        return yield* new OpenCodeRuntimeError({
+                          operation: "runOpenCodeCommand",
+                          detail: `spawn ${input.binaryPath} ENOENT`,
+                        });
+                      }
+                      return {
+                        stdout,
+                        stderr,
+                        code: exitCode,
+                      } satisfies OpenCodeCommandResult;
+                    }),
+                  );
+                }).pipe(Effect.provideService(Scope.Scope, commandScope)),
+              );
+              const closeExit = yield* Effect.exit(Scope.close(commandScope, Exit.void));
+              if (Exit.isFailure(closeExit)) {
+                const operationFailure = Exit.isFailure(operationExit)
+                  ? Cause.squash(operationExit.cause)
+                  : undefined;
+                const cleanupFailure = Cause.squash(closeExit.cause);
+                if (owner) {
+                  retainedCommandCleanup = {
+                    scope: commandScope,
+                    owner,
+                    ...(operationFailure !== undefined ? { operationFailure } : {}),
+                    cleanupFailure,
+                  };
+                }
+                const failures: Array<unknown> = [];
+                if (operationFailure !== undefined) failures.push(operationFailure);
+                failures.push(cleanupFailure);
+                const aggregate = new AggregateError(
+                  failures,
+                  "OpenCode command execution and owned process cleanup did not both complete.",
+                );
+                return yield* new OpenCodeRuntimeError({
+                  operation: "runOpenCodeCommand",
+                  detail: aggregate.message,
+                  cause: aggregate,
+                });
+              }
+              if (Exit.isFailure(operationExit)) {
+                return yield* Effect.failCause(operationExit.cause);
+              }
+              return operationExit.value;
+            }),
           ),
-        ),
-      );
+        )
+        .pipe(
+          Effect.mapError((cause) =>
+            ensureRuntimeError(
+              "runOpenCodeCommand",
+              `Failed to execute '${input.binaryPath} ${input.args.join(" ")}': ${openCodeRuntimeErrorDetail(cause)}`,
+              cause,
+            ),
+          ),
+        );
 
     const startOpenCodeServerProcess: OpenCodeRuntimeShape["startOpenCodeServerProcess"] = (
       input,
     ) =>
-      Effect.gen(function* () {
-        const runtimeScope = yield* Scope.Scope;
-        const cliSpec = input.cliSpec ?? OPENCODE_CLI_SPEC;
+      Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function* () {
+          const runtimeScope = yield* Scope.Scope;
+          const cliSpec = input.cliSpec ?? OPENCODE_CLI_SPEC;
 
-        const hostname = input.hostname ?? DEFAULT_HOSTNAME;
-        const port =
-          input.port ??
-          (yield* netService.findAvailablePort(0).pipe(
-            Effect.mapError(
-              (cause) =>
-                new OpenCodeRuntimeError({
-                  operation: "startOpenCodeServerProcess",
-                  detail: `Failed to find available port: ${openCodeRuntimeErrorDetail(cause)}`,
-                  cause,
-                }),
-            ),
-          ));
-        const timeoutMs = input.timeoutMs ?? DEFAULT_OPENCODE_SERVER_TIMEOUT_MS;
-        const args = ["serve", "--hostname", hostname, "--port", String(port)];
-        const childEnv = buildOpenCodeServerProcessEnv({
-          cliSpec,
-          ...(input.experimentalWebSockets !== undefined
-            ? { experimentalWebSockets: input.experimentalWebSockets }
-            : {}),
-        });
-        const prepared = (options?.prepareProcess ?? prepareWindowsProviderProcess)(
-          input.binaryPath,
-          args,
-          {
-            cwd: input.cwd,
-            env: childEnv,
-          },
-        );
-
-        const spawnedChild = yield* spawner
-          .spawn(
-            ChildProcess.make(prepared.command, prepared.args, {
-              env: childEnv,
-              ...(input.cwd ? { cwd: input.cwd } : {}),
-              shell: prepared.shell,
-              ...(prepared.windowsHide ? { windowsHide: true } : {}),
-              ...(prepared.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
-              detached: false,
-              killSignal: "SIGKILL",
-              forceKillAfter: "1500 millis",
-            }),
-          )
-          .pipe(
-            Effect.provideService(Scope.Scope, runtimeScope),
-            Effect.mapError(
-              (cause) =>
-                new OpenCodeRuntimeError({
-                  operation: "startOpenCodeServerProcess",
-                  detail: `Failed to spawn OpenCode server process: ${openCodeRuntimeErrorDetail(cause)}`,
-                  cause,
-                }),
-            ),
-          );
-        const child = markWindowsProviderProcessSpawn(spawnedChild, prepared, true);
-        yield* Scope.addFinalizer(
-          runtimeScope,
-          Effect.tryPromise({
-            try: () =>
-              teardownEffectProcessTree(
-                child,
-                options?.teardownProcessTree ?? teardownProviderProcessTree,
+          const hostname = input.hostname ?? DEFAULT_HOSTNAME;
+          const port =
+            input.port ??
+            (yield* restore(
+              netService.findAvailablePort(0).pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new OpenCodeRuntimeError({
+                      operation: "startOpenCodeServerProcess",
+                      detail: `Failed to find available port: ${openCodeRuntimeErrorDetail(cause)}`,
+                      cause,
+                    }),
+                ),
               ),
-            catch: (cause) =>
-              new OpenCodeRuntimeError({
-                operation: "stopOpenCodeServerProcess",
-                detail: `Failed to prove ${cliSpec.displayName} server process-tree exit: ${openCodeRuntimeErrorDetail(cause)}`,
-                cause,
-              }),
-          }).pipe(Effect.asVoid, Effect.orDie),
-        );
-
-        const stdoutRef = yield* Ref.make("");
-        const stderrRef = yield* Ref.make("");
-        const readyDeferred = yield* Deferred.make<string, OpenCodeRuntimeError>();
-
-        const setReadyFromStdoutChunk = (chunk: string) =>
-          Ref.updateAndGet(stdoutRef, (stdout) => `${stdout}${chunk}`).pipe(
-            Effect.flatMap((nextStdout) => {
-              const parsed = parseServerUrlFromOutput(nextStdout, cliSpec.serverReadyPrefix);
-              return parsed
-                ? Deferred.succeed(readyDeferred, parsed).pipe(Effect.ignore)
-                : Effect.void;
-            }),
+            ));
+          const timeoutMs = input.timeoutMs ?? DEFAULT_OPENCODE_SERVER_TIMEOUT_MS;
+          const args = ["serve", "--hostname", hostname, "--port", String(port)];
+          const childEnv = buildOpenCodeServerProcessEnv({
+            cliSpec,
+            ...(input.experimentalWebSockets !== undefined
+              ? { experimentalWebSockets: input.experimentalWebSockets }
+              : {}),
+          });
+          const prepared = (options?.prepareProcess ?? prepareWindowsProviderProcess)(
+            input.binaryPath,
+            args,
+            {
+              cwd: input.cwd,
+              env: childEnv,
+              completionReceipt: "create",
+            },
           );
 
-        const stdoutFiber = yield* child.stdout.pipe(
-          Stream.decodeText(),
-          Stream.runForEach(setReadyFromStdoutChunk),
-          Effect.ignore,
-          Effect.forkIn(runtimeScope),
-        );
-        const stderrFiber = yield* child.stderr.pipe(
-          Stream.decodeText(),
-          Stream.runForEach((chunk) => Ref.update(stderrRef, (stderr) => `${stderr}${chunk}`)),
-          Effect.ignore,
-          Effect.forkIn(runtimeScope),
-        );
-
-        const exitFiber = yield* child.exitCode.pipe(
-          Effect.flatMap((code) =>
+          const spawnedChild = yield* spawner
+            .spawn(
+              ChildProcess.make(prepared.command, prepared.args, {
+                env: childEnv,
+                ...(input.cwd ? { cwd: input.cwd } : {}),
+                shell: prepared.shell,
+                ...(prepared.windowsHide ? { windowsHide: true } : {}),
+                ...(prepared.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
+                detached: runtimePlatform !== "win32",
+                killSignal: "SIGKILL",
+                forceKillAfter: "1500 millis",
+              }),
+            )
+            .pipe(
+              Effect.provideService(Scope.Scope, runtimeScope),
+              Effect.mapError(
+                (cause) =>
+                  new OpenCodeRuntimeError({
+                    operation: "startOpenCodeServerProcess",
+                    detail: `Failed to spawn OpenCode server process: ${openCodeRuntimeErrorDetail(cause)}`,
+                    cause,
+                  }),
+              ),
+            );
+          const child = markWindowsProviderProcessSpawn(spawnedChild, prepared, true);
+          let processOwner!: OpenCodeProcessOwner;
+          processOwner = makeProcessOwner({
+            scope: runtimeScope,
+            child,
+            displayName: `${cliSpec.displayName} server`,
+            cleanupOperation: "stopOpenCodeServerProcess",
+            onCleanupSuccess: () => {
+              if (serverProcessOwners.get(runtimeScope) === processOwner) {
+                serverProcessOwners.delete(runtimeScope);
+              }
+            },
+          });
+          serverProcessOwners.set(runtimeScope, processOwner);
+          yield* Scope.addFinalizer(runtimeScope, processOwner.cleanup().pipe(Effect.orDie));
+          return yield* restore(
             Effect.gen(function* () {
-              const stdout = yield* Ref.get(stdoutRef);
-              const stderr = yield* Ref.get(stderrRef);
-              const redactedStdout = redactStartupOutput(stdout);
-              const redactedStderr = redactStartupOutput(stderr);
-              const exitCode = Number(code);
-              yield* Deferred.fail(
-                readyDeferred,
-                new OpenCodeRuntimeError({
+              const observedExitCode = child.exitCode.pipe(
+                Effect.tap(() =>
+                  Effect.sync(() => {
+                    recordWindowsProviderProcessExit(child);
+                  }),
+                ),
+              );
+
+              const stdoutRef = yield* Ref.make("");
+              const stderrRef = yield* Ref.make("");
+              const readyDeferred = yield* Deferred.make<string, OpenCodeRuntimeError>();
+
+              const setReadyFromStdoutChunk = (chunk: string) =>
+                Ref.updateAndGet(stdoutRef, (stdout) => `${stdout}${chunk}`).pipe(
+                  Effect.flatMap((nextStdout) => {
+                    const parsed = parseServerUrlFromOutput(nextStdout, cliSpec.serverReadyPrefix);
+                    return parsed
+                      ? Deferred.succeed(readyDeferred, parsed).pipe(Effect.ignore)
+                      : Effect.void;
+                  }),
+                );
+
+              const stdoutFiber = yield* child.stdout.pipe(
+                Stream.decodeText(),
+                Stream.runForEach(setReadyFromStdoutChunk),
+                Effect.ignore,
+                Effect.forkIn(runtimeScope),
+              );
+              const stderrFiber = yield* child.stderr.pipe(
+                Stream.decodeText(),
+                Stream.runForEach((chunk) =>
+                  Ref.update(stderrRef, (stderr) => `${stderr}${chunk}`),
+                ),
+                Effect.ignore,
+                Effect.forkIn(runtimeScope),
+              );
+
+              const exitFiber = yield* observedExitCode.pipe(
+                Effect.flatMap((code) =>
+                  Effect.gen(function* () {
+                    const stdout = yield* Ref.get(stdoutRef);
+                    const stderr = yield* Ref.get(stderrRef);
+                    const redactedStdout = redactStartupOutput(stdout);
+                    const redactedStderr = redactStartupOutput(stderr);
+                    const exitCode = Number(code);
+                    yield* Deferred.fail(
+                      readyDeferred,
+                      new OpenCodeRuntimeError({
+                        operation: "startOpenCodeServerProcess",
+                        detail: formatOpenCodeServerStartupDetail({
+                          displayName: cliSpec.displayName,
+                          summary: `${cliSpec.displayName} server exited before startup completed (code: ${String(exitCode)}).`,
+                          binaryPath: input.binaryPath,
+                          args,
+                          readyPrefix: cliSpec.serverReadyPrefix,
+                          stdout: redactedStdout,
+                          stderr: redactedStderr,
+                        }),
+                        cause: {
+                          exitCode,
+                          stdout: redactedStdout,
+                          stderr: redactedStderr,
+                          binaryPath: input.binaryPath,
+                          args,
+                          readyPrefix: cliSpec.serverReadyPrefix,
+                        },
+                      }),
+                    ).pipe(Effect.ignore);
+                  }),
+                ),
+                Effect.ignore,
+                Effect.forkIn(runtimeScope),
+              );
+
+              const readyExit = yield* Effect.exit(
+                Deferred.await(readyDeferred).pipe(Effect.timeoutOption(timeoutMs)),
+              );
+
+              yield* Fiber.interrupt(stdoutFiber).pipe(Effect.ignore);
+              yield* Fiber.interrupt(stderrFiber).pipe(Effect.ignore);
+
+              if (Exit.isFailure(readyExit)) {
+                yield* Fiber.interrupt(exitFiber).pipe(Effect.ignore);
+                const squashed = Cause.squash(readyExit.cause);
+                return yield* ensureRuntimeError(
+                  "startOpenCodeServerProcess",
+                  [
+                    `Failed while waiting for ${cliSpec.displayName} server startup:`,
+                    openCodeRuntimeErrorDetail(squashed),
+                  ].join(" "),
+                  squashed,
+                );
+              }
+
+              const readyOption = readyExit.value;
+              if (Option.isNone(readyOption)) {
+                yield* Fiber.interrupt(exitFiber).pipe(Effect.ignore);
+                const stdout = yield* Ref.get(stdoutRef);
+                const stderr = yield* Ref.get(stderrRef);
+                const redactedStdout = redactStartupOutput(stdout);
+                const redactedStderr = redactStartupOutput(stderr);
+                return yield* new OpenCodeRuntimeError({
                   operation: "startOpenCodeServerProcess",
                   detail: formatOpenCodeServerStartupDetail({
                     displayName: cliSpec.displayName,
-                    summary: `${cliSpec.displayName} server exited before startup completed (code: ${String(exitCode)}).`,
+                    summary: `Timed out waiting for ${cliSpec.displayName} server start after ${timeoutMs}ms.`,
                     binaryPath: input.binaryPath,
                     args,
                     readyPrefix: cliSpec.serverReadyPrefix,
@@ -1039,78 +1278,27 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
                     stderr: redactedStderr,
                   }),
                   cause: {
-                    exitCode,
+                    timeoutMs,
                     stdout: redactedStdout,
                     stderr: redactedStderr,
                     binaryPath: input.binaryPath,
                     args,
                     readyPrefix: cliSpec.serverReadyPrefix,
                   },
-                }),
-              ).pipe(Effect.ignore);
+                });
+              }
+
+              return {
+                url: readyOption.value,
+                exitCode: observedExitCode.pipe(
+                  Effect.map(Number),
+                  Effect.orElseSucceed(() => 0),
+                ),
+              } satisfies OpenCodeServerProcess;
             }),
-          ),
-          Effect.ignore,
-          Effect.forkIn(runtimeScope),
-        );
-
-        const readyExit = yield* Effect.exit(
-          Deferred.await(readyDeferred).pipe(Effect.timeoutOption(timeoutMs)),
-        );
-
-        yield* Fiber.interrupt(stdoutFiber).pipe(Effect.ignore);
-        yield* Fiber.interrupt(stderrFiber).pipe(Effect.ignore);
-
-        if (Exit.isFailure(readyExit)) {
-          yield* Fiber.interrupt(exitFiber).pipe(Effect.ignore);
-          const squashed = Cause.squash(readyExit.cause);
-          return yield* ensureRuntimeError(
-            "startOpenCodeServerProcess",
-            [
-              `Failed while waiting for ${cliSpec.displayName} server startup:`,
-              openCodeRuntimeErrorDetail(squashed),
-            ].join(" "),
-            squashed,
           );
-        }
-
-        const readyOption = readyExit.value;
-        if (Option.isNone(readyOption)) {
-          yield* Fiber.interrupt(exitFiber).pipe(Effect.ignore);
-          const stdout = yield* Ref.get(stdoutRef);
-          const stderr = yield* Ref.get(stderrRef);
-          const redactedStdout = redactStartupOutput(stdout);
-          const redactedStderr = redactStartupOutput(stderr);
-          return yield* new OpenCodeRuntimeError({
-            operation: "startOpenCodeServerProcess",
-            detail: formatOpenCodeServerStartupDetail({
-              displayName: cliSpec.displayName,
-              summary: `Timed out waiting for ${cliSpec.displayName} server start after ${timeoutMs}ms.`,
-              binaryPath: input.binaryPath,
-              args,
-              readyPrefix: cliSpec.serverReadyPrefix,
-              stdout: redactedStdout,
-              stderr: redactedStderr,
-            }),
-            cause: {
-              timeoutMs,
-              stdout: redactedStdout,
-              stderr: redactedStderr,
-              binaryPath: input.binaryPath,
-              args,
-              readyPrefix: cliSpec.serverReadyPrefix,
-            },
-          });
-        }
-
-        return {
-          url: readyOption.value,
-          exitCode: child.exitCode.pipe(
-            Effect.map(Number),
-            Effect.orElseSucceed(() => 0),
-          ),
-        } satisfies OpenCodeServerProcess;
-      });
+        }),
+      );
 
     const cancelPooledServerIdleClose = Effect.fn("cancelPooledServerIdleClose")(function* (
       pooledServer: PooledOpenCodeServer,
@@ -1143,6 +1331,7 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
         yield* Fiber.interrupt(exitWatchFiber).pipe(Effect.ignore);
       }
 
+      yield* pooledServer.owner.cleanup();
       yield* Scope.close(pooledServer.scope, Exit.void);
       yield* detachPooledServer(pooledServer);
     });
@@ -1182,40 +1371,74 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
                 return;
               }
               pooledServer.exitWatchFiber = null;
-              yield* Scope.close(pooledServer.scope, Exit.void);
-              yield* detachPooledServer(pooledServer);
+              pooledServer.exited = true;
+              yield* closePooledServer(pooledServer);
             }),
           ),
         ),
+        Effect.tapError(Effect.logError),
         Effect.ignore,
         Effect.forkIn(pooledServerScope),
       );
       pooledServer.exitWatchFiber = exitWatchFiber;
     });
 
-    const acquirePooledServer = (input: {
-      readonly binaryPath: string;
-      readonly cliSpec?: OpenCodeCompatibleCliSpec;
-      readonly cwd?: string;
-      readonly port?: number;
-      readonly hostname?: string;
-      readonly timeoutMs?: number;
-      readonly experimentalWebSockets?: boolean;
-      readonly poolIsolationKey?: string;
-    }) =>
-      pooledServerMutex.withPermit(
-        Effect.gen(function* () {
-          const key = pooledOpenCodeServerKey(input);
-          const existing = pooledServers.get(key);
-          if (existing) {
-            yield* cancelPooledServerIdleClose(existing);
-            existing.refCount += 1;
-            return existing;
-          }
+    const retryRetainedPooledStartupCleanup = Effect.fn("retryRetainedPooledStartupCleanup")(
+      function* () {
+        const retained = retainedPooledStartupCleanup;
+        if (!retained) return;
+        const retryExit = yield* Effect.exit(retained.owner.cleanup());
+        if (Exit.isFailure(retryExit)) {
+          const retryFailure = Cause.squash(retryExit.cause);
+          const aggregate = new AggregateError(
+            [retained.startupFailure, retained.cleanupFailure, retryFailure],
+            "OpenCode startup cleanup remains unproven after retry.",
+          );
+          retained.cleanupFailure = aggregate;
+          return yield* new OpenCodeRuntimeError({
+            operation: "startOpenCodeServerProcess",
+            detail: aggregate.message,
+            cause: aggregate,
+          });
+        }
+        if (retainedPooledStartupCleanup === retained) {
+          retainedPooledStartupCleanup = null;
+        }
+      },
+    );
 
-          // Start lazily on first real use, then keep warm only while recent sessions need it.
-          return yield* Effect.uninterruptibleMask((restore) =>
+    const acquirePooledServer = (
+      input: {
+        readonly binaryPath: string;
+        readonly cliSpec?: OpenCodeCompatibleCliSpec;
+        readonly cwd?: string;
+        readonly port?: number;
+        readonly hostname?: string;
+        readonly timeoutMs?: number;
+        readonly experimentalWebSockets?: boolean;
+        readonly poolIsolationKey?: string;
+      },
+      callerScope: Scope.Scope,
+    ) =>
+      Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function* () {
+          const permits = yield* restore(pooledServerMutex.take(1));
+          const acquiredExit = yield* Effect.exit(
             Effect.gen(function* () {
+              const key = pooledOpenCodeServerKey(input);
+              const existing = pooledServers.get(key);
+              if (existing && !existing.exited) {
+                yield* restore(cancelPooledServerIdleClose(existing));
+                existing.refCount += 1;
+                return existing;
+              }
+              if (existing) {
+                yield* restore(closePooledServer(existing));
+              }
+
+              yield* restore(retryRetainedPooledStartupCleanup());
+
+              // Start lazily on first real use, then keep warm only while recent sessions need it.
               const serverScope = yield* Scope.make();
               const startedExit = yield* Effect.exit(
                 restore(
@@ -1226,15 +1449,48 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
               );
 
               if (Exit.isFailure(startedExit)) {
-                yield* Scope.close(serverScope, Exit.void).pipe(Effect.ignore);
+                const startupFailure = Cause.squash(startedExit.cause);
+                const closeExit = yield* Effect.exit(Scope.close(serverScope, Exit.void));
+                if (Exit.isFailure(closeExit)) {
+                  const cleanupFailure = Cause.squash(closeExit.cause);
+                  const owner = serverProcessOwners.get(serverScope);
+                  const aggregate = new AggregateError(
+                    [startupFailure, cleanupFailure],
+                    "OpenCode server startup and owned process cleanup both failed.",
+                  );
+                  if (owner) {
+                    retainedPooledStartupCleanup = {
+                      scope: serverScope,
+                      owner,
+                      startupFailure,
+                      cleanupFailure,
+                    };
+                  }
+                  return yield* new OpenCodeRuntimeError({
+                    operation: "startOpenCodeServerProcess",
+                    detail: aggregate.message,
+                    cause: aggregate,
+                  });
+                }
                 return yield* Effect.failCause(startedExit.cause);
               }
 
+              const owner = serverProcessOwners.get(serverScope);
+              if (!owner) {
+                yield* Scope.close(serverScope, Exit.void);
+                return yield* new OpenCodeRuntimeError({
+                  operation: "startOpenCodeServerProcess",
+                  detail:
+                    "OpenCode server startup completed without an authoritative process owner.",
+                });
+              }
               const pooledServer: PooledOpenCodeServer = {
                 key,
                 server: startedExit.value,
                 scope: serverScope,
+                owner,
                 closeOnRelease: input.poolIsolationKey !== undefined,
+                exited: false,
                 refCount: 1,
                 idleCloseFiber: null,
                 exitWatchFiber: null,
@@ -1244,6 +1500,14 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
               return pooledServer;
             }),
           );
+          yield* pooledServerMutex.release(permits);
+          if (Exit.isFailure(acquiredExit)) {
+            return yield* Effect.failCause(acquiredExit.cause);
+          }
+
+          const pooledServer = acquiredExit.value;
+          yield* Scope.addFinalizer(callerScope, releasePooledServer(pooledServer));
+          return pooledServer;
         }),
       );
 
@@ -1265,13 +1529,36 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
       );
 
     yield* Effect.addFinalizer(() =>
-      pooledServerMutex.withPermit(
-        Effect.gen(function* () {
-          for (const pooledServer of Array.from(pooledServers.values())) {
-            yield* closePooledServer(pooledServer);
-          }
-        }),
-      ),
+      Effect.gen(function* () {
+        const failures: Array<unknown> = [];
+        const attempt = <A, E>(effect: Effect.Effect<A, E>) =>
+          Effect.exit(effect).pipe(
+            Effect.tap((exit) =>
+              Effect.sync(() => {
+                if (Exit.isFailure(exit)) failures.push(Cause.squash(exit.cause));
+              }),
+            ),
+            Effect.asVoid,
+          );
+
+        yield* oneShotCommandMutex.withPermit(attempt(retryRetainedCommandCleanup()));
+        yield* pooledServerMutex.withPermit(
+          Effect.gen(function* () {
+            yield* attempt(retryRetainedPooledStartupCleanup());
+            for (const pooledServer of Array.from(pooledServers.values())) {
+              yield* attempt(closePooledServer(pooledServer));
+            }
+            for (const owner of Array.from(serverProcessOwners.values())) {
+              yield* attempt(owner.cleanup());
+            }
+          }),
+        );
+        if (failures.length > 0) {
+          return yield* Effect.die(
+            new AggregateError(failures, "One or more OpenCode process cleanups failed."),
+          );
+        }
+      }).pipe(Effect.orDie),
     );
 
     const connectToOpenCodeServer: OpenCodeRuntimeShape["connectToOpenCodeServer"] = (input) => {
@@ -1286,21 +1573,23 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
 
       return Effect.gen(function* () {
         const callerScope = yield* Scope.Scope;
-        const pooledServer = yield* acquirePooledServer({
-          binaryPath: input.binaryPath,
-          ...(input.cliSpec !== undefined ? { cliSpec: input.cliSpec } : {}),
-          ...(input.cwd !== undefined ? { cwd: input.cwd } : {}),
-          ...(input.port !== undefined ? { port: input.port } : {}),
-          ...(input.hostname !== undefined ? { hostname: input.hostname } : {}),
-          ...(input.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {}),
-          ...(input.experimentalWebSockets !== undefined
-            ? { experimentalWebSockets: input.experimentalWebSockets }
-            : {}),
-          ...(input.poolIsolationKey !== undefined
-            ? { poolIsolationKey: input.poolIsolationKey }
-            : {}),
-        });
-        yield* Scope.addFinalizer(callerScope, releasePooledServer(pooledServer));
+        const pooledServer = yield* acquirePooledServer(
+          {
+            binaryPath: input.binaryPath,
+            ...(input.cliSpec !== undefined ? { cliSpec: input.cliSpec } : {}),
+            ...(input.cwd !== undefined ? { cwd: input.cwd } : {}),
+            ...(input.port !== undefined ? { port: input.port } : {}),
+            ...(input.hostname !== undefined ? { hostname: input.hostname } : {}),
+            ...(input.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {}),
+            ...(input.experimentalWebSockets !== undefined
+              ? { experimentalWebSockets: input.experimentalWebSockets }
+              : {}),
+            ...(input.poolIsolationKey !== undefined
+              ? { poolIsolationKey: input.poolIsolationKey }
+              : {}),
+          },
+          callerScope,
+        );
         return {
           url: pooledServer.server.url,
           exitCode: pooledServer.server.exitCode,

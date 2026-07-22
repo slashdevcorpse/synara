@@ -9,6 +9,7 @@
  * @module ProviderHealthLive
  */
 import * as OS from "node:os";
+import type { ChildProcess as NodeChildProcess } from "node:child_process";
 import type {
   ProviderKind,
   ServerSettings,
@@ -31,6 +32,7 @@ import {
 import {
   Array,
   Cache,
+  Cause,
   DateTime,
   Duration,
   Effect,
@@ -109,7 +111,10 @@ import {
 } from "../providerMaintenance";
 import { collectUint8StreamText } from "../../stream/collectUint8StreamText";
 import { buildCodexProcessEnv } from "../../codexProcessEnv.ts";
-import { spawnContainedClaudeSdkProcess } from "../containedClaudeSdkProcess.ts";
+import {
+  spawnContainedClaudeSdkProcess,
+  teardownContainedClaudeSdkProcess,
+} from "../containedClaudeSdkProcess.ts";
 
 export { parseClaudeAuthStatusFromOutput } from "../claudeAuthStatus";
 export type { CommandResult } from "../providerCliOutput";
@@ -481,43 +486,271 @@ function waitForAbortSignal(signal: AbortSignal): Promise<void> {
   });
 }
 
-function spawnContainedClaudeProbe(options: ClaudeSpawnOptions): ClaudeSpawnedProcess {
-  return spawnContainedClaudeSdkProcess(options) as unknown as ClaudeSpawnedProcess;
+interface ClaudeProbeProcessOwner {
+  process?: NodeChildProcess;
+  query?: Pick<ReturnType<typeof claudeQuery>, "initializationResult" | "close">;
+  readonly abort: AbortController;
+  acceptingSpawns: boolean;
+  cleanup?: Promise<void>;
 }
 
-const probeClaudeSubscription = () => {
-  const abort = new AbortController();
-  return Effect.tryPromise(async () => {
-    const q = claudeQuery({
-      // oxlint-disable-next-line require-yield
-      prompt: (async function* (): AsyncGenerator<SDKUserMessage> {
-        await waitForAbortSignal(abort.signal);
-      })(),
-      options: {
-        persistSession: false,
-        abortController: abort,
-        settingSources: ["user", "project", "local"],
-        allowedTools: [],
-        stderr: () => {},
-        spawnClaudeCodeProcess: spawnContainedClaudeProbe,
-      },
-    });
-    const init = await q.initializationResult();
-    return { subscriptionType: init.account?.subscriptionType };
-  }).pipe(
-    Effect.ensuring(
-      Effect.sync(() => {
-        if (!abort.signal.aborted) abort.abort();
-      }),
-    ),
-    Effect.timeoutOption(CAPABILITIES_PROBE_TIMEOUT_MS),
-    Effect.result,
-    Effect.map((result) => {
-      if (Result.isFailure(result)) return undefined;
-      return Option.isSome(result.success) ? result.success.value : undefined;
+interface ClaudeProbeActiveOwner {
+  readonly generation: number;
+  readonly owner: ClaudeProbeProcessOwner;
+}
+
+interface ClaudeProbeRun {
+  readonly generation: number;
+  readonly promise: Promise<{ readonly subscriptionType?: string }>;
+}
+
+function bindContainedClaudeProbeProcess(
+  owner: ClaudeProbeProcessOwner,
+  spawnProcess: (options: ClaudeSpawnOptions) => NodeChildProcess,
+  assertOwnerActive: () => void,
+): (options: ClaudeSpawnOptions) => ClaudeSpawnedProcess {
+  return (options) => {
+    assertOwnerActive();
+    const process = spawnProcess(options);
+    owner.process = process;
+    return process as unknown as ClaudeSpawnedProcess;
+  };
+}
+
+export interface ClaudeSubscriptionProbeDependencies {
+  readonly createQuery?: (
+    input: Parameters<typeof claudeQuery>[0],
+  ) => Pick<ReturnType<typeof claudeQuery>, "initializationResult" | "close">;
+  readonly spawnProcess?: (options: ClaudeSpawnOptions) => NodeChildProcess;
+  readonly teardownProcess?: (process: NodeChildProcess) => Promise<unknown>;
+  readonly timeoutMs?: number;
+}
+
+export interface ClaudeSubscriptionProbe {
+  readonly probe: () => Effect.Effect<{ readonly subscriptionType?: string }, unknown>;
+  /** Permanently closes this probe and cleans any process ownership it established. */
+  readonly cleanup: () => Effect.Effect<void, unknown>;
+}
+
+const CLAUDE_SUBSCRIPTION_PROBE_CLOSED_MESSAGE = "Claude subscription probe has been closed.";
+
+function initializationBeforeTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race([
+    promise,
+    new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(
+        () => reject(new Error(`Claude subscription probe timed out after ${timeoutMs}ms.`)),
+        timeoutMs,
+      );
+      timer.unref?.();
     }),
-  );
-};
+  ]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer);
+  });
+}
+
+export function makeClaudeSubscriptionProbe(
+  options: ClaudeSubscriptionProbeDependencies = {},
+): ClaudeSubscriptionProbe {
+  const createQuery = options.createQuery ?? claudeQuery;
+  const spawnProcess =
+    options.spawnProcess ??
+    ((spawnOptions: ClaudeSpawnOptions) => spawnContainedClaudeSdkProcess(spawnOptions));
+  const teardownProcess =
+    options.teardownProcess ??
+    ((process: NodeChildProcess) => teardownContainedClaudeSdkProcess(process));
+  const timeoutMs = options.timeoutMs ?? CAPABILITIES_PROBE_TIMEOUT_MS;
+  let lifecycleGeneration = 0;
+  let closed = false;
+  let pendingProbe: ClaudeProbeRun | undefined;
+  let activeOwner: ClaudeProbeActiveOwner | undefined;
+  let retainedCleanup: { readonly owner: ClaudeProbeProcessOwner; failure: unknown } | undefined;
+
+  const assertProbeOpen = (generation: number): void => {
+    if (closed || generation !== lifecycleGeneration) {
+      throw new Error(CLAUDE_SUBSCRIPTION_PROBE_CLOSED_MESSAGE);
+    }
+  };
+
+  const cleanupOwner = (owner: ClaudeProbeProcessOwner): Promise<void> => {
+    owner.acceptingSpawns = false;
+    if (!owner.cleanup) {
+      const cleanup = (async () => {
+        const process = owner.process;
+        if (process) {
+          await teardownProcess(process);
+          if (owner.process === process) delete owner.process;
+        }
+        if (!owner.abort.signal.aborted) owner.abort.abort();
+        const query = owner.query;
+        if (query) {
+          query.close();
+          if (owner.query === query) delete owner.query;
+        }
+      })();
+      owner.cleanup = cleanup;
+      void cleanup.catch(() => {
+        if (owner.cleanup === cleanup) delete owner.cleanup;
+      });
+    }
+    return owner.cleanup;
+  };
+
+  const retryRetainedCleanup = async (): Promise<void> => {
+    const retained = retainedCleanup;
+    if (!retained) return;
+    try {
+      await cleanupOwner(retained.owner);
+    } catch (cause) {
+      const aggregate = new AggregateError(
+        [retained.failure, cause],
+        "Claude subscription probe cleanup remains unproven after retry.",
+      );
+      retained.failure = aggregate;
+      throw aggregate;
+    }
+    if (retainedCleanup === retained) retainedCleanup = undefined;
+  };
+
+  const runProbe = async (generation: number): Promise<{ readonly subscriptionType?: string }> => {
+    assertProbeOpen(generation);
+    await retryRetainedCleanup();
+    assertProbeOpen(generation);
+    const owner: ClaudeProbeProcessOwner = {
+      abort: new AbortController(),
+      acceptingSpawns: true,
+    };
+    const ownership: ClaudeProbeActiveOwner = { generation, owner };
+    activeOwner = ownership;
+    let result: { readonly subscriptionType?: string } | undefined;
+    let probeFailure: unknown;
+
+    const assertOwnerActive = (): void => {
+      assertProbeOpen(generation);
+      if (activeOwner !== ownership || !owner.acceptingSpawns) {
+        throw new Error(CLAUDE_SUBSCRIPTION_PROBE_CLOSED_MESSAGE);
+      }
+    };
+
+    try {
+      const query = createQuery({
+        // oxlint-disable-next-line require-yield
+        prompt: (async function* (): AsyncGenerator<SDKUserMessage> {
+          await waitForAbortSignal(owner.abort.signal);
+        })(),
+        options: {
+          persistSession: false,
+          abortController: owner.abort,
+          settingSources: ["user", "project", "local"],
+          allowedTools: [],
+          stderr: () => {},
+          spawnClaudeCodeProcess: bindContainedClaudeProbeProcess(
+            owner,
+            spawnProcess,
+            assertOwnerActive,
+          ),
+        },
+      });
+      owner.query = query;
+      const init = await initializationBeforeTimeout(query.initializationResult(), timeoutMs);
+      assertOwnerActive();
+      result = { subscriptionType: init.account?.subscriptionType };
+    } catch (cause) {
+      probeFailure = cause;
+    }
+
+    let cleanupFailure: unknown;
+    try {
+      await cleanupOwner(owner);
+    } catch (cause) {
+      cleanupFailure = cause;
+      retainedCleanup = { owner, failure: cause };
+    } finally {
+      if (activeOwner === ownership) activeOwner = undefined;
+    }
+
+    if (probeFailure !== undefined && cleanupFailure !== undefined) {
+      throw new AggregateError(
+        [probeFailure, cleanupFailure],
+        "Claude subscription probe and owned process cleanup both failed.",
+      );
+    }
+    if (cleanupFailure !== undefined) throw cleanupFailure;
+    if (probeFailure !== undefined) throw probeFailure;
+    assertProbeOpen(generation);
+    return result!;
+  };
+
+  const beginProbe = (): Promise<{ readonly subscriptionType?: string }> => {
+    if (closed) return Promise.reject(new Error(CLAUDE_SUBSCRIPTION_PROBE_CLOSED_MESSAGE));
+    const generation = lifecycleGeneration;
+    if (!pendingProbe || pendingProbe.generation !== generation) {
+      const probe = runProbe(generation);
+      const run: ClaudeProbeRun = { generation, promise: probe };
+      pendingProbe = run;
+      void probe.then(
+        () => {
+          if (pendingProbe === run) pendingProbe = undefined;
+        },
+        () => {
+          if (pendingProbe === run) pendingProbe = undefined;
+        },
+      );
+    }
+    return pendingProbe.promise;
+  };
+
+  const cleanup = async (): Promise<void> => {
+    if (!closed) {
+      closed = true;
+      lifecycleGeneration += 1;
+    }
+    const failures: Array<unknown> = [];
+    const ownership = activeOwner;
+    if (ownership) {
+      try {
+        await cleanupOwner(ownership.owner);
+      } catch (cause) {
+        failures.push(cause);
+        retainedCleanup = { owner: ownership.owner, failure: cause };
+      }
+    }
+    const pending = pendingProbe?.promise;
+    if (pending) {
+      try {
+        await pending;
+      } catch {
+        // The retained cleanup gate below owns any process-tree proof failure.
+      }
+    }
+    try {
+      await retryRetainedCleanup();
+    } catch (cause) {
+      failures.push(cause);
+    }
+    if (failures.length === 1) throw failures[0];
+    if (failures.length > 1) {
+      throw new AggregateError(
+        failures,
+        "One or more Claude subscription-probe cleanup attempts failed.",
+      );
+    }
+  };
+
+  return {
+    probe: () =>
+      Effect.tryPromise({
+        try: beginProbe,
+        catch: (cause) => cause,
+      }),
+    cleanup: () =>
+      Effect.tryPromise({
+        try: cleanup,
+        catch: (cause) => cause,
+      }),
+  };
+}
 
 export function parseAuthStatusFromOutput(result: CommandResult): {
   readonly status: ServerProviderStatusState;
@@ -2262,7 +2495,34 @@ export function projectProviderStatusesForSettings(
 
 // ── Layer ───────────────────────────────────────────────────────────
 
-export function makeProviderHealthLive(options?: { readonly providerUpdateTimeoutMs?: number }) {
+export interface ProviderHealthLiveOptions {
+  readonly providerUpdateTimeoutMs?: number;
+  readonly claudeSubscriptionProbe?: ClaudeSubscriptionProbeDependencies;
+}
+
+export function closeProviderHealthRefreshScopeAndSubscriptionProbe(
+  refreshScope: Scope.Scope,
+  claudeSubscriptionProbe: ClaudeSubscriptionProbe,
+) {
+  return Effect.gen(function* () {
+    const refreshExit = yield* Scope.close(refreshScope, Exit.void).pipe(Effect.exit);
+    const subscriptionProbeExit = yield* claudeSubscriptionProbe
+      .cleanup()
+      .pipe(Effect.orDie, Effect.exit);
+
+    if (Exit.isFailure(refreshExit) && Exit.isFailure(subscriptionProbeExit)) {
+      return yield* Effect.failCause(Cause.combine(refreshExit.cause, subscriptionProbeExit.cause));
+    }
+    if (Exit.isFailure(refreshExit)) {
+      return yield* Effect.failCause(refreshExit.cause);
+    }
+    if (Exit.isFailure(subscriptionProbeExit)) {
+      return yield* Effect.failCause(subscriptionProbeExit.cause);
+    }
+  });
+}
+
+export function makeProviderHealthLive(options?: ProviderHealthLiveOptions) {
   const providerUpdateTimeoutMs = options?.providerUpdateTimeoutMs ?? PROVIDER_UPDATE_TIMEOUT_MS;
   return Layer.effect(
     ProviderHealth,
@@ -2277,7 +2537,10 @@ export function makeProviderHealthLive(options?: { readonly providerUpdateTimeou
         PubSub.shutdown,
       );
       const refreshScope = yield* Scope.make("sequential");
-      yield* Effect.addFinalizer(() => Scope.close(refreshScope, Exit.void));
+      const claudeSubscriptionProbe = makeClaudeSubscriptionProbe(options?.claudeSubscriptionProbe);
+      yield* Effect.addFinalizer(() =>
+        closeProviderHealthRefreshScopeAndSubscriptionProbe(refreshScope, claudeSubscriptionProbe),
+      );
 
       const cachePathByProvider = new Map(
         PROVIDERS.map(
@@ -2330,7 +2593,8 @@ export function makeProviderHealthLive(options?: { readonly providerUpdateTimeou
       const claudeSubscriptionCache = yield* Cache.make({
         capacity: 1,
         timeToLive: Duration.minutes(5),
-        lookup: (_: "claude") => probeClaudeSubscription(),
+        lookup: (_: "claude") =>
+          claudeSubscriptionProbe.probe().pipe(Effect.catchAll(() => Effect.succeed(undefined))),
       });
       const resolveClaudeSubscription = Cache.get(claudeSubscriptionCache, "claude").pipe(
         Effect.map((probe) => probe?.subscriptionType),

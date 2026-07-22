@@ -1,16 +1,25 @@
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { describe, expect, it } from "vitest";
 
-import { Deferred, Effect, Exit, Scope } from "effect";
+import { Cause, Deferred, Effect, Exit, Fiber, Layer, Scope, Sink, Stream } from "effect";
+import { ChildProcessSpawner } from "effect/unstable/process";
 import type * as EffectAcpSchema from "effect-acp/schema";
 
 import {
+  AcpSessionRuntime,
   assistantItemId,
   awaitAcpChildExit,
   decodeSetSessionConfigOptionResponse,
   makeAcpIncomingFrameGuard,
+  makeRetryableAcpChildTeardown,
   sessionConfigOptionsFromSetup,
   teardownAcpChildProcess,
 } from "./AcpSessionRuntime.ts";
+import { teardownProviderProcessTree } from "../supervisedProcessTeardown.ts";
+import { markWindowsProviderProcessSpawn } from "../windowsProviderProcess.ts";
 
 describe("makeAcpIncomingFrameGuard", () => {
   const encode = (value: string) => new TextEncoder().encode(value);
@@ -34,6 +43,95 @@ describe("makeAcpIncomingFrameGuard", () => {
 });
 
 describe("teardownAcpChildProcess", () => {
+  it("registers exact teardown before honoring a queued post-spawn interruption", async () => {
+    const childPid = 4_246;
+    const acquiredSpawn = Promise.withResolvers<void>();
+    const releaseSpawn = Promise.withResolvers<void>();
+    const awaitStage = async <A>(stage: string, promise: Promise<A>): Promise<A> => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        return await Promise.race([
+          promise,
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(() => {
+              releaseSpawn.resolve();
+              reject(new Error(`Timed out waiting for ACP test stage: ${stage}`));
+            }, 3_000);
+          }),
+        ]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    };
+    const teardownPids: number[] = [];
+    let capturedTeardown:
+      | Effect.Effect<{
+          readonly escalated: boolean;
+          readonly signalErrors: Error[];
+        }>
+      | undefined;
+    const childExited = Deferred.makeUnsafe<ChildProcessSpawner.ExitCode>();
+    const child = ChildProcessSpawner.makeHandle({
+      pid: ChildProcessSpawner.ProcessId(childPid),
+      exitCode: Deferred.await(childExited),
+      isRunning: Effect.succeed(true),
+      kill: () =>
+        Deferred.succeed(childExited, ChildProcessSpawner.ExitCode(0)).pipe(Effect.asVoid),
+      stdin: Sink.drain,
+      stdout: Stream.empty,
+      stderr: Stream.empty,
+      all: Stream.empty,
+      getInputFd: () => Sink.drain,
+      getOutputFd: () => Stream.empty,
+    });
+    const spawnerLayer = Layer.succeed(
+      ChildProcessSpawner.ChildProcessSpawner,
+      ChildProcessSpawner.make(() =>
+        Effect.promise(async () => {
+          acquiredSpawn.resolve();
+          await releaseSpawn.promise;
+          return child;
+        }),
+      ),
+    );
+    const runtimeLayer = AcpSessionRuntime.layer({
+      spawn: { command: process.execPath, args: [] },
+      cwd: process.cwd(),
+      clientInfo: { name: "synara-test", version: "1.0.0" },
+      teardownProcessTree: async (input) => {
+        teardownPids.push(input.rootPid);
+        return { escalated: false, signalErrors: [] };
+      },
+      captureProcessTeardown: (teardown) => {
+        capturedTeardown = teardown;
+      },
+    }).pipe(Layer.provide(spawnerLayer));
+    const runtimeFiber = Effect.runFork(
+      Effect.gen(function* () {
+        yield* AcpSessionRuntime;
+      }).pipe(Effect.provide(runtimeLayer), Effect.scoped),
+    );
+
+    await awaitStage("spawn acquisition", acquiredSpawn.promise);
+    const interrupting = Effect.runPromise(Fiber.interrupt(runtimeFiber));
+    await Promise.resolve();
+    const capturedBeforeRelease = capturedTeardown;
+    releaseSpawn.resolve();
+    await awaitStage("interruption cleanup", interrupting);
+
+    expect(capturedBeforeRelease).toBeUndefined();
+    expect(capturedTeardown).toBeDefined();
+    expect(teardownPids).toEqual([childPid]);
+    const runtimeExit = runtimeFiber.pollUnsafe();
+    expect(runtimeExit).toBeDefined();
+    expect(
+      runtimeExit && Exit.isFailure(runtimeExit) ? Cause.hasInterrupts(runtimeExit.cause) : false,
+    ).toBe(true);
+
+    await Effect.runPromise(capturedTeardown!);
+    expect(teardownPids).toEqual([childPid]);
+  });
+
   it("keeps ACP scope closure pending until the owned root exit settles", async () => {
     const processExited = Deferred.makeUnsafe<number>();
     const exitCode = Deferred.await(processExited);
@@ -71,6 +169,112 @@ describe("teardownAcpChildProcess", () => {
     Deferred.doneUnsafe(processExited, Effect.succeed(0));
     await closing;
     expect(scopeClosed).toBe(true);
+  });
+
+  it("accepts ACP Job-empty receipt proof when exit settles during signaling", async () => {
+    let captureCalls = 0;
+    let signalCalls = 0;
+    const processExited = Deferred.makeUnsafe<number>();
+    const receiptDirectory = mkdtempSync(join(tmpdir(), "synara-acp-job-receipt-"));
+    const completionReceipt = {
+      path: join(receiptDirectory, "job-empty.receipt"),
+      token: "acp-job-empty-proof",
+    };
+    writeFileSync(completionReceipt.path, `${completionReceipt.token}\n4243\n`, "utf8");
+    const child = markWindowsProviderProcessSpawn(
+      { pid: 4_243, exitCode: Deferred.await(processExited) },
+      {
+        command: "C:\\Synara\\synara-windows-job-launcher.exe",
+        args: [],
+        shell: false,
+        containment: "windows-job-object",
+        completionReceipt,
+      },
+      true,
+    );
+
+    try {
+      await expect(
+        Effect.runPromise(
+          teardownAcpChildProcess(child, (input) =>
+            teardownProviderProcessTree(
+              { ...input, termGraceMs: 5, forceExitMs: 5 },
+              {
+                processTreeKiller: {
+                  capture: () => {
+                    captureCalls += 1;
+                    throw new Error("capture must not run for an exited ACP launcher");
+                  },
+                  signal: async () => {
+                    signalCalls += 1;
+                    Deferred.doneUnsafe(processExited, Effect.succeed(0));
+                    return { rootTreeSignalSucceeded: false };
+                  },
+                },
+              },
+            ),
+          ),
+        ),
+      ).resolves.toEqual({ escalated: false, signalErrors: [] });
+      expect(captureCalls).toBe(0);
+      expect(signalCalls).toBe(1);
+    } finally {
+      rmSync(receiptDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("retries failed cleanup against the same owned child and latches success", async () => {
+    const child = { pid: 4_244, exitCode: Effect.succeed(0) };
+    const cleanupError = new Error("cleanup proof rejected");
+    const observedRootPids: number[] = [];
+    const teardown = makeRetryableAcpChildTeardown(child, async (input) => {
+      observedRootPids.push(input.rootPid);
+      if (observedRootPids.length === 1) {
+        throw cleanupError;
+      }
+      return { escalated: false, signalErrors: [] };
+    });
+
+    await expect(Effect.runPromise(teardown)).rejects.toBe(cleanupError);
+    await expect(Effect.runPromise(teardown)).resolves.toEqual({
+      escalated: false,
+      signalErrors: [],
+    });
+    await expect(Effect.runPromise(teardown)).resolves.toEqual({
+      escalated: false,
+      signalErrors: [],
+    });
+    expect(observedRootPids).toEqual([4_244, 4_244]);
+  });
+
+  it("shares one exact-child cleanup attempt across concurrent callers", async () => {
+    const child = { pid: 4_245, exitCode: Effect.succeed(0) };
+    const result = { escalated: false, signalErrors: [] };
+    let cleanupCalls = 0;
+    let notifyCleanupStarted!: () => void;
+    let finishCleanup!: (value: typeof result) => void;
+    const cleanupStarted = new Promise<void>((resolve) => {
+      notifyCleanupStarted = resolve;
+    });
+    const cleanupResult = new Promise<typeof result>((resolve) => {
+      finishCleanup = resolve;
+    });
+    const teardown = makeRetryableAcpChildTeardown(child, (input) => {
+      expect(input.rootPid).toBe(child.pid);
+      cleanupCalls += 1;
+      notifyCleanupStarted();
+      return cleanupResult;
+    });
+
+    const first = Effect.runPromise(teardown);
+    const second = Effect.runPromise(teardown);
+    await cleanupStarted;
+    expect(cleanupCalls).toBe(1);
+
+    finishCleanup(result);
+    await expect(Promise.all([first, second])).resolves.toEqual([result, result]);
+    await expect(Effect.runPromise(teardown)).resolves.toBe(result);
+    expect(cleanupCalls).toBe(1);
   });
 });
 

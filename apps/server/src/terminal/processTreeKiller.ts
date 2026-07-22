@@ -201,12 +201,8 @@ function signalPid(pid: number, signal: TerminalKillSignal): Error | null {
 
 function shouldSignalCapturedProcess(
   process: CapturedProcess,
-  signal: TerminalKillSignal,
   currentCommands: ProcessCommandMap | null,
 ): boolean {
-  if (signal !== "SIGKILL") {
-    return true;
-  }
   return currentCommands?.get(process.pid) === process.command;
 }
 
@@ -222,18 +218,14 @@ function throwIfSignalingAborted(signal: AbortSignal | undefined): void {
 
 async function capturedProcessesForSignal(
   descendants: readonly CapturedProcess[],
-  signal: TerminalKillSignal,
   readCommands: (pids: readonly number[]) => MaybePromise<ProcessCommandMap | null>,
   abortSignal?: AbortSignal,
 ): Promise<CapturedProcess[]> {
   throwIfSignalingAborted(abortSignal);
-  const currentCommands =
-    signal === "SIGKILL"
-      ? await readCommands(descendants.map((descendant) => descendant.pid))
-      : null;
+  const currentCommands = await readCommands(descendants.map((descendant) => descendant.pid));
   throwIfSignalingAborted(abortSignal);
   return descendants.filter((descendant) =>
-    shouldSignalCapturedProcess(descendant, signal, currentCommands),
+    shouldSignalCapturedProcess(descendant, currentCommands),
   );
 }
 
@@ -353,7 +345,6 @@ export function createProcessTreeKiller(
       // the PTY root exits, those children may be reparented before escalation.
       const capturedProcesses = await capturedProcessesForSignal(
         tree.descendants,
-        signal,
         (pids) => readCommandsForPlatform(pids, abortSignal),
         abortSignal,
       );

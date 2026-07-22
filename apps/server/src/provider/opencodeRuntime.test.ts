@@ -3,10 +3,12 @@
 // Layer: Provider runtime tests
 // Exports: Vitest suites for opencodeRuntime.ts
 
+import { existsSync, rmSync, writeFileSync } from "node:fs";
+import os from "node:os";
 import nodePath from "node:path";
 import { pathToFileURL } from "node:url";
 
-import { Duration, Effect, Exit, Fiber, Layer, Scope, Sink, Stream } from "effect";
+import { Cause, Duration, Effect, Exit, Fiber, Layer, Scope, Sink, Stream } from "effect";
 import { ChildProcessSpawner } from "effect/unstable/process";
 import { TestClock } from "effect/testing";
 import type { ChatAttachment } from "@synara/contracts";
@@ -212,6 +214,204 @@ describe("buildOpenCodeServerProcessEnv", () => {
   });
 });
 
+describe("OpenCodeRuntime one-shot command ownership", () => {
+  it("requests and validates a Windows Job-empty receipt for a natural command exit", async () => {
+    const receiptToken = `opencode-command-${String(process.pid)}-${String(Date.now())}`;
+    const receiptPath = nodePath.join(os.tmpdir(), `${receiptToken}.receipt`);
+    let requestedCompletionReceipt: unknown;
+    let teardownCalls = 0;
+    let receiptWritten = false;
+    const layer = makeOpenCodeRuntimeLive({
+      prepareProcess: (command, args, input) => {
+        requestedCompletionReceipt = input.completionReceipt;
+        return {
+          command,
+          args: [...args],
+          shell: false,
+          containment: "windows-job-object",
+          completionReceipt: { path: receiptPath, token: receiptToken },
+        };
+      },
+      teardownProcessTree: async (input) => {
+        teardownCalls += 1;
+        expect(input.descendantExitProof).toBe("windows-job-empty-on-exit");
+        expect(await input.rootExitProof).toBe(true);
+        return { escalated: false, signalErrors: [] };
+      },
+    }).pipe(
+      Layer.provide(
+        Layer.succeed(
+          ChildProcessSpawner.ChildProcessSpawner,
+          ChildProcessSpawner.make(() =>
+            Effect.succeed(
+              mockOpenCodeServerHandle({
+                stdout: "models listed\n",
+                stderr: "",
+                pid: 59_050,
+                exitCode: Effect.sync(() => {
+                  if (!receiptWritten) {
+                    receiptWritten = true;
+                    writeFileSync(receiptPath, `${receiptToken}\n59050\n`);
+                  }
+                  return ChildProcessSpawner.ExitCode(0);
+                }),
+              }),
+            ),
+          ),
+        ),
+      ),
+    );
+
+    try {
+      const result = await Effect.runPromise(
+        Effect.gen(function* () {
+          const runtime = yield* OpenCodeRuntime;
+          return yield* runtime.runOpenCodeCommand({
+            binaryPath: "opencode",
+            args: ["models"],
+          });
+        }).pipe(Effect.provide(layer)),
+      );
+
+      expect(result).toEqual({ stdout: "models listed\n", stderr: "", code: 0 });
+      expect(requestedCompletionReceipt).toBe("create");
+      expect(teardownCalls).toBe(1);
+      expect(existsSync(receiptPath)).toBe(false);
+    } finally {
+      rmSync(receiptPath, { force: true });
+    }
+  });
+
+  it("requires POSIX process-group exit proof after a natural command exit", async () => {
+    const provenProcessGroups: Array<number> = [];
+    let observedDetached: boolean | undefined;
+    const layer = makeOpenCodeRuntimeLive({
+      platform: "linux",
+      prepareProcess: prepareMockProcess,
+      teardownPosixProcessGroup: async (processGroupId) => {
+        provenProcessGroups.push(processGroupId);
+      },
+    }).pipe(
+      Layer.provide(
+        Layer.succeed(
+          ChildProcessSpawner.ChildProcessSpawner,
+          ChildProcessSpawner.make((command) => {
+            observedDetached = (
+              command as unknown as { readonly options?: { readonly detached?: boolean } }
+            ).options?.detached;
+            return Effect.succeed(
+              mockOpenCodeServerHandle({
+                stdout: "models listed\n",
+                stderr: "",
+                pid: 59_055,
+                exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(0)),
+              }),
+            );
+          }),
+        ),
+      ),
+    );
+
+    const result = await Effect.runPromise(
+      Effect.gen(function* () {
+        const runtime = yield* OpenCodeRuntime;
+        return yield* runtime.runOpenCodeCommand({
+          binaryPath: "opencode",
+          args: ["models"],
+        });
+      }).pipe(Effect.provide(layer)),
+    );
+
+    expect(result).toEqual({ stdout: "models listed\n", stderr: "", code: 0 });
+    expect(observedDetached).toBe(true);
+    expect(provenProcessGroups).toEqual([59_055]);
+  });
+
+  it("registers interrupted command ownership after spawn and retains failed group cleanup", async () => {
+    let spawnCalls = 0;
+    let teardownCalls = 0;
+    const provenProcessGroups: number[] = [];
+    const acquiredFirstSpawn = Promise.withResolvers<void>();
+    const releaseFirstSpawn = Promise.withResolvers<void>();
+    let proveRetry: (() => void) | undefined;
+    const retryProof = new Promise<void>((resolve) => {
+      proveRetry = resolve;
+    });
+    const spawnerLayer = Layer.succeed(
+      ChildProcessSpawner.ChildProcessSpawner,
+      ChildProcessSpawner.make(() => {
+        const spawnIndex = spawnCalls;
+        spawnCalls += 1;
+        const child = mockOpenCodeServerHandle({
+          stdout: spawnIndex === 0 ? "running\n" : `result-${String(spawnIndex)}\n`,
+          stderr: "",
+          pid: 59_060 + spawnIndex,
+          exitCode:
+            spawnIndex === 0 ? Effect.never : Effect.succeed(ChildProcessSpawner.ExitCode(0)),
+        });
+        return spawnIndex === 0
+          ? Effect.promise(async () => {
+              acquiredFirstSpawn.resolve();
+              await releaseFirstSpawn.promise;
+              return child;
+            })
+          : Effect.succeed(child);
+      }),
+    );
+    const layer = makeOpenCodeRuntimeLive({
+      platform: "linux",
+      prepareProcess: prepareMockProcess,
+      teardownPosixProcessGroup: async (processGroupId) => {
+        teardownCalls += 1;
+        provenProcessGroups.push(processGroupId);
+        if (teardownCalls === 1) throw new Error("interrupted command cleanup proof failed");
+        if (teardownCalls === 2) await retryProof;
+      },
+    }).pipe(Layer.provide(spawnerLayer));
+
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const runtime = yield* OpenCodeRuntime;
+          const command = () =>
+            runtime.runOpenCodeCommand({ binaryPath: "opencode", args: ["models"] });
+          const interruptedCommand = yield* command().pipe(Effect.forkChild);
+          yield* Effect.promise(() => acquiredFirstSpawn.promise);
+          const interrupting = yield* Fiber.interrupt(interruptedCommand).pipe(Effect.forkChild);
+          yield* Effect.yieldNow;
+          expect(spawnCalls).toBe(1);
+          releaseFirstSpawn.resolve();
+          yield* Fiber.join(interrupting);
+          expect(teardownCalls).toBe(1);
+          expect(provenProcessGroups).toEqual([59_060]);
+
+          const replacementA = yield* command().pipe(Effect.forkChild);
+          yield* Effect.yieldNow;
+          yield* Effect.yieldNow;
+          expect(teardownCalls).toBe(2);
+          const replacementB = yield* command().pipe(Effect.forkChild);
+          yield* Effect.yieldNow;
+          yield* Effect.yieldNow;
+          expect(spawnCalls).toBe(1);
+          expect(replacementA.pollUnsafe()).toBeUndefined();
+          expect(replacementB.pollUnsafe()).toBeUndefined();
+
+          proveRetry?.();
+          const [first, second] = yield* Effect.all([
+            Fiber.join(replacementA),
+            Fiber.join(replacementB),
+          ]);
+          expect(first.stdout).toBe("result-1\n");
+          expect(second.stdout).toBe("result-2\n");
+          expect(spawnCalls).toBe(3);
+          expect(teardownCalls).toBe(4);
+          expect(provenProcessGroups).toEqual([59_060, 59_060, 59_061, 59_062]);
+        }),
+      ).pipe(Effect.provide(layer)),
+    );
+  });
+});
+
 describe("OpenCodeRuntime startup diagnostics", () => {
   it("forwards prepared hidden-window policy to command and server launches", async () => {
     const observedWindowsHide: Array<boolean | undefined> = [];
@@ -381,6 +581,76 @@ describe("OpenCodeRuntime startup diagnostics", () => {
 });
 
 describe("OpenCodeRuntime local server pool", () => {
+  it("completes caller-scope ownership transfer before honoring interruption", async () => {
+    let teardownCalls = 0;
+    let cleanupFinished = false;
+    const cleanupStarted = Promise.withResolvers<void>();
+    const releaseCleanup = Promise.withResolvers<void>();
+    const layer = makeOpenCodeRuntimeLive({
+      prepareProcess: prepareMockProcess,
+      netService: {
+        canListenOnHost: () => Effect.succeed(true),
+        isPortAvailableOnLoopback: () => Effect.succeed(true),
+        reserveLoopbackPort: () => Effect.succeed(59_090),
+        findAvailablePort: () => Effect.succeed(59_090),
+      },
+      teardownProcessTree: async () => {
+        teardownCalls += 1;
+        cleanupStarted.resolve();
+        await releaseCleanup.promise;
+        cleanupFinished = true;
+        return { escalated: false, signalErrors: [] };
+      },
+    }).pipe(
+      Layer.provide(
+        mockOpenCodeServerSpawnerLayer({
+          stdout: "opencode server listening on http://127.0.0.1:59090\n",
+          stderr: "",
+        }),
+      ),
+    );
+
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const runtime = yield* OpenCodeRuntime;
+          const callerScope = yield* Scope.make();
+          yield* Scope.close(callerScope, Exit.void);
+
+          yield* Effect.gen(function* () {
+            const connecting = yield* runtime
+              .connectToOpenCodeServer({
+                binaryPath: "opencode",
+                poolIsolationKey: "closed-caller-scope-transfer",
+              })
+              .pipe(Effect.provideService(Scope.Scope, callerScope), Effect.forkChild);
+
+            yield* Effect.promise(() => cleanupStarted.promise);
+            const interrupting = yield* Fiber.interrupt(connecting).pipe(Effect.forkChild);
+            yield* Effect.yieldNow;
+            yield* Effect.yieldNow;
+
+            expect(teardownCalls).toBe(1);
+            expect(cleanupFinished).toBe(false);
+            expect(interrupting.pollUnsafe()).toBeUndefined();
+
+            releaseCleanup.resolve();
+            yield* Fiber.join(interrupting);
+            expect(cleanupFinished).toBe(true);
+
+            const connectingExit = connecting.pollUnsafe();
+            expect(connectingExit).toBeDefined();
+            expect(
+              connectingExit && Exit.isFailure(connectingExit)
+                ? Cause.hasInterrupts(connectingExit.cause)
+                : false,
+            ).toBe(true);
+          }).pipe(Effect.ensuring(Effect.sync(() => releaseCleanup.resolve())));
+        }),
+      ).pipe(Effect.provide(layer)),
+    );
+  });
+
   it("keeps server scope closure pending until process-tree exit is proven", async () => {
     let proveExit: (() => void) | undefined;
     const exitProof = new Promise<void>((resolve) => {
@@ -428,6 +698,396 @@ describe("OpenCodeRuntime local server pool", () => {
           yield* Fiber.join(closing);
         }),
       ).pipe(Effect.provide(layer)),
+    );
+  });
+
+  it("retains failed startup cleanup and serializes concurrent replacement until proof", async () => {
+    let spawnCalls = 0;
+    let teardownCalls = 0;
+    let proveRetry: (() => void) | undefined;
+    const retryProof = new Promise<void>((resolve) => {
+      proveRetry = resolve;
+    });
+    const spawnerLayer = Layer.succeed(
+      ChildProcessSpawner.ChildProcessSpawner,
+      ChildProcessSpawner.make(() => {
+        const spawnIndex = spawnCalls;
+        spawnCalls += 1;
+        return Effect.succeed(
+          mockOpenCodeServerHandle({
+            stdout:
+              spawnIndex === 0
+                ? "startup stalled before ready\n"
+                : "opencode server listening on http://127.0.0.1:59101\n",
+            stderr: spawnIndex === 0 ? "simulated startup stall\n" : "",
+            pid: 59_100 + spawnIndex,
+            exitCode: Effect.never,
+          }),
+        );
+      }),
+    );
+    const layer = makeOpenCodeRuntimeLive({
+      prepareProcess: prepareMockProcess,
+      netService: {
+        canListenOnHost: () => Effect.succeed(true),
+        isPortAvailableOnLoopback: () => Effect.succeed(true),
+        reserveLoopbackPort: () => Effect.succeed(59_101),
+        findAvailablePort: () => Effect.succeed(59_101),
+      },
+      teardownProcessTree: async () => {
+        teardownCalls += 1;
+        if (teardownCalls === 1) {
+          throw new Error("startup cleanup proof failed");
+        }
+        if (teardownCalls === 2) {
+          await retryProof;
+        }
+        return { escalated: false, signalErrors: [] };
+      },
+    }).pipe(Layer.provide(spawnerLayer));
+
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const runtime = yield* OpenCodeRuntime;
+          const input = {
+            binaryPath: "opencode",
+            poolIsolationKey: "startup-cleanup-recovery",
+            timeoutMs: 5,
+          };
+          const initialScope = yield* Scope.make();
+          const initialExit = yield* runtime
+            .connectToOpenCodeServer(input)
+            .pipe(Effect.provideService(Scope.Scope, initialScope), Effect.exit);
+          expect(Exit.isFailure(initialExit)).toBe(true);
+          if (Exit.isFailure(initialExit)) {
+            const failure = Cause.squash(initialExit.cause);
+            expect(OpenCodeRuntimeError.is(failure)).toBe(true);
+            if (OpenCodeRuntimeError.is(failure)) {
+              expect(failure.cause).toBeInstanceOf(AggregateError);
+              const causes = (failure.cause as AggregateError).errors;
+              expect(OpenCodeRuntimeError.is(causes[0])).toBe(true);
+              if (OpenCodeRuntimeError.is(causes[0])) {
+                expect(causes[0].detail).toContain("Timed out waiting for OpenCode server start");
+              }
+              expect(OpenCodeRuntimeError.is(causes[1])).toBe(true);
+              if (OpenCodeRuntimeError.is(causes[1])) {
+                expect(causes[1].detail).toContain("startup cleanup proof failed");
+              }
+            }
+          }
+          yield* Scope.close(initialScope, Exit.void);
+          expect(spawnCalls).toBe(1);
+          expect(teardownCalls).toBe(1);
+
+          const firstScope = yield* Scope.make();
+          const secondScope = yield* Scope.make();
+          const firstReplacement = yield* runtime
+            .connectToOpenCodeServer(input)
+            .pipe(Effect.provideService(Scope.Scope, firstScope), Effect.forkChild);
+          yield* Effect.yieldNow;
+          yield* Effect.yieldNow;
+          expect(teardownCalls).toBe(2);
+          const secondReplacement = yield* runtime
+            .connectToOpenCodeServer(input)
+            .pipe(Effect.provideService(Scope.Scope, secondScope), Effect.forkChild);
+          yield* Effect.yieldNow;
+          yield* Effect.yieldNow;
+
+          expect(spawnCalls).toBe(1);
+          expect(firstReplacement.pollUnsafe()).toBeUndefined();
+          expect(secondReplacement.pollUnsafe()).toBeUndefined();
+
+          proveRetry?.();
+          const [first, second] = yield* Effect.all([
+            Fiber.join(firstReplacement),
+            Fiber.join(secondReplacement),
+          ]);
+          expect(first.url).toBe("http://127.0.0.1:59101");
+          expect(second.url).toBe(first.url);
+          expect(spawnCalls).toBe(2);
+          expect(teardownCalls).toBe(2);
+
+          yield* Scope.close(firstScope, Exit.void);
+          yield* Scope.close(secondScope, Exit.void);
+          expect(teardownCalls).toBe(3);
+        }),
+      ).pipe(Effect.provide(layer)),
+    );
+  });
+
+  it("registers receipt-aware server ownership before a queued post-spawn interruption", async () => {
+    let spawnCalls = 0;
+    let teardownCalls = 0;
+    const acquiredFirstSpawn = Promise.withResolvers<void>();
+    const releaseFirstSpawn = Promise.withResolvers<void>();
+    const releaseCleanupRetry = Promise.withResolvers<void>();
+    const cleanupInputs: Array<{
+      readonly rootPid: number;
+      readonly descendantExitProof: string | undefined;
+      readonly hasRootExitProof: boolean;
+    }> = [];
+    const spawnerLayer = Layer.succeed(
+      ChildProcessSpawner.ChildProcessSpawner,
+      ChildProcessSpawner.make(() => {
+        const spawnIndex = spawnCalls;
+        spawnCalls += 1;
+        const child = mockOpenCodeServerHandle({
+          stdout:
+            spawnIndex === 0
+              ? "startup waiting after spawn\n"
+              : "opencode server listening on http://127.0.0.1:59110\n",
+          stderr: "",
+          pid: 59_110 + spawnIndex,
+          exitCode: Effect.never,
+        });
+        return spawnIndex === 0
+          ? Effect.promise(async () => {
+              acquiredFirstSpawn.resolve();
+              await releaseFirstSpawn.promise;
+              return child;
+            })
+          : Effect.succeed(child);
+      }),
+    );
+    const layer = makeOpenCodeRuntimeLive({
+      platform: "win32",
+      prepareProcess: () => ({
+        command: "synara-windows-job-launcher.exe",
+        args: ["--", "opencode"],
+        shell: false as const,
+        containment: "windows-job-object" as const,
+        completionReceipt: {
+          path: "C:\\Synara\\opencode-job-empty.receipt",
+          token: "opencode-job-empty-proof",
+        },
+        windowsJobName: "synara-opencode-job",
+      }),
+      netService: {
+        canListenOnHost: () => Effect.succeed(true),
+        isPortAvailableOnLoopback: () => Effect.succeed(true),
+        reserveLoopbackPort: () => Effect.succeed(59_110),
+        findAvailablePort: () => Effect.succeed(59_110),
+      },
+      teardownProcessTree: async (input) => {
+        teardownCalls += 1;
+        cleanupInputs.push({
+          rootPid: input.rootPid,
+          descendantExitProof: input.descendantExitProof,
+          hasRootExitProof: input.rootExitProof instanceof Promise,
+        });
+        if (teardownCalls === 1) {
+          throw new Error("interrupted server receipt cleanup proof failed");
+        }
+        if (teardownCalls === 2) {
+          await releaseCleanupRetry.promise;
+        }
+        return { escalated: false, signalErrors: [] };
+      },
+    }).pipe(Layer.provide(spawnerLayer));
+
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const runtime = yield* OpenCodeRuntime;
+          const input = {
+            binaryPath: "opencode",
+            poolIsolationKey: "post-spawn-interruption",
+          };
+          const interruptedScope = yield* Scope.make();
+          const interruptedStartup = yield* runtime
+            .connectToOpenCodeServer(input)
+            .pipe(Effect.provideService(Scope.Scope, interruptedScope), Effect.forkChild);
+
+          yield* Effect.promise(() => acquiredFirstSpawn.promise);
+          const interrupting = yield* Fiber.interrupt(interruptedStartup).pipe(Effect.forkChild);
+          yield* Effect.yieldNow;
+          releaseFirstSpawn.resolve();
+          yield* Fiber.join(interrupting);
+
+          const replacementScope = yield* Scope.make();
+          const replacement = yield* runtime
+            .connectToOpenCodeServer(input)
+            .pipe(Effect.provideService(Scope.Scope, replacementScope), Effect.forkChild);
+          yield* Effect.yieldNow;
+          yield* Effect.yieldNow;
+          const stateBeforeRetryProof = {
+            teardownCalls,
+            spawnCalls,
+            replacementPending: replacement.pollUnsafe() === undefined,
+          };
+
+          releaseCleanupRetry.resolve();
+          const server = yield* Fiber.join(replacement);
+
+          expect(stateBeforeRetryProof).toEqual({
+            teardownCalls: 2,
+            spawnCalls: 1,
+            replacementPending: true,
+          });
+          expect(cleanupInputs[0]).toEqual({
+            rootPid: 59_110,
+            descendantExitProof: "windows-job-empty-on-exit",
+            hasRootExitProof: true,
+          });
+          expect(server.url).toBe("http://127.0.0.1:59110");
+          expect(spawnCalls).toBe(2);
+
+          yield* Scope.close(interruptedScope, Exit.void);
+          yield* Scope.close(replacementScope, Exit.void);
+          expect(teardownCalls).toBe(3);
+          expect(
+            cleanupInputs.every(
+              (cleanup) =>
+                cleanup.descendantExitProof === "windows-job-empty-on-exit" &&
+                cleanup.hasRootExitProof,
+            ),
+          ).toBe(true);
+        }).pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              releaseFirstSpawn.resolve();
+              releaseCleanupRetry.resolve();
+            }),
+          ),
+        ),
+      ).pipe(Effect.provide(layer)),
+    );
+  });
+
+  it("proves an exited POSIX server group is empty before replacement", async () => {
+    const spawnedUrls: Array<string> = [];
+    const exitResolvers: Array<(code: ChildProcessSpawner.ExitCode) => void> = [];
+    const provenProcessGroups: Array<number> = [];
+    const spawnerLayer = Layer.succeed(
+      ChildProcessSpawner.ChildProcessSpawner,
+      ChildProcessSpawner.make(() => {
+        const url = `http://127.0.0.1:${String(59_200 + spawnedUrls.length)}`;
+        const pid = 59_200 + spawnedUrls.length;
+        spawnedUrls.push(url);
+        let resolveExit!: (code: ChildProcessSpawner.ExitCode) => void;
+        const exitCode = new Promise<ChildProcessSpawner.ExitCode>((resolve) => {
+          resolveExit = resolve;
+        });
+        exitResolvers.push(resolveExit);
+        return Effect.succeed(
+          mockOpenCodeServerHandle({
+            stdout: `opencode server listening on ${url}\n`,
+            stderr: "",
+            pid,
+            exitCode: Effect.promise(() => exitCode),
+          }),
+        );
+      }),
+    );
+    const layer = makeOpenCodeRuntimeLive({
+      platform: "linux",
+      prepareProcess: prepareMockProcess,
+      netService: {
+        canListenOnHost: () => Effect.succeed(true),
+        isPortAvailableOnLoopback: () => Effect.succeed(true),
+        reserveLoopbackPort: () => Effect.succeed(59_200),
+        findAvailablePort: () => Effect.succeed(59_200),
+      },
+      teardownPosixProcessGroup: async (processGroupId) => {
+        provenProcessGroups.push(processGroupId);
+      },
+    }).pipe(Layer.provide(spawnerLayer));
+
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const runtime = yield* OpenCodeRuntime;
+          const input = {
+            binaryPath: "opencode",
+            poolIsolationKey: "natural-exit-replacement",
+          };
+          const firstScope = yield* Scope.make();
+          const first = yield* runtime
+            .connectToOpenCodeServer(input)
+            .pipe(Effect.provideService(Scope.Scope, firstScope));
+          expect(first.url).toBe("http://127.0.0.1:59200");
+
+          exitResolvers[0]?.(ChildProcessSpawner.ExitCode(0));
+          yield* Effect.yieldNow;
+          yield* Effect.yieldNow;
+
+          const secondScope = yield* Scope.make();
+          const second = yield* runtime
+            .connectToOpenCodeServer(input)
+            .pipe(Effect.provideService(Scope.Scope, secondScope));
+          expect(second.url).toBe("http://127.0.0.1:59201");
+          expect(spawnedUrls).toEqual(["http://127.0.0.1:59200", "http://127.0.0.1:59201"]);
+          expect(provenProcessGroups).toEqual([59_200]);
+
+          yield* Scope.close(firstScope, Exit.void);
+          yield* Scope.close(secondScope, Exit.void);
+          expect(provenProcessGroups).toEqual([59_200, 59_201]);
+        }),
+      ).pipe(Effect.provide(layer)),
+    );
+  });
+
+  it("attempts every owned server cleanup before finalizer failure is surfaced", async () => {
+    const attemptedProcessIds: Array<number> = [];
+    let spawnCalls = 0;
+    const spawnerLayer = Layer.succeed(
+      ChildProcessSpawner.ChildProcessSpawner,
+      ChildProcessSpawner.make(() => {
+        const processIndex = spawnCalls;
+        spawnCalls += 1;
+        const port = 59_300 + processIndex;
+        return Effect.succeed(
+          mockOpenCodeServerHandle({
+            stdout: `opencode server listening on http://127.0.0.1:${String(port)}\n`,
+            stderr: "",
+            pid: port,
+            exitCode: Effect.never,
+          }),
+        );
+      }),
+    );
+    const layer = makeOpenCodeRuntimeLive({
+      prepareProcess: prepareMockProcess,
+      netService: {
+        canListenOnHost: () => Effect.succeed(true),
+        isPortAvailableOnLoopback: () => Effect.succeed(true),
+        reserveLoopbackPort: () => Effect.succeed(59_300),
+        findAvailablePort: () => Effect.succeed(59_300),
+      },
+      teardownProcessTree: async ({ rootPid }) => {
+        attemptedProcessIds.push(rootPid);
+        throw new Error(`cleanup failed for ${String(rootPid)}`);
+      },
+    }).pipe(Layer.provide(spawnerLayer));
+
+    const exit = await Effect.runPromiseExit(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const runtime = yield* OpenCodeRuntime;
+          const firstScope = yield* Scope.make();
+          const secondScope = yield* Scope.make();
+          yield* runtime
+            .connectToOpenCodeServer({
+              binaryPath: "opencode",
+              poolIsolationKey: "finalizer-first",
+            })
+            .pipe(Effect.provideService(Scope.Scope, firstScope));
+          yield* runtime
+            .connectToOpenCodeServer({
+              binaryPath: "opencode",
+              poolIsolationKey: "finalizer-second",
+            })
+            .pipe(Effect.provideService(Scope.Scope, secondScope));
+        }),
+      ).pipe(Effect.provide(layer)),
+    );
+
+    expect(Exit.isFailure(exit)).toBe(true);
+    expect(attemptedProcessIds).toContain(59_300);
+    expect(attemptedProcessIds).toContain(59_301);
+    expect(attemptedProcessIds.indexOf(59_301)).toBeGreaterThan(
+      attemptedProcessIds.indexOf(59_300),
     );
   });
 

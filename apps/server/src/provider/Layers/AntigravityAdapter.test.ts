@@ -578,7 +578,11 @@ describe("Antigravity process spawning and output ownership", () => {
       env: turnEnv,
       dependencies: {
         prepareProcess: (command, args, input) => {
-          expect(input).toEqual({ cwd: "C:\\turn cwd", env: turnEnv });
+          expect(input).toEqual({
+            cwd: "C:\\turn cwd",
+            env: turnEnv,
+            completionReceipt: "create",
+          });
           return {
             command: `prepared-${command}`,
             args: [...args],
@@ -726,7 +730,7 @@ describe("Antigravity process spawning and output ownership", () => {
     await expect(closeResult).resolves.toMatchObject({ code: 0 });
     await new Promise((resolve) => setTimeout(resolve, 30));
 
-    expect(spawnErrorTeardown).not.toHaveBeenCalled();
+    expect(spawnErrorTeardown).toHaveBeenCalledOnce();
     expect(closeTeardown).not.toHaveBeenCalled();
     for (const fake of [spawnErrorFake, closeFake]) {
       expect(fake.child.listenerCount("error")).toBe(0);
@@ -734,9 +738,63 @@ describe("Antigravity process spawning and output ownership", () => {
       expect(fake.stdout.listenerCount("data")).toBe(0);
       expect(fake.stderr.listenerCount("data")).toBe(0);
     }
+
+    const pidlessFake = makeFakeChild(42_011);
+    Object.assign(pidlessFake.child, { pid: undefined });
+    const pidlessTeardown = vi.fn(async () => undefined);
+    const pidlessFailure = new Error("helper failed before spawning");
+    const pidlessResult = runAntigravityHelperProcess("missing-helper", [], {
+      dependencies: fakeProcessDependencies(pidlessFake, {
+        teardownProcessTree: pidlessTeardown,
+      }),
+    });
+    pidlessFake.emitError(pidlessFailure);
+    await expect(pidlessResult).rejects.toBe(pidlessFailure);
+    expect(pidlessTeardown).not.toHaveBeenCalled();
   });
 
-  it("finalizes a turn spawn error once when close races behind it", async () => {
+  it("retains a failed helper owner and blocks replacement until cleanup retry proves exit", async () => {
+    const first = makeFakeChild(42_008);
+    const replacement = makeFakeChild(42_009);
+    const children = [first, replacement];
+    const spawnProcess = vi.fn(() => children.shift()!.child);
+    let teardownCalls = 0;
+    const teardownProcessTree = vi.fn(async () => {
+      teardownCalls += 1;
+      if (teardownCalls <= 2) throw new Error(`helper cleanup proof failed ${teardownCalls}`);
+    });
+    const dependencies: AntigravityProcessDependencies = {
+      ...fakeProcessDependencies(first),
+      spawnProcess,
+      teardownProcessTree,
+    };
+
+    const failed = runAntigravityHelperProcess("fake-helper", [], {
+      dependencies,
+    });
+    await waitFor(() => spawnProcess.mock.calls.length === 1);
+    const blockedReplacement = runAntigravityHelperProcess("fake-helper", [], { dependencies });
+    await expectPending(blockedReplacement);
+    expect(spawnProcess).toHaveBeenCalledOnce();
+
+    first.emitError(new Error("helper transport failed"));
+    await expect(failed).rejects.toThrow("helper transport failed");
+    expect(spawnProcess).toHaveBeenCalledOnce();
+
+    await expect(blockedReplacement).rejects.toThrow(
+      "previous Antigravity helper process tree is still unproven",
+    );
+    expect(spawnProcess).toHaveBeenCalledOnce();
+    expect(teardownProcessTree).toHaveBeenCalledTimes(2);
+
+    const recovered = runAntigravityHelperProcess("fake-helper", [], { dependencies });
+    await waitFor(() => spawnProcess.mock.calls.length === 2);
+    replacement.emitClose(0);
+    await expect(recovered).resolves.toMatchObject({ code: 0 });
+    expect(teardownProcessTree).toHaveBeenCalledTimes(3);
+  });
+
+  it("tears down an owned turn after a process error and finalizes once", async () => {
     const fake = makeFakeChild(42_005);
     const failure = new Error("turn spawn failed");
     const teardownProcessTree = vi.fn(async () => undefined);
@@ -753,11 +811,32 @@ describe("Antigravity process spawning and output ownership", () => {
     fake.emitClose(1);
     await expect(lifecycle.finalization).rejects.toBe(failure);
     expect(onFinalize).toHaveBeenCalledOnce();
-    expect(teardownProcessTree).not.toHaveBeenCalled();
+    expect(teardownProcessTree).toHaveBeenCalledOnce();
     expect(fake.child.listenerCount("error")).toBe(0);
     expect(fake.child.listenerCount("close")).toBe(0);
     expect(fake.stdout.listenerCount("data")).toBe(0);
     expect(fake.stderr.listenerCount("data")).toBe(0);
+  });
+
+  it("does not teardown a PID-less turn spawn failure", async () => {
+    const fake = makeFakeChild(42_010);
+    Object.assign(fake.child, { pid: undefined });
+    const failure = new Error("turn spawn failed before process ownership");
+    const teardownProcessTree = vi.fn(async () => undefined);
+    const onFinalize = vi.fn(async () => undefined);
+    const lifecycle = startAntigravityTurnProcess({
+      command: "fake-turn",
+      args: [],
+      env: process.env,
+      dependencies: fakeProcessDependencies(fake, { teardownProcessTree }),
+      onFinalize,
+    });
+
+    fake.emitError(failure);
+    fake.emitClose(1);
+    await expect(lifecycle.finalization).rejects.toBe(failure);
+    expect(onFinalize).toHaveBeenCalledOnce();
+    expect(teardownProcessTree).not.toHaveBeenCalled();
   });
 
   it("awaits requested teardown when spawn error and close race behind it", async () => {
@@ -968,11 +1047,14 @@ describe("Antigravity active turn lifecycle", () => {
     });
   });
 
-  it("lets teardown failure win over interrupted status and releases turn ownership", async () => {
+  it("retains teardown-failed turn ownership until a later cleanup retry proves exit", async () => {
     const fake = makeFakeChild();
-    const failure = new Error("descendant survival could not be disproven");
+    let teardownCalls = 0;
     const teardownProcessTree = vi.fn(async () => {
-      throw failure;
+      teardownCalls += 1;
+      if (teardownCalls <= 2) {
+        throw new Error(`descendant survival could not be disproven ${teardownCalls}`);
+      }
     });
 
     await startFakeAdapterTurn({
@@ -986,11 +1068,29 @@ describe("Antigravity active turn lifecycle", () => {
         expect(sessions).toHaveLength(1);
         expect(sessions[0]).toMatchObject({
           status: "error",
-          lastError: "descendant survival could not be disproven",
+          lastError: "descendant survival could not be disproven 1",
         });
         expect(sessions[0]).not.toHaveProperty("activeTurnId");
         expect(fake.child.listenerCount("close")).toBe(0);
-        expect(teardownProcessTree).toHaveBeenCalledOnce();
+
+        await expect(
+          Effect.runPromise(adapter.sendTurn({ threadId, input: "must not overlap" })),
+        ).rejects.toThrow("previous Antigravity process tree is still unproven");
+        await expect(
+          Effect.runPromise(
+            adapter.startSession({
+              provider: "antigravity",
+              threadId,
+              runtimeMode: "full-access",
+              providerOptions: { antigravity: { binaryPath: "fake-antigravity" } },
+            }),
+          ),
+        ).rejects.toThrow("descendant survival could not be disproven 2");
+        expect(await Effect.runPromise(adapter.hasSession(threadId))).toBe(true);
+
+        await Effect.runPromise(adapter.stopSession(threadId));
+        expect(await Effect.runPromise(adapter.hasSession(threadId))).toBe(false);
+        expect(teardownProcessTree).toHaveBeenCalledTimes(3);
       },
     });
   });

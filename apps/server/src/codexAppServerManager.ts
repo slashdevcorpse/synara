@@ -57,6 +57,7 @@ import {
 import {
   markWindowsProviderProcessSpawn,
   prepareResolvedWindowsProviderProcess,
+  windowsProviderProcessExitProofError,
 } from "./provider/windowsProviderProcess.ts";
 import { ensureIsolatedScratchWorkspace } from "./scratchWorkspaces.ts";
 import { createLogger } from "./logger";
@@ -147,7 +148,7 @@ interface CodexSessionContext {
   account: CodexAccountSnapshot;
   child: ChildProcessWithoutNullStreams;
   stdoutFramer: CodexJsonlFramer;
-  stdinWriter: CodexJsonlWriter;
+  stdinWriter?: CodexJsonlWriter;
   detachStdout?: () => void;
   pending: Map<PendingRequestKey, PendingRequest>;
   pendingApprovals: Map<ApprovalRequestId, PendingApprovalRequest>;
@@ -630,6 +631,7 @@ function spawnCodexAppServer(input: {
     {
       cwd: input.cwd,
       env: input.env,
+      completionReceipt: "create",
     },
   );
   return markWindowsProviderProcessSpawn(
@@ -832,6 +834,10 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
       }
     | undefined;
   private readonly teardownProcessTree: typeof teardownProviderProcessTree;
+  private readonly spawnAppServer: typeof spawnCodexAppServer;
+  private readonly createStdinWriter: (
+    stdin: ChildProcessWithoutNullStreams["stdin"],
+  ) => CodexJsonlWriter;
   constructor(
     services?: ServiceMap.ServiceMap<never>,
     options?: {
@@ -841,6 +847,10 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
         readonly acquireSessionLease: (threadId: ThreadId) => AgentGatewaySessionLease;
       };
       readonly teardownProcessTree?: typeof teardownProviderProcessTree;
+      readonly spawnAppServer?: typeof spawnCodexAppServer;
+      readonly createStdinWriter?: (
+        stdin: ChildProcessWithoutNullStreams["stdin"],
+      ) => CodexJsonlWriter;
     },
   ) {
     super();
@@ -848,6 +858,8 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
     this.synaraSkillsDir = options?.synaraSkillsDir;
     this.agentGatewayMcp = options?.agentGatewayMcp;
     this.teardownProcessTree = options?.teardownProcessTree ?? teardownProviderProcessTree;
+    this.spawnAppServer = options?.spawnAppServer ?? spawnCodexAppServer;
+    this.createStdinWriter = options?.createStdinWriter ?? ((stdin) => new CodexJsonlWriter(stdin));
   }
 
   // The Synara MCP server rides on the shared overlay config (no secrets),
@@ -926,7 +938,14 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
         env: codexLaunch.env,
       });
       gatewaySessionLease = this.agentGatewayMcp?.acquireSessionLease(threadId);
-      const child = spawnCodexAppServer({
+      const stdoutFramer = new CodexJsonlFramer();
+      const pending = new Map<PendingRequestKey, PendingRequest>();
+      const pendingApprovals = new Map<ApprovalRequestId, PendingApprovalRequest>();
+      const pendingUserInputs = new Map<ApprovalRequestId, PendingUserInputRequest>();
+      const collabReceiverTurns = new Map<string, TurnId>();
+      const collabReceiverParents = new Map<string, string>();
+      const reviewTurnIds = new Set<TurnId>();
+      const child = this.spawnAppServer({
         binaryPath: codexLaunch.binaryPath,
         cwd: resolvedCwd,
         env: await this.buildSessionProcessEnv(
@@ -949,19 +968,19 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
           sparkEnabled: true,
         },
         child,
-        stdoutFramer: new CodexJsonlFramer(),
-        stdinWriter: new CodexJsonlWriter(child.stdin),
-        pending: new Map(),
-        pendingApprovals: new Map(),
-        pendingUserInputs: new Map(),
-        collabReceiverTurns: new Map(),
-        collabReceiverParents: new Map(),
-        reviewTurnIds: new Set(),
+        stdoutFramer,
+        pending,
+        pendingApprovals,
+        pendingUserInputs,
+        collabReceiverTurns,
+        collabReceiverParents,
+        reviewTurnIds,
         nextRequestId: 1,
         stopping: false,
       };
 
       this.sessions.set(threadId, context);
+      context.stdinWriter = this.createStdinWriter(child.stdin);
       this.attachProcessListeners(context);
 
       this.emitLifecycleEvent(context, "session/connecting", "Starting codex app-server");
@@ -1493,7 +1512,14 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
         env: codexLaunch.env,
       });
       gatewaySessionLease = this.agentGatewayMcp?.acquireSessionLease(threadId);
-      const child = spawnCodexAppServer({
+      const stdoutFramer = new CodexJsonlFramer();
+      const pending = new Map<PendingRequestKey, PendingRequest>();
+      const pendingApprovals = new Map<ApprovalRequestId, PendingApprovalRequest>();
+      const pendingUserInputs = new Map<ApprovalRequestId, PendingUserInputRequest>();
+      const collabReceiverTurns = new Map<string, TurnId>();
+      const collabReceiverParents = new Map<string, string>();
+      const reviewTurnIds = new Set<TurnId>();
+      const child = this.spawnAppServer({
         binaryPath: codexLaunch.binaryPath,
         cwd: resolvedCwd,
         env: await this.buildSessionProcessEnv(
@@ -1513,19 +1539,19 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
           sparkEnabled: true,
         },
         child,
-        stdoutFramer: new CodexJsonlFramer(),
-        stdinWriter: new CodexJsonlWriter(child.stdin),
-        pending: new Map(),
-        pendingApprovals: new Map(),
-        pendingUserInputs: new Map(),
-        collabReceiverTurns: new Map(),
-        collabReceiverParents: new Map(),
-        reviewTurnIds: new Set(),
+        stdoutFramer,
+        pending,
+        pendingApprovals,
+        pendingUserInputs,
+        collabReceiverTurns,
+        collabReceiverParents,
+        reviewTurnIds,
         nextRequestId: 1,
         stopping: false,
       };
 
       this.sessions.set(threadId, context);
+      context.stdinWriter = this.createStdinWriter(child.stdin);
       this.attachProcessListeners(context);
       this.emitLifecycleEvent(context, "session/connecting", "Starting codex app-server");
 
@@ -1843,7 +1869,14 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
       }
     });
     context.stopPromise = stopPromise;
-    return stopPromise;
+    try {
+      await stopPromise;
+    } catch (cause) {
+      if (context.stopPromise === stopPromise) {
+        delete context.stopPromise;
+      }
+      throw cause;
+    }
   }
 
   listSessions(): ProviderSession[] {
@@ -2204,7 +2237,24 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
       cwd: normalizedCwd,
       env: codexLaunch.env,
     });
-    const child = spawnCodexAppServer({
+    const stdoutFramer = new CodexJsonlFramer();
+    const pending = new Map<PendingRequestKey, PendingRequest>();
+    const pendingApprovals = new Map<ApprovalRequestId, PendingApprovalRequest>();
+    const pendingUserInputs = new Map<ApprovalRequestId, PendingUserInputRequest>();
+    const collabReceiverTurns = new Map<string, TurnId>();
+    const collabReceiverParents = new Map<string, string>();
+    const reviewTurnIds = new Set<TurnId>();
+    const discoverySession: ProviderSession = {
+      provider: "codex",
+      status: "connecting",
+      runtimeMode: "full-access",
+      model: CODEX_DEFAULT_MODEL,
+      cwd: normalizedCwd,
+      threadId: ThreadId.makeUnsafe(`__codex_discovery__:${normalizedCwd}`),
+      createdAt: now,
+      updatedAt: now,
+    };
+    const child = this.spawnAppServer({
       binaryPath: codexLaunch.binaryPath,
       cwd: normalizedCwd,
       env: codexLaunch.env,
@@ -2213,38 +2263,29 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
       binaryPath: codexLaunch.binaryPath,
       ...(normalizedHomePath ? { homePath: normalizedHomePath } : {}),
       discoveryKey,
-      session: {
-        provider: "codex",
-        status: "connecting",
-        runtimeMode: "full-access",
-        model: CODEX_DEFAULT_MODEL,
-        cwd: normalizedCwd,
-        threadId: ThreadId.makeUnsafe(`__codex_discovery__:${normalizedCwd}`),
-        createdAt: now,
-        updatedAt: now,
-      },
+      session: discoverySession,
       account: {
         type: "unknown",
         planType: null,
         sparkEnabled: true,
       },
       child,
-      stdoutFramer: new CodexJsonlFramer(),
-      stdinWriter: new CodexJsonlWriter(child.stdin),
-      pending: new Map(),
-      pendingApprovals: new Map(),
-      pendingUserInputs: new Map(),
-      collabReceiverTurns: new Map(),
-      collabReceiverParents: new Map(),
-      reviewTurnIds: new Set(),
+      stdoutFramer,
+      pending,
+      pendingApprovals,
+      pendingUserInputs,
+      collabReceiverTurns,
+      collabReceiverParents,
+      reviewTurnIds,
       nextRequestId: 1,
       stopping: false,
       discovery: true,
     };
 
     this.discoverySessions.set(discoveryKey, context);
-    this.attachProcessListeners(context);
     try {
+      context.stdinWriter = this.createStdinWriter(child.stdin);
+      this.attachProcessListeners(context);
       await this.sendRequest(context, "initialize", buildCodexInitializeParams());
       await this.writeMessage(context, { method: "initialized" });
       await this.registerSynaraSkillsRoot(context);
@@ -2320,7 +2361,14 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
       }
     });
     context.stopPromise = stopPromise;
-    return stopPromise;
+    try {
+      await stopPromise;
+    } catch (cause) {
+      if (context.stopPromise === stopPromise) {
+        delete context.stopPromise;
+      }
+      throw cause;
+    }
   }
 
   private attachProcessListeners(context: CodexSessionContext): void {
@@ -2384,12 +2432,25 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
 
       context.detachStdout?.();
       context.gatewaySessionLease?.release();
-      const message = `codex app-server exited (code=${code ?? "null"}, signal=${signal ?? "null"}).`;
+      const processExitProofError = windowsProviderProcessExitProofError(context.child);
+      const message = processExitProofError
+        ? `codex app-server exited without proven Windows process-tree cleanup (code=${code ?? "null"}, signal=${signal ?? "null"}): ${processExitProofError.message}`
+        : `codex app-server exited (code=${code ?? "null"}, signal=${signal ?? "null"}).`;
       const exitError = new Error(message);
-      context.stdinWriter.close(exitError);
+      context.stdinWriter?.close(exitError);
       this.rejectPendingRequests(context, exitError);
       context.pendingApprovals.clear();
       context.pendingUserInputs.clear();
+      if (processExitProofError) {
+        context.stopping = true;
+        this.updateSession(context, {
+          status: "error",
+          activeTurnId: undefined,
+          lastError: message,
+        });
+        this.emitErrorEvent(context, "process/exitUnproven", message);
+        return;
+      }
       this.updateSession(context, {
         status: "closed",
         activeTurnId: undefined,
@@ -2404,7 +2465,7 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
           this.discoverySessionIdleTimers.delete(discoveryKey);
           this.discoverySessions.delete(discoveryKey);
         }
-      } else {
+      } else if (this.sessions.get(context.session.threadId) === context) {
         this.sessions.delete(context.session.threadId);
       }
     });
@@ -2826,7 +2887,13 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
   }
 
   private writeMessage(context: CodexSessionContext, message: unknown): Promise<void> {
-    return context.stdinWriter.write(message).catch((cause) => {
+    const stdinWriter = context.stdinWriter;
+    if (!stdinWriter) {
+      const cause = new Error("Codex app-server stdin transport was not initialized.");
+      this.handleTransportFailure(context, cause);
+      return Promise.reject(cause);
+    }
+    return stdinWriter.write(message).catch((cause) => {
       this.handleTransportFailure(context, cause);
       throw cause;
     });

@@ -152,7 +152,10 @@ import {
   teardownProviderProcessTree,
   type ProcessExitHandle,
 } from "../supervisedProcessTeardown.ts";
-import { spawnContainedClaudeSdkProcess } from "../containedClaudeSdkProcess.ts";
+import {
+  spawnContainedClaudeSdkProcess,
+  teardownContainedClaudeSdkProcess,
+} from "../containedClaudeSdkProcess.ts";
 
 const PROVIDER = "claudeAgent" as const;
 type ClaudeTextStreamKind = Extract<RuntimeContentStreamKind, "assistant_text" | "reasoning_text">;
@@ -387,6 +390,22 @@ export type ClaudeOwnedProcess = ClaudeSpawnedProcess & ProcessExitHandle;
 
 interface ClaudeProcessOwner {
   process?: ClaudeOwnedProcess;
+}
+
+interface ClaudeCommandDiscoveryOwner {
+  readonly processOwner: ClaudeProcessOwner;
+  query?: ClaudeQueryRuntime;
+  cleanup?: Promise<void>;
+}
+
+interface ClaudePreInstallOwner {
+  readonly processOwner: ClaudeProcessOwner;
+  readonly promptQueue: Queue.Queue<PromptQueueItem>;
+  query?: ClaudeQueryRuntime;
+  gatewaySessionLease?: AgentGatewaySessionLease;
+  startupFailure?: unknown;
+  cleanupFailure?: unknown;
+  cleanup?: Promise<void>;
 }
 
 function spawnOwnedClaudeCodeProcess(options: ClaudeSpawnOptions): ClaudeOwnedProcess {
@@ -1484,6 +1503,7 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
 
     const sessions = new Map<ThreadId, ClaudeSessionContext>();
     const sessionLifecycleLocks = new Map<ThreadId, Semaphore.Semaphore>();
+    const preInstallOwners = new Map<ThreadId, ClaudePreInstallOwner>();
     let cachedModels: ProviderListModelsResult | null = null;
     let cachedAgents: ProviderListAgentsResult | null = null;
     const runtimeEventQueue = yield* Queue.unbounded<ProviderRuntimeEvent>();
@@ -1523,7 +1543,10 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
         return Effect.void;
       }
       return Effect.tryPromise({
-        try: () => teardownChildProcessTree(process, teardownProcessTree),
+        try: () =>
+          teardownContainedClaudeSdkProcess(process, () =>
+            teardownChildProcessTree(process, teardownProcessTree),
+          ),
         catch: (cause) =>
           new ProviderAdapterProcessError({
             provider: PROVIDER,
@@ -1542,6 +1565,76 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
         Effect.asVoid,
       );
     };
+
+    const cleanupPreInstallOwner = (
+      threadId: ThreadId,
+      owner: ClaudePreInstallOwner,
+    ): Effect.Effect<void, ProviderAdapterProcessError> =>
+      Effect.tryPromise({
+        try: () => {
+          if (!owner.cleanup) {
+            const cleanup = (async () => {
+              await Effect.runPromise(teardownClaudeProcess(threadId, owner.processOwner));
+              await Effect.runPromise(Queue.shutdown(owner.promptQueue));
+              const query = owner.query;
+              if (query) {
+                query.close();
+                if (owner.query === query) delete owner.query;
+              }
+              const gatewaySessionLease = owner.gatewaySessionLease;
+              if (gatewaySessionLease) {
+                gatewaySessionLease.release();
+                if (owner.gatewaySessionLease === gatewaySessionLease) {
+                  delete owner.gatewaySessionLease;
+                }
+              }
+            })();
+            owner.cleanup = cleanup;
+            void cleanup.catch(() => {
+              if (owner.cleanup === cleanup) delete owner.cleanup;
+            });
+          }
+          return owner.cleanup;
+        },
+        catch: (cause) =>
+          cause instanceof ProviderAdapterProcessError
+            ? cause
+            : new ProviderAdapterProcessError({
+                provider: PROVIDER,
+                threadId,
+                detail: toMessage(cause, "Failed to clean up an uninstalled Claude session."),
+                cause,
+              }),
+      });
+
+    const retryPreInstallOwnerCleanup = (
+      threadId: ThreadId,
+    ): Effect.Effect<void, ProviderAdapterProcessError> =>
+      Effect.gen(function* () {
+        const owner = preInstallOwners.get(threadId);
+        if (!owner) return;
+        const cleanupExit = yield* Effect.exit(cleanupPreInstallOwner(threadId, owner));
+        if (Exit.isFailure(cleanupExit)) {
+          const failures: Array<unknown> = [];
+          if (owner.startupFailure !== undefined) failures.push(owner.startupFailure);
+          if (owner.cleanupFailure !== undefined) failures.push(owner.cleanupFailure);
+          failures.push(Cause.squash(cleanupExit.cause));
+          const aggregate = new AggregateError(
+            failures,
+            "Claude pre-install process cleanup remains unproven after retry.",
+          );
+          owner.cleanupFailure = aggregate;
+          return yield* new ProviderAdapterProcessError({
+            provider: PROVIDER,
+            threadId,
+            detail: aggregate.message,
+            cause: aggregate,
+          });
+        }
+        if (preInstallOwners.get(threadId) === owner) {
+          preInstallOwners.delete(threadId);
+        }
+      });
 
     const offerRuntimeEvent = (
       context: ClaudeSessionContext,
@@ -3874,8 +3967,13 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
           yield* completeTurn(context, "interrupted", "Session stopped.");
         }
 
+        const teardownExit = yield* Effect.exit(
+          teardownClaudeProcess(context.session.threadId, context.processOwner),
+        );
+        if (Exit.isFailure(teardownExit)) {
+          return yield* Effect.failCause(teardownExit.cause);
+        }
         yield* Queue.shutdown(context.promptQueue);
-
         const streamFiber = context.streamFiber;
         context.streamFiber = undefined;
         if (streamFiber && streamFiber.pollUnsafe() === undefined) {
@@ -3888,8 +3986,6 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
         } catch (cause) {
           yield* emitRuntimeError(context, "Failed to close Claude runtime query.", cause);
         }
-        yield* teardownClaudeProcess(context.session.threadId, context.processOwner);
-
         const updatedAt = yield* nowIso;
         context.session = {
           ...context.session,
@@ -3979,6 +4075,8 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
             issue: `Expected provider '${PROVIDER}' but received '${input.provider}'.`,
           });
         }
+
+        yield* retryPreInstallOwnerCleanup(input.threadId);
 
         const startedAt = yield* nowIso;
         const resumeState = readClaudeResumeState(input.resumeCursor);
@@ -4394,6 +4492,12 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
           threadId,
           PROVIDER,
         );
+        const preInstallOwner: ClaudePreInstallOwner = {
+          processOwner,
+          promptQueue,
+          ...(gatewaySessionLease ? { gatewaySessionLease } : {}),
+        };
+        preInstallOwners.set(threadId, preInstallOwner);
         const queryOptions: ClaudeQueryOptions = {
           ...(input.cwd ? { cwd: input.cwd } : {}),
           // Keep Claude context-window selection model-driven so session start
@@ -4443,251 +4547,304 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
             : {}),
         };
 
-        const queryRuntime = yield* Effect.try({
-          try: () =>
-            createQuery({
-              prompt,
-              options: queryOptions,
-            }),
-          catch: (cause) =>
-            new ProviderAdapterProcessError({
-              provider: PROVIDER,
-              threadId,
-              detail: toMessage(cause, "Failed to start Claude runtime session."),
-              cause,
-            }),
-        }).pipe(
-          Effect.tapError(() =>
-            Effect.all([
-              teardownClaudeProcess(threadId, processOwner),
-              gatewaySessionLease ? Effect.sync(gatewaySessionLease.release) : Effect.void,
-            ]).pipe(Effect.asVoid),
-          ),
-        );
-
-        let installationContext: ClaudeSessionContext | undefined;
-        let installationComplete = false;
-
-        return yield* Effect.gen(function* () {
-          // Populate model cache in background from first session
-          if (!cachedModels) {
-            queryRuntime
-              .supportedModels()
-              .then((models) => {
-                cachedModels = {
-                  models: models.map((m) => ({ slug: m.value, name: m.displayName })),
-                  source: "sdk",
-                  cached: false,
-                };
-              })
-              .catch(() => {
-                /* ignore discovery failures */
-              });
-          }
-
-          // Populate agent cache in background from first session
-          if (!cachedAgents) {
-            queryRuntime
-              .supportedAgents()
-              .then((agents) => {
-                cachedAgents = {
-                  agents: agents.map((a) => ({
-                    name: a.name,
-                    displayName: a.name,
-                    ...(a.description ? { description: a.description } : {}),
-                    ...(a.model ? { model: a.model } : {}),
-                  })),
-                  source: "sdk",
-                  cached: false,
-                };
-              })
-              .catch(() => {
-                /* ignore discovery failures */
-              });
-          }
-
-          const session: ProviderSession = {
-            threadId,
-            provider: PROVIDER,
-            status: "ready",
-            runtimeMode: input.runtimeMode,
-            ...(input.cwd ? { cwd: input.cwd } : {}),
-            ...(modelSelection?.model ? { model: modelSelection.model } : {}),
-            ...(threadId ? { threadId } : {}),
-            resumeCursor: {
-              ...(threadId ? { threadId } : {}),
-              ...(sessionId ? { resume: sessionId } : {}),
-              ...(resumeState?.resumeSessionAt
-                ? { resumeSessionAt: resumeState.resumeSessionAt }
-                : {}),
-              turnCount: resumeState?.turnCount ?? 0,
-              ...(trackedTasks.size > 0 ? { trackedTasks: Array.from(trackedTasks.values()) } : {}),
-            },
-            createdAt: startedAt,
-            updatedAt: startedAt,
-          };
-
-          const context: ClaudeSessionContext = {
-            ...(gatewaySessionLease ? { gatewaySessionLease } : {}),
-            session,
-            ...(input.lifecycleGeneration !== undefined
-              ? { lifecycleGeneration: input.lifecycleGeneration }
-              : {}),
-            promptQueue,
-            query: queryRuntime,
-            processOwner,
-            streamFiber: undefined,
-            startedAt,
-            basePermissionMode: permissionMode,
-            // A fresh CLI starts in `permissionMode` when queryOptions provides
-            // one, otherwise the SDK's "default" mode (queryOptions omits it).
-            spawnPermissionMode: permissionMode ?? "default",
-            firstTurnSpawnModeAuthoritative: true,
-            lastInteractionMode: undefined,
-            currentApiModelId: apiModelId,
-            resumeSessionId: sessionId,
-            pendingApprovals,
-            pendingUserInputs,
-            turns: [],
-            inFlightTools,
-            trackedTasks,
-            turnState: undefined,
-            interruptRequestedTurnId: undefined,
-            lastKnownContextWindow: resolveClaudeApiModelIdContextWindowMaxTokens(
-              apiModelId ?? effectiveClaudeModel,
-            ),
-            currentAutoCompactWindow: requestedAutoCompactWindowTokens,
-            currentAlwaysThinkingEnabled: thinking,
-            currentEffort: effectiveEffort,
-            currentUltracode: ultracode,
-            currentFastMode: fastMode,
-            lastKnownAutoCompactThreshold: requestedAutoCompactWindowTokens,
-            contextUsageControlEnabled: true,
-            lastKnownTokenUsage: undefined,
-            lastAssistantUuid: resumeState?.resumeSessionAt,
-            lastThreadStartedId: undefined,
-            rerouteOriginalApiModelId: undefined,
-            emittedContextUsageWarnings: new Set(),
-            stopped: false,
-            warnedUnhandledSdkKinds: new Set(),
-            subagentRuns: new Map(),
-            pendingSubagentSteers,
-            pendingSubagentStops,
-            knownBackgroundTaskIds: new Set(),
-            settledSubagentToolUseIds: new Map(),
-            liveWorkflowTaskIds: new Set(),
-            knownWorkflowTaskIds: new Set(),
-            workflowTaskIdByMemberTaskId: new Map(),
-            workflowRuntimePollers: new Map(),
-            workflowAgentLabels: new Map(),
-            workflowRuntimeStates: new Map(),
-          };
-          installationContext = context;
-          yield* Effect.gen(function* () {
-            yield* Ref.set(contextRef, context);
-            sessions.set(threadId, context);
-
-            const sessionStartedStamp = yield* makeEventStamp();
-            yield* offerRuntimeEvent(context, {
-              type: "session.started",
-              eventId: sessionStartedStamp.eventId,
-              provider: PROVIDER,
-              createdAt: sessionStartedStamp.createdAt,
-              threadId,
-              payload: input.resumeCursor !== undefined ? { resume: input.resumeCursor } : {},
-              providerRefs: {},
-            });
-
-            const configuredStamp = yield* makeEventStamp();
-            yield* offerRuntimeEvent(context, {
-              type: "session.configured",
-              eventId: configuredStamp.eventId,
-              provider: PROVIDER,
-              createdAt: configuredStamp.createdAt,
-              threadId,
-              payload: {
-                config: {
-                  ...(modelSelection?.model ? { model: modelSelection.model } : {}),
-                  ...(apiModelId ? { apiModelId } : {}),
-                  ...(requestedAutoCompactWindow
-                    ? { autoCompactWindow: requestedAutoCompactWindow }
-                    : {}),
-                  ...(input.cwd ? { cwd: input.cwd } : {}),
-                  ...(effectiveEffort ? { effort: effectiveEffort } : {}),
-                  ...(permissionMode ? { permissionMode } : {}),
-                  ...(providerOptions?.maxThinkingTokens !== undefined
-                    ? { maxThinkingTokens: providerOptions.maxThinkingTokens }
-                    : {}),
-                  ...(fastMode ? { fastMode: true } : {}),
-                  ...(ultracode ? { ultracode: true } : {}),
-                },
-              },
-              providerRefs: {},
-            });
-
-            const readyStamp = yield* makeEventStamp();
-            yield* offerRuntimeEvent(context, {
-              type: "session.state.changed",
-              eventId: readyStamp.eventId,
-              provider: PROVIDER,
-              createdAt: readyStamp.createdAt,
-              threadId,
-              payload: {
-                state: "ready",
-              },
-              providerRefs: {},
-            });
-
-            if (context.currentAutoCompactWindow === CLAUDE_CONTEXT_WINDOW_MAX_TOKENS["1m"]) {
-              context.emittedContextUsageWarnings.add("one-million-window");
-              yield* emitRuntimeWarning(
-                context,
-                "Claude's auto-compact budget is set to the model's 1M limit for this thread. Long conversations can consume usage limits much faster; switch Auto-compact to 200k unless the larger working context is intentional.",
+        return yield* Effect.uninterruptibleMask((restore) =>
+          Effect.gen(function* () {
+            const queryExit = yield* Effect.exit(
+              restore(
+                Effect.try({
+                  try: () =>
+                    createQuery({
+                      prompt,
+                      options: queryOptions,
+                    }),
+                  catch: (cause) =>
+                    new ProviderAdapterProcessError({
+                      provider: PROVIDER,
+                      threadId,
+                      detail: toMessage(cause, "Failed to start Claude runtime session."),
+                      cause,
+                    }),
+                }),
+              ),
+            );
+            if (Exit.isFailure(queryExit)) {
+              const startupFailure = Cause.squash(queryExit.cause);
+              preInstallOwner.startupFailure = startupFailure;
+              const cleanupExit = yield* Effect.exit(
+                cleanupPreInstallOwner(threadId, preInstallOwner),
               );
+              if (Exit.isFailure(cleanupExit)) {
+                const cleanupFailure = Cause.squash(cleanupExit.cause);
+                preInstallOwner.cleanupFailure = cleanupFailure;
+                const aggregate = new AggregateError(
+                  [startupFailure, cleanupFailure],
+                  "Claude session startup and pre-install process cleanup both failed.",
+                );
+                return yield* new ProviderAdapterProcessError({
+                  provider: PROVIDER,
+                  threadId,
+                  detail: aggregate.message,
+                  cause: aggregate,
+                });
+              }
+              if (preInstallOwners.get(threadId) === preInstallOwner) {
+                preInstallOwners.delete(threadId);
+              }
+              return yield* Effect.failCause(queryExit.cause);
             }
 
-            const streamFiber = Effect.runFork(runSdkStream(context));
-            context.streamFiber = streamFiber;
-            streamFiber.addObserver((exit) => {
-              if (context.stopped) {
-                return;
-              }
-              if (context.streamFiber === streamFiber) {
-                context.streamFiber = undefined;
-              }
-              Effect.runFork(handleStreamExit(context, exit));
-            });
-          });
+            const queryRuntime = queryExit.value;
+            preInstallOwner.query = queryRuntime;
+            let installationContext: ClaudeSessionContext | undefined;
 
-          installationComplete = true;
-          return {
-            ...session,
-          };
-        }).pipe(
-          Effect.ensuring(
-            Effect.suspend(() => {
-              if (installationComplete) {
-                return Effect.void;
-              }
-              if (installationContext !== undefined) {
-                return stopSessionInternal(installationContext, {
-                  emitExitEvent: false,
-                }).pipe(Effect.ignore);
-              }
-              return Effect.gen(function* () {
-                gatewaySessionLease?.release();
-                yield* Queue.shutdown(promptQueue);
-                const closeExit = yield* Effect.exit(Effect.sync(() => queryRuntime.close()));
-                if (Exit.isFailure(closeExit)) {
-                  yield* Effect.logWarning("claude.session.failed_install_cleanup", {
+            const installationExit = yield* Effect.exit(
+              restore(
+                Effect.gen(function* () {
+                  // Populate model cache in background from first session
+                  if (!cachedModels) {
+                    queryRuntime
+                      .supportedModels()
+                      .then((models) => {
+                        cachedModels = {
+                          models: models.map((m) => ({ slug: m.value, name: m.displayName })),
+                          source: "sdk",
+                          cached: false,
+                        };
+                      })
+                      .catch(() => {
+                        /* ignore discovery failures */
+                      });
+                  }
+
+                  // Populate agent cache in background from first session
+                  if (!cachedAgents) {
+                    queryRuntime
+                      .supportedAgents()
+                      .then((agents) => {
+                        cachedAgents = {
+                          agents: agents.map((a) => ({
+                            name: a.name,
+                            displayName: a.name,
+                            ...(a.description ? { description: a.description } : {}),
+                            ...(a.model ? { model: a.model } : {}),
+                          })),
+                          source: "sdk",
+                          cached: false,
+                        };
+                      })
+                      .catch(() => {
+                        /* ignore discovery failures */
+                      });
+                  }
+
+                  const session: ProviderSession = {
                     threadId,
-                    cause: Cause.pretty(closeExit.cause),
+                    provider: PROVIDER,
+                    status: "ready",
+                    runtimeMode: input.runtimeMode,
+                    ...(input.cwd ? { cwd: input.cwd } : {}),
+                    ...(modelSelection?.model ? { model: modelSelection.model } : {}),
+                    ...(threadId ? { threadId } : {}),
+                    resumeCursor: {
+                      ...(threadId ? { threadId } : {}),
+                      ...(sessionId ? { resume: sessionId } : {}),
+                      ...(resumeState?.resumeSessionAt
+                        ? { resumeSessionAt: resumeState.resumeSessionAt }
+                        : {}),
+                      turnCount: resumeState?.turnCount ?? 0,
+                      ...(trackedTasks.size > 0
+                        ? { trackedTasks: Array.from(trackedTasks.values()) }
+                        : {}),
+                    },
+                    createdAt: startedAt,
+                    updatedAt: startedAt,
+                  };
+
+                  const context: ClaudeSessionContext = {
+                    ...(gatewaySessionLease ? { gatewaySessionLease } : {}),
+                    session,
+                    ...(input.lifecycleGeneration !== undefined
+                      ? { lifecycleGeneration: input.lifecycleGeneration }
+                      : {}),
+                    promptQueue,
+                    query: queryRuntime,
+                    processOwner,
+                    streamFiber: undefined,
+                    startedAt,
+                    basePermissionMode: permissionMode,
+                    // A fresh CLI starts in `permissionMode` when queryOptions provides
+                    // one, otherwise the SDK's "default" mode (queryOptions omits it).
+                    spawnPermissionMode: permissionMode ?? "default",
+                    firstTurnSpawnModeAuthoritative: true,
+                    lastInteractionMode: undefined,
+                    currentApiModelId: apiModelId,
+                    resumeSessionId: sessionId,
+                    pendingApprovals,
+                    pendingUserInputs,
+                    turns: [],
+                    inFlightTools,
+                    trackedTasks,
+                    turnState: undefined,
+                    interruptRequestedTurnId: undefined,
+                    lastKnownContextWindow: resolveClaudeApiModelIdContextWindowMaxTokens(
+                      apiModelId ?? effectiveClaudeModel,
+                    ),
+                    currentAutoCompactWindow: requestedAutoCompactWindowTokens,
+                    currentAlwaysThinkingEnabled: thinking,
+                    currentEffort: effectiveEffort,
+                    currentUltracode: ultracode,
+                    currentFastMode: fastMode,
+                    lastKnownAutoCompactThreshold: requestedAutoCompactWindowTokens,
+                    contextUsageControlEnabled: true,
+                    lastKnownTokenUsage: undefined,
+                    lastAssistantUuid: resumeState?.resumeSessionAt,
+                    lastThreadStartedId: undefined,
+                    rerouteOriginalApiModelId: undefined,
+                    emittedContextUsageWarnings: new Set(),
+                    stopped: false,
+                    warnedUnhandledSdkKinds: new Set(),
+                    subagentRuns: new Map(),
+                    pendingSubagentSteers,
+                    pendingSubagentStops,
+                    knownBackgroundTaskIds: new Set(),
+                    settledSubagentToolUseIds: new Map(),
+                    liveWorkflowTaskIds: new Set(),
+                    knownWorkflowTaskIds: new Set(),
+                    workflowTaskIdByMemberTaskId: new Map(),
+                    workflowRuntimePollers: new Map(),
+                    workflowAgentLabels: new Map(),
+                    workflowRuntimeStates: new Map(),
+                  };
+                  installationContext = context;
+                  yield* Effect.gen(function* () {
+                    yield* Ref.set(contextRef, context);
+                    sessions.set(threadId, context);
+                    if (preInstallOwners.get(threadId) === preInstallOwner) {
+                      preInstallOwners.delete(threadId);
+                    }
+
+                    const sessionStartedStamp = yield* makeEventStamp();
+                    yield* offerRuntimeEvent(context, {
+                      type: "session.started",
+                      eventId: sessionStartedStamp.eventId,
+                      provider: PROVIDER,
+                      createdAt: sessionStartedStamp.createdAt,
+                      threadId,
+                      payload:
+                        input.resumeCursor !== undefined ? { resume: input.resumeCursor } : {},
+                      providerRefs: {},
+                    });
+
+                    const configuredStamp = yield* makeEventStamp();
+                    yield* offerRuntimeEvent(context, {
+                      type: "session.configured",
+                      eventId: configuredStamp.eventId,
+                      provider: PROVIDER,
+                      createdAt: configuredStamp.createdAt,
+                      threadId,
+                      payload: {
+                        config: {
+                          ...(modelSelection?.model ? { model: modelSelection.model } : {}),
+                          ...(apiModelId ? { apiModelId } : {}),
+                          ...(requestedAutoCompactWindow
+                            ? { autoCompactWindow: requestedAutoCompactWindow }
+                            : {}),
+                          ...(input.cwd ? { cwd: input.cwd } : {}),
+                          ...(effectiveEffort ? { effort: effectiveEffort } : {}),
+                          ...(permissionMode ? { permissionMode } : {}),
+                          ...(providerOptions?.maxThinkingTokens !== undefined
+                            ? { maxThinkingTokens: providerOptions.maxThinkingTokens }
+                            : {}),
+                          ...(fastMode ? { fastMode: true } : {}),
+                          ...(ultracode ? { ultracode: true } : {}),
+                        },
+                      },
+                      providerRefs: {},
+                    });
+
+                    const readyStamp = yield* makeEventStamp();
+                    yield* offerRuntimeEvent(context, {
+                      type: "session.state.changed",
+                      eventId: readyStamp.eventId,
+                      provider: PROVIDER,
+                      createdAt: readyStamp.createdAt,
+                      threadId,
+                      payload: {
+                        state: "ready",
+                      },
+                      providerRefs: {},
+                    });
+
+                    if (
+                      context.currentAutoCompactWindow === CLAUDE_CONTEXT_WINDOW_MAX_TOKENS["1m"]
+                    ) {
+                      context.emittedContextUsageWarnings.add("one-million-window");
+                      yield* emitRuntimeWarning(
+                        context,
+                        "Claude's auto-compact budget is set to the model's 1M limit for this thread. Long conversations can consume usage limits much faster; switch Auto-compact to 200k unless the larger working context is intentional.",
+                      );
+                    }
+
+                    const streamFiber = Effect.runFork(runSdkStream(context));
+                    context.streamFiber = streamFiber;
+                    streamFiber.addObserver((exit) => {
+                      if (context.stopped) {
+                        return;
+                      }
+                      if (context.streamFiber === streamFiber) {
+                        context.streamFiber = undefined;
+                      }
+                      Effect.runFork(handleStreamExit(context, exit));
+                    });
                   });
-                }
-                yield* teardownClaudeProcess(threadId, processOwner);
+
+                  return {
+                    ...session,
+                  };
+                }),
+              ),
+            );
+            if (Exit.isSuccess(installationExit)) {
+              return installationExit.value;
+            }
+
+            const startupFailure = Cause.squash(installationExit.cause);
+            const installedContext =
+              installationContext !== undefined && sessions.get(threadId) === installationContext
+                ? installationContext
+                : undefined;
+            if (installedContext === undefined) {
+              preInstallOwner.startupFailure = startupFailure;
+            }
+            const cleanupExit = yield* Effect.exit(
+              installedContext
+                ? stopSessionInternal(installedContext, { emitExitEvent: false })
+                : cleanupPreInstallOwner(threadId, preInstallOwner),
+            );
+            if (Exit.isFailure(cleanupExit)) {
+              const cleanupFailure = Cause.squash(cleanupExit.cause);
+              if (installedContext === undefined) {
+                preInstallOwner.cleanupFailure = cleanupFailure;
+              }
+              const aggregate = new AggregateError(
+                [startupFailure, cleanupFailure],
+                "Claude session installation and owned process cleanup both failed.",
+              );
+              return yield* new ProviderAdapterProcessError({
+                provider: PROVIDER,
+                threadId,
+                detail: aggregate.message,
+                cause: aggregate,
               });
-            }).pipe(Effect.ignore),
-          ),
+            }
+            if (
+              installedContext === undefined &&
+              preInstallOwners.get(threadId) === preInstallOwner
+            ) {
+              preInstallOwners.delete(threadId);
+            }
+            return yield* Effect.failCause(installationExit.cause);
+          }),
         );
       });
 
@@ -5081,33 +5238,124 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
 
     // Native command discovery cache — avoids spawning a process per query.
     let commandsCache: { result: ProviderListCommandsResult; cwd: string } | null = null;
-    let pendingCommandDiscovery: Promise<ProviderListCommandsResult> | null = null;
+    let commandDiscoveryEpoch = 0;
+    let pendingCommandDiscovery: {
+      readonly epoch: number;
+      readonly promise: Promise<ProviderListCommandsResult>;
+    } | null = null;
+    let activeCommandDiscoveryOwner: ClaudeCommandDiscoveryOwner | null = null;
+    let retainedCommandDiscoveryCleanup: {
+      readonly owner: ClaudeCommandDiscoveryOwner;
+      failure: unknown;
+    } | null = null;
+
+    const cleanupCommandDiscoveryOwner = (owner: ClaudeCommandDiscoveryOwner): Promise<void> => {
+      if (!owner.cleanup) {
+        const cleanup = (async () => {
+          await Effect.runPromise(
+            teardownClaudeProcess(
+              ThreadId.makeUnsafe("claude:command-discovery"),
+              owner.processOwner,
+            ),
+          );
+          const query = owner.query;
+          if (query) {
+            query.close();
+            if (owner.query === query) delete owner.query;
+          }
+        })();
+        owner.cleanup = cleanup;
+        void cleanup.catch(() => {
+          if (owner.cleanup === cleanup) delete owner.cleanup;
+        });
+      }
+      return owner.cleanup;
+    };
+
+    const retryRetainedCommandDiscoveryCleanup = async (): Promise<void> => {
+      const retained = retainedCommandDiscoveryCleanup;
+      if (!retained) return;
+      try {
+        await cleanupCommandDiscoveryOwner(retained.owner);
+      } catch (cause) {
+        const aggregate = new AggregateError(
+          [retained.failure, cause],
+          "Claude command discovery cleanup remains unproven after retry.",
+        );
+        retained.failure = aggregate;
+        throw aggregate;
+      }
+      if (retainedCommandDiscoveryCleanup === retained) {
+        retainedCommandDiscoveryCleanup = null;
+      }
+    };
+
+    const cleanupCommandDiscoveryOnShutdown = async (): Promise<void> => {
+      commandDiscoveryEpoch += 1;
+      const failures: Array<unknown> = [];
+      const activeOwner = activeCommandDiscoveryOwner;
+      if (activeOwner) {
+        try {
+          await cleanupCommandDiscoveryOwner(activeOwner);
+        } catch (cause) {
+          failures.push(cause);
+          retainedCommandDiscoveryCleanup = {
+            owner: activeOwner,
+            failure: cause,
+          };
+        }
+      }
+
+      try {
+        await retryRetainedCommandDiscoveryCleanup();
+      } catch (cause) {
+        failures.push(cause);
+      }
+      if (failures.length === 1) throw failures[0];
+      if (failures.length > 1) {
+        throw new AggregateError(
+          failures,
+          "One or more Claude command-discovery cleanup attempts failed.",
+        );
+      }
+    };
 
     async function discoverCommandsViaTemporaryProcess(
       cwd: string,
       env: NodeJS.ProcessEnv,
+      epoch: number,
     ): Promise<ProviderListCommandsResult> {
+      await retryRetainedCommandDiscoveryCleanup();
+      if (epoch !== commandDiscoveryEpoch) {
+        throw new Error("Claude command discovery was canceled by provider shutdown.");
+      }
+
       // Spawn a lightweight Claude Code process for native command discovery.
       // The SDK's supportedCommands() awaits an internal initialization promise
       // that only resolves when the async generator is iterated (driving the
       // subprocess handshake). We iterate in the background to unblock it.
-      const processOwner: ClaudeProcessOwner = {};
-      const tempQuery = createQuery({
-        prompt: neverResolvingUserMessageStream(),
-        options: {
-          cwd,
-          pathToClaudeCodeExecutable: "claude",
-          settingSources: [...CLAUDE_SETTING_SOURCES],
-          permissionMode: "plan" as PermissionMode,
-          persistSession: false,
-          env,
-          spawnClaudeCodeProcess: bindClaudeProcessOwner(processOwner),
-        },
-      });
+      const owner: ClaudeCommandDiscoveryOwner = { processOwner: {} };
+      activeCommandDiscoveryOwner = owner;
+      let result: ProviderListCommandsResult | undefined;
+      let discoveryFailure: unknown;
 
       try {
+        const tempQuery = createQuery({
+          prompt: neverResolvingUserMessageStream(),
+          options: {
+            cwd,
+            pathToClaudeCodeExecutable: "claude",
+            settingSources: [...CLAUDE_SETTING_SOURCES],
+            permissionMode: "plan" as PermissionMode,
+            persistSession: false,
+            env,
+            spawnClaudeCodeProcess: bindClaudeProcessOwner(owner.processOwner),
+          },
+        });
+        owner.query = tempQuery;
+
         // Drive the iterator so the subprocess completes its init handshake.
-        // This runs in the background; close() in the finally block stops it.
+        // This runs in the background; owner cleanup stops it after process-tree proof.
         void (async () => {
           for await (const message of tempQuery) {
             void message;
@@ -5116,13 +5364,33 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
         })().catch(() => undefined);
 
         const commands = await tempQuery.supportedCommands();
-        return mapSupportedCommands(commands);
+        if (epoch !== commandDiscoveryEpoch) {
+          throw new Error("Claude command discovery was canceled by provider shutdown.");
+        }
+        result = mapSupportedCommands(commands);
+      } catch (cause) {
+        discoveryFailure = cause;
+      }
+
+      let cleanupFailure: unknown;
+      try {
+        await cleanupCommandDiscoveryOwner(owner);
+      } catch (cause) {
+        cleanupFailure = cause;
+        retainedCommandDiscoveryCleanup = { owner, failure: cause };
       } finally {
-        tempQuery.close();
-        await Effect.runPromise(
-          teardownClaudeProcess(ThreadId.makeUnsafe("claude:command-discovery"), processOwner),
+        if (activeCommandDiscoveryOwner === owner) activeCommandDiscoveryOwner = null;
+      }
+
+      if (discoveryFailure !== undefined && cleanupFailure !== undefined) {
+        throw new AggregateError(
+          [discoveryFailure, cleanupFailure],
+          "Claude command discovery and owned process cleanup both failed.",
         );
       }
+      if (cleanupFailure !== undefined) throw cleanupFailure;
+      if (discoveryFailure !== undefined) throw discoveryFailure;
+      return result!;
     }
 
     const listCommands: NonNullable<ClaudeAdapterShape["listCommands"]> = (
@@ -5151,12 +5419,18 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
 
         // 3. Spawn a temporary process for discovery (deduplicating concurrent requests).
         const claudeSdkEnv = yield* resolveClaudeSdkEnv;
-        const discoveryPromise =
-          pendingCommandDiscovery ?? discoverCommandsViaTemporaryProcess(input.cwd, claudeSdkEnv);
-        pendingCommandDiscovery = discoveryPromise;
+        const epoch = commandDiscoveryEpoch;
+        const discovery =
+          pendingCommandDiscovery?.epoch === epoch
+            ? pendingCommandDiscovery
+            : {
+                epoch,
+                promise: discoverCommandsViaTemporaryProcess(input.cwd, claudeSdkEnv, epoch),
+              };
+        pendingCommandDiscovery = discovery;
 
         const result = yield* Effect.tryPromise({
-          try: () => discoveryPromise,
+          try: () => discovery.promise,
           catch: (cause) =>
             new ProviderAdapterProcessError({
               provider: PROVIDER,
@@ -5167,12 +5441,16 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
         }).pipe(
           Effect.tap(() =>
             Effect.sync(() => {
-              pendingCommandDiscovery = null;
+              if (pendingCommandDiscovery === discovery) {
+                pendingCommandDiscovery = null;
+              }
             }),
           ),
           Effect.tapError(() =>
             Effect.sync(() => {
-              pendingCommandDiscovery = null;
+              if (pendingCommandDiscovery === discovery) {
+                pendingCommandDiscovery = null;
+              }
             }),
           ),
         );
@@ -5190,25 +5468,73 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
         cached: false,
       } satisfies ProviderListSkillsResult);
 
-    const stopAll: ClaudeAdapterShape["stopAll"] = () =>
-      Effect.forEach(
-        sessions,
-        ([, context]) =>
-          stopSessionInternal(context, {
-            emitExitEvent: true,
+    const cleanupAllClaudeOwnership = (
+      emitExitEvent: boolean,
+    ): Effect.Effect<void, ProviderAdapterProcessError> =>
+      Effect.gen(function* () {
+        const failures: Array<unknown> = [];
+        const discoveryExit = yield* Effect.exit(
+          Effect.tryPromise({
+            try: cleanupCommandDiscoveryOnShutdown,
+            catch: (cause) =>
+              new ProviderAdapterProcessError({
+                provider: PROVIDER,
+                threadId: ThreadId.makeUnsafe("claude:command-discovery"),
+                detail: toMessage(cause, "Failed to clean up Claude command discovery."),
+                cause,
+              }),
           }),
-        { discard: true },
-      );
+        );
+        if (Exit.isFailure(discoveryExit)) {
+          failures.push(Cause.squash(discoveryExit.cause));
+        }
+
+        const threadIds = new Set<ThreadId>([...sessions.keys(), ...preInstallOwners.keys()]);
+        for (const threadId of threadIds) {
+          yield* withSessionLifecycleLock(
+            threadId,
+            Effect.gen(function* () {
+              const context = sessions.get(threadId);
+              if (context) {
+                const sessionExit = yield* Effect.exit(
+                  stopSessionInternal(context, { emitExitEvent }),
+                );
+                if (Exit.isFailure(sessionExit)) {
+                  failures.push(Cause.squash(sessionExit.cause));
+                }
+              }
+
+              if (preInstallOwners.has(threadId)) {
+                const preInstallExit = yield* Effect.exit(retryPreInstallOwnerCleanup(threadId));
+                if (Exit.isFailure(preInstallExit)) {
+                  failures.push(Cause.squash(preInstallExit.cause));
+                }
+              }
+            }),
+          );
+        }
+
+        if (failures.length > 0) {
+          const aggregate = new AggregateError(
+            failures,
+            "One or more Claude process cleanups failed.",
+          );
+          return yield* new ProviderAdapterProcessError({
+            provider: PROVIDER,
+            threadId: ThreadId.makeUnsafe("claude:shutdown"),
+            detail: aggregate.message,
+            cause: aggregate,
+          });
+        }
+      });
+
+    const stopAll: ClaudeAdapterShape["stopAll"] = () => cleanupAllClaudeOwnership(true);
 
     yield* Effect.addFinalizer(() =>
-      Effect.forEach(
-        sessions,
-        ([, context]) =>
-          stopSessionInternal(context, {
-            emitExitEvent: false,
-          }),
-        { discard: true },
-      ).pipe(Effect.ignore, Effect.andThen(Queue.shutdown(runtimeEventQueue))),
+      cleanupAllClaudeOwnership(false).pipe(
+        Effect.ensuring(Queue.shutdown(runtimeEventQueue)),
+        Effect.orDie,
+      ),
     );
 
     const composerCapabilities: ProviderComposerCapabilities = {

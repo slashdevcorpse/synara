@@ -27,13 +27,15 @@ import {
   type ProviderSession,
 } from "@synara/contracts";
 import { resolveCommandCodeCliExecutable } from "@synara/shared/commandCodeCliExecutable";
-import { Effect, Layer, Queue, Stream } from "effect";
+import { Effect, Layer, Queue, Result, Stream } from "effect";
 
 import { ServerConfig } from "../../config.ts";
 import { buildProviderChildEnvironment } from "../../providerChildEnvironment.ts";
 import {
   markWindowsProviderProcessSpawn,
   prepareWindowsProviderProcess,
+  recordWindowsProviderProcessExit,
+  windowsProviderProcessExitProofError,
 } from "../windowsProviderProcess.ts";
 import { appendFileAttachmentsPromptBlock } from "../attachmentProjection.ts";
 import {
@@ -101,6 +103,14 @@ interface ActiveCommandCodeTurn {
   output: string;
   interrupted: boolean;
   settled: boolean;
+  cleanupPending: boolean;
+  terminal?: {
+    readonly exitCode: number | null;
+    readonly signal: NodeJS.Signals | null;
+  };
+  readonly finalization: Promise<void>;
+  readonly resolveFinalization: () => void;
+  cleanupUnproven?: Error;
   failure?: Error;
 }
 
@@ -119,6 +129,18 @@ export interface CommandCodeModelDescriptor {
   readonly name: string;
   readonly description?: string;
   readonly upstreamProviderName?: string;
+}
+
+function errorFromUnknown(cause: unknown, fallback: string): Error {
+  return cause instanceof Error ? cause : new Error(cause === undefined ? fallback : String(cause));
+}
+
+function cleanupAggregateError(subjectError: Error, cleanupCause: unknown): AggregateError {
+  const cleanupError = errorFromUnknown(cleanupCause, "Process-tree cleanup failed.");
+  return new AggregateError(
+    [subjectError, cleanupError],
+    `${subjectError.message} Process-tree cleanup could not be proven: ${cleanupError.message}`,
+  );
 }
 
 function isPathLikeExecutable(command: string): boolean {
@@ -256,9 +278,42 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
     const prepareProcess = options?.prepareProcess ?? prepareWindowsProviderProcess;
     const teardown = options?.teardownProcessTree;
     const resolveExecutable = options?.resolveExecutable ?? resolveAndValidateExecutable;
+    let failedModelDiscoveryCleanup:
+      | { readonly child: ChildProcess; readonly error: Error }
+      | undefined;
+    let modelDiscoveryLocked = false;
+    const modelDiscoveryWaiters: Array<() => void> = [];
 
     const teardownProcess = (child: ChildProcess): Promise<unknown> =>
       teardown ? teardown(child) : teardownChildProcessTree(child);
+
+    const withModelDiscoveryLock = async <T>(operation: () => Promise<T>): Promise<T> => {
+      if (modelDiscoveryLocked) {
+        await new Promise<void>((resolve) => modelDiscoveryWaiters.push(resolve));
+      } else {
+        modelDiscoveryLocked = true;
+      }
+      try {
+        return await operation();
+      } finally {
+        const next = modelDiscoveryWaiters.shift();
+        if (next) next();
+        else modelDiscoveryLocked = false;
+      }
+    };
+
+    const retryFailedModelDiscoveryCleanup = async (): Promise<void> => {
+      const previousCleanup = failedModelDiscoveryCleanup;
+      if (!previousCleanup) return;
+      try {
+        await teardownProcess(previousCleanup.child);
+      } catch (cause) {
+        throw cleanupAggregateError(previousCleanup.error, cause);
+      }
+      if (failedModelDiscoveryCleanup === previousCleanup) {
+        failedModelDiscoveryCleanup = undefined;
+      }
+    };
 
     const offerEvent = (event: ProviderRuntimeEvent): void => {
       Effect.runFork(Queue.offer(runtimeEventQueue, event));
@@ -283,15 +338,32 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
         : {}),
     });
 
-    const snapshotSession = (context: CommandCodeSessionContext): ProviderSession => ({
-      ...context.session,
-      status: context.stopped ? "closed" : context.active ? "running" : "ready",
-      updatedAt: new Date().toISOString(),
-      ...(context.active ? { activeTurnId: context.active.turnId } : {}),
-      ...(context.providerSessionId
-        ? { resumeCursor: { sessionId: context.providerSessionId } }
-        : {}),
-    });
+    const snapshotSession = (context: CommandCodeSessionContext): ProviderSession => {
+      const cleanupFailure = context.active?.cleanupUnproven;
+      const {
+        activeTurnId: _activeTurnId,
+        lastError: _lastError,
+        ...sessionWithoutTransientState
+      } = context.session;
+      return {
+        ...sessionWithoutTransientState,
+        status: cleanupFailure
+          ? "error"
+          : context.stopped
+            ? "closed"
+            : context.active
+              ? "running"
+              : "ready",
+        updatedAt: new Date().toISOString(),
+        ...(context.active && !context.active.settled
+          ? { activeTurnId: context.active.turnId }
+          : {}),
+        ...(cleanupFailure ? { lastError: cleanupFailure.message } : {}),
+        ...(context.providerSessionId
+          ? { resumeCursor: { sessionId: context.providerSessionId } }
+          : {}),
+      };
+    };
 
     const requireSession = (
       threadId: ThreadId,
@@ -325,18 +397,6 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
       const lines = active.stderrLineBuffer.split(/\r?\n/u);
       active.stderrLineBuffer = lines.pop() ?? "";
       for (const line of lines) updateProviderSessionId(context, line);
-    };
-
-    const terminateTurnWithError = (
-      context: CommandCodeSessionContext,
-      active: ActiveCommandCodeTurn,
-      error: Error,
-    ): void => {
-      if (active.settled || active.failure) return;
-      active.failure = error;
-      void teardownProcess(active.child)
-        .catch(() => undefined)
-        .then(() => finishTurn(context, active, null, null, error));
     };
 
     const emitAssistantChunk = (
@@ -373,8 +433,8 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
       if (active.settled) return;
       active.settled = true;
       updateProviderSessionId(context, active.stderrLineBuffer);
-      const interrupted = active.interrupted || exitCode === 130;
       const failure = active.failure ?? (processError instanceof Error ? processError : undefined);
+      const interrupted = failure === undefined && (active.interrupted || exitCode === 130);
       const succeeded = exitCode === 0 && failure === undefined;
       const state = interrupted ? "interrupted" : succeeded ? "completed" : "failed";
       const message =
@@ -431,8 +491,93 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
       if (turn && active.output) {
         turn.items.push({ type: "assistant_message", text: active.output });
       }
-      if (context.active === active) delete context.active;
+      if (context.active === active && !active.cleanupUnproven) delete context.active;
       context.session = snapshotSession(context);
+      active.resolveFinalization();
+    };
+
+    const teardownActiveTurn = async (
+      context: CommandCodeSessionContext,
+      active: ActiveCommandCodeTurn,
+      threadId: ThreadId,
+    ): Promise<void> => {
+      active.cleanupPending = true;
+      try {
+        await teardownProcess(active.child);
+      } catch (cause) {
+        active.cleanupPending = false;
+        const cleanupError = errorFromUnknown(
+          cause,
+          "Command Code process-tree cleanup could not be proven.",
+        );
+        const requestError = new ProviderAdapterProcessError({
+          provider: PROVIDER,
+          threadId,
+          detail: cleanupError.message,
+          cause,
+        });
+        active.cleanupUnproven = cleanupError;
+        if (!active.settled) {
+          active.failure = active.failure
+            ? cleanupAggregateError(active.failure, cleanupError)
+            : requestError;
+          finishTurn(
+            context,
+            active,
+            active.terminal?.exitCode ?? null,
+            active.terminal?.signal ?? null,
+            active.failure,
+          );
+        } else {
+          context.session = snapshotSession(context);
+        }
+        throw requestError;
+      }
+
+      active.cleanupPending = false;
+      delete active.cleanupUnproven;
+      if (active.settled) {
+        if (context.active === active) delete context.active;
+        context.session = snapshotSession(context);
+        return;
+      }
+      if (active.terminal) {
+        finishTurn(context, active, active.terminal.exitCode, active.terminal.signal);
+      }
+      await active.finalization;
+    };
+
+    const teardownActiveTurnEffect = (
+      context: CommandCodeSessionContext,
+      active: ActiveCommandCodeTurn,
+      threadId: ThreadId,
+    ) =>
+      Effect.tryPromise({
+        try: () => teardownActiveTurn(context, active, threadId),
+        catch: (cause) =>
+          cause instanceof ProviderAdapterProcessError
+            ? cause
+            : new ProviderAdapterProcessError({
+                provider: PROVIDER,
+                threadId,
+                detail: errorFromUnknown(cause, "Failed to prove Command Code process-tree exit.")
+                  .message,
+                cause,
+              }),
+      });
+
+    const terminateTurnWithError = (
+      context: CommandCodeSessionContext,
+      active: ActiveCommandCodeTurn,
+      error: Error,
+    ): void => {
+      if (active.settled || active.cleanupPending || active.failure) return;
+      active.failure = error;
+      if (active.child.pid === undefined) {
+        finishTurn(context, active, null, null, error);
+        return;
+      }
+      void teardownActiveTurn(context, active, context.session.threadId).catch(() => undefined);
     };
 
     const startSession: CommandCodeAdapterShape["startSession"] = (input) =>
@@ -463,12 +608,12 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
         const existing = sessions.get(input.threadId);
         if (existing) {
           existing.stopped = true;
-          sessions.delete(input.threadId);
           const active = existing.active;
           if (active) {
             active.interrupted = true;
-            yield* Effect.promise(() => teardownProcess(active.child));
+            yield* teardownActiveTurnEffect(existing, active, input.threadId);
           }
+          sessions.delete(input.threadId);
         }
         const session: ProviderSession = {
           provider: PROVIDER,
@@ -555,7 +700,9 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
           return yield* new ProviderAdapterValidationError({
             provider: PROVIDER,
             operation: "sendTurn",
-            issue: "A Command Code turn is already active for this thread.",
+            issue: context.active.cleanupUnproven
+              ? `The previous Command Code process tree is still unproven: ${context.active.cleanupUnproven.message}`
+              : "A Command Code turn is already active for this thread.",
           });
         }
         const prompt = yield* buildPrompt(input);
@@ -581,7 +728,11 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
         });
         const child = yield* Effect.try({
           try: () => {
-            const prepared = prepareProcess(executable, args, { cwd, env });
+            const prepared = prepareProcess(executable, args, {
+              cwd,
+              env,
+              completionReceipt: "create",
+            });
             return markWindowsProviderProcessSpawn(
               spawnProcess(prepared.command, prepared.args, {
                 cwd,
@@ -604,6 +755,10 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
             }),
         });
         const turnId = TurnId.makeUnsafe(randomUUID());
+        let resolveFinalization!: () => void;
+        const finalization = new Promise<void>((resolve) => {
+          resolveFinalization = resolve;
+        });
         const active: ActiveCommandCodeTurn = {
           turnId,
           itemId: RuntimeItemId.makeUnsafe(`command-code-assistant-${randomUUID()}`),
@@ -618,6 +773,9 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
           output: "",
           interrupted: false,
           settled: false,
+          cleanupPending: false,
+          finalization,
+          resolveFinalization,
         };
         context.active = active;
         context.turns.push({ id: turnId, items: [] });
@@ -670,7 +828,15 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
         child.once("close", (code, signal) => {
           emitAssistantChunk(context, active, active.stdoutDecoder.end());
           consumeStderr(context, active, active.stderrDecoder.end());
-          finishTurn(context, active, code, signal);
+          active.terminal = { exitCode: code, signal };
+          recordWindowsProviderProcessExit(child);
+          if (active.cleanupPending) return;
+          const processError =
+            active.interrupted || active.failure
+              ? undefined
+              : windowsProviderProcessExitProofError(child);
+          if (processError) active.cleanupUnproven = processError;
+          finishTurn(context, active, code, signal, processError);
         });
         child.stdin?.once("error", (cause) =>
           terminateTurnWithError(
@@ -696,19 +862,19 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
         const active = context.active;
         if (!active || (turnId && active.turnId !== turnId)) return;
         active.interrupted = true;
-        yield* Effect.promise(() => teardownProcess(active.child));
+        yield* teardownActiveTurnEffect(context, active, threadId);
       });
 
     const stopSession: CommandCodeAdapterShape["stopSession"] = (threadId) =>
       Effect.gen(function* () {
         const context = yield* requireSession(threadId);
         context.stopped = true;
-        sessions.delete(threadId);
         const active = context.active;
         if (active) {
           active.interrupted = true;
-          yield* Effect.promise(() => teardownProcess(active.child));
+          yield* teardownActiveTurnEffect(context, active, threadId);
         }
+        sessions.delete(threadId);
         offerEvent({
           ...eventBase(context),
           type: "thread.state.changed",
@@ -745,88 +911,117 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
     const listModels: NonNullable<CommandCodeAdapterShape["listModels"]> = (input) =>
       Effect.tryPromise({
         try: () =>
-          new Promise<ProviderListModelsResult>((resolve, reject) => {
-            const cwd = input.cwd ?? process.cwd();
-            const env = buildProviderChildEnvironment({ provider: PROVIDER });
-            const configured = input.binaryPath?.trim() || DEFAULT_BINARY;
-            const executable = resolveExecutable(configured, { cwd, env });
-            const prepared = prepareProcess(executable, ["--list-models"], { cwd, env });
-            const child = markWindowsProviderProcessSpawn(
-              spawnProcess(prepared.command, prepared.args, {
+          withModelDiscoveryLock(async () => {
+            if (failedModelDiscoveryCleanup) await retryFailedModelDiscoveryCleanup();
+            return await new Promise<ProviderListModelsResult>((resolve, reject) => {
+              const cwd = input.cwd ?? process.cwd();
+              const env = buildProviderChildEnvironment({ provider: PROVIDER });
+              const configured = input.binaryPath?.trim() || DEFAULT_BINARY;
+              const executable = resolveExecutable(configured, { cwd, env });
+              const prepared = prepareProcess(executable, ["--list-models"], {
                 cwd,
                 env,
-                stdio: ["ignore", "pipe", "pipe"],
-                shell: prepared.shell,
-                windowsHide: prepared.windowsHide,
-                windowsVerbatimArguments: prepared.windowsVerbatimArguments,
-              }),
-              prepared,
-              options?.spawnProcess === undefined,
-            );
-            let stdout = "";
-            let stderr = "";
-            let stdoutBytes = 0;
-            let stderrBytes = 0;
-            let settled = false;
-            const stdoutDecoder = new StringDecoder("utf8");
-            const stderrDecoder = new StringDecoder("utf8");
-            const finish = (error?: Error, result?: ProviderListModelsResult): void => {
-              if (settled) return;
-              settled = true;
-              clearTimeout(timeout);
-              if (error) reject(error);
-              else if (result) resolve(result);
-            };
-            const terminate = (error: Error): void => {
-              if (settled) return;
-              void teardownProcess(child)
-                .catch(() => undefined)
-                .then(() => finish(error));
-            };
-            const timeout = setTimeout(
-              () => terminate(new Error("Command Code model discovery timed out.")),
-              MODEL_LIST_TIMEOUT_MS,
-            );
-            child.stdout?.on("data", (chunk: Buffer | string) => {
-              stdoutBytes += chunkByteLength(chunk);
-              if (stdoutBytes > MAX_MODEL_LIST_BYTES) {
-                terminate(
-                  new Error(
-                    `Command Code model discovery stdout exceeded ${MAX_MODEL_LIST_BYTES} bytes.`,
-                  ),
+                completionReceipt: "create",
+              });
+              const child = markWindowsProviderProcessSpawn(
+                spawnProcess(prepared.command, prepared.args, {
+                  cwd,
+                  env,
+                  stdio: ["ignore", "pipe", "pipe"],
+                  shell: prepared.shell,
+                  windowsHide: prepared.windowsHide,
+                  windowsVerbatimArguments: prepared.windowsVerbatimArguments,
+                }),
+                prepared,
+                options?.spawnProcess === undefined,
+              );
+              let stdout = "";
+              let stderr = "";
+              let stdoutBytes = 0;
+              let stderrBytes = 0;
+              let settled = false;
+              let terminationStarted = false;
+              const stdoutDecoder = new StringDecoder("utf8");
+              const stderrDecoder = new StringDecoder("utf8");
+              const finish = (error?: Error, result?: ProviderListModelsResult): void => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timeout);
+                if (error) reject(error);
+                else if (result) resolve(result);
+              };
+              const terminate = (error: Error): void => {
+                if (settled || terminationStarted) return;
+                terminationStarted = true;
+                void teardownProcess(child).then(
+                  () => finish(error),
+                  (cause) => {
+                    const aggregate = cleanupAggregateError(error, cause);
+                    failedModelDiscoveryCleanup = {
+                      child,
+                      error: errorFromUnknown(
+                        cause,
+                        "Command Code model-discovery cleanup could not be proven.",
+                      ),
+                    };
+                    finish(aggregate);
+                  },
                 );
-                return;
-              }
-              stdout += decodeChunk(stdoutDecoder, chunk);
-            });
-            child.stderr?.on("data", (chunk: Buffer | string) => {
-              stderrBytes += chunkByteLength(chunk);
-              if (stderrBytes > MAX_MODEL_LIST_BYTES) {
-                terminate(
-                  new Error(
-                    `Command Code model discovery stderr exceeded ${MAX_MODEL_LIST_BYTES} bytes.`,
-                  ),
-                );
-                return;
-              }
-              stderr += decodeChunk(stderrDecoder, chunk);
-            });
-            child.once("error", (cause) =>
-              terminate(cause instanceof Error ? cause : new Error(String(cause))),
-            );
-            child.once("close", (code) => {
-              stdout += stdoutDecoder.end();
-              stderr += stderrDecoder.end();
-              if (code !== 0) {
-                finish(new Error(processErrorMessage(stderr, code)));
-                return;
-              }
-              const models = parseCommandCodeModelList(stdout);
-              if (models.length === 0) {
-                finish(new Error("Command Code model discovery returned no models."));
-                return;
-              }
-              finish(undefined, { models, source: "command-code.cli", cached: false });
+              };
+              const timeout = setTimeout(
+                () => terminate(new Error("Command Code model discovery timed out.")),
+                MODEL_LIST_TIMEOUT_MS,
+              );
+              child.stdout?.on("data", (chunk: Buffer | string) => {
+                stdoutBytes += chunkByteLength(chunk);
+                if (stdoutBytes > MAX_MODEL_LIST_BYTES) {
+                  terminate(
+                    new Error(
+                      `Command Code model discovery stdout exceeded ${MAX_MODEL_LIST_BYTES} bytes.`,
+                    ),
+                  );
+                  return;
+                }
+                stdout += decodeChunk(stdoutDecoder, chunk);
+              });
+              child.stderr?.on("data", (chunk: Buffer | string) => {
+                stderrBytes += chunkByteLength(chunk);
+                if (stderrBytes > MAX_MODEL_LIST_BYTES) {
+                  terminate(
+                    new Error(
+                      `Command Code model discovery stderr exceeded ${MAX_MODEL_LIST_BYTES} bytes.`,
+                    ),
+                  );
+                  return;
+                }
+                stderr += decodeChunk(stderrDecoder, chunk);
+              });
+              child.once("error", (cause) => {
+                const error = cause instanceof Error ? cause : new Error(String(cause));
+                if (child.pid === undefined) finish(error);
+                else terminate(error);
+              });
+              child.once("close", (code) => {
+                stdout += stdoutDecoder.end();
+                stderr += stderrDecoder.end();
+                recordWindowsProviderProcessExit(child);
+                const processExitProofError = windowsProviderProcessExitProofError(child);
+                if (processExitProofError) {
+                  failedModelDiscoveryCleanup = { child, error: processExitProofError };
+                  finish(processExitProofError);
+                  return;
+                }
+                if (code !== 0) {
+                  finish(new Error(processErrorMessage(stderr, code)));
+                  return;
+                }
+                const models = parseCommandCodeModelList(stdout);
+                if (models.length === 0) {
+                  finish(new Error("Command Code model discovery returned no models."));
+                  return;
+                }
+                finish(undefined, { models, source: "command-code.cli", cached: false });
+              });
             });
           }),
         catch: (cause) =>
@@ -838,16 +1033,44 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
           }),
       });
 
+    const cleanupModelDiscovery = Effect.tryPromise({
+      try: () => withModelDiscoveryLock(retryFailedModelDiscoveryCleanup),
+      catch: (cause) =>
+        new ProviderAdapterRequestError({
+          provider: PROVIDER,
+          method: "model/cleanup",
+          detail: errorFromUnknown(
+            cause,
+            "Failed to prove Command Code model-discovery process-tree exit.",
+          ).message,
+          cause,
+        }),
+    });
+
     const stopAll: CommandCodeAdapterShape["stopAll"] = () =>
-      Effect.forEach(
-        Array.from(sessions.keys()),
-        (threadId) => stopSession(threadId).pipe(Effect.catch(() => Effect.void)),
-        { discard: true },
-      );
+      Effect.gen(function* () {
+        const sessionResults = yield* Effect.forEach(
+          Array.from(sessions.keys()),
+          (threadId) => stopSession(threadId).pipe(Effect.result),
+          { concurrency: "unbounded" },
+        );
+        const modelResult = yield* cleanupModelDiscovery.pipe(Effect.result);
+        const failures = [...sessionResults, modelResult]
+          .filter(Result.isFailure)
+          .map((result) => result.failure);
+        if (failures.length > 0) {
+          return yield* new ProviderAdapterRequestError({
+            provider: PROVIDER,
+            method: "session/stop-all",
+            detail: `Failed to prove cleanup for ${failures.length} Command Code owner${failures.length === 1 ? "" : "s"}.`,
+            cause: new AggregateError(failures, "Command Code stop-all cleanup failed."),
+          });
+        }
+      });
 
     yield* Effect.addFinalizer(() =>
       stopAll().pipe(
-        Effect.ignore,
+        Effect.orDie,
         Effect.ensuring(options?.nativeEventLogger?.close() ?? Effect.void),
         Effect.ensuring(Queue.shutdown(runtimeEventQueue)),
       ),

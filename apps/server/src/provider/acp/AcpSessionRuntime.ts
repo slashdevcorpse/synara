@@ -9,6 +9,7 @@ import {
   Cause,
   Deferred,
   Effect,
+  Exit,
   Fiber,
   Layer,
   Option,
@@ -32,6 +33,8 @@ import {
 import {
   markWindowsProviderProcessSpawn,
   prepareWindowsProviderProcess,
+  recordWindowsProviderProcessExit,
+  windowsProviderProcessExitProofError,
 } from "../windowsProviderProcess.ts";
 import {
   collectSessionConfigOptionValues,
@@ -137,6 +140,10 @@ export interface AcpSessionRuntimeOptions {
   };
   /** Test seam for the single shared ACP subprocess teardown owner. */
   readonly teardownProcessTree?: typeof teardownProviderProcessTree;
+  /** Captures the exact retryable child owner before any later runtime setup can fail. */
+  readonly captureProcessTeardown?: (
+    teardown: Effect.Effect<SupervisedProcessTeardownResult>,
+  ) => void;
 }
 
 export interface AcpSessionRequestLogEvent {
@@ -212,6 +219,11 @@ export interface AcpSessionRuntimeShape {
   readonly start: () => Effect.Effect<AcpSessionRuntimeStartResult, EffectAcpErrors.AcpError>;
   /** Completes when the owned ACP process exits, regardless of its exit status. */
   readonly awaitExit: Effect.Effect<void>;
+  /**
+   * Stops the exact owned ACP process tree. Concurrent callers share one attempt,
+   * successful proof is latched, and a failed attempt may be retried.
+   */
+  readonly teardown: Effect.Effect<SupervisedProcessTeardownResult>;
   readonly getEvents: () => Stream.Stream<AcpParsedSessionEvent, never>;
   // Monotonic count of parsed session/update events enqueued for the
   // getEvents() consumer. Adapters snapshot it and wait until their own
@@ -278,7 +290,14 @@ interface AcpOwnedChildProcess {
 }
 
 export const awaitAcpChildExit = (child: AcpOwnedChildProcess): Effect.Effect<void> =>
-  child.exitCode.pipe(Effect.exit, Effect.asVoid);
+  child.exitCode.pipe(
+    Effect.exit,
+    Effect.flatMap(() => {
+      recordWindowsProviderProcessExit(child);
+      const proofError = windowsProviderProcessExitProofError(child);
+      return proofError ? Effect.die(proofError) : Effect.void;
+    }),
+  );
 
 /**
  * Bridges Effect's child-process exit signal into Synara's process-tree proof. This is deliberately
@@ -295,6 +314,48 @@ export const teardownAcpChildProcess = (
       catch: (error) => (error instanceof Error ? error : new Error(String(error))),
     }).pipe(Effect.orDie);
   });
+
+export const makeRetryableAcpChildTeardown = (
+  child: AcpOwnedChildProcess,
+  teardownProcessTree: typeof teardownProviderProcessTree = teardownProviderProcessTree,
+): Effect.Effect<SupervisedProcessTeardownResult> => {
+  let completed: SupervisedProcessTeardownResult | undefined;
+  let activeAttempt: Deferred.Deferred<SupervisedProcessTeardownResult> | undefined;
+
+  return Effect.suspend(() => {
+    if (completed !== undefined) {
+      return Effect.succeed(completed);
+    }
+    if (activeAttempt !== undefined) {
+      return Deferred.await(activeAttempt);
+    }
+
+    const attempt = Deferred.makeUnsafe<SupervisedProcessTeardownResult>();
+    activeAttempt = attempt;
+    return teardownAcpChildProcess(child, teardownProcessTree).pipe(
+      Effect.tap((result) =>
+        Effect.sync(() => {
+          completed = result;
+        }),
+      ),
+      Effect.exit,
+      Effect.flatMap((exit) =>
+        Effect.sync(() => {
+          if (Exit.isSuccess(exit)) {
+            Deferred.doneUnsafe(attempt, Effect.succeed(exit.value));
+            return;
+          }
+          Deferred.doneUnsafe(attempt, Effect.failCause(exit.cause));
+          if (activeAttempt === attempt) {
+            activeAttempt = undefined;
+          }
+        }),
+      ),
+      Effect.forkDetach,
+      Effect.andThen(Deferred.await(attempt)),
+    );
+  });
+};
 
 function officialSdkError(error: unknown): EffectAcpErrors.AcpError {
   return error instanceof OfficialAcp.RequestError
@@ -768,29 +829,42 @@ const makeAcpSessionRuntime = (
     const prepared = prepareWindowsProviderProcess(options.spawn.command, options.spawn.args, {
       cwd: options.spawn.cwd,
       env,
+      completionReceipt: "create",
     });
-    const spawnedChild = yield* spawner
-      .spawn(
-        ChildProcess.make(prepared.command, prepared.args, {
-          ...(options.spawn.cwd ? { cwd: options.spawn.cwd } : {}),
-          env,
-          shell: prepared.shell,
-          ...(prepared.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
-        }),
-      )
-      .pipe(
-        Effect.provideService(Scope.Scope, runtimeScope),
-        Effect.mapError(
-          (cause) =>
-            new EffectAcpErrors.AcpSpawnError({
-              command: options.spawn.command,
-              cause,
+    const { child, teardown } = yield* Effect.uninterruptible(
+      Effect.gen(function* () {
+        const spawnedChild = yield* spawner
+          .spawn(
+            ChildProcess.make(prepared.command, prepared.args, {
+              ...(options.spawn.cwd ? { cwd: options.spawn.cwd } : {}),
+              env,
+              shell: prepared.shell,
+              ...(prepared.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
             }),
-        ),
-      );
-    const child = markWindowsProviderProcessSpawn(spawnedChild, prepared, true);
+          )
+          .pipe(
+            Effect.provideService(Scope.Scope, runtimeScope),
+            Effect.mapError(
+              (cause) =>
+                new EffectAcpErrors.AcpSpawnError({
+                  command: options.spawn.command,
+                  cause,
+                }),
+            ),
+          );
+        const child = markWindowsProviderProcessSpawn(spawnedChild, prepared, true);
+        const teardown = makeRetryableAcpChildTeardown(child, options.teardownProcessTree);
 
-    yield* Effect.addFinalizer(() => teardownAcpChildProcess(child, options.teardownProcessTree));
+        yield* Effect.addFinalizer(() => teardown);
+        options.captureProcessTeardown?.(teardown);
+        yield* child.exitCode.pipe(
+          Effect.tap(() => Effect.sync(() => recordWindowsProviderProcessExit(child))),
+          Effect.ignore,
+          Effect.forkIn(runtimeScope),
+        );
+        return { child, teardown };
+      }),
+    );
 
     const acp = yield* makeOfficialSdkClient(child, runtimeScope, options.protocolLogging);
 
@@ -1201,6 +1275,7 @@ const makeAcpSessionRuntime = (
       handleExtNotification: acp.handleExtNotification,
       start: () => start,
       awaitExit: awaitAcpChildExit(child),
+      teardown,
       getEvents: () => {
         // Attaching a consumer opens the session/update gate: from here on the
         // queue is drained, so accepting notifications can no longer grow it

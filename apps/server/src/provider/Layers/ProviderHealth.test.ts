@@ -1,4 +1,6 @@
 import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import type { ChildProcess as NodeChildProcess } from "node:child_process";
+import { EventEmitter } from "node:events";
 import * as NodeOs from "node:os";
 import * as NodePath from "node:path";
 
@@ -7,7 +9,7 @@ import type { ServerProviderStatus } from "@synara/contracts";
 import { DEFAULT_SERVER_SETTINGS, ServerProviderUpdateError } from "@synara/contracts";
 import { buildWindowsBatchCommandArgs, resolveWindowsComSpec } from "@synara/shared/windowsProcess";
 import { describe, it, assert } from "@effect/vitest";
-import { Effect, Fiber, FileSystem, Layer, Path, Sink, Stream } from "effect";
+import { Cause, Effect, Exit, Fiber, FileSystem, Layer, Path, Scope, Sink, Stream } from "effect";
 import { TestClock } from "effect/testing";
 import * as PlatformError from "effect/PlatformError";
 import { ChildProcessSpawner } from "effect/unstable/process";
@@ -30,6 +32,7 @@ import {
   checkGrokProviderStatus,
   checkOpenCodeProviderStatus,
   checkPiProviderStatus,
+  closeProviderHealthRefreshScopeAndSubscriptionProbe,
   hasCustomModelProvider,
   makeDisabledProviderStatus,
   makeCheckClaudeProviderStatus,
@@ -39,6 +42,7 @@ import {
   makeCheckGrokProviderStatus,
   makeCheckKiloProviderStatus,
   makeCheckOpenCodeProviderStatus,
+  makeClaudeSubscriptionProbe,
   makeProviderHealthLive,
   parseAuthStatusFromOutput,
   parseClaudeAuthStatusFromOutput,
@@ -51,7 +55,10 @@ import {
   stabilizeProviderStatusesAgainstTransientTimeouts,
 } from "./ProviderHealth";
 import { resolvePackageManagedProviderMaintenance } from "../providerMaintenance";
+import { protectContainedClaudeSdkProcessTermination } from "../containedClaudeSdkProcess.ts";
 import {
+  markWindowsProviderProcessSpawn,
+  recordWindowsProviderProcessExit,
   WINDOWS_JOB_LAUNCHER_ENV,
   WINDOWS_JOB_LAUNCHER_EXECUTABLE,
   WINDOWS_JOB_LAUNCHER_PROTOCOL_VERSION,
@@ -1595,6 +1602,293 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
   // ── checkClaudeProviderStatus tests ──────────────────────────
 
   describe("checkClaudeProviderStatus", () => {
+    it.effect(
+      "retains a failed subscription-probe owner and serializes replacement until recovery",
+      () => {
+        let spawnCalls = 0;
+        let teardownCalls = 0;
+        const closeCalls: Array<number> = [];
+        let proveRetry: (() => void) | undefined;
+        const retryProof = new Promise<void>((resolve) => {
+          proveRetry = resolve;
+        });
+        const subscriptionProbe = makeClaudeSubscriptionProbe({
+          timeoutMs: 1_000,
+          spawnProcess: () => {
+            spawnCalls += 1;
+            return {
+              pid: 75_000 + spawnCalls,
+              exitCode: 0,
+              signalCode: null,
+            } as unknown as NodeChildProcess;
+          },
+          teardownProcess: async () => {
+            teardownCalls += 1;
+            if (teardownCalls === 1) {
+              throw new Error("subscription cleanup proof failed");
+            }
+            if (teardownCalls === 2) {
+              await retryProof;
+            }
+          },
+          createQuery: (input) => {
+            const queryIndex = spawnCalls;
+            input.options?.spawnClaudeCodeProcess?.({
+              command: "claude",
+              args: [],
+              env: {},
+            });
+            return {
+              initializationResult: async () => {
+                if (queryIndex === 0) throw new Error("subscription initialization failed");
+                return { account: { subscriptionType: "max" } } as never;
+              },
+              close: () => {
+                closeCalls.push(queryIndex);
+              },
+            };
+          },
+        });
+
+        return Effect.gen(function* () {
+          const initial = yield* subscriptionProbe.probe().pipe(Effect.result);
+          assert.equal(initial._tag, "Failure");
+          if (initial._tag === "Failure") {
+            assert.instanceOf(initial.failure, AggregateError);
+            const causes = initial.failure.errors;
+            assert.match(String(causes[0]), /subscription initialization failed/);
+            assert.match(String(causes[1]), /subscription cleanup proof failed/);
+          }
+          assert.strictEqual(spawnCalls, 1);
+          assert.strictEqual(teardownCalls, 1);
+          assert.deepStrictEqual(closeCalls, []);
+
+          const replacementA = yield* subscriptionProbe.probe().pipe(Effect.forkChild);
+          const replacementB = yield* subscriptionProbe.probe().pipe(Effect.forkChild);
+          yield* Effect.yieldNow;
+          yield* Effect.yieldNow;
+          assert.strictEqual(teardownCalls, 2);
+          assert.strictEqual(spawnCalls, 1);
+
+          proveRetry?.();
+          const [firstResult, secondResult] = yield* Effect.all([
+            Fiber.join(replacementA),
+            Fiber.join(replacementB),
+          ]);
+          assert.deepStrictEqual(firstResult, { subscriptionType: "max" });
+          assert.deepStrictEqual(secondResult, firstResult);
+          assert.strictEqual(spawnCalls, 2);
+          assert.strictEqual(teardownCalls, 3);
+          assert.deepStrictEqual(closeCalls, [0, 1]);
+          yield* subscriptionProbe.cleanup();
+        });
+      },
+    );
+
+    it.effect("closes before a retained-cleanup continuation can start a replacement probe", () => {
+      let spawnCalls = 0;
+      let teardownCalls = 0;
+      let queryCalls = 0;
+      let closeCalls = 0;
+      let invokeLateSpawn: (() => unknown) | undefined;
+      const retryStarted = Promise.withResolvers<void>();
+      const releaseRetry = Promise.withResolvers<void>();
+      const subscriptionProbe = makeClaudeSubscriptionProbe({
+        timeoutMs: 1_000,
+        spawnProcess: () => {
+          spawnCalls += 1;
+          return {
+            pid: 75_050 + spawnCalls,
+            exitCode: 0,
+            signalCode: null,
+          } as unknown as NodeChildProcess;
+        },
+        teardownProcess: async () => {
+          teardownCalls += 1;
+          if (teardownCalls === 1) {
+            throw new Error("initial subscription cleanup failed");
+          }
+          if (teardownCalls === 2) {
+            retryStarted.resolve();
+            await releaseRetry.promise;
+          }
+        },
+        createQuery: (input) => {
+          queryCalls += 1;
+          const spawnClaudeCodeProcess = input.options?.spawnClaudeCodeProcess;
+          assert.ok(spawnClaudeCodeProcess);
+          const spawnOptions = {
+            command: "claude",
+            args: [],
+            env: {},
+          };
+          spawnClaudeCodeProcess(spawnOptions);
+          invokeLateSpawn = () => spawnClaudeCodeProcess(spawnOptions);
+          return {
+            initializationResult: async () => {
+              throw new Error("initial subscription probe failed");
+            },
+            close: () => {
+              closeCalls += 1;
+            },
+          };
+        },
+      });
+
+      return Effect.gen(function* () {
+        const initial = yield* subscriptionProbe.probe().pipe(Effect.result);
+        assert.equal(initial._tag, "Failure");
+
+        const replacement = yield* subscriptionProbe.probe().pipe(Effect.result, Effect.forkChild);
+        yield* Effect.promise(() => retryStarted.promise);
+        const cleanup = yield* subscriptionProbe.cleanup().pipe(Effect.result, Effect.forkChild);
+        yield* Effect.yieldNow;
+        yield* Effect.yieldNow;
+        releaseRetry.resolve();
+
+        const [replacementResult, cleanupResult] = yield* Effect.all([
+          Fiber.join(replacement),
+          Fiber.join(cleanup),
+        ]);
+        assert.equal(replacementResult._tag, "Failure");
+        if (replacementResult._tag === "Failure") {
+          assert.match(String(replacementResult.failure), /probe has been closed/);
+        }
+        assert.equal(cleanupResult._tag, "Success");
+
+        const afterCleanup = yield* subscriptionProbe.probe().pipe(Effect.result);
+        assert.equal(afterCleanup._tag, "Failure");
+        if (afterCleanup._tag === "Failure") {
+          assert.match(String(afterCleanup.failure), /probe has been closed/);
+        }
+        assert.strictEqual(queryCalls, 1);
+        assert.strictEqual(spawnCalls, 1);
+        assert.strictEqual(teardownCalls, 2);
+        assert.strictEqual(closeCalls, 1);
+        assert.throws(() => invokeLateSpawn?.(), /probe has been closed/);
+        assert.strictEqual(spawnCalls, 1);
+      }).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            releaseRetry.resolve();
+          }),
+        ),
+      );
+    });
+
+    it.effect("closes refresh work before probe cleanup and preserves both failures", () =>
+      Effect.gen(function* () {
+        const finalizationOrder: Array<string> = [];
+        const refreshScope = yield* Scope.make("sequential");
+        yield* Scope.addFinalizer(
+          refreshScope,
+          Effect.sync(() => {
+            finalizationOrder.push("refresh-scope-closed");
+          }),
+        );
+
+        yield* closeProviderHealthRefreshScopeAndSubscriptionProbe(refreshScope, {
+          probe: () => Effect.die(new Error("unused subscription probe")),
+          cleanup: () =>
+            Effect.sync(() => {
+              finalizationOrder.push("subscription-probe-cleanup");
+            }),
+        });
+        assert.deepStrictEqual(finalizationOrder, [
+          "refresh-scope-closed",
+          "subscription-probe-cleanup",
+        ]);
+
+        const failureOrder: Array<string> = [];
+        const failingRefreshScope = yield* Scope.make("sequential");
+        yield* Scope.addFinalizer(
+          failingRefreshScope,
+          Effect.sync(() => {
+            failureOrder.push("refresh-scope-failed");
+            throw new Error("refresh scope close failed");
+          }),
+        );
+        const failureExit = yield* closeProviderHealthRefreshScopeAndSubscriptionProbe(
+          failingRefreshScope,
+          {
+            probe: () => Effect.die(new Error("unused subscription probe")),
+            cleanup: () =>
+              Effect.sync(() => {
+                failureOrder.push("subscription-probe-failed");
+                throw new Error("subscription probe cleanup failed");
+              }),
+          },
+        ).pipe(Effect.exit);
+        assert.equal(failureExit._tag, "Failure");
+        if (Exit.isFailure(failureExit)) {
+          const renderedCause = Cause.pretty(failureExit.cause);
+          assert.match(renderedCause, /refresh scope close failed/);
+          assert.match(renderedCause, /subscription probe cleanup failed/);
+        }
+        assert.deepStrictEqual(failureOrder, ["refresh-scope-failed", "subscription-probe-failed"]);
+      }),
+    );
+
+    it.effect("uses the contained process's default cleanup without recursive self-wait", () => {
+      let closeCalls = 0;
+      const launcherPid = 75_100;
+      const receiptToken = `provider-health-${String(process.pid)}-${String(Date.now())}`;
+      const receiptPath = NodePath.join(NodeOs.tmpdir(), `${receiptToken}.receipt`);
+      const child = Object.assign(new EventEmitter(), {
+        pid: launcherPid,
+        exitCode: 0,
+        signalCode: null,
+        kill: () => true,
+      }) as unknown as NodeChildProcess;
+      writeFileSync(receiptPath, `${receiptToken}\n${String(launcherPid)}\n`);
+      markWindowsProviderProcessSpawn(
+        child,
+        {
+          command: "synara-windows-job-launcher.exe",
+          args: [],
+          shell: false,
+          containment: "windows-job-object",
+          completionReceipt: { path: receiptPath, token: receiptToken },
+        },
+        true,
+      );
+      recordWindowsProviderProcessExit(child);
+      protectContainedClaudeSdkProcessTermination(child, undefined);
+      const subscriptionProbe = makeClaudeSubscriptionProbe({
+        timeoutMs: 1_000,
+        spawnProcess: () => child,
+        createQuery: (input) => {
+          input.options?.spawnClaudeCodeProcess?.({
+            command: "claude",
+            args: [],
+            env: {},
+          });
+          return {
+            initializationResult: async () => ({ account: { subscriptionType: "max" } }) as never,
+            close: () => {
+              closeCalls += 1;
+            },
+          };
+        },
+      });
+
+      return Effect.gen(function* () {
+        const result = yield* subscriptionProbe.probe().pipe(Effect.timeoutOption(500));
+        assert.strictEqual(result._tag, "Some");
+        if (result._tag === "Some") {
+          assert.deepStrictEqual(result.value, { subscriptionType: "max" });
+        }
+        assert.strictEqual(closeCalls, 1);
+        yield* subscriptionProbe.cleanup();
+      }).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            rmSync(receiptPath, { force: true });
+          }),
+        ),
+      );
+    });
+
     it.effect("returns ready when claude is installed and authenticated", () =>
       Effect.gen(function* () {
         const status = yield* checkClaudeProviderStatus;

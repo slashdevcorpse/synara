@@ -38,7 +38,7 @@ import {
   TurnId,
   type UserInputQuestion,
 } from "@synara/contracts";
-import { Effect, FileSystem, Layer, Option, Queue, Stream } from "effect";
+import { Cause, Effect, Exit, FileSystem, Layer, Option, Queue, Stream } from "effect";
 
 import { takeSynaraHarnessPolicyForProviderSession } from "../../agentGateway/harnessPolicy.ts";
 import {
@@ -68,6 +68,7 @@ import { PiAdapter, type PiAdapterShape } from "../Services/PiAdapter.ts";
 import type { ProviderThreadSnapshot } from "../Services/ProviderAdapter.ts";
 import { appendFileAttachmentsPromptBlock } from "../attachmentProjection.ts";
 import { classifyPiTurnFailure } from "../piTurnFailure.ts";
+import { teardownPosixProcessGroup } from "../posixProcessGroup.ts";
 import { clampUsagePercent, nonNegativeFiniteNumber, positiveFiniteNumber } from "../tokenUsage.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
 import {
@@ -75,8 +76,10 @@ import {
   teardownProviderProcessTree,
 } from "../supervisedProcessTeardown.ts";
 import {
+  isWindowsJobContainedProviderProcess,
   markWindowsProviderProcessSpawn,
   prepareWindowsProviderProcess,
+  windowsProviderProcessExitProofError,
 } from "../windowsProviderProcess.ts";
 
 const PROVIDER = "pi" as const;
@@ -110,8 +113,8 @@ type PiShellConfig = ReturnType<PiCodingAgentModule["getShellConfig"]>;
 interface PiActiveProcess {
   readonly child: ChildProcess;
   teardown: Promise<void> | undefined;
-  teardownRequested: boolean;
-  teardownProven: boolean;
+  cleanupRequested: boolean;
+  cleanupProven: boolean;
 }
 
 export interface PiBashProcessSupervisor {
@@ -128,28 +131,62 @@ export interface PiBashProcessSupervisorOptions {
     options: SpawnOptions,
   ) => ChildProcess;
   readonly teardownProcessTree?: typeof teardownProviderProcessTree;
+  readonly teardownPosixProcessGroup?: (processGroupId: number) => Promise<void>;
+  readonly platform?: NodeJS.Platform;
 }
+
+const teardownPiPosixProcessGroup = (processGroupId: number): Promise<void> =>
+  teardownPosixProcessGroup(processGroupId, { displayName: "Pi" });
 
 export function makePiBashProcessSupervisor(
   options: PiBashProcessSupervisorOptions,
 ): PiBashProcessSupervisor {
   const spawnProcess = options.spawnProcess ?? spawnChildProcess;
   const teardownProcessTree = options.teardownProcessTree ?? teardownProviderProcessTree;
+  const platform = options.platform ?? process.platform;
   const activeProcesses = new Set<PiActiveProcess>();
   let configuredShellPath: string | undefined;
 
   const startTeardown = (active: PiActiveProcess): Promise<void> => {
-    active.teardownRequested = true;
-    active.teardown ??= teardownChildProcessTree(active.child, teardownProcessTree).then(
-      () => {
-        active.teardownProven = true;
-      },
-      (cause) => {
-        active.teardown = undefined;
-        throw cause;
-      },
-    );
+    active.cleanupRequested = true;
+    if (active.teardown === undefined) {
+      const cleanup = Promise.resolve().then(() =>
+        platform !== "win32" &&
+        !isWindowsJobContainedProviderProcess(active.child) &&
+        (options.teardownPosixProcessGroup !== undefined ||
+          options.teardownProcessTree === undefined)
+          ? (options.teardownPosixProcessGroup ?? teardownPiPosixProcessGroup)(
+              Number(active.child.pid),
+            )
+          : teardownChildProcessTree(active.child, teardownProcessTree),
+      );
+      active.teardown = cleanup.then(
+        () => {
+          active.cleanupProven = true;
+        },
+        (cause) => {
+          active.teardown = undefined;
+          throw cause;
+        },
+      );
+    }
     return active.teardown;
+  };
+
+  const proveProcessCleanup = async (
+    processes: ReadonlyArray<PiActiveProcess>,
+    failureMessage: string,
+  ): Promise<void> => {
+    const results = await Promise.allSettled(processes.map(startTeardown));
+    const failures = results.flatMap((result) =>
+      result.status === "rejected" ? [result.reason] : [],
+    );
+    for (const active of processes) {
+      if (active.cleanupProven) activeProcesses.delete(active);
+    }
+    if (failures.length > 0) {
+      throw new AggregateError(failures, failureMessage);
+    }
   };
 
   const operations: BashOperations = {
@@ -167,6 +204,15 @@ export function makePiBashProcessSupervisor(
       if (timeoutMs !== undefined && timeoutMs > 2_147_483_647) {
         throw new Error(`Invalid timeout: maximum is ${String(2_147_483_647 / 1_000)} seconds`);
       }
+      const pendingCleanup = Array.from(activeProcesses).filter(
+        (active) => active.cleanupRequested && !active.cleanupProven,
+      );
+      if (pendingCleanup.length > 0) {
+        await proveProcessCleanup(
+          pendingCleanup,
+          "Cannot start a Pi subprocess while prior process-tree cleanup is unproven.",
+        );
+      }
       const shell = options.getShellConfig(configuredShellPath);
       const commandFromStdin = shell.commandTransport === "stdin";
       const childEnv = buildProviderChildEnvironment({
@@ -177,11 +223,12 @@ export function makePiBashProcessSupervisor(
       const prepared = prepareWindowsProviderProcess(shell.shell, shellArgs, {
         cwd,
         env: childEnv,
+        completionReceipt: "create",
       });
       const child = markWindowsProviderProcessSpawn(
         spawnProcess(prepared.command, prepared.args, {
           cwd,
-          detached: process.platform !== "win32",
+          detached: platform !== "win32",
           env: childEnv,
           shell: prepared.shell,
           ...(prepared.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
@@ -194,8 +241,8 @@ export function makePiBashProcessSupervisor(
       const active: PiActiveProcess = {
         child,
         teardown: undefined,
-        teardownRequested: false,
-        teardownProven: false,
+        cleanupRequested: false,
+        cleanupProven: false,
       };
       activeProcesses.add(active);
 
@@ -212,8 +259,13 @@ export function makePiBashProcessSupervisor(
 
       let timedOut = false;
       let timeout: ReturnType<typeof setTimeout> | undefined;
+      let postSpawnError: unknown;
+      let rejectTeardownFailure!: (cause: unknown) => void;
+      const teardownFailure = new Promise<never>((_resolve, reject) => {
+        rejectTeardownFailure = reject;
+      });
       const requestTeardown = () => {
-        void startTeardown(active).catch(() => undefined);
+        void startTeardown(active).catch(rejectTeardownFailure);
       };
       if (timeoutMs !== undefined) {
         timeout = setTimeout(() => {
@@ -222,14 +274,40 @@ export function makePiBashProcessSupervisor(
         }, timeoutMs);
       }
       execution.signal?.addEventListener("abort", requestTeardown, { once: true });
+      if (execution.signal?.aborted) requestTeardown();
 
       try {
-        const exitCode = await new Promise<number | null>((resolve, reject) => {
-          child.once("error", reject);
-          child.once("exit", (code) => resolve(code));
-        });
-        if (active.teardown) {
-          await active.teardown;
+        const exitCode = await Promise.race([
+          new Promise<number | null>((resolve, reject) => {
+            child.once("error", (error) => {
+              if (child.pid === undefined) {
+                active.cleanupProven = true;
+              } else {
+                active.cleanupRequested = true;
+                postSpawnError = error;
+              }
+              reject(error);
+            });
+            child.once("exit", (code) => resolve(code));
+          }),
+          teardownFailure,
+        ]);
+        if (active.cleanupRequested && !active.cleanupProven) {
+          await startTeardown(active);
+        }
+        if (!active.cleanupRequested) {
+          if (platform === "win32") {
+            const processExitProofError = windowsProviderProcessExitProofError(child);
+            if (processExitProofError) {
+              active.cleanupRequested = true;
+              throw processExitProofError;
+            }
+            active.cleanupProven = true;
+          } else {
+            // A detached shell's root exit does not prove that its process-group
+            // descendants exited. Reap the exact group before releasing ownership.
+            await startTeardown(active);
+          }
         }
         if (execution.signal?.aborted) {
           throw new Error("aborted");
@@ -238,12 +316,22 @@ export function makePiBashProcessSupervisor(
           throw new Error(`timeout:${String(execution.timeout)}`);
         }
         return { exitCode };
+      } catch (operationError) {
+        if (postSpawnError === operationError && child.pid !== undefined && !active.cleanupProven) {
+          try {
+            await startTeardown(active);
+          } catch (cleanupError) {
+            throw new AggregateError(
+              [operationError, cleanupError],
+              "Pi subprocess failed after spawn and its process-group cleanup remains unproven.",
+            );
+          }
+        }
+        throw operationError;
       } finally {
         if (timeout !== undefined) clearTimeout(timeout);
         execution.signal?.removeEventListener("abort", requestTeardown);
-        if (!active.teardownRequested || active.teardownProven) {
-          activeProcesses.delete(active);
-        }
+        if (active.cleanupProven) activeProcesses.delete(active);
       }
     },
   };
@@ -254,21 +342,151 @@ export function makePiBashProcessSupervisor(
       configuredShellPath = shellPath;
     },
     teardownAll: async () => {
-      const results = await Promise.allSettled(
-        Array.from(activeProcesses, (active) => startTeardown(active)),
+      await proveProcessCleanup(
+        Array.from(activeProcesses),
+        "Failed to prove all Pi subprocess trees exited.",
       );
-      const failures = results.flatMap((result) =>
-        result.status === "rejected" ? [result.reason] : [],
-      );
-      if (failures.length > 0) {
-        throw new AggregateError(failures, "Failed to prove all Pi subprocess trees exited.");
-      }
-      for (const active of Array.from(activeProcesses)) {
-        if (active.teardownProven) activeProcesses.delete(active);
-      }
     },
   };
 }
+
+export interface PiStartupProcessOwner {
+  readonly processSupervisor: PiBashProcessSupervisor;
+  cleanupPromise: Promise<void> | undefined;
+  cleanupProven: boolean;
+}
+
+export const makePiStartupProcessOwner = (
+  processSupervisor: PiBashProcessSupervisor,
+): PiStartupProcessOwner => ({
+  processSupervisor,
+  cleanupPromise: undefined,
+  cleanupProven: false,
+});
+
+export const cleanupPiStartupProcessOwner = (owner: PiStartupProcessOwner): Promise<void> => {
+  if (owner.cleanupProven) return Promise.resolve();
+  if (owner.cleanupPromise !== undefined) return owner.cleanupPromise;
+
+  let cleanupPromise!: Promise<void>;
+  cleanupPromise = Promise.resolve()
+    .then(() => owner.processSupervisor.teardownAll())
+    .then(
+      () => {
+        owner.cleanupProven = true;
+      },
+      (cause) => {
+        if (owner.cleanupPromise === cleanupPromise) {
+          owner.cleanupPromise = undefined;
+        }
+        throw cause;
+      },
+    );
+  owner.cleanupPromise = cleanupPromise;
+  return cleanupPromise;
+};
+
+export const retryRetainedPiStartupOwner = (
+  retainedOwners: Map<ThreadId, PiStartupProcessOwner>,
+  threadId: ThreadId,
+): Effect.Effect<void, unknown> =>
+  Effect.suspend(() => {
+    const owner = retainedOwners.get(threadId);
+    if (owner === undefined) return Effect.void;
+    return Effect.tryPromise({
+      try: () => cleanupPiStartupProcessOwner(owner),
+      catch: (cause) => cause,
+    }).pipe(
+      Effect.tap(() =>
+        Effect.sync(() => {
+          if (retainedOwners.get(threadId) === owner) {
+            retainedOwners.delete(threadId);
+          }
+        }),
+      ),
+    );
+  });
+
+export const failPiStartupCauseAfterCleanup = <E>(input: {
+  readonly threadId: ThreadId;
+  readonly startupCause: Cause.Cause<E>;
+  readonly owner: PiStartupProcessOwner;
+  readonly retainedOwners: Map<ThreadId, PiStartupProcessOwner>;
+}): Effect.Effect<never, E | ProviderAdapterRequestError> =>
+  Effect.uninterruptible(
+    Effect.tryPromise({
+      try: () => cleanupPiStartupProcessOwner(input.owner),
+      catch: (cause) => cause,
+    }).pipe(
+      Effect.matchEffect({
+        onSuccess: () => Effect.failCause(input.startupCause),
+        onFailure: (cleanupError) => {
+          const startupError = Cause.squash(input.startupCause);
+          input.retainedOwners.set(input.threadId, input.owner);
+          return Effect.fail(
+            new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "session/start-cleanup",
+              detail: "Pi startup failed and its subprocess-tree cleanup remains unproven.",
+              cause: new AggregateError(
+                [startupError, cleanupError],
+                "Pi startup and process cleanup both failed.",
+              ),
+            }),
+          );
+        },
+      }),
+    ),
+  );
+
+export const failPiStartupAfterCleanup = (input: {
+  readonly threadId: ThreadId;
+  readonly startupError: ProviderAdapterRequestError;
+  readonly owner: PiStartupProcessOwner;
+  readonly retainedOwners: Map<ThreadId, PiStartupProcessOwner>;
+}): Effect.Effect<never, ProviderAdapterRequestError> =>
+  failPiStartupCauseAfterCleanup({
+    ...input,
+    startupCause: Cause.fail(input.startupError),
+  });
+
+export interface PiCleanupOwner {
+  readonly threadId: ThreadId;
+  readonly cleanup: Effect.Effect<void, unknown>;
+}
+
+export const cleanupAllPiOwners = (
+  ownersInput: Iterable<PiCleanupOwner>,
+): Effect.Effect<void, ProviderAdapterRequestError> => {
+  const owners = Array.from(ownersInput);
+  return Effect.uninterruptible(
+    Effect.forEach(owners, (owner) => Effect.exit(owner.cleanup), {
+      concurrency: "unbounded",
+    }).pipe(
+      Effect.flatMap((exits) => {
+        const failures = exits.flatMap((exit, index) =>
+          Exit.isFailure(exit)
+            ? [{ threadId: owners[index]!.threadId, cause: Cause.squash(exit.cause) }]
+            : [],
+        );
+        if (failures.length === 0) return Effect.void;
+        return Effect.fail(
+          new ProviderAdapterRequestError({
+            provider: PROVIDER,
+            method: "session/stop-all",
+            detail: `Failed to prove cleanup for ${String(failures.length)} Pi owner(s): ${failures
+              .map((failure) => failure.threadId)
+              .join(", ")}.`,
+            cause: new AggregateError(
+              failures.map((failure) => failure.cause),
+              "Failed to clean up every Pi owner.",
+            ),
+          }),
+        );
+      }),
+    ),
+  );
+};
 
 let piCodingAgentModulePromise: Promise<PiCodingAgentModule> | undefined;
 
@@ -288,6 +506,9 @@ interface PiSessionContext {
   activeToolItems: Map<string, PiTrackedToolCall>;
   pendingUserInputs: Map<ApprovalRequestId, PiPendingUserInput>;
   stopped: boolean;
+  disposePromise: Promise<void> | undefined;
+  runtimeDisposed: boolean;
+  processCleanupProven: boolean;
   lastKnownTokenUsage: ThreadTokenUsageSnapshot | undefined;
   unsubscribe: (() => void) | undefined;
 }
@@ -342,6 +563,7 @@ export interface PiAdapterLiveOptions {
   readonly nativeEventLogger?: EventNdjsonLogger;
   readonly spawnProcess?: PiBashProcessSupervisorOptions["spawnProcess"];
   readonly teardownProcessTree?: typeof teardownProviderProcessTree;
+  readonly teardownPosixProcessGroup?: PiBashProcessSupervisorOptions["teardownPosixProcessGroup"];
   readonly agentGatewayFetch?: AgentGatewayMcpFetch;
 }
 
@@ -1170,6 +1392,7 @@ const makePiAdapter = (options?: PiAdapterLiveOptions) =>
     );
     const runtimeEventQueue = yield* Queue.unbounded<ProviderRuntimeEvent>();
     const sessions = new Map<ThreadId, PiSessionContext>();
+    const startupProcessOwners = new Map<ThreadId, PiStartupProcessOwner>();
     const modelRegistries = new Map<string, ModelRegistry>();
     const ownsNativeEventLogger = options?.nativeEventLogger === undefined;
     const nativeEventLogger =
@@ -1548,39 +1771,59 @@ const makePiAdapter = (options?: PiAdapterLiveOptions) =>
       return context;
     });
 
-    const disposeSessionContext = async (context: PiSessionContext) => {
-      try {
-        context.unsubscribe?.();
-        context.unsubscribe = undefined;
-        for (const pending of Array.from(context.pendingUserInputs.values())) {
-          pending.resolve({});
-        }
-        context.pendingUserInputs.clear();
-        context.stopped = true;
-        let runtimeFailure: unknown;
+    const disposeSessionContext = (context: PiSessionContext): Promise<void> => {
+      if (context.disposePromise) return context.disposePromise;
+
+      const disposeAttempt = async () => {
         try {
-          await context.runtime.dispose();
-        } catch (cause) {
-          runtimeFailure = cause;
+          context.unsubscribe?.();
+          context.unsubscribe = undefined;
+          for (const pending of Array.from(context.pendingUserInputs.values())) {
+            pending.resolve({});
+          }
+          context.pendingUserInputs.clear();
+          context.stopped = true;
+          let runtimeFailure: unknown;
+          if (!context.runtimeDisposed) {
+            try {
+              await context.runtime.dispose();
+              context.runtimeDisposed = true;
+            } catch (cause) {
+              runtimeFailure = cause;
+            }
+          }
+          let processFailure: unknown;
+          if (!context.processCleanupProven) {
+            try {
+              await context.processSupervisor.teardownAll();
+              context.processCleanupProven = true;
+            } catch (cause) {
+              processFailure = cause;
+            }
+          }
+          if (runtimeFailure !== undefined && processFailure !== undefined) {
+            throw new AggregateError(
+              [runtimeFailure, processFailure],
+              "Failed to dispose the Pi runtime and prove its subprocess trees exited.",
+            );
+          }
+          if (processFailure !== undefined) throw processFailure;
+          if (runtimeFailure !== undefined) throw runtimeFailure;
+        } finally {
+          context.gatewaySessionLease?.release();
+          delete context.gatewaySessionLease;
         }
-        let processFailure: unknown;
-        try {
-          await context.processSupervisor.teardownAll();
-        } catch (cause) {
-          processFailure = cause;
+      };
+
+      let disposePromise!: Promise<void>;
+      disposePromise = disposeAttempt().catch((cause) => {
+        if (context.disposePromise === disposePromise) {
+          context.disposePromise = undefined;
         }
-        if (runtimeFailure !== undefined && processFailure !== undefined) {
-          throw new AggregateError(
-            [runtimeFailure, processFailure],
-            "Failed to dispose the Pi runtime and prove its subprocess trees exited.",
-          );
-        }
-        if (processFailure !== undefined) throw processFailure;
-        if (runtimeFailure !== undefined) throw runtimeFailure;
-      } finally {
-        context.gatewaySessionLease?.release();
-        delete context.gatewaySessionLease;
-      }
+        throw cause;
+      });
+      context.disposePromise = disposePromise;
+      return disposePromise;
     };
 
     const handleMessageUpdate = (
@@ -1951,17 +2194,77 @@ const makePiAdapter = (options?: PiAdapterLiveOptions) =>
       return { runtime, modelRegistry: runtime.services.modelRegistry };
     };
 
-    const startSession: PiAdapterShape["startSession"] = (input) =>
-      Effect.gen(function* () {
+    const startSession: PiAdapterShape["startSession"] = (input) => {
+      let startupOwnerForFailure: PiStartupProcessOwner | undefined;
+      let gatewayLeaseForFailure: AgentGatewaySessionLease | undefined;
+      let startupContextForFailure: PiSessionContext | undefined;
+      let processOwnerTransferred = false;
+      const cleanupFailedStartup = <E>(startupCause: Cause.Cause<E>) => {
+        if (startupContextForFailure !== undefined) {
+          const context = startupContextForFailure;
+          return Effect.uninterruptible(
+            Effect.tryPromise({
+              try: () => disposeSessionContext(context),
+              catch: (cause) => cause,
+            }).pipe(
+              Effect.matchEffect({
+                onSuccess: () =>
+                  Effect.sync(() => {
+                    if (sessions.get(input.threadId) === context) {
+                      sessions.delete(input.threadId);
+                    }
+                  }).pipe(Effect.andThen(Effect.failCause(startupCause))),
+                onFailure: (cleanupError) => {
+                  if (sessions.get(input.threadId) === undefined) {
+                    sessions.set(input.threadId, context);
+                  }
+                  return Effect.fail(
+                    new ProviderAdapterRequestError({
+                      provider: PROVIDER,
+                      method: "session/start-cleanup",
+                      detail: "Pi startup failed and its runtime cleanup remains unproven.",
+                      cause: new AggregateError(
+                        [Cause.squash(startupCause), cleanupError],
+                        "Pi startup and runtime cleanup both failed.",
+                      ),
+                    }),
+                  );
+                },
+              }),
+            ),
+          );
+        }
+        if (startupOwnerForFailure === undefined || processOwnerTransferred) {
+          return Effect.failCause(startupCause);
+        }
+        return failPiStartupCauseAfterCleanup({
+          threadId: input.threadId,
+          startupCause,
+          owner: startupOwnerForFailure,
+          retainedOwners: startupProcessOwners,
+        }).pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              gatewayLeaseForFailure?.release();
+            }),
+          ),
+        );
+      };
+
+      return Effect.gen(function* () {
         const cwd = trimToUndefined(input.cwd) ?? serverConfig.cwd;
         const piSdk = yield* loadPiSdk("session/start");
-        const processSupervisor = makePiBashProcessSupervisor({
-          getShellConfig: () => piSdk.getShellConfig(),
-          ...(options?.spawnProcess ? { spawnProcess: options.spawnProcess } : {}),
-          ...(options?.teardownProcessTree
-            ? { teardownProcessTree: options.teardownProcessTree }
-            : {}),
-        });
+        yield* retryRetainedPiStartupOwner(startupProcessOwners, input.threadId).pipe(
+          Effect.mapError(
+            (cause) =>
+              new ProviderAdapterRequestError({
+                provider: PROVIDER,
+                method: "session/restart",
+                detail: "Cannot replace Pi session while prior startup cleanup is unproven.",
+                cause,
+              }),
+          ),
+        );
         const agentDir = makeAgentDir(input.providerOptions?.pi?.agentDir, piSdk);
         const sessionFile = extractResumeSessionFile(input.resumeCursor);
         const sessionManager = sessionFile
@@ -1989,11 +2292,24 @@ const makePiAdapter = (options?: PiAdapterLiveOptions) =>
             sessions.delete(input.threadId);
           }
         }
+        const processSupervisor = makePiBashProcessSupervisor({
+          getShellConfig: () => piSdk.getShellConfig(),
+          ...(options?.spawnProcess ? { spawnProcess: options.spawnProcess } : {}),
+          ...(options?.teardownProcessTree
+            ? { teardownProcessTree: options.teardownProcessTree }
+            : {}),
+          ...(options?.teardownPosixProcessGroup
+            ? { teardownPosixProcessGroup: options.teardownPosixProcessGroup }
+            : {}),
+        });
+        const startupProcessOwner = makePiStartupProcessOwner(processSupervisor);
+        startupOwnerForFailure = startupProcessOwner;
         const agentGatewaySessionLease = acquireAgentGatewaySessionLease(
           agentGatewayCredentials,
           input.threadId,
           PROVIDER,
         );
+        gatewayLeaseForFailure = agentGatewaySessionLease;
         const agentGatewayConnection = agentGatewaySessionLease?.connection;
         const gatewayTools = agentGatewayConnection
           ? yield* releaseAgentGatewaySessionLeaseOnInterrupt(
@@ -2049,12 +2365,6 @@ const makePiAdapter = (options?: PiAdapterLiveOptions) =>
                 cause,
               }),
           }),
-        ).pipe(
-          Effect.tapError(() =>
-            Effect.sync(() => {
-              agentGatewaySessionLease?.release();
-            }),
-          ),
         );
         const now = new Date().toISOString();
         const model = runtime.session.model
@@ -2091,13 +2401,18 @@ const makePiAdapter = (options?: PiAdapterLiveOptions) =>
           activeToolItems: new Map(),
           pendingUserInputs: new Map(),
           stopped: false,
+          disposePromise: undefined,
+          runtimeDisposed: false,
+          processCleanupProven: false,
           lastKnownTokenUsage: undefined,
           unsubscribe: undefined,
         };
+        startupContextForFailure = context;
         context.unsubscribe = runtime.session.subscribe((event) =>
           handleSessionEvent(context, event),
         );
         sessions.set(input.threadId, context);
+        processOwnerTransferred = true;
         yield* Effect.tryPromise({
           try: () =>
             runtime.session.bindExtensions({ uiContext: makePiExtensionUIContext(context) }),
@@ -2108,26 +2423,7 @@ const makePiAdapter = (options?: PiAdapterLiveOptions) =>
               detail: toMessage(cause, "Failed to bind Pi extensions."),
               cause,
             }),
-        }).pipe(
-          Effect.catch((error) =>
-            Effect.gen(function* () {
-              yield* Effect.tryPromise({
-                try: () => disposeSessionContext(context),
-                catch: (cause) =>
-                  new ProviderAdapterRequestError({
-                    provider: PROVIDER,
-                    method: "session/start-cleanup",
-                    detail: toMessage(cause, "Failed to prove Pi startup cleanup completed."),
-                    cause,
-                  }),
-              });
-              if (sessions.get(input.threadId) === context) {
-                sessions.delete(input.threadId);
-              }
-              return yield* Effect.fail(error);
-            }),
-          ),
-        );
+        });
         const loadedExtensions = runtime.session.resourceLoader.getExtensions().extensions;
         if (loadedExtensions.length > 0) {
           const extensionNames = loadedExtensions.map(extensionDisplayName);
@@ -2172,7 +2468,8 @@ const makePiAdapter = (options?: PiAdapterLiveOptions) =>
           } satisfies ProviderRuntimeEvent);
         }
         return session;
-      });
+      }).pipe(Effect.catchCause(cleanupFailedStartup));
+    };
 
     const buildPromptPayload = (input: {
       readonly input?: string | undefined;
@@ -2459,10 +2756,17 @@ const makePiAdapter = (options?: PiAdapterLiveOptions) =>
       });
 
     const listSessions: PiAdapterShape["listSessions"] = () =>
-      Effect.sync(() => Array.from(sessions.values()).map(makeSessionSnapshot));
+      Effect.sync(() =>
+        Array.from(sessions.values())
+          .filter((context) => !context.stopped)
+          .map(makeSessionSnapshot),
+      );
 
     const hasSession: PiAdapterShape["hasSession"] = (threadId) =>
-      Effect.sync(() => sessions.has(threadId));
+      Effect.sync(() => {
+        const context = sessions.get(threadId);
+        return context !== undefined && !context.stopped;
+      });
 
     const snapshotThread = (context: PiSessionContext): ProviderThreadSnapshot => {
       const historyItems = mapMessageHistory(context.runtime.session);
@@ -2525,10 +2829,16 @@ const makePiAdapter = (options?: PiAdapterLiveOptions) =>
       );
 
     const stopAll: PiAdapterShape["stopAll"] = () =>
-      Effect.forEach(Array.from(sessions.keys()), (threadId) => stopSession(threadId), {
-        concurrency: "unbounded",
-        discard: true,
-      }).pipe(Effect.asVoid);
+      cleanupAllPiOwners([
+        ...Array.from(sessions.keys(), (threadId) => ({
+          threadId,
+          cleanup: stopSession(threadId),
+        })),
+        ...Array.from(startupProcessOwners.keys(), (threadId) => ({
+          threadId,
+          cleanup: retryRetainedPiStartupOwner(startupProcessOwners, threadId),
+        })),
+      ]);
 
     const listModels: NonNullable<PiAdapterShape["listModels"]> = (input) =>
       Effect.tryPromise({

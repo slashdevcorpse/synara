@@ -11,7 +11,13 @@ import {
   WINDOWS_PROCESS_TREE_SIGNAL_TIMEOUT_MS,
 } from "../terminal/processTreeKiller";
 import { Effect } from "effect";
-import { isWindowsJobContainedProviderProcess } from "./windowsProviderProcess.ts";
+import {
+  isWindowsJobContainedProviderProcess,
+  prepareWindowsJobTerminationCommand,
+  recordWindowsProviderProcessExit,
+  requestWindowsJobTermination,
+  WINDOWS_JOB_EMPTY_PROOF_TIMEOUT_MS,
+} from "./windowsProviderProcess.ts";
 
 const DEFAULT_TERM_GRACE_MS = 1_500;
 const DEFAULT_FORCE_EXIT_MS = 1_500;
@@ -25,8 +31,12 @@ export interface SupervisedProcessTeardownInput {
   readonly termGraceMs?: number;
   readonly forceExitMs?: number;
   readonly pollMs?: number;
-  /** Trusted spawn-time proof that Windows root-tree signaling replaces PID-based capture. */
-  readonly descendantExitProof?: "root-tree-signal" | undefined;
+  /** Trusted spawn-time proof that the v2 launcher exits only after its Windows Job is empty. */
+  readonly descendantExitProof?: "windows-job-empty-on-exit" | undefined;
+  /** Resolves true only when the exact launcher wrote its nonce receipt after proving Job empty. */
+  readonly rootExitProof?: Promise<boolean> | undefined;
+  /** Cooperatively asks the owning launcher Job to terminate while its proof handle stays alive. */
+  readonly requestWindowsJobTermination?: ((abortSignal: AbortSignal) => Promise<void>) | undefined;
 }
 
 export interface ProcessExitHandle {
@@ -53,6 +63,7 @@ export interface SupervisedProcessTeardownDependencies {
   readonly processTreeKiller: ProcessTreeKiller;
   readonly now: () => number;
   readonly sleep: (milliseconds: number) => Promise<void>;
+  readonly yieldToEventLoop: () => Promise<void>;
 }
 
 export class ProviderProcessExitUnprovenError extends Error {
@@ -97,6 +108,7 @@ const defaultDependencies: SupervisedProcessTeardownDependencies = {
   processTreeKiller: defaultProcessTreeKiller,
   now: () => performance.now(),
   sleep: (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+  yieldToEventLoop: () => new Promise((resolve) => setImmediate(resolve)),
 };
 
 function positiveDuration(value: number | undefined, fallback: number): number {
@@ -185,11 +197,23 @@ export async function teardownChildProcessTree(
   if (process.pid === undefined) {
     throw new Error("Cannot prove process exit because the spawned process has no PID.");
   }
+  const rootExited = waitForOwnedProcessExit(process);
+  const isWindowsJobContained = isWindowsJobContainedProviderProcess(process);
+  const terminationCommand = prepareWindowsJobTerminationCommand(process);
   return teardownProcessTree({
     rootPid: process.pid,
-    rootExited: waitForOwnedProcessExit(process),
-    ...(isWindowsJobContainedProviderProcess(process)
-      ? { descendantExitProof: "root-tree-signal" as const }
+    rootExited,
+    ...(isWindowsJobContained
+      ? {
+          descendantExitProof: "windows-job-empty-on-exit" as const,
+          rootExitProof: rootExited.then(() => recordWindowsProviderProcessExit(process)),
+          ...(terminationCommand
+            ? {
+                requestWindowsJobTermination: (abortSignal: AbortSignal) =>
+                  requestWindowsJobTermination(process, abortSignal),
+              }
+            : {}),
+        }
       : {}),
   });
 }
@@ -198,11 +222,23 @@ export function teardownEffectProcessTree(
   process: EffectProcessExitHandle,
   teardownProcessTree: typeof teardownProviderProcessTree = teardownProviderProcessTree,
 ): Promise<SupervisedProcessTeardownResult> {
+  const rootExited = Effect.runPromise(Effect.exit(process.exitCode));
+  const isWindowsJobContained = isWindowsJobContainedProviderProcess(process);
+  const terminationCommand = prepareWindowsJobTerminationCommand(process);
   return teardownProcessTree({
     rootPid: Number(process.pid),
-    rootExited: Effect.runPromise(Effect.exit(process.exitCode)),
-    ...(isWindowsJobContainedProviderProcess(process)
-      ? { descendantExitProof: "root-tree-signal" as const }
+    rootExited,
+    ...(isWindowsJobContained
+      ? {
+          descendantExitProof: "windows-job-empty-on-exit" as const,
+          rootExitProof: rootExited.then(() => recordWindowsProviderProcessExit(process)),
+          ...(terminationCommand
+            ? {
+                requestWindowsJobTermination: (abortSignal: AbortSignal) =>
+                  requestWindowsJobTermination(process, abortSignal),
+              }
+            : {}),
+        }
       : {}),
   });
 }
@@ -210,8 +246,8 @@ export function teardownEffectProcessTree(
 /**
  * Owns the complete provider process-tree stop sequence. Success means the exact root emitted exit
  * and every identity-matched descendant captured before TERM is gone, or an explicitly marked
- * Windows launcher completed root-tree signaling and exited. Sending a signal alone is not
- * considered completion.
+ * Windows launcher exited with a nonce receipt proving its Job reached zero active processes.
+ * Sending a signal or completing an external tree-kill command is not considered completion.
  */
 export async function teardownProviderProcessTree(
   input: SupervisedProcessTeardownInput,
@@ -225,16 +261,16 @@ export async function teardownProviderProcessTree(
 
   const deps = { ...defaultDependencies, ...dependencies };
   const signalErrors: Error[] = [];
+  const hasTrustedWindowsJobContainment = input.descendantExitProof === "windows-job-empty-on-exit";
+  const trustedWindowsJobExitProof =
+    hasTrustedWindowsJobContainment && input.rootExitProof
+      ? input.rootExitProof.catch(() => false)
+      : Promise.resolve(false);
   let rootExited = false;
-  let captureFinished = false;
-  let rootExitedBeforeCaptureFinished = false;
   let rootTreeSignalSucceeded = false;
   void input.rootExited.then(
     () => {
       rootExited = true;
-      if (!captureFinished) {
-        rootExitedBeforeCaptureFinished = true;
-      }
     },
     () => {
       // A rejected watcher is not evidence that the owned process exited.
@@ -252,26 +288,34 @@ export async function teardownProviderProcessTree(
     });
   };
 
+  const windowsJobExitIsProven = async (): Promise<boolean> =>
+    rootExited && (await trustedWindowsJobExitProof);
+
   // Observe an already-settled exit before using the PID. Once the owned root is gone, that PID
   // may identify an unrelated process, so neither capture nor signaling is safe.
   await Promise.resolve();
-  if (rootExited) failUncapturedExit();
+  if (rootExited) {
+    if (await windowsJobExitIsProven()) return { escalated: false, signalErrors };
+    failUncapturedExit();
+  }
 
   const capturedTree =
-    input.descendantExitProof === "root-tree-signal"
+    input.descendantExitProof === "windows-job-empty-on-exit"
       ? ({
           descendants: [],
           captureComplete: true,
           descendantExitProof: "root-tree-signal",
         } as const)
       : await deps.processTreeKiller.capture(input.rootPid);
-  captureFinished = true;
 
-  // An asynchronous process-table scan can overlap root exit. Flush an exit
-  // resolution queued in the same turn as capture completion, then discard the
-  // PID-keyed result if the owned root exited before capture finished.
-  await Promise.resolve();
-  if (rootExitedBeforeCaptureFinished) failUncapturedExit();
+  // Process exit notifications can arrive on a later event-loop phase than process-table capture.
+  // Yield through a macrotask before trusting the PID-keyed result, then discard it if ownership
+  // ended before teardown could signal anything.
+  await deps.yieldToEventLoop();
+  if (rootExited) {
+    if (await windowsJobExitIsProven()) return { escalated: false, signalErrors };
+    failUncapturedExit();
+  }
 
   const captureComplete = capturedTree.captureComplete !== false;
   const tree = capturedTree;
@@ -320,6 +364,11 @@ export async function teardownProviderProcessTree(
     do {
       // Flush a root-exit resolution caused synchronously by a signal test double.
       await Promise.resolve();
+      // A contained launcher exit is proof only when its nonce receipt confirms that the Job
+      // reached zero active processes. External tree-kill completion is cleanup, not proof.
+      if (await windowsJobExitIsProven()) {
+        return { proven: true as const, remainingDescendants: [] };
+      }
       const inspectionBudgetMs = deadline - deps.now();
       if (inspectionBudgetMs <= 0) break;
       let inspection: CapturedProcessTreeInspection | typeof INSPECTION_TIMED_OUT | undefined;
@@ -338,6 +387,7 @@ export async function teardownProviderProcessTree(
       const requiredDescendantProofCompleted =
         tree.descendantExitProof !== "root-tree-signal" || rootTreeSignalSucceeded;
       if (
+        !hasTrustedWindowsJobContainment &&
         rootExited &&
         captureComplete &&
         requiredDescendantProofCompleted &&
@@ -357,15 +407,67 @@ export async function teardownProviderProcessTree(
   // PID may already identify an unrelated process. The untrusted capture was
   // discarded above; skip the root tree and keep the result unproven.
   const signalDeadlineMs = (exitWaitMs: number): number =>
-    input.descendantExitProof === "root-tree-signal"
+    tree.descendantExitProof === "root-tree-signal"
       ? Math.max(
           exitWaitMs,
           WINDOWS_PROCESS_TREE_SIGNAL_TIMEOUT_MS + ROOT_TREE_SIGNAL_SETTLEMENT_SLACK_MS,
         )
       : exitWaitMs;
   const termGraceMs = positiveDuration(input.termGraceMs, DEFAULT_TERM_GRACE_MS);
-  await signal("SIGTERM", !rootExited, signalDeadlineMs(termGraceMs));
-  const graceful = await waitForExitProof(termGraceMs);
+  let gracefulProofWaitMs = termGraceMs;
+  if (hasTrustedWindowsJobContainment && input.requestWindowsJobTermination) {
+    const cooperativeDeadlineMs = Math.max(termGraceMs, WINDOWS_JOB_EMPTY_PROOF_TIMEOUT_MS);
+    const abortController = new AbortController();
+    const requestOutcome = (async () => {
+      try {
+        const request = Promise.resolve()
+          .then(() => input.requestWindowsJobTermination!(abortController.signal))
+          .then(() => ({ rootTreeSignalSucceeded: false }));
+        return {
+          kind: "request-settled" as const,
+          outcome: await signalBeforeDeadline(request, cooperativeDeadlineMs, abortController),
+        };
+      } catch (cause) {
+        return { kind: "request-failed" as const, cause };
+      }
+    })();
+    const rootExitOutcome = input.rootExited.then(
+      () => ({ kind: "root-exited" as const }),
+      () => new Promise<never>(() => {}),
+    );
+    const firstOutcome = await Promise.race([requestOutcome, rootExitOutcome]);
+    if (firstOutcome.kind === "root-exited") {
+      // A naturally completed or early-failing launcher can prove the Job empty before the
+      // controller finds its named Job. Stop waiting on that helper and inspect the receipt now.
+      abortController.abort();
+      gracefulProofWaitMs = 1;
+    } else if (firstOutcome.kind === "request-failed") {
+      const cause = firstOutcome.cause;
+      const detail = cause instanceof Error ? cause.message : String(cause);
+      signalErrors.push(
+        new Error(
+          `Windows Job termination request for provider process ${input.rootPid} failed: ${detail}`,
+          cause instanceof Error ? { cause } : undefined,
+        ),
+      );
+      gracefulProofWaitMs = cooperativeDeadlineMs;
+    } else {
+      const outcome = firstOutcome.outcome;
+      if (outcome === SIGNAL_TIMED_OUT) {
+        signalErrors.push(
+          new Error(
+            `Windows Job termination request for provider process ${input.rootPid} did not settle within ${cooperativeDeadlineMs}ms.`,
+          ),
+        );
+      }
+      // Controller success proves only that TerminateJobObject was requested. The owner launcher
+      // gets a separate full native deadline to observe ACTIVE_PROCESS_ZERO and write its receipt.
+      gracefulProofWaitMs = cooperativeDeadlineMs;
+    }
+  } else {
+    await signal("SIGTERM", !rootExited, signalDeadlineMs(termGraceMs));
+  }
+  const graceful = await waitForExitProof(gracefulProofWaitMs);
   if (graceful.proven) {
     return { escalated: false, signalErrors };
   }

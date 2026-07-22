@@ -39,6 +39,7 @@ import { CodexJsonlFramer, CodexJsonlWriter } from "./codexAppServerTransport";
 import { ensureIsolatedScratchWorkspace } from "./scratchWorkspaces";
 import { SYNARA_HARNESS_POLICY_MARKER } from "./agentGateway/harnessPolicy.ts";
 import { acquireAgentGatewaySessionLease } from "./agentGateway/sessionLease.ts";
+import { markWindowsProviderProcessSpawn } from "./provider/windowsProviderProcess.ts";
 
 const asThreadId = (value: string): ThreadId => ThreadId.makeUnsafe(value);
 const fullAccessTurnOverrides = {
@@ -461,6 +462,87 @@ function createProcessOutputHarness() {
 }
 
 describe("Codex app-server teardown", () => {
+  it("installs exact child ownership before stdin transport construction can throw", async () => {
+    class FakeCodexChild extends EventEmitter {
+      readonly pid = 5050;
+      exitCode: number | null = null;
+      signalCode: NodeJS.Signals | null = null;
+      readonly stdin = new PassThrough();
+      readonly stdout = new PassThrough();
+      readonly stderr = new PassThrough();
+    }
+    const child = markWindowsProviderProcessSpawn(
+      new FakeCodexChild(),
+      {
+        command: "C:\\synara-windows-job-launcher.exe",
+        args: [],
+        shell: false,
+        containment: "windows-job-object",
+        completionReceipt: {
+          path: path.join(os.tmpdir(), "codex-post-spawn-construction.receipt"),
+          token: "codex-post-spawn-construction",
+        },
+      },
+      true,
+    );
+    const transportError = new Error("stdin transport construction failed");
+    const cleanupError = new Error("spawned child cleanup is still unproven");
+    const teardownProcessTree = vi
+      .fn()
+      .mockRejectedValueOnce(cleanupError)
+      .mockResolvedValueOnce({ escalated: false, signalErrors: [] });
+    const manager = new CodexAppServerManager(undefined, {
+      teardownProcessTree,
+      spawnAppServer: () => child as never,
+      createStdinWriter: () => {
+        throw transportError;
+      },
+    });
+    vi.spyOn(
+      manager as unknown as {
+        assertSupportedCodexCliVersion: (input: unknown) => Promise<void>;
+      },
+      "assertSupportedCodexCliVersion",
+    ).mockResolvedValue();
+    vi.spyOn(
+      manager as unknown as {
+        buildSessionProcessEnv: (
+          homePath: string | undefined,
+          token: string | undefined,
+        ) => Promise<NodeJS.ProcessEnv>;
+      },
+      "buildSessionProcessEnv",
+    ).mockResolvedValue({});
+    const threadId = asThreadId("thread-codex-post-spawn-construction-failure");
+
+    await expect(
+      manager.startSession({
+        provider: "codex",
+        threadId,
+        runtimeMode: "full-access",
+        cwd: process.cwd(),
+        providerOptions: {
+          codex: {
+            binaryPath: process.execPath,
+          },
+        },
+      }),
+    ).rejects.toThrow(cleanupError.message);
+
+    expect(teardownProcessTree).toHaveBeenCalledTimes(1);
+    expect(teardownProcessTree.mock.calls[0]?.[0]).toMatchObject({
+      rootPid: child.pid,
+      descendantExitProof: "windows-job-empty-on-exit",
+    });
+    expect(teardownProcessTree.mock.calls[0]?.[0]?.rootExitProof).toBeInstanceOf(Promise);
+    expect(manager.hasSession(threadId)).toBe(true);
+
+    await manager.stopSession(threadId);
+
+    expect(teardownProcessTree).toHaveBeenCalledTimes(2);
+    expect(manager.hasSession(threadId)).toBe(false);
+  });
+
   it("keeps the session owned until shared process-tree exit proof resolves", async () => {
     class FakeCodexChild extends EventEmitter {
       readonly pid = 5151;
@@ -597,6 +679,93 @@ describe("Codex app-server teardown", () => {
 
     expect(revokeSessionToken).toHaveBeenCalledOnce();
     expect(manager.hasSession(threadId)).toBe(false);
+  });
+
+  it("retains an unproven natural exit and blocks replacement until cleanup retry succeeds", async () => {
+    class FakeCodexChild extends EventEmitter {
+      readonly pid = 5353;
+      exitCode: number | null = null;
+      signalCode: NodeJS.Signals | null = null;
+      readonly stdin = new PassThrough();
+      readonly stdout = new PassThrough();
+      readonly stderr = new PassThrough();
+    }
+    const child = new FakeCodexChild();
+    markWindowsProviderProcessSpawn(
+      child,
+      {
+        command: "C:\\synara-windows-job-launcher.exe",
+        args: [],
+        shell: false,
+        containment: "windows-job-object",
+      },
+      true,
+    );
+    const teardownProcessTree = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("cleanup proof is still unavailable"))
+      .mockResolvedValueOnce({ escalated: false, signalErrors: [] });
+    const manager = new CodexAppServerManager(undefined, { teardownProcessTree });
+    const threadId = asThreadId("thread-codex-unproven-natural-exit");
+    const context = {
+      session: {
+        provider: "codex",
+        status: "ready",
+        threadId,
+        runtimeMode: "full-access",
+        createdAt: "2026-07-21T00:00:00.000Z",
+        updatedAt: "2026-07-21T00:00:00.000Z",
+      },
+      account: { type: "unknown", planType: null, sparkEnabled: true },
+      child,
+      stdoutFramer: new CodexJsonlFramer(),
+      stdinWriter: new CodexJsonlWriter(child.stdin),
+      pending: new Map(),
+      pendingApprovals: new Map(),
+      pendingUserInputs: new Map(),
+      collabReceiverTurns: new Map(),
+      collabReceiverParents: new Map(),
+      reviewTurnIds: new Set(),
+      nextRequestId: 1,
+      stopping: false,
+    };
+    const internals = manager as unknown as {
+      sessions: Map<ThreadId, unknown>;
+      attachProcessListeners: (context: unknown) => void;
+    };
+    const methods: string[] = [];
+    manager.on("event", (event) => methods.push(event.method));
+    internals.sessions.set(threadId, context);
+    internals.attachProcessListeners(context);
+
+    child.exitCode = 1;
+    child.emit("exit", 1, null);
+
+    expect(manager.hasSession(threadId)).toBe(true);
+    expect(manager.listSessions()).toEqual([
+      expect.objectContaining({ status: "error", threadId }),
+    ]);
+    expect(context.stopping).toBe(true);
+    expect(methods).toContain("process/exitUnproven");
+    expect(methods).not.toContain("session/exited");
+    expect(methods).not.toContain("session/closed");
+
+    await expect(
+      manager.startSession({
+        provider: "codex",
+        threadId,
+        runtimeMode: "full-access",
+        cwd: process.cwd(),
+      }),
+    ).rejects.toThrow("cleanup proof is still unavailable");
+    expect(teardownProcessTree).toHaveBeenCalledTimes(1);
+    expect(internals.sessions.get(threadId)).toBe(context);
+    expect(methods).not.toContain("session/closed");
+
+    await manager.stopSession(threadId);
+    expect(teardownProcessTree).toHaveBeenCalledTimes(2);
+    expect(manager.hasSession(threadId)).toBe(false);
+    expect(methods.filter((method) => method === "session/closed")).toHaveLength(1);
   });
 });
 
@@ -3480,6 +3649,64 @@ describe("CodexAppServerManager process teardown", () => {
 
     expect(closedEvents).toEqual(["session/closed"]);
     expect(manager.hasSession(threadId)).toBe(false);
+  });
+
+  it("retains a failed explicit stop as a retryable owner without publishing closed", async () => {
+    const teardownProcessTree = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("first cleanup attempt failed"))
+      .mockResolvedValueOnce({ escalated: false, signalErrors: [] });
+    const manager = new CodexAppServerManager(undefined, { teardownProcessTree });
+    const threadId = asThreadId("thread-stop-retry-owner");
+    const closedEvents: string[] = [];
+    manager.on("event", (event) => {
+      if (event.method === "session/closed") closedEvents.push(event.method);
+    });
+    const context = {
+      session: {
+        provider: "codex",
+        status: "ready",
+        threadId,
+        runtimeMode: "full-access",
+        createdAt: "2026-07-21T00:00:00.000Z",
+        updatedAt: "2026-07-21T00:00:00.000Z",
+      },
+      account: { type: "unknown", planType: null, sparkEnabled: true },
+      child: {
+        pid: 42_425,
+        exitCode: null,
+        signalCode: null,
+        once: vi.fn(),
+        removeListener: vi.fn(),
+      },
+      pending: new Map(),
+      pendingApprovals: new Map(),
+      pendingUserInputs: new Map(),
+      collabReceiverTurns: new Map(),
+      collabReceiverParents: new Map(),
+      reviewTurnIds: new Set(),
+      nextRequestId: 1,
+      stopping: false,
+    };
+    const internals = manager as unknown as {
+      sessions: Map<ThreadId, unknown>;
+    };
+    internals.sessions.set(threadId, context);
+
+    await expect(manager.stopSession(threadId)).rejects.toThrow("first cleanup attempt failed");
+
+    expect(manager.hasSession(threadId)).toBe(true);
+    expect(internals.sessions.get(threadId)).toBe(context);
+    expect(
+      (context as typeof context & { stopPromise?: Promise<void> }).stopPromise,
+    ).toBeUndefined();
+    expect(closedEvents).toEqual([]);
+
+    await manager.stopSession(threadId);
+
+    expect(teardownProcessTree).toHaveBeenCalledTimes(2);
+    expect(manager.hasSession(threadId)).toBe(false);
+    expect(closedEvents).toEqual(["session/closed"]);
   });
 });
 
