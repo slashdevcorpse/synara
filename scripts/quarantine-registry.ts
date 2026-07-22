@@ -11,6 +11,7 @@ import {
   parseVitestQuarantineInventory,
   QUARANTINE_PLATFORMS,
   quarantineInventoryFileBatches,
+  quarantinePlatformForRuntime,
   quarantineSuitesForPlatform,
   validateQuarantineCaseInventory,
   validateQuarantineRegistry,
@@ -148,12 +149,6 @@ function runSuite(
   if (result.status !== 0) process.exitCode = result.status ?? 1;
 }
 
-function runtimeQuarantinePlatform(): QuarantinePlatform | null {
-  if (process.platform === "linux") return "linux";
-  if (process.platform === "win32") return "windows";
-  return null;
-}
-
 function runVitestList(
   webRoot: string,
   vitestCli: string,
@@ -182,14 +177,7 @@ function runVitestList(
 
 function collectQuarantineInventory(
   repositoryRoot: string,
-  platform: QuarantinePlatform,
 ): readonly QuarantineTestInventoryItem[] {
-  const runtimePlatform = runtimeQuarantinePlatform();
-  if (runtimePlatform !== platform) {
-    throw new Error(
-      `Quarantine inventory requested ${platform}, but this runner is ${runtimePlatform ?? process.platform}.`,
-    );
-  }
   const webRoot = resolve(repositoryRoot, "apps/web");
   const vitestCli = resolve(repositoryRoot, "node_modules/vitest/vitest.mjs");
   const temporaryDirectory = createQuarantineInventoryTemporaryDirectory(repositoryRoot);
@@ -225,6 +213,14 @@ function main(): void {
   const args = parseArgs(process.argv.slice(2));
   const repositoryRoot = process.cwd();
   const registry = loadRegistry(repositoryRoot);
+  if (args.command === "inventory" || args.command === "run") {
+    const runtimePlatform = quarantinePlatformForRuntime(process.platform);
+    if (runtimePlatform !== args.platform) {
+      throw new Error(
+        `Quarantine ${args.command} requested ${args.platform}, but this runner is ${runtimePlatform ?? process.platform}.`,
+      );
+    }
+  }
   if (args.command === "validate") {
     console.log(
       `Quarantine registry validation passed for ${registry.entries.length} registered group(s).`,
@@ -232,7 +228,7 @@ function main(): void {
     return;
   }
   if (args.command === "inventory") {
-    const inventory = collectQuarantineInventory(repositoryRoot, args.platform!);
+    const inventory = collectQuarantineInventory(repositoryRoot);
     const errors = validateQuarantineCaseInventory(registry, inventory);
     if (errors.length > 0) {
       throw new Error(`Quarantine case inventory validation failed:\n- ${errors.join("\n- ")}`);

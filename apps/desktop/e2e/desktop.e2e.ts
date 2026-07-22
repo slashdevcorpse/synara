@@ -38,11 +38,8 @@ async function addAndSelectProject(
     invalidProjectPathInput.waitFor({ state: "attached", timeout: 60_000 }).then(async () => ({
       state: "failed" as const,
       error:
-        (await invalidProjectPathInput
-          .locator(
-            "xpath=ancestor::div[contains(concat(' ', normalize-space(@class), ' '), ' mb-2.5 ')][1]//p[1]",
-          )
-          .textContent()) ?? "Project creation failed without an error message.",
+        (await page.getByTestId("add-project-error").textContent()) ??
+        "Project creation failed without an error message.",
     })),
   ]);
   if (projectSubmission.state === "failed") {

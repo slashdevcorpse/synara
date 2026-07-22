@@ -14,6 +14,7 @@ import {
   parseVitestQuarantineInventory,
   QUARANTINE_PLATFORMS,
   quarantineInventoryFileBatches,
+  quarantinePlatformForRuntime,
   quarantineTestNamePattern,
   quarantineSuitesForPlatform,
   validateQuarantineCaseInventory,
@@ -22,6 +23,14 @@ import {
 
 const roots: string[] = [];
 const quarantineMarker = (id: string) => `[quarantine:${id}]`;
+
+describe("quarantine runtime platform mapping", () => {
+  it("maps supported runners and rejects unsupported runners", () => {
+    expect(quarantinePlatformForRuntime("linux")).toBe("linux");
+    expect(quarantinePlatformForRuntime("win32")).toBe("windows");
+    expect(quarantinePlatformForRuntime("darwin")).toBeNull();
+  });
+});
 
 function fixture(): { readonly root: string; readonly source: string } {
   const root = mkdtempSync(resolve(tmpdir(), "synara-quarantine-"));

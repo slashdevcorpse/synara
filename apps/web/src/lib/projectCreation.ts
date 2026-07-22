@@ -98,22 +98,27 @@ export async function createOrRecoverProjectFromPath(input: {
     // The command can commit immediately before its WebSocket response is interrupted.
     // Resolve that uncertain outcome by observing the exact intended id; never replay the
     // mutation, and preserve the original failure when no committed row appears.
-    const committed = await waitForRecoverableProjectInReadModel({
-      projectId,
-      loadSnapshot: input.loadSnapshot,
-      maxAttempts,
-      delayMs,
-    });
-    if (committed.project && committed.snapshot) {
-      return {
+    const dispatchError = error instanceof Error ? error : new Error(description, { cause: error });
+    try {
+      const committed = await waitForRecoverableProjectInReadModel({
         projectId,
-        project: committed.project,
-        snapshot: committed.snapshot,
-        created: true,
-        restored: false,
-      };
+        loadSnapshot: input.loadSnapshot,
+        maxAttempts,
+        delayMs,
+      });
+      if (committed.project && committed.snapshot) {
+        return {
+          projectId,
+          project: committed.project,
+          snapshot: committed.snapshot,
+          created: true,
+          restored: false,
+        };
+      }
+    } catch {
+      throw dispatchError;
     }
-    throw error instanceof Error ? error : new Error(description, { cause: error });
+    throw dispatchError;
   }
 
   if (isArchivedProjectCreateError(description)) {

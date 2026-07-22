@@ -209,6 +209,30 @@ describe("createOrRecoverProjectFromPath", () => {
     expect(loadSnapshot).toHaveBeenCalledOnce();
   });
 
+  it("preserves an unclassified create failure when the recovery snapshot read fails", async () => {
+    const dispatchFailure = new Error("Project creation response was interrupted.");
+    const snapshotFailure = new Error("Snapshot read failed.");
+    const dispatchCommand = vi.fn(async () => {
+      throw dispatchFailure;
+    });
+    const loadSnapshot = vi.fn(async () => {
+      throw snapshotFailure;
+    });
+
+    await expect(
+      createOrRecoverProjectFromPath({
+        api: makeApi(dispatchCommand),
+        workspaceRoot: WORKSPACE_ROOT,
+        loadSnapshot,
+        maxAttempts: 1,
+        delayMs: 0,
+      }),
+    ).rejects.toBe(dispatchFailure);
+
+    expect(dispatchCommand).toHaveBeenCalledOnce();
+    expect(loadSnapshot).toHaveBeenCalledOnce();
+  });
+
   it("recovers the existing project when project.create reports a duplicate workspace root", async () => {
     const existingProject = makeProject("project-existing");
     const dispatchCommand = vi.fn(async () => {

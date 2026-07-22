@@ -45,6 +45,7 @@ import { IoFilter } from "react-icons/io5";
 import {
   useCallback,
   useEffect,
+  useId,
   lazy,
   startTransition,
   useMemo,
@@ -1473,6 +1474,7 @@ export default function Sidebar() {
   const [showManualPathInput, setShowManualPathInput] = useState(false);
   const [isAddingProject, setIsAddingProject] = useState(false);
   const [addProjectError, setAddProjectError] = useState<string | null>(null);
+  const addProjectErrorId = useId();
   const addProjectErrorMeaning = useMemo(
     () => (addProjectError ? describeAddProjectError(addProjectError) : null),
     [addProjectError],
@@ -6008,6 +6010,7 @@ export default function Sidebar() {
                             spellCheck={false}
                             autoCorrect="off"
                             autoCapitalize="off"
+                            aria-describedby={addProjectError ? addProjectErrorId : undefined}
                             aria-invalid={addProjectError ? true : undefined}
                             aria-label="Project path"
                             className="[&>[data-slot=input]]:pe-9"
@@ -6038,7 +6041,14 @@ export default function Sidebar() {
                       )}
                       {addProjectError && (
                         <div className="mt-1 space-y-1 px-0.5">
-                          <p className="text-xs leading-tight text-red-400">{addProjectError}</p>
+                          <p
+                            id={addProjectErrorId}
+                            role="alert"
+                            data-testid="add-project-error"
+                            className="text-xs leading-tight text-red-400"
+                          >
+                            {addProjectError}
+                          </p>
                           {addProjectErrorMeaning && (
                             <p className="text-xs leading-tight text-muted-foreground/70">
                               {addProjectErrorMeaning}

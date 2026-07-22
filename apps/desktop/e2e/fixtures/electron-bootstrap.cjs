@@ -80,8 +80,8 @@ function installChromiumNetworkGuard(partition, guardedSession) {
 }
 
 // Electron does not load NODE_OPTIONS into its browser process. Require the guard
-// here for desktop-main, then restore NODE_OPTIONS before production main code
-// derives the environment for its ELECTRON_RUN_AS_NODE backend child.
+// here for desktop-main, and retain the same require hook so its
+// ELECTRON_RUN_AS_NODE backend child installs the guard before production code.
 const nodeRequirePath =
   process.platform === "win32" ? networkGuardPath.replaceAll("\\", "/") : networkGuardPath;
 process.env.NODE_OPTIONS = `--require="${nodeRequirePath.replaceAll('"', '\\"')}"`;

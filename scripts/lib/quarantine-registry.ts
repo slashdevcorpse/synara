@@ -16,6 +16,12 @@ type UnknownRecord = Record<string, unknown>;
 export const QUARANTINE_PLATFORMS = ["linux", "windows"] as const;
 export type QuarantinePlatform = (typeof QUARANTINE_PLATFORMS)[number];
 
+export function quarantinePlatformForRuntime(platform: NodeJS.Platform): QuarantinePlatform | null {
+  if (platform === "linux") return "linux";
+  if (platform === "win32") return "windows";
+  return null;
+}
+
 export interface QuarantineEntry {
   readonly id: string;
   readonly path: string;

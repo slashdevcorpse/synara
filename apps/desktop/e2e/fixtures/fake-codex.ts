@@ -5,6 +5,7 @@ import * as FS from "node:fs";
 import * as Path from "node:path";
 import * as Readline from "node:readline";
 import { spawnSync } from "node:child_process";
+import { once } from "node:events";
 import "./network-guard.cjs";
 
 type JsonRecord = Record<string, unknown>;
@@ -108,7 +109,7 @@ function argumentValue(name: string): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
 }
 
-function runTextGeneration(): void {
+async function runTextGeneration(): Promise<void> {
   const schemaPath = argumentValue("--output-schema");
   const outputPath = argumentValue("--output-last-message");
   if (!schemaPath || !outputPath) {
@@ -121,7 +122,9 @@ function runTextGeneration(): void {
     throw new Error("Fake Codex text generation only supports the thread-title schema.");
   }
   appendProtocolLog("fixture", { event: "text-generation-awaiting-stdin" });
-  FS.readFileSync(0, "utf8");
+  const stdinEnd = once(process.stdin, "end");
+  process.stdin.resume();
+  await stdinEnd;
   appendProtocolLog("fixture", { event: "text-generation-stdin-complete" });
   FS.writeFileSync(outputPath, JSON.stringify({ title: "E2E Test Thread" }), "utf8");
   appendProtocolLog("fixture", { event: "text-generation-output-written" });
@@ -513,8 +516,14 @@ if (args.length === 1 && args[0] === "--version") {
 } else if (args[0] === "login" && args[1] === "status") {
   writeStdoutAndExit("Logged in\n");
 } else if (args[0] === "exec") {
-  runTextGeneration();
-  process.exit(0);
+  void runTextGeneration().then(
+    () => process.exit(0),
+    (error: unknown) => {
+      const description = error instanceof Error ? (error.stack ?? error.message) : String(error);
+      process.stderr.write(`${description}\n`);
+      process.exit(1);
+    },
+  );
 } else if (args.includes("app-server")) {
   startAppServer();
 } else {

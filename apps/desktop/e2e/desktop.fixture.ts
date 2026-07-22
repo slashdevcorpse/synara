@@ -960,7 +960,8 @@ export class DesktopHarness {
             ? (entry.runtime as { bun?: unknown; executable?: unknown })
             : null;
         return typeof entry.pid === "number" &&
-          (runtime?.bun !== false ||
+          (runtime === null ||
+            runtime.bun !== false ||
             typeof runtime.executable !== "string" ||
             !/^node(?:\.exe)?$/iu.test(Path.basename(runtime.executable)))
           ? [entry.pid]

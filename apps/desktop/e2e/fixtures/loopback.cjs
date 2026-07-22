@@ -18,9 +18,10 @@ function isLoopbackHost(host) {
   if (normalized === "localhost") return true;
   if (Net.isIP(normalized) === 4) return Number(normalized.split(".", 1)[0]) === 127;
   if (Net.isIP(normalized) !== 6) return false;
-  if (normalized === "::1" || normalized === "0:0:0:0:0:0:0:1") return true;
-  const mappedIpv4 = normalized.startsWith("::ffff:") ? normalized.slice("::ffff:".length) : "";
-  return Net.isIP(mappedIpv4) === 4 && Number(mappedIpv4.split(".", 1)[0]) === 127;
+  const canonical = new URL(`http://[${normalized}]/`).hostname.slice(1, -1);
+  if (canonical === "::1") return true;
+  const mappedIpv4 = /^::ffff:([\da-f]{1,4}):([\da-f]{1,4})$/u.exec(canonical);
+  return mappedIpv4 !== null && Number.parseInt(mappedIpv4[1], 16) >> 8 === 127;
 }
 
 module.exports = { isLoopbackHost, normalizeHost };

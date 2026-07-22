@@ -317,7 +317,11 @@ describe("desktop fixture loopback policy", () => {
       "127.0.0.1",
       "127.42.0.9",
       "::1",
+      "0000:0000:0000:0000:0000:0000:0000:0001",
+      "0:0::1",
+      "::0:1",
       "::ffff:127.0.0.1",
+      "0:0:0:0:0:ffff:127.42.0.9",
     ]) {
       expect(isLoopbackHost(host)).toBe(true);
     }
