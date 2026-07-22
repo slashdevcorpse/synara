@@ -1,12 +1,12 @@
 import { EventEmitter } from "node:events";
 import type { ChildProcess } from "node:child_process";
-import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import type { WindowsSafeProcessCommand } from "@synara/shared/windowsProcess";
 import { Deferred, Effect } from "effect";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   finalizeSynchronousWindowsJobExit,
@@ -30,6 +30,8 @@ import {
   windowsJobControlFilePath,
 } from "./windowsProviderProcess.ts";
 
+const windowsJobFixtureControlPaths = new Set<string>();
+
 function jobPreparedCommand(controlDirectory = "C:\\Temp"): WindowsJobPreparedCommand {
   const prepared = containPreparedWindowsProviderProcess(
     { command: "C:\\tools\\provider.exe", args: [], shell: false, windowsHide: true },
@@ -45,12 +47,27 @@ function jobPreparedCommand(controlDirectory = "C:\\Temp"): WindowsJobPreparedCo
   if (!isWindowsJobPreparedCommand(prepared)) {
     throw new Error("Expected the Windows fixture command to be Job-prepared.");
   }
+  windowsJobFixtureControlPaths.add(windowsJobControlFilePath(prepared));
   return prepared;
 }
 
 function posixPreparedCommand(): WindowsSafeProcessCommand {
   return { command: "/usr/local/bin/provider", args: [], shell: false };
 }
+
+async function cleanupWindowsJobFixtureArtifacts(): Promise<void> {
+  const fixturePaths = [...windowsJobFixtureControlPaths];
+  windowsJobFixtureControlPaths.clear();
+  await Promise.all(
+    fixturePaths.flatMap((controlFilePath) =>
+      [controlFilePath, `${controlFilePath}.drained`, `${controlFilePath}.drained.tmp`].map(
+        (path) => rm(path, { force: true, recursive: true }),
+      ),
+    ),
+  );
+}
+
+afterEach(cleanupWindowsJobFixtureArtifacts);
 
 type MutableChildProcess = ChildProcess & { exitCode: number | null };
 
@@ -615,7 +632,12 @@ describe("Windows Job exact-handle supervision", () => {
     const controlDirectory = await mkdtemp(join(tmpdir(), "synara-job-proof-"));
     try {
       const prepared = jobPreparedCommand(controlDirectory);
-      await writeFile(`${windowsJobControlFilePath(prepared)}.drained`, "drained\nspoof", "utf8");
+      const controlFilePath = windowsJobControlFilePath(prepared);
+      await Promise.all([
+        writeFile(controlFilePath, "stop\n", "utf8"),
+        writeFile(`${controlFilePath}.drained`, "drained\nspoof", "utf8"),
+        writeFile(`${controlFilePath}.drained.tmp`, "partial", "utf8"),
+      ]);
       const supervisor = superviseWindowsJobEffectProcess(prepared, {
         pid: 22,
         exitCode: Effect.succeed(0),
@@ -626,6 +648,53 @@ describe("Windows Job exact-handle supervision", () => {
       await expect(supervisor.proveExit()).rejects.toThrow(
         "Invalid Windows Job drain acknowledgement",
       );
+      await expect(access(controlFilePath)).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(access(`${controlFilePath}.drained`)).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(access(`${controlFilePath}.drained.tmp`)).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+    } finally {
+      await rm(controlDirectory, { force: true, recursive: true });
+    }
+  });
+
+  it("preserves a tampered proof failure when artifact cleanup also fails", async () => {
+    const controlDirectory = await mkdtemp(join(tmpdir(), "synara-job-proof-"));
+    try {
+      const prepared = jobPreparedCommand(controlDirectory);
+      const controlFilePath = windowsJobControlFilePath(prepared);
+      const acknowledgementPath = `${controlFilePath}.drained`;
+      const temporaryAcknowledgementPath = `${acknowledgementPath}.tmp`;
+      await writeFile(acknowledgementPath, "tampered", "utf8");
+      await mkdir(temporaryAcknowledgementPath);
+      const supervisor = superviseWindowsJobEffectProcess(prepared, {
+        pid: 27,
+        exitCode: Effect.succeed(0),
+        isRunning: Effect.succeed(false),
+        synaraTerminateExact: () => true,
+      });
+
+      let failure: unknown;
+      try {
+        await supervisor.proveExit();
+      } catch (cause) {
+        failure = cause;
+      }
+
+      expect(failure).toBeInstanceOf(WindowsJobProcessExitUnprovenError);
+      const proofFailure = (failure as WindowsJobProcessExitUnprovenError).cause;
+      expect(proofFailure).toBeInstanceOf(AggregateError);
+      const aggregateFailure = proofFailure as AggregateError;
+      expect(aggregateFailure.errors).toHaveLength(2);
+      expect(aggregateFailure.errors[0]).toMatchObject({
+        message: expect.stringContaining("Invalid Windows Job drain acknowledgement"),
+      });
+      expect(["EISDIR", "EPERM"]).toContain(
+        (aggregateFailure.errors[1] as NodeJS.ErrnoException).code,
+      );
+      await expect(access(controlFilePath)).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(access(acknowledgementPath)).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(access(temporaryAcknowledgementPath)).resolves.toBeUndefined();
     } finally {
       await rm(controlDirectory, { force: true, recursive: true });
     }

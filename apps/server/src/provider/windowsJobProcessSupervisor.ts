@@ -176,12 +176,29 @@ async function removeFileIfPresent(path: string): Promise<void> {
 
 async function verifyWindowsJobDrain(controlFilePath: string): Promise<void> {
   const acknowledgementPath = `${controlFilePath}.drained`;
-  const acknowledgement = await readFile(acknowledgementPath, "utf8");
-  if (acknowledgement !== "drained\n") {
-    throw new Error(`Invalid Windows Job drain acknowledgement at ${acknowledgementPath}.`);
+  let proofFailure: unknown;
+  try {
+    const acknowledgement = await readFile(acknowledgementPath, "utf8");
+    if (acknowledgement !== "drained\n") {
+      throw new Error(`Invalid Windows Job drain acknowledgement at ${acknowledgementPath}.`);
+    }
+  } catch (cause) {
+    proofFailure = cause;
   }
-  await removeFileIfPresent(controlFilePath);
-  await unlink(acknowledgementPath);
+
+  const cleanupFailures: unknown[] = [];
+  for (const path of [controlFilePath, acknowledgementPath, `${acknowledgementPath}.tmp`]) {
+    try {
+      await removeFileIfPresent(path);
+    } catch (cause) {
+      cleanupFailures.push(cause);
+    }
+  }
+  const failures = [...(proofFailure === undefined ? [] : [proofFailure]), ...cleanupFailures];
+  if (failures.length === 1) throw failures[0];
+  if (failures.length > 1) {
+    throw new AggregateError(failures, "Windows Job drain proof finalization failed.");
+  }
 }
 
 async function bestEffortCleanupCompromisedProof(controlFilePath: string): Promise<void> {
