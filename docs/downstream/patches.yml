@@ -1968,5 +1968,34 @@
             },
           ],
       },
+      {
+        "id": "windows-nsis-upgrade-time-budget",
+        "purpose": "Give real Windows NSIS install and in-place upgrade work a dedicated bounded runtime while preserving a shorter cleanup budget for standalone uninstall commands.",
+        "userVisibleConsequence": "Windows prerelease upgrades can finish on slower hosted disks without being mistaken for a hang at three minutes, while genuine stalls still fail closed with phase and elapsed-time diagnostics.",
+        "owner": "slashdevcorpse",
+        "status": "downstream-only",
+        "upstreamSourceCommit": null,
+        "introducingCommit": "25ba85822a64f72a6cb02142b572efe85f66a4ee",
+        "touchedFiles":
+          [
+            "scripts/lib/windows-installer-qualification.test.ts",
+            "scripts/lib/windows-installer-qualification.ts",
+          ],
+        "subsystems": ["windows", "nsis", "installer", "upgrade", "release"],
+        "regressionTests": ["scripts/lib/windows-installer-qualification.test.ts"],
+        "upstreamLinks": ["https://github.com/slashdevcorpse/synara/issues/11"],
+        "overlapResolutionPolicy": "Keep install and in-place upgrade execution fail closed with the explicit ten-minute NSIS budget and phase, elapsed, and timeout diagnostics. Keep standalone uninstall commands at three minutes so the 45-minute Windows release lane retains bounded cleanup capacity; never accept a timeout as successful installation or bypass previous-release upgrade qualification.",
+        "lastAssessedUpstreamSha": "1664ce2f152cd6131a30d1ee8d7c9b60235bb0fe",
+        "verificationDate": "2026-07-22",
+        "retirementCondition": "Retire after the canonical Windows release pipeline supplies equivalent bounded, diagnostic-rich previous-version NSIS upgrade qualification across hosted-runner storage variability.",
+        "statusHistory":
+          [
+            {
+              "status": "downstream-only",
+              "date": "2026-07-22",
+              "evidence": "Release run 29897248938 proved the first real previous-version upgrade still had a live NSIS parent at the generic 180000ms bound; 25ba85822a64f72a6cb02142b572efe85f66a4ee adds a dedicated 600000ms install and upgrade budget with explicit phase and elapsed diagnostics while preserving fail-closed cleanup",
+            },
+          ],
+      },
     ],
 }
