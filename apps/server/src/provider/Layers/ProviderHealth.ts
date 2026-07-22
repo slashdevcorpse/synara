@@ -655,7 +655,8 @@ export function makeClaudeSubscriptionProbe(
       owner.query = query;
       const init = await initializationBeforeTimeout(query.initializationResult(), timeoutMs);
       assertOwnerActive();
-      result = { subscriptionType: init.account?.subscriptionType };
+      const subscriptionType = init.account?.subscriptionType;
+      result = subscriptionType === undefined ? {} : { subscriptionType };
     } catch (cause) {
       probeFailure = cause;
     }
@@ -2594,7 +2595,7 @@ export function makeProviderHealthLive(options?: ProviderHealthLiveOptions) {
         capacity: 1,
         timeToLive: Duration.minutes(5),
         lookup: (_: "claude") =>
-          claudeSubscriptionProbe.probe().pipe(Effect.catchAll(() => Effect.succeed(undefined))),
+          claudeSubscriptionProbe.probe().pipe(Effect.orElseSucceed(() => undefined)),
       });
       const resolveClaudeSubscription = Cache.get(claudeSubscriptionCache, "claude").pipe(
         Effect.map((probe) => probe?.subscriptionType),

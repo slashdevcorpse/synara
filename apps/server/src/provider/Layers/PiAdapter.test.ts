@@ -25,6 +25,7 @@ import {
   makePiRuntimeEventBase,
   makePiStartupProcessOwner,
   makePiUserInputOptions,
+  type PiBashProcessSupervisorOptions,
   PLAIN_PI_EXTENSION_THEME,
   retryRetainedPiStartupOwner,
 } from "./PiAdapter";
@@ -153,7 +154,9 @@ describe("Pi Bash process supervision", () => {
       stdout: new PassThrough(),
       stderr: new PassThrough(),
     }) as unknown as ChildProcess;
-    const spawnProcess = vi.fn(() => child);
+    const spawnProcess = vi.fn<NonNullable<PiBashProcessSupervisorOptions["spawnProcess"]>>(
+      () => child,
+    );
     const teardownPosixProcessGroup = vi.fn(async () => undefined);
     const supervisor = makePiBashProcessSupervisor({
       platform: "linux",
@@ -507,6 +510,7 @@ describe("Pi Bash process supervision", () => {
       .mockRejectedValueOnce(new Error("prior Pi tree remains unproven"))
       .mockResolvedValueOnce({ escalated: false, signalErrors: [] });
     const supervisor = makePiBashProcessSupervisor({
+      platform: "win32",
       getShellConfig: () =>
         process.platform === "win32"
           ? {

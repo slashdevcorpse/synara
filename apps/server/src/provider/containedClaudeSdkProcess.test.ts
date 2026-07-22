@@ -4,6 +4,7 @@ import { EventEmitter } from "node:events";
 import type { SpawnOptions as ClaudeSpawnOptions } from "@anthropic-ai/claude-agent-sdk";
 
 import {
+  type ClaudeNodeProcessSpawner,
   protectContainedClaudeSdkProcessTermination,
   spawnContainedClaudeSdkProcess,
   teardownContainedClaudeSdkProcess,
@@ -31,7 +32,7 @@ describe("spawnContainedClaudeSdkProcess", () => {
       windowsVerbatimArguments: true as const,
       containment: "windows-job-object" as const,
     }));
-    const spawnProcess = vi.fn(() => child);
+    const spawnProcess = vi.fn<ClaudeNodeProcessSpawner>(() => child);
     const options = {
       command: "C:\\tools\\claude.exe",
       args: ["--version"],

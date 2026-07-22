@@ -10,7 +10,7 @@ import {
 
 import type { SpawnOptions as ClaudeSpawnOptions } from "@anthropic-ai/claude-agent-sdk";
 
-import { teardownChildProcessTree } from "./supervisedProcessTeardown.ts";
+import { teardownChildProcessTree, type ProcessExitHandle } from "./supervisedProcessTeardown.ts";
 import {
   markWindowsProviderProcessSpawn,
   prepareWindowsProviderProcess,
@@ -45,7 +45,7 @@ const containedClaudeSdkProcessTermination = new WeakMap<
  * then released so the owning lifecycle can retry a transient termination failure.
  */
 export function teardownContainedClaudeSdkProcess(
-  process: ChildProcess,
+  process: ProcessExitHandle,
   teardown: ClaudeProcessTeardown = () => teardownChildProcessTree(process),
 ): Promise<unknown> {
   const state = containedClaudeSdkProcessTermination.get(process);

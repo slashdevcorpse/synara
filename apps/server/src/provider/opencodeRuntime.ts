@@ -110,7 +110,7 @@ interface PooledOpenCodeServer {
   readonly closeOnRelease: boolean;
   exited: boolean;
   refCount: number;
-  idleCloseFiber: Fiber.Fiber<void, never> | null;
+  idleCloseFiber: Fiber.Fiber<void, OpenCodeRuntimeError> | null;
   exitWatchFiber: Fiber.Fiber<void, never> | null;
 }
 
@@ -1355,6 +1355,7 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
             }),
           ),
         ),
+        Effect.tapError(Effect.logError),
         Effect.forkIn(pooledServerScope),
       );
       pooledServer.idleCloseFiber = idleCloseFiber;
@@ -1506,7 +1507,10 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
           }
 
           const pooledServer = acquiredExit.value;
-          yield* Scope.addFinalizer(callerScope, releasePooledServer(pooledServer));
+          yield* Scope.addFinalizer(
+            callerScope,
+            releasePooledServer(pooledServer).pipe(Effect.orDie),
+          );
           return pooledServer;
         }),
       );

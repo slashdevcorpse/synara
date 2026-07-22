@@ -3,6 +3,7 @@ import { performance } from "node:perf_hooks";
 import {
   defaultProcessTreeKiller,
   type CapturedProcess,
+  type CapturedProcessTree,
   type CapturedProcessTreeInspection,
   type ProcessTreeKiller,
   type ProcessTreeDescendantExitProof,
@@ -299,13 +300,13 @@ export async function teardownProviderProcessTree(
     failUncapturedExit();
   }
 
-  const capturedTree =
+  const capturedTree: CapturedProcessTree =
     input.descendantExitProof === "windows-job-empty-on-exit"
-      ? ({
+      ? {
           descendants: [],
           captureComplete: true,
           descendantExitProof: "root-tree-signal",
-        } as const)
+        }
       : await deps.processTreeKiller.capture(input.rootPid);
 
   // Process exit notifications can arrive on a later event-loop phase than process-table capture.

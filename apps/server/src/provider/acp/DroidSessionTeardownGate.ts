@@ -112,7 +112,7 @@ export const failAcpStartupCauseAfterCleanup = <E>(input: {
 }): Effect.Effect<never, E | ProviderAdapterProcessError> =>
   Effect.uninterruptible(
     Effect.exit(input.owner.cleanup).pipe(
-      Effect.flatMap((cleanupExit) => {
+      Effect.flatMap((cleanupExit): Effect.Effect<never, E | ProviderAdapterProcessError> => {
         if (Exit.isSuccess(cleanupExit)) {
           return Effect.failCause(input.startupCause);
         }

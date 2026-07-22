@@ -549,7 +549,7 @@ export function makeDroidAdapter(
         readonly reason?: string;
         readonly awaitTermination?: boolean;
       },
-    ) =>
+    ): Effect.Effect<void, ProviderAdapterProcessError> =>
       Effect.uninterruptibleMask((restore) =>
         Effect.gen(function* () {
           if (!ctx.stopped) {
@@ -1385,7 +1385,11 @@ export function makeDroidAdapter(
     // is alive but has gone completely silent. Mirrors the prompt-fiber
     // onFailure branch and stays idempotent via clearAcpActiveTurn, so it is a
     // no-op if the turn settled normally first (whichever fires first wins).
-    const failDroidTurnAsTimedOut = (ctx: DroidSessionContext, turnId: TurnId, idleMs: number) =>
+    const failDroidTurnAsTimedOut = (
+      ctx: DroidSessionContext,
+      turnId: TurnId,
+      idleMs: number,
+    ): Effect.Effect<void, ProviderAdapterProcessError> =>
       Effect.gen(function* () {
         const promptFiber = ctx.activePromptFiber;
         if (!clearAcpActiveTurn(ctx, turnId)) {
@@ -1456,7 +1460,7 @@ export function makeDroidAdapter(
     const startDroidTurn = (
       ctx: DroidSessionContext,
       input: Parameters<DroidAdapterShape["sendTurn"]>[0],
-    ) =>
+    ): ReturnType<DroidAdapterShape["sendTurn"]> =>
       Effect.gen(function* () {
         // Startup registers the session before its config RPCs settle; a turn
         // routed in during that window must not prompt with provider defaults.
@@ -1514,7 +1518,7 @@ export function makeDroidAdapter(
             stopSessionInternal(ctx, {
               exitKind: "error",
               reason: Cause.pretty(cause),
-            }),
+            }).pipe(Effect.orDie),
           ),
         );
         const promptParts: Array<EffectAcpSchema.ContentBlock> = [];
@@ -1756,7 +1760,8 @@ export function makeDroidAdapter(
           touchActivity: () => {
             ctx.lastTurnActivityAt = Date.now();
           },
-          onIdleTimeout: (idleMs) => failDroidTurnAsTimedOut(ctx, turnId, idleMs),
+          onIdleTimeout: (idleMs) =>
+            failDroidTurnAsTimedOut(ctx, turnId, idleMs).pipe(Effect.orDie),
         });
 
         return {

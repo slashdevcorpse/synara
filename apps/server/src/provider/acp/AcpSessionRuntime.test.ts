@@ -18,7 +18,10 @@ import {
   sessionConfigOptionsFromSetup,
   teardownAcpChildProcess,
 } from "./AcpSessionRuntime.ts";
-import { teardownProviderProcessTree } from "../supervisedProcessTeardown.ts";
+import {
+  type SupervisedProcessTeardownResult,
+  teardownProviderProcessTree,
+} from "../supervisedProcessTeardown.ts";
 import { markWindowsProviderProcessSpawn } from "../windowsProviderProcess.ts";
 
 describe("makeAcpIncomingFrameGuard", () => {
@@ -64,12 +67,7 @@ describe("teardownAcpChildProcess", () => {
       }
     };
     const teardownPids: number[] = [];
-    let capturedTeardown:
-      | Effect.Effect<{
-          readonly escalated: boolean;
-          readonly signalErrors: Error[];
-        }>
-      | undefined;
+    let capturedTeardown: Effect.Effect<SupervisedProcessTeardownResult> | undefined;
     const childExited = Deferred.makeUnsafe<ChildProcessSpawner.ExitCode>();
     const child = ChildProcessSpawner.makeHandle({
       pid: ChildProcessSpawner.ProcessId(childPid),

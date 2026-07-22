@@ -2,6 +2,7 @@ import { ThreadId } from "@synara/contracts";
 import { Cause, Deferred, Effect, Fiber, Scope } from "effect";
 import { describe, expect, it } from "vitest";
 
+import { ProviderAdapterProcessError } from "../Errors.ts";
 import {
   cleanupAllAcpOwners,
   closeAcpSessionAfterProcessTeardown,
@@ -100,27 +101,37 @@ describe("DroidSessionTeardownGate", () => {
 
   it("attempts every ACP owner cleanup before aggregating failures", async () => {
     const attempts: string[] = [];
-    const failureOne = new Error("owner one failed");
-    const failureThree = new Error("owner three failed");
+    const failureOne = new ProviderAdapterProcessError({
+      provider: "droid",
+      threadId: "thread-1",
+      detail: "owner one failed",
+    });
+    const failureThree = new ProviderAdapterProcessError({
+      provider: "droid",
+      threadId: "thread-3",
+      detail: "owner three failed",
+    });
     const cleanup = cleanupAllAcpOwners({
       provider: "droid",
       providerLabel: "Droid",
       owners: [
         {
           threadId: ThreadId.makeUnsafe("thread-1"),
-          cleanup: Effect.sync(() => attempts.push("thread-1")).pipe(
-            Effect.andThen(Effect.fail(failureOne)),
-          ),
+          cleanup: Effect.sync(() => {
+            attempts.push("thread-1");
+          }).pipe(Effect.andThen(Effect.fail(failureOne))),
         },
         {
           threadId: ThreadId.makeUnsafe("thread-2"),
-          cleanup: Effect.sync(() => attempts.push("thread-2")),
+          cleanup: Effect.sync(() => {
+            attempts.push("thread-2");
+          }),
         },
         {
           threadId: ThreadId.makeUnsafe("thread-3"),
-          cleanup: Effect.sync(() => attempts.push("thread-3")).pipe(
-            Effect.andThen(Effect.fail(failureThree)),
-          ),
+          cleanup: Effect.sync(() => {
+            attempts.push("thread-3");
+          }).pipe(Effect.andThen(Effect.fail(failureThree))),
         },
       ],
     });

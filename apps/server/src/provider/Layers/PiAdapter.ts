@@ -150,16 +150,20 @@ export function makePiBashProcessSupervisor(
   const startTeardown = (active: PiActiveProcess): Promise<void> => {
     active.cleanupRequested = true;
     if (active.teardown === undefined) {
-      const cleanup = Promise.resolve().then(() =>
-        platform !== "win32" &&
-        !isWindowsJobContainedProviderProcess(active.child) &&
-        (options.teardownPosixProcessGroup !== undefined ||
-          options.teardownProcessTree === undefined)
-          ? (options.teardownPosixProcessGroup ?? teardownPiPosixProcessGroup)(
-              Number(active.child.pid),
-            )
-          : teardownChildProcessTree(active.child, teardownProcessTree),
-      );
+      const cleanup = Promise.resolve().then(async () => {
+        if (
+          platform !== "win32" &&
+          !isWindowsJobContainedProviderProcess(active.child) &&
+          (options.teardownPosixProcessGroup !== undefined ||
+            options.teardownProcessTree === undefined)
+        ) {
+          await (options.teardownPosixProcessGroup ?? teardownPiPosixProcessGroup)(
+            Number(active.child.pid),
+          );
+          return;
+        }
+        await teardownChildProcessTree(active.child, teardownProcessTree);
+      });
       active.teardown = cleanup.then(
         () => {
           active.cleanupProven = true;

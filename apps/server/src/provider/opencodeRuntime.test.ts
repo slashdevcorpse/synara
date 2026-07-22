@@ -223,7 +223,7 @@ describe("OpenCodeRuntime one-shot command ownership", () => {
     let receiptWritten = false;
     const layer = makeOpenCodeRuntimeLive({
       prepareProcess: (command, args, input) => {
-        requestedCompletionReceipt = input.completionReceipt;
+        requestedCompletionReceipt = input?.completionReceipt;
         return {
           command,
           args: [...args],

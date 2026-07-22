@@ -951,7 +951,10 @@ describe("teardownProviderProcessTree", () => {
       once: () => undefined,
       removeListener: () => undefined,
     };
-    const teardown = vi.fn(async () => ({ escalated: false, signalErrors: [] }));
+    const teardown = vi.fn(async (_input: Parameters<typeof teardownProviderProcessTree>[0]) => ({
+      escalated: false,
+      signalErrors: [],
+    }));
     markWindowsProviderProcessSpawn(
       markedChild,
       {

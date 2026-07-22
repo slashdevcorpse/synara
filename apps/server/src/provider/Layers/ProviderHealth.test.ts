@@ -1637,6 +1637,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
               command: "claude",
               args: [],
               env: {},
+              signal: new AbortController().signal,
             });
             return {
               initializationResult: async () => {
@@ -1721,6 +1722,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
             command: "claude",
             args: [],
             env: {},
+            signal: new AbortController().signal,
           };
           spawnClaudeCodeProcess(spawnOptions);
           invokeLateSpawn = () => spawnClaudeCodeProcess(spawnOptions);
@@ -1862,6 +1864,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
             command: "claude",
             args: [],
             env: {},
+            signal: new AbortController().signal,
           });
           return {
             initializationResult: async () => ({ account: { subscriptionType: "max" } }) as never,

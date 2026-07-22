@@ -11,6 +11,7 @@ import type {
   SDKControlGetContextUsageResponse,
   SDKMessage,
   SDKUserMessage,
+  SlashCommand,
 } from "@anthropic-ai/claude-agent-sdk";
 import {
   ApprovalRequestId,
@@ -144,9 +145,7 @@ class FakeClaudeQuery implements AsyncIterable<SDKMessage> {
     return this.contextUsageResponse;
   };
 
-  readonly supportedCommands = async (): Promise<
-    Array<{ name: string; description: string; argumentHint: string }>
-  > => {
+  supportedCommands = async (): Promise<SlashCommand[]> => {
     return [];
   };
 
@@ -3832,7 +3831,7 @@ await agent("Draft the spec", { label: "delta-agent", phase: "Two" });
         createQuery: (input) => {
           const query = new FakeClaudeQuery();
           const queryIndex = queries.length;
-          (query as { supportedCommands: () => Promise<Array<never>> }).supportedCommands =
+          query.supportedCommands =
             queryIndex === 0
               ? async () => {
                   throw new Error("command discovery failed");
@@ -3843,6 +3842,7 @@ await agent("Draft the spec", { label: "delta-agent", phase: "Two" });
             command: "claude",
             args: [],
             env: {},
+            signal: new AbortController().signal,
           });
           return query;
         },
@@ -3929,7 +3929,7 @@ await agent("Draft the spec", { label: "delta-agent", phase: "Two" });
       createQuery: (input) => {
         const query = new FakeClaudeQuery();
         const queryIndex = queries.length;
-        (query as { supportedCommands: () => Promise<Array<never>> }).supportedCommands =
+        query.supportedCommands =
           queryIndex === 0
             ? async () => {
                 throw new Error("initial command discovery failed");
@@ -3944,6 +3944,7 @@ await agent("Draft the spec", { label: "delta-agent", phase: "Two" });
           command: "claude",
           args: [],
           env: {},
+          signal: new AbortController().signal,
         });
         return query;
       },
@@ -4040,10 +4041,9 @@ await agent("Draft the spec", { label: "delta-agent", phase: "Two" });
       createQuery: (input) => {
         const query = new FakeClaudeQuery();
         if (queries.length === 0) {
-          (query as { supportedCommands: () => Promise<Array<never>> }).supportedCommands =
-            async () => {
-              throw new Error("command discovery failed");
-            };
+          query.supportedCommands = async () => {
+            throw new Error("command discovery failed");
+          };
         }
         queries.push(query);
         input.options.spawnClaudeCodeProcess?.({
