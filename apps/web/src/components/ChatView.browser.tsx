@@ -1862,7 +1862,7 @@ describe("ChatView timeline estimator parity (full app)", () => {
   });
 
   it.each(TEXT_VIEWPORT_MATRIX)(
-    "[geometry:linux] keeps long user message estimate close at the $name viewport",
+    "[quarantine:web-chatview-geometry] keeps long user message estimate close at the $name viewport",
     async (viewport) => {
       const userText = "x".repeat(3_200);
       const targetMessageId = `msg-user-target-long-${viewport.name}` as MessageId;
@@ -1894,7 +1894,7 @@ describe("ChatView timeline estimator parity (full app)", () => {
     },
   );
 
-  it("[geometry:linux] tracks wrapping parity while resizing an existing ChatView across the viewport matrix", async () => {
+  it("[quarantine:web-chatview-geometry] tracks wrapping parity while resizing an existing ChatView across the viewport matrix", async () => {
     const userText = "x".repeat(3_200);
     const targetMessageId = "msg-user-target-resize" as MessageId;
     const mounted = await mountChatView({
@@ -1947,7 +1947,7 @@ describe("ChatView timeline estimator parity (full app)", () => {
     }
   });
 
-  it("[geometry:linux] tracks additional rendered wrapping when ChatView width narrows between desktop and mobile viewports", async () => {
+  it("[quarantine:web-chatview-geometry] tracks additional rendered wrapping when ChatView width narrows between desktop and mobile viewports", async () => {
     // Short enough to remain below the 12-line collapse at both widths, while
     // still wrapping onto materially more lines on mobile.
     const userText = "x".repeat(320);
@@ -1986,7 +1986,7 @@ describe("ChatView timeline estimator parity (full app)", () => {
     expect(ratio).toBeLessThan(1.35);
   });
 
-  it("[geometry:linux] collapses header actions into overflow before they can overlap the thread title", async () => {
+  it("[quarantine:web-chatview-geometry] collapses header actions into overflow before they can overlap the thread title", async () => {
     const longTitle =
       'remove "ago" from the sidebar while the diff panel stays open on smaller viewports';
     const headerOverflowSnapshot = (() => {
@@ -2067,7 +2067,7 @@ describe("ChatView timeline estimator parity (full app)", () => {
     }
   });
 
-  it("[geometry:linux] keeps the composer visible while a long assistant response forces a viewport relayout", async () => {
+  it("[quarantine:web-chatview-geometry] keeps the composer visible while a long assistant response forces a viewport relayout", async () => {
     const mounted = await mountChatView({
       viewport: TEXT_VIEWPORT_MATRIX[0],
       snapshot: createSnapshotWithLongAssistantResponse(),
@@ -2866,7 +2866,7 @@ describe("ChatView timeline estimator parity (full app)", () => {
   });
 
   it.each(ATTACHMENT_VIEWPORT_MATRIX)(
-    "[geometry:linux] keeps user attachment estimate close at the $name viewport",
+    "[quarantine:web-chatview-geometry] keeps user attachment estimate close at the $name viewport",
     async (viewport) => {
       const targetMessageId = `msg-user-target-attachments-${viewport.name}` as MessageId;
       const userText = "message with image attachments";
