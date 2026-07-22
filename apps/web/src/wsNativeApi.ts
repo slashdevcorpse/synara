@@ -66,27 +66,42 @@ function installE2eRendererHarness(api: NativeApi, transport: WsTransport): void
       let lastError: unknown;
       for (let attempt = 0; attempt < 5; attempt += 1) {
         try {
+          const session = transport.getSessionSnapshot();
+          const assertSameOpenSession = (): void => {
+            const current = transport.getSessionSnapshot();
+            if (current.state !== "open" || current.generation !== session.generation) {
+              throw new Error(
+                "Desktop E2E renderer transport session changed during readiness probe.",
+              );
+            }
+          };
+          const requestOnSameSession = async <T>(request: () => Promise<T>): Promise<T> => {
+            assertSameOpenSession();
+            const result = await request();
+            assertSameOpenSession();
+            return result;
+          };
+
           // The desktop fixture invokes this only after the root UI has committed its initial
           // shell snapshot. Re-reading around the explicit provider refresh proves the current
-          // feature session can serve both orchestration and provider RPCs without changing any
-          // production retry behavior.
-          await api.orchestration.getShellSnapshot();
-          const refreshed = await api.server.refreshProviders();
-          const snapshot = await api.orchestration.getShellSnapshot();
+          // feature session can serve both orchestration and provider RPCs. The generation guards
+          // keep every request on that same feature session without changing production retries.
+          await requestOnSameSession(() => api.orchestration.getShellSnapshot());
+          const refreshed = await requestOnSameSession(() => api.server.refreshProviders());
+          await requestOnSameSession(() => api.orchestration.getShellSnapshot());
           const includesCodex = refreshed.providers.some(
             (provider) => provider.provider === "codex",
           );
-          if (transport.getState() === "open" && includesCodex) {
-            return {
-              snapshotSequence: snapshot.snapshotSequence,
-              providers: refreshed.providers,
-            };
+          if (!includesCodex) {
+            throw new Error("Desktop E2E provider refresh omitted the enabled Codex provider.");
           }
-          lastError = includesCodex
-            ? new Error(
-                "Desktop E2E renderer transport left the open state during readiness probe.",
-              )
-            : new Error("Desktop E2E provider refresh omitted the enabled Codex provider.");
+
+          await new Promise<void>((resolve) => setTimeout(resolve, 0));
+          const snapshot = await requestOnSameSession(() => api.orchestration.getShellSnapshot());
+          return {
+            snapshotSequence: snapshot.snapshotSequence,
+            providers: refreshed.providers,
+          };
         } catch (error) {
           lastError = error instanceof Error ? error : new Error(String(error));
         }
