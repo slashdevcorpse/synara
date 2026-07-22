@@ -51,6 +51,11 @@ import { resolveWsHttpUrl } from "./lib/wsHttpUrl";
 
 let instance: { api: NativeApi; transport: WsTransport } | null = null;
 
+// A failed feature stream waits 500 ms before reconnecting, then the first reconnect session
+// waits another 500 ms. Fifteen retry intervals leave 500 ms for handshake and scheduling jitter.
+const E2E_READINESS_MAX_ATTEMPTS = 16;
+const E2E_READINESS_RETRY_DELAY_MS = 100;
+
 function clearE2eRendererHarness(): void {
   if (typeof window !== "undefined") {
     delete window.__synaraE2e;
@@ -64,7 +69,7 @@ function installE2eRendererHarness(api: NativeApi, transport: WsTransport): void
   window.__synaraE2e = {
     probeReadiness: async () => {
       let lastError: unknown;
-      for (let attempt = 0; attempt < 5; attempt += 1) {
+      for (let attempt = 0; attempt < E2E_READINESS_MAX_ATTEMPTS; attempt += 1) {
         try {
           const session = transport.getSessionSnapshot();
           const assertSameOpenSession = (): void => {
@@ -105,8 +110,8 @@ function installE2eRendererHarness(api: NativeApi, transport: WsTransport): void
         } catch (error) {
           lastError = error instanceof Error ? error : new Error(String(error));
         }
-        if (attempt < 4) {
-          await new Promise<void>((resolve) => setTimeout(resolve, 100));
+        if (attempt < E2E_READINESS_MAX_ATTEMPTS - 1) {
+          await new Promise<void>((resolve) => setTimeout(resolve, E2E_READINESS_RETRY_DELAY_MS));
         }
       }
       throw lastError instanceof Error
