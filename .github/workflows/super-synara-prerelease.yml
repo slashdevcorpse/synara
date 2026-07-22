@@ -296,7 +296,7 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 45
     steps:
-      - name: Checkout exact tagged source
+      - name: Checkout exact planned source
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           ref: ${{ needs.preflight.outputs.source_commit }}
@@ -572,7 +572,7 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 45
     steps:
-      - name: Checkout exact tagged source
+      - name: Checkout exact planned source
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           ref: ${{ needs.preflight.outputs.source_commit }}

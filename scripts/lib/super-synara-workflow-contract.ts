@@ -35,6 +35,11 @@ const PUBLISH_JOB_CONDITION =
   "${{ always() && needs.draft_admission.result == 'success' && needs.preflight.result == 'success' && needs.windows_x64.result == 'success' && ((needs.preflight.outputs.include_macos == 'true' && needs.macos_arm64.result == 'success') || (needs.preflight.outputs.include_macos == 'false' && needs.macos_arm64.result == 'skipped')) }}";
 const CHECKOUT_ACTION = "actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10";
 const SETUP_NODE_ACTION = "actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38";
+const PLANNED_SOURCE_PROOF_COMMAND = [
+  "node scripts/verify-release-source-provenance.ts \\",
+  '"$VERSION" "$TAG" true "$SOURCE_COMMIT" branch main \\',
+  "github-unsigned-prerelease false",
+] as const;
 
 function isRecord(value: unknown): value is UnknownRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -617,6 +622,57 @@ function verifyPublicationJobDependencies(jobs: UnknownRecord): void {
   }
 }
 
+function verifyNativePlannedSource(job: UnknownRecord, jobName: string): number {
+  const steps = job.steps;
+  if (!Array.isArray(steps)) {
+    throw new Error(`Publication workflow ${jobName} must define native release steps.`);
+  }
+  const checkoutIndexes = steps.flatMap((step, index) =>
+    isRecord(step) && step.name === "Checkout exact planned source" ? [index] : [],
+  );
+  const proofIndexes = steps.flatMap((step, index) =>
+    isRecord(step) && step.name === "Revalidate protected-main source provenance" ? [index] : [],
+  );
+  if (checkoutIndexes.length !== 1 || proofIndexes.length !== 1) {
+    throw new Error(
+      `Publication workflow ${jobName} must validate the admitted draft's exact planned source without requiring a pre-publication tag.`,
+    );
+  }
+
+  const checkoutIndex = checkoutIndexes[0]!;
+  const proofIndex = proofIndexes[0]!;
+  const checkout = steps[checkoutIndex];
+  const proof = steps[proofIndex];
+  if (
+    !isRecord(checkout) ||
+    !hasExactKeys(checkout, ["name", "uses", "with"]) ||
+    checkout.uses !== CHECKOUT_ACTION ||
+    !hasExactEntries(checkout.with, {
+      ref: "${{ needs.preflight.outputs.source_commit }}",
+      "fetch-depth": 0,
+      "persist-credentials": false,
+    }) ||
+    !isRecord(proof) ||
+    !hasExactKeys(proof, ["name", "shell", "env", "run"]) ||
+    proof.shell !== "bash" ||
+    !hasExactEntries(proof.env, {
+      VERSION: "${{ needs.preflight.outputs.version }}",
+      TAG: "${{ needs.preflight.outputs.tag }}",
+      SOURCE_COMMIT: "${{ needs.preflight.outputs.source_commit }}",
+    }) ||
+    typeof proof.run !== "string" ||
+    JSON.stringify(executableShellLines(proof.run)) !==
+      JSON.stringify(PLANNED_SOURCE_PROOF_COMMAND) ||
+    masksShellFailure(proof.run) ||
+    proofIndex <= checkoutIndex
+  ) {
+    throw new Error(
+      `Publication workflow ${jobName} must validate the admitted draft's exact planned source without requiring a pre-publication tag.`,
+    );
+  }
+  return proofIndex;
+}
+
 function verifyNativeJobCommands(
   job: UnknownRecord,
   jobName: string,
@@ -646,6 +702,7 @@ function verifyNativeJobCommands(
     );
   }
   const [buildStep] = buildSteps;
+  const plannedSourceProofIndex = verifyNativePlannedSource(job, jobName);
   if (
     buildStep!.condition !== undefined ||
     (buildStep!.continueOnError !== undefined && buildStep!.continueOnError !== false)
@@ -656,6 +713,11 @@ function verifyNativeJobCommands(
   }
   if (masksShellFailure(buildStep!.rawCommand)) {
     throw new Error(`Publication workflow ${jobName} native build must not mask shell failures.`);
+  }
+  if (plannedSourceProofIndex >= buildStep!.index) {
+    throw new Error(
+      `Publication workflow ${jobName} must validate the admitted draft's exact planned source before the native build.`,
+    );
   }
   for (const command of requiredCommands) {
     const matches = steps.filter((step) => step.command === command);
