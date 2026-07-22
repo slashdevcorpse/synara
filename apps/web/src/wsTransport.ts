@@ -583,6 +583,10 @@ export class WsTransport {
     return this.state;
   }
 
+  getSessionSnapshot(): { readonly state: WsTransportState; readonly generation: number } {
+    return { state: this.state, generation: this.sessionVersion };
+  }
+
   getCompatibility(): WsBootstrapNegotiateResult | null {
     return this.compatibility;
   }
