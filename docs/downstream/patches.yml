@@ -1917,7 +1917,7 @@
         "owner": "slashdevcorpse",
         "status": "upstreamed",
         "upstreamSourceCommit": "9ceb8f2876089c755ef6acf32c4708c5cdb71b30",
-        "introducingCommit": "33fe3b0e80b941f078c5f400565538ec97f0bc5c",
+        "introducingCommit": "2cf9a6115c142e33799a854e8b9315207c46d558",
         "touchedFiles":
           [
             "apps/server/src/provider/Layers/AntigravityAdapter.test.ts",
@@ -1935,7 +1935,7 @@
             {
               "status": "upstreamed",
               "date": "2026-07-21",
-              "evidence": "PR 425 merged as 9ceb8f2876089c755ef6acf32c4708c5cdb71b30 and was absorbed downstream at 33fe3b0e80b941f078c5f400565538ec97f0bc5c without advancing the classified full-sync authority beyond 1664ce2f152cd6131a30d1ee8d7c9b60235bb0fe",
+              "evidence": "PR 425 merged as 9ceb8f2876089c755ef6acf32c4708c5cdb71b30 and was absorbed downstream by PR 124 at 2cf9a6115c142e33799a854e8b9315207c46d558 without advancing the classified full-sync authority beyond 1664ce2f152cd6131a30d1ee8d7c9b60235bb0fe",
             },
           ],
       },
