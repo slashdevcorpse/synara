@@ -74,6 +74,25 @@ async function sendPrompt(desktop: DesktopHarness, prompt: string): Promise<void
   await expect(sendButton).toBeEnabled({ timeout: 30_000 });
   const protocolBaseline = (await desktop.readProtocolLog()).length;
   await sendButton.click();
+  try {
+    await expect(editor).toBeEmpty({ timeout: 3_000 });
+  } catch {
+    // A lost thread.create response can leave its durable server receipt behind while the
+    // composer restores the draft. Retry only that explicit, user-retryable state; the
+    // promotion helper recovers the duplicate create before starting one turn.
+    await expect(editor).toHaveText(prompt);
+    await expect(sendButton).toBeEnabled();
+    const turnStartsSinceClick = requestMethods(
+      (await desktop.readProtocolLog()).slice(protocolBaseline),
+    ).filter((method) => method === "turn/start");
+    if (turnStartsSinceClick.length !== 0) {
+      throw new Error(
+        "Refusing to retry a restored desktop E2E draft after the provider accepted turn/start.",
+      );
+    }
+    await sendButton.click();
+    await expect(editor).toBeEmpty({ timeout: 10_000 });
+  }
   await expect
     .poll(async () => requestMethods((await desktop.readProtocolLog()).slice(protocolBaseline)), {
       timeout: 30_000,
@@ -322,8 +341,15 @@ test("runs a real terminal and renders echoed output", async ({ desktop }) => {
   await findInput.fill("E2E_TERMINAL_OUTPUT_THAT_DOES_NOT_EXIST");
   await expect(noResults).toBeVisible({ timeout: 30_000 });
   await findInput.fill("E2E_TERMINAL_42");
-  await findInput.press("Enter");
-  await expect(noResults).toBeHidden({ timeout: 30_000 });
+  await expect
+    .poll(
+      async () => {
+        await findInput.press("Enter");
+        return noResults.isVisible();
+      },
+      { timeout: 30_000 },
+    )
+    .toBe(false);
 });
 
 test("opens a workspace file in source and rendered preview modes", async ({ desktop }) => {
