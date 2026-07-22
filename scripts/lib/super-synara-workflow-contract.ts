@@ -1066,6 +1066,11 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
       "Windows installer qualification must run after packaged startup verification.",
     );
   }
+  requireText(
+    main,
+    "- id: windows_installer_qualification\n        name: Qualify concurrent Windows side-by-side runtime, upgrade, and uninstall",
+    "Windows installer qualification must expose the stable step id used by failure diagnostics.",
+  );
   const windowsProvenanceIndex = main.indexOf(
     "Write final Windows provenance from native qualification",
   );
@@ -1099,11 +1104,13 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
   );
   requireText(
     windowsDiagnosticCandidateBlock,
-    "if: ${{ failure() }}",
-    "The Windows diagnostic candidate upload must run only after a failed qualification path.",
+    "if: ${{ failure() && steps.windows_installer_qualification.outcome == 'failure' }}",
+    "The Windows diagnostic candidate upload must run only when its qualification step fails.",
   );
   for (const candidateNeedle of [
     "super-synara-windows-x64-candidate-${{ github.run_attempt }}",
+    "path: release-publish/Super-Synara-${{ needs.preflight.outputs.version }}-windows-x64-unsigned.exe",
+    "if-no-files-found: error",
     "retention-days: 1",
     "compression-level: 0",
   ]) {

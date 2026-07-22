@@ -1115,9 +1115,7 @@ describe("Super Synara workflow contracts", () => {
     const provenanceStep = main.indexOf(
       "      - name: Write final Windows provenance from native qualification",
     );
-    const qualificationStep = main.indexOf(
-      "      - name: Qualify concurrent Windows side-by-side runtime, upgrade, and uninstall",
-    );
+    const qualificationStep = main.indexOf("      - id: windows_installer_qualification");
     const provenanceEnd = main.indexOf("\n      - name:", provenanceStep + 1);
     const provenanceBlock = main.slice(provenanceStep, provenanceEnd);
     const reordered =
@@ -1143,14 +1141,32 @@ describe("Super Synara workflow contracts", () => {
   it("requires the diagnostic Windows candidate only after failed qualification", () => {
     expect(() =>
       verifySuperSynaraWorkflowText(
-        main.replace("        if: ${{ failure() }}", "        if: ${{ success() }}"),
+        main.replace("      - id: windows_installer_qualification", "      - id: unrelated_step"),
         audit,
       ),
-    ).toThrow("must run only after a failed qualification path");
+    ).toThrow("stable step id used by failure diagnostics");
 
-    const qualificationStep = main.indexOf(
-      "      - name: Qualify concurrent Windows side-by-side runtime, upgrade, and uninstall",
-    );
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          "        if: ${{ failure() && steps.windows_installer_qualification.outcome == 'failure' }}",
+          "        if: ${{ failure() }}",
+        ),
+        audit,
+      ),
+    ).toThrow("must run only when its qualification step fails");
+
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          "path: release-publish/Super-Synara-${{ needs.preflight.outputs.version }}-windows-x64-unsigned.exe",
+          "path: release-publish/not-the-qualified-installer.exe",
+        ),
+        audit,
+      ),
+    ).toThrow("diagnostic candidate upload is missing path:");
+
+    const qualificationStep = main.indexOf("      - id: windows_installer_qualification");
     const candidateStep = main.indexOf(
       "      - name: Retain exact Windows candidate for failed qualification diagnosis",
     );
@@ -1164,6 +1180,20 @@ describe("Super Synara workflow contracts", () => {
       main.slice(candidateEnd);
     expect(() => verifySuperSynaraWorkflowText(reordered, audit)).toThrow(
       "must run after native qualification",
+    );
+
+    const provenanceStep = main.indexOf(
+      "      - name: Write final Windows provenance from native qualification",
+    );
+    const provenanceEnd = main.indexOf("\n      - name:", provenanceStep + 1);
+    const reorderedAfterProvenance =
+      main.slice(0, candidateStep) +
+      main.slice(candidateEnd, provenanceEnd) +
+      "\n" +
+      candidateBlock +
+      main.slice(provenanceEnd);
+    expect(() => verifySuperSynaraWorkflowText(reorderedAfterProvenance, audit)).toThrow(
+      "before provenance generation",
     );
   });
 

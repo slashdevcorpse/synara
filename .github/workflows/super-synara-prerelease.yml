@@ -485,7 +485,8 @@ jobs:
           }
           "path=$installer" >> $env:GITHUB_OUTPUT
 
-      - name: Qualify concurrent Windows side-by-side runtime, upgrade, and uninstall
+      - id: windows_installer_qualification
+        name: Qualify concurrent Windows side-by-side runtime, upgrade, and uninstall
         shell: pwsh
         env:
           VERSION: ${{ needs.preflight.outputs.version }}
@@ -511,7 +512,7 @@ jobs:
           node @qualificationArgs
 
       - name: Retain exact Windows candidate for failed qualification diagnosis
-        if: ${{ failure() }}
+        if: ${{ failure() && steps.windows_installer_qualification.outcome == 'failure' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: super-synara-windows-x64-candidate-${{ github.run_attempt }}
