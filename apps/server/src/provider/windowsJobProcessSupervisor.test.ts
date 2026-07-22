@@ -6,7 +6,7 @@ import { join } from "node:path";
 
 import type { WindowsSafeProcessCommand } from "@synara/shared/windowsProcess";
 import { Deferred, Effect } from "effect";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   finalizeSynchronousWindowsJobExit,
@@ -30,6 +30,8 @@ import {
   windowsJobControlFilePath,
 } from "./windowsProviderProcess.ts";
 
+const windowsJobFixtureControlPaths = new Set<string>();
+
 function jobPreparedCommand(controlDirectory = "C:\\Temp"): WindowsJobPreparedCommand {
   const prepared = containPreparedWindowsProviderProcess(
     { command: "C:\\tools\\provider.exe", args: [], shell: false, windowsHide: true },
@@ -45,8 +47,23 @@ function jobPreparedCommand(controlDirectory = "C:\\Temp"): WindowsJobPreparedCo
   if (!isWindowsJobPreparedCommand(prepared)) {
     throw new Error("Expected the Windows fixture command to be Job-prepared.");
   }
+  windowsJobFixtureControlPaths.add(windowsJobControlFilePath(prepared));
   return prepared;
 }
+
+async function cleanupWindowsJobFixtureArtifacts(): Promise<void> {
+  const fixturePaths = [...windowsJobFixtureControlPaths];
+  windowsJobFixtureControlPaths.clear();
+  await Promise.all(
+    fixturePaths.flatMap((controlFilePath) =>
+      [controlFilePath, `${controlFilePath}.drained`, `${controlFilePath}.drained.tmp`].map(
+        (path) => rm(path, { force: true }),
+      ),
+    ),
+  );
+}
+
+afterEach(cleanupWindowsJobFixtureArtifacts);
 
 function posixPreparedCommand(): WindowsSafeProcessCommand {
   return { command: "/usr/local/bin/provider", args: [], shell: false };
@@ -65,6 +82,24 @@ function nodeChild(pid: number): MutableChildProcess {
 }
 
 describe("Windows Job exact-handle supervision", () => {
+  it("cleans fixture artifacts placed outside the native temporary directory", async () => {
+    const prepared = jobPreparedCommand(".");
+    const controlFilePath = windowsJobControlFilePath(prepared);
+    await Promise.all([
+      writeFile(controlFilePath, "stop\n", "utf8"),
+      writeFile(`${controlFilePath}.drained`, "drained\n", "utf8"),
+      writeFile(`${controlFilePath}.drained.tmp`, "partial", "utf8"),
+    ]);
+
+    await cleanupWindowsJobFixtureArtifacts();
+
+    await Promise.all(
+      [controlFilePath, `${controlFilePath}.drained`, `${controlFilePath}.drained.tmp`].map(
+        (path) => expect(access(path)).rejects.toMatchObject({ code: "ENOENT" }),
+      ),
+    );
+  });
+
   it("rejects an unbranded command before selecting exact supervision", () => {
     expect(() =>
       supervisePreparedEffectProcess(
