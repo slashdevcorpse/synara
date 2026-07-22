@@ -593,8 +593,8 @@ describe("WsTransport", () => {
       answers: { Language: null, Runtime: "Bun" },
       createdAt: "2026-07-21T00:00:00.000Z",
     };
-    const firstDispatch = vi.fn(() => Effect.interrupt);
-    const secondDispatch = vi.fn(() => Effect.succeed({ sequence: 4 }));
+    const firstDispatch = vi.fn((_input: unknown) => Effect.interrupt);
+    const secondDispatch = vi.fn((_input: unknown) => Effect.succeed({ sequence: 4 }));
     const firstClient = { [ORCHESTRATION_WS_METHODS.dispatchCommand]: firstDispatch };
     const secondClient = { [ORCHESTRATION_WS_METHODS.dispatchCommand]: secondDispatch };
     const { transport, reconnect } = stubUnaryTransport(firstClient, secondClient);

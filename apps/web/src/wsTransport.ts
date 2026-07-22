@@ -297,7 +297,7 @@ const RECOVERABLE_SOCKET_REASON_TAGS = new Set([
   "SocketOpenError",
   "SocketCloseError",
 ]);
-const SESSION_RECOVERABLE_UNARY_METHODS = new Set([
+const SESSION_RECOVERABLE_UNARY_METHODS: ReadonlySet<string> = new Set([
   ORCHESTRATION_WS_METHODS.dispatchCommand,
   ORCHESTRATION_WS_METHODS.getShellSnapshot,
   WS_METHODS.serverRefreshProviders,
