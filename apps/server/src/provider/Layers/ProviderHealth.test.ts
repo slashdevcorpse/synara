@@ -4542,6 +4542,24 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
       ),
     );
 
+    it.effect("honors caller process supervision overrides", () => {
+      let supervisorInstallations = 0;
+      return makeCheckClaudeProviderStatus(undefined, "claude", undefined, {
+        superviseProcess: (prepared, child) => {
+          supervisorInstallations += 1;
+          return TEST_PROVIDER_PROCESS_OPTIONS.superviseProcess(prepared, child);
+        },
+      }).pipe(
+        Effect.provide(mockSpawnerLayer(() => ({ stdout: "", stderr: "version failed", code: 1 }))),
+        Effect.tap((status) =>
+          Effect.sync(() => {
+            assert.strictEqual(status.status, "error");
+            assert.strictEqual(supervisorInstallations, 1);
+          }),
+        ),
+      );
+    });
+
     it.effect(
       "strips stale direct Claude credentials from health probes when local OAuth is usable",
       () =>
