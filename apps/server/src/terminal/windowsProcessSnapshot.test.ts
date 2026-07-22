@@ -3,12 +3,13 @@
 // Layer: Terminal infrastructure tests
 import { describe, expect, it, vi } from "vitest";
 
-import type { ProcessRunResult } from "../processRunner";
+import { runProcess, type ProcessRunResult } from "../processRunner";
 import {
-  captureWindowsProcessSnapshot,
   createWindowsProcessSnapshotCollector,
   WINDOWS_PROCESS_SNAPSHOT_MAX_BUFFER_BYTES,
   WINDOWS_PROCESS_SNAPSHOT_TIMEOUT_MS,
+  type WindowsProcessSnapshotCollector,
+  type WindowsProcessSnapshotResult,
   type WindowsProcessSnapshotRunner,
 } from "./windowsProcessSnapshot";
 
@@ -22,6 +23,17 @@ interface TestProcessRecord {
 
 const SYSTEM_ROOT = String.raw`C:\Windows`;
 const POWERSHELL_PATH = String.raw`C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`;
+const NATIVE_WINDOWS_PROCESS_SNAPSHOT_TIMEOUT_MS = 30_000;
+
+// Keep the product's fail-closed five-second deadline while giving the hosted native capability
+// proof enough headroom when the full Windows suite contends for PowerShell/CIM resources.
+const captureNativeWindowsProcessSnapshot = createWindowsProcessSnapshotCollector({
+  runProcess: (command, args, options) =>
+    runProcess(command, args, {
+      ...(options ?? {}),
+      timeoutMs: NATIVE_WINDOWS_PROCESS_SNAPSHOT_TIMEOUT_MS,
+    }),
+});
 
 function record(
   ProcessId: number,
@@ -86,6 +98,76 @@ function expectUnknown(
   expect(result).toEqual({ kind: "unknown", reason });
   expect(Object.keys(result).sort()).toEqual(["kind", "reason"]);
 }
+
+async function captureNativeWindowsProcessSnapshotWithTimeoutRetry(
+  capture: WindowsProcessSnapshotCollector = captureNativeWindowsProcessSnapshot,
+): Promise<{
+  result: WindowsProcessSnapshotResult;
+  attemptOutcomes: readonly string[];
+}> {
+  const first = await capture();
+  const firstOutcome = first.kind === "ok" ? "ok" : first.reason;
+  if (first.kind === "ok" || first.reason !== "timed_out") {
+    return { result: first, attemptOutcomes: [firstOutcome] };
+  }
+
+  const second = await capture();
+  return {
+    result: second,
+    attemptOutcomes: [firstOutcome, second.kind === "ok" ? "ok" : second.reason],
+  };
+}
+
+describe("native Windows process snapshot retry policy", () => {
+  const successfulSnapshot = (): WindowsProcessSnapshotResult => ({
+    kind: "ok",
+    processCount: 1,
+    childrenByParentPid: new Map([[0, [{ pid: 41, command: "process-41.exe" }]]]),
+  });
+
+  it("retries one transient timeout and returns the successful second capture", async () => {
+    const capture = vi
+      .fn<WindowsProcessSnapshotCollector>()
+      .mockResolvedValueOnce({ kind: "unknown", reason: "timed_out" })
+      .mockResolvedValueOnce(successfulSnapshot());
+
+    const outcome = await captureNativeWindowsProcessSnapshotWithTimeoutRetry(capture);
+
+    expect(capture).toHaveBeenCalledTimes(2);
+    expect(outcome).toEqual({
+      result: successfulSnapshot(),
+      attemptOutcomes: ["timed_out", "ok"],
+    });
+  });
+
+  it("stops after the second timeout", async () => {
+    const capture = vi
+      .fn<WindowsProcessSnapshotCollector>()
+      .mockResolvedValue({ kind: "unknown", reason: "timed_out" });
+
+    const outcome = await captureNativeWindowsProcessSnapshotWithTimeoutRetry(capture);
+
+    expect(capture).toHaveBeenCalledTimes(2);
+    expect(outcome).toEqual({
+      result: { kind: "unknown", reason: "timed_out" },
+      attemptOutcomes: ["timed_out", "timed_out"],
+    });
+  });
+
+  it("does not retry a non-timeout failure", async () => {
+    const capture = vi
+      .fn<WindowsProcessSnapshotCollector>()
+      .mockResolvedValue({ kind: "unknown", reason: "malformed_output" });
+
+    const outcome = await captureNativeWindowsProcessSnapshotWithTimeoutRetry(capture);
+
+    expect(capture).toHaveBeenCalledTimes(1);
+    expect(outcome).toEqual({
+      result: { kind: "unknown", reason: "malformed_output" },
+      attemptOutcomes: ["malformed_output"],
+    });
+  });
+});
 
 describe("createWindowsProcessSnapshotCollector", () => {
   it("invokes absolute Windows PowerShell 5.1 once with the exact bounds and caller signal", async () => {
@@ -458,10 +540,13 @@ describe("createWindowsProcessSnapshotCollector", () => {
 it.runIf(process.platform === "win32")(
   "captures the native process table, includes this test process, and leaves its PowerShell child exited",
   async () => {
-    const result = await captureWindowsProcessSnapshot();
+    const { result, attemptOutcomes } = await captureNativeWindowsProcessSnapshotWithTimeoutRetry();
 
-    expect(result.kind).toBe("ok");
-    if (result.kind !== "ok") return;
+    if (result.kind !== "ok") {
+      throw new Error(
+        `Native Windows process snapshot was unavailable after ${attemptOutcomes.length} attempt(s): ${attemptOutcomes.join(" -> ")}.`,
+      );
+    }
     const allChildren = [...result.childrenByParentPid.values()].flat();
     expect(result.processCount).toBe(allChildren.length);
     expect(allChildren.some((child) => child.pid === process.pid)).toBe(true);
@@ -480,4 +565,5 @@ it.runIf(process.platform === "win32")(
       }
     }
   },
+  NATIVE_WINDOWS_PROCESS_SNAPSHOT_TIMEOUT_MS * 2 + 5_000,
 );
