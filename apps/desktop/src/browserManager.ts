@@ -2565,8 +2565,20 @@ function syncTabStateFromRuntime(
   faviconUrls?: string[],
 ): boolean {
   const currentUrl = webContents.getURL();
+  const runtimeIsLoading = webContents.isLoading();
+  // An adopted renderer guest starts at about:blank. Keep the manager-owned
+  // destination authoritative until that guest commits the requested page;
+  // otherwise the transient blank state can make React remove the webview and
+  // abort the navigation that is still in flight.
+  const isInertGuestLoadingManagedTarget =
+    runtimeIsLoading &&
+    tab.isLoading &&
+    currentUrl === ABOUT_BLANK_URL &&
+    tab.url !== ABOUT_BLANK_URL;
   const acceptedCurrentUrl =
-    currentUrl && isPageNavigationAllowed(tab, currentUrl) ? currentUrl : "";
+    !isInertGuestLoadingManagedTarget && currentUrl && isPageNavigationAllowed(tab, currentUrl)
+      ? currentUrl
+      : "";
   const nextUrl = acceptedCurrentUrl || tab.url;
   const nextTitle = webContents.getTitle();
   let didChange = false;
@@ -2588,7 +2600,7 @@ function syncTabStateFromRuntime(
       tab.title = value;
     }) || didChange;
   didChange =
-    setIfChanged(tab.isLoading, webContents.isLoading(), (value) => {
+    setIfChanged(tab.isLoading, runtimeIsLoading, (value) => {
       tab.isLoading = value;
     }) || didChange;
   didChange =

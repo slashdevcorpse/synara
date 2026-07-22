@@ -118,7 +118,7 @@ class FakeWebContents extends EventEmitter {
     goForward: vi.fn(),
   };
   readonly stop = vi.fn();
-  readonly loadURL = vi.fn(async () => undefined);
+  readonly loadURL = vi.fn(async (): Promise<void> => undefined);
   readonly openDevTools = vi.fn();
   readonly setUserAgent = vi.fn();
   windowOpenHandler: ((details: FakeWindowOpenDetails) => FakeWindowOpenResult) | null = null;
@@ -831,6 +831,32 @@ describe("DesktopBrowserManager local-preview lifecycle", () => {
     expect(webContents.stop).toHaveBeenCalled();
     expect(webContents.debugger.attach).toHaveBeenCalledWith("1.3");
     expect(webContents.loadURL).toHaveBeenCalledWith(FIRST_PREVIEW_URL);
+  });
+
+  it("keeps the managed target while an adopted inert webview starts loading it", async () => {
+    const manager = new DesktopBrowserManager();
+    const targetUrl = "http://127.0.0.1:54321/";
+    const tab = manager.open({ threadId: THREAD_ID, initialUrl: targetUrl }).tabs[0]!;
+    const webContents = new FakeWebContents();
+    vi.spyOn(webContents, "isLoading").mockReturnValue(true);
+    webContents.loadURL.mockImplementation(async () => {
+      webContents.emit("did-start-loading");
+      await Promise.resolve();
+    });
+    electronMocks.webContentsFromId.mockReturnValue(webContents);
+
+    await manager.attachWebview({
+      threadId: THREAD_ID,
+      tabId: tab.id,
+      webContentsId: webContents.id,
+    });
+
+    expect(webContents.loadURL).toHaveBeenCalledWith(targetUrl);
+    expect(manager.getState({ threadId: THREAD_ID }).tabs[0]).toMatchObject({
+      url: targetUrl,
+      lastCommittedUrl: null,
+      isLoading: true,
+    });
   });
 
   it("closes a renderer webview whose document committed before first adoption", async () => {
