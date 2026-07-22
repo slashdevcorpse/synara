@@ -61,7 +61,10 @@ import {
   readCodexConfigModelProvider,
   stabilizeProviderStatusesAgainstTransientTimeouts,
 } from "./ProviderHealth";
-import { resolvePackageManagedProviderMaintenance } from "../providerMaintenance";
+import {
+  deriveNpmGlobalPrefix,
+  resolvePackageManagedProviderMaintenance,
+} from "../providerMaintenance";
 import {
   isWindowsJobPreparedCommand,
   prepareWindowsProviderProcess,
@@ -245,6 +248,13 @@ const writeLatestKiloPackageFixture = Effect.fn("writeLatestKiloPackageFixture")
     })}\n`,
   );
 });
+
+function canonicalNpmPrefixForBinary(binaryPath: string): string {
+  const canonicalBinaryPath = realpathSync(binaryPath);
+  const npmPrefix = deriveNpmGlobalPrefix(canonicalBinaryPath, process.platform);
+  assert.ok(npmPrefix, `Expected an npm prefix for ${canonicalBinaryPath}`);
+  return npmPrefix;
+}
 
 interface ProviderCommandFixture {
   readonly commandDirectory: string;
@@ -656,6 +666,7 @@ function withKiloUpdateFixture<A, E, R>(
         binaryPath: kiloBinaryPath,
         version: installedVersion,
       });
+      const canonicalNpmPrefix = canonicalNpmPrefixForBinary(kiloBinaryPath);
       const cachePath = resolveProviderStatusCachePath({
         stateDir: NodePath.join(baseDir, "userdata"),
         provider: "kilo",
@@ -683,7 +694,14 @@ function withKiloUpdateFixture<A, E, R>(
           },
         },
       } satisfies typeof DEFAULT_SERVER_SETTINGS;
-      return yield* use({ fixture, baseDir, npmPrefix, kiloBinaryPath, cachePath, settings });
+      return yield* use({
+        fixture,
+        baseDir,
+        npmPrefix: canonicalNpmPrefix,
+        kiloBinaryPath,
+        cachePath,
+        settings,
+      });
     }),
   );
 }
@@ -2295,6 +2313,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
                 binaryPath: kiloBinaryPath,
                 version: "7.4.10",
               });
+              const canonicalNpmPrefix = canonicalNpmPrefixForBinary(kiloBinaryPath);
               yield* writeProviderStatusCache({
                 filePath: resolveProviderStatusCachePath({
                   stateDir: NodePath.join(baseDir, "userdata"),
@@ -2339,7 +2358,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
                           "install",
                           "-g",
                           "--prefix",
-                          npmPrefix,
+                          canonicalNpmPrefix,
                           "@kilocode/cli@latest",
                         ],
                         command,
@@ -3103,6 +3122,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
               binaryPath: kiloBinaryPath,
               version: "7.3.46",
             });
+            const canonicalNpmPrefix = canonicalNpmPrefixForBinary(kiloBinaryPath);
             yield* writeProviderStatusCache({
               filePath: resolveProviderStatusCachePath({
                 stateDir: path.join(baseDir, "userdata"),
@@ -3153,7 +3173,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
                         "install",
                         "-g",
                         "--prefix",
-                        npmPrefix,
+                        canonicalNpmPrefix,
                         "@kilocode/cli@latest",
                       ],
                       command,
@@ -3414,6 +3434,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
                 binaryPath: kiloBinaryPath,
                 version: "7.4.10",
               });
+              const canonicalNpmPrefix = canonicalNpmPrefixForBinary(kiloBinaryPath);
               yield* writeProviderStatusCache({
                 filePath: resolveProviderStatusCachePath({
                   stateDir: NodePath.join(baseDir, "userdata"),
@@ -3507,7 +3528,13 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
                   const isUpdater = preparedProviderCommandMatches({
                     fixture,
                     executable: fixtureExecutablePath(fixture, "npm"),
-                    expectedArgs: ["install", "-g", "--prefix", npmPrefix, "@kilocode/cli@latest"],
+                    expectedArgs: [
+                      "install",
+                      "-g",
+                      "--prefix",
+                      canonicalNpmPrefix,
+                      "@kilocode/cli@latest",
+                    ],
                     command: unwrapped.command,
                     actualArgs: unwrapped.args,
                     env: unwrapped.options?.env,

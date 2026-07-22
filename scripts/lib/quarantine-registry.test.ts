@@ -79,6 +79,97 @@ describe("quarantine registry", () => {
     );
   });
 
+  it("rejects duplicate and unsorted entry ids", () => {
+    const duplicateFixture = fixture();
+    const duplicateSource = [
+      duplicateFixture.source,
+      ...duplicateFixture.source.split("\n").slice(2),
+    ].join("\n");
+    expect(
+      validateQuarantineRegistry(duplicateSource, {
+        repositoryRoot: duplicateFixture.root,
+        today: "2026-07-20",
+      }).errors,
+    ).toContain("Quarantine entry 2 duplicates id `web-geometry`.");
+
+    const unsortedFixture = fixture();
+    const earlierId = "aaa-geometry";
+    const earlierPath = "apps/web/src/aaa.browser.tsx";
+    writeFileSync(
+      resolve(unsortedFixture.root, earlierPath),
+      `it(${JSON.stringify(`${quarantineMarker(earlierId)} measures layout`)}, () => {});`,
+    );
+    const earlierEntry = unsortedFixture.source
+      .split("\n")
+      .slice(2)
+      .map((line) =>
+        line
+          .replaceAll("web-geometry", earlierId)
+          .replace("apps/web/src/example.browser.tsx", earlierPath),
+      );
+    const unsortedSource = [unsortedFixture.source, ...earlierEntry].join("\n");
+    expect(
+      validateQuarantineRegistry(unsortedSource, {
+        repositoryRoot: unsortedFixture.root,
+        today: "2026-07-20",
+      }).errors,
+    ).toContain("Quarantine entries must be sorted by id.");
+  });
+
+  it("rejects escaped, missing, directory, and marker-free source paths", () => {
+    const escapedFixture = fixture();
+    const escapedSource = escapedFixture.source.replace(
+      "path: apps/web/src/example.browser.tsx",
+      "path: ../outside.browser.tsx",
+    );
+    expect(
+      validateQuarantineRegistry(escapedSource, {
+        repositoryRoot: escapedFixture.root,
+        today: "2026-07-20",
+      }).errors,
+    ).toContain("Quarantine entry `web-geometry` escapes the repository root.");
+
+    const missingFixture = fixture();
+    const missingPath = "apps/web/src/missing.browser.tsx";
+    const missingSource = missingFixture.source.replace(
+      "apps/web/src/example.browser.tsx",
+      missingPath,
+    );
+    expect(
+      validateQuarantineRegistry(missingSource, {
+        repositoryRoot: missingFixture.root,
+        today: "2026-07-20",
+      }).errors,
+    ).toContain(`Quarantine entry \`web-geometry\` path does not exist: ${missingPath}.`);
+
+    const directoryFixture = fixture();
+    const directoryPath = "apps/web/src";
+    const directorySource = directoryFixture.source.replace(
+      "apps/web/src/example.browser.tsx",
+      directoryPath,
+    );
+    expect(
+      validateQuarantineRegistry(directorySource, {
+        repositoryRoot: directoryFixture.root,
+        today: "2026-07-20",
+      }).errors,
+    ).toContain(`Quarantine entry \`web-geometry\` path is not a file: ${directoryPath}.`);
+
+    const markerFixture = fixture();
+    writeFileSync(
+      resolve(markerFixture.root, "apps/web/src/example.browser.tsx"),
+      "it('has no quarantine marker', () => {});",
+    );
+    expect(
+      validateQuarantineRegistry(markerFixture.source, {
+        repositoryRoot: markerFixture.root,
+        today: "2026-07-20",
+      }).errors,
+    ).toContain(
+      "Quarantine entry `web-geometry` marker is missing from apps/web/src/example.browser.tsx.",
+    );
+  });
+
   it("derives platform-scoped stable and quarantine selectors for every registered marker", () => {
     const { root, source } = fixture();
     writeFileSync(

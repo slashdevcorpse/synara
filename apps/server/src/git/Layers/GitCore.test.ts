@@ -11,7 +11,12 @@ import { splitLines } from "@synara/shared/text";
 import { Effect, Exit, FileSystem, Layer, PlatformError, Schema, Scope } from "effect";
 import { describe, expect, vi } from "vitest";
 
-import { GitCoreLive, makeGitCore, splitCompleteProcessOutputFrames } from "./GitCore.ts";
+import {
+  GitCoreLive,
+  makeGitCore,
+  parseDirtyWorktreeFiles,
+  splitCompleteProcessOutputFrames,
+} from "./GitCore.ts";
 import { GitCore, type GitCoreShape } from "../Services/GitCore.ts";
 import { GitCheckoutDirtyWorktreeError, GitCommandError } from "../Errors.ts";
 import { type ProcessRunResult, runProcess } from "../../processRunner.ts";
@@ -156,6 +161,52 @@ function commitWithDate(
 // ── Tests ──
 
 it.layer(TestLayer)("git integration", (it) => {
+  describe("dirty worktree parsing", () => {
+    it("recognizes advice-enabled and advice-disabled tracked and untracked errors", () => {
+      expect(
+        parseDirtyWorktreeFiles(
+          [
+            "error: Your local changes to the following files would be overwritten by checkout:",
+            "\tREADME.md",
+            "",
+            "Please commit your changes or stash them before you switch branches.",
+          ].join("\n"),
+        ),
+      ).toEqual(["README.md"]);
+      expect(
+        parseDirtyWorktreeFiles(
+          [
+            "error: Your local changes to the following files would be overwritten by merge:",
+            "\tREADME.md",
+            "",
+            "Aborting",
+          ].join("\n"),
+        ),
+      ).toEqual(["README.md"]);
+      expect(
+        parseDirtyWorktreeFiles(
+          [
+            "error: The following untracked working tree files would be overwritten by checkout:",
+            "\tnotes.txt",
+            "",
+            "Please move or remove them before you switch branches.",
+          ].join("\n"),
+        ),
+      ).toEqual(["notes.txt"]);
+      expect(
+        parseDirtyWorktreeFiles(
+          [
+            "error: The following untracked working tree files would be overwritten by merge:",
+            "\tgenerated.txt",
+            "",
+            "Aborting",
+          ].join("\r\n"),
+        ),
+      ).toEqual(["generated.txt"]);
+      expect(parseDirtyWorktreeFiles("fatal: unrelated checkout failure\nAborting\n")).toBeNull();
+    });
+  });
+
   describe("shell process execution", () => {
     it.effect("caps captured output when maxOutputBytes is exceeded", () =>
       Effect.gen(function* () {

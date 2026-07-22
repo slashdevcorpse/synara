@@ -85,6 +85,11 @@ const BROWSER_INSTALL_COMMANDS = {
 } as const;
 const BROWSER_STABLE_COMMAND = "bun run --cwd apps/web test:browser:stable";
 const MATRIX_RUNNER_EXPRESSION = "${{ matrix.runner }}";
+const QUARANTINE_RUN_COMMANDS = {
+  linux: "node scripts/quarantine-registry.ts run --platform linux",
+  windows: "node scripts/quarantine-registry.ts run --platform windows",
+} as const;
+const ALLOWED_NONBLOCKING_CI_COMMANDS = new Set(Object.values(QUARANTINE_RUN_COMMANDS));
 const FULL_UNIT_COMMAND = "bun turbo test";
 const UNIT_WINDOWS_SETUP_COMMAND =
   "node apps/server/scripts/build-windows-job-launcher.mjs --arch x64";
@@ -171,6 +176,7 @@ const QUALITY_AGGREGATE_NEEDS = [
   "browser_windows",
   "e2e_linux",
   "e2e_windows",
+  "macos_arm64",
 ] as const;
 const QUALITY_AGGREGATE_COMMAND = `
 test "\${{ needs.quality_linux.result }}" = success
@@ -179,6 +185,7 @@ test "\${{ needs.unit.result }}" = success
 test "\${{ needs.browser_windows.result }}" = success
 test "\${{ needs.e2e_linux.result }}" = success
 test "\${{ needs.e2e_windows.result }}" = success
+test "\${{ needs.macos_arm64.result }}" = success
 `;
 
 function isRecord(value: unknown): value is UnknownRecord {
@@ -976,15 +983,23 @@ function workflowTriggers(workflow: UnknownRecord, path: string, errors: string[
   return [];
 }
 
-function collectValuesForKey(value: unknown, key: string, results: unknown[]): void {
+function collectValuesForKey(
+  value: unknown,
+  key: string,
+  results: Array<{ readonly location: string; readonly value: unknown }>,
+  location: string,
+): void {
   if (Array.isArray(value)) {
-    for (const entry of value) collectValuesForKey(entry, key, results);
+    for (const [index, entry] of value.entries()) {
+      collectValuesForKey(entry, key, results, `${location}[${index}]`);
+    }
     return;
   }
   if (!isRecord(value)) return;
   for (const [entryKey, entryValue] of Object.entries(value)) {
-    if (entryKey === key) results.push(entryValue);
-    collectValuesForKey(entryValue, key, results);
+    const entryLocation = location.length > 0 ? `${location}.${entryKey}` : entryKey;
+    if (entryKey === key) results.push({ location: entryLocation, value: entryValue });
+    collectValuesForKey(entryValue, key, results, entryLocation);
   }
 }
 
@@ -1114,7 +1129,7 @@ function validateQuarantineCommands(
   platform: "linux" | "windows",
   errors: string[],
 ): void {
-  const runCommand = `node scripts/quarantine-registry.ts run --platform ${platform}`;
+  const runCommand = QUARANTINE_RUN_COMMANDS[platform];
   const runs = steps.filter((step) => step.command === runCommand);
   if (runs.length !== 1 || runs[0]!.condition !== undefined || runs[0]!.continueOnError !== true) {
     errors.push(
@@ -1664,7 +1679,7 @@ function validateCiArchitecture(workflow: UnknownRecord, errors: string[]): void
       const allowed =
         step["continue-on-error"] === true &&
         typeof step.run === "string" &&
-        normalizeShellCommand(step.run).startsWith("node scripts/quarantine-registry.ts run ");
+        ALLOWED_NONBLOCKING_CI_COMMANDS.has(normalizeShellCommand(step.run));
       if (!allowed && step["continue-on-error"] !== false) {
         errors.push(
           `${workflowPath} ${jobName} may use continue-on-error only for registered quarantine runs.`,
@@ -1721,13 +1736,18 @@ function validateAllowedWorkflow(
     }
   }
 
-  const runners: unknown[] = [];
-  collectValuesForKey(workflow.jobs, "runs-on", runners);
+  const runners: Array<{ readonly location: string; readonly value: unknown }> = [];
+  collectValuesForKey(workflow.jobs, "runs-on", runners, "jobs");
   for (const runner of runners) {
     const isCiUnitMatrixRunner =
-      policy.path === ".github/workflows/ci.yml" && runner === MATRIX_RUNNER_EXPRESSION;
-    if (typeof runner !== "string" || (!APPROVED_RUNNERS.has(runner) && !isCiUnitMatrixRunner)) {
-      errors.push(`${policy.path} references unsupported runner ${String(runner)}.`);
+      policy.path === ".github/workflows/ci.yml" &&
+      runner.location === "jobs.unit.runs-on" &&
+      runner.value === MATRIX_RUNNER_EXPRESSION;
+    if (
+      typeof runner.value !== "string" ||
+      (!APPROVED_RUNNERS.has(runner.value) && !isCiUnitMatrixRunner)
+    ) {
+      errors.push(`${policy.path} references unsupported runner ${String(runner.value)}.`);
     }
   }
   if (policy.path === ".github/workflows/ci.yml") validateCiArchitecture(workflow, errors);

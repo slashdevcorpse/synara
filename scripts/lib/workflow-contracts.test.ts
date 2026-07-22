@@ -378,6 +378,7 @@ ${macosStartupSmokeStep}
       - browser_windows
       - e2e_linux
       - e2e_windows
+      - macos_arm64
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -388,6 +389,7 @@ ${macosStartupSmokeStep}
           test "\${{ needs.browser_windows.result }}" = success
           test "\${{ needs.e2e_linux.result }}" = success
           test "\${{ needs.e2e_windows.result }}" = success
+          test "\${{ needs.macos_arm64.result }}" = success
   release_smoke:
     runs-on: ubuntu-24.04
     steps:
@@ -561,6 +563,14 @@ describe("workflow contracts", () => {
     expect(ciErrors(ciWorkflow.replace(` --baseline-ref ${quarantineBaselineRef}`, ""))).toContain(
       "quality_linux must publish the linux quarantine summary",
     );
+
+    const chainedQuarantine = ciWorkflow.replace(
+      "node scripts/quarantine-registry.ts run --platform linux",
+      "node scripts/quarantine-registry.ts run --platform linux && bun run lint",
+    );
+    expect(ciErrors(chainedQuarantine)).toContain(
+      "may use continue-on-error only for registered quarantine runs",
+    );
   });
 
   it("keeps Linux and Windows Playwright caches outside the checkout", () => {
@@ -671,6 +681,18 @@ describe("workflow contracts", () => {
     files.set(".github/workflows/ci.yml", ciWorkflow.replace("ubuntu-24.04", "macos-15-intel"));
     expect(validateWorkflowContracts(files, policy()).join("\n")).toContain(
       "references unsupported runner macos-15-intel",
+    );
+
+    const misplacedMatrixRunner = validFiles();
+    misplacedMatrixRunner.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace(
+        "  release_smoke:",
+        "  rogue:\n    runs-on: ${{ matrix.runner }}\n    steps:\n      - run: echo unsafe\n  release_smoke:",
+      ),
+    );
+    expect(validateWorkflowContracts(misplacedMatrixRunner, policy()).join("\n")).toContain(
+      "references unsupported runner ${{ matrix.runner }}",
     );
   });
 
@@ -920,6 +942,15 @@ describe("workflow contracts", () => {
       ciWorkflow.replace("      - e2e_linux\n", ""),
     );
     expect(validateWorkflowContracts(missingE2eAggregate, policy()).join("\n")).toContain(
+      "quality aggregate must depend on the exact merge-blocking quality job set",
+    );
+
+    const missingMacosAggregate = validFiles();
+    missingMacosAggregate.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace("      - macos_arm64\n", ""),
+    );
+    expect(validateWorkflowContracts(missingMacosAggregate, policy()).join("\n")).toContain(
       "quality aggregate must depend on the exact merge-blocking quality job set",
     );
 

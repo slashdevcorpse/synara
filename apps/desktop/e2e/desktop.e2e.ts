@@ -4,7 +4,7 @@
 import * as FS from "node:fs";
 import * as Http from "node:http";
 import * as Path from "node:path";
-import type { Page } from "@playwright/test";
+import type { Locator, Page } from "@playwright/test";
 import { test, expect, type DesktopHarness } from "./desktop.fixture";
 
 const PROJECT_NAME = "workspace";
@@ -79,6 +79,21 @@ async function sendPrompt(desktop: DesktopHarness, prompt: string): Promise<void
 
 async function expectAssistantText(page: Page, text: string): Promise<void> {
   await expect(page.getByText(text, { exact: true }).last()).toBeVisible({ timeout: 30_000 });
+}
+
+async function ensureDisclosureExpanded(trigger: Locator): Promise<void> {
+  await expect
+    .poll(
+      async () => {
+        if ((await trigger.getAttribute("aria-expanded")) !== "true") {
+          await trigger.click();
+        }
+        return trigger.getAttribute("aria-expanded");
+      },
+      { timeout: 30_000 },
+    )
+    .toBe("true");
+  await expect(trigger).toHaveAttribute("aria-expanded", "true");
 }
 
 function requestMethods(entries: readonly Record<string, unknown>[]): string[] {
@@ -245,12 +260,13 @@ test("surfaces and resolves a command approval", async ({ desktop }) => {
   const workSummary = desktop.page.getByRole("button", { name: /^Worked for /u }).last();
   await expect(workSummary).toBeVisible({ timeout: 30_000 });
   await workSummary.click();
+  await expect(workSummary).toHaveAttribute("aria-expanded", "true", { timeout: 30_000 });
   const commandRow = desktop.page
     .getByRole("button", { name: /^Ran /u })
     .filter({ hasText: APPROVAL_MARKER_FILENAME })
     .last();
   await expect(commandRow).toBeVisible({ timeout: 30_000 });
-  await commandRow.click();
+  await ensureDisclosureExpanded(commandRow);
   await expect(
     desktop.page.getByText("E2E_APPROVAL_COMMAND_OUTPUT", { exact: true }),
   ).toBeVisible();
@@ -307,7 +323,15 @@ test("runs a real terminal and renders echoed output", async ({ desktop }) => {
   await findInput.fill("E2E_TERMINAL_OUTPUT_THAT_DOES_NOT_EXIST");
   await expect(noResults).toBeVisible({ timeout: 30_000 });
   await findInput.fill("E2E_TERMINAL_42");
-  await expect(noResults).toBeHidden({ timeout: 30_000 });
+  await expect
+    .poll(
+      async () => {
+        await findInput.press("Enter");
+        return noResults.isVisible();
+      },
+      { timeout: 30_000 },
+    )
+    .toBe(false);
 });
 
 test("opens a workspace file in source and rendered preview modes", async ({ desktop }) => {

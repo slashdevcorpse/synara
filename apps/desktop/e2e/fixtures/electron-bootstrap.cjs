@@ -64,7 +64,12 @@ function installChromiumNetworkGuard(partition, guardedSession) {
     callback({ cancel: true });
   });
   guardedSession.webRequest.onCompleted({ urls: ["<all_urls>"] }, (details) => {
-    const parsed = new URL(details.url);
+    let parsed;
+    try {
+      parsed = new URL(details.url);
+    } catch {
+      return;
+    }
     if (NETWORK_PROTOCOLS.has(parsed.protocol) && isLoopbackHost(parsed.hostname)) {
       recordNetworkEvent({
         event: "request-completed",
@@ -101,14 +106,19 @@ process.env.NODE_OPTIONS = `--require="${nodeRequirePath.replaceAll('"', '\\"')}
 require(networkGuardPath);
 
 app.on("web-contents-created", (_event, contents) => {
-  const record = (event, details = {}) =>
+  const webContentsId = contents.id;
+  const webContentsType = contents.getType();
+  let lastKnownUrl = contents.getURL();
+  const record = (event, details = {}) => {
+    if (!contents.isDestroyed()) lastKnownUrl = contents.getURL();
     recordNetworkEvent({
       event,
-      webContentsId: contents.id,
-      webContentsType: contents.getType(),
-      url: contents.getURL(),
+      webContentsId,
+      webContentsType,
+      url: lastKnownUrl,
       ...details,
     });
+  };
   record("web-contents-created");
   contents.on("did-start-navigation", (_navigationEvent, url, _isInPlace, isMainFrame) => {
     if (isMainFrame) record("did-start-navigation", { url });

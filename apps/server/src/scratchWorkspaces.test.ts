@@ -6,6 +6,7 @@
 import {
   chmodSync,
   mkdirSync,
+  realpathSync,
   renameSync,
   rmSync,
   statSync,
@@ -46,7 +47,9 @@ describe("ensureIsolatedScratchWorkspace", () => {
     const workspace = ensureIsolatedScratchWorkspace(ThreadId.makeUnsafe("thread-1"));
     try {
       expect(workspace).toContain(`${path.sep}${SCRATCH_WORKSPACES_DIRNAME}${path.sep}thread-1-`);
-      expect(path.relative(scratchRoot(), workspace).startsWith("..")).toBe(false);
+      expect(
+        path.relative(realpathSync(scratchRoot()), realpathSync(workspace)).startsWith(".."),
+      ).toBe(false);
     } finally {
       rmSync(workspace, { recursive: true, force: true });
     }
@@ -55,7 +58,7 @@ describe("ensureIsolatedScratchWorkspace", () => {
   it("does not let path-like thread ids escape the scratch root", () => {
     const workspace = ensureIsolatedScratchWorkspace(ThreadId.makeUnsafe("../outside/thread"));
     try {
-      const relative = path.relative(scratchRoot(), workspace);
+      const relative = path.relative(realpathSync(scratchRoot()), realpathSync(workspace));
       expect(relative.startsWith("..")).toBe(false);
       expect(path.isAbsolute(relative)).toBe(false);
       expect(workspace).not.toContain(`${path.sep}..${path.sep}`);
@@ -76,7 +79,9 @@ describe("ensureIsolatedScratchWorkspace", () => {
         chmodSync(rootDir, 0o755);
         chmodSync(workspaceDir, 0o755);
 
-        expect(ensureIsolatedScratchWorkspace(threadId, { rootDir })).toBe(workspaceDir);
+        expect(ensureIsolatedScratchWorkspace(threadId, { rootDir })).toBe(
+          realpathSync(workspaceDir),
+        );
         expect(statSync(rootDir).mode & 0o777).toBe(0o700);
         expect(statSync(workspaceDir).mode & 0o777).toBe(0o700);
       } finally {

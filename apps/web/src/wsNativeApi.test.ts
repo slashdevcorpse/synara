@@ -282,6 +282,45 @@ describe("wsNativeApi", () => {
     ]);
   });
 
+  it("keeps the E2E-only readiness probe alive through a cold provider launch", async () => {
+    vi.useFakeTimers();
+    Object.defineProperty(getWindowForTest(), "desktopBridge", {
+      configurable: true,
+      value: { isE2eHarness: true },
+    });
+    let refreshCount = 0;
+    requestMock.mockImplementation(async (method) => {
+      if (method === ORCHESTRATION_WS_METHODS.getShellSnapshot) {
+        return {
+          snapshotSequence: 15,
+          projects: [],
+          threads: [],
+          updatedAt: "2026-01-01T00:00:00.000Z",
+        };
+      }
+      if (method === WS_METHODS.serverRefreshProviders) {
+        refreshCount += 1;
+        return { providers: refreshCount < 9 ? [] : defaultProviders };
+      }
+      throw new Error(`Unexpected RPC method: ${String(method)}`);
+    });
+    const { createWsNativeApi } = await import("./wsNativeApi");
+
+    createWsNativeApi();
+
+    const startedAt = Date.now();
+    const readiness = getWindowForTest().__synaraE2e?.probeReadiness();
+    const assertion = expect(readiness).resolves.toEqual({
+      snapshotSequence: 15,
+      providers: defaultProviders,
+    });
+    await vi.runAllTimersAsync();
+    await assertion;
+
+    expect(Date.now() - startedAt).toBe(2_600);
+    expect(refreshCount).toBe(9);
+  });
+
   it("does not certify a session before its deferred stream failure starts reconnecting", async () => {
     vi.useFakeTimers();
     Object.defineProperty(getWindowForTest(), "desktopBridge", {
@@ -374,8 +413,8 @@ describe("wsNativeApi", () => {
     await vi.runAllTimersAsync();
     await assertion;
 
-    expect(Date.now() - startedAt).toBe(1_500);
-    expect(requestMock).toHaveBeenCalledTimes(16);
+    expect(Date.now() - startedAt).toBe(30_000);
+    expect(requestMock).toHaveBeenCalledTimes(121);
   });
 
   it("removes the renderer readiness probe when the native API is reset", async () => {

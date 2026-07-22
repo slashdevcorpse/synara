@@ -296,11 +296,11 @@ function createGitCommandError(
 }
 
 const DIRTY_WORKTREE_PATTERN =
-  /Your local changes to the following files would be overwritten by (?:checkout|merge):\s*([\s\S]*?)Please commit your changes or stash them/;
+  /Your local changes to the following files would be overwritten by (?:checkout|merge):\r?\n([\s\S]*?)(?=^(?:Please commit your changes or stash them\b.*|Aborting)\r?$)/m;
 const UNTRACKED_OVERWRITE_PATTERN =
-  /The following untracked working tree files would be overwritten by (?:checkout|merge):\s*([\s\S]*?)Please move or remove them/;
+  /The following untracked working tree files would be overwritten by (?:checkout|merge):\r?\n([\s\S]*?)(?=^(?:Please move or remove them\b.*|Aborting)\r?$)/m;
 
-function parseDirtyWorktreeFiles(stderr: string): string[] | null {
+export function parseDirtyWorktreeFiles(stderr: string): string[] | null {
   const match = DIRTY_WORKTREE_PATTERN.exec(stderr) ?? UNTRACKED_OVERWRITE_PATTERN.exec(stderr);
   if (!match?.[1]) return null;
   const files = splitLines(match[1])

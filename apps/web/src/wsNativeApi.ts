@@ -53,10 +53,10 @@ let instance: { api: NativeApi; transport: WsTransport } | null = null;
 
 // A failed feature stream waits 500 ms before reconnecting. Require a slightly longer unchanged
 // open-session interval so the E2E fixture cannot certify a socket whose deferred failure handler
-// has not run yet. The retry window then spans the first reconnect session's additional 500 ms
-// delay, with time left for its handshake and scheduling jitter.
-const E2E_READINESS_MAX_ATTEMPTS = 16;
-const E2E_READINESS_RETRY_DELAY_MS = 100;
+// has not run yet. Keep the E2E-only probe alive through a cold hosted Windows provider launch;
+// production RPC retry behavior remains unchanged.
+const E2E_READINESS_RETRY_WINDOW_MS = 30_000;
+const E2E_READINESS_RETRY_DELAY_MS = 250;
 const E2E_READINESS_STABILITY_DELAY_MS = 600;
 
 function clearE2eRendererHarness(): void {
@@ -72,7 +72,8 @@ function installE2eRendererHarness(api: NativeApi, transport: WsTransport): void
   window.__synaraE2e = {
     probeReadiness: async () => {
       let lastError: unknown;
-      for (let attempt = 0; attempt < E2E_READINESS_MAX_ATTEMPTS; attempt += 1) {
+      const retryDeadline = Date.now() + E2E_READINESS_RETRY_WINDOW_MS;
+      while (true) {
         try {
           const session = transport.getSessionSnapshot();
           const assertSameOpenSession = (): void => {
@@ -115,9 +116,11 @@ function installE2eRendererHarness(api: NativeApi, transport: WsTransport): void
         } catch (error) {
           lastError = error instanceof Error ? error : new Error(String(error));
         }
-        if (attempt < E2E_READINESS_MAX_ATTEMPTS - 1) {
-          await new Promise<void>((resolve) => setTimeout(resolve, E2E_READINESS_RETRY_DELAY_MS));
-        }
+        const remainingRetryMs = retryDeadline - Date.now();
+        if (remainingRetryMs <= 0) break;
+        await new Promise<void>((resolve) =>
+          setTimeout(resolve, Math.min(E2E_READINESS_RETRY_DELAY_MS, remainingRetryMs)),
+        );
       }
       throw lastError instanceof Error
         ? lastError

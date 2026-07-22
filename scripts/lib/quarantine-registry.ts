@@ -148,6 +148,7 @@ export function validateQuarantineRegistry(
       errors.push(`${label} must be a mapping.`);
       continue;
     }
+    const errorsBeforeEntry = errors.length;
     for (const key of Object.keys(value)) {
       if (!ENTRY_KEYS.has(key)) errors.push(`${label} has unsupported key \`${key}\`.`);
     }
@@ -203,37 +204,16 @@ export function validateQuarantineRegistry(
       errors.push(`${label} cases must be a positive integer.`);
     }
 
-    if (
-      typeof id === "string" &&
-      ID_PATTERN.test(id) &&
-      typeof path === "string" &&
-      path.length > 0 &&
-      !path.includes("\\") &&
-      !path.startsWith("/") &&
-      typeof marker === "string" &&
-      marker === `[quarantine:${id}]` &&
-      suite === "browser-geometry" &&
-      Array.isArray(platforms) &&
-      platforms.length > 0 &&
-      platforms.every(isPlatform) &&
-      typeof reason === "string" &&
-      reason.trim().length >= 12 &&
-      typeof owner === "string" &&
-      owner.trim().length > 0 &&
-      typeof lastFlaked === "string" &&
-      lastFlakedDate &&
-      Number.isInteger(cases) &&
-      (cases as number) > 0
-    ) {
+    if (errors.length === errorsBeforeEntry) {
       entries.push({
-        id,
-        path,
-        marker,
-        suite,
-        platform: platforms,
-        reason,
-        owner,
-        lastFlaked,
+        id: id as string,
+        path: path as string,
+        marker: marker as string,
+        suite: suite as "browser-geometry",
+        platform: platforms as QuarantinePlatform[],
+        reason: reason as string,
+        owner: owner as string,
+        lastFlaked: lastFlaked as string,
         cases: cases as number,
       });
     }

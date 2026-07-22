@@ -664,6 +664,7 @@ jobs:
       - browser_windows
       - e2e_linux
       - e2e_windows
+      - macos_arm64
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -675,6 +676,7 @@ jobs:
           test "${{ needs.browser_windows.result }}" = success
           test "${{ needs.e2e_linux.result }}" = success
           test "${{ needs.e2e_windows.result }}" = success
+          test "${{ needs.macos_arm64.result }}" = success
 
   release_smoke:
     name: release_smoke

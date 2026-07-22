@@ -22,6 +22,7 @@ export function browserQuarantineTestNamePattern(mode: "stable" | "quarantine"):
 
   const result = validateQuarantineRegistry(readFileSync(REGISTRY_PATH, "utf8"), {
     repositoryRoot: REPOSITORY_ROOT,
+    validateSources: false,
   });
   if (!result.registry || result.errors.length > 0) {
     throw new Error(
