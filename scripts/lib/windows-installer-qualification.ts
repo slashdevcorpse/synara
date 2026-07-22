@@ -16,7 +16,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join, normalize, resolve, sep, win32 } from "node:path";
+import { basename, join, normalize, relative, resolve, sep, win32 } from "node:path";
 
 import {
   SYNARA_WINDOWS_INSTALLER_GUID,
@@ -44,8 +44,10 @@ export type WindowsRegistryView = "32" | "64";
 export type WindowsRegistrationKind = "install" | "uninstall";
 export type WindowsInstallerCommandPhase = "install" | "uninstall";
 
-export const NSIS_INSTALL_TIMEOUT_MS = 600_000;
+export const NSIS_INSTALL_TIMEOUT_MS = 180_000;
 export const NSIS_UNINSTALL_TIMEOUT_MS = 180_000;
+export const NSIS_ATOMIC_UPGRADE_PATH_LIMIT = 259;
+const NSIS_PLUGIN_DIRECTORY_SEGMENT_BUDGET = 24;
 
 export interface WindowsRegistryTarget {
   readonly id: string;
@@ -350,6 +352,44 @@ function resolveQualificationPath(path: string): string {
   return resolve(path);
 }
 
+export function estimateWindowsNsisAtomicUpgradeDestinationLength(
+  tempDirectory: string,
+  installedRelativePath: string,
+): number {
+  const normalizedRelativePath = win32.normalize(installedRelativePath.replaceAll("/", "\\"));
+  if (
+    !normalizedRelativePath ||
+    win32.isAbsolute(normalizedRelativePath) ||
+    normalizedRelativePath === ".." ||
+    normalizedRelativePath.startsWith(`..${win32.sep}`)
+  ) {
+    throw new Error(
+      `NSIS atomic-upgrade path must be relative to the install directory: ${installedRelativePath}.`,
+    );
+  }
+  return win32.join(
+    resolveQualificationPath(tempDirectory),
+    "p".repeat(NSIS_PLUGIN_DIRECTORY_SEGMENT_BUDGET),
+    "old-install",
+    normalizedRelativePath,
+  ).length;
+}
+
+export function assertWindowsNsisAtomicUpgradePathBudget(
+  tempDirectory: string,
+  installedRelativePath: string,
+): void {
+  const estimatedLength = estimateWindowsNsisAtomicUpgradeDestinationLength(
+    tempDirectory,
+    installedRelativePath,
+  );
+  if (estimatedLength > NSIS_ATOMIC_UPGRADE_PATH_LIMIT) {
+    throw new Error(
+      `NSIS atomic-upgrade destination exceeds the guarded Windows path budget (estimatedLength=${estimatedLength}, limit=${NSIS_ATOMIC_UPGRADE_PATH_LIMIT}, installedRelativePath=${JSON.stringify(installedRelativePath)}, tempDirectory=${JSON.stringify(resolveQualificationPath(tempDirectory))}).`,
+    );
+  }
+}
+
 export function createSilentInstallerCommand(
   installerPath: string,
   installDirectory: string,
@@ -467,7 +507,7 @@ function createQualificationPaths(
   identity: SynaraDesktopIdentity,
   flavor: Exclude<SynaraDesktopFlavor, "development">,
 ): QualificationPaths {
-  const stateRoot = join(root, "state");
+  const stateRoot = join(root, "d");
   const environment = createPackagedDesktopSmokeEnvironment(
     stateRoot,
     { platform: "win", version: "qualification", flavor },
@@ -476,14 +516,14 @@ function createQualificationPaths(
   if (flavor !== "super") {
     delete environment.SYNARA_DESKTOP_QUALIFICATION_EXIT_AFTER_STARTUP;
   }
-  environment.TEMP = join(stateRoot, "temp");
+  environment.TEMP = join(root, "t");
   environment.TMP = environment.TEMP;
   mkdirSync(environment.TEMP, { recursive: true });
 
-  const installDirectory = join(root, "install", identity.displayName);
-  const profileSeed = join(root, "copied-profile-seed");
-  const seededBackendHome = join(profileSeed, "backend-home");
-  const seededDesktopProfile = join(profileSeed, "appdata", identity.userDataDirectoryName);
+  const installDirectory = join(root, "i");
+  const profileSeed = join(root, "p");
+  const seededBackendHome = join(profileSeed, "h");
+  const seededDesktopProfile = join(profileSeed, "a", identity.userDataDirectoryName);
   mkdirSync(join(seededBackendHome, "userdata"), { recursive: true });
   mkdirSync(seededDesktopProfile, { recursive: true });
   writeFileSync(
@@ -514,6 +554,20 @@ function createQualificationPaths(
       join(environment.APPDATA!, identity.userDataDirectoryName, "qualification-sentinel.bin"),
     ],
   };
+}
+
+function assertInstalledTreeWithinNsisAtomicUpgradePathBudget(paths: QualificationPaths): void {
+  const visit = (currentDirectory: string): void => {
+    for (const entry of readdirSync(currentDirectory, { withFileTypes: true })) {
+      const path = join(currentDirectory, entry.name);
+      const installedRelativePath = relative(paths.installDirectory, path)
+        .split(sep)
+        .join(win32.sep);
+      assertWindowsNsisAtomicUpgradePathBudget(paths.environment.TEMP!, installedRelativePath);
+      if (entry.isDirectory() && !entry.isSymbolicLink()) visit(path);
+    }
+  };
+  visit(paths.installDirectory);
 }
 
 function normalizedPathKey(path: string): string {
@@ -932,16 +986,12 @@ export async function qualifySuperSynaraWindowsInstaller(
     ? previousVersionFromInstaller(previousInstaller, currentVersion)
     : null;
 
-  const root = mkdtempSync(join(tmpdir(), "super-synara-installer-qualification-"));
+  const root = mkdtempSync(join(resolve(process.env.RUNNER_TEMP ?? tmpdir()), "sq-"));
   let superPaths: QualificationPaths;
   let upstreamPaths: QualificationPaths;
   try {
-    superPaths = createQualificationPaths(join(root, "super"), SUPER_IDENTITY, "super");
-    upstreamPaths = createQualificationPaths(
-      join(root, "upstream"),
-      UPSTREAM_IDENTITY,
-      "production",
-    );
+    superPaths = createQualificationPaths(join(root, "s"), SUPER_IDENTITY, "super");
+    upstreamPaths = createQualificationPaths(join(root, "u"), UPSTREAM_IDENTITY, "production");
     assertDistinctProfileRoots(superPaths, upstreamPaths);
   } catch (error) {
     rmSync(root, { recursive: true, force: true });
@@ -989,6 +1039,7 @@ export async function qualifySuperSynaraWindowsInstaller(
         superTargets,
         SUPER_IDENTITY,
       );
+      assertInstalledTreeWithinNsisAtomicUpgradePathBudget(superPaths);
       assertSentinelsUnchanged(superSentinelSnapshot);
       assertInstalledApplicationUnchanged(
         runtime,

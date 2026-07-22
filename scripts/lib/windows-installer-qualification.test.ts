@@ -1,14 +1,17 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { basename, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { synaraDesktopIdentity } from "@synara/shared/desktopIdentity";
 
 import {
+  assertWindowsNsisAtomicUpgradePathBudget,
   canonicalizeRegistryQueryOutput,
   createSilentInstallerCommand,
   createWindowsRegistrationTargets,
+  estimateWindowsNsisAtomicUpgradeDestinationLength,
+  NSIS_ATOMIC_UPGRADE_PATH_LIMIT,
   NSIS_INSTALL_TIMEOUT_MS,
   NSIS_UNINSTALL_TIMEOUT_MS,
   parseRegistryQueryOutput,
@@ -178,8 +181,8 @@ function fakeRuntime(): FakeRuntime {
       startupEnvironments.push(options.env);
       expect(options.command.endsWith("Synara.exe")).toBe(true);
       expect(options.command.endsWith("Super Synara.exe")).toBe(false);
-      expect(options.env.SYNARA_HOME).toContain("super-synara-installer-qualification-");
-      expect(options.env.APPDATA).toContain("super-synara-installer-qualification-");
+      expect(options.env.SYNARA_HOME).toMatch(/[\\/]sq-/);
+      expect(options.env.APPDATA).toMatch(/[\\/]sq-/);
       expect(options.env.SYNARA_DESKTOP_QUALIFICATION_EXIT_AFTER_STARTUP).toBeUndefined();
       runtime.upstreamRunning = true;
       lifecycleEvents.push("upstream-startup-proven");
@@ -207,8 +210,8 @@ function fakeRuntime(): FakeRuntime {
     verifyStartup: vi.fn(async (options) => {
       startupEnvironments.push(options.env);
       expect(options.command.endsWith("Super Synara.exe")).toBe(true);
-      expect(options.env.SYNARA_HOME).toContain("super-synara-installer-qualification-");
-      expect(options.env.APPDATA).toContain("super-synara-installer-qualification-");
+      expect(options.env.SYNARA_HOME).toMatch(/[\\/]sq-/);
+      expect(options.env.APPDATA).toMatch(/[\\/]sq-/);
       expect(options.env.SYNARA_DESKTOP_QUALIFICATION_EXIT_AFTER_STARTUP).toBe("1");
       expect(options.expectedIdentityProof).toEqual({
         flavor: "super",
@@ -367,6 +370,24 @@ describe("Windows installer qualification primitives", () => {
       args: ["/currentuser", "/S"],
     });
   });
+
+  it("guards the mirrored NSIS upgrade destination against legacy Windows path overflow", () => {
+    const tempDirectory = "D:\\a\\_temp\\sq-123456\\s\\t";
+    const packagedPath =
+      "resources\\app.asar.unpacked\\node_modules\\node-pty\\node-addon-api\\Release\\obj\\node_addon_api_except\\node_add.1103A96B.tlog\\node_addon_api_except.lastbuildstate";
+    expect(
+      estimateWindowsNsisAtomicUpgradeDestinationLength(tempDirectory, packagedPath),
+    ).toBeLessThanOrEqual(NSIS_ATOMIC_UPGRADE_PATH_LIMIT);
+    expect(() =>
+      assertWindowsNsisAtomicUpgradePathBudget(tempDirectory, packagedPath),
+    ).not.toThrow();
+    expect(() =>
+      assertWindowsNsisAtomicUpgradePathBudget(
+        tempDirectory,
+        `resources\\${"deep-segment\\".repeat(20)}payload.bin`,
+      ),
+    ).toThrow(/exceeds the guarded Windows path budget/);
+  });
 });
 
 describe("Super Synara Windows installer qualification", () => {
@@ -482,6 +503,23 @@ describe("Super Synara Windows installer qualification", () => {
       { phase: "uninstall", timeoutMs: NSIS_UNINSTALL_TIMEOUT_MS },
       { phase: "uninstall", timeoutMs: NSIS_UNINSTALL_TIMEOUT_MS },
     ]);
+    const upstreamInstallDirectory = runtime.commands[0]!.args.at(-1)!.slice(3);
+    const previousSuperCommand = runtime.commands[1]!;
+    const superInstallDirectory = previousSuperCommand.args.at(-1)!.slice(3);
+    const superTempDirectory = previousSuperCommand.env!.TEMP!;
+    const qualificationRoot = dirname(dirname(superInstallDirectory));
+    expect(basename(qualificationRoot)).toMatch(/^sq-/);
+    expect(basename(dirname(upstreamInstallDirectory))).toBe("u");
+    expect(basename(dirname(superInstallDirectory))).toBe("s");
+    expect(basename(superInstallDirectory)).toBe("i");
+    expect(basename(superTempDirectory)).toBe("t");
+    expect(dirname(superInstallDirectory)).toBe(dirname(superTempDirectory));
+    expect(superInstallDirectory.length).toBeLessThan(
+      join(qualificationRoot, "super", "install", identity.displayName).length,
+    );
+    expect(superTempDirectory.length).toBeLessThan(
+      join(qualificationRoot, "super", "state", "temp").length,
+    );
   });
 
   it("inventories vendor executables without claiming they are product-owned or unsigned", async () => {
