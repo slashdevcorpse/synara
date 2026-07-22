@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "repository": "slashdevcorpse/synara",
   "canonicalUpstream": "Emanuele-web04/synara",
-  "verifiedOn": "2026-07-21",
+  "verifiedOn": "2026-07-22",
   "patches":
     [
       {
@@ -1936,6 +1936,35 @@
               "status": "upstreamed",
               "date": "2026-07-21",
               "evidence": "PR 425 merged as 9ceb8f2876089c755ef6acf32c4708c5cdb71b30 and was absorbed downstream by PR 124 at 2cf9a6115c142e33799a854e8b9315207c46d558 without advancing the classified full-sync authority beyond 1664ce2f152cd6131a30d1ee8d7c9b60235bb0fe",
+            },
+          ],
+      },
+      {
+        "id": "windows-job-drain-artifact-cleanup",
+        "purpose": "Finalize asynchronous Windows Job drain proof without leaving request, acknowledgement, or temporary acknowledgement artifacts on invalid-proof and cleanup-failure paths.",
+        "userVisibleConsequence": "Windows provider shutdown remains fail closed while stale Job control artifacts cannot dirty release preflight or survive a tampered drain acknowledgement.",
+        "owner": "slashdevcorpse",
+        "status": "downstream-only",
+        "upstreamSourceCommit": null,
+        "introducingCommit": "c196a1986b7d4ee35054988ffc14ed67b27f2ada",
+        "touchedFiles":
+          [
+            "apps/server/src/provider/windowsJobProcessSupervisor.test.ts",
+            "apps/server/src/provider/windowsJobProcessSupervisor.ts",
+          ],
+        "subsystems": ["windows", "provider-runtime", "process-containment", "release"],
+        "regressionTests": ["apps/server/src/provider/windowsJobProcessSupervisor.test.ts"],
+        "upstreamLinks": ["https://github.com/slashdevcorpse/synara/pull/129"],
+        "overlapResolutionPolicy": "Retain proof-first failure ordering, attempt cleanup of the request, acknowledgement, and temporary acknowledgement on every terminal verification path, and aggregate cleanup failures without accepting a missing or tampered proof. Keep exact fixture-path cleanup as a final test safeguard; never weaken the release worktree validator or Windows Job ownership proof to accommodate artifacts.",
+        "lastAssessedUpstreamSha": "1664ce2f152cd6131a30d1ee8d7c9b60235bb0fe",
+        "verificationDate": "2026-07-22",
+        "retirementCondition": "Retire after upstream provides equivalent fail-closed asynchronous Windows Job proof finalization with exhaustive artifact cleanup, deterministic error aggregation, and permanent regression coverage.",
+        "statusHistory":
+          [
+            {
+              "status": "downstream-only",
+              "date": "2026-07-22",
+              "evidence": "Release run 29894316751 exposed the tampered-proof fixture leak; downstream PR 129 fixes production finalization and fixture cleanup at c196a1986b7d4ee35054988ffc14ed67b27f2ada",
             },
           ],
       },
