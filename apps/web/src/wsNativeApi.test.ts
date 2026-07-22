@@ -282,7 +282,7 @@ describe("wsNativeApi", () => {
     ]);
   });
 
-  it("spans the first reconnect window without certifying the replaced session", async () => {
+  it("does not certify a session before its deferred stream failure starts reconnecting", async () => {
     vi.useFakeTimers();
     Object.defineProperty(getWindowForTest(), "desktopBridge", {
       configurable: true,
@@ -305,7 +305,9 @@ describe("wsNativeApi", () => {
       if (method === WS_METHODS.serverRefreshProviders) {
         refreshCount += 1;
         if (refreshCount === 1) {
-          transportState = "connecting";
+          setTimeout(() => {
+            transportState = "connecting";
+          }, 500);
           setTimeout(() => {
             transportSessionGeneration += 1;
             transportState = "open";
@@ -329,11 +331,12 @@ describe("wsNativeApi", () => {
     await vi.runAllTimersAsync();
     await assertion;
 
-    expect(Date.now() - startedAt).toBe(1_100);
+    expect(Date.now() - startedAt).toBe(1_700);
     expect(refreshCount).toBe(2);
     expect(requestMock.mock.calls.map(([method]) => method)).toEqual([
       ORCHESTRATION_WS_METHODS.getShellSnapshot,
       WS_METHODS.serverRefreshProviders,
+      ORCHESTRATION_WS_METHODS.getShellSnapshot,
       ORCHESTRATION_WS_METHODS.getShellSnapshot,
       WS_METHODS.serverRefreshProviders,
       ORCHESTRATION_WS_METHODS.getShellSnapshot,

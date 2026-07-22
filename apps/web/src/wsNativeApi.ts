@@ -51,10 +51,13 @@ import { resolveWsHttpUrl } from "./lib/wsHttpUrl";
 
 let instance: { api: NativeApi; transport: WsTransport } | null = null;
 
-// A failed feature stream waits 500 ms before reconnecting, then the first reconnect session
-// waits another 500 ms. Fifteen retry intervals leave 500 ms for handshake and scheduling jitter.
+// A failed feature stream waits 500 ms before reconnecting. Require a slightly longer unchanged
+// open-session interval so the E2E fixture cannot certify a socket whose deferred failure handler
+// has not run yet. The retry window then spans the first reconnect session's additional 500 ms
+// delay, with time left for its handshake and scheduling jitter.
 const E2E_READINESS_MAX_ATTEMPTS = 16;
 const E2E_READINESS_RETRY_DELAY_MS = 100;
+const E2E_READINESS_STABILITY_DELAY_MS = 600;
 
 function clearE2eRendererHarness(): void {
   if (typeof window !== "undefined") {
@@ -101,7 +104,9 @@ function installE2eRendererHarness(api: NativeApi, transport: WsTransport): void
             throw new Error("Desktop E2E provider refresh omitted the enabled Codex provider.");
           }
 
-          await new Promise<void>((resolve) => setTimeout(resolve, 0));
+          await new Promise<void>((resolve) =>
+            setTimeout(resolve, E2E_READINESS_STABILITY_DELAY_MS),
+          );
           const snapshot = await requestOnSameSession(() => api.orchestration.getShellSnapshot());
           return {
             snapshotSequence: snapshot.snapshotSequence,
