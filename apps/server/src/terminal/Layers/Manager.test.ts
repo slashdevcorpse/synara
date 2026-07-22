@@ -2027,7 +2027,10 @@ describe("TerminalManager", () => {
         treeSignals.push({ rootPid, signal, includeRootTree });
       },
     };
-    const { manager, ptyAdapter } = makeManager(5, { processTreeKiller });
+    const { manager, ptyAdapter } = makeManager(5, {
+      processTreeKiller,
+      subprocessPlatform: "win32",
+    });
     await manager.open(openInput({ terminalId: "default" }));
     await manager.open(openInput({ terminalId: "sidecar" }));
     const defaultProcess = ptyAdapter.processes[0];
@@ -2176,7 +2179,10 @@ describe("TerminalManager", () => {
         });
       },
     };
-    const { manager, ptyAdapter } = makeManager(5, { processTreeKiller });
+    const { manager, ptyAdapter } = makeManager(5, {
+      processTreeKiller,
+      subprocessPlatform: "win32",
+    });
     await manager.open(openInput());
     const process = ptyAdapter.processes[0];
     expect(process).toBeDefined();
@@ -2555,7 +2561,10 @@ describe("TerminalManager", () => {
         treeSignals.push({ signal, includeRootTree });
       },
     };
-    const { manager, ptyAdapter } = makeManager(5, { processTreeKiller });
+    const { manager, ptyAdapter } = makeManager(5, {
+      processTreeKiller,
+      subprocessPlatform: "win32",
+    });
     await manager.open(openInput());
     const process = ptyAdapter.processes[0];
     expect(process).toBeDefined();
