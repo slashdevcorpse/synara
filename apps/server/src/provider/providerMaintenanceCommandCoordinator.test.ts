@@ -22,12 +22,19 @@ class CoordinatorTestError extends Error {
 
 const tempDirectories: string[] = [];
 
-async function makeLockDirectory(): Promise<string> {
-  const directory = await NodeFs.mkdtemp(
+async function makeLockFixture(): Promise<{
+  readonly installRoot: string;
+  readonly lockDirectory: string;
+}> {
+  const created = await NodeFs.mkdtemp(
     NodePath.join(NodeOs.tmpdir(), "synara-provider-command-coordinator-"),
   );
+  const directory = await NodeFs.realpath(created);
   tempDirectories.push(directory);
-  return directory;
+  const installRoot = NodePath.join(directory, "cli-install");
+  const lockDirectory = NodePath.join(directory, "maintenance-locks");
+  await NodeFs.mkdir(installRoot);
+  return { installRoot, lockDirectory };
 }
 
 function makeCoordinator(directoryPath: string) {
@@ -35,7 +42,7 @@ function makeCoordinator(directoryPath: string) {
     crossProcessLockDirectory: directoryPath,
     makeAlreadyRunningError: (targetKey) => new CoordinatorTestError("already-running", targetKey),
     makeCrossProcessLockError: (targetKey, lockKey, cause) =>
-      new CoordinatorTestError("cross-process", lockKey, targetKey, cause._tag),
+      new CoordinatorTestError("cross-process", lockKey, targetKey, cause.name),
   });
 }
 
@@ -49,17 +56,17 @@ afterEach(async () => {
 
 describe("provider maintenance command coordinator", () => {
   it("rejects duplicate target requests in one process", async () => {
-    const directoryPath = await makeLockDirectory();
+    const { installRoot, lockDirectory } = await makeLockFixture();
     const result = await Effect.runPromise(
       Effect.gen(function* () {
-        const coordinator = yield* makeCoordinator(directoryPath);
+        const coordinator = yield* makeCoordinator(lockDirectory);
         const started = yield* Deferred.make<void>();
         const release = yield* Deferred.make<void>();
         const first = yield* coordinator
           .withCommandLock({
             targetKey: "codex",
             lockKey: "npm-global:/shared",
-            canonicalInstallRoot: directoryPath,
+            canonicalInstallRoot: installRoot,
             run: Deferred.succeed(started, undefined).pipe(Effect.andThen(Deferred.await(release))),
           })
           .pipe(Effect.forkChild);
@@ -68,7 +75,7 @@ describe("provider maintenance command coordinator", () => {
           coordinator.withCommandLock({
             targetKey: "codex",
             lockKey: "npm-global:/shared",
-            canonicalInstallRoot: directoryPath,
+            canonicalInstallRoot: installRoot,
             run: Effect.void,
           }),
         );
@@ -82,18 +89,18 @@ describe("provider maintenance command coordinator", () => {
   });
 
   it("excludes the same canonical root across independent coordinators", async () => {
-    const directoryPath = await makeLockDirectory();
+    const { installRoot, lockDirectory } = await makeLockFixture();
     const result = await Effect.runPromise(
       Effect.gen(function* () {
-        const firstCoordinator = yield* makeCoordinator(directoryPath);
-        const secondCoordinator = yield* makeCoordinator(directoryPath);
+        const firstCoordinator = yield* makeCoordinator(lockDirectory);
+        const secondCoordinator = yield* makeCoordinator(lockDirectory);
         const started = yield* Deferred.make<void>();
         const release = yield* Deferred.make<void>();
         const first = yield* firstCoordinator
           .withCommandLock({
             targetKey: "codex",
             lockKey: "npm-global:/shared",
-            canonicalInstallRoot: directoryPath,
+            canonicalInstallRoot: installRoot,
             run: Deferred.succeed(started, undefined).pipe(Effect.andThen(Deferred.await(release))),
           })
           .pipe(Effect.forkChild);
@@ -102,7 +109,7 @@ describe("provider maintenance command coordinator", () => {
           secondCoordinator.withCommandLock({
             targetKey: "opencode",
             lockKey: "npm-global:/shared",
-            canonicalInstallRoot: directoryPath,
+            canonicalInstallRoot: installRoot,
             run: Effect.void,
           }),
         );
@@ -121,10 +128,10 @@ describe("provider maintenance command coordinator", () => {
   });
 
   it("releases a target reservation when a queued command is interrupted", async () => {
-    const directoryPath = await makeLockDirectory();
+    const { installRoot, lockDirectory } = await makeLockFixture();
     const result = await Effect.runPromise(
       Effect.gen(function* () {
-        const coordinator = yield* makeCoordinator(directoryPath);
+        const coordinator = yield* makeCoordinator(lockDirectory);
         const firstStarted = yield* Deferred.make<void>();
         const releaseFirst = yield* Deferred.make<void>();
         const queued = yield* Deferred.make<void>();
@@ -132,7 +139,7 @@ describe("provider maintenance command coordinator", () => {
           .withCommandLock({
             targetKey: "codex",
             lockKey: "npm-global:/shared",
-            canonicalInstallRoot: directoryPath,
+            canonicalInstallRoot: installRoot,
             run: Deferred.succeed(firstStarted, undefined).pipe(
               Effect.andThen(Deferred.await(releaseFirst)),
             ),
@@ -144,7 +151,7 @@ describe("provider maintenance command coordinator", () => {
           .withCommandLock({
             targetKey: "opencode",
             lockKey: "npm-global:/shared",
-            canonicalInstallRoot: directoryPath,
+            canonicalInstallRoot: installRoot,
             onQueued: Deferred.succeed(queued, undefined),
             run: Effect.void,
           })
@@ -156,7 +163,7 @@ describe("provider maintenance command coordinator", () => {
         yield* coordinator.withCommandLock({
           targetKey: "opencode",
           lockKey: "npm-global:/other",
-          canonicalInstallRoot: directoryPath,
+          canonicalInstallRoot: installRoot,
           run: Effect.sync(() => {
             retried = true;
           }),
