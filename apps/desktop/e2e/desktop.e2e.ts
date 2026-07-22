@@ -256,7 +256,7 @@ test("runs a real terminal and renders echoed output", async ({ desktop }) => {
     .last();
   await expect(terminalInput).toBeVisible({ timeout: 30_000 });
   await terminalInput.focus();
-  await desktop.page.keyboard.type("node -e \"console.log('E2E_TERMINAL_'+(6*7))\"");
+  await desktop.page.keyboard.insertText("node -e \"console.log('E2E_TERMINAL_'+(6*7))\"");
   await desktop.page.keyboard.press("Enter");
   await desktop.page.keyboard.press("Control+f");
   const findInput = desktop.page.getByRole("textbox", { name: "Find", exact: true });
