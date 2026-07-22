@@ -35,6 +35,7 @@ const PUBLISH_JOB_CONDITION =
   "${{ always() && needs.draft_admission.result == 'success' && needs.preflight.result == 'success' && needs.windows_x64.result == 'success' && ((needs.preflight.outputs.include_macos == 'true' && needs.macos_arm64.result == 'success') || (needs.preflight.outputs.include_macos == 'false' && needs.macos_arm64.result == 'skipped')) }}";
 const CHECKOUT_ACTION = "actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10";
 const SETUP_NODE_ACTION = "actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38";
+const UPLOAD_ARTIFACT_ACTION = "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a";
 const PLANNED_SOURCE_PROOF_COMMAND = [
   "node scripts/verify-release-source-provenance.ts \\",
   '"$VERSION" "$TAG" true "$SOURCE_COMMIT" branch main \\',
@@ -1066,11 +1067,65 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
       "Windows installer qualification must run after packaged startup verification.",
     );
   }
-  requireText(
-    main,
-    "- id: windows_installer_qualification\n        name: Qualify concurrent Windows side-by-side runtime, upgrade, and uninstall",
-    "Windows installer qualification must expose the stable step id used by failure diagnostics.",
+  const indexedWindowsSteps = windowsJob.steps.flatMap((step, index) =>
+    isRecord(step) ? [{ index, step }] : [],
   );
+  const windowsQualificationSteps = indexedWindowsSteps.filter(
+    ({ step }) =>
+      typeof step.run === "string" &&
+      step.run.includes("scripts/qualify-super-synara-windows-installer.ts"),
+  );
+  const windowsQualificationStep = windowsQualificationSteps[0];
+  if (
+    windowsQualificationSteps.length !== 1 ||
+    !windowsQualificationStep ||
+    !hasExactKeys(windowsQualificationStep.step, ["id", "name", "shell", "env", "run"]) ||
+    windowsQualificationStep.step.id !== "windows_installer_qualification" ||
+    windowsQualificationStep.step.name !==
+      "Qualify concurrent Windows side-by-side runtime, upgrade, and uninstall" ||
+    windowsQualificationStep.step.shell !== "pwsh"
+  ) {
+    throw new Error(
+      "The same Windows step that runs native installer qualification must own its stable diagnostic id and name.",
+    );
+  }
+  const windowsDiagnosticCandidateSteps = indexedWindowsSteps.filter(
+    ({ step }) => step.name === "Retain exact Windows candidate for failed qualification diagnosis",
+  );
+  const windowsDiagnosticCandidateStep = windowsDiagnosticCandidateSteps[0];
+  if (
+    windowsDiagnosticCandidateSteps.length !== 1 ||
+    !windowsDiagnosticCandidateStep ||
+    !hasExactKeys(windowsDiagnosticCandidateStep.step, ["name", "if", "uses", "with"]) ||
+    windowsDiagnosticCandidateStep.step.if !==
+      "${{ failure() && steps.windows_installer_qualification.outcome == 'failure' }}" ||
+    windowsDiagnosticCandidateStep.step.uses !== UPLOAD_ARTIFACT_ACTION ||
+    !hasExactEntries(windowsDiagnosticCandidateStep.step.with, {
+      name: "super-synara-windows-x64-candidate-${{ github.run_attempt }}",
+      path: "release-publish/Super-Synara-${{ needs.preflight.outputs.version }}-windows-x64-unsigned.exe",
+      "if-no-files-found": "error",
+      "retention-days": 1,
+      "compression-level": 0,
+    })
+  ) {
+    throw new Error(
+      "Windows diagnostic retention must be the exact failure-scoped pinned candidate upload.",
+    );
+  }
+  const windowsProvenanceSteps = indexedWindowsSteps.filter(
+    ({ step }) => step.name === "Write final Windows provenance from native qualification",
+  );
+  const windowsProvenanceStep = windowsProvenanceSteps[0];
+  if (
+    windowsProvenanceSteps.length !== 1 ||
+    !windowsProvenanceStep ||
+    windowsDiagnosticCandidateStep.index !== windowsQualificationStep.index + 1 ||
+    windowsProvenanceStep.index !== windowsDiagnosticCandidateStep.index + 1
+  ) {
+    throw new Error(
+      "The Windows diagnostic candidate must immediately follow native qualification and precede provenance generation.",
+    );
+  }
   const windowsProvenanceIndex = main.indexOf(
     "Write final Windows provenance from native qualification",
   );
@@ -1081,43 +1136,6 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
   ) {
     throw new Error(
       "Windows provenance must consume native qualification before the exact lane is uploaded.",
-    );
-  }
-  const windowsDiagnosticCandidateIndex = main.indexOf(
-    "Retain exact Windows candidate for failed qualification diagnosis",
-  );
-  if (
-    windowsDiagnosticCandidateIndex <= installerQualificationIndex ||
-    windowsDiagnosticCandidateIndex >= windowsProvenanceIndex
-  ) {
-    throw new Error(
-      "The Windows diagnostic candidate upload must run after native qualification and before provenance generation.",
-    );
-  }
-  const windowsDiagnosticCandidateEnd = main.indexOf(
-    "\n      - name:",
-    windowsDiagnosticCandidateIndex + 1,
-  );
-  const windowsDiagnosticCandidateBlock = main.slice(
-    windowsDiagnosticCandidateIndex,
-    windowsDiagnosticCandidateEnd,
-  );
-  requireText(
-    windowsDiagnosticCandidateBlock,
-    "if: ${{ failure() && steps.windows_installer_qualification.outcome == 'failure' }}",
-    "The Windows diagnostic candidate upload must run only when its qualification step fails.",
-  );
-  for (const candidateNeedle of [
-    "super-synara-windows-x64-candidate-${{ github.run_attempt }}",
-    "path: release-publish/Super-Synara-${{ needs.preflight.outputs.version }}-windows-x64-unsigned.exe",
-    "if-no-files-found: error",
-    "retention-days: 1",
-    "compression-level: 0",
-  ]) {
-    requireText(
-      windowsDiagnosticCandidateBlock,
-      candidateNeedle,
-      `The Windows diagnostic candidate upload is missing ${candidateNeedle}.`,
     );
   }
   const windowsUploadBlock = main.slice(
