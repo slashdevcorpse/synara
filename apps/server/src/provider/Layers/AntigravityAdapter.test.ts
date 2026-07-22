@@ -67,7 +67,7 @@ function runCaptureCommand(command: string, input: string, env: NodeJS.ProcessEn
     env: { ...process.env, ...env },
     input,
     encoding: "utf8",
-    timeout: 1_000,
+    timeout: 10_000,
     windowsVerbatimArguments: process.platform === "win32",
   });
 }
@@ -214,6 +214,7 @@ async function runWithAdapter<T>(
 async function startFakeAdapterTurn(input: {
   readonly fake: FakeChild;
   readonly teardownProcessTree: NonNullable<AntigravityProcessDependencies["teardownProcessTree"]>;
+  readonly spawnProcess?: NonNullable<AntigravityProcessDependencies["spawnProcess"]>;
   readonly beforeTurnFinalization?: AntigravityAdapterLiveOptions["beforeTurnFinalization"];
   readonly use: (adapter: AntigravityAdapterShape, threadId: ThreadId) => Promise<void>;
 }): Promise<void> {
@@ -222,6 +223,7 @@ async function startFakeAdapterTurn(input: {
     {
       ...fakeProcessDependencies(input.fake, {
         teardownProcessTree: input.teardownProcessTree,
+        ...(input.spawnProcess ? { spawnProcess: input.spawnProcess } : {}),
       }),
       installCapturePlugin: async () => undefined,
       ...(input.beforeTurnFinalization
@@ -1109,6 +1111,44 @@ describe("Antigravity process spawning and output ownership", () => {
 });
 
 describe("Antigravity active turn lifecycle", () => {
+  it("wires exact managed capture paths without enabling Electron mode on the provider", async () => {
+    const fake = makeFakeChild();
+    let spawnedEnv: NodeJS.ProcessEnv | undefined;
+    const spawnProcess = vi.fn(
+      (_command: string, _args: ReadonlyArray<string>, options: SpawnOptions) => {
+        spawnedEnv = options.env;
+        return fake.child;
+      },
+    );
+    const teardownProcessTree = vi.fn(async () => {
+      fake.emitClose(null, "SIGTERM");
+    });
+
+    await startFakeAdapterTurn({
+      fake,
+      spawnProcess,
+      teardownProcessTree,
+      use: async (adapter, threadId) => {
+        expect(spawnedEnv).toMatchObject({
+          SYNARA_ANTIGRAVITY_CAPTURE_EXECUTABLE: process.execPath,
+          SYNARA_ANTIGRAVITY_CAPTURE_SCRIPT: path.join(
+            os.homedir(),
+            ".gemini",
+            "antigravity-cli",
+            "plugins",
+            "synara-capture",
+            "capture.cjs",
+          ),
+        });
+        expect(spawnedEnv?.ELECTRON_RUN_AS_NODE).toBeUndefined();
+        await Effect.runPromise(adapter.stopSession(threadId));
+      },
+    });
+
+    expect(spawnProcess).toHaveBeenCalledOnce();
+    expect(teardownProcessTree).toHaveBeenCalledOnce();
+  });
+
   it("keeps interrupt pending through shared teardown and full finalization", async () => {
     const fake = makeFakeChild();
     const teardown = deferred<void>();

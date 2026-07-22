@@ -209,6 +209,8 @@ export function buildAntigravityCaptureCommand(
   platform: NodeJS.Platform = process.platform,
 ): string {
   if (platform === "win32") {
+    // cmd.exe expands these references once, preserving any literal %NAME% segments in the
+    // environment-provided path values instead of recursively treating them as variables.
     const invocation = [
       `"%${ANTIGRAVITY_CAPTURE_EXECUTABLE_ENV}%"`,
       `"%${ANTIGRAVITY_CAPTURE_SCRIPT_ENV}%"`,
