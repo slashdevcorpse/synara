@@ -262,6 +262,7 @@ describe("Windows installer qualification primitives", () => {
       "child.unref();",
     ].join("\n");
 
+    let cleanupError: unknown;
     try {
       expect(() =>
         runNativeWindowsCommand({
@@ -282,11 +283,12 @@ describe("Windows installer qualification primitives", () => {
           try {
             process.kill(childPid);
           } catch (error) {
-            if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+            if ((error as NodeJS.ErrnoException).code !== "ESRCH") cleanupError = error;
           }
         }
       }
     }
+    if (cleanupError !== undefined) throw cleanupError;
   });
 
   it("fails closed when a native installer command times out or exits unsuccessfully", () => {
