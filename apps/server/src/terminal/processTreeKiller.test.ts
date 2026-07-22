@@ -11,6 +11,9 @@ import {
   collectDescendantProcesses,
   createProcessTreeKiller,
   parseProcessCommandMap,
+  parsePosixProcessSnapshot,
+  parseWindowsProcessSnapshot,
+  type CapturedProcess,
   type CapturedProcessTree,
   type ProcessChildrenMap,
   type TerminalKillSignal,
@@ -36,6 +39,35 @@ describe("processTreeKiller", () => {
     ]);
   });
 
+  it("captures Windows-style children that retain an exited root as their parent", () => {
+    const killer = createProcessTreeKiller({
+      captureProcessSnapshot: () =>
+        new Map([
+          [
+            202,
+            {
+              pid: 202,
+              parentPid: 201,
+              command: "node updater-child.js",
+              identity: "202:20260720120000.000000-240",
+            },
+          ],
+        ]),
+    });
+
+    expect(killer.capture(201)).toEqual({
+      descendants: [
+        {
+          pid: 202,
+          parentPid: 201,
+          command: "node updater-child.js",
+          identity: "202:20260720120000.000000-240",
+        },
+      ],
+      captureComplete: true,
+    });
+  });
+
   it("parses current command snapshots with command arguments intact", () => {
     expect(
       parseProcessCommandMap(`
@@ -50,208 +82,88 @@ describe("processTreeKiller", () => {
     );
   });
 
-  it("captures nested Windows descendants from the shared process snapshot", async () => {
-    const killer = createProcessTreeKiller({
-      platform: "win32",
-      captureWindowsSnapshot: async () => ({
-        kind: "ok",
-        processCount: 3,
-        childrenByParentPid: new Map([
-          [100, [{ pid: 101, command: "provider.exe" }]],
-          [101, [{ pid: 102, command: "worker.exe --serve" }]],
-          [999, [{ pid: 1000, command: "unrelated.exe" }]],
-        ]),
-      }),
-    });
-
-    await expect(killer.capture(100)).resolves.toEqual({
-      descendants: [
-        { pid: 101, command: "provider.exe" },
-        { pid: 102, command: "worker.exe --serve" },
-      ],
-      captureComplete: true,
-    });
-  });
-
-  it("fails capture closed when the bounded descendant walk is truncated", async () => {
-    const children = Array.from({ length: 257 }, (_, index) => ({
-      pid: index + 101,
-      command: `worker-${index}`,
-    }));
-    const killer = createProcessTreeKiller({
-      platform: "win32",
-      captureWindowsSnapshot: async () => ({
-        kind: "ok",
-        processCount: children.length,
-        childrenByParentPid: new Map([[100, children]]),
-      }),
-    });
-
-    await expect(killer.capture(100)).resolves.toMatchObject({
-      descendants: children.slice(0, 256),
-      captureComplete: false,
-    });
-  });
-
-  it.each(["capture_failed", "timed_out"] as const)(
-    "fails Windows capture closed when the snapshot is %s",
-    async (reason) => {
-      const killer = createProcessTreeKiller({
-        platform: "win32",
-        captureWindowsSnapshot: async () => ({ kind: "unknown", reason }),
-      });
-
-      await expect(killer.capture(100)).resolves.toEqual({
-        descendants: [],
-        captureComplete: false,
-      });
-    },
-  );
-
-  it("re-inspects Windows descendants by captured command identity", async () => {
-    const tree: CapturedProcessTree = {
-      descendants: [
-        { pid: 101, command: "provider.exe" },
-        { pid: 102, command: "worker.exe --serve" },
-      ],
-      captureComplete: true,
-    };
-    const killer = createProcessTreeKiller({
-      platform: "win32",
-      captureWindowsSnapshot: async () => ({
-        kind: "ok",
-        processCount: 2,
-        childrenByParentPid: new Map([
-          [1, [{ pid: 101, command: "provider.exe" }]],
-          [2, [{ pid: 102, command: "reused-pid.exe" }]],
-        ]),
-      }),
-    });
-
-    await expect(killer.inspect?.(tree)).resolves.toEqual({
-      verified: true,
-      survivors: [{ pid: 101, command: "provider.exe" }],
-    });
-  });
-
-  it("fails Windows inspection closed when the snapshot is unknown", async () => {
-    const tree: CapturedProcessTree = {
-      descendants: [{ pid: 101, command: "provider.exe" }],
-      captureComplete: true,
-    };
-    const killer = createProcessTreeKiller({
-      platform: "win32",
-      captureWindowsSnapshot: async () => ({ kind: "unknown", reason: "capture_failed" }),
-    });
-
-    await expect(killer.inspect?.(tree)).resolves.toEqual({
-      verified: false,
-      survivors: tree.descendants,
-    });
-  });
-
-  it("revalidates Windows command identities before signaling captured PIDs", async () => {
-    const signaledPids: number[] = [];
-    const killer = createProcessTreeKiller({
-      platform: "win32",
-      captureWindowsSnapshot: async () => ({
-        kind: "ok",
-        processCount: 2,
-        childrenByParentPid: new Map([
-          [1, [{ pid: 101, command: "provider.exe" }]],
-          [2, [{ pid: 102, command: "reused-pid.exe" }]],
-        ]),
-      }),
-      signalPid: (pid) => {
-        signaledPids.push(pid);
-        return null;
-      },
-      signalTree: () => {
-        throw new Error("The exited root tree must not be signaled.");
-      },
-    });
-
-    await killer.signal({
-      rootPid: 100,
-      signal: "SIGKILL",
-      includeRootTree: false,
-      tree: {
-        descendants: [
-          { pid: 101, command: "provider.exe" },
-          { pid: 102, command: "worker.exe" },
+  it("parses stable POSIX creation-time and process-group identities", () => {
+    expect(
+      parsePosixProcessSnapshot(
+        "  101  100  101 Mon Jul 20 12:34:56 2026 node updater.js --child\n",
+      ),
+    ).toEqual(
+      new Map([
+        [
+          101,
+          {
+            pid: 101,
+            parentPid: 100,
+            groupId: 101,
+            command: "node updater.js --child",
+            identity: "101:Mon Jul 20 12:34:56 2026",
+            identityPrecision: "seconds",
+          },
         ],
-        captureComplete: true,
-      },
-      onError: () => undefined,
-    });
-
-    expect(signaledPids).toEqual([101]);
+      ]),
+    );
   });
 
-  it("rechecks root ownership after delayed Windows identity preparation", async () => {
-    const identityPreparationStarted = Promise.withResolvers<void>();
-    const releaseIdentityPreparation = Promise.withResolvers<void>();
-    const signaledPids: number[] = [];
-    const treeSignals: number[] = [];
-    let rootOwned = true;
-    const killer = createProcessTreeKiller({
-      platform: "win32",
-      captureWindowsSnapshot: async () => {
-        identityPreparationStarted.resolve();
-        await releaseIdentityPreparation.promise;
-        return {
-          kind: "ok",
-          processCount: 1,
-          childrenByParentPid: new Map([[100, [{ pid: 101, command: "provider.exe" }]]]),
-        };
-      },
-      signalPid: (pid) => {
-        signaledPids.push(pid);
-        return null;
-      },
-      signalTree: (rootPid, _signal, callback) => {
-        treeSignals.push(rootPid);
-        callback(null);
-      },
-    });
-    const signaling = killer.signal({
-      rootPid: 100,
-      signal: "SIGKILL",
-      includeRootTree: true,
-      shouldSignalRootTree: () => rootOwned,
-      tree: {
-        descendants: [{ pid: 101, command: "provider.exe" }],
-        captureComplete: true,
-      },
-      onError: () => undefined,
-    });
-
-    await identityPreparationStarted.promise;
-    rootOwned = false;
-    releaseIdentityPreparation.resolve();
-    await signaling;
-
-    expect(signaledPids).toEqual([101]);
-    expect(treeSignals).toEqual([]);
+  it("parses stable Windows CIM creation identities", () => {
+    expect(
+      parseWindowsProcessSnapshot(
+        JSON.stringify({
+          ProcessId: 202,
+          ParentProcessId: 201,
+          CreationDate: "2026-07-20T12:34:56.000000-04:00",
+          CommandLine: "node updater-child.js",
+          ExecutablePath: "C:\\Program Files\\nodejs\\node.exe",
+          Name: "node.exe",
+        }),
+      ),
+    ).toEqual(
+      new Map([
+        [
+          202,
+          {
+            pid: 202,
+            parentPid: 201,
+            command: "node updater-child.js",
+            identity: "202:2026-07-20T12:34:56.000000-04:00",
+            identityPrecision: "exact",
+          },
+        ],
+      ]),
+    );
   });
 
-  it("validates captured child commands before delayed SIGKILL", async () => {
+  it("validates captured children without signalling an uncaptured root", async () => {
     const signaledPids: Array<{ pid: number; signal: TerminalKillSignal }> = [];
     const treeSignals: Array<{ rootPid: number; signal: TerminalKillSignal }> = [];
     const commandReadCalls: number[][] = [];
     const tree: CapturedProcessTree = {
       descendants: [
-        { pid: 102, command: "bun run dev" },
-        { pid: 103, command: "tsdown --watch" },
+        { pid: 102, command: "bun run dev", identity: "102:owned-start" },
+        { pid: 103, command: "tsdown --watch", identity: "103:owned-start" },
       ],
     };
     const killer = createProcessTreeKiller({
-      platform: "linux",
-      readCurrentCommands: (pids) => {
+      readCurrentProcesses: (pids) => {
         commandReadCalls.push([...pids]);
         return new Map([
-          [102, "bun run dev"],
-          [103, "node unrelated-process.js"],
+          [
+            102,
+            {
+              pid: 102,
+              parentPid: 100,
+              command: "bun run dev",
+              identity: "102:owned-start",
+            },
+          ],
+          [
+            103,
+            {
+              pid: 103,
+              parentPid: 100,
+              command: "node unrelated-process.js",
+              identity: "103:owned-start",
+            },
+          ],
         ]);
       },
       signalPid: (pid, signal) => {
@@ -273,16 +185,185 @@ describe("processTreeKiller", () => {
 
     expect(signaledPids).toEqual([{ pid: 102, signal: "SIGKILL" }]);
     expect(commandReadCalls).toEqual([[102, 103]]);
-    expect(treeSignals).toEqual([{ rootPid: 100, signal: "SIGKILL" }]);
+    expect(treeSignals).toEqual([]);
   });
 
-  it("does not validate captured child commands before initial SIGTERM", async () => {
+  it("reports an exec-replaced POSIX process instance as a live survivor", () => {
+    const captured = {
+      pid: 103,
+      groupId: 100,
+      command: "node updater-wrapper.js",
+      identity: "103:Mon Jul 20 12:34:56 2026",
+      identityPrecision: "seconds",
+    } satisfies CapturedProcess;
+    const killer = createProcessTreeKiller({
+      readCurrentProcesses: () =>
+        new Map([
+          [
+            captured.pid,
+            {
+              pid: captured.pid,
+              parentPid: 1,
+              groupId: captured.groupId,
+              command: "provider updater --apply",
+              identity: captured.identity,
+              identityPrecision: captured.identityPrecision,
+            },
+          ],
+        ]),
+    });
+
+    expect(killer.inspect?.({ descendants: [captured] })).toEqual({
+      verified: true,
+      survivors: [captured],
+    });
+  });
+
+  it("refuses to signal an exec-replaced command for the same POSIX process instance", () => {
+    const signaledPids: number[] = [];
+    const captured = {
+      pid: 103,
+      groupId: 100,
+      command: "node updater-wrapper.js",
+      identity: "103:Mon Jul 20 12:34:56 2026",
+      identityPrecision: "seconds",
+    } satisfies CapturedProcess;
+    const killer = createProcessTreeKiller({
+      readCurrentProcesses: () =>
+        new Map([
+          [
+            captured.pid,
+            {
+              pid: captured.pid,
+              parentPid: 1,
+              groupId: captured.groupId,
+              command: "provider updater --apply",
+              identity: captured.identity,
+              identityPrecision: captured.identityPrecision,
+            },
+          ],
+        ]),
+      signalPid: (pid) => {
+        signaledPids.push(pid);
+        return null;
+      },
+      signalTree: (_rootPid, _signal, callback) => callback(null),
+    });
+
+    killer.signal({
+      rootPid: 100,
+      signal: "SIGKILL",
+      includeRootTree: false,
+      tree: { descendants: [captured] },
+      onError: () => undefined,
+    });
+
+    expect(signaledPids).toEqual([]);
+  });
+
+  it("does not TERM a reused PID whose stable creation identity changed", () => {
     const signaledPids: number[] = [];
     const killer = createProcessTreeKiller({
-      platform: "linux",
-      readCurrentCommands: () => {
-        throw new Error("SIGTERM should not read current commands");
+      readCurrentProcesses: () =>
+        new Map([
+          [
+            102,
+            {
+              pid: 102,
+              parentPid: 100,
+              command: "provider worker",
+              identity: "102:new-process-start",
+            },
+          ],
+        ]),
+      signalPid: (pid) => {
+        signaledPids.push(pid);
+        return null;
       },
+      signalTree: (_rootPid, _signal, callback) => callback(null),
+    });
+
+    killer.signal({
+      rootPid: 100,
+      signal: "SIGTERM",
+      includeRootTree: false,
+      tree: {
+        descendants: [
+          {
+            pid: 102,
+            command: "provider worker",
+            identity: "102:owned-process-start",
+          },
+        ],
+      },
+      onError: () => undefined,
+    });
+
+    expect(signaledPids).toEqual([]);
+  });
+
+  it("does not signal a reused root PID whose stable creation identity changed", () => {
+    const treeSignals: number[] = [];
+    const killer = createProcessTreeKiller({
+      readCurrentProcesses: () =>
+        new Map([
+          [
+            100,
+            {
+              pid: 100,
+              parentPid: 1,
+              command: "unrelated root",
+              identity: "100:new-process-start",
+            },
+          ],
+        ]),
+      signalTree: (rootPid, _signal, callback) => {
+        treeSignals.push(rootPid);
+        callback(null);
+      },
+    });
+
+    killer.signal({
+      rootPid: 100,
+      signal: "SIGTERM",
+      tree: {
+        root: {
+          pid: 100,
+          command: "provider root",
+          identity: "100:owned-process-start",
+        },
+        descendants: [],
+      },
+      onError: () => undefined,
+    });
+
+    expect(treeSignals).toEqual([]);
+  });
+
+  it("validates captured child identity and command before initial SIGTERM", async () => {
+    const signaledPids: number[] = [];
+    const killer = createProcessTreeKiller({
+      readCurrentProcesses: () =>
+        new Map([
+          [
+            102,
+            {
+              pid: 102,
+              parentPid: 100,
+              command: "bun run dev",
+              identity: "102:owned-start",
+            },
+          ],
+          [
+            103,
+            {
+              pid: 103,
+              parentPid: 100,
+              command: "tsdown --watch",
+              identity: "103:owned-start",
+            },
+          ],
+        ]),
       signalPid: (pid) => {
         signaledPids.push(pid);
         return null;
@@ -295,8 +376,8 @@ describe("processTreeKiller", () => {
       signal: "SIGTERM",
       tree: {
         descendants: [
-          { pid: 102, command: "bun run dev" },
-          { pid: 103, command: "tsdown --watch" },
+          { pid: 102, command: "bun run dev", identity: "102:owned-start" },
+          { pid: 103, command: "tsdown --watch", identity: "103:owned-start" },
         ],
       },
       onError: () => undefined,
@@ -313,7 +394,18 @@ describe("processTreeKiller", () => {
     }> = [];
     let completeSignalTree: ((error?: Error | null) => void) | undefined;
     const killer = createProcessTreeKiller({
-      platform: "linux",
+      captureProcessSnapshotAsync: async () =>
+        new Map([
+          [
+            100,
+            {
+              pid: 100,
+              parentPid: 1,
+              command: "terminal root",
+              identity: "100:owned-start",
+            },
+          ],
+        ]),
       signalTree: (_rootPid, _signal, callback) => {
         completeSignalTree = callback;
       },
@@ -321,10 +413,13 @@ describe("processTreeKiller", () => {
 
     let settled = false;
     const signaling = Promise.resolve(
-      killer.signal({
+      killer.signalAsync?.({
         rootPid: 100,
         signal: "SIGTERM",
-        tree: { descendants: [] },
+        tree: {
+          root: { pid: 100, command: "terminal root", identity: "100:owned-start" },
+          descendants: [],
+        },
         onError: (error, context) => errors.push({ error, context }),
       }),
     ).then(() => {
@@ -350,8 +445,18 @@ describe("processTreeKiller", () => {
     const signaledPids: number[] = [];
     const treeSignals: number[] = [];
     const killer = createProcessTreeKiller({
-      platform: "linux",
-      readCurrentCommands: () => new Map([[103, "tsdown --watch"]]),
+      readCurrentProcesses: () =>
+        new Map([
+          [
+            103,
+            {
+              pid: 103,
+              parentPid: 100,
+              command: "tsdown --watch",
+              identity: "103:owned-start",
+            },
+          ],
+        ]),
       signalPid: (pid) => {
         signaledPids.push(pid);
         return null;
@@ -367,7 +472,7 @@ describe("processTreeKiller", () => {
       signal: "SIGKILL",
       includeRootTree: false,
       tree: {
-        descendants: [{ pid: 103, command: "tsdown --watch" }],
+        descendants: [{ pid: 103, command: "tsdown --watch", identity: "103:owned-start" }],
       },
       onError: () => undefined,
     });
@@ -375,8 +480,207 @@ describe("processTreeKiller", () => {
     expect(signaledPids).toEqual([103]);
     expect(treeSignals).toEqual([]);
   });
-});
 
+  it("refuses same-second POSIX PID reuse outside the captured process group", () => {
+    const signaledPids: number[] = [];
+    const killer = createProcessTreeKiller({
+      readCurrentProcesses: () =>
+        new Map([
+          [
+            103,
+            {
+              pid: 103,
+              parentPid: 1,
+              groupId: 999,
+              command: "provider worker",
+              identity: "103:Mon Jul 20 12:34:56 2026",
+              identityPrecision: "seconds",
+            },
+          ],
+        ]),
+      signalPid: (pid) => {
+        signaledPids.push(pid);
+        return null;
+      },
+      signalTree: (_rootPid, _signal, callback) => callback(null),
+    });
+
+    killer.signal({
+      rootPid: 100,
+      signal: "SIGTERM",
+      includeRootTree: false,
+      tree: {
+        descendants: [
+          {
+            pid: 103,
+            groupId: 100,
+            command: "provider worker",
+            identity: "103:Mon Jul 20 12:34:56 2026",
+            identityPrecision: "seconds",
+          },
+        ],
+      },
+      onError: () => undefined,
+    });
+
+    expect(signaledPids).toEqual([]);
+  });
+
+  it("refuses to signal a captured PID without a stable creation identity", () => {
+    const signaledPids: number[] = [];
+    const killer = createProcessTreeKiller({
+      readCurrentProcesses: () =>
+        new Map([[103, { pid: 103, parentPid: 100, command: "provider worker" }]]),
+      signalPid: (pid) => {
+        signaledPids.push(pid);
+        return null;
+      },
+      signalTree: (_rootPid, _signal, callback) => callback(null),
+    });
+
+    killer.signal({
+      rootPid: 100,
+      signal: "SIGKILL",
+      includeRootTree: false,
+      tree: { descendants: [{ pid: 103, command: "provider worker" }] },
+      onError: () => undefined,
+    });
+
+    expect(signaledPids).toEqual([]);
+  });
+
+  it("uses the asynchronous snapshot path for asynchronous signaling", async () => {
+    const signaledPids: number[] = [];
+    const killer = createProcessTreeKiller({
+      readCurrentProcesses: () => {
+        throw new Error("synchronous process-table read must not run");
+      },
+      captureProcessSnapshotAsync: async () =>
+        new Map([
+          [
+            103,
+            {
+              pid: 103,
+              parentPid: 100,
+              command: "provider worker",
+              identity: "103:owned-start",
+            },
+          ],
+        ]),
+      signalPid: (pid) => {
+        signaledPids.push(pid);
+        return null;
+      },
+      signalTree: (_rootPid, _signal, callback) => callback(null),
+    });
+
+    await killer.signalAsync?.({
+      rootPid: 100,
+      signal: "SIGTERM",
+      includeRootTree: false,
+      tree: {
+        descendants: [{ pid: 103, command: "provider worker", identity: "103:owned-start" }],
+      },
+      onError: () => undefined,
+    });
+
+    expect(signaledPids).toEqual([103]);
+  });
+
+  it("waits for asynchronous root-tree signaling to invoke its completion callback", async () => {
+    const root = {
+      pid: 100,
+      parentPid: 1,
+      command: "provider root",
+      identity: "100:owned-start",
+    };
+    let completeTreeSignal!: () => void;
+    let markTreeSignalStarted!: () => void;
+    const treeSignalStarted = new Promise<void>((resolve) => {
+      markTreeSignalStarted = resolve;
+    });
+    const killer = createProcessTreeKiller({
+      captureProcessSnapshotAsync: async () => new Map([[root.pid, root]]),
+      signalTree: (_rootPid, _signal, callback) => {
+        completeTreeSignal = () => callback(null);
+        markTreeSignalStarted();
+      },
+    });
+    let signalSettled = false;
+
+    const signaling = killer.signalAsync!({
+      rootPid: root.pid,
+      signal: "SIGKILL",
+      tree: { root, descendants: [], captureComplete: true },
+      onError: () => undefined,
+    }).then(() => {
+      signalSettled = true;
+    });
+
+    await treeSignalStarted;
+    expect(signalSettled).toBe(false);
+    completeTreeSignal();
+    await signaling;
+    expect(signalSettled).toBe(true);
+  });
+
+  it("captures reparented POSIX members through an explicitly owned process group", () => {
+    const killer = createProcessTreeKiller({
+      captureProcessSnapshot: () =>
+        new Map([
+          [
+            302,
+            {
+              pid: 302,
+              parentPid: 1,
+              groupId: 301,
+              command: "node postinstall.js",
+              identity: "302:Mon Jul 20 12:34:56 2026",
+            },
+          ],
+        ]),
+    });
+
+    expect(killer.capture(301, { processGroupId: 301 })).toMatchObject({
+      descendants: [
+        {
+          pid: 302,
+          groupId: 301,
+          identity: "302:Mon Jul 20 12:34:56 2026",
+        },
+      ],
+      captureComplete: true,
+    });
+  });
+
+  it("marks capture incomplete when descendant traversal reaches its safety cap", () => {
+    const snapshot = new Map();
+    snapshot.set(401, {
+      pid: 401,
+      parentPid: 1,
+      command: "provider root",
+      identity: "401:root-start",
+    });
+    for (let offset = 1; offset <= 257; offset += 1) {
+      const pid = 401 + offset;
+      snapshot.set(pid, {
+        pid,
+        parentPid: pid - 1,
+        command: `provider child ${offset}`,
+        identity: `${pid}:child-start`,
+      });
+    }
+    const killer = createProcessTreeKiller({ captureProcessSnapshot: () => snapshot });
+
+    expect(killer.capture(401)).toMatchObject({
+      captureComplete: false,
+      descendants: expect.arrayContaining([
+        expect.objectContaining({ pid: 402 }),
+        expect.objectContaining({ pid: 657 }),
+      ]),
+    });
+  });
+});
 it.runIf(process.platform === "win32")(
   "captures a native Windows child as a descendant of this process",
   async () => {

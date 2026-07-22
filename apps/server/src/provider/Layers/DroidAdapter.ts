@@ -84,6 +84,13 @@ import {
 } from "../acp/AcpAdapterSessionSupport.ts";
 import { type AcpSessionRuntimeShape } from "../acp/AcpSessionRuntime.ts";
 import {
+  type AcpSessionTeardownState,
+  awaitAcpSessionTeardown,
+  beginAcpSessionTeardown,
+  completeAcpSessionTeardown,
+  makeAcpSessionTeardownState,
+} from "../acp/AcpSessionTeardown.ts";
+import {
   makeAcpAssistantItemEvent,
   makeAcpContentDeltaEvent,
   makeAcpPlanUpdatedEvent,
@@ -178,6 +185,7 @@ function isDroidAcpDebugEnabled(): boolean {
 export interface DroidAdapterLiveOptions {
   readonly nativeEventLogPath?: string;
   readonly nativeEventLogger?: EventNdjsonLogger;
+  readonly closeSessionScope?: (scope: Scope.Closeable) => Effect.Effect<void>;
 }
 
 interface PendingApproval {
@@ -232,7 +240,7 @@ interface DroidSessionContext {
   sessionConfigReady: Deferred.Deferred<void> | undefined;
   // Resolves only after the ACP scope and its child process have fully closed.
   // Recovery awaits this gate before starting a replacement session.
-  readonly teardownComplete: Deferred.Deferred<void>;
+  readonly teardown: AcpSessionTeardownState;
   latestSessionCostUsd: number | undefined;
   // Count of ACP session/update events fully handled by the notification
   // consumer. Compared against acp.sessionUpdatesEnqueuedCount to detect when
@@ -355,6 +363,8 @@ export function makeDroidAdapter(
   options?: DroidAdapterLiveOptions,
 ) {
   return Effect.gen(function* () {
+    const closeSessionScope =
+      options?.closeSessionScope ?? ((scope: Scope.Closeable) => Scope.close(scope, Exit.void));
     const fileSystem = yield* FileSystem.FileSystem;
     const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
     const serverConfig = yield* Effect.service(ServerConfig);
@@ -542,44 +552,49 @@ export function makeDroidAdapter(
     ) =>
       Effect.uninterruptibleMask((restore) =>
         Effect.gen(function* () {
-          if (!ctx.stopped) {
-            ctx.stopped = true;
-            ctx.gatewaySessionLease?.release();
-            sessionTeardownGate.track(ctx.threadId, ctx.teardownComplete);
-            sessions.delete(ctx.threadId);
-            yield* settleAcpPendingApprovalsAsCancelled(ctx.pendingApprovals);
-            yield* settleAcpPendingUserInputsAsEmptyAnswers(ctx.pendingUserInputs);
-            if (ctx.sessionConfigReady !== undefined) {
-              yield* Deferred.succeed(ctx.sessionConfigReady, undefined);
-              ctx.sessionConfigReady = undefined;
-            }
-            if (ctx.resumeReplayReady !== undefined) {
-              yield* Deferred.succeed(ctx.resumeReplayReady, undefined);
-              ctx.resumeReplayReady = undefined;
-              ctx.resumeReplayLastSuppressedAt = undefined;
-            }
-            if (ctx.notificationFiber) {
-              yield* Fiber.interrupt(ctx.notificationFiber);
-            }
-
-            const completeTeardown = sessionTeardownGate.complete(
-              ctx.threadId,
-              ctx.teardownComplete,
+          if (
+            beginAcpSessionTeardown(ctx.teardown, () => {
+              ctx.stopped = true;
+              ctx.gatewaySessionLease?.release();
+            })
+          ) {
+            sessionTeardownGate.track(ctx.threadId, ctx.teardown);
+            const teardown = completeAcpSessionTeardown(
+              ctx.teardown,
+              Effect.gen(function* () {
+                yield* settleAcpPendingApprovalsAsCancelled(ctx.pendingApprovals);
+                yield* settleAcpPendingUserInputsAsEmptyAnswers(ctx.pendingUserInputs);
+                if (ctx.sessionConfigReady !== undefined) {
+                  yield* Deferred.succeed(ctx.sessionConfigReady, undefined);
+                  ctx.sessionConfigReady = undefined;
+                }
+                if (ctx.resumeReplayReady !== undefined) {
+                  yield* Deferred.succeed(ctx.resumeReplayReady, undefined);
+                  ctx.resumeReplayReady = undefined;
+                  ctx.resumeReplayLastSuppressedAt = undefined;
+                }
+                if (ctx.notificationFiber) {
+                  yield* Fiber.interrupt(ctx.notificationFiber);
+                }
+                yield* closeSessionScope(ctx.scope);
+                if (sessions.get(ctx.threadId) === ctx) {
+                  sessions.delete(ctx.threadId);
+                }
+                yield* offerRuntimeEvent(ctx.lifecycleGeneration, {
+                  type: "session.exited",
+                  ...(yield* makeEventStamp()),
+                  provider: PROVIDER,
+                  threadId: ctx.threadId,
+                  payload: {
+                    exitKind: options?.exitKind ?? "graceful",
+                    ...(options?.reason ? { reason: options.reason } : {}),
+                  },
+                });
+              }),
+            ).pipe(
+              Effect.tap(() => sessionTeardownGate.release(ctx.threadId, ctx.teardown)),
+              Effect.ignoreCause,
             );
-            const teardown = Effect.gen(function* () {
-              yield* Effect.ignore(Scope.close(ctx.scope, Exit.void));
-              yield* offerRuntimeEvent(ctx.lifecycleGeneration, {
-                type: "session.exited",
-                ...(yield* makeEventStamp()),
-                provider: PROVIDER,
-                threadId: ctx.threadId,
-                payload: {
-                  exitKind: options?.exitKind ?? "graceful",
-                  ...(options?.reason ? { reason: options.reason } : {}),
-                },
-              });
-            }).pipe(Effect.ensuring(completeTeardown));
-
             // Scope.close interrupts prompt/watchdog fibers owned by this scope.
             // A daemon performs the close so those fibers can initiate teardown
             // without waiting on their own termination.
@@ -587,7 +602,7 @@ export function makeDroidAdapter(
           }
 
           if (options?.awaitTermination !== false) {
-            yield* restore(Deferred.await(ctx.teardownComplete));
+            yield* restore(awaitAcpSessionTeardown(ctx.teardown));
           }
         }),
       );
@@ -990,7 +1005,7 @@ export function makeDroidAdapter(
           const resumeReplayReady =
             started.sessionSetupMethod === "load" ? yield* Deferred.make<void>() : undefined;
           const sessionConfigReady = yield* Deferred.make<void>();
-          const teardownComplete = yield* Deferred.make<void>();
+          const teardown = yield* makeAcpSessionTeardownState();
           const now = yield* nowIso;
           const session: ProviderSession = {
             provider: PROVIDER,
@@ -1034,7 +1049,7 @@ export function makeDroidAdapter(
             resumeReplayReady,
             resumeReplayLastSuppressedAt: resumeReplayReady !== undefined ? Date.now() : undefined,
             sessionConfigReady,
-            teardownComplete,
+            teardown,
             latestSessionCostUsd: undefined,
             sessionUpdatesProcessed: 0,
             turnStarting: false,

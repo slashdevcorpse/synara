@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   containPreparedWindowsProviderProcess,
+  isWindowsJobPreparedCommand,
   prepareResolvedWindowsProviderProcess,
   resolveWindowsJobLauncherPath,
   WINDOWS_JOB_LAUNCHER_EXECUTABLE,
@@ -21,24 +22,27 @@ describe("Windows provider process containment", () => {
   });
 
   it("wraps a resolved executable in the versioned argv protocol", () => {
-    expect(
-      prepareResolvedWindowsProviderProcess(
-        "C:\\Program Files\\Codex\\codex.exe",
-        ["app-server", "--flag", "value with spaces"],
-        {
-          platform: "win32",
-          arch: "x64",
-          launcherPath: launcher,
-          fileExists: () => true,
-        },
-      ),
-    ).toEqual({
+    const prepared = prepareResolvedWindowsProviderProcess(
+      "C:\\Program Files\\Codex\\codex.exe",
+      ["app-server", "--flag", "value with spaces"],
+      {
+        platform: "win32",
+        arch: "x64",
+        controlDirectory: "C:\\Temp",
+        launcherPath: launcher,
+        fileExists: () => true,
+      },
+    );
+    expect(isWindowsJobPreparedCommand(prepared)).toBe(true);
+    expect(prepared).toEqual({
       command: launcher,
       args: [
         "--protocol",
-        "1",
+        "2",
         "--argument-mode",
         "argv",
+        "--control-file",
+        expect.stringMatching(/^C:\\Temp\\synara-job-control-/u),
         "--",
         "C:\\Program Files\\Codex\\codex.exe",
         "app-server",
@@ -63,15 +67,18 @@ describe("Windows provider process containment", () => {
         {
           platform: "win32",
           arch: "arm64",
+          controlDirectory: "C:\\Temp",
           launcherPath: launcher,
           fileExists: () => true,
         },
       ).args,
     ).toEqual([
       "--protocol",
-      "1",
+      "2",
       "--argument-mode",
       "verbatim",
+      "--control-file",
+      expect.stringMatching(/^C:\\Temp\\synara-job-control-/u),
       "--",
       "C:\\Windows\\System32\\cmd.exe",
       "/d",
@@ -94,7 +101,7 @@ describe("Windows provider process containment", () => {
       },
     );
 
-    expect(wrapped.args[5]).toBe("D:\\work\\bin\\agent.exe");
+    expect(wrapped.args[7]).toBe("D:\\work\\bin\\agent.exe");
   });
 
   it("qualifies a drive-rooted target against the provider cwd drive", () => {
@@ -109,7 +116,7 @@ describe("Windows provider process containment", () => {
       },
     );
 
-    expect(wrapped.args[5]).toBe("D:\\tools\\agent.exe");
+    expect(wrapped.args[7]).toBe("D:\\tools\\agent.exe");
   });
 
   it.each([
@@ -138,7 +145,7 @@ describe("Windows provider process containment", () => {
       },
     );
 
-    expect(wrapped.args[5]).toBe(expected);
+    expect(wrapped.args[7]).toBe(expected);
   });
 
   it("fails closed when a drive-rooted target has no absolute Windows cwd", () => {

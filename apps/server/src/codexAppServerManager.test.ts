@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import {
@@ -31,10 +32,16 @@ import {
   classifyCodexStderrLine,
   formatCodexCliVersionCheckFailure,
   isRecoverableThreadResumeError,
+  installCodexAppServerProcessOwnership,
   normalizeCodexModelSlug,
   readCodexAccountSnapshot,
   resolveCodexModelForAccount,
 } from "./codexAppServerManager";
+import { prepareWindowsProviderProcess } from "./provider/windowsProviderProcess.ts";
+import {
+  supervisePreparedNodeProcess,
+  windowsJobNodeProcessSupervisor,
+} from "./provider/windowsJobProcessSupervisor.ts";
 import { CodexJsonlFramer, CodexJsonlWriter } from "./codexAppServerTransport";
 import { ensureIsolatedScratchWorkspace } from "./scratchWorkspaces";
 import { SYNARA_HARNESS_POLICY_MARKER } from "./agentGateway/harnessPolicy.ts";
@@ -83,6 +90,76 @@ describe("Codex CLI version check failures", () => {
         stderr,
       }),
     ).toBe(`Codex CLI version check failed. ${stderr}`);
+  });
+});
+
+describe("Codex app-server process ownership installation", () => {
+  const makeChild = (pid: number | undefined) =>
+    Object.assign(new EventEmitter(), {
+      pid,
+      exitCode: null,
+      signalCode: null,
+      killed: false,
+      stdin: new PassThrough(),
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+      kill: vi.fn(() => true),
+    }) as unknown as ChildProcessWithoutNullStreams;
+
+  it("defers supervisor construction until callers can publish the spawned child", async () => {
+    const child = makeChild(8101);
+    const superviseProcess = vi.fn(() => ({
+      rootPid: 8101,
+      proveExit: vi.fn(),
+      requestTermination: vi.fn(),
+      teardown: vi.fn(),
+    }));
+    const ownershipReady = installCodexAppServerProcessOwnership(
+      { command: "codex", args: ["app-server"], shell: false },
+      child,
+      superviseProcess,
+    );
+
+    expect(superviseProcess).not.toHaveBeenCalled();
+    await expect(ownershipReady).resolves.toEqual({ _tag: "Installed" });
+    expect(superviseProcess).toHaveBeenCalledTimes(1);
+  });
+
+  it("retains the shared fallback supervisor before surfacing constructor failure", async () => {
+    const child = makeChild(8102);
+    const requestedFailure = new Error("injected app-server supervisor failed");
+    const prepared = prepareWindowsProviderProcess("C:\\tools\\codex.exe", ["app-server"], {
+      platform: "win32",
+      launcherPath: "C:\\Synara\\synara-windows-job-launcher.exe",
+      fileExists: () => true,
+      controlDirectory: "C:\\Temp",
+    });
+
+    await expect(
+      installCodexAppServerProcessOwnership(prepared, child, () => {
+        throw requestedFailure;
+      }),
+    ).rejects.toBe(requestedFailure);
+    expect(windowsJobNodeProcessSupervisor(child)?.rootPid).toBe(8102);
+  });
+
+  it("classifies a PID-less error without invoking a supervisor", async () => {
+    const child = makeChild(undefined);
+    const superviseProcess = vi.fn();
+    const ownershipReady = installCodexAppServerProcessOwnership(
+      { command: "codex", args: ["app-server"], shell: false },
+      child,
+      superviseProcess,
+    );
+    const spawnFailure = new Error("spawn codex ENOENT");
+
+    child.emit("error", spawnFailure);
+
+    await expect(ownershipReady).resolves.toEqual({
+      _tag: "NotSpawned",
+      cause: spawnFailure,
+    });
+    expect(superviseProcess).not.toHaveBeenCalled();
   });
 });
 
@@ -461,6 +538,127 @@ function createProcessOutputHarness() {
 }
 
 describe("Codex app-server teardown", () => {
+  class FakeCodexLifecycleChild extends EventEmitter {
+    readonly pid: number;
+    exitCode: number | null = null;
+    signalCode: NodeJS.Signals | null = null;
+    readonly stdin = new PassThrough();
+    readonly stdout = new PassThrough();
+    readonly stderr = new PassThrough();
+    readonly kill = vi.fn(() => true);
+
+    constructor(pid: number) {
+      super();
+      this.pid = pid;
+    }
+  }
+
+  type RetainedTeardownProcessTree = NonNullable<
+    NonNullable<Parameters<typeof supervisePreparedNodeProcess>[2]>["teardownProcessTree"]
+  >;
+
+  const createSpontaneousExitHarness = (input: {
+    readonly threadId: ThreadId;
+    readonly pid: number;
+    readonly teardownProcessTree: RetainedTeardownProcessTree;
+    readonly discoveryKey?: string;
+  }) => {
+    const child = new FakeCodexLifecycleChild(input.pid);
+    const fallbackTeardownProcessTree = vi.fn(async () => {
+      throw new Error("unexpected unretained process-tree fallback");
+    });
+    const manager = new CodexAppServerManager(undefined, {
+      teardownProcessTree: fallbackTeardownProcessTree,
+    });
+    supervisePreparedNodeProcess(
+      { command: "codex", args: ["app-server"], shell: false },
+      child as unknown as ChildProcessWithoutNullStreams,
+      {
+        platform: "linux",
+        teardownProcessTree: input.teardownProcessTree,
+      },
+    );
+
+    const revokeSessionToken = vi.fn();
+    const gatewaySessionLease = acquireAgentGatewaySessionLease(
+      {
+        connectionForThread: () => ({
+          url: "http://127.0.0.1:48123/mcp",
+          bearerToken: "gateway-token",
+        }),
+        revokeSessionToken,
+      },
+      input.threadId,
+      "codex",
+    );
+    const pendingReject = vi.fn();
+    const pendingTimeout = setTimeout(() => undefined, 60_000);
+    pendingTimeout.unref();
+    const context = {
+      gatewaySessionLease,
+      session: {
+        provider: "codex",
+        status: "ready",
+        threadId: input.threadId,
+        runtimeMode: "full-access",
+        ...(input.discoveryKey ? { cwd: input.discoveryKey } : {}),
+        createdAt: "2026-07-14T00:00:00.000Z",
+        updatedAt: "2026-07-14T00:00:00.000Z",
+      },
+      account: { type: "unknown", planType: null, sparkEnabled: true },
+      child,
+      stdoutFramer: new CodexJsonlFramer(),
+      stdinWriter: new CodexJsonlWriter(child.stdin),
+      pending: new Map([
+        [
+          "pending-request",
+          {
+            method: "test/request",
+            timeout: pendingTimeout,
+            resolve: vi.fn(),
+            reject: pendingReject,
+          },
+        ],
+      ]),
+      pendingApprovals: new Map(),
+      pendingUserInputs: new Map(),
+      collabReceiverTurns: new Map(),
+      collabReceiverParents: new Map(),
+      reviewTurnIds: new Set(),
+      nextRequestId: 1,
+      stopping: false,
+      ...(input.discoveryKey ? { discovery: true } : {}),
+    };
+    const internals = manager as unknown as {
+      sessions: Map<ThreadId, unknown>;
+      discoverySessions: Map<string, unknown>;
+      attachProcessListeners: (context: unknown) => void;
+    };
+    if (input.discoveryKey) {
+      internals.discoverySessions.set(input.discoveryKey, context);
+    } else {
+      internals.sessions.set(input.threadId, context);
+    }
+    internals.attachProcessListeners(context);
+    const eventMethods: string[] = [];
+    manager.on("event", (event) => eventMethods.push(event.method));
+    const hasOwnedContext = () =>
+      input.discoveryKey
+        ? internals.discoverySessions.get(input.discoveryKey) === context
+        : internals.sessions.get(input.threadId) === context;
+
+    return {
+      child,
+      context,
+      eventMethods,
+      fallbackTeardownProcessTree,
+      hasOwnedContext,
+      manager,
+      pendingReject,
+      revokeSessionToken,
+    };
+  };
+
   it("keeps the session owned until shared process-tree exit proof resolves", async () => {
     class FakeCodexChild extends EventEmitter {
       readonly pid = 5151;
@@ -525,7 +723,7 @@ describe("Codex app-server teardown", () => {
 
     const stopping = manager.stopSession(threadId);
     await Promise.resolve();
-    expect(revokeSessionToken).toHaveBeenCalledOnce();
+    expect(revokeSessionToken).not.toHaveBeenCalled();
     expect(teardownProcessTree).toHaveBeenCalledTimes(1);
     expect(manager.hasSession(threadId)).toBe(true);
     expect(exitProven).toBe(false);
@@ -538,66 +736,239 @@ describe("Codex app-server teardown", () => {
     expect(manager.hasSession(threadId)).toBe(false);
   });
 
-  it("releases the session lease once when the app-server exits spontaneously", () => {
-    class FakeCodexChild extends EventEmitter {
-      readonly pid = 5252;
-      exitCode: number | null = null;
-      signalCode: NodeJS.Signals | null = null;
-      readonly stdin = new PassThrough();
-      readonly stdout = new PassThrough();
-      readonly stderr = new PassThrough();
-    }
-    const child = new FakeCodexChild();
-    const manager = new CodexAppServerManager();
-    const threadId = asThreadId("thread-codex-spontaneous-exit");
-    const revokeSessionToken = vi.fn();
-    const gatewaySessionLease = acquireAgentGatewaySessionLease(
-      {
-        connectionForThread: () => ({
-          url: "http://127.0.0.1:48123/mcp",
-          bearerToken: "gateway-token",
-        }),
-        revokeSessionToken,
+  it("retains the session lease and map entry until spontaneous-exit proof resolves", async () => {
+    let resolveExitProof: (() => void) | undefined;
+    const exitProof = new Promise<void>((resolve) => {
+      resolveExitProof = resolve;
+    });
+    const teardownProcessTree = vi.fn(
+      async (input: { readonly rootPid: number; readonly rootExited: Promise<unknown> }) => {
+        expect(input.rootPid).toBe(5252);
+        await input.rootExited;
+        await exitProof;
+        return { escalated: false as const, signalErrors: [] };
       },
-      threadId,
-      "codex",
     );
-    const context = {
-      gatewaySessionLease,
-      session: {
-        provider: "codex",
-        status: "ready",
-        threadId,
-        runtimeMode: "full-access",
-        createdAt: "2026-07-14T00:00:00.000Z",
-        updatedAt: "2026-07-14T00:00:00.000Z",
-      },
-      account: { type: "unknown", planType: null, sparkEnabled: true },
+    const threadId = asThreadId("thread-codex-spontaneous-exit");
+    const {
       child,
-      stdoutFramer: new CodexJsonlFramer(),
-      stdinWriter: new CodexJsonlWriter(child.stdin),
-      pending: new Map(),
-      pendingApprovals: new Map(),
-      pendingUserInputs: new Map(),
-      collabReceiverTurns: new Map(),
-      collabReceiverParents: new Map(),
-      reviewTurnIds: new Set(),
-      nextRequestId: 1,
-      stopping: false,
-    };
-    const internals = manager as unknown as {
-      sessions: Map<ThreadId, unknown>;
-      attachProcessListeners: (context: unknown) => void;
-    };
-    internals.sessions.set(threadId, context);
-    internals.attachProcessListeners(context);
+      context,
+      eventMethods,
+      fallbackTeardownProcessTree,
+      manager,
+      pendingReject,
+      revokeSessionToken,
+    } = createSpontaneousExitHarness({ threadId, pid: 5252, teardownProcessTree });
 
+    child.exitCode = 1;
     child.emit("exit", 1, null);
-    child.emit("exit", 1, null);
+    await Promise.resolve();
+
+    expect(pendingReject).toHaveBeenCalledOnce();
+    expect(context.pending.size).toBe(0);
+    expect(teardownProcessTree).toHaveBeenCalledTimes(1);
+    expect(fallbackTeardownProcessTree).not.toHaveBeenCalled();
+    expect(revokeSessionToken).not.toHaveBeenCalled();
+    expect(manager.hasSession(threadId)).toBe(true);
+    expect(context.session.status).toBe("error");
+    expect(eventMethods).not.toContain("session/exited");
+
+    revokeSessionToken.mockImplementation(() => {
+      expect(context.session.status).toBe("closed");
+      expect(eventMethods.filter((method) => method === "session/exited")).toHaveLength(1);
+      expect(manager.hasSession(threadId)).toBe(false);
+    });
+    resolveExitProof?.();
+    await (context as typeof context & { stopPromise?: Promise<void> }).stopPromise;
 
     expect(revokeSessionToken).toHaveBeenCalledOnce();
     expect(manager.hasSession(threadId)).toBe(false);
+    expect(context.session.status).toBe("closed");
+    expect(eventMethods.filter((method) => method === "session/exited")).toHaveLength(1);
   });
+
+  it("retains a fail-closed session and lease when spontaneous-exit proof fails", async () => {
+    let rejectExitProof: ((cause: Error) => void) | undefined;
+    const exitProof = new Promise<void>((_resolve, reject) => {
+      rejectExitProof = reject;
+    });
+    const teardownProcessTree = vi.fn(
+      async (input: { readonly rootPid: number; readonly rootExited: Promise<unknown> }) => {
+        await input.rootExited;
+        await exitProof;
+        return { escalated: false as const, signalErrors: [] };
+      },
+    );
+    const threadId = asThreadId("thread-codex-spontaneous-exit-proof-failure");
+    const { child, context, eventMethods, manager, revokeSessionToken } =
+      createSpontaneousExitHarness({ threadId, pid: 5353, teardownProcessTree });
+    const proofFailure = new Error("injected process-tree proof failure");
+
+    child.exitCode = 1;
+    child.emit("exit", 1, null);
+    const stopPromise = (context as typeof context & { stopPromise?: Promise<void> }).stopPromise;
+    rejectExitProof?.(proofFailure);
+
+    await expect(stopPromise).rejects.toThrow("Failed to prove Codex app-server process-tree exit");
+    expect(teardownProcessTree).toHaveBeenCalledTimes(1);
+    expect(revokeSessionToken).not.toHaveBeenCalled();
+    expect(manager.hasSession(threadId)).toBe(true);
+    expect(context.session).toMatchObject({
+      status: "error",
+      activeTurnId: undefined,
+      lastError: expect.stringContaining("injected process-tree proof failure"),
+    });
+    expect(eventMethods).not.toContain("session/exited");
+    expect(eventMethods).not.toContain("session/closed");
+    expect((context as typeof context & { stopPromise?: Promise<void> }).stopPromise).toBe(
+      stopPromise,
+    );
+    await expect(manager.stopSession(threadId)).rejects.toThrow(
+      "Failed to prove Codex app-server process-tree exit",
+    );
+    expect(teardownProcessTree).toHaveBeenCalledTimes(1);
+  });
+
+  it("finalizes duplicate spontaneous exit signals exactly once", async () => {
+    let resolveExitProof: (() => void) | undefined;
+    const exitProof = new Promise<void>((resolve) => {
+      resolveExitProof = resolve;
+    });
+    const teardownProcessTree = vi.fn(
+      async (input: { readonly rootPid: number; readonly rootExited: Promise<unknown> }) => {
+        await input.rootExited;
+        await exitProof;
+        return { escalated: false as const, signalErrors: [] };
+      },
+    );
+    const threadId = asThreadId("thread-codex-duplicate-spontaneous-exit");
+    const { child, context, eventMethods, manager, revokeSessionToken } =
+      createSpontaneousExitHarness({ threadId, pid: 5454, teardownProcessTree });
+
+    child.exitCode = 1;
+    child.emit("exit", 1, null);
+    child.emit("exit", 1, null);
+    await Promise.resolve();
+
+    expect(teardownProcessTree).toHaveBeenCalledTimes(1);
+    expect(revokeSessionToken).not.toHaveBeenCalled();
+    expect(manager.hasSession(threadId)).toBe(true);
+
+    resolveExitProof?.();
+    await (context as typeof context & { stopPromise?: Promise<void> }).stopPromise;
+    child.emit("exit", 1, null);
+    await Promise.resolve();
+
+    expect(teardownProcessTree).toHaveBeenCalledTimes(1);
+    expect(revokeSessionToken).toHaveBeenCalledOnce();
+    expect(eventMethods.filter((method) => method === "session/exited")).toHaveLength(1);
+    expect(manager.hasSession(threadId)).toBe(false);
+  });
+
+  it.each(["exit-first", "transport-first"] as const)(
+    "shares one proof finalization when %s signals race",
+    async (signalOrder) => {
+      let resolveExitProof: (() => void) | undefined;
+      const exitProof = new Promise<void>((resolve) => {
+        resolveExitProof = resolve;
+      });
+      const teardownProcessTree = vi.fn(
+        async (input: { readonly rootPid: number; readonly rootExited: Promise<unknown> }) => {
+          await input.rootExited;
+          await exitProof;
+          return { escalated: false as const, signalErrors: [] };
+        },
+      );
+      const threadId = asThreadId(`thread-codex-${signalOrder}-race`);
+      const { child, context, eventMethods, manager, pendingReject, revokeSessionToken } =
+        createSpontaneousExitHarness({
+          threadId,
+          pid: signalOrder === "exit-first" ? 5555 : 5656,
+          teardownProcessTree,
+        });
+
+      if (signalOrder === "transport-first") {
+        child.stdout.emit("end");
+      }
+      child.exitCode = 1;
+      child.emit("exit", 1, null);
+      if (signalOrder === "exit-first") {
+        child.stdout.emit("end");
+      }
+      await Promise.resolve();
+
+      const stopPromise = (context as typeof context & { stopPromise?: Promise<void> }).stopPromise;
+      expect(stopPromise).toBeInstanceOf(Promise);
+      expect(teardownProcessTree).toHaveBeenCalledTimes(1);
+      expect(pendingReject).toHaveBeenCalledOnce();
+      expect(revokeSessionToken).not.toHaveBeenCalled();
+      expect(manager.hasSession(threadId)).toBe(true);
+
+      resolveExitProof?.();
+      await stopPromise;
+
+      const terminalEvents = eventMethods.filter(
+        (method) => method === "session/exited" || method === "session/closed",
+      );
+      expect(teardownProcessTree).toHaveBeenCalledTimes(1);
+      expect(revokeSessionToken).toHaveBeenCalledOnce();
+      expect(terminalEvents).toHaveLength(1);
+      expect(manager.hasSession(threadId)).toBe(false);
+    },
+  );
+
+  it.each(["exit-first", "transport-first"] as const)(
+    "shares one discovery proof finalization when %s signals race",
+    async (signalOrder) => {
+      let resolveExitProof: (() => void) | undefined;
+      const exitProof = new Promise<void>((resolve) => {
+        resolveExitProof = resolve;
+      });
+      const teardownProcessTree = vi.fn(
+        async (input: { readonly rootPid: number; readonly rootExited: Promise<unknown> }) => {
+          await input.rootExited;
+          await exitProof;
+          return { escalated: false as const, signalErrors: [] };
+        },
+      );
+      const discoveryKey = `C:\\workspace\\${signalOrder}`;
+      const threadId = asThreadId(`__codex_discovery__:${discoveryKey}`);
+      const { child, context, hasOwnedContext, pendingReject, revokeSessionToken } =
+        createSpontaneousExitHarness({
+          threadId,
+          pid: signalOrder === "exit-first" ? 5757 : 5858,
+          teardownProcessTree,
+          discoveryKey,
+        });
+
+      if (signalOrder === "transport-first") {
+        child.stdout.emit("end");
+      }
+      child.exitCode = 1;
+      child.emit("exit", 1, null);
+      if (signalOrder === "exit-first") {
+        child.stdout.emit("end");
+      }
+      await Promise.resolve();
+
+      const stopPromise = (context as typeof context & { stopPromise?: Promise<void> }).stopPromise;
+      expect(stopPromise).toBeInstanceOf(Promise);
+      expect(teardownProcessTree).toHaveBeenCalledTimes(1);
+      expect(pendingReject).toHaveBeenCalledOnce();
+      expect(revokeSessionToken).not.toHaveBeenCalled();
+      expect(hasOwnedContext()).toBe(true);
+
+      revokeSessionToken.mockImplementation(() => {
+        expect(hasOwnedContext()).toBe(false);
+      });
+      resolveExitProof?.();
+      await stopPromise;
+
+      expect(teardownProcessTree).toHaveBeenCalledTimes(1);
+      expect(revokeSessionToken).toHaveBeenCalledOnce();
+      expect(hasOwnedContext()).toBe(false);
+    },
+  );
 });
 
 describe("classifyCodexStderrLine", () => {

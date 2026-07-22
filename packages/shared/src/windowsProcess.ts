@@ -246,6 +246,46 @@ export function buildWindowsBatchCommandArgs(
   return ["/d", "/s", "/v:off", "/c", commandLine];
 }
 
+/** Encodes one argv value using the quoting rules consumed by CommandLineToArgvW/MSVC runtimes. */
+export function quoteWindowsCommandLineArgument(value: string): string {
+  if (value.length > 0 && !/[\s"]/u.test(value)) return value;
+
+  let encoded = '"';
+  let backslashes = 0;
+  for (const character of value) {
+    if (character === "\\") {
+      backslashes += 1;
+      continue;
+    }
+    if (character === '"') {
+      encoded += "\\".repeat(backslashes * 2 + 1) + '"';
+      backslashes = 0;
+      continue;
+    }
+    encoded += "\\".repeat(backslashes) + character;
+    backslashes = 0;
+  }
+  return encoded + "\\".repeat(backslashes * 2) + '"';
+}
+
+/** Builds the exact CreateProcessW command line for a previously resolved safe Windows command. */
+export function buildWindowsCreateProcessCommandLine(
+  command: string,
+  args: ReadonlyArray<string>,
+  windowsVerbatimArguments = false,
+): string {
+  if (command.length === 0 || command.includes("\0")) {
+    throw new Error("Windows process command must be non-empty and cannot contain NUL.");
+  }
+  if (args.some((argument) => argument.includes("\0"))) {
+    throw new Error("Windows process arguments cannot contain NUL.");
+  }
+  const encodedCommand = quoteWindowsCommandLineArgument(command);
+  return windowsVerbatimArguments
+    ? [encodedCommand, ...args].join(" ")
+    : [command, ...args].map(quoteWindowsCommandLineArgument).join(" ");
+}
+
 function isPathLikeCommand(command: string): boolean {
   return WINDOWS_PATH_SEPARATOR_PATTERN.test(command) || Path.win32.isAbsolute(command);
 }

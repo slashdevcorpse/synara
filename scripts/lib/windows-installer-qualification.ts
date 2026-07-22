@@ -2,6 +2,7 @@
 // Purpose: Qualifies Super Synara's Windows installer lifecycle without touching live profiles.
 
 import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import {
   cpSync,
   existsSync,
@@ -67,6 +68,23 @@ export interface WindowsCommandSpec {
   readonly env?: NodeJS.ProcessEnv;
   readonly timeoutMs: number;
   readonly label: string;
+}
+
+export function runNativeWindowsCommand(spec: WindowsCommandSpec): void {
+  const result = spawnSync(spec.command, [...spec.args], {
+    env: spec.env,
+    shell: false,
+    windowsHide: true,
+    timeout: spec.timeoutMs,
+    // NSIS upgrades may leave a short-lived cleanup descendant behind after the
+    // successful installer parent exits. Pipes inherited by that descendant keep
+    // spawnSync waiting until timeout even though the installer returned status 0.
+    stdio: "ignore",
+  });
+  if (result.error) throw new Error(`${spec.label} could not complete: ${result.error.message}`);
+  if (result.status !== 0) {
+    throw new Error(`${spec.label} failed with exit ${result.status ?? "unknown"}.`);
+  }
 }
 
 export interface WindowsExecutableIdentity {

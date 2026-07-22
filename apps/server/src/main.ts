@@ -37,6 +37,14 @@ import { startServerMemoryDiagnostics } from "./memoryDiagnostics";
 import { startClaudeCredentialKeepalive } from "./provider/claudeCredentialKeepalive";
 import { ProjectionSnapshotQuery } from "./orchestration/Services/ProjectionSnapshotQuery";
 import { ProviderSessionReaperLive } from "./provider/Layers/ProviderSessionReaper";
+import {
+  makeProviderMaintenanceGate,
+  type ProviderMaintenanceGate,
+} from "./provider/providerMaintenanceGate";
+import {
+  makeProviderMaintenanceOwnedResourceCoordinator,
+  type ProviderMaintenanceOwnedResourceCoordinator,
+} from "./provider/providerMaintenanceOwnedResources";
 import { Server } from "./effectServer";
 import { ServerLoggerLive } from "./serverLogger";
 import { ServerSettingsService } from "./serverSettings";
@@ -295,8 +303,15 @@ const ServerConfigLive = (input: CliInput) =>
     }),
   );
 
-const LayerLive = (input: CliInput) => {
-  const { runtimeServicesLayer, providerLayer } = makeServerApplicationLayers();
+const LayerLive = (
+  input: CliInput,
+  maintenanceGate: ProviderMaintenanceGate,
+  maintenanceOwnedResources: ProviderMaintenanceOwnedResourceCoordinator,
+) => {
+  const { runtimeServicesLayer, providerLayer } = makeServerApplicationLayers({
+    maintenanceGate,
+    maintenanceOwnedResources,
+  });
   const providerSessionReaperLayer = ProviderSessionReaperLive.pipe(
     // The reaper coordinates orchestration state with live provider sessions,
     // so it belongs at the top level where both layers are available.
@@ -349,8 +364,10 @@ export function makeServerStartupLogData(config: ServerConfigShape): Record<stri
   };
 }
 
-const makeServerProgram = (input: CliInput) =>
-  Effect.gen(function* () {
+const makeServerProgram = (input: CliInput) => {
+  const maintenanceGate = Effect.runSync(makeProviderMaintenanceGate);
+  const maintenanceOwnedResources = Effect.runSync(makeProviderMaintenanceOwnedResourceCoordinator);
+  return Effect.gen(function* () {
     const cliConfig = yield* CliConfig;
     const { start, stopSignal } = yield* Server;
     const openDeps = yield* Open;
@@ -410,6 +427,14 @@ const makeServerProgram = (input: CliInput) =>
           startClaudeCredentialKeepalive({
             binaryPath: settings.providers.claudeAgent.binaryPath,
             homeDir: config.homeDir,
+            runOperation: (run) =>
+              Effect.runPromise(
+                maintenanceGate.withOperation({
+                  provider: "claudeAgent",
+                  operation: "ClaudeCredentialKeepalive.refresh",
+                  run: Effect.tryPromise(run),
+                }),
+              ),
             log: (message) => Effect.runFork(Effect.logInfo(message)),
           }),
         );
@@ -453,7 +478,11 @@ const makeServerProgram = (input: CliInput) =>
     }
 
     return yield* stopSignal;
-  }).pipe(Effect.scoped, Effect.provide(LayerLive(input)));
+  }).pipe(
+    Effect.scoped,
+    Effect.provide(LayerLive(input, maintenanceGate, maintenanceOwnedResources)),
+  );
+};
 
 /**
  * These flags mirrors the environment variables and the config shape.

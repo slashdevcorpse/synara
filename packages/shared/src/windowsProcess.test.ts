@@ -11,6 +11,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   buildWindowsBatchCommandArgs,
+  buildWindowsCreateProcessCommandLine,
   clearWindowsCommandDiscoveryCache,
   createWindowsCommandDiscoveryCache,
   foldWindowsAsciiCase,
@@ -19,6 +20,7 @@ import {
   normalizeWindowsChildEnvironment,
   prepareResolvedWindowsSafeProcess,
   prepareWindowsSafeProcess,
+  quoteWindowsCommandLineArgument,
   readEffectiveWindowsEnvironmentValue,
   resolveWindowsCommandCandidates,
   resolveWindowsCommandPath,
@@ -383,6 +385,32 @@ describe("windowsProcess", () => {
       "/c",
       'call "C:\\Users\\Test User\\npm\\tool.cmd" "path with spaces" "flag=value"',
     ]);
+  });
+
+  it("quotes native CreateProcess arguments without losing backslashes before quotes", () => {
+    expect(quoteWindowsCommandLineArgument("")).toBe('""');
+    expect(quoteWindowsCommandLineArgument("plain")).toBe("plain");
+    expect(quoteWindowsCommandLineArgument("C:\\path with spaces\\")).toBe(
+      '"C:\\path with spaces\\\\"',
+    );
+    expect(quoteWindowsCommandLineArgument('say "hello"')).toBe('"say \\"hello\\""');
+  });
+
+  it("builds native and verbatim CreateProcess command lines from resolved launches", () => {
+    expect(
+      buildWindowsCreateProcessCommandLine("C:\\Program Files\\tool.exe", [
+        "--name",
+        "value with spaces",
+      ]),
+    ).toBe('"C:\\Program Files\\tool.exe" --name "value with spaces"');
+
+    expect(
+      buildWindowsCreateProcessCommandLine(
+        "C:\\Windows\\System32\\cmd.exe",
+        ["/d", "/s", "/v:off", "/c", 'call "C:\\npm\\tool.cmd" "app-server"'],
+        true,
+      ),
+    ).toBe('C:\\Windows\\System32\\cmd.exe /d /s /v:off /c call "C:\\npm\\tool.cmd" "app-server"');
   });
 
   it("preserves literal quotes in existing Codex config arguments", () => {

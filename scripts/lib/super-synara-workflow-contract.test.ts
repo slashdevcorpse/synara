@@ -732,6 +732,26 @@ describe("Super Synara workflow contracts", () => {
     expect(() =>
       verifySuperSynaraWorkflowText(
         main.replace(
+          "node apps/server/scripts/build-windows-job-launcher.mjs --arch x64",
+          "node apps/server/scripts/build-windows-job-launcher.mjs --arch arm64",
+        ),
+        audit,
+      ),
+    ).toThrow("windows_x64 must run exact native gate command");
+
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          "src/provider/windowsProviderProcess.test.ts\n          src/provider/windowsProviderProcess.windows.test.ts",
+          "src/provider/windowsProviderProcess.test.ts\n          src/provider/forgedWindowsContainment.test.ts",
+        ),
+        audit,
+      ),
+    ).toThrow("windows_x64 must run exact native gate command");
+
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
           "src/desktopIdentityProof.test.ts\n          src/windowsCertificate.test.ts",
           "src/forgedIdentityProof.test.ts\n          src/windowsCertificate.test.ts",
         ),

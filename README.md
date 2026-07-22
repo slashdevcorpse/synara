@@ -11,7 +11,7 @@ It brings chats, terminals, browser previews, diffs, branches, provider sessions
 
 ## What it does
 
-- Use the AI accounts you already pay for: Claude Code, Codex, Antigravity, OpenCode, Cursor, Grok, Kilo Code, and Pi.
+- Use the AI accounts you already pay for: Claude Code, Codex, Command Code, Antigravity, OpenCode, Cursor, Grok, Droid, Kilo Code, and Pi.
 - Run parallel work across projects, threads, and isolated Git worktrees without branches stepping on each other.
 - Keep split chats, terminals, browser previews, and agent output visible in the same window.
 - Hand off a thread to another provider when you want a second model to pick up with the same context.
@@ -23,7 +23,7 @@ It brings chats, terminals, browser previews, diffs, branches, provider sessions
 > [!WARNING]
 > You need to have [Codex CLI](https://github.com/openai/codex) installed and authorized for Codex sessions to work.
 
-Install an unsigned prerelease from the [Super Synara releases page](https://github.com/slashdevcorpse/synara/releases). Read the [Super Synara installation guide](./docs/super-synara-install.md) before running a download; it covers checksum verification and the per-app Windows SmartScreen and macOS Gatekeeper prompts. Do not disable either operating-system protection globally.
+Install an unsigned prerelease from the [Super Synara releases page](https://github.com/slashdevcorpse/synara/releases). Read the [Super Synara installation guide](./docs/super-synara-install.md) before running a download; it covers checksum verification and the per-app Windows SmartScreen and macOS Gatekeeper prompts. Do not disable either operating-system protection globally. See the [provider CLI update runbook](./docs/provider-cli-updates.md) before using or troubleshooting provider updates.
 
 You can also run Synara locally while the project is still early:
 

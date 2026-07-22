@@ -86,6 +86,47 @@ describe("resolveCommandCodeCliExecutable", () => {
     expect(spawnSync).toHaveBeenCalledTimes(3);
   });
 
+  it("resolves the cmd alias only to an npm shim, never the Windows command processor", () => {
+    const commandProcessor = "C:\\Windows\\System32\\cmd.exe";
+    const shim = "C:\\npm\\cmd.cmd";
+    const spawnSync = vi.fn((_command: string, args: ReadonlyArray<string>) =>
+      args[0] === "cmd"
+        ? { stdout: `${commandProcessor}\r\n${shim}\r\n`, status: 0 }
+        : { stdout: "", status: 1 },
+    );
+
+    expect(
+      resolveCommandCodeCliExecutable("cmd", {
+        platform: "win32",
+        cwd: "C:\\repo",
+        env: { SystemRoot: "C:\\Windows" },
+        spawnSync,
+        statSync: regularFiles(commandProcessor, shim),
+      }),
+    ).toBe(shim);
+    expect(spawnSync).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails safe to the non-conflicting default when bare cmd has no package shim", () => {
+    const commandProcessor = "C:\\Windows\\System32\\cmd.exe";
+    const spawnSync = vi.fn((_command: string, args: ReadonlyArray<string>) =>
+      args[0] === "cmd"
+        ? { stdout: `${commandProcessor}\r\n`, status: 0 }
+        : { stdout: "", status: 1 },
+    );
+
+    expect(
+      resolveCommandCodeCliExecutable("cmd", {
+        platform: "win32",
+        cwd: "C:\\repo",
+        env: { SystemRoot: "C:\\Windows" },
+        spawnSync,
+        statSync: regularFiles(commandProcessor),
+      }),
+    ).toBe("commandcode");
+    expect(spawnSync).toHaveBeenCalledTimes(4);
+  });
+
   it("uses the case-insensitive APPDATA npm fallback", () => {
     const shim = "C:\\Users\\test\\AppData\\Roaming\\npm\\commandcode.cmd";
     expect(

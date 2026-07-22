@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -12,6 +12,7 @@ import {
   parseRegistryQueryOutput,
   parseWindowsExecutableCommandLine,
   qualifySuperSynaraWindowsInstaller,
+  runNativeWindowsCommand,
   type WindowsCommandSpec,
   type WindowsInstallerQualificationRuntime,
   type WindowsRegistryTarget,
@@ -241,6 +242,73 @@ describe("Windows installer qualification primitives", () => {
     expect(command.command).toBe("C:\\artifacts\\Super Synara.exe");
     expect(command.args).toEqual(["/S", "/D=C:\\isolated root\\Super Synara"]);
     expect(command.env?.PATH).toBe("C:\\Windows");
+  });
+
+  it("does not wait on output handles inherited by a successful installer descendant", () => {
+    const fixtureRoot = join(
+      process.cwd(),
+      `.qualification-fixture-${process.pid}-descendant-handles`,
+    );
+    roots.push(fixtureRoot);
+    mkdirSync(fixtureRoot, { recursive: true });
+    const childPidPath = join(fixtureRoot, "child.pid");
+    const parentScript = [
+      'const { spawn } = require("node:child_process");',
+      'const { writeFileSync } = require("node:fs");',
+      'const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 10000)"], {',
+      '  detached: true, stdio: "inherit", windowsHide: true',
+      "});",
+      "writeFileSync(process.env.SYNARA_QUALIFICATION_DESCENDANT_PID_PATH, String(child.pid));",
+      "child.unref();",
+    ].join("\n");
+
+    let cleanupError: unknown;
+    try {
+      expect(() =>
+        runNativeWindowsCommand({
+          command: process.execPath,
+          args: ["-e", parentScript],
+          env: {
+            ...process.env,
+            SYNARA_QUALIFICATION_DESCENDANT_PID_PATH: childPidPath,
+          },
+          timeoutMs: 5_000,
+          label: "installer descendant fixture",
+        }),
+      ).not.toThrow();
+    } finally {
+      if (existsSync(childPidPath)) {
+        const childPid = Number(readFileSync(childPidPath, "utf8"));
+        if (Number.isInteger(childPid) && childPid > 0) {
+          try {
+            process.kill(childPid);
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ESRCH") cleanupError = error;
+          }
+        }
+      }
+    }
+    if (cleanupError !== undefined) throw cleanupError;
+  });
+
+  it("fails closed when a native installer command times out or exits unsuccessfully", () => {
+    expect(() =>
+      runNativeWindowsCommand({
+        command: process.execPath,
+        args: ["-e", "setTimeout(() => {}, 2000)"],
+        timeoutMs: 100,
+        label: "timed-out installer fixture",
+      }),
+    ).toThrow("timed-out installer fixture could not complete");
+
+    expect(() =>
+      runNativeWindowsCommand({
+        command: process.execPath,
+        args: ["-e", "process.exit(7)"],
+        timeoutMs: 5_000,
+        label: "failed installer fixture",
+      }),
+    ).toThrow("failed installer fixture failed with exit 7");
   });
 
   it("parses typed registry values and quoted uninstall commands", () => {

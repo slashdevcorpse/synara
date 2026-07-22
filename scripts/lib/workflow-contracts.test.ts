@@ -81,6 +81,7 @@ const nativeDesktopBuildStep = [
   "          SYNARA_DESKTOP_FLAVOR: super",
   "        run: bun run build:desktop",
 ].join("\n");
+const windowsPackagedCliGateStep = "      - run: node apps/server/scripts/cli.ts publish --dry-run";
 const windowsPersistenceSmokeStep = [
   "      - name: Verify two-launch desktop persistence",
   "        timeout-minutes: 5",
@@ -194,11 +195,12 @@ ${codecovTestResultsUploadStep}
       - run: bun run --cwd packages/shared test src/desktopIdentity.test.ts src/desktopIdentityProof.test.ts src/windowsCertificate.test.ts
       - run: bun run --cwd apps/desktop test src/backendShutdown.test.ts src/backendShutdown.windows.integration.test.ts
       - run: bun run --cwd packages/shared test src/windowsProcess.test.ts
-      - run: bun run --cwd apps/server test src/windowsProcessEffect.test.ts src/codexAppServerManager.test.ts src/provider/Layers/ProviderHealth.test.ts src/persistence/MigrationBackup.test.ts src/restoreMigrationBackup.test.ts
+      - run: bun run --cwd apps/server test src/windowsProcessEffect.test.ts src/codexAppServerManager.test.ts src/provider/Layers/ProviderHealth.test.ts src/provider/acp/AcpJsonRpcConnection.test.ts src/persistence/MigrationBackup.test.ts src/restoreMigrationBackup.test.ts
       - run: bun run --cwd apps/desktop test src/desktopMigrationRecovery.test.ts src/desktopStorageMigration.test.ts src/windowState.test.ts src/updateState.test.ts
       - run: bun run --cwd scripts test check-brand-identity.test.ts verify-packaged-desktop-startup.test.ts lib/desktop-artifact-policy.test.ts lib/windows-authenticode.test.ts lib/windows-installer-qualification.test.ts lib/release-artifact-provenance.test.ts lib/super-synara-release-admission.test.ts lib/super-synara-workflow-contract.test.ts
       - run: node scripts/verify-workflow-contracts.ts
 ${nativeDesktopBuildStep}
+${windowsPackagedCliGateStep}
 ${windowsPersistenceSmokeStep}
 ${windowsStartupSmokeStep}
   macos_arm64:
@@ -441,6 +443,27 @@ describe("workflow contracts", () => {
     );
     expect(validateWorkflowContracts(missingArm64LauncherBuild, policy()).join("\n")).toContain(
       "windows_x64 must run exact native gate command: node apps/server/scripts/build-windows-job-launcher.mjs --arch arm64",
+    );
+
+    const missingPackagedCliGate = validFiles();
+    missingPackagedCliGate.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace(`${windowsPackagedCliGateStep}\n`, ""),
+    );
+    expect(validateWorkflowContracts(missingPackagedCliGate, policy()).join("\n")).toContain(
+      "windows_x64 must run exact post-build gate command: node apps/server/scripts/cli.ts publish --dry-run",
+    );
+
+    const preBuildPackagedCliGate = validFiles();
+    preBuildPackagedCliGate.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace(
+        `${nativeDesktopBuildStep}\n${windowsPackagedCliGateStep}`,
+        `${windowsPackagedCliGateStep}\n${nativeDesktopBuildStep}`,
+      ),
+    );
+    expect(validateWorkflowContracts(preBuildPackagedCliGate, policy()).join("\n")).toContain(
+      "windows_x64 post-build gate must run after the desktop build: node apps/server/scripts/cli.ts publish --dry-run",
     );
 
     const broadWindowsSuite = validFiles();
@@ -906,8 +929,8 @@ jobs:
     preBuildSmoke.set(
       ".github/workflows/ci.yml",
       ciWorkflow.replace(
-        `${nativeDesktopBuildStep}\n${windowsPersistenceSmokeStep}`,
-        `${windowsPersistenceSmokeStep}\n${nativeDesktopBuildStep}`,
+        `${nativeDesktopBuildStep}\n${windowsPackagedCliGateStep}\n${windowsPersistenceSmokeStep}`,
+        `${windowsPersistenceSmokeStep}\n${nativeDesktopBuildStep}\n${windowsPackagedCliGateStep}`,
       ),
     );
     expect(validateWorkflowContracts(preBuildSmoke, policy()).join("\n")).toContain(

@@ -17,6 +17,7 @@ import {
   type AcpProtocolLogEvent,
   type AcpSessionRequestLogEvent,
 } from "./AcpSessionRuntime.ts";
+import { makeAcpFixtureRuntimeLayer as acpTestRuntimeLayer } from "./AcpSessionRuntimeTestSupport.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const mockAgentPath = path.join(__dirname, "../../../scripts/acp-mock-agent.ts");
@@ -42,7 +43,7 @@ describe("AcpSessionRuntime", () => {
       });
     }).pipe(
       Effect.provide(
-        AcpSessionRuntime.layer({
+        acpTestRuntimeLayer({
           spawn: {
             command: bunExe,
             args: [mockAgentPath],
@@ -94,7 +95,7 @@ describe("AcpSessionRuntime", () => {
       ]);
     }).pipe(
       Effect.provide(
-        AcpSessionRuntime.layer({
+        acpTestRuntimeLayer({
           spawn: {
             command: bunExe,
             args: [mockAgentPath],
@@ -120,7 +121,7 @@ describe("AcpSessionRuntime", () => {
       expect(requestEvents.some((event) => event.method === "session/load")).toBe(false);
     }).pipe(
       Effect.provide(
-        AcpSessionRuntime.layer({
+        acpTestRuntimeLayer({
           spawn: {
             command: bunExe,
             args: [mockAgentPath],
@@ -151,7 +152,7 @@ describe("AcpSessionRuntime", () => {
       expect(requestEvents.some((event) => event.method === "session/new")).toBe(false);
     }).pipe(
       Effect.provide(
-        AcpSessionRuntime.layer({
+        acpTestRuntimeLayer({
           spawn: {
             command: bunExe,
             args: [mockAgentPath],
@@ -193,7 +194,7 @@ describe("AcpSessionRuntime", () => {
       });
     }).pipe(
       Effect.provide(
-        AcpSessionRuntime.layer({
+        acpTestRuntimeLayer({
           spawn: {
             command: bunExe,
             args: [mockAgentPath],
@@ -222,7 +223,7 @@ describe("AcpSessionRuntime", () => {
   it.effect(
     "assigns distinct fallback assistant item ids across separate runtime instances",
     () => {
-      const runtimeLayer = AcpSessionRuntime.layer({
+      const runtimeLayer = acpTestRuntimeLayer({
         spawn: {
           command: bunExe,
           args: [mockAgentPath],
@@ -295,7 +296,7 @@ describe("AcpSessionRuntime", () => {
       }
     }).pipe(
       Effect.provide(
-        AcpSessionRuntime.layer({
+        acpTestRuntimeLayer({
           spawn: {
             command: bunExe,
             args: [mockAgentPath],
@@ -353,7 +354,7 @@ describe("AcpSessionRuntime", () => {
       }
     }).pipe(
       Effect.provide(
-        AcpSessionRuntime.layer({
+        acpTestRuntimeLayer({
           spawn: {
             command: bunExe,
             args: [mockAgentPath],
@@ -399,7 +400,7 @@ describe("AcpSessionRuntime", () => {
       ).toEqual(["upstream-answer", "upstream-answer", "upstream-followup"]);
     }).pipe(
       Effect.provide(
-        AcpSessionRuntime.layer({
+        acpTestRuntimeLayer({
           spawn: {
             command: bunExe,
             args: [mockAgentPath],
@@ -448,7 +449,7 @@ describe("AcpSessionRuntime", () => {
       }
     }).pipe(
       Effect.provide(
-        AcpSessionRuntime.layer({
+        acpTestRuntimeLayer({
           spawn: {
             command: bunExe,
             args: [mockAgentPath],
@@ -491,7 +492,7 @@ describe("AcpSessionRuntime", () => {
       }
     }).pipe(
       Effect.provide(
-        AcpSessionRuntime.layer({
+        acpTestRuntimeLayer({
           spawn: {
             command: bunExe,
             args: [mockAgentPath],
@@ -543,7 +544,7 @@ describe("AcpSessionRuntime", () => {
       ).toBe(true);
     }).pipe(
       Effect.provide(
-        AcpSessionRuntime.layer({
+        acpTestRuntimeLayer({
           authMethodId: "test",
           spawn: {
             command: bunExe,
@@ -578,7 +579,7 @@ describe("AcpSessionRuntime", () => {
       ).toBe(false);
     }).pipe(
       Effect.provide(
-        AcpSessionRuntime.layer({
+        acpTestRuntimeLayer({
           authMethodId: "test",
           spawn: {
             command: bunExe,
@@ -621,7 +622,7 @@ describe("AcpSessionRuntime", () => {
       ).toBe(true);
     }).pipe(
       Effect.provide(
-        AcpSessionRuntime.layer({
+        acpTestRuntimeLayer({
           authMethodId: "test",
           spawn: {
             command: bunExe,
@@ -675,7 +676,7 @@ describe("AcpSessionRuntime", () => {
       ).toBe(false);
     }).pipe(
       Effect.provide(
-        AcpSessionRuntime.layer({
+        acpTestRuntimeLayer({
           authMethodId: "test",
           spawn: {
             command: bunExe,
@@ -690,6 +691,39 @@ describe("AcpSessionRuntime", () => {
         }),
       ),
       Effect.scoped,
+      Effect.provide(NodeServices.layer),
+      Effect.ensuring(Effect.sync(() => rmSync(tempDir, { recursive: true, force: true }))),
+    );
+  });
+
+  it.effect("closes the fixture through stdin EOF without sending a process signal", () => {
+    const tempDir = mkdtempSync(path.join(os.tmpdir(), "acp-runtime-teardown-"));
+    const exitLogPath = path.join(tempDir, "exit.log");
+    return Effect.gen(function* () {
+      yield* Effect.gen(function* () {
+        const runtime = yield* AcpSessionRuntime;
+        yield* runtime.start();
+      }).pipe(
+        Effect.provide(
+          acpTestRuntimeLayer({
+            authMethodId: "test",
+            spawn: {
+              command: bunExe,
+              args: [mockAgentPath],
+              env: {
+                VITEST: "true",
+                SYNARA_ACP_EXIT_LOG_PATH: exitLogPath,
+              },
+            },
+            cwd: process.cwd(),
+            clientInfo: { name: "synara-test", version: "0.0.0" },
+          }),
+        ),
+        Effect.scoped,
+      );
+
+      expect(readFileSync(exitLogPath, "utf8").trim().split("\n")).toEqual(["stdin:end", "exit:0"]);
+    }).pipe(
       Effect.provide(NodeServices.layer),
       Effect.ensuring(Effect.sync(() => rmSync(tempDir, { recursive: true, force: true }))),
     );

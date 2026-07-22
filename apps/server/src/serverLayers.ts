@@ -1,5 +1,5 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { Layer } from "effect";
+import { Effect, Layer } from "effect";
 
 import { AgentGatewayLive } from "./agentGateway/Layers/AgentGateway";
 import { AgentGatewayOperationRepositoryLive } from "./agentGateway/Layers/AgentGatewayOperationRepository";
@@ -21,7 +21,7 @@ import { OrchestrationLayerWithDevServerLifecycleLive } from "./orchestration/ru
 import { DevServerManagerLive } from "./devServerManager";
 import { KeybindingsLive } from "./keybindings";
 import { GitCoreLive } from "./git/Layers/GitCore";
-import { GitLayerLive, TextGenerationLayerLive } from "./git/runtimeLayer";
+import { makeGitLayerLive, makeTextGenerationLayerLive } from "./git/runtimeLayer";
 import { TerminalLayerLive } from "./terminal/runtimeLayer";
 import { AuthControlPlaneLive } from "./auth/Layers/AuthControlPlane";
 import { BootstrapCredentialServiceLive } from "./auth/Layers/BootstrapCredentialService";
@@ -44,19 +44,55 @@ import { OrchestrationEventDeliveryRepositoryLive } from "./persistence/Layers/O
 import { ManagedAttachmentCleanupLive } from "./managedAttachmentCleanup";
 import { ScratchWorkspaceCleanupLive } from "./scratchWorkspaceCleanup";
 import { PullRequestServiceLive } from "./pullRequests/Layers/PullRequestService";
-import { ProviderHealthLive } from "./provider/Layers/ProviderHealth";
+import { makeProviderHealthLive } from "./provider/Layers/ProviderHealth";
+import {
+  makeProviderMaintenanceGate,
+  type ProviderMaintenanceGate,
+} from "./provider/providerMaintenanceGate";
+import {
+  makeProviderMaintenanceOwnedResourceCoordinator,
+  type ProviderMaintenanceOwnedResourceCoordinator,
+} from "./provider/providerMaintenanceOwnedResources";
 import { makeServerProviderLayer } from "./provider/runtimeLayer";
 
 export { makeServerProviderLayer } from "./provider/runtimeLayer";
 
-export function makeServerRuntimeServicesLayer(
-  options: {
-    readonly agentGatewayCredentialsLayer?: typeof AgentGatewayCredentialsWithSecretsLive;
-  } = {},
-) {
+interface ServerRuntimeServicesLayerOptions {
+  readonly agentGatewayCredentialsLayer?: typeof AgentGatewayCredentialsWithSecretsLive;
+  readonly maintenanceGate?: ProviderMaintenanceGate;
+  readonly maintenanceOwnedResources?: ProviderMaintenanceOwnedResourceCoordinator;
+  readonly providerLayer?: ReturnType<typeof makeServerProviderLayer>;
+}
+
+function resolveMaintenanceCoordination(options: {
+  readonly maintenanceGate?: ProviderMaintenanceGate;
+  readonly maintenanceOwnedResources?: ProviderMaintenanceOwnedResourceCoordinator;
+}) {
+  return {
+    maintenanceGate: options.maintenanceGate ?? Effect.runSync(makeProviderMaintenanceGate),
+    maintenanceOwnedResources:
+      options.maintenanceOwnedResources ??
+      Effect.runSync(makeProviderMaintenanceOwnedResourceCoordinator),
+  } as const;
+}
+
+export function makeServerRuntimeServicesLayer(options: ServerRuntimeServicesLayerOptions = {}) {
   const agentGatewayCredentialsLayer =
     options.agentGatewayCredentialsLayer ?? AgentGatewayCredentialsWithSecretsLive;
-  const providerHealthLayer = ProviderHealthLive.pipe(Layer.provideMerge(ServerSettingsLive));
+  const maintenanceOptions = resolveMaintenanceCoordination(options);
+  const providerLayer =
+    options.providerLayer ??
+    makeServerProviderLayer({
+      agentGatewayCredentialsLayer,
+      maintenanceGate: maintenanceOptions.maintenanceGate,
+      maintenanceOwnedResources: maintenanceOptions.maintenanceOwnedResources,
+    });
+  const providerHealthLayer = makeProviderHealthLive(maintenanceOptions).pipe(
+    Layer.provideMerge(ServerSettingsLive),
+    Layer.provide(providerLayer),
+  );
+  const textGenerationLayer = makeTextGenerationLayerLive(maintenanceOptions);
+  const gitLayer = makeGitLayerLive(maintenanceOptions, { textGenerationLayer });
   // Both orchestration archive admission and WebSocket dev-server RPCs receive
   // this exact memoized manager instance, making their lifecycle lock authoritative.
   const devServerManagerLayer = DevServerManagerLive.pipe(Layer.provide(TerminalLayerLive));
@@ -93,7 +129,7 @@ export function makeServerRuntimeServicesLayer(
     Layer.provideMerge(OrchestrationEventDeliveryRepositoryLive),
     Layer.provideMerge(studioOutputReactorLayer),
     Layer.provideMerge(GitCoreLive),
-    Layer.provideMerge(TextGenerationLayerLive),
+    Layer.provideMerge(textGenerationLayer),
     Layer.provideMerge(ServerSettingsLive),
   );
   const checkpointReactorLayer = CheckpointReactorLive.pipe(
@@ -138,7 +174,7 @@ export function makeServerRuntimeServicesLayer(
     Layer.provideMerge(AutomationRepositoryLive),
     Layer.provideMerge(ProjectionTurnRepositoryLive),
     Layer.provideMerge(GitCoreLive),
-    Layer.provideMerge(TextGenerationLayerLive),
+    Layer.provideMerge(textGenerationLayer),
     Layer.provideMerge(ServerSettingsLive),
     Layer.provideMerge(runtimeServicesLayer),
   );
@@ -160,12 +196,12 @@ export function makeServerRuntimeServicesLayer(
     Layer.provideMerge(providerHealthLayer),
   );
   const pullRequestServiceLayer = PullRequestServiceLive.pipe(
-    Layer.provideMerge(GitLayerLive),
+    Layer.provideMerge(gitLayer),
     Layer.provideMerge(ProjectPullRequestPinsLive),
     Layer.provideMerge(orchestrationLayer),
   );
   const workspaceLayer = WorkspaceLayerLive.pipe(
-    Layer.provideMerge(GitLayerLive),
+    Layer.provideMerge(gitLayer),
     Layer.provideMerge(orchestrationLayer),
   );
 
@@ -186,8 +222,8 @@ export function makeServerRuntimeServicesLayer(
     providerCommandReactorLayer,
     threadDeletionReactorLayer,
     orchestrationLayer,
-    GitLayerLive,
-    TextGenerationLayerLive,
+    gitLayer,
+    textGenerationLayer,
     TerminalLayerLive,
     KeybindingsLive,
     ServerSettingsLive,
@@ -206,12 +242,25 @@ export function makeServerRuntimeServicesLayer(
  * adapters issue tokens from this registry and the HTTP gateway verifies those
  * same tokens, so constructing them independently would break scoped MCP.
  */
-export function makeServerApplicationLayers() {
+export function makeServerApplicationLayers(
+  options: {
+    readonly maintenanceGate?: ProviderMaintenanceGate;
+    readonly maintenanceOwnedResources?: ProviderMaintenanceOwnedResourceCoordinator;
+  } = {},
+) {
   const agentGatewayCredentialsLayer = AgentGatewayCredentialsWithSecretsLive;
+  const maintenanceOptions = resolveMaintenanceCoordination(options);
+  const providerLayer = makeServerProviderLayer({
+    agentGatewayCredentialsLayer,
+    maintenanceGate: maintenanceOptions.maintenanceGate,
+    maintenanceOwnedResources: maintenanceOptions.maintenanceOwnedResources,
+  });
   return {
     runtimeServicesLayer: makeServerRuntimeServicesLayer({
       agentGatewayCredentialsLayer,
+      providerLayer,
+      ...maintenanceOptions,
     }),
-    providerLayer: makeServerProviderLayer({ agentGatewayCredentialsLayer }),
+    providerLayer,
   } as const;
 }

@@ -75,6 +75,21 @@ import {
   teardownProviderProcessTree,
 } from "../supervisedProcessTeardown.ts";
 import { prepareWindowsProviderProcess } from "../windowsProviderProcess.ts";
+import {
+  installPreparedNodeProcessSupervisor,
+  type NodeProviderProcessSupervisor,
+  observeNodeProviderProcessSpawn,
+  supervisePreparedNodeProcess,
+} from "../windowsJobProcessSupervisor.ts";
+import {
+  makeProviderMaintenanceOwnedResourceCoordinator,
+  type ProviderMaintenanceOwnedResourceCoordinator,
+} from "../providerMaintenanceOwnedResources.ts";
+import {
+  makeProviderProcessOwnerTracker,
+  type ProviderProcessOwnerTracker,
+  type TrackedProviderProcessOwner,
+} from "../providerProcessOwnerTracker.ts";
 
 const PROVIDER = "pi" as const;
 const DEFAULT_PI_THINKING_LEVEL: ThinkingLevel = "medium";
@@ -106,9 +121,14 @@ type PiShellConfig = ReturnType<PiCodingAgentModule["getShellConfig"]>;
 
 interface PiActiveProcess {
   readonly child: ChildProcess;
+  readonly supervisor: NodeProviderProcessSupervisor;
+  readonly owner?: TrackedProviderProcessOwner;
+  readonly teardownOutcome: Promise<void>;
+  readonly resolveTeardown: () => void;
+  readonly rejectTeardown: (cause: unknown) => void;
   teardown: Promise<void> | undefined;
   teardownRequested: boolean;
-  teardownProven: boolean;
+  ownershipProven: boolean;
 }
 
 export interface PiBashProcessSupervisor {
@@ -119,12 +139,16 @@ export interface PiBashProcessSupervisor {
 
 export interface PiBashProcessSupervisorOptions {
   readonly getShellConfig: (shellPath?: string) => PiShellConfig;
+  readonly platform?: NodeJS.Platform;
+  readonly prepareProcess?: typeof prepareWindowsProviderProcess;
+  readonly superviseProcess?: typeof supervisePreparedNodeProcess;
   readonly spawnProcess?: (
     command: string,
     args: ReadonlyArray<string>,
     options: SpawnOptions,
   ) => ChildProcess;
   readonly teardownProcessTree?: typeof teardownProviderProcessTree;
+  readonly maintenanceOwnedResources?: ProviderMaintenanceOwnedResourceCoordinator;
 }
 
 export function makePiBashProcessSupervisor(
@@ -132,17 +156,32 @@ export function makePiBashProcessSupervisor(
 ): PiBashProcessSupervisor {
   const spawnProcess = options.spawnProcess ?? spawnChildProcess;
   const teardownProcessTree = options.teardownProcessTree ?? teardownProviderProcessTree;
+  const platform = options.platform ?? process.platform;
   const activeProcesses = new Set<PiActiveProcess>();
+  const processOwnerTracker: ProviderProcessOwnerTracker | undefined =
+    options.maintenanceOwnedResources === undefined
+      ? undefined
+      : makeProviderProcessOwnerTracker({
+          provider: PROVIDER,
+          resourcePrefix: "pi-bash-process",
+          maintenanceOwnedResources: options.maintenanceOwnedResources,
+        });
   let configuredShellPath: string | undefined;
 
   const startTeardown = (active: PiActiveProcess): Promise<void> => {
     active.teardownRequested = true;
-    active.teardown ??= teardownChildProcessTree(active.child, teardownProcessTree).then(
+    active.teardown ??= (
+      active.owner && processOwnerTracker
+        ? Effect.runPromise(processOwnerTracker.teardown(active.owner))
+        : active.supervisor.teardown()
+    ).then(
       () => {
-        active.teardownProven = true;
+        active.ownershipProven = true;
+        active.resolveTeardown();
       },
       (cause) => {
         active.teardown = undefined;
+        active.rejectTeardown(cause);
         throw cause;
       },
     );
@@ -171,26 +210,74 @@ export function makePiBashProcessSupervisor(
         baseEnv: execution.env ?? process.env,
       });
       const shellArgs = commandFromStdin ? shell.args : [...shell.args, command];
-      const prepared = prepareWindowsProviderProcess(shell.shell, shellArgs, {
-        cwd,
-        env: childEnv,
-      });
+      const prepared = (options.prepareProcess ?? prepareWindowsProviderProcess)(
+        shell.shell,
+        shellArgs,
+        {
+          cwd,
+          env: childEnv,
+          platform,
+        },
+      );
       const child = spawnProcess(prepared.command, prepared.args, {
         cwd,
-        detached: process.platform !== "win32",
+        detached: platform !== "win32",
         env: childEnv,
         shell: prepared.shell,
         ...(prepared.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
         stdio: [commandFromStdin ? "pipe" : "ignore", "pipe", "pipe"],
         windowsHide: true,
       });
+      const spawnOutcome = observeNodeProviderProcessSpawn(child);
+      const processError = new Promise<never>((_resolve, reject) => {
+        child.once("error", reject);
+      });
+      void processError.catch(() => undefined);
+      const installSupervisor = () =>
+        installPreparedNodeProcessSupervisor(
+          prepared,
+          child,
+          {
+            platform,
+            teardownProcessTree,
+            ...(platform === "win32" ? {} : { ownedProcessGroupId: Number(child.pid) }),
+          },
+          options.superviseProcess,
+        );
+      const rootPid = Number(child.pid);
+      const supervisorInstallation =
+        Number.isInteger(rootPid) && rootPid > 0
+          ? installSupervisor()
+          : await spawnOutcome.then((outcome) => {
+              if (outcome._tag !== "Spawned") throw outcome.cause;
+              return installSupervisor();
+            });
+      const supervisor = supervisorInstallation.supervisor;
+      const owner = processOwnerTracker
+        ? Effect.runSync(processOwnerTracker.register(supervisor))
+        : undefined;
+      let resolveTeardown!: () => void;
+      let rejectTeardown!: (cause: unknown) => void;
+      const teardownOutcome = new Promise<void>((resolve, reject) => {
+        resolveTeardown = resolve;
+        rejectTeardown = reject;
+      });
+      void teardownOutcome.catch(() => undefined);
       const active: PiActiveProcess = {
         child,
+        supervisor,
+        ...(owner ? { owner } : {}),
+        teardownOutcome,
+        resolveTeardown,
+        rejectTeardown,
         teardown: undefined,
         teardownRequested: false,
-        teardownProven: false,
+        ownershipProven: false,
       };
       activeProcesses.add(active);
+      if (supervisorInstallation._tag === "Recovered") {
+        throw supervisorInstallation.requestedSupervisorFailure;
+      }
 
       if (commandFromStdin) {
         child.stdin?.on("error", () => undefined);
@@ -217,10 +304,21 @@ export function makePiBashProcessSupervisor(
       execution.signal?.addEventListener("abort", requestTeardown, { once: true });
 
       try {
-        const exitCode = await new Promise<number | null>((resolve, reject) => {
-          child.once("error", reject);
-          child.once("exit", (code) => resolve(code));
-        });
+        const terminal = await Promise.race([
+          new Promise<{ readonly _tag: "Exit"; readonly exitCode: number | null }>((resolve) => {
+            child.once("exit", (exitCode) => resolve({ _tag: "Exit", exitCode }));
+          }),
+          processError,
+          active.teardownOutcome.then(() => ({ _tag: "Teardown" }) as const),
+        ]);
+        if (terminal._tag === "Exit") {
+          if (active.owner && processOwnerTracker) {
+            await Effect.runPromise(processOwnerTracker.proveExit(active.owner));
+          } else {
+            await supervisor.proveExit();
+          }
+          active.ownershipProven = true;
+        }
         if (active.teardown) {
           await active.teardown;
         }
@@ -230,11 +328,11 @@ export function makePiBashProcessSupervisor(
         if (timedOut) {
           throw new Error(`timeout:${String(execution.timeout)}`);
         }
-        return { exitCode };
+        return { exitCode: terminal._tag === "Exit" ? terminal.exitCode : null };
       } finally {
         if (timeout !== undefined) clearTimeout(timeout);
         execution.signal?.removeEventListener("abort", requestTeardown);
-        if (!active.teardownRequested || active.teardownProven) {
+        if (active.ownershipProven) {
           activeProcesses.delete(active);
         }
       }
@@ -247,9 +345,19 @@ export function makePiBashProcessSupervisor(
       configuredShellPath = shellPath;
     },
     teardownAll: async () => {
-      const results = await Promise.allSettled(
-        Array.from(activeProcesses, (active) => startTeardown(active)),
-      );
+      const activeSnapshot = Array.from(activeProcesses);
+      const results = await Promise.allSettled([
+        ...activeSnapshot.map((active) => startTeardown(active)),
+        ...(processOwnerTracker
+          ? [
+              Effect.runPromise(
+                processOwnerTracker.drainExcluding(
+                  activeSnapshot.flatMap((active) => (active.owner ? [active.owner] : [])),
+                ),
+              ),
+            ]
+          : []),
+      ]);
       const failures = results.flatMap((result) =>
         result.status === "rejected" ? [result.reason] : [],
       );
@@ -257,7 +365,7 @@ export function makePiBashProcessSupervisor(
         throw new AggregateError(failures, "Failed to prove all Pi subprocess trees exited.");
       }
       for (const active of Array.from(activeProcesses)) {
-        if (active.teardownProven) activeProcesses.delete(active);
+        if (active.ownershipProven) activeProcesses.delete(active);
       }
     },
   };
@@ -334,8 +442,12 @@ export interface PiAdapterLiveOptions {
   readonly nativeEventLogPath?: string;
   readonly nativeEventLogger?: EventNdjsonLogger;
   readonly spawnProcess?: PiBashProcessSupervisorOptions["spawnProcess"];
+  readonly platform?: NodeJS.Platform;
+  readonly prepareProcess?: PiBashProcessSupervisorOptions["prepareProcess"];
+  readonly superviseProcess?: PiBashProcessSupervisorOptions["superviseProcess"];
   readonly teardownProcessTree?: typeof teardownProviderProcessTree;
   readonly agentGatewayFetch?: AgentGatewayMcpFetch;
+  readonly maintenanceOwnedResources?: ProviderMaintenanceOwnedResourceCoordinator;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -1163,6 +1275,9 @@ const makePiAdapter = (options?: PiAdapterLiveOptions) =>
     );
     const runtimeEventQueue = yield* Queue.unbounded<ProviderRuntimeEvent>();
     const sessions = new Map<ThreadId, PiSessionContext>();
+    const maintenanceOwnedResources =
+      options?.maintenanceOwnedResources ??
+      (yield* makeProviderMaintenanceOwnedResourceCoordinator);
     const modelRegistries = new Map<string, ModelRegistry>();
     const ownsNativeEventLogger = options?.nativeEventLogger === undefined;
     const nativeEventLogger =
@@ -1950,6 +2065,10 @@ const makePiAdapter = (options?: PiAdapterLiveOptions) =>
         const piSdk = yield* loadPiSdk("session/start");
         const processSupervisor = makePiBashProcessSupervisor({
           getShellConfig: () => piSdk.getShellConfig(),
+          maintenanceOwnedResources,
+          ...(options?.platform ? { platform: options.platform } : {}),
+          ...(options?.prepareProcess ? { prepareProcess: options.prepareProcess } : {}),
+          ...(options?.superviseProcess ? { superviseProcess: options.superviseProcess } : {}),
           ...(options?.spawnProcess ? { spawnProcess: options.spawnProcess } : {}),
           ...(options?.teardownProcessTree
             ? { teardownProcessTree: options.teardownProcessTree }

@@ -54,7 +54,17 @@ import {
   teardownChildProcessTree,
   teardownProviderProcessTree,
 } from "./provider/supervisedProcessTeardown.ts";
-import { prepareResolvedWindowsProviderProcess } from "./provider/windowsProviderProcess.ts";
+import {
+  isWindowsJobPreparedCommand,
+  prepareResolvedWindowsProviderProcess,
+} from "./provider/windowsProviderProcess.ts";
+import {
+  finalizeSynchronousWindowsJobExit,
+  installPreparedNodeProcessSupervisor,
+  observeNodeProviderProcessSpawn,
+  supervisePreparedNodeProcess,
+  teardownNodeProviderProcess,
+} from "./provider/windowsJobProcessSupervisor.ts";
 import { ensureIsolatedScratchWorkspace } from "./scratchWorkspaces.ts";
 import { createLogger } from "./logger";
 import { transcribeVoiceWithChatGptSession } from "./voiceTranscription.ts";
@@ -260,7 +270,7 @@ export interface CodexThreadSnapshot {
   cwd?: string | null;
 }
 
-const CODEX_VERSION_CHECK_TIMEOUT_MS = 4_000;
+const CODEX_VERSION_CHECK_TIMEOUT_MS = 8_000;
 
 const ANSI_ESCAPE_CHAR = String.fromCharCode(27);
 const ANSI_ESCAPE_REGEX = new RegExp(`${ANSI_ESCAPE_CHAR}\\[[0-9;]*m`, "g");
@@ -606,11 +616,57 @@ export function resolveCodexModelForAccount(
   return CODEX_DEFAULT_MODEL;
 }
 
+export type CodexAppServerProcessOwnershipResult =
+  | { readonly _tag: "Installed" }
+  | { readonly _tag: "NotSpawned"; readonly cause: Error };
+
+const codexAppServerProcessesWithoutPid = new WeakSet<ChildProcessWithoutNullStreams>();
+
+/**
+ * Observes spawn before invoking the supervisor factory. Installation is intentionally deferred to
+ * the returned promise so the manager can publish its context and attach operational listeners
+ * before a recovered constructor failure is surfaced.
+ */
+export function installCodexAppServerProcessOwnership(
+  prepared: ReturnType<typeof prepareResolvedWindowsProviderProcess>,
+  child: ChildProcessWithoutNullStreams,
+  superviseProcess: typeof supervisePreparedNodeProcess = supervisePreparedNodeProcess,
+): Promise<CodexAppServerProcessOwnershipResult> {
+  const spawnOutcome = observeNodeProviderProcessSpawn(child);
+  if (!(Number.isInteger(Number(child.pid)) && Number(child.pid) > 0)) {
+    const markNoPid = () => {
+      if (!(Number.isInteger(Number(child.pid)) && Number(child.pid) > 0)) {
+        codexAppServerProcessesWithoutPid.add(child);
+      }
+    };
+    child.once("error", markNoPid);
+    child.once("close", markNoPid);
+  }
+  return spawnOutcome.then((outcome) => {
+    if (outcome._tag !== "Spawned") {
+      return { _tag: "NotSpawned", cause: outcome.cause };
+    }
+    const installation = installPreparedNodeProcessSupervisor(
+      prepared,
+      child,
+      {},
+      superviseProcess,
+    );
+    if (installation._tag === "Recovered") {
+      throw installation.requestedSupervisorFailure;
+    }
+    return { _tag: "Installed" };
+  });
+}
+
 function spawnCodexAppServer(input: {
   readonly binaryPath: string;
   readonly cwd: string;
   readonly env: NodeJS.ProcessEnv;
-}): ChildProcessWithoutNullStreams {
+}): {
+  readonly child: ChildProcessWithoutNullStreams;
+  readonly ownershipReady: Promise<CodexAppServerProcessOwnershipResult>;
+} {
   const prepared = prepareResolvedWindowsProviderProcess(
     input.binaryPath,
     buildCodexAppServerArgs(input.env),
@@ -619,7 +675,7 @@ function spawnCodexAppServer(input: {
       env: input.env,
     },
   );
-  return spawn(prepared.command, prepared.args, {
+  const child = spawn(prepared.command, prepared.args, {
     cwd: input.cwd,
     env: input.env,
     stdio: ["pipe", "pipe", "pipe"],
@@ -627,6 +683,9 @@ function spawnCodexAppServer(input: {
     windowsHide: prepared.windowsHide,
     windowsVerbatimArguments: prepared.windowsVerbatimArguments,
   });
+  const ownershipReady = installCodexAppServerProcessOwnership(prepared, child);
+  void ownershipReady.catch(() => undefined);
+  return { child, ownershipReady };
 }
 
 async function resolveCodexLaunch(input: {
@@ -909,7 +968,7 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
         env: codexLaunch.env,
       });
       gatewaySessionLease = this.agentGatewayMcp?.acquireSessionLease(threadId);
-      const child = spawnCodexAppServer({
+      const spawned = spawnCodexAppServer({
         binaryPath: codexLaunch.binaryPath,
         cwd: resolvedCwd,
         env: await this.buildSessionProcessEnv(
@@ -917,6 +976,7 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
           gatewaySessionLease?.connection.bearerToken,
         ),
       });
+      const child = spawned.child;
 
       context = {
         ...(gatewaySessionLease ? { gatewaySessionLease } : {}),
@@ -944,6 +1004,9 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
 
       this.sessions.set(threadId, context);
       this.attachProcessListeners(context);
+
+      const ownership = await spawned.ownershipReady;
+      if (ownership._tag === "NotSpawned") throw ownership.cause;
 
       this.emitLifecycleEvent(context, "session/connecting", "Starting codex app-server");
 
@@ -1474,7 +1537,7 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
         env: codexLaunch.env,
       });
       gatewaySessionLease = this.agentGatewayMcp?.acquireSessionLease(threadId);
-      const child = spawnCodexAppServer({
+      const spawned = spawnCodexAppServer({
         binaryPath: codexLaunch.binaryPath,
         cwd: resolvedCwd,
         env: await this.buildSessionProcessEnv(
@@ -1482,6 +1545,7 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
           gatewaySessionLease?.connection.bearerToken,
         ),
       });
+      const child = spawned.child;
 
       context = {
         ...(gatewaySessionLease ? { gatewaySessionLease } : {}),
@@ -1506,6 +1570,8 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
 
       this.sessions.set(threadId, context);
       this.attachProcessListeners(context);
+      const ownership = await spawned.ownershipReady;
+      if (ownership._tag === "NotSpawned") throw ownership.cause;
       this.emitLifecycleEvent(context, "session/connecting", "Starting codex app-server");
 
       await this.sendRequest(context, "initialize", buildCodexInitializeParams());
@@ -1774,8 +1840,11 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
   }
 
   private async teardownContextProcess(context: CodexSessionContext): Promise<void> {
+    if (codexAppServerProcessesWithoutPid.has(context.child)) return;
     try {
-      await teardownChildProcessTree(context.child, this.teardownProcessTree);
+      await teardownNodeProviderProcess(context.child, () =>
+        teardownChildProcessTree(context.child, this.teardownProcessTree),
+      );
     } catch (cause) {
       const detail = cause instanceof Error ? cause.message : String(cause);
       throw new Error(
@@ -1793,36 +1862,121 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
     context.pending.clear();
   }
 
+  private beginContextProcessFinalization(
+    context: CodexSessionContext,
+    input: {
+      readonly pendingError: Error;
+      readonly stdinError: Error;
+      readonly beforeProofUpdates?: Partial<ProviderSession>;
+      readonly successUpdates?: Partial<ProviderSession>;
+      readonly successEvent?: {
+        readonly method: string;
+        readonly message: string;
+      };
+      readonly proofFailureMessage: string;
+    },
+  ): Promise<void> {
+    if (context.stopPromise) return context.stopPromise;
+
+    context.stopping = true;
+    this.rejectPendingRequests(context, input.pendingError);
+    context.pendingApprovals.clear();
+    context.pendingUserInputs.clear();
+    context.detachStdout?.();
+    context.stdinWriter?.close(input.stdinError);
+    if (input.beforeProofUpdates) {
+      this.updateSession(context, input.beforeProofUpdates);
+    }
+
+    const finalization = this.teardownContextProcess(context).then(
+      () => {
+        if (input.successUpdates) {
+          this.updateSession(context, input.successUpdates);
+        }
+        if (input.successEvent) {
+          this.emitLifecycleEvent(context, input.successEvent.method, input.successEvent.message);
+        }
+        if (context.discovery) {
+          const discoveryKey = context.session.cwd ?? "";
+          if (discoveryKey && this.discoverySessions.get(discoveryKey) === context) {
+            this.discoverySessions.delete(discoveryKey);
+          }
+        } else if (this.sessions.get(context.session.threadId) === context) {
+          this.sessions.delete(context.session.threadId);
+        }
+        context.gatewaySessionLease?.release();
+      },
+      (cause) => {
+        const detail = cause instanceof Error ? cause.message : String(cause);
+        const proofMessage = `${input.proofFailureMessage}: ${detail}`;
+        this.updateSession(context, {
+          status: "error",
+          activeTurnId: undefined,
+          lastError: proofMessage,
+        });
+        this.emitErrorEvent(context, "process/exitProofFailed", proofMessage);
+        throw cause;
+      },
+    );
+    context.stopPromise = finalization;
+    void finalization.catch((error) => {
+      log.error("failed to prove Codex app-server process-tree exit", {
+        threadId: context.session.threadId,
+        error,
+      });
+    });
+    return finalization;
+  }
+
+  private handleUnexpectedProcessExit(
+    context: CodexSessionContext,
+    code: number | null,
+    signal: NodeJS.Signals | null,
+  ): void {
+    if (context.stopping || context.stopPromise) return;
+
+    const message = `codex app-server exited (code=${code ?? "null"}, signal=${signal ?? "null"}).`;
+    const exitError = new Error(message);
+    const terminalLastError = code === 0 ? context.session.lastError : message;
+    void this.beginContextProcessFinalization(context, {
+      pendingError: exitError,
+      stdinError: exitError,
+      beforeProofUpdates: {
+        status: "error",
+        activeTurnId: undefined,
+        lastError: message,
+      },
+      successUpdates: {
+        status: "closed",
+        activeTurnId: undefined,
+        lastError: terminalLastError,
+      },
+      successEvent: {
+        method: "session/exited",
+        message,
+      },
+      proofFailureMessage: `${message} Process-tree exit proof failed`,
+    });
+  }
+
   async stopSession(threadId: ThreadId): Promise<void> {
     const context = this.sessions.get(threadId);
     if (!context) {
       return;
     }
-    if (context.stopPromise) {
-      return context.stopPromise;
-    }
-
-    context.stopping = true;
-    context.gatewaySessionLease?.release();
-
-    this.rejectPendingRequests(context, new Error("Session stopped before request completed."));
-    context.pendingApprovals.clear();
-    context.pendingUserInputs.clear();
-
-    context.detachStdout?.();
-    context.stdinWriter?.close(new Error("Codex session stopped"));
-    const stopPromise = this.teardownContextProcess(context).then(() => {
-      this.updateSession(context, {
+    return this.beginContextProcessFinalization(context, {
+      pendingError: new Error("Session stopped before request completed."),
+      stdinError: new Error("Codex session stopped"),
+      successUpdates: {
         status: "closed",
         activeTurnId: undefined,
-      });
-      this.emitLifecycleEvent(context, "session/closed", "Session stopped");
-      if (this.sessions.get(threadId) === context) {
-        this.sessions.delete(threadId);
-      }
+      },
+      successEvent: {
+        method: "session/closed",
+        message: "Session stopped",
+      },
+      proofFailureMessage: `Failed to stop Codex session '${threadId}' because process-tree exit could not be proven`,
     });
-    context.stopPromise = stopPromise;
-    return stopPromise;
   }
 
   listSessions(): ProviderSession[] {
@@ -2116,11 +2270,12 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
       cwd: normalizedCwd,
       env: codexLaunch.env,
     });
-    const child = spawnCodexAppServer({
+    const spawned = spawnCodexAppServer({
       binaryPath: codexLaunch.binaryPath,
       cwd: normalizedCwd,
       env: codexLaunch.env,
     });
+    const child = spawned.child;
     const context: CodexSessionContext = {
       session: {
         provider: "codex",
@@ -2154,6 +2309,8 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
     this.discoverySessions.set(normalizedCwd, context);
     this.attachProcessListeners(context);
     try {
+      const ownership = await spawned.ownershipReady;
+      if (ownership._tag === "NotSpawned") throw ownership.cause;
       await this.sendRequest(context, "initialize", buildCodexInitializeParams());
       await this.writeMessage(context, { method: "initialized" });
       await this.registerSynaraSkillsRoot(context);
@@ -2212,24 +2369,11 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
     if (!context) {
       return;
     }
-    if (context.stopPromise) {
-      return context.stopPromise;
-    }
-
-    context.stopping = true;
-    this.rejectPendingRequests(
-      context,
-      new Error("Discovery session stopped before request completed."),
-    );
-    context.detachStdout?.();
-    context.stdinWriter?.close(new Error("Codex discovery session stopped"));
-    const stopPromise = this.teardownContextProcess(context).then(() => {
-      if (this.discoverySessions.get(discoveryKey) === context) {
-        this.discoverySessions.delete(discoveryKey);
-      }
+    return this.beginContextProcessFinalization(context, {
+      pendingError: new Error("Discovery session stopped before request completed."),
+      stdinError: new Error("Codex discovery session stopped"),
+      proofFailureMessage: `Failed to stop Codex discovery session '${discoveryKey}' because process-tree exit could not be proven`,
     });
-    context.stopPromise = stopPromise;
-    return stopPromise;
   }
 
   private attachProcessListeners(context: CodexSessionContext): void {
@@ -2286,34 +2430,9 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
 
     context.child.on("error", (error) => this.handleTransportFailure(context, error));
 
-    context.child.on("exit", (code, signal) => {
-      if (context.stopping) {
-        return;
-      }
-
-      context.detachStdout?.();
-      context.gatewaySessionLease?.release();
-      const message = `codex app-server exited (code=${code ?? "null"}, signal=${signal ?? "null"}).`;
-      const exitError = new Error(message);
-      context.stdinWriter.close(exitError);
-      this.rejectPendingRequests(context, exitError);
-      context.pendingApprovals.clear();
-      context.pendingUserInputs.clear();
-      this.updateSession(context, {
-        status: "closed",
-        activeTurnId: undefined,
-        lastError: code === 0 ? context.session.lastError : message,
-      });
-      this.emitLifecycleEvent(context, "session/exited", message);
-      if (context.discovery) {
-        const discoveryKey = context.session.cwd ?? "";
-        if (discoveryKey) {
-          this.discoverySessions.delete(discoveryKey);
-        }
-      } else {
-        this.sessions.delete(context.session.threadId);
-      }
-    });
+    context.child.on("exit", (code, signal) =>
+      this.handleUnexpectedProcessExit(context, code, signal),
+    );
   }
 
   private handleTransportFailure(context: CodexSessionContext, cause: unknown): void {
@@ -3233,6 +3352,9 @@ async function assertSupportedCodexCliVersion(input: {
     cwd: input.cwd,
     env: input.env,
   });
+  // SYNCHRONOUS_WINDOWS_JOB_OWNERSHIP_EXCEPTION: spawnSync retains the native launcher handle and
+  // does not return until the Job-wrapped target has exited, so no asynchronous teardown owner or
+  // PID lookup is involved in this bounded version probe.
   const result = spawnSync(prepared.command, prepared.args, {
     cwd: input.cwd,
     env: input.env,
@@ -3245,6 +3367,9 @@ async function assertSupportedCodexCliVersion(input: {
     windowsVerbatimArguments: prepared.windowsVerbatimArguments,
   });
 
+  const stdout = result.stdout ?? "";
+  const stderr = result.stderr ?? "";
+  let commandFailure: Error | undefined;
   if (result.error) {
     const lower = result.error.message.toLowerCase();
     if (
@@ -3252,17 +3377,16 @@ async function assertSupportedCodexCliVersion(input: {
       lower.includes("command not found") ||
       lower.includes("not found")
     ) {
-      throw new Error(`Codex CLI (${input.binaryPath}) is not installed or not executable.`);
+      commandFailure = new Error(
+        `Codex CLI (${input.binaryPath}) is not installed or not executable.`,
+      );
+    } else {
+      commandFailure = new Error(
+        `Failed to execute Codex CLI version check: ${result.error.message || String(result.error)}`,
+      );
     }
-    throw new Error(
-      `Failed to execute Codex CLI version check: ${result.error.message || String(result.error)}`,
-    );
-  }
-
-  const stdout = result.stdout ?? "";
-  const stderr = result.stderr ?? "";
-  if (result.status !== 0) {
-    throw new Error(
+  } else if (result.status !== 0) {
+    commandFailure = new Error(
       formatCodexCliVersionCheckFailure({
         binaryPath: input.binaryPath,
         status: result.status,
@@ -3271,6 +3395,26 @@ async function assertSupportedCodexCliVersion(input: {
       }),
     );
   }
+  const isUnstartedWindowsLauncherTargetFailure =
+    isWindowsJobPreparedCommand(prepared) &&
+    result.status === 241 &&
+    stderr.includes("[synara-windows-job-launcher] stage=target ");
+  let finalizationFailure: unknown;
+  try {
+    finalizeSynchronousWindowsJobExit(prepared, {
+      proofRequired: result.error === undefined && !isUnstartedWindowsLauncherTargetFailure,
+    });
+  } catch (cause) {
+    finalizationFailure = cause;
+  }
+  if (commandFailure && finalizationFailure) {
+    throw new AggregateError(
+      [commandFailure, finalizationFailure],
+      `${commandFailure.message} Windows Job proof finalization also failed.`,
+    );
+  }
+  if (commandFailure) throw commandFailure;
+  if (finalizationFailure) throw finalizationFailure;
 
   const parsedVersion = parseCodexCliVersion(`${stdout}\n${stderr}`);
   if (parsedVersion && !isCodexCliVersionSupported(parsedVersion)) {

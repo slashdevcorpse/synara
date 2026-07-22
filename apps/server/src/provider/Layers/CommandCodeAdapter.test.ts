@@ -6,11 +6,19 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { ThreadId, type ProviderRuntimeEvent } from "@synara/contracts";
 import { prepareWindowsSafeProcess } from "@synara/shared/windowsProcess";
 import { it, assert, describe, vi } from "@effect/vitest";
-import { Effect, Fiber, Layer, Stream } from "effect";
+import { Effect, Fiber, Layer, Result, Stream } from "effect";
 
 import { ServerConfig } from "../../config.ts";
-import { ProviderAdapterProcessError, ProviderAdapterValidationError } from "../Errors.ts";
+import {
+  ProviderAdapterProcessError,
+  ProviderAdapterRequestError,
+  ProviderAdapterValidationError,
+} from "../Errors.ts";
 import { CommandCodeAdapter } from "../Services/CommandCodeAdapter.ts";
+import {
+  findProviderProcessExitUnprovenError,
+  ProviderProcessExitUnprovenError,
+} from "../supervisedProcessTeardown.ts";
 import {
   buildCommandCodeTurnArgs,
   makeCommandCodeAdapterLive,
@@ -58,6 +66,7 @@ function makeMockChild(): MockChild {
     },
     close(code, signal = null) {
       Object.assign(emitter, { exitCode: code, signalCode: signal });
+      emitter.emit("exit", code, signal);
       emitter.emit("close", code, signal);
     },
   };
@@ -71,16 +80,27 @@ function adapterLayer(input: {
   readonly resolveExecutable?: (command: string) => string;
 }) {
   const spawnProcess = input.spawnProcess ?? vi.fn<SpawnProcess>(() => input.child.child);
+  const teardownProcessTree =
+    input.teardownProcessTree ??
+    (async () => {
+      if (input.child.child.exitCode === null) input.child.close(130);
+    });
   return {
     spawnProcess,
     layer: makeCommandCodeAdapterLive({
+      platform: "linux",
       spawnProcess,
       prepareProcess: input.prepareProcess ?? prepareWindowsSafeProcess,
-      teardownProcessTree:
-        input.teardownProcessTree ??
-        (async () => {
-          if (input.child.child.exitCode === null) input.child.close(130);
-        }),
+      teardownProcessTree,
+      superviseProcess: (_prepared, child) => ({
+        rootPid: Number(child.pid),
+        proveExit: async () => ({ escalated: false, signalErrors: [] }),
+        teardown: async () => {
+          await teardownProcessTree(child);
+          return { escalated: false, signalErrors: [] };
+        },
+        requestTermination: (signal) => child.kill(signal),
+      }),
       resolveExecutable: input.resolveExecutable ?? (() => "C:\\tools\\commandcode.cmd"),
     }).pipe(
       Layer.provide(
@@ -443,6 +463,136 @@ it.effect("discovers models through the mocked CLI without a vendor call", () =>
         (spawnProcess.mock.calls[0]?.[1] as ReadonlyArray<string>).join(" "),
         /--list-models/u,
       );
+    }),
+  ),
+);
+
+it.effect("retains failed model discovery ownership until a later stopAll retry", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const mock = makeMockChild();
+      const primaryFailure = new Error("Command Code model discovery stream failed.");
+      const processFailure = new ProviderProcessExitUnprovenError({
+        rootPid: 6_501,
+        rootExited: true,
+        remainingDescendantPids: [6_502],
+        captureComplete: true,
+      });
+      let teardownCalls = 0;
+      const teardown = vi.fn(async () => {
+        teardownCalls += 1;
+        if (teardownCalls === 1) {
+          mock.close(1);
+          throw processFailure;
+        }
+      });
+      const { layer } = adapterLayer({ child: mock, teardownProcessTree: teardown });
+
+      const result = yield* Effect.gen(function* () {
+        const adapter = yield* CommandCodeAdapter;
+        const listing = yield* adapter.listModels!({
+          provider: "commandCode",
+          cwd: process.cwd(),
+        }).pipe(Effect.result, Effect.forkChild);
+        yield* Effect.yieldNow;
+        mock.error(primaryFailure);
+        const result = yield* Fiber.join(listing);
+        assert.equal(teardown.mock.calls.length, 1);
+        yield* adapter.stopAll();
+        return result;
+      }).pipe(Effect.provide(layer));
+
+      assert.equal(Result.isFailure(result), true);
+      if (Result.isFailure(result)) {
+        assert.ok(result.failure instanceof ProviderAdapterRequestError);
+        assert.equal(findProviderProcessExitUnprovenError(result.failure), processFailure);
+        assert.ok(result.failure.cause instanceof AggregateError);
+        assert.equal(result.failure.cause.errors[0], primaryFailure);
+        assert.equal(result.failure.cause.errors[1], processFailure);
+      }
+      assert.equal(teardown.mock.calls.length, 2);
+    }),
+  ),
+);
+
+it.effect("attempts a failed active owner only once per stopAll call", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const mock = makeMockChild();
+      const processFailure = new ProviderProcessExitUnprovenError({
+        rootPid: 6_505,
+        rootExited: true,
+        remainingDescendantPids: [6_506],
+        captureComplete: true,
+      });
+      const teardown = vi
+        .fn<() => Promise<void>>()
+        .mockRejectedValueOnce(processFailure)
+        .mockResolvedValue(undefined);
+      const { layer } = adapterLayer({ child: mock, teardownProcessTree: teardown });
+      const threadId = ThreadId.makeUnsafe("command-code-one-stop-attempt");
+
+      yield* Effect.gen(function* () {
+        const adapter = yield* CommandCodeAdapter;
+        yield* adapter.startSession(startInput(threadId));
+        yield* adapter.sendTurn({ threadId, input: "keep running" });
+
+        const firstStop = yield* adapter.stopAll().pipe(Effect.result);
+        assert.equal(Result.isFailure(firstStop), true);
+        if (Result.isFailure(firstStop)) {
+          assert.equal(findProviderProcessExitUnprovenError(firstStop.failure), processFailure);
+        }
+        assert.equal(teardown.mock.calls.length, 1);
+
+        yield* adapter.stopAll();
+        assert.equal(teardown.mock.calls.length, 2);
+      }).pipe(Effect.provide(layer));
+    }),
+  ),
+);
+
+it.effect("retains a failed turn owner so stopAll can retry exact teardown proof", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const mock = makeMockChild();
+      const processFailure = new ProviderProcessExitUnprovenError({
+        rootPid: 6_503,
+        rootExited: true,
+        remainingDescendantPids: [6_504],
+        captureComplete: true,
+      });
+      let teardownCalls = 0;
+      const teardown = vi.fn(async () => {
+        teardownCalls += 1;
+        if (teardownCalls === 1) {
+          mock.close(1);
+          throw processFailure;
+        }
+      });
+      const { layer } = adapterLayer({ child: mock, teardownProcessTree: teardown });
+      const threadId = ThreadId.makeUnsafe("command-code-retained-proof-owner");
+
+      const events = yield* Effect.gen(function* () {
+        const adapter = yield* CommandCodeAdapter;
+        const eventFiber = yield* Stream.runCollect(adapter.streamEvents.pipe(Stream.take(5))).pipe(
+          Effect.forkChild,
+        );
+        yield* adapter.startSession(startInput(threadId));
+        yield* adapter.sendTurn({ threadId, input: "trigger a process error" });
+        mock.error(new Error("Command Code transport failed."));
+        const observed = Array.from(yield* Fiber.join(eventFiber));
+        yield* adapter.stopAll();
+        assert.equal(yield* adapter.hasSession(threadId), false);
+        return observed;
+      }).pipe(Effect.provide(layer));
+
+      const completed = events.find(
+        (event): event is Extract<ProviderRuntimeEvent, { type: "turn.completed" }> =>
+          event.type === "turn.completed",
+      );
+      assert.equal(completed?.payload.state, "failed");
+      assert.match(completed?.payload.errorMessage ?? "", /transport failed/u);
+      assert.equal(teardown.mock.calls.length, 2);
     }),
   ),
 );
