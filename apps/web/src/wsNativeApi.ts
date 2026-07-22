@@ -50,6 +50,7 @@ import { emitWsCompatibilityIssue, emitWsTransportState } from "./wsTransportEve
 import { resolveWsHttpUrl } from "./lib/wsHttpUrl";
 
 let instance: { api: NativeApi; transport: WsTransport } | null = null;
+const RETRY_ON_SESSION_INTERRUPTION = { retryOnSessionInterruption: true } as const;
 
 function createListenerRegistry<T>() {
   const listeners = new Set<(payload: T) => void>();
@@ -628,7 +629,12 @@ export function createWsNativeApi(): NativeApi {
         await transport.dispose();
         return result;
       },
-      refreshProviders: () => transport.request(WS_METHODS.serverRefreshProviders),
+      refreshProviders: () =>
+        transport.request(
+          WS_METHODS.serverRefreshProviders,
+          undefined,
+          RETRY_ON_SESSION_INTERRUPTION,
+        ),
       // Provider updates run up to 2 minutes server-side; callers wrap this in
       // withProviderUpdateTimeout, which owns the client-side watchdog.
       updateProvider: (input) =>
@@ -678,11 +684,20 @@ export function createWsNativeApi(): NativeApi {
     },
     orchestration: {
       getSnapshot: () => transport.request(ORCHESTRATION_WS_METHODS.getSnapshot),
-      getShellSnapshot: () => transport.request(ORCHESTRATION_WS_METHODS.getShellSnapshot),
+      getShellSnapshot: () =>
+        transport.request(
+          ORCHESTRATION_WS_METHODS.getShellSnapshot,
+          undefined,
+          RETRY_ON_SESSION_INTERRUPTION,
+        ),
       dispatchCommand: (command) => {
-        return transport.request(ORCHESTRATION_WS_METHODS.dispatchCommand, {
-          command: omitNullUserInputAnswers(command),
-        });
+        return transport.request(
+          ORCHESTRATION_WS_METHODS.dispatchCommand,
+          {
+            command: omitNullUserInputAnswers(command),
+          },
+          RETRY_ON_SESSION_INTERRUPTION,
+        );
       },
       importThread: (input) => transport.request(ORCHESTRATION_WS_METHODS.importThread, input),
       repairState: () => transport.request(ORCHESTRATION_WS_METHODS.repairState),

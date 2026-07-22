@@ -512,9 +512,32 @@ describe("wsNativeApi", () => {
     } as const;
     await api.orchestration.dispatchCommand(command);
 
-    expect(requestMock).toHaveBeenCalledWith(ORCHESTRATION_WS_METHODS.dispatchCommand, {
-      command,
+    expect(requestMock).toHaveBeenCalledWith(
+      ORCHESTRATION_WS_METHODS.dispatchCommand,
+      { command },
+      { retryOnSessionInterruption: true },
+    );
+  });
+
+  it("opts only the safe provider and shell reads into session recovery", async () => {
+    requestMock
+      .mockResolvedValueOnce({ providers: [] })
+      .mockResolvedValueOnce({ snapshotSequence: 1, projects: [], threads: [] });
+    const { createWsNativeApi } = await import("./wsNativeApi");
+    const api = createWsNativeApi();
+
+    await api.server.refreshProviders();
+    await api.orchestration.getShellSnapshot();
+
+    expect(requestMock).toHaveBeenNthCalledWith(1, WS_METHODS.serverRefreshProviders, undefined, {
+      retryOnSessionInterruption: true,
     });
+    expect(requestMock).toHaveBeenNthCalledWith(
+      2,
+      ORCHESTRATION_WS_METHODS.getShellSnapshot,
+      undefined,
+      { retryOnSessionInterruption: true },
+    );
   });
 
   it("forwards terminal output ACKs to the websocket transport", async () => {
@@ -583,14 +606,18 @@ describe("wsNativeApi", () => {
     } as const;
     await api.orchestration.dispatchCommand(command);
 
-    expect(requestMock).toHaveBeenCalledWith(ORCHESTRATION_WS_METHODS.dispatchCommand, {
-      command: {
-        ...command,
-        answers: {
-          Runtime: "Bun",
+    expect(requestMock).toHaveBeenCalledWith(
+      ORCHESTRATION_WS_METHODS.dispatchCommand,
+      {
+        command: {
+          ...command,
+          answers: {
+            Runtime: "Bun",
+          },
         },
       },
-    });
+      { retryOnSessionInterruption: true },
+    );
   });
 
   it("forwards workspace file writes to the websocket project method", async () => {

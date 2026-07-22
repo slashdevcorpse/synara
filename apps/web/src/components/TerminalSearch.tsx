@@ -51,17 +51,25 @@ export function TerminalSearch({ searchAddon, isOpen, onClose }: TerminalSearchP
     }
   }, [isOpen, searchAddon]);
 
+  useEffect(() => {
+    if (!searchAddon) return;
+    const resultsSubscription = searchAddon.onDidChangeResults(({ resultCount }) => {
+      setHasResults(resultCount > 0);
+    });
+    return () => resultsSubscription.dispose();
+  }, [searchAddon]);
+
   const handleSearch = (direction: "next" | "previous") => {
     if (!searchAddon || !query) return;
     if (searchTimerRef.current !== null) {
       window.clearTimeout(searchTimerRef.current);
       searchTimerRef.current = null;
     }
-    const found =
-      direction === "next"
-        ? searchAddon.findNext(query, searchOptions)
-        : searchAddon.findPrevious(query, searchOptions);
-    setHasResults(found);
+    if (direction === "next") {
+      searchAddon.findNext(query, searchOptions);
+    } else {
+      searchAddon.findPrevious(query, searchOptions);
+    }
   };
 
   const clearSearchTimer = useCallback(() => {
@@ -80,7 +88,7 @@ export function TerminalSearch({ searchAddon, isOpen, onClose }: TerminalSearchP
 
     searchTimerRef.current = window.setTimeout(() => {
       searchTimerRef.current = null;
-      setHasResults(searchAddon.findNext(nextQuery, searchOptions));
+      searchAddon.findNext(nextQuery, searchOptions);
     }, SEARCH_DEBOUNCE_MS);
   };
 
@@ -107,7 +115,7 @@ export function TerminalSearch({ searchAddon, isOpen, onClose }: TerminalSearchP
       clearSearchTimer();
       searchTimerRef.current = window.setTimeout(() => {
         searchTimerRef.current = null;
-        setHasResults(searchAddon.findNext(query, searchOptions));
+        searchAddon.findNext(query, searchOptions);
       }, SEARCH_DEBOUNCE_MS);
     }
   }, [searchAddon, query, clearSearchTimer, caseSensitive, searchOptions]);

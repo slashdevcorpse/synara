@@ -17,6 +17,7 @@ export interface DuplicateProjectCreateRecoveryCandidate {
   readonly kind?: string | undefined;
   readonly workspaceRoot: string;
   readonly deletedAt?: string | null | undefined;
+  readonly archivedAt?: string | null | undefined;
 }
 
 interface SnapshotWithProjects<T extends DuplicateProjectCreateRecoveryCandidate> {
@@ -42,7 +43,9 @@ function isRecoverableActiveProject(
   recoverableKinds?: ReadonlySet<string>,
 ): boolean {
   return (
-    (project.deletedAt ?? null) === null && isRecoverableProjectKind(project.kind, recoverableKinds)
+    (project.deletedAt ?? null) === null &&
+    (project.archivedAt ?? null) === null &&
+    isRecoverableProjectKind(project.kind, recoverableKinds)
   );
 }
 

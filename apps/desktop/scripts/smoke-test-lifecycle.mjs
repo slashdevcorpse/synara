@@ -6,7 +6,9 @@ import { isAbsolute, parse, relative, resolve, win32 } from "node:path";
 export const DESKTOP_SMOKE_OBSERVATION_MS = 8_000;
 export const DESKTOP_SMOKE_GRACEFUL_SHUTDOWN_MS = 5_000;
 export const DESKTOP_SMOKE_EXIT_PROOF_MS = 2_000;
-export const DESKTOP_SMOKE_WINDOWS_JOB_STARTUP_MS = 30_000;
+// Windows PowerShell compiles the embedded Job Object helper before it can emit READY.
+// Hosted runners can exceed 30s while the full desktop test suite is contending for CPU.
+export const DESKTOP_SMOKE_WINDOWS_JOB_STARTUP_MS = 45_000;
 export const DESKTOP_SMOKE_WINDOWS_TEARDOWN_MS = 13_000;
 export const DESKTOP_SMOKE_WINDOWS_SETTLEMENT_MS = 2_000;
 export const WINDOWS_SMOKE_JOB_READY_PREFIX = "SYNARA_SMOKE_JOB_READY ";

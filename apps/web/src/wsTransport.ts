@@ -80,6 +80,8 @@ export class WorkspaceCloneStreamIncompleteError extends Data.TaggedError(
 export interface WsRequestOptions {
   readonly timeoutMs?: number | null;
   readonly signal?: AbortSignal;
+  /** Retry once after a feature-session interruption or recognized socket failure. */
+  readonly retryOnSessionInterruption?: boolean;
 }
 
 export interface ShellSubscriptionResumeState {
@@ -192,6 +194,10 @@ const makeRpcClient = RpcClient.make(WsFeatureRpcGroup);
 const makeBootstrapRpcClient = RpcClient.make(WsBootstrapRpcGroup);
 const REQUEST_TIMEOUT_MS = 60_000;
 
+type UnaryRpcAttemptResult<T> =
+  | { readonly _tag: "Success"; readonly value: T }
+  | { readonly _tag: "Failure"; readonly cause: Cause.Cause<unknown> };
+
 function resolveRpcUrl(rawUrl: string, path: string): string {
   const url = new URL(rawUrl);
   url.pathname = path;
@@ -283,6 +289,49 @@ export function shouldReconnectAfterStreamFailure(cause: Cause.Cause<unknown>): 
     const code = "code" in error ? error.code : undefined;
     return typeof code === "string" && STREAM_ADMISSION_ERROR_CODES.has(code);
   });
+}
+
+const RECOVERABLE_SOCKET_REASON_TAGS = new Set([
+  "SocketReadError",
+  "SocketWriteError",
+  "SocketOpenError",
+  "SocketCloseError",
+]);
+const SESSION_RECOVERABLE_UNARY_METHODS: ReadonlySet<string> = new Set([
+  ORCHESTRATION_WS_METHODS.dispatchCommand,
+  ORCHESTRATION_WS_METHODS.getShellSnapshot,
+  WS_METHODS.serverRefreshProviders,
+]);
+
+function getSocketReasonTag(error: unknown): string | null {
+  if (typeof error !== "object" || error === null || !("_tag" in error)) return null;
+  const tagged = error as { readonly _tag?: unknown; readonly reason?: unknown };
+  if (tagged._tag !== "RpcClientError" && tagged._tag !== "SocketError") return null;
+  if (typeof tagged.reason !== "object" || tagged.reason === null || !("_tag" in tagged.reason)) {
+    return null;
+  }
+  const reasonTag = (tagged.reason as { readonly _tag?: unknown })._tag;
+  return typeof reasonTag === "string" && RECOVERABLE_SOCKET_REASON_TAGS.has(reasonTag)
+    ? reasonTag
+    : null;
+}
+
+export function shouldRecoverUnaryRequest(cause: Cause.Cause<unknown>): boolean {
+  let hasRecoverableReason = false;
+  for (const reason of cause.reasons) {
+    if (Cause.isInterruptReason(reason)) {
+      hasRecoverableReason = true;
+      continue;
+    }
+    const failure = Cause.isFailReason(reason)
+      ? reason.error
+      : Cause.isDieReason(reason)
+        ? reason.defect
+        : null;
+    if (getSocketReasonTag(failure) === null) return false;
+    hasRecoverableReason = true;
+  }
+  return hasRecoverableReason;
 }
 
 export function isTerminalResnapshotRequiredFailure(cause: Cause.Cause<unknown>): boolean {
@@ -438,10 +487,15 @@ export class WsTransport {
     if (this.disposed) throw new Error("Transport disposed");
     const requestOptions: WsRequestOptions =
       options?.timeoutMs === undefined ? { ...options, timeoutMs: REQUEST_TIMEOUT_MS } : options;
+    if (
+      requestOptions.retryOnSessionInterruption === true &&
+      !SESSION_RECOVERABLE_UNARY_METHODS.has(method)
+    ) {
+      throw new RangeError(`WebSocket RPC session recovery is not permitted for method ${method}.`);
+    }
     const abortScope = makeRequestAbortScope(requestOptions);
     try {
-      const client = await awaitWithAbort(this.getClient(), abortScope.signal);
-      const clientRuntime = this.getClientRuntime(client);
+      let client = await awaitWithAbort(this.getClient(), abortScope.signal);
 
       if (method === WS_METHODS.gitRunStackedAction) {
         return (await this.runGitActionStream(client, params, abortScope.signal)) as T;
@@ -484,17 +538,40 @@ export class WsTransport {
           ? (params as { command: unknown }).command
           : (params ?? {});
       const normalizedRpcInput = omitNullUserInputAnswers(rpcInput);
-      const call = (
-        client as unknown as Record<
-          string,
-          (input: unknown) => Effect.Effect<unknown, WsTransportRpcError, never>
-        >
-      )[method];
-      if (!call) throw new WsTransportRpcError({ message: `Unknown RPC method: ${method}` });
-      return (await clientRuntime.runPromise(
-        call(normalizedRpcInput),
-        abortScope.signal ? { signal: abortScope.signal } : undefined,
-      )) as T;
+      const firstSessionVersion = this.sessionVersion;
+      const firstAttempt = await this.runUnaryRpcAttempt<T>(
+        client,
+        method,
+        normalizedRpcInput,
+        abortScope.signal,
+      );
+      if (firstAttempt._tag === "Success") return firstAttempt.value;
+
+      if (abortScope.signal?.aborted) {
+        throw causeToError(firstAttempt.cause);
+      }
+
+      if (
+        requestOptions.retryOnSessionInterruption === true &&
+        shouldRecoverUnaryRequest(firstAttempt.cause)
+      ) {
+        client = await awaitWithAbort(
+          this.recoverUnaryRequestSession(firstSessionVersion),
+          abortScope.signal,
+        );
+      } else {
+        throw causeToError(firstAttempt.cause);
+      }
+
+      if (abortScope.signal?.aborted) throw abortScope.signal.reason;
+      const secondAttempt = await this.runUnaryRpcAttempt<T>(
+        client,
+        method,
+        normalizedRpcInput,
+        abortScope.signal,
+      );
+      if (secondAttempt._tag === "Success") return secondAttempt.value;
+      throw causeToError(secondAttempt.cause);
     } catch (error) {
       if (abortScope.didTimeout()) {
         throw new WsTransportRequestInterruptedError({
@@ -684,10 +761,13 @@ export class WsTransport {
 
   private async getClient(): Promise<RpcClientInstance> {
     try {
-      return await this.clientPromise;
+      if (this.reconnectPromise) return await this.reconnectPromise;
+      const client = await this.clientPromise;
+      return this.reconnectPromise ? await this.reconnectPromise : client;
     } catch (error) {
       if (this.disposed) throw new Error("Transport disposed");
       if (isTerminalCompatibilityFailure(error)) throw error;
+      if (this.reconnectPromise) return this.reconnectPromise;
       return this.reconnect();
     }
   }
@@ -700,6 +780,37 @@ export class WsTransport {
       throw new Error("Missing runtime for WebSocket RPC client");
     }
     return runtime;
+  }
+
+  private async runUnaryRpcAttempt<T>(
+    client: RpcClientInstance,
+    method: string,
+    normalizedRpcInput: unknown,
+    signal: AbortSignal | undefined,
+  ): Promise<UnaryRpcAttemptResult<T>> {
+    const call = (
+      client as unknown as Record<
+        string,
+        (input: unknown) => Effect.Effect<unknown, WsTransportRpcError, never>
+      >
+    )[method];
+    if (!call) throw new WsTransportRpcError({ message: `Unknown RPC method: ${method}` });
+
+    const exit = await this.getClientRuntime(client).runPromiseExit(
+      call(normalizedRpcInput),
+      signal ? { signal } : undefined,
+    );
+    if (Exit.isFailure(exit)) return { _tag: "Failure", cause: exit.cause };
+    return { _tag: "Success", value: exit.value as T };
+  }
+
+  private recoverUnaryRequestSession(attemptSessionVersion: number): Promise<RpcClientInstance> {
+    if (this.disposed) return Promise.reject(new Error("Transport disposed"));
+    if (this.reconnectPromise) return this.getClient();
+    if (this.sessionVersion !== attemptSessionVersion && this.state === "open") {
+      return this.getClient();
+    }
+    return this.reconnect();
   }
 
   private reconnect(): Promise<RpcClientInstance> {

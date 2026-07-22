@@ -1,12 +1,13 @@
 import { defineConfig, mergeConfig } from "vitest/config";
 
 import browserConfig from "./vitest.browser.config";
+import { browserQuarantineTestNamePattern } from "./vitest.browser.quarantine";
 
 export default mergeConfig(
   browserConfig,
   defineConfig({
     test: {
-      testNamePattern: /^(?!.*\[geometry:linux\])/,
+      testNamePattern: browserQuarantineTestNamePattern("stable"),
       browser: {
         fileParallelism: false,
       },

@@ -257,7 +257,10 @@ it.layer(NodeServices.layer)("resolveEditorLaunch", (it) => {
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
       const path = yield* Path.Path;
-      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "synara-open-terminal-" });
+      const dir = yield* fs.makeTempDirectoryScoped({
+        directory: process.cwd(),
+        prefix: "synara-open-terminal-",
+      });
       const filePath = path.join(dir, "src", "open.ts");
       yield* fs.makeDirectory(path.dirname(filePath), { recursive: true });
       yield* fs.writeFileString(filePath, "export const value = 1;\n");
@@ -286,11 +289,12 @@ it.layer(NodeServices.layer)("resolveEditorLaunch", (it) => {
       yield* fs.makeDirectory(binDir, { recursive: true });
       yield* fs.writeFileString(path.join(binDir, "konsole"), "#!/bin/sh\n");
       yield* fs.chmod(path.join(binDir, "konsole"), 0o755);
+      const linuxBinDir = path.relative(process.cwd(), binDir);
 
       const linuxTerminalLaunch = yield* resolveEditorLaunch(
         { cwd: `${filePath}:71:5`, editor: "terminal" },
         "linux",
-        { PATH: binDir },
+        { PATH: linuxBinDir },
       );
       assert.deepEqual(linuxTerminalLaunch, {
         command: "konsole",
@@ -546,17 +550,24 @@ it.layer(NodeServices.layer)("isCommandAvailable", (it) => {
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
       const path = yield* Path.Path;
-      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "synara-open-posix-path-" });
+      const dir = yield* fs.makeTempDirectoryScoped({
+        directory: process.cwd(),
+        prefix: "synara-open-posix-path-",
+      });
       yield* fs.writeFileString(path.join(dir, "code"), "#!/bin/sh\n");
       yield* fs.chmod(path.join(dir, "code"), 0o755);
+      const pathEntry = path.relative(process.cwd(), dir);
 
       for (const name of ["Path", "path"] as const) {
-        assert.equal(isCommandAvailable("code", { platform: "linux", env: { [name]: dir } }), true);
+        assert.equal(
+          isCommandAvailable("code", { platform: "linux", env: { [name]: pathEntry } }),
+          true,
+        );
       }
       assert.equal(
         isCommandAvailable("code", {
           platform: "linux",
-          env: { PATH: dir, Path: "/missing-mixed", path: "/missing-lower" },
+          env: { PATH: pathEntry, Path: "/missing-mixed", path: "/missing-lower" },
         }),
         true,
       );
@@ -884,7 +895,7 @@ it.layer(NodeServices.layer)("discoverAvailableEditors", (it) => {
           discoverAvailableEditors({
             platform: "linux",
             cwd: dir,
-            env: { [name]: dir },
+            env: { [name]: "." },
             lookupWindowsStorePackages: async () => ({
               status: "success",
               installLocationsByFamily: {},

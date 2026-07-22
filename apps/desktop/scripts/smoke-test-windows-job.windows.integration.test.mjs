@@ -12,6 +12,8 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   createDesktopSmokeEnvironment,
   createDesktopSmokeSpawnSpec,
+  DESKTOP_SMOKE_OBSERVATION_MS,
+  DESKTOP_SMOKE_WINDOWS_JOB_STARTUP_MS,
   resolveWindowsPowerShellPath,
   superviseDesktopSmokeProcess,
   WINDOWS_SMOKE_JOB_READY_PREFIX,
@@ -175,6 +177,7 @@ describe.skipIf(process.platform !== "win32")(
       await waitFor(
         () => output.includes(WINDOWS_SMOKE_JOB_READY_PREFIX + runId),
         "the wrapper ready marker",
+        DESKTOP_SMOKE_WINDOWS_JOB_STARTUP_MS,
       );
       await waitFor(
         () => output.includes("FIXTURE_ARGV:[]"),
@@ -186,7 +189,7 @@ describe.skipIf(process.platform !== "win32")(
       expect({ code, signal }).toEqual({ code: 137, signal: null });
       expect(output).toContain("FIXTURE_ARGV:[]");
       expect(output).not.toContain("SYNARA_SMOKE_JOB_ERROR");
-    }, 20_000);
+    }, 90_000);
 
     it("preserves literal -- argv and contains root, child, grandchild, and TCP listener", async () => {
       const pidFile = join(temporaryDirectory, "owned process ids.txt");
@@ -205,17 +208,21 @@ describe.skipIf(process.platform !== "win32")(
         child,
         platform: "win32",
         windowsJobRunId: runId,
-        observationMs: 4_000,
+        observationMs: DESKTOP_SMOKE_OBSERVATION_MS,
       });
 
-      await waitFor(async () => {
-        try {
-          return (await readFile(pidFile, "utf8")).includes("grandchild:");
-        } catch (error) {
-          if (error?.code === "ENOENT") return false;
-          throw error;
-        }
-      }, "the grandchild to start");
+      await waitFor(
+        async () => {
+          try {
+            return (await readFile(pidFile, "utf8")).includes("grandchild:");
+          } catch (error) {
+            if (error?.code === "ENOENT") return false;
+            throw error;
+          }
+        },
+        "the grandchild to start",
+        DESKTOP_SMOKE_WINDOWS_JOB_STARTUP_MS,
+      );
       await waitFor(() => canConnect(port), "the grandchild listener");
 
       const result = await resultPromise;
@@ -232,7 +239,7 @@ describe.skipIf(process.platform !== "win32")(
         "all Job-owned PIDs to exit",
       );
       await expect(canConnect(port)).resolves.toBe(false);
-    }, 25_000);
+    }, 90_000);
 
     it("treats wrapper stdin EOF as a contained Job shutdown", async () => {
       const pidFile = join(temporaryDirectory, "eof target pid.txt");
@@ -248,6 +255,7 @@ describe.skipIf(process.platform !== "win32")(
       await waitFor(
         () => output.includes(WINDOWS_SMOKE_JOB_READY_PREFIX + runId),
         "the wrapper ready marker",
+        DESKTOP_SMOKE_WINDOWS_JOB_STARTUP_MS,
       );
       await waitFor(async () => {
         try {
@@ -264,7 +272,7 @@ describe.skipIf(process.platform !== "win32")(
       expect(output).not.toContain("SYNARA_SMOKE_JOB_ERROR");
       const pid = Number((await readFile(pidFile, "utf8")).trim().split(":")[1]);
       await waitFor(() => !processExists(pid), "the EOF target to be killed by Job teardown");
-    }, 20_000);
+    }, 90_000);
 
     it("rejects an existing drive-root-relative target before READY in the helper itself", async () => {
       await access(process.execPath);

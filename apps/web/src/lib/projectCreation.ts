@@ -55,6 +55,7 @@ export async function createOrRecoverProjectFromPath(input: {
   const createdAt = new Date().toISOString();
   const title = buildProjectTitleFromWorkspaceRoot(workspaceRoot);
 
+  let dispatchFailure: { readonly error: unknown } | null = null;
   try {
     await input.api.orchestration.dispatchCommand({
       type: "project.create",
@@ -70,7 +71,11 @@ export async function createOrRecoverProjectFromPath(input: {
       },
       createdAt,
     });
+  } catch (error) {
+    dispatchFailure = { error };
+  }
 
+  if (dispatchFailure === null) {
     const { project, snapshot } = await waitForRecoverableProjectInReadModel({
       projectId,
       loadSnapshot: input.loadSnapshot,
@@ -84,90 +89,115 @@ export async function createOrRecoverProjectFromPath(input: {
       created: true,
       restored: false,
     };
-  } catch (error) {
-    const description =
-      error instanceof Error ? error.message : "An error occurred while adding the project.";
-    if (isArchivedProjectCreateError(description)) {
-      const archivedProjectId = extractArchivedProjectCreateProjectId(
-        description,
-      ) as ProjectId | null;
-      if (!archivedProjectId) {
-        throw error instanceof Error ? error : new Error(description);
-      }
+  }
 
-      try {
-        await unarchiveProjectFromClient(input.api.orchestration, archivedProjectId);
-      } catch (restoreError) {
-        // Another client may have restored the project after our create was rejected.
-        // Recover that active row if it has appeared; otherwise preserve the real
-        // unarchive failure (pending cleanup, pin cap, etc.) for an actionable UI error.
-        const raced = await waitForRecoverableProjectInReadModel({
-          projectId: archivedProjectId,
-          loadSnapshot: input.loadSnapshot,
-          maxAttempts,
-          delayMs,
-        });
-        if (raced.project && raced.snapshot) {
-          return {
-            projectId: archivedProjectId,
-            project: raced.project,
-            snapshot: raced.snapshot,
-            created: false,
-            restored: false,
-          };
-        }
-        throw restoreError;
+  const { error } = dispatchFailure;
+  const description =
+    error instanceof Error ? error.message : "An error occurred while adding the project.";
+  if (!isArchivedProjectCreateError(description) && !isDuplicateProjectCreateError(description)) {
+    // The command can commit immediately before its WebSocket response is interrupted.
+    // Resolve that uncertain outcome by observing the exact intended id; never replay the
+    // mutation, and preserve the original failure when no committed row appears.
+    const dispatchError = error instanceof Error ? error : new Error(description, { cause: error });
+    try {
+      const committed = await waitForRecoverableProjectInReadModel({
+        projectId,
+        loadSnapshot: input.loadSnapshot,
+        maxAttempts,
+        delayMs,
+      });
+      if (committed.project && committed.snapshot) {
+        return {
+          projectId,
+          project: committed.project,
+          snapshot: committed.snapshot,
+          created: true,
+          restored: false,
+        };
       }
+    } catch {
+      throw dispatchError;
+    }
+    throw dispatchError;
+  }
 
-      const restored = await waitForRecoverableProjectInReadModel({
+  if (isArchivedProjectCreateError(description)) {
+    const archivedProjectId = extractArchivedProjectCreateProjectId(
+      description,
+    ) as ProjectId | null;
+    if (!archivedProjectId) {
+      throw error instanceof Error ? error : new Error(description, { cause: error });
+    }
+
+    try {
+      await unarchiveProjectFromClient(input.api.orchestration, archivedProjectId);
+    } catch (restoreError) {
+      // Another client may have restored the project after our create was rejected.
+      // Recover that active row if it has appeared; otherwise preserve the real
+      // unarchive failure (pending cleanup, pin cap, etc.) for an actionable UI error.
+      const raced = await waitForRecoverableProjectInReadModel({
         projectId: archivedProjectId,
         loadSnapshot: input.loadSnapshot,
         maxAttempts,
         delayMs,
       });
-      if (!restored.project || !restored.snapshot) {
-        throw new Error(PROJECT_CREATE_EXISTING_SYNC_ERROR, { cause: error });
+      if (raced.project && raced.snapshot) {
+        return {
+          projectId: archivedProjectId,
+          project: raced.project,
+          snapshot: raced.snapshot,
+          created: false,
+          restored: false,
+        };
       }
-      return {
-        projectId: archivedProjectId,
-        project: restored.project,
-        snapshot: restored.snapshot,
-        created: false,
-        restored: true,
-      };
-    }
-    if (!isDuplicateProjectCreateError(description)) {
-      throw error instanceof Error ? error : new Error(description);
+      throw restoreError;
     }
 
-    const { project, snapshot } = await waitForRecoverableProjectForDuplicateCreate({
-      message: description,
-      workspaceRoot,
+    const restored = await waitForRecoverableProjectInReadModel({
+      projectId: archivedProjectId,
       loadSnapshot: input.loadSnapshot,
       maxAttempts,
       delayMs,
     });
-    if (project && snapshot) {
-      return {
-        projectId: project.id,
-        project,
-        snapshot,
-        created: false,
-        restored: false,
-      };
+    if (!restored.project || !restored.snapshot) {
+      throw new Error(PROJECT_CREATE_EXISTING_SYNC_ERROR, { cause: error });
     }
-
-    const duplicateProjectId = extractDuplicateProjectCreateProjectId(description);
-    if (duplicateProjectId) {
-      return {
-        projectId: duplicateProjectId as ProjectId,
-        project: null,
-        snapshot,
-        created: false,
-        restored: false,
-      };
-    }
-
-    throw new Error(PROJECT_CREATE_EXISTING_SYNC_ERROR, { cause: error });
+    return {
+      projectId: archivedProjectId,
+      project: restored.project,
+      snapshot: restored.snapshot,
+      created: false,
+      restored: true,
+    };
   }
+
+  const { project, snapshot } = await waitForRecoverableProjectForDuplicateCreate({
+    message: description,
+    workspaceRoot,
+    loadSnapshot: input.loadSnapshot,
+    maxAttempts,
+    delayMs,
+  });
+  if (project && snapshot) {
+    return {
+      projectId: project.id,
+      project,
+      snapshot,
+      created: false,
+      restored: false,
+    };
+  }
+
+  const duplicateProjectId = extractDuplicateProjectCreateProjectId(description);
+  if (duplicateProjectId) {
+    return {
+      projectId: duplicateProjectId as ProjectId,
+      project: null,
+      snapshot,
+      created: false,
+      restored: false,
+    };
+  }
+
+  throw new Error(PROJECT_CREATE_EXISTING_SYNC_ERROR, { cause: error });
 }
