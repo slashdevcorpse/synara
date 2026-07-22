@@ -47,6 +47,8 @@ export interface QuarantineSummaryBaseline {
   readonly registry: QuarantineRegistry;
 }
 
+export const QUARANTINE_INVENTORY_BATCH_SIZE = 8;
+
 export function createQuarantineInventoryEnvironment(
   baseEnvironment: NodeJS.ProcessEnv,
   generatedRouteTreePath: string,
@@ -338,10 +340,7 @@ export function validateQuarantineCaseInventory(
   return errors;
 }
 
-export function parseVitestQuarantineInventory(
-  result: VitestInventoryProcessResult,
-  options: { readonly repositoryRoot: string },
-): readonly QuarantineTestInventoryItem[] {
+function parseVitestJsonArray(result: VitestInventoryProcessResult): readonly unknown[] {
   if (result.error) {
     if (result.error.code === "ETIMEDOUT") {
       throw new Error("Vitest quarantine inventory collection timed out.", { cause: result.error });
@@ -384,6 +383,14 @@ export function parseVitestQuarantineInventory(
   if (!Array.isArray(document)) {
     throw new Error("Vitest quarantine inventory JSON must be an array.");
   }
+  return document;
+}
+
+export function parseVitestQuarantineInventory(
+  result: VitestInventoryProcessResult,
+  options: { readonly repositoryRoot: string },
+): readonly QuarantineTestInventoryItem[] {
+  const document = parseVitestJsonArray(result);
 
   const repositoryRoot = resolve(options.repositoryRoot);
   return document.map((value, index) => {
@@ -399,6 +406,61 @@ export function parseVitestQuarantineInventory(
       fullName: value.name,
     };
   });
+}
+
+export function parseVitestBrowserFiles(
+  result: VitestInventoryProcessResult,
+  options: { readonly repositoryRoot: string },
+): readonly string[] {
+  const repositoryRoot = resolve(options.repositoryRoot);
+  const paths = parseVitestJsonArray(result).map((value, index) => {
+    if (!isRecord(value) || typeof value.file !== "string") {
+      throw new Error(`Vitest browser file inventory item ${index + 1} is invalid.`);
+    }
+    const absolutePath = resolve(value.file);
+    if (!isWithinRepository(repositoryRoot, absolutePath)) {
+      throw new Error(`Vitest browser file inventory item ${index + 1} escapes the repository root.`);
+    }
+    return relative(repositoryRoot, absolutePath).replaceAll("\\", "/");
+  });
+  return [...new Set(paths)].sort();
+}
+
+export function quarantineInventoryFileBatches(
+  paths: readonly string[],
+  batchSize = QUARANTINE_INVENTORY_BATCH_SIZE,
+): readonly (readonly string[])[] {
+  if (!Number.isInteger(batchSize) || batchSize < 1) {
+    throw new Error("Quarantine inventory batch size must be a positive integer.");
+  }
+  const batches: string[][] = [];
+  for (let index = 0; index < paths.length; index += batchSize) {
+    batches.push(paths.slice(index, index + batchSize));
+  }
+  return batches;
+}
+
+export function collectQuarantineInventoryBatches<T>(
+  batches: readonly (readonly string[])[],
+  collectBatch: (paths: readonly string[]) => readonly T[],
+): readonly T[] {
+  const collectWithFallback = (paths: readonly string[]): readonly T[] => {
+    try {
+      return collectBatch(paths);
+    } catch {
+      try {
+        return collectBatch(paths);
+      } catch (retryError) {
+        if (paths.length <= 1) throw retryError;
+        const midpoint = Math.ceil(paths.length / 2);
+        return [
+          ...collectWithFallback(paths.slice(0, midpoint)),
+          ...collectWithFallback(paths.slice(midpoint)),
+        ];
+      }
+    }
+  };
+  return batches.flatMap(collectWithFallback);
 }
 
 export function quarantineSuitesForPlatform(

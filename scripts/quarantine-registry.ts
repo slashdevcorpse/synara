@@ -4,15 +4,20 @@ import { resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 
 import {
+  collectQuarantineInventoryBatches,
   createQuarantineInventoryEnvironment,
   formatQuarantineSummary,
+  parseVitestBrowserFiles,
   parseVitestQuarantineInventory,
   QUARANTINE_PLATFORMS,
+  quarantineInventoryFileBatches,
   quarantineSuitesForPlatform,
   validateQuarantineCaseInventory,
   validateQuarantineRegistry,
   type QuarantinePlatform,
   type QuarantineRegistry,
+  type QuarantineTestInventoryItem,
+  type VitestInventoryProcessResult,
 } from "./lib/quarantine-registry.ts";
 
 function usage(): never {
@@ -149,11 +154,36 @@ function runtimeQuarantinePlatform(): QuarantinePlatform | null {
   return null;
 }
 
+function runVitestList(
+  webRoot: string,
+  vitestCli: string,
+  environment: NodeJS.ProcessEnv,
+  args: readonly string[],
+): VitestInventoryProcessResult {
+  const result = spawnSync(
+    process.execPath,
+    [vitestCli, "list", ...args, "--config", "vitest.browser.config.ts", "--json"],
+    {
+      cwd: webRoot,
+      encoding: "utf8",
+      env: environment,
+      maxBuffer: 64 * 1024 * 1024,
+      timeout: 120_000,
+      windowsHide: true,
+    },
+  );
+  return {
+    ...(result.error ? { error: result.error } : {}),
+    status: result.status,
+    stdout: result.stdout ?? "",
+    stderr: result.stderr ?? "",
+  };
+}
+
 function collectQuarantineInventory(
   repositoryRoot: string,
   platform: QuarantinePlatform,
-  registry: QuarantineRegistry,
-) {
+): readonly QuarantineTestInventoryItem[] {
   const runtimePlatform = runtimeQuarantinePlatform();
   if (runtimePlatform !== platform) {
     throw new Error(
@@ -162,43 +192,31 @@ function collectQuarantineInventory(
   }
   const webRoot = resolve(repositoryRoot, "apps/web");
   const vitestCli = resolve(repositoryRoot, "node_modules/vitest/vitest.mjs");
-  const registeredPaths = [
-    ...new Set(registry.entries.map((entry) => resolve(repositoryRoot, entry.path))),
-  ];
-  if (registeredPaths.length === 0) return [];
   const temporaryDirectory = mkdtempSync(resolve(tmpdir(), "synara-quarantine-inventory-"));
   try {
-    const result = spawnSync(
-      process.execPath,
-      [
-        vitestCli,
-        "list",
-        ...registeredPaths,
-        "--config",
-        "vitest.browser.config.ts",
-        "--json",
-      ],
-      {
-        cwd: webRoot,
-        encoding: "utf8",
-        env: createQuarantineInventoryEnvironment(
-          process.env,
-          resolve(temporaryDirectory, "routeTree.gen.ts"),
-        ),
-        maxBuffer: 64 * 1024 * 1024,
-        timeout: 120_000,
-        windowsHide: true,
-      },
+    const environment = createQuarantineInventoryEnvironment(
+      process.env,
+      resolve(temporaryDirectory, "routeTree.gen.ts"),
     );
-    return parseVitestQuarantineInventory(
-      {
-        ...(result.error ? { error: result.error } : {}),
-        status: result.status,
-        stdout: result.stdout ?? "",
-        stderr: result.stderr ?? "",
-      },
+    const browserFiles = parseVitestBrowserFiles(
+      runVitestList(webRoot, vitestCli, environment, ["--staticParse", "--filesOnly"]),
       { repositoryRoot },
     );
+    const inventory: readonly QuarantineTestInventoryItem[] =
+      collectQuarantineInventoryBatches(
+        quarantineInventoryFileBatches(browserFiles),
+        (batch) =>
+          parseVitestQuarantineInventory(
+            runVitestList(
+              webRoot,
+              vitestCli,
+              environment,
+              batch.map((path) => resolve(repositoryRoot, path)),
+            ),
+            { repositoryRoot },
+          ),
+      );
+    return inventory;
   } finally {
     rmSync(temporaryDirectory, { recursive: true, force: true });
   }
@@ -215,7 +233,7 @@ function main(): void {
     return;
   }
   if (args.command === "inventory") {
-    const inventory = collectQuarantineInventory(repositoryRoot, args.platform!, registry);
+    const inventory = collectQuarantineInventory(repositoryRoot, args.platform!);
     const errors = validateQuarantineCaseInventory(registry, inventory);
     if (errors.length > 0) {
       throw new Error(`Quarantine case inventory validation failed:\n- ${errors.join("\n- ")}`);

@@ -6,10 +6,13 @@ import { spawnSync } from "node:child_process";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
+  collectQuarantineInventoryBatches,
   createQuarantineInventoryEnvironment,
   formatQuarantineSummary,
+  parseVitestBrowserFiles,
   parseVitestQuarantineInventory,
   QUARANTINE_PLATFORMS,
+  quarantineInventoryFileBatches,
   quarantineTestNamePattern,
   quarantineSuitesForPlatform,
   validateQuarantineCaseInventory,
@@ -217,6 +220,48 @@ describe("quarantine registry", () => {
     ).toThrow("did not return valid JSON");
   });
 
+  it("discovers every browser file and partitions each path exactly once", () => {
+    const { root } = fixture();
+    const first = resolve(root, "apps/web/src/example.browser.tsx");
+    const second = resolve(root, "apps/web/src/second.browser.tsx");
+    const files = parseVitestBrowserFiles(
+      {
+        status: 0,
+        stdout: JSON.stringify([{ file: second }, { file: first }, { file: second }]),
+        stderr: "",
+      },
+      { repositoryRoot: root },
+    );
+
+    expect(files).toEqual([
+      "apps/web/src/example.browser.tsx",
+      "apps/web/src/second.browser.tsx",
+    ]);
+    expect(quarantineInventoryFileBatches(files, 1)).toEqual([
+      ["apps/web/src/example.browser.tsx"],
+      ["apps/web/src/second.browser.tsx"],
+    ]);
+    expect(() => quarantineInventoryFileBatches(files, 0)).toThrow("positive integer");
+  });
+
+  it("retries failed batches, splits persistent conflicts, and fails closed per file", () => {
+    const attempts: string[][] = [];
+    const files = ["one.browser.ts", "two.browser.ts", "three.browser.ts"];
+    const inventory = collectQuarantineInventoryBatches([files], (batch) => {
+      attempts.push([...batch]);
+      if (batch.length > 1) throw new Error("cross-file mock conflict");
+      return batch;
+    });
+
+    expect(inventory).toEqual(files);
+    expect(attempts.filter((batch) => batch.length > 1)).toHaveLength(4);
+    expect(() =>
+      collectQuarantineInventoryBatches([["broken.browser.ts"]], () => {
+        throw new Error("single-file import failed");
+      }),
+    ).toThrow("single-file import failed");
+  });
+
   it("uses pinned Vitest collection to expand each row into a separate case", () => {
     const root = mkdtempSync(resolve(tmpdir(), "synara-quarantine-inventory-"));
     roots.push(root);
@@ -266,6 +311,67 @@ describe("quarantine registry", () => {
 
     expect(inventory).toHaveLength(3);
     expect(validateQuarantineCaseInventory(registry, inventory)).toEqual([]);
+  });
+
+  it("rejects a runtime-composed quarantine marker in a non-registered file", () => {
+    const root = mkdtempSync(resolve(tmpdir(), "synara-quarantine-runtime-marker-"));
+    roots.push(root);
+    const marker = quarantineMarker("runtime-wrong-file");
+    const registeredPath = resolve(root, "registered.test.ts");
+    writeFileSync(registeredPath, `it(${JSON.stringify(`${marker} registered`)}, () => {});`);
+    writeFileSync(
+      resolve(root, "runtime-marker.ts"),
+      'export const runtimeMarker = ["[quaran", "tine:runtime-wrong-file]"].join("");',
+    );
+    writeFileSync(
+      resolve(root, "wrong-file.test.ts"),
+      [
+        'import { runtimeMarker } from "./runtime-marker";',
+        'it(`${runtimeMarker} composed at runtime`, () => {});',
+      ].join("\n"),
+    );
+    const vitestCli = resolve(__dirname, "../../node_modules/vitest/vitest.mjs");
+    const result = spawnSync(
+      process.execPath,
+      [vitestCli, "list", "--root", root, "--globals", "--json"],
+      {
+        cwd: root,
+        encoding: "utf8",
+        env: { ...process.env, CI: "true", FORCE_COLOR: "0", NO_COLOR: "1" },
+        timeout: 30_000,
+        windowsHide: true,
+      },
+    );
+    const inventory = parseVitestQuarantineInventory(
+      {
+        ...(result.error ? { error: result.error } : {}),
+        status: result.status,
+        stdout: result.stdout ?? "",
+        stderr: result.stderr ?? "",
+      },
+      { repositoryRoot: root },
+    );
+    const registry = {
+      schemaVersion: 1 as const,
+      entries: [
+        {
+          id: "runtime-wrong-file",
+          path: "registered.test.ts",
+          marker,
+          suite: "browser-geometry" as const,
+          platform: ["linux", "windows"] as const,
+          reason: "Runtime collection must reject markers from the wrong file.",
+          owner: "web/test-infrastructure",
+          lastFlaked: "2026-07-01",
+          cases: 1,
+        },
+      ],
+    };
+
+    expect(inventory).toHaveLength(2);
+    expect(validateQuarantineCaseInventory(registry, inventory)).toContain(
+      `Quarantine marker ${marker} was collected in wrong-file.test.ts, not registered.test.ts.`,
+    );
   });
 
   it("rejects future dates, unsupported platforms, and markers that do not match the id", () => {
