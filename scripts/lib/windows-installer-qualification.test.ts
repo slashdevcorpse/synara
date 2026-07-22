@@ -14,6 +14,8 @@ import {
   NSIS_ATOMIC_UPGRADE_PATH_LIMIT,
   NSIS_INSTALL_TIMEOUT_MS,
   NSIS_UNINSTALL_TIMEOUT_MS,
+  NSIS_UPGRADE_HANDOFF_POLL_MS,
+  NSIS_UPGRADE_HANDOFF_STABLE_POLLS,
   parseRegistryQueryOutput,
   parseWindowsExecutableCommandLine,
   qualifySuperSynaraWindowsInstaller,
@@ -232,7 +234,7 @@ function fakeRuntime(): FakeRuntime {
       }
       lifecycleEvents.push("super-startup-and-clean-exit-proven");
     }),
-    sleep: async () => undefined,
+    sleep: vi.fn(async () => undefined),
   };
   return runtime;
 }
@@ -489,6 +491,10 @@ describe("Super Synara Windows installer qualification", () => {
 
     expect(report.upgrade).toBe("qualified");
     expect(report.previousVersion).toBe("0.5.5-super.1");
+    expect(runtime.sleep).toHaveBeenCalledTimes(NSIS_UPGRADE_HANDOFF_STABLE_POLLS);
+    for (let poll = 1; poll <= NSIS_UPGRADE_HANDOFF_STABLE_POLLS; poll += 1) {
+      expect(runtime.sleep).toHaveBeenNthCalledWith(poll, NSIS_UPGRADE_HANDOFF_POLL_MS);
+    }
     expect(runtime.commands.map((command) => command.label)).toEqual([
       "silent installer Synara-0.5.5-x64.exe",
       "silent installer Super-Synara-0.5.5-super.1-windows-x64-unsigned.exe",

@@ -48,6 +48,8 @@ export const NSIS_INSTALL_TIMEOUT_MS = 180_000;
 export const NSIS_UNINSTALL_TIMEOUT_MS = 180_000;
 export const NSIS_ATOMIC_UPGRADE_PATH_LIMIT = 259;
 const NSIS_PLUGIN_DIRECTORY_SEGMENT_BUDGET = 24;
+export const NSIS_UPGRADE_HANDOFF_POLL_MS = 5_000;
+export const NSIS_UPGRADE_HANDOFF_STABLE_POLLS = 3;
 
 export interface WindowsRegistryTarget {
   readonly id: string;
@@ -662,17 +664,13 @@ export function upstreamVersionFromInstaller(installerPath: string): string {
   return match[1]!;
 }
 
-function runAndValidateInstaller(
+function validateInstalledApplication(
   runtime: WindowsInstallerQualificationRuntime,
-  installerPath: string,
   version: string,
   paths: QualificationPaths,
   targets: ReadonlyArray<WindowsRegistryTarget>,
   identity: SynaraDesktopIdentity,
 ): ValidatedRegistration {
-  runtime.runCommand(
-    createSilentInstallerCommand(installerPath, paths.installDirectory, paths.environment),
-  );
   if (!existsSync(paths.executablePath) || !statSync(paths.executablePath).isFile()) {
     throw new Error(
       `Installed ${identity.displayName} executable is missing: ${paths.executablePath}.`,
@@ -696,6 +694,47 @@ function runAndValidateInstaller(
     );
   }
   return validateRegistration(snapshotRawRegistry(runtime, targets), version, paths, identity);
+}
+
+function runAndValidateInstaller(
+  runtime: WindowsInstallerQualificationRuntime,
+  installerPath: string,
+  version: string,
+  paths: QualificationPaths,
+  targets: ReadonlyArray<WindowsRegistryTarget>,
+  identity: SynaraDesktopIdentity,
+): ValidatedRegistration {
+  runtime.runCommand(
+    createSilentInstallerCommand(installerPath, paths.installDirectory, paths.environment),
+  );
+  return validateInstalledApplication(runtime, version, paths, targets, identity);
+}
+
+async function waitForPreviousInstallerHandoff(
+  runtime: WindowsInstallerQualificationRuntime,
+  version: string,
+  paths: QualificationPaths,
+  targets: ReadonlyArray<WindowsRegistryTarget>,
+  installedPrevious: InstalledApplicationSnapshot,
+): Promise<void> {
+  const handoffMs = NSIS_UPGRADE_HANDOFF_POLL_MS * NSIS_UPGRADE_HANDOFF_STABLE_POLLS;
+  console.info(
+    `[windows-installer-qualification] phase=upgrade-handoff status=started previousVersion=${JSON.stringify(version)} stablePolls=${NSIS_UPGRADE_HANDOFF_STABLE_POLLS} pollMs=${NSIS_UPGRADE_HANDOFF_POLL_MS}`,
+  );
+  for (let poll = 1; poll <= NSIS_UPGRADE_HANDOFF_STABLE_POLLS; poll += 1) {
+    await runtime.sleep(NSIS_UPGRADE_HANDOFF_POLL_MS);
+    validateInstalledApplication(runtime, version, paths, targets, SUPER_IDENTITY);
+    assertInstalledApplicationUnchanged(
+      runtime,
+      targets,
+      paths,
+      installedPrevious,
+      `Previous Super Synara handoff sample ${poll}`,
+    );
+  }
+  console.info(
+    `[windows-installer-qualification] phase=upgrade-handoff status=completed previousVersion=${JSON.stringify(version)} stablePolls=${NSIS_UPGRADE_HANDOFF_STABLE_POLLS} elapsedMs=${handoffMs}`,
+  );
 }
 
 async function waitForUninstallCleanup(
@@ -1040,6 +1079,14 @@ export async function qualifySuperSynaraWindowsInstaller(
         SUPER_IDENTITY,
       );
       assertInstalledTreeWithinNsisAtomicUpgradePathBudget(superPaths);
+      const installedPrevious = snapshotInstalledApplication(runtime, superTargets, superPaths);
+      await waitForPreviousInstallerHandoff(
+        runtime,
+        previousVersion,
+        superPaths,
+        superTargets,
+        installedPrevious,
+      );
       assertSentinelsUnchanged(superSentinelSnapshot);
       assertInstalledApplicationUnchanged(
         runtime,
