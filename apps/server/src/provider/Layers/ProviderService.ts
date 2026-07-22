@@ -325,9 +325,9 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
         gate: maintenanceGate,
         provider: input.provider,
         operation: input.operation,
-        run: Effect.result(input.run),
+        run: input.run,
         mapBusyError: (error) => toValidationError(input.operation, error.message, error),
-      }).pipe(Effect.flatMap((result) => Effect.fromResult(result)));
+      });
     const lifecycle = makeProviderLifecycleCoordinator();
     const persistedBindings = yield* directory.listBindings();
     for (const binding of persistedBindings) {

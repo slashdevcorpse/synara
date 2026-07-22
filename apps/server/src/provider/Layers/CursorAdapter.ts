@@ -24,7 +24,6 @@ import {
 } from "@synara/contracts";
 import type { WindowsSafeProcessCommand } from "@synara/shared/windowsProcess";
 import {
-  Cause,
   DateTime,
   Deferred,
   Effect,
@@ -69,6 +68,7 @@ import {
   type ProviderMaintenanceOwnedResourceCoordinator,
 } from "../providerMaintenanceOwnedResources.ts";
 import { makeProviderProcessOwnerTracker } from "../providerProcessOwnerTracker.ts";
+import { stopSessionsBestEffort } from "../stopSessionsBestEffort.ts";
 import {
   ProviderAdapterProcessError,
   ProviderAdapterRequestError,
@@ -139,6 +139,8 @@ import { discoverCursorSkills } from "../cursorSkillsDiscovery.ts";
 
 const PROVIDER = "cursor" as const;
 
+export { stopSessionsBestEffort as stopCursorSessionsBestEffort } from "../stopSessionsBestEffort.ts";
+
 export const takeCursorSynaraHarnessPolicyTextPart = (
   state: SynaraHarnessPolicyDeliveryState,
   scopedGatewayConnectionAvailable: boolean,
@@ -157,24 +159,6 @@ const CURSOR_TURN_IDLE_TIMEOUT_MS = resolveAcpTurnIdleTimeoutMs({
   defaultMs: 600_000,
 });
 
-/** Attempts every Cursor session stop and re-raises the first failure only after all were tried. */
-export function stopCursorSessionsBestEffort<Session, Error, Requirements>(
-  sessions: Iterable<Session>,
-  stopSession: (session: Session) => Effect.Effect<void, Error, Requirements>,
-): Effect.Effect<void, Error, Requirements> {
-  return Effect.gen(function* () {
-    let firstFailure: Cause.Cause<Error> | undefined;
-    for (const session of Array.from(sessions)) {
-      const exit = yield* Effect.exit(stopSession(session));
-      if (Exit.isFailure(exit) && firstFailure === undefined) {
-        firstFailure = exit.cause;
-      }
-    }
-    if (firstFailure !== undefined) {
-      return yield* Effect.failCause(firstFailure);
-    }
-  });
-}
 const CURSOR_TURN_WATCHDOG_INTERVAL_MS = 15_000;
 const ACP_PLAN_MODE_ALIASES = ["plan", "architect"];
 const ACP_IMPLEMENT_MODE_ALIASES = ["code", "agent", "default", "chat", "implement"];
@@ -1655,7 +1639,7 @@ export function makeCursorAdapter(
     const stopAll: CursorAdapterShape["stopAll"] = () =>
       Effect.gen(function* () {
         const sessionExit = yield* Effect.exit(
-          stopCursorSessionsBestEffort(sessions.values(), stopSessionInternal),
+          stopSessionsBestEffort(sessions.values(), stopSessionInternal),
         );
         const ownerExit = yield* Effect.exit(
           modelProcessOwners.drain.pipe(

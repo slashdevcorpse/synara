@@ -71,6 +71,7 @@ import {
   ProviderMaintenanceBusyError,
   type ProviderMaintenanceGate,
 } from "../providerMaintenanceGate.ts";
+import { ProviderProcessExitUnprovenError } from "../supervisedProcessTeardown.ts";
 
 const asRequestId = (value: string): ApprovalRequestId => ApprovalRequestId.makeUnsafe(value);
 const asEventId = (value: string): EventId => EventId.makeUnsafe(value);
@@ -463,6 +464,10 @@ function makeProviderServiceLayer(
 
 const routingMaintenanceGate = Effect.runSync(makeProviderMaintenanceGate);
 const routing = makeProviderServiceLayer({ maintenanceGate: routingMaintenanceGate });
+const processExitMaintenanceGate = Effect.runSync(makeProviderMaintenanceGate);
+const processExitRouting = makeProviderServiceLayer({
+  maintenanceGate: processExitMaintenanceGate,
+});
 const restartRollbackRouting = makeProviderServiceLayer(undefined, {
   includeRestartRollbackDroid: true,
 });
@@ -988,6 +993,63 @@ it.effect(
       fs.rmSync(tempDir, { recursive: true, force: true });
     }).pipe(Effect.provide(NodeServices.layer)),
 );
+
+processExitRouting.layer("ProviderServiceLive process-exit maintenance latch", (it) => {
+  it.effect("latches the provider when an admitted operation cannot prove process exit", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService;
+      const threadId = asThreadId("thread-unproven-process-exit");
+      const unprovenExit = new ProviderProcessExitUnprovenError({
+        rootPid: 42,
+        rootExited: false,
+        remainingDescendantPids: [43],
+        captureComplete: true,
+      });
+
+      yield* provider.startSession(threadId, {
+        provider: "codex",
+        threadId,
+        runtimeMode: "full-access",
+      });
+      processExitRouting.codex.sendTurn.mockImplementationOnce(
+        () =>
+          Effect.fail(unprovenExit) as unknown as Effect.Effect<
+            ProviderTurnStartResult,
+            ProviderAdapterError
+          >,
+      );
+
+      const failedOperation = yield* provider
+        .sendTurn({ threadId, input: "trigger unproven exit", attachments: [] })
+        .pipe(Effect.result);
+      assert.equal(Result.isFailure(failedOperation), true);
+      if (Result.isFailure(failedOperation)) {
+        assert.equal(failedOperation.failure, unprovenExit);
+      }
+
+      let refusedRunExecuted = false;
+      processExitRouting.codex.sendTurn.mockImplementationOnce((input) =>
+        Effect.sync(() => {
+          refusedRunExecuted = true;
+          return {
+            threadId: input.threadId,
+            turnId: asTurnId("turn-after-unproven-exit"),
+          };
+        }),
+      );
+      const refusedOperation = yield* provider
+        .sendTurn({ threadId, input: "must remain blocked", attachments: [] })
+        .pipe(Effect.result);
+      assert.equal(Result.isFailure(refusedOperation), true);
+      if (Result.isFailure(refusedOperation)) {
+        assert.ok(refusedOperation.failure instanceof ProviderValidationError);
+        assert.ok(refusedOperation.failure.cause instanceof ProviderMaintenanceBusyError);
+        assert.equal(refusedOperation.failure.cause.latchedReason, unprovenExit.message);
+      }
+      assert.equal(refusedRunExecuted, false);
+    }),
+  );
+});
 
 routing.layer("ProviderServiceLive routing", (it) => {
   it.effect("persists the freshest live resume cursor during maintenance shutdown", () =>

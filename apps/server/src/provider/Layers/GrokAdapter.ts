@@ -71,6 +71,7 @@ import {
   type ProviderMaintenanceOwnedResourceCoordinator,
 } from "../providerMaintenanceOwnedResources.ts";
 import { makeProviderProcessOwnerTracker } from "../providerProcessOwnerTracker.ts";
+import { stopSessionsBestEffort } from "../stopSessionsBestEffort.ts";
 import {
   ProviderAdapterRequestError,
   ProviderAdapterSessionNotFoundError,
@@ -2340,7 +2341,7 @@ export function makeGrokAdapter(
     const stopAll: GrokAdapterShape["stopAll"] = () =>
       Effect.gen(function* () {
         const sessionExit = yield* Effect.exit(
-          Effect.forEach(Array.from(sessions.values()), stopSessionInternal, { discard: true }),
+          stopSessionsBestEffort(sessions.values(), stopSessionInternal),
         );
         const ownerExit = yield* Effect.exit(
           modelProcessOwners.drain.pipe(
