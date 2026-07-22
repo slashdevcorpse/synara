@@ -1910,5 +1910,34 @@
             },
           ],
       },
+      {
+        "id": "antigravity-packaged-hook-gate",
+        "purpose": "Keep the globally installed Antigravity capture hook inert outside managed sessions while running the packaged desktop executable as Node for managed capture.",
+        "userVisibleConsequence": "Using Antigravity outside Synara no longer launches the Synara desktop app, while Synara-managed sessions continue to capture and approve lifecycle events.",
+        "owner": "slashdevcorpse",
+        "status": "upstreamed",
+        "upstreamSourceCommit": "9ceb8f2876089c755ef6acf32c4708c5cdb71b30",
+        "introducingCommit": "33fe3b0e80b941f078c5f400565538ec97f0bc5c",
+        "touchedFiles":
+          [
+            "apps/server/src/provider/Layers/AntigravityAdapter.test.ts",
+            "apps/server/src/provider/Layers/AntigravityAdapter.ts",
+          ],
+        "subsystems": ["antigravity", "provider-runtime", "hooks", "desktop", "windows"],
+        "regressionTests": ["apps/server/src/provider/Layers/AntigravityAdapter.test.ts"],
+        "upstreamLinks": ["https://github.com/Emanuele-web04/synara/pull/425"],
+        "overlapResolutionPolicy": "Preserve the shell-level environment gate so an unmanaged hook drains all stdin and emits an empty JSON object without starting the packaged executable. Managed sessions must set ELECTRON_RUN_AS_NODE only in the launch branch and retain exact quoted executable, script, and event arguments on Windows and POSIX. Keep this command construction separate from PR 57 process ownership, Job Object containment, and maintenance gating.",
+        "lastAssessedUpstreamSha": "1664ce2f152cd6131a30d1ee8d7c9b60235bb0fe",
+        "verificationDate": "2026-07-21",
+        "retirementCondition": "Retire after a future classified full sync advances through 9ceb8f2876089c755ef6acf32c4708c5cdb71b30 and equivalent unmanaged-hook and managed packaged-runtime checks remain permanent on Windows and POSIX.",
+        "statusHistory":
+          [
+            {
+              "status": "upstreamed",
+              "date": "2026-07-21",
+              "evidence": "PR 425 merged as 9ceb8f2876089c755ef6acf32c4708c5cdb71b30 and was absorbed downstream at 33fe3b0e80b941f078c5f400565538ec97f0bc5c without advancing the classified full-sync authority beyond 1664ce2f152cd6131a30d1ee8d7c9b60235bb0fe",
+            },
+          ],
+      },
     ],
 }
