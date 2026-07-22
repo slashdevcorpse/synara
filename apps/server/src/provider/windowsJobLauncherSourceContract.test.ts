@@ -43,9 +43,9 @@ describe("Windows Job launcher source contract", () => {
     expect(drainEnd).toBeGreaterThan(drainStart);
     expect(drainSource).toContain("if (accounting.ActiveProcesses == 0) {\n      break;");
     expect(drainSource).not.toContain("if (accounting.ActiveProcesses == 0) {\n      return;");
-    expect(drainSource.indexOf("WaitForSingleObject(tracked.handle.get(), remaining)")).toBeGreaterThan(
-      drainSource.indexOf("if (accounting.ActiveProcesses == 0)"),
-    );
+    expect(
+      drainSource.indexOf("WaitForSingleObject(tracked.handle.get(), remaining)"),
+    ).toBeGreaterThan(drainSource.indexOf("if (accounting.ActiveProcesses == 0)"));
     expect(drainSource.indexOf("tracked_processes.clear();")).toBeGreaterThan(
       drainSource.indexOf("WaitForSingleObject(tracked.handle.get(), remaining)"),
     );
@@ -53,9 +53,7 @@ describe("Windows Job launcher source contract", () => {
 
   it("publishes drain proof after cleanup and immediately before wrapper exit", () => {
     const assignment = launcherSource.indexOf("AssignProcessToJobObject(job.get(), process.get())");
-    const finalDrain = launcherSource.lastIndexOf(
-      "WaitForEmptyJob(job.get(), tracked_processes);",
-    );
+    const finalDrain = launcherSource.lastIndexOf("WaitForEmptyJob(job.get(), tracked_processes);");
     const releaseProcess = launcherSource.lastIndexOf("process.reset();");
     const releaseJob = launcherSource.lastIndexOf("job.reset();");
     const removeControl = launcherSource.lastIndexOf(

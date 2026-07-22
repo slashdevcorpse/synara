@@ -60,6 +60,31 @@ export interface ProviderMaintenanceGate {
   }) => Effect.Effect<void>;
 }
 
+/**
+ * Runs a provider operation through the maintenance gate while translating
+ * only maintenance-busy failures into the caller's public error type. All
+ * other failures, defects, and interruptions retain the gate's semantics.
+ */
+export function withProviderMaintenanceOperation<A, E, R, EBusy>(input: {
+  readonly gate: ProviderMaintenanceGate;
+  readonly provider: ProviderKind;
+  readonly operation: string;
+  readonly run: Effect.Effect<A, E, R>;
+  readonly mapBusyError: (error: ProviderMaintenanceBusyError) => EBusy;
+}): Effect.Effect<A, E | EBusy, R> {
+  return input.gate
+    .withOperation({
+      provider: input.provider,
+      operation: input.operation,
+      run: input.run,
+    })
+    .pipe(
+      Effect.catchTag("ProviderMaintenanceBusyError", (error) =>
+        Effect.fail(input.mapBusyError(error)),
+      ),
+    );
+}
+
 interface ProviderMaintenanceGateState {
   readonly activeOperations: number;
   readonly drain: Deferred.Deferred<void> | null;

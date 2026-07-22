@@ -7,6 +7,7 @@ import {
   ProviderMaintenanceAlreadyRunningError,
   ProviderMaintenanceBusyError,
   ProviderMaintenanceLatchedError,
+  withProviderMaintenanceOperation,
 } from "./providerMaintenanceGate.ts";
 import { ProviderProcessExitUnprovenError } from "./supervisedProcessTeardown.ts";
 import { ProviderMaintenanceOwnedResourceCloseError } from "./providerMaintenanceOwnedResources.ts";
@@ -39,6 +40,88 @@ function awaitBusyRejection(
 }
 
 describe("providerMaintenanceGate", () => {
+  it("maps maintenance-busy failures and preserves other operation failures", async () => {
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const gate = yield* makeProviderMaintenanceGate;
+          const maintenanceStarted = yield* Deferred.make<void>();
+          const releaseMaintenance = yield* Deferred.make<void>();
+          const maintenance = yield* gate
+            .withExclusiveMaintenance({
+              provider: "codex",
+              run: Deferred.succeed(maintenanceStarted, undefined).pipe(
+                Effect.andThen(Deferred.await(releaseMaintenance)),
+              ),
+            })
+            .pipe(Effect.forkChild);
+          yield* Deferred.await(maintenanceStarted);
+
+          const mapped = new Error("mapped maintenance failure");
+          const blocked = yield* withProviderMaintenanceOperation({
+            gate,
+            provider: "codex",
+            operation: "session.start",
+            run: Effect.succeed("not started"),
+            mapBusyError: () => mapped,
+          }).pipe(Effect.result);
+          expect(Result.isFailure(blocked)).toBe(true);
+          if (Result.isFailure(blocked)) {
+            expect(blocked.failure).toBe(mapped);
+          }
+
+          yield* Deferred.succeed(releaseMaintenance, undefined);
+          yield* Fiber.join(maintenance);
+
+          const operationFailure = new Error("provider operation failed");
+          let mapperCalls = 0;
+          const failed = yield* withProviderMaintenanceOperation({
+            gate,
+            provider: "codex",
+            operation: "session.start",
+            run: Effect.fail(operationFailure),
+            mapBusyError: () => {
+              mapperCalls += 1;
+              return mapped;
+            },
+          }).pipe(Effect.result);
+          expect(Result.isFailure(failed)).toBe(true);
+          if (Result.isFailure(failed)) {
+            expect(failed.failure).toBe(operationFailure);
+          }
+          expect(mapperCalls).toBe(0);
+        }),
+      ),
+    );
+  });
+
+  it("preserves interruption and releases helper-owned admission", async () => {
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const gate = yield* makeProviderMaintenanceGate;
+          const operationStarted = yield* Deferred.make<void>();
+          const operation = yield* withProviderMaintenanceOperation({
+            gate,
+            provider: "cursor",
+            operation: "provider.discovery",
+            run: Deferred.succeed(operationStarted, undefined).pipe(Effect.andThen(Effect.never)),
+            mapBusyError: (error) => error,
+          }).pipe(Effect.forkChild);
+          yield* Deferred.await(operationStarted);
+
+          yield* Fiber.interrupt(operation);
+          expect(
+            yield* gate.withExclusiveMaintenance({
+              provider: "cursor",
+              run: Effect.succeed("drained"),
+            }),
+          ).toBe("drained");
+        }),
+      ),
+    );
+  });
+
   it("drains admitted operations and refuses new work once maintenance is requested", async () => {
     await Effect.runPromise(
       Effect.scoped(

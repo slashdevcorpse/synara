@@ -23,16 +23,16 @@ describe("Windows provider process containment", () => {
 
   it("wraps a resolved executable in the versioned argv protocol", () => {
     const prepared = prepareResolvedWindowsProviderProcess(
-        "C:\\Program Files\\Codex\\codex.exe",
-        ["app-server", "--flag", "value with spaces"],
-        {
-          platform: "win32",
-          arch: "x64",
-          controlDirectory: "C:\\Temp",
-          launcherPath: launcher,
-          fileExists: () => true,
-        },
-      );
+      "C:\\Program Files\\Codex\\codex.exe",
+      ["app-server", "--flag", "value with spaces"],
+      {
+        platform: "win32",
+        arch: "x64",
+        controlDirectory: "C:\\Temp",
+        launcherPath: launcher,
+        fileExists: () => true,
+      },
+    );
     expect(isWindowsJobPreparedCommand(prepared)).toBe(true);
     expect(prepared).toEqual({
       command: launcher,

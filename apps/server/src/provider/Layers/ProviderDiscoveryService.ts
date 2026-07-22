@@ -29,6 +29,7 @@ import {
 import {
   makeProviderMaintenanceGate,
   type ProviderMaintenanceGate,
+  withProviderMaintenanceOperation,
 } from "../providerMaintenanceGate.ts";
 import { findProviderProcessExitUnprovenError } from "../supervisedProcessTeardown.ts";
 
@@ -79,23 +80,18 @@ const make = (options?: ProviderDiscoveryServiceLiveOptions) =>
       readonly operation: string;
       readonly run: Effect.Effect<A, E, R>;
     }): Effect.Effect<A, E | ProviderValidationError, R> =>
-      maintenanceGate
-        .withOperation({
-          provider: input.provider,
-          operation: input.operation,
-          run: input.run,
-        })
-        .pipe(
-          Effect.catchTag("ProviderMaintenanceBusyError", (error) =>
-            Effect.fail(
-              new ProviderValidationError({
-                operation: input.operation,
-                issue: error.message,
-                cause: error,
-              }),
-            ),
-          ),
-        );
+      withProviderMaintenanceOperation({
+        gate: maintenanceGate,
+        provider: input.provider,
+        operation: input.operation,
+        run: input.run,
+        mapBusyError: (error) =>
+          new ProviderValidationError({
+            operation: input.operation,
+            issue: error.message,
+            cause: error,
+          }),
+      });
 
     const getComposerCapabilities: ProviderDiscoveryServiceShape["getComposerCapabilities"] = (
       input,

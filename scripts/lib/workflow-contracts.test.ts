@@ -81,8 +81,7 @@ const nativeDesktopBuildStep = [
   "          SYNARA_DESKTOP_FLAVOR: super",
   "        run: bun run build:desktop",
 ].join("\n");
-const windowsPackagedCliGateStep =
-  "      - run: node apps/server/scripts/cli.ts publish --dry-run";
+const windowsPackagedCliGateStep = "      - run: node apps/server/scripts/cli.ts publish --dry-run";
 const windowsPersistenceSmokeStep = [
   "      - name: Verify two-launch desktop persistence",
   "        timeout-minutes: 5",

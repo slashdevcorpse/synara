@@ -178,22 +178,25 @@ export function containPreparedWindowsProviderProcess(
     controlDirectory,
     `synara-job-control-${process.pid}-${randomUUID()}.signal`,
   );
-  return markWindowsJobPreparedCommand({
-    command: launcherPath,
-    args: [
-      "--protocol",
-      WINDOWS_JOB_LAUNCHER_PROTOCOL_VERSION,
-      "--argument-mode",
-      argumentMode,
-      "--control-file",
-      controlFilePath,
-      "--",
-      target,
-      ...prepared.args,
-    ],
-    shell: false,
-    windowsHide: true,
-  }, controlFilePath);
+  return markWindowsJobPreparedCommand(
+    {
+      command: launcherPath,
+      args: [
+        "--protocol",
+        WINDOWS_JOB_LAUNCHER_PROTOCOL_VERSION,
+        "--argument-mode",
+        argumentMode,
+        "--control-file",
+        controlFilePath,
+        "--",
+        target,
+        ...prepared.args,
+      ],
+      shell: false,
+      windowsHide: true,
+    },
+    controlFilePath,
+  );
 }
 
 export function prepareWindowsProviderProcess(

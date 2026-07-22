@@ -5,6 +5,7 @@ import { parseOpenCodeModelSlug } from "../../provider/opencodeRuntime.ts";
 import {
   makeProviderMaintenanceGate,
   type ProviderMaintenanceGate,
+  withProviderMaintenanceOperation,
 } from "../../provider/providerMaintenanceGate.ts";
 import { TextGenerationError } from "../Errors.ts";
 import {
@@ -52,23 +53,18 @@ const makeProviderTextGeneration = (options?: ProviderTextGenerationLiveOptions)
       readonly provider: ProviderKind;
       readonly run: Effect.Effect<A, TextGenerationError>;
     }) =>
-      maintenanceGate
-        .withOperation({
-          provider: input.provider,
-          operation: `TextGeneration.${input.operation}`,
-          run: input.run,
-        })
-        .pipe(
-          Effect.catchTag("ProviderMaintenanceBusyError", (error) =>
-            Effect.fail(
-              new TextGenerationError({
-                operation: input.operation,
-                detail: error.message,
-                cause: error,
-              }),
-            ),
-          ),
-        );
+      withProviderMaintenanceOperation({
+        gate: maintenanceGate,
+        provider: input.provider,
+        operation: `TextGeneration.${input.operation}`,
+        run: input.run,
+        mapBusyError: (error) =>
+          new TextGenerationError({
+            operation: input.operation,
+            detail: error.message,
+            cause: error,
+          }),
+      });
 
     const run = <A>(
       operation: TextGenerationOperation,

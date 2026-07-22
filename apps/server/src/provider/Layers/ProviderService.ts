@@ -67,6 +67,7 @@ import {
   makeProviderMaintenanceGate,
   ProviderMaintenanceBusyError,
   type ProviderMaintenanceGate,
+  withProviderMaintenanceOperation,
 } from "../providerMaintenanceGate.ts";
 
 export interface ProviderServiceLiveOptions {
@@ -320,16 +321,13 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
       readonly operation: string;
       readonly run: Effect.Effect<A, E, R>;
     }): Effect.Effect<A, E | ProviderValidationError, R> =>
-      maintenanceGate
-        .withOperation({
-          provider: input.provider,
-          operation: input.operation,
-          run: Effect.result(input.run),
-        })
-        .pipe(
-          Effect.mapError((error) => toValidationError(input.operation, error.message, error)),
-          Effect.flatMap((result) => Effect.fromResult(result)),
-        );
+      withProviderMaintenanceOperation({
+        gate: maintenanceGate,
+        provider: input.provider,
+        operation: input.operation,
+        run: Effect.result(input.run),
+        mapBusyError: (error) => toValidationError(input.operation, error.message, error),
+      }).pipe(Effect.flatMap((result) => Effect.fromResult(result)));
     const lifecycle = makeProviderLifecycleCoordinator();
     const persistedBindings = yield* directory.listBindings();
     for (const binding of persistedBindings) {

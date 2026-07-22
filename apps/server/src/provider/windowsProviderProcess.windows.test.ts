@@ -318,40 +318,43 @@ describeWindows("Windows Job launcher native integration", () => {
   it.each([
     { mode: "forced stop", keepRootAlive: true },
     { mode: "natural root exit", keepRootAlive: false },
-  ])("releases a descendant-mapped CLI file before $mode proof resolves", async ({ keepRootAlive }) => {
-    const directory = mkdtempSync(join(tmpdir(), "synara-job-lock-proof-"));
-    const heldExecutable = join(directory, "held-provider.exe");
-    const renamedExecutable = join(directory, "replaceable-provider.exe");
-    const commandShell = process.env.ComSpec ?? "C:\\Windows\\System32\\cmd.exe";
-    copyFileSync(commandShell, heldExecutable);
-    const script = [
-      "const { spawn } = require('node:child_process')",
-      `const descendant = spawn(${JSON.stringify(heldExecutable)}, ['/d', '/s', '/c', 'echo ready & ping.exe -t 127.0.0.1 >nul'], { stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true })`,
-      "descendant.stdout.once('data', () => {",
-      "  descendant.stdout.destroy()",
-      "  descendant.unref()",
-      "  process.stdout.write(String(descendant.pid) + '\\n')",
-      "})",
-      ...(keepRootAlive ? ["setInterval(() => {}, 1000)"] : []),
-    ].join(";");
-    const { child, supervisor } = spawnPreparedJobProcess(script);
-    try {
-      const descendantPid = Number.parseInt(await readFirstLine(child), 10);
-      expect(Number.isSafeInteger(descendantPid)).toBe(true);
-      if (keepRootAlive) {
-        await supervisor.teardown();
-      } else {
-        await supervisor.proveExit();
-      }
+  ])(
+    "releases a descendant-mapped CLI file before $mode proof resolves",
+    async ({ keepRootAlive }) => {
+      const directory = mkdtempSync(join(tmpdir(), "synara-job-lock-proof-"));
+      const heldExecutable = join(directory, "held-provider.exe");
+      const renamedExecutable = join(directory, "replaceable-provider.exe");
+      const commandShell = process.env.ComSpec ?? "C:\\Windows\\System32\\cmd.exe";
+      copyFileSync(commandShell, heldExecutable);
+      const script = [
+        "const { spawn } = require('node:child_process')",
+        `const descendant = spawn(${JSON.stringify(heldExecutable)}, ['/d', '/s', '/c', 'echo ready & ping.exe -t 127.0.0.1 >nul'], { stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true })`,
+        "descendant.stdout.once('data', () => {",
+        "  descendant.stdout.destroy()",
+        "  descendant.unref()",
+        "  process.stdout.write(String(descendant.pid) + '\\n')",
+        "})",
+        ...(keepRootAlive ? ["setInterval(() => {}, 1000)"] : []),
+      ].join(";");
+      const { child, supervisor } = spawnPreparedJobProcess(script);
+      try {
+        const descendantPid = Number.parseInt(await readFirstLine(child), 10);
+        expect(Number.isSafeInteger(descendantPid)).toBe(true);
+        if (keepRootAlive) {
+          await supervisor.teardown();
+        } else {
+          await supervisor.proveExit();
+        }
 
-      // This is the API boundary promised to CLI updates: when proof resolves, Windows must no
-      // longer hold the old executable image, so atomic replacement can proceed immediately.
-      renameSync(heldExecutable, renamedExecutable);
-      rmSync(renamedExecutable);
-      expect(await waitForProcessExit(descendantPid)).toBe(true);
-    } finally {
-      await supervisor.teardown().catch(() => undefined);
-      await cleanupTestDirectory(directory);
-    }
-  });
+        // This is the API boundary promised to CLI updates: when proof resolves, Windows must no
+        // longer hold the old executable image, so atomic replacement can proceed immediately.
+        renameSync(heldExecutable, renamedExecutable);
+        rmSync(renamedExecutable);
+        expect(await waitForProcessExit(descendantPid)).toBe(true);
+      } finally {
+        await supervisor.teardown().catch(() => undefined);
+        await cleanupTestDirectory(directory);
+      }
+    },
+  );
 });

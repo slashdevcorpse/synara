@@ -438,9 +438,13 @@ function makeManualOnlyProviderMaintenanceCapabilities(input: {
   });
 }
 
-function makeNpmGlobalProviderMaintenanceCapabilities(
+function makeGlobalPackageManagerProviderMaintenanceCapabilities(
   definition: PackageManagedProviderMaintenanceDefinition,
   target: ProviderMaintenanceTargetIdentity,
+  input: {
+    readonly updateArgs: (packageName: string, globalRoot: string) => ReadonlyArray<string>;
+    readonly updateLockPrefix: string;
+  },
 ): ProviderMaintenanceCapabilities {
   if (!definition.npmPackageName) {
     return makeManualOnlyProviderMaintenanceCapabilities({
@@ -448,8 +452,8 @@ function makeNpmGlobalProviderMaintenanceCapabilities(
       packageName: null,
     });
   }
-  const globalPrefix = nonEmptyString(target.canonicalInstallRoot);
-  if (!globalPrefix) {
+  const globalRoot = nonEmptyString(target.canonicalInstallRoot);
+  if (!globalRoot) {
     return makeManualOnlyProviderMaintenanceCapabilities({
       provider: definition.provider,
       packageName: definition.npmPackageName,
@@ -459,18 +463,29 @@ function makeNpmGlobalProviderMaintenanceCapabilities(
     provider: definition.provider,
     packageName: definition.npmPackageName,
     updateExecutable: target.managerExecutablePath,
-    updateArgs: [
-      "install",
-      "-g",
-      ...(definition.npmInstallFlags ?? []),
-      ...(globalPrefix ? ["--prefix", globalPrefix] : []),
-      `${definition.npmPackageName}@latest`,
-    ],
-    updateLockKey: `npm-global:${normalizeCommandPath(globalPrefix, target.platform)}`,
+    updateArgs: input.updateArgs(definition.npmPackageName, globalRoot),
+    updateLockKey: `${input.updateLockPrefix}:${normalizeCommandPath(globalRoot, target.platform)}`,
     updatePathPrepend: commandPathImplementation(target.platform).dirname(
       target.managerExecutablePath,
     ),
     updateTarget: target,
+  });
+}
+
+function makeNpmGlobalProviderMaintenanceCapabilities(
+  definition: PackageManagedProviderMaintenanceDefinition,
+  target: ProviderMaintenanceTargetIdentity,
+): ProviderMaintenanceCapabilities {
+  return makeGlobalPackageManagerProviderMaintenanceCapabilities(definition, target, {
+    updateArgs: (packageName, globalPrefix) => [
+      "install",
+      "-g",
+      ...(definition.npmInstallFlags ?? []),
+      "--prefix",
+      globalPrefix,
+      `${packageName}@latest`,
+    ],
+    updateLockPrefix: "npm-global",
   });
 }
 
@@ -478,29 +493,9 @@ function makeBunGlobalProviderMaintenanceCapabilities(
   definition: PackageManagedProviderMaintenanceDefinition,
   target: ProviderMaintenanceTargetIdentity,
 ): ProviderMaintenanceCapabilities {
-  if (!definition.npmPackageName) {
-    return makeManualOnlyProviderMaintenanceCapabilities({
-      provider: definition.provider,
-      packageName: null,
-    });
-  }
-  const globalRoot = nonEmptyString(target.canonicalInstallRoot);
-  if (!globalRoot) {
-    return makeManualOnlyProviderMaintenanceCapabilities({
-      provider: definition.provider,
-      packageName: definition.npmPackageName,
-    });
-  }
-  return makeProviderMaintenanceCapabilities({
-    provider: definition.provider,
-    packageName: definition.npmPackageName,
-    updateExecutable: target.managerExecutablePath,
-    updateArgs: ["i", "-g", `${definition.npmPackageName}@latest`],
-    updateLockKey: `bun-global:${normalizeCommandPath(globalRoot, target.platform)}`,
-    updatePathPrepend: commandPathImplementation(target.platform).dirname(
-      target.managerExecutablePath,
-    ),
-    updateTarget: target,
+  return makeGlobalPackageManagerProviderMaintenanceCapabilities(definition, target, {
+    updateArgs: (packageName) => ["i", "-g", `${packageName}@latest`],
+    updateLockPrefix: "bun-global",
   });
 }
 
@@ -508,29 +503,9 @@ function makePnpmGlobalProviderMaintenanceCapabilities(
   definition: PackageManagedProviderMaintenanceDefinition,
   target: ProviderMaintenanceTargetIdentity,
 ): ProviderMaintenanceCapabilities {
-  if (!definition.npmPackageName) {
-    return makeManualOnlyProviderMaintenanceCapabilities({
-      provider: definition.provider,
-      packageName: null,
-    });
-  }
-  const globalRoot = nonEmptyString(target.canonicalInstallRoot);
-  if (!globalRoot) {
-    return makeManualOnlyProviderMaintenanceCapabilities({
-      provider: definition.provider,
-      packageName: definition.npmPackageName,
-    });
-  }
-  return makeProviderMaintenanceCapabilities({
-    provider: definition.provider,
-    packageName: definition.npmPackageName,
-    updateExecutable: target.managerExecutablePath,
-    updateArgs: ["add", "-g", `${definition.npmPackageName}@latest`],
-    updateLockKey: `pnpm-global:${normalizeCommandPath(globalRoot, target.platform)}`,
-    updatePathPrepend: commandPathImplementation(target.platform).dirname(
-      target.managerExecutablePath,
-    ),
-    updateTarget: target,
+  return makeGlobalPackageManagerProviderMaintenanceCapabilities(definition, target, {
+    updateArgs: (packageName) => ["add", "-g", `${packageName}@latest`],
+    updateLockPrefix: "pnpm-global",
   });
 }
 

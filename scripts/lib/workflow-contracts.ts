@@ -263,7 +263,9 @@ function validatePostBuildGate(
 
   const buildStep = steps.find((candidate) => candidate.command === CI_DESKTOP_BUILD_COMMAND);
   if (buildStep && step!.index <= buildStep.index) {
-    errors.push(`${workflowPath} ${jobName} post-build gate must run after the desktop build: ${command}.`);
+    errors.push(
+      `${workflowPath} ${jobName} post-build gate must run after the desktop build: ${command}.`,
+    );
   }
 }
 
