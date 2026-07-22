@@ -80,7 +80,9 @@ const QUARANTINE_RUN_COMMANDS = {
   linux: "node scripts/quarantine-registry.ts run --platform linux",
   windows: "node scripts/quarantine-registry.ts run --platform windows",
 } as const;
-const ALLOWED_NONBLOCKING_CI_COMMANDS = new Set(Object.values(QUARANTINE_RUN_COMMANDS));
+const ALLOWED_NONBLOCKING_CI_COMMANDS: ReadonlySet<string> = new Set(
+  Object.values(QUARANTINE_RUN_COMMANDS),
+);
 const FULL_UNIT_COMMAND = "bun turbo test";
 const UNIT_WINDOWS_SETUP_COMMAND =
   "node apps/server/scripts/build-windows-job-launcher.mjs --arch x64";
