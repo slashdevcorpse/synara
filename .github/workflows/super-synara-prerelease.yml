@@ -319,7 +319,7 @@ jobs:
       - name: Verify dependency install preserved source
         run: node scripts/verify-release-worktree-clean.ts
 
-      - name: Revalidate exact planned source
+      - name: Revalidate protected-main source provenance
         shell: bash
         env:
           VERSION: ${{ needs.preflight.outputs.version }}
@@ -595,7 +595,7 @@ jobs:
       - name: Verify dependency install preserved source
         run: node scripts/verify-release-worktree-clean.ts
 
-      - name: Revalidate exact planned source
+      - name: Revalidate protected-main source provenance
         shell: bash
         env:
           VERSION: ${{ needs.preflight.outputs.version }}

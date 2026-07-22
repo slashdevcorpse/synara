@@ -141,6 +141,78 @@ describe("Super Synara workflow contracts", () => {
     ).toThrow("not pinned to a full commit");
   });
 
+  it("keeps every source check tagless until atomic draft publication", () => {
+    expect(() => verifySuperSynaraWorkflowText(main, audit)).not.toThrow();
+
+    const bypassedShell = main.replace(
+      "        name: Validate source provenance\n        shell: bash",
+      "        name: Validate source provenance\n        shell: bash -c 'true' {0}",
+    );
+    expect(bypassedShell).not.toBe(main);
+    expect(() => verifySuperSynaraWorkflowText(bypassedShell, audit)).toThrow(
+      "without requiring the immutable tag before atomic publication",
+    );
+
+    for (const [startMarker, endMarker, command, environmentBindings] of [
+      [
+        "\n  preflight:",
+        "\n  windows_x64:",
+        "github-unsigned-prerelease \\\n            false",
+        [
+          "VERSION: ${{ steps.meta.outputs.version }}",
+          "TAG: ${{ steps.meta.outputs.tag }}",
+          "SOURCE_COMMIT: ${{ inputs.expected_source_sha }}",
+        ],
+      ],
+      [
+        "\n  windows_x64:",
+        "\n  macos_arm64:",
+        "github-unsigned-prerelease false",
+        [
+          "VERSION: ${{ needs.preflight.outputs.version }}",
+          "TAG: ${{ needs.preflight.outputs.tag }}",
+          "SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}",
+        ],
+      ],
+      [
+        "\n  macos_arm64:",
+        "\n  publish:",
+        "github-unsigned-prerelease false",
+        [
+          "VERSION: ${{ needs.preflight.outputs.version }}",
+          "TAG: ${{ needs.preflight.outputs.tag }}",
+          "SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}",
+        ],
+      ],
+    ] as const) {
+      const start = main.indexOf(startMarker);
+      const end = main.indexOf(endMarker, start + startMarker.length);
+      expect(start).toBeGreaterThanOrEqual(0);
+      expect(end).toBeGreaterThan(start);
+      const block = main.slice(start, end);
+      const mutatedBlock = block.replace(command, command.replace("false", "true"));
+      expect(mutatedBlock).not.toBe(block);
+      const mutation = main.slice(0, start) + mutatedBlock + main.slice(end);
+      expect(() => verifySuperSynaraWorkflowText(mutation, audit)).toThrow(
+        "without requiring the immutable tag before atomic publication",
+      );
+
+      for (const environmentBinding of environmentBindings) {
+        const separator = environmentBinding.indexOf(":");
+        expect(separator).toBeGreaterThan(0);
+        const forgedEnvironmentBlock = block.replace(
+          environmentBinding,
+          `${environmentBinding.slice(0, separator)}: attacker`,
+        );
+        expect(forgedEnvironmentBlock).not.toBe(block);
+        const forgedEnvironment = main.slice(0, start) + forgedEnvironmentBlock + main.slice(end);
+        expect(() => verifySuperSynaraWorkflowText(forgedEnvironment, audit)).toThrow(
+          "without requiring the immutable tag before atomic publication",
+        );
+      }
+    }
+  });
+
   it("adopts only the exact planned Release Drafter draft", () => {
     for (const [binding, replacement] of [
       [
@@ -490,8 +562,8 @@ describe("Super Synara workflow contracts", () => {
     );
 
     const alternatePhaseInReadOnlyWindows = main.replace(
-      "      - name: Revalidate exact planned source",
-      "      - name: Reintroduced native-lane release-state validation\n        shell: bash\n        run: node scripts/verify-super-synara-github-state.ts --phase before-draft\n\n      - name: Revalidate exact planned source",
+      "      - name: Revalidate protected-main source provenance",
+      "      - name: Reintroduced native-lane release-state validation\n        shell: bash\n        run: node scripts/verify-super-synara-github-state.ts --phase before-draft\n\n      - name: Revalidate protected-main source provenance",
     );
     expect(alternatePhaseInReadOnlyWindows).not.toBe(main);
     expect(() => verifySuperSynaraWorkflowText(alternatePhaseInReadOnlyWindows, audit)).toThrow(
@@ -530,7 +602,7 @@ describe("Super Synara workflow contracts", () => {
         const mutation = replaceExactWorkflowJobText(main, jobName, search, replacement);
         expect(mutation).not.toBe(main);
         expect(() => verifySuperSynaraWorkflowText(mutation, audit)).toThrow(
-          "without requiring a pre-publication tag",
+          /without requiring (?:a pre-publication|the immutable) tag/,
         );
       }
     }
