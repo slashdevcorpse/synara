@@ -950,7 +950,7 @@ describe("DesktopBrowserManager local-preview lifecycle", () => {
     const targetUrl = "http://127.0.0.1:54321/";
     const tab = manager.open({ threadId: THREAD_ID, initialUrl: targetUrl }).tabs[0]!;
     let rejectStaleLoad: ((error: Error) => void) | undefined;
-    const staleLoad = new Promise<void>((_resolve, reject) => {
+    const staleLoad = new Promise<undefined>((_resolve, reject) => {
       rejectStaleLoad = reject;
     });
     const staleWebContents = new FakeWebContents();
