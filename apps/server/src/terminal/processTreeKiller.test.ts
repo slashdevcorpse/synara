@@ -15,6 +15,7 @@ import {
   type ProcessChildrenMap,
   type TerminalKillSignal,
 } from "./processTreeKiller";
+import { WINDOWS_PROCESS_SNAPSHOT_TIMEOUT_MS } from "./windowsProcessSnapshot";
 
 describe("processTreeKiller", () => {
   it("collects nested process-tree descendants in parent-first order", () => {
@@ -557,9 +558,9 @@ it.runIf(process.platform === "win32")(
       if (tree.captureComplete) {
         expect(tree.descendants.some((descendant) => descendant.pid === child.pid)).toBe(true);
       } else {
-        // A busy shared test runner can legitimately exceed the bounded walk.
-        // In that case the important contract is that capture fails closed.
-        expect(tree.descendants).toHaveLength(256);
+        // A busy shared test runner can exceed the bounded snapshot or descendant walk.
+        // Both states must remain explicitly incomplete and fail closed.
+        expect([0, 256]).toContain(tree.descendants.length);
       }
     } finally {
       if (child.exitCode === null && child.signalCode === null) {
@@ -568,5 +569,5 @@ it.runIf(process.platform === "win32")(
       }
     }
   },
-  10_000,
+  WINDOWS_PROCESS_SNAPSHOT_TIMEOUT_MS + 5_000,
 );

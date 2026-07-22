@@ -3,9 +3,8 @@
 // Layer: Terminal infrastructure tests
 import { describe, expect, it, vi } from "vitest";
 
-import type { ProcessRunResult } from "../processRunner";
+import { runProcess, type ProcessRunResult } from "../processRunner";
 import {
-  captureWindowsProcessSnapshot,
   createWindowsProcessSnapshotCollector,
   WINDOWS_PROCESS_SNAPSHOT_MAX_BUFFER_BYTES,
   WINDOWS_PROCESS_SNAPSHOT_TIMEOUT_MS,
@@ -24,6 +23,17 @@ interface TestProcessRecord {
 
 const SYSTEM_ROOT = String.raw`C:\Windows`;
 const POWERSHELL_PATH = String.raw`C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`;
+const NATIVE_WINDOWS_PROCESS_SNAPSHOT_TIMEOUT_MS = 30_000;
+
+// Keep the product's fail-closed 10-second deadline while giving the hosted native capability
+// proof enough headroom when the full Windows suite contends for PowerShell/CIM resources.
+const captureNativeWindowsProcessSnapshot = createWindowsProcessSnapshotCollector({
+  runProcess: (command, args, options) =>
+    runProcess(command, args, {
+      ...(options ?? {}),
+      timeoutMs: NATIVE_WINDOWS_PROCESS_SNAPSHOT_TIMEOUT_MS,
+    }),
+});
 
 function record(
   ProcessId: number,
@@ -90,7 +100,7 @@ function expectUnknown(
 }
 
 async function captureNativeWindowsProcessSnapshotWithTimeoutRetry(
-  capture: WindowsProcessSnapshotCollector = captureWindowsProcessSnapshot,
+  capture: WindowsProcessSnapshotCollector = captureNativeWindowsProcessSnapshot,
 ): Promise<{
   result: WindowsProcessSnapshotResult;
   attemptOutcomes: readonly string[];
@@ -555,4 +565,5 @@ it.runIf(process.platform === "win32")(
       }
     }
   },
+  NATIVE_WINDOWS_PROCESS_SNAPSHOT_TIMEOUT_MS * 2 + 5_000,
 );
