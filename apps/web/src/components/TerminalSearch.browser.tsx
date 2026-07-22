@@ -16,15 +16,34 @@ describe("TerminalSearch", () => {
     document.body.innerHTML = "";
   });
 
-  it("runs a debounced search after the query rerender", async () => {
-    const findNext = vi.fn((_term: string) => false);
+  it("tracks authoritative result updates after a debounced miss", async () => {
+    type SearchResultsListener = (results: { resultIndex: number; resultCount: number }) => void;
+    let resultListener: SearchResultsListener = () => {
+      throw new Error("Terminal search result listener was not registered.");
+    };
+    const disposeResultListener = vi.fn();
+    const onDidChangeResults = vi.fn((listener: SearchResultsListener) => {
+      resultListener = listener;
+      return { dispose: disposeResultListener };
+    });
+    let synchronousResultCount = 0;
+    const findNext = vi.fn((_term: string) => {
+      resultListener({
+        resultIndex: synchronousResultCount > 0 ? 0 : -1,
+        resultCount: synchronousResultCount,
+      });
+      return false;
+    });
     const searchAddon = {
       clearDecorations: vi.fn(),
       findNext,
       findPrevious: vi.fn(() => false),
+      onDidChangeResults,
     } as unknown as SearchAddon;
 
-    await render(<TerminalSearch searchAddon={searchAddon} isOpen onClose={() => undefined} />);
+    const screen = await render(
+      <TerminalSearch searchAddon={searchAddon} isOpen onClose={() => undefined} />,
+    );
     const searchInput = page.getByRole("textbox", { name: "Find" });
     await expect.element(searchInput).toHaveAttribute("aria-label", "Find");
     await searchInput.fill("needle");
@@ -34,5 +53,16 @@ describe("TerminalSearch", () => {
     expect(findNext).toHaveBeenCalledTimes(1);
     expect(findNext.mock.calls[0]?.[0]).toBe("needle");
     await expect.element(page.getByText("No results")).toBeVisible();
+
+    expect(onDidChangeResults).toHaveBeenCalledTimes(1);
+    resultListener({ resultIndex: 0, resultCount: 1 });
+
+    await expect.element(page.getByText("No results")).not.toBeInTheDocument();
+    synchronousResultCount = 1;
+    await page.getByRole("button", { name: "Next match (Enter)" }).click();
+    expect(findNext).toHaveBeenCalledTimes(2);
+    await expect.element(page.getByText("No results")).not.toBeInTheDocument();
+    await screen.unmount();
+    expect(disposeResultListener).toHaveBeenCalledTimes(1);
   });
 });
