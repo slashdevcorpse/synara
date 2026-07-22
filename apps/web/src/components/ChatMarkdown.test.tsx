@@ -43,7 +43,8 @@ describe("ChatMarkdown", () => {
 
     expect(markup).toContain("text-foreground");
     expect(markup).not.toContain("text-neutral-900");
-  });
+    // Full-suite runs can push the first dynamic import and compiler transform past Vitest's 5s default.
+  }, 30_000);
 
   it("renders inline math with KaTeX", async () => {
     const markup = await renderMarkdown("Euler wrote $e^{i\\\\pi} + 1 = 0$.");

@@ -10,19 +10,29 @@ import {
 } from "./workflow-contracts";
 
 const pinnedCheckout = "actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6";
+const pinnedSetupBun = "oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2";
+const pinnedSetupNode = "actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6";
+const pinnedCache = "actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5";
+const pinnedUploadArtifact =
+  "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7";
+const pinnedDownloadArtifact =
+  "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8";
 const pinnedCodecov = "codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5.5.5";
 const codecovCondition =
-  "${{ !cancelled() && (steps.unit_tests.outcome == 'success' || steps.unit_tests.outcome == 'failure') }}";
+  "${{ matrix.platform == 'linux' && !cancelled() && (steps.unit_tests.outcome == 'success' || steps.unit_tests.outcome == 'failure') }}";
 const codecovToken = "${{ secrets.CODECOV_TOKEN }}";
 const pinnedMergify = "Mergifyio/gha-mergify-ci@8173bc3c1d337d3367454672d50cfdf6f0273396 # v23";
 const mergifyCondition =
-  "${{ !cancelled() && (steps.unit_tests.outcome == 'success' || steps.unit_tests.outcome == 'failure') && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) }}";
+  "${{ matrix.platform == 'linux' && !cancelled() && (steps.unit_tests.outcome == 'success' || steps.unit_tests.outcome == 'failure') && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) }}";
 const disabledPaths = [
   ".github/workflows/issue-labels.yml",
   ".github/workflows/pr-size.yml",
   ".github/workflows/pr-vouch.yml",
   ".github/workflows/release.yml",
 ] as const;
+const linuxPlaywrightCachePath = "~/.cache/ms-playwright";
+const windowsPlaywrightCachePath = "~\\AppData\\Local\\ms-playwright";
+const quarantineBaselineRef = '"${{ github.event.pull_request.base.sha || github.event.before }}"';
 
 const policy = (): WorkflowPolicy => ({
   schemaVersion: 1,
@@ -121,7 +131,19 @@ const macosStartupSmokeStep = [
 const ciRootTestStep = [
   "      - name: Test with coverage and JUnit",
   "        id: unit_tests",
+  "        if: matrix.platform == 'linux'",
+  "        timeout-minutes: 30",
+  "        env:",
+  "          TURBO_CONCURRENCY: ${{ matrix.turbo_concurrency }}",
   "        run: bun run test:ci",
+].join("\n");
+const windowsUnitTestStep = [
+  "      - name: Run Windows unit suite",
+  "        if: matrix.platform == 'windows'",
+  "        timeout-minutes: 30",
+  "        env:",
+  "          TURBO_CONCURRENCY: ${{ matrix.turbo_concurrency }}",
+  "        run: bun turbo test",
 ].join("\n");
 const codecovCoverageUploadStep = [
   "      - name: Upload coverage reports to Codecov",
@@ -176,15 +198,79 @@ on:
 permissions:
   contents: read
 jobs:
-  quality:
+  quality_linux:
     runs-on: ubuntu-24.04
     steps:
       - uses: ${pinnedCheckout}
+      - name: Cache Playwright browsers
+        uses: ${pinnedCache}
+        with:
+          path: ${linuxPlaywrightCachePath}
+      - run: node scripts/quarantine-registry.ts validate
+      - run: bun run --cwd apps/web test:browser:install
+      - name: Browser test (stable)
+        run: bun run --cwd apps/web test:browser:stable
+      - name: Browser test (registered Linux quarantine)
+        continue-on-error: true
+        run: node scripts/quarantine-registry.ts run --platform linux
+      - name: Summarize Linux quarantine
+        if: always()
+        run: node scripts/quarantine-registry.ts summary --platform linux --baseline-ref ${quarantineBaselineRef} --github-step-summary
+      - run: bun run build:desktop
+  quality_windows:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - uses: ${pinnedCheckout}
+      - uses: ${pinnedSetupBun}
+      - uses: ${pinnedSetupNode}
+      - uses: ${pinnedCache}
+      - run: bun install --frozen-lockfile
+      - run: bun run fmt:check
+      - run: bun run lint
+      - run: bun run typecheck
+  unit:
+    runs-on: \${{ matrix.runner }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            runner: ubuntu-24.04
+            turbo_concurrency: "50%"
+          - platform: windows
+            runner: windows-2022
+            turbo_concurrency: "1"
+    steps:
+      - uses: ${pinnedCheckout}
+      - if: matrix.platform == 'windows'
+        run: node apps/server/scripts/build-windows-job-launcher.mjs --arch x64
 ${ciRootTestStep}
+${windowsUnitTestStep}
 ${mergifyUploadStep}
 ${mergifyVerificationStep}
 ${codecovCoverageUploadStep}
 ${codecovTestResultsUploadStep}
+  browser_windows:
+    runs-on: windows-2022
+    timeout-minutes: 40
+    steps:
+      - name: Cache Playwright browsers
+        uses: ${pinnedCache}
+        with:
+          path: ${windowsPlaywrightCachePath}
+      - run: bun install --frozen-lockfile
+      - run: node scripts/quarantine-registry.ts validate
+      - run: bun run --cwd apps/web playwright install chromium
+      - name: Browser test (stable)
+        run: bun run --cwd apps/web test:browser:stable
+      - name: Browser test (registered Windows quarantine)
+        continue-on-error: true
+        run: node scripts/quarantine-registry.ts run --platform windows
+      - name: Summarize Windows quarantine
+        if: always()
+        run: node scripts/quarantine-registry.ts summary --platform windows --baseline-ref ${quarantineBaselineRef} --github-step-summary
   windows_x64:
     runs-on: windows-2022
     steps:
@@ -203,6 +289,39 @@ ${nativeDesktopBuildStep}
 ${windowsPackagedCliGateStep}
 ${windowsPersistenceSmokeStep}
 ${windowsStartupSmokeStep}
+      - name: Upload Windows desktop E2E build
+        uses: ${pinnedUploadArtifact}
+        with:
+          name: desktop-build-windows
+          path: |
+            apps/desktop/dist-electron/**
+            apps/server/dist/**
+            apps/web/dist/**
+            packages/contracts/dist/**
+            packages/effect-acp/dist/**
+          if-no-files-found: error
+          retention-days: 1
+  e2e_windows:
+    name: e2e_windows
+    needs: windows_x64
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - run: bun install --frozen-lockfile
+      - uses: ${pinnedDownloadArtifact}
+        with:
+          name: desktop-build-windows
+          path: .
+      - run: bun run test:e2e
+      - if: failure()
+        uses: ${pinnedUploadArtifact}
+        with:
+          name: desktop-e2e-windows-diagnostics
+          path: |
+            apps/desktop/test-results/**
+            apps/desktop/playwright-report/**
+          if-no-files-found: ignore
+          retention-days: 7
   macos_arm64:
     runs-on: macos-15
     steps:
@@ -213,6 +332,25 @@ ${windowsStartupSmokeStep}
 ${nativeDesktopBuildStep}
 ${macosPersistenceSmokeStep}
 ${macosStartupSmokeStep}
+  quality:
+    if: always()
+    needs:
+      - quality_linux
+      - quality_windows
+      - unit
+      - browser_windows
+      - e2e_windows
+      - macos_arm64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - run: |
+          test "\${{ needs.quality_linux.result }}" = success
+          test "\${{ needs.quality_windows.result }}" = success
+          test "\${{ needs.unit.result }}" = success
+          test "\${{ needs.browser_windows.result }}" = success
+          test "\${{ needs.e2e_windows.result }}" = success
+          test "\${{ needs.macos_arm64.result }}" = success
   release_smoke:
     runs-on: ubuntu-24.04
     steps:
@@ -348,10 +486,105 @@ function validFiles(): Map<string, string> {
   ]);
 }
 
+function ciErrors(workflow: string): string {
+  const files = validFiles();
+  files.set(".github/workflows/ci.yml", workflow);
+  return validateWorkflowContracts(files, policy()).join("\n");
+}
+
 describe("workflow contracts", () => {
   it("accepts pinned, read-only PR CI and the narrowly scoped watcher", () => {
     expect(validateWorkflowContracts(validFiles(), policy())).toEqual([]);
     expect(validateMergifyConfiguration(mergifyConfiguration)).toEqual([]);
+  });
+
+  it("keeps stable browser tests blocking and only registry-backed quarantine runs nonblocking", () => {
+    const stableNonblocking = ciWorkflow.replace(
+      "      - name: Browser test (stable)\n        run: bun run --cwd apps/web test:browser:stable",
+      "      - name: Browser test (stable)\n        continue-on-error: true\n        run: bun run --cwd apps/web test:browser:stable",
+    );
+    expect(ciErrors(stableNonblocking)).toContain(
+      "quality_linux browser gate must be unconditional and fail closed: bun run --cwd apps/web test:browser:stable",
+    );
+    expect(ciErrors(stableNonblocking)).toContain(
+      "may use continue-on-error only for registered quarantine runs",
+    );
+
+    expect(
+      ciErrors(
+        ciWorkflow.replace(
+          "node scripts/quarantine-registry.ts run --platform linux",
+          "bun run --cwd apps/web test:browser:geometry",
+        ),
+      ),
+    ).toContain(
+      "quality_linux must run the registered linux quarantine as the sole nonblocking test step",
+    );
+
+    expect(ciErrors(ciWorkflow.replace(` --baseline-ref ${quarantineBaselineRef}`, ""))).toContain(
+      "quality_linux must publish the linux quarantine summary",
+    );
+
+    const chainedQuarantine = ciWorkflow.replace(
+      "node scripts/quarantine-registry.ts run --platform linux",
+      "node scripts/quarantine-registry.ts run --platform linux && bun run lint",
+    );
+    expect(ciErrors(chainedQuarantine)).toContain(
+      "may use continue-on-error only for registered quarantine runs",
+    );
+  });
+
+  it("keeps Linux and Windows Playwright caches outside the checkout", () => {
+    const checkoutCachePath = "${{ github.workspace }}/.playwright-browsers";
+    expect(ciErrors(ciWorkflow.replace(linuxPlaywrightCachePath, checkoutCachePath))).toContain(
+      `quality_linux must cache Playwright browsers at ${linuxPlaywrightCachePath}`,
+    );
+    expect(ciErrors(ciWorkflow.replace(windowsPlaywrightCachePath, checkoutCachePath))).toContain(
+      `browser_windows must cache Playwright browsers at ${windowsPlaywrightCachePath}`,
+    );
+    expect(
+      ciErrors(
+        ciWorkflow.replace(
+          "jobs:\n",
+          `env:\n  PLAYWRIGHT_BROWSERS_PATH: ${checkoutCachePath}\njobs:\n`,
+        ),
+      ),
+    ).toContain(
+      "must use Playwright's OS-default browser paths without a workflow-level PLAYWRIGHT_BROWSERS_PATH override",
+    );
+  });
+
+  it("requires an independent blocking Windows browser lane with registered quarantine reporting", () => {
+    expect(
+      ciErrors(
+        ciWorkflow.replace(
+          "  browser_windows:\n    runs-on: windows-2022",
+          "  browser_windows:\n    runs-on: ubuntu-24.04",
+        ),
+      ),
+    ).toContain("browser_windows must run on windows-2022");
+
+    expect(
+      ciErrors(
+        ciWorkflow.replace(
+          "      - run: bun run --cwd apps/web playwright install chromium",
+          "      - run: bun run --cwd apps/web playwright install firefox",
+        ),
+      ),
+    ).toContain(
+      "browser_windows must run exact browser gate command: bun run --cwd apps/web playwright install chromium",
+    );
+
+    expect(
+      ciErrors(
+        ciWorkflow.replace(
+          "      - name: Browser test (registered Windows quarantine)\n        continue-on-error: true",
+          "      - name: Browser test (registered Windows quarantine)",
+        ),
+      ),
+    ).toContain(
+      "browser_windows must run the registered windows quarantine as the sole nonblocking test step",
+    );
   });
 
   it("locks Mergify to the protected-main queue ruleset", () => {
@@ -409,6 +642,18 @@ describe("workflow contracts", () => {
     files.set(".github/workflows/ci.yml", ciWorkflow.replace("ubuntu-24.04", "macos-15-intel"));
     expect(validateWorkflowContracts(files, policy()).join("\n")).toContain(
       "references unsupported runner macos-15-intel",
+    );
+
+    const misplacedMatrixRunner = validFiles();
+    misplacedMatrixRunner.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace(
+        "  release_smoke:",
+        "  rogue:\n    runs-on: ${{ matrix.runner }}\n    steps:\n      - run: echo unsafe\n  release_smoke:",
+      ),
+    );
+    expect(validateWorkflowContracts(misplacedMatrixRunner, policy()).join("\n")).toContain(
+      "references unsupported runner ${{ matrix.runner }}",
     );
   });
 
@@ -498,7 +743,7 @@ describe("workflow contracts", () => {
       ciWorkflow.replace(`${ciRootTestStep}\n`, ""),
     );
     expect(validateWorkflowContracts(missingQualitySuite, policy()).join("\n")).toContain(
-      "quality must run exactly one bun run test:ci suite",
+      "unit must run exactly one Linux-only bun run test:ci command",
     );
 
     const duplicateQualitySuite = validFiles();
@@ -507,13 +752,16 @@ describe("workflow contracts", () => {
       ciWorkflow.replace(`${ciRootTestStep}\n`, `${ciRootTestStep}\n${ciRootTestStep}\n`),
     );
     expect(validateWorkflowContracts(duplicateQualitySuite, policy()).join("\n")).toContain(
-      "quality must run exactly one bun run test:ci suite",
+      "unit must run exactly one Linux-only bun run test:ci command",
     );
 
     const swappedWindowsRunner = validFiles();
     swappedWindowsRunner.set(
       ".github/workflows/ci.yml",
-      ciWorkflow.replace("    runs-on: windows-2022", "    runs-on: ubuntu-24.04"),
+      ciWorkflow.replace(
+        "  windows_x64:\n    runs-on: windows-2022",
+        "  windows_x64:\n    runs-on: ubuntu-24.04",
+      ),
     );
     expect(validateWorkflowContracts(swappedWindowsRunner, policy()).join("\n")).toContain(
       "windows_x64 must run on windows-2022",
@@ -522,10 +770,10 @@ describe("workflow contracts", () => {
     const conditionalQuality = validFiles();
     conditionalQuality.set(
       ".github/workflows/ci.yml",
-      ciWorkflow.replace("  quality:\n", "  quality:\n    if: false\n"),
+      ciWorkflow.replace("  quality:\n    if: always()", "  quality:\n    if: success()"),
     );
     expect(validateWorkflowContracts(conditionalQuality, policy()).join("\n")).toContain(
-      "quality job must be unconditional and fail closed",
+      "quality aggregate must run with always() and fail closed",
     );
 
     const chainedReleaseSuite = validFiles();
@@ -534,8 +782,207 @@ describe("workflow contracts", () => {
       ciWorkflow.replace("          echo safe", "          bun run test && echo done"),
     );
     expect(validateWorkflowContracts(chainedReleaseSuite, policy()).join("\n")).toContain(
-      "release_smoke must not own an additional or chained monorepo-wide bun run test suite",
+      "release_smoke must not own an additional, filtered, or chained monorepo-wide unit suite",
     );
+  });
+
+  it("locks the complete bounded unit matrix and required quality aggregate", () => {
+    const failFast = validFiles();
+    failFast.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace("      fail-fast: false", "      fail-fast: true"),
+    );
+    expect(validateWorkflowContracts(failFast, policy()).join("\n")).toContain(
+      "unit must use a fail-fast: false static include matrix",
+    );
+
+    const concurrentWindows = validFiles();
+    concurrentWindows.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace(
+        '            runner: windows-2022\n            turbo_concurrency: "1"',
+        '            runner: windows-2022\n            turbo_concurrency: "50%"',
+      ),
+    );
+    expect(validateWorkflowContracts(concurrentWindows, policy()).join("\n")).toContain(
+      "unit matrix entry 2 has drifted",
+    );
+
+    const detachedConcurrency = validFiles();
+    detachedConcurrency.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace(
+        "          TURBO_CONCURRENCY: ${{ matrix.turbo_concurrency }}",
+        '          TURBO_CONCURRENCY: "100%"',
+      ),
+    );
+    expect(validateWorkflowContracts(detachedConcurrency, policy()).join("\n")).toContain(
+      "unit bun run test:ci must set TURBO_CONCURRENCY to ${{ matrix.turbo_concurrency }}",
+    );
+
+    const filteredWindows = validFiles();
+    filteredWindows.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace(
+        "        run: bun turbo test",
+        "        run: bun turbo test --filter=server",
+      ),
+    );
+    expect(validateWorkflowContracts(filteredWindows, policy()).join("\n")).toContain(
+      "unit must run exactly one Windows bun turbo test command",
+    );
+
+    const misplacedWindowsSetup = validFiles();
+    misplacedWindowsSetup.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow
+        .replace(
+          "      - if: matrix.platform == 'windows'\n        run: node apps/server/scripts/build-windows-job-launcher.mjs --arch x64\n",
+          "",
+        )
+        .replace(
+          `${windowsUnitTestStep}\n`,
+          `${windowsUnitTestStep}\n      - if: matrix.platform == 'windows'\n        run: node apps/server/scripts/build-windows-job-launcher.mjs --arch x64\n`,
+        ),
+    );
+    expect(validateWorkflowContracts(misplacedWindowsSetup, policy()).join("\n")).toContain(
+      "unit Windows launcher setup must run before bun turbo test",
+    );
+
+    const permissiveWindowsQuality = validFiles();
+    permissiveWindowsQuality.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace(
+        "      - run: bun run lint",
+        "      - continue-on-error: true\n        run: bun run lint",
+      ),
+    );
+    expect(validateWorkflowContracts(permissiveWindowsQuality, policy()).join("\n")).toContain(
+      "quality_windows required steps must be unconditional and fail closed",
+    );
+
+    const incompleteWindowsQuality = validFiles();
+    incompleteWindowsQuality.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace("      - run: bun run typecheck\n", ""),
+    );
+    expect(validateWorkflowContracts(incompleteWindowsQuality, policy()).join("\n")).toContain(
+      "quality_windows must contain only the required setup, install, and quality steps",
+    );
+
+    const incompleteAggregate = validFiles();
+    incompleteAggregate.set(".github/workflows/ci.yml", ciWorkflow.replace("      - unit\n", ""));
+    expect(validateWorkflowContracts(incompleteAggregate, policy()).join("\n")).toContain(
+      "quality aggregate must depend on the exact merge-blocking quality job set",
+    );
+
+    const missingWindowsAggregate = validFiles();
+    missingWindowsAggregate.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace("      - quality_windows\n", ""),
+    );
+    expect(validateWorkflowContracts(missingWindowsAggregate, policy()).join("\n")).toContain(
+      "quality aggregate must depend on the exact merge-blocking quality job set",
+    );
+
+    const permissiveAggregate = validFiles();
+    permissiveAggregate.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace(
+        '          test "${{ needs.unit.result }}" = success',
+        '          test "${{ needs.unit.result }}" != failure',
+      ),
+    );
+    expect(validateWorkflowContracts(permissiveAggregate, policy()).join("\n")).toContain(
+      "quality must run exact aggregate gate command",
+    );
+
+    const missingE2eAggregate = validFiles();
+    missingE2eAggregate.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace("      - e2e_windows\n", ""),
+    );
+    expect(validateWorkflowContracts(missingE2eAggregate, policy()).join("\n")).toContain(
+      "quality aggregate must depend on the exact merge-blocking quality job set",
+    );
+
+    const missingMacosAggregate = validFiles();
+    missingMacosAggregate.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace("      - macos_arm64\n", ""),
+    );
+    expect(validateWorkflowContracts(missingMacosAggregate, policy()).join("\n")).toContain(
+      "quality aggregate must depend on the exact merge-blocking quality job set",
+    );
+
+    const permissiveE2eAggregate = validFiles();
+    permissiveE2eAggregate.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace(
+        '          test "${{ needs.e2e_windows.result }}" = success',
+        '          test "${{ needs.e2e_windows.result }}" != failure',
+      ),
+    );
+    expect(validateWorkflowContracts(permissiveE2eAggregate, policy()).join("\n")).toContain(
+      "quality must run exact aggregate gate command",
+    );
+  });
+
+  it("locks the Windows packaged desktop E2E artifact pipeline", () => {
+    expect(
+      ciErrors(
+        ciWorkflow.replace(
+          "            packages/effect-acp/dist/**",
+          "            packages/effect-acp/build/**",
+        ),
+      ),
+    ).toContain(
+      "windows_x64 must upload exact desktop-build-windows paths with one-day fail-closed retention",
+    );
+
+    expect(
+      ciErrors(
+        ciWorkflow.replace(
+          "          name: desktop-build-windows\n          path: .",
+          "          name: desktop-build-windows\n          path: artifacts",
+        ),
+      ),
+    ).toContain(
+      "e2e_windows must download desktop-build-windows at the repository root and fail closed",
+    );
+
+    expect(
+      ciErrors(
+        ciWorkflow.replace(
+          "    needs: windows_x64\n    runs-on: windows-2022",
+          "    needs: [windows_x64, unit]\n    runs-on: windows-2022",
+        ),
+      ),
+    ).toContain("e2e_windows must need only its same-platform producer windows_x64");
+
+    expect(
+      ciErrors(
+        ciWorkflow.replace(
+          "      - run: bun run test:e2e\n      - if: failure()",
+          "      - run: bun run --cwd apps/desktop test:e2e\n      - if: failure()",
+        ),
+      ),
+    ).toContain("e2e_windows must run exact packaged desktop E2E command: bun run test:e2e");
+
+    const alwaysUpload = ciWorkflow.replaceAll("      - if: failure()", "      - if: always()");
+    const alwaysUploadErrors = ciErrors(alwaysUpload);
+    expect(alwaysUploadErrors).toContain(
+      "e2e_windows diagnostics must upload exact failure-only paths with seven-day retention",
+    );
+
+    expect(
+      ciErrors(
+        ciWorkflow.replace(
+          "      - run: bun run test:e2e",
+          "      - run: bun run build:desktop\n      - run: bun run test:e2e",
+        ),
+      ),
+    ).toContain("e2e_windows must consume prebuilt artifacts without builds");
   });
 
   it("requires fail-closed Codecov coverage and test-result uploads", () => {
@@ -1048,8 +1495,8 @@ jobs:
     files.set(
       ".github/workflows/ci.yml",
       ciWorkflow.replace(
-        "    runs-on: ubuntu-24.04",
-        "    permissions: write-all\n    runs-on: ubuntu-24.04",
+        "  quality:\n    if: always()",
+        "  quality:\n    if: always()\n    permissions: write-all",
       ),
     );
     expect(validateWorkflowContracts(files, policy()).join("\n")).toContain(

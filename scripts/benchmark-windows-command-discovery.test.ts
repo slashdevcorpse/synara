@@ -39,6 +39,94 @@ import {
 const SHA_A = "a".repeat(40);
 const SHA_B = "b".repeat(40);
 const SHA_C = "c".repeat(40);
+const WINDOWS_FIXTURE_POWERSHELL_TIMEOUT_MS = 10_000;
+const WINDOWS_FIXTURE_TEST_TIMEOUT_MS = 45_000;
+
+interface WindowsStorePackageDefinition {
+  readonly packageName: string;
+  readonly publisherId: string;
+}
+
+type WindowsStoreBulkLookupResult =
+  | {
+      readonly status: "success";
+      readonly installLocationsByFamily: Readonly<Record<string, string>>;
+      readonly subprocessCount: 0 | 1;
+    }
+  | {
+      readonly status: "failure";
+      readonly category: string;
+      readonly subprocessCount: 0 | 1;
+    };
+
+interface WindowsStoreFixtureDiscovery {
+  readonly clearWindowsStorePackageDiscoveryCache: () => void;
+  readonly resolveWindowsStorePackageInstallLocation: (
+    packages: readonly WindowsStorePackageDefinition[] | undefined,
+    platform: NodeJS.Platform,
+    env: NodeJS.ProcessEnv,
+    execFile: (
+      file: string,
+      args: readonly string[],
+      options: {
+        readonly encoding: "utf8";
+        readonly env: NodeJS.ProcessEnv;
+        readonly stdio: ["ignore", "pipe", "ignore"];
+        readonly timeout: number;
+        readonly windowsHide: true;
+      },
+    ) => string | Buffer,
+  ) => string | null;
+}
+
+interface WindowsStoreFixtureOpen {
+  readonly resolveAvailableEditors: (
+    platform: NodeJS.Platform,
+    env: NodeJS.ProcessEnv,
+    options: {
+      readonly lookupWindowsStorePackage: (
+        packages: readonly WindowsStorePackageDefinition[] | undefined,
+        platform: NodeJS.Platform,
+        env: NodeJS.ProcessEnv,
+      ) => string | null;
+    },
+  ) => ReadonlyArray<string>;
+  readonly discoverAvailableEditors: (options: {
+    readonly platform: NodeJS.Platform;
+    readonly env: NodeJS.ProcessEnv;
+    readonly cwd: string;
+    readonly signal: AbortSignal;
+    readonly lookupWindowsStorePackages: (
+      packages: readonly WindowsStorePackageDefinition[],
+      options: {
+        readonly platform: NodeJS.Platform;
+        readonly env: NodeJS.ProcessEnv;
+        readonly signal?: AbortSignal;
+      },
+    ) => Promise<WindowsStoreBulkLookupResult>;
+  }) => Promise<{
+    readonly status: string;
+    readonly availableEditors?: ReadonlyArray<string>;
+  }>;
+}
+
+function resolveWindowsStoreFixture(
+  discovery: WindowsStoreFixtureDiscovery,
+  packages: readonly WindowsStorePackageDefinition[] | undefined,
+  platform: NodeJS.Platform,
+  env: NodeJS.ProcessEnv,
+): string | null {
+  return discovery.resolveWindowsStorePackageInstallLocation(
+    packages,
+    platform,
+    env,
+    (file, args, options) =>
+      execFileSync(file, [...args], {
+        ...options,
+        timeout: WINDOWS_FIXTURE_POWERSHELL_TIMEOUT_MS,
+      }),
+  );
+}
 
 function summary(overrides: Partial<BenchmarkSummary> = {}): BenchmarkSummary {
   return {
@@ -376,30 +464,19 @@ describe("benchmark-windows-command-discovery", () => {
         });
         const open = (await import(
           new URL("../apps/server/src/open.ts", import.meta.url).href
-        )) as {
-          readonly resolveAvailableEditors: (
-            platform: NodeJS.Platform,
-            env: NodeJS.ProcessEnv,
-          ) => ReadonlyArray<string>;
-          readonly discoverAvailableEditors: (options: {
-            readonly platform: NodeJS.Platform;
-            readonly env: NodeJS.ProcessEnv;
-            readonly cwd: string;
-            readonly signal: AbortSignal;
-          }) => Promise<{
-            readonly status: string;
-            readonly availableEditors?: ReadonlyArray<string>;
-          }>;
-        };
+        )) as WindowsStoreFixtureOpen;
         const discovery = (await import(
           new URL("../apps/server/src/editorAppDiscovery.ts", import.meta.url).href
-        )) as {
-          readonly clearWindowsStorePackageDiscoveryCache: () => void;
-        };
+        )) as WindowsStoreFixtureDiscovery;
         const env = editorFixtureEnvironment(fixture);
 
         discovery.clearWindowsStorePackageDiscoveryCache();
-        expect(open.resolveAvailableEditors("win32", env)).toEqual(["vscode"]);
+        expect(
+          open.resolveAvailableEditors("win32", env, {
+            lookupWindowsStorePackage: (packages, platform, childEnv) =>
+              resolveWindowsStoreFixture(discovery, packages, platform, childEnv),
+          }),
+        ).toEqual(["vscode"]);
         expect(readAppxSubprocessCount(fixture)).toBe(1);
 
         resetAppxSubprocessMarkers(fixture);
@@ -409,6 +486,26 @@ describe("benchmark-windows-command-discovery", () => {
           env,
           cwd: fixture.cwdA,
           signal: new AbortController().signal,
+          lookupWindowsStorePackages: async (packages, options) => {
+            const [packageDef] = packages;
+            if (packages.length !== 1 || packageDef === undefined) {
+              throw new Error(
+                `Editor fixture expected exactly one Windows Store package; received ${packages.length}.`,
+              );
+            }
+            const installLocation = resolveWindowsStoreFixture(
+              discovery,
+              packages,
+              options.platform,
+              options.env,
+            );
+            const family = `${packageDef.packageName}_${packageDef.publisherId}`.toLowerCase();
+            return {
+              status: "success",
+              installLocationsByFamily: installLocation ? { [family]: installLocation } : {},
+              subprocessCount: 1,
+            };
+          },
         });
         expect(candidate).toMatchObject({ status: "success", availableEditors: ["vscode"] });
         expect(readAppxSubprocessCount(fixture)).toBe(1);
@@ -416,6 +513,7 @@ describe("benchmark-windows-command-discovery", () => {
         rmSync(root, { recursive: true, force: true });
       }
     },
+    WINDOWS_FIXTURE_TEST_TIMEOUT_MS,
   );
 
   it("summarizes recorded samples without including warmups", () => {

@@ -1,0 +1,13 @@
+schemaVersion: 1
+entries:
+  - id: web-chatview-geometry
+    path: apps/web/src/components/ChatView.browser.tsx
+    marker: "[quarantine:web-chatview-geometry]"
+    suite: browser-geometry
+    platform:
+      - linux
+      - windows
+    reason: Pixel and font geometry assertions vary across hosted browser runners.
+    owner: web/transcript
+    lastFlaked: "2026-07-01"
+    cases: 11

@@ -42,6 +42,7 @@
     "lint": "oxlint --report-unused-disable-directives",
     "test": "turbo run test",
     "test:ci": "turbo run test --continue=dependencies-successful -- --coverage --coverage.provider=v8 --coverage.reporter=text --coverage.reporter=lcov --coverage.reportOnFailure --testTimeout=90000 --hookTimeout=90000 --reporter=default --reporter=github-actions --reporter=junit --outputFile.junit=test-report.junit.xml",
+    "test:e2e": "bun run --cwd apps/desktop test:e2e",
     "brand:check": "node scripts/check-brand-identity.ts",
     "downstream:validate": "node scripts/validate-downstream-state.ts",
     "workflows:validate": "node scripts/verify-workflow-contracts.ts",
