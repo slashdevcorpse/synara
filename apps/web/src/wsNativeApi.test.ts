@@ -529,12 +529,9 @@ describe("wsNativeApi", () => {
     await api.server.refreshProviders();
     await api.orchestration.getShellSnapshot();
 
-    expect(requestMock).toHaveBeenNthCalledWith(
-      1,
-      WS_METHODS.serverRefreshProviders,
-      undefined,
-      { retryOnSessionInterruption: true },
-    );
+    expect(requestMock).toHaveBeenNthCalledWith(1, WS_METHODS.serverRefreshProviders, undefined, {
+      retryOnSessionInterruption: true,
+    });
     expect(requestMock).toHaveBeenNthCalledWith(
       2,
       ORCHESTRATION_WS_METHODS.getShellSnapshot,

@@ -873,9 +873,13 @@ describe("WsTransport", () => {
     const transport = new WsTransport("ws://localhost:3020");
     try {
       await expect(
-        transport.request(WS_METHODS.serverUpdateProvider, {}, {
-          retryOnSessionInterruption: true,
-        }),
+        transport.request(
+          WS_METHODS.serverUpdateProvider,
+          {},
+          {
+            retryOnSessionInterruption: true,
+          },
+        ),
       ).rejects.toThrow("WebSocket RPC session recovery is not permitted");
     } finally {
       await transport.dispose();

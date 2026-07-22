@@ -202,20 +202,19 @@ function collectQuarantineInventory(
       runVitestList(webRoot, vitestCli, environment, ["--staticParse", "--filesOnly"]),
       { repositoryRoot },
     );
-    const inventory: readonly QuarantineTestInventoryItem[] =
-      collectQuarantineInventoryBatches(
-        quarantineInventoryFileBatches(browserFiles),
-        (batch) =>
-          parseVitestQuarantineInventory(
-            runVitestList(
-              webRoot,
-              vitestCli,
-              environment,
-              batch.map((path) => resolve(repositoryRoot, path)),
-            ),
-            { repositoryRoot },
+    const inventory: readonly QuarantineTestInventoryItem[] = collectQuarantineInventoryBatches(
+      quarantineInventoryFileBatches(browserFiles),
+      (batch) =>
+        parseVitestQuarantineInventory(
+          runVitestList(
+            webRoot,
+            vitestCli,
+            environment,
+            batch.map((path) => resolve(repositoryRoot, path)),
           ),
-      );
+          { repositoryRoot },
+        ),
+    );
     return inventory;
   } finally {
     rmSync(temporaryDirectory, { recursive: true, force: true });

@@ -419,7 +419,9 @@ export function parseVitestBrowserFiles(
     }
     const absolutePath = resolve(value.file);
     if (!isWithinRepository(repositoryRoot, absolutePath)) {
-      throw new Error(`Vitest browser file inventory item ${index + 1} escapes the repository root.`);
+      throw new Error(
+        `Vitest browser file inventory item ${index + 1} escapes the repository root.`,
+      );
     }
     return relative(repositoryRoot, absolutePath).replaceAll("\\", "/");
   });

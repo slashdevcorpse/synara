@@ -82,10 +82,7 @@ export function isProjectReadFileCapacityError(error: unknown): boolean {
   while (typeof current === "object" && current !== null && !seen.has(current)) {
     seen.add(current);
     const candidate = current as { code?: unknown; retryable?: unknown; cause?: unknown };
-    if (
-      candidate.code === "RPC_EXPENSIVE_READ_CAPACITY_EXCEEDED" &&
-      candidate.retryable === true
-    ) {
+    if (candidate.code === "RPC_EXPENSIVE_READ_CAPACITY_EXCEEDED" && candidate.retryable === true) {
       return true;
     }
     current = candidate.cause;

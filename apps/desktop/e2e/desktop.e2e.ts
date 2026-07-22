@@ -78,10 +78,9 @@ async function sendPrompt(desktop: DesktopHarness, prompt: string): Promise<void
   const protocolBaseline = (await desktop.readProtocolLog()).length;
   await sendButton.click();
   await expect
-    .poll(
-      async () => requestMethods((await desktop.readProtocolLog()).slice(protocolBaseline)),
-      { timeout: 30_000 },
-    )
+    .poll(async () => requestMethods((await desktop.readProtocolLog()).slice(protocolBaseline)), {
+      timeout: 30_000,
+    })
     .toContain("turn/start");
 }
 

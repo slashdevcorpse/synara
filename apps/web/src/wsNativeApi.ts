@@ -682,23 +682,23 @@ export function createWsNativeApi(): NativeApi {
       listModels: (input) => transport.request(WS_METHODS.providerListModels, input),
       listAgents: (input) => transport.request(WS_METHODS.providerListAgents, input),
     },
-      orchestration: {
-        getSnapshot: () => transport.request(ORCHESTRATION_WS_METHODS.getSnapshot),
-        getShellSnapshot: () =>
-          transport.request(
-            ORCHESTRATION_WS_METHODS.getShellSnapshot,
-            undefined,
-            RETRY_ON_SESSION_INTERRUPTION,
-          ),
-        dispatchCommand: (command) => {
-          return transport.request(
-            ORCHESTRATION_WS_METHODS.dispatchCommand,
-            {
-              command: omitNullUserInputAnswers(command),
-            },
-            RETRY_ON_SESSION_INTERRUPTION,
-          );
-        },
+    orchestration: {
+      getSnapshot: () => transport.request(ORCHESTRATION_WS_METHODS.getSnapshot),
+      getShellSnapshot: () =>
+        transport.request(
+          ORCHESTRATION_WS_METHODS.getShellSnapshot,
+          undefined,
+          RETRY_ON_SESSION_INTERRUPTION,
+        ),
+      dispatchCommand: (command) => {
+        return transport.request(
+          ORCHESTRATION_WS_METHODS.dispatchCommand,
+          {
+            command: omitNullUserInputAnswers(command),
+          },
+          RETRY_ON_SESSION_INTERRUPTION,
+        );
+      },
       importThread: (input) => transport.request(ORCHESTRATION_WS_METHODS.importThread, input),
       repairState: () => transport.request(ORCHESTRATION_WS_METHODS.repairState),
       getTurnDiff: (input) => transport.request(ORCHESTRATION_WS_METHODS.getTurnDiff, input),

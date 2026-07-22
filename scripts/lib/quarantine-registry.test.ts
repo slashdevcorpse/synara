@@ -76,9 +76,9 @@ describe("quarantine registry", () => {
     });
     expect(environment.synara_generated_route_tree).toBeUndefined();
     expect(environment.Synara_Generated_Route_Tree).toBeUndefined();
-    expect(() =>
-      createQuarantineInventoryEnvironment({}, "relative/routeTree.gen.ts"),
-    ).toThrow("absolute generated route-tree path");
+    expect(() => createQuarantineInventoryEnvironment({}, "relative/routeTree.gen.ts")).toThrow(
+      "absolute generated route-tree path",
+    );
   });
 
   it("accepts a deterministic registry whose marker exists in the declared source", () => {
@@ -112,9 +112,7 @@ describe("quarantine registry", () => {
         ...inventory,
         { path: entry.path, fullName: `suite ${entry.marker} case 12` },
       ]),
-    ).toContain(
-      "Quarantine entry `web-geometry` declares 11 case(s), but Vitest collected 12.",
-    );
+    ).toContain("Quarantine entry `web-geometry` declares 11 case(s), but Vitest collected 12.");
     expect(validateQuarantineCaseInventory(registry, [])).toContain(
       "Quarantine entry `web-geometry` declares 11 case(s), but Vitest collected 0.",
     );
@@ -233,10 +231,7 @@ describe("quarantine registry", () => {
       { repositoryRoot: root },
     );
 
-    expect(files).toEqual([
-      "apps/web/src/example.browser.tsx",
-      "apps/web/src/second.browser.tsx",
-    ]);
+    expect(files).toEqual(["apps/web/src/example.browser.tsx", "apps/web/src/second.browser.tsx"]);
     expect(quarantineInventoryFileBatches(files, 1)).toEqual([
       ["apps/web/src/example.browser.tsx"],
       ["apps/web/src/second.browser.tsx"],
@@ -327,7 +322,7 @@ describe("quarantine registry", () => {
       resolve(root, "wrong-file.test.ts"),
       [
         'import { runtimeMarker } from "./runtime-marker";',
-        'it(`${runtimeMarker} composed at runtime`, () => {});',
+        "it(`${runtimeMarker} composed at runtime`, () => {});",
       ].join("\n"),
     );
     const vitestCli = resolve(__dirname, "../../node_modules/vitest/vitest.mjs");
