@@ -403,6 +403,7 @@ async function seedServerSettings(
             homePath: Path.join(runtimeDir, "fake-codex-home"),
             customModels: ["gpt-5.5", "gpt-5.3-codex"],
           },
+          commandCode: { enabled: false },
           claudeAgent: { enabled: false },
           cursor: { enabled: false },
           antigravity: { enabled: false },
