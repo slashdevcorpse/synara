@@ -35,6 +35,42 @@ const EXPECTED_DISABLED_PATHS = new Set([
   ".github/workflows/release.yml",
 ]);
 const CACHE_ACTION = "actions/cache@caa296126883cff596d87d8935842f9db880ef25";
+const UPLOAD_ARTIFACT_ACTION = "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a";
+const DOWNLOAD_ARTIFACT_ACTION =
+  "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c";
+const DESKTOP_E2E_BUILD_ARTIFACT_PATHS = [
+  "apps/desktop/dist-electron/**",
+  "apps/server/dist/**",
+  "apps/web/dist/**",
+  "packages/contracts/dist/**",
+  "packages/effect-acp/dist/**",
+] as const;
+const DESKTOP_E2E_DIAGNOSTIC_PATHS = [
+  "apps/desktop/test-results/**",
+  "apps/desktop/playwright-report/**",
+] as const;
+const DESKTOP_E2E_JOB_TIMEOUT_MINUTES = 30;
+const DESKTOP_E2E_INSTALL_COMMAND = "bun install --frozen-lockfile";
+const DESKTOP_E2E_CONFIG = {
+  linux: {
+    artifactName: "desktop-build-linux",
+    diagnosticName: "desktop-e2e-linux-diagnostics",
+    jobName: "e2e_linux",
+    producerJobName: "quality_linux",
+    runner: "ubuntu-24.04",
+    systemDependenciesCommand: "bun run --cwd apps/web playwright install-deps chromium",
+    testCommand: "xvfb-run -a bun run test:e2e",
+  },
+  windows: {
+    artifactName: "desktop-build-windows",
+    diagnosticName: "desktop-e2e-windows-diagnostics",
+    jobName: "e2e_windows",
+    producerJobName: "windows_x64",
+    runner: "windows-2022",
+    systemDependenciesCommand: null,
+    testCommand: "bun run test:e2e",
+  },
+} as const;
 const PLAYWRIGHT_BROWSER_CACHE_PATHS = {
   quality_linux: "~/.cache/ms-playwright",
   browser_windows: "~\\AppData\\Local\\ms-playwright",
@@ -133,12 +169,16 @@ const QUALITY_AGGREGATE_NEEDS = [
   "quality_windows",
   "unit",
   "browser_windows",
+  "e2e_linux",
+  "e2e_windows",
 ] as const;
 const QUALITY_AGGREGATE_COMMAND = `
 test "\${{ needs.quality_linux.result }}" = success
 test "\${{ needs.quality_windows.result }}" = success
 test "\${{ needs.unit.result }}" = success
 test "\${{ needs.browser_windows.result }}" = success
+test "\${{ needs.e2e_linux.result }}" = success
+test "\${{ needs.e2e_windows.result }}" = success
 `;
 
 function isRecord(value: unknown): value is UnknownRecord {
@@ -148,6 +188,14 @@ function isRecord(value: unknown): value is UnknownRecord {
 function stringArray(value: unknown): string[] | null {
   if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string")) return null;
   return value as string[];
+}
+
+function multilineStringEntries(value: unknown): string[] | null {
+  if (typeof value !== "string") return null;
+  return value
+    .split(/\r?\n/u)
+    .map((entry) => entry.trim())
+    .filter(Boolean);
 }
 
 function normalizeShellCommand(command: string): string {
@@ -518,13 +566,14 @@ function validateUnitMatrix(jobs: UnknownRecord, workflowPath: string, errors: s
 
   const nonLinuxTestSteps = unitSteps.filter((step) => step.command === FULL_UNIT_COMMAND);
   if (nonLinuxTestSteps.length !== 1) {
-    errors.push(`${workflowPath} unit must run exactly one non-Linux ${FULL_UNIT_COMMAND} command.`);
+    errors.push(
+      `${workflowPath} unit must run exactly one non-Linux ${FULL_UNIT_COMMAND} command.`,
+    );
   } else {
     const nonLinuxTestStep = nonLinuxTestSteps[0]!;
     if (
       nonLinuxTestStep.condition !== FULL_UNIT_CONDITION ||
-      (nonLinuxTestStep.continueOnError !== undefined &&
-        nonLinuxTestStep.continueOnError !== false)
+      (nonLinuxTestStep.continueOnError !== undefined && nonLinuxTestStep.continueOnError !== false)
     ) {
       errors.push(
         `${workflowPath} unit ${FULL_UNIT_COMMAND} command must run only when matrix.platform != 'linux' and fail closed.`,
@@ -538,9 +587,7 @@ function validateUnitMatrix(jobs: UnknownRecord, workflowPath: string, errors: s
     validateUnitTestConcurrency(workflowPath, nonLinuxTestStep, errors);
   }
 
-  const windowsSetupSteps = unitSteps.filter(
-    (step) => step.command === UNIT_WINDOWS_SETUP_COMMAND,
-  );
+  const windowsSetupSteps = unitSteps.filter((step) => step.command === UNIT_WINDOWS_SETUP_COMMAND);
   if (windowsSetupSteps.length !== 1) {
     errors.push(
       `${workflowPath} unit must run exactly one Windows launcher setup command: ${UNIT_WINDOWS_SETUP_COMMAND}.`,
@@ -634,9 +681,7 @@ function validateCodecovUploads(
   );
 
   for (const expected of expectedUploads) {
-    const matches = unitJob.steps.filter(
-      (step) => isRecord(step) && step.name === expected.name,
-    );
+    const matches = unitJob.steps.filter((step) => isRecord(step) && step.name === expected.name);
     if (matches.length !== 1) {
       errors.push(`${workflowPath} unit must define exactly one ${expected.name} step.`);
       continue;
@@ -1088,6 +1133,227 @@ function validateQuarantineCommands(
   }
 }
 
+function hasExactMultilineEntries(value: unknown, expected: readonly string[]): boolean {
+  const entries = multilineStringEntries(value);
+  return (
+    entries !== null &&
+    entries.length === expected.length &&
+    entries.every((entry, index) => entry === expected[index])
+  );
+}
+
+function exactDesktopE2eCommand(
+  workflowPath: string,
+  jobName: string,
+  steps: readonly WorkflowRunStep[],
+  command: string,
+  label: string,
+  errors: string[],
+): WorkflowRunStep | null {
+  const matches = steps.filter((step) => step.command === command);
+  if (matches.length !== 1) {
+    errors.push(`${workflowPath} ${jobName} must run exact ${label} command: ${command}.`);
+    return null;
+  }
+  const step = matches[0]!;
+  if (
+    step.condition !== undefined ||
+    (step.continueOnError !== undefined && step.continueOnError !== false)
+  ) {
+    errors.push(`${workflowPath} ${jobName} ${label} must be unconditional and fail closed.`);
+  }
+  return step;
+}
+
+function validateDesktopE2eProducer(
+  jobs: UnknownRecord,
+  workflowPath: string,
+  config: (typeof DESKTOP_E2E_CONFIG)[keyof typeof DESKTOP_E2E_CONFIG],
+  errors: string[],
+): void {
+  const job = jobs[config.producerJobName];
+  if (!isRecord(job) || !Array.isArray(job.steps)) {
+    errors.push(
+      `${workflowPath} must define the ${config.producerJobName} desktop E2E artifact producer.`,
+    );
+    return;
+  }
+  const uploads = actionSteps(job, UPLOAD_ARTIFACT_ACTION);
+  if (uploads.length !== 1) {
+    errors.push(
+      `${workflowPath} ${config.producerJobName} must upload exactly one pinned ${config.artifactName} artifact.`,
+    );
+    return;
+  }
+  const upload = uploads[0]!;
+  if (
+    upload.if !== undefined ||
+    (upload["continue-on-error"] !== undefined && upload["continue-on-error"] !== false)
+  ) {
+    errors.push(
+      `${workflowPath} ${config.producerJobName} desktop E2E artifact upload must be unconditional and fail closed.`,
+    );
+  }
+  if (
+    !isRecord(upload.with) ||
+    upload.with.name !== config.artifactName ||
+    !hasExactMultilineEntries(upload.with.path, DESKTOP_E2E_BUILD_ARTIFACT_PATHS) ||
+    upload.with["if-no-files-found"] !== "error" ||
+    upload.with["retention-days"] !== 1
+  ) {
+    errors.push(
+      `${workflowPath} ${config.producerJobName} must upload exact ${config.artifactName} paths with one-day fail-closed retention.`,
+    );
+  }
+
+  const runSteps = jobRunSteps(jobs, config.producerJobName, workflowPath, errors) ?? [];
+  const buildSteps = runSteps.filter((step) => step.command === CI_DESKTOP_BUILD_COMMAND);
+  const uploadIndex = job.steps.indexOf(upload);
+  if (buildSteps.length !== 1 || buildSteps[0]!.index >= uploadIndex) {
+    errors.push(
+      `${workflowPath} ${config.producerJobName} must upload ${config.artifactName} after its sole desktop build.`,
+    );
+  }
+}
+
+function validateDesktopE2eConsumer(
+  jobs: UnknownRecord,
+  workflowPath: string,
+  config: (typeof DESKTOP_E2E_CONFIG)[keyof typeof DESKTOP_E2E_CONFIG],
+  errors: string[],
+): void {
+  const job = jobs[config.jobName];
+  if (!isRecord(job) || !Array.isArray(job.steps)) {
+    errors.push(`${workflowPath} must define the ${config.jobName} packaged desktop E2E job.`);
+    return;
+  }
+  const needs = typeof job.needs === "string" ? [job.needs] : stringArray(job.needs);
+  if (!needs || needs.length !== 1 || needs[0] !== config.producerJobName) {
+    errors.push(
+      `${workflowPath} ${config.jobName} must need only its same-platform producer ${config.producerJobName}.`,
+    );
+  }
+  if (
+    job.name !== config.jobName ||
+    job["runs-on"] !== config.runner ||
+    job["timeout-minutes"] !== DESKTOP_E2E_JOB_TIMEOUT_MINUTES ||
+    job.if !== undefined ||
+    (job["continue-on-error"] !== undefined && job["continue-on-error"] !== false)
+  ) {
+    errors.push(
+      `${workflowPath} ${config.jobName} must be a named, bounded, fail-closed ${config.runner} job.`,
+    );
+  }
+
+  const runSteps = jobRunSteps(jobs, config.jobName, workflowPath, errors) ?? [];
+  const install = exactDesktopE2eCommand(
+    workflowPath,
+    config.jobName,
+    runSteps,
+    DESKTOP_E2E_INSTALL_COMMAND,
+    "dependency install",
+    errors,
+  );
+  const systemDependencies = config.systemDependenciesCommand
+    ? exactDesktopE2eCommand(
+        workflowPath,
+        config.jobName,
+        runSteps,
+        config.systemDependenciesCommand,
+        "system dependency install",
+        errors,
+      )
+    : null;
+  const test = exactDesktopE2eCommand(
+    workflowPath,
+    config.jobName,
+    runSteps,
+    config.testCommand,
+    "packaged desktop E2E",
+    errors,
+  );
+  if (
+    runSteps.some((step) =>
+      executableShellLines(step.rawCommand).some((line) =>
+        /(?:^|[\s"'&|;()<>])(?:bun\s+run\s+build:desktop|turbo\s+(?:run\s+)?build)(?=$|[\s"'&|;()<>])/u.test(
+          line,
+        ),
+      ),
+    )
+  ) {
+    errors.push(
+      `${workflowPath} ${config.jobName} must consume prebuilt artifacts without builds.`,
+    );
+  }
+
+  const downloads = actionSteps(job, DOWNLOAD_ARTIFACT_ACTION);
+  if (downloads.length !== 1) {
+    errors.push(
+      `${workflowPath} ${config.jobName} must download exactly one pinned ${config.artifactName} artifact.`,
+    );
+  } else {
+    const download = downloads[0]!;
+    const downloadIndex = job.steps.indexOf(download);
+    if (
+      download.if !== undefined ||
+      (download["continue-on-error"] !== undefined && download["continue-on-error"] !== false) ||
+      !isRecord(download.with) ||
+      download.with.name !== config.artifactName ||
+      download.with.path !== "."
+    ) {
+      errors.push(
+        `${workflowPath} ${config.jobName} must download ${config.artifactName} at the repository root and fail closed.`,
+      );
+    }
+    if (
+      (install && install.index >= downloadIndex) ||
+      (test && downloadIndex >= test.index) ||
+      (systemDependencies && test && systemDependencies.index >= test.index)
+    ) {
+      errors.push(
+        `${workflowPath} ${config.jobName} must install, download, and execute its prebuilt E2E artifact in order.`,
+      );
+    }
+  }
+
+  const diagnostics = actionSteps(job, UPLOAD_ARTIFACT_ACTION);
+  if (diagnostics.length !== 1) {
+    errors.push(
+      `${workflowPath} ${config.jobName} must define exactly one pinned failure diagnostics upload.`,
+    );
+  } else {
+    const diagnostic = diagnostics[0]!;
+    if (
+      diagnostic.if !== "failure()" ||
+      (diagnostic["continue-on-error"] !== undefined &&
+        diagnostic["continue-on-error"] !== false) ||
+      !isRecord(diagnostic.with) ||
+      diagnostic.with.name !== config.diagnosticName ||
+      !hasExactMultilineEntries(diagnostic.with.path, DESKTOP_E2E_DIAGNOSTIC_PATHS) ||
+      diagnostic.with["if-no-files-found"] !== "ignore" ||
+      diagnostic.with["retention-days"] !== 7
+    ) {
+      errors.push(
+        `${workflowPath} ${config.jobName} diagnostics must upload exact failure-only paths with seven-day retention.`,
+      );
+    }
+    if (test && job.steps.indexOf(diagnostic) <= test.index) {
+      errors.push(`${workflowPath} ${config.jobName} diagnostics must run after the E2E command.`);
+    }
+  }
+}
+
+function validateDesktopE2ePipeline(
+  jobs: UnknownRecord,
+  workflowPath: string,
+  errors: string[],
+): void {
+  for (const config of Object.values(DESKTOP_E2E_CONFIG)) {
+    validateDesktopE2eProducer(jobs, workflowPath, config, errors);
+    validateDesktopE2eConsumer(jobs, workflowPath, config, errors);
+  }
+}
+
 function validateRequiredQualityAggregate(
   jobs: UnknownRecord,
   workflowPath: string,
@@ -1132,11 +1398,7 @@ function validateRequiredQualityAggregate(
   }
 }
 
-function validateQualityWindows(
-  jobs: UnknownRecord,
-  workflowPath: string,
-  errors: string[],
-): void {
+function validateQualityWindows(jobs: UnknownRecord, workflowPath: string, errors: string[]): void {
   const job = jobs.quality_windows;
   if (!isRecord(job) || !Array.isArray(job.steps)) {
     errors.push(`${workflowPath} must define the required quality_windows job with steps.`);
@@ -1200,13 +1462,9 @@ function validateCiArchitecture(workflow: UnknownRecord, errors: string[]): void
   }
   validateUnitMatrix(workflow.jobs, workflowPath, errors);
   validateQualityWindows(workflow.jobs, workflowPath, errors);
+  validateDesktopE2ePipeline(workflow.jobs, workflowPath, errors);
   validateRequiredQualityAggregate(workflow.jobs, workflowPath, errors);
-  const qualityLinuxSteps = jobRunSteps(
-    workflow.jobs,
-    "quality_linux",
-    workflowPath,
-    errors,
-  );
+  const qualityLinuxSteps = jobRunSteps(workflow.jobs, "quality_linux", workflowPath, errors);
   const windowsSteps = jobRunSteps(workflow.jobs, "windows_x64", workflowPath, errors);
   const macosSteps = jobRunSteps(workflow.jobs, "macos_arm64", workflowPath, errors);
   const windowsJob = workflow.jobs.windows_x64;
@@ -1252,22 +1510,14 @@ function validateCiArchitecture(workflow: UnknownRecord, errors: string[]): void
         browserInstall &&
         quarantineValidation.index >= browserInstall.index
       ) {
-        errors.push(
-          `${workflowPath} quality_linux must validate quarantine before browser setup.`,
-        );
+        errors.push(`${workflowPath} quality_linux must validate quarantine before browser setup.`);
       }
       if (browserInstall && stableBrowser && browserInstall.index >= stableBrowser.index) {
         errors.push(
           `${workflowPath} quality_linux must install Playwright before stable browser tests.`,
         );
       }
-      validateQuarantineCommands(
-        workflowPath,
-        "quality_linux",
-        qualityLinuxSteps,
-        "linux",
-        errors,
-      );
+      validateQuarantineCommands(workflowPath, "quality_linux", qualityLinuxSteps, "linux", errors);
     }
     validatePlaywrightBrowserCache(workflowPath, "quality_linux", qualityLinuxJob, errors);
   }
