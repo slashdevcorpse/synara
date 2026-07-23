@@ -13,6 +13,7 @@ import launcherConfig from "../../native/windows-job-launcher/launcher.config.js
 import {
   prepareResolvedWindowsSafeProcess,
   prepareWindowsSafeProcess,
+  type WindowsCommandDiscoveryOutcome,
   type WindowsSafeProcessCommand,
   type WindowsSafeProcessInput,
 } from "@synara/shared/windowsProcess";
@@ -34,6 +35,20 @@ export interface WindowsProviderProcessInput extends WindowsSafeProcessInput {
   readonly launcherPath?: string | undefined;
   readonly fileExists?: ((path: string) => boolean) | undefined;
   readonly controlDirectory?: string | undefined;
+}
+
+export class WindowsProviderTargetNotResolvedError extends Error {
+  readonly command: string;
+  readonly discoveryOutcome: WindowsCommandDiscoveryOutcome | undefined;
+
+  constructor(command: string, discoveryOutcome?: WindowsCommandDiscoveryOutcome) {
+    super(
+      `Windows provider target '${command}' was not resolved to an absolute executable path; containment refuses PATH/CWD fallback.`,
+    );
+    this.name = "WindowsProviderTargetNotResolvedError";
+    this.command = command;
+    this.discoveryOutcome = discoveryOutcome;
+  }
 }
 
 export function isWindowsJobPreparedCommand(
@@ -156,9 +171,7 @@ function resolveAbsolutePreparedCommand(command: string, cwd: string | undefined
   if (/[\\/]/.test(command)) {
     return Path.win32.resolve(cwd ?? process.cwd(), command);
   }
-  throw new Error(
-    `Windows provider target '${command}' was not resolved to an absolute executable path; containment refuses PATH/CWD fallback.`,
-  );
+  throw new WindowsProviderTargetNotResolvedError(command);
 }
 
 export function containPreparedWindowsProviderProcess(
@@ -204,10 +217,22 @@ export function prepareWindowsProviderProcess(
   args: ReadonlyArray<string>,
   input: WindowsProviderProcessInput = {},
 ): WindowsSafeProcessCommand {
-  return containPreparedWindowsProviderProcess(
-    prepareWindowsSafeProcess(command, args, input),
-    input,
-  );
+  let discoveryOutcome: WindowsCommandDiscoveryOutcome | undefined;
+  const prepared = prepareWindowsSafeProcess(command, args, {
+    ...input,
+    onCommandDiscovery: (observation) => {
+      discoveryOutcome = observation.outcome;
+      input.onCommandDiscovery?.(observation);
+    },
+  });
+  try {
+    return containPreparedWindowsProviderProcess(prepared, input);
+  } catch (cause) {
+    if (cause instanceof WindowsProviderTargetNotResolvedError && discoveryOutcome !== undefined) {
+      throw new WindowsProviderTargetNotResolvedError(cause.command, discoveryOutcome);
+    }
+    throw cause;
+  }
 }
 
 export function prepareResolvedWindowsProviderProcess(

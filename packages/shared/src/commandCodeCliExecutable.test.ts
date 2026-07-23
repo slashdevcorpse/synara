@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { resolveCommandCodeCliExecutable } from "./commandCodeCliExecutable";
+import {
+  resolveCommandCodeCliExecutable,
+  resolveCommandCodeCliExecutableWithDiscovery,
+} from "./commandCodeCliExecutable";
 
 function regularFiles(...paths: string[]) {
   const files = new Set(paths.map((path) => path.toLowerCase()));
@@ -138,5 +141,40 @@ describe("resolveCommandCodeCliExecutable", () => {
         statSync: regularFiles(shim),
       }),
     ).toBe(shim);
+  });
+
+  it("preserves definitive not-found discovery across every official alias", () => {
+    expect(
+      resolveCommandCodeCliExecutableWithDiscovery("commandcode", {
+        platform: "win32",
+        cwd: "C:\\repo",
+        env: { SystemRoot: "C:\\Windows" },
+        spawnSync: vi.fn(() => ({ stdout: "", status: 1 })),
+        statSync: regularFiles(),
+      }),
+    ).toEqual({ executable: "commandcode", discoveryOutcome: "not_found" });
+  });
+
+  it("preserves a transient failure from any official alias", () => {
+    const spawnSync = vi.fn((_command: string, args: ReadonlyArray<string>) =>
+      args[0] === "commandcode"
+        ? {
+            error: Object.assign(new Error("where.exe timed out"), { code: "ETIMEDOUT" }),
+            stdout: "",
+            status: null,
+          }
+        : { stdout: "", status: 1 },
+    );
+
+    expect(
+      resolveCommandCodeCliExecutableWithDiscovery("commandcode", {
+        platform: "win32",
+        cwd: "C:\\repo",
+        env: { SystemRoot: "C:\\Windows" },
+        spawnSync,
+        statSync: regularFiles(),
+      }),
+    ).toEqual({ executable: "commandcode", discoveryOutcome: "transient_failure" });
+    expect(spawnSync).toHaveBeenCalledTimes(4);
   });
 });

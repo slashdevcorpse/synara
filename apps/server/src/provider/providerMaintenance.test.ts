@@ -4,6 +4,7 @@ import {
   type WindowsSafeProcessInput,
 } from "@synara/shared/windowsProcess";
 import { describe, it, assert } from "@effect/vitest";
+import { realpathSync } from "node:fs";
 import * as NodeFs from "node:fs/promises";
 import * as NodePath from "node:path";
 import { Effect, FileSystem, Fiber } from "effect";
@@ -125,6 +126,43 @@ function windowsNpmCmdShim(packageName: string, binTarget: string): string {
   const windowsPackageName = packageName.replaceAll("/", "\\");
   const windowsBinTarget = binTarget.replaceAll("/", "\\");
   return `@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\n\r\nIF EXIST "%dp0%\\node.exe" (\r\n  SET "_prog=%dp0%\\node.exe"\r\n) ELSE (\r\n  SET "_prog=node"\r\n  SET PATHEXT=%PATHEXT:;.JS;=;%\r\n)\r\n\r\nendLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%" "%dp0%\\node_modules\\${windowsPackageName}\\${windowsBinTarget}" %*\r\n`;
+}
+
+function windowsNpmManagerCommand(
+  managerDirectory: string,
+  npmCliRoot = managerDirectory,
+) {
+  return {
+    executablePath: NodePath.join(managerDirectory, "node.exe"),
+    argsPrefix: [NodePath.join(npmCliRoot, "node_modules", "npm", "bin", "npm-cli.js")],
+  } as const;
+}
+
+function writeWindowsNpmManagerRuntime(
+  fileSystem: FileSystem.FileSystem,
+  managerDirectory: string,
+  npmCliRoot = managerDirectory,
+) {
+  const managerPath = NodePath.join(managerDirectory, "npm.cmd");
+  const managerCommand = windowsNpmManagerCommand(managerDirectory, npmCliRoot);
+  return Effect.gen(function* () {
+    yield* fileSystem.makeDirectory(NodePath.dirname(managerCommand.argsPrefix[0]), {
+      recursive: true,
+    });
+    yield* fileSystem.writeFileString(managerPath, "@echo off\r\n");
+    yield* fileSystem.writeFileString(managerCommand.executablePath, "node fixture\n");
+    yield* fileSystem.writeFileString(
+      managerCommand.argsPrefix[0],
+      "console.log('npm fixture');\n",
+    );
+    return {
+      managerPath,
+      managerCommand: {
+        executablePath: realpathSync.native(managerCommand.executablePath),
+        argsPrefix: [realpathSync.native(managerCommand.argsPrefix[0])],
+      },
+    };
+  });
 }
 
 function resolveWindowsCommandFromCandidates(
@@ -271,6 +309,10 @@ describe("providerMaintenance", () => {
         canonicalInstallRoot: "/Users/test/.npm-global",
         managerExecutablePath: "/usr/local/bin/npm",
         canonicalManagerExecutablePath: "/usr/local/lib/node_modules/npm/bin/npm-cli.js",
+        managerCommand: {
+          executablePath: "/usr/local/bin/npm",
+          argsPrefix: [],
+        },
         channel: {
           kind: "package-dist-tag",
           tag: "latest",
@@ -451,6 +493,7 @@ describe("providerMaintenance", () => {
       canonicalInstallRoot: "C:\\Users\\Test User\\AppData\\Roaming\\npm",
       managerExecutablePath: "C:\\Program Files\\nodejs\\npm.cmd",
       realManagerExecutablePath: "C:\\Program Files\\nodejs\\npm.cmd",
+      managerCommand: windowsNpmManagerCommand("C:\\Program Files\\nodejs"),
       packageChannelEvidence: latestChannel(
         "0.130.0",
         "C:\\Users\\Test User\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\package.json",
@@ -459,8 +502,31 @@ describe("providerMaintenance", () => {
 
     assert.strictEqual(
       capabilities.update?.command,
-      '"C:\\Program Files\\nodejs\\npm.cmd" install -g --prefix "C:\\Users\\Test User\\AppData\\Roaming\\npm" @openai/codex@latest',
+      '"C:\\Program Files\\nodejs\\node.exe" "C:\\Program Files\\nodejs\\node_modules\\npm\\bin\\npm-cli.js" install -g --prefix "C:\\Users\\Test User\\AppData\\Roaming\\npm" @openai/codex@latest',
     );
+  });
+
+  it("rejects Windows npm manager provenance other than exact npm.cmd", () => {
+    const managerDirectory = "C:\\Program Files\\nodejs";
+    for (const extension of [".exe", ".bat", ".com"] as const) {
+      const managerPath = `${managerDirectory}\\npm${extension}`;
+      const capabilities = resolvePackageManagedProviderMaintenance(CODEX_DEFINITION, {
+        platform: "win32",
+        binaryPath: "C:\\Users\\Test\\AppData\\Roaming\\npm\\codex.cmd",
+        realCommandPath:
+          "C:\\Users\\Test\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\bin\\codex.js",
+        canonicalInstallRoot: "C:\\Users\\Test\\AppData\\Roaming\\npm",
+        managerExecutablePath: managerPath,
+        realManagerExecutablePath: managerPath,
+        managerCommand: windowsNpmManagerCommand(managerDirectory),
+        packageChannelEvidence: latestChannel(
+          "0.130.0",
+          "C:\\Users\\Test\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\package.json",
+        ),
+      });
+
+      assert.strictEqual(capabilities.update, null, `${extension} must not prove npm ownership`);
+    }
   });
 
   win("verifies manifest identity, bin mapping, and linkage for a Windows npm shim", async () => {
@@ -473,7 +539,6 @@ describe("providerMaintenance", () => {
         const npmPrefix = NodePath.join(tempDirectory, "npm");
         const windowsEnv = { PATH: npmPrefix, PATHEXT: ".COM;.EXE;.BAT;.CMD" };
         const shimPath = NodePath.join(npmPrefix, "codex.cmd");
-        const npmManagerPath = NodePath.join(npmPrefix, "npm.cmd");
         const packageManifestPath = NodePath.join(
           npmPrefix,
           "node_modules",
@@ -505,7 +570,7 @@ describe("providerMaintenance", () => {
         yield* fileSystem.writeFileString(packageManifestPath, codexPackageManifest());
         yield* fileSystem.makeDirectory(NodePath.dirname(packageBinPath), { recursive: true });
         yield* fileSystem.writeFileString(packageBinPath, "console.log('codex fixture');\n");
-        yield* fileSystem.writeFileString(npmManagerPath, "@echo off\r\n");
+        yield* writeWindowsNpmManagerRuntime(fileSystem, npmPrefix);
 
         const explicitCapabilities = yield* resolveProviderMaintenanceCapabilitiesEffect(
           CODEX_DEFINITION,
@@ -551,7 +616,6 @@ describe("providerMaintenance", () => {
         return {
           customChannelCapabilities,
           explicitCapabilities,
-          npmManagerPath,
           npmPrefix,
           packageBinPath,
           pathCapabilities,
@@ -575,14 +639,28 @@ describe("providerMaintenance", () => {
       const renderedManager = /\s/u.test(capabilities.update.executable)
         ? `"${capabilities.update.executable}"`
         : capabilities.update.executable;
+      const renderedNpmCli = /\s/u.test(capabilities.update.args[0] ?? "")
+        ? `"${capabilities.update.args[0]}"`
+        : capabilities.update.args[0];
       assert.strictEqual(
         capabilities.update.command,
-        `${renderedManager} install -g --prefix ${renderedPrefix} @openai/codex@latest`,
+        `${renderedManager} ${renderedNpmCli} install -g --prefix ${renderedPrefix} @openai/codex@latest`,
       );
       assert.strictEqual(
         NodePath.win32.extname(capabilities.update.executable).toLowerCase(),
-        ".cmd",
+        ".exe",
       );
+      assert.strictEqual(
+        capabilities.update.executable,
+        capabilities.update.target.managerCommand.executablePath,
+      );
+      assert.strictEqual(
+        capabilities.update.args[0],
+        capabilities.update.target.managerCommand.argsPrefix[0],
+      );
+      assert.ok(!capabilities.update.command.toLowerCase().includes("cmd.exe"));
+      assert.ok(!capabilities.update.command.toLowerCase().includes("npm.cmd"));
+      assert.ok(!capabilities.update.command.toLowerCase().includes("npm-prefix.js"));
       assert.strictEqual(
         capabilities.update.lockKey,
         `npm-global:${normalizeCommandPath(result.npmPrefix, "win32")}`,
@@ -592,6 +670,16 @@ describe("providerMaintenance", () => {
         normalizeCommandPath(capabilities.update.pathPrepend, "win32"),
         normalizeCommandPath(NodePath.win32.dirname(capabilities.update.executable), "win32"),
       );
+      assert.strictEqual(
+        NodePath.win32.basename(capabilities.update.target.managerExecutablePath).toLowerCase(),
+        "npm.cmd",
+      );
+      assert.strictEqual(
+        NodePath.win32
+          .basename(capabilities.update.target.canonicalManagerExecutablePath)
+          .toLowerCase(),
+        "npm.cmd",
+      );
       assert.strictEqual(capabilities.update.target.visibleCommandPath, result.shimPath);
       assert.strictEqual(
         normalizeCommandPath(capabilities.update.target.canonicalCommandPath, "win32"),
@@ -599,6 +687,116 @@ describe("providerMaintenance", () => {
       );
       assert.strictEqual(capabilities.update.target.channel.kind, "package-dist-tag");
     }
+  });
+
+  win("uses a verified direct Node npm command and never falls back to npm.cmd", async () => {
+    const result = await Effect.runPromise(
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const tempDirectory = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "synara-provider-maintenance-direct-npm-",
+        });
+        const npmPrefix = NodePath.join(tempDirectory, "npm");
+        const managerDirectory = NodePath.join(tempDirectory, "nodejs");
+        const shimPath = NodePath.join(npmPrefix, "codex.cmd");
+        const packageManifestPath = NodePath.join(
+          npmPrefix,
+          "node_modules",
+          "@openai",
+          "codex",
+          "package.json",
+        );
+        const packageBinPath = NodePath.join(
+          NodePath.dirname(packageManifestPath),
+          ...CODEX_PACKAGE_BIN_TARGET.split("/"),
+        );
+        yield* fileSystem.makeDirectory(NodePath.dirname(packageBinPath), { recursive: true });
+        yield* fileSystem.writeFileString(packageManifestPath, codexPackageManifest());
+        yield* fileSystem.writeFileString(packageBinPath, "console.log('codex fixture');\n");
+        yield* fileSystem.writeFileString(
+          shimPath,
+          windowsNpmCmdShim("@openai/codex", CODEX_PACKAGE_BIN_TARGET),
+        );
+        const { managerPath, managerCommand: bundledManagerCommand } =
+          yield* writeWindowsNpmManagerRuntime(fileSystem, managerDirectory);
+        const prefixManagerCommand = windowsNpmManagerCommand(managerDirectory, npmPrefix);
+        yield* fileSystem.makeDirectory(NodePath.dirname(prefixManagerCommand.argsPrefix[0]), {
+          recursive: true,
+        });
+        yield* fileSystem.writeFileString(
+          prefixManagerCommand.argsPrefix[0],
+          "console.log('prefix npm fixture');\n",
+        );
+        const resolve = (managerExecutablePath = managerPath) =>
+          resolveProviderMaintenanceCapabilitiesEffect(CODEX_DEFINITION, {
+            binaryPath: shimPath,
+            env: { PATH: npmPrefix, PATHEXT: ".CMD;.EXE" },
+            managerExecutablePath,
+            platform: "win32",
+          });
+
+        const prefixPreferred = yield* resolve();
+        const prefixExecutableMatches =
+          prefixPreferred.update !== null &&
+          realpathSync.native(prefixPreferred.update.executable) ===
+            realpathSync.native(prefixManagerCommand.executablePath);
+        const prefixNpmCliMatches =
+          prefixPreferred.update !== null &&
+          realpathSync.native(prefixPreferred.update.args[0] ?? "") ===
+            realpathSync.native(prefixManagerCommand.argsPrefix[0]);
+        yield* fileSystem.remove(prefixManagerCommand.argsPrefix[0]);
+        const bundledFallback = yield* resolve();
+        const bundledNpmCliMatches =
+          bundledFallback.update !== null &&
+          realpathSync.native(bundledFallback.update.args[0] ?? "") ===
+            realpathSync.native(bundledManagerCommand.argsPrefix[0]);
+        yield* fileSystem.remove(bundledManagerCommand.argsPrefix[0]);
+        const missingNpmCli = yield* resolve();
+        yield* fileSystem.writeFileString(
+          bundledManagerCommand.argsPrefix[0],
+          "console.log('npm fixture');\n",
+        );
+        yield* fileSystem.remove(bundledManagerCommand.executablePath);
+        const missingNode = yield* resolve();
+        yield* fileSystem.writeFileString(bundledManagerCommand.executablePath, "node fixture\n");
+        yield* fileSystem.remove(managerPath);
+        const npmExePath = NodePath.join(managerDirectory, "npm.exe");
+        yield* fileSystem.writeFileString(npmExePath, "unverified npm executable\n");
+        const nonCmdManager = yield* resolve(npmExePath);
+        return {
+          bundledFallback,
+          bundledNpmCliMatches,
+          managerPath,
+          missingNode,
+          missingNpmCli,
+          nonCmdManager,
+          npmPrefix,
+          prefixExecutableMatches,
+          prefixNpmCliMatches,
+          prefixPreferred,
+        };
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+    );
+
+    assert.ok(result.prefixPreferred.update);
+    assert.strictEqual(result.prefixExecutableMatches, true);
+    assert.strictEqual(result.prefixNpmCliMatches, true);
+    assert.deepStrictEqual(result.prefixPreferred.update.args.slice(1), [
+      "install",
+      "-g",
+      "--prefix",
+      result.npmPrefix,
+      "@openai/codex@latest",
+    ]);
+    assert.strictEqual(
+      result.prefixPreferred.update.target.managerExecutablePath,
+      result.managerPath,
+    );
+    assert.ok(result.bundledFallback.update);
+    assert.strictEqual(result.bundledNpmCliMatches, true);
+    assert.strictEqual(result.missingNpmCli.update, null);
+    assert.strictEqual(result.missingNode.update, null);
+    assert.strictEqual(result.nonCmdManager.update, null);
   });
 
   win(
@@ -667,8 +865,7 @@ describe("providerMaintenance", () => {
           const longManagerDirectory = NodePath.join(tempDirectory, "Program Files", "nodejs");
           const aliasManagerDirectory = NodePath.join(tempDirectory, "NODEJS~1");
           const longManagerPath = NodePath.join(longManagerDirectory, "npm.cmd");
-          yield* fileSystem.makeDirectory(longManagerDirectory, { recursive: true });
-          yield* fileSystem.writeFileString(longManagerPath, "@echo off\r\n");
+          yield* writeWindowsNpmManagerRuntime(fileSystem, longManagerDirectory);
           yield* Effect.promise(() =>
             NodeFs.symlink(longManagerDirectory, aliasManagerDirectory, "junction"),
           );
@@ -684,9 +881,10 @@ describe("providerMaintenance", () => {
       assert.strictEqual(result.escaped.update, null);
       assert.ok(result.aliased.update);
       assert.strictEqual(
-        normalizeCommandPath(result.aliased.update.executable, "win32"),
-        normalizeCommandPath(result.longManagerPath, "win32"),
+        result.aliased.update.executable,
+        result.aliased.update.target.managerCommand.executablePath,
       );
+      assert.strictEqual(result.aliased.update.target.managerExecutablePath, result.longManagerPath);
     },
   );
 
@@ -784,10 +982,8 @@ describe("providerMaintenance", () => {
           prefix: "synara-provider-maintenance-windows-aliases-",
         });
         const npmPrefix = NodePath.join(tempDirectory, "npm");
-        const npmManagerPath = NodePath.join(npmPrefix, "npm.cmd");
         const npmManagerExePath = NodePath.join(npmPrefix, "npm.exe");
-        yield* fileSystem.makeDirectory(npmPrefix, { recursive: true });
-        yield* fileSystem.writeFileString(npmManagerPath, "@echo off\r\n");
+        yield* writeWindowsNpmManagerRuntime(fileSystem, npmPrefix);
         yield* fileSystem.writeFileString(npmManagerExePath, "unverified colliding executable\n");
 
         const commandCodeManifestPath = NodePath.join(
@@ -900,7 +1096,6 @@ describe("providerMaintenance", () => {
           commandCodeShimPath,
           droid,
           droidShimPath,
-          npmManagerPath,
           selectedCmdPathExt,
           unverifiedSelectedDroid,
         };
@@ -910,7 +1105,11 @@ describe("providerMaintenance", () => {
     assert.ok(result.commandCode.update);
     assert.strictEqual(
       NodePath.win32.extname(result.commandCode.update.executable).toLowerCase(),
-      ".cmd",
+      ".exe",
+    );
+    assert.strictEqual(
+      result.commandCode.update.executable,
+      result.commandCode.update.target.managerCommand.executablePath,
     );
     assert.strictEqual(
       normalizeCommandPath(result.commandCode.update.target.visibleCommandPath, "win32"),
@@ -919,7 +1118,7 @@ describe("providerMaintenance", () => {
     assert.ok(result.droid.update);
     assert.strictEqual(
       NodePath.win32.extname(result.droid.update.executable).toLowerCase(),
-      ".cmd",
+      ".exe",
     );
     assert.strictEqual(
       normalizeCommandPath(result.droid.update.target.visibleCommandPath, "win32"),

@@ -978,6 +978,7 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
           flavor: options.flavor,
           disableUpdates: options.disableUpdates,
           exactProvenanceRequested,
+          ...(options.version ? { version: options.version } : {}),
           ...(generatedRouteTreePath ? { generatedRouteTreePath } : {}),
         }),
         ...commandOutputOptions(options.verbose),

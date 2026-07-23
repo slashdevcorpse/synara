@@ -41,6 +41,13 @@ export type ProviderMaintenanceChannelIdentity =
       readonly provider: ProviderKind;
     };
 
+export interface ProviderMaintenanceManagerCommandIdentity {
+  /** Canonical executable launched for the package-manager operation. */
+  readonly executablePath: string;
+  /** Canonical arguments required before the package-manager operation arguments. */
+  readonly argsPrefix: ReadonlyArray<string>;
+}
+
 export interface ProviderMaintenanceTargetIdentity {
   readonly platform: NodeJS.Platform;
   readonly installSource: ActionableProviderInstallSource;
@@ -49,6 +56,7 @@ export interface ProviderMaintenanceTargetIdentity {
   readonly canonicalInstallRoot: string;
   readonly managerExecutablePath: string;
   readonly canonicalManagerExecutablePath: string;
+  readonly managerCommand: ProviderMaintenanceManagerCommandIdentity;
   readonly channel: ProviderMaintenanceChannelIdentity;
 }
 
@@ -93,6 +101,8 @@ export interface ProviderMaintenanceCapabilityResolutionOptions {
   /** Canonical manager/root evidence for the pure resolver and focused tests. */
   readonly managerExecutablePath?: string | null;
   readonly realManagerExecutablePath?: string | null;
+  /** Verified direct invocation used to avoid Windows package-manager batch wrappers. */
+  readonly managerCommand?: ProviderMaintenanceManagerCommandIdentity | null;
   readonly canonicalInstallRoot?: string | null;
   readonly packageChannelEvidence?: ProviderPackageChannelEvidence | null;
 }
@@ -375,6 +385,17 @@ export function providerMaintenanceTargetFingerprint(
       target.canonicalManagerExecutablePath,
       target.platform,
     ),
+    managerCommand: {
+      executablePath: normalizeCommandPath(
+        target.managerCommand.executablePath,
+        target.platform,
+      ),
+      argsPrefix: target.managerCommand.argsPrefix.map((arg) =>
+        isAbsoluteCommandPath(arg, target.platform)
+          ? normalizeCommandPath(arg, target.platform)
+          : arg,
+      ),
+    },
     channel,
   });
 }
@@ -411,6 +432,14 @@ export function providerMaintenanceTargetsShareUpdateDestination(
       normalizeCommandPath(right.canonicalInstallRoot, right.platform) ||
     normalizeCommandPath(left.managerExecutablePath, left.platform) !==
       normalizeCommandPath(right.managerExecutablePath, right.platform) ||
+    normalizeCommandPath(left.managerCommand.executablePath, left.platform) !==
+      normalizeCommandPath(right.managerCommand.executablePath, right.platform) ||
+    left.managerCommand.argsPrefix.length !== right.managerCommand.argsPrefix.length ||
+    left.managerCommand.argsPrefix.some(
+      (arg, index) =>
+        normalizeCommandPath(arg, left.platform) !==
+        normalizeCommandPath(right.managerCommand.argsPrefix[index] ?? "", right.platform),
+    ) ||
     providerMaintenanceChannelDestinationFingerprint(left.channel, left.platform) !==
       providerMaintenanceChannelDestinationFingerprint(right.channel, right.platform)
   ) {
@@ -462,11 +491,14 @@ function makeGlobalPackageManagerProviderMaintenanceCapabilities(
   return makeProviderMaintenanceCapabilities({
     provider: definition.provider,
     packageName: definition.npmPackageName,
-    updateExecutable: target.managerExecutablePath,
-    updateArgs: input.updateArgs(definition.npmPackageName, globalRoot),
+    updateExecutable: target.managerCommand.executablePath,
+    updateArgs: [
+      ...target.managerCommand.argsPrefix,
+      ...input.updateArgs(definition.npmPackageName, globalRoot),
+    ],
     updateLockKey: `${input.updateLockPrefix}:${normalizeCommandPath(globalRoot, target.platform)}`,
     updatePathPrepend: commandPathImplementation(target.platform).dirname(
-      target.managerExecutablePath,
+      target.managerCommand.executablePath,
     ),
     updateTarget: target,
   });
@@ -1112,6 +1144,15 @@ function managerMatchesInstallRoot(input: {
   ) {
     return false;
   }
+  if (
+    input.platform === "win32" &&
+    input.installSource === "npm" &&
+    commandPathImplementation(input.platform)
+      .basename(input.managerExecutablePath)
+      .toLowerCase() !== "npm.cmd"
+  ) {
+    return false;
+  }
   if (input.installSource === "npm" || input.installSource === "native") {
     return true;
   }
@@ -1152,6 +1193,7 @@ function makeMaintenanceTarget(input: {
   readonly canonicalInstallRoot: string | null;
   readonly managerExecutablePath: string | null;
   readonly canonicalManagerExecutablePath: string | null;
+  readonly managerCommand: ProviderMaintenanceManagerCommandIdentity | null;
   readonly packageChannelEvidence: ProviderPackageChannelEvidence | null;
 }): ProviderMaintenanceTargetIdentity | null {
   if (!isInstallSourceAllowed(input.definition, input.installSource)) {
@@ -1163,6 +1205,14 @@ function makeMaintenanceTarget(input: {
   if (!canonicalInstallRoot || !managerExecutablePath || !canonicalManagerExecutablePath) {
     return null;
   }
+  const managerCommand =
+    input.managerCommand ??
+    (input.platform === "win32" && input.installSource === "npm"
+      ? null
+      : { executablePath: managerExecutablePath, argsPrefix: [] });
+  if (!managerCommand) {
+    return null;
+  }
   if (
     [
       input.visibleCommandPath,
@@ -1170,7 +1220,15 @@ function makeMaintenanceTarget(input: {
       canonicalInstallRoot,
       managerExecutablePath,
       canonicalManagerExecutablePath,
+      managerCommand.executablePath,
     ].some((path) => !isAbsoluteCommandPath(path, input.platform))
+  ) {
+    return null;
+  }
+  if (
+    managerCommand.argsPrefix.some(
+      (arg) => hasPathSeparator(arg) && !isAbsoluteCommandPath(arg, input.platform),
+    )
   ) {
     return null;
   }
@@ -1200,6 +1258,35 @@ function makeMaintenanceTarget(input: {
     })
   ) {
     return null;
+  }
+  if (input.platform === "win32" && input.installSource === "npm") {
+    const path = commandPathImplementation(input.platform);
+    if (path.basename(canonicalManagerExecutablePath).toLowerCase() !== "npm.cmd") {
+      return null;
+    }
+    const expectedNodePath = path.join(path.dirname(canonicalManagerExecutablePath), "node.exe");
+    const allowedNpmCliPaths = [
+      path.join(canonicalInstallRoot, "node_modules", "npm", "bin", "npm-cli.js"),
+      path.join(
+        path.dirname(canonicalManagerExecutablePath),
+        "node_modules",
+        "npm",
+        "bin",
+        "npm-cli.js",
+      ),
+    ];
+    if (
+      normalizeCommandPath(managerCommand.executablePath, input.platform) !==
+        normalizeCommandPath(expectedNodePath, input.platform) ||
+      managerCommand.argsPrefix.length !== 1 ||
+      !allowedNpmCliPaths.some(
+        (candidate) =>
+          normalizeCommandPath(candidate, input.platform) ===
+          normalizeCommandPath(managerCommand.argsPrefix[0] ?? "", input.platform),
+      )
+    ) {
+      return null;
+    }
   }
 
   let channel: ProviderMaintenanceChannelIdentity;
@@ -1251,6 +1338,7 @@ function makeMaintenanceTarget(input: {
     canonicalInstallRoot,
     managerExecutablePath,
     canonicalManagerExecutablePath,
+    managerCommand,
     channel,
   };
 }
@@ -1482,6 +1570,59 @@ const resolveManagerExecutable = Effect.fn("resolveProviderMaintenanceManager")(
   return null;
 });
 
+const resolveWindowsNpmManagerCommand = Effect.fn(
+  "resolveWindowsNpmManagerCommand",
+)(function* (
+  input: {
+    readonly canonicalInstallRoot: string;
+    readonly canonicalManagerExecutablePath: string;
+  },
+  fileSystem: FileSystem.FileSystem,
+) {
+  const path = commandPathImplementation("win32");
+  const canonicalManagerDirectory = path.dirname(input.canonicalManagerExecutablePath);
+  const expectedNodePath = path.join(canonicalManagerDirectory, "node.exe");
+  const resolveExactFile = (candidate: string) =>
+    Effect.gen(function* () {
+      const stat = yield* fileSystem.stat(candidate).pipe(Effect.catch(() => Effect.succeed(null)));
+      if (stat?.type !== "File") {
+        return null;
+      }
+      const canonicalPath = yield* fileSystem
+        .realPath(candidate)
+        .pipe(Effect.catch(() => Effect.succeed(null)));
+      return canonicalPath &&
+        normalizeCommandPath(canonicalPath, "win32") === normalizeCommandPath(candidate, "win32")
+        ? canonicalPath
+        : null;
+    });
+  const nodeExecutablePath = yield* resolveExactFile(expectedNodePath);
+  if (!nodeExecutablePath) {
+    return null;
+  }
+
+  const npmCliCandidates = [
+    path.join(input.canonicalInstallRoot, "node_modules", "npm", "bin", "npm-cli.js"),
+    path.join(canonicalManagerDirectory, "node_modules", "npm", "bin", "npm-cli.js"),
+  ].filter(
+    (candidate, index, candidates) =>
+      candidates.findIndex(
+        (other) =>
+          normalizeCommandPath(other, "win32") === normalizeCommandPath(candidate, "win32"),
+      ) === index,
+  );
+  for (const candidate of npmCliCandidates) {
+    const npmCliPath = yield* resolveExactFile(candidate);
+    if (npmCliPath) {
+      return {
+        executablePath: nodeExecutablePath,
+        argsPrefix: [npmCliPath],
+      } satisfies ProviderMaintenanceManagerCommandIdentity;
+    }
+  }
+  return null;
+});
+
 const resolvePackageChannelEvidence = Effect.fn("resolveProviderPackageChannelEvidence")(function* (
   input: {
     readonly definition: PackageManagedProviderMaintenanceDefinition;
@@ -1626,6 +1767,7 @@ export function resolvePackageManagedProviderMaintenance(
     canonicalInstallRoot: nonEmptyString(options?.canonicalInstallRoot),
     managerExecutablePath: nonEmptyString(options?.managerExecutablePath),
     canonicalManagerExecutablePath: nonEmptyString(options?.realManagerExecutablePath),
+    managerCommand: options?.managerCommand ?? null,
     packageChannelEvidence: options?.packageChannelEvidence ?? null,
   });
   return target
@@ -1712,6 +1854,19 @@ const resolveVerifiedCandidateMaintenance = Effect.fn("resolveVerifiedCandidateM
     if (!manager) {
       return manualCapabilities(input.definition);
     }
+    const managerCommand =
+      input.platform === "win32" && installSource === "npm"
+        ? yield* resolveWindowsNpmManagerCommand(
+            {
+              canonicalInstallRoot,
+              canonicalManagerExecutablePath: manager.canonicalPath,
+            },
+            fileSystem,
+          )
+        : null;
+    if (input.platform === "win32" && installSource === "npm" && !managerCommand) {
+      return manualCapabilities(input.definition);
+    }
 
     let packageChannelEvidence: ProviderPackageChannelEvidence | null = null;
     if (installSource === "npm" || installSource === "bun" || installSource === "pnpm") {
@@ -1743,6 +1898,7 @@ const resolveVerifiedCandidateMaintenance = Effect.fn("resolveVerifiedCandidateM
       canonicalInstallRoot,
       managerExecutablePath: manager.visiblePath,
       realManagerExecutablePath: manager.canonicalPath,
+      ...(managerCommand ? { managerCommand } : {}),
       packageChannelEvidence,
     });
   },
