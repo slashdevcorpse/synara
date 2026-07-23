@@ -438,6 +438,7 @@ export const PACKAGE_MANAGED_PROVIDER_UPDATES: Partial<
     npmPackageName: "command-code",
     allowedInstallSources: ["npm"],
     homebrew: null,
+    advisoryLatestVersionSource: { kind: "npm", name: "command-code" },
     nativeUpdate: null,
   },
   claudeAgent: {
