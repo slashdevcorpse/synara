@@ -62,6 +62,62 @@ describe("buildProviderChildEnvironment", () => {
     });
   });
 
+  it("forces Command Code update suppression after caller overlays without removing credentials", () => {
+    const env = buildProviderChildEnvironment({
+      provider: "commandCode",
+      baseEnv: {
+        COMMANDCODE_SKIP_UPDATES: "0",
+        OPENAI_API_KEY: "openai-secret",
+      },
+      overrides: {
+        COMMANDCODE_SKIP_UPDATES: "false",
+        ANTHROPIC_API_KEY: "anthropic-secret",
+      },
+    });
+
+    expect(env.COMMANDCODE_SKIP_UPDATES).toBe("1");
+    expect(env.OPENAI_API_KEY).toBe("openai-secret");
+    expect(env.ANTHROPIC_API_KEY).toBe("anthropic-secret");
+  });
+
+  it("prevents mixed-case Windows overlays from disabling Command Code update suppression", () => {
+    const env = buildProviderChildEnvironment({
+      provider: "commandCode",
+      baseEnv: {
+        commandcode_skip_updates: "0",
+      },
+      overrides: {
+        CommandCode_Skip_Updates: "false",
+      },
+      platform: "win32",
+    });
+
+    expect(readEffectiveWindowsEnvironmentValue(env, "COMMANDCODE_SKIP_UPDATES")).toBe("1");
+    expect(
+      Object.keys(env).filter((key) => key.toUpperCase() === "COMMANDCODE_SKIP_UPDATES"),
+    ).toEqual(["COMMANDCODE_SKIP_UPDATES"]);
+  });
+
+  it.each([
+    "acp",
+    "antigravity",
+    "claude",
+    "codex",
+    "cursor",
+    "droid",
+    "grok",
+    "kilo",
+    "opencode",
+    "pi",
+  ] as const)("does not inject Command Code update suppression for %s", (provider) => {
+    const env = buildProviderChildEnvironment({
+      provider,
+      baseEnv: { PATH: "/usr/bin" },
+    });
+
+    expect(env.COMMANDCODE_SKIP_UPDATES).toBeUndefined();
+  });
+
   it.each([
     ["claude", "ANTHROPIC_API_KEY", "GEMINI_API_KEY"],
     ["cursor", "CURSOR_API_KEY", "FACTORY_API_KEY"],

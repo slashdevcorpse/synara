@@ -890,6 +890,42 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
       );
     });
 
+    it.effect("suppresses Command Code self-updates for version and status probes", () => {
+      const calls: Array<{
+        readonly args: ReadonlyArray<string>;
+        readonly skipUpdates: string | undefined;
+      }> = [];
+      return makeCheckCommandCodeProviderStatus("commandcode.exe").pipe(
+        Effect.provide(
+          mockSpawnerLayer((args, _command, env) => {
+            calls.push({
+              args: [...args],
+              skipUpdates: env?.COMMANDCODE_SKIP_UPDATES,
+            });
+            return args.includes("--version")
+              ? { stdout: "command-code 0.52.1", stderr: "", code: 0 }
+              : {
+                  stdout: JSON.stringify({ authenticated: true, version: "0.52.1" }),
+                  stderr: "",
+                  code: 0,
+                };
+          }),
+        ),
+        Effect.tap(() =>
+          Effect.sync(() => {
+            assert.deepStrictEqual(
+              calls.map((call) => call.args),
+              [["--version"], ["status", "--json"]],
+            );
+            assert.deepStrictEqual(
+              calls.map((call) => call.skipUpdates),
+              ["1", "1"],
+            );
+          }),
+        ),
+      );
+    });
+
     it.effect("reports unauthenticated and malformed status responses as warnings", () =>
       Effect.gen(function* () {
         let statusResponse = JSON.stringify({ authenticated: false, error: "Login required" });

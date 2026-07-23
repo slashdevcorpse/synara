@@ -31,6 +31,7 @@ type SpawnProcess = NonNullable<CommandCodeAdapterLiveOptions["spawnProcess"]>;
 type SpawnProcessMock = ReturnType<typeof vi.fn<SpawnProcess>>;
 type PrepareProcess = NonNullable<CommandCodeAdapterLiveOptions["prepareProcess"]>;
 type PrepareProcessMock = ReturnType<typeof vi.fn<PrepareProcess>>;
+type ResolveExecutable = NonNullable<CommandCodeAdapterLiveOptions["resolveExecutable"]>;
 
 interface MockChild {
   readonly child: ChildProcess;
@@ -77,7 +78,7 @@ function adapterLayer(input: {
   readonly spawnProcess?: SpawnProcessMock;
   readonly prepareProcess?: PrepareProcessMock;
   readonly teardownProcessTree?: (child: ChildProcess) => Promise<unknown>;
-  readonly resolveExecutable?: (command: string) => string;
+  readonly resolveExecutable?: ResolveExecutable;
 }) {
   const spawnProcess = input.spawnProcess ?? vi.fn<SpawnProcess>(() => input.child.child);
   const teardownProcessTree =
@@ -306,6 +307,49 @@ it.effect("spawns only on send, uses Windows-safe argv, resumes, and projects fi
         resumedMock.close(0);
       });
       yield* program.pipe(Effect.provide(layer));
+    }),
+  ),
+);
+
+it.effect("suppresses Command Code self-updates for session, turn, and model-list launches", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const turnChild = makeMockChild();
+      const modelListChild = makeMockChild();
+      const children = [turnChild, modelListChild];
+      const spawnProcess = vi.fn<SpawnProcess>(() => children.shift()!.child);
+      const resolveExecutable = vi.fn<ResolveExecutable>(() => "C:\\tools\\commandcode.cmd");
+      const { layer } = adapterLayer({
+        child: turnChild,
+        spawnProcess,
+        resolveExecutable,
+      });
+      const threadId = ThreadId.makeUnsafe("command-code-skip-updates");
+
+      yield* Effect.gen(function* () {
+        const adapter = yield* CommandCodeAdapter;
+        yield* adapter.startSession(startInput(threadId));
+        assert.strictEqual(resolveExecutable.mock.calls[0]?.[1].env.COMMANDCODE_SKIP_UPDATES, "1");
+
+        yield* adapter.sendTurn({ threadId, input: "do not self-update" });
+        assert.strictEqual(spawnProcess.mock.calls[0]?.[2].env?.COMMANDCODE_SKIP_UPDATES, "1");
+        turnChild.close(0);
+
+        const listing = yield* adapter.listModels!({
+          provider: "commandCode",
+          cwd: process.cwd(),
+        }).pipe(Effect.forkChild);
+        yield* Effect.promise(() =>
+          vi.waitFor(() => assert.strictEqual(spawnProcess.mock.calls.length, 2)),
+        );
+        assert.strictEqual(resolveExecutable.mock.calls[1]?.[1].env.COMMANDCODE_SKIP_UPDATES, "1");
+        assert.strictEqual(spawnProcess.mock.calls[1]?.[2].env?.COMMANDCODE_SKIP_UPDATES, "1");
+        modelListChild.stdout.write(
+          "Available models · 1 model\n\nOpenAI\n\ngpt-5.6-sol  frontier model\n",
+        );
+        modelListChild.close(0);
+        yield* Fiber.join(listing);
+      }).pipe(Effect.provide(layer));
     }),
   ),
 );
