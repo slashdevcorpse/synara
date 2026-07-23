@@ -416,6 +416,7 @@ export const PACKAGE_MANAGED_PROVIDER_UPDATES: Partial<
     npmPackageName: "@openai/codex",
     allowedInstallSources: ["npm", "bun", "pnpm", "homebrew", "native"],
     homebrew: { name: "codex", kind: "cask" },
+    advisoryLatestVersionSource: { kind: "npm", name: "@openai/codex" },
     nativeUpdate: {
       executable: "codex",
       args: () => ["update"],
@@ -478,6 +479,7 @@ export const PACKAGE_MANAGED_PROVIDER_UPDATES: Partial<
     npmPackageName: "droid",
     allowedInstallSources: ["npm", "native"],
     homebrew: null,
+    advisoryLatestVersionSource: { kind: "npm", name: "droid" },
     nativeUpdate: {
       executable: "droid",
       args: () => ["update"],
@@ -508,6 +510,7 @@ export const PACKAGE_MANAGED_PROVIDER_UPDATES: Partial<
     npmPackageName: "opencode-ai",
     allowedInstallSources: ["npm", "bun", "pnpm", "homebrew", "native"],
     homebrew: { name: "anomalyco/tap/opencode", kind: "formula" },
+    advisoryLatestVersionSource: { kind: "npm", name: "opencode-ai" },
     nativeUpdate: {
       executable: "opencode",
       args: (installSource) =>
@@ -3260,6 +3263,16 @@ export function makeProviderHealthLive(
             updateLockKey: null,
           });
         }
+        if (provider === ANTIGRAVITY_PROVIDER && !isAntigravityAvailableOnPlatform(platform)) {
+          return makeProviderMaintenanceCapabilities({
+            provider,
+            packageName: null,
+            latestVersionSource: null,
+            updateExecutable: null,
+            updateArgs: [],
+            updateLockKey: null,
+          });
+        }
         if (provider === GROK_PROVIDER) {
           return makeProviderMaintenanceCapabilities({
             provider,
@@ -3495,7 +3508,9 @@ export function makeProviderHealthLive(
           (status) =>
             getProviderMaintenanceCapabilities(status.provider).pipe(
               Effect.flatMap((capabilities) =>
-                enrichProviderStatusWithVersionAdvisory(status, capabilities),
+                enrichProviderStatusWithVersionAdvisory(status, capabilities, {
+                  useAdvisoryLatestVersionSource: true,
+                }),
               ),
               Effect.flatMap(applyVolatileProviderState),
               Effect.catchCause((cause) =>

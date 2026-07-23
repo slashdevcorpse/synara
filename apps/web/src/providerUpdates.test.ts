@@ -149,11 +149,18 @@ describe("getVisibleProviderUpdateStatuses", () => {
         oneClickOnly: true,
       }).map((provider) => provider.provider),
     ).toEqual(["codex"]);
+    expect(shouldOfferProviderUpdateAction(manualOnly)).toBe(false);
+    expect(getProviderUpdatePresentation(manualOnly)).toMatchObject({
+      kind: "behind_latest",
+      label: "v1.0.0 -> v1.1.0",
+      isVerifiedSuccess: false,
+      severity: "warning",
+    });
   });
 });
 
 describe("providerUpdateNotificationKey", () => {
-  it("keys by provider/version and ignores ordering", () => {
+  it("keys by provider/version/actionability and ignores ordering", () => {
     const left = providerUpdateNotificationKey([
       providerStatus("pi", {
         versionAdvisory: {
@@ -174,6 +181,30 @@ describe("providerUpdateNotificationKey", () => {
     ]);
 
     expect(left).toBe(right);
+  });
+
+  it("changes when an unchanged provider version becomes manual-only", () => {
+    const actionable = providerStatus("codex");
+    const manualOnly = providerStatus("codex", {
+      versionAdvisory: {
+        ...actionable.versionAdvisory!,
+        canUpdate: false,
+        updateCommand: null,
+      },
+    });
+    const active = providerStatus("codex", {
+      updateState: {
+        status: "running",
+        startedAt: "2026-06-10T10:00:00.000Z",
+        finishedAt: null,
+        message: "Updating provider.",
+        output: null,
+      },
+    });
+
+    expect(providerUpdateNotificationKey([actionable])).toBe("codex:1.1.0:actionable");
+    expect(providerUpdateNotificationKey([manualOnly])).toBe("codex:1.1.0:manual");
+    expect(providerUpdateNotificationKey([active])).toBe("codex:1.1.0:active");
   });
 });
 
