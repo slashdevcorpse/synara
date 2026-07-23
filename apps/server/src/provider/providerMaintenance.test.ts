@@ -1280,94 +1280,83 @@ describe("providerMaintenance", () => {
     );
   });
 
-  win(
-    "keeps a Windows Codex bin junction to a foreign runtime manual-only",
-    async () => {
-      const result = await Effect.runPromise(
-        Effect.gen(function* () {
-          const fileSystem = yield* FileSystem.FileSystem;
-          const tempDirectory = yield* fileSystem.makeTempDirectoryScoped({
-            prefix: "synara-provider-maintenance-foreign-codex-runtime-",
-          });
-          const visibleInstallRoot = NodePath.join(
-            tempDirectory,
-            "Programs",
-            "OpenAI",
-            "Codex",
-          );
-          const visibleBinDirectory = NodePath.join(visibleInstallRoot, "bin");
-          const visibleCommandPath = NodePath.join(visibleBinDirectory, "codex.exe");
-          const foreignRuntimeDirectory = NodePath.join(
-            tempDirectory,
-            "Orca",
-            "runtimes",
-            "codex",
-            "0.144.1",
-          );
-          const foreignCommandPath = NodePath.join(foreignRuntimeDirectory, "codex.exe");
+  win("keeps a Windows Codex bin junction to a foreign runtime manual-only", async () => {
+    const result = await Effect.runPromise(
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const tempDirectory = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "synara-provider-maintenance-foreign-codex-runtime-",
+        });
+        const visibleInstallRoot = NodePath.join(tempDirectory, "Programs", "OpenAI", "Codex");
+        const visibleBinDirectory = NodePath.join(visibleInstallRoot, "bin");
+        const visibleCommandPath = NodePath.join(visibleBinDirectory, "codex.exe");
+        const foreignRuntimeDirectory = NodePath.join(
+          tempDirectory,
+          "Orca",
+          "runtimes",
+          "codex",
+          "0.144.1",
+        );
+        const foreignCommandPath = NodePath.join(foreignRuntimeDirectory, "codex.exe");
 
-          yield* fileSystem.makeDirectory(visibleInstallRoot, { recursive: true });
-          yield* fileSystem.makeDirectory(foreignRuntimeDirectory, { recursive: true });
-          yield* fileSystem.writeFileString(foreignCommandPath, "foreign codex fixture\n");
-          yield* Effect.promise(() =>
-            NodeFs.symlink(foreignRuntimeDirectory, visibleBinDirectory, "junction"),
-          );
+        yield* fileSystem.makeDirectory(visibleInstallRoot, { recursive: true });
+        yield* fileSystem.makeDirectory(foreignRuntimeDirectory, { recursive: true });
+        yield* fileSystem.writeFileString(foreignCommandPath, "foreign codex fixture\n");
+        yield* Effect.promise(() =>
+          NodeFs.symlink(foreignRuntimeDirectory, visibleBinDirectory, "junction"),
+        );
 
-          const canonicalCommandPath = realpathSync.native(visibleCommandPath);
-          const canonicalForeignCommandPath = realpathSync.native(foreignCommandPath);
-          const capabilities = yield* resolveProviderMaintenanceCapabilitiesEffect(
-            CODEX_DEFINITION,
+        const canonicalCommandPath = realpathSync.native(visibleCommandPath);
+        const canonicalForeignCommandPath = realpathSync.native(foreignCommandPath);
+        const capabilities = yield* resolveProviderMaintenanceCapabilitiesEffect(CODEX_DEFINITION, {
+          binaryPath: visibleCommandPath,
+          env: { PATH: visibleBinDirectory },
+          platform: "win32",
+        });
+        const status = yield* withFetchMock(
+          makeFetchMock(() => Promise.resolve(npmVersionResponse("0.145.0"))),
+          enrichProviderStatusWithVersionAdvisory(
             {
-              binaryPath: visibleCommandPath,
-              env: { PATH: visibleBinDirectory },
-              platform: "win32",
+              provider: "codex",
+              status: "ready",
+              available: true,
+              authStatus: "authenticated",
+              version: "0.144.1",
+              checkedAt: "2026-07-23T12:00:00.000Z",
             },
-          );
-          const status = yield* withFetchMock(
-            makeFetchMock(() => Promise.resolve(npmVersionResponse("0.145.0"))),
-            enrichProviderStatusWithVersionAdvisory(
-              {
-                provider: "codex",
-                status: "ready",
-                available: true,
-                authStatus: "authenticated",
-                version: "0.144.1",
-                checkedAt: "2026-07-23T12:00:00.000Z",
-              },
-              capabilities,
-              {
-                forceRefresh: true,
-                useAdvisoryLatestVersionSource: true,
-              },
-            ),
-          );
-
-          return {
             capabilities,
-            canonicalCommandPath,
-            canonicalForeignCommandPath,
-            status,
-          };
-        }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
-      );
+            {
+              forceRefresh: true,
+              useAdvisoryLatestVersionSource: true,
+            },
+          ),
+        );
 
-      assert.strictEqual(
-        normalizeCommandPath(result.canonicalCommandPath, "win32"),
-        normalizeCommandPath(result.canonicalForeignCommandPath, "win32"),
-      );
-      assert.strictEqual(result.capabilities.update, null);
-      assert.strictEqual(result.capabilities.latestVersionSource, null);
-      assert.deepStrictEqual(result.capabilities.advisoryLatestVersionSource, {
-        kind: "npm",
-        name: "@openai/codex",
-      });
-      assert.strictEqual(result.status.versionAdvisory?.status, "behind_latest");
-      assert.strictEqual(result.status.versionAdvisory?.currentVersion, "0.144.1");
-      assert.strictEqual(result.status.versionAdvisory?.latestVersion, "0.145.0");
-      assert.strictEqual(result.status.versionAdvisory?.canUpdate, false);
-      assert.strictEqual(result.status.versionAdvisory?.updateCommand, null);
-    },
-  );
+        return {
+          capabilities,
+          canonicalCommandPath,
+          canonicalForeignCommandPath,
+          status,
+        };
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+    );
+
+    assert.strictEqual(
+      normalizeCommandPath(result.canonicalCommandPath, "win32"),
+      normalizeCommandPath(result.canonicalForeignCommandPath, "win32"),
+    );
+    assert.strictEqual(result.capabilities.update, null);
+    assert.strictEqual(result.capabilities.latestVersionSource, null);
+    assert.deepStrictEqual(result.capabilities.advisoryLatestVersionSource, {
+      kind: "npm",
+      name: "@openai/codex",
+    });
+    assert.strictEqual(result.status.versionAdvisory?.status, "behind_latest");
+    assert.strictEqual(result.status.versionAdvisory?.currentVersion, "0.144.1");
+    assert.strictEqual(result.status.versionAdvisory?.latestVersion, "0.145.0");
+    assert.strictEqual(result.status.versionAdvisory?.canUpdate, false);
+    assert.strictEqual(result.status.versionAdvisory?.updateCommand, null);
+  });
 
   win("does not fall back to a different npm install when native Codex is selected", async () => {
     const result = await Effect.runPromise(
