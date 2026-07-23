@@ -1539,6 +1539,82 @@ describe("buildCodexProcessEnv", () => {
     }
   });
 
+  it("uses a real Windows skills root while sharing user skills", async () => {
+    const tempDir = mkdtempSync(path.join(os.tmpdir(), "synara-codex-env-"));
+    const runtimeHome = mkdtempSync(path.join(os.tmpdir(), "synara-runtime-home-"));
+    try {
+      writeFileSync(path.join(tempDir, "config.toml"), 'model = "gpt-5.5"', "utf8");
+      const sourceSkillsDir = path.join(tempDir, "skills");
+      const sourceSystemSkillDir = path.join(sourceSkillsDir, ".system", "skill-installer");
+      const sourceUserSkillDir = path.join(sourceSkillsDir, "user-skill");
+      mkdirSync(sourceSystemSkillDir, { recursive: true });
+      mkdirSync(sourceUserSkillDir, { recursive: true });
+      writeFileSync(path.join(sourceSystemSkillDir, "SKILL.md"), "system", "utf8");
+      writeFileSync(path.join(sourceUserSkillDir, "SKILL.md"), "user", "utf8");
+
+      const env = await buildCodexProcessEnv({
+        env: { SYNARA_HOME: runtimeHome },
+        homePath: tempDir,
+        platform: "win32",
+      });
+
+      const overlaySkillsDir = path.join(String(env.CODEX_HOME), "skills");
+      expect(lstatSync(overlaySkillsDir).isDirectory()).toBe(true);
+      expect(lstatSync(overlaySkillsDir).isSymbolicLink()).toBe(false);
+      expect(lstatSync(path.join(overlaySkillsDir, "user-skill")).isSymbolicLink()).toBe(true);
+      expect(readFileSync(path.join(overlaySkillsDir, "user-skill", "SKILL.md"), "utf8")).toBe(
+        "user",
+      );
+      expect(() => lstatSync(path.join(overlaySkillsDir, ".system"))).toThrow();
+      expect(readFileSync(path.join(sourceSystemSkillDir, "SKILL.md"), "utf8")).toBe("system");
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+      rmSync(runtimeHome, { recursive: true, force: true });
+    }
+  });
+
+  it("migrates a linked Windows skills root and preserves overlay system skills", async () => {
+    const tempDir = mkdtempSync(path.join(os.tmpdir(), "synara-codex-env-"));
+    const runtimeHome = mkdtempSync(path.join(os.tmpdir(), "synara-runtime-home-"));
+    try {
+      writeFileSync(path.join(tempDir, "config.toml"), 'model = "gpt-5.5"', "utf8");
+      const sourceSkillsDir = path.join(tempDir, "skills");
+      const sourceUserSkillDir = path.join(sourceSkillsDir, "user-skill");
+      mkdirSync(sourceUserSkillDir, { recursive: true });
+      writeFileSync(path.join(sourceUserSkillDir, "SKILL.md"), "user", "utf8");
+
+      const overlayHome = path.join(runtimeHome, "codex-home-overlay");
+      const overlaySkillsDir = path.join(overlayHome, "skills");
+      mkdirSync(overlayHome, { recursive: true });
+      symlinkSync(sourceSkillsDir, overlaySkillsDir, "dir");
+
+      const input = {
+        env: { SYNARA_HOME: runtimeHome },
+        homePath: tempDir,
+        platform: "win32",
+      } as const;
+      const env = await buildCodexProcessEnv(input);
+      expect(env.CODEX_HOME).toBe(overlayHome);
+      expect(lstatSync(overlaySkillsDir).isDirectory()).toBe(true);
+      expect(lstatSync(overlaySkillsDir).isSymbolicLink()).toBe(false);
+      expect(lstatSync(path.join(overlaySkillsDir, "user-skill")).isSymbolicLink()).toBe(true);
+
+      const overlaySystemSkillsDir = path.join(overlaySkillsDir, ".system");
+      mkdirSync(overlaySystemSkillsDir, { recursive: true });
+      writeFileSync(path.join(overlaySystemSkillsDir, "installed.txt"), "overlay-owned", "utf8");
+      await buildCodexProcessEnv(input);
+
+      expect(lstatSync(overlaySystemSkillsDir).isDirectory()).toBe(true);
+      expect(lstatSync(overlaySystemSkillsDir).isSymbolicLink()).toBe(false);
+      expect(readFileSync(path.join(overlaySystemSkillsDir, "installed.txt"), "utf8")).toBe(
+        "overlay-owned",
+      );
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+      rmSync(runtimeHome, { recursive: true, force: true });
+    }
+  });
+
   it("preserves real generated image directories in Synara's Codex home overlay", async () => {
     const tempDir = mkdtempSync(path.join(os.tmpdir(), "synara-codex-env-"));
     const runtimeHome = mkdtempSync(path.join(os.tmpdir(), "synara-runtime-home-"));

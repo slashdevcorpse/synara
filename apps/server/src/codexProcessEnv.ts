@@ -21,6 +21,8 @@ const CODEX_PROCESS_SHELL_ENV_NAMES = ["PATH", "SSH_AUTH_SOCK"] as const;
 const NODE_REPL_SANDBOX_ALLOWED_UNIX_SOCKETS = "NODE_REPL_SANDBOX_ALLOWED_UNIX_SOCKETS";
 const CODEX_OVERLAY_SHARED_STATE_FILES = new Set(["auth.json"]);
 const CODEX_SQLITE_STATE_ENTRY_PATTERN = /^.+\.sqlite(?:-(?:wal|shm|journal))?$/;
+const CODEX_SKILLS_ENTRY = "skills";
+const CODEX_SYSTEM_SKILLS_ENTRY = ".system";
 const SYNARA_CONFIG_SUPPRESSIONS_FILE = "synara-config-suppressions-v1.json";
 const MAX_CONFIG_SUPPRESSION_SECTIONS = 32;
 const MAX_CONFIG_SUPPRESSION_HEADER_LENGTH = 256;
@@ -235,6 +237,62 @@ async function ensureCodexOverlaySymlink(input: {
   }
 
   await linkOrCopyCodexOverlayEntry(input);
+}
+
+async function prepareWindowsCodexSkillsOverlay(input: {
+  readonly sourcePath: string;
+  readonly targetPath: string;
+}): Promise<void> {
+  let targetStat: Awaited<ReturnType<typeof fs.lstat>> | undefined;
+  try {
+    targetStat = await fs.lstat(input.targetPath);
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+
+  if (targetStat?.isSymbolicLink()) {
+    // Older overlays linked the entire skills root. On Windows, Codex's
+    // create_dir_all call treats that directory link as ERROR_ALREADY_EXISTS
+    // and skips installing its bundled system skills.
+    await fs.unlink(input.targetPath);
+    targetStat = undefined;
+  }
+
+  if (targetStat && !targetStat.isDirectory()) {
+    throw new Error(`Codex skills overlay is not a directory: ${input.targetPath}`);
+  }
+  await fs.mkdir(input.targetPath, { recursive: true });
+
+  const systemSkillsPath = path.join(input.targetPath, CODEX_SYSTEM_SKILLS_ENTRY);
+  try {
+    if ((await fs.lstat(systemSkillsPath)).isSymbolicLink()) {
+      await fs.unlink(systemSkillsPath);
+    }
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+
+  const sourceEntries = new Set(await fs.readdir(input.sourcePath));
+  for (const entry of await fs.readdir(input.targetPath)) {
+    if (entry === CODEX_SYSTEM_SKILLS_ENTRY || sourceEntries.has(entry)) continue;
+    const targetEntryPath = path.join(input.targetPath, entry);
+    if ((await fs.lstat(targetEntryPath)).isSymbolicLink()) {
+      await fs.unlink(targetEntryPath);
+    }
+  }
+
+  for (const entry of sourceEntries) {
+    if (entry === CODEX_SYSTEM_SKILLS_ENTRY) continue;
+    const sourceEntryPath = path.join(input.sourcePath, entry);
+    const targetEntryPath = path.join(input.targetPath, entry);
+    const stat = await fs.stat(sourceEntryPath);
+    await ensureCodexOverlaySymlink({
+      entryName: entry,
+      sourcePath: sourceEntryPath,
+      targetPath: targetEntryPath,
+      type: stat.isDirectory() ? "dir" : "file",
+    });
+  }
 }
 
 export function appendCodexConfigSection(config: string, section: string): string {
@@ -548,6 +606,7 @@ async function prepareSynaraCodexHomeOverlayUnlocked(input: {
   readonly env: NodeJS.ProcessEnv;
   readonly homePath?: string;
   readonly appendConfigToml?: string;
+  readonly platform: NodeJS.Platform;
 }): Promise<string | undefined> {
   const sourceHomePath = resolveBaseCodexHomePath(input.env, input.homePath);
   const overlayHomePath = resolveSynaraCodexHomeOverlayPath(input.env, sourceHomePath);
@@ -577,6 +636,10 @@ async function prepareSynaraCodexHomeOverlayUnlocked(input: {
       const sourcePath = path.join(sourceHomePath, entry);
       const targetPath = path.join(overlayHomePath, entry);
       const stat = await fs.lstat(sourcePath);
+      if (input.platform === "win32" && entry === CODEX_SKILLS_ENTRY) {
+        await prepareWindowsCodexSkillsOverlay({ sourcePath, targetPath });
+        continue;
+      }
       await ensureCodexOverlaySymlink({
         entryName: entry,
         sourcePath,
@@ -633,6 +696,7 @@ async function prepareSynaraCodexHomeOverlay(input: {
   readonly env: NodeJS.ProcessEnv;
   readonly homePath?: string;
   readonly appendConfigToml?: string;
+  readonly platform: NodeJS.Platform;
 }): Promise<string | undefined> {
   const sourceHomePath = resolveBaseCodexHomePath(input.env, input.homePath);
   const overlayHomePath = resolveSynaraCodexHomeOverlayPath(input.env, sourceHomePath);
@@ -654,8 +718,10 @@ export async function buildCodexProcessEnv(
   } = {},
 ): Promise<NodeJS.ProcessEnv> {
   const baseEnv = { ...(input.env ?? process.env) };
+  const platform = input.platform ?? process.platform;
   const overlayHomePath = await prepareSynaraCodexHomeOverlay({
     env: baseEnv,
+    platform,
     ...(input.homePath ? { homePath: input.homePath } : {}),
     ...(input.appendConfigToml ? { appendConfigToml: input.appendConfigToml } : {}),
   });
@@ -668,7 +734,6 @@ export async function buildCodexProcessEnv(
         CODEX_SQLITE_HOME: configuredCodexHome,
       }
     : baseEnv;
-  const platform = input.platform ?? process.platform;
   const browserUsePipePath =
     platform === "win32"
       ? undefined
