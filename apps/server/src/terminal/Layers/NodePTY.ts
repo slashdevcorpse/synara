@@ -61,7 +61,10 @@ export const ensureNodePtySpawnHelperExecutable = Effect.fn(function* (explicitP
 });
 
 class NodePtyProcess implements PtyProcess {
-  constructor(private readonly process: import("node-pty").IPty) {}
+  constructor(
+    private readonly process: import("node-pty").IPty,
+    private readonly platform: NodeJS.Platform,
+  ) {}
 
   get pid(): number {
     return this.process.pid;
@@ -76,6 +79,12 @@ class NodePtyProcess implements PtyProcess {
   }
 
   kill(signal?: string): void {
+    // node-pty rejects signals on Windows before closing its ConPTY handles.
+    // Omitting the signal lets it close the pseudoconsole and reap conhost.exe.
+    if (this.platform === "win32") {
+      this.process.kill();
+      return;
+    }
     this.process.kill(signal);
   }
 
@@ -108,7 +117,10 @@ class NodePtyProcess implements PtyProcess {
 }
 
 // Creates the adapter layer with an injectable loader so startup/lazy-load behavior is testable.
-export const makeNodePtyLayer = (loadNodePtyModule: NodePtyLoader = () => import("node-pty")) =>
+export const makeNodePtyLayer = (
+  loadNodePtyModule: NodePtyLoader = () => import("node-pty"),
+  platform: NodeJS.Platform = globalThis.process.platform,
+) =>
   Layer.effect(
     PtyAdapter,
     Effect.gen(function* () {
@@ -146,7 +158,7 @@ export const makeNodePtyLayer = (loadNodePtyModule: NodePtyLoader = () => import
                 cols: input.cols,
                 rows: input.rows,
                 env: input.env,
-                name: globalThis.process.platform === "win32" ? "xterm-color" : "xterm-256color",
+                name: platform === "win32" ? "xterm-color" : "xterm-256color",
               }),
             catch: (cause) =>
               new PtySpawnError({
@@ -155,7 +167,7 @@ export const makeNodePtyLayer = (loadNodePtyModule: NodePtyLoader = () => import
                 cause,
               }),
           });
-          return new NodePtyProcess(ptyProcess);
+          return new NodePtyProcess(ptyProcess, platform);
         }),
       } satisfies PtyAdapterShape;
     }),
