@@ -160,7 +160,7 @@ describe("getVisibleProviderUpdateStatuses", () => {
 });
 
 describe("providerUpdateNotificationKey", () => {
-  it("keys by provider/version and ignores ordering", () => {
+  it("keys by provider/version/actionability and ignores ordering", () => {
     const left = providerUpdateNotificationKey([
       providerStatus("pi", {
         versionAdvisory: {
@@ -181,6 +181,21 @@ describe("providerUpdateNotificationKey", () => {
     ]);
 
     expect(left).toBe(right);
+  });
+
+  it("changes when an unchanged provider version becomes manual-only", () => {
+    const actionable = providerStatus("codex");
+    const manualOnly = providerStatus("codex", {
+      versionAdvisory: {
+        ...actionable.versionAdvisory!,
+        canUpdate: false,
+        updateCommand: null,
+      },
+    });
+
+    expect(providerUpdateNotificationKey([actionable])).not.toBe(
+      providerUpdateNotificationKey([manualOnly]),
+    );
   });
 });
 

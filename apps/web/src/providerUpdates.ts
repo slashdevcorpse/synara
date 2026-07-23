@@ -354,7 +354,11 @@ export function providerUpdateNotificationKey(
 ): string | null {
   const parts = providers
     .map((provider) =>
-      [provider.provider, provider.versionAdvisory?.latestVersion ?? "unknown"].join(":"),
+      [
+        provider.provider,
+        provider.versionAdvisory?.latestVersion ?? "unknown",
+        shouldOfferProviderUpdateAction(provider) ? "actionable" : "manual",
+      ].join(":"),
     )
     .toSorted();
 

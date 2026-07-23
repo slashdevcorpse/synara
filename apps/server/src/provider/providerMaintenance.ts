@@ -350,7 +350,7 @@ export function makeProviderMaintenanceCapabilities(input: {
   readonly provider: ProviderKind;
   readonly packageName: string | null;
   readonly latestVersionSource?: ProviderLatestVersionSource | null;
-  readonly advisoryLatestVersionSource?: ProviderLatestVersionSource | null;
+  readonly advisoryLatestVersionSource?: ProviderLatestVersionSource | null | undefined;
   readonly updateExecutable: string | null;
   readonly updateArgs: ReadonlyArray<string>;
   readonly updateLockKey: string | null;
@@ -477,7 +477,7 @@ export function providerMaintenanceTargetsShareUpdateDestination(
 function makeManualOnlyProviderMaintenanceCapabilities(input: {
   readonly provider: ProviderKind;
   readonly packageName: string | null;
-  readonly advisoryLatestVersionSource?: ProviderLatestVersionSource | null;
+  readonly advisoryLatestVersionSource?: ProviderLatestVersionSource | null | undefined;
 }): ProviderMaintenanceCapabilities {
   return makeProviderMaintenanceCapabilities({
     provider: input.provider,
@@ -2199,9 +2199,10 @@ export const enrichProviderStatusWithVersionAdvisory = Effect.fn(
           latestVersionSource: maintenanceCapabilities.advisoryLatestVersionSource,
         }
       : maintenanceCapabilities;
-  const latestVersion = yield* resolveLatestProviderVersion(advisoryCapabilities, {
-    forceRefresh: options?.forceRefresh,
-  });
+  const latestVersion = yield* resolveLatestProviderVersion(
+    advisoryCapabilities,
+    options?.forceRefresh === undefined ? undefined : { forceRefresh: options.forceRefresh },
+  );
   return {
     ...status,
     versionAdvisory: createProviderVersionAdvisory({
