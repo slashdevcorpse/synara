@@ -102,6 +102,7 @@ import {
   isProviderUpdateActive,
   providerUpdateNotificationKey,
   resolveProviderUpdateManualCommand,
+  shouldOfferProviderUpdateAction,
   PROVIDER_UPDATE_INITIAL_REFRESH_DELAY_MS,
   PROVIDER_UPDATE_REFRESH_INTERVAL_MS,
   withProviderUpdateTimeout,
@@ -537,10 +538,10 @@ function ProviderUpdateNotifications() {
     providers: serverConfigQuery.data?.providers ?? [],
     hiddenProviders: settings.hiddenProviders,
     serverSettings: providerUpdateServerSettings,
-    oneClickOnly: true,
   });
   const oneClickProviders = outdatedProviders.filter(
-    (provider) => !isProviderUpdateActive(provider),
+    (provider) =>
+      shouldOfferProviderUpdateAction(provider) && !isProviderUpdateActive(provider),
   );
   const notificationKey = providerUpdateNotificationKey(outdatedProviders);
 
@@ -563,7 +564,6 @@ function ProviderUpdateNotifications() {
 
     if (
       outdatedProviders.length === 0 ||
-      oneClickProviders.length === 0 ||
       !notificationKey ||
       isUpdatingAll ||
       activeToastRef.current ||
@@ -615,12 +615,16 @@ function ProviderUpdateNotifications() {
       },
       data: {
         onClose: closeTrackedPrompt,
-        secondaryActionProps: {
-          children: "Update all",
-          onClick: () => {
-            void updateAll(oneClickProviders);
-          },
-        },
+        ...(oneClickProviders.length > 0
+          ? {
+              secondaryActionProps: {
+                children: "Update all",
+                onClick: () => {
+                  void updateAll(oneClickProviders);
+                },
+              },
+            }
+          : {}),
       },
     });
     activeToastRef.current = { kind: "prompt", key: notificationKey, toastId };

@@ -12,6 +12,7 @@ import { Effect, FileSystem, Fiber } from "effect";
 import {
   createProviderVersionAdvisory,
   deriveNpmGlobalPrefix,
+  enrichProviderStatusWithVersionAdvisory,
   makeCommandPathSuffixMatcher,
   normalizeCommandPath,
   parseGenericCliVersion,
@@ -36,6 +37,7 @@ const CODEX_DEFINITION = {
   npmPackageName: "@openai/codex",
   allowedInstallSources: ["npm", "bun", "pnpm", "homebrew", "native"],
   homebrew: { name: "codex", kind: "cask" },
+  advisoryLatestVersionSource: { kind: "npm", name: "@openai/codex" },
   nativeUpdate: {
     executable: "codex",
     args: () => ["update"],
@@ -55,6 +57,7 @@ const OPENCODE_DEFINITION = {
   npmPackageName: "opencode-ai",
   allowedInstallSources: ["npm", "bun", "pnpm", "homebrew", "native"],
   homebrew: { name: "anomalyco/tap/opencode", kind: "formula" },
+  advisoryLatestVersionSource: { kind: "npm", name: "opencode-ai" },
   nativeUpdate: {
     executable: "opencode",
     args: (installSource) =>
@@ -85,6 +88,7 @@ const DROID_DEFINITION = {
   npmPackageName: "droid",
   allowedInstallSources: ["npm"],
   homebrew: null,
+  advisoryLatestVersionSource: { kind: "npm", name: "droid" },
   nativeUpdate: null,
 } as const satisfies PackageManagedProviderMaintenanceDefinition;
 
@@ -183,6 +187,7 @@ function latestNpmCapabilities(packageName: string): ProviderMaintenanceCapabili
     provider: "codex",
     packageName,
     latestVersionSource: { kind: "npm", name: packageName },
+    advisoryLatestVersionSource: null,
     update: null,
   };
 }
@@ -411,10 +416,16 @@ describe("providerMaintenance", () => {
       allowedInstallSources: ["npm"],
     } as const satisfies PackageManagedProviderMaintenanceDefinition;
 
-    assert.strictEqual(
-      resolvePackageManagedProviderMaintenance(manualDefinition, npmOptions).update,
-      null,
+    const manualCapabilities = resolvePackageManagedProviderMaintenance(
+      manualDefinition,
+      npmOptions,
     );
+    assert.strictEqual(manualCapabilities.update, null);
+    assert.strictEqual(manualCapabilities.latestVersionSource, null);
+    assert.deepStrictEqual(manualCapabilities.advisoryLatestVersionSource, {
+      kind: "npm",
+      name: "@openai/codex",
+    });
     assert.strictEqual(
       resolvePackageManagedProviderMaintenance(npmOnlyDefinition, {
         platform: "darwin",
@@ -669,6 +680,11 @@ describe("providerMaintenance", () => {
     assert.strictEqual(result.customChannelCapabilities.update, null);
     assert.strictEqual(result.prereleaseCapabilities.update, null);
     assert.strictEqual(result.unprovenChannelCapabilities.update, null);
+    assert.strictEqual(result.unprovenChannelCapabilities.latestVersionSource, null);
+    assert.deepStrictEqual(result.unprovenChannelCapabilities.advisoryLatestVersionSource, {
+      kind: "npm",
+      name: "@openai/codex",
+    });
     const renderedPrefix = /\s/u.test(result.npmPrefix)
       ? `"${result.npmPrefix}"`
       : result.npmPrefix;
@@ -1312,6 +1328,11 @@ describe("providerMaintenance", () => {
       ? `"${result.nativeBinaryPath}"`
       : result.nativeBinaryPath;
     assert.ok(result.capabilities.update);
+    assert.strictEqual(result.capabilities.latestVersionSource, null);
+    assert.deepStrictEqual(result.capabilities.advisoryLatestVersionSource, {
+      kind: "npm",
+      name: "@openai/codex",
+    });
     assert.strictEqual(result.capabilities.update.command, `${renderedBinaryPath} update`);
     assert.strictEqual(result.capabilities.update.executable, result.nativeBinaryPath);
     assert.deepStrictEqual(result.capabilities.update.args, ["update"]);
@@ -1322,6 +1343,56 @@ describe("providerMaintenance", () => {
         "win32",
       )}`,
     );
+    const advisory = createProviderVersionAdvisory({
+      provider: "codex",
+      currentVersion: "0.144.1",
+      latestVersion: "0.145.0",
+      maintenanceCapabilities: result.capabilities,
+    });
+    assert.strictEqual(advisory.status, "behind_latest");
+    assert.strictEqual(advisory.canUpdate, true);
+    assert.strictEqual(advisory.updateCommand, result.capabilities.update.command);
+
+    let fetchCount = 0;
+    const enriched = await Effect.runPromise(
+      withFetchMock(
+        makeFetchMock(() => {
+          fetchCount += 1;
+          return Promise.resolve(npmVersionResponse("0.145.0"));
+        }),
+        Effect.gen(function* () {
+          const status = {
+            provider: "codex" as const,
+            status: "ready" as const,
+            available: true,
+            authStatus: "authenticated" as const,
+            version: "0.144.1",
+            checkedAt: "2026-07-23T12:00:00.000Z",
+          };
+          const maintenanceChannel = yield* enrichProviderStatusWithVersionAdvisory(
+            status,
+            result.capabilities,
+            { forceRefresh: true },
+          );
+          const readOnlyAdvisory = yield* enrichProviderStatusWithVersionAdvisory(
+            status,
+            result.capabilities,
+            {
+              forceRefresh: true,
+              useAdvisoryLatestVersionSource: true,
+            },
+          );
+          return { maintenanceChannel, readOnlyAdvisory };
+        }),
+      ),
+    );
+    assert.strictEqual(fetchCount, 1);
+    assert.strictEqual(enriched.maintenanceChannel.versionAdvisory?.status, "unknown");
+    assert.strictEqual(enriched.maintenanceChannel.versionAdvisory?.latestVersion, null);
+    assert.strictEqual(enriched.maintenanceChannel.versionAdvisory?.canUpdate, true);
+    assert.strictEqual(enriched.readOnlyAdvisory.versionAdvisory?.status, "behind_latest");
+    assert.strictEqual(enriched.readOnlyAdvisory.versionAdvisory?.latestVersion, "0.145.0");
+    assert.strictEqual(enriched.readOnlyAdvisory.versionAdvisory?.canUpdate, true);
   });
 
   it("does not guess an update command for unclassified binaries", () => {
@@ -1332,6 +1403,134 @@ describe("providerMaintenance", () => {
     });
 
     assert.strictEqual(capabilities.update, null);
+    assert.strictEqual(capabilities.latestVersionSource, null);
+    assert.deepStrictEqual(capabilities.advisoryLatestVersionSource, {
+      kind: "npm",
+      name: "@openai/codex",
+    });
+  });
+
+  win(
+    "advises an exact OpenCode npm shim without legacy channel fields but never authorizes mutation",
+    async () => {
+      const result = await Effect.runPromise(
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystem.FileSystem;
+          const tempDirectory = yield* fileSystem.makeTempDirectoryScoped({
+            prefix: "synara-provider-maintenance-opencode-advisory-",
+          });
+          const npmPrefix = NodePath.join(tempDirectory, "npm");
+          const packageManifestPath = NodePath.join(
+            npmPrefix,
+            "node_modules",
+            "opencode-ai",
+            "package.json",
+          );
+          const packageBinTarget = "bin/opencode";
+          const packageBinPath = NodePath.join(
+            NodePath.dirname(packageManifestPath),
+            ...packageBinTarget.split("/"),
+          );
+          const shimPath = NodePath.join(npmPrefix, "opencode.cmd");
+          yield* fileSystem.makeDirectory(NodePath.dirname(packageBinPath), { recursive: true });
+          yield* fileSystem.writeFileString(packageBinPath, "console.log('opencode fixture');\n");
+          yield* fileSystem.writeFileString(
+            packageManifestPath,
+            `${JSON.stringify({
+              name: "opencode-ai",
+              version: "1.14.50",
+              bin: { opencode: packageBinTarget },
+            })}\n`,
+          );
+          yield* fileSystem.writeFileString(
+            shimPath,
+            windowsNpmCmdShim("opencode-ai", packageBinTarget),
+          );
+          yield* writeWindowsNpmManagerRuntime(fileSystem, npmPrefix);
+
+          const capabilities = yield* resolveProviderMaintenanceCapabilitiesEffect(
+            OPENCODE_DEFINITION,
+            {
+              binaryPath: shimPath,
+              env: { PATH: npmPrefix, PATHEXT: ".COM;.EXE;.BAT;.CMD" },
+              platform: "win32",
+            },
+          );
+          const status = yield* withFetchMock(
+            makeFetchMock(() => Promise.resolve(npmVersionResponse("1.18.4"))),
+            enrichProviderStatusWithVersionAdvisory(
+              {
+                provider: "opencode",
+                status: "ready",
+                available: true,
+                authStatus: "authenticated",
+                version: "1.14.50",
+                checkedAt: "2026-07-23T12:00:00.000Z",
+              },
+              capabilities,
+              {
+                forceRefresh: true,
+                useAdvisoryLatestVersionSource: true,
+              },
+            ),
+          );
+          return { capabilities, status };
+        }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+      );
+
+      assert.strictEqual(result.capabilities.update, null);
+      assert.strictEqual(result.capabilities.latestVersionSource, null);
+      assert.deepStrictEqual(result.capabilities.advisoryLatestVersionSource, {
+        kind: "npm",
+        name: "opencode-ai",
+      });
+      assert.strictEqual(result.status.versionAdvisory?.status, "behind_latest");
+      assert.strictEqual(result.status.versionAdvisory?.currentVersion, "1.14.50");
+      assert.strictEqual(result.status.versionAdvisory?.latestVersion, "1.18.4");
+      assert.strictEqual(result.status.versionAdvisory?.canUpdate, false);
+      assert.strictEqual(result.status.versionAdvisory?.updateCommand, null);
+    },
+  );
+
+  win("advises an unverified Droid install without granting update authority", async () => {
+    const binaryPath = "C:\\Users\\Test\\bin\\droid.exe";
+    const capabilities = resolvePackageManagedProviderMaintenance(DROID_DEFINITION, {
+      binaryPath,
+      realCommandPath: binaryPath,
+      platform: "win32",
+    });
+    const status = await Effect.runPromise(
+      withFetchMock(
+        makeFetchMock(() => Promise.resolve(npmVersionResponse("0.178.0"))),
+        enrichProviderStatusWithVersionAdvisory(
+          {
+            provider: "droid",
+            status: "ready",
+            available: true,
+            authStatus: "authenticated",
+            version: "0.174.0",
+            checkedAt: "2026-07-23T12:00:00.000Z",
+          },
+          capabilities,
+          {
+            forceRefresh: true,
+            useAdvisoryLatestVersionSource: true,
+          },
+        ),
+      ),
+    );
+
+    assert.strictEqual(capabilities.update, null);
+    assert.strictEqual(capabilities.latestVersionSource, null);
+    assert.deepStrictEqual(capabilities.advisoryLatestVersionSource, {
+      kind: "npm",
+      name: "droid",
+    });
+    assert.strictEqual(status.versionAdvisory?.status, "behind_latest");
+    assert.strictEqual(status.versionAdvisory?.currentVersion, "0.174.0");
+    assert.strictEqual(status.versionAdvisory?.latestVersion, "0.178.0");
+    assert.strictEqual(status.versionAdvisory?.canUpdate, false);
+    assert.strictEqual(status.versionAdvisory?.updateCommand, null);
   });
 
   it("does not classify a Windows Codex suffix as standalone on POSIX", () => {

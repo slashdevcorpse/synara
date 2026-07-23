@@ -2269,6 +2269,8 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
       });
 
       assert.ok(capabilities.update);
+      assert.strictEqual(capabilities.latestVersionSource, null);
+      assert.strictEqual(capabilities.advisoryLatestVersionSource, null);
       assert.strictEqual(capabilities.update.executable, binaryPath);
       assert.deepStrictEqual(capabilities.update.args, ["update"]);
       assert.strictEqual(capabilities.update.lockKey, "antigravity-native:/Users/test/.local/bin");
@@ -2289,6 +2291,11 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
       });
 
       assert.ok(capabilities.update);
+      assert.strictEqual(capabilities.latestVersionSource, null);
+      assert.deepStrictEqual(capabilities.advisoryLatestVersionSource, {
+        kind: "npm",
+        name: "@openai/codex",
+      });
       assert.strictEqual(capabilities.update.command, `${binaryPath} update`);
       assert.strictEqual(capabilities.update.executable, binaryPath);
       assert.deepStrictEqual(capabilities.update.args, ["update"]);
@@ -2324,6 +2331,8 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
       });
 
       assert.ok(standalone.update);
+      assert.strictEqual(standalone.latestVersionSource, null);
+      assert.strictEqual(standalone.advisoryLatestVersionSource, null);
       assert.strictEqual(standalone.update.executable, visiblePath);
       assert.deepStrictEqual(standalone.update.args, ["update"]);
       assert.strictEqual(
@@ -2331,6 +2340,8 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
         "cursor-agent-native:/Users/test/.local/share/cursor-agent",
       );
       assert.strictEqual(editor.update, null);
+      assert.strictEqual(editor.latestVersionSource, null);
+      assert.strictEqual(editor.advisoryLatestVersionSource, null);
     });
 
     it("updates either exact Factory Droid npm identity through its owning manager", () => {
@@ -2388,6 +2399,11 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
 
         assert.strictEqual(capabilities.packageName, "droid");
         assert.ok(capabilities.update);
+        assert.strictEqual(capabilities.latestVersionSource, null);
+        assert.deepStrictEqual(capabilities.advisoryLatestVersionSource, {
+          kind: "npm",
+          name: "droid",
+        });
         assert.strictEqual(capabilities.update.executable, binaryPath);
         assert.deepStrictEqual(capabilities.update.args, ["update"]);
         assert.strictEqual(capabilities.update.lockKey, "droid-native:c:/users/test/bin");
@@ -2401,7 +2417,61 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
         commandDirectory: "C:\\Users\\Test\\bin",
       });
       assert.strictEqual(unresolved.update, null);
+      assert.strictEqual(unresolved.latestVersionSource, null);
+      assert.deepStrictEqual(unresolved.advisoryLatestVersionSource, {
+        kind: "npm",
+        name: "droid",
+      });
     });
+
+    it.effect("keeps Windows Antigravity unavailable and non-actionable", () =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "provider-health-windows-antigravity-",
+        });
+        const settings = {
+          ...allProvidersDisabledServerSettings,
+          enableProviderUpdateChecks: true,
+          providers: {
+            ...allProvidersDisabledServerSettings.providers,
+            antigravity: {
+              ...DEFAULT_SERVER_SETTINGS.providers.antigravity,
+              enabled: true,
+              binaryPath: "agy",
+            },
+          },
+        } satisfies typeof DEFAULT_SERVER_SETTINGS;
+        let spawnCount = 0;
+        const layer = makeProviderHealthLive({
+          platform: "win32",
+          prepareProcess: prepareContainedWindowsProviderForTest,
+        }).pipe(
+          Layer.provideMerge(providerServiceWithoutRuntimesLayer),
+          Layer.provideMerge(ServerSettingsService.layerTest(settings)),
+          Layer.provideMerge(ServerConfig.layerTest(process.cwd(), baseDir)),
+          Layer.provideMerge(
+            mockSpawnerLayer(() => {
+              spawnCount += 1;
+              return { stdout: "agy 1.1.2\n", stderr: "", code: 0 };
+            }),
+          ),
+        );
+
+        const statuses = yield* Effect.gen(function* () {
+          const providerHealth = yield* ProviderHealth;
+          return yield* providerHealth.refresh;
+        }).pipe(Effect.provide(layer));
+        const antigravity = statuses.find((status) => status.provider === "antigravity");
+
+        assert.strictEqual(spawnCount, 0);
+        assert.strictEqual(antigravity?.available, false);
+        assert.strictEqual(antigravity?.versionAdvisory?.status, "unknown");
+        assert.strictEqual(antigravity?.versionAdvisory?.latestVersion, null);
+        assert.strictEqual(antigravity?.versionAdvisory?.canUpdate, false);
+        assert.strictEqual(antigravity?.versionAdvisory?.updateCommand, null);
+      }),
+    );
 
     it("updates npm-managed Kilo through its matching package manager and PATH", () => {
       const definition = PACKAGE_MANAGED_PROVIDER_UPDATES.kilo;

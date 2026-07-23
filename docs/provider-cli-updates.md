@@ -14,7 +14,7 @@ The required behavior is:
 
 1. Resolve the exact configured provider command, including an explicit custom binary path.
 2. Identify the owning install source and install root. A manager or layout is supported only where the provider section below lists it under **Implemented in this build**.
-3. Compare the resolved binary only with the latest version from the same channel. An npm release does not prove that a Homebrew, WinGet, alpha, or enterprise-managed install is stale.
+3. To authorize or verify maintenance, compare the resolved binary only with the latest version from the same channel. An npm release does not prove that a Homebrew, WinGet, alpha, or enterprise-managed update target is current or stale.
 4. Refuse one-click update when the source or target is ambiguous. When the current UI does not expose the resolved path or detected source, direct the operator to the troubleshooting commands and vendor instructions instead of guessing.
 5. Do not interrupt an active turn, review, compaction, pending approval or user-input request, provider background task, or provider-launched tool task. If the implementation cannot prove that all Super Synara-owned runtimes using the target are idle, it must defer or reject the update.
 6. Quiesce only idle runtimes owned by Super Synara, wait for their process trees to exit, and preserve their provider resume cursors. If ownership, idleness, resumability, or exit cannot be proven, defer the update before modifying the installation.
@@ -24,6 +24,12 @@ The required behavior is:
 10. Preserve provider authentication, configuration, conversations, and Super Synara history. Uninstall/reinstall and deletion of provider state directories are not update fallbacks.
 
 An update may hold new turns behind an explicit drain barrier after existing work has settled. It must never send an interrupt merely to make the update start sooner.
+
+### Read-only advisories are not mutation proof
+
+Super Synara may show a nonblocking, read-only latest-version advisory from an explicitly trusted provider metadata source even when it cannot prove which installation channel owns the resolved binary. Current provider-wide fallbacks are limited to the official npm metadata for Codex, OpenCode, and Droid. This advisory is a prompt to review provider settings; it does not prove the selected installation can reach that version.
+
+The advisory source never authorizes an update, supplies an update command, or participates in pre-update or post-update verification. `canUpdate` remains true only when the independent exact-target ownership checks succeed, and an unverified install remains manual-only. A verified native updater may remain actionable while displaying the read-only advisory, but its maintenance result is still classified from exact target and same-channel evidence only.
 
 ## Exact binary and source rules
 
@@ -48,7 +54,7 @@ The current build must not translate updater exit code zero directly into “upd
 - **Completed but change unverified (`unverified`):** the updater exited successfully, but Super Synara cannot prove the post-update path, owning source/channel, or comparable version. This is not “updated.”
 - **Failed:** the updater exited unsuccessfully, timed out, or left no valid configured binary.
 
-If comparable latest-version metadata is unavailable for the detected source/channel, the advisory state is **unknown**. Do not compare an npm release with a Homebrew, WinGet, alpha, native, enterprise-managed, or other independently published channel and label it current or outdated.
+If comparable latest-version metadata is unavailable for the detected source/channel, the maintenance-verification state is **unknown**. A separate read-only advisory may still report an explicitly trusted provider release in the UI, but it must not be reused to label the detected channel current, short-circuit its updater, or verify its result.
 
 ## Provider channel boundaries
 

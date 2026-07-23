@@ -149,6 +149,13 @@ describe("getVisibleProviderUpdateStatuses", () => {
         oneClickOnly: true,
       }).map((provider) => provider.provider),
     ).toEqual(["codex"]);
+    expect(shouldOfferProviderUpdateAction(manualOnly)).toBe(false);
+    expect(getProviderUpdatePresentation(manualOnly)).toMatchObject({
+      kind: "behind_latest",
+      label: "v1.0.0 -> v1.1.0",
+      isVerifiedSuccess: false,
+      severity: "warning",
+    });
   });
 });
 

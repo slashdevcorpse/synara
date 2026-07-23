@@ -80,6 +80,7 @@ export interface ProviderMaintenanceCapabilities {
   readonly provider: ProviderKind;
   readonly packageName: string | null;
   readonly latestVersionSource: ProviderLatestVersionSource | null;
+  readonly advisoryLatestVersionSource: ProviderLatestVersionSource | null;
   readonly update: ProviderMaintenanceCommandAction | null;
 }
 
@@ -141,6 +142,12 @@ export interface PackageManagedProviderMaintenanceDefinition {
     readonly kind: "formula" | "cask";
   } | null;
   readonly latestVersionSource?: ProviderLatestVersionSource | null;
+  /**
+   * Explicitly trusted read-only metadata fallback used when update ownership
+   * cannot be proven or an exact maintenance channel has no latest source.
+   * This never authorizes or verifies a mutation.
+   */
+  readonly advisoryLatestVersionSource?: ProviderLatestVersionSource | null;
   readonly nativeUpdate: {
     readonly executable: string;
     readonly args: (installSource: ProviderInstallSource) => ReadonlyArray<string>;
@@ -343,6 +350,7 @@ export function makeProviderMaintenanceCapabilities(input: {
   readonly provider: ProviderKind;
   readonly packageName: string | null;
   readonly latestVersionSource?: ProviderLatestVersionSource | null;
+  readonly advisoryLatestVersionSource?: ProviderLatestVersionSource | null;
   readonly updateExecutable: string | null;
   readonly updateArgs: ReadonlyArray<string>;
   readonly updateLockKey: string | null;
@@ -374,6 +382,7 @@ export function makeProviderMaintenanceCapabilities(input: {
           ? { kind: "npm", name: input.packageName }
           : null
         : input.latestVersionSource,
+    advisoryLatestVersionSource: input.advisoryLatestVersionSource ?? null,
     update,
   };
 }
@@ -468,11 +477,13 @@ export function providerMaintenanceTargetsShareUpdateDestination(
 function makeManualOnlyProviderMaintenanceCapabilities(input: {
   readonly provider: ProviderKind;
   readonly packageName: string | null;
+  readonly advisoryLatestVersionSource?: ProviderLatestVersionSource | null;
 }): ProviderMaintenanceCapabilities {
   return makeProviderMaintenanceCapabilities({
     provider: input.provider,
     packageName: input.packageName,
     latestVersionSource: null,
+    advisoryLatestVersionSource: input.advisoryLatestVersionSource,
     updateExecutable: null,
     updateArgs: [],
     updateLockKey: null,
@@ -491,6 +502,7 @@ function makeGlobalPackageManagerProviderMaintenanceCapabilities(
     return makeManualOnlyProviderMaintenanceCapabilities({
       provider: definition.provider,
       packageName: null,
+      advisoryLatestVersionSource: definition.advisoryLatestVersionSource,
     });
   }
   const globalRoot = nonEmptyString(target.canonicalInstallRoot);
@@ -498,11 +510,13 @@ function makeGlobalPackageManagerProviderMaintenanceCapabilities(
     return makeManualOnlyProviderMaintenanceCapabilities({
       provider: definition.provider,
       packageName: definition.npmPackageName,
+      advisoryLatestVersionSource: definition.advisoryLatestVersionSource,
     });
   }
   return makeProviderMaintenanceCapabilities({
     provider: definition.provider,
     packageName: definition.npmPackageName,
+    advisoryLatestVersionSource: definition.advisoryLatestVersionSource,
     updateExecutable: target.managerCommand.executablePath,
     updateArgs: [
       ...target.managerCommand.argsPrefix,
@@ -561,6 +575,7 @@ function makeHomebrewProviderMaintenanceCapabilities(
     return makeManualOnlyProviderMaintenanceCapabilities({
       provider: definition.provider,
       packageName: definition.npmPackageName,
+      advisoryLatestVersionSource: definition.advisoryLatestVersionSource,
     });
   }
 
@@ -569,12 +584,14 @@ function makeHomebrewProviderMaintenanceCapabilities(
     return makeManualOnlyProviderMaintenanceCapabilities({
       provider: definition.provider,
       packageName: definition.npmPackageName,
+      advisoryLatestVersionSource: definition.advisoryLatestVersionSource,
     });
   }
   return makeProviderMaintenanceCapabilities({
     provider: definition.provider,
     packageName: null,
     latestVersionSource: resolveLatestVersionSourceForInstallSource(definition, "homebrew"),
+    advisoryLatestVersionSource: definition.advisoryLatestVersionSource,
     updateExecutable: target.managerExecutablePath,
     updateArgs:
       definition.homebrew.kind === "cask"
@@ -624,6 +641,7 @@ function makeNativeProviderMaintenanceCapabilities(
     // Prefer explicit upstream metadata for channels like third-party Homebrew taps,
     // then fall back to the package manager channel when its public API is usable.
     latestVersionSource: resolveLatestVersionSourceForInstallSource(definition, installSource),
+    advisoryLatestVersionSource: definition.advisoryLatestVersionSource,
     updateExecutable: target.visibleCommandPath,
     updateArgs: definition.nativeUpdate.args(installSource),
     updateLockKey: `${definition.nativeUpdate.lockKey}:${normalizeCommandPath(target.canonicalInstallRoot, target.platform)}`,
@@ -686,6 +704,7 @@ function makeProviderMaintenanceForInstallSource(input: {
     return makeManualOnlyProviderMaintenanceCapabilities({
       provider: definition.provider,
       packageName: definition.npmPackageName,
+      advisoryLatestVersionSource: definition.advisoryLatestVersionSource,
     });
   }
   if (
@@ -695,6 +714,7 @@ function makeProviderMaintenanceForInstallSource(input: {
     return makeManualOnlyProviderMaintenanceCapabilities({
       provider: definition.provider,
       packageName: definition.npmPackageName,
+      advisoryLatestVersionSource: definition.advisoryLatestVersionSource,
     });
   }
   if (
@@ -706,6 +726,7 @@ function makeProviderMaintenanceForInstallSource(input: {
       makeManualOnlyProviderMaintenanceCapabilities({
         provider: definition.provider,
         packageName: definition.npmPackageName,
+        advisoryLatestVersionSource: definition.advisoryLatestVersionSource,
       })
     );
   }
@@ -715,6 +736,7 @@ function makeProviderMaintenanceForInstallSource(input: {
       makeManualOnlyProviderMaintenanceCapabilities({
         provider: definition.provider,
         packageName: definition.npmPackageName,
+        advisoryLatestVersionSource: definition.advisoryLatestVersionSource,
       })
     );
   }
@@ -733,6 +755,7 @@ function makeProviderMaintenanceForInstallSource(input: {
   return makeManualOnlyProviderMaintenanceCapabilities({
     provider: definition.provider,
     packageName: definition.npmPackageName,
+    advisoryLatestVersionSource: definition.advisoryLatestVersionSource,
   });
 }
 
@@ -1325,6 +1348,7 @@ function manualCapabilities(
   return makeManualOnlyProviderMaintenanceCapabilities({
     provider: definition.provider,
     packageName: definition.npmPackageName,
+    advisoryLatestVersionSource: definition.advisoryLatestVersionSource,
   });
 }
 
@@ -2149,7 +2173,10 @@ export const enrichProviderStatusWithVersionAdvisory = Effect.fn(
 )(function* (
   status: ServerProviderStatus,
   maintenanceCapabilities: ProviderMaintenanceCapabilities,
-  options?: { readonly forceRefresh?: boolean },
+  options?: {
+    readonly forceRefresh?: boolean;
+    readonly useAdvisoryLatestVersionSource?: boolean;
+  },
 ) {
   if (!status.available || !status.version) {
     return {
@@ -2163,7 +2190,18 @@ export const enrichProviderStatusWithVersionAdvisory = Effect.fn(
     };
   }
 
-  const latestVersion = yield* resolveLatestProviderVersion(maintenanceCapabilities, options);
+  const advisoryCapabilities =
+    options?.useAdvisoryLatestVersionSource === true &&
+    maintenanceCapabilities.latestVersionSource === null &&
+    maintenanceCapabilities.advisoryLatestVersionSource !== null
+      ? {
+          ...maintenanceCapabilities,
+          latestVersionSource: maintenanceCapabilities.advisoryLatestVersionSource,
+        }
+      : maintenanceCapabilities;
+  const latestVersion = yield* resolveLatestProviderVersion(advisoryCapabilities, {
+    forceRefresh: options?.forceRefresh,
+  });
   return {
     ...status,
     versionAdvisory: createProviderVersionAdvisory({
