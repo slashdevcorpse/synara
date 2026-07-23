@@ -4,14 +4,7 @@
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { prepareWindowsSafeProcess } from "@synara/shared/windowsProcess";
-import {
-  copyFileSync,
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as Path from "node:path";
 
@@ -99,7 +92,7 @@ it.runIf(process.platform === "win32")(
       copyFileSync(process.execPath, nodePath);
       writeFileSync(
         npmPrefixScriptPath,
-        'process.stdout.write(`${process.env.SYNARA_EXPECTED_NPM_PREFIX}\\n`);\n',
+        "process.stdout.write(`${process.env.SYNARA_EXPECTED_NPM_PREFIX}\\n`);\n",
       );
       writeFileSync(
         npmCommandPath,

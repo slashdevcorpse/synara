@@ -3482,9 +3482,7 @@ export function makeProviderHealthLive(
                       : Effect.logWarning("Provider health probe failed", {
                           provider,
                           cause: Cause.pretty(cause),
-                        }).pipe(
-                          Effect.as(Option.some(makeFailedProviderHealthStatus(provider))),
-                        ),
+                        }).pipe(Effect.as(Option.some(makeFailedProviderHealthStatus(provider)))),
                   ),
                 ),
               ),

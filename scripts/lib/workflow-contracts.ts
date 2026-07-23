@@ -1728,8 +1728,7 @@ function validateCiArchitecture(workflow: UnknownRecord, errors: string[]): void
   if (
     isRecord(windowsJob) &&
     (windowsJob.if !== undefined ||
-      (windowsJob["continue-on-error"] !== undefined &&
-        windowsJob["continue-on-error"] !== false))
+      (windowsJob["continue-on-error"] !== undefined && windowsJob["continue-on-error"] !== false))
   ) {
     errors.push(`${workflowPath} windows_x64 job must be unconditional and fail closed.`);
   }

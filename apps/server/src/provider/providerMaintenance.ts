@@ -386,10 +386,7 @@ export function providerMaintenanceTargetFingerprint(
       target.platform,
     ),
     managerCommand: {
-      executablePath: normalizeCommandPath(
-        target.managerCommand.executablePath,
-        target.platform,
-      ),
+      executablePath: normalizeCommandPath(target.managerCommand.executablePath, target.platform),
       argsPrefix: target.managerCommand.argsPrefix.map((arg) =>
         isAbsoluteCommandPath(arg, target.platform)
           ? normalizeCommandPath(arg, target.platform)
@@ -1570,9 +1567,7 @@ const resolveManagerExecutable = Effect.fn("resolveProviderMaintenanceManager")(
   return null;
 });
 
-const resolveWindowsNpmManagerCommand = Effect.fn(
-  "resolveWindowsNpmManagerCommand",
-)(function* (
+const resolveWindowsNpmManagerCommand = Effect.fn("resolveWindowsNpmManagerCommand")(function* (
   input: {
     readonly canonicalInstallRoot: string;
     readonly canonicalManagerExecutablePath: string;

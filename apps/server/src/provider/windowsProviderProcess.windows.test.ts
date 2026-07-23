@@ -212,13 +212,7 @@ describeWindows("Windows Job launcher native integration", () => {
     const root = mkdtempSync(join(tmpdir(), "synara-job-npm-prefix-"));
     const nodeDirectory = join(root, "Program Files", "nodejs");
     const nodePath = join(nodeDirectory, "node.exe");
-    const npmPrefixScriptPath = join(
-      nodeDirectory,
-      "node_modules",
-      "npm",
-      "bin",
-      "npm-prefix.js",
-    );
+    const npmPrefixScriptPath = join(nodeDirectory, "node_modules", "npm", "bin", "npm-prefix.js");
     const npmCommandPath = join(nodeDirectory, "npm.cmd");
     const expectedPrefix = join(root, "User Data", "npm");
 
@@ -227,7 +221,7 @@ describeWindows("Windows Job launcher native integration", () => {
       copyFileSync(process.execPath, nodePath);
       writeFileSync(
         npmPrefixScriptPath,
-        'process.stdout.write(`${process.env.SYNARA_EXPECTED_NPM_PREFIX}\\n`);\n',
+        "process.stdout.write(`${process.env.SYNARA_EXPECTED_NPM_PREFIX}\\n`);\n",
       );
       writeFileSync(
         npmCommandPath,

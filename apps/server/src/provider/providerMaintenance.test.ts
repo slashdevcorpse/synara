@@ -128,10 +128,7 @@ function windowsNpmCmdShim(packageName: string, binTarget: string): string {
   return `@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\n\r\nIF EXIST "%dp0%\\node.exe" (\r\n  SET "_prog=%dp0%\\node.exe"\r\n) ELSE (\r\n  SET "_prog=node"\r\n  SET PATHEXT=%PATHEXT:;.JS;=;%\r\n)\r\n\r\nendLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%" "%dp0%\\node_modules\\${windowsPackageName}\\${windowsBinTarget}" %*\r\n`;
 }
 
-function windowsNpmManagerCommand(
-  managerDirectory: string,
-  npmCliRoot = managerDirectory,
-) {
+function windowsNpmManagerCommand(managerDirectory: string, npmCliRoot = managerDirectory) {
   return {
     executablePath: NodePath.join(managerDirectory, "node.exe"),
     argsPrefix: [NodePath.join(npmCliRoot, "node_modules", "npm", "bin", "npm-cli.js")],
@@ -884,7 +881,10 @@ describe("providerMaintenance", () => {
         result.aliased.update.executable,
         result.aliased.update.target.managerCommand.executablePath,
       );
-      assert.strictEqual(result.aliased.update.target.managerExecutablePath, result.longManagerPath);
+      assert.strictEqual(
+        result.aliased.update.target.managerExecutablePath,
+        result.longManagerPath,
+      );
     },
   );
 

@@ -301,13 +301,7 @@ function fixtureWindowsNpmNodePath(fixture: ProviderCommandFixture): string {
 }
 
 function fixtureWindowsNpmCliPath(fixture: ProviderCommandFixture): string {
-  return NodePath.join(
-    fixture.commandDirectory,
-    "node_modules",
-    "npm",
-    "bin",
-    "npm-cli.js",
-  );
+  return NodePath.join(fixture.commandDirectory, "node_modules", "npm", "bin", "npm-cli.js");
 }
 
 function preparedProviderCommandMatches(input: {
@@ -389,10 +383,7 @@ function withIsolatedProviderCommands<A, E, R>(
           const fixture = { commandDirectory: canonicalCommandDirectory };
           const npmCliPath = fixtureWindowsNpmCliPath(fixture);
           yield* fileSystem.makeDirectory(NodePath.dirname(npmCliPath), { recursive: true });
-          yield* fileSystem.writeFileString(
-            fixtureWindowsNpmNodePath(fixture),
-            "node fixture\n",
-          );
+          yield* fileSystem.writeFileString(fixtureWindowsNpmNodePath(fixture), "node fixture\n");
           yield* fileSystem.writeFileString(npmCliPath, "console.log('npm fixture');\n");
         }
       }
