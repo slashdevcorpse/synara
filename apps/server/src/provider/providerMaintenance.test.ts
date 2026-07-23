@@ -716,6 +716,8 @@ describe("providerMaintenance", () => {
         );
         const { managerPath, managerCommand: bundledManagerCommand } =
           yield* writeWindowsNpmManagerRuntime(fileSystem, managerDirectory);
+        const bundledNpmCliPath = bundledManagerCommand.argsPrefix[0];
+        assert.ok(bundledNpmCliPath);
         const prefixManagerCommand = windowsNpmManagerCommand(managerDirectory, npmPrefix);
         yield* fileSystem.makeDirectory(NodePath.dirname(prefixManagerCommand.argsPrefix[0]), {
           recursive: true,
@@ -746,13 +748,10 @@ describe("providerMaintenance", () => {
         const bundledNpmCliMatches =
           bundledFallback.update !== null &&
           realpathSync.native(bundledFallback.update.args[0] ?? "") ===
-            realpathSync.native(bundledManagerCommand.argsPrefix[0]);
-        yield* fileSystem.remove(bundledManagerCommand.argsPrefix[0]);
+            realpathSync.native(bundledNpmCliPath);
+        yield* fileSystem.remove(bundledNpmCliPath);
         const missingNpmCli = yield* resolve();
-        yield* fileSystem.writeFileString(
-          bundledManagerCommand.argsPrefix[0],
-          "console.log('npm fixture');\n",
-        );
+        yield* fileSystem.writeFileString(bundledNpmCliPath, "console.log('npm fixture');\n");
         yield* fileSystem.remove(bundledManagerCommand.executablePath);
         const missingNode = yield* resolve();
         yield* fileSystem.writeFileString(bundledManagerCommand.executablePath, "node fixture\n");
