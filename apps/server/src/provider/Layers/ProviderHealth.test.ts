@@ -67,7 +67,10 @@ import {
   readCodexConfigModelProvider,
   stabilizeProviderStatusesAgainstTransientTimeouts,
 } from "./ProviderHealth";
-import { resolvePackageManagedProviderMaintenance } from "../providerMaintenance";
+import {
+  enrichProviderStatusWithVersionAdvisory,
+  resolvePackageManagedProviderMaintenance,
+} from "../providerMaintenance";
 import {
   isWindowsJobPreparedCommand,
   prepareResolvedWindowsProviderProcess,
@@ -2252,7 +2255,67 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
         commandDirectory: "/usr/local/bin",
       });
       assert.strictEqual(capabilities.update, null);
+      assert.strictEqual(capabilities.latestVersionSource, null);
+      assert.deepStrictEqual(capabilities.advisoryLatestVersionSource, {
+        kind: "npm",
+        name: "command-code",
+      });
     });
+
+    it.effect("advises a legacy Command Code install without granting update authority", () =>
+      withLatestNpmVersion(
+        "0.53.0",
+        Effect.gen(function* () {
+          const definition = PACKAGE_MANAGED_PROVIDER_UPDATES.commandCode;
+          assert.ok(definition);
+          const npmPrefix = "C:\\Users\\Test\\AppData\\Roaming\\npm";
+          const npmExecutable = `${npmPrefix}\\npm.cmd`;
+          const capabilities = resolvePackageManagedProviderMaintenance(definition, {
+            platform: "win32",
+            binaryPath: `${npmPrefix}\\command-code.cmd`,
+            realCommandPath: `${npmPrefix}\\node_modules\\command-code\\dist\\cli.js`,
+            canonicalInstallRoot: npmPrefix,
+            managerExecutablePath: npmExecutable,
+            realManagerExecutablePath: npmExecutable,
+            managerCommand: {
+              executablePath: `${npmPrefix}\\node.exe`,
+              argsPrefix: [`${npmPrefix}\\node_modules\\npm\\bin\\npm-cli.js`],
+            },
+          });
+          const status = yield* enrichProviderStatusWithVersionAdvisory(
+            {
+              provider: "commandCode",
+              status: "ready",
+              available: true,
+              authStatus: "authenticated",
+              version: "0.52.1",
+              checkedAt: "2026-07-23T12:00:00.000Z",
+            },
+            capabilities,
+            {
+              forceRefresh: true,
+              useAdvisoryLatestVersionSource: true,
+            },
+          );
+
+          assert.strictEqual(capabilities.update, null);
+          assert.strictEqual(capabilities.latestVersionSource, null);
+          assert.deepStrictEqual(capabilities.advisoryLatestVersionSource, {
+            kind: "npm",
+            name: "command-code",
+          });
+          assert.strictEqual(status.versionAdvisory?.status, "behind_latest");
+          assert.strictEqual(status.versionAdvisory?.currentVersion, "0.52.1");
+          assert.strictEqual(status.versionAdvisory?.latestVersion, "0.53.0");
+          assert.strictEqual(
+            status.versionAdvisory?.message,
+            "Install the update now or review provider settings.",
+          );
+          assert.strictEqual(status.versionAdvisory?.canUpdate, false);
+          assert.strictEqual(status.versionAdvisory?.updateCommand, null);
+        }),
+      ),
+    );
 
     it("registers Antigravity's native updater", () => {
       const definition = PACKAGE_MANAGED_PROVIDER_UPDATES.antigravity;
