@@ -9,7 +9,19 @@ import type { ServerProviderStatus } from "@synara/contracts";
 import { DEFAULT_SERVER_SETTINGS, ServerProviderUpdateError } from "@synara/contracts";
 import { buildWindowsBatchCommandArgs, resolveWindowsComSpec } from "@synara/shared/windowsProcess";
 import { describe, it, assert } from "@effect/vitest";
-import { Deferred, Effect, Fiber, FileSystem, Layer, Path, Result, Sink, Stream } from "effect";
+import {
+  Clock,
+  Deferred,
+  Duration,
+  Effect,
+  Fiber,
+  FileSystem,
+  Layer,
+  Path,
+  Result,
+  Sink,
+  Stream,
+} from "effect";
 import { TestClock } from "effect/testing";
 import * as PlatformError from "effect/PlatformError";
 import { ChildProcessSpawner } from "effect/unstable/process";
@@ -29,6 +41,7 @@ import {
 } from "../providerStatusCache";
 import {
   makeProviderMaintenanceGate,
+  ProviderMaintenanceBusyError,
   type ProviderMaintenanceGate,
 } from "../providerMaintenanceGate.ts";
 import {
@@ -67,6 +80,7 @@ import {
   readCodexConfigModelProvider,
   stabilizeProviderStatusesAgainstTransientTimeouts,
 } from "./ProviderHealth";
+import { PROVIDER_UPDATE_POST_PROBE_RETRY_DELAYS_MS } from "../providerUpdateVerification.ts";
 import {
   enrichProviderStatusWithVersionAdvisory,
   resolvePackageManagedProviderMaintenance,
@@ -1614,6 +1628,32 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
           let updatePrepareCount = 0;
           let updateSpawnCount = 0;
           let updaterCompleted = false;
+          let blockedOperationEntered = false;
+          let firstRetrySleepIntercepted = false;
+          const firstRetrySleepStarted = yield* Deferred.make<void>();
+          const releaseFirstRetrySleep = yield* Deferred.make<void>();
+          const baseClock = yield* Clock.Clock;
+          const controlledUpdateClock: Clock.Clock = {
+            currentTimeMillisUnsafe: () => baseClock.currentTimeMillisUnsafe(),
+            currentTimeMillis: baseClock.currentTimeMillis,
+            currentTimeNanosUnsafe: () => baseClock.currentTimeNanosUnsafe(),
+            currentTimeNanos: baseClock.currentTimeNanos,
+            sleep: (duration) => {
+              if (
+                !firstRetrySleepIntercepted &&
+                updaterCompleted &&
+                healthProbeCount === 2 &&
+                Duration.toMillis(duration) === PROVIDER_UPDATE_POST_PROBE_RETRY_DELAYS_MS[0]
+              ) {
+                firstRetrySleepIntercepted = true;
+                return Deferred.succeed(firstRetrySleepStarted, undefined).pipe(
+                  Effect.andThen(Deferred.await(releaseFirstRetrySleep)),
+                );
+              }
+              return baseClock.sleep(duration);
+            },
+          };
+          const maintenanceGate = yield* makeProviderMaintenanceGate;
           const prepareProcess: ProviderHealthProcessOptions["prepareProcess"] = (
             command,
             args,
@@ -1634,6 +1674,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
             platform: "win32",
             prepareProcess,
             processTreeKiller: syntheticProcessTreeKiller(72),
+            maintenanceGate,
           }).pipe(
             Layer.provideMerge(providerServiceWithoutRuntimesLayer),
             Layer.provideMerge(ServerSettingsService.layerTest(settings)),
@@ -1662,7 +1703,40 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
 
           const result = yield* Effect.gen(function* () {
             const providerHealth = yield* ProviderHealth;
-            return yield* TestClock.withLive(providerHealth.updateProvider({ provider: "droid" }));
+            const update = yield* providerHealth
+              .updateProvider({ provider: "droid" })
+              .pipe(Effect.provideService(Clock.Clock, controlledUpdateClock), Effect.forkChild);
+            yield* Deferred.await(firstRetrySleepStarted);
+            assert.strictEqual(healthProbeCount, 2);
+
+            const blocked = yield* maintenanceGate
+              .withOperation({
+                provider: "droid",
+                operation: "session.start",
+                run: Effect.sync(() => {
+                  blockedOperationEntered = true;
+                }),
+              })
+              .pipe(Effect.result);
+            assert.ok(Result.isFailure(blocked));
+            if (Result.isFailure(blocked)) {
+              assert.ok(blocked.failure instanceof ProviderMaintenanceBusyError);
+              assert.strictEqual(blocked.failure.latchedReason, null);
+            }
+            assert.strictEqual(blockedOperationEntered, false);
+
+            yield* Deferred.succeed(releaseFirstRetrySleep, undefined);
+            const updateResult = yield* Fiber.join(update);
+            assert.strictEqual(blockedOperationEntered, false);
+            assert.strictEqual(
+              yield* maintenanceGate.withOperation({
+                provider: "droid",
+                operation: "session.start.after-update",
+                run: Effect.succeed("released"),
+              }),
+              "released",
+            );
+            return updateResult;
           }).pipe(Effect.provide(layer));
           const droid = result.providers.find((provider) => provider.provider === "droid");
 

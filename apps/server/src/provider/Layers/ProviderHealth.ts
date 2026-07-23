@@ -4085,29 +4085,41 @@ export function makeProviderHealthLive(
           );
         });
 
-        const runUpdateHealthProbe = (
-          settings: ServerSettings,
+        const handleUpdateHealthProbeFailure = <E extends Error>(
+          probe: Effect.Effect<ServerProviderStatus, E>,
           phase: "pre-update" | "post-update",
         ) =>
-          maintenanceGate
-            .withOperation({
+          probe.pipe(
+            Effect.catch((cause) => {
+              const reason =
+                cause instanceof ProviderMaintenanceBusyError
+                  ? cause.message
+                  : `${phase === "pre-update" ? "Pre-update" : "Post-update"} provider health could not prove process exit. Restart Synara before using '${provider}' again. ${cause.message}`;
+              const error = new ServerProviderUpdateError({ provider, reason });
+              Object.defineProperty(error, "cause", { value: cause, enumerable: false });
+              return markTerminal({ status: "failed", message: reason }).pipe(
+                Effect.andThen(Effect.fail(error)),
+              );
+            }),
+          );
+
+        const runAdmittedPreUpdateHealthProbe = (settings: ServerSettings) =>
+          handleUpdateHealthProbeFailure(
+            maintenanceGate.withOperation({
               provider,
-              operation: `ProviderHealth.update.${phase}`,
+              operation: "ProviderHealth.update.pre-update",
               run: checkProviderStatusForSettings(settings, provider),
-            })
-            .pipe(
-              Effect.catch((cause) => {
-                const reason =
-                  cause instanceof ProviderMaintenanceBusyError
-                    ? cause.message
-                    : `${phase === "pre-update" ? "Pre-update" : "Post-update"} provider health could not prove process exit. Restart Synara before using '${provider}' again. ${cause.message}`;
-                const error = new ServerProviderUpdateError({ provider, reason });
-                Object.defineProperty(error, "cause", { value: cause, enumerable: false });
-                return markTerminal({ status: "failed", message: reason }).pipe(
-                  Effect.andThen(Effect.fail(error)),
-                );
-              }),
-            );
+            }),
+            "pre-update",
+          );
+
+        // The caller already owns exclusive maintenance. Reacquiring operation admission here
+        // would reject the update itself and release the gate before delayed replacement probes.
+        const runExclusivePostUpdateHealthProbe = (settings: ServerSettings) =>
+          handleUpdateHealthProbeFailure(
+            checkProviderStatusForSettings(settings, provider),
+            "post-update",
+          );
 
         const runPostUpdateVerificationProbe = Effect.fn("runProviderPostUpdateVerificationProbe")(
           function* (stableGeneration: ProviderUpdateSettingsGeneration) {
@@ -4116,7 +4128,7 @@ export function makeProviderHealthLive(
             const targetChangedBeforeProbe =
               !update ||
               !updateDestinationGenerationMatches(provider, stableGeneration, generation);
-            const status = yield* runUpdateHealthProbe(generation.settings, "post-update");
+            const status = yield* runExclusivePostUpdateHealthProbe(generation.settings);
             const decisionGeneration = yield* readUpdateSettingsGeneration();
             const evidenceChanged = !updateEvidenceGenerationMatches(
               provider,
@@ -4163,7 +4175,7 @@ export function makeProviderHealthLive(
             }),
           );
 
-          const beforeStatus = yield* runUpdateHealthProbe(lockedSettings, "pre-update");
+          const beforeStatus = yield* runAdmittedPreUpdateHealthProbe(lockedSettings);
           const beforeVersion = beforeStatus.version ?? null;
           const stableGeneration = yield* readUpdateSettingsGeneration();
           const stableCapabilities = stableGeneration.capabilities;
@@ -4210,7 +4222,7 @@ export function makeProviderHealthLive(
           }
           yield* commitProviderState(provider, { status: preflightStatus });
 
-          const commandResult = yield* maintenanceGate
+          const exclusiveResult = yield* maintenanceGate
             .withExclusiveMaintenance({
               provider,
               latchReasonOnFailure: (cause) =>
@@ -4254,18 +4266,40 @@ export function makeProviderHealthLive(
                       "Provider settings or the resolved install target changed while owned runtimes were stopping. Retry the update.",
                   });
                 }
-                return yield* runUpdateCommand({
+                const commandResult = yield* runUpdateCommand({
                   provider,
                   command: commandUpdate.executable,
                   args: commandUpdate.args,
                   ...(commandUpdate.pathPrepend ? { pathPrepend: commandUpdate.pathPrepend } : {}),
                   teardownFailureRef,
                 }).pipe(Effect.scoped);
+                if (commandResult.exitCode !== 0) {
+                  return {
+                    _tag: "NonZeroExit",
+                    commandResult,
+                  } as const;
+                }
+
+                const initialPostProbe = yield* runPostUpdateVerificationProbe(stableGeneration);
+                const verifiedPostProbe = yield* verifyDelayedProviderUpdateVersion({
+                  beforeVersion,
+                  initialSnapshot: initialPostProbe,
+                  probe: runPostUpdateVerificationProbe(stableGeneration),
+                });
+                return {
+                  _tag: "Verified",
+                  commandResult,
+                  verifiedPostProbe,
+                } as const;
               }),
             })
             .pipe(Effect.result);
-          if (Result.isFailure(commandResult)) {
-            const unprovenExit = findProviderProcessExitUnprovenError(commandResult.failure);
+          if (Result.isFailure(exclusiveResult)) {
+            const terminalStateWritten = yield* Ref.get(terminalStateWrittenRef);
+            if (terminalStateWritten) {
+              return yield* Effect.fail(exclusiveResult.failure);
+            }
+            const unprovenExit = findProviderProcessExitUnprovenError(exclusiveResult.failure);
             if (unprovenExit) {
               yield* maintenanceGate.latchProvider({
                 provider,
@@ -4275,14 +4309,15 @@ export function makeProviderHealthLive(
             const providers = yield* markTerminal({
               status: "failed",
               message: unprovenExit
-                ? `${describeUpdateCommandError(commandResult.failure)} Restart Synara before using this provider again.`
-                : describeUpdateCommandError(commandResult.failure),
+                ? `${describeUpdateCommandError(exclusiveResult.failure)} Restart Synara before using this provider again.`
+                : describeUpdateCommandError(exclusiveResult.failure),
             });
             return { providers };
           }
-          const result = commandResult.success;
+          const maintenanceResult = exclusiveResult.success;
+          const result = maintenanceResult.commandResult;
           const output = [result.stderr, result.stdout].filter(Boolean).join("\n\n").trim() || null;
-          if (result.exitCode !== 0) {
+          if (maintenanceResult._tag === "NonZeroExit") {
             const providers = yield* markTerminal({
               status: "failed",
               message: `Update command exited with code ${result.exitCode}.`,
@@ -4291,12 +4326,7 @@ export function makeProviderHealthLive(
             return { providers };
           }
 
-          const initialPostProbe = yield* runPostUpdateVerificationProbe(stableGeneration);
-          const verifiedPostProbe = yield* verifyDelayedProviderUpdateVersion({
-            beforeVersion,
-            initialSnapshot: initialPostProbe,
-            probe: runPostUpdateVerificationProbe(stableGeneration),
-          });
+          const verifiedPostProbe = maintenanceResult.verifiedPostProbe;
           const afterStatus = verifiedPostProbe.status;
           const postCapabilities = verifiedPostProbe.generation.capabilities;
           const postStatus = yield* enrichProviderStatusWithVersionAdvisory(
