@@ -24,13 +24,22 @@ describe("desktop source build environment", () => {
     );
     expect(resolveDesktopGeneratedRouteTreePath(repoRoot)).toBe(generatedPath);
     expect(turboConfig.globalEnv ?? []).toContain("SYNARA_GENERATED_ROUTE_TREE");
+    expect(turboConfig.globalEnv ?? []).toContain("SYNARA_WEB_BUILD_VERSION");
     expect(turboConfig.globalPassThroughEnv ?? []).not.toContain("SYNARA_GENERATED_ROUTE_TREE");
+    expect(turboConfig.globalPassThroughEnv ?? []).not.toContain("SYNARA_WEB_BUILD_VERSION");
   });
 
-  it("redirects route-tree generation for exact-provenance builds", () => {
+  it("passes the exact release version and redirects route-tree generation", () => {
     const environment = createDesktopSourceBuildEnvironment({
-      baseEnvironment: { synara_generated_route_tree: "inherited", PRESERVED: "yes" },
+      baseEnvironment: {
+        synara_generated_route_tree: "inherited",
+        SYNARA_WEB_BUILD_VERSION: "0.5.5-super.8",
+        Synara_Web_Build_Version: "0.5.5-super.9",
+        synara_web_build_version: "0.5.5-super.10",
+        PRESERVED: "yes",
+      },
       flavor: "super",
+      version: "0.5.5-super.11",
       disableUpdates: true,
       exactProvenanceRequested: true,
       generatedRouteTreePath: "C:\\release-stage\\routeTree.gen.ts",
@@ -40,9 +49,13 @@ describe("desktop source build environment", () => {
       PRESERVED: "yes",
       SYNARA_DESKTOP_FLAVOR: "super",
       SYNARA_DESKTOP_DISABLE_UPDATES: "1",
+      SYNARA_WEB_BUILD_VERSION: "0.5.5-super.11",
       SYNARA_GENERATED_ROUTE_TREE: "C:\\release-stage\\routeTree.gen.ts",
     });
     expect(environment).not.toHaveProperty("synara_generated_route_tree");
+    expect(
+      Object.keys(environment).filter((key) => key.toUpperCase() === "SYNARA_WEB_BUILD_VERSION"),
+    ).toEqual(["SYNARA_WEB_BUILD_VERSION"]);
   });
 
   it("removes inherited route-tree redirects outside exact-provenance builds", () => {
@@ -51,6 +64,9 @@ describe("desktop source build environment", () => {
         SYNARA_GENERATED_ROUTE_TREE: "inherited-uppercase",
         Synara_Generated_Route_Tree: "inherited-mixed-case",
         synara_generated_route_tree: "inherited-lowercase",
+        SYNARA_WEB_BUILD_VERSION: "0.5.5-super.8",
+        Synara_Web_Build_Version: "0.5.5-super.9",
+        synara_web_build_version: "0.5.5-super.10",
         PRESERVED: "yes",
       },
       flavor: "production",
@@ -66,6 +82,9 @@ describe("desktop source build environment", () => {
     expect(
       Object.keys(environment).filter((key) => key.toUpperCase() === "SYNARA_GENERATED_ROUTE_TREE"),
     ).toEqual([]);
+    expect(
+      Object.keys(environment).filter((key) => key.toUpperCase() === "SYNARA_WEB_BUILD_VERSION"),
+    ).toEqual([]);
   });
 
   it("fails closed when an exact build has no redirect", () => {
@@ -73,6 +92,7 @@ describe("desktop source build environment", () => {
       createDesktopSourceBuildEnvironment({
         baseEnvironment: {},
         flavor: "super",
+        version: "0.5.5-super.11",
         disableUpdates: true,
         exactProvenanceRequested: true,
       }),

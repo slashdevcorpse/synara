@@ -255,9 +255,6 @@ jobs:
           - platform: windows
             runner: windows-2022
             turbo_concurrency: "1"
-          - platform: macos
-            runner: macos-15
-            turbo_concurrency: "50%"
     steps:
       - uses: ${pinnedCheckout}
       - if: matrix.platform == 'windows'
@@ -358,6 +355,7 @@ ${windowsStartupSmokeStep}
           if-no-files-found: ignore
           retention-days: 7
   macos_arm64:
+    if: false
     runs-on: macos-15
     steps:
       - run: test "$(uname -m)" = arm64
@@ -387,7 +385,7 @@ ${macosStartupSmokeStep}
           test "\${{ needs.browser_windows.result }}" = success
           test "\${{ needs.e2e_linux.result }}" = success
           test "\${{ needs.e2e_windows.result }}" = success
-          test "\${{ needs.macos_arm64.result }}" = success
+          test "\${{ needs.macos_arm64.result }}" = skipped
   release_smoke:
     runs-on: ubuntu-24.04
     steps:
@@ -451,6 +449,7 @@ jobs:
           category: /language:javascript-typescript
   analyze_swift:
     name: codeql-swift
+    if: false
     runs-on: macos-15
     timeout-minutes: 60
     permissions:
@@ -721,7 +720,16 @@ describe("workflow contracts", () => {
     );
   });
 
-  it("requires the macOS lane to prove its arm64 architecture", () => {
+  it("keeps the backlogged macOS lane disabled and architecture complete", () => {
+    const enabled = validFiles();
+    enabled.set(
+      ".github/workflows/ci.yml",
+      ciWorkflow.replace("    if: false", "    if: ${{ github.event_name == 'push' }}"),
+    );
+    expect(validateWorkflowContracts(enabled, policy()).join("\n")).toContain(
+      "macos_arm64 must remain disabled while macOS CI is backlogged",
+    );
+
     const files = validFiles();
     files.set(
       ".github/workflows/ci.yml",
@@ -1283,6 +1291,15 @@ describe("workflow contracts", () => {
   });
 
   it("locks CodeQL languages, permissions, action SHA, and result categories", () => {
+    const enabledSwift = validFiles();
+    enabledSwift.set(
+      ".github/workflows/codeql.yml",
+      codeqlWorkflow.replace("    if: false", "    if: ${{ github.event_name == 'push' }}"),
+    );
+    expect(validateWorkflowContracts(enabledSwift, policy()).join("\n")).toContain(
+      "codeql-swift must remain disabled while macOS CI is backlogged",
+    );
+
     const missingPermission = validFiles();
     missingPermission.set(
       ".github/workflows/codeql.yml",

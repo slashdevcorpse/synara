@@ -139,6 +139,7 @@ const DEPENDENCY_REVIEW_ACTION =
 const CODEQL_ACTION = "github/codeql-action";
 const CODEQL_ACTION_SHA = "e0647621c2984b5ed2f768cb892365bf2a616ad1";
 const CODEQL_SWIFT_TIMEOUT_MINUTES = 60;
+const MACOS_BACKLOG_CONDITION = false;
 const CI_MACOS_REQUIRED_COMMANDS = [
   'test "$(uname -m)" = arm64',
   "bun run brand:check",
@@ -161,7 +162,6 @@ type CiNativeJobName = keyof typeof CI_DESKTOP_PERSISTENCE_SMOKE_HOMES;
 const UNIT_MATRIX = [
   { platform: "linux", runner: "ubuntu-24.04", turbo_concurrency: "50%" },
   { platform: "windows", runner: "windows-2022", turbo_concurrency: "1" },
-  { platform: "macos", runner: "macos-15", turbo_concurrency: "50%" },
 ] as const;
 const UNIT_JOB_TIMEOUT_MINUTES = 40;
 const UNIT_STEP_TIMEOUT_MINUTES = 30;
@@ -192,7 +192,7 @@ test "\${{ needs.unit.result }}" = success
 test "\${{ needs.browser_windows.result }}" = success
 test "\${{ needs.e2e_linux.result }}" = success
 test "\${{ needs.e2e_windows.result }}" = success
-test "\${{ needs.macos_arm64.result }}" = success
+test "\${{ needs.macos_arm64.result }}" = skipped
 `;
 
 function isRecord(value: unknown): value is UnknownRecord {
@@ -880,6 +880,7 @@ function validateCodeqlWorkflow(workflow: UnknownRecord, errors: string[]): void
       language: "actions",
       buildMode: "none",
       category: "/language:actions",
+      condition: undefined,
     },
     {
       jobName: "analyze_javascript_typescript",
@@ -888,6 +889,7 @@ function validateCodeqlWorkflow(workflow: UnknownRecord, errors: string[]): void
       language: "javascript-typescript",
       buildMode: "none",
       category: "/language:javascript-typescript",
+      condition: undefined,
     },
     {
       jobName: "analyze_swift",
@@ -896,6 +898,7 @@ function validateCodeqlWorkflow(workflow: UnknownRecord, errors: string[]): void
       language: "swift",
       buildMode: "manual",
       category: "/language:swift",
+      condition: MACOS_BACKLOG_CONDITION,
     },
   ] as const;
   for (const lane of expected) {
@@ -903,6 +906,13 @@ function validateCodeqlWorkflow(workflow: UnknownRecord, errors: string[]): void
     if (!job || job.name !== lane.displayName || job["runs-on"] !== lane.runner) {
       errors.push(`${path} must define fixed ${lane.displayName} on ${lane.runner}.`);
       continue;
+    }
+    if (job.if !== lane.condition) {
+      errors.push(
+        lane.condition === undefined
+          ? `${path} ${lane.displayName} must remain unconditional.`
+          : `${path} ${lane.displayName} must remain disabled while macOS CI is backlogged.`,
+      );
     }
     if (
       !isRecord(job.permissions) ||
@@ -1714,19 +1724,20 @@ function validateCiArchitecture(workflow: UnknownRecord, errors: string[]): void
   if (isRecord(windowsJob) && windowsJob["runs-on"] !== "windows-2022") {
     errors.push(`${workflowPath} windows_x64 must run on windows-2022.`);
   }
-  for (const [jobName, job] of [
-    ["windows_x64", windowsJob],
-    ["macos_arm64", macosJob],
-  ] as const) {
-    if (
-      isRecord(job) &&
-      (job.if !== undefined ||
-        (job["continue-on-error"] !== undefined && job["continue-on-error"] !== false))
-    ) {
-      errors.push(`${workflowPath} ${jobName} job must be unconditional and fail closed.`);
-    }
+  if (
+    isRecord(windowsJob) &&
+    (windowsJob.if !== undefined ||
+      (windowsJob["continue-on-error"] !== undefined && windowsJob["continue-on-error"] !== false))
+  ) {
+    errors.push(`${workflowPath} windows_x64 job must be unconditional and fail closed.`);
   }
   if (isRecord(macosJob)) {
+    if (
+      macosJob.if !== MACOS_BACKLOG_CONDITION ||
+      (macosJob["continue-on-error"] !== undefined && macosJob["continue-on-error"] !== false)
+    ) {
+      errors.push(`${workflowPath} macos_arm64 must remain disabled while macOS CI is backlogged.`);
+    }
     if (macosJob["runs-on"] !== "macos-15") {
       errors.push(`${workflowPath} macos_arm64 must run on macos-15.`);
     }

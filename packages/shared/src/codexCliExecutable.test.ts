@@ -4,7 +4,10 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { resolveCodexCliExecutable } from "./codexCliExecutable";
+import {
+  resolveCodexCliExecutable,
+  resolveCodexCliExecutableWithDiscovery,
+} from "./codexCliExecutable";
 
 function whereOutput(...candidates: string[]) {
   return vi.fn(() => ({ stdout: candidates.join("\r\n"), status: 0 }));
@@ -279,5 +282,33 @@ describe("resolveCodexCliExecutable", () => {
         statSync: regularFiles(),
       }),
     ).toBe("codex");
+  });
+
+  it("preserves definitive not-found discovery when falling back to bare codex", () => {
+    expect(
+      resolveCodexCliExecutableWithDiscovery("codex", {
+        platform: "win32",
+        cwd: "C:\\projects\\synara",
+        env: { SystemRoot: "C:\\Windows" },
+        spawnSync: vi.fn(() => ({ stdout: "", status: 1 })),
+        statSync: regularFiles(),
+      }),
+    ).toEqual({ executable: "codex", discoveryOutcome: "not_found" });
+  });
+
+  it("preserves transient discovery failure when falling back to bare codex", () => {
+    expect(
+      resolveCodexCliExecutableWithDiscovery("codex", {
+        platform: "win32",
+        cwd: "C:\\projects\\synara",
+        env: { SystemRoot: "C:\\Windows" },
+        spawnSync: vi.fn(() => ({
+          error: Object.assign(new Error("where.exe timed out"), { code: "ETIMEDOUT" }),
+          stdout: "",
+          status: null,
+        })),
+        statSync: regularFiles(),
+      }),
+    ).toEqual({ executable: "codex", discoveryOutcome: "transient_failure" });
   });
 });

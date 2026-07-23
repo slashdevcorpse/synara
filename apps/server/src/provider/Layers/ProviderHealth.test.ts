@@ -26,7 +26,10 @@ import {
   resolveProviderStatusCachePath,
   writeProviderStatusCache,
 } from "../providerStatusCache";
-import { makeProviderMaintenanceGate } from "../providerMaintenanceGate.ts";
+import {
+  makeProviderMaintenanceGate,
+  type ProviderMaintenanceGate,
+} from "../providerMaintenanceGate.ts";
 import {
   makeProviderMaintenanceOwnedResourceCoordinator,
   type ProviderMaintenanceOwnedResourceCoordinator,
@@ -64,6 +67,7 @@ import {
 import { resolvePackageManagedProviderMaintenance } from "../providerMaintenance";
 import {
   isWindowsJobPreparedCommand,
+  prepareResolvedWindowsProviderProcess,
   prepareWindowsProviderProcess,
   WINDOWS_JOB_LAUNCHER_ENV,
   WINDOWS_JOB_LAUNCHER_EXECUTABLE,
@@ -106,6 +110,35 @@ const TEST_PROVIDER_LAYER_PROCESS_OPTIONS = {
   platform: process.platform,
   superviseProcess: TEST_PROVIDER_PROCESS_OPTIONS.superviseProcess,
 } as const satisfies ProviderHealthProcessOptions;
+
+function makeContainedWindowsProviderPreparationForTest(result: {
+  readonly stdout?: string | null;
+  readonly status?: number | null;
+  readonly error?: Error | undefined;
+}): typeof prepareWindowsProviderProcess {
+  return (command, args, options = {}) =>
+    prepareWindowsProviderProcess(command, args, {
+      ...options,
+      platform: "win32",
+      launcherPath: `C:\\Synara\\${WINDOWS_JOB_LAUNCHER_EXECUTABLE}`,
+      fileExists: () => true,
+      spawnSync: () => result,
+    });
+}
+
+const prepareContainedWindowsProviderForTest = makeContainedWindowsProviderPreparationForTest({
+  stdout: "",
+  status: 1,
+});
+
+const prepareContainedResolvedWindowsProviderForTest: typeof prepareResolvedWindowsProviderProcess =
+  (command, args, options = {}) =>
+    prepareResolvedWindowsProviderProcess(command, args, {
+      ...options,
+      platform: "win32",
+      launcherPath: `C:\\Synara\\${WINDOWS_JOB_LAUNCHER_EXECUTABLE}`,
+      fileExists: () => true,
+    });
 
 const makeCheckCodexProviderStatus = (binaryPath?: string, homePath?: string) =>
   makeProductionCheckCodexProviderStatus(binaryPath, homePath, TEST_PROVIDER_PROCESS_OPTIONS);
@@ -263,6 +296,14 @@ function fixtureExecutablePath(fixture: ProviderCommandFixture, command: string)
   );
 }
 
+function fixtureWindowsNpmNodePath(fixture: ProviderCommandFixture): string {
+  return NodePath.join(fixture.commandDirectory, "node.exe");
+}
+
+function fixtureWindowsNpmCliPath(fixture: ProviderCommandFixture): string {
+  return NodePath.join(fixture.commandDirectory, "node_modules", "npm", "bin", "npm-cli.js");
+}
+
 function preparedProviderCommandMatches(input: {
   readonly fixture: ProviderCommandFixture;
   readonly executable: string;
@@ -273,6 +314,16 @@ function preparedProviderCommandMatches(input: {
   readonly options?: TestProcessCommandOptions | undefined;
 }): boolean {
   const argsMatch = JSON.stringify(input.actualArgs) === JSON.stringify(input.expectedArgs);
+  if (
+    process.platform === "win32" &&
+    NodePath.win32.basename(input.executable).toLowerCase() === "npm.cmd"
+  ) {
+    return (
+      input.command.toLowerCase() === fixtureWindowsNpmNodePath(input.fixture).toLowerCase() &&
+      JSON.stringify(input.actualArgs) ===
+        JSON.stringify([fixtureWindowsNpmCliPath(input.fixture), ...input.expectedArgs])
+    );
+  }
   const directCommandMatches =
     process.platform === "win32"
       ? input.command.toLowerCase() === input.executable.toLowerCase()
@@ -327,6 +378,13 @@ function withIsolatedProviderCommands<A, E, R>(
         );
         if (process.platform !== "win32") {
           yield* fileSystem.chmod(executablePath, 0o755);
+        }
+        if (process.platform === "win32" && command === "npm") {
+          const fixture = { commandDirectory: canonicalCommandDirectory };
+          const npmCliPath = fixtureWindowsNpmCliPath(fixture);
+          yield* fileSystem.makeDirectory(NodePath.dirname(npmCliPath), { recursive: true });
+          yield* fileSystem.writeFileString(fixtureWindowsNpmNodePath(fixture), "node fixture\n");
+          yield* fileSystem.writeFileString(npmCliPath, "console.log('npm fixture');\n");
         }
       }
 
@@ -1454,6 +1512,72 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
 
   describe("provider update commands", () => {
     it.effect.skipIf(process.platform !== "win32")(
+      "launches Windows npm updates as node.exe plus npm-cli.js without cmd.exe",
+      () =>
+        withKiloUpdateFixture("7.4.10", (input) =>
+          withLatestNpmVersion(
+            "7.4.11",
+            Effect.gen(function* () {
+              let updated = false;
+              let updateSpawnCount = 0;
+              const layer = makeProviderHealthLive({
+                processTreeKiller: syntheticProcessTreeKiller(71),
+              }).pipe(
+                Layer.provideMerge(providerServiceWithoutRuntimesLayer),
+                Layer.provideMerge(ServerSettingsService.layerTest(input.settings)),
+                Layer.provideMerge(ServerConfig.layerTest(process.cwd(), input.baseDir)),
+                Layer.provideMerge(
+                  mockSpawnerLayer((args, command, env, options) => {
+                    if (args.includes("@kilocode/cli@latest")) {
+                      updateSpawnCount += 1;
+                      assert.strictEqual(
+                        command.toLowerCase(),
+                        fixtureWindowsNpmNodePath(input.fixture).toLowerCase(),
+                      );
+                      assert.deepStrictEqual(args, [
+                        fixtureWindowsNpmCliPath(input.fixture),
+                        "install",
+                        "-g",
+                        "--prefix",
+                        input.npmPrefix,
+                        "@kilocode/cli@latest",
+                      ]);
+                      assert.strictEqual(options?.windowsVerbatimArguments, undefined);
+                      assert.strictEqual(
+                        env?.PATH?.split(";")[0]?.toLowerCase(),
+                        input.fixture.commandDirectory.toLowerCase(),
+                      );
+                      const invocation = `${command} ${args.join(" ")}`.toLowerCase();
+                      assert.ok(!invocation.includes("cmd.exe"));
+                      assert.ok(!invocation.includes("npm.cmd"));
+                      assert.ok(!invocation.includes("call "));
+                      assert.ok(!invocation.includes("npm-prefix.js"));
+                      updated = true;
+                      return { stdout: "updated\n", stderr: "", code: 0 };
+                    }
+                    return {
+                      stdout: updated ? "kilo 7.4.11\n" : "kilo 7.4.10\n",
+                      stderr: "",
+                      code: 0,
+                    };
+                  }),
+                ),
+              );
+
+              const result = yield* Effect.gen(function* () {
+                const providerHealth = yield* ProviderHealth;
+                return yield* providerHealth.updateProvider({ provider: "kilo" });
+              }).pipe(Effect.provide(layer));
+              const kilo = result.providers.find((status) => status.provider === "kilo");
+
+              assert.strictEqual(updateSpawnCount, 1);
+              assert.strictEqual(kilo?.updateState?.status, "succeeded");
+            }),
+          ),
+        ),
+    );
+
+    it.effect.skipIf(process.platform !== "win32")(
       "keeps Effect cleanup when the default updater supervisor constructor fails",
       () =>
         withKiloUpdateFixture("7.4.10", (input) =>
@@ -1462,6 +1586,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
             Effect.gen(function* () {
               const lifecycle: string[] = [];
               const expectedUpdateArgs = [
+                fixtureWindowsNpmCliPath(input.fixture),
                 "install",
                 "-g",
                 "--prefix",
@@ -3630,6 +3755,384 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
     );
   });
 
+  describe("Windows provider refresh isolation", () => {
+    it.effect.skipIf(process.platform !== "win32")(
+      "keeps installed, missing, and failed provider results when one probe defects",
+      () =>
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+            prefix: "provider-health-windows-refresh-",
+          });
+          const maintenanceGate = yield* makeProviderMaintenanceGate;
+          const faultInjectingMaintenanceGate: ProviderMaintenanceGate = {
+            ...maintenanceGate,
+            withOperation: (input) =>
+              input.provider === "opencode" && input.operation === "ProviderHealth.refresh"
+                ? Effect.die(new Error("synthetic OpenCode health probe defect"))
+                : maintenanceGate.withOperation(input),
+          };
+          const kiloBinaryPath = "C:\\provider-fixtures\\kilo.exe";
+          const settings = {
+            ...allProvidersDisabledServerSettings,
+            enableProviderUpdateChecks: false,
+            providers: {
+              ...allProvidersDisabledServerSettings.providers,
+              grok: {
+                ...DEFAULT_SERVER_SETTINGS.providers.grok,
+                enabled: true,
+                binaryPath: "grok",
+              },
+              kilo: {
+                ...DEFAULT_SERVER_SETTINGS.providers.kilo,
+                enabled: true,
+                binaryPath: kiloBinaryPath,
+              },
+              opencode: {
+                ...DEFAULT_SERVER_SETTINGS.providers.opencode,
+                enabled: true,
+                binaryPath: "opencode",
+              },
+            },
+          } satisfies typeof DEFAULT_SERVER_SETTINGS;
+          let spawnCount = 0;
+          const layer = makeProviderHealthLive({
+            platform: "win32",
+            maintenanceGate: faultInjectingMaintenanceGate,
+            prepareProcess: prepareContainedWindowsProviderForTest,
+          }).pipe(
+            Layer.provideMerge(providerServiceWithoutRuntimesLayer),
+            Layer.provideMerge(ServerSettingsService.layerTest(settings)),
+            Layer.provideMerge(ServerConfig.layerTest(process.cwd(), baseDir)),
+            Layer.provideMerge(
+              mockSpawnerLayer((args, command) => {
+                spawnCount += 1;
+                assert.strictEqual(command.toLowerCase(), kiloBinaryPath.toLowerCase());
+                assert.deepStrictEqual(args, ["--version"]);
+                return { stdout: "kilo 7.4.10\n", stderr: "", code: 0 };
+              }),
+            ),
+          );
+
+          const result = yield* Effect.gen(function* () {
+            const providerHealth = yield* ProviderHealth;
+            const firstRefresh = yield* providerHealth.refresh;
+            const secondRefresh = yield* providerHealth.refresh;
+            const current = yield* providerHealth.getStatuses;
+            return { firstRefresh, secondRefresh, current };
+          }).pipe(Effect.provide(layer));
+
+          for (const statuses of [result.firstRefresh, result.secondRefresh, result.current]) {
+            assert.strictEqual(statuses.length, 10);
+            const kilo = statuses.find((status) => status.provider === "kilo");
+            const grok = statuses.find((status) => status.provider === "grok");
+            const opencode = statuses.find((status) => status.provider === "opencode");
+            assert.strictEqual(kilo?.status, "ready");
+            assert.strictEqual(kilo?.available, true);
+            assert.strictEqual(kilo?.version, "7.4.10");
+            assert.strictEqual(grok?.status, "error");
+            assert.strictEqual(grok?.available, false);
+            assert.strictEqual(grok?.message, "Grok CLI (`grok`) is not installed or not on PATH.");
+            assert.strictEqual(opencode?.status, "error");
+            assert.strictEqual(opencode?.available, false);
+            assert.strictEqual(
+              opencode?.message,
+              "Provider health check failed before completion. Retry to refresh its status.",
+            );
+            assert.strictEqual(/synthetic OpenCode/u.test(opencode?.message ?? ""), false);
+          }
+          assert.strictEqual(spawnCount, 2);
+
+          for (const provider of ["grok", "kilo", "opencode"] as const) {
+            const cached = yield* readProviderStatusCache(
+              resolveProviderStatusCachePath({
+                stateDir: path.join(baseDir, "userdata"),
+                provider,
+              }),
+            );
+            assert.strictEqual(cached?.provider, provider);
+          }
+        }),
+    );
+
+    it.effect.skipIf(process.platform !== "win32")(
+      "keeps other providers when update advisory enrichment defects",
+      () =>
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystem.FileSystem;
+          const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+            prefix: "provider-health-windows-enrichment-",
+          });
+          const malformedKiloBinaryPath = "C:\\provider-fixtures\\kilo\0.exe";
+          const settings = {
+            ...allProvidersDisabledServerSettings,
+            enableProviderUpdateChecks: true,
+            providers: {
+              ...allProvidersDisabledServerSettings.providers,
+              kilo: {
+                ...DEFAULT_SERVER_SETTINGS.providers.kilo,
+                enabled: true,
+                binaryPath: malformedKiloBinaryPath,
+              },
+            },
+          } satisfies typeof DEFAULT_SERVER_SETTINGS;
+          const layer = makeProviderHealthLive({
+            platform: "win32",
+            prepareProcess: prepareContainedWindowsProviderForTest,
+          }).pipe(
+            Layer.provideMerge(providerServiceWithoutRuntimesLayer),
+            Layer.provideMerge(ServerSettingsService.layerTest(settings)),
+            Layer.provideMerge(ServerConfig.layerTest(process.cwd(), baseDir)),
+            Layer.provideMerge(
+              mockSpawnerLayer((args, command) => {
+                assert.strictEqual(command, malformedKiloBinaryPath);
+                assert.deepStrictEqual(args, ["--version"]);
+                return { stdout: "kilo 7.4.10\n", stderr: "", code: 0 };
+              }),
+            ),
+          );
+
+          const statuses = yield* Effect.gen(function* () {
+            const providerHealth = yield* ProviderHealth;
+            return yield* providerHealth.refresh;
+          }).pipe(Effect.provide(layer));
+
+          assert.strictEqual(statuses.length, 10);
+          const kilo = statuses.find((status) => status.provider === "kilo");
+          assert.strictEqual(kilo?.status, "ready");
+          assert.strictEqual(kilo?.available, true);
+          assert.strictEqual(kilo?.version, "7.4.10");
+          assert.strictEqual(kilo?.versionAdvisory?.status, "unknown");
+          assert.strictEqual(kilo?.versionAdvisory?.canUpdate, false);
+        }),
+    );
+
+    it.effect.skipIf(process.platform !== "win32")(
+      "retains a cached ready provider after transient Windows command discovery fails",
+      () =>
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+            prefix: "provider-health-windows-transient-cache-",
+          });
+          const cachePath = resolveProviderStatusCachePath({
+            stateDir: path.join(baseDir, "userdata"),
+            provider: "grok",
+          });
+          yield* writeProviderStatusCache({
+            filePath: cachePath,
+            provider: {
+              provider: "grok",
+              status: "ready",
+              available: true,
+              authStatus: "unknown",
+              version: "0.2.4",
+              checkedAt: "2026-07-22T12:00:00.000Z",
+              message: "Grok CLI is installed. Authentication is managed by the Grok CLI.",
+            },
+          });
+          const settings = {
+            ...allProvidersDisabledServerSettings,
+            enableProviderUpdateChecks: false,
+            providers: {
+              ...allProvidersDisabledServerSettings.providers,
+              grok: {
+                ...DEFAULT_SERVER_SETTINGS.providers.grok,
+                enabled: true,
+                binaryPath: "grok",
+              },
+            },
+          } satisfies typeof DEFAULT_SERVER_SETTINGS;
+          let spawnCount = 0;
+          const layer = makeProviderHealthLive({
+            platform: "win32",
+            prepareProcess: makeContainedWindowsProviderPreparationForTest({
+              error: Object.assign(new Error("where.exe timed out"), { code: "ETIMEDOUT" }),
+              stdout: "",
+              status: null,
+            }),
+          }).pipe(
+            Layer.provideMerge(providerServiceWithoutRuntimesLayer),
+            Layer.provideMerge(ServerSettingsService.layerTest(settings)),
+            Layer.provideMerge(ServerConfig.layerTest(process.cwd(), baseDir)),
+            Layer.provideMerge(
+              mockSpawnerLayer(() => {
+                spawnCount += 1;
+                return { stdout: "", stderr: "", code: 0 };
+              }),
+            ),
+          );
+
+          const statuses = yield* Effect.gen(function* () {
+            const providerHealth = yield* ProviderHealth;
+            return yield* providerHealth.refresh;
+          }).pipe(Effect.provide(layer));
+          const grok = statuses.find((status) => status.provider === "grok");
+          const cached = yield* readProviderStatusCache(cachePath);
+
+          assert.strictEqual(spawnCount, 0);
+          assert.strictEqual(grok?.status, "ready");
+          assert.strictEqual(grok?.available, true);
+          assert.strictEqual(grok?.version, "0.2.4");
+          assert.strictEqual(cached?.status, "ready");
+          assert.strictEqual(cached?.available, true);
+          assert.strictEqual(cached?.version, "0.2.4");
+        }),
+    );
+
+    it.effect.skipIf(process.platform !== "win32")(
+      "retains cached Codex and Command Code providers after pre-resolution discovery fails",
+      () =>
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+            prefix: "provider-health-windows-preresolved-cache-",
+          });
+          const cachedProviders = [
+            {
+              provider: "codex",
+              status: "ready",
+              available: true,
+              authStatus: "authenticated",
+              version: "0.114.0",
+              checkedAt: "2026-07-22T12:00:00.000Z",
+            },
+            {
+              provider: "commandCode",
+              status: "ready",
+              available: true,
+              authStatus: "authenticated",
+              version: "1.2.3",
+              checkedAt: "2026-07-22T12:00:00.000Z",
+            },
+          ] as const satisfies ReadonlyArray<ServerProviderStatus>;
+          for (const provider of cachedProviders) {
+            yield* writeProviderStatusCache({
+              filePath: resolveProviderStatusCachePath({
+                stateDir: path.join(baseDir, "userdata"),
+                provider: provider.provider,
+              }),
+              provider,
+            });
+          }
+          const settings = {
+            ...allProvidersDisabledServerSettings,
+            enableProviderUpdateChecks: false,
+            providers: {
+              ...allProvidersDisabledServerSettings.providers,
+              codex: { ...DEFAULT_SERVER_SETTINGS.providers.codex, enabled: true },
+              commandCode: { ...DEFAULT_SERVER_SETTINGS.providers.commandCode, enabled: true },
+            },
+          } satisfies typeof DEFAULT_SERVER_SETTINGS;
+          let spawnCount = 0;
+          const layer = makeProviderHealthLive({
+            platform: "win32",
+            prepareResolvedProcess: prepareContainedResolvedWindowsProviderForTest,
+            resolveCodexExecutable: () => ({
+              executable: "codex",
+              discoveryOutcome: "transient_failure",
+            }),
+            resolveCommandCodeExecutable: () => ({
+              executable: "commandcode",
+              discoveryOutcome: "transient_failure",
+            }),
+          }).pipe(
+            Layer.provideMerge(providerServiceWithoutRuntimesLayer),
+            Layer.provideMerge(ServerSettingsService.layerTest(settings)),
+            Layer.provideMerge(ServerConfig.layerTest(process.cwd(), baseDir)),
+            Layer.provideMerge(
+              mockSpawnerLayer(() => {
+                spawnCount += 1;
+                return { stdout: "", stderr: "", code: 0 };
+              }),
+            ),
+          );
+
+          const statuses = yield* Effect.gen(function* () {
+            const providerHealth = yield* ProviderHealth;
+            return yield* providerHealth.refresh;
+          }).pipe(Effect.provide(layer));
+
+          assert.strictEqual(spawnCount, 0);
+          for (const provider of cachedProviders) {
+            const status = statuses.find((candidate) => candidate.provider === provider.provider);
+            const cached = yield* readProviderStatusCache(
+              resolveProviderStatusCachePath({
+                stateDir: path.join(baseDir, "userdata"),
+                provider: provider.provider,
+              }),
+            );
+            assert.strictEqual(status?.status, "ready", provider.provider);
+            assert.strictEqual(status?.available, true, provider.provider);
+            assert.strictEqual(status?.version, provider.version, provider.provider);
+            assert.strictEqual(cached?.status, "ready", provider.provider);
+            assert.strictEqual(cached?.available, true, provider.provider);
+            assert.strictEqual(cached?.version, provider.version, provider.provider);
+          }
+        }),
+    );
+
+    it.effect.skipIf(process.platform !== "win32")(
+      "reports definitive pre-resolution misses for Codex and Command Code as not installed",
+      () =>
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystem.FileSystem;
+          const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+            prefix: "provider-health-windows-preresolved-missing-",
+          });
+          const settings = {
+            ...allProvidersDisabledServerSettings,
+            enableProviderUpdateChecks: false,
+            providers: {
+              ...allProvidersDisabledServerSettings.providers,
+              codex: { ...DEFAULT_SERVER_SETTINGS.providers.codex, enabled: true },
+              commandCode: { ...DEFAULT_SERVER_SETTINGS.providers.commandCode, enabled: true },
+            },
+          } satisfies typeof DEFAULT_SERVER_SETTINGS;
+          const layer = makeProviderHealthLive({
+            platform: "win32",
+            prepareResolvedProcess: prepareContainedResolvedWindowsProviderForTest,
+            resolveCodexExecutable: () => ({
+              executable: "codex",
+              discoveryOutcome: "not_found",
+            }),
+            resolveCommandCodeExecutable: () => ({
+              executable: "commandcode",
+              discoveryOutcome: "not_found",
+            }),
+          }).pipe(
+            Layer.provideMerge(providerServiceWithoutRuntimesLayer),
+            Layer.provideMerge(ServerSettingsService.layerTest(settings)),
+            Layer.provideMerge(ServerConfig.layerTest(process.cwd(), baseDir)),
+            Layer.provideMerge(
+              mockSpawnerLayer(() => {
+                throw new Error("Definitive missing commands must not reach spawn.");
+              }),
+            ),
+          );
+
+          const statuses = yield* Effect.gen(function* () {
+            const providerHealth = yield* ProviderHealth;
+            return yield* providerHealth.refresh;
+          }).pipe(Effect.provide(layer));
+          const codex = statuses.find((status) => status.provider === "codex");
+          const commandCode = statuses.find((status) => status.provider === "commandCode");
+
+          assert.strictEqual(
+            codex?.message,
+            "Codex CLI (`codex`) is not installed or not on PATH.",
+          );
+          assert.strictEqual(
+            commandCode?.message,
+            "Command Code CLI (`commandcode` or `command-code`) is not installed or not on PATH.",
+          );
+        }),
+    );
+  });
+
   describe("disabled provider handling", () => {
     it("builds an inert status for disabled providers", () => {
       assert.deepStrictEqual(makeDisabledProviderStatus("kilo", "2026-06-16T12:00:00.000Z"), {
@@ -3894,6 +4397,30 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
         ),
         [unavailableStatus],
       );
+    });
+
+    it("keeps an already usable provider available after transient Windows discovery fails", () => {
+      const result = stabilizeProviderStatusesAgainstTransientTimeouts(
+        [previousReadyOpenCode],
+        [
+          {
+            provider: "opencode",
+            status: "error",
+            available: false,
+            authStatus: "unknown",
+            checkedAt: "2026-06-04T17:01:00.000Z",
+            message:
+              "Failed to execute OpenCode CLI health check: Windows command discovery was temporarily unavailable: opencode.",
+          },
+        ],
+      );
+
+      assert.deepStrictEqual(result, [
+        {
+          ...previousReadyOpenCode,
+          checkedAt: "2026-06-04T17:01:00.000Z",
+        },
+      ]);
     });
 
     it("keeps an already usable provider ready after a transient auth timeout warning", () => {
@@ -5325,6 +5852,112 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
         assert.strictEqual(status.authStatus, "unknown");
         assert.strictEqual(status.message, "Grok CLI (`grok`) is not installed or not on PATH.");
       }).pipe(Effect.provide(failingSpawnerLayer("spawn grok ENOENT"))),
+    );
+
+    it.effect.skipIf(process.platform !== "win32")(
+      "returns unavailable before spawn when Windows containment cannot resolve Grok",
+      () => {
+        let spawnCount = 0;
+        return Effect.gen(function* () {
+          const status = yield* makeProductionCheckGrokProviderStatus(undefined, {
+            ...TEST_PROVIDER_PROCESS_OPTIONS,
+            platform: "win32",
+            prepareProcess: prepareContainedWindowsProviderForTest,
+          });
+          assert.strictEqual(status.provider, "grok");
+          assert.strictEqual(status.status, "error");
+          assert.strictEqual(status.available, false);
+          assert.strictEqual(status.authStatus, "unknown");
+          assert.strictEqual(status.message, "Grok CLI (`grok`) is not installed or not on PATH.");
+          assert.strictEqual(spawnCount, 0);
+        }).pipe(
+          Effect.provide(
+            mockSpawnerLayer(() => {
+              spawnCount += 1;
+              return { stdout: "", stderr: "", code: 0 };
+            }),
+          ),
+        );
+      },
+    );
+
+    it.effect.skipIf(process.platform !== "win32")(
+      "reports transient Windows discovery failures as execution failures rather than missing",
+      () =>
+        Effect.gen(function* () {
+          const transientCases = [
+            {
+              name: "where timeout",
+              result: {
+                error: Object.assign(new Error("where.exe timed out"), { code: "ETIMEDOUT" }),
+                stdout: "",
+                status: null,
+              },
+            },
+            {
+              name: "missing process status",
+              result: { stdout: "", status: null },
+            },
+            {
+              name: "unexpected nonzero exit",
+              result: { stdout: "", status: 2 },
+            },
+            {
+              name: "malformed relative output",
+              result: { stdout: "relative\\grok.exe\r\n", status: 0 },
+            },
+            {
+              name: "oversized output",
+              result: { stdout: "x".repeat(256 * 1024 + 1), status: 0 },
+            },
+          ] as const;
+
+          for (const testCase of transientCases) {
+            let spawnCount = 0;
+            const status = yield* makeProductionCheckGrokProviderStatus(undefined, {
+              ...TEST_PROVIDER_PROCESS_OPTIONS,
+              platform: "win32",
+              prepareProcess: makeContainedWindowsProviderPreparationForTest(testCase.result),
+            }).pipe(
+              Effect.provide(
+                mockSpawnerLayer(() => {
+                  spawnCount += 1;
+                  return { stdout: "", stderr: "", code: 0 };
+                }),
+              ),
+            );
+
+            assert.strictEqual(status.provider, "grok", testCase.name);
+            assert.strictEqual(status.status, "error", testCase.name);
+            assert.strictEqual(status.available, false, testCase.name);
+            assert.match(status.message ?? "", /Failed to execute Grok CLI health check:/u);
+            assert.strictEqual(
+              /not installed or not on PATH/u.test(status.message ?? ""),
+              false,
+              testCase.name,
+            );
+            assert.strictEqual(spawnCount, 0, testCase.name);
+          }
+        }),
+    );
+
+    it.effect.skipIf(process.platform !== "win32")(
+      "reports a thrown Windows discovery error as an execution failure",
+      () =>
+        Effect.gen(function* () {
+          const status = yield* makeProductionCheckGrokProviderStatus(undefined, {
+            ...TEST_PROVIDER_PROCESS_OPTIONS,
+            platform: "win32",
+            prepareProcess: () => {
+              throw new Error("synthetic where.exe launch failure");
+            },
+          });
+
+          assert.strictEqual(status.status, "error");
+          assert.strictEqual(status.available, false);
+          assert.match(status.message ?? "", /Failed to execute Grok CLI health check:/u);
+          assert.strictEqual(/not installed or not on PATH/u.test(status.message ?? ""), false);
+        }).pipe(Effect.provide(mockSpawnerLayer(() => ({ stdout: "", stderr: "", code: 0 })))),
     );
   });
 

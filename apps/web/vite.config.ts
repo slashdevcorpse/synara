@@ -11,6 +11,7 @@ import babel from "@rolldown/plugin-babel";
 import { tanstackRouter } from "@tanstack/router-plugin/vite";
 import { defineConfig, type Plugin } from "vite";
 import pkg from "./package.json" with { type: "json" };
+import { resolveWebBuildVersion } from "./viteBuildVersion";
 import { resolveGeneratedRouteTree } from "./viteRouteGeneration";
 
 const port = Number(process.env.PORT ?? 5733);
@@ -23,6 +24,7 @@ const buildSourcemap =
       ? "hidden"
       : false;
 const generatedRouteTree = resolveGeneratedRouteTree(process.env);
+const appVersion = resolveWebBuildVersion(process.env, pkg.version);
 
 const CENTRAL_ICON_DIR = "central-icons-reversed";
 const CENTRAL_ICON_NAME_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
@@ -132,7 +134,7 @@ export default defineConfig({
   define: {
     // In dev mode, tell the web app where the WebSocket server lives
     "import.meta.env.VITE_WS_URL": JSON.stringify(process.env.VITE_WS_URL ?? ""),
-    "import.meta.env.APP_VERSION": JSON.stringify(pkg.version),
+    "import.meta.env.APP_VERSION": JSON.stringify(appVersion),
   },
   resolve: {
     ...(generatedRouteTree

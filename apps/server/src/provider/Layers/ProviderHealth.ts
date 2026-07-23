@@ -19,10 +19,17 @@ import type {
   ServerProviderUpdateState,
 } from "@synara/contracts";
 import { ServerProviderUpdateError } from "@synara/contracts";
-import { resolveCodexCliExecutable } from "@synara/shared/codexCliExecutable";
-import { resolveCommandCodeCliExecutable } from "@synara/shared/commandCodeCliExecutable";
+import {
+  resolveCodexCliExecutable,
+  resolveCodexCliExecutableWithDiscovery,
+} from "@synara/shared/codexCliExecutable";
+import {
+  resolveCommandCodeCliExecutable,
+  resolveCommandCodeCliExecutableWithDiscovery,
+} from "@synara/shared/commandCodeCliExecutable";
 import { parseCodexConfigModelProvider } from "@synara/shared/codexConfig";
 import { decodeJsonResult } from "@synara/shared/schemaJson";
+import type { WindowsCommandDiscoveryOutcome } from "@synara/shared/windowsProcess";
 import {
   query as claudeQuery,
   type SDKUserMessage,
@@ -107,6 +114,7 @@ import {
   isWindowsJobPreparedCommand,
   prepareResolvedWindowsProviderProcess,
   prepareWindowsProviderProcess,
+  WindowsProviderTargetNotResolvedError,
 } from "../windowsProviderProcess.ts";
 import {
   enrichProviderStatusWithVersionAdvisory,
@@ -1017,6 +1025,29 @@ const collectStreamAsString = <E>(stream: Stream.Stream<Uint8Array, E>): Effect.
     (acc, chunk) => acc + new TextDecoder().decode(chunk),
   );
 
+const TRANSIENT_WINDOWS_COMMAND_DISCOVERY_DETAIL =
+  "Windows command discovery was temporarily unavailable";
+
+function normalizeProviderCommandPreparationError(
+  cause: unknown,
+  executable: string,
+  discoveryOutcome?: WindowsCommandDiscoveryOutcome,
+): Error {
+  if (cause instanceof WindowsProviderTargetNotResolvedError) {
+    const effectiveDiscoveryOutcome = cause.discoveryOutcome ?? discoveryOutcome;
+    if (effectiveDiscoveryOutcome === "not_found") {
+      return Object.assign(new Error(`spawn ${executable} ENOENT`, { cause }), { code: "ENOENT" });
+    }
+    if (effectiveDiscoveryOutcome === "transient_failure") {
+      return Object.assign(
+        new Error(`${TRANSIENT_WINDOWS_COMMAND_DISCOVERY_DETAIL}: ${executable}`, { cause }),
+        { code: "EAGAIN" },
+      );
+    }
+  }
+  return cause instanceof Error ? cause : new Error(String(cause), { cause });
+}
+
 export interface ProviderHealthProcessOptions {
   readonly platform?: NodeJS.Platform;
   readonly prepareProcess?: typeof prepareWindowsProviderProcess;
@@ -1035,6 +1066,8 @@ export interface ProviderHealthProcessOptions {
   }) => Effect.Effect<void>;
   readonly spawnContainedClaudeProcess?: typeof spawnContainedClaudeSdkProcess;
   readonly queryClaude?: typeof claudeQuery;
+  readonly resolveCodexExecutable?: typeof resolveCodexCliExecutableWithDiscovery;
+  readonly resolveCommandCodeExecutable?: typeof resolveCommandCodeCliExecutableWithDiscovery;
 }
 
 const runProviderCommand = (
@@ -1045,20 +1078,26 @@ const runProviderCommand = (
   executableAlreadyResolved = false,
   teardownProcessTree: typeof teardownProviderProcessTree = teardownProviderProcessTree,
   processOptions: ProviderHealthProcessOptions = {},
+  discoveryOutcome?: WindowsCommandDiscoveryOutcome,
 ) =>
   Effect.gen(function* () {
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
     const platform = processOptions.platform ?? process.platform;
-    const prepared = executableAlreadyResolved
-      ? (processOptions.prepareResolvedProcess ?? prepareResolvedWindowsProviderProcess)(
-          executable,
-          args,
-          { env, platform },
-        )
-      : (processOptions.prepareProcess ?? prepareWindowsProviderProcess)(executable, args, {
-          env,
-          platform,
-        });
+    const prepared = yield* Effect.try({
+      try: () =>
+        executableAlreadyResolved
+          ? (processOptions.prepareResolvedProcess ?? prepareResolvedWindowsProviderProcess)(
+              executable,
+              args,
+              { env, platform },
+            )
+          : (processOptions.prepareProcess ?? prepareWindowsProviderProcess)(executable, args, {
+              env,
+              platform,
+            }),
+      catch: (cause) =>
+        normalizeProviderCommandPreparationError(cause, executable, discoveryOutcome),
+    });
     const exactWindowsOwner = isWindowsJobPreparedCommand(prepared);
     const command = ChildProcess.make(prepared.command, prepared.args, {
       shell: prepared.shell,
@@ -1190,6 +1229,7 @@ const runCodexCommand = (
   executable = "codex",
   env: NodeJS.ProcessEnv = providerCommandEnv(CODEX_PROVIDER),
   processOptions: ProviderHealthProcessOptions = {},
+  discoveryOutcome?: WindowsCommandDiscoveryOutcome,
 ) =>
   runProviderCommand(
     CODEX_PROVIDER,
@@ -1199,6 +1239,7 @@ const runCodexCommand = (
     true,
     teardownProviderProcessTree,
     processOptions,
+    discoveryOutcome,
   ).pipe(
     Effect.flatMap((result) =>
       isWindowsShellCommandMissingResult({ code: result.code, stderr: result.stderr })
@@ -1212,6 +1253,7 @@ const runCommandCodeCommand = (
   executable = "commandcode",
   teardownProcessTree: typeof teardownProviderProcessTree = teardownProviderProcessTree,
   processOptions: ProviderHealthProcessOptions = {},
+  discoveryOutcome?: WindowsCommandDiscoveryOutcome,
 ) =>
   runProviderCommand(
     COMMAND_CODE_PROVIDER,
@@ -1221,6 +1263,7 @@ const runCommandCodeCommand = (
     true,
     teardownProcessTree,
     processOptions,
+    discoveryOutcome,
   ).pipe(
     Effect.flatMap((result) =>
       isWindowsShellCommandMissingResult({ code: result.code, stderr: result.stderr })
@@ -1496,11 +1539,23 @@ export const makeCheckCodexProviderStatus = (
     const checkedAt = new Date().toISOString();
     const probeEnv = yield* Effect.promise(() => makeCodexProbeEnv(homePath));
     const configuredExecutable = nonEmptyTrimmed(binaryPath) ?? "codex";
-    const executable = resolveCodexCliExecutable(configuredExecutable, { env: probeEnv });
+    const resolution = (
+      processOptions.resolveCodexExecutable ?? resolveCodexCliExecutableWithDiscovery
+    )(configuredExecutable, {
+      env: probeEnv,
+      platform: processOptions.platform,
+    });
+    const executable = resolution.executable;
 
     // Probe 1: `codex --version` — is the CLI reachable?
     const versionProbe = yield* probeProviderCliVersion(
-      runCodexCommand(["--version"], executable, probeEnv, processOptions),
+      runCodexCommand(
+        ["--version"],
+        executable,
+        probeEnv,
+        processOptions,
+        resolution.discoveryOutcome,
+      ),
       DEFAULT_TIMEOUT_MS,
     );
 
@@ -1581,6 +1636,7 @@ export const makeCheckCodexProviderStatus = (
       executable,
       probeEnv,
       processOptions,
+      resolution.discoveryOutcome,
     ).pipe(Effect.timeoutOption(DEFAULT_TIMEOUT_MS), Effect.result);
 
     if (Result.isFailure(authProbe)) {
@@ -1696,9 +1752,18 @@ export const makeCheckCommandCodeProviderStatus = (
     const checkedAt = new Date().toISOString();
     const env = providerCommandEnv(COMMAND_CODE_PROVIDER);
     const configured = nonEmptyTrimmed(binaryPath) ?? "commandcode";
-    const executable = resolveCommandCodeCliExecutable(configured, { env });
+    const resolution = (
+      options?.resolveCommandCodeExecutable ?? resolveCommandCodeCliExecutableWithDiscovery
+    )(configured, { env, platform: options?.platform });
+    const executable = resolution.executable;
     const versionProbe = yield* probeProviderCliVersion(
-      runCommandCodeCommand(["--version"], executable, options?.teardownProcessTree, options),
+      runCommandCodeCommand(
+        ["--version"],
+        executable,
+        options?.teardownProcessTree,
+        options,
+        resolution.discoveryOutcome,
+      ),
       COMMAND_CODE_HEALTH_TIMEOUT_MS,
     );
 
@@ -1748,6 +1813,7 @@ export const makeCheckCommandCodeProviderStatus = (
       executable,
       options?.teardownProcessTree,
       options,
+      resolution.discoveryOutcome,
     ).pipe(Effect.timeoutOption(COMMAND_CODE_HEALTH_TIMEOUT_MS), Effect.result);
     if (Result.isFailure(authProbe)) {
       return {
@@ -2721,11 +2787,12 @@ export function providerStatusesEqual(
   });
 }
 
-function isTransientProviderCommandTimeout(status: ServerProviderStatus): boolean {
+function isTransientProviderCommandFailure(status: ServerProviderStatus): boolean {
   return (
     status.status !== "ready" &&
     status.authStatus === "unknown" &&
-    (status.message ?? "").includes(PROVIDER_COMMAND_TIMEOUT_DETAIL)
+    ((status.message ?? "").includes(PROVIDER_COMMAND_TIMEOUT_DETAIL) ||
+      (status.message ?? "").includes(TRANSIENT_WINDOWS_COMMAND_DISCOVERY_DETAIL))
   );
 }
 
@@ -2750,7 +2817,7 @@ export function stabilizeProviderStatusesAgainstTransientTimeouts(
     if (
       !previous ||
       !wasPreviouslyUsableProviderStatus(previous) ||
-      !isTransientProviderCommandTimeout(status)
+      !isTransientProviderCommandFailure(status)
     ) {
       return status;
     }
@@ -2802,6 +2869,20 @@ function mergeProviderStatusUpdates(
     statusByProvider.set(status.provider, status);
   }
   return orderProviderStatuses([...statusByProvider.values()]);
+}
+
+function makeFailedProviderHealthStatus(
+  provider: ProviderKind,
+  checkedAt = new Date().toISOString(),
+): ServerProviderStatus {
+  return {
+    provider,
+    status: "error" as const,
+    available: false,
+    authStatus: "unknown" as const,
+    checkedAt,
+    message: "Provider health check failed before completion. Retry to refresh its status.",
+  } satisfies ServerProviderStatus;
 }
 
 // Keeps local CLI version/status visible while removing network-backed update metadata.
@@ -2887,6 +2968,12 @@ export function makeProviderHealthLive(
       ? { spawnContainedClaudeProcess: options.spawnContainedClaudeProcess }
       : {}),
     ...(options?.queryClaude ? { queryClaude: options.queryClaude } : {}),
+    ...(options?.resolveCodexExecutable
+      ? { resolveCodexExecutable: options.resolveCodexExecutable }
+      : {}),
+    ...(options?.resolveCommandCodeExecutable
+      ? { resolveCommandCodeExecutable: options.resolveCommandCodeExecutable }
+      : {}),
   };
   return Layer.effect(
     ProviderHealth,
@@ -3239,39 +3326,43 @@ export function makeProviderHealthLive(
         );
         if (settings?.enableProviderUpdateChecks === false) {
           return yield* Effect.forEach(
-            statuses.map(suppressProviderVersionAdvisory),
-            applyVolatileProviderState,
+            statuses,
+            (status) => {
+              const suppressedStatus = suppressProviderVersionAdvisory(status);
+              return applyVolatileProviderState(suppressedStatus).pipe(
+                Effect.catchCause((cause) =>
+                  Cause.hasInterrupts(cause)
+                    ? Effect.failCause(cause)
+                    : Effect.logWarning("Provider status projection failed", {
+                        provider: status.provider,
+                        cause: Cause.pretty(cause),
+                      }).pipe(Effect.as(suppressedStatus)),
+                ),
+              );
+            },
             { concurrency: "unbounded" },
           );
         }
 
-        const enriched = yield* Effect.forEach(
+        return yield* Effect.forEach(
           statuses,
           (status) =>
             getProviderMaintenanceCapabilities(status.provider).pipe(
               Effect.flatMap((capabilities) =>
                 enrichProviderStatusWithVersionAdvisory(status, capabilities),
               ),
-              Effect.catch(() =>
-                Effect.succeed({
-                  ...status,
-                  versionAdvisory: {
-                    status: "unknown" as const,
-                    currentVersion: status.version ?? null,
-                    latestVersion: null,
-                    updateCommand: null,
-                    canUpdate: false,
-                    checkedAt: status.checkedAt,
-                    message: null,
-                  },
-                }),
+              Effect.flatMap(applyVolatileProviderState),
+              Effect.catchCause((cause) =>
+                Cause.hasInterrupts(cause)
+                  ? Effect.failCause(cause)
+                  : Effect.logWarning("Provider status enrichment failed", {
+                      provider: status.provider,
+                      cause: Cause.pretty(cause),
+                    }).pipe(Effect.as(suppressProviderVersionAdvisory(status))),
               ),
             ),
           { concurrency: "unbounded" },
         );
-        return yield* Effect.forEach(enriched, applyVolatileProviderState, {
-          concurrency: "unbounded",
-        });
       });
 
       const checkProviderWhenEnabled = <E, R>(
@@ -3384,6 +3475,15 @@ export function makeProviderHealthLive(
                   settings,
                   provider,
                   checkProviderStatusForSettings(settings, provider),
+                ).pipe(
+                  Effect.catchCause((cause) =>
+                    Cause.hasInterrupts(cause)
+                      ? Effect.failCause(cause)
+                      : Effect.logWarning("Provider health probe failed", {
+                          provider,
+                          cause: Cause.pretty(cause),
+                        }).pipe(Effect.as(Option.some(makeFailedProviderHealthStatus(provider)))),
+                  ),
                 ),
               ),
               {

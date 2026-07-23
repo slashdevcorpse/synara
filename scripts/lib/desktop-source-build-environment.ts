@@ -7,6 +7,7 @@ import { join } from "node:path";
 export interface DesktopSourceBuildEnvironmentInput {
   readonly baseEnvironment: NodeJS.ProcessEnv;
   readonly flavor: string;
+  readonly version?: string;
   readonly disableUpdates: boolean;
   readonly exactProvenanceRequested: boolean;
   readonly generatedRouteTreePath?: string;
@@ -24,7 +25,11 @@ export function createDesktopSourceBuildEnvironment(
   }
   const baseEnvironment = { ...input.baseEnvironment };
   for (const key of Object.keys(baseEnvironment)) {
-    if (key.toUpperCase() === "SYNARA_GENERATED_ROUTE_TREE") {
+    const normalizedKey = key.toUpperCase();
+    if (
+      normalizedKey === "SYNARA_GENERATED_ROUTE_TREE" ||
+      normalizedKey === "SYNARA_WEB_BUILD_VERSION"
+    ) {
       delete baseEnvironment[key];
     }
   }
@@ -32,6 +37,7 @@ export function createDesktopSourceBuildEnvironment(
     ...baseEnvironment,
     SYNARA_DESKTOP_FLAVOR: input.flavor,
     SYNARA_DESKTOP_DISABLE_UPDATES: input.disableUpdates ? "1" : "0",
+    ...(input.version ? { SYNARA_WEB_BUILD_VERSION: input.version } : {}),
     ...(input.exactProvenanceRequested
       ? { SYNARA_GENERATED_ROUTE_TREE: input.generatedRouteTreePath }
       : {}),

@@ -1,7 +1,15 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { copyFileSync, mkdtempSync, readFileSync, renameSync, rmSync } from "node:fs";
+import {
+  copyFileSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 
 import { afterEach, describe, expect, it } from "vitest";
@@ -9,6 +17,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { superviseWindowsJobNodeProcess } from "./windowsJobProcessSupervisor.ts";
 import {
   prepareResolvedWindowsProviderProcess,
+  prepareWindowsProviderProcess,
   resolveWindowsJobLauncherPath,
 } from "./windowsProviderProcess.ts";
 
@@ -197,6 +206,55 @@ describeWindows("Windows Job launcher native integration", () => {
       value: "preserved",
     });
     proveSynchronousHelperDrain(args);
+  });
+
+  it("preserves npm's nested prefix probe through the native Job launcher", async () => {
+    const root = mkdtempSync(join(tmpdir(), "synara-job-npm-prefix-"));
+    const nodeDirectory = join(root, "Program Files", "nodejs");
+    const nodePath = join(nodeDirectory, "node.exe");
+    const npmPrefixScriptPath = join(nodeDirectory, "node_modules", "npm", "bin", "npm-prefix.js");
+    const npmCommandPath = join(nodeDirectory, "npm.cmd");
+    const expectedPrefix = join(root, "User Data", "npm");
+
+    try {
+      mkdirSync(dirname(npmPrefixScriptPath), { recursive: true });
+      copyFileSync(process.execPath, nodePath);
+      writeFileSync(
+        npmPrefixScriptPath,
+        "process.stdout.write(`${process.env.SYNARA_EXPECTED_NPM_PREFIX}\\n`);\n",
+      );
+      writeFileSync(
+        npmCommandPath,
+        [
+          "@ECHO OFF",
+          "SETLOCAL",
+          'SET "NODE_EXE=%~dp0node.exe"',
+          'SET "NPM_PREFIX_JS=%~dp0node_modules\\npm\\bin\\npm-prefix.js"',
+          'FOR /F "delims=" %%F IN (\'CALL "%NODE_EXE%" "%NPM_PREFIX_JS%"\') DO (',
+          '  SET "NPM_PREFIX=%%F"',
+          ")",
+          "IF NOT DEFINED NPM_PREFIX EXIT /B 41",
+          "ECHO %NPM_PREFIX%",
+          "",
+        ].join("\r\n"),
+      );
+      const env = { ...process.env, SYNARA_EXPECTED_NPM_PREFIX: expectedPrefix };
+      const prepared = prepareWindowsProviderProcess(npmCommandPath, [], { env });
+      const result = spawnSync(prepared.command, prepared.args, {
+        encoding: "utf8",
+        env,
+        shell: prepared.shell,
+        windowsHide: true,
+      });
+
+      expect(result.error).toBeUndefined();
+      expect(result.status).toBe(0);
+      expect(result.stderr).toBe("");
+      expect(result.stdout.trim()).toBe(expectedPrefix);
+      proveSynchronousHelperDrain(prepared.args);
+    } finally {
+      await cleanupTestDirectory(root);
+    }
   });
 
   it("closes the Job and kills a surviving nested descendant when the provider root exits", async () => {

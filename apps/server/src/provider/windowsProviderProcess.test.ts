@@ -1,11 +1,14 @@
+import type { WindowsCommandDiscoveryObservation } from "@synara/shared/windowsProcess";
 import { describe, expect, it } from "vitest";
 
 import {
   containPreparedWindowsProviderProcess,
   isWindowsJobPreparedCommand,
   prepareResolvedWindowsProviderProcess,
+  prepareWindowsProviderProcess,
   resolveWindowsJobLauncherPath,
   WINDOWS_JOB_LAUNCHER_EXECUTABLE,
+  WindowsProviderTargetNotResolvedError,
 } from "./windowsProviderProcess.ts";
 
 const launcher = `C:\\Synara\\native\\${WINDOWS_JOB_LAUNCHER_EXECUTABLE}`;
@@ -175,6 +178,56 @@ describe("Windows provider process containment", () => {
         },
       ),
     ).toThrow("was not resolved to an absolute executable path");
+  });
+
+  it("preserves a definitive not-found discovery outcome and forwards the observer", () => {
+    const observations: WindowsCommandDiscoveryObservation[] = [];
+    let failure: unknown;
+
+    try {
+      prepareWindowsProviderProcess("codex", [], {
+        platform: "win32",
+        arch: "x64",
+        launcherPath: launcher,
+        fileExists: () => true,
+        spawnSync: () => ({ stdout: "", status: 1 }),
+        onCommandDiscovery: (observation) => observations.push(observation),
+      });
+    } catch (cause) {
+      failure = cause;
+    }
+
+    expect(failure).toBeInstanceOf(WindowsProviderTargetNotResolvedError);
+    expect((failure as WindowsProviderTargetNotResolvedError).discoveryOutcome).toBe("not_found");
+    expect(observations).toEqual([{ outcome: "not_found", source: "where" }]);
+  });
+
+  it("preserves a transient discovery failure without weakening containment", () => {
+    const observations: WindowsCommandDiscoveryObservation[] = [];
+    let failure: unknown;
+
+    try {
+      prepareWindowsProviderProcess("codex", [], {
+        platform: "win32",
+        arch: "x64",
+        launcherPath: launcher,
+        fileExists: () => true,
+        spawnSync: () => ({
+          error: Object.assign(new Error("where.exe timed out"), { code: "ETIMEDOUT" }),
+          stdout: "",
+          status: null,
+        }),
+        onCommandDiscovery: (observation) => observations.push(observation),
+      });
+    } catch (cause) {
+      failure = cause;
+    }
+
+    expect(failure).toBeInstanceOf(WindowsProviderTargetNotResolvedError);
+    expect((failure as WindowsProviderTargetNotResolvedError).discoveryOutcome).toBe(
+      "transient_failure",
+    );
+    expect(observations).toEqual([{ outcome: "transient_failure", source: "where" }]);
   });
 
   it("fails closed when the architecture-specific helper is absent", () => {

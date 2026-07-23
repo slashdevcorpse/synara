@@ -74,18 +74,44 @@ async function sendPrompt(desktop: DesktopHarness, prompt: string): Promise<void
   await expect(sendButton).toBeEnabled({ timeout: 30_000 });
   const protocolBaseline = (await desktop.readProtocolLog()).length;
   await sendButton.click();
-  try {
-    await expect(editor).toBeEmpty({ timeout: 3_000 });
-  } catch {
+  await expect(editor)
+    .toBeEmpty({ timeout: 10_000 })
+    .catch(() => undefined);
+  await expect
+    .poll(
+      async () => {
+        const turnStartsSinceClick = requestMethods(
+          (await desktop.readProtocolLog()).slice(protocolBaseline),
+        ).filter((method) => method === "turn/start");
+        if (turnStartsSinceClick.length !== 0) {
+          return "started";
+        }
+        return (await editor.textContent()) === prompt && (await sendButton.isEnabled())
+          ? "restored"
+          : "pending";
+      },
+      { timeout: 65_000 },
+    )
+    .not.toBe("pending");
+
+  const turnStartsBeforeRetry = requestMethods(
+    (await desktop.readProtocolLog()).slice(protocolBaseline),
+  ).filter((method) => method === "turn/start");
+  if (turnStartsBeforeRetry.length === 0) {
     // A lost thread.create response can leave its durable server receipt behind while the
     // composer restores the draft. Retry only that explicit, user-retryable state; the
     // promotion helper recovers the duplicate create before starting one turn.
     await expect(editor).toHaveText(prompt);
     await expect(sendButton).toBeEnabled();
-    const turnStartsSinceClick = requestMethods(
+    // The failed submit restores the draft before its async handler clears the
+    // non-visual in-flight guard. Cross a render boundary before retrying.
+    await page.evaluate(
+      () => new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve())),
+    );
+    const turnStartsAfterRestore = requestMethods(
       (await desktop.readProtocolLog()).slice(protocolBaseline),
     ).filter((method) => method === "turn/start");
-    if (turnStartsSinceClick.length !== 0) {
+    if (turnStartsAfterRestore.length !== 0) {
       throw new Error(
         "Refusing to retry a restored desktop E2E draft after the provider accepted turn/start.",
       );
