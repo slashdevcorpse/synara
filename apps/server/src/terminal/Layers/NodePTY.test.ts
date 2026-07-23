@@ -5,6 +5,42 @@ import { PtyAdapter } from "../Services/PTY";
 import { ensureNodePtySpawnHelperExecutable, makeNodePtyLayer } from "./NodePTY";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 
+const spawnInput = {
+  shell: "test-shell",
+  args: ["--test"],
+  cwd: process.cwd(),
+  cols: 80,
+  rows: 24,
+  env: {},
+};
+
+const makeFakeNodePty = () => {
+  const killCalls: Array<{ argumentCount: number; signal: string | undefined }> = [];
+  const pty = {
+    pid: 42,
+    cols: 80,
+    rows: 24,
+    process: "test-shell",
+    handleFlowControl: false,
+    onData: () => ({ dispose: () => undefined }),
+    onExit: () => ({ dispose: () => undefined }),
+    resize: () => undefined,
+    clear: () => undefined,
+    write: () => undefined,
+    kill(signal?: string) {
+      killCalls.push({ argumentCount: arguments.length, signal });
+    },
+    pause: () => undefined,
+    resume: () => undefined,
+  } satisfies import("node-pty").IPty;
+  const loadNodePty = async () =>
+    ({
+      spawn: () => pty,
+    }) as typeof import("node-pty");
+
+  return { killCalls, loadNodePty };
+};
+
 it.layer(NodeServices.layer)("ensureNodePtySpawnHelperExecutable", (it) => {
   it.effect("adds executable bits when helper exists but is not executable", () =>
     Effect.gen(function* () {
@@ -73,5 +109,31 @@ it.layer(NodeServices.layer)("ensureNodePtySpawnHelperExecutable", (it) => {
         }),
       ),
     );
+  });
+
+  it.effect("omits the signal when killing a Windows node-pty process", () => {
+    const { killCalls, loadNodePty } = makeFakeNodePty();
+
+    return Effect.gen(function* () {
+      const adapter = yield* PtyAdapter;
+      const ptyProcess = yield* adapter.spawn(spawnInput);
+
+      ptyProcess.kill("SIGTERM");
+
+      assert.deepStrictEqual(killCalls, [{ argumentCount: 0, signal: undefined }]);
+    }).pipe(Effect.provide(makeNodePtyLayer(loadNodePty, "win32")));
+  });
+
+  it.effect("forwards the signal when killing a non-Windows node-pty process", () => {
+    const { killCalls, loadNodePty } = makeFakeNodePty();
+
+    return Effect.gen(function* () {
+      const adapter = yield* PtyAdapter;
+      const ptyProcess = yield* adapter.spawn(spawnInput);
+
+      ptyProcess.kill("SIGKILL");
+
+      assert.deepStrictEqual(killCalls, [{ argumentCount: 1, signal: "SIGKILL" }]);
+    }).pipe(Effect.provide(makeNodePtyLayer(loadNodePty, "linux")));
   });
 });
