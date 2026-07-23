@@ -101,6 +101,11 @@ async function sendPrompt(desktop: DesktopHarness, prompt: string): Promise<void
     // promotion helper recovers the duplicate create before starting one turn.
     await expect(editor).toHaveText(prompt);
     await expect(sendButton).toBeEnabled();
+    // The failed submit restores the draft before its async handler clears the
+    // non-visual in-flight guard. Cross a render boundary before retrying.
+    await page.evaluate(
+      () => new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve())),
+    );
     const turnStartsAfterRestore = requestMethods(
       (await desktop.readProtocolLog()).slice(protocolBaseline),
     ).filter((method) => method === "turn/start");
