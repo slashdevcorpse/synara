@@ -3263,10 +3263,7 @@ export function makeProviderHealthLive(
             updateLockKey: null,
           });
         }
-        if (
-          provider === ANTIGRAVITY_PROVIDER &&
-          !isAntigravityAvailableOnPlatform(platform)
-        ) {
+        if (provider === ANTIGRAVITY_PROVIDER && !isAntigravityAvailableOnPlatform(platform)) {
           return makeProviderMaintenanceCapabilities({
             provider,
             packageName: null,

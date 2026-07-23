@@ -540,8 +540,7 @@ function ProviderUpdateNotifications() {
     serverSettings: providerUpdateServerSettings,
   });
   const oneClickProviders = outdatedProviders.filter(
-    (provider) =>
-      shouldOfferProviderUpdateAction(provider) && !isProviderUpdateActive(provider),
+    (provider) => shouldOfferProviderUpdateAction(provider) && !isProviderUpdateActive(provider),
   );
   const notificationKey = providerUpdateNotificationKey(outdatedProviders);
 
