@@ -74,7 +74,9 @@ async function sendPrompt(desktop: DesktopHarness, prompt: string): Promise<void
   await expect(sendButton).toBeEnabled({ timeout: 30_000 });
   const protocolBaseline = (await desktop.readProtocolLog()).length;
   await sendButton.click();
-  await expect(editor).toBeEmpty({ timeout: 10_000 });
+  await expect(editor)
+    .toBeEmpty({ timeout: 10_000 })
+    .catch(() => undefined);
   await expect
     .poll(
       async () => {

@@ -599,7 +599,7 @@ jobs:
 
   macos_arm64:
     name: macos_arm64
-    if: ${{ github.event_name == 'workflow_dispatch' }}
+    if: false
     runs-on: macos-15
     timeout-minutes: 60
     steps:

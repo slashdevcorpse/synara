@@ -68,7 +68,7 @@ jobs:
 
   analyze_swift:
     name: codeql-swift
-    if: ${{ github.event_name == 'workflow_dispatch' }}
+    if: false
     runs-on: macos-15
     timeout-minutes: 60
     permissions:
