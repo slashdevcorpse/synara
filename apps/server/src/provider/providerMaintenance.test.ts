@@ -130,8 +130,8 @@ function windowsNpmCmdShim(packageName: string, binTarget: string): string {
 
 function windowsNpmManagerCommand(managerDirectory: string, npmCliRoot = managerDirectory) {
   return {
-    executablePath: NodePath.join(managerDirectory, "node.exe"),
-    argsPrefix: [NodePath.join(npmCliRoot, "node_modules", "npm", "bin", "npm-cli.js")],
+    executablePath: NodePath.win32.join(managerDirectory, "node.exe"),
+    argsPrefix: [NodePath.win32.join(npmCliRoot, "node_modules", "npm", "bin", "npm-cli.js")],
   } as const;
 }
 

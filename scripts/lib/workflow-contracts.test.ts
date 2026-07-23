@@ -355,7 +355,7 @@ ${windowsStartupSmokeStep}
           if-no-files-found: ignore
           retention-days: 7
   macos_arm64:
-    if: \${{ false }}
+    if: \${{ github.event_name == 'workflow_dispatch' }}
     runs-on: macos-15
     steps:
       - run: test "$(uname -m)" = arm64
@@ -449,7 +449,7 @@ jobs:
           category: /language:javascript-typescript
   analyze_swift:
     name: codeql-swift
-    if: \${{ false }}
+    if: \${{ github.event_name == 'workflow_dispatch' }}
     runs-on: macos-15
     timeout-minutes: 60
     permissions:
@@ -724,7 +724,10 @@ describe("workflow contracts", () => {
     const enabled = validFiles();
     enabled.set(
       ".github/workflows/ci.yml",
-      ciWorkflow.replace("    if: ${{ false }}", "    if: ${{ true }}"),
+      ciWorkflow.replace(
+        "    if: ${{ github.event_name == 'workflow_dispatch' }}",
+        "    if: ${{ github.event_name == 'push' }}",
+      ),
     );
     expect(validateWorkflowContracts(enabled, policy()).join("\n")).toContain(
       "macos_arm64 must remain disabled while macOS CI is backlogged",
@@ -1294,7 +1297,10 @@ describe("workflow contracts", () => {
     const enabledSwift = validFiles();
     enabledSwift.set(
       ".github/workflows/codeql.yml",
-      codeqlWorkflow.replace("    if: ${{ false }}", "    if: ${{ true }}"),
+      codeqlWorkflow.replace(
+        "    if: ${{ github.event_name == 'workflow_dispatch' }}",
+        "    if: ${{ github.event_name == 'push' }}",
+      ),
     );
     expect(validateWorkflowContracts(enabledSwift, policy()).join("\n")).toContain(
       "codeql-swift must remain disabled while macOS CI is backlogged",

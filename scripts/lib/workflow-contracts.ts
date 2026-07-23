@@ -139,8 +139,7 @@ const DEPENDENCY_REVIEW_ACTION =
 const CODEQL_ACTION = "github/codeql-action";
 const CODEQL_ACTION_SHA = "e0647621c2984b5ed2f768cb892365bf2a616ad1";
 const CODEQL_SWIFT_TIMEOUT_MINUTES = 60;
-const CODEQL_SWIFT_BACKLOG_CONDITION = "${{ false }}";
-const CI_MACOS_BACKLOG_CONDITION = "${{ false }}";
+const MACOS_BACKLOG_CONDITION = "${{ github.event_name == 'workflow_dispatch' }}";
 const CI_MACOS_REQUIRED_COMMANDS = [
   'test "$(uname -m)" = arm64',
   "bun run brand:check",
@@ -899,7 +898,7 @@ function validateCodeqlWorkflow(workflow: UnknownRecord, errors: string[]): void
       language: "swift",
       buildMode: "manual",
       category: "/language:swift",
-      condition: CODEQL_SWIFT_BACKLOG_CONDITION,
+      condition: MACOS_BACKLOG_CONDITION,
     },
   ] as const;
   for (const lane of expected) {
@@ -1734,7 +1733,7 @@ function validateCiArchitecture(workflow: UnknownRecord, errors: string[]): void
   }
   if (isRecord(macosJob)) {
     if (
-      macosJob.if !== CI_MACOS_BACKLOG_CONDITION ||
+      macosJob.if !== MACOS_BACKLOG_CONDITION ||
       (macosJob["continue-on-error"] !== undefined && macosJob["continue-on-error"] !== false)
     ) {
       errors.push(`${workflowPath} macos_arm64 must remain disabled while macOS CI is backlogged.`);
