@@ -4011,11 +4011,17 @@ export function makeProviderHealthLive(
         "ProviderHealth.updateProvider",
       )(function* (input) {
         const provider = input.provider;
-        const toUpdateError = (reason: unknown) =>
-          new ServerProviderUpdateError({
+        const toUpdateError = (cause: unknown, reason?: string): ServerProviderUpdateError => {
+          if (reason === undefined && cause instanceof ServerProviderUpdateError) {
+            return cause;
+          }
+          const error = new ServerProviderUpdateError({
             provider,
-            reason: reason instanceof Error ? reason.message : String(reason),
+            reason: reason ?? (cause instanceof Error ? cause.message : String(cause)),
           });
+          Object.defineProperty(error, "cause", { value: cause, enumerable: false });
+          return error;
+        };
         const readUpdateSettingsGeneration = Effect.fn("readProviderUpdateSettingsGeneration")(
           function* () {
             const snapshot = yield* serverSettings.getSnapshot.pipe(Effect.mapError(toUpdateError));
@@ -4096,8 +4102,7 @@ export function makeProviderHealthLive(
                 cause instanceof ProviderMaintenanceBusyError
                   ? cause.message
                   : `${phase === "pre-update" ? "Pre-update" : "Post-update"} provider health could not prove process exit. Restart Synara before using '${provider}' again. ${cause.message}`;
-              const error = new ServerProviderUpdateError({ provider, reason });
-              Object.defineProperty(error, "cause", { value: cause, enumerable: false });
+              const error = toUpdateError(cause, reason);
               return markTerminal({ status: "failed", message: reason }).pipe(
                 Effect.andThen(Effect.fail(error)),
               );
@@ -4300,7 +4305,7 @@ export function makeProviderHealthLive(
           if (Result.isFailure(exclusiveResult)) {
             const terminalStateWritten = yield* Ref.get(terminalStateWrittenRef);
             if (terminalStateWritten) {
-              return yield* Effect.fail(exclusiveResult.failure);
+              return yield* Effect.fail(toUpdateError(exclusiveResult.failure));
             }
             const unprovenExit = findProviderProcessExitUnprovenError(exclusiveResult.failure);
             if (unprovenExit) {
