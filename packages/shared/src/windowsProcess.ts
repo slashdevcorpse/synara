@@ -28,6 +28,15 @@ export interface WindowsCommandDiscoveryObservation {
   readonly source: "bypass" | "cache" | "where";
 }
 
+export function unresolvedWindowsCommandDiscoveryOutcome(
+  observations: ReadonlyArray<WindowsCommandDiscoveryObservation>,
+): WindowsCommandDiscoveryOutcome | undefined {
+  if (observations.length === 0) return undefined;
+  return observations.every((observation) => observation.outcome === "not_found")
+    ? "not_found"
+    : "transient_failure";
+}
+
 export interface WindowsCommandDiscoveryCache {
   readonly kind: "windows-command-discovery-cache";
 }

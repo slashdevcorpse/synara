@@ -8,6 +8,7 @@ import * as Path from "node:path";
 import {
   resolveWindowsCommandCandidates,
   resolveWindowsCommandPath,
+  unresolvedWindowsCommandDiscoveryOutcome,
   type WindowsCommandDiscoveryObservation,
   type WindowsCommandDiscoveryOutcome,
   type WindowsSafeProcessInput,
@@ -97,15 +98,6 @@ function validNpmCodexShim(
   return isAbsoluteRegularFile(candidate, readStat) ? candidate : undefined;
 }
 
-function unresolvedDiscoveryOutcome(
-  observations: ReadonlyArray<WindowsCommandDiscoveryObservation>,
-): WindowsCommandDiscoveryOutcome | undefined {
-  if (observations.length === 0) return undefined;
-  return observations.every((observation) => observation.outcome === "not_found")
-    ? "not_found"
-    : "transient_failure";
-}
-
 export function resolveCodexCliExecutableWithDiscovery(
   command: string,
   input: CodexCliExecutableInput = {},
@@ -128,7 +120,7 @@ export function resolveCodexCliExecutableWithDiscovery(
       executable,
       ...(Path.win32.isAbsolute(executable)
         ? {}
-        : { discoveryOutcome: unresolvedDiscoveryOutcome(observations) }),
+        : { discoveryOutcome: unresolvedWindowsCommandDiscoveryOutcome(observations) }),
     };
   }
 
@@ -150,7 +142,7 @@ export function resolveCodexCliExecutableWithDiscovery(
   return {
     executable,
     ...(executable === DEFAULT_CODEX_COMMAND
-      ? { discoveryOutcome: unresolvedDiscoveryOutcome(observations) }
+      ? { discoveryOutcome: unresolvedWindowsCommandDiscoveryOutcome(observations) }
       : {}),
   };
 }

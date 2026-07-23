@@ -8,6 +8,7 @@ import * as Path from "node:path";
 import {
   resolveWindowsCommandCandidates,
   resolveWindowsCommandPath,
+  unresolvedWindowsCommandDiscoveryOutcome,
   type WindowsCommandDiscoveryObservation,
   type WindowsCommandDiscoveryOutcome,
   type WindowsSafeProcessInput,
@@ -89,15 +90,6 @@ export function resolveCommandCodeCliExecutable(
   return resolveCommandCodeCliExecutableWithDiscovery(command, input).executable;
 }
 
-function unresolvedDiscoveryOutcome(
-  observations: ReadonlyArray<WindowsCommandDiscoveryObservation>,
-): WindowsCommandDiscoveryOutcome | undefined {
-  if (observations.length === 0) return undefined;
-  return observations.every((observation) => observation.outcome === "not_found")
-    ? "not_found"
-    : "transient_failure";
-}
-
 export function resolveCommandCodeCliExecutableWithDiscovery(
   command: string = DEFAULT_COMMAND_CODE_COMMAND,
   input: CommandCodeCliExecutableInput = {},
@@ -122,7 +114,7 @@ export function resolveCommandCodeCliExecutableWithDiscovery(
       executable,
       ...(Path.win32.isAbsolute(executable)
         ? {}
-        : { discoveryOutcome: unresolvedDiscoveryOutcome(observations) }),
+        : { discoveryOutcome: unresolvedWindowsCommandDiscoveryOutcome(observations) }),
     };
   }
 
@@ -151,6 +143,6 @@ export function resolveCommandCodeCliExecutableWithDiscovery(
       normalized === "cmd"
         ? DEFAULT_COMMAND_CODE_COMMAND
         : configured || DEFAULT_COMMAND_CODE_COMMAND,
-    discoveryOutcome: unresolvedDiscoveryOutcome(observations),
+    discoveryOutcome: unresolvedWindowsCommandDiscoveryOutcome(observations),
   };
 }
