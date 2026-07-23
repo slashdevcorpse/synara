@@ -70,6 +70,8 @@ const INHERITED_NATIVE_CAPABILITY_KEYS = new Set([
   "NODE_REPL_SANDBOX_ALLOWED_UNIX_SOCKETS",
 ]);
 
+const COMMAND_CODE_SKIP_UPDATES_ENV_KEY = "COMMANDCODE_SKIP_UPDATES";
+
 export function buildProviderChildEnvironment(input: {
   readonly provider: ProviderChildKind;
   readonly baseEnv?: NodeJS.ProcessEnv;
@@ -83,6 +85,11 @@ export function buildProviderChildEnvironment(input: {
     ...(input.baseEnv ?? process.env),
     ...input.overrides,
   };
+  // Synara owns Command Code process lifecycle and surfaces updates separately.
+  // Apply this after caller overlays so child launches cannot re-enable CLI self-updates.
+  if (input.provider === "commandCode") {
+    mergedEnv[COMMAND_CODE_SKIP_UPDATES_ENV_KEY] = "1";
+  }
   const baseEnv = platform === "win32" ? normalizeWindowsChildEnvironment(mergedEnv) : mergedEnv;
   const policyKey = (key: string): string => (platform === "win32" ? key.toUpperCase() : key);
   const allowedSynaraKeys = new Set((input.inheritedSynaraKeys ?? []).map(policyKey));

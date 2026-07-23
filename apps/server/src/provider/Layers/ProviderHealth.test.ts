@@ -9,7 +9,19 @@ import type { ServerProviderStatus } from "@synara/contracts";
 import { DEFAULT_SERVER_SETTINGS, ServerProviderUpdateError } from "@synara/contracts";
 import { buildWindowsBatchCommandArgs, resolveWindowsComSpec } from "@synara/shared/windowsProcess";
 import { describe, it, assert } from "@effect/vitest";
-import { Deferred, Effect, Fiber, FileSystem, Layer, Path, Result, Sink, Stream } from "effect";
+import {
+  Clock,
+  Deferred,
+  Duration,
+  Effect,
+  Fiber,
+  FileSystem,
+  Layer,
+  Path,
+  Result,
+  Sink,
+  Stream,
+} from "effect";
 import { TestClock } from "effect/testing";
 import * as PlatformError from "effect/PlatformError";
 import { ChildProcessSpawner } from "effect/unstable/process";
@@ -29,6 +41,7 @@ import {
 } from "../providerStatusCache";
 import {
   makeProviderMaintenanceGate,
+  ProviderMaintenanceBusyError,
   type ProviderMaintenanceGate,
 } from "../providerMaintenanceGate.ts";
 import {
@@ -67,6 +80,7 @@ import {
   readCodexConfigModelProvider,
   stabilizeProviderStatusesAgainstTransientTimeouts,
 } from "./ProviderHealth";
+import { PROVIDER_UPDATE_POST_PROBE_RETRY_DELAYS_MS } from "../providerUpdateVerification.ts";
 import {
   enrichProviderStatusWithVersionAdvisory,
   resolvePackageManagedProviderMaintenance,
@@ -890,6 +904,42 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
       );
     });
 
+    it.effect("suppresses Command Code self-updates for version and status probes", () => {
+      const calls: Array<{
+        readonly args: ReadonlyArray<string>;
+        readonly skipUpdates: string | undefined;
+      }> = [];
+      return makeCheckCommandCodeProviderStatus("commandcode.exe").pipe(
+        Effect.provide(
+          mockSpawnerLayer((args, _command, env) => {
+            calls.push({
+              args: [...args],
+              skipUpdates: env?.COMMANDCODE_SKIP_UPDATES,
+            });
+            return args.includes("--version")
+              ? { stdout: "command-code 0.52.1", stderr: "", code: 0 }
+              : {
+                  stdout: JSON.stringify({ authenticated: true, version: "0.52.1" }),
+                  stderr: "",
+                  code: 0,
+                };
+          }),
+        ),
+        Effect.tap(() =>
+          Effect.sync(() => {
+            assert.deepStrictEqual(
+              calls.map((call) => call.args),
+              [["--version"], ["status", "--json"]],
+            );
+            assert.deepStrictEqual(
+              calls.map((call) => call.skipUpdates),
+              ["1", "1"],
+            );
+          }),
+        ),
+      );
+    });
+
     it.effect("reports unauthenticated and malformed status responses as warnings", () =>
       Effect.gen(function* () {
         let statusResponse = JSON.stringify({ authenticated: false, error: "Login required" });
@@ -1538,6 +1588,168 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
     });
 
     it.effect.skipIf(process.platform !== "win32")(
+      "waits for a delayed native Droid replacement and keeps the updater job-contained",
+      () =>
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystem.FileSystem;
+          const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+            prefix: "provider-update-delayed-droid-",
+          });
+          const droidDirectory = NodePath.join(baseDir, "bin");
+          const droidBinaryPath = NodePath.join(droidDirectory, "droid.exe");
+          yield* fileSystem.makeDirectory(droidDirectory, { recursive: true });
+          yield* fileSystem.writeFileString(droidBinaryPath, "droid fixture\n");
+          yield* writeProviderStatusCache({
+            filePath: resolveProviderStatusCachePath({
+              stateDir: NodePath.join(baseDir, "userdata"),
+              provider: "droid",
+            }),
+            provider: {
+              provider: "droid",
+              status: "ready",
+              available: true,
+              authStatus: "unknown",
+              checkedAt: "2026-07-23T20:00:00.000Z",
+              version: "0.174.0",
+            },
+          });
+          const settings = {
+            ...allProvidersDisabledServerSettings,
+            providers: {
+              ...allProvidersDisabledServerSettings.providers,
+              droid: {
+                ...DEFAULT_SERVER_SETTINGS.providers.droid,
+                enabled: true,
+                binaryPath: droidBinaryPath,
+              },
+            },
+          } satisfies typeof DEFAULT_SERVER_SETTINGS;
+          let healthProbeCount = 0;
+          let updatePrepareCount = 0;
+          let updateSpawnCount = 0;
+          let updaterCompleted = false;
+          let blockedOperationEntered = false;
+          let firstRetrySleepIntercepted = false;
+          const firstRetrySleepStarted = yield* Deferred.make<void>();
+          const releaseFirstRetrySleep = yield* Deferred.make<void>();
+          const baseClock = yield* Clock.Clock;
+          const controlledUpdateClock: Clock.Clock = {
+            currentTimeMillisUnsafe: () => baseClock.currentTimeMillisUnsafe(),
+            currentTimeMillis: baseClock.currentTimeMillis,
+            currentTimeNanosUnsafe: () => baseClock.currentTimeNanosUnsafe(),
+            currentTimeNanos: baseClock.currentTimeNanos,
+            sleep: (duration) => {
+              if (
+                !firstRetrySleepIntercepted &&
+                updaterCompleted &&
+                healthProbeCount === 2 &&
+                Duration.toMillis(duration) === PROVIDER_UPDATE_POST_PROBE_RETRY_DELAYS_MS[0]
+              ) {
+                firstRetrySleepIntercepted = true;
+                return Deferred.succeed(firstRetrySleepStarted, undefined).pipe(
+                  Effect.andThen(Deferred.await(releaseFirstRetrySleep)),
+                );
+              }
+              return baseClock.sleep(duration);
+            },
+          };
+          const maintenanceGate = yield* makeProviderMaintenanceGate;
+          const prepareProcess: ProviderHealthProcessOptions["prepareProcess"] = (
+            command,
+            args,
+            options,
+          ) => {
+            const prepared = prepareContainedResolvedWindowsProviderForTest(command, args, options);
+            if (args.length === 1 && args[0] === "update") {
+              updatePrepareCount += 1;
+              assert.ok(isWindowsJobPreparedCommand(prepared));
+              assert.ok(prepared.args.includes(droidBinaryPath));
+              assert.ok(
+                ![prepared.command, ...prepared.args].join(" ").toLowerCase().includes("cmd.exe"),
+              );
+            }
+            return prepared;
+          };
+          const layer = makeProviderHealthLive({
+            platform: "win32",
+            prepareProcess,
+            processTreeKiller: syntheticProcessTreeKiller(72),
+            maintenanceGate,
+          }).pipe(
+            Layer.provideMerge(providerServiceWithoutRuntimesLayer),
+            Layer.provideMerge(ServerSettingsService.layerTest(settings)),
+            Layer.provideMerge(ServerConfig.layerTest(process.cwd(), baseDir)),
+            Layer.provideMerge(
+              mockSpawnerLayer((args, command) => {
+                assert.strictEqual(command.toLowerCase(), droidBinaryPath.toLowerCase());
+                if (args.length === 1 && args[0] === "update") {
+                  updateSpawnCount += 1;
+                  updaterCompleted = true;
+                  return { stdout: "Update initiated.\n", stderr: "", code: 0 };
+                }
+                assert.deepStrictEqual(args, ["--version"]);
+                healthProbeCount += 1;
+                return {
+                  stdout:
+                    updaterCompleted && healthProbeCount >= 3
+                      ? "droid 0.178.0\n"
+                      : "droid 0.174.0\n",
+                  stderr: "",
+                  code: 0,
+                };
+              }),
+            ),
+          );
+
+          const result = yield* Effect.gen(function* () {
+            const providerHealth = yield* ProviderHealth;
+            const update = yield* providerHealth
+              .updateProvider({ provider: "droid" })
+              .pipe(Effect.provideService(Clock.Clock, controlledUpdateClock), Effect.forkChild);
+            yield* Deferred.await(firstRetrySleepStarted);
+            assert.strictEqual(healthProbeCount, 2);
+
+            const blocked = yield* maintenanceGate
+              .withOperation({
+                provider: "droid",
+                operation: "session.start",
+                run: Effect.sync(() => {
+                  blockedOperationEntered = true;
+                }),
+              })
+              .pipe(Effect.result);
+            assert.ok(Result.isFailure(blocked));
+            if (Result.isFailure(blocked)) {
+              assert.ok(blocked.failure instanceof ProviderMaintenanceBusyError);
+              assert.strictEqual(blocked.failure.latchedReason, null);
+            }
+            assert.strictEqual(blockedOperationEntered, false);
+
+            yield* Deferred.succeed(releaseFirstRetrySleep, undefined);
+            const updateResult = yield* Fiber.join(update);
+            assert.strictEqual(blockedOperationEntered, false);
+            assert.strictEqual(
+              yield* maintenanceGate.withOperation({
+                provider: "droid",
+                operation: "session.start.after-update",
+                run: Effect.succeed("released"),
+              }),
+              "released",
+            );
+            return updateResult;
+          }).pipe(Effect.provide(layer));
+          const droid = result.providers.find((provider) => provider.provider === "droid");
+
+          assert.strictEqual(updatePrepareCount, 1);
+          assert.strictEqual(updateSpawnCount, 1);
+          assert.strictEqual(healthProbeCount, 3);
+          assert.strictEqual(droid?.version, "0.178.0");
+          assert.strictEqual(droid?.updateState?.status, "succeeded");
+          assert.strictEqual(droid?.updateState?.message, "Provider CLI update verified.");
+        }),
+    );
+
+    it.effect.skipIf(process.platform !== "win32")(
       "launches Windows npm updates as node.exe plus npm-cli.js without cmd.exe",
       () =>
         withKiloUpdateFixture("7.4.10", (input) =>
@@ -2087,6 +2299,106 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
             }),
           ),
         ),
+    );
+
+    it.effect("fails terminally before retrying when a post-update probe latches exit proof", () =>
+      withKiloUpdateFixture("7.4.10", (input) =>
+        withLatestNpmVersion(
+          "7.4.11",
+          Effect.gen(function* () {
+            const maintenanceGate = yield* makeProviderMaintenanceGate;
+            let healthSupervisorCount = 0;
+            let healthSpawnCount = 0;
+            let updateSpawnCount = 0;
+            const layer = makeProviderHealthLive({
+              maintenanceGate,
+              superviseProcess: (prepared, child) => {
+                if (prepared.args.some((arg) => arg.includes("@kilocode/cli@latest"))) {
+                  return TEST_PROVIDER_PROCESS_OPTIONS.superviseProcess(prepared, child);
+                }
+                healthSupervisorCount += 1;
+                if (healthSupervisorCount !== 2) {
+                  return TEST_PROVIDER_PROCESS_OPTIONS.superviseProcess(prepared, child);
+                }
+                return {
+                  ...TEST_PROVIDER_PROCESS_OPTIONS.superviseProcess(prepared, child),
+                  proveExit: async () => {
+                    await Effect.runPromise(
+                      maintenanceGate.latchProvider({
+                        provider: "kilo",
+                        reason: "post-update health exit proof requires restart",
+                      }),
+                    );
+                    return { escalated: false, signalErrors: [] };
+                  },
+                };
+              },
+            }).pipe(
+              Layer.provideMerge(providerServiceWithoutRuntimesLayer),
+              Layer.provideMerge(ServerSettingsService.layerTest(input.settings)),
+              Layer.provideMerge(ServerConfig.layerTest(process.cwd(), input.baseDir)),
+              Layer.provideMerge(
+                mockSpawnerLayer((args, command, env, options) => {
+                  if (
+                    preparedProviderCommandMatches({
+                      fixture: input.fixture,
+                      executable: fixtureExecutablePath(input.fixture, "npm"),
+                      expectedArgs: [
+                        "install",
+                        "-g",
+                        "--prefix",
+                        input.npmPrefix,
+                        "@kilocode/cli@latest",
+                      ],
+                      command,
+                      actualArgs: args,
+                      env,
+                      options,
+                    })
+                  ) {
+                    updateSpawnCount += 1;
+                    return { stdout: "updated\n", stderr: "", code: 0 };
+                  }
+                  healthSpawnCount += 1;
+                  return { stdout: "kilo 7.4.10\n", stderr: "", code: 0 };
+                }),
+              ),
+            );
+
+            const observed = yield* Effect.gen(function* () {
+              const providerHealth = yield* ProviderHealth;
+              const error = yield* providerHealth
+                .updateProvider({ provider: "kilo" })
+                .pipe(Effect.flip);
+              const providers = yield* providerHealth.getStatuses;
+              return { error, providers };
+            }).pipe(Effect.provide(layer));
+            const kilo = observed.providers.find((status) => status.provider === "kilo");
+            const blocked = yield* maintenanceGate
+              .withOperation({
+                provider: "kilo",
+                operation: "session.start",
+                run: Effect.void,
+              })
+              .pipe(Effect.flip);
+
+            assert.ok(observed.error instanceof ServerProviderUpdateError);
+            assert.match(observed.error.message, /post-update health exit proof requires restart/u);
+            assert.strictEqual(updateSpawnCount, 1);
+            assert.strictEqual(healthSpawnCount, 2);
+            assert.strictEqual(healthSupervisorCount, 2);
+            assert.strictEqual(kilo?.updateState?.status, "failed");
+            assert.match(
+              kilo?.updateState?.message ?? "",
+              /post-update health exit proof requires restart/u,
+            );
+            assert.strictEqual(
+              blocked.latchedReason,
+              "post-update health exit proof requires restart",
+            );
+          }),
+        ),
+      ),
     );
 
     it.effect("latches an unproven health proveExit even when teardown later succeeds", () =>

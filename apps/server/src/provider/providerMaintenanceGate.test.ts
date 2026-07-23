@@ -414,6 +414,49 @@ describe("providerMaintenanceGate", () => {
     );
   });
 
+  it("lets an exclusive owner observe a latch before releasing maintenance", async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const gate = yield* makeProviderMaintenanceGate;
+        let workAfterAssertion = 0;
+        const maintenance = yield* gate
+          .withExclusiveMaintenance({
+            provider: "kilo",
+            run: gate
+              .latchProvider({
+                provider: "kilo",
+                reason: "updater exit proof requires restart",
+              })
+              .pipe(
+                Effect.andThen(gate.assertProviderNotLatched({ provider: "kilo" })),
+                Effect.andThen(
+                  Effect.sync(() => {
+                    workAfterAssertion += 1;
+                  }),
+                ),
+              ),
+          })
+          .pipe(Effect.result);
+
+        expect(Result.isFailure(maintenance)).toBe(true);
+        if (Result.isFailure(maintenance)) {
+          expect(maintenance.failure).toBeInstanceOf(ProviderMaintenanceLatchedError);
+          expect(maintenance.failure.message).toContain("updater exit proof requires restart");
+        }
+        expect(workAfterAssertion).toBe(0);
+
+        const blocked = yield* gate
+          .withOperation({ provider: "kilo", operation: "session.start", run: Effect.void })
+          .pipe(Effect.result);
+        expect(Result.isFailure(blocked)).toBe(true);
+        if (Result.isFailure(blocked)) {
+          expect(blocked.failure).toBeInstanceOf(ProviderMaintenanceBusyError);
+          expect(blocked.failure.latchedReason).toBe("updater exit proof requires restart");
+        }
+      }),
+    );
+  });
+
   it("latches a maintenance failure before concurrent operations can observe released admission", async () => {
     await Effect.runPromise(
       Effect.scoped(

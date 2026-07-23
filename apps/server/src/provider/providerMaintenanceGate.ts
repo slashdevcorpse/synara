@@ -53,6 +53,13 @@ export interface ProviderMaintenanceGate {
     E | ProviderMaintenanceAlreadyRunningError | ProviderMaintenanceLatchedError,
     R
   >;
+  /**
+   * Lets an exclusive maintenance owner fail closed when work performed while
+   * holding the gate latches the provider without failing its own operation.
+   */
+  readonly assertProviderNotLatched: (input: {
+    readonly provider: ProviderKind;
+  }) => Effect.Effect<void, ProviderMaintenanceLatchedError>;
   /** Fail closed until process restart when a maintenance process tree cannot prove exit. */
   readonly latchProvider: (input: {
     readonly provider: ProviderKind;
@@ -221,6 +228,21 @@ export const makeProviderMaintenanceGate = Effect.gen(function* () {
       return next;
     });
 
+  const assertProviderNotLatched: ProviderMaintenanceGate["assertProviderNotLatched"] = (input) =>
+    Ref.get(statesRef).pipe(
+      Effect.flatMap((states) => {
+        const reason = states.get(input.provider)?.latchedReason ?? null;
+        return reason === null
+          ? Effect.void
+          : Effect.fail(
+              new ProviderMaintenanceLatchedError({
+                provider: input.provider,
+                reason,
+              }),
+            );
+      }),
+    );
+
   const withOperation: ProviderMaintenanceGate["withOperation"] = (input) =>
     Effect.uninterruptibleMask((restore) =>
       Effect.gen(function* () {
@@ -299,6 +321,7 @@ export const makeProviderMaintenanceGate = Effect.gen(function* () {
   return {
     withOperation,
     withExclusiveMaintenance,
+    assertProviderNotLatched,
     latchProvider,
   } satisfies ProviderMaintenanceGate;
 });
