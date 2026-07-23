@@ -148,6 +148,7 @@ import {
 import { quiesceProviderRuntimesForUpdate } from "../providerUpdateQuiescence.ts";
 import { classifyCompletedProviderUpdate } from "../providerUpdateOutcome.ts";
 import {
+  shouldRetryDelayedProviderUpdateVersion,
   verifyDelayedProviderUpdateVersion,
   type ProviderUpdateVerificationSnapshot,
 } from "../providerUpdateVerification.ts";
@@ -4281,11 +4282,13 @@ export function makeProviderHealthLive(
                 }
 
                 const initialPostProbe = yield* runPostUpdateVerificationProbe(stableGeneration);
-                const verifiedPostProbe = yield* verifyDelayedProviderUpdateVersion({
-                  beforeVersion,
-                  initialSnapshot: initialPostProbe,
-                  probe: runPostUpdateVerificationProbe(stableGeneration),
-                });
+                const verifiedPostProbe = shouldRetryDelayedProviderUpdateVersion(platform)
+                  ? yield* verifyDelayedProviderUpdateVersion({
+                      beforeVersion,
+                      initialSnapshot: initialPostProbe,
+                      probe: runPostUpdateVerificationProbe(stableGeneration),
+                    })
+                  : initialPostProbe;
                 return {
                   _tag: "Verified",
                   commandResult,

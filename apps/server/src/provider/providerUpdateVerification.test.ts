@@ -5,6 +5,7 @@ import { TestClock } from "effect/testing";
 
 import {
   PROVIDER_UPDATE_POST_PROBE_RETRY_DELAYS_MS,
+  shouldRetryDelayedProviderUpdateVersion,
   verifyDelayedProviderUpdateVersion,
   type ProviderUpdateVerificationSnapshot,
 } from "./providerUpdateVerification.ts";
@@ -30,6 +31,12 @@ function snapshot(
 }
 
 describe("verifyDelayedProviderUpdateVersion", () => {
+  it("limits delayed replacement retries to Windows", () => {
+    assert.strictEqual(shouldRetryDelayedProviderUpdateVersion("win32"), true);
+    assert.strictEqual(shouldRetryDelayedProviderUpdateVersion("linux"), false);
+    assert.strictEqual(shouldRetryDelayedProviderUpdateVersion("darwin"), false);
+  });
+
   it.effect("observes a delayed self-replacement without waiting past the successful probe", () =>
     Effect.gen(function* () {
       let probeCount = 0;

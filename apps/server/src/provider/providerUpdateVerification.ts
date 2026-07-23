@@ -8,6 +8,10 @@ export interface ProviderUpdateVerificationSnapshot {
   readonly targetChanged: boolean;
 }
 
+export function shouldRetryDelayedProviderUpdateVersion(platform: NodeJS.Platform): boolean {
+  return platform === "win32";
+}
+
 function mayStillBeReplacing(
   snapshot: ProviderUpdateVerificationSnapshot,
   beforeVersion: string | null,
