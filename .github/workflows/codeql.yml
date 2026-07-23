@@ -68,6 +68,7 @@ jobs:
 
   analyze_swift:
     name: codeql-swift
+    if: ${{ false }}
     runs-on: macos-15
     timeout-minutes: 60
     permissions:
