@@ -1756,8 +1756,8 @@ describe("providerMaintenance", () => {
     );
   });
 
-  it.effect("keeps a forced null result authoritative over an older normal lookup", () => {
-    const mock = makeDeferredFetchMock(2);
+  it.effect("keeps a forced null generation authoritative without caching the failure", () => {
+    const mock = makeDeferredFetchMock(3);
     const capabilities = latestNpmCapabilities("@synara-tests/latest-forced-null");
 
     return withFetchMock(
@@ -1776,8 +1776,12 @@ describe("providerMaintenance", () => {
         mock.requests[0]!.resolve(npmVersionResponse("1.0.0"));
         assert.strictEqual(yield* Fiber.join(normal), "1.0.0");
 
-        assert.strictEqual(yield* resolveLatestProviderVersion(capabilities), null);
-        assert.strictEqual(mock.requests.length, 2);
+        const retry = yield* resolveLatestProviderVersion(capabilities).pipe(Effect.forkChild);
+        yield* waitForFetchRequests(mock.requests, 3);
+        mock.requests[2]!.resolve(npmVersionResponse("2.0.0"));
+        assert.strictEqual(yield* Fiber.join(retry), "2.0.0");
+        assert.strictEqual(yield* resolveLatestProviderVersion(capabilities), "2.0.0");
+        assert.strictEqual(mock.requests.length, 3);
       }),
     );
   });

@@ -2155,11 +2155,18 @@ export const resolveLatestProviderVersion = Effect.fn("resolveLatestProviderVers
       latestVersionGenerations.get(cacheKey) === generation &&
       currentRequest?.generation === generation
     ) {
-      latestVersionCache.set(cacheKey, {
-        expiresAt: now + LATEST_VERSION_CACHE_TTL_MS,
-        generation,
-        version,
-      });
+      if (version === null) {
+        // Registry failures are transient metadata failures, not authoritative
+        // version results. Keep the next scheduled, focus, or manual provider
+        // refresh retryable instead of suppressing update notices for an hour.
+        latestVersionCache.delete(cacheKey);
+      } else {
+        latestVersionCache.set(cacheKey, {
+          expiresAt: now + LATEST_VERSION_CACHE_TTL_MS,
+          generation,
+          version,
+        });
+      }
       latestVersionInFlightRequests.delete(cacheKey);
     }
     return version;
