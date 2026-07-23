@@ -193,9 +193,15 @@ function resolveAbsoluteWindowsPath(value: string, cwd: string): string {
 }
 
 export function foldWindowsAsciiCase(value: string): string {
-  return value.replace(/[A-Z]/g, (character) =>
-    String.fromCharCode(character.charCodeAt(0) + 0x20),
-  );
+  let folded = "";
+  for (let index = 0; index < value.length; index += 1) {
+    const codeUnit = value.charCodeAt(index);
+    folded +=
+      codeUnit >= 0x41 && codeUnit <= 0x5a
+        ? String.fromCharCode(codeUnit + 0x20)
+        : value.charAt(index);
+  }
+  return folded;
 }
 
 function normalizeWindowsPathIdentity(value: string, cwd: string): string {
