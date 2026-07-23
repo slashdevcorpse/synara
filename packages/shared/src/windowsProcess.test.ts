@@ -603,6 +603,7 @@ describe("windowsProcess", () => {
     it("shares cwd cache identity across trailing separators while preserving roots", () => {
       const commandDiscoveryCache = createWindowsCommandDiscoveryCache();
       const spawnSync = vi.fn(() => ({ stdout: `${resolvedCommand}\r\n`, status: 0 }));
+      const longMixedSeparators = "\\/".repeat(10_000);
       const resolveAt = (command: string, workingDirectory: string) =>
         resolveWindowsCommandCandidates(command, {
           platform: "win32",
@@ -614,11 +615,14 @@ describe("windowsProcess", () => {
 
       resolveAt("codex", "C:\\x");
       resolveAt("codex", "C:\\x\\");
+      resolveAt("codex", `C:\\x${longMixedSeparators}`);
       resolveAt("root-tool", "C:\\");
       resolveAt("root-tool", "C:\\\\");
+      resolveAt("nested-tool", `C:\\x\\${longMixedSeparators}tail`);
+      resolveAt("nested-tool", `C:\\x\\${longMixedSeparators}tail${longMixedSeparators}`);
 
-      expect(spawnSync).toHaveBeenCalledTimes(2);
-      expect(getWindowsCommandDiscoveryCacheStats(commandDiscoveryCache)).toEqual({ size: 2 });
+      expect(spawnSync).toHaveBeenCalledTimes(3);
+      expect(getWindowsCommandDiscoveryCacheStats(commandDiscoveryCache)).toEqual({ size: 3 });
     });
 
     it("keeps quoted and whitespace-wrapped invalid cwd values cache-distinct", () => {

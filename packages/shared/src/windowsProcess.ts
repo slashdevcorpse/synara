@@ -193,22 +193,28 @@ function resolveAbsoluteWindowsPath(value: string, cwd: string): string {
 }
 
 export function foldWindowsAsciiCase(value: string): string {
-  let folded = "";
-  for (let index = 0; index < value.length; index += 1) {
-    const codeUnit = value.charCodeAt(index);
-    folded +=
-      codeUnit >= 0x41 && codeUnit <= 0x5a
-        ? String.fromCharCode(codeUnit + 0x20)
-        : value.charAt(index);
+  return value.replace(/[A-Z]/g, (character) =>
+    String.fromCharCode(character.charCodeAt(0) + 0x20),
+  );
+}
+
+function stripTrailingWindowsPathSeparators(value: string): string {
+  let end = value.length;
+  while (end > 0) {
+    const codeUnit = value.charCodeAt(end - 1);
+    if (codeUnit !== 0x2f && codeUnit !== 0x5c) {
+      break;
+    }
+    end -= 1;
   }
-  return folded;
+  return end === value.length ? value : value.slice(0, end);
 }
 
 function normalizeWindowsPathIdentity(value: string, cwd: string): string {
   const normalized = resolveAbsoluteWindowsPath(value, cwd);
   const root = Path.win32.parse(normalized).root;
   const withoutTrailingSeparators =
-    normalized.length > root.length ? normalized.replace(/[\\/]+$/, "") : normalized;
+    normalized.length > root.length ? stripTrailingWindowsPathSeparators(normalized) : normalized;
   return foldWindowsAsciiCase(withoutTrailingSeparators);
 }
 
@@ -217,7 +223,7 @@ function normalizeWindowsCwdCacheIdentity(cwd: string): string {
     return foldWindowsAsciiCase(cwd);
   }
   const root = Path.win32.parse(cwd).root;
-  const withoutTrailingSeparators = cwd.replace(/[\\/]+$/, "");
+  const withoutTrailingSeparators = stripTrailingWindowsPathSeparators(cwd);
   const normalized =
     root.length > 0 && withoutTrailingSeparators.length < root.length
       ? root
