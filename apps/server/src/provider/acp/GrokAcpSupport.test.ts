@@ -20,7 +20,7 @@ describe("buildGrokAcpSpawnInput", () => {
   it("builds the default Grok ACP command", () => {
     expect(buildGrokAcpSpawnInput(undefined, "/tmp/project")).toMatchObject({
       command: "grok",
-      args: ["agent", "--no-leader", "stdio"],
+      args: ["--no-auto-update", "agent", "--no-leader", "stdio"],
       cwd: "/tmp/project",
     });
   });
@@ -30,7 +30,7 @@ describe("buildGrokAcpSpawnInput", () => {
       buildGrokAcpSpawnInput({ binaryPath: "/usr/local/bin/grok" }, "/tmp/project"),
     ).toMatchObject({
       command: "/usr/local/bin/grok",
-      args: ["agent", "--no-leader", "stdio"],
+      args: ["--no-auto-update", "agent", "--no-leader", "stdio"],
       cwd: "/tmp/project",
     });
   });
@@ -49,12 +49,13 @@ describe("buildGrokAcpSpawnInput", () => {
     ).toMatchObject({
       command: "/usr/local/bin/grok",
       args: [
+        "--no-auto-update",
         "agent",
         "--no-leader",
         "--always-approve",
         "-m",
         "grok-build",
-        "--reasoning-effort",
+        "--effort",
         "high",
         "stdio",
       ],

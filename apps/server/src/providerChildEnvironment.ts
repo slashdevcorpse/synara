@@ -2,6 +2,8 @@
 // Purpose: Builds provider child environments without Synara control-plane authority.
 // Layer: Server provider process security
 
+import { normalizeWindowsChildEnvironment } from "@synara/shared/windowsProcess";
+
 export type ProviderChildKind =
   | "acp"
   | "antigravity"
@@ -22,9 +24,15 @@ const PROVIDER_CREDENTIAL_KEYS = new Set([
   "AWS_ACCESS_KEY_ID",
   "AWS_SECRET_ACCESS_KEY",
   "AWS_SESSION_TOKEN",
+  "AZURE_API_KEY",
+  "AZURE_OPENAI_API_KEY",
   "GEMINI_API_KEY",
   "GOOGLE_API_KEY",
   "GOOGLE_APPLICATION_CREDENTIALS",
+  "KIMI_MODEL_API_KEY",
+  "OPENAI_API_KEY",
+  "OPENCODE_API_KEY",
+  "PORTKEY_API_KEY",
   "XAI_API_KEY",
   "GROK_CODE_XAI_API_KEY",
   "FACTORY_API_KEY",
@@ -62,40 +70,53 @@ const INHERITED_NATIVE_CAPABILITY_KEYS = new Set([
   "NODE_REPL_SANDBOX_ALLOWED_UNIX_SOCKETS",
 ]);
 
-const isTestHarnessKey = (key: string, env: NodeJS.ProcessEnv): boolean =>
-  Boolean(env.VITEST) && (key.startsWith("SYNARA_FAKE_") || key.startsWith("SYNARA_ACP_"));
-
 export function buildProviderChildEnvironment(input: {
   readonly provider: ProviderChildKind;
   readonly baseEnv?: NodeJS.ProcessEnv;
   readonly inheritedSynaraKeys?: ReadonlyArray<string>;
   readonly inheritedNativeCapabilityKeys?: ReadonlyArray<string>;
   readonly overrides?: NodeJS.ProcessEnv;
+  readonly platform?: NodeJS.Platform;
 }): NodeJS.ProcessEnv {
-  const baseEnv = {
+  const platform = input.platform ?? process.platform;
+  const mergedEnv = {
     ...(input.baseEnv ?? process.env),
     ...input.overrides,
   };
-  const allowedSynaraKeys = new Set(input.inheritedSynaraKeys ?? []);
-  const allowedNativeCapabilities = new Set(input.inheritedNativeCapabilityKeys ?? []);
+  const baseEnv = platform === "win32" ? normalizeWindowsChildEnvironment(mergedEnv) : mergedEnv;
+  const policyKey = (key: string): string => (platform === "win32" ? key.toUpperCase() : key);
+  const allowedSynaraKeys = new Set((input.inheritedSynaraKeys ?? []).map(policyKey));
+  const allowedNativeCapabilities = new Set(
+    (input.inheritedNativeCapabilityKeys ?? []).map(policyKey),
+  );
   const credentialGrants = PROVIDER_CREDENTIAL_GRANTS[input.provider];
+  const testHarnessEnabled = Object.entries(baseEnv).some(
+    ([key, value]) => policyKey(key) === "VITEST" && Boolean(value),
+  );
   const childEnv: NodeJS.ProcessEnv = {};
 
   for (const [key, value] of Object.entries(baseEnv)) {
+    const normalizedKey = policyKey(key);
     if (
-      key.startsWith("SYNARA_") &&
-      !allowedSynaraKeys.has(key) &&
-      !isTestHarnessKey(key, baseEnv)
+      normalizedKey.startsWith("SYNARA_") &&
+      !allowedSynaraKeys.has(normalizedKey) &&
+      !(
+        testHarnessEnabled &&
+        (normalizedKey.startsWith("SYNARA_FAKE_") || normalizedKey.startsWith("SYNARA_ACP_"))
+      )
     ) {
       continue;
     }
-    if (INHERITED_NATIVE_CAPABILITY_KEYS.has(key) && !allowedNativeCapabilities.has(key)) {
+    if (
+      INHERITED_NATIVE_CAPABILITY_KEYS.has(normalizedKey) &&
+      !allowedNativeCapabilities.has(normalizedKey)
+    ) {
       continue;
     }
     if (
-      PROVIDER_CREDENTIAL_KEYS.has(key) &&
+      PROVIDER_CREDENTIAL_KEYS.has(normalizedKey) &&
       credentialGrants !== "all" &&
-      !credentialGrants.has(key)
+      !credentialGrants.has(normalizedKey)
     ) {
       continue;
     }

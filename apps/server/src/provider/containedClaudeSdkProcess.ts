@@ -9,8 +9,10 @@ import {
 } from "node:child_process";
 
 import type { SpawnOptions as ClaudeSpawnOptions } from "@anthropic-ai/claude-agent-sdk";
+import { createWindowsCommandDiscoveryCache } from "@synara/shared/windowsProcess";
 
 import {
+  prepareWindowsProviderProcessAsync,
   prepareWindowsProviderProcess,
   type WindowsProviderProcessInput,
 } from "./windowsProviderProcess.ts";
@@ -39,6 +41,57 @@ export interface ContainedClaudeSdkProcessDependencies {
   readonly onSupervisionError?: (cause: Error) => void | PromiseLike<unknown>;
 }
 
+export interface ContainedClaudeSdkProcessPreparation {
+  readonly platform: NodeJS.Platform;
+  readonly prepareProcess: typeof prepareWindowsProviderProcess;
+}
+
+export interface PrepareContainedClaudeSdkProcessDependencies {
+  readonly prepareProcessAsync?: typeof prepareWindowsProviderProcessAsync;
+}
+
+/**
+ * Pre-resolves the Claude executable and any canonical npm-shim Node runtime
+ * before the Agent SDK enters its synchronous spawn callback. The returned
+ * callback preparer can consume only this exact isolated cache; a mismatched
+ * command or missing prewarm fails closed instead of performing `spawnSync`.
+ */
+export async function prepareContainedClaudeSdkProcess(
+  command: string,
+  input: WindowsProviderProcessInput = {},
+  dependencies: PrepareContainedClaudeSdkProcessDependencies = {},
+): Promise<ContainedClaudeSdkProcessPreparation> {
+  const platform = input.platform ?? globalThis.process.platform;
+  if (platform !== "win32") {
+    return {
+      platform,
+      prepareProcess: (spawnCommand, args) => ({
+        command: spawnCommand,
+        args: [...args],
+        shell: false,
+      }),
+    };
+  }
+
+  const commandDiscoveryCache = input.commandDiscoveryCache ?? createWindowsCommandDiscoveryCache();
+  await (dependencies.prepareProcessAsync ?? prepareWindowsProviderProcessAsync)(command, [], {
+    ...input,
+    platform,
+    commandDiscoveryCache,
+  });
+  return {
+    platform,
+    prepareProcess: (spawnCommand, args, spawnInput = {}) =>
+      prepareWindowsProviderProcess(spawnCommand, args, {
+        ...input,
+        ...spawnInput,
+        platform,
+        commandDiscoveryCache,
+        commandDiscoveryMode: "cache-only",
+      }),
+  };
+}
+
 const containedClaudeProcessesWithoutPid = new WeakSet<ChildProcess>();
 const containedClaudeProcessSupervisionFailures = new WeakMap<ChildProcess, Error>();
 
@@ -56,9 +109,18 @@ export function spawnContainedClaudeSdkProcess(
   options: ClaudeSpawnOptions,
   dependencies: ContainedClaudeSdkProcessDependencies = {},
 ): ChildProcess {
-  const prepareProcess = dependencies.prepareProcess ?? prepareWindowsProviderProcess;
   const spawnProcess = dependencies.spawnProcess ?? spawnChildProcess;
   const platform = dependencies.platform ?? globalThis.process.platform;
+  const prepareProcess: typeof prepareWindowsProviderProcess =
+    dependencies.prepareProcess ??
+    ((command: string, args: ReadonlyArray<string>) => {
+      if (platform === "win32") {
+        throw new Error(
+          "Claude's synchronous SDK spawn callback requires async Windows process prewarming.",
+        );
+      }
+      return { command, args: [...args], shell: false as const };
+    });
   const processInput: WindowsProviderProcessInput = {
     cwd: options.cwd,
     env: options.env,

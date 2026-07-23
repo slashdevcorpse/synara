@@ -44,6 +44,10 @@
       "types": "./src/windowsProcess.ts",
       "import": "./src/windowsProcess.ts"
     },
+    "./windowsNpmShim": {
+      "types": "./src/windowsNpmShim.ts",
+      "import": "./src/windowsNpmShim.ts"
+    },
     "./codexCliExecutable": {
       "types": "./src/codexCliExecutable.ts",
       "import": "./src/codexCliExecutable.ts"

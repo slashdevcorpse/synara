@@ -5,15 +5,18 @@ import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 
 import { DEFAULT_GIT_TEXT_GENERATION_MODEL } from "@synara/contracts";
 import { sanitizeGeneratedThreadTitle } from "@synara/shared/chatThreads";
-import { resolveCodexCliExecutable } from "@synara/shared/codexCliExecutable";
+import { resolveCodexCliExecutableAsync } from "@synara/shared/codexCliExecutable";
 import { resolveCodexHome } from "@synara/shared/codexConfig";
 import { sanitizeBranchFragment, sanitizeFeatureBranchName } from "@synara/shared/git";
-import type { WindowsSafeProcessCommand } from "@synara/shared/windowsProcess";
+import {
+  createWindowsCommandDiscoveryCache,
+  type WindowsSafeProcessCommand,
+} from "@synara/shared/windowsProcess";
 
 import { resolveProviderAttachmentPath } from "../../provider/providerAttachmentPaths.ts";
 import {
   isWindowsJobPreparedCommand,
-  prepareResolvedWindowsProviderProcess,
+  prepareWindowsProviderProcessAsync,
 } from "../../provider/windowsProviderProcess.ts";
 import {
   installPreparedEffectProcessSupervisor,
@@ -383,6 +386,8 @@ const makeCodexTextGeneration = Effect.gen(function* () {
           "--skip-git-repo-check",
           "--config",
           'approval_policy="never"',
+          "-c",
+          "check_for_update_on_startup=false",
           "-s",
           "read-only",
           "--model",
@@ -396,8 +401,37 @@ const makeCodexTextGeneration = Effect.gen(function* () {
           ...imagePaths.flatMap((imagePath) => ["--image", imagePath]),
           "-",
         ];
-        const executable = resolveCodexCliExecutable(codexBinaryPath, { cwd, env });
-        const prepared = prepareResolvedWindowsProviderProcess(executable, args, { cwd, env });
+        const commandDiscoveryCache = createWindowsCommandDiscoveryCache();
+        const executable = yield* Effect.tryPromise({
+          try: () =>
+            resolveCodexCliExecutableAsync(codexBinaryPath, {
+              cwd,
+              env,
+              commandDiscoveryCache,
+            }),
+          catch: (cause) =>
+            normalizeCodexError(
+              codexBinaryPath,
+              operation,
+              cause,
+              "Failed to resolve the Codex CLI process",
+            ),
+        });
+        const prepared = yield* Effect.tryPromise({
+          try: () =>
+            prepareWindowsProviderProcessAsync(executable, args, {
+              cwd,
+              env,
+              commandDiscoveryCache,
+            }),
+          catch: (cause) =>
+            normalizeCodexError(
+              codexBinaryPath,
+              operation,
+              cause,
+              "Failed to prepare the Codex CLI process",
+            ),
+        });
         const command = ChildProcess.make(prepared.command, prepared.args, {
           cwd,
           env,

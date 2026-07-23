@@ -35,7 +35,7 @@ import {
 } from "../supervisedProcessTeardown.ts";
 import type { ProcessTreeKiller } from "../../terminal/processTreeKiller.ts";
 import { supervisePreparedEffectProcess } from "../windowsJobProcessSupervisor.ts";
-import { prepareWindowsProviderProcess } from "../windowsProviderProcess.ts";
+import { prepareWindowsProviderProcessAsync } from "../windowsProviderProcess.ts";
 import {
   collectSessionConfigOptionValues,
   extractModelConfigId,
@@ -907,9 +907,17 @@ const makeAcpSessionRuntime = (
       provider: "acp",
       baseEnv: options.spawn.env ? { ...options.spawn.env } : process.env,
     });
-    const prepared = prepareWindowsProviderProcess(options.spawn.command, options.spawn.args, {
-      cwd: options.spawn.cwd,
-      env,
+    const prepared = yield* Effect.tryPromise({
+      try: () =>
+        prepareWindowsProviderProcessAsync(options.spawn.command, options.spawn.args, {
+          cwd: options.spawn.cwd,
+          env,
+        }),
+      catch: (cause) =>
+        new EffectAcpErrors.AcpSpawnError({
+          command: options.spawn.command,
+          cause,
+        }),
     });
     const childCommandOptions: ChildProcess.CommandOptions & {
       readonly synaraExternallySupervised: true;

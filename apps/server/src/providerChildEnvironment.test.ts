@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
 
+import { readEffectiveWindowsEnvironmentValue } from "@synara/shared/windowsProcess";
 import { describe, expect, it } from "vitest";
 
 import { buildProviderChildEnvironment } from "./providerChildEnvironment";
@@ -91,14 +92,60 @@ describe("buildProviderChildEnvironment", () => {
         provider,
         baseEnv: {
           ANTHROPIC_API_KEY: "anthropic-secret",
+          AZURE_OPENAI_API_KEY: "azure-openai-secret",
           GEMINI_API_KEY: "gemini-secret",
+          KIMI_MODEL_API_KEY: "kimi-secret",
+          OPENAI_API_KEY: "openai-secret",
         },
       });
 
       expect(env.ANTHROPIC_API_KEY).toBe("anthropic-secret");
+      expect(env.AZURE_OPENAI_API_KEY).toBe("azure-openai-secret");
       expect(env.GEMINI_API_KEY).toBe("gemini-secret");
+      expect(env.KIMI_MODEL_API_KEY).toBe("kimi-secret");
+      expect(env.OPENAI_API_KEY).toBe("openai-secret");
     },
   );
+
+  it("filters mixed-case Windows credentials using case-insensitive policy keys", () => {
+    const source = {
+      Path: "C:\\tools",
+      factory_api_key: "factory-secret",
+      OpenAi_Api_Key: "openai-secret",
+      Azure_OpenAI_Api_Key: "azure-secret",
+      Kimi_Model_Api_Key: "kimi-secret",
+      PortKey_Api_Key: "portkey-secret",
+    };
+    const env = buildProviderChildEnvironment({
+      provider: "droid",
+      baseEnv: source,
+      platform: "win32",
+    });
+
+    expect(readEffectiveWindowsEnvironmentValue(env, "PATH")).toBe("C:\\tools");
+    expect(readEffectiveWindowsEnvironmentValue(env, "FACTORY_API_KEY")).toBe("factory-secret");
+    expect(readEffectiveWindowsEnvironmentValue(env, "OPENAI_API_KEY")).toBeUndefined();
+    expect(readEffectiveWindowsEnvironmentValue(env, "AZURE_OPENAI_API_KEY")).toBeUndefined();
+    expect(readEffectiveWindowsEnvironmentValue(env, "KIMI_MODEL_API_KEY")).toBeUndefined();
+    expect(readEffectiveWindowsEnvironmentValue(env, "PORTKEY_API_KEY")).toBeUndefined();
+    expect(source.OpenAi_Api_Key).toBe("openai-secret");
+  });
+
+  it("does not let mixed-case Windows overlays bypass credential policy", () => {
+    const env = buildProviderChildEnvironment({
+      provider: "grok",
+      baseEnv: { XAI_API_KEY: "grok-secret" },
+      overrides: {
+        OpenAi_Api_Key: "overlaid-openai-secret",
+        Azure_Api_Key: "overlaid-azure-secret",
+      },
+      platform: "win32",
+    });
+
+    expect(readEffectiveWindowsEnvironmentValue(env, "XAI_API_KEY")).toBe("grok-secret");
+    expect(readEffectiveWindowsEnvironmentValue(env, "OPENAI_API_KEY")).toBeUndefined();
+    expect(readEffectiveWindowsEnvironmentValue(env, "AZURE_API_KEY")).toBeUndefined();
+  });
 
   it("keeps stripped authority absent in descendants", () => {
     const env = buildProviderChildEnvironment({

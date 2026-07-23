@@ -1,4 +1,4 @@
-import { type ChildProcessWithoutNullStreams, spawn, spawnSync } from "node:child_process";
+import { type ChildProcess, type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 
@@ -32,9 +32,16 @@ import {
   type ServerVoiceTranscriptionInput,
   type ServerVoiceTranscriptionResult,
 } from "@synara/contracts";
-import { resolveCodexCliExecutable } from "@synara/shared/codexCliExecutable";
+import { resolveCodexCliExecutableAsync } from "@synara/shared/codexCliExecutable";
 import { getModelSelectionBooleanOptionValue, normalizeModelSlug } from "@synara/shared/model";
 import { decodeSubagentReceiverThreadIds } from "@synara/shared/subagents";
+import {
+  createWindowsCommandDiscoveryCache,
+  isWindowsBatchCommand,
+  resolveWindowsCommandCandidatesAsync,
+  type WindowsCommandDiscoveryCache,
+  type WindowsSafeProcessInput,
+} from "@synara/shared/windowsProcess";
 import { Effect, ServiceMap } from "effect";
 
 import {
@@ -54,13 +61,10 @@ import {
   teardownChildProcessTree,
   teardownProviderProcessTree,
 } from "./provider/supervisedProcessTeardown.ts";
+import { prepareResolvedWindowsProviderProcess } from "./provider/windowsProviderProcess.ts";
 import {
-  isWindowsJobPreparedCommand,
-  prepareResolvedWindowsProviderProcess,
-} from "./provider/windowsProviderProcess.ts";
-import {
-  finalizeSynchronousWindowsJobExit,
   installPreparedNodeProcessSupervisor,
+  type NodeProviderProcessSupervisor,
   observeNodeProviderProcessSpawn,
   supervisePreparedNodeProcess,
   teardownNodeProviderProcess,
@@ -271,6 +275,14 @@ export interface CodexThreadSnapshot {
 }
 
 const CODEX_VERSION_CHECK_TIMEOUT_MS = 8_000;
+const CODEX_VERSION_CHECK_MAX_BUFFER_BYTES = 1024 * 1024;
+const preventSynchronousWindowsCommandDiscovery: NonNullable<
+  WindowsSafeProcessInput["spawnSync"]
+> = () => ({
+  error: new Error("Synchronous Windows command discovery is disabled on the Codex startup path."),
+  stdout: "",
+  status: null,
+});
 
 const ANSI_ESCAPE_CHAR = String.fromCharCode(27);
 const ANSI_ESCAPE_REGEX = new RegExp(`${ANSI_ESCAPE_CHAR}\\[[0-9;]*m`, "g");
@@ -594,15 +606,20 @@ function encodeCodexTomlBasicStringForCommand(value: string): string {
 }
 
 export function buildCodexAppServerArgs(env: NodeJS.ProcessEnv): string[] {
+  const args = ["-c", "check_for_update_on_startup=false"];
   const sqliteHome = env.CODEX_SQLITE_HOME?.trim();
   if (!sqliteHome) {
-    return ["app-server"];
+    return [...args, "app-server"];
   }
 
-  // Keep this as a root CLI override. Codex session flags outrank project,
-  // user, and system config, any of which can otherwise redirect sqlite_home
-  // away from Synara's process-owned overlay.
-  return ["-c", `sqlite_home=${encodeCodexTomlBasicStringForCommand(sqliteHome)}`, "app-server"];
+  // Keep these as root CLI overrides. They outrank project, user, and system config,
+  // keeping updates advisory in Synara and sqlite_home inside the process-owned overlay.
+  return [
+    ...args,
+    "-c",
+    `sqlite_home=${encodeCodexTomlBasicStringForCommand(sqliteHome)}`,
+    "app-server",
+  ];
 }
 
 export function resolveCodexModelForAccount(
@@ -663,6 +680,7 @@ function spawnCodexAppServer(input: {
   readonly binaryPath: string;
   readonly cwd: string;
   readonly env: NodeJS.ProcessEnv;
+  readonly commandDiscoveryCache: WindowsCommandDiscoveryCache;
 }): {
   readonly child: ChildProcessWithoutNullStreams;
   readonly ownershipReady: Promise<CodexAppServerProcessOwnershipResult>;
@@ -673,6 +691,8 @@ function spawnCodexAppServer(input: {
     {
       cwd: input.cwd,
       env: input.env,
+      commandDiscoveryCache: input.commandDiscoveryCache,
+      spawnSync: preventSynchronousWindowsCommandDiscovery,
     },
   );
   const child = spawn(prepared.command, prepared.args, {
@@ -692,11 +712,29 @@ async function resolveCodexLaunch(input: {
   readonly binaryPath: string;
   readonly cwd: string;
   readonly homePath?: string;
-}): Promise<{ readonly binaryPath: string; readonly env: NodeJS.ProcessEnv }> {
+}): Promise<{
+  readonly binaryPath: string;
+  readonly env: NodeJS.ProcessEnv;
+  readonly commandDiscoveryCache: WindowsCommandDiscoveryCache;
+}> {
   const env = await buildCodexProcessEnv(input.homePath ? { homePath: input.homePath } : {});
-  return {
-    binaryPath: resolveCodexCliExecutable(input.binaryPath, { cwd: input.cwd, env }),
+  const commandDiscoveryCache = createWindowsCommandDiscoveryCache();
+  const binaryPath = await resolveCodexCliExecutableAsync(input.binaryPath, {
+    cwd: input.cwd,
     env,
+    commandDiscoveryCache,
+  });
+  if (process.platform === "win32" && isWindowsBatchCommand(binaryPath)) {
+    await resolveWindowsCommandCandidatesAsync("node", {
+      cwd: input.cwd,
+      env,
+      commandDiscoveryCache,
+    });
+  }
+  return {
+    binaryPath,
+    env,
+    commandDiscoveryCache,
   };
 }
 
@@ -966,6 +1004,7 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
         binaryPath: codexLaunch.binaryPath,
         cwd: resolvedCwd,
         env: codexLaunch.env,
+        commandDiscoveryCache: codexLaunch.commandDiscoveryCache,
       });
       gatewaySessionLease = this.agentGatewayMcp?.acquireSessionLease(threadId);
       const spawned = spawnCodexAppServer({
@@ -975,6 +1014,7 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
           codexHomePath,
           gatewaySessionLease?.connection.bearerToken,
         ),
+        commandDiscoveryCache: codexLaunch.commandDiscoveryCache,
       });
       const child = spawned.child;
 
@@ -1535,6 +1575,7 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
         binaryPath: codexLaunch.binaryPath,
         cwd: resolvedCwd,
         env: codexLaunch.env,
+        commandDiscoveryCache: codexLaunch.commandDiscoveryCache,
       });
       gatewaySessionLease = this.agentGatewayMcp?.acquireSessionLease(threadId);
       const spawned = spawnCodexAppServer({
@@ -1544,6 +1585,7 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
           codexHomePath,
           gatewaySessionLease?.connection.bearerToken,
         ),
+        commandDiscoveryCache: codexLaunch.commandDiscoveryCache,
       });
       const child = spawned.child;
 
@@ -2269,11 +2311,13 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
       binaryPath: codexLaunch.binaryPath,
       cwd: normalizedCwd,
       env: codexLaunch.env,
+      commandDiscoveryCache: codexLaunch.commandDiscoveryCache,
     });
     const spawned = spawnCodexAppServer({
       binaryPath: codexLaunch.binaryPath,
       cwd: normalizedCwd,
       env: codexLaunch.env,
+      commandDiscoveryCache: codexLaunch.commandDiscoveryCache,
     });
     const child = spawned.child;
     const context: CodexSessionContext = {
@@ -2949,6 +2993,7 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
     readonly binaryPath: string;
     readonly cwd: string;
     readonly env: NodeJS.ProcessEnv;
+    readonly commandDiscoveryCache: WindowsCommandDiscoveryCache;
   }): Promise<void> {
     await assertSupportedCodexCliVersion(input);
   }
@@ -3343,80 +3388,287 @@ export function formatCodexCliVersionCheckFailure(input: {
   return `Codex CLI version check failed. ${detail}`;
 }
 
-async function assertSupportedCodexCliVersion(input: {
-  readonly binaryPath: string;
-  readonly cwd: string;
-  readonly env: NodeJS.ProcessEnv;
-}): Promise<void> {
-  const prepared = prepareResolvedWindowsProviderProcess(input.binaryPath, ["--version"], {
-    cwd: input.cwd,
-    env: input.env,
-  });
-  // SYNCHRONOUS_WINDOWS_JOB_OWNERSHIP_EXCEPTION: spawnSync retains the native launcher handle and
-  // does not return until the Job-wrapped target has exited, so no asynchronous teardown owner or
-  // PID lookup is involved in this bounded version probe.
-  const result = spawnSync(prepared.command, prepared.args, {
-    cwd: input.cwd,
-    env: input.env,
-    encoding: "utf8",
-    shell: prepared.shell,
-    stdio: ["ignore", "pipe", "pipe"],
-    timeout: CODEX_VERSION_CHECK_TIMEOUT_MS,
-    maxBuffer: 1024 * 1024,
-    windowsHide: prepared.windowsHide,
-    windowsVerbatimArguments: prepared.windowsVerbatimArguments,
-  });
+interface CodexVersionProbeChild extends ChildProcess {
+  readonly stdout: NonNullable<ChildProcess["stdout"]>;
+  readonly stderr: NonNullable<ChildProcess["stderr"]>;
+}
 
-  const stdout = result.stdout ?? "";
-  const stderr = result.stderr ?? "";
-  let commandFailure: Error | undefined;
-  if (result.error) {
-    const lower = result.error.message.toLowerCase();
-    if (
-      lower.includes("enoent") ||
-      lower.includes("command not found") ||
-      lower.includes("not found")
-    ) {
-      commandFailure = new Error(
-        `Codex CLI (${input.binaryPath}) is not installed or not executable.`,
-      );
-    } else {
-      commandFailure = new Error(
-        `Failed to execute Codex CLI version check: ${result.error.message || String(result.error)}`,
-      );
+type SpawnCodexVersionProbe = (
+  command: string,
+  args: ReadonlyArray<string>,
+  options: {
+    readonly cwd: string;
+    readonly env: NodeJS.ProcessEnv;
+    readonly shell: false;
+    readonly stdio: ["ignore", "pipe", "pipe"];
+    readonly detached?: true | undefined;
+    readonly windowsHide?: true | undefined;
+    readonly windowsVerbatimArguments?: true | undefined;
+  },
+) => CodexVersionProbeChild;
+
+interface CodexVersionProbeDependencies {
+  readonly timeoutMs?: number | undefined;
+  readonly platform?: NodeJS.Platform | undefined;
+  readonly prepareProcess?: typeof prepareResolvedWindowsProviderProcess | undefined;
+  readonly spawnProcess?: SpawnCodexVersionProbe | undefined;
+  readonly superviseProcess?: typeof supervisePreparedNodeProcess | undefined;
+}
+
+type CodexVersionProbeCompletion =
+  | {
+      readonly _tag: "Completed";
+      readonly status: number | null;
+      readonly stdout: string;
+      readonly stderr: string;
     }
-  } else if (result.status !== 0) {
-    commandFailure = new Error(
-      formatCodexCliVersionCheckFailure({
-        binaryPath: input.binaryPath,
-        status: result.status,
-        stdout,
-        stderr,
-      }),
+  | {
+      readonly _tag: "Failed";
+      readonly cause: Error;
+      readonly executionFailure: boolean;
+    };
+
+function errorFromUnknown(cause: unknown): Error {
+  return cause instanceof Error ? cause : new Error(String(cause));
+}
+
+function formatCodexVersionProbeExecutionError(binaryPath: string, cause: unknown): Error {
+  const error = errorFromUnknown(cause);
+  const code = (error as NodeJS.ErrnoException).code;
+  const lower = error.message.toLowerCase();
+  if (
+    code === "ENOENT" ||
+    lower.includes("enoent") ||
+    lower.includes("command not found") ||
+    lower.includes("not found")
+  ) {
+    return new Error(`Codex CLI (${binaryPath}) is not installed or not executable.`);
+  }
+  return new Error(`Failed to execute Codex CLI version check: ${error.message || String(error)}`, {
+    cause: error,
+  });
+}
+
+function collectCodexVersionProbe(
+  child: CodexVersionProbeChild,
+  timeoutMs: number,
+): Promise<CodexVersionProbeCompletion> {
+  return new Promise((resolve) => {
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    const finish = (completion: CodexVersionProbeCompletion) => {
+      if (settled) return;
+      settled = true;
+      if (timer !== undefined) clearTimeout(timer);
+      resolve(completion);
+    };
+    const collect = (
+      chunks: Buffer[],
+      currentBytes: number,
+      value: unknown,
+      streamName: "stdout" | "stderr",
+    ): number => {
+      const chunk = Buffer.isBuffer(value) ? value : Buffer.from(String(value));
+      const nextBytes = currentBytes + chunk.byteLength;
+      if (nextBytes > CODEX_VERSION_CHECK_MAX_BUFFER_BYTES) {
+        finish({
+          _tag: "Failed",
+          cause: new Error(
+            `Codex CLI version check ${streamName} exceeded ${CODEX_VERSION_CHECK_MAX_BUFFER_BYTES} bytes.`,
+          ),
+          executionFailure: false,
+        });
+        return nextBytes;
+      }
+      chunks.push(chunk);
+      return nextBytes;
+    };
+
+    child.stdout.on("data", (value) => {
+      if (stdoutBytes <= CODEX_VERSION_CHECK_MAX_BUFFER_BYTES) {
+        stdoutBytes = collect(stdoutChunks, stdoutBytes, value, "stdout");
+      }
+    });
+    child.stderr.on("data", (value) => {
+      if (stderrBytes <= CODEX_VERSION_CHECK_MAX_BUFFER_BYTES) {
+        stderrBytes = collect(stderrChunks, stderrBytes, value, "stderr");
+      }
+    });
+    child.once("error", (cause) => {
+      finish({ _tag: "Failed", cause, executionFailure: true });
+    });
+    child.once("close", (status) => {
+      finish({
+        _tag: "Completed",
+        status,
+        stdout: Buffer.concat(stdoutChunks).toString("utf8"),
+        stderr: Buffer.concat(stderrChunks).toString("utf8"),
+      });
+    });
+    timer = setTimeout(() => {
+      finish({
+        _tag: "Failed",
+        cause: new Error(`Codex CLI version check timed out after ${timeoutMs}ms.`),
+        executionFailure: false,
+      });
+    }, timeoutMs);
+    timer.unref?.();
+  });
+}
+
+async function throwAfterVerifiedVersionProbeTeardown(
+  supervisor: NodeProviderProcessSupervisor,
+  primaryFailure: Error,
+): Promise<never> {
+  try {
+    await supervisor.teardown();
+  } catch (teardownFailure) {
+    throw new AggregateError(
+      [primaryFailure, teardownFailure],
+      `${primaryFailure.message} Windows Job teardown also failed.`,
     );
   }
-  const isUnstartedWindowsLauncherTargetFailure =
-    isWindowsJobPreparedCommand(prepared) &&
-    result.status === 241 &&
-    stderr.includes("[synara-windows-job-launcher] stage=target ");
-  let finalizationFailure: unknown;
+  throw primaryFailure;
+}
+
+export async function assertSupportedCodexCliVersion(
+  input: {
+    readonly binaryPath: string;
+    readonly cwd: string;
+    readonly env: NodeJS.ProcessEnv;
+    readonly commandDiscoveryCache: WindowsCommandDiscoveryCache;
+  },
+  dependencies: CodexVersionProbeDependencies = {},
+): Promise<void> {
+  const prepareProcess = dependencies.prepareProcess ?? prepareResolvedWindowsProviderProcess;
+  const timeoutMs =
+    typeof dependencies.timeoutMs === "number" &&
+    Number.isFinite(dependencies.timeoutMs) &&
+    dependencies.timeoutMs > 0
+      ? dependencies.timeoutMs
+      : CODEX_VERSION_CHECK_TIMEOUT_MS;
+  const platform = dependencies.platform ?? process.platform;
+  const prepared = prepareProcess(input.binaryPath, ["--version"], {
+    cwd: input.cwd,
+    env: input.env,
+    commandDiscoveryCache: input.commandDiscoveryCache,
+    spawnSync: preventSynchronousWindowsCommandDiscovery,
+  });
+
+  const spawnProcess: SpawnCodexVersionProbe =
+    dependencies.spawnProcess ??
+    ((command, args, options) =>
+      spawn(command, [...args], options) as unknown as CodexVersionProbeChild);
+  let child: CodexVersionProbeChild;
   try {
-    finalizeSynchronousWindowsJobExit(prepared, {
-      proofRequired: result.error === undefined && !isUnstartedWindowsLauncherTargetFailure,
+    child = spawnProcess(prepared.command, prepared.args, {
+      cwd: input.cwd,
+      env: input.env,
+      stdio: ["ignore", "pipe", "pipe"],
+      shell: prepared.shell,
+      ...(platform === "win32" ? {} : { detached: true as const }),
+      windowsHide: prepared.windowsHide,
+      windowsVerbatimArguments: prepared.windowsVerbatimArguments,
     });
   } catch (cause) {
-    finalizationFailure = cause;
+    throw formatCodexVersionProbeExecutionError(input.binaryPath, cause);
   }
-  if (commandFailure && finalizationFailure) {
+
+  const completionPromise = collectCodexVersionProbe(child, timeoutMs);
+  const spawnOutcome = await Promise.race([
+    observeNodeProviderProcessSpawn(child),
+    completionPromise.then((completion) => ({
+      _tag: "Unidentified" as const,
+      cause:
+        completion._tag === "Failed"
+          ? completion.cause
+          : new Error("Codex CLI version probe closed without establishing a positive root PID."),
+    })),
+  ]);
+  if (spawnOutcome._tag !== "Spawned") {
+    const completion = await completionPromise;
+    if (completion._tag === "Failed" && !completion.executionFailure) {
+      try {
+        child.kill();
+      } catch {
+        // No positive PID was established, so there is no exact supervisor to own teardown.
+      }
+      throw completion.cause;
+    }
+    const cause = completion._tag === "Failed" ? completion.cause : spawnOutcome.cause;
+    throw formatCodexVersionProbeExecutionError(input.binaryPath, cause);
+  }
+
+  let installation: ReturnType<typeof installPreparedNodeProcessSupervisor>;
+  try {
+    installation = installPreparedNodeProcessSupervisor(
+      prepared,
+      child,
+      {
+        exitTimeoutMs: timeoutMs,
+        ...(platform === "win32" ? {} : { ownedProcessGroupId: spawnOutcome.rootPid, platform }),
+      },
+      dependencies.superviseProcess,
+    );
+  } catch (cause) {
+    try {
+      child.kill();
+    } catch {
+      // Supervisor establishment failed; the retained child handle is the final containment fallback.
+    }
+    await completionPromise;
+    throw cause;
+  }
+  const supervisor = installation.supervisor;
+  if (installation._tag === "Recovered") {
+    await throwAfterVerifiedVersionProbeTeardown(
+      supervisor,
+      errorFromUnknown(installation.requestedSupervisorFailure),
+    );
+  }
+
+  const completion = await completionPromise;
+  if (completion._tag === "Failed") {
+    return throwAfterVerifiedVersionProbeTeardown(
+      supervisor,
+      completion.executionFailure
+        ? formatCodexVersionProbeExecutionError(input.binaryPath, completion.cause)
+        : completion.cause,
+    );
+  }
+
+  const commandFailure =
+    completion.status === 0
+      ? undefined
+      : new Error(
+          formatCodexCliVersionCheckFailure({
+            binaryPath: input.binaryPath,
+            status: completion.status,
+            stdout: completion.stdout,
+            stderr: completion.stderr,
+          }),
+        );
+  let proofFailure: unknown;
+  try {
+    await supervisor.proveExit();
+  } catch (cause) {
+    proofFailure = cause;
+  }
+  if (commandFailure && proofFailure) {
     throw new AggregateError(
-      [commandFailure, finalizationFailure],
-      `${commandFailure.message} Windows Job proof finalization also failed.`,
+      [commandFailure, proofFailure],
+      `${commandFailure.message} Windows Job exit proof also failed.`,
     );
   }
   if (commandFailure) throw commandFailure;
-  if (finalizationFailure) throw finalizationFailure;
+  if (proofFailure) throw proofFailure;
 
-  const parsedVersion = parseCodexCliVersion(`${stdout}\n${stderr}`);
+  const parsedVersion = parseCodexCliVersion(`${completion.stdout}\n${completion.stderr}`);
   if (parsedVersion && !isCodexCliVersionSupported(parsedVersion)) {
     throw new Error(formatCodexCliUpgradeMessage(parsedVersion));
   }

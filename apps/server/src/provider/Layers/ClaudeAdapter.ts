@@ -161,7 +161,9 @@ import {
 } from "../supervisedProcessTeardown.ts";
 import {
   containedClaudeSdkProcessDidNotSpawn,
+  prepareContainedClaudeSdkProcess,
   spawnContainedClaudeSdkProcess,
+  type ContainedClaudeSdkProcessPreparation,
 } from "../containedClaudeSdkProcess.ts";
 import { teardownNodeProviderProcess } from "../windowsJobProcessSupervisor.ts";
 
@@ -428,6 +430,7 @@ export interface ClaudeAdapterLiveOptions {
   // Interval for polling a live workflow's transcript directory. Tests shrink it.
   readonly workflowRuntimePollIntervalMs?: number;
   readonly spawnClaudeCodeProcess?: (options: ClaudeSpawnOptions) => ClaudeOwnedProcess;
+  readonly prepareContainedClaudeProcess?: typeof prepareContainedClaudeSdkProcess;
   readonly spawnContainedClaudeProcess?: typeof spawnContainedClaudeSdkProcess;
   readonly teardownProcessTree?: typeof teardownProviderProcessTree;
   readonly maintenanceOwnedResources?: ProviderMaintenanceOwnedResourceCoordinator;
@@ -1506,9 +1509,13 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
         readonly prompt: AsyncIterable<SDKUserMessage>;
         readonly options: ClaudeQueryOptions;
       }) => query({ prompt: input.prompt, options: input.options }) as ClaudeQueryRuntime);
+    const usesDefaultCreateQuery = options?.createQuery === undefined;
     const spawnClaudeProcess = options?.spawnClaudeCodeProcess;
+    const prepareContainedClaudeProcessForLaunch =
+      options?.prepareContainedClaudeProcess ?? prepareContainedClaudeSdkProcess;
     const spawnContainedClaudeProcess =
       options?.spawnContainedClaudeProcess ?? spawnContainedClaudeSdkProcess;
+    const usesDefaultContainedClaudeProcess = options?.spawnContainedClaudeProcess === undefined;
     const teardownProcessTree = options?.teardownProcessTree ?? teardownProviderProcessTree;
     const maintenanceOwnedResources =
       options?.maintenanceOwnedResources ??
@@ -1715,10 +1722,16 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
         );
 
     const bindClaudeProcessOwner =
-      (owner: ClaudeProcessOwner) =>
+      (owner: ClaudeProcessOwner, containedPreparation?: ContainedClaudeSdkProcessPreparation) =>
       (spawnOptions: ClaudeSpawnOptions): ClaudeSpawnedProcess => {
         if (spawnClaudeProcess === undefined) {
           return spawnContainedClaudeProcess(spawnOptions, {
+            ...(containedPreparation
+              ? {
+                  platform: containedPreparation.platform,
+                  prepareProcess: containedPreparation.prepareProcess,
+                }
+              : {}),
             // Publish the provisional handle before any fallible supervisor construction. The
             // startup error path can then tear down the exact retained shared supervisor or its
             // generic child-process fallback.
@@ -1737,6 +1750,28 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
         publishClaudeProcessOwner(owner, process);
         return process;
       };
+
+    const prepareDefaultContainedClaudeProcess = (
+      command: string,
+      cwd: string | undefined,
+      env: NodeJS.ProcessEnv,
+    ): Effect.Effect<ContainedClaudeSdkProcessPreparation | undefined, Error> =>
+      options?.prepareContainedClaudeProcess === undefined &&
+      (!usesDefaultCreateQuery ||
+        spawnClaudeProcess !== undefined ||
+        !usesDefaultContainedClaudeProcess)
+        ? Effect.succeed(undefined)
+        : Effect.tryPromise({
+            try: () =>
+              prepareContainedClaudeProcessForLaunch(command, {
+                ...(cwd ? { cwd } : {}),
+                env,
+              }),
+            catch: (cause) =>
+              cause instanceof Error
+                ? cause
+                : new Error("Failed to prepare the Claude CLI process.", { cause }),
+          });
 
     const teardownClaudeProcess = (
       threadId: ThreadId,
@@ -4644,6 +4679,23 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
           });
         }
 
+        const claudeExecutable = providerOptions?.binaryPath ?? "claude";
+        const containedPreparation = yield* prepareDefaultContainedClaudeProcess(
+          claudeExecutable,
+          input.cwd,
+          claudeSdkEnv,
+        ).pipe(
+          Effect.mapError(
+            (cause) =>
+              new ProviderAdapterProcessError({
+                provider: PROVIDER,
+                threadId,
+                detail: toMessage(cause, "Failed to prepare the Claude runtime process."),
+                cause,
+              }),
+          ),
+        );
+
         const gatewaySessionLease = acquireAgentGatewaySessionLease(
           agentGatewayCredentials,
           threadId,
@@ -4663,13 +4715,12 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
             // supervision failure remains authoritative and is surfaced by lifecycle cleanup.
           }
         };
-
         const queryOptions: ClaudeQueryOptions = {
           ...(input.cwd ? { cwd: input.cwd } : {}),
           // Keep Claude context-window selection model-driven so session start
           // and in-session switches both use the same API model contract.
           ...(apiModelId ? { model: apiModelId } : {}),
-          pathToClaudeCodeExecutable: providerOptions?.binaryPath ?? "claude",
+          pathToClaudeCodeExecutable: claudeExecutable,
           settingSources: [...CLAUDE_SETTING_SOURCES],
           systemPrompt: {
             type: "preset",
@@ -4704,7 +4755,7 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
           },
           canUseTool,
           env: claudeSdkEnv,
-          spawnClaudeCodeProcess: bindClaudeProcessOwner(processOwner),
+          spawnClaudeCodeProcess: bindClaudeProcessOwner(processOwner, containedPreparation),
           ...(input.cwd ? { additionalDirectories: [input.cwd] } : {}),
           ...(agentGatewayCredentials
             ? {
@@ -5427,6 +5478,23 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
           cause: new Error(`Retained Claude process owner: ${retainedDiscoveryOwner.resourceId}`),
         });
       }
+      const containedPreparation = await Effect.runPromise(
+        prepareDefaultContainedClaudeProcess("claude", cwd, env),
+      );
+      const ownerRetainedDuringPreparation = Array.from(processOwners).find(
+        (owner) => owner.threadId === discoveryThreadId,
+      );
+      if (ownerRetainedDuringPreparation) {
+        throw new ProviderAdapterProcessError({
+          provider: PROVIDER,
+          threadId: discoveryThreadId,
+          detail:
+            "Cannot start Claude command discovery while cleanup of the previous owned process remains unproven.",
+          cause: new Error(
+            `Retained Claude process owner: ${ownerRetainedDuringPreparation.resourceId}`,
+          ),
+        });
+      }
       const processOwner = createClaudeProcessOwner({
         threadId: discoveryThreadId,
         purpose: "command-discovery",
@@ -5463,7 +5531,10 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
                     permissionMode: "plan" as PermissionMode,
                     persistSession: false,
                     env,
-                    spawnClaudeCodeProcess: bindClaudeProcessOwner(processOwner),
+                    spawnClaudeCodeProcess: bindClaudeProcessOwner(
+                      processOwner,
+                      containedPreparation,
+                    ),
                   },
                 }),
               catch: (cause) =>

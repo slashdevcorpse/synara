@@ -62,7 +62,7 @@ describe("GrokAdapter runtime event scoping", () => {
     const command = makeGrokModelListChildProcess(
       {
         command: "C:\\tools\\synara-windows-job-launcher.exe",
-        args: ["--", "C:\\tools\\grok.exe", "models"],
+        args: ["--", "C:\\tools\\grok.exe", "--no-auto-update", "models"],
         shell: false,
         windowsHide: true,
         windowsVerbatimArguments: true,
@@ -86,6 +86,11 @@ describe("GrokAdapter runtime event scoping", () => {
       captureComplete: false,
     });
     let spawnCount = 0;
+    const prepareProcess = vi.fn((command: string, args: ReadonlyArray<string>) => ({
+      command,
+      args: [...args],
+      shell: false as const,
+    }));
     const spawner = ChildProcessSpawner.make(() => {
       spawnCount += 1;
       return Effect.fail(
@@ -98,7 +103,10 @@ describe("GrokAdapter runtime event scoping", () => {
     const failure = await Effect.runPromise(
       Effect.scoped(
         Effect.gen(function* () {
-          const adapter = yield* makeGrokAdapter({ binaryPath: "C:\\tools\\grok.exe" });
+          const adapter = yield* makeGrokAdapter(
+            { binaryPath: "C:\\tools\\grok.exe" },
+            { prepareProcess },
+          );
           return yield* adapter.listModels!({
             provider: "grok",
             binaryPath: "C:\\tools\\grok.exe",
@@ -112,6 +120,11 @@ describe("GrokAdapter runtime event scoping", () => {
     );
 
     expect(findProviderProcessExitUnprovenError(failure)).toBe(processFailure);
+    expect(prepareProcess).toHaveBeenCalledWith(
+      "C:\\tools\\grok.exe",
+      ["--no-auto-update", "models"],
+      expect.objectContaining({ env: expect.any(Object) }),
+    );
     expect(spawnCount).toBe(1);
   });
 

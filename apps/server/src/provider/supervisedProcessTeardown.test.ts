@@ -1448,6 +1448,195 @@ describe("superviseEffectProcessTree", () => {
     });
   });
 
+  it("proves an empty owned POSIX group after a short-lived root beats initial capture", async () => {
+    const owned = controllableEffectProcess(556);
+    const captureStarted = Promise.withResolvers<void>();
+    const releaseInitialCapture = Promise.withResolvers<void>();
+    let captureCalls = 0;
+    let inspectionCalls = 0;
+    const supervisor = superviseEffectProcessTree(owned.process, {
+      processTreeKiller: {
+        capture: () => {
+          throw new Error("synchronous capture must not run");
+        },
+        captureAsync: async (_rootPid, options) => {
+          expect(options).toEqual({ processGroupId: 556 });
+          captureCalls += 1;
+          if (captureCalls === 1) {
+            captureStarted.resolve();
+            await releaseInitialCapture.promise;
+          }
+          return { descendants: [], captureComplete: true };
+        },
+        inspect: () => {
+          inspectionCalls += 1;
+          return { verified: true, survivors: [] };
+        },
+        signal: () => undefined,
+      },
+      platform: "linux",
+      ownedProcessGroupId: 556,
+      capturePollMs: 60_000,
+    });
+
+    await captureStarted.promise;
+    owned.exit();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    releaseInitialCapture.resolve();
+
+    await expect(supervisor.proveExit()).resolves.toEqual({
+      escalated: false,
+      signalErrors: [],
+    });
+    expect(captureCalls).toBe(2);
+    expect(inspectionCalls).toBe(1);
+  });
+
+  it("rejects a complete drain after an incomplete initial POSIX group snapshot", async () => {
+    const owned = controllableEffectProcess(557);
+    const captureStarted = Promise.withResolvers<void>();
+    const releaseInitialCapture = Promise.withResolvers<void>();
+    let captureCalls = 0;
+    const supervisor = superviseEffectProcessTree(owned.process, {
+      processTreeKiller: {
+        capture: () => {
+          throw new Error("synchronous capture must not run");
+        },
+        captureAsync: async () => {
+          captureCalls += 1;
+          if (captureCalls === 1) {
+            captureStarted.resolve();
+            await releaseInitialCapture.promise;
+            return { descendants: [], captureComplete: false };
+          }
+          return { descendants: [], captureComplete: true };
+        },
+        inspect: () => ({ verified: true, survivors: [] }),
+        signal: () => undefined,
+      },
+      platform: "linux",
+      ownedProcessGroupId: 557,
+      capturePollMs: 60_000,
+      proofTimeoutMs: 5,
+    });
+
+    await captureStarted.promise;
+    owned.exit();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    releaseInitialCapture.resolve();
+
+    await expect(supervisor.proveExit()).rejects.toMatchObject({
+      rootPid: 557,
+      rootExited: true,
+      remainingDescendantPids: [],
+      captureComplete: false,
+    });
+  });
+
+  it("rejects a reused POSIX root after a short-lived root beats initial capture", async () => {
+    const owned = controllableEffectProcess(558);
+    const captureStarted = Promise.withResolvers<void>();
+    const releaseInitialCapture = Promise.withResolvers<void>();
+    const reusedRoot: CapturedProcess = {
+      pid: 558,
+      command: "unrelated process",
+      identity: "558:reused-start",
+      groupId: 558,
+    };
+    let captureCalls = 0;
+    const inspectedTrees: CapturedProcessTree[] = [];
+    const supervisor = superviseEffectProcessTree(owned.process, {
+      processTreeKiller: {
+        capture: () => {
+          throw new Error("synchronous capture must not run");
+        },
+        captureAsync: async () => {
+          captureCalls += 1;
+          if (captureCalls === 1) {
+            captureStarted.resolve();
+            await releaseInitialCapture.promise;
+            return { descendants: [], captureComplete: true };
+          }
+          return { root: reusedRoot, descendants: [], captureComplete: true };
+        },
+        inspect: (tree) => {
+          inspectedTrees.push(tree);
+          return { verified: true, survivors: [] };
+        },
+        signal: () => undefined,
+      },
+      platform: "linux",
+      ownedProcessGroupId: 558,
+      capturePollMs: 60_000,
+      proofTimeoutMs: 5,
+    });
+
+    await captureStarted.promise;
+    owned.exit();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    releaseInitialCapture.resolve();
+
+    await expect(supervisor.proveExit()).rejects.toMatchObject({
+      rootPid: 558,
+      rootExited: true,
+      captureComplete: false,
+    });
+    expect(inspectedTrees).not.toContainEqual(expect.objectContaining({ root: reusedRoot }));
+  });
+
+  it("still rejects a retained POSIX descendant after the owned group drains", async () => {
+    const owned = controllableEffectProcess(559);
+    const ownedRoot: CapturedProcess = {
+      pid: 559,
+      command: "provider updater",
+      identity: "559:owned-start",
+      groupId: 559,
+    };
+    const escapedDescendant: CapturedProcess = {
+      pid: 560,
+      command: "provider worker",
+      identity: "560:worker-start",
+      groupId: 559,
+    };
+    let captureCalls = 0;
+    const supervisor = superviseEffectProcessTree(owned.process, {
+      processTreeKiller: {
+        capture: () => {
+          throw new Error("synchronous capture must not run");
+        },
+        captureAsync: async () => {
+          captureCalls += 1;
+          return captureCalls === 1
+            ? {
+                root: ownedRoot,
+                descendants: [escapedDescendant],
+                captureComplete: true,
+              }
+            : { descendants: [], captureComplete: true };
+        },
+        inspect: (tree) => ({
+          verified: true,
+          survivors: tree.descendants.filter(({ pid }) => pid === escapedDescendant.pid),
+        }),
+        signal: () => undefined,
+      },
+      platform: "linux",
+      ownedProcessGroupId: 559,
+      capturePollMs: 60_000,
+      proofTimeoutMs: 5,
+    });
+
+    await supervisor.waitForInitialCapture();
+    owned.exit();
+
+    await expect(supervisor.proveExit()).rejects.toMatchObject({
+      rootPid: 559,
+      rootExited: true,
+      remainingDescendantPids: [560],
+      captureComplete: true,
+    });
+  });
+
   it("does not adopt a rootless POSIX group after identity continuity is lost", async () => {
     const owned = controllableEffectProcess(561);
     const ownedRoot: CapturedProcess = {

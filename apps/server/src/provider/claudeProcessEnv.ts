@@ -6,6 +6,11 @@ import { readFileSync } from "node:fs";
 import OS from "node:os";
 import nodePath from "node:path";
 
+import {
+  normalizeWindowsChildEnvironment,
+  readEffectiveWindowsEnvironmentValue,
+} from "@synara/shared/windowsProcess";
+
 import { buildProviderChildEnvironment } from "../providerChildEnvironment.ts";
 
 const CLAUDE_DIRECT_CREDENTIAL_ENV_KEYS = [
@@ -31,8 +36,35 @@ function envFlagEnabled(value: string | undefined): boolean {
   return Boolean(normalized && normalized !== "0" && normalized !== "false");
 }
 
-function hasClaudeExternalAuthEnv(env: NodeJS.ProcessEnv): boolean {
-  return CLAUDE_EXTERNAL_AUTH_ENV_KEYS.some((key) => envFlagEnabled(env[key]));
+function readEnvironmentValue(
+  env: NodeJS.ProcessEnv,
+  key: string,
+  platform: NodeJS.Platform,
+): string | undefined {
+  return platform === "win32" ? readEffectiveWindowsEnvironmentValue(env, key) : env[key];
+}
+
+function deleteEnvironmentValue(
+  env: NodeJS.ProcessEnv,
+  key: string,
+  platform: NodeJS.Platform,
+): void {
+  if (platform !== "win32") {
+    delete env[key];
+    return;
+  }
+  const normalizedKey = key.toUpperCase();
+  for (const candidate of Object.keys(env)) {
+    if (candidate.toUpperCase() === normalizedKey) {
+      delete env[candidate];
+    }
+  }
+}
+
+function hasClaudeExternalAuthEnv(env: NodeJS.ProcessEnv, platform: NodeJS.Platform): boolean {
+  return CLAUDE_EXTERNAL_AUTH_ENV_KEYS.some((key) =>
+    envFlagEnabled(readEnvironmentValue(env, key, platform)),
+  );
 }
 
 function readNonEmptyString(value: unknown): string | undefined {
@@ -61,11 +93,16 @@ export interface ClaudeCliCredentialsSummary {
 export function resolveClaudeCredentialsPaths(input?: {
   readonly env?: NodeJS.ProcessEnv;
   readonly homeDir?: string;
+  readonly platform?: NodeJS.Platform;
 }): ReadonlyArray<string> {
   const env = input?.env ?? process.env;
-  const homeDir = trimToUndefined(input?.homeDir) ?? trimToUndefined(env.HOME) ?? OS.homedir();
+  const platform = input?.platform ?? process.platform;
+  const homeDir =
+    trimToUndefined(input?.homeDir) ??
+    trimToUndefined(readEnvironmentValue(env, "HOME", platform)) ??
+    OS.homedir();
   const paths: string[] = [];
-  const configDir = trimToUndefined(env.CLAUDE_CONFIG_DIR);
+  const configDir = trimToUndefined(readEnvironmentValue(env, "CLAUDE_CONFIG_DIR", platform));
   if (configDir) {
     paths.push(nodePath.join(configDir, ".credentials.json"));
   }
@@ -101,6 +138,7 @@ export function readClaudeCliCredentialsContentSummary(
 export function hasUsableClaudeCliCredentials(input?: {
   readonly env?: NodeJS.ProcessEnv;
   readonly homeDir?: string;
+  readonly platform?: NodeJS.Platform;
   readonly nowMs?: number;
   readonly readFile?: (path: string) => string;
 }): boolean {
@@ -110,6 +148,7 @@ export function hasUsableClaudeCliCredentials(input?: {
 export function readClaudeCliCredentialsSummary(input?: {
   readonly env?: NodeJS.ProcessEnv;
   readonly homeDir?: string;
+  readonly platform?: NodeJS.Platform;
   readonly nowMs?: number;
   readonly readFile?: (path: string) => string;
 }): ClaudeCliCredentialsSummary {
@@ -131,23 +170,34 @@ export function buildClaudeProcessEnv(input?: {
   readonly env?: NodeJS.ProcessEnv;
   readonly homeDir?: string;
   readonly hasClaudeCliCredentials?: boolean;
+  readonly platform?: NodeJS.Platform;
 }): NodeJS.ProcessEnv {
-  const env = { ...(input?.env ?? process.env) };
+  const platform = input?.platform ?? process.platform;
+  const sourceEnv = { ...(input?.env ?? process.env) };
+  const env = platform === "win32" ? normalizeWindowsChildEnvironment(sourceEnv) : sourceEnv;
   if (input?.homeDir) {
+    deleteEnvironmentValue(env, "HOME", platform);
     env.HOME = input.homeDir;
   }
-  const credentialInput = input?.homeDir ? { env, homeDir: input.homeDir } : { env };
+  const credentialInput = input?.homeDir
+    ? { env, homeDir: input.homeDir, platform }
+    : { env, platform };
   const hasLocalClaudeAuth =
     input?.hasClaudeCliCredentials ?? hasUsableClaudeCliCredentials(credentialInput);
 
-  if (!hasLocalClaudeAuth || hasClaudeExternalAuthEnv(env)) {
-    return buildProviderChildEnvironment({ provider: "claude", baseEnv: env });
+  if (hasLocalClaudeAuth && !hasClaudeExternalAuthEnv(env, platform)) {
+    // Claude gives direct request credentials precedence over local OAuth. Drop stale
+    // app-process keys when a real Claude CLI login can satisfy the subprocess.
+    for (const key of CLAUDE_DIRECT_CREDENTIAL_ENV_KEYS) {
+      deleteEnvironmentValue(env, key, platform);
+    }
   }
 
-  // Claude gives direct request credentials precedence over local OAuth. Drop stale
-  // app-process keys when a real Claude CLI login can satisfy the subprocess.
-  for (const key of CLAUDE_DIRECT_CREDENTIAL_ENV_KEYS) {
-    delete env[key];
-  }
-  return buildProviderChildEnvironment({ provider: "claude", baseEnv: env });
+  const childEnv = buildProviderChildEnvironment({
+    provider: "claude",
+    baseEnv: env,
+    overrides: { DISABLE_AUTOUPDATER: "1" },
+    platform,
+  });
+  return childEnv;
 }

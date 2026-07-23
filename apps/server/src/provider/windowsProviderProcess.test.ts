@@ -6,12 +6,45 @@ import {
   isWindowsJobPreparedCommand,
   prepareResolvedWindowsProviderProcess,
   prepareWindowsProviderProcess,
+  prepareWindowsProviderProcessAsync,
   resolveWindowsJobLauncherPath,
   WINDOWS_JOB_LAUNCHER_EXECUTABLE,
+  WindowsProviderBatchShimLaunchError,
   WindowsProviderTargetNotResolvedError,
 } from "./windowsProviderProcess.ts";
 
 const launcher = `C:\\Synara\\native\\${WINDOWS_JOB_LAUNCHER_EXECUTABLE}`;
+const shimPath = "C:\\Users\\Test\\AppData\\Roaming\\npm\\codex.cmd";
+const shimDirectory = "C:\\Users\\Test\\AppData\\Roaming\\npm";
+const packageTarget =
+  "C:\\Users\\Test\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\bin\\codex.js";
+const pathNode = "C:\\Program Files\\nodejs\\node.exe";
+
+function npmCmdShim(target = "node_modules\\@openai\\codex\\bin\\codex.js"): string {
+  return [
+    "@ECHO off",
+    "GOTO start",
+    ":find_dp0",
+    "SET dp0=%~dp0",
+    "EXIT /b",
+    ":start",
+    "SETLOCAL",
+    "CALL :find_dp0",
+    "",
+    'IF EXIST "%dp0%\\node.exe" (',
+    '  SET "_prog=%dp0%\\node.exe"',
+    ") ELSE (",
+    '  SET "_prog=node"',
+    "  SET PATHEXT=%PATHEXT:;.JS;=;%",
+    ")",
+    "",
+    `endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\\${target}" %*`,
+  ].join("\r\n");
+}
+
+function hostNpmCmdShim(): string {
+  return `@ECHO off\r\n"%~dp0\\node.exe" "%~dp0\\node_modules\\@openai\\codex\\bin\\codex.js" %*\r\n`;
+}
 
 describe("Windows provider process containment", () => {
   it("preserves non-Windows launches exactly", () => {
@@ -55,6 +88,228 @@ describe("Windows provider process containment", () => {
       shell: false,
       windowsHide: true,
     });
+  });
+
+  it("turns a discovered canonical npm shim into Job -> native Node -> package target", () => {
+    const observations: WindowsCommandDiscoveryObservation[] = [];
+    const prepared = prepareWindowsProviderProcess(
+      "codex",
+      ["app-server", "--flag", "value with spaces"],
+      {
+        platform: "win32",
+        arch: "x64",
+        controlDirectory: "C:\\Temp",
+        launcherPath: launcher,
+        fileExists: (path) => [launcher, shimPath, packageTarget, pathNode].includes(path),
+        readFileString: (path) => (path === shimPath ? npmCmdShim() : undefined),
+        realPath: (path) => path,
+        spawnSync: (_command, args) => {
+          if (args[0] === "codex") {
+            return { stdout: `${shimPath}\r\n`, status: 0 };
+          }
+          if (args[0] === "node") {
+            return { stdout: `${pathNode}\r\n`, status: 0 };
+          }
+          return { stdout: "", status: 1 };
+        },
+        onCommandDiscovery: (observation) => observations.push(observation),
+      },
+    );
+
+    expect(prepared).toEqual({
+      command: launcher,
+      args: [
+        "--protocol",
+        "2",
+        "--argument-mode",
+        "argv",
+        "--control-file",
+        expect.stringMatching(/^C:\\Temp\\synara-job-control-/u),
+        "--",
+        pathNode,
+        packageTarget,
+        "app-server",
+        "--flag",
+        "value with spaces",
+      ],
+      shell: false,
+      windowsHide: true,
+    });
+    expect(prepared.windowsVerbatimArguments).toBeUndefined();
+    expect(prepared.args.join(" ").toLowerCase()).not.toContain("cmd.exe");
+    expect(observations).toEqual([{ outcome: "resolved", source: "where" }]);
+  });
+
+  it("asynchronously resolves canonical npm shims and skips an earlier node.cmd candidate", async () => {
+    const nodeShim = "C:\\tools\\node.cmd";
+    const execFileCalls: string[] = [];
+    let eventLoopAdvanced = false;
+    let synchronousDiscoveryCalls = 0;
+    const preparing = prepareWindowsProviderProcessAsync(
+      "codex",
+      ["app-server", "--flag", "value with spaces"],
+      {
+        platform: "win32",
+        arch: "x64",
+        controlDirectory: "C:\\Temp",
+        launcherPath: launcher,
+        fileExists: (path) =>
+          [launcher, shimPath, packageTarget, nodeShim, pathNode].includes(path),
+        readFileString: (path) => (path === shimPath ? npmCmdShim() : undefined),
+        realPath: (path) => path,
+        execFile: async (_command, args) => {
+          execFileCalls.push(args[0] ?? "");
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          return args[0] === "codex"
+            ? { stdout: `${shimPath}\r\n`, status: 0 }
+            : args[0] === "node"
+              ? { stdout: `${nodeShim}\r\n${pathNode}\r\n`, status: 0 }
+              : { stdout: "", status: 1 };
+        },
+        spawnSync: () => {
+          synchronousDiscoveryCalls += 1;
+          throw new Error("the async provider path must never invoke spawnSync");
+        },
+      },
+    );
+    queueMicrotask(() => {
+      eventLoopAdvanced = true;
+    });
+
+    await Promise.resolve();
+    expect(eventLoopAdvanced).toBe(true);
+    const prepared = await preparing;
+
+    expect(execFileCalls).toEqual(["codex", "node"]);
+    expect(synchronousDiscoveryCalls).toBe(0);
+    expect(prepared.args.slice(7)).toEqual([
+      pathNode,
+      packageTarget,
+      "app-server",
+      "--flag",
+      "value with spaces",
+    ]);
+    expect(prepared.args.join(" ").toLowerCase()).not.toContain("cmd.exe");
+    expect(prepared.windowsVerbatimArguments).toBeUndefined();
+  });
+
+  it("fails closed instead of falling back to cold sync discovery after a transient Node prewarm", async () => {
+    let synchronousDiscoveryCalls = 0;
+    let failure: unknown;
+    try {
+      await prepareWindowsProviderProcessAsync("codex", ["--version"], {
+        platform: "win32",
+        arch: "x64",
+        launcherPath: launcher,
+        fileExists: (path) => [launcher, shimPath, packageTarget].includes(path),
+        readFileString: (path) => (path === shimPath ? npmCmdShim() : undefined),
+        realPath: (path) => path,
+        execFile: async (_command, args) =>
+          args[0] === "codex"
+            ? { stdout: `${shimPath}\r\n`, status: 0 }
+            : {
+                error: Object.assign(new Error("where.exe timed out"), {
+                  code: "ETIMEDOUT",
+                }),
+                stdout: "",
+                status: null,
+              },
+        spawnSync: () => {
+          synchronousDiscoveryCalls += 1;
+          return { stdout: `${pathNode}\r\n`, status: 0 };
+        },
+      });
+    } catch (cause) {
+      failure = cause;
+    }
+
+    expect(synchronousDiscoveryCalls).toBe(0);
+    expect(failure).toBeInstanceOf(WindowsProviderBatchShimLaunchError);
+    expect((failure as WindowsProviderBatchShimLaunchError).reason).toBe("native_node_not_found");
+  });
+
+  it("prefers a verified sibling node.exe for npm's direct host .bat shim template", () => {
+    const batShimPath = shimPath.replace(/\.cmd$/u, ".bat");
+    const relativeBatShimPath = ".\\npm\\codex.bat";
+    const siblingNode = `${shimDirectory}\\node.exe`;
+    const spawnSync = () => {
+      throw new Error("PATH node discovery must not run when sibling node.exe is verified");
+    };
+    const prepared = prepareResolvedWindowsProviderProcess(relativeBatShimPath, ["--version"], {
+      platform: "win32",
+      arch: "x64",
+      cwd: "C:\\Users\\Test\\AppData\\Roaming",
+      controlDirectory: "C:\\Temp",
+      launcherPath: launcher,
+      fileExists: (path) => [launcher, batShimPath, packageTarget, siblingNode].includes(path),
+      readFileString: (path) => (path === batShimPath ? hostNpmCmdShim() : undefined),
+      realPath: (path) => path,
+      spawnSync,
+    });
+
+    expect(prepared.args.slice(7)).toEqual([siblingNode, packageTarget, "--version"]);
+    expect(prepared.args[3]).toBe("argv");
+    expect(prepared.windowsVerbatimArguments).toBeUndefined();
+  });
+
+  it.each([
+    ["noncanonical wrapper", "@ECHO off\r\nCALL node arbitrary.js %*\r\n"],
+    [
+      "traversal target",
+      hostNpmCmdShim().replace(
+        "node_modules\\@openai\\codex\\bin\\codex.js",
+        "node_modules\\@openai\\codex\\..\\escape.js",
+      ),
+    ],
+  ])("fails closed for a %s", (_label, shimContents) => {
+    expect(() =>
+      prepareResolvedWindowsProviderProcess(shimPath, [], {
+        platform: "win32",
+        arch: "x64",
+        launcherPath: launcher,
+        fileExists: () => true,
+        readFileString: () => shimContents,
+        realPath: (path) => path,
+      }),
+    ).toThrow(
+      expect.objectContaining({
+        name: "WindowsProviderBatchShimLaunchError",
+        reason: "shim_not_canonical_npm_node",
+      }),
+    );
+  });
+
+  it.each([
+    {
+      label: "missing package target",
+      reason: "target_not_file",
+      existingFiles: [launcher, shimPath],
+      nodeDiscovery: { stdout: `${pathNode}\r\n`, status: 0 },
+    },
+    {
+      label: "missing native Node runtime",
+      reason: "native_node_not_found",
+      existingFiles: [launcher, shimPath, packageTarget, "C:\\tools\\node.cmd"],
+      nodeDiscovery: { stdout: "C:\\tools\\node.cmd\r\n", status: 0 },
+    },
+  ])("fails closed for a $label", ({ reason, existingFiles, nodeDiscovery }) => {
+    let failure: unknown;
+    try {
+      prepareResolvedWindowsProviderProcess(shimPath, [], {
+        platform: "win32",
+        arch: "x64",
+        launcherPath: launcher,
+        fileExists: (path) => existingFiles.includes(path),
+        readFileString: () => npmCmdShim(),
+        realPath: (path) => path,
+        spawnSync: () => nodeDiscovery,
+      });
+    } catch (cause) {
+      failure = cause;
+    }
+
+    expect(failure).toBeInstanceOf(WindowsProviderBatchShimLaunchError);
+    expect((failure as WindowsProviderBatchShimLaunchError).reason).toBe(reason);
   });
 
   it("preserves the existing cmd.exe verbatim argument mode", () => {

@@ -40,8 +40,8 @@ import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 
 import { NetService, type NetServiceShape } from "@synara/shared/Net";
 import { splitLines } from "@synara/shared/text";
-import { buildProviderChildEnvironment } from "../providerChildEnvironment.ts";
 import type { ProcessTreeKiller } from "../terminal/processTreeKiller.ts";
+import { buildOpenCodeCompatibleProcessEnv } from "./openCodeProcessEnv.ts";
 import {
   findProviderProcessExitUnprovenError,
   teardownProviderProcessTree,
@@ -56,7 +56,7 @@ import {
   installPreparedEffectProcessSupervisor,
   supervisePreparedEffectProcess,
 } from "./windowsJobProcessSupervisor.ts";
-import { prepareWindowsProviderProcess } from "./windowsProviderProcess.ts";
+import { prepareWindowsProviderProcessAsync } from "./windowsProviderProcess.ts";
 
 const DEFAULT_OPENCODE_SERVER_TIMEOUT_MS = 20_000;
 const DEFAULT_HOSTNAME = "127.0.0.1";
@@ -816,12 +816,18 @@ export function buildOpenCodeServerProcessEnv(input: {
   readonly cliSpec?: OpenCodeCompatibleCliSpec;
   readonly experimentalWebSockets?: boolean;
   readonly baseEnv?: NodeJS.ProcessEnv;
+  readonly platform?: NodeJS.Platform;
+  readonly isFile?: (path: string) => boolean;
 }): NodeJS.ProcessEnv {
-  return buildProviderChildEnvironment({
+  return buildOpenCodeCompatibleProcessEnv({
     provider:
       input.cliSpec?.dataDirectoryName === KILO_CLI_SPEC.dataDirectoryName ? "kilo" : "opencode",
     baseEnv: input.baseEnv ?? process.env,
-    overrides: input.experimentalWebSockets ? { OPENCODE_EXPERIMENTAL_WEBSOCKETS: "true" } : {},
+    ...(input.experimentalWebSockets !== undefined
+      ? { experimentalWebSockets: input.experimentalWebSockets }
+      : {}),
+    ...(input.platform ? { platform: input.platform } : {}),
+    ...(input.isFile ? { isFile: input.isFile } : {}),
   });
 }
 
@@ -876,9 +882,15 @@ const collectStreamAsString = <E>(stream: Stream.Stream<Uint8Array, E>): Effect.
     (acc, chunk) => acc + new TextDecoder().decode(chunk),
   );
 
+type PrepareOpenCodeProcess = (
+  ...args: Parameters<typeof prepareWindowsProviderProcessAsync>
+) =>
+  | Awaited<ReturnType<typeof prepareWindowsProviderProcessAsync>>
+  | ReturnType<typeof prepareWindowsProviderProcessAsync>;
+
 export interface OpenCodeRuntimeLiveOptions {
   readonly platform?: NodeJS.Platform;
-  readonly prepareProcess?: typeof prepareWindowsProviderProcess;
+  readonly prepareProcess?: PrepareOpenCodeProcess;
   readonly superviseProcess?: typeof supervisePreparedEffectProcess;
   readonly teardownProcessTree?: typeof teardownProviderProcessTree;
   readonly processTreeKiller?: ProcessTreeKiller;
@@ -917,19 +929,32 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
 
     const runOpenCodeCommand: OpenCodeRuntimeShape["runOpenCodeCommand"] = (input) =>
       Effect.gen(function* () {
+        const platform = options?.platform ?? globalThis.process.platform;
         const childEnv = buildOpenCodeServerProcessEnv({
           ...(input.cliSpec ? { cliSpec: input.cliSpec } : {}),
+          platform,
         });
-        const prepared = (options?.prepareProcess ?? prepareWindowsProviderProcess)(
-          input.binaryPath,
-          input.args,
-          {
-            cwd: input.cwd,
-            env: childEnv,
-          },
-        );
-        const platform = options?.platform ?? globalThis.process.platform;
         const cliSpec = input.cliSpec ?? OPENCODE_CLI_SPEC;
+        const prepared = yield* Effect.tryPromise({
+          try: () =>
+            Promise.resolve(
+              (options?.prepareProcess ?? prepareWindowsProviderProcessAsync)(
+                input.binaryPath,
+                input.args,
+                {
+                  cwd: input.cwd,
+                  env: childEnv,
+                  platform,
+                },
+              ),
+            ),
+          catch: (cause) =>
+            ensureRuntimeError(
+              "runOpenCodeCommand",
+              `Failed to prepare ${cliSpec.displayName} command process: ${openCodeRuntimeErrorDetail(cause)}`,
+              cause,
+            ),
+        });
         const oneShotOwnerTracker = oneShotOwnerTrackerFor(cliSpec);
         const owned = yield* Effect.uninterruptible(
           Effect.gen(function* () {
@@ -1047,18 +1072,31 @@ const makeOpenCodeRuntime = (options?: OpenCodeRuntimeLiveOptions) =>
         const args = ["serve", "--hostname", hostname, "--port", String(port)];
         const childEnv = buildOpenCodeServerProcessEnv({
           cliSpec,
+          platform,
           ...(input.experimentalWebSockets !== undefined
             ? { experimentalWebSockets: input.experimentalWebSockets }
             : {}),
         });
-        const prepared = (options?.prepareProcess ?? prepareWindowsProviderProcess)(
-          input.binaryPath,
-          args,
-          {
-            cwd: input.cwd,
-            env: childEnv,
-          },
-        );
+        const prepared = yield* Effect.tryPromise({
+          try: () =>
+            Promise.resolve(
+              (options?.prepareProcess ?? prepareWindowsProviderProcessAsync)(
+                input.binaryPath,
+                args,
+                {
+                  cwd: input.cwd,
+                  env: childEnv,
+                  platform,
+                },
+              ),
+            ),
+          catch: (cause) =>
+            new OpenCodeRuntimeError({
+              operation: "startOpenCodeServerProcess",
+              detail: `Failed to prepare ${cliSpec.displayName} server process: ${openCodeRuntimeErrorDetail(cause)}`,
+              cause,
+            }),
+        });
 
         const supervised = yield* Effect.uninterruptible(
           Effect.gen(function* () {

@@ -4,6 +4,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   renameSync,
   rmSync,
   writeFileSync,
@@ -208,38 +209,66 @@ describeWindows("Windows Job launcher native integration", () => {
     proveSynchronousHelperDrain(args);
   });
 
-  it("preserves npm's nested prefix probe through the native Job launcher", async () => {
-    const root = mkdtempSync(join(tmpdir(), "synara-job-npm-prefix-"));
+  it("launches a canonical npm provider shim directly as Job -> node.exe -> package target", async () => {
+    const root = mkdtempSync(join(tmpdir(), "synara-job-npm-provider-"));
     const nodeDirectory = join(root, "Program Files", "nodejs");
     const nodePath = join(nodeDirectory, "node.exe");
-    const npmPrefixScriptPath = join(nodeDirectory, "node_modules", "npm", "bin", "npm-prefix.js");
-    const npmCommandPath = join(nodeDirectory, "npm.cmd");
-    const expectedPrefix = join(root, "User Data", "npm");
+    const npmPrefix = join(root, "User Data", "npm");
+    const packageTargetPath = join(npmPrefix, "node_modules", "fixture-provider", "bin", "cli.js");
+    const providerCommandPath = join(npmPrefix, "fixture-provider.cmd");
 
     try {
-      mkdirSync(dirname(npmPrefixScriptPath), { recursive: true });
+      mkdirSync(dirname(packageTargetPath), { recursive: true });
+      mkdirSync(nodeDirectory, { recursive: true });
       copyFileSync(process.execPath, nodePath);
       writeFileSync(
-        npmPrefixScriptPath,
-        "process.stdout.write(`${process.env.SYNARA_EXPECTED_NPM_PREFIX}\\n`);\n",
+        packageTargetPath,
+        [
+          "process.stdout.write(JSON.stringify({",
+          "  argv: process.argv.slice(2),",
+          "  executable: process.execPath,",
+          "}));",
+        ].join("\n"),
       );
       writeFileSync(
-        npmCommandPath,
+        providerCommandPath,
         [
-          "@ECHO OFF",
+          "@ECHO off",
+          "GOTO start",
+          ":find_dp0",
+          "SET dp0=%~dp0",
+          "EXIT /b",
+          ":start",
           "SETLOCAL",
-          'SET "NODE_EXE=%~dp0node.exe"',
-          'SET "NPM_PREFIX_JS=%~dp0node_modules\\npm\\bin\\npm-prefix.js"',
-          'FOR /F "delims=" %%F IN (\'CALL "%NODE_EXE%" "%NPM_PREFIX_JS%"\') DO (',
-          '  SET "NPM_PREFIX=%%F"',
-          ")",
-          "IF NOT DEFINED NPM_PREFIX EXIT /B 41",
-          "ECHO %NPM_PREFIX%",
+          "CALL :find_dp0",
           "",
+          'IF EXIST "%dp0%\\node.exe" (',
+          '  SET "_prog=%dp0%\\node.exe"',
+          ") ELSE (",
+          '  SET "_prog=node"',
+          "  SET PATHEXT=%PATHEXT:;.JS;=;%",
+          ")",
+          "",
+          'endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\\node_modules\\fixture-provider\\bin\\cli.js" %*',
         ].join("\r\n"),
       );
-      const env = { ...process.env, SYNARA_EXPECTED_NPM_PREFIX: expectedPrefix };
-      const prepared = prepareWindowsProviderProcess(npmCommandPath, [], { env });
+      const env = { ...process.env, PATH: nodeDirectory };
+      const prepared = prepareWindowsProviderProcess(
+        providerCommandPath,
+        ["hello", "value with spaces"],
+        { env },
+      );
+      expect(prepared.args.slice(7)).toEqual([
+        realpathSync.native(nodePath),
+        realpathSync.native(packageTargetPath),
+        "hello",
+        "value with spaces",
+      ]);
+      expect(prepared.args[3]).toBe("argv");
+      expect(prepared.windowsVerbatimArguments).toBeUndefined();
+      expect(prepared.args.join(" ").toLowerCase()).not.toContain("cmd.exe");
+      expect(prepared.args.join(" ").toLowerCase()).not.toContain("comspec");
+
       const result = spawnSync(prepared.command, prepared.args, {
         encoding: "utf8",
         env,
@@ -250,7 +279,10 @@ describeWindows("Windows Job launcher native integration", () => {
       expect(result.error).toBeUndefined();
       expect(result.status).toBe(0);
       expect(result.stderr).toBe("");
-      expect(result.stdout.trim()).toBe(expectedPrefix);
+      expect(JSON.parse(result.stdout)).toEqual({
+        argv: ["hello", "value with spaces"],
+        executable: realpathSync.native(nodePath),
+      });
       proveSynchronousHelperDrain(prepared.args);
     } finally {
       await cleanupTestDirectory(root);

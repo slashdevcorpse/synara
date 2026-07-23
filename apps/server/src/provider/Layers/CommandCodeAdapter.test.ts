@@ -364,6 +364,131 @@ it.effect("maps synchronous process preparation failures to ProviderAdapterProce
   ),
 );
 
+it.effect("does not spawn when stopSession wins during async process preparation", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const mock = makeMockChild();
+      type PreparedProcess = Awaited<ReturnType<PrepareProcess>>;
+      let resolvePreparation!: (prepared: PreparedProcess) => void;
+      const pendingPreparation = new Promise<PreparedProcess>((resolve) => {
+        resolvePreparation = resolve;
+      });
+      const prepareProcess = vi.fn<PrepareProcess>(() => pendingPreparation);
+      const { layer, spawnProcess } = adapterLayer({ child: mock, prepareProcess });
+      const threadId = ThreadId.makeUnsafe("command-code-stop-during-prepare");
+
+      yield* Effect.gen(function* () {
+        const adapter = yield* CommandCodeAdapter;
+        yield* adapter.startSession(startInput(threadId));
+        const sendFiber = yield* adapter
+          .sendTurn({ threadId, input: "must not launch" })
+          .pipe(Effect.result, Effect.forkChild);
+        yield* Effect.promise(() =>
+          vi.waitFor(() => assert.strictEqual(prepareProcess.mock.calls.length, 1)),
+        );
+
+        yield* adapter.stopSession(threadId);
+        resolvePreparation({
+          command: "C:\\tools\\synara-windows-job-launcher.exe",
+          args: ["--contained", "C:\\tools\\commandcode.cmd"],
+          shell: false,
+          windowsHide: true,
+        });
+
+        const result = yield* Fiber.join(sendFiber);
+        assert.equal(Result.isFailure(result), true);
+        if (Result.isFailure(result)) {
+          assert.ok(result.failure instanceof ProviderAdapterValidationError);
+        }
+        assert.strictEqual(spawnProcess.mock.calls.length, 0);
+        assert.strictEqual(yield* adapter.hasSession(threadId), false);
+      }).pipe(Effect.provide(layer));
+    }),
+  ),
+);
+
+it.effect("does not spawn when a replacement session wins during async process preparation", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const mock = makeMockChild();
+      type PreparedProcess = Awaited<ReturnType<PrepareProcess>>;
+      let resolvePreparation!: (prepared: PreparedProcess) => void;
+      const pendingPreparation = new Promise<PreparedProcess>((resolve) => {
+        resolvePreparation = resolve;
+      });
+      const prepareProcess = vi.fn<PrepareProcess>(() => pendingPreparation);
+      const { layer, spawnProcess } = adapterLayer({ child: mock, prepareProcess });
+      const threadId = ThreadId.makeUnsafe("command-code-replace-during-prepare");
+
+      yield* Effect.gen(function* () {
+        const adapter = yield* CommandCodeAdapter;
+        yield* adapter.startSession(startInput(threadId));
+        const sendFiber = yield* adapter
+          .sendTurn({ threadId, input: "must not outlive replacement" })
+          .pipe(Effect.result, Effect.forkChild);
+        yield* Effect.promise(() =>
+          vi.waitFor(() => assert.strictEqual(prepareProcess.mock.calls.length, 1)),
+        );
+
+        yield* adapter.startSession(startInput(threadId));
+        resolvePreparation({
+          command: "C:\\tools\\synara-windows-job-launcher.exe",
+          args: ["--contained", "C:\\tools\\commandcode.cmd"],
+          shell: false,
+          windowsHide: true,
+        });
+
+        const result = yield* Fiber.join(sendFiber);
+        assert.equal(Result.isFailure(result), true);
+        if (Result.isFailure(result)) {
+          assert.ok(result.failure instanceof ProviderAdapterValidationError);
+        }
+        assert.strictEqual(spawnProcess.mock.calls.length, 0);
+        assert.strictEqual(yield* adapter.hasSession(threadId), true);
+        yield* adapter.stopSession(threadId);
+      }).pipe(Effect.provide(layer));
+    }),
+  ),
+);
+
+it.effect("tears down a spawned process when stopSession wins during deferred ownership", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const mock = makeMockChild();
+      delete (mock.child as ChildProcess & { pid?: number }).pid;
+      const teardown = vi.fn(async () => mock.close(130));
+      const { layer, spawnProcess } = adapterLayer({
+        child: mock,
+        teardownProcessTree: teardown,
+      });
+      const threadId = ThreadId.makeUnsafe("command-code-stop-during-ownership");
+
+      yield* Effect.gen(function* () {
+        const adapter = yield* CommandCodeAdapter;
+        yield* adapter.startSession(startInput(threadId));
+        const sendFiber = yield* adapter
+          .sendTurn({ threadId, input: "must be torn down" })
+          .pipe(Effect.result, Effect.forkChild);
+        yield* Effect.promise(() =>
+          vi.waitFor(() => assert.strictEqual(spawnProcess.mock.calls.length, 1)),
+        );
+
+        yield* adapter.stopSession(threadId);
+        Object.assign(mock.child, { pid: 4_242 });
+        mock.child.emit("spawn");
+
+        const result = yield* Fiber.join(sendFiber);
+        assert.equal(Result.isFailure(result), true);
+        if (Result.isFailure(result)) {
+          assert.ok(result.failure instanceof ProviderAdapterValidationError);
+        }
+        assert.strictEqual(teardown.mock.calls.length, 1);
+        assert.strictEqual(yield* adapter.hasSession(threadId), false);
+      }).pipe(Effect.provide(layer));
+    }),
+  ),
+);
+
 it.effect("defaults direct sessions to gpt-5.6-sol and validates before replacing state", () =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -439,7 +564,9 @@ it.effect("discovers models through the mocked CLI without a vendor call", () =>
           provider: "commandCode",
           cwd: process.cwd(),
         }).pipe(Effect.forkChild);
-        yield* Effect.yieldNow;
+        yield* Effect.promise(() =>
+          vi.waitFor(() => assert.strictEqual(spawnProcess.mock.calls.length, 1)),
+        );
         mock.stdout.write("Available models · 1 model\n\nOpenAI\n\ngpt-5.6-sol  frontier model\n");
         mock.close(0);
         return yield* Fiber.join(fiber);
@@ -486,7 +613,7 @@ it.effect("retains failed model discovery ownership until a later stopAll retry"
           throw processFailure;
         }
       });
-      const { layer } = adapterLayer({ child: mock, teardownProcessTree: teardown });
+      const { layer, spawnProcess } = adapterLayer({ child: mock, teardownProcessTree: teardown });
 
       const result = yield* Effect.gen(function* () {
         const adapter = yield* CommandCodeAdapter;
@@ -494,7 +621,9 @@ it.effect("retains failed model discovery ownership until a later stopAll retry"
           provider: "commandCode",
           cwd: process.cwd(),
         }).pipe(Effect.result, Effect.forkChild);
-        yield* Effect.yieldNow;
+        yield* Effect.promise(() =>
+          vi.waitFor(() => assert.strictEqual(spawnProcess.mock.calls.length, 1)),
+        );
         mock.error(primaryFailure);
         const result = yield* Fiber.join(listing);
         assert.equal(teardown.mock.calls.length, 1);

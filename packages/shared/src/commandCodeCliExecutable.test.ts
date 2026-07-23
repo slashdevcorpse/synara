@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   resolveCommandCodeCliExecutable,
+  resolveCommandCodeCliExecutableAsync,
   resolveCommandCodeCliExecutableWithDiscovery,
 } from "./commandCodeCliExecutable";
 
@@ -34,6 +35,30 @@ describe("resolveCommandCodeCliExecutable", () => {
       }),
     ).toBe(resolved);
     expect(spawnSync).toHaveBeenCalledTimes(1);
+  });
+
+  it("resolves configured commands asynchronously without invoking spawnSync", async () => {
+    const resolved = "C:\\tools\\custom-command-code.cmd";
+    const spawnSync = vi.fn();
+    let eventLoopAdvanced = false;
+    const resolving = resolveCommandCodeCliExecutableAsync("custom-command-code", {
+      platform: "win32",
+      cwd: "C:\\repo",
+      env: { SystemRoot: "C:\\Windows" },
+      execFile: async () => {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        return { stdout: resolved, status: 0 };
+      },
+      spawnSync,
+    });
+    queueMicrotask(() => {
+      eventLoopAdvanced = true;
+    });
+
+    await Promise.resolve();
+    expect(eventLoopAdvanced).toBe(true);
+    await expect(resolving).resolves.toBe(resolved);
+    expect(spawnSync).not.toHaveBeenCalled();
   });
 
   it("prefers the configured official alias before its sibling", () => {

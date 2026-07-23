@@ -6,10 +6,42 @@ import type { SpawnOptions as ClaudeSpawnOptions } from "@anthropic-ai/claude-ag
 import {
   containedClaudeSdkProcessDidNotSpawn,
   containedClaudeSdkProcessSupervisionFailure,
+  prepareContainedClaudeSdkProcess,
   spawnContainedClaudeSdkProcess,
 } from "./containedClaudeSdkProcess.ts";
 
 describe("spawnContainedClaudeSdkProcess", () => {
+  it("prewarms an exact Windows command cache for the synchronous SDK callback", async () => {
+    const executable = "C:\\tools\\claude.exe";
+    const launcher = "C:\\Synara\\synara-windows-job-launcher.exe";
+    const env = { PATH: "C:\\tools", SystemRoot: "C:\\Windows" };
+    const execFile = vi.fn(async () => ({ stdout: `${executable}\r\n`, status: 0 }));
+    const spawnSync = vi.fn(() => {
+      throw new Error("the Claude SDK callback must not perform cold sync discovery");
+    });
+    const preparation = await prepareContainedClaudeSdkProcess("claude", {
+      platform: "win32",
+      arch: "x64",
+      cwd: "D:\\worktree",
+      env,
+      launcherPath: launcher,
+      fileExists: () => true,
+      execFile,
+      spawnSync,
+    });
+
+    const prepared = preparation.prepareProcess("claude", ["--help"], {
+      platform: "win32",
+      cwd: "D:\\worktree",
+      env,
+    });
+
+    expect(execFile).toHaveBeenCalledTimes(1);
+    expect(spawnSync).not.toHaveBeenCalled();
+    expect(prepared.command).toBe(launcher);
+    expect(prepared.args.slice(7)).toEqual([executable, "--help"]);
+  });
+
   it("preserves the Claude SDK process contract through the contained command", () => {
     const child = { pid: 401 } as ChildProcess;
     const controller = new AbortController();

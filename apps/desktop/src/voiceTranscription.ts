@@ -1,31 +1,27 @@
 // FILE: voiceTranscription.ts
 // Purpose: Owns the desktop-specific voice transcription flow for Electron builds.
-// Layer: Desktop IPC + ChatGPT upload bridge
-// Depends on: Codex auth discovery, Electron net uploads, and the shared server voice contract.
+// Layer: Desktop IPC + managed backend bridge
+// Depends on: The managed local backend, bounded loopback transport, and the shared voice contract.
 
-import * as ChildProcess from "node:child_process";
+import * as Http from "node:http";
 
-import { app, ipcMain } from "electron";
+import { ipcMain } from "electron";
 import type {
   ServerVoiceTranscriptionInput,
   ServerVoiceTranscriptionResult,
 } from "@synara/contracts";
 import { SERVER_VOICE_TRANSCRIPTION_MAX_AUDIO_BYTES } from "@synara/contracts";
-import {
-  CHATGPT_VOICE_TRANSCRIPTION_URL,
-  requestChatGptVoiceTranscription,
-} from "@synara/shared/chatGptVoiceTranscription";
-import { resolveCodexCliExecutable } from "@synara/shared/codexCliExecutable";
+import { VOICE_TRANSCRIPTION_UPLOAD_ROUTE_PATH } from "@synara/shared/binaryTransfer";
 import {
   decodeOutboundJson,
   decodeOutboundText,
   type OutboundHttpResponse,
 } from "@synara/shared/outboundHttp";
-import { splitLines } from "@synara/shared/text";
-import { prepareResolvedWindowsSafeProcess } from "@synara/shared/windowsProcess";
 import { SERVER_TRANSCRIBE_VOICE_CHANNEL } from "./ipcChannels";
 
 const MAX_VOICE_DURATION_MS = 120_000;
+const DESKTOP_VOICE_BACKEND_TIMEOUT_MS = 45_000;
+const DESKTOP_VOICE_BACKEND_MAX_RESPONSE_BYTES = 1024 * 1024;
 
 // --- Input validation ------------------------------------------------------
 
@@ -84,144 +80,250 @@ function readNonEmptyString(value: unknown): string | null {
   return normalized.length > 0 ? normalized : null;
 }
 
-// --- Auth discovery --------------------------------------------------------
+// --- Managed backend bridge -----------------------------------------------
 
-async function resolveDesktopVoiceAuth(
-  cwd: string,
-): Promise<{ token: string; transcriptionUrl: string }> {
+export interface DesktopVoiceBackendConnection {
+  readonly baseUrl: string;
+  readonly authToken: string;
+}
+
+interface DesktopVoiceBackendHttpRequest {
+  readonly url: URL;
+  readonly audioBuffer: Buffer;
+  readonly timeoutMs: number;
+}
+
+type RequestDesktopVoiceBackend = (
+  input: DesktopVoiceBackendHttpRequest,
+) => Promise<OutboundHttpResponse>;
+
+interface DesktopVoiceBackendRequestDependencies {
+  readonly request?: RequestDesktopVoiceBackend | undefined;
+  readonly timeoutMs?: number | undefined;
+}
+
+type DesktopVoiceBackendRequestErrorCode = "request" | "response-too-large" | "timeout";
+
+class DesktopVoiceBackendRequestError extends Error {
+  constructor(
+    readonly code: DesktopVoiceBackendRequestErrorCode,
+    message: string,
+    override readonly cause?: unknown,
+  ) {
+    super(message);
+    this.name = "DesktopVoiceBackendRequestError";
+  }
+}
+
+function responseHeaders(headers: Http.IncomingHttpHeaders): Headers {
+  const result = new Headers();
+  for (const [name, value] of Object.entries(headers)) {
+    if (Array.isArray(value)) {
+      for (const item of value) result.append(name, item);
+    } else if (value !== undefined) {
+      result.set(name, value);
+    }
+  }
+  return result;
+}
+
+function requestManagedDesktopVoiceBackend(
+  input: DesktopVoiceBackendHttpRequest,
+): Promise<OutboundHttpResponse> {
   return new Promise((resolve, reject) => {
-    const env = process.env;
-    const executable = resolveCodexCliExecutable("codex", { cwd, env });
-    const prepared = prepareResolvedWindowsSafeProcess(executable, ["app-server"], {
-      cwd,
-      env,
-    });
-    const child = ChildProcess.spawn(prepared.command, prepared.args, {
-      cwd,
-      env,
-      stdio: ["pipe", "pipe", "pipe"],
-      shell: prepared.shell,
-      windowsHide: prepared.windowsHide,
-      windowsVerbatimArguments: prepared.windowsVerbatimArguments,
-    });
-
     let settled = false;
-    let stdoutBuffer = "";
-    const rejectOnce = (error: Error) => {
-      if (settled) {
-        return;
+    let request: Http.ClientRequest | null = null;
+    let response: Http.IncomingMessage | null = null;
+    let deadline: ReturnType<typeof setTimeout> | null = null;
+
+    const cleanup = (): void => {
+      if (deadline) {
+        clearTimeout(deadline);
+        deadline = null;
       }
+    };
+    const rejectOnce = (error: DesktopVoiceBackendRequestError): void => {
+      if (settled) return;
       settled = true;
-      child.kill();
+      cleanup();
+      response?.destroy();
+      request?.destroy();
       reject(error);
     };
-    const resolveOnce = (value: { token: string; transcriptionUrl: string }) => {
-      if (settled) {
-        return;
-      }
+    const resolveOnce = (value: OutboundHttpResponse): void => {
+      if (settled) return;
       settled = true;
-      child.kill();
+      cleanup();
       resolve(value);
     };
-    const send = (payload: Record<string, unknown>) => {
-      child.stdin.write(`${JSON.stringify(payload)}\n`);
-    };
 
-    child.once("error", (error) => {
-      rejectOnce(new Error(`Could not start Codex auth discovery: ${error.message}`));
-    });
-    child.stderr.on("data", () => {
-      // Ignore stderr noise from the discovery process; the JSON-RPC result is authoritative.
-    });
-    child.stdout.on("data", (chunk) => {
-      stdoutBuffer += chunk.toString();
-      const lines = splitLines(stdoutBuffer);
-      stdoutBuffer = lines.pop() ?? "";
-      for (const line of lines) {
-        let message: Record<string, unknown>;
-        try {
-          message = JSON.parse(line) as Record<string, unknown>;
-        } catch {
-          continue;
-        }
+    deadline = setTimeout(() => {
+      rejectOnce(
+        new DesktopVoiceBackendRequestError(
+          "timeout",
+          `Managed voice request exceeded its ${input.timeoutMs}ms deadline.`,
+        ),
+      );
+    }, input.timeoutMs);
+    deadline.unref();
 
-        if (message.id === 1) {
-          send({ jsonrpc: "2.0", method: "initialized", params: {} });
-          send({
-            jsonrpc: "2.0",
-            id: 2,
-            method: "getAuthStatus",
-            params: { includeToken: true, refreshToken: true },
-          });
-          continue;
-        }
-
-        if (message.id !== 2) {
-          continue;
-        }
-
-        const result =
-          typeof message.result === "object" && message.result !== null
-            ? (message.result as Record<string, unknown>)
-            : null;
-        const authMethod = readNonEmptyString(result?.authMethod);
-        const token = readNonEmptyString(result?.authToken);
-        if (!token) {
-          rejectOnce(
-            new Error("No ChatGPT session token is available. Sign in to ChatGPT in Codex."),
-          );
-          return;
-        }
-        if (authMethod !== "chatgpt" && authMethod !== "chatgptAuthTokens") {
-          rejectOnce(
-            new Error("Voice transcription requires a ChatGPT-authenticated Codex session."),
-          );
-          return;
-        }
-
-        resolveOnce({
-          token,
-          transcriptionUrl:
-            readNonEmptyString(result?.transcriptionUrl) ?? CHATGPT_VOICE_TRANSCRIPTION_URL,
-        });
-      }
-    });
-
-    setTimeout(() => {
-      send({
-        jsonrpc: "2.0",
-        id: 1,
-        method: "initialize",
-        params: {
-          clientInfo: {
-            name: "synara-desktop",
-            title: "Synara Desktop",
-            version: app.getVersion(),
+    try {
+      request = Http.request(
+        input.url,
+        {
+          method: "POST",
+          agent: false,
+          headers: {
+            "Content-Length": String(input.audioBuffer.byteLength),
+            "Content-Type": "application/octet-stream",
           },
-          capabilities: { experimentalApi: true },
         },
-      });
-    }, 100);
+        (incoming) => {
+          response = incoming;
+          const declaredLength = Number(incoming.headers["content-length"] ?? "0");
+          if (
+            Number.isFinite(declaredLength) &&
+            declaredLength > DESKTOP_VOICE_BACKEND_MAX_RESPONSE_BYTES
+          ) {
+            rejectOnce(
+              new DesktopVoiceBackendRequestError(
+                "response-too-large",
+                "Managed voice response exceeded the 1 MB limit.",
+              ),
+            );
+            return;
+          }
 
-    setTimeout(() => {
-      rejectOnce(new Error("Timed out while reading ChatGPT auth from Codex."));
-    }, 10_000).unref();
+          const chunks: Buffer[] = [];
+          let responseBytes = 0;
+          incoming.on("data", (chunk: Buffer | string) => {
+            if (settled) return;
+            const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+            if (bytes.byteLength > DESKTOP_VOICE_BACKEND_MAX_RESPONSE_BYTES - responseBytes) {
+              rejectOnce(
+                new DesktopVoiceBackendRequestError(
+                  "response-too-large",
+                  "Managed voice response exceeded the 1 MB limit.",
+                ),
+              );
+              return;
+            }
+            responseBytes += bytes.byteLength;
+            chunks.push(bytes);
+          });
+          incoming.once("aborted", () => {
+            rejectOnce(
+              new DesktopVoiceBackendRequestError(
+                "request",
+                "Managed voice response ended before completion.",
+              ),
+            );
+          });
+          incoming.once("error", (cause) => {
+            rejectOnce(
+              new DesktopVoiceBackendRequestError(
+                "request",
+                "Managed voice response could not be read.",
+                cause,
+              ),
+            );
+          });
+          incoming.once("end", () => {
+            resolveOnce({
+              status: incoming.statusCode ?? 0,
+              headers: responseHeaders(incoming.headers),
+              body: Buffer.concat(chunks, responseBytes),
+              url: input.url.toString(),
+            });
+          });
+        },
+      );
+      request.once("error", (cause) => {
+        rejectOnce(
+          new DesktopVoiceBackendRequestError(
+            "request",
+            "Could not reach Synara's managed voice backend.",
+            cause,
+          ),
+        );
+      });
+      request.end(input.audioBuffer);
+    } catch (cause) {
+      rejectOnce(
+        new DesktopVoiceBackendRequestError(
+          "request",
+          "Could not start Synara's managed voice request.",
+          cause,
+        ),
+      );
+    }
   });
 }
 
-// --- Network upload --------------------------------------------------------
+function resolveDesktopVoiceBackendUrl(input: {
+  readonly backend: DesktopVoiceBackendConnection;
+  readonly request: ServerVoiceTranscriptionInput;
+}): URL {
+  const baseUrl = readNonEmptyString(input.backend.baseUrl);
+  const authToken = readNonEmptyString(input.backend.authToken);
+  if (!baseUrl || !authToken) {
+    throw new Error("The managed Synara backend is not ready for voice transcription.");
+  }
+
+  let base: URL;
+  try {
+    base = new URL(baseUrl);
+  } catch {
+    throw new Error("The managed Synara backend URL is invalid.");
+  }
+  if (
+    base.protocol !== "http:" ||
+    !["127.0.0.1", "[::1]", "::1"].includes(base.hostname) ||
+    base.username.length > 0 ||
+    base.password.length > 0
+  ) {
+    throw new Error("Voice transcription requires Synara's private loopback backend.");
+  }
+
+  const url = new URL(VOICE_TRANSCRIPTION_UPLOAD_ROUTE_PATH, `${base.origin}/`);
+  url.searchParams.set("provider", input.request.provider);
+  url.searchParams.set("cwd", input.request.cwd?.trim() || process.cwd());
+  url.searchParams.set("mimeType", input.request.mimeType);
+  url.searchParams.set("sampleRateHz", String(input.request.sampleRateHz));
+  url.searchParams.set("durationMs", String(input.request.durationMs));
+  if (input.request.threadId) {
+    url.searchParams.set("threadId", input.request.threadId);
+  }
+  url.searchParams.set("token", authToken);
+  return url;
+}
 
 export async function requestDesktopVoiceTranscription(input: {
   readonly audioBuffer: Buffer;
-  readonly mimeType: string;
-  readonly token: string;
-  readonly transcriptionUrl: string;
+  readonly request: ServerVoiceTranscriptionInput;
+  readonly backend: DesktopVoiceBackendConnection;
+  readonly dependencies?: DesktopVoiceBackendRequestDependencies | undefined;
 }): Promise<OutboundHttpResponse> {
-  return requestChatGptVoiceTranscription({
-    audio: input.audioBuffer,
-    mimeType: input.mimeType,
-    token: input.token,
-    transcriptionUrl: input.transcriptionUrl,
+  if (
+    input.audioBuffer.byteLength <= 0 ||
+    input.audioBuffer.byteLength > SERVER_VOICE_TRANSCRIPTION_MAX_AUDIO_BYTES
+  ) {
+    throw new Error("Voice messages are limited to 10 MB.");
+  }
+  const url = resolveDesktopVoiceBackendUrl({
+    backend: input.backend,
+    request: input.request,
+  });
+  const timeoutMs =
+    typeof input.dependencies?.timeoutMs === "number" &&
+    Number.isFinite(input.dependencies.timeoutMs) &&
+    input.dependencies.timeoutMs > 0
+      ? input.dependencies.timeoutMs
+      : DESKTOP_VOICE_BACKEND_TIMEOUT_MS;
+  return (input.dependencies?.request ?? requestManagedDesktopVoiceBackend)({
+    url,
+    audioBuffer: input.audioBuffer,
+    timeoutMs,
   });
 }
 
@@ -238,10 +340,10 @@ function readVoiceResponseErrorMessage(statusCode: number, body: string): string
   }
 
   if (statusCode === 401) {
-    return "Your ChatGPT login has expired. Sign in again.";
+    return "Synara's managed backend rejected the voice request. Restart Synara and try again.";
   }
   if (statusCode === 403) {
-    return "ChatGPT rejected the transcription request. Your Codex login is present, but this desktop upload was forbidden.";
+    return "Synara's managed backend refused the voice request.";
   }
 
   return `Transcription failed with status ${statusCode}.`;
@@ -249,16 +351,17 @@ function readVoiceResponseErrorMessage(statusCode: number, body: string): string
 
 // --- IPC entrypoint --------------------------------------------------------
 
-async function transcribeVoiceViaDesktopBridge(
+export async function transcribeVoiceViaDesktopBridge(
   input: ServerVoiceTranscriptionInput,
+  backend: DesktopVoiceBackendConnection,
+  dependencies?: DesktopVoiceBackendRequestDependencies,
 ): Promise<ServerVoiceTranscriptionResult> {
   const audioBuffer = decodeDesktopVoiceAudio(input);
-  const auth = await resolveDesktopVoiceAuth(input.cwd?.trim() || process.cwd());
   const response = await requestDesktopVoiceTranscription({
     audioBuffer,
-    mimeType: input.mimeType,
-    token: auth.token,
-    transcriptionUrl: auth.transcriptionUrl,
+    request: input,
+    backend,
+    ...(dependencies ? { dependencies } : {}),
   });
   if (response.status < 200 || response.status >= 300) {
     throw new Error(readVoiceResponseErrorMessage(response.status, decodeOutboundText(response)));
@@ -276,10 +379,13 @@ async function transcribeVoiceViaDesktopBridge(
   return { text };
 }
 
-export function registerDesktopVoiceTranscriptionHandler(): void {
+export function registerDesktopVoiceTranscriptionHandler(
+  resolveBackend: () => DesktopVoiceBackendConnection,
+): void {
   ipcMain.removeHandler(SERVER_TRANSCRIBE_VOICE_CHANNEL);
   ipcMain.handle(
     SERVER_TRANSCRIBE_VOICE_CHANNEL,
-    async (_event, input: ServerVoiceTranscriptionInput) => transcribeVoiceViaDesktopBridge(input),
+    async (_event, input: ServerVoiceTranscriptionInput) =>
+      transcribeVoiceViaDesktopBridge(input, resolveBackend()),
   );
 }

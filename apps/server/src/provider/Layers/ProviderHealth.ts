@@ -20,12 +20,12 @@ import type {
 } from "@synara/contracts";
 import { ServerProviderUpdateError } from "@synara/contracts";
 import {
-  resolveCodexCliExecutable,
-  resolveCodexCliExecutableWithDiscovery,
+  resolveCodexCliExecutableAsync,
+  resolveCodexCliExecutableWithDiscoveryAsync,
 } from "@synara/shared/codexCliExecutable";
 import {
-  resolveCommandCodeCliExecutable,
-  resolveCommandCodeCliExecutableWithDiscovery,
+  resolveCommandCodeCliExecutableAsync,
+  resolveCommandCodeCliExecutableWithDiscoveryAsync,
 } from "@synara/shared/commandCodeCliExecutable";
 import { parseCodexConfigModelProvider } from "@synara/shared/codexConfig";
 import { decodeJsonResult } from "@synara/shared/schemaJson";
@@ -87,6 +87,15 @@ import {
 import { acquireClaudeAuthStatusLock } from "../claudeAuthStatusLock";
 import { buildClaudeProcessEnv, readClaudeCliCredentialsSummary } from "../claudeProcessEnv";
 import {
+  ANTIGRAVITY_WINDOWS_UNAVAILABLE_MESSAGE,
+  isAntigravityAvailableOnPlatform,
+} from "../antigravityAvailability.ts";
+import { buildOpenCodeCompatibleProcessEnv } from "../openCodeProcessEnv.ts";
+import {
+  buildDroidMaintenanceProcessEnv,
+  buildDroidRuntimeProcessEnv,
+} from "../droidProcessEnv.ts";
+import {
   detailFromResult,
   extractAuthBoolean,
   extractAuthMethod,
@@ -95,6 +104,7 @@ import {
   toTitleCaseWords,
   type CommandResult,
 } from "../providerCliOutput";
+import { buildPiProcessEnv } from "../piProcessEnv.ts";
 import { probeProviderCliVersion } from "../providerCliVersionProbe";
 import { ProviderHealth, type ProviderHealthShape } from "../Services/ProviderHealth";
 import { ProviderService } from "../Services/ProviderService";
@@ -112,8 +122,7 @@ import {
 } from "../providerMaintenanceOwnedResources";
 import {
   isWindowsJobPreparedCommand,
-  prepareResolvedWindowsProviderProcess,
-  prepareWindowsProviderProcess,
+  prepareWindowsProviderProcessAsync,
   WindowsProviderTargetNotResolvedError,
 } from "../windowsProviderProcess.ts";
 import {
@@ -146,7 +155,9 @@ import {
 } from "../supervisedProcessTeardown.ts";
 import {
   containedClaudeSdkProcessDidNotSpawn,
+  prepareContainedClaudeSdkProcess,
   spawnContainedClaudeSdkProcess,
+  type ContainedClaudeSdkProcessPreparation,
 } from "../containedClaudeSdkProcess.ts";
 import {
   installPreparedEffectProcessSupervisor,
@@ -177,6 +188,19 @@ type ProviderStatuses = ReadonlyArray<ServerProviderStatus>;
 const DISABLED_PROVIDER_STATUS_MESSAGE = "Provider is disabled in Synara settings.";
 const MINIMUM_ANTIGRAVITY_CLI_VERSION = "1.0.12";
 
+function makeAntigravityWindowsUnavailableStatus(
+  checkedAt = new Date().toISOString(),
+): ServerProviderStatus {
+  return {
+    provider: ANTIGRAVITY_PROVIDER,
+    status: "error",
+    available: false,
+    authStatus: "unknown",
+    checkedAt,
+    message: ANTIGRAVITY_WINDOWS_UNAVAILABLE_MESSAGE,
+  };
+}
+
 const PROVIDERS = [
   CODEX_PROVIDER,
   COMMAND_CODE_PROVIDER,
@@ -195,6 +219,34 @@ const providerChildKind = (provider: ProviderKind): ProviderChildKind =>
 
 const providerCommandEnv = (provider: ProviderKind): NodeJS.ProcessEnv =>
   buildProviderChildEnvironment({ provider: providerChildKind(provider) });
+
+export function buildProviderUpdateProcessEnv(input: {
+  readonly provider: ProviderKind;
+  readonly pathPrepend?: string;
+  readonly baseEnv?: NodeJS.ProcessEnv;
+  readonly platform?: NodeJS.Platform;
+}): NodeJS.ProcessEnv {
+  const platform = input.platform ?? process.platform;
+  const baseEnv =
+    input.provider === DROID_PROVIDER
+      ? buildDroidMaintenanceProcessEnv({
+          baseEnv: input.baseEnv ?? process.env,
+          platform,
+        })
+      : buildProviderChildEnvironment({
+          provider: providerChildKind(input.provider),
+          baseEnv: input.baseEnv ?? process.env,
+          platform,
+        });
+  return input.pathPrepend
+    ? {
+        ...baseEnv,
+        PATH: [input.pathPrepend, baseEnv.PATH]
+          .filter((entry): entry is string => Boolean(entry))
+          .join(platform === "win32" ? ";" : ":"),
+      }
+    : baseEnv;
+}
 
 const UPDATE_OUTPUT_MAX_BYTES = 10_000;
 export const PROVIDER_UPDATE_TIMEOUT_MS = 2 * 60_000;
@@ -272,6 +324,12 @@ const isAntigravityNativeCommandPath = makeCommandPathSuffixMatcher([
   "/AppData/Local/agy/bin/agy.exe",
 ]);
 
+function isWindowsDroidNativeCommandPath(commandPath: string, platform: NodeJS.Platform): boolean {
+  if (platform !== "win32" || !NodePath.win32.isAbsolute(commandPath)) return false;
+  const normalized = normalizeCommandPath(commandPath, platform);
+  return normalized.endsWith("/droid.exe") || normalized.endsWith("/droid.com");
+}
+
 function isCursorAgentNativeCommandPath(commandPath: string, platform: NodeJS.Platform): boolean {
   const normalized = normalizeCommandPath(commandPath, platform);
   return (
@@ -312,6 +370,15 @@ const resolveAntigravityNativeInstallRoot = (input: {
   readonly canonicalCommandPath: string;
   readonly platform: NodeJS.Platform;
 }) => installRootThroughMarker(input, ["/AppData/Local/agy"]);
+
+const resolveDroidNativeInstallRoot = (input: {
+  readonly visibleCommandPath: string;
+  readonly canonicalCommandPath: string;
+  readonly platform: NodeJS.Platform;
+}) =>
+  isWindowsDroidNativeCommandPath(input.canonicalCommandPath, input.platform)
+    ? NodePath.win32.dirname(input.canonicalCommandPath)
+    : null;
 
 const resolveKiloNativeInstallRoot = (input: {
   readonly visibleCommandPath: string;
@@ -409,9 +476,16 @@ export const PACKAGE_MANAGED_PROVIDER_UPDATES: Partial<
     binaryName: "droid",
     allowedBinaryNames: ["droid"],
     npmPackageName: "droid",
-    allowedInstallSources: ["npm"],
+    allowedInstallSources: ["npm", "native"],
     homebrew: null,
-    nativeUpdate: null,
+    nativeUpdate: {
+      executable: "droid",
+      args: () => ["update"],
+      lockKey: "droid-native",
+      strategy: "matching-path",
+      isCommandPath: isWindowsDroidNativeCommandPath,
+      resolveInstallRoot: resolveDroidNativeInstallRoot,
+    },
   },
   kilo: {
     provider: KILO_PROVIDER,
@@ -671,6 +745,21 @@ function extractCodexAccountTypeFromOutput(result: CommandResult): string | unde
 
 const CAPABILITIES_PROBE_TIMEOUT_MS = 8_000;
 
+type PreparedProviderProcess = Awaited<ReturnType<typeof prepareWindowsProviderProcessAsync>>;
+type ProviderProcessPreparer = (
+  ...args: Parameters<typeof prepareWindowsProviderProcessAsync>
+) => PreparedProviderProcess | Promise<PreparedProviderProcess>;
+type CodexExecutableResolver = (
+  ...args: Parameters<typeof resolveCodexCliExecutableWithDiscoveryAsync>
+) =>
+  | Awaited<ReturnType<typeof resolveCodexCliExecutableWithDiscoveryAsync>>
+  | ReturnType<typeof resolveCodexCliExecutableWithDiscoveryAsync>;
+type CommandCodeExecutableResolver = (
+  ...args: Parameters<typeof resolveCommandCodeCliExecutableWithDiscoveryAsync>
+) =>
+  | Awaited<ReturnType<typeof resolveCommandCodeCliExecutableWithDiscoveryAsync>>
+  | ReturnType<typeof resolveCommandCodeCliExecutableWithDiscoveryAsync>;
+
 function waitForAbortSignal(signal: AbortSignal): Promise<void> {
   if (signal.aborted) return Promise.resolve();
   return new Promise((resolve) => {
@@ -683,7 +772,7 @@ export const probeClaudeSubscription = (processOptions: ProviderHealthProcessOpt
   type ClaudeProbeProcessOwner = {
     readonly sequence: number;
     readonly process: import("node:child_process").ChildProcess;
-    readonly prepared?: ReturnType<typeof prepareWindowsProviderProcess>;
+    readonly prepared?: PreparedProviderProcess;
     readonly exactWindowsOwner: boolean;
     registrationPromise?: Promise<ProviderMaintenanceOwnedResourceRegistration>;
     supervisionFailure?: Error;
@@ -754,7 +843,7 @@ export const probeClaudeSubscription = (processOptions: ProviderHealthProcessOpt
   };
   const recordOwner = (input: {
     readonly process: import("node:child_process").ChildProcess;
-    readonly prepared?: ReturnType<typeof prepareWindowsProviderProcess>;
+    readonly prepared?: PreparedProviderProcess;
   }) => {
     const exactWindowsOwner = platform === "win32";
     const owner: ClaudeProbeProcessOwner = {
@@ -778,6 +867,11 @@ export const probeClaudeSubscription = (processOptions: ProviderHealthProcessOpt
     return owner;
   };
   return Effect.tryPromise(async () => {
+    const containedPreparation: ContainedClaudeSdkProcessPreparation | undefined =
+      processOptions.spawnContainedClaudeProcess === undefined &&
+      processOptions.prepareProcess === undefined
+        ? await prepareContainedClaudeSdkProcess("claude", { platform })
+        : undefined;
     const q = (processOptions.queryClaude ?? claudeQuery)({
       // oxlint-disable-next-line require-yield
       prompt: (async function* (): AsyncGenerator<SDKUserMessage> {
@@ -795,9 +889,21 @@ export const probeClaudeSubscription = (processOptions: ProviderHealthProcessOpt
             processOptions.spawnContainedClaudeProcess ?? spawnContainedClaudeSdkProcess
           )(options, {
             platform,
-            ...(processOptions.prepareProcess
-              ? { prepareProcess: processOptions.prepareProcess }
-              : {}),
+            ...(containedPreparation
+              ? { prepareProcess: containedPreparation.prepareProcess }
+              : processOptions.prepareProcess
+                ? {
+                    prepareProcess: (command, args, input) => {
+                      const prepared = processOptions.prepareProcess!(command, args, input);
+                      if (prepared instanceof Promise) {
+                        throw new Error(
+                          "The synchronous Claude SDK callback requires a prewarmed process preparer.",
+                        );
+                      }
+                      return prepared;
+                    },
+                  }
+                : {}),
             onSpawnedProcess: ({ prepared, process }) => {
               spawnedOwner = recordOwner({ prepared, process });
             },
@@ -1050,8 +1156,8 @@ function normalizeProviderCommandPreparationError(
 
 export interface ProviderHealthProcessOptions {
   readonly platform?: NodeJS.Platform;
-  readonly prepareProcess?: typeof prepareWindowsProviderProcess;
-  readonly prepareResolvedProcess?: typeof prepareResolvedWindowsProviderProcess;
+  readonly prepareProcess?: ProviderProcessPreparer;
+  readonly prepareResolvedProcess?: ProviderProcessPreparer;
   readonly superviseProcess?: typeof supervisePreparedEffectProcess;
   readonly processTreeKiller?: ProcessTreeKiller;
   readonly teardownProcessTree?: typeof teardownProviderProcessTree;
@@ -1066,8 +1172,8 @@ export interface ProviderHealthProcessOptions {
   }) => Effect.Effect<void>;
   readonly spawnContainedClaudeProcess?: typeof spawnContainedClaudeSdkProcess;
   readonly queryClaude?: typeof claudeQuery;
-  readonly resolveCodexExecutable?: typeof resolveCodexCliExecutableWithDiscovery;
-  readonly resolveCommandCodeExecutable?: typeof resolveCommandCodeCliExecutableWithDiscovery;
+  readonly resolveCodexExecutable?: CodexExecutableResolver;
+  readonly resolveCommandCodeExecutable?: CommandCodeExecutableResolver;
 }
 
 const runProviderCommand = (
@@ -1083,18 +1189,20 @@ const runProviderCommand = (
   Effect.gen(function* () {
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
     const platform = processOptions.platform ?? process.platform;
-    const prepared = yield* Effect.try({
+    const prepared = yield* Effect.tryPromise({
       try: () =>
-        executableAlreadyResolved
-          ? (processOptions.prepareResolvedProcess ?? prepareResolvedWindowsProviderProcess)(
-              executable,
-              args,
-              { env, platform },
-            )
-          : (processOptions.prepareProcess ?? prepareWindowsProviderProcess)(executable, args, {
-              env,
-              platform,
-            }),
+        Promise.resolve(
+          executableAlreadyResolved && processOptions.prepareResolvedProcess
+            ? processOptions.prepareResolvedProcess(executable, args, { env, platform })
+            : (processOptions.prepareProcess ?? prepareWindowsProviderProcessAsync)(
+                executable,
+                args,
+                {
+                  env,
+                  platform,
+                },
+              ),
+        ),
       catch: (cause) =>
         normalizeProviderCommandPreparationError(cause, executable, discoveryOutcome),
     });
@@ -1302,7 +1410,7 @@ const runGrokCommand = (
   runProviderCommand(
     GROK_PROVIDER,
     executable,
-    args,
+    ["--no-auto-update", ...args],
     providerCommandEnv(GROK_PROVIDER),
     false,
     teardownProviderProcessTree,
@@ -1324,7 +1432,10 @@ const runOpenCodeCommand = (
     OPENCODE_PROVIDER,
     executable,
     args,
-    providerCommandEnv(OPENCODE_PROVIDER),
+    buildOpenCodeCompatibleProcessEnv({
+      provider: OPENCODE_PROVIDER,
+      ...(processOptions.platform ? { platform: processOptions.platform } : {}),
+    }),
     false,
     teardownProviderProcessTree,
     processOptions,
@@ -1345,7 +1456,10 @@ const runKiloCommand = (
     KILO_PROVIDER,
     executable,
     args,
-    providerCommandEnv(KILO_PROVIDER),
+    buildOpenCodeCompatibleProcessEnv({
+      provider: KILO_PROVIDER,
+      ...(processOptions.platform ? { platform: processOptions.platform } : {}),
+    }),
     false,
     teardownProviderProcessTree,
     processOptions,
@@ -1461,7 +1575,9 @@ const runPiCommand = (
     PI_PROVIDER,
     executable,
     args,
-    providerCommandEnv(PI_PROVIDER),
+    buildPiProcessEnv({
+      ...(processOptions.platform ? { platform: processOptions.platform } : {}),
+    }),
     false,
     teardownProviderProcessTree,
     processOptions,
@@ -1539,12 +1655,17 @@ export const makeCheckCodexProviderStatus = (
     const checkedAt = new Date().toISOString();
     const probeEnv = yield* Effect.promise(() => makeCodexProbeEnv(homePath));
     const configuredExecutable = nonEmptyTrimmed(binaryPath) ?? "codex";
-    const resolution = (
-      processOptions.resolveCodexExecutable ?? resolveCodexCliExecutableWithDiscovery
-    )(configuredExecutable, {
-      env: probeEnv,
-      platform: processOptions.platform,
-    });
+    const resolution = yield* Effect.promise(() =>
+      Promise.resolve(
+        (processOptions.resolveCodexExecutable ?? resolveCodexCliExecutableWithDiscoveryAsync)(
+          configuredExecutable,
+          {
+            env: probeEnv,
+            platform: processOptions.platform,
+          },
+        ),
+      ),
+    );
     const executable = resolution.executable;
 
     // Probe 1: `codex --version` — is the CLI reachable?
@@ -1752,9 +1873,13 @@ export const makeCheckCommandCodeProviderStatus = (
     const checkedAt = new Date().toISOString();
     const env = providerCommandEnv(COMMAND_CODE_PROVIDER);
     const configured = nonEmptyTrimmed(binaryPath) ?? "commandcode";
-    const resolution = (
-      options?.resolveCommandCodeExecutable ?? resolveCommandCodeCliExecutableWithDiscovery
-    )(configured, { env, platform: options?.platform });
+    const resolution = yield* Effect.promise(() =>
+      Promise.resolve(
+        (
+          options?.resolveCommandCodeExecutable ?? resolveCommandCodeCliExecutableWithDiscoveryAsync
+        )(configured, { env, platform: options?.platform }),
+      ),
+    );
     const executable = resolution.executable;
     const versionProbe = yield* probeProviderCliVersion(
       runCommandCodeCommand(
@@ -2149,7 +2274,9 @@ const runDroidCommand = (
     DROID_PROVIDER,
     executable,
     args,
-    providerCommandEnv(DROID_PROVIDER),
+    buildDroidRuntimeProcessEnv({
+      ...(processOptions.platform ? { platform: processOptions.platform } : {}),
+    }),
     false,
     teardownProviderProcessTree,
     processOptions,
@@ -2457,6 +2584,10 @@ export const checkAntigravityProviderStatus = (
 ): Effect.Effect<ServerProviderStatus, never, ChildProcessSpawner.ChildProcessSpawner> =>
   Effect.gen(function* () {
     const checkedAt = new Date().toISOString();
+    const platform = processOptions.platform ?? process.platform;
+    if (!isAntigravityAvailableOnPlatform(platform)) {
+      return makeAntigravityWindowsUnavailableStatus(checkedAt);
+    }
     const executable = nonEmptyTrimmed(binaryPath) ?? "agy";
     const versionProbe = yield* probeProviderCliVersion(
       runAntigravityCommand(["--version"], executable, processOptions),
@@ -3041,10 +3172,17 @@ export function makeProviderHealthLive(
       ).pipe(
         Effect.map((statuses) =>
           orderProviderStatuses(
-            statuses.filter(
-              (status): status is ServerProviderStatus =>
-                status !== undefined && !isDisabledProviderStatusOverlay(status),
-            ),
+            statuses
+              .filter(
+                (status): status is ServerProviderStatus =>
+                  status !== undefined && !isDisabledProviderStatusOverlay(status),
+              )
+              .map((status) =>
+                status.provider === ANTIGRAVITY_PROVIDER &&
+                !isAntigravityAvailableOnPlatform(platform)
+                  ? makeAntigravityWindowsUnavailableStatus(status.checkedAt)
+                  : status,
+              ),
           ),
         ),
       );
@@ -3151,11 +3289,19 @@ export function makeProviderHealthLive(
         const configuredBinaryPath = getProviderBinaryPath(provider, settings);
         const binaryPath =
           provider === CODEX_PROVIDER
-            ? resolveCodexCliExecutable(configuredBinaryPath ?? "codex", { env: commandEnv })
-            : provider === COMMAND_CODE_PROVIDER
-              ? resolveCommandCodeCliExecutable(configuredBinaryPath ?? "commandcode", {
+            ? yield* Effect.promise(() =>
+                resolveCodexCliExecutableAsync(configuredBinaryPath ?? "codex", {
                   env: commandEnv,
-                })
+                  platform,
+                }),
+              )
+            : provider === COMMAND_CODE_PROVIDER
+              ? yield* Effect.promise(() =>
+                  resolveCommandCodeCliExecutableAsync(configuredBinaryPath ?? "commandcode", {
+                    env: commandEnv,
+                    platform,
+                  }),
+                )
               : provider === CURSOR_PROVIDER
                 ? resolveCursorAgentBinaryPath(configuredBinaryPath)
                 : provider === DROID_PROVIDER
@@ -3622,23 +3768,25 @@ export function makeProviderHealthLive(
         readonly pathPrepend?: string;
         readonly teardownFailureRef: Ref.Ref<Error | null>;
       }) {
-        const baseEnv = providerCommandEnv(input.provider);
-        const updateEnv = input.pathPrepend
-          ? {
-              ...baseEnv,
-              PATH: [input.pathPrepend, baseEnv.PATH]
-                .filter((entry): entry is string => Boolean(entry))
-                .join(platform === "win32" ? ";" : ":"),
-            }
-          : baseEnv;
-        const prepared = (providerProcessOptions.prepareProcess ?? prepareWindowsProviderProcess)(
-          input.command,
-          input.args,
-          {
-            env: updateEnv,
-            platform,
-          },
-        );
+        const updateEnv = buildProviderUpdateProcessEnv({
+          provider: input.provider,
+          ...(input.pathPrepend ? { pathPrepend: input.pathPrepend } : {}),
+          platform,
+        });
+        const prepared = yield* Effect.tryPromise({
+          try: () =>
+            Promise.resolve(
+              (providerProcessOptions.prepareProcess ?? prepareWindowsProviderProcessAsync)(
+                input.command,
+                input.args,
+                {
+                  env: updateEnv,
+                  platform,
+                },
+              ),
+            ),
+          catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause))),
+        });
         const supervised = yield* Effect.uninterruptible(
           Effect.gen(function* () {
             const childCommandOptions: ChildProcess.CommandOptions = {

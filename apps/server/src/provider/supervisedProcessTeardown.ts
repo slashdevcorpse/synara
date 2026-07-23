@@ -322,6 +322,8 @@ export function superviseEffectProcessTree(
   const descendants = new Map<string, CapturedProcess>();
   let root: CapturedProcess | undefined;
   let captureComplete = true;
+  let initialFastRootDrainEligible = false;
+  let ownedProcessGroupDrainProven = false;
   let rootSettled = false;
   let monitorStopped = false;
   let resolveMonitorStop: (() => void) | undefined;
@@ -379,6 +381,8 @@ export function superviseEffectProcessTree(
     const introducesOwnershipWithoutLiveRoot =
       !ownedRootCanAuthorizeCapture &&
       ((tree.root !== undefined && !capturedRootMatchesOwned) || hasNewDescendant);
+    const introducesUnprovenRoot =
+      !ownedRootCanAuthorizeCapture && tree.root !== undefined && !capturedRootMatchesOwned;
     const hasKnownOwnedIdentity =
       capturedRootMatchesOwned ||
       tree.descendants.some(
@@ -391,6 +395,7 @@ export function superviseEffectProcessTree(
       hasNewDescendant &&
       !hasKnownOwnedIdentity;
     if (
+      introducesUnprovenRoot ||
       stableGroupContinuityMissing ||
       (!hasStableOwnedProcessGroup &&
         (introducesOwnershipWithoutLiveRoot || lacksStableRootOwnership))
@@ -426,10 +431,14 @@ export function superviseEffectProcessTree(
     | { readonly _tag: "Running" }
     | { readonly _tag: "Stopped" }
     | { readonly _tag: "Unavailable"; readonly error: unknown };
+  let rawRootExitObserved = false;
   const rawRootOutcome: Promise<RootOutcome> = Effect.runPromise(
     process.exitCode.pipe(Effect.asVoid),
   ).then(
-    () => ({ _tag: "Exited" as const }),
+    () => {
+      rawRootExitObserved = true;
+      return { _tag: "Exited" as const };
+    },
     (error: unknown) => ({ _tag: "WatcherFailed" as const, error }),
   );
   let rootLivenessUnproven = false;
@@ -509,7 +518,15 @@ export function superviseEffectProcessTree(
   // and teardown operation below awaits this promise before observing or signaling the tree.
   const initialCapture = pendingInitialCapture.then(
     async (tree) => {
-      mergeCapture(tree, true, await ownedRootCanAuthorizeCapture());
+      const ownedRootCanAuthorize = await ownedRootCanAuthorizeCapture();
+      initialFastRootDrainEligible =
+        hasStableOwnedProcessGroup &&
+        rawRootExitObserved &&
+        !rootLivenessUnproven &&
+        tree.root === undefined &&
+        tree.descendants.length === 0 &&
+        tree.captureComplete !== false;
+      mergeCapture(tree, true, ownedRootCanAuthorize);
       initialCaptureSucceeded =
         tree.root !== undefined && tree.captureComplete !== false && captureComplete;
     },
@@ -537,7 +554,23 @@ export function superviseEffectProcessTree(
       // Windows retains parent PIDs after root exit, while POSIX callers provide the isolated
       // process group. Captures stay additive so a vanished wrapper never erases prior identities.
       const tree = await captureOwnedTreeAsync();
-      mergeCapture(tree, false, await ownedRootCanAuthorizeCapture());
+      const ownedRootCanAuthorize = await ownedRootCanAuthorizeCapture();
+      if (
+        initialFastRootDrainEligible &&
+        hasStableOwnedProcessGroup &&
+        rootSettled &&
+        !rootLivenessUnproven &&
+        tree.root === undefined &&
+        tree.descendants.length === 0 &&
+        tree.captureComplete !== false
+      ) {
+        // A detached POSIX group cannot be reused until it is empty. A complete post-exit
+        // snapshot with neither the numeric root nor any group member therefore proves that the
+        // owned group drained, even when a short-lived root beat the initial live-root capture.
+        // Any reused root or surviving group member remains fail-closed through mergeCapture.
+        ownedProcessGroupDrainProven = true;
+      }
+      mergeCapture(tree, false, ownedRootCanAuthorize);
     } catch {
       captureComplete = false;
     }
@@ -611,10 +644,16 @@ export function superviseEffectProcessTree(
         captureComplete: false,
       });
     }
+    rootSettled = true;
     await captureNow();
     const tree = capturedTree();
-    const remaining = await inspectUntil(tree);
-    if (tree.captureComplete !== false && remaining !== null && remaining.length === 0) {
+    const inspectionTree = ownedProcessGroupDrainProven ? { ...tree, captureComplete: true } : tree;
+    const remaining = await inspectUntil(inspectionTree);
+    if (
+      (tree.captureComplete !== false || ownedProcessGroupDrainProven) &&
+      remaining !== null &&
+      remaining.length === 0
+    ) {
       return { escalated: false, signalErrors: [] };
     }
     throw new ProviderProcessExitUnprovenError({

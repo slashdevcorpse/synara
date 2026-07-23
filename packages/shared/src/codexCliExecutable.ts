@@ -7,8 +7,11 @@ import * as Path from "node:path";
 
 import {
   resolveWindowsCommandCandidates,
+  resolveWindowsCommandCandidatesAsync,
   resolveWindowsCommandPath,
+  resolveWindowsCommandPathAsync,
   unresolvedWindowsCommandDiscoveryOutcome,
+  type WindowsAsyncCommandDiscoveryInput,
   type WindowsCommandDiscoveryObservation,
   type WindowsCommandDiscoveryOutcome,
   type WindowsSafeProcessInput,
@@ -23,6 +26,9 @@ type StatSyncLike = (path: string) => FileStatLike;
 export interface CodexCliExecutableInput extends WindowsSafeProcessInput {
   readonly statSync?: StatSyncLike | undefined;
 }
+
+export interface CodexCliExecutableAsyncInput
+  extends CodexCliExecutableInput, WindowsAsyncCommandDiscoveryInput {}
 
 export interface CodexCliExecutableResolution {
   readonly executable: string;
@@ -98,6 +104,57 @@ function validNpmCodexShim(
   return isAbsoluteRegularFile(candidate, readStat) ? candidate : undefined;
 }
 
+function observeCodexCommandDiscovery(input: CodexCliExecutableInput): {
+  readonly observations: WindowsCommandDiscoveryObservation[];
+  readonly discoveryInput: CodexCliExecutableInput;
+} {
+  const observations: WindowsCommandDiscoveryObservation[] = [];
+  return {
+    observations,
+    discoveryInput: {
+      ...input,
+      onCommandDiscovery: (observation) => {
+        observations.push(observation);
+        input.onCommandDiscovery?.(observation);
+      },
+    },
+  };
+}
+
+function resolveDefaultCodexExecutable(
+  whereCandidates: ReadonlyArray<string>,
+  input: CodexCliExecutableInput,
+): string {
+  const env = input.env ?? process.env;
+  const readStat = input.statSync ?? statSync;
+  const localAppData = nonEmptyEnvironmentValue(env, "LOCALAPPDATA");
+  const standaloneInstallDirectory = localAppData
+    ? Path.win32.join(localAppData, "Programs", "OpenAI", "Codex", "bin")
+    : undefined;
+
+  return (
+    firstValidCandidate(whereCandidates, WINDOWS_NATIVE_EXECUTABLE_PATTERN, readStat) ??
+    validCodexExecutableInDirectory(nonEmptyEnvironmentValue(env, "CODEX_INSTALL_DIR"), readStat) ??
+    validCodexExecutableInDirectory(standaloneInstallDirectory, readStat) ??
+    firstValidCandidate(whereCandidates, WINDOWS_BATCH_EXECUTABLE_PATTERN, readStat) ??
+    validNpmCodexShim(nonEmptyEnvironmentValue(env, "APPDATA"), readStat) ??
+    DEFAULT_CODEX_COMMAND
+  );
+}
+
+function withUnresolvedDiscoveryOutcome(
+  executable: string,
+  isUnresolved: boolean,
+  observations: ReadonlyArray<WindowsCommandDiscoveryObservation>,
+): CodexCliExecutableResolution {
+  return {
+    executable,
+    ...(isUnresolved
+      ? { discoveryOutcome: unresolvedWindowsCommandDiscoveryOutcome(observations) }
+      : {}),
+  };
+}
+
 export function resolveCodexCliExecutableWithDiscovery(
   command: string,
   input: CodexCliExecutableInput = {},
@@ -106,45 +163,23 @@ export function resolveCodexCliExecutableWithDiscovery(
   if (platform !== "win32") {
     return { executable: command };
   }
-  const observations: WindowsCommandDiscoveryObservation[] = [];
-  const discoveryInput: CodexCliExecutableInput = {
-    ...input,
-    onCommandDiscovery: (observation) => {
-      observations.push(observation);
-      input.onCommandDiscovery?.(observation);
-    },
-  };
+  const { observations, discoveryInput } = observeCodexCommandDiscovery(input);
   if (command.trim().toLowerCase() !== DEFAULT_CODEX_COMMAND) {
     const executable = resolveWindowsCommandPath(command, discoveryInput);
-    return {
+    return withUnresolvedDiscoveryOutcome(
       executable,
-      ...(Path.win32.isAbsolute(executable)
-        ? {}
-        : { discoveryOutcome: unresolvedWindowsCommandDiscoveryOutcome(observations) }),
-    };
+      !Path.win32.isAbsolute(executable),
+      observations,
+    );
   }
 
-  const env = input.env ?? process.env;
-  const readStat = input.statSync ?? statSync;
   const whereCandidates = resolveWindowsCommandCandidates(DEFAULT_CODEX_COMMAND, discoveryInput);
-  const localAppData = nonEmptyEnvironmentValue(env, "LOCALAPPDATA");
-  const standaloneInstallDirectory = localAppData
-    ? Path.win32.join(localAppData, "Programs", "OpenAI", "Codex", "bin")
-    : undefined;
-
-  const executable =
-    firstValidCandidate(whereCandidates, WINDOWS_NATIVE_EXECUTABLE_PATTERN, readStat) ??
-    validCodexExecutableInDirectory(nonEmptyEnvironmentValue(env, "CODEX_INSTALL_DIR"), readStat) ??
-    validCodexExecutableInDirectory(standaloneInstallDirectory, readStat) ??
-    firstValidCandidate(whereCandidates, WINDOWS_BATCH_EXECUTABLE_PATTERN, readStat) ??
-    validNpmCodexShim(nonEmptyEnvironmentValue(env, "APPDATA"), readStat) ??
-    DEFAULT_CODEX_COMMAND;
-  return {
+  const executable = resolveDefaultCodexExecutable(whereCandidates, input);
+  return withUnresolvedDiscoveryOutcome(
     executable,
-    ...(executable === DEFAULT_CODEX_COMMAND
-      ? { discoveryOutcome: unresolvedWindowsCommandDiscoveryOutcome(observations) }
-      : {}),
-  };
+    executable === DEFAULT_CODEX_COMMAND,
+    observations,
+  );
 }
 
 export function resolveCodexCliExecutable(
@@ -152,4 +187,41 @@ export function resolveCodexCliExecutable(
   input: CodexCliExecutableInput = {},
 ): string {
   return resolveCodexCliExecutableWithDiscovery(command, input).executable;
+}
+
+export async function resolveCodexCliExecutableWithDiscoveryAsync(
+  command: string,
+  input: CodexCliExecutableAsyncInput = {},
+): Promise<CodexCliExecutableResolution> {
+  const platform = input.platform ?? process.platform;
+  if (platform !== "win32") {
+    return { executable: command };
+  }
+  const { observations, discoveryInput } = observeCodexCommandDiscovery(input);
+  if (command.trim().toLowerCase() !== DEFAULT_CODEX_COMMAND) {
+    const executable = await resolveWindowsCommandPathAsync(command, discoveryInput);
+    return withUnresolvedDiscoveryOutcome(
+      executable,
+      !Path.win32.isAbsolute(executable),
+      observations,
+    );
+  }
+
+  const whereCandidates = await resolveWindowsCommandCandidatesAsync(
+    DEFAULT_CODEX_COMMAND,
+    discoveryInput,
+  );
+  const executable = resolveDefaultCodexExecutable(whereCandidates, input);
+  return withUnresolvedDiscoveryOutcome(
+    executable,
+    executable === DEFAULT_CODEX_COMMAND,
+    observations,
+  );
+}
+
+export async function resolveCodexCliExecutableAsync(
+  command: string,
+  input: CodexCliExecutableAsyncInput = {},
+): Promise<string> {
+  return (await resolveCodexCliExecutableWithDiscoveryAsync(command, input)).executable;
 }

@@ -934,7 +934,7 @@ export function ProvidersSettingsPanel({
                 ? "Automatic checks off"
                 : outdatedProviderCount > 0
                   ? `${outdatedProviderCount} ${pluralize(outdatedProviderCount, "update")} available`
-                  : "No provider updates detected"
+                  : "No updates detected among providers with a supported update channel"
             }
           >
             {settings.enableProviderUpdateChecks && outdatedProviderStatuses.length > 0 ? (
@@ -1044,7 +1044,7 @@ export function ProvidersSettingsPanel({
                 ? "Automatic checks off"
                 : outdatedProviderCount > 0
                   ? `${outdatedProviderCount} ${pluralize(outdatedProviderCount, "update")} available`
-                  : "No provider updates detected"
+                  : "No updates detected among providers with a supported update channel"
             }
             resetAction={
               installSettingsDirty ? (
