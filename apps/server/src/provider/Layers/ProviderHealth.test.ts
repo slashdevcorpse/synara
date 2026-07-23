@@ -1538,6 +1538,108 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
     });
 
     it.effect.skipIf(process.platform !== "win32")(
+      "waits for a delayed native Droid replacement and keeps the updater job-contained",
+      () =>
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystem.FileSystem;
+          const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+            prefix: "provider-update-delayed-droid-",
+          });
+          const droidDirectory = NodePath.join(baseDir, "bin");
+          const droidBinaryPath = NodePath.join(droidDirectory, "droid.exe");
+          yield* fileSystem.makeDirectory(droidDirectory, { recursive: true });
+          yield* fileSystem.writeFileString(droidBinaryPath, "droid fixture\n");
+          yield* writeProviderStatusCache({
+            filePath: resolveProviderStatusCachePath({
+              stateDir: NodePath.join(baseDir, "userdata"),
+              provider: "droid",
+            }),
+            provider: {
+              provider: "droid",
+              status: "ready",
+              available: true,
+              authStatus: "unknown",
+              checkedAt: "2026-07-23T20:00:00.000Z",
+              version: "0.174.0",
+            },
+          });
+          const settings = {
+            ...allProvidersDisabledServerSettings,
+            providers: {
+              ...allProvidersDisabledServerSettings.providers,
+              droid: {
+                ...DEFAULT_SERVER_SETTINGS.providers.droid,
+                enabled: true,
+                binaryPath: droidBinaryPath,
+              },
+            },
+          } satisfies typeof DEFAULT_SERVER_SETTINGS;
+          let healthProbeCount = 0;
+          let updatePrepareCount = 0;
+          let updateSpawnCount = 0;
+          let updaterCompleted = false;
+          const prepareProcess: ProviderHealthProcessOptions["prepareProcess"] = (
+            command,
+            args,
+            options,
+          ) => {
+            const prepared = prepareContainedResolvedWindowsProviderForTest(command, args, options);
+            if (args.length === 1 && args[0] === "update") {
+              updatePrepareCount += 1;
+              assert.ok(isWindowsJobPreparedCommand(prepared));
+              assert.ok(prepared.args.includes(droidBinaryPath));
+              assert.ok(
+                ![prepared.command, ...prepared.args].join(" ").toLowerCase().includes("cmd.exe"),
+              );
+            }
+            return prepared;
+          };
+          const layer = makeProviderHealthLive({
+            platform: "win32",
+            prepareProcess,
+            processTreeKiller: syntheticProcessTreeKiller(72),
+          }).pipe(
+            Layer.provideMerge(providerServiceWithoutRuntimesLayer),
+            Layer.provideMerge(ServerSettingsService.layerTest(settings)),
+            Layer.provideMerge(ServerConfig.layerTest(process.cwd(), baseDir)),
+            Layer.provideMerge(
+              mockSpawnerLayer((args, command) => {
+                assert.strictEqual(command.toLowerCase(), droidBinaryPath.toLowerCase());
+                if (args.length === 1 && args[0] === "update") {
+                  updateSpawnCount += 1;
+                  updaterCompleted = true;
+                  return { stdout: "Update initiated.\n", stderr: "", code: 0 };
+                }
+                assert.deepStrictEqual(args, ["--version"]);
+                healthProbeCount += 1;
+                return {
+                  stdout:
+                    updaterCompleted && healthProbeCount >= 3
+                      ? "droid 0.178.0\n"
+                      : "droid 0.174.0\n",
+                  stderr: "",
+                  code: 0,
+                };
+              }),
+            ),
+          );
+
+          const result = yield* Effect.gen(function* () {
+            const providerHealth = yield* ProviderHealth;
+            return yield* TestClock.withLive(providerHealth.updateProvider({ provider: "droid" }));
+          }).pipe(Effect.provide(layer));
+          const droid = result.providers.find((provider) => provider.provider === "droid");
+
+          assert.strictEqual(updatePrepareCount, 1);
+          assert.strictEqual(updateSpawnCount, 1);
+          assert.strictEqual(healthProbeCount, 3);
+          assert.strictEqual(droid?.version, "0.178.0");
+          assert.strictEqual(droid?.updateState?.status, "succeeded");
+          assert.strictEqual(droid?.updateState?.message, "Provider CLI update verified.");
+        }),
+    );
+
+    it.effect.skipIf(process.platform !== "win32")(
       "launches Windows npm updates as node.exe plus npm-cli.js without cmd.exe",
       () =>
         withKiloUpdateFixture("7.4.10", (input) =>

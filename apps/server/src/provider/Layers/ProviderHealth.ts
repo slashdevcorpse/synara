@@ -148,6 +148,10 @@ import {
 import { quiesceProviderRuntimesForUpdate } from "../providerUpdateQuiescence.ts";
 import { classifyCompletedProviderUpdate } from "../providerUpdateOutcome.ts";
 import {
+  verifyDelayedProviderUpdateVersion,
+  type ProviderUpdateVerificationSnapshot,
+} from "../providerUpdateVerification.ts";
+import {
   findProviderProcessExitUnprovenError,
   ProviderProcessExitUnprovenError,
   teardownChildProcessTree,
@@ -4105,6 +4109,32 @@ export function makeProviderHealthLive(
               }),
             );
 
+        const runPostUpdateVerificationProbe = Effect.fn("runProviderPostUpdateVerificationProbe")(
+          function* (stableGeneration: ProviderUpdateSettingsGeneration): Effect.fn.Return<
+            ProviderUpdateVerificationSnapshot & {
+              readonly generation: ProviderUpdateSettingsGeneration;
+            }
+          > {
+            const generation = yield* readUpdateSettingsGeneration();
+            const update = generation.capabilities.update;
+            const targetChangedBeforeProbe =
+              !update ||
+              !updateDestinationGenerationMatches(provider, stableGeneration, generation);
+            const status = yield* runUpdateHealthProbe(generation.settings, "post-update");
+            const decisionGeneration = yield* readUpdateSettingsGeneration();
+            const evidenceChanged = !updateEvidenceGenerationMatches(
+              provider,
+              generation,
+              decisionGeneration,
+            );
+            return {
+              generation,
+              status,
+              targetChanged: targetChangedBeforeProbe || evidenceChanged,
+            };
+          },
+        );
+
         const run = Effect.gen(function* () {
           const lockedGeneration = yield* readUpdateSettingsGeneration();
           const lockedSettings = lockedGeneration.settings;
@@ -4265,14 +4295,14 @@ export function makeProviderHealthLive(
             return { providers };
           }
 
-          const postProbeGeneration = yield* readUpdateSettingsGeneration();
-          const postSettings = postProbeGeneration.settings;
-          const postCapabilities = postProbeGeneration.capabilities;
-          const postUpdate = postCapabilities.update;
-          const targetChangedBeforePostProbe =
-            !postUpdate ||
-            !updateDestinationGenerationMatches(provider, stableGeneration, postProbeGeneration);
-          const afterStatus = yield* runUpdateHealthProbe(postSettings, "post-update");
+          const initialPostProbe = yield* runPostUpdateVerificationProbe(stableGeneration);
+          const verifiedPostProbe = yield* verifyDelayedProviderUpdateVersion({
+            beforeVersion,
+            initialSnapshot: initialPostProbe,
+            probe: runPostUpdateVerificationProbe(stableGeneration),
+          });
+          const afterStatus = verifiedPostProbe.status;
+          const postCapabilities = verifiedPostProbe.generation.capabilities;
           const postStatus = yield* enrichProviderStatusWithVersionAdvisory(
             afterStatus,
             postCapabilities,
@@ -4281,10 +4311,10 @@ export function makeProviderHealthLive(
           const postDecisionGeneration = yield* readUpdateSettingsGeneration();
           const postEvidenceGenerationChanged = !updateEvidenceGenerationMatches(
             provider,
-            postProbeGeneration,
+            verifiedPostProbe.generation,
             postDecisionGeneration,
           );
-          const targetChanged = targetChangedBeforePostProbe || postEvidenceGenerationChanged;
+          const targetChanged = verifiedPostProbe.targetChanged || postEvidenceGenerationChanged;
           const afterVersion = afterStatus.version ?? null;
           const configuredBinaryUnavailable = !afterStatus.available;
           const postAdvisory = postStatus.versionAdvisory;
