@@ -4110,11 +4110,7 @@ export function makeProviderHealthLive(
             );
 
         const runPostUpdateVerificationProbe = Effect.fn("runProviderPostUpdateVerificationProbe")(
-          function* (stableGeneration: ProviderUpdateSettingsGeneration): Effect.fn.Return<
-            ProviderUpdateVerificationSnapshot & {
-              readonly generation: ProviderUpdateSettingsGeneration;
-            }
-          > {
+          function* (stableGeneration: ProviderUpdateSettingsGeneration) {
             const generation = yield* readUpdateSettingsGeneration();
             const update = generation.capabilities.update;
             const targetChangedBeforeProbe =
