@@ -4123,7 +4123,10 @@ export function makeProviderHealthLive(
         // would reject the update itself and release the gate before delayed replacement probes.
         const runExclusivePostUpdateHealthProbe = (settings: ServerSettings) =>
           handleUpdateHealthProbeFailure(
-            checkProviderStatusForSettings(settings, provider),
+            maintenanceGate.assertProviderNotLatched({ provider }).pipe(
+              Effect.andThen(checkProviderStatusForSettings(settings, provider)),
+              Effect.tap(() => maintenanceGate.assertProviderNotLatched({ provider })),
+            ),
             "post-update",
           );
 

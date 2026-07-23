@@ -2301,6 +2301,106 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
         ),
     );
 
+    it.effect("fails terminally before retrying when a post-update probe latches exit proof", () =>
+      withKiloUpdateFixture("7.4.10", (input) =>
+        withLatestNpmVersion(
+          "7.4.11",
+          Effect.gen(function* () {
+            const maintenanceGate = yield* makeProviderMaintenanceGate;
+            let healthSupervisorCount = 0;
+            let healthSpawnCount = 0;
+            let updateSpawnCount = 0;
+            const layer = makeProviderHealthLive({
+              maintenanceGate,
+              superviseProcess: (prepared, child) => {
+                if (prepared.args.some((arg) => arg.includes("@kilocode/cli@latest"))) {
+                  return TEST_PROVIDER_PROCESS_OPTIONS.superviseProcess(prepared, child);
+                }
+                healthSupervisorCount += 1;
+                if (healthSupervisorCount !== 2) {
+                  return TEST_PROVIDER_PROCESS_OPTIONS.superviseProcess(prepared, child);
+                }
+                return {
+                  ...TEST_PROVIDER_PROCESS_OPTIONS.superviseProcess(prepared, child),
+                  proveExit: async () => {
+                    await Effect.runPromise(
+                      maintenanceGate.latchProvider({
+                        provider: "kilo",
+                        reason: "post-update health exit proof requires restart",
+                      }),
+                    );
+                    return { escalated: false, signalErrors: [] };
+                  },
+                };
+              },
+            }).pipe(
+              Layer.provideMerge(providerServiceWithoutRuntimesLayer),
+              Layer.provideMerge(ServerSettingsService.layerTest(input.settings)),
+              Layer.provideMerge(ServerConfig.layerTest(process.cwd(), input.baseDir)),
+              Layer.provideMerge(
+                mockSpawnerLayer((args, command, env, options) => {
+                  if (
+                    preparedProviderCommandMatches({
+                      fixture: input.fixture,
+                      executable: fixtureExecutablePath(input.fixture, "npm"),
+                      expectedArgs: [
+                        "install",
+                        "-g",
+                        "--prefix",
+                        input.npmPrefix,
+                        "@kilocode/cli@latest",
+                      ],
+                      command,
+                      actualArgs: args,
+                      env,
+                      options,
+                    })
+                  ) {
+                    updateSpawnCount += 1;
+                    return { stdout: "updated\n", stderr: "", code: 0 };
+                  }
+                  healthSpawnCount += 1;
+                  return { stdout: "kilo 7.4.10\n", stderr: "", code: 0 };
+                }),
+              ),
+            );
+
+            const observed = yield* Effect.gen(function* () {
+              const providerHealth = yield* ProviderHealth;
+              const error = yield* providerHealth
+                .updateProvider({ provider: "kilo" })
+                .pipe(Effect.flip);
+              const providers = yield* providerHealth.getStatuses;
+              return { error, providers };
+            }).pipe(Effect.provide(layer));
+            const kilo = observed.providers.find((status) => status.provider === "kilo");
+            const blocked = yield* maintenanceGate
+              .withOperation({
+                provider: "kilo",
+                operation: "session.start",
+                run: Effect.void,
+              })
+              .pipe(Effect.flip);
+
+            assert.ok(observed.error instanceof ServerProviderUpdateError);
+            assert.match(observed.error.message, /post-update health exit proof requires restart/u);
+            assert.strictEqual(updateSpawnCount, 1);
+            assert.strictEqual(healthSpawnCount, 2);
+            assert.strictEqual(healthSupervisorCount, 2);
+            assert.strictEqual(kilo?.updateState?.status, "failed");
+            assert.match(
+              kilo?.updateState?.message ?? "",
+              /post-update health exit proof requires restart/u,
+            );
+            assert.strictEqual(
+              blocked.latchedReason,
+              "post-update health exit proof requires restart",
+            );
+          }),
+        ),
+      ),
+    );
+
     it.effect("latches an unproven health proveExit even when teardown later succeeds", () =>
       withKiloUpdateFixture("7.4.10", (input) =>
         withLatestNpmVersion(
