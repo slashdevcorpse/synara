@@ -25,7 +25,7 @@ The required behavior is:
 
 An update may hold new turns behind an explicit drain barrier after existing work has settled. It must never send an interrupt merely to make the update start sooner.
 
-### Read-only advisories are not mutation proof
+### Read-only advisories do not prove update eligibility
 
 Super Synara may show a nonblocking, read-only latest-version advisory from an explicitly trusted provider metadata source even when it cannot prove which installation channel owns the resolved binary. Current provider-wide fallbacks are limited to the official npm metadata for Codex, OpenCode, and Droid. This advisory is a prompt to review provider settings; it does not prove the selected installation can reach that version.
 

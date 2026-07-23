@@ -192,10 +192,19 @@ describe("providerUpdateNotificationKey", () => {
         updateCommand: null,
       },
     });
+    const active = providerStatus("codex", {
+      updateState: {
+        status: "running",
+        startedAt: "2026-06-10T10:00:00.000Z",
+        finishedAt: null,
+        message: "Updating provider.",
+        output: null,
+      },
+    });
 
-    expect(providerUpdateNotificationKey([actionable])).not.toBe(
-      providerUpdateNotificationKey([manualOnly]),
-    );
+    expect(providerUpdateNotificationKey([actionable])).toBe("codex:1.1.0:actionable");
+    expect(providerUpdateNotificationKey([manualOnly])).toBe("codex:1.1.0:manual");
+    expect(providerUpdateNotificationKey([active])).toBe("codex:1.1.0:active");
   });
 });
 

@@ -357,7 +357,11 @@ export function providerUpdateNotificationKey(
       [
         provider.provider,
         provider.versionAdvisory?.latestVersion ?? "unknown",
-        shouldOfferProviderUpdateAction(provider) ? "actionable" : "manual",
+        isProviderUpdateActive(provider)
+          ? "active"
+          : shouldOfferProviderUpdateAction(provider)
+            ? "actionable"
+            : "manual",
       ].join(":"),
     )
     .toSorted();
