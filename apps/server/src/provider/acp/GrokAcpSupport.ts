@@ -60,7 +60,7 @@ export function buildGrokAcpSpawnInput(
   grokSettings: GrokAcpRuntimeSettings | null | undefined,
   cwd: string,
 ): AcpSpawnInput {
-  const args = ["agent", "--no-leader"];
+  const args = ["--no-auto-update", "agent", "--no-leader"];
   if (grokSettings?.alwaysApprove === true) {
     // Grok's approval flag belongs to `grok agent`, before the `stdio` subcommand.
     args.push("--always-approve");
@@ -71,7 +71,7 @@ export function buildGrokAcpSpawnInput(
   }
   const reasoningEffort = grokSettings?.reasoningEffort?.trim();
   if (reasoningEffort) {
-    args.push("--reasoning-effort", reasoningEffort);
+    args.push("--effort", reasoningEffort);
   }
   args.push("stdio");
 

@@ -526,6 +526,47 @@ describe("providerMaintenance", () => {
     }
   });
 
+  win(
+    "awaits asynchronous Windows provider discovery without blocking the event loop",
+    async () => {
+      let releaseDiscovery!: (path: string) => void;
+      let discoveryStarted = false;
+      let resolutionSettled = false;
+      const pendingDiscovery = new Promise<string>((resolve) => {
+        releaseDiscovery = resolve;
+      });
+      const resolution = Effect.runPromise(
+        resolveProviderMaintenanceCapabilitiesEffect(
+          CODEX_DEFINITION,
+          {
+            binaryPath: "codex",
+            env: { PATH: "C:\\missing", PATHEXT: ".CMD;.EXE" },
+            platform: "win32",
+          },
+          {
+            resolveWindowsCommandPath: () => {
+              discoveryStarted = true;
+              return pendingDiscovery;
+            },
+          },
+        ).pipe(Effect.provide(NodeServices.layer)),
+      ).finally(() => {
+        resolutionSettled = true;
+      });
+
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, 0);
+      });
+      assert.strictEqual(discoveryStarted, true);
+      assert.strictEqual(resolutionSettled, false);
+
+      releaseDiscovery("C:\\missing\\codex.cmd");
+      const capabilities = await resolution;
+      assert.strictEqual(capabilities.update, null);
+      assert.strictEqual(resolutionSettled, true);
+    },
+  );
+
   win("verifies manifest identity, bin mapping, and linkage for a Windows npm shim", async () => {
     const result = await Effect.runPromise(
       Effect.gen(function* () {
@@ -726,15 +767,24 @@ describe("providerMaintenance", () => {
           prefixManagerCommand.argsPrefix[0],
           "console.log('prefix npm fixture');\n",
         );
-        const resolve = (managerExecutablePath = managerPath) =>
+        const resolve = (
+          managerExecutablePath = managerPath,
+          pathExt: string | null = ".CMD;.EXE",
+        ) =>
           resolveProviderMaintenanceCapabilitiesEffect(CODEX_DEFINITION, {
             binaryPath: shimPath,
-            env: { PATH: npmPrefix, PATHEXT: ".CMD;.EXE" },
+            env: { PATH: npmPrefix, ...(pathExt === null ? {} : { PATHEXT: pathExt }) },
             managerExecutablePath,
             platform: "win32",
           });
 
         const prefixPreferred = yield* resolve();
+        const extensionlessManagerPath = NodePath.join(managerDirectory, "npm");
+        const lowerCasePathExt = yield* resolve(extensionlessManagerPath, ".cmd;.exe");
+        const reorderedPathExt = yield* resolve(extensionlessManagerPath, ".EXE;.CMD");
+        const missingPathExt = yield* resolve(extensionlessManagerPath, null);
+        const leadingSpacePathExt = yield* resolve(extensionlessManagerPath, " .CMD;.EXE");
+        const trailingSpacePathExt = yield* resolve(extensionlessManagerPath, ".CMD ;.EXE");
         const prefixExecutableMatches =
           prefixPreferred.update !== null &&
           realpathSync.native(prefixPreferred.update.executable) ===
@@ -762,7 +812,10 @@ describe("providerMaintenance", () => {
         return {
           bundledFallback,
           bundledNpmCliMatches,
+          leadingSpacePathExt,
+          lowerCasePathExt,
           managerPath,
+          missingPathExt,
           missingNode,
           missingNpmCli,
           nonCmdManager,
@@ -770,11 +823,18 @@ describe("providerMaintenance", () => {
           prefixExecutableMatches,
           prefixNpmCliMatches,
           prefixPreferred,
+          reorderedPathExt,
+          trailingSpacePathExt,
         };
       }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
     );
 
     assert.ok(result.prefixPreferred.update);
+    assert.ok(result.lowerCasePathExt.update);
+    assert.ok(result.reorderedPathExt.update);
+    assert.strictEqual(result.missingPathExt.update, null);
+    assert.strictEqual(result.leadingSpacePathExt.update, null);
+    assert.strictEqual(result.trailingSpacePathExt.update, null);
     assert.strictEqual(result.prefixExecutableMatches, true);
     assert.strictEqual(result.prefixNpmCliMatches, true);
     assert.deepStrictEqual(result.prefixPreferred.update.args.slice(1), [
@@ -832,6 +892,7 @@ describe("providerMaintenance", () => {
           yield* fileSystem.makeDirectory(escapedManagerDirectory, { recursive: true });
           yield* fileSystem.writeFileString(escapedManagerPath, "@echo off\r\n");
 
+          let asyncCandidateDiscoveryTurns = 0;
           const resolveWithManagerCandidates = (managerPath: string, managerDirectory: string) =>
             resolveProviderMaintenanceCapabilitiesEffect(
               CODEX_DEFINITION,
@@ -845,11 +906,18 @@ describe("providerMaintenance", () => {
               },
               {
                 resolveWindowsCommandPath: resolveWindowsCommandFromCandidates([shimPath]),
-                resolveWindowsCommandCandidates: (_command, input = {}) =>
-                  normalizeCommandPath(input.env?.PATH ?? "", "win32") ===
-                  normalizeCommandPath(managerDirectory, "win32")
+                resolveWindowsCommandCandidates: async (_command, input = {}) => {
+                  await new Promise<void>((resolve) => {
+                    setTimeout(() => {
+                      asyncCandidateDiscoveryTurns += 1;
+                      resolve();
+                    }, 0);
+                  });
+                  return normalizeCommandPath(input.env?.PATH ?? "", "win32") ===
+                    normalizeCommandPath(managerDirectory, "win32")
                     ? [managerPath]
-                    : [],
+                    : [];
+                },
               },
             );
 
@@ -870,11 +938,12 @@ describe("providerMaintenance", () => {
             aliasManagerDirectory,
           );
 
-          return { aliased, escaped, longManagerPath };
+          return { aliased, asyncCandidateDiscoveryTurns, escaped, longManagerPath };
         }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
       );
 
       assert.strictEqual(result.escaped.update, null);
+      assert.strictEqual(result.asyncCandidateDiscoveryTurns, 2);
       assert.ok(result.aliased.update);
       assert.strictEqual(
         result.aliased.update.executable,

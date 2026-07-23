@@ -21,6 +21,10 @@ import { Cause, Effect, Exit, Layer, Queue, Stream } from "effect";
 import { ServerConfig } from "../../config.ts";
 import { buildProviderChildEnvironment } from "../../providerChildEnvironment.ts";
 import {
+  ANTIGRAVITY_WINDOWS_UNAVAILABLE_MESSAGE,
+  isAntigravityAvailableOnPlatform,
+} from "../antigravityAvailability.ts";
+import {
   ProviderAdapterRequestError,
   ProviderAdapterSessionNotFoundError,
   ProviderAdapterValidationError,
@@ -917,6 +921,7 @@ export function makeAntigravityRuntimeEventBase(input: {
 
 const makeAntigravityAdapter = Effect.fn(function* (options: AntigravityAdapterLiveOptions = {}) {
   const serverConfig = yield* ServerConfig;
+  const platform = options.platform ?? process.platform;
   const events = yield* Queue.unbounded<ProviderRuntimeEvent>();
   const sessions = new Map<ThreadId, AntigravitySessionContext>();
   const defaultEffortByModel = new Map(Object.entries(DEFAULT_EFFORT_BY_MODEL));
@@ -1210,6 +1215,13 @@ const makeAntigravityAdapter = Effect.fn(function* (options: AntigravityAdapterL
 
   const startSession: AntigravityAdapterShape["startSession"] = (input) =>
     Effect.gen(function* () {
+      if (!isAntigravityAvailableOnPlatform(platform)) {
+        return yield* new ProviderAdapterValidationError({
+          provider: PROVIDER,
+          operation: "session/start",
+          issue: ANTIGRAVITY_WINDOWS_UNAVAILABLE_MESSAGE,
+        });
+      }
       if (input.runtimeMode !== "full-access") {
         return yield* new ProviderAdapterValidationError({
           provider: PROVIDER,
@@ -1609,8 +1621,17 @@ const makeAntigravityAdapter = Effect.fn(function* (options: AntigravityAdapterL
       }),
     );
 
-  const listModels: NonNullable<AntigravityAdapterShape["listModels"]> = (input) =>
-    Effect.tryPromise({
+  const listModels: NonNullable<AntigravityAdapterShape["listModels"]> = (input) => {
+    if (!isAntigravityAvailableOnPlatform(platform)) {
+      return Effect.fail(
+        new ProviderAdapterRequestError({
+          provider: PROVIDER,
+          method: "model/list",
+          detail: ANTIGRAVITY_WINDOWS_UNAVAILABLE_MESSAGE,
+        }),
+      );
+    }
+    return Effect.tryPromise({
       try: async () => {
         const result = await runAntigravityHelperProcess(
           trim(input.binaryPath) ?? "agy",
@@ -1642,6 +1663,7 @@ const makeAntigravityAdapter = Effect.fn(function* (options: AntigravityAdapterL
           cause,
         }),
     });
+  };
 
   const stopAll = () =>
     Effect.gen(function* () {

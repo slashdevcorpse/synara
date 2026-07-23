@@ -25,10 +25,18 @@ function shellSingleQuote(value: string): string {
 
 function makeAcpAgentWrapper(dir: string, env: Record<string, string>): string {
   const binDir = path.join(dir, "bin");
-  const launcherPath = path.join(binDir, "agent-launcher.ts");
+  const windowsLauncherRelativePath = path.join(
+    "node_modules",
+    "synara-cursor-text-fixture",
+    "bin",
+    "agent-launcher.mjs",
+  );
+  const launcherPath = path.join(
+    binDir,
+    process.platform === "win32" ? windowsLauncherRelativePath : "agent-launcher.ts",
+  );
   const agentPath = path.join(binDir, process.platform === "win32" ? "agent.cmd" : "agent");
-  const bunExecutableForCmd = process.execPath.replaceAll("%", "%%");
-  mkdirSync(binDir, { recursive: true });
+  mkdirSync(path.dirname(launcherPath), { recursive: true });
   writeFileSync(
     launcherPath,
     [
@@ -48,7 +56,11 @@ function makeAcpAgentWrapper(dir: string, env: Record<string, string>): string {
   writeFileSync(
     agentPath,
     process.platform === "win32"
-      ? ["@echo off", `"${bunExecutableForCmd}" "%~dp0agent-launcher.ts" %*`, ""].join("\r\n")
+      ? [
+          "@ECHO off",
+          `"%~dp0\\node.exe" "%~dp0\\${windowsLauncherRelativePath.replaceAll("/", "\\")}" %*`,
+          "",
+        ].join("\r\n")
       : [
           "#!/bin/sh",
           `exec ${shellSingleQuote(process.execPath)} ${shellSingleQuote(launcherPath)} "$@"`,

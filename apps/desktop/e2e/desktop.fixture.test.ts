@@ -5,12 +5,14 @@ import * as FS from "node:fs";
 import * as OS from "node:os";
 import * as Path from "node:path";
 import { createRequire } from "node:module";
+import { parseCanonicalWindowsNpmNodeShim } from "@synara/shared/windowsNpmShim";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   assertFakeCodexIsOnlyPathCandidate,
   isolatedExecutablePath,
   isolatedElectronEnv,
   parseDiagnosticJsonLines,
+  windowsFakeCodexLauncherContents,
 } from "./desktop.fixture";
 import desktopPlaywrightConfig from "./playwright.config";
 import {
@@ -48,6 +50,12 @@ afterEach(async () => {
 });
 
 describe("desktop fixture executable PATH isolation", () => {
+  it("models the Windows fake Codex launcher as a canonical npm Node shim", () => {
+    expect(parseCanonicalWindowsNpmNodeShim(windowsFakeCodexLauncherContents())).toBe(
+      "node_modules/@synara/desktop-e2e/fake-codex-runtime.mjs",
+    );
+  });
+
   it("removes a quoted directory that exposes a non-fixture Codex executable", async () => {
     const root = await FS.promises.mkdtemp(Path.join(OS.tmpdir(), "synara-e2e-path-"));
     temporaryRoots.push(root);

@@ -3,9 +3,11 @@
 // Layer: Shared Node runtime utility tests
 
 import { spawnSync as spawnChildSync } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { copyFileSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as Path from "node:path";
+import { PassThrough } from "node:stream";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -23,12 +25,47 @@ import {
   quoteWindowsCommandLineArgument,
   readEffectiveWindowsEnvironmentValue,
   resolveWindowsCommandCandidates,
+  resolveWindowsCommandCandidatesAsync,
   resolveWindowsCommandPath,
+  resolveWindowsCommandPathAsync,
   resolveWindowsComSpec,
   resolveWindowsSystemRoot,
+  type WindowsAsyncCommandDiscoveryInput,
   type WindowsCommandDiscoveryObservation,
   type WindowsSafeProcessInput,
 } from "./windowsProcess";
+
+type SpawnProcess = NonNullable<WindowsAsyncCommandDiscoveryInput["spawnProcess"]>;
+
+function makeMockWhereChild() {
+  const emitter = new EventEmitter();
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  const kill = vi.fn(() => true);
+  Object.assign(emitter, {
+    pid: 4_242,
+    stdout,
+    stderr,
+    stdin: null,
+    exitCode: null,
+    signalCode: null,
+    killed: false,
+    kill,
+  });
+  return {
+    child: emitter as ReturnType<SpawnProcess>,
+    stdout,
+    stderr,
+    kill,
+    close(status: number | null): void {
+      Object.assign(emitter, { exitCode: status });
+      emitter.emit("close", status, null);
+    },
+    error(cause: Error): void {
+      emitter.emit("error", cause);
+    },
+  };
+}
 
 describe("windowsProcess", () => {
   afterEach(() => {
@@ -1997,6 +2034,234 @@ describe("windowsProcess", () => {
         clearWindowsCommandDiscoveryCache();
         rmSync(root, { force: true, recursive: true });
       }
+    });
+  });
+
+  describe("async Windows command discovery", () => {
+    const cwd = "C:\\projects\\synara";
+    const env = {
+      PATH: "C:\\tools",
+      PATHEXT: ".COM;.EXE;.BAT;.CMD",
+      SystemRoot: "C:\\Windows",
+    };
+
+    it("keeps the event loop responsive while where.exe is pending", async () => {
+      const resolvedCommand = "C:\\tools\\codex.cmd";
+      const execFile = vi.fn(
+        () =>
+          new Promise<{ stdout: string; status: number }>((resolve) => {
+            setTimeout(() => resolve({ stdout: `${resolvedCommand}\r\n`, status: 0 }), 20);
+          }),
+      );
+      let heartbeatFired = false;
+
+      const discovery = resolveWindowsCommandPathAsync("codex", {
+        platform: "win32",
+        cwd,
+        env,
+        execFile,
+      });
+      setTimeout(() => {
+        heartbeatFired = true;
+      }, 0);
+
+      await expect(discovery).resolves.toBe(resolvedCommand);
+      expect(heartbeatFired).toBe(true);
+      expect(execFile).toHaveBeenCalledTimes(1);
+    });
+
+    it("shares verified async results with synchronous consumers through the exact cache key", async () => {
+      const resolvedCommand = "C:\\tools\\node.exe";
+      const commandDiscoveryCache = createWindowsCommandDiscoveryCache();
+      const execFile = vi.fn(async () => ({
+        stdout: `${resolvedCommand}\r\n`,
+        status: 0,
+      }));
+      const spawnSync = vi.fn();
+
+      await expect(
+        resolveWindowsCommandCandidatesAsync("node", {
+          platform: "win32",
+          cwd,
+          env,
+          execFile,
+          commandDiscoveryCache,
+        }),
+      ).resolves.toEqual([resolvedCommand]);
+      expect(
+        resolveWindowsCommandCandidates("node", {
+          platform: "win32",
+          cwd,
+          env,
+          spawnSync,
+          commandDiscoveryCache,
+        }),
+      ).toEqual([resolvedCommand]);
+
+      expect(execFile).toHaveBeenCalledTimes(1);
+      expect(spawnSync).not.toHaveBeenCalled();
+    });
+
+    it("preserves the two-second negative cache without caching transient failures", async () => {
+      let now = 10_000;
+      const commandDiscoveryCache = createWindowsCommandDiscoveryCache({ now: () => now });
+      const notFound = vi.fn(async () => ({ stdout: "", status: 1 }));
+      const input = {
+        platform: "win32" as const,
+        cwd,
+        env,
+        execFile: notFound,
+        commandDiscoveryCache,
+      };
+
+      await expect(resolveWindowsCommandCandidatesAsync("missing", input)).resolves.toEqual([]);
+      await expect(resolveWindowsCommandCandidatesAsync("missing", input)).resolves.toEqual([]);
+      expect(notFound).toHaveBeenCalledTimes(1);
+
+      now += 1_999;
+      await expect(resolveWindowsCommandCandidatesAsync("missing", input)).resolves.toEqual([]);
+      expect(notFound).toHaveBeenCalledTimes(1);
+
+      now += 1;
+      await expect(resolveWindowsCommandCandidatesAsync("missing", input)).resolves.toEqual([]);
+      expect(notFound).toHaveBeenCalledTimes(2);
+
+      const transient = vi.fn(async () => ({
+        error: Object.assign(new Error("where.exe timed out"), { code: "ETIMEDOUT" }),
+        stdout: "",
+        status: null,
+      }));
+      const transientInput = {
+        ...input,
+        execFile: transient,
+        commandDiscoveryCache: createWindowsCommandDiscoveryCache(),
+      };
+      await expect(resolveWindowsCommandCandidatesAsync("codex", transientInput)).resolves.toEqual(
+        [],
+      );
+      await expect(resolveWindowsCommandCandidatesAsync("codex", transientInput)).resolves.toEqual(
+        [],
+      );
+      expect(transient).toHaveBeenCalledTimes(2);
+    });
+
+    it("uses stdout-only spawn transport and ignores unbounded stderr", async () => {
+      const resolvedCommand = "C:\\tools\\codex.cmd";
+      const mock = makeMockWhereChild();
+      const spawnProcess = vi.fn<SpawnProcess>(() => mock.child);
+
+      const discovery = resolveWindowsCommandPathAsync("codex", {
+        platform: "win32",
+        cwd,
+        env,
+        spawnProcess,
+      });
+      expect(mock.stderr.listenerCount("data")).toBe(0);
+      mock.stderr.write(Buffer.alloc(512 * 1024, 0x78));
+      mock.stdout.write(`${resolvedCommand}\r\n`);
+      mock.close(0);
+
+      await expect(discovery).resolves.toBe(resolvedCommand);
+      expect(spawnProcess).toHaveBeenCalledTimes(1);
+      expect(spawnProcess.mock.calls[0]?.[2]).toMatchObject({
+        shell: false,
+        stdio: ["ignore", "pipe", "ignore"],
+        windowsHide: true,
+      });
+      expect(mock.kill).not.toHaveBeenCalled();
+    });
+
+    it("kills stdout overflow but does not settle until the child closes", async () => {
+      const mock = makeMockWhereChild();
+      const spawnProcess = vi.fn<SpawnProcess>(() => mock.child);
+      let settled = false;
+      const discovery = resolveWindowsCommandCandidatesAsync("codex", {
+        platform: "win32",
+        cwd,
+        env,
+        spawnProcess,
+      }).finally(() => {
+        settled = true;
+      });
+
+      mock.stdout.write(Buffer.alloc(256 * 1024 + 1, 0x78));
+      await vi.waitFor(() => expect(mock.kill).toHaveBeenCalledTimes(1));
+      await Promise.resolve();
+      expect(settled).toBe(false);
+
+      mock.close(null);
+      await expect(discovery).resolves.toEqual([]);
+      expect(mock.kill).toHaveBeenNthCalledWith(1);
+    });
+
+    it("bounds timeout drain and escalates before returning a transient failure", async () => {
+      vi.useFakeTimers();
+      try {
+        const mock = makeMockWhereChild();
+        const spawnProcess = vi.fn<SpawnProcess>(() => mock.child);
+        let settled = false;
+        const discovery = resolveWindowsCommandCandidatesAsync("codex", {
+          platform: "win32",
+          cwd,
+          env,
+          spawnProcess,
+        }).finally(() => {
+          settled = true;
+        });
+
+        await vi.advanceTimersByTimeAsync(2_000);
+        expect(mock.kill).toHaveBeenNthCalledWith(1);
+        expect(settled).toBe(false);
+        await vi.advanceTimersByTimeAsync(250);
+        expect(mock.kill).toHaveBeenNthCalledWith(2, "SIGKILL");
+        expect(settled).toBe(false);
+        await vi.advanceTimersByTimeAsync(250);
+        await expect(discovery).resolves.toEqual([]);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("caches numeric not-found exits from spawn transport", async () => {
+      const mock = makeMockWhereChild();
+      const spawnProcess = vi.fn<SpawnProcess>(() => mock.child);
+      const commandDiscoveryCache = createWindowsCommandDiscoveryCache();
+      const input = {
+        platform: "win32" as const,
+        cwd,
+        env,
+        spawnProcess,
+        commandDiscoveryCache,
+      };
+
+      const first = resolveWindowsCommandCandidatesAsync("missing", input);
+      mock.close(1);
+      await expect(first).resolves.toEqual([]);
+      await expect(resolveWindowsCommandCandidatesAsync("missing", input)).resolves.toEqual([]);
+      expect(spawnProcess).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not cache spawn transport errors", async () => {
+      const firstMock = makeMockWhereChild();
+      const secondMock = makeMockWhereChild();
+      const children = [firstMock, secondMock];
+      const spawnProcess = vi.fn<SpawnProcess>(() => children.shift()!.child);
+      const commandDiscoveryCache = createWindowsCommandDiscoveryCache();
+      const input = {
+        platform: "win32" as const,
+        cwd,
+        env,
+        spawnProcess,
+        commandDiscoveryCache,
+      };
+
+      const first = resolveWindowsCommandCandidatesAsync("codex", input);
+      firstMock.error(new Error("where.exe failed to spawn"));
+      await expect(first).resolves.toEqual([]);
+      const second = resolveWindowsCommandCandidatesAsync("codex", input);
+      secondMock.error(new Error("where.exe failed to spawn again"));
+      await expect(second).resolves.toEqual([]);
+      expect(spawnProcess).toHaveBeenCalledTimes(2);
     });
   });
 

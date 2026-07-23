@@ -4,6 +4,7 @@
 // Exports: Vitest coverage for apps/server/src/provider/claudeProcessEnv.ts.
 import nodePath from "node:path";
 
+import { readEffectiveWindowsEnvironmentValue } from "@synara/shared/windowsProcess";
 import { describe, it, assert } from "@effect/vitest";
 
 import {
@@ -36,6 +37,7 @@ describe("claudeProcessEnv", () => {
     assert.equal(result.ANTHROPIC_API_KEY, undefined);
     assert.equal(result.ANTHROPIC_AUTH_TOKEN, undefined);
     assert.equal(result.CLAUDE_CODE_OAUTH_TOKEN, undefined);
+    assert.equal(result.DISABLE_AUTOUPDATER, "1");
     assert.equal(env.ANTHROPIC_API_KEY, "stale-api-key");
   });
 
@@ -48,6 +50,78 @@ describe("claudeProcessEnv", () => {
     });
 
     assert.equal(result.ANTHROPIC_API_KEY, "api-key-auth");
+    assert.equal(result.DISABLE_AUTOUPDATER, "1");
+  });
+
+  it("overrides inherited updater settings without mutating the source environment", () => {
+    const env = {
+      DISABLE_AUTOUPDATER: "0",
+    };
+    const result = buildClaudeProcessEnv({
+      env,
+      hasClaudeCliCredentials: false,
+      platform: "linux",
+    });
+
+    assert.equal(result.DISABLE_AUTOUPDATER, "1");
+    assert.equal(env.DISABLE_AUTOUPDATER, "0");
+  });
+
+  it("normalizes mixed-case Windows updater keys to the process-local override", () => {
+    const result = buildClaudeProcessEnv({
+      env: {
+        Disable_AutoUpdater: "0",
+      },
+      hasClaudeCliCredentials: false,
+      platform: "win32",
+    });
+
+    assert.equal(result.DISABLE_AUTOUPDATER, "1");
+    assert.equal(result.Disable_AutoUpdater, undefined);
+  });
+
+  it("removes mixed-case Windows direct credentials when local OAuth is usable", () => {
+    const env = {
+      anthropic_api_key: "stale-api-key",
+      Anthropic_Auth_Token: "stale-auth-token",
+      claude_code_oauth_token: "stale-oauth-token",
+      Path: "C:\\Windows",
+    };
+
+    const result = buildClaudeProcessEnv({
+      env,
+      hasClaudeCliCredentials: true,
+      platform: "win32",
+    });
+
+    assert.equal(readEffectiveWindowsEnvironmentValue(result, "ANTHROPIC_API_KEY"), undefined);
+    assert.equal(readEffectiveWindowsEnvironmentValue(result, "ANTHROPIC_AUTH_TOKEN"), undefined);
+    assert.equal(
+      readEffectiveWindowsEnvironmentValue(result, "CLAUDE_CODE_OAUTH_TOKEN"),
+      undefined,
+    );
+    assert.equal(readEffectiveWindowsEnvironmentValue(result, "PATH"), "C:\\Windows");
+    assert.equal(env.anthropic_api_key, "stale-api-key");
+  });
+
+  it("recognizes mixed-case Windows external auth before applying OAuth isolation", () => {
+    const result = buildClaudeProcessEnv({
+      env: {
+        anthropic_api_key: "proxy-api-key",
+        anthropic_base_url: "https://anthropic-proxy.example.test",
+      },
+      hasClaudeCliCredentials: true,
+      platform: "win32",
+    });
+
+    assert.equal(
+      readEffectiveWindowsEnvironmentValue(result, "ANTHROPIC_API_KEY"),
+      "proxy-api-key",
+    );
+    assert.equal(
+      readEffectiveWindowsEnvironmentValue(result, "ANTHROPIC_BASE_URL"),
+      "https://anthropic-proxy.example.test",
+    );
   });
 
   it("does not grant Synara control-plane authority to Claude", () => {

@@ -196,16 +196,29 @@ async function assertWorkspaceAncestorsAreIsolated(workspaceDir: string): Promis
   }
 }
 
-function quoteCmdArgument(value: string): string {
-  return `"${value.replaceAll('"', '""')}"`;
-}
-
 function quotePosixArgument(value: string): string {
   return `'${value.replaceAll("'", `'\\''`)}'`;
 }
 
+const FAKE_CODEX_PACKAGE_TARGET = "node_modules/@synara/desktop-e2e/fake-codex-runtime.mjs";
+
+export function windowsFakeCodexLauncherContents(): string {
+  const target = FAKE_CODEX_PACKAGE_TARGET.replaceAll("/", "\\");
+  return [
+    '@if exist "%~dp0\\node.exe" (',
+    `  "%~dp0\\node.exe" "%~dp0\\${target}" %*`,
+    ") else (",
+    "  @setlocal",
+    "  @set PATHEXT=%PATHEXT:;.JS;=;%",
+    `  node "%~dp0\\${target}" %*`,
+    ")",
+    "",
+  ].join("\r\n");
+}
+
 async function buildFakeCodexRuntime(runtimeDir: string): Promise<string> {
-  const outputPath = Path.join(runtimeDir, "fake-codex-runtime.mjs");
+  const outputPath = Path.join(runtimeDir, "fake-codex", ...FAKE_CODEX_PACKAGE_TARGET.split("/"));
+  await FS.promises.mkdir(Path.dirname(outputPath), { recursive: true });
   const result = spawnSync(
     BUN_RUNTIME_COMMAND,
     ["build", FAKE_CODEX_SOURCE_PATH, "--target=node", "--format=esm", "--outfile", outputPath],
@@ -238,13 +251,7 @@ async function createFakeCodexLauncher(
   await FS.promises.mkdir(fakeCodexHome, { recursive: true });
   if (process.platform === "win32") {
     const launcherPath = Path.join(launcherDir, "codex.cmd");
-    const contents = [
-      "@echo off",
-      `${quoteCmdArgument(NODE_RUNTIME_COMMAND)} ${quoteCmdArgument(fakeCodexRuntimePath)} %*`,
-      "exit /b %errorlevel%",
-      "",
-    ].join("\r\n");
-    await FS.promises.writeFile(launcherPath, contents, "utf8");
+    await FS.promises.writeFile(launcherPath, windowsFakeCodexLauncherContents(), "utf8");
     return launcherPath;
   }
 
@@ -613,7 +620,7 @@ export class DesktopHarness {
       });
       const fakeCodexRuntimePath = await buildFakeCodexRuntime(harness.operationalDir);
       await FS.promises.writeFile(
-        Path.join(harness.operationalDir, "fake-codex-config.json"),
+        Path.join(Path.dirname(fakeCodexRuntimePath), "fake-codex-config.json"),
         `${JSON.stringify({
           invocationLogPath: harness.invocationLogPath,
           networkGuardPath: harness.networkGuardPath,

@@ -59,7 +59,7 @@ import { appendFileAttachmentsPromptBlock } from "../attachmentProjection.ts";
 import { loadProviderPromptImageBlocks } from "../promptAttachments.ts";
 import {
   isWindowsJobPreparedCommand,
-  prepareWindowsProviderProcess,
+  prepareWindowsProviderProcessAsync,
 } from "../windowsProviderProcess.ts";
 import {
   installPreparedEffectProcessSupervisor,
@@ -249,12 +249,18 @@ export function makeGrokModelListChildProcess(
   } as ChildProcess.CommandOptions & { readonly synaraExternallySupervised?: true });
 }
 
+type PrepareGrokProcess = (
+  ...args: Parameters<typeof prepareWindowsProviderProcessAsync>
+) =>
+  | Awaited<ReturnType<typeof prepareWindowsProviderProcessAsync>>
+  | ReturnType<typeof prepareWindowsProviderProcessAsync>;
+
 export interface GrokAdapterLiveOptions {
   readonly nativeEventLogPath?: string;
   readonly nativeEventLogger?: EventNdjsonLogger;
   readonly closeSessionScope?: (scope: Scope.Closeable) => Effect.Effect<void>;
   readonly maintenanceOwnedResources?: ProviderMaintenanceOwnedResourceCoordinator;
-  readonly prepareProcess?: typeof prepareWindowsProviderProcess;
+  readonly prepareProcess?: PrepareGrokProcess;
   readonly superviseProcess?: typeof supervisePreparedEffectProcess;
 }
 
@@ -2215,11 +2221,23 @@ export function makeGrokAdapter(
         let apiError: ProviderAdapterRequestError | undefined;
         const cliModels = yield* Effect.gen(function* () {
           const childEnv = buildProviderChildEnvironment({ provider: "grok" });
-          const prepared = (options?.prepareProcess ?? prepareWindowsProviderProcess)(
-            binaryPath,
-            ["models"],
-            { env: childEnv },
-          );
+          const prepared = yield* Effect.tryPromise({
+            try: () =>
+              Promise.resolve(
+                (options?.prepareProcess ?? prepareWindowsProviderProcessAsync)(
+                  binaryPath,
+                  ["--no-auto-update", "models"],
+                  { env: childEnv },
+                ),
+              ),
+            catch: (cause) =>
+              new ProviderAdapterRequestError({
+                provider: PROVIDER,
+                method: "model/list",
+                detail: "Failed to prepare the Grok model discovery process.",
+                cause,
+              }),
+          });
           const owned = yield* Effect.uninterruptible(
             Effect.gen(function* () {
               const child = yield* childProcessSpawner.spawn(

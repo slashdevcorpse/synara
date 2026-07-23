@@ -3,23 +3,49 @@
 // Layer: Shared Node runtime utility
 // Exports: command resolution plus safe spawn/spawnSync argument preparation.
 
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import * as Path from "node:path";
+
+type WindowsWhereResult = {
+  readonly stdout?: string | null;
+  readonly status?: number | null;
+  readonly error?: Error | undefined;
+};
+
+type WindowsWhereOptions = {
+  cwd?: string;
+  env?: NodeJS.ProcessEnv;
+  encoding: "utf8";
+  shell: false;
+  stdio: ["ignore", "pipe", "ignore"];
+  maxBuffer: number;
+  timeout: number;
+  windowsHide: true;
+};
 
 type SpawnSyncLike = (
   command: string,
   args: ReadonlyArray<string>,
+  options: WindowsWhereOptions,
+) => WindowsWhereResult;
+
+type ExecFileLike = (
+  command: string,
+  args: ReadonlyArray<string>,
+  options: WindowsWhereOptions,
+) => Promise<WindowsWhereResult>;
+
+type SpawnLike = (
+  command: string,
+  args: ReadonlyArray<string>,
   options: {
-    cwd?: string;
-    env?: NodeJS.ProcessEnv;
-    encoding: "utf8";
-    shell: false;
-    stdio: ["ignore", "pipe", "ignore"];
-    maxBuffer: number;
-    timeout: number;
-    windowsHide: true;
+    readonly cwd?: string | undefined;
+    readonly env?: NodeJS.ProcessEnv | undefined;
+    readonly shell: false;
+    readonly stdio: ["ignore", "pipe", "ignore"];
+    readonly windowsHide: true;
   },
-) => { stdout?: string | null; status?: number | null; error?: Error | undefined };
+) => ReturnType<typeof spawn>;
 
 export type WindowsCommandDiscoveryOutcome = "resolved" | "not_found" | "transient_failure";
 
@@ -56,6 +82,11 @@ export interface WindowsSafeProcessInput {
     | undefined;
 }
 
+export interface WindowsAsyncCommandDiscoveryInput extends WindowsSafeProcessInput {
+  readonly execFile?: ExecFileLike | undefined;
+  readonly spawnProcess?: SpawnLike | undefined;
+}
+
 export interface WindowsSafeProcessCommand {
   readonly command: string;
   readonly args: string[];
@@ -70,6 +101,8 @@ const WINDOWS_PATH_SEPARATOR_PATTERN = /[\\/]/;
 const WINDOWS_BATCH_UNSAFE_TOKEN_PATTERN = /[\r\n&|<>^%]/;
 const WHERE_TIMEOUT_MS = 2_000;
 const WHERE_STDOUT_MAX_BYTES = 256 * 1024;
+const WHERE_TERMINATION_GRACE_MS = 250;
+const WHERE_FORCE_CLOSE_GRACE_MS = 250;
 const WINDOWS_COMMAND_DISCOVERY_POSITIVE_TTL_MS = 30_000;
 const WINDOWS_COMMAND_DISCOVERY_NEGATIVE_TTL_MS = 2_000;
 const WINDOWS_COMMAND_DISCOVERY_CACHE_MAX_ENTRIES = 256;
@@ -468,7 +501,7 @@ function isMalformedWindowsWhereCandidate(candidate: string): boolean {
   return !Path.win32.isAbsolute(candidate) || /[\u0000-\u001f]/.test(candidate);
 }
 
-function classifyWindowsWhereResult(result: ReturnType<SpawnSyncLike>): WindowsCommandDiscovery {
+function classifyWindowsWhereResult(result: WindowsWhereResult): WindowsCommandDiscovery {
   if (result.error || typeof result.stdout !== "string") {
     return { outcome: "transient_failure", candidates: [] };
   }
@@ -502,6 +535,7 @@ function observeWindowsCommandDiscovery(
 
 function selectWindowsCommandDiscoveryCache(
   input: WindowsSafeProcessInput,
+  hasInjectedLauncher: boolean,
 ): WindowsCommandDiscoveryCache | undefined {
   if (input.commandDiscoveryCache) {
     return input.commandDiscoveryCache;
@@ -509,7 +543,7 @@ function selectWindowsCommandDiscoveryCache(
   // Injected process launchers are generally test- or caller-specific. They do
   // not share process cache state unless the caller explicitly supplies an
   // isolated cache created by this module.
-  return input.spawnSync ? undefined : processWindowsCommandDiscoveryCache;
+  return hasInjectedLauncher ? undefined : processWindowsCommandDiscoveryCache;
 }
 
 function discoverWindowsCommandCandidates(
@@ -518,7 +552,7 @@ function discoverWindowsCommandCandidates(
   env: NodeJS.ProcessEnv,
   cwd: string,
 ): WindowsCommandDiscovery {
-  const cache = selectWindowsCommandDiscoveryCache(input);
+  const cache = selectWindowsCommandDiscoveryCache(input, input.spawnSync !== undefined);
   const cacheKey = cache
     ? buildWindowsCommandDiscoveryCacheKey(command, input, env, cwd)
     : undefined;
@@ -554,6 +588,175 @@ function discoverWindowsCommandCandidates(
   return discovery;
 }
 
+function executeWindowsWhere(
+  command: string,
+  args: ReadonlyArray<string>,
+  options: WindowsWhereOptions,
+  launchProcess: SpawnLike = (spawnCommand, spawnArgs, spawnOptions) =>
+    spawn(spawnCommand, [...spawnArgs], spawnOptions),
+): Promise<WindowsWhereResult> {
+  return new Promise((resolve) => {
+    let settled = false;
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    let terminationDeadline: ReturnType<typeof setTimeout> | undefined;
+    let forceCloseDeadline: ReturnType<typeof setTimeout> | undefined;
+    const terminalErrors: Error[] = [];
+    const stdoutChunks: Buffer[] = [];
+    let stdoutBytes = 0;
+    const complete = (result: WindowsWhereResult): void => {
+      if (settled) return;
+      settled = true;
+      if (deadline) clearTimeout(deadline);
+      if (terminationDeadline) clearTimeout(terminationDeadline);
+      if (forceCloseDeadline) clearTimeout(forceCloseDeadline);
+      resolve(result);
+    };
+    const capturedStdout = (): string => Buffer.concat(stdoutChunks, stdoutBytes).toString("utf8");
+    const terminalError = (): Error =>
+      terminalErrors.length === 1
+        ? terminalErrors[0]!
+        : new AggregateError(terminalErrors, "where.exe discovery did not terminate cleanly.");
+
+    try {
+      const child = launchProcess(command, args, {
+        cwd: options.cwd,
+        env: options.env,
+        shell: options.shell,
+        stdio: options.stdio,
+        windowsHide: options.windowsHide,
+      });
+      const requestTermination = (error: Error): void => {
+        if (settled || terminalErrors.length > 0) return;
+        terminalErrors.push(error);
+        if (deadline) clearTimeout(deadline);
+        try {
+          if (!child.kill()) {
+            terminalErrors.push(new Error("where.exe did not accept the termination request."));
+          }
+        } catch (cause) {
+          terminalErrors.push(
+            cause instanceof Error ? cause : new Error("where.exe termination failed.", { cause }),
+          );
+        }
+        if (settled) return;
+        terminationDeadline = setTimeout(() => {
+          try {
+            if (!child.kill("SIGKILL")) {
+              terminalErrors.push(
+                new Error("where.exe did not accept the forced termination request."),
+              );
+            }
+          } catch (cause) {
+            terminalErrors.push(
+              cause instanceof Error
+                ? cause
+                : new Error("where.exe forced termination failed.", { cause }),
+            );
+          }
+          if (settled) return;
+          forceCloseDeadline = setTimeout(() => {
+            terminalErrors.push(
+              new Error("where.exe did not emit close after forced termination."),
+            );
+            complete({ stdout: capturedStdout(), status: null, error: terminalError() });
+          }, WHERE_FORCE_CLOSE_GRACE_MS);
+          forceCloseDeadline.unref();
+        }, WHERE_TERMINATION_GRACE_MS);
+        terminationDeadline.unref();
+      };
+      child.stdout?.on("data", (chunk: Buffer | string) => {
+        if (settled || terminalErrors.length > 0) return;
+        const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        if (bytes.byteLength > options.maxBuffer - stdoutBytes) {
+          requestTermination(
+            Object.assign(new Error("where.exe stdout exceeded the discovery limit."), {
+              code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
+            }),
+          );
+          return;
+        }
+        stdoutBytes += bytes.byteLength;
+        stdoutChunks.push(bytes);
+      });
+      child.stdout?.once("error", (error) => {
+        requestTermination(error);
+      });
+      child.once("error", (error) => {
+        if (terminalErrors.length > 0) {
+          terminalErrors.push(error);
+          return;
+        }
+        complete({ stdout: capturedStdout(), status: null, error });
+      });
+      child.once("close", (status) => {
+        complete({
+          stdout: capturedStdout(),
+          status,
+          ...(terminalErrors.length > 0 ? { error: terminalError() } : {}),
+        });
+      });
+      deadline = setTimeout(() => {
+        requestTermination(
+          Object.assign(new Error("where.exe discovery timed out."), {
+            code: "ETIMEDOUT",
+          }),
+        );
+      }, options.timeout);
+      deadline.unref();
+    } catch (cause) {
+      complete({
+        stdout: capturedStdout(),
+        status: null,
+        error: cause instanceof Error ? cause : new Error("Failed to launch where.exe.", { cause }),
+      });
+    }
+  });
+}
+
+async function discoverWindowsCommandCandidatesAsync(
+  command: string,
+  input: WindowsAsyncCommandDiscoveryInput,
+  env: NodeJS.ProcessEnv,
+  cwd: string,
+): Promise<WindowsCommandDiscovery> {
+  const cache = selectWindowsCommandDiscoveryCache(
+    input,
+    input.execFile !== undefined || input.spawnProcess !== undefined,
+  );
+  const cacheKey = cache
+    ? buildWindowsCommandDiscoveryCacheKey(command, input, env, cwd)
+    : undefined;
+  if (cache && cacheKey) {
+    const cached = readWindowsCommandDiscoveryCache(cache, cacheKey);
+    if (cached) {
+      observeWindowsCommandDiscovery(input, cached, "cache");
+      return cached;
+    }
+  }
+
+  const whereCommand = resolveWindowsWhereExe(env, cwd);
+  const whereArgs = [command];
+  const whereOptions: WindowsWhereOptions = {
+    cwd,
+    env,
+    encoding: "utf8",
+    shell: false,
+    stdio: ["ignore", "pipe", "ignore"],
+    maxBuffer: WHERE_STDOUT_MAX_BYTES,
+    timeout: WHERE_TIMEOUT_MS,
+    windowsHide: true,
+  };
+  const result = input.execFile
+    ? await input.execFile(whereCommand, whereArgs, whereOptions)
+    : await executeWindowsWhere(whereCommand, whereArgs, whereOptions, input.spawnProcess);
+  const discovery = classifyWindowsWhereResult(result);
+  observeWindowsCommandDiscovery(input, discovery, "where");
+  if (cache && cacheKey && discovery.outcome !== "transient_failure") {
+    writeWindowsCommandDiscoveryCache(cache, cacheKey, discovery);
+  }
+  return discovery;
+}
+
 // Return every where.exe result in PATH order after applying the same
 // current-directory protection used by resolveWindowsCommandPath. Consumers
 // with command-specific precedence rules can inspect the full list without
@@ -577,6 +780,25 @@ export function resolveWindowsCommandCandidates(
     : candidates.filter((candidate) => !isFromCurrentDirectory(candidate, cwd));
 }
 
+export async function resolveWindowsCommandCandidatesAsync(
+  command: string,
+  input: WindowsAsyncCommandDiscoveryInput = {},
+): Promise<string[]> {
+  const pathLikeCommand = isPathLikeCommand(command);
+  if (pathLikeCommand && hasWindowsExecutableExtension(command)) {
+    observeWindowsCommandDiscovery(input, { outcome: "resolved", candidates: [command] }, "bypass");
+    return [command];
+  }
+
+  const env = normalizeWindowsChildEnvironment(input.env ?? process.env);
+  const cwd = input.cwd ?? process.cwd();
+  const discovery = await discoverWindowsCommandCandidatesAsync(command, input, env, cwd);
+  const candidates = [...discovery.candidates];
+  return pathLikeCommand
+    ? candidates
+    : candidates.filter((candidate) => !isFromCurrentDirectory(candidate, cwd));
+}
+
 // Resolve PATH/PATHEXT commands through where.exe so `.cmd` shims can be wrapped
 // explicitly. Prefer candidates that native spawn can execute or that we can
 // wrap, and skip current-directory hits for PATH commands to avoid restoring
@@ -590,6 +812,20 @@ export function resolveWindowsCommandPath(
     return command;
   }
   return selectWindowsCommandCandidate(resolveWindowsCommandCandidates(command, input)) ?? command;
+}
+
+export async function resolveWindowsCommandPathAsync(
+  command: string,
+  input: WindowsAsyncCommandDiscoveryInput = {},
+): Promise<string> {
+  const pathLikeCommand = isPathLikeCommand(command);
+  if (pathLikeCommand && hasWindowsExecutableExtension(command)) {
+    return command;
+  }
+  return (
+    selectWindowsCommandCandidate(await resolveWindowsCommandCandidatesAsync(command, input)) ??
+    command
+  );
 }
 
 export function prepareWindowsSafeProcess(

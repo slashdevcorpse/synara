@@ -19,6 +19,7 @@ import { SYNARA_CODEX_HOME_OVERLAY_DIR } from "../../codexHomePaths";
 import { ServerConfig } from "../../config";
 import { ServerSettingsService } from "../../serverSettings";
 import type { ProcessTreeKiller } from "../../terminal/processTreeKiller.ts";
+import { ANTIGRAVITY_WINDOWS_UNAVAILABLE_MESSAGE } from "../antigravityAvailability.ts";
 import { ProviderHealth } from "../Services/ProviderHealth";
 import { ProviderService, type ProviderServiceShape } from "../Services/ProviderService";
 import {
@@ -48,10 +49,12 @@ import {
   makeCheckCommandCodeProviderStatus as makeProductionCheckCommandCodeProviderStatus,
   makeCheckCodexProviderStatus as makeProductionCheckCodexProviderStatus,
   makeCheckCursorProviderStatus as makeProductionCheckCursorProviderStatus,
+  makeCheckDroidProviderStatus as makeProductionCheckDroidProviderStatus,
   makeCheckGrokProviderStatus as makeProductionCheckGrokProviderStatus,
   makeCheckKiloProviderStatus as makeProductionCheckKiloProviderStatus,
   makeCheckOpenCodeProviderStatus as makeProductionCheckOpenCodeProviderStatus,
   makeProviderHealthLive as makeProductionProviderHealthLive,
+  buildProviderUpdateProcessEnv,
   parseAuthStatusFromOutput,
   parseClaudeAuthStatusFromOutput,
   parseCommandCodeStatusJson,
@@ -69,7 +72,6 @@ import {
   isWindowsJobPreparedCommand,
   prepareResolvedWindowsProviderProcess,
   prepareWindowsProviderProcess,
-  WINDOWS_JOB_LAUNCHER_ENV,
   WINDOWS_JOB_LAUNCHER_EXECUTABLE,
   WINDOWS_JOB_LAUNCHER_PROTOCOL_VERSION,
 } from "../windowsProviderProcess.ts";
@@ -1511,6 +1513,27 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
   });
 
   describe("provider update commands", () => {
+    it("keeps Droid runtime-only update suppression out of maintenance environments", () => {
+      const env = buildProviderUpdateProcessEnv({
+        provider: "droid",
+        platform: "win32",
+        pathPrepend: "C:\\Factory\\bin",
+        baseEnv: {
+          PATH: "C:\\Windows\\System32",
+          FACTORY_API_KEY: "factory-secret",
+          Factory_Droid_Auto_Update_Enabled: "false",
+          OpenAi_Api_Key: "unrelated-openai-secret",
+        },
+      });
+
+      assert.strictEqual(env.PATH, "C:\\Factory\\bin;C:\\Windows\\System32");
+      assert.strictEqual(env.FACTORY_API_KEY, "factory-secret");
+      assert.ok(
+        !Object.keys(env).some((key) => key.toUpperCase() === "FACTORY_DROID_AUTO_UPDATE_ENABLED"),
+      );
+      assert.ok(!Object.keys(env).some((key) => key.toUpperCase() === "OPENAI_API_KEY"));
+    });
+
     it.effect.skipIf(process.platform !== "win32")(
       "launches Windows npm updates as node.exe plus npm-cli.js without cmd.exe",
       () =>
@@ -2347,6 +2370,37 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
         ]);
         assert.strictEqual(capabilities.update.lockKey, "npm-global:/Users/test/.npm");
       }
+    });
+
+    it("updates absolute native Windows Droid executables without translating them to npm", () => {
+      const definition = PACKAGE_MANAGED_PROVIDER_UPDATES.droid;
+      assert.ok(definition);
+      for (const extension of ["exe", "com"]) {
+        const binaryPath = `C:\\Users\\Test\\bin\\droid.${extension}`;
+        const capabilities = resolvePackageManagedProviderMaintenance(definition, {
+          platform: "win32",
+          binaryPath,
+          realCommandPath: binaryPath,
+          canonicalInstallRoot: "C:\\Users\\Test\\bin",
+          managerExecutablePath: binaryPath,
+          realManagerExecutablePath: binaryPath,
+        });
+
+        assert.strictEqual(capabilities.packageName, "droid");
+        assert.ok(capabilities.update);
+        assert.strictEqual(capabilities.update.executable, binaryPath);
+        assert.deepStrictEqual(capabilities.update.args, ["update"]);
+        assert.strictEqual(capabilities.update.lockKey, "droid-native:c:/users/test/bin");
+        assert.strictEqual(capabilities.update.target.installSource, "native");
+      }
+
+      const unresolved = resolvePackageManagedProviderMaintenance(definition, {
+        platform: "win32",
+        binaryPath: "droid.exe",
+        realCommandPath: "droid.exe",
+        commandDirectory: "C:\\Users\\Test\\bin",
+      });
+      assert.strictEqual(unresolved.update, null);
     });
 
     it("updates npm-managed Kilo through its matching package manager and PATH", () => {
@@ -4594,45 +4648,65 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
       ),
     );
 
-    it.effect("propagates verbatim Windows arguments through the Effect command", () => {
+    it.effect("launches a canonical Windows npm shim directly without cmd.exe", () => {
       const platform = vi.spyOn(process, "platform", "get").mockReturnValue("win32");
       return Effect.gen(function* () {
-        const fileSystem = yield* FileSystem.FileSystem;
-        const path = yield* Path.Path;
-        const { tmpDir } = yield* withTempCodexHome();
-        const launcherPath = path.join(tmpDir, WINDOWS_JOB_LAUNCHER_EXECUTABLE);
-        yield* fileSystem.writeFileString(launcherPath, "");
-        yield* Effect.acquireRelease(
-          Effect.sync(() => {
-            const previous = process.env[WINDOWS_JOB_LAUNCHER_ENV];
-            process.env[WINDOWS_JOB_LAUNCHER_ENV] = launcherPath;
-            return previous;
-          }),
-          (previous) =>
-            Effect.sync(() => {
-              if (previous === undefined) {
-                delete process.env[WINDOWS_JOB_LAUNCHER_ENV];
-              } else {
-                process.env[WINDOWS_JOB_LAUNCHER_ENV] = previous;
-              }
+        yield* withTempCodexHome();
+        const launcherPath = `/synara/${WINDOWS_JOB_LAUNCHER_EXECUTABLE}`;
+        const shimPath = "C:\\Users\\Test\\AppData\\Roaming\\npm\\codex.cmd";
+        const nodePath = "C:\\Users\\Test\\AppData\\Roaming\\npm\\node.exe";
+        const packageTargetPath =
+          "C:\\Users\\Test\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\bin\\codex.js";
+        const existingFiles = new Set([shimPath, nodePath, packageTargetPath]);
+        const shimContents = [
+          "@ECHO off",
+          "GOTO start",
+          ":find_dp0",
+          "SET dp0=%~dp0",
+          "EXIT /b",
+          ":start",
+          "SETLOCAL",
+          "CALL :find_dp0",
+          "",
+          'IF EXIST "%dp0%\\node.exe" (',
+          '  SET "_prog=%dp0%\\node.exe"',
+          ") ELSE (",
+          '  SET "_prog=node"',
+          "  SET PATHEXT=%PATHEXT:;.JS;=;%",
+          ")",
+          "",
+          'endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\\node_modules\\@openai\\codex\\bin\\codex.js" %*',
+        ].join("\r\n");
+        const status = yield* makeProductionCheckCodexProviderStatus(shimPath, undefined, {
+          ...TEST_PROVIDER_LAYER_PROCESS_OPTIONS,
+          platform: "win32",
+          prepareResolvedProcess: (command, args, options = {}) =>
+            prepareResolvedWindowsProviderProcess(command, args, {
+              ...options,
+              platform: "win32",
+              launcherPath,
+              fileExists: (path) =>
+                existingFiles.has(path) ||
+                path.toLowerCase().endsWith(WINDOWS_JOB_LAUNCHER_EXECUTABLE),
+              readFileString: (path) => (path === shimPath ? shimContents : undefined),
+              realPath: (path) => path,
             }),
-        );
-        const status = yield* makeProductionCheckCodexProviderStatus(
-          "C:\\tools(x86)\\codex.cmd",
-          undefined,
-          { ...TEST_PROVIDER_LAYER_PROCESS_OPTIONS, platform: "win32" },
-        );
+        });
         assert.strictEqual(status.status, "ready");
       }).pipe(
         Effect.provide(
           mockSpawnerLayer((args, command, _env, options) => {
-            assert.strictEqual(command.toLowerCase(), "c:\\windows\\system32\\cmd.exe");
-            assert.strictEqual(options?.windowsVerbatimArguments, true);
-            const commandLine = args.at(-1) ?? "";
-            if (commandLine.includes('"--version"')) {
+            assert.ok(command.toLowerCase().endsWith("\\node.exe"));
+            assert.strictEqual(options?.windowsVerbatimArguments, undefined);
+            assert.ok(
+              args[0]?.toLowerCase().endsWith("\\node_modules\\@openai\\codex\\bin\\codex.js"),
+            );
+            const providerArgs = args.slice(1);
+            assert.ok(!args.join(" ").toLowerCase().includes("cmd.exe"));
+            if (providerArgs.join(" ") === "--version") {
               return { stdout: "codex 1.0.0\n", stderr: "", code: 0 };
             }
-            if (commandLine.includes('"login" "status"')) {
+            if (providerArgs.join(" ") === "login status") {
               return { stdout: "Logged in\n", stderr: "", code: 0 };
             }
             throw new Error(`Unexpected args: ${args.join(" ")}`);
@@ -5536,6 +5610,8 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
         }).pipe(
           Effect.provide(
             mockSpawnerLayer((args, command, env, options) => {
+              assert.ok(env);
+              assert.strictEqual(env.OPENCODE_DISABLE_AUTOUPDATE, "1");
               assertPreparedProviderCommand({
                 fixture,
                 executable: "opencode",
@@ -5548,6 +5624,46 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
               return { stdout: "opencode 1.3.17\n", stderr: "", code: 0 };
             }),
           ),
+        ),
+      ),
+    );
+
+    it.effect("uses a safe absolute PowerShell shell during Windows health probes", () =>
+      Effect.gen(function* () {
+        const binaryPath = "C:\\Tools\\opencode.exe";
+        const status = yield* makeProductionCheckOpenCodeProviderStatus(binaryPath, {
+          ...TEST_PROVIDER_PROCESS_OPTIONS,
+          platform: "win32",
+          prepareProcess: (command, args) => ({
+            command,
+            args: [...args],
+            shell: false,
+          }),
+        });
+        assert.strictEqual(status.status, "ready");
+      }).pipe(
+        Effect.provide(
+          mockSpawnerLayer((args, command, env) => {
+            assert.ok(env);
+            assert.strictEqual(command, "C:\\Tools\\opencode.exe");
+            assert.deepStrictEqual(args, ["--version"]);
+            assert.strictEqual(env.OPENCODE_DISABLE_AUTOUPDATE, "1");
+            const config = JSON.parse(env.OPENCODE_CONFIG_CONTENT ?? "{}") as {
+              shell?: unknown;
+            };
+            assert.strictEqual(typeof config.shell, "string");
+            assert.ok(NodePath.win32.isAbsolute(String(config.shell)));
+            assert.ok(
+              ["powershell.exe", "pwsh.exe"].includes(
+                NodePath.win32.basename(String(config.shell)).toLowerCase(),
+              ),
+            );
+            assert.notStrictEqual(
+              NodePath.win32.basename(String(config.shell)).toLowerCase(),
+              "cmd.exe",
+            );
+            return { stdout: "opencode 1.3.17\n", stderr: "", code: 0 };
+          }),
         ),
       ),
     );
@@ -5590,11 +5706,56 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
         assert.strictEqual(status.status, "ready");
       }).pipe(
         Effect.provide(
-          mockSpawnerLayer((args, command) => {
+          mockSpawnerLayer((args, command, env) => {
+            assert.ok(env);
             assert.strictEqual(command, configuredTestBinary("kilo"));
+            assert.deepStrictEqual(JSON.parse(env.KILO_CONFIG_CONTENT ?? ""), {
+              autoupdate: false,
+            });
             const joined = args.join(" ");
             if (joined === "--version") return { stdout: "kilo 7.2.52\n", stderr: "", code: 0 };
             throw new Error(`Unexpected args: ${joined}`);
+          }),
+        ),
+      ),
+    );
+
+    it.effect("forces safe Windows Kilo health configuration", () =>
+      Effect.gen(function* () {
+        const binaryPath = "C:\\Tools\\kilo.exe";
+        const status = yield* makeProductionCheckKiloProviderStatus(binaryPath, {
+          ...TEST_PROVIDER_PROCESS_OPTIONS,
+          platform: "win32",
+          prepareProcess: (command, args) => ({
+            command,
+            args: [...args],
+            shell: false,
+          }),
+        });
+        assert.strictEqual(status.status, "ready");
+      }).pipe(
+        Effect.provide(
+          mockSpawnerLayer((args, command, env) => {
+            assert.ok(env);
+            assert.strictEqual(command, "C:\\Tools\\kilo.exe");
+            assert.deepStrictEqual(args, ["--version"]);
+            const config = JSON.parse(env.KILO_CONFIG_CONTENT ?? "{}") as {
+              autoupdate?: unknown;
+              shell?: unknown;
+            };
+            assert.strictEqual(config.autoupdate, false);
+            assert.strictEqual(typeof config.shell, "string");
+            assert.ok(NodePath.win32.isAbsolute(String(config.shell)));
+            assert.ok(
+              ["powershell.exe", "pwsh.exe"].includes(
+                NodePath.win32.basename(String(config.shell)).toLowerCase(),
+              ),
+            );
+            assert.notStrictEqual(
+              NodePath.win32.basename(String(config.shell)).toLowerCase(),
+              "cmd.exe",
+            );
+            return { stdout: "kilo 7.2.52\n", stderr: "", code: 0 };
           }),
         ),
       ),
@@ -5617,6 +5778,8 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
         }).pipe(
           Effect.provide(
             mockSpawnerLayer((args, command, env, options) => {
+              assert.ok(env);
+              assert.strictEqual(env.PI_SKIP_VERSION_CHECK, "1");
               assertPreparedProviderCommand({
                 fixture,
                 executable: "pi",
@@ -5668,7 +5831,53 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
     );
   });
 
+  describe("checkDroidProviderStatus", () => {
+    it.effect("suppresses implicit updates during Droid health probes", () =>
+      Effect.gen(function* () {
+        const status = yield* makeProductionCheckDroidProviderStatus(
+          configuredTestBinary("droid"),
+          TEST_PROVIDER_PROCESS_OPTIONS,
+        );
+        assert.strictEqual(status.provider, "droid");
+        assert.strictEqual(status.status, "ready");
+      }).pipe(
+        Effect.provide(
+          mockSpawnerLayer((args, command, env) => {
+            assert.ok(env);
+            assert.strictEqual(command, configuredTestBinary("droid"));
+            assert.deepStrictEqual(args, ["--version"]);
+            assert.strictEqual(env.FACTORY_DROID_AUTO_UPDATE_ENABLED, "false");
+            return { stdout: "droid 0.175.1\n", stderr: "", code: 0 };
+          }),
+        ),
+      ),
+    );
+  });
+
   describe("checkAntigravityProviderStatus", () => {
+    it.effect("returns unavailable on Windows without spawning Antigravity", () => {
+      let spawnCount = 0;
+      return Effect.gen(function* () {
+        const status = yield* productionCheckAntigravityProviderStatus(undefined, {
+          ...TEST_PROVIDER_PROCESS_OPTIONS,
+          platform: "win32",
+        });
+        assert.strictEqual(status.provider, "antigravity");
+        assert.strictEqual(status.status, "error");
+        assert.strictEqual(status.available, false);
+        assert.strictEqual(status.authStatus, "unknown");
+        assert.strictEqual(status.message, ANTIGRAVITY_WINDOWS_UNAVAILABLE_MESSAGE);
+        assert.strictEqual(spawnCount, 0);
+      }).pipe(
+        Effect.provide(
+          mockSpawnerLayer(() => {
+            spawnCount += 1;
+            return { stdout: "", stderr: "", code: 0 };
+          }),
+        ),
+      );
+    });
+
     it.effect("rejects versions that predate --new-project support", () =>
       Effect.gen(function* () {
         const status = yield* checkAntigravityProviderStatus();
@@ -5771,7 +5980,9 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
         Effect.provide(
           mockSpawnerLayer((args) => {
             const joined = args.join(" ");
-            if (joined === "--version") return { stdout: "grok 0.1.0\n", stderr: "", code: 0 };
+            if (joined === "--no-auto-update --version") {
+              return { stdout: "grok 0.1.0\n", stderr: "", code: 0 };
+            }
             throw new Error(`Unexpected args: ${joined}`);
           }),
         ),
@@ -5806,7 +6017,9 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
         Effect.provide(
           mockSpawnerLayer((args) => {
             const joined = args.join(" ");
-            if (joined === "--version") return { stdout: "grok 0.1.0\n", stderr: "", code: 0 };
+            if (joined === "--no-auto-update --version") {
+              return { stdout: "grok 0.1.0\n", stderr: "", code: 0 };
+            }
             throw new Error(`Unexpected args: ${joined}`);
           }),
         ),
@@ -5836,7 +6049,9 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
           mockSpawnerLayer((args, command) => {
             assert.strictEqual(command, configuredTestBinary("grok"));
             const joined = args.join(" ");
-            if (joined === "--version") return { stdout: "grok 0.1.0\n", stderr: "", code: 0 };
+            if (joined === "--no-auto-update --version") {
+              return { stdout: "grok 0.1.0\n", stderr: "", code: 0 };
+            }
             throw new Error(`Unexpected args: ${joined}`);
           }),
         ),

@@ -18,6 +18,7 @@ import {
 } from "effect";
 import { ChildProcessSpawner } from "effect/unstable/process";
 import { TestClock } from "effect/testing";
+import * as NodePath from "node:path";
 import { pathToFileURL } from "node:url";
 import type { ChatAttachment } from "@synara/contracts";
 import { describe, expect, it, vi } from "vitest";
@@ -45,6 +46,8 @@ import { prepareWindowsProviderProcess } from "./windowsProviderProcess.ts";
 import type { CapturedProcessTree, ProcessTreeKiller } from "../terminal/processTreeKiller.ts";
 
 const encoder = new TextEncoder();
+const builtInWindowsPowerShell = (systemRoot: string) =>
+  NodePath.win32.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
 const prepareMockProcess = (command: string, args: ReadonlyArray<string>) => ({
   command,
   args: [...args],
@@ -236,14 +239,16 @@ describe("toOpenCodeFileParts", () => {
 });
 
 describe("buildOpenCodeServerProcessEnv", () => {
-  it("does not override file-based config with synthetic empty config content", () => {
+  it("does not override file-based config on non-Windows platforms", () => {
     const env = buildOpenCodeServerProcessEnv({
       baseEnv: {
         PATH: "/usr/bin",
       },
+      platform: "linux",
     });
 
     expect(env.OPENCODE_CONFIG_CONTENT).toBeUndefined();
+    expect(env.OPENCODE_DISABLE_AUTOUPDATE).toBe("1");
     expect(env.PATH).toBe("/usr/bin");
   });
 
@@ -252,9 +257,147 @@ describe("buildOpenCodeServerProcessEnv", () => {
       baseEnv: {
         OPENCODE_CONFIG_CONTENT: '{"provider":{"openai":{}}}',
       },
+      platform: "linux",
     });
 
     expect(env.OPENCODE_CONFIG_CONTENT).toBe('{"provider":{"openai":{}}}');
+    expect(env.OPENCODE_DISABLE_AUTOUPDATE).toBe("1");
+  });
+
+  it("merges JSONC and replaces cmd.exe with absolute built-in PowerShell on Windows", () => {
+    const source = {
+      SystemRoot: "D:\\Windows",
+      OpenCode_Config_Content: `{
+        // Preserve model-provider configuration.
+        "provider": { "openai": {} },
+        "shell": "cmd.exe",
+      }`,
+    };
+    const env = buildOpenCodeServerProcessEnv({
+      baseEnv: source,
+      platform: "win32",
+    });
+
+    expect(JSON.parse(env.OPENCODE_CONFIG_CONTENT ?? "")).toEqual({
+      provider: { openai: {} },
+      shell: builtInWindowsPowerShell("D:\\Windows"),
+    });
+    expect(env.OpenCode_Config_Content).toBeUndefined();
+    expect(source.OpenCode_Config_Content).toContain('"shell": "cmd.exe"');
+  });
+
+  it("preserves only a verified configured absolute PowerShell 7 executable", () => {
+    const configuredPwsh = "C:/Program Files/PowerShell/7/pwsh.exe";
+    const env = buildOpenCodeServerProcessEnv({
+      baseEnv: {
+        SystemRoot: "D:\\Windows",
+        OPENCODE_CONFIG_CONTENT: JSON.stringify({ shell: configuredPwsh }),
+      },
+      platform: "win32",
+      isFile: (path) => path === "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+    });
+
+    expect(JSON.parse(env.OPENCODE_CONFIG_CONTENT ?? "")).toEqual({
+      shell: "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+    });
+  });
+
+  it("rejects unverified pwsh and invalid SystemRoot values", () => {
+    const env = buildOpenCodeServerProcessEnv({
+      baseEnv: {
+        SystemRoot: "relative-windows",
+        OPENCODE_CONFIG_CONTENT: JSON.stringify({
+          shell: "C:\\Unverified\\PowerShell\\7\\pwsh.exe",
+        }),
+      },
+      platform: "win32",
+      isFile: () => false,
+    });
+
+    expect(JSON.parse(env.OPENCODE_CONFIG_CONTENT ?? "")).toEqual({
+      shell: builtInWindowsPowerShell("C:\\Windows"),
+    });
+  });
+
+  it("replaces malformed OpenCode content with a safe child-only overlay", () => {
+    const source = {
+      SystemRoot: "E:\\Windows",
+      OPENCODE_CONFIG_CONTENT: '{ "shell": "cmd.exe", ',
+    };
+    const env = buildOpenCodeServerProcessEnv({
+      baseEnv: source,
+      platform: "win32",
+    });
+
+    expect(JSON.parse(env.OPENCODE_CONFIG_CONTENT ?? "")).toEqual({
+      shell: builtInWindowsPowerShell("E:\\Windows"),
+    });
+    expect(source.OPENCODE_CONFIG_CONTENT).toBe('{ "shell": "cmd.exe", ');
+  });
+
+  it("disables Kilo auto-update through merged child-only inline configuration", () => {
+    const source = {
+      KILO_CONFIG_CONTENT: JSON.stringify({
+        provider: { openai: { options: { timeout: 30_000 } } },
+        autoupdate: true,
+      }),
+    };
+    const env = buildOpenCodeServerProcessEnv({
+      cliSpec: KILO_CLI_SPEC,
+      baseEnv: source,
+      platform: "linux",
+    });
+
+    expect(JSON.parse(env.KILO_CONFIG_CONTENT ?? "")).toEqual({
+      provider: { openai: { options: { timeout: 30_000 } } },
+      autoupdate: false,
+    });
+    expect(source.KILO_CONFIG_CONTENT).toContain('"autoupdate":true');
+    expect(env.OPENCODE_DISABLE_AUTOUPDATE).toBeUndefined();
+  });
+
+  it("creates minimal child-only Kilo config when no inline content exists", () => {
+    const env = buildOpenCodeServerProcessEnv({
+      cliSpec: KILO_CLI_SPEC,
+      baseEnv: {},
+      platform: "linux",
+    });
+
+    expect(JSON.parse(env.KILO_CONFIG_CONTENT ?? "")).toEqual({ autoupdate: false });
+  });
+
+  it("replaces malformed Kilo content with a safe child-only overlay", () => {
+    const source = { KILO_CONFIG_CONTENT: "{ user-jsonc: true }" };
+    const env = buildOpenCodeServerProcessEnv({
+      cliSpec: KILO_CLI_SPEC,
+      baseEnv: source,
+      platform: "linux",
+    });
+
+    expect(JSON.parse(env.KILO_CONFIG_CONTENT ?? "")).toEqual({ autoupdate: false });
+    expect(source.KILO_CONFIG_CONTENT).toBe("{ user-jsonc: true }");
+  });
+
+  it("merges Windows Kilo JSONC and forces safe shell and update settings", () => {
+    const env = buildOpenCodeServerProcessEnv({
+      cliSpec: KILO_CLI_SPEC,
+      baseEnv: {
+        SystemRoot: "F:\\Windows",
+        Kilo_Config_Content: `{
+          "theme": "dark",
+          "autoupdate": true,
+          "shell": "cmd.exe",
+        }`,
+      },
+      platform: "win32",
+    });
+
+    expect(JSON.parse(env.KILO_CONFIG_CONTENT ?? "")).toEqual({
+      theme: "dark",
+      autoupdate: false,
+      shell: builtInWindowsPowerShell("F:\\Windows"),
+    });
+    expect(env.Kilo_Config_Content).toBeUndefined();
   });
 
   it("strips inherited Synara authority from managed server processes", () => {
@@ -278,16 +421,19 @@ describe("OpenCodeRuntime startup diagnostics", () => {
       readonly windowsHide: boolean | undefined;
       readonly windowsVerbatimArguments: boolean | undefined;
     }> = [];
+    const observedProcessEnvironments: Array<NodeJS.ProcessEnv> = [];
     const spawnerLayer = Layer.succeed(
       ChildProcessSpawner.ChildProcessSpawner,
       ChildProcessSpawner.make((command) => {
         const preparedCommand = command as unknown as {
           readonly args: ReadonlyArray<string>;
           readonly options?: {
+            readonly env?: NodeJS.ProcessEnv;
             readonly windowsHide?: boolean;
             readonly windowsVerbatimArguments?: boolean;
           };
         };
+        observedProcessEnvironments.push(preparedCommand.options?.env ?? {});
         observedWindowsOptions.push({
           windowsHide: preparedCommand.options?.windowsHide,
           windowsVerbatimArguments: preparedCommand.options?.windowsVerbatimArguments,
@@ -305,6 +451,7 @@ describe("OpenCodeRuntime startup diagnostics", () => {
       }),
     );
     const layer = makeTestOpenCodeRuntimeLive({
+      platform: "win32",
       prepareProcess: (command, args) => ({
         command,
         args: [...args],
@@ -312,7 +459,13 @@ describe("OpenCodeRuntime startup diagnostics", () => {
         windowsHide: true,
         windowsVerbatimArguments: true,
       }),
-      teardownProcessTree: async () => ({ escalated: false, signalErrors: [] }),
+      superviseProcess: (_prepared, child) => ({
+        rootPid: Number(child.pid),
+        waitForInitialCapture: async () => undefined,
+        captureNow: async () => undefined,
+        proveExit: async () => ({ escalated: false, signalErrors: [] }),
+        teardown: async () => ({ escalated: false, signalErrors: [] }),
+      }),
     }).pipe(Layer.provide(spawnerLayer));
 
     await Effect.runPromise(
@@ -337,6 +490,16 @@ describe("OpenCodeRuntime startup diagnostics", () => {
       { windowsHide: true, windowsVerbatimArguments: true },
       { windowsHide: true, windowsVerbatimArguments: true },
     ]);
+    expect(observedProcessEnvironments).toHaveLength(2);
+    for (const environment of observedProcessEnvironments) {
+      const config = JSON.parse(environment.OPENCODE_CONFIG_CONTENT ?? "") as {
+        readonly shell?: unknown;
+      };
+      expect(config).toMatchObject({
+        shell: expect.stringMatching(/powershell\.exe$/i),
+      });
+      expect(NodePath.win32.isAbsolute(String(config.shell))).toBe(true);
+    }
   });
 
   it("does not retry the plain model command when verbose-command exit is unproven", async () => {

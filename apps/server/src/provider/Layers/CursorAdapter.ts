@@ -56,7 +56,7 @@ import { appendFileAttachmentsPromptBlock } from "../attachmentProjection.ts";
 import { loadProviderPromptImageBlocks } from "../promptAttachments.ts";
 import {
   isWindowsJobPreparedCommand,
-  prepareWindowsProviderProcess,
+  prepareWindowsProviderProcessAsync,
 } from "../windowsProviderProcess.ts";
 import {
   installPreparedEffectProcessSupervisor,
@@ -195,12 +195,18 @@ export function makeCursorModelListChildProcess(
   } as ChildProcess.CommandOptions & { readonly synaraExternallySupervised?: true });
 }
 
+type PrepareCursorProcess = (
+  ...args: Parameters<typeof prepareWindowsProviderProcessAsync>
+) =>
+  | Awaited<ReturnType<typeof prepareWindowsProviderProcessAsync>>
+  | ReturnType<typeof prepareWindowsProviderProcessAsync>;
+
 export interface CursorAdapterLiveOptions {
   readonly nativeEventLogPath?: string;
   readonly nativeEventLogger?: EventNdjsonLogger;
   readonly closeSessionScope?: (scope: Scope.Closeable) => Effect.Effect<void>;
   readonly maintenanceOwnedResources?: ProviderMaintenanceOwnedResourceCoordinator;
-  readonly prepareProcess?: typeof prepareWindowsProviderProcess;
+  readonly prepareProcess?: PrepareCursorProcess;
   readonly superviseProcess?: typeof supervisePreparedEffectProcess;
 }
 
@@ -1468,11 +1474,23 @@ export function makeCursorAdapter(
           ...(effectiveApiEndpoint ? { apiEndpoint: effectiveApiEndpoint } : {}),
         });
         const env = buildCursorAgentHeadlessEnv();
-        const prepared = (options?.prepareProcess ?? prepareWindowsProviderProcess)(
-          command.command,
-          command.args,
-          { env },
-        );
+        const prepared = yield* Effect.tryPromise({
+          try: () =>
+            Promise.resolve(
+              (options?.prepareProcess ?? prepareWindowsProviderProcessAsync)(
+                command.command,
+                command.args,
+                { env },
+              ),
+            ),
+          catch: (cause) =>
+            new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "model/list",
+              detail: "Failed to prepare the Cursor model discovery process.",
+              cause,
+            }),
+        });
         const owned = yield* Effect.uninterruptible(
           Effect.gen(function* () {
             const child = yield* childProcessSpawner.spawn(

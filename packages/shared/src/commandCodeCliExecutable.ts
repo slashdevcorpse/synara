@@ -7,8 +7,11 @@ import * as Path from "node:path";
 
 import {
   resolveWindowsCommandCandidates,
+  resolveWindowsCommandCandidatesAsync,
   resolveWindowsCommandPath,
+  resolveWindowsCommandPathAsync,
   unresolvedWindowsCommandDiscoveryOutcome,
+  type WindowsAsyncCommandDiscoveryInput,
   type WindowsCommandDiscoveryObservation,
   type WindowsCommandDiscoveryOutcome,
   type WindowsSafeProcessInput,
@@ -23,6 +26,9 @@ type StatSyncLike = (path: string) => FileStatLike;
 export interface CommandCodeCliExecutableInput extends WindowsSafeProcessInput {
   readonly statSync?: StatSyncLike | undefined;
 }
+
+export interface CommandCodeCliExecutableAsyncInput
+  extends CommandCodeCliExecutableInput, WindowsAsyncCommandDiscoveryInput {}
 
 export interface CommandCodeCliExecutableResolution {
   readonly executable: string;
@@ -145,4 +151,68 @@ export function resolveCommandCodeCliExecutableWithDiscovery(
         : configured || DEFAULT_COMMAND_CODE_COMMAND,
     discoveryOutcome: unresolvedWindowsCommandDiscoveryOutcome(observations),
   };
+}
+
+export async function resolveCommandCodeCliExecutableWithDiscoveryAsync(
+  command: string = DEFAULT_COMMAND_CODE_COMMAND,
+  input: CommandCodeCliExecutableAsyncInput = {},
+): Promise<CommandCodeCliExecutableResolution> {
+  const platform = input.platform ?? process.platform;
+  if (platform !== "win32") return { executable: command };
+
+  const observations: WindowsCommandDiscoveryObservation[] = [];
+  const discoveryInput: CommandCodeCliExecutableAsyncInput = {
+    ...input,
+    onCommandDiscovery: (observation) => {
+      observations.push(observation);
+      input.onCommandDiscovery?.(observation);
+    },
+  };
+
+  const configured = command.trim();
+  const normalized = configured.toLowerCase();
+  if (!COMMAND_CODE_ALIASES.includes(normalized as (typeof COMMAND_CODE_ALIASES)[number])) {
+    const executable = await resolveWindowsCommandPathAsync(command, discoveryInput);
+    return {
+      executable,
+      ...(Path.win32.isAbsolute(executable)
+        ? {}
+        : { discoveryOutcome: unresolvedWindowsCommandDiscoveryOutcome(observations) }),
+    };
+  }
+
+  const readStat = input.statSync ?? statSync;
+  const env = input.env ?? process.env;
+  const appData = environmentValue(env, "APPDATA");
+  const orderedAliases = [
+    normalized as (typeof COMMAND_CODE_ALIASES)[number],
+    ...COMMAND_CODE_ALIASES.filter((alias) => alias !== normalized),
+  ];
+
+  for (const alias of orderedAliases) {
+    const candidate = firstValidCandidate(
+      alias,
+      await resolveWindowsCommandCandidatesAsync(alias, discoveryInput),
+      readStat,
+    );
+    if (candidate) return { executable: candidate };
+  }
+  for (const alias of orderedAliases) {
+    const candidate = npmShim(appData, alias, readStat);
+    if (candidate) return { executable: candidate };
+  }
+  return {
+    executable:
+      normalized === "cmd"
+        ? DEFAULT_COMMAND_CODE_COMMAND
+        : configured || DEFAULT_COMMAND_CODE_COMMAND,
+    discoveryOutcome: unresolvedWindowsCommandDiscoveryOutcome(observations),
+  };
+}
+
+export async function resolveCommandCodeCliExecutableAsync(
+  command: string = DEFAULT_COMMAND_CODE_COMMAND,
+  input: CommandCodeCliExecutableAsyncInput = {},
+): Promise<string> {
+  return (await resolveCommandCodeCliExecutableWithDiscoveryAsync(command, input)).executable;
 }

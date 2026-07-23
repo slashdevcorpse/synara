@@ -16,7 +16,10 @@ import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import { ApprovalRequestId, ThreadId } from "@synara/contracts";
-import { prepareWindowsSafeProcess } from "@synara/shared/windowsProcess";
+import {
+  createWindowsCommandDiscoveryCache,
+  prepareWindowsSafeProcess,
+} from "@synara/shared/windowsProcess";
 
 import {
   buildCodexProcessEnv,
@@ -29,6 +32,7 @@ import {
   CODEX_DEFAULT_MODE_DEVELOPER_INSTRUCTIONS,
   CODEX_PLAN_MODE_DEVELOPER_INSTRUCTIONS,
   CodexAppServerManager,
+  assertSupportedCodexCliVersion,
   classifyCodexStderrLine,
   formatCodexCliVersionCheckFailure,
   isRecoverableThreadResumeError,
@@ -58,6 +62,47 @@ const approvalRequiredTurnOverrides = {
 } as const;
 
 describe("Codex CLI version check failures", () => {
+  type VersionProbeDependencies = NonNullable<Parameters<typeof assertSupportedCodexCliVersion>[1]>;
+
+  const makeVersionProbeChild = (pid = 7301) =>
+    Object.assign(new EventEmitter(), {
+      pid,
+      exitCode: null,
+      signalCode: null,
+      killed: false,
+      stdin: new PassThrough(),
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+      kill: vi.fn(() => true),
+    }) as unknown as ChildProcessWithoutNullStreams;
+
+  const completeVersionProbe = (
+    child: ChildProcessWithoutNullStreams,
+    input: { readonly status: number; readonly stdout?: string; readonly stderr?: string },
+  ) => {
+    if (input.stdout) (child.stdout as PassThrough).write(input.stdout);
+    if (input.stderr) (child.stderr as PassThrough).write(input.stderr);
+    (child.stdout as PassThrough).end();
+    (child.stderr as PassThrough).end();
+    Reflect.set(child, "exitCode", input.status);
+    child.emit("exit", input.status, null);
+    child.emit("close", input.status, null);
+  };
+
+  const versionProbeInput = () => ({
+    binaryPath: "C:\\tools\\codex.exe",
+    cwd: "C:\\projects\\synara",
+    env: {},
+    commandDiscoveryCache: createWindowsCommandDiscoveryCache(),
+  });
+
+  const preparedVersionProbe = {
+    command: "C:\\tools\\codex.exe",
+    args: ["--version"],
+    shell: false as const,
+    windowsHide: true as const,
+  };
+
   it("maps Windows launcher target failures to the friendly executable error", () => {
     expect(
       formatCodexCliVersionCheckFailure({
@@ -90,6 +135,166 @@ describe("Codex CLI version check failures", () => {
         stderr,
       }),
     ).toBe(`Codex CLI version check failed. ${stderr}`);
+  });
+
+  it("keeps timers responsive and proves process exit before accepting the version", async () => {
+    const child = makeVersionProbeChild();
+    const proveExit = vi.fn(async () => ({ escalated: false, signalErrors: [] }));
+    const teardown = vi.fn(async () => ({ escalated: false, signalErrors: [] }));
+    const superviseProcess = vi.fn<NonNullable<VersionProbeDependencies["superviseProcess"]>>(
+      () => ({
+        rootPid: child.pid ?? 0,
+        proveExit,
+        requestTermination: vi.fn(() => true),
+        teardown,
+      }),
+    );
+    const spawnProcess = vi.fn<NonNullable<VersionProbeDependencies["spawnProcess"]>>(() => child);
+    let heartbeatFired = false;
+    const check = assertSupportedCodexCliVersion(versionProbeInput(), {
+      platform: "win32",
+      prepareProcess: vi.fn(() => preparedVersionProbe),
+      spawnProcess,
+      superviseProcess,
+      timeoutMs: 200,
+    });
+    setTimeout(() => {
+      heartbeatFired = true;
+    }, 0);
+    setTimeout(() => {
+      completeVersionProbe(child, { status: 0, stdout: "codex-cli 1.0.0\n" });
+    }, 20);
+
+    await expect(check).resolves.toBeUndefined();
+    expect(heartbeatFired).toBe(true);
+    expect(proveExit).toHaveBeenCalledTimes(1);
+    expect(teardown).not.toHaveBeenCalled();
+    expect(spawnProcess.mock.calls[0]?.[2]).not.toHaveProperty("detached");
+    expect(superviseProcess.mock.calls[0]?.[2]).toEqual(
+      expect.objectContaining({ exitTimeoutMs: 200 }),
+    );
+    expect(superviseProcess.mock.calls[0]?.[2]).not.toHaveProperty("ownedProcessGroupId");
+  });
+
+  it("owns a POSIX version probe with a detached process group", async () => {
+    const child = makeVersionProbeChild(7302);
+    const spawnProcess = vi.fn<NonNullable<VersionProbeDependencies["spawnProcess"]>>(() => child);
+    const proveExit = vi.fn(async () => ({ escalated: false, signalErrors: [] }));
+    const superviseProcess = vi.fn<NonNullable<VersionProbeDependencies["superviseProcess"]>>(
+      () => ({
+        rootPid: child.pid ?? 0,
+        proveExit,
+        requestTermination: vi.fn(() => true),
+        teardown: vi.fn(async () => ({ escalated: false, signalErrors: [] })),
+      }),
+    );
+    const check = assertSupportedCodexCliVersion(versionProbeInput(), {
+      platform: "linux",
+      prepareProcess: vi.fn(() => preparedVersionProbe),
+      spawnProcess,
+      superviseProcess,
+      timeoutMs: 200,
+    });
+    setTimeout(() => {
+      completeVersionProbe(child, { status: 0, stdout: "codex-cli 1.0.0\n" });
+    }, 20);
+
+    await expect(check).resolves.toBeUndefined();
+    expect(spawnProcess).toHaveBeenCalledWith(
+      preparedVersionProbe.command,
+      preparedVersionProbe.args,
+      expect.objectContaining({ detached: true }),
+    );
+    expect(superviseProcess).toHaveBeenCalledWith(
+      preparedVersionProbe,
+      child,
+      expect.objectContaining({
+        exitTimeoutMs: 200,
+        ownedProcessGroupId: 7302,
+        platform: "linux",
+      }),
+    );
+    expect(proveExit).toHaveBeenCalledTimes(1);
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "proves exit for a real short-lived POSIX version process",
+    async () => {
+      await expect(
+        assertSupportedCodexCliVersion({
+          binaryPath: process.execPath,
+          cwd: process.cwd(),
+          env: process.env,
+          commandDiscoveryCache: createWindowsCommandDiscoveryCache(),
+        }),
+      ).resolves.toBeUndefined();
+    },
+  );
+
+  it("uses the exact supervisor teardown when the version probe times out", async () => {
+    const child = makeVersionProbeChild();
+    const proveExit = vi.fn();
+    const teardown = vi.fn(async () => ({ escalated: true, signalErrors: [] }));
+
+    await expect(
+      assertSupportedCodexCliVersion(versionProbeInput(), {
+        prepareProcess: vi.fn(() => preparedVersionProbe),
+        spawnProcess: vi.fn(() => child),
+        superviseProcess: vi.fn(() => ({
+          rootPid: child.pid ?? 0,
+          proveExit,
+          requestTermination: vi.fn(() => true),
+          teardown,
+        })),
+        timeoutMs: 10,
+      }),
+    ).rejects.toThrow("Codex CLI version check timed out after 10ms.");
+    expect(teardown).toHaveBeenCalledTimes(1);
+    expect(proveExit).not.toHaveBeenCalled();
+  });
+
+  it("bounds PID-less spawn observation instead of waiting forever", async () => {
+    const child = makeVersionProbeChild();
+    Reflect.set(child, "pid", undefined);
+    const superviseProcess = vi.fn();
+
+    await expect(
+      assertSupportedCodexCliVersion(versionProbeInput(), {
+        prepareProcess: vi.fn(() => preparedVersionProbe),
+        spawnProcess: vi.fn(() => child),
+        superviseProcess,
+        timeoutMs: 10,
+      }),
+    ).rejects.toThrow("Codex CLI version check timed out after 10ms.");
+    expect(superviseProcess).not.toHaveBeenCalled();
+    expect(child.kill).toHaveBeenCalledTimes(1);
+  });
+
+  it("preserves both the timeout and an unproven teardown failure", async () => {
+    const child = makeVersionProbeChild();
+    const teardownFailure = new Error("drain acknowledgement missing");
+    const teardown = vi.fn(async () => {
+      throw teardownFailure;
+    });
+
+    const failure = await assertSupportedCodexCliVersion(versionProbeInput(), {
+      prepareProcess: vi.fn(() => preparedVersionProbe),
+      spawnProcess: vi.fn(() => child),
+      superviseProcess: vi.fn(() => ({
+        rootPid: child.pid ?? 0,
+        proveExit: vi.fn(),
+        requestTermination: vi.fn(() => true),
+        teardown,
+      })),
+      timeoutMs: 10,
+    }).catch((cause: unknown) => cause);
+
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect((failure as AggregateError).errors).toEqual([
+      expect.objectContaining({ message: "Codex CLI version check timed out after 10ms." }),
+      teardownFailure,
+    ]);
+    expect(teardown).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -1384,13 +1589,19 @@ describe("buildCodexAppServerArgs", () => {
       }),
     ).toEqual([
       "-c",
+      "check_for_update_on_startup=false",
+      "-c",
       'sqlite_home="C:\\\\Users\\\\test\\\\.synara\\\\codex-home-overlay"',
       "app-server",
     ]);
   });
 
-  it("keeps the legacy invocation when no isolated SQLite home is configured", () => {
-    expect(buildCodexAppServerArgs({ CODEX_SQLITE_HOME: "  " })).toEqual(["app-server"]);
+  it("disables Codex background update checks without an isolated SQLite home", () => {
+    expect(buildCodexAppServerArgs({ CODEX_SQLITE_HOME: "  " })).toEqual([
+      "-c",
+      "check_for_update_on_startup=false",
+      "app-server",
+    ]);
   });
 
   it("keeps valid cmd metacharacters inside the SQLite path inert", () => {
@@ -1399,10 +1610,12 @@ describe("buildCodexAppServerArgs", () => {
     });
     expect(args).toEqual([
       "-c",
+      "check_for_update_on_startup=false",
+      "-c",
       String.raw`sqlite_home="D:\\R\u0026D\\100\u0025 Local\u005eState"`,
       "app-server",
     ]);
-    expect(args[1]).not.toMatch(/[&|<>^%]/);
+    expect(args[3]).not.toMatch(/[&|<>^%]/);
 
     expect(() =>
       prepareWindowsSafeProcess("C:\\tools\\codex.cmd", args, {

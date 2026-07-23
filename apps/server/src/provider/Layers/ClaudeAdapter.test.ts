@@ -205,6 +205,10 @@ function makeHarness(config?: {
   readonly cwd?: string;
   readonly baseDir?: string;
   readonly workflowRuntimePollIntervalMs?: number;
+  readonly prepareContainedClaudeProcess?:
+    | ClaudeAdapterLiveOptions["prepareContainedClaudeProcess"]
+    | undefined;
+  readonly gatewayCredentials?: AgentGatewayCredentialsShape | undefined;
 }) {
   const query = new FakeClaudeQuery();
   let createInput:
@@ -234,18 +238,27 @@ function makeHarness(config?: {
           workflowRuntimePollIntervalMs: config.workflowRuntimePollIntervalMs,
         }
       : {}),
+    ...(config?.prepareContainedClaudeProcess
+      ? {
+          prepareContainedClaudeProcess: config.prepareContainedClaudeProcess,
+        }
+      : {}),
   };
 
-  return {
-    layer: makeClaudeAdapterLive(adapterOptions).pipe(
-      Layer.provideMerge(
-        ServerConfig.layerTest(
-          config?.cwd ?? "/tmp/claude-adapter-test",
-          config?.baseDir ?? "/tmp",
-        ),
-      ),
-      Layer.provideMerge(NodeServices.layer),
+  let layer = makeClaudeAdapterLive(adapterOptions).pipe(
+    Layer.provideMerge(
+      ServerConfig.layerTest(config?.cwd ?? "/tmp/claude-adapter-test", config?.baseDir ?? "/tmp"),
     ),
+    Layer.provideMerge(NodeServices.layer),
+  );
+  if (config?.gatewayCredentials) {
+    layer = layer.pipe(
+      Layer.provideMerge(Layer.succeed(AgentGatewayCredentials, config.gatewayCredentials)),
+    );
+  }
+
+  return {
+    layer,
     query,
     getLastCreateQueryInput: () => createInput,
   };
@@ -285,11 +298,16 @@ function makeMultiQueryHarness(config?: {
 
 function makeGatewayCredentialsHarness() {
   let sequence = 0;
+  const issuedTokens: string[] = [];
   const revokedTokens: string[] = [];
   const credentials = {
     mcpEndpointUrl: "http://127.0.0.1:48123/mcp",
     setListeningPort: () => undefined,
-    issueSessionToken: () => `gateway-token-${++sequence}`,
+    issueSessionToken: () => {
+      const token = `gateway-token-${++sequence}`;
+      issuedTokens.push(token);
+      return token;
+    },
     verifySessionToken: () => null,
     verifySession: () => null,
     bindWriteAuthority: () => null,
@@ -297,13 +315,17 @@ function makeGatewayCredentialsHarness() {
     revokeSessionToken: (token: string) => {
       revokedTokens.push(token);
     },
-    connectionForThread: () => ({
-      url: "http://127.0.0.1:48123/mcp",
-      bearerToken: `gateway-token-${++sequence}`,
-    }),
+    connectionForThread: () => {
+      const bearerToken = `gateway-token-${++sequence}`;
+      issuedTokens.push(bearerToken);
+      return {
+        url: "http://127.0.0.1:48123/mcp",
+        bearerToken,
+      };
+    },
     stdioProxy: { command: "node", args: ["/state/proxy.mjs"] },
   } satisfies AgentGatewayCredentialsShape;
-  return { credentials, revokedTokens };
+  return { credentials, issuedTokens, revokedTokens };
 }
 
 function makeOwnedClaudeProcess(pid: number): ClaudeOwnedProcess {
@@ -419,6 +441,74 @@ describe("ClaudeAdapterLive", () => {
           issue: "Expected provider 'claudeAgent' but received 'codex'.",
         }),
       );
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("does not retain a session owner when contained process preparation fails", () => {
+    let preparationCalls = 0;
+    const gateway = makeGatewayCredentialsHarness();
+    const harness = makeHarness({
+      gatewayCredentials: gateway.credentials,
+      prepareContainedClaudeProcess: async () => {
+        preparationCalls += 1;
+        throw new Error("simulated Claude prewarm failure");
+      },
+    });
+    const start = {
+      threadId: THREAD_ID,
+      provider: "claudeAgent" as const,
+      runtimeMode: "full-access" as const,
+    };
+
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const firstFailure = yield* adapter.startSession(start).pipe(Effect.flip);
+      const secondFailure = yield* adapter.startSession(start).pipe(Effect.flip);
+
+      assert.match(firstFailure.message, /simulated Claude prewarm failure/u);
+      assert.match(secondFailure.message, /simulated Claude prewarm failure/u);
+      assert.notInclude(secondFailure.message, "Retained Claude process owner");
+      assert.equal(preparationCalls, 2);
+      assert.deepEqual(gateway.issuedTokens, []);
+      assert.deepEqual(gateway.revokedTokens, []);
+      assert.equal((yield* adapter.listSessions()).length, 0);
+      yield* adapter.stopAll();
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("does not retain a command-discovery owner when contained preparation fails", () => {
+    let preparationCalls = 0;
+    const harness = makeHarness({
+      prepareContainedClaudeProcess: async () => {
+        preparationCalls += 1;
+        throw new Error("simulated Claude command prewarm failure");
+      },
+    });
+
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const firstFailure = yield* adapter.listCommands!({
+        provider: "claudeAgent",
+        cwd: "/tmp",
+        forceReload: true,
+      }).pipe(Effect.flip);
+      const secondFailure = yield* adapter.listCommands!({
+        provider: "claudeAgent",
+        cwd: "/tmp",
+        forceReload: true,
+      }).pipe(Effect.flip);
+
+      assert.match(firstFailure.message, /simulated Claude command prewarm failure/u);
+      assert.match(secondFailure.message, /simulated Claude command prewarm failure/u);
+      assert.notInclude(secondFailure.message, "Retained Claude process owner");
+      assert.equal(preparationCalls, 2);
+      assert.equal(harness.query.closeCalls, 0);
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(harness.layer),

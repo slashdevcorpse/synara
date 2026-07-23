@@ -45,6 +45,7 @@ function fakeCodexNodeScript(): string {
     "let seenImage = false;",
     "let seenSkipGitRepoCheck = false;",
     "let seenApprovalNever = false;",
+    "let seenUpdateCheckDisabled = false;",
     "for (let index = 0; index < args.length; index += 1) {",
     "  const argument = args[index];",
     '  if (argument === "--image") {',
@@ -59,6 +60,11 @@ function fakeCodexNodeScript(): string {
     '  if (argument === "--config") {',
     "    index += 1;",
     "    seenApprovalNever ||= args[index] === 'approval_policy=\"never\"';",
+    "    continue;",
+    "  }",
+    '  if (argument === "-c") {',
+    "    index += 1;",
+    '    seenUpdateCheckDisabled ||= args[index] === "check_for_update_on_startup=false";',
     "    continue;",
     "  }",
     '  if (argument === "--output-last-message") {',
@@ -80,6 +86,9 @@ function fakeCodexNodeScript(): string {
     "}",
     'if (process.env.SYNARA_FAKE_CODEX_REQUIRE_APPROVAL_NEVER === "1" && !seenApprovalNever) {',
     '  fail("missing approval_policy=never", 10);',
+    "}",
+    "if (!seenUpdateCheckDisabled) {",
+    '  fail("missing check_for_update_on_startup=false", 11);',
     "}",
     "if (process.env.SYNARA_FAKE_CODEX_STDIN_MUST_CONTAIN && !stdinContent.includes(process.env.SYNARA_FAKE_CODEX_STDIN_MUST_CONTAIN)) {",
     '  fail("stdin missing expected content", 3);',
@@ -132,15 +141,23 @@ function makeFakeCodexBinary(dir: string) {
     const path = yield* Path.Path;
     const binDir = path.join(dir, "bin");
     const codexPath = path.join(binDir, process.platform === "win32" ? "codex.cmd" : "codex");
-    const scriptPath = path.join(binDir, "fake-codex.mjs");
+    const scriptDirectory =
+      process.platform === "win32"
+        ? path.join(binDir, "node_modules", "@openai", "codex", "bin")
+        : binDir;
+    const scriptPath = path.join(scriptDirectory, "fake-codex.mjs");
     yield* fs.makeDirectory(binDir, { recursive: true });
+    yield* fs.makeDirectory(scriptDirectory, { recursive: true });
     yield* fs.writeFileString(scriptPath, fakeCodexNodeScript());
 
     if (process.platform === "win32") {
-      const escapedNodePath = process.execPath.replaceAll("%", "%%");
       yield* fs.writeFileString(
         codexPath,
-        ["@echo off", `@"${escapedNodePath}" "%~dp0fake-codex.mjs" %*`, ""].join("\r\n"),
+        [
+          "@echo off",
+          '"%~dp0\\node.exe" "%~dp0\\node_modules\\@openai\\codex\\bin\\fake-codex.mjs" %*',
+          "",
+        ].join("\r\n"),
       );
     } else {
       const escapedNodePath = process.execPath.replaceAll("'", "'\\''");

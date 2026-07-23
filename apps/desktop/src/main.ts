@@ -3779,7 +3779,10 @@ function registerIpcHandlers(): void {
   if (appSnapManager) {
     registerAppSnapIpcHandlers(ipcMain, appSnapManager);
   }
-  registerDesktopVoiceTranscriptionHandler();
+  registerDesktopVoiceTranscriptionHandler(() => ({
+    baseUrl: backendHttpUrl,
+    authToken: backendAuthToken,
+  }));
   startBrowserPerformanceLogging();
   registerBrowserIpcHandlers(ipcMain, browserManager);
 }

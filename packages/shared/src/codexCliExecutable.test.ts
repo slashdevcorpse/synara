@@ -6,7 +6,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   resolveCodexCliExecutable,
+  resolveCodexCliExecutableAsync,
   resolveCodexCliExecutableWithDiscovery,
+  resolveCodexCliExecutableWithDiscoveryAsync,
 } from "./codexCliExecutable";
 
 function whereOutput(...candidates: string[]) {
@@ -310,5 +312,56 @@ describe("resolveCodexCliExecutable", () => {
         statSync: regularFiles(),
       }),
     ).toEqual({ executable: "codex", discoveryOutcome: "transient_failure" });
+  });
+
+  it("resolves the default Codex executable asynchronously without invoking spawnSync", async () => {
+    const batch = "C:\\Users\\test\\AppData\\Roaming\\npm\\codex.cmd";
+    const native = "C:\\tools\\codex.exe";
+    const execFile = vi.fn(async () => ({
+      stdout: `${batch}\r\n${native}\r\n`,
+      status: 0,
+    }));
+    const spawnSync = vi.fn(() => {
+      throw new Error("synchronous discovery must not run");
+    });
+
+    await expect(
+      resolveCodexCliExecutableAsync("codex", {
+        platform: "win32",
+        cwd: "C:\\projects\\synara",
+        env: { SystemRoot: "C:\\Windows" },
+        execFile,
+        spawnSync,
+        statSync: regularFiles(batch, native),
+      }),
+    ).resolves.toBe(native);
+    expect(execFile).toHaveBeenCalledTimes(1);
+    expect(spawnSync).not.toHaveBeenCalled();
+  });
+
+  it("preserves async not-found and transient discovery outcomes", async () => {
+    await expect(
+      resolveCodexCliExecutableWithDiscoveryAsync("codex", {
+        platform: "win32",
+        cwd: "C:\\projects\\synara",
+        env: { SystemRoot: "C:\\Windows" },
+        execFile: vi.fn(async () => ({ stdout: "", status: 1 })),
+        statSync: regularFiles(),
+      }),
+    ).resolves.toEqual({ executable: "codex", discoveryOutcome: "not_found" });
+
+    await expect(
+      resolveCodexCliExecutableWithDiscoveryAsync("codex", {
+        platform: "win32",
+        cwd: "C:\\projects\\synara",
+        env: { SystemRoot: "C:\\Windows" },
+        execFile: vi.fn(async () => ({
+          error: Object.assign(new Error("where.exe timed out"), { code: "ETIMEDOUT" }),
+          stdout: "",
+          status: null,
+        })),
+        statSync: regularFiles(),
+      }),
+    ).resolves.toEqual({ executable: "codex", discoveryOutcome: "transient_failure" });
   });
 });

@@ -157,10 +157,11 @@ describe("Pi Bash process supervision", () => {
     const teardownStarted = new Promise<void>((resolve) => {
       observeTeardown = resolve;
     });
+    const spawnProcess = vi.fn(() => child);
     const supervisor = makePiBashProcessSupervisor({
       getShellConfig: () => ({ shell: "/bin/sh", args: ["-c"] }),
       platform: "linux",
-      spawnProcess: () => child,
+      spawnProcess,
       superviseProcess: (_prepared, process, options) => {
         const teardownProcessTree = options?.teardownProcessTree;
         if (teardownProcessTree === undefined) {
@@ -206,6 +207,7 @@ describe("Pi Bash process supervision", () => {
       },
     );
 
+    await vi.waitFor(() => expect(spawnProcess).toHaveBeenCalledOnce());
     abortController.abort();
     await teardownStarted;
     await Promise.resolve();
@@ -233,6 +235,7 @@ describe("Pi Bash process supervision", () => {
       child.emit("exit", 143, null);
     });
     const verifyExit = vi.fn(async () => undefined);
+    const spawnProcess = vi.fn(() => child);
     const supervisor = makePiBashProcessSupervisor({
       getShellConfig: () => ({ shell: "C:\\tools\\bash.exe", args: ["-c"] }),
       platform: "win32",
@@ -251,7 +254,7 @@ describe("Pi Bash process supervision", () => {
           requestStop,
           verifyExit,
         }),
-      spawnProcess: () => child,
+      spawnProcess,
     });
     const abortController = new AbortController();
     const command = supervisor.operations.exec("sleep 10", "C:\\workspace", {
@@ -259,6 +262,7 @@ describe("Pi Bash process supervision", () => {
       onData: () => undefined,
     });
 
+    await vi.waitFor(() => expect(spawnProcess).toHaveBeenCalledOnce());
     abortController.abort();
     await expect(command).rejects.toThrow("aborted");
     expect(requestStop).toHaveBeenCalledOnce();
@@ -284,6 +288,7 @@ describe("Pi Bash process supervision", () => {
       .mockRejectedValueOnce(new Error("initial drain proof unavailable"))
       .mockRejectedValueOnce(new Error("retry drain proof unavailable"))
       .mockResolvedValue(undefined);
+    const spawnProcess = vi.fn(() => child);
     const supervisor = makePiBashProcessSupervisor({
       getShellConfig: () => ({ shell: "C:\\tools\\bash.exe", args: ["-c"] }),
       platform: "win32",
@@ -302,12 +307,13 @@ describe("Pi Bash process supervision", () => {
           requestStop,
           verifyExit,
         }),
-      spawnProcess: () => child,
+      spawnProcess,
     });
     const command = supervisor.operations.exec("exit 0", "C:\\workspace", {
       onData: () => undefined,
     });
 
+    await vi.waitFor(() => expect(spawnProcess).toHaveBeenCalledOnce());
     (child as ChildProcess & { exitCode: number | null }).exitCode = 0;
     child.emit("exit", 0, null);
 
@@ -335,10 +341,11 @@ describe("Pi Bash process supervision", () => {
       .fn<() => Promise<{ escalated: boolean; signalErrors: never[] }>>()
       .mockRejectedValueOnce(new Error("abort teardown proof failed"))
       .mockResolvedValue({ escalated: false, signalErrors: [] });
+    const spawnProcess = vi.fn(() => child);
     const processSupervisor = makePiBashProcessSupervisor({
       getShellConfig: () => ({ shell: "/bin/sh", args: ["-c"] }),
       platform: "linux",
-      spawnProcess: () => child,
+      spawnProcess,
       superviseProcess: (_prepared, process) => ({
         rootPid: Number(process.pid),
         requestTermination: () => true,
@@ -352,6 +359,7 @@ describe("Pi Bash process supervision", () => {
       onData: () => undefined,
     });
 
+    await vi.waitFor(() => expect(spawnProcess).toHaveBeenCalledOnce());
     abortController.abort();
     await expect(
       Promise.race([
@@ -379,10 +387,11 @@ describe("Pi Bash process supervision", () => {
     const superviseProcess = vi.fn(() => {
       throw new Error("must not install a PID-less supervisor");
     });
+    const spawnProcess = vi.fn(() => child);
     const processSupervisor = makePiBashProcessSupervisor({
       getShellConfig: () => ({ shell: "/bin/sh", args: ["-c"] }),
       platform: "linux",
-      spawnProcess: () => child,
+      spawnProcess,
       superviseProcess,
     });
     const command = processSupervisor.operations.exec("echo never-started", "/tmp", {
@@ -390,6 +399,7 @@ describe("Pi Bash process supervision", () => {
     });
     const spawnFailure = new Error("spawn failed after returning the child handle");
 
+    await vi.waitFor(() => expect(spawnProcess).toHaveBeenCalledOnce());
     child.emit("error", spawnFailure);
     child.emit("close", null, null);
 

@@ -74,7 +74,7 @@ import {
   teardownChildProcessTree,
   teardownProviderProcessTree,
 } from "../supervisedProcessTeardown.ts";
-import { prepareWindowsProviderProcess } from "../windowsProviderProcess.ts";
+import { prepareWindowsProviderProcessAsync } from "../windowsProviderProcess.ts";
 import {
   installPreparedNodeProcessSupervisor,
   type NodeProviderProcessSupervisor,
@@ -137,10 +137,16 @@ export interface PiBashProcessSupervisor {
   readonly teardownAll: () => Promise<void>;
 }
 
+type PreparePiProcess = (
+  ...args: Parameters<typeof prepareWindowsProviderProcessAsync>
+) =>
+  | Awaited<ReturnType<typeof prepareWindowsProviderProcessAsync>>
+  | ReturnType<typeof prepareWindowsProviderProcessAsync>;
+
 export interface PiBashProcessSupervisorOptions {
   readonly getShellConfig: (shellPath?: string) => PiShellConfig;
   readonly platform?: NodeJS.Platform;
-  readonly prepareProcess?: typeof prepareWindowsProviderProcess;
+  readonly prepareProcess?: PreparePiProcess;
   readonly superviseProcess?: typeof supervisePreparedNodeProcess;
   readonly spawnProcess?: (
     command: string,
@@ -210,15 +216,16 @@ export function makePiBashProcessSupervisor(
         baseEnv: execution.env ?? process.env,
       });
       const shellArgs = commandFromStdin ? shell.args : [...shell.args, command];
-      const prepared = (options.prepareProcess ?? prepareWindowsProviderProcess)(
-        shell.shell,
-        shellArgs,
-        {
+      const prepared = await Promise.resolve(
+        (options.prepareProcess ?? prepareWindowsProviderProcessAsync)(shell.shell, shellArgs, {
           cwd,
           env: childEnv,
           platform,
-        },
+        }),
       );
+      if (execution.signal?.aborted) {
+        throw new Error("aborted");
+      }
       const child = spawnProcess(prepared.command, prepared.args, {
         cwd,
         detached: platform !== "win32",

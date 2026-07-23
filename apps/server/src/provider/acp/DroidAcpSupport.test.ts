@@ -41,7 +41,7 @@ describe("buildDroidAcpSpawnInput", () => {
     expect(spawn.args).toEqual(["exec", "--output-format", "acp"]);
     expect(spawn.cwd).toBe("/tmp/project");
     expect(spawn.command.length).toBeGreaterThan(0);
-    expect(spawn.env).toBeDefined();
+    expect(spawn.env?.FACTORY_DROID_AUTO_UPDATE_ENABLED).toBe("false");
   });
 
   it("passes model, reasoning effort, full-access, and an appended system prompt", () => {
@@ -70,7 +70,7 @@ describe("buildDroidAcpSpawnInput", () => {
       "high",
     ]);
     expect(spawn.cwd).toBe("/tmp/project");
-    expect(spawn.env).toBeDefined();
+    expect(spawn.env?.FACTORY_DROID_AUTO_UPDATE_ENABLED).toBe("false");
   });
 });
 

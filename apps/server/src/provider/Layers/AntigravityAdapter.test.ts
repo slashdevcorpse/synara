@@ -13,6 +13,7 @@ import { Effect, Layer } from "effect";
 import { describe, expect, it, vi } from "vitest";
 
 import { ServerConfig } from "../../config";
+import { ANTIGRAVITY_WINDOWS_UNAVAILABLE_MESSAGE } from "../antigravityAvailability.ts";
 import type { ProviderMaintenanceOwnedResourceCoordinator } from "../providerMaintenanceOwnedResources";
 import { makeProviderProcessOwnerTracker } from "../providerProcessOwnerTracker.ts";
 import { AntigravityAdapter, type AntigravityAdapterShape } from "../Services/AntigravityAdapter";
@@ -245,6 +246,79 @@ async function startFakeAdapterTurn(input: {
     },
   );
 }
+
+describe("Antigravity platform availability", () => {
+  it("fails closed on Windows before plugin installation, model discovery, or provider spawn", async () => {
+    const installCapturePlugin = vi.fn(async () => undefined);
+    const spawnProcess = vi.fn<NonNullable<AntigravityProcessDependencies["spawnProcess"]>>(() => {
+      throw new Error("Antigravity must not spawn on Windows");
+    });
+    const threadId = ThreadId.makeUnsafe(`antigravity-windows-${crypto.randomUUID()}`);
+
+    await runWithAdapter(
+      {
+        platform: "win32",
+        installCapturePlugin,
+        spawnProcess,
+      },
+      async (adapter) => {
+        await expect(
+          Effect.runPromise(
+            adapter.startSession({
+              provider: "antigravity",
+              threadId,
+              runtimeMode: "full-access",
+              providerOptions: { antigravity: { binaryPath: "agy.exe" } },
+            }),
+          ),
+        ).rejects.toThrow(ANTIGRAVITY_WINDOWS_UNAVAILABLE_MESSAGE);
+        await expect(
+          Effect.runPromise(
+            adapter.listModels!({
+              provider: "antigravity",
+              binaryPath: "agy.exe",
+            }),
+          ),
+        ).rejects.toThrow(ANTIGRAVITY_WINDOWS_UNAVAILABLE_MESSAGE);
+        expect(await Effect.runPromise(adapter.listSessions())).toEqual([]);
+      },
+    );
+
+    expect(installCapturePlugin).not.toHaveBeenCalled();
+    expect(spawnProcess).not.toHaveBeenCalled();
+  });
+
+  it("preserves non-Windows session startup and plugin installation", async () => {
+    const installCapturePlugin = vi.fn(async () => undefined);
+    const spawnProcess = vi.fn<NonNullable<AntigravityProcessDependencies["spawnProcess"]>>(() => {
+      throw new Error("session startup must not spawn a turn process");
+    });
+    const threadId = ThreadId.makeUnsafe(`antigravity-linux-${crypto.randomUUID()}`);
+
+    await runWithAdapter(
+      {
+        platform: "linux",
+        installCapturePlugin,
+        spawnProcess,
+      },
+      async (adapter) => {
+        await expect(
+          Effect.runPromise(
+            adapter.startSession({
+              provider: "antigravity",
+              threadId,
+              runtimeMode: "full-access",
+              providerOptions: { antigravity: { binaryPath: "agy" } },
+            }),
+          ),
+        ).resolves.toMatchObject({ provider: "antigravity", status: "ready", threadId });
+      },
+    );
+
+    expect(installCapturePlugin).toHaveBeenCalledExactlyOnceWith("agy");
+    expect(spawnProcess).not.toHaveBeenCalled();
+  });
+});
 
 describe("Antigravity CLI model translation", () => {
   it("collapses CLI model/effort labels into base models with effort ladders", () => {
