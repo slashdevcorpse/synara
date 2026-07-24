@@ -599,7 +599,7 @@ jobs:
   macos_arm64:
     name: macos_arm64
     if: false
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 60
     steps:
       - name: Checkout
