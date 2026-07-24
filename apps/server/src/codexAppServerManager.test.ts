@@ -769,6 +769,7 @@ describe("Codex app-server teardown", () => {
     readonly pid: number;
     readonly teardownProcessTree: RetainedTeardownProcessTree;
     readonly discoveryKey?: string;
+    readonly discoveryCwd?: string;
   }) => {
     const child = new FakeCodexLifecycleChild(input.pid);
     const fallbackTeardownProcessTree = vi.fn(async () => {
@@ -808,7 +809,7 @@ describe("Codex app-server teardown", () => {
         status: "ready",
         threadId: input.threadId,
         runtimeMode: "full-access",
-        ...(input.discoveryKey ? { cwd: input.discoveryKey } : {}),
+        ...(input.discoveryKey ? { cwd: input.discoveryCwd ?? input.discoveryKey } : {}),
         createdAt: "2026-07-14T00:00:00.000Z",
         updatedAt: "2026-07-14T00:00:00.000Z",
       },
@@ -1176,6 +1177,81 @@ describe("Codex app-server teardown", () => {
       expect(hasOwnedContext()).toBe(false);
     },
   );
+
+  it("does not reuse a profile-keyed discovery runtime after a transport failure", async () => {
+    let resolveExitProof: (() => void) | undefined;
+    const exitProof = new Promise<void>((resolve) => {
+      resolveExitProof = resolve;
+    });
+    const teardownProcessTree = vi.fn(
+      async (input: { readonly rootPid: number; readonly rootExited: Promise<unknown> }) => {
+        await input.rootExited;
+        await exitProof;
+        return { escalated: false as const, signalErrors: [] };
+      },
+    );
+    const cwd = "C:\\workspace\\profile-keyed";
+    const profile = {
+      binaryPath: "C:\\Users\\test\\AppData\\Roaming\\npm\\codex.cmd",
+      homePath: "C:\\Users\\test\\.codex",
+    } satisfies CodexDiscoveryProfile;
+    const discoveryKey = JSON.stringify({
+      cwd,
+      profile: codexDiscoveryProfileKey(profile),
+    });
+    const threadId = asThreadId("__codex_discovery__:profile-keyed");
+    const { child, context, hasOwnedContext, manager, revokeSessionToken } =
+      createSpontaneousExitHarness({
+        threadId,
+        pid: 5959,
+        teardownProcessTree,
+        discoveryKey,
+        discoveryCwd: cwd,
+      });
+
+    child.stdout.emit("end");
+    await Promise.resolve();
+
+    const stopPromise = (context as typeof context & { stopPromise?: Promise<void> }).stopPromise;
+    expect(stopPromise).toBeInstanceOf(Promise);
+    expect(context.stopping).toBe(true);
+    expect(teardownProcessTree).toHaveBeenCalledTimes(1);
+    expect(hasOwnedContext()).toBe(true);
+
+    child.exitCode = 1;
+    child.emit("exit", 1, null);
+    resolveExitProof?.();
+    await stopPromise;
+
+    expect(revokeSessionToken).toHaveBeenCalledOnce();
+    expect(hasOwnedContext()).toBe(false);
+
+    const replacementContext = {
+      child: { killed: false },
+      stopping: false,
+    };
+    const internals = manager as unknown as {
+      discoverySessions: Map<string, unknown>;
+      discoverySessionIdleTimers: Map<string, ReturnType<typeof setTimeout>>;
+      getOrCreateDiscoverySession: (
+        cwd: string,
+        profile: CodexDiscoveryProfile,
+      ) => Promise<unknown>;
+    };
+    internals.discoverySessions.set(discoveryKey, replacementContext);
+
+    const nextContext = await internals.getOrCreateDiscoverySession(cwd, profile);
+
+    expect(nextContext).toBe(replacementContext);
+    expect(nextContext).not.toBe(context);
+
+    const idleTimer = internals.discoverySessionIdleTimers.get(discoveryKey);
+    if (idleTimer) {
+      clearTimeout(idleTimer);
+    }
+    internals.discoverySessionIdleTimers.delete(discoveryKey);
+    internals.discoverySessions.delete(discoveryKey);
+  });
 });
 
 describe("classifyCodexStderrLine", () => {

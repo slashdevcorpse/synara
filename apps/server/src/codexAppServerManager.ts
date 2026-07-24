@@ -2596,7 +2596,7 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
     this.emitErrorEvent(context, "protocol/transportError", message);
 
     const stopping = context.discovery
-      ? this.stopDiscoverySession(context.session.cwd ?? "")
+      ? this.stopDiscoverySession(context.discoveryKey ?? "")
       : this.stopSession(context.session.threadId);
     void stopping.catch((stopError) => {
       log.error("failed to stop Codex session after transport error", {
