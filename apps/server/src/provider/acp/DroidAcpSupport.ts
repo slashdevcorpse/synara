@@ -59,7 +59,6 @@ const DROID_DEFAULT_MODE_ID = "normal";
 const DROID_PLAN_MODE_ID = "spec";
 
 const DROID_API_KEY_AUTH_METHOD_ID = "factory-api-key";
-const DROID_DEVICE_PAIRING_AUTH_METHOD_ID = "device-pairing";
 const DROID_API_KEY_ENV_KEYS = ["FACTORY_API_KEY"] as const;
 
 export function getDroidApiKeyEnv(env: NodeJS.ProcessEnv = process.env): string | undefined {
@@ -139,23 +138,17 @@ function availableAuthMethodIds(
 
 export const resolveDroidAcpAuthMethodId = (
   initializeResult: EffectAcpSchema.InitializeResponse,
-): Effect.Effect<string, EffectAcpErrors.AcpError> =>
+): Effect.Effect<string | undefined, EffectAcpErrors.AcpError> =>
   Effect.gen(function* () {
     const authMethodIds = availableAuthMethodIds(initializeResult);
     if (hasDroidApiKeyEnv() && authMethodIds.has(DROID_API_KEY_AUTH_METHOD_ID)) {
       return DROID_API_KEY_AUTH_METHOD_ID;
     }
-    if (authMethodIds.has(DROID_DEVICE_PAIRING_AUTH_METHOD_ID)) {
-      return DROID_DEVICE_PAIRING_AUTH_METHOD_ID;
-    }
-    return yield* new EffectAcpErrorsRuntime.AcpRequestError({
-      code: -32602,
-      errorMessage: "Droid ACP authentication is unavailable.",
-      data: {
-        authMethods: [...authMethodIds],
-        detail: "Run `droid` to authenticate locally, or set FACTORY_API_KEY.",
-      },
-    });
+    // `authMethods` advertises capabilities, not current auth state. Automatic
+    // device pairing is interactive and can hang a headless desktop child.
+    // Let session/new validate an existing cached login and return auth_required
+    // immediately when the user needs to sign in.
+    return undefined;
   });
 
 export const makeDroidAcpRuntime = (

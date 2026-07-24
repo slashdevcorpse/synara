@@ -3336,6 +3336,153 @@ it.effect("restores pending turn-start metadata across projection pipeline resta
   ),
 );
 
+it.layer(
+  Layer.fresh(makeProjectionPipelinePrefixedTestLayer("synara-failed-turn-start-cleanup-")),
+)("OrchestrationProjectionPipeline", (it) => {
+  it.effect("clears only the pending turn start correlated to a provider failure on replay", () =>
+    Effect.gen(function* () {
+      const eventStore = yield* OrchestrationEventStore;
+      const projectionPipeline = yield* OrchestrationProjectionPipeline;
+      const sql = yield* SqlClient.SqlClient;
+      const threadId = ThreadId.makeUnsafe("thread-failed-start-cleanup");
+      const firstMessageId = MessageId.makeUnsafe("message-failed-start-first");
+      const secondMessageId = MessageId.makeUnsafe("message-failed-start-second");
+
+      yield* eventStore.append({
+        type: "thread.turn-start-requested",
+        eventId: EventId.makeUnsafe("evt-failed-start-1"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: "2026-07-24T10:00:00.000Z",
+        commandId: CommandId.makeUnsafe("cmd-failed-start-1"),
+        causationEventId: null,
+        correlationId: CorrelationId.makeUnsafe("cmd-failed-start-1"),
+        metadata: {},
+        payload: {
+          threadId,
+          messageId: firstMessageId,
+          runtimeMode: "approval-required",
+          createdAt: "2026-07-24T10:00:00.000Z",
+        },
+      });
+      yield* eventStore.append({
+        type: "thread.session-set",
+        eventId: EventId.makeUnsafe("evt-failed-start-2"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: "2026-07-24T10:00:01.000Z",
+        commandId: CommandId.makeUnsafe("cmd-failed-start-2"),
+        causationEventId: null,
+        correlationId: CorrelationId.makeUnsafe("cmd-failed-start-2"),
+        metadata: {},
+        payload: {
+          threadId,
+          session: {
+            threadId,
+            status: "ready",
+            providerName: "codex",
+            runtimeMode: "approval-required",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: "2026-07-24T10:00:01.000Z",
+          },
+        },
+      });
+      yield* eventStore.append({
+        type: "thread.turn-start-requested",
+        eventId: EventId.makeUnsafe("evt-failed-start-3"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: "2026-07-24T10:00:02.000Z",
+        commandId: CommandId.makeUnsafe("cmd-failed-start-3"),
+        causationEventId: null,
+        correlationId: CorrelationId.makeUnsafe("cmd-failed-start-3"),
+        metadata: {},
+        payload: {
+          threadId,
+          messageId: secondMessageId,
+          runtimeMode: "approval-required",
+          createdAt: "2026-07-24T10:00:02.000Z",
+        },
+      });
+      yield* eventStore.append({
+        type: "thread.activity-appended",
+        eventId: EventId.makeUnsafe("evt-failed-start-4"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: "2026-07-24T10:00:03.000Z",
+        commandId: CommandId.makeUnsafe("cmd-failed-start-4"),
+        causationEventId: null,
+        correlationId: CorrelationId.makeUnsafe("cmd-failed-start-4"),
+        metadata: {},
+        payload: {
+          threadId,
+          activity: {
+            id: EventId.makeUnsafe("activity-failed-start-4"),
+            tone: "error",
+            kind: "provider.turn.start.failed",
+            summary: "Provider turn start failed",
+            payload: {
+              detail: "late failure for the first request",
+              messageId: firstMessageId,
+            },
+            turnId: null,
+            createdAt: "2026-07-24T10:00:03.000Z",
+          },
+        },
+      });
+
+      yield* projectionPipeline.bootstrap;
+
+      const pendingAfterLateFailure = yield* sql<{ readonly messageId: string }>`
+        SELECT pending_message_id AS "messageId"
+        FROM projection_turns
+        WHERE thread_id = ${threadId}
+          AND turn_id IS NULL
+          AND state = 'pending'
+      `;
+      assert.deepEqual(pendingAfterLateFailure, [{ messageId: secondMessageId }]);
+
+      const appendAndProject = makeAppendAndProject(eventStore, projectionPipeline);
+      yield* appendAndProject({
+        type: "thread.activity-appended",
+        eventId: EventId.makeUnsafe("evt-failed-start-5"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: "2026-07-24T10:00:04.000Z",
+        commandId: CommandId.makeUnsafe("cmd-failed-start-5"),
+        causationEventId: null,
+        correlationId: CorrelationId.makeUnsafe("cmd-failed-start-5"),
+        metadata: {},
+        payload: {
+          threadId,
+          activity: {
+            id: EventId.makeUnsafe("activity-failed-start-5"),
+            tone: "error",
+            kind: "provider.turn.start.failed",
+            summary: "Provider turn start failed",
+            payload: {
+              detail: "failure for the active request",
+              messageId: secondMessageId,
+            },
+            turnId: null,
+            createdAt: "2026-07-24T10:00:04.000Z",
+          },
+        },
+      });
+
+      const pendingAfterMatchingFailure = yield* sql<{ readonly messageId: string }>`
+        SELECT pending_message_id AS "messageId"
+        FROM projection_turns
+        WHERE thread_id = ${threadId}
+          AND turn_id IS NULL
+          AND state = 'pending'
+      `;
+      assert.deepEqual(pendingAfterMatchingFailure, []);
+    }),
+  );
+});
+
 const engineLayer = it.layer(
   OrchestrationEngineLive.pipe(
     Layer.provide(OrchestrationProjectionPipelineLive),

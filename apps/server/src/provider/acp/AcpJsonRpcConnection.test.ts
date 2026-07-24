@@ -24,6 +24,37 @@ const mockAgentPath = path.join(__dirname, "../../../scripts/acp-mock-agent.ts")
 const bunExe = process.execPath;
 
 describe("AcpSessionRuntime", () => {
+  it.effect("allows an explicit resolver to skip interactive authentication", () => {
+    const requestEvents: Array<AcpSessionRequestLogEvent> = [];
+    return Effect.gen(function* () {
+      const runtime = yield* AcpSessionRuntime;
+      const started = yield* runtime.start();
+
+      expect(started.sessionSetupMethod).toBe("new");
+      expect(requestEvents.some((event) => event.method === "initialize")).toBe(true);
+      expect(requestEvents.some((event) => event.method === "authenticate")).toBe(false);
+      expect(requestEvents.some((event) => event.method === "session/new")).toBe(true);
+    }).pipe(
+      Effect.provide(
+        acpTestRuntimeLayer({
+          spawn: {
+            command: bunExe,
+            args: [mockAgentPath],
+          },
+          cwd: process.cwd(),
+          clientInfo: { name: "synara-test", version: "0.0.0" },
+          resolveAuthMethodId: () => Effect.succeed(undefined),
+          requestLogger: (event) =>
+            Effect.sync(() => {
+              requestEvents.push(event);
+            }),
+        }),
+      ),
+      Effect.scoped,
+      Effect.provide(NodeServices.layer),
+    );
+  });
+
   it.effect("merges custom initialize client capabilities into the ACP handshake", () => {
     const requestEvents: Array<AcpSessionRequestLogEvent> = [];
     return Effect.gen(function* () {

@@ -161,6 +161,14 @@ function toNonEmptyProviderInput(value: string | undefined): string | undefined 
   return normalized && normalized.length > 0 ? normalized : undefined;
 }
 
+function providerFailureDisplayDetail(cause: Cause.Cause<ProviderServiceError>): string {
+  const diagnosticDetail = Cause.pretty(cause);
+  return Option.match(Cause.findErrorOption(cause), {
+    onNone: () => diagnosticDetail,
+    onSome: (error) => error.message.trim() || diagnosticDetail,
+  });
+}
+
 // Codex app-server still expects `$skill` text next to the structured skill item.
 export function normalizeSkillMentionTextForProvider(input: {
   readonly provider: ProviderKind;
@@ -524,6 +532,7 @@ const make = Effect.gen(function* () {
     readonly lifecycleGeneration?: string;
     readonly responseCommandId?: CommandId;
     readonly settlementStatus?: "retryable" | "uncertain";
+    readonly messageId?: MessageId;
   }) =>
     orchestrationEngine.dispatch({
       type: "thread.activity.append",
@@ -540,6 +549,7 @@ const make = Effect.gen(function* () {
           ...(input.lifecycleGeneration ? { lifecycleGeneration: input.lifecycleGeneration } : {}),
           ...(input.responseCommandId ? { responseCommandId: input.responseCommandId } : {}),
           ...(input.settlementStatus ? { settlementStatus: input.settlementStatus } : {}),
+          ...(input.messageId ? { messageId: input.messageId } : {}),
         },
         turnId: input.turnId,
         createdAt: input.createdAt,
@@ -1873,6 +1883,7 @@ const make = Effect.gen(function* () {
           detail: `User message '${event.payload.messageId}' was not found for turn start request.`,
           turnId: null,
           createdAt: event.payload.createdAt,
+          messageId: event.payload.messageId,
         });
         return;
       }
@@ -2004,7 +2015,13 @@ const make = Effect.gen(function* () {
       }).pipe(
         Effect.catchCause((cause) =>
           Effect.gen(function* () {
-            const detail = Cause.pretty(cause);
+            const diagnosticDetail = Cause.pretty(cause);
+            const detail = providerFailureDisplayDetail(cause);
+            yield* Effect.logError("provider turn start failed", {
+              threadId: event.payload.threadId,
+              messageId: message.id,
+              cause: diagnosticDetail,
+            });
             yield* appendProviderFailureActivity({
               threadId: event.payload.threadId,
               kind: "provider.turn.start.failed",
@@ -2012,6 +2029,7 @@ const make = Effect.gen(function* () {
               detail,
               turnId: null,
               createdAt: event.payload.createdAt,
+              messageId: message.id,
             });
             yield* setThreadSessionError({
               threadId: event.payload.threadId,

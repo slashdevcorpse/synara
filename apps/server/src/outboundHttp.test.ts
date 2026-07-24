@@ -1,4 +1,8 @@
-import { encodeOutboundMultipart, OutboundHttpError } from "@synara/shared/outboundHttp";
+import {
+  encodeOutboundMultipart,
+  makePinnedDnsLookup,
+  OutboundHttpError,
+} from "@synara/shared/outboundHttp";
 import {
   assertJsonWithinLimits,
   assertOutboundUrlAllowed,
@@ -81,5 +85,21 @@ describe("outbound HTTP policy", () => {
         { maxBytes: 1_024 },
       ),
     ).toThrowError(/content type is invalid/u);
+  });
+
+  it("returns the pinned address array when Node requests all DNS results", () => {
+    const pinned = { address: "203.0.113.7", family: 4 as const };
+    const lookup = makePinnedDnsLookup(pinned);
+    let lookupResult: unknown;
+    let lookupFamily: number | undefined;
+
+    lookup("usage.example", { all: true }, (error, address, family) => {
+      expect(error).toBeNull();
+      lookupResult = address;
+      lookupFamily = family;
+    });
+
+    expect(lookupResult).toEqual([pinned]);
+    expect(lookupFamily).toBeUndefined();
   });
 });

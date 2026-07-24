@@ -304,19 +304,19 @@ describe("resolveDroidAcpAuthMethodId", () => {
     expect(id).toBe("factory-api-key");
   });
 
-  it("falls back to device-pairing", async () => {
+  it("skips interactive device-pairing when no API key is configured", async () => {
     delete process.env.FACTORY_API_KEY;
     const id = await Effect.runPromise(
       resolveDroidAcpAuthMethodId(initializeWithAuthMethods(["device-pairing"])),
     );
-    expect(id).toBe("device-pairing");
+    expect(id).toBeUndefined();
   });
 
-  it("fails when no auth method is available", async () => {
+  it("lets session creation validate a cached login when no auth method is advertised", async () => {
     delete process.env.FACTORY_API_KEY;
-    const error = await Effect.runPromise(
-      resolveDroidAcpAuthMethodId(initializeWithAuthMethods([])).pipe(Effect.flip),
+    const id = await Effect.runPromise(
+      resolveDroidAcpAuthMethodId(initializeWithAuthMethods([])),
     );
-    expect(error).toBeInstanceOf(EffectAcpErrors.AcpRequestError);
+    expect(id).toBeUndefined();
   });
 });
