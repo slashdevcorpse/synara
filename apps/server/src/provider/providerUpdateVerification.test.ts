@@ -6,6 +6,7 @@ import { TestClock } from "effect/testing";
 import {
   PROVIDER_UPDATE_POST_PROBE_RETRY_DELAYS_MS,
   shouldRetryDelayedProviderUpdateVersion,
+  shouldRunWindowsDroidPendingUpdateBootstrapProbe,
   verifyDelayedProviderUpdateVersion,
   type ProviderUpdateVerificationSnapshot,
 } from "./providerUpdateVerification.ts";
@@ -29,6 +30,79 @@ function snapshot(
     targetChanged: options?.targetChanged ?? false,
   };
 }
+
+describe("shouldRunWindowsDroidPendingUpdateBootstrapProbe", () => {
+  it("selects only an unchanged Windows native Droid update", () => {
+    assert.strictEqual(
+      shouldRunWindowsDroidPendingUpdateBootstrapProbe({
+        platform: "win32",
+        provider: "droid",
+        updateChannelKind: "native-self-update",
+        beforeVersion: "0.174.0",
+        initialSnapshot: snapshot("0.174.0"),
+      }),
+      true,
+    );
+  });
+
+  it("excludes npm-managed Droid and inconclusive verification evidence", () => {
+    const excludedCases = [
+      {
+        platform: "win32" as const,
+        provider: "droid" as const,
+        updateChannelKind: "package-dist-tag" as const,
+        beforeVersion: "0.174.0",
+        initialSnapshot: snapshot("0.174.0"),
+      },
+      {
+        platform: "linux" as const,
+        provider: "droid" as const,
+        updateChannelKind: "native-self-update" as const,
+        beforeVersion: "0.174.0",
+        initialSnapshot: snapshot("0.174.0"),
+      },
+      {
+        platform: "win32" as const,
+        provider: "kilo" as const,
+        updateChannelKind: "native-self-update" as const,
+        beforeVersion: "0.174.0",
+        initialSnapshot: snapshot("0.174.0"),
+      },
+      {
+        platform: "win32" as const,
+        provider: "droid" as const,
+        updateChannelKind: "native-self-update" as const,
+        beforeVersion: null,
+        initialSnapshot: snapshot("0.174.0"),
+      },
+      {
+        platform: "win32" as const,
+        provider: "droid" as const,
+        updateChannelKind: "native-self-update" as const,
+        beforeVersion: "0.174.0",
+        initialSnapshot: snapshot("0.178.0"),
+      },
+      {
+        platform: "win32" as const,
+        provider: "droid" as const,
+        updateChannelKind: "native-self-update" as const,
+        beforeVersion: "0.174.0",
+        initialSnapshot: snapshot("0.174.0", { targetChanged: true }),
+      },
+      {
+        platform: "win32" as const,
+        provider: "droid" as const,
+        updateChannelKind: "native-self-update" as const,
+        beforeVersion: "0.174.0",
+        initialSnapshot: snapshot(null, { available: false }),
+      },
+    ];
+
+    for (const testCase of excludedCases) {
+      assert.strictEqual(shouldRunWindowsDroidPendingUpdateBootstrapProbe(testCase), false);
+    }
+  });
+});
 
 describe("verifyDelayedProviderUpdateVersion", () => {
   it("limits delayed replacement retries to Windows", () => {

@@ -1,5 +1,7 @@
-import type { ServerProviderStatus } from "@synara/contracts";
+import type { ProviderKind, ServerProviderStatus } from "@synara/contracts";
 import { Duration, Effect } from "effect";
+
+import type { ProviderMaintenanceChannelIdentity } from "./providerMaintenance.ts";
 
 export const PROVIDER_UPDATE_POST_PROBE_RETRY_DELAYS_MS = [250, 750, 1_500, 2_500] as const;
 
@@ -21,6 +23,21 @@ function mayStillBeReplacing(
     !snapshot.targetChanged &&
     snapshot.status.available &&
     snapshot.status.version === beforeVersion
+  );
+}
+
+export function shouldRunWindowsDroidPendingUpdateBootstrapProbe(input: {
+  readonly platform: NodeJS.Platform;
+  readonly provider: ProviderKind;
+  readonly updateChannelKind: ProviderMaintenanceChannelIdentity["kind"];
+  readonly beforeVersion: string | null;
+  readonly initialSnapshot: ProviderUpdateVerificationSnapshot;
+}): boolean {
+  return (
+    input.platform === "win32" &&
+    input.provider === "droid" &&
+    input.updateChannelKind === "native-self-update" &&
+    mayStillBeReplacing(input.initialSnapshot, input.beforeVersion)
   );
 }
 

@@ -149,6 +149,7 @@ import { quiesceProviderRuntimesForUpdate } from "../providerUpdateQuiescence.ts
 import { classifyCompletedProviderUpdate } from "../providerUpdateOutcome.ts";
 import {
   shouldRetryDelayedProviderUpdateVersion,
+  shouldRunWindowsDroidPendingUpdateBootstrapProbe,
   verifyDelayedProviderUpdateVersion,
   type ProviderUpdateVerificationSnapshot,
 } from "../providerUpdateVerification.ts";
@@ -4204,7 +4205,7 @@ export function makeProviderHealthLive(
           const preflightStatus = yield* enrichProviderStatusWithVersionAdvisory(
             beforeStatus,
             stableCapabilities,
-            { forceRefresh: true },
+            { forceRefresh: true, useAdvisoryLatestVersionSource: true },
           ).pipe(Effect.catch(() => Effect.succeed(beforeStatus)));
           const preflightDecisionGeneration = yield* readUpdateSettingsGeneration();
           if (
@@ -4282,24 +4283,78 @@ export function makeProviderHealthLive(
                   ...(commandUpdate.pathPrepend ? { pathPrepend: commandUpdate.pathPrepend } : {}),
                   teardownFailureRef,
                 }).pipe(Effect.scoped);
+                const commandResults = [commandResult];
                 if (commandResult.exitCode !== 0) {
                   return {
                     _tag: "NonZeroExit",
-                    commandResult,
+                    commandResults,
+                    failedCommandResult: commandResult,
                   } as const;
                 }
 
-                const initialPostProbe = yield* runPostUpdateVerificationProbe(stableGeneration);
+                let verificationGeneration = stableGeneration;
+                let initialPostProbe = yield* runPostUpdateVerificationProbe(stableGeneration);
+                if (
+                  shouldRunWindowsDroidPendingUpdateBootstrapProbe({
+                    platform,
+                    provider,
+                    updateChannelKind: commandUpdate.target.channel.kind,
+                    beforeVersion,
+                    initialSnapshot: initialPostProbe,
+                  })
+                ) {
+                  const bootstrapProbeGeneration = yield* readUpdateSettingsGeneration();
+                  const bootstrapProbeUpdate = bootstrapProbeGeneration.capabilities.update;
+                  if (
+                    !bootstrapProbeUpdate ||
+                    !updateEvidenceGenerationMatches(
+                      provider,
+                      initialPostProbe.generation,
+                      bootstrapProbeGeneration,
+                    )
+                  ) {
+                    initialPostProbe = {
+                      ...initialPostProbe,
+                      targetChanged: true,
+                    };
+                  } else {
+                    yield* maintenanceGate.assertProviderNotLatched({ provider });
+                    // Factory's signed Windows standalone artifact applies a pending replacement
+                    // during process bootstrap, before dispatching the requested subcommand.
+                    // The documented `update --check` remains non-installing; it is only a bounded
+                    // command that starts the exact target through that bootstrap path.
+                    const bootstrapProbeResult = yield* runUpdateCommand({
+                      provider,
+                      command: bootstrapProbeUpdate.executable,
+                      args: ["update", "--check"],
+                      ...(bootstrapProbeUpdate.pathPrepend
+                        ? { pathPrepend: bootstrapProbeUpdate.pathPrepend }
+                        : {}),
+                      teardownFailureRef,
+                    }).pipe(Effect.scoped);
+                    commandResults.push(bootstrapProbeResult);
+                    if (bootstrapProbeResult.exitCode !== 0) {
+                      return {
+                        _tag: "NonZeroExit",
+                        commandResults,
+                        failedCommandResult: bootstrapProbeResult,
+                      } as const;
+                    }
+                    verificationGeneration = bootstrapProbeGeneration;
+                    initialPostProbe =
+                      yield* runPostUpdateVerificationProbe(bootstrapProbeGeneration);
+                  }
+                }
                 const verifiedPostProbe = shouldRetryDelayedProviderUpdateVersion(platform)
                   ? yield* verifyDelayedProviderUpdateVersion({
                       beforeVersion,
                       initialSnapshot: initialPostProbe,
-                      probe: runPostUpdateVerificationProbe(stableGeneration),
+                      probe: runPostUpdateVerificationProbe(verificationGeneration),
                     })
                   : initialPostProbe;
                 return {
                   _tag: "Verified",
-                  commandResult,
+                  commandResults,
                   verifiedPostProbe,
                 } as const;
               }),
@@ -4326,12 +4381,16 @@ export function makeProviderHealthLive(
             return { providers };
           }
           const maintenanceResult = exclusiveResult.success;
-          const result = maintenanceResult.commandResult;
-          const output = [result.stderr, result.stdout].filter(Boolean).join("\n\n").trim() || null;
+          const output =
+            maintenanceResult.commandResults
+              .flatMap((result) => [result.stderr, result.stdout])
+              .filter(Boolean)
+              .join("\n\n")
+              .trim() || null;
           if (maintenanceResult._tag === "NonZeroExit") {
             const providers = yield* markTerminal({
               status: "failed",
-              message: `Update command exited with code ${result.exitCode}.`,
+              message: `Update command exited with code ${maintenanceResult.failedCommandResult.exitCode}.`,
               output: output ? output.slice(0, UPDATE_OUTPUT_MAX_BYTES) : null,
             });
             return { providers };
@@ -4343,7 +4402,7 @@ export function makeProviderHealthLive(
           const postStatus = yield* enrichProviderStatusWithVersionAdvisory(
             afterStatus,
             postCapabilities,
-            { forceRefresh: true },
+            { forceRefresh: true, useAdvisoryLatestVersionSource: true },
           ).pipe(Effect.catch(() => Effect.succeed(afterStatus)));
           const postDecisionGeneration = yield* readUpdateSettingsGeneration();
           const postEvidenceGenerationChanged = !updateEvidenceGenerationMatches(
