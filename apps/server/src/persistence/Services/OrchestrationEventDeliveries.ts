@@ -120,6 +120,18 @@ export interface OrchestrationEventDeliveryRepositoryShape {
     readonly consumerName: string;
     readonly threadId: string;
   }) => Effect.Effect<Option.Option<OrchestrationEventDelivery>, PersistenceSqlError>;
+  readonly firstBlockingDeliveryForThreads: (input: {
+    readonly consumerName: string;
+    readonly threadIds: ReadonlyArray<string>;
+  }) => Effect.Effect<Option.Option<OrchestrationEventDelivery>, PersistenceSqlError>;
+  readonly hasUnsettledDeliveryForThreads: (input: {
+    readonly consumerName: string;
+    readonly threadIds: ReadonlyArray<string>;
+    readonly excludingEventSequence?: number | undefined;
+  }) => Effect.Effect<boolean, PersistenceSqlError>;
+  readonly listUnsettledThreadIds: (
+    consumerName: string,
+  ) => Effect.Effect<ReadonlyArray<string>, PersistenceSqlError>;
   readonly listBlockingDeliveries: (input: {
     readonly consumerName: string;
     readonly threadId?: string | undefined;

@@ -92,6 +92,7 @@ import Migration0073 from "./Migrations/073_ProjectionProjectsArchivedAt.ts";
 import Migration0074 from "./Migrations/074_ProviderRequestAdmissions.ts";
 import Migration0075 from "./Migrations/075_ProjectionTurnSummaries.ts";
 import Migration0076 from "./Migrations/076_ReconcileFailedPendingTurnStarts.ts";
+import Migration0077 from "./Migrations/077_BackfillQuarantinedTurnPromotions.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -183,6 +184,7 @@ export const migrationEntries = [
   [74, "ProviderRequestAdmissions", Migration0074],
   [75, "ProjectionTurnSummaries", Migration0075],
   [76, "ReconcileFailedPendingTurnStarts", Migration0076],
+  [77, "BackfillQuarantinedTurnPromotions", Migration0077],
 ] as const;
 
 export const makeMigrationLoader = (throughId?: number) =>

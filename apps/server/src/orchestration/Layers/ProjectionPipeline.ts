@@ -391,6 +391,7 @@ const THREAD_ACTIVITY_PROJECTION_EVENT_TYPES = new Set<OrchestrationEvent["type"
 
 const THREAD_TURN_PROJECTION_EVENT_TYPES = new Set<OrchestrationEvent["type"]>([
   "thread.turn-start-requested",
+  "thread.session-stop-requested",
   "thread.session-set",
   "thread.turn-diff-completed",
   "thread.reverted",
@@ -1344,6 +1345,19 @@ const makeOrchestrationProjectionPipeline = Effect.gen(function* () {
             interactionMode: event.payload.interactionMode,
             envMode: event.payload.envMode ?? null,
             assistantDeliveryMode: event.payload.assistantDeliveryMode ?? null,
+          });
+          return;
+        }
+
+        case "thread.session-stop-requested": {
+          // The provider reactor treats this durable stop intent as a terminal
+          // cancellation for queued promotions on the requested thread,
+          // including child stops that later publish an interrupted (not
+          // stopped) session. Project the same lifecycle boundary so replay
+          // cannot resurrect its pending placeholder; concrete turns are
+          // preserved by the repository's pending-only delete.
+          yield* projectionTurnRepository.deletePendingTurnStartByThreadId({
+            threadId: event.payload.threadId,
           });
           return;
         }
