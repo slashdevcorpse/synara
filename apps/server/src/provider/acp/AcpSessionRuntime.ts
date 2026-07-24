@@ -123,7 +123,7 @@ export interface AcpSessionRuntimeOptions {
   readonly authMethodId?: string;
   readonly resolveAuthMethodId?: (
     initializeResult: EffectAcpSchema.InitializeResponse,
-  ) => Effect.Effect<string, EffectAcpErrors.AcpError>;
+  ) => Effect.Effect<string | undefined, EffectAcpErrors.AcpError>;
   /**
    * MCP servers to attach to the session. Invoked after `initialize` so the
    * builder can pick a transport based on the agent's advertised
@@ -1233,7 +1233,7 @@ const makeAcpSessionRuntime = (
           ? yield* options.resolveAuthMethodId(initializeResult)
           : options.authMethodId;
 
-      if (!authMethodId) {
+      if (!authMethodId && options.resolveAuthMethodId === undefined) {
         return yield* new EffectAcpErrors.AcpRequestError({
           code: -32602,
           errorMessage: "ACP agent did not provide an authentication method.",
@@ -1241,16 +1241,18 @@ const makeAcpSessionRuntime = (
         });
       }
 
-      const authenticatePayload = {
-        methodId: authMethodId,
-        ...(options.authenticateMeta ? { _meta: options.authenticateMeta } : {}),
-      } satisfies EffectAcpSchema.AuthenticateRequest;
+      if (authMethodId) {
+        const authenticatePayload = {
+          methodId: authMethodId,
+          ...(options.authenticateMeta ? { _meta: options.authenticateMeta } : {}),
+        } satisfies EffectAcpSchema.AuthenticateRequest;
 
-      yield* runLoggedRequest(
-        "authenticate",
-        authenticatePayload,
-        acp.agent.authenticate(authenticatePayload),
-      );
+        yield* runLoggedRequest(
+          "authenticate",
+          authenticatePayload,
+          acp.agent.authenticate(authenticatePayload),
+        );
+      }
 
       const mcpServers = options.buildMcpServers?.(initializeResult) ?? [];
 

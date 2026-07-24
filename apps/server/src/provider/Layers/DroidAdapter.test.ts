@@ -1,12 +1,14 @@
 import * as NodePath from "node:path";
 
-import { TurnId } from "@synara/contracts";
+import { ThreadId, TurnId } from "@synara/contracts";
+import * as EffectAcpErrors from "effect-acp/errors";
 import { describe, expect, it } from "vitest";
 import { SYNARA_HARNESS_POLICY_MARKER } from "../../agentGateway/harnessPolicy.ts";
 
 import {
   isDroidNestedTaskToolCall,
   isRenderableDroidAssistantDelta,
+  mapDroidAcpSessionStartError,
   resolveDroidSessionCwd,
   resolveDroidPermissionPolicy,
   scopeDroidRuntimeItemIdForTurn,
@@ -41,6 +43,26 @@ describe("resolveDroidSessionCwd", () => {
     expect(resolveDroidSessionCwd(undefined, serverConfig, "/thread")).toBe(
       NodePath.resolve("/thread"),
     );
+  });
+});
+
+describe("mapDroidAcpSessionStartError", () => {
+  it("turns ACP auth_required into actionable, non-interactive sign-in guidance", () => {
+    const mapped = mapDroidAcpSessionStartError(
+      ThreadId.makeUnsafe("thread-auth-required"),
+      new EffectAcpErrors.AcpRequestError({
+        code: -32_000,
+        errorMessage: "Authentication required",
+      }),
+    );
+
+    expect(mapped).toMatchObject({
+      method: "authenticate",
+      detail: expect.stringContaining("Run `droid`"),
+    });
+    expect(mapped).toMatchObject({
+      detail: expect.stringContaining("FACTORY_API_KEY"),
+    });
   });
 });
 

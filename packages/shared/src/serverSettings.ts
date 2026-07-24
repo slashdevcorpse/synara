@@ -50,30 +50,53 @@ export function providerStartOptionsFromServerSettings(
   settings: ServerSettings,
 ): ProviderStartOptions {
   const { providers } = settings;
+  const nonEmpty = (value: string): string | undefined => value.trim() || undefined;
+  const codexBinaryPath = nonEmpty(providers.codex.binaryPath);
+  const commandCodeBinaryPath = nonEmpty(providers.commandCode.binaryPath);
+  const claudeBinaryPath = nonEmpty(providers.claudeAgent.binaryPath);
+  const cursorBinaryPath = nonEmpty(providers.cursor.binaryPath);
+  const antigravityBinaryPath = nonEmpty(providers.antigravity.binaryPath);
+  const grokBinaryPath = nonEmpty(providers.grok.binaryPath);
+  const droidBinaryPath = nonEmpty(providers.droid.binaryPath);
+  const kiloBinaryPath = nonEmpty(providers.kilo.binaryPath);
+  const openCodeBinaryPath = nonEmpty(providers.opencode.binaryPath);
+  const piBinaryPath = nonEmpty(providers.pi.binaryPath);
+
   return {
     codex: {
-      binaryPath: providers.codex.binaryPath,
+      ...(codexBinaryPath ? { binaryPath: codexBinaryPath } : {}),
       ...(providers.codex.homePath ? { homePath: providers.codex.homePath } : {}),
     },
-    claudeAgent: { binaryPath: providers.claudeAgent.binaryPath },
+    commandCode: {
+      ...(commandCodeBinaryPath ? { binaryPath: commandCodeBinaryPath } : {}),
+    },
+    claudeAgent: {
+      ...(claudeBinaryPath ? { binaryPath: claudeBinaryPath } : {}),
+    },
     cursor: {
-      binaryPath: providers.cursor.binaryPath,
+      ...(cursorBinaryPath ? { binaryPath: cursorBinaryPath } : {}),
       ...(providers.cursor.apiEndpoint ? { apiEndpoint: providers.cursor.apiEndpoint } : {}),
     },
-    antigravity: { binaryPath: providers.antigravity.binaryPath },
-    grok: { binaryPath: providers.grok.binaryPath },
-    droid: { binaryPath: providers.droid.binaryPath },
+    antigravity: {
+      ...(antigravityBinaryPath ? { binaryPath: antigravityBinaryPath } : {}),
+    },
+    grok: {
+      ...(grokBinaryPath ? { binaryPath: grokBinaryPath } : {}),
+    },
+    droid: {
+      ...(droidBinaryPath ? { binaryPath: droidBinaryPath } : {}),
+    },
     kilo: {
-      binaryPath: providers.kilo.binaryPath,
+      ...(kiloBinaryPath ? { binaryPath: kiloBinaryPath } : {}),
       ...(providers.kilo.serverUrl ? { serverUrl: providers.kilo.serverUrl } : {}),
     },
     opencode: {
-      binaryPath: providers.opencode.binaryPath,
+      ...(openCodeBinaryPath ? { binaryPath: openCodeBinaryPath } : {}),
       ...(providers.opencode.serverUrl ? { serverUrl: providers.opencode.serverUrl } : {}),
       experimentalWebSockets: providers.opencode.experimentalWebSockets,
     },
     pi: {
-      binaryPath: providers.pi.binaryPath,
+      ...(piBinaryPath ? { binaryPath: piBinaryPath } : {}),
       ...(providers.pi.agentDir ? { agentDir: providers.pi.agentDir } : {}),
     },
   };

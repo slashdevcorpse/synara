@@ -31,12 +31,14 @@ import {
   Option,
   PubSub,
   Random,
+  Schema,
   Semaphore,
   Scope,
   Stream,
 } from "effect";
 import { ChildProcessSpawner } from "effect/unstable/process";
 import type * as EffectAcpSchema from "effect-acp/schema";
+import * as EffectAcpErrors from "effect-acp/errors";
 
 import { buildAcpSynaraMcpServers } from "../../agentGateway/mcpInjection.ts";
 import {
@@ -61,6 +63,7 @@ import {
   ProviderAdapterSessionClosedError,
   ProviderAdapterSessionNotFoundError,
   ProviderAdapterValidationError,
+  type ProviderAdapterError,
 } from "../Errors.ts";
 import {
   classifyAcpPromptTurnCompletion,
@@ -156,6 +159,9 @@ const DROID_TURN_WATCHDOG_INTERVAL_MS = 15_000;
 const DROID_NESTED_TASK_IDLE_TIMEOUT_MS = 60 * 60_000;
 const DROID_CANCEL_GRACE_MS = 5_000;
 const DROID_ACP_REQUEST_TIMEOUT_MS = 30_000;
+const DROID_AUTH_REQUIRED_CODE = -32_000;
+const DROID_AUTH_REQUIRED_DETAIL =
+  "Droid needs Factory sign-in. Run `droid` in a terminal and complete sign-in, then retry, or set FACTORY_API_KEY.";
 const DROID_MODEL_DISCOVERY_CACHE_MS = 5 * 60_000;
 const DROID_MODEL_DISCOVERY_TIMEOUT_MS = 30_000;
 const DROID_DISCOVERY_CACHE_MAX_ENTRIES = 16;
@@ -174,6 +180,24 @@ function droidAcpTimeoutError(method: string): ProviderAdapterRequestError {
     method,
     detail: `Droid ACP did not respond to ${method} within ${DROID_ACP_REQUEST_TIMEOUT_MS / 1000}s.`,
   });
+}
+
+export function mapDroidAcpSessionStartError(
+  threadId: ThreadId,
+  error: EffectAcpErrors.AcpError,
+): ProviderAdapterError {
+  if (
+    Schema.is(EffectAcpErrors.AcpRequestError)(error) &&
+    error.code === DROID_AUTH_REQUIRED_CODE
+  ) {
+    return new ProviderAdapterRequestError({
+      provider: PROVIDER,
+      method: "authenticate",
+      detail: DROID_AUTH_REQUIRED_DETAIL,
+      cause: error,
+    });
+  }
+  return mapAcpToAdapterError(PROVIDER, threadId, "session/start", error);
 }
 
 function isDroidAcpDebugEnabled(): boolean {
@@ -987,7 +1011,7 @@ export function makeDroidAdapter(
             Effect.mapError((error) =>
               error instanceof ProviderAdapterRequestError
                 ? error
-                : mapAcpToAdapterError(PROVIDER, input.threadId, "session/start", error),
+                : mapDroidAcpSessionStartError(input.threadId, error),
             ),
           );
 

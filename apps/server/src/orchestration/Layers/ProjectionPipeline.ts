@@ -414,7 +414,8 @@ function shouldApplyThreadTurnsProjection(event: OrchestrationEvent): boolean {
   return (
     THREAD_TURN_PROJECTION_EVENT_TYPES.has(event.type) ||
     (event.type === "thread.activity-appended" &&
-      TURN_SUMMARY_ACTIVITY_KINDS.has(event.payload.activity.kind)) ||
+      (event.payload.activity.kind === "provider.turn.start.failed" ||
+        TURN_SUMMARY_ACTIVITY_KINDS.has(event.payload.activity.kind))) ||
     (event.type === "thread.message-sent" &&
       event.payload.role === "assistant" &&
       event.payload.turnId !== null)
@@ -1640,6 +1641,22 @@ const makeOrchestrationProjectionPipeline = Effect.gen(function* () {
 
         case "thread.activity-appended": {
           const activity = event.payload.activity;
+          if (activity.kind === "provider.turn.start.failed" && activity.turnId === null) {
+            const failedMessageId = payloadNonEmptyString(activity.payload, "messageId");
+            if (failedMessageId === null) return;
+            const pendingTurnStart = yield* projectionTurnRepository.getPendingTurnStartByThreadId({
+              threadId: event.payload.threadId,
+            });
+            if (
+              Option.isSome(pendingTurnStart) &&
+              pendingTurnStart.value.messageId === failedMessageId
+            ) {
+              yield* projectionTurnRepository.deletePendingTurnStartByThreadId({
+                threadId: event.payload.threadId,
+              });
+            }
+            return;
+          }
           if (activity.turnId === null || !TURN_SUMMARY_ACTIVITY_KINDS.has(activity.kind)) return;
           const existing = yield* projectionTurnRepository.getByTurnId({
             threadId: event.payload.threadId,

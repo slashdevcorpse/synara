@@ -297,6 +297,18 @@ async function resolvePinnedAddress(
   return selected;
 }
 
+export function makePinnedDnsLookup(
+  pinned: Readonly<{ address: string; family: 4 | 6 }>,
+): Net.LookupFunction {
+  return (_hostname, options, callback) => {
+    if (options.all) {
+      callback(null, [pinned]);
+      return;
+    }
+    callback(null, pinned.address, pinned.family);
+  };
+}
+
 async function requestHop(input: {
   readonly url: URL;
   readonly method: string;
@@ -323,9 +335,7 @@ async function requestHop(input: {
         method: input.method,
         headers: requestHeaders(input.headers),
         signal: input.signal,
-        lookup: (_hostname, _options, callback) => {
-          callback(null, pinned.address, pinned.family);
-        },
+        lookup: makePinnedDnsLookup(pinned),
       },
       (response) => {
         const headers = responseHeaders(response.headers);

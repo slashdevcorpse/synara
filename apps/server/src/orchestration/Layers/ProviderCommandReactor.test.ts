@@ -3713,6 +3713,55 @@ describe("ProviderCommandReactor", () => {
     });
   });
 
+  it("surfaces provider startup validation failures without persisting stack traces", async () => {
+    const harness = await createHarness();
+    const now = new Date().toISOString();
+    const messageId = asMessageId("user-message-provider-start-validation-fails");
+    const expectedDetail =
+      'Provider validation failed in ProviderService.startSession: Expected a value with a length of at least 1, got "" at ["providerOptions"]["codex"]["binaryPath"]';
+    harness.startSession.mockImplementationOnce(
+      () =>
+        Effect.fail(
+          new ProviderValidationError({
+            operation: "ProviderService.startSession",
+            issue:
+              'Expected a value with a length of at least 1, got "" at ["providerOptions"]["codex"]["binaryPath"]',
+          }),
+        ) as never,
+    );
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.makeUnsafe("cmd-provider-start-validation-fails"),
+        threadId: ThreadId.makeUnsafe("thread-1"),
+        message: {
+          messageId,
+          role: "user",
+          text: "hello reactor",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(async () => (await readHarnessThread(harness))?.session?.status === "error");
+
+    const thread = await readHarnessThread(harness);
+    expect(harness.sendTurn).not.toHaveBeenCalled();
+    expect(thread?.session?.lastError).toBe(expectedDetail);
+    expect(thread?.session?.lastError).not.toContain("at file:///");
+    expect(
+      thread?.activities.find((activity) => activity.kind === "provider.turn.start.failed")
+        ?.payload,
+    ).toMatchObject({
+      detail: expectedDetail,
+      messageId,
+    });
+  });
+
   it("uses the runtime mode requested by thread.turn.start when starting the provider session", async () => {
     const harness = await createHarness();
     const now = new Date().toISOString();
