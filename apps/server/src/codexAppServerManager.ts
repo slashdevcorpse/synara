@@ -1,6 +1,7 @@
 import { type ChildProcess, type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
+import path from "node:path";
 
 import {
   ApprovalRequestId,
@@ -152,6 +153,7 @@ interface CodexSessionContext {
   readonly gatewaySessionLease?: AgentGatewaySessionLease;
   session: ProviderSession;
   lifecycleGeneration?: string;
+  codexProfileKey?: string;
   account: CodexAccountSnapshot;
   child: ChildProcessWithoutNullStreams;
   stdoutFramer: CodexJsonlFramer;
@@ -168,17 +170,34 @@ interface CodexSessionContext {
   stopping: boolean;
   stopPromise?: Promise<void>;
   discovery?: boolean;
+  discoveryKey?: string;
 }
 
-interface CodexSkillListInput {
+export interface CodexDiscoveryProfile {
+  readonly binaryPath: string;
+  readonly homePath?: string;
+}
+
+interface CodexDiscoveryInput {
+  readonly profile: CodexDiscoveryProfile;
+}
+
+interface CodexSkillListInput extends CodexDiscoveryInput {
   readonly cwd: string;
   readonly forceReload?: boolean;
   readonly threadId?: string;
 }
 
-interface CodexPluginListInput extends Omit<ProviderListPluginsInput, "provider"> {}
+interface CodexPluginListInput
+  extends Omit<ProviderListPluginsInput, "provider">, CodexDiscoveryInput {}
 
-interface CodexPluginReadInput extends Omit<ProviderReadPluginInput, "provider"> {}
+interface CodexPluginReadInput
+  extends Omit<ProviderReadPluginInput, "provider">, CodexDiscoveryInput {}
+
+interface CodexModelListInput extends CodexDiscoveryInput {
+  readonly cwd?: string;
+  readonly threadId?: string;
+}
 
 interface JsonRpcError {
   code?: number;
@@ -867,6 +886,73 @@ export interface CodexAppServerManagerEvents {
 
 const CODEX_DISCOVERY_CACHE_MAX_ENTRIES = 128;
 
+function normalizeCodexDiscoveryProfile(profile: CodexDiscoveryProfile): CodexDiscoveryProfile {
+  const binaryPath = profile.binaryPath.trim() || "codex";
+  const homePath = profile.homePath?.trim();
+  return {
+    binaryPath,
+    ...(homePath ? { homePath } : {}),
+  };
+}
+
+function normalizeCodexDiscoveryPathIdentity(
+  value: string,
+  input: {
+    readonly platform: NodeJS.Platform;
+    readonly pathOnly: boolean;
+  },
+): string {
+  if (input.platform !== "win32") {
+    return value;
+  }
+
+  const normalized = path.win32.normalize(value).toLowerCase();
+  const root = path.win32.parse(normalized).root;
+  const withoutTrailingSeparators =
+    normalized.length > root.length ? normalized.replace(/[\\/]+$/u, "") : normalized;
+  if (input.pathOnly || path.win32.isAbsolute(value)) {
+    return withoutTrailingSeparators;
+  }
+
+  // A PATH-resolved command and an explicit relative path can select different
+  // executables, even when Windows normalizes both strings to the same basename.
+  const isExplicitRelativePath =
+    /^[a-z]:/iu.test(value) ||
+    value.includes("\\") ||
+    value.includes("/") ||
+    value === "." ||
+    value === "..";
+  return isExplicitRelativePath
+    ? `relative:${withoutTrailingSeparators}`
+    : withoutTrailingSeparators;
+}
+
+export function codexDiscoveryProfileKey(
+  profile: CodexDiscoveryProfile,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  const normalized = normalizeCodexDiscoveryProfile(profile);
+  return JSON.stringify({
+    binaryPath: normalizeCodexDiscoveryPathIdentity(normalized.binaryPath, {
+      platform,
+      pathOnly: false,
+    }),
+    homePath: normalized.homePath
+      ? normalizeCodexDiscoveryPathIdentity(normalized.homePath, {
+          platform,
+          pathOnly: true,
+        })
+      : null,
+  });
+}
+
+function codexDiscoverySessionKey(cwd: string, profile: CodexDiscoveryProfile): string {
+  return JSON.stringify({
+    cwd,
+    profile: codexDiscoveryProfileKey(profile),
+  });
+}
+
 function getRecentCacheEntry<K, V>(cache: Map<K, V>, key: K): V | undefined {
   const value = cache.get(key);
   if (value === undefined) {
@@ -897,7 +983,11 @@ function setRecentCacheEntry<K, V>(
 export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEvents> {
   private readonly sessions = new Map<ThreadId, CodexSessionContext>();
   private readonly discoverySessions = new Map<string, CodexSessionContext>();
+  private readonly discoverySessionCreations = new Map<string, Promise<CodexSessionContext>>();
   private readonly discoverySessionIdleTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private discoveryLifecycleGeneration = 0;
+  private discoveryStopAllActive = false;
+  private stopAllPromise: Promise<void> | undefined;
   private readonly skillsCache = new Map<string, ProviderListSkillsResult>();
   private readonly pluginsCache = new Map<string, ProviderListPluginsResult>();
   private readonly pluginDetailCache = new Map<string, ProviderReadPluginResult>();
@@ -995,6 +1085,10 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
 
       const codexOptions = readCodexProviderOptions(input);
       const codexHomePath = codexOptions.homePath;
+      const codexProfileKey = codexDiscoveryProfileKey({
+        binaryPath: codexOptions.binaryPath ?? "codex",
+        ...(codexHomePath ? { homePath: codexHomePath } : {}),
+      });
       const codexLaunch = await resolveCodexLaunch({
         binaryPath: codexOptions.binaryPath ?? "codex",
         cwd: resolvedCwd,
@@ -1024,6 +1118,7 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
         ...(input.lifecycleGeneration !== undefined
           ? { lifecycleGeneration: input.lifecycleGeneration }
           : {}),
+        codexProfileKey,
         account: {
           type: "unknown",
           planType: null,
@@ -1518,8 +1613,9 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
   async readExternalThread(input: {
     externalThreadId: string;
     cwd?: string;
+    profile: CodexDiscoveryProfile;
   }): Promise<CodexThreadSnapshot> {
-    const context = await this.resolveContextForDiscovery(undefined, input.cwd);
+    const context = await this.resolveContextForDiscovery(input.profile, undefined, input.cwd);
     const response = await this.sendRequest(context, "thread/read", {
       threadId: input.externalThreadId,
       includeTurns: true,
@@ -1566,6 +1662,10 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
         ...(input.cwd !== undefined ? { cwd: input.cwd } : {}),
       });
       const codexHomePath = codexOptions.homePath;
+      const codexProfileKey = codexDiscoveryProfileKey({
+        binaryPath: codexOptions.binaryPath ?? "codex",
+        ...(codexHomePath ? { homePath: codexHomePath } : {}),
+      });
       const codexLaunch = await resolveCodexLaunch({
         binaryPath: codexOptions.binaryPath ?? "codex",
         cwd: resolvedCwd,
@@ -1592,6 +1692,7 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
       context = {
         ...(gatewaySessionLease ? { gatewaySessionLease } : {}),
         session,
+        codexProfileKey,
         account: {
           type: "unknown",
           planType: null,
@@ -1939,7 +2040,7 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
           this.emitLifecycleEvent(context, input.successEvent.method, input.successEvent.message);
         }
         if (context.discovery) {
-          const discoveryKey = context.session.cwd ?? "";
+          const discoveryKey = context.discoveryKey ?? "";
           if (discoveryKey && this.discoverySessions.get(discoveryKey) === context) {
             this.discoverySessions.delete(discoveryKey);
           }
@@ -2031,11 +2132,38 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
     return this.sessions.has(threadId);
   }
 
-  async stopAll(): Promise<void> {
-    const results = await Promise.allSettled([
+  stopAll(): Promise<void> {
+    if (this.stopAllPromise) {
+      return this.stopAllPromise;
+    }
+
+    this.discoveryStopAllActive = true;
+    this.discoveryLifecycleGeneration += 1;
+    const stopping = this.stopAllContexts();
+    const trackedStopping = stopping.finally(() => {
+      if (this.stopAllPromise === trackedStopping) {
+        this.stopAllPromise = undefined;
+        this.discoveryStopAllActive = false;
+      }
+    });
+    this.stopAllPromise = trackedStopping;
+    return trackedStopping;
+  }
+
+  private async stopAllContexts(): Promise<void> {
+    const pendingDiscoveryCreations = Array.from(this.discoverySessionCreations.values());
+    const initialStops = [
       ...Array.from(this.sessions.keys(), (threadId) => this.stopSession(threadId)),
       ...Array.from(this.discoverySessions.keys(), (key) => this.stopDiscoverySession(key)),
+    ];
+    const [, initialResults] = await Promise.all([
+      Promise.allSettled(pendingDiscoveryCreations),
+      Promise.allSettled(initialStops),
     ]);
+    const finalDiscoveryResults = await Promise.allSettled(
+      Array.from(this.discoverySessions.keys(), (key) => this.stopDiscoverySession(key)),
+    );
+    const results = [...initialResults, ...finalDiscoveryResults];
     const failures = results.flatMap((result) =>
       result.status === "rejected" ? [result.reason] : [],
     );
@@ -2048,8 +2176,11 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
   }
 
   async listSkills(input: CodexSkillListInput): Promise<ProviderListSkillsResult> {
+    const profile = normalizeCodexDiscoveryProfile(input.profile);
+    const profileKey = codexDiscoveryProfileKey(profile);
     const cwd = input.cwd.trim();
     const cacheKey = JSON.stringify({
+      profileKey,
       cwd,
       threadId: input.threadId?.trim() || null,
     });
@@ -2063,7 +2194,7 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
       }
     }
 
-    const context = await this.resolveContextForDiscovery(input.threadId, cwd);
+    const context = await this.resolveContextForDiscovery(profile, input.threadId, cwd);
     let response: Record<string, unknown>;
     try {
       response = await this.sendRequest<Record<string, unknown>>(context, "skills/list", {
@@ -2090,8 +2221,11 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
   }
 
   async listPlugins(input: CodexPluginListInput): Promise<ProviderListPluginsResult> {
+    const profile = normalizeCodexDiscoveryProfile(input.profile);
+    const profileKey = codexDiscoveryProfileKey(profile);
     const cwd = input.cwd?.trim() || null;
     const cacheKey = JSON.stringify({
+      profileKey,
       cwd,
       threadId: input.threadId?.trim() || null,
       forceRemoteSync: input.forceRemoteSync === true,
@@ -2106,7 +2240,11 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
       }
     }
 
-    const context = await this.resolveContextForDiscovery(input.threadId, cwd ?? undefined);
+    const context = await this.resolveContextForDiscovery(
+      profile,
+      input.threadId,
+      cwd ?? undefined,
+    );
     const response = await this.sendRequest<Record<string, unknown>>(context, "plugin/list", {
       ...(cwd ? { cwds: [cwd] } : {}),
       ...(input.forceRemoteSync ? { forceRemoteSync: true } : {}),
@@ -2121,11 +2259,16 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
   }
 
   async readPlugin(input: CodexPluginReadInput): Promise<ProviderReadPluginResult> {
+    const profile = normalizeCodexDiscoveryProfile(input.profile);
+    const profileKey = codexDiscoveryProfileKey(profile);
     const marketplacePath = input.marketplacePath.trim();
     const pluginName = input.pluginName.trim();
     const cacheKey = JSON.stringify({
+      profileKey,
       marketplacePath,
       pluginName,
+      cwd: input.cwd?.trim() || null,
+      threadId: input.threadId?.trim() || null,
     });
     const cached = getRecentCacheEntry(this.pluginDetailCache, cacheKey);
     if (cached) {
@@ -2135,7 +2278,7 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
       };
     }
 
-    const context = await this.resolveContextForDiscovery(undefined);
+    const context = await this.resolveContextForDiscovery(profile, input.threadId, input.cwd);
     const response = await this.sendRequest<Record<string, unknown>>(context, "plugin/read", {
       marketplacePath,
       pluginName,
@@ -2149,8 +2292,16 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
     return result;
   }
 
-  async listModels(threadId?: string): Promise<ProviderListModelsResult> {
-    const cacheKey = threadId?.trim() || "__default__";
+  async listModels(input: CodexModelListInput): Promise<ProviderListModelsResult> {
+    const profile = normalizeCodexDiscoveryProfile(input.profile);
+    const profileKey = codexDiscoveryProfileKey(profile);
+    const cwd = input.cwd?.trim() || null;
+    const threadId = input.threadId?.trim() || null;
+    const cacheKey = JSON.stringify({
+      profileKey,
+      cwd,
+      threadId,
+    });
     const cached = getRecentCacheEntry(this.modelCache, cacheKey);
     if (cached) {
       return {
@@ -2159,7 +2310,11 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
       };
     }
 
-    const context = await this.resolveContextForDiscovery(threadId);
+    const context = await this.resolveContextForDiscovery(
+      profile,
+      threadId ?? undefined,
+      cwd ?? undefined,
+    );
     const response = await this.sendRequest<Record<string, unknown>>(context, "model/list", {
       cursor: null,
       limit: 50,
@@ -2177,11 +2332,13 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
 
   async transcribeVoice(
     input: ServerVoiceTranscriptionInput,
+    profile: CodexDiscoveryProfile,
   ): Promise<ServerVoiceTranscriptionResult> {
     return transcribeVoiceWithChatGptSession({
       request: input,
       resolveAuth: (refreshToken) =>
         this.resolveVoiceTranscriptionAuth({
+          profile,
           cwd: input.cwd,
           ...(input.threadId ? { threadId: input.threadId } : {}),
           refreshToken,
@@ -2217,15 +2374,21 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
   }
 
   private async resolveContextForDiscovery(
+    profile: CodexDiscoveryProfile,
     threadId?: string,
     cwd?: string,
   ): Promise<CodexSessionContext> {
+    const normalizedProfile = normalizeCodexDiscoveryProfile(profile);
+    const profileKey = codexDiscoveryProfileKey(normalizedProfile);
     const normalizedThreadId = threadId?.trim();
     const normalizedCwd = cwd?.trim() || undefined;
     if (normalizedThreadId) {
       try {
         const session = this.requireSession(ThreadId.makeUnsafe(normalizedThreadId));
-        if (!normalizedCwd || session.session.cwd === normalizedCwd) {
+        if (
+          session.codexProfileKey === profileKey &&
+          (!normalizedCwd || session.session.cwd === normalizedCwd)
+        ) {
           return session;
         }
       } catch {
@@ -2239,28 +2402,36 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
         if (
           !activeSession.stopping &&
           !activeSession.child.killed &&
+          activeSession.codexProfileKey === profileKey &&
           activeSession.session.cwd === normalizedCwd
         ) {
           return activeSession;
         }
       }
-      return this.getOrCreateDiscoverySession(normalizedCwd);
+      return this.getOrCreateDiscoverySession(normalizedCwd, normalizedProfile);
     }
-    const firstActive = this.sessions.values().next().value;
+    const firstActive = Array.from(this.sessions.values()).find(
+      (session) =>
+        !session.stopping && !session.child.killed && session.codexProfileKey === profileKey,
+    );
     if (firstActive) {
       return firstActive;
     }
-    return this.getOrCreateDiscoverySession(process.cwd());
+    return this.getOrCreateDiscoverySession(process.cwd(), normalizedProfile);
   }
 
   private async resolveVoiceTranscriptionAuth(input: {
+    readonly profile: CodexDiscoveryProfile;
     readonly cwd?: string;
     readonly threadId?: string;
     readonly refreshToken: boolean;
   }): Promise<CodexVoiceTranscriptionAuthContext> {
     // Voice transcription should always resolve auth from a fresh discovery context
     // instead of reusing a possibly stale thread-bound session token.
-    const context = await this.getOrCreateDiscoverySession(input.cwd?.trim() || process.cwd());
+    const context = await this.getOrCreateDiscoverySession(
+      input.cwd?.trim() || process.cwd(),
+      input.profile,
+    );
     const readAuthStatus = async (refreshToken: boolean) => {
       const response = await this.sendRequest<Record<string, unknown>>(context, "getAuthStatus", {
         includeToken: true,
@@ -2291,29 +2462,79 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
     };
   }
 
-  private async getOrCreateDiscoverySession(cwd: string): Promise<CodexSessionContext> {
-    const normalizedCwd = cwd.trim() || process.cwd();
-    const existing = this.discoverySessions.get(normalizedCwd);
-    if (existing && !existing.stopping && !existing.child.killed) {
-      this.scheduleDiscoverySessionIdleStop(normalizedCwd);
-      return existing;
+  private getOrCreateDiscoverySession(
+    cwd: string,
+    profile: CodexDiscoveryProfile,
+  ): Promise<CodexSessionContext> {
+    if (this.discoveryStopAllActive) {
+      return Promise.reject(
+        new Error("Codex discovery session creation is unavailable while sessions are stopping."),
+      );
     }
+
+    const lifecycleGeneration = this.discoveryLifecycleGeneration;
+    const normalizedCwd = cwd.trim() || process.cwd();
+    const normalizedProfile = normalizeCodexDiscoveryProfile(profile);
+    const profileKey = codexDiscoveryProfileKey(normalizedProfile);
+    const discoveryKey = codexDiscoverySessionKey(normalizedCwd, normalizedProfile);
+    const pending = this.discoverySessionCreations.get(discoveryKey);
+    if (pending) {
+      return pending;
+    }
+
+    const existing = this.discoverySessions.get(discoveryKey);
+    if (existing && !existing.stopping && !existing.child.killed) {
+      this.scheduleDiscoverySessionIdleStop(discoveryKey);
+      return Promise.resolve(existing);
+    }
+
+    const creation = this.createDiscoverySession({
+      normalizedCwd,
+      normalizedProfile,
+      profileKey,
+      discoveryKey,
+      lifecycleGeneration,
+    });
+    const trackedCreation = creation.finally(() => {
+      if (this.discoverySessionCreations.get(discoveryKey) === trackedCreation) {
+        this.discoverySessionCreations.delete(discoveryKey);
+      }
+    });
+    this.discoverySessionCreations.set(discoveryKey, trackedCreation);
+    return trackedCreation;
+  }
+
+  private async createDiscoverySession(input: {
+    readonly normalizedCwd: string;
+    readonly normalizedProfile: CodexDiscoveryProfile;
+    readonly profileKey: string;
+    readonly discoveryKey: string;
+    readonly lifecycleGeneration: number;
+  }): Promise<CodexSessionContext> {
+    const { normalizedCwd, normalizedProfile, profileKey, discoveryKey, lifecycleGeneration } =
+      input;
+    this.assertDiscoveryCreationActive(lifecycleGeneration);
+    const existing = this.discoverySessions.get(discoveryKey);
     if (existing) {
-      await this.stopDiscoverySession(normalizedCwd);
+      await this.stopDiscoverySession(discoveryKey);
+      this.assertDiscoveryCreationActive(lifecycleGeneration);
     }
 
     const now = new Date().toISOString();
-    const codexLaunch = await resolveCodexLaunch({
-      binaryPath: "codex",
+    const codexLaunch = await this.resolveDiscoveryLaunch({
+      binaryPath: normalizedProfile.binaryPath,
       cwd: normalizedCwd,
+      ...(normalizedProfile.homePath ? { homePath: normalizedProfile.homePath } : {}),
     });
+    this.assertDiscoveryCreationActive(lifecycleGeneration);
     await this.assertSupportedCodexCliVersion({
       binaryPath: codexLaunch.binaryPath,
       cwd: normalizedCwd,
       env: codexLaunch.env,
       commandDiscoveryCache: codexLaunch.commandDiscoveryCache,
     });
-    const spawned = spawnCodexAppServer({
+    this.assertDiscoveryCreationActive(lifecycleGeneration);
+    const spawned = this.spawnDiscoveryAppServer({
       binaryPath: codexLaunch.binaryPath,
       cwd: normalizedCwd,
       env: codexLaunch.env,
@@ -2327,10 +2548,11 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
         runtimeMode: "full-access",
         model: CODEX_DEFAULT_MODEL,
         cwd: normalizedCwd,
-        threadId: ThreadId.makeUnsafe(`__codex_discovery__:${normalizedCwd}`),
+        threadId: ThreadId.makeUnsafe(`__codex_discovery__:${randomUUID()}`),
         createdAt: now,
         updatedAt: now,
       },
+      codexProfileKey: profileKey,
       account: {
         type: "unknown",
         planType: null,
@@ -2348,13 +2570,15 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
       nextRequestId: 1,
       stopping: false,
       discovery: true,
+      discoveryKey,
     };
 
-    this.discoverySessions.set(normalizedCwd, context);
+    this.discoverySessions.set(discoveryKey, context);
     this.attachProcessListeners(context);
     try {
       const ownership = await spawned.ownershipReady;
       if (ownership._tag === "NotSpawned") throw ownership.cause;
+      this.assertDiscoveryCreationActive(lifecycleGeneration);
       await this.sendRequest(context, "initialize", buildCodexInitializeParams());
       await this.writeMessage(context, { method: "initialized" });
       await this.registerSynaraSkillsRoot(context);
@@ -2364,13 +2588,39 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
       } catch {
         // Discovery can still function without account metadata.
       }
+      this.assertDiscoveryCreationActive(lifecycleGeneration);
       this.updateSession(context, { status: "ready" });
-      this.scheduleDiscoverySessionIdleStop(normalizedCwd);
+      this.scheduleDiscoverySessionIdleStop(discoveryKey);
       return context;
     } catch (error) {
-      await this.stopDiscoverySession(normalizedCwd);
+      await this.stopDiscoverySession(discoveryKey);
       throw error;
     }
+  }
+
+  private assertDiscoveryCreationActive(lifecycleGeneration: number): void {
+    if (this.discoveryStopAllActive || lifecycleGeneration !== this.discoveryLifecycleGeneration) {
+      throw new Error(
+        "Codex discovery session creation was cancelled because sessions are stopping.",
+      );
+    }
+  }
+
+  private resolveDiscoveryLaunch(input: {
+    readonly binaryPath: string;
+    readonly cwd: string;
+    readonly homePath?: string;
+  }) {
+    return resolveCodexLaunch(input);
+  }
+
+  private spawnDiscoveryAppServer(input: {
+    readonly binaryPath: string;
+    readonly cwd: string;
+    readonly env: NodeJS.ProcessEnv;
+    readonly commandDiscoveryCache: WindowsCommandDiscoveryCache;
+  }) {
+    return spawnCodexAppServer(input);
   }
 
   private scheduleDiscoverySessionIdleStop(discoveryKey: string): void {
@@ -2491,7 +2741,7 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
     this.emitErrorEvent(context, "protocol/transportError", message);
 
     const stopping = context.discovery
-      ? this.stopDiscoverySession(context.session.cwd ?? "")
+      ? this.stopDiscoverySession(context.discoveryKey ?? "")
       : this.stopSession(context.session.threadId);
     void stopping.catch((stopError) => {
       log.error("failed to stop Codex session after transport error", {

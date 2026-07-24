@@ -43,6 +43,7 @@ import {
 import { CodexAdapter, type CodexAdapterShape } from "../Services/CodexAdapter.ts";
 import {
   CodexAppServerManager,
+  type CodexDiscoveryProfile,
   type CodexAppServerSendTurnInput,
   type CodexAppServerStartSessionInput,
 } from "../../codexAppServerManager.ts";
@@ -63,6 +64,7 @@ import { extractProposedPlanMarkdown } from "../planMode.ts";
 import { appendFileAttachmentsPromptBlock } from "../attachmentProjection.ts";
 import { synaraSkillsDir } from "../skillsCatalog.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
+import { ServerSettingsService } from "../../serverSettings.ts";
 
 const PROVIDER = "codex" as const;
 
@@ -1616,6 +1618,7 @@ const makeCodexAdapter = (options?: CodexAdapterLiveOptions) =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystem.FileSystem;
     const serverConfig = yield* Effect.service(ServerConfig);
+    const serverSettings = yield* ServerSettingsService;
     // Optional so adapter tests can run without the gateway layer; when
     // present, every session gets the synara_* MCP tools.
     const agentGatewayCredentials = Option.getOrUndefined(
@@ -1653,6 +1656,42 @@ const makeCodexAdapter = (options?: CodexAdapterLiveOptions) =>
       }),
       (manager) => Effect.promise(() => manager.stopAll()),
     );
+
+    const runCodexDiscovery = <A>(
+      method: string,
+      run: (profile: CodexDiscoveryProfile) => Promise<A>,
+      fallbackDetail = `${method} failed`,
+    ): Effect.Effect<A, ProviderAdapterRequestError> =>
+      serverSettings.getSettings.pipe(
+        Effect.map((settings) => {
+          const codex = settings.providers.codex;
+          return {
+            binaryPath: codex.binaryPath,
+            ...(codex.homePath ? { homePath: codex.homePath } : {}),
+          } satisfies CodexDiscoveryProfile;
+        }),
+        Effect.mapError(
+          (cause) =>
+            new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method,
+              detail: toMessage(cause, fallbackDetail),
+              cause,
+            }),
+        ),
+        Effect.flatMap((profile) =>
+          Effect.tryPromise({
+            try: () => run(profile),
+            catch: (cause) =>
+              new ProviderAdapterRequestError({
+                provider: PROVIDER,
+                method,
+                detail: toMessage(cause, fallbackDetail),
+                cause,
+              }),
+          }),
+        ),
+      );
 
     const prepareCodexManagerTurnInput = (
       input: ProviderSendTurnInput,
@@ -1797,16 +1836,15 @@ const makeCodexAdapter = (options?: CodexAdapterLiveOptions) =>
       );
 
     const readExternalThread: NonNullable<CodexAdapterShape["readExternalThread"]> = (input) =>
-      Effect.tryPromise({
-        try: () => manager.readExternalThread(input),
-        catch: (cause) =>
-          new ProviderAdapterRequestError({
-            provider: PROVIDER,
-            method: "thread/read",
-            detail: toMessage(cause, "Failed to read external Codex thread."),
-            cause,
+      runCodexDiscovery(
+        "thread/read",
+        (profile) =>
+          manager.readExternalThread({
+            ...input,
+            profile,
           }),
-      }).pipe(
+        "Failed to read external Codex thread.",
+      ).pipe(
         Effect.map((snapshot) => ({
           threadId: ThreadId.makeUnsafe(snapshot.threadId),
           turns: snapshot.turns,
@@ -1902,81 +1940,51 @@ const makeCodexAdapter = (options?: CodexAdapterLiveOptions) =>
       Effect.succeed(manager.getComposerCapabilities() satisfies ProviderComposerCapabilities);
 
     const listSkills: NonNullable<CodexAdapterShape["listSkills"]> = (input) =>
-      Effect.tryPromise({
-        try: () =>
-          manager.listSkills({
-            cwd: input.cwd,
-            ...(input.threadId !== undefined ? { threadId: input.threadId } : {}),
-            ...(input.forceReload !== undefined ? { forceReload: input.forceReload } : {}),
-          }),
-        catch: (cause) =>
-          new ProviderAdapterRequestError({
-            provider: PROVIDER,
-            method: "skills/list",
-            detail: toMessage(cause, "skills/list failed"),
-            cause,
-          }),
-      }).pipe(Effect.map((result) => result satisfies ProviderListSkillsResult));
+      runCodexDiscovery("skills/list", (profile) =>
+        manager.listSkills({
+          profile,
+          cwd: input.cwd,
+          ...(input.threadId !== undefined ? { threadId: input.threadId } : {}),
+          ...(input.forceReload !== undefined ? { forceReload: input.forceReload } : {}),
+        }),
+      ).pipe(Effect.map((result) => result satisfies ProviderListSkillsResult));
 
     const listPlugins: NonNullable<CodexAdapterShape["listPlugins"]> = (input) =>
-      Effect.tryPromise({
-        try: () =>
-          manager.listPlugins({
-            ...(input.cwd !== undefined ? { cwd: input.cwd } : {}),
-            ...(input.threadId !== undefined ? { threadId: input.threadId } : {}),
-            ...(input.forceRemoteSync !== undefined
-              ? { forceRemoteSync: input.forceRemoteSync }
-              : {}),
-            ...(input.forceReload !== undefined ? { forceReload: input.forceReload } : {}),
-          }),
-        catch: (cause) =>
-          new ProviderAdapterRequestError({
-            provider: PROVIDER,
-            method: "plugin/list",
-            detail: toMessage(cause, "plugin/list failed"),
-            cause,
-          }),
-      }).pipe(Effect.map((result) => result satisfies ProviderListPluginsResult));
+      runCodexDiscovery("plugin/list", (profile) =>
+        manager.listPlugins({
+          profile,
+          ...(input.cwd !== undefined ? { cwd: input.cwd } : {}),
+          ...(input.threadId !== undefined ? { threadId: input.threadId } : {}),
+          ...(input.forceRemoteSync !== undefined
+            ? { forceRemoteSync: input.forceRemoteSync }
+            : {}),
+          ...(input.forceReload !== undefined ? { forceReload: input.forceReload } : {}),
+        }),
+      ).pipe(Effect.map((result) => result satisfies ProviderListPluginsResult));
 
     const readPlugin: NonNullable<CodexAdapterShape["readPlugin"]> = (input) =>
-      Effect.tryPromise({
-        try: () =>
-          manager.readPlugin({
-            marketplacePath: input.marketplacePath,
-            pluginName: input.pluginName,
-          }),
-        catch: (cause) =>
-          new ProviderAdapterRequestError({
-            provider: PROVIDER,
-            method: "plugin/read",
-            detail: toMessage(cause, "plugin/read failed"),
-            cause,
-          }),
-      }).pipe(Effect.map((result) => result satisfies ProviderReadPluginResult));
+      runCodexDiscovery("plugin/read", (profile) =>
+        manager.readPlugin({
+          profile,
+          marketplacePath: input.marketplacePath,
+          pluginName: input.pluginName,
+          ...(input.cwd !== undefined ? { cwd: input.cwd } : {}),
+          ...(input.threadId !== undefined ? { threadId: input.threadId } : {}),
+        }),
+      ).pipe(Effect.map((result) => result satisfies ProviderReadPluginResult));
 
-    const listModels: NonNullable<CodexAdapterShape["listModels"]> = (_input) =>
-      Effect.tryPromise({
-        try: () => manager.listModels(),
-        catch: (cause) =>
-          new ProviderAdapterRequestError({
-            provider: PROVIDER,
-            method: "model/list",
-            detail: toMessage(cause, "model/list failed"),
-            cause,
-          }),
-      }).pipe(Effect.map((result) => result satisfies ProviderListModelsResult));
+    const listModels: NonNullable<CodexAdapterShape["listModels"]> = (input) =>
+      runCodexDiscovery("model/list", (profile) =>
+        manager.listModels({
+          profile,
+          ...(input.cwd !== undefined ? { cwd: input.cwd } : {}),
+        }),
+      ).pipe(Effect.map((result) => result satisfies ProviderListModelsResult));
 
     const transcribeVoice: NonNullable<CodexAdapterShape["transcribeVoice"]> = (input) =>
-      Effect.tryPromise({
-        try: () => manager.transcribeVoice(input),
-        catch: (cause) =>
-          new ProviderAdapterRequestError({
-            provider: PROVIDER,
-            method: "voice/transcribe",
-            detail: toMessage(cause, "voice/transcribe failed"),
-            cause,
-          }),
-      }).pipe(Effect.map((result) => result satisfies ServerVoiceTranscriptionResult));
+      runCodexDiscovery("voice/transcribe", (profile) =>
+        manager.transcribeVoice(input, profile),
+      ).pipe(Effect.map((result) => result satisfies ServerVoiceTranscriptionResult));
 
     const runtimeEventQueue = yield* Queue.unbounded<ProviderRuntimeEvent>();
 

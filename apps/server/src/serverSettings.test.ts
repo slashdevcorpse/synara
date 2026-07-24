@@ -16,6 +16,10 @@ const runWithSettings = <A, E>(
 ) => Effect.runPromise(effect.pipe(Effect.provide(testLayer)) as Effect.Effect<A, E, never>);
 
 describe("ServerSettingsService", () => {
+  const windowsCodexBinaryPath =
+    "C:\\Users\\test\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\node_modules\\@openai\\codex-win32-x64\\vendor\\x86_64-pc-windows-msvc\\bin\\codex.exe";
+  const windowsCodexHomePath = "C:\\Users\\test\\.super-synara\\codex-home-overlay";
+
   it("loads defaults when settings file does not exist", async () => {
     const settings = await runWithSettings(
       Effect.gen(function* () {
@@ -44,7 +48,8 @@ describe("ServerSettingsService", () => {
           enableProviderUpdateChecks: false,
           providers: {
             codex: {
-              binaryPath: "/usr/local/bin/codex",
+              binaryPath: windowsCodexBinaryPath,
+              homePath: windowsCodexHomePath,
               customModels: ["gpt-custom"],
             },
           },
@@ -56,7 +61,8 @@ describe("ServerSettingsService", () => {
 
     expect(result.updated.enableAssistantStreaming).toBe(true);
     expect(result.updated.enableProviderUpdateChecks).toBe(false);
-    expect(result.updated.providers.codex.binaryPath).toBe("/usr/local/bin/codex");
+    expect(result.updated.providers.codex.binaryPath).toBe(windowsCodexBinaryPath);
+    expect(result.updated.providers.codex.homePath).toBe(windowsCodexHomePath);
     expect(result.parsed).toMatchObject({
       revision: 1,
       migrationVersion: 1,
@@ -65,7 +71,8 @@ describe("ServerSettingsService", () => {
         enableProviderUpdateChecks: false,
         providers: {
           codex: {
-            binaryPath: "/usr/local/bin/codex",
+            binaryPath: windowsCodexBinaryPath,
+            homePath: windowsCodexHomePath,
             customModels: ["gpt-custom"],
           },
         },

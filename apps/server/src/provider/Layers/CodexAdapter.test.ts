@@ -19,10 +19,12 @@ import { Effect, Fiber, FileSystem, Layer, Option, Stream } from "effect";
 
 import {
   CodexAppServerManager,
+  type CodexDiscoveryProfile,
   type CodexAppServerStartSessionInput,
   type CodexAppServerSendTurnInput,
 } from "../../codexAppServerManager.ts";
 import { ServerConfig } from "../../config.ts";
+import { ServerSettingsService } from "../../serverSettings.ts";
 import { ProviderAdapterValidationError } from "../Errors.ts";
 import { CodexAdapter } from "../Services/CodexAdapter.ts";
 import { ProviderSessionDirectory } from "../Services/ProviderSessionDirectory.ts";
@@ -155,6 +157,87 @@ class FakeCodexManager extends CodexAppServerManager {
   }
 }
 
+class DiscoveryRecordingCodexManager extends FakeCodexManager {
+  readonly discoveryCalls: Array<{
+    readonly method: string;
+    readonly profile: CodexDiscoveryProfile;
+    readonly input: unknown;
+  }> = [];
+
+  private record(method: string, profile: CodexDiscoveryProfile, input: unknown): void {
+    this.discoveryCalls.push({
+      method,
+      profile: { ...profile },
+      input,
+    });
+  }
+
+  override async listSkills(input: Parameters<CodexAppServerManager["listSkills"]>[0]) {
+    this.record("skills/list", input.profile, input);
+    return { skills: [], source: "test", cached: false };
+  }
+
+  override async listPlugins(input: Parameters<CodexAppServerManager["listPlugins"]>[0]) {
+    this.record("plugin/list", input.profile, input);
+    return {
+      marketplaces: [],
+      marketplaceLoadErrors: [],
+      remoteSyncError: null,
+      featuredPluginIds: [],
+      source: "test",
+      cached: false,
+    };
+  }
+
+  override async readPlugin(input: Parameters<CodexAppServerManager["readPlugin"]>[0]) {
+    this.record("plugin/read", input.profile, input);
+    return {
+      plugin: {
+        marketplaceName: "test",
+        marketplacePath: input.marketplacePath,
+        summary: {
+          id: "plugin/test",
+          name: input.pluginName,
+          source: { type: "local" as const, path: "C:\\plugins\\test" },
+          installed: true,
+          enabled: true,
+          installPolicy: "INSTALLED_BY_DEFAULT" as const,
+          authPolicy: "ON_USE" as const,
+        },
+        skills: [],
+        apps: [],
+        mcpServers: [],
+      },
+      source: "test",
+      cached: false,
+    };
+  }
+
+  override async listModels(input: Parameters<CodexAppServerManager["listModels"]>[0]) {
+    this.record("model/list", input.profile, input);
+    return { models: [], source: "test", cached: false };
+  }
+
+  override async transcribeVoice(
+    input: Parameters<CodexAppServerManager["transcribeVoice"]>[0],
+    profile: Parameters<CodexAppServerManager["transcribeVoice"]>[1],
+  ) {
+    this.record("voice/transcribe", profile, input);
+    return { text: "transcribed" };
+  }
+
+  override async readExternalThread(
+    input: Parameters<CodexAppServerManager["readExternalThread"]>[0],
+  ) {
+    this.record("thread/read", input.profile, input);
+    return {
+      threadId: input.externalThreadId,
+      turns: [],
+      cwd: input.cwd ?? null,
+    };
+  }
+}
+
 const providerSessionDirectoryTestLayer = Layer.succeed(ProviderSessionDirectory, {
   upsert: () => Effect.void,
   getProvider: () =>
@@ -165,10 +248,116 @@ const providerSessionDirectoryTestLayer = Layer.succeed(ProviderSessionDirectory
   listBindings: () => Effect.succeed([]),
 });
 
+const configuredDiscoveryBinaryPath =
+  "C:\\Users\\example\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\codex.exe";
+const configuredDiscoveryHomePath = "C:\\Users\\example\\.super-synara\\codex-home-overlay";
+const updatedDiscoveryBinaryPath = "D:\\tools\\codex-0.146.0\\codex.exe";
+const updatedDiscoveryHomePath = "D:\\profiles\\codex-home";
+const discoveryManager = new DiscoveryRecordingCodexManager();
+const discoveryLayer = it.layer(
+  makeCodexAdapterLive({ manager: discoveryManager }).pipe(
+    Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
+    Layer.provideMerge(
+      ServerSettingsService.layerTest({
+        providers: {
+          codex: {
+            binaryPath: configuredDiscoveryBinaryPath,
+            homePath: configuredDiscoveryHomePath,
+          },
+        },
+      }),
+    ),
+    Layer.provideMerge(providerSessionDirectoryTestLayer),
+    Layer.provideMerge(NodeServices.layer),
+  ),
+);
+
+discoveryLayer("CodexAdapterLive discovery settings", (it) => {
+  it.effect("uses the current server Codex profile for every discovery surface", () =>
+    Effect.gen(function* () {
+      discoveryManager.discoveryCalls.length = 0;
+      const adapter = yield* CodexAdapter;
+      const settings = yield* ServerSettingsService;
+      const cwd = "C:\\workspaces\\synara";
+
+      yield* adapter.listModels!({
+        provider: "codex",
+        binaryPath: "C:\\client-controlled\\wrong-codex.exe",
+        cwd,
+      });
+      yield* settings.updateSettings({
+        providers: {
+          codex: {
+            binaryPath: updatedDiscoveryBinaryPath,
+            homePath: updatedDiscoveryHomePath,
+          },
+        },
+      });
+      yield* adapter.listModels!({ provider: "codex", cwd });
+      yield* adapter.listSkills!({ provider: "codex", cwd });
+      yield* adapter.listPlugins!({ provider: "codex", cwd });
+      yield* adapter.readPlugin!({
+        provider: "codex",
+        marketplacePath: "C:\\plugins\\marketplace.json",
+        pluginName: "github",
+        cwd,
+      });
+      yield* adapter.transcribeVoice!({
+        provider: "codex",
+        cwd,
+        mimeType: "audio/wav",
+        sampleRateHz: 16_000,
+        durationMs: 1,
+        audioBase64: "AA==",
+      });
+      yield* adapter.readExternalThread!({
+        externalThreadId: "provider-thread-1",
+        cwd,
+      });
+
+      assert.deepEqual(
+        discoveryManager.discoveryCalls.map(({ method, profile }) => ({ method, profile })),
+        [
+          {
+            method: "model/list",
+            profile: {
+              binaryPath: configuredDiscoveryBinaryPath,
+              homePath: configuredDiscoveryHomePath,
+            },
+          },
+          ...[
+            "model/list",
+            "skills/list",
+            "plugin/list",
+            "plugin/read",
+            "voice/transcribe",
+            "thread/read",
+          ].map((method) => ({
+            method,
+            profile: {
+              binaryPath: updatedDiscoveryBinaryPath,
+              homePath: updatedDiscoveryHomePath,
+            },
+          })),
+        ],
+      );
+      const firstModelInput = discoveryManager.discoveryCalls[0]?.input;
+      assert.deepEqual(firstModelInput, {
+        profile: {
+          binaryPath: configuredDiscoveryBinaryPath,
+          homePath: configuredDiscoveryHomePath,
+        },
+        cwd,
+      });
+    }),
+  );
+});
+
 const validationManager = new FakeCodexManager();
 const validationLayer = it.layer(
   makeCodexAdapterLive({ manager: validationManager }).pipe(
     Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
+    Layer.provideMerge(ServerSettingsService.layerTest()),
     Layer.provideMerge(providerSessionDirectoryTestLayer),
     Layer.provideMerge(NodeServices.layer),
   ),
@@ -238,6 +427,7 @@ sessionErrorManager.sendTurnImpl.mockImplementation(async () => {
 const sessionErrorLayer = it.layer(
   makeCodexAdapterLive({ manager: sessionErrorManager }).pipe(
     Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
+    Layer.provideMerge(ServerSettingsService.layerTest()),
     Layer.provideMerge(providerSessionDirectoryTestLayer),
     Layer.provideMerge(NodeServices.layer),
   ),
@@ -306,6 +496,7 @@ const turnPreparationManager = new FakeCodexManager();
 const turnPreparationLayer = it.layer(
   makeCodexAdapterLive({ manager: turnPreparationManager }).pipe(
     Layer.provideMerge(ServerConfig.layerTest(process.cwd(), { prefix: "codex-turn-input-" })),
+    Layer.provideMerge(ServerSettingsService.layerTest()),
     Layer.provideMerge(providerSessionDirectoryTestLayer),
     Layer.provideMerge(NodeServices.layer),
   ),
@@ -435,6 +626,7 @@ const lifecycleManager = new FakeCodexManager();
 const lifecycleLayer = it.layer(
   makeCodexAdapterLive({ manager: lifecycleManager }).pipe(
     Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
+    Layer.provideMerge(ServerSettingsService.layerTest()),
     Layer.provideMerge(providerSessionDirectoryTestLayer),
     Layer.provideMerge(NodeServices.layer),
   ),

@@ -172,6 +172,15 @@ const startTurn = (input: {
     createdAt: nowIso(),
   });
 
+it.live("boots the real Codex orchestration graph with no active sessions", () =>
+  withRealCodexHarness((harness) =>
+    Effect.gen(function* () {
+      assert.equal(harness.adapterHarness, null);
+      assert.deepEqual(yield* harness.providerService.listSessions(), []);
+    }),
+  ),
+);
+
 it.live("runs a single turn end-to-end and persists checkpoint state in sqlite + git", () =>
   withHarness((harness) =>
     Effect.gen(function* () {

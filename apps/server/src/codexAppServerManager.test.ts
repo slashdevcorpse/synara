@@ -34,6 +34,8 @@ import {
   CodexAppServerManager,
   assertSupportedCodexCliVersion,
   classifyCodexStderrLine,
+  codexDiscoveryProfileKey,
+  type CodexDiscoveryProfile,
   formatCodexCliVersionCheckFailure,
   isRecoverableThreadResumeError,
   installCodexAppServerProcessOwnership,
@@ -767,6 +769,7 @@ describe("Codex app-server teardown", () => {
     readonly pid: number;
     readonly teardownProcessTree: RetainedTeardownProcessTree;
     readonly discoveryKey?: string;
+    readonly discoveryCwd?: string;
   }) => {
     const child = new FakeCodexLifecycleChild(input.pid);
     const fallbackTeardownProcessTree = vi.fn(async () => {
@@ -806,7 +809,7 @@ describe("Codex app-server teardown", () => {
         status: "ready",
         threadId: input.threadId,
         runtimeMode: "full-access",
-        ...(input.discoveryKey ? { cwd: input.discoveryKey } : {}),
+        ...(input.discoveryKey ? { cwd: input.discoveryCwd ?? input.discoveryKey } : {}),
         createdAt: "2026-07-14T00:00:00.000Z",
         updatedAt: "2026-07-14T00:00:00.000Z",
       },
@@ -832,7 +835,7 @@ describe("Codex app-server teardown", () => {
       reviewTurnIds: new Set(),
       nextRequestId: 1,
       stopping: false,
-      ...(input.discoveryKey ? { discovery: true } : {}),
+      ...(input.discoveryKey ? { discovery: true, discoveryKey: input.discoveryKey } : {}),
     };
     const internals = manager as unknown as {
       sessions: Map<ThreadId, unknown>;
@@ -1174,6 +1177,81 @@ describe("Codex app-server teardown", () => {
       expect(hasOwnedContext()).toBe(false);
     },
   );
+
+  it("does not reuse a profile-keyed discovery runtime after a transport failure", async () => {
+    let resolveExitProof: (() => void) | undefined;
+    const exitProof = new Promise<void>((resolve) => {
+      resolveExitProof = resolve;
+    });
+    const teardownProcessTree = vi.fn(
+      async (input: { readonly rootPid: number; readonly rootExited: Promise<unknown> }) => {
+        await input.rootExited;
+        await exitProof;
+        return { escalated: false as const, signalErrors: [] };
+      },
+    );
+    const cwd = "C:\\workspace\\profile-keyed";
+    const profile = {
+      binaryPath: "C:\\Users\\test\\AppData\\Roaming\\npm\\codex.cmd",
+      homePath: "C:\\Users\\test\\.codex",
+    } satisfies CodexDiscoveryProfile;
+    const discoveryKey = JSON.stringify({
+      cwd,
+      profile: codexDiscoveryProfileKey(profile),
+    });
+    const threadId = asThreadId("__codex_discovery__:profile-keyed");
+    const { child, context, hasOwnedContext, manager, revokeSessionToken } =
+      createSpontaneousExitHarness({
+        threadId,
+        pid: 5959,
+        teardownProcessTree,
+        discoveryKey,
+        discoveryCwd: cwd,
+      });
+
+    child.stdout.emit("end");
+    await Promise.resolve();
+
+    const stopPromise = (context as typeof context & { stopPromise?: Promise<void> }).stopPromise;
+    expect(stopPromise).toBeInstanceOf(Promise);
+    expect(context.stopping).toBe(true);
+    expect(teardownProcessTree).toHaveBeenCalledTimes(1);
+    expect(hasOwnedContext()).toBe(true);
+
+    child.exitCode = 1;
+    child.emit("exit", 1, null);
+    resolveExitProof?.();
+    await stopPromise;
+
+    expect(revokeSessionToken).toHaveBeenCalledOnce();
+    expect(hasOwnedContext()).toBe(false);
+
+    const replacementContext = {
+      child: { killed: false },
+      stopping: false,
+    };
+    const internals = manager as unknown as {
+      discoverySessions: Map<string, unknown>;
+      discoverySessionIdleTimers: Map<string, ReturnType<typeof setTimeout>>;
+      getOrCreateDiscoverySession: (
+        cwd: string,
+        profile: CodexDiscoveryProfile,
+      ) => Promise<unknown>;
+    };
+    internals.discoverySessions.set(discoveryKey, replacementContext);
+
+    const nextContext = await internals.getOrCreateDiscoverySession(cwd, profile);
+
+    expect(nextContext).toBe(replacementContext);
+    expect(nextContext).not.toBe(context);
+
+    const idleTimer = internals.discoverySessionIdleTimers.get(discoveryKey);
+    if (idleTimer) {
+      clearTimeout(idleTimer);
+    }
+    internals.discoverySessionIdleTimers.delete(discoveryKey);
+    internals.discoverySessions.delete(discoveryKey);
+  });
 });
 
 describe("classifyCodexStderrLine", () => {
@@ -2356,7 +2434,272 @@ describe("steerTurn", () => {
   });
 });
 
+describe("codexDiscoveryProfileKey", () => {
+  it("collapses equivalent Windows casing, separators, and dot segments", () => {
+    const configuredProfile = {
+      binaryPath: String.raw`C:\Users\Test\AppData\Roaming\npm\.\CODEX.CMD`,
+      homePath: String.raw`C:\Users\Test\.codex\cache\..`,
+    } satisfies CodexDiscoveryProfile;
+    const equivalentProfile = {
+      binaryPath: "c:/users/test/appdata/roaming/npm/codex.cmd",
+      homePath: "c:/users/test/.codex",
+    } satisfies CodexDiscoveryProfile;
+
+    expect(codexDiscoveryProfileKey(configuredProfile, "win32")).toBe(
+      codexDiscoveryProfileKey(equivalentProfile, "win32"),
+    );
+    expect(configuredProfile).toEqual({
+      binaryPath: String.raw`C:\Users\Test\AppData\Roaming\npm\.\CODEX.CMD`,
+      homePath: String.raw`C:\Users\Test\.codex\cache\..`,
+    });
+  });
+
+  it("keeps bare Windows commands distinct from explicit relative paths", () => {
+    expect(codexDiscoveryProfileKey({ binaryPath: "CODEX" }, "win32")).not.toBe(
+      codexDiscoveryProfileKey({ binaryPath: String.raw`.\codex` }, "win32"),
+    );
+  });
+
+  it("preserves non-Windows path identity and default home behavior", () => {
+    expect(
+      codexDiscoveryProfileKey(
+        {
+          binaryPath: "/OPT/Codex/../Codex/bin/codex",
+          homePath: "/HOME/User/.codex",
+        },
+        "linux",
+      ),
+    ).not.toBe(
+      codexDiscoveryProfileKey(
+        {
+          binaryPath: "/opt/Codex/bin/codex",
+          homePath: "/home/user/.codex",
+        },
+        "linux",
+      ),
+    );
+    expect(
+      JSON.parse(codexDiscoveryProfileKey({ binaryPath: "   ", homePath: "   " }, "win32")),
+    ).toEqual({
+      binaryPath: "codex",
+      homePath: null,
+    });
+  });
+});
+
 describe("CodexAppServerManager discovery", () => {
+  const defaultProfile = { binaryPath: "codex" } satisfies CodexDiscoveryProfile;
+  const configuredProfile = {
+    binaryPath: "C:\\Users\\test\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\codex.exe",
+    homePath: "C:\\Users\\test\\.super-synara\\codex-home-overlay",
+  } satisfies CodexDiscoveryProfile;
+
+  it("single-flights concurrent discovery session creation", async () => {
+    const manager = new CodexAppServerManager();
+    const context = {
+      child: { killed: false },
+      stopping: false,
+    };
+    let releaseCreation: (() => void) | undefined;
+    const creationGate = new Promise<void>((resolve) => {
+      releaseCreation = resolve;
+    });
+    const internals = manager as unknown as {
+      discoverySessions: Map<string, unknown>;
+      discoverySessionCreations: Map<string, Promise<unknown>>;
+      createDiscoverySession: (input: {
+        readonly normalizedCwd: string;
+        readonly normalizedProfile: CodexDiscoveryProfile;
+        readonly profileKey: string;
+        readonly discoveryKey: string;
+        readonly lifecycleGeneration: number;
+      }) => Promise<unknown>;
+      getOrCreateDiscoverySession: (
+        cwd: string,
+        profile: CodexDiscoveryProfile,
+      ) => Promise<unknown>;
+    };
+    const createDiscoverySession = vi
+      .spyOn(internals, "createDiscoverySession")
+      .mockImplementation(async (input) => {
+        await creationGate;
+        internals.discoverySessions.set(input.discoveryKey, context);
+        return context;
+      });
+
+    const first = internals.getOrCreateDiscoverySession("C:\\workspace\\synara", defaultProfile);
+    const second = internals.getOrCreateDiscoverySession("C:\\workspace\\synara", defaultProfile);
+
+    expect(first).toBe(second);
+    expect(createDiscoverySession).toHaveBeenCalledOnce();
+    expect(internals.discoverySessionCreations.size).toBe(1);
+
+    releaseCreation?.();
+    await expect(Promise.all([first, second])).resolves.toEqual([context, context]);
+
+    expect(internals.discoverySessionCreations.size).toBe(0);
+    expect(internals.discoverySessions.size).toBe(1);
+    expect(new Set(internals.discoverySessions.values())).toEqual(new Set([context]));
+    internals.discoverySessions.clear();
+  });
+
+  it("clears failed discovery creation so a later request can retry", async () => {
+    const manager = new CodexAppServerManager();
+    const retryContext = {
+      child: { killed: false },
+      stopping: false,
+    };
+    let rejectCreation: ((error: Error) => void) | undefined;
+    const failedCreation = new Promise<never>((_resolve, reject) => {
+      rejectCreation = reject;
+    });
+    const internals = manager as unknown as {
+      discoverySessions: Map<string, unknown>;
+      discoverySessionCreations: Map<string, Promise<unknown>>;
+      createDiscoverySession: (input: {
+        readonly normalizedCwd: string;
+        readonly normalizedProfile: CodexDiscoveryProfile;
+        readonly profileKey: string;
+        readonly discoveryKey: string;
+        readonly lifecycleGeneration: number;
+      }) => Promise<unknown>;
+      getOrCreateDiscoverySession: (
+        cwd: string,
+        profile: CodexDiscoveryProfile,
+      ) => Promise<unknown>;
+    };
+    const createDiscoverySession = vi
+      .spyOn(internals, "createDiscoverySession")
+      .mockImplementationOnce(() => failedCreation)
+      .mockImplementationOnce(async (input) => {
+        internals.discoverySessions.set(input.discoveryKey, retryContext);
+        return retryContext;
+      });
+
+    const first = internals.getOrCreateDiscoverySession("C:\\workspace\\synara", defaultProfile);
+    const second = internals.getOrCreateDiscoverySession("C:\\workspace\\synara", defaultProfile);
+    const failedResults = Promise.allSettled([first, second]);
+
+    expect(first).toBe(second);
+    expect(createDiscoverySession).toHaveBeenCalledOnce();
+    rejectCreation?.(new Error("initialize failed"));
+    await expect(failedResults).resolves.toEqual([
+      expect.objectContaining({ status: "rejected", reason: new Error("initialize failed") }),
+      expect.objectContaining({ status: "rejected", reason: new Error("initialize failed") }),
+    ]);
+    expect(internals.discoverySessionCreations.size).toBe(0);
+    expect(internals.discoverySessions.size).toBe(0);
+
+    await expect(
+      internals.getOrCreateDiscoverySession("C:\\workspace\\synara", defaultProfile),
+    ).resolves.toBe(retryContext);
+    expect(createDiscoverySession).toHaveBeenCalledTimes(2);
+    expect(internals.discoverySessionCreations.size).toBe(0);
+    expect(internals.discoverySessions.size).toBe(1);
+    internals.discoverySessions.clear();
+  });
+
+  it("fences pre-spawn discovery creation while stopAll drains in-flight work", async () => {
+    const manager = new CodexAppServerManager();
+    let resolveLaunch:
+      | ((value: {
+          readonly binaryPath: string;
+          readonly env: NodeJS.ProcessEnv;
+          readonly commandDiscoveryCache: ReturnType<typeof createWindowsCommandDiscoveryCache>;
+        }) => void)
+      | undefined;
+    const launchGate = new Promise<{
+      readonly binaryPath: string;
+      readonly env: NodeJS.ProcessEnv;
+      readonly commandDiscoveryCache: ReturnType<typeof createWindowsCommandDiscoveryCache>;
+    }>((resolve) => {
+      resolveLaunch = resolve;
+    });
+    const internals = manager as unknown as {
+      discoverySessions: Map<string, unknown>;
+      discoverySessionCreations: Map<string, Promise<unknown>>;
+      discoverySessionIdleTimers: Map<string, ReturnType<typeof setTimeout>>;
+      discoveryStopAllActive: boolean;
+      stopAllPromise: Promise<void> | undefined;
+      assertSupportedCodexCliVersion: (input: unknown) => Promise<void>;
+      createDiscoverySession: (input: {
+        readonly normalizedCwd: string;
+        readonly normalizedProfile: CodexDiscoveryProfile;
+        readonly profileKey: string;
+        readonly discoveryKey: string;
+        readonly lifecycleGeneration: number;
+      }) => Promise<unknown>;
+      getOrCreateDiscoverySession: (
+        cwd: string,
+        profile: CodexDiscoveryProfile,
+      ) => Promise<unknown>;
+      resolveDiscoveryLaunch: (input: {
+        readonly binaryPath: string;
+        readonly cwd: string;
+        readonly homePath?: string;
+      }) => typeof launchGate;
+      spawnDiscoveryAppServer: (input: unknown) => unknown;
+    };
+    const resolveDiscoveryLaunch = vi
+      .spyOn(internals, "resolveDiscoveryLaunch")
+      .mockReturnValue(launchGate);
+    const assertSupportedCodexCliVersion = vi
+      .spyOn(internals, "assertSupportedCodexCliVersion")
+      .mockResolvedValue();
+    const spawnDiscoveryAppServer = vi.spyOn(internals, "spawnDiscoveryAppServer");
+
+    const creation = internals.getOrCreateDiscoverySession(
+      "C:\\workspace\\shutdown-race",
+      defaultProfile,
+    );
+    const creationOutcome = creation.then(
+      () => null,
+      (error: unknown) => error,
+    );
+
+    expect(resolveDiscoveryLaunch).toHaveBeenCalledOnce();
+    expect(internals.discoverySessionCreations.size).toBe(1);
+
+    const stopping = manager.stopAll();
+    expect(internals.discoveryStopAllActive).toBe(true);
+    await expect(
+      internals.getOrCreateDiscoverySession(
+        "C:\\workspace\\blocked-during-shutdown",
+        defaultProfile,
+      ),
+    ).rejects.toThrow("unavailable while sessions are stopping");
+    expect(resolveDiscoveryLaunch).toHaveBeenCalledOnce();
+
+    resolveLaunch?.({
+      binaryPath: "C:\\tools\\codex.exe",
+      env: {},
+      commandDiscoveryCache: createWindowsCommandDiscoveryCache(),
+    });
+    await expect(creationOutcome).resolves.toBeInstanceOf(Error);
+    await expect(stopping).resolves.toBeUndefined();
+
+    expect(assertSupportedCodexCliVersion).not.toHaveBeenCalled();
+    expect(spawnDiscoveryAppServer).not.toHaveBeenCalled();
+    expect(internals.discoverySessions.size).toBe(0);
+    expect(internals.discoverySessionCreations.size).toBe(0);
+    expect(internals.discoverySessionIdleTimers.size).toBe(0);
+    expect(internals.discoveryStopAllActive).toBe(false);
+    expect(internals.stopAllPromise).toBeUndefined();
+
+    const retryContext = {
+      child: { killed: false },
+      stopping: false,
+    };
+    const createDiscoverySession = vi
+      .spyOn(internals, "createDiscoverySession")
+      .mockResolvedValue(retryContext);
+    await expect(
+      internals.getOrCreateDiscoverySession("C:\\workspace\\after-shutdown", defaultProfile),
+    ).resolves.toBe(retryContext);
+    expect(createDiscoverySession).toHaveBeenCalledOnce();
+    expect(internals.discoverySessionCreations.size).toBe(0);
+  });
+
   it("wires model discovery through model/list", async () => {
     const manager = new CodexAppServerManager();
     const context = {
@@ -2378,7 +2721,11 @@ describe("CodexAppServerManager discovery", () => {
 
     vi.spyOn(
       manager as unknown as {
-        resolveContextForDiscovery: (threadId?: string) => unknown;
+        resolveContextForDiscovery: (
+          profile: CodexDiscoveryProfile,
+          threadId?: string,
+          cwd?: string,
+        ) => unknown;
       },
       "resolveContextForDiscovery",
     ).mockReturnValue(context);
@@ -2391,7 +2738,12 @@ describe("CodexAppServerManager discovery", () => {
       )
       .mockResolvedValue({ result: { items: [] } });
 
-    await expect(manager.listModels("thread_1")).resolves.toMatchObject({
+    await expect(
+      manager.listModels({
+        profile: configuredProfile,
+        threadId: "thread_1",
+      }),
+    ).resolves.toMatchObject({
       models: [],
       source: "codex-app-server",
       cached: false,
@@ -2477,7 +2829,10 @@ describe("CodexAppServerManager discovery", () => {
     const getOrCreateDiscoverySession = vi
       .spyOn(
         manager as unknown as {
-          getOrCreateDiscoverySession: (cwd: string) => Promise<unknown>;
+          getOrCreateDiscoverySession: (
+            cwd: string,
+            profile: CodexDiscoveryProfile,
+          ) => Promise<unknown>;
         },
         "getOrCreateDiscoverySession",
       )
@@ -2496,14 +2851,144 @@ describe("CodexAppServerManager discovery", () => {
       });
 
     await manager.listSkills({
+      profile: configuredProfile,
       cwd: "/repo-b",
       threadId: "thread_missing",
     });
 
-    expect(getOrCreateDiscoverySession).toHaveBeenCalledWith("/repo-b");
+    expect(getOrCreateDiscoverySession).toHaveBeenCalledWith("/repo-b", configuredProfile);
     expect(sendRequest).toHaveBeenCalledWith(discoveryContext, "skills/list", {
       cwds: ["/repo-b"],
     });
+  });
+
+  it("never reuses a default-path runtime for a configured Windows Codex profile", async () => {
+    const manager = new CodexAppServerManager();
+    const defaultRuntime = {
+      session: {
+        provider: "codex",
+        status: "ready",
+        threadId: "thread_default",
+        runtimeMode: "full-access",
+        model: "gpt-5.5",
+        cwd: "C:\\workspaces\\synara",
+      },
+      codexProfileKey: codexDiscoveryProfileKey(defaultProfile),
+      child: { killed: false },
+      stopping: false,
+    };
+    const configuredRuntime = {
+      ...defaultRuntime,
+      session: {
+        ...defaultRuntime.session,
+        threadId: "__codex_discovery__:configured",
+      },
+      codexProfileKey: codexDiscoveryProfileKey(configuredProfile),
+      discovery: true,
+    };
+    (
+      manager as unknown as {
+        sessions: Map<string, unknown>;
+      }
+    ).sessions.set("thread_default", defaultRuntime);
+    const getOrCreateDiscoverySession = vi
+      .spyOn(
+        manager as unknown as {
+          getOrCreateDiscoverySession: (
+            cwd: string,
+            profile: CodexDiscoveryProfile,
+          ) => Promise<unknown>;
+        },
+        "getOrCreateDiscoverySession",
+      )
+      .mockResolvedValue(configuredRuntime);
+    const resolveContextForDiscovery = (
+      manager as unknown as {
+        resolveContextForDiscovery: (
+          profile: CodexDiscoveryProfile,
+          threadId?: string,
+          cwd?: string,
+        ) => Promise<unknown>;
+      }
+    ).resolveContextForDiscovery.bind(manager);
+
+    await expect(
+      resolveContextForDiscovery(configuredProfile, "thread_default", "C:\\workspaces\\synara"),
+    ).resolves.toBe(configuredRuntime);
+    expect(getOrCreateDiscoverySession).toHaveBeenCalledWith(
+      "C:\\workspaces\\synara",
+      configuredProfile,
+    );
+  });
+
+  it("isolates model cache entries by Codex binary and home profile", async () => {
+    const manager = new CodexAppServerManager();
+    const context = {
+      session: {
+        provider: "codex",
+        status: "ready",
+        threadId: "__codex_discovery__:models",
+        runtimeMode: "full-access",
+        model: "gpt-5.5",
+      },
+      account: {
+        type: "unknown",
+        planType: null,
+        sparkEnabled: true,
+      },
+      collabReceiverTurns: new Map(),
+      collabReceiverParents: new Map(),
+    };
+    vi.spyOn(
+      manager as unknown as {
+        resolveContextForDiscovery: (
+          profile: CodexDiscoveryProfile,
+          threadId?: string,
+          cwd?: string,
+        ) => unknown;
+      },
+      "resolveContextForDiscovery",
+    ).mockReturnValue(context);
+    const sendRequest = vi
+      .spyOn(
+        manager as unknown as {
+          sendRequest: (...args: unknown[]) => Promise<unknown>;
+        },
+        "sendRequest",
+      )
+      .mockResolvedValueOnce({
+        result: { data: [{ id: "gpt-default", displayName: "Default runtime" }] },
+      })
+      .mockResolvedValueOnce({
+        result: { data: [{ id: "gpt-configured", displayName: "Configured runtime" }] },
+      });
+
+    const defaultResult = await manager.listModels({
+      profile: defaultProfile,
+      cwd: "C:\\workspaces\\synara",
+    });
+    const configuredResult = await manager.listModels({
+      profile: configuredProfile,
+      cwd: "C:\\workspaces\\synara",
+    });
+    const cachedDefaultResult = await manager.listModels({
+      profile: defaultProfile,
+      cwd: "C:\\workspaces\\synara",
+    });
+
+    expect(defaultResult).toMatchObject({
+      cached: false,
+      models: [{ slug: "gpt-default" }],
+    });
+    expect(configuredResult).toMatchObject({
+      cached: false,
+      models: [{ slug: "gpt-configured" }],
+    });
+    expect(cachedDefaultResult).toMatchObject({
+      cached: true,
+      models: [{ slug: "gpt-default" }],
+    });
+    expect(sendRequest).toHaveBeenCalledTimes(2);
   });
 
   it("retries skills/list with cwd when a runtime rejects cwds", async () => {
@@ -2530,7 +3015,11 @@ describe("CodexAppServerManager discovery", () => {
 
     vi.spyOn(
       manager as unknown as {
-        resolveContextForDiscovery: (threadId?: string) => unknown;
+        resolveContextForDiscovery: (
+          profile: CodexDiscoveryProfile,
+          threadId?: string,
+          cwd?: string,
+        ) => unknown;
       },
       "resolveContextForDiscovery",
     ).mockReturnValue(context);
@@ -2554,6 +3043,7 @@ describe("CodexAppServerManager discovery", () => {
       });
 
     const result = await manager.listSkills({
+      profile: defaultProfile,
       cwd: "/repo",
       threadId: "thread_1",
     });
@@ -2595,7 +3085,11 @@ describe("CodexAppServerManager discovery", () => {
     const resolveContextForDiscovery = vi
       .spyOn(
         manager as unknown as {
-          resolveContextForDiscovery: (threadId?: string, cwd?: string) => unknown;
+          resolveContextForDiscovery: (
+            profile: CodexDiscoveryProfile,
+            threadId?: string,
+            cwd?: string,
+          ) => unknown;
         },
         "resolveContextForDiscovery",
       )
@@ -2611,6 +3105,7 @@ describe("CodexAppServerManager discovery", () => {
 
     await expect(
       manager.listPlugins({
+        profile: defaultProfile,
         cwd: "/repo",
         threadId: "thread_1",
         forceRemoteSync: true,
@@ -2620,7 +3115,7 @@ describe("CodexAppServerManager discovery", () => {
       source: "codex-app-server",
       cached: false,
     });
-    expect(resolveContextForDiscovery).toHaveBeenCalledWith("thread_1", "/repo");
+    expect(resolveContextForDiscovery).toHaveBeenCalledWith(defaultProfile, "thread_1", "/repo");
     expect(sendRequest).toHaveBeenCalledWith(context, "plugin/list", {
       cwds: ["/repo"],
       forceRemoteSync: true,
@@ -2648,7 +3143,11 @@ describe("CodexAppServerManager discovery", () => {
 
     vi.spyOn(
       manager as unknown as {
-        resolveContextForDiscovery: (threadId?: string, cwd?: string) => unknown;
+        resolveContextForDiscovery: (
+          profile: CodexDiscoveryProfile,
+          threadId?: string,
+          cwd?: string,
+        ) => unknown;
       },
       "resolveContextForDiscovery",
     ).mockReturnValue(context);
@@ -2679,6 +3178,7 @@ describe("CodexAppServerManager discovery", () => {
 
     await expect(
       manager.readPlugin({
+        profile: defaultProfile,
         marketplacePath: "/marketplace.json",
         pluginName: "github",
       }),
