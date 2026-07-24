@@ -2512,6 +2512,7 @@ describe("CodexAppServerManager discovery", () => {
         readonly normalizedProfile: CodexDiscoveryProfile;
         readonly profileKey: string;
         readonly discoveryKey: string;
+        readonly lifecycleGeneration: number;
       }) => Promise<unknown>;
       getOrCreateDiscoverySession: (
         cwd: string,
@@ -2560,6 +2561,7 @@ describe("CodexAppServerManager discovery", () => {
         readonly normalizedProfile: CodexDiscoveryProfile;
         readonly profileKey: string;
         readonly discoveryKey: string;
+        readonly lifecycleGeneration: number;
       }) => Promise<unknown>;
       getOrCreateDiscoverySession: (
         cwd: string,
@@ -2595,6 +2597,107 @@ describe("CodexAppServerManager discovery", () => {
     expect(internals.discoverySessionCreations.size).toBe(0);
     expect(internals.discoverySessions.size).toBe(1);
     internals.discoverySessions.clear();
+  });
+
+  it("fences pre-spawn discovery creation while stopAll drains in-flight work", async () => {
+    const manager = new CodexAppServerManager();
+    let resolveLaunch:
+      | ((value: {
+          readonly binaryPath: string;
+          readonly env: NodeJS.ProcessEnv;
+          readonly commandDiscoveryCache: ReturnType<typeof createWindowsCommandDiscoveryCache>;
+        }) => void)
+      | undefined;
+    const launchGate = new Promise<{
+      readonly binaryPath: string;
+      readonly env: NodeJS.ProcessEnv;
+      readonly commandDiscoveryCache: ReturnType<typeof createWindowsCommandDiscoveryCache>;
+    }>((resolve) => {
+      resolveLaunch = resolve;
+    });
+    const internals = manager as unknown as {
+      discoverySessions: Map<string, unknown>;
+      discoverySessionCreations: Map<string, Promise<unknown>>;
+      discoverySessionIdleTimers: Map<string, ReturnType<typeof setTimeout>>;
+      discoveryStopAllActive: boolean;
+      stopAllPromise: Promise<void> | undefined;
+      assertSupportedCodexCliVersion: (input: unknown) => Promise<void>;
+      createDiscoverySession: (input: {
+        readonly normalizedCwd: string;
+        readonly normalizedProfile: CodexDiscoveryProfile;
+        readonly profileKey: string;
+        readonly discoveryKey: string;
+        readonly lifecycleGeneration: number;
+      }) => Promise<unknown>;
+      getOrCreateDiscoverySession: (
+        cwd: string,
+        profile: CodexDiscoveryProfile,
+      ) => Promise<unknown>;
+      resolveDiscoveryLaunch: (input: {
+        readonly binaryPath: string;
+        readonly cwd: string;
+        readonly homePath?: string;
+      }) => typeof launchGate;
+      spawnDiscoveryAppServer: (input: unknown) => unknown;
+    };
+    const resolveDiscoveryLaunch = vi
+      .spyOn(internals, "resolveDiscoveryLaunch")
+      .mockReturnValue(launchGate);
+    const assertSupportedCodexCliVersion = vi
+      .spyOn(internals, "assertSupportedCodexCliVersion")
+      .mockResolvedValue();
+    const spawnDiscoveryAppServer = vi.spyOn(internals, "spawnDiscoveryAppServer");
+
+    const creation = internals.getOrCreateDiscoverySession(
+      "C:\\workspace\\shutdown-race",
+      defaultProfile,
+    );
+    const creationOutcome = creation.then(
+      () => null,
+      (error: unknown) => error,
+    );
+
+    expect(resolveDiscoveryLaunch).toHaveBeenCalledOnce();
+    expect(internals.discoverySessionCreations.size).toBe(1);
+
+    const stopping = manager.stopAll();
+    expect(internals.discoveryStopAllActive).toBe(true);
+    await expect(
+      internals.getOrCreateDiscoverySession(
+        "C:\\workspace\\blocked-during-shutdown",
+        defaultProfile,
+      ),
+    ).rejects.toThrow("unavailable while sessions are stopping");
+    expect(resolveDiscoveryLaunch).toHaveBeenCalledOnce();
+
+    resolveLaunch?.({
+      binaryPath: "C:\\tools\\codex.exe",
+      env: {},
+      commandDiscoveryCache: createWindowsCommandDiscoveryCache(),
+    });
+    await expect(creationOutcome).resolves.toBeInstanceOf(Error);
+    await expect(stopping).resolves.toBeUndefined();
+
+    expect(assertSupportedCodexCliVersion).not.toHaveBeenCalled();
+    expect(spawnDiscoveryAppServer).not.toHaveBeenCalled();
+    expect(internals.discoverySessions.size).toBe(0);
+    expect(internals.discoverySessionCreations.size).toBe(0);
+    expect(internals.discoverySessionIdleTimers.size).toBe(0);
+    expect(internals.discoveryStopAllActive).toBe(false);
+    expect(internals.stopAllPromise).toBeUndefined();
+
+    const retryContext = {
+      child: { killed: false },
+      stopping: false,
+    };
+    const createDiscoverySession = vi
+      .spyOn(internals, "createDiscoverySession")
+      .mockResolvedValue(retryContext);
+    await expect(
+      internals.getOrCreateDiscoverySession("C:\\workspace\\after-shutdown", defaultProfile),
+    ).resolves.toBe(retryContext);
+    expect(createDiscoverySession).toHaveBeenCalledOnce();
+    expect(internals.discoverySessionCreations.size).toBe(0);
   });
 
   it("wires model discovery through model/list", async () => {

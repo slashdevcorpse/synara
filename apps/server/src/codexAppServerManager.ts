@@ -985,6 +985,9 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
   private readonly discoverySessions = new Map<string, CodexSessionContext>();
   private readonly discoverySessionCreations = new Map<string, Promise<CodexSessionContext>>();
   private readonly discoverySessionIdleTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private discoveryLifecycleGeneration = 0;
+  private discoveryStopAllActive = false;
+  private stopAllPromise: Promise<void> | undefined;
   private readonly skillsCache = new Map<string, ProviderListSkillsResult>();
   private readonly pluginsCache = new Map<string, ProviderListPluginsResult>();
   private readonly pluginDetailCache = new Map<string, ProviderReadPluginResult>();
@@ -2129,11 +2132,38 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
     return this.sessions.has(threadId);
   }
 
-  async stopAll(): Promise<void> {
-    const results = await Promise.allSettled([
+  stopAll(): Promise<void> {
+    if (this.stopAllPromise) {
+      return this.stopAllPromise;
+    }
+
+    this.discoveryStopAllActive = true;
+    this.discoveryLifecycleGeneration += 1;
+    const stopping = this.stopAllContexts();
+    const trackedStopping = stopping.finally(() => {
+      if (this.stopAllPromise === trackedStopping) {
+        this.stopAllPromise = undefined;
+        this.discoveryStopAllActive = false;
+      }
+    });
+    this.stopAllPromise = trackedStopping;
+    return trackedStopping;
+  }
+
+  private async stopAllContexts(): Promise<void> {
+    const pendingDiscoveryCreations = Array.from(this.discoverySessionCreations.values());
+    const initialStops = [
       ...Array.from(this.sessions.keys(), (threadId) => this.stopSession(threadId)),
       ...Array.from(this.discoverySessions.keys(), (key) => this.stopDiscoverySession(key)),
+    ];
+    const [, initialResults] = await Promise.all([
+      Promise.allSettled(pendingDiscoveryCreations),
+      Promise.allSettled(initialStops),
     ]);
+    const finalDiscoveryResults = await Promise.allSettled(
+      Array.from(this.discoverySessions.keys(), (key) => this.stopDiscoverySession(key)),
+    );
+    const results = [...initialResults, ...finalDiscoveryResults];
     const failures = results.flatMap((result) =>
       result.status === "rejected" ? [result.reason] : [],
     );
@@ -2436,6 +2466,13 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
     cwd: string,
     profile: CodexDiscoveryProfile,
   ): Promise<CodexSessionContext> {
+    if (this.discoveryStopAllActive) {
+      return Promise.reject(
+        new Error("Codex discovery session creation is unavailable while sessions are stopping."),
+      );
+    }
+
+    const lifecycleGeneration = this.discoveryLifecycleGeneration;
     const normalizedCwd = cwd.trim() || process.cwd();
     const normalizedProfile = normalizeCodexDiscoveryProfile(profile);
     const profileKey = codexDiscoveryProfileKey(normalizedProfile);
@@ -2456,6 +2493,7 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
       normalizedProfile,
       profileKey,
       discoveryKey,
+      lifecycleGeneration,
     });
     const trackedCreation = creation.finally(() => {
       if (this.discoverySessionCreations.get(discoveryKey) === trackedCreation) {
@@ -2471,26 +2509,32 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
     readonly normalizedProfile: CodexDiscoveryProfile;
     readonly profileKey: string;
     readonly discoveryKey: string;
+    readonly lifecycleGeneration: number;
   }): Promise<CodexSessionContext> {
-    const { normalizedCwd, normalizedProfile, profileKey, discoveryKey } = input;
+    const { normalizedCwd, normalizedProfile, profileKey, discoveryKey, lifecycleGeneration } =
+      input;
+    this.assertDiscoveryCreationActive(lifecycleGeneration);
     const existing = this.discoverySessions.get(discoveryKey);
     if (existing) {
       await this.stopDiscoverySession(discoveryKey);
+      this.assertDiscoveryCreationActive(lifecycleGeneration);
     }
 
     const now = new Date().toISOString();
-    const codexLaunch = await resolveCodexLaunch({
+    const codexLaunch = await this.resolveDiscoveryLaunch({
       binaryPath: normalizedProfile.binaryPath,
       cwd: normalizedCwd,
       ...(normalizedProfile.homePath ? { homePath: normalizedProfile.homePath } : {}),
     });
+    this.assertDiscoveryCreationActive(lifecycleGeneration);
     await this.assertSupportedCodexCliVersion({
       binaryPath: codexLaunch.binaryPath,
       cwd: normalizedCwd,
       env: codexLaunch.env,
       commandDiscoveryCache: codexLaunch.commandDiscoveryCache,
     });
-    const spawned = spawnCodexAppServer({
+    this.assertDiscoveryCreationActive(lifecycleGeneration);
+    const spawned = this.spawnDiscoveryAppServer({
       binaryPath: codexLaunch.binaryPath,
       cwd: normalizedCwd,
       env: codexLaunch.env,
@@ -2534,6 +2578,7 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
     try {
       const ownership = await spawned.ownershipReady;
       if (ownership._tag === "NotSpawned") throw ownership.cause;
+      this.assertDiscoveryCreationActive(lifecycleGeneration);
       await this.sendRequest(context, "initialize", buildCodexInitializeParams());
       await this.writeMessage(context, { method: "initialized" });
       await this.registerSynaraSkillsRoot(context);
@@ -2543,6 +2588,7 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
       } catch {
         // Discovery can still function without account metadata.
       }
+      this.assertDiscoveryCreationActive(lifecycleGeneration);
       this.updateSession(context, { status: "ready" });
       this.scheduleDiscoverySessionIdleStop(discoveryKey);
       return context;
@@ -2550,6 +2596,31 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
       await this.stopDiscoverySession(discoveryKey);
       throw error;
     }
+  }
+
+  private assertDiscoveryCreationActive(lifecycleGeneration: number): void {
+    if (this.discoveryStopAllActive || lifecycleGeneration !== this.discoveryLifecycleGeneration) {
+      throw new Error(
+        "Codex discovery session creation was cancelled because sessions are stopping.",
+      );
+    }
+  }
+
+  private resolveDiscoveryLaunch(input: {
+    readonly binaryPath: string;
+    readonly cwd: string;
+    readonly homePath?: string;
+  }) {
+    return resolveCodexLaunch(input);
+  }
+
+  private spawnDiscoveryAppServer(input: {
+    readonly binaryPath: string;
+    readonly cwd: string;
+    readonly env: NodeJS.ProcessEnv;
+    readonly commandDiscoveryCache: WindowsCommandDiscoveryCache;
+  }) {
+    return spawnCodexAppServer(input);
   }
 
   private scheduleDiscoverySessionIdleStop(discoveryKey: string): void {
