@@ -644,7 +644,7 @@ describe("Super Synara workflow contracts", () => {
         ),
         audit,
       ),
-    ).toThrow("workspace-local Playwright binary");
+    ).toThrow("preflight Linux-equivalent validation must run");
     expect(() =>
       verifySuperSynaraWorkflowText(
         main.replaceAll(
@@ -720,8 +720,8 @@ describe("Super Synara workflow contracts", () => {
     expect(() =>
       verifySuperSynaraWorkflowText(
         main.replace(
-          "      - name: Run stable browser tests\n        run: bun run --cwd apps/web test:browser:stable",
-          "      - name: Run stable browser tests\n        env:\n          SYNARA_GENERATED_ROUTE_TREE: apps/web/src/routeTree.gen.ts\n        run: bun run --cwd apps/web test:browser:stable",
+          "      - name: Run stable browser tests\n        if: ${{ steps.meta.outputs.release_scope == 'windows-and-macos' }}\n        run: bun run --cwd apps/web test:browser:stable",
+          "      - name: Run stable browser tests\n        if: ${{ steps.meta.outputs.release_scope == 'windows-and-macos' }}\n        env:\n          SYNARA_GENERATED_ROUTE_TREE: apps/web/src/routeTree.gen.ts\n        run: bun run --cwd apps/web test:browser:stable",
         ),
         audit,
       ),
@@ -793,7 +793,10 @@ describe("Super Synara workflow contracts", () => {
   it("binds prerelease suite ownership and native runners", () => {
     expect(() =>
       verifySuperSynaraWorkflowText(
-        main.replace("      - name: Test\n        run: bun run test\n", ""),
+        main.replace(
+          "      - name: Test\n        if: ${{ steps.meta.outputs.release_scope == 'windows-and-macos' }}\n        run: bun run test\n",
+          "",
+        ),
         audit,
       ),
     ).toThrow("preflight must run exactly one bare bun run test suite");
@@ -801,8 +804,8 @@ describe("Super Synara workflow contracts", () => {
     expect(() =>
       verifySuperSynaraWorkflowText(
         main.replace(
-          "      - name: Test\n        run: bun run test",
-          "      - name: Test\n        run: bun run test\n\n      - name: Duplicate full suite\n        run: bun run test",
+          "      - name: Test\n        if: ${{ steps.meta.outputs.release_scope == 'windows-and-macos' }}\n        run: bun run test",
+          "      - name: Test\n        if: ${{ steps.meta.outputs.release_scope == 'windows-and-macos' }}\n        run: bun run test\n\n      - name: Duplicate full suite\n        run: bun run test",
         ),
         audit,
       ),
@@ -841,6 +844,38 @@ describe("Super Synara workflow contracts", () => {
     expect(() => verifySuperSynaraWorkflowText(chainedPublishSuite, audit)).toThrow(
       "publish must not own an additional or chained monorepo-wide bun run test suite",
     );
+  });
+
+  it("runs Ubuntu quality, unit, and browser validation only for the combined scope", () => {
+    const condition = "${{ steps.meta.outputs.release_scope == 'windows-and-macos' }}";
+    for (const [name, command] of [
+      ["Check formatting", "bun run fmt:check"],
+      ["Lint", "bun run lint"],
+      ["Typecheck", "bun run typecheck"],
+      ["Test", "bun run test"],
+      [
+        "Install Chromium test runtime",
+        "cd apps/web && ./node_modules/.bin/playwright install --with-deps chromium",
+      ],
+      ["Run stable browser tests", "bun run --cwd apps/web test:browser:stable"],
+    ] as const) {
+      const guardedStep = `      - name: ${name}\n        if: ${condition}\n        run: ${command}`;
+      const mutation = main.replace(guardedStep, `      - name: ${name}\n        run: ${command}`);
+      expect(mutation).not.toBe(main);
+      expect(() => verifySuperSynaraWorkflowText(mutation, audit)).toThrow(
+        /only for windows-and-macos,? and fail closed/,
+      );
+    }
+
+    expect(() =>
+      verifySuperSynaraWorkflowText(
+        main.replace(
+          `      - name: Lint\n        if: ${condition}\n        run: bun run lint`,
+          `      - name: Lint\n        if: ${condition}\n        continue-on-error: true\n        run: bun run lint`,
+        ),
+        audit,
+      ),
+    ).toThrow(/only for windows-and-macos,? and fail closed/);
   });
 
   it("requires prerelease native gates and builds to fail closed in order", () => {

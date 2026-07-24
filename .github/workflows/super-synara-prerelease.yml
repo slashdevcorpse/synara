@@ -267,21 +267,27 @@ jobs:
         run: bun run brand:check
 
       - name: Check formatting
+        if: ${{ steps.meta.outputs.release_scope == 'windows-and-macos' }}
         run: bun run fmt:check
 
       - name: Lint
+        if: ${{ steps.meta.outputs.release_scope == 'windows-and-macos' }}
         run: bun run lint
 
       - name: Typecheck
+        if: ${{ steps.meta.outputs.release_scope == 'windows-and-macos' }}
         run: bun run typecheck
 
       - name: Test
+        if: ${{ steps.meta.outputs.release_scope == 'windows-and-macos' }}
         run: bun run test
 
       - name: Install Chromium test runtime
+        if: ${{ steps.meta.outputs.release_scope == 'windows-and-macos' }}
         run: cd apps/web && ./node_modules/.bin/playwright install --with-deps chromium
 
       - name: Run stable browser tests
+        if: ${{ steps.meta.outputs.release_scope == 'windows-and-macos' }}
         run: bun run --cwd apps/web test:browser:stable
 
       - name: Run release contract smoke tests

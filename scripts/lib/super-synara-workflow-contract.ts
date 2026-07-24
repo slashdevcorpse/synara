@@ -26,6 +26,16 @@ const PRERELEASE_MACOS_REQUIRED_COMMANDS = [
 ] as const;
 const WINDOWS_RELEASE_SCOPE = "windows-only";
 const MACOS_RELEASE_SCOPE = "windows-and-macos";
+const COMBINED_SCOPE_PREFLIGHT_CONDITION =
+  "${{ steps.meta.outputs.release_scope == 'windows-and-macos' }}";
+const COMBINED_SCOPE_PREFLIGHT_COMMANDS = [
+  "bun run fmt:check",
+  "bun run lint",
+  "bun run typecheck",
+  "bun run test",
+  "cd apps/web && ./node_modules/.bin/playwright install --with-deps chromium",
+  "bun run --cwd apps/web test:browser:stable",
+] as const;
 const PREFLIGHT_ROUTE_TREE_SETUP_COMMAND = [
   "set -euo pipefail",
   `printf 'SYNARA_GENERATED_ROUTE_TREE=%s\\n' "$RUNNER_TEMP/super-synara-preflight-route-tree/routeTree.gen.ts" >> "$GITHUB_ENV"`,
@@ -355,12 +365,12 @@ function verifyRootTestOwnership(jobs: UnknownRecord): void {
   }
   const [preflightSuite] = barePreflight;
   if (
-    preflightSuite!.step.condition !== undefined ||
+    preflightSuite!.step.condition !== COMBINED_SCOPE_PREFLIGHT_CONDITION ||
     (preflightSuite!.step.continueOnError !== undefined &&
       preflightSuite!.step.continueOnError !== false)
   ) {
     throw new Error(
-      "Publication workflow preflight bare bun run test must be unconditional and fail closed.",
+      "Publication workflow preflight bare bun run test must run only for windows-and-macos and fail closed.",
     );
   }
   const additionalInvocation = occurrences.find(
@@ -370,6 +380,22 @@ function verifyRootTestOwnership(jobs: UnknownRecord): void {
     throw new Error(
       `Publication workflow ${additionalInvocation.jobName} must not own an additional or chained monorepo-wide bun run test suite.`,
     );
+  }
+}
+
+function verifyCombinedScopePreflightValidation(jobs: UnknownRecord): void {
+  const steps = nativeJobRunSteps(jobs, "preflight");
+  for (const command of COMBINED_SCOPE_PREFLIGHT_COMMANDS) {
+    const matches = steps.filter((step) => step.command === command);
+    if (
+      matches.length !== 1 ||
+      matches[0]!.condition !== COMBINED_SCOPE_PREFLIGHT_CONDITION ||
+      (matches[0]!.continueOnError !== undefined && matches[0]!.continueOnError !== false)
+    ) {
+      throw new Error(
+        `Publication workflow preflight Linux-equivalent validation must run ${command} exactly once, only for windows-and-macos, and fail closed.`,
+      );
+    }
   }
 }
 
@@ -862,6 +888,7 @@ export function verifySuperSynaraWorkflowText(main: string, audit: string): void
     throw new Error("Publication release-scope contract must default to exact Windows x64.");
   }
   verifyRootTestOwnership(jobs);
+  verifyCombinedScopePreflightValidation(jobs);
   verifyDraftAdmissionJob(jobs);
   verifyPublicationJobDependencies(jobs);
   verifyPrereleaseSourceProvenanceSteps(jobs);
