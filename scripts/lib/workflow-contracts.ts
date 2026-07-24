@@ -1553,7 +1553,9 @@ function validateCiArchitecture(workflow: UnknownRecord, errors: string[]): void
       (qualityLinuxJob["continue-on-error"] !== undefined &&
         qualityLinuxJob["continue-on-error"] !== false))
   ) {
-    errors.push(`${workflowPath} quality_linux must remain disabled while Linux CI is backlogged.`);
+    errors.push(
+      `${workflowPath} quality_linux backlog policy requires if: false and continue-on-error to be unset or false.`,
+    );
   }
   if (isRecord(qualityLinuxJob)) {
     if (qualityLinuxSteps) {

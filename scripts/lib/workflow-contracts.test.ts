@@ -538,7 +538,9 @@ describe("workflow contracts", () => {
       ciErrors(
         ciWorkflow.replace("  quality_linux:\n    if: false", "  quality_linux:\n    if: true"),
       ),
-    ).toContain("quality_linux must remain disabled while Linux CI is backlogged");
+    ).toContain(
+      "quality_linux backlog policy requires if: false and continue-on-error to be unset or false",
+    );
 
     expect(
       ciErrors(
