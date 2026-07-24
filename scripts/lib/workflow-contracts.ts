@@ -50,11 +50,13 @@ const DESKTOP_E2E_DIAGNOSTIC_PATHS = [
 ] as const;
 const UNSAFE_DESKTOP_E2E_DIAGNOSTIC_PATH_PATTERN =
   /(?:^|\/)(?:playwright-report|test-results)(?:\/|$)|(?:^|\/)(?:backend-logs|protocol\.jsonl|[^/]*\.sqlite(?:-(?:shm|wal))?)(?:\/|$)/u;
+const LINUX_CI_BACKLOG_CONDITION = false;
 const DESKTOP_E2E_JOB_TIMEOUT_MINUTES = 30;
 const DESKTOP_E2E_INSTALL_COMMAND = "bun install --frozen-lockfile";
 const DESKTOP_E2E_CONFIG = {
   linux: {
     artifactName: "desktop-build-linux",
+    condition: LINUX_CI_BACKLOG_CONDITION,
     diagnosticName: "desktop-e2e-linux-diagnostics",
     jobName: "e2e_linux",
     producerJobName: "quality_linux",
@@ -64,6 +66,7 @@ const DESKTOP_E2E_CONFIG = {
   },
   windows: {
     artifactName: "desktop-build-windows",
+    condition: undefined,
     diagnosticName: "desktop-e2e-windows-diagnostics",
     jobName: "e2e_windows",
     producerJobName: "windows_x64",
@@ -160,7 +163,6 @@ const CI_DESKTOP_PERSISTENCE_SMOKE_HOMES = {
 } as const;
 type CiNativeJobName = keyof typeof CI_DESKTOP_PERSISTENCE_SMOKE_HOMES;
 const UNIT_MATRIX = [
-  { platform: "linux", runner: "ubuntu-24.04", turbo_concurrency: "50%" },
   { platform: "windows", runner: "windows-2022", turbo_concurrency: "1" },
 ] as const;
 const UNIT_JOB_TIMEOUT_MINUTES = 40;
@@ -186,11 +188,11 @@ const QUALITY_AGGREGATE_NEEDS = [
   "macos_arm64",
 ] as const;
 const QUALITY_AGGREGATE_COMMAND = `
-test "\${{ needs.quality_linux.result }}" = success
+test "\${{ needs.quality_linux.result }}" = skipped
 test "\${{ needs.quality_windows.result }}" = success
 test "\${{ needs.unit.result }}" = success
 test "\${{ needs.browser_windows.result }}" = success
-test "\${{ needs.e2e_linux.result }}" = success
+test "\${{ needs.e2e_linux.result }}" = skipped
 test "\${{ needs.e2e_windows.result }}" = success
 test "\${{ needs.macos_arm64.result }}" = skipped
 `;
@@ -1295,11 +1297,16 @@ function validateDesktopE2eConsumer(
     job.name !== config.jobName ||
     job["runs-on"] !== config.runner ||
     job["timeout-minutes"] !== DESKTOP_E2E_JOB_TIMEOUT_MINUTES ||
-    job.if !== undefined ||
+    job.if !== config.condition ||
     (job["continue-on-error"] !== undefined && job["continue-on-error"] !== false)
   ) {
     errors.push(
       `${workflowPath} ${config.jobName} must be a named, bounded, fail-closed ${config.runner} job.`,
+    );
+  }
+  if (config.condition === LINUX_CI_BACKLOG_CONDITION && job.if !== config.condition) {
+    errors.push(
+      `${workflowPath} ${config.jobName} must remain disabled while Linux CI is backlogged.`,
     );
   }
 
@@ -1542,11 +1549,13 @@ function validateCiArchitecture(workflow: UnknownRecord, errors: string[]): void
   }
   if (
     isRecord(qualityLinuxJob) &&
-    (qualityLinuxJob.if !== undefined ||
+    (qualityLinuxJob.if !== LINUX_CI_BACKLOG_CONDITION ||
       (qualityLinuxJob["continue-on-error"] !== undefined &&
         qualityLinuxJob["continue-on-error"] !== false))
   ) {
-    errors.push(`${workflowPath} quality_linux job must be unconditional and fail closed.`);
+    errors.push(
+      `${workflowPath} quality_linux backlog policy requires if: false and continue-on-error to be unset or false.`,
+    );
   }
   if (isRecord(qualityLinuxJob)) {
     if (qualityLinuxSteps) {

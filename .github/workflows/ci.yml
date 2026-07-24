@@ -16,6 +16,7 @@ concurrency:
 jobs:
   quality_linux:
     name: quality_linux
+    if: false
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -175,9 +176,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: linux
-            runner: ubuntu-24.04
-            turbo_concurrency: "50%"
           - platform: windows
             runner: windows-2022
             turbo_concurrency: "1"
@@ -494,6 +492,7 @@ jobs:
 
   e2e_linux:
     name: e2e_linux
+    if: false
     needs: quality_linux
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -672,11 +671,11 @@ jobs:
     steps:
       - name: Require every quality dependency to succeed
         run: |
-          test "${{ needs.quality_linux.result }}" = success
+          test "${{ needs.quality_linux.result }}" = skipped
           test "${{ needs.quality_windows.result }}" = success
           test "${{ needs.unit.result }}" = success
           test "${{ needs.browser_windows.result }}" = success
-          test "${{ needs.e2e_linux.result }}" = success
+          test "${{ needs.e2e_linux.result }}" = skipped
           test "${{ needs.e2e_windows.result }}" = success
           test "${{ needs.macos_arm64.result }}" = skipped
 

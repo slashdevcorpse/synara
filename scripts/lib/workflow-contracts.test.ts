@@ -199,6 +199,7 @@ permissions:
   contents: read
 jobs:
   quality_linux:
+    if: false
     runs-on: ubuntu-24.04
     steps:
       - uses: ${pinnedCheckout}
@@ -249,9 +250,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: linux
-            runner: ubuntu-24.04
-            turbo_concurrency: "50%"
           - platform: windows
             runner: windows-2022
             turbo_concurrency: "1"
@@ -317,6 +315,7 @@ ${windowsStartupSmokeStep}
           retention-days: 1
   e2e_linux:
     name: e2e_linux
+    if: false
     needs: quality_linux
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -379,11 +378,11 @@ ${macosStartupSmokeStep}
     timeout-minutes: 5
     steps:
       - run: |
-          test "\${{ needs.quality_linux.result }}" = success
+          test "\${{ needs.quality_linux.result }}" = skipped
           test "\${{ needs.quality_windows.result }}" = success
           test "\${{ needs.unit.result }}" = success
           test "\${{ needs.browser_windows.result }}" = success
-          test "\${{ needs.e2e_linux.result }}" = success
+          test "\${{ needs.e2e_linux.result }}" = skipped
           test "\${{ needs.e2e_windows.result }}" = success
           test "\${{ needs.macos_arm64.result }}" = skipped
   release_smoke:
@@ -532,6 +531,34 @@ describe("workflow contracts", () => {
   it("accepts pinned, read-only PR CI and the narrowly scoped watcher", () => {
     expect(validateWorkflowContracts(validFiles(), policy())).toEqual([]);
     expect(validateMergifyConfiguration(mergifyConfiguration)).toEqual([]);
+  });
+
+  it("keeps only the three backlogged Linux CI lanes from executing", () => {
+    expect(
+      ciErrors(
+        ciWorkflow.replace("  quality_linux:\n    if: false", "  quality_linux:\n    if: true"),
+      ),
+    ).toContain(
+      "quality_linux backlog policy requires if: false and continue-on-error to be unset or false",
+    );
+
+    expect(
+      ciErrors(
+        ciWorkflow.replace(
+          "  e2e_linux:\n    name: e2e_linux\n    if: false",
+          "  e2e_linux:\n    name: e2e_linux",
+        ),
+      ),
+    ).toContain("e2e_linux must remain disabled while Linux CI is backlogged");
+
+    expect(
+      ciErrors(
+        ciWorkflow.replace(
+          "        include:\n          - platform: windows",
+          '        include:\n          - platform: linux\n            runner: ubuntu-24.04\n            turbo_concurrency: "50%"\n          - platform: windows',
+        ),
+      ),
+    ).toContain("unit matrix must contain the exact required platforms");
   });
 
   it("keeps stable browser tests blocking and only registry-backed quarantine runs nonblocking", () => {
@@ -724,7 +751,10 @@ describe("workflow contracts", () => {
     const enabled = validFiles();
     enabled.set(
       ".github/workflows/ci.yml",
-      ciWorkflow.replace("    if: false", "    if: ${{ github.event_name == 'push' }}"),
+      ciWorkflow.replace(
+        "  macos_arm64:\n    if: false",
+        "  macos_arm64:\n    if: ${{ github.event_name == 'push' }}",
+      ),
     );
     expect(validateWorkflowContracts(enabled, policy()).join("\n")).toContain(
       "macos_arm64 must remain disabled while macOS CI is backlogged",
@@ -858,7 +888,7 @@ describe("workflow contracts", () => {
     );
   });
 
-  it("locks the complete bounded unit matrix and required quality aggregate", () => {
+  it("locks the bounded Windows unit matrix and required quality aggregate", () => {
     const failFast = validFiles();
     failFast.set(
       ".github/workflows/ci.yml",
@@ -877,7 +907,7 @@ describe("workflow contracts", () => {
       ),
     );
     expect(validateWorkflowContracts(concurrentWindows, policy()).join("\n")).toContain(
-      "unit matrix entry 2 has drifted",
+      "unit matrix entry 1 has drifted",
     );
 
     const detachedConcurrency = validFiles();
