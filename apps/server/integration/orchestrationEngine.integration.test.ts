@@ -172,7 +172,7 @@ const startTurn = (input: {
     createdAt: nowIso(),
   });
 
-it.live("constructs the real Codex orchestration graph with shared server settings", () =>
+it.live("boots the real Codex orchestration graph with no active sessions", () =>
   withRealCodexHarness((harness) =>
     Effect.gen(function* () {
       assert.equal(harness.adapterHarness, null);
