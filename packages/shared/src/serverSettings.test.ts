@@ -8,10 +8,7 @@ import { describe, expect, it } from "vitest";
 
 import { providerStartOptionsFromServerSettings } from "./serverSettings";
 
-function withProviderPaths(
-  binaryPath: string,
-  commandCodeBinaryPath = binaryPath,
-): ServerSettings {
+function withProviderPaths(binaryPath: string, commandCodeBinaryPath = binaryPath): ServerSettings {
   return {
     ...DEFAULT_SERVER_SETTINGS,
     providers: {

@@ -314,9 +314,7 @@ describe("resolveDroidAcpAuthMethodId", () => {
 
   it("lets session creation validate a cached login when no auth method is advertised", async () => {
     delete process.env.FACTORY_API_KEY;
-    const id = await Effect.runPromise(
-      resolveDroidAcpAuthMethodId(initializeWithAuthMethods([])),
-    );
+    const id = await Effect.runPromise(resolveDroidAcpAuthMethodId(initializeWithAuthMethods([])));
     expect(id).toBeUndefined();
   });
 });

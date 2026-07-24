@@ -1644,10 +1644,9 @@ const makeOrchestrationProjectionPipeline = Effect.gen(function* () {
           if (activity.kind === "provider.turn.start.failed" && activity.turnId === null) {
             const failedMessageId = payloadNonEmptyString(activity.payload, "messageId");
             if (failedMessageId === null) return;
-            const pendingTurnStart =
-              yield* projectionTurnRepository.getPendingTurnStartByThreadId({
-                threadId: event.payload.threadId,
-              });
+            const pendingTurnStart = yield* projectionTurnRepository.getPendingTurnStartByThreadId({
+              threadId: event.payload.threadId,
+            });
             if (
               Option.isSome(pendingTurnStart) &&
               pendingTurnStart.value.messageId === failedMessageId
