@@ -261,6 +261,7 @@ export const makeOrchestrationIntegrationHarness = (
     const providerSessionDirectoryLayer = ProviderSessionDirectoryLive.pipe(
       Layer.provide(ProviderSessionRuntimeRepositoryLive),
     );
+    const serverSettingsLayer = ServerSettingsService.layerTest();
     const realCodexRegistry = Layer.effect(
       ProviderAdapterRegistry,
       Effect.gen(function* () {
@@ -278,6 +279,7 @@ export const makeOrchestrationIntegrationHarness = (
       Layer.provideMerge(ServerConfig.layerTest(workspaceDir, rootDir)),
       Layer.provideMerge(NodeServices.layer),
       Layer.provideMerge(providerSessionDirectoryLayer),
+      Layer.provideMerge(serverSettingsLayer),
     );
     const providerLayer = useRealCodex
       ? makeProviderServiceLive().pipe(
@@ -320,7 +322,7 @@ export const makeOrchestrationIntegrationHarness = (
       Layer.provideMerge(studioOutputReactorLayer),
       Layer.provideMerge(gitCoreLayer),
       Layer.provideMerge(textGenerationLayer),
-      Layer.provideMerge(ServerSettingsService.layerTest()),
+      Layer.provideMerge(serverSettingsLayer),
     );
     const checkpointReactorLayer = CheckpointReactorLive.pipe(
       Layer.provideMerge(runtimeServicesLayer),

@@ -84,6 +84,11 @@ export function makeServerProviderLayer(
     }).pipe(Layer.provide(agentGatewayCredentialsLayer));
     const gatewayCodexAdapterLayer = codexAdapterLayer.pipe(
       Layer.provide(agentGatewayCredentialsLayer),
+      // Codex discovery reads the current server-authoritative binary/home
+      // profile. Use the shared live layer so every production composition,
+      // including the standalone provider graph, receives the same settings
+      // instance as the rest of the server.
+      Layer.provide(ServerSettingsLive),
     );
     const claudeAdapterLayer = makeClaudeAdapterLive({
       ...(nativeEventLogger ? { nativeEventLogger } : {}),
