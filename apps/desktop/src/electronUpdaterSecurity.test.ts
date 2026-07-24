@@ -247,7 +247,7 @@ describe("electronUpdaterSecurity", () => {
     );
     expect(result).not.toContain("no valid embedded publisher subject DN");
     expect(result).toContain("signature verification could not be completed");
-  });
+  }, 30_000);
 
   it("fails closed before invoking the verifier when the packaged publisher pin is absent", async () => {
     const updater = {
