@@ -28,7 +28,7 @@
     "@anthropic-ai/sdk": "^0.100.0",
     "@earendil-works/pi-agent-core": "0.80.6",
     "@earendil-works/pi-ai": "0.80.6",
-    "@earendil-works/pi-coding-agent": "0.80.6",
+    "@earendil-works/pi-coding-agent": "0.82.0",
     "@effect/platform-node": "catalog:",
     "@effect/sql-sqlite-bun": "catalog:",
     "@opencode-ai/sdk": "^1.15.13",
