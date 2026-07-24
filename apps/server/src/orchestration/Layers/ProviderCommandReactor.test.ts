@@ -59,6 +59,10 @@ import { OrchestrationProjectionPipelineLive } from "./ProjectionPipeline.ts";
 import { OrchestrationProjectionSnapshotQueryLive } from "./ProjectionSnapshotQuery.ts";
 import { ProviderCommandReactorLive } from "./ProviderCommandReactor.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
+import {
+  ProjectionSnapshotQuery,
+  type ProjectionSnapshotQueryShape,
+} from "../Services/ProjectionSnapshotQuery.ts";
 import { ProviderCommandReactor } from "../Services/ProviderCommandReactor.ts";
 import {
   StudioOutputReactor,
@@ -465,6 +469,9 @@ describe("ProviderCommandReactor", () => {
     const deliveryRepository = await runtime.runPromise(
       Effect.service(OrchestrationEventDeliveryRepository),
     );
+    const projectionSnapshotQuery = await runtime.runPromise(
+      Effect.service(ProjectionSnapshotQuery),
+    );
     if (input?.afterDeliveryReconcile !== undefined) {
       const reconcile = deliveryRepository.reconcile;
       let callbackInvoked = false;
@@ -617,6 +624,7 @@ describe("ProviderCommandReactor", () => {
       setRuntimeSessionTurnState,
       startReactor,
       deliveryRepository,
+      projectionSnapshotQuery,
       pendingInteractionRepository,
       persistWithoutLivePublication: async (
         events: ReadonlyArray<Omit<OrchestrationEvent, "sequence">>,
@@ -829,26 +837,225 @@ describe("ProviderCommandReactor", () => {
     );
   }
 
-  async function advanceHarnessCursorThrough(
+  async function establishUncertainInterruptBlocker(
     harness: Awaited<ReturnType<typeof createHarness>>,
-    eventSequence: number,
-    updatedAt: string,
+    input: {
+      readonly suffix: string;
+      readonly now: string;
+      readonly threadId: ThreadId;
+    },
   ) {
-    const events = Array.from(
-      await Effect.runPromise(
-        Stream.runCollect(harness.engine.readEventsThrough(0, eventSequence)),
+    const activeTurnId = asTurnId(`turn-${input.suffix}`);
+    harness.setRuntimeSessionTurnState({
+      threadId: input.threadId,
+      status: "running",
+      activeTurnId,
+    });
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.makeUnsafe(`cmd-${input.suffix}-session`),
+        threadId: input.threadId,
+        session: {
+          threadId: input.threadId,
+          status: "running",
+          providerName: "codex",
+          runtimeMode: "approval-required",
+          activeTurnId,
+          lastError: null,
+          updatedAt: input.now,
+        },
+        createdAt: input.now,
+      }),
+    );
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.interrupt",
+        commandId: CommandId.makeUnsafe(`cmd-${input.suffix}-blocker`),
+        threadId: input.threadId,
+        turnId: activeTurnId,
+        createdAt: input.now,
+      }),
+    );
+    await waitFor(async () =>
+      Effect.runPromise(
+        harness.deliveryRepository
+          .firstBlockingDeliveryForThread({
+            consumerName: PROVIDER_COMMAND_REACTOR_CONSUMER,
+            threadId: input.threadId,
+          })
+          .pipe(Effect.map(Option.isSome)),
       ),
     );
-    for (const event of events) {
+    return (
       await Effect.runPromise(
-        harness.deliveryRepository.advanceCursor({
+        harness.deliveryRepository.firstBlockingDeliveryForThread({
           consumerName: PROVIDER_COMMAND_REACTOR_CONSUMER,
-          eventSequence: event.sequence,
-          updatedAt,
+          threadId: input.threadId,
         }),
-      );
-    }
+      )
+    ).pipe(Option.getOrThrow);
   }
+
+  it("reuses one provider-session membership scope across a queue drain", async () => {
+    const harness = await createHarness();
+    const now = new Date().toISOString();
+    const threadId = ThreadId.makeUnsafe("thread-1");
+    const syntheticThreadId = ThreadId.makeUnsafe(`subagent:${threadId}:missing-child`);
+    const unrelatedThreadId = ThreadId.makeUnsafe("thread-membership-cache-unrelated");
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.create",
+        commandId: CommandId.makeUnsafe("cmd-membership-cache-unrelated-create"),
+        threadId: unrelatedThreadId,
+        projectId: asProjectId("project-1"),
+        title: "Unrelated membership candidate",
+        modelSelection: { provider: "codex", model: "gpt-5-codex" },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        branch: null,
+        worktreePath: null,
+        createdAt: now,
+      }),
+    );
+    const queuedEvents = await harness.persistWithoutLivePublication([
+      {
+        eventId: asEventId("evt-membership-cache-parent"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: now,
+        commandId: CommandId.makeUnsafe("cmd-membership-cache-parent"),
+        causationEventId: null,
+        correlationId: CommandId.makeUnsafe("cmd-membership-cache-parent"),
+        metadata: {},
+        type: "thread.turn-queued",
+        payload: {
+          threadId,
+          messageId: asMessageId("message-membership-cache-parent"),
+          dispatchMode: "queue",
+          runtimeMode: "approval-required",
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          createdAt: now,
+        },
+      },
+      {
+        eventId: asEventId("evt-membership-cache-synthetic"),
+        aggregateKind: "thread",
+        aggregateId: syntheticThreadId,
+        occurredAt: now,
+        commandId: CommandId.makeUnsafe("cmd-membership-cache-synthetic"),
+        causationEventId: null,
+        correlationId: CommandId.makeUnsafe("cmd-membership-cache-synthetic"),
+        metadata: {},
+        type: "thread.turn-queued",
+        payload: {
+          threadId: syntheticThreadId,
+          messageId: asMessageId("message-membership-cache-synthetic"),
+          dispatchMode: "queue",
+          runtimeMode: "approval-required",
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          createdAt: now,
+        },
+      },
+      {
+        eventId: asEventId("evt-membership-cache-unrelated"),
+        aggregateKind: "thread",
+        aggregateId: unrelatedThreadId,
+        occurredAt: now,
+        commandId: CommandId.makeUnsafe("cmd-membership-cache-unrelated"),
+        causationEventId: null,
+        correlationId: CommandId.makeUnsafe("cmd-membership-cache-unrelated"),
+        metadata: {},
+        type: "thread.turn-queued",
+        payload: {
+          threadId: unrelatedThreadId,
+          messageId: asMessageId("message-membership-cache-unrelated"),
+          dispatchMode: "queue",
+          runtimeMode: "approval-required",
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          createdAt: now,
+        },
+      },
+    ]);
+    for (const event of queuedEvents) {
+      if (event.type !== "thread.turn-queued") {
+        throw new Error("Expected a queued turn source.");
+      }
+      await enqueueHarnessQueuedTurnSource(harness, event);
+    }
+    const unrelatedQueuedEvent = queuedEvents[2]!;
+    await Effect.runPromise(
+      harness.deliveryRepository.claim({
+        consumerName: PROVIDER_COMMAND_REACTOR_CONSUMER,
+        eventSequence: unrelatedQueuedEvent.sequence,
+        threadId: unrelatedThreadId,
+        claimOwner: "membership-cache-unrelated-owner",
+        claimedAt: now,
+        claimExpiresAt: now,
+      }),
+    );
+    await Effect.runPromise(
+      harness.deliveryRepository.markTerminalFailure({
+        consumerName: PROVIDER_COMMAND_REACTOR_CONSUMER,
+        eventSequence: unrelatedQueuedEvent.sequence,
+        expectedClaimOwner: "membership-cache-unrelated-owner",
+        state: "uncertain",
+        error: "unrelated session blocker",
+        updatedAt: now,
+      }),
+    );
+
+    const originalGetThreadDetailById = harness.projectionSnapshotQuery.getThreadDetailById;
+    const getThreadDetailById = vi.fn<ProjectionSnapshotQueryShape["getThreadDetailById"]>(
+      originalGetThreadDetailById,
+    );
+    (
+      harness.projectionSnapshotQuery as {
+        getThreadDetailById: ProjectionSnapshotQueryShape["getThreadDetailById"];
+      }
+    ).getThreadDetailById = getThreadDetailById;
+    let claimedThreadIds: ReadonlyArray<string> = [];
+    const claimNextForThreads = vi.fn<
+      typeof harness.queuedTurnPromotionRepository.claimNextForThreads
+    >((claimInput) => {
+      claimedThreadIds = claimInput.threadIds;
+      return Effect.succeed(Option.none());
+    });
+    (
+      harness.queuedTurnPromotionRepository as {
+        claimNextForThreads: typeof harness.queuedTurnPromotionRepository.claimNextForThreads;
+      }
+    ).claimNextForThreads = claimNextForThreads;
+
+    await harness.emitRuntimeEvent({
+      type: "turn.completed",
+      eventId: asEventId("evt-membership-cache-drain"),
+      provider: "codex",
+      threadId,
+      createdAt: now,
+      turnId: asTurnId("turn-membership-cache-drain"),
+      payload: { state: "completed" },
+      providerRefs: {},
+    } as ProviderRuntimeEvent);
+    await waitFor(() => claimNextForThreads.mock.calls.length === 1);
+
+    const resolvedThreadIds = getThreadDetailById.mock.calls.map(([resolvedThreadId]) =>
+      String(resolvedThreadId),
+    );
+    expect(
+      resolvedThreadIds.filter((resolvedThreadId) => resolvedThreadId === threadId),
+    ).toHaveLength(1);
+    expect(resolvedThreadIds).not.toContain(syntheticThreadId);
+    expect(
+      resolvedThreadIds.filter((resolvedThreadId) => resolvedThreadId === unrelatedThreadId),
+    ).toHaveLength(1);
+    expect(claimNextForThreads).toHaveBeenCalledWith(
+      expect.objectContaining({
+        threadIds: expect.arrayContaining([threadId, syntheticThreadId]),
+      }),
+    );
+    expect(claimedThreadIds).not.toContain(unrelatedThreadId);
+  });
 
   it("REL-01B gate: delivers intents committed before the reactor subscribes", async () => {
     const harness = await createHarness({ startReactor: false });
@@ -1433,6 +1640,300 @@ describe("ProviderCommandReactor", () => {
     await new Promise((resolve) => setTimeout(resolve, 25));
     expect(harness.sendTurn).toHaveBeenCalledTimes(4);
   });
+
+  it("leaves durable handoffs and cancellations untouched when the full replay range is unsafe", async () => {
+    const failure = new ProviderAdapterRequestError({
+      provider: "codex",
+      method: "turn/interrupt",
+      detail: "connection closed after request write",
+    });
+    const harness = await createHarness({
+      interruptTurn: () => Effect.fail(failure),
+    });
+    const now = new Date().toISOString();
+    const threadId = ThreadId.makeUnsafe("thread-1");
+    const blocker = await establishUncertainInterruptBlocker(harness, {
+      suffix: "pure-replay-plan",
+      now,
+      threadId,
+    });
+    const firstMessageId = asMessageId("message-pure-replay-plan-first");
+    const secondMessageId = asMessageId("message-pure-replay-plan-second");
+    const replayEvents = await harness.persistWithoutLivePublication([
+      {
+        eventId: asEventId("evt-pure-replay-plan-first"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: now,
+        commandId: CommandId.makeUnsafe("cmd-pure-replay-plan-first"),
+        causationEventId: null,
+        correlationId: CommandId.makeUnsafe("cmd-pure-replay-plan-first"),
+        metadata: {},
+        type: "thread.turn-start-requested",
+        payload: {
+          threadId,
+          messageId: firstMessageId,
+          dispatchMode: "queue",
+          runtimeMode: "approval-required",
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          createdAt: now,
+        },
+      },
+      {
+        eventId: asEventId("evt-pure-replay-plan-session-stop"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: now,
+        commandId: CommandId.makeUnsafe("cmd-pure-replay-plan-session-stop"),
+        causationEventId: null,
+        correlationId: CommandId.makeUnsafe("cmd-pure-replay-plan-session-stop"),
+        metadata: {},
+        type: "thread.session-stop-requested",
+        payload: {
+          threadId,
+          createdAt: now,
+        },
+      },
+      {
+        eventId: asEventId("evt-pure-replay-plan-second"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: now,
+        commandId: CommandId.makeUnsafe("cmd-pure-replay-plan-second"),
+        causationEventId: null,
+        correlationId: CommandId.makeUnsafe("cmd-pure-replay-plan-second"),
+        metadata: {},
+        type: "thread.turn-start-requested",
+        payload: {
+          threadId,
+          messageId: secondMessageId,
+          dispatchMode: "queue",
+          runtimeMode: "approval-required",
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          createdAt: now,
+        },
+      },
+      {
+        eventId: asEventId("evt-pure-replay-plan-task-stop"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: now,
+        commandId: CommandId.makeUnsafe("cmd-pure-replay-plan-task-stop"),
+        causationEventId: null,
+        correlationId: CommandId.makeUnsafe("cmd-pure-replay-plan-task-stop"),
+        metadata: {},
+        type: "thread.task-stop-requested",
+        payload: {
+          threadId,
+          taskId: "pure-replay-plan-task",
+          createdAt: now,
+        },
+      },
+    ]);
+    const turnSources = replayEvents.filter(
+      (
+        event,
+      ): event is Extract<
+        OrchestrationEvent,
+        { type: "thread.turn-start-requested" | "thread.turn-queued" }
+      > => event.type === "thread.turn-start-requested" || event.type === "thread.turn-queued",
+    );
+    const expectNoReplayMutations = async () => {
+      for (const source of turnSources) {
+        expect(
+          Option.isNone(
+            await Effect.runPromise(
+              harness.queuedTurnPromotionRepository.getBySequence(source.sequence),
+            ),
+          ),
+        ).toBe(true);
+      }
+      for (const event of replayEvents) {
+        expect(
+          Option.isNone(
+            await Effect.runPromise(
+              harness.deliveryRepository.getDelivery({
+                consumerName: PROVIDER_COMMAND_REACTOR_CONSUMER,
+                eventSequence: event.sequence,
+              }),
+            ),
+          ),
+        ).toBe(true);
+      }
+    };
+    await expectNoReplayMutations();
+
+    await expect(
+      Effect.runPromise(
+        harness.reactor.reconcileDelivery({
+          eventSequence: blocker.eventSequence,
+          threadId,
+          expectedState: "uncertain",
+          outcome: "accepted",
+          reconciledBy: "test-operator",
+        }),
+      ),
+    ).rejects.toThrow(/deferred turn ordering/);
+
+    await expectNoReplayMutations();
+    expect(
+      (
+        await Effect.runPromise(
+          harness.deliveryRepository.getDelivery({
+            consumerName: PROVIDER_COMMAND_REACTOR_CONSUMER,
+            eventSequence: blocker.eventSequence,
+          }),
+        )
+      ).pipe(Option.getOrThrow).state,
+    ).toBe("uncertain");
+  });
+
+  it.each([
+    {
+      caseId: "null-expiry",
+      claimExpiresAt: null,
+      claimUnavailable: false,
+      label: "inflight NULL-expiry",
+    },
+    {
+      caseId: "invalid-expiry",
+      claimExpiresAt: "not-an-iso-date",
+      claimUnavailable: false,
+      label: "inflight unparseable-expiry",
+    },
+    {
+      caseId: "unclaimable",
+      claimExpiresAt: null,
+      claimUnavailable: true,
+      label: "unclaimable",
+    },
+  ])(
+    "bounds quarantined handoff retries for a $label delivery",
+    async ({ caseId, claimExpiresAt, claimUnavailable }) => {
+      const failure = new ProviderAdapterRequestError({
+        provider: "codex",
+        method: "turn/interrupt",
+        detail: "connection closed after request write",
+      });
+      const harness = await createHarness({
+        interruptTurn: () => Effect.fail(failure),
+      });
+      const now = new Date().toISOString();
+      const threadId = ThreadId.makeUnsafe("thread-1");
+      const blocker = await establishUncertainInterruptBlocker(harness, {
+        suffix: `bounded-handoff-${caseId}`,
+        now,
+        threadId,
+      });
+      const [deferredStart] = await harness.persistWithoutLivePublication([
+        {
+          eventId: asEventId(`evt-bounded-handoff-${caseId}`),
+          aggregateKind: "thread",
+          aggregateId: threadId,
+          occurredAt: now,
+          commandId: CommandId.makeUnsafe(`cmd-bounded-handoff-${caseId}`),
+          causationEventId: null,
+          correlationId: CommandId.makeUnsafe(`cmd-bounded-handoff-${caseId}`),
+          metadata: {},
+          type: "thread.turn-start-requested",
+          payload: {
+            threadId,
+            messageId: asMessageId(`message-bounded-handoff-${caseId}`),
+            dispatchMode: "queue",
+            runtimeMode: "approval-required",
+            interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+            createdAt: now,
+          },
+        },
+      ]);
+      if (deferredStart === undefined) {
+        throw new Error("Expected a deferred turn start.");
+      }
+
+      const originalGetDelivery = harness.deliveryRepository.getDelivery;
+      const getDelivery = vi.fn<OrchestrationEventDeliveryRepositoryShape["getDelivery"]>(
+        (deliveryInput) =>
+          deliveryInput.eventSequence === deferredStart.sequence
+            ? Effect.succeed(
+                claimUnavailable
+                  ? Option.none()
+                  : Option.some({
+                      consumerName: PROVIDER_COMMAND_REACTOR_CONSUMER,
+                      eventSequence: deferredStart.sequence,
+                      threadId,
+                      state: "inflight" as const,
+                      claimOwner: "stuck-handoff-owner",
+                      claimedAt: now,
+                      claimExpiresAt,
+                      attemptCount: 1,
+                      lastError: null,
+                      completedAt: null,
+                      updatedAt: now,
+                    }),
+              )
+            : originalGetDelivery(deliveryInput),
+      );
+      const originalRequeueExpired = harness.deliveryRepository.requeueExpired;
+      const requeueExpired = vi.fn<OrchestrationEventDeliveryRepositoryShape["requeueExpired"]>(
+        (requeueInput) =>
+          requeueInput.eventSequence === deferredStart.sequence
+            ? Effect.succeed(false)
+            : originalRequeueExpired(requeueInput),
+      );
+      const originalClaim = harness.deliveryRepository.claim;
+      const claim = vi.fn<OrchestrationEventDeliveryRepositoryShape["claim"]>((claimInput) =>
+        claimUnavailable && claimInput.eventSequence === deferredStart.sequence
+          ? Effect.succeed(Option.none())
+          : originalClaim(claimInput),
+      );
+      (
+        harness.deliveryRepository as {
+          getDelivery: OrchestrationEventDeliveryRepositoryShape["getDelivery"];
+        }
+      ).getDelivery = getDelivery;
+      (
+        harness.deliveryRepository as {
+          requeueExpired: OrchestrationEventDeliveryRepositoryShape["requeueExpired"];
+        }
+      ).requeueExpired = requeueExpired;
+      (
+        harness.deliveryRepository as {
+          claim: OrchestrationEventDeliveryRepositoryShape["claim"];
+        }
+      ).claim = claim;
+
+      const startedAt = Date.now();
+      await expect(
+        Effect.runPromise(
+          harness.reactor.reconcileDelivery({
+            eventSequence: blocker.eventSequence,
+            threadId,
+            expectedState: "uncertain",
+            outcome: "accepted",
+            reconciledBy: "test-operator",
+          }),
+        ),
+      ).rejects.toThrow(
+        new RegExp(
+          `Turn-start queue handoff for delivery ${deferredStart.sequence} could not settle after 3 attempts`,
+        ),
+      );
+      expect(Date.now() - startedAt).toBeGreaterThanOrEqual(75);
+      const targetRequeueCalls = requeueExpired.mock.calls.filter(
+        ([requeueInput]) => requeueInput.eventSequence === deferredStart.sequence,
+      );
+      const targetClaimCalls = claim.mock.calls.filter(
+        ([claimInput]) => claimInput.eventSequence === deferredStart.sequence,
+      );
+      expect(targetRequeueCalls).toHaveLength(claimUnavailable ? 0 : 3);
+      expect(targetClaimCalls).toHaveLength(claimUnavailable ? 3 : 0);
+      expect(
+        getDelivery.mock.calls.filter(
+          ([deliveryInput]) => deliveryInput.eventSequence === deferredStart.sequence,
+        ),
+      ).toHaveLength(3);
+    },
+  );
 
   it("fails reconciliation closed when queued work precedes a deferred provider side effect", async () => {
     const failure = new ProviderAdapterRequestError({

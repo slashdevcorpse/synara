@@ -213,6 +213,8 @@ const HANDLED_TURN_START_KEY_TTL = Duration.minutes(30);
 const PROVIDER_COMMAND_CLAIM_LEASE_MS = 30_000;
 const PROVIDER_COMMAND_SAFE_RETRY_LIMIT = 3;
 const PROVIDER_COMMAND_SAFE_RETRY_DELAY = Duration.millis(50);
+const QUEUED_TURN_HANDOFF_RETRY_LIMIT = 3;
+const QUEUED_TURN_HANDOFF_RETRY_DELAY = Duration.millis(50);
 const DEFAULT_RUNTIME_MODE: RuntimeMode = "full-access";
 const SIDECHAT_BOUNDARY_INSTRUCTION =
   "You are in a sidechat. Treat all prior conversation as reference-only context. Do not continue any prior task automatically. Do not mutate files, git, or the workspace and do not run workspace-changing commands unless the latest user message explicitly asks you to do so after this boundary. Use this sidechat for focused explanation, safety checks, summaries, and alternatives.";
@@ -655,47 +657,91 @@ const make = Effect.gen(function* () {
     return parentThread ?? thread;
   });
 
-  const resolveProviderSessionThreadIds = Effect.fnUntraced(function* (input: {
+  type ProviderSessionThreadScope = {
+    readonly requestedThreadId: ThreadId;
+    readonly sessionThreadId: ThreadId;
+    readonly syntheticSubagentPrefix: string;
+    readonly sessionThreadIdByThreadId: Map<string, ThreadId>;
+  };
+
+  const makeProviderSessionThreadScope = (
+    requestedThreadId: ThreadId,
+    sessionThreadId: ThreadId,
+  ): ProviderSessionThreadScope => ({
+    requestedThreadId,
+    sessionThreadId,
+    syntheticSubagentPrefix: `subagent:${sessionThreadId}:`,
+    sessionThreadIdByThreadId: new Map<string, ThreadId>([
+      [requestedThreadId, sessionThreadId],
+      [sessionThreadId, sessionThreadId],
+    ]),
+  });
+
+  const resolveProviderSessionThreadScope = Effect.fnUntraced(function* (threadId: ThreadId) {
+    const providerThread = yield* resolveProviderSessionThread(threadId);
+    return makeProviderSessionThreadScope(threadId, providerThread?.id ?? threadId);
+  });
+
+  const resolveSessionThreadIdInScope = Effect.fnUntraced(function* (input: {
+    readonly scope: ProviderSessionThreadScope;
     readonly threadId: ThreadId;
-    readonly candidateThreadIds: ReadonlyArray<string>;
   }) {
+    const rawThreadId = input.threadId as string;
+    const cached = input.scope.sessionThreadIdByThreadId.get(rawThreadId);
+    if (cached !== undefined) {
+      return cached;
+    }
+    if (
+      input.threadId === input.scope.sessionThreadId ||
+      rawThreadId.startsWith(input.scope.syntheticSubagentPrefix)
+    ) {
+      input.scope.sessionThreadIdByThreadId.set(rawThreadId, input.scope.sessionThreadId);
+      return input.scope.sessionThreadId;
+    }
+
     const providerThread = yield* resolveProviderSessionThread(input.threadId);
     const sessionThreadId = providerThread?.id ?? input.threadId;
-    const memberThreadIds = new Set<string>([sessionThreadId, input.threadId]);
-    const candidateMemberThreadIds = new Set<string>();
-    const syntheticPrefix = `subagent:${sessionThreadId}:`;
+    input.scope.sessionThreadIdByThreadId.set(rawThreadId, sessionThreadId);
+    return sessionThreadId;
+  });
+
+  const resolveProviderSessionThreadIds = Effect.fnUntraced(function* (input: {
+    readonly scope: ProviderSessionThreadScope;
+    readonly candidateThreadIds: ReadonlyArray<string>;
+  }) {
+    const memberThreadIds = new Set<string>([
+      input.scope.sessionThreadId,
+      input.scope.requestedThreadId,
+    ]);
 
     for (const rawCandidateThreadId of input.candidateThreadIds) {
       const candidateThreadId = ThreadId.makeUnsafe(rawCandidateThreadId);
-      const candidateProviderThread = yield* resolveProviderSessionThread(candidateThreadId);
-      const candidateSessionThreadId =
-        candidateProviderThread?.id ??
-        (rawCandidateThreadId.startsWith(syntheticPrefix) ? sessionThreadId : candidateThreadId);
-      if (candidateSessionThreadId === sessionThreadId) {
+      const candidateSessionThreadId = yield* resolveSessionThreadIdInScope({
+        scope: input.scope,
+        threadId: candidateThreadId,
+      });
+      if (candidateSessionThreadId === input.scope.sessionThreadId) {
         memberThreadIds.add(rawCandidateThreadId);
-        candidateMemberThreadIds.add(rawCandidateThreadId);
       }
     }
 
-    return {
-      sessionThreadId,
-      memberThreadIds: [...memberThreadIds].map((threadId) => ThreadId.makeUnsafe(threadId)),
-      candidateMemberThreadIds: [...candidateMemberThreadIds].map((threadId) =>
-        ThreadId.makeUnsafe(threadId),
-      ),
-    };
+    return [...memberThreadIds].map((threadId) => ThreadId.makeUnsafe(threadId));
   });
 
-  const listPendingProviderSessionThreadIds = Effect.fnUntraced(function* (threadId: ThreadId) {
+  const listPendingProviderSessionThreadIds = Effect.fnUntraced(function* (
+    scope: ProviderSessionThreadScope,
+  ) {
     return yield* resolveProviderSessionThreadIds({
-      threadId,
+      scope,
       candidateThreadIds: yield* queuedTurnPromotions.listPendingThreadIds,
     });
   });
 
-  const listCancellableProviderSessionThreadIds = Effect.fnUntraced(function* (threadId: ThreadId) {
+  const listCancellableProviderSessionThreadIds = Effect.fnUntraced(function* (
+    scope: ProviderSessionThreadScope,
+  ) {
     return yield* resolveProviderSessionThreadIds({
-      threadId,
+      scope,
       candidateThreadIds: yield* queuedTurnPromotions.listCancellableThreadIds,
     });
   });
@@ -705,9 +751,10 @@ const make = Effect.gen(function* () {
     readonly throughEventSequence: number;
     readonly updatedAt: string;
   }) {
-    const session = yield* listCancellableProviderSessionThreadIds(input.threadId);
+    const scope = yield* resolveProviderSessionThreadScope(input.threadId);
+    const memberThreadIds = yield* listCancellableProviderSessionThreadIds(scope);
     yield* Effect.forEach(
-      session.memberThreadIds,
+      memberThreadIds,
       (memberThreadId) =>
         queuedTurnPromotions.cancelThread({
           threadId: memberThreadId,
@@ -716,12 +763,13 @@ const make = Effect.gen(function* () {
         }),
       { discard: true },
     );
-    return session;
   });
 
-  const listUnsettledProviderSessionThreadIds = Effect.fnUntraced(function* (threadId: ThreadId) {
+  const listUnsettledProviderSessionThreadIds = Effect.fnUntraced(function* (
+    scope: ProviderSessionThreadScope,
+  ) {
     return yield* resolveProviderSessionThreadIds({
-      threadId,
+      scope,
       candidateThreadIds: yield* deliveryRepository.listUnsettledThreadIds(
         PROVIDER_COMMAND_REACTOR_CONSUMER,
       ),
@@ -729,10 +777,11 @@ const make = Effect.gen(function* () {
   });
 
   const firstBlockingProviderDeliveryForSession = Effect.fnUntraced(function* (threadId: ThreadId) {
-    const session = yield* listUnsettledProviderSessionThreadIds(threadId);
+    const scope = yield* resolveProviderSessionThreadScope(threadId);
+    const memberThreadIds = yield* listUnsettledProviderSessionThreadIds(scope);
     return yield* deliveryRepository.firstBlockingDeliveryForThreads({
       consumerName: PROVIDER_COMMAND_REACTOR_CONSUMER,
-      threadIds: session.memberThreadIds,
+      threadIds: memberThreadIds,
     });
   });
 
@@ -790,13 +839,13 @@ const make = Effect.gen(function* () {
     queuedTurnPromotions.hasPendingMessage({ threadId, messageId });
 
   const hasUnsettledProviderDeliveryForSession = Effect.fnUntraced(function* (input: {
-    readonly threadId: ThreadId;
+    readonly scope: ProviderSessionThreadScope;
     readonly excludingEventSequence?: number | undefined;
   }) {
-    const session = yield* listUnsettledProviderSessionThreadIds(input.threadId);
+    const memberThreadIds = yield* listUnsettledProviderSessionThreadIds(input.scope);
     return yield* deliveryRepository.hasUnsettledDeliveryForThreads({
       consumerName: PROVIDER_COMMAND_REACTOR_CONSUMER,
-      threadIds: session.memberThreadIds,
+      threadIds: memberThreadIds,
       ...(input.excludingEventSequence === undefined
         ? {}
         : { excludingEventSequence: input.excludingEventSequence }),
@@ -811,13 +860,17 @@ const make = Effect.gen(function* () {
   // Child subagent threads share their parent's provider session, so the
   // lookup must resolve to the session-owning thread — a raw child-id lookup
   // would always miss and drain queued child messages into a live turn.
-  const resolveLiveProviderTurnId = Effect.fnUntraced(function* (threadId: ThreadId) {
-    const providerThread = yield* resolveProviderSessionThread(threadId);
-    const sessionThreadId = providerThread?.id ?? threadId;
+  const resolveLiveProviderTurnIdForSessionThread = Effect.fnUntraced(function* (
+    sessionThreadId: ThreadId,
+  ) {
     const session = yield* providerService
       .listSessions()
       .pipe(Effect.map((sessions) => sessions.find((entry) => entry.threadId === sessionThreadId)));
     return session?.status === "running" ? session.activeTurnId : undefined;
+  });
+  const resolveLiveProviderTurnId = Effect.fnUntraced(function* (threadId: ThreadId) {
+    const scope = yield* resolveProviderSessionThreadScope(threadId);
+    return yield* resolveLiveProviderTurnIdForSessionThread(scope.sessionThreadId);
   });
   const hasLiveProviderTurn = (threadId: ThreadId) =>
     resolveLiveProviderTurnId(threadId).pipe(Effect.map((turnId) => turnId !== undefined));
@@ -2064,7 +2117,7 @@ const make = Effect.gen(function* () {
       delete reservation.pendingTerminalTurnIds;
       if (completedBeforeBinding) {
         pendingQueuedDispatchBySessionThread.delete(sessionThreadId);
-        yield* drainQueuedTurnsForSession(event.payload.threadId, {
+        yield* drainQueuedTurnsForThread(event.payload.threadId, {
           excludingEventSequence: event.sequence,
         });
       }
@@ -2251,7 +2304,7 @@ const make = Effect.gen(function* () {
             if (isPendingQueuedDispatch) {
               yield* clearPendingQueuedDispatch;
             }
-            yield* drainQueuedTurnsForSession(event.payload.threadId, {
+            yield* drainQueuedTurnsForThread(event.payload.threadId, {
               excludingEventSequence: event.sequence,
             });
             return yield* Effect.failCause(cause);
@@ -2273,7 +2326,7 @@ const make = Effect.gen(function* () {
         !(yield* hasLiveProviderTurn(event.payload.threadId))
       ) {
         yield* clearPendingQueuedDispatch;
-        yield* drainQueuedTurnsForSession(event.payload.threadId, {
+        yield* drainQueuedTurnsForThread(event.payload.threadId, {
           excludingEventSequence: event.sequence,
         });
       }
@@ -2307,14 +2360,14 @@ const make = Effect.gen(function* () {
   // Promote the next queued message only after the active provider turn settles.
   // Every queue sharing one provider session competes for the same claim and
   // in-memory guard; parent/child threads can never promote concurrently.
-  const drainQueuedTurnsForThread: (
-    threadId: ThreadId,
+  const drainQueuedTurnsForResolvedSession: (
+    scope: ProviderSessionThreadScope,
     options?: DrainQueuedTurnsOptions,
   ) => Effect.Effect<void, unknown, Scope.Scope> = Effect.fnUntraced(function* (
-    threadId: ThreadId,
+    scope: ProviderSessionThreadScope,
     options?: DrainQueuedTurnsOptions,
   ) {
-    const sessionThreadId = (yield* resolveProviderSessionThread(threadId))?.id ?? threadId;
+    const { sessionThreadId } = scope;
     let continueDrainAfterPromotion = false;
     if (
       drainingQueuedSessions.has(sessionThreadId) ||
@@ -2326,19 +2379,19 @@ const make = Effect.gen(function* () {
     try {
       if (
         (yield* hasUnsettledProviderDeliveryForSession({
-          threadId,
+          scope,
           ...(options?.excludingEventSequence === undefined
             ? {}
             : { excludingEventSequence: options.excludingEventSequence }),
         })) ||
-        (yield* hasLiveProviderTurn(sessionThreadId)) ||
+        (yield* resolveLiveProviderTurnIdForSessionThread(sessionThreadId)) !== undefined ||
         pendingQueuedDispatchBySessionThread.has(sessionThreadId)
       ) {
         return;
       }
-      const sessionQueue = yield* listPendingProviderSessionThreadIds(threadId);
+      const sessionQueue = yield* listPendingProviderSessionThreadIds(scope);
       const claimed = yield* queuedTurnPromotions.claimNextForThreads({
-        threadIds: sessionQueue.memberThreadIds,
+        threadIds: sessionQueue,
         claimOwner: queuedTurnPromotionOwner,
         claimedAt: new Date().toISOString(),
         claimExpiresAt: new Date(Date.now() + PROVIDER_COMMAND_CLAIM_LEASE_MS).toISOString(),
@@ -2456,7 +2509,7 @@ const make = Effect.gen(function* () {
           derivedDelivery.value.state === "succeeded" &&
           reservation?.releaseOnTurnId === undefined
         ) {
-          const liveTurnId = yield* resolveLiveProviderTurnId(queuedThreadId);
+          const liveTurnId = yield* resolveLiveProviderTurnIdForSessionThread(sessionThreadId);
           if (liveTurnId !== undefined && reservation !== undefined) {
             reservation.releaseOnTurnId = liveTurnId;
           } else {
@@ -2482,17 +2535,25 @@ const make = Effect.gen(function* () {
       drainingQueuedSessions.delete(sessionThreadId);
     }
     if (continueDrainAfterPromotion) {
-      yield* drainQueuedTurnsForThread(sessionThreadId, options);
+      yield* drainQueuedTurnsForResolvedSession(scope, options);
     }
   });
 
-  const drainQueuedTurnsForSession = (threadId: ThreadId, options?: DrainQueuedTurnsOptions) =>
-    drainQueuedTurnsForThread(threadId, options);
+  const drainQueuedTurnsForThread: (
+    threadId: ThreadId,
+    options?: DrainQueuedTurnsOptions,
+  ) => Effect.Effect<void, unknown, Scope.Scope> = Effect.fnUntraced(function* (
+    threadId: ThreadId,
+    options?: DrainQueuedTurnsOptions,
+  ) {
+    const scope = yield* resolveProviderSessionThreadScope(threadId);
+    yield* drainQueuedTurnsForResolvedSession(scope, options);
+  });
 
   const processQueueDrainEvent = Effect.fnUntraced(function* (event: ProviderQueueDrainEvent) {
     observePendingContextBootstrapTerminalEvent(event);
-    const sessionThreadId =
-      (yield* resolveProviderSessionThread(event.threadId))?.id ?? event.threadId;
+    const scope = yield* resolveProviderSessionThreadScope(event.threadId);
+    const { sessionThreadId } = scope;
     const reservation = pendingQueuedDispatchBySessionThread.get(sessionThreadId);
     if (reservation) {
       if (event.turnId === undefined) {
@@ -2501,7 +2562,7 @@ const make = Effect.gen(function* () {
         // cleared before the terminal event is emitted. Keep the reservation
         // while a turn is genuinely live; otherwise release it so queued work
         // cannot remain stranded behind an id-less terminal event.
-        if (yield* hasLiveProviderTurn(event.threadId)) {
+        if ((yield* resolveLiveProviderTurnIdForSessionThread(sessionThreadId)) !== undefined) {
           return;
         }
         pendingQueuedDispatchBySessionThread.delete(sessionThreadId);
@@ -2519,7 +2580,7 @@ const make = Effect.gen(function* () {
     // Child subagent threads queue under their own id but share the parent's
     // provider session, and terminal runtime events carry the session-owning
     // thread id — drain every queue bound to this session.
-    yield* drainQueuedTurnsForSession(event.threadId);
+    yield* drainQueuedTurnsForResolvedSession(scope);
   });
 
   const recoverQueuedTurnPromotions = Effect.gen(function* () {
@@ -3106,16 +3167,13 @@ const make = Effect.gen(function* () {
 
     const stoppedSessionThreadId = providerThread?.id ?? thread.id;
     const stopsProviderSession = providerThread === null || providerThread.id === thread.id;
-    const clearedQueuedThreadIds = new Set<ThreadId>([thread.id]);
-    if (stopsProviderSession) {
-      for (const queuedThreadId of yield* queuedTurnPromotions.listCancellableThreadIds) {
-        const queuedThread = ThreadId.makeUnsafe(queuedThreadId);
-        const queuedProviderThread = yield* resolveProviderSessionThread(queuedThread);
-        if ((queuedProviderThread?.id ?? queuedThread) === stoppedSessionThreadId) {
-          clearedQueuedThreadIds.add(queuedThread);
-        }
-      }
-    }
+    const clearedQueuedThreadIds = new Set<ThreadId>(
+      stopsProviderSession
+        ? yield* listCancellableProviderSessionThreadIds(
+            makeProviderSessionThreadScope(thread.id, stoppedSessionThreadId),
+          )
+        : [thread.id],
+    );
     for (const queuedThreadId of clearedQueuedThreadIds) {
       yield* queuedTurnPromotions.cancelThread({
         threadId: queuedThreadId,
@@ -3629,15 +3687,13 @@ const make = Effect.gen(function* () {
 
     const providerIntentBelongsToSession = Effect.fnUntraced(function* (input: {
       readonly event: ProviderIntentEvent;
-      readonly sessionThreadId: ThreadId;
+      readonly scope: ProviderSessionThreadScope;
     }) {
-      const providerThread = yield* resolveProviderSessionThread(input.event.payload.threadId);
-      const eventSessionThreadId =
-        providerThread?.id ??
-        ((input.event.payload.threadId as string).startsWith(`subagent:${input.sessionThreadId}:`)
-          ? input.sessionThreadId
-          : input.event.payload.threadId);
-      return eventSessionThreadId === input.sessionThreadId;
+      const eventSessionThreadId = yield* resolveSessionThreadIdInScope({
+        scope: input.scope,
+        threadId: input.event.payload.threadId,
+      });
+      return eventSessionThreadId === input.scope.sessionThreadId;
     });
 
     const replayQuarantinedThreadSideEffects = Effect.fnUntraced(function* (input: {
@@ -3646,9 +3702,7 @@ const make = Effect.gen(function* () {
       readonly replayThrough: number;
     }) {
       if (input.replayThrough <= input.afterSequence) return;
-      const sessionThreadId =
-        (yield* resolveProviderSessionThread(ThreadId.makeUnsafe(input.threadId)))?.id ??
-        ThreadId.makeUnsafe(input.threadId);
+      const scope = yield* resolveProviderSessionThreadScope(ThreadId.makeUnsafe(input.threadId));
       yield* Stream.runForEach(
         orchestrationEngine.readEventsThrough(input.afterSequence, input.replayThrough),
         (event) =>
@@ -3656,7 +3710,7 @@ const make = Effect.gen(function* () {
             if (
               !isProviderIntentEvent(event) ||
               !isProviderSideEffectIntent(event) ||
-              !(yield* providerIntentBelongsToSession({ event, sessionThreadId }))
+              !(yield* providerIntentBelongsToSession({ event, scope }))
             ) {
               return;
             }
@@ -3677,7 +3731,36 @@ const make = Effect.gen(function* () {
       );
     });
 
-    const ensureQuarantinedReplayOrderIsSafe = Effect.fnUntraced(function* (input: {
+    type QuarantinedReplayMutation =
+      | {
+          readonly _tag: "completeTurnStartHandoff";
+          readonly event: Extract<ProviderIntentEvent, { type: "thread.turn-start-requested" }>;
+        }
+      | {
+          readonly _tag: "enqueueQueuedTurn";
+          readonly event: Extract<ProviderIntentEvent, { type: "thread.turn-queued" }>;
+        }
+      | {
+          readonly _tag: "enqueueQuarantinedTurn";
+          readonly event: QueuedTurnSourceEvent;
+        }
+      | {
+          readonly _tag: "cancelProviderSession";
+          readonly event: Extract<ProviderIntentEvent, { type: "thread.session-stop-requested" }>;
+        }
+      | {
+          readonly _tag: "cancelThread";
+          readonly event: Extract<ProviderIntentEvent, { type: "thread.session-stop-requested" }>;
+        }
+      | {
+          readonly _tag: "cancelMessage";
+          readonly event: Extract<
+            ProviderIntentEvent,
+            { type: "thread.message-edit-resend-requested" }
+          >;
+        };
+
+    const planQuarantinedReplayMutations = Effect.fnUntraced(function* (input: {
       readonly threadId: string;
       readonly afterSequence: number;
       readonly replayThrough: number;
@@ -3686,10 +3769,9 @@ const make = Effect.gen(function* () {
         { type: "thread.turn-start-requested" }
       >;
     }) {
-      if (input.replayThrough <= input.afterSequence) return;
-      const sessionThreadId =
-        (yield* resolveProviderSessionThread(ThreadId.makeUnsafe(input.threadId)))?.id ??
-        ThreadId.makeUnsafe(input.threadId);
+      const mutationPlan: QuarantinedReplayMutation[] = [];
+      if (input.replayThrough <= input.afterSequence) return mutationPlan;
+      const scope = yield* resolveProviderSessionThreadScope(ThreadId.makeUnsafe(input.threadId));
       const events = Array.from(
         yield* Stream.runCollect(
           orchestrationEngine.readEventsThrough(input.afterSequence, input.replayThrough),
@@ -3699,28 +3781,27 @@ const make = Effect.gen(function* () {
         number,
         {
           readonly event: QueuedTurnSourceEvent;
-          readonly handoffCompleted: boolean;
+          readonly handoffPlanned: boolean;
         }
       >();
       if (input.initialDeferredTurn !== undefined) {
         deferredTurns.set(input.initialDeferredTurn.sequence, {
           event: input.initialDeferredTurn,
-          handoffCompleted: false,
+          handoffPlanned: false,
         });
       }
 
-      const materializeDeferredTurns = Effect.fnUntraced(function* (
+      const planDeferredTurnMaterialization = (
         deferred: ReadonlyArray<{
           readonly event: QueuedTurnSourceEvent;
-          readonly handoffCompleted: boolean;
+          readonly handoffPlanned: boolean;
         }>,
-      ) {
+      ) => {
         for (const entry of deferred) {
-          if (entry.handoffCompleted) continue;
-          yield* enqueueQuarantinedTurnStart(entry.event);
-          yield* requireExactQueuedTurnHandoff(entry.event);
+          if (entry.handoffPlanned) continue;
+          mutationPlan.push({ _tag: "enqueueQuarantinedTurn", event: entry.event });
         }
-      });
+      };
 
       const failUnsafeOrdering = (event: ProviderIntentEvent) =>
         Effect.fail(
@@ -3734,7 +3815,7 @@ const make = Effect.gen(function* () {
       for (const event of events) {
         if (
           !isProviderIntentEvent(event) ||
-          !(yield* providerIntentBelongsToSession({ event, sessionThreadId }))
+          !(yield* providerIntentBelongsToSession({ event, scope }))
         ) {
           continue;
         }
@@ -3749,14 +3830,13 @@ const make = Effect.gen(function* () {
             continue;
           }
           if (event.type === "thread.turn-start-requested") {
-            yield* completeQueuedTurnStartHandoff(event);
+            mutationPlan.push({ _tag: "completeTurnStartHandoff", event });
           } else {
-            yield* enqueueQueuedTurnStart(event);
-            yield* requireExactQueuedTurnHandoff(event);
+            mutationPlan.push({ _tag: "enqueueQueuedTurn", event });
           }
           deferredTurns.set(event.sequence, {
             event,
-            handoffCompleted: true,
+            handoffPlanned: true,
           });
           continue;
         }
@@ -3765,9 +3845,11 @@ const make = Effect.gen(function* () {
         }
 
         if (event.type === "thread.session-stop-requested") {
-          const targetProviderThread = yield* resolveProviderSessionThread(event.payload.threadId);
-          const stopsWholeProviderSession =
-            targetProviderThread === null || targetProviderThread.id === event.payload.threadId;
+          const targetSessionThreadId = yield* resolveSessionThreadIdInScope({
+            scope,
+            threadId: event.payload.threadId,
+          });
+          const stopsWholeProviderSession = targetSessionThreadId === event.payload.threadId;
           const affected = [...deferredTurns.values()].filter(
             (entry) =>
               stopsWholeProviderSession || entry.event.payload.threadId === event.payload.threadId,
@@ -3775,20 +3857,11 @@ const make = Effect.gen(function* () {
           if (affected.length !== deferredTurns.size) {
             return yield* failUnsafeOrdering(event);
           }
-          yield* materializeDeferredTurns(affected);
-          if (stopsWholeProviderSession) {
-            yield* cancelProviderSessionPromotionsThrough({
-              threadId: event.payload.threadId,
-              throughEventSequence: event.sequence,
-              updatedAt: event.payload.createdAt,
-            });
-          } else {
-            yield* queuedTurnPromotions.cancelThread({
-              threadId: event.payload.threadId,
-              throughEventSequence: event.sequence,
-              updatedAt: event.payload.createdAt,
-            });
-          }
+          planDeferredTurnMaterialization(affected);
+          mutationPlan.push({
+            _tag: stopsWholeProviderSession ? "cancelProviderSession" : "cancelThread",
+            event,
+          });
           deferredTurns.clear();
           continue;
         }
@@ -3802,18 +3875,56 @@ const make = Effect.gen(function* () {
           if (affected.length !== deferredTurns.size) {
             return yield* failUnsafeOrdering(event);
           }
-          yield* materializeDeferredTurns(affected);
-          yield* queuedTurnPromotions.cancelMessage({
-            threadId: event.payload.threadId,
-            messageId: event.payload.messageId,
-            throughEventSequence: event.sequence,
-            updatedAt: event.payload.createdAt,
-          });
+          planDeferredTurnMaterialization(affected);
+          mutationPlan.push({ _tag: "cancelMessage", event });
           deferredTurns.clear();
           continue;
         }
 
         return yield* failUnsafeOrdering(event);
+      }
+      return mutationPlan;
+    });
+
+    const applyQuarantinedReplayMutations = Effect.fnUntraced(function* (
+      mutationPlan: ReadonlyArray<QuarantinedReplayMutation>,
+    ) {
+      for (const mutation of mutationPlan) {
+        switch (mutation._tag) {
+          case "completeTurnStartHandoff":
+            yield* completeQueuedTurnStartHandoff(mutation.event);
+            break;
+          case "enqueueQueuedTurn":
+            yield* enqueueQueuedTurnStart(mutation.event);
+            yield* requireExactQueuedTurnHandoff(mutation.event);
+            break;
+          case "enqueueQuarantinedTurn":
+            yield* enqueueQuarantinedTurnStart(mutation.event);
+            yield* requireExactQueuedTurnHandoff(mutation.event);
+            break;
+          case "cancelProviderSession":
+            yield* cancelProviderSessionPromotionsThrough({
+              threadId: mutation.event.payload.threadId,
+              throughEventSequence: mutation.event.sequence,
+              updatedAt: mutation.event.payload.createdAt,
+            });
+            break;
+          case "cancelThread":
+            yield* queuedTurnPromotions.cancelThread({
+              threadId: mutation.event.payload.threadId,
+              throughEventSequence: mutation.event.sequence,
+              updatedAt: mutation.event.payload.createdAt,
+            });
+            break;
+          case "cancelMessage":
+            yield* queuedTurnPromotions.cancelMessage({
+              threadId: mutation.event.payload.threadId,
+              messageId: mutation.event.payload.messageId,
+              throughEventSequence: mutation.event.sequence,
+              updatedAt: mutation.event.payload.createdAt,
+            });
+            break;
+        }
       }
     });
 
@@ -3852,8 +3963,12 @@ const make = Effect.gen(function* () {
       // provider, then replay the barrier and post-barrier work.
       yield* requireExactQueuedTurnHandoff(event, { allowCancelled: true });
       const claimOwner = `${processOwner}:${event.sequence}:queue-handoff`;
+      let lastRetryDetail = "delivery was not claimable";
 
-      while (true) {
+      for (let attempt = 1; attempt <= QUEUED_TURN_HANDOFF_RETRY_LIMIT; attempt += 1) {
+        if (attempt > 1) {
+          yield* Effect.sleep(QUEUED_TURN_HANDOFF_RETRY_DELAY);
+        }
         const existing = yield* deliveryRepository.getDelivery({
           consumerName: PROVIDER_COMMAND_REACTOR_CONSUMER,
           eventSequence: event.sequence,
@@ -3885,6 +4000,9 @@ const make = Effect.gen(function* () {
               error: "Turn-start queue handoff claim expired before settlement.",
             });
             if (!requeued) {
+              lastRetryDetail =
+                `inflight claim owned by ${existing.value.claimOwner ?? "<missing>"} ` +
+                `with expiry ${existing.value.claimExpiresAt ?? "<missing>"} could not be requeued`;
               continue;
             }
           }
@@ -3899,6 +4017,9 @@ const make = Effect.gen(function* () {
           claimExpiresAt: new Date(Date.now() + PROVIDER_COMMAND_CLAIM_LEASE_MS).toISOString(),
         });
         if (Option.isNone(claimed)) {
+          lastRetryDetail = Option.isSome(existing)
+            ? `delivery remained in state ${existing.value.state}`
+            : "delivery row was unavailable after the claim attempt";
           continue;
         }
         const completed = yield* deliveryRepository.complete({
@@ -3915,6 +4036,13 @@ const make = Effect.gen(function* () {
         yield* refreshCursor;
         return;
       }
+
+      return yield* Effect.die(
+        new Error(
+          `Turn-start queue handoff for delivery ${event.sequence} could not settle after ` +
+            `${QUEUED_TURN_HANDOFF_RETRY_LIMIT} attempts: ${lastRetryDetail}.`,
+        ),
+      );
     });
 
     const resumeRetryableDelivery = Effect.fnUntraced(function* (
@@ -3951,7 +4079,7 @@ const make = Effect.gen(function* () {
           afterSequence: input.eventSequence,
           replayThrough,
         });
-        yield* drainQueuedTurnsForSession(ThreadId.makeUnsafe(input.threadId), {
+        yield* drainQueuedTurnsForThread(ThreadId.makeUnsafe(input.threadId), {
           synchronouslyProcessCommittedStart: options?.synchronouslyProcessCommittedStart === true,
         });
       }
@@ -3963,7 +4091,7 @@ const make = Effect.gen(function* () {
           Effect.gen(function* () {
             const reconciliationEvent = yield* readProviderIntentEvent(input.eventSequence);
             const replayThrough = yield* orchestrationEngine.getEventHighWaterSequence;
-            yield* ensureQuarantinedReplayOrderIsSafe({
+            const replayMutations = yield* planQuarantinedReplayMutations({
               threadId: input.threadId,
               afterSequence: input.eventSequence,
               replayThrough,
@@ -3972,6 +4100,7 @@ const make = Effect.gen(function* () {
                 ? { initialDeferredTurn: reconciliationEvent }
                 : {}),
             });
+            yield* applyQuarantinedReplayMutations(replayMutations);
             if (cursor < replayThrough) {
               yield* Stream.runForEach(
                 orchestrationEngine.readEventsThrough(cursor, replayThrough),
@@ -4011,7 +4140,7 @@ const make = Effect.gen(function* () {
                 afterSequence: input.eventSequence,
                 replayThrough,
               });
-              yield* drainQueuedTurnsForSession(ThreadId.makeUnsafe(input.threadId), {
+              yield* drainQueuedTurnsForThread(ThreadId.makeUnsafe(input.threadId), {
                 synchronouslyProcessCommittedStart: true,
               });
             }

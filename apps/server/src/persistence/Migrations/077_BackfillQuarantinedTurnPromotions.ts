@@ -79,56 +79,26 @@ export default Effect.gen(function* () {
                 AND reconciled_blocker.thread_id = requested.stream_id
                 AND reconciled_blocker.event_sequence < requested.sequence
                 AND reconciliation.reconciled_at >= requested.occurred_at
-                AND NOT EXISTS (
-                  SELECT 1
-                  FROM orchestration_events AS later_side_effect
-                  WHERE later_side_effect.aggregate_kind = 'thread'
-                    AND later_side_effect.stream_id = requested.stream_id
-                    AND later_side_effect.event_type IN (
-                      'thread.meta-updated',
-                      'thread.runtime-mode-set',
-                      'thread.turn-interrupt-requested',
-                      'thread.task-stop-requested',
-                      'thread.task-background-requested',
-                      'thread.approval-response-requested',
-                      'thread.user-input-response-requested',
-                      'thread.conversation-rollback-requested',
-                      'thread.message-edit-resend-requested',
-                      'thread.session-stop-requested'
-                    )
-                    AND EXISTS (
-                      SELECT 1
-                      FROM orchestration_events AS skipped_start
-                      WHERE skipped_start.aggregate_kind = 'thread'
-                        AND skipped_start.stream_id = requested.stream_id
-                        AND skipped_start.event_type =
-                          'thread.turn-start-requested'
-                        AND skipped_start.sequence >
-                          reconciled_blocker.event_sequence
-                        AND skipped_start.sequence <
-                          later_side_effect.sequence
-                        AND skipped_start.occurred_at <=
-                          reconciliation.reconciled_at
-                        AND EXISTS (
-                          SELECT 1
-                          FROM orchestration_consumer_state AS skipped_consumer
-                          WHERE skipped_consumer.consumer_name =
-                            ${PROVIDER_COMMAND_REACTOR_CONSUMER}
-                            AND skipped_consumer.last_acked_sequence >=
-                              skipped_start.sequence
-                        )
-                        AND NOT EXISTS (
-                          SELECT 1
-                          FROM orchestration_event_deliveries AS
-                            skipped_delivery
-                          WHERE skipped_delivery.consumer_name =
-                            ${PROVIDER_COMMAND_REACTOR_CONSUMER}
-                            AND skipped_delivery.event_sequence =
-                              skipped_start.sequence
-                        )
-                    )
-                )
             )
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM orchestration_events AS later_side_effect
+            WHERE later_side_effect.aggregate_kind = 'thread'
+              AND later_side_effect.stream_id = requested.stream_id
+              AND later_side_effect.sequence > requested.sequence
+              AND later_side_effect.event_type IN (
+                'thread.meta-updated',
+                'thread.runtime-mode-set',
+                'thread.turn-interrupt-requested',
+                'thread.task-stop-requested',
+                'thread.task-background-requested',
+                'thread.approval-response-requested',
+                'thread.user-input-response-requested',
+                'thread.conversation-rollback-requested',
+                'thread.message-edit-resend-requested',
+                'thread.session-stop-requested'
+              )
           )
           AND 1 = (
             SELECT COUNT(*)
@@ -222,6 +192,7 @@ export default Effect.gen(function* () {
           created_at,
           NULL
         FROM migration_077_quarantined_turn_starts
+        WHERE true
         ORDER BY queued_event_sequence ASC
         ON CONFLICT DO UPDATE SET
           queued_event_sequence = excluded.queued_event_sequence,
@@ -277,6 +248,7 @@ export default Effect.gen(function* () {
           ON queued.queued_event_sequence = eligible.queued_event_sequence
           AND queued.thread_id = eligible.thread_id
           AND queued.message_id = eligible.message_id
+        WHERE true
         ON CONFLICT DO NOTHING
       `;
 

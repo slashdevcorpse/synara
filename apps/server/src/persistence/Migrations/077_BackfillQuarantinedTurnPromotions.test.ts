@@ -197,6 +197,147 @@ layer("077_BackfillQuarantinedTurnPromotions", (it) => {
           )
         `;
 
+      type LaterSideEffectFixture = {
+        readonly suffix: string;
+        readonly eventType: string;
+        readonly payload: (context: {
+          readonly threadId: string;
+          readonly messageId: string;
+          readonly occurredAt: string;
+        }) => Readonly<Record<string, unknown>>;
+      };
+      const laterSideEffectFixtures = [
+        {
+          suffix: "meta-update",
+          eventType: "thread.meta-updated",
+          payload: ({ threadId, occurredAt }) => ({
+            threadId,
+            modelSelection: {
+              provider: "codex",
+              model: "gpt-5.6-sol",
+            },
+            updatedAt: occurredAt,
+          }),
+        },
+        {
+          suffix: "runtime-mode",
+          eventType: "thread.runtime-mode-set",
+          payload: ({ threadId, occurredAt }) => ({
+            threadId,
+            runtimeMode: "full-access",
+            updatedAt: occurredAt,
+          }),
+        },
+        {
+          suffix: "turn-interrupt",
+          eventType: "thread.turn-interrupt-requested",
+          payload: ({ threadId, occurredAt }) => ({
+            threadId,
+            turnId: "turn-unresolved-fence",
+            createdAt: occurredAt,
+          }),
+        },
+        {
+          suffix: "task-stop",
+          eventType: "thread.task-stop-requested",
+          payload: ({ threadId, occurredAt }) => ({
+            threadId,
+            taskId: "task-unresolved-fence",
+            createdAt: occurredAt,
+          }),
+        },
+        {
+          suffix: "task-background",
+          eventType: "thread.task-background-requested",
+          payload: ({ threadId, occurredAt }) => ({
+            threadId,
+            toolUseId: "tool-unresolved-fence",
+            createdAt: occurredAt,
+          }),
+        },
+        {
+          suffix: "approval-response",
+          eventType: "thread.approval-response-requested",
+          payload: ({ threadId, occurredAt }) => ({
+            threadId,
+            requestId: "approval-unresolved-fence",
+            lifecycleGeneration: "generation-unresolved-fence",
+            decision: "cancel",
+            createdAt: occurredAt,
+          }),
+        },
+        {
+          suffix: "user-input-response",
+          eventType: "thread.user-input-response-requested",
+          payload: ({ threadId, occurredAt }) => ({
+            threadId,
+            requestId: "input-unresolved-fence",
+            lifecycleGeneration: "generation-unresolved-fence",
+            answers: { action: "continue" },
+            createdAt: occurredAt,
+          }),
+        },
+        {
+          suffix: "conversation-rollback",
+          eventType: "thread.conversation-rollback-requested",
+          payload: ({ threadId, messageId, occurredAt }) => ({
+            threadId,
+            messageId,
+            numTurns: 1,
+            createdAt: occurredAt,
+          }),
+        },
+        {
+          suffix: "message-edit-resend",
+          eventType: "thread.message-edit-resend-requested",
+          payload: ({ threadId, messageId, occurredAt }) => ({
+            threadId,
+            messageId,
+            text: "Replacement text after skipped start",
+            rollbackTurnCount: 1,
+            removedTurnIds: [],
+            runtimeMode: "approval-required",
+            interactionMode: "default",
+            createdAt: occurredAt,
+          }),
+        },
+        {
+          suffix: "session-stop",
+          eventType: "thread.session-stop-requested",
+          payload: ({ threadId, occurredAt }) => ({
+            threadId,
+            createdAt: occurredAt,
+          }),
+        },
+      ] satisfies ReadonlyArray<LaterSideEffectFixture>;
+
+      const appendRealUserMessage = (input: {
+        readonly suffix: string;
+        readonly threadId: string;
+        readonly messageId: string;
+        readonly createdAt: string;
+      }) =>
+        appendEvent({
+          suffix: input.suffix,
+          threadId: input.threadId,
+          eventType: "thread.message-sent",
+          occurredAt: input.createdAt,
+          payload: {
+            threadId: input.threadId,
+            messageId: input.messageId,
+            role: "user",
+            text: input.suffix,
+            attachments: [],
+            dispatchMode: "queue",
+            dispatchOrigin: "composer",
+            turnId: null,
+            streaming: false,
+            source: "native",
+            createdAt: input.createdAt,
+            updatedAt: input.createdAt,
+          },
+        });
+
       const orderedThread = "thread-ordered-steers";
       const orderedBlocker = yield* appendBlocker({
         suffix: "ordered-blocker",
@@ -650,6 +791,105 @@ layer("077_BackfillQuarantinedTurnPromotions", (it) => {
         createdAt: "2026-07-24T12:21:30.000Z",
       });
 
+      const unresolvedPositiveThread = "thread-unresolved-positive";
+      const unresolvedPositiveBlocker = yield* appendBlocker({
+        suffix: "unresolved-positive-blocker",
+        threadId: unresolvedPositiveThread,
+        createdAt: "2026-07-24T12:21:31.000Z",
+      });
+      yield* insertDelivery({
+        eventSequence: unresolvedPositiveBlocker,
+        threadId: unresolvedPositiveThread,
+        state: "uncertain",
+      });
+      yield* appendRealUserMessage({
+        suffix: "unresolved-positive-message",
+        threadId: unresolvedPositiveThread,
+        messageId: "message-unresolved-positive",
+        createdAt: "2026-07-24T12:21:31.000Z",
+      });
+      const unresolvedPositiveStart = yield* appendStart({
+        suffix: "unresolved-positive-start",
+        threadId: unresolvedPositiveThread,
+        messageId: "message-unresolved-positive",
+        createdAt: "2026-07-24T12:21:31.000Z",
+      });
+
+      const unresolvedFencedStarts: Array<number> = [];
+      const postFenceRecoveries: Array<{
+        readonly sequence: number;
+        readonly threadId: string;
+        readonly messageId: string;
+        readonly dispatchMode: string;
+        readonly state: string;
+      }> = [];
+      for (const [index, fixture] of laterSideEffectFixtures.entries()) {
+        const staleAt = `2026-07-24T12:21:${String(32 + index * 2).padStart(2, "0")}.000Z`;
+        const sideEffectAt = `2026-07-24T12:21:${String(33 + index * 2).padStart(2, "0")}.000Z`;
+        const threadId = `thread-unresolved-fence-${fixture.suffix}`;
+        const staleMessageId = `message-unresolved-fence-${fixture.suffix}-stale`;
+        const blocker = yield* appendBlocker({
+          suffix: `unresolved-fence-${fixture.suffix}-blocker`,
+          threadId,
+          createdAt: staleAt,
+        });
+        yield* insertDelivery({
+          eventSequence: blocker,
+          threadId,
+          state: "uncertain",
+        });
+        yield* appendRealUserMessage({
+          suffix: `unresolved-fence-${fixture.suffix}-stale-message`,
+          threadId,
+          messageId: staleMessageId,
+          createdAt: staleAt,
+        });
+        const staleStart = yield* appendStart({
+          suffix: `unresolved-fence-${fixture.suffix}-stale-start`,
+          threadId,
+          messageId: staleMessageId,
+          createdAt: staleAt,
+        });
+        unresolvedFencedStarts.push(staleStart);
+        yield* appendEvent({
+          suffix: `unresolved-fence-${fixture.suffix}-side-effect`,
+          threadId,
+          eventType: fixture.eventType,
+          occurredAt: sideEffectAt,
+          payload: fixture.payload({
+            threadId,
+            messageId: staleMessageId,
+            occurredAt: sideEffectAt,
+          }),
+        });
+
+        const freshMessageId =
+          fixture.eventType === "thread.message-edit-resend-requested"
+            ? staleMessageId
+            : `message-unresolved-fence-${fixture.suffix}-fresh`;
+        if (freshMessageId !== staleMessageId) {
+          yield* appendRealUserMessage({
+            suffix: `unresolved-fence-${fixture.suffix}-fresh-message`,
+            threadId,
+            messageId: freshMessageId,
+            createdAt: sideEffectAt,
+          });
+        }
+        const freshStart = yield* appendStart({
+          suffix: `unresolved-fence-${fixture.suffix}-fresh-start`,
+          threadId,
+          messageId: freshMessageId,
+          createdAt: sideEffectAt,
+        });
+        postFenceRecoveries.push({
+          sequence: freshStart,
+          threadId,
+          messageId: freshMessageId,
+          dispatchMode: "queue",
+          state: "queued",
+        });
+      }
+
       const noBlockerThread = "thread-no-blocker";
       yield* appendMessage({
         suffix: "no-blocker-message",
@@ -753,6 +993,13 @@ layer("077_BackfillQuarantinedTurnPromotions", (it) => {
           state: "queued",
         },
         {
+          sequence: interleavedStartC,
+          threadId: interleavedThread,
+          messageId: "message-reconciled-interleaved-c",
+          dispatchMode: "queue",
+          state: "queued",
+        },
+        {
           sequence: promotedStart,
           threadId: promotedThread,
           messageId: "message-promoted-source",
@@ -773,9 +1020,17 @@ layer("077_BackfillQuarantinedTurnPromotions", (it) => {
           dispatchMode: "queue",
           state: "queued",
         },
+        {
+          sequence: unresolvedPositiveStart,
+          threadId: unresolvedPositiveThread,
+          messageId: "message-unresolved-positive",
+          dispatchMode: "queue",
+          state: "queued",
+        },
+        ...postFenceRecoveries,
       ]);
 
-      const unsafeInterleavedBackfills = yield* sql<{
+      const interleavedBoundaryBackfills = yield* sql<{
         readonly sequence: number;
         readonly queueRows: number;
         readonly deliveryRows: number;
@@ -801,10 +1056,42 @@ layer("077_BackfillQuarantinedTurnPromotions", (it) => {
         ) AS candidate
         ORDER BY candidate.sequence ASC
       `;
-      assert.deepStrictEqual(unsafeInterleavedBackfills, [
+      assert.deepStrictEqual(interleavedBoundaryBackfills, [
         { sequence: interleavedStartB, queueRows: 0, deliveryRows: 0 },
-        { sequence: interleavedStartC, queueRows: 0, deliveryRows: 0 },
+        { sequence: interleavedStartC, queueRows: 1, deliveryRows: 1 },
       ]);
+
+      const unresolvedFenceBackfills = yield* sql<{
+        readonly sequence: number;
+        readonly queueRows: number;
+        readonly deliveryRows: number;
+      }>`
+        SELECT
+          candidate.sequence,
+          (
+            SELECT COUNT(*)
+            FROM queued_turn_promotions AS queued
+            WHERE queued.queued_event_sequence = candidate.sequence
+          ) AS "queueRows",
+          (
+            SELECT COUNT(*)
+            FROM orchestration_event_deliveries AS delivery
+            WHERE delivery.consumer_name =
+              ${PROVIDER_COMMAND_REACTOR_CONSUMER}
+              AND delivery.event_sequence = candidate.sequence
+          ) AS "deliveryRows"
+        FROM orchestration_events AS candidate
+        WHERE candidate.sequence IN ${sql.in(unresolvedFencedStarts)}
+        ORDER BY candidate.sequence ASC
+      `;
+      assert.deepStrictEqual(
+        unresolvedFenceBackfills,
+        unresolvedFencedStarts.map((sequence) => ({
+          sequence,
+          queueRows: 0,
+          deliveryRows: 0,
+        })),
+      );
 
       const handledDeliveries = yield* sql<{
         readonly sequence: number;
@@ -819,14 +1106,7 @@ layer("077_BackfillQuarantinedTurnPromotions", (it) => {
           attempt_count AS "attemptCount"
         FROM orchestration_event_deliveries
         WHERE consumer_name = ${PROVIDER_COMMAND_REACTOR_CONSUMER}
-          AND event_sequence IN (
-            ${orderedStartOne},
-            ${orderedStartTwo},
-            ${reconciledStart},
-            ${promotedStart},
-            ${replacingStart},
-            ${cancelledStart}
-          )
+          AND state = 'succeeded'
         ORDER BY event_sequence ASC
       `;
       assert.deepStrictEqual(handledDeliveries, [
@@ -843,8 +1123,26 @@ layer("077_BackfillQuarantinedTurnPromotions", (it) => {
           attemptCount: 1,
         },
         {
+          sequence: reconciledBlocker,
+          threadId: reconciledThread,
+          state: "succeeded",
+          attemptCount: 1,
+        },
+        {
           sequence: reconciledStart,
           threadId: reconciledThread,
+          state: "succeeded",
+          attemptCount: 1,
+        },
+        {
+          sequence: interleavedBlocker,
+          threadId: interleavedThread,
+          state: "succeeded",
+          attemptCount: 1,
+        },
+        {
+          sequence: interleavedStartC,
+          threadId: interleavedThread,
           state: "succeeded",
           attemptCount: 1,
         },
@@ -861,11 +1159,29 @@ layer("077_BackfillQuarantinedTurnPromotions", (it) => {
           attemptCount: 1,
         },
         {
+          sequence: ownDeliveryStart,
+          threadId: ownDeliveryThread,
+          state: "succeeded",
+          attemptCount: 1,
+        },
+        {
           sequence: cancelledStart,
           threadId: cancelledThread,
           state: "succeeded",
           attemptCount: 1,
         },
+        {
+          sequence: unresolvedPositiveStart,
+          threadId: unresolvedPositiveThread,
+          state: "succeeded",
+          attemptCount: 1,
+        },
+        ...postFenceRecoveries.map(({ sequence, threadId }) => ({
+          sequence,
+          threadId,
+          state: "succeeded",
+          attemptCount: 1,
+        })),
       ]);
 
       yield* BackfillQuarantinedTurnPromotionsMigration;
@@ -907,16 +1223,19 @@ legacyShapeLayer("077_BackfillQuarantinedTurnPromotions legacy shape", (it) => {
       yield* runMigrations({ toMigrationInclusive: 76 });
 
       const threadId = "thread-legacy-quarantined-fifo";
-      let streamVersion = 0;
+      const streamVersions = new Map<string, number>();
       const appendEvent = (input: {
         readonly suffix: string;
+        readonly threadId?: string;
         readonly eventType: string;
         readonly occurredAt: string;
         readonly payload: Readonly<Record<string, unknown>>;
         readonly causationEventId?: string;
       }) =>
         Effect.gen(function* () {
-          streamVersion += 1;
+          const eventThreadId = input.threadId ?? threadId;
+          const streamVersion = (streamVersions.get(eventThreadId) ?? 0) + 1;
+          streamVersions.set(eventThreadId, streamVersion);
           const rows = yield* sql<{ readonly sequence: number }>`
             INSERT INTO orchestration_events (
               event_id,
@@ -934,7 +1253,7 @@ legacyShapeLayer("077_BackfillQuarantinedTurnPromotions legacy shape", (it) => {
             ) VALUES (
               ${`event-legacy-${input.suffix}`},
               'thread',
-              ${threadId},
+              ${eventThreadId},
               ${streamVersion},
               ${input.eventType},
               ${input.occurredAt},
@@ -992,13 +1311,15 @@ legacyShapeLayer("077_BackfillQuarantinedTurnPromotions legacy shape", (it) => {
       const startBSequence = yield* appendStart("b", "steer", "2026-07-24T14:01:00.000Z");
       const messageCSequence = yield* appendMessage("c", "2026-07-24T14:02:00.000Z");
       const startCSequence = yield* appendStart("c", "steer", "2026-07-24T14:02:00.000Z");
+      const cursorThreadId = "thread-legacy-cursor-tail";
       const cursorSequence = yield* appendEvent({
         suffix: "cursor-tail",
+        threadId: cursorThreadId,
         eventType: "thread.meta-updated",
         occurredAt: "2026-07-24T14:03:00.000Z",
         payload: {
-          threadId,
-          title: "Legacy quarantined FIFO",
+          threadId: cursorThreadId,
+          title: "Unrelated cursor tail",
           updatedAt: "2026-07-24T14:03:00.000Z",
         },
       });
