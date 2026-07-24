@@ -149,6 +149,7 @@ import { quiesceProviderRuntimesForUpdate } from "../providerUpdateQuiescence.ts
 import { classifyCompletedProviderUpdate } from "../providerUpdateOutcome.ts";
 import {
   shouldRetryDelayedProviderUpdateVersion,
+  shouldRunWindowsDroidNativeUpdateFinalizer,
   verifyDelayedProviderUpdateVersion,
   type ProviderUpdateVerificationSnapshot,
 } from "../providerUpdateVerification.ts";
@@ -4204,7 +4205,7 @@ export function makeProviderHealthLive(
           const preflightStatus = yield* enrichProviderStatusWithVersionAdvisory(
             beforeStatus,
             stableCapabilities,
-            { forceRefresh: true },
+            { forceRefresh: true, useAdvisoryLatestVersionSource: true },
           ).pipe(Effect.catch(() => Effect.succeed(beforeStatus)));
           const preflightDecisionGeneration = yield* readUpdateSettingsGeneration();
           if (
@@ -4282,24 +4283,73 @@ export function makeProviderHealthLive(
                   ...(commandUpdate.pathPrepend ? { pathPrepend: commandUpdate.pathPrepend } : {}),
                   teardownFailureRef,
                 }).pipe(Effect.scoped);
+                const commandResults: CommandResult[] = [commandResult];
                 if (commandResult.exitCode !== 0) {
                   return {
                     _tag: "NonZeroExit",
-                    commandResult,
+                    commandResults,
+                    failedCommandResult: commandResult,
                   } as const;
                 }
 
-                const initialPostProbe = yield* runPostUpdateVerificationProbe(stableGeneration);
+                let verificationGeneration = stableGeneration;
+                let initialPostProbe = yield* runPostUpdateVerificationProbe(stableGeneration);
+                if (
+                  shouldRunWindowsDroidNativeUpdateFinalizer({
+                    platform,
+                    provider,
+                    updateChannelKind: commandUpdate.target.channel.kind,
+                    beforeVersion,
+                    initialSnapshot: initialPostProbe,
+                  })
+                ) {
+                  const finalizerGeneration = yield* readUpdateSettingsGeneration();
+                  const finalizerUpdate = finalizerGeneration.capabilities.update;
+                  if (
+                    !finalizerUpdate ||
+                    !updateEvidenceGenerationMatches(
+                      provider,
+                      initialPostProbe.generation,
+                      finalizerGeneration,
+                    )
+                  ) {
+                    initialPostProbe = {
+                      ...initialPostProbe,
+                      targetChanged: true,
+                    };
+                  } else {
+                    yield* maintenanceGate.assertProviderNotLatched({ provider });
+                    const finalizerResult = yield* runUpdateCommand({
+                      provider,
+                      command: finalizerUpdate.executable,
+                      args: ["update", "--check"],
+                      ...(finalizerUpdate.pathPrepend
+                        ? { pathPrepend: finalizerUpdate.pathPrepend }
+                        : {}),
+                      teardownFailureRef,
+                    }).pipe(Effect.scoped);
+                    commandResults.push(finalizerResult);
+                    if (finalizerResult.exitCode !== 0) {
+                      return {
+                        _tag: "NonZeroExit",
+                        commandResults,
+                        failedCommandResult: finalizerResult,
+                      } as const;
+                    }
+                    verificationGeneration = finalizerGeneration;
+                    initialPostProbe = yield* runPostUpdateVerificationProbe(finalizerGeneration);
+                  }
+                }
                 const verifiedPostProbe = shouldRetryDelayedProviderUpdateVersion(platform)
                   ? yield* verifyDelayedProviderUpdateVersion({
                       beforeVersion,
                       initialSnapshot: initialPostProbe,
-                      probe: runPostUpdateVerificationProbe(stableGeneration),
+                      probe: runPostUpdateVerificationProbe(verificationGeneration),
                     })
                   : initialPostProbe;
                 return {
                   _tag: "Verified",
-                  commandResult,
+                  commandResults,
                   verifiedPostProbe,
                 } as const;
               }),
@@ -4326,12 +4376,16 @@ export function makeProviderHealthLive(
             return { providers };
           }
           const maintenanceResult = exclusiveResult.success;
-          const result = maintenanceResult.commandResult;
-          const output = [result.stderr, result.stdout].filter(Boolean).join("\n\n").trim() || null;
+          const output =
+            maintenanceResult.commandResults
+              .flatMap((result) => [result.stderr, result.stdout])
+              .filter(Boolean)
+              .join("\n\n")
+              .trim() || null;
           if (maintenanceResult._tag === "NonZeroExit") {
             const providers = yield* markTerminal({
               status: "failed",
-              message: `Update command exited with code ${result.exitCode}.`,
+              message: `Update command exited with code ${maintenanceResult.failedCommandResult.exitCode}.`,
               output: output ? output.slice(0, UPDATE_OUTPUT_MAX_BYTES) : null,
             });
             return { providers };
@@ -4343,7 +4397,7 @@ export function makeProviderHealthLive(
           const postStatus = yield* enrichProviderStatusWithVersionAdvisory(
             afterStatus,
             postCapabilities,
-            { forceRefresh: true },
+            { forceRefresh: true, useAdvisoryLatestVersionSource: true },
           ).pipe(Effect.catch(() => Effect.succeed(afterStatus)));
           const postDecisionGeneration = yield* readUpdateSettingsGeneration();
           const postEvidenceGenerationChanged = !updateEvidenceGenerationMatches(

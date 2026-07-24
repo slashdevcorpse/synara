@@ -9,19 +9,7 @@ import type { ServerProviderStatus } from "@synara/contracts";
 import { DEFAULT_SERVER_SETTINGS, ServerProviderUpdateError } from "@synara/contracts";
 import { buildWindowsBatchCommandArgs, resolveWindowsComSpec } from "@synara/shared/windowsProcess";
 import { describe, it, assert } from "@effect/vitest";
-import {
-  Clock,
-  Deferred,
-  Duration,
-  Effect,
-  Fiber,
-  FileSystem,
-  Layer,
-  Path,
-  Result,
-  Sink,
-  Stream,
-} from "effect";
+import { Deferred, Effect, Fiber, FileSystem, Layer, Path, Result, Sink, Stream } from "effect";
 import { TestClock } from "effect/testing";
 import * as PlatformError from "effect/PlatformError";
 import { ChildProcessSpawner } from "effect/unstable/process";
@@ -80,7 +68,6 @@ import {
   readCodexConfigModelProvider,
   stabilizeProviderStatusesAgainstTransientTimeouts,
 } from "./ProviderHealth";
-import { PROVIDER_UPDATE_POST_PROBE_RETRY_DELAYS_MS } from "../providerUpdateVerification.ts";
 import {
   enrichProviderStatusWithVersionAdvisory,
   resolvePackageManagedProviderMaintenance,
@@ -763,6 +750,54 @@ function withKiloUpdateFixture<A, E, R>(
       return yield* use({ fixture, baseDir, npmPrefix, kiloBinaryPath, cachePath, settings });
     }),
   );
+}
+
+function withNativeDroidUpdateFixture<A, E, R>(
+  installedVersion: string,
+  use: (input: {
+    readonly baseDir: string;
+    readonly droidBinaryPath: string;
+    readonly cachePath: string;
+    readonly settings: typeof DEFAULT_SERVER_SETTINGS;
+  }) => Effect.Effect<A, E, R>,
+) {
+  return Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+      prefix: "provider-update-native-droid-",
+    });
+    const droidDirectory = NodePath.join(baseDir, "bin");
+    const droidBinaryPath = NodePath.join(droidDirectory, "droid.exe");
+    yield* fileSystem.makeDirectory(droidDirectory, { recursive: true });
+    yield* fileSystem.writeFileString(droidBinaryPath, "droid fixture\n");
+    const cachePath = resolveProviderStatusCachePath({
+      stateDir: NodePath.join(baseDir, "userdata"),
+      provider: "droid",
+    });
+    yield* writeProviderStatusCache({
+      filePath: cachePath,
+      provider: {
+        provider: "droid",
+        status: "ready",
+        available: true,
+        authStatus: "unknown",
+        checkedAt: "2026-07-23T20:00:00.000Z",
+        version: installedVersion,
+      },
+    });
+    const settings = {
+      ...allProvidersDisabledServerSettings,
+      providers: {
+        ...allProvidersDisabledServerSettings.providers,
+        droid: {
+          ...DEFAULT_SERVER_SETTINGS.providers.droid,
+          enabled: true,
+          binaryPath: droidBinaryPath,
+        },
+      },
+    } satisfies typeof DEFAULT_SERVER_SETTINGS;
+    return yield* use({ baseDir, droidBinaryPath, cachePath, settings });
+  });
 }
 
 const providerServiceWithoutRuntimesLayer = Layer.succeed(ProviderService, {
@@ -1588,165 +1623,386 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
     });
 
     it.effect.skipIf(process.platform !== "win32")(
-      "waits for a delayed native Droid replacement and keeps the updater job-contained",
+      "finalizes a staged native Droid update inside the same contained maintenance window",
       () =>
-        Effect.gen(function* () {
-          const fileSystem = yield* FileSystem.FileSystem;
-          const baseDir = yield* fileSystem.makeTempDirectoryScoped({
-            prefix: "provider-update-delayed-droid-",
-          });
-          const droidDirectory = NodePath.join(baseDir, "bin");
-          const droidBinaryPath = NodePath.join(droidDirectory, "droid.exe");
-          yield* fileSystem.makeDirectory(droidDirectory, { recursive: true });
-          yield* fileSystem.writeFileString(droidBinaryPath, "droid fixture\n");
-          yield* writeProviderStatusCache({
-            filePath: resolveProviderStatusCachePath({
-              stateDir: NodePath.join(baseDir, "userdata"),
-              provider: "droid",
-            }),
-            provider: {
-              provider: "droid",
-              status: "ready",
-              available: true,
-              authStatus: "unknown",
-              checkedAt: "2026-07-23T20:00:00.000Z",
-              version: "0.174.0",
-            },
-          });
-          const settings = {
-            ...allProvidersDisabledServerSettings,
-            providers: {
-              ...allProvidersDisabledServerSettings.providers,
-              droid: {
-                ...DEFAULT_SERVER_SETTINGS.providers.droid,
-                enabled: true,
-                binaryPath: droidBinaryPath,
-              },
-            },
-          } satisfies typeof DEFAULT_SERVER_SETTINGS;
-          let healthProbeCount = 0;
-          let updatePrepareCount = 0;
-          let updateSpawnCount = 0;
-          let updaterCompleted = false;
-          let blockedOperationEntered = false;
-          let firstRetrySleepIntercepted = false;
-          const firstRetrySleepStarted = yield* Deferred.make<void>();
-          const releaseFirstRetrySleep = yield* Deferred.make<void>();
-          const baseClock = yield* Clock.Clock;
-          const controlledUpdateClock: Clock.Clock = {
-            currentTimeMillisUnsafe: () => baseClock.currentTimeMillisUnsafe(),
-            currentTimeMillis: baseClock.currentTimeMillis,
-            currentTimeNanosUnsafe: () => baseClock.currentTimeNanosUnsafe(),
-            currentTimeNanos: baseClock.currentTimeNanos,
-            sleep: (duration) => {
-              if (
-                !firstRetrySleepIntercepted &&
-                updaterCompleted &&
-                healthProbeCount === 2 &&
-                Duration.toMillis(duration) === PROVIDER_UPDATE_POST_PROBE_RETRY_DELAYS_MS[0]
-              ) {
-                firstRetrySleepIntercepted = true;
-                return Deferred.succeed(firstRetrySleepStarted, undefined).pipe(
-                  Effect.andThen(Deferred.await(releaseFirstRetrySleep)),
+        withNativeDroidUpdateFixture("0.174.0", (input) =>
+          withLatestNpmVersion(
+            "0.178.0",
+            Effect.gen(function* () {
+              let healthProbeCount = 0;
+              let updatePrepareCount = 0;
+              let initialUpdateSpawnCount = 0;
+              let finalizerSpawnCount = 0;
+              let finalizerCompleted = false;
+              let blockedOperationEntered = false;
+              const finalizerStarted = yield* Deferred.make<void>();
+              const releaseFinalizer = yield* Deferred.make<void>();
+              const maintenanceGate = yield* makeProviderMaintenanceGate;
+              const prepareProcess: ProviderHealthProcessOptions["prepareProcess"] = (
+                command,
+                args,
+                options,
+              ) => {
+                const prepared = prepareContainedResolvedWindowsProviderForTest(
+                  command,
+                  args,
+                  options,
                 );
-              }
-              return baseClock.sleep(duration);
-            },
-          };
-          const maintenanceGate = yield* makeProviderMaintenanceGate;
-          const prepareProcess: ProviderHealthProcessOptions["prepareProcess"] = (
-            command,
-            args,
-            options,
-          ) => {
-            const prepared = prepareContainedResolvedWindowsProviderForTest(command, args, options);
-            if (args.length === 1 && args[0] === "update") {
-              updatePrepareCount += 1;
-              assert.ok(isWindowsJobPreparedCommand(prepared));
-              assert.ok(prepared.args.includes(droidBinaryPath));
-              assert.ok(
-                ![prepared.command, ...prepared.args].join(" ").toLowerCase().includes("cmd.exe"),
-              );
-            }
-            return prepared;
-          };
-          const layer = makeProviderHealthLive({
-            platform: "win32",
-            prepareProcess,
-            processTreeKiller: syntheticProcessTreeKiller(72),
-            maintenanceGate,
-          }).pipe(
-            Layer.provideMerge(providerServiceWithoutRuntimesLayer),
-            Layer.provideMerge(ServerSettingsService.layerTest(settings)),
-            Layer.provideMerge(ServerConfig.layerTest(process.cwd(), baseDir)),
-            Layer.provideMerge(
-              mockSpawnerLayer((args, command) => {
-                assert.strictEqual(command.toLowerCase(), droidBinaryPath.toLowerCase());
-                if (args.length === 1 && args[0] === "update") {
-                  updateSpawnCount += 1;
-                  updaterCompleted = true;
-                  return { stdout: "Update initiated.\n", stderr: "", code: 0 };
+                if (args[0] === "update") {
+                  updatePrepareCount += 1;
+                  assert.ok(isWindowsJobPreparedCommand(prepared));
+                  assert.ok(prepared.args.includes(input.droidBinaryPath));
+                  assert.ok(
+                    ![prepared.command, ...prepared.args]
+                      .join(" ")
+                      .toLowerCase()
+                      .includes("cmd.exe"),
+                  );
                 }
-                assert.deepStrictEqual(args, ["--version"]);
-                healthProbeCount += 1;
-                return {
-                  stdout:
-                    updaterCompleted && healthProbeCount >= 3
-                      ? "droid 0.178.0\n"
-                      : "droid 0.174.0\n",
-                  stderr: "",
-                  code: 0,
-                };
-              }),
-            ),
-          );
+                return prepared;
+              };
+              const layer = makeProviderHealthLive({
+                platform: "win32",
+                prepareProcess,
+                processTreeKiller: syntheticProcessTreeKiller(72),
+                maintenanceGate,
+              }).pipe(
+                Layer.provideMerge(providerServiceWithoutRuntimesLayer),
+                Layer.provideMerge(ServerSettingsService.layerTest(input.settings)),
+                Layer.provideMerge(ServerConfig.layerTest(process.cwd(), input.baseDir)),
+                Layer.provideMerge(
+                  effectSpawnerLayer((args, command) => {
+                    assert.strictEqual(command.toLowerCase(), input.droidBinaryPath.toLowerCase());
+                    if (args.length === 1 && args[0] === "update") {
+                      initialUpdateSpawnCount += 1;
+                      return Effect.succeed(
+                        mockHandle({ stdout: "Update staged.\n", stderr: "", code: 0 }),
+                      );
+                    }
+                    if (args.length === 2 && args[0] === "update" && args[1] === "--check") {
+                      finalizerSpawnCount += 1;
+                      return Deferred.succeed(finalizerStarted, undefined).pipe(
+                        Effect.andThen(Deferred.await(releaseFinalizer)),
+                        Effect.tap(() =>
+                          Effect.sync(() => {
+                            finalizerCompleted = true;
+                          }),
+                        ),
+                        Effect.as(
+                          mockHandle({
+                            stdout: "Staged update applied.\n",
+                            stderr: "",
+                            code: 0,
+                          }),
+                        ),
+                      );
+                    }
+                    assert.deepStrictEqual(args, ["--version"]);
+                    healthProbeCount += 1;
+                    return Effect.succeed(
+                      mockHandle({
+                        stdout: finalizerCompleted ? "droid 0.178.0\n" : "droid 0.174.0\n",
+                        stderr: "",
+                        code: 0,
+                      }),
+                    );
+                  }),
+                ),
+              );
 
-          const result = yield* Effect.gen(function* () {
-            const providerHealth = yield* ProviderHealth;
-            const update = yield* providerHealth
-              .updateProvider({ provider: "droid" })
-              .pipe(Effect.provideService(Clock.Clock, controlledUpdateClock), Effect.forkChild);
-            yield* Deferred.await(firstRetrySleepStarted);
-            assert.strictEqual(healthProbeCount, 2);
+              const result = yield* Effect.gen(function* () {
+                const providerHealth = yield* ProviderHealth;
+                const update = yield* providerHealth
+                  .updateProvider({ provider: "droid" })
+                  .pipe(Effect.forkChild);
+                yield* Deferred.await(finalizerStarted);
 
-            const blocked = yield* maintenanceGate
-              .withOperation({
-                provider: "droid",
-                operation: "session.start",
-                run: Effect.sync(() => {
-                  blockedOperationEntered = true;
-                }),
-              })
-              .pipe(Effect.result);
-            assert.ok(Result.isFailure(blocked));
-            if (Result.isFailure(blocked)) {
-              assert.ok(blocked.failure instanceof ProviderMaintenanceBusyError);
-              assert.strictEqual(blocked.failure.latchedReason, null);
-            }
-            assert.strictEqual(blockedOperationEntered, false);
+                const blocked = yield* maintenanceGate
+                  .withOperation({
+                    provider: "droid",
+                    operation: "session.start",
+                    run: Effect.sync(() => {
+                      blockedOperationEntered = true;
+                    }),
+                  })
+                  .pipe(Effect.result);
+                assert.ok(Result.isFailure(blocked));
+                if (Result.isFailure(blocked)) {
+                  assert.ok(blocked.failure instanceof ProviderMaintenanceBusyError);
+                  assert.strictEqual(blocked.failure.latchedReason, null);
+                }
+                assert.strictEqual(blockedOperationEntered, false);
 
-            yield* Deferred.succeed(releaseFirstRetrySleep, undefined);
-            const updateResult = yield* Fiber.join(update);
-            assert.strictEqual(blockedOperationEntered, false);
-            assert.strictEqual(
-              yield* maintenanceGate.withOperation({
-                provider: "droid",
-                operation: "session.start.after-update",
-                run: Effect.succeed("released"),
-              }),
-              "released",
-            );
-            return updateResult;
-          }).pipe(Effect.provide(layer));
-          const droid = result.providers.find((provider) => provider.provider === "droid");
+                yield* Deferred.succeed(releaseFinalizer, undefined);
+                const updateResult = yield* Fiber.join(update);
+                assert.strictEqual(
+                  yield* maintenanceGate.withOperation({
+                    provider: "droid",
+                    operation: "session.start.after-update",
+                    run: Effect.succeed("released"),
+                  }),
+                  "released",
+                );
+                return updateResult;
+              }).pipe(Effect.provide(layer));
+              const droid = result.providers.find((provider) => provider.provider === "droid");
+              const persisted = yield* readProviderStatusCache(input.cachePath);
 
-          assert.strictEqual(updatePrepareCount, 1);
-          assert.strictEqual(updateSpawnCount, 1);
-          assert.strictEqual(healthProbeCount, 3);
-          assert.strictEqual(droid?.version, "0.178.0");
-          assert.strictEqual(droid?.updateState?.status, "succeeded");
-          assert.strictEqual(droid?.updateState?.message, "Provider CLI update verified.");
-        }),
+              assert.strictEqual(updatePrepareCount, 2);
+              assert.strictEqual(initialUpdateSpawnCount, 1);
+              assert.strictEqual(finalizerSpawnCount, 1);
+              assert.strictEqual(healthProbeCount, 3);
+              assert.strictEqual(droid?.version, "0.178.0");
+              assert.strictEqual(droid?.versionAdvisory?.status, "current");
+              assert.strictEqual(droid?.versionAdvisory?.latestVersion, "0.178.0");
+              assert.strictEqual(droid?.updateState?.status, "succeeded");
+              assert.strictEqual(droid?.updateState?.message, "Provider CLI update verified.");
+              assert.match(droid?.updateState?.output ?? "", /Update staged/u);
+              assert.match(droid?.updateState?.output ?? "", /Staged update applied/u);
+              assert.strictEqual(persisted?.version, "0.178.0");
+              assert.strictEqual(persisted?.versionAdvisory?.status, "current");
+            }),
+          ),
+        ),
+    );
+
+    it.effect.skipIf(process.platform !== "win32")(
+      "fails when the native Droid staged-update finalizer exits nonzero",
+      () =>
+        withNativeDroidUpdateFixture("0.174.0", (input) =>
+          withLatestNpmVersion(
+            "0.178.0",
+            Effect.gen(function* () {
+              let healthProbeCount = 0;
+              let initialUpdateSpawnCount = 0;
+              let finalizerSpawnCount = 0;
+              const layer = makeProviderHealthLive({
+                platform: "win32",
+                prepareProcess: prepareContainedResolvedWindowsProviderForTest,
+                processTreeKiller: syntheticProcessTreeKiller(73),
+              }).pipe(
+                Layer.provideMerge(providerServiceWithoutRuntimesLayer),
+                Layer.provideMerge(ServerSettingsService.layerTest(input.settings)),
+                Layer.provideMerge(ServerConfig.layerTest(process.cwd(), input.baseDir)),
+                Layer.provideMerge(
+                  mockSpawnerLayer((args, command) => {
+                    assert.strictEqual(command.toLowerCase(), input.droidBinaryPath.toLowerCase());
+                    if (args.length === 1 && args[0] === "update") {
+                      initialUpdateSpawnCount += 1;
+                      return { stdout: "Update staged.\n", stderr: "", code: 0 };
+                    }
+                    if (args.length === 2 && args[0] === "update" && args[1] === "--check") {
+                      finalizerSpawnCount += 1;
+                      return {
+                        stdout: "Checking staged update.\n",
+                        stderr: "Replacement failed.\n",
+                        code: 23,
+                      };
+                    }
+                    assert.deepStrictEqual(args, ["--version"]);
+                    healthProbeCount += 1;
+                    return { stdout: "droid 0.174.0\n", stderr: "", code: 0 };
+                  }),
+                ),
+              );
+
+              const result = yield* Effect.gen(function* () {
+                const providerHealth = yield* ProviderHealth;
+                return yield* providerHealth.updateProvider({ provider: "droid" });
+              }).pipe(Effect.provide(layer));
+              const droid = result.providers.find((provider) => provider.provider === "droid");
+              const persisted = yield* readProviderStatusCache(input.cachePath);
+
+              assert.strictEqual(initialUpdateSpawnCount, 1);
+              assert.strictEqual(finalizerSpawnCount, 1);
+              assert.strictEqual(healthProbeCount, 2);
+              assert.strictEqual(droid?.version, "0.174.0");
+              assert.strictEqual(droid?.versionAdvisory?.status, "behind_latest");
+              assert.strictEqual(droid?.versionAdvisory?.latestVersion, "0.178.0");
+              assert.strictEqual(droid?.updateState?.status, "failed");
+              assert.strictEqual(
+                droid?.updateState?.message,
+                "Update command exited with code 23.",
+              );
+              assert.match(droid?.updateState?.output ?? "", /Update staged/u);
+              assert.match(droid?.updateState?.output ?? "", /Replacement failed/u);
+              assert.strictEqual(persisted?.versionAdvisory?.status, "behind_latest");
+            }),
+          ),
+        ),
+    );
+
+    it.effect.skipIf(process.platform !== "win32")(
+      "does not finalize a staged native Droid update after settings drift",
+      () =>
+        withNativeDroidUpdateFixture("0.174.0", (input) =>
+          withLatestNpmVersion(
+            "0.178.0",
+            Effect.gen(function* () {
+              let healthProbeCount = 0;
+              let initialUpdateSpawnCount = 0;
+              let finalizerSpawnCount = 0;
+              const postProbeStarted = yield* Deferred.make<void>();
+              const releasePostProbe = yield* Deferred.make<void>();
+              const layer = makeProviderHealthLive({
+                platform: "win32",
+                prepareProcess: prepareContainedResolvedWindowsProviderForTest,
+                processTreeKiller: syntheticProcessTreeKiller(74),
+              }).pipe(
+                Layer.provideMerge(providerServiceWithoutRuntimesLayer),
+                Layer.provideMerge(ServerSettingsService.layerTest(input.settings)),
+                Layer.provideMerge(ServerConfig.layerTest(process.cwd(), input.baseDir)),
+                Layer.provideMerge(
+                  effectSpawnerLayer((args, command) => {
+                    assert.strictEqual(command.toLowerCase(), input.droidBinaryPath.toLowerCase());
+                    if (args.length === 1 && args[0] === "update") {
+                      initialUpdateSpawnCount += 1;
+                      return Effect.succeed(
+                        mockHandle({ stdout: "Update staged.\n", stderr: "", code: 0 }),
+                      );
+                    }
+                    if (args.length === 2 && args[0] === "update" && args[1] === "--check") {
+                      finalizerSpawnCount += 1;
+                      return Effect.succeed(
+                        mockHandle({ stdout: "unexpected\n", stderr: "", code: 0 }),
+                      );
+                    }
+                    assert.deepStrictEqual(args, ["--version"]);
+                    healthProbeCount += 1;
+                    const healthResult = mockHandle({
+                      stdout: "droid 0.174.0\n",
+                      stderr: "",
+                      code: 0,
+                    });
+                    return healthProbeCount === 2
+                      ? Deferred.succeed(postProbeStarted, undefined).pipe(
+                          Effect.andThen(Deferred.await(releasePostProbe)),
+                          Effect.as(healthResult),
+                        )
+                      : Effect.succeed(healthResult);
+                  }),
+                ),
+              );
+
+              const result = yield* Effect.gen(function* () {
+                const providerHealth = yield* ProviderHealth;
+                const settings = yield* ServerSettingsService;
+                const update = yield* providerHealth
+                  .updateProvider({ provider: "droid" })
+                  .pipe(Effect.forkChild);
+                yield* Deferred.await(postProbeStarted);
+                yield* settings.updateSettings({
+                  providers: {
+                    droid: {
+                      binaryPath: NodePath.join(input.baseDir, "changed", "droid.exe"),
+                    },
+                  },
+                });
+                yield* Deferred.succeed(releasePostProbe, undefined);
+                return yield* Fiber.join(update);
+              }).pipe(Effect.provide(layer));
+              const droid = result.providers.find((provider) => provider.provider === "droid");
+
+              assert.strictEqual(initialUpdateSpawnCount, 1);
+              assert.strictEqual(finalizerSpawnCount, 0);
+              assert.strictEqual(healthProbeCount, 2);
+              assert.strictEqual(droid?.version, "0.174.0");
+              assert.strictEqual(droid?.versionAdvisory?.status, "behind_latest");
+              assert.strictEqual(droid?.updateState?.status, "unverified");
+              assert.match(
+                droid?.updateState?.message ?? "",
+                /target changed before verification/u,
+              );
+            }),
+          ),
+        ),
+    );
+
+    it.effect.skipIf(process.platform !== "win32")(
+      "does not finalize a staged native Droid update after the provider gate latches",
+      () =>
+        withNativeDroidUpdateFixture("0.174.0", (input) =>
+          withLatestNpmVersion(
+            "0.178.0",
+            Effect.gen(function* () {
+              let healthProbeCount = 0;
+              let initialUpdateSpawnCount = 0;
+              let finalizerSpawnCount = 0;
+              const postProbeStarted = yield* Deferred.make<void>();
+              const releasePostProbe = yield* Deferred.make<void>();
+              const maintenanceGate = yield* makeProviderMaintenanceGate;
+              const layer = makeProviderHealthLive({
+                platform: "win32",
+                prepareProcess: prepareContainedResolvedWindowsProviderForTest,
+                processTreeKiller: syntheticProcessTreeKiller(75),
+                maintenanceGate,
+              }).pipe(
+                Layer.provideMerge(providerServiceWithoutRuntimesLayer),
+                Layer.provideMerge(ServerSettingsService.layerTest(input.settings)),
+                Layer.provideMerge(ServerConfig.layerTest(process.cwd(), input.baseDir)),
+                Layer.provideMerge(
+                  effectSpawnerLayer((args, command) => {
+                    assert.strictEqual(command.toLowerCase(), input.droidBinaryPath.toLowerCase());
+                    if (args.length === 1 && args[0] === "update") {
+                      initialUpdateSpawnCount += 1;
+                      return Effect.succeed(
+                        mockHandle({ stdout: "Update staged.\n", stderr: "", code: 0 }),
+                      );
+                    }
+                    if (args.length === 2 && args[0] === "update" && args[1] === "--check") {
+                      finalizerSpawnCount += 1;
+                      return Effect.succeed(
+                        mockHandle({ stdout: "unexpected\n", stderr: "", code: 0 }),
+                      );
+                    }
+                    assert.deepStrictEqual(args, ["--version"]);
+                    healthProbeCount += 1;
+                    const healthResult = mockHandle({
+                      stdout: "droid 0.174.0\n",
+                      stderr: "",
+                      code: 0,
+                    });
+                    return healthProbeCount === 2
+                      ? Deferred.succeed(postProbeStarted, undefined).pipe(
+                          Effect.andThen(Deferred.await(releasePostProbe)),
+                          Effect.as(healthResult),
+                        )
+                      : Effect.succeed(healthResult);
+                  }),
+                ),
+              );
+
+              const observed = yield* Effect.gen(function* () {
+                const providerHealth = yield* ProviderHealth;
+                const update = yield* providerHealth
+                  .updateProvider({ provider: "droid" })
+                  .pipe(Effect.result, Effect.forkChild);
+                yield* Deferred.await(postProbeStarted);
+                yield* maintenanceGate.latchProvider({
+                  provider: "droid",
+                  reason: "post probe latched for test",
+                });
+                yield* Deferred.succeed(releasePostProbe, undefined);
+                const updateResult = yield* Fiber.join(update);
+                const providers = yield* providerHealth.getStatuses;
+                return { updateResult, providers };
+              }).pipe(Effect.provide(layer));
+              const droid = observed.providers.find((provider) => provider.provider === "droid");
+
+              assert.ok(Result.isFailure(observed.updateResult));
+              if (Result.isFailure(observed.updateResult)) {
+                assert.ok(observed.updateResult.failure instanceof ServerProviderUpdateError);
+                assert.match(observed.updateResult.failure.message, /post probe latched for test/u);
+              }
+              assert.strictEqual(initialUpdateSpawnCount, 1);
+              assert.strictEqual(finalizerSpawnCount, 0);
+              assert.strictEqual(healthProbeCount, 2);
+              assert.strictEqual(droid?.updateState?.status, "failed");
+              assert.match(droid?.updateState?.message ?? "", /Restart Synara/u);
+              assert.match(droid?.updateState?.message ?? "", /post probe latched for test/u);
+            }),
+          ),
+        ),
     );
 
     it.effect.skipIf(process.platform !== "win32")(
