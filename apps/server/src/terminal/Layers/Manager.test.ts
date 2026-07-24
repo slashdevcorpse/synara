@@ -2067,8 +2067,8 @@ describe("TerminalManager", () => {
       { rootPid: defaultProcess.pid, signal: "SIGTERM", includeRootTree: false },
       { rootPid: sidecarProcess.pid, signal: "SIGTERM", includeRootTree: false },
     ]);
-    expect(defaultProcess.killSignals).toEqual([]);
-    expect(sidecarProcess.killSignals).toEqual([]);
+    expect(defaultProcess.killSignals).toEqual(["SIGTERM"]);
+    expect(sidecarProcess.killSignals).toEqual(["SIGTERM"]);
     expect(sessions.size).toBe(0);
     await manager.dispose();
   });
@@ -2158,7 +2158,7 @@ describe("TerminalManager", () => {
     await manager.dispose();
   });
 
-  it("discards descendants captured after the owned terminal root exits", async () => {
+  it("discards late Windows descendants but still closes the owned PTY handle", async () => {
     const captureStarted = deferred<void>();
     const capturedTree = deferred<CapturedProcessTree>();
     const treeSignals: Array<{
@@ -2200,7 +2200,40 @@ describe("TerminalManager", () => {
     expect(treeSignals).toEqual([
       { signal: "SIGTERM", includeRootTree: false, descendantPids: [] },
     ]);
-    expect(process.killSignals).toEqual([]);
+    expect(process.killSignals).toEqual(["SIGTERM"]);
+    await manager.dispose();
+  });
+
+  it("closes the Windows PTY handle when tree signaling exits the root before replacement", async () => {
+    let processSignaledByTree: FakePtyProcess | undefined;
+    const treeSignals: Array<{ rootPid: number; signal: TerminalKillSignal }> = [];
+    const processTreeKiller: ProcessTreeKiller = {
+      capture: () => ({ descendants: [], captureComplete: true }),
+      signal: ({ rootPid, signal }) => {
+        treeSignals.push({ rootPid, signal });
+        processSignaledByTree?.emitExit({ exitCode: 0, signal: 15 });
+      },
+    };
+    const { manager, ptyAdapter } = makeManager(5, {
+      processTreeKiller,
+      subprocessPlatform: "win32",
+    });
+    await manager.open(openInput());
+    const originalProcess = ptyAdapter.processes[0];
+    expect(originalProcess).toBeDefined();
+    if (!originalProcess) return;
+    processSignaledByTree = originalProcess;
+
+    await manager.close({ threadId: "thread-1", terminalId: "default" });
+
+    expect(treeSignals).toEqual([{ rootPid: originalProcess.pid, signal: "SIGTERM" }]);
+    expect(originalProcess.killSignals).toEqual(["SIGTERM"]);
+
+    await manager.open(openInput({ terminalId: "replacement" }));
+    const replacementProcess = ptyAdapter.processes[1];
+    expect(replacementProcess).toBeDefined();
+    expect(replacementProcess?.pid).not.toBe(originalProcess.pid);
+    processSignaledByTree = replacementProcess;
     await manager.dispose();
   });
 
@@ -2581,7 +2614,7 @@ describe("TerminalManager", () => {
     await shutdown;
 
     expect(treeSignals).toEqual([{ signal: "SIGTERM", includeRootTree: false }]);
-    expect(process.killSignals).toEqual([]);
+    expect(process.killSignals).toEqual(["SIGTERM"]);
     expect(sessions.size).toBe(0);
   });
 
