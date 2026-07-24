@@ -1974,10 +1974,6 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
         ? { descendants: [], captureComplete: false }
         : capturedTree;
     handle.retainAfterRootExit = tree.descendants.length > 0 || tree.captureComplete === false;
-    if (handle.rootExited && !handle.retainAfterRootExit) {
-      this.clearKillEscalationTimer(ptyProcess);
-      return;
-    }
 
     const signalProcess = (signal: TerminalKillSignal) => {
       try {
@@ -1996,6 +1992,15 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
         });
       }
     };
+    if (handle.rootExited && !handle.retainAfterRootExit) {
+      // On Windows the PTY object owns the ConPTY handle independently of the shell process.
+      // A tree signal can make the shell exit first, but node-pty still needs kill() to close the
+      // pseudoconsole; otherwise its backend-owned conhost.exe survives into the replacement.
+      if (this.subprocessPlatform === "win32") signalProcess("SIGTERM");
+      this.clearKillEscalationTimer(ptyProcess);
+      return;
+    }
+
     const signalTree = async (
       signal: TerminalKillSignal,
       options: { includeRootTree?: boolean } = {},
@@ -2064,9 +2069,12 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
     };
 
     await signalTree("SIGTERM", { includeRootTree: !handle.rootExited });
+    // Tree signaling can synchronously deliver the root-exit event and clear this handle. Close the
+    // independently owned Windows pseudoconsole before consulting that process-exit bookkeeping.
+    if (this.subprocessPlatform === "win32") signalProcess("SIGTERM");
     if (this.killEscalationTimers.get(ptyProcess) !== handle) return;
     // Also signal the PTY handle directly for adapter compatibility and test doubles.
-    if (!handle.rootExited) signalProcess("SIGTERM");
+    if (!handle.rootExited && this.subprocessPlatform !== "win32") signalProcess("SIGTERM");
 
     if (handle.rootExited && tree.descendants.length === 0) {
       this.clearKillEscalationTimer(ptyProcess);
