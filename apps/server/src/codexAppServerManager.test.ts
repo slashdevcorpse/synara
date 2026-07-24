@@ -34,6 +34,8 @@ import {
   CodexAppServerManager,
   assertSupportedCodexCliVersion,
   classifyCodexStderrLine,
+  codexDiscoveryProfileKey,
+  type CodexDiscoveryProfile,
   formatCodexCliVersionCheckFailure,
   isRecoverableThreadResumeError,
   installCodexAppServerProcessOwnership,
@@ -832,7 +834,7 @@ describe("Codex app-server teardown", () => {
       reviewTurnIds: new Set(),
       nextRequestId: 1,
       stopping: false,
-      ...(input.discoveryKey ? { discovery: true } : {}),
+      ...(input.discoveryKey ? { discovery: true, discoveryKey: input.discoveryKey } : {}),
     };
     const internals = manager as unknown as {
       sessions: Map<ThreadId, unknown>;
@@ -2357,6 +2359,12 @@ describe("steerTurn", () => {
 });
 
 describe("CodexAppServerManager discovery", () => {
+  const defaultProfile = { binaryPath: "codex" } satisfies CodexDiscoveryProfile;
+  const configuredProfile = {
+    binaryPath: "C:\\Users\\test\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\codex.exe",
+    homePath: "C:\\Users\\test\\.super-synara\\codex-home-overlay",
+  } satisfies CodexDiscoveryProfile;
+
   it("wires model discovery through model/list", async () => {
     const manager = new CodexAppServerManager();
     const context = {
@@ -2378,7 +2386,11 @@ describe("CodexAppServerManager discovery", () => {
 
     vi.spyOn(
       manager as unknown as {
-        resolveContextForDiscovery: (threadId?: string) => unknown;
+        resolveContextForDiscovery: (
+          profile: CodexDiscoveryProfile,
+          threadId?: string,
+          cwd?: string,
+        ) => unknown;
       },
       "resolveContextForDiscovery",
     ).mockReturnValue(context);
@@ -2391,7 +2403,12 @@ describe("CodexAppServerManager discovery", () => {
       )
       .mockResolvedValue({ result: { items: [] } });
 
-    await expect(manager.listModels("thread_1")).resolves.toMatchObject({
+    await expect(
+      manager.listModels({
+        profile: configuredProfile,
+        threadId: "thread_1",
+      }),
+    ).resolves.toMatchObject({
       models: [],
       source: "codex-app-server",
       cached: false,
@@ -2477,7 +2494,10 @@ describe("CodexAppServerManager discovery", () => {
     const getOrCreateDiscoverySession = vi
       .spyOn(
         manager as unknown as {
-          getOrCreateDiscoverySession: (cwd: string) => Promise<unknown>;
+          getOrCreateDiscoverySession: (
+            cwd: string,
+            profile: CodexDiscoveryProfile,
+          ) => Promise<unknown>;
         },
         "getOrCreateDiscoverySession",
       )
@@ -2496,14 +2516,144 @@ describe("CodexAppServerManager discovery", () => {
       });
 
     await manager.listSkills({
+      profile: configuredProfile,
       cwd: "/repo-b",
       threadId: "thread_missing",
     });
 
-    expect(getOrCreateDiscoverySession).toHaveBeenCalledWith("/repo-b");
+    expect(getOrCreateDiscoverySession).toHaveBeenCalledWith("/repo-b", configuredProfile);
     expect(sendRequest).toHaveBeenCalledWith(discoveryContext, "skills/list", {
       cwds: ["/repo-b"],
     });
+  });
+
+  it("never reuses a default-path runtime for a configured Windows Codex profile", async () => {
+    const manager = new CodexAppServerManager();
+    const defaultRuntime = {
+      session: {
+        provider: "codex",
+        status: "ready",
+        threadId: "thread_default",
+        runtimeMode: "full-access",
+        model: "gpt-5.5",
+        cwd: "C:\\workspaces\\synara",
+      },
+      codexProfileKey: codexDiscoveryProfileKey(defaultProfile),
+      child: { killed: false },
+      stopping: false,
+    };
+    const configuredRuntime = {
+      ...defaultRuntime,
+      session: {
+        ...defaultRuntime.session,
+        threadId: "__codex_discovery__:configured",
+      },
+      codexProfileKey: codexDiscoveryProfileKey(configuredProfile),
+      discovery: true,
+    };
+    (
+      manager as unknown as {
+        sessions: Map<string, unknown>;
+      }
+    ).sessions.set("thread_default", defaultRuntime);
+    const getOrCreateDiscoverySession = vi
+      .spyOn(
+        manager as unknown as {
+          getOrCreateDiscoverySession: (
+            cwd: string,
+            profile: CodexDiscoveryProfile,
+          ) => Promise<unknown>;
+        },
+        "getOrCreateDiscoverySession",
+      )
+      .mockResolvedValue(configuredRuntime);
+    const resolveContextForDiscovery = (
+      manager as unknown as {
+        resolveContextForDiscovery: (
+          profile: CodexDiscoveryProfile,
+          threadId?: string,
+          cwd?: string,
+        ) => Promise<unknown>;
+      }
+    ).resolveContextForDiscovery.bind(manager);
+
+    await expect(
+      resolveContextForDiscovery(configuredProfile, "thread_default", "C:\\workspaces\\synara"),
+    ).resolves.toBe(configuredRuntime);
+    expect(getOrCreateDiscoverySession).toHaveBeenCalledWith(
+      "C:\\workspaces\\synara",
+      configuredProfile,
+    );
+  });
+
+  it("isolates model cache entries by Codex binary and home profile", async () => {
+    const manager = new CodexAppServerManager();
+    const context = {
+      session: {
+        provider: "codex",
+        status: "ready",
+        threadId: "__codex_discovery__:models",
+        runtimeMode: "full-access",
+        model: "gpt-5.5",
+      },
+      account: {
+        type: "unknown",
+        planType: null,
+        sparkEnabled: true,
+      },
+      collabReceiverTurns: new Map(),
+      collabReceiverParents: new Map(),
+    };
+    vi.spyOn(
+      manager as unknown as {
+        resolveContextForDiscovery: (
+          profile: CodexDiscoveryProfile,
+          threadId?: string,
+          cwd?: string,
+        ) => unknown;
+      },
+      "resolveContextForDiscovery",
+    ).mockReturnValue(context);
+    const sendRequest = vi
+      .spyOn(
+        manager as unknown as {
+          sendRequest: (...args: unknown[]) => Promise<unknown>;
+        },
+        "sendRequest",
+      )
+      .mockResolvedValueOnce({
+        result: { data: [{ id: "gpt-default", displayName: "Default runtime" }] },
+      })
+      .mockResolvedValueOnce({
+        result: { data: [{ id: "gpt-configured", displayName: "Configured runtime" }] },
+      });
+
+    const defaultResult = await manager.listModels({
+      profile: defaultProfile,
+      cwd: "C:\\workspaces\\synara",
+    });
+    const configuredResult = await manager.listModels({
+      profile: configuredProfile,
+      cwd: "C:\\workspaces\\synara",
+    });
+    const cachedDefaultResult = await manager.listModels({
+      profile: defaultProfile,
+      cwd: "C:\\workspaces\\synara",
+    });
+
+    expect(defaultResult).toMatchObject({
+      cached: false,
+      models: [{ slug: "gpt-default" }],
+    });
+    expect(configuredResult).toMatchObject({
+      cached: false,
+      models: [{ slug: "gpt-configured" }],
+    });
+    expect(cachedDefaultResult).toMatchObject({
+      cached: true,
+      models: [{ slug: "gpt-default" }],
+    });
+    expect(sendRequest).toHaveBeenCalledTimes(2);
   });
 
   it("retries skills/list with cwd when a runtime rejects cwds", async () => {
@@ -2530,7 +2680,11 @@ describe("CodexAppServerManager discovery", () => {
 
     vi.spyOn(
       manager as unknown as {
-        resolveContextForDiscovery: (threadId?: string) => unknown;
+        resolveContextForDiscovery: (
+          profile: CodexDiscoveryProfile,
+          threadId?: string,
+          cwd?: string,
+        ) => unknown;
       },
       "resolveContextForDiscovery",
     ).mockReturnValue(context);
@@ -2554,6 +2708,7 @@ describe("CodexAppServerManager discovery", () => {
       });
 
     const result = await manager.listSkills({
+      profile: defaultProfile,
       cwd: "/repo",
       threadId: "thread_1",
     });
@@ -2595,7 +2750,11 @@ describe("CodexAppServerManager discovery", () => {
     const resolveContextForDiscovery = vi
       .spyOn(
         manager as unknown as {
-          resolveContextForDiscovery: (threadId?: string, cwd?: string) => unknown;
+          resolveContextForDiscovery: (
+            profile: CodexDiscoveryProfile,
+            threadId?: string,
+            cwd?: string,
+          ) => unknown;
         },
         "resolveContextForDiscovery",
       )
@@ -2611,6 +2770,7 @@ describe("CodexAppServerManager discovery", () => {
 
     await expect(
       manager.listPlugins({
+        profile: defaultProfile,
         cwd: "/repo",
         threadId: "thread_1",
         forceRemoteSync: true,
@@ -2620,7 +2780,7 @@ describe("CodexAppServerManager discovery", () => {
       source: "codex-app-server",
       cached: false,
     });
-    expect(resolveContextForDiscovery).toHaveBeenCalledWith("thread_1", "/repo");
+    expect(resolveContextForDiscovery).toHaveBeenCalledWith(defaultProfile, "thread_1", "/repo");
     expect(sendRequest).toHaveBeenCalledWith(context, "plugin/list", {
       cwds: ["/repo"],
       forceRemoteSync: true,
@@ -2648,7 +2808,11 @@ describe("CodexAppServerManager discovery", () => {
 
     vi.spyOn(
       manager as unknown as {
-        resolveContextForDiscovery: (threadId?: string, cwd?: string) => unknown;
+        resolveContextForDiscovery: (
+          profile: CodexDiscoveryProfile,
+          threadId?: string,
+          cwd?: string,
+        ) => unknown;
       },
       "resolveContextForDiscovery",
     ).mockReturnValue(context);
@@ -2679,6 +2843,7 @@ describe("CodexAppServerManager discovery", () => {
 
     await expect(
       manager.readPlugin({
+        profile: defaultProfile,
         marketplacePath: "/marketplace.json",
         pluginName: "github",
       }),

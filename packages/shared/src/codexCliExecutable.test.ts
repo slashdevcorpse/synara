@@ -339,6 +339,26 @@ describe("resolveCodexCliExecutable", () => {
     expect(spawnSync).not.toHaveBeenCalled();
   });
 
+  it("preserves an absolute configured Windows executable asynchronously without PATH probing", async () => {
+    const configured =
+      "C:\\Users\\test\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\codex.exe";
+    const execFile = vi.fn();
+    const spawnSync = vi.fn();
+
+    await expect(
+      resolveCodexCliExecutableAsync(configured, {
+        platform: "win32",
+        cwd: "C:\\projects\\synara",
+        env: { SystemRoot: "C:\\Windows" },
+        execFile,
+        spawnSync,
+        statSync: vi.fn(),
+      }),
+    ).resolves.toBe(configured);
+    expect(execFile).not.toHaveBeenCalled();
+    expect(spawnSync).not.toHaveBeenCalled();
+  });
+
   it("preserves async not-found and transient discovery outcomes", async () => {
     await expect(
       resolveCodexCliExecutableWithDiscoveryAsync("codex", {
