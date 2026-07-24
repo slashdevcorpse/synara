@@ -149,6 +149,7 @@ describe("WebSocket transport admission", () => {
   ])("rate-limits repeated connections in %s mode", (_label, config) => {
     const admission = makeWsTransportAdmission(
       wsTransportAdmissionOptionsForServerConfig(config, {
+        now: () => 0,
         maxConcurrentConnections: 20,
         connectionBurstPerPeer: 2,
         connectionRatePerMinutePerPeer: 2,
