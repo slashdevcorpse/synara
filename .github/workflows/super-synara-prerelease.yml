@@ -299,7 +299,7 @@ jobs:
   windows_x64:
     name: Build unsigned Windows x64 installer
     needs: [draft_admission, preflight]
-    runs-on: windows-2022
+    runs-on: windows-2025
     timeout-minutes: 45
     steps:
       - name: Checkout exact planned source
