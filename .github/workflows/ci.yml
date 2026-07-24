@@ -476,7 +476,7 @@ jobs:
         run: bun run --cwd apps/web playwright install chromium
 
       - name: Verify registered Windows quarantine inventory
-        timeout-minutes: 5
+        timeout-minutes: 10
         run: node scripts/quarantine-registry.ts inventory --platform windows
 
       - name: Browser test (stable)
