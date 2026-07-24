@@ -315,9 +315,7 @@ const makeRepository = Effect.gen(function* () {
         ORDER BY thread_id ASC
       `.pipe(
         Effect.map((rows) => rows.map((row) => row.threadId)),
-        Effect.mapError(
-          toPersistenceSqlError("OrchestrationEventDelivery.listUnsettledThreadIds"),
-        ),
+        Effect.mapError(toPersistenceSqlError("OrchestrationEventDelivery.listUnsettledThreadIds")),
       );
 
   const listBlockingDeliveries: OrchestrationEventDeliveryRepositoryShape["listBlockingDeliveries"] =

@@ -149,14 +149,12 @@ layer("QueuedTurnPromotionRepository", (it) => {
         },
       );
       assert.strictEqual(
-        (
-          yield* repository.claimNext({
-            threadId: "thread-promotion-handoff",
-            claimOwner: "handoff-owner",
-            claimedAt: now,
-            claimExpiresAt: "2099-01-01T00:00:00.000Z",
-          })
-        ).pipe(Option.getOrThrow).queuedEventSequence,
+        (yield* repository.claimNext({
+          threadId: "thread-promotion-handoff",
+          claimOwner: "handoff-owner",
+          claimedAt: now,
+          claimExpiresAt: "2099-01-01T00:00:00.000Z",
+        })).pipe(Option.getOrThrow).queuedEventSequence,
         handoffSequence,
       );
     }),

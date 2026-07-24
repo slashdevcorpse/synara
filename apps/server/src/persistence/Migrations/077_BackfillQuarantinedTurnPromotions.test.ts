@@ -965,23 +965,11 @@ legacyShapeLayer("077_BackfillQuarantinedTurnPromotions legacy shape", (it) => {
         });
 
       const messageASequence = yield* appendMessage("a", "2026-07-24T14:00:00.000Z");
-      const startASequence = yield* appendStart(
-        "a",
-        "queue",
-        "2026-07-24T14:00:00.000Z",
-      );
+      const startASequence = yield* appendStart("a", "queue", "2026-07-24T14:00:00.000Z");
       const messageBSequence = yield* appendMessage("b", "2026-07-24T14:01:00.000Z");
-      const startBSequence = yield* appendStart(
-        "b",
-        "steer",
-        "2026-07-24T14:01:00.000Z",
-      );
+      const startBSequence = yield* appendStart("b", "steer", "2026-07-24T14:01:00.000Z");
       const messageCSequence = yield* appendMessage("c", "2026-07-24T14:02:00.000Z");
-      const startCSequence = yield* appendStart(
-        "c",
-        "steer",
-        "2026-07-24T14:02:00.000Z",
-      );
+      const startCSequence = yield* appendStart("c", "steer", "2026-07-24T14:02:00.000Z");
       const cursorSequence = yield* appendEvent({
         suffix: "cursor-tail",
         eventType: "thread.meta-updated",

@@ -762,9 +762,7 @@ describe("ProviderCommandReactor", () => {
     commandId: string,
   ): HarnessQueuedTurnSource {
     const event = events.find(
-      (
-        candidate,
-      ): candidate is HarnessQueuedTurnSource =>
+      (candidate): candidate is HarnessQueuedTurnSource =>
         (candidate.type === "thread.turn-queued" ||
           candidate.type === "thread.turn-start-requested") &&
         candidate.commandId === commandId,
@@ -1643,9 +1641,7 @@ describe("ProviderCommandReactor", () => {
         harness.deliveryRepository.getConsumerState(PROVIDER_COMMAND_REACTOR_CONSUMER),
       )
     ).pipe(Option.getOrThrow);
-    expect(consumerBeforeLaterSideEffect.lastAckedSequence).toBeGreaterThanOrEqual(
-      queued.sequence,
-    );
+    expect(consumerBeforeLaterSideEffect.lastAckedSequence).toBeGreaterThanOrEqual(queued.sequence);
 
     const [laterSideEffect] = await harness.persistWithoutLivePublication([
       {
@@ -1655,9 +1651,7 @@ describe("ProviderCommandReactor", () => {
         occurredAt: now,
         commandId: CommandId.makeUnsafe("cmd-order-guard-high-water-later-interrupt"),
         causationEventId: null,
-        correlationId: CommandId.makeUnsafe(
-          "cmd-order-guard-high-water-later-interrupt",
-        ),
+        correlationId: CommandId.makeUnsafe("cmd-order-guard-high-water-later-interrupt"),
         metadata: {},
         type: "thread.turn-interrupt-requested",
         payload: {
@@ -1707,9 +1701,7 @@ describe("ProviderCommandReactor", () => {
     const activeTurnId = asTurnId("turn-post-high-water-active");
     const recoveredCommandId = "cmd-post-high-water-recovered";
     const tailCommandId = "cmd-post-high-water-tail";
-    let harnessForTail:
-      | Awaited<ReturnType<typeof createHarness>>
-      | undefined;
+    let harnessForTail: Awaited<ReturnType<typeof createHarness>> | undefined;
     let tailCommitted = false;
     const harness = await createHarness({
       interruptTurn: () =>
@@ -1846,9 +1838,7 @@ describe("ProviderCommandReactor", () => {
       }),
     );
     await harness.drain();
-    const capturedHighWater = await Effect.runPromise(
-      harness.engine.getEventHighWaterSequence,
-    );
+    const capturedHighWater = await Effect.runPromise(harness.engine.getEventHighWaterSequence);
     const blocker = await Effect.runPromise(
       harness.deliveryRepository.firstBlockingDeliveryForThread({
         consumerName: PROVIDER_COMMAND_REACTOR_CONSUMER,
@@ -3093,10 +3083,8 @@ describe("ProviderCommandReactor", () => {
       const now = new Date().toISOString();
       const parentThreadId = ThreadId.makeUnsafe("thread-1");
       const childThreadId = ThreadId.makeUnsafe(`thread-shared-fifo-${blockerOwner}`);
-      const ownerThreadId =
-        blockerOwner === "parent" ? parentThreadId : childThreadId;
-      const otherThreadId =
-        blockerOwner === "parent" ? childThreadId : parentThreadId;
+      const ownerThreadId = blockerOwner === "parent" ? parentThreadId : childThreadId;
+      const otherThreadId = blockerOwner === "parent" ? childThreadId : parentThreadId;
       const activeTurnId = asTurnId(`turn-shared-fifo-active-${blockerOwner}`);
       const oldestCommandId = `cmd-shared-fifo-oldest-${blockerOwner}`;
       const newerCommandId = `cmd-shared-fifo-newer-${blockerOwner}`;
@@ -3568,11 +3556,8 @@ describe("ProviderCommandReactor", () => {
 
     const afterReconciliation = await readHarnessEvents(harness);
     const replacementSources = afterReconciliation.filter(
-      (
-        event,
-      ): event is HarnessQueuedTurnSource =>
-        (event.type === "thread.turn-queued" ||
-          event.type === "thread.turn-start-requested") &&
+      (event): event is HarnessQueuedTurnSource =>
+        (event.type === "thread.turn-queued" || event.type === "thread.turn-start-requested") &&
         event.sequence > editBarrier.sequence &&
         event.payload.threadId === threadId &&
         event.payload.messageId === messageId,

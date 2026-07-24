@@ -566,9 +566,7 @@ const make = Effect.gen(function* () {
   ) =>
     orchestrationEngine.dispatch({
       type: "thread.activity.append",
-      commandId: CommandId.makeUnsafe(
-        `server:cancelled-queued-turn-cleanup:${event.sequence}`,
-      ),
+      commandId: CommandId.makeUnsafe(`server:cancelled-queued-turn-cleanup:${event.sequence}`),
       threadId: event.payload.threadId,
       activity: {
         id: EventId.makeUnsafe(`cancelled-queued-turn-cleanup:${event.sequence}`),
@@ -671,9 +669,7 @@ const make = Effect.gen(function* () {
       const candidateProviderThread = yield* resolveProviderSessionThread(candidateThreadId);
       const candidateSessionThreadId =
         candidateProviderThread?.id ??
-        (rawCandidateThreadId.startsWith(syntheticPrefix)
-          ? sessionThreadId
-          : candidateThreadId);
+        (rawCandidateThreadId.startsWith(syntheticPrefix) ? sessionThreadId : candidateThreadId);
       if (candidateSessionThreadId === sessionThreadId) {
         memberThreadIds.add(rawCandidateThreadId);
         candidateMemberThreadIds.add(rawCandidateThreadId);
@@ -687,18 +683,14 @@ const make = Effect.gen(function* () {
     };
   });
 
-  const listPendingProviderSessionThreadIds = Effect.fnUntraced(function* (
-    threadId: ThreadId,
-  ) {
+  const listPendingProviderSessionThreadIds = Effect.fnUntraced(function* (threadId: ThreadId) {
     return yield* resolveProviderSessionThreadIds({
       threadId,
       candidateThreadIds: yield* queuedTurnPromotions.listPendingThreadIds,
     });
   });
 
-  const listCancellableProviderSessionThreadIds = Effect.fnUntraced(function* (
-    threadId: ThreadId,
-  ) {
+  const listCancellableProviderSessionThreadIds = Effect.fnUntraced(function* (threadId: ThreadId) {
     return yield* resolveProviderSessionThreadIds({
       threadId,
       candidateThreadIds: yield* queuedTurnPromotions.listCancellableThreadIds,
@@ -724,9 +716,7 @@ const make = Effect.gen(function* () {
     return session;
   });
 
-  const listUnsettledProviderSessionThreadIds = Effect.fnUntraced(function* (
-    threadId: ThreadId,
-  ) {
+  const listUnsettledProviderSessionThreadIds = Effect.fnUntraced(function* (threadId: ThreadId) {
     return yield* resolveProviderSessionThreadIds({
       threadId,
       candidateThreadIds: yield* deliveryRepository.listUnsettledThreadIds(
@@ -735,9 +725,7 @@ const make = Effect.gen(function* () {
     });
   });
 
-  const firstBlockingProviderDeliveryForSession = Effect.fnUntraced(function* (
-    threadId: ThreadId,
-  ) {
+  const firstBlockingProviderDeliveryForSession = Effect.fnUntraced(function* (threadId: ThreadId) {
     const session = yield* listUnsettledProviderSessionThreadIds(threadId);
     return yield* deliveryRepository.firstBlockingDeliveryForThreads({
       consumerName: PROVIDER_COMMAND_REACTOR_CONSUMER,
@@ -798,12 +786,10 @@ const make = Effect.gen(function* () {
   const hasQueuedTurnStart = (threadId: ThreadId, messageId: string) =>
     queuedTurnPromotions.hasPendingMessage({ threadId, messageId });
 
-  const hasUnsettledProviderDeliveryForSession = Effect.fnUntraced(function* (
-    input: {
-      readonly threadId: ThreadId;
-      readonly excludingEventSequence?: number | undefined;
-    },
-  ) {
+  const hasUnsettledProviderDeliveryForSession = Effect.fnUntraced(function* (input: {
+    readonly threadId: ThreadId;
+    readonly excludingEventSequence?: number | undefined;
+  }) {
     const session = yield* listUnsettledProviderSessionThreadIds(input.threadId);
     return yield* deliveryRepository.hasUnsettledDeliveryForThreads({
       consumerName: PROVIDER_COMMAND_REACTOR_CONSUMER,
@@ -2042,10 +2028,7 @@ const make = Effect.gen(function* () {
       sourceSequence !== undefined &&
       Option.isSome(sourcePromotion)
     ) {
-      if (
-        matchesEvent(sourcePromotion.value) &&
-        sourcePromotion.value.state !== "cancelled"
-      ) {
+      if (matchesEvent(sourcePromotion.value) && sourcePromotion.value.state !== "cancelled") {
         // A process can crash after committing this deterministic derived
         // start but before marking its source promotion. Rebuild the
         // in-memory reservation before provider replay so post-replay queue
@@ -2497,10 +2480,8 @@ const make = Effect.gen(function* () {
     }
   });
 
-  const drainQueuedTurnsForSession = (
-    threadId: ThreadId,
-    options?: DrainQueuedTurnsOptions,
-  ) => drainQueuedTurnsForThread(threadId, options);
+  const drainQueuedTurnsForSession = (threadId: ThreadId, options?: DrainQueuedTurnsOptions) =>
+    drainQueuedTurnsForThread(threadId, options);
 
   const processQueueDrainEvent = Effect.fnUntraced(function* (event: ProviderQueueDrainEvent) {
     observePendingContextBootstrapTerminalEvent(event);
@@ -3428,9 +3409,7 @@ const make = Effect.gen(function* () {
       if (!isProviderSideEffectIntent(event)) {
         return false;
       }
-      const blocker = yield* firstBlockingProviderDeliveryForSession(
-        event.payload.threadId,
-      );
+      const blocker = yield* firstBlockingProviderDeliveryForSession(event.payload.threadId);
       if (Option.isNone(blocker)) return false;
       if (blocker.value.eventSequence === event.sequence) {
         // This event is the ambiguous operation itself, not a later command
@@ -3647,9 +3626,7 @@ const make = Effect.gen(function* () {
       const providerThread = yield* resolveProviderSessionThread(input.event.payload.threadId);
       const eventSessionThreadId =
         providerThread?.id ??
-        ((input.event.payload.threadId as string).startsWith(
-          `subagent:${input.sessionThreadId}:`,
-        )
+        ((input.event.payload.threadId as string).startsWith(`subagent:${input.sessionThreadId}:`)
           ? input.sessionThreadId
           : input.event.payload.threadId);
       return eventSessionThreadId === input.sessionThreadId;
@@ -3668,26 +3645,26 @@ const make = Effect.gen(function* () {
         orchestrationEngine.readEventsThrough(input.afterSequence, input.replayThrough),
         (event) =>
           Effect.gen(function* () {
-          if (
-            !isProviderIntentEvent(event) ||
-            !isProviderSideEffectIntent(event) ||
-            !(yield* providerIntentBelongsToSession({ event, sessionThreadId }))
-          ) {
-            return;
-          }
-          if (
-            event.type === "thread.turn-start-requested" ||
-            event.type === "thread.turn-queued"
-          ) {
-            // Pre-reconciliation validation already established this exact
-            // durable queue handoff. Raw replay would bypass FIFO ordering and
-            // can bind a newer pending message to this turn. Queue drains stay
-            // paused until every cancellation/supersession barrier is replayed.
-            return;
-          }
-          yield* isClaimedProviderIntent(event)
-            ? processClaimedProviderIntent(event)
-            : processUnclaimedProviderIntent(event);
+            if (
+              !isProviderIntentEvent(event) ||
+              !isProviderSideEffectIntent(event) ||
+              !(yield* providerIntentBelongsToSession({ event, sessionThreadId }))
+            ) {
+              return;
+            }
+            if (
+              event.type === "thread.turn-start-requested" ||
+              event.type === "thread.turn-queued"
+            ) {
+              // Pre-reconciliation validation already established this exact
+              // durable queue handoff. Raw replay would bypass FIFO ordering and
+              // can bind a newer pending message to this turn. Queue drains stay
+              // paused until every cancellation/supersession barrier is replayed.
+              return;
+            }
+            yield* isClaimedProviderIntent(event)
+              ? processClaimedProviderIntent(event)
+              : processUnclaimedProviderIntent(event);
           }),
       );
     });
@@ -3753,10 +3730,7 @@ const make = Effect.gen(function* () {
         ) {
           continue;
         }
-        if (
-          event.type === "thread.turn-start-requested" ||
-          event.type === "thread.turn-queued"
-        ) {
+        if (event.type === "thread.turn-start-requested" || event.type === "thread.turn-queued") {
           const existingHandoff = yield* queuedTurnPromotions.getBySequence(event.sequence);
           if (
             Option.isSome(existingHandoff) &&
@@ -3783,16 +3757,12 @@ const make = Effect.gen(function* () {
         }
 
         if (event.type === "thread.session-stop-requested") {
-          const targetProviderThread = yield* resolveProviderSessionThread(
-            event.payload.threadId,
-          );
+          const targetProviderThread = yield* resolveProviderSessionThread(event.payload.threadId);
           const stopsWholeProviderSession =
-            targetProviderThread === null ||
-            targetProviderThread.id === event.payload.threadId;
+            targetProviderThread === null || targetProviderThread.id === event.payload.threadId;
           const affected = [...deferredTurns.values()].filter(
             (entry) =>
-              stopsWholeProviderSession ||
-              entry.event.payload.threadId === event.payload.threadId,
+              stopsWholeProviderSession || entry.event.payload.threadId === event.payload.threadId,
           );
           if (affected.length !== deferredTurns.size) {
             return yield* failUnsafeOrdering(event);
@@ -3974,8 +3944,7 @@ const make = Effect.gen(function* () {
           replayThrough,
         });
         yield* drainQueuedTurnsForSession(ThreadId.makeUnsafe(input.threadId), {
-          synchronouslyProcessCommittedStart:
-            options?.synchronouslyProcessCommittedStart === true,
+          synchronouslyProcessCommittedStart: options?.synchronouslyProcessCommittedStart === true,
         });
       }
     });
@@ -4090,9 +4059,7 @@ const make = Effect.gen(function* () {
     Effect.andThen(
       Effect.all([
         startProviderIntentSource.pipe(
-          Effect.andThen(
-            deliverySourceLock.withPermits(1)(recoverQueuedTurnPromotions),
-          ),
+          Effect.andThen(deliverySourceLock.withPermits(1)(recoverQueuedTurnPromotions)),
         ),
         Stream.runForEach(providerService.streamEvents, (event) => {
           if (event.type !== "turn.completed" && event.type !== "turn.aborted") {

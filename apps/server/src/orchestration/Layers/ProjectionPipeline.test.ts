@@ -356,12 +356,8 @@ it.layer(Layer.fresh(makeProjectionPipelinePrefixedTestLayer("synara-session-sto
           const targetThreadId = ThreadId.makeUnsafe("thread-session-stop-cleanup-target");
           const otherThreadId = ThreadId.makeUnsafe("thread-session-stop-cleanup-other");
           const concreteTurnId = TurnId.makeUnsafe("turn-session-stop-cleanup-concrete");
-          const concreteMessageId = MessageId.makeUnsafe(
-            "message-session-stop-cleanup-concrete",
-          );
-          const cancelledMessageId = MessageId.makeUnsafe(
-            "message-session-stop-cleanup-cancelled",
-          );
+          const concreteMessageId = MessageId.makeUnsafe("message-session-stop-cleanup-concrete");
+          const cancelledMessageId = MessageId.makeUnsafe("message-session-stop-cleanup-cancelled");
           const otherMessageId = MessageId.makeUnsafe("message-session-stop-cleanup-other");
 
           yield* appendAndProject({
