@@ -26,7 +26,7 @@ function mayStillBeReplacing(
   );
 }
 
-export function shouldRunWindowsDroidNativeUpdateFinalizer(input: {
+export function shouldRunWindowsDroidPendingUpdateBootstrapProbe(input: {
   readonly platform: NodeJS.Platform;
   readonly provider: ProviderKind;
   readonly updateChannelKind: ProviderMaintenanceChannelIdentity["kind"];

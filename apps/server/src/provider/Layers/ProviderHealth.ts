@@ -149,7 +149,7 @@ import { quiesceProviderRuntimesForUpdate } from "../providerUpdateQuiescence.ts
 import { classifyCompletedProviderUpdate } from "../providerUpdateOutcome.ts";
 import {
   shouldRetryDelayedProviderUpdateVersion,
-  shouldRunWindowsDroidNativeUpdateFinalizer,
+  shouldRunWindowsDroidPendingUpdateBootstrapProbe,
   verifyDelayedProviderUpdateVersion,
   type ProviderUpdateVerificationSnapshot,
 } from "../providerUpdateVerification.ts";
@@ -4295,7 +4295,7 @@ export function makeProviderHealthLive(
                 let verificationGeneration = stableGeneration;
                 let initialPostProbe = yield* runPostUpdateVerificationProbe(stableGeneration);
                 if (
-                  shouldRunWindowsDroidNativeUpdateFinalizer({
+                  shouldRunWindowsDroidPendingUpdateBootstrapProbe({
                     platform,
                     provider,
                     updateChannelKind: commandUpdate.target.channel.kind,
@@ -4303,14 +4303,14 @@ export function makeProviderHealthLive(
                     initialSnapshot: initialPostProbe,
                   })
                 ) {
-                  const finalizerGeneration = yield* readUpdateSettingsGeneration();
-                  const finalizerUpdate = finalizerGeneration.capabilities.update;
+                  const bootstrapProbeGeneration = yield* readUpdateSettingsGeneration();
+                  const bootstrapProbeUpdate = bootstrapProbeGeneration.capabilities.update;
                   if (
-                    !finalizerUpdate ||
+                    !bootstrapProbeUpdate ||
                     !updateEvidenceGenerationMatches(
                       provider,
                       initialPostProbe.generation,
-                      finalizerGeneration,
+                      bootstrapProbeGeneration,
                     )
                   ) {
                     initialPostProbe = {
@@ -4319,25 +4319,30 @@ export function makeProviderHealthLive(
                     };
                   } else {
                     yield* maintenanceGate.assertProviderNotLatched({ provider });
-                    const finalizerResult = yield* runUpdateCommand({
+                    // Factory's signed Windows standalone artifact applies a pending replacement
+                    // during process bootstrap, before dispatching the requested subcommand.
+                    // The documented `update --check` remains non-installing; it is only a bounded
+                    // command that starts the exact target through that bootstrap path.
+                    const bootstrapProbeResult = yield* runUpdateCommand({
                       provider,
-                      command: finalizerUpdate.executable,
+                      command: bootstrapProbeUpdate.executable,
                       args: ["update", "--check"],
-                      ...(finalizerUpdate.pathPrepend
-                        ? { pathPrepend: finalizerUpdate.pathPrepend }
+                      ...(bootstrapProbeUpdate.pathPrepend
+                        ? { pathPrepend: bootstrapProbeUpdate.pathPrepend }
                         : {}),
                       teardownFailureRef,
                     }).pipe(Effect.scoped);
-                    commandResults.push(finalizerResult);
-                    if (finalizerResult.exitCode !== 0) {
+                    commandResults.push(bootstrapProbeResult);
+                    if (bootstrapProbeResult.exitCode !== 0) {
                       return {
                         _tag: "NonZeroExit",
                         commandResults,
-                        failedCommandResult: finalizerResult,
+                        failedCommandResult: bootstrapProbeResult,
                       } as const;
                     }
-                    verificationGeneration = finalizerGeneration;
-                    initialPostProbe = yield* runPostUpdateVerificationProbe(finalizerGeneration);
+                    verificationGeneration = bootstrapProbeGeneration;
+                    initialPostProbe =
+                      yield* runPostUpdateVerificationProbe(bootstrapProbeGeneration);
                   }
                 }
                 const verifiedPostProbe = shouldRetryDelayedProviderUpdateVersion(platform)

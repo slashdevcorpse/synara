@@ -1623,7 +1623,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
     });
 
     it.effect.skipIf(process.platform !== "win32")(
-      "finalizes a staged native Droid update inside the same contained maintenance window",
+      "keeps a staged native Droid update contained while a second process bootstrap applies it",
       () =>
         withNativeDroidUpdateFixture("0.174.0", (input) =>
           withLatestNpmVersion(
@@ -1632,11 +1632,11 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
               let healthProbeCount = 0;
               let updatePrepareCount = 0;
               let initialUpdateSpawnCount = 0;
-              let finalizerSpawnCount = 0;
-              let finalizerCompleted = false;
+              let bootstrapProbeSpawnCount = 0;
+              let pendingBootstrapApplied = false;
               let blockedOperationEntered = false;
-              const finalizerStarted = yield* Deferred.make<void>();
-              const releaseFinalizer = yield* Deferred.make<void>();
+              const bootstrapProbeStarted = yield* Deferred.make<void>();
+              const releaseBootstrapProbe = yield* Deferred.make<void>();
               const maintenanceGate = yield* makeProviderMaintenanceGate;
               const prepareProcess: ProviderHealthProcessOptions["prepareProcess"] = (
                 command,
@@ -1680,17 +1680,17 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
                       );
                     }
                     if (args.length === 2 && args[0] === "update" && args[1] === "--check") {
-                      finalizerSpawnCount += 1;
-                      return Deferred.succeed(finalizerStarted, undefined).pipe(
-                        Effect.andThen(Deferred.await(releaseFinalizer)),
-                        Effect.tap(() =>
-                          Effect.sync(() => {
-                            finalizerCompleted = true;
-                          }),
-                        ),
+                      bootstrapProbeSpawnCount += 1;
+                      return Effect.sync(() => {
+                        // Model Droid's executable bootstrap applying the pending marker before
+                        // the documented check-only subcommand runs.
+                        pendingBootstrapApplied = true;
+                      }).pipe(
+                        Effect.andThen(Deferred.succeed(bootstrapProbeStarted, undefined)),
+                        Effect.andThen(Deferred.await(releaseBootstrapProbe)),
                         Effect.as(
                           mockHandle({
-                            stdout: "Staged update applied.\n",
+                            stdout: "Already on target version.\n",
                             stderr: "",
                             code: 0,
                           }),
@@ -1701,7 +1701,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
                     healthProbeCount += 1;
                     return Effect.succeed(
                       mockHandle({
-                        stdout: finalizerCompleted ? "droid 0.178.0\n" : "droid 0.174.0\n",
+                        stdout: pendingBootstrapApplied ? "droid 0.178.0\n" : "droid 0.174.0\n",
                         stderr: "",
                         code: 0,
                       }),
@@ -1715,7 +1715,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
                 const update = yield* providerHealth
                   .updateProvider({ provider: "droid" })
                   .pipe(Effect.forkChild);
-                yield* Deferred.await(finalizerStarted);
+                yield* Deferred.await(bootstrapProbeStarted);
 
                 const blocked = yield* maintenanceGate
                   .withOperation({
@@ -1733,7 +1733,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
                 }
                 assert.strictEqual(blockedOperationEntered, false);
 
-                yield* Deferred.succeed(releaseFinalizer, undefined);
+                yield* Deferred.succeed(releaseBootstrapProbe, undefined);
                 const updateResult = yield* Fiber.join(update);
                 assert.strictEqual(
                   yield* maintenanceGate.withOperation({
@@ -1750,7 +1750,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
 
               assert.strictEqual(updatePrepareCount, 2);
               assert.strictEqual(initialUpdateSpawnCount, 1);
-              assert.strictEqual(finalizerSpawnCount, 1);
+              assert.strictEqual(bootstrapProbeSpawnCount, 1);
               assert.strictEqual(healthProbeCount, 3);
               assert.strictEqual(droid?.version, "0.178.0");
               assert.strictEqual(droid?.versionAdvisory?.status, "current");
@@ -1758,7 +1758,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
               assert.strictEqual(droid?.updateState?.status, "succeeded");
               assert.strictEqual(droid?.updateState?.message, "Provider CLI update verified.");
               assert.match(droid?.updateState?.output ?? "", /Update staged/u);
-              assert.match(droid?.updateState?.output ?? "", /Staged update applied/u);
+              assert.match(droid?.updateState?.output ?? "", /Already on target version/u);
               assert.strictEqual(persisted?.version, "0.178.0");
               assert.strictEqual(persisted?.versionAdvisory?.status, "current");
             }),
@@ -1767,7 +1767,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
     );
 
     it.effect.skipIf(process.platform !== "win32")(
-      "fails when the native Droid staged-update finalizer exits nonzero",
+      "fails when the post-bootstrap Droid check process exits nonzero",
       () =>
         withNativeDroidUpdateFixture("0.174.0", (input) =>
           withLatestNpmVersion(
@@ -1775,7 +1775,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
             Effect.gen(function* () {
               let healthProbeCount = 0;
               let initialUpdateSpawnCount = 0;
-              let finalizerSpawnCount = 0;
+              let bootstrapProbeSpawnCount = 0;
               const layer = makeProviderHealthLive({
                 platform: "win32",
                 prepareProcess: prepareContainedResolvedWindowsProviderForTest,
@@ -1792,10 +1792,10 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
                       return { stdout: "Update staged.\n", stderr: "", code: 0 };
                     }
                     if (args.length === 2 && args[0] === "update" && args[1] === "--check") {
-                      finalizerSpawnCount += 1;
+                      bootstrapProbeSpawnCount += 1;
                       return {
-                        stdout: "Checking staged update.\n",
-                        stderr: "Replacement failed.\n",
+                        stdout: "Checking for updates.\n",
+                        stderr: "Update check failed.\n",
                         code: 23,
                       };
                     }
@@ -1814,7 +1814,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
               const persisted = yield* readProviderStatusCache(input.cachePath);
 
               assert.strictEqual(initialUpdateSpawnCount, 1);
-              assert.strictEqual(finalizerSpawnCount, 1);
+              assert.strictEqual(bootstrapProbeSpawnCount, 1);
               assert.strictEqual(healthProbeCount, 2);
               assert.strictEqual(droid?.version, "0.174.0");
               assert.strictEqual(droid?.versionAdvisory?.status, "behind_latest");
@@ -1825,7 +1825,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
                 "Update command exited with code 23.",
               );
               assert.match(droid?.updateState?.output ?? "", /Update staged/u);
-              assert.match(droid?.updateState?.output ?? "", /Replacement failed/u);
+              assert.match(droid?.updateState?.output ?? "", /Update check failed/u);
               assert.strictEqual(persisted?.versionAdvisory?.status, "behind_latest");
             }),
           ),
@@ -1833,7 +1833,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
     );
 
     it.effect.skipIf(process.platform !== "win32")(
-      "does not finalize a staged native Droid update after settings drift",
+      "does not start the pending-update bootstrap probe after settings drift",
       () =>
         withNativeDroidUpdateFixture("0.174.0", (input) =>
           withLatestNpmVersion(
@@ -1841,7 +1841,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
             Effect.gen(function* () {
               let healthProbeCount = 0;
               let initialUpdateSpawnCount = 0;
-              let finalizerSpawnCount = 0;
+              let bootstrapProbeSpawnCount = 0;
               const postProbeStarted = yield* Deferred.make<void>();
               const releasePostProbe = yield* Deferred.make<void>();
               const layer = makeProviderHealthLive({
@@ -1862,7 +1862,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
                       );
                     }
                     if (args.length === 2 && args[0] === "update" && args[1] === "--check") {
-                      finalizerSpawnCount += 1;
+                      bootstrapProbeSpawnCount += 1;
                       return Effect.succeed(
                         mockHandle({ stdout: "unexpected\n", stderr: "", code: 0 }),
                       );
@@ -1904,7 +1904,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
               const droid = result.providers.find((provider) => provider.provider === "droid");
 
               assert.strictEqual(initialUpdateSpawnCount, 1);
-              assert.strictEqual(finalizerSpawnCount, 0);
+              assert.strictEqual(bootstrapProbeSpawnCount, 0);
               assert.strictEqual(healthProbeCount, 2);
               assert.strictEqual(droid?.version, "0.174.0");
               assert.strictEqual(droid?.versionAdvisory?.status, "behind_latest");
@@ -1919,7 +1919,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
     );
 
     it.effect.skipIf(process.platform !== "win32")(
-      "does not finalize a staged native Droid update after the provider gate latches",
+      "does not start the pending-update bootstrap probe after the provider gate latches",
       () =>
         withNativeDroidUpdateFixture("0.174.0", (input) =>
           withLatestNpmVersion(
@@ -1927,7 +1927,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
             Effect.gen(function* () {
               let healthProbeCount = 0;
               let initialUpdateSpawnCount = 0;
-              let finalizerSpawnCount = 0;
+              let bootstrapProbeSpawnCount = 0;
               const postProbeStarted = yield* Deferred.make<void>();
               const releasePostProbe = yield* Deferred.make<void>();
               const maintenanceGate = yield* makeProviderMaintenanceGate;
@@ -1950,7 +1950,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
                       );
                     }
                     if (args.length === 2 && args[0] === "update" && args[1] === "--check") {
-                      finalizerSpawnCount += 1;
+                      bootstrapProbeSpawnCount += 1;
                       return Effect.succeed(
                         mockHandle({ stdout: "unexpected\n", stderr: "", code: 0 }),
                       );
@@ -1995,7 +1995,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
                 assert.match(observed.updateResult.failure.message, /post probe latched for test/u);
               }
               assert.strictEqual(initialUpdateSpawnCount, 1);
-              assert.strictEqual(finalizerSpawnCount, 0);
+              assert.strictEqual(bootstrapProbeSpawnCount, 0);
               assert.strictEqual(healthProbeCount, 2);
               assert.strictEqual(droid?.updateState?.status, "failed");
               assert.match(droid?.updateState?.message ?? "", /Restart Synara/u);

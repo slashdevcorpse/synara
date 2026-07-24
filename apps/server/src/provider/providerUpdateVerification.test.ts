@@ -6,7 +6,7 @@ import { TestClock } from "effect/testing";
 import {
   PROVIDER_UPDATE_POST_PROBE_RETRY_DELAYS_MS,
   shouldRetryDelayedProviderUpdateVersion,
-  shouldRunWindowsDroidNativeUpdateFinalizer,
+  shouldRunWindowsDroidPendingUpdateBootstrapProbe,
   verifyDelayedProviderUpdateVersion,
   type ProviderUpdateVerificationSnapshot,
 } from "./providerUpdateVerification.ts";
@@ -31,10 +31,10 @@ function snapshot(
   };
 }
 
-describe("shouldRunWindowsDroidNativeUpdateFinalizer", () => {
+describe("shouldRunWindowsDroidPendingUpdateBootstrapProbe", () => {
   it("selects only an unchanged Windows native Droid update", () => {
     assert.strictEqual(
-      shouldRunWindowsDroidNativeUpdateFinalizer({
+      shouldRunWindowsDroidPendingUpdateBootstrapProbe({
         platform: "win32",
         provider: "droid",
         updateChannelKind: "native-self-update",
@@ -99,7 +99,7 @@ describe("shouldRunWindowsDroidNativeUpdateFinalizer", () => {
     ];
 
     for (const testCase of excludedCases) {
-      assert.strictEqual(shouldRunWindowsDroidNativeUpdateFinalizer(testCase), false);
+      assert.strictEqual(shouldRunWindowsDroidPendingUpdateBootstrapProbe(testCase), false);
     }
   });
 });
