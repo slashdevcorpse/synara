@@ -74,36 +74,123 @@ describe("WebSocket transport admission", () => {
     expect(admission.acquireConnection("127.0.0.1").admitted).toBe(true);
   });
 
-  it("keeps publicUrl proxy traffic out of shared peer buckets while preserving the global cap", () => {
-    const options = wsTransportAdmissionOptionsForServerConfig(
-      { publicUrl: new URL("https://synara.example.test/") },
-      {
-        maxConcurrentConnections: 11,
-        connectionBurstPerPeer: 2,
-        connectionRatePerMinutePerPeer: 2,
-      },
-    );
-    expect(options.connectionPeerRateLimitEnabled).toBe(false);
-    const admission = makeWsTransportAdmission(options);
+  it.each([
+    ["implicit loopback", undefined],
+    ["localhost", "localhost"],
+    ["IPv4 loopback", "127.0.0.1"],
+    ["IPv6 loopback", "::1"],
+    ["bracketed IPv6 loopback", "[::1]"],
+  ])("disables the peer bucket for private desktop %s", (_label, host) => {
+    expect(
+      wsTransportAdmissionOptionsForServerConfig({
+        mode: "desktop",
+        host,
+        publicUrl: undefined,
+      }).connectionPeerRateLimitEnabled,
+    ).toBe(false);
+  });
 
-    // Two five-socket page loads plus one reconnect all arrive from the same
-    // proxy socket address. Direct mode would reject the third connection.
-    for (let index = 0; index < 11; index += 1) {
-      expect(admission.acquireConnection("127.0.0.1").admitted).toBe(true);
+  it.each([
+    [
+      "desktop IPv4 wildcard bind",
+      { mode: "desktop" as const, host: "0.0.0.0", publicUrl: undefined },
+    ],
+    ["desktop IPv6 wildcard bind", { mode: "desktop" as const, host: "::", publicUrl: undefined }],
+    [
+      "desktop bracketed IPv6 wildcard bind",
+      { mode: "desktop" as const, host: "[::]", publicUrl: undefined },
+    ],
+    ["desktop remote bind", { mode: "desktop" as const, host: "192.0.2.10", publicUrl: undefined }],
+    ["direct web loopback", { mode: "web" as const, host: "127.0.0.1", publicUrl: undefined }],
+  ])("retains pre-auth peer throttling for %s", (_label, config) => {
+    expect(wsTransportAdmissionOptionsForServerConfig(config).connectionPeerRateLimitEnabled).toBe(
+      true,
+    );
+  });
+
+  it("allows repeated private desktop bootstrap and feature cycles while retaining the global cap", () => {
+    const admission = makeWsTransportAdmission(
+      wsTransportAdmissionOptionsForServerConfig(
+        { mode: "desktop", host: "127.0.0.1", publicUrl: undefined },
+        {
+          maxConcurrentConnections: 2,
+          connectionBurstPerPeer: 1,
+          connectionRatePerMinutePerPeer: 1,
+        },
+      ),
+    );
+
+    for (let index = 0; index < 20; index += 1) {
+      const bootstrap = admission.acquireConnection("127.0.0.1");
+      expect(bootstrap.admitted).toBe(true);
+      if (!bootstrap.admitted) throw new Error("Expected desktop bootstrap to be admitted");
+      admission.releaseConnection(bootstrap.lease);
+
+      const feature = admission.acquireConnection("127.0.0.1");
+      expect(feature.admitted).toBe(true);
+      if (!feature.admitted) throw new Error("Expected desktop feature socket to be admitted");
+      admission.releaseConnection(feature.lease);
     }
-    expect(admission.snapshot()).toEqual({ activeConnections: 11, trackedPeers: 0 });
+    expect(admission.snapshot()).toEqual({ activeConnections: 0, trackedPeers: 0 });
+
+    const first = admission.acquireConnection("127.0.0.1");
+    const second = admission.acquireConnection("127.0.0.1");
+    expect(first.admitted).toBe(true);
+    expect(second.admitted).toBe(true);
     expect(admission.acquireConnection("127.0.0.1")).toMatchObject({
       admitted: false,
       reason: "global-capacity",
     });
   });
 
-  it("keeps peer limiting enabled when no publicUrl proxy is configured", () => {
-    expect(
-      wsTransportAdmissionOptionsForServerConfig({ publicUrl: undefined })
-        .connectionPeerRateLimitEnabled,
-    ).toBe(true);
+  it.each([
+    ["desktop non-loopback", { mode: "desktop" as const, host: "0.0.0.0", publicUrl: undefined }],
+    ["direct web", { mode: "web" as const, host: "127.0.0.1", publicUrl: undefined }],
+  ])("rate-limits repeated connections in %s mode", (_label, config) => {
+    const admission = makeWsTransportAdmission(
+      wsTransportAdmissionOptionsForServerConfig(config, {
+        maxConcurrentConnections: 20,
+        connectionBurstPerPeer: 2,
+        connectionRatePerMinutePerPeer: 2,
+      }),
+    );
+    const first = admission.acquireConnection("203.0.113.8");
+    const second = admission.acquireConnection("203.0.113.8");
+    expect(first.admitted).toBe(true);
+    expect(second.admitted).toBe(true);
+    expect(admission.acquireConnection("203.0.113.8")).toMatchObject({
+      admitted: false,
+      reason: "peer-rate",
+      retryAfterMs: 30_000,
+    });
   });
+
+  it.each(["desktop", "web"] as const)(
+    "preserves publicUrl proxy peer handling and the global cap in %s mode",
+    (mode) => {
+      const admission = makeWsTransportAdmission(
+        wsTransportAdmissionOptionsForServerConfig(
+          {
+            mode,
+            host: "127.0.0.1",
+            publicUrl: new URL("https://synara.example.test/"),
+          },
+          {
+            maxConcurrentConnections: 2,
+            connectionBurstPerPeer: 1,
+            connectionRatePerMinutePerPeer: 1,
+          },
+        ),
+      );
+      expect(admission.acquireConnection("127.0.0.1").admitted).toBe(true);
+      expect(admission.acquireConnection("127.0.0.1").admitted).toBe(true);
+      expect(admission.snapshot()).toEqual({ activeConnections: 2, trackedPeers: 0 });
+      expect(admission.acquireConnection("127.0.0.1")).toMatchObject({
+        admitted: false,
+        reason: "global-capacity",
+      });
+    },
+  );
 
   it("bounds inbound messages with a sustained token bucket", () => {
     let nowMs = 0;

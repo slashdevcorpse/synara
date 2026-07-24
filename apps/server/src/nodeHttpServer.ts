@@ -8,6 +8,7 @@ import { ServeError } from "effect/unstable/http/HttpServerError";
 import { WebSocket, WebSocketServer } from "ws";
 
 import type { ServerConfigShape } from "./config";
+import { isLoopbackHost } from "./startupAccess";
 import {
   classifyWsMessage,
   makeWsMessageAdmission,
@@ -18,18 +19,23 @@ import {
 export const MAX_WEBSOCKET_MESSAGE_BYTES = 2 * 1024 * 1024;
 
 /**
- * A configured public URL declares HTTPS reverse-proxy mode. The socket peer
- * is then the shared proxy, not a client identity, so pre-auth transport keeps
- * only the global cap and post-auth session admission owns client isolation.
- * No forwarded request header is consulted. Direct modes retain peer limits.
+ * Private desktop renderer traffic shares one loopback peer identity while
+ * bootstrap and feature sockets reconnect together, so its pre-auth peer
+ * bucket is disabled while the global connection cap, origin/auth checks, and
+ * per-connection message limits remain in force. Public URL proxy mode
+ * preserves its existing shared-peer handling. Every direct web or non-loopback
+ * deployment retains peer throttling, and no forwarded request header is
+ * consulted.
  */
 export function wsTransportAdmissionOptionsForServerConfig(
-  config: Pick<ServerConfigShape, "publicUrl">,
+  config: Pick<ServerConfigShape, "publicUrl"> & Partial<Pick<ServerConfigShape, "mode" | "host">>,
   overrides: WsTransportAdmissionOptions = {},
 ): WsTransportAdmissionOptions {
+  const isPrivateDesktopLoopback =
+    config.mode === "desktop" && config.publicUrl === undefined && isLoopbackHost(config.host);
   return {
     ...overrides,
-    connectionPeerRateLimitEnabled: config.publicUrl === undefined,
+    connectionPeerRateLimitEnabled: config.publicUrl === undefined && !isPrivateDesktopLoopback,
   };
 }
 
