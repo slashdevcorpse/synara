@@ -860,10 +860,7 @@ describe("Super Synara workflow contracts", () => {
       ["Run stable browser tests", "bun run --cwd apps/web test:browser:stable"],
     ] as const) {
       const guardedStep = `      - name: ${name}\n        if: ${condition}\n        run: ${command}`;
-      const mutation = main.replace(
-        guardedStep,
-        `      - name: ${name}\n        run: ${command}`,
-      );
+      const mutation = main.replace(guardedStep, `      - name: ${name}\n        run: ${command}`);
       expect(mutation).not.toBe(main);
       expect(() => verifySuperSynaraWorkflowText(mutation, audit)).toThrow(
         /only for windows-and-macos,? and fail closed/,
