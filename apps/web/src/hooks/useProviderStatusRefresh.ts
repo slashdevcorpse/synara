@@ -12,12 +12,25 @@ import { readNativeApi } from "../nativeApi";
 import { serverQueryKeys } from "../lib/serverReactQuery";
 
 export type RefreshProviderStatusesOptions = {
+  readonly minIntervalMs?: number;
   readonly silent?: boolean;
 };
 
 export type RefreshProviderStatusesNow = (
   options?: RefreshProviderStatusesOptions,
 ) => Promise<readonly ServerProviderStatus[] | null>;
+
+export const PROVIDER_STATUS_FOREGROUND_REFRESH_MIN_INTERVAL_MS = 15_000;
+
+type ProviderStatusRefreshState = {
+  inFlight: Promise<readonly ServerProviderStatus[]> | null;
+  lastStartedAtMs: number | null;
+};
+
+const providerStatusRefreshStateByQueryClient = new WeakMap<
+  QueryClient,
+  ProviderStatusRefreshState
+>();
 
 function writeProviderStatusesToConfigCache(
   queryClient: QueryClient,
@@ -28,31 +41,73 @@ function writeProviderStatusesToConfigCache(
   );
 }
 
+function getProviderStatusRefreshState(queryClient: QueryClient): ProviderStatusRefreshState {
+  const existing = providerStatusRefreshStateByQueryClient.get(queryClient);
+  if (existing) return existing;
+
+  const created: ProviderStatusRefreshState = {
+    inFlight: null,
+    lastStartedAtMs: null,
+  };
+  providerStatusRefreshStateByQueryClient.set(queryClient, created);
+  return created;
+}
+
+async function refreshProviderStatusesNow(
+  queryClient: QueryClient,
+  options?: RefreshProviderStatusesOptions,
+): Promise<readonly ServerProviderStatus[] | null> {
+  const api = readNativeApi();
+  if (!api) return null;
+
+  const state = getProviderStatusRefreshState(queryClient);
+  const minIntervalMs = options?.minIntervalMs ?? 0;
+  const nowMs = Date.now();
+  const refreshPromise =
+    state.inFlight ??
+    (minIntervalMs > 0 &&
+    state.lastStartedAtMs !== null &&
+    nowMs - state.lastStartedAtMs < minIntervalMs
+      ? null
+      : Promise.resolve()
+          .then(() => api.server.refreshProviders())
+          .then((result) => {
+            writeProviderStatusesToConfigCache(queryClient, result.providers);
+            return result.providers;
+          })
+          .finally(() => {
+            state.inFlight = null;
+          }));
+
+  if (!refreshPromise) return null;
+  if (!state.inFlight) {
+    state.lastStartedAtMs = nowMs;
+    state.inFlight = refreshPromise;
+  }
+
+  try {
+    return await refreshPromise;
+  } catch (error) {
+    if (!options?.silent) {
+      toastManager.add({
+        type: "error",
+        title: "Unable to refresh provider status",
+        description:
+          error instanceof Error ? error.message : "Unknown error refreshing provider status.",
+      });
+    }
+    return null;
+  }
+}
+
 /**
  * Imperative one-shot provider-status refresh: re-checks providers on the server
  * and folds the result into the cached server config. Surfaces failures as a toast.
  */
 export function useRefreshProviderStatusesNow(): RefreshProviderStatusesNow {
   const queryClient = useQueryClient();
-  return async (options?: RefreshProviderStatusesOptions) => {
-    const api = readNativeApi();
-    if (!api) return null;
-    try {
-      const result = await api.server.refreshProviders();
-      writeProviderStatusesToConfigCache(queryClient, result.providers);
-      return result.providers;
-    } catch (error) {
-      if (!options?.silent) {
-        toastManager.add({
-          type: "error",
-          title: "Unable to refresh provider status",
-          description:
-            error instanceof Error ? error.message : "Unknown error refreshing provider status.",
-        });
-      }
-      return null;
-    }
-  };
+  return (options?: RefreshProviderStatusesOptions) =>
+    refreshProviderStatusesNow(queryClient, options);
 }
 
 type ProviderStatusRefreshOptions = {
@@ -76,48 +131,31 @@ export function useProviderStatusRefresh(options: ProviderStatusRefreshOptions):
       return;
     }
 
-    let disposed = false;
-    let lastRefreshAtMs = 0;
-    const refreshProviderStatuses = () => {
+    const triggerProviderStatusRefresh = () => {
       if (document.visibilityState !== "visible") {
         return;
       }
-      const nowMs = Date.now();
-      if (minIntervalMs > 0 && nowMs - lastRefreshAtMs < minIntervalMs) {
-        return;
-      }
-      const api = readNativeApi();
-      if (!api) {
-        return;
-      }
-      lastRefreshAtMs = nowMs;
-      void api.server
-        .refreshProviders()
-        .then((result) => {
-          if (disposed) {
-            return;
-          }
-          writeProviderStatusesToConfigCache(queryClient, result.providers);
-        })
-        .catch(() => undefined);
+      void refreshProviderStatusesNow(queryClient, {
+        minIntervalMs,
+        silent: true,
+      });
     };
 
     const initialRefreshId =
       typeof initialDelayMs === "number" && initialDelayMs >= 0
-        ? window.setTimeout(refreshProviderStatuses, initialDelayMs)
+        ? window.setTimeout(triggerProviderStatusRefresh, initialDelayMs)
         : null;
     const refreshIntervalId =
       typeof intervalMs === "number" && intervalMs > 0
-        ? window.setInterval(refreshProviderStatuses, intervalMs)
+        ? window.setInterval(triggerProviderStatusRefresh, intervalMs)
         : null;
 
     if (refreshOnFocus) {
-      window.addEventListener("focus", refreshProviderStatuses);
-      document.addEventListener("visibilitychange", refreshProviderStatuses);
+      window.addEventListener("focus", triggerProviderStatusRefresh);
+      document.addEventListener("visibilitychange", triggerProviderStatusRefresh);
     }
 
     return () => {
-      disposed = true;
       if (initialRefreshId !== null) {
         window.clearTimeout(initialRefreshId);
       }
@@ -125,8 +163,8 @@ export function useProviderStatusRefresh(options: ProviderStatusRefreshOptions):
         window.clearInterval(refreshIntervalId);
       }
       if (refreshOnFocus) {
-        window.removeEventListener("focus", refreshProviderStatuses);
-        document.removeEventListener("visibilitychange", refreshProviderStatuses);
+        window.removeEventListener("focus", triggerProviderStatusRefresh);
+        document.removeEventListener("visibilitychange", triggerProviderStatusRefresh);
       }
     };
   }, [enabled, initialDelayMs, intervalMs, minIntervalMs, queryClient, refreshOnFocus]);
