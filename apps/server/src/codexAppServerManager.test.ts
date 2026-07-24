@@ -2434,12 +2434,168 @@ describe("steerTurn", () => {
   });
 });
 
+describe("codexDiscoveryProfileKey", () => {
+  it("collapses equivalent Windows casing, separators, and dot segments", () => {
+    const configuredProfile = {
+      binaryPath: String.raw`C:\Users\Test\AppData\Roaming\npm\.\CODEX.CMD`,
+      homePath: String.raw`C:\Users\Test\.codex\cache\..`,
+    } satisfies CodexDiscoveryProfile;
+    const equivalentProfile = {
+      binaryPath: "c:/users/test/appdata/roaming/npm/codex.cmd",
+      homePath: "c:/users/test/.codex",
+    } satisfies CodexDiscoveryProfile;
+
+    expect(codexDiscoveryProfileKey(configuredProfile, "win32")).toBe(
+      codexDiscoveryProfileKey(equivalentProfile, "win32"),
+    );
+    expect(configuredProfile).toEqual({
+      binaryPath: String.raw`C:\Users\Test\AppData\Roaming\npm\.\CODEX.CMD`,
+      homePath: String.raw`C:\Users\Test\.codex\cache\..`,
+    });
+  });
+
+  it("keeps bare Windows commands distinct from explicit relative paths", () => {
+    expect(codexDiscoveryProfileKey({ binaryPath: "CODEX" }, "win32")).not.toBe(
+      codexDiscoveryProfileKey({ binaryPath: String.raw`.\codex` }, "win32"),
+    );
+  });
+
+  it("preserves non-Windows path identity and default home behavior", () => {
+    expect(
+      codexDiscoveryProfileKey(
+        {
+          binaryPath: "/OPT/Codex/../Codex/bin/codex",
+          homePath: "/HOME/User/.codex",
+        },
+        "linux",
+      ),
+    ).not.toBe(
+      codexDiscoveryProfileKey(
+        {
+          binaryPath: "/opt/Codex/bin/codex",
+          homePath: "/home/user/.codex",
+        },
+        "linux",
+      ),
+    );
+    expect(
+      JSON.parse(codexDiscoveryProfileKey({ binaryPath: "   ", homePath: "   " }, "win32")),
+    ).toEqual({
+      binaryPath: "codex",
+      homePath: null,
+    });
+  });
+});
+
 describe("CodexAppServerManager discovery", () => {
   const defaultProfile = { binaryPath: "codex" } satisfies CodexDiscoveryProfile;
   const configuredProfile = {
     binaryPath: "C:\\Users\\test\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\codex.exe",
     homePath: "C:\\Users\\test\\.super-synara\\codex-home-overlay",
   } satisfies CodexDiscoveryProfile;
+
+  it("single-flights concurrent discovery session creation", async () => {
+    const manager = new CodexAppServerManager();
+    const context = {
+      child: { killed: false },
+      stopping: false,
+    };
+    let releaseCreation: (() => void) | undefined;
+    const creationGate = new Promise<void>((resolve) => {
+      releaseCreation = resolve;
+    });
+    const internals = manager as unknown as {
+      discoverySessions: Map<string, unknown>;
+      discoverySessionCreations: Map<string, Promise<unknown>>;
+      createDiscoverySession: (input: {
+        readonly normalizedCwd: string;
+        readonly normalizedProfile: CodexDiscoveryProfile;
+        readonly profileKey: string;
+        readonly discoveryKey: string;
+      }) => Promise<unknown>;
+      getOrCreateDiscoverySession: (
+        cwd: string,
+        profile: CodexDiscoveryProfile,
+      ) => Promise<unknown>;
+    };
+    const createDiscoverySession = vi
+      .spyOn(internals, "createDiscoverySession")
+      .mockImplementation(async (input) => {
+        await creationGate;
+        internals.discoverySessions.set(input.discoveryKey, context);
+        return context;
+      });
+
+    const first = internals.getOrCreateDiscoverySession("C:\\workspace\\synara", defaultProfile);
+    const second = internals.getOrCreateDiscoverySession("C:\\workspace\\synara", defaultProfile);
+
+    expect(first).toBe(second);
+    expect(createDiscoverySession).toHaveBeenCalledOnce();
+    expect(internals.discoverySessionCreations.size).toBe(1);
+
+    releaseCreation?.();
+    await expect(Promise.all([first, second])).resolves.toEqual([context, context]);
+
+    expect(internals.discoverySessionCreations.size).toBe(0);
+    expect(internals.discoverySessions.size).toBe(1);
+    expect(new Set(internals.discoverySessions.values())).toEqual(new Set([context]));
+    internals.discoverySessions.clear();
+  });
+
+  it("clears failed discovery creation so a later request can retry", async () => {
+    const manager = new CodexAppServerManager();
+    const retryContext = {
+      child: { killed: false },
+      stopping: false,
+    };
+    let rejectCreation: ((error: Error) => void) | undefined;
+    const failedCreation = new Promise<never>((_resolve, reject) => {
+      rejectCreation = reject;
+    });
+    const internals = manager as unknown as {
+      discoverySessions: Map<string, unknown>;
+      discoverySessionCreations: Map<string, Promise<unknown>>;
+      createDiscoverySession: (input: {
+        readonly normalizedCwd: string;
+        readonly normalizedProfile: CodexDiscoveryProfile;
+        readonly profileKey: string;
+        readonly discoveryKey: string;
+      }) => Promise<unknown>;
+      getOrCreateDiscoverySession: (
+        cwd: string,
+        profile: CodexDiscoveryProfile,
+      ) => Promise<unknown>;
+    };
+    const createDiscoverySession = vi
+      .spyOn(internals, "createDiscoverySession")
+      .mockImplementationOnce(() => failedCreation)
+      .mockImplementationOnce(async (input) => {
+        internals.discoverySessions.set(input.discoveryKey, retryContext);
+        return retryContext;
+      });
+
+    const first = internals.getOrCreateDiscoverySession("C:\\workspace\\synara", defaultProfile);
+    const second = internals.getOrCreateDiscoverySession("C:\\workspace\\synara", defaultProfile);
+    const failedResults = Promise.allSettled([first, second]);
+
+    expect(first).toBe(second);
+    expect(createDiscoverySession).toHaveBeenCalledOnce();
+    rejectCreation?.(new Error("initialize failed"));
+    await expect(failedResults).resolves.toEqual([
+      expect.objectContaining({ status: "rejected", reason: new Error("initialize failed") }),
+      expect.objectContaining({ status: "rejected", reason: new Error("initialize failed") }),
+    ]);
+    expect(internals.discoverySessionCreations.size).toBe(0);
+    expect(internals.discoverySessions.size).toBe(0);
+
+    await expect(
+      internals.getOrCreateDiscoverySession("C:\\workspace\\synara", defaultProfile),
+    ).resolves.toBe(retryContext);
+    expect(createDiscoverySession).toHaveBeenCalledTimes(2);
+    expect(internals.discoverySessionCreations.size).toBe(0);
+    expect(internals.discoverySessions.size).toBe(1);
+    internals.discoverySessions.clear();
+  });
 
   it("wires model discovery through model/list", async () => {
     const manager = new CodexAppServerManager();

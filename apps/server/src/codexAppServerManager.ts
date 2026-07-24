@@ -1,6 +1,7 @@
 import { type ChildProcess, type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
+import path from "node:path";
 
 import {
   ApprovalRequestId,
@@ -894,11 +895,54 @@ function normalizeCodexDiscoveryProfile(profile: CodexDiscoveryProfile): CodexDi
   };
 }
 
-export function codexDiscoveryProfileKey(profile: CodexDiscoveryProfile): string {
+function normalizeCodexDiscoveryPathIdentity(
+  value: string,
+  input: {
+    readonly platform: NodeJS.Platform;
+    readonly pathOnly: boolean;
+  },
+): string {
+  if (input.platform !== "win32") {
+    return value;
+  }
+
+  const normalized = path.win32.normalize(value).toLowerCase();
+  const root = path.win32.parse(normalized).root;
+  const withoutTrailingSeparators =
+    normalized.length > root.length ? normalized.replace(/[\\/]+$/u, "") : normalized;
+  if (input.pathOnly || path.win32.isAbsolute(value)) {
+    return withoutTrailingSeparators;
+  }
+
+  // A PATH-resolved command and an explicit relative path can select different
+  // executables, even when Windows normalizes both strings to the same basename.
+  const isExplicitRelativePath =
+    /^[a-z]:/iu.test(value) ||
+    value.includes("\\") ||
+    value.includes("/") ||
+    value === "." ||
+    value === "..";
+  return isExplicitRelativePath
+    ? `relative:${withoutTrailingSeparators}`
+    : withoutTrailingSeparators;
+}
+
+export function codexDiscoveryProfileKey(
+  profile: CodexDiscoveryProfile,
+  platform: NodeJS.Platform = process.platform,
+): string {
   const normalized = normalizeCodexDiscoveryProfile(profile);
   return JSON.stringify({
-    binaryPath: normalized.binaryPath,
-    homePath: normalized.homePath ?? null,
+    binaryPath: normalizeCodexDiscoveryPathIdentity(normalized.binaryPath, {
+      platform,
+      pathOnly: false,
+    }),
+    homePath: normalized.homePath
+      ? normalizeCodexDiscoveryPathIdentity(normalized.homePath, {
+          platform,
+          pathOnly: true,
+        })
+      : null,
   });
 }
 
@@ -939,6 +983,7 @@ function setRecentCacheEntry<K, V>(
 export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEvents> {
   private readonly sessions = new Map<ThreadId, CodexSessionContext>();
   private readonly discoverySessions = new Map<string, CodexSessionContext>();
+  private readonly discoverySessionCreations = new Map<string, Promise<CodexSessionContext>>();
   private readonly discoverySessionIdleTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly skillsCache = new Map<string, ProviderListSkillsResult>();
   private readonly pluginsCache = new Map<string, ProviderListPluginsResult>();
@@ -2387,7 +2432,7 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
     };
   }
 
-  private async getOrCreateDiscoverySession(
+  private getOrCreateDiscoverySession(
     cwd: string,
     profile: CodexDiscoveryProfile,
   ): Promise<CodexSessionContext> {
@@ -2395,11 +2440,40 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
     const normalizedProfile = normalizeCodexDiscoveryProfile(profile);
     const profileKey = codexDiscoveryProfileKey(normalizedProfile);
     const discoveryKey = codexDiscoverySessionKey(normalizedCwd, normalizedProfile);
+    const pending = this.discoverySessionCreations.get(discoveryKey);
+    if (pending) {
+      return pending;
+    }
+
     const existing = this.discoverySessions.get(discoveryKey);
     if (existing && !existing.stopping && !existing.child.killed) {
       this.scheduleDiscoverySessionIdleStop(discoveryKey);
-      return existing;
+      return Promise.resolve(existing);
     }
+
+    const creation = this.createDiscoverySession({
+      normalizedCwd,
+      normalizedProfile,
+      profileKey,
+      discoveryKey,
+    });
+    const trackedCreation = creation.finally(() => {
+      if (this.discoverySessionCreations.get(discoveryKey) === trackedCreation) {
+        this.discoverySessionCreations.delete(discoveryKey);
+      }
+    });
+    this.discoverySessionCreations.set(discoveryKey, trackedCreation);
+    return trackedCreation;
+  }
+
+  private async createDiscoverySession(input: {
+    readonly normalizedCwd: string;
+    readonly normalizedProfile: CodexDiscoveryProfile;
+    readonly profileKey: string;
+    readonly discoveryKey: string;
+  }): Promise<CodexSessionContext> {
+    const { normalizedCwd, normalizedProfile, profileKey, discoveryKey } = input;
+    const existing = this.discoverySessions.get(discoveryKey);
     if (existing) {
       await this.stopDiscoverySession(discoveryKey);
     }
