@@ -30,6 +30,18 @@ export interface QueuedTurnPromotionRepositoryShape {
     readonly claimedAt: string;
     readonly claimExpiresAt: string;
   }) => Effect.Effect<Option.Option<QueuedTurnPromotion>, PersistenceSqlError>;
+  /**
+   * Claim the next promotion across every thread sharing one provider session.
+   * Ordering matches the ordinary queue policy globally: newest steer first,
+   * then queued work in durable source order. Quarantine recovery stores its
+   * rows as `queue`, so those rows remain strict FIFO.
+   */
+  readonly claimNextForThreads: (input: {
+    readonly threadIds: ReadonlyArray<string>;
+    readonly claimOwner: string;
+    readonly claimedAt: string;
+    readonly claimExpiresAt: string;
+  }) => Effect.Effect<Option.Option<QueuedTurnPromotion>, PersistenceSqlError>;
   readonly markPromoted: (input: {
     readonly queuedEventSequence: number;
     readonly claimOwner: string;
@@ -44,6 +56,7 @@ export interface QueuedTurnPromotionRepositoryShape {
     readonly threadId: string;
     readonly messageId: string;
     readonly updatedAt: string;
+    readonly throughEventSequence?: number | undefined;
   }) => Effect.Effect<boolean, PersistenceSqlError>;
   /**
    * Cancel all in-flight promotions for a thread. Matches both 'queued' and
@@ -54,12 +67,18 @@ export interface QueuedTurnPromotionRepositoryShape {
   readonly cancelThread: (input: {
     readonly threadId: string;
     readonly updatedAt: string;
+    readonly throughEventSequence?: number | undefined;
   }) => Effect.Effect<void, PersistenceSqlError>;
   readonly hasPendingMessage: (input: {
     readonly threadId: string;
     readonly messageId: string;
   }) => Effect.Effect<boolean, PersistenceSqlError>;
   readonly listPendingThreadIds: Effect.Effect<ReadonlyArray<string>, PersistenceSqlError>;
+  /**
+   * Includes promoted source rows because they remain the durable cancellation
+   * proof for a deterministic derived start that may not have executed yet.
+   */
+  readonly listCancellableThreadIds: Effect.Effect<ReadonlyArray<string>, PersistenceSqlError>;
 }
 
 export class QueuedTurnPromotionRepository extends ServiceMap.Service<

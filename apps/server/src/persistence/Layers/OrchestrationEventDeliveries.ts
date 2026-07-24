@@ -258,6 +258,66 @@ const makeRepository = Effect.gen(function* () {
         ),
       );
 
+  const firstBlockingDeliveryForThreads: OrchestrationEventDeliveryRepositoryShape["firstBlockingDeliveryForThreads"] =
+    (input) => {
+      const threadIds = [...new Set(input.threadIds)];
+      if (threadIds.length === 0) {
+        return Effect.succeed(Option.none<OrchestrationEventDelivery>());
+      }
+      return sql<OrchestrationEventDelivery>`
+        SELECT ${deliveryColumns(sql)}
+        FROM orchestration_event_deliveries
+        WHERE consumer_name = ${input.consumerName}
+          AND thread_id IN ${sql.in(threadIds)}
+          AND state IN ('dead', 'uncertain')
+        ORDER BY event_sequence ASC
+        LIMIT 1
+      `.pipe(
+        Effect.map((rows) => Option.fromNullishOr(rows[0])),
+        Effect.mapError(
+          toPersistenceSqlError("OrchestrationEventDelivery.firstBlockingDeliveryForThreads"),
+        ),
+      );
+    };
+
+  const hasUnsettledDeliveryForThreads: OrchestrationEventDeliveryRepositoryShape["hasUnsettledDeliveryForThreads"] =
+    (input) => {
+      const threadIds = [...new Set(input.threadIds)];
+      if (threadIds.length === 0) {
+        return Effect.succeed(false);
+      }
+      const eventSequenceFilter =
+        input.excludingEventSequence === undefined
+          ? sql``
+          : sql`AND event_sequence <> ${input.excludingEventSequence}`;
+      return sql<{ readonly count: number }>`
+        SELECT COUNT(*) AS count
+        FROM orchestration_event_deliveries
+        WHERE consumer_name = ${input.consumerName}
+          AND thread_id IN ${sql.in(threadIds)}
+          AND state IN ('inflight', 'retry', 'dead', 'uncertain')
+          ${eventSequenceFilter}
+      `.pipe(
+        Effect.map((rows) => (rows[0]?.count ?? 0) > 0),
+        Effect.mapError(
+          toPersistenceSqlError("OrchestrationEventDelivery.hasUnsettledDeliveryForThreads"),
+        ),
+      );
+    };
+
+  const listUnsettledThreadIds: OrchestrationEventDeliveryRepositoryShape["listUnsettledThreadIds"] =
+    (consumerName) =>
+      sql<{ readonly threadId: string }>`
+        SELECT DISTINCT thread_id AS "threadId"
+        FROM orchestration_event_deliveries
+        WHERE consumer_name = ${consumerName}
+          AND state IN ('inflight', 'retry', 'dead', 'uncertain')
+        ORDER BY thread_id ASC
+      `.pipe(
+        Effect.map((rows) => rows.map((row) => row.threadId)),
+        Effect.mapError(toPersistenceSqlError("OrchestrationEventDelivery.listUnsettledThreadIds")),
+      );
+
   const listBlockingDeliveries: OrchestrationEventDeliveryRepositoryShape["listBlockingDeliveries"] =
     (input) => {
       const threadFilter =
@@ -382,6 +442,9 @@ const makeRepository = Effect.gen(function* () {
     advanceCursor,
     firstBlockingDelivery,
     firstBlockingDeliveryForThread,
+    firstBlockingDeliveryForThreads,
+    hasUnsettledDeliveryForThreads,
+    listUnsettledThreadIds,
     listBlockingDeliveries,
     listRetryableDeliveries,
     reconcile,

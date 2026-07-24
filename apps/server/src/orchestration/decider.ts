@@ -1422,7 +1422,7 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
     }
 
     case "thread.turn.dispatch-queued": {
-      yield* requireThread({
+      const targetThread = yield* requireThread({
         readModel,
         command,
         threadId: command.threadId,
@@ -1449,6 +1449,10 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           dispatchMode: command.dispatchMode ?? "queue",
           runtimeMode: command.runtimeMode,
           interactionMode: command.interactionMode,
+          // Recompute from the canonical thread at promotion time. Keeping this
+          // out of the deterministic command preserves command-receipt identity
+          // across upgrades while still emitting the environment actually used.
+          envMode: targetThread.envMode,
           ...(command.sourceProposedPlan !== undefined
             ? { sourceProposedPlan: command.sourceProposedPlan }
             : {}),

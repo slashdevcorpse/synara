@@ -16,7 +16,7 @@ layer("076_ReconcileFailedPendingTurnStarts", (it) => {
       const sql = yield* SqlClient.SqlClient;
       yield* runMigrations({ toMigrationInclusive: 75 });
 
-      assert.deepStrictEqual(migrationEntries.at(-1)?.slice(0, 2), [
+      assert.deepStrictEqual(migrationEntries.find(([id]) => id === 76)?.slice(0, 2), [
         76,
         "ReconcileFailedPendingTurnStarts",
       ]);

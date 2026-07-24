@@ -342,6 +342,161 @@ it.layer(BaseTestLayer)("OrchestrationProjectionPipeline", (it) => {
   );
 });
 
+it.layer(Layer.fresh(makeProjectionPipelinePrefixedTestLayer("synara-session-stop-cleanup-")))(
+  "OrchestrationProjectionPipeline",
+  (it) => {
+    it.effect(
+      "clears only the stopped thread pending start live and after turn projection rebuild",
+      () =>
+        Effect.gen(function* () {
+          const eventStore = yield* OrchestrationEventStore;
+          const projectionPipeline = yield* OrchestrationProjectionPipeline;
+          const sql = yield* SqlClient.SqlClient;
+          const appendAndProject = makeAppendAndProject(eventStore, projectionPipeline);
+          const targetThreadId = ThreadId.makeUnsafe("thread-session-stop-cleanup-target");
+          const otherThreadId = ThreadId.makeUnsafe("thread-session-stop-cleanup-other");
+          const concreteTurnId = TurnId.makeUnsafe("turn-session-stop-cleanup-concrete");
+          const concreteMessageId = MessageId.makeUnsafe("message-session-stop-cleanup-concrete");
+          const cancelledMessageId = MessageId.makeUnsafe("message-session-stop-cleanup-cancelled");
+          const otherMessageId = MessageId.makeUnsafe("message-session-stop-cleanup-other");
+
+          yield* appendAndProject({
+            type: "thread.turn-start-requested",
+            eventId: EventId.makeUnsafe("evt-session-stop-cleanup-1"),
+            aggregateKind: "thread",
+            aggregateId: targetThreadId,
+            occurredAt: "2026-07-24T11:00:00.000Z",
+            commandId: CommandId.makeUnsafe("cmd-session-stop-cleanup-1"),
+            causationEventId: null,
+            correlationId: CorrelationId.makeUnsafe("cmd-session-stop-cleanup-1"),
+            metadata: {},
+            payload: {
+              threadId: targetThreadId,
+              messageId: concreteMessageId,
+              runtimeMode: "approval-required",
+              createdAt: "2026-07-24T11:00:00.000Z",
+            },
+          });
+          yield* appendAndProject({
+            type: "thread.session-set",
+            eventId: EventId.makeUnsafe("evt-session-stop-cleanup-2"),
+            aggregateKind: "thread",
+            aggregateId: targetThreadId,
+            occurredAt: "2026-07-24T11:00:01.000Z",
+            commandId: CommandId.makeUnsafe("cmd-session-stop-cleanup-2"),
+            causationEventId: null,
+            correlationId: CorrelationId.makeUnsafe("cmd-session-stop-cleanup-2"),
+            metadata: {},
+            payload: {
+              threadId: targetThreadId,
+              session: {
+                threadId: targetThreadId,
+                status: "running",
+                providerName: "codex",
+                runtimeMode: "approval-required",
+                activeTurnId: concreteTurnId,
+                lastError: null,
+                updatedAt: "2026-07-24T11:00:01.000Z",
+              },
+            },
+          });
+          yield* appendAndProject({
+            type: "thread.turn-start-requested",
+            eventId: EventId.makeUnsafe("evt-session-stop-cleanup-3"),
+            aggregateKind: "thread",
+            aggregateId: targetThreadId,
+            occurredAt: "2026-07-24T11:00:02.000Z",
+            commandId: CommandId.makeUnsafe("cmd-session-stop-cleanup-3"),
+            causationEventId: null,
+            correlationId: CorrelationId.makeUnsafe("cmd-session-stop-cleanup-3"),
+            metadata: {},
+            payload: {
+              threadId: targetThreadId,
+              messageId: cancelledMessageId,
+              runtimeMode: "approval-required",
+              createdAt: "2026-07-24T11:00:02.000Z",
+            },
+          });
+          yield* appendAndProject({
+            type: "thread.turn-start-requested",
+            eventId: EventId.makeUnsafe("evt-session-stop-cleanup-4"),
+            aggregateKind: "thread",
+            aggregateId: otherThreadId,
+            occurredAt: "2026-07-24T11:00:03.000Z",
+            commandId: CommandId.makeUnsafe("cmd-session-stop-cleanup-4"),
+            causationEventId: null,
+            correlationId: CorrelationId.makeUnsafe("cmd-session-stop-cleanup-4"),
+            metadata: {},
+            payload: {
+              threadId: otherThreadId,
+              messageId: otherMessageId,
+              runtimeMode: "approval-required",
+              createdAt: "2026-07-24T11:00:03.000Z",
+            },
+          });
+          yield* appendAndProject({
+            type: "thread.session-stop-requested",
+            eventId: EventId.makeUnsafe("evt-session-stop-cleanup-5"),
+            aggregateKind: "thread",
+            aggregateId: targetThreadId,
+            occurredAt: "2026-07-24T11:00:04.000Z",
+            commandId: CommandId.makeUnsafe("cmd-session-stop-cleanup-5"),
+            causationEventId: null,
+            correlationId: CorrelationId.makeUnsafe("cmd-session-stop-cleanup-5"),
+            metadata: {},
+            payload: {
+              threadId: targetThreadId,
+              createdAt: "2026-07-24T11:00:04.000Z",
+            },
+          });
+
+          const readTurnRows = () =>
+            sql<{
+              readonly threadId: string;
+              readonly turnId: string | null;
+              readonly messageId: string | null;
+              readonly state: string;
+            }>`
+              SELECT
+                thread_id AS "threadId",
+                turn_id AS "turnId",
+                pending_message_id AS "messageId",
+                state
+              FROM projection_turns
+              WHERE thread_id = ${targetThreadId}
+                 OR thread_id = ${otherThreadId}
+              ORDER BY thread_id ASC, turn_id ASC
+            `;
+          const expectedRows = [
+            {
+              threadId: otherThreadId,
+              turnId: null,
+              messageId: otherMessageId,
+              state: "pending",
+            },
+            {
+              threadId: targetThreadId,
+              turnId: concreteTurnId,
+              messageId: concreteMessageId,
+              state: "running",
+            },
+          ];
+
+          assert.deepEqual(yield* readTurnRows(), expectedRows);
+
+          yield* sql`DELETE FROM projection_turns`;
+          yield* sql`
+            DELETE FROM projection_state
+            WHERE projector = ${ORCHESTRATION_PROJECTOR_NAMES.threadTurns}
+          `;
+          yield* projectionPipeline.bootstrap;
+
+          assert.deepEqual(yield* readTurnRows(), expectedRows);
+        }),
+    );
+  },
+);
+
 it.layer(Layer.fresh(makeProjectionPipelinePrefixedTestLayer("synara-message-identity-scope-")))(
   "OrchestrationProjectionPipeline",
   (it) => {

@@ -352,10 +352,11 @@ managedAttachmentsLegacyLayer("managed attachment migration after private migrat
         [74, "ProviderRequestAdmissions"],
         [75, "ProjectionTurnSummaries"],
         [76, "ReconcileFailedPendingTurnStarts"],
+        [77, "BackfillQuarantinedTurnPromotions"],
       ]);
 
       const tracker = yield* trackerRows(sql);
-      assert.deepStrictEqual(tracker.slice(-23), [
+      assert.deepStrictEqual(tracker.slice(-24), [
         { migration_id: 54, name: "DurableProviderCommandDelivery" },
         { migration_id: 55, name: "ManagedAttachments" },
         { migration_id: 56, name: "CommandReceiptFingerprints" },
@@ -379,6 +380,7 @@ managedAttachmentsLegacyLayer("managed attachment migration after private migrat
         { migration_id: 74, name: "ProviderRequestAdmissions" },
         { migration_id: 75, name: "ProjectionTurnSummaries" },
         { migration_id: 76, name: "ReconcileFailedPendingTurnStarts" },
+        { migration_id: 77, name: "BackfillQuarantinedTurnPromotions" },
       ]);
       const preserved = yield* sql<{ readonly count: number }>`
         SELECT COUNT(*) AS count FROM orchestration_consumer_state

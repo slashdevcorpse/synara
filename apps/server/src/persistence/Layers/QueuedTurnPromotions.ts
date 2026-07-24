@@ -39,10 +39,21 @@ const make = Effect.gen(function* () {
         queued_event_sequence, thread_id, message_id, dispatch_mode, state,
         claim_owner, claimed_at, claim_expires_at, attempt_count,
         created_at, updated_at, promoted_at
-      ) VALUES (
+      )
+      SELECT
         ${input.queuedEventSequence}, ${input.threadId}, ${input.messageId},
         ${input.dispatchMode}, 'queued', NULL, NULL, NULL, 0,
         ${input.createdAt}, ${input.createdAt}, NULL
+      WHERE NOT EXISTS (
+        SELECT 1
+        FROM queued_turn_promotions AS cancelled
+        INNER JOIN orchestration_events AS source
+          ON source.sequence = ${input.queuedEventSequence}
+          AND source.command_id =
+            'server:dispatch-queued-turn:' || cancelled.queued_event_sequence
+        WHERE cancelled.thread_id = ${input.threadId}
+          AND cancelled.message_id = ${input.messageId}
+          AND cancelled.state = 'cancelled'
       )
       ON CONFLICT DO UPDATE SET
         queued_event_sequence = excluded.queued_event_sequence,
@@ -55,19 +66,35 @@ const make = Effect.gen(function* () {
         created_at = excluded.created_at,
         updated_at = excluded.updated_at,
         promoted_at = NULL
-      WHERE queued_turn_promotions.state IN ('promoted', 'cancelled')
-        AND excluded.queued_event_sequence > queued_turn_promotions.queued_event_sequence
+      WHERE excluded.queued_event_sequence > queued_turn_promotions.queued_event_sequence
+        AND EXISTS (
+          SELECT 1
+          FROM orchestration_events AS source
+          WHERE source.sequence = excluded.queued_event_sequence
+            AND source.command_id =
+              'server:dispatch-queued-turn:' ||
+              queued_turn_promotions.queued_event_sequence
+        )
     `.pipe(Effect.asVoid, Effect.mapError(toPersistenceSqlError("QueuedTurnPromotion.enqueue")));
 
-  const claimNext: QueuedTurnPromotionRepositoryShape["claimNext"] = (input) =>
-    sql
+  const claimNextForThreadIds = (input: {
+    readonly threadIds: ReadonlyArray<string>;
+    readonly claimOwner: string;
+    readonly claimedAt: string;
+    readonly claimExpiresAt: string;
+  }) => {
+    const threadIds = [...new Set(input.threadIds)];
+    if (threadIds.length === 0) {
+      return Effect.succeed(Option.none<QueuedTurnPromotion>());
+    }
+    return sql
       .withTransaction(
         Effect.gen(function* () {
           yield* sql`
           UPDATE queued_turn_promotions
           SET state = 'queued', claim_owner = NULL, claimed_at = NULL,
               claim_expires_at = NULL, updated_at = ${input.claimedAt}
-          WHERE thread_id = ${input.threadId}
+          WHERE thread_id IN ${sql.in(threadIds)}
             AND state = 'promoting'
             AND (
               claim_expires_at <= ${input.claimedAt}
@@ -77,7 +104,7 @@ const make = Effect.gen(function* () {
           const candidates = yield* sql<{ readonly queuedEventSequence: number }>`
           SELECT queued_event_sequence AS "queuedEventSequence"
           FROM queued_turn_promotions
-          WHERE thread_id = ${input.threadId} AND state = 'queued'
+          WHERE thread_id IN ${sql.in(threadIds)} AND state = 'queued'
           ORDER BY
             CASE dispatch_mode WHEN 'steer' THEN 0 ELSE 1 END ASC,
             CASE WHEN dispatch_mode = 'steer' THEN queued_event_sequence END DESC,
@@ -97,7 +124,19 @@ const make = Effect.gen(function* () {
           return Option.fromNullishOr(rows[0]);
         }),
       )
-      .pipe(Effect.mapError(toPersistenceSqlError("QueuedTurnPromotion.claimNext")));
+      .pipe(Effect.mapError(toPersistenceSqlError("QueuedTurnPromotion.claimNextForThreads")));
+  };
+
+  const claimNext: QueuedTurnPromotionRepositoryShape["claimNext"] = (input) =>
+    claimNextForThreadIds({
+      threadIds: [input.threadId],
+      claimOwner: input.claimOwner,
+      claimedAt: input.claimedAt,
+      claimExpiresAt: input.claimExpiresAt,
+    });
+
+  const claimNextForThreads: QueuedTurnPromotionRepositoryShape["claimNextForThreads"] =
+    claimNextForThreadIds;
 
   const markPromoted: QueuedTurnPromotionRepositoryShape["markPromoted"] = (input) =>
     sql<{ readonly sequence: number }>`
@@ -126,35 +165,45 @@ const make = Effect.gen(function* () {
       Effect.mapError(toPersistenceSqlError("QueuedTurnPromotion.releaseClaim")),
     );
 
-  const cancelMessage: QueuedTurnPromotionRepositoryShape["cancelMessage"] = (input) =>
-    sql<{ readonly sequence: number }>`
+  const cancelMessage: QueuedTurnPromotionRepositoryShape["cancelMessage"] = (input) => {
+    const sequenceFence =
+      input.throughEventSequence === undefined
+        ? sql``
+        : sql`AND queued_event_sequence <= ${input.throughEventSequence}`;
+    return sql<{ readonly sequence: number }>`
       UPDATE queued_turn_promotions
       SET state = 'cancelled', claim_owner = NULL, claimed_at = NULL,
           claim_expires_at = NULL, updated_at = ${input.updatedAt}
       WHERE thread_id = ${input.threadId} AND message_id = ${input.messageId}
-        AND state = 'queued'
+        AND state IN ('queued', 'promoting', 'promoted')
+        ${sequenceFence}
       RETURNING queued_event_sequence AS sequence
     `.pipe(
-      Effect.map((rows) => rows.length === 1),
+      Effect.map((rows) => rows.length > 0),
       Effect.mapError(toPersistenceSqlError("QueuedTurnPromotion.cancelMessage")),
     );
+  };
 
-  const cancelThread: QueuedTurnPromotionRepositoryShape["cancelThread"] = (input) =>
-    // Cancel BOTH 'queued' and 'promoting' rows. A row claimed for a drain sits
-    // in 'promoting'; if we only cancelled 'queued', a thread deletion racing an
-    // in-flight drain could cancel nothing, and the drain's error path would
-    // later `releaseClaim` the row back to 'queued', resurrecting it. Cancelling
-    // the 'promoting' row means the later `releaseClaim` (WHERE state='promoting')
-    // no longer matches, so the cancelled turn stays dead.
-    sql`
+  const cancelThread: QueuedTurnPromotionRepositoryShape["cancelThread"] = (input) => {
+    const sequenceFence =
+      input.throughEventSequence === undefined
+        ? sql``
+        : sql`AND queued_event_sequence <= ${input.throughEventSequence}`;
+    // Cancel queued, claimed, and handed-off rows. A promoted source remains
+    // the durable lineage for its deterministic derived start until provider
+    // execution, so stop/edit barriers must be able to tombstone it too.
+    return sql`
       UPDATE queued_turn_promotions
       SET state = 'cancelled', claim_owner = NULL, claimed_at = NULL,
           claim_expires_at = NULL, updated_at = ${input.updatedAt}
-      WHERE thread_id = ${input.threadId} AND state IN ('queued', 'promoting')
+      WHERE thread_id = ${input.threadId}
+        AND state IN ('queued', 'promoting', 'promoted')
+        ${sequenceFence}
     `.pipe(
       Effect.asVoid,
       Effect.mapError(toPersistenceSqlError("QueuedTurnPromotion.cancelThread")),
     );
+  };
 
   const hasPendingMessage: QueuedTurnPromotionRepositoryShape["hasPendingMessage"] = (input) =>
     sql<{ readonly count: number }>`
@@ -176,16 +225,28 @@ const make = Effect.gen(function* () {
     Effect.mapError(toPersistenceSqlError("QueuedTurnPromotion.listPendingThreadIds")),
   );
 
+  const listCancellableThreadIds = sql<{ readonly threadId: string }>`
+    SELECT DISTINCT thread_id AS "threadId"
+    FROM queued_turn_promotions
+    WHERE state IN ('queued', 'promoting', 'promoted')
+    ORDER BY thread_id ASC
+  `.pipe(
+    Effect.map((rows) => rows.map((row) => row.threadId)),
+    Effect.mapError(toPersistenceSqlError("QueuedTurnPromotion.listCancellableThreadIds")),
+  );
+
   return {
     getBySequence,
     enqueue,
     claimNext,
+    claimNextForThreads,
     markPromoted,
     releaseClaim,
     cancelMessage,
     cancelThread,
     hasPendingMessage,
     listPendingThreadIds,
+    listCancellableThreadIds,
   } satisfies QueuedTurnPromotionRepositoryShape;
 });
 

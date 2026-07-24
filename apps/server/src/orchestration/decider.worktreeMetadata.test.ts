@@ -123,6 +123,32 @@ describe("decider worktree metadata", () => {
     });
   });
 
+  it("recomputes worktree environment mode for a promoted queued turn", async () => {
+    const now = new Date().toISOString();
+    const readModel = await createWorktreeThreadReadModel(now);
+    const result = await Effect.runPromise(
+      decideOrchestrationCommand({
+        command: {
+          type: "thread.turn.dispatch-queued",
+          commandId: CommandId.makeUnsafe("server:dispatch-queued-turn:123"),
+          threadId: THREAD_ID,
+          messageId: MessageId.makeUnsafe("message-promoted-worktree-env"),
+          dispatchMode: "queue",
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          createdAt: now,
+        },
+        readModel,
+      }),
+    );
+    const event = Array.isArray(result) ? result[0] : result;
+    expect(event?.type).toBe("thread.turn-start-requested");
+    if (!event || event.type !== "thread.turn-start-requested") {
+      return;
+    }
+    expect(event.payload.envMode).toBe("worktree");
+  });
+
   it("derives associated worktree metadata during thread.create when only branch and worktreePath are provided", async () => {
     const now = new Date().toISOString();
     const readModel = await createProjectReadModel(now);
