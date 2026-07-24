@@ -13,6 +13,62 @@ const layer = it.layer(
 );
 
 layer("OrchestrationEventStore", (it) => {
+  it.effect("keeps the high-water sequence monotonic after retained events are deleted", () =>
+    Effect.gen(function* () {
+      const eventStore = yield* OrchestrationEventStore;
+      const sql = yield* SqlClient.SqlClient;
+      const now = new Date().toISOString();
+
+      const first = yield* eventStore.append({
+        type: "project.created",
+        eventId: EventId.makeUnsafe("evt-store-high-water-first"),
+        aggregateKind: "project",
+        aggregateId: ProjectId.makeUnsafe("project-high-water-first"),
+        occurredAt: now,
+        commandId: CommandId.makeUnsafe("cmd-store-high-water-first"),
+        causationEventId: null,
+        correlationId: CommandId.makeUnsafe("cmd-store-high-water-first"),
+        metadata: {},
+        payload: {
+          projectId: ProjectId.makeUnsafe("project-high-water-first"),
+          title: "High-water first",
+          workspaceRoot: "/tmp/project-high-water-first",
+          defaultModelSelection: null,
+          scripts: [],
+          createdAt: now,
+          updatedAt: now,
+        },
+      });
+
+      yield* sql`DELETE FROM orchestration_events WHERE sequence = ${first.sequence}`;
+      assert.equal(yield* eventStore.getHighWaterSequence(), first.sequence);
+
+      const second = yield* eventStore.append({
+        type: "project.created",
+        eventId: EventId.makeUnsafe("evt-store-high-water-second"),
+        aggregateKind: "project",
+        aggregateId: ProjectId.makeUnsafe("project-high-water-second"),
+        occurredAt: now,
+        commandId: CommandId.makeUnsafe("cmd-store-high-water-second"),
+        causationEventId: null,
+        correlationId: CommandId.makeUnsafe("cmd-store-high-water-second"),
+        metadata: {},
+        payload: {
+          projectId: ProjectId.makeUnsafe("project-high-water-second"),
+          title: "High-water second",
+          workspaceRoot: "/tmp/project-high-water-second",
+          defaultModelSelection: null,
+          scripts: [],
+          createdAt: now,
+          updatedAt: now,
+        },
+      });
+
+      assert.equal(second.sequence, first.sequence + 1);
+      assert.equal(yield* eventStore.getHighWaterSequence(), second.sequence);
+    }),
+  );
+
   it.effect("stores json columns as strings and replays decoded events", () =>
     Effect.gen(function* () {
       const eventStore = yield* OrchestrationEventStore;

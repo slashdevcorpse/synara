@@ -402,12 +402,23 @@ const makeEventStore = Effect.gen(function* () {
       `,
   });
 
+  // Profile retention can delete the newest durable rows. SQLite's AUTOINCREMENT
+  // sequence remains the monotonic committed fence; MAX(sequence) can move backward
+  // and strand projections ahead of the apparent event-store high water.
   const readHighWaterSequenceRow = SqlSchema.findOne({
     Request: Schema.Void,
     Result: HighWaterSequenceRowSchema,
     execute: () =>
       sql`
-        SELECT COALESCE(MAX(sequence), 0) AS "highWaterSequence"
+        SELECT COALESCE(
+          (
+            SELECT seq
+            FROM sqlite_sequence
+            WHERE name = 'orchestration_events'
+          ),
+          MAX(sequence),
+          0
+        ) AS "highWaterSequence"
         FROM orchestration_events
       `,
   });
