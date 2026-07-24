@@ -4283,7 +4283,7 @@ export function makeProviderHealthLive(
                   ...(commandUpdate.pathPrepend ? { pathPrepend: commandUpdate.pathPrepend } : {}),
                   teardownFailureRef,
                 }).pipe(Effect.scoped);
-                const commandResults: CommandResult[] = [commandResult];
+                const commandResults = [commandResult];
                 if (commandResult.exitCode !== 0) {
                   return {
                     _tag: "NonZeroExit",
