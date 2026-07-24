@@ -829,22 +829,44 @@ layer("077_BackfillQuarantinedTurnPromotions", (it) => {
           )
         ORDER BY event_sequence ASC
       `;
-      assert.deepStrictEqual(
-        handledDeliveries,
-        [
-          [orderedStartOne, orderedThread],
-          [orderedStartTwo, orderedThread],
-          [reconciledStart, reconciledThread],
-          [promotedStart, promotedThread],
-          [replacingStart, replacingThread],
-          [cancelledStart, cancelledThread],
-        ].map(([sequence, threadId]) => ({
-          sequence,
-          threadId,
+      assert.deepStrictEqual(handledDeliveries, [
+        {
+          sequence: orderedStartOne,
+          threadId: orderedThread,
           state: "succeeded",
           attemptCount: 1,
-        })),
-      );
+        },
+        {
+          sequence: orderedStartTwo,
+          threadId: orderedThread,
+          state: "succeeded",
+          attemptCount: 1,
+        },
+        {
+          sequence: reconciledStart,
+          threadId: reconciledThread,
+          state: "succeeded",
+          attemptCount: 1,
+        },
+        {
+          sequence: promotedStart,
+          threadId: promotedThread,
+          state: "succeeded",
+          attemptCount: 1,
+        },
+        {
+          sequence: replacingStart,
+          threadId: replacingThread,
+          state: "succeeded",
+          attemptCount: 1,
+        },
+        {
+          sequence: cancelledStart,
+          threadId: cancelledThread,
+          state: "succeeded",
+          attemptCount: 1,
+        },
+      ]);
 
       yield* BackfillQuarantinedTurnPromotionsMigration;
       const recoveredAfterDirectRerun = yield* sql<{

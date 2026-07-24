@@ -752,6 +752,14 @@ describe("ProviderCommandReactor", () => {
     return event as Extract<OrchestrationEvent, { readonly type: TType }>;
   }
 
+  function requireHarnessArrayItem<T>(items: ReadonlyArray<T>, index: number, label: string): T {
+    const item = items[index];
+    if (item === undefined) {
+      throw new Error(`Missing ${label} at index ${index}.`);
+    }
+    return item;
+  }
+
   type HarnessQueuedTurnSource = Extract<
     OrchestrationEvent,
     { readonly type: "thread.turn-queued" | "thread.turn-start-requested" }
@@ -813,7 +821,6 @@ describe("ProviderCommandReactor", () => {
         dispatchMode: source.payload.dispatchMode,
         runtimeMode: source.payload.runtimeMode,
         interactionMode: source.payload.interactionMode,
-        envMode: source.payload.envMode,
         ...(source.payload.sourceProposedPlan !== undefined
           ? { sourceProposedPlan: source.payload.sourceProposedPlan }
           : {}),
@@ -1205,6 +1212,7 @@ describe("ProviderCommandReactor", () => {
         dispatchMode: "steer" as const,
       },
     ];
+    const firstStart = requireHarnessArrayItem(starts, 0, "first quarantined start");
     let successfulTurnIndex = 0;
     harness.sendTurn.mockImplementation(() => {
       successfulTurnIndex += 1;
@@ -1238,15 +1246,15 @@ describe("ProviderCommandReactor", () => {
     await Effect.runPromise(
       harness.engine.dispatch({
         type: "thread.turn.start",
-        commandId: CommandId.makeUnsafe(starts[0].commandId),
+        commandId: CommandId.makeUnsafe(firstStart.commandId),
         threadId,
         message: {
-          messageId: asMessageId(starts[0].messageId),
+          messageId: asMessageId(firstStart.messageId),
           role: "user",
-          text: starts[0].text,
+          text: firstStart.text,
           attachments: [],
         },
-        dispatchMode: starts[0].dispatchMode,
+        dispatchMode: firstStart.dispatchMode,
         runtimeMode: "approval-required",
         interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
         createdAt: now,
@@ -1292,6 +1300,16 @@ describe("ProviderCommandReactor", () => {
         commandId: start.commandId,
       }),
     );
+    const firstOriginalStart = requireHarnessArrayItem(
+      originalStarts,
+      0,
+      "first original quarantined start",
+    );
+    const lastOriginalStart = requireHarnessArrayItem(
+      originalStarts,
+      starts.length - 1,
+      "last original quarantined start",
+    );
     expect(harness.sendTurn).toHaveBeenCalledTimes(1);
 
     for (const event of originalStarts.slice(1)) {
@@ -1322,7 +1340,7 @@ describe("ProviderCommandReactor", () => {
       harness.deliveryRepository.getConsumerState(PROVIDER_COMMAND_REACTOR_CONSUMER),
     );
     expect(consumerState.pipe(Option.getOrThrow).lastAckedSequence).toBeGreaterThanOrEqual(
-      originalStarts[2].sequence,
+      lastOriginalStart.sequence,
     );
 
     const blocker = await Effect.runPromise(
@@ -1342,16 +1360,16 @@ describe("ProviderCommandReactor", () => {
       }),
     );
     expect(reconciled).toMatchObject({
-      eventSequence: originalStarts[0].sequence,
+      eventSequence: firstOriginalStart.sequence,
       outcome: "safe_retry",
       state: "succeeded",
     });
 
-    for (let index = 0; index < starts.length; index += 1) {
+    for (const [index, start] of starts.entries()) {
       await waitFor(() => harness.sendTurn.mock.calls.length === index + 2);
       expect(harness.sendTurn.mock.calls[index + 1]?.[0]).toMatchObject({
         threadId,
-        input: starts[index].text,
+        input: start.text,
       });
       if (index < starts.length - 1) {
         const turnId = asTurnId(`turn-quarantined-fifo-${index + 1}`);
@@ -1376,15 +1394,20 @@ describe("ProviderCommandReactor", () => {
     await harness.drain();
 
     const recoveredEvents = await readHarnessEvents(harness);
-    for (const [index, sourceEvent] of originalStarts.entries()) {
+    for (const [index, start] of starts.entries()) {
+      const sourceEvent = requireHarnessArrayItem(
+        originalStarts,
+        index,
+        "original quarantined start",
+      );
       const derived = requireHarnessEvent(recoveredEvents, {
         type: "thread.turn-start-requested",
         commandId: `server:dispatch-queued-turn:${sourceEvent.sequence}`,
       });
       expect(derived.payload).toMatchObject({
         threadId,
-        messageId: asMessageId(starts[index].messageId),
-        dispatchMode: starts[index].dispatchMode,
+        messageId: asMessageId(start.messageId),
+        dispatchMode: start.dispatchMode,
         envMode: "worktree",
       });
       const promotion = await Effect.runPromise(
@@ -1394,14 +1417,12 @@ describe("ProviderCommandReactor", () => {
     }
 
     expect(harness.sendTurn.mock.calls.map(([request]) => request.input)).toEqual([
-      starts[0].text,
-      starts[0].text,
-      starts[1].text,
-      starts[2].text,
+      firstStart.text,
+      ...starts.map((start) => start.text),
     ]);
     const repeatedReconciliation = await Effect.runPromise(
       harness.reactor.reconcileDelivery({
-        eventSequence: originalStarts[0].sequence,
+        eventSequence: firstOriginalStart.sequence,
         threadId,
         expectedState: "uncertain",
         outcome: "safe_retry",
@@ -2522,7 +2543,6 @@ describe("ProviderCommandReactor", () => {
         dispatchMode: queuedOne.payload.dispatchMode,
         runtimeMode: queuedOne.payload.runtimeMode,
         interactionMode: queuedOne.payload.interactionMode,
-        envMode: queuedOne.payload.envMode,
         ...(queuedOne.payload.sourceProposedPlan !== undefined
           ? { sourceProposedPlan: queuedOne.payload.sourceProposedPlan }
           : {}),

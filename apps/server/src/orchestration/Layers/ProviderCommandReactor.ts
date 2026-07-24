@@ -36,6 +36,7 @@ import {
   Option,
   Schema,
   Semaphore,
+  type Scope,
   Stream,
 } from "effect";
 import {
@@ -356,7 +357,7 @@ const make = Effect.gen(function* () {
   const deliverySourceLock = yield* Semaphore.make(1);
   let reconcileDeliveryRuntime: ProviderCommandReactorShape["reconcileDelivery"] | undefined;
   let processCommittedProviderIntentAtSequence:
-    | ((eventSequence: number) => Effect.Effect<void>)
+    | ((eventSequence: number) => Effect.Effect<void, never, Scope.Scope>)
     | undefined;
 
   const hasHandledTurnStartRecently = (key: string) =>
@@ -678,8 +679,10 @@ const make = Effect.gen(function* () {
 
     return {
       sessionThreadId,
-      memberThreadIds: [...memberThreadIds].map(ThreadId.makeUnsafe),
-      candidateMemberThreadIds: [...candidateMemberThreadIds].map(ThreadId.makeUnsafe),
+      memberThreadIds: [...memberThreadIds].map((threadId) => ThreadId.makeUnsafe(threadId)),
+      candidateMemberThreadIds: [...candidateMemberThreadIds].map((threadId) =>
+        ThreadId.makeUnsafe(threadId),
+      ),
     };
   });
 
@@ -2304,7 +2307,10 @@ const make = Effect.gen(function* () {
   // Promote the next queued message only after the active provider turn settles.
   // Every queue sharing one provider session competes for the same claim and
   // in-memory guard; parent/child threads can never promote concurrently.
-  const drainQueuedTurnsForThread = Effect.fnUntraced(function* (
+  const drainQueuedTurnsForThread: (
+    threadId: ThreadId,
+    options?: DrainQueuedTurnsOptions,
+  ) => Effect.Effect<void, unknown, Scope.Scope> = Effect.fnUntraced(function* (
     threadId: ThreadId,
     options?: DrainQueuedTurnsOptions,
   ) {
@@ -3613,7 +3619,9 @@ const make = Effect.gen(function* () {
       return event;
     });
 
-    processCommittedProviderIntentAtSequence = (eventSequence) =>
+    processCommittedProviderIntentAtSequence = (
+      eventSequence: number,
+    ): Effect.Effect<void, never, Scope.Scope> =>
       readProviderIntentEvent(eventSequence).pipe(
         Effect.flatMap(processOrderedEvent),
         Effect.orDie,
@@ -4034,7 +4042,9 @@ const make = Effect.gen(function* () {
       PROVIDER_COMMAND_REACTOR_CONSUMER,
     );
     yield* deliverySourceLock.withPermits(1)(
-      Effect.forEach(retryableDeliveries, resumeRetryableDelivery, { discard: true }),
+      Effect.forEach(retryableDeliveries, (delivery) => resumeRetryableDelivery(delivery), {
+        discard: true,
+      }),
     );
 
     const processOrderedEventSerially = (event: OrchestrationEvent) =>
