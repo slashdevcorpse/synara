@@ -3719,14 +3719,15 @@ describe("ProviderCommandReactor", () => {
     const messageId = asMessageId("user-message-provider-start-validation-fails");
     const expectedDetail =
       'Provider validation failed in ProviderService.startSession: Expected a value with a length of at least 1, got "" at ["providerOptions"]["codex"]["binaryPath"]';
-    harness.startSession.mockImplementationOnce(() =>
-      Effect.fail(
-        new ProviderValidationError({
-          operation: "ProviderService.startSession",
-          issue:
-            'Expected a value with a length of at least 1, got "" at ["providerOptions"]["codex"]["binaryPath"]',
-        }),
-      ),
+    harness.startSession.mockImplementationOnce(
+      () =>
+        Effect.fail(
+          new ProviderValidationError({
+            operation: "ProviderService.startSession",
+            issue:
+              'Expected a value with a length of at least 1, got "" at ["providerOptions"]["codex"]["binaryPath"]',
+          }),
+        ) as never,
     );
 
     await Effect.runPromise(

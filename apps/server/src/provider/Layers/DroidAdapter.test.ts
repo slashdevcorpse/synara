@@ -1,6 +1,6 @@
 import * as NodePath from "node:path";
 
-import { TurnId } from "@synara/contracts";
+import { ThreadId, TurnId } from "@synara/contracts";
 import * as EffectAcpErrors from "effect-acp/errors";
 import { describe, expect, it } from "vitest";
 import { SYNARA_HARNESS_POLICY_MARKER } from "../../agentGateway/harnessPolicy.ts";
@@ -49,7 +49,7 @@ describe("resolveDroidSessionCwd", () => {
 describe("mapDroidAcpSessionStartError", () => {
   it("turns ACP auth_required into actionable, non-interactive sign-in guidance", () => {
     const mapped = mapDroidAcpSessionStartError(
-      "thread-auth-required",
+      ThreadId.makeUnsafe("thread-auth-required"),
       new EffectAcpErrors.AcpRequestError({
         code: -32_000,
         errorMessage: "Authentication required",

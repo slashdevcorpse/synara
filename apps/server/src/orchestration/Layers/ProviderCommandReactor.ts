@@ -161,11 +161,12 @@ function toNonEmptyProviderInput(value: string | undefined): string | undefined 
   return normalized && normalized.length > 0 ? normalized : undefined;
 }
 
-function providerFailureDisplayDetail(cause: Cause.Cause<ProviderServiceError>): string {
+function providerFailureDisplayDetail(cause: Cause.Cause<unknown>): string {
   const diagnosticDetail = Cause.pretty(cause);
   return Option.match(Cause.findErrorOption(cause), {
     onNone: () => diagnosticDetail,
-    onSome: (error) => error.message.trim() || diagnosticDetail,
+    onSome: (error) =>
+      error instanceof Error && error.message.trim() ? error.message.trim() : diagnosticDetail,
   });
 }
 
