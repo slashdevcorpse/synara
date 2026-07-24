@@ -30,6 +30,10 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { type MouseEvent, type ReactNode, useCallback, useMemo, useState } from "react";
 
 import type { AppSettings, AppSettingsBinding } from "~/appSettings";
+import {
+  PROVIDER_STATUS_FOREGROUND_REFRESH_MIN_INTERVAL_MS,
+  useProviderStatusRefresh,
+} from "~/hooks/useProviderStatusRefresh";
 import { CentralIcon } from "~/lib/central-icons";
 import { DownloadIcon, ExternalLinkIcon, Loader2Icon } from "~/lib/icons";
 import {
@@ -753,6 +757,11 @@ export function ProvidersSettingsPanel({
   const queryClient = useQueryClient();
   const serverConfigQuery = useQuery(serverConfigQueryOptions());
   const serverSettingsQuery = useQuery(serverSettingsQueryOptions());
+  useProviderStatusRefresh({
+    enabled: active,
+    initialDelayMs: 0,
+    minIntervalMs: PROVIDER_STATUS_FOREGROUND_REFRESH_MIN_INTERVAL_MS,
+  });
   const [openInstallProviders, setOpenInstallProviders] = useState<Record<ProviderKind, boolean>>(
     () => createProviderInstallDisclosureState(settings),
   );
