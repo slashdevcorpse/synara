@@ -66,7 +66,7 @@ jobs:
           [[ "$DRAFT_ID" =~ ^[1-9][0-9]*$ ]]
 
       - name: Checkout exact admitted source
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ inputs.expected_source_sha }}
           fetch-depth: 1
@@ -120,7 +120,7 @@ jobs:
       max_total_bytes: ${{ steps.budget.outputs.max_total_bytes }}
     steps:
       - name: Checkout exact workflow commit
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ inputs.expected_source_sha }}
           fetch-depth: 0
@@ -303,7 +303,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Checkout exact planned source
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ needs.preflight.outputs.source_commit }}
           fetch-depth: 0
@@ -590,7 +590,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Checkout exact planned source
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ needs.preflight.outputs.source_commit }}
           fetch-depth: 0
@@ -766,7 +766,7 @@ jobs:
       contents: write
     steps:
       - name: Checkout exact source
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ needs.preflight.outputs.source_commit }}
           fetch-depth: 0
