@@ -79,6 +79,12 @@ export type RuntimeThreadState = typeof RuntimeThreadState.Type;
 const RuntimeTurnState = Schema.Literals(["completed", "failed", "interrupted", "cancelled"]);
 export type RuntimeTurnState = typeof RuntimeTurnState.Type;
 
+export const ProviderCompatibilityFailureReason = Schema.Literal(
+  "opencode_storage_schema_incompatible",
+);
+export type ProviderCompatibilityFailureReason =
+  typeof ProviderCompatibilityFailureReason.Type;
+
 const RuntimeTaskStatus = Schema.Literals(["pending", "inProgress", "completed"]);
 export type RuntimeTaskStatus = typeof RuntimeTaskStatus.Type;
 
@@ -373,6 +379,7 @@ export type TurnStartedPayload = typeof TurnStartedPayload.Type;
 
 const TurnCompletedPayload = Schema.Struct({
   state: RuntimeTurnState,
+  failureReason: Schema.optional(ProviderCompatibilityFailureReason),
   stopReason: Schema.optional(Schema.NullOr(TrimmedNonEmptyStringSchema)),
   usage: Schema.optional(Schema.Unknown),
   modelUsage: Schema.optional(UnknownRecordSchema),
@@ -384,6 +391,7 @@ export type TurnCompletedPayload = typeof TurnCompletedPayload.Type;
 
 const TurnAbortedPayload = Schema.Struct({
   reason: TrimmedNonEmptyStringSchema,
+  failureReason: Schema.optional(ProviderCompatibilityFailureReason),
 });
 export type TurnAbortedPayload = typeof TurnAbortedPayload.Type;
 
@@ -718,6 +726,7 @@ export type RuntimeWarningPayload = typeof RuntimeWarningPayload.Type;
 const RuntimeErrorPayload = Schema.Struct({
   message: TrimmedNonEmptyStringSchema,
   class: Schema.optional(RuntimeErrorClass),
+  reason: Schema.optional(ProviderCompatibilityFailureReason),
   detail: Schema.optional(Schema.Unknown),
 });
 export type RuntimeErrorPayload = typeof RuntimeErrorPayload.Type;

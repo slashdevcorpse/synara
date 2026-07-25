@@ -60,6 +60,7 @@ import {
 import { CheckpointStore } from "../../checkpointing/Services/CheckpointStore.ts";
 import { GitCore } from "../../git/Services/GitCore.ts";
 import {
+  OPENCODE_STORAGE_SCHEMA_INCOMPATIBLE_REASON,
   ProviderAdapterRequestError,
   ProviderAdapterValidationError,
   ProviderServiceError,
@@ -145,6 +146,7 @@ function classifyProviderAttemptOutcome(exit: Exit.Exit<void, unknown>): Provide
     case "ProviderAdapterValidationError":
     case "ProviderAdapterSessionNotFoundError":
     case "ProviderAdapterSessionClosedError":
+    case "ProviderAdapterCompatibilityError":
     case "ProviderValidationError":
     case "ProviderUnsupportedError":
     case "ProviderSessionNotFoundError":
@@ -760,6 +762,22 @@ const make = Effect.gen(function* () {
           threadId: memberThreadId,
           updatedAt: input.updatedAt,
           throughEventSequence: input.throughEventSequence,
+        }),
+      { discard: true },
+    );
+  });
+
+  const cancelAllProviderSessionPromotions = Effect.fnUntraced(function* (input: {
+    readonly scope: ProviderSessionThreadScope;
+    readonly updatedAt: string;
+  }) {
+    const memberThreadIds = yield* listCancellableProviderSessionThreadIds(input.scope);
+    yield* Effect.forEach(
+      memberThreadIds,
+      (memberThreadId) =>
+        queuedTurnPromotions.cancelThread({
+          threadId: memberThreadId,
+          updatedAt: input.updatedAt,
         }),
       { discard: true },
     );
@@ -2554,6 +2572,17 @@ const make = Effect.gen(function* () {
     observePendingContextBootstrapTerminalEvent(event);
     const scope = yield* resolveProviderSessionThreadScope(event.threadId);
     const { sessionThreadId } = scope;
+    if (
+      event.provider === "opencode" &&
+      event.payload.failureReason === OPENCODE_STORAGE_SCHEMA_INCOMPATIBLE_REASON
+    ) {
+      pendingQueuedDispatchBySessionThread.delete(sessionThreadId);
+      yield* cancelAllProviderSessionPromotions({
+        scope,
+        updatedAt: event.createdAt,
+      });
+      return;
+    }
     const reservation = pendingQueuedDispatchBySessionThread.get(sessionThreadId);
     if (reservation) {
       if (event.turnId === undefined) {

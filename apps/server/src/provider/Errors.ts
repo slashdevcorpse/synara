@@ -2,6 +2,11 @@ import { Schema } from "effect";
 
 import type { CheckpointServiceError } from "../checkpointing/Errors.ts";
 
+export const OPENCODE_STORAGE_SCHEMA_INCOMPATIBLE_REASON =
+  "opencode_storage_schema_incompatible" as const;
+export type ProviderAdapterCompatibilityReason =
+  typeof OPENCODE_STORAGE_SCHEMA_INCOMPATIBLE_REASON;
+
 /**
  * ProviderAdapterValidationError - Invalid adapter API input.
  */
@@ -65,6 +70,27 @@ export class ProviderAdapterRequestError extends Schema.TaggedErrorClass<Provide
 ) {
   override get message(): string {
     return `Provider adapter request failed (${this.provider}) for ${this.method}: ${this.detail}`;
+  }
+}
+
+/**
+ * ProviderAdapterCompatibilityError - A narrow provider/runtime incompatibility
+ * that is terminal for the current delivery and runtime generation.
+ */
+export class ProviderAdapterCompatibilityError extends Schema.TaggedErrorClass<ProviderAdapterCompatibilityError>()(
+  "ProviderAdapterCompatibilityError",
+  {
+    provider: Schema.String,
+    method: Schema.String,
+    reason: Schema.Literal(OPENCODE_STORAGE_SCHEMA_INCOMPATIBLE_REASON),
+    lifecycleStage: Schema.Literal("first_prompt"),
+    retryable: Schema.Literal(false),
+    detail: Schema.String,
+    cause: Schema.optional(Schema.Defect),
+  },
+) {
+  override get message(): string {
+    return `Provider compatibility failure (${this.provider}) for ${this.method}: ${this.detail}`;
   }
 }
 
@@ -151,6 +177,7 @@ export type ProviderAdapterError =
   | ProviderAdapterValidationError
   | ProviderAdapterSessionNotFoundError
   | ProviderAdapterSessionClosedError
+  | ProviderAdapterCompatibilityError
   | ProviderAdapterRequestError
   | ProviderAdapterProcessError;
 

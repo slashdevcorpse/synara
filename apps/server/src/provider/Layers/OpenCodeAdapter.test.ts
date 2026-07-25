@@ -5,7 +5,10 @@ import { Deferred, Effect, Exit, Fiber, Layer, Result, Scope, Stream } from "eff
 import { describe, it, expect, vi } from "vitest";
 
 import { ServerConfig } from "../../config.ts";
-import { ProviderAdapterRequestError } from "../Errors.ts";
+import {
+  ProviderAdapterCompatibilityError,
+  ProviderAdapterRequestError,
+} from "../Errors.ts";
 import {
   findProviderProcessExitUnprovenError,
   ProviderProcessExitUnprovenError,
@@ -45,6 +48,7 @@ function createMockOpenCodeRuntime(options?: {
   readonly events?: AsyncIterable<unknown>;
   readonly prompt?: (input: Record<string, unknown>) => Promise<unknown>;
   readonly promptAsync?: (input: Record<string, unknown>) => Promise<unknown>;
+  readonly sessionGet?: (input: { sessionID: string }) => Promise<unknown>;
   readonly commandList?: () => Promise<{
     data?: ReadonlyArray<{ name: string; description?: string }>;
   }>;
@@ -69,6 +73,7 @@ function createMockOpenCodeRuntime(options?: {
   const createCalls: Array<Record<string, unknown>> = [];
   const updateCalls: Array<Record<string, unknown>> = [];
   const forkCalls: Array<{ sessionID: string }> = [];
+  const getCalls: Array<{ sessionID: string }> = [];
   const permissionReplyCalls: Array<Record<string, unknown>> = [];
   const promptCalls: Array<Record<string, unknown>> = [];
   const lifecycleEvents: Array<string> = [];
@@ -116,7 +121,19 @@ function createMockOpenCodeRuntime(options?: {
         return { data: null };
       },
       messages: options?.messages ?? (async () => ({ data: [] })),
-      get: async () => ({ data: { directory: process.cwd(), ...(options?.session ?? {}) } }),
+      get: async (input: { sessionID: string }) => {
+        getCalls.push(input);
+        if (options?.sessionGet) {
+          return options.sessionGet(input);
+        }
+        return {
+          data: {
+            id: input.sessionID,
+            directory: process.cwd(),
+            ...(options?.session ?? {}),
+          },
+        };
+      },
       revert: async () => ({ data: null }),
       summarize: async () => ({ data: null }),
       fork: async (input: { sessionID: string }) => {
@@ -243,6 +260,7 @@ function createMockOpenCodeRuntime(options?: {
     createCalls,
     updateCalls,
     forkCalls,
+    getCalls,
     permissionReplyCalls,
     promptCalls,
     lifecycleEvents,
@@ -1155,6 +1173,44 @@ describe("OpenCodeAdapter runtime lifecycle", () => {
     expect(gateway.revoked).toEqual(["gateway-token-1", "gateway-token-2"]);
   });
 
+  it("isolates managed OpenCode sessions even when no gateway token is available", async () => {
+    const runtime = createMockOpenCodeRuntime();
+    const firstThread = asThreadId("thread-isolated-opencode-a");
+    const secondThread = asThreadId("thread-isolated-opencode-b");
+
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const adapter = yield* OpenCodeAdapter;
+        for (const threadId of [firstThread, secondThread]) {
+          yield* adapter.startSession({
+            provider: "opencode",
+            threadId,
+            runtimeMode: "full-access",
+            cwd: "/same/repo",
+          });
+        }
+        yield* adapter.stopSession(firstThread);
+        yield* adapter.stopSession(secondThread);
+      }).pipe(
+        Effect.provide(
+          makeOpenCodeAdapterLive({ runtime: runtime.runtime }).pipe(
+            Layer.provideMerge(
+              ServerConfig.layerTest(process.cwd(), { prefix: "opencode-adapter-test-" }),
+            ),
+            Layer.provideMerge(NodeServices.layer),
+          ),
+        ),
+      ),
+    );
+
+    expect(runtime.connectCalls).toHaveLength(2);
+    expect(runtime.connectCalls[0]?.poolIsolationKey).toBeTruthy();
+    expect(runtime.connectCalls[1]?.poolIsolationKey).toBeTruthy();
+    expect(runtime.connectCalls[0]?.poolIsolationKey).not.toBe(
+      runtime.connectCalls[1]?.poolIsolationKey,
+    );
+  });
+
   it("keeps shared external OpenCode servers identity-only and never installs a token", async () => {
     const runtime = createMockOpenCodeRuntime();
     const gateway = makeGatewayCredentials();
@@ -1500,6 +1556,104 @@ describe("OpenCodeAdapter runtime lifecycle", () => {
         permission: [{ permission: "*", pattern: "*", action: "allow" }],
       },
     ]);
+  });
+
+  it("creates a fresh session only for a structured session.get 404", async () => {
+    const runtime = createMockOpenCodeRuntime({
+      sessionGet: async () => ({
+        error: {
+          name: "NotFoundError",
+          data: { message: "Session not found" },
+        },
+        response: { status: 404 },
+      }),
+    });
+
+    const session = await Effect.runPromise(
+      Effect.gen(function* () {
+        const adapter = yield* OpenCodeAdapter;
+        return yield* adapter.startSession({
+          provider: "opencode",
+          threadId: asThreadId("thread-resume-not-found"),
+          runtimeMode: "full-access",
+          resumeCursor: { openCodeSessionId: "missing-session", cwd: "/repo/resume" },
+        });
+      }).pipe(
+        Effect.provide(
+          makeOpenCodeAdapterLive({ runtime: runtime.runtime }).pipe(
+            Layer.provideMerge(
+              ServerConfig.layerTest(process.cwd(), { prefix: "opencode-adapter-test-" }),
+            ),
+            Layer.provideMerge(NodeServices.layer),
+          ),
+        ),
+      ),
+    );
+
+    expect(runtime.getCalls).toEqual([{ sessionID: "missing-session" }]);
+    expect(runtime.createCalls).toHaveLength(1);
+    expect(runtime.updateCalls).toEqual([]);
+    expect(session.resumeCursor).toMatchObject({ openCodeSessionId: "opencode-session-1" });
+  });
+
+  it.each([
+    [
+      "a server error",
+      {
+        error: { name: "UnknownError", data: { message: "temporarily unavailable" } },
+        response: { status: 500 },
+      },
+    ],
+    [
+      "an untyped 404",
+      {
+        error: { name: "UnknownError", data: { message: "not found" } },
+        response: { status: 404 },
+      },
+    ],
+    [
+      "a schema compatibility error",
+      {
+        error: {
+          name: "UnknownError",
+          data: {
+            message: "SQLiteError: NOT NULL constraint failed: session_message.seq",
+          },
+        },
+        response: { status: 500 },
+      },
+    ],
+  ])("propagates %s from the resume probe without creating a session", async (_name, response) => {
+    const runtime = createMockOpenCodeRuntime({
+      sessionGet: async () => response,
+    });
+
+    const result = await Effect.runPromise(
+      Effect.gen(function* () {
+        const adapter = yield* OpenCodeAdapter;
+        return yield* adapter
+          .startSession({
+            provider: "opencode",
+            threadId: asThreadId(`thread-resume-${_name.replaceAll(" ", "-")}`),
+            runtimeMode: "full-access",
+            resumeCursor: { openCodeSessionId: "existing-session", cwd: "/repo/resume" },
+          })
+          .pipe(Effect.result);
+      }).pipe(
+        Effect.provide(
+          makeOpenCodeAdapterLive({ runtime: runtime.runtime }).pipe(
+            Layer.provideMerge(
+              ServerConfig.layerTest(process.cwd(), { prefix: "opencode-adapter-test-" }),
+            ),
+            Layer.provideMerge(NodeServices.layer),
+          ),
+        ),
+      ),
+    );
+
+    expect(Result.isFailure(result)).toBe(true);
+    expect(runtime.createCalls).toEqual([]);
+    expect(runtime.updateCalls).toEqual([]);
   });
 
   it("declines inactive OpenCode native fork when source and target cwd differ", async () => {
@@ -3721,6 +3875,357 @@ describe("OpenCodeAdapter runtime lifecycle", () => {
         reason: "prompt rejected",
       },
     });
+  });
+
+  it("terminally classifies an immediate first-prompt SDK schema failure", async () => {
+    let scopeCloseCount = 0;
+    const runtime = createMockOpenCodeRuntime({
+      onScopeClose: () => {
+        scopeCloseCount += 1;
+      },
+      promptAsync: async () => ({
+        error: {
+          name: "UnknownError",
+          data: {
+            message: "SQLiteError: NOT NULL constraint failed: session_message.seq",
+          },
+        },
+        response: { status: 500 },
+      }),
+    });
+    const threadId = asThreadId("thread-opencode-schema-sdk");
+
+    const result = await Effect.runPromise(
+      Effect.gen(function* () {
+        const adapter = yield* OpenCodeAdapter;
+        const eventsFiber = yield* Stream.runCollect(Stream.take(adapter.streamEvents, 6)).pipe(
+          Effect.forkChild,
+        );
+        yield* adapter.startSession({
+          provider: "opencode",
+          threadId,
+          runtimeMode: "full-access",
+        });
+        const sendResult = yield* adapter
+          .sendTurn({
+            threadId,
+            input: "hello",
+            attachments: [],
+            modelSelection: {
+              provider: "opencode",
+              model: "opencode/claude-opus-4-7",
+            },
+          })
+          .pipe(Effect.result);
+        const events = Array.from(yield* Fiber.join(eventsFiber));
+        const sessions = yield* adapter.listSessions();
+        return { events, sendResult, sessions };
+      }).pipe(
+        Effect.provide(
+          makeOpenCodeAdapterLive({
+            runtime: runtime.runtime,
+            promptSubmissionInlineWaitMs: 50,
+          }).pipe(
+            Layer.provideMerge(
+              ServerConfig.layerTest(process.cwd(), { prefix: "opencode-adapter-test-" }),
+            ),
+            Layer.provideMerge(NodeServices.layer),
+          ),
+        ),
+      ),
+    );
+
+    expect(Result.isFailure(result.sendResult)).toBe(true);
+    if (Result.isFailure(result.sendResult)) {
+      expect(result.sendResult.failure).toBeInstanceOf(ProviderAdapterCompatibilityError);
+    }
+    expect(result.events.map((event) => event.type)).toEqual([
+      "session.started",
+      "thread.started",
+      "turn.started",
+      "turn.completed",
+      "runtime.error",
+      "session.exited",
+    ]);
+    expect(result.events[3]).toMatchObject({
+      type: "turn.completed",
+      payload: {
+        state: "failed",
+        failureReason: "opencode_storage_schema_incompatible",
+      },
+    });
+    expect(result.events[4]).toMatchObject({
+      type: "runtime.error",
+      turnId: expect.any(String),
+      payload: {
+        reason: "opencode_storage_schema_incompatible",
+        detail: {
+          lifecycleStage: "first_prompt",
+          retryable: false,
+          serverOrigin: "managed",
+        },
+      },
+    });
+    expect(result.sessions).toEqual([]);
+    expect(runtime.promptCalls).toHaveLength(1);
+    expect(runtime.connectCalls).toHaveLength(1);
+    expect(runtime.connectCalls[0]?.poolIsolationKey).toBeTruthy();
+    expect(runtime.abortCalls).toEqual([{ sessionID: "opencode-session-1" }]);
+    expect(scopeCloseCount).toBe(1);
+  });
+
+  it("terminally classifies a delayed first-prompt SDK schema failure without replay", async () => {
+    let resolvePrompt:
+      | ((value: {
+          error: { name: string; data: { message: string } };
+          response: { status: number };
+        }) => void)
+      | undefined;
+    const promptResponse = new Promise<{
+      error: { name: string; data: { message: string } };
+      response: { status: number };
+    }>((resolve) => {
+      resolvePrompt = resolve;
+    });
+    const runtime = createMockOpenCodeRuntime({
+      promptAsync: async () => promptResponse,
+    });
+    const threadId = asThreadId("thread-opencode-schema-sdk-delayed");
+
+    const result = await Effect.runPromise(
+      Effect.gen(function* () {
+        const adapter = yield* OpenCodeAdapter;
+        const eventsFiber = yield* Stream.runCollect(Stream.take(adapter.streamEvents, 6)).pipe(
+          Effect.forkChild,
+        );
+        yield* adapter.startSession({
+          provider: "opencode",
+          threadId,
+          runtimeMode: "full-access",
+        });
+        const sendResult = yield* adapter
+          .sendTurn({
+            threadId,
+            input: "hello",
+            attachments: [],
+            modelSelection: {
+              provider: "opencode",
+              model: "opencode/claude-opus-4-7",
+            },
+          })
+          .pipe(Effect.result);
+        resolvePrompt?.({
+          error: {
+            name: "UnknownError",
+            data: {
+              message: "SQLiteError: NOT NULL constraint failed: session_message.seq",
+            },
+          },
+          response: { status: 500 },
+        });
+        const events = Array.from(yield* Fiber.join(eventsFiber));
+        yield* Effect.sleep(25);
+        return { events, sendResult };
+      }).pipe(
+        Effect.provide(
+          makeOpenCodeAdapterLive({
+            runtime: runtime.runtime,
+            promptSubmissionInlineWaitMs: 1,
+            promptAcceptedActivityTimeoutMs: 5,
+            promptAcceptedRecoveryDelaysMs: [1, 2],
+          }).pipe(
+            Layer.provideMerge(
+              ServerConfig.layerTest(process.cwd(), { prefix: "opencode-adapter-test-" }),
+            ),
+            Layer.provideMerge(NodeServices.layer),
+          ),
+        ),
+      ),
+    );
+
+    expect(Result.isSuccess(result.sendResult)).toBe(true);
+    expect(result.events.map((event) => event.type)).toEqual([
+      "session.started",
+      "thread.started",
+      "turn.started",
+      "turn.completed",
+      "runtime.error",
+      "session.exited",
+    ]);
+    expect(runtime.promptCalls).toHaveLength(1);
+    expect(runtime.connectCalls).toHaveLength(1);
+    expect(runtime.abortCalls).toHaveLength(1);
+  });
+
+  it("terminally classifies a delayed session.error once and cancels owned watchdog work", async () => {
+    const eventQueue = createSubscribedEventQueue();
+    let scopeCloseCount = 0;
+    const runtime = createMockOpenCodeRuntime({
+      abort: async () => await new Promise(() => undefined),
+      onScopeClose: () => {
+        scopeCloseCount += 1;
+      },
+    });
+    const client = runtime.runtime.createOpenCodeSdkClient({
+      baseUrl: "http://127.0.0.1:4099",
+      directory: process.cwd(),
+    }) as unknown as {
+      event: {
+        subscribe: () => Promise<{ stream: AsyncIterable<unknown> }>;
+      };
+    };
+    client.event.subscribe = async () => ({ stream: eventQueue.stream });
+    const threadId = asThreadId("thread-opencode-schema-event");
+    const providerError = {
+      name: "UnknownError",
+      data: {
+        message:
+          "SQLiteError: NOT NULL constraint failed: session_message.seq\n    at appendMessage (provider-runtime.js:1:1)",
+      },
+    };
+
+    const result = await Effect.runPromise(
+      Effect.gen(function* () {
+        const adapter = yield* OpenCodeAdapter;
+        const eventsFiber = yield* Stream.runCollect(Stream.take(adapter.streamEvents, 6)).pipe(
+          Effect.forkChild,
+        );
+        yield* adapter.startSession({
+          provider: "opencode",
+          threadId,
+          runtimeMode: "full-access",
+        });
+        yield* adapter.sendTurn({
+          threadId,
+          input: "hello",
+          attachments: [],
+          modelSelection: {
+            provider: "opencode",
+            model: "opencode/claude-opus-4-7",
+          },
+        });
+        for (const id of ["schema-error-1", "schema-error-duplicate"]) {
+          eventQueue.push({
+            id,
+            type: "session.error",
+            properties: {
+              sessionID: "opencode-session-1",
+              error: providerError,
+            },
+          });
+        }
+        const events = Array.from(yield* Fiber.join(eventsFiber));
+        yield* Effect.sleep(25);
+        return {
+          events,
+          sessions: yield* adapter.listSessions(),
+        };
+      }).pipe(
+        Effect.provide(
+          makeOpenCodeAdapterLive({
+            runtime: runtime.runtime,
+            promptSubmissionInlineWaitMs: 1,
+            promptAcceptedActivityTimeoutMs: 5,
+            promptAcceptedRecoveryDelaysMs: [1, 2],
+            sessionAbortTimeoutMs: 5,
+            waitForSessionAbortTimeout: () => Effect.void,
+          }).pipe(
+            Layer.provideMerge(
+              ServerConfig.layerTest(process.cwd(), { prefix: "opencode-adapter-test-" }),
+            ),
+            Layer.provideMerge(NodeServices.layer),
+          ),
+        ),
+      ),
+    );
+
+    expect(result.events.map((event) => event.type)).toEqual([
+      "session.started",
+      "thread.started",
+      "turn.started",
+      "turn.completed",
+      "runtime.error",
+      "session.exited",
+    ]);
+    expect(result.events.filter((event) => event.type === "turn.completed")).toHaveLength(1);
+    expect(result.events.filter((event) => event.type === "runtime.error")).toHaveLength(1);
+    expect(result.sessions).toEqual([]);
+    expect(runtime.promptCalls).toHaveLength(1);
+    expect(runtime.connectCalls).toHaveLength(1);
+    expect(runtime.abortCalls).toEqual([{ sessionID: "opencode-session-1" }]);
+    expect(scopeCloseCount).toBe(1);
+  });
+
+  it("closes only Synara-owned client resources for an external incompatible server", async () => {
+    const eventQueue = createSubscribedEventQueue();
+    let scopeCloseCount = 0;
+    const runtime = createMockOpenCodeRuntime({
+      events: eventQueue.stream,
+      onScopeClose: () => {
+        scopeCloseCount += 1;
+      },
+    });
+    const threadId = asThreadId("thread-opencode-schema-external");
+
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const adapter = yield* OpenCodeAdapter;
+        const eventsFiber = yield* Stream.runCollect(Stream.take(adapter.streamEvents, 6)).pipe(
+          Effect.forkChild,
+        );
+        yield* adapter.startSession({
+          provider: "opencode",
+          threadId,
+          runtimeMode: "full-access",
+          providerOptions: {
+            opencode: { serverUrl: "http://127.0.0.1:9999" },
+          },
+        });
+        yield* adapter.sendTurn({
+          threadId,
+          input: "hello",
+          attachments: [],
+          modelSelection: {
+            provider: "opencode",
+            model: "opencode/claude-opus-4-7",
+          },
+        });
+        eventQueue.push({
+          id: "schema-error-external",
+          type: "session.error",
+          properties: {
+            sessionID: "opencode-session-1",
+            error: {
+              name: "UnknownError",
+              data: {
+                message: "SQLiteError: NOT NULL constraint failed: session_message.seq",
+              },
+            },
+          },
+        });
+        yield* Fiber.join(eventsFiber);
+      }).pipe(
+        Effect.provide(
+          makeOpenCodeAdapterLive({
+            runtime: runtime.runtime,
+            promptSubmissionInlineWaitMs: 1,
+          }).pipe(
+            Layer.provideMerge(
+              ServerConfig.layerTest(process.cwd(), { prefix: "opencode-adapter-test-" }),
+            ),
+            Layer.provideMerge(NodeServices.layer),
+          ),
+        ),
+      ),
+    );
+
+    expect(runtime.connectCalls).toHaveLength(1);
+    expect(runtime.connectCalls[0]).toMatchObject({
+      serverUrl: "http://127.0.0.1:9999",
+    });
+    expect(runtime.connectCalls[0]?.poolIsolationKey).toBeUndefined();
+    expect(runtime.closePoolCalls).toEqual([]);
+    expect(scopeCloseCount).toBe(1);
   });
 
   it("treats OpenCode session.idle as turn completion", async () => {

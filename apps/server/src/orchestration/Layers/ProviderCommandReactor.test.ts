@@ -32,6 +32,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { deriveServerPaths, ServerConfig } from "../../config.ts";
 import { TextGenerationError } from "../../git/Errors.ts";
 import {
+  ProviderAdapterCompatibilityError,
   ProviderAdapterRequestError,
   ProviderAdapterValidationError,
   ProviderValidationError,
@@ -145,6 +146,7 @@ describe("ProviderCommandReactor", () => {
     readonly forkThreadResult?: ProviderForkThreadResult | null;
     readonly startReactor?: boolean;
     readonly interruptTurn?: ProviderServiceShape["interruptTurn"];
+    readonly sendTurn?: ProviderServiceShape["sendTurn"];
     readonly stopRuntimeSession?: NonNullable<ProviderServiceShape["stopRuntimeSession"]>;
     readonly afterDeliveryReconcile?: () => Promise<void>;
   }) {
@@ -198,11 +200,13 @@ describe("ProviderCommandReactor", () => {
       runtimeSessions.push(session);
       return Effect.succeed(session);
     });
-    const sendTurn = vi.fn<ProviderServiceShape["sendTurn"]>((_: unknown) =>
-      Effect.succeed({
-        threadId: ThreadId.makeUnsafe("thread-1"),
-        turnId: asTurnId("turn-1"),
-      }),
+    const sendTurn = vi.fn<ProviderServiceShape["sendTurn"]>(
+      input?.sendTurn ??
+        ((_: unknown) =>
+          Effect.succeed({
+            threadId: ThreadId.makeUnsafe("thread-1"),
+            turnId: asTurnId("turn-1"),
+          })),
     );
     // Mirrors adapter behavior: the reactor consults live provider sessions
     // (status + activeTurnId) to decide whether a turn is genuinely running.
@@ -1224,6 +1228,72 @@ describe("ProviderCommandReactor", () => {
       harness.deliveryRepository.getConsumerState("provider-command-reactor.v1"),
     );
     expect(consumerState.pipe(Option.getOrThrow).lastAckedSequence).toBe(events.at(-1)!.sequence);
+  });
+
+  it("settles a typed OpenCode compatibility rejection without retrying the delivery", async () => {
+    const compatibilityFailure = new ProviderAdapterCompatibilityError({
+      provider: "opencode",
+      method: "session.promptAsync",
+      reason: "opencode_storage_schema_incompatible",
+      lifecycleStage: "first_prompt",
+      retryable: false,
+      detail:
+        "OpenCode could not use its current data format. Update OpenCode, refresh provider status, then start a new attempt. Super Synara did not modify OpenCode data.",
+    });
+    const harness = await createHarness({
+      threadModelSelection: {
+        provider: "opencode",
+        model: "openai/gpt-5",
+      },
+      sendTurn: () => Effect.fail(compatibilityFailure),
+    });
+    const now = new Date().toISOString();
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.makeUnsafe("cmd-opencode-compatibility-terminal"),
+        threadId: ThreadId.makeUnsafe("thread-1"),
+        message: {
+          messageId: asMessageId("msg-opencode-compatibility-terminal"),
+          role: "user",
+          text: "run once",
+          attachments: [],
+        },
+        runtimeMode: "approval-required",
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        createdAt: now,
+      }),
+    );
+    await harness.drain();
+
+    const events = await Effect.runPromise(
+      Stream.runCollect(harness.engine.readEvents(0)).pipe(
+        Effect.map((chunk) => Array.from(chunk)),
+      ),
+    );
+    const requested = events.find(
+      (event) =>
+        event.type === "thread.turn-start-requested" &&
+        event.commandId === CommandId.makeUnsafe("cmd-opencode-compatibility-terminal"),
+    );
+    expect(requested).toBeDefined();
+    const delivery = await Effect.runPromise(
+      harness.deliveryRepository.getDelivery({
+        consumerName: PROVIDER_COMMAND_REACTOR_CONSUMER,
+        eventSequence: requested!.sequence,
+      }),
+    );
+
+    expect(delivery.pipe(Option.getOrThrow)).toMatchObject({
+      state: "succeeded",
+      attemptCount: 1,
+      lastError: null,
+    });
+    expect(harness.startSession).toHaveBeenCalledTimes(1);
+    expect(harness.sendTurn).toHaveBeenCalledTimes(1);
+    await harness.drain();
+    expect(harness.sendTurn).toHaveBeenCalledTimes(1);
   });
 
   it("REL-01B gate: quarantines one thread and resumes it after explicit safe retry", async () => {
@@ -7160,6 +7230,87 @@ describe("ProviderCommandReactor", () => {
       threadId: ThreadId.makeUnsafe("thread-1"),
       input: "queue this next",
     });
+  });
+
+  it("cancels queued promotions after a terminal OpenCode schema compatibility failure", async () => {
+    const harness = await createHarness({
+      threadModelSelection: {
+        provider: "opencode",
+        model: "openai/gpt-5",
+      },
+    });
+    const now = new Date().toISOString();
+    const threadId = ThreadId.makeUnsafe("thread-1");
+    const activeTurnId = asTurnId("turn-opencode-schema");
+
+    harness.setRuntimeSessionTurnState({
+      threadId,
+      status: "running",
+      activeTurnId,
+    });
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.makeUnsafe("cmd-session-opencode-schema"),
+        threadId,
+        session: {
+          threadId,
+          status: "running",
+          providerName: "opencode",
+          runtimeMode: "approval-required",
+          activeTurnId,
+          lastError: null,
+          updatedAt: now,
+        },
+        createdAt: now,
+      }),
+    );
+    harness.sendTurn.mockClear();
+
+    const queuedEvent = await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.makeUnsafe("cmd-turn-queue-opencode-schema"),
+        threadId,
+        message: {
+          messageId: asMessageId("msg-queue-opencode-schema"),
+          role: "user",
+          text: "do not replay this automatically",
+          attachments: [],
+        },
+        runtimeMode: "approval-required",
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        createdAt: now,
+      }),
+    );
+    await harness.drain();
+    expect(harness.sendTurn).not.toHaveBeenCalled();
+
+    harness.setRuntimeSessionTurnState({ threadId, status: "error" });
+    await harness.emitRuntimeEvent({
+      type: "turn.completed",
+      eventId: asEventId("evt-turn-completed-opencode-schema"),
+      provider: "opencode",
+      threadId,
+      createdAt: new Date().toISOString(),
+      turnId: activeTurnId,
+      payload: {
+        state: "failed",
+        failureReason: "opencode_storage_schema_incompatible",
+        errorMessage:
+          "OpenCode could not use its current data format. Update OpenCode, refresh provider status, then start a new attempt. Super Synara did not modify OpenCode data.",
+      },
+      providerRefs: {},
+    });
+
+    await waitFor(async () => {
+      const promotion = await Effect.runPromise(
+        harness.queuedTurnPromotionRepository.getBySequence(queuedEvent.sequence),
+      );
+      return Option.isSome(promotion) && promotion.value.state === "cancelled";
+    });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(harness.sendTurn).not.toHaveBeenCalled();
   });
 
   it("keeps the next queued turn blocked until the promoted turn settles", async () => {

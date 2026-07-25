@@ -35,6 +35,7 @@ import {
   OPENCODE_LOCAL_SERVER_IDLE_TTL_MS,
   parseOpenCodeCliModelsOutput,
   parseOpenCodeCredentialProviderIDs,
+  runOpenCodeSdkRequest,
   toOpenCodeFileParts,
 } from "./opencodeRuntime.ts";
 import {
@@ -46,6 +47,36 @@ import { prepareWindowsProviderProcess } from "./windowsProviderProcess.ts";
 import type { CapturedProcessTree, ProcessTreeKiller } from "../terminal/processTreeKiller.ts";
 
 const encoder = new TextEncoder();
+
+describe("runOpenCodeSdkRequest", () => {
+  it("turns the SDK's non-throwing error tuple into an OpenCodeRuntimeError", async () => {
+    const result = await Effect.runPromise(
+      runOpenCodeSdkRequest("session.promptAsync", async () => ({
+        error: { name: "UnknownError", data: { message: "provider rejected prompt" } },
+        response: { status: 500 },
+      })).pipe(Effect.result),
+    );
+
+    expect(Result.isFailure(result)).toBe(true);
+    if (Result.isFailure(result)) {
+      expect(OpenCodeRuntimeError.is(result.failure)).toBe(true);
+      if (!OpenCodeRuntimeError.is(result.failure)) {
+        throw new Error("Expected OpenCodeRuntimeError");
+      }
+      expect(result.failure.operation).toBe("session.promptAsync");
+      expect(result.failure.cause).toMatchObject({
+        response: { status: 500 },
+      });
+    }
+  });
+
+  it("preserves successful SDK tuples", async () => {
+    const response = { data: undefined, response: { status: 204 } };
+    await expect(
+      Effect.runPromise(runOpenCodeSdkRequest("session.promptAsync", async () => response)),
+    ).resolves.toBe(response);
+  });
+});
 const builtInWindowsPowerShell = (systemRoot: string) =>
   NodePath.win32.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
 const prepareMockProcess = (command: string, args: ReadonlyArray<string>) => ({
