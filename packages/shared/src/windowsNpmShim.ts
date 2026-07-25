@@ -4,6 +4,14 @@
 
 const WINDOWS_UNSAFE_PATH_CHARACTER_PATTERN = /[\u0000-\u001f"<>|?*:%!&^]/u;
 const WINDOWS_PATH_WHITESPACE_PATTERN = /\s/u;
+const WINDOWS_MANIFEST_UNSAFE_PATH_CHARACTER_PATTERN = /[\u0000-\u001f"<>|?*:]/u;
+
+export interface CanonicalWindowsNpmNodeShimTarget {
+  readonly relativeTarget: string;
+  readonly packageName: string;
+  readonly relativePackageRoot: string;
+  readonly packageBinTarget: string;
+}
 
 function normalizeShimLine(line: string): string {
   return line.trim().replaceAll("\\", "/").replace(/\s+/gu, " ");
@@ -113,5 +121,116 @@ export function parseCanonicalWindowsNpmNodeShim(contents: string): string | nul
       ")",
       `endlocal & goto #_undefined_# 2>nul || title %comspec% & "%_prog%" "%dp0%/${target}" %*`,
     ],
+  );
+}
+
+/**
+ * Splits a verified npm shim target into the package identity and package-local
+ * bin target needed to prove the shim against that package's manifest.
+ */
+export function parseCanonicalWindowsNpmNodeShimTarget(
+  contents: string,
+): CanonicalWindowsNpmNodeShimTarget | null {
+  const relativeTarget = parseCanonicalWindowsNpmNodeShim(contents);
+  if (!relativeTarget) {
+    return null;
+  }
+
+  const segments = relativeTarget.split("/");
+  const scoped = segments[1]?.startsWith("@") ?? false;
+  const packageSegmentCount = scoped ? 3 : 2;
+  if (
+    segments.length <= packageSegmentCount ||
+    (scoped && (!segments[1] || !segments[2])) ||
+    (!scoped && !segments[1])
+  ) {
+    return null;
+  }
+
+  const packageName = scoped ? `${segments[1]}/${segments[2]}` : segments[1];
+  const packageBinTarget = segments.slice(packageSegmentCount).join("/");
+  return {
+    relativeTarget,
+    packageName,
+    relativePackageRoot: segments.slice(0, packageSegmentCount).join("/"),
+    packageBinTarget,
+  };
+}
+
+function normalizeManifestBinTarget(value: string): string | null {
+  const target = value.replaceAll("\\", "/");
+  if (
+    target !== target.trim() ||
+    WINDOWS_MANIFEST_UNSAFE_PATH_CHARACTER_PATTERN.test(target) ||
+    target.startsWith("/") ||
+    target.startsWith("//")
+  ) {
+    return null;
+  }
+  const segments = target.split("/").filter((segment) => segment !== ".");
+  if (
+    segments.length === 0 ||
+    segments.some(
+      (segment) =>
+        segment.length === 0 ||
+        segment === ".." ||
+        segment.endsWith(".") ||
+        segment.endsWith(" "),
+    )
+  ) {
+    return null;
+  }
+  return segments.join("/");
+}
+
+function unscopedPackageName(packageName: string): string {
+  const separator = packageName.lastIndexOf("/");
+  return separator >= 0 ? packageName.slice(separator + 1) : packageName;
+}
+
+/**
+ * Proves that a parsed canonical shim name resolves to the exact `bin` target
+ * declared by the package manifest. String-form `bin` declarations use npm's
+ * unscoped package-name alias; object-form declarations must name the shim.
+ */
+export function windowsNpmPackageManifestDeclaresShimTarget(input: {
+  readonly target: CanonicalWindowsNpmNodeShimTarget;
+  readonly shimName: string;
+  readonly manifestContents: string;
+}): boolean {
+  let manifest: unknown;
+  try {
+    manifest = JSON.parse(input.manifestContents);
+  } catch {
+    return false;
+  }
+  if (
+    typeof manifest !== "object" ||
+    manifest === null ||
+    Array.isArray(manifest) ||
+    !("name" in manifest) ||
+    manifest.name !== input.target.packageName ||
+    !("bin" in manifest)
+  ) {
+    return false;
+  }
+
+  const shimName = input.shimName.replace(/\.(?:cmd|bat)$/iu, "");
+  const bin = manifest.bin;
+  let declaredTarget: unknown;
+  if (typeof bin === "string") {
+    if (shimName.toLowerCase() !== unscopedPackageName(input.target.packageName).toLowerCase()) {
+      return false;
+    }
+    declaredTarget = bin;
+  } else if (typeof bin === "object" && bin !== null && !Array.isArray(bin)) {
+    const entry = Object.entries(bin).find(([name]) => name.toLowerCase() === shimName.toLowerCase());
+    declaredTarget = entry?.[1];
+  }
+
+  return (
+    typeof declaredTarget === "string" &&
+    normalizeManifestBinTarget(declaredTarget)?.toLowerCase() ===
+      input.target.packageBinTarget.toLowerCase()
   );
 }

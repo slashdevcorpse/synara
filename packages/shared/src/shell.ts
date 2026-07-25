@@ -4,6 +4,8 @@
 
 import * as OS from "node:os";
 import { execFileSync } from "node:child_process";
+import { statSync } from "node:fs";
+import * as Path from "node:path";
 
 const PATH_CAPTURE_START = "__SYNARA_PATH_START__";
 const PATH_CAPTURE_END = "__SYNARA_PATH_END__";
@@ -125,6 +127,71 @@ export function mergePathEntries(
   }
 
   return merged.length > 0 ? merged.join(delimiter) : undefined;
+}
+
+export type WindowsDirectoryExists = (path: string) => boolean;
+
+function defaultWindowsDirectoryExists(path: string): boolean {
+  try {
+    return statSync(path).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function readWindowsEnvironmentValue(
+  env: NodeJS.ProcessEnv,
+  name: string,
+): string | undefined {
+  const normalizedName = name.toUpperCase();
+  const effectiveName = Object.keys(env)
+    .filter((key) => env[key] !== undefined && key.toUpperCase() === normalizedName)
+    .sort()[0];
+  return effectiveName === undefined ? undefined : trimNonEmpty(env[effectiveName]);
+}
+
+/**
+ * Returns existing absolute user CLI directories in deterministic fallback
+ * order. Callers append these after persisted/inherited PATH entries so normal
+ * PATH precedence always wins and the process current directory is never used.
+ */
+export function listWindowsUserCliFallbackDirectories(
+  env: NodeJS.ProcessEnv,
+  directoryExists: WindowsDirectoryExists = defaultWindowsDirectoryExists,
+): ReadonlyArray<string> {
+  const appData = readWindowsEnvironmentValue(env, "APPDATA");
+  const localAppData = readWindowsEnvironmentValue(env, "LOCALAPPDATA");
+  const userProfile = readWindowsEnvironmentValue(env, "USERPROFILE");
+  const voltaHome = readWindowsEnvironmentValue(env, "VOLTA_HOME");
+  const pnpmHome = readWindowsEnvironmentValue(env, "PNPM_HOME");
+  const candidates = [
+    appData ? Path.win32.join(appData, "npm") : undefined,
+    localAppData ? Path.win32.join(localAppData, "Programs", "nodejs") : undefined,
+    voltaHome ? Path.win32.join(voltaHome, "bin") : undefined,
+    userProfile ? Path.win32.join(userProfile, ".volta", "bin") : undefined,
+    pnpmHome,
+    localAppData ? Path.win32.join(localAppData, "pnpm") : undefined,
+    userProfile ? Path.win32.join(userProfile, ".bun", "bin") : undefined,
+    userProfile ? Path.win32.join(userProfile, "scoop", "shims") : undefined,
+  ];
+  const seen = new Set<string>();
+  const directories: string[] = [];
+  for (const candidate of candidates) {
+    if (
+      !candidate ||
+      !/^(?:[A-Za-z]:[\\/]|\\\\[^\\/]+[\\/][^\\/]+)/u.test(candidate) ||
+      !directoryExists(candidate)
+    ) {
+      continue;
+    }
+    const normalized = Path.win32.normalize(candidate);
+    const identity = normalized.toLowerCase().replace(/[\\/]+$/u, "");
+    if (!seen.has(identity)) {
+      seen.add(identity);
+      directories.push(normalized);
+    }
+  }
+  return directories;
 }
 
 function envCaptureStart(name: string): string {

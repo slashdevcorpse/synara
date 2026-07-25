@@ -214,6 +214,38 @@ describe("syncShellEnvironment", () => {
     expect(env.GEMINI_API_KEY).toBe("from-registry");
   });
 
+  it("appends existing user CLI fallbacks after registry and inherited PATH entries", () => {
+    const env: NodeJS.ProcessEnv = {
+      PATH: "C:\\Inherited",
+      USERPROFILE: "C:\\Users\\Test",
+    };
+    const existing = new Set([
+      "C:\\Users\\Test\\AppData\\Roaming\\npm",
+      "C:\\Users\\Test\\.bun\\bin",
+      "C:\\Users\\Test\\scoop\\shims",
+    ]);
+
+    syncShellEnvironment(env, {
+      platform: "win32",
+      readWindowsEnvironment: () => ({
+        PATH: "C:\\Registry",
+        APPDATA: "C:\\Users\\Test\\AppData\\Roaming",
+        LOCALAPPDATA: "C:\\Users\\Test\\AppData\\Local",
+      }),
+      windowsDirectoryExists: (path) => existing.has(path),
+    });
+
+    expect(env.PATH).toBe(
+      [
+        "C:\\Registry",
+        "C:\\Inherited",
+        "C:\\Users\\Test\\AppData\\Roaming\\npm",
+        "C:\\Users\\Test\\.bun\\bin",
+        "C:\\Users\\Test\\scoop\\shims",
+      ].join(";"),
+    );
+  });
+
   it("logs a warning and leaves the environment intact when the Windows reader throws", () => {
     const env: NodeJS.ProcessEnv = {
       PATH: "C:\\Windows\\system32",
