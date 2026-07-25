@@ -52,7 +52,10 @@ import {
   ProviderValidationError,
   type ProviderAdapterError,
 } from "../Errors.ts";
-import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
+import type {
+  ProviderAdapterShape,
+  ProviderRuntimeEventDurabilityBarrier,
+} from "../Services/ProviderAdapter.ts";
 import { ProviderAdapterRegistry } from "../Services/ProviderAdapterRegistry.ts";
 import { ProviderService } from "../Services/ProviderService.ts";
 import { ProviderSessionDirectory } from "../Services/ProviderSessionDirectory.ts";
@@ -125,10 +128,15 @@ function asRuntimePayloadRecord(value: unknown): Record<string, unknown> {
 
 function makeFakeCodexAdapter(
   provider: ProviderKind = "codex",
-  options?: { readonly conversationRollback?: "native" | "restart-session" },
+  options?: {
+    readonly conversationRollback?: "native" | "restart-session";
+    readonly runtimeEventDurabilityBarrier?: boolean;
+  },
 ) {
   const sessions = new Map<ThreadId, ProviderSession>();
   const runtimeEventPubSub = Effect.runSync(PubSub.unbounded<ProviderRuntimeEvent>());
+  const pendingDurabilityEventIds = new Set<EventId>();
+  const acknowledgedDurabilityEventIds: Array<EventId> = [];
 
   const startSession = vi.fn(
     (input: ProviderSessionStartInput): Effect.Effect<ProviderSession, ProviderAdapterError> =>
@@ -293,6 +301,28 @@ function makeFakeCodexAdapter(
       }),
   );
 
+  const runtimeEventDurabilityBarrier: ProviderRuntimeEventDurabilityBarrier<ProviderAdapterError> =
+    {
+      isPending: (event) => Effect.sync(() => pendingDurabilityEventIds.has(event.eventId)),
+      acknowledge: vi.fn((event: ProviderRuntimeEvent) =>
+        Effect.sync(() => {
+          if (!pendingDurabilityEventIds.delete(event.eventId)) {
+            return;
+          }
+          acknowledgedDurabilityEventIds.push(event.eventId);
+          const session = sessions.get(event.threadId);
+          if (session !== undefined) {
+            sessions.set(event.threadId, {
+              ...withoutActiveTurn(session),
+              status: "error",
+              lastError: "terminal event acknowledged",
+              updatedAt: new Date().toISOString(),
+            });
+          }
+        }),
+      ),
+    };
+
   const adapter: ProviderAdapterShape<ProviderAdapterError> = {
     provider,
     capabilities: {
@@ -318,6 +348,7 @@ function makeFakeCodexAdapter(
     compactThread,
     stopAll,
     streamEvents: Stream.fromPubSub(runtimeEventPubSub),
+    ...(options?.runtimeEventDurabilityBarrier === true ? { runtimeEventDurabilityBarrier } : {}),
   };
 
   const emit = (event: LegacyProviderRuntimeEvent): void => {
@@ -363,6 +394,12 @@ function makeFakeCodexAdapter(
     rollbackThread,
     compactThread,
     stopAll,
+    markRuntimeEventPending: (eventId: EventId): void => {
+      pendingDurabilityEventIds.add(eventId);
+    },
+    isRuntimeEventPending: (eventId: EventId): boolean => pendingDurabilityEventIds.has(eventId),
+    acknowledgedDurabilityEventIds,
+    runtimeEventDurabilityBarrier,
   };
 }
 
@@ -408,9 +445,14 @@ function makeProviderServiceLayer(
   providers?: {
     readonly includeRestartRollbackDroid?: boolean;
     readonly includePi?: boolean;
+    readonly includeCodexDurabilityBarrier?: boolean;
   },
 ) {
-  const codex = makeFakeCodexAdapter();
+  const codex = makeFakeCodexAdapter("codex", {
+    ...(providers?.includeCodexDurabilityBarrier === true
+      ? { runtimeEventDurabilityBarrier: true }
+      : {}),
+  });
   const claude = makeFakeCodexAdapter("claudeAgent");
   const antigravity = makeFakeCodexAdapter("antigravity");
   const droid = makeFakeCodexAdapter("droid", { conversationRollback: "restart-session" });
@@ -5430,164 +5472,382 @@ durableRuntimeEvents.layer("ProviderServiceLive runtime event durability", (it) 
   );
 });
 
-function makeDurableTerminalBarrierLayer() {
-  const persistenceStarted = Effect.runSync(Deferred.make<ProviderRuntimeEvent>());
-  const releasePersistence = Effect.runSync(Deferred.make<void>());
-  const observedOrder: Array<string> = [];
-  const service = makeProviderServiceLayer({
+const durabilitySuccessEventId = asEventId("runtime-durability-ack-success");
+const durabilitySuccessPersistenceStarted = Effect.runSync(Deferred.make<ProviderRuntimeEvent>());
+const releaseDurabilitySuccessPersistence = Effect.runSync(Deferred.make<void>());
+const durabilitySuccess = makeProviderServiceLayer(
+  {
     persistRuntimeEvent: (event) =>
-      Deferred.succeed(persistenceStarted, event).pipe(
-        Effect.andThen(Deferred.await(releasePersistence)),
-        Effect.andThen(
-          Effect.sync(() => {
-            observedOrder.push(`persist:${String(event.eventId)}`);
-          }),
-        ),
-      ),
-  });
-  return {
-    ...service,
-    persistenceStarted,
-    releasePersistence,
-    observedOrder,
-  };
-}
-
-function assertDurableTerminalBarrier(
-  fixture: ReturnType<typeof makeDurableTerminalBarrierLayer>,
-  mode: "clear" | "remove",
-) {
-  return Effect.gen(function* () {
-    const provider = yield* ProviderService;
-    const directory = yield* ProviderSessionDirectory;
-    const threadId = asThreadId(`thread-durable-terminal-${mode}`);
-    const startedSession = yield* provider.startSession(threadId, {
-      provider: "codex",
-      threadId,
-      runtimeMode: "full-access",
-    });
-    const turn = yield* provider.sendTurn({
-      threadId,
-      input: `hold ${mode} terminal persistence`,
-      attachments: [],
-    });
-
-    fixture.codex.updateSession(threadId, (session) => ({
-      ...session,
-      status: "running",
-      activeTurnId: turn.turnId,
-    }));
-    if (mode === "clear") {
-      fixture.codex.updateSession(threadId, (session) => ({
-        ...withoutActiveTurn(session),
-        status: "ready",
+      event.eventId === durabilitySuccessEventId
+        ? Deferred.succeed(durabilitySuccessPersistenceStarted, event).pipe(
+            Effect.andThen(Deferred.await(releaseDurabilitySuccessPersistence)),
+          )
+        : Effect.void,
+  },
+  { includeCodexDurabilityBarrier: true },
+);
+durabilitySuccess.layer("ProviderServiceLive adapter durability acknowledgement", (it) => {
+  it.effect("acks only after journal and binding commit, with no pre-persistence fanout", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService;
+      const directory = yield* ProviderSessionDirectory;
+      const threadId = asThreadId("thread-durability-ack-success");
+      yield* provider.startSession(threadId, {
+        provider: "codex",
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const turn = yield* provider.sendTurn({
+        threadId,
+        input: "hold terminal persistence",
+        attachments: [],
+      });
+      durabilitySuccess.codex.updateSession(threadId, (session) => ({
+        ...session,
+        status: "running",
+        activeTurnId: turn.turnId,
       }));
-    } else {
-      yield* fixture.codex.stopSession(threadId);
-    }
+      durabilitySuccess.codex.markRuntimeEventPending(durabilitySuccessEventId);
 
-    const bindingBeforeEvent = Option.getOrUndefined(yield* directory.getBinding(threadId));
-    assert.equal(bindingBeforeEvent?.status, "running");
-    assert.equal(
-      asRuntimePayloadRecord(bindingBeforeEvent?.runtimePayload).activeTurnId,
-      turn.turnId,
-    );
-    const sessionBeforeEvent = (yield* provider.listSessions()).find(
-      (session) => session.threadId === threadId,
-    );
-    assert.equal(sessionBeforeEvent?.status, "running");
-    assert.equal(sessionBeforeEvent?.activeTurnId, turn.turnId);
-    assert.equal(sessionBeforeEvent?.runtimeMode, startedSession.runtimeMode);
-    assert.deepEqual(sessionBeforeEvent?.resumeCursor, startedSession.resumeCursor);
+      const fanoutReceived = yield* Deferred.make<ProviderRuntimeEvent>();
+      const fanoutConsumer = yield* Stream.runForEach(provider.streamEvents, (event) =>
+        event.eventId === durabilitySuccessEventId
+          ? Deferred.succeed(fanoutReceived, event).pipe(Effect.asVoid)
+          : Effect.void,
+      ).pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+      yield* durabilitySuccess.codex.waitForRuntimeSubscribers();
 
-    const fanoutReceived = yield* Deferred.make<ProviderRuntimeEvent>();
-    const fanoutConsumer = yield* Stream.runForEach(provider.streamEvents, (event) =>
-      Effect.sync(() => {
-        fixture.observedOrder.push(`fanout:${String(event.eventId)}`);
-      }).pipe(Effect.andThen(Deferred.succeed(fanoutReceived, event)), Effect.asVoid),
-    ).pipe(Effect.forkChild);
-    yield* Effect.yieldNow;
-    yield* Effect.yieldNow;
-    yield* fixture.codex.waitForRuntimeSubscribers();
+      durabilitySuccess.codex.emit({
+        type: "turn.completed",
+        eventId: durabilitySuccessEventId,
+        provider: "codex",
+        createdAt: "2026-07-25T12:00:00.000Z",
+        threadId,
+        turnId: turn.turnId,
+        payload: { state: "failed" },
+      });
 
-    const eventId = asEventId(`runtime-durable-terminal-${mode}`);
-    fixture.codex.emit(
-      mode === "clear"
-        ? {
-            type: "turn.completed",
-            eventId,
-            provider: "codex",
-            createdAt: "2026-07-25T12:00:00.000Z",
-            threadId,
-            turnId: turn.turnId,
-            payload: { state: "completed" },
-          }
-        : {
-            type: "session.exited",
-            eventId,
-            provider: "codex",
-            createdAt: "2026-07-25T12:00:00.000Z",
-            threadId,
-            payload: { reason: "provider runtime exited" },
-          },
-    );
+      yield* Deferred.await(durabilitySuccessPersistenceStarted);
+      assert.equal(yield* Deferred.isDone(fanoutReceived), false);
+      assert.equal(durabilitySuccess.codex.isRuntimeEventPending(durabilitySuccessEventId), true);
+      assert.deepEqual(durabilitySuccess.codex.acknowledgedDurabilityEventIds, []);
+      const bindingWhileBlocked = Option.getOrUndefined(yield* directory.getBinding(threadId));
+      assert.equal(bindingWhileBlocked?.status, "running");
+      assert.equal(
+        asRuntimePayloadRecord(bindingWhileBlocked?.runtimePayload).activeTurnId,
+        turn.turnId,
+      );
+      const [sessionWhileBlocked] = yield* durabilitySuccess.codex.listSessions();
+      assert.equal(sessionWhileBlocked?.status, "running");
+      assert.equal(sessionWhileBlocked?.activeTurnId, turn.turnId);
 
-    const persistingEvent = yield* Deferred.await(fixture.persistenceStarted);
-    assert.equal(persistingEvent.eventId, eventId);
-    assert.equal(yield* Deferred.isDone(fanoutReceived), false);
-    const bindingDuringPersistence = Option.getOrUndefined(yield* directory.getBinding(threadId));
-    assert.equal(bindingDuringPersistence?.status, "running");
-    assert.equal(
-      asRuntimePayloadRecord(bindingDuringPersistence?.runtimePayload).activeTurnId,
-      turn.turnId,
-    );
-    const sessionDuringPersistence = (yield* provider.listSessions()).find(
-      (session) => session.threadId === threadId,
-    );
-    assert.equal(sessionDuringPersistence?.status, "running");
-    assert.equal(sessionDuringPersistence?.activeTurnId, turn.turnId);
-
-    yield* Deferred.succeed(fixture.releasePersistence, undefined);
-    const receivedEvent = yield* Deferred.await(fanoutReceived);
-    assert.equal(receivedEvent.eventId, eventId);
-    const bindingAfterPersistence = Option.getOrUndefined(yield* directory.getBinding(threadId));
-    assert.equal(bindingAfterPersistence?.status, "stopped");
-    assert.equal(
-      asRuntimePayloadRecord(bindingAfterPersistence?.runtimePayload).activeTurnId,
-      null,
-    );
-    const sessionAfterPersistence = (yield* provider.listSessions()).find(
-      (session) => session.threadId === threadId,
-    );
-    if (mode === "clear") {
-      assert.equal(sessionAfterPersistence?.status, "ready");
-      assert.equal(sessionAfterPersistence?.activeTurnId, undefined);
-      assert.equal(sessionAfterPersistence?.runtimeMode, startedSession.runtimeMode);
-      assert.deepEqual(sessionAfterPersistence?.resumeCursor, startedSession.resumeCursor);
-    } else {
-      assert.equal(sessionAfterPersistence, undefined);
-    }
-    assert.deepEqual(fixture.observedOrder, [
-      `persist:${String(eventId)}`,
-      `fanout:${String(eventId)}`,
-    ]);
-    yield* Fiber.interrupt(fanoutConsumer);
-  }).pipe(
-    Effect.ensuring(Deferred.succeed(fixture.releasePersistence, undefined).pipe(Effect.asVoid)),
-  );
-}
-
-const durableClearedTerminal = makeDurableTerminalBarrierLayer();
-durableClearedTerminal.layer("ProviderServiceLive cleared terminal persistence barrier", (it) => {
-  it.effect("preserves the persisted active turn until a cleared terminal event is durable", () =>
-    assertDurableTerminalBarrier(durableClearedTerminal, "clear"),
+      yield* Deferred.succeed(releaseDurabilitySuccessPersistence, undefined);
+      const received = yield* Deferred.await(fanoutReceived);
+      assert.equal(received.eventId, durabilitySuccessEventId);
+      assert.equal(durabilitySuccess.codex.isRuntimeEventPending(durabilitySuccessEventId), false);
+      assert.deepEqual(durabilitySuccess.codex.acknowledgedDurabilityEventIds, [
+        durabilitySuccessEventId,
+      ]);
+      const committedBinding = Option.getOrUndefined(yield* directory.getBinding(threadId));
+      assert.equal(committedBinding?.status, "stopped");
+      assert.equal(asRuntimePayloadRecord(committedBinding?.runtimePayload).activeTurnId, null);
+      const [acknowledgedSession] = yield* durabilitySuccess.codex.listSessions();
+      assert.equal(acknowledgedSession?.status, "error");
+      assert.equal(acknowledgedSession?.activeTurnId, undefined);
+      yield* Fiber.interrupt(fanoutConsumer);
+    }).pipe(
+      Effect.ensuring(
+        Deferred.succeed(releaseDurabilitySuccessPersistence, undefined).pipe(Effect.asVoid),
+      ),
+    ),
   );
 });
 
-const durableRemovedTerminal = makeDurableTerminalBarrierLayer();
-durableRemovedTerminal.layer("ProviderServiceLive removed terminal persistence barrier", (it) => {
-  it.effect("preserves the persisted active turn until a removed terminal event is durable", () =>
-    assertDurableTerminalBarrier(durableRemovedTerminal, "remove"),
+const blockedFanoutEventId = asEventId("runtime-durability-blocked-fanout");
+const blockedFanoutCanonicalWrite = Effect.runSync(Deferred.make<void>());
+const blockedFanout = makeProviderServiceLayer(
+  {
+    runtimeEventBufferCapacity: 1,
+    persistRuntimeEvent: () => Effect.void,
+    canonicalEventLogger: {
+      filePath: "test://provider-runtime-events",
+      write: (event) =>
+        (event as ProviderRuntimeEvent).eventId === blockedFanoutEventId
+          ? Deferred.succeed(blockedFanoutCanonicalWrite, undefined).pipe(Effect.asVoid)
+          : Effect.void,
+      close: () => Effect.void,
+    },
+  },
+  { includeCodexDurabilityBarrier: true },
+);
+blockedFanout.layer("ProviderServiceLive durability ack before fanout", (it) => {
+  it.effect("does not hold the adapter tombstone behind blocked subscriber fanout", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService;
+      const directory = yield* ProviderSessionDirectory;
+      const threadId = asThreadId("thread-durability-blocked-fanout");
+      yield* provider.startSession(threadId, {
+        provider: "codex",
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const turn = yield* provider.sendTurn({
+        threadId,
+        input: "prove ack precedes fanout",
+        attachments: [],
+      });
+      blockedFanout.codex.updateSession(threadId, (session) => ({
+        ...session,
+        status: "running",
+        activeTurnId: turn.turnId,
+      }));
+
+      const releaseSlowConsumer = yield* Deferred.make<void>();
+      const slowConsumerStarted = yield* Deferred.make<void>();
+      const slowConsumer = yield* Stream.runForEach(provider.streamEvents, () =>
+        Deferred.succeed(slowConsumerStarted, undefined).pipe(
+          Effect.andThen(Deferred.await(releaseSlowConsumer)),
+        ),
+      ).pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+      yield* blockedFanout.codex.waitForRuntimeSubscribers();
+
+      for (const index of [1, 2]) {
+        blockedFanout.codex.emit({
+          type: "message.delta",
+          eventId: asEventId(`runtime-durability-filler-${index}`),
+          provider: "codex",
+          createdAt: "2026-07-25T12:00:00.000Z",
+          threadId,
+          turnId: turn.turnId,
+          delta: String(index),
+        });
+        if (index === 1) {
+          yield* Deferred.await(slowConsumerStarted);
+        }
+      }
+
+      blockedFanout.codex.markRuntimeEventPending(blockedFanoutEventId);
+      blockedFanout.codex.emit({
+        type: "turn.completed",
+        eventId: blockedFanoutEventId,
+        provider: "codex",
+        createdAt: "2026-07-25T12:00:01.000Z",
+        threadId,
+        turnId: turn.turnId,
+        payload: { state: "failed" },
+      });
+
+      yield* Deferred.await(blockedFanoutCanonicalWrite);
+      assert.equal(blockedFanout.codex.isRuntimeEventPending(blockedFanoutEventId), false);
+      assert.deepEqual(blockedFanout.codex.acknowledgedDurabilityEventIds, [blockedFanoutEventId]);
+      const committedBinding = Option.getOrUndefined(yield* directory.getBinding(threadId));
+      assert.equal(committedBinding?.status, "stopped");
+      const [acknowledgedSession] = yield* blockedFanout.codex.listSessions();
+      assert.equal(acknowledgedSession?.status, "error");
+      assert.equal(acknowledgedSession?.activeTurnId, undefined);
+
+      yield* Deferred.succeed(releaseSlowConsumer, undefined);
+      yield* Fiber.interrupt(slowConsumer);
+    }),
+  );
+});
+
+const persistenceFailureEventId = asEventId("runtime-durability-persistence-failure");
+let persistenceFailureAttempted = false;
+const persistenceFailureCanonicalWrite = Effect.runSync(Deferred.make<void>());
+const durabilityPersistenceFailure = makeProviderServiceLayer(
+  {
+    persistRuntimeEvent: (event) =>
+      event.eventId === persistenceFailureEventId
+        ? Effect.gen(function* () {
+            persistenceFailureAttempted = true;
+            return yield* Effect.dieMessage("injected runtime journal failure");
+          })
+        : Effect.void,
+    canonicalEventLogger: {
+      filePath: "test://provider-runtime-persistence-failure",
+      write: (event) =>
+        (event as ProviderRuntimeEvent).eventId === persistenceFailureEventId
+          ? Deferred.succeed(persistenceFailureCanonicalWrite, undefined).pipe(Effect.asVoid)
+          : Effect.void,
+      close: () => Effect.void,
+    },
+  },
+  { includeCodexDurabilityBarrier: true },
+);
+durabilityPersistenceFailure.layer("ProviderServiceLive durability persistence failure", (it) => {
+  it.effect("retains the adapter barrier and active binding when journal persistence fails", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService;
+      const directory = yield* ProviderSessionDirectory;
+      const threadId = asThreadId("thread-durability-persistence-failure");
+      yield* provider.startSession(threadId, {
+        provider: "codex",
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const turn = yield* provider.sendTurn({
+        threadId,
+        input: "fail terminal persistence",
+        attachments: [],
+      });
+      durabilityPersistenceFailure.codex.updateSession(threadId, (session) => ({
+        ...session,
+        status: "running",
+        activeTurnId: turn.turnId,
+      }));
+      durabilityPersistenceFailure.codex.markRuntimeEventPending(persistenceFailureEventId);
+      yield* durabilityPersistenceFailure.codex.waitForRuntimeSubscribers();
+
+      durabilityPersistenceFailure.codex.emit({
+        type: "turn.completed",
+        eventId: persistenceFailureEventId,
+        provider: "codex",
+        createdAt: "2026-07-25T12:00:00.000Z",
+        threadId,
+        turnId: turn.turnId,
+        payload: { state: "failed" },
+      });
+      yield* waitUntil(
+        () => persistenceFailureAttempted,
+        500,
+        10,
+        "runtime journal failure attempt",
+      );
+      yield* Effect.yieldNow;
+
+      assert.equal(
+        durabilityPersistenceFailure.codex.isRuntimeEventPending(persistenceFailureEventId),
+        true,
+      );
+      assert.deepEqual(durabilityPersistenceFailure.codex.acknowledgedDurabilityEventIds, []);
+      assert.equal(yield* Deferred.isDone(persistenceFailureCanonicalWrite), false);
+      const binding = Option.getOrUndefined(yield* directory.getBinding(threadId));
+      assert.equal(binding?.status, "running");
+      assert.equal(asRuntimePayloadRecord(binding?.runtimePayload).activeTurnId, turn.turnId);
+      const [session] = yield* durabilityPersistenceFailure.codex.listSessions();
+      assert.equal(session?.status, "running");
+      assert.equal(session?.activeTurnId, turn.turnId);
+    }),
+  );
+});
+
+const bindingFailureEventId = asEventId("runtime-durability-binding-failure");
+const bindingFailurePersisted = Effect.runSync(Deferred.make<void>());
+const durabilityBindingFailure = makeProviderServiceLayer(
+  {
+    persistRuntimeEvent: (event) =>
+      event.eventId === bindingFailureEventId
+        ? Deferred.succeed(bindingFailurePersisted, undefined).pipe(Effect.asVoid)
+        : Effect.void,
+  },
+  { includeCodexDurabilityBarrier: true },
+);
+durabilityBindingFailure.layer("ProviderServiceLive durability binding failure", (it) => {
+  it.effect("retains the adapter barrier and suppresses fanout when binding commit fails", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService;
+      const directory = yield* ProviderSessionDirectory;
+      const threadId = asThreadId("thread-durability-binding-failure");
+      yield* provider.startSession(threadId, {
+        provider: "codex",
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const turn = yield* provider.sendTurn({
+        threadId,
+        input: "fail terminal binding",
+        attachments: [],
+      });
+      durabilityBindingFailure.codex.updateSession(threadId, (session) => ({
+        ...session,
+        status: "running",
+        activeTurnId: turn.turnId,
+      }));
+      durabilityBindingFailure.codex.markRuntimeEventPending(bindingFailureEventId);
+
+      const bindingFailure = new ProviderSessionDirectoryPersistenceError({
+        operation: "test",
+        detail: "injected terminal binding failure",
+      });
+      const upsertSpy = vi
+        .spyOn(directory, "upsert")
+        .mockImplementationOnce(() => Effect.fail(bindingFailure));
+      const fanoutReceived = yield* Deferred.make<void>();
+      const fanoutConsumer = yield* Stream.runForEach(provider.streamEvents, (event) =>
+        event.eventId === bindingFailureEventId
+          ? Deferred.succeed(fanoutReceived, undefined).pipe(Effect.asVoid)
+          : Effect.void,
+      ).pipe(Effect.forkChild);
+
+      yield* Effect.gen(function* () {
+        yield* Effect.yieldNow;
+        yield* durabilityBindingFailure.codex.waitForRuntimeSubscribers();
+        durabilityBindingFailure.codex.emit({
+          type: "turn.completed",
+          eventId: bindingFailureEventId,
+          provider: "codex",
+          createdAt: "2026-07-25T12:00:00.000Z",
+          threadId,
+          turnId: turn.turnId,
+          payload: { state: "failed" },
+        });
+        yield* Deferred.await(bindingFailurePersisted);
+        yield* sleep(20);
+
+        assert.equal(
+          durabilityBindingFailure.codex.isRuntimeEventPending(bindingFailureEventId),
+          true,
+        );
+        assert.deepEqual(durabilityBindingFailure.codex.acknowledgedDurabilityEventIds, []);
+        assert.equal(yield* Deferred.isDone(fanoutReceived), false);
+        const binding = Option.getOrUndefined(yield* directory.getBinding(threadId));
+        assert.equal(binding?.status, "running");
+        assert.equal(asRuntimePayloadRecord(binding?.runtimePayload).activeTurnId, turn.turnId);
+        const [session] = yield* durabilityBindingFailure.codex.listSessions();
+        assert.equal(session?.status, "running");
+        assert.equal(session?.activeTurnId, turn.turnId);
+      }).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            upsertSpy.mockRestore();
+          }),
+        ),
+        Effect.ensuring(Fiber.interrupt(fanoutConsumer)),
+      );
+    }),
+  );
+});
+
+const stalePersistedBinding = makeProviderServiceLayer();
+stalePersistedBinding.layer("ProviderServiceLive adapter session inventory", (it) => {
+  it.effect("does not synthesize a live session from a stale persisted active binding", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService;
+      const directory = yield* ProviderSessionDirectory;
+      const threadId = asThreadId("thread-stale-persisted-active-binding");
+      yield* provider.startSession(threadId, {
+        provider: "codex",
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const turn = yield* provider.sendTurn({
+        threadId,
+        input: "leave a persisted active binding",
+        attachments: [],
+      });
+      yield* stalePersistedBinding.codex.stopSession(threadId);
+
+      const binding = Option.getOrUndefined(yield* directory.getBinding(threadId));
+      assert.equal(binding?.status, "running");
+      assert.equal(asRuntimePayloadRecord(binding?.runtimePayload).activeTurnId, turn.turnId);
+      assert.equal(
+        (yield* provider.listSessions()).some((session) => session.threadId === threadId),
+        false,
+      );
+    }),
   );
 });
 

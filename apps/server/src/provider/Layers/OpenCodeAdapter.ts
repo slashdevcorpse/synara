@@ -41,6 +41,7 @@ import {
 import {
   classifyOpenCodeCompatibilityFailure,
   isStructuredOpenCodeSessionNotFound,
+  type OpenCodeCompatibilityFailure,
   OPENCODE_STORAGE_SCHEMA_INCOMPATIBLE_MESSAGE,
 } from "../opencodeCompatibility.ts";
 import { takeSynaraHarnessPolicyForProviderSession } from "../../agentGateway/harnessPolicy.ts";
@@ -162,6 +163,9 @@ interface OpenCodeCompatibilityIncident {
   readonly correlationId: string;
   readonly error: ProviderAdapterCompatibilityError;
   readonly originalCause: unknown;
+  readonly failure: OpenCodeCompatibilityFailure;
+  pendingTerminalEventId: EventId | undefined;
+  terminalAcknowledged: boolean;
 }
 
 interface OpenCodeSessionContext {
@@ -1244,6 +1248,115 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
             : {}),
         }).pipe(Effect.asVoid);
 
+      const acknowledgeOpenCodeCompatibilityTerminal = Effect.fn(
+        "acknowledgeOpenCodeCompatibilityTerminal",
+      )(function* (event: ProviderRuntimeEvent) {
+        const context = sessions.get(event.threadId);
+        const incident = context?.compatibilityIncident;
+        if (
+          context === undefined ||
+          incident === undefined ||
+          incident.pendingTerminalEventId !== event.eventId
+        ) {
+          return;
+        }
+
+        // ProviderService invokes this only after the terminal event is durable
+        // and the persisted binding has transitioned out of the active turn.
+        // Keep the compatibility incident itself as a permanent dispatch block
+        // for this context; only the pending durability tombstone is consumed.
+        incident.pendingTerminalEventId = undefined;
+        incident.terminalAcknowledged = true;
+        clearActiveTurnState(context);
+        updateProviderSession(
+          context,
+          {
+            status: "error",
+            lastError: OPENCODE_STORAGE_SCHEMA_INCOMPATIBLE_MESSAGE,
+          },
+          { clearActiveTurnId: true },
+        );
+
+        const safeRaw = {
+          source: "synara.opencode.compatibility",
+          reason: incident.failure.reason,
+          correlationId: incident.correlationId,
+        };
+        yield* emit(context, {
+          ...buildEventBase({
+            threadId: context.session.threadId,
+            turnId: incident.turnId,
+            raw: safeRaw,
+          }),
+          type: "runtime.error",
+          payload: {
+            message: OPENCODE_STORAGE_SCHEMA_INCOMPATIBLE_MESSAGE,
+            class: "provider_error",
+            reason: incident.failure.reason,
+            detail: {
+              lifecycleStage: incident.failure.lifecycleStage,
+              retryable: false,
+              serverOrigin: context.runtimeOwnership === "external" ? "external" : "managed",
+              correlationId: incident.correlationId,
+            },
+          },
+        });
+
+        if (context.runtimeOwnership === "shared_managed") {
+          yield* Effect.logError("OpenCode compatibility cleanup could not prove isolation", {
+            provider,
+            reason: incident.failure.reason,
+            lifecycleStage: incident.failure.lifecycleStage,
+            serverOrigin: "managed",
+            cleanupOutcome: "isolation_unproven",
+            retrySuppressed: true,
+            correlationId: incident.correlationId,
+          });
+          return;
+        }
+
+        yield* stopAndRemoveOpenCodeContext(context, {
+          releaseOwnedResourcesOnAbortTimeout: true,
+          onClosed: emit(context, {
+            ...buildEventBase({
+              threadId: context.session.threadId,
+              turnId: incident.turnId,
+              raw: safeRaw,
+            }),
+            type: "session.exited",
+            payload: {
+              reason: OPENCODE_STORAGE_SCHEMA_INCOMPATIBLE_MESSAGE,
+              recoverable: false,
+              exitKind: "error",
+            },
+          }),
+        }).pipe(
+          Effect.tap(() =>
+            Effect.logError("OpenCode compatibility incident", {
+              provider,
+              reason: incident.failure.reason,
+              lifecycleStage: incident.failure.lifecycleStage,
+              serverOrigin: context.runtimeOwnership === "external" ? "external" : "managed",
+              cleanupOutcome: "completed",
+              retrySuppressed: true,
+              correlationId: incident.correlationId,
+            }),
+          ),
+          Effect.catchCause(() =>
+            Effect.logError("OpenCode compatibility cleanup failed", {
+              provider,
+              reason: incident.failure.reason,
+              lifecycleStage: incident.failure.lifecycleStage,
+              serverOrigin: context.runtimeOwnership === "external" ? "external" : "managed",
+              cleanupOutcome: "failed",
+              retrySuppressed: true,
+              correlationId: incident.correlationId,
+            }),
+          ),
+          Effect.forkIn(adapterScope),
+        );
+      });
+
       const failOpenCodeCompatibility = Effect.fn("failOpenCodeCompatibility")(function* (
         context: OpenCodeSessionContext,
         input: {
@@ -1277,29 +1390,13 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
           retryable: false,
           detail: failure.diagnosticSummary,
         });
-        const incident: OpenCodeCompatibilityIncident = {
-          turnId: input.turnId,
-          correlationId: randomUUID(),
-          error: compatibilityError,
-          originalCause: input.error,
-        };
-        context.compatibilityIncident = incident;
-
-        clearActiveTurnState(context);
-        updateProviderSession(
-          context,
-          {
-            status: "error",
-            lastError: OPENCODE_STORAGE_SCHEMA_INCOMPATIBLE_MESSAGE,
-          },
-          { clearActiveTurnId: true },
-        );
+        const correlationId = randomUUID();
         const safeRaw = {
           source: "synara.opencode.compatibility",
           reason: failure.reason,
-          correlationId: incident.correlationId,
+          correlationId,
         };
-        yield* emit(context, {
+        const terminalEvent = {
           ...buildEventBase({
             threadId: context.session.threadId,
             turnId: input.turnId,
@@ -1311,83 +1408,38 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
             failureReason: failure.reason,
             errorMessage: OPENCODE_STORAGE_SCHEMA_INCOMPATIBLE_MESSAGE,
           },
-        });
-        yield* emit(context, {
-          ...buildEventBase({
-            threadId: context.session.threadId,
-            turnId: input.turnId,
-            raw: safeRaw,
-          }),
-          type: "runtime.error",
-          payload: {
-            message: OPENCODE_STORAGE_SCHEMA_INCOMPATIBLE_MESSAGE,
-            class: "provider_error",
-            reason: failure.reason,
-            detail: {
-              lifecycleStage: failure.lifecycleStage,
-              retryable: false,
-              serverOrigin: context.runtimeOwnership === "external" ? "external" : "managed",
-              correlationId: incident.correlationId,
-            },
-          },
-        });
+        } satisfies ProviderRuntimeEvent;
+        const incident: OpenCodeCompatibilityIncident = {
+          turnId: input.turnId,
+          correlationId,
+          error: compatibilityError,
+          originalCause: input.error,
+          failure,
+          pendingTerminalEventId: terminalEvent.eventId,
+          terminalAcknowledged: false,
+        };
+        // Install the dispatch-blocking tombstone before the terminal event can
+        // become visible to ProviderService. The adapter remains active/running
+        // until the service acknowledges durable journal + binding completion.
+        context.compatibilityIncident = incident;
 
-        if (context.runtimeOwnership === "shared_managed") {
-          yield* Effect.logError("OpenCode compatibility cleanup could not prove isolation", {
-            provider,
-            reason: failure.reason,
-            lifecycleStage: failure.lifecycleStage,
-            serverOrigin: "managed",
-            cleanupOutcome: "isolation_unproven",
-            retrySuppressed: true,
-            correlationId: incident.correlationId,
-          });
-          return compatibilityError;
-        }
-
-        yield* stopAndRemoveOpenCodeContext(context, {
-          releaseOwnedResourcesOnAbortTimeout: true,
-          onClosed: emit(context, {
-            ...buildEventBase({
-              threadId: context.session.threadId,
-              turnId: input.turnId,
-              raw: safeRaw,
-            }),
-            type: "session.exited",
-            payload: {
-              reason: OPENCODE_STORAGE_SCHEMA_INCOMPATIBLE_MESSAGE,
-              recoverable: false,
-              exitKind: "error",
-            },
-          }),
-        }).pipe(
-          Effect.tap(() =>
-            Effect.logError("OpenCode compatibility incident", {
-              provider,
-              reason: failure.reason,
-              lifecycleStage: failure.lifecycleStage,
-              serverOrigin: context.runtimeOwnership === "external" ? "external" : "managed",
-              cleanupOutcome: "completed",
-              retrySuppressed: true,
-              correlationId: incident.correlationId,
-            }),
-          ),
-          Effect.catchCause(() =>
-            Effect.logError("OpenCode compatibility cleanup failed", {
-              provider,
-              reason: failure.reason,
-              lifecycleStage: failure.lifecycleStage,
-              serverOrigin: context.runtimeOwnership === "external" ? "external" : "managed",
-              cleanupOutcome: "failed",
-              retrySuppressed: true,
-              correlationId: incident.correlationId,
-            }),
-          ),
-          Effect.forkIn(adapterScope),
-        );
+        yield* emit(context, terminalEvent);
 
         return compatibilityError;
       });
+
+      const runtimeEventDurabilityBarrier = {
+        isPending: (event: ProviderRuntimeEvent) =>
+          Effect.sync(() => {
+            const incident = sessions.get(event.threadId)?.compatibilityIncident;
+            return (
+              event.provider === provider &&
+              incident !== undefined &&
+              incident.pendingTerminalEventId === event.eventId
+            );
+          }),
+        acknowledge: acknowledgeOpenCodeCompatibilityTerminal,
+      };
 
       const writeNativeEvent = (
         threadId: ThreadId,
@@ -1672,6 +1724,9 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
           readonly errorMessage?: string | undefined;
         },
       ) {
+        if (context.compatibilityIncident !== undefined) {
+          return;
+        }
         clearActiveTurnState(context);
         updateProviderSession(context, { status: "ready" }, { clearActiveTurnId: true });
         yield* emit(context, {
@@ -2116,6 +2171,9 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
         event: OpenCodeSubscribedEvent,
       ) {
         if (!shouldHandleSubscribedEvent(context, event)) {
+          return;
+        }
+        if (context.compatibilityIncident !== undefined) {
           return;
         }
 
@@ -3267,6 +3325,9 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
               ? input.modelSelection.options?.variant
               : undefined;
           const existing = sessions.get(input.threadId);
+          if (existing?.compatibilityIncident?.pendingTerminalEventId !== undefined) {
+            return yield* existing.compatibilityIncident.error;
+          }
           if (existing) {
             yield* stopAndRemoveOpenCodeContext(existing);
           }
@@ -3579,6 +3640,9 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
 
       const sendTurn: OpenCodeAdapterShape["sendTurn"] = Effect.fn("sendTurn")(function* (input) {
         const context = ensureAdapterSessionContext(input.threadId);
+        if (context.compatibilityIncident !== undefined) {
+          return yield* context.compatibilityIncident.error;
+        }
         const turnId = TurnId.makeUnsafe(`${adapterConfig.turnIdPrefix}-${randomUUID()}`);
         const modelSelection =
           input.modelSelection ??
@@ -3732,6 +3796,9 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
       const interruptTurn: OpenCodeAdapterShape["interruptTurn"] = Effect.fn("interruptTurn")(
         function* (threadId, turnId) {
           const context = ensureAdapterSessionContext(threadId);
+          if (context.compatibilityIncident !== undefined) {
+            return yield* context.compatibilityIncident.error;
+          }
           const activeTurnId = turnId ?? context.activeTurnId;
           yield* runOpenCodeSdk("session.abort", () =>
             context.client.session.abort({
@@ -3801,6 +3868,9 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
               provider,
               threadId,
             });
+          }
+          if (context.compatibilityIncident?.pendingTerminalEventId !== undefined) {
+            return yield* context.compatibilityIncident.error;
           }
           yield* stopAndRemoveOpenCodeContext(context, {
             onClosed: emit(context, {
@@ -4362,6 +4432,7 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
         listAgents,
         ...(provider === "opencode" ? { listCommands } : {}),
         getComposerCapabilities,
+        runtimeEventDurabilityBarrier,
         get streamEvents() {
           return Stream.fromQueue(runtimeEvents);
         },

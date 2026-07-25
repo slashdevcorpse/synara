@@ -32,7 +32,7 @@ import {
   OPENCODE_CLI_SPEC,
 } from "../opencodeRuntime.ts";
 import { KiloAdapter } from "../Services/KiloAdapter.ts";
-import { OpenCodeAdapter } from "../Services/OpenCodeAdapter.ts";
+import { OpenCodeAdapter, type OpenCodeAdapterShape } from "../Services/OpenCodeAdapter.ts";
 import {
   flattenOpenCodeCliModels,
   flattenOpenCodeModels,
@@ -42,6 +42,14 @@ import {
 } from "./OpenCodeAdapter.ts";
 
 const asThreadId = (value: string): ThreadId => ThreadId.makeUnsafe(value);
+
+function requireRuntimeEventDurabilityBarrier(adapter: OpenCodeAdapterShape) {
+  const barrier = adapter.runtimeEventDurabilityBarrier;
+  if (barrier === undefined) {
+    throw new Error("Expected OpenCode runtime-event durability barrier");
+  }
+  return barrier;
+}
 
 function createMockOpenCodeRuntime(options?: {
   readonly inventory?: OpenCodeInventory;
@@ -3911,9 +3919,9 @@ describe("OpenCodeAdapter runtime lifecycle", () => {
     const result = await Effect.runPromise(
       Effect.gen(function* () {
         const adapter = yield* OpenCodeAdapter;
-        const eventsFiber = yield* Stream.runCollect(Stream.take(adapter.streamEvents, 6)).pipe(
-          Effect.forkChild,
-        );
+        const terminalEventsFiber = yield* Stream.runCollect(
+          Stream.take(adapter.streamEvents, 4),
+        ).pipe(Effect.forkChild);
         yield* adapter.startSession({
           provider: "opencode",
           threadId,
@@ -3930,9 +3938,42 @@ describe("OpenCodeAdapter runtime lifecycle", () => {
             },
           })
           .pipe(Effect.result);
-        const events = Array.from(yield* Fiber.join(eventsFiber));
+        const terminalEvents = Array.from(yield* Fiber.join(terminalEventsFiber));
+        const terminalEvent = terminalEvents[3];
+        if (terminalEvent === undefined) {
+          return yield* Effect.dieMessage("Expected OpenCode compatibility terminal event");
+        }
+        const barrier = requireRuntimeEventDurabilityBarrier(adapter);
+        const pendingBeforeAck = yield* barrier.isPending(terminalEvent);
+        const sessionsDuringBarrier = yield* adapter.listSessions();
+        const secondSendResult = yield* adapter
+          .sendTurn({
+            threadId,
+            input: "do not replay",
+            attachments: [],
+            modelSelection: {
+              provider: "opencode",
+              model: "opencode/claude-opus-4-7",
+            },
+          })
+          .pipe(Effect.result);
+        yield* barrier.acknowledge(terminalEvent);
+        yield* barrier.acknowledge(terminalEvent);
+        const pendingAfterAck = yield* barrier.isPending(terminalEvent);
+        const cleanupEvents = Array.from(
+          yield* Stream.runCollect(Stream.take(adapter.streamEvents, 2)),
+        );
+        const events = [...terminalEvents, ...cleanupEvents];
         const sessions = yield* adapter.listSessions();
-        return { events, sendResult, sessions };
+        return {
+          events,
+          pendingBeforeAck,
+          pendingAfterAck,
+          secondSendResult,
+          sendResult,
+          sessions,
+          sessionsDuringBarrier,
+        };
       }).pipe(
         Effect.provide(
           makeOpenCodeAdapterLive({
@@ -3952,6 +3993,17 @@ describe("OpenCodeAdapter runtime lifecycle", () => {
     if (Result.isFailure(result.sendResult)) {
       expect(result.sendResult.failure).toBeInstanceOf(ProviderAdapterCompatibilityError);
     }
+    expect(result.pendingBeforeAck).toBe(true);
+    expect(result.pendingAfterAck).toBe(false);
+    expect(Result.isFailure(result.secondSendResult)).toBe(true);
+    if (Result.isFailure(result.secondSendResult)) {
+      expect(result.secondSendResult.failure).toBeInstanceOf(ProviderAdapterCompatibilityError);
+    }
+    expect(result.sessionsDuringBarrier).toHaveLength(1);
+    expect(result.sessionsDuringBarrier[0]).toMatchObject({
+      status: "running",
+      activeTurnId: expect.any(String),
+    });
     expect(result.events.map((event) => event.type)).toEqual([
       "session.started",
       "thread.started",
@@ -4008,9 +4060,9 @@ describe("OpenCodeAdapter runtime lifecycle", () => {
     const result = await Effect.runPromise(
       Effect.gen(function* () {
         const adapter = yield* OpenCodeAdapter;
-        const eventsFiber = yield* Stream.runCollect(Stream.take(adapter.streamEvents, 6)).pipe(
-          Effect.forkChild,
-        );
+        const terminalEventsFiber = yield* Stream.runCollect(
+          Stream.take(adapter.streamEvents, 4),
+        ).pipe(Effect.forkChild);
         yield* adapter.startSession({
           provider: "opencode",
           threadId,
@@ -4036,7 +4088,16 @@ describe("OpenCodeAdapter runtime lifecycle", () => {
           },
           response: { status: 500 },
         });
-        const events = Array.from(yield* Fiber.join(eventsFiber));
+        const terminalEvents = Array.from(yield* Fiber.join(terminalEventsFiber));
+        const terminalEvent = terminalEvents[3];
+        if (terminalEvent === undefined) {
+          return yield* Effect.dieMessage("Expected delayed compatibility terminal event");
+        }
+        yield* requireRuntimeEventDurabilityBarrier(adapter).acknowledge(terminalEvent);
+        const cleanupEvents = Array.from(
+          yield* Stream.runCollect(Stream.take(adapter.streamEvents, 2)),
+        );
+        const events = [...terminalEvents, ...cleanupEvents];
         yield* Effect.sleep(25);
         return { events, sendResult };
       }).pipe(
@@ -4100,9 +4161,9 @@ describe("OpenCodeAdapter runtime lifecycle", () => {
     const result = await Effect.runPromise(
       Effect.gen(function* () {
         const adapter = yield* OpenCodeAdapter;
-        const eventsFiber = yield* Stream.runCollect(Stream.take(adapter.streamEvents, 6)).pipe(
-          Effect.forkChild,
-        );
+        const terminalEventsFiber = yield* Stream.runCollect(
+          Stream.take(adapter.streamEvents, 4),
+        ).pipe(Effect.forkChild);
         yield* adapter.startSession({
           provider: "opencode",
           threadId,
@@ -4127,7 +4188,16 @@ describe("OpenCodeAdapter runtime lifecycle", () => {
             },
           });
         }
-        const events = Array.from(yield* Fiber.join(eventsFiber));
+        const terminalEvents = Array.from(yield* Fiber.join(terminalEventsFiber));
+        const terminalEvent = terminalEvents[3];
+        if (terminalEvent === undefined) {
+          return yield* Effect.dieMessage("Expected provider compatibility terminal event");
+        }
+        yield* requireRuntimeEventDurabilityBarrier(adapter).acknowledge(terminalEvent);
+        const cleanupEvents = Array.from(
+          yield* Stream.runCollect(Stream.take(adapter.streamEvents, 2)),
+        );
+        const events = [...terminalEvents, ...cleanupEvents];
         yield* Effect.sleep(25);
         return {
           events,
@@ -4183,9 +4253,9 @@ describe("OpenCodeAdapter runtime lifecycle", () => {
     await Effect.runPromise(
       Effect.gen(function* () {
         const adapter = yield* OpenCodeAdapter;
-        const eventsFiber = yield* Stream.runCollect(Stream.take(adapter.streamEvents, 6)).pipe(
-          Effect.forkChild,
-        );
+        const terminalEventsFiber = yield* Stream.runCollect(
+          Stream.take(adapter.streamEvents, 4),
+        ).pipe(Effect.forkChild);
         yield* adapter.startSession({
           provider: "opencode",
           threadId,
@@ -4216,7 +4286,13 @@ describe("OpenCodeAdapter runtime lifecycle", () => {
             },
           },
         });
-        yield* Fiber.join(eventsFiber);
+        const terminalEvents = Array.from(yield* Fiber.join(terminalEventsFiber));
+        const terminalEvent = terminalEvents[3];
+        if (terminalEvent === undefined) {
+          return yield* Effect.dieMessage("Expected external compatibility terminal event");
+        }
+        yield* requireRuntimeEventDurabilityBarrier(adapter).acknowledge(terminalEvent);
+        yield* Stream.runCollect(Stream.take(adapter.streamEvents, 2));
       }).pipe(
         Effect.provide(
           makeOpenCodeAdapterLive({

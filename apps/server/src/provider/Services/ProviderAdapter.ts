@@ -93,6 +93,19 @@ export interface ProviderThreadSnapshot {
   readonly cwd?: string | null;
 }
 
+/**
+ * Optional adapter-owned barrier for runtime events that must become durable
+ * before the adapter may expose an idle/removed session.
+ *
+ * `isPending` must remain true while the adapter still owns the corresponding
+ * dispatch-blocking tombstone. `ProviderService` calls `acknowledge` only after
+ * the event journal append and binding transition have both succeeded.
+ */
+export interface ProviderRuntimeEventDurabilityBarrier<TError> {
+  readonly isPending: (event: ProviderRuntimeEvent) => Effect.Effect<boolean, TError>;
+  readonly acknowledge: (event: ProviderRuntimeEvent) => Effect.Effect<void, TError>;
+}
+
 export interface ProviderAdapterShape<TError> {
   /**
    * Provider kind implemented by this adapter.
@@ -234,6 +247,12 @@ export interface ProviderAdapterShape<TError> {
    * Canonical runtime event stream emitted by this adapter.
    */
   readonly streamEvents: Stream.Stream<ProviderRuntimeEvent>;
+
+  /**
+   * Adapter-owned handoff for terminal events whose local state must remain
+   * dispatch-blocking until the service has durably committed the event.
+   */
+  readonly runtimeEventDurabilityBarrier?: ProviderRuntimeEventDurabilityBarrier<TError>;
 
   /**
    * Read provider-specific composer capabilities.
