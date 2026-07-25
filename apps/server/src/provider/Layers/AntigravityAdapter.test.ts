@@ -16,10 +16,7 @@ import { ServerConfig } from "../../config";
 import type { ProviderMaintenanceOwnedResourceCoordinator } from "../providerMaintenanceOwnedResources";
 import { makeProviderProcessOwnerTracker } from "../providerProcessOwnerTracker.ts";
 import { AntigravityAdapter, type AntigravityAdapterShape } from "../Services/AntigravityAdapter";
-import {
-  containPreparedWindowsProviderProcess,
-  WindowsProviderShellLaunchError,
-} from "../windowsProviderProcess.ts";
+import { containPreparedWindowsProviderProcess } from "../windowsProviderProcess.ts";
 import {
   supervisePreparedNodeProcess,
   windowsJobNodeProcessSupervisor,
