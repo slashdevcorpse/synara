@@ -233,9 +233,8 @@ function withFakeCodexEnv<A, E, R>(
   },
   effect: Effect.Effect<A, E, R>,
 ) {
-  return Effect.acquireUseRelease(
+  const withEnvironment = Effect.acquireUseRelease(
     Effect.gen(function* () {
-      const releaseLock = yield* acquireCodexEnvLock();
       const fs = yield* FileSystem.FileSystem;
       const tempDir = yield* fs.makeTempDirectoryScoped({ prefix: "synara-codex-text-" });
       const { binDir, nativeCodexPath } = yield* makeFakeCodexBinary(tempDir);
@@ -259,23 +258,35 @@ function withFakeCodexEnv<A, E, R>(
         process.env.SYNARA_FAKE_CODEX_CODEX_HOME_CONFIG_MUST_CONTAIN;
       const previousCodexHomeConfigMustNotContain =
         process.env.SYNARA_FAKE_CODEX_CODEX_HOME_CONFIG_MUST_NOT_CONTAIN;
+      const fakePath = [binDir, ...inheritedPathWithoutNativeCodex(previousPath)].join(
+        NodePath.delimiter,
+      );
+      const fakeResolverEnv = {
+        ...process.env,
+        PATH: fakePath,
+        CODEX_INSTALL_DIR: tempDir,
+        LOCALAPPDATA: tempDir,
+        SYNARA_HOME: tempDir,
+      };
+      const encodedOutput = Buffer.from(input.output, "utf8").toString("base64");
+
+      if (process.platform === "win32") {
+        yield* Effect.sync(() =>
+          expect(
+            realpathSync.native(resolveCodexCliExecutable("codex", { env: fakeResolverEnv })),
+          ).toBe(realpathSync.native(nativeCodexPath!)),
+        );
+      }
 
       yield* Effect.sync(() => {
-        process.env.PATH = [binDir, ...inheritedPathWithoutNativeCodex(previousPath)].join(
-          NodePath.delimiter,
-        );
+        if (process.platform === "win32") {
+          process.chdir(tempDir);
+        }
+        process.env.PATH = fakePath;
         process.env.CODEX_INSTALL_DIR = tempDir;
         process.env.LOCALAPPDATA = tempDir;
         process.env.SYNARA_HOME = tempDir;
-        if (process.platform === "win32") {
-          expect(
-            realpathSync.native(resolveCodexCliExecutable("codex", { env: process.env })),
-          ).toBe(realpathSync.native(nativeCodexPath!));
-          process.chdir(tempDir);
-        }
-        process.env.SYNARA_FAKE_CODEX_OUTPUT_B64 = Buffer.from(input.output, "utf8").toString(
-          "base64",
-        );
+        process.env.SYNARA_FAKE_CODEX_OUTPUT_B64 = encodedOutput;
 
         if (input.exitCode !== undefined) {
           process.env.SYNARA_FAKE_CODEX_EXIT_CODE = String(input.exitCode);
@@ -364,7 +375,6 @@ function withFakeCodexEnv<A, E, R>(
         previousRequireApprovalNever,
         previousCodexHomeConfigMustContain,
         previousCodexHomeConfigMustNotContain,
-        releaseLock,
       };
     }),
     () => effect,
@@ -466,9 +476,12 @@ function withFakeCodexEnv<A, E, R>(
           process.env.SYNARA_FAKE_CODEX_CODEX_HOME_CONFIG_MUST_NOT_CONTAIN =
             previous.previousCodexHomeConfigMustNotContain;
         }
-
-        previous.releaseLock();
       }),
+  );
+  return Effect.acquireUseRelease(
+    acquireCodexEnvLock(),
+    () => withEnvironment,
+    (releaseLock) => Effect.sync(releaseLock),
   );
 }
 
