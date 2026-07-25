@@ -9,11 +9,10 @@ import { PassThrough } from "node:stream";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { ThreadId } from "@synara/contracts";
 import type { WindowsSafeProcessInput } from "@synara/shared/windowsProcess";
-import { Effect, Layer } from "effect";
+import { Effect, Layer, Stream } from "effect";
 import { describe, expect, it, vi } from "vitest";
 
 import { ServerConfig } from "../../config";
-import { ANTIGRAVITY_WINDOWS_UNAVAILABLE_MESSAGE } from "../antigravityAvailability.ts";
 import type { ProviderMaintenanceOwnedResourceCoordinator } from "../providerMaintenanceOwnedResources";
 import { makeProviderProcessOwnerTracker } from "../providerProcessOwnerTracker.ts";
 import { AntigravityAdapter, type AntigravityAdapterShape } from "../Services/AntigravityAdapter";
@@ -248,44 +247,182 @@ async function startFakeAdapterTurn(input: {
 }
 
 describe("Antigravity platform availability", () => {
-  it("fails closed on Windows before plugin installation, model discovery, or provider spawn", async () => {
+  it("uses native Windows compatibility mode without hooks or capture state", async () => {
+    const fakes = [makeFakeChild(42_101), makeFakeChild(42_102)];
     const installCapturePlugin = vi.fn(async () => undefined);
-    const spawnProcess = vi.fn<NonNullable<AntigravityProcessDependencies["spawnProcess"]>>(() => {
-      throw new Error("Antigravity must not spawn on Windows");
-    });
-    const threadId = ThreadId.makeUnsafe(`antigravity-windows-${crypto.randomUUID()}`);
-
-    await runWithAdapter(
-      {
-        platform: "win32",
-        installCapturePlugin,
-        spawnProcess,
+    const preparedTurns: Array<{
+      readonly command: string;
+      readonly args: ReadonlyArray<string>;
+    }> = [];
+    const spawned: Array<{
+      readonly command: string;
+      readonly args: ReadonlyArray<string>;
+      readonly options: SpawnOptions;
+    }> = [];
+    const spawnProcess = vi.fn<NonNullable<AntigravityProcessDependencies["spawnProcess"]>>(
+      (command, args, options) => {
+        const fake = fakes[spawned.length];
+        if (!fake) throw new Error("Unexpected Antigravity spawn.");
+        spawned.push({ command, args, options });
+        return fake.child;
       },
-      async (adapter) => {
-        await expect(
-          Effect.runPromise(
+    );
+    const threadId = ThreadId.makeUnsafe(`antigravity-windows-${crypto.randomUUID()}`);
+    const captureEnv = {
+      SYNARA_ANTIGRAVITY_EVENTS: process.env.SYNARA_ANTIGRAVITY_EVENTS,
+      SYNARA_ANTIGRAVITY_HOOK_DECISION: process.env.SYNARA_ANTIGRAVITY_HOOK_DECISION,
+      SYNARA_ANTIGRAVITY_CAPTURE_EXECUTABLE:
+        process.env.SYNARA_ANTIGRAVITY_CAPTURE_EXECUTABLE,
+      SYNARA_ANTIGRAVITY_CAPTURE_SCRIPT: process.env.SYNARA_ANTIGRAVITY_CAPTURE_SCRIPT,
+    };
+    process.env.SYNARA_ANTIGRAVITY_EVENTS = "must-not-leak";
+    process.env.SYNARA_ANTIGRAVITY_HOOK_DECISION = "must-not-leak";
+    process.env.SYNARA_ANTIGRAVITY_CAPTURE_EXECUTABLE = "must-not-leak";
+    process.env.SYNARA_ANTIGRAVITY_CAPTURE_SCRIPT = "must-not-leak";
+
+    try {
+      await runWithAdapter(
+        {
+          platform: "win32",
+          installCapturePlugin,
+          prepareProcess: (command, args) => {
+            preparedTurns.push({ command, args: [...args] });
+            return {
+              command: "C:\\Users\\Test\\AppData\\Local\\agy\\bin\\agy.exe",
+              args: [...args],
+              shell: false,
+              windowsHide: true,
+            };
+          },
+          containProcess: (prepared, input) =>
+            containPreparedWindowsProviderProcess(prepared, {
+              ...input,
+              platform: "win32",
+              arch: "x64",
+              launcherPath: "C:\\synara\\synara-windows-job-launcher.exe",
+              fileExists: () => true,
+            }),
+          spawnProcess,
+          superviseProcess: (prepared, child, supervisorOptions) =>
+            supervisePreparedNodeProcess(prepared, child, {
+              ...supervisorOptions,
+              requestStop: async () => {
+                child.emit("close", 143, null);
+              },
+              verifyExit: async () => undefined,
+            }),
+        },
+        async (adapter) => {
+          expect(adapter.capabilities.conversationContinuity).toBe("prompt-replay");
+          const runtimeEvents = Effect.runPromise(
+            adapter.streamEvents.pipe(
+              Stream.takeUntil((event) => event.type === "turn.completed"),
+              Stream.runCollect,
+            ),
+          );
+          await Effect.runPromise(
             adapter.startSession({
               provider: "antigravity",
               threadId,
               runtimeMode: "full-access",
-              providerOptions: { antigravity: { binaryPath: "agy.exe" } },
+              providerOptions: { antigravity: { binaryPath: "agy" } },
             }),
-          ),
-        ).rejects.toThrow(ANTIGRAVITY_WINDOWS_UNAVAILABLE_MESSAGE);
-        await expect(
-          Effect.runPromise(
-            adapter.listModels!({
+          );
+          await Effect.runPromise(adapter.sendTurn({ threadId, input: "first prompt" }));
+          fakes[0]!.stdout.write("first final answer");
+          fakes[0]!.stderr.write("opaque warning");
+          fakes[0]!.emitClose(0);
+          const events = Array.from(await runtimeEvents);
+
+          expect(events.filter((event) => event.type === "content.delta")).toEqual([
+            expect.objectContaining({
+              payload: { streamKind: "assistant_text", delta: "first final answer" },
+            }),
+          ]);
+          expect(
+            events.some(
+              (event) =>
+                event.type === "item.started" &&
+                ["reasoning", "plan", "command_execution"].includes(event.payload.itemType),
+            ),
+          ).toBe(false);
+          expect(events.at(-1)).toMatchObject({
+            type: "turn.completed",
+            payload: { state: "completed", stopReason: "model_stop" },
+          });
+
+          await Effect.runPromise(
+            adapter.startSession({
               provider: "antigravity",
-              binaryPath: "agy.exe",
+              threadId,
+              runtimeMode: "full-access",
+              resumeCursor: { providerThreadId: "conversation-123" },
+              providerOptions: { antigravity: { binaryPath: "agy" } },
             }),
-          ),
-        ).rejects.toThrow(ANTIGRAVITY_WINDOWS_UNAVAILABLE_MESSAGE);
-        expect(await Effect.runPromise(adapter.listSessions())).toEqual([]);
-      },
-    );
+          );
+          await Effect.runPromise(adapter.sendTurn({ threadId, input: "resumed prompt" }));
+          fakes[1]!.stdout.write("resumed final answer");
+          fakes[1]!.emitClose(0);
+          await waitFor(
+            () =>
+              preparedTurns.length === 2 &&
+              spawned.length === 2 &&
+              !(
+                Effect.runSync(adapter.listSessions())[0]?.status === "running"
+              ),
+          );
+        },
+      );
+    } finally {
+      for (const [key, value] of Object.entries(captureEnv)) {
+        if (value === undefined) {
+          delete process.env[key];
+        } else {
+          process.env[key] = value;
+        }
+      }
+    }
 
     expect(installCapturePlugin).not.toHaveBeenCalled();
-    expect(spawnProcess).not.toHaveBeenCalled();
+    expect(preparedTurns).toHaveLength(2);
+    expect(preparedTurns[0]).toEqual({
+      command: "agy",
+      args: [
+        "--new-project",
+        "--dangerously-skip-permissions",
+        "--model",
+        "Gemini 3.5 Flash (Medium)",
+        "--print-timeout",
+        "30m",
+        "-p",
+        "first prompt",
+      ],
+    });
+    expect(preparedTurns[1]?.args).toEqual([
+      "--conversation",
+      "conversation-123",
+      "--dangerously-skip-permissions",
+      "--model",
+      "Gemini 3.5 Flash (Medium)",
+      "--print-timeout",
+      "30m",
+      "-p",
+      "resumed prompt",
+    ]);
+    for (const turn of preparedTurns) {
+      expect(turn.args).not.toContain("--continue");
+      expect(turn.args).not.toContain("--log-file");
+    }
+    for (const launch of spawned) {
+      expect(launch.command).toBe("C:\\synara\\synara-windows-job-launcher.exe");
+      expect(launch.options.shell).toBe(false);
+      expect(launch.options.windowsHide).toBe(true);
+      expect(
+        Object.keys(launch.options.env ?? {}).some((key) =>
+          key.toUpperCase().startsWith("SYNARA_ANTIGRAVITY"),
+        ),
+      ).toBe(false);
+    }
   });
 
   it("preserves non-Windows session startup and plugin installation", async () => {

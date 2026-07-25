@@ -118,6 +118,9 @@ type ProviderInstallSettings = {
   readonly fields: readonly ProviderInstallField[];
 };
 
+export const ANTIGRAVITY_WINDOWS_COMPATIBILITY_DESCRIPTION =
+  "On Windows, Synara uses native compatibility mode: it captures final response text and replays a bounded Synara transcript for follow-ups. Live structured events, usage telemetry, and native resume are unavailable. Synara does not install hooks or modify Antigravity provider state.";
+
 const PROVIDER_VISIBILITY_OPTIONS: ReadonlyArray<{ provider: ProviderKind; title: string }> =
   PROVIDER_DESCRIPTORS.map((descriptor) => ({
     provider: descriptor.kind,
@@ -236,6 +239,9 @@ const PROVIDER_INSTALL_SETTINGS: readonly ProviderInstallSettings[] = [
         description: (
           <>
             Leave blank to use <code>agy</code> from your PATH.
+            <span className="mt-1 block">
+              {ANTIGRAVITY_WINDOWS_COMPATIBILITY_DESCRIPTION}
+            </span>
           </>
         ),
       },

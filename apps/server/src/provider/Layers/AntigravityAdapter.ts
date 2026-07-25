@@ -20,10 +20,7 @@ import { Cause, Effect, Exit, Layer, Queue, Stream } from "effect";
 
 import { ServerConfig } from "../../config.ts";
 import { buildProviderChildEnvironment } from "../../providerChildEnvironment.ts";
-import {
-  ANTIGRAVITY_WINDOWS_UNAVAILABLE_MESSAGE,
-  isAntigravityAvailableOnPlatform,
-} from "../antigravityAvailability.ts";
+import { isAntigravityWindowsCompatibilityMode } from "../antigravityAvailability.ts";
 import {
   ProviderAdapterRequestError,
   ProviderAdapterSessionNotFoundError,
@@ -33,7 +30,10 @@ import {
   AntigravityAdapter,
   type AntigravityAdapterShape,
 } from "../Services/AntigravityAdapter.ts";
-import type { ProviderThreadSnapshot } from "../Services/ProviderAdapter.ts";
+import {
+  PROVIDER_PROMPT_REPLAY_MAX_INPUT_CHARS,
+  type ProviderThreadSnapshot,
+} from "../Services/ProviderAdapter.ts";
 import { appendFileAttachmentsPromptBlock } from "../attachmentProjection.ts";
 import {
   findProviderProcessExitUnprovenError,
@@ -71,7 +71,6 @@ const POLL_INTERVAL_MS = 75;
 const MODEL_DISCOVERY_TIMEOUT_MS = 15_000;
 const PLUGIN_INSTALL_TIMEOUT_MS = 30_000;
 export const ANTIGRAVITY_PROCESS_OUTPUT_MAX_BYTES = 128 * 1024;
-const WINDOWS_PROMPT_MAX_CHARS = 24_000;
 const ANTIGRAVITY_CAPTURE_EXECUTABLE_ENV = "SYNARA_ANTIGRAVITY_CAPTURE_EXECUTABLE";
 const ANTIGRAVITY_CAPTURE_SCRIPT_ENV = "SYNARA_ANTIGRAVITY_CAPTURE_SCRIPT";
 
@@ -186,6 +185,13 @@ function resumeConversationId(value: unknown): string | undefined {
     if (typeof record[key] === "string" && record[key].trim()) return record[key].trim();
   }
   return undefined;
+}
+
+function trustworthyWindowsConversationId(value: unknown): string | undefined {
+  const conversationId = resumeConversationId(value);
+  return conversationId && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u.test(conversationId)
+    ? conversationId
+    : undefined;
 }
 
 function transcriptPathForConversation(conversationId: string): string {
@@ -814,10 +820,10 @@ export function antigravityPromptCommandLineIssue(
   prompt: string,
   platform: NodeJS.Platform = process.platform,
 ): string | null {
-  if (platform !== "win32" || prompt.length <= WINDOWS_PROMPT_MAX_CHARS) {
+  if (platform !== "win32" || prompt.length <= PROVIDER_PROMPT_REPLAY_MAX_INPUT_CHARS) {
     return null;
   }
-  return `Antigravity prompts on Windows are limited to ${WINDOWS_PROMPT_MAX_CHARS.toLocaleString("en-US")} characters because the CLI accepts print-mode prompts as command-line arguments. Shorten the prompt or attach the content as files.`;
+  return `Antigravity prompts on Windows are limited to ${PROVIDER_PROMPT_REPLAY_MAX_INPUT_CHARS.toLocaleString("en-US")} characters because the CLI accepts print-mode prompts as command-line arguments. Shorten the prompt or attach the content as files.`;
 }
 
 export function parseAntigravityModelLines(output: string): ProviderListModelsResult["models"] {
@@ -922,6 +928,7 @@ export function makeAntigravityRuntimeEventBase(input: {
 const makeAntigravityAdapter = Effect.fn(function* (options: AntigravityAdapterLiveOptions = {}) {
   const serverConfig = yield* ServerConfig;
   const platform = options.platform ?? process.platform;
+  const windowsCompatibilityMode = isAntigravityWindowsCompatibilityMode(platform);
   const events = yield* Queue.unbounded<ProviderRuntimeEvent>();
   const sessions = new Map<ThreadId, AntigravitySessionContext>();
   const defaultEffortByModel = new Map(Object.entries(DEFAULT_EFFORT_BY_MODEL));
@@ -1215,13 +1222,6 @@ const makeAntigravityAdapter = Effect.fn(function* (options: AntigravityAdapterL
 
   const startSession: AntigravityAdapterShape["startSession"] = (input) =>
     Effect.gen(function* () {
-      if (!isAntigravityAvailableOnPlatform(platform)) {
-        return yield* new ProviderAdapterValidationError({
-          provider: PROVIDER,
-          operation: "session/start",
-          issue: ANTIGRAVITY_WINDOWS_UNAVAILABLE_MESSAGE,
-        });
-      }
       if (input.runtimeMode !== "full-access") {
         return yield* new ProviderAdapterValidationError({
           provider: PROVIDER,
@@ -1231,19 +1231,21 @@ const makeAntigravityAdapter = Effect.fn(function* (options: AntigravityAdapterL
         });
       }
       const binaryPath = trim(input.providerOptions?.antigravity?.binaryPath) ?? "agy";
-      yield* Effect.tryPromise({
-        try: () =>
-          options.installCapturePlugin
-            ? options.installCapturePlugin(binaryPath)
-            : ensureCapturePlugin(binaryPath, processDependencies),
-        catch: (cause) =>
-          new ProviderAdapterRequestError({
-            provider: PROVIDER,
-            method: "plugin/install",
-            detail: messageFromCause(cause, "Failed to install the Synara capture hook."),
-            cause,
-          }),
-      });
+      if (!windowsCompatibilityMode) {
+        yield* Effect.tryPromise({
+          try: () =>
+            options.installCapturePlugin
+              ? options.installCapturePlugin(binaryPath)
+              : ensureCapturePlugin(binaryPath, processDependencies),
+          catch: (cause) =>
+            new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "plugin/install",
+              detail: messageFromCause(cause, "Failed to install the Synara capture hook."),
+              cause,
+            }),
+        });
+      }
       const existing = sessions.get(input.threadId);
       if (existing) {
         existing.stopped = true;
@@ -1251,7 +1253,9 @@ const makeAntigravityAdapter = Effect.fn(function* (options: AntigravityAdapterL
         yield* teardownActiveProcess(existing, "session/restart");
       }
       const now = new Date().toISOString();
-      const conversationId = resumeConversationId(input.resumeCursor);
+      const conversationId = windowsCompatibilityMode
+        ? trustworthyWindowsConversationId(input.resumeCursor)
+        : resumeConversationId(input.resumeCursor);
       const modelSelection =
         input.modelSelection?.provider === PROVIDER ? input.modelSelection : undefined;
       const model = modelSelection?.model ?? DEFAULT_MODEL;
@@ -1275,7 +1279,7 @@ const makeAntigravityAdapter = Effect.fn(function* (options: AntigravityAdapterL
         turns: [],
         ...(conversationId ? { conversationId } : {}),
         ...(modelSelection?.options ? { modelOptions: modelSelection.options } : {}),
-        ...(conversationId
+        ...(!windowsCompatibilityMode && conversationId
           ? { transcriptPath: transcriptPathForConversation(conversationId) }
           : {}),
         processedHookBytes: 0,
@@ -1291,7 +1295,9 @@ const makeAntigravityAdapter = Effect.fn(function* (options: AntigravityAdapterL
         ...base(context, { includeTurn: false }),
         type: "session.started",
         payload: {
-          message: "Antigravity CLI session started",
+          message: windowsCompatibilityMode
+            ? "Antigravity CLI native compatibility session started"
+            : "Antigravity CLI session started",
           ...(conversationId ? { resume: conversationId } : {}),
         },
       } satisfies ProviderRuntimeEvent);
@@ -1327,7 +1333,7 @@ const makeAntigravityAdapter = Effect.fn(function* (options: AntigravityAdapterL
           issue: "A prompt or file attachment is required.",
         });
       }
-      const promptIssue = antigravityPromptCommandLineIssue(normalizedPrompt);
+      const promptIssue = antigravityPromptCommandLineIssue(normalizedPrompt, platform);
       if (promptIssue) {
         return yield* new ProviderAdapterValidationError({
           provider: PROVIDER,
@@ -1345,28 +1351,32 @@ const makeAntigravityAdapter = Effect.fn(function* (options: AntigravityAdapterL
         modelOptions,
         defaultEffortByModel.get(model),
       );
-      const runDir = yield* Effect.tryPromise({
-        try: () => fs.mkdtemp(path.join(os.tmpdir(), "synara-antigravity-")),
-        catch: (cause) =>
-          new ProviderAdapterRequestError({
-            provider: PROVIDER,
-            method: "turn/prepare",
-            detail: messageFromCause(cause, "Failed to prepare Antigravity turn files."),
-            cause,
-          }),
-      });
-      const eventFile = path.join(runDir, "hooks.ndjson");
-      const logFile = path.join(runDir, "agy.log");
-      yield* Effect.tryPromise({
-        try: () => fs.writeFile(eventFile, ""),
-        catch: (cause) =>
-          new ProviderAdapterRequestError({
-            provider: PROVIDER,
-            method: "turn/prepare",
-            detail: messageFromCause(cause, "Failed to create the Antigravity hook stream."),
-            cause,
-          }),
-      });
+      const runDir = windowsCompatibilityMode
+        ? undefined
+        : yield* Effect.tryPromise({
+            try: () => fs.mkdtemp(path.join(os.tmpdir(), "synara-antigravity-")),
+            catch: (cause) =>
+              new ProviderAdapterRequestError({
+                provider: PROVIDER,
+                method: "turn/prepare",
+                detail: messageFromCause(cause, "Failed to prepare Antigravity turn files."),
+                cause,
+              }),
+          });
+      const eventFile = runDir ? path.join(runDir, "hooks.ndjson") : undefined;
+      const logFile = runDir ? path.join(runDir, "agy.log") : undefined;
+      if (eventFile) {
+        yield* Effect.tryPromise({
+          try: () => fs.writeFile(eventFile, ""),
+          catch: (cause) =>
+            new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "turn/prepare",
+              detail: messageFromCause(cause, "Failed to create the Antigravity hook stream."),
+              cause,
+            }),
+        });
+      }
       context.activeTurnId = turnId;
       context.activePrompt = normalizedPrompt;
       if (modelOptions) {
@@ -1374,10 +1384,16 @@ const makeAntigravityAdapter = Effect.fn(function* (options: AntigravityAdapterL
       } else {
         delete context.modelOptions;
       }
-      context.eventFile = eventFile;
+      if (eventFile) {
+        context.eventFile = eventFile;
+      } else {
+        delete context.eventFile;
+      }
       context.processedHookBytes = 0;
       context.processedSteps.clear();
-      yield* Effect.promise(() => markExistingTranscriptStepsProcessed(context));
+      if (!windowsCompatibilityMode) {
+        yield* Effect.promise(() => markExistingTranscriptStepsProcessed(context));
+      }
       context.pendingTools = [];
       context.sawAssistant = false;
       context.interrupted = false;
@@ -1395,29 +1411,31 @@ const makeAntigravityAdapter = Effect.fn(function* (options: AntigravityAdapterL
         "--dangerously-skip-permissions",
         "--model",
         cliModel,
-        "--log-file",
-        logFile,
+        ...(logFile ? ["--log-file", logFile] : []),
         "--print-timeout",
         PRINT_TIMEOUT,
         "-p",
         normalizedPrompt,
       ];
       const cwd = context.session.cwd ?? serverConfig.cwd;
-      const env = buildProviderChildEnvironment({
-        provider: PROVIDER,
-        inheritedSynaraKeys: [
-          "SYNARA_ANTIGRAVITY_EVENTS",
-          "SYNARA_ANTIGRAVITY_HOOK_DECISION",
-          ANTIGRAVITY_CAPTURE_EXECUTABLE_ENV,
-          ANTIGRAVITY_CAPTURE_SCRIPT_ENV,
-        ],
-        overrides: {
-          SYNARA_ANTIGRAVITY_EVENTS: eventFile,
-          SYNARA_ANTIGRAVITY_HOOK_DECISION: "allow",
-          [ANTIGRAVITY_CAPTURE_EXECUTABLE_ENV]: process.execPath,
-          [ANTIGRAVITY_CAPTURE_SCRIPT_ENV]: antigravityCaptureScriptPath(),
-        },
-      });
+      const env = windowsCompatibilityMode
+        ? buildProviderChildEnvironment({ provider: PROVIDER, platform })
+        : buildProviderChildEnvironment({
+            provider: PROVIDER,
+            platform,
+            inheritedSynaraKeys: [
+              "SYNARA_ANTIGRAVITY_EVENTS",
+              "SYNARA_ANTIGRAVITY_HOOK_DECISION",
+              ANTIGRAVITY_CAPTURE_EXECUTABLE_ENV,
+              ANTIGRAVITY_CAPTURE_SCRIPT_ENV,
+            ],
+            overrides: {
+              SYNARA_ANTIGRAVITY_EVENTS: eventFile,
+              SYNARA_ANTIGRAVITY_HOOK_DECISION: "allow",
+              [ANTIGRAVITY_CAPTURE_EXECUTABLE_ENV]: process.execPath,
+              [ANTIGRAVITY_CAPTURE_SCRIPT_ENV]: antigravityCaptureScriptPath(),
+            },
+          });
       let pollTimer: ReturnType<typeof setInterval> | undefined;
       let lifecycle!: AntigravityTurnProcessLifecycle;
       try {
@@ -1430,11 +1448,15 @@ const makeAntigravityAdapter = Effect.fn(function* (options: AntigravityAdapterL
           onFinalize: async (result) => {
             if (pollTimer) clearInterval(pollTimer);
             if (sessions.get(input.threadId) !== context || context.activeLifecycle !== lifecycle) {
-              await fs.rm(runDir, { recursive: true, force: true }).catch(() => undefined);
+              if (runDir) {
+                await fs.rm(runDir, { recursive: true, force: true }).catch(() => undefined);
+              }
               return;
             }
 
-            await pollHookFile(context);
+            if (!windowsCompatibilityMode) {
+              await pollHookFile(context);
+            }
             if (!context.sawAssistant && result.stdout.trim()) {
               emitTextItem(
                 context,
@@ -1523,7 +1545,9 @@ const makeAntigravityAdapter = Effect.fn(function* (options: AntigravityAdapterL
                 retainedOutputBytes: result.retainedOutputBytes,
               }),
             } satisfies ProviderRuntimeEvent);
-            await fs.rm(runDir, { recursive: true, force: true }).catch(() => undefined);
+            if (runDir) {
+              await fs.rm(runDir, { recursive: true, force: true }).catch(() => undefined);
+            }
             if (finalizationHookError) throw finalizationHookError;
           },
         });
@@ -1538,9 +1562,11 @@ const makeAntigravityAdapter = Effect.fn(function* (options: AntigravityAdapterL
           status: "ready",
           updatedAt: new Date().toISOString(),
         };
-        yield* Effect.promise(() =>
-          fs.rm(runDir, { recursive: true, force: true }).catch(() => undefined),
-        );
+        if (runDir) {
+          yield* Effect.promise(() =>
+            fs.rm(runDir, { recursive: true, force: true }).catch(() => undefined),
+          );
+        }
         return yield* new ProviderAdapterRequestError({
           provider: PROVIDER,
           method: "turn/start",
@@ -1549,10 +1575,12 @@ const makeAntigravityAdapter = Effect.fn(function* (options: AntigravityAdapterL
         });
       }
       context.activeLifecycle = lifecycle;
-      pollTimer = setInterval(
-        () => void pollHookFile(context),
-        options.pollIntervalMs ?? POLL_INTERVAL_MS,
-      );
+      if (!windowsCompatibilityMode) {
+        pollTimer = setInterval(
+          () => void pollHookFile(context),
+          options.pollIntervalMs ?? POLL_INTERVAL_MS,
+        );
+      }
       offer({
         ...base(context),
         type: "turn.started",
@@ -1621,17 +1649,8 @@ const makeAntigravityAdapter = Effect.fn(function* (options: AntigravityAdapterL
       }),
     );
 
-  const listModels: NonNullable<AntigravityAdapterShape["listModels"]> = (input) => {
-    if (!isAntigravityAvailableOnPlatform(platform)) {
-      return Effect.fail(
-        new ProviderAdapterRequestError({
-          provider: PROVIDER,
-          method: "model/list",
-          detail: ANTIGRAVITY_WINDOWS_UNAVAILABLE_MESSAGE,
-        }),
-      );
-    }
-    return Effect.tryPromise({
+  const listModels: NonNullable<AntigravityAdapterShape["listModels"]> = (input) =>
+    Effect.tryPromise({
       try: async () => {
         const result = await runAntigravityHelperProcess(
           trim(input.binaryPath) ?? "agy",
@@ -1663,7 +1682,6 @@ const makeAntigravityAdapter = Effect.fn(function* (options: AntigravityAdapterL
           cause,
         }),
     });
-  };
 
   const stopAll = () =>
     Effect.gen(function* () {
@@ -1707,6 +1725,7 @@ const makeAntigravityAdapter = Effect.fn(function* (options: AntigravityAdapterL
     provider: PROVIDER,
     capabilities: {
       sessionModelSwitch: "restart-session",
+      conversationContinuity: windowsCompatibilityMode ? "prompt-replay" : "native",
       conversationRollback: "restart-session",
       supportsRuntimeModelList: true,
       supportsLiveTurnDiffPatch: false,

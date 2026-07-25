@@ -4,7 +4,7 @@
 
 ### Added
 
-- Added Antigravity CLI as a first-class provider, including installation and authentication guidance, runtime model and reasoning-effort discovery, session creation and resume, streaming text and reasoning, tool and plan events, approvals, usage reporting, cancellation, and restart recovery.
+- Added Antigravity CLI as a first-class provider, including installation and authentication guidance, runtime model and reasoning-effort discovery, and session lifecycle support. Platforms with structured capture also provide streaming reasoning, tool and plan events, approvals, usage reporting, native resume, cancellation, and restart recovery.
 - Added dedicated Antigravity branding across provider setup and selection, with stable SVG filter identifiers for predictable rendering.
 - Added shared parsing and normalization for desktop file and folder drops so paths containing spaces, parentheses, encoded characters, or multiple items become valid composer mentions.
 
@@ -26,6 +26,7 @@
 - Fixed Cursor model-discovery failures taking down the picker or discarding usable cached and independently discovered model choices.
 - Fixed pull-request list typing under `exactOptionalPropertyTypes` and reduced duplicate list state across project contexts.
 - Fixed Antigravity SVG filter keys relying on floating-point geometry strings instead of the stable generated filter identifiers.
+- Fixed Antigravity being unusable on Windows by adding native print-mode compatibility with final-text capture and bounded transcript replay, without installing hooks or reading provider-owned transcript state.
 
 ### Verification
 

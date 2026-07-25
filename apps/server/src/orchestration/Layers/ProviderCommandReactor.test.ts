@@ -52,6 +52,7 @@ import {
   ProviderService,
   type ProviderServiceShape,
 } from "../../provider/Services/ProviderService.ts";
+import { PROVIDER_PROMPT_REPLAY_MAX_INPUT_CHARS } from "../../provider/Services/ProviderAdapter.ts";
 import { GitCore, type GitCoreShape } from "../../git/Services/GitCore.ts";
 import { TextGeneration, type TextGenerationShape } from "../../git/Services/TextGeneration.ts";
 import { OrchestrationEngineLive } from "./OrchestrationEngine.ts";
@@ -140,6 +141,7 @@ describe("ProviderCommandReactor", () => {
     readonly threadModelSelection?: ModelSelection;
     readonly sessionModelSwitch?: "unsupported" | "in-session" | "restart-session";
     readonly conversationRollback?: "native" | "restart-session";
+    readonly conversationContinuity?: "native" | "prompt-replay";
     readonly checkpointStore?: Partial<CheckpointStoreShape>;
     readonly studioOutputReactor?: Partial<StudioOutputReactorShape>;
     readonly forkThreadResult?: ProviderForkThreadResult | null;
@@ -419,6 +421,9 @@ describe("ProviderCommandReactor", () => {
       getCapabilities: (_provider) =>
         Effect.succeed({
           sessionModelSwitch: input?.sessionModelSwitch ?? "in-session",
+          ...(input?.conversationContinuity
+            ? { conversationContinuity: input.conversationContinuity }
+            : {}),
           ...(input?.conversationRollback
             ? { conversationRollback: input.conversationRollback }
             : {}),
@@ -4913,6 +4918,124 @@ describe("ProviderCommandReactor", () => {
     expect(secondInput?.input).not.toContain("<thread_context>");
     expect(secondInput?.input).not.toContain("First message without prior context");
     expect(secondInput?.input).toContain("Second message continues the native session");
+  });
+
+  it("replays transcript context for an active prompt-replay session", async () => {
+    const harness = await createHarness({
+      threadModelSelection: {
+        provider: "antigravity",
+        model: "Gemini 3.5 Flash",
+      },
+      conversationContinuity: "prompt-replay",
+    });
+    const now = new Date().toISOString();
+    const threadId = ThreadId.makeUnsafe("thread-1");
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.makeUnsafe("cmd-prompt-replay-first"),
+        threadId,
+        message: {
+          messageId: asMessageId("message-prompt-replay-first"),
+          role: "user",
+          text: "Remember the compatibility context",
+          attachments: [],
+        },
+        runtimeMode: "full-access",
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        createdAt: now,
+      }),
+    );
+    await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+    const firstInput = harness.sendTurn.mock.calls[0]?.[0] as { input?: string } | undefined;
+    expect(firstInput?.input).toBe("Remember the compatibility context");
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.makeUnsafe("cmd-prompt-replay-follow-up"),
+        threadId,
+        message: {
+          messageId: asMessageId("message-prompt-replay-follow-up"),
+          role: "user",
+          text: "Use it in this follow-up",
+          attachments: [],
+        },
+        runtimeMode: "full-access",
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        createdAt: now,
+      }),
+    );
+    await waitFor(() => harness.sendTurn.mock.calls.length === 2);
+
+    expect(harness.startSession).toHaveBeenCalledTimes(1);
+    const followUpInput = harness.sendTurn.mock.calls[1]?.[0] as { input?: string } | undefined;
+    expect(followUpInput?.input).toContain("<thread_context>");
+    expect(followUpInput?.input).toContain("Remember the compatibility context");
+    expect(followUpInput?.input).toContain("<latest_user_message>");
+    expect(followUpInput?.input).toContain("Use it in this follow-up");
+    expect(followUpInput?.input?.length).toBeLessThanOrEqual(
+      PROVIDER_PROMPT_REPLAY_MAX_INPUT_CHARS,
+    );
+  });
+
+  it("drops oldest prompt-replay context and discloses the 24,000 character bound", async () => {
+    const harness = await createHarness({
+      threadModelSelection: {
+        provider: "antigravity",
+        model: "Gemini 3.5 Flash",
+      },
+      conversationContinuity: "prompt-replay",
+    });
+    const now = new Date().toISOString();
+    const threadId = ThreadId.makeUnsafe("thread-1");
+    const oldestContext = `oldest-context-${"x".repeat(19_000)}`;
+    const latestMessage = `latest-message-${"y".repeat(8_000)}`;
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.makeUnsafe("cmd-prompt-replay-bounded-first"),
+        threadId,
+        message: {
+          messageId: asMessageId("message-prompt-replay-bounded-first"),
+          role: "user",
+          text: oldestContext,
+          attachments: [],
+        },
+        runtimeMode: "full-access",
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        createdAt: now,
+      }),
+    );
+    await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.makeUnsafe("cmd-prompt-replay-bounded-follow-up"),
+        threadId,
+        message: {
+          messageId: asMessageId("message-prompt-replay-bounded-follow-up"),
+          role: "user",
+          text: latestMessage,
+          attachments: [],
+        },
+        runtimeMode: "full-access",
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        createdAt: now,
+      }),
+    );
+    await waitFor(() => harness.sendTurn.mock.calls.length === 2);
+
+    const replayInput = harness.sendTurn.mock.calls[1]?.[0] as { input?: string } | undefined;
+    expect(replayInput?.input).not.toContain("oldest-context");
+    expect(replayInput?.input).toContain("Transcript truncated: 1 older message was omitted");
+    expect(replayInput?.input).toContain(latestMessage);
+    expect(replayInput?.input?.length).toBeLessThanOrEqual(
+      PROVIDER_PROMPT_REPLAY_MAX_INPUT_CHARS,
+    );
   });
 
   it("retries a pending Droid fork bootstrap on an existing session", async () => {
