@@ -886,7 +886,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
         parseCommandCodeStatusJson(
           JSON.stringify({
             authenticated: true,
-            version: "0.52.1",
+            version: "1.4.0",
             user: "operator@example.com",
             provider: "openai",
             model: "gpt-5.6-sol",
@@ -894,7 +894,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
         ),
         {
           authenticated: true,
-          version: "0.52.1",
+          version: "1.4.0",
           user: "operator@example.com",
           provider: "openai",
           model: "gpt-5.6-sol",
@@ -911,12 +911,12 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
           mockSpawnerLayer((args) => {
             calls.push(args);
             if (args.includes("--version")) {
-              return { stdout: "command-code 0.52.1", stderr: "", code: 0 };
+              return { stdout: "command-code 1.4.0", stderr: "", code: 0 };
             }
             return {
               stdout: JSON.stringify({
                 authenticated: true,
-                version: "0.52.1",
+                version: "1.4.0",
                 user: "operator@example.com",
                 provider: "openai",
                 model: "gpt-5.6-sol",
@@ -930,7 +930,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
           Effect.sync(() => {
             assert.strictEqual(status.status, "ready");
             assert.strictEqual(status.authStatus, "authenticated");
-            assert.strictEqual(status.version, "0.52.1");
+            assert.strictEqual(status.version, "1.4.0");
             assert.strictEqual(status.authLabel, "operator@example.com");
             assert.ok(
               calls.some((args) => JSON.stringify(args) === JSON.stringify(["status", "--json"])),
@@ -953,9 +953,9 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
               skipUpdates: env?.COMMANDCODE_SKIP_UPDATES,
             });
             return args.includes("--version")
-              ? { stdout: "command-code 0.52.1", stderr: "", code: 0 }
+              ? { stdout: "command-code 1.4.0", stderr: "", code: 0 }
               : {
-                  stdout: JSON.stringify({ authenticated: true, version: "0.52.1" }),
+                  stdout: JSON.stringify({ authenticated: true, version: "1.4.0" }),
                   stderr: "",
                   code: 0,
                 };
@@ -981,7 +981,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
         let statusResponse = JSON.stringify({ authenticated: false, error: "Login required" });
         const spawner = mockSpawnerLayer((args) =>
           args.includes("--version")
-            ? { stdout: "0.52.1", stderr: "", code: 0 }
+            ? { stdout: "1.4.0", stderr: "", code: 0 }
             : { stdout: statusResponse, stderr: "", code: 1 },
         );
         const unauthenticated = yield* makeCheckCommandCodeProviderStatus("commandcode.exe").pipe(
@@ -997,6 +997,43 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
         );
         assert.strictEqual(malformed.authStatus, "unknown");
         assert.match(malformed.message ?? "", /malformed/u);
+      }),
+    );
+
+    it.effect("rejects pre-v1 and unparseable Command Code versions before auth probing", () =>
+      Effect.gen(function* () {
+        let versionOutput = "command-code 0.52.1";
+        let authProbeCount = 0;
+        const spawner = mockSpawnerLayer((args) => {
+          if (args.includes("--version")) {
+            return { stdout: versionOutput, stderr: "", code: 0 };
+          }
+          authProbeCount += 1;
+          return {
+            stdout: JSON.stringify({ authenticated: true, version: "1.4.0" }),
+            stderr: "",
+            code: 0,
+          };
+        });
+
+        const legacy = yield* makeCheckCommandCodeProviderStatus("commandcode.exe").pipe(
+          Effect.provide(spawner),
+        );
+        assert.strictEqual(legacy.status, "error");
+        assert.strictEqual(legacy.available, false);
+        assert.strictEqual(legacy.version, "0.52.1");
+        assert.match(legacy.message ?? "", /v1 runtime integration/u);
+        assert.match(legacy.message ?? "", /npm i -g command-code@latest/u);
+
+        versionOutput = "Command Code development build";
+        const unparseable = yield* makeCheckCommandCodeProviderStatus("commandcode.exe").pipe(
+          Effect.provide(spawner),
+        );
+        assert.strictEqual(unparseable.status, "error");
+        assert.strictEqual(unparseable.available, false);
+        assert.strictEqual(unparseable.version, undefined);
+        assert.match(unparseable.message ?? "", /version could not be determined/u);
+        assert.strictEqual(authProbeCount, 0);
       }),
     );
 
@@ -2831,9 +2868,9 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
       });
     });
 
-    it.effect("advises a legacy Command Code install without granting update authority", () =>
+    it.effect("advises a v1 Command Code install without granting update authority", () =>
       withLatestNpmVersion(
-        "0.53.0",
+        "1.4.0",
         Effect.gen(function* () {
           const definition = PACKAGE_MANAGED_PROVIDER_UPDATES.commandCode;
           assert.ok(definition);
@@ -2842,7 +2879,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
           const capabilities = resolvePackageManagedProviderMaintenance(definition, {
             platform: "win32",
             binaryPath: `${npmPrefix}\\command-code.cmd`,
-            realCommandPath: `${npmPrefix}\\node_modules\\command-code\\dist\\cli.js`,
+            realCommandPath: `${npmPrefix}\\node_modules\\command-code\\dist\\index.mjs`,
             canonicalInstallRoot: npmPrefix,
             managerExecutablePath: npmExecutable,
             realManagerExecutablePath: npmExecutable,
@@ -2857,7 +2894,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
               status: "ready",
               available: true,
               authStatus: "authenticated",
-              version: "0.52.1",
+              version: "1.3.1",
               checkedAt: "2026-07-23T12:00:00.000Z",
             },
             capabilities,
@@ -2874,8 +2911,8 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
             name: "command-code",
           });
           assert.strictEqual(status.versionAdvisory?.status, "behind_latest");
-          assert.strictEqual(status.versionAdvisory?.currentVersion, "0.52.1");
-          assert.strictEqual(status.versionAdvisory?.latestVersion, "0.53.0");
+          assert.strictEqual(status.versionAdvisory?.currentVersion, "1.3.1");
+          assert.strictEqual(status.versionAdvisory?.latestVersion, "1.4.0");
           assert.strictEqual(
             status.versionAdvisory?.message,
             "Install the update now or review provider settings.",
@@ -4883,7 +4920,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
           );
           assert.strictEqual(
             commandCode?.message,
-            "Command Code CLI (`commandcode` or `command-code`) is not installed or not on PATH.",
+            "Command Code CLI (`commandcode`, `command-code`, or `cmdc`) is not installed or not on PATH.",
           );
         }),
     );

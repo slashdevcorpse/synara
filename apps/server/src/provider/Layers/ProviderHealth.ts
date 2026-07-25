@@ -1839,6 +1839,7 @@ export const checkCodexProviderStatus = makeCheckCodexProviderStatus();
 // ── Command Code health check ──────────────────────────────────────
 
 const COMMAND_CODE_HEALTH_TIMEOUT_MS = 15_000;
+export const MINIMUM_COMMAND_CODE_CLI_VERSION = "1.0.0";
 
 export interface CommandCodeStatusJson {
   readonly authenticated: boolean;
@@ -1917,7 +1918,7 @@ export const makeCheckCommandCodeProviderStatus = (
         checkedAt,
         message:
           versionProbe.outcome === "missing"
-            ? "Command Code CLI (`commandcode` or `command-code`) is not installed or not on PATH."
+            ? "Command Code CLI (`commandcode`, `command-code`, or `cmdc`) is not installed or not on PATH."
             : `Failed to execute Command Code CLI health check: ${error instanceof Error ? error.message : String(error)}.`,
       } satisfies ServerProviderStatus;
     }
@@ -1948,6 +1949,19 @@ export const makeCheckCommandCodeProviderStatus = (
     }
     const versionResult = versionProbe.result;
     const version = parseGenericCliVersion(`${versionResult.stdout}\n${versionResult.stderr}`);
+    if (version === null || compareSemverVersions(version, MINIMUM_COMMAND_CODE_CLI_VERSION) < 0) {
+      return {
+        provider: COMMAND_CODE_PROVIDER,
+        status: "error" as const,
+        available: false,
+        authStatus: "unknown" as const,
+        ...(version ? { version } : {}),
+        checkedAt,
+        message: version
+          ? `Command Code CLI v${version} is too old for Synara's v1 runtime integration. Upgrade to v${MINIMUM_COMMAND_CODE_CLI_VERSION} or newer with \`npm i -g command-code@latest\` and restart Synara.`
+          : `Command Code CLI version could not be determined. Synara's v1 runtime integration requires v${MINIMUM_COMMAND_CODE_CLI_VERSION} or newer; upgrade with \`npm i -g command-code@latest\` and restart Synara.`,
+      } satisfies ServerProviderStatus;
+    }
     const authProbe = yield* runCommandCodeCommand(
       ["status", "--json"],
       executable,
@@ -2008,7 +2022,7 @@ export const makeCheckCommandCodeProviderStatus = (
         : {
             message:
               parsedStatus.error ??
-              "Command Code is not authenticated. Run `commandcode login` and try again.",
+              "Command Code is not authenticated. Run `cmdc login` on native Windows or `commandcode login` on macOS/Linux, then try again.",
           }),
     } satisfies ServerProviderStatus;
   });
