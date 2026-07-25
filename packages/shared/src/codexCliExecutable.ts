@@ -108,7 +108,13 @@ function parseStableCodexVersion(version: unknown): StableCodexVersion | undefin
     return undefined;
   }
   const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.exec(version);
-  return match ? [match[1], match[2], match[3]] : undefined;
+  if (!match) {
+    return undefined;
+  }
+  const [, major, minor, patch] = match;
+  return major !== undefined && minor !== undefined && patch !== undefined
+    ? [major, minor, patch]
+    : undefined;
 }
 
 function readStableCodexVersion(
@@ -181,7 +187,7 @@ function compareDecimalIntegers(left: string, right: string): number {
 }
 
 function compareStableCodexVersions(left: StableCodexVersion, right: StableCodexVersion): number {
-  for (let index = 0; index < left.length; index += 1) {
+  for (const index of [0, 1, 2] as const) {
     const comparison = compareDecimalIntegers(left[index], right[index]);
     if (comparison !== 0) {
       return comparison;
