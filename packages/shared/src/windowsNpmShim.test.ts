@@ -1,12 +1,15 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  parseCanonicalWindowsNpmNativeExecutableShim,
+  parseCanonicalWindowsNpmNativeExecutableShimTarget,
   parseCanonicalWindowsNpmNodeShim,
   parseCanonicalWindowsNpmNodeShimTarget,
   windowsNpmPackageManifestDeclaresShimTarget,
 } from "./windowsNpmShim";
 
 const target = "node_modules/@openai/codex/bin/codex.js";
+const nativeTarget = "node_modules/opencode-ai/bin/opencode.exe";
 
 describe("canonical Windows npm Node shim parsing", () => {
   it.each([
@@ -140,5 +143,59 @@ describe("canonical Windows npm Node shim parsing", () => {
         manifestContents: JSON.stringify(manifest),
       }),
     ).toBe(false);
+  });
+});
+
+describe("canonical Windows npm native executable shim parsing", () => {
+  const nativeShim = [
+    "@ECHO off",
+    "GOTO start",
+    ":find_dp0",
+    "SET dp0=%~dp0",
+    "EXIT /b",
+    ":start",
+    "SETLOCAL",
+    "CALL :find_dp0",
+    `"%dp0%\\${nativeTarget.replaceAll("/", "\\")}"   %*`,
+  ].join("\r\n");
+
+  it("recognizes npm's direct native executable cmd-shim template", () => {
+    expect(parseCanonicalWindowsNpmNativeExecutableShim(nativeShim)).toBe(nativeTarget);
+    expect(parseCanonicalWindowsNpmNativeExecutableShimTarget(nativeShim)).toEqual({
+      relativeTarget: nativeTarget,
+      packageName: "opencode-ai",
+      relativePackageRoot: "node_modules/opencode-ai",
+      packageBinTarget: "bin/opencode.exe",
+    });
+  });
+
+  it("proves the native target against the package manifest", () => {
+    const parsed = parseCanonicalWindowsNpmNativeExecutableShimTarget(nativeShim);
+    expect(parsed).not.toBeNull();
+    expect(
+      windowsNpmPackageManifestDeclaresShimTarget({
+        target: parsed!,
+        shimName: "opencode.cmd",
+        manifestContents: JSON.stringify({
+          name: "opencode-ai",
+          bin: { opencode: "bin/opencode.exe" },
+        }),
+      }),
+    ).toBe(true);
+  });
+
+  it.each([
+    ["extra command", `${nativeShim}\r\nother-tool.exe --version\r\n`],
+    [
+      "path traversal",
+      nativeShim.replace(
+        "node_modules\\opencode-ai\\bin\\opencode.exe",
+        "node_modules\\opencode-ai\\..\\escape.exe",
+      ),
+    ],
+    ["non-native target", nativeShim.replace("bin\\opencode.exe", "bin\\opencode.js")],
+  ])("rejects a native shim with %s", (_label, contents) => {
+    expect(parseCanonicalWindowsNpmNativeExecutableShim(contents)).toBeNull();
+    expect(parseCanonicalWindowsNpmNativeExecutableShimTarget(contents)).toBeNull();
   });
 });

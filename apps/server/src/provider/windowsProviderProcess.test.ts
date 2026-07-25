@@ -30,6 +30,15 @@ const packageManifestContents = JSON.stringify({
   bin: { codex: "bin/codex.js" },
 });
 const pathNode = "C:\\Program Files\\nodejs\\node.exe";
+const nativeShimPath = "C:\\Users\\Test\\AppData\\Roaming\\npm\\opencode.cmd";
+const nativePackageTarget =
+  "C:\\Users\\Test\\AppData\\Roaming\\npm\\node_modules\\opencode-ai\\bin\\opencode.exe";
+const nativePackageDirectory = "C:\\Users\\Test\\AppData\\Roaming\\npm\\node_modules\\opencode-ai";
+const nativePackageManifestPath = `${nativePackageDirectory}\\package.json`;
+const nativePackageManifestContents = JSON.stringify({
+  name: "opencode-ai",
+  bin: { opencode: "bin/opencode.exe" },
+});
 
 function npmCmdShim(target = "node_modules\\@openai\\codex\\bin\\codex.js"): string {
   return [
@@ -55,6 +64,20 @@ function npmCmdShim(target = "node_modules\\@openai\\codex\\bin\\codex.js"): str
 
 function hostNpmCmdShim(): string {
   return `@ECHO off\r\n"%~dp0\\node.exe" "%~dp0\\node_modules\\@openai\\codex\\bin\\codex.js" %*\r\n`;
+}
+
+function nativeNpmCmdShim(target = "node_modules\\opencode-ai\\bin\\opencode.exe"): string {
+  return [
+    "@ECHO off",
+    "GOTO start",
+    ":find_dp0",
+    "SET dp0=%~dp0",
+    "EXIT /b",
+    ":start",
+    "SETLOCAL",
+    "CALL :find_dp0",
+    `"%dp0%\\${target}"   %*`,
+  ].join("\r\n");
 }
 
 function readCanonicalCodexShimFile(
@@ -160,6 +183,59 @@ describe("Windows provider process containment", () => {
     expect(prepared.windowsVerbatimArguments).toBeUndefined();
     expect(prepared.args.join(" ").toLowerCase()).not.toContain("cmd.exe");
     expect(observations).toEqual([{ outcome: "resolved", source: "where" }]);
+  });
+
+  it("turns npm's native executable shim into Job -> package executable without cmd", () => {
+    let commandDiscoveryCalls = 0;
+    const prepared = prepareWindowsProviderProcess(
+      "opencode",
+      ["serve", "--hostname", "127.0.0.1", "--port", "52130"],
+      {
+        platform: "win32",
+        arch: "x64",
+        controlDirectory: "C:\\Temp",
+        launcherPath: launcher,
+        fileExists: (path) =>
+          [launcher, nativeShimPath, nativePackageTarget, nativePackageManifestPath].includes(path),
+        readFileString: (path) =>
+          path === nativeShimPath
+            ? nativeNpmCmdShim()
+            : path === nativePackageManifestPath
+              ? nativePackageManifestContents
+              : undefined,
+        realPath: (path) => path,
+        spawnSync: (_command, args) => {
+          commandDiscoveryCalls += 1;
+          return args[0] === "opencode"
+            ? { stdout: `${nativeShimPath}\r\n`, status: 0 }
+            : { stdout: "", status: 1 };
+        },
+      },
+    );
+
+    expect(commandDiscoveryCalls).toBe(1);
+    expect(prepared).toEqual({
+      command: launcher,
+      args: [
+        "--protocol",
+        "2",
+        "--argument-mode",
+        "argv",
+        "--control-file",
+        expect.stringMatching(/^C:\\Temp\\synara-job-control-/u),
+        "--",
+        nativePackageTarget,
+        "serve",
+        "--hostname",
+        "127.0.0.1",
+        "--port",
+        "52130",
+      ],
+      shell: false,
+      windowsHide: true,
+    });
+    expect(prepared.windowsVerbatimArguments).toBeUndefined();
+    expect(prepared.args.join(" ").toLowerCase()).not.toContain("cmd.exe");
   });
 
   it("asynchronously resolves canonical npm shims and skips an earlier node.cmd candidate", async () => {
@@ -322,7 +398,7 @@ describe("Windows provider process containment", () => {
     ).toThrow(
       expect.objectContaining({
         name: "WindowsProviderBatchShimLaunchError",
-        reason: "shim_not_canonical_npm_node",
+        reason: "shim_not_canonical_npm",
       }),
     );
   });

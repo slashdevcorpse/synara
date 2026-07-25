@@ -1,5 +1,5 @@
 // FILE: windowsNpmShim.ts
-// Purpose: Parses only canonical npm-generated Windows Node launcher shims.
+// Purpose: Parses only canonical npm-generated Windows Node and native executable shims.
 // Layer: Shared pure runtime utility
 
 const WINDOWS_UNSAFE_PATH_CHARACTER_PATTERN = /[\u0000-\u001f"<>|?*:%!&^]/u;
@@ -125,13 +125,35 @@ export function parseCanonicalWindowsNpmNodeShim(contents: string): string | nul
 }
 
 /**
- * Splits a verified npm shim target into the package identity and package-local
- * bin target needed to prove the shim against that package's manifest.
+ * Returns the forward-slash relative `node_modules/...` target from npm's
+ * canonical cmd-shim template for a package bin that is already a native
+ * Windows executable. The exact template is proven before the batch layer is
+ * bypassed; arbitrary wrappers and non-native targets fail closed.
  */
-export function parseCanonicalWindowsNpmNodeShimTarget(
-  contents: string,
+export function parseCanonicalWindowsNpmNativeExecutableShim(contents: string): string | null {
+  const lines = contents.split(/\r?\n/u).map(normalizeShimLine).filter(Boolean);
+
+  return matchTemplate(
+    lines,
+    8,
+    /^"%dp0%\/(node_modules\/[^"]+\.(?:exe|com))" %\*$/iu,
+    (target) => [
+      "@echo off",
+      "goto start",
+      ":find_dp0",
+      "set dp0=%~dp0",
+      "exit /b",
+      ":start",
+      "setlocal",
+      "call :find_dp0",
+      `"%dp0%/${target}" %*`,
+    ],
+  );
+}
+
+function parseCanonicalWindowsNpmShimTarget(
+  relativeTarget: string | null,
 ): CanonicalWindowsNpmNodeShimTarget | null {
-  const relativeTarget = parseCanonicalWindowsNpmNodeShim(contents);
   if (!relativeTarget) {
     return null;
   }
@@ -159,6 +181,27 @@ export function parseCanonicalWindowsNpmNodeShimTarget(
     relativePackageRoot: segments.slice(0, packageSegmentCount).join("/"),
     packageBinTarget,
   };
+}
+
+/**
+ * Splits a verified npm shim target into the package identity and package-local
+ * bin target needed to prove the shim against that package's manifest.
+ */
+export function parseCanonicalWindowsNpmNodeShimTarget(
+  contents: string,
+): CanonicalWindowsNpmNodeShimTarget | null {
+  return parseCanonicalWindowsNpmShimTarget(parseCanonicalWindowsNpmNodeShim(contents));
+}
+
+/**
+ * Splits a verified native-executable npm shim target into its package identity
+ * and package-local bin target for the same manifest and containment proof used
+ * by canonical Node shims.
+ */
+export function parseCanonicalWindowsNpmNativeExecutableShimTarget(
+  contents: string,
+): CanonicalWindowsNpmNodeShimTarget | null {
+  return parseCanonicalWindowsNpmShimTarget(parseCanonicalWindowsNpmNativeExecutableShim(contents));
 }
 
 function normalizeManifestBinTarget(value: string): string | null {
