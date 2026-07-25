@@ -229,6 +229,26 @@ async function waitForCondition(predicate: () => boolean, timeoutMs = 2000): Pro
   }
 }
 
+async function within<Value>(
+  promise: Promise<Value>,
+  stage: string,
+  timeoutMs = 2_000,
+): Promise<Value> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => reject(new Error(`Timed out during ${stage}`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeout !== undefined) {
+      clearTimeout(timeout);
+    }
+  }
+}
+
 async function waitForThreadActivities(
   engine: OrchestrationEngineShape,
   activityIds: readonly string[],
@@ -550,12 +570,7 @@ describe("ProviderRuntimeIngestion", () => {
       runtimeEventsPersistedBeforeFanout: true,
     });
 
-    await Promise.race([
-      harness.closeRuntimeEventSource(),
-      new Promise<never>((_, reject) => {
-        setTimeout(() => reject(new Error("Timed out closing an unstarted runtime source")), 2_000);
-      }),
-    ]);
+    await within(harness.closeRuntimeEventSource(), "unstarted runtime source close");
 
     expect(harness.getRuntimeEventStreamAccessCount()).toBe(0);
   });
@@ -593,15 +608,7 @@ describe("ProviderRuntimeIngestion", () => {
       );
       await Effect.runPromise(harness.closeRuntimeEvents);
 
-      await Promise.race([
-        harness.closeRuntimeEventSource(),
-        new Promise<never>((_, reject) => {
-          setTimeout(
-            () => reject(new Error("Timed out interrupting a post-append replay wait")),
-            2_000,
-          );
-        }),
-      ]);
+      await within(harness.closeRuntimeEventSource(), "post-append replay-wait source close");
 
       await Effect.runPromise(Deferred.succeed(runtimeEventReplayGate, undefined));
       replayReleased = true;
@@ -642,13 +649,6 @@ describe("ProviderRuntimeIngestion", () => {
         message: "Nondurable in-flight output survived shutdown",
       },
     };
-    const within = <Value>(promise: Promise<Value>, stage: string): Promise<Value> =>
-      Promise.race([
-        promise,
-        new Promise<never>((_, reject) => {
-          setTimeout(() => reject(new Error(`Timed out during ${stage}`)), 2_000);
-        }),
-      ]);
     let appendReleased = false;
 
     try {

@@ -5418,6 +5418,16 @@ durableRuntimeEvents.layer("ProviderServiceLive runtime event durability", (it) 
   );
 });
 
+const nondurableRuntimeEvents = makeProviderServiceLayer();
+nondurableRuntimeEvents.layer("ProviderServiceLive nondurable runtime events", (it) => {
+  it.effect("does not advertise journal-before-fanout without persistence", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService;
+      assert.equal(provider.runtimeEventsPersistedBeforeFanout, false);
+    }),
+  );
+});
+
 const boundedFanout = makeProviderServiceLayer({ runtimeEventBufferCapacity: 1 });
 it.effect("ProviderServiceLive backpressures slow subscribers and completes fanout shutdown", () =>
   Effect.gen(function* () {
