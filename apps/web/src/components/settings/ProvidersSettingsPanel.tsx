@@ -239,9 +239,7 @@ const PROVIDER_INSTALL_SETTINGS: readonly ProviderInstallSettings[] = [
         description: (
           <>
             Leave blank to use <code>agy</code> from your PATH.
-            <span className="mt-1 block">
-              {ANTIGRAVITY_WINDOWS_COMPATIBILITY_DESCRIPTION}
-            </span>
+            <span className="mt-1 block">{ANTIGRAVITY_WINDOWS_COMPATIBILITY_DESCRIPTION}</span>
           </>
         ),
       },

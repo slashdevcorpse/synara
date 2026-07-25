@@ -5084,9 +5084,7 @@ describe("ProviderCommandReactor", () => {
     expect(replayInput?.input).toContain("oldest-context");
     expect(replayInput?.input).toContain("[Message shortened for compatibility replay.]");
     expect(replayInput?.input).toContain(latestMessage);
-    expect(replayInput?.input?.length).toBeLessThanOrEqual(
-      PROVIDER_PROMPT_REPLAY_MAX_INPUT_CHARS,
-    );
+    expect(replayInput?.input?.length).toBeLessThanOrEqual(PROVIDER_PROMPT_REPLAY_MAX_INPUT_CHARS);
   });
 
   it("retries a pending Droid fork bootstrap on an existing session", async () => {

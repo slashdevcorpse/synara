@@ -6597,16 +6597,19 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
     it.effect("returns a Windows compatibility warning after native checks", () => {
       const spawnedArgs: string[] = [];
       return Effect.gen(function* () {
-        const status = yield* productionCheckAntigravityProviderStatus(configuredTestBinary("agy"), {
-          ...TEST_PROVIDER_PROCESS_OPTIONS,
-          platform: "win32",
-          prepareProcess: (command, args) => ({
-            command,
-            args: [...args],
-            shell: false,
-            windowsHide: true,
-          }),
-        });
+        const status = yield* productionCheckAntigravityProviderStatus(
+          configuredTestBinary("agy"),
+          {
+            ...TEST_PROVIDER_PROCESS_OPTIONS,
+            platform: "win32",
+            prepareProcess: (command, args) => ({
+              command,
+              args: [...args],
+              shell: false,
+              windowsHide: true,
+            }),
+          },
+        );
         assert.strictEqual(status.provider, "antigravity");
         assert.strictEqual(status.status, "warning");
         assert.strictEqual(status.available, true);

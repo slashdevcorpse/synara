@@ -370,9 +370,7 @@ describe("Antigravity platform availability", () => {
             () =>
               preparedTurns.length === 2 &&
               spawned.length === 2 &&
-              !(
-                Effect.runSync(adapter.listSessions())[0]?.status === "running"
-              ),
+              !(Effect.runSync(adapter.listSessions())[0]?.status === "running"),
           );
           expect(Effect.runSync(adapter.listSessions())[0]?.resumeCursor).toBeUndefined();
         },
@@ -709,9 +707,7 @@ describe("Antigravity CLI integration helpers", () => {
     expect(
       antigravityWindowsCommandLineIssue(prepared('"'.repeat(24_000)), "win32"),
     ).toContain("exceeding the CreateProcess limit");
-    expect(
-      antigravityWindowsCommandLineIssue(prepared('"'.repeat(120_000)), "darwin"),
-    ).toBeNull();
+    expect(antigravityWindowsCommandLineIssue(prepared('"'.repeat(120_000)), "darwin")).toBeNull();
   });
 
   it("marks every generated hook as a command hook", () => {
@@ -812,14 +808,7 @@ describe("Antigravity process spawning and output ownership", () => {
     "runs a real .cmd helper and turn from a path with spaces and non-ASCII",
     async () => {
       const directory = await fs.mkdtemp(path.join(os.tmpdir(), "synara agy café 東京 "));
-      const scriptPath = path.join(
-        directory,
-        "node_modules",
-        "@synara",
-        "agy",
-        "bin",
-        "agy.cjs",
-      );
+      const scriptPath = path.join(directory, "node_modules", "@synara", "agy", "bin", "agy.cjs");
       const commandPath = path.join(directory, "echo args.cmd");
       const nodePath = path.join(directory, "node.exe");
       const values = [
@@ -839,9 +828,7 @@ describe("Antigravity process spawning and output ownership", () => {
       };
       try {
         await fs.mkdir(path.dirname(scriptPath), { recursive: true });
-        await fs
-          .link(process.execPath, nodePath)
-          .catch(() => fs.copyFile(process.execPath, nodePath));
+        await fs.link(process.execPath, nodePath).catch(() => fs.copyFile(process.execPath, nodePath));
         await fs.writeFile(
           scriptPath,
           `process.stdout.write(JSON.stringify(process.argv.slice(2)));process.stderr.write(${JSON.stringify(stderr)});`,
@@ -884,9 +871,9 @@ describe("Antigravity process spawning and output ownership", () => {
         });
         expect(finalized).toEqual(turn);
         expect(spawnedCommands).toHaveLength(2);
-        expect(spawnedCommands.every((command) => !command.toLowerCase().endsWith("cmd.exe"))).toBe(
-          true,
-        );
+        expect(
+          spawnedCommands.every((command) => !command.toLowerCase().endsWith("cmd.exe")),
+        ).toBe(true);
       } finally {
         await fs.rm(directory, { recursive: true, force: true });
       }
@@ -1440,9 +1427,7 @@ describe("Antigravity active turn lifecycle", () => {
           payload: {
             state: "failed",
             stopReason: "error",
-            errorMessage: expect.stringContaining(
-              "final response exceeded Synara's capture limit",
-            ),
+            errorMessage: expect.stringContaining("final response exceeded Synara's capture limit"),
           },
           raw: expect.objectContaining({
             payload: expect.objectContaining({
@@ -1486,9 +1471,7 @@ describe("Antigravity active turn lifecycle", () => {
           expect.objectContaining({
             type: "runtime.error",
             payload: expect.objectContaining({
-              message: expect.stringContaining(
-                "diagnostic output exceeded Synara's capture limit",
-              ),
+              message: expect.stringContaining("diagnostic output exceeded Synara's capture limit"),
             }),
           }),
         );

@@ -251,8 +251,7 @@ function normalizedPromptReplayMessageText(value: string): string {
 
 const PROMPT_REPLAY_MAX_MESSAGES = 6;
 const PROMPT_REPLAY_MAX_MESSAGE_CHARS = 4_000;
-const PROMPT_REPLAY_MESSAGE_TRUNCATION_MARKER =
-  "\n[Message shortened for compatibility replay.]";
+const PROMPT_REPLAY_MESSAGE_TRUNCATION_MARKER = "\n[Message shortened for compatibility replay.]";
 
 function boundedPromptReplayMessageText(value: string): string {
   const normalized = normalizedPromptReplayMessageText(value);
