@@ -246,7 +246,10 @@ function availableProviderContextChars(input: {
 }
 
 function normalizedPromptReplayMessageText(value: string): string {
-  return value.replace(/\s+\n/gu, "\n").replace(/\n{3,}/gu, "\n\n").trim();
+  return value
+    .replace(/\s+\n/gu, "\n")
+    .replace(/\n{3,}/gu, "\n\n")
+    .trim();
 }
 
 const PROMPT_REPLAY_MAX_MESSAGES = 6;
@@ -257,10 +260,7 @@ function boundedPromptReplayMessageText(value: string): string {
   const normalized = normalizedPromptReplayMessageText(value);
   if (normalized.length <= PROMPT_REPLAY_MAX_MESSAGE_CHARS) return normalized;
   return `${normalized
-    .slice(
-      0,
-      PROMPT_REPLAY_MAX_MESSAGE_CHARS - PROMPT_REPLAY_MESSAGE_TRUNCATION_MARKER.length,
-    )
+    .slice(0, PROMPT_REPLAY_MAX_MESSAGE_CHARS - PROMPT_REPLAY_MESSAGE_TRUNCATION_MARKER.length)
     .trimEnd()}${PROMPT_REPLAY_MESSAGE_TRUNCATION_MARKER}`;
 }
 

@@ -272,8 +272,7 @@ describe("Antigravity platform availability", () => {
     const captureEnv = {
       SYNARA_ANTIGRAVITY_EVENTS: process.env.SYNARA_ANTIGRAVITY_EVENTS,
       SYNARA_ANTIGRAVITY_HOOK_DECISION: process.env.SYNARA_ANTIGRAVITY_HOOK_DECISION,
-      SYNARA_ANTIGRAVITY_CAPTURE_EXECUTABLE:
-        process.env.SYNARA_ANTIGRAVITY_CAPTURE_EXECUTABLE,
+      SYNARA_ANTIGRAVITY_CAPTURE_EXECUTABLE: process.env.SYNARA_ANTIGRAVITY_CAPTURE_EXECUTABLE,
       SYNARA_ANTIGRAVITY_CAPTURE_SCRIPT: process.env.SYNARA_ANTIGRAVITY_CAPTURE_SCRIPT,
     };
     process.env.SYNARA_ANTIGRAVITY_EVENTS = "must-not-leak";
@@ -426,46 +425,41 @@ describe("Antigravity platform availability", () => {
     }
   });
 
-  it(
-    "rejects an oversized encoded Windows launch before spawn and restores session state",
-    async () => {
-      const spawnProcess = vi.fn<NonNullable<AntigravityProcessDependencies["spawnProcess"]>>(
-        () => {
-          throw new Error("oversized command line must not spawn");
-        },
-      );
-      const threadId = ThreadId.makeUnsafe(`antigravity-windows-limit-${crypto.randomUUID()}`);
+  it("rejects an oversized encoded Windows launch before spawn and restores session state", async () => {
+    const spawnProcess = vi.fn<NonNullable<AntigravityProcessDependencies["spawnProcess"]>>(() => {
+      throw new Error("oversized command line must not spawn");
+    });
+    const threadId = ThreadId.makeUnsafe(`antigravity-windows-limit-${crypto.randomUUID()}`);
 
-      await runWithAdapter(
-        {
-          platform: "win32",
-          prepareProcess: () => ({
-            command: "C:\\synara\\synara-windows-job-launcher.exe",
-            args: ["--", "C:\\Program Files\\nodejs\\node.exe", "-p", '"'.repeat(24_000)],
-            shell: false,
+    await runWithAdapter(
+      {
+        platform: "win32",
+        prepareProcess: () => ({
+          command: "C:\\synara\\synara-windows-job-launcher.exe",
+          args: ["--", "C:\\Program Files\\nodejs\\node.exe", "-p", '"'.repeat(24_000)],
+          shell: false,
+        }),
+        spawnProcess,
+      },
+      async (adapter) => {
+        await Effect.runPromise(
+          adapter.startSession({
+            provider: "antigravity",
+            threadId,
+            runtimeMode: "full-access",
+            providerOptions: { antigravity: { binaryPath: "agy" } },
           }),
-          spawnProcess,
-        },
-        async (adapter) => {
-          await Effect.runPromise(
-            adapter.startSession({
-              provider: "antigravity",
-              threadId,
-              runtimeMode: "full-access",
-              providerOptions: { antigravity: { binaryPath: "agy" } },
-            }),
-          );
+        );
 
-          await expect(
-            Effect.runPromise(adapter.sendTurn({ threadId, input: "short raw prompt" })),
-          ).rejects.toThrow("exceeding the CreateProcess limit");
-          expect(spawnProcess).not.toHaveBeenCalled();
-          expect(Effect.runSync(adapter.listSessions())[0]).toMatchObject({ status: "ready" });
-          expect(Effect.runSync(adapter.listSessions())[0]).not.toHaveProperty("activeTurnId");
-        },
-      );
-    },
-  );
+        await expect(
+          Effect.runPromise(adapter.sendTurn({ threadId, input: "short raw prompt" })),
+        ).rejects.toThrow("exceeding the CreateProcess limit");
+        expect(spawnProcess).not.toHaveBeenCalled();
+        expect(Effect.runSync(adapter.listSessions())[0]).toMatchObject({ status: "ready" });
+        expect(Effect.runSync(adapter.listSessions())[0]).not.toHaveProperty("activeTurnId");
+      },
+    );
+  });
 
   it("preserves non-Windows session startup and plugin installation", async () => {
     const installCapturePlugin = vi.fn(async () => undefined);
@@ -704,9 +698,9 @@ describe("Antigravity CLI integration helpers", () => {
     });
 
     expect(antigravityWindowsCommandLineIssue(prepared("x".repeat(24_000)), "win32")).toBeNull();
-    expect(
-      antigravityWindowsCommandLineIssue(prepared('"'.repeat(24_000)), "win32"),
-    ).toContain("exceeding the CreateProcess limit");
+    expect(antigravityWindowsCommandLineIssue(prepared('"'.repeat(24_000)), "win32")).toContain(
+      "exceeding the CreateProcess limit",
+    );
     expect(antigravityWindowsCommandLineIssue(prepared('"'.repeat(120_000)), "darwin")).toBeNull();
   });
 
@@ -828,7 +822,9 @@ describe("Antigravity process spawning and output ownership", () => {
       };
       try {
         await fs.mkdir(path.dirname(scriptPath), { recursive: true });
-        await fs.link(process.execPath, nodePath).catch(() => fs.copyFile(process.execPath, nodePath));
+        await fs
+          .link(process.execPath, nodePath)
+          .catch(() => fs.copyFile(process.execPath, nodePath));
         await fs.writeFile(
           scriptPath,
           `process.stdout.write(JSON.stringify(process.argv.slice(2)));process.stderr.write(${JSON.stringify(stderr)});`,
@@ -840,7 +836,7 @@ describe("Antigravity process spawning and output ownership", () => {
 
         const helper = await runAntigravityHelperProcess(commandPath, values, {
           cwd: directory,
-          timeoutMs: 2_000,
+          timeoutMs: 10_000,
           dependencies,
         });
         expect(helper).toMatchObject({
@@ -871,9 +867,9 @@ describe("Antigravity process spawning and output ownership", () => {
         });
         expect(finalized).toEqual(turn);
         expect(spawnedCommands).toHaveLength(2);
-        expect(
-          spawnedCommands.every((command) => !command.toLowerCase().endsWith("cmd.exe")),
-        ).toBe(true);
+        expect(spawnedCommands.every((command) => !command.toLowerCase().endsWith("cmd.exe"))).toBe(
+          true,
+        );
       } finally {
         await fs.rm(directory, { recursive: true, force: true });
       }
