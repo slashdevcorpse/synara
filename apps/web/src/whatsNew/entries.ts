@@ -29,9 +29,9 @@ export const WHATS_NEW_ENTRIES: readonly WhatsNewEntry[] = [
         id: "antigravity-provider",
         title: "Antigravity joins Synara",
         description:
-          "Connect the Antigravity CLI as a first-class coding agent, with discovered models, reasoning controls, and platform-appropriate conversation handling.",
+          "Connect the Antigravity CLI as a first-class coding agent, with discovered models, reasoning controls, streaming activity, approvals, and resumable conversations.",
         details:
-          "Platforms with structured capture support session resume, live tool and plan events, permission requests, usage reporting, cancellation, and restart recovery. Windows uses native print-mode compatibility: Synara captures final text and replays a bounded transcript without installing hooks or modifying provider state; live structured events, usage telemetry, and native resume are unavailable there. Synara also includes dedicated Antigravity branding throughout provider setup and selection.",
+          "The new provider adapter covers installation and authentication guidance, model and effort discovery, session creation and resume, tool and plan events, permission requests, usage reporting, cancellation, and restart recovery. Synara also includes dedicated Antigravity branding throughout provider setup and selection.",
       },
       {
         id: "steadier-live-turns",

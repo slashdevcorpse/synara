@@ -86,6 +86,7 @@ describe("Windows provider process ownership inventory", () => {
     const automaticLiveConsumers = [
       "git/Layers/CodexTextGeneration.ts",
       "provider/acp/AcpSessionRuntime.ts",
+      "provider/Layers/AntigravityAdapter.ts",
       "provider/Layers/ClaudeAdapter.ts",
       "provider/Layers/CommandCodeAdapter.ts",
       "provider/Layers/CursorAdapter.ts",

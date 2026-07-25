@@ -15,7 +15,10 @@ import {
   ThreadId,
   TurnId,
 } from "@synara/contracts";
-import { prepareWindowsSafeProcess } from "@synara/shared/windowsProcess";
+import {
+  buildWindowsCreateProcessCommandLine,
+  type WindowsSafeProcessCommand,
+} from "@synara/shared/windowsProcess";
 import { Cause, Effect, Exit, Layer, Queue, Stream } from "effect";
 
 import { ServerConfig } from "../../config.ts";
@@ -30,10 +33,7 @@ import {
   AntigravityAdapter,
   type AntigravityAdapterShape,
 } from "../Services/AntigravityAdapter.ts";
-import {
-  PROVIDER_PROMPT_REPLAY_MAX_INPUT_CHARS,
-  type ProviderThreadSnapshot,
-} from "../Services/ProviderAdapter.ts";
+import type { ProviderThreadSnapshot } from "../Services/ProviderAdapter.ts";
 import { appendFileAttachmentsPromptBlock } from "../attachmentProjection.ts";
 import {
   findProviderProcessExitUnprovenError,
@@ -48,7 +48,7 @@ import {
   type ProviderProcessOwnerTracker,
   type TrackedProviderProcessOwner,
 } from "../providerProcessOwnerTracker.ts";
-import { containPreparedWindowsProviderProcess } from "../windowsProviderProcess.ts";
+import { prepareWindowsProviderProcessAsync } from "../windowsProviderProcess.ts";
 import {
   installPreparedNodeProcessSupervisor,
   type NodeProviderProcessSupervisor,
@@ -71,6 +71,7 @@ const POLL_INTERVAL_MS = 75;
 const MODEL_DISCOVERY_TIMEOUT_MS = 15_000;
 const PLUGIN_INSTALL_TIMEOUT_MS = 30_000;
 export const ANTIGRAVITY_PROCESS_OUTPUT_MAX_BYTES = 128 * 1024;
+const WINDOWS_CREATE_PROCESS_MAX_COMMAND_LINE_CHARS = 32_766;
 const ANTIGRAVITY_CAPTURE_EXECUTABLE_ENV = "SYNARA_ANTIGRAVITY_CAPTURE_EXECUTABLE";
 const ANTIGRAVITY_CAPTURE_SCRIPT_ENV = "SYNARA_ANTIGRAVITY_CAPTURE_SCRIPT";
 
@@ -81,11 +82,15 @@ type SpawnProcess = (
 ) => ChildProcess;
 
 type TeardownProcessTree = (child: ChildProcess) => Promise<unknown>;
+type PrepareAntigravityProcess = (
+  ...args: Parameters<typeof prepareWindowsProviderProcessAsync>
+) =>
+  | Awaited<ReturnType<typeof prepareWindowsProviderProcessAsync>>
+  | ReturnType<typeof prepareWindowsProviderProcessAsync>;
 
 export interface AntigravityProcessDependencies {
   readonly spawnProcess?: SpawnProcess;
-  readonly prepareProcess?: typeof prepareWindowsSafeProcess;
-  readonly containProcess?: typeof containPreparedWindowsProviderProcess;
+  readonly prepareProcess?: PrepareAntigravityProcess;
   readonly teardownProcessTree?: TeardownProcessTree;
   readonly superviseProcess?: typeof supervisePreparedNodeProcess;
   readonly platform?: NodeJS.Platform;
@@ -96,6 +101,8 @@ export interface AntigravityProcessDependencies {
 export interface AntigravityProcessOutput {
   readonly stdout: string;
   readonly stderr: string;
+  readonly stdoutTruncated: boolean;
+  readonly stderrTruncated: boolean;
   readonly outputTruncated: boolean;
   readonly retainedOutputBytes: number;
 }
@@ -185,13 +192,6 @@ function resumeConversationId(value: unknown): string | undefined {
     if (typeof record[key] === "string" && record[key].trim()) return record[key].trim();
   }
   return undefined;
-}
-
-function trustworthyWindowsConversationId(value: unknown): string | undefined {
-  const conversationId = resumeConversationId(value);
-  return conversationId && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u.test(conversationId)
-    ? conversationId
-    : undefined;
 }
 
 function transcriptPathForConversation(conversationId: string): string {
@@ -306,24 +306,27 @@ function completeUtf8Prefix(buffer: Buffer): Buffer {
 
 function makeBoundedProcessOutput() {
   const chunks: Record<"stdout" | "stderr", Buffer[]> = { stdout: [], stderr: [] };
-  let acceptedBytes = 0;
-  let outputTruncated = false;
+  const acceptedBytes: Record<"stdout" | "stderr", number> = { stdout: 0, stderr: 0 };
+  const truncated: Record<"stdout" | "stderr", boolean> = {
+    stdout: false,
+    stderr: false,
+  };
 
   const append = (stream: "stdout" | "stderr", chunk: unknown): void => {
-    if (outputTruncated) return;
+    if (truncated[stream]) return;
     const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), "utf8");
     if (bytes.length === 0) return;
-    const remaining = ANTIGRAVITY_PROCESS_OUTPUT_MAX_BYTES - acceptedBytes;
+    const remaining = ANTIGRAVITY_PROCESS_OUTPUT_MAX_BYTES - acceptedBytes[stream];
     if (bytes.length <= remaining) {
       chunks[stream].push(Buffer.from(bytes));
-      acceptedBytes += bytes.length;
+      acceptedBytes[stream] += bytes.length;
       return;
     }
 
-    outputTruncated = true;
+    truncated[stream] = true;
     if (remaining > 0) {
       chunks[stream].push(Buffer.from(bytes.subarray(0, remaining)));
-      acceptedBytes += remaining;
+      acceptedBytes[stream] += remaining;
     }
   };
 
@@ -333,7 +336,9 @@ function makeBoundedProcessOutput() {
     return {
       stdout: stdoutBytes.toString("utf8"),
       stderr: stderrBytes.toString("utf8"),
-      outputTruncated,
+      stdoutTruncated: truncated.stdout,
+      stderrTruncated: truncated.stderr,
+      outputTruncated: truncated.stdout || truncated.stderr,
       retainedOutputBytes: stdoutBytes.length + stderrBytes.length,
     };
   };
@@ -341,7 +346,32 @@ function makeBoundedProcessOutput() {
   return { append, snapshot };
 }
 
-function spawnAntigravityProcess(
+export function antigravityWindowsCommandLineIssue(
+  prepared: WindowsSafeProcessCommand,
+  platform: NodeJS.Platform = process.platform,
+): string | null {
+  if (platform !== "win32") return null;
+  const commandLine = buildWindowsCreateProcessCommandLine(
+    prepared.command,
+    prepared.args,
+    prepared.windowsVerbatimArguments === true,
+  );
+  if (commandLine.length <= WINDOWS_CREATE_PROCESS_MAX_COMMAND_LINE_CHARS) return null;
+  return `Antigravity's prepared Windows command line requires ${commandLine.length.toLocaleString(
+    "en-US",
+  )} characters, exceeding the CreateProcess limit of ${WINDOWS_CREATE_PROCESS_MAX_COMMAND_LINE_CHARS.toLocaleString(
+    "en-US",
+  )}. Shorten the prompt or attach the content as files.`;
+}
+
+class AntigravityWindowsCommandLineError extends Error {
+  constructor(readonly issue: string) {
+    super(issue);
+    this.name = "AntigravityWindowsCommandLineError";
+  }
+}
+
+async function spawnAntigravityProcess(
   command: string,
   args: ReadonlyArray<string>,
   options: {
@@ -349,20 +379,22 @@ function spawnAntigravityProcess(
     readonly env: NodeJS.ProcessEnv;
     readonly dependencies?: AntigravityProcessDependencies;
   },
-): ChildProcess {
+): Promise<ChildProcess> {
+  const platform = options.dependencies?.platform ?? process.platform;
   const prepareInput = {
     cwd: options.cwd,
     env: options.env,
+    platform,
   };
-  const prepared = (options.dependencies?.containProcess ?? containPreparedWindowsProviderProcess)(
-    (options.dependencies?.prepareProcess ?? prepareWindowsSafeProcess)(
+  const prepared = await Promise.resolve(
+    (options.dependencies?.prepareProcess ?? prepareWindowsProviderProcessAsync)(
       command,
       args,
       prepareInput,
     ),
-    prepareInput,
   );
-  const platform = options.dependencies?.platform ?? process.platform;
+  const commandLineIssue = antigravityWindowsCommandLineIssue(prepared, platform);
+  if (commandLineIssue) throw new AntigravityWindowsCommandLineError(commandLineIssue);
   const child = (options.dependencies?.spawnProcess ?? spawn)(prepared.command, prepared.args, {
     ...(options.cwd ? { cwd: options.cwd } : {}),
     env: options.env,
@@ -460,7 +492,7 @@ export async function runAntigravityHelperProcess(
   } = {},
 ): Promise<AntigravityProcessOutput & { code: number }> {
   const env = buildProviderChildEnvironment({ provider: PROVIDER });
-  const child = spawnAntigravityProcess(command, args, {
+  const child = await spawnAntigravityProcess(command, args, {
     ...(options.cwd ? { cwd: options.cwd } : {}),
     env,
     ...(options.dependencies ? { dependencies: options.dependencies } : {}),
@@ -552,15 +584,15 @@ export async function runAntigravityHelperProcess(
   });
 }
 
-export function startAntigravityTurnProcess(input: {
+export async function startAntigravityTurnProcess(input: {
   readonly command: string;
   readonly args: ReadonlyArray<string>;
   readonly cwd?: string;
   readonly env: NodeJS.ProcessEnv;
   readonly dependencies?: AntigravityProcessDependencies;
   readonly onFinalize: (result: AntigravityTurnProcessResult) => Promise<void>;
-}): AntigravityTurnProcessLifecycle {
-  const child = spawnAntigravityProcess(input.command, input.args, {
+}): Promise<AntigravityTurnProcessLifecycle> {
+  const child = await spawnAntigravityProcess(input.command, input.args, {
     ...(input.cwd ? { cwd: input.cwd } : {}),
     env: input.env,
     ...(input.dependencies ? { dependencies: input.dependencies } : {}),
@@ -777,6 +809,11 @@ async function ensureCapturePlugin(
       ...(dependencies ? { dependencies } : {}),
     },
   );
+  if (installed.outputTruncated) {
+    throw new Error(
+      "Antigravity plugin installation output exceeded Synara's capture limit; installation status cannot be verified.",
+    );
+  }
   if (installed.code !== 0) {
     throw new Error(installed.stderr.trim() || installed.stdout.trim() || "Plugin install failed.");
   }
@@ -814,16 +851,6 @@ export function parseAntigravityCliModelLabel(
     model: match[1].trim(),
     effort: match[2].trim().toLowerCase(),
   };
-}
-
-export function antigravityPromptCommandLineIssue(
-  prompt: string,
-  platform: NodeJS.Platform = process.platform,
-): string | null {
-  if (platform !== "win32" || prompt.length <= PROVIDER_PROMPT_REPLAY_MAX_INPUT_CHARS) {
-    return null;
-  }
-  return `Antigravity prompts on Windows are limited to ${PROVIDER_PROMPT_REPLAY_MAX_INPUT_CHARS.toLocaleString("en-US")} characters because the CLI accepts print-mode prompts as command-line arguments. Shorten the prompt or attach the content as files.`;
 }
 
 export function parseAntigravityModelLines(output: string): ProviderListModelsResult["models"] {
@@ -1254,7 +1281,7 @@ const makeAntigravityAdapter = Effect.fn(function* (options: AntigravityAdapterL
       }
       const now = new Date().toISOString();
       const conversationId = windowsCompatibilityMode
-        ? trustworthyWindowsConversationId(input.resumeCursor)
+        ? undefined
         : resumeConversationId(input.resumeCursor);
       const modelSelection =
         input.modelSelection?.provider === PROVIDER ? input.modelSelection : undefined;
@@ -1333,14 +1360,6 @@ const makeAntigravityAdapter = Effect.fn(function* (options: AntigravityAdapterL
           issue: "A prompt or file attachment is required.",
         });
       }
-      const promptIssue = antigravityPromptCommandLineIssue(normalizedPrompt, platform);
-      if (promptIssue) {
-        return yield* new ProviderAdapterValidationError({
-          provider: PROVIDER,
-          operation: "turn/start",
-          issue: promptIssue,
-        });
-      }
       const turnId = TurnId.makeUnsafe(crypto.randomUUID());
       const modelSelection =
         input.modelSelection?.provider === PROVIDER ? input.modelSelection : undefined;
@@ -1407,7 +1426,11 @@ const makeAntigravityAdapter = Effect.fn(function* (options: AntigravityAdapterL
       };
       const conversationId = context.conversationId;
       const args: string[] = [
-        ...(conversationId ? ["--conversation", conversationId] : ["--new-project"]),
+        ...(windowsCompatibilityMode
+          ? []
+          : conversationId
+            ? ["--conversation", conversationId]
+            : ["--new-project"]),
         "--dangerously-skip-permissions",
         "--model",
         cliModel,
@@ -1438,120 +1461,144 @@ const makeAntigravityAdapter = Effect.fn(function* (options: AntigravityAdapterL
           });
       let pollTimer: ReturnType<typeof setInterval> | undefined;
       let lifecycle!: AntigravityTurnProcessLifecycle;
-      try {
-        lifecycle = startAntigravityTurnProcess({
-          command: context.binaryPath,
-          args,
-          cwd,
-          env,
-          dependencies: processDependencies,
-          onFinalize: async (result) => {
-            if (pollTimer) clearInterval(pollTimer);
-            if (sessions.get(input.threadId) !== context || context.activeLifecycle !== lifecycle) {
-              if (runDir) {
-                await fs.rm(runDir, { recursive: true, force: true }).catch(() => undefined);
-              }
-              return;
-            }
+      const launchExit = yield* Effect.exit(
+        Effect.tryPromise({
+          try: () =>
+            startAntigravityTurnProcess({
+              command: context.binaryPath,
+              args,
+              cwd,
+              env,
+              dependencies: processDependencies,
+              onFinalize: async (result) => {
+                if (pollTimer) clearInterval(pollTimer);
+                if (
+                  sessions.get(input.threadId) !== context ||
+                  context.activeLifecycle !== lifecycle
+                ) {
+                  if (runDir) {
+                    await fs.rm(runDir, { recursive: true, force: true }).catch(() => undefined);
+                  }
+                  return;
+                }
 
-            if (!windowsCompatibilityMode) {
-              await pollHookFile(context);
-            }
-            if (!context.sawAssistant && result.stdout.trim()) {
-              emitTextItem(
-                context,
-                {
-                  step_index: Number.MAX_SAFE_INTEGER,
-                  type: "PRINT_OUTPUT",
-                  content: result.stdout.trim(),
-                },
-                "assistant_message",
-                "assistant_text",
-              );
-            }
-            let finalizationHookError: unknown;
-            if (options.beforeTurnFinalization) {
-              try {
-                await options.beforeTurnFinalization(result);
-              } catch (cause) {
-                finalizationHookError = cause;
-              }
-            }
+                if (!windowsCompatibilityMode) {
+                  await pollHookFile(context);
+                }
+                if (!context.sawAssistant && !result.stdoutTruncated && result.stdout.trim()) {
+                  emitTextItem(
+                    context,
+                    {
+                      step_index: Number.MAX_SAFE_INTEGER,
+                      type: "PRINT_OUTPUT",
+                      content: result.stdout.trim(),
+                    },
+                    "assistant_message",
+                    "assistant_text",
+                  );
+                }
+                let finalizationHookError: unknown;
+                if (options.beforeTurnFinalization) {
+                  try {
+                    await options.beforeTurnFinalization(result);
+                  } catch (cause) {
+                    finalizationHookError = cause;
+                  }
+                }
 
-            const completionBase = base(context);
-            const lifecycleCause =
-              result.teardownError ?? result.spawnError ?? finalizationHookError;
-            const interrupted = !lifecycleCause && (context.interrupted || result.signal !== null);
-            const failed = Boolean(lifecycleCause) || (!interrupted && (result.code ?? 1) !== 0);
-            const failureMessage = lifecycleCause
-              ? messageFromCause(
-                  lifecycleCause,
-                  "Failed to prove the Antigravity process tree exited.",
-                )
-              : result.stderr.trim() || `Antigravity CLI exited with code ${result.code ?? 1}.`;
-            if (failed) {
-              offer({
-                ...base(context, { includeTurn: false }),
-                type: "runtime.error",
-                payload: {
-                  message: failureMessage,
-                  class: result.spawnError ? "transport_error" : "provider_error",
-                },
-                raw: raw(result.spawnError ? "process-error" : "stderr", {
-                  code: result.code,
-                  signal: result.signal,
-                  stderr: result.stderr,
-                  outputTruncated: result.outputTruncated,
-                  retainedOutputBytes: result.retainedOutputBytes,
-                }),
-              } satisfies ProviderRuntimeEvent);
-            }
-            if (findProviderProcessExitUnprovenError(lifecycleCause) === null) {
-              delete context.activeLifecycle;
-              delete context.activeTurnId;
-              delete context.activePrompt;
-              delete context.eventFile;
-            }
-            const {
-              activeTurnId: _activeTurnId,
-              lastError: _lastError,
-              ...inactiveSession
-            } = context.session;
-            context.session = {
-              ...inactiveSession,
-              status: failed ? "error" : "ready",
-              ...(context.conversationId ? { resumeCursor: context.conversationId } : {}),
-              updatedAt: new Date().toISOString(),
-              ...(failed ? { lastError: failureMessage } : {}),
-            };
-            offer({
-              ...completionBase,
-              type: "turn.completed",
-              payload: interrupted
-                ? { state: "interrupted", stopReason: "interrupted" }
-                : failed
-                  ? {
-                      state: "failed",
-                      stopReason: "error",
-                      errorMessage: failureMessage,
-                    }
-                  : { state: "completed", stopReason: "model_stop" },
-              raw: raw("process-exit", {
-                code: result.code,
-                signal: result.signal,
-                stdout: result.stdout,
-                stderr: result.stderr,
-                outputTruncated: result.outputTruncated,
-                retainedOutputBytes: result.retainedOutputBytes,
-              }),
-            } satisfies ProviderRuntimeEvent);
-            if (runDir) {
-              await fs.rm(runDir, { recursive: true, force: true }).catch(() => undefined);
-            }
-            if (finalizationHookError) throw finalizationHookError;
-          },
-        });
-      } catch (cause) {
+                const completionBase = base(context);
+                const lifecycleCause =
+                  result.teardownError ?? result.spawnError ?? finalizationHookError;
+                const interrupted =
+                  !lifecycleCause &&
+                  !result.outputTruncated &&
+                  (context.interrupted || result.signal !== null);
+                const failed =
+                  Boolean(lifecycleCause) ||
+                  result.outputTruncated ||
+                  (!interrupted && (result.code ?? 1) !== 0);
+                const failureMessage = lifecycleCause
+                  ? messageFromCause(
+                      lifecycleCause,
+                      "Failed to prove the Antigravity process tree exited.",
+                    )
+                  : result.stdoutTruncated
+                    ? "Antigravity's final response exceeded Synara's capture limit and was not displayed as complete."
+                    : result.stderrTruncated
+                      ? "Antigravity's diagnostic output exceeded Synara's capture limit, so the turn result cannot be verified."
+                      : result.stderr.trim() ||
+                        `Antigravity CLI exited with code ${result.code ?? 1}.`;
+                if (failed) {
+                  offer({
+                    ...base(context, { includeTurn: false }),
+                    type: "runtime.error",
+                    payload: {
+                      message: failureMessage,
+                      class: result.spawnError ? "transport_error" : "provider_error",
+                    },
+                    raw: raw(result.spawnError ? "process-error" : "stderr", {
+                      code: result.code,
+                      signal: result.signal,
+                      stderr: result.stderr,
+                      stdoutTruncated: result.stdoutTruncated,
+                      stderrTruncated: result.stderrTruncated,
+                      outputTruncated: result.outputTruncated,
+                      retainedOutputBytes: result.retainedOutputBytes,
+                    }),
+                  } satisfies ProviderRuntimeEvent);
+                }
+                if (findProviderProcessExitUnprovenError(lifecycleCause) === null) {
+                  delete context.activeLifecycle;
+                  delete context.activeTurnId;
+                  delete context.activePrompt;
+                  delete context.eventFile;
+                }
+                const {
+                  activeTurnId: _activeTurnId,
+                  lastError: _lastError,
+                  ...inactiveSession
+                } = context.session;
+                context.session = {
+                  ...inactiveSession,
+                  status: failed ? "error" : "ready",
+                  ...(context.conversationId ? { resumeCursor: context.conversationId } : {}),
+                  updatedAt: new Date().toISOString(),
+                  ...(failed ? { lastError: failureMessage } : {}),
+                };
+                offer({
+                  ...completionBase,
+                  type: "turn.completed",
+                  payload: interrupted
+                    ? { state: "interrupted", stopReason: "interrupted" }
+                    : failed
+                      ? {
+                          state: "failed",
+                          stopReason: "error",
+                          errorMessage: failureMessage,
+                        }
+                      : { state: "completed", stopReason: "model_stop" },
+                  raw: raw("process-exit", {
+                    code: result.code,
+                    signal: result.signal,
+                    stdout: result.stdout,
+                    stderr: result.stderr,
+                    stdoutTruncated: result.stdoutTruncated,
+                    stderrTruncated: result.stderrTruncated,
+                    outputTruncated: result.outputTruncated,
+                    retainedOutputBytes: result.retainedOutputBytes,
+                  }),
+                } satisfies ProviderRuntimeEvent);
+                if (runDir) {
+                  await fs.rm(runDir, { recursive: true, force: true }).catch(() => undefined);
+                }
+                if (finalizationHookError) throw finalizationHookError;
+              },
+            }),
+          catch: (cause) => cause,
+        }),
+      );
+      if (Exit.isFailure(launchExit)) {
+        const cause = Cause.squash(launchExit.cause);
         context.turns.pop();
         delete context.activeTurnId;
         delete context.activePrompt;
@@ -1567,6 +1614,13 @@ const makeAntigravityAdapter = Effect.fn(function* (options: AntigravityAdapterL
             fs.rm(runDir, { recursive: true, force: true }).catch(() => undefined),
           );
         }
+        if (cause instanceof AntigravityWindowsCommandLineError) {
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "turn/start",
+            issue: cause.issue,
+          });
+        }
         return yield* new ProviderAdapterRequestError({
           provider: PROVIDER,
           method: "turn/start",
@@ -1574,6 +1628,7 @@ const makeAntigravityAdapter = Effect.fn(function* (options: AntigravityAdapterL
           cause,
         });
       }
+      lifecycle = launchExit.value;
       context.activeLifecycle = lifecycle;
       if (!windowsCompatibilityMode) {
         pollTimer = setInterval(
@@ -1661,6 +1716,11 @@ const makeAntigravityAdapter = Effect.fn(function* (options: AntigravityAdapterL
             dependencies: processDependencies,
           },
         );
+        if (result.outputTruncated) {
+          throw new Error(
+            "Antigravity model-list output exceeded Synara's capture limit; refusing to use a partial model catalog.",
+          );
+        }
         if (result.code !== 0) throw new Error(result.stderr || "agy models failed");
         const models = parseModelLines(result.stdout);
         for (const model of models) {

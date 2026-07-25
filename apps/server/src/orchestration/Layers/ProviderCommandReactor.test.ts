@@ -58,7 +58,10 @@ import { TextGeneration, type TextGenerationShape } from "../../git/Services/Tex
 import { OrchestrationEngineLive } from "./OrchestrationEngine.ts";
 import { OrchestrationProjectionPipelineLive } from "./ProjectionPipeline.ts";
 import { OrchestrationProjectionSnapshotQueryLive } from "./ProjectionSnapshotQuery.ts";
-import { ProviderCommandReactorLive } from "./ProviderCommandReactor.ts";
+import {
+  buildPromptReplayProviderInput,
+  ProviderCommandReactorLive,
+} from "./ProviderCommandReactor.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import {
   ProjectionSnapshotQuery,
@@ -4920,6 +4923,54 @@ describe("ProviderCommandReactor", () => {
     expect(secondInput?.input).toContain("Second message continues the native session");
   });
 
+  it("retains older prompt-replay context when the newest prior message is oversized", () => {
+    const now = new Date().toISOString();
+    const replay = buildPromptReplayProviderInput({
+      thread: {
+        messages: [
+          {
+            id: asMessageId("prompt-replay-older-user"),
+            role: "user",
+            text: "small older context that must survive",
+            turnId: null,
+            streaming: false,
+            source: "native",
+            createdAt: now,
+            updatedAt: now,
+          },
+          {
+            id: asMessageId("prompt-replay-oversized-assistant"),
+            role: "assistant",
+            text: `oversized newest answer ${"x".repeat(30_000)}`,
+            turnId: null,
+            streaming: false,
+            source: "native",
+            createdAt: now,
+            updatedAt: now,
+          },
+          {
+            id: asMessageId("prompt-replay-current-user"),
+            role: "user",
+            text: "continue from both messages",
+            turnId: null,
+            streaming: false,
+            source: "native",
+            createdAt: now,
+            updatedAt: now,
+          },
+        ],
+      },
+      currentMessageId: "prompt-replay-current-user",
+      messageText: "continue from both messages",
+    });
+
+    expect(replay).not.toBeNull();
+    expect(replay).toContain("small older context that must survive");
+    expect(replay).toContain("oversized newest answer");
+    expect(replay).toContain("[Message shortened for compatibility replay.]");
+    expect(replay?.length).toBeLessThanOrEqual(PROVIDER_PROMPT_REPLAY_MAX_INPUT_CHARS);
+  });
+
   it("replays transcript context for an active prompt-replay session", async () => {
     const harness = await createHarness({
       threadModelSelection: {
@@ -4980,7 +5031,7 @@ describe("ProviderCommandReactor", () => {
     );
   });
 
-  it("drops oldest prompt-replay context and discloses the 24,000 character bound", async () => {
+  it("shortens oversized prompt-replay context within the 24,000 character bound", async () => {
     const harness = await createHarness({
       threadModelSelection: {
         provider: "antigravity",
@@ -5030,8 +5081,8 @@ describe("ProviderCommandReactor", () => {
     await waitFor(() => harness.sendTurn.mock.calls.length === 2);
 
     const replayInput = harness.sendTurn.mock.calls[1]?.[0] as { input?: string } | undefined;
-    expect(replayInput?.input).not.toContain("oldest-context");
-    expect(replayInput?.input).toContain("Transcript truncated: 1 older message was omitted");
+    expect(replayInput?.input).toContain("oldest-context");
+    expect(replayInput?.input).toContain("[Message shortened for compatibility replay.]");
     expect(replayInput?.input).toContain(latestMessage);
     expect(replayInput?.input?.length).toBeLessThanOrEqual(
       PROVIDER_PROMPT_REPLAY_MAX_INPUT_CHARS,

@@ -11,19 +11,26 @@ import {
 const defaults = AppSettingsSchema.makeUnsafe({});
 
 describe("Antigravity Windows compatibility guidance", () => {
-  it("discloses capture, continuity, and provider-state limits", () => {
+  it("discloses capture, continuity, prompt transport, and provider-state limits", () => {
     expect(ANTIGRAVITY_WINDOWS_COMPATIBILITY_DESCRIPTION).toContain(
-      "native compatibility mode",
+      "new Antigravity CLI conversation in its default project",
     );
     expect(ANTIGRAVITY_WINDOWS_COMPATIBILITY_DESCRIPTION).toContain("final response text");
     expect(ANTIGRAVITY_WINDOWS_COMPATIBILITY_DESCRIPTION).toContain(
-      "bounded Synara transcript",
+      "bounded recent Synara transcript as a CLI command-line argument",
+    );
+    expect(ANTIGRAVITY_WINDOWS_COMPATIBILITY_DESCRIPTION).toContain("long history is truncated");
+    expect(ANTIGRAVITY_WINDOWS_COMPATIBILITY_DESCRIPTION).toContain(
+      "visible to local process-inspection tools while the request runs",
     );
     expect(ANTIGRAVITY_WINDOWS_COMPATIBILITY_DESCRIPTION).toContain(
       "Live structured events, usage telemetry, and native resume are unavailable",
     );
     expect(ANTIGRAVITY_WINDOWS_COMPATIBILITY_DESCRIPTION).toContain(
-      "does not install hooks or modify Antigravity provider state",
+      "does not install hooks or read or modify Antigravity configuration or transcript files",
+    );
+    expect(ANTIGRAVITY_WINDOWS_COMPATIBILITY_DESCRIPTION).toContain(
+      "may retain its normal local conversation records",
     );
   });
 });

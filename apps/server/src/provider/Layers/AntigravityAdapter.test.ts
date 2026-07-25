@@ -1,4 +1,4 @@
-import { spawnSync, type ChildProcess, type SpawnOptions } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess, type SpawnOptions } from "node:child_process";
 import crypto from "node:crypto";
 import { EventEmitter } from "node:events";
 import fs from "node:fs/promises";
@@ -30,7 +30,7 @@ import {
   type AntigravityAdapterLiveOptions,
   type AntigravityProcessDependencies,
   type AntigravityTurnProcessResult,
-  antigravityPromptCommandLineIssue,
+  antigravityWindowsCommandLineIssue,
   buildAntigravityCaptureCommand,
   buildAntigravityHookConfig,
   hookScriptSource,
@@ -140,7 +140,6 @@ function fakeProcessDependencies(
   return {
     platform: "linux",
     prepareProcess: (command, args) => ({ command, args: [...args], shell: false }),
-    containProcess: (prepared) => prepared,
     spawnProcess: (_command: string, _args: ReadonlyArray<string>, _options: SpawnOptions) =>
       fake.child,
     teardownProcessTree,
@@ -167,15 +166,17 @@ function exactWindowsJobDependencies(
 ): AntigravityProcessDependencies {
   return {
     platform: "win32",
-    prepareProcess: (command, args) => ({ command, args: [...args], shell: false }),
-    containProcess: (prepared, input) =>
-      containPreparedWindowsProviderProcess(prepared, {
-        ...input,
-        platform: "win32",
-        arch: "x64",
-        launcherPath: "C:\\synara\\synara-windows-job-launcher.exe",
-        fileExists: () => true,
-      }),
+    prepareProcess: (command, args, input) =>
+      containPreparedWindowsProviderProcess(
+        { command, args: [...args], shell: false },
+        {
+          ...input,
+          platform: "win32",
+          arch: "x64",
+          launcherPath: "C:\\synara\\synara-windows-job-launcher.exe",
+          fileExists: () => true,
+        },
+      ),
     spawnProcess: () => fake.child,
     superviseProcess: (prepared, child, supervisorOptions) =>
       supervisePreparedNodeProcess(prepared, child, {
@@ -285,23 +286,24 @@ describe("Antigravity platform availability", () => {
         {
           platform: "win32",
           installCapturePlugin,
-          prepareProcess: (command, args) => {
+          prepareProcess: (command, args, input) => {
             preparedTurns.push({ command, args: [...args] });
-            return {
-              command: "C:\\Users\\Test\\AppData\\Local\\agy\\bin\\agy.exe",
-              args: [...args],
-              shell: false,
-              windowsHide: true,
-            };
+            return containPreparedWindowsProviderProcess(
+              {
+                command: "C:\\Users\\Test\\AppData\\Local\\agy\\bin\\agy.exe",
+                args: [...args],
+                shell: false,
+                windowsHide: true,
+              },
+              {
+                ...input,
+                platform: "win32",
+                arch: "x64",
+                launcherPath: "C:\\synara\\synara-windows-job-launcher.exe",
+                fileExists: () => true,
+              },
+            );
           },
-          containProcess: (prepared, input) =>
-            containPreparedWindowsProviderProcess(prepared, {
-              ...input,
-              platform: "win32",
-              arch: "x64",
-              launcherPath: "C:\\synara\\synara-windows-job-launcher.exe",
-              fileExists: () => true,
-            }),
           spawnProcess,
           superviseProcess: (prepared, child, supervisorOptions) =>
             supervisePreparedNodeProcess(prepared, child, {
@@ -351,7 +353,7 @@ describe("Antigravity platform availability", () => {
             payload: { state: "completed", stopReason: "model_stop" },
           });
 
-          await Effect.runPromise(
+          const restartedSession = await Effect.runPromise(
             adapter.startSession({
               provider: "antigravity",
               threadId,
@@ -360,6 +362,7 @@ describe("Antigravity platform availability", () => {
               providerOptions: { antigravity: { binaryPath: "agy" } },
             }),
           );
+          expect(restartedSession.resumeCursor).toBeUndefined();
           await Effect.runPromise(adapter.sendTurn({ threadId, input: "resumed prompt" }));
           fakes[1]!.stdout.write("resumed final answer");
           fakes[1]!.emitClose(0);
@@ -371,6 +374,7 @@ describe("Antigravity platform availability", () => {
                 Effect.runSync(adapter.listSessions())[0]?.status === "running"
               ),
           );
+          expect(Effect.runSync(adapter.listSessions())[0]?.resumeCursor).toBeUndefined();
         },
       );
     } finally {
@@ -388,7 +392,6 @@ describe("Antigravity platform availability", () => {
     expect(preparedTurns[0]).toEqual({
       command: "agy",
       args: [
-        "--new-project",
         "--dangerously-skip-permissions",
         "--model",
         "Gemini 3.5 Flash (Medium)",
@@ -399,8 +402,6 @@ describe("Antigravity platform availability", () => {
       ],
     });
     expect(preparedTurns[1]?.args).toEqual([
-      "--conversation",
-      "conversation-123",
       "--dangerously-skip-permissions",
       "--model",
       "Gemini 3.5 Flash (Medium)",
@@ -411,6 +412,8 @@ describe("Antigravity platform availability", () => {
     ]);
     for (const turn of preparedTurns) {
       expect(turn.args).not.toContain("--continue");
+      expect(turn.args).not.toContain("--conversation");
+      expect(turn.args).not.toContain("--new-project");
       expect(turn.args).not.toContain("--log-file");
     }
     for (const launch of spawned) {
@@ -424,6 +427,47 @@ describe("Antigravity platform availability", () => {
       ).toBe(false);
     }
   });
+
+  it(
+    "rejects an oversized encoded Windows launch before spawn and restores session state",
+    async () => {
+      const spawnProcess = vi.fn<NonNullable<AntigravityProcessDependencies["spawnProcess"]>>(
+        () => {
+          throw new Error("oversized command line must not spawn");
+        },
+      );
+      const threadId = ThreadId.makeUnsafe(`antigravity-windows-limit-${crypto.randomUUID()}`);
+
+      await runWithAdapter(
+        {
+          platform: "win32",
+          prepareProcess: () => ({
+            command: "C:\\synara\\synara-windows-job-launcher.exe",
+            args: ["--", "C:\\Program Files\\nodejs\\node.exe", "-p", '"'.repeat(24_000)],
+            shell: false,
+          }),
+          spawnProcess,
+        },
+        async (adapter) => {
+          await Effect.runPromise(
+            adapter.startSession({
+              provider: "antigravity",
+              threadId,
+              runtimeMode: "full-access",
+              providerOptions: { antigravity: { binaryPath: "agy" } },
+            }),
+          );
+
+          await expect(
+            Effect.runPromise(adapter.sendTurn({ threadId, input: "short raw prompt" })),
+          ).rejects.toThrow("exceeding the CreateProcess limit");
+          expect(spawnProcess).not.toHaveBeenCalled();
+          expect(Effect.runSync(adapter.listSessions())[0]).toMatchObject({ status: "ready" });
+          expect(Effect.runSync(adapter.listSessions())[0]).not.toHaveProperty("activeTurnId");
+        },
+      );
+    },
+  );
 
   it("preserves non-Windows session startup and plugin installation", async () => {
     const installCapturePlugin = vi.fn(async () => undefined);
@@ -654,12 +698,20 @@ describe("Antigravity CLI integration helpers", () => {
     );
   });
 
-  it("guards Windows command-line limits before spawning the CLI", () => {
-    expect(antigravityPromptCommandLineIssue("x".repeat(24_000), "win32")).toBeNull();
-    expect(antigravityPromptCommandLineIssue("x".repeat(24_001), "win32")).toContain(
-      "limited to 24,000 characters",
-    );
-    expect(antigravityPromptCommandLineIssue("x".repeat(120_000), "darwin")).toBeNull();
+  it("guards the fully encoded Windows command line rather than raw prompt length", () => {
+    const prepared = (prompt: string) => ({
+      command: "C:\\synara\\synara-windows-job-launcher.exe",
+      args: ["--", "C:\\Program Files\\nodejs\\node.exe", "C:\\npm\\agy.js", "-p", prompt],
+      shell: false as const,
+    });
+
+    expect(antigravityWindowsCommandLineIssue(prepared("x".repeat(24_000)), "win32")).toBeNull();
+    expect(
+      antigravityWindowsCommandLineIssue(prepared('"'.repeat(24_000)), "win32"),
+    ).toContain("exceeding the CreateProcess limit");
+    expect(
+      antigravityWindowsCommandLineIssue(prepared('"'.repeat(120_000)), "darwin"),
+    ).toBeNull();
   });
 
   it("marks every generated hook as a command hook", () => {
@@ -734,7 +786,7 @@ describe("Antigravity process spawning and output ownership", () => {
       );
 
       let finalized: AntigravityTurnProcessResult | undefined;
-      const lifecycle = startAntigravityTurnProcess({
+      const lifecycle = await startAntigravityTurnProcess({
         command: process.execPath,
         args,
         cwd: process.cwd(),
@@ -760,23 +812,49 @@ describe("Antigravity process spawning and output ownership", () => {
     "runs a real .cmd helper and turn from a path with spaces and non-ASCII",
     async () => {
       const directory = await fs.mkdtemp(path.join(os.tmpdir(), "synara agy café 東京 "));
-      const scriptPath = path.join(directory, "echo args.cjs");
+      const scriptPath = path.join(
+        directory,
+        "node_modules",
+        "@synara",
+        "agy",
+        "bin",
+        "agy.cjs",
+      );
       const commandPath = path.join(directory, "echo args.cmd");
-      const values = ["ordinary", "space value", 'quoted " value', "naïve-東京"];
+      const nodePath = path.join(directory, "node.exe");
+      const values = [
+        "ordinary",
+        "space value",
+        'quoted " value',
+        "safe & literal | value",
+        "naïve-東京",
+      ];
       const stderr = "cmd stderr café-東京";
+      const spawnedCommands: string[] = [];
+      const dependencies: AntigravityProcessDependencies = {
+        spawnProcess: (command, args, options) => {
+          spawnedCommands.push(command);
+          return spawn(command, args, options);
+        },
+      };
       try {
+        await fs.mkdir(path.dirname(scriptPath), { recursive: true });
+        await fs
+          .link(process.execPath, nodePath)
+          .catch(() => fs.copyFile(process.execPath, nodePath));
         await fs.writeFile(
           scriptPath,
           `process.stdout.write(JSON.stringify(process.argv.slice(2)));process.stderr.write(${JSON.stringify(stderr)});`,
         );
         await fs.writeFile(
           commandPath,
-          `@echo off\r\n"${process.execPath}" "%~dp0echo args.cjs" %*\r\n`,
+          '@ECHO off\r\n"%~dp0\\node.exe" "%~dp0\\node_modules\\@synara\\agy\\bin\\agy.cjs" %*\r\n',
         );
 
         const helper = await runAntigravityHelperProcess(commandPath, values, {
           cwd: directory,
           timeoutMs: 2_000,
+          dependencies,
         });
         expect(helper).toMatchObject({
           code: 0,
@@ -786,11 +864,12 @@ describe("Antigravity process spawning and output ownership", () => {
         });
 
         let finalized: AntigravityTurnProcessResult | undefined;
-        const lifecycle = startAntigravityTurnProcess({
+        const lifecycle = await startAntigravityTurnProcess({
           command: commandPath,
           args: values,
           cwd: directory,
           env: process.env,
+          dependencies,
           onFinalize: async (result) => {
             finalized = result;
           },
@@ -804,6 +883,10 @@ describe("Antigravity process spawning and output ownership", () => {
           outputTruncated: false,
         });
         expect(finalized).toEqual(turn);
+        expect(spawnedCommands).toHaveLength(2);
+        expect(spawnedCommands.every((command) => !command.toLowerCase().endsWith("cmd.exe"))).toBe(
+          true,
+        );
       } finally {
         await fs.rm(directory, { recursive: true, force: true });
       }
@@ -811,7 +894,7 @@ describe("Antigravity process spawning and output ownership", () => {
   );
 
   it.runIf(process.platform === "win32")(
-    "rejects .cmd command and argument metacharacters before spawn without executing a sentinel",
+    "rejects noncanonical .cmd shims before spawn without executing a sentinel",
     async () => {
       const directory = await fs.mkdtemp(path.join(os.tmpdir(), "synara-agy-sentinel-"));
       const sentinel = path.join(directory, "executed.txt");
@@ -830,14 +913,8 @@ describe("Antigravity process spawning and output ownership", () => {
             cwd: directory,
             dependencies,
           }),
-        ).rejects.toThrow("cmd.exe control characters");
+        ).rejects.toThrow("not one of npm's canonical Node shim templates");
         await expect(
-          runAntigravityHelperProcess(`${commandPath}&unsafe.cmd`, ["safe"], {
-            cwd: directory,
-            dependencies,
-          }),
-        ).rejects.toThrow("cmd.exe control characters");
-        expect(() =>
           startAntigravityTurnProcess({
             command: commandPath,
             args: ["safe | unsafe"],
@@ -846,17 +923,7 @@ describe("Antigravity process spawning and output ownership", () => {
             dependencies,
             onFinalize,
           }),
-        ).toThrow("cmd.exe control characters");
-        expect(() =>
-          startAntigravityTurnProcess({
-            command: `${commandPath}^unsafe.cmd`,
-            args: ["safe"],
-            cwd: directory,
-            env: process.env,
-            dependencies,
-            onFinalize,
-          }),
-        ).toThrow("cmd.exe control characters");
+        ).rejects.toThrow("not one of npm's canonical Node shim templates");
 
         expect(spawnProcess).not.toHaveBeenCalled();
         await expect(fs.access(sentinel)).rejects.toThrow();
@@ -889,13 +956,15 @@ describe("Antigravity process spawning and output ownership", () => {
         ...fakeProcessDependencies(helperFake),
         platform: "linux",
         prepareProcess: helperPrepare,
-        containProcess: (prepared) => prepared,
         spawnProcess: (_command, _args, options) => {
           helperSpawnOptions = options;
           return helperFake.child;
         },
       },
     });
+    await waitFor(
+      () => helperSpawnOptions !== undefined && helperFake.child.listenerCount("close") > 0,
+    );
     helperFake.emitClose(0);
     await helperPromise;
     expect(helperPrepare).toHaveBeenCalledOnce();
@@ -911,7 +980,7 @@ describe("Antigravity process spawning and output ownership", () => {
     const turnFake = makeFakeChild(42_002);
     const turnEnv = { TEST_ENV: "turn" };
     let turnSpawnOptions: SpawnOptions | undefined;
-    const lifecycle = startAntigravityTurnProcess({
+    const lifecycle = await startAntigravityTurnProcess({
       command: "turn.exe",
       args: ["two"],
       cwd: "C:\\turn cwd",
@@ -920,7 +989,7 @@ describe("Antigravity process spawning and output ownership", () => {
         ...fakeProcessDependencies(turnFake),
         platform: "linux",
         prepareProcess: (command, args, input) => {
-          expect(input).toEqual({ cwd: "C:\\turn cwd", env: turnEnv });
+          expect(input).toEqual({ cwd: "C:\\turn cwd", env: turnEnv, platform: "linux" });
           return {
             command: `prepared-${command}`,
             args: [...args],
@@ -929,7 +998,6 @@ describe("Antigravity process spawning and output ownership", () => {
             windowsVerbatimArguments: true,
           };
         },
-        containProcess: (prepared) => prepared,
         spawnProcess: (_command, _args, options) => {
           turnSpawnOptions = options;
           return turnFake.child;
@@ -956,6 +1024,8 @@ describe("Antigravity process spawning and output ownership", () => {
         fake.stdout.write("a".repeat(ANTIGRAVITY_PROCESS_OUTPUT_MAX_BYTES + 9)),
       stdout: "a".repeat(ANTIGRAVITY_PROCESS_OUTPUT_MAX_BYTES),
       stderr: "",
+      stdoutTruncated: true,
+      stderrTruncated: false,
       bytes: ANTIGRAVITY_PROCESS_OUTPUT_MAX_BYTES,
     },
     {
@@ -964,43 +1034,55 @@ describe("Antigravity process spawning and output ownership", () => {
         fake.stderr.write("b".repeat(ANTIGRAVITY_PROCESS_OUTPUT_MAX_BYTES + 9)),
       stdout: "",
       stderr: "b".repeat(ANTIGRAVITY_PROCESS_OUTPUT_MAX_BYTES),
+      stdoutTruncated: false,
+      stderrTruncated: true,
       bytes: ANTIGRAVITY_PROCESS_OUTPUT_MAX_BYTES,
     },
     {
-      name: "combined with a split multibyte boundary",
+      name: "combined independent streams",
       write: (fake: FakeChild) => {
-        fake.stdout.write("c".repeat(ANTIGRAVITY_PROCESS_OUTPUT_MAX_BYTES - 5));
-        fake.stderr.write("ééé-tail");
-        fake.stdout.write("ignored-after-overflow");
+        fake.stdout.write("c".repeat(ANTIGRAVITY_PROCESS_OUTPUT_MAX_BYTES + 5));
+        fake.stderr.write("d".repeat(ANTIGRAVITY_PROCESS_OUTPUT_MAX_BYTES + 7));
       },
-      stdout: "c".repeat(ANTIGRAVITY_PROCESS_OUTPUT_MAX_BYTES - 5),
-      stderr: "éé",
-      bytes: ANTIGRAVITY_PROCESS_OUTPUT_MAX_BYTES - 1,
+      stdout: "c".repeat(ANTIGRAVITY_PROCESS_OUTPUT_MAX_BYTES),
+      stderr: "d".repeat(ANTIGRAVITY_PROCESS_OUTPUT_MAX_BYTES),
+      stdoutTruncated: true,
+      stderrTruncated: true,
+      bytes: ANTIGRAVITY_PROCESS_OUTPUT_MAX_BYTES * 2,
     },
-  ])("bounds $name helper output at ingestion", async ({ write, stdout, stderr, bytes }) => {
-    const fake = makeFakeChild();
-    const promise = runAntigravityHelperProcess("fake-helper", [], {
-      dependencies: fakeProcessDependencies(fake),
-    });
-    write(fake);
-    fake.emitClose(0);
-    const result = await promise;
-    expect(result).toEqual({
-      code: 0,
-      stdout,
-      stderr,
-      outputTruncated: true,
-      retainedOutputBytes: bytes,
-    });
-    expect(Buffer.byteLength(result.stdout) + Buffer.byteLength(result.stderr)).toBeLessThanOrEqual(
-      ANTIGRAVITY_PROCESS_OUTPUT_MAX_BYTES,
-    );
-  });
+  ])(
+    "bounds $name helper output at ingestion",
+    async ({ write, stdout, stderr, stdoutTruncated, stderrTruncated, bytes }) => {
+      const fake = makeFakeChild();
+      const promise = runAntigravityHelperProcess("fake-helper", [], {
+        dependencies: fakeProcessDependencies(fake),
+      });
+      await waitFor(() => fake.child.listenerCount("close") > 0);
+      write(fake);
+      fake.emitClose(0);
+      const result = await promise;
+      expect(result).toEqual({
+        code: 0,
+        stdout,
+        stderr,
+        stdoutTruncated,
+        stderrTruncated,
+        outputTruncated: true,
+        retainedOutputBytes: bytes,
+      });
+      expect(Buffer.byteLength(result.stdout)).toBeLessThanOrEqual(
+        ANTIGRAVITY_PROCESS_OUTPUT_MAX_BYTES,
+      );
+      expect(Buffer.byteLength(result.stderr)).toBeLessThanOrEqual(
+        ANTIGRAVITY_PROCESS_OUTPUT_MAX_BYTES,
+      );
+    },
+  );
 
-  it("applies the same combined byte cap to turn output", async () => {
+  it("keeps bounded turn stderr from consuming the stdout budget", async () => {
     const fake = makeFakeChild();
     let finalized: AntigravityTurnProcessResult | undefined;
-    const lifecycle = startAntigravityTurnProcess({
+    const lifecycle = await startAntigravityTurnProcess({
       command: "fake-turn",
       args: [],
       env: process.env,
@@ -1009,16 +1091,19 @@ describe("Antigravity process spawning and output ownership", () => {
         finalized = result;
       },
     });
-    fake.stderr.write("d".repeat(ANTIGRAVITY_PROCESS_OUTPUT_MAX_BYTES - 2));
+    fake.stderr.write("d".repeat(ANTIGRAVITY_PROCESS_OUTPUT_MAX_BYTES + 2));
     fake.stdout.write("é-more");
-    fake.stderr.write("ignored");
     fake.emitClose(0);
 
     const result = await lifecycle.finalization;
-    expect(result.stderr).toBe("d".repeat(ANTIGRAVITY_PROCESS_OUTPUT_MAX_BYTES - 2));
-    expect(result.stdout).toBe("é");
+    expect(result.stderr).toBe("d".repeat(ANTIGRAVITY_PROCESS_OUTPUT_MAX_BYTES));
+    expect(result.stdout).toBe("é-more");
+    expect(result.stdoutTruncated).toBe(false);
+    expect(result.stderrTruncated).toBe(true);
     expect(result.outputTruncated).toBe(true);
-    expect(result.retainedOutputBytes).toBe(ANTIGRAVITY_PROCESS_OUTPUT_MAX_BYTES);
+    expect(result.retainedOutputBytes).toBe(
+      ANTIGRAVITY_PROCESS_OUTPUT_MAX_BYTES + Buffer.byteLength("é-more"),
+    );
     expect(finalized).toEqual(result);
   });
 
@@ -1065,7 +1150,7 @@ describe("Antigravity process spawning and output ownership", () => {
     const numericTeardown = vi.fn(async () => undefined);
     const exactKill = vi.fn(() => true);
     fake.child.kill = exactKill;
-    const lifecycle = startAntigravityTurnProcess({
+    const lifecycle = await startAntigravityTurnProcess({
       command: "C:\\tools\\antigravity.exe",
       args: [],
       env: process.env,
@@ -1115,6 +1200,7 @@ describe("Antigravity process spawning and output ownership", () => {
         teardownProcessTree: spawnErrorTeardown,
       }),
     });
+    await waitFor(() => spawnErrorFake.child.listenerCount("error") > 0);
     spawnErrorFake.emitError(spawnFailure);
     spawnErrorFake.emitClose(1);
     await expect(spawnErrorResult).rejects.toBe(spawnFailure);
@@ -1125,6 +1211,7 @@ describe("Antigravity process spawning and output ownership", () => {
       timeoutMs: 20,
       dependencies: fakeProcessDependencies(closeFake, { teardownProcessTree: closeTeardown }),
     });
+    await waitFor(() => closeFake.child.listenerCount("close") > 0);
     closeFake.emitClose(0);
     await expect(closeResult).resolves.toMatchObject({ code: 0 });
     await new Promise((resolve) => setTimeout(resolve, 30));
@@ -1144,7 +1231,7 @@ describe("Antigravity process spawning and output ownership", () => {
     const failure = new Error("turn spawn failed");
     const teardownProcessTree = vi.fn(async () => undefined);
     const onFinalize = vi.fn(async () => undefined);
-    const lifecycle = startAntigravityTurnProcess({
+    const lifecycle = await startAntigravityTurnProcess({
       command: "fake-turn",
       args: [],
       env: process.env,
@@ -1173,7 +1260,7 @@ describe("Antigravity process spawning and output ownership", () => {
     const onFinalize = vi.fn(async (result: AntigravityTurnProcessResult) => {
       finalized = result;
     });
-    const lifecycle = startAntigravityTurnProcess({
+    const lifecycle = await startAntigravityTurnProcess({
       command: "fake-turn",
       args: [],
       env: process.env,
@@ -1244,7 +1331,7 @@ describe("Antigravity process spawning and output ownership", () => {
     const finalizationGate = deferred<void>();
     const teardownProcessTree = vi.fn(async () => undefined);
     const onFinalize = vi.fn(() => finalizationGate.promise);
-    const lifecycle = startAntigravityTurnProcess({
+    const lifecycle = await startAntigravityTurnProcess({
       command: "fake-turn",
       args: [],
       env: process.env,
@@ -1271,7 +1358,7 @@ describe("Antigravity process spawning and output ownership", () => {
     const fake = makeFakeChild(42_025);
     const finalizationFailure = new Error("finalization hook failed");
     const teardownProcessTree = vi.fn(async () => undefined);
-    const lifecycle = startAntigravityTurnProcess({
+    const lifecycle = await startAntigravityTurnProcess({
       command: "fake-turn",
       args: [],
       env: process.env,
@@ -1297,7 +1384,7 @@ describe("Antigravity process spawning and output ownership", () => {
       finalized = result;
     });
     const teardownProcessTree = vi.fn(() => teardown.promise);
-    const lifecycle = startAntigravityTurnProcess({
+    const lifecycle = await startAntigravityTurnProcess({
       command: "fake-turn",
       args: [],
       env: process.env,
@@ -1322,6 +1409,106 @@ describe("Antigravity process spawning and output ownership", () => {
 });
 
 describe("Antigravity active turn lifecycle", () => {
+  it("fails visibly instead of publishing a truncated final response as complete", async () => {
+    const fake = makeFakeChild();
+
+    await startFakeAdapterTurn({
+      fake,
+      teardownProcessTree: async () => undefined,
+      use: async (adapter) => {
+        const runtimeEvents = Effect.runPromise(
+          adapter.streamEvents.pipe(
+            Stream.takeUntil((event) => event.type === "turn.completed"),
+            Stream.runCollect,
+          ),
+        );
+        fake.stdout.write("x".repeat(ANTIGRAVITY_PROCESS_OUTPUT_MAX_BYTES + 1));
+        fake.emitClose(0);
+
+        const events = Array.from(await runtimeEvents);
+        expect(events.some((event) => event.type === "content.delta")).toBe(false);
+        expect(events).toContainEqual(
+          expect.objectContaining({
+            type: "runtime.error",
+            payload: expect.objectContaining({
+              message: expect.stringContaining("final response exceeded Synara's capture limit"),
+            }),
+          }),
+        );
+        expect(events.at(-1)).toMatchObject({
+          type: "turn.completed",
+          payload: {
+            state: "failed",
+            stopReason: "error",
+            errorMessage: expect.stringContaining(
+              "final response exceeded Synara's capture limit",
+            ),
+          },
+          raw: expect.objectContaining({
+            payload: expect.objectContaining({
+              stdoutTruncated: true,
+              stderrTruncated: false,
+            }),
+          }),
+        });
+      },
+    });
+  });
+
+  it("fails visibly on truncated diagnostics while preserving complete stdout", async () => {
+    const fake = makeFakeChild();
+
+    await startFakeAdapterTurn({
+      fake,
+      teardownProcessTree: async () => undefined,
+      use: async (adapter) => {
+        const runtimeEvents = Effect.runPromise(
+          adapter.streamEvents.pipe(
+            Stream.takeUntil((event) => event.type === "turn.completed"),
+            Stream.runCollect,
+          ),
+        );
+        fake.stdout.write("complete final response");
+        fake.stderr.write("e".repeat(ANTIGRAVITY_PROCESS_OUTPUT_MAX_BYTES + 1));
+        fake.emitClose(0);
+
+        const events = Array.from(await runtimeEvents);
+        expect(events).toContainEqual(
+          expect.objectContaining({
+            type: "content.delta",
+            payload: {
+              streamKind: "assistant_text",
+              delta: "complete final response",
+            },
+          }),
+        );
+        expect(events).toContainEqual(
+          expect.objectContaining({
+            type: "runtime.error",
+            payload: expect.objectContaining({
+              message: expect.stringContaining(
+                "diagnostic output exceeded Synara's capture limit",
+              ),
+            }),
+          }),
+        );
+        expect(events.at(-1)).toMatchObject({
+          type: "turn.completed",
+          payload: {
+            state: "failed",
+            stopReason: "error",
+          },
+          raw: expect.objectContaining({
+            payload: expect.objectContaining({
+              stdoutTruncated: false,
+              stderrTruncated: true,
+            }),
+          }),
+        });
+      },
+    });
+  });
+
   it("wires exact managed capture paths without enabling Electron mode on the provider", async () => {
     const fake = makeFakeChild();
     let spawnedEnv: NodeJS.ProcessEnv | undefined;
@@ -1572,6 +1759,7 @@ describe("Antigravity active turn lifecycle", () => {
         const listing = Effect.runPromise(
           adapter.listModels!({ provider: "antigravity", binaryPath: "fake-antigravity" }),
         );
+        await waitFor(() => fake.child.listenerCount("error") > 0);
         fake.emitError(new Error("model helper transport failed"));
 
         await expect(listing).rejects.toThrow("model helper transport failed");
@@ -1601,7 +1789,7 @@ describe("Antigravity active turn lifecycle", () => {
       maintenanceOwnedResources,
     });
     const finalizedResults: AntigravityTurnProcessResult[] = [];
-    const lifecycle = startAntigravityTurnProcess({
+    const lifecycle = await startAntigravityTurnProcess({
       command: "fake-antigravity",
       args: [],
       env: process.env,

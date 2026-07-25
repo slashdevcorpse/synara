@@ -249,8 +249,24 @@ function normalizedPromptReplayMessageText(value: string): string {
   return value.replace(/\s+\n/gu, "\n").replace(/\n{3,}/gu, "\n\n").trim();
 }
 
+const PROMPT_REPLAY_MAX_MESSAGES = 6;
+const PROMPT_REPLAY_MAX_MESSAGE_CHARS = 4_000;
+const PROMPT_REPLAY_MESSAGE_TRUNCATION_MARKER =
+  "\n[Message shortened for compatibility replay.]";
+
+function boundedPromptReplayMessageText(value: string): string {
+  const normalized = normalizedPromptReplayMessageText(value);
+  if (normalized.length <= PROMPT_REPLAY_MAX_MESSAGE_CHARS) return normalized;
+  return `${normalized
+    .slice(
+      0,
+      PROMPT_REPLAY_MAX_MESSAGE_CHARS - PROMPT_REPLAY_MESSAGE_TRUNCATION_MARKER.length,
+    )
+    .trimEnd()}${PROMPT_REPLAY_MESSAGE_TRUNCATION_MARKER}`;
+}
+
 function promptReplayTruncationNotice(omittedMessages: number): string {
-  return `[Transcript truncated: ${omittedMessages} older ${
+  return `[Transcript truncated: ${omittedMessages} prior ${
     omittedMessages === 1 ? "message was" : "messages were"
   } omitted to keep this compatibility request within ${PROVIDER_PROMPT_REPLAY_MAX_INPUT_CHARS.toLocaleString(
     "en-US",
@@ -278,9 +294,11 @@ export function buildPromptReplayProviderInput(input: {
 
   const intro =
     "This provider uses Synara transcript replay for conversation continuity. Use the retained transcript as context for the latest user message.";
-  const renderedMessages = priorMessages.map((message) => {
+  const replayWindow = priorMessages.slice(-PROMPT_REPLAY_MAX_MESSAGES);
+  const windowOmissions = priorMessages.length - replayWindow.length;
+  const renderedMessages = replayWindow.map((message) => {
     const role = message.role === "assistant" ? "Assistant" : "User";
-    return `${role}:\n${normalizedPromptReplayMessageText(message.text)}`;
+    return `${role}:\n${boundedPromptReplayMessageText(message.text)}`;
   });
   const availableContextChars = Math.max(
     0,
@@ -296,18 +314,19 @@ export function buildPromptReplayProviderInput(input: {
 
   for (let index = renderedMessages.length - 1; index >= 0; index -= 1) {
     const candidateMessages = [renderedMessages[index]!, ...retainedMessages];
+    const candidateOmissions = windowOmissions + index;
     const candidateSections = [
       intro,
-      ...(index > 0 ? [promptReplayTruncationNotice(index)] : []),
+      ...(candidateOmissions > 0 ? [promptReplayTruncationNotice(candidateOmissions)] : []),
       ...candidateMessages,
     ];
     if (candidateSections.join("\n\n").length > availableContextChars) {
-      break;
+      continue;
     }
     retainedMessages.unshift(renderedMessages[index]!);
   }
 
-  const omittedMessages = renderedMessages.length - retainedMessages.length;
+  const omittedMessages = priorMessages.length - retainedMessages.length;
   const contextText = [
     intro,
     ...(omittedMessages > 0 ? [promptReplayTruncationNotice(omittedMessages)] : []),
