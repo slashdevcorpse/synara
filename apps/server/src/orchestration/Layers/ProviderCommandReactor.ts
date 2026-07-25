@@ -431,6 +431,13 @@ const make = Effect.gen(function* () {
     pendingTerminalTurnIds?: Set<TurnId>;
   };
   const pendingQueuedDispatchBySessionThread = new Map<string, PendingQueuedDispatch>();
+  // Runtime terminals and orchestration intents share one delivery lock, but
+  // semaphore waiter order is not a correctness boundary. Record the narrow
+  // OpenCode compatibility terminal as soon as the runtime stream observes it
+  // so an already-committed queued event cannot materialize ahead of the
+  // terminal handler. The durable high-water fence remains authoritative
+  // across restart; this map only closes the in-process scheduling window.
+  const pendingOpenCodeCompatibilityTerminalBySessionThread = new Map<string, string>();
   const queuedTurnPromotionOwner = `provider-queued-turn:${crypto.randomUUID()}`;
   const sidechatContextBootstrapThreadIds = new Set<string>();
   // Fresh sessions that cannot inherit native conversation state need one
@@ -767,20 +774,18 @@ const make = Effect.gen(function* () {
     );
   });
 
-  const cancelAllProviderSessionPromotions = Effect.fnUntraced(function* (input: {
+  const fenceProviderSessionPromotionsThrough = Effect.fnUntraced(function* (input: {
     readonly scope: ProviderSessionThreadScope;
+    readonly throughEventSequence: number;
     readonly updatedAt: string;
   }) {
     const memberThreadIds = yield* listCancellableProviderSessionThreadIds(input.scope);
-    yield* Effect.forEach(
+    yield* queuedTurnPromotions.cancelProviderSessionThrough({
+      providerSessionThreadId: input.scope.sessionThreadId,
       memberThreadIds,
-      (memberThreadId) =>
-        queuedTurnPromotions.cancelThread({
-          threadId: memberThreadId,
-          updatedAt: input.updatedAt,
-        }),
-      { discard: true },
-    );
+      throughEventSequence: input.throughEventSequence,
+      updatedAt: input.updatedAt,
+    });
   });
 
   const listUnsettledProviderSessionThreadIds = Effect.fnUntraced(function* (
@@ -2354,6 +2359,25 @@ const make = Effect.gen(function* () {
   const processTurnQueued = Effect.fnUntraced(function* (
     event: Extract<ProviderIntentEvent, { type: "thread.turn-queued" }>,
   ) {
+    const scope = yield* resolveProviderSessionThreadScope(event.payload.threadId);
+    const pendingCompatibilityTerminalAt =
+      pendingOpenCodeCompatibilityTerminalBySessionThread.get(scope.sessionThreadId);
+    if (pendingCompatibilityTerminalAt !== undefined) {
+      yield* fenceProviderSessionPromotionsThrough({
+        scope,
+        throughEventSequence: yield* orchestrationEngine.getEventHighWaterSequence,
+        updatedAt: pendingCompatibilityTerminalAt,
+      });
+      return;
+    }
+    if (
+      yield* queuedTurnPromotions.isQueuedEventCancelledByProviderSessionFence({
+        providerSessionThreadId: scope.sessionThreadId,
+        queuedEventSequence: event.sequence,
+      })
+    ) {
+      return;
+    }
     yield* enqueueQueuedTurnStart(event);
     // Recovery drain: if the provider turn settled between the decider's
     // (stale) running check and this enqueue, the terminal
@@ -2577,10 +2601,12 @@ const make = Effect.gen(function* () {
       event.payload.failureReason === OPENCODE_STORAGE_SCHEMA_INCOMPATIBLE_REASON
     ) {
       pendingQueuedDispatchBySessionThread.delete(sessionThreadId);
-      yield* cancelAllProviderSessionPromotions({
+      yield* fenceProviderSessionPromotionsThrough({
         scope,
+        throughEventSequence: yield* orchestrationEngine.getEventHighWaterSequence,
         updatedAt: event.createdAt,
       });
+      pendingOpenCodeCompatibilityTerminalBySessionThread.delete(sessionThreadId);
       return;
     }
     const reservation = pendingQueuedDispatchBySessionThread.get(sessionThreadId);
@@ -4232,6 +4258,15 @@ const make = Effect.gen(function* () {
         Stream.runForEach(providerService.streamEvents, (event) => {
           if (event.type !== "turn.completed" && event.type !== "turn.aborted") {
             return Effect.void;
+          }
+          if (
+            event.provider === "opencode" &&
+            event.payload.failureReason === OPENCODE_STORAGE_SCHEMA_INCOMPATIBLE_REASON
+          ) {
+            pendingOpenCodeCompatibilityTerminalBySessionThread.set(
+              event.threadId,
+              event.createdAt,
+            );
           }
           return deliverySourceLock.withPermits(1)(processQueueDrainEventSafely(event));
         }).pipe(Effect.forkScoped),

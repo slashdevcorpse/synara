@@ -69,6 +69,25 @@ export interface QueuedTurnPromotionRepositoryShape {
     readonly updatedAt: string;
     readonly throughEventSequence?: number | undefined;
   }) => Effect.Effect<void, PersistenceSqlError>;
+  /**
+   * Atomically persist a monotonic cancellation fence for one provider
+   * session and tombstone every already-materialized promotion in that
+   * session through the same orchestration event sequence.
+   */
+  readonly cancelProviderSessionThrough: (input: {
+    readonly providerSessionThreadId: string;
+    readonly memberThreadIds: ReadonlyArray<string>;
+    readonly throughEventSequence: number;
+    readonly updatedAt: string;
+  }) => Effect.Effect<void, PersistenceSqlError>;
+  /**
+   * True when a provider-session terminal barrier covers a queued source
+   * event that has not necessarily materialized its promotion row yet.
+   */
+  readonly isQueuedEventCancelledByProviderSessionFence: (input: {
+    readonly providerSessionThreadId: string;
+    readonly queuedEventSequence: number;
+  }) => Effect.Effect<boolean, PersistenceSqlError>;
   readonly hasPendingMessage: (input: {
     readonly threadId: string;
     readonly messageId: string;

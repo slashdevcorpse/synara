@@ -205,6 +205,64 @@ const make = Effect.gen(function* () {
     );
   };
 
+  const cancelProviderSessionThrough: QueuedTurnPromotionRepositoryShape["cancelProviderSessionThrough"] =
+    (input) => {
+      const memberThreadIds = [...new Set(input.memberThreadIds)];
+      return sql
+        .withTransaction(
+          Effect.gen(function* () {
+            yield* sql`
+              INSERT INTO queued_turn_promotion_cancellation_fences (
+                provider_session_thread_id, through_event_sequence, updated_at
+              ) VALUES (
+                ${input.providerSessionThreadId}, ${input.throughEventSequence}, ${input.updatedAt}
+              )
+              ON CONFLICT (provider_session_thread_id) DO UPDATE SET
+                through_event_sequence = excluded.through_event_sequence,
+                updated_at = excluded.updated_at
+              WHERE excluded.through_event_sequence >
+                queued_turn_promotion_cancellation_fences.through_event_sequence
+            `;
+            if (memberThreadIds.length === 0) {
+              return;
+            }
+            yield* sql`
+              UPDATE queued_turn_promotions
+              SET state = 'cancelled', claim_owner = NULL, claimed_at = NULL,
+                  claim_expires_at = NULL, updated_at = ${input.updatedAt}
+              WHERE thread_id IN ${sql.in(memberThreadIds)}
+                AND state IN ('queued', 'promoting', 'promoted')
+                AND queued_event_sequence <= (
+                  SELECT through_event_sequence
+                  FROM queued_turn_promotion_cancellation_fences
+                  WHERE provider_session_thread_id = ${input.providerSessionThreadId}
+                )
+            `;
+          }),
+        )
+        .pipe(
+          Effect.mapError(
+            toPersistenceSqlError("QueuedTurnPromotion.cancelProviderSessionThrough"),
+          ),
+        );
+    };
+
+  const isQueuedEventCancelledByProviderSessionFence: QueuedTurnPromotionRepositoryShape["isQueuedEventCancelledByProviderSessionFence"] =
+    (input) =>
+      sql<{ readonly count: number }>`
+        SELECT COUNT(*) AS count
+        FROM queued_turn_promotion_cancellation_fences
+        WHERE provider_session_thread_id = ${input.providerSessionThreadId}
+          AND through_event_sequence >= ${input.queuedEventSequence}
+      `.pipe(
+        Effect.map((rows) => (rows[0]?.count ?? 0) > 0),
+        Effect.mapError(
+          toPersistenceSqlError(
+            "QueuedTurnPromotion.isQueuedEventCancelledByProviderSessionFence",
+          ),
+        ),
+      );
+
   const hasPendingMessage: QueuedTurnPromotionRepositoryShape["hasPendingMessage"] = (input) =>
     sql<{ readonly count: number }>`
       SELECT COUNT(*) AS count FROM queued_turn_promotions
@@ -244,6 +302,8 @@ const make = Effect.gen(function* () {
     releaseClaim,
     cancelMessage,
     cancelThread,
+    cancelProviderSessionThrough,
+    isQueuedEventCancelledByProviderSessionFence,
     hasPendingMessage,
     listPendingThreadIds,
     listCancellableThreadIds,

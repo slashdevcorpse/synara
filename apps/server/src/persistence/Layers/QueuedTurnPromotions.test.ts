@@ -11,6 +11,89 @@ const layer = it.layer(
 );
 
 layer("QueuedTurnPromotionRepository", (it) => {
+  it.effect(
+    "persists a provider-session cancellation fence without suppressing later user turns",
+    () =>
+      Effect.gen(function* () {
+        const repository = yield* QueuedTurnPromotionRepository;
+        const sql = yield* SqlClient.SqlClient;
+        const now = "2026-07-25T00:00:00.000Z";
+        const insertSourceEvent = (id: number) =>
+          sql<{ readonly sequence: number }>`
+            INSERT INTO orchestration_events (
+              event_id, aggregate_kind, stream_id, stream_version, event_type,
+              occurred_at, command_id, causation_event_id, correlation_id,
+              actor_kind, payload_json, metadata_json
+            ) VALUES (
+              ${`evt-provider-session-fence-${id}`}, 'thread',
+              'thread-provider-session-fence', ${id - 1},
+              'thread.turn-queued', ${now}, ${`cmd-provider-session-fence-${id}`},
+              NULL, NULL, 'server', '{}', '{}'
+            )
+            RETURNING sequence
+          `.pipe(Effect.map((rows) => rows[0]!.sequence));
+
+        const materializedSequence = yield* insertSourceEvent(1);
+        const notYetMaterializedSequence = yield* insertSourceEvent(2);
+        yield* repository.enqueue({
+          queuedEventSequence: materializedSequence,
+          threadId: "thread-provider-session-fence",
+          messageId: "message-provider-session-fence-existing",
+          dispatchMode: "queue",
+          createdAt: now,
+        });
+
+        yield* repository.cancelProviderSessionThrough({
+          providerSessionThreadId: "thread-provider-session-fence",
+          memberThreadIds: ["thread-provider-session-fence"],
+          throughEventSequence: notYetMaterializedSequence,
+          updatedAt: now,
+        });
+
+        assert.deepInclude(
+          (yield* repository.getBySequence(materializedSequence)).pipe(Option.getOrThrow),
+          { state: "cancelled" },
+        );
+        assert.isTrue(
+          yield* repository.isQueuedEventCancelledByProviderSessionFence({
+            providerSessionThreadId: "thread-provider-session-fence",
+            queuedEventSequence: notYetMaterializedSequence,
+          }),
+        );
+        yield* repository.cancelProviderSessionThrough({
+          providerSessionThreadId: "thread-provider-session-fence",
+          memberThreadIds: [],
+          throughEventSequence: materializedSequence,
+          updatedAt: "2026-07-25T00:01:00.000Z",
+        });
+        assert.isTrue(
+          yield* repository.isQueuedEventCancelledByProviderSessionFence({
+            providerSessionThreadId: "thread-provider-session-fence",
+            queuedEventSequence: notYetMaterializedSequence,
+          }),
+        );
+
+        const laterSequence = yield* insertSourceEvent(3);
+        assert.isFalse(
+          yield* repository.isQueuedEventCancelledByProviderSessionFence({
+            providerSessionThreadId: "thread-provider-session-fence",
+            queuedEventSequence: laterSequence,
+          }),
+        );
+        yield* repository.enqueue({
+          queuedEventSequence: laterSequence,
+          threadId: "thread-provider-session-fence",
+          messageId: "message-provider-session-fence-later",
+          dispatchMode: "queue",
+          createdAt: now,
+        });
+        assert.deepInclude(
+          (yield* repository.getBySequence(laterSequence)).pipe(Option.getOrThrow),
+          { state: "queued" },
+        );
+      }),
+  );
+
   it.effect("fences a cancelled promotion child but permits an independent later generation", () =>
     Effect.gen(function* () {
       const repository = yield* QueuedTurnPromotionRepository;

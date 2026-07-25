@@ -93,6 +93,7 @@ import Migration0074 from "./Migrations/074_ProviderRequestAdmissions.ts";
 import Migration0075 from "./Migrations/075_ProjectionTurnSummaries.ts";
 import Migration0076 from "./Migrations/076_ReconcileFailedPendingTurnStarts.ts";
 import Migration0077 from "./Migrations/077_BackfillQuarantinedTurnPromotions.ts";
+import Migration0078 from "./Migrations/078_DurableQueuedTurnCancellationFences.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -185,6 +186,7 @@ export const migrationEntries = [
   [75, "ProjectionTurnSummaries", Migration0075],
   [76, "ReconcileFailedPendingTurnStarts", Migration0076],
   [77, "BackfillQuarantinedTurnPromotions", Migration0077],
+  [78, "DurableQueuedTurnCancellationFences", Migration0078],
 ] as const;
 
 export const makeMigrationLoader = (throughId?: number) =>
