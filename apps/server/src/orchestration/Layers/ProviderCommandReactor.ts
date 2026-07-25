@@ -76,6 +76,7 @@ import { ProviderService } from "../../provider/Services/ProviderService.ts";
 import { resolveProviderDispatchAttachments } from "../../provider/providerAttachmentPaths.ts";
 import { OrchestrationEventDeliveryRepositoryLive } from "../../persistence/Layers/OrchestrationEventDeliveries.ts";
 import { ProjectionPendingInteractionRepositoryLive } from "../../persistence/Layers/ProjectionPendingInteractions.ts";
+import { ProviderRuntimeEventRepositoryLive } from "../../persistence/Layers/ProviderRuntimeEvents.ts";
 import { QueuedTurnPromotionRepositoryLive } from "../../persistence/Layers/QueuedTurnPromotions.ts";
 import { ProjectionPendingInteractionRepository } from "../../persistence/Services/ProjectionPendingInteractions.ts";
 import {
@@ -83,6 +84,10 @@ import {
   PROVIDER_COMMAND_REACTOR_CONSUMER,
 } from "../../persistence/Services/OrchestrationEventDeliveries.ts";
 import { QueuedTurnPromotionRepository } from "../../persistence/Services/QueuedTurnPromotions.ts";
+import {
+  PROVIDER_COMMAND_REACTOR_RUNTIME_CONSUMER,
+  ProviderRuntimeEventRepository,
+} from "../../persistence/Services/ProviderRuntimeEvents.ts";
 import { ManagedAttachmentRepository } from "../../persistence/Services/ManagedAttachments.ts";
 import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
@@ -217,6 +222,8 @@ const PROVIDER_COMMAND_SAFE_RETRY_LIMIT = 3;
 const PROVIDER_COMMAND_SAFE_RETRY_DELAY = Duration.millis(50);
 const QUEUED_TURN_HANDOFF_RETRY_LIMIT = 3;
 const QUEUED_TURN_HANDOFF_RETRY_DELAY = Duration.millis(50);
+const PROVIDER_COMMAND_RUNTIME_REPLAY_PAGE_SIZE = 256;
+const PROVIDER_COMMAND_RUNTIME_REPLAY_POLL_INTERVAL = Duration.millis(10);
 const DEFAULT_RUNTIME_MODE: RuntimeMode = "full-access";
 const SIDECHAT_BOUNDARY_INSTRUCTION =
   "You are in a sidechat. Treat all prior conversation as reference-only context. Do not continue any prior task automatically. Do not mutate files, git, or the workspace and do not run workspace-changing commands unless the latest user message explicitly asks you to do so after this boundary. Use this sidechat for focused explanation, safety checks, summaries, and alternatives.";
@@ -343,6 +350,7 @@ const make = Effect.gen(function* () {
   const orchestrationEngine = yield* OrchestrationEngineService;
   const deliveryRepository = yield* OrchestrationEventDeliveryRepository;
   const queuedTurnPromotions = yield* QueuedTurnPromotionRepository;
+  const runtimeEvents = yield* ProviderRuntimeEventRepository;
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
   const providerService = yield* ProviderService;
   const pendingInteractions = yield* ProjectionPendingInteractionRepository;
@@ -363,6 +371,11 @@ const make = Effect.gen(function* () {
   let processCommittedProviderIntentAtSequence:
     | ((eventSequence: number) => Effect.Effect<void, never, Scope.Scope>)
     | undefined;
+  let drainProviderRuntimeJournalThroughCurrentHighWater: Effect.Effect<
+    void,
+    unknown,
+    Scope.Scope
+  > = Effect.void;
 
   const hasHandledTurnStartRecently = (key: string) =>
     Cache.getOption(handledTurnStartKeys, key).pipe(
@@ -431,13 +444,6 @@ const make = Effect.gen(function* () {
     pendingTerminalTurnIds?: Set<TurnId>;
   };
   const pendingQueuedDispatchBySessionThread = new Map<string, PendingQueuedDispatch>();
-  // Runtime terminals and orchestration intents share one delivery lock, but
-  // semaphore waiter order is not a correctness boundary. Record the narrow
-  // OpenCode compatibility terminal as soon as the runtime stream observes it
-  // so an already-committed queued event cannot materialize ahead of the
-  // terminal handler. The durable high-water fence remains authoritative
-  // across restart; this map only closes the in-process scheduling window.
-  const pendingOpenCodeCompatibilityTerminalBySessionThread = new Map<string, string>();
   const queuedTurnPromotionOwner = `provider-queued-turn:${crypto.randomUUID()}`;
   const sidechatContextBootstrapThreadIds = new Set<string>();
   // Fresh sessions that cannot inherit native conversation state need one
@@ -821,27 +827,37 @@ const make = Effect.gen(function* () {
     return rawThreadId.startsWith(prefix) ? rawThreadId.slice(prefix.length) : undefined;
   };
 
-  const enqueueQueuedTurnStart = (event: QueuedTurnSourceEvent) =>
-    queuedTurnPromotions.enqueue({
-      queuedEventSequence: event.sequence,
-      threadId: event.payload.threadId,
-      messageId: event.payload.messageId,
-      dispatchMode: event.payload.dispatchMode,
-      createdAt: event.payload.createdAt,
-    });
-
-  const enqueueQuarantinedTurnStart = (event: QueuedTurnSourceEvent) =>
-    queuedTurnPromotions.enqueue({
-      queuedEventSequence: event.sequence,
-      threadId: event.payload.threadId,
-      messageId: event.payload.messageId,
+  const materializeRunnableQueuedTurn = Effect.fnUntraced(function* (input: {
+    readonly event: QueuedTurnSourceEvent;
+    readonly quarantineFifo: boolean;
+  }) {
+    // The runtime journal is the ordering authority for compatibility
+    // terminals. Catch up to its current durable boundary while the shared
+    // delivery lock is held, then consult the monotonic provider-session fence
+    // before any runnable row can be inserted or rematerialized.
+    yield* drainProviderRuntimeJournalThroughCurrentHighWater;
+    const scope = yield* resolveProviderSessionThreadScope(input.event.payload.threadId);
+    if (
+      yield* queuedTurnPromotions.isQueuedEventCancelledByProviderSessionFence({
+        providerSessionThreadId: scope.sessionThreadId,
+        queuedEventSequence: input.event.sequence,
+      })
+    ) {
+      return false;
+    }
+    yield* queuedTurnPromotions.enqueue({
+      queuedEventSequence: input.event.sequence,
+      threadId: input.event.payload.threadId,
+      messageId: input.event.payload.messageId,
       // Quarantine recovery is strict source FIFO. In particular, multiple
       // original steers must not inherit the ordinary newest-steer-first queue
       // policy. Promotion rereads the source event and preserves its original
       // dispatch mode when it emits the fresh turn-start intent.
-      dispatchMode: "queue",
-      createdAt: event.payload.createdAt,
+      dispatchMode: input.quarantineFifo ? "queue" : input.event.payload.dispatchMode,
+      createdAt: input.event.payload.createdAt,
     });
+    return true;
+  });
 
   const queuedPromotionSourceSequence = (
     event: Extract<ProviderIntentEvent, { type: "thread.turn-start-requested" }>,
@@ -2186,7 +2202,13 @@ const make = Effect.gen(function* () {
       const isCodexSteer =
         event.payload.dispatchMode === "steer" && providerName === "codex" && hasLiveTurn;
       if (!isCodexSteer && hasLiveTurn) {
-        yield* enqueueQueuedTurnStart(event);
+        const materialized = yield* materializeRunnableQueuedTurn({
+          event,
+          quarantineFifo: false,
+        });
+        if (!materialized) {
+          return;
+        }
         // The promotion raced another live turn and was re-queued. Release
         // only when that exact blocking turn settles, not on any late
         // terminal event for the shared provider session.
@@ -2359,27 +2381,14 @@ const make = Effect.gen(function* () {
   const processTurnQueued = Effect.fnUntraced(function* (
     event: Extract<ProviderIntentEvent, { type: "thread.turn-queued" }>,
   ) {
-    const scope = yield* resolveProviderSessionThreadScope(event.payload.threadId);
-    const pendingCompatibilityTerminalAt = pendingOpenCodeCompatibilityTerminalBySessionThread.get(
-      scope.sessionThreadId,
-    );
-    if (pendingCompatibilityTerminalAt !== undefined) {
-      yield* fenceProviderSessionPromotionsThrough({
-        scope,
-        throughEventSequence: yield* orchestrationEngine.getEventHighWaterSequence,
-        updatedAt: pendingCompatibilityTerminalAt,
-      });
-      return;
-    }
     if (
-      yield* queuedTurnPromotions.isQueuedEventCancelledByProviderSessionFence({
-        providerSessionThreadId: scope.sessionThreadId,
-        queuedEventSequence: event.sequence,
-      })
+      !(yield* materializeRunnableQueuedTurn({
+        event,
+        quarantineFifo: false,
+      }))
     ) {
       return;
     }
-    yield* enqueueQueuedTurnStart(event);
     // Recovery drain: if the provider turn settled between the decider's
     // (stale) running check and this enqueue, the terminal
     // `turn.completed`/`turn.aborted` event has already been consumed and will
@@ -2607,7 +2616,6 @@ const make = Effect.gen(function* () {
         throughEventSequence: yield* orchestrationEngine.getEventHighWaterSequence,
         updatedAt: event.createdAt,
       });
-      pendingOpenCodeCompatibilityTerminalBySessionThread.delete(sessionThreadId);
       return;
     }
     const reservation = pendingQueuedDispatchBySessionThread.get(sessionThreadId);
@@ -3439,19 +3447,73 @@ const make = Effect.gen(function* () {
       }),
     );
 
-  const processQueueDrainEventSafely = (event: ProviderQueueDrainEvent) =>
-    processQueueDrainEvent(event).pipe(
-      Effect.catchCause((cause) => {
-        if (Cause.hasInterruptsOnly(cause)) {
-          return Effect.failCause(cause);
+  const runtimeJournalDrainLock = yield* Semaphore.make(1);
+  let runtimeTerminalQueueDrainEnabled = false;
+  const drainProviderRuntimeJournalThrough = (throughSequenceInclusive: number) =>
+    runtimeJournalDrainLock.withPermits(1)(
+      Effect.gen(function* () {
+        let cursor = yield* runtimeEvents.getConsumerCursor(
+          PROVIDER_COMMAND_REACTOR_RUNTIME_CONSUMER,
+        );
+        while (cursor < throughSequenceInclusive) {
+          const page = yield* runtimeEvents.readAfter({
+            sequenceExclusive: cursor,
+            throughSequenceInclusive,
+            limit: PROVIDER_COMMAND_RUNTIME_REPLAY_PAGE_SIZE,
+          });
+          if (page.length === 0) {
+            return yield* Effect.die(
+              new Error(`Provider command runtime journal is missing rows after cursor ${cursor}`),
+            );
+          }
+          for (const entry of page) {
+            const isQueueDrainEvent =
+              entry.event.type === "turn.completed" || entry.event.type === "turn.aborted";
+            const isCompatibilityTerminal =
+              isQueueDrainEvent &&
+              entry.event.provider === "opencode" &&
+              entry.event.payload.failureReason === OPENCODE_STORAGE_SCHEMA_INCOMPATIBLE_REASON;
+            if (
+              isQueueDrainEvent &&
+              (isCompatibilityTerminal || runtimeTerminalQueueDrainEnabled)
+            ) {
+              // Persist the provider-session cancellation fence (when relevant)
+              // before acknowledging the runtime row. A crash between these
+              // operations safely replays the idempotent fence transaction.
+              yield* processQueueDrainEvent(entry.event);
+            }
+            const advanced = yield* runtimeEvents.advanceConsumerCursor({
+              consumerName: PROVIDER_COMMAND_REACTOR_RUNTIME_CONSUMER,
+              eventSequence: entry.sequence,
+              updatedAt: new Date().toISOString(),
+            });
+            if (!advanced) {
+              return yield* Effect.die(
+                new Error(
+                  `Provider command runtime cursor could not advance through event ${entry.sequence}`,
+                ),
+              );
+            }
+            cursor = entry.sequence;
+          }
         }
-        return Effect.logWarning("provider command reactor failed to drain queued turn", {
-          eventType: event.type,
-          threadId: event.threadId,
-          cause: Cause.pretty(cause),
-        });
       }),
     );
+
+  drainProviderRuntimeJournalThroughCurrentHighWater = runtimeEvents.getHighWaterSequence.pipe(
+    Effect.flatMap(drainProviderRuntimeJournalThrough),
+  );
+
+  const drainProviderRuntimeJournalSafely = drainProviderRuntimeJournalThroughCurrentHighWater.pipe(
+    Effect.catchCause((cause) => {
+      if (Cause.hasInterruptsOnly(cause)) {
+        return Effect.failCause(cause);
+      }
+      return Effect.logWarning("provider command runtime journal drain failed", {
+        cause: Cause.pretty(cause),
+      });
+    }),
+  );
 
   // One attach-before-replay source owns every provider intent. The claimed
   // canary classes settle before cursor advancement. Remaining classes execute
@@ -3951,11 +4013,17 @@ const make = Effect.gen(function* () {
             yield* completeQueuedTurnStartHandoff(mutation.event);
             break;
           case "enqueueQueuedTurn":
-            yield* enqueueQueuedTurnStart(mutation.event);
+            yield* materializeRunnableQueuedTurn({
+              event: mutation.event,
+              quarantineFifo: false,
+            });
             yield* requireExactQueuedTurnHandoff(mutation.event);
             break;
           case "enqueueQuarantinedTurn":
-            yield* enqueueQuarantinedTurnStart(mutation.event);
+            yield* materializeRunnableQueuedTurn({
+              event: mutation.event,
+              quarantineFifo: true,
+            });
             yield* requireExactQueuedTurnHandoff(mutation.event);
             break;
           case "cancelProviderSession":
@@ -3989,14 +4057,30 @@ const make = Effect.gen(function* () {
       options?: { readonly allowCancelled?: boolean },
     ) {
       const durableHandoff = yield* queuedTurnPromotions.getBySequence(event.sequence);
+      const exactHandoff =
+        Option.isSome(durableHandoff) &&
+        durableHandoff.value.threadId === (event.payload.threadId as string) &&
+        durableHandoff.value.messageId === event.payload.messageId
+          ? durableHandoff.value
+          : undefined;
+      if (Option.isNone(durableHandoff) || exactHandoff?.state === "cancelled") {
+        const scope = yield* resolveProviderSessionThreadScope(event.payload.threadId);
+        if (
+          yield* queuedTurnPromotions.isQueuedEventCancelledByProviderSessionFence({
+            providerSessionThreadId: scope.sessionThreadId,
+            queuedEventSequence: event.sequence,
+          })
+        ) {
+          return;
+        }
+      }
       if (
         Option.isNone(durableHandoff) ||
-        durableHandoff.value.threadId !== (event.payload.threadId as string) ||
-        durableHandoff.value.messageId !== event.payload.messageId ||
-        (durableHandoff.value.state !== "queued" &&
-          durableHandoff.value.state !== "promoting" &&
-          durableHandoff.value.state !== "promoted" &&
-          !(options?.allowCancelled === true && durableHandoff.value.state === "cancelled"))
+        exactHandoff === undefined ||
+        (exactHandoff.state !== "queued" &&
+          exactHandoff.state !== "promoting" &&
+          exactHandoff.state !== "promoted" &&
+          !(options?.allowCancelled === true && exactHandoff.state === "cancelled"))
       ) {
         return yield* Effect.die(
           new Error(`Turn source event ${event.sequence} has no exact durable queue handoff`),
@@ -4012,7 +4096,10 @@ const make = Effect.gen(function* () {
       // Hand the immutable source event to the durable FIFO before settling
       // the consumer delivery. Startup can resume either side of this boundary
       // without calling the provider twice.
-      yield* enqueueQuarantinedTurnStart(event);
+      yield* materializeRunnableQueuedTurn({
+        event,
+        quarantineFifo: true,
+      });
       // A later stop/edit barrier may already have cancelled this exact
       // generation during reconciliation preflight. That durable tombstone is
       // a complete handoff: settle the original delivery without invoking the
@@ -4252,37 +4339,45 @@ const make = Effect.gen(function* () {
 
   const start: ProviderCommandReactorShape["start"] = seedThreadModelSelections.pipe(
     Effect.andThen(
-      Effect.all([
-        startProviderIntentSource.pipe(
-          Effect.andThen(deliverySourceLock.withPermits(1)(recoverQueuedTurnPromotions)),
-        ),
-        Stream.runForEach(providerService.streamEvents, (event) => {
-          if (event.type !== "turn.completed" && event.type !== "turn.aborted") {
-            return Effect.void;
-          }
-          if (
-            event.provider === "opencode" &&
-            event.payload.failureReason === OPENCODE_STORAGE_SCHEMA_INCOMPATIBLE_REASON
-          ) {
-            pendingOpenCodeCompatibilityTerminalBySessionThread.set(
-              event.threadId,
-              event.createdAt,
-            );
-          }
-          return deliverySourceLock.withPermits(1)(processQueueDrainEventSafely(event));
-        }).pipe(Effect.forkScoped),
-      ]).pipe(Effect.asVoid),
+      Effect.gen(function* () {
+        // Runtime terminals must establish their durable fences before any
+        // provider intent or queued-promotion recovery can materialize work.
+        const runtimeReplayThrough = yield* runtimeEvents.getHighWaterSequence;
+        yield* deliverySourceLock.withPermits(1)(
+          drainProviderRuntimeJournalThrough(runtimeReplayThrough),
+        );
+        yield* startProviderIntentSource;
+        yield* deliverySourceLock.withPermits(1)(
+          drainProviderRuntimeJournalThroughCurrentHighWater.pipe(
+            Effect.andThen(recoverQueuedTurnPromotions),
+          ),
+        );
+        runtimeTerminalQueueDrainEnabled = true;
+        yield* Effect.sleep(PROVIDER_COMMAND_RUNTIME_REPLAY_POLL_INTERVAL).pipe(
+          Effect.andThen(deliverySourceLock.withPermits(1)(drainProviderRuntimeJournalSafely)),
+          Effect.forever,
+          Effect.forkScoped,
+        );
+      }),
     ),
     Effect.orDie,
   );
 
   const drain: ProviderCommandReactorShape["drain"] = Effect.gen(function* () {
-    const targetSequence = yield* orchestrationEngine.getEventHighWaterSequence;
+    const targetIntentSequence = yield* orchestrationEngine.getEventHighWaterSequence;
+    const targetRuntimeSequence = yield* runtimeEvents.getHighWaterSequence;
     while (true) {
       const consumerState = yield* deliveryRepository.getConsumerState(
         PROVIDER_COMMAND_REACTOR_CONSUMER,
       );
-      if (Option.isSome(consumerState) && consumerState.value.lastAckedSequence >= targetSequence) {
+      const runtimeCursor = yield* runtimeEvents.getConsumerCursor(
+        PROVIDER_COMMAND_REACTOR_RUNTIME_CONSUMER,
+      );
+      if (
+        Option.isSome(consumerState) &&
+        consumerState.value.lastAckedSequence >= targetIntentSequence &&
+        runtimeCursor >= targetRuntimeSequence
+      ) {
         return;
       }
       yield* Effect.sleep(Duration.millis(5));
@@ -4318,4 +4413,5 @@ export const ProviderCommandReactorLive = Layer.effect(ProviderCommandReactor, m
   Layer.provideMerge(OrchestrationEventDeliveryRepositoryLive),
   Layer.provideMerge(QueuedTurnPromotionRepositoryLive),
   Layer.provideMerge(ProjectionPendingInteractionRepositoryLive),
+  Layer.provideMerge(ProviderRuntimeEventRepositoryLive),
 );

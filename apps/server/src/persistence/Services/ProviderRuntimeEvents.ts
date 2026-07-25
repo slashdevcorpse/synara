@@ -5,6 +5,7 @@ import type { Effect } from "effect";
 import type { PersistenceDecodeError, PersistenceSqlError } from "../Errors.ts";
 
 export const PROVIDER_RUNTIME_INGESTION_CONSUMER = "provider-runtime-ingestion.v1";
+export const PROVIDER_COMMAND_REACTOR_RUNTIME_CONSUMER = "provider-command-reactor-runtime.v1";
 export const PROVIDER_RUNTIME_EVENT_MAX_BYTES = 2 * 1024 * 1024;
 export const PROVIDER_RUNTIME_EVENT_RETAIN_ACCEPTED = 512;
 

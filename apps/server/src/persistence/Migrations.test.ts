@@ -8,6 +8,10 @@ import { MigrationSchemaTooNewError } from "./Errors.ts";
 import * as NodeSqliteClient from "./NodeSqliteClient.ts";
 import DurableProviderCommandDeliveryMigration from "./Migrations/064_DurableProviderCommandDelivery.ts";
 import ProjectionThreadsGatewayProvenanceMigration from "./Migrations/071_ProjectionThreadsGatewayProvenance.ts";
+import {
+  PROVIDER_COMMAND_REACTOR_RUNTIME_CONSUMER,
+  PROVIDER_RUNTIME_INGESTION_CONSUMER,
+} from "./Services/ProviderRuntimeEvents.ts";
 
 const layer = it.layer(Layer.mergeAll(NodeSqliteClient.layerMemory()));
 
@@ -354,10 +358,11 @@ managedAttachmentsLegacyLayer("managed attachment migration after private migrat
         [76, "ReconcileFailedPendingTurnStarts"],
         [77, "BackfillQuarantinedTurnPromotions"],
         [78, "DurableQueuedTurnCancellationFences"],
+        [79, "ProviderCommandRuntimeConsumer"],
       ]);
 
       const tracker = yield* trackerRows(sql);
-      assert.deepStrictEqual(tracker.slice(-25), [
+      assert.deepStrictEqual(tracker.slice(-26), [
         { migration_id: 54, name: "DurableProviderCommandDelivery" },
         { migration_id: 55, name: "ManagedAttachments" },
         { migration_id: 56, name: "CommandReceiptFingerprints" },
@@ -383,11 +388,30 @@ managedAttachmentsLegacyLayer("managed attachment migration after private migrat
         { migration_id: 76, name: "ReconcileFailedPendingTurnStarts" },
         { migration_id: 77, name: "BackfillQuarantinedTurnPromotions" },
         { migration_id: 78, name: "DurableQueuedTurnCancellationFences" },
+        { migration_id: 79, name: "ProviderCommandRuntimeConsumer" },
       ]);
       const preserved = yield* sql<{ readonly count: number }>`
         SELECT COUNT(*) AS count FROM orchestration_consumer_state
       `;
       assert.strictEqual(preserved[0]?.count, 1);
+      const runtimeConsumers = yield* sql<{
+        readonly consumerName: string;
+        readonly lastAckedSequence: number;
+      }>`
+        SELECT consumer_name AS "consumerName", last_acked_sequence AS "lastAckedSequence"
+        FROM provider_runtime_event_consumers
+        ORDER BY consumer_name ASC
+      `;
+      assert.deepStrictEqual(runtimeConsumers, [
+        {
+          consumerName: PROVIDER_COMMAND_REACTOR_RUNTIME_CONSUMER,
+          lastAckedSequence: 0,
+        },
+        {
+          consumerName: PROVIDER_RUNTIME_INGESTION_CONSUMER,
+          lastAckedSequence: 0,
+        },
+      ]);
     }),
   );
 });

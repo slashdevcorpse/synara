@@ -10,6 +10,7 @@ import {
 import {
   PROVIDER_RUNTIME_EVENT_MAX_BYTES,
   PROVIDER_RUNTIME_EVENT_RETAIN_ACCEPTED,
+  PROVIDER_RUNTIME_INGESTION_CONSUMER,
   ProviderRuntimeEventRepository,
   type PersistedProviderRuntimeEvent,
   type ProviderRuntimeEventRepositoryShape,
@@ -228,51 +229,61 @@ const make = Effect.gen(function* () {
           `;
           if (advanced.length !== 1) return false;
 
-          const isTerminalTurnEvent =
-            event.eventType === "turn.completed" || event.eventType === "turn.aborted";
-          const isThreadTerminalEvent =
-            event.eventType === "session.exited" || event.eventType === "runtime.error";
-          if (event.turnId !== null && !isTerminalTurnEvent && !isThreadTerminalEvent) {
-            yield* sql`
-              INSERT INTO provider_runtime_open_turns (
-                thread_id, turn_id, first_sequence, updated_at
-              ) VALUES (
-                ${event.threadId}, ${event.turnId}, ${input.eventSequence}, ${input.updatedAt}
-              )
-              ON CONFLICT (thread_id, turn_id) DO UPDATE SET
-                first_sequence = MIN(
-                  provider_runtime_open_turns.first_sequence,
-                  excluded.first_sequence
-                ),
-                updated_at = excluded.updated_at
-            `;
-          } else if (event.turnId !== null) {
-            yield* sql`
-              DELETE FROM provider_runtime_open_turns
-              WHERE thread_id = ${event.threadId} AND turn_id = ${event.turnId}
-            `;
-          } else if (isThreadTerminalEvent) {
-            yield* sql`
-              DELETE FROM provider_runtime_open_turns
-              WHERE thread_id = ${event.threadId}
-            `;
-          } else if (isTerminalTurnEvent) {
-            yield* sql`
-              DELETE FROM provider_runtime_open_turns
-              WHERE thread_id = ${event.threadId}
-                AND 1 = (
-                  SELECT COUNT(*) FROM provider_runtime_open_turns
-                  WHERE thread_id = ${event.threadId}
+          // Open-turn replay state belongs to runtime ingestion. Independent
+          // consumers may acknowledge the same terminal first, but must not
+          // erase ingestion's accepted-delta recovery boundary.
+          if (input.consumerName === PROVIDER_RUNTIME_INGESTION_CONSUMER) {
+            const isTerminalTurnEvent =
+              event.eventType === "turn.completed" || event.eventType === "turn.aborted";
+            const isThreadTerminalEvent =
+              event.eventType === "session.exited" || event.eventType === "runtime.error";
+            if (event.turnId !== null && !isTerminalTurnEvent && !isThreadTerminalEvent) {
+              yield* sql`
+                INSERT INTO provider_runtime_open_turns (
+                  thread_id, turn_id, first_sequence, updated_at
+                ) VALUES (
+                  ${event.threadId}, ${event.turnId}, ${input.eventSequence}, ${input.updatedAt}
                 )
-            `;
+                ON CONFLICT (thread_id, turn_id) DO UPDATE SET
+                  first_sequence = MIN(
+                    provider_runtime_open_turns.first_sequence,
+                    excluded.first_sequence
+                  ),
+                  updated_at = excluded.updated_at
+              `;
+            } else if (event.turnId !== null) {
+              yield* sql`
+                DELETE FROM provider_runtime_open_turns
+                WHERE thread_id = ${event.threadId} AND turn_id = ${event.turnId}
+              `;
+            } else if (isThreadTerminalEvent) {
+              yield* sql`
+                DELETE FROM provider_runtime_open_turns
+                WHERE thread_id = ${event.threadId}
+              `;
+            } else if (isTerminalTurnEvent) {
+              yield* sql`
+                DELETE FROM provider_runtime_open_turns
+                WHERE thread_id = ${event.threadId}
+                  AND 1 = (
+                    SELECT COUNT(*) FROM provider_runtime_open_turns
+                    WHERE thread_id = ${event.threadId}
+                  )
+              `;
+            }
           }
 
           // Pending rows are above the cursor. Accepted rows for an open turn
           // remain replayable until its terminal output is accepted; all other
-          // accepted history is bounded to a diagnostic tail.
+          // accepted history is bounded to a diagnostic tail. Retention follows
+          // the slowest durable consumer so one projection cannot delete rows
+          // that another registered consumer has not acknowledged yet.
           yield* sql`
             DELETE FROM provider_runtime_events AS event
-            WHERE event.sequence <= ${input.eventSequence}
+            WHERE event.sequence <= (
+                SELECT COALESCE(MIN(last_acked_sequence), 0)
+                FROM provider_runtime_event_consumers
+              )
               AND NOT EXISTS (
                 SELECT 1
                 FROM provider_runtime_open_turns AS open_turn
