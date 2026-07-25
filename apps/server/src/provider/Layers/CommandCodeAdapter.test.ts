@@ -263,7 +263,7 @@ describe("Command Code CLI helpers", () => {
             command,
             args: [...args],
             shell: false,
-            windowsHide: platform === "win32",
+            ...(platform === "win32" ? { windowsHide: true as const } : {}),
           }));
           const { layer, spawnProcess } = adapterLayer({
             child: mock,
@@ -277,9 +277,12 @@ describe("Command Code CLI helpers", () => {
             yield* adapter.startSession(startInput(threadId));
             yield* adapter.sendTurn({ threadId, input: `run on ${platform}` });
 
-            assert.strictEqual(prepareProcess.mock.calls[0]?.[2].platform, platform);
+            assert.strictEqual(prepareProcess.mock.calls[0]?.[2]?.platform, platform);
             assert.strictEqual(spawnProcess.mock.calls[0]?.[2].detached, platform !== "win32");
-            assert.strictEqual(spawnProcess.mock.calls[0]?.[2].windowsHide, platform === "win32");
+            assert.strictEqual(
+              spawnProcess.mock.calls[0]?.[2].windowsHide,
+              platform === "win32" ? true : undefined,
+            );
 
             yield* adapter.stopSession(threadId);
           }).pipe(Effect.provide(layer));
