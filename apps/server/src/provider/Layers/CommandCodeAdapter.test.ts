@@ -7,6 +7,7 @@ import { ThreadId, type ProviderRuntimeEvent } from "@synara/contracts";
 import { prepareWindowsSafeProcess } from "@synara/shared/windowsProcess";
 import { it, assert, describe, vi } from "@effect/vitest";
 import { Effect, Fiber, Layer, Result, Stream } from "effect";
+import { TestClock } from "effect/testing";
 
 import { ServerConfig } from "../../config.ts";
 import {
@@ -753,7 +754,7 @@ it.effect("projects v1 tool updates and terminal denied or hook-blocked states",
             type: "tool_running",
             toolCallId: "call_progress",
             toolName: "read_file",
-            description: "r".repeat(5_000),
+            description: `${"r".repeat(4_095)}🙂tail`,
           },
           {
             type: "tool_update",
@@ -817,10 +818,9 @@ it.effect("projects v1 tool updates and terminal denied or hook-blocked states",
       assert.ok(
         runningDetail?.type === "item.updated" && runningDetail.payload.detail?.endsWith("…"),
       );
-      assert.ok(
-        (runningDetail?.type === "item.updated"
-          ? (runningDetail.payload.detail?.length ?? 0)
-          : 0) <= 4_097,
+      assert.strictEqual(
+        runningDetail?.type === "item.updated" ? runningDetail.payload.detail : undefined,
+        `${"r".repeat(4_095)}…`,
       );
 
       const denied = events.find(
@@ -1048,6 +1048,55 @@ it.effect("fails the turn instead of ignoring a malformed recognized v1 event", 
           .map((event) => (event.type === "content.delta" ? event.payload.delta : "")),
         ["valid prefix"],
       );
+    }),
+  ),
+);
+
+it.effect("does not persist usage from a stream rejected after its terminal result", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const mock = makeMockChild();
+      const { layer } = adapterLayer({ child: mock });
+      const threadId = ThreadId.makeUnsafe("command-code-invalid-trailing-stream");
+      const { events, session } = yield* Effect.gen(function* () {
+        const adapter = yield* CommandCodeAdapter;
+        const eventFiber = yield* adapter.streamEvents.pipe(
+          Stream.takeUntil((event) => event.type === "turn.completed"),
+          Stream.runCollect,
+          Effect.forkChild,
+        );
+        yield* adapter.startSession({
+          ...startInput(threadId),
+          resumeCursor: {
+            sessionId: COMMAND_CODE_SESSION_ID,
+            totalProcessedTokens: 37,
+          },
+        });
+        yield* adapter.sendTurn({ threadId, input: "reject trailing protocol data" });
+        writeSuccessfulResult(mock, {
+          usage: {
+            inputTokens: 20,
+            outputTokens: 5,
+            cacheReadTokens: 8,
+            cacheWriteTokens: 1,
+          },
+        });
+        mock.stdout.write("{not-json}\n");
+
+        const events = Array.from(yield* Fiber.join(eventFiber));
+        return { events, session: (yield* adapter.listSessions())[0] };
+      }).pipe(Effect.provide(layer));
+
+      const completed = events.find(
+        (event): event is Extract<ProviderRuntimeEvent, { type: "turn.completed" }> =>
+          event.type === "turn.completed",
+      );
+      assert.strictEqual(completed?.payload.state, "failed");
+      assert.ok(!events.some((event) => event.type === "thread.token-usage.updated"));
+      assert.deepStrictEqual(session?.resumeCursor, {
+        sessionId: COMMAND_CODE_SESSION_ID,
+        totalProcessedTokens: 37,
+      });
     }),
   ),
 );
@@ -2009,6 +2058,66 @@ it.effect("attempts a failed active owner only once per stopAll call", () =>
 
         yield* adapter.stopAll();
         assert.equal(teardown.mock.calls.length, 2);
+      }).pipe(Effect.provide(layer));
+    }),
+  ),
+);
+
+it.effect("allows overlapping stopAll calls to converge after shared teardown", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const mock = makeMockChild();
+      let releaseTeardown!: () => void;
+      const teardownGate = new Promise<void>((resolve) => {
+        releaseTeardown = resolve;
+      });
+      const teardown = vi.fn(async () => {
+        await teardownGate;
+        if (mock.child.exitCode === null) mock.close(130);
+      });
+      const { layer } = adapterLayer({ child: mock, teardownProcessTree: teardown });
+      const activeThreadId = ThreadId.makeUnsafe("command-code-concurrent-stop-active");
+      const readyThreadId = ThreadId.makeUnsafe("command-code-concurrent-stop-ready");
+
+      yield* Effect.gen(function* () {
+        const adapter = yield* CommandCodeAdapter;
+        const eventFiber = yield* adapter.streamEvents.pipe(
+          Stream.filter((event) => event.type === "session.exited"),
+          Stream.take(2),
+          Stream.runCollect,
+          Effect.forkChild,
+        );
+        yield* adapter.startSession(startInput(activeThreadId));
+        yield* adapter.sendTurn({ threadId: activeThreadId, input: "wait for shared teardown" });
+        yield* adapter.startSession(startInput(readyThreadId));
+
+        const firstStop = yield* adapter.stopAll().pipe(Effect.result, Effect.forkChild);
+        yield* Effect.promise(() =>
+          vi.waitFor(() => assert.strictEqual(teardown.mock.calls.length, 1)),
+        );
+        const secondStop = yield* adapter.stopAll().pipe(Effect.result, Effect.forkChild);
+        yield* Effect.yieldNow;
+        releaseTeardown();
+
+        assert.strictEqual(Result.isSuccess(yield* Fiber.join(firstStop)), true);
+        assert.strictEqual(Result.isSuccess(yield* Fiber.join(secondStop)), true);
+        assert.deepStrictEqual(yield* adapter.listSessions(), []);
+        assert.strictEqual(teardown.mock.calls.length, 1);
+        const events = Array.from(yield* Fiber.join(eventFiber));
+        assert.strictEqual(events.length, 2);
+        assert.ok(events.every((event) => event.type === "session.exited"));
+        assert.deepStrictEqual(
+          events.map((event) => event.threadId).sort(),
+          [activeThreadId, readyThreadId].sort(),
+        );
+        const unexpectedEvent = yield* TestClock.withLive(
+          adapter.streamEvents.pipe(
+            Stream.filter((event) => event.type === "session.exited"),
+            Stream.runHead,
+            Effect.timeoutOption("25 millis"),
+          ),
+        );
+        assert.strictEqual(unexpectedEvent._tag, "None");
       }).pipe(Effect.provide(layer));
     }),
   ),

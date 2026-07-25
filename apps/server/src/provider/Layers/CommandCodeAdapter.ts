@@ -25,7 +25,7 @@ import {
   type ThreadTokenUsageSnapshot,
 } from "@synara/contracts";
 import { resolveCommandCodeCliExecutableAsync } from "@synara/shared/commandCodeCliExecutable";
-import { Cause, Effect, Exit, Layer, Queue, Stream } from "effect";
+import { Effect, Exit, Layer, Queue, Stream } from "effect";
 
 import { ServerConfig } from "../../config.ts";
 import { buildProviderChildEnvironment } from "../../providerChildEnvironment.ts";
@@ -146,7 +146,6 @@ interface ActiveCommandCodeTurn {
     }
   >;
   stderr: string;
-  stderrLineBuffer: string;
   stderrBytes: number;
   projectedOutputBytes: number;
   headlessRecordCount: number;
@@ -421,9 +420,19 @@ function compactCommandCodeValue(value: unknown): unknown {
 
 function compactCommandCodeDetail(value: string, fallback: string): string {
   const detail = value.trim() || fallback;
-  return detail.length <= MAX_TOOL_DETAIL_LENGTH
-    ? detail
-    : `${detail.slice(0, MAX_TOOL_DETAIL_LENGTH)}…`;
+  if (detail.length <= MAX_TOOL_DETAIL_LENGTH) return detail;
+  let end = MAX_TOOL_DETAIL_LENGTH;
+  const lastIncludedCodeUnit = detail.charCodeAt(end - 1);
+  const firstExcludedCodeUnit = detail.charCodeAt(end);
+  if (
+    lastIncludedCodeUnit >= 0xd800 &&
+    lastIncludedCodeUnit <= 0xdbff &&
+    firstExcludedCodeUnit >= 0xdc00 &&
+    firstExcludedCodeUnit <= 0xdfff
+  ) {
+    end -= 1;
+  }
+  return `${detail.slice(0, end)}…`;
 }
 
 const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
@@ -707,9 +716,6 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
 
     const consumeStderr = (active: ActiveCommandCodeTurn, chunk: string) => {
       active.stderr += chunk;
-      active.stderrLineBuffer += chunk;
-      const lines = active.stderrLineBuffer.split(/\r?\n/u);
-      active.stderrLineBuffer = lines.pop() ?? "";
     };
 
     const terminateTurnWithError = (
@@ -1120,13 +1126,14 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
           },
         } satisfies ProviderRuntimeEvent);
       }
-      const normalizedUsage = result
-        ? normalizeCommandCodeTokenUsage(
-            result,
-            active.toolItems.size,
-            context.cumulativeProcessedTokens,
-          )
-        : undefined;
+      const normalizedUsage =
+        failure === undefined && result
+          ? normalizeCommandCodeTokenUsage(
+              result,
+              active.toolItems.size,
+              context.cumulativeProcessedTokens,
+            )
+          : undefined;
       if (normalizedUsage) {
         context.cumulativeProcessedTokens =
           normalizedUsage.totalProcessedTokens ?? context.cumulativeProcessedTokens;
@@ -1503,7 +1510,6 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
               stderrDecoder: new StringDecoder("utf8"),
               toolItems: new Map(),
               stderr: "",
-              stderrLineBuffer: "",
               stderrBytes: 0,
               projectedOutputBytes: 0,
               headlessRecordCount: 0,
@@ -1613,15 +1619,18 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
         yield* teardownTurn(active, "turn/interrupt");
       });
 
-    const stopSession: CommandCodeAdapterShape["stopSession"] = (threadId) =>
+    const stopSessionContext = (
+      threadId: ThreadId,
+      context: CommandCodeSessionContext,
+    ): Effect.Effect<void, ProviderAdapterRequestError> =>
       Effect.gen(function* () {
-        const context = yield* requireSession(threadId);
         context.stopped = true;
         const active = context.active;
         if (active) {
           active.interrupted = true;
           yield* teardownTurn(active, "session/stop");
         }
+        if (sessions.get(threadId) !== context) return;
         sessions.delete(threadId);
         offerEvent({
           ...eventBase(context),
@@ -1634,6 +1643,9 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
           payload: { reason: "stopped", exitKind: "graceful" },
         } satisfies ProviderRuntimeEvent);
       });
+
+    const stopSession: CommandCodeAdapterShape["stopSession"] = (threadId) =>
+      Effect.flatMap(requireSession(threadId), (context) => stopSessionContext(threadId, context));
 
     const readThread: CommandCodeAdapterShape["readThread"] = (threadId) =>
       requireSession(threadId).pipe(
@@ -1840,7 +1852,8 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
       }).pipe(
         Effect.andThen(
           Effect.gen(function* () {
-            const activeOwners = Array.from(sessions.values()).flatMap((context) => {
+            const sessionEntries = Array.from(sessions.entries());
+            const activeOwners = sessionEntries.flatMap(([, context]) => {
               const owner = context.active ? processOwners.get(context.active.child) : undefined;
               return owner ? [owner] : [];
             });
@@ -1848,8 +1861,8 @@ const makeCommandCodeAdapter = (options?: CommandCodeAdapterLiveOptions) =>
             for (const pending of pendingOwnerships) {
               void beginPendingProcessTeardown(pending);
             }
-            const results = yield* Effect.forEach(Array.from(sessions.keys()), (threadId) =>
-              stopSession(threadId).pipe(Effect.exit),
+            const results = yield* Effect.forEach(sessionEntries, ([threadId, context]) =>
+              stopSessionContext(threadId, context).pipe(Effect.exit),
             );
             const pendingResults = yield* Effect.forEach(
               pendingOwnerships,
