@@ -129,7 +129,7 @@ describe("classifyOpenCodeCompatibilityFailure", () => {
 });
 
 describe("isStructuredOpenCodeSessionNotFound", () => {
-  it("accepts only the typed SDK 404 response envelope", () => {
+  it("accepts the typed SDK 404 response tuple", () => {
     expect(
       isStructuredOpenCodeSessionNotFound(
         new OpenCodeRuntimeError({
@@ -147,6 +147,53 @@ describe("isStructuredOpenCodeSessionNotFound", () => {
     ).toBe(true);
   });
 
+  it("accepts the SDK's thrown 404 envelope through retained runtime causes", () => {
+    const sdkError = new Error("Session not found", {
+      cause: {
+        body: {
+          name: "NotFoundError",
+          data: { message: "Session not found" },
+        },
+        status: 404,
+      },
+    });
+    const nestedRuntimeError = new OpenCodeRuntimeError({
+      operation: "session.get",
+      detail: "Session not found",
+      cause: sdkError,
+    });
+
+    expect(
+      isStructuredOpenCodeSessionNotFound(
+        new OpenCodeRuntimeError({
+          operation: "session.get",
+          detail: "resume failed",
+          cause: nestedRuntimeError,
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  it("rejects the SDK's thrown 404 envelope for another operation", () => {
+    expect(
+      isStructuredOpenCodeSessionNotFound(
+        new OpenCodeRuntimeError({
+          operation: "session.create",
+          detail: "Session not found",
+          cause: new Error("Session not found", {
+            cause: {
+              body: {
+                name: "NotFoundError",
+                data: { message: "Session not found" },
+              },
+              status: 404,
+            },
+          }),
+        }),
+      ),
+    ).toBe(false);
+  });
+
   it.each([
     [
       "wrong status",
@@ -158,6 +205,34 @@ describe("isStructuredOpenCodeSessionNotFound", () => {
     ],
     ["missing response", { error: { name: "NotFoundError", data: { message: "missing" } } }],
     ["malformed data", { response: { status: 404 }, error: { name: "NotFoundError", data: {} } }],
+    [
+      "thrown wrong status",
+      new Error("Session not found", {
+        cause: {
+          body: { name: "NotFoundError", data: { message: "missing" } },
+          status: 500,
+        },
+      }),
+    ],
+    [
+      "thrown wrong type",
+      new Error("Session not found", {
+        cause: {
+          body: { name: "UnknownError", data: { message: "missing" } },
+          status: 404,
+        },
+      }),
+    ],
+    [
+      "thrown malformed data",
+      new Error("Session not found", {
+        cause: {
+          body: { name: "NotFoundError", data: {} },
+          status: 404,
+        },
+      }),
+    ],
+    ["unstructured thrown 404 text", new Error("404 Session not found")],
   ])("rejects a %s resume failure", (_name, cause) => {
     expect(
       isStructuredOpenCodeSessionNotFound(

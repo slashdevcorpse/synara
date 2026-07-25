@@ -1,6 +1,13 @@
 import { ThreadId } from "@synara/contracts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import type { Agent, Model, OpencodeClient, Part, Provider } from "@opencode-ai/sdk/v2";
+import {
+  createOpencodeClient,
+  type Agent,
+  type Model,
+  type OpencodeClient,
+  type Part,
+  type Provider,
+} from "@opencode-ai/sdk/v2";
 import { Deferred, Effect, Exit, Fiber, Layer, Result, Scope, Stream } from "effect";
 import { describe, it, expect, vi } from "vitest";
 
@@ -1555,15 +1562,24 @@ describe("OpenCodeAdapter runtime lifecycle", () => {
     ]);
   });
 
-  it("creates a fresh session only for a structured session.get 404", async () => {
+  it("creates a fresh session for the SDK's thrown structured session.get 404", async () => {
+    const sdkClient = createOpencodeClient({
+      baseUrl: "http://127.0.0.1:4099",
+      throwOnError: true,
+      fetch: async () =>
+        new Response(
+          JSON.stringify({
+            name: "NotFoundError",
+            data: { message: "Session not found" },
+          }),
+          {
+            status: 404,
+            headers: { "content-type": "application/json" },
+          },
+        ),
+    });
     const runtime = createMockOpenCodeRuntime({
-      sessionGet: async () => ({
-        error: {
-          name: "NotFoundError",
-          data: { message: "Session not found" },
-        },
-        response: { status: 404 },
-      }),
+      sessionGet: (input) => sdkClient.session.get(input),
     });
 
     const session = await Effect.runPromise(

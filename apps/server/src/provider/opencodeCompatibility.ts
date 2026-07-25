@@ -95,36 +95,54 @@ export function classifyOpenCodeCompatibilityFailure(
   };
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function isOpenCodeSessionNotFoundBody(value: unknown): boolean {
+  if (!isRecord(value) || value.name !== "NotFoundError") {
+    return false;
+  }
+  const data = value.data;
+  return isRecord(data) && typeof data.message === "string";
+}
+
+function isDirectOpenCodeSessionNotFoundEnvelope(value: unknown): boolean {
+  if (!isRecord(value)) {
+    return false;
+  }
+
+  const response = value.response;
+  const tupleStatus = isRecord(response) ? response.status : undefined;
+  if (tupleStatus === 404 && isOpenCodeSessionNotFoundBody(value.error)) {
+    return true;
+  }
+
+  return value.status === 404 && isOpenCodeSessionNotFoundBody(value.body);
+}
+
+function containsStructuredOpenCodeSessionNotFound(
+  value: unknown,
+  depth: number,
+  seen: Set<object>,
+): boolean {
+  if (depth > MAX_ERROR_ENVELOPE_DEPTH || !isRecord(value) || seen.has(value)) {
+    return false;
+  }
+  seen.add(value);
+
+  if (value.operation !== undefined && value.operation !== "session.get") {
+    return false;
+  }
+  if (isDirectOpenCodeSessionNotFoundEnvelope(value)) {
+    return true;
+  }
+  return containsStructuredOpenCodeSessionNotFound(value.cause, depth + 1, seen);
+}
+
 export function isStructuredOpenCodeSessionNotFound(error: unknown): boolean {
-  if (!error || typeof error !== "object" || Array.isArray(error)) {
+  if (!isRecord(error) || error.operation !== "session.get") {
     return false;
   }
-  const runtimeError = error as Record<string, unknown>;
-  if (runtimeError.operation !== "session.get") {
-    return false;
-  }
-  const cause = runtimeError.cause;
-  if (!cause || typeof cause !== "object" || Array.isArray(cause)) {
-    return false;
-  }
-  const result = cause as Record<string, unknown>;
-  const response = result.response;
-  const responseStatus =
-    response && typeof response === "object" && !Array.isArray(response)
-      ? (response as Record<string, unknown>).status
-      : undefined;
-  const responseError = result.error;
-  if (!responseError || typeof responseError !== "object" || Array.isArray(responseError)) {
-    return false;
-  }
-  const errorRecord = responseError as Record<string, unknown>;
-  const data = errorRecord.data;
-  return (
-    responseStatus === 404 &&
-    errorRecord.name === "NotFoundError" &&
-    !!data &&
-    typeof data === "object" &&
-    !Array.isArray(data) &&
-    typeof (data as Record<string, unknown>).message === "string"
-  );
+  return containsStructuredOpenCodeSessionNotFound(error.cause, 0, new Set());
 }
