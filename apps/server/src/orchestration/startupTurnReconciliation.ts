@@ -349,10 +349,11 @@ export const reconcileRestartProviderInterruptDeliveries: Effect.Effect<
       .pipe(
         Effect.catchCause((cause) =>
           Effect.logWarning(
-            "restart provider delivery reconciliation skipped: failed to list blockers",
+            "restart provider delivery reconciliation failed: could not list blockers",
             { cause },
-          ).pipe(Effect.as([])),
+          ).pipe(Effect.andThen(Effect.failCause(cause))),
         ),
+        Effect.orDie,
       );
     if (blockers.length === 0) {
       return;
@@ -391,8 +392,9 @@ export const reconcileRestartProviderInterruptDeliveries: Effect.Effect<
                 eventSequence: reconciliation.eventSequence,
                 threadId: reconciliation.threadId,
                 cause,
-              }),
+              }).pipe(Effect.andThen(Effect.failCause(cause))),
             ),
+            Effect.orDie,
           ),
         { concurrency: 1, discard: true },
       );

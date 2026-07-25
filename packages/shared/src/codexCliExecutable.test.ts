@@ -40,7 +40,9 @@ function completeCodexBundle(executable: string): [string, string, string] {
   ];
 }
 
-function nestedNpmVendorCodex(shim: string): string {
+function nestedNpmVendorCodex(shim: string, arch: "x64" | "arm64" = "x64"): string {
+  const platformPackage = arch === "arm64" ? "codex-win32-arm64" : "codex-win32-x64";
+  const target = arch === "arm64" ? "aarch64-pc-windows-msvc" : "x86_64-pc-windows-msvc";
   return Path.win32.join(
     Path.win32.dirname(shim),
     "node_modules",
@@ -48,9 +50,9 @@ function nestedNpmVendorCodex(shim: string): string {
     "codex",
     "node_modules",
     "@openai",
-    "codex-win32-x64",
+    platformPackage,
     "vendor",
-    "x86_64-pc-windows-msvc",
+    target,
     "bin",
     "codex.exe",
   );
@@ -121,6 +123,7 @@ describe("resolveCodexCliExecutable", () => {
     expect(
       resolveCodexCliExecutable(configured, {
         platform: "win32",
+        arch: "x64",
         cwd: "C:\\projects\\synara",
         env: { SystemRoot: "C:\\Windows" },
         spawnSync,
@@ -240,6 +243,7 @@ describe("resolveCodexCliExecutable", () => {
     expect(
       resolveCodexCliExecutable("codex", {
         platform: "win32",
+        arch: "x64",
         cwd: "C:\\projects\\synara",
         env: {
           SystemRoot: "C:\\Windows",
@@ -260,6 +264,7 @@ describe("resolveCodexCliExecutable", () => {
     expect(
       resolveCodexCliExecutable("codex", {
         platform: "win32",
+        arch: "x64",
         cwd: "C:\\projects\\synara",
         env: {
           SystemRoot: "C:\\Windows",
@@ -279,6 +284,7 @@ describe("resolveCodexCliExecutable", () => {
     expect(
       resolveCodexCliExecutable("codex", {
         platform: "win32",
+        arch: "x64",
         cwd: "C:\\Users\\Test User\\Synara Project",
         env: { SystemRoot: "C:\\Windows" },
         spawnSync,
@@ -296,6 +302,7 @@ describe("resolveCodexCliExecutable", () => {
     expect(
       resolveCodexCliExecutable("codex", {
         platform: "win32",
+        arch: "x64",
         cwd: "C:\\projects\\synara",
         env: { SystemRoot: "C:\\Windows" },
         spawnSync: whereOutput(olderNative, npmBatch),
@@ -335,6 +342,7 @@ describe("resolveCodexCliExecutable", () => {
     expect(
       resolveCodexCliExecutable("codex", {
         platform: "win32",
+        arch: "x64",
         cwd: "C:\\projects\\synara",
         env: {
           SystemRoot: "C:\\Windows",
@@ -400,6 +408,7 @@ describe("resolveCodexCliExecutable", () => {
     expect(
       resolveCodexCliExecutable(configured, {
         platform: "win32",
+        arch: "x64",
         cwd: "C:\\projects\\synara",
         env: { SystemRoot: "C:\\Windows" },
         spawnSync,
@@ -417,6 +426,7 @@ describe("resolveCodexCliExecutable", () => {
     expect(
       resolveCodexCliExecutable(configured, {
         platform: "win32",
+        arch: "x64",
         cwd: "C:\\projects\\synara",
         env: { SystemRoot: "C:\\Windows" },
         spawnSync,
@@ -424,6 +434,22 @@ describe("resolveCodexCliExecutable", () => {
       }),
     ).toBe(vendorNative);
     expect(spawnSync).not.toHaveBeenCalled();
+  });
+
+  it("resolves the ARM64 native package behind an explicit npm shim", () => {
+    const configured = "C:\\Users\\test\\AppData\\Roaming\\npm\\codex.cmd";
+    const vendorNative = nestedNpmVendorCodex(configured, "arm64");
+
+    expect(
+      resolveCodexCliExecutable(configured, {
+        platform: "win32",
+        arch: "arm64",
+        cwd: "C:\\projects\\synara",
+        env: { SystemRoot: "C:\\Windows" },
+        spawnSync: vi.fn(),
+        statSync: regularFiles(configured, ...completeCodexBundle(vendorNative)),
+      }),
+    ).toBe(vendorNative);
   });
 
   it("falls through from an explicit npm shim whose native package is incomplete", () => {
@@ -436,6 +462,7 @@ describe("resolveCodexCliExecutable", () => {
     expect(
       resolveCodexCliExecutable(configured, {
         platform: "win32",
+        arch: "x64",
         cwd: "C:\\projects\\synara",
         env: { SystemRoot: "C:\\Windows" },
         spawnSync,
@@ -488,6 +515,7 @@ describe("resolveCodexCliExecutable", () => {
     expect(
       resolveCodexCliExecutable("codex", {
         platform: "win32",
+        arch: "x64",
         cwd: "C:\\projects\\synara",
         env: {
           SystemRoot: "C:\\Windows",

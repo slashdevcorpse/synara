@@ -604,4 +604,87 @@ describe("planRestartProviderDeliveryReconciliations", () => {
     expect(observedCursors).toEqual([undefined, 100]);
     expect(reconciledSequences).toEqual([101]);
   });
+
+  it("fails closed when startup cannot list blocking deliveries", async () => {
+    const listingFailure = new Error("injected blocker listing failure");
+    let reconciliationAttempted = false;
+    let continuedAfterReconciliation = false;
+    const reactor = {
+      start: Effect.void,
+      drain: Effect.void,
+      listBlockingDeliveries: () => Effect.fail(listingFailure),
+      reconcileDelivery: () =>
+        Effect.sync(() => {
+          reconciliationAttempted = true;
+          return null;
+        }),
+    } as unknown as ProviderCommandReactorShape;
+    const providerService = {
+      listSessions: () => Effect.succeed([]),
+    } as unknown as ProviderServiceShape;
+    const program = reconcileRestartProviderInterruptDeliveries.pipe(
+      Effect.andThen(
+        Effect.sync(() => {
+          continuedAfterReconciliation = true;
+        }),
+      ),
+      Effect.provide(
+        Layer.mergeAll(
+          Layer.succeed(ProviderCommandReactor, reactor),
+          Layer.succeed(ProviderService, providerService),
+        ),
+      ),
+    );
+
+    await expect(Effect.runPromise(program)).rejects.toThrow("injected blocker listing failure");
+    expect(reconciliationAttempted).toBe(false);
+    expect(continuedAfterReconciliation).toBe(false);
+  });
+
+  it("fails closed on the first delivery reconciliation error", async () => {
+    const reconciliationFailure = new Error("injected delivery reconciliation failure");
+    const attemptedSequences: number[] = [];
+    let continuedAfterReconciliation = false;
+    const reactor = {
+      start: Effect.void,
+      drain: Effect.void,
+      listBlockingDeliveries: () => Effect.succeed([deliveryEvidence(10), deliveryEvidence(11)]),
+      reconcileDelivery: (input: { readonly eventSequence: number; readonly threadId: ThreadId }) =>
+        Effect.gen(function* () {
+          attemptedSequences.push(input.eventSequence);
+          if (input.eventSequence === 10) {
+            return yield* Effect.fail(reconciliationFailure);
+          }
+          return {
+            eventSequence: input.eventSequence,
+            threadId: input.threadId,
+            outcome: "abandon" as const,
+            state: "succeeded" as const,
+            reconciledAt: NOW,
+          };
+        }),
+    } as unknown as ProviderCommandReactorShape;
+    const providerService = {
+      listSessions: () => Effect.succeed([]),
+    } as unknown as ProviderServiceShape;
+    const program = reconcileRestartProviderInterruptDeliveries.pipe(
+      Effect.andThen(
+        Effect.sync(() => {
+          continuedAfterReconciliation = true;
+        }),
+      ),
+      Effect.provide(
+        Layer.mergeAll(
+          Layer.succeed(ProviderCommandReactor, reactor),
+          Layer.succeed(ProviderService, providerService),
+        ),
+      ),
+    );
+
+    await expect(Effect.runPromise(program)).rejects.toThrow(
+      "injected delivery reconciliation failure",
+    );
+    expect(attemptedSequences).toEqual([10]);
+    expect(continuedAfterReconciliation).toBe(false);
+  });
 });
