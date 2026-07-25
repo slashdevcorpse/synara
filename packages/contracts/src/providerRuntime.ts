@@ -79,8 +79,10 @@ export type RuntimeThreadState = typeof RuntimeThreadState.Type;
 const RuntimeTurnState = Schema.Literals(["completed", "failed", "interrupted", "cancelled"]);
 export type RuntimeTurnState = typeof RuntimeTurnState.Type;
 
+export const OPENCODE_STORAGE_SCHEMA_INCOMPATIBLE_REASON =
+  "opencode_storage_schema_incompatible" as const;
 export const ProviderCompatibilityFailureReason = Schema.Literal(
-  "opencode_storage_schema_incompatible",
+  OPENCODE_STORAGE_SCHEMA_INCOMPATIBLE_REASON,
 );
 export type ProviderCompatibilityFailureReason = typeof ProviderCompatibilityFailureReason.Type;
 

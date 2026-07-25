@@ -1,3 +1,5 @@
+import type { ProviderRuntimeEvent } from "@synara/contracts";
+
 import {
   OPENCODE_STORAGE_SCHEMA_INCOMPATIBLE_REASON,
   type ProviderAdapterCompatibilityReason,
@@ -24,6 +26,17 @@ export interface OpenCodeCompatibilityClassifierInput {
   readonly operation: string;
   readonly lifecycleStage: string;
   readonly error: unknown;
+}
+
+export function isOpenCodeCompatibilityTerminal(event: ProviderRuntimeEvent): boolean {
+  return (
+    event.provider === "opencode" &&
+    ((event.type === "turn.completed" &&
+      event.payload.state !== "completed" &&
+      event.payload.failureReason === OPENCODE_STORAGE_SCHEMA_INCOMPATIBLE_REASON) ||
+      (event.type === "turn.aborted" &&
+        event.payload.failureReason === OPENCODE_STORAGE_SCHEMA_INCOMPATIBLE_REASON))
+  );
 }
 
 function hasExactConstraintLine(message: string): boolean {

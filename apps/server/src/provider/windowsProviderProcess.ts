@@ -31,6 +31,7 @@ import {
 const WINDOWS_JOB_PREPARED_COMMAND = Symbol("synara.windowsJobPreparedCommand");
 const WINDOWS_JOB_CONTROL_FILE = Symbol("synara.windowsJobControlFile");
 const MAX_WINDOWS_PROVIDER_SHIM_BYTES = 64 * 1024;
+const MAX_WINDOWS_PROVIDER_PACKAGE_MANIFEST_BYTES = 1024 * 1024;
 
 export interface WindowsJobPreparedCommand extends WindowsSafeProcessCommand {
   readonly [WINDOWS_JOB_PREPARED_COMMAND]: true;
@@ -46,6 +47,7 @@ export interface WindowsProviderProcessInput extends WindowsAsyncCommandDiscover
   readonly launcherPath?: string | undefined;
   readonly fileExists?: ((path: string) => boolean) | undefined;
   readonly readFileString?: ((path: string) => string | undefined) | undefined;
+  readonly readPackageManifestString?: ((path: string) => string | undefined) | undefined;
   readonly realPath?: ((path: string) => string | undefined) | undefined;
   readonly controlDirectory?: string | undefined;
   /**
@@ -169,6 +171,18 @@ function defaultReadFileString(path: string): string | undefined {
   try {
     const stat = statSync(path);
     if (!stat.isFile() || stat.size > MAX_WINDOWS_PROVIDER_SHIM_BYTES) {
+      return undefined;
+    }
+    return readFileSync(path, "utf8");
+  } catch {
+    return undefined;
+  }
+}
+
+function defaultReadPackageManifestString(path: string): string | undefined {
+  try {
+    const stat = statSync(path);
+    if (!stat.isFile() || stat.size > MAX_WINDOWS_PROVIDER_PACKAGE_MANIFEST_BYTES) {
       return undefined;
     }
     return readFileSync(path, "utf8");
@@ -367,9 +381,11 @@ function inspectCanonicalWindowsNpmShim(
   }
   let packageManifestContents: string | undefined;
   try {
-    packageManifestContents = (input.readFileString ?? defaultReadFileString)(
-      canonicalPackageManifestPath,
-    );
+    packageManifestContents = (
+      input.readPackageManifestString ??
+      input.readFileString ??
+      defaultReadPackageManifestString
+    )(canonicalPackageManifestPath);
   } catch {
     packageManifestContents = undefined;
   }

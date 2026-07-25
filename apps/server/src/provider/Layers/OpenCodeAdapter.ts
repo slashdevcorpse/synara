@@ -1400,7 +1400,11 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
         if (existingIncident !== undefined) {
           return existingIncident.error;
         }
-        if (context.teardownRequested) {
+        if (
+          context.teardownRequested ||
+          (yield* Ref.get(context.stopped)) ||
+          context.activeTurnId !== input.turnId
+        ) {
           return null;
         }
 
@@ -4420,7 +4424,12 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
           const contexts = [...sessions.values()];
           yield* Effect.forEach(
             contexts,
-            (context) => Effect.ignoreCause(stopAndRemoveOpenCodeContext(context)),
+            (context) =>
+              Effect.ignoreCause(
+                stopAndRemoveOpenCodeContext(context, {
+                  allowPendingCompatibilityTerminal: true,
+                }),
+              ),
             { concurrency: "unbounded", discard: true },
           );
           if (openCodeRuntime.closeLocalServerPoolsForCliSpec !== undefined) {

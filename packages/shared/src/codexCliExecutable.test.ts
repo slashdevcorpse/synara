@@ -46,6 +46,37 @@ describe("resolveCodexCliExecutable", () => {
     expect(readStat).not.toHaveBeenCalled();
   });
 
+  it("normalizes a whitespace-padded default before Windows PATH discovery", () => {
+    const npmCodex = "C:\\Users\\Test\\AppData\\Roaming\\npm\\codex.cmd";
+    const spawnSync = whereOutput(npmCodex);
+
+    expect(
+      resolveCodexCliExecutable(" CoDeX ", {
+        platform: "win32",
+        spawnSync,
+      }),
+    ).toBe(npmCodex);
+    expect(spawnSync).toHaveBeenCalledTimes(1);
+    expect(spawnSync.mock.calls[0]?.[1]).toEqual(["codex"]);
+  });
+
+  it("normalizes a whitespace-padded default before async Windows PATH discovery", async () => {
+    const npmCodex = "C:\\Users\\Test\\AppData\\Roaming\\npm\\codex.cmd";
+    const execFile = vi.fn(async (_command: string, _args: ReadonlyArray<string>) => ({
+      stdout: npmCodex,
+      status: 0,
+    }));
+
+    await expect(
+      resolveCodexCliExecutableAsync(" CoDeX ", {
+        platform: "win32",
+        execFile,
+      }),
+    ).resolves.toBe(npmCodex);
+    expect(execFile).toHaveBeenCalledTimes(1);
+    expect(execFile.mock.calls[0]?.[1]).toEqual(["codex"]);
+  });
+
   it.each([
     "C:\\Program Files\\OpenAI\\codex.exe",
     "C:\\Users\\Test\\AppData\\Roaming\\npm\\codex.cmd",

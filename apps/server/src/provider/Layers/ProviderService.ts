@@ -63,6 +63,7 @@ import {
 } from "../terminalTurnApplicability.ts";
 import { makeProviderLifecycleCoordinator } from "../providerLifecycleCoordinator.ts";
 import { carryProviderAttachmentPaths } from "../providerAttachmentPaths.ts";
+import { isOpenCodeCompatibilityTerminal } from "../opencodeCompatibility.ts";
 import {
   makeProviderMaintenanceGate,
   ProviderMaintenanceBusyError,
@@ -1063,18 +1064,37 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
                   ?.outstandingTurnIds.delete(String(event.turnId));
                 cleanupDispatchState(event.threadId);
               }
-              if (applicability.reason === "ambiguous-missing-turn-id") {
-                yield* Effect.logWarning("provider.session.ambiguous_terminal_event_ignored", {
-                  threadId: event.threadId,
-                  eventType: event.type,
-                });
+              // A schema incompatibility invalidates the entire provider
+              // session, not only the turn that observed it. Clear a newer
+              // overlapping active turn rather than leaving the durable
+              // adapter terminal permanently unacknowledgeable.
+              if (isOpenCodeCompatibilityTerminal(event)) {
+                yield* Effect.logWarning(
+                  "provider.session.compatibility_terminal_superseded_active_turn",
+                  {
+                    threadId: event.threadId,
+                    eventTurnId: event.turnId,
+                    activeTurnId: currentActiveTurnId,
+                  },
+                );
+              } else {
+                if (applicability.reason === "ambiguous-missing-turn-id") {
+                  yield* Effect.logWarning("provider.session.ambiguous_terminal_event_ignored", {
+                    threadId: event.threadId,
+                    eventType: event.type,
+                  });
+                }
+                return false;
               }
-              return false;
             }
-            if (event.turnId === undefined && applicability.resolvedTurnId !== undefined) {
+            if (
+              applicability.applicable &&
+              event.turnId === undefined &&
+              applicability.resolvedTurnId !== undefined
+            ) {
               recordRecentlyCompletedTurn(event.threadId, applicability.resolvedTurnId);
             }
-            if (applicability.resolvedTurnId !== undefined) {
+            if (applicability.applicable && applicability.resolvedTurnId !== undefined) {
               dispatchStateByThread
                 .get(event.threadId)
                 ?.outstandingTurnIds.delete(applicability.resolvedTurnId);
@@ -1182,13 +1202,23 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
             const bindingCommitted =
               yield* updateSessionBindingFromRuntimeEventStrict(canonicalEvent);
             if (!bindingCommitted) {
-              return yield* Effect.die(
-                `Provider runtime event '${String(canonicalEvent.eventId)}' could not commit its terminal binding transition before adapter acknowledgement.`,
+              // The binding may have been removed or replaced while the
+              // terminal was being journaled. The terminal is already durable;
+              // acknowledge the obsolete adapter context without mutating the
+              // current binding or wedging teardown.
+              yield* Effect.logWarning(
+                "provider.session.durable_terminal_binding_transition_skipped",
+                {
+                  threadId: canonicalEvent.threadId,
+                  provider: canonicalEvent.provider,
+                  eventId: canonicalEvent.eventId,
+                  eventType: canonicalEvent.type,
+                },
               );
             }
             // Acknowledgement intentionally precedes fan-out: slow subscribers
-            // must not hold a provider-owned terminal tombstone or keep the
-            // adapter dispatch-blocked after journal + binding commit.
+            // must not hold a provider-owned terminal tombstone after the
+            // journal write and any applicable binding transition.
             yield* durabilityBarrier.acknowledge(canonicalEvent);
             yield* fanOutRuntimeEvent(canonicalEvent);
             return;
@@ -1214,12 +1244,31 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
         }),
       );
 
+    const processRuntimeEventSafely = (
+      adapter: (typeof adapters)[number],
+      event: ProviderRuntimeEvent,
+    ) =>
+      processRuntimeEvent(adapter, event).pipe(
+        Effect.catchCause((cause) => {
+          if (Cause.hasInterruptsOnly(cause)) {
+            return Effect.failCause(cause);
+          }
+          return Effect.logError("provider.session.runtime_event_processing_failed", {
+            threadId: event.threadId,
+            provider: event.provider,
+            eventId: event.eventId,
+            eventType: event.type,
+            cause: Cause.pretty(cause),
+          });
+        }),
+      );
+
     // Fan provider events straight into the bounded pubsub so high-volume
     // streams backpressure at one lossless owner without an extra queue hop.
     yield* Effect.forEach(adapters, (adapter) =>
-      Stream.runForEach(adapter.streamEvents, (event) => processRuntimeEvent(adapter, event)).pipe(
-        Effect.forkIn(runtimeEventProducerScope),
-      ),
+      Stream.runForEach(adapter.streamEvents, (event) =>
+        processRuntimeEventSafely(adapter, event),
+      ).pipe(Effect.forkIn(runtimeEventProducerScope)),
     ).pipe(Effect.asVoid);
 
     const recoverSessionForThread = (input: {

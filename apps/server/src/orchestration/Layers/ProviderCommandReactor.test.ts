@@ -5412,7 +5412,7 @@ describe("ProviderCommandReactor", () => {
       },
       providerRefs: {},
     } as ProviderRuntimeEvent);
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    await harness.drain();
 
     await Effect.runPromise(
       harness.engine.dispatch({
@@ -5449,7 +5449,7 @@ describe("ProviderCommandReactor", () => {
       },
       providerRefs: {},
     } as ProviderRuntimeEvent);
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    await harness.drain();
 
     await Effect.runPromise(
       harness.engine.dispatch({
@@ -7566,6 +7566,76 @@ describe("ProviderCommandReactor", () => {
     });
     await new Promise((resolve) => setTimeout(resolve, 25));
     expect(harness.sendTurn).not.toHaveBeenCalled();
+  });
+
+  it("does not fence a successful terminal that carries malformed compatibility metadata", async () => {
+    const harness = await createHarness({
+      threadModelSelection: {
+        provider: "opencode",
+        model: "openai/gpt-5",
+      },
+    });
+    const threadId = ThreadId.makeUnsafe("thread-1");
+    const terminal = await harness.persistRuntimeEventWithoutLivePublication({
+      type: "turn.completed",
+      eventId: asEventId("evt-opencode-success-with-compatibility-metadata"),
+      provider: "opencode",
+      threadId,
+      createdAt: new Date().toISOString(),
+      turnId: asTurnId("turn-opencode-success-with-compatibility-metadata"),
+      payload: {
+        state: "completed",
+        failureReason: "opencode_storage_schema_incompatible",
+      },
+      providerRefs: {},
+    });
+
+    await harness.drain();
+
+    expect(
+      await Effect.runPromise(
+        harness.runtimeEventRepository.getConsumerCursor(PROVIDER_COMMAND_REACTOR_RUNTIME_CONSUMER),
+      ),
+    ).toBe(terminal.sequence);
+    expect(
+      await Effect.runPromise(
+        harness.queuedTurnPromotionRepository.isQueuedEventCancelledByProviderSessionFence({
+          providerSessionThreadId: threadId,
+          queuedEventSequence: terminal.orchestrationCutoffSequence ?? 0,
+        }),
+      ),
+    ).toBe(false);
+  });
+
+  it("advances past a malformed compatibility terminal without wedging reactor startup", async () => {
+    const harness = await createHarness({
+      startReactor: false,
+      threadModelSelection: {
+        provider: "opencode",
+        model: "openai/gpt-5",
+      },
+    });
+    const terminal = await harness.persistRuntimeEventWithoutLivePublication({
+      type: "turn.completed",
+      eventId: asEventId("evt-opencode-compatibility-missing-turn-id"),
+      provider: "opencode",
+      threadId: ThreadId.makeUnsafe("thread-1"),
+      createdAt: new Date().toISOString(),
+      payload: {
+        state: "failed",
+        failureReason: "opencode_storage_schema_incompatible",
+      },
+      providerRefs: {},
+    });
+
+    await harness.startReactor();
+    await harness.drain();
+
+    expect(
+      await Effect.runPromise(
+        harness.runtimeEventRepository.getConsumerCursor(PROVIDER_COMMAND_REACTOR_RUNTIME_CONSUMER),
+      ),
+    ).toBe(terminal.sequence);
   });
 
   it("catches a compatibility terminal appended after the first queue snapshot before claim", async () => {

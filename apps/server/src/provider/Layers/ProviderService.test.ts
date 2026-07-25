@@ -445,6 +445,7 @@ function makeProviderServiceLayer(
     readonly includeRestartRollbackDroid?: boolean;
     readonly includePi?: boolean;
     readonly includeCodexDurabilityBarrier?: boolean;
+    readonly includeOpenCodeDurabilityBarrier?: boolean;
   },
 ) {
   const codex = makeFakeCodexAdapter("codex", {
@@ -455,6 +456,11 @@ function makeProviderServiceLayer(
   const claude = makeFakeCodexAdapter("claudeAgent");
   const antigravity = makeFakeCodexAdapter("antigravity");
   const droid = makeFakeCodexAdapter("droid", { conversationRollback: "restart-session" });
+  const opencode = makeFakeCodexAdapter("opencode", {
+    ...(providers?.includeOpenCodeDurabilityBarrier === true
+      ? { runtimeEventDurabilityBarrier: true }
+      : {}),
+  });
   const pi = makeFakeCodexAdapter("pi");
   const registry: typeof ProviderAdapterRegistry.Service = {
     getByProvider: (provider) =>
@@ -466,15 +472,18 @@ function makeProviderServiceLayer(
             ? Effect.succeed(antigravity.adapter)
             : provider === "droid" && providers?.includeRestartRollbackDroid === true
               ? Effect.succeed(droid.adapter)
-              : provider === "pi" && providers?.includePi === true
-                ? Effect.succeed(pi.adapter)
-                : Effect.fail(new ProviderUnsupportedError({ provider })),
+              : provider === "opencode" && providers?.includeOpenCodeDurabilityBarrier === true
+                ? Effect.succeed(opencode.adapter)
+                : provider === "pi" && providers?.includePi === true
+                  ? Effect.succeed(pi.adapter)
+                  : Effect.fail(new ProviderUnsupportedError({ provider })),
     listProviders: () =>
       Effect.succeed([
         "codex",
         "claudeAgent",
         "antigravity",
         ...(providers?.includeRestartRollbackDroid === true ? (["droid"] as const) : []),
+        ...(providers?.includeOpenCodeDurabilityBarrier === true ? (["opencode"] as const) : []),
         ...(providers?.includePi === true ? (["pi"] as const) : []),
       ] as const),
   };
@@ -502,6 +511,7 @@ function makeProviderServiceLayer(
     claude,
     antigravity,
     droid,
+    opencode,
     pi,
     layer,
     rawLayer,
@@ -5563,6 +5573,86 @@ durabilitySuccess.layer("ProviderServiceLive adapter durability acknowledgement"
   );
 });
 
+const supersededCompatibilityEventId = asEventId("runtime-durability-superseded-compatibility");
+const supersededCompatibility = makeProviderServiceLayer(
+  {
+    persistRuntimeEvent: () => Effect.void,
+  },
+  { includeOpenCodeDurabilityBarrier: true },
+);
+supersededCompatibility.layer(
+  "ProviderServiceLive compatibility terminal acknowledgement",
+  (it) => {
+    it.effect("clears a newer active turn after an older session-wide compatibility failure", () =>
+      Effect.gen(function* () {
+        const provider = yield* ProviderService;
+        const directory = yield* ProviderSessionDirectory;
+        const threadId = asThreadId("thread-durability-superseded-compatibility");
+        yield* provider.startSession(threadId, {
+          provider: "opencode",
+          threadId,
+          runtimeMode: "full-access",
+        });
+        const failedTurn = yield* provider.sendTurn({
+          threadId,
+          input: "start the failing turn",
+          attachments: [],
+        });
+        const newerTurnId = asTurnId("turn-durability-superseded-compatibility-newer");
+        const activeBinding = Option.getOrUndefined(yield* directory.getBinding(threadId));
+        if (activeBinding === undefined) {
+          return yield* Effect.die("Expected an active OpenCode binding");
+        }
+        yield* directory.upsert({
+          ...activeBinding,
+          status: "running",
+          runtimePayload: {
+            ...asRuntimePayloadRecord(activeBinding.runtimePayload),
+            activeTurnId: newerTurnId,
+          },
+        });
+        supersededCompatibility.opencode.updateSession(threadId, (session) => ({
+          ...session,
+          status: "running",
+          activeTurnId: newerTurnId,
+        }));
+        supersededCompatibility.opencode.markRuntimeEventPending(supersededCompatibilityEventId);
+        yield* supersededCompatibility.opencode.waitForRuntimeSubscribers();
+
+        supersededCompatibility.opencode.emit({
+          type: "turn.completed",
+          eventId: supersededCompatibilityEventId,
+          provider: "opencode",
+          createdAt: "2026-07-25T12:00:00.000Z",
+          threadId,
+          turnId: failedTurn.turnId,
+          payload: {
+            state: "failed",
+            failureReason: "opencode_storage_schema_incompatible",
+          },
+        });
+
+        yield* waitUntil(
+          () =>
+            supersededCompatibility.opencode.acknowledgedDurabilityEventIds.includes(
+              supersededCompatibilityEventId,
+            ),
+          500,
+          10,
+          "superseded compatibility terminal acknowledgement",
+        );
+        const binding = Option.getOrUndefined(yield* directory.getBinding(threadId));
+        assert.equal(binding?.status, "stopped");
+        assert.equal(asRuntimePayloadRecord(binding?.runtimePayload).activeTurnId, null);
+        assert.notEqual(newerTurnId, failedTurn.turnId);
+        const [session] = yield* supersededCompatibility.opencode.listSessions();
+        assert.equal(session?.status, "error");
+        assert.equal(session?.activeTurnId, undefined);
+      }),
+    );
+  },
+);
+
 const transientLifecycleEventId = asEventId("runtime-durability-transient-lifecycle");
 const transientLifecyclePersisted = Effect.runSync(Deferred.make<void>());
 const transientLifecycleRestartStarted = Effect.runSync(Deferred.make<ProviderSessionStartInput>());
@@ -5753,7 +5843,9 @@ blockedFanout.layer("ProviderServiceLive durability ack before fanout", (it) => 
 });
 
 const persistenceFailureEventId = asEventId("runtime-durability-persistence-failure");
+const persistenceRecoveryEventId = asEventId("runtime-durability-persistence-recovery");
 let persistenceFailureAttempted = false;
+let persistenceRecoveryPersisted = false;
 const persistenceFailureCanonicalWrite = Effect.runSync(Deferred.make<void>());
 const durabilityPersistenceFailure = makeProviderServiceLayer(
   {
@@ -5763,7 +5855,11 @@ const durabilityPersistenceFailure = makeProviderServiceLayer(
             persistenceFailureAttempted = true;
             return yield* Effect.die("injected runtime journal failure");
           })
-        : Effect.void,
+        : event.eventId === persistenceRecoveryEventId
+          ? Effect.sync(() => {
+              persistenceRecoveryPersisted = true;
+            })
+          : Effect.void,
     canonicalEventLogger: {
       filePath: "test://provider-runtime-persistence-failure",
       write: (event) =>
@@ -5776,59 +5872,76 @@ const durabilityPersistenceFailure = makeProviderServiceLayer(
   { includeCodexDurabilityBarrier: true },
 );
 durabilityPersistenceFailure.layer("ProviderServiceLive durability persistence failure", (it) => {
-  it.effect("retains the adapter barrier and active binding when journal persistence fails", () =>
-    Effect.gen(function* () {
-      const provider = yield* ProviderService;
-      const directory = yield* ProviderSessionDirectory;
-      const threadId = asThreadId("thread-durability-persistence-failure");
-      yield* provider.startSession(threadId, {
-        provider: "codex",
-        threadId,
-        runtimeMode: "full-access",
-      });
-      const turn = yield* provider.sendTurn({
-        threadId,
-        input: "fail terminal persistence",
-        attachments: [],
-      });
-      durabilityPersistenceFailure.codex.updateSession(threadId, (session) => ({
-        ...session,
-        status: "running",
-        activeTurnId: turn.turnId,
-      }));
-      durabilityPersistenceFailure.codex.markRuntimeEventPending(persistenceFailureEventId);
-      yield* durabilityPersistenceFailure.codex.waitForRuntimeSubscribers();
+  it.effect(
+    "retains the barrier and keeps the runtime-event pump alive after persistence fails",
+    () =>
+      Effect.gen(function* () {
+        const provider = yield* ProviderService;
+        const directory = yield* ProviderSessionDirectory;
+        const threadId = asThreadId("thread-durability-persistence-failure");
+        yield* provider.startSession(threadId, {
+          provider: "codex",
+          threadId,
+          runtimeMode: "full-access",
+        });
+        const turn = yield* provider.sendTurn({
+          threadId,
+          input: "fail terminal persistence",
+          attachments: [],
+        });
+        durabilityPersistenceFailure.codex.updateSession(threadId, (session) => ({
+          ...session,
+          status: "running",
+          activeTurnId: turn.turnId,
+        }));
+        durabilityPersistenceFailure.codex.markRuntimeEventPending(persistenceFailureEventId);
+        yield* durabilityPersistenceFailure.codex.waitForRuntimeSubscribers();
 
-      durabilityPersistenceFailure.codex.emit({
-        type: "turn.completed",
-        eventId: persistenceFailureEventId,
-        provider: "codex",
-        createdAt: "2026-07-25T12:00:00.000Z",
-        threadId,
-        turnId: turn.turnId,
-        payload: { state: "failed" },
-      });
-      yield* waitUntil(
-        () => persistenceFailureAttempted,
-        500,
-        10,
-        "runtime journal failure attempt",
-      );
-      yield* Effect.yieldNow;
+        durabilityPersistenceFailure.codex.emit({
+          type: "turn.completed",
+          eventId: persistenceFailureEventId,
+          provider: "codex",
+          createdAt: "2026-07-25T12:00:00.000Z",
+          threadId,
+          turnId: turn.turnId,
+          payload: { state: "failed" },
+        });
+        yield* waitUntil(
+          () => persistenceFailureAttempted,
+          500,
+          10,
+          "runtime journal failure attempt",
+        );
+        yield* Effect.yieldNow;
 
-      assert.equal(
-        durabilityPersistenceFailure.codex.isRuntimeEventPending(persistenceFailureEventId),
-        true,
-      );
-      assert.deepEqual(durabilityPersistenceFailure.codex.acknowledgedDurabilityEventIds, []);
-      assert.equal(yield* Deferred.isDone(persistenceFailureCanonicalWrite), false);
-      const binding = Option.getOrUndefined(yield* directory.getBinding(threadId));
-      assert.equal(binding?.status, "running");
-      assert.equal(asRuntimePayloadRecord(binding?.runtimePayload).activeTurnId, turn.turnId);
-      const [session] = yield* durabilityPersistenceFailure.codex.listSessions();
-      assert.equal(session?.status, "running");
-      assert.equal(session?.activeTurnId, turn.turnId);
-    }),
+        assert.equal(
+          durabilityPersistenceFailure.codex.isRuntimeEventPending(persistenceFailureEventId),
+          true,
+        );
+        assert.deepEqual(durabilityPersistenceFailure.codex.acknowledgedDurabilityEventIds, []);
+        assert.equal(yield* Deferred.isDone(persistenceFailureCanonicalWrite), false);
+        const binding = Option.getOrUndefined(yield* directory.getBinding(threadId));
+        assert.equal(binding?.status, "running");
+        assert.equal(asRuntimePayloadRecord(binding?.runtimePayload).activeTurnId, turn.turnId);
+        const [session] = yield* durabilityPersistenceFailure.codex.listSessions();
+        assert.equal(session?.status, "running");
+        assert.equal(session?.activeTurnId, turn.turnId);
+
+        durabilityPersistenceFailure.codex.emit({
+          type: "runtime.warning",
+          eventId: persistenceRecoveryEventId,
+          provider: "codex",
+          createdAt: "2026-07-25T12:00:01.000Z",
+          threadId,
+          payload: { message: "runtime event pump recovery probe" },
+        });
+        yield* waitUntil(
+          () => persistenceRecoveryPersisted,
+          500,
+          10,
+          "runtime event processing after persistence failure",
+        );
+      }),
   );
 });
 

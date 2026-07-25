@@ -147,7 +147,10 @@ export function resolveCodexCliExecutableWithDiscovery(
 
   const { observations, discoveryInput } = observeCodexCommandDiscovery(input);
   const isDefault = command.trim().toLowerCase() === DEFAULT_CODEX_COMMAND;
-  const resolved = resolveWindowsCommandPath(command, discoveryInput);
+  const resolved = resolveWindowsCommandPath(
+    isDefault ? DEFAULT_CODEX_COMMAND : command,
+    discoveryInput,
+  );
   if (!isDefault || Path.win32.isAbsolute(resolved)) {
     return resolution(resolved, observations);
   }
@@ -172,7 +175,10 @@ export async function resolveCodexCliExecutableWithDiscoveryAsync(
 
   const { observations, discoveryInput } = observeCodexCommandDiscovery(input);
   const isDefault = command.trim().toLowerCase() === DEFAULT_CODEX_COMMAND;
-  const resolved = await resolveWindowsCommandPathAsync(command, discoveryInput);
+  const resolved = await resolveWindowsCommandPathAsync(
+    isDefault ? DEFAULT_CODEX_COMMAND : command,
+    discoveryInput,
+  );
   if (!isDefault || Path.win32.isAbsolute(resolved)) {
     return resolution(resolved, observations);
   }

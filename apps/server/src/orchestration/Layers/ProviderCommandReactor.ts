@@ -60,7 +60,6 @@ import {
 import { CheckpointStore } from "../../checkpointing/Services/CheckpointStore.ts";
 import { GitCore } from "../../git/Services/GitCore.ts";
 import {
-  OPENCODE_STORAGE_SCHEMA_INCOMPATIBLE_REASON,
   ProviderAdapterRequestError,
   ProviderAdapterValidationError,
   ProviderServiceError,
@@ -75,6 +74,7 @@ import {
 import { resolveTextGenerationInputForSelection } from "../../git/textGenerationSelection.ts";
 import { ProviderService } from "../../provider/Services/ProviderService.ts";
 import { resolveProviderDispatchAttachments } from "../../provider/providerAttachmentPaths.ts";
+import { isOpenCodeCompatibilityTerminal } from "../../provider/opencodeCompatibility.ts";
 import { OrchestrationEventDeliveryRepositoryLive } from "../../persistence/Layers/OrchestrationEventDeliveries.ts";
 import { ProjectionPendingInteractionRepositoryLive } from "../../persistence/Layers/ProjectionPendingInteractions.ts";
 import { ProviderRuntimeEventRepositoryLive } from "../../persistence/Layers/ProviderRuntimeEvents.ts";
@@ -225,7 +225,7 @@ const PROVIDER_COMMAND_SAFE_RETRY_DELAY = Duration.millis(50);
 const QUEUED_TURN_HANDOFF_RETRY_LIMIT = 3;
 const QUEUED_TURN_HANDOFF_RETRY_DELAY = Duration.millis(50);
 const PROVIDER_COMMAND_RUNTIME_REPLAY_PAGE_SIZE = 256;
-const PROVIDER_COMMAND_RUNTIME_REPLAY_POLL_INTERVAL = Duration.millis(10);
+const PROVIDER_COMMAND_RUNTIME_REPLAY_POLL_INTERVAL = Duration.millis(250);
 const DEFAULT_RUNTIME_MODE: RuntimeMode = "full-access";
 const SIDECHAT_BOUNDARY_INSTRUCTION =
   "You are in a sidechat. Treat all prior conversation as reference-only context. Do not continue any prior task automatically. Do not mutate files, git, or the workspace and do not run workspace-changing commands unless the latest user message explicitly asks you to do so after this boundary. Use this sidechat for focused explanation, safety checks, summaries, and alternatives.";
@@ -282,23 +282,28 @@ function promptReplayTruncationNotice(omittedMessages: number): string {
   )} characters.]`;
 }
 
-export function buildPromptReplayProviderInput(input: {
+interface PromptReplayProviderInputResult {
+  readonly providerInput: string | null;
+  readonly retainedPriorTranscript: boolean;
+}
+
+function buildPromptReplayProviderInputResult(input: {
   readonly thread: Pick<OrchestrationThread, "messages">;
   readonly currentMessageId: string;
   readonly messageText: string;
   readonly maxChars?: number;
-}): string | null {
+}): PromptReplayProviderInputResult {
   const maxChars = Math.min(
     Math.max(0, input.maxChars ?? PROVIDER_PROMPT_REPLAY_MAX_INPUT_CHARS),
     PROVIDER_PROMPT_REPLAY_MAX_INPUT_CHARS,
   );
   if (input.messageText.length > maxChars) {
-    return null;
+    return { providerInput: null, retainedPriorTranscript: false };
   }
 
   const priorMessages = listPriorTranscriptMessages(input.thread, input.currentMessageId);
   if (priorMessages.length === 0) {
-    return input.messageText;
+    return { providerInput: input.messageText, retainedPriorTranscript: false };
   }
 
   const intro =
@@ -341,7 +346,7 @@ export function buildPromptReplayProviderInput(input: {
     ...retainedMessages,
   ].join("\n\n");
   if (contextText.length > availableContextChars) {
-    return null;
+    return { providerInput: null, retainedPriorTranscript: false };
   }
 
   const providerInput = wrapProviderContext({
@@ -350,7 +355,19 @@ export function buildPromptReplayProviderInput(input: {
     messageText: input.messageText,
     wrapLatestUserMessage: true,
   });
-  return providerInput.length <= maxChars ? providerInput : null;
+  return {
+    providerInput: providerInput.length <= maxChars ? providerInput : null,
+    retainedPriorTranscript: retainedMessages.length > 0,
+  };
+}
+
+export function buildPromptReplayProviderInput(input: {
+  readonly thread: Pick<OrchestrationThread, "messages">;
+  readonly currentMessageId: string;
+  readonly messageText: string;
+  readonly maxChars?: number;
+}): string | null {
+  return buildPromptReplayProviderInputResult(input).providerInput;
 }
 
 function isUnknownPendingApprovalRequestError(cause: Cause.Cause<ProviderServiceError>): boolean {
@@ -1617,16 +1634,18 @@ const make = Effect.gen(function* () {
             priorTranscriptBootstrapAvailableChars,
           )
         : null;
-    const hasPromptReplayPriorTranscript =
-      usesPromptReplay && listPriorTranscriptMessages(thread, input.messageId).length > 0;
-    const promptReplayProviderInput =
+    const promptReplayResult =
       usesPromptReplay && input.reviewTarget === undefined
-        ? buildPromptReplayProviderInput({
+        ? buildPromptReplayProviderInputResult({
             thread,
             currentMessageId: input.messageId,
             messageText: boundaryMessageText,
           })
-        : boundaryMessageText;
+        : {
+            providerInput: boundaryMessageText,
+            retainedPriorTranscript: false,
+          };
+    const promptReplayProviderInput = promptReplayResult.providerInput;
     if (promptReplayProviderInput === null) {
       return yield* new ProviderAdapterValidationError({
         provider: selectedProvider as ProviderKind,
@@ -1636,6 +1655,8 @@ const make = Effect.gen(function* () {
         )} characters. Shorten the message and retry.`,
       });
     }
+    const hasPromptReplayPriorTranscript =
+      usesPromptReplay && promptReplayResult.retainedPriorTranscript;
     const providerInput = usesPromptReplay
       ? promptReplayProviderInput
       : handoffBootstrapText
@@ -2769,21 +2790,28 @@ const make = Effect.gen(function* () {
     observePendingContextBootstrapTerminalEvent(event);
     const scope = yield* resolveProviderSessionThreadScope(event.threadId);
     const { sessionThreadId } = scope;
-    if (
-      event.provider === "opencode" &&
-      event.payload.failureReason === OPENCODE_STORAGE_SCHEMA_INCOMPATIBLE_REASON
-    ) {
+    if (isOpenCodeCompatibilityTerminal(event)) {
       if (entry.orchestrationCutoffSequence === null) {
-        return yield* Effect.die(
-          new Error(
-            `OpenCode compatibility terminal ${entry.sequence} has no durable orchestration cutoff.`,
-          ),
+        yield* Effect.logWarning(
+          "provider command compatibility terminal skipped without orchestration cutoff",
+          {
+            eventSequence: entry.sequence,
+            eventId: event.eventId,
+            threadId: event.threadId,
+          },
         );
+        return;
       }
       if (event.turnId === undefined) {
-        return yield* Effect.die(
-          new Error(`OpenCode compatibility terminal ${entry.sequence} has no turn identity.`),
+        yield* Effect.logWarning(
+          "provider command compatibility terminal skipped without turn identity",
+          {
+            eventSequence: entry.sequence,
+            eventId: event.eventId,
+            threadId: event.threadId,
+          },
         );
+        return;
       }
       pendingQueuedDispatchBySessionThread.delete(sessionThreadId);
       yield* fenceProviderSessionPromotionsThrough({
@@ -3655,10 +3683,7 @@ const make = Effect.gen(function* () {
           for (const entry of page) {
             const isQueueDrainEvent =
               entry.event.type === "turn.completed" || entry.event.type === "turn.aborted";
-            const isCompatibilityTerminal =
-              isQueueDrainEvent &&
-              entry.event.provider === "opencode" &&
-              entry.event.payload.failureReason === OPENCODE_STORAGE_SCHEMA_INCOMPATIBLE_REASON;
+            const isCompatibilityTerminal = isOpenCodeCompatibilityTerminal(entry.event);
             if (
               isQueueDrainEvent &&
               (isCompatibilityTerminal || runtimeTerminalQueueDrainEnabled)

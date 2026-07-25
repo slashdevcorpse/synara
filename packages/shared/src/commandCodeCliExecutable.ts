@@ -10,7 +10,7 @@ import {
   resolveWindowsCommandCandidatesAsync,
   resolveWindowsCommandPath,
   resolveWindowsCommandPathAsync,
-  resolveWindowsSystemRoot,
+  readEffectiveWindowsEnvironmentValue,
   unresolvedWindowsCommandDiscoveryOutcome,
   type WindowsAsyncCommandDiscoveryInput,
   type WindowsCommandDiscoveryObservation,
@@ -41,13 +41,8 @@ const COMMAND_CODE_ALIASES = ["commandcode", "command-code", "cmdc", "cmd"] as c
 const WINDOWS_EXECUTABLE_PATTERN = /\.(?:exe|com|cmd|bat)$/i;
 
 function environmentValue(env: NodeJS.ProcessEnv, name: string): string | undefined {
-  const normalizedName = name.toUpperCase();
-  for (const [key, value] of Object.entries(env)) {
-    if (key.toUpperCase() === normalizedName && typeof value === "string" && value.trim()) {
-      return value.trim();
-    }
-  }
-  return undefined;
+  const value = readEffectiveWindowsEnvironmentValue(env, name)?.trim();
+  return value ? value : undefined;
 }
 
 function isRegularAbsoluteWindowsFile(candidate: string, readStat: StatSyncLike): boolean {
@@ -101,12 +96,13 @@ function effectiveAliasDiscoveryObservations(
 
 function windowsCommandProcessorPaths(env: NodeJS.ProcessEnv): ReadonlySet<string> {
   const systemRoot =
-    environmentValue(env, "SystemRoot") ??
-    environmentValue(env, "WINDIR") ??
-    resolveWindowsSystemRoot(env);
+    environmentValue(env, "SystemRoot") ?? environmentValue(env, "WINDIR") ?? "C:\\Windows";
+  const systemDirectories = ["System32", "SysWOW64", "Sysnative"] as const;
   return new Set(
-    ["cmd.exe", "cmd.com"].map((name) =>
-      Path.win32.normalize(Path.win32.join(systemRoot, "System32", name)).toLowerCase(),
+    systemDirectories.flatMap((directory) =>
+      ["cmd.exe", "cmd.com"].map((name) =>
+        Path.win32.normalize(Path.win32.join(systemRoot, directory, name)).toLowerCase(),
+      ),
     ),
   );
 }

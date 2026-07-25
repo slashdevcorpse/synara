@@ -59,7 +59,6 @@ describe("runOpenCodeSdkRequest", () => {
 
     expect(Result.isFailure(result)).toBe(true);
     if (Result.isFailure(result)) {
-      expect(OpenCodeRuntimeError.is(result.failure)).toBe(true);
       if (!OpenCodeRuntimeError.is(result.failure)) {
         throw new Error("Expected OpenCodeRuntimeError");
       }

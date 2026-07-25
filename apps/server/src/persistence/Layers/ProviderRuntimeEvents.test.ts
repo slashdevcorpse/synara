@@ -231,11 +231,7 @@ layer("ProviderRuntimeEventRepository", (it) => {
   );
 });
 
-const runtimeCutoffLayer = it.layer(
-  ProviderRuntimeEventRepositoryLive.pipe(Layer.provideMerge(SqlitePersistenceMemory)),
-);
-
-runtimeCutoffLayer("ProviderRuntimeEventRepository append-time cutoff", (it) => {
+layer("ProviderRuntimeEventRepository append-time cutoff", (it) => {
   it.effect("captures the orchestration cutoff atomically and keeps it immutable on replay", () =>
     Effect.gen(function* () {
       const repository = yield* ProviderRuntimeEventRepository;

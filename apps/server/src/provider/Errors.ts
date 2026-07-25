@@ -1,9 +1,9 @@
+import { OPENCODE_STORAGE_SCHEMA_INCOMPATIBLE_REASON } from "@synara/contracts";
 import { Schema } from "effect";
 
 import type { CheckpointServiceError } from "../checkpointing/Errors.ts";
 
-export const OPENCODE_STORAGE_SCHEMA_INCOMPATIBLE_REASON =
-  "opencode_storage_schema_incompatible" as const;
+export { OPENCODE_STORAGE_SCHEMA_INCOMPATIBLE_REASON };
 export type ProviderAdapterCompatibilityReason = typeof OPENCODE_STORAGE_SCHEMA_INCOMPATIBLE_REASON;
 
 /**

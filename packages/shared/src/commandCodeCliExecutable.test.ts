@@ -196,6 +196,35 @@ describe("resolveCommandCodeCliExecutable", () => {
     expect(statSync).toHaveBeenCalledWith(shim);
   });
 
+  it.each(["SysWOW64", "Sysnative"])(
+    "recognizes the %s command processor using the effective case-insensitive SystemRoot",
+    (systemDirectory) => {
+      const commandProcessor = `D:\\Windows\\${systemDirectory}\\cmd.exe`;
+      const shim = "C:\\Users\\test\\AppData\\Roaming\\npm\\commandcode.cmd";
+      const statSync = regularFiles(commandProcessor, shim);
+      const spawnSync = vi.fn((_command: string, args: ReadonlyArray<string>) =>
+        args[0] === "cmd"
+          ? { stdout: `${commandProcessor}\r\n`, status: 0 }
+          : { stdout: "", status: 1 },
+      );
+
+      expect(
+        resolveCommandCodeCliExecutableWithDiscovery("commandcode", {
+          platform: "win32",
+          cwd: "C:\\repo",
+          env: {
+            SystemRoot: "C:\\discarded-windows",
+            SYSTEMROOT: "D:\\Windows",
+            APPDATA: "C:\\Users\\test\\AppData\\Roaming",
+          },
+          spawnSync,
+          statSync,
+        }),
+      ).toEqual({ executable: shim });
+      expect(spawnSync).toHaveBeenCalledTimes(4);
+    },
+  );
+
   it("uses the default Windows root for the cmd.exe collision when env omits it", () => {
     const commandProcessor = "C:\\Windows\\System32\\cmd.exe";
     const shim = "C:\\Users\\test\\AppData\\Roaming\\npm\\commandcode.cmd";

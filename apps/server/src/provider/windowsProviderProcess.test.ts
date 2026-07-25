@@ -354,6 +354,28 @@ describe("Windows provider process containment", () => {
     );
   });
 
+  it("uses a separately bounded reader for package manifests larger than the shim limit", () => {
+    const largeManifest = JSON.stringify({
+      name: "@openai/codex",
+      description: "x".repeat(70 * 1024),
+      bin: { codex: "bin/codex.js" },
+    });
+    const prepared = prepareResolvedWindowsProviderProcess(shimPath, ["app-server"], {
+      platform: "win32",
+      arch: "x64",
+      launcherPath: launcher,
+      fileExists: (path) =>
+        [launcher, shimPath, packageTarget, packageManifestPath, pathNode].includes(path),
+      readFileString: (path) => (path === shimPath ? npmCmdShim() : undefined),
+      readPackageManifestString: (path) =>
+        path === packageManifestPath ? largeManifest : undefined,
+      realPath: (path) => path,
+      spawnSync: () => ({ stdout: `${pathNode}\r\n`, status: 0 }),
+    });
+
+    expect(prepared.args.slice(7)).toEqual([pathNode, packageTarget, "app-server"]);
+  });
+
   it("fails closed when the proven target resolves outside its package root", () => {
     const escapedTarget =
       "C:\\Users\\Test\\AppData\\Roaming\\npm\\node_modules\\other\\bin\\codex.js";
