@@ -126,7 +126,9 @@ function createProviderServiceHarness(options?: {
     rollbackConversation: () => unsupported(),
     compactThread: () => unsupported(),
     closeRuntimeEvents,
-    runtimeEventsPersistedBeforeFanout: options?.runtimeEventsPersistedBeforeFanout,
+    ...(options?.runtimeEventsPersistedBeforeFanout === undefined
+      ? {}
+      : { runtimeEventsPersistedBeforeFanout: options.runtimeEventsPersistedBeforeFanout }),
     get streamEvents() {
       runtimeEventStreamAccessCount += 1;
       return Stream.fromPubSub(runtimeEventPubSub);
@@ -324,9 +326,7 @@ describe("ProviderRuntimeIngestion", () => {
   }) {
     const workspaceRoot = options?.workspaceRoot ?? makeTempDir("synara-provider-project-");
     fs.mkdirSync(path.join(workspaceRoot, ".git"), { recursive: true });
-    const provider = createProviderServiceHarness({
-      runtimeEventsPersistedBeforeFanout: options?.runtimeEventsPersistedBeforeFanout,
-    });
+    const provider = createProviderServiceHarness(options);
     const orchestrationLayer = OrchestrationEngineLive.pipe(
       Layer.provide(OrchestrationProjectionPipelineLive),
       Layer.provide(OrchestrationProjectionSnapshotQueryLive),
