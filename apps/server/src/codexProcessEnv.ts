@@ -20,6 +20,7 @@ import { buildProviderChildEnvironment } from "./providerChildEnvironment.ts";
 const CODEX_PROCESS_SHELL_ENV_NAMES = ["PATH", "SSH_AUTH_SOCK"] as const;
 const NODE_REPL_SANDBOX_ALLOWED_UNIX_SOCKETS = "NODE_REPL_SANDBOX_ALLOWED_UNIX_SOCKETS";
 const CODEX_OVERLAY_SHARED_STATE_FILES = new Set(["auth.json"]);
+const CODEX_OVERLAY_ISOLATED_STATE_FILES = new Set(["models_cache.json"]);
 const CODEX_SQLITE_STATE_ENTRY_PATTERN = /^.+\.sqlite(?:-(?:wal|shm|journal))?$/;
 const CODEX_SKILLS_ENTRY = "skills";
 const CODEX_SYSTEM_SKILLS_ENTRY = ".system";
@@ -193,7 +194,7 @@ export function prioritizeCodexOverlayEntries(entries: readonly string[]): strin
   return [...sharedStateEntries, ...otherEntries];
 }
 
-async function removeLegacyCodexOverlaySqliteLink(targetPath: string): Promise<void> {
+async function removeLegacyCodexOverlayStateLink(targetPath: string): Promise<void> {
   let targetStat: Awaited<ReturnType<typeof fs.lstat>>;
   try {
     targetStat = await fs.lstat(targetPath);
@@ -617,8 +618,11 @@ async function prepareSynaraCodexHomeOverlayUnlocked(input: {
   await fs.mkdir(overlayHomePath, { recursive: true });
 
   for (const entry of await fs.readdir(overlayHomePath)) {
-    if (CODEX_SQLITE_STATE_ENTRY_PATTERN.test(entry)) {
-      await removeLegacyCodexOverlaySqliteLink(path.join(overlayHomePath, entry));
+    if (
+      CODEX_SQLITE_STATE_ENTRY_PATTERN.test(entry) ||
+      CODEX_OVERLAY_ISOLATED_STATE_FILES.has(entry)
+    ) {
+      await removeLegacyCodexOverlayStateLink(path.join(overlayHomePath, entry));
     }
   }
 
@@ -631,6 +635,11 @@ async function prepareSynaraCodexHomeOverlayUnlocked(input: {
       }
       if (CODEX_SQLITE_STATE_ENTRY_PATTERN.test(entry)) {
         // SQLite is mutable app-server state owned by this isolated overlay.
+        continue;
+      }
+      if (CODEX_OVERLAY_ISOLATED_STATE_FILES.has(entry)) {
+        // The model cache schema is coupled to the selected Codex CLI version.
+        // Keep it local so another harness cannot invalidate or be rewritten by it.
         continue;
       }
       const sourcePath = path.join(sourceHomePath, entry);

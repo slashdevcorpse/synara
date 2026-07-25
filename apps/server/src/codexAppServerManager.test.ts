@@ -1271,6 +1271,29 @@ describe("classifyCodexStderrLine", () => {
     expect(classifyCodexStderrLine(line)).toBeNull();
   });
 
+  it("ignores the recoverable legacy model-cache schema error", () => {
+    const line =
+      "\u001b[2m2026-07-24T23:40:31.607856Z\u001b[0m \u001b[31mERROR\u001b[0m \u001b[2mcodex_models_manager::cache\u001b[0m: failed to load models cache: missing field `supports_reasoning_summaries` at line 88 column 5";
+    expect(classifyCodexStderrLine(line)).toBeNull();
+  });
+
+  it.each([
+    [
+      "another missing field",
+      "2026-07-24T23:40:31.607856Z ERROR codex_models_manager::cache: failed to load models cache: missing field `model` at line 88 column 5",
+    ],
+    [
+      "malformed cache JSON",
+      "2026-07-24T23:40:31.607856Z ERROR codex_models_manager::cache: failed to load models cache: expected value at line 88 column 5",
+    ],
+    [
+      "another tracing target",
+      "2026-07-24T23:40:31.607856Z ERROR codex_core::cache: failed to load models cache: missing field `supports_reasoning_summaries` at line 88 column 5",
+    ],
+  ])("keeps %s errors visible", (_caseName, line) => {
+    expect(classifyCodexStderrLine(line)).toEqual({ message: line });
+  });
+
   it("ignores token usage footers emitted during shutdown", () => {
     const line =
       "^CToken usage: total=360,953 input=336,874 (+ 4,219,648 cached) output=24,079 (reasoning 7,982)";
@@ -1582,6 +1605,43 @@ describe("buildCodexProcessEnv", () => {
         expect(() => lstatSync(path.join(overlayHome, entry))).toThrow();
         expect(readFileSync(path.join(tempDir, entry), "utf8")).toBe(`source-${entry}`);
       }
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+      rmSync(runtimeHome, { recursive: true, force: true });
+    }
+  });
+
+  it("isolates the version-coupled model cache without changing the source cache", async () => {
+    const tempDir = mkdtempSync(path.join(os.tmpdir(), "synara-codex-env-"));
+    const runtimeHome = mkdtempSync(path.join(os.tmpdir(), "synara-runtime-home-"));
+    try {
+      writeFileSync(path.join(tempDir, "config.toml"), 'model = "gpt-5.5"', "utf8");
+      const sourceCachePath = path.join(tempDir, "models_cache.json");
+      writeFileSync(sourceCachePath, '{"client_version":"0.145.0"}', "utf8");
+
+      const overlayHome = path.join(runtimeHome, "codex-home-overlay");
+      const overlayCachePath = path.join(overlayHome, "models_cache.json");
+      mkdirSync(overlayHome, { recursive: true });
+      symlinkSync(sourceCachePath, overlayCachePath, "file");
+
+      const input = {
+        env: { SYNARA_HOME: runtimeHome },
+        homePath: tempDir,
+        platform: "win32",
+      } as const;
+      const env = await buildCodexProcessEnv(input);
+
+      expect(env.CODEX_HOME).toBe(overlayHome);
+      expect(() => lstatSync(overlayCachePath)).toThrow();
+      expect(readFileSync(sourceCachePath, "utf8")).toBe('{"client_version":"0.145.0"}');
+
+      writeFileSync(overlayCachePath, '{"client_version":"0.144.1"}', "utf8");
+      await buildCodexProcessEnv(input);
+
+      expect(lstatSync(overlayCachePath).isFile()).toBe(true);
+      expect(lstatSync(overlayCachePath).isSymbolicLink()).toBe(false);
+      expect(readFileSync(overlayCachePath, "utf8")).toBe('{"client_version":"0.144.1"}');
+      expect(readFileSync(sourceCachePath, "utf8")).toBe('{"client_version":"0.145.0"}');
     } finally {
       rmSync(tempDir, { recursive: true, force: true });
       rmSync(runtimeHome, { recursive: true, force: true });

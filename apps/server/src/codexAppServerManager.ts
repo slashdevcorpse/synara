@@ -311,6 +311,9 @@ const BENIGN_ERROR_LOG_SNIPPETS = [
   "state db missing rollout path for thread",
   "state db record_discrepancy: find_thread_path_by_id_str_in_subdir, falling_back",
 ];
+const BENIGN_ERROR_LOG_REGEXES = [
+  /^\d{4}-\d{2}-\d{2}T\S+\s+ERROR\s+codex_models_manager::cache:\s+failed to load models cache: missing field `supports_reasoning_summaries` at line \d+ column \d+$/,
+];
 const BENIGN_PROCESS_OUTPUT_REGEXES = [/^(?:\^C)?Token usage:/i];
 const RECOVERABLE_THREAD_RESUME_ERROR_SNIPPETS = [
   "not found",
@@ -862,7 +865,9 @@ export function classifyCodexStderrLine(rawLine: string): { message: string } | 
       return null;
     }
 
-    const isBenignError = BENIGN_ERROR_LOG_SNIPPETS.some((snippet) => line.includes(snippet));
+    const isBenignError =
+      BENIGN_ERROR_LOG_SNIPPETS.some((snippet) => line.includes(snippet)) ||
+      BENIGN_ERROR_LOG_REGEXES.some((pattern) => pattern.test(line));
     if (isBenignError) {
       return null;
     }
