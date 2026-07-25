@@ -2818,9 +2818,9 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
       rollbackConversation,
       compactThread,
       closeRuntimeEvents,
-      // Each access creates a fresh PubSub subscription so that multiple
-      // consumers (ProviderRuntimeIngestion, CheckpointReactor, etc.) each
-      // independently receive all runtime events.
+      runtimeEventsPersistedBeforeFanout: options?.persistRuntimeEvent !== undefined,
+      // Each access creates a fresh PubSub subscription so auxiliary reactors
+      // and nondurable ingestion consumers independently receive runtime events.
       get streamEvents(): ProviderServiceShape["streamEvents"] {
         return Stream.fromPubSub(runtimeEventPubSub);
       },
