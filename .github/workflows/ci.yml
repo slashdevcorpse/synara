@@ -169,7 +169,7 @@ jobs:
         run: bun run typecheck
 
   unit:
-    name: unit_${{ matrix.platform }}
+    name: unit_windows_${{ matrix.lane }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 40
     strategy:
@@ -177,8 +177,28 @@ jobs:
       matrix:
         include:
           - platform: windows
+            lane: cli_1
             runner: windows-2022
             turbo_concurrency: "1"
+            test_command: bun run --cwd apps/server test --shard=1/2
+          - platform: windows
+            lane: cli_2
+            runner: windows-2022
+            turbo_concurrency: "1"
+            test_command: bun run --cwd apps/server test --shard=2/2
+          - platform: windows
+            lane: workspace
+            runner: windows-2022
+            turbo_concurrency: "1"
+            test_command: >-
+              bun turbo test
+              --filter=@synara/desktop
+              --filter=@synara/web
+              --filter=@synara/contracts
+              --filter=@synara/shared
+              --filter=@synara/scripts
+              --filter=@synara/marketing
+              --filter=effect-acp
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -209,70 +229,89 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      - name: Build CLI unit dependencies
+        if: matrix.lane == 'cli_1' || matrix.lane == 'cli_2'
+        run: bun turbo build --filter=@synara/cli^...
+
       - name: Build Windows Job launcher for unit suite
-        if: matrix.platform == 'windows'
+        if: matrix.lane == 'cli_1' || matrix.lane == 'cli_2'
         run: node apps/server/scripts/build-windows-job-launcher.mjs --arch x64
 
-      - name: Test with coverage and JUnit
-        id: unit_tests
-        if: matrix.platform == 'linux'
+      - name: Run Windows unit lane
         timeout-minutes: 30
         env:
           TURBO_CONCURRENCY: ${{ matrix.turbo_concurrency }}
-        run: bun run test:ci
+        run: ${{ matrix.test_command }}
 
-      - name: Run cross-platform unit suite
-        if: matrix.platform != 'linux'
-        timeout-minutes: 30
+  unit_windows:
+    name: unit_windows
+    if: always()
+    needs: unit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every Windows unit lane to succeed
+        shell: bash
+        run: test "${{ needs.unit.result }}" = success
+
+  windows_e2e_build:
+    name: windows_e2e_build
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version-file: package.json
+
+      - name: Setup Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: package.json
+
+      - name: Cache Bun and Turbo
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            ~/.bun/install/cache
+            .turbo
+          key: ${{ runner.os }}-desktop-e2e-build-${{ hashFiles('bun.lock') }}-${{ hashFiles('turbo.json') }}
+          restore-keys: |
+            ${{ runner.os }}-desktop-e2e-build-${{ hashFiles('bun.lock') }}-
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build Windows Job launcher (x64)
+        run: node apps/server/scripts/build-windows-job-launcher.mjs --arch x64
+
+      - name: Build Windows Job launcher (ARM64)
+        run: node apps/server/scripts/build-windows-job-launcher.mjs --arch arm64
+
+      - name: Build desktop E2E artifact
         env:
-          TURBO_CONCURRENCY: ${{ matrix.turbo_concurrency }}
-        run: bun turbo test
+          SYNARA_DESKTOP_DISABLE_UPDATES: "1"
+          SYNARA_DESKTOP_FLAVOR: super
+        run: bun run build:desktop
 
-      - name: Upload test results to Mergify CI Insights
-        id: mergify_ci
-        if: ${{ matrix.platform == 'linux' && !cancelled() && (steps.unit_tests.outcome == 'success' || steps.unit_tests.outcome == 'failure') && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) }}
-        uses: Mergifyio/gha-mergify-ci@8173bc3c1d337d3367454672d50cfdf6f0273396 # v23
+      - name: Upload Windows desktop E2E build
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          action: junit-process
-          token: ${{ secrets.MERGIFY_TOKEN }}
-          job_name: quality
-          report_path: >-
-            ./apps/desktop/test-report.junit.xml
-            ./apps/server/test-report.junit.xml
-            ./apps/web/test-report.junit.xml
-            ./packages/contracts/test-report.junit.xml
-            ./packages/shared/test-report.junit.xml
-            ./scripts/test-report.junit.xml
-          test_step_outcome: ${{ steps.unit_tests.outcome }}
-
-      - name: Verify Mergify test results upload
-        if: ${{ matrix.platform == 'linux' && !cancelled() && (steps.unit_tests.outcome == 'success' || steps.unit_tests.outcome == 'failure') && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) }}
-        env:
-          MERGIFY_UPLOAD_OUTCOME: ${{ steps.mergify_ci.outputs.test_results_upload }}
-        run: test "$MERGIFY_UPLOAD_OUTCOME" = "success"
-
-      - name: Upload coverage reports to Codecov
-        if: ${{ matrix.platform == 'linux' && !cancelled() && (steps.unit_tests.outcome == 'success' || steps.unit_tests.outcome == 'failure') }}
-        uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5.5.5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: ./apps/desktop/coverage/lcov.info,./apps/server/coverage/lcov.info,./apps/web/coverage/lcov.info,./packages/contracts/coverage/lcov.info,./packages/shared/coverage/lcov.info,./scripts/coverage/lcov.info
-          disable_search: true
-          fail_ci_if_error: true
-          flags: unit
-          name: super-synara-unit-coverage
-
-      - name: Upload test results to Codecov
-        if: ${{ matrix.platform == 'linux' && !cancelled() && (steps.unit_tests.outcome == 'success' || steps.unit_tests.outcome == 'failure') }}
-        uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5.5.5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: ./apps/desktop/test-report.junit.xml,./apps/server/test-report.junit.xml,./apps/web/test-report.junit.xml,./packages/contracts/test-report.junit.xml,./packages/shared/test-report.junit.xml,./scripts/test-report.junit.xml
-          disable_search: true
-          fail_ci_if_error: true
-          flags: unit
-          name: super-synara-unit-test-results
-          report_type: test_results
+          name: desktop-build-windows
+          path: |
+            apps/desktop/dist-electron/**
+            apps/server/dist/**
+            apps/web/dist/**
+            packages/contracts/dist/**
+            packages/effect-acp/dist/**
+          if-no-files-found: error
+          retention-days: 1
 
   windows_x64:
     name: windows_x64
@@ -294,6 +333,17 @@ jobs:
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version-file: package.json
+
+      - name: Cache Bun, Turbo, and npm
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            ~/.bun/install/cache
+            .turbo
+            ${{ runner.temp }}\npm-cache
+          key: ${{ runner.os }}-windows-release-${{ hashFiles('bun.lock') }}-${{ hashFiles('package.json') }}-${{ hashFiles('turbo.json') }}
+          restore-keys: |
+            ${{ runner.os }}-windows-release-${{ hashFiles('bun.lock') }}-
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
@@ -393,6 +443,8 @@ jobs:
         run: bun run build:desktop
 
       - name: Verify isolated packaged CLI runtime
+        env:
+          npm_config_cache: ${{ runner.temp }}\npm-cache
         run: node apps/server/scripts/cli.ts publish --dry-run
 
       - name: Verify two-launch desktop persistence
@@ -411,23 +463,18 @@ jobs:
           SYNARA_PORT_OFFSET: "2710"
         run: bun run --cwd apps/desktop smoke-test
 
-      - name: Upload Windows desktop E2E build
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: desktop-build-windows
-          path: |
-            apps/desktop/dist-electron/**
-            apps/server/dist/**
-            apps/web/dist/**
-            packages/contracts/dist/**
-            packages/effect-acp/dist/**
-          if-no-files-found: error
-          retention-days: 1
-
-  browser_windows:
-    name: browser_windows
-    runs-on: windows-2022
+  browser_windows_workers:
+    name: browser_windows_${{ matrix.lane }}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lane: stable
+            runner: windows-2022
+          - lane: quarantine
+            runner: windows-2022
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -474,21 +521,35 @@ jobs:
         run: bun run --cwd apps/web playwright install chromium
 
       - name: Verify registered Windows quarantine inventory
+        if: matrix.lane == 'quarantine'
         timeout-minutes: 10
         run: node scripts/quarantine-registry.ts inventory --platform windows
 
       - name: Browser test (stable)
+        if: matrix.lane == 'stable'
         timeout-minutes: 20
         run: bun run --cwd apps/web test:browser:stable
 
       - name: Browser test (registered Windows quarantine)
+        if: matrix.lane == 'quarantine'
         continue-on-error: true
         timeout-minutes: 10
         run: node scripts/quarantine-registry.ts run --platform windows
 
       - name: Summarize Windows quarantine
-        if: always()
+        if: ${{ always() && matrix.lane == 'quarantine' }}
         run: node scripts/quarantine-registry.ts summary --platform windows --baseline-ref "${{ github.event.pull_request.base.sha || github.event.before }}" --github-step-summary
+
+  browser_windows:
+    name: browser_windows
+    if: always()
+    needs: browser_windows_workers
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require stable and quarantine Windows browser lanes to complete
+        shell: bash
+        run: test "${{ needs.browser_windows_workers.result }}" = success
 
   e2e_linux:
     name: e2e_linux
@@ -547,10 +608,15 @@ jobs:
 
   e2e_windows:
     name: e2e_windows
-    needs: windows_x64
+    if: always()
+    needs: windows_e2e_build
     runs-on: windows-2022
     timeout-minutes: 30
     steps:
+      - name: Require the Windows desktop E2E build
+        shell: bash
+        run: test "${{ needs.windows_e2e_build.result }}" = success
+
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
@@ -661,8 +727,9 @@ jobs:
     needs:
       - quality_linux
       - quality_windows
-      - unit
+      - unit_windows
       - browser_windows
+      - windows_x64
       - e2e_linux
       - e2e_windows
       - macos_arm64
@@ -670,11 +737,13 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Require every quality dependency to succeed
+        shell: bash
         run: |
           test "${{ needs.quality_linux.result }}" = skipped
           test "${{ needs.quality_windows.result }}" = success
-          test "${{ needs.unit.result }}" = success
+          test "${{ needs.unit_windows.result }}" = success
           test "${{ needs.browser_windows.result }}" = success
+          test "${{ needs.windows_x64.result }}" = success
           test "${{ needs.e2e_linux.result }}" = skipped
           test "${{ needs.e2e_windows.result }}" = success
           test "${{ needs.macos_arm64.result }}" = skipped
