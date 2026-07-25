@@ -139,10 +139,7 @@ function defaultWindowsDirectoryExists(path: string): boolean {
   }
 }
 
-function readWindowsEnvironmentValue(
-  env: NodeJS.ProcessEnv,
-  name: string,
-): string | undefined {
+function readWindowsEnvironmentValue(env: NodeJS.ProcessEnv, name: string): string | undefined {
   const normalizedName = name.toUpperCase();
   const effectiveName = Object.keys(env)
     .filter((key) => env[key] !== undefined && key.toUpperCase() === normalizedName)

@@ -23,8 +23,7 @@ const shimPath = "C:\\Users\\Test\\AppData\\Roaming\\npm\\codex.cmd";
 const shimDirectory = "C:\\Users\\Test\\AppData\\Roaming\\npm";
 const packageTarget =
   "C:\\Users\\Test\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\bin\\codex.js";
-const packageDirectory =
-  "C:\\Users\\Test\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex";
+const packageDirectory = "C:\\Users\\Test\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex";
 const packageManifestPath = `${packageDirectory}\\package.json`;
 const packageManifestContents = JSON.stringify({
   name: "@openai/codex",
@@ -177,7 +176,9 @@ describe("Windows provider process containment", () => {
         controlDirectory: "C:\\Temp",
         launcherPath: launcher,
         fileExists: (path) =>
-          [launcher, shimPath, packageTarget, packageManifestPath, nodeShim, pathNode].includes(path),
+          [launcher, shimPath, packageTarget, packageManifestPath, nodeShim, pathNode].includes(
+            path,
+          ),
         readFileString: readCanonicalCodexShimFile,
         realPath: (path) => path,
         execFile: async (_command, args) => {
@@ -289,8 +290,7 @@ describe("Windows provider process containment", () => {
       launcherPath: launcher,
       fileExists: (path) =>
         [launcher, batShimPath, packageTarget, packageManifestPath, siblingNode].includes(path),
-      readFileString: (path) =>
-        readCanonicalCodexShimFile(path, batShimPath, hostNpmCmdShim()),
+      readFileString: (path) => readCanonicalCodexShimFile(path, batShimPath, hostNpmCmdShim()),
       realPath: (path) => path,
       spawnSync,
     });
@@ -381,9 +381,7 @@ describe("Windows provider process containment", () => {
     }
 
     expect(failure).toBeInstanceOf(WindowsProviderBatchShimLaunchError);
-    expect((failure as WindowsProviderBatchShimLaunchError).reason).toBe(
-      "target_outside_package",
-    );
+    expect((failure as WindowsProviderBatchShimLaunchError).reason).toBe("target_outside_package");
   });
 
   it("preserves spaces, Unicode paths, and argv while unwrapping a proven npm shim", () => {
@@ -464,24 +462,23 @@ describe("Windows provider process containment", () => {
   });
 
   it("rejects prepared cmd.exe provider launches instead of preserving shell execution", () => {
-    expect(
-      () =>
-        containPreparedWindowsProviderProcess(
-          {
-            command: "C:\\Windows\\System32\\cmd.exe",
-            args: ["/d", "/s", "/v:off", "/c", 'call "C:\\tools\\agent.cmd" "hello"'],
-            shell: false,
-            windowsHide: true,
-            windowsVerbatimArguments: true,
-          },
-          {
-            platform: "win32",
-            arch: "arm64",
-            controlDirectory: "C:\\Temp",
-            launcherPath: launcher,
-            fileExists: () => true,
-          },
-        ),
+    expect(() =>
+      containPreparedWindowsProviderProcess(
+        {
+          command: "C:\\Windows\\System32\\cmd.exe",
+          args: ["/d", "/s", "/v:off", "/c", 'call "C:\\tools\\agent.cmd" "hello"'],
+          shell: false,
+          windowsHide: true,
+          windowsVerbatimArguments: true,
+        },
+        {
+          platform: "win32",
+          arch: "arm64",
+          controlDirectory: "C:\\Temp",
+          launcherPath: launcher,
+          fileExists: () => true,
+        },
+      ),
     ).toThrow(WindowsProviderShellLaunchError);
   });
 
@@ -539,12 +536,7 @@ describe("Windows provider process containment", () => {
       );
 
       expect(wrapped.command).toBe(launcher);
-      expect(wrapped.args.slice(7)).toEqual([
-        target,
-        "--flag",
-        "value with spaces",
-        "ユニコード",
-      ]);
+      expect(wrapped.args.slice(7)).toEqual([target, "--flag", "value with spaces", "ユニコード"]);
       expect(wrapped.shell).toBe(false);
       expect(wrapped.windowsVerbatimArguments).toBeUndefined();
       expect(wrapped.args.join(" ").toLowerCase()).not.toContain("cmd.exe");

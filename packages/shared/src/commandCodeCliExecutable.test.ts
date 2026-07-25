@@ -196,6 +196,30 @@ describe("resolveCommandCodeCliExecutable", () => {
     expect(statSync).toHaveBeenCalledWith(shim);
   });
 
+  it("uses the default Windows root for the cmd.exe collision when env omits it", () => {
+    const commandProcessor = "C:\\Windows\\System32\\cmd.exe";
+    const shim = "C:\\Users\\test\\AppData\\Roaming\\npm\\commandcode.cmd";
+    const statSync = regularFiles(commandProcessor, shim);
+    const spawnSync = vi.fn((_command: string, args: ReadonlyArray<string>) =>
+      args[0] === "cmd"
+        ? { stdout: `${commandProcessor}\r\n`, status: 0 }
+        : { stdout: "", status: 1 },
+    );
+
+    expect(
+      resolveCommandCodeCliExecutableWithDiscovery("commandcode", {
+        platform: "win32",
+        cwd: "C:\\repo",
+        env: { APPDATA: "C:\\Users\\test\\AppData\\Roaming" },
+        spawnSync,
+        statSync,
+      }),
+    ).toEqual({ executable: shim });
+    expect(spawnSync).toHaveBeenCalledTimes(4);
+    expect(statSync).toHaveBeenCalledWith(commandProcessor);
+    expect(statSync).toHaveBeenCalledWith(shim);
+  });
+
   it("does not treat a non-system cmd.exe candidate as the Windows alias collision", () => {
     const otherCmd = "C:\\Tools\\cmd.exe";
     const shim = "C:\\Users\\test\\AppData\\Roaming\\npm\\commandcode.cmd";

@@ -10,6 +10,7 @@ import {
   resolveWindowsCommandCandidatesAsync,
   resolveWindowsCommandPath,
   resolveWindowsCommandPathAsync,
+  resolveWindowsSystemRoot,
   unresolvedWindowsCommandDiscoveryOutcome,
   type WindowsAsyncCommandDiscoveryInput,
   type WindowsCommandDiscoveryObservation,
@@ -78,11 +79,10 @@ function effectiveAliasDiscoveryObservations(
   command: (typeof COMMAND_CODE_ALIASES)[number],
   candidates: ReadonlyArray<string>,
   observations: ReadonlyArray<WindowsCommandDiscoveryObservation>,
-  commandProcessorPaths: ReadonlySet<string> | undefined,
+  commandProcessorPaths: ReadonlySet<string>,
 ): WindowsCommandDiscoveryObservation[] {
   const resolvedOnlyToWindowsCommandProcessor =
     command === "cmd" &&
-    commandProcessorPaths !== undefined &&
     candidates.length > 0 &&
     candidates.every((candidate) =>
       commandProcessorPaths.has(Path.win32.normalize(candidate).toLowerCase()),
@@ -99,15 +99,16 @@ function effectiveAliasDiscoveryObservations(
   return observations.map((observation) => ({ ...observation, outcome: "not_found" }));
 }
 
-function windowsCommandProcessorPaths(env: NodeJS.ProcessEnv): ReadonlySet<string> | undefined {
-  const systemRoot = environmentValue(env, "SystemRoot") ?? environmentValue(env, "WINDIR");
-  return systemRoot
-    ? new Set(
-        ["cmd.exe", "cmd.com"].map((name) =>
-          Path.win32.normalize(Path.win32.join(systemRoot, "System32", name)).toLowerCase(),
-        ),
-      )
-    : undefined;
+function windowsCommandProcessorPaths(env: NodeJS.ProcessEnv): ReadonlySet<string> {
+  const systemRoot =
+    environmentValue(env, "SystemRoot") ??
+    environmentValue(env, "WINDIR") ??
+    resolveWindowsSystemRoot(env);
+  return new Set(
+    ["cmd.exe", "cmd.com"].map((name) =>
+      Path.win32.normalize(Path.win32.join(systemRoot, "System32", name)).toLowerCase(),
+    ),
+  );
 }
 
 function npmShim(

@@ -50,10 +50,9 @@ function syncWindowsEnvironment(
       }
     }
 
-    const fallbackDirectories = listWindowsUserCliFallbackDirectories(
-      env,
-      directoryExists,
-    ).join(";");
+    const fallbackDirectories = listWindowsUserCliFallbackDirectories(env, directoryExists).join(
+      ";",
+    );
     const mergedPath = mergePathEntries(
       registryAndInheritedPath,
       fallbackDirectories || undefined,

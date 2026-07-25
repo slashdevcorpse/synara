@@ -215,12 +215,7 @@ describeWindows("Windows Job launcher native integration", () => {
     const nodePath = join(nodeDirectory, "node.exe");
     const npmPrefix = join(root, "User Data", "npm");
     const packageTargetPath = join(npmPrefix, "node_modules", "fixture-provider", "bin", "cli.js");
-    const packageManifestPath = join(
-      npmPrefix,
-      "node_modules",
-      "fixture-provider",
-      "package.json",
-    );
+    const packageManifestPath = join(npmPrefix, "node_modules", "fixture-provider", "package.json");
     const providerCommandPath = join(npmPrefix, "fixture-provider.cmd");
 
     try {

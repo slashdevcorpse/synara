@@ -172,10 +172,7 @@ function normalizeManifestBinTarget(value: string): string | null {
     segments.length === 0 ||
     segments.some(
       (segment) =>
-        segment.length === 0 ||
-        segment === ".." ||
-        segment.endsWith(".") ||
-        segment.endsWith(" "),
+        segment.length === 0 || segment === ".." || segment.endsWith(".") || segment.endsWith(" "),
     )
   ) {
     return null;
@@ -224,7 +221,9 @@ export function windowsNpmPackageManifestDeclaresShimTarget(input: {
     }
     declaredTarget = bin;
   } else if (typeof bin === "object" && bin !== null && !Array.isArray(bin)) {
-    const entry = Object.entries(bin).find(([name]) => name.toLowerCase() === shimName.toLowerCase());
+    const entry = Object.entries(bin).find(
+      ([name]) => name.toLowerCase() === shimName.toLowerCase(),
+    );
     declaredTarget = entry?.[1];
   }
 

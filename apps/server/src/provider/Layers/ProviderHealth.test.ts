@@ -5365,12 +5365,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
           name: "@openai/codex",
           bin: { codex: "bin/codex.js" },
         });
-        const existingFiles = new Set([
-          shimPath,
-          nodePath,
-          packageTargetPath,
-          packageManifestPath,
-        ]);
+        const existingFiles = new Set([shimPath, nodePath, packageTargetPath, packageManifestPath]);
         const shimContents = [
           "@ECHO off",
           "GOTO start",

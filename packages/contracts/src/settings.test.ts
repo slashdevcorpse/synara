@@ -41,10 +41,7 @@ describe("Command Code server settings", () => {
 
     expect(
       Object.fromEntries(
-        Object.entries(settings.providers).map(([provider, value]) => [
-          provider,
-          value.binaryPath,
-        ]),
+        Object.entries(settings.providers).map(([provider, value]) => [provider, value.binaryPath]),
       ),
     ).toEqual({
       codex: "codex",

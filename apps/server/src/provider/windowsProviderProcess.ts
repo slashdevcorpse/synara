@@ -372,10 +372,7 @@ function inspectCanonicalWindowsNpmShim(
     return fail("package_manifest_bin_mismatch");
   }
 
-  const visibleTargetPath = Path.win32.join(
-    shimDirectory,
-    ...shimTarget.relativeTarget.split("/"),
-  );
+  const visibleTargetPath = Path.win32.join(shimDirectory, ...shimTarget.relativeTarget.split("/"));
   const canonicalTargetPath = verifiedRealFile(visibleTargetPath, input);
   if (!canonicalTargetPath) {
     return fail("target_not_file");
