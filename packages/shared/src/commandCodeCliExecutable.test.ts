@@ -169,11 +169,63 @@ describe("resolveCommandCodeCliExecutable", () => {
     ).toBe(shim);
   });
 
+  it("treats the Windows cmd.exe alias collision as not found before APPDATA fallback", () => {
+    const commandProcessor = "C:\\Windows\\System32\\cmd.exe";
+    const shim = "C:\\Users\\test\\AppData\\Roaming\\npm\\commandcode.cmd";
+    const statSync = regularFiles(commandProcessor, shim);
+    const spawnSync = vi.fn((_command: string, args: ReadonlyArray<string>) =>
+      args[0] === "cmd"
+        ? { stdout: `${commandProcessor}\r\n`, status: 0 }
+        : { stdout: "", status: 1 },
+    );
+
+    expect(
+      resolveCommandCodeCliExecutableWithDiscovery("commandcode", {
+        platform: "win32",
+        cwd: "C:\\repo",
+        env: {
+          SystemRoot: "C:\\Windows",
+          APPDATA: "C:\\Users\\test\\AppData\\Roaming",
+        },
+        spawnSync,
+        statSync,
+      }),
+    ).toEqual({ executable: shim });
+    expect(spawnSync).toHaveBeenCalledTimes(4);
+    expect(statSync).toHaveBeenCalledWith(commandProcessor);
+    expect(statSync).toHaveBeenCalledWith(shim);
+  });
+
+  it("does not treat a non-system cmd.exe candidate as the Windows alias collision", () => {
+    const otherCmd = "C:\\Tools\\cmd.exe";
+    const shim = "C:\\Users\\test\\AppData\\Roaming\\npm\\commandcode.cmd";
+    const statSync = regularFiles(otherCmd, shim);
+    const spawnSync = vi.fn((_command: string, args: ReadonlyArray<string>) =>
+      args[0] === "cmd" ? { stdout: `${otherCmd}\r\n`, status: 0 } : { stdout: "", status: 1 },
+    );
+
+    expect(
+      resolveCommandCodeCliExecutableWithDiscovery("commandcode", {
+        platform: "win32",
+        cwd: "C:\\repo",
+        env: {
+          SystemRoot: "C:\\Windows",
+          APPDATA: "C:\\Users\\test\\AppData\\Roaming",
+        },
+        spawnSync,
+        statSync,
+      }),
+    ).toEqual({ executable: "commandcode", discoveryOutcome: "transient_failure" });
+    expect(spawnSync).toHaveBeenCalledTimes(4);
+    expect(statSync).toHaveBeenCalledWith(otherCmd);
+    expect(statSync).not.toHaveBeenCalledWith(shim);
+  });
+
   it("does not probe the APPDATA fallback after a transient discovery failure", () => {
     const shim = "C:\\Users\\test\\AppData\\Roaming\\npm\\commandcode.cmd";
     const statSync = regularFiles(shim);
     const spawnSync = vi.fn((_command: string, args: ReadonlyArray<string>) =>
-      args[0] === "commandcode"
+      args[0] === "cmd"
         ? {
             error: Object.assign(new Error("where.exe timed out"), { code: "ETIMEDOUT" }),
             stdout: "",
@@ -219,11 +271,38 @@ describe("resolveCommandCodeCliExecutable", () => {
     expect(statSync).toHaveBeenCalledWith(shim);
   });
 
+  it("treats the Windows cmd.exe alias collision as not found asynchronously", async () => {
+    const commandProcessor = "C:\\Windows\\System32\\cmd.exe";
+    const shim = "C:\\Users\\test\\AppData\\Roaming\\npm\\commandcode.cmd";
+    const statSync = regularFiles(commandProcessor, shim);
+    const execFile = vi.fn(async (_command: string, args: ReadonlyArray<string>) =>
+      args[0] === "cmd"
+        ? { stdout: `${commandProcessor}\r\n`, status: 0 }
+        : { stdout: "", status: 1 },
+    );
+
+    await expect(
+      resolveCommandCodeCliExecutableWithDiscoveryAsync("commandcode", {
+        platform: "win32",
+        cwd: "C:\\repo",
+        env: {
+          SystemRoot: "C:\\Windows",
+          APPDATA: "C:\\Users\\test\\AppData\\Roaming",
+        },
+        execFile,
+        statSync,
+      }),
+    ).resolves.toEqual({ executable: shim });
+    expect(execFile).toHaveBeenCalledTimes(4);
+    expect(statSync).toHaveBeenCalledWith(commandProcessor);
+    expect(statSync).toHaveBeenCalledWith(shim);
+  });
+
   it("does not probe the APPDATA fallback asynchronously after a transient failure", async () => {
     const shim = "C:\\Users\\test\\AppData\\Roaming\\npm\\commandcode.cmd";
     const statSync = regularFiles(shim);
     const execFile = vi.fn(async (_command: string, args: ReadonlyArray<string>) =>
-      args[0] === "commandcode"
+      args[0] === "cmd"
         ? {
             error: Object.assign(new Error("where.exe timed out"), { code: "ETIMEDOUT" }),
             stdout: "",
