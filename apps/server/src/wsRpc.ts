@@ -958,10 +958,7 @@ const makeWsRpcHandlersLayer = () =>
                       projectionReadModelQuery.getThreadDetailSnapshotById(input.threadId),
                     ),
                     Effect.mapError((cause) =>
-                      toWsRpcError(
-                        cause,
-                        "Failed to refresh the terminal thread detail snapshot",
-                      ),
+                      toWsRpcError(cause, "Failed to refresh the terminal thread detail snapshot"),
                     ),
                     Effect.map(
                       Option.map(

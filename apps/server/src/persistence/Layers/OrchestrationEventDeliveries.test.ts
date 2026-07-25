@@ -291,25 +291,21 @@ layer("OrchestrationEventDeliveryRepository", (it) => {
       assert.strictEqual(blockers[0]?.eventId, "evt-reconcile-delivery");
       assert.strictEqual(blockers[0]?.state, "uncertain");
       assert.strictEqual(
-        (
-          yield* repository.listBlockingDeliveries({
-            consumerName: PROVIDER_COMMAND_REACTOR_CONSUMER,
-            threadId: "thread-reconcile",
-            afterEventSequence: eventSequence,
-            limit: 10,
-          })
-        ).length,
+        (yield* repository.listBlockingDeliveries({
+          consumerName: PROVIDER_COMMAND_REACTOR_CONSUMER,
+          threadId: "thread-reconcile",
+          afterEventSequence: eventSequence,
+          limit: 10,
+        })).length,
         0,
       );
       assert.strictEqual(
-        (
-          yield* repository.listBlockingDeliveries({
-            consumerName: PROVIDER_COMMAND_REACTOR_CONSUMER,
-            threadId: "thread-reconcile",
-            afterEventSequence: eventSequence - 1,
-            limit: 10,
-          })
-        ).length,
+        (yield* repository.listBlockingDeliveries({
+          consumerName: PROVIDER_COMMAND_REACTOR_CONSUMER,
+          threadId: "thread-reconcile",
+          afterEventSequence: eventSequence - 1,
+          limit: 10,
+        })).length,
         1,
       );
 

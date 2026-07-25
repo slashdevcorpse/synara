@@ -65,11 +65,9 @@ describe("thread detail projection refresh", () => {
 
   it("maps persistent projection lag to a retryable stream restart error", async () => {
     const failure = await Effect.runPromise(
-      awaitThreadDetailProjectionReady(
-        () => Effect.succeed({ snapshotSequence: 8 }),
-        9,
-        [],
-      ).pipe(Effect.flip),
+      awaitThreadDetailProjectionReady(() => Effect.succeed({ snapshotSequence: 8 }), 9, []).pipe(
+        Effect.flip,
+      ),
     );
 
     expect(failure).toMatchObject({
@@ -121,8 +119,8 @@ describe("thread detail projection refresh", () => {
         makeActivityEvent("context-window.updated", TurnId.makeUnsafe("turn-1")),
       ),
     ).toBe(false);
-    expect(shouldRefreshThreadDetailSnapshotAfterEvent(makeActivityEvent("turn.completed", null))).toBe(
-      false,
-    );
+    expect(
+      shouldRefreshThreadDetailSnapshotAfterEvent(makeActivityEvent("turn.completed", null)),
+    ).toBe(false);
   });
 });

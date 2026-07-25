@@ -233,8 +233,7 @@ describe("resolveCodexCliExecutable", () => {
   });
 
   it("rejects an incomplete OpenAI native install and uses the complete npm package", () => {
-    const native =
-      "C:\\Users\\test\\AppData\\Local\\Programs\\OpenAI\\Codex\\bin\\codex.exe";
+    const native = "C:\\Users\\test\\AppData\\Local\\Programs\\OpenAI\\Codex\\bin\\codex.exe";
     const npmBatch = "C:\\Users\\test\\AppData\\Roaming\\npm\\codex.cmd";
     const vendorNative = nestedNpmVendorCodex(npmBatch);
 
@@ -305,10 +304,7 @@ describe("resolveCodexCliExecutable", () => {
           ...completeCodexBundle(olderNative),
           ...completeCodexBundle(newerNative),
         ),
-        readFileSync: codexVersions(
-          [olderNative, "0.144.1"],
-          [newerNative, "0.145.0"],
-        ),
+        readFileSync: codexVersions([olderNative, "0.144.1"], [newerNative, "0.145.0"]),
       }),
     ).toBe(newerNative);
   });
@@ -371,9 +367,7 @@ describe("resolveCodexCliExecutable", () => {
     const missing = "C:\\missing\\codex.exe";
     const directory = "C:\\directory\\codex.exe";
     const fallback = "D:\\Codex\\codex.exe";
-    const fallbackFiles = new Set(
-      completeCodexBundle(fallback).map((path) => path.toLowerCase()),
-    );
+    const fallbackFiles = new Set(completeCodexBundle(fallback).map((path) => path.toLowerCase()));
     const readStat = vi.fn((path: string) => {
       if (path === directory) {
         return { isFile: () => false };
@@ -409,11 +403,7 @@ describe("resolveCodexCliExecutable", () => {
         cwd: "C:\\projects\\synara",
         env: { SystemRoot: "C:\\Windows" },
         spawnSync,
-        statSync: regularFiles(
-          configured,
-          npmBatch,
-          ...completeCodexBundle(vendorNative),
-        ),
+        statSync: regularFiles(configured, npmBatch, ...completeCodexBundle(vendorNative)),
       }),
     ).toBe(vendorNative);
     expect(spawnSync).toHaveBeenCalledTimes(1);
@@ -493,8 +483,7 @@ describe("resolveCodexCliExecutable", () => {
     const incompleteNative = "C:\\OpenAI\\Codex\\bin\\codex.exe";
     const npmBatch = "C:\\Users\\test\\AppData\\Roaming\\npm\\codex.cmd";
     const incompleteVendorNative = nestedNpmVendorCodex(npmBatch);
-    const [vendorExecutable, vendorCommandRunner] =
-      completeCodexBundle(incompleteVendorNative);
+    const [vendorExecutable, vendorCommandRunner] = completeCodexBundle(incompleteVendorNative);
 
     expect(
       resolveCodexCliExecutable("codex", {
@@ -505,12 +494,7 @@ describe("resolveCodexCliExecutable", () => {
           APPDATA: "C:\\Users\\test\\AppData\\Roaming",
         },
         spawnSync: whereOutput(incompleteNative, npmBatch),
-        statSync: regularFiles(
-          incompleteNative,
-          npmBatch,
-          vendorExecutable,
-          vendorCommandRunner,
-        ),
+        statSync: regularFiles(incompleteNative, npmBatch, vendorExecutable, vendorCommandRunner),
       }),
     ).toBe("codex");
   });

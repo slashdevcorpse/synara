@@ -225,10 +225,7 @@ function windowsCodexPlatformPackage(
   return undefined;
 }
 
-function npmVendorExecutablePaths(
-  shim: string,
-  arch: NodeJS.Architecture,
-): ReadonlyArray<string> {
+function npmVendorExecutablePaths(shim: string, arch: NodeJS.Architecture): ReadonlyArray<string> {
   const platformPackage = windowsCodexPlatformPackage(arch);
   if (!platformPackage) {
     return [];
@@ -378,12 +375,7 @@ function resolveExplicitCodexExecutable(
   }
   if (CODEX_BATCH_EXECUTABLE_PATTERN.test(Path.win32.basename(executable))) {
     return selectPreferredCandidate(
-      nativeCandidatesBehindNpmShim(
-        executable,
-        input.arch ?? process.arch,
-        readStat,
-        readFile,
-      ),
+      nativeCandidatesBehindNpmShim(executable, input.arch ?? process.arch, readStat, readFile),
     );
   }
   return executable;
