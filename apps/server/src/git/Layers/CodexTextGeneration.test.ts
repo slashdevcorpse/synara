@@ -149,7 +149,7 @@ function makeFakeCodexBinary(dir: string) {
 
     if (process.platform === "win32") {
       if (process.arch !== "x64" && process.arch !== "arm64") {
-        return yield* Effect.dieMessage(
+        return yield* Effect.die(
           `Unsupported Windows architecture for fake Codex bundle: ${process.arch}`,
         );
       }
