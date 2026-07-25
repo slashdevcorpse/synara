@@ -127,7 +127,7 @@ jobs:
 
   quality_windows:
     name: quality_windows
-    runs-on: windows-2022
+    runs-on: windows-2025
     timeout-minutes: 45
     steps:
       - name: Checkout
@@ -256,7 +256,7 @@ jobs:
 
   windows_e2e_build:
     name: windows_e2e_build
-    runs-on: windows-2022
+    runs-on: windows-2025
     timeout-minutes: 30
     steps:
       - name: Checkout
@@ -315,7 +315,7 @@ jobs:
 
   windows_x64:
     name: windows_x64
-    runs-on: windows-2022
+    runs-on: windows-2025
     timeout-minutes: 90
     steps:
       - name: Checkout
@@ -610,7 +610,7 @@ jobs:
     name: e2e_windows
     if: always()
     needs: windows_e2e_build
-    runs-on: windows-2022
+    runs-on: windows-2025
     timeout-minutes: 30
     steps:
       - name: Require the Windows desktop E2E build
