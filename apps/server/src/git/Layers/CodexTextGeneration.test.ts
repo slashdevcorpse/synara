@@ -198,7 +198,7 @@ function makeFakeCodexBinary(dir: string) {
         codexPath,
         [
           "@echo off",
-          '"%~dp0\\node.exe" "%~dp0\\node_modules\\@openai\\codex\\bin\\fake-codex.cjs" %*',
+          `"${process.execPath.replaceAll("%", "%%")}" "${scriptPath.replaceAll("%", "%%")}" %*`,
           "",
         ].join("\r\n"),
       );

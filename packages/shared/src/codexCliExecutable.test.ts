@@ -439,6 +439,7 @@ describe("resolveCodexCliExecutable", () => {
   it("resolves the ARM64 native package behind an explicit npm shim", () => {
     const configured = "C:\\Users\\test\\AppData\\Roaming\\npm\\codex.cmd";
     const vendorNative = nestedNpmVendorCodex(configured, "arm64");
+    const spawnSync = vi.fn();
 
     expect(
       resolveCodexCliExecutable(configured, {
@@ -446,10 +447,11 @@ describe("resolveCodexCliExecutable", () => {
         arch: "arm64",
         cwd: "C:\\projects\\synara",
         env: { SystemRoot: "C:\\Windows" },
-        spawnSync: vi.fn(),
+        spawnSync,
         statSync: regularFiles(configured, ...completeCodexBundle(vendorNative)),
       }),
     ).toBe(vendorNative);
+    expect(spawnSync).not.toHaveBeenCalled();
   });
 
   it("falls through from an explicit npm shim whose native package is incomplete", () => {
