@@ -95,9 +95,7 @@ function createProviderServiceHarness(options?: {
   const awaitRuntimeEventFanoutDrained: Effect.Effect<void> = Effect.suspend(() =>
     PubSub.isEmpty(runtimeEventPubSub).pipe(
       Effect.flatMap((empty) =>
-        empty
-          ? Effect.void
-          : Effect.yieldNow.pipe(Effect.andThen(awaitRuntimeEventFanoutDrained)),
+        empty ? Effect.void : Effect.yieldNow.pipe(Effect.andThen(awaitRuntimeEventFanoutDrained)),
       ),
     ),
   );
@@ -302,6 +300,7 @@ describe("ProviderRuntimeIngestion", () => {
     readonly runtimeEventsPersistedBeforeFanout?: boolean;
     readonly runtimeEventAppendGate?: Deferred.Deferred<void>;
     readonly runtimeEventAppendStarted?: Deferred.Deferred<void>;
+    readonly runtimeEventReplayGate?: Deferred.Deferred<void>;
   }) {
     const workspaceRoot = options?.workspaceRoot ?? makeTempDir("synara-provider-project-");
     fs.mkdirSync(path.join(workspaceRoot, ".git"), { recursive: true });
@@ -322,25 +321,35 @@ describe("ProviderRuntimeIngestion", () => {
     );
     const runtimeEventAppendGate = options?.runtimeEventAppendGate;
     const runtimeEventAppendStarted = options?.runtimeEventAppendStarted;
-    const runtimeEventRepositoryLayer = runtimeEventAppendGate
-      ? Layer.effect(
-          ProviderRuntimeEventRepository,
-          Effect.gen(function* () {
-            const repository = yield* ProviderRuntimeEventRepository;
-            return {
-              ...repository,
-              append: (event: ProviderRuntimeEvent) =>
-                (runtimeEventAppendStarted
-                  ? Deferred.succeed(runtimeEventAppendStarted, undefined).pipe(Effect.asVoid)
-                  : Effect.void
-                ).pipe(
-                  Effect.andThen(Deferred.await(runtimeEventAppendGate)),
-                  Effect.andThen(repository.append(event)),
-                ),
-            };
-          }),
-        ).pipe(Layer.provide(baseRuntimeEventRepositoryLayer))
-      : baseRuntimeEventRepositoryLayer;
+    const runtimeEventReplayGate = options?.runtimeEventReplayGate;
+    const runtimeEventRepositoryLayer =
+      runtimeEventAppendGate || runtimeEventReplayGate
+        ? Layer.effect(
+            ProviderRuntimeEventRepository,
+            Effect.gen(function* () {
+              const repository = yield* ProviderRuntimeEventRepository;
+              return {
+                ...repository,
+                append: (event: ProviderRuntimeEvent) =>
+                  runtimeEventAppendGate
+                    ? (runtimeEventAppendStarted
+                        ? Deferred.succeed(runtimeEventAppendStarted, undefined).pipe(Effect.asVoid)
+                        : Effect.void
+                      ).pipe(
+                        Effect.andThen(Deferred.await(runtimeEventAppendGate)),
+                        Effect.andThen(repository.append(event)),
+                      )
+                    : repository.append(event),
+                readAcceptedOpenTurnEvents: (input) =>
+                  runtimeEventReplayGate
+                    ? Deferred.await(runtimeEventReplayGate).pipe(
+                        Effect.andThen(repository.readAcceptedOpenTurnEvents(input)),
+                      )
+                    : repository.readAcceptedOpenTurnEvents(input),
+              };
+            }),
+          ).pipe(Layer.provide(baseRuntimeEventRepositoryLayer))
+        : baseRuntimeEventRepositoryLayer;
     const layer = ProviderRuntimeIngestionWithoutRuntimeEventRepository.pipe(
       Layer.provideMerge(orchestrationLayer),
       Layer.provideMerge(OrchestrationProjectionSnapshotQueryLive),
@@ -361,11 +370,11 @@ describe("ProviderRuntimeIngestion", () => {
     );
     scope = await Effect.runPromise(Scope.make("sequential"));
     let ingestionStarted = false;
-    const startIngestion = async () => {
+    const startIngestion = async (waitForRuntimeEventSubscriber = true) => {
       if (ingestionStarted) return;
       ingestionStarted = true;
       await Effect.runPromise(ingestion.start.pipe(Scope.provide(scope!)));
-      if (options?.runtimeEventsPersistedBeforeFanout !== true) {
+      if (waitForRuntimeEventSubscriber && options?.runtimeEventsPersistedBeforeFanout !== true) {
         const deadline = Date.now() + 2_000;
         while (provider.getRuntimeEventSubscriberCount() < 1) {
           if (Date.now() >= deadline) {
@@ -501,6 +510,7 @@ describe("ProviderRuntimeIngestion", () => {
       stopRuntimeSession: provider.stopRuntimeSession,
       hasLiveRuntimeTasks: provider.hasLiveRuntimeTasks,
       closeRuntimeEvents: provider.closeRuntimeEvents,
+      getRuntimeEventSubscriberCount: provider.getRuntimeEventSubscriberCount,
       getRuntimeEventStreamAccessCount: provider.getRuntimeEventStreamAccessCount,
       createAdditionalThread,
     };
@@ -532,6 +542,87 @@ describe("ProviderRuntimeIngestion", () => {
       ),
     ).toBe(persisted.sequence);
     expect(harness.getRuntimeEventStreamAccessCount()).toBe(0);
+  });
+
+  it("closes the runtime event source before ingestion starts without waiting", async () => {
+    const harness = await createHarness({
+      startIngestion: false,
+      runtimeEventsPersistedBeforeFanout: true,
+    });
+
+    await Promise.race([
+      harness.closeRuntimeEventSource(),
+      new Promise<never>((_, reject) => {
+        setTimeout(() => reject(new Error("Timed out closing an unstarted runtime source")), 2_000);
+      }),
+    ]);
+
+    expect(harness.getRuntimeEventStreamAccessCount()).toBe(0);
+  });
+
+  it("interrupts a nondurable post-append replay wait before the shutdown drain", async () => {
+    const runtimeEventReplayGate = await Effect.runPromise(Deferred.make<void>());
+    const harness = await createHarness({
+      startIngestion: false,
+      runtimeEventReplayGate,
+    });
+    const event: ProviderRuntimeEvent = {
+      type: "runtime.warning",
+      eventId: asEventId("evt-nondurable-post-append-replay-wait"),
+      provider: "codex",
+      createdAt: "2026-07-25T15:00:30.000Z",
+      threadId: asThreadId("thread-1"),
+      payload: {
+        message: "Persisted output survived an interrupted startup replay wait",
+      },
+    };
+    const ingestionStart = harness.startIngestion(false);
+    let replayReleased = false;
+    let persistedSequence = 0;
+
+    try {
+      await waitForCondition(() => harness.getRuntimeEventSubscriberCount() === 1);
+      harness.emit(event);
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          while (persistedSequence < 1) {
+            persistedSequence = yield* harness.runtimeEventRepository.getHighWaterSequence;
+            yield* Effect.yieldNow;
+          }
+        }),
+      );
+      await Effect.runPromise(harness.closeRuntimeEvents);
+
+      await Promise.race([
+        harness.closeRuntimeEventSource(),
+        new Promise<never>((_, reject) => {
+          setTimeout(
+            () => reject(new Error("Timed out interrupting a post-append replay wait")),
+            2_000,
+          );
+        }),
+      ]);
+
+      await Effect.runPromise(Deferred.succeed(runtimeEventReplayGate, undefined));
+      replayReleased = true;
+      await ingestionStart;
+      await harness.drain();
+
+      const thread = await waitForThread(harness.engine, (entry) =>
+        entry.activities.some((activity) => activity.id === event.eventId),
+      );
+      expect(thread.activities.filter((activity) => activity.id === event.eventId)).toHaveLength(1);
+      expect(
+        await Effect.runPromise(
+          harness.runtimeEventRepository.getConsumerCursor(PROVIDER_RUNTIME_INGESTION_CONSUMER),
+        ),
+      ).toBe(persistedSequence);
+    } finally {
+      if (!replayReleased) {
+        await Effect.runPromise(Deferred.succeed(runtimeEventReplayGate, undefined));
+      }
+      await ingestionStart;
+    }
   });
 
   it("fences an in-flight nondurable append after provider events close", async () => {

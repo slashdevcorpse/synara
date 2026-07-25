@@ -33,6 +33,7 @@ describe("OrchestrationReactor", () => {
               () => Effect.sync(() => stopped.push("provider-runtime-ingestion")),
             ),
             drain: Effect.void,
+            closeRuntimeEventSource: Effect.void,
           }),
         ),
         Layer.provideMerge(

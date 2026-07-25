@@ -26,10 +26,10 @@ import {
   Duration,
   Effect,
   Exit,
-  Fiber,
   Layer,
   Option,
   Ref,
+  Scope,
   Stream,
 } from "effect";
 import * as Semaphore from "effect/Semaphore";
@@ -3078,17 +3078,18 @@ const make = Effect.gen(function* () {
     }
   });
   const startupRuntimeReplayComplete = yield* Deferred.make<void>();
-  const providerRuntimeEventSourceFiber =
-    yield* Deferred.make<Fiber.Fiber<void, never> | null>();
+  const providerRuntimeEventSourceScope = yield* Scope.make("sequential");
+  yield* Effect.addFinalizer(() => Scope.close(providerRuntimeEventSourceScope, Exit.void));
 
   const start: ProviderRuntimeIngestionShape["start"] = startDrainableWorkerProducers(
     worker,
     Effect.gen(function* () {
       if (!providerService.runtimeEventsPersistedBeforeFanout) {
-        const runtimeEventSourceFiber = yield* Effect.forkScoped(
-          Stream.runForEach(providerService.streamEvents, (event) =>
-            Effect.uninterruptible(
+        yield* Scope.provide(
+          Effect.forkScoped(
+            Stream.runForEach(providerService.streamEvents, (event) =>
               runtimeEvents.append(event).pipe(
+                Effect.uninterruptible,
                 Effect.flatMap((persisted) =>
                   Deferred.await(startupRuntimeReplayComplete).pipe(
                     Effect.andThen(drainRuntimeJournalThrough(persisted.sequence)),
@@ -3106,12 +3107,8 @@ const make = Effect.gen(function* () {
               ),
             ),
           ),
+          providerRuntimeEventSourceScope,
         );
-        yield* Deferred.succeed(providerRuntimeEventSourceFiber, runtimeEventSourceFiber).pipe(
-          Effect.orDie,
-        );
-      } else {
-        yield* Deferred.succeed(providerRuntimeEventSourceFiber, null).pipe(Effect.orDie);
       }
       yield* Effect.forkScoped(
         Stream.runForEach(orchestrationEngine.streamDomainEvents, (event) => {
@@ -3154,11 +3151,7 @@ const make = Effect.gen(function* () {
     }
   }).pipe(Effect.orDie);
   const closeRuntimeEventSource = yield* Effect.cached(
-    Deferred.await(providerRuntimeEventSourceFiber).pipe(
-      Effect.flatMap((fiber) => (fiber === null ? Effect.void : Fiber.interrupt(fiber))),
-      Effect.asVoid,
-      Effect.uninterruptible,
-    ),
+    Scope.close(providerRuntimeEventSourceScope, Exit.void).pipe(Effect.uninterruptible),
   );
 
   return {
