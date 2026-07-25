@@ -114,6 +114,11 @@ function withoutResumeCursor(session: ProviderSession): ProviderSession {
   return rest;
 }
 
+function withoutActiveTurn(session: ProviderSession): ProviderSession {
+  const { activeTurnId: _omittedActiveTurnId, ...rest } = session;
+  return rest;
+}
+
 function asRuntimePayloadRecord(value: unknown): Record<string, unknown> {
   return value !== null && typeof value === "object" ? (value as Record<string, unknown>) : {};
 }
@@ -2099,15 +2104,17 @@ routing.layer("ProviderServiceLive routing", (it) => {
   it.effect("lists no sessions after adapter runtime clears", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService;
+      const firstThreadId = asThreadId("thread-1");
+      const secondThreadId = asThreadId("thread-2");
 
-      yield* provider.startSession(asThreadId("thread-1"), {
+      yield* provider.startSession(firstThreadId, {
         provider: "codex",
-        threadId: asThreadId("thread-1"),
+        threadId: firstThreadId,
         runtimeMode: "full-access",
       });
-      yield* provider.startSession(asThreadId("thread-2"), {
+      yield* provider.startSession(secondThreadId, {
         provider: "codex",
-        threadId: asThreadId("thread-2"),
+        threadId: secondThreadId,
         runtimeMode: "full-access",
       });
 
@@ -2115,7 +2122,12 @@ routing.layer("ProviderServiceLive routing", (it) => {
       yield* routing.claude.stopAll();
 
       const remaining = yield* provider.listSessions();
-      assert.equal(remaining.length, 0);
+      assert.equal(
+        remaining.some(
+          (session) => session.threadId === firstThreadId || session.threadId === secondThreadId,
+        ),
+        false,
+      );
     }),
   );
 
@@ -5415,6 +5427,167 @@ durableRuntimeEvents.layer("ProviderServiceLive runtime event durability", (it) 
       const provider = yield* ProviderService;
       assert.equal(provider.runtimeEventsPersistedBeforeFanout, true);
     }),
+  );
+});
+
+function makeDurableTerminalBarrierLayer() {
+  const persistenceStarted = Effect.runSync(Deferred.make<ProviderRuntimeEvent>());
+  const releasePersistence = Effect.runSync(Deferred.make<void>());
+  const observedOrder: Array<string> = [];
+  const service = makeProviderServiceLayer({
+    persistRuntimeEvent: (event) =>
+      Deferred.succeed(persistenceStarted, event).pipe(
+        Effect.andThen(Deferred.await(releasePersistence)),
+        Effect.andThen(
+          Effect.sync(() => {
+            observedOrder.push(`persist:${String(event.eventId)}`);
+          }),
+        ),
+      ),
+  });
+  return {
+    ...service,
+    persistenceStarted,
+    releasePersistence,
+    observedOrder,
+  };
+}
+
+function assertDurableTerminalBarrier(
+  fixture: ReturnType<typeof makeDurableTerminalBarrierLayer>,
+  mode: "clear" | "remove",
+) {
+  return Effect.gen(function* () {
+    const provider = yield* ProviderService;
+    const directory = yield* ProviderSessionDirectory;
+    const threadId = asThreadId(`thread-durable-terminal-${mode}`);
+    const startedSession = yield* provider.startSession(threadId, {
+      provider: "codex",
+      threadId,
+      runtimeMode: "full-access",
+    });
+    const turn = yield* provider.sendTurn({
+      threadId,
+      input: `hold ${mode} terminal persistence`,
+      attachments: [],
+    });
+
+    fixture.codex.updateSession(threadId, (session) => ({
+      ...session,
+      status: "running",
+      activeTurnId: turn.turnId,
+    }));
+    if (mode === "clear") {
+      fixture.codex.updateSession(threadId, (session) => ({
+        ...withoutActiveTurn(session),
+        status: "ready",
+      }));
+    } else {
+      yield* fixture.codex.stopSession(threadId);
+    }
+
+    const bindingBeforeEvent = Option.getOrUndefined(yield* directory.getBinding(threadId));
+    assert.equal(bindingBeforeEvent?.status, "running");
+    assert.equal(
+      asRuntimePayloadRecord(bindingBeforeEvent?.runtimePayload).activeTurnId,
+      turn.turnId,
+    );
+    const sessionBeforeEvent = (yield* provider.listSessions()).find(
+      (session) => session.threadId === threadId,
+    );
+    assert.equal(sessionBeforeEvent?.status, "running");
+    assert.equal(sessionBeforeEvent?.activeTurnId, turn.turnId);
+    assert.equal(sessionBeforeEvent?.runtimeMode, startedSession.runtimeMode);
+    assert.deepEqual(sessionBeforeEvent?.resumeCursor, startedSession.resumeCursor);
+
+    const fanoutReceived = yield* Deferred.make<ProviderRuntimeEvent>();
+    const fanoutConsumer = yield* Stream.runForEach(provider.streamEvents, (event) =>
+      Effect.sync(() => {
+        fixture.observedOrder.push(`fanout:${String(event.eventId)}`);
+      }).pipe(Effect.andThen(Deferred.succeed(fanoutReceived, event)), Effect.asVoid),
+    ).pipe(Effect.forkChild);
+    yield* Effect.yieldNow;
+    yield* Effect.yieldNow;
+    yield* fixture.codex.waitForRuntimeSubscribers();
+
+    const eventId = asEventId(`runtime-durable-terminal-${mode}`);
+    fixture.codex.emit(
+      mode === "clear"
+        ? {
+            type: "turn.completed",
+            eventId,
+            provider: "codex",
+            createdAt: "2026-07-25T12:00:00.000Z",
+            threadId,
+            turnId: turn.turnId,
+            payload: { state: "completed" },
+          }
+        : {
+            type: "session.exited",
+            eventId,
+            provider: "codex",
+            createdAt: "2026-07-25T12:00:00.000Z",
+            threadId,
+            payload: { reason: "provider runtime exited" },
+          },
+    );
+
+    const persistingEvent = yield* Deferred.await(fixture.persistenceStarted);
+    assert.equal(persistingEvent.eventId, eventId);
+    assert.equal(yield* Deferred.isDone(fanoutReceived), false);
+    const bindingDuringPersistence = Option.getOrUndefined(yield* directory.getBinding(threadId));
+    assert.equal(bindingDuringPersistence?.status, "running");
+    assert.equal(
+      asRuntimePayloadRecord(bindingDuringPersistence?.runtimePayload).activeTurnId,
+      turn.turnId,
+    );
+    const sessionDuringPersistence = (yield* provider.listSessions()).find(
+      (session) => session.threadId === threadId,
+    );
+    assert.equal(sessionDuringPersistence?.status, "running");
+    assert.equal(sessionDuringPersistence?.activeTurnId, turn.turnId);
+
+    yield* Deferred.succeed(fixture.releasePersistence, undefined);
+    const receivedEvent = yield* Deferred.await(fanoutReceived);
+    assert.equal(receivedEvent.eventId, eventId);
+    const bindingAfterPersistence = Option.getOrUndefined(yield* directory.getBinding(threadId));
+    assert.equal(bindingAfterPersistence?.status, "stopped");
+    assert.equal(
+      asRuntimePayloadRecord(bindingAfterPersistence?.runtimePayload).activeTurnId,
+      null,
+    );
+    const sessionAfterPersistence = (yield* provider.listSessions()).find(
+      (session) => session.threadId === threadId,
+    );
+    if (mode === "clear") {
+      assert.equal(sessionAfterPersistence?.status, "ready");
+      assert.equal(sessionAfterPersistence?.activeTurnId, undefined);
+      assert.equal(sessionAfterPersistence?.runtimeMode, startedSession.runtimeMode);
+      assert.deepEqual(sessionAfterPersistence?.resumeCursor, startedSession.resumeCursor);
+    } else {
+      assert.equal(sessionAfterPersistence, undefined);
+    }
+    assert.deepEqual(fixture.observedOrder, [
+      `persist:${String(eventId)}`,
+      `fanout:${String(eventId)}`,
+    ]);
+    yield* Fiber.interrupt(fanoutConsumer);
+  }).pipe(
+    Effect.ensuring(Deferred.succeed(fixture.releasePersistence, undefined).pipe(Effect.asVoid)),
+  );
+}
+
+const durableClearedTerminal = makeDurableTerminalBarrierLayer();
+durableClearedTerminal.layer("ProviderServiceLive cleared terminal persistence barrier", (it) => {
+  it.effect("preserves the persisted active turn until a cleared terminal event is durable", () =>
+    assertDurableTerminalBarrier(durableClearedTerminal, "clear"),
+  );
+});
+
+const durableRemovedTerminal = makeDurableTerminalBarrierLayer();
+durableRemovedTerminal.layer("ProviderServiceLive removed terminal persistence barrier", (it) => {
+  it.effect("preserves the persisted active turn until a removed terminal event is durable", () =>
+    assertDurableTerminalBarrier(durableRemovedTerminal, "remove"),
   );
 });
 

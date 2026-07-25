@@ -275,6 +275,33 @@ function runtimeStatusForEvent(
   }
 }
 
+function runtimeEventClearsActiveTurn(event: ProviderRuntimeEvent): boolean {
+  if (event.providerRefs?.providerParentThreadId !== undefined) {
+    return false;
+  }
+  if (
+    event.type === "turn.completed" ||
+    event.type === "turn.aborted" ||
+    event.type === "session.exited" ||
+    event.type === "runtime.error"
+  ) {
+    return true;
+  }
+  if (event.type === "thread.state.changed") {
+    return (
+      event.payload.state === "archived" ||
+      event.payload.state === "closed" ||
+      event.payload.state === "error"
+    );
+  }
+  return (
+    event.type === "session.state.changed" &&
+    (event.payload.state === "ready" ||
+      event.payload.state === "stopped" ||
+      event.payload.state === "error")
+  );
+}
+
 function shouldRefreshResumeCursorForEvent(event: ProviderRuntimeEvent): boolean {
   return (
     event.type === "thread.started" ||
@@ -620,15 +647,12 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
       }
     };
 
-    const publishRuntimeEvent = (event: ProviderRuntimeEvent): Effect.Effect<void> =>
-      Effect.uninterruptible(
-        (options?.persistRuntimeEvent ? options.persistRuntimeEvent(event) : Effect.void).pipe(
-          Effect.andThen(
-            canonicalEventLogger ? canonicalEventLogger.write(event, null) : Effect.void,
-          ),
-          Effect.andThen(PubSub.publish(runtimeEventPubSub, event)),
-          Effect.asVoid,
-        ),
+    const persistRuntimeEvent = (event: ProviderRuntimeEvent): Effect.Effect<void> =>
+      options?.persistRuntimeEvent ? options.persistRuntimeEvent(event) : Effect.void;
+    const fanOutRuntimeEvent = (event: ProviderRuntimeEvent): Effect.Effect<void> =>
+      (canonicalEventLogger ? canonicalEventLogger.write(event, null) : Effect.void).pipe(
+        Effect.andThen(PubSub.publish(runtimeEventPubSub, event)),
+        Effect.asVoid,
       );
 
     const upsertSessionBinding = (
@@ -1059,18 +1083,7 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
               ? (event.turnId ?? null)
               : event.type === "thread.state.changed" && event.payload.state === "compacted"
                 ? (event.turnId ?? currentActiveTurnId)
-                : event.type === "turn.completed" ||
-                    event.type === "turn.aborted" ||
-                    (event.type === "thread.state.changed" &&
-                      (event.payload.state === "archived" ||
-                        event.payload.state === "closed" ||
-                        event.payload.state === "error")) ||
-                    event.type === "session.exited" ||
-                    event.type === "runtime.error" ||
-                    (event.type === "session.state.changed" &&
-                      (event.payload.state === "ready" ||
-                        event.payload.state === "stopped" ||
-                        event.payload.state === "error"))
+                : runtimeEventClearsActiveTurn(event)
                   ? null
                   : currentActiveTurnId;
           const lastError = runtimeLastErrorForEvent(event);
@@ -1122,6 +1135,10 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
       registry.getByProvider(provider),
     );
     const processRuntimeEvent = (event: ProviderRuntimeEvent): Effect.Effect<void> =>
+      // Persistence, binding mutation, canonical logging, and fan-out form one
+      // uninterruptible commit sequence. In particular, a durable terminal
+      // event cannot be interrupted after clearing the binding but before it
+      // reaches the journal or subscribers.
       Effect.uninterruptible(
         Effect.suspend(() => {
           if (
@@ -1136,13 +1153,22 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
             });
           }
           const canonicalEvent = event;
+          const updateBinding = updateSessionBindingFromRuntimeEvent(canonicalEvent);
+          const persistEvent = persistRuntimeEvent(canonicalEvent);
+          const persistBeforeBinding =
+            options?.persistRuntimeEvent !== undefined &&
+            runtimeEventClearsActiveTurn(canonicalEvent);
           return Effect.sync(() => {
             if (canonicalEvent.type === "turn.started") {
               reconcileRuntimeIdleTimer(canonicalEvent);
             }
           }).pipe(
-            Effect.andThen(updateSessionBindingFromRuntimeEvent(canonicalEvent)),
-            Effect.andThen(publishRuntimeEvent(canonicalEvent)),
+            Effect.andThen(
+              persistBeforeBinding
+                ? persistEvent.pipe(Effect.andThen(updateBinding))
+                : updateBinding.pipe(Effect.andThen(persistEvent)),
+            ),
+            Effect.andThen(fanOutRuntimeEvent(canonicalEvent)),
           );
         }),
       );
@@ -2599,13 +2625,12 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
           ),
           Effect.orElseSucceed(() => [] as Array<Option.Option<ProviderRuntimeBinding>>),
         );
+        const bindings = EffectArray.getSomes(persistedBindings);
         const bindingsByThreadId = new Map(
-          EffectArray.getSomes(persistedBindings).map(
-            (binding) => [binding.threadId, binding] as const,
-          ),
+          bindings.map((binding) => [binding.threadId, binding] as const),
         );
 
-        return activeSessions.map((session) => {
+        const mergedActiveSessions = activeSessions.map((session) => {
           const binding = bindingsByThreadId.get(session.threadId);
           if (!binding) {
             return session;
@@ -2614,6 +2639,8 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
           const overrides: {
             resumeCursor?: ProviderSession["resumeCursor"];
             runtimeMode?: ProviderSession["runtimeMode"];
+            status?: ProviderSession["status"];
+            activeTurnId?: ProviderSession["activeTurnId"];
           } = {};
           if (session.resumeCursor === undefined && binding.resumeCursor !== undefined) {
             overrides.resumeCursor = binding.resumeCursor;
@@ -2621,8 +2648,48 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
           if (binding.runtimeMode !== undefined) {
             overrides.runtimeMode = binding.runtimeMode;
           }
+          const persistedActiveTurnId = runtimeActiveTurnId(binding.runtimePayload);
+          if (session.activeTurnId === undefined && persistedActiveTurnId !== undefined) {
+            overrides.status = "running";
+            overrides.activeTurnId = TurnId.makeUnsafe(persistedActiveTurnId);
+          }
           return Object.assign({}, session, overrides);
         });
+        const activeThreadIds = new Set(activeSessions.map((session) => session.threadId));
+        const persistedActiveSessions = bindings.flatMap((binding) => {
+          if (activeThreadIds.has(binding.threadId) || binding.runtimeMode === undefined) {
+            return [];
+          }
+          const activeTurnId = runtimeActiveTurnId(binding.runtimePayload);
+          if (activeTurnId === undefined) {
+            return [];
+          }
+          const runtimePayload = runtimePayloadRecord(binding.runtimePayload);
+          const lastRuntimeEventAt = runtimePayload.lastRuntimeEventAt;
+          const updatedAt =
+            typeof lastRuntimeEventAt === "string"
+              ? lastRuntimeEventAt
+              : (binding.lastSeenAt ?? new Date().toISOString());
+          const cwd = readPersistedCwd(binding.runtimePayload);
+          const model = runtimePayload.model;
+          const lastError = runtimePayload.lastError;
+          return [
+            {
+              provider: binding.provider,
+              status: "running",
+              runtimeMode: binding.runtimeMode,
+              threadId: binding.threadId,
+              ...(cwd !== undefined ? { cwd } : {}),
+              ...(typeof model === "string" ? { model } : {}),
+              ...(binding.resumeCursor !== undefined ? { resumeCursor: binding.resumeCursor } : {}),
+              activeTurnId: TurnId.makeUnsafe(activeTurnId),
+              createdAt: updatedAt,
+              updatedAt,
+              ...(typeof lastError === "string" ? { lastError } : {}),
+            } satisfies ProviderSession,
+          ];
+        });
+        return [...mergedActiveSessions, ...persistedActiveSessions];
       });
 
     const getCapabilities: ProviderServiceShape["getCapabilities"] = (provider) =>
