@@ -5,13 +5,15 @@ import * as FS from "node:fs";
 import * as OS from "node:os";
 import * as Path from "node:path";
 import { createRequire } from "node:module";
+import { resolveCodexCliExecutableAsync } from "@synara/shared/codexCliExecutable";
 import { parseCanonicalWindowsNpmNodeShim } from "@synara/shared/windowsNpmShim";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   assertFakeCodexIsOnlyPathCandidate,
   isolatedExecutablePath,
   isolatedElectronEnv,
   parseDiagnosticJsonLines,
+  WINDOWS_FAKE_CODEX_LAUNCHER_NAME,
   windowsFakeCodexLauncherContents,
 } from "./desktop.fixture";
 import desktopPlaywrightConfig from "./playwright.config";
@@ -56,6 +58,25 @@ describe("desktop fixture executable PATH isolation", () => {
     );
   });
 
+  it("preserves the explicitly configured custom Windows fake Codex launcher", async () => {
+    const fakeCodexPath = `C:\\synara-e2e\\fake-codex\\${WINDOWS_FAKE_CODEX_LAUNCHER_NAME}`;
+    const execFile = vi.fn();
+    const spawnSync = vi.fn();
+
+    await expect(
+      resolveCodexCliExecutableAsync(fakeCodexPath, {
+        platform: "win32",
+        cwd: "C:\\synara-e2e\\workspace",
+        env: { SystemRoot: "C:\\Windows" },
+        execFile,
+        spawnSync,
+        statSync: vi.fn(),
+      }),
+    ).resolves.toBe(fakeCodexPath);
+    expect(execFile).not.toHaveBeenCalled();
+    expect(spawnSync).not.toHaveBeenCalled();
+  });
+
   it("removes a quoted directory that exposes a non-fixture Codex executable", async () => {
     const root = await FS.promises.mkdtemp(Path.join(OS.tmpdir(), "synara-e2e-path-"));
     temporaryRoots.push(root);
@@ -67,11 +88,13 @@ describe("desktop fixture executable PATH isolation", () => {
         FS.promises.mkdir(directory, { recursive: true }),
       ),
     );
-    const executableName = process.platform === "win32" ? "codex.cmd" : "codex";
-    const fakeCodexPath = Path.join(fakeDirectory, executableName);
+    const fakeExecutableName =
+      process.platform === "win32" ? WINDOWS_FAKE_CODEX_LAUNCHER_NAME : "codex";
+    const inheritedExecutableName = process.platform === "win32" ? "codex.cmd" : "codex";
+    const fakeCodexPath = Path.join(fakeDirectory, fakeExecutableName);
     await Promise.all([
       FS.promises.writeFile(fakeCodexPath, "fixture", "utf8"),
-      FS.promises.writeFile(Path.join(inheritedDirectory, executableName), "real", "utf8"),
+      FS.promises.writeFile(Path.join(inheritedDirectory, inheritedExecutableName), "real", "utf8"),
     ]);
 
     const isolatedPath = isolatedExecutablePath(
@@ -92,7 +115,7 @@ describe("desktop fixture executable PATH isolation", () => {
     await FS.promises.mkdir(fakeDirectory, { recursive: true });
     const fakeCodexPath = Path.join(
       fakeDirectory,
-      process.platform === "win32" ? "codex.cmd" : "codex",
+      process.platform === "win32" ? WINDOWS_FAKE_CODEX_LAUNCHER_NAME : "codex",
     );
     await FS.promises.writeFile(fakeCodexPath, "fixture", {
       encoding: "utf8",

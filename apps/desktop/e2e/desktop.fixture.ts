@@ -201,6 +201,7 @@ function quotePosixArgument(value: string): string {
 }
 
 const FAKE_CODEX_PACKAGE_TARGET = "node_modules/@synara/desktop-e2e/fake-codex-runtime.mjs";
+export const WINDOWS_FAKE_CODEX_LAUNCHER_NAME = "synara-e2e-codex.cmd";
 
 export function windowsFakeCodexLauncherContents(): string {
   const target = FAKE_CODEX_PACKAGE_TARGET.replaceAll("/", "\\");
@@ -250,7 +251,7 @@ async function createFakeCodexLauncher(
   await FS.promises.mkdir(launcherDir, { recursive: true });
   await FS.promises.mkdir(fakeCodexHome, { recursive: true });
   if (process.platform === "win32") {
-    const launcherPath = Path.join(launcherDir, "codex.cmd");
+    const launcherPath = Path.join(launcherDir, WINDOWS_FAKE_CODEX_LAUNCHER_NAME);
     await FS.promises.writeFile(launcherPath, windowsFakeCodexLauncherContents(), "utf8");
     return launcherPath;
   }
@@ -388,10 +389,18 @@ export function assertFakeCodexIsOnlyPathCandidate(
   pathValue: string,
   fakeCodexPath: string,
 ): readonly string[] {
-  const candidateNames =
+  const standardCandidateNames =
     process.platform === "win32"
       ? ["codex.com", "codex.exe", "codex.cmd", "codex.bat", "codex"]
       : ["codex"];
+  const fakeCodexName = Path.basename(fakeCodexPath);
+  const candidateNames = standardCandidateNames.some(
+    (name) =>
+      (process.platform === "win32" ? name.toLowerCase() : name) ===
+      (process.platform === "win32" ? fakeCodexName.toLowerCase() : fakeCodexName),
+  )
+    ? standardCandidateNames
+    : [...standardCandidateNames, fakeCodexName];
   const candidates = pathValue
     .split(Path.delimiter)
     .map(normalizePathDirectory)
@@ -587,7 +596,7 @@ export class DesktopHarness {
     this.fakeCodexPath = Path.join(
       this.operationalDir,
       "fake-codex",
-      process.platform === "win32" ? "codex.cmd" : "codex",
+      process.platform === "win32" ? WINDOWS_FAKE_CODEX_LAUNCHER_NAME : "codex",
     );
   }
 
