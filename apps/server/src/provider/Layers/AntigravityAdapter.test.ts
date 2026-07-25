@@ -912,7 +912,7 @@ describe("Antigravity process spawning and output ownership", () => {
             cwd: directory,
             dependencies,
           }),
-        ).rejects.toThrow("not one of npm's canonical Node shim templates");
+        ).rejects.toThrow("not one of npm's canonical Node or native-executable shim templates");
         await expect(
           startAntigravityTurnProcess({
             command: commandPath,
@@ -922,7 +922,7 @@ describe("Antigravity process spawning and output ownership", () => {
             dependencies,
             onFinalize,
           }),
-        ).rejects.toThrow("not one of npm's canonical Node shim templates");
+        ).rejects.toThrow("not one of npm's canonical Node or native-executable shim templates");
 
         expect(spawnProcess).not.toHaveBeenCalled();
         await expect(fs.access(sentinel)).rejects.toThrow();
