@@ -5440,7 +5440,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
 
         assert.strictEqual(status.status, "error");
         assert.strictEqual(status.available, false);
-        assert.match(status.message, /Windows command discovery was temporarily unavailable/);
+        assert.match(status.message ?? "", /Windows command discovery was temporarily unavailable/);
         assert.strictEqual(spawnCount, 0);
       }),
     );
