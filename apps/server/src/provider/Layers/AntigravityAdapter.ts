@@ -371,6 +371,20 @@ class AntigravityWindowsCommandLineError extends Error {
   }
 }
 
+class AntigravityTurnLaunchCancelledError extends Error {
+  constructor(readonly teardownCause?: unknown) {
+    super(
+      teardownCause === undefined
+        ? "Antigravity turn launch was cancelled before the process became active."
+        : `Antigravity turn launch was cancelled and its process could not be finalized cleanly: ${messageFromCause(
+            teardownCause,
+            "Unknown process finalization failure.",
+          )}`,
+    );
+    this.name = "AntigravityTurnLaunchCancelledError";
+  }
+}
+
 async function spawnAntigravityProcess(
   command: string,
   args: ReadonlyArray<string>,
@@ -1044,6 +1058,23 @@ const makeAntigravityAdapter = Effect.fn(function* (options: AntigravityAdapterL
       ? context.turns.find((turn) => turn.id === context.activeTurnId)
       : undefined;
 
+  const clearPendingTurnLaunch = (context: AntigravitySessionContext, turnId: TurnId): boolean => {
+    if (context.activeTurnId !== turnId) return false;
+    const turnIndex = context.turns.findIndex((turn) => turn.id === turnId);
+    if (turnIndex >= 0) context.turns.splice(turnIndex, 1);
+    delete context.activeLifecycle;
+    delete context.activeTurnId;
+    delete context.activePrompt;
+    delete context.eventFile;
+    const { activeTurnId: _activeTurnId, ...inactiveSession } = context.session;
+    context.session = {
+      ...inactiveSession,
+      status: context.stopped ? "closed" : "ready",
+      updatedAt: new Date().toISOString(),
+    };
+    return true;
+  };
+
   const emitTextItem = (
     context: AntigravitySessionContext,
     step: TranscriptStep,
@@ -1339,7 +1370,7 @@ const makeAntigravityAdapter = Effect.fn(function* (options: AntigravityAdapterL
   const sendTurn: AntigravityAdapterShape["sendTurn"] = (input) =>
     Effect.gen(function* () {
       const context = yield* requireSession(input.threadId);
-      if (context.activeLifecycle) {
+      if (context.activeTurnId) {
         return yield* new ProviderAdapterValidationError({
           provider: PROVIDER,
           operation: "turn/start",
@@ -1463,8 +1494,8 @@ const makeAntigravityAdapter = Effect.fn(function* (options: AntigravityAdapterL
       let lifecycle!: AntigravityTurnProcessLifecycle;
       const launchExit = yield* Effect.exit(
         Effect.tryPromise({
-          try: () =>
-            startAntigravityTurnProcess({
+          try: async () => {
+            lifecycle = await startAntigravityTurnProcess({
               command: context.binaryPath,
               args,
               cwd,
@@ -1593,22 +1624,42 @@ const makeAntigravityAdapter = Effect.fn(function* (options: AntigravityAdapterL
                 }
                 if (finalizationHookError) throw finalizationHookError;
               },
-            }),
+            });
+            const launchIsCurrent =
+              sessions.get(input.threadId) === context &&
+              context.activeTurnId === turnId &&
+              !context.interrupted &&
+              !context.stopped;
+            if (!launchIsCurrent) {
+              let teardownCause: unknown;
+              try {
+                await lifecycle.teardownAndFinalize();
+              } catch (cause) {
+                teardownCause = cause;
+              }
+              clearPendingTurnLaunch(context, turnId);
+              throw new AntigravityTurnLaunchCancelledError(teardownCause);
+            }
+            context.activeLifecycle = lifecycle;
+            if (!windowsCompatibilityMode) {
+              pollTimer = setInterval(
+                () => void pollHookFile(context),
+                options.pollIntervalMs ?? POLL_INTERVAL_MS,
+              );
+            }
+            offer({
+              ...base(context),
+              type: "turn.started",
+              payload: { model },
+            } satisfies ProviderRuntimeEvent);
+            return lifecycle;
+          },
           catch: (cause) => cause,
         }),
       );
       if (Exit.isFailure(launchExit)) {
         const cause = Cause.squash(launchExit.cause);
-        context.turns.pop();
-        delete context.activeTurnId;
-        delete context.activePrompt;
-        delete context.eventFile;
-        const { activeTurnId: _activeTurnId, ...inactiveSession } = context.session;
-        context.session = {
-          ...inactiveSession,
-          status: "ready",
-          updatedAt: new Date().toISOString(),
-        };
+        clearPendingTurnLaunch(context, turnId);
         if (runDir) {
           yield* Effect.promise(() =>
             fs.rm(runDir, { recursive: true, force: true }).catch(() => undefined),
@@ -1628,19 +1679,6 @@ const makeAntigravityAdapter = Effect.fn(function* (options: AntigravityAdapterL
           cause,
         });
       }
-      lifecycle = launchExit.value;
-      context.activeLifecycle = lifecycle;
-      if (!windowsCompatibilityMode) {
-        pollTimer = setInterval(
-          () => void pollHookFile(context),
-          options.pollIntervalMs ?? POLL_INTERVAL_MS,
-        );
-      }
-      offer({
-        ...base(context),
-        type: "turn.started",
-        payload: { model },
-      } satisfies ProviderRuntimeEvent);
       return {
         threadId: input.threadId,
         turnId,

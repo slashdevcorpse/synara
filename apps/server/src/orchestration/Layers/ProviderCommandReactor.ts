@@ -294,7 +294,6 @@ export function buildPromptReplayProviderInput(input: {
   const intro =
     "This provider uses Synara transcript replay for conversation continuity. Use the retained transcript as context for the latest user message.";
   const replayWindow = priorMessages.slice(-PROMPT_REPLAY_MAX_MESSAGES);
-  const windowOmissions = priorMessages.length - replayWindow.length;
   const renderedMessages = replayWindow.map((message) => {
     const role = message.role === "assistant" ? "Assistant" : "User";
     return `${role}:\n${boundedPromptReplayMessageText(message.text)}`;
@@ -313,7 +312,7 @@ export function buildPromptReplayProviderInput(input: {
 
   for (let index = renderedMessages.length - 1; index >= 0; index -= 1) {
     const candidateMessages = [renderedMessages[index]!, ...retainedMessages];
-    const candidateOmissions = windowOmissions + index;
+    const candidateOmissions = priorMessages.length - candidateMessages.length;
     const candidateSections = [
       intro,
       ...(candidateOmissions > 0 ? [promptReplayTruncationNotice(candidateOmissions)] : []),

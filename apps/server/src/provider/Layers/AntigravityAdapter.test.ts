@@ -1392,6 +1392,165 @@ describe("Antigravity process spawning and output ownership", () => {
 });
 
 describe("Antigravity active turn lifecycle", () => {
+  it.each(["interrupt", "stop", "restart"] as const)(
+    "fully finalizes a launch invalidated by %s before reporting the stale turn",
+    async (action) => {
+      const staleFake = makeFakeChild(42_030);
+      const activeFake = makeFakeChild(42_031);
+      const firstPreparation = deferred<{
+        command: string;
+        args: string[];
+        shell: false;
+      }>();
+      let prepareCalls = 0;
+      const prepareProcess = vi.fn((command: string, args: ReadonlyArray<string>) => {
+        prepareCalls += 1;
+        const prepared = { command, args: [...args], shell: false as const };
+        return prepareCalls === 1 ? firstPreparation.promise : prepared;
+      });
+      const spawnProcess = vi
+        .fn<AntigravityProcessDependencies["spawnProcess"]>()
+        .mockReturnValueOnce(staleFake.child)
+        .mockReturnValueOnce(activeFake.child);
+      const teardownProcessTree = vi.fn(async (child: ChildProcess) => {
+        if (child === staleFake.child) {
+          staleFake.emitClose(null, "SIGTERM");
+        } else if (child === activeFake.child) {
+          activeFake.emitClose(null, "SIGTERM");
+        }
+      });
+      const threadId = ThreadId.makeUnsafe(`antigravity-launch-${action}`);
+
+      await runWithAdapter(
+        {
+          ...fakeProcessDependencies(staleFake, {
+            platform: "win32",
+            prepareProcess,
+            spawnProcess,
+            teardownProcessTree,
+          }),
+        },
+        async (adapter) => {
+          await Effect.runPromise(
+            adapter.startSession({
+              provider: "antigravity",
+              threadId,
+              runtimeMode: "full-access",
+              providerOptions: { antigravity: { binaryPath: "fake-antigravity" } },
+            }),
+          );
+          const staleTurn = Effect.runPromise(
+            adapter.sendTurn({ threadId, input: "must not become active" }),
+          );
+          await waitFor(() => prepareProcess.mock.calls.length === 1);
+
+          if (action === "interrupt") {
+            await Effect.runPromise(adapter.interruptTurn(threadId));
+          } else if (action === "stop") {
+            await Effect.runPromise(adapter.stopSession(threadId));
+          } else {
+            await Effect.runPromise(
+              adapter.startSession({
+                provider: "antigravity",
+                threadId,
+                runtimeMode: "full-access",
+                providerOptions: { antigravity: { binaryPath: "fake-antigravity" } },
+              }),
+            );
+          }
+
+          firstPreparation.resolve({
+            command: "fake-antigravity",
+            args: [],
+            shell: false,
+          });
+          await expect(staleTurn).rejects.toThrow(
+            "Antigravity turn launch was cancelled before the process became active.",
+          );
+          expect(spawnProcess).toHaveBeenCalledOnce();
+          expect(teardownProcessTree).toHaveBeenCalledOnce();
+          expect(staleFake.child.listenerCount("close")).toBe(0);
+
+          if (action === "interrupt") {
+            const activeTurn = await Effect.runPromise(
+              adapter.sendTurn({ threadId, input: "valid follow-up" }),
+            );
+            const events = Array.from(
+              await Effect.runPromise(adapter.streamEvents.pipe(Stream.take(3), Stream.runCollect)),
+            );
+            expect(events.filter((event) => event.type === "turn.started")).toEqual([
+              expect.objectContaining({
+                type: "turn.started",
+                turnId: activeTurn.turnId,
+              }),
+            ]);
+            await Effect.runPromise(adapter.stopSession(threadId));
+            expect(teardownProcessTree).toHaveBeenCalledTimes(2);
+          } else {
+            const expectedEventCount = action === "stop" ? 3 : 4;
+            const events = Array.from(
+              await Effect.runPromise(
+                adapter.streamEvents.pipe(Stream.take(expectedEventCount), Stream.runCollect),
+              ),
+            );
+            expect(events.some((event) => event.type === "turn.started")).toBe(false);
+            expect(await Effect.runPromise(adapter.hasSession(threadId))).toBe(
+              action === "restart",
+            );
+          }
+        },
+      );
+    },
+  );
+
+  it("rejects a second turn while the first turn still owns async launch preparation", async () => {
+    const fake = makeFakeChild(42_032);
+    const preparation = deferred<{ command: string; args: string[]; shell: false }>();
+    const prepareProcess = vi.fn((command: string, args: ReadonlyArray<string>) =>
+      preparation.promise.then(() => ({ command, args: [...args], shell: false as const })),
+    );
+    const teardownProcessTree = vi.fn(async () => {
+      fake.emitClose(null, "SIGTERM");
+    });
+    const threadId = ThreadId.makeUnsafe("antigravity-launch-pending-owner");
+
+    await runWithAdapter(
+      {
+        ...fakeProcessDependencies(fake, {
+          platform: "win32",
+          prepareProcess,
+          teardownProcessTree,
+        }),
+      },
+      async (adapter) => {
+        await Effect.runPromise(
+          adapter.startSession({
+            provider: "antigravity",
+            threadId,
+            runtimeMode: "full-access",
+            providerOptions: { antigravity: { binaryPath: "fake-antigravity" } },
+          }),
+        );
+        const firstTurn = Effect.runPromise(
+          adapter.sendTurn({ threadId, input: "first pending turn" }),
+        );
+        await waitFor(() => prepareProcess.mock.calls.length === 1);
+
+        await expect(
+          Effect.runPromise(adapter.sendTurn({ threadId, input: "must stay queued upstream" })),
+        ).rejects.toThrow("An Antigravity turn is already active for this thread.");
+        expect(prepareProcess).toHaveBeenCalledOnce();
+
+        await Effect.runPromise(adapter.interruptTurn(threadId));
+        preparation.resolve({ command: "fake-antigravity", args: [], shell: false });
+        await expect(firstTurn).rejects.toThrow(
+          "Antigravity turn launch was cancelled before the process became active.",
+        );
+        expect(teardownProcessTree).toHaveBeenCalledOnce();
+      },
+    );
+  });
+
   it("fails visibly instead of publishing a truncated final response as complete", async () => {
     const fake = makeFakeChild();
 

@@ -4971,6 +4971,49 @@ describe("ProviderCommandReactor", () => {
     expect(replay?.length).toBeLessThanOrEqual(PROVIDER_PROMPT_REPLAY_MAX_INPUT_CHARS);
   });
 
+  it("sizes a 10-message omission notice from the actual non-contiguous replay selection", () => {
+    const now = new Date().toISOString();
+    const priorMessages = Array.from({ length: 11 }, (_, index) => ({
+      id: asMessageId(`prompt-replay-boundary-${index}`),
+      role: "user" as const,
+      text:
+        index === 9
+          ? "boundary retained context"
+          : index < 5
+            ? `outside replay window ${index}`
+            : `oversized replay message ${index} ${"x".repeat(4_000)}`,
+      turnId: null,
+      streaming: false,
+      source: "native" as const,
+      createdAt: now,
+      updatedAt: now,
+    }));
+    const currentMessage = {
+      id: asMessageId("prompt-replay-boundary-current"),
+      role: "user" as const,
+      text: "continue",
+      turnId: null,
+      streaming: false,
+      source: "native" as const,
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    const replay = buildPromptReplayProviderInput({
+      thread: { messages: [...priorMessages, currentMessage] },
+      currentMessageId: currentMessage.id,
+      messageText: currentMessage.text,
+      // The candidate with message 9 fits only if its notice incorrectly says
+      // nine omissions. Its correct ten-omission notice is one character longer.
+      maxChars: 379,
+    });
+
+    expect(replay).not.toBeNull();
+    expect(replay).toContain("Transcript truncated: 11 prior messages were omitted");
+    expect(replay).not.toContain("boundary retained context");
+    expect(replay?.length).toBeLessThanOrEqual(379);
+  });
+
   it("replays transcript context for an active prompt-replay session", async () => {
     const harness = await createHarness({
       threadModelSelection: {
