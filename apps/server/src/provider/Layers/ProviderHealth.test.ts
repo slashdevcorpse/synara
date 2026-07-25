@@ -75,6 +75,7 @@ import {
 import {
   isWindowsJobPreparedCommand,
   prepareResolvedWindowsProviderProcess,
+  prepareResolvedWindowsProviderProcessAsync,
   prepareWindowsProviderProcess,
   WINDOWS_JOB_LAUNCHER_EXECUTABLE,
   WINDOWS_JOB_LAUNCHER_PROTOCOL_VERSION,
@@ -5383,7 +5384,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
           platform: "win32",
           resolveCodexExecutable: () => ({ executable: shimPath }),
           prepareResolvedProcess: (command, args, options = {}) =>
-            prepareResolvedWindowsProviderProcess(command, args, {
+            prepareResolvedWindowsProviderProcessAsync(command, args, {
               ...options,
               platform: "win32",
               launcherPath,

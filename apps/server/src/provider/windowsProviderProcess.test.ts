@@ -5,6 +5,7 @@ import {
   containPreparedWindowsProviderProcess,
   isWindowsJobPreparedCommand,
   prepareResolvedWindowsProviderProcess,
+  prepareResolvedWindowsProviderProcessAsync,
   prepareWindowsProviderProcess,
   prepareWindowsProviderProcessAsync,
   resolveWindowsJobLauncherPath,
@@ -191,6 +192,28 @@ describe("Windows provider process containment", () => {
     ]);
     expect(prepared.args.join(" ").toLowerCase()).not.toContain("cmd.exe");
     expect(prepared.windowsVerbatimArguments).toBeUndefined();
+  });
+
+  it("prepares an already-resolved target asynchronously without provider rediscovery", async () => {
+    let asyncDiscoveryCalls = 0;
+    let failure: unknown;
+
+    try {
+      await prepareResolvedWindowsProviderProcessAsync("codex", ["--version"], {
+        platform: "win32",
+        launcherPath: launcher,
+        fileExists: (path) => path === launcher,
+        execFile: async () => {
+          asyncDiscoveryCalls += 1;
+          return { stdout: "C:\\tools\\codex.exe\r\n", status: 0 };
+        },
+      });
+    } catch (cause) {
+      failure = cause;
+    }
+
+    expect(asyncDiscoveryCalls).toBe(0);
+    expect(failure).toBeInstanceOf(WindowsProviderTargetNotResolvedError);
   });
 
   it("fails closed instead of falling back to cold sync discovery after a transient Node prewarm", async () => {

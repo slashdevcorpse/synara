@@ -122,7 +122,7 @@ import {
 } from "../providerMaintenanceOwnedResources";
 import {
   isWindowsJobPreparedCommand,
-  prepareResolvedWindowsProviderProcess,
+  prepareResolvedWindowsProviderProcessAsync,
   prepareWindowsProviderProcessAsync,
   WindowsProviderTargetNotResolvedError,
 } from "../windowsProviderProcess.ts";
@@ -1204,7 +1204,7 @@ const runProviderCommand = (
       try: () =>
         Promise.resolve(
           executableAlreadyResolved
-            ? (processOptions.prepareResolvedProcess ?? prepareResolvedWindowsProviderProcess)(
+            ? (processOptions.prepareResolvedProcess ?? prepareResolvedWindowsProviderProcessAsync)(
                 executable,
                 args,
                 { env, platform },
