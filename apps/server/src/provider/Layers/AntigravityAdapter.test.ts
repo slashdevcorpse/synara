@@ -1409,7 +1409,7 @@ describe("Antigravity active turn lifecycle", () => {
         return prepareCalls === 1 ? firstPreparation.promise : prepared;
       });
       const spawnProcess = vi
-        .fn<AntigravityProcessDependencies["spawnProcess"]>()
+        .fn<NonNullable<AntigravityProcessDependencies["spawnProcess"]>>()
         .mockReturnValueOnce(staleFake.child)
         .mockReturnValueOnce(activeFake.child);
       const teardownProcessTree = vi.fn(async (child: ChildProcess) => {
