@@ -70,7 +70,7 @@
     "clean": "rm -rf node_modules apps/*/node_modules packages/*/node_modules scripts/node_modules apps/*/dist apps/*/dist-electron packages/*/dist .turbo apps/*/.turbo packages/*/.turbo"
   },
   "devDependencies": {
-    "@babel/core": "7.29.7",
+    "@babel/core": "8.0.1",
     "@effect/language-service": "catalog:",
     "@types/node": "catalog:",
     "@vitest/coverage-v8": "catalog:",
