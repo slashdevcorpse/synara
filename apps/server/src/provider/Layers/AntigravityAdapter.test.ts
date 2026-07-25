@@ -16,7 +16,10 @@ import { ServerConfig } from "../../config";
 import type { ProviderMaintenanceOwnedResourceCoordinator } from "../providerMaintenanceOwnedResources";
 import { makeProviderProcessOwnerTracker } from "../providerProcessOwnerTracker.ts";
 import { AntigravityAdapter, type AntigravityAdapterShape } from "../Services/AntigravityAdapter";
-import { containPreparedWindowsProviderProcess } from "../windowsProviderProcess.ts";
+import {
+  containPreparedWindowsProviderProcess,
+  WindowsProviderShellLaunchError,
+} from "../windowsProviderProcess.ts";
 import {
   supervisePreparedNodeProcess,
   windowsJobNodeProcessSupervisor,
@@ -799,11 +802,18 @@ describe("Antigravity process spawning and output ownership", () => {
   );
 
   it.runIf(process.platform === "win32")(
-    "runs a real .cmd helper and turn from a path with spaces and non-ASCII",
+    "runs a canonical .cmd helper and turn from a path with spaces and non-ASCII without cmd.exe",
     async () => {
       const directory = await fs.mkdtemp(path.join(os.tmpdir(), "synara agy café 東京 "));
       const scriptPath = path.join(directory, "node_modules", "@synara", "agy", "bin", "agy.cjs");
-      const commandPath = path.join(directory, "echo args.cmd");
+      const packageManifestPath = path.join(
+        directory,
+        "node_modules",
+        "@synara",
+        "agy",
+        "package.json",
+      );
+      const commandPath = path.join(directory, "agy.cmd");
       const nodePath = path.join(directory, "node.exe");
       const values = [
         "ordinary",
@@ -828,6 +838,15 @@ describe("Antigravity process spawning and output ownership", () => {
         await fs.writeFile(
           scriptPath,
           `process.stdout.write(JSON.stringify(process.argv.slice(2)));process.stderr.write(${JSON.stringify(stderr)});`,
+        );
+        await fs.writeFile(
+          packageManifestPath,
+          JSON.stringify({
+            name: "@synara/agy",
+            bin: {
+              agy: "bin/agy.cjs",
+            },
+          }),
         );
         await fs.writeFile(
           commandPath,

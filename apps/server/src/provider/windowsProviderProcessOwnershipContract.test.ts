@@ -168,6 +168,19 @@ describe("Windows provider process ownership inventory", () => {
       path.join(serverSourceRoot, "codexAppServerManager.ts"),
       "utf8",
     );
+    const appServerSpawnStart = managerSource.indexOf("function spawnCodexAppServer");
+    const appServerSpawnEnd = managerSource.indexOf(
+      "async function resolveCodexLaunch",
+      appServerSpawnStart,
+    );
+    const appServerSpawnSource = managerSource.slice(appServerSpawnStart, appServerSpawnEnd);
+    expect(appServerSpawnStart).toBeGreaterThan(0);
+    expect(appServerSpawnEnd).toBeGreaterThan(appServerSpawnStart);
+    expect(appServerSpawnSource).toContain("prepareResolvedWindowsProviderProcess(");
+    expect(appServerSpawnSource).toContain("spawn(prepared.command, prepared.args");
+    expect(appServerSpawnSource).toContain("shell: prepared.shell");
+    expect(appServerSpawnSource).not.toContain("spawn(input.binaryPath");
+
     const resolveLaunchStart = managerSource.indexOf("async function resolveCodexLaunch");
     const resolveLaunchEnd = managerSource.indexOf(
       "export function normalizeCodexModelSlug",

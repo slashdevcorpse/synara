@@ -11,7 +11,7 @@ import {
   resolveWindowsCommandPathAsync as resolveRuntimeWindowsCommandPathAsync,
   type WindowsAsyncCommandDiscoveryInput,
 } from "@synara/shared/windowsProcess";
-import { parseCanonicalWindowsNpmNodeShim } from "@synara/shared/windowsNpmShim";
+import { parseCanonicalWindowsNpmNodeShimTarget } from "@synara/shared/windowsNpmShim";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -959,12 +959,15 @@ function windowsNpmShimLinksToPackageBin(input: {
   readonly packageBinTarget: string;
   readonly shimContents: string;
 }): boolean {
-  const packagePath = expectedNpmPackagePath(input.definition);
-  if (!packagePath) {
+  const target = parseCanonicalWindowsNpmNodeShimTarget(input.shimContents);
+  const packageName = input.definition.npmPackageName;
+  if (!target || !packageName) {
     return false;
   }
-  const expectedTarget = `node_modules/${packagePath}/${input.packageBinTarget}`.toLowerCase();
-  return parseCanonicalWindowsNpmNodeShim(input.shimContents)?.toLowerCase() === expectedTarget;
+  return (
+    target.packageName.toLowerCase() === packageName.toLowerCase() &&
+    target.packageBinTarget.toLowerCase() === input.packageBinTarget.toLowerCase()
+  );
 }
 
 function commandPathImplementation(platform: NodeJS.Platform): typeof NodePath.posix {
