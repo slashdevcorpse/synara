@@ -84,6 +84,12 @@ function npmShim(
   return isRegularAbsoluteWindowsFile(candidate, readStat) ? candidate : undefined;
 }
 
+function unresolvedOfficialAliasExecutable(configured: string, normalized: string): string {
+  return normalized === "cmd"
+    ? DEFAULT_COMMAND_CODE_COMMAND
+    : configured || DEFAULT_COMMAND_CODE_COMMAND;
+}
+
 /**
  * Resolve the configured Command Code command. On Windows, all official npm
  * aliases are considered and `.cmd` shims are returned explicitly so callers
@@ -140,16 +146,21 @@ export function resolveCommandCodeCliExecutableWithDiscovery(
     );
     if (candidate) return { executable: candidate };
   }
+  const executable = unresolvedOfficialAliasExecutable(configured, normalized);
+  const discoveryOutcome = unresolvedWindowsCommandDiscoveryOutcome(observations);
+  if (discoveryOutcome !== "not_found") {
+    return {
+      executable,
+      ...(discoveryOutcome ? { discoveryOutcome } : {}),
+    };
+  }
   for (const alias of orderedAliases) {
     const candidate = npmShim(appData, alias, readStat);
     if (candidate) return { executable: candidate };
   }
   return {
-    executable:
-      normalized === "cmd"
-        ? DEFAULT_COMMAND_CODE_COMMAND
-        : configured || DEFAULT_COMMAND_CODE_COMMAND,
-    discoveryOutcome: unresolvedWindowsCommandDiscoveryOutcome(observations),
+    executable,
+    discoveryOutcome,
   };
 }
 
@@ -197,16 +208,21 @@ export async function resolveCommandCodeCliExecutableWithDiscoveryAsync(
     );
     if (candidate) return { executable: candidate };
   }
+  const executable = unresolvedOfficialAliasExecutable(configured, normalized);
+  const discoveryOutcome = unresolvedWindowsCommandDiscoveryOutcome(observations);
+  if (discoveryOutcome !== "not_found") {
+    return {
+      executable,
+      ...(discoveryOutcome ? { discoveryOutcome } : {}),
+    };
+  }
   for (const alias of orderedAliases) {
     const candidate = npmShim(appData, alias, readStat);
     if (candidate) return { executable: candidate };
   }
   return {
-    executable:
-      normalized === "cmd"
-        ? DEFAULT_COMMAND_CODE_COMMAND
-        : configured || DEFAULT_COMMAND_CODE_COMMAND,
-    discoveryOutcome: unresolvedWindowsCommandDiscoveryOutcome(observations),
+    executable,
+    discoveryOutcome,
   };
 }
 

@@ -4,6 +4,7 @@ import {
   resolveCommandCodeCliExecutable,
   resolveCommandCodeCliExecutableAsync,
   resolveCommandCodeCliExecutableWithDiscovery,
+  resolveCommandCodeCliExecutableWithDiscoveryAsync,
 } from "./commandCodeCliExecutable";
 
 function regularFiles(...paths: string[]) {
@@ -166,6 +167,85 @@ describe("resolveCommandCodeCliExecutable", () => {
         statSync: regularFiles(shim),
       }),
     ).toBe(shim);
+  });
+
+  it("does not probe the APPDATA fallback after a transient discovery failure", () => {
+    const shim = "C:\\Users\\test\\AppData\\Roaming\\npm\\commandcode.cmd";
+    const statSync = regularFiles(shim);
+    const spawnSync = vi.fn((_command: string, args: ReadonlyArray<string>) =>
+      args[0] === "commandcode"
+        ? {
+            error: Object.assign(new Error("where.exe timed out"), { code: "ETIMEDOUT" }),
+            stdout: "",
+            status: null,
+          }
+        : { stdout: "", status: 1 },
+    );
+
+    expect(
+      resolveCommandCodeCliExecutableWithDiscovery("commandcode", {
+        platform: "win32",
+        cwd: "C:\\repo",
+        env: {
+          SystemRoot: "C:\\Windows",
+          APPDATA: "C:\\Users\\test\\AppData\\Roaming",
+        },
+        spawnSync,
+        statSync,
+      }),
+    ).toEqual({ executable: "commandcode", discoveryOutcome: "transient_failure" });
+    expect(spawnSync).toHaveBeenCalledTimes(4);
+    expect(statSync).not.toHaveBeenCalled();
+  });
+
+  it("uses the APPDATA fallback asynchronously after definitive not-found discovery", async () => {
+    const shim = "C:\\Users\\test\\AppData\\Roaming\\npm\\commandcode.cmd";
+    const statSync = regularFiles(shim);
+    const execFile = vi.fn(async () => ({ stdout: "", status: 1 }));
+
+    await expect(
+      resolveCommandCodeCliExecutableWithDiscoveryAsync("commandcode", {
+        platform: "win32",
+        cwd: "C:\\repo",
+        env: {
+          SystemRoot: "C:\\Windows",
+          APPDATA: "C:\\Users\\test\\AppData\\Roaming",
+        },
+        execFile,
+        statSync,
+      }),
+    ).resolves.toEqual({ executable: shim });
+    expect(execFile).toHaveBeenCalledTimes(4);
+    expect(statSync).toHaveBeenCalledWith(shim);
+  });
+
+  it("does not probe the APPDATA fallback asynchronously after a transient failure", async () => {
+    const shim = "C:\\Users\\test\\AppData\\Roaming\\npm\\commandcode.cmd";
+    const statSync = regularFiles(shim);
+    const execFile = vi.fn(async (_command: string, args: ReadonlyArray<string>) =>
+      args[0] === "commandcode"
+        ? {
+            error: Object.assign(new Error("where.exe timed out"), { code: "ETIMEDOUT" }),
+            stdout: "",
+            status: null,
+          }
+        : { stdout: "", status: 1 },
+    );
+
+    await expect(
+      resolveCommandCodeCliExecutableWithDiscoveryAsync("commandcode", {
+        platform: "win32",
+        cwd: "C:\\repo",
+        env: {
+          SystemRoot: "C:\\Windows",
+          APPDATA: "C:\\Users\\test\\AppData\\Roaming",
+        },
+        execFile,
+        statSync,
+      }),
+    ).resolves.toEqual({ executable: "commandcode", discoveryOutcome: "transient_failure" });
+    expect(execFile).toHaveBeenCalledTimes(4);
+    expect(statSync).not.toHaveBeenCalled();
   });
 
   it("preserves definitive not-found discovery across every official alias", () => {
