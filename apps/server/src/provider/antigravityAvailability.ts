@@ -1,6 +1,6 @@
-export const ANTIGRAVITY_WINDOWS_UNAVAILABLE_MESSAGE =
-  "Antigravity is unavailable on Windows because Synara's current capture integration requires a persistent provider plugin and a cmd.exe hook. Synara will not install or launch that integration on Windows.";
+export const ANTIGRAVITY_WINDOWS_COMPATIBILITY_MESSAGE =
+  "Antigravity is available on Windows in native compatibility mode. Synara starts each request as a new Antigravity CLI conversation in its default project, captures final response text, and passes a bounded recent Synara transcript as a CLI command-line argument for follow-ups; long history is truncated. That bounded text may be visible to local process-inspection tools while the request runs. Live structured events, usage telemetry, and native resume are unavailable. Synara does not install hooks or read or modify Antigravity configuration or transcript files. Antigravity may retain its normal local conversation records.";
 
-export function isAntigravityAvailableOnPlatform(platform: NodeJS.Platform): boolean {
-  return platform !== "win32";
+export function isAntigravityWindowsCompatibilityMode(platform: NodeJS.Platform): boolean {
+  return platform === "win32";
 }

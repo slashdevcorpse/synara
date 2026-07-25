@@ -18,12 +18,13 @@ export interface QueuedTurnPromotionRepositoryShape {
     queuedEventSequence: number,
   ) => Effect.Effect<Option.Option<QueuedTurnPromotion>, PersistenceSqlError>;
   readonly enqueue: (input: {
+    readonly providerSessionThreadId: string;
     readonly queuedEventSequence: number;
     readonly threadId: string;
     readonly messageId: string;
     readonly dispatchMode: "queue" | "steer";
     readonly createdAt: string;
-  }) => Effect.Effect<void, PersistenceSqlError>;
+  }) => Effect.Effect<boolean, PersistenceSqlError>;
   readonly claimNext: (input: {
     readonly threadId: string;
     readonly claimOwner: string;
@@ -37,6 +38,7 @@ export interface QueuedTurnPromotionRepositoryShape {
    * rows as `queue`, so those rows remain strict FIFO.
    */
   readonly claimNextForThreads: (input: {
+    readonly providerSessionThreadId: string;
     readonly threadIds: ReadonlyArray<string>;
     readonly claimOwner: string;
     readonly claimedAt: string;
@@ -69,6 +71,28 @@ export interface QueuedTurnPromotionRepositoryShape {
     readonly updatedAt: string;
     readonly throughEventSequence?: number | undefined;
   }) => Effect.Effect<void, PersistenceSqlError>;
+  /**
+   * Atomically persist a monotonic cancellation fence for one provider
+   * session and tombstone every already-materialized promotion in that
+   * session through the same orchestration event sequence.
+   */
+  readonly cancelProviderSessionThrough: (input: {
+    readonly compatibilityIncidentKey: string;
+    readonly runtimeEventSequence: number;
+    readonly runtimeEventId: string;
+    readonly providerSessionThreadId: string;
+    readonly memberThreadIds: ReadonlyArray<string>;
+    readonly throughEventSequence: number;
+    readonly updatedAt: string;
+  }) => Effect.Effect<void, PersistenceSqlError>;
+  /**
+   * True when a provider-session terminal barrier covers a queued source
+   * event that has not necessarily materialized its promotion row yet.
+   */
+  readonly isQueuedEventCancelledByProviderSessionFence: (input: {
+    readonly providerSessionThreadId: string;
+    readonly queuedEventSequence: number;
+  }) => Effect.Effect<boolean, PersistenceSqlError>;
   readonly hasPendingMessage: (input: {
     readonly threadId: string;
     readonly messageId: string;

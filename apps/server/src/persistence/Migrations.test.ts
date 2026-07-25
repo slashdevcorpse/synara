@@ -8,6 +8,10 @@ import { MigrationSchemaTooNewError } from "./Errors.ts";
 import * as NodeSqliteClient from "./NodeSqliteClient.ts";
 import DurableProviderCommandDeliveryMigration from "./Migrations/064_DurableProviderCommandDelivery.ts";
 import ProjectionThreadsGatewayProvenanceMigration from "./Migrations/071_ProjectionThreadsGatewayProvenance.ts";
+import {
+  PROVIDER_COMMAND_REACTOR_RUNTIME_CONSUMER,
+  PROVIDER_RUNTIME_INGESTION_CONSUMER,
+} from "./Services/ProviderRuntimeEvents.ts";
 
 const layer = it.layer(Layer.mergeAll(NodeSqliteClient.layerMemory()));
 
@@ -291,6 +295,7 @@ managedAttachmentsFreshLayer("managed attachment migration on a fresh database",
       assert.deepInclude(executed, [65, "DurableQueuedTurnPromotions"]);
       assert.deepInclude(executed, [66, "DurableProviderRuntimeEvents"]);
       assert.deepInclude(executed, [67, "ProviderDeliveryReconciliation"]);
+      assert.deepInclude(executed, [80, "DurableProviderRuntimePromotionCutoffs"]);
 
       const tables = yield* sql<{ readonly name: string }>`
         SELECT name
@@ -311,6 +316,74 @@ managedAttachmentsFreshLayer("managed attachment migration on a fresh database",
           AND name IN ('orchestration_consumer_state', 'orchestration_event_deliveries')
       `;
       assert.strictEqual(providerDeliveryTables[0]?.count, 2);
+    }),
+  );
+});
+
+const providerRuntimeCutoffUpgradeLayer = it.layer(Layer.mergeAll(NodeSqliteClient.layerMemory()));
+
+providerRuntimeCutoffUpgradeLayer("provider runtime promotion cutoff migration", (it) => {
+  it.effect("baselines unknowable legacy rows without cancelling later queued work", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* runMigrations({ toMigrationInclusive: 79 });
+      const legacyRuntimeRows = yield* sql<{ readonly sequence: number }>`
+        INSERT INTO provider_runtime_events (
+          event_id, thread_id, turn_id, lifecycle_generation, event_type,
+          event_json, persisted_at
+        ) VALUES (
+          'runtime-legacy-opencode-schema', 'thread-runtime-cutoff-upgrade',
+          'turn-runtime-cutoff-upgrade', 'generation-runtime-cutoff-upgrade',
+          'turn.completed', '{}', '2026-07-24T00:00:00.000Z'
+        )
+        RETURNING sequence
+      `;
+      const queuedRows = yield* sql<{ readonly sequence: number }>`
+        INSERT INTO orchestration_events (
+          event_id, aggregate_kind, stream_id, stream_version, event_type,
+          occurred_at, command_id, causation_event_id, correlation_id,
+          actor_kind, payload_json, metadata_json
+        ) VALUES (
+          'event-runtime-cutoff-upgrade-later', 'thread',
+          'thread-runtime-cutoff-upgrade', 0, 'thread.turn-queued',
+          '2026-07-24T00:01:00.000Z', 'cmd-runtime-cutoff-upgrade-later',
+          NULL, NULL, 'user', '{}', '{}'
+        )
+        RETURNING sequence
+      `;
+      yield* sql`
+        INSERT INTO queued_turn_promotions (
+          queued_event_sequence, thread_id, message_id, dispatch_mode, state,
+          claim_owner, claimed_at, claim_expires_at, attempt_count,
+          created_at, updated_at, promoted_at
+        ) VALUES (
+          ${queuedRows[0]!.sequence}, 'thread-runtime-cutoff-upgrade',
+          'message-runtime-cutoff-upgrade', 'queue', 'queued',
+          NULL, NULL, NULL, 0, '2026-07-24T00:01:00.000Z',
+          '2026-07-24T00:01:00.000Z', NULL
+        )
+      `;
+
+      yield* runMigrations();
+
+      const cursor = yield* sql<{ readonly sequence: number }>`
+        SELECT last_acked_sequence AS sequence
+        FROM provider_runtime_event_consumers
+        WHERE consumer_name = ${PROVIDER_COMMAND_REACTOR_RUNTIME_CONSUMER}
+      `;
+      assert.strictEqual(cursor[0]?.sequence, legacyRuntimeRows[0]?.sequence);
+      const promotion = yield* sql<{ readonly state: string }>`
+        SELECT state
+        FROM queued_turn_promotions
+        WHERE queued_event_sequence = ${queuedRows[0]!.sequence}
+      `;
+      assert.deepStrictEqual(promotion, [{ state: "queued" }]);
+      const cutoffColumns = yield* sql<{ readonly name: string }>`
+        SELECT name
+        FROM pragma_table_info('provider_runtime_events')
+        WHERE name = 'orchestration_cutoff_sequence'
+      `;
+      assert.lengthOf(cutoffColumns, 1);
     }),
   );
 });
@@ -353,10 +426,13 @@ managedAttachmentsLegacyLayer("managed attachment migration after private migrat
         [75, "ProjectionTurnSummaries"],
         [76, "ReconcileFailedPendingTurnStarts"],
         [77, "BackfillQuarantinedTurnPromotions"],
+        [78, "DurableQueuedTurnCancellationFences"],
+        [79, "ProviderCommandRuntimeConsumer"],
+        [80, "DurableProviderRuntimePromotionCutoffs"],
       ]);
 
       const tracker = yield* trackerRows(sql);
-      assert.deepStrictEqual(tracker.slice(-24), [
+      assert.deepStrictEqual(tracker.slice(-27), [
         { migration_id: 54, name: "DurableProviderCommandDelivery" },
         { migration_id: 55, name: "ManagedAttachments" },
         { migration_id: 56, name: "CommandReceiptFingerprints" },
@@ -381,11 +457,32 @@ managedAttachmentsLegacyLayer("managed attachment migration after private migrat
         { migration_id: 75, name: "ProjectionTurnSummaries" },
         { migration_id: 76, name: "ReconcileFailedPendingTurnStarts" },
         { migration_id: 77, name: "BackfillQuarantinedTurnPromotions" },
+        { migration_id: 78, name: "DurableQueuedTurnCancellationFences" },
+        { migration_id: 79, name: "ProviderCommandRuntimeConsumer" },
+        { migration_id: 80, name: "DurableProviderRuntimePromotionCutoffs" },
       ]);
       const preserved = yield* sql<{ readonly count: number }>`
         SELECT COUNT(*) AS count FROM orchestration_consumer_state
       `;
       assert.strictEqual(preserved[0]?.count, 1);
+      const runtimeConsumers = yield* sql<{
+        readonly consumerName: string;
+        readonly lastAckedSequence: number;
+      }>`
+        SELECT consumer_name AS "consumerName", last_acked_sequence AS "lastAckedSequence"
+        FROM provider_runtime_event_consumers
+        ORDER BY consumer_name ASC
+      `;
+      assert.deepStrictEqual(runtimeConsumers, [
+        {
+          consumerName: PROVIDER_COMMAND_REACTOR_RUNTIME_CONSUMER,
+          lastAckedSequence: 0,
+        },
+        {
+          consumerName: PROVIDER_RUNTIME_INGESTION_CONSUMER,
+          lastAckedSequence: 0,
+        },
+      ]);
     }),
   );
 });

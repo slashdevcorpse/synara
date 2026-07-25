@@ -239,22 +239,6 @@ describe("Command Code CLI helpers", () => {
     assert.ok(!args.includes("--plan"));
   });
 
-  it("prepares a Command Code npm shim through cmd.exe deterministically", () => {
-    const prepared = prepareWindowsSafeProcess(
-      "C:\\tools\\commandcode.cmd",
-      ["-p", "--trust", "--model", "gpt-5.6-sol"],
-      {
-        platform: "win32",
-        cwd: "C:\\repo",
-        env: { SystemRoot: "C:\\Windows", ComSpec: "C:\\Windows\\System32\\cmd.exe" },
-      },
-    );
-    assert.strictEqual(prepared.command, "C:\\Windows\\System32\\cmd.exe");
-    assert.deepStrictEqual(prepared.args.slice(0, 4), ["/d", "/s", "/v:off", "/c"]);
-    assert.match(prepared.args[4] ?? "", /call "C:\\tools\\commandcode\.cmd"/u);
-    assert.strictEqual(prepared.windowsVerbatimArguments, true);
-  });
-
   it.effect("propagates Windows, macOS, and Linux launch semantics through the adapter", () =>
     Effect.scoped(
       Effect.gen(function* () {

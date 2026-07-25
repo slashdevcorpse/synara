@@ -1,4 +1,7 @@
-import type { WindowsCommandDiscoveryObservation } from "@synara/shared/windowsProcess";
+import {
+  prepareWindowsSafeProcess,
+  type WindowsCommandDiscoveryObservation,
+} from "@synara/shared/windowsProcess";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -11,6 +14,7 @@ import {
   resolveWindowsJobLauncherPath,
   WINDOWS_JOB_LAUNCHER_EXECUTABLE,
   WindowsProviderBatchShimLaunchError,
+  WindowsProviderShellLaunchError,
   WindowsProviderTargetNotResolvedError,
 } from "./windowsProviderProcess.ts";
 
@@ -19,6 +23,12 @@ const shimPath = "C:\\Users\\Test\\AppData\\Roaming\\npm\\codex.cmd";
 const shimDirectory = "C:\\Users\\Test\\AppData\\Roaming\\npm";
 const packageTarget =
   "C:\\Users\\Test\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\bin\\codex.js";
+const packageDirectory = "C:\\Users\\Test\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex";
+const packageManifestPath = `${packageDirectory}\\package.json`;
+const packageManifestContents = JSON.stringify({
+  name: "@openai/codex",
+  bin: { codex: "bin/codex.js" },
+});
 const pathNode = "C:\\Program Files\\nodejs\\node.exe";
 
 function npmCmdShim(target = "node_modules\\@openai\\codex\\bin\\codex.js"): string {
@@ -45,6 +55,16 @@ function npmCmdShim(target = "node_modules\\@openai\\codex\\bin\\codex.js"): str
 
 function hostNpmCmdShim(): string {
   return `@ECHO off\r\n"%~dp0\\node.exe" "%~dp0\\node_modules\\@openai\\codex\\bin\\codex.js" %*\r\n`;
+}
+
+function readCanonicalCodexShimFile(
+  path: string,
+  expectedShimPath = shimPath,
+  shimContents = npmCmdShim(),
+): string | undefined {
+  if (path === expectedShimPath) return shimContents;
+  if (path === packageManifestPath) return packageManifestContents;
+  return undefined;
 }
 
 describe("Windows provider process containment", () => {
@@ -101,8 +121,9 @@ describe("Windows provider process containment", () => {
         arch: "x64",
         controlDirectory: "C:\\Temp",
         launcherPath: launcher,
-        fileExists: (path) => [launcher, shimPath, packageTarget, pathNode].includes(path),
-        readFileString: (path) => (path === shimPath ? npmCmdShim() : undefined),
+        fileExists: (path) =>
+          [launcher, shimPath, packageTarget, packageManifestPath, pathNode].includes(path),
+        readFileString: readCanonicalCodexShimFile,
         realPath: (path) => path,
         spawnSync: (_command, args) => {
           if (args[0] === "codex") {
@@ -155,8 +176,10 @@ describe("Windows provider process containment", () => {
         controlDirectory: "C:\\Temp",
         launcherPath: launcher,
         fileExists: (path) =>
-          [launcher, shimPath, packageTarget, nodeShim, pathNode].includes(path),
-        readFileString: (path) => (path === shimPath ? npmCmdShim() : undefined),
+          [launcher, shimPath, packageTarget, packageManifestPath, nodeShim, pathNode].includes(
+            path,
+          ),
+        readFileString: readCanonicalCodexShimFile,
         realPath: (path) => path,
         execFile: async (_command, args) => {
           execFileCalls.push(args[0] ?? "");
@@ -224,8 +247,9 @@ describe("Windows provider process containment", () => {
         platform: "win32",
         arch: "x64",
         launcherPath: launcher,
-        fileExists: (path) => [launcher, shimPath, packageTarget].includes(path),
-        readFileString: (path) => (path === shimPath ? npmCmdShim() : undefined),
+        fileExists: (path) =>
+          [launcher, shimPath, packageTarget, packageManifestPath].includes(path),
+        readFileString: readCanonicalCodexShimFile,
         realPath: (path) => path,
         execFile: async (_command, args) =>
           args[0] === "codex"
@@ -264,8 +288,9 @@ describe("Windows provider process containment", () => {
       cwd: "C:\\Users\\Test\\AppData\\Roaming",
       controlDirectory: "C:\\Temp",
       launcherPath: launcher,
-      fileExists: (path) => [launcher, batShimPath, packageTarget, siblingNode].includes(path),
-      readFileString: (path) => (path === batShimPath ? hostNpmCmdShim() : undefined),
+      fileExists: (path) =>
+        [launcher, batShimPath, packageTarget, packageManifestPath, siblingNode].includes(path),
+      readFileString: (path) => readCanonicalCodexShimFile(path, batShimPath, hostNpmCmdShim()),
       realPath: (path) => path,
       spawnSync,
     });
@@ -302,17 +327,140 @@ describe("Windows provider process containment", () => {
     );
   });
 
+  it("fails closed when package.json does not prove the shim alias and target", () => {
+    expect(() =>
+      prepareResolvedWindowsProviderProcess(shimPath, [], {
+        platform: "win32",
+        arch: "x64",
+        launcherPath: launcher,
+        fileExists: (path) =>
+          [launcher, shimPath, packageTarget, packageManifestPath, pathNode].includes(path),
+        readFileString: (path) =>
+          path === shimPath
+            ? npmCmdShim()
+            : path === packageManifestPath
+              ? JSON.stringify({
+                  name: "@openai/codex",
+                  bin: { codex: "bin/other.js" },
+                })
+              : undefined,
+        realPath: (path) => path,
+      }),
+    ).toThrow(
+      expect.objectContaining({
+        name: "WindowsProviderBatchShimLaunchError",
+        reason: "package_manifest_bin_mismatch",
+      }),
+    );
+  });
+
+  it("uses a separately bounded reader for package manifests larger than the shim limit", () => {
+    const largeManifest = JSON.stringify({
+      name: "@openai/codex",
+      description: "x".repeat(70 * 1024),
+      bin: { codex: "bin/codex.js" },
+    });
+    const prepared = prepareResolvedWindowsProviderProcess(shimPath, ["app-server"], {
+      platform: "win32",
+      arch: "x64",
+      launcherPath: launcher,
+      fileExists: (path) =>
+        [launcher, shimPath, packageTarget, packageManifestPath, pathNode].includes(path),
+      readFileString: (path) => (path === shimPath ? npmCmdShim() : undefined),
+      readPackageManifestString: (path) =>
+        path === packageManifestPath ? largeManifest : undefined,
+      realPath: (path) => path,
+      spawnSync: () => ({ stdout: `${pathNode}\r\n`, status: 0 }),
+    });
+
+    expect(prepared.args.slice(7)).toEqual([pathNode, packageTarget, "app-server"]);
+  });
+
+  it("fails closed when the proven target resolves outside its package root", () => {
+    const escapedTarget =
+      "C:\\Users\\Test\\AppData\\Roaming\\npm\\node_modules\\other\\bin\\codex.js";
+    let failure: unknown;
+    try {
+      prepareResolvedWindowsProviderProcess(shimPath, [], {
+        platform: "win32",
+        arch: "x64",
+        launcherPath: launcher,
+        fileExists: (path) =>
+          [
+            launcher,
+            shimPath,
+            packageTarget,
+            escapedTarget,
+            packageManifestPath,
+            pathNode,
+          ].includes(path),
+        readFileString: readCanonicalCodexShimFile,
+        realPath: (path) => (path === packageTarget ? escapedTarget : path),
+        spawnSync: () => ({ stdout: `${pathNode}\r\n`, status: 0 }),
+      });
+    } catch (cause) {
+      failure = cause;
+    }
+
+    expect(failure).toBeInstanceOf(WindowsProviderBatchShimLaunchError);
+    expect((failure as WindowsProviderBatchShimLaunchError).reason).toBe("target_outside_package");
+  });
+
+  it("preserves spaces, Unicode paths, and argv while unwrapping a proven npm shim", () => {
+    const unicodeRoot = "C:\\Users\\Test User\\工具\\npm";
+    const unicodeShim = `${unicodeRoot}\\codex.cmd`;
+    const unicodePackage = `${unicodeRoot}\\node_modules\\@openai\\codex`;
+    const unicodeManifest = `${unicodePackage}\\package.json`;
+    const unicodeTarget = `${unicodePackage}\\bin\\codex.js`;
+    const unicodeNode = `${unicodeRoot}\\node.exe`;
+    const prepared = prepareResolvedWindowsProviderProcess(
+      unicodeShim,
+      ["app-server", "--label", "hello world", "ユニコード"],
+      {
+        platform: "win32",
+        arch: "x64",
+        launcherPath: launcher,
+        fileExists: (path) =>
+          [launcher, unicodeShim, unicodeManifest, unicodeTarget, unicodeNode].includes(path),
+        readFileString: (path) =>
+          path === unicodeShim
+            ? npmCmdShim()
+            : path === unicodeManifest
+              ? packageManifestContents
+              : undefined,
+        realPath: (path) => path,
+      },
+    );
+
+    expect(prepared.args.slice(7)).toEqual([
+      unicodeNode,
+      unicodeTarget,
+      "app-server",
+      "--label",
+      "hello world",
+      "ユニコード",
+    ]);
+    expect(prepared.shell).toBe(false);
+    expect(prepared.windowsVerbatimArguments).toBeUndefined();
+  });
+
   it.each([
     {
       label: "missing package target",
       reason: "target_not_file",
-      existingFiles: [launcher, shimPath],
+      existingFiles: [launcher, shimPath, packageManifestPath],
       nodeDiscovery: { stdout: `${pathNode}\r\n`, status: 0 },
     },
     {
       label: "missing native Node runtime",
       reason: "native_node_not_found",
-      existingFiles: [launcher, shimPath, packageTarget, "C:\\tools\\node.cmd"],
+      existingFiles: [
+        launcher,
+        shimPath,
+        packageTarget,
+        packageManifestPath,
+        "C:\\tools\\node.cmd",
+      ],
       nodeDiscovery: { stdout: "C:\\tools\\node.cmd\r\n", status: 0 },
     },
   ])("fails closed for a $label", ({ reason, existingFiles, nodeDiscovery }) => {
@@ -323,7 +471,7 @@ describe("Windows provider process containment", () => {
         arch: "x64",
         launcherPath: launcher,
         fileExists: (path) => existingFiles.includes(path),
-        readFileString: () => npmCmdShim(),
+        readFileString: readCanonicalCodexShimFile,
         realPath: (path) => path,
         spawnSync: () => nodeDiscovery,
       });
@@ -335,8 +483,8 @@ describe("Windows provider process containment", () => {
     expect((failure as WindowsProviderBatchShimLaunchError).reason).toBe(reason);
   });
 
-  it("preserves the existing cmd.exe verbatim argument mode", () => {
-    expect(
+  it("rejects prepared cmd.exe provider launches instead of preserving shell execution", () => {
+    expect(() =>
       containPreparedWindowsProviderProcess(
         {
           command: "C:\\Windows\\System32\\cmd.exe",
@@ -352,23 +500,89 @@ describe("Windows provider process containment", () => {
           launcherPath: launcher,
           fileExists: () => true,
         },
-      ).args,
-    ).toEqual([
-      "--protocol",
-      "2",
-      "--argument-mode",
-      "verbatim",
-      "--control-file",
-      expect.stringMatching(/^C:\\Temp\\synara-job-control-/u),
-      "--",
-      "C:\\Windows\\System32\\cmd.exe",
-      "/d",
-      "/s",
-      "/v:off",
-      "/c",
-      'call "C:\\tools\\agent.cmd" "hello"',
-    ]);
+      ),
+    ).toThrow(WindowsProviderShellLaunchError);
   });
+
+  it("rejects batch-wrapper provenance even when ComSpec has a custom executable name", () => {
+    const prepared = prepareWindowsSafeProcess(
+      "C:\\tools\\agent.cmd",
+      ["--flag", "value with spaces"],
+      {
+        platform: "win32",
+        env: { ComSpec: "C:\\Tools\\custom-shell.exe" },
+      },
+    );
+    expect(prepared.command).toBe("C:\\Tools\\custom-shell.exe");
+    expect(prepared.windowsVerbatimArguments).toBe(true);
+
+    expect(() =>
+      containPreparedWindowsProviderProcess(prepared, {
+        platform: "win32",
+        arch: "x64",
+        launcherPath: launcher,
+        fileExists: () => true,
+      }),
+    ).toThrow(WindowsProviderShellLaunchError);
+  });
+
+  it.each(["C:\\tools\\provider.cmd", "C:\\tools\\provider.bat"])(
+    "rejects an unverified raw batch provider target: %s",
+    (command) => {
+      expect(() =>
+        containPreparedWindowsProviderProcess(
+          { command, args: [], shell: false },
+          {
+            platform: "win32",
+            arch: "x64",
+            launcherPath: launcher,
+            fileExists: () => true,
+          },
+        ),
+      ).toThrow(WindowsProviderShellLaunchError);
+    },
+  );
+
+  it.each([
+    "C:\\tools\\provider.cmd. ",
+    "C:\\tools\\provider.bat .. ",
+    "C:\\Windows\\System32\\cmd.exe. ",
+    "C:\\Windows\\System32\\cmd.com .. ",
+  ])("rejects a Windows-normalized raw shell alias: %s", (command) => {
+    expect(() =>
+      containPreparedWindowsProviderProcess(
+        { command, args: [], shell: false },
+        {
+          platform: "win32",
+          arch: "x64",
+          launcherPath: launcher,
+          fileExists: () => true,
+        },
+      ),
+    ).toThrow(WindowsProviderShellLaunchError);
+  });
+
+  it.each(["codex.exe", "commandcode.exe", "opencode.exe", "droid.exe", "agy.exe"])(
+    "keeps native %s launches shell-free and Job-contained",
+    (name) => {
+      const target = `C:\\Program Files\\Provider Tools\\${name}`;
+      const wrapped = containPreparedWindowsProviderProcess(
+        { command: target, args: ["--flag", "value with spaces", "ユニコード"], shell: false },
+        {
+          platform: "win32",
+          arch: "x64",
+          launcherPath: launcher,
+          fileExists: () => true,
+        },
+      );
+
+      expect(wrapped.command).toBe(launcher);
+      expect(wrapped.args.slice(7)).toEqual([target, "--flag", "value with spaces", "ユニコード"]);
+      expect(wrapped.shell).toBe(false);
+      expect(wrapped.windowsVerbatimArguments).toBeUndefined();
+      expect(wrapped.args.join(" ").toLowerCase()).not.toContain("cmd.exe");
+    },
+  );
 
   it("resolves an explicit relative target against the provider cwd", () => {
     const wrapped = containPreparedWindowsProviderProcess(

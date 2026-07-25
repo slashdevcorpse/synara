@@ -19,7 +19,7 @@ import { SYNARA_CODEX_HOME_OVERLAY_DIR } from "../../codexHomePaths";
 import { ServerConfig } from "../../config";
 import { ServerSettingsService } from "../../serverSettings";
 import type { ProcessTreeKiller } from "../../terminal/processTreeKiller.ts";
-import { ANTIGRAVITY_WINDOWS_UNAVAILABLE_MESSAGE } from "../antigravityAvailability.ts";
+import { ANTIGRAVITY_WINDOWS_COMPATIBILITY_MESSAGE } from "../antigravityAvailability.ts";
 import { ProviderHealth } from "../Services/ProviderHealth";
 import { ProviderService, type ProviderServiceShape } from "../Services/ProviderService";
 import {
@@ -3093,7 +3093,7 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
       });
     });
 
-    it.effect("keeps Windows Antigravity unavailable and non-actionable", () =>
+    it.effect("keeps Windows Antigravity available with compatibility guidance", () =>
       Effect.gen(function* () {
         const fileSystem = yield* FileSystem.FileSystem;
         const baseDir = yield* fileSystem.makeTempDirectoryScoped({
@@ -3111,18 +3111,26 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
             },
           },
         } satisfies typeof DEFAULT_SERVER_SETTINGS;
-        let spawnCount = 0;
+        const spawnedArgs: string[] = [];
         const layer = makeProviderHealthLive({
           platform: "win32",
-          prepareProcess: prepareContainedWindowsProviderForTest,
+          prepareProcess: (command, args) => ({
+            command,
+            args: [...args],
+            shell: false,
+            windowsHide: true,
+          }),
         }).pipe(
           Layer.provideMerge(providerServiceWithoutRuntimesLayer),
           Layer.provideMerge(ServerSettingsService.layerTest(settings)),
           Layer.provideMerge(ServerConfig.layerTest(process.cwd(), baseDir)),
           Layer.provideMerge(
-            mockSpawnerLayer(() => {
-              spawnCount += 1;
-              return { stdout: "agy 1.1.2\n", stderr: "", code: 0 };
+            mockSpawnerLayer((args) => {
+              const joined = args.join(" ");
+              spawnedArgs.push(joined);
+              return joined === "--version"
+                ? { stdout: "agy 1.1.5\n", stderr: "", code: 0 }
+                : { stdout: "Gemini 3.5 Flash (Medium)\n", stderr: "", code: 0 };
             }),
           ),
         );
@@ -3133,12 +3141,13 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
         }).pipe(Effect.provide(layer));
         const antigravity = statuses.find((status) => status.provider === "antigravity");
 
-        assert.strictEqual(spawnCount, 0);
-        assert.strictEqual(antigravity?.available, false);
+        assert.deepStrictEqual(spawnedArgs, ["--version", "models"]);
+        assert.strictEqual(antigravity?.status, "warning");
+        assert.strictEqual(antigravity?.available, true);
+        assert.strictEqual(antigravity?.authStatus, "authenticated");
+        assert.strictEqual(antigravity?.message, ANTIGRAVITY_WINDOWS_COMPATIBILITY_MESSAGE);
         assert.strictEqual(antigravity?.versionAdvisory?.status, "unknown");
         assert.strictEqual(antigravity?.versionAdvisory?.latestVersion, null);
-        assert.strictEqual(antigravity?.versionAdvisory?.canUpdate, false);
-        assert.strictEqual(antigravity?.versionAdvisory?.updateCommand, null);
       }),
     );
 
@@ -5396,7 +5405,13 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
         const nodePath = "C:\\Users\\Test\\AppData\\Roaming\\npm\\node.exe";
         const packageTargetPath =
           "C:\\Users\\Test\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\bin\\codex.js";
-        const existingFiles = new Set([shimPath, nodePath, packageTargetPath]);
+        const packageManifestPath =
+          "C:\\Users\\Test\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\package.json";
+        const packageManifestContents = JSON.stringify({
+          name: "@openai/codex",
+          bin: { codex: "bin/codex.js" },
+        });
+        const existingFiles = new Set([shimPath, nodePath, packageTargetPath, packageManifestPath]);
         const shimContents = [
           "@ECHO off",
           "GOTO start",
@@ -5428,7 +5443,11 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
               fileExists: (path) =>
                 existingFiles.has(path) ||
                 path.toLowerCase().endsWith(WINDOWS_JOB_LAUNCHER_EXECUTABLE),
-              readFileString: (path) => (path === shimPath ? shimContents : undefined),
+              readFileString: (path) => {
+                if (path === shimPath) return shimContents;
+                if (path === packageManifestPath) return packageManifestContents;
+                return undefined;
+              },
               realPath: (path) => path,
             }),
         });
@@ -6622,24 +6641,37 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
   });
 
   describe("checkAntigravityProviderStatus", () => {
-    it.effect("returns unavailable on Windows without spawning Antigravity", () => {
-      let spawnCount = 0;
+    it.effect("returns a Windows compatibility warning after native checks", () => {
+      const spawnedArgs: string[] = [];
       return Effect.gen(function* () {
-        const status = yield* productionCheckAntigravityProviderStatus(undefined, {
-          ...TEST_PROVIDER_PROCESS_OPTIONS,
-          platform: "win32",
-        });
+        const status = yield* productionCheckAntigravityProviderStatus(
+          configuredTestBinary("agy"),
+          {
+            ...TEST_PROVIDER_PROCESS_OPTIONS,
+            platform: "win32",
+            prepareProcess: (command, args) => ({
+              command,
+              args: [...args],
+              shell: false,
+              windowsHide: true,
+            }),
+          },
+        );
         assert.strictEqual(status.provider, "antigravity");
-        assert.strictEqual(status.status, "error");
-        assert.strictEqual(status.available, false);
-        assert.strictEqual(status.authStatus, "unknown");
-        assert.strictEqual(status.message, ANTIGRAVITY_WINDOWS_UNAVAILABLE_MESSAGE);
-        assert.strictEqual(spawnCount, 0);
+        assert.strictEqual(status.status, "warning");
+        assert.strictEqual(status.available, true);
+        assert.strictEqual(status.authStatus, "authenticated");
+        assert.strictEqual(status.version, "1.1.5");
+        assert.strictEqual(status.message, ANTIGRAVITY_WINDOWS_COMPATIBILITY_MESSAGE);
+        assert.deepStrictEqual(spawnedArgs, ["--version", "models"]);
       }).pipe(
         Effect.provide(
-          mockSpawnerLayer(() => {
-            spawnCount += 1;
-            return { stdout: "", stderr: "", code: 0 };
+          mockSpawnerLayer((args) => {
+            const joined = args.join(" ");
+            spawnedArgs.push(joined);
+            return joined === "--version"
+              ? { stdout: "Antigravity CLI 1.1.5\n", stderr: "", code: 0 }
+              : { stdout: "Gemini 3.5 Flash (Medium)\n", stderr: "", code: 0 };
           }),
         ),
       );

@@ -31,12 +31,19 @@ import { resolveProviderAttachmentPath } from "../providerAttachmentPaths.ts";
 import { ServerConfig } from "../../config.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
 import {
+  ProviderAdapterCompatibilityError,
   ProviderAdapterProcessError,
   ProviderAdapterRequestError,
   ProviderAdapterSessionClosedError,
   ProviderAdapterSessionNotFoundError,
   ProviderAdapterValidationError,
 } from "../Errors.ts";
+import {
+  classifyOpenCodeCompatibilityFailure,
+  isStructuredOpenCodeSessionNotFound,
+  type OpenCodeCompatibilityFailure,
+  OPENCODE_STORAGE_SCHEMA_INCOMPATIBLE_MESSAGE,
+} from "../opencodeCompatibility.ts";
 import { takeSynaraHarnessPolicyForProviderSession } from "../../agentGateway/harnessPolicy.ts";
 import { buildOpenCodeMcpServer, SYNARA_MCP_SERVER_NAME } from "../../agentGateway/mcpInjection.ts";
 import { AgentGatewayCredentials } from "../../agentGateway/Services/AgentGatewayCredentials.ts";
@@ -61,6 +68,7 @@ import {
   openCodeRuntimeErrorDetail,
   parseOpenCodeModelSlug,
   runOpenCodeSdk,
+  runOpenCodeSdkRequest,
   toOpenCodeFileParts,
   toOpenCodePermissionReply,
   toOpenCodeQuestionAnswers,
@@ -148,9 +156,21 @@ interface OpenCodeTurnSnapshot {
 }
 
 type OpenCodeSessionShutdownState = "running" | "stopping" | "closed";
+type OpenCodeRuntimeOwnership = "external" | "isolated_managed" | "shared_managed";
+
+interface OpenCodeCompatibilityIncident {
+  readonly turnId: TurnId;
+  readonly correlationId: string;
+  readonly error: ProviderAdapterCompatibilityError;
+  readonly originalCause: unknown;
+  readonly failure: OpenCodeCompatibilityFailure;
+  pendingTerminalEventId: EventId | undefined;
+  terminalAcknowledged: boolean;
+}
 
 interface OpenCodeSessionContext {
   harnessPolicyDelivered?: boolean;
+  teardownRequested: boolean;
   readonly gatewayControlAvailable: boolean;
   gatewaySessionLease?: AgentGatewaySessionLease;
   session: ProviderSession;
@@ -159,6 +179,7 @@ interface OpenCodeSessionContext {
   readonly server: OpenCodeServerConnection;
   readonly directory: string;
   readonly openCodeSessionId: string;
+  readonly runtimeOwnership: OpenCodeRuntimeOwnership;
   readonly pendingPermissions: Map<string, PermissionRequest>;
   /** Permission request ids auto-approved server-side in full-access mode (never surfaced to the UI). */
   readonly autoApprovedPermissionIds: Set<string>;
@@ -186,6 +207,9 @@ interface OpenCodeSessionContext {
   activeInteractionMode: "default" | "plan" | undefined;
   activeAgent: string | undefined;
   activeVariant: string | undefined;
+  promptAttemptCount: number;
+  compatibilityIncident: OpenCodeCompatibilityIncident | undefined;
+  readonly compatibilityIncidentMutex: Semaphore.Semaphore;
   readonly stopped: Ref.Ref<boolean>;
   readonly shutdownState: Ref.Ref<OpenCodeSessionShutdownState>;
   readonly shutdownMutex: Semaphore.Semaphore;
@@ -221,6 +245,7 @@ export interface OpenCodeAdapterLiveOptions {
   readonly sessionAbortTimeoutMs?: number;
   readonly waitForSessionAbortTimeout?: (timeoutMs: number) => Effect.Effect<void>;
   readonly beforeSessionInstall?: Effect.Effect<void>;
+  readonly beforeCompatibilityIncidentInstall?: Effect.Effect<void>;
   readonly resolveServerPassword?: (
     provider: OpenCodeCompatibleProvider,
   ) => Effect.Effect<string | undefined, ProviderAdapterValidationError>;
@@ -1079,6 +1104,7 @@ const stopOpenCodeContext = Effect.fn("stopOpenCodeContext")(function* (
   input: {
     readonly abortTimeoutMs: number;
     readonly waitForAbortTimeout: Effect.Effect<void>;
+    readonly releaseOwnedResourcesOnAbortTimeout?: boolean;
     readonly onStopping?: Effect.Effect<void>;
     readonly onClosed?: Effect.Effect<void>;
   },
@@ -1103,7 +1129,7 @@ const stopOpenCodeContext = Effect.fn("stopOpenCodeContext")(function* (
           ).pipe(Effect.ignore({ log: true }), Effect.as(true)),
           input.waitForAbortTimeout.pipe(Effect.as(false)),
         ).pipe(Effect.interruptible);
-        if (!abortCompleted) {
+        if (!abortCompleted && input.releaseOwnedResourcesOnAbortTimeout !== true) {
           return yield* new ProviderAdapterRequestError({
             provider: context.session.provider,
             method: "session.abort",
@@ -1132,6 +1158,7 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
       const agentGatewayCredentials = Option.getOrUndefined(
         yield* Effect.serviceOption(AgentGatewayCredentials),
       );
+      const adapterScope = yield* Scope.Scope;
       const provider = adapterConfig.provider;
       const buildEventBase = (
         input: Omit<
@@ -1181,13 +1208,36 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
       const stopAndRemoveOpenCodeContext = Effect.fn("stopAndRemoveOpenCodeContext")(function* (
         context: OpenCodeSessionContext,
         callbacks: {
+          readonly allowPendingCompatibilityTerminal?: boolean;
           readonly onStopping?: Effect.Effect<void>;
           readonly onClosed?: Effect.Effect<void>;
+          readonly releaseOwnedResourcesOnAbortTimeout?: boolean;
         } = {},
       ) {
+        const pendingCompatibilityError = yield* context.compatibilityIncidentMutex.withPermit(
+          Effect.sync(() => {
+            const pendingCompatibilityIncident = context.compatibilityIncident;
+            if (
+              pendingCompatibilityIncident?.pendingTerminalEventId !== undefined &&
+              callbacks.allowPendingCompatibilityTerminal !== true
+            ) {
+              return pendingCompatibilityIncident.error;
+            }
+            // Claim teardown under the same lock used to install compatibility
+            // incidents so exactly one lifecycle path can cross the boundary.
+            context.teardownRequested = true;
+            return undefined;
+          }),
+        );
+        if (pendingCompatibilityError !== undefined) {
+          return yield* pendingCompatibilityError;
+        }
         return yield* stopOpenCodeContext(context, {
           abortTimeoutMs: sessionAbortTimeoutMs,
           waitForAbortTimeout: waitForSessionAbortTimeout(sessionAbortTimeoutMs),
+          ...(callbacks.releaseOwnedResourcesOnAbortTimeout === true
+            ? { releaseOwnedResourcesOnAbortTimeout: true }
+            : {}),
           ...(callbacks.onStopping !== undefined ? { onStopping: callbacks.onStopping } : {}),
           onClosed: Effect.gen(function* () {
             yield* callbacks.onClosed ?? Effect.void;
@@ -1203,7 +1253,12 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
           const contexts = [...sessions.values()];
           yield* Effect.forEach(
             contexts,
-            (context) => Effect.ignoreCause(stopAndRemoveOpenCodeContext(context)),
+            (context) =>
+              Effect.ignoreCause(
+                stopAndRemoveOpenCodeContext(context, {
+                  allowPendingCompatibilityTerminal: true,
+                }),
+              ),
             { concurrency: "unbounded", discard: true },
           );
           if (managedNativeEventLogger !== undefined) {
@@ -1219,6 +1274,216 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
             ? { lifecycleGeneration: context.lifecycleGeneration }
             : {}),
         }).pipe(Effect.asVoid);
+
+      const acknowledgeOpenCodeCompatibilityTerminal = Effect.fn(
+        "acknowledgeOpenCodeCompatibilityTerminal",
+      )(function* (event: ProviderRuntimeEvent) {
+        const context = sessions.get(event.threadId);
+        const incident = context?.compatibilityIncident;
+        if (
+          context === undefined ||
+          incident === undefined ||
+          incident.pendingTerminalEventId !== event.eventId
+        ) {
+          return;
+        }
+
+        // ProviderService invokes this only after the terminal event is durable
+        // and the persisted binding has transitioned out of the active turn.
+        // Keep the compatibility incident itself as a permanent dispatch block
+        // for this context; only the pending durability tombstone is consumed.
+        incident.pendingTerminalEventId = undefined;
+        incident.terminalAcknowledged = true;
+        clearActiveTurnState(context);
+        updateProviderSession(
+          context,
+          {
+            status: "error",
+            lastError: OPENCODE_STORAGE_SCHEMA_INCOMPATIBLE_MESSAGE,
+          },
+          { clearActiveTurnId: true },
+        );
+
+        const safeRaw = {
+          source: "synara.opencode.compatibility",
+          reason: incident.failure.reason,
+          correlationId: incident.correlationId,
+        };
+        yield* emit(context, {
+          ...buildEventBase({
+            threadId: context.session.threadId,
+            turnId: incident.turnId,
+            raw: safeRaw,
+          }),
+          type: "runtime.error",
+          payload: {
+            message: OPENCODE_STORAGE_SCHEMA_INCOMPATIBLE_MESSAGE,
+            class: "provider_error",
+            reason: incident.failure.reason,
+            detail: {
+              lifecycleStage: incident.failure.lifecycleStage,
+              retryable: false,
+              serverOrigin: context.runtimeOwnership === "external" ? "external" : "managed",
+              correlationId: incident.correlationId,
+            },
+          },
+        });
+
+        if (context.runtimeOwnership === "shared_managed") {
+          yield* Effect.logError("OpenCode compatibility cleanup could not prove isolation", {
+            provider,
+            reason: incident.failure.reason,
+            lifecycleStage: incident.failure.lifecycleStage,
+            serverOrigin: "managed",
+            cleanupOutcome: "isolation_unproven",
+            retrySuppressed: true,
+            correlationId: incident.correlationId,
+          });
+          return;
+        }
+
+        yield* stopAndRemoveOpenCodeContext(context, {
+          releaseOwnedResourcesOnAbortTimeout: true,
+          onClosed: emit(context, {
+            ...buildEventBase({
+              threadId: context.session.threadId,
+              turnId: incident.turnId,
+              raw: safeRaw,
+            }),
+            type: "session.exited",
+            payload: {
+              reason: OPENCODE_STORAGE_SCHEMA_INCOMPATIBLE_MESSAGE,
+              recoverable: false,
+              exitKind: "error",
+            },
+          }),
+        }).pipe(
+          Effect.tap(() =>
+            Effect.logError("OpenCode compatibility incident", {
+              provider,
+              reason: incident.failure.reason,
+              lifecycleStage: incident.failure.lifecycleStage,
+              serverOrigin: context.runtimeOwnership === "external" ? "external" : "managed",
+              cleanupOutcome: "completed",
+              retrySuppressed: true,
+              correlationId: incident.correlationId,
+            }),
+          ),
+          Effect.catchCause(() =>
+            Effect.logError("OpenCode compatibility cleanup failed", {
+              provider,
+              reason: incident.failure.reason,
+              lifecycleStage: incident.failure.lifecycleStage,
+              serverOrigin: context.runtimeOwnership === "external" ? "external" : "managed",
+              cleanupOutcome: "failed",
+              retrySuppressed: true,
+              correlationId: incident.correlationId,
+            }),
+          ),
+          Effect.forkIn(adapterScope),
+        );
+      });
+
+      const failOpenCodeCompatibility = Effect.fn("failOpenCodeCompatibility")(function* (
+        context: OpenCodeSessionContext,
+        input: {
+          readonly source: "provider_event" | "sdk_response";
+          readonly operation: "session.error" | "session.promptAsync";
+          readonly turnId: TurnId;
+          readonly error: unknown;
+        },
+      ) {
+        const failure = classifyOpenCodeCompatibilityFailure({
+          provider,
+          source: input.source,
+          operation: input.operation,
+          lifecycleStage: context.promptAttemptCount === 1 ? "first_prompt" : "later_prompt",
+          error: input.error,
+        });
+        if (!failure) {
+          return null;
+        }
+
+        const installation = yield* context.compatibilityIncidentMutex.withPermit(
+          Effect.gen(function* () {
+            const existingIncident = context.compatibilityIncident;
+            if (existingIncident !== undefined) {
+              return { error: existingIncident.error, terminalEvent: undefined } as const;
+            }
+            if (
+              context.teardownRequested ||
+              (yield* Ref.get(context.stopped)) ||
+              context.activeTurnId !== input.turnId
+            ) {
+              return { error: null, terminalEvent: undefined } as const;
+            }
+            if (options?.beforeCompatibilityIncidentInstall) {
+              yield* options.beforeCompatibilityIncidentInstall;
+            }
+
+            const compatibilityError = new ProviderAdapterCompatibilityError({
+              provider,
+              method: input.operation,
+              reason: failure.reason,
+              lifecycleStage: failure.lifecycleStage,
+              retryable: false,
+              detail: failure.diagnosticSummary,
+            });
+            const correlationId = randomUUID();
+            const safeRaw = {
+              source: "synara.opencode.compatibility",
+              reason: failure.reason,
+              correlationId,
+            };
+            const terminalEvent = {
+              ...buildEventBase({
+                threadId: context.session.threadId,
+                turnId: input.turnId,
+                raw: safeRaw,
+              }),
+              type: "turn.completed",
+              payload: {
+                state: "failed",
+                failureReason: failure.reason,
+                errorMessage: OPENCODE_STORAGE_SCHEMA_INCOMPATIBLE_MESSAGE,
+              },
+            } satisfies ProviderRuntimeEvent;
+            const incident: OpenCodeCompatibilityIncident = {
+              turnId: input.turnId,
+              correlationId,
+              error: compatibilityError,
+              originalCause: input.error,
+              failure,
+              pendingTerminalEventId: terminalEvent.eventId,
+              terminalAcknowledged: false,
+            };
+            // Install the dispatch-blocking tombstone before the terminal event
+            // becomes visible. Concurrent error fibers and teardown claims use
+            // this same lock, so the event id cannot be overwritten.
+            context.compatibilityIncident = incident;
+            return { error: compatibilityError, terminalEvent } as const;
+          }),
+        );
+
+        if (installation.terminalEvent !== undefined) {
+          yield* emit(context, installation.terminalEvent);
+        }
+        return installation.error;
+      });
+
+      const runtimeEventDurabilityBarrier = {
+        isPending: (event: ProviderRuntimeEvent) =>
+          Effect.sync(() => {
+            const incident = sessions.get(event.threadId)?.compatibilityIncident;
+            return (
+              event.provider === provider &&
+              incident !== undefined &&
+              incident.pendingTerminalEventId === event.eventId
+            );
+          }),
+        acknowledge: acknowledgeOpenCodeCompatibilityTerminal,
+      };
+
       const writeNativeEvent = (
         threadId: ThreadId,
         event: {
@@ -1502,6 +1767,9 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
           readonly errorMessage?: string | undefined;
         },
       ) {
+        if (context.compatibilityIncident !== undefined) {
+          return;
+        }
         clearActiveTurnState(context);
         updateProviderSession(context, { status: "ready" }, { clearActiveTurnId: true });
         yield* emit(context, {
@@ -1882,14 +2150,27 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
           readonly promptInput: Parameters<OpencodeClient["session"]["promptAsync"]>[0];
         },
       ) {
-        const settled = yield* Deferred.make<ProviderAdapterRequestError | null, never>();
-        yield* runOpenCodeSdk("session.promptAsync", () =>
+        const settled = yield* Deferred.make<
+          ProviderAdapterCompatibilityError | ProviderAdapterRequestError | null,
+          never
+        >();
+        context.promptAttemptCount += 1;
+        yield* runOpenCodeSdkRequest("session.promptAsync", () =>
           context.client.session.promptAsync(input.promptInput),
         ).pipe(
-          Effect.mapError(toAdapterRequestError),
           Effect.as(null),
-          Effect.catch((requestError) =>
+          Effect.catch((runtimeError) =>
             Effect.gen(function* () {
+              const compatibilityError = yield* failOpenCodeCompatibility(context, {
+                source: "sdk_response",
+                operation: "session.promptAsync",
+                turnId: input.turnId,
+                error: runtimeError,
+              });
+              if (compatibilityError) {
+                return compatibilityError;
+              }
+              const requestError = toAdapterRequestError(runtimeError);
               if (yield* Ref.get(context.stopped)) {
                 return requestError;
               }
@@ -1933,6 +2214,9 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
         event: OpenCodeSubscribedEvent,
       ) {
         if (!shouldHandleSubscribedEvent(context, event)) {
+          return;
+        }
+        if (context.compatibilityIncident !== undefined) {
           return;
         }
 
@@ -2727,6 +3011,20 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
           }
 
           case "session.error": {
+            if (context.compatibilityIncident !== undefined) {
+              break;
+            }
+            if (turnId) {
+              const compatibilityError = yield* failOpenCodeCompatibility(context, {
+                source: "provider_event",
+                operation: "session.error",
+                turnId,
+                error: event.properties.error,
+              });
+              if (compatibilityError) {
+                break;
+              }
+            }
             const message = sessionErrorMessage(event.properties.error);
             if (isOpenCodeContextOverflowError(event.properties.error)) {
               updateProviderSession(
@@ -3070,6 +3368,9 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
               ? input.modelSelection.options?.variant
               : undefined;
           const existing = sessions.get(input.threadId);
+          if (existing?.compatibilityIncident?.pendingTerminalEventId !== undefined) {
+            return yield* existing.compatibilityIncident.error;
+          }
           if (existing) {
             yield* stopAndRemoveOpenCodeContext(existing);
           }
@@ -3082,7 +3383,10 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
             ? undefined
             : acquireAgentGatewaySessionLease(agentGatewayCredentials, input.threadId, provider);
           const agentGatewayConnection = agentGatewaySessionLease?.connection;
-          const poolIsolationKey = agentGatewayConnection ? randomUUID() : undefined;
+          const poolIsolationKey =
+            !serverUrl && (provider === "opencode" || agentGatewayConnection)
+              ? randomUUID()
+              : undefined;
 
           let sessionScopeTransferred = false;
           const installed = yield* Effect.acquireUseRelease(
@@ -3143,56 +3447,79 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
                           ),
                         )
                       : false;
-                    const createSessionId = resumedSessionId
-                      ? // Resumed sessions skip session.create, so re-apply the runtime-mode
-                        // permission ruleset explicitly. Non-fatal: older servers may reject the
-                        // field, and full-access asks are still auto-approved in the event pump.
-                        runOpenCodeSdk("session.update", () =>
-                          client.session.update({
-                            sessionID: resumedSessionId,
-                            permission: buildOpenCodePermissionRules(input.runtimeMode),
-                          }),
-                        ).pipe(
-                          Effect.catchCause((cause) =>
-                            Effect.logWarning(
-                              `${adapterConfig.displayName} failed to apply permission ruleset on resume`,
-                              Cause.squash(cause),
+                    const createFreshSession = runOpenCodeSdkRequest("session.create", () => {
+                      const sessionCreateInput = {
+                        ...(initialParsedModel
+                          ? {
+                              model: {
+                                providerID: initialParsedModel.providerID,
+                                id: initialParsedModel.modelID,
+                                ...(initialVariant ? { variant: initialVariant } : {}),
+                              },
+                            }
+                          : {}),
+                        ...(initialAgent ? { agent: initialAgent } : {}),
+                        permission: buildOpenCodePermissionRules(input.runtimeMode),
+                        title: `Synara ${input.threadId}`,
+                      };
+                      return client.session.create(
+                        sessionCreateInput as unknown as Parameters<
+                          typeof client.session.create
+                        >[0],
+                      );
+                    }).pipe(
+                      Effect.flatMap((sessionResult) =>
+                        sessionResult.data?.id
+                          ? Effect.succeed({
+                              id: sessionResult.data.id,
+                              resumed: false,
+                            })
+                          : Effect.fail(
+                              new OpenCodeRuntimeError({
+                                operation: "session.create",
+                                detail: `${adapterConfig.displayName} session.create returned no session payload.`,
+                              }),
                             ),
-                          ),
-                          Effect.as(resumedSessionId),
-                        )
-                      : runOpenCodeSdk("session.create", () => {
-                          const sessionCreateInput = {
-                            ...(initialParsedModel
-                              ? {
-                                  model: {
-                                    providerID: initialParsedModel.providerID,
-                                    id: initialParsedModel.modelID,
-                                    ...(initialVariant ? { variant: initialVariant } : {}),
-                                  },
-                                }
-                              : {}),
-                            ...(initialAgent ? { agent: initialAgent } : {}),
-                            permission: buildOpenCodePermissionRules(input.runtimeMode),
-                            title: `Synara ${input.threadId}`,
-                          };
-                          return client.session.create(
-                            sessionCreateInput as unknown as Parameters<
-                              typeof client.session.create
-                            >[0],
-                          );
-                        }).pipe(
+                      ),
+                    );
+                    const resolveSession = resumedSessionId
+                      ? runOpenCodeSdkRequest("session.get", () =>
+                          client.session.get({ sessionID: resumedSessionId }),
+                        ).pipe(
                           Effect.flatMap((sessionResult) =>
-                            sessionResult.data?.id
-                              ? Effect.succeed(sessionResult.data.id)
+                            sessionResult.data?.id === resumedSessionId
+                              ? // Re-apply the runtime-mode rules after existence is proven.
+                                // This remains non-fatal for older compatible servers.
+                                runOpenCodeSdkRequest("session.update", () =>
+                                  client.session.update({
+                                    sessionID: resumedSessionId,
+                                    permission: buildOpenCodePermissionRules(input.runtimeMode),
+                                  }),
+                                ).pipe(
+                                  Effect.catch(() =>
+                                    Effect.logWarning(
+                                      `${adapterConfig.displayName} failed to apply permission ruleset on resume`,
+                                    ),
+                                  ),
+                                  Effect.as({
+                                    id: resumedSessionId,
+                                    resumed: true,
+                                  }),
+                                )
                               : Effect.fail(
                                   new OpenCodeRuntimeError({
-                                    operation: "session.create",
-                                    detail: `${adapterConfig.displayName} session.create returned no session payload.`,
+                                    operation: "session.get",
+                                    detail: `${adapterConfig.displayName} session.get returned an invalid session payload.`,
                                   }),
                                 ),
                           ),
-                        );
+                          Effect.catch((error) =>
+                            isStructuredOpenCodeSessionNotFound(error)
+                              ? createFreshSession
+                              : Effect.fail(error),
+                          ),
+                        )
+                      : createFreshSession;
                     const loadModelContextLimits = openCodeRuntime
                       .loadOpenCodeInventory(client)
                       .pipe(
@@ -3200,8 +3527,8 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
                         Effect.catchCause(() => Effect.succeed(new Map<string, number>())),
                       );
                     // Session creation and metadata discovery are independent once the server is up.
-                    const [openCodeSessionId, modelContextLimitBySlug] = yield* Effect.all(
-                      [createSessionId, loadModelContextLimits],
+                    const [resolvedSession, modelContextLimitBySlug] = yield* Effect.all(
+                      [resolveSession, loadModelContextLimits],
                       { concurrency: "unbounded" },
                     );
 
@@ -3209,7 +3536,8 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
                       sessionScope,
                       server,
                       client,
-                      openCodeSessionId,
+                      openCodeSessionId: resolvedSession.id,
+                      resumed: resolvedSession.resumed,
                       modelContextLimitBySlug,
                       gatewayControlAvailable,
                     };
@@ -3268,6 +3596,11 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
                   server: started.server,
                   directory,
                   openCodeSessionId: started.openCodeSessionId,
+                  runtimeOwnership: started.server.external
+                    ? "external"
+                    : poolIsolationKey
+                      ? "isolated_managed"
+                      : "shared_managed",
                   pendingPermissions: new Map(),
                   autoApprovedPermissionIds: new Set(),
                   pendingQuestions: new Map(),
@@ -3294,6 +3627,10 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
                   activeInteractionMode: undefined,
                   activeAgent: undefined,
                   activeVariant: undefined,
+                  promptAttemptCount: 0,
+                  compatibilityIncident: undefined,
+                  compatibilityIncidentMutex: yield* Semaphore.make(1),
+                  teardownRequested: false,
                   stopped: yield* Ref.make(false),
                   shutdownState: yield* Ref.make<OpenCodeSessionShutdownState>("running"),
                   shutdownMutex: yield* Semaphore.make(1),
@@ -3305,6 +3642,7 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
                   kind: "installed" as const,
                   session,
                   context,
+                  resumed: started.resumed,
                 };
               }),
             (sessionScope) =>
@@ -3320,14 +3658,14 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
             return installed.session;
           }
 
-          const { context, session } = installed;
+          const { context, resumed, session } = installed;
           yield* startEventPump(context);
 
           yield* emit(context, {
             ...buildEventBase({ threadId: input.threadId }),
             type: "session.started",
             payload: {
-              message: resumedSessionId
+              message: resumed
                 ? `${adapterConfig.displayName} session resumed`
                 : `${adapterConfig.displayName} session started`,
               resume: { openCodeSessionId: context.openCodeSessionId },
@@ -3347,6 +3685,9 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
 
       const sendTurn: OpenCodeAdapterShape["sendTurn"] = Effect.fn("sendTurn")(function* (input) {
         const context = ensureAdapterSessionContext(input.threadId);
+        if (context.compatibilityIncident !== undefined) {
+          return yield* context.compatibilityIncident.error;
+        }
         const turnId = TurnId.makeUnsafe(`${adapterConfig.turnIdPrefix}-${randomUUID()}`);
         const modelSelection =
           input.modelSelection ??
@@ -3500,6 +3841,9 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
       const interruptTurn: OpenCodeAdapterShape["interruptTurn"] = Effect.fn("interruptTurn")(
         function* (threadId, turnId) {
           const context = ensureAdapterSessionContext(threadId);
+          if (context.compatibilityIncident !== undefined) {
+            return yield* context.compatibilityIncident.error;
+          }
           const activeTurnId = turnId ?? context.activeTurnId;
           yield* runOpenCodeSdk("session.abort", () =>
             context.client.session.abort({
@@ -3569,6 +3913,9 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
               provider,
               threadId,
             });
+          }
+          if (context.compatibilityIncident?.pendingTerminalEventId !== undefined) {
+            return yield* context.compatibilityIncident.error;
           }
           yield* stopAndRemoveOpenCodeContext(context, {
             onClosed: emit(context, {
@@ -4095,7 +4442,12 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
           const contexts = [...sessions.values()];
           yield* Effect.forEach(
             contexts,
-            (context) => Effect.ignoreCause(stopAndRemoveOpenCodeContext(context)),
+            (context) =>
+              Effect.ignoreCause(
+                stopAndRemoveOpenCodeContext(context, {
+                  allowPendingCompatibilityTerminal: true,
+                }),
+              ),
             { concurrency: "unbounded", discard: true },
           );
           if (openCodeRuntime.closeLocalServerPoolsForCliSpec !== undefined) {
@@ -4130,6 +4482,7 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
         listAgents,
         ...(provider === "opencode" ? { listCommands } : {}),
         getComposerCapabilities,
+        runtimeEventDurabilityBarrier,
         get streamEvents() {
           return Stream.fromQueue(runtimeEvents);
         },

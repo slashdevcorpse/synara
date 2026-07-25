@@ -5,11 +5,19 @@ import type { Effect } from "effect";
 import type { PersistenceDecodeError, PersistenceSqlError } from "../Errors.ts";
 
 export const PROVIDER_RUNTIME_INGESTION_CONSUMER = "provider-runtime-ingestion.v1";
+export const PROVIDER_COMMAND_REACTOR_RUNTIME_CONSUMER = "provider-command-reactor-runtime.v1";
 export const PROVIDER_RUNTIME_EVENT_MAX_BYTES = 2 * 1024 * 1024;
 export const PROVIDER_RUNTIME_EVENT_RETAIN_ACCEPTED = 512;
 
 export interface PersistedProviderRuntimeEvent {
   readonly sequence: number;
+  /**
+   * Orchestration high-water captured in the same SQLite transaction that
+   * first journaled this runtime event. Null is reserved for rows retained
+   * from before migration 080, whose historical cross-domain cutoff cannot be
+   * reconstructed safely.
+   */
+  readonly orchestrationCutoffSequence: number | null;
   readonly event: ProviderRuntimeEvent;
 }
 

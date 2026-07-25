@@ -200,8 +200,11 @@ function quotePosixArgument(value: string): string {
   return `'${value.replaceAll("'", `'\\''`)}'`;
 }
 
-const FAKE_CODEX_PACKAGE_TARGET = "node_modules/@synara/desktop-e2e/fake-codex-runtime.mjs";
-export const WINDOWS_FAKE_CODEX_LAUNCHER_NAME = "synara-e2e-codex.cmd";
+const FAKE_CODEX_PACKAGE_NAME = "@synara/desktop-e2e";
+const FAKE_CODEX_PACKAGE_BIN_NAME = "synara-e2e-codex";
+const FAKE_CODEX_PACKAGE_BIN_TARGET = "fake-codex-runtime.mjs";
+const FAKE_CODEX_PACKAGE_TARGET = `node_modules/${FAKE_CODEX_PACKAGE_NAME}/${FAKE_CODEX_PACKAGE_BIN_TARGET}`;
+export const WINDOWS_FAKE_CODEX_LAUNCHER_NAME = `${FAKE_CODEX_PACKAGE_BIN_NAME}.cmd`;
 
 export function windowsFakeCodexLauncherContents(): string {
   const target = FAKE_CODEX_PACKAGE_TARGET.replaceAll("/", "\\");
@@ -215,6 +218,15 @@ export function windowsFakeCodexLauncherContents(): string {
     ")",
     "",
   ].join("\r\n");
+}
+
+export function windowsFakeCodexPackageManifestContents(): string {
+  return `${JSON.stringify({
+    name: FAKE_CODEX_PACKAGE_NAME,
+    bin: {
+      [FAKE_CODEX_PACKAGE_BIN_NAME]: FAKE_CODEX_PACKAGE_BIN_TARGET,
+    },
+  })}\n`;
 }
 
 async function buildFakeCodexRuntime(runtimeDir: string): Promise<string> {
@@ -252,7 +264,14 @@ async function createFakeCodexLauncher(
   await FS.promises.mkdir(fakeCodexHome, { recursive: true });
   if (process.platform === "win32") {
     const launcherPath = Path.join(launcherDir, WINDOWS_FAKE_CODEX_LAUNCHER_NAME);
-    await FS.promises.writeFile(launcherPath, windowsFakeCodexLauncherContents(), "utf8");
+    await Promise.all([
+      FS.promises.writeFile(launcherPath, windowsFakeCodexLauncherContents(), "utf8"),
+      FS.promises.writeFile(
+        Path.join(Path.dirname(fakeCodexRuntimePath), "package.json"),
+        windowsFakeCodexPackageManifestContents(),
+        "utf8",
+      ),
+    ]);
     return launcherPath;
   }
 

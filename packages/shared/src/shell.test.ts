@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   extractPathFromShellOutput,
   listLoginShellCandidates,
+  listWindowsUserCliFallbackDirectories,
   mergePathEntries,
   mergeWindowsScopes,
   readEnvironmentFromLoginShell,
@@ -11,6 +12,83 @@ import {
   readWindowsPersistentEnvironment,
   resolveLoginShell,
 } from "./shell";
+
+describe("listWindowsUserCliFallbackDirectories", () => {
+  it("returns existing absolute user CLI directories in deterministic deduplicated order", () => {
+    const existing = new Set(
+      [
+        "C:\\Users\\Test\\AppData\\Roaming\\npm",
+        "C:\\Users\\Test\\AppData\\Local\\Programs\\nodejs",
+        "C:\\Users\\Test\\.volta\\bin",
+        "C:\\Users\\Test\\AppData\\Local\\pnpm",
+        "C:\\Users\\Test\\.bun\\bin",
+        "C:\\Users\\Test\\scoop\\shims",
+      ].map((path) => path.toLowerCase()),
+    );
+
+    expect(
+      listWindowsUserCliFallbackDirectories(
+        {
+          APPDATA: "C:\\Users\\Test\\AppData\\Roaming",
+          LOCALAPPDATA: "C:\\Users\\Test\\AppData\\Local",
+          USERPROFILE: "C:\\Users\\Test",
+          VOLTA_HOME: "C:\\Users\\Test\\.volta",
+          PNPM_HOME: "C:\\Users\\Test\\AppData\\Local\\pnpm",
+        },
+        (path) => existing.has(path.toLowerCase()),
+      ),
+    ).toEqual([
+      "C:\\Users\\Test\\AppData\\Roaming\\npm",
+      "C:\\Users\\Test\\AppData\\Local\\Programs\\nodejs",
+      "C:\\Users\\Test\\.volta\\bin",
+      "C:\\Users\\Test\\AppData\\Local\\pnpm",
+      "C:\\Users\\Test\\.bun\\bin",
+      "C:\\Users\\Test\\scoop\\shims",
+    ]);
+  });
+
+  it("never admits relative user directories or a process current-directory fallback", () => {
+    const checked: string[] = [];
+    expect(
+      listWindowsUserCliFallbackDirectories(
+        {
+          APPDATA: ".\\AppData\\Roaming",
+          LOCALAPPDATA: "AppData\\Local",
+          USERPROFILE: ".",
+        },
+        (path) => {
+          checked.push(path);
+          return true;
+        },
+      ),
+    ).toEqual([]);
+    expect(checked).toEqual([]);
+  });
+
+  it("preserves fallback directories that differ only by non-ASCII case", () => {
+    const pnpmUpper = "C:\\Users\\Äda\\AppData\\Local\\pnpm";
+    const pnpmLower = "C:\\Users\\äda\\AppData\\Local\\pnpm";
+    const existing = new Set([pnpmUpper, pnpmLower]);
+
+    expect(
+      listWindowsUserCliFallbackDirectories(
+        {
+          LOCALAPPDATA: "C:\\Users\\äda\\AppData\\Local",
+          PNPM_HOME: pnpmUpper,
+        },
+        (path) => existing.has(path),
+      ),
+    ).toEqual([pnpmUpper, pnpmLower]);
+  });
+
+  it("handles a long run of trailing separators without regex backtracking", () => {
+    const pnpmHome = `C:\\Tools\\pnpm${"/".repeat(50_000)}`;
+
+    expect(
+      listWindowsUserCliFallbackDirectories({ PNPM_HOME: pnpmHome }, (path) => path === pnpmHome),
+    ).toEqual(["C:\\Tools\\pnpm\\"]);
+  });
+});
 
 describe("extractPathFromShellOutput", () => {
   it("extracts the path between capture markers", () => {

@@ -53,6 +53,17 @@ function makeAcpAgentWrapper(dir: string, env: Record<string, string>): string {
     ].join("\n"),
     "utf8",
   );
+  if (process.platform === "win32") {
+    writeFileSync(
+      path.join(binDir, "node_modules", "synara-cursor-text-fixture", "package.json"),
+      `${JSON.stringify({
+        name: "synara-cursor-text-fixture",
+        version: "1.0.0",
+        bin: { agent: "bin/agent-launcher.mjs" },
+      })}\n`,
+      "utf8",
+    );
+  }
   writeFileSync(
     agentPath,
     process.platform === "win32"

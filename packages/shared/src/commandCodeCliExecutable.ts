@@ -10,6 +10,7 @@ import {
   resolveWindowsCommandCandidatesAsync,
   resolveWindowsCommandPath,
   resolveWindowsCommandPathAsync,
+  readEffectiveWindowsEnvironmentValue,
   unresolvedWindowsCommandDiscoveryOutcome,
   type WindowsAsyncCommandDiscoveryInput,
   type WindowsCommandDiscoveryObservation,
@@ -40,13 +41,8 @@ const COMMAND_CODE_ALIASES = ["commandcode", "command-code", "cmdc", "cmd"] as c
 const WINDOWS_EXECUTABLE_PATTERN = /\.(?:exe|com|cmd|bat)$/i;
 
 function environmentValue(env: NodeJS.ProcessEnv, name: string): string | undefined {
-  const normalizedName = name.toUpperCase();
-  for (const [key, value] of Object.entries(env)) {
-    if (key.toUpperCase() === normalizedName && typeof value === "string" && value.trim()) {
-      return value.trim();
-    }
-  }
-  return undefined;
+  const value = readEffectiveWindowsEnvironmentValue(env, name)?.trim();
+  return value ? value : undefined;
 }
 
 function isRegularAbsoluteWindowsFile(candidate: string, readStat: StatSyncLike): boolean {
@@ -74,6 +70,43 @@ function firstValidCandidate(
   );
 }
 
+function effectiveAliasDiscoveryObservations(
+  command: (typeof COMMAND_CODE_ALIASES)[number],
+  candidates: ReadonlyArray<string>,
+  observations: ReadonlyArray<WindowsCommandDiscoveryObservation>,
+  commandProcessorPaths: ReadonlySet<string>,
+): WindowsCommandDiscoveryObservation[] {
+  const resolvedOnlyToWindowsCommandProcessor =
+    command === "cmd" &&
+    candidates.length > 0 &&
+    candidates.every((candidate) =>
+      commandProcessorPaths.has(Path.win32.normalize(candidate).toLowerCase()),
+    ) &&
+    observations.length > 0 &&
+    observations.every((observation) => observation.outcome === "resolved");
+  if (!resolvedOnlyToWindowsCommandProcessor) {
+    return [...observations];
+  }
+
+  // `cmd` is an official package alias, but Windows normally resolves it to
+  // the command processor. That collision means no usable Command Code alias
+  // was found; it is not a discovery transport failure.
+  return observations.map((observation) => ({ ...observation, outcome: "not_found" }));
+}
+
+function windowsCommandProcessorPaths(env: NodeJS.ProcessEnv): ReadonlySet<string> {
+  const systemRoot =
+    environmentValue(env, "SystemRoot") ?? environmentValue(env, "WINDIR") ?? "C:\\Windows";
+  const systemDirectories = ["System32", "SysWOW64", "Sysnative"] as const;
+  return new Set(
+    systemDirectories.flatMap((directory) =>
+      ["cmd.exe", "cmd.com"].map((name) =>
+        Path.win32.normalize(Path.win32.join(systemRoot, directory, name)).toLowerCase(),
+      ),
+    ),
+  );
+}
+
 function npmShim(
   appData: string | undefined,
   command: (typeof COMMAND_CODE_ALIASES)[number],
@@ -82,6 +115,12 @@ function npmShim(
   if (!appData) return undefined;
   const candidate = Path.win32.join(appData, "npm", `${command}.cmd`);
   return isRegularAbsoluteWindowsFile(candidate, readStat) ? candidate : undefined;
+}
+
+function unresolvedOfficialAliasExecutable(configured: string, normalized: string): string {
+  return normalized === "cmd"
+    ? DEFAULT_COMMAND_CODE_COMMAND
+    : configured || DEFAULT_COMMAND_CODE_COMMAND;
 }
 
 /**
@@ -127,29 +166,44 @@ export function resolveCommandCodeCliExecutableWithDiscovery(
   const readStat = input.statSync ?? statSync;
   const env = input.env ?? process.env;
   const appData = environmentValue(env, "APPDATA");
+  const commandProcessorPaths = windowsCommandProcessorPaths(env);
   const orderedAliases = [
     normalized as (typeof COMMAND_CODE_ALIASES)[number],
     ...COMMAND_CODE_ALIASES.filter((alias) => alias !== normalized),
   ];
+  const effectiveObservations: WindowsCommandDiscoveryObservation[] = [];
 
   for (const alias of orderedAliases) {
-    const candidate = firstValidCandidate(
-      alias,
-      resolveWindowsCommandCandidates(alias, discoveryInput),
-      readStat,
+    const observationStart = observations.length;
+    const candidates = resolveWindowsCommandCandidates(alias, discoveryInput);
+    const candidate = firstValidCandidate(alias, candidates, readStat);
+    if (candidate) {
+      return { executable: candidate };
+    }
+    effectiveObservations.push(
+      ...effectiveAliasDiscoveryObservations(
+        alias,
+        candidates,
+        observations.slice(observationStart),
+        commandProcessorPaths,
+      ),
     );
-    if (candidate) return { executable: candidate };
+  }
+  const executable = unresolvedOfficialAliasExecutable(configured, normalized);
+  const discoveryOutcome = unresolvedWindowsCommandDiscoveryOutcome(effectiveObservations);
+  if (discoveryOutcome !== "not_found") {
+    return {
+      executable,
+      ...(discoveryOutcome ? { discoveryOutcome } : {}),
+    };
   }
   for (const alias of orderedAliases) {
     const candidate = npmShim(appData, alias, readStat);
     if (candidate) return { executable: candidate };
   }
   return {
-    executable:
-      normalized === "cmd"
-        ? DEFAULT_COMMAND_CODE_COMMAND
-        : configured || DEFAULT_COMMAND_CODE_COMMAND,
-    discoveryOutcome: unresolvedWindowsCommandDiscoveryOutcome(observations),
+    executable,
+    discoveryOutcome,
   };
 }
 
@@ -184,29 +238,44 @@ export async function resolveCommandCodeCliExecutableWithDiscoveryAsync(
   const readStat = input.statSync ?? statSync;
   const env = input.env ?? process.env;
   const appData = environmentValue(env, "APPDATA");
+  const commandProcessorPaths = windowsCommandProcessorPaths(env);
   const orderedAliases = [
     normalized as (typeof COMMAND_CODE_ALIASES)[number],
     ...COMMAND_CODE_ALIASES.filter((alias) => alias !== normalized),
   ];
+  const effectiveObservations: WindowsCommandDiscoveryObservation[] = [];
 
   for (const alias of orderedAliases) {
-    const candidate = firstValidCandidate(
-      alias,
-      await resolveWindowsCommandCandidatesAsync(alias, discoveryInput),
-      readStat,
+    const observationStart = observations.length;
+    const candidates = await resolveWindowsCommandCandidatesAsync(alias, discoveryInput);
+    const candidate = firstValidCandidate(alias, candidates, readStat);
+    if (candidate) {
+      return { executable: candidate };
+    }
+    effectiveObservations.push(
+      ...effectiveAliasDiscoveryObservations(
+        alias,
+        candidates,
+        observations.slice(observationStart),
+        commandProcessorPaths,
+      ),
     );
-    if (candidate) return { executable: candidate };
+  }
+  const executable = unresolvedOfficialAliasExecutable(configured, normalized);
+  const discoveryOutcome = unresolvedWindowsCommandDiscoveryOutcome(effectiveObservations);
+  if (discoveryOutcome !== "not_found") {
+    return {
+      executable,
+      ...(discoveryOutcome ? { discoveryOutcome } : {}),
+    };
   }
   for (const alias of orderedAliases) {
     const candidate = npmShim(appData, alias, readStat);
     if (candidate) return { executable: candidate };
   }
   return {
-    executable:
-      normalized === "cmd"
-        ? DEFAULT_COMMAND_CODE_COMMAND
-        : configured || DEFAULT_COMMAND_CODE_COMMAND,
-    discoveryOutcome: unresolvedWindowsCommandDiscoveryOutcome(observations),
+    executable,
+    discoveryOutcome,
   };
 }
 

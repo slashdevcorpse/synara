@@ -10,7 +10,10 @@ import { fileURLToPath } from "node:url";
 
 import launcherConfig from "../../native/windows-job-launcher/launcher.config.json" with { type: "json" };
 
-import { parseCanonicalWindowsNpmNodeShim } from "@synara/shared/windowsNpmShim";
+import {
+  parseCanonicalWindowsNpmNodeShimTarget,
+  windowsNpmPackageManifestDeclaresShimTarget,
+} from "@synara/shared/windowsNpmShim";
 import {
   createWindowsCommandDiscoveryCache,
   isWindowsBatchCommand,
@@ -28,6 +31,7 @@ import {
 const WINDOWS_JOB_PREPARED_COMMAND = Symbol("synara.windowsJobPreparedCommand");
 const WINDOWS_JOB_CONTROL_FILE = Symbol("synara.windowsJobControlFile");
 const MAX_WINDOWS_PROVIDER_SHIM_BYTES = 64 * 1024;
+const MAX_WINDOWS_PROVIDER_PACKAGE_MANIFEST_BYTES = 1024 * 1024;
 
 export interface WindowsJobPreparedCommand extends WindowsSafeProcessCommand {
   readonly [WINDOWS_JOB_PREPARED_COMMAND]: true;
@@ -43,6 +47,7 @@ export interface WindowsProviderProcessInput extends WindowsAsyncCommandDiscover
   readonly launcherPath?: string | undefined;
   readonly fileExists?: ((path: string) => boolean) | undefined;
   readonly readFileString?: ((path: string) => string | undefined) | undefined;
+  readonly readPackageManifestString?: ((path: string) => string | undefined) | undefined;
   readonly realPath?: ((path: string) => string | undefined) | undefined;
   readonly controlDirectory?: string | undefined;
   /**
@@ -70,8 +75,11 @@ export class WindowsProviderTargetNotResolvedError extends Error {
 export type WindowsProviderBatchShimLaunchFailure =
   | "shim_not_file"
   | "shim_not_canonical_npm_node"
+  | "package_manifest_not_file"
+  | "package_manifest_bin_mismatch"
   | "target_not_file"
   | "target_outside_node_modules"
+  | "target_outside_package"
   | "native_node_not_found";
 
 export class WindowsProviderBatchShimLaunchError extends Error {
@@ -88,9 +96,15 @@ export class WindowsProviderBatchShimLaunchError extends Error {
       shim_not_file: "the resolved batch shim is missing or cannot be verified as a file",
       shim_not_canonical_npm_node:
         "the batch file is not one of npm's canonical Node shim templates",
+      package_manifest_not_file:
+        "the npm package manifest referenced by the shim is missing or not a file",
+      package_manifest_bin_mismatch:
+        "the npm package manifest does not declare this shim name and exact target",
       target_not_file: "the npm package target referenced by the shim is missing or not a file",
       target_outside_node_modules:
         "the npm package target does not remain inside the shim's canonical node_modules tree",
+      target_outside_package:
+        "the npm package target does not remain inside the package declared by the shim",
       native_node_not_found:
         "no verified native node.exe or node.com was found beside the shim or on PATH",
     } satisfies Record<WindowsProviderBatchShimLaunchFailure, string>;
@@ -101,6 +115,18 @@ export class WindowsProviderBatchShimLaunchError extends Error {
     this.command = command;
     this.reason = reason;
     this.discoveryOutcome = discoveryOutcome;
+  }
+}
+
+export class WindowsProviderShellLaunchError extends Error {
+  readonly command: string;
+
+  constructor(command: string) {
+    super(
+      `Windows provider command '${command}' cannot be launched through cmd.exe or a raw batch file. Configure a native provider executable or reinstall a canonical npm provider shim.`,
+    );
+    this.name = "WindowsProviderShellLaunchError";
+    this.command = command;
   }
 }
 
@@ -145,6 +171,18 @@ function defaultReadFileString(path: string): string | undefined {
   try {
     const stat = statSync(path);
     if (!stat.isFile() || stat.size > MAX_WINDOWS_PROVIDER_SHIM_BYTES) {
+      return undefined;
+    }
+    return readFileSync(path, "utf8");
+  } catch {
+    return undefined;
+  }
+}
+
+function defaultReadPackageManifestString(path: string): string | undefined {
+  try {
+    const stat = statSync(path);
+    if (!stat.isFile() || stat.size > MAX_WINDOWS_PROVIDER_PACKAGE_MANIFEST_BYTES) {
       return undefined;
     }
     return readFileSync(path, "utf8");
@@ -247,6 +285,18 @@ function resolveAbsolutePreparedCommand(command: string, cwd: string | undefined
   throw new WindowsProviderTargetNotResolvedError(command);
 }
 
+function withoutTrailingWindowsDotsAndSpaces(name: string): string {
+  let end = name.length;
+  while (end > 0) {
+    const character = name[end - 1];
+    if (character !== "." && character !== " ") {
+      break;
+    }
+    end -= 1;
+  }
+  return end === name.length ? name : name.slice(0, end);
+}
+
 function isAbsoluteNativeWindowsExecutable(path: string): boolean {
   return (
     Path.win32.isAbsolute(path) && [".exe", ".com"].includes(Path.win32.extname(path).toLowerCase())
@@ -309,12 +359,48 @@ function inspectCanonicalWindowsNpmShim(
   } catch {
     shimContents = undefined;
   }
-  const relativeTarget = shimContents ? parseCanonicalWindowsNpmNodeShim(shimContents) : null;
-  if (!relativeTarget) {
+  const shimTarget = shimContents ? parseCanonicalWindowsNpmNodeShimTarget(shimContents) : null;
+  if (!shimTarget) {
     return fail("shim_not_canonical_npm_node");
   }
 
-  const visibleTargetPath = Path.win32.join(shimDirectory, ...relativeTarget.split("/"));
+  const visiblePackageDirectory = Path.win32.join(
+    shimDirectory,
+    ...shimTarget.relativePackageRoot.split("/"),
+  );
+  const canonicalPackageDirectory = (input.realPath ?? defaultRealPath)(visiblePackageDirectory);
+  const visiblePackageManifestPath = Path.win32.join(visiblePackageDirectory, "package.json");
+  const canonicalPackageManifestPath = verifiedRealFile(visiblePackageManifestPath, input);
+  if (
+    !canonicalPackageDirectory ||
+    !Path.win32.isAbsolute(canonicalPackageDirectory) ||
+    !canonicalPackageManifestPath ||
+    !windowsPathIsWithinRoot(canonicalPackageManifestPath, canonicalPackageDirectory)
+  ) {
+    return fail("package_manifest_not_file");
+  }
+  let packageManifestContents: string | undefined;
+  try {
+    packageManifestContents = (
+      input.readPackageManifestString ??
+      input.readFileString ??
+      defaultReadPackageManifestString
+    )(canonicalPackageManifestPath);
+  } catch {
+    packageManifestContents = undefined;
+  }
+  if (
+    !packageManifestContents ||
+    !windowsNpmPackageManifestDeclaresShimTarget({
+      target: shimTarget,
+      shimName: Path.win32.basename(canonicalShimPath),
+      manifestContents: packageManifestContents,
+    })
+  ) {
+    return fail("package_manifest_bin_mismatch");
+  }
+
+  const visibleTargetPath = Path.win32.join(shimDirectory, ...shimTarget.relativeTarget.split("/"));
   const canonicalTargetPath = verifiedRealFile(visibleTargetPath, input);
   if (!canonicalTargetPath) {
     return fail("target_not_file");
@@ -329,6 +415,9 @@ function inspectCanonicalWindowsNpmShim(
     !windowsPathIsWithinRoot(canonicalTargetPath, canonicalNodeModulesDirectory)
   ) {
     return fail("target_outside_node_modules");
+  }
+  if (!windowsPathIsWithinRoot(canonicalTargetPath, canonicalPackageDirectory)) {
+    return fail("target_outside_package");
   }
 
   const siblingNodePath = Path.win32.join(shimDirectory, "node.exe");
@@ -406,9 +495,20 @@ export function containPreparedWindowsProviderProcess(
     return prepared;
   }
 
-  const launcherPath = resolveWindowsJobLauncherPath(input);
   const target = resolveAbsolutePreparedCommand(prepared.command, input.cwd);
-  const argumentMode = prepared.windowsVerbatimArguments ? "verbatim" : "argv";
+  const targetName = withoutTrailingWindowsDotsAndSpaces(Path.win32.basename(target)).toLowerCase();
+  const targetExtension = Path.win32.extname(targetName).toLowerCase();
+  if (
+    prepared.windowsVerbatimArguments === true ||
+    targetExtension === ".cmd" ||
+    targetExtension === ".bat" ||
+    targetName === "cmd.exe" ||
+    targetName === "cmd.com"
+  ) {
+    throw new WindowsProviderShellLaunchError(target);
+  }
+
+  const launcherPath = resolveWindowsJobLauncherPath(input);
   const controlDirectory = input.controlDirectory ?? OS.tmpdir();
   const controlFilePath = Path.win32.join(
     controlDirectory,
@@ -421,7 +521,7 @@ export function containPreparedWindowsProviderProcess(
         "--protocol",
         WINDOWS_JOB_LAUNCHER_PROTOCOL_VERSION,
         "--argument-mode",
-        argumentMode,
+        "argv",
         "--control-file",
         controlFilePath,
         "--",

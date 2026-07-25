@@ -118,6 +118,9 @@ type ProviderInstallSettings = {
   readonly fields: readonly ProviderInstallField[];
 };
 
+export const ANTIGRAVITY_WINDOWS_COMPATIBILITY_DESCRIPTION =
+  "On Windows, Synara starts each request as a new Antigravity CLI conversation in its default project, captures final response text, and passes a bounded recent Synara transcript as a CLI command-line argument for follow-ups; long history is truncated. That bounded text may be visible to local process-inspection tools while the request runs. Live structured events, usage telemetry, and native resume are unavailable. Synara does not install hooks or read or modify Antigravity configuration or transcript files. Antigravity may retain its normal local conversation records.";
+
 const PROVIDER_VISIBILITY_OPTIONS: ReadonlyArray<{ provider: ProviderKind; title: string }> =
   PROVIDER_DESCRIPTORS.map((descriptor) => ({
     provider: descriptor.kind,
@@ -236,6 +239,7 @@ const PROVIDER_INSTALL_SETTINGS: readonly ProviderInstallSettings[] = [
         description: (
           <>
             Leave blank to use <code>agy</code> from your PATH.
+            <span className="mt-1 block">{ANTIGRAVITY_WINDOWS_COMPATIBILITY_DESCRIPTION}</span>
           </>
         ),
       },

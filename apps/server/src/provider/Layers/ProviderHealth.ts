@@ -87,8 +87,8 @@ import {
 import { acquireClaudeAuthStatusLock } from "../claudeAuthStatusLock";
 import { buildClaudeProcessEnv, readClaudeCliCredentialsSummary } from "../claudeProcessEnv";
 import {
-  ANTIGRAVITY_WINDOWS_UNAVAILABLE_MESSAGE,
-  isAntigravityAvailableOnPlatform,
+  ANTIGRAVITY_WINDOWS_COMPATIBILITY_MESSAGE,
+  isAntigravityWindowsCompatibilityMode,
 } from "../antigravityAvailability.ts";
 import { buildOpenCodeCompatibleProcessEnv } from "../openCodeProcessEnv.ts";
 import {
@@ -194,19 +194,6 @@ const PI_PROVIDER = "pi" as const;
 type ProviderStatuses = ReadonlyArray<ServerProviderStatus>;
 const DISABLED_PROVIDER_STATUS_MESSAGE = "Provider is disabled in Synara settings.";
 const MINIMUM_ANTIGRAVITY_CLI_VERSION = "1.0.12";
-
-function makeAntigravityWindowsUnavailableStatus(
-  checkedAt = new Date().toISOString(),
-): ServerProviderStatus {
-  return {
-    provider: ANTIGRAVITY_PROVIDER,
-    status: "error",
-    available: false,
-    authStatus: "unknown",
-    checkedAt,
-    message: ANTIGRAVITY_WINDOWS_UNAVAILABLE_MESSAGE,
-  };
-}
 
 const PROVIDERS = [
   CODEX_PROVIDER,
@@ -2614,9 +2601,7 @@ export const checkAntigravityProviderStatus = (
   Effect.gen(function* () {
     const checkedAt = new Date().toISOString();
     const platform = processOptions.platform ?? process.platform;
-    if (!isAntigravityAvailableOnPlatform(platform)) {
-      return makeAntigravityWindowsUnavailableStatus(checkedAt);
-    }
+    const windowsCompatibilityMode = isAntigravityWindowsCompatibilityMode(platform);
     const executable = nonEmptyTrimmed(binaryPath) ?? "agy";
     const versionProbe = yield* probeProviderCliVersion(
       runAntigravityCommand(["--version"], executable, processOptions),
@@ -2642,7 +2627,9 @@ export const checkAntigravityProviderStatus = (
         available: true,
         authStatus: "unknown",
         checkedAt,
-        message: "Antigravity CLI version check timed out.",
+        message: windowsCompatibilityMode
+          ? `Antigravity CLI version check timed out. ${ANTIGRAVITY_WINDOWS_COMPATIBILITY_MESSAGE}`
+          : "Antigravity CLI version check timed out.",
       } satisfies ServerProviderStatus;
     }
     if (versionProbe.outcome === "nonzero") {
@@ -2684,12 +2671,14 @@ export const checkAntigravityProviderStatus = (
     ) {
       return {
         provider: ANTIGRAVITY_PROVIDER,
-        status: "ready",
+        status: windowsCompatibilityMode ? "warning" : "ready",
         available: true,
         authStatus: "authenticated",
         version: parsedVersion,
         checkedAt,
-        message: "Antigravity CLI is installed, authenticated, and returned available models.",
+        message: windowsCompatibilityMode
+          ? ANTIGRAVITY_WINDOWS_COMPATIBILITY_MESSAGE
+          : "Antigravity CLI is installed, authenticated, and returned available models.",
       } satisfies ServerProviderStatus;
     }
     return {
@@ -2699,7 +2688,9 @@ export const checkAntigravityProviderStatus = (
       authStatus: "unknown",
       version: parsedVersion,
       checkedAt,
-      message: "Antigravity CLI is installed, but Synara could not verify login by listing models.",
+      message: windowsCompatibilityMode
+        ? `${ANTIGRAVITY_WINDOWS_COMPATIBILITY_MESSAGE} Synara could not verify login by listing models.`
+        : "Antigravity CLI is installed, but Synara could not verify login by listing models.",
     } satisfies ServerProviderStatus;
   });
 
@@ -3201,17 +3192,10 @@ export function makeProviderHealthLive(
       ).pipe(
         Effect.map((statuses) =>
           orderProviderStatuses(
-            statuses
-              .filter(
-                (status): status is ServerProviderStatus =>
-                  status !== undefined && !isDisabledProviderStatusOverlay(status),
-              )
-              .map((status) =>
-                status.provider === ANTIGRAVITY_PROVIDER &&
-                !isAntigravityAvailableOnPlatform(platform)
-                  ? makeAntigravityWindowsUnavailableStatus(status.checkedAt)
-                  : status,
-              ),
+            statuses.filter(
+              (status): status is ServerProviderStatus =>
+                status !== undefined && !isDisabledProviderStatusOverlay(status),
+            ),
           ),
         ),
       );
@@ -3280,16 +3264,6 @@ export function makeProviderHealthLive(
         "resolveProviderMaintenanceCapabilitiesForSettings",
       )(function* (provider: ProviderKind, settings: ServerSettings) {
         if (!isProviderEnabledForSettings(provider, settings)) {
-          return makeProviderMaintenanceCapabilities({
-            provider,
-            packageName: null,
-            latestVersionSource: null,
-            updateExecutable: null,
-            updateArgs: [],
-            updateLockKey: null,
-          });
-        }
-        if (provider === ANTIGRAVITY_PROVIDER && !isAntigravityAvailableOnPlatform(platform)) {
           return makeProviderMaintenanceCapabilities({
             provider,
             packageName: null,

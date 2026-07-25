@@ -43,6 +43,7 @@ import type { Effect } from "effect";
 import type { Stream } from "effect";
 
 export type ProviderSessionModelSwitchMode = "in-session" | "restart-session" | "unsupported";
+export const PROVIDER_PROMPT_REPLAY_MAX_INPUT_CHARS = 24_000;
 
 /**
  * Structured payload for steering a running subagent. Mirrors the turn-input
@@ -56,12 +57,18 @@ export interface ProviderSteerSubagentPayload {
   readonly mentions?: ProviderSendTurnInput["mentions"];
 }
 export type ProviderConversationRollbackMode = "native" | "restart-session";
+export type ProviderConversationContinuityMode = "native" | "prompt-replay";
 
 export interface ProviderAdapterCapabilities {
   /**
    * Declares whether changing the model on an existing session is supported.
    */
   readonly sessionModelSwitch: ProviderSessionModelSwitchMode;
+  /**
+   * Declares how follow-up turns retain model-visible conversation context.
+   * Omitted capabilities preserve the native provider-session default.
+   */
+  readonly conversationContinuity?: ProviderConversationContinuityMode;
   /** Restart-session adapters cannot rewind provider history and must rebuild context locally. */
   readonly conversationRollback?: ProviderConversationRollbackMode;
   readonly supportsSkillMentions?: boolean;
@@ -84,6 +91,19 @@ export interface ProviderThreadSnapshot {
   readonly threadId: ThreadId;
   readonly turns: ReadonlyArray<ProviderThreadTurnSnapshot>;
   readonly cwd?: string | null;
+}
+
+/**
+ * Optional adapter-owned barrier for runtime events that must become durable
+ * before the adapter may expose an idle/removed session.
+ *
+ * `isPending` must remain true while the adapter still owns the corresponding
+ * dispatch-blocking tombstone. `ProviderService` calls `acknowledge` only after
+ * the event journal append and binding transition have both succeeded.
+ */
+export interface ProviderRuntimeEventDurabilityBarrier {
+  readonly isPending: (event: ProviderRuntimeEvent) => Effect.Effect<boolean>;
+  readonly acknowledge: (event: ProviderRuntimeEvent) => Effect.Effect<void>;
 }
 
 export interface ProviderAdapterShape<TError> {
@@ -227,6 +247,12 @@ export interface ProviderAdapterShape<TError> {
    * Canonical runtime event stream emitted by this adapter.
    */
   readonly streamEvents: Stream.Stream<ProviderRuntimeEvent>;
+
+  /**
+   * Adapter-owned handoff for terminal events whose local state must remain
+   * dispatch-blocking until the service has durably committed the event.
+   */
+  readonly runtimeEventDurabilityBarrier?: ProviderRuntimeEventDurabilityBarrier;
 
   /**
    * Read provider-specific composer capabilities.

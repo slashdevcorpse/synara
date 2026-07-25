@@ -6,7 +6,10 @@ import * as OS from "node:os";
 import * as Path from "node:path";
 import { createRequire } from "node:module";
 import { resolveCodexCliExecutableAsync } from "@synara/shared/codexCliExecutable";
-import { parseCanonicalWindowsNpmNodeShim } from "@synara/shared/windowsNpmShim";
+import {
+  parseCanonicalWindowsNpmNodeShimTarget,
+  windowsNpmPackageManifestDeclaresShimTarget,
+} from "@synara/shared/windowsNpmShim";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   assertFakeCodexIsOnlyPathCandidate,
@@ -15,6 +18,7 @@ import {
   parseDiagnosticJsonLines,
   WINDOWS_FAKE_CODEX_LAUNCHER_NAME,
   windowsFakeCodexLauncherContents,
+  windowsFakeCodexPackageManifestContents,
 } from "./desktop.fixture";
 import desktopPlaywrightConfig from "./playwright.config";
 import {
@@ -53,9 +57,23 @@ afterEach(async () => {
 
 describe("desktop fixture executable PATH isolation", () => {
   it("models the Windows fake Codex launcher as a canonical npm Node shim", () => {
-    expect(parseCanonicalWindowsNpmNodeShim(windowsFakeCodexLauncherContents())).toBe(
-      "node_modules/@synara/desktop-e2e/fake-codex-runtime.mjs",
-    );
+    const target = parseCanonicalWindowsNpmNodeShimTarget(windowsFakeCodexLauncherContents());
+    if (!target) {
+      throw new Error("The Windows fake Codex launcher must remain a canonical npm Node shim.");
+    }
+    expect(target).toEqual({
+      relativeTarget: "node_modules/@synara/desktop-e2e/fake-codex-runtime.mjs",
+      packageName: "@synara/desktop-e2e",
+      relativePackageRoot: "node_modules/@synara/desktop-e2e",
+      packageBinTarget: "fake-codex-runtime.mjs",
+    });
+    expect(
+      windowsNpmPackageManifestDeclaresShimTarget({
+        target,
+        shimName: WINDOWS_FAKE_CODEX_LAUNCHER_NAME,
+        manifestContents: windowsFakeCodexPackageManifestContents(),
+      }),
+    ).toBe(true);
   });
 
   it("preserves the explicitly configured custom Windows fake Codex launcher", async () => {

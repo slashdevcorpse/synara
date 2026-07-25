@@ -34,50 +34,78 @@ const make = Effect.gen(function* () {
     );
 
   const enqueue: QueuedTurnPromotionRepositoryShape["enqueue"] = (input) =>
-    sql`
-      INSERT INTO queued_turn_promotions (
-        queued_event_sequence, thread_id, message_id, dispatch_mode, state,
-        claim_owner, claimed_at, claim_expires_at, attempt_count,
-        created_at, updated_at, promoted_at
+    sql
+      .withTransaction(
+        Effect.gen(function* () {
+          yield* sql`
+            INSERT INTO queued_turn_promotions (
+              queued_event_sequence, thread_id, message_id, dispatch_mode, state,
+              claim_owner, claimed_at, claim_expires_at, attempt_count,
+              created_at, updated_at, promoted_at
+            )
+            SELECT
+              ${input.queuedEventSequence}, ${input.threadId}, ${input.messageId},
+              ${input.dispatchMode}, 'queued', NULL, NULL, NULL, 0,
+              ${input.createdAt}, ${input.createdAt}, NULL
+            WHERE NOT EXISTS (
+              SELECT 1
+              FROM queued_turn_promotion_cancellation_fences
+              WHERE provider_session_thread_id = ${input.providerSessionThreadId}
+                AND through_event_sequence >= ${input.queuedEventSequence}
+            )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM queued_turn_promotions AS cancelled
+                INNER JOIN orchestration_events AS source
+                  ON source.sequence = ${input.queuedEventSequence}
+                  AND source.command_id =
+                    'server:dispatch-queued-turn:' || cancelled.queued_event_sequence
+                WHERE cancelled.thread_id = ${input.threadId}
+                  AND cancelled.message_id = ${input.messageId}
+                  AND cancelled.state = 'cancelled'
+              )
+            ON CONFLICT DO UPDATE SET
+              queued_event_sequence = excluded.queued_event_sequence,
+              dispatch_mode = excluded.dispatch_mode,
+              state = 'queued',
+              claim_owner = NULL,
+              claimed_at = NULL,
+              claim_expires_at = NULL,
+              attempt_count = 0,
+              created_at = excluded.created_at,
+              updated_at = excluded.updated_at,
+              promoted_at = NULL
+            WHERE excluded.queued_event_sequence > queued_turn_promotions.queued_event_sequence
+              AND EXISTS (
+                SELECT 1
+                FROM orchestration_events AS source
+                WHERE source.sequence = excluded.queued_event_sequence
+                  AND source.command_id =
+                    'server:dispatch-queued-turn:' ||
+                    queued_turn_promotions.queued_event_sequence
+              )
+          `;
+          const runnable = yield* sql<{ readonly sequence: number }>`
+            SELECT promotion.queued_event_sequence AS sequence
+            FROM queued_turn_promotions AS promotion
+            WHERE promotion.queued_event_sequence = ${input.queuedEventSequence}
+              AND promotion.thread_id = ${input.threadId}
+              AND promotion.message_id = ${input.messageId}
+              AND promotion.state IN ('queued', 'promoting', 'promoted')
+              AND NOT EXISTS (
+                SELECT 1
+                FROM queued_turn_promotion_cancellation_fences AS fence
+                WHERE fence.provider_session_thread_id = ${input.providerSessionThreadId}
+                  AND fence.through_event_sequence >= promotion.queued_event_sequence
+              )
+          `;
+          return runnable.length === 1;
+        }),
       )
-      SELECT
-        ${input.queuedEventSequence}, ${input.threadId}, ${input.messageId},
-        ${input.dispatchMode}, 'queued', NULL, NULL, NULL, 0,
-        ${input.createdAt}, ${input.createdAt}, NULL
-      WHERE NOT EXISTS (
-        SELECT 1
-        FROM queued_turn_promotions AS cancelled
-        INNER JOIN orchestration_events AS source
-          ON source.sequence = ${input.queuedEventSequence}
-          AND source.command_id =
-            'server:dispatch-queued-turn:' || cancelled.queued_event_sequence
-        WHERE cancelled.thread_id = ${input.threadId}
-          AND cancelled.message_id = ${input.messageId}
-          AND cancelled.state = 'cancelled'
-      )
-      ON CONFLICT DO UPDATE SET
-        queued_event_sequence = excluded.queued_event_sequence,
-        dispatch_mode = excluded.dispatch_mode,
-        state = 'queued',
-        claim_owner = NULL,
-        claimed_at = NULL,
-        claim_expires_at = NULL,
-        attempt_count = 0,
-        created_at = excluded.created_at,
-        updated_at = excluded.updated_at,
-        promoted_at = NULL
-      WHERE excluded.queued_event_sequence > queued_turn_promotions.queued_event_sequence
-        AND EXISTS (
-          SELECT 1
-          FROM orchestration_events AS source
-          WHERE source.sequence = excluded.queued_event_sequence
-            AND source.command_id =
-              'server:dispatch-queued-turn:' ||
-              queued_turn_promotions.queued_event_sequence
-        )
-    `.pipe(Effect.asVoid, Effect.mapError(toPersistenceSqlError("QueuedTurnPromotion.enqueue")));
+      .pipe(Effect.mapError(toPersistenceSqlError("QueuedTurnPromotion.enqueue")));
 
   const claimNextForThreadIds = (input: {
+    readonly providerSessionThreadId: string;
     readonly threadIds: ReadonlyArray<string>;
     readonly claimOwner: string;
     readonly claimedAt: string;
@@ -90,6 +118,21 @@ const make = Effect.gen(function* () {
     return sql
       .withTransaction(
         Effect.gen(function* () {
+          yield* sql`
+            UPDATE queued_turn_promotions
+            SET state = 'cancelled', claim_owner = NULL, claimed_at = NULL,
+                claim_expires_at = NULL, updated_at = ${input.claimedAt}
+            WHERE thread_id IN ${sql.in(threadIds)}
+              AND state IN ('queued', 'promoting', 'promoted')
+              AND queued_event_sequence <= COALESCE(
+                (
+                  SELECT through_event_sequence
+                  FROM queued_turn_promotion_cancellation_fences
+                  WHERE provider_session_thread_id = ${input.providerSessionThreadId}
+                ),
+                -1
+              )
+          `;
           yield* sql`
           UPDATE queued_turn_promotions
           SET state = 'queued', claim_owner = NULL, claimed_at = NULL,
@@ -105,6 +148,13 @@ const make = Effect.gen(function* () {
           SELECT queued_event_sequence AS "queuedEventSequence"
           FROM queued_turn_promotions
           WHERE thread_id IN ${sql.in(threadIds)} AND state = 'queued'
+            AND NOT EXISTS (
+              SELECT 1
+              FROM queued_turn_promotion_cancellation_fences AS fence
+              WHERE fence.provider_session_thread_id = ${input.providerSessionThreadId}
+                AND fence.through_event_sequence >=
+                  queued_turn_promotions.queued_event_sequence
+            )
           ORDER BY
             CASE dispatch_mode WHEN 'steer' THEN 0 ELSE 1 END ASC,
             CASE WHEN dispatch_mode = 'steer' THEN queued_event_sequence END DESC,
@@ -129,6 +179,7 @@ const make = Effect.gen(function* () {
 
   const claimNext: QueuedTurnPromotionRepositoryShape["claimNext"] = (input) =>
     claimNextForThreadIds({
+      providerSessionThreadId: input.threadId,
       threadIds: [input.threadId],
       claimOwner: input.claimOwner,
       claimedAt: input.claimedAt,
@@ -205,6 +256,113 @@ const make = Effect.gen(function* () {
     );
   };
 
+  const cancelProviderSessionThrough: QueuedTurnPromotionRepositoryShape["cancelProviderSessionThrough"] =
+    (input) => {
+      const memberThreadIds = [...new Set(input.memberThreadIds)];
+      return sql
+        .withTransaction(
+          Effect.gen(function* () {
+            yield* sql`
+              INSERT INTO queued_turn_promotion_compatibility_incidents (
+                incident_key, runtime_event_sequence, runtime_event_id,
+                provider_session_thread_id, through_event_sequence, created_at
+              ) VALUES (
+                ${input.compatibilityIncidentKey}, ${input.runtimeEventSequence},
+                ${input.runtimeEventId}, ${input.providerSessionThreadId},
+                ${input.throughEventSequence}, ${input.updatedAt}
+              )
+              ON CONFLICT DO NOTHING
+            `;
+            const incidents = yield* sql<{
+              readonly incidentKey: string;
+              readonly runtimeEventSequence: number;
+              readonly runtimeEventId: string;
+              readonly providerSessionThreadId: string;
+              readonly throughEventSequence: number;
+              readonly createdAt: string;
+            }>`
+              SELECT
+                incident_key AS "incidentKey",
+                runtime_event_sequence AS "runtimeEventSequence",
+                runtime_event_id AS "runtimeEventId",
+                provider_session_thread_id AS "providerSessionThreadId",
+                through_event_sequence AS "throughEventSequence",
+                created_at AS "createdAt"
+              FROM queued_turn_promotion_compatibility_incidents
+              WHERE incident_key = ${input.compatibilityIncidentKey}
+                OR runtime_event_sequence = ${input.runtimeEventSequence}
+                OR runtime_event_id = ${input.runtimeEventId}
+            `;
+            const incident = incidents.find(
+              (row) => row.incidentKey === input.compatibilityIncidentKey,
+            );
+            if (
+              incident === undefined ||
+              incident.providerSessionThreadId !== input.providerSessionThreadId ||
+              incidents.some(
+                (row) =>
+                  row.incidentKey !== input.compatibilityIncidentKey &&
+                  (row.runtimeEventSequence === input.runtimeEventSequence ||
+                    row.runtimeEventId === input.runtimeEventId),
+              )
+            ) {
+              return yield* Effect.die(
+                new Error(
+                  `OpenCode compatibility incident identity conflict for runtime event ${input.runtimeEventSequence}.`,
+                ),
+              );
+            }
+            yield* sql`
+              INSERT INTO queued_turn_promotion_cancellation_fences (
+                provider_session_thread_id, through_event_sequence, updated_at
+              ) VALUES (
+                ${input.providerSessionThreadId}, ${incident.throughEventSequence},
+                ${incident.createdAt}
+              )
+              ON CONFLICT (provider_session_thread_id) DO UPDATE SET
+                through_event_sequence = excluded.through_event_sequence,
+                updated_at = excluded.updated_at
+              WHERE excluded.through_event_sequence >
+                queued_turn_promotion_cancellation_fences.through_event_sequence
+            `;
+            if (memberThreadIds.length === 0) {
+              return;
+            }
+            yield* sql`
+              UPDATE queued_turn_promotions
+              SET state = 'cancelled', claim_owner = NULL, claimed_at = NULL,
+                  claim_expires_at = NULL, updated_at = ${incident.createdAt}
+              WHERE thread_id IN ${sql.in(memberThreadIds)}
+                AND state IN ('queued', 'promoting', 'promoted')
+                AND queued_event_sequence <= (
+                  SELECT through_event_sequence
+                  FROM queued_turn_promotion_cancellation_fences
+                  WHERE provider_session_thread_id = ${input.providerSessionThreadId}
+                )
+            `;
+          }),
+        )
+        .pipe(
+          Effect.mapError(
+            toPersistenceSqlError("QueuedTurnPromotion.cancelProviderSessionThrough"),
+          ),
+        );
+    };
+
+  const isQueuedEventCancelledByProviderSessionFence: QueuedTurnPromotionRepositoryShape["isQueuedEventCancelledByProviderSessionFence"] =
+    (input) =>
+      sql<{ readonly count: number }>`
+        SELECT COUNT(*) AS count
+        FROM queued_turn_promotion_cancellation_fences
+        WHERE provider_session_thread_id = ${input.providerSessionThreadId}
+          AND through_event_sequence >= ${input.queuedEventSequence}
+      `.pipe(
+        Effect.map((rows) => (rows[0]?.count ?? 0) > 0),
+        Effect.mapError(
+          toPersistenceSqlError("QueuedTurnPromotion.isQueuedEventCancelledByProviderSessionFence"),
+        ),
+      );
+
   const hasPendingMessage: QueuedTurnPromotionRepositoryShape["hasPendingMessage"] = (input) =>
     sql<{ readonly count: number }>`
       SELECT COUNT(*) AS count FROM queued_turn_promotions
@@ -244,6 +402,8 @@ const make = Effect.gen(function* () {
     releaseClaim,
     cancelMessage,
     cancelThread,
+    cancelProviderSessionThrough,
+    isQueuedEventCancelledByProviderSessionFence,
     hasPendingMessage,
     listPendingThreadIds,
     listCancellableThreadIds,

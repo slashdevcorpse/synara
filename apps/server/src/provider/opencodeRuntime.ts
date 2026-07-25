@@ -163,6 +163,34 @@ export const runOpenCodeSdk = <A>(
       new OpenCodeRuntimeError({ operation, detail: openCodeRuntimeErrorDetail(cause), cause }),
   }).pipe(Effect.withSpan(`opencode.${operation}`));
 
+interface OpenCodeSdkResponseLike {
+  readonly error?: unknown;
+  readonly response?: {
+    readonly status?: number;
+  };
+}
+
+export const runOpenCodeSdkRequest = <A extends OpenCodeSdkResponseLike>(
+  operation: string,
+  fn: () => Promise<A>,
+): Effect.Effect<A, OpenCodeRuntimeError> =>
+  runOpenCodeSdk(operation, fn).pipe(
+    Effect.flatMap((result) =>
+      result.error === undefined
+        ? Effect.succeed(result)
+        : Effect.fail(
+            new OpenCodeRuntimeError({
+              operation,
+              detail:
+                typeof result.response?.status === "number"
+                  ? `${operation} request failed with status ${result.response.status}.`
+                  : `${operation} request failed before receiving a response.`,
+              cause: result,
+            }),
+          ),
+    ),
+  );
+
 export interface OpenCodeCommandResult {
   readonly stdout: string;
   readonly stderr: string;
