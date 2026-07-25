@@ -222,6 +222,13 @@ export interface ProviderServiceShape {
    * Fan-out is owned by ProviderService (not by a standalone event-bus service).
    */
   readonly streamEvents: Stream.Stream<ProviderRuntimeEvent>;
+
+  /**
+   * True when every canonical runtime event is durably journaled before it is
+   * offered to `streamEvents`. Durable consumers can then replay from their own
+   * cursor without joining the live fan-out and backpressuring provider output.
+   */
+  readonly runtimeEventsPersistedBeforeFanout?: boolean;
 }
 
 /**

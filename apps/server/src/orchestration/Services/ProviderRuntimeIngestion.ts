@@ -25,10 +25,18 @@ export interface ProviderRuntimeIngestionShape {
   readonly start: Effect.Effect<void, never, Scope.Scope>;
 
   /**
-   * Resolves when the internal processing queue is empty and idle.
-   * Intended for test use to replace timing-sensitive sleeps.
+   * Drains the durable runtime journal through its current high-water mark,
+   * then resolves when the internal processing queue is empty and idle.
+   * Used by tests and runtime callers that need a deterministic fence.
    */
   readonly drain: Effect.Effect<void>;
+
+  /**
+   * Stops the nondurable provider runtime subscription and waits for any
+   * live-to-journal append already in flight. Provider shutdown must call this
+   * only after closing provider event sources and before draining the journal.
+   */
+  readonly closeRuntimeEventSource: Effect.Effect<void>;
 }
 
 /**
