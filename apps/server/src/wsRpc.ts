@@ -25,7 +25,18 @@ import {
 } from "@synara/contracts";
 import { clamp } from "effect/Number";
 import { getDefaultModel } from "@synara/shared/model";
-import { Effect, FileSystem, Layer, Option, Path, Queue, Schema, Scope, Stream } from "effect";
+import {
+  Duration,
+  Effect,
+  FileSystem,
+  Layer,
+  Option,
+  Path,
+  Queue,
+  Schema,
+  Scope,
+  Stream,
+} from "effect";
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/unstable/http";
 import { RpcMiddleware, RpcSchema, RpcSerialization, RpcServer } from "effect/unstable/rpc";
 
@@ -130,6 +141,7 @@ import { resolveGitHubRepository } from "./pullRequests/repositoryResolution";
 
 const MAX_DIAGNOSTIC_CHILD_PROCESSES = 80;
 const MAX_DIAGNOSTIC_ARGS_CHARS = 500;
+const THREAD_DETAIL_PROJECTION_RETRY_DELAYS_MS = [10, 25, 50, 100, 200, 400] as const;
 
 export function listManagedWorktreesForRpc(input: {
   readonly worktreesDir: string;
@@ -301,6 +313,54 @@ export function ensureShellProjectionReady<E>(
           ),
     ),
   );
+}
+
+export function shouldRefreshThreadDetailSnapshotAfterEvent(event: OrchestrationEvent): boolean {
+  return (
+    event.type === "thread.activity-appended" &&
+    event.payload.activity.turnId !== null &&
+    (event.payload.activity.kind === "turn.completed" ||
+      event.payload.activity.kind === "turn.aborted")
+  );
+}
+
+export function awaitThreadDetailProjectionReady<E>(
+  readSnapshotSequence: () => Effect.Effect<{ readonly snapshotSequence: number }, E>,
+  throughSequenceInclusive: number,
+  retryDelaysMs: ReadonlyArray<number> = THREAD_DETAIL_PROJECTION_RETRY_DELAYS_MS,
+): Effect.Effect<void, WsRpcError> {
+  return Effect.gen(function* () {
+    let appliedSequence = -1;
+    for (let attempt = 0; attempt <= retryDelaysMs.length; attempt += 1) {
+      const projection = yield* readSnapshotSequence().pipe(
+        Effect.mapError(
+          (cause) =>
+            new WsRpcError({
+              message: "Failed to read the thread detail projection readiness fence.",
+              cause,
+              code: "ORCHESTRATION_THREAD_PROJECTION_FENCE_READ_FAILED",
+              retryable: true,
+            }),
+        ),
+      );
+      appliedSequence = projection.snapshotSequence;
+      if (appliedSequence >= throughSequenceInclusive) {
+        return;
+      }
+
+      const retryDelayMs = retryDelaysMs[attempt];
+      if (retryDelayMs === undefined) {
+        break;
+      }
+      yield* Effect.sleep(Duration.millis(retryDelayMs));
+    }
+
+    return yield* new WsRpcError({
+      message: `Thread detail projections are still catching up (applied ${appliedSequence}, required ${throughSequenceInclusive}); restarting the stream for an authoritative turn snapshot.`,
+      code: "ORCHESTRATION_THREAD_PROJECTION_NOT_READY",
+      retryable: true,
+    });
+  });
 }
 
 const failLiveUiStreamForSnapshotResync = (report: LiveUiStreamDropReport) =>
@@ -882,10 +942,48 @@ const makeWsRpcHandlersLayer = () =>
             }).pipe(
               Stream.flatMap((item) => {
                 if (item.kind === "event") {
-                  return Stream.succeed<OrchestrationThreadStreamItem>({
+                  const eventItem: OrchestrationThreadStreamItem = {
                     kind: "event",
                     event: item.event,
-                  });
+                  };
+                  if (!shouldRefreshThreadDetailSnapshotAfterEvent(item.event)) {
+                    return Stream.succeed(eventItem);
+                  }
+
+                  const refreshedSnapshot = awaitThreadDetailProjectionReady(
+                    () => projectionReadModelQuery.getSnapshotSequence(),
+                    item.event.sequence,
+                  ).pipe(
+                    Effect.andThen(
+                      projectionReadModelQuery.getThreadDetailSnapshotById(input.threadId),
+                    ),
+                    Effect.mapError((cause) =>
+                      toWsRpcError(
+                        cause,
+                        "Failed to refresh the terminal thread detail snapshot",
+                      ),
+                    ),
+                    Effect.map(
+                      Option.map(
+                        (snapshot): OrchestrationThreadStreamItem => ({
+                          kind: "snapshot",
+                          snapshot,
+                        }),
+                      ),
+                    ),
+                  );
+
+                  return Stream.concat(
+                    Stream.succeed(eventItem),
+                    Stream.fromEffect(refreshedSnapshot).pipe(
+                      Stream.flatMap(
+                        Option.match({
+                          onNone: () => Stream.empty,
+                          onSome: (snapshotItem) => Stream.succeed(snapshotItem),
+                        }),
+                      ),
+                    ),
+                  );
                 }
                 return Option.isSome(item.snapshot.detail)
                   ? Stream.succeed<OrchestrationThreadStreamItem>({

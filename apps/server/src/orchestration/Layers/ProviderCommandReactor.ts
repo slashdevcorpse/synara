@@ -4228,6 +4228,9 @@ const make = Effect.gen(function* () {
     deliveryRepository.listBlockingDeliveries({
       consumerName: PROVIDER_COMMAND_REACTOR_CONSUMER,
       ...(input.threadId === undefined ? {} : { threadId: input.threadId }),
+      ...(input.afterEventSequence === undefined
+        ? {}
+        : { afterEventSequence: input.afterEventSequence }),
       limit: Math.max(1, Math.min(100, input.limit)),
     });
 

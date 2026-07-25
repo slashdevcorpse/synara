@@ -43,8 +43,10 @@ import {
 } from "@synara/shared/threadSummary";
 import { Effect, Option } from "effect";
 
+import { ProviderService } from "../provider/Services/ProviderService.ts";
 import { threadHasInFlightTurn } from "./commandInvariants.ts";
 import { OrchestrationEngineService } from "./Services/OrchestrationEngine.ts";
+import { ProviderCommandReactor } from "./Services/ProviderCommandReactor.ts";
 import { ProjectionSnapshotQuery } from "./Services/ProjectionSnapshotQuery.ts";
 
 /** The `thread.session.set` variant of the internal orchestration command union. */
@@ -57,6 +59,11 @@ type ThreadActivityAppendCommand = Extract<
   { readonly type: "thread.activity.append" }
 >;
 type RestartReconciliationCommand = ThreadSessionSetCommand | ThreadActivityAppendCommand;
+
+const RESTART_PROVIDER_DELIVERY_RECONCILIATION_LIMIT = 100;
+const RESTART_PROVIDER_DELIVERY_RECONCILED_BY = "server-startup-recovery";
+const RESTART_PROVIDER_DELIVERY_NOTE =
+  "The provider runtime and its target turn ended with the previous server process; the uncertain interrupt is obsolete and must not be replayed.";
 
 /** Minimal persisted thread shape the planner inspects (a superset is fine). */
 export interface ReconcilableThread {
@@ -189,6 +196,51 @@ export function planRestartTurnReconciliation(input: {
   return commands;
 }
 
+interface RestartProviderDeliveryBlocker {
+  readonly eventSequence: number;
+  readonly eventType: string;
+  readonly threadId: ThreadId;
+  readonly state: "dead" | "uncertain";
+}
+
+export interface RestartProviderDeliveryReconciliation {
+  readonly eventSequence: number;
+  readonly threadId: ThreadId;
+  readonly expectedState: "uncertain";
+  readonly outcome: "abandon";
+  readonly reconciledBy: string;
+  readonly note: string;
+}
+
+/**
+ * Process loss is authoritative evidence that an old interrupt can no longer
+ * control a live turn. Abandon only that obsolete uncertain command; ambiguous
+ * starts and every other provider side effect remain fail-closed for explicit
+ * operator reconciliation.
+ */
+export function planRestartProviderDeliveryReconciliations(input: {
+  readonly blockers: ReadonlyArray<RestartProviderDeliveryBlocker>;
+  readonly liveRuntimeThreadIds?: ReadonlySet<ThreadId>;
+}): ReadonlyArray<RestartProviderDeliveryReconciliation> {
+  const liveRuntimeThreadIds = input.liveRuntimeThreadIds ?? new Set<ThreadId>();
+  return input.blockers
+    .filter(
+      (blocker) =>
+        blocker.state === "uncertain" &&
+        blocker.eventType === "thread.turn-interrupt-requested" &&
+        !liveRuntimeThreadIds.has(blocker.threadId),
+    )
+    .toSorted((left, right) => left.eventSequence - right.eventSequence)
+    .map((blocker) => ({
+      eventSequence: blocker.eventSequence,
+      threadId: blocker.threadId,
+      expectedState: "uncertain" as const,
+      outcome: "abandon" as const,
+      reconciledBy: RESTART_PROVIDER_DELIVERY_RECONCILED_BY,
+      note: RESTART_PROVIDER_DELIVERY_NOTE,
+    }));
+}
+
 /**
  * Reconcile restart-orphaned turns once at boot.
  *
@@ -260,6 +312,106 @@ export const reconcileRestartStuckTurns: Effect.Effect<
           }),
         ),
       ),
-    { discard: true },
+    { concurrency: 1, discard: true },
   );
+});
+
+/**
+ * Release durable provider work that was quarantined behind an interrupt whose
+ * target runtime died with the previous process. This runs after stale sessions
+ * are event-sourced to `interrupted` and before commands are admitted.
+ */
+export const reconcileRestartProviderInterruptDeliveries: Effect.Effect<
+  void,
+  never,
+  ProviderCommandReactor | ProviderService
+> = Effect.gen(function* () {
+  const providerCommandReactor = yield* ProviderCommandReactor;
+  const providerService = yield* ProviderService;
+
+  const liveRuntimeThreadIds = new Set(
+    (yield* providerService.listSessions())
+      .filter(
+        (session) =>
+          session.status === "connecting" ||
+          session.status === "running" ||
+          session.activeTurnId !== undefined,
+      )
+      .map((session) => session.threadId),
+  );
+  let afterEventSequence: number | undefined;
+  while (true) {
+    const blockers = yield* providerCommandReactor
+      .listBlockingDeliveries({
+        ...(afterEventSequence === undefined ? {} : { afterEventSequence }),
+        limit: RESTART_PROVIDER_DELIVERY_RECONCILIATION_LIMIT,
+      })
+      .pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning(
+            "restart provider delivery reconciliation skipped: failed to list blockers",
+            { cause },
+          ).pipe(Effect.as([])),
+        ),
+      );
+    if (blockers.length === 0) {
+      return;
+    }
+
+    const reconciliations = planRestartProviderDeliveryReconciliations({
+      blockers,
+      liveRuntimeThreadIds,
+    });
+    if (reconciliations.length > 0) {
+      yield* Effect.logInfo("reconciling obsolete provider interrupts after restart", {
+        reconciliationCount: reconciliations.length,
+        eventSequences: reconciliations.map((entry) => entry.eventSequence),
+        threadIds: reconciliations.map((entry) => entry.threadId),
+      });
+
+      yield* Effect.forEach(
+        reconciliations,
+        (reconciliation) =>
+          providerCommandReactor.reconcileDelivery(reconciliation).pipe(
+            Effect.tap((result) =>
+              result === null
+                ? Effect.logInfo("restart provider interrupt reconciliation became unnecessary", {
+                    eventSequence: reconciliation.eventSequence,
+                    threadId: reconciliation.threadId,
+                  })
+                : Effect.logInfo("restart provider interrupt reconciliation completed", {
+                    eventSequence: result.eventSequence,
+                    threadId: result.threadId,
+                    outcome: result.outcome,
+                    state: result.state,
+                  }),
+            ),
+            Effect.catchCause((cause) =>
+              Effect.logWarning("failed to reconcile obsolete provider interrupt after restart", {
+                eventSequence: reconciliation.eventSequence,
+                threadId: reconciliation.threadId,
+                cause,
+              }),
+            ),
+          ),
+        { concurrency: 1, discard: true },
+      );
+    }
+
+    if (blockers.length < RESTART_PROVIDER_DELIVERY_RECONCILIATION_LIMIT) {
+      return;
+    }
+    const nextCursor = blockers[blockers.length - 1]?.eventSequence;
+    if (
+      nextCursor === undefined ||
+      (afterEventSequence !== undefined && nextCursor <= afterEventSequence)
+    ) {
+      yield* Effect.logWarning(
+        "restart provider delivery reconciliation stopped: blocker cursor did not advance",
+        { afterEventSequence, nextCursor },
+      );
+      return;
+    }
+    afterEventSequence = nextCursor;
+  }
 });
