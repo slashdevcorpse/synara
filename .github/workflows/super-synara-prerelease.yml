@@ -586,7 +586,7 @@ jobs:
     name: Build unsigned macOS arm64 disk image
     needs: [draft_admission, preflight]
     if: ${{ needs.preflight.outputs.include_macos == 'true' }}
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 45
     steps:
       - name: Checkout exact planned source
