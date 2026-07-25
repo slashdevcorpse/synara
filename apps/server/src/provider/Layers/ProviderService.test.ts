@@ -5564,6 +5564,105 @@ durabilitySuccess.layer("ProviderServiceLive adapter durability acknowledgement"
   );
 });
 
+const transientLifecycleEventId = asEventId("runtime-durability-transient-lifecycle");
+const transientLifecyclePersisted = Effect.runSync(Deferred.make<void>());
+const transientLifecycleRestartStarted = Effect.runSync(Deferred.make<ProviderSessionStartInput>());
+const releaseTransientLifecycleRestart = Effect.runSync(Deferred.make<void>());
+const transientLifecycle = makeProviderServiceLayer(
+  {
+    persistRuntimeEvent: (event) =>
+      event.eventId === transientLifecycleEventId
+        ? Deferred.succeed(transientLifecyclePersisted, undefined).pipe(Effect.asVoid)
+        : Effect.void,
+  },
+  { includeCodexDurabilityBarrier: true },
+);
+transientLifecycle.layer("ProviderServiceLive durability acknowledgement lifecycle race", (it) => {
+  it.effect("commits a pending terminal across a transient replacement generation", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService;
+      const directory = yield* ProviderSessionDirectory;
+      const threadId = asThreadId("thread-durability-transient-lifecycle");
+      yield* provider.startSession(threadId, {
+        provider: "codex",
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const turn = yield* provider.sendTurn({
+        threadId,
+        input: "hold the original lifecycle",
+        attachments: [],
+      });
+      transientLifecycle.codex.updateSession(threadId, (session) => ({
+        ...session,
+        status: "running",
+        activeTurnId: turn.turnId,
+      }));
+      const originalBinding = Option.getOrUndefined(yield* directory.getBinding(threadId));
+      assert.isString(originalBinding?.lifecycleGeneration);
+
+      const replacementFailure = new ProviderAdapterProcessError({
+        provider: "codex",
+        threadId,
+        detail: "replacement rejected while terminal durability is pending",
+      });
+      transientLifecycle.codex.startSession.mockImplementationOnce((input) =>
+        Deferred.succeed(transientLifecycleRestartStarted, input).pipe(
+          Effect.andThen(Deferred.await(releaseTransientLifecycleRestart)),
+          Effect.andThen(Effect.fail(replacementFailure)),
+        ),
+      );
+      const replacement = yield* provider
+        .startSession(threadId, {
+          provider: "codex",
+          threadId,
+          runtimeMode: "full-access",
+        })
+        .pipe(Effect.result, Effect.forkChild);
+      const replacementInput = yield* Deferred.await(transientLifecycleRestartStarted);
+      assert.notEqual(replacementInput.lifecycleGeneration, originalBinding?.lifecycleGeneration);
+
+      transientLifecycle.codex.markRuntimeEventPending(transientLifecycleEventId);
+      transientLifecycle.codex.emit({
+        type: "turn.completed",
+        eventId: transientLifecycleEventId,
+        provider: "codex",
+        createdAt: "2026-07-25T12:00:02.000Z",
+        threadId,
+        turnId: turn.turnId,
+        lifecycleGeneration: originalBinding?.lifecycleGeneration,
+        payload: { state: "failed" },
+      });
+
+      yield* Deferred.await(transientLifecyclePersisted);
+      yield* waitUntil(
+        () =>
+          transientLifecycle.codex.acknowledgedDurabilityEventIds.includes(
+            transientLifecycleEventId,
+          ),
+        500,
+        10,
+        "pending terminal durability acknowledgement",
+      );
+      assert.equal(
+        transientLifecycle.codex.isRuntimeEventPending(transientLifecycleEventId),
+        false,
+      );
+      const committedBinding = Option.getOrUndefined(yield* directory.getBinding(threadId));
+      assert.equal(committedBinding?.status, "stopped");
+      assert.equal(asRuntimePayloadRecord(committedBinding?.runtimePayload).activeTurnId, null);
+
+      yield* Deferred.succeed(releaseTransientLifecycleRestart, undefined);
+      const replacementResult = yield* Fiber.join(replacement);
+      assertFailure(replacementResult, replacementFailure);
+    }).pipe(
+      Effect.ensuring(
+        Deferred.succeed(releaseTransientLifecycleRestart, undefined).pipe(Effect.asVoid),
+      ),
+    ),
+  );
+});
+
 const blockedFanoutEventId = asEventId("runtime-durability-blocked-fanout");
 const blockedFanoutCanonicalWrite = Effect.runSync(Deferred.make<void>());
 const blockedFanout = makeProviderServiceLayer(

@@ -1149,22 +1149,28 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
       // logging, and fan-out form one uninterruptible commit sequence.
       Effect.uninterruptible(
         Effect.gen(function* () {
-          if (
-            event.lifecycleGeneration !== undefined &&
-            lifecycle.currentGeneration(event.threadId) !== event.lifecycleGeneration
-          ) {
-            yield* Effect.logDebug("provider.session.stale_generation_event_ignored", {
-              threadId: event.threadId,
-              provider: event.provider,
-              eventType: event.type,
-              eventLifecycleGeneration: event.lifecycleGeneration,
-            });
-            return;
-          }
           const canonicalEvent = event;
           const durabilityBarrier = adapter.runtimeEventDurabilityBarrier;
           const requiresDurabilityAcknowledgement =
             durabilityBarrier !== undefined && (yield* durabilityBarrier.isPending(canonicalEvent));
+          // A failed replacement temporarily advances the in-memory lifecycle
+          // generation. Do not discard the exact adapter-owned terminal during
+          // that window; the strict binding transition below still validates
+          // its persisted lifecycle generation before acknowledgement.
+          if (
+            !requiresDurabilityAcknowledgement &&
+            canonicalEvent.lifecycleGeneration !== undefined &&
+            lifecycle.currentGeneration(canonicalEvent.threadId) !==
+              canonicalEvent.lifecycleGeneration
+          ) {
+            yield* Effect.logDebug("provider.session.stale_generation_event_ignored", {
+              threadId: canonicalEvent.threadId,
+              provider: canonicalEvent.provider,
+              eventType: canonicalEvent.type,
+              eventLifecycleGeneration: canonicalEvent.lifecycleGeneration,
+            });
+            return;
+          }
           if (requiresDurabilityAcknowledgement) {
             if (options?.persistRuntimeEvent === undefined) {
               return yield* Effect.dieMessage(
