@@ -4,8 +4,7 @@ import type { CheckpointServiceError } from "../checkpointing/Errors.ts";
 
 export const OPENCODE_STORAGE_SCHEMA_INCOMPATIBLE_REASON =
   "opencode_storage_schema_incompatible" as const;
-export type ProviderAdapterCompatibilityReason =
-  typeof OPENCODE_STORAGE_SCHEMA_INCOMPATIBLE_REASON;
+export type ProviderAdapterCompatibilityReason = typeof OPENCODE_STORAGE_SCHEMA_INCOMPATIBLE_REASON;
 
 /**
  * ProviderAdapterValidationError - Invalid adapter API input.

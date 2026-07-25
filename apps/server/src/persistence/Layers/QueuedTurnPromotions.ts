@@ -257,9 +257,7 @@ const make = Effect.gen(function* () {
       `.pipe(
         Effect.map((rows) => (rows[0]?.count ?? 0) > 0),
         Effect.mapError(
-          toPersistenceSqlError(
-            "QueuedTurnPromotion.isQueuedEventCancelledByProviderSessionFence",
-          ),
+          toPersistenceSqlError("QueuedTurnPromotion.isQueuedEventCancelledByProviderSessionFence"),
         ),
       );
 

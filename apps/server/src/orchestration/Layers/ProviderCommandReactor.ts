@@ -2360,8 +2360,9 @@ const make = Effect.gen(function* () {
     event: Extract<ProviderIntentEvent, { type: "thread.turn-queued" }>,
   ) {
     const scope = yield* resolveProviderSessionThreadScope(event.payload.threadId);
-    const pendingCompatibilityTerminalAt =
-      pendingOpenCodeCompatibilityTerminalBySessionThread.get(scope.sessionThreadId);
+    const pendingCompatibilityTerminalAt = pendingOpenCodeCompatibilityTerminalBySessionThread.get(
+      scope.sessionThreadId,
+    );
     if (pendingCompatibilityTerminalAt !== undefined) {
       yield* fenceProviderSessionPromotionsThrough({
         scope,

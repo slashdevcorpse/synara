@@ -82,8 +82,7 @@ export type RuntimeTurnState = typeof RuntimeTurnState.Type;
 export const ProviderCompatibilityFailureReason = Schema.Literal(
   "opencode_storage_schema_incompatible",
 );
-export type ProviderCompatibilityFailureReason =
-  typeof ProviderCompatibilityFailureReason.Type;
+export type ProviderCompatibilityFailureReason = typeof ProviderCompatibilityFailureReason.Type;
 
 const RuntimeTaskStatus = Schema.Literals(["pending", "inProgress", "completed"]);
 export type RuntimeTaskStatus = typeof RuntimeTaskStatus.Type;

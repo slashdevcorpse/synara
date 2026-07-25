@@ -5,10 +5,7 @@ import { Deferred, Effect, Exit, Fiber, Layer, Result, Scope, Stream } from "eff
 import { describe, it, expect, vi } from "vitest";
 
 import { ServerConfig } from "../../config.ts";
-import {
-  ProviderAdapterCompatibilityError,
-  ProviderAdapterRequestError,
-} from "../Errors.ts";
+import { ProviderAdapterCompatibilityError, ProviderAdapterRequestError } from "../Errors.ts";
 import {
   findProviderProcessExitUnprovenError,
   ProviderProcessExitUnprovenError,

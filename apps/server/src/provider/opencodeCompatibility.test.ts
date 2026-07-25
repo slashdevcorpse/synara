@@ -148,8 +148,14 @@ describe("isStructuredOpenCodeSessionNotFound", () => {
   });
 
   it.each([
-    ["wrong status", { response: { status: 500 }, error: { name: "NotFoundError", data: { message: "missing" } } }],
-    ["wrong type", { response: { status: 404 }, error: { name: "UnknownError", data: { message: "missing" } } }],
+    [
+      "wrong status",
+      { response: { status: 500 }, error: { name: "NotFoundError", data: { message: "missing" } } },
+    ],
+    [
+      "wrong type",
+      { response: { status: 404 }, error: { name: "UnknownError", data: { message: "missing" } } },
+    ],
     ["missing response", { error: { name: "NotFoundError", data: { message: "missing" } } }],
     ["malformed data", { response: { status: 404 }, error: { name: "NotFoundError", data: {} } }],
   ])("rejects a %s resume failure", (_name, cause) => {

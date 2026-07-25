@@ -27,9 +27,7 @@ export interface OpenCodeCompatibilityClassifierInput {
 }
 
 function hasExactConstraintLine(message: string): boolean {
-  return message
-    .split(/\r?\n/u)
-    .some((line) => line.trim() === OPENCODE_SCHEMA_CONSTRAINT_MESSAGE);
+  return message.split(/\r?\n/u).some((line) => line.trim() === OPENCODE_SCHEMA_CONSTRAINT_MESSAGE);
 }
 
 function errorEnvelopeContainsExactConstraint(
