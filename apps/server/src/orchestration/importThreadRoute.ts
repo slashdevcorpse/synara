@@ -1,7 +1,7 @@
 // FILE: importThreadRoute.ts
 // Purpose: Imports provider-native sessions and binds them to Synara thread projections.
 // Layer: Orchestration command handler
-// Exports: makeImportThreadHandler.
+// Exports: makeImportThreadHandler and the provider import cursor mapper.
 
 import {
   getSessionInfo as getClaudeSessionInfo,
@@ -44,8 +44,10 @@ function importMessagesError(message: string): ImportThreadError {
   return new ImportThreadError({ message });
 }
 
-function providerResumeCursorForImport(provider: ProviderKind, externalId: string): unknown {
+export function providerResumeCursorForImport(provider: ProviderKind, externalId: string): unknown {
   switch (provider) {
+    case "commandCode":
+      return { sessionId: externalId, totalProcessedTokens: 0 };
     case "claudeAgent":
       return { resume: externalId };
     case "droid":
