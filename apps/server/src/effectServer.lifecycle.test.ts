@@ -45,8 +45,11 @@ describe("server runtime pipeline shutdown", () => {
           }),
         },
         providerRuntimeIngestion: {
-          drain: Effect.sync(() => {
+          closeRuntimeEventSource: Effect.sync(() => {
             expect(terminalAccepted).toBe(true);
+            order.push("provider-runtime-source-closed");
+          }),
+          drain: Effect.sync(() => {
             terminalPersisted = true;
             order.push("provider-runtime-journal-drained");
           }),
@@ -66,6 +69,7 @@ describe("server runtime pipeline shutdown", () => {
       "engine-quiesced",
       "admitted-commands-drained",
       "provider-terminal-events-fenced",
+      "provider-runtime-source-closed",
       "provider-runtime-journal-drained",
       "reactors-drained",
       "managed-attachments-drained",

@@ -19,7 +19,19 @@ import {
   type ProviderRuntimeEvent,
   type RuntimeMode,
 } from "@synara/contracts";
-import { Cache, Cause, Deferred, Duration, Effect, Exit, Layer, Option, Ref, Stream } from "effect";
+import {
+  Cache,
+  Cause,
+  Deferred,
+  Duration,
+  Effect,
+  Exit,
+  Fiber,
+  Layer,
+  Option,
+  Ref,
+  Stream,
+} from "effect";
 import * as Semaphore from "effect/Semaphore";
 import { makeDrainableWorker, startDrainableWorkerProducers } from "@synara/shared/DrainableWorker";
 import {
@@ -3066,31 +3078,40 @@ const make = Effect.gen(function* () {
     }
   });
   const startupRuntimeReplayComplete = yield* Deferred.make<void>();
+  const providerRuntimeEventSourceFiber =
+    yield* Deferred.make<Fiber.Fiber<void, never> | null>();
 
   const start: ProviderRuntimeIngestionShape["start"] = startDrainableWorkerProducers(
     worker,
     Effect.gen(function* () {
       if (!providerService.runtimeEventsPersistedBeforeFanout) {
-        yield* Effect.forkScoped(
+        const runtimeEventSourceFiber = yield* Effect.forkScoped(
           Stream.runForEach(providerService.streamEvents, (event) =>
-            runtimeEvents.append(event).pipe(
-              Effect.flatMap((persisted) =>
-                Deferred.await(startupRuntimeReplayComplete).pipe(
-                  Effect.andThen(drainRuntimeJournalThrough(persisted.sequence)),
+            Effect.uninterruptible(
+              runtimeEvents.append(event).pipe(
+                Effect.flatMap((persisted) =>
+                  Deferred.await(startupRuntimeReplayComplete).pipe(
+                    Effect.andThen(drainRuntimeJournalThrough(persisted.sequence)),
+                  ),
                 ),
-              ),
-              Effect.catchCause((cause) =>
-                Cause.hasInterruptsOnly(cause)
-                  ? Effect.failCause(cause)
-                  : Effect.logWarning("provider runtime event journal ingestion failed", {
-                      eventId: event.eventId,
-                      eventType: event.type,
-                      cause: Cause.pretty(cause),
-                    }),
+                Effect.catchCause((cause) =>
+                  Cause.hasInterruptsOnly(cause)
+                    ? Effect.failCause(cause)
+                    : Effect.logWarning("provider runtime event journal ingestion failed", {
+                        eventId: event.eventId,
+                        eventType: event.type,
+                        cause: Cause.pretty(cause),
+                      }),
+                ),
               ),
             ),
           ),
         );
+        yield* Deferred.succeed(providerRuntimeEventSourceFiber, runtimeEventSourceFiber).pipe(
+          Effect.orDie,
+        );
+      } else {
+        yield* Deferred.succeed(providerRuntimeEventSourceFiber, null).pipe(Effect.orDie);
       }
       yield* Effect.forkScoped(
         Stream.runForEach(orchestrationEngine.streamDomainEvents, (event) => {
@@ -3132,23 +3153,39 @@ const make = Effect.gen(function* () {
       );
     }
   }).pipe(Effect.orDie);
+  const closeRuntimeEventSource = yield* Effect.cached(
+    Deferred.await(providerRuntimeEventSourceFiber).pipe(
+      Effect.flatMap((fiber) => (fiber === null ? Effect.void : Fiber.interrupt(fiber))),
+      Effect.asVoid,
+      Effect.uninterruptible,
+    ),
+  );
 
   return {
     start,
     drain: drainThroughCurrentHighWater,
+    closeRuntimeEventSource,
   } satisfies ProviderRuntimeIngestionShape;
 });
 
-export const ProviderRuntimeIngestionLive = Layer.effect(
+/**
+ * Provider runtime ingestion with its durable event repository left unprovided.
+ *
+ * Production should use {@link ProviderRuntimeIngestionLive}. This seam lets
+ * focused tests replace the repository so shutdown races can be controlled
+ * without changing runtime behavior.
+ */
+export const ProviderRuntimeIngestionWithoutRuntimeEventRepository = Layer.effect(
   ProviderRuntimeIngestionService,
   make,
 ).pipe(
   Layer.provide(
-    Layer.mergeAll(
-      ProjectionTurnRepositoryLive,
-      ProviderRuntimeEventRepositoryLive,
-      OrchestrationCommandReceiptRepositoryLive,
-    ),
+    Layer.mergeAll(ProjectionTurnRepositoryLive, OrchestrationCommandReceiptRepositoryLive),
   ),
   Layer.provideMerge(ProviderRequestAdmissionRepositoryLive),
 );
+
+export const ProviderRuntimeIngestionLive =
+  ProviderRuntimeIngestionWithoutRuntimeEventRepository.pipe(
+    Layer.provide(ProviderRuntimeEventRepositoryLive),
+  );
