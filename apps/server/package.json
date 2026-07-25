@@ -54,7 +54,7 @@
     "tsdown": "catalog:",
     "typescript": "catalog:",
     "vitest": "catalog:",
-    "zod": "4.3.6"
+    "zod": "4.4.3"
   },
   "engines": {
     "node": "^22.19 || ^23.11 || >=24.10"
