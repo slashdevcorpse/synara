@@ -35,6 +35,10 @@ import {
   type ProjectionSnapshotQueryShape,
 } from "./orchestration/Services/ProjectionSnapshotQuery";
 import { ProviderCommandReactor } from "./orchestration/Services/ProviderCommandReactor";
+import {
+  ProviderRuntimeIngestionService,
+  type ProviderRuntimeIngestionShape,
+} from "./orchestration/Services/ProviderRuntimeIngestion";
 import { ThreadDeletionReactor } from "./orchestration/Services/ThreadDeletionReactor";
 import {
   reconcileRestartProviderInterruptDeliveries,
@@ -78,6 +82,7 @@ export interface ServerShape {
     | OrchestrationReactor
     | ProjectionSnapshotQuery
     | ProviderCommandReactor
+    | ProviderRuntimeIngestionService
     | ProviderSessionReaper
     | ProviderService
     | ServerRuntimeStartup
@@ -103,15 +108,22 @@ export class ServerLifecycleError extends Schema.TaggedErrorClass<ServerLifecycl
 export function closeServerRuntimePipeline(input: {
   readonly orchestrationEngine: Pick<OrchestrationEngineShape, "quiesce" | "drain" | "stop">;
   readonly providerService: Pick<ProviderServiceShape, "closeRuntimeEvents">;
+  readonly providerRuntimeIngestion: Pick<
+    ProviderRuntimeIngestionShape,
+    "closeRuntimeEventSource" | "drain"
+  >;
   readonly managedAttachmentCleanup: Pick<ManagedAttachmentCleanupShape, "drain">;
   readonly subscriptionsScope: Scope.Closeable;
 }): Effect.Effect<void> {
   return input.orchestrationEngine.quiesce.pipe(
     // Drain already-admitted commands while every subscriber is live. Provider
-    // close then fences terminal runtime events into subscriber workers; scope
-    // close drains those workers before the engine accepts its final stop.
+    // close then fences terminal runtime events into the durable journal. Drain
+    // that journal through its current high-water mark before closing reactor
+    // scopes and allowing the engine to accept its final stop.
     Effect.andThen(input.orchestrationEngine.drain),
     Effect.andThen(input.providerService.closeRuntimeEvents),
+    Effect.andThen(input.providerRuntimeIngestion.closeRuntimeEventSource),
+    Effect.andThen(input.providerRuntimeIngestion.drain),
     Effect.andThen(Scope.close(input.subscriptionsScope, Exit.void)),
     Effect.andThen(input.managedAttachmentCleanup.drain),
     Effect.andThen(input.orchestrationEngine.stop),
@@ -176,6 +188,7 @@ export const createEffectServer = Effect.fn(function* (
   const orchestrationReactor = yield* OrchestrationReactor;
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
   const providerService = yield* ProviderService;
+  const providerRuntimeIngestion = yield* ProviderRuntimeIngestionService;
   const providerSessionReaper = yield* ProviderSessionReaper;
   const runtimeStartup = yield* ServerRuntimeStartup;
   const serverSettings = yield* ServerSettingsService;
@@ -264,6 +277,7 @@ export const createEffectServer = Effect.fn(function* (
     closeServerRuntimePipeline({
       orchestrationEngine,
       providerService,
+      providerRuntimeIngestion,
       managedAttachmentCleanup,
       subscriptionsScope,
     }),

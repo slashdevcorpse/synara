@@ -21,8 +21,8 @@ describe("server runtime pipeline shutdown", () => {
         subscriptionsScope,
         Effect.sync(() => {
           expect(terminalAccepted).toBe(true);
-          terminalPersisted = true;
-          order.push("reactors-drained-and-persisted");
+          expect(terminalPersisted).toBe(true);
+          order.push("reactors-drained");
         }),
       ),
     );
@@ -44,6 +44,16 @@ describe("server runtime pipeline shutdown", () => {
             order.push("provider-terminal-events-fenced");
           }),
         },
+        providerRuntimeIngestion: {
+          closeRuntimeEventSource: Effect.sync(() => {
+            expect(terminalAccepted).toBe(true);
+            order.push("provider-runtime-source-closed");
+          }),
+          drain: Effect.sync(() => {
+            terminalPersisted = true;
+            order.push("provider-runtime-journal-drained");
+          }),
+        },
         managedAttachmentCleanup: {
           drain: Effect.sync(() => {
             expect(terminalPersisted).toBe(true);
@@ -59,7 +69,9 @@ describe("server runtime pipeline shutdown", () => {
       "engine-quiesced",
       "admitted-commands-drained",
       "provider-terminal-events-fenced",
-      "reactors-drained-and-persisted",
+      "provider-runtime-source-closed",
+      "provider-runtime-journal-drained",
+      "reactors-drained",
       "managed-attachments-drained",
       "engine-stopped",
     ]);
