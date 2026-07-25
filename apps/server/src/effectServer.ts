@@ -34,8 +34,12 @@ import {
   ProjectionSnapshotQuery,
   type ProjectionSnapshotQueryShape,
 } from "./orchestration/Services/ProjectionSnapshotQuery";
+import { ProviderCommandReactor } from "./orchestration/Services/ProviderCommandReactor";
 import { ThreadDeletionReactor } from "./orchestration/Services/ThreadDeletionReactor";
-import { reconcileRestartStuckTurns } from "./orchestration/startupTurnReconciliation";
+import {
+  reconcileRestartProviderInterruptDeliveries,
+  reconcileRestartStuckTurns,
+} from "./orchestration/startupTurnReconciliation";
 import { ProviderSessionReaper } from "./provider/Services/ProviderSessionReaper";
 import { ProviderService, type ProviderServiceShape } from "./provider/Services/ProviderService";
 import { ServerLifecycleEvents } from "./serverLifecycleEvents";
@@ -73,6 +77,7 @@ export interface ServerShape {
     | OrchestrationEngineService
     | OrchestrationReactor
     | ProjectionSnapshotQuery
+    | ProviderCommandReactor
     | ProviderSessionReaper
     | ProviderService
     | ServerRuntimeStartup
@@ -274,6 +279,10 @@ export const createEffectServer = Effect.fn(function* (
   // died, so they can never complete on their own) before clients can observe
   // the stale "Working" state.
   yield* reconcileRestartStuckTurns;
+  // An uncertain interrupt from the previous process cannot affect a live
+  // provider turn after restart. Settle only that obsolete blocker through the
+  // reactor so later durable work can replay and drain before command admission.
+  yield* reconcileRestartProviderInterruptDeliveries;
   yield* runtimeStartup.markCommandReady;
 
   yield* lifecycleEvents.publish({

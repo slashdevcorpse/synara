@@ -1,8 +1,19 @@
 import { EventId, ThreadId, TurnId } from "@synara/contracts";
+import { Effect, Layer } from "effect";
 import { describe, expect, it } from "vitest";
 
 import {
+  ProviderService,
+  type ProviderServiceShape,
+} from "../provider/Services/ProviderService.ts";
+import {
+  ProviderCommandReactor,
+  type ProviderCommandReactorShape,
+} from "./Services/ProviderCommandReactor.ts";
+import {
+  planRestartProviderDeliveryReconciliations,
   planRestartTurnReconciliation,
+  reconcileRestartProviderInterruptDeliveries,
   type ReconcilableThread,
 } from "./startupTurnReconciliation.ts";
 
@@ -331,5 +342,349 @@ describe("planRestartTurnReconciliation", () => {
     const second = planRestartTurnReconciliation({ threads, now: NOW });
     expect(first[0]?.commandId).toBe(second[0]?.commandId);
     expect(first[0]?.commandId).toBe(`restart-reconcile:stuck:${NOW}`);
+  });
+});
+
+describe("planRestartProviderDeliveryReconciliations", () => {
+  const blocker = (
+    eventSequence: number,
+    overrides: Partial<{
+      eventType: string;
+      threadId: ThreadId;
+      state: "dead" | "uncertain";
+    }> = {},
+  ) => ({
+    eventSequence,
+    eventType: "thread.turn-interrupt-requested",
+    threadId: ThreadId.makeUnsafe(`thread-${eventSequence}`),
+    state: "uncertain" as const,
+    ...overrides,
+  });
+
+  const deliveryEvidence = (
+    eventSequence: number,
+    overrides: Parameters<typeof blocker>[1] = {},
+  ) => ({
+    ...blocker(eventSequence, overrides),
+    consumerName: "provider-command-reactor.v1",
+    eventId: EventId.makeUnsafe(`event-${eventSequence}`),
+    occurredAt: NOW,
+    attemptCount: 1,
+    lastError: "Timed out waiting for provider delivery.",
+    updatedAt: NOW,
+    lastReconciliationOutcome: null,
+    lastReconciledAt: null,
+    lastReconciledBy: null,
+    lastReconciliationNote: null,
+  });
+
+  it("abandons only obsolete uncertain interrupts in source order", () => {
+    const reconciliations = planRestartProviderDeliveryReconciliations({
+      blockers: [
+        blocker(8),
+        blocker(3),
+        blocker(4, { state: "dead" }),
+        blocker(5, { eventType: "thread.turn-start-requested" }),
+      ],
+    });
+
+    expect(reconciliations).toEqual([
+      expect.objectContaining({
+        eventSequence: 3,
+        threadId: "thread-3",
+        expectedState: "uncertain",
+        outcome: "abandon",
+        reconciledBy: "server-startup-recovery",
+      }),
+      expect.objectContaining({
+        eventSequence: 8,
+        threadId: "thread-8",
+        expectedState: "uncertain",
+        outcome: "abandon",
+        reconciledBy: "server-startup-recovery",
+      }),
+    ]);
+    expect(reconciliations.every((entry) => entry.note.includes("must not be replayed"))).toBe(
+      true,
+    );
+  });
+
+  it("leaves an uncertain interrupt quarantined when a replacement runtime is live", () => {
+    const liveThreadId = ThreadId.makeUnsafe("thread-live");
+
+    expect(
+      planRestartProviderDeliveryReconciliations({
+        blockers: [blocker(10, { threadId: liveThreadId })],
+        liveRuntimeThreadIds: new Set([liveThreadId]),
+      }),
+    ).toEqual([]);
+  });
+
+  it("reconciles eligible blockers sequentially through the provider reactor", async () => {
+    const reconciledSequences: number[] = [];
+    const liveThreadId = ThreadId.makeUnsafe("thread-live");
+    const connectingThreadId = ThreadId.makeUnsafe("thread-connecting");
+    const activeTurnThreadId = ThreadId.makeUnsafe("thread-active-turn");
+    const reactor = {
+      start: Effect.void,
+      drain: Effect.void,
+      listBlockingDeliveries: () =>
+        Effect.succeed([
+          {
+            ...blocker(12),
+            consumerName: "provider-command-reactor.v1",
+            eventId: EventId.makeUnsafe("event-12"),
+            occurredAt: NOW,
+            attemptCount: 1,
+            lastError: "Timed out waiting for turn/interrupt.",
+            updatedAt: NOW,
+            lastReconciliationOutcome: null,
+            lastReconciledAt: null,
+            lastReconciledBy: null,
+            lastReconciliationNote: null,
+          },
+          {
+            ...blocker(14, { threadId: connectingThreadId }),
+            consumerName: "provider-command-reactor.v1",
+            eventId: EventId.makeUnsafe("event-14"),
+            occurredAt: NOW,
+            attemptCount: 1,
+            lastError: "Timed out waiting for turn/interrupt.",
+            updatedAt: NOW,
+            lastReconciliationOutcome: null,
+            lastReconciledAt: null,
+            lastReconciledBy: null,
+            lastReconciliationNote: null,
+          },
+          {
+            ...blocker(13, { threadId: activeTurnThreadId }),
+            consumerName: "provider-command-reactor.v1",
+            eventId: EventId.makeUnsafe("event-13"),
+            occurredAt: NOW,
+            attemptCount: 1,
+            lastError: "Timed out waiting for turn/interrupt.",
+            updatedAt: NOW,
+            lastReconciliationOutcome: null,
+            lastReconciledAt: null,
+            lastReconciledBy: null,
+            lastReconciliationNote: null,
+          },
+          {
+            ...blocker(11, { threadId: liveThreadId }),
+            consumerName: "provider-command-reactor.v1",
+            eventId: EventId.makeUnsafe("event-11"),
+            occurredAt: NOW,
+            attemptCount: 1,
+            lastError: "Timed out waiting for turn/interrupt.",
+            updatedAt: NOW,
+            lastReconciliationOutcome: null,
+            lastReconciledAt: null,
+            lastReconciledBy: null,
+            lastReconciliationNote: null,
+          },
+          {
+            ...blocker(10),
+            consumerName: "provider-command-reactor.v1",
+            eventId: EventId.makeUnsafe("event-10"),
+            occurredAt: NOW,
+            attemptCount: 1,
+            lastError: "Timed out waiting for turn/interrupt.",
+            updatedAt: NOW,
+            lastReconciliationOutcome: null,
+            lastReconciledAt: null,
+            lastReconciledBy: null,
+            lastReconciliationNote: null,
+          },
+        ]),
+      reconcileDelivery: (input: { readonly eventSequence: number; readonly threadId: ThreadId }) =>
+        Effect.sync(() => {
+          reconciledSequences.push(input.eventSequence);
+          return {
+            eventSequence: input.eventSequence,
+            threadId: input.threadId,
+            outcome: "abandon" as const,
+            state: "succeeded" as const,
+            reconciledAt: NOW,
+          };
+        }),
+    } as unknown as ProviderCommandReactorShape;
+    const providerService = {
+      listSessions: () =>
+        Effect.succeed([
+          {
+            provider: "codex",
+            status: "running",
+            runtimeMode: "full-access",
+            threadId: liveThreadId,
+            createdAt: NOW,
+            updatedAt: NOW,
+          },
+          {
+            provider: "codex",
+            status: "connecting",
+            runtimeMode: "full-access",
+            threadId: connectingThreadId,
+            createdAt: NOW,
+            updatedAt: NOW,
+          },
+          {
+            provider: "codex",
+            status: "ready",
+            runtimeMode: "full-access",
+            threadId: activeTurnThreadId,
+            activeTurnId: TurnId.makeUnsafe("turn-active"),
+            createdAt: NOW,
+            updatedAt: NOW,
+          },
+        ]),
+    } as unknown as ProviderServiceShape;
+
+    await Effect.runPromise(
+      reconcileRestartProviderInterruptDeliveries.pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            Layer.succeed(ProviderCommandReactor, reactor),
+            Layer.succeed(ProviderService, providerService),
+          ),
+        ),
+      ),
+    );
+
+    expect(reconciledSequences).toEqual([10, 12]);
+  });
+
+  it("pages past unrelated blockers to reconcile a later obsolete interrupt", async () => {
+    const observedCursors: Array<number | undefined> = [];
+    const reconciledSequences: number[] = [];
+    const firstPage = Array.from({ length: 100 }, (_, index) =>
+      deliveryEvidence(index + 1, {
+        eventType: "thread.turn-start-requested",
+      }),
+    );
+    const reactor = {
+      start: Effect.void,
+      drain: Effect.void,
+      listBlockingDeliveries: (input: { readonly afterEventSequence?: number | undefined }) => {
+        observedCursors.push(input.afterEventSequence);
+        if (input.afterEventSequence === undefined) {
+          return Effect.succeed(firstPage);
+        }
+        if (input.afterEventSequence === 100) {
+          return Effect.succeed([deliveryEvidence(101)]);
+        }
+        return Effect.succeed([]);
+      },
+      reconcileDelivery: (input: { readonly eventSequence: number; readonly threadId: ThreadId }) =>
+        Effect.sync(() => {
+          reconciledSequences.push(input.eventSequence);
+          return {
+            eventSequence: input.eventSequence,
+            threadId: input.threadId,
+            outcome: "abandon" as const,
+            state: "succeeded" as const,
+            reconciledAt: NOW,
+          };
+        }),
+    } as unknown as ProviderCommandReactorShape;
+    const providerService = {
+      listSessions: () => Effect.succeed([]),
+    } as unknown as ProviderServiceShape;
+
+    await Effect.runPromise(
+      reconcileRestartProviderInterruptDeliveries.pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            Layer.succeed(ProviderCommandReactor, reactor),
+            Layer.succeed(ProviderService, providerService),
+          ),
+        ),
+      ),
+    );
+
+    expect(observedCursors).toEqual([undefined, 100]);
+    expect(reconciledSequences).toEqual([101]);
+  });
+
+  it("fails closed when startup cannot list blocking deliveries", async () => {
+    const listingFailure = new Error("injected blocker listing failure");
+    let reconciliationAttempted = false;
+    let continuedAfterReconciliation = false;
+    const reactor = {
+      start: Effect.void,
+      drain: Effect.void,
+      listBlockingDeliveries: () => Effect.fail(listingFailure),
+      reconcileDelivery: () =>
+        Effect.sync(() => {
+          reconciliationAttempted = true;
+          return null;
+        }),
+    } as unknown as ProviderCommandReactorShape;
+    const providerService = {
+      listSessions: () => Effect.succeed([]),
+    } as unknown as ProviderServiceShape;
+    const program = reconcileRestartProviderInterruptDeliveries.pipe(
+      Effect.andThen(
+        Effect.sync(() => {
+          continuedAfterReconciliation = true;
+        }),
+      ),
+      Effect.provide(
+        Layer.mergeAll(
+          Layer.succeed(ProviderCommandReactor, reactor),
+          Layer.succeed(ProviderService, providerService),
+        ),
+      ),
+    );
+
+    await expect(Effect.runPromise(program)).rejects.toThrow("injected blocker listing failure");
+    expect(reconciliationAttempted).toBe(false);
+    expect(continuedAfterReconciliation).toBe(false);
+  });
+
+  it("fails closed on the first delivery reconciliation error", async () => {
+    const reconciliationFailure = new Error("injected delivery reconciliation failure");
+    const attemptedSequences: number[] = [];
+    let continuedAfterReconciliation = false;
+    const reactor = {
+      start: Effect.void,
+      drain: Effect.void,
+      listBlockingDeliveries: () => Effect.succeed([deliveryEvidence(10), deliveryEvidence(11)]),
+      reconcileDelivery: (input: { readonly eventSequence: number; readonly threadId: ThreadId }) =>
+        Effect.gen(function* () {
+          attemptedSequences.push(input.eventSequence);
+          if (input.eventSequence === 10) {
+            return yield* Effect.fail(reconciliationFailure);
+          }
+          return {
+            eventSequence: input.eventSequence,
+            threadId: input.threadId,
+            outcome: "abandon" as const,
+            state: "succeeded" as const,
+            reconciledAt: NOW,
+          };
+        }),
+    } as unknown as ProviderCommandReactorShape;
+    const providerService = {
+      listSessions: () => Effect.succeed([]),
+    } as unknown as ProviderServiceShape;
+    const program = reconcileRestartProviderInterruptDeliveries.pipe(
+      Effect.andThen(
+        Effect.sync(() => {
+          continuedAfterReconciliation = true;
+        }),
+      ),
+      Effect.provide(
+        Layer.mergeAll(
+          Layer.succeed(ProviderCommandReactor, reactor),
+          Layer.succeed(ProviderService, providerService),
+        ),
+      ),
+    );
+
+    await expect(Effect.runPromise(program)).rejects.toThrow(
+      "injected delivery reconciliation failure",
+    );
+    expect(attemptedSequences).toEqual([10]);
+    expect(continuedAfterReconciliation).toBe(false);
   });
 });

@@ -75,6 +75,7 @@ import {
 import {
   isWindowsJobPreparedCommand,
   prepareResolvedWindowsProviderProcess,
+  prepareResolvedWindowsProviderProcessAsync,
   prepareWindowsProviderProcess,
   WINDOWS_JOB_LAUNCHER_EXECUTABLE,
   WINDOWS_JOB_LAUNCHER_PROTOCOL_VERSION,
@@ -5381,8 +5382,9 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
         const status = yield* makeProductionCheckCodexProviderStatus(shimPath, undefined, {
           ...TEST_PROVIDER_LAYER_PROCESS_OPTIONS,
           platform: "win32",
+          resolveCodexExecutable: () => ({ executable: shimPath }),
           prepareResolvedProcess: (command, args, options = {}) =>
-            prepareResolvedWindowsProviderProcess(command, args, {
+            prepareResolvedWindowsProviderProcessAsync(command, args, {
               ...options,
               platform: "win32",
               launcherPath,
@@ -5416,6 +5418,33 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
         Effect.ensuring(Effect.sync(() => platform.mockRestore())),
       );
     });
+
+    it.effect("fails closed when Codex bundle resolution has no usable native target", () =>
+      Effect.gen(function* () {
+        yield* withTempCodexHome();
+        let spawnCount = 0;
+        const status = yield* makeProductionCheckCodexProviderStatus(undefined, undefined, {
+          ...TEST_PROVIDER_PROCESS_OPTIONS,
+          platform: "win32",
+          resolveCodexExecutable: () => ({
+            executable: "codex",
+            discoveryOutcome: "transient_failure",
+          }),
+        }).pipe(
+          Effect.provide(
+            mockSpawnerLayer(() => {
+              spawnCount += 1;
+              return { stdout: "codex 1.0.0\n", stderr: "", code: 0 };
+            }),
+          ),
+        );
+
+        assert.strictEqual(status.status, "error");
+        assert.strictEqual(status.available, false);
+        assert.match(status.message ?? "", /Windows command discovery was temporarily unavailable/);
+        assert.strictEqual(spawnCount, 0);
+      }),
+    );
 
     it.effect("uses configured codex home for version, config, and auth probes", () => {
       let sawLoginStatusProbe = false;

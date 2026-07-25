@@ -2,6 +2,8 @@
 // Purpose: Verifies deterministic Windows Codex CLI executable selection.
 // Layer: Shared Node runtime utility tests
 
+import * as Path from "node:path";
+
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -22,6 +24,54 @@ function regularFiles(...paths: string[]) {
       throw Object.assign(new Error(`Missing file: ${path}`), { code: "ENOENT" });
     }
     return { isFile: () => true };
+  });
+}
+
+function codexPackageRoot(executable: string): string {
+  return Path.win32.dirname(Path.win32.dirname(executable));
+}
+
+function completeCodexBundle(executable: string): [string, string, string] {
+  const resources = Path.win32.join(codexPackageRoot(executable), "codex-resources");
+  return [
+    executable,
+    Path.win32.join(resources, "codex-command-runner.exe"),
+    Path.win32.join(resources, "codex-windows-sandbox-setup.exe"),
+  ];
+}
+
+function nestedNpmVendorCodex(shim: string, arch: "x64" | "arm64" = "x64"): string {
+  const platformPackage = arch === "arm64" ? "codex-win32-arm64" : "codex-win32-x64";
+  const target = arch === "arm64" ? "aarch64-pc-windows-msvc" : "x86_64-pc-windows-msvc";
+  return Path.win32.join(
+    Path.win32.dirname(shim),
+    "node_modules",
+    "@openai",
+    "codex",
+    "node_modules",
+    "@openai",
+    platformPackage,
+    "vendor",
+    target,
+    "bin",
+    "codex.exe",
+  );
+}
+
+function codexVersions(...entries: ReadonlyArray<readonly [executable: string, version: string]>) {
+  const manifests = new Map(
+    entries.map(([executable, version]) => [
+      Path.win32.join(codexPackageRoot(executable), "codex-package.json").toLowerCase(),
+      JSON.stringify({ version }),
+    ]),
+  );
+  return vi.fn((path: string, encoding: "utf8") => {
+    expect(encoding).toBe("utf8");
+    const manifest = manifests.get(path.toLowerCase());
+    if (manifest === undefined) {
+      throw Object.assign(new Error(`Missing file: ${path}`), { code: "ENOENT" });
+    }
+    return manifest;
   });
 }
 
@@ -64,32 +114,41 @@ describe("resolveCodexCliExecutable", () => {
     expect(readStat).not.toHaveBeenCalled();
   });
 
-  it.each([
-    {
-      configured: "C:\\Users\\test\\AppData\\Roaming\\npm\\codex",
-      resolved: "C:\\Users\\test\\AppData\\Roaming\\npm\\codex.cmd",
-    },
-    {
-      configured: "custom-codex",
-      resolved: "C:\\tools\\custom-codex.cmd",
-    },
-  ])(
-    "resolves the explicit extensionless command $configured exactly once",
-    ({ configured, resolved }) => {
-      const spawnSync = whereOutput(resolved);
+  it("resolves an explicit extensionless Codex command to its complete native package", () => {
+    const configured = "C:\\Users\\test\\AppData\\Roaming\\npm\\codex";
+    const shim = "C:\\Users\\test\\AppData\\Roaming\\npm\\codex.cmd";
+    const native = nestedNpmVendorCodex(shim);
+    const spawnSync = whereOutput(shim);
 
-      expect(
-        resolveCodexCliExecutable(configured, {
-          platform: "win32",
-          cwd: "C:\\projects\\synara",
-          env: { SystemRoot: "C:\\Windows" },
-          spawnSync,
-          statSync: vi.fn(),
-        }),
-      ).toBe(resolved);
-      expect(spawnSync).toHaveBeenCalledTimes(1);
-    },
-  );
+    expect(
+      resolveCodexCliExecutable(configured, {
+        platform: "win32",
+        arch: "x64",
+        cwd: "C:\\projects\\synara",
+        env: { SystemRoot: "C:\\Windows" },
+        spawnSync,
+        statSync: regularFiles(shim, ...completeCodexBundle(native)),
+      }),
+    ).toBe(native);
+    expect(spawnSync).toHaveBeenCalledTimes(1);
+  });
+
+  it("resolves an unknown explicit extensionless command exactly once", () => {
+    const configured = "custom-codex";
+    const resolved = "C:\\tools\\custom-codex.cmd";
+    const spawnSync = whereOutput(resolved);
+
+    expect(
+      resolveCodexCliExecutable(configured, {
+        platform: "win32",
+        cwd: "C:\\projects\\synara",
+        env: { SystemRoot: "C:\\Windows" },
+        spawnSync,
+        statSync: vi.fn(),
+      }),
+    ).toBe(resolved);
+    expect(spawnSync).toHaveBeenCalledTimes(1);
+  });
 
   it("keeps a failed explicit alias without consulting default fallbacks", () => {
     const fallback = "D:\\Codex\\codex.exe";
@@ -115,7 +174,7 @@ describe("resolveCodexCliExecutable", () => {
     const native = "C:\\Users\\Test User\\AppData\\Local\\Programs\\OpenAI\\Codex\\bin\\codex.exe";
     const installDirNative = "D:\\Codex\\codex.exe";
     const spawnSync = whereOutput(extensionless, batch, native);
-    const readStat = regularFiles(batch, native, installDirNative);
+    const readStat = regularFiles(batch, ...completeCodexBundle(native), installDirNative);
 
     expect(
       resolveCodexCliExecutable(" CoDeX ", {
@@ -153,7 +212,7 @@ describe("resolveCodexCliExecutable", () => {
         cwd: "C:\\projects\\synara",
         env: { systemroot: "C:\\Windows", codex_install_dir: " D:\\OpenAI CLI " },
         spawnSync: whereOutput(batch),
-        statSync: regularFiles(batch, native),
+        statSync: regularFiles(batch, ...completeCodexBundle(native)),
       }),
     ).toBe(native);
   });
@@ -171,50 +230,133 @@ describe("resolveCodexCliExecutable", () => {
           localappdata: "C:\\Users\\Test User\\AppData\\Local",
         },
         spawnSync: whereOutput(batch),
-        statSync: regularFiles(batch, native),
+        statSync: regularFiles(batch, ...completeCodexBundle(native)),
       }),
     ).toBe(native);
   });
 
-  it("uses a valid PATH batch shim before the APPDATA npm fallback", () => {
-    const pathBatch = "D:\\node\\codex.bat";
+  it("rejects an incomplete OpenAI native install and uses the complete npm package", () => {
+    const native = "C:\\Users\\test\\AppData\\Local\\Programs\\OpenAI\\Codex\\bin\\codex.exe";
     const npmBatch = "C:\\Users\\test\\AppData\\Roaming\\npm\\codex.cmd";
+    const vendorNative = nestedNpmVendorCodex(npmBatch);
 
     expect(
       resolveCodexCliExecutable("codex", {
         platform: "win32",
+        arch: "x64",
+        cwd: "C:\\projects\\synara",
+        env: {
+          SystemRoot: "C:\\Windows",
+          LOCALAPPDATA: "C:\\Users\\test\\AppData\\Local",
+          APPDATA: "C:\\Users\\test\\AppData\\Roaming",
+        },
+        spawnSync: whereOutput(npmBatch, native),
+        statSync: regularFiles(native, npmBatch, ...completeCodexBundle(vendorNative)),
+      }),
+    ).toBe(vendorNative);
+  });
+
+  it("resolves a complete npm vendor-native executable behind a PATH batch shim", () => {
+    const pathBatch = "D:\\node\\codex.bat";
+    const npmBatch = "C:\\Users\\test\\AppData\\Roaming\\npm\\codex.cmd";
+    const vendorNative = nestedNpmVendorCodex(pathBatch);
+
+    expect(
+      resolveCodexCliExecutable("codex", {
+        platform: "win32",
+        arch: "x64",
         cwd: "C:\\projects\\synara",
         env: {
           SystemRoot: "C:\\Windows",
           AppData: "C:\\Users\\test\\AppData\\Roaming",
         },
         spawnSync: whereOutput(pathBatch),
-        statSync: regularFiles(pathBatch, npmBatch),
+        statSync: regularFiles(pathBatch, npmBatch, ...completeCodexBundle(vendorNative)),
       }),
-    ).toBe(pathBatch);
+    ).toBe(vendorNative);
   });
 
-  it("uses the case-insensitive APPDATA npm fallback when PATH resolution fails", () => {
-    const npmBatch = "C:\\Users\\test\\AppData\\Roaming\\npm\\codex.cmd";
+  it("resolves an npm vendor-native executable through paths containing spaces", () => {
+    const npmBatch = "C:\\Users\\Test User\\AppData\\Roaming\\npm\\codex.cmd";
+    const vendorNative = nestedNpmVendorCodex(npmBatch);
+    const spawnSync = whereOutput(npmBatch);
 
     expect(
       resolveCodexCliExecutable("codex", {
         platform: "win32",
+        arch: "x64",
+        cwd: "C:\\Users\\Test User\\Synara Project",
+        env: { SystemRoot: "C:\\Windows" },
+        spawnSync,
+        statSync: regularFiles(npmBatch, ...completeCodexBundle(vendorNative)),
+      }),
+    ).toBe(vendorNative);
+    expect(spawnSync).toHaveBeenCalledTimes(1);
+  });
+
+  it("prefers the newest complete native package when stable versions are readable", () => {
+    const olderNative = "C:\\OpenAI\\Codex\\bin\\codex.exe";
+    const npmBatch = "C:\\Users\\test\\AppData\\Roaming\\npm\\codex.cmd";
+    const newerNative = nestedNpmVendorCodex(npmBatch);
+
+    expect(
+      resolveCodexCliExecutable("codex", {
+        platform: "win32",
+        arch: "x64",
+        cwd: "C:\\projects\\synara",
+        env: { SystemRoot: "C:\\Windows" },
+        spawnSync: whereOutput(olderNative, npmBatch),
+        statSync: regularFiles(
+          npmBatch,
+          ...completeCodexBundle(olderNative),
+          ...completeCodexBundle(newerNative),
+        ),
+        readFileSync: codexVersions([olderNative, "0.144.1"], [newerNative, "0.145.0"]),
+      }),
+    ).toBe(newerNative);
+  });
+
+  it("preserves deterministic candidate ordering when every version cannot be read safely", () => {
+    const firstNative = "C:\\first\\bin\\codex.exe";
+    const secondNative = "D:\\second\\bin\\codex.exe";
+
+    expect(
+      resolveCodexCliExecutable("codex", {
+        platform: "win32",
+        cwd: "C:\\projects\\synara",
+        env: { SystemRoot: "C:\\Windows" },
+        spawnSync: whereOutput(firstNative, secondNative),
+        statSync: regularFiles(
+          ...completeCodexBundle(firstNative),
+          ...completeCodexBundle(secondNative),
+        ),
+        readFileSync: codexVersions([secondNative, "999.0.0"]),
+      }),
+    ).toBe(firstNative);
+  });
+
+  it("uses the native npm package behind the case-insensitive APPDATA fallback", () => {
+    const npmBatch = "C:\\Users\\test\\AppData\\Roaming\\npm\\codex.cmd";
+    const vendorNative = nestedNpmVendorCodex(npmBatch);
+
+    expect(
+      resolveCodexCliExecutable("codex", {
+        platform: "win32",
+        arch: "x64",
         cwd: "C:\\projects\\synara",
         env: {
           SystemRoot: "C:\\Windows",
           appdata: "C:\\Users\\test\\AppData\\Roaming",
         },
         spawnSync: vi.fn(() => ({ stdout: "", status: 1 })),
-        statSync: regularFiles(npmBatch),
+        statSync: regularFiles(npmBatch, ...completeCodexBundle(vendorNative)),
       }),
-    ).toBe(npmBatch);
+    ).toBe(vendorNative);
   });
 
   it("rejects current-directory where.exe hits before validating candidates", () => {
     const cwdHit = "C:\\projects\\synara\\codex.exe";
     const safeNative = "C:\\tools\\codex.exe";
-    const readStat = regularFiles(cwdHit, safeNative);
 
     expect(
       resolveCodexCliExecutable("codex", {
@@ -222,10 +364,9 @@ describe("resolveCodexCliExecutable", () => {
         cwd: "C:\\PROJECTS\\SYNARA",
         env: { SystemRoot: "C:\\Windows" },
         spawnSync: whereOutput(cwdHit, safeNative),
-        statSync: readStat,
+        statSync: regularFiles(cwdHit, ...completeCodexBundle(safeNative)),
       }),
     ).toBe(safeNative);
-    expect(readStat).not.toHaveBeenCalledWith(cwdHit);
   });
 
   it("rejects relative, drive-root-relative, missing, and non-file candidates", () => {
@@ -234,11 +375,12 @@ describe("resolveCodexCliExecutable", () => {
     const missing = "C:\\missing\\codex.exe";
     const directory = "C:\\directory\\codex.exe";
     const fallback = "D:\\Codex\\codex.exe";
+    const fallbackFiles = new Set(completeCodexBundle(fallback).map((path) => path.toLowerCase()));
     const readStat = vi.fn((path: string) => {
       if (path === directory) {
         return { isFile: () => false };
       }
-      if (path === fallback) {
+      if (fallbackFiles.has(path.toLowerCase())) {
         return { isFile: () => true };
       }
       throw Object.assign(new Error(`Missing file: ${path}`), { code: "ENOENT" });
@@ -255,6 +397,86 @@ describe("resolveCodexCliExecutable", () => {
     ).toBe(fallback);
     expect(readStat).not.toHaveBeenCalledWith(relative);
     expect(readStat).not.toHaveBeenCalledWith(driveRootRelative);
+  });
+
+  it("falls through from an incomplete explicit codex.exe to a healthy discovered package", () => {
+    const configured = "C:\\Configured\\Codex\\bin\\codex.exe";
+    const npmBatch = "C:\\Users\\test\\AppData\\Roaming\\npm\\codex.cmd";
+    const vendorNative = nestedNpmVendorCodex(npmBatch);
+    const spawnSync = whereOutput(configured, npmBatch);
+
+    expect(
+      resolveCodexCliExecutable(configured, {
+        platform: "win32",
+        arch: "x64",
+        cwd: "C:\\projects\\synara",
+        env: { SystemRoot: "C:\\Windows" },
+        spawnSync,
+        statSync: regularFiles(configured, npmBatch, ...completeCodexBundle(vendorNative)),
+      }),
+    ).toBe(vendorNative);
+    expect(spawnSync).toHaveBeenCalledTimes(1);
+  });
+
+  it("resolves a complete native package behind an explicit npm shim without running it", () => {
+    const configured = "C:\\Users\\Test User\\AppData\\Roaming\\npm\\codex.cmd";
+    const vendorNative = nestedNpmVendorCodex(configured);
+    const spawnSync = vi.fn();
+
+    expect(
+      resolveCodexCliExecutable(configured, {
+        platform: "win32",
+        arch: "x64",
+        cwd: "C:\\projects\\synara",
+        env: { SystemRoot: "C:\\Windows" },
+        spawnSync,
+        statSync: regularFiles(configured, ...completeCodexBundle(vendorNative)),
+      }),
+    ).toBe(vendorNative);
+    expect(spawnSync).not.toHaveBeenCalled();
+  });
+
+  it("resolves the ARM64 native package behind an explicit npm shim", () => {
+    const configured = "C:\\Users\\test\\AppData\\Roaming\\npm\\codex.cmd";
+    const vendorNative = nestedNpmVendorCodex(configured, "arm64");
+    const spawnSync = vi.fn();
+
+    expect(
+      resolveCodexCliExecutable(configured, {
+        platform: "win32",
+        arch: "arm64",
+        cwd: "C:\\projects\\synara",
+        env: { SystemRoot: "C:\\Windows" },
+        spawnSync,
+        statSync: regularFiles(configured, ...completeCodexBundle(vendorNative)),
+      }),
+    ).toBe(vendorNative);
+    expect(spawnSync).not.toHaveBeenCalled();
+  });
+
+  it("falls through from an explicit npm shim whose native package is incomplete", () => {
+    const configured = "C:\\Users\\Test User\\AppData\\Roaming\\npm\\codex.cmd";
+    const configuredNative = nestedNpmVendorCodex(configured);
+    const healthyShim = "D:\\tools\\codex.cmd";
+    const healthyNative = nestedNpmVendorCodex(healthyShim);
+    const spawnSync = whereOutput(configured, healthyShim);
+
+    expect(
+      resolveCodexCliExecutable(configured, {
+        platform: "win32",
+        arch: "x64",
+        cwd: "C:\\projects\\synara",
+        env: { SystemRoot: "C:\\Windows" },
+        spawnSync,
+        statSync: regularFiles(
+          configured,
+          configuredNative,
+          healthyShim,
+          ...completeCodexBundle(healthyNative),
+        ),
+      }),
+    ).toBe(healthyNative);
+    expect(spawnSync).toHaveBeenCalledTimes(1);
   });
 
   it("does not read fallback values from process.env when an env is supplied", () => {
@@ -282,6 +504,27 @@ describe("resolveCodexCliExecutable", () => {
         env: { SystemRoot: "C:\\Windows" },
         spawnSync: whereOutput("codex", "C:\\missing\\codex.cmd"),
         statSync: regularFiles(),
+      }),
+    ).toBe("codex");
+  });
+
+  it("does not fall back to a batch shim when no complete native package exists", () => {
+    const incompleteNative = "C:\\OpenAI\\Codex\\bin\\codex.exe";
+    const npmBatch = "C:\\Users\\test\\AppData\\Roaming\\npm\\codex.cmd";
+    const incompleteVendorNative = nestedNpmVendorCodex(npmBatch);
+    const [vendorExecutable, vendorCommandRunner] = completeCodexBundle(incompleteVendorNative);
+
+    expect(
+      resolveCodexCliExecutable("codex", {
+        platform: "win32",
+        arch: "x64",
+        cwd: "C:\\projects\\synara",
+        env: {
+          SystemRoot: "C:\\Windows",
+          APPDATA: "C:\\Users\\test\\AppData\\Roaming",
+        },
+        spawnSync: whereOutput(incompleteNative, npmBatch),
+        statSync: regularFiles(incompleteNative, npmBatch, vendorExecutable, vendorCommandRunner),
       }),
     ).toBe("codex");
   });
@@ -332,7 +575,7 @@ describe("resolveCodexCliExecutable", () => {
         env: { SystemRoot: "C:\\Windows" },
         execFile,
         spawnSync,
-        statSync: regularFiles(batch, native),
+        statSync: regularFiles(batch, ...completeCodexBundle(native)),
       }),
     ).resolves.toBe(native);
     expect(execFile).toHaveBeenCalledTimes(1);
@@ -352,7 +595,7 @@ describe("resolveCodexCliExecutable", () => {
         env: { SystemRoot: "C:\\Windows" },
         execFile,
         spawnSync,
-        statSync: vi.fn(),
+        statSync: regularFiles(...completeCodexBundle(configured)),
       }),
     ).resolves.toBe(configured);
     expect(execFile).not.toHaveBeenCalled();

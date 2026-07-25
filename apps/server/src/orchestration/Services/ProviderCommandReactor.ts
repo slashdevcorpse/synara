@@ -46,6 +46,7 @@ export interface ProviderCommandReactorShape {
 
   readonly listBlockingDeliveries: (input: {
     readonly threadId?: string | undefined;
+    readonly afterEventSequence?: number | undefined;
     readonly limit: number;
   }) => Effect.Effect<ReadonlyArray<ProviderBlockingDeliveryEvidence>, unknown>;
 

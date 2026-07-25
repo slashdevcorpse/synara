@@ -2157,6 +2157,39 @@ describe("sendRequest", () => {
     }
   });
 
+  it("keeps thread open requests alive beyond Codex's internal 30-second startup budget", async () => {
+    vi.useFakeTimers();
+    try {
+      const { context, handleResponse, sendRequest } = createRequestHarness();
+      const resumeRequest = sendRequest(context, "thread/resume", {});
+
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(context.pending.size).toBe(1);
+
+      handleResponse(context, {
+        jsonrpc: "2.0",
+        id: 1,
+        result: { thread: { id: "provider-thread-1" } },
+      });
+      await expect(resumeRequest).resolves.toEqual({
+        thread: { id: "provider-thread-1" },
+      });
+      expect(context.pending.size).toBe(0);
+
+      const startRequest = sendRequest(context, "thread/start", {});
+      const startRejection = expect(startRequest).rejects.toThrow(
+        "Timed out waiting for thread/start.",
+      );
+      await vi.advanceTimersByTimeAsync(59_999);
+      expect(context.pending.size).toBe(1);
+      await vi.advanceTimersByTimeAsync(1);
+      await startRejection;
+      expect(context.pending.size).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("rejects immediately and clears pending state when the transport write fails", async () => {
     const { context, sendRequest, writeMessage } = createRequestHarness();
     writeMessage.mockRejectedValueOnce(new Error("injected transport write failure"));

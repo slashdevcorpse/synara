@@ -1,4 +1,4 @@
-import { existsSync, realpathSync } from "node:fs";
+import { copyFileSync, existsSync, linkSync, realpathSync } from "node:fs";
 import * as NodePath from "node:path";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -7,6 +7,7 @@ import { Effect, FileSystem, Layer, Path } from "effect";
 import { expect } from "vitest";
 
 import { resolveCodexCliExecutable } from "@synara/shared/codexCliExecutable";
+import { resolveWindowsCommandPath } from "@synara/shared/windowsProcess";
 
 import { ServerConfig } from "../../config.ts";
 import { CodexTextGenerationLive } from "./CodexTextGeneration.ts";
@@ -38,7 +39,7 @@ function acquireCodexEnvLock() {
 
 function fakeCodexNodeScript(): string {
   return [
-    'import fs from "node:fs";',
+    'const fs = require("node:fs");',
     "",
     "const args = process.argv.slice(2);",
     'let outputPath = "";',
@@ -141,24 +142,67 @@ function makeFakeCodexBinary(dir: string) {
     const path = yield* Path.Path;
     const binDir = path.join(dir, "bin");
     const codexPath = path.join(binDir, process.platform === "win32" ? "codex.cmd" : "codex");
-    const scriptDirectory =
-      process.platform === "win32"
-        ? path.join(binDir, "node_modules", "@openai", "codex", "bin")
-        : binDir;
-    const scriptPath = path.join(scriptDirectory, "fake-codex.mjs");
+    const scriptPath =
+      process.platform === "win32" ? path.join(dir, "exec") : path.join(binDir, "fake-codex.cjs");
     yield* fs.makeDirectory(binDir, { recursive: true });
-    yield* fs.makeDirectory(scriptDirectory, { recursive: true });
     yield* fs.writeFileString(scriptPath, fakeCodexNodeScript());
 
     if (process.platform === "win32") {
+      if (process.arch !== "x64" && process.arch !== "arm64") {
+        return yield* Effect.die(
+          `Unsupported Windows architecture for fake Codex bundle: ${process.arch}`,
+        );
+      }
+      const platformPackage = process.arch === "arm64" ? "codex-win32-arm64" : "codex-win32-x64";
+      const target =
+        process.arch === "arm64" ? "aarch64-pc-windows-msvc" : "x86_64-pc-windows-msvc";
+      const packageRoot = path.join(
+        binDir,
+        "node_modules",
+        "@openai",
+        "codex",
+        "node_modules",
+        "@openai",
+        platformPackage,
+        "vendor",
+        target,
+      );
+      const nativeCodexPath = path.join(packageRoot, "bin", "codex.exe");
+      const resourcesDir = path.join(packageRoot, "codex-resources");
+      const nativeNodePath = resolveWindowsCommandPath("node", {
+        cwd: dir,
+        env: process.env,
+      });
+      yield* fs.makeDirectory(path.dirname(nativeCodexPath), { recursive: true });
+      yield* fs.makeDirectory(resourcesDir, { recursive: true });
+      yield* Effect.sync(() => {
+        try {
+          linkSync(nativeNodePath, nativeCodexPath);
+        } catch {
+          copyFileSync(nativeNodePath, nativeCodexPath);
+        }
+      });
+      yield* fs.writeFileString(
+        path.join(resourcesDir, "codex-command-runner.exe"),
+        "fake Codex resource\n",
+      );
+      yield* fs.writeFileString(
+        path.join(resourcesDir, "codex-windows-sandbox-setup.exe"),
+        "fake Codex resource\n",
+      );
+      yield* fs.writeFileString(
+        path.join(packageRoot, "codex-package.json"),
+        `${JSON.stringify({ version: "999.0.0" })}\n`,
+      );
       yield* fs.writeFileString(
         codexPath,
         [
           "@echo off",
-          '"%~dp0\\node.exe" "%~dp0\\node_modules\\@openai\\codex\\bin\\fake-codex.mjs" %*',
+          `"${process.execPath.replaceAll("%", "%%")}" "${scriptPath.replaceAll("%", "%%")}" %*`,
           "",
         ].join("\r\n"),
       );
+      return { binDir, nativeCodexPath };
     } else {
       const escapedNodePath = process.execPath.replaceAll("'", "'\\''");
       const escapedScriptPath = scriptPath.replaceAll("'", "'\\''");
@@ -168,7 +212,7 @@ function makeFakeCodexBinary(dir: string) {
       );
       yield* fs.chmod(codexPath, 0o755);
     }
-    return binDir;
+    return { binDir, nativeCodexPath: undefined };
   });
 }
 
@@ -189,12 +233,12 @@ function withFakeCodexEnv<A, E, R>(
   },
   effect: Effect.Effect<A, E, R>,
 ) {
-  return Effect.acquireUseRelease(
+  const withEnvironment = Effect.acquireUseRelease(
     Effect.gen(function* () {
-      const releaseLock = yield* acquireCodexEnvLock();
       const fs = yield* FileSystem.FileSystem;
       const tempDir = yield* fs.makeTempDirectoryScoped({ prefix: "synara-codex-text-" });
-      const binDir = yield* makeFakeCodexBinary(tempDir);
+      const { binDir, nativeCodexPath } = yield* makeFakeCodexBinary(tempDir);
+      const previousWorkingDirectory = process.cwd();
       const previousPath = process.env.PATH;
       const previousCodexInstallDir = process.env.CODEX_INSTALL_DIR;
       const previousLocalAppData = process.env.LOCALAPPDATA;
@@ -214,22 +258,35 @@ function withFakeCodexEnv<A, E, R>(
         process.env.SYNARA_FAKE_CODEX_CODEX_HOME_CONFIG_MUST_CONTAIN;
       const previousCodexHomeConfigMustNotContain =
         process.env.SYNARA_FAKE_CODEX_CODEX_HOME_CONFIG_MUST_NOT_CONTAIN;
+      const fakePath = [binDir, ...inheritedPathWithoutNativeCodex(previousPath)].join(
+        NodePath.delimiter,
+      );
+      const fakeResolverEnv = {
+        ...process.env,
+        PATH: fakePath,
+        CODEX_INSTALL_DIR: tempDir,
+        LOCALAPPDATA: tempDir,
+        SYNARA_HOME: tempDir,
+      };
+      const encodedOutput = Buffer.from(input.output, "utf8").toString("base64");
+
+      if (process.platform === "win32") {
+        yield* Effect.sync(() =>
+          expect(
+            realpathSync.native(resolveCodexCliExecutable("codex", { env: fakeResolverEnv })),
+          ).toBe(realpathSync.native(nativeCodexPath!)),
+        );
+      }
 
       yield* Effect.sync(() => {
-        process.env.PATH = [binDir, ...inheritedPathWithoutNativeCodex(previousPath)].join(
-          NodePath.delimiter,
-        );
+        if (process.platform === "win32") {
+          process.chdir(tempDir);
+        }
+        process.env.PATH = fakePath;
         process.env.CODEX_INSTALL_DIR = tempDir;
         process.env.LOCALAPPDATA = tempDir;
         process.env.SYNARA_HOME = tempDir;
-        if (process.platform === "win32") {
-          expect(
-            realpathSync.native(resolveCodexCliExecutable("codex", { env: process.env })),
-          ).toBe(realpathSync.native(NodePath.join(binDir, "codex.cmd")));
-        }
-        process.env.SYNARA_FAKE_CODEX_OUTPUT_B64 = Buffer.from(input.output, "utf8").toString(
-          "base64",
-        );
+        process.env.SYNARA_FAKE_CODEX_OUTPUT_B64 = encodedOutput;
 
         if (input.exitCode !== undefined) {
           process.env.SYNARA_FAKE_CODEX_EXIT_CODE = String(input.exitCode);
@@ -301,6 +358,7 @@ function withFakeCodexEnv<A, E, R>(
       });
 
       return {
+        previousWorkingDirectory,
         previousPath,
         previousCodexInstallDir,
         previousLocalAppData,
@@ -317,12 +375,14 @@ function withFakeCodexEnv<A, E, R>(
         previousRequireApprovalNever,
         previousCodexHomeConfigMustContain,
         previousCodexHomeConfigMustNotContain,
-        releaseLock,
       };
     }),
     () => effect,
     (previous) =>
       Effect.sync(() => {
+        if (process.platform === "win32") {
+          process.chdir(previous.previousWorkingDirectory);
+        }
         process.env.PATH = previous.previousPath;
         if (previous.previousCodexInstallDir === undefined) {
           delete process.env.CODEX_INSTALL_DIR;
@@ -416,9 +476,12 @@ function withFakeCodexEnv<A, E, R>(
           process.env.SYNARA_FAKE_CODEX_CODEX_HOME_CONFIG_MUST_NOT_CONTAIN =
             previous.previousCodexHomeConfigMustNotContain;
         }
-
-        previous.releaseLock();
       }),
+  );
+  return Effect.acquireUseRelease(
+    acquireCodexEnvLock(),
+    () => withEnvironment,
+    (releaseLock) => Effect.sync(releaseLock),
   );
 }
 

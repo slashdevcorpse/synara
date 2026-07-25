@@ -47,7 +47,7 @@ export interface WindowsProviderProcessInput extends WindowsAsyncCommandDiscover
   readonly controlDirectory?: string | undefined;
   /**
    * Cache-only mode is reserved for a synchronously constrained callback after
-   * `prepareWindowsProviderProcessAsync` has populated the exact supplied cache.
+   * an asynchronous provider preparer has populated the exact supplied cache.
    * A cache miss fails closed without invoking an OS-level synchronous lookup.
    */
   readonly commandDiscoveryMode?: "default" | "cache-only" | undefined;
@@ -490,6 +490,56 @@ export function prepareWindowsProviderProcess(
   }
 }
 
+async function prepareResolvedWindowsProviderProcessWithAsyncRuntime(
+  command: string,
+  args: ReadonlyArray<string>,
+  input: WindowsProviderProcessInput,
+  discoveryOutcome?: WindowsCommandDiscoveryOutcome,
+): Promise<WindowsSafeProcessCommand> {
+  const platform = input.platform ?? process.platform;
+  if (platform !== "win32") {
+    return prepareResolvedWindowsSafeProcess(command, args, input);
+  }
+
+  const commandDiscoveryCache = input.commandDiscoveryCache ?? createWindowsCommandDiscoveryCache();
+  const observedInput = {
+    ...input,
+    commandDiscoveryCache,
+  } satisfies WindowsProviderProcessInput;
+
+  if (isWindowsBatchCommand(command)) {
+    const absoluteCommand = resolveAbsolutePreparedCommand(command, input.cwd);
+    const shim = inspectCanonicalWindowsNpmShim(absoluteCommand, observedInput, discoveryOutcome);
+    if (!shim.nativeSiblingNodePath && input.commandDiscoveryMode !== "cache-only") {
+      await resolveWindowsCommandCandidatesAsync("node", {
+        ...observedInput,
+        // The provider command is already resolved. Internal runtime lookup
+        // must not publish a replacement provider discovery observation.
+        onCommandDiscovery: undefined,
+      });
+    }
+  }
+
+  const cacheOnlyInput = applyWindowsProviderDiscoveryMode({
+    ...input,
+    commandDiscoveryCache,
+    commandDiscoveryMode: "cache-only",
+    // Runtime lookup is internal to an already-resolved provider command.
+    onCommandDiscovery: undefined,
+  });
+  try {
+    return containPreparedWindowsProviderProcess(
+      prepareResolvedWindowsProviderTarget(command, args, cacheOnlyInput, discoveryOutcome),
+      cacheOnlyInput,
+    );
+  } catch (cause) {
+    if (cause instanceof WindowsProviderTargetNotResolvedError && discoveryOutcome !== undefined) {
+      throw new WindowsProviderTargetNotResolvedError(cause.command, discoveryOutcome);
+    }
+    throw cause;
+  }
+}
+
 /**
  * Resolves provider commands without blocking the JavaScript isolate. Every
  * Windows launch gets an isolated discovery cache unless the caller supplies
@@ -520,35 +570,25 @@ export async function prepareWindowsProviderProcessAsync(
   } satisfies WindowsProviderProcessInput;
   const resolvedCommand = await resolveWindowsCommandPathAsync(command, observedInput);
 
-  if (isWindowsBatchCommand(resolvedCommand)) {
-    const absoluteCommand = resolveAbsolutePreparedCommand(resolvedCommand, input.cwd);
-    const shim = inspectCanonicalWindowsNpmShim(absoluteCommand, observedInput, discoveryOutcome);
-    if (!shim.nativeSiblingNodePath) {
-      await resolveWindowsCommandCandidatesAsync("node", {
-        ...observedInput,
-        // The provider command observation remains authoritative for user-facing
-        // not-found/transient classification.
-        onCommandDiscovery: undefined,
-      });
-    }
-  }
+  return prepareResolvedWindowsProviderProcessWithAsyncRuntime(
+    resolvedCommand,
+    args,
+    observedInput,
+    discoveryOutcome,
+  );
+}
 
-  const cacheOnlyInput = applyWindowsProviderDiscoveryMode({
-    ...input,
-    commandDiscoveryCache,
-    commandDiscoveryMode: "cache-only",
-  });
-  try {
-    return containPreparedWindowsProviderProcess(
-      prepareResolvedWindowsProviderTarget(resolvedCommand, args, cacheOnlyInput, discoveryOutcome),
-      cacheOnlyInput,
-    );
-  } catch (cause) {
-    if (cause instanceof WindowsProviderTargetNotResolvedError && discoveryOutcome !== undefined) {
-      throw new WindowsProviderTargetNotResolvedError(cause.command, discoveryOutcome);
-    }
-    throw cause;
-  }
+/**
+ * Prepares an already-resolved provider command without re-running provider
+ * discovery. Canonical npm shims may still prewarm their native Node runtime
+ * asynchronously before cache-only containment.
+ */
+export async function prepareResolvedWindowsProviderProcessAsync(
+  command: string,
+  args: ReadonlyArray<string>,
+  input: WindowsProviderProcessInput = {},
+): Promise<WindowsSafeProcessCommand> {
+  return prepareResolvedWindowsProviderProcessWithAsyncRuntime(command, args, input);
 }
 
 export function prepareResolvedWindowsProviderProcess(

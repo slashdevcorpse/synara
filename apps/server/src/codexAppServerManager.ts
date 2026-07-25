@@ -89,6 +89,7 @@ import {
 const log = createLogger("codex");
 const CODEX_DEFAULT_REQUEST_TIMEOUT_MS = 20_000;
 const CODEX_INITIALIZE_TIMEOUT_MS = 45_000;
+const CODEX_THREAD_OPEN_TIMEOUT_MS = 60_000;
 
 type PendingRequestKey = string;
 
@@ -3122,7 +3123,9 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
     params: unknown,
     timeoutMs = method === "initialize"
       ? CODEX_INITIALIZE_TIMEOUT_MS
-      : CODEX_DEFAULT_REQUEST_TIMEOUT_MS,
+      : method === "thread/start" || method === "thread/resume"
+        ? CODEX_THREAD_OPEN_TIMEOUT_MS
+        : CODEX_DEFAULT_REQUEST_TIMEOUT_MS,
   ): Promise<TResponse> {
     const id = context.nextRequestId;
     context.nextRequestId += 1;
