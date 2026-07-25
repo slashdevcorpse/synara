@@ -170,6 +170,7 @@ interface OpenCodeCompatibilityIncident {
 
 interface OpenCodeSessionContext {
   harnessPolicyDelivered?: boolean;
+  teardownRequested: boolean;
   readonly gatewayControlAvailable: boolean;
   gatewaySessionLease?: AgentGatewaySessionLease;
   session: ProviderSession;
@@ -1205,11 +1206,24 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
       const stopAndRemoveOpenCodeContext = Effect.fn("stopAndRemoveOpenCodeContext")(function* (
         context: OpenCodeSessionContext,
         callbacks: {
+          readonly allowPendingCompatibilityTerminal?: boolean;
           readonly onStopping?: Effect.Effect<void>;
           readonly onClosed?: Effect.Effect<void>;
           readonly releaseOwnedResourcesOnAbortTimeout?: boolean;
         } = {},
       ) {
+        const pendingCompatibilityIncident = context.compatibilityIncident;
+        if (
+          pendingCompatibilityIncident?.pendingTerminalEventId !== undefined &&
+          callbacks.allowPendingCompatibilityTerminal !== true
+        ) {
+          return yield* pendingCompatibilityIncident.error;
+        }
+        // Claim teardown synchronously before session.abort yields. Compatibility
+        // promotion checks the same flag, so replacement/stop and terminal
+        // promotion have a deterministic winner instead of racing across the
+        // destructive boundary.
+        context.teardownRequested = true;
         return yield* stopOpenCodeContext(context, {
           abortTimeoutMs: sessionAbortTimeoutMs,
           waitForAbortTimeout: waitForSessionAbortTimeout(sessionAbortTimeoutMs),
@@ -1231,7 +1245,12 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
           const contexts = [...sessions.values()];
           yield* Effect.forEach(
             contexts,
-            (context) => Effect.ignoreCause(stopAndRemoveOpenCodeContext(context)),
+            (context) =>
+              Effect.ignoreCause(
+                stopAndRemoveOpenCodeContext(context, {
+                  allowPendingCompatibilityTerminal: true,
+                }),
+              ),
             { concurrency: "unbounded", discard: true },
           );
           if (managedNativeEventLogger !== undefined) {
@@ -1380,6 +1399,9 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
         const existingIncident = context.compatibilityIncident;
         if (existingIncident !== undefined) {
           return existingIncident.error;
+        }
+        if (context.teardownRequested) {
+          return null;
         }
 
         const compatibilityError = new ProviderAdapterCompatibilityError({
@@ -3586,6 +3608,7 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
                   activeVariant: undefined,
                   promptAttemptCount: 0,
                   compatibilityIncident: undefined,
+                  teardownRequested: false,
                   stopped: yield* Ref.make(false),
                   shutdownState: yield* Ref.make<OpenCodeSessionShutdownState>("running"),
                   shutdownMutex: yield* Semaphore.make(1),

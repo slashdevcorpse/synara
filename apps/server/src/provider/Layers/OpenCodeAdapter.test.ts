@@ -3957,6 +3957,13 @@ describe("OpenCodeAdapter runtime lifecycle", () => {
             },
           })
           .pipe(Effect.result);
+        const replacementResult = yield* adapter
+          .startSession({
+            provider: "opencode",
+            threadId,
+            runtimeMode: "full-access",
+          })
+          .pipe(Effect.result);
         yield* barrier.acknowledge(terminalEvent);
         yield* barrier.acknowledge(terminalEvent);
         const pendingAfterAck = yield* barrier.isPending(terminalEvent);
@@ -3970,6 +3977,7 @@ describe("OpenCodeAdapter runtime lifecycle", () => {
           pendingBeforeAck,
           pendingAfterAck,
           secondSendResult,
+          replacementResult,
           sendResult,
           sessions,
           sessionsDuringBarrier,
@@ -3998,6 +4006,10 @@ describe("OpenCodeAdapter runtime lifecycle", () => {
     expect(Result.isFailure(result.secondSendResult)).toBe(true);
     if (Result.isFailure(result.secondSendResult)) {
       expect(result.secondSendResult.failure).toBeInstanceOf(ProviderAdapterCompatibilityError);
+    }
+    expect(Result.isFailure(result.replacementResult)).toBe(true);
+    if (Result.isFailure(result.replacementResult)) {
+      expect(result.replacementResult.failure).toBeInstanceOf(ProviderAdapterCompatibilityError);
     }
     expect(result.sessionsDuringBarrier).toHaveLength(1);
     expect(result.sessionsDuringBarrier[0]).toMatchObject({
@@ -4037,6 +4049,116 @@ describe("OpenCodeAdapter runtime lifecycle", () => {
     expect(runtime.connectCalls[0]?.poolIsolationKey).toBeTruthy();
     expect(runtime.abortCalls).toEqual([{ sessionID: "opencode-session-1" }]);
     expect(scopeCloseCount).toBe(1);
+  });
+
+  it("does not promote a schema failure after replacement has claimed teardown", async () => {
+    let resolvePrompt:
+      | ((value: {
+          error: { name: string; data: { message: string } };
+          response: { status: number };
+        }) => void)
+      | undefined;
+    const promptResponse = new Promise<{
+      error: { name: string; data: { message: string } };
+      response: { status: number };
+    }>((resolve) => {
+      resolvePrompt = resolve;
+    });
+    let markAbortStarted: (() => void) | undefined;
+    const abortStarted = new Promise<void>((resolve) => {
+      markAbortStarted = resolve;
+    });
+    let releaseAbort: (() => void) | undefined;
+    const abortGate = new Promise<void>((resolve) => {
+      releaseAbort = resolve;
+    });
+    const runtime = createMockOpenCodeRuntime({
+      promptAsync: async () => promptResponse,
+      abort: async () => {
+        markAbortStarted?.();
+        await abortGate;
+        return { data: null };
+      },
+    });
+    const threadId = asThreadId("thread-opencode-schema-replacement-race");
+
+    const result = await Effect.runPromise(
+      Effect.gen(function* () {
+        const adapter = yield* OpenCodeAdapter;
+        const eventsFiber = yield* Stream.runCollect(Stream.take(adapter.streamEvents, 5)).pipe(
+          Effect.forkChild,
+        );
+        yield* adapter.startSession({
+          provider: "opencode",
+          threadId,
+          runtimeMode: "full-access",
+        });
+        yield* adapter.sendTurn({
+          threadId,
+          input: "start a delayed prompt",
+          attachments: [],
+          modelSelection: {
+            provider: "opencode",
+            model: "opencode/claude-opus-4-7",
+          },
+        });
+
+        const replacement = yield* adapter
+          .startSession({
+            provider: "opencode",
+            threadId,
+            runtimeMode: "full-access",
+          })
+          .pipe(Effect.result, Effect.forkChild);
+        yield* Effect.promise(() => abortStarted);
+        resolvePrompt?.({
+          error: {
+            name: "UnknownError",
+            data: {
+              message: "SQLiteError: NOT NULL constraint failed: session_message.seq",
+            },
+          },
+          response: { status: 500 },
+        });
+        yield* Effect.yieldNow;
+        releaseAbort?.();
+
+        const replacementResult = yield* Fiber.join(replacement);
+        const events = Array.from(yield* Fiber.join(eventsFiber));
+        const sessions = yield* adapter.listSessions();
+        yield* adapter.stopAll();
+        return { events, replacementResult, sessions };
+      }).pipe(
+        Effect.provide(
+          makeOpenCodeAdapterLive({
+            runtime: runtime.runtime,
+            promptSubmissionInlineWaitMs: 1,
+          }).pipe(
+            Layer.provideMerge(
+              ServerConfig.layerTest(process.cwd(), { prefix: "opencode-adapter-test-" }),
+            ),
+            Layer.provideMerge(NodeServices.layer),
+          ),
+        ),
+      ),
+    );
+
+    expect(Result.isSuccess(result.replacementResult)).toBe(true);
+    expect(result.events.map((event) => event.type)).toEqual([
+      "session.started",
+      "thread.started",
+      "turn.started",
+      "session.started",
+      "thread.started",
+    ]);
+    expect(result.events.some((event) => event.type === "turn.completed")).toBe(false);
+    expect(result.sessions).toHaveLength(1);
+    expect(result.sessions[0]).toMatchObject({
+      threadId,
+      status: "ready",
+    });
+    expect(runtime.promptCalls).toHaveLength(1);
+    expect(runtime.connectCalls).toHaveLength(2);
   });
 
   it("terminally classifies a delayed first-prompt SDK schema failure without replay", async () => {
