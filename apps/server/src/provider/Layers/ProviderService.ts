@@ -1173,7 +1173,7 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
           }
           if (requiresDurabilityAcknowledgement) {
             if (options?.persistRuntimeEvent === undefined) {
-              return yield* Effect.dieMessage(
+              return yield* Effect.die(
                 `Provider runtime event '${String(canonicalEvent.eventId)}' requires durable persistence before adapter acknowledgement, but no runtime journal is configured.`,
               );
             }
@@ -1182,7 +1182,7 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
             const bindingCommitted =
               yield* updateSessionBindingFromRuntimeEventStrict(canonicalEvent);
             if (!bindingCommitted) {
-              return yield* Effect.dieMessage(
+              return yield* Effect.die(
                 `Provider runtime event '${String(canonicalEvent.eventId)}' could not commit its terminal binding transition before adapter acknowledgement.`,
               );
             }

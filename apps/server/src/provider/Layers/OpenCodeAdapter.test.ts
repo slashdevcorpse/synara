@@ -1574,7 +1574,7 @@ describe("OpenCodeAdapter runtime lifecycle", () => {
     const sdkClient = createOpencodeClient({
       baseUrl: "http://127.0.0.1:4099",
       throwOnError: true,
-      fetch: async () =>
+      fetch: (async () =>
         new Response(
           JSON.stringify({
             name: "NotFoundError",
@@ -1584,7 +1584,7 @@ describe("OpenCodeAdapter runtime lifecycle", () => {
             status: 404,
             headers: { "content-type": "application/json" },
           },
-        ),
+        )) as typeof globalThis.fetch,
     });
     const runtime = createMockOpenCodeRuntime({
       sessionGet: (input) => sdkClient.session.get(input),
@@ -3941,7 +3941,7 @@ describe("OpenCodeAdapter runtime lifecycle", () => {
         const terminalEvents = Array.from(yield* Fiber.join(terminalEventsFiber));
         const terminalEvent = terminalEvents[3];
         if (terminalEvent === undefined) {
-          return yield* Effect.dieMessage("Expected OpenCode compatibility terminal event");
+          return yield* Effect.die("Expected OpenCode compatibility terminal event");
         }
         const barrier = requireRuntimeEventDurabilityBarrier(adapter);
         const pendingBeforeAck = yield* barrier.isPending(terminalEvent);
@@ -4213,7 +4213,7 @@ describe("OpenCodeAdapter runtime lifecycle", () => {
         const terminalEvents = Array.from(yield* Fiber.join(terminalEventsFiber));
         const terminalEvent = terminalEvents[3];
         if (terminalEvent === undefined) {
-          return yield* Effect.dieMessage("Expected delayed compatibility terminal event");
+          return yield* Effect.die("Expected delayed compatibility terminal event");
         }
         yield* requireRuntimeEventDurabilityBarrier(adapter).acknowledge(terminalEvent);
         const cleanupEvents = Array.from(
@@ -4313,7 +4313,7 @@ describe("OpenCodeAdapter runtime lifecycle", () => {
         const terminalEvents = Array.from(yield* Fiber.join(terminalEventsFiber));
         const terminalEvent = terminalEvents[3];
         if (terminalEvent === undefined) {
-          return yield* Effect.dieMessage("Expected provider compatibility terminal event");
+          return yield* Effect.die("Expected provider compatibility terminal event");
         }
         yield* requireRuntimeEventDurabilityBarrier(adapter).acknowledge(terminalEvent);
         const cleanupEvents = Array.from(
@@ -4411,7 +4411,7 @@ describe("OpenCodeAdapter runtime lifecycle", () => {
         const terminalEvents = Array.from(yield* Fiber.join(terminalEventsFiber));
         const terminalEvent = terminalEvents[3];
         if (terminalEvent === undefined) {
-          return yield* Effect.dieMessage("Expected external compatibility terminal event");
+          return yield* Effect.die("Expected external compatibility terminal event");
         }
         yield* requireRuntimeEventDurabilityBarrier(adapter).acknowledge(terminalEvent);
         yield* Stream.runCollect(Stream.take(adapter.streamEvents, 2));

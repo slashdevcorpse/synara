@@ -58,6 +58,7 @@ import { listFactoryPlugins, readFactoryPlugin } from "../FactoryPluginDiscovery
 import { readFactorySessionHistory } from "../FactorySessionHistory.ts";
 import { appendProviderReferencesPromptBlock } from "../promptReferenceProjection.ts";
 import {
+  ProviderAdapterCompatibilityError,
   ProviderAdapterRequestError,
   ProviderAdapterProcessError,
   ProviderAdapterSessionClosedError,
@@ -1931,6 +1932,7 @@ export function makeDroidAdapter(
         Effect.mapError((cause) =>
           cause instanceof ProviderAdapterRequestError ||
           cause instanceof ProviderAdapterProcessError ||
+          cause instanceof ProviderAdapterCompatibilityError ||
           cause instanceof ProviderAdapterSessionClosedError ||
           cause instanceof ProviderAdapterSessionNotFoundError ||
           cause instanceof ProviderAdapterValidationError

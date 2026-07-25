@@ -101,9 +101,9 @@ export interface ProviderThreadSnapshot {
  * dispatch-blocking tombstone. `ProviderService` calls `acknowledge` only after
  * the event journal append and binding transition have both succeeded.
  */
-export interface ProviderRuntimeEventDurabilityBarrier<TError> {
-  readonly isPending: (event: ProviderRuntimeEvent) => Effect.Effect<boolean, TError>;
-  readonly acknowledge: (event: ProviderRuntimeEvent) => Effect.Effect<void, TError>;
+export interface ProviderRuntimeEventDurabilityBarrier {
+  readonly isPending: (event: ProviderRuntimeEvent) => Effect.Effect<boolean>;
+  readonly acknowledge: (event: ProviderRuntimeEvent) => Effect.Effect<void>;
 }
 
 export interface ProviderAdapterShape<TError> {
@@ -252,7 +252,7 @@ export interface ProviderAdapterShape<TError> {
    * Adapter-owned handoff for terminal events whose local state must remain
    * dispatch-blocking until the service has durably committed the event.
    */
-  readonly runtimeEventDurabilityBarrier?: ProviderRuntimeEventDurabilityBarrier<TError>;
+  readonly runtimeEventDurabilityBarrier?: ProviderRuntimeEventDurabilityBarrier;
 
   /**
    * Read provider-specific composer capabilities.

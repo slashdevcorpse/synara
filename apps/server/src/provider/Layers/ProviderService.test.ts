@@ -301,27 +301,26 @@ function makeFakeCodexAdapter(
       }),
   );
 
-  const runtimeEventDurabilityBarrier: ProviderRuntimeEventDurabilityBarrier<ProviderAdapterError> =
-    {
-      isPending: (event) => Effect.sync(() => pendingDurabilityEventIds.has(event.eventId)),
-      acknowledge: vi.fn((event: ProviderRuntimeEvent) =>
-        Effect.sync(() => {
-          if (!pendingDurabilityEventIds.delete(event.eventId)) {
-            return;
-          }
-          acknowledgedDurabilityEventIds.push(event.eventId);
-          const session = sessions.get(event.threadId);
-          if (session !== undefined) {
-            sessions.set(event.threadId, {
-              ...withoutActiveTurn(session),
-              status: "error",
-              lastError: "terminal event acknowledged",
-              updatedAt: new Date().toISOString(),
-            });
-          }
-        }),
-      ),
-    };
+  const runtimeEventDurabilityBarrier: ProviderRuntimeEventDurabilityBarrier = {
+    isPending: (event) => Effect.sync(() => pendingDurabilityEventIds.has(event.eventId)),
+    acknowledge: vi.fn((event: ProviderRuntimeEvent) =>
+      Effect.sync(() => {
+        if (!pendingDurabilityEventIds.delete(event.eventId)) {
+          return;
+        }
+        acknowledgedDurabilityEventIds.push(event.eventId);
+        const session = sessions.get(event.threadId);
+        if (session !== undefined) {
+          sessions.set(event.threadId, {
+            ...withoutActiveTurn(session),
+            status: "error",
+            lastError: "terminal event acknowledged",
+            updatedAt: new Date().toISOString(),
+          });
+        }
+      }),
+    ),
+  };
 
   const adapter: ProviderAdapterShape<ProviderAdapterError> = {
     provider,
@@ -5762,7 +5761,7 @@ const durabilityPersistenceFailure = makeProviderServiceLayer(
       event.eventId === persistenceFailureEventId
         ? Effect.gen(function* () {
             persistenceFailureAttempted = true;
-            return yield* Effect.dieMessage("injected runtime journal failure");
+            return yield* Effect.die("injected runtime journal failure");
           })
         : Effect.void,
     canonicalEventLogger: {
