@@ -11,6 +11,7 @@ import { fileURLToPath } from "node:url";
 import launcherConfig from "../../native/windows-job-launcher/launcher.config.json" with { type: "json" };
 
 import {
+  parseCanonicalWindowsNpmNativeExecutableShimTarget,
   parseCanonicalWindowsNpmNodeShimTarget,
   windowsNpmPackageManifestDeclaresShimTarget,
 } from "@synara/shared/windowsNpmShim";
@@ -74,10 +75,11 @@ export class WindowsProviderTargetNotResolvedError extends Error {
 
 export type WindowsProviderBatchShimLaunchFailure =
   | "shim_not_file"
-  | "shim_not_canonical_npm_node"
+  | "shim_not_canonical_npm"
   | "package_manifest_not_file"
   | "package_manifest_bin_mismatch"
   | "target_not_file"
+  | "target_not_native_executable"
   | "target_outside_node_modules"
   | "target_outside_package"
   | "native_node_not_found";
@@ -94,13 +96,15 @@ export class WindowsProviderBatchShimLaunchError extends Error {
   ) {
     const detail = {
       shim_not_file: "the resolved batch shim is missing or cannot be verified as a file",
-      shim_not_canonical_npm_node:
-        "the batch file is not one of npm's canonical Node shim templates",
+      shim_not_canonical_npm:
+        "the batch file is not one of npm's canonical Node or native-executable shim templates",
       package_manifest_not_file:
         "the npm package manifest referenced by the shim is missing or not a file",
       package_manifest_bin_mismatch:
         "the npm package manifest does not declare this shim name and exact target",
       target_not_file: "the npm package target referenced by the shim is missing or not a file",
+      target_not_native_executable:
+        "the npm native bin target did not resolve to an .exe or .com file",
       target_outside_node_modules:
         "the npm package target does not remain inside the shim's canonical node_modules tree",
       target_outside_package:
@@ -329,6 +333,7 @@ function verifiedRealFile(path: string, input: WindowsProviderProcessInput): str
 
 interface CanonicalWindowsNpmShim {
   readonly canonicalTargetPath: string;
+  readonly host: "node" | "native";
   readonly nativeSiblingNodePath?: string | undefined;
 }
 
@@ -359,9 +364,14 @@ function inspectCanonicalWindowsNpmShim(
   } catch {
     shimContents = undefined;
   }
-  const shimTarget = shimContents ? parseCanonicalWindowsNpmNodeShimTarget(shimContents) : null;
+  const nodeShimTarget = shimContents ? parseCanonicalWindowsNpmNodeShimTarget(shimContents) : null;
+  const nativeShimTarget =
+    !nodeShimTarget && shimContents
+      ? parseCanonicalWindowsNpmNativeExecutableShimTarget(shimContents)
+      : null;
+  const shimTarget = nodeShimTarget ?? nativeShimTarget;
   if (!shimTarget) {
-    return fail("shim_not_canonical_npm_node");
+    return fail("shim_not_canonical_npm");
   }
 
   const visiblePackageDirectory = Path.win32.join(
@@ -419,12 +429,19 @@ function inspectCanonicalWindowsNpmShim(
   if (!windowsPathIsWithinRoot(canonicalTargetPath, canonicalPackageDirectory)) {
     return fail("target_outside_package");
   }
+  const host = nativeShimTarget ? "native" : "node";
+  if (host === "native" && !isAbsoluteNativeWindowsExecutable(canonicalTargetPath)) {
+    return fail("target_not_native_executable");
+  }
 
   const siblingNodePath = Path.win32.join(shimDirectory, "node.exe");
   const nativeSiblingNodePath = verifiedRealFile(siblingNodePath, input);
   return {
     canonicalTargetPath,
-    ...(nativeSiblingNodePath && isAbsoluteNativeWindowsExecutable(nativeSiblingNodePath)
+    host,
+    ...(host === "node" &&
+    nativeSiblingNodePath &&
+    isAbsoluteNativeWindowsExecutable(nativeSiblingNodePath)
       ? { nativeSiblingNodePath }
       : {}),
   };
@@ -437,6 +454,14 @@ function prepareDirectWindowsNpmShimProcess(
   discoveryOutcome?: WindowsCommandDiscoveryOutcome,
 ): WindowsSafeProcessCommand {
   const shim = inspectCanonicalWindowsNpmShim(command, input, discoveryOutcome);
+  if (shim.host === "native") {
+    return {
+      command: shim.canonicalTargetPath,
+      args: [...args],
+      shell: false,
+      windowsHide: true,
+    };
+  }
   let nativeNodePath = shim.nativeSiblingNodePath;
   if (!nativeNodePath || !isAbsoluteNativeWindowsExecutable(nativeNodePath)) {
     const resolvedNodeCandidates = resolveWindowsCommandCandidates("node", {
@@ -610,7 +635,11 @@ async function prepareResolvedWindowsProviderProcessWithAsyncRuntime(
   if (isWindowsBatchCommand(command)) {
     const absoluteCommand = resolveAbsolutePreparedCommand(command, input.cwd);
     const shim = inspectCanonicalWindowsNpmShim(absoluteCommand, observedInput, discoveryOutcome);
-    if (!shim.nativeSiblingNodePath && input.commandDiscoveryMode !== "cache-only") {
+    if (
+      shim.host === "node" &&
+      !shim.nativeSiblingNodePath &&
+      input.commandDiscoveryMode !== "cache-only"
+    ) {
       await resolveWindowsCommandCandidatesAsync("node", {
         ...observedInput,
         // The provider command is already resolved. Internal runtime lookup
@@ -644,9 +673,9 @@ async function prepareResolvedWindowsProviderProcessWithAsyncRuntime(
  * Resolves provider commands without blocking the JavaScript isolate. Every
  * Windows launch gets an isolated discovery cache unless the caller supplies
  * one explicitly for an exact handoff to a synchronously constrained callback.
- * Canonical npm shims prewarm their native Node lookup asynchronously, then the
- * final cache-only preparation fails closed if any unexpected sync lookup
- * would otherwise occur.
+ * Canonical npm Node shims prewarm their native Node lookup asynchronously;
+ * canonical native-executable shims need no runtime lookup. Final cache-only
+ * preparation fails closed if any unexpected sync lookup would otherwise occur.
  */
 export async function prepareWindowsProviderProcessAsync(
   command: string,
@@ -680,8 +709,8 @@ export async function prepareWindowsProviderProcessAsync(
 
 /**
  * Prepares an already-resolved provider command without re-running provider
- * discovery. Canonical npm shims may still prewarm their native Node runtime
- * asynchronously before cache-only containment.
+ * discovery. Canonical npm Node shims may still prewarm their native Node
+ * runtime asynchronously before cache-only containment.
  */
 export async function prepareResolvedWindowsProviderProcessAsync(
   command: string,

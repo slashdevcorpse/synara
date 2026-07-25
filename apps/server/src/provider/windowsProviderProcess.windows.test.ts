@@ -297,6 +297,84 @@ describeWindows("Windows Job launcher native integration", () => {
     }
   });
 
+  it("launches npm's canonical native executable shim as Job -> package executable", async () => {
+    const root = mkdtempSync(join(tmpdir(), "synara-job-native-npm-provider-"));
+    const npmPrefix = join(root, "User Data", "npm");
+    const packageDirectory = join(npmPrefix, "node_modules", "fixture-provider");
+    const packageExecutablePath = join(packageDirectory, "bin", "fixture-provider.exe");
+    const packageRunnerPath = join(packageDirectory, "bin", "runner.js");
+    const packageManifestPath = join(packageDirectory, "package.json");
+    const providerCommandPath = join(npmPrefix, "fixture-provider.cmd");
+
+    try {
+      mkdirSync(dirname(packageExecutablePath), { recursive: true });
+      copyFileSync(process.execPath, packageExecutablePath);
+      writeFileSync(
+        packageRunnerPath,
+        [
+          "process.stdout.write(JSON.stringify({",
+          "  argv: process.argv.slice(2),",
+          "  executable: process.execPath,",
+          "}));",
+        ].join("\n"),
+      );
+      writeFileSync(
+        packageManifestPath,
+        JSON.stringify({
+          name: "fixture-provider",
+          bin: { "fixture-provider": "bin/fixture-provider.exe" },
+        }),
+      );
+      writeFileSync(
+        providerCommandPath,
+        [
+          "@ECHO off",
+          "GOTO start",
+          ":find_dp0",
+          "SET dp0=%~dp0",
+          "EXIT /b",
+          ":start",
+          "SETLOCAL",
+          "CALL :find_dp0",
+          '"%dp0%\\node_modules\\fixture-provider\\bin\\fixture-provider.exe"   %*',
+        ].join("\r\n"),
+      );
+
+      const prepared = prepareWindowsProviderProcess(providerCommandPath, [
+        packageRunnerPath,
+        "hello",
+        "value with spaces",
+      ]);
+      expect(prepared.args.slice(7)).toEqual([
+        realpathSync.native(packageExecutablePath),
+        packageRunnerPath,
+        "hello",
+        "value with spaces",
+      ]);
+      expect(prepared.args[3]).toBe("argv");
+      expect(prepared.windowsVerbatimArguments).toBeUndefined();
+      expect(prepared.args.join(" ").toLowerCase()).not.toContain("cmd.exe");
+      expect(prepared.args.join(" ").toLowerCase()).not.toContain("comspec");
+
+      const result = spawnSync(prepared.command, prepared.args, {
+        encoding: "utf8",
+        shell: prepared.shell,
+        windowsHide: true,
+      });
+
+      expect(result.error).toBeUndefined();
+      expect(result.status).toBe(0);
+      expect(result.stderr).toBe("");
+      expect(JSON.parse(result.stdout)).toEqual({
+        argv: ["hello", "value with spaces"],
+        executable: realpathSync.native(packageExecutablePath),
+      });
+      proveSynchronousHelperDrain(prepared.args);
+    } finally {
+      await cleanupTestDirectory(root);
+    }
+  });
+
   it("closes the Job and kills a surviving nested descendant when the provider root exits", async () => {
     const helper = resolveWindowsJobLauncherPath();
     const rootScript = [
