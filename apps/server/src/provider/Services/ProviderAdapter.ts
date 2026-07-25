@@ -43,6 +43,7 @@ import type { Effect } from "effect";
 import type { Stream } from "effect";
 
 export type ProviderSessionModelSwitchMode = "in-session" | "restart-session" | "unsupported";
+export const PROVIDER_PROMPT_REPLAY_MAX_INPUT_CHARS = 24_000;
 
 /**
  * Structured payload for steering a running subagent. Mirrors the turn-input
@@ -56,12 +57,18 @@ export interface ProviderSteerSubagentPayload {
   readonly mentions?: ProviderSendTurnInput["mentions"];
 }
 export type ProviderConversationRollbackMode = "native" | "restart-session";
+export type ProviderConversationContinuityMode = "native" | "prompt-replay";
 
 export interface ProviderAdapterCapabilities {
   /**
    * Declares whether changing the model on an existing session is supported.
    */
   readonly sessionModelSwitch: ProviderSessionModelSwitchMode;
+  /**
+   * Declares how follow-up turns retain model-visible conversation context.
+   * Omitted capabilities preserve the native provider-session default.
+   */
+  readonly conversationContinuity?: ProviderConversationContinuityMode;
   /** Restart-session adapters cannot rewind provider history and must rebuild context locally. */
   readonly conversationRollback?: ProviderConversationRollbackMode;
   readonly supportsSkillMentions?: boolean;

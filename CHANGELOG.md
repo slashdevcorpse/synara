@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Fixed Antigravity on Windows by launching canonical npm shims through native Node without `cmd.exe`, using bounded prompt replay without native-resume duplication or persistent project churn, and failing visibly instead of displaying truncated process output as complete.
+
 ## 0.5.5 - 2026-07-17
 
 ### Added

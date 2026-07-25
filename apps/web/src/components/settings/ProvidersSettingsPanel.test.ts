@@ -3,11 +3,37 @@ import { describe, expect, it } from "vitest";
 import { type AppSettings, AppSettingsSchema } from "~/appSettings";
 
 import {
+  ANTIGRAVITY_WINDOWS_COMPATIBILITY_DESCRIPTION,
   createProviderInstallResetPatch,
   isProviderInstallSettingsDirty,
 } from "./ProvidersSettingsPanel";
 
 const defaults = AppSettingsSchema.makeUnsafe({});
+
+describe("Antigravity Windows compatibility guidance", () => {
+  it("discloses capture, continuity, prompt transport, and provider-state limits", () => {
+    expect(ANTIGRAVITY_WINDOWS_COMPATIBILITY_DESCRIPTION).toContain(
+      "new Antigravity CLI conversation in its default project",
+    );
+    expect(ANTIGRAVITY_WINDOWS_COMPATIBILITY_DESCRIPTION).toContain("final response text");
+    expect(ANTIGRAVITY_WINDOWS_COMPATIBILITY_DESCRIPTION).toContain(
+      "bounded recent Synara transcript as a CLI command-line argument",
+    );
+    expect(ANTIGRAVITY_WINDOWS_COMPATIBILITY_DESCRIPTION).toContain("long history is truncated");
+    expect(ANTIGRAVITY_WINDOWS_COMPATIBILITY_DESCRIPTION).toContain(
+      "visible to local process-inspection tools while the request runs",
+    );
+    expect(ANTIGRAVITY_WINDOWS_COMPATIBILITY_DESCRIPTION).toContain(
+      "Live structured events, usage telemetry, and native resume are unavailable",
+    );
+    expect(ANTIGRAVITY_WINDOWS_COMPATIBILITY_DESCRIPTION).toContain(
+      "does not install hooks or read or modify Antigravity configuration or transcript files",
+    );
+    expect(ANTIGRAVITY_WINDOWS_COMPATIBILITY_DESCRIPTION).toContain(
+      "may retain its normal local conversation records",
+    );
+  });
+});
 
 describe("isProviderInstallSettingsDirty", () => {
   it("covers every provider install text and boolean field", () => {

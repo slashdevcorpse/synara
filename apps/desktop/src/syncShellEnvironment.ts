@@ -5,11 +5,13 @@
 import {
   isPathName,
   listLoginShellCandidates,
+  listWindowsUserCliFallbackDirectories,
   mergePathEntries,
   readPathFromLaunchctl,
   readEnvironmentFromLoginShell,
   readWindowsPersistentEnvironment,
   type ShellEnvironmentReader,
+  type WindowsDirectoryExists,
   type WindowsEnvironmentReader,
 } from "@synara/shared/shell";
 
@@ -33,14 +35,15 @@ function logShellEnvironmentWarning(message: string, error?: unknown): void {
 function syncWindowsEnvironment(
   env: NodeJS.ProcessEnv,
   readWindowsEnvironment: WindowsEnvironmentReader,
+  directoryExists: WindowsDirectoryExists | undefined,
   logWarning: (message: string, error?: unknown) => void,
 ): void {
   try {
     const persisted = readWindowsEnvironment();
 
-    const mergedPath = mergePathEntries(persisted.PATH, env.PATH, "win32");
-    if (mergedPath) {
-      env.PATH = mergedPath;
+    const registryAndInheritedPath = mergePathEntries(persisted.PATH, env.PATH, "win32");
+    if (registryAndInheritedPath) {
+      env.PATH = registryAndInheritedPath;
     }
 
     for (const [name, value] of Object.entries(persisted)) {
@@ -48,6 +51,18 @@ function syncWindowsEnvironment(
       if (value && env[name] === undefined) {
         env[name] = value;
       }
+    }
+
+    const fallbackDirectories = listWindowsUserCliFallbackDirectories(env, directoryExists).join(
+      ";",
+    );
+    const mergedPath = mergePathEntries(
+      registryAndInheritedPath,
+      fallbackDirectories || undefined,
+      "win32",
+    );
+    if (mergedPath) {
+      env.PATH = mergedPath;
     }
   } catch (error) {
     logWarning("Failed to synchronize the desktop Windows environment.", error);
@@ -61,6 +76,7 @@ export function syncShellEnvironment(
     readEnvironment?: ShellEnvironmentReader;
     readLaunchctlPath?: typeof readPathFromLaunchctl;
     readWindowsEnvironment?: WindowsEnvironmentReader;
+    windowsDirectoryExists?: WindowsDirectoryExists;
     userShell?: string;
     logWarning?: (message: string, error?: unknown) => void;
   } = {},
@@ -72,6 +88,7 @@ export function syncShellEnvironment(
     syncWindowsEnvironment(
       env,
       options.readWindowsEnvironment ?? readWindowsPersistentEnvironment,
+      options.windowsDirectoryExists,
       logWarning,
     );
     return;

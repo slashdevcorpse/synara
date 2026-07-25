@@ -65,6 +65,7 @@ import {
   ProviderAdapterValidationError,
   ProviderServiceError,
 } from "../../provider/Errors.ts";
+import { PROVIDER_PROMPT_REPLAY_MAX_INPUT_CHARS } from "../../provider/Services/ProviderAdapter.ts";
 import { buildInlineSkillInstructions } from "../../provider/skillPromptInjection.ts";
 import {
   TextGeneration,
@@ -251,6 +252,104 @@ function availableProviderContextChars(input: {
     0,
     PROVIDER_SEND_TURN_MAX_INPUT_CHARS - wrapProviderContext({ ...input, contextText: "" }).length,
   );
+}
+
+function normalizedPromptReplayMessageText(value: string): string {
+  return value
+    .replace(/\s+\n/gu, "\n")
+    .replace(/\n{3,}/gu, "\n\n")
+    .trim();
+}
+
+const PROMPT_REPLAY_MAX_MESSAGES = 6;
+const PROMPT_REPLAY_MAX_MESSAGE_CHARS = 4_000;
+const PROMPT_REPLAY_MESSAGE_TRUNCATION_MARKER = "\n[Message shortened for compatibility replay.]";
+
+function boundedPromptReplayMessageText(value: string): string {
+  const normalized = normalizedPromptReplayMessageText(value);
+  if (normalized.length <= PROMPT_REPLAY_MAX_MESSAGE_CHARS) return normalized;
+  return `${normalized
+    .slice(0, PROMPT_REPLAY_MAX_MESSAGE_CHARS - PROMPT_REPLAY_MESSAGE_TRUNCATION_MARKER.length)
+    .trimEnd()}${PROMPT_REPLAY_MESSAGE_TRUNCATION_MARKER}`;
+}
+
+function promptReplayTruncationNotice(omittedMessages: number): string {
+  return `[Transcript truncated: ${omittedMessages} prior ${
+    omittedMessages === 1 ? "message was" : "messages were"
+  } omitted to keep this compatibility request within ${PROVIDER_PROMPT_REPLAY_MAX_INPUT_CHARS.toLocaleString(
+    "en-US",
+  )} characters.]`;
+}
+
+export function buildPromptReplayProviderInput(input: {
+  readonly thread: Pick<OrchestrationThread, "messages">;
+  readonly currentMessageId: string;
+  readonly messageText: string;
+  readonly maxChars?: number;
+}): string | null {
+  const maxChars = Math.min(
+    Math.max(0, input.maxChars ?? PROVIDER_PROMPT_REPLAY_MAX_INPUT_CHARS),
+    PROVIDER_PROMPT_REPLAY_MAX_INPUT_CHARS,
+  );
+  if (input.messageText.length > maxChars) {
+    return null;
+  }
+
+  const priorMessages = listPriorTranscriptMessages(input.thread, input.currentMessageId);
+  if (priorMessages.length === 0) {
+    return input.messageText;
+  }
+
+  const intro =
+    "This provider uses Synara transcript replay for conversation continuity. Use the retained transcript as context for the latest user message.";
+  const replayWindow = priorMessages.slice(-PROMPT_REPLAY_MAX_MESSAGES);
+  const renderedMessages = replayWindow.map((message) => {
+    const role = message.role === "assistant" ? "Assistant" : "User";
+    return `${role}:\n${boundedPromptReplayMessageText(message.text)}`;
+  });
+  const availableContextChars = Math.max(
+    0,
+    maxChars -
+      wrapProviderContext({
+        tag: "thread_context",
+        contextText: "",
+        messageText: input.messageText,
+        wrapLatestUserMessage: true,
+      }).length,
+  );
+  const retainedMessages: string[] = [];
+
+  for (let index = renderedMessages.length - 1; index >= 0; index -= 1) {
+    const candidateMessages = [renderedMessages[index]!, ...retainedMessages];
+    const candidateOmissions = priorMessages.length - candidateMessages.length;
+    const candidateSections = [
+      intro,
+      ...(candidateOmissions > 0 ? [promptReplayTruncationNotice(candidateOmissions)] : []),
+      ...candidateMessages,
+    ];
+    if (candidateSections.join("\n\n").length > availableContextChars) {
+      continue;
+    }
+    retainedMessages.unshift(renderedMessages[index]!);
+  }
+
+  const omittedMessages = priorMessages.length - retainedMessages.length;
+  const contextText = [
+    intro,
+    ...(omittedMessages > 0 ? [promptReplayTruncationNotice(omittedMessages)] : []),
+    ...retainedMessages,
+  ].join("\n\n");
+  if (contextText.length > availableContextChars) {
+    return null;
+  }
+
+  const providerInput = wrapProviderContext({
+    tag: "thread_context",
+    contextText,
+    messageText: input.messageText,
+    wrapLatestUserMessage: true,
+  });
+  return providerInput.length <= maxChars ? providerInput : null;
 }
 
 function isUnknownPendingApprovalRequestError(cause: Cause.Cause<ProviderServiceError>): boolean {
@@ -1427,7 +1526,17 @@ const make = Effect.gen(function* () {
     const boundaryMessageText = thread.sidechatSourceThreadId
       ? `<sidechat_boundary>\n${SIDECHAT_BOUNDARY_INSTRUCTION}\n</sidechat_boundary>\n\n<latest_user_message>\n${input.messageText}\n</latest_user_message>`
       : input.messageText;
+    const selectedProvider =
+      input.modelSelection?.provider ??
+      threadSessionModelSelections.get(input.threadId)?.provider ??
+      thread.session?.providerName ??
+      thread.modelSelection.provider;
+    const providerCapabilities = yield* providerService.getCapabilities(
+      selectedProvider as ProviderKind,
+    );
+    const usesPromptReplay = providerCapabilities.conversationContinuity === "prompt-replay";
     const shouldBootstrapHandoff =
+      !usesPromptReplay &&
       thread.handoff?.bootstrapStatus === "pending" &&
       !hasNativeAssistantMessagesBefore(thread, input.messageId);
     const handoffBootstrapAvailableChars = availableProviderContextChars({
@@ -1439,15 +1548,11 @@ const make = Effect.gen(function* () {
       shouldBootstrapHandoff && handoffBootstrapAvailableChars > 0
         ? buildHandoffBootstrapText(thread, handoffBootstrapAvailableChars)
         : null;
-    const selectedProvider =
-      input.modelSelection?.provider ??
-      threadSessionModelSelections.get(input.threadId)?.provider ??
-      thread.session?.providerName ??
-      thread.modelSelection.provider;
     const hasPendingPriorTranscriptBootstrap =
       freshSessionContextBootstrapThreadIds.has(input.threadId) ||
       rollbackContextBootstrapThreadIds.has(input.threadId);
     const shouldBootstrapSidechatContext =
+      !usesPromptReplay &&
       thread.sidechatSourceThreadId !== null &&
       sidechatContextBootstrapThreadIds.has(input.threadId) &&
       !hasNativeAssistantMessagesBefore(thread, input.messageId) &&
@@ -1477,6 +1582,7 @@ const make = Effect.gen(function* () {
       });
     }
     const shouldBootstrapPriorTranscriptContext =
+      !usesPromptReplay &&
       (((selectedProvider === "kilo" || selectedProvider === "opencode") &&
         activeSessionBeforeEnsure === undefined) ||
         hasPendingPriorTranscriptBootstrap) &&
@@ -1512,28 +1618,49 @@ const make = Effect.gen(function* () {
             priorTranscriptBootstrapAvailableChars,
           )
         : null;
-    const providerInput = handoffBootstrapText
-      ? wrapProviderContext({
-          tag: "handoff_context",
-          contextText: handoffBootstrapText,
-          messageText: boundaryMessageText,
-          wrapLatestUserMessage: true,
-        })
-      : sidechatBootstrapText
-        ? wrapProviderContext({
-            tag: "sidechat_context",
-            contextText: sidechatBootstrapText,
+    const hasPromptReplayPriorTranscript =
+      usesPromptReplay && listPriorTranscriptMessages(thread, input.messageId).length > 0;
+    const promptReplayProviderInput =
+      usesPromptReplay && input.reviewTarget === undefined
+        ? buildPromptReplayProviderInput({
+            thread,
+            currentMessageId: input.messageId,
             messageText: boundaryMessageText,
-            wrapLatestUserMessage: false,
           })
-        : priorTranscriptBootstrapText
+        : boundaryMessageText;
+    if (promptReplayProviderInput === null) {
+      return yield* new ProviderAdapterValidationError({
+        provider: selectedProvider as ProviderKind,
+        operation: "thread.turn.start",
+        issue: `The latest message is too long to preserve prompt-replay continuity within ${PROVIDER_PROMPT_REPLAY_MAX_INPUT_CHARS.toLocaleString(
+          "en-US",
+        )} characters. Shorten the message and retry.`,
+      });
+    }
+    const providerInput = usesPromptReplay
+      ? promptReplayProviderInput
+      : handoffBootstrapText
+        ? wrapProviderContext({
+            tag: "handoff_context",
+            contextText: handoffBootstrapText,
+            messageText: boundaryMessageText,
+            wrapLatestUserMessage: true,
+          })
+        : sidechatBootstrapText
           ? wrapProviderContext({
-              tag: "thread_context",
-              contextText: priorTranscriptBootstrapText,
+              tag: "sidechat_context",
+              contextText: sidechatBootstrapText,
               messageText: boundaryMessageText,
-              wrapLatestUserMessage: true,
+              wrapLatestUserMessage: false,
             })
-          : boundaryMessageText;
+          : priorTranscriptBootstrapText
+            ? wrapProviderContext({
+                tag: "thread_context",
+                contextText: priorTranscriptBootstrapText,
+                messageText: boundaryMessageText,
+                wrapLatestUserMessage: true,
+              })
+            : boundaryMessageText;
     // Portable skills fallback: providers that cannot load the referenced skill
     // file natively get the skill instructions inlined into the prompt.
     const skillInlineText =
@@ -1544,7 +1671,11 @@ const make = Effect.gen(function* () {
               skills: input.skills ?? [],
               maxChars: Math.max(
                 0,
-                PROVIDER_SEND_TURN_MAX_INPUT_CHARS - providerInput.length - 1_000,
+                (usesPromptReplay
+                  ? PROVIDER_PROMPT_REPLAY_MAX_INPUT_CHARS
+                  : PROVIDER_SEND_TURN_MAX_INPUT_CHARS) -
+                  providerInput.length -
+                  1_000,
               ),
             }),
           ).pipe(
@@ -1821,7 +1952,11 @@ const make = Effect.gen(function* () {
         }
       }
     }
-    if (handoffBootstrapText && thread.handoff !== null && input.reviewTarget === undefined) {
+    if (
+      (handoffBootstrapText || hasPromptReplayPriorTranscript) &&
+      thread.handoff !== null &&
+      input.reviewTarget === undefined
+    ) {
       yield* orchestrationEngine.dispatch({
         type: "thread.meta.update",
         commandId: serverCommandId("handoff-bootstrap-complete"),
@@ -1831,6 +1966,11 @@ const make = Effect.gen(function* () {
           bootstrapStatus: "completed",
         },
       });
+    }
+    if (usesPromptReplay && input.reviewTarget === undefined) {
+      sidechatContextBootstrapThreadIds.delete(input.threadId);
+      freshSessionContextBootstrapThreadIds.delete(input.threadId);
+      rollbackContextBootstrapThreadIds.delete(input.threadId);
     }
     if (
       shouldBootstrapSidechatContext &&
