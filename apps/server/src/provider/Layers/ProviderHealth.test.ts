@@ -5359,7 +5359,18 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
         const nodePath = "C:\\Users\\Test\\AppData\\Roaming\\npm\\node.exe";
         const packageTargetPath =
           "C:\\Users\\Test\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\bin\\codex.js";
-        const existingFiles = new Set([shimPath, nodePath, packageTargetPath]);
+        const packageManifestPath =
+          "C:\\Users\\Test\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\package.json";
+        const packageManifestContents = JSON.stringify({
+          name: "@openai/codex",
+          bin: { codex: "bin/codex.js" },
+        });
+        const existingFiles = new Set([
+          shimPath,
+          nodePath,
+          packageTargetPath,
+          packageManifestPath,
+        ]);
         const shimContents = [
           "@ECHO off",
           "GOTO start",
@@ -5391,7 +5402,11 @@ it.layer(NodeServices.layer)("ProviderHealth", (it) => {
               fileExists: (path) =>
                 existingFiles.has(path) ||
                 path.toLowerCase().endsWith(WINDOWS_JOB_LAUNCHER_EXECUTABLE),
-              readFileString: (path) => (path === shimPath ? shimContents : undefined),
+              readFileString: (path) => {
+                if (path === shimPath) return shimContents;
+                if (path === packageManifestPath) return packageManifestContents;
+                return undefined;
+              },
               realPath: (path) => path,
             }),
         });

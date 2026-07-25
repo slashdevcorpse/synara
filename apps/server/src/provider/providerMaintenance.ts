@@ -960,8 +960,12 @@ function windowsNpmShimLinksToPackageBin(input: {
   readonly shimContents: string;
 }): boolean {
   const target = parseCanonicalWindowsNpmNodeShimTarget(input.shimContents);
+  const packageName = input.definition.npmPackageName;
+  if (!target || !packageName) {
+    return false;
+  }
   return (
-    target?.packageName.toLowerCase() === input.definition.npmPackageName?.toLowerCase() &&
+    target.packageName.toLowerCase() === packageName.toLowerCase() &&
     target.packageBinTarget.toLowerCase() === input.packageBinTarget.toLowerCase()
   );
 }

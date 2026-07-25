@@ -117,6 +117,20 @@ function resolution(
   };
 }
 
+function defaultCodexResolutionAfterUnresolvedDiscovery(
+  input: CodexCliExecutableInput,
+  observations: ReadonlyArray<WindowsCommandDiscoveryObservation>,
+): CodexCliExecutableResolution {
+  const discoveryOutcome = unresolvedWindowsCommandDiscoveryOutcome(observations);
+  if (discoveryOutcome !== "not_found") {
+    return {
+      executable: DEFAULT_CODEX_COMMAND,
+      ...(discoveryOutcome ? { discoveryOutcome } : {}),
+    };
+  }
+  return resolution(firstVerifiedFallback(input) ?? DEFAULT_CODEX_COMMAND, observations);
+}
+
 export function resolveCodexCliExecutableWithDiscovery(
   command: string,
   input: CodexCliExecutableInput = {},
@@ -132,7 +146,7 @@ export function resolveCodexCliExecutableWithDiscovery(
     return resolution(resolved, observations);
   }
 
-  return resolution(firstVerifiedFallback(input) ?? DEFAULT_CODEX_COMMAND, observations);
+  return defaultCodexResolutionAfterUnresolvedDiscovery(input, observations);
 }
 
 export function resolveCodexCliExecutable(
@@ -157,7 +171,7 @@ export async function resolveCodexCliExecutableWithDiscoveryAsync(
     return resolution(resolved, observations);
   }
 
-  return resolution(firstVerifiedFallback(input) ?? DEFAULT_CODEX_COMMAND, observations);
+  return defaultCodexResolutionAfterUnresolvedDiscovery(input, observations);
 }
 
 export async function resolveCodexCliExecutableAsync(

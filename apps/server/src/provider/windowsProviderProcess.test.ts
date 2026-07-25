@@ -1,4 +1,7 @@
-import type { WindowsCommandDiscoveryObservation } from "@synara/shared/windowsProcess";
+import {
+  prepareWindowsSafeProcess,
+  type WindowsCommandDiscoveryObservation,
+} from "@synara/shared/windowsProcess";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -479,6 +482,28 @@ describe("Windows provider process containment", () => {
             fileExists: () => true,
           },
         ),
+    ).toThrow(WindowsProviderShellLaunchError);
+  });
+
+  it("rejects batch-wrapper provenance even when ComSpec has a custom executable name", () => {
+    const prepared = prepareWindowsSafeProcess(
+      "C:\\tools\\agent.cmd",
+      ["--flag", "value with spaces"],
+      {
+        platform: "win32",
+        env: { ComSpec: "C:\\Tools\\custom-shell.exe" },
+      },
+    );
+    expect(prepared.command).toBe("C:\\Tools\\custom-shell.exe");
+    expect(prepared.windowsVerbatimArguments).toBe(true);
+
+    expect(() =>
+      containPreparedWindowsProviderProcess(prepared, {
+        platform: "win32",
+        arch: "x64",
+        launcherPath: launcher,
+        fileExists: () => true,
+      }),
     ).toThrow(WindowsProviderShellLaunchError);
   });
 

@@ -178,6 +178,29 @@ describe("resolveCodexCliExecutable", () => {
     });
   });
 
+  it("fails closed on transient discovery without probing an existing fallback", () => {
+    const standaloneCodex =
+      "C:\\Users\\Test\\AppData\\Local\\Programs\\OpenAI\\Codex\\bin\\codex.exe";
+    const readStat = regularFiles(standaloneCodex);
+
+    expect(
+      resolveCodexCliExecutableWithDiscovery("codex", {
+        platform: "win32",
+        env: { LOCALAPPDATA: "C:\\Users\\Test\\AppData\\Local" },
+        spawnSync: vi.fn(() => ({
+          stdout: "",
+          status: null,
+          error: Object.assign(new Error("where.exe timed out"), { code: "ETIMEDOUT" }),
+        })),
+        statSync: readStat,
+      }),
+    ).toEqual({
+      executable: "codex",
+      discoveryOutcome: "transient_failure",
+    });
+    expect(readStat).not.toHaveBeenCalled();
+  });
+
   it("resolves the first PATH Codex asynchronously without invoking spawnSync", async () => {
     const npmCodex = "C:\\Users\\Test\\AppData\\Roaming\\npm\\codex.cmd";
     const standaloneCodex = "C:\\Tools\\codex.exe";
@@ -222,5 +245,27 @@ describe("resolveCodexCliExecutable", () => {
       executable: "company-codex",
       discoveryOutcome: "not_found",
     });
+  });
+
+  it("fails closed asynchronously on transient discovery with an existing fallback", async () => {
+    const npmCodex = "C:\\Users\\Test\\AppData\\Roaming\\npm\\codex.cmd";
+    const readStat = regularFiles(npmCodex);
+
+    await expect(
+      resolveCodexCliExecutableWithDiscoveryAsync("codex", {
+        platform: "win32",
+        env: { APPDATA: "C:\\Users\\Test\\AppData\\Roaming" },
+        execFile: vi.fn(async () => ({
+          stdout: "",
+          status: null,
+          error: Object.assign(new Error("where.exe timed out"), { code: "ETIMEDOUT" }),
+        })),
+        statSync: readStat,
+      }),
+    ).resolves.toEqual({
+      executable: "codex",
+      discoveryOutcome: "transient_failure",
+    });
+    expect(readStat).not.toHaveBeenCalled();
   });
 });

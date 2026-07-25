@@ -474,6 +474,7 @@ export function containPreparedWindowsProviderProcess(
   const targetExtension = Path.win32.extname(target).toLowerCase();
   const targetName = Path.win32.basename(target).toLowerCase();
   if (
+    prepared.windowsVerbatimArguments === true ||
     targetExtension === ".cmd" ||
     targetExtension === ".bat" ||
     targetName === "cmd.exe" ||
@@ -483,7 +484,6 @@ export function containPreparedWindowsProviderProcess(
   }
 
   const launcherPath = resolveWindowsJobLauncherPath(input);
-  const argumentMode = prepared.windowsVerbatimArguments ? "verbatim" : "argv";
   const controlDirectory = input.controlDirectory ?? OS.tmpdir();
   const controlFilePath = Path.win32.join(
     controlDirectory,
@@ -496,7 +496,7 @@ export function containPreparedWindowsProviderProcess(
         "--protocol",
         WINDOWS_JOB_LAUNCHER_PROTOCOL_VERSION,
         "--argument-mode",
-        argumentMode,
+        "argv",
         "--control-file",
         controlFilePath,
         "--",

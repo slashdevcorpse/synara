@@ -17,7 +17,10 @@ import { ANTIGRAVITY_WINDOWS_UNAVAILABLE_MESSAGE } from "../antigravityAvailabil
 import type { ProviderMaintenanceOwnedResourceCoordinator } from "../providerMaintenanceOwnedResources";
 import { makeProviderProcessOwnerTracker } from "../providerProcessOwnerTracker.ts";
 import { AntigravityAdapter, type AntigravityAdapterShape } from "../Services/AntigravityAdapter";
-import { containPreparedWindowsProviderProcess } from "../windowsProviderProcess.ts";
+import {
+  containPreparedWindowsProviderProcess,
+  WindowsProviderShellLaunchError,
+} from "../windowsProviderProcess.ts";
 import {
   supervisePreparedNodeProcess,
   windowsJobNodeProcessSupervisor,
@@ -620,53 +623,29 @@ describe("Antigravity process spawning and output ownership", () => {
   );
 
   it.runIf(process.platform === "win32")(
-    "runs a real .cmd helper and turn from a path with spaces and non-ASCII",
+    "rejects a real .cmd helper and turn from a path with spaces and non-ASCII",
     async () => {
       const directory = await fs.mkdtemp(path.join(os.tmpdir(), "synara agy café 東京 "));
-      const scriptPath = path.join(directory, "echo args.cjs");
       const commandPath = path.join(directory, "echo args.cmd");
       const values = ["ordinary", "space value", 'quoted " value', "naïve-東京"];
-      const stderr = "cmd stderr café-東京";
       try {
-        await fs.writeFile(
-          scriptPath,
-          `process.stdout.write(JSON.stringify(process.argv.slice(2)));process.stderr.write(${JSON.stringify(stderr)});`,
-        );
-        await fs.writeFile(
-          commandPath,
-          `@echo off\r\n"${process.execPath}" "%~dp0echo args.cjs" %*\r\n`,
-        );
+        await fs.writeFile(commandPath, "@echo off\r\nexit /b 0\r\n");
 
-        const helper = await runAntigravityHelperProcess(commandPath, values, {
-          cwd: directory,
-          timeoutMs: 2_000,
-        });
-        expect(helper).toMatchObject({
-          code: 0,
-          stdout: JSON.stringify(values),
-          stderr,
-          outputTruncated: false,
-        });
-
-        let finalized: AntigravityTurnProcessResult | undefined;
-        const lifecycle = startAntigravityTurnProcess({
-          command: commandPath,
-          args: values,
-          cwd: directory,
-          env: process.env,
-          onFinalize: async (result) => {
-            finalized = result;
-          },
-        });
-        const turn = await lifecycle.finalization;
-        expect(turn).toMatchObject({
-          code: 0,
-          signal: null,
-          stdout: JSON.stringify(values),
-          stderr,
-          outputTruncated: false,
-        });
-        expect(finalized).toEqual(turn);
+        await expect(
+          runAntigravityHelperProcess(commandPath, values, {
+            cwd: directory,
+            timeoutMs: 2_000,
+          }),
+        ).rejects.toBeInstanceOf(WindowsProviderShellLaunchError);
+        expect(() =>
+          startAntigravityTurnProcess({
+            command: commandPath,
+            args: values,
+            cwd: directory,
+            env: process.env,
+            onFinalize: async () => undefined,
+          }),
+        ).toThrow(WindowsProviderShellLaunchError);
       } finally {
         await fs.rm(directory, { recursive: true, force: true });
       }
