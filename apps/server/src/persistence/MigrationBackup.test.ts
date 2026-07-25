@@ -1584,7 +1584,7 @@ describe("migration backups", () => {
       expectPublishedPinSchema(upgraded);
       const terminalSchemaObjects = upgraded
         .prepare(
-          "SELECT name FROM sqlite_master WHERE name IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ORDER BY name",
+          "SELECT name FROM sqlite_master WHERE name IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ORDER BY name",
         )
         .all(
           "git_handoff_operations",
@@ -1597,6 +1597,7 @@ describe("migration backups", () => {
           "provider_runtime_events",
           "provider_runtime_open_turns",
           "queued_turn_promotion_cancellation_fences",
+          "queued_turn_promotion_compatibility_incidents",
           "queued_turn_promotions",
           "trg_project_pull_request_pins_limit",
         ) as Array<{ readonly name: string }>;
@@ -1611,6 +1612,7 @@ describe("migration backups", () => {
         "provider_runtime_events",
         "provider_runtime_open_turns",
         "queued_turn_promotion_cancellation_fences",
+        "queued_turn_promotion_compatibility_incidents",
         "queued_turn_promotions",
         "trg_project_pull_request_pins_limit",
       ]);

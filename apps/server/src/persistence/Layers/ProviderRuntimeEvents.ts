@@ -22,6 +22,7 @@ const decodeEvent = Schema.decodeUnknownEffect(ProviderRuntimeEventJson);
 
 const StoredRowSchema = Schema.Struct({
   sequence: NonNegativeInt,
+  orchestrationCutoffSequence: Schema.NullOr(NonNegativeInt),
   eventJson: Schema.String,
 });
 const decodeStoredRow = Schema.decodeUnknownEffect(StoredRowSchema);
@@ -44,7 +45,10 @@ const make = Effect.gen(function* () {
         .withTransaction(
           Effect.gen(function* () {
             const existing = yield* sql<Record<string, unknown>>`
-            SELECT sequence, event_json AS "eventJson"
+            SELECT
+              sequence,
+              orchestration_cutoff_sequence AS "orchestrationCutoffSequence",
+              event_json AS "eventJson"
             FROM provider_runtime_events
             WHERE event_id = ${event.eventId}
           `;
@@ -52,13 +56,17 @@ const make = Effect.gen(function* () {
             return yield* sql<Record<string, unknown>>`
             INSERT INTO provider_runtime_events (
               event_id, thread_id, turn_id, lifecycle_generation, event_type,
-              event_json, persisted_at
-            ) VALUES (
+              event_json, persisted_at, orchestration_cutoff_sequence
+            ) SELECT
               ${event.eventId}, ${event.threadId}, ${event.turnId ?? null},
               ${event.lifecycleGeneration ?? null},
-              ${event.type}, ${eventJson}, ${new Date().toISOString()}
-            )
-            RETURNING sequence, event_json AS "eventJson"
+              ${event.type}, ${eventJson}, ${new Date().toISOString()},
+              COALESCE(MAX(sequence), 0)
+            FROM orchestration_events
+            RETURNING
+              sequence,
+              orchestration_cutoff_sequence AS "orchestrationCutoffSequence",
+              event_json AS "eventJson"
           `;
           }),
         )
@@ -72,7 +80,11 @@ const make = Effect.gen(function* () {
           issue: `Provider event '${event.eventId}' was reused with different content.`,
         });
       }
-      return { sequence: row.sequence, event } satisfies PersistedProviderRuntimeEvent;
+      return {
+        sequence: row.sequence,
+        orchestrationCutoffSequence: row.orchestrationCutoffSequence,
+        event,
+      } satisfies PersistedProviderRuntimeEvent;
     });
 
   const getHighWaterSequence = sql<{ readonly highWaterSequence: number }>`
@@ -87,7 +99,10 @@ const make = Effect.gen(function* () {
     const limit = Math.max(1, Math.min(1_000, Math.floor(input.limit)));
     return Effect.gen(function* () {
       const rows = yield* sql<Record<string, unknown>>`
-        SELECT sequence, event_json AS "eventJson"
+        SELECT
+          sequence,
+          orchestration_cutoff_sequence AS "orchestrationCutoffSequence",
+          event_json AS "eventJson"
         FROM provider_runtime_events
         WHERE sequence > ${input.sequenceExclusive}
           AND sequence <= ${input.throughSequenceInclusive}
@@ -108,7 +123,11 @@ const make = Effect.gen(function* () {
                 ),
               ),
             );
-            return { sequence: row.sequence, event } satisfies PersistedProviderRuntimeEvent;
+            return {
+              sequence: row.sequence,
+              orchestrationCutoffSequence: row.orchestrationCutoffSequence,
+              event,
+            } satisfies PersistedProviderRuntimeEvent;
           }),
         { concurrency: 1 },
       );
@@ -120,7 +139,10 @@ const make = Effect.gen(function* () {
       const limit = Math.max(1, Math.min(1_000, Math.floor(input.limit)));
       return Effect.gen(function* () {
         const rows = yield* sql<Record<string, unknown>>`
-          SELECT event.sequence, event.event_json AS "eventJson"
+          SELECT
+            event.sequence,
+            event.orchestration_cutoff_sequence AS "orchestrationCutoffSequence",
+            event.event_json AS "eventJson"
           FROM provider_runtime_events AS event
           INNER JOIN provider_runtime_open_turns AS open_turn
             ON open_turn.thread_id = event.thread_id
@@ -151,7 +173,11 @@ const make = Effect.gen(function* () {
                   ),
                 ),
               );
-              return { sequence: row.sequence, event } satisfies PersistedProviderRuntimeEvent;
+              return {
+                sequence: row.sequence,
+                orchestrationCutoffSequence: row.orchestrationCutoffSequence,
+                event,
+              } satisfies PersistedProviderRuntimeEvent;
             }),
           { concurrency: 1 },
         );

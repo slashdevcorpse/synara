@@ -18,12 +18,13 @@ export interface QueuedTurnPromotionRepositoryShape {
     queuedEventSequence: number,
   ) => Effect.Effect<Option.Option<QueuedTurnPromotion>, PersistenceSqlError>;
   readonly enqueue: (input: {
+    readonly providerSessionThreadId: string;
     readonly queuedEventSequence: number;
     readonly threadId: string;
     readonly messageId: string;
     readonly dispatchMode: "queue" | "steer";
     readonly createdAt: string;
-  }) => Effect.Effect<void, PersistenceSqlError>;
+  }) => Effect.Effect<boolean, PersistenceSqlError>;
   readonly claimNext: (input: {
     readonly threadId: string;
     readonly claimOwner: string;
@@ -37,6 +38,7 @@ export interface QueuedTurnPromotionRepositoryShape {
    * rows as `queue`, so those rows remain strict FIFO.
    */
   readonly claimNextForThreads: (input: {
+    readonly providerSessionThreadId: string;
     readonly threadIds: ReadonlyArray<string>;
     readonly claimOwner: string;
     readonly claimedAt: string;
@@ -75,6 +77,9 @@ export interface QueuedTurnPromotionRepositoryShape {
    * session through the same orchestration event sequence.
    */
   readonly cancelProviderSessionThrough: (input: {
+    readonly compatibilityIncidentKey: string;
+    readonly runtimeEventSequence: number;
+    readonly runtimeEventId: string;
     readonly providerSessionThreadId: string;
     readonly memberThreadIds: ReadonlyArray<string>;
     readonly throughEventSequence: number;

@@ -88,6 +88,7 @@ import { QueuedTurnPromotionRepository } from "../../persistence/Services/Queued
 import {
   PROVIDER_COMMAND_REACTOR_RUNTIME_CONSUMER,
   ProviderRuntimeEventRepository,
+  type PersistedProviderRuntimeEvent,
 } from "../../persistence/Services/ProviderRuntimeEvents.ts";
 import { ManagedAttachmentRepository } from "../../persistence/Services/ManagedAttachments.ts";
 import { ServerConfig } from "../../config.ts";
@@ -881,11 +882,17 @@ const make = Effect.gen(function* () {
 
   const fenceProviderSessionPromotionsThrough = Effect.fnUntraced(function* (input: {
     readonly scope: ProviderSessionThreadScope;
+    readonly compatibilityIncidentKey: string;
+    readonly runtimeEventSequence: number;
+    readonly runtimeEventId: string;
     readonly throughEventSequence: number;
     readonly updatedAt: string;
   }) {
     const memberThreadIds = yield* listCancellableProviderSessionThreadIds(input.scope);
     yield* queuedTurnPromotions.cancelProviderSessionThrough({
+      compatibilityIncidentKey: input.compatibilityIncidentKey,
+      runtimeEventSequence: input.runtimeEventSequence,
+      runtimeEventId: input.runtimeEventId,
       providerSessionThreadId: input.scope.sessionThreadId,
       memberThreadIds,
       throughEventSequence: input.throughEventSequence,
@@ -936,15 +943,8 @@ const make = Effect.gen(function* () {
     // before any runnable row can be inserted or rematerialized.
     yield* drainProviderRuntimeJournalThroughCurrentHighWater;
     const scope = yield* resolveProviderSessionThreadScope(input.event.payload.threadId);
-    if (
-      yield* queuedTurnPromotions.isQueuedEventCancelledByProviderSessionFence({
-        providerSessionThreadId: scope.sessionThreadId,
-        queuedEventSequence: input.event.sequence,
-      })
-    ) {
-      return false;
-    }
-    yield* queuedTurnPromotions.enqueue({
+    return yield* queuedTurnPromotions.enqueue({
+      providerSessionThreadId: scope.sessionThreadId,
       queuedEventSequence: input.event.sequence,
       threadId: input.event.payload.threadId,
       messageId: input.event.payload.messageId,
@@ -955,7 +955,6 @@ const make = Effect.gen(function* () {
       dispatchMode: input.quarantineFifo ? "queue" : input.event.payload.dispatchMode,
       createdAt: input.event.payload.createdAt,
     });
-    return true;
   });
 
   const queuedPromotionSourceSequence = (
@@ -2547,6 +2546,7 @@ const make = Effect.gen(function* () {
   type DrainQueuedTurnsOptions = {
     readonly synchronouslyProcessCommittedStart?: boolean;
     readonly excludingEventSequence?: number | undefined;
+    readonly runtimeJournalAlreadyCaughtUp?: boolean;
   };
 
   // Promote the next queued message only after the active provider turn settles.
@@ -2581,8 +2581,28 @@ const make = Effect.gen(function* () {
       ) {
         return;
       }
+      if (options?.runtimeJournalAlreadyCaughtUp !== true) {
+        // The provider terminal acknowledgement path keeps the turn active
+        // until its runtime event has been journaled. Once idle is observable,
+        // catch the command consumer up again before claiming: this closes the
+        // snapshot -> terminal append -> idle transition without polling lag.
+        yield* drainProviderRuntimeJournalThroughCurrentHighWater;
+        if (
+          (yield* hasUnsettledProviderDeliveryForSession({
+            scope,
+            ...(options?.excludingEventSequence === undefined
+              ? {}
+              : { excludingEventSequence: options.excludingEventSequence }),
+          })) ||
+          (yield* resolveLiveProviderTurnIdForSessionThread(sessionThreadId)) !== undefined ||
+          pendingQueuedDispatchBySessionThread.has(sessionThreadId)
+        ) {
+          return;
+        }
+      }
       const sessionQueue = yield* listPendingProviderSessionThreadIds(scope);
       const claimed = yield* queuedTurnPromotions.claimNextForThreads({
+        providerSessionThreadId: sessionThreadId,
         threadIds: sessionQueue,
         claimOwner: queuedTurnPromotionOwner,
         claimedAt: new Date().toISOString(),
@@ -2742,7 +2762,10 @@ const make = Effect.gen(function* () {
     yield* drainQueuedTurnsForResolvedSession(scope, options);
   });
 
-  const processQueueDrainEvent = Effect.fnUntraced(function* (event: ProviderQueueDrainEvent) {
+  const processQueueDrainEvent = Effect.fnUntraced(function* (
+    entry: PersistedProviderRuntimeEvent & { readonly event: ProviderQueueDrainEvent },
+  ) {
+    const { event } = entry;
     observePendingContextBootstrapTerminalEvent(event);
     const scope = yield* resolveProviderSessionThreadScope(event.threadId);
     const { sessionThreadId } = scope;
@@ -2750,10 +2773,31 @@ const make = Effect.gen(function* () {
       event.provider === "opencode" &&
       event.payload.failureReason === OPENCODE_STORAGE_SCHEMA_INCOMPATIBLE_REASON
     ) {
+      if (entry.orchestrationCutoffSequence === null) {
+        return yield* Effect.die(
+          new Error(
+            `OpenCode compatibility terminal ${entry.sequence} has no durable orchestration cutoff.`,
+          ),
+        );
+      }
+      if (event.turnId === undefined) {
+        return yield* Effect.die(
+          new Error(`OpenCode compatibility terminal ${entry.sequence} has no turn identity.`),
+        );
+      }
       pendingQueuedDispatchBySessionThread.delete(sessionThreadId);
       yield* fenceProviderSessionPromotionsThrough({
         scope,
-        throughEventSequence: yield* orchestrationEngine.getEventHighWaterSequence,
+        compatibilityIncidentKey: JSON.stringify([
+          event.provider,
+          sessionThreadId,
+          event.lifecycleGeneration ?? null,
+          event.turnId,
+          event.payload.failureReason,
+        ]),
+        runtimeEventSequence: entry.sequence,
+        runtimeEventId: event.eventId,
+        throughEventSequence: entry.orchestrationCutoffSequence,
         updatedAt: event.createdAt,
       });
       return;
@@ -2784,7 +2828,9 @@ const make = Effect.gen(function* () {
     // Child subagent threads queue under their own id but share the parent's
     // provider session, and terminal runtime events carry the session-owning
     // thread id — drain every queue bound to this session.
-    yield* drainQueuedTurnsForResolvedSession(scope);
+    yield* drainQueuedTurnsForResolvedSession(scope, {
+      runtimeJournalAlreadyCaughtUp: true,
+    });
   });
 
   const recoverQueuedTurnPromotions = Effect.gen(function* () {
@@ -3620,7 +3666,10 @@ const make = Effect.gen(function* () {
               // Persist the provider-session cancellation fence (when relevant)
               // before acknowledging the runtime row. A crash between these
               // operations safely replays the idempotent fence transaction.
-              yield* processQueueDrainEvent(entry.event);
+              yield* processQueueDrainEvent({
+                ...entry,
+                event: entry.event,
+              } as PersistedProviderRuntimeEvent & { readonly event: ProviderQueueDrainEvent });
             }
             const advanced = yield* runtimeEvents.advanceConsumerCursor({
               consumerName: PROVIDER_COMMAND_REACTOR_RUNTIME_CONSUMER,
@@ -4549,9 +4598,15 @@ const make = Effect.gen(function* () {
   } satisfies ProviderCommandReactorShape;
 });
 
-export const ProviderCommandReactorLive = Layer.effect(ProviderCommandReactor, make).pipe(
+export const ProviderCommandReactorWithoutRuntimeEventRepository = Layer.effect(
+  ProviderCommandReactor,
+  make,
+).pipe(
   Layer.provideMerge(OrchestrationEventDeliveryRepositoryLive),
   Layer.provideMerge(QueuedTurnPromotionRepositoryLive),
   Layer.provideMerge(ProjectionPendingInteractionRepositoryLive),
+);
+
+export const ProviderCommandReactorLive = ProviderCommandReactorWithoutRuntimeEventRepository.pipe(
   Layer.provideMerge(ProviderRuntimeEventRepositoryLive),
 );

@@ -40,6 +40,7 @@ import {
 import { OrchestrationEventStoreLive } from "../../persistence/Layers/OrchestrationEventStore.ts";
 import { OrchestrationCommandReceiptRepositoryLive } from "../../persistence/Layers/OrchestrationCommandReceipts.ts";
 import { OrchestrationEventDeliveryRepositoryLive } from "../../persistence/Layers/OrchestrationEventDeliveries.ts";
+import { ProviderRuntimeEventRepositoryLive } from "../../persistence/Layers/ProviderRuntimeEvents.ts";
 import {
   OrchestrationEventDeliveryRepository,
   PROVIDER_COMMAND_REACTOR_CONSUMER,
@@ -65,7 +66,7 @@ import { OrchestrationProjectionPipelineLive } from "./ProjectionPipeline.ts";
 import { OrchestrationProjectionSnapshotQueryLive } from "./ProjectionSnapshotQuery.ts";
 import {
   buildPromptReplayProviderInput,
-  ProviderCommandReactorLive,
+  ProviderCommandReactorWithoutRuntimeEventRepository,
 } from "./ProviderCommandReactor.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import {
@@ -158,6 +159,7 @@ describe("ProviderCommandReactor", () => {
     readonly sendTurn?: ProviderServiceShape["sendTurn"];
     readonly stopRuntimeSession?: NonNullable<ProviderServiceShape["stopRuntimeSession"]>;
     readonly afterDeliveryReconcile?: () => Promise<void>;
+    readonly onRuntimeHighWaterRead?: (sequence: number) => Promise<void>;
   }) {
     const now = new Date().toISOString();
     const baseDir = input?.baseDir ?? fs.mkdtempSync(path.join(os.tmpdir(), "synara-reactor-"));
@@ -451,7 +453,24 @@ describe("ProviderCommandReactor", () => {
       Layer.provide(OrchestrationEventStoreLive),
       Layer.provide(OrchestrationCommandReceiptRepositoryLive),
     );
-    const layer = ProviderCommandReactorLive.pipe(
+    const runtimeEventRepositoryLayer =
+      input?.onRuntimeHighWaterRead === undefined
+        ? ProviderRuntimeEventRepositoryLive
+        : Layer.effect(
+            ProviderRuntimeEventRepository,
+            Effect.gen(function* () {
+              const repository = yield* ProviderRuntimeEventRepository;
+              return {
+                ...repository,
+                getHighWaterSequence: repository.getHighWaterSequence.pipe(
+                  Effect.tap((sequence) =>
+                    Effect.promise(() => input.onRuntimeHighWaterRead!(sequence)),
+                  ),
+                ),
+              };
+            }),
+          ).pipe(Layer.provide(ProviderRuntimeEventRepositoryLive));
+    const layer = ProviderCommandReactorWithoutRuntimeEventRepository.pipe(
       Layer.provideMerge(orchestrationLayer),
       Layer.provideMerge(OrchestrationProjectionSnapshotQueryLive),
       Layer.provideMerge(Layer.succeed(ProviderService, service)),
@@ -474,6 +493,7 @@ describe("ProviderCommandReactor", () => {
       Layer.provideMerge(ServerConfig.layerTest(process.cwd(), baseDir)),
       Layer.provideMerge(NodeServices.layer),
       Layer.provideMerge(OrchestrationEventDeliveryRepositoryLive),
+      Layer.provideMerge(runtimeEventRepositoryLayer),
       Layer.provideMerge(SqlitePersistenceMemory),
     );
     const runtime = ManagedRuntime.make(layer);
@@ -820,6 +840,7 @@ describe("ProviderCommandReactor", () => {
   ) {
     await Effect.runPromise(
       harness.queuedTurnPromotionRepository.enqueue({
+        providerSessionThreadId: source.payload.threadId,
         queuedEventSequence: source.sequence,
         threadId: source.payload.threadId,
         messageId: source.payload.messageId,
@@ -2856,6 +2877,7 @@ describe("ProviderCommandReactor", () => {
     const queuedEvent = persisted[1]!;
     await Effect.runPromise(
       harness.queuedTurnPromotionRepository.enqueue({
+        providerSessionThreadId: threadId,
         queuedEventSequence: queuedEvent.sequence,
         threadId,
         messageId,
@@ -2973,6 +2995,7 @@ describe("ProviderCommandReactor", () => {
     const queuedEvent = persisted[1]!;
     await Effect.runPromise(
       harness.queuedTurnPromotionRepository.enqueue({
+        providerSessionThreadId: threadId,
         queuedEventSequence: queuedEvent.sequence,
         threadId,
         messageId,
@@ -3098,6 +3121,7 @@ describe("ProviderCommandReactor", () => {
     });
     await Effect.runPromise(
       harness.queuedTurnPromotionRepository.enqueue({
+        providerSessionThreadId: threadId,
         queuedEventSequence: queuedOne.sequence,
         threadId,
         messageId: queuedOne.payload.messageId,
@@ -3166,6 +3190,7 @@ describe("ProviderCommandReactor", () => {
     });
     await Effect.runPromise(
       harness.queuedTurnPromotionRepository.enqueue({
+        providerSessionThreadId: threadId,
         queuedEventSequence: queuedTwo.sequence,
         threadId,
         messageId: queuedTwo.payload.messageId,
@@ -4340,6 +4365,7 @@ describe("ProviderCommandReactor", () => {
     const queuedEvent = persisted[0]!;
     await Effect.runPromise(
       harness.queuedTurnPromotionRepository.enqueue({
+        providerSessionThreadId: threadId,
         queuedEventSequence: queuedEvent.sequence,
         threadId,
         messageId,
@@ -4397,6 +4423,7 @@ describe("ProviderCommandReactor", () => {
     const queuedEvent = persisted[0]!;
     await Effect.runPromise(
       harness.queuedTurnPromotionRepository.enqueue({
+        providerSessionThreadId: threadId,
         queuedEventSequence: queuedEvent.sequence,
         threadId,
         messageId,
@@ -7541,7 +7568,117 @@ describe("ProviderCommandReactor", () => {
     expect(harness.sendTurn).not.toHaveBeenCalled();
   });
 
-  it("does not materialize a queued turn observed behind an OpenCode compatibility terminal", async () => {
+  it("catches a compatibility terminal appended after the first queue snapshot before claim", async () => {
+    let gateArmed = false;
+    let observeSnapshot!: (sequence: number) => void;
+    let releaseSnapshot!: () => void;
+    const snapshotObserved = new Promise<number>((resolve) => {
+      observeSnapshot = resolve;
+    });
+    const snapshotRelease = new Promise<void>((resolve) => {
+      releaseSnapshot = resolve;
+    });
+    const harness = await createHarness({
+      threadModelSelection: {
+        provider: "opencode",
+        model: "openai/gpt-5",
+      },
+      onRuntimeHighWaterRead: async (sequence) => {
+        if (!gateArmed) return;
+        gateArmed = false;
+        observeSnapshot(sequence);
+        await snapshotRelease;
+      },
+    });
+    const now = new Date().toISOString();
+    const threadId = ThreadId.makeUnsafe("thread-1");
+    const activeTurnId = asTurnId("turn-opencode-after-snapshot");
+
+    harness.setRuntimeSessionTurnState({
+      threadId,
+      status: "running",
+      activeTurnId,
+    });
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.makeUnsafe("cmd-session-opencode-after-snapshot"),
+        threadId,
+        session: {
+          threadId,
+          status: "running",
+          providerName: "opencode",
+          runtimeMode: "approval-required",
+          activeTurnId,
+          lastError: null,
+          updatedAt: now,
+        },
+        createdAt: now,
+      }),
+    );
+    await harness.drain();
+    harness.sendTurn.mockClear();
+
+    gateArmed = true;
+    const queuedEvent = await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.makeUnsafe("cmd-opencode-after-snapshot-queued"),
+        threadId,
+        message: {
+          messageId: asMessageId("msg-opencode-after-snapshot-queued"),
+          role: "user",
+          text: "must remain behind the compatibility terminal",
+          attachments: [],
+        },
+        runtimeMode: "approval-required",
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        createdAt: now,
+      }),
+    );
+    const staleRuntimeHighWater = await snapshotObserved;
+    const terminal = await harness.persistRuntimeEventWithoutLivePublication({
+      type: "turn.completed",
+      eventId: asEventId("evt-opencode-after-snapshot-terminal"),
+      provider: "opencode",
+      threadId,
+      createdAt: now,
+      turnId: activeTurnId,
+      lifecycleGeneration: "generation-opencode-after-snapshot",
+      payload: {
+        state: "failed",
+        failureReason: "opencode_storage_schema_incompatible",
+        errorMessage:
+          "OpenCode could not use its current data format. Update OpenCode, refresh provider status, then start a new attempt. Super Synara did not modify OpenCode data.",
+      },
+      providerRefs: {},
+    });
+    expect(terminal.sequence).toBeGreaterThan(staleRuntimeHighWater);
+    expect(terminal.orchestrationCutoffSequence).toBeGreaterThanOrEqual(queuedEvent.sequence);
+    harness.setRuntimeSessionTurnState({ threadId, status: "error" });
+    releaseSnapshot();
+
+    await harness.drain();
+
+    expect(harness.sendTurn).not.toHaveBeenCalled();
+    const stalePromotion = await Effect.runPromise(
+      harness.queuedTurnPromotionRepository.getBySequence(queuedEvent.sequence),
+    );
+    expect(
+      Option.isNone(stalePromotion) ||
+        (Option.isSome(stalePromotion) && stalePromotion.value.state === "cancelled"),
+    ).toBe(true);
+    expect(
+      await Effect.runPromise(
+        harness.queuedTurnPromotionRepository.isQueuedEventCancelledByProviderSessionFence({
+          providerSessionThreadId: threadId,
+          queuedEventSequence: queuedEvent.sequence,
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  it("does not extend an OpenCode compatibility fence over a later explicit turn", async () => {
     const compatibilityFailure = new ProviderAdapterCompatibilityError({
       provider: "opencode",
       method: "session.promptAsync",
@@ -7658,18 +7795,17 @@ describe("ProviderCommandReactor", () => {
       ),
     )[0];
     expect(committedQueuedSource?.type).toBe("thread.turn-queued");
-    harness.setRuntimeSessionTurnState({ threadId, status: "error" });
     releasePromptFailure!();
 
     await harness.drain();
     expect(harness.sendTurn).toHaveBeenCalledTimes(1);
     expect(
-      Option.isNone(
+      (
         await Effect.runPromise(
           harness.queuedTurnPromotionRepository.getBySequence(queuedEvent.sequence),
-        ),
-      ),
-    ).toBe(true);
+        )
+      ).pipe(Option.getOrThrow),
+    ).toMatchObject({ state: "queued" });
     expect(
       await Effect.runPromise(
         harness.queuedTurnPromotionRepository.isQueuedEventCancelledByProviderSessionFence({
@@ -7677,10 +7813,10 @@ describe("ProviderCommandReactor", () => {
           queuedEventSequence: queuedEvent.sequence,
         }),
       ),
-    ).toBe(true);
+    ).toBe(false);
   });
 
-  it("replays a persisted OpenCode compatibility terminal before queued promotion recovery without live fanout", async () => {
+  it("replays a persisted OpenCode compatibility terminal without extending its cutoff on a delayed duplicate", async () => {
     const harness = await createHarness({
       startReactor: false,
       threadModelSelection: {
@@ -7753,7 +7889,48 @@ describe("ProviderCommandReactor", () => {
       },
       providerRefs: {},
     });
-    harness.setRuntimeSessionTurnState({ threadId, status: "error" });
+    const laterDispatch = await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.makeUnsafe("cmd-opencode-durable-replay-later"),
+        threadId,
+        message: {
+          messageId: asMessageId("msg-opencode-durable-replay-later"),
+          role: "user",
+          text: "must remain eligible after the earlier compatibility terminal",
+          attachments: [],
+        },
+        runtimeMode: "approval-required",
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        createdAt: "2026-07-25T00:00:01.000Z",
+      }),
+    );
+    const laterSource = requireHarnessQueuedTurnSource(
+      await readHarnessEvents(harness),
+      "cmd-opencode-durable-replay-later",
+    );
+    expect(laterSource.type).toBe("thread.turn-queued");
+    expect(laterSource.sequence).toBe(laterDispatch.sequence);
+    await enqueueHarnessQueuedTurnSource(harness, laterSource);
+    const delayedDuplicate = await harness.persistRuntimeEventWithoutLivePublication({
+      type: "turn.completed",
+      eventId: asEventId("evt-opencode-durable-replay-terminal-delayed"),
+      provider: "opencode",
+      threadId,
+      createdAt: "2026-07-25T00:00:02.000Z",
+      turnId: activeTurnId,
+      payload: {
+        state: "failed",
+        failureReason: "opencode_storage_schema_incompatible",
+        errorMessage:
+          "OpenCode could not use its current data format. Update OpenCode, refresh provider status, then start a new attempt. Super Synara did not modify OpenCode data.",
+      },
+      providerRefs: {},
+    });
+    expect(persistedTerminal.orchestrationCutoffSequence).toBeLessThan(laterSource.sequence);
+    expect(delayedDuplicate.orchestrationCutoffSequence).toBeGreaterThanOrEqual(
+      laterSource.sequence,
+    );
 
     await harness.startReactor();
     await harness.drain();
@@ -7777,10 +7954,25 @@ describe("ProviderCommandReactor", () => {
       ),
     ).toBe(true);
     expect(
+      (
+        await Effect.runPromise(
+          harness.queuedTurnPromotionRepository.getBySequence(laterSource.sequence),
+        )
+      ).pipe(Option.getOrThrow),
+    ).toMatchObject({ state: "queued" });
+    expect(
+      await Effect.runPromise(
+        harness.queuedTurnPromotionRepository.isQueuedEventCancelledByProviderSessionFence({
+          providerSessionThreadId: threadId,
+          queuedEventSequence: laterSource.sequence,
+        }),
+      ),
+    ).toBe(false);
+    expect(
       await Effect.runPromise(
         harness.runtimeEventRepository.getConsumerCursor(PROVIDER_COMMAND_REACTOR_RUNTIME_CONSUMER),
       ),
-    ).toBe(persistedTerminal.sequence);
+    ).toBe(delayedDuplicate.sequence);
   });
 
   it("keeps fenced no-row quarantine recovery cancelled while materializing a later sequence", async () => {

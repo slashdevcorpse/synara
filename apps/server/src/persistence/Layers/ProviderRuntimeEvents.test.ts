@@ -1,6 +1,7 @@
 import { EventId, ThreadId, TurnId, type ProviderRuntimeEvent } from "@synara/contracts";
 import { assert, it } from "@effect/vitest";
 import { Effect, Layer } from "effect";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import {
   PROVIDER_COMMAND_REACTOR_RUNTIME_CONSUMER,
@@ -137,6 +138,7 @@ layer("ProviderRuntimeEventRepository", (it) => {
   it.effect("retains journal rows until every registered consumer acknowledges them", () =>
     Effect.gen(function* () {
       const repository = yield* ProviderRuntimeEventRepository;
+      const sql = yield* SqlClient.SqlClient;
       const baselineHighWater = yield* repository.getHighWaterSequence;
       const baselineRows = yield* repository.readAfter({
         sequenceExclusive: 0,
@@ -179,6 +181,15 @@ layer("ProviderRuntimeEventRepository", (it) => {
       const first = entries[0];
       assert.isDefined(first);
       assert.isDefined(last);
+      yield* sql`
+        INSERT INTO queued_turn_promotion_compatibility_incidents (
+          incident_key, runtime_event_sequence, runtime_event_id,
+          provider_session_thread_id, through_event_sequence, created_at
+        ) VALUES (
+          'runtime-retention-incident', ${first.sequence}, ${first.event.eventId},
+          'thread-runtime-retention', 0, '2026-07-14T00:00:01.500Z'
+        )
+      `;
       assert.strictEqual(
         yield* repository.getConsumerCursor(PROVIDER_COMMAND_REACTOR_RUNTIME_CONSUMER),
         baselineHighWater,
@@ -208,6 +219,57 @@ layer("ProviderRuntimeEventRepository", (it) => {
       });
       assert.lengthOf(retained, PROVIDER_RUNTIME_EVENT_RETAIN_ACCEPTED);
       assert.strictEqual(retained[0]?.sequence, entries[1]?.sequence);
+      assert.deepStrictEqual(
+        yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS count
+          FROM queued_turn_promotion_compatibility_incidents
+          WHERE incident_key = 'runtime-retention-incident'
+        `,
+        [{ count: 1 }],
+      );
+    }),
+  );
+});
+
+const runtimeCutoffLayer = it.layer(
+  ProviderRuntimeEventRepositoryLive.pipe(Layer.provideMerge(SqlitePersistenceMemory)),
+);
+
+runtimeCutoffLayer("ProviderRuntimeEventRepository append-time cutoff", (it) => {
+  it.effect("captures the orchestration cutoff atomically and keeps it immutable on replay", () =>
+    Effect.gen(function* () {
+      const repository = yield* ProviderRuntimeEventRepository;
+      const sql = yield* SqlClient.SqlClient;
+      const insertOrchestrationEvent = (suffix: string, streamVersion: number) =>
+        sql<{ readonly sequence: number }>`
+          INSERT INTO orchestration_events (
+            event_id, aggregate_kind, stream_id, stream_version, event_type,
+            occurred_at, command_id, causation_event_id, correlation_id,
+            actor_kind, payload_json, metadata_json
+          ) VALUES (
+            ${`runtime-cutoff-${suffix}`}, 'thread', 'thread-runtime-cutoff',
+            ${streamVersion}, 'thread.turn-queued', '2026-07-25T00:00:00.000Z',
+            ${`cmd-runtime-cutoff-${suffix}`}, NULL, NULL, 'server', '{}', '{}'
+          )
+          RETURNING sequence
+        `.pipe(Effect.map((rows) => rows[0]!.sequence));
+
+      const cutoff = yield* insertOrchestrationEvent("before", 0);
+      const event = runtimeEvent("runtime-event-cutoff", "captured");
+      const persisted = yield* repository.append(event);
+      assert.strictEqual(persisted.orchestrationCutoffSequence, cutoff);
+
+      yield* insertOrchestrationEvent("after", 1);
+      const duplicate = yield* repository.append(event);
+      assert.strictEqual(duplicate.sequence, persisted.sequence);
+      assert.strictEqual(duplicate.orchestrationCutoffSequence, cutoff);
+
+      const replayed = (yield* repository.readAfter({
+        sequenceExclusive: persisted.sequence - 1,
+        throughSequenceInclusive: persisted.sequence,
+        limit: 1,
+      }))[0];
+      assert.strictEqual(replayed?.orchestrationCutoffSequence, cutoff);
     }),
   );
 });

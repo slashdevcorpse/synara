@@ -11,6 +11,13 @@ export const PROVIDER_RUNTIME_EVENT_RETAIN_ACCEPTED = 512;
 
 export interface PersistedProviderRuntimeEvent {
   readonly sequence: number;
+  /**
+   * Orchestration high-water captured in the same SQLite transaction that
+   * first journaled this runtime event. Null is reserved for rows retained
+   * from before migration 080, whose historical cross-domain cutoff cannot be
+   * reconstructed safely.
+   */
+  readonly orchestrationCutoffSequence: number | null;
   readonly event: ProviderRuntimeEvent;
 }
 
