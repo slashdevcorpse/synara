@@ -139,15 +139,19 @@ export function parseCanonicalWindowsNpmNodeShimTarget(
   const segments = relativeTarget.split("/");
   const scoped = segments[1]?.startsWith("@") ?? false;
   const packageSegmentCount = scoped ? 3 : 2;
-  if (
-    segments.length <= packageSegmentCount ||
-    (scoped && (!segments[1] || !segments[2])) ||
-    (!scoped && !segments[1])
-  ) {
+  const firstPackageSegment = segments[1];
+  if (segments.length <= packageSegmentCount || !firstPackageSegment) {
     return null;
   }
 
-  const packageName = scoped ? `${segments[1]}/${segments[2]}` : segments[1];
+  let packageName = firstPackageSegment;
+  if (scoped) {
+    const scopedPackageName = segments[2];
+    if (!scopedPackageName) {
+      return null;
+    }
+    packageName = `${firstPackageSegment}/${scopedPackageName}`;
+  }
   const packageBinTarget = segments.slice(packageSegmentCount).join("/");
   return {
     relativeTarget,

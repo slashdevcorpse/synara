@@ -7,6 +7,8 @@ import { execFileSync } from "node:child_process";
 import { statSync } from "node:fs";
 import * as Path from "node:path";
 
+import { foldWindowsAsciiCase } from "./windowsProcess";
+
 const PATH_CAPTURE_START = "__SYNARA_PATH_START__";
 const PATH_CAPTURE_END = "__SYNARA_PATH_END__";
 const SHELL_ENV_NAME_PATTERN = /^[A-Z0-9_]+$/;
@@ -139,6 +141,18 @@ function defaultWindowsDirectoryExists(path: string): boolean {
   }
 }
 
+function withoutTrailingWindowsDirectorySeparators(path: string): string {
+  let end = path.length;
+  while (end > 0) {
+    const character = path[end - 1];
+    if (character !== "\\" && character !== "/") {
+      break;
+    }
+    end -= 1;
+  }
+  return end === path.length ? path : path.slice(0, end);
+}
+
 function readWindowsEnvironmentValue(env: NodeJS.ProcessEnv, name: string): string | undefined {
   const normalizedName = name.toUpperCase();
   const effectiveName = Object.keys(env)
@@ -182,7 +196,7 @@ export function listWindowsUserCliFallbackDirectories(
       continue;
     }
     const normalized = Path.win32.normalize(candidate);
-    const identity = normalized.toLowerCase().replace(/[\\/]+$/u, "");
+    const identity = foldWindowsAsciiCase(withoutTrailingWindowsDirectorySeparators(normalized));
     if (!seen.has(identity)) {
       seen.add(identity);
       directories.push(normalized);

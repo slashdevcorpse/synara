@@ -521,6 +521,25 @@ describe("Windows provider process containment", () => {
     },
   );
 
+  it.each([
+    "C:\\tools\\provider.cmd. ",
+    "C:\\tools\\provider.bat .. ",
+    "C:\\Windows\\System32\\cmd.exe. ",
+    "C:\\Windows\\System32\\cmd.com .. ",
+  ])("rejects a Windows-normalized raw shell alias: %s", (command) => {
+    expect(() =>
+      containPreparedWindowsProviderProcess(
+        { command, args: [], shell: false },
+        {
+          platform: "win32",
+          arch: "x64",
+          launcherPath: launcher,
+          fileExists: () => true,
+        },
+      ),
+    ).toThrow(WindowsProviderShellLaunchError);
+  });
+
   it.each(["codex.exe", "commandcode.exe", "opencode.exe", "droid.exe", "agy.exe"])(
     "keeps native %s launches shell-free and Job-contained",
     (name) => {

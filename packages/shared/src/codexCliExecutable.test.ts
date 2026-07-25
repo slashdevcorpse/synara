@@ -14,7 +14,10 @@ import {
 } from "./codexCliExecutable";
 
 function whereOutput(...candidates: string[]) {
-  return vi.fn(() => ({ stdout: candidates.join("\r\n"), status: 0 }));
+  return vi.fn((_command: string, _args: ReadonlyArray<string>) => ({
+    stdout: candidates.join("\r\n"),
+    status: 0,
+  }));
 }
 
 function regularFiles(...paths: string[]) {

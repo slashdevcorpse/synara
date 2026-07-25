@@ -246,6 +246,33 @@ describe("syncShellEnvironment", () => {
     );
   });
 
+  it("preserves the registry PATH merge when fallback directory discovery throws", () => {
+    const env: NodeJS.ProcessEnv = {
+      PATH: "C:\\Inherited",
+    };
+    const failure = new Error("directory lookup failed");
+    const logWarning = vi.fn();
+
+    syncShellEnvironment(env, {
+      platform: "win32",
+      readWindowsEnvironment: () => ({
+        PATH: "C:\\Registry",
+        APPDATA: "C:\\Users\\Test\\AppData\\Roaming",
+      }),
+      windowsDirectoryExists: () => {
+        throw failure;
+      },
+      logWarning,
+    });
+
+    expect(env.PATH).toBe("C:\\Registry;C:\\Inherited");
+    expect(env.APPDATA).toBe("C:\\Users\\Test\\AppData\\Roaming");
+    expect(logWarning).toHaveBeenCalledWith(
+      "Failed to synchronize the desktop Windows environment.",
+      failure,
+    );
+  });
+
   it("logs a warning and leaves the environment intact when the Windows reader throws", () => {
     const env: NodeJS.ProcessEnv = {
       PATH: "C:\\Windows\\system32",

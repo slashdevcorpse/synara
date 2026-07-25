@@ -42,6 +42,9 @@ function syncWindowsEnvironment(
     const persisted = readWindowsEnvironment();
 
     const registryAndInheritedPath = mergePathEntries(persisted.PATH, env.PATH, "win32");
+    if (registryAndInheritedPath) {
+      env.PATH = registryAndInheritedPath;
+    }
 
     for (const [name, value] of Object.entries(persisted)) {
       if (isPathName(name)) continue;

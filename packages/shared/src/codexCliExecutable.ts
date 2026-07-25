@@ -36,6 +36,12 @@ export interface CodexCliExecutableAsyncInput
   extends CodexCliExecutableInput, WindowsAsyncCommandDiscoveryInput {}
 
 export interface CodexCliExecutableResolution {
+  /**
+   * Discovery result, not a directly spawnable Windows launch plan. This may
+   * be an absolute `.cmd` or `.bat` candidate; launching consumers must retain
+   * their argument vector and pass both through Windows provider preparation,
+   * which validates canonical npm shims and resolves their native Node host.
+   */
   readonly executable: string;
   readonly discoveryOutcome?: WindowsCommandDiscoveryOutcome | undefined;
 }

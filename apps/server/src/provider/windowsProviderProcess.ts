@@ -271,6 +271,18 @@ function resolveAbsolutePreparedCommand(command: string, cwd: string | undefined
   throw new WindowsProviderTargetNotResolvedError(command);
 }
 
+function withoutTrailingWindowsDotsAndSpaces(name: string): string {
+  let end = name.length;
+  while (end > 0) {
+    const character = name[end - 1];
+    if (character !== "." && character !== " ") {
+      break;
+    }
+    end -= 1;
+  }
+  return end === name.length ? name : name.slice(0, end);
+}
+
 function isAbsoluteNativeWindowsExecutable(path: string): boolean {
   return (
     Path.win32.isAbsolute(path) && [".exe", ".com"].includes(Path.win32.extname(path).toLowerCase())
@@ -468,8 +480,8 @@ export function containPreparedWindowsProviderProcess(
   }
 
   const target = resolveAbsolutePreparedCommand(prepared.command, input.cwd);
-  const targetExtension = Path.win32.extname(target).toLowerCase();
-  const targetName = Path.win32.basename(target).toLowerCase();
+  const targetName = withoutTrailingWindowsDotsAndSpaces(Path.win32.basename(target)).toLowerCase();
+  const targetExtension = Path.win32.extname(targetName).toLowerCase();
   if (
     prepared.windowsVerbatimArguments === true ||
     targetExtension === ".cmd" ||

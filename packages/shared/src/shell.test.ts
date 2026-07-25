@@ -64,6 +64,30 @@ describe("listWindowsUserCliFallbackDirectories", () => {
     ).toEqual([]);
     expect(checked).toEqual([]);
   });
+
+  it("preserves fallback directories that differ only by non-ASCII case", () => {
+    const pnpmUpper = "C:\\Users\\Äda\\AppData\\Local\\pnpm";
+    const pnpmLower = "C:\\Users\\äda\\AppData\\Local\\pnpm";
+    const existing = new Set([pnpmUpper, pnpmLower]);
+
+    expect(
+      listWindowsUserCliFallbackDirectories(
+        {
+          LOCALAPPDATA: "C:\\Users\\äda\\AppData\\Local",
+          PNPM_HOME: pnpmUpper,
+        },
+        (path) => existing.has(path),
+      ),
+    ).toEqual([pnpmUpper, pnpmLower]);
+  });
+
+  it("handles a long run of trailing separators without regex backtracking", () => {
+    const pnpmHome = `C:\\Tools\\pnpm${"/".repeat(50_000)}`;
+
+    expect(
+      listWindowsUserCliFallbackDirectories({ PNPM_HOME: pnpmHome }, (path) => path === pnpmHome),
+    ).toEqual(["C:\\Tools\\pnpm\\"]);
+  });
 });
 
 describe("extractPathFromShellOutput", () => {
