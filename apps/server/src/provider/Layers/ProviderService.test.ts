@@ -5406,6 +5406,18 @@ validation.layer("ProviderServiceLive validation", (it) => {
   );
 });
 
+const durableRuntimeEvents = makeProviderServiceLayer({
+  persistRuntimeEvent: () => Effect.void,
+});
+durableRuntimeEvents.layer("ProviderServiceLive runtime event durability", (it) => {
+  it.effect("advertises journal-before-fanout only when persistence is configured", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService;
+      assert.equal(provider.runtimeEventsPersistedBeforeFanout, true);
+    }),
+  );
+});
+
 const boundedFanout = makeProviderServiceLayer({ runtimeEventBufferCapacity: 1 });
 it.effect("ProviderServiceLive backpressures slow subscribers and completes fanout shutdown", () =>
   Effect.gen(function* () {

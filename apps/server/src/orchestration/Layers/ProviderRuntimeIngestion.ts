@@ -3070,26 +3070,28 @@ const make = Effect.gen(function* () {
   const start: ProviderRuntimeIngestionShape["start"] = startDrainableWorkerProducers(
     worker,
     Effect.gen(function* () {
-      yield* Effect.forkScoped(
-        Stream.runForEach(providerService.streamEvents, (event) =>
-          runtimeEvents.append(event).pipe(
-            Effect.flatMap((persisted) =>
-              Deferred.await(startupRuntimeReplayComplete).pipe(
-                Effect.andThen(drainRuntimeJournalThrough(persisted.sequence)),
+      if (!providerService.runtimeEventsPersistedBeforeFanout) {
+        yield* Effect.forkScoped(
+          Stream.runForEach(providerService.streamEvents, (event) =>
+            runtimeEvents.append(event).pipe(
+              Effect.flatMap((persisted) =>
+                Deferred.await(startupRuntimeReplayComplete).pipe(
+                  Effect.andThen(drainRuntimeJournalThrough(persisted.sequence)),
+                ),
+              ),
+              Effect.catchCause((cause) =>
+                Cause.hasInterruptsOnly(cause)
+                  ? Effect.failCause(cause)
+                  : Effect.logWarning("provider runtime event journal ingestion failed", {
+                      eventId: event.eventId,
+                      eventType: event.type,
+                      cause: Cause.pretty(cause),
+                    }),
               ),
             ),
-            Effect.catchCause((cause) =>
-              Cause.hasInterruptsOnly(cause)
-                ? Effect.failCause(cause)
-                : Effect.logWarning("provider runtime event journal ingestion failed", {
-                    eventId: event.eventId,
-                    eventType: event.type,
-                    cause: Cause.pretty(cause),
-                  }),
-            ),
           ),
-        ),
-      );
+        );
+      }
       yield* Effect.forkScoped(
         Stream.runForEach(orchestrationEngine.streamDomainEvents, (event) => {
           if (

@@ -75,9 +75,12 @@ type LegacyProviderRuntimeEvent = {
   readonly [key: string]: unknown;
 };
 
-function createProviderServiceHarness() {
+function createProviderServiceHarness(options?: {
+  readonly runtimeEventsPersistedBeforeFanout?: boolean;
+}) {
   const runtimeEventPubSub = Effect.runSync(PubSub.unbounded<ProviderRuntimeEvent>());
   const runtimeSessions: ProviderSession[] = [];
+  let runtimeEventStreamAccessCount = 0;
 
   const unsupported = () => Effect.die(new Error("Unsupported provider call in test")) as never;
   const respondToRequest = vi.fn<ProviderServiceShape["respondToRequest"]>(() => Effect.void);
@@ -113,7 +116,11 @@ function createProviderServiceHarness() {
     rollbackConversation: () => unsupported(),
     compactThread: () => unsupported(),
     closeRuntimeEvents: Effect.void,
-    streamEvents: Stream.fromPubSub(runtimeEventPubSub),
+    runtimeEventsPersistedBeforeFanout: options?.runtimeEventsPersistedBeforeFanout,
+    get streamEvents() {
+      runtimeEventStreamAccessCount += 1;
+      return Stream.fromPubSub(runtimeEventPubSub);
+    },
   };
 
   const setSession = (session: ProviderSession): void => {
@@ -169,6 +176,7 @@ function createProviderServiceHarness() {
     stopSession,
     stopRuntimeSession,
     hasLiveRuntimeTasks,
+    getRuntimeEventStreamAccessCount: () => runtimeEventStreamAccessCount,
   };
 }
 
@@ -277,10 +285,13 @@ describe("ProviderRuntimeIngestion", () => {
     readonly dbPath?: string;
     readonly workspaceRoot?: string;
     readonly createdAt?: string;
+    readonly runtimeEventsPersistedBeforeFanout?: boolean;
   }) {
     const workspaceRoot = options?.workspaceRoot ?? makeTempDir("synara-provider-project-");
     fs.mkdirSync(path.join(workspaceRoot, ".git"), { recursive: true });
-    const provider = createProviderServiceHarness();
+    const provider = createProviderServiceHarness({
+      runtimeEventsPersistedBeforeFanout: options?.runtimeEventsPersistedBeforeFanout,
+    });
     const orchestrationLayer = OrchestrationEngineLive.pipe(
       Layer.provide(OrchestrationProjectionPipelineLive),
       Layer.provide(OrchestrationProjectionSnapshotQueryLive),
@@ -441,9 +452,38 @@ describe("ProviderRuntimeIngestion", () => {
       stopSession: provider.stopSession,
       stopRuntimeSession: provider.stopRuntimeSession,
       hasLiveRuntimeTasks: provider.hasLiveRuntimeTasks,
+      getRuntimeEventStreamAccessCount: provider.getRuntimeEventStreamAccessCount,
       createAdditionalThread,
     };
   }
+
+  it("drains a durable provider journal without joining the live fan-out", async () => {
+    const harness = await createHarness({ runtimeEventsPersistedBeforeFanout: true });
+    const event: ProviderRuntimeEvent = {
+      type: "runtime.warning",
+      eventId: asEventId("evt-durable-journal-without-live-subscription"),
+      provider: "codex",
+      createdAt: "2026-07-25T15:00:00.000Z",
+      threadId: asThreadId("thread-1"),
+      payload: {
+        message: "Durable output remained independent of live fan-out",
+      },
+    };
+
+    const persisted = await Effect.runPromise(harness.runtimeEventRepository.append(event));
+    const thread = await waitForThread(harness.engine, (entry) =>
+      entry.activities.some((activity) => activity.id === event.eventId),
+    );
+    await harness.drain();
+
+    expect(thread.activities.some((activity) => activity.id === event.eventId)).toBe(true);
+    expect(
+      await Effect.runPromise(
+        harness.runtimeEventRepository.getConsumerCursor(PROVIDER_RUNTIME_INGESTION_CONSUMER),
+      ),
+    ).toBe(persisted.sequence);
+    expect(harness.getRuntimeEventStreamAccessCount()).toBe(0);
+  });
 
   it("REL-01C gate: replays output persisted before subscription without duplicate acceptance", async () => {
     const harness = await createHarness({ startIngestion: false });
