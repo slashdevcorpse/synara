@@ -4051,6 +4051,135 @@ describe("OpenCodeAdapter runtime lifecycle", () => {
     expect(scopeCloseCount).toBe(1);
   });
 
+  it("installs one compatibility incident when SDK and provider errors race", async () => {
+    const eventQueue = createSubscribedEventQueue();
+    const incidentInstallEntered = Deferred.makeUnsafe<void>();
+    const releaseIncidentInstall = Deferred.makeUnsafe<void>();
+    let resolvePrompt:
+      | ((value: {
+          error: { name: string; data: { message: string } };
+          response: { status: number };
+        }) => void)
+      | undefined;
+    const promptResponse = new Promise<{
+      error: { name: string; data: { message: string } };
+      response: { status: number };
+    }>((resolve) => {
+      resolvePrompt = resolve;
+    });
+    const runtime = createMockOpenCodeRuntime({
+      promptAsync: async () => promptResponse,
+    });
+    const client = runtime.runtime.createOpenCodeSdkClient({
+      baseUrl: "http://127.0.0.1:4099",
+      directory: process.cwd(),
+    }) as unknown as {
+      event: {
+        subscribe: () => Promise<{ stream: AsyncIterable<unknown> }>;
+      };
+    };
+    client.event.subscribe = async () => ({ stream: eventQueue.stream });
+    const threadId = asThreadId("thread-opencode-schema-race");
+    const providerError = {
+      name: "UnknownError",
+      data: {
+        message: "SQLiteError: NOT NULL constraint failed: session_message.seq",
+      },
+    };
+
+    const result = await Effect.runPromise(
+      Effect.gen(function* () {
+        const adapter = yield* OpenCodeAdapter;
+        const terminalEventsFiber = yield* Stream.runCollect(
+          Stream.take(adapter.streamEvents, 4),
+        ).pipe(Effect.forkChild);
+        yield* adapter.startSession({
+          provider: "opencode",
+          threadId,
+          runtimeMode: "full-access",
+        });
+        const sendResult = yield* adapter
+          .sendTurn({
+            threadId,
+            input: "hello",
+            attachments: [],
+            modelSelection: {
+              provider: "opencode",
+              model: "opencode/claude-opus-4-7",
+            },
+          })
+          .pipe(Effect.result);
+
+        resolvePrompt?.({
+          error: providerError,
+          response: { status: 500 },
+        });
+        yield* Deferred.await(incidentInstallEntered);
+        eventQueue.push({
+          id: "schema-error-racing-provider-event",
+          type: "session.error",
+          properties: {
+            sessionID: "opencode-session-1",
+            error: providerError,
+          },
+        });
+        yield* Effect.sleep(5);
+        yield* Effect.sync(() => Deferred.doneUnsafe(releaseIncidentInstall, Effect.void));
+
+        const terminalEvents = Array.from(yield* Fiber.join(terminalEventsFiber));
+        const terminalEvent = terminalEvents[3];
+        if (terminalEvent === undefined) {
+          return yield* Effect.die("Expected OpenCode compatibility terminal event");
+        }
+        const barrier = requireRuntimeEventDurabilityBarrier(adapter);
+        const pendingBeforeAck = yield* barrier.isPending(terminalEvent);
+        yield* barrier.acknowledge(terminalEvent);
+        const cleanupEvents = Array.from(
+          yield* Stream.runCollect(Stream.take(adapter.streamEvents, 2)),
+        );
+        const extraEvent = yield* Stream.runHead(adapter.streamEvents).pipe(
+          Effect.timeoutOption(25),
+        );
+        return {
+          events: [...terminalEvents, ...cleanupEvents],
+          extraEvent,
+          pendingBeforeAck,
+          sendResult,
+        };
+      }).pipe(
+        Effect.provide(
+          makeOpenCodeAdapterLive({
+            runtime: runtime.runtime,
+            promptSubmissionInlineWaitMs: 1,
+            beforeCompatibilityIncidentInstall: Effect.sync(() =>
+              Deferred.doneUnsafe(incidentInstallEntered, Effect.void),
+            ).pipe(Effect.andThen(Deferred.await(releaseIncidentInstall))),
+          }).pipe(
+            Layer.provideMerge(
+              ServerConfig.layerTest(process.cwd(), { prefix: "opencode-adapter-test-" }),
+            ),
+            Layer.provideMerge(NodeServices.layer),
+          ),
+        ),
+      ),
+    );
+
+    expect(Result.isSuccess(result.sendResult)).toBe(true);
+    expect(result.pendingBeforeAck).toBe(true);
+    expect(result.events.map((event) => event.type)).toEqual([
+      "session.started",
+      "thread.started",
+      "turn.started",
+      "turn.completed",
+      "runtime.error",
+      "session.exited",
+    ]);
+    expect(result.events.filter((event) => event.type === "turn.completed")).toHaveLength(1);
+    expect(result.extraEvent._tag).toBe("None");
+    expect(runtime.promptCalls).toHaveLength(1);
+    expect(runtime.abortCalls).toEqual([{ sessionID: "opencode-session-1" }]);
+  });
+
   it("tears down a pending compatibility terminal during stopAll", async () => {
     const runtime = createMockOpenCodeRuntime({
       promptAsync: async () => ({

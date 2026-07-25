@@ -209,6 +209,7 @@ interface OpenCodeSessionContext {
   activeVariant: string | undefined;
   promptAttemptCount: number;
   compatibilityIncident: OpenCodeCompatibilityIncident | undefined;
+  readonly compatibilityIncidentMutex: Semaphore.Semaphore;
   readonly stopped: Ref.Ref<boolean>;
   readonly shutdownState: Ref.Ref<OpenCodeSessionShutdownState>;
   readonly shutdownMutex: Semaphore.Semaphore;
@@ -244,6 +245,7 @@ export interface OpenCodeAdapterLiveOptions {
   readonly sessionAbortTimeoutMs?: number;
   readonly waitForSessionAbortTimeout?: (timeoutMs: number) => Effect.Effect<void>;
   readonly beforeSessionInstall?: Effect.Effect<void>;
+  readonly beforeCompatibilityIncidentInstall?: Effect.Effect<void>;
   readonly resolveServerPassword?: (
     provider: OpenCodeCompatibleProvider,
   ) => Effect.Effect<string | undefined, ProviderAdapterValidationError>;
@@ -1212,18 +1214,24 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
           readonly releaseOwnedResourcesOnAbortTimeout?: boolean;
         } = {},
       ) {
-        const pendingCompatibilityIncident = context.compatibilityIncident;
-        if (
-          pendingCompatibilityIncident?.pendingTerminalEventId !== undefined &&
-          callbacks.allowPendingCompatibilityTerminal !== true
-        ) {
-          return yield* pendingCompatibilityIncident.error;
+        const pendingCompatibilityError = yield* context.compatibilityIncidentMutex.withPermit(
+          Effect.sync(() => {
+            const pendingCompatibilityIncident = context.compatibilityIncident;
+            if (
+              pendingCompatibilityIncident?.pendingTerminalEventId !== undefined &&
+              callbacks.allowPendingCompatibilityTerminal !== true
+            ) {
+              return pendingCompatibilityIncident.error;
+            }
+            // Claim teardown under the same lock used to install compatibility
+            // incidents so exactly one lifecycle path can cross the boundary.
+            context.teardownRequested = true;
+            return undefined;
+          }),
+        );
+        if (pendingCompatibilityError !== undefined) {
+          return yield* pendingCompatibilityError;
         }
-        // Claim teardown synchronously before session.abort yields. Compatibility
-        // promotion checks the same flag, so replacement/stop and terminal
-        // promotion have a deterministic winner instead of racing across the
-        // destructive boundary.
-        context.teardownRequested = true;
         return yield* stopOpenCodeContext(context, {
           abortTimeoutMs: sessionAbortTimeoutMs,
           waitForAbortTimeout: waitForSessionAbortTimeout(sessionAbortTimeoutMs),
@@ -1396,62 +1404,71 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
           return null;
         }
 
-        const existingIncident = context.compatibilityIncident;
-        if (existingIncident !== undefined) {
-          return existingIncident.error;
-        }
-        if (
-          context.teardownRequested ||
-          (yield* Ref.get(context.stopped)) ||
-          context.activeTurnId !== input.turnId
-        ) {
-          return null;
-        }
+        const installation = yield* context.compatibilityIncidentMutex.withPermit(
+          Effect.gen(function* () {
+            const existingIncident = context.compatibilityIncident;
+            if (existingIncident !== undefined) {
+              return { error: existingIncident.error, terminalEvent: undefined } as const;
+            }
+            if (
+              context.teardownRequested ||
+              (yield* Ref.get(context.stopped)) ||
+              context.activeTurnId !== input.turnId
+            ) {
+              return { error: null, terminalEvent: undefined } as const;
+            }
+            if (options?.beforeCompatibilityIncidentInstall) {
+              yield* options.beforeCompatibilityIncidentInstall;
+            }
 
-        const compatibilityError = new ProviderAdapterCompatibilityError({
-          provider,
-          method: input.operation,
-          reason: failure.reason,
-          lifecycleStage: failure.lifecycleStage,
-          retryable: false,
-          detail: failure.diagnosticSummary,
-        });
-        const correlationId = randomUUID();
-        const safeRaw = {
-          source: "synara.opencode.compatibility",
-          reason: failure.reason,
-          correlationId,
-        };
-        const terminalEvent = {
-          ...buildEventBase({
-            threadId: context.session.threadId,
-            turnId: input.turnId,
-            raw: safeRaw,
+            const compatibilityError = new ProviderAdapterCompatibilityError({
+              provider,
+              method: input.operation,
+              reason: failure.reason,
+              lifecycleStage: failure.lifecycleStage,
+              retryable: false,
+              detail: failure.diagnosticSummary,
+            });
+            const correlationId = randomUUID();
+            const safeRaw = {
+              source: "synara.opencode.compatibility",
+              reason: failure.reason,
+              correlationId,
+            };
+            const terminalEvent = {
+              ...buildEventBase({
+                threadId: context.session.threadId,
+                turnId: input.turnId,
+                raw: safeRaw,
+              }),
+              type: "turn.completed",
+              payload: {
+                state: "failed",
+                failureReason: failure.reason,
+                errorMessage: OPENCODE_STORAGE_SCHEMA_INCOMPATIBLE_MESSAGE,
+              },
+            } satisfies ProviderRuntimeEvent;
+            const incident: OpenCodeCompatibilityIncident = {
+              turnId: input.turnId,
+              correlationId,
+              error: compatibilityError,
+              originalCause: input.error,
+              failure,
+              pendingTerminalEventId: terminalEvent.eventId,
+              terminalAcknowledged: false,
+            };
+            // Install the dispatch-blocking tombstone before the terminal event
+            // becomes visible. Concurrent error fibers and teardown claims use
+            // this same lock, so the event id cannot be overwritten.
+            context.compatibilityIncident = incident;
+            return { error: compatibilityError, terminalEvent } as const;
           }),
-          type: "turn.completed",
-          payload: {
-            state: "failed",
-            failureReason: failure.reason,
-            errorMessage: OPENCODE_STORAGE_SCHEMA_INCOMPATIBLE_MESSAGE,
-          },
-        } satisfies ProviderRuntimeEvent;
-        const incident: OpenCodeCompatibilityIncident = {
-          turnId: input.turnId,
-          correlationId,
-          error: compatibilityError,
-          originalCause: input.error,
-          failure,
-          pendingTerminalEventId: terminalEvent.eventId,
-          terminalAcknowledged: false,
-        };
-        // Install the dispatch-blocking tombstone before the terminal event can
-        // become visible to ProviderService. The adapter remains active/running
-        // until the service acknowledges durable journal + binding completion.
-        context.compatibilityIncident = incident;
+        );
 
-        yield* emit(context, terminalEvent);
-
-        return compatibilityError;
+        if (installation.terminalEvent !== undefined) {
+          yield* emit(context, installation.terminalEvent);
+        }
+        return installation.error;
       });
 
       const runtimeEventDurabilityBarrier = {
@@ -3612,6 +3629,7 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
                   activeVariant: undefined,
                   promptAttemptCount: 0,
                   compatibilityIncident: undefined,
+                  compatibilityIncidentMutex: yield* Semaphore.make(1),
                   teardownRequested: false,
                   stopped: yield* Ref.make(false),
                   shutdownState: yield* Ref.make<OpenCodeSessionShutdownState>("running"),
