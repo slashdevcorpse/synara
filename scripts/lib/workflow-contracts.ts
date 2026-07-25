@@ -105,8 +105,7 @@ const ALLOWED_NONBLOCKING_CI_COMMANDS: ReadonlySet<string> = new Set(
 const UNIT_WINDOWS_SETUP_COMMAND =
   "node apps/server/scripts/build-windows-job-launcher.mjs --arch x64";
 const UNIT_WINDOWS_SETUP_CONDITION = "matrix.lane == 'cli_1' || matrix.lane == 'cli_2'";
-const UNIT_CLI_DEPENDENCY_BUILD_COMMAND =
-  "bun turbo build --filter=@synara/cli^...";
+const UNIT_CLI_DEPENDENCY_BUILD_COMMAND = "bun turbo build --filter=@synara/cli^...";
 const UNIT_TURBO_CONCURRENCY_EXPRESSION = "${{ matrix.turbo_concurrency }}";
 const UNIT_TEST_COMMAND_EXPRESSION = "${{ matrix.test_command }}";
 const UNIT_JOB_NAME_EXPRESSION = "unit_windows_${{ matrix.lane }}";
@@ -119,8 +118,7 @@ const BROWSER_WINDOWS_MATRIX = [
 const BROWSER_WINDOWS_JOB_NAME_EXPRESSION = "browser_windows_${{ matrix.lane }}";
 const BROWSER_WINDOWS_STABLE_CONDITION = "matrix.lane == 'stable'";
 const BROWSER_WINDOWS_QUARANTINE_CONDITION = "matrix.lane == 'quarantine'";
-const BROWSER_WINDOWS_SUMMARY_CONDITION =
-  "${{ always() && matrix.lane == 'quarantine' }}";
+const BROWSER_WINDOWS_SUMMARY_CONDITION = "${{ always() && matrix.lane == 'quarantine' }}";
 const BROWSER_WINDOWS_AGGREGATE_NEEDS = ["browser_windows_workers"] as const;
 const BROWSER_WINDOWS_AGGREGATE_COMMAND =
   'test "${{ needs.browser_windows_workers.result }}" = success';
@@ -657,9 +655,7 @@ function validateUnitMatrix(jobs: UnknownRecord, workflowPath: string, errors: s
     (step) => step.command === UNIT_TEST_COMMAND_EXPRESSION,
   );
   if (windowsTestSteps.length !== 1) {
-    errors.push(
-      `${workflowPath} unit must run exactly one matrix-owned Windows unit command.`,
-    );
+    errors.push(`${workflowPath} unit must run exactly one matrix-owned Windows unit command.`);
   } else {
     const windowsTestStep = windowsTestSteps[0]!;
     if (
@@ -685,10 +681,7 @@ function validateUnitMatrix(jobs: UnknownRecord, workflowPath: string, errors: s
     );
   } else {
     const setupStep = windowsSetupSteps[0]!;
-    if (
-      dependencyBuildSteps.length === 1 &&
-      dependencyBuildSteps[0]!.index >= setupStep.index
-    ) {
+    if (dependencyBuildSteps.length === 1 && dependencyBuildSteps[0]!.index >= setupStep.index) {
       errors.push(
         `${workflowPath} unit CLI dependency build must run before the Windows launcher setup.`,
       );
@@ -1273,18 +1266,10 @@ function validateBrowserWindowsPipeline(
         `${workflowPath} ${jobName} must install Playwright before quarantine inventory.`,
       );
     }
-    if (
-      quarantineInventory &&
-      quarantineRun &&
-      quarantineInventory.index >= quarantineRun.index
-    ) {
+    if (quarantineInventory && quarantineRun && quarantineInventory.index >= quarantineRun.index) {
       errors.push(`${workflowPath} ${jobName} must verify inventory before quarantine execution.`);
     }
-    if (
-      quarantineRun &&
-      quarantineSummary &&
-      quarantineRun.index >= quarantineSummary.index
-    ) {
+    if (quarantineRun && quarantineSummary && quarantineRun.index >= quarantineSummary.index) {
       errors.push(`${workflowPath} ${jobName} must summarize quarantine after execution.`);
     }
   }
@@ -1458,8 +1443,7 @@ function validateWindowsReleaseCache(
   const job = jobs.windows_x64;
   if (!isRecord(job) || !Array.isArray(job.steps)) return;
   const caches = job.steps.filter(
-    (step): step is UnknownRecord =>
-      isRecord(step) && step.name === "Cache Bun, Turbo, and npm",
+    (step): step is UnknownRecord => isRecord(step) && step.name === "Cache Bun, Turbo, and npm",
   );
   if (caches.length !== 1) {
     errors.push(`${workflowPath} windows_x64 must define exactly one Bun, Turbo, and npm cache.`);
@@ -1482,8 +1466,7 @@ function validateWindowsReleaseCache(
   const packagedCli = steps.find((step) => step.command === CI_WINDOWS_PACKAGED_CLI_COMMAND);
   if (
     packagedCli &&
-    workflowStepEnvironmentValue(packagedCli, "npm_config_cache") !==
-      WINDOWS_RELEASE_NPM_CACHE
+    workflowStepEnvironmentValue(packagedCli, "npm_config_cache") !== WINDOWS_RELEASE_NPM_CACHE
   ) {
     errors.push(
       `${workflowPath} windows_x64 packaged CLI verification must use the restored npm cache.`,

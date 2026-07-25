@@ -669,7 +669,9 @@ describe("workflow contracts", () => {
           "  browser_windows_workers:\n    name: browser_windows",
         ),
       ),
-    ).toContain("browser_windows_workers must be an independent, bounded, fail-closed Windows lane matrix");
+    ).toContain(
+      "browser_windows_workers must be an independent, bounded, fail-closed Windows lane matrix",
+    );
 
     expect(
       ciErrors(
@@ -930,10 +932,7 @@ describe("workflow contracts", () => {
     const filteredWindows = validFiles();
     filteredWindows.set(
       ".github/workflows/ci.yml",
-      ciWorkflow.replace(
-        "--filter=effect-acp",
-        "--filter=@synara/unknown",
-      ),
+      ciWorkflow.replace("--filter=effect-acp", "--filter=@synara/unknown"),
     );
     expect(validateWorkflowContracts(filteredWindows, policy()).join("\n")).toContain(
       "unit matrix entry 3 has drifted",
@@ -1073,9 +1072,7 @@ describe("workflow contracts", () => {
           "  unit_windows:\n    name: unit_windows\n    if: success()",
         ),
       ),
-    ).toContain(
-      "unit_windows must be a named, bounded, always-running, fail-closed aggregate",
-    );
+    ).toContain("unit_windows must be a named, bounded, always-running, fail-closed aggregate");
 
     expect(
       ciErrors(
@@ -1088,10 +1085,7 @@ describe("workflow contracts", () => {
 
     expect(
       ciErrors(
-        ciWorkflow.replace(
-          "          - lane: quarantine\n            runner: windows-2022",
-          "",
-        ),
+        ciWorkflow.replace("          - lane: quarantine\n            runner: windows-2022", ""),
       ),
     ).toContain("browser_windows_workers matrix must contain the exact required platforms");
 
@@ -1102,9 +1096,7 @@ describe("workflow contracts", () => {
           '      - shell: bash\n        run: test "${{ needs.windows_e2e_build.result }}" != failure',
         ),
       ),
-    ).toContain(
-      "e2e_windows must run exact producer result gate command",
-    );
+    ).toContain("e2e_windows must run exact producer result gate command");
 
     expect(
       ciErrors(
@@ -1124,7 +1116,9 @@ describe("workflow contracts", () => {
 
   it("locks required-check names and fail-fast shell behavior", () => {
     expect(
-      ciErrors(ciWorkflow.replace("    name: quality_windows", "    name: quality_windows_renamed")),
+      ciErrors(
+        ciWorkflow.replace("    name: quality_windows", "    name: quality_windows_renamed"),
+      ),
     ).toContain("quality_windows must retain its exact required display name");
 
     expect(
@@ -1178,9 +1172,9 @@ describe("workflow contracts", () => {
       "node scripts/verify-workflow-contracts.ts --check-github-state",
       "node scripts/release-smoke.ts",
     ]) {
-      expect(
-        ciErrors(ciWorkflow.replace(requiredCommand, "echo pass")),
-      ).toContain("release_smoke step");
+      expect(ciErrors(ciWorkflow.replace(requiredCommand, "echo pass"))).toContain(
+        "release_smoke step",
+      );
     }
 
     expect(
@@ -1195,8 +1189,8 @@ describe("workflow contracts", () => {
     expect(
       ciErrors(
         ciWorkflow.replace(
-          "      - shell: bash\n        run: |\n          test \"${{ needs.quality_linux.result }}\" = skipped",
-          "      - shell: bash {0}\n        run: |\n          test \"${{ needs.quality_linux.result }}\" = skipped",
+          '      - shell: bash\n        run: |\n          test "${{ needs.quality_linux.result }}" = skipped',
+          '      - shell: bash {0}\n        run: |\n          test "${{ needs.quality_linux.result }}" = skipped',
         ),
       ),
     ).toContain("quality aggregate result gate must use the fail-closed bash shell");
@@ -1248,9 +1242,7 @@ describe("workflow contracts", () => {
       "          path: .",
     ].join("\n");
     expect(
-      ciErrors(
-        ciWorkflow.replace(expectedDownload, `${expectedDownload}\n${untrustedDownload}`),
-      ),
+      ciErrors(ciWorkflow.replace(expectedDownload, `${expectedDownload}\n${untrustedDownload}`)),
     ).toContain("e2e_windows must download exactly one pinned desktop-build-windows artifact");
 
     for (const rebuildCommand of ["npm run build", "pnpm run build", "yarn run build"]) {
